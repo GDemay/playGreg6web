@@ -429,5 +429,285 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
             self.assertEqual(data["first_non_black_s"], 0.0)
 
 
+def _build_synthetic_boot_presents(
+    *,
+    bink2_light_fps: float = 40.0,
+    bink2_heavy_fps: float = 20.0,
+    menu_fps: float = 25.0,
+    spinner_fps: float = 30.0,
+    spinner_s: float = 6.0,
+) -> list[dict]:
+    """Build cumulative-counter presents: Start Screen -> 4K Bink2 -> Menu (2 screens) -> Loading Spinner."""
+    presents: list[dict] = []
+    t_ms = 0.0
+    total_draws = 0
+    total_res = 5
+
+    def emit(count: int, dt_ms: float, draws_per_frame: int, res_at_start: int = 0) -> None:
+        nonlocal t_ms, total_draws, total_res
+        for idx in range(count):
+            if idx == 0 and res_at_start:
+                total_res += res_at_start
+            total_draws += draws_per_frame
+            presents.append({
+                "wall_ms": round(t_ms, 3),
+                "counters": {"draws_issued": total_draws, "resources_created": total_res},
+            })
+            t_ms += dt_ms
+
+    # Start Screen: 12 draws/p for 2s @ 25 FPS (pre-Bink2 -> must not pollute post-Bink2 menu)
+    emit(50, 40.0, 12, res_at_start=3)
+    # 4K Bink2 light window: 10s @ bink2_light_fps (4 draws/p)
+    light_dt = 1000.0 / bink2_light_fps
+    emit(int(round(10.0 * bink2_light_fps)), light_dt, 4, res_at_start=2)
+    # 4K Bink2 heavy window: 10s @ bink2_heavy_fps (4 draws/p)
+    heavy_dt = 1000.0 / bink2_heavy_fps
+    emit(int(round(10.0 * bink2_heavy_fps)) + 1, heavy_dt, 4, res_at_start=0)
+    # Menu screen 1 (UI TEXT SIZE): 15 draws/p for 5s @ menu_fps
+    menu_dt = 1000.0 / menu_fps
+    emit(int(round(5.0 * menu_fps)), menu_dt, 15, res_at_start=4)
+    # Menu screen 2 (BRIGHTNESS): 25 draws/p for 5s @ menu_fps
+    emit(int(round(5.0 * menu_fps)) + 1, menu_dt, 25, res_at_start=1)
+    # Loading Spinner: 1 draw/p sustained for spinner_s @ spinner_fps
+    spin_dt = 1000.0 / spinner_fps
+    emit(int(round(spinner_s * spinner_fps)) + 1, spin_dt, 1, res_at_start=1)
+    return presents
+
+
+class BootPhaseAnalysisTests(unittest.TestCase):
+    def _run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        out = io.StringIO()
+        err = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = st.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_analyze_boot_phases_full_synthetic_boot(self):
+        presents = _build_synthetic_boot_presents(
+            bink2_light_fps=40.0,
+            bink2_heavy_fps=20.0,
+            menu_fps=25.0,
+            spinner_fps=30.0,
+            spinner_s=6.0,
+        )
+        phases = st.analyze_boot_phases(presents, window_ms=5000.0, black_loading_s=4.5)
+        self.assertEqual(phases["window_ms"], 5000.0)
+        self.assertEqual(phases["bink2_draws_range"], [3, 5])
+        self.assertEqual(phases["black_loading_s"], 4.5)
+
+        bink2 = phases["bink2_video"]
+        self.assertIsNotNone(bink2)
+        self.assertEqual(bink2["segments"], 1)
+        self.assertAlmostEqual(bink2["duration_s"], 20.0, delta=0.1)
+        self.assertAlmostEqual(bink2["fps_min"], 20.0, delta=0.5)
+        self.assertAlmostEqual(bink2["fps_max"], 40.0, delta=0.5)
+        self.assertAlmostEqual(bink2["fps_median"], 30.0, delta=0.5)
+        self.assertAlmostEqual(bink2["fps_avg"], 30.0, delta=0.5)
+        self.assertGreater(bink2["presents"], 500)
+        self.assertAlmostEqual(bink2["start_s"], 2.0, delta=0.1)
+        self.assertAlmostEqual(bink2["end_s"], 22.0, delta=0.1)
+
+        menu = phases["menu"]
+        self.assertIsNotNone(menu)
+        self.assertEqual(menu["segments"], 2)
+        self.assertAlmostEqual(menu["duration_s"], 10.0, delta=0.15)
+        self.assertAlmostEqual(menu["fps_avg"], 25.0, delta=0.5)
+        self.assertAlmostEqual(menu["fps_median"], 25.0, delta=0.5)
+        self.assertAlmostEqual(menu["fps_min"], 25.0, delta=0.5)
+        self.assertAlmostEqual(menu["fps_max"], 25.0, delta=0.5)
+
+        spinner = phases["loading_spinner"]
+        self.assertIsNotNone(spinner)
+        self.assertEqual(spinner["segments"], 1)
+        self.assertAlmostEqual(spinner["duration_s"], 6.0, delta=0.1)
+        self.assertEqual(phases["loading_spinner_s"], spinner["duration_s"])
+        self.assertAlmostEqual(spinner["fps_avg"], 30.0, delta=0.5)
+
+        summary_lines = st.format_phase_summary(phases)
+        summary_text = "\n".join(summary_lines)
+        self.assertIn("bink2_video:", summary_text)
+        self.assertIn("menu:", summary_text)
+        self.assertIn("loading_spinner:", summary_text)
+        self.assertIn("black_loading_s: 4.50s", summary_text)
+
+    def test_present_samples_polled_browser_and_explicit_phase_tags(self):
+        # 1. Per-present `draws` format
+        per_present = [
+            {"index": i, "wall_ms": i * 50.0, "draws": 4, "resources": 0}
+            for i in range(6)
+        ] + [
+            {"index": 6 + i, "wall_ms": 300.0 + i * 100.0, "draws": 20, "resources": 0}
+            for i in range(5)
+        ]
+        p1 = st.analyze_boot_phases(per_present, window_ms=5000.0)
+        self.assertIsNotNone(p1["bink2_video"])
+        self.assertEqual(p1["bink2_video"]["fps_avg"], 20.0)
+        self.assertIsNotNone(p1["menu"])
+        self.assertEqual(p1["menu"]["fps_avg"], 10.0)
+
+        # 2. Polled browser presents with `present_count` + `draws_per_frame`
+        polled = [
+            {"wall_ms": 10000.0, "present_count": 100, "draws_per_frame": 4},
+            {"wall_ms": 15000.0, "present_count": 250, "draws_per_frame": 4},  # 30 fps
+            {"wall_ms": 20000.0, "present_count": 350, "draws_per_frame": 4},  # 20 fps
+            {"wall_ms": 25000.0, "present_count": 475, "draws_per_frame": 22}, # menu
+            {"wall_ms": 30000.0, "present_count": 625, "draws_per_frame": 22}, # 30 fps menu
+        ]
+        p2 = st.analyze_boot_phases(polled, window_ms=5000.0)
+        self.assertEqual(p2["bink2_video"]["fps_min"], 20.0)
+        self.assertEqual(p2["bink2_video"]["fps_max"], 30.0)
+        self.assertEqual(p2["bink2_video"]["fps_median"], 25.0)
+        self.assertEqual(p2["bink2_video"]["fps_avg"], 25.0)
+        self.assertEqual(p2["bink2_video"]["duration_s"], 10.0)
+        self.assertEqual(p2["menu"]["fps_avg"], 30.0)
+
+        # 3. Polled browser presents with `presents` + cumulative `counters.draws_issued` + explicit phase tags
+        tagged = [
+            {"wall_ms": 1000.0, "presents": 10, "phase": "start_screen", "counters": {"draws_issued": 120}},
+            {"wall_ms": 2000.0, "presents": 30, "phase": "start_screen", "counters": {"draws_issued": 360}},
+            {"wall_ms": 3000.0, "presents": 60, "phase": "bink2_video", "counters": {"draws_issued": 480}},
+            {"wall_ms": 4000.0, "presents": 90, "phase": "bink2_video", "counters": {"draws_issued": 600}},
+            {"wall_ms": 5000.0, "presents": 110, "phase": "loading_spinner", "counters": {"draws_issued": 620}},
+            {"wall_ms": 6000.0, "presents": 130, "phase": "loading_spinner", "counters": {"draws_issued": 640}},
+        ]
+        p3 = st.analyze_boot_phases(tagged, window_ms=5000.0)
+        self.assertIsNotNone(p3["bink2_video"])
+        self.assertEqual(p3["bink2_video"]["fps_avg"], 30.0)
+        self.assertIsNone(p3["menu"])
+        self.assertIsNotNone(p3["loading_spinner"])
+        self.assertEqual(p3["loading_spinner"]["duration_s"], 1.0)
+        self.assertEqual(p3["loading_spinner"]["fps_avg"], 20.0)
+
+    def test_short_phase_fallback_empty_and_validation(self):
+        # Short phase (< 5000ms window) falls back to inter-present FPS cleanly
+        short = [
+            {"wall_ms": 0.0, "draws": 4},
+            {"wall_ms": 50.0, "draws": 4},   # 20 fps
+            {"wall_ms": 150.0, "draws": 4},  # 10 fps
+            {"wall_ms": 250.0, "draws": 4},  # 10 fps
+            {"wall_ms": 450.0, "draws": 4},  # 5 fps
+        ]
+        p = st.analyze_boot_phases(short, window_ms=5000.0)
+        self.assertEqual(p["bink2_video"]["fps_min"], 5.0)
+        self.assertEqual(p["bink2_video"]["fps_median"], 10.0)
+        self.assertEqual(p["bink2_video"]["fps_max"], 20.0)
+        self.assertEqual(p["bink2_video"]["fps_avg"], 8.89)
+        self.assertEqual(p["bink2_video"]["duration_s"], 0.45)
+
+        # Empty input
+        empty = st.analyze_boot_phases([])
+        self.assertIsNone(empty["bink2_video"])
+        self.assertIsNone(empty["menu"])
+        self.assertIsNone(empty["loading_spinner"])
+        self.assertIsNone(empty["loading_spinner_s"])
+        self.assertEqual(st.format_phase_summary(empty), ["boot phases: none detected"])
+
+        # Explicit loading_spinner_s without presents
+        only_spinner = st.analyze_boot_phases([], loading_spinner_s=7.25)
+        self.assertEqual(only_spinner["loading_spinner_s"], 7.25)
+        self.assertEqual(only_spinner["loading_spinner"]["duration_s"], 7.25)
+
+        # Invalid parameters raise ValueError
+        for bad_win in (0, -100, float("nan"), float("inf"), True):
+            with self.assertRaises(ValueError):
+                st.analyze_boot_phases([], window_ms=bad_win)
+        for bad_rng in ((5, 3), (-1, 4), (3,)):
+            with self.assertRaises(ValueError):
+                st.analyze_boot_phases([], bink2_draws_range=bad_rng)  # type: ignore[arg-type]
+
+    def test_extract_boot_phases_from_report_fallbacks_and_cli(self):
+        # 1. screen_timeline fallback + summary overrides
+        report_tl = {
+            "schema": "playgta6-boot-report",
+            "screen_timeline": [
+                {"start_time": 1000.0, "end_time": 11000.0, "presents": 301, "draws_per_frame": 4},
+                {"start_time": 11000.0, "end_time": 16000.0, "presents": 126, "draws_per_frame": 20},
+                {"start_time": 16000.0, "end_time": 20000.0, "presents": 121, "draws_per_frame": 1},
+            ],
+            "summary": {"black_loading_s": 3.5},
+        }
+        p_tl = st.extract_boot_phases_from_report(report_tl)
+        self.assertEqual(p_tl["bink2_video"]["fps_avg"], 30.0)
+        self.assertEqual(p_tl["menu"]["fps_avg"], 25.0)
+        self.assertEqual(p_tl["loading_spinner"]["duration_s"], 4.0)
+        self.assertEqual(p_tl["loading_spinner_s"], 4.0)
+        self.assertEqual(p_tl["black_loading_s"], 3.5)
+
+        # 2. Pre-computed summary/telemetry fields + bad/path values rejected
+        report_pre = {
+            "schema": "playgta6-boot-report",
+            "summary": {
+                "bink2_fps_min": 18.5,
+                "bink2_fps_median": 28.0,
+                "bink2_fps_max": 34.0,
+                "bink2_duration_s": 42.0,
+                "menu_fps_median": 29.0,
+                "menu_fps_avg": 27.5,
+                "loading_spinner_s": 5.2,
+                "secret": r"C:\Users\secret_alice\dump.bin",
+            },
+            "telemetry": {
+                "bink2_fps_avg": r"/home/secret_bob/bad",
+                "black_loading_s": -2.0,
+            },
+        }
+        p_pre = st.extract_boot_phases_from_report(report_pre)
+        self.assertEqual(p_pre["bink2_video"]["fps_min"], 18.5)
+        self.assertEqual(p_pre["bink2_video"]["fps_median"], 28.0)
+        self.assertEqual(p_pre["bink2_video"]["fps_max"], 34.0)
+        self.assertEqual(p_pre["bink2_video"]["duration_s"], 42.0)
+        self.assertIsNone(p_pre["bink2_video"]["fps_avg"])
+        self.assertEqual(p_pre["menu"]["fps_median"], 29.0)
+        self.assertEqual(p_pre["menu"]["fps_avg"], 27.5)
+        self.assertEqual(p_pre["loading_spinner_s"], 5.2)
+        self.assertIsNone(p_pre["black_loading_s"])
+        serialized = json.dumps(p_pre)
+        self.assertNotIn("secret_alice", serialized)
+        self.assertNotIn("secret_bob", serialized)
+
+        # 3. CLI --boot-report JSON, plain text, and sanitized errors
+        with tempfile.TemporaryDirectory(prefix="playgta6_secret_report_") as tmp:
+            nested = Path(tmp) / "Users" / "secret_alice"
+            nested.mkdir(parents=True)
+            rep_path = nested / "boot-report.json"
+            rep_path.write_text(json.dumps({
+                "schema": "playgta6-boot-report",
+                "presents": _build_synthetic_boot_presents(),
+                "black_loading_s": 2.5,
+            }), encoding="utf-8")
+
+            rc_j, out_j, err_j = self._run_cli(["--boot-report", str(rep_path), "--json"])
+            self.assertEqual(rc_j, 0, err_j)
+            self.assertEqual(err_j, "")
+            for forbidden in (str(rep_path), str(tmp), "secret_alice", "playgta6_secret_report_"):
+                self.assertNotIn(forbidden, out_j)
+            data = json.loads(out_j)
+            self.assertIsNotNone(data["bink2_video"])
+            self.assertIsNotNone(data["menu"])
+            self.assertIsNotNone(data["loading_spinner"])
+
+            rc_t, out_t, err_t = self._run_cli(["--boot-report", str(rep_path)])
+            self.assertEqual(rc_t, 0, err_t)
+            self.assertIn("bink2_video:", out_t)
+            self.assertIn("menu:", out_t)
+            self.assertIn("loading_spinner:", out_t)
+            self.assertNotIn("secret_alice", out_t)
+
+            # Missing boot report -> exit 2, sanitized stderr
+            missing = nested / "missing.json"
+            rc_m, _, err_m = self._run_cli(["--boot-report", str(missing)])
+            self.assertEqual(rc_m, 2)
+            self.assertNotIn("secret_alice", err_m)
+            self.assertNotIn(str(missing), err_m)
+
+            # Both frames_dir and --boot-report -> exit 2
+            rc_both, _, _ = self._run_cli([str(nested), "--boot-report", str(rep_path)])
+            self.assertEqual(rc_both, 2)
+
+            # Neither -> exit 2
+            rc_none, _, _ = self._run_cli([])
+            self.assertEqual(rc_none, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

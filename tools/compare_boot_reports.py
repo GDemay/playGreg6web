@@ -74,10 +74,11 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import gpu_trace  # noqa: E402
+import screen_timeline  # noqa: E402
 
 REPORT_SCHEMA = "playgta6-boot-report"
 CAPTURE_SCHEMA = "playgta6-frame-capture"
@@ -105,6 +106,7 @@ class Comparison:
     entries: list[dict[str, Any]] = field(default_factory=list)
     gpu_delta: dict[str, dict[str, int | float | None]] = field(default_factory=dict)
     telemetry_delta: dict[str, dict[str, Any]] = field(default_factory=dict)
+    phase_delta: dict[str, dict[str, Any]] = field(default_factory=dict)
     gpu_adapter: dict[str, Any] | None = None
     warnings: list[str] = field(default_factory=list)
 
@@ -148,30 +150,32 @@ class Comparison:
 
 
 def load_json(path: Path, schema: str) -> dict[str, Any]:
+    label = screen_timeline.sanitize_path_label(path) or "<file>"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError) as exc:
-        raise InputError(f"cannot read {path}: {exc}") from exc
+        raise InputError(f"cannot read {label}: {screen_timeline.sanitize_text(str(exc))}") from exc
     except json.JSONDecodeError as exc:
-        raise InputError(f"{path} is not valid JSON: {exc}") from exc
+        raise InputError(f"{label} is not valid JSON: {screen_timeline.sanitize_text(str(exc))}") from exc
     if not isinstance(data, dict) or data.get("schema") != schema:
-        raise InputError(f"{path} is not a {schema} file")
+        raise InputError(f"{label} is not a {schema} file")
     return data
 
 
 def load_import_trace(path: Path) -> list[tuple[int, int, str]]:
     """Parses `--import-trace` lines `<seq> <thread> <label> <args...>` to (seq, thread, label)."""
+    label = screen_timeline.sanitize_path_label(path) or "<file>"
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
-        raise InputError(f"cannot read {path}: {exc}") from exc
+        raise InputError(f"cannot read {label}: {screen_timeline.sanitize_text(str(exc))}") from exc
     rows = []
     for line in text.splitlines():
         if not line or line.startswith("#"):
             continue
         parts = line.split(None, 3)
         if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
-            raise InputError(f"{path}: malformed import trace line: {line[:60]!r}")
+            raise InputError(f"{label}: malformed import trace line: {screen_timeline.sanitize_text(line[:60])!r}")
         rows.append((int(parts[0]), int(parts[1]), parts[2]))
     return rows
 
@@ -184,10 +188,11 @@ class Capture:
 
 def load_capture(trace_path: Path) -> Capture:
     sidecar = load_json(Path(str(trace_path) + ".json"), CAPTURE_SCHEMA)
+    label = screen_timeline.sanitize_path_label(trace_path) or "<file>"
     try:
         raw = trace_path.read_bytes()
     except OSError as exc:
-        raise InputError(f"cannot read {trace_path}: {exc}") from exc
+        raise InputError(f"cannot read {label}: {screen_timeline.sanitize_text(str(exc))}") from exc
     return Capture(sidecar, gpu_trace.decode_stream(raw))
 
 
@@ -809,6 +814,26 @@ TELEMETRY_DELTA_METRICS: tuple[str, ...] = (
     "present_fps_avg",
 )
 
+OPTIONAL_TELEMETRY_DELTA_METRICS: tuple[str, ...] = (
+    "fps_steady_avg",
+    "fps_p50_window",
+    "fps_max_window",
+    "windows_ge_30fps_pct",
+)
+
+PHASE_DELTA_METRICS: tuple[str, ...] = (
+    "bink2_fps_min",
+    "bink2_fps_median",
+    "bink2_fps_max",
+    "bink2_fps_avg",
+    "bink2_duration_s",
+    "menu_fps_min",
+    "menu_fps_median",
+    "menu_fps_max",
+    "menu_fps_avg",
+    "loading_spinner_s",
+)
+
 _TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
     "first_visible_frame_s": {"kind": "float", "unit": "s", "better": "lower"},
     "black_loading_s": {"kind": "float", "unit": "s", "better": "lower"},
@@ -817,7 +842,59 @@ _TELEMETRY_METRIC_SPECS: dict[str, dict[str, str]] = {
     "audio_ring_attached": {"kind": "bool", "unit": "", "better": "true"},
     "audio_frames_drained": {"kind": "int", "unit": "", "better": "higher"},
     "present_fps_avg": {"kind": "float", "unit": " fps", "better": "higher"},
+    "fps_steady_avg": {"kind": "float", "unit": " fps", "better": "higher"},
+    "fps_p50_window": {"kind": "float", "unit": " fps", "better": "higher"},
+    "fps_max_window": {"kind": "float", "unit": " fps", "better": "higher"},
+    "windows_ge_30fps_pct": {"kind": "float", "unit": "%", "better": "higher"},
 }
+
+_PHASE_METRIC_SPECS: dict[str, dict[str, str]] = {
+    "bink2_fps_min": {"kind": "float", "unit": " fps", "better": "higher"},
+    "bink2_fps_median": {"kind": "float", "unit": " fps", "better": "higher"},
+    "bink2_fps_max": {"kind": "float", "unit": " fps", "better": "higher"},
+    "bink2_fps_avg": {"kind": "float", "unit": " fps", "better": "higher"},
+    "bink2_duration_s": {"kind": "float", "unit": "s", "better": "neutral"},
+    "menu_fps_min": {"kind": "float", "unit": " fps", "better": "higher"},
+    "menu_fps_median": {"kind": "float", "unit": " fps", "better": "higher"},
+    "menu_fps_max": {"kind": "float", "unit": " fps", "better": "higher"},
+    "menu_fps_avg": {"kind": "float", "unit": " fps", "better": "higher"},
+    "loading_spinner_s": {"kind": "float", "unit": "s", "better": "lower"},
+}
+
+_MULTI_RUN_EXTRA_SPECS: dict[str, dict[str, str]] = {
+    "gpu_validation_errors": {"kind": "int", "unit": "", "better": "lower"},
+}
+
+_ALL_METRIC_SPECS: dict[str, dict[str, str]] = {
+    **_TELEMETRY_METRIC_SPECS,
+    **_PHASE_METRIC_SPECS,
+    **_MULTI_RUN_EXTRA_SPECS,
+}
+
+MULTI_RUN_METRICS: tuple[str, ...] = (
+    "first_visible_frame_s",
+    "black_loading_s",
+    "loading_spinner_s",
+    "bink2_fps_min",
+    "bink2_fps_median",
+    "bink2_fps_max",
+    "bink2_fps_avg",
+    "bink2_duration_s",
+    "menu_fps_min",
+    "menu_fps_median",
+    "menu_fps_max",
+    "menu_fps_avg",
+    "present_fps_avg",
+    "fps_steady_avg",
+    "fps_p50_window",
+    "fps_max_window",
+    "windows_ge_30fps_pct",
+    "audio_frames_drained",
+    "audio_ring_attached",
+    "js_heap_used_mb",
+    "js_heap_total_mb",
+    "gpu_validation_errors",
+)
 
 _BYTES_PER_MIB = 1024.0 * 1024.0
 
@@ -837,7 +914,7 @@ def _format_decimal(value: float, *, signed: bool = False) -> str:
 def _format_telemetry_value(metric: str, value: Any) -> str:
     if value is None:
         return "<missing>"
-    spec = _TELEMETRY_METRIC_SPECS[metric]
+    spec = _ALL_METRIC_SPECS[metric]
     kind = spec["kind"]
     unit = spec["unit"]
     if kind == "bool":
@@ -852,7 +929,7 @@ def _format_telemetry_value(metric: str, value: Any) -> str:
 def _format_telemetry_signed_delta(metric: str, delta: Any) -> str | None:
     if delta is None:
         return None
-    spec = _TELEMETRY_METRIC_SPECS[metric]
+    spec = _ALL_METRIC_SPECS[metric]
     kind = spec["kind"]
     unit = spec["unit"]
     if kind == "bool":
@@ -1157,7 +1234,112 @@ def extract_telemetry_metrics(report: dict[str, Any]) -> dict[str, int | float |
     if present_fps_avg is not None:
         metrics["present_fps_avg"] = present_fps_avg
 
+    # 8. Optional rolling FPS window metrics (omitted when absent so legacy schemas stay identical)
+    for opt_key, camel_key, digits in (
+        ("fps_steady_avg", "fpsSteadyAvg", 2),
+        ("fps_p50_window", "fpsP50Window", 2),
+        ("fps_max_window", "fpsMaxWindow", 2),
+        ("windows_ge_30fps_pct", "windowsGe30fpsPct", 1),
+    ):
+        val = _first_non_negative_number(
+            report.get(opt_key),
+            report.get(camel_key),
+            telemetry.get(opt_key),
+            telemetry.get(camel_key),
+            summary.get(opt_key),
+            summary.get(camel_key),
+            counters.get(opt_key),
+            counters.get(camel_key),
+        )
+        if val is not None:
+            if opt_key == "windows_ge_30fps_pct" and float(val) > 100.0:
+                continue
+            metrics[opt_key] = round(float(val), digits)
+
     return metrics
+
+
+def _build_metric_delta_entry(
+    key: str,
+    in_a: bool,
+    va: Any,
+    in_b: bool,
+    vb: Any,
+) -> dict[str, Any]:
+    spec = _ALL_METRIC_SPECS[key]
+    kind = spec["kind"]
+    better = spec["better"]
+
+    if kind == "bool":
+        if in_a and in_b:
+            changed = bool(va) != bool(vb)
+            transition = f"{'true' if va else 'false'} -> {'true' if vb else 'false'}"
+            if not changed:
+                status = "unchanged"
+            elif vb:
+                status = "improved"
+            else:
+                status = "regressed"
+            return {
+                "a": bool(va),
+                "b": bool(vb),
+                "delta": transition,
+                "changed": changed,
+                "transition": transition,
+                "better": better,
+                "status": status,
+            }
+        return {
+            "a": bool(va) if in_a else None,
+            "b": bool(vb) if in_b else None,
+            "delta": None,
+            "changed": None,
+            "transition": None,
+            "better": better,
+            "status": "added" if not in_a else "removed",
+        }
+
+    if in_a and in_b:
+        if isinstance(va, int) and isinstance(vb, int) and not isinstance(va, bool) and not isinstance(vb, bool):
+            delta: int | float = vb - va
+        else:
+            va = round(float(va), 2)
+            vb = round(float(vb), 2)
+            delta = round(vb - va, 2)
+            if delta == 0.0:
+                delta = 0.0
+        if va != 0:
+            pct: float | None = round(((vb - va) / va) * 100.0, 2)
+        elif vb == 0:
+            pct = 0.0
+        else:
+            pct = None
+        if delta == 0:
+            status = "unchanged"
+        elif better == "lower":
+            status = "improved" if delta < 0 else "regressed"
+        elif better == "higher":
+            status = "improved" if delta > 0 else "regressed"
+        else:
+            status = "changed"
+        return {
+            "a": va,
+            "b": vb,
+            "delta": delta,
+            "pct": pct,
+            "formatted_delta": _format_telemetry_signed_delta(key, delta),
+            "better": better,
+            "status": status,
+        }
+    return {
+        "a": va if in_a else None,
+        "b": vb if in_b else None,
+        "delta": None,
+        "pct": None,
+        "formatted_delta": None,
+        "better": better,
+        "status": "added" if not in_a else "removed",
+    }
 
 
 def compute_telemetry_delta(
@@ -1168,88 +1350,77 @@ def compute_telemetry_delta(
     ma = extract_telemetry_metrics(ra)
     mb = extract_telemetry_metrics(rb)
     out: dict[str, dict[str, Any]] = {}
-    for key in TELEMETRY_DELTA_METRICS:
+    for key in TELEMETRY_DELTA_METRICS + OPTIONAL_TELEMETRY_DELTA_METRICS:
         in_a = key in ma
         in_b = key in mb
         if not in_a and not in_b:
             continue
-        spec = _TELEMETRY_METRIC_SPECS[key]
-        kind = spec["kind"]
-        better = spec["better"]
-        va: Any = ma.get(key)
-        vb: Any = mb.get(key)
+        out[key] = _build_metric_delta_entry(key, in_a, ma.get(key), in_b, mb.get(key))
+    return out
 
-        if kind == "bool":
-            if in_a and in_b:
-                changed = bool(va) != bool(vb)
-                transition = f"{'true' if va else 'false'} -> {'true' if vb else 'false'}"
-                if not changed:
-                    status = "unchanged"
-                elif vb:
-                    status = "improved"
-                else:
-                    status = "regressed"
-                out[key] = {
-                    "a": bool(va),
-                    "b": bool(vb),
-                    "delta": transition,
-                    "changed": changed,
-                    "transition": transition,
-                    "better": better,
-                    "status": status,
-                }
-            else:
-                out[key] = {
-                    "a": bool(va) if in_a else None,
-                    "b": bool(vb) if in_b else None,
-                    "delta": None,
-                    "changed": None,
-                    "transition": None,
-                    "better": better,
-                    "status": "added" if not in_a else "removed",
-                }
+
+def extract_phase_metrics(
+    report: Mapping[str, Any],
+    presents: list[dict[str, Any]] | None = None,
+) -> dict[str, float]:
+    """Extract sanitized phase-by-phase FPS and duration metrics via `screen_timeline`."""
+    if not isinstance(report, Mapping):
+        return {}
+    if presents and not report.get("presents") and not report.get("present_samples"):
+        source: Mapping[str, Any] = {**report, "presents": presents}
+    else:
+        source = report
+    phases = screen_timeline.extract_boot_phases_from_report(source)
+    metrics: dict[str, float] = {}
+
+    bink2 = phases.get("bink2_video")
+    if isinstance(bink2, Mapping):
+        for dst, src_key in (
+            ("bink2_fps_min", "fps_min"),
+            ("bink2_fps_median", "fps_median"),
+            ("bink2_fps_max", "fps_max"),
+            ("bink2_fps_avg", "fps_avg"),
+            ("bink2_duration_s", "duration_s"),
+        ):
+            val = _non_negative_number(bink2.get(src_key))
+            if val is not None:
+                metrics[dst] = round(float(val), 2)
+
+    menu = phases.get("menu")
+    if isinstance(menu, Mapping):
+        for dst, src_key in (
+            ("menu_fps_min", "fps_min"),
+            ("menu_fps_median", "fps_median"),
+            ("menu_fps_max", "fps_max"),
+            ("menu_fps_avg", "fps_avg"),
+        ):
+            val = _non_negative_number(menu.get(src_key))
+            if val is not None:
+                metrics[dst] = round(float(val), 2)
+
+    spinner_s = _non_negative_number(phases.get("loading_spinner_s"))
+    if spinner_s is not None:
+        metrics["loading_spinner_s"] = round(float(spinner_s), 2)
+
+    return metrics
+
+
+def compute_phase_delta(
+    ra: Mapping[str, Any],
+    rb: Mapping[str, Any],
+    pa: list[dict[str, Any]] | None = None,
+    pb: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Build a strictly-sanitized delta map for boot-phase FPS and duration metrics."""
+    ma = extract_phase_metrics(ra, pa)
+    mb = extract_phase_metrics(rb, pb)
+    out: dict[str, dict[str, Any]] = {}
+    for key in PHASE_DELTA_METRICS:
+        in_a = key in ma
+        in_b = key in mb
+        if not in_a and not in_b:
             continue
-
-        if in_a and in_b:
-            if isinstance(va, int) and isinstance(vb, int):
-                delta: int | float = vb - va
-            else:
-                va = round(float(va), 2)
-                vb = round(float(vb), 2)
-                delta = round(vb - va, 2)
-                if delta == 0.0:
-                    delta = 0.0
-            if va != 0:
-                pct: float | None = round(((vb - va) / va) * 100.0, 2)
-            elif vb == 0:
-                pct = 0.0
-            else:
-                pct = None
-            if delta == 0:
-                status = "unchanged"
-            elif better == "lower":
-                status = "improved" if delta < 0 else "regressed"
-            else:
-                status = "improved" if delta > 0 else "regressed"
-            out[key] = {
-                "a": va,
-                "b": vb,
-                "delta": delta,
-                "pct": pct,
-                "formatted_delta": _format_telemetry_signed_delta(key, delta),
-                "better": better,
-                "status": status,
-            }
-        else:
-            out[key] = {
-                "a": va if in_a else None,
-                "b": vb if in_b else None,
-                "delta": None,
-                "pct": None,
-                "formatted_delta": None,
-                "better": better,
-                "status": "added" if not in_a else "removed",
-            }
+        out[key] = _build_metric_delta_entry(key, in_a, ma.get(key), in_b, mb.get(key))
     return out
 
 
@@ -1316,6 +1487,7 @@ def compare(
         c.warnings.append(adapter_warning)
     c.gpu_delta = compute_gpu_delta(ra, rb, pa, pb)
     c.telemetry_delta = compute_telemetry_delta(ra, rb)
+    c.phase_delta = compute_phase_delta(ra, rb, pa, pb)
     return c
 
 
@@ -1349,6 +1521,8 @@ def to_result(c: Comparison) -> dict[str, Any]:
         result["gpu_delta"] = c.gpu_delta
     if c.telemetry_delta:
         result["telemetry_delta"] = c.telemetry_delta
+    if c.phase_delta:
+        result["phase_delta"] = c.phase_delta
     return result
 
 
@@ -1369,7 +1543,7 @@ def _format_telemetry_delta_line(metric: str, item: dict[str, Any]) -> str:
     a_str = _format_telemetry_value(metric, item.get("a"))
     b_str = _format_telemetry_value(metric, item.get("b"))
     status = item.get("status")
-    spec = _TELEMETRY_METRIC_SPECS[metric]
+    spec = _ALL_METRIC_SPECS[metric]
     if spec["kind"] == "bool":
         if item.get("delta") is None:
             return f"  {metric}: {a_str} -> {b_str} (n/a, {status})"
@@ -1416,14 +1590,107 @@ def format_text(c: Comparison, verbose: bool = False) -> str:
         lines.append("[telemetry_delta]")
         for metric, item in c.telemetry_delta.items():
             lines.append(_format_telemetry_delta_line(metric, item))
+    if c.phase_delta:
+        lines.append("[phase_delta]")
+        for metric, item in c.phase_delta.items():
+            lines.append(_format_telemetry_delta_line(metric, item))
     lines.append(
         f"verdict: {result['verdict'].upper()} ({result['differences']} difference(s) in {result['checked']} checks)"
     )
     return "\n".join(lines)
 
 
-def format_markdown(c: Comparison, verbose: bool = False) -> str:
+_RUN_LABEL_SAFE_RE = re.compile(r"[^A-Za-z0-9._:/+#\- ]")
+_RUN_LABEL_MAX_LEN = 64
+
+
+def sanitize_run_label(raw: str | Path | None, fallback: str = "run") -> str:
+    """Sanitize a run label so no host paths, usernames, control chars, or Markdown pipes leak."""
+    if raw is None:
+        return fallback
+    text = str(raw).strip()
+    if not text:
+        return fallback
+    if isinstance(raw, Path) or "/" in text or "\\" in text or re.match(r"(?i)^[A-Za-z]:", text):
+        text = screen_timeline.sanitize_path_label(text)
+    else:
+        text = screen_timeline.sanitize_text(text)
+    if text.lower().endswith(".json") and len(text) > 5:
+        text = text[:-5]
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in text):
+        text = "".join(ch if 32 <= ord(ch) < 127 else " " for ch in text)
+    text = _RUN_LABEL_SAFE_RE.sub("", text)
+    text = " ".join(text.split())
+    if len(text) > _RUN_LABEL_MAX_LEN:
+        text = text[:_RUN_LABEL_MAX_LEN].rstrip()
+    if not text or text == "<redacted>" or not any(ch.isalnum() for ch in text):
+        return fallback
+    return text
+
+
+def _derive_run_labels(
+    count: int,
+    raw_labels: Sequence[str | Path] | None = None,
+    source_paths: Sequence[Path] | None = None,
+) -> list[str]:
+    out: list[str] = []
+    if raw_labels is not None:
+        for idx, raw in enumerate(raw_labels, start=1):
+            out.append(sanitize_run_label(raw, fallback=f"run{idx}"))
+    elif source_paths is not None:
+        base_labels = [
+            sanitize_run_label(path, fallback=f"run{idx}")
+            for idx, path in enumerate(source_paths, start=1)
+        ]
+        counts = Counter(base_labels)
+        seen: Counter[str] = Counter()
+        for idx, lbl in enumerate(base_labels, start=1):
+            if counts[lbl] > 1:
+                seen[lbl] += 1
+                out.append(f"{lbl}#{seen[lbl]}")
+            else:
+                out.append(lbl)
+    else:
+        out = [f"run{idx}" for idx in range(1, count + 1)]
+    return out
+
+
+def _format_markdown_metric_delta_table(
+    title: str,
+    delta_map: Mapping[str, Mapping[str, Any]],
+    col_a: str,
+    col_b: str,
+) -> list[str]:
+    lines = [
+        "",
+        f"### {title}",
+        f"| Metric | {col_a} | {col_b} | Delta | % | Status |",
+        "|---|---:|---:|---:|---:|---|",
+    ]
+    for metric, item in delta_map.items():
+        a_str = _format_telemetry_value(metric, item.get("a")) if item.get("a") is not None else "—"
+        b_str = _format_telemetry_value(metric, item.get("b")) if item.get("b") is not None else "—"
+        spec = _ALL_METRIC_SPECS[metric]
+        if spec["kind"] == "bool":
+            delta_str = item.get("transition") or "—"
+            pct_str = "—"
+        else:
+            delta_str = item.get("formatted_delta") or "—"
+            pct = item.get("pct")
+            pct_str = f"{pct:+.1f}%" if (item.get("delta") not in (None, 0) and pct is not None) else "—"
+        status_str = str(item.get("status") or "—")
+        lines.append(f"| `{metric}` | {a_str} | {b_str} | {delta_str} | {pct_str} | {status_str} |")
+    return lines
+
+
+def format_markdown(
+    c: Comparison,
+    verbose: bool = False,
+    labels: tuple[str, str] | None = None,
+) -> str:
     """Format the comparison result as clean GitHub-flavored Markdown."""
+    col_a = sanitize_run_label(labels[0], fallback="Baseline") if labels is not None else "Baseline"
+    col_b = sanitize_run_label(labels[1], fallback="Candidate") if labels is not None else "Candidate"
     result = to_result(c)
     lines = [
         f"## Boot Report Comparison — {result['verdict'].upper()} "
@@ -1433,7 +1700,7 @@ def format_markdown(c: Comparison, verbose: bool = False) -> str:
     if shown:
         lines.append("")
         lines.append("### Checks" if verbose else "### Differences")
-        lines.append("| Field | Status | Baseline | Candidate | Mode |")
+        lines.append(f"| Field | Status | {col_a} | {col_b} | Mode |")
         lines.append("|---|---|---|---|---|")
         for e in shown:
             st = "ok" if e["ok"] else "DIFF"
@@ -1451,27 +1718,13 @@ def format_markdown(c: Comparison, verbose: bool = False) -> str:
         for warning in c.warnings:
             lines.append(f"- {warning}")
     if c.telemetry_delta:
-        lines.append("")
-        lines.append("### Telemetry Delta")
-        lines.append("| Metric | Baseline | Candidate | Delta | % | Status |")
-        lines.append("|---|---:|---:|---:|---:|---|")
-        for metric, item in c.telemetry_delta.items():
-            a_str = _format_telemetry_value(metric, item.get("a")) if item.get("a") is not None else "—"
-            b_str = _format_telemetry_value(metric, item.get("b")) if item.get("b") is not None else "—"
-            spec = _TELEMETRY_METRIC_SPECS[metric]
-            if spec["kind"] == "bool":
-                delta_str = item.get("transition") or "—"
-                pct_str = "—"
-            else:
-                delta_str = item.get("formatted_delta") or "—"
-                pct = item.get("pct")
-                pct_str = f"{pct:+.1f}%" if (item.get("delta") not in (None, 0) and pct is not None) else "—"
-            status_str = str(item.get("status") or "—")
-            lines.append(f"| `{metric}` | {a_str} | {b_str} | {delta_str} | {pct_str} | {status_str} |")
+        lines.extend(_format_markdown_metric_delta_table("Telemetry Delta", c.telemetry_delta, col_a, col_b))
+    if c.phase_delta:
+        lines.extend(_format_markdown_metric_delta_table("Phase Delta", c.phase_delta, col_a, col_b))
     if c.gpu_delta:
         lines.append("")
         lines.append("### GPU Delta")
-        lines.append("| Metric | Baseline | Candidate | Delta | % |")
+        lines.append(f"| Metric | {col_a} | {col_b} | Delta | % |")
         lines.append("|---|---:|---:|---:|---:|")
         for metric, item in c.gpu_delta.items():
             unit = _GPU_DELTA_UNITS.get(metric, "")
@@ -1487,14 +1740,199 @@ def format_markdown(c: Comparison, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
+def build_multi_run_summary(
+    reports: Sequence[Mapping[str, Any]],
+    labels: Sequence[str] | None = None,
+) -> dict[str, Any]:
+    """Build a strictly-sanitized side-by-side comparison across 2 or more boot reports."""
+    if len(reports) < 2:
+        raise ValueError("build_multi_run_summary requires at least 2 reports")
+    if labels is not None and len(labels) != len(reports):
+        raise ValueError("labels length must match reports length")
+
+    clean_labels = _derive_run_labels(len(reports), raw_labels=labels)
+    per_run_metrics: list[dict[str, Any]] = []
+    adapters: list[str | None] = []
+    for raw_report in reports:
+        rep = dict(raw_report) if isinstance(raw_report, Mapping) else {}
+        telemetry = extract_telemetry_metrics(rep)
+        phases = extract_phase_metrics(rep)
+        gpu = extract_gpu_metrics(rep)
+        combined: dict[str, Any] = {}
+        combined.update(telemetry)
+        combined.update(phases)
+        gve = _non_negative_number(gpu.get("gpu_validation_errors"))
+        if gve is not None:
+            combined["gpu_validation_errors"] = int(gve) if float(gve).is_integer() else round(float(gve), 2)
+        per_run_metrics.append(combined)
+        adapters.append(extract_gpu_adapter(rep))
+
+    metrics_out: dict[str, dict[str, Any]] = {}
+    for key in MULTI_RUN_METRICS:
+        vals = [run.get(key) for run in per_run_metrics]
+        if all(v is None for v in vals):
+            continue
+        in_first = key in per_run_metrics[0]
+        in_last = key in per_run_metrics[-1]
+        entry = _build_metric_delta_entry(key, in_first, vals[0], in_last, vals[-1])
+        metrics_out[key] = {
+            "values": vals,
+            "by_label": {lbl: val for lbl, val in zip(clean_labels, vals)},
+            "first": vals[0],
+            "last": vals[-1],
+            "delta": entry.get("delta"),
+            "pct": entry.get("pct"),
+            "formatted_delta": entry.get("formatted_delta", entry.get("transition")),
+            "better": entry.get("better"),
+            "status": entry.get("status"),
+        }
+
+    warnings: list[str] = []
+    known_adapters = [a for a in adapters if a is not None]
+    canonical_set = {_canonical_gpu_adapter(a) for a in known_adapters}
+    if len(canonical_set) > 1:
+        shown = ", ".join(
+            f"{lbl}={a if a is not None else '<unknown>'}"
+            for lbl, a in zip(clean_labels, adapters)
+        )
+        warnings.append(
+            f"gpu_adapter mismatch across runs ({shown}); timing deltas may reflect different GPU adapters"
+        )
+
+    summary: dict[str, Any] = {
+        "labels": clean_labels,
+        "run_count": len(reports),
+        "delta_pair": [clean_labels[0], clean_labels[-1]],
+        "metrics": metrics_out,
+    }
+    if any(a is not None for a in adapters):
+        summary["gpu_adapters"] = adapters
+    if warnings:
+        summary["warnings"] = warnings
+    return screen_timeline.sanitize_json_payload(summary)
+
+
+def _format_multi_run_delta_cell(metric: str, item: Mapping[str, Any]) -> str:
+    spec = _ALL_METRIC_SPECS[metric]
+    if spec["kind"] == "bool":
+        return str(item.get("formatted_delta") or "—")
+    formatted = item.get("formatted_delta")
+    if formatted is None:
+        return "—"
+    pct = item.get("pct")
+    if item.get("delta") not in (None, 0) and pct is not None:
+        return f"{formatted} ({pct:+.1f}%)"
+    return str(formatted)
+
+
+def format_multi_run_markdown(summary: Mapping[str, Any]) -> str:
+    """Render a strictly-sanitized GitHub-ready Markdown table for a multi-run summary."""
+    labels = [sanitize_run_label(lbl, fallback=f"run{i}") for i, lbl in enumerate(summary.get("labels") or [], start=1)]
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), Mapping) else {}
+    first_lbl = labels[0] if labels else "first"
+    last_lbl = labels[-1] if labels else "last"
+
+    title_runs = " vs ".join(labels) if labels else "runs"
+    lines = [f"## Multi-Run Boot Comparison ({title_runs})"]
+
+    adapters = summary.get("gpu_adapters")
+    if isinstance(adapters, list) and any(a is not None for a in adapters):
+        lines.append("")
+        lines.append("### GPU Adapters")
+        for lbl, adp in zip(labels, adapters):
+            lines.append(f"- `{lbl}`: `{adp if adp is not None else '<unknown>'}`")
+
+    warnings = summary.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        lines.append("")
+        lines.append("### Warnings")
+        for w in warnings:
+            lines.append(f"- {screen_timeline.sanitize_text(str(w))}")
+
+    lines.append("")
+    if not metrics:
+        lines.append("_No comparable telemetry or phase metrics found._")
+        return screen_timeline.sanitize_text("\n".join(lines))
+
+    header_cells = ["Metric", *labels, f"Delta ({first_lbl} -> {last_lbl})"]
+    align_cells = ["---", *("---:" for _ in labels), "---:"]
+    lines.append("| " + " | ".join(header_cells) + " |")
+    lines.append("|" + "|".join(align_cells) + "|")
+
+    for metric, item in metrics.items():
+        if metric not in _ALL_METRIC_SPECS or not isinstance(item, Mapping):
+            continue
+        vals = item.get("values") if isinstance(item.get("values"), list) else []
+        rendered_vals = [
+            _format_telemetry_value(metric, v) if v is not None else "—"
+            for v in vals
+        ]
+        delta_cell = _format_multi_run_delta_cell(metric, item)
+        lines.append(f"| `{metric}` | " + " | ".join(rendered_vals) + f" | {delta_cell} |")
+
+    return screen_timeline.sanitize_text("\n".join(lines))
+
+
+def format_multi_run_text(summary: Mapping[str, Any]) -> str:
+    """Render a strictly-sanitized plain-text table for a multi-run summary."""
+    labels = [sanitize_run_label(lbl, fallback=f"run{i}") for i, lbl in enumerate(summary.get("labels") or [], start=1)]
+    metrics = summary.get("metrics") if isinstance(summary.get("metrics"), Mapping) else {}
+    first_lbl = labels[0] if labels else "first"
+    last_lbl = labels[-1] if labels else "last"
+
+    lines = [f"Multi-Run Boot Comparison ({' vs '.join(labels)})"]
+    adapters = summary.get("gpu_adapters")
+    if isinstance(adapters, list) and any(a is not None for a in adapters):
+        lines.append("[gpu_adapters]")
+        for lbl, adp in zip(labels, adapters):
+            lines.append(f"  {lbl}: {adp if adp is not None else '<unknown>'}")
+    warnings = summary.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        lines.append("[warnings]")
+        for w in warnings:
+            lines.append(f"  WARN {screen_timeline.sanitize_text(str(w))}")
+
+    if not metrics:
+        lines.append("  (no comparable telemetry or phase metrics)")
+        return screen_timeline.sanitize_text("\n".join(lines))
+
+    delta_header = f"Delta ({first_lbl} -> {last_lbl})"
+    rows: list[list[str]] = [["Metric", *labels, delta_header]]
+    for metric, item in metrics.items():
+        if metric not in _ALL_METRIC_SPECS or not isinstance(item, Mapping):
+            continue
+        vals = item.get("values") if isinstance(item.get("values"), list) else []
+        rendered_vals = [_format_telemetry_value(metric, v) for v in vals]
+        delta_cell = _format_multi_run_delta_cell(metric, item)
+        rows.append([metric, *rendered_vals, delta_cell])
+
+    col_widths = [max(len(row[c]) for row in rows) for c in range(len(rows[0]))]
+    for r_idx, row in enumerate(rows):
+        padded = [
+            row[c].ljust(col_widths[c]) if c == 0 else row[c].rjust(col_widths[c])
+            for c in range(len(row))
+        ]
+        lines.append("  " + "  ".join(padded))
+        if r_idx == 0:
+            lines.append("  " + "  ".join("-" * w for w in col_widths))
+
+    return screen_timeline.sanitize_text("\n".join(lines))
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Compare two native boot runs (playgta6_boot reports, optional GPU captures and "
-        "import traces) and print a structured diff with a pass/fail verdict.",
+        description="Compare two native/browser boot runs (with pass/fail verdict) or render a "
+        "multi-run comparison table with --reports.",
         epilog="Exit code: 0 pass, 1 differences, 2 usage error. See the module docstring for the compared fields.",
     )
-    p.add_argument("report_a", type=Path, help="boot report JSON of run A (playgta6_boot --report)")
-    p.add_argument("report_b", type=Path, help="boot report JSON of run B")
+    p.add_argument("report_a", nargs="?", default=None, type=Path,
+                   help="boot report JSON of run A (playgta6_boot --report)")
+    p.add_argument("report_b", nargs="?", default=None, type=Path,
+                   help="boot report JSON of run B")
+    p.add_argument("--reports", nargs="+", type=Path, default=None, metavar="REPORT",
+                   help="compare 2 or more boot report JSON files side-by-side (multi-run table)")
+    p.add_argument("--labels", nargs="+", type=str, default=None, metavar="LABEL",
+                   help="sanitized run labels matching --reports (or report_a report_b for --markdown)")
     p.add_argument("--capture", nargs=2, type=Path, metavar=("A", "B"),
                    help="GPU captures (.pg6trace; the .json sidecar is read next to each)")
     p.add_argument("--import-trace", nargs=2, type=Path, metavar=("A", "B"),
@@ -1524,6 +1962,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.as_json and args.as_markdown:
         print("error: --json and --markdown are mutually exclusive", file=sys.stderr)
         return 2
+
+    if args.reports is not None:
+        if args.report_a is not None or args.report_b is not None:
+            print("error: --reports cannot be combined with positional report_a/report_b", file=sys.stderr)
+            return 2
+        if args.capture or args.import_trace or args.min_fps_ratio is not None:
+            print("error: --reports cannot be combined with --capture, --import-trace, or --min-fps-ratio", file=sys.stderr)
+            return 2
+        if len(args.reports) < 2:
+            print("error: --reports requires at least 2 boot reports", file=sys.stderr)
+            return 2
+        if args.labels is not None and len(args.labels) != len(args.reports):
+            print("error: --labels count must match --reports count", file=sys.stderr)
+            return 2
+        try:
+            loaded_reports = [load_json(p, REPORT_SCHEMA) for p in args.reports]
+        except InputError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        derived_labels = _derive_run_labels(
+            len(loaded_reports),
+            raw_labels=args.labels,
+            source_paths=args.reports,
+        )
+        summary = build_multi_run_summary(loaded_reports, derived_labels)
+        if args.as_json:
+            print(json.dumps(summary, indent=2))
+        elif args.as_markdown:
+            print(format_multi_run_markdown(summary))
+        else:
+            print(format_multi_run_text(summary))
+        return 0
+
+    if args.report_a is None or args.report_b is None:
+        print("error: report_a and report_b (or --reports A B ...) are required", file=sys.stderr)
+        return 2
+    pair_labels: tuple[str, str] | None = None
+    if args.labels is not None:
+        if len(args.labels) != 2:
+            print("error: --labels requires exactly 2 labels for 2-report comparison", file=sys.stderr)
+            return 2
+        derived = _derive_run_labels(2, raw_labels=args.labels)
+        pair_labels = (derived[0], derived[1])
     if args.import_trace and not args.capture:
         print("error: --import-trace needs --capture", file=sys.stderr)
         return 2
@@ -1556,7 +2037,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.as_json:
         print(json.dumps(to_result(c), indent=2))
     elif args.as_markdown:
-        print(format_markdown(c, args.verbose))
+        print(format_markdown(c, args.verbose, labels=pair_labels))
     else:
         print(format_text(c, args.verbose))
     return 1 if c.failures() else 0
