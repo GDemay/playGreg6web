@@ -49,31 +49,42 @@ public:
         uint32_t version, count;
         std::memcpy(&version, head + 4, 4);
         std::memcpy(&count, head + 8, 4);
-        if (version != 1) return fail("unsupported WGPK pack version");
+        if (version != 1 && version != 2) return fail("unsupported WGPK pack version");
+        // v1: 20-byte entries {hash u64, stage u8, pad[3], offset u32, length u32}; v2 (merged packs,
+        // > 4 GiB): 24-byte entries {hash u64, stage u8, pad[3], length u32, offset u64}.
+        const size_t entry_bytes = version == 2 ? 24 : 20;
         std::fseek(f, 0, SEEK_END);
 #ifdef _WIN32
         const uint64_t size = static_cast<uint64_t>(_ftelli64(f));
 #else
         const uint64_t size = static_cast<uint64_t>(std::ftell(f));
 #endif
-        const uint64_t data_start = 16 + uint64_t{count} * 20;
+        const uint64_t data_start = 16 + uint64_t{count} * entry_bytes;
         if (size < data_start) return fail("WGPK pack truncated (entry table)");
         std::fseek(f, 16, SEEK_SET);
-        std::vector<uint8_t> table(size_t{count} * 20);
+        std::vector<uint8_t> table(size_t{count} * entry_bytes);
         if (!table.empty() && std::fread(table.data(), 1, table.size(), f) != table.size())
             return fail("WGPK pack truncated (entry table)");
         entries_.clear();
         entries_.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
-            const uint8_t* e = table.data() + size_t{i} * 20;
-            uint64_t hash;
-            uint32_t offset, length;
+            const uint8_t* e = table.data() + size_t{i} * entry_bytes;
+            uint64_t hash, offset;
+            uint32_t length;
             std::memcpy(&hash, e, 8);
-            std::memcpy(&offset, e + 12, 4);
-            std::memcpy(&length, e + 16, 4);
+            if (version == 2) {
+                std::memcpy(&length, e + 12, 4);
+                std::memcpy(&offset, e + 16, 8);
+            } else {
+                uint32_t o32, l32;
+                std::memcpy(&o32, e + 12, 4);
+                std::memcpy(&l32, e + 16, 4);
+                offset = o32;
+                length = l32;
+            }
             const uint8_t stage = e[8];
             if (stage < 1 || stage > 3) return fail("invalid WGPK shader stage");
-            if (offset < data_start || uint64_t{offset} + length > size) return fail("WGPK entry out of bounds");
+            if (offset < data_start || offset > size || offset + length > size) return fail("WGPK entry out of bounds");
             entries_[hash] = Entry{stage, offset, length};
         }
         path_ = path;

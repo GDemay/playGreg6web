@@ -295,6 +295,32 @@ void test_pack() {
         CHECK(!bad.load("test_native_exec_model.does-not-exist", &err));
     }
     std::remove(path);
+
+    // WGPK v2 (merged packs): 24-byte entries {hash, stage, pad, length u32, offset u64}; the live run
+    // logged shader_pack_hits 0 because the executor's own loader accepted v1 only.
+    std::vector<uint8_t> v2 = {'W', 'G', 'P', 'K', 2, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+    auto w32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) v2.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    auto w64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) v2.push_back(static_cast<uint8_t>(v >> (8 * i))); };
+    const uint64_t ds2 = 16 + 2 * 24;
+    w64(0x1111); v2.push_back(1); v2.insert(v2.end(), 3, 0); w32(static_cast<uint32_t>(a.size())); w64(ds2);
+    w64(0x2222); v2.push_back(2); v2.insert(v2.end(), 3, 0); w32(static_cast<uint32_t>(b.size())); w64(ds2 + a.size());
+    v2.insert(v2.end(), a.begin(), a.end());
+    v2.insert(v2.end(), b.begin(), b.end());
+    const char* path2 = "test_native_exec_model_v2.wgsl.pack";
+    FILE* f2 = std::fopen(path2, "wb");
+    CHECK(f2 != nullptr);
+    if (!f2) return;
+    std::fwrite(v2.data(), 1, v2.size(), f2);
+    std::fclose(f2);
+    {
+        WgslPack p;
+        std::string err;
+        CHECK(p.load(path2, &err));
+        CHECK(p.size() == 2 && p.has(0x1111) && p.has(0x2222));
+        CHECK(p.get(0x2222) == b);
+        CHECK(p.get(0x1111) == a);
+    }
+    std::remove(path2);
 }
 
 void test_formats() {
