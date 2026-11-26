@@ -160,6 +160,46 @@ const INDEX_FORMAT_NAMES = Object.freeze(['uint16', 'uint32']);
 
 const DEFAULT_CLEAR_COLOR = Object.freeze({ r: 0.05, g: 0.07, b: 0.11, a: 1.0 });
 
+const MAX_PASS_COMMAND_POOL_SIZE = 16384;
+const WGPU_META_BEGIN_RENDER_PASS = Object.freeze({ kind: 'beginRenderPass' });
+const WGPU_META_END_RENDER_PASS = Object.freeze({ kind: 'endRenderPass' });
+const SENTINEL_BOUND_BIND_GROUP = Object.freeze({ bound: true });
+const DRAIN_DEFERRED_OPTS_IMMEDIATE = Object.freeze({ immediate: true });
+const DRAIN_DEFERRED_OPTS_DEFERRED = Object.freeze({ immediate: false });
+const DRAIN_RING_REUSE_OPTS = Object.freeze({ reuseResult: true });
+
+function createPassCommandSlot() {
+  return {
+    type: '',
+    pipelineId: 0,
+    pipeline: null,
+    slot: 0,
+    bufferId: 0,
+    offset: 0,
+    indexFormat: 'uint16',
+    groupIndex: 0,
+    bindGroupId: 0,
+    bindGroup: null,
+    vertexCount: 0,
+    instanceCount: 0,
+    firstVertex: 0,
+    firstInstance: 0,
+    indexCount: 0,
+    firstIndex: 0,
+    baseVertex: 0,
+    workgroupX: 0,
+    workgroupY: 0,
+    workgroupZ: 0,
+    _wgpuMeta: null,
+  };
+}
+
+function readUint64AsNumber(view, offset) {
+  const lo = view.getUint32(offset, true);
+  const hi = view.getUint32(offset + 4, true);
+  return hi === 0 ? lo : hi * 4294967296 + lo;
+}
+
 const DEFAULT_MAX_VALIDATION_ERROR_HISTORY = 32;
 const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
@@ -2164,7 +2204,7 @@ class WgpuCommandProcessor {
     this._frameStartMs = null;
     this._gpuAdapter =
       options.gpuAdapter && typeof options.gpuAdapter === 'object'
-        ? sanitizeGpuAdapterInfo(options.gpuAdapter)
+        ? Object.freeze(sanitizeGpuAdapterInfo(options.gpuAdapter))
         : null;
     this._ownsDrawExecutor = false;
     this.drawExecutor =
@@ -2195,17 +2235,100 @@ class WgpuCommandProcessor {
         ? options.resourceTable
         : null;
     this._zeroAllocDrains = 0;
-    this._zeroAllocDrainOpts = { reuseResult: true };
+    this._zeroAllocDrainOpts = { reuseResult: true, directView: true };
     this._zeroAllocDrainPresents = 0;
     this._zeroAllocDrainSpanBytes = 0;
-    this._onZeroAllocDrainSpan = (bytesView, byteOffset, byteLength) => {
-      const viewBytes =
-        byteOffset === 0 && byteLength === bytesView.byteLength
-          ? bytesView
-          : bytesView.subarray(byteOffset, byteOffset + byteLength);
-      this._zeroAllocDrainSpanBytes = viewBytes.byteLength;
-      const execRes = this.executeCommandBuffer(viewBytes);
-      this._zeroAllocDrainPresents += execRes.presents;
+    this._cachedCmdBuffer = null;
+    this._cachedCmdView = null;
+    this._drainRingResultScratch = { frameCount: 0, presents: 0, bytesDrained: 0 };
+    this._executeResultScratch = { frameCount: 0, presents: 0 };
+    this._onZeroAllocDrainSpan = (bytesView, byteOffset, byteLength, span) => {
+      this._zeroAllocDrainSpanBytes = byteLength;
+      if (span && span.dataView instanceof DataView) {
+        const viewStart = typeof span.viewOffset === 'number' ? span.viewOffset : 0;
+        this._zeroAllocDrainPresents += this._executeCommandView(
+          span.dataView,
+          viewStart,
+          viewStart + byteLength
+        );
+        return;
+      }
+      const view = this._getCachedDataView(bytesView.buffer);
+      const viewStart = bytesView.byteOffset + byteOffset;
+      this._zeroAllocDrainPresents += this._executeCommandView(
+        view,
+        viewStart,
+        viewStart + byteLength
+      );
+    };
+    // W359: Reusable per-frame pass command pool, binding maps/slots, and present scratch state
+    // so steady-state 60 Hz draw & present loops incur zero per-packet/per-frame JS allocations.
+    this._clearColor = DEFAULT_CLEAR_COLOR;
+    this._lastCustomClearColor = null;
+    this._reusablePassCommands = [];
+    this._passCommands = this._reusablePassCommands;
+    this._passCommandPool = [];
+    this._passCommandPoolUsed = 0;
+    this._setBindGroup2MetaPool = [];
+    this._setBindGroup2MetaPoolUsed = 0;
+    this._boundBindGroups = new Map();
+    this._boundVertexBuffers = new Map();
+    this._boundBindGroupSlots = new Map();
+    this._boundVertexBufferSlots = new Map();
+    this._fallbackProfileStateScratch = {
+      vertexCount: 0,
+      instanceCount: 0,
+      vertexStride: 0,
+      bindGroups: this._boundBindGroups,
+      vertexBuffers: this._boundVertexBuffers,
+    };
+    this._frameHintsScratch = {
+      sceneTransition: false,
+      resolutionChanged: false,
+      isIdleFrame: false,
+    };
+    this._markFrameContentScratch = {
+      hasNonClearDraw: false,
+      nonClearDraw: false,
+      hasVisibleContent: false,
+      hasDraws: false,
+      realPackDraws: 0,
+      fallbackDraws: 0,
+      drawsThisFrame: 0,
+      timestampMs: 0,
+    };
+    this._presentState = {
+      encoder: null,
+      activeSwapchain: null,
+      swapchainTexture: null,
+      swapchainView: null,
+      activePass: null,
+      activePassKind: null,
+      renderPassOpened: false,
+      renderPassIdx: 0,
+      computePassIdx: 0,
+      timerSupported: false,
+      activePipelineId: null,
+      specializedActiveKey: null,
+      cachedFrameSummary: null,
+    };
+    const presentState = this._presentState;
+    this._passControl = {
+      encoder: null,
+      swapchainTexture: null,
+      swapchainView: null,
+      canvasWidth: undefined,
+      canvasHeight: undefined,
+      swapchainWidth: undefined,
+      swapchainHeight: undefined,
+      get pass() {
+        return presentState.activePass;
+      },
+      get passKind() {
+        return presentState.activePassKind;
+      },
+      endPass: () => this._endPresentActivePass(),
+      beginRenderPass: (descriptor) => this._beginExtensionRenderPass(descriptor),
     };
     this._reclaimedOversizedBytes = 0;
     this._oversizedRtReclaimIdleFrames = resolvePositiveIntOption(
@@ -2712,6 +2835,8 @@ class WgpuCommandProcessor {
     this._specializedFallbackBindGroups = new Map();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
+    this._pendingCommandStreamStartOffset = 0;
+    this._pendingCommandStreamEndOffset = 0;
     this._pendingCommandStreamScanned = true;
     this._fallbackProfileScanCount = 0;
     this._fallbackProfileCounts = {
@@ -2867,7 +2992,7 @@ class WgpuCommandProcessor {
   }
 
   get gpuAdapter() {
-    return this._gpuAdapter ? { ...this._gpuAdapter } : null;
+    return this._gpuAdapter;
   }
 
   get chunkedWriteBufferUploads() {
@@ -2877,7 +3002,7 @@ class WgpuCommandProcessor {
   setGpuAdapter(adapterInfo) {
     this._gpuAdapter =
       adapterInfo && typeof adapterInfo === 'object'
-        ? sanitizeGpuAdapterInfo(adapterInfo)
+        ? Object.freeze(sanitizeGpuAdapterInfo(adapterInfo))
         : null;
   }
 
@@ -3404,13 +3529,17 @@ class WgpuCommandProcessor {
       this._pendingCommandStreamScanned = true;
       const view = this._pendingCommandStreamView;
       if (view) {
-        this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(view);
+        this._pendingCommandStreamShaderProfiles = this._scanCommandBufferFallbackProfiles(
+          view,
+          this._pendingCommandStreamStartOffset,
+          this._pendingCommandStreamEndOffset
+        );
       }
     }
     return this._pendingCommandStreamShaderProfiles;
   }
 
-  _scanCommandBufferFallbackProfiles(view) {
+  _scanCommandBufferFallbackProfiles(view, startOffset = 0, endOffset = view.byteLength) {
     if (!this.shaderFallbackRouter || typeof this.shaderFallbackRouter.resolve !== 'function') {
       return null;
     }
@@ -3434,12 +3563,13 @@ class WgpuCommandProcessor {
       }
     };
 
-    let offset = 0;
-    while (offset + 8 <= view.byteLength) {
+    const limit = Math.min(view.byteLength, endOffset);
+    let offset = startOffset;
+    while (offset + 8 <= limit) {
       const opcode = view.getUint16(offset, true);
       const payloadBytes = view.getUint32(offset + 4, true);
       const payloadOffset = offset + 8;
-      if (payloadOffset + payloadBytes > view.byteLength) break;
+      if (payloadOffset + payloadBytes > limit) break;
 
       switch (opcode) {
         case OPCODES.BEGIN_FRAME:
@@ -3761,15 +3891,11 @@ class WgpuCommandProcessor {
             ...info,
             timestampMs: ts,
             gpuAdapter:
-              info.gpuAdapter !== undefined
-                ? info.gpuAdapter
-                : this._gpuAdapter
-                  ? { ...this._gpuAdapter }
-                  : null,
+              info.gpuAdapter !== undefined ? info.gpuAdapter : this._gpuAdapter,
           }
         : {
             timestampMs: ts,
-            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+            gpuAdapter: this._gpuAdapter,
           };
     if (typeof this._onFirstPresent === 'function') {
       try {
@@ -3960,7 +4086,7 @@ class WgpuCommandProcessor {
                 source: (info && info.source) || 'bink2',
                 maxLuma: this._lastSampledMaxLuma,
                 suppressedBlackFrames: this._suppressedBlackFrames,
-                gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+                gpuAdapter: this._gpuAdapter,
               });
             }
             if (userOnFirstVisible) {
@@ -4443,7 +4569,7 @@ class WgpuCommandProcessor {
                   source: renderResult.source || 'bink2',
                   maxLuma: this._lastSampledMaxLuma,
                   suppressedBlackFrames: this._suppressedBlackFrames,
-                  gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+                  gpuAdapter: this._gpuAdapter,
                 });
               } else if (this._requireNonBlackFrame || splashCheck.evaluated) {
                 this._suppressedBlackFrames += 1;
@@ -4675,7 +4801,7 @@ class WgpuCommandProcessor {
               source: framePayload.source || 'bink2',
               maxLuma: this._lastSampledMaxLuma,
               suppressedBlackFrames: this._suppressedBlackFrames,
-              gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+              gpuAdapter: this._gpuAdapter,
             });
           } else if (this._requireNonBlackFrame || directCheck.evaluated) {
             this._suppressedBlackFrames += 1;
@@ -4869,10 +4995,73 @@ class WgpuCommandProcessor {
     }
   }
 
+  _acquirePassCommand(type) {
+    const idx = this._passCommandPoolUsed;
+    this._passCommandPoolUsed = idx + 1;
+    let slot;
+    if (idx < this._passCommandPool.length) {
+      slot = this._passCommandPool[idx];
+    } else {
+      slot = createPassCommandSlot();
+      this._passCommandPool.push(slot);
+    }
+    slot.type = type;
+    slot._wgpuMeta = null;
+    return slot;
+  }
+
+  _acquireSetBindGroup2Meta(groupIndex, bindGroupId) {
+    const idx = this._setBindGroup2MetaPoolUsed;
+    this._setBindGroup2MetaPoolUsed = idx + 1;
+    let meta;
+    if (idx < this._setBindGroup2MetaPool.length) {
+      meta = this._setBindGroup2MetaPool[idx];
+      meta.groupIndex = groupIndex;
+      meta.bindGroupId = bindGroupId;
+    } else {
+      meta = { kind: 'setBindGroup2', groupIndex, bindGroupId };
+      this._setBindGroup2MetaPool.push(meta);
+    }
+    return meta;
+  }
+
+  _clearPassCommands() {
+    const used = this._passCommandPoolUsed;
+    const pool = this._passCommandPool;
+    for (let i = 0; i < used; i += 1) {
+      const slot = pool[i];
+      slot.pipeline = null;
+      slot.bindGroup = null;
+      slot._wgpuMeta = null;
+    }
+    this._passCommandPoolUsed = 0;
+    this._setBindGroup2MetaPoolUsed = 0;
+    if (pool.length > MAX_PASS_COMMAND_POOL_SIZE) {
+      pool.length = MAX_PASS_COMMAND_POOL_SIZE;
+    }
+    if (this._setBindGroup2MetaPool.length > MAX_PASS_COMMAND_POOL_SIZE) {
+      this._setBindGroup2MetaPool.length = MAX_PASS_COMMAND_POOL_SIZE;
+    }
+    this._reusablePassCommands.length = 0;
+    if (this._passCommands !== this._reusablePassCommands) {
+      this._passCommands = this._reusablePassCommands;
+    }
+  }
+
+  _getCachedDataView(buffer) {
+    if (this._cachedCmdBuffer === buffer && this._cachedCmdView !== null) {
+      return this._cachedCmdView;
+    }
+    const view = new DataView(buffer);
+    this._cachedCmdBuffer = buffer;
+    this._cachedCmdView = view;
+    return view;
+  }
+
   _resetFrameState() {
     this._earlyFlushedThisFrame = false;
-    this._clearColor = { ...DEFAULT_CLEAR_COLOR };
-    this._passCommands = [];
+    this._clearColor = DEFAULT_CLEAR_COLOR;
+    this._clearPassCommands();
     this._resetPerFrameDrawCounters();
   }
 
@@ -5401,7 +5590,7 @@ class WgpuCommandProcessor {
         maxLuma: this._lastSampledMaxLuma,
         suppressedBlackFrames: this._suppressedBlackFrames,
         swapchainProbeErrorCount: this._swapchainProbeErrorCount,
-        gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+        gpuAdapter: this._gpuAdapter,
       });
     }
     return true;
@@ -5634,7 +5823,7 @@ class WgpuCommandProcessor {
             source: 'swapchain-probe',
             maxLuma: maxRgb,
             suppressedBlackFrames: this._suppressedBlackFrames,
-            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+            gpuAdapter: this._gpuAdapter,
           });
         } else {
           this._suppressedBlackFrames += 1;
@@ -6146,7 +6335,7 @@ class WgpuCommandProcessor {
     this._deviceRecovering = true;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
-    this._passCommands = [];
+    this._clearPassCommands();
     return true;
   }
 
@@ -6262,16 +6451,17 @@ class WgpuCommandProcessor {
    * W104: record the resource packets of `view` starting at `offset` without executing them
    * (command buffers dropped while the device is lost / recovering).
    */
-  _recordReplayPacketsFrom(view, offset) {
+  _recordReplayPacketsFrom(view, offset, endOffset = view.byteLength) {
     if (!this._resourceReplayEnabled || this._replayingResources) {
       return;
     }
+    const limit = Math.min(view.byteLength, endOffset);
     let cursor = offset;
-    while (cursor + 8 <= view.byteLength) {
+    while (cursor + 8 <= limit) {
       const opcode = view.getUint16(cursor, true);
       const payloadBytes = view.getUint32(cursor + 4, true);
       const payloadOffset = cursor + 8;
-      if (payloadOffset + payloadBytes > view.byteLength) {
+      if (payloadOffset + payloadBytes > limit) {
         break;
       }
       this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
@@ -6598,7 +6788,8 @@ class WgpuCommandProcessor {
     this._swapchainProbeFallbackWarned = false;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
-    this._passCommands = [];
+    this._clearPassCommands();
+    this._clearPresentPassBindings();
     this._frameBegunForIndex = -1;
     this._flushAllDeferredGpuDestroysImmediate();
 
@@ -6646,6 +6837,8 @@ class WgpuCommandProcessor {
     this._specializedFallbackBindGroups.clear();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
+    this._pendingCommandStreamStartOffset = 0;
+    this._pendingCommandStreamEndOffset = 0;
     this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
@@ -9576,27 +9769,23 @@ class WgpuCommandProcessor {
       }
       case OPCODES.SET_BIND_GROUP2: {
         if (payloadBytes >= 16 && this._passCommands.length > prevCmdLen) {
-          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
-            kind: 'setBindGroup2',
-            groupIndex: view.getUint32(payloadOffset, true),
-            bindGroupId: view.getUint32(payloadOffset + 4, true),
-          };
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta =
+            this._acquireSetBindGroup2Meta(
+              view.getUint32(payloadOffset, true),
+              view.getUint32(payloadOffset + 4, true)
+            );
         }
         break;
       }
       case OPCODES.BEGIN_RENDER_PASS: {
         if (this._passCommands.length > prevCmdLen) {
-          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
-            kind: 'beginRenderPass',
-          };
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta = WGPU_META_BEGIN_RENDER_PASS;
         }
         break;
       }
       case OPCODES.END_RENDER_PASS: {
         if (this._passCommands.length > prevCmdLen) {
-          this._passCommands[this._passCommands.length - 1]._wgpuMeta = {
-            kind: 'endRenderPass',
-          };
+          this._passCommands[this._passCommands.length - 1]._wgpuMeta = WGPU_META_END_RENDER_PASS;
         }
         break;
       }
@@ -9654,6 +9843,304 @@ class WgpuCommandProcessor {
     return reflected && reflected[groupIndex] ? reflected[groupIndex] : null;
   }
 
+  _clearPresentPassBindings() {
+    const ps = this._presentState;
+    ps.activePipelineId = null;
+    ps.specializedActiveKey = null;
+    if (this._boundBindGroups.size > 0) {
+      for (const entry of this._boundBindGroups.values()) {
+        if (entry) {
+          entry.bindGroup = null;
+          entry.meta = null;
+          entry.entries = null;
+          entry.desc = null;
+        }
+      }
+      this._boundBindGroups.clear();
+    }
+    if (this._boundVertexBuffers.size > 0) {
+      for (const entry of this._boundVertexBuffers.values()) {
+        if (entry) {
+          entry.buffer = null;
+        }
+      }
+      this._boundVertexBuffers.clear();
+    }
+  }
+
+  _bindPresentVertexBuffer(slot, bufferId, buffer, offset) {
+    let entry = this._boundVertexBufferSlots.get(slot);
+    if (!entry) {
+      entry = { bufferId: 0, buffer: null, offset: 0, stride: undefined };
+      this._boundVertexBufferSlots.set(slot, entry);
+    }
+    entry.bufferId = bufferId;
+    entry.buffer = buffer;
+    entry.offset = offset;
+    entry.stride =
+      typeof buffer.stride === 'number'
+        ? buffer.stride
+        : typeof buffer.arrayStride === 'number'
+          ? buffer.arrayStride
+          : undefined;
+    this._boundVertexBuffers.set(slot, entry);
+  }
+
+  _bindPresentBindGroup(groupIndex, bindGroupId, bindGroup, bgMeta) {
+    let entry = this._boundBindGroupSlots.get(groupIndex);
+    if (!entry) {
+      entry = {
+        bindGroupId: 0,
+        bindGroup: null,
+        meta: null,
+        hasCbv: false,
+        hasTexture: false,
+        hasSampler: false,
+        entries: null,
+        desc: null,
+      };
+      this._boundBindGroupSlots.set(groupIndex, entry);
+    }
+    entry.bindGroupId = bindGroupId;
+    entry.bindGroup = bindGroup;
+    entry.meta = bgMeta;
+    entry.hasCbv = Boolean(bgMeta && bgMeta.hasCbv);
+    entry.hasTexture = Boolean(bgMeta && bgMeta.hasTexture);
+    entry.hasSampler = Boolean(bgMeta && bgMeta.hasSampler);
+    entry.entries = bgMeta ? bgMeta.entries : null;
+    entry.desc = bindGroup && bindGroup.desc ? bindGroup.desc : null;
+    this._boundBindGroups.set(groupIndex, entry);
+  }
+
+  _endPresentActivePass() {
+    const ps = this._presentState;
+    if (ps.activePass) {
+      try {
+        ps.activePass.end();
+      } catch (err) {
+        this._recordOpValidationError('EndRenderPass', err);
+      }
+      ps.activePass = null;
+      ps.activePassKind = null;
+      this._clearPresentPassBindings();
+    }
+  }
+
+  _ensurePresentRenderPass() {
+    const ps = this._presentState;
+    if (ps.activePassKind === 'render') return ps.activePass;
+    this._endPresentActivePass();
+    const attachment = {
+      view: ps.swapchainView,
+      loadOp: ps.renderPassOpened ? 'load' : 'clear',
+      storeOp: 'store',
+    };
+    if (!ps.renderPassOpened) {
+      attachment.clearValue = this._clearColor;
+    }
+    const passDesc = {
+      colorAttachments: [attachment],
+    };
+    if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
+      const tsWrites = this.passTimer.getPassTimestampWrites(`render_${ps.renderPassIdx}`);
+      if (tsWrites) {
+        passDesc.timestampWrites = tsWrites;
+      }
+    }
+    ps.renderPassIdx += 1;
+    ps.activePass = ps.encoder.beginRenderPass(passDesc);
+    ps.activePassKind = 'render';
+    ps.renderPassOpened = true;
+    return ps.activePass;
+  }
+
+  _ensurePresentComputePass() {
+    const ps = this._presentState;
+    if (ps.activePassKind === 'compute') return ps.activePass;
+    this._endPresentActivePass();
+    if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
+      const tsWrites = this.passTimer.getPassTimestampWrites(`compute_${ps.computePassIdx}`);
+      ps.computePassIdx += 1;
+      ps.activePass = tsWrites
+        ? ps.encoder.beginComputePass({ timestampWrites: tsWrites })
+        : ps.encoder.beginComputePass();
+    } else {
+      ps.computePassIdx += 1;
+      ps.activePass = ps.encoder.beginComputePass();
+    }
+    ps.activePassKind = 'compute';
+    return ps.activePass;
+  }
+
+  _beginExtensionRenderPass(descriptor) {
+    const ps = this._presentState;
+    this._endPresentActivePass();
+    if (ps.timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
+      const tsWrites = this.passTimer.getPassTimestampWrites(`render_${ps.renderPassIdx}`);
+      if (tsWrites) descriptor = { ...descriptor, timestampWrites: tsWrites };
+    }
+    ps.renderPassIdx += 1;
+    ps.activePass = ps.encoder.beginRenderPass(descriptor);
+    ps.activePassKind = 'render';
+    ps.renderPassOpened = true;
+    return ps.activePass;
+  }
+
+  _maybeSpecializeFallbackPipeline(pass, vertexCount, instanceCount) {
+    const ps = this._presentState;
+    if (ps.activePipelineId === null || !this.shaderFallbackRouter) {
+      return;
+    }
+    const pipeMeta = this._pipelineMeta.get(ps.activePipelineId);
+    if (!pipeMeta || !pipeMeta.isFallback) {
+      return;
+    }
+    const scratch = this._fallbackProfileStateScratch;
+    scratch.vertexCount = vertexCount;
+    scratch.instanceCount = instanceCount;
+    scratch.vertexStride = pipeMeta.vertexStride || 0;
+    const desiredProfile = selectFallbackShaderProfile(scratch);
+    if (
+      desiredProfile === FALLBACK_PROFILE.DEFAULT ||
+      desiredProfile === pipeMeta.fallbackProfile
+    ) {
+      return;
+    }
+    const spec = this._getOrCreateSpecializedFallbackPipeline(pipeMeta, desiredProfile);
+    if (!spec || !spec.changed || !spec.pipeline) {
+      return;
+    }
+    const key = `${pipeMeta.id}|${desiredProfile}`;
+    if (ps.specializedActiveKey !== key) {
+      pass.setPipeline(spec.pipeline);
+      for (const [groupIndex, boundBg] of this._boundBindGroups.entries()) {
+        if (boundBg && boundBg.meta) {
+          const specBg = this._getOrCreateSpecializedBindGroup(
+            pipeMeta.id,
+            desiredProfile,
+            spec.pipeline,
+            groupIndex,
+            boundBg.meta
+          );
+          if (specBg) {
+            pass.setBindGroup(groupIndex, specBg);
+            boundBg.bindGroup = specBg;
+          }
+        }
+      }
+      ps.specializedActiveKey = key;
+    }
+  }
+
+  _executePresentRenderDraw(drawOpName, cmd, isIndexed) {
+    const ps = this._presentState;
+    const pass = this._ensurePresentRenderPass();
+    const count = isIndexed ? cmd.indexCount : cmd.vertexCount;
+    const instanceCount = cmd.instanceCount;
+    this._maybeSpecializeFallbackPipeline(pass, count, instanceCount);
+    const activePipelineId = ps.activePipelineId;
+    const pipeMeta =
+      activePipelineId !== null ? this._pipelineMeta.get(activePipelineId) || null : null;
+    const activePipeline =
+      activePipelineId !== null ? this.pipelines.get(activePipelineId) || null : null;
+    if (activePipelineId !== null && !activePipeline && ps.specializedActiveKey === null) {
+      if (this.isAsyncPipelinePending(activePipelineId)) {
+        // W103: still compiling; draw normally on a later frame once it is ready.
+        this._pendingAsyncPipelineSkips += 1;
+        return;
+      }
+      this._skippedDrawCount += 1;
+      this._recordOpValidationError(
+        drawOpName,
+        `skipped draw: render pipeline ${activePipelineId} is unavailable`
+      );
+      return;
+    }
+    const group0Entry = this._boundBindGroups.get(0);
+    const hasLiveGroup0 = Boolean(group0Entry && group0Entry.bindGroup);
+    if (pipeMeta && pipeMeta.expectsGroup0 && !hasLiveGroup0) {
+      this._unboundBindGroupCount += 1;
+      this._skippedDrawCount += 1;
+      this._recordOpValidationError(
+        drawOpName,
+        `skipped draw on pipeline ${activePipelineId}: expected @group(0) bind group is not bound`
+      );
+      return;
+    }
+    try {
+      if (isIndexed) {
+        pass.drawIndexed(
+          cmd.indexCount,
+          cmd.instanceCount,
+          cmd.firstIndex,
+          cmd.baseVertex,
+          cmd.firstInstance
+        );
+      } else {
+        pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
+      }
+    } catch (err) {
+      this._skippedDrawCount += 1;
+      if (/\b(?:group|bind\s*group)\b/i.test(String(err))) {
+        this._unboundBindGroupCount += 1;
+      }
+      this._recordOpValidationError(drawOpName, err);
+      return;
+    }
+    this._drawCallCount += 1;
+    this._frameDrawsThisFrame += 1;
+    const isClearPipe = Boolean(pipeMeta && pipeMeta.isClear === true);
+    if (pipeMeta && pipeMeta.isRealPack && ps.specializedActiveKey === null) {
+      this._realPackDrawCount += 1;
+      this._frameRealPackDrawsThisFrame += 1;
+    } else if (
+      (pipeMeta && (pipeMeta.isFallback || pipeMeta.usesFallbackShader)) ||
+      ps.specializedActiveKey !== null
+    ) {
+      this._fallbackDrawCount += 1;
+      this._frameFallbackDrawsThisFrame += 1;
+    }
+    if (!isClearPipe) {
+      this._frameNonClearDrawsThisFrame += 1;
+    }
+  }
+
+  _ensurePresentFrameDrawSummary() {
+    const ps = this._presentState;
+    if (ps.cachedFrameSummary !== null) {
+      return ps.cachedFrameSummary;
+    }
+    let rawSummary = null;
+    if (this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function') {
+      try {
+        rawSummary = this.drawExecutor.getFrameDrawSummary(this._frameDrawSummaryOpts);
+      } catch (_) {
+        rawSummary = this.drawExecutor.getFrameDrawSummary();
+      }
+    }
+    const summary = this._frameSummaryScratch;
+    if (rawSummary && typeof rawSummary === 'object') {
+      summary.hasNonClearDraw =
+        Boolean(rawSummary.hasNonClearDraw === true) ||
+        this._frameNonClearDrawsThisFrame > 0;
+      summary.realPackDrawsThisFrame =
+        toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
+        this._frameRealPackDrawsThisFrame;
+      summary.fallbackDrawsThisFrame =
+        toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
+        this._frameFallbackDrawsThisFrame;
+      summary.drawsThisFrame =
+        toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame;
+    } else {
+      summary.hasNonClearDraw = this._frameNonClearDrawsThisFrame > 0;
+      summary.realPackDrawsThisFrame = this._frameRealPackDrawsThisFrame;
+      summary.fallbackDrawsThisFrame = this._frameFallbackDrawsThisFrame;
+      summary.drawsThisFrame = this._frameDrawsThisFrame;
+    }
+    ps.cachedFrameSummary = summary;
+    return summary;
+  }
+
   /**
    * @param {{ readbackOnly?: boolean }} [opts] G66: `readbackOnly` submits the recorded work up to
    *   the last read-back without presenting (no frame accounting, no frame reset), so the staging
@@ -9706,229 +10193,48 @@ class WgpuCommandProcessor {
         this._startRecordedReadbacks(false);
         return;
       }
-      this._drainDeferredGpuDestroys(null, { immediate: true });
+      this._drainDeferredGpuDestroys(null, DRAIN_DEFERRED_OPTS_IMMEDIATE);
       this._endSubsystemsForFrame(null);
       this._resetFrameState();
       return;
     }
-    let activePass = null;
-    let activePassKind = null;
+
+    const ps = this._presentState;
+    ps.encoder = encoder;
+    ps.activeSwapchain = activeSwapchain;
+    ps.swapchainTexture = swapchainTexture;
+    ps.swapchainView = swapchainView;
+    ps.activePass = null;
+    ps.activePassKind = null;
     // After an early read-back flush the canvas already holds this frame's work: keep it.
-    let renderPassOpened = readbackOnly || this._earlyFlushedThisFrame === true;
-    let renderPassIdx = 0;
-    let computePassIdx = 0;
+    ps.renderPassOpened = readbackOnly || this._earlyFlushedThisFrame === true;
+    ps.renderPassIdx = 0;
+    ps.computePassIdx = 0;
+    ps.timerSupported = Boolean(this.passTimer && this.passTimer.supported);
+    ps.activePipelineId = null;
+    ps.specializedActiveKey = null;
+    ps.cachedFrameSummary = null;
+    this._clearPresentPassBindings();
 
-    const timerSupported = Boolean(this.passTimer && this.passTimer.supported);
+    const passControl = this._passControl;
+    passControl.encoder = encoder;
+    passControl.swapchainTexture = swapchainTexture;
+    passControl.swapchainView = swapchainView;
+    passControl.canvasWidth = this._viewportWidth > 0 ? this._viewportWidth : undefined;
+    passControl.canvasHeight = this._viewportHeight > 0 ? this._viewportHeight : undefined;
+    passControl.swapchainWidth =
+      activeSwapchain && activeSwapchain.width > 0 ? activeSwapchain.width : undefined;
+    passControl.swapchainHeight =
+      activeSwapchain && activeSwapchain.height > 0 ? activeSwapchain.height : undefined;
 
-    let activePipelineId = null;
-    let specializedActiveKey = null;
-    const boundBindGroups = new Map();
-    const boundVertexBuffers = new Map();
-
-    const clearPassBindings = () => {
-      activePipelineId = null;
-      specializedActiveKey = null;
-      boundBindGroups.clear();
-      boundVertexBuffers.clear();
-    };
-
-    const endActivePass = () => {
-      if (activePass) {
-        try {
-          activePass.end();
-        } catch (err) {
-          this._recordOpValidationError('EndRenderPass', err);
-        }
-        activePass = null;
-        activePassKind = null;
-        clearPassBindings();
-      }
-    };
-
-    const ensureRenderPass = () => {
-      if (activePassKind === 'render') return activePass;
-      endActivePass();
-      const attachment = {
-        view: swapchainView,
-        loadOp: renderPassOpened ? 'load' : 'clear',
-        storeOp: 'store',
-      };
-      if (!renderPassOpened) {
-        attachment.clearValue = { ...this._clearColor };
-      }
-      const passDesc = {
-        colorAttachments: [attachment],
-      };
-      if (timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-        const tsWrites = this.passTimer.getPassTimestampWrites(`render_${renderPassIdx}`);
-        if (tsWrites) {
-          passDesc.timestampWrites = tsWrites;
-        }
-      }
-      renderPassIdx += 1;
-      activePass = encoder.beginRenderPass(passDesc);
-      activePassKind = 'render';
-      renderPassOpened = true;
-      return activePass;
-    };
-
-    const ensureComputePass = () => {
-      if (activePassKind === 'compute') return activePass;
-      endActivePass();
-      if (timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-        const tsWrites = this.passTimer.getPassTimestampWrites(`compute_${computePassIdx}`);
-        computePassIdx += 1;
-        activePass = tsWrites
-          ? encoder.beginComputePass({ timestampWrites: tsWrites })
-          : encoder.beginComputePass();
-      } else {
-        computePassIdx += 1;
-        activePass = encoder.beginComputePass();
-      }
-      activePassKind = 'compute';
-      return activePass;
-    };
-
-    // Pass access for queued extension commands ({ type, run(passControl) }).
-    const passControl = {
-      swapchainTexture,
-      swapchainView,
-      canvasWidth: this._viewportWidth > 0 ? this._viewportWidth : undefined,
-      canvasHeight: this._viewportHeight > 0 ? this._viewportHeight : undefined,
-      swapchainWidth:
-        activeSwapchain && activeSwapchain.width > 0 ? activeSwapchain.width : undefined,
-      swapchainHeight:
-        activeSwapchain && activeSwapchain.height > 0 ? activeSwapchain.height : undefined,
-      encoder,
-      get pass() { return activePass; },
-      get passKind() { return activePassKind; },
-      endPass: endActivePass,
-      beginRenderPass: (descriptor) => {
-        endActivePass();
-        if (timerSupported && typeof this.passTimer.getPassTimestampWrites === 'function') {
-          const tsWrites = this.passTimer.getPassTimestampWrites(`render_${renderPassIdx}`);
-          if (tsWrites) descriptor = { ...descriptor, timestampWrites: tsWrites };
-        }
-        renderPassIdx += 1;
-        activePass = encoder.beginRenderPass(descriptor);
-        activePassKind = 'render';
-        renderPassOpened = true;
-        return activePass;
-      },
-    };
-
-    const maybeSpecializeFallbackPipeline = (pass, vertexCount, instanceCount) => {
-      if (activePipelineId === null || !this.shaderFallbackRouter) {
-        return;
-      }
-      const pipeMeta = this._pipelineMeta.get(activePipelineId);
-      if (!pipeMeta || !pipeMeta.isFallback) {
-        return;
-      }
-      const desiredProfile = selectFallbackShaderProfile({
-        vertexCount,
-        instanceCount,
-        vertexStride: pipeMeta.vertexStride || 0,
-        bindGroups: boundBindGroups,
-        vertexBuffers: boundVertexBuffers,
-      });
-      if (
-        desiredProfile === FALLBACK_PROFILE.DEFAULT ||
-        desiredProfile === pipeMeta.fallbackProfile
-      ) {
-        return;
-      }
-      const spec = this._getOrCreateSpecializedFallbackPipeline(pipeMeta, desiredProfile);
-      if (!spec || !spec.changed || !spec.pipeline) {
-        return;
-      }
-      const key = `${pipeMeta.id}|${desiredProfile}`;
-      if (specializedActiveKey !== key) {
-        pass.setPipeline(spec.pipeline);
-        for (const [groupIndex, boundBg] of boundBindGroups.entries()) {
-          if (boundBg && boundBg.meta) {
-            const specBg = this._getOrCreateSpecializedBindGroup(
-              pipeMeta.id,
-              desiredProfile,
-              spec.pipeline,
-              groupIndex,
-              boundBg.meta
-            );
-            if (specBg) {
-              pass.setBindGroup(groupIndex, specBg);
-              boundBg.bindGroup = specBg;
-            }
-          }
-        }
-        specializedActiveKey = key;
-      }
-    };
-
-    const executeRenderDraw = (drawOpName, count, instanceCount, invokeDraw) => {
-      const pass = ensureRenderPass();
-      maybeSpecializeFallbackPipeline(pass, count, instanceCount);
-      const pipeMeta =
-        activePipelineId !== null ? this._pipelineMeta.get(activePipelineId) || null : null;
-      const activePipeline =
-        activePipelineId !== null ? this.pipelines.get(activePipelineId) || null : null;
-      if (activePipelineId !== null && !activePipeline && specializedActiveKey === null) {
-        if (this.isAsyncPipelinePending(activePipelineId)) {
-          // W103: still compiling; draw normally on a later frame once it is ready.
-          this._pendingAsyncPipelineSkips += 1;
-          return;
-        }
-        this._skippedDrawCount += 1;
-        this._recordOpValidationError(
-          drawOpName,
-          `skipped draw: render pipeline ${activePipelineId} is unavailable`
-        );
-        return;
-      }
-      const group0Entry = boundBindGroups.get(0);
-      const hasLiveGroup0 = Boolean(group0Entry && group0Entry.bindGroup);
-      if (pipeMeta && pipeMeta.expectsGroup0 && !hasLiveGroup0) {
-        this._unboundBindGroupCount += 1;
-        this._skippedDrawCount += 1;
-        this._recordOpValidationError(
-          drawOpName,
-          `skipped draw on pipeline ${activePipelineId}: expected @group(0) bind group is not bound`
-        );
-        return;
-      }
-      try {
-        invokeDraw(pass);
-      } catch (err) {
-        this._skippedDrawCount += 1;
-        if (/\b(?:group|bind\s*group)\b/i.test(String(err))) {
-          this._unboundBindGroupCount += 1;
-        }
-        this._recordOpValidationError(drawOpName, err);
-        return;
-      }
-      this._drawCallCount += 1;
-      this._frameDrawsThisFrame += 1;
-      const isClearPipe = Boolean(pipeMeta && pipeMeta.isClear === true);
-      if (pipeMeta && pipeMeta.isRealPack && specializedActiveKey === null) {
-        this._realPackDrawCount += 1;
-        this._frameRealPackDrawsThisFrame += 1;
-      } else if (
-        (pipeMeta && (pipeMeta.isFallback || pipeMeta.usesFallbackShader)) ||
-        specializedActiveKey !== null
-      ) {
-        this._fallbackDrawCount += 1;
-        this._frameFallbackDrawsThisFrame += 1;
-      }
-      if (!isClearPipe) {
-        this._frameNonClearDrawsThisFrame += 1;
-      }
-    };
-
-    for (const cmd of this._passCommands) {
+    const cmds = this._passCommands;
+    for (let i = 0, cmdLen = cmds.length; i < cmdLen; i += 1) {
+      const cmd = cmds[i];
       switch (cmd.type) {
         case 'setPipeline': {
-          const pass = ensureRenderPass();
-          activePipelineId = cmd.pipelineId;
-          specializedActiveKey = null;
+          const pass = this._ensurePresentRenderPass();
+          ps.activePipelineId = cmd.pipelineId;
+          ps.specializedActiveKey = null;
           const pipeline = this.pipelines.get(cmd.pipelineId) || cmd.pipeline || null;
           if (pipeline) {
             try {
@@ -9945,20 +10251,10 @@ class WgpuCommandProcessor {
           break;
         }
         case 'setVertexBuffer': {
-          const pass = ensureRenderPass();
+          const pass = this._ensurePresentRenderPass();
           const buffer = this.buffers.get(cmd.bufferId);
           if (buffer) {
-            boundVertexBuffers.set(cmd.slot, {
-              bufferId: cmd.bufferId,
-              buffer,
-              offset: cmd.offset,
-              stride:
-                typeof buffer.stride === 'number'
-                  ? buffer.stride
-                  : typeof buffer.arrayStride === 'number'
-                    ? buffer.arrayStride
-                    : undefined,
-            });
+            this._bindPresentVertexBuffer(cmd.slot, cmd.bufferId, buffer, cmd.offset);
             try {
               pass.setVertexBuffer(cmd.slot, buffer, cmd.offset);
             } catch (err) {
@@ -9968,7 +10264,7 @@ class WgpuCommandProcessor {
           break;
         }
         case 'setIndexBuffer': {
-          const pass = ensureRenderPass();
+          const pass = this._ensurePresentRenderPass();
           const buffer = this.buffers.get(cmd.bufferId);
           if (buffer) {
             try {
@@ -9983,16 +10279,7 @@ class WgpuCommandProcessor {
           const bindGroup = this.bindGroups.get(cmd.bindGroupId) || cmd.bindGroup || null;
           const bgMeta = this._bindGroupMeta.get(cmd.bindGroupId) || null;
           if (bindGroup || bgMeta) {
-            boundBindGroups.set(cmd.groupIndex, {
-              bindGroupId: cmd.bindGroupId,
-              bindGroup: bindGroup || null,
-              meta: bgMeta,
-              hasCbv: Boolean(bgMeta && bgMeta.hasCbv),
-              hasTexture: Boolean(bgMeta && bgMeta.hasTexture),
-              hasSampler: Boolean(bgMeta && bgMeta.hasSampler),
-              entries: bgMeta ? bgMeta.entries : null,
-              desc: bindGroup && bindGroup.desc ? bindGroup.desc : null,
-            });
+            this._bindPresentBindGroup(cmd.groupIndex, cmd.bindGroupId, bindGroup || null, bgMeta);
           } else {
             this._recordOpValidationError(
               'SetBindGroup',
@@ -10001,10 +10288,10 @@ class WgpuCommandProcessor {
           }
           if (bindGroup) {
             const pass =
-              activePass ||
+              ps.activePass ||
               (this._bindGroupKinds.get(cmd.bindGroupId) === 'compute'
-                ? ensureComputePass()
-                : ensureRenderPass());
+                ? this._ensurePresentComputePass()
+                : this._ensurePresentRenderPass());
             try {
               pass.setBindGroup(cmd.groupIndex, bindGroup);
             } catch (err) {
@@ -10014,25 +10301,15 @@ class WgpuCommandProcessor {
           break;
         }
         case 'draw': {
-          executeRenderDraw('Draw', cmd.vertexCount, cmd.instanceCount, (pass) => {
-            pass.draw(cmd.vertexCount, cmd.instanceCount, cmd.firstVertex, cmd.firstInstance);
-          });
+          this._executePresentRenderDraw('Draw', cmd, false);
           break;
         }
         case 'drawIndexed': {
-          executeRenderDraw('DrawIndexed', cmd.indexCount, cmd.instanceCount, (pass) => {
-            pass.drawIndexed(
-              cmd.indexCount,
-              cmd.instanceCount,
-              cmd.firstIndex,
-              cmd.baseVertex,
-              cmd.firstInstance
-            );
-          });
+          this._executePresentRenderDraw('DrawIndexed', cmd, true);
           break;
         }
         case 'setComputePipeline': {
-          const pass = ensureComputePass();
+          const pass = this._ensurePresentComputePass();
           const pipeline = this.computePipelines.get(cmd.pipelineId);
           if (pipeline) {
             try {
@@ -10044,7 +10321,7 @@ class WgpuCommandProcessor {
           break;
         }
         case 'dispatchCompute': {
-          const pass = ensureComputePass();
+          const pass = this._ensurePresentComputePass();
           try {
             pass.dispatchWorkgroups(cmd.workgroupX, cmd.workgroupY, cmd.workgroupZ);
             this._computeDispatchCount += 1;
@@ -10091,19 +10368,15 @@ class WgpuCommandProcessor {
             const meta = cmd._wgpuMeta || null;
             try {
               cmd.run(passControl);
-              if (meta && meta.kind === 'setBindGroup2' && activePass) {
+              if (meta && meta.kind === 'setBindGroup2' && ps.activePass) {
                 const bg = this.bindGroups.get(meta.bindGroupId) || null;
                 const bgMeta = this._bindGroupMeta.get(meta.bindGroupId) || null;
-                boundBindGroups.set(meta.groupIndex, {
-                  bindGroupId: meta.bindGroupId,
-                  bindGroup: bg || { bound: true },
-                  meta: bgMeta,
-                  hasCbv: Boolean(bgMeta && bgMeta.hasCbv),
-                  hasTexture: Boolean(bgMeta && bgMeta.hasTexture),
-                  hasSampler: Boolean(bgMeta && bgMeta.hasSampler),
-                  entries: bgMeta ? bgMeta.entries : null,
-                  desc: bg && bg.desc ? bg.desc : null,
-                });
+                this._bindPresentBindGroup(
+                  meta.groupIndex,
+                  meta.bindGroupId,
+                  bg || SENTINEL_BOUND_BIND_GROUP,
+                  bgMeta
+                );
               }
             } catch (err) {
               this._recordOpValidationError(
@@ -10116,14 +10389,14 @@ class WgpuCommandProcessor {
       }
     }
 
-    endActivePass();
-    if (!renderPassOpened && !readbackOnly) {
+    this._endPresentActivePass();
+    if (!ps.renderPassOpened && !readbackOnly) {
       try {
-        ensureRenderPass();
+        this._ensurePresentRenderPass();
       } catch (err) {
         this._recordOpValidationError('BeginRenderPass', sanitizeGpuErrorDetail(err));
       }
-      endActivePass();
+      this._endPresentActivePass();
     }
 
     // W112 / W121: Blit the offscreen intermediate render-target texture onto the canvas
@@ -10141,43 +10414,8 @@ class WgpuCommandProcessor {
       }
     }
 
-    let cachedFrameSummary = null;
-    const ensureFrameDrawSummary = () => {
-      if (cachedFrameSummary !== null) {
-        return cachedFrameSummary;
-      }
-      let rawSummary = null;
-      if (this.drawExecutor && typeof this.drawExecutor.getFrameDrawSummary === 'function') {
-        try {
-          rawSummary = this.drawExecutor.getFrameDrawSummary(this._frameDrawSummaryOpts);
-        } catch (_) {
-          rawSummary = this.drawExecutor.getFrameDrawSummary();
-        }
-      }
-      cachedFrameSummary = this._frameSummaryScratch;
-      if (rawSummary && typeof rawSummary === 'object') {
-        cachedFrameSummary.hasNonClearDraw =
-          Boolean(rawSummary.hasNonClearDraw === true) ||
-          this._frameNonClearDrawsThisFrame > 0;
-        cachedFrameSummary.realPackDrawsThisFrame =
-          toNonNegativeInt(rawSummary.realPackDrawsThisFrame, 0) +
-          this._frameRealPackDrawsThisFrame;
-        cachedFrameSummary.fallbackDrawsThisFrame =
-          toNonNegativeInt(rawSummary.fallbackDrawsThisFrame, 0) +
-          this._frameFallbackDrawsThisFrame;
-        cachedFrameSummary.drawsThisFrame =
-          toNonNegativeInt(rawSummary.drawsThisFrame, 0) + this._frameDrawsThisFrame;
-      } else {
-        cachedFrameSummary.hasNonClearDraw = this._frameNonClearDrawsThisFrame > 0;
-        cachedFrameSummary.realPackDrawsThisFrame = this._frameRealPackDrawsThisFrame;
-        cachedFrameSummary.fallbackDrawsThisFrame = this._frameFallbackDrawsThisFrame;
-        cachedFrameSummary.drawsThisFrame = this._frameDrawsThisFrame;
-      }
-      return cachedFrameSummary;
-    };
-
     // W338 / W348: While waiting for first-visible-frame on a real WebGPU device with COPY_SRC
-    // swapchain readback support, encode 4 small horizontal strip copies before encoder.finish()
+    // swapchain readback support, encode 8 small horizontal strip copies before encoder.finish()
     // (throttled to >= 250 ms and strictly non-overlapping; zero work once first-visible-frame fires).
     // Once swapchain probe capability is established on this device (`_swapchainProbeSupported === true`),
     // keep `swapchainProbeActive = true` for EVERY frame (including clear-only frames, throttled frames,
@@ -10197,7 +10435,7 @@ class WgpuCommandProcessor {
       encoder &&
       typeof encoder.copyTextureToBuffer === 'function'
     ) {
-      const preSummary = ensureFrameDrawSummary();
+      const preSummary = this._ensurePresentFrameDrawSummary();
       const hasDrawCandidate =
         this._realPackDrawCount > 0 ||
         preSummary.realPackDrawsThisFrame > 0 ||
@@ -10241,7 +10479,7 @@ class WgpuCommandProcessor {
     }
 
     let timerResolved = false;
-    if (!readbackOnly && timerSupported && typeof this.passTimer.resolveFrame === 'function') {
+    if (!readbackOnly && ps.timerSupported && typeof this.passTimer.resolveFrame === 'function') {
       timerResolved = Boolean(this.passTimer.resolveFrame(encoder));
     }
 
@@ -10282,6 +10520,14 @@ class WgpuCommandProcessor {
     }
     this._startRecordedReadbacks(submitted);
     if (readbackOnly) {
+      ps.encoder = null;
+      ps.activeSwapchain = null;
+      ps.swapchainTexture = null;
+      ps.swapchainView = null;
+      ps.cachedFrameSummary = null;
+      passControl.encoder = null;
+      passControl.swapchainTexture = null;
+      passControl.swapchainView = null;
       if (submitted) this._earlyFlushedThisFrame = true;
       return;
     }
@@ -10336,11 +10582,11 @@ class WgpuCommandProcessor {
           framesPresented: 1,
           source: 'command-buffer',
           timestampMs: presentTs,
-          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+          gpuAdapter: this._gpuAdapter,
         });
       }
 
-      const summary = ensureFrameDrawSummary();
+      const summary = this._ensurePresentFrameDrawSummary();
       presentIsIdleFrame = summary.drawsThisFrame === 0;
 
       // W348: While a non-black pixel gate is active (async swapchain luminance probe OR
@@ -10388,17 +10634,17 @@ class WgpuCommandProcessor {
           activeSwapchain.hasFirstVisibleFrame === true ||
             activeSwapchain.hasVisibleContent === true
         );
+        const markPayload = this._markFrameContentScratch;
+        markPayload.hasNonClearDraw = swapchainFrameVisible;
+        markPayload.nonClearDraw = swapchainFrameVisible;
+        markPayload.hasVisibleContent = swapchainFrameVisible;
+        markPayload.hasDraws = swapchainFrameVisible;
+        markPayload.realPackDraws = swapchainFrameVisible ? summary.realPackDrawsThisFrame : 0;
+        markPayload.fallbackDraws = swapchainFrameVisible ? summary.fallbackDrawsThisFrame : 0;
+        markPayload.drawsThisFrame = summary.drawsThisFrame;
+        markPayload.timestampMs = presentTs;
         try {
-          markResult = activeSwapchain.markFrameContent({
-            hasNonClearDraw: swapchainFrameVisible,
-            nonClearDraw: swapchainFrameVisible,
-            hasVisibleContent: swapchainFrameVisible,
-            hasDraws: swapchainFrameVisible,
-            realPackDraws: swapchainFrameVisible ? summary.realPackDrawsThisFrame : 0,
-            fallbackDraws: swapchainFrameVisible ? summary.fallbackDrawsThisFrame : 0,
-            drawsThisFrame: summary.drawsThisFrame,
-            timestampMs: presentTs,
-          });
+          markResult = activeSwapchain.markFrameContent(markPayload);
         } catch (_) {
           markResult = null;
         }
@@ -10453,7 +10699,7 @@ class WgpuCommandProcessor {
             drawsThisFrame: summary.drawsThisFrame,
             maxLuma: this._lastSampledMaxLuma,
             suppressedBlackFrames: this._suppressedBlackFrames,
-            gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+            gpuAdapter: this._gpuAdapter,
           });
         } else {
           if (syncGate && syncGate.evaluated && !syncGate.visible) {
@@ -10502,7 +10748,7 @@ class WgpuCommandProcessor {
           realPackDrawsThisFrame: summary.realPackDrawsThisFrame,
           fallbackDrawsThisFrame: summary.fallbackDrawsThisFrame,
           drawsThisFrame: summary.drawsThisFrame,
-          gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+          gpuAdapter: this._gpuAdapter,
         });
       }
 
@@ -10525,15 +10771,28 @@ class WgpuCommandProcessor {
       this._frameStartMs = null;
     }
 
+    // Release per-frame GPU object references held by presentState / passControl before returning.
+    ps.encoder = null;
+    ps.activeSwapchain = null;
+    ps.swapchainTexture = null;
+    ps.swapchainView = null;
+    ps.cachedFrameSummary = null;
+    passControl.encoder = null;
+    passControl.swapchainTexture = null;
+    passControl.swapchainView = null;
+
     const workDoneFence = submitted ? this._getWorkDoneFence() : null;
-    this._drainDeferredGpuDestroys(workDoneFence, {
-      immediate: !submitted || workDoneFence === null,
-    });
-    this._endSubsystemsForFrame(workDoneFence, {
-      sceneTransition: presentSceneTransition,
-      resolutionChanged: presentResolutionChanged,
-      isIdleFrame: presentIsIdleFrame,
-    });
+    this._drainDeferredGpuDestroys(
+      workDoneFence,
+      !submitted || workDoneFence === null
+        ? DRAIN_DEFERRED_OPTS_IMMEDIATE
+        : DRAIN_DEFERRED_OPTS_DEFERRED
+    );
+    const frameHints = this._frameHintsScratch;
+    frameHints.sceneTransition = presentSceneTransition;
+    frameHints.resolutionChanged = presentResolutionChanged;
+    frameHints.isIdleFrame = presentIsIdleFrame;
+    this._endSubsystemsForFrame(workDoneFence, frameHints);
 
     if (submitted) {
       this._advanceUniformRingForFrame(this.frameCount);
@@ -10587,12 +10846,20 @@ class WgpuCommandProcessor {
     return this.ring;
   }
 
-  drainRing() {
+  drainRing(options = null) {
+    const reuseResult = Boolean(options && options.reuseResult === true);
     if (this._destroyed || !this.ring || !this.device || !this.ctx) {
+      if (reuseResult) {
+        const out = this._drainRingResultScratch;
+        out.frameCount = this.frameCount;
+        out.presents = 0;
+        out.bytesDrained = 0;
+        return out;
+      }
       return { frameCount: this.frameCount, presents: 0, bytesDrained: 0 };
     }
     let presents = 0;
-    // W284: Prefer zero-alloc span draining when supported by the attached ring.
+    // W284 / W359: Prefer zero-alloc direct-view span draining when supported by the attached ring.
     if (typeof this.ring.drainBatchZeroAlloc === 'function') {
       let bytesDrained = 0;
       for (let batch = 0; batch < MAX_ZERO_ALLOC_RING_DRAIN_BATCHES; batch += 1) {
@@ -10621,27 +10888,134 @@ class WgpuCommandProcessor {
           break;
         }
       }
+      if (reuseResult) {
+        const out = this._drainRingResultScratch;
+        out.frameCount = this.frameCount;
+        out.presents = presents;
+        out.bytesDrained = bytesDrained;
+        return out;
+      }
       return { frameCount: this.frameCount, presents, bytesDrained };
     }
     const bytesDrained = this.ring.drainTo((bytes) => {
-      const result = this.executeCommandBuffer(bytes);
-      presents += result.presents;
+      const view = this._getCachedDataView(bytes.buffer);
+      presents += this._executeCommandView(
+        view,
+        bytes.byteOffset,
+        bytes.byteOffset + bytes.byteLength
+      );
     });
+    if (reuseResult) {
+      const out = this._drainRingResultScratch;
+      out.frameCount = this.frameCount;
+      out.presents = presents;
+      out.bytesDrained = bytesDrained;
+      return out;
+    }
     return { frameCount: this.frameCount, presents, bytesDrained };
   }
 
-  executeCommandBuffer(input) {
+  _executeCommandView(view, startOffset, endOffset) {
+    if (this._deviceRecovering) {
+      // W100: drop submissions for the lost device while recovery is in flight.
+      this._droppedWhileRecoveringCount += 1;
+      // W104 / W346: resources the guest creates meanwhile are still recorded for replay
+      // only when resource replay is enabled.
+      if (view && this._resourceReplayEnabled && !this._replayingResources) {
+        this._recordReplayPacketsFrom(view, startOffset, endOffset);
+      }
+      return 0;
+    }
+
+    let offset = startOffset;
+    let presents = 0;
+
+    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
+    const prevPendingView = this._pendingCommandStreamView;
+    const prevPendingStart = this._pendingCommandStreamStartOffset;
+    const prevPendingEnd = this._pendingCommandStreamEndOffset;
+    const prevPendingScanned = this._pendingCommandStreamScanned;
+    // W346: Defer fallback profile lookahead scanning until a CreateShaderModule packet
+    // actually misses the WGSL pack; steady-state & pack-backed submissions walk once.
+    this._pendingCommandStreamShaderProfiles = null;
+    this._pendingCommandStreamView = view;
+    this._pendingCommandStreamStartOffset = startOffset;
+    this._pendingCommandStreamEndOffset = endOffset;
+    this._pendingCommandStreamScanned = false;
+    try {
+      while (offset + 8 <= endOffset) {
+        const opcode = view.getUint16(offset, true);
+        const payloadBytes = view.getUint32(offset + 4, true);
+        const payloadOffset = offset + 8;
+        if (payloadOffset + payloadBytes > endOffset) {
+          this._recordOpValidationError(
+            'CommandStream',
+            `truncated packet ${opcodeLabel(opcode)} (need ${payloadBytes}B, remaining ${endOffset - payloadOffset}B)`
+          );
+          break;
+        }
+
+        this._packetCount += 1;
+        this._bytesProcessed += 8 + payloadBytes;
+
+        if (this._resourceReplayEnabled && !this._replayingResources) {
+          this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
+        }
+        presents += this._dispatchPacket(opcode, view, payloadOffset, payloadBytes);
+
+        offset = payloadOffset + payloadBytes;
+        if (this._deviceRecovering) {
+          // W100: device loss detected mid-buffer; skip the remaining packets cleanly.
+          // W104 / W346: still record the skipped resource packets when replay is enabled.
+          if (this._resourceReplayEnabled && !this._replayingResources) {
+            this._recordReplayPacketsFrom(view, offset, endOffset);
+          }
+          break;
+        }
+      }
+    } finally {
+      this._pendingCommandStreamShaderProfiles = prevPendingHints;
+      this._pendingCommandStreamView = prevPendingView;
+      this._pendingCommandStreamStartOffset = prevPendingStart;
+      this._pendingCommandStreamEndOffset = prevPendingEnd;
+      this._pendingCommandStreamScanned = prevPendingScanned;
+    }
+    if (this._readbackFlushWanted) {
+      this._flushReadbacksNow();
+    }
+
+    return presents;
+  }
+
+  executeCommandBuffer(input, options = null) {
+    const reuseResult = Boolean(options && options.reuseResult === true);
     if (this._destroyed || !this.device || !this.ctx) {
+      if (reuseResult) {
+        const out = this._executeResultScratch;
+        out.frameCount = this.frameCount;
+        out.presents = 0;
+        return out;
+      }
       return { frameCount: this.frameCount, presents: 0 };
     }
     let view;
-    if (
+    let startOffset = 0;
+    let endOffset = 0;
+    if (input instanceof DataView) {
+      view = input;
+      startOffset = 0;
+      endOffset = input.byteLength;
+    } else if (
       input instanceof ArrayBuffer ||
       (typeof SharedArrayBuffer !== 'undefined' && input instanceof SharedArrayBuffer)
     ) {
-      view = new DataView(input);
+      view = this._getCachedDataView(input);
+      startOffset = 0;
+      endOffset = input.byteLength;
     } else if (ArrayBuffer.isView(input)) {
-      view = new DataView(input.buffer, input.byteOffset, input.byteLength);
+      view = this._getCachedDataView(input.buffer);
+      startOffset = input.byteOffset;
+      endOffset = startOffset + input.byteLength;
     } else if (this._deviceRecovering) {
       view = null;
     } else {
@@ -10650,68 +11024,13 @@ class WgpuCommandProcessor {
       );
     }
 
-    if (this._deviceRecovering) {
-      // W100: drop submissions for the lost device while recovery is in flight.
-      this._droppedWhileRecoveringCount += 1;
-      // W104 / W346: resources the guest creates meanwhile are still recorded for replay
-      // only when resource replay is enabled.
-      if (view && this._resourceReplayEnabled && !this._replayingResources) {
-        this._recordReplayPacketsFrom(view, 0);
-      }
-      return { frameCount: this.frameCount, presents: 0 };
+    const presents = this._executeCommandView(view, startOffset, endOffset);
+    if (reuseResult) {
+      const out = this._executeResultScratch;
+      out.frameCount = this.frameCount;
+      out.presents = presents;
+      return out;
     }
-
-    let offset = 0;
-    let presents = 0;
-
-    const prevPendingHints = this._pendingCommandStreamShaderProfiles;
-    const prevPendingView = this._pendingCommandStreamView;
-    const prevPendingScanned = this._pendingCommandStreamScanned;
-    // W346: Defer fallback profile lookahead scanning until a CreateShaderModule packet
-    // actually misses the WGSL pack; steady-state & pack-backed submissions walk once.
-    this._pendingCommandStreamShaderProfiles = null;
-    this._pendingCommandStreamView = view;
-    this._pendingCommandStreamScanned = false;
-    try {
-    while (offset + 8 <= view.byteLength) {
-      const opcode = view.getUint16(offset, true);
-      const payloadBytes = view.getUint32(offset + 4, true);
-      const payloadOffset = offset + 8;
-      if (payloadOffset + payloadBytes > view.byteLength) {
-        this._recordOpValidationError(
-          'CommandStream',
-          `truncated packet ${opcodeLabel(opcode)} (need ${payloadBytes}B, remaining ${view.byteLength - payloadOffset}B)`
-        );
-        break;
-      }
-
-      this._packetCount += 1;
-      this._bytesProcessed += 8 + payloadBytes;
-
-      if (this._resourceReplayEnabled && !this._replayingResources) {
-        this._recordReplayPacket(opcode, view, payloadOffset, payloadBytes);
-      }
-      presents += this._dispatchPacket(opcode, view, payloadOffset, payloadBytes);
-
-      offset = payloadOffset + payloadBytes;
-      if (this._deviceRecovering) {
-        // W100: device loss detected mid-buffer; skip the remaining packets cleanly.
-        // W104 / W346: still record the skipped resource packets when replay is enabled.
-        if (this._resourceReplayEnabled && !this._replayingResources) {
-          this._recordReplayPacketsFrom(view, offset);
-        }
-        break;
-      }
-    }
-    } finally {
-      this._pendingCommandStreamShaderProfiles = prevPendingHints;
-      this._pendingCommandStreamView = prevPendingView;
-      this._pendingCommandStreamScanned = prevPendingScanned;
-    }
-    if (this._readbackFlushWanted) {
-      this._flushReadbacksNow();
-    }
-
     return { frameCount: this.frameCount, presents };
   }
 
@@ -10737,12 +11056,29 @@ class WgpuCommandProcessor {
         break;
       case OPCODES.CLEAR_COLOR:
         if (payloadBytes >= 16) {
-          this._clearColor = {
-            r: view.getFloat32(payloadOffset, true),
-            g: view.getFloat32(payloadOffset + 4, true),
-            b: view.getFloat32(payloadOffset + 8, true),
-            a: view.getFloat32(payloadOffset + 12, true),
-          };
+          const r = view.getFloat32(payloadOffset, true);
+          const g = view.getFloat32(payloadOffset + 4, true);
+          const b = view.getFloat32(payloadOffset + 8, true);
+          const a = view.getFloat32(payloadOffset + 12, true);
+          if (
+            r === DEFAULT_CLEAR_COLOR.r &&
+            g === DEFAULT_CLEAR_COLOR.g &&
+            b === DEFAULT_CLEAR_COLOR.b &&
+            a === DEFAULT_CLEAR_COLOR.a
+          ) {
+            this._clearColor = DEFAULT_CLEAR_COLOR;
+          } else if (
+            this._lastCustomClearColor !== null &&
+            r === this._lastCustomClearColor.r &&
+            g === this._lastCustomClearColor.g &&
+            b === this._lastCustomClearColor.b &&
+            a === this._lastCustomClearColor.a
+          ) {
+            this._clearColor = this._lastCustomClearColor;
+          } else {
+            this._lastCustomClearColor = Object.freeze({ r, g, b, a });
+            this._clearColor = this._lastCustomClearColor;
+          }
         } else {
           this._recordOpValidationError('ClearColor', `truncated payload (${payloadBytes}B < 16B)`);
         }
@@ -10784,36 +11120,33 @@ class WgpuCommandProcessor {
       case OPCODES.SET_PIPELINE:
         if (payloadBytes >= 4) {
           const pipelineId = view.getUint32(payloadOffset, true);
-          this._passCommands.push({
-            type: 'setPipeline',
-            pipelineId,
-            pipeline: this.pipelines.get(pipelineId) || null,
-          });
+          const cmd = this._acquirePassCommand('setPipeline');
+          cmd.pipelineId = pipelineId;
+          cmd.pipeline = this.pipelines.get(pipelineId) || null;
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('SetPipeline', `truncated payload (${payloadBytes}B < 4B)`);
         }
         break;
       case OPCODES.SET_VERTEX_BUFFER:
         if (payloadBytes >= 16) {
-          this._passCommands.push({
-            type: 'setVertexBuffer',
-            slot: view.getUint32(payloadOffset, true),
-            bufferId: view.getUint32(payloadOffset + 4, true),
-            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
-          });
+          const cmd = this._acquirePassCommand('setVertexBuffer');
+          cmd.slot = view.getUint32(payloadOffset, true);
+          cmd.bufferId = view.getUint32(payloadOffset + 4, true);
+          cmd.offset = readUint64AsNumber(view, payloadOffset + 8);
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('SetVertexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
         }
         break;
       case OPCODES.DRAW:
         if (payloadBytes >= 16) {
-          this._passCommands.push({
-            type: 'draw',
-            vertexCount: view.getUint32(payloadOffset, true),
-            instanceCount: view.getUint32(payloadOffset + 4, true),
-            firstVertex: view.getUint32(payloadOffset + 8, true),
-            firstInstance: view.getUint32(payloadOffset + 12, true),
-          });
+          const cmd = this._acquirePassCommand('draw');
+          cmd.vertexCount = view.getUint32(payloadOffset, true);
+          cmd.instanceCount = view.getUint32(payloadOffset + 4, true);
+          cmd.firstVertex = view.getUint32(payloadOffset + 8, true);
+          cmd.firstInstance = view.getUint32(payloadOffset + 12, true);
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('Draw', `truncated payload (${payloadBytes}B < 16B)`);
         }
@@ -10870,12 +11203,11 @@ class WgpuCommandProcessor {
         if (payloadBytes >= 8) {
           const groupIndex = view.getUint32(payloadOffset, true);
           const bindGroupId = view.getUint32(payloadOffset + 4, true);
-          this._passCommands.push({
-            type: 'setBindGroup',
-            groupIndex,
-            bindGroupId,
-            bindGroup: this.bindGroups.get(bindGroupId) || null,
-          });
+          const cmd = this._acquirePassCommand('setBindGroup');
+          cmd.groupIndex = groupIndex;
+          cmd.bindGroupId = bindGroupId;
+          cmd.bindGroup = this.bindGroups.get(bindGroupId) || null;
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('SetBindGroup', `truncated payload (${payloadBytes}B < 8B)`);
         }
@@ -10883,26 +11215,24 @@ class WgpuCommandProcessor {
       case OPCODES.SET_INDEX_BUFFER:
         if (payloadBytes >= 16) {
           const formatCode = view.getUint32(payloadOffset + 4, true);
-          this._passCommands.push({
-            type: 'setIndexBuffer',
-            bufferId: view.getUint32(payloadOffset, true),
-            indexFormat: INDEX_FORMAT_NAMES[formatCode] || 'uint16',
-            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
-          });
+          const cmd = this._acquirePassCommand('setIndexBuffer');
+          cmd.bufferId = view.getUint32(payloadOffset, true);
+          cmd.indexFormat = INDEX_FORMAT_NAMES[formatCode] || 'uint16';
+          cmd.offset = readUint64AsNumber(view, payloadOffset + 8);
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('SetIndexBuffer', `truncated payload (${payloadBytes}B < 16B)`);
         }
         break;
       case OPCODES.DRAW_INDEXED:
         if (payloadBytes >= 20) {
-          this._passCommands.push({
-            type: 'drawIndexed',
-            indexCount: view.getUint32(payloadOffset, true),
-            instanceCount: view.getUint32(payloadOffset + 4, true),
-            firstIndex: view.getUint32(payloadOffset + 8, true),
-            baseVertex: view.getInt32(payloadOffset + 12, true),
-            firstInstance: view.getUint32(payloadOffset + 16, true),
-          });
+          const cmd = this._acquirePassCommand('drawIndexed');
+          cmd.indexCount = view.getUint32(payloadOffset, true);
+          cmd.instanceCount = view.getUint32(payloadOffset + 4, true);
+          cmd.firstIndex = view.getUint32(payloadOffset + 8, true);
+          cmd.baseVertex = view.getInt32(payloadOffset + 12, true);
+          cmd.firstInstance = view.getUint32(payloadOffset + 16, true);
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError('DrawIndexed', `truncated payload (${payloadBytes}B < 20B)`);
         }
@@ -10932,10 +11262,9 @@ class WgpuCommandProcessor {
         break;
       case OPCODES.SET_COMPUTE_PIPELINE:
         if (payloadBytes >= 4) {
-          this._passCommands.push({
-            type: 'setComputePipeline',
-            pipelineId: view.getUint32(payloadOffset, true),
-          });
+          const cmd = this._acquirePassCommand('setComputePipeline');
+          cmd.pipelineId = view.getUint32(payloadOffset, true);
+          this._passCommands.push(cmd);
         }
         break;
       case OPCODES.READBACK_BUFFER:
@@ -10944,12 +11273,11 @@ class WgpuCommandProcessor {
         break;
       case OPCODES.DISPATCH_COMPUTE:
         if (payloadBytes >= 12) {
-          this._passCommands.push({
-            type: 'dispatchCompute',
-            workgroupX: view.getUint32(payloadOffset, true),
-            workgroupY: view.getUint32(payloadOffset + 4, true),
-            workgroupZ: view.getUint32(payloadOffset + 8, true),
-          });
+          const cmd = this._acquirePassCommand('dispatchCompute');
+          cmd.workgroupX = view.getUint32(payloadOffset, true);
+          cmd.workgroupY = view.getUint32(payloadOffset + 4, true);
+          cmd.workgroupZ = view.getUint32(payloadOffset + 8, true);
+          this._passCommands.push(cmd);
         }
         break;
       case OPCODES.DRAW_INDIRECT:
@@ -11175,7 +11503,7 @@ class WgpuCommandProcessor {
       swapchainProbeInFlight: this._swapchainProbeInFlight,
       swapchainProbeSupported: this._swapchainProbeSupported,
       swapchainProbeErrorCount: this._swapchainProbeErrorCount,
-      gpuAdapter: this._gpuAdapter ? { ...this._gpuAdapter } : null,
+      gpuAdapter: this._gpuAdapter,
       chunkedWriteBufferUploads: this._chunkedWriteBufferUploads,
       packetCount: this._packetCount,
       drawCalls: this._drawCallCount,
@@ -11294,7 +11622,8 @@ class WgpuCommandProcessor {
     }
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
-    this._passCommands = [];
+    this._clearPassCommands();
+    this._clearPresentPassBindings();
     this._frameBegunForIndex = -1;
     // W104: drop the replay log and shadow buffer cache.
     this._replayLog.clear();
@@ -11349,6 +11678,8 @@ class WgpuCommandProcessor {
     this._specializedFallbackBindGroups.clear();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
+    this._pendingCommandStreamStartOffset = 0;
+    this._pendingCommandStreamEndOffset = 0;
     this._pendingCommandStreamScanned = true;
     this._explicitFallbackDrawContext = null;
     this.computePipelines.clear();
@@ -11428,6 +11759,14 @@ class WgpuCommandProcessor {
     this._lastSplashPresentMs = null;
     this._pendingTimerReadbacks.clear();
     this._lastPassTimings = null;
+    this._clearPassCommands();
+    this._passCommandPool.length = 0;
+    this._setBindGroup2MetaPool.length = 0;
+    this._clearPresentPassBindings();
+    this._boundBindGroupSlots.clear();
+    this._boundVertexBufferSlots.clear();
+    this._cachedCmdBuffer = null;
+    this._cachedCmdView = null;
     this.ring = null;
   }
 }
@@ -12853,9 +13192,9 @@ function createWgpuWorkerHandler(options = {}) {
   let attachedRing = processor && processor.ring ? processor.ring : null;
   let currentGpuAdapter =
     options.gpuAdapter && typeof options.gpuAdapter === 'object'
-      ? sanitizeGpuAdapterInfo(options.gpuAdapter)
+      ? Object.freeze(sanitizeGpuAdapterInfo(options.gpuAdapter))
       : processor && processor.gpuAdapter && typeof processor.gpuAdapter === 'object'
-        ? sanitizeGpuAdapterInfo(processor.gpuAdapter)
+        ? Object.freeze(sanitizeGpuAdapterInfo(processor.gpuAdapter))
         : null;
   let preloadedInDefaultInit = false;
   let lastTelemetryEmitMs = -Infinity;
@@ -12910,10 +13249,10 @@ function createWgpuWorkerHandler(options = {}) {
 
   function getActiveGpuAdapter() {
     if (processor && processor._gpuAdapter && typeof processor._gpuAdapter === 'object') {
-      return { ...processor._gpuAdapter };
+      return processor._gpuAdapter;
     }
     if (currentGpuAdapter && typeof currentGpuAdapter === 'object') {
-      return { ...currentGpuAdapter };
+      return currentGpuAdapter;
     }
     return null;
   }
@@ -12999,7 +13338,7 @@ function createWgpuWorkerHandler(options = {}) {
       targetProcessor._gpuAdapter &&
       typeof targetProcessor._gpuAdapter === 'object'
     ) {
-      currentGpuAdapter = sanitizeGpuAdapterInfo(targetProcessor._gpuAdapter);
+      currentGpuAdapter = Object.freeze(sanitizeGpuAdapterInfo(targetProcessor._gpuAdapter));
     }
     if (typeof targetProcessor.addFirstVisibleFrameListener === 'function') {
       unbindFirstVisibleFrameListener = targetProcessor.addFirstVisibleFrameListener((info) => {
@@ -13397,7 +13736,7 @@ function createWgpuWorkerHandler(options = {}) {
         throw new Error('processor replaced or destroyed during recovery');
       }
       if (acquired.gpuAdapter && typeof acquired.gpuAdapter === 'object') {
-        currentGpuAdapter = sanitizeGpuAdapterInfo(acquired.gpuAdapter);
+        currentGpuAdapter = Object.freeze(sanitizeGpuAdapterInfo(acquired.gpuAdapter));
         if (typeof targetProcessor.setGpuAdapter === 'function') {
           targetProcessor.setGpuAdapter(currentGpuAdapter);
         }
@@ -13541,7 +13880,7 @@ function createWgpuWorkerHandler(options = {}) {
       postMessage({ error: 'no WebGPU adapter available' });
       return null;
     }
-    const gpuAdapter = await extractSanitizedGpuAdapter(adapter);
+    const gpuAdapter = Object.freeze(await extractSanitizedGpuAdapter(adapter));
     currentGpuAdapter = gpuAdapter;
     if (adapter.info && typeof adapter.info === 'object') {
       const desc = [adapter.info.vendor, adapter.info.architecture, adapter.info.description]
@@ -14364,7 +14703,7 @@ function createWgpuWorkerHandler(options = {}) {
         postMessage({ id: payload.id, destroyed: true });
       } else if ((payload.drainRing || payload.type === 'drain-ring') && processor) {
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
-        const result = processor.drainRing();
+        const result = processor.drainRing(DRAIN_RING_REUSE_OPTS);
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
             notifyHandlerFirstPresent({
@@ -14404,7 +14743,7 @@ function createWgpuWorkerHandler(options = {}) {
           processor.attachGuestMemory(pendingGuestMemory);
         }
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
-        const result = processor.executeCommandBuffer(batchBuffer);
+        const result = processor.executeCommandBuffer(batchBuffer, DRAIN_RING_REUSE_OPTS);
         if (result.presents > 0) {
           if (prevFrames === 0 && result.frameCount >= 1) {
             notifyHandlerFirstPresent({
