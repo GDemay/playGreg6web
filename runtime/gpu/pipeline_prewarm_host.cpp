@@ -1,4 +1,5 @@
 #include "gpu/pipeline_prewarm_host.h"
+#include "os/thread_name.h"
 
 #include <atomic>
 #include <chrono>
@@ -112,6 +113,7 @@ void prewarm_host_start(PrewarmBuilder builder) {
     prewarm_host_stop();
     g_stop = false;
     g_thread = std::thread([b = std::move(builder)]() {
+        playgta6::os::name_this_thread(L"pg6-prewarm");
         while (!g_stop && !b.ready()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }

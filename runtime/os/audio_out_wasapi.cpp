@@ -1,4 +1,5 @@
 #include "os/audio_out_wasapi.h"
+#include "os/thread_name.h"
 
 #include <atomic>
 #include <cstdio>
@@ -102,6 +103,7 @@ struct Wasapi::Impl {
     }
 
     void run() {
+        playgta6::os::name_this_thread(L"pg6-audio-out");
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         client_->Start();
         while (running_) {

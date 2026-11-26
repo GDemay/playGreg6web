@@ -1,4 +1,5 @@
 #include "os/win32_sync.h"
+#include "os/thread_name.h"
 
 #include <algorithm>
 #include <array>
@@ -1145,6 +1146,7 @@ void wake_condition_variable(const void* key, bool wake_all) {
 // ---------------------------------------------------------------------------
 
 void thread_trampoline(std::shared_ptr<ThreadObject> self) {
+    playgta6::os::name_this_thread(L"pg6-guest-thread");
     t_thread.info = self->info;
     {
         std::unique_lock<std::mutex> lock(self->lock);

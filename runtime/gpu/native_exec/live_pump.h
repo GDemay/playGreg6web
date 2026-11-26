@@ -17,6 +17,7 @@
 // closed); void wait_idle(). Optional: bool window_focused() const, forwarded to on_focus on change.
 #pragma once
 
+#include "os/thread_name.h"
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -194,6 +195,7 @@ private:
     }
 
     void run(Factory factory) {
+        playgta6::os::name_this_thread(L"pg6-livepump");
         std::string error;
         std::unique_ptr<Executor> exec = factory ? factory(&error) : nullptr;
         {
