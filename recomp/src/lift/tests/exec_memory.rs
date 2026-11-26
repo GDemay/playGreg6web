@@ -1121,3 +1121,159 @@ fn r63_dual_base_burst_and_cross_slot_marks_execute() {
         }
     }
 }
+
+#[test]
+fn r64_triple_base_burst_and_entry_dead_xmm_elision_execute() {
+    if !exec_or_skip("r64_triple_base_burst_and_entry_dead_xmm_elision_execute") {
+        return;
+    }
+    // Exercises R64a + R64b end-to-end under every memory model:
+    //  - Caller loads poison bytes into `xmm0..3` and `init_xmm8` into `xmm8`, then calls `CALLEE`.
+    //  - `CALLEE` entry block overwrites `xmm0..3` (`vpxor xmm0, xmm0, xmm0`, `vmovdqu xmm1/xmm2`,
+    //    `vpaddw xmm3, xmm1, xmm2`) so their `%state.xmmN` loads are elided at entry (R64a).
+    //  - Partial-write `pinsrd xmm8, eax, 1` preserves incoming lanes 0, 2, 3 of `xmm8` and writes
+    //    `xmm8` and `xmm0` to `[r8]`.
+    //  - 20-instruction interleaved 3-base SIMD blend loop (`[rcx + d]` + `[rdx + d]` -> `[rbx + d]`)
+    //    coalesces into ONE 3-base window burst with ONE shared cold fallback and exact dirty marks.
+    const CALLEE: u64 = CODE_BASE + 0x200;
+    let prog = super::Program::new()
+        .asm(CODE_BASE, |a| {
+            a.vmovdqu(xmm0, xmmword_ptr(r9))?;
+            a.vmovdqu(xmm1, xmmword_ptr(r9))?;
+            a.vmovdqu(xmm2, xmmword_ptr(r9))?;
+            a.vmovdqu(xmm3, xmmword_ptr(r9))?;
+            a.vmovdqu(xmm8, xmmword_ptr(r9 + 16))?;
+            a.jmp(CALLEE)
+        })
+        .asm(CALLEE, |a| {
+            a.vpxor(xmm0, xmm0, xmm0)?;
+            for k in 0..4i32 {
+                let off = k * 16;
+                a.vmovdqu(xmm1, xmmword_ptr(rcx + off))?;
+                a.vmovdqu(xmm2, xmmword_ptr(rdx + off))?;
+                a.vpaddw(xmm3, xmm1, xmm2)?;
+                a.vpaddw(xmm0, xmm0, xmm3)?;
+                a.vmovdqu(xmmword_ptr(rbx + off), xmm3)?;
+            }
+            // Preserve incoming xmm8 lanes 0/2/3 via partial lane insert, then store xmm8 and xmm0.
+            a.pinsrd(xmm8, eax, 1)?;
+            a.vzeroupper()?;
+            a.vmovdqu(xmmword_ptr(r8), xmm8)?;
+            a.vmovdqu(xmmword_ptr(r8 + 16), xmm0)?;
+            a.ret()
+        });
+    let f_caller = prog.function(CODE_BASE);
+    let f_callee = prog.function(CALLEE);
+
+    // src_a: 32 u16 lanes [10, 20, ..., 320]; src_b: 32 u16 lanes [1, 2, ..., 32].
+    let mut src_a = Vec::with_capacity(64);
+    let mut src_b = Vec::with_capacity(64);
+    let mut want_dst = Vec::with_capacity(64);
+    let mut sum_lanes = [0u16; 8];
+    for i in 0..32usize {
+        let a_val = ((i + 1) * 10) as u16;
+        let b_val = (i + 1) as u16;
+        let s_val = a_val.wrapping_add(b_val);
+        src_a.extend_from_slice(&a_val.to_le_bytes());
+        src_b.extend_from_slice(&b_val.to_le_bytes());
+        want_dst.extend_from_slice(&s_val.to_le_bytes());
+        sum_lanes[i % 8] = sum_lanes[i % 8].wrapping_add(s_val);
+    }
+    let mut want_sum = Vec::with_capacity(16);
+    for w in sum_lanes {
+        want_sum.extend_from_slice(&w.to_le_bytes());
+    }
+    let init_xmm8: [u8; 16] = [
+        0x11, 0x22, 0x33, 0x44, 0xAA, 0xBB, 0xCC, 0xDD, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0xEE,
+        0xFF,
+    ];
+    let lane1_val = 0xDEAD_BEEFu32;
+    let mut want_xmm8 = init_xmm8;
+    want_xmm8[4..8].copy_from_slice(&lane1_val.to_le_bytes());
+    // Seed xmm0..xmm3 with non-zero poison values and xmm8 with `init_xmm8` via `[r9]`.
+    let mut seed_vecs = Vec::with_capacity(32);
+    seed_vecs.extend_from_slice(&[0xFFu8; 16]);
+    seed_vecs.extend_from_slice(&init_xmm8);
+    let seed_addr = FLAT_ADDR + 0x400;
+
+    struct TripleScenario {
+        name: &'static str,
+        src_a: u64,
+        src_b: u64,
+        dst: u64,
+        want_slots: Vec<u64>,
+        outside_store: bool,
+    }
+    let tail_addr = FLAT_ADDR + 0x300;
+    let scenarios = [
+        TripleScenario {
+            name: "all_flat",
+            src_a: FLAT_ADDR,
+            src_b: FLAT_ADDR + 0x100,
+            dst: FLAT_ADDR + 0x200,
+            want_slots: vec![],
+            outside_store: true,
+        },
+        TripleScenario {
+            name: "all_three_in_window_single_slot",
+            src_a: boundary(2) + 0x100,
+            src_b: boundary(3) + 0x100,
+            dst: boundary(4) + 0x100,
+            want_slots: vec![4],
+            outside_store: true,
+        },
+        TripleScenario {
+            name: "src_a_straddles_slot",
+            src_a: boundary(2) - 24,
+            src_b: boundary(3) + 0x100,
+            dst: boundary(4) + 0x100,
+            want_slots: vec![4],
+            outside_store: true,
+        },
+        TripleScenario {
+            name: "src_b_straddles_slot",
+            src_a: boundary(1) + 0x100,
+            src_b: boundary(3) - 24,
+            dst: boundary(4) + 0x100,
+            want_slots: vec![4],
+            outside_store: true,
+        },
+        TripleScenario {
+            name: "dst_straddles_slot",
+            src_a: boundary(1) + 0x100,
+            src_b: boundary(2) + 0x100,
+            dst: boundary(6) - 24,
+            want_slots: vec![5, 6],
+            outside_store: true,
+        },
+    ];
+
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f_caller, &f_callee], &[], &memory, GUEST_BASE);
+        for sc in &scenarios {
+            let sc_name = sc.name;
+            let case = Case::new(CODE_BASE)
+                .reg(RAX, u64::from(lane1_val))
+                .reg(RCX, sc.src_a)
+                .reg(super::exec::RDX, sc.src_b)
+                .reg(RBX, sc.dst)
+                .reg(super::exec::R8, tail_addr)
+                .reg(super::exec::R9, seed_addr)
+                .mem(seed_addr, &seed_vecs)
+                .mem(sc.src_a, &src_a)
+                .mem(sc.src_b, &src_b)
+                .read(sc.dst, 64)
+                .read(tail_addr, 32);
+            let o = run(&built, &[case]);
+            ok(&o, &format!("{name}/{sc_name}"));
+            assert_eq!(o[0].mem[0], want_dst, "{name}/{sc_name}: dst");
+            assert_eq!(&o[0].mem[1][0..16], &want_xmm8, "{name}/{sc_name}: xmm8");
+            assert_eq!(&o[0].mem[1][16..32], &want_sum, "{name}/{sc_name}: xmm0 sum");
+            assert_eq!(
+                o[0].dirty,
+                expected_marks(name, &sc.want_slots, sc.outside_store),
+                "{name}/{sc_name}: dirty"
+            );
+        }
+    }
+}

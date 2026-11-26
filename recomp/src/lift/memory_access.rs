@@ -127,17 +127,21 @@ pub(super) struct BurstOverrideBase {
     pub(super) addrs: BTreeMap<String, i64>,
 }
 
-/// Active override for a coalesced 1- or 2-base window burst (`[base_k + d_i]`).
+/// Maximum number of distinct unmodified base GPRs coalesced into a single window burst.
+pub(super) const MAX_BURST_BASES: usize = 3;
+
+/// Active override for a coalesced multi-base window burst (`[base_k + d_i]`, up to
+/// [`MAX_BURST_BASES`] bases).
 #[derive(Clone)]
 pub(super) struct BurstOverride {
     /// True in the 99.95% hot path (flat or single 64 KiB slot per base), false in the cold
     /// boundary-crossing fallback (`__playgta6_guest_read` / `__playgta6_slow_storeN`).
     pub(super) fast: bool,
-    /// Active base descriptors (1 or 2 entries).
+    /// Active base descriptors (1..=[`MAX_BURST_BASES`] entries).
     pub(super) bases: Vec<BurstOverrideBase>,
 }
 
-/// One coalesced 1- or 2-base access burst detected in a basic block's instruction list.
+/// One coalesced multi-base access burst detected in a basic block's instruction list.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct WindowBurst {
     /// First instruction index in `body` (inclusive).
@@ -145,8 +149,8 @@ pub(super) struct WindowBurst {
     /// Last instruction index in `body` (inclusive).
     pub(super) end: usize,
     /// Active base descriptors (`bases[..base_count as usize]`).
-    pub(super) bases: [BurstBase; 2],
-    /// Number of active base descriptors (`1` or `2`).
+    pub(super) bases: [BurstBase; MAX_BURST_BASES],
+    /// Number of active base descriptors (`1..=MAX_BURST_BASES`).
     pub(super) base_count: u8,
 }
 
@@ -1015,13 +1019,13 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// R58/R63: lifts a coalesced 1- or 2-base window burst (`insns = body[burst.start..=burst.end]`)
-    /// under `WindowCheck::Branch` with a single range/page check per active base for its span
-    /// `[reg + min_d, reg + max_end)`:
+    /// R58/R63/R64: lifts a coalesced multi-base window burst (`insns = body[burst.start..=burst.end]`,
+    /// up to [`MAX_BURST_BASES`] unmodified base GPRs) under `WindowCheck::Branch` with a single
+    /// range/page check per active base for its span `[reg + min_d, reg + max_end)`:
     /// - Fast path (each base is flat outside `[W, W+S)`, or inside a single 64 KiB window slot):
     ///   one `delta` per base, direct `base_host + disp` accesses with zero intervening branches
     ///   or table loads, and at most one dirty mark per written base after all stores.
-    /// - Cold fallback (either base's span straddles `W`, `W+S`, or a 64 KiB slot boundary inside
+    /// - Cold fallback (any base's span straddles `W`, `W+S`, or a 64 KiB slot boundary inside
     ///   the window): compact cold runtime helpers (`guest_read` / `slow_storeN`).
     ///
     /// Returns `Ok(true)` if the burst was lifted, or `Ok(false)` (with state rolled back) if any
@@ -1042,9 +1046,9 @@ impl FunctionLifter<'_> {
             return Ok(false);
         }
         // Skip any base register already known to be stack-flat (its accesses are already flat
-        // with zero overhead); if only 1 non-stack-flat base remains, lift as a 1-base burst.
-        let mut active_bases: Vec<BurstBase> = Vec::with_capacity(2);
-        let mut span_m1s: Vec<u64> = Vec::with_capacity(2);
+        // with zero overhead); lift the remaining non-stack-flat bases as a single burst.
+        let mut active_bases: Vec<BurstBase> = Vec::with_capacity(MAX_BURST_BASES);
+        let mut span_m1s: Vec<u64> = Vec::with_capacity(MAX_BURST_BASES);
         for &b in burst.active_bases() {
             if self.stack_flat().is_some()
                 && self

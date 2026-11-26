@@ -715,6 +715,161 @@ fn r63b_dual_base_interleaved_and_long_bursts() {
     );
 }
 
+#[test]
+fn r64b_triple_base_and_32_insn_bursts() {
+    use iced_x86::code_asm::*;
+
+    // 1. Interleaved triple-base filter/blend burst (`[rcx + d]` + `[rdx + d]` -> `[rbx + d]`,
+    //    16 instructions): must coalesce into ONE fast path (`gbf*`), ONE shared cold fallback
+    //    (`gbs*`), 2 chained base-check continuations (`gbc*`), 3 `window_table` lookups (1 per
+    //    base), and 1 coalesced dirty mark (written base `rbx` only).
+    let triple_f = super::asm_function(0x1000, |a| {
+        for k in 0..4i32 {
+            let off = k * 16;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx + off))?;
+            a.vmovdqu(xmm1, xmmword_ptr(rdx + off))?;
+            a.vpaddw(xmm2, xmm0, xmm1)?;
+            a.vmovdqu(xmmword_ptr(rbx + off), xmm2)?;
+        }
+        a.ret()
+    });
+    let triple_ir = lift_module_with([&triple_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        triple_ir.matches("\ngbf").count(),
+        1,
+        "interleaved 3-base burst must emit one combined fast path:\n{triple_ir}"
+    );
+    assert_eq!(
+        triple_ir.matches("\ngbs").count(),
+        1,
+        "interleaved 3-base burst must emit one shared slow fallback:\n{triple_ir}"
+    );
+    assert_eq!(
+        triple_ir.matches("\ngbc").count(),
+        2,
+        "3-base burst chains 2 intermediate base checks before gbf:\n{triple_ir}"
+    );
+    assert_eq!(
+        triple_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        3,
+        "3-base burst must perform exactly 3 window_table lookups (1 per base):\n{triple_ir}"
+    );
+    assert_eq!(
+        triple_ir.matches("load atomic i8, ptr ").count(),
+        1,
+        "only written base rbx needs a dirty mark:\n{triple_ir}"
+    );
+    assert_eq!(
+        triple_ir.matches("store atomic i8 1, ptr ").count(),
+        1,
+        "single coalesced dirty mark for rbx:\n{triple_ir}"
+    );
+
+    // 2. Long 30-instruction (>24, <=32) 3-base burst stays inside ONE single burst.
+    let long30_f = super::asm_function(0x2000, |a| {
+        for k in 0..6i32 {
+            let off = k * 16;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx + off))?;
+            a.vmovdqu(xmm1, xmmword_ptr(rdx + off))?;
+            a.vpaddw(xmm2, xmm0, xmm1)?;
+            a.vpavgw(xmm2, xmm2, xmm0)?;
+            a.vmovdqu(xmmword_ptr(rbx + off), xmm2)?;
+        }
+        a.ret()
+    });
+    let long30_ir = lift_module_with([&long30_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        long30_ir.matches("\ngbf").count(),
+        1,
+        "30-instruction 3-base burst must stay in ONE burst (MAX_BURST_INSNS=32):\n{long30_ir}"
+    );
+    assert_eq!(
+        long30_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        3,
+        "30-instruction 3-base burst must emit 3 window_table lookups:\n{long30_ir}"
+    );
+
+    // 3. 3-base burst where 2 bases write (`rdx` and `rbx`) emits 2 conditional dirty marks.
+    let two_writes_f = super::asm_function(0x3000, |a| {
+        for k in 0..2i32 {
+            let off = k * 16;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx + off))?;
+            a.vmovdqu(xmmword_ptr(rdx + off), xmm0)?;
+            a.vmovdqu(xmmword_ptr(rbx + off), xmm0)?;
+        }
+        a.ret()
+    });
+    let two_writes_ir = lift_module_with([&two_writes_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(two_writes_ir.matches("\ngbf").count(), 1, "{two_writes_ir}");
+    assert_eq!(
+        two_writes_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        3,
+        "{two_writes_ir}"
+    );
+    assert_eq!(two_writes_ir.matches("\ngbm").count(), 2, "{two_writes_ir}");
+    assert_eq!(
+        two_writes_ir.matches("store atomic i8 1, ptr ").count(),
+        2,
+        "{two_writes_ir}"
+    );
+
+    // 4. Soundness: modifying the 3rd base (`rbx`) strictly inside `[rcx, rdx]` burst must NOT
+    //    merge `rbx` into the burst (only `rcx` + `rdx` form a 2-base burst).
+    let mod3_f = super::asm_function(0x4000, |a| {
+        a.vmovdqu(xmm0, xmmword_ptr(rcx))?;
+        a.vmovdqu(xmm1, xmmword_ptr(rdx))?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.add(rbx, 32)?;
+        a.vmovdqu(xmm2, xmmword_ptr(rcx + 16))?;
+        a.vmovdqu(xmm3, xmmword_ptr(rdx + 16))?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm2)?;
+        a.ret()
+    });
+    let mod3_ir = lift_module_with([&mod3_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(mod3_ir.matches("\ngbf").count(), 1, "{mod3_ir}");
+    assert_eq!(
+        mod3_ir.matches("\ngbc").count(),
+        1,
+        "only unmodified rcx+rdx may merge (2 bases -> 1 gbc); modified rbx stays outside:\n{mod3_ir}"
+    );
+
+    // 5. Soundness: modifying partner 2 (`rdx`) at `k` must stop partner 3 (`rbx`) from extending
+    //    the burst past `k` (preventing stale `base_host` reuse if `rdx` were accessed after `k`).
+    let mod_p2_f = super::asm_function(0x5000, |a| {
+        a.vmovdqu(xmm0, xmmword_ptr(rcx))?;
+        a.vmovdqu(xmm1, xmmword_ptr(rdx))?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.vmovdqu(xmm2, xmmword_ptr(rcx + 16))?;
+        a.vmovdqu(xmm3, xmmword_ptr(rdx + 16))?;
+        a.add(rdx, 64)?; // modifies rdx after rcx's burst ends
+        a.vmovdqu(xmm4, xmmword_ptr(rdx))?; // uses NEW rdx!
+        a.vmovdqu(xmmword_ptr(rbx + 16), xmm4)?;
+        a.ret()
+    });
+    let mod_p2_ir = lift_module_with([&mod_p2_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        mod_p2_ir.matches("\ngbc").count(),
+        1,
+        "rdx modification must prevent rbx from extending the burst past `add rdx, 64`:\n{mod_p2_ir}"
+    );
+}
+
 /// FNV-1a 64 of a byte string (stable fingerprint of emitted IR).
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {

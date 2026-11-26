@@ -964,7 +964,8 @@ impl FunctionLifter<'_> {
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
         self.known = Known::default();
-        self.sync_in();
+        let entry_dead_xmm = self.entry_overwritten_xmms();
+        self.sync_in_parts(ALL_STATE & !entry_dead_xmm);
         self.unwind_entry();
         if self.support.contains(&Support::GuestBase)
             && let Some(base_name) = &self.guest_base
@@ -1261,6 +1262,44 @@ impl FunctionLifter<'_> {
 
     fn state_flag_ptr(&mut self, flag: Flag) -> String {
         self.state_ptr(2, Some(flag as usize))
+    }
+
+    /// R64a: bitmask of `StateMask` XMM bits (`xmm0..15`) that the function's entry block
+    /// unconditionally overwrites (all 128 bits) before any read, call, branch, or potentially
+    /// trapping instruction. Skipping their entry-block `%state.xmmN` loads is 100% sound because
+    /// every path from `entry:` stores into `%xmmN` before any read or `sync_out()`.
+    fn entry_overwritten_xmms(&self) -> StateMask {
+        let Some(entry_block) = self.func.blocks.get(&self.func.entry) else {
+            return 0;
+        };
+        let body = match entry_block.instructions.split_last() {
+            Some((_, rest)) if ends_in_transfer(entry_block.terminator) => rest,
+            _ => &entry_block.instructions[..],
+        };
+        let mut factory = InstructionInfoFactory::new();
+        let mut read_before_write: u16 = 0;
+        let mut written_first: u16 = 0;
+        for ins in body {
+            if is_control_transfer(ins)
+                || !flag_liveness::is_modelled_non_trapping(ins)
+                || self.unsupported.iter().any(|u| u.address == ins.ip())
+            {
+                break;
+            }
+            if simd::is_simd(ins) {
+                let info = factory.info(ins);
+                let (reads, full_writes) = simd::xmm_rw_masks(ins, info);
+                read_before_write |= reads & !written_first;
+                written_first |= full_writes & !read_before_write;
+            }
+        }
+        let mut state_mask: StateMask = 0;
+        for idx in 0..16 {
+            if written_first & (1u16 << idx) != 0 {
+                state_mask |= flag_liveness::xmm_state_bit(idx);
+            }
+        }
+        state_mask
     }
 
     /// Loads all tracked registers and flags from `%state` into their allocas.
@@ -1587,10 +1626,10 @@ impl FunctionLifter<'_> {
         self.store_gpr(RSP, &new_rsp)
     }
 
-    /// R58/R63: scans a basic block body for non-overlapping bursts of consecutive plain memory
-    /// accesses sharing 1 or 2 64-bit base GPRs under `WindowCheck::Branch` (`window`,
-    /// `window-stack`, `window-runs`), so the entire burst pays one window range/page check per
-    /// active base instead of one per access.
+    /// R58/R63/R64: scans a basic block body for non-overlapping bursts of consecutive plain memory
+    /// accesses sharing up to [`memory_access::MAX_BURST_BASES`] (3) 64-bit base GPRs under
+    /// `WindowCheck::Branch` (`window`, `window-stack`, `window-runs`), so the entire burst pays
+    /// one window range/page check per active base instead of one per access.
     fn find_window_bursts(&self, body: &[Instruction]) -> Vec<memory_access::WindowBurst> {
         use crate::lift::memory::WindowCheck;
         let MemoryModel::Windowed(w) = self.memory else {
@@ -1599,7 +1638,7 @@ impl FunctionLifter<'_> {
         if w.check != WindowCheck::Branch || body.len() < 2 {
             return Vec::new();
         }
-        const MAX_BURST_INSNS: usize = 24;
+        const MAX_BURST_INSNS: usize = 32;
         #[derive(Clone, Copy)]
         struct Active {
             start: usize,
@@ -1743,22 +1782,16 @@ impl FunctionLifter<'_> {
         close_all(&mut active, &mut candidates);
 
         // Pick non-overlapping bursts in program order (preferring earlier start, then larger span),
-        // merging each chosen burst with the best overlapping unmodified partner base GPR (R63b).
+        // iteratively merging up to `MAX_BURST_BASES` (3) overlapping unmodified base GPRs (R63b/R64b).
         candidates.sort_by_key(|b| (b.start, std::cmp::Reverse(b.end)));
         let mut chosen: Vec<memory_access::WindowBurst> = Vec::new();
         while !candidates.is_empty() {
             let a = candidates.remove(0);
-            let r1 = a.base.reg;
             let limit = (a.start + MAX_BURST_INSNS - 1).min(body.len() - 1);
-            let mut max_end_idx = a.end;
-            if written[a.end] & (1u16 << r1) == 0 {
-                while max_end_idx < limit
-                    && !barriers[max_end_idx + 1]
-                    && written[max_end_idx + 1] & (1u16 << r1) == 0
-                {
-                    max_end_idx += 1;
-                }
-            }
+            let mut bases = [a.base; memory_access::MAX_BURST_BASES];
+            let mut base_count = 1usize;
+            let mut merged_end = a.end;
+            let mut chosen_mask = 1u16 << a.base.reg;
 
             #[derive(Clone, Copy)]
             struct Partner {
@@ -1771,100 +1804,116 @@ impl FunctionLifter<'_> {
                 frozen: bool,
                 dead: bool,
             }
-            let mut partners = [Partner {
-                last_i: 0,
-                min_d: 0,
-                max_end: 0,
-                count: 0,
-                has_write: false,
-                has_simd_mem: false,
-                frozen: false,
-                dead: false,
-            }; 16];
-            partners[r1].dead = true;
 
-            for k in a.start..=max_end_idx {
-                if let Some((reg, disp, size, is_write, is_simd_mem)) = accesses[k] {
-                    let p = &mut partners[reg];
-                    if !p.dead && !p.frozen {
-                        let end_d = disp.saturating_add(size as i64);
-                        if p.count == 0 {
-                            if k > a.end || !span_ok(disp, end_d) {
-                                // Only merge a partner base that actually overlaps `a`.
-                                p.dead = true;
+            while base_count < memory_access::MAX_BURST_BASES {
+                let mut max_end_idx = merged_end;
+                if written[merged_end] & chosen_mask == 0 {
+                    while max_end_idx < limit
+                        && !barriers[max_end_idx + 1]
+                        && written[max_end_idx + 1] & chosen_mask == 0
+                    {
+                        max_end_idx += 1;
+                    }
+                }
+
+                let mut partners = [Partner {
+                    last_i: 0,
+                    min_d: 0,
+                    max_end: 0,
+                    count: 0,
+                    has_write: false,
+                    has_simd_mem: false,
+                    frozen: false,
+                    dead: false,
+                }; 16];
+                for (r, p) in partners.iter_mut().enumerate() {
+                    if chosen_mask & (1u16 << r) != 0 {
+                        p.dead = true;
+                    }
+                }
+
+                for k in a.start..=max_end_idx {
+                    if let Some((reg, disp, size, is_write, is_simd_mem)) = accesses[k] {
+                        let p = &mut partners[reg];
+                        if !p.dead && !p.frozen {
+                            let end_d = disp.saturating_add(size as i64);
+                            if p.count == 0 {
+                                if k > merged_end || !span_ok(disp, end_d) {
+                                    // Only merge a partner base that actually overlaps the burst.
+                                    p.dead = true;
+                                } else {
+                                    p.last_i = k;
+                                    p.min_d = disp;
+                                    p.max_end = end_d;
+                                    p.count = 1;
+                                    p.has_write = is_write;
+                                    p.has_simd_mem = is_simd_mem;
+                                }
                             } else {
-                                p.last_i = k;
-                                p.min_d = disp;
-                                p.max_end = end_d;
-                                p.count = 1;
-                                p.has_write = is_write;
-                                p.has_simd_mem = is_simd_mem;
+                                let new_min = p.min_d.min(disp);
+                                let new_max = p.max_end.max(end_d);
+                                if span_ok(new_min, new_max) {
+                                    p.last_i = k;
+                                    p.min_d = new_min;
+                                    p.max_end = new_max;
+                                    p.count += 1;
+                                    p.has_write |= is_write;
+                                    p.has_simd_mem |= is_simd_mem;
+                                } else {
+                                    p.frozen = true;
+                                }
                             }
-                        } else {
-                            let new_min = p.min_d.min(disp);
-                            let new_max = p.max_end.max(end_d);
-                            if span_ok(new_min, new_max) {
-                                p.last_i = k;
-                                p.min_d = new_min;
-                                p.max_end = new_max;
-                                p.count += 1;
-                                p.has_write |= is_write;
-                                p.has_simd_mem |= is_simd_mem;
-                            } else {
-                                p.frozen = true;
+                        }
+                    }
+                    let w_mask = written[k];
+                    if w_mask != 0 {
+                        for (r2, p) in partners.iter_mut().enumerate() {
+                            if w_mask & (1u16 << r2) != 0 && !p.dead {
+                                if k < merged_end {
+                                    // Modified strictly inside `[a.start, merged_end)`: unsafe to hoist.
+                                    p.dead = true;
+                                } else {
+                                    // Modified at or after `merged_end`: valid through `k` as the
+                                    // final instruction of the burst, so freeze further extension.
+                                    p.frozen = true;
+                                }
                             }
                         }
                     }
                 }
-                let w_mask = written[k];
-                if w_mask != 0 {
-                    for (r2, p) in partners.iter_mut().enumerate() {
-                        if w_mask & (1u16 << r2) != 0 && !p.dead {
-                            if k < a.end {
-                                // Modified strictly inside `[a.start, a.end)`: unsafe to hoist.
-                                p.dead = true;
-                            } else {
-                                // Modified at or after `a.end`: valid through `k` as the final
-                                // instruction of the burst, so freeze further extension.
-                                p.frozen = true;
-                            }
-                        }
-                    }
-                }
+
+                let best_partner = partners
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| {
+                        !p.dead
+                            && meets_threshold(p.count, p.has_write, p.has_simd_mem)
+                            && span_ok(p.min_d, p.max_end)
+                    })
+                    .max_by_key(|(_, p)| {
+                        (p.count, usize::from(p.has_write), usize::from(p.has_simd_mem))
+                    })
+                    .map(|(r2, &p)| (r2, p));
+
+                let Some((r2, p)) = best_partner else {
+                    break;
+                };
+                bases[base_count] = memory_access::BurstBase {
+                    reg: r2,
+                    min_d: p.min_d,
+                    max_end: p.max_end,
+                    has_write: p.has_write,
+                };
+                base_count += 1;
+                chosen_mask |= 1u16 << r2;
+                merged_end = merged_end.max(p.last_i);
             }
 
-            let best_partner = partners
-                .iter()
-                .enumerate()
-                .filter(|(_, p)| {
-                    !p.dead
-                        && meets_threshold(p.count, p.has_write, p.has_simd_mem)
-                        && span_ok(p.min_d, p.max_end)
-                })
-                .max_by_key(|(_, p)| (p.count, usize::from(p.has_write), usize::from(p.has_simd_mem)))
-                .map(|(r2, &p)| (r2, p));
-
-            let (merged_end, bases, base_count) = match best_partner {
-                Some((r2, p)) => (
-                    a.end.max(p.last_i),
-                    [
-                        a.base,
-                        memory_access::BurstBase {
-                            reg: r2,
-                            min_d: p.min_d,
-                            max_end: p.max_end,
-                            has_write: p.has_write,
-                        },
-                    ],
-                    2u8,
-                ),
-                None => (a.end, [a.base, a.base], 1u8),
-            };
             chosen.push(memory_access::WindowBurst {
                 start: a.start,
                 end: merged_end,
                 bases,
-                base_count,
+                base_count: base_count as u8,
             });
 
             // Drop covered candidates and trim any candidate whose tail extends past `merged_end`.
