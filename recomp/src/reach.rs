@@ -118,10 +118,14 @@ impl State {
         for (o, x) in out.0.iter_mut().zip(other.0.iter()) {
             *o = o.join(*x);
         }
-        for (o, x) in out.1.iter_mut().zip(other.1.iter()) {
-            *o = match (*o, *x) {
+        for (i, o) in out.1.iter_mut().enumerate() {
+            *o = match (self.1[i], other.1[i]) {
                 (ALIAS_UNVISITED, y) | (y, ALIAS_UNVISITED) => y,
                 (a, b) if a == b => a,
+                // Copies of one source on one path, of each other on the other: `i = a` and
+                // `b = a` on the first path make `i` a copy of `b` there too (and symmetrically).
+                (a, b) if b < GPR_COUNT as u8 && self.1[usize::from(b)] == a => b,
+                (a, b) if a < GPR_COUNT as u8 && other.1[usize::from(a)] == b => a,
                 _ => NO_ALIAS,
             };
         }
@@ -411,6 +415,30 @@ fn writes(info: &mut InstructionInfoFactory, instr: &Instruction, reg: Register)
 }
 
 /// Apply `instr` to `state`.
+/// Register `i` is overwritten: it is no longer a copy of anything, and the registers that were
+/// copies of it (`j = zext(i32)`) and survive the write (`keeps(j)`) stay copies of each other.
+/// The first of them takes the place of `i` as their source; the rest lose their relation.
+fn unlink(state: &mut State, i: usize, keeps: &dyn Fn(usize) -> bool) {
+    state.1[i] = NO_ALIAS;
+    let mut rep: Option<u8> = None;
+    for j in 0..GPR_COUNT {
+        if j == i || usize::from(state.1[j]) != i {
+            continue;
+        }
+        if !keeps(j) {
+            state.1[j] = NO_ALIAS;
+            continue;
+        }
+        match rep {
+            None => {
+                rep = Some(j as u8);
+                state.1[j] = NO_ALIAS;
+            }
+            Some(r) => state.1[j] = r,
+        }
+    }
+}
+
 fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut State) {
     if matches!(
         instr.flow_control(),
@@ -423,11 +451,7 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
         }
         for i in 0..GPR_COUNT {
             if is_win64_volatile(Register::RAX + i as u32) {
-                state.1[i] = NO_ALIAS;
-            }
-            let src = state.1[i];
-            if src != NO_ALIAS && is_win64_volatile(Register::RAX + u32::from(src)) {
-                state.1[i] = NO_ALIAS;
+                unlink(state, i, &|j| !is_win64_volatile(Register::RAX + j as u32));
             }
         }
         return;
@@ -470,15 +494,9 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
             instr.op1_register().full_register(),
         )
     });
-    for reg in &written {
-        if let Some(i) = slot(*reg) {
-            state.1[i] = NO_ALIAS;
-            for other in state.1.iter_mut() {
-                if usize::from(*other) == i {
-                    *other = NO_ALIAS;
-                }
-            }
-        }
+    let written_slots: Vec<usize> = written.iter().filter_map(|r| slot(*r)).collect();
+    for &i in &written_slots {
+        unlink(state, i, &|j| !written_slots.contains(&j));
     }
     if let Some((dst, src)) = copy
         && let (Some(d), Some(sr)) = (slot(dst), slot(src))
