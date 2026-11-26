@@ -89,6 +89,7 @@ from typing import Callable, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import boot_summary  # noqa: E402
 import compare_boot_reports  # noqa: E402
 import find_chrome  # noqa: E402
 import screen_timeline  # noqa: E402
@@ -1129,6 +1130,10 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         text += NL + waits
     (run_dir / "digest.txt").write_text(text + "\n", encoding="utf-8")
     print(text)
+    try:
+        print(NL + "summary (tools/boot_summary.py):" + NL + boot_summary.render_path(run_dir))
+    except (OSError, ValueError) as exc:
+        print(f"[run] boot_summary failed: {exc}", file=sys.stderr)
     hint = shader_pack_hint(report, args.shader_pack)
     if hint:
         print(hint)

@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
   Build (if stale, with the Dawn native executor on) and play natively: a live window, audio out, keyboard/pad.
-  Thin wrapper around tools/run_native_boot.py --play (uses the object/lift/recomp caches).
+  Thin wrapper around tools/run_native_boot.py --play (uses the object/lift/recomp caches). At the end of every run the boot summary (tools/boot_summary.py) is printed.
 .EXAMPLE
   .\tools\play_native.ps1 -MaxMs 120000
 .NOTES
