@@ -9,12 +9,14 @@ const HTTPFS_PAYLOAD_BYTES = 64 * 1024; // 64 KiB fixed transfer buffer
 const HTTPFS_MAILBOX_BYTES = HTTPFS_HEADER_BYTES + HTTPFS_PAYLOAD_BYTES;
 
 // Mailbox state machine transitions for Atomics.wait / Atomics.notify:
-//   Idle -> RequestReady (client) -> ResponseReady / Error (worker) -> Idle (client)
+//   Idle -> Claimed (client CAS) -> RequestReady (client) -> ResponseReady / Error (worker)
+//        -> [RequestReady (client, next chunk) -> ...] -> Idle (client + notify)
 //   Any  -> Shutdown (teardown to wake blocked responder/client threads)
 const HttpfsStatus = Object.freeze({
   Idle: 0,
   RequestReady: 1,
   ResponseReady: 2,
+  Claimed: 3,
   Error: -1,
   Shutdown: -2,
   // Uppercase convenience aliases
@@ -23,6 +25,7 @@ const HttpfsStatus = Object.freeze({
   PENDING: 1,
   RESPONSE_READY: 2,
   DONE: 2,
+  CLAIMED: 3,
   ERROR: -1,
   SHUTDOWN: -2,
 });
@@ -1765,6 +1768,7 @@ class HttpfsMailboxHost {
   constructor(sab, options = {}) {
     assertValidMailboxBuffer(sab);
     this.sab = sab;
+    this._isShared = typeof SharedArrayBuffer !== 'undefined' && sab instanceof SharedArrayBuffer;
     this._statusView = new Int32Array(sab, 0, 1);
     this._headerView = new DataView(sab, 0, HTTPFS_HEADER_BYTES);
     this._payloadView = new Uint8Array(
@@ -2054,7 +2058,11 @@ class HttpfsMailboxHost {
     }
     this._headerView.setBigInt64(HttpfsOffsets.RESULT, BigInt(result), true);
     Atomics.store(this._statusView, 0, status);
-    Atomics.notify(this._statusView, 0, 1);
+    if (this._isShared) {
+      // Wake all waiters on statusView[0] so the active lane owner wakes even when
+      // contending pthreads are also sleeping on this shared lane.
+      Atomics.notify(this._statusView, 0);
+    }
   }
 
   _finishOpenResult(handle, cleanPath) {
@@ -2820,7 +2828,9 @@ class HttpfsMailboxHost {
 
   shutdown() {
     Atomics.store(this._statusView, 0, HttpfsStatus.Shutdown);
-    Atomics.notify(this._statusView, 0);
+    if (this._isShared) {
+      Atomics.notify(this._statusView, 0);
+    }
   }
 
   stop() {
@@ -2847,6 +2857,7 @@ class HttpfsMailboxClient {
         ? { responder: optionsOrResponder }
         : optionsOrResponder || {};
     this.sab = sab;
+    this._isShared = typeof SharedArrayBuffer !== 'undefined' && sab instanceof SharedArrayBuffer;
     this._statusView = new Int32Array(sab, 0, 1);
     this._headerView = new DataView(sab, 0, HTTPFS_HEADER_BYTES);
     this._payloadView = new Uint8Array(
@@ -2873,26 +2884,190 @@ class HttpfsMailboxClient {
     assertValidMailboxBuffer(sab);
     const statusView = new Int32Array(sab, 0, 1);
     Atomics.store(statusView, 0, HttpfsStatus.Shutdown);
-    Atomics.notify(statusView, 0);
+    if (typeof SharedArrayBuffer !== 'undefined' && sab instanceof SharedArrayBuffer) {
+      Atomics.notify(statusView, 0);
+    }
+  }
+
+  _tryAcquireLaneImmediate() {
+    if (!this._isShared || typeof Atomics.compareExchange !== 'function') {
+      if (this._statusView[0] === HttpfsStatus.Shutdown) {
+        return HttpfsStatus.Shutdown;
+      }
+      this._statusView[0] = HttpfsStatus.Claimed;
+      return HttpfsStatus.Idle;
+    }
+    return Atomics.compareExchange(
+      this._statusView,
+      0,
+      HttpfsStatus.Idle,
+      HttpfsStatus.Claimed,
+    );
+  }
+
+  _acquireLaneSync() {
+    let observed = this._tryAcquireLaneImmediate();
+    if (observed === HttpfsStatus.Idle) {
+      return true;
+    }
+    if (observed === HttpfsStatus.Shutdown) {
+      return false;
+    }
+
+    // Brief bounded spin before entering OS futex sleep for contended shared lanes.
+    for (let s = 0; s < HTTPFS_CLIENT_SYNC_SPIN_ITERS; s += 1) {
+      observed = Atomics.load(this._statusView, 0);
+      if (observed === HttpfsStatus.Idle) {
+        observed = Atomics.compareExchange(
+          this._statusView,
+          0,
+          HttpfsStatus.Idle,
+          HttpfsStatus.Claimed,
+        );
+        if (observed === HttpfsStatus.Idle) {
+          return true;
+        }
+      }
+      if (observed === HttpfsStatus.Shutdown) {
+        return false;
+      }
+    }
+
+    const deadline = defaultNowMs() + this._timeoutMs;
+    while (true) {
+      observed = Atomics.compareExchange(
+        this._statusView,
+        0,
+        HttpfsStatus.Idle,
+        HttpfsStatus.Claimed,
+      );
+      if (observed === HttpfsStatus.Idle) {
+        return true;
+      }
+      if (observed === HttpfsStatus.Shutdown) {
+        return false;
+      }
+      const remaining = deadline - defaultNowMs();
+      if (remaining <= 0) {
+        return false;
+      }
+      const waitResult = Atomics.wait(this._statusView, 0, observed, remaining);
+      if (waitResult === 'timed-out') {
+        if (Atomics.load(this._statusView, 0) === HttpfsStatus.Idle) {
+          continue;
+        }
+        return false;
+      }
+    }
+  }
+
+  async _acquireLaneAsync() {
+    let observed = this._tryAcquireLaneImmediate();
+    if (observed === HttpfsStatus.Idle) {
+      return true;
+    }
+    if (observed === HttpfsStatus.Shutdown) {
+      return false;
+    }
+
+    const deadline = defaultNowMs() + this._timeoutMs;
+    while (true) {
+      observed = Atomics.compareExchange(
+        this._statusView,
+        0,
+        HttpfsStatus.Idle,
+        HttpfsStatus.Claimed,
+      );
+      if (observed === HttpfsStatus.Idle) {
+        return true;
+      }
+      if (observed === HttpfsStatus.Shutdown) {
+        return false;
+      }
+      const remaining = deadline - defaultNowMs();
+      if (remaining <= 0) {
+        return false;
+      }
+      if (typeof Atomics.waitAsync === 'function') {
+        const waitObj = Atomics.waitAsync(this._statusView, 0, observed, remaining);
+        const waitResult = waitObj.async ? await waitObj.value : waitObj.value;
+        if (waitResult === 'timed-out') {
+          if (Atomics.load(this._statusView, 0) === HttpfsStatus.Idle) {
+            continue;
+          }
+          return false;
+        }
+      } else {
+        await new Promise((r) => setTimeout(r, 1));
+      }
+    }
   }
 
   _resetToIdle(status) {
-    if (status !== HttpfsStatus.Shutdown) {
-      // Store Idle without calling Atomics.notify: avoids spuriously waking the responder
-      // only to see Idle and allocate a second Atomics.waitAsync promise.
-      Atomics.store(this._statusView, 0, HttpfsStatus.Idle);
+    if (status === HttpfsStatus.Shutdown) {
+      return;
+    }
+    if (!this._isShared) {
+      if (this._statusView[0] !== HttpfsStatus.Shutdown) {
+        this._statusView[0] = HttpfsStatus.Idle;
+      }
+      return;
+    }
+    // Atomically release back to Idle without clobbering a concurrent Shutdown,
+    // and wake waiters so any pthread waiting to claim this lane proceeds immediately.
+    for (;;) {
+      const cur = Atomics.load(this._statusView, 0);
+      if (cur === HttpfsStatus.Shutdown) {
+        return;
+      }
+      if (Atomics.compareExchange(this._statusView, 0, cur, HttpfsStatus.Idle) === cur) {
+        Atomics.notify(this._statusView, 0);
+        return;
+      }
+    }
+  }
+
+  _publishRequestReady() {
+    if (!this._isShared) {
+      if (this._statusView[0] === HttpfsStatus.Shutdown) {
+        return false;
+      }
+      this._statusView[0] = HttpfsStatus.RequestReady;
+      return true;
+    }
+    for (;;) {
+      const cur = Atomics.load(this._statusView, 0);
+      if (cur === HttpfsStatus.Shutdown) {
+        return false;
+      }
+      if (Atomics.compareExchange(this._statusView, 0, cur, HttpfsStatus.RequestReady) === cur) {
+        // Wake all waiters so the host wakes even if contending clients are waiting on this lane.
+        Atomics.notify(this._statusView, 0);
+        return true;
+      }
     }
   }
 
   _executeRoundtripSync() {
-    Atomics.store(this._statusView, 0, HttpfsStatus.RequestReady);
-    Atomics.notify(this._statusView, 0, 1);
+    if (!this._publishRequestReady()) {
+      return { status: HttpfsStatus.Shutdown, result: -1n };
+    }
 
     if (this._responder) {
       this._responder(this.sab);
     }
 
-    let cur = Atomics.load(this._statusView, 0);
+    let cur = this._isShared ? Atomics.load(this._statusView, 0) : this._statusView[0];
+    if (!this._isShared) {
+      if (cur === HttpfsStatus.RequestReady) {
+        return { status: HttpfsStatus.Error, result: -110n };
+      }
+      return {
+        status: cur,
+        result: this._headerView.getBigInt64(HttpfsOffsets.RESULT, true),
+      };
+    }
+
     if (cur === HttpfsStatus.RequestReady && !this._responder) {
       // Brief bounded spin before entering OS futex sleep to catch fast synchronous cache hits.
       for (let s = 0; s < HTTPFS_CLIENT_SYNC_SPIN_ITERS; s += 1) {
@@ -2922,14 +3097,25 @@ class HttpfsMailboxClient {
   }
 
   async _executeRoundtripAsync() {
-    Atomics.store(this._statusView, 0, HttpfsStatus.RequestReady);
-    Atomics.notify(this._statusView, 0, 1);
+    if (!this._publishRequestReady()) {
+      return { status: HttpfsStatus.Shutdown, result: -1n };
+    }
 
     if (this._responder) {
       await this._responder(this.sab);
     }
 
-    let cur = Atomics.load(this._statusView, 0);
+    let cur = this._isShared ? Atomics.load(this._statusView, 0) : this._statusView[0];
+    if (!this._isShared) {
+      if (cur === HttpfsStatus.RequestReady) {
+        return { status: HttpfsStatus.Error, result: -110n };
+      }
+      return {
+        status: cur,
+        result: this._headerView.getBigInt64(HttpfsOffsets.RESULT, true),
+      };
+    }
+
     while (cur === HttpfsStatus.RequestReady) {
       if (typeof Atomics.waitAsync === 'function') {
         const waitObj = Atomics.waitAsync(
@@ -2955,6 +3141,15 @@ class HttpfsMailboxClient {
     };
   }
 
+  _writeOpenRequest(encoded) {
+    this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Open, true);
+    this._headerView.setInt32(HttpfsOffsets.HANDLE, -1, true);
+    this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
+    this._headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(encoded.byteLength), true);
+    this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+    this._payloadView.set(encoded, 0);
+  }
+
   _prepareOpen(relPath) {
     if (typeof relPath !== 'string' || relPath.length === 0) {
       return false;
@@ -2964,37 +3159,62 @@ class HttpfsMailboxClient {
     if (encoded.byteLength === 0 || encoded.byteLength > cap) {
       return false;
     }
-    this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Open, true);
-    this._headerView.setInt32(HttpfsOffsets.HANDLE, -1, true);
-    this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
-    this._headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(encoded.byteLength), true);
-    this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
-    this._payloadView.set(encoded, 0);
+    this._writeOpenRequest(encoded);
     return true;
   }
 
   open(relPath) {
-    if (!this._prepareOpen(relPath)) {
+    if (typeof relPath !== 'string' || relPath.length === 0) {
       return -1;
     }
-    const { status, result } = this._executeRoundtripSync();
-    this._resetToIdle(status);
-    if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+    const encoded = textEncoder.encode(relPath);
+    if (encoded.byteLength === 0 || encoded.byteLength > this.payloadCapacity) {
       return -1;
     }
-    return Number(result) | 0;
+    if (!this._acquireLaneSync()) {
+      return -1;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._writeOpenRequest(encoded);
+      const { status, result } = this._executeRoundtripSync();
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+        return -1;
+      }
+      return Number(result) | 0;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 
   async openAsync(relPath) {
-    if (!this._prepareOpen(relPath)) {
+    if (typeof relPath !== 'string' || relPath.length === 0) {
       return -1;
     }
-    const { status, result } = await this._executeRoundtripAsync();
-    this._resetToIdle(status);
-    if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+    const encoded = textEncoder.encode(relPath);
+    if (encoded.byteLength === 0 || encoded.byteLength > this.payloadCapacity) {
       return -1;
     }
-    return Number(result) | 0;
+    const fast = this._tryAcquireLaneImmediate();
+    if (fast === HttpfsStatus.Shutdown) {
+      return -1;
+    }
+    if (fast !== HttpfsStatus.Idle && !(await this._acquireLaneAsync())) {
+      return -1;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._writeOpenRequest(encoded);
+      const { status, result } = await this._executeRoundtripAsync();
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n) {
+        return -1;
+      }
+      return Number(result) | 0;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 
   read(handle, offset, dst, len) {
@@ -3012,41 +3232,48 @@ class HttpfsMailboxClient {
     let remaining = reqLen;
     let outCursor = 0;
     let totalRead = 0;
-    let lastStatus = HttpfsStatus.Idle;
 
-    while (remaining > 0) {
-      const chunk = Math.min(remaining, cap);
-      const chunkBig = BigInt(chunk);
-      this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
-      this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
-      this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
-      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
-      this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
-
-      const { status, result } = this._executeRoundtripSync();
-      lastStatus = status;
-      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
-        this._resetToIdle(status);
-        return result < 0n ? Number(result) : -1;
-      }
-
-      const got = Number(result);
-      if (got > 0) {
-        dst.set(this._payloadView.subarray(0, got), outCursor);
-      }
-
-      outCursor += got;
-      curOffset += BigInt(got);
-      remaining -= got;
-      totalRead += got;
-
-      if (got < chunk) {
-        break;
-      }
+    if (!this._acquireLaneSync()) {
+      return -1;
     }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      // Keep the lane claimed across all chunks of a multi-chunk read (W367 optimization),
+      // releasing to Idle + notify once in `finally`.
+      while (remaining > 0) {
+        const chunk = Math.min(remaining, cap);
+        const chunkBig = BigInt(chunk);
+        this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
+        this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
+        this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
+        this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
+        this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
-    this._resetToIdle(lastStatus);
-    return totalRead;
+        const { status, result } = this._executeRoundtripSync();
+        lastStatus = status;
+        if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
+          return result < 0n ? Number(result) : -1;
+        }
+
+        const got = Number(result);
+        if (got > 0) {
+          dst.set(this._payloadView.subarray(0, got), outCursor);
+        }
+
+        outCursor += got;
+        curOffset += BigInt(got);
+        remaining -= got;
+        totalRead += got;
+
+        if (got < chunk) {
+          break;
+        }
+      }
+
+      return totalRead;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 
   async readAsync(handle, offset, dst, len) {
@@ -3064,69 +3291,98 @@ class HttpfsMailboxClient {
     let remaining = reqLen;
     let outCursor = 0;
     let totalRead = 0;
-    let lastStatus = HttpfsStatus.Idle;
 
-    while (remaining > 0) {
-      const chunk = Math.min(remaining, cap);
-      const chunkBig = BigInt(chunk);
-      this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
-      this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
-      this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
-      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
-      this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
-
-      const { status, result } = await this._executeRoundtripAsync();
-      lastStatus = status;
-      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
-        this._resetToIdle(status);
-        return result < 0n ? Number(result) : -1;
-      }
-
-      const got = Number(result);
-      if (got > 0) {
-        dst.set(this._payloadView.subarray(0, got), outCursor);
-      }
-
-      outCursor += got;
-      curOffset += BigInt(got);
-      remaining -= got;
-      totalRead += got;
-
-      if (got < chunk) {
-        break;
-      }
+    const fast = this._tryAcquireLaneImmediate();
+    if (fast === HttpfsStatus.Shutdown) {
+      return -1;
     }
+    if (fast !== HttpfsStatus.Idle && !(await this._acquireLaneAsync())) {
+      return -1;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      while (remaining > 0) {
+        const chunk = Math.min(remaining, cap);
+        const chunkBig = BigInt(chunk);
+        this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
+        this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
+        this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
+        this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
+        this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
-    this._resetToIdle(lastStatus);
-    return totalRead;
+        const { status, result } = await this._executeRoundtripAsync();
+        lastStatus = status;
+        if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
+          return result < 0n ? Number(result) : -1;
+        }
+
+        const got = Number(result);
+        if (got > 0) {
+          dst.set(this._payloadView.subarray(0, got), outCursor);
+        }
+
+        outCursor += got;
+        curOffset += BigInt(got);
+        remaining -= got;
+        totalRead += got;
+
+        if (got < chunk) {
+          break;
+        }
+      }
+
+      return totalRead;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 
   close(handle) {
     const h = Number(handle) | 0;
     if (h < 0) return false;
-    this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Close, true);
-    this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
-    this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
-    this._headerView.setBigUint64(HttpfsOffsets.LENGTH, 0n, true);
-    this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+    if (!this._acquireLaneSync()) {
+      return false;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Close, true);
+      this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
+      this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
+      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, 0n, true);
+      this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
-    const { status, result } = this._executeRoundtripSync();
-    this._resetToIdle(status);
-    return status === HttpfsStatus.ResponseReady && result >= 0n;
+      const { status, result } = this._executeRoundtripSync();
+      lastStatus = status;
+      return status === HttpfsStatus.ResponseReady && result >= 0n;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 
   async closeAsync(handle) {
     const h = Number(handle) | 0;
     if (h < 0) return false;
-    this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Close, true);
-    this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
-    this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
-    this._headerView.setBigUint64(HttpfsOffsets.LENGTH, 0n, true);
-    this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+    const fast = this._tryAcquireLaneImmediate();
+    if (fast === HttpfsStatus.Shutdown) {
+      return false;
+    }
+    if (fast !== HttpfsStatus.Idle && !(await this._acquireLaneAsync())) {
+      return false;
+    }
+    let lastStatus = HttpfsStatus.Claimed;
+    try {
+      this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Close, true);
+      this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
+      this._headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
+      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, 0n, true);
+      this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
-    const { status, result } = await this._executeRoundtripAsync();
-    this._resetToIdle(status);
-    return status === HttpfsStatus.ResponseReady && result >= 0n;
+      const { status, result } = await this._executeRoundtripAsync();
+      lastStatus = status;
+      return status === HttpfsStatus.ResponseReady && result >= 0n;
+    } finally {
+      this._resetToIdle(lastStatus);
+    }
   }
 }
 

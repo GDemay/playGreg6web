@@ -1,3 +1,5 @@
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -6,9 +8,11 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -2117,6 +2121,126 @@ void test_program_boot_shader_pack_toc_only_loading() {
     }
 }
 
+void test_program_boot_scoped_httpfs_bridge_concurrent_and_256k_chunks() {
+    FakeFs fs;
+    setup_synthetic_program_fs(fs);
+
+    constexpr size_t kFileBytes = 300 * 1024;  // > 256 KiB to verify 256 KiB direct chunks
+    std::vector<uint8_t> payload_a(kFileBytes);
+    std::vector<uint8_t> payload_b(kFileBytes);
+    for (size_t i = 0; i < kFileBytes; ++i) {
+        payload_a[i] = static_cast<uint8_t>((i * 37u + 11u) & 0xFFu);
+        payload_b[i] = static_cast<uint8_t>((i * 53u + 29u) & 0xFFu);
+    }
+    put_bytes(fs, "game/stream_a.rpf", payload_a);
+    put_bytes(fs, "game/stream_b.rpf", payload_b);
+
+    std::mutex fs_mu;
+    std::atomic<int> in_flight_reads{0};
+    std::atomic<int> peak_in_flight_reads{0};
+    std::atomic<size_t> max_chunk_seen{0};
+    std::atomic<bool> hold_for_overlap{false};
+
+    WasmBootConfig cfg = make_cfg(fs);
+    cfg.read_chunk_bytes = 4096;
+    cfg.open_fn = [&](std::string_view rel_path) -> int32_t {
+        std::lock_guard<std::mutex> lock(fs_mu);
+        return fake_open(rel_path);
+    };
+    cfg.read_fn = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+        if (hold_for_overlap.load(std::memory_order_acquire)) {
+            const int active = in_flight_reads.fetch_add(1, std::memory_order_acq_rel) + 1;
+            int prev_peak = peak_in_flight_reads.load(std::memory_order_relaxed);
+            while (active > prev_peak &&
+                   !peak_in_flight_reads.compare_exchange_weak(
+                       prev_peak, active, std::memory_order_relaxed)) {
+            }
+            size_t prev_max = max_chunk_seen.load(std::memory_order_relaxed);
+            while (len > prev_max &&
+                   !max_chunk_seen.compare_exchange_weak(
+                       prev_max, len, std::memory_order_relaxed)) {
+            }
+            // Rendezvous briefly (bounded) so concurrent readers deterministically overlap.
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+            while (peak_in_flight_reads.load(std::memory_order_acquire) < 2 &&
+                   std::chrono::steady_clock::now() < deadline) {
+                std::this_thread::yield();
+            }
+        }
+        int64_t rc = -9;
+        {
+            std::lock_guard<std::mutex> lock(fs_mu);
+            rc = fake_read(handle, offset, dst, len);
+        }
+        if (hold_for_overlap.load(std::memory_order_acquire)) {
+            in_flight_reads.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        return rc;
+    };
+    cfg.close_fn = [&](int32_t handle) {
+        std::lock_guard<std::mutex> lock(fs_mu);
+        fake_close(handle);
+    };
+
+    const Pg6ProgramModule mods[] = {
+        {"game_scarlett_master.exe", "main", kTestExeBase, kTestImageSize,
+         kTestExeBase + kTestTextRva, kPg6ProgramModuleMain, 0, kTestExeTable, &kTestExeTableCount,
+         nullptr, nullptr},
+    };
+    const Pg6Program prog{kPg6ProgramVersion, 1, mods, nullptr, nullptr};
+
+    size_t reported_cap = 0;
+    std::vector<uint8_t> out_a(kFileBytes, 0);
+    std::vector<uint8_t> out_b(kFileBytes, 0);
+    int64_t got_a = -1;
+    int64_t got_b = -1;
+    bool closed_a = false;
+    bool closed_b = false;
+
+    g_test_entry_hook = [&]() {
+        playgta6::os::HttpfsMailboxClient* client = playgta6::os::win32::get_httpfs_client();
+        if (client == nullptr) {
+            return;
+        }
+        reported_cap = client->payload_capacity();
+        hold_for_overlap.store(true, std::memory_order_release);
+
+        auto worker = [&](const char* rel, std::vector<uint8_t>& out, int64_t& got, bool& closed) {
+            const int32_t h = client->open(rel);
+            if (h < 0) {
+                return;
+            }
+            got = client->read(h, 0, out.data(), out.size());
+            closed = client->close(h);
+        };
+
+        std::thread t1(worker, "stream_a.rpf", std::ref(out_a), std::ref(got_a), std::ref(closed_a));
+        std::thread t2(worker, "stream_b.rpf", std::ref(out_b), std::ref(got_b), std::ref(closed_b));
+        t1.join();
+        t2.join();
+        hold_for_overlap.store(false, std::memory_order_release);
+    };
+
+    playgta6::os::VirtualMemoryArena arena;
+    playgta6::os::win32::set_vmem_arena(&arena);
+    const WasmBootResult r = playgta6::boot::run_wasm_program_boot(cfg, prog);
+    g_test_entry_hook = nullptr;
+    playgta6::guest::reset_boot();
+    playgta6::os::win32::set_vmem_arena(nullptr);
+
+    CHECK(r.ok);
+    CHECK(reported_cap == 256 * 1024);
+    CHECK(max_chunk_seen.load() == 256 * 1024);
+    CHECK(peak_in_flight_reads.load() >= 2);
+    CHECK(got_a == static_cast<int64_t>(kFileBytes));
+    CHECK(got_b == static_cast<int64_t>(kFileBytes));
+    CHECK(out_a == payload_a);
+    CHECK(out_b == payload_b);
+    CHECK(closed_a);
+    CHECK(closed_b);
+    CHECK(fs.handles.empty());
+}
+
 }  // namespace
 
 int main() {
@@ -2139,6 +2263,7 @@ int main() {
     test_program_boot_corrupt_pgim_error_propagation();
     test_program_boot_full_synthetic_execution();
     test_program_boot_scoped_httpfs_bridge();
+    test_program_boot_scoped_httpfs_bridge_concurrent_and_256k_chunks();
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
     test_shader_pack_index_toc_unit();
