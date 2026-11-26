@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <chrono>
 #include <cstring>
+#include <mutex>
 #include <iterator>
 #include <new>
 #include <vector>
@@ -12,6 +14,28 @@
 #include "os/win32_kernel.h"
 
 namespace playgta6::os {
+
+// Scoped lock on GuestHeap::mutex_ that counts acquisitions and, for acquisitions that found the
+// mutex held, the time spent blocked (uncontended path: one try_lock and three plain increments).
+class HeapLock {
+public:
+    explicit HeapLock(const GuestHeap& heap) : heap_(heap), lock_(heap.mutex_, std::try_to_lock) {
+        if (!lock_.owns_lock()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            lock_.lock();
+            const auto waited = std::chrono::steady_clock::now() - t0;
+            ++heap_.lock_contended_;
+            heap_.lock_wait_ns_ += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
+        }
+        ++heap_.lock_acquisitions_;
+    }
+    void unlock() { lock_.unlock(); }
+
+private:
+    const GuestHeap& heap_;
+    std::unique_lock<std::mutex> lock_;
+};
 
 namespace {
 
@@ -262,19 +286,19 @@ uint64_t GuestHeap::alloc(uint64_t size,
         alignment = kMinAlignment;
     }
     if (!is_pow2(alignment)) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         fail_locked(status, HeapStatus::InvalidParameter);
         return 0;
     }
     if (size > kMaxRequest || alignment > kMaxRequest) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         fail_locked(status, HeapStatus::OutOfMemory);
         return 0;
     }
     const bool large = size > kLargeThreshold || alignment > kAllocationGranularity;
 
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         if (!charge_locked(size, family)) {
             fail_locked(status, HeapStatus::OutOfMemory);
             return 0;
@@ -296,7 +320,7 @@ uint64_t GuestHeap::alloc(uint64_t size,
     }
 
     const uint64_t va = reserve_large(size, alignment);
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     if (va == 0) {
         uncharge_locked(size, family);
         stats_.total_allocs -= 1;
@@ -326,7 +350,7 @@ uint64_t GuestHeap::calloc(uint64_t count,
                            HeapFamily family,
                            HeapStatus* status) {
     if (count != 0 && size > kMaxRequest / count) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         fail_locked(status, HeapStatus::OutOfMemory);
         return 0;
     }
@@ -340,7 +364,7 @@ bool GuestHeap::free(uint64_t va, HeapStatus* status) {
     if (va == 0) {
         return true;
     }
-    std::unique_lock<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     auto it = live_.find(va);
     if (it == live_.end()) {
         note_invalid_free(va);
@@ -448,12 +472,12 @@ uint64_t GuestHeap::realloc(uint64_t va,
         return 0;
     }
     if (alignment != 0 && !is_pow2(alignment)) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         fail_locked(status, HeapStatus::InvalidParameter);
         return 0;
     }
     if (size > kMaxRequest) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         fail_locked(status, HeapStatus::OutOfMemory);
         return 0;
     }
@@ -461,7 +485,7 @@ uint64_t GuestHeap::realloc(uint64_t va,
     Block old;
     uint64_t new_align = 0;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        HeapLock lock(*this);
         auto it = live_.find(va);
         if (it == live_.end()) {
             note_invalid_free(va);
@@ -503,7 +527,7 @@ uint64_t GuestHeap::expand(uint64_t va, uint64_t size, HeapStatus* status) {
     if (status != nullptr) {
         *status = HeapStatus::Ok;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     auto it = live_.find(va);
     if (va == 0 || it == live_.end()) {
         if (va != 0) {
@@ -526,13 +550,13 @@ uint64_t GuestHeap::expand(uint64_t va, uint64_t size, HeapStatus* status) {
 }
 
 uint64_t GuestHeap::usable_size(uint64_t va) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     auto it = live_.find(va);
     return it == live_.end() ? kInvalidSize : it->second.size;
 }
 
 bool GuestHeap::block_info(uint64_t va, HeapBlockInfo* out) const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     auto it = live_.find(va);
     if (va == 0 || it == live_.end()) {
         return false;
@@ -547,24 +571,27 @@ bool GuestHeap::block_info(uint64_t va, HeapBlockInfo* out) const {
 }
 
 GuestHeapStats GuestHeap::stats() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     GuestHeapStats copy = stats_;
     copy.soft_limit_bytes = soft_limit_;
+    copy.lock_acquisitions = lock_acquisitions_;
+    copy.lock_contended = lock_contended_;
+    copy.lock_wait_ns = lock_wait_ns_;
     return copy;
 }
 
 void GuestHeap::set_soft_limit(uint64_t bytes) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     soft_limit_ = bytes;
 }
 
 uint64_t GuestHeap::soft_limit() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     return soft_limit_;
 }
 
 void GuestHeap::abandon() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     abandoned_ = true;
     live_.clear();
     segments_.clear();
@@ -574,7 +601,7 @@ void GuestHeap::abandon() {
 }
 
 void GuestHeap::release_all() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    HeapLock lock(*this);
     for (const auto& [va, block] : live_) {
         if (block.large) {
             arena_.release(va);

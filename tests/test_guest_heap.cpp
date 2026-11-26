@@ -371,6 +371,7 @@ void test_family_accounting_and_cross_free(GuestHeap& heap) {
 
 void test_threads(GuestHeap& heap) {
     constexpr int kThreads = 8;
+    const GuestHeapStats lock_before = heap.stats();
 #if defined(__EMSCRIPTEN__)
     constexpr int kIterations = 400;
 #else
@@ -447,6 +448,13 @@ void test_threads(GuestHeap& heap) {
     CHECK(errors.load() == 0);
     CHECK(heap.stats().live_blocks == 0);
     CHECK(heap.stats().live_bytes == 0);
+    // Lock counters: every alloc/free took the lock at least once; contended <= acquisitions.
+    const GuestHeapStats lock_after = heap.stats();
+    CHECK(lock_after.lock_acquisitions >=
+          lock_before.lock_acquisitions + (lock_after.total_allocs - lock_before.total_allocs) +
+              (lock_after.total_frees - lock_before.total_frees));
+    CHECK(lock_after.lock_contended <= lock_after.lock_acquisitions);
+    CHECK(lock_after.lock_contended > 0 || lock_after.lock_wait_ns == 0);
 }
 
 void run_core_suite(GuestHeap& heap) {
