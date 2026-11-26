@@ -4,9 +4,10 @@ use std::fmt;
 use naga::back::wgsl;
 use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{
-    AddressSpace, ArraySize, AtomicFunction, Block, Expression, Function, Handle, ImageClass,
-    ImageDimension, ImageQuery, MemoryDecorations, ResourceBinding, SampleLevel, ScalarKind,
-    ShaderStage, Statement, StorageAccess, StorageFormat, Type, TypeInner,
+    AddressSpace, ArraySize, AtomicFunction, Binding, Block, BuiltIn, Expression, Function, Handle,
+    ImageClass, ImageDimension, ImageQuery, Interpolation, MemoryDecorations, ResourceBinding,
+    SampleLevel, Sampling, ScalarKind, ShaderStage, Statement, StorageAccess, StorageFormat, Type,
+    TypeInner,
 };
 
 use crate::compat::WEBGPU_MAX_BIND_GROUPS;
@@ -268,6 +269,38 @@ impl fmt::Display for LoweringError {
 
 impl std::error::Error for LoweringError {}
 
+/// Maximum baseline WebGPU color attachments (`@location(0..=7)`).
+pub const WEBGPU_MAX_COLOR_ATTACHMENTS: u32 = 8;
+
+/// Interpolation qualifiers for a single fragment input `@location(N)` attribute.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentInputInterpInfo {
+    pub location: u32,
+    pub interpolation: Option<Interpolation>,
+    pub sampling: Option<Sampling>,
+}
+
+/// Summary of a fragment entry point's input interpolation qualifiers, MRT outputs, and depth export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentInterfaceSummary {
+    pub entry_point: String,
+    pub input_interpolations: Vec<FragmentInputInterpInfo>,
+    pub mrt_output_locations: Vec<u32>,
+    pub exports_frag_depth: bool,
+}
+
+/// Summary of 3D PBR texture sampling, MRT, and interpolation lowering rewrites performed on a Naga IR module.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PbrLoweringSummary {
+    pub normalized_depth_compare_levels: usize,
+    pub normalized_gather_levels: usize,
+    pub stripped_cube_offsets: usize,
+    pub fixed_flat_integer_locations: usize,
+    pub sanitized_flat_sampling: usize,
+    pub degraded_sample_rate_inputs: usize,
+    pub fragment_interfaces: Vec<FragmentInterfaceSummary>,
+}
+
 /// Run all WebGPU baseline Naga IR lowering passes in-place on `module`:
 ///
 /// 1. **Pass 1 — Push Constants (`AddressSpace::Immediate`) -> Uniform Buffer:**
@@ -276,12 +309,16 @@ impl std::error::Error for LoweringError {}
 /// 2. **Pass 2 — Bind-Group Compression (`group >= 4` -> `0..=3`):**
 ///    Deterministically remaps every binding with `group >= 4` into the least-populated
 ///    group in `0..=3` using `max_existing_binding + 1`.
+/// 3. **Pass 3 — 3D PBR Sampling & Interpolation Normalization:**
+///    Normalizes gather4 / depth-compare sample levels, strips illegal cube offsets,
+///    and enforces baseline WebGPU `@interpolate(flat)` / sampling rules on inter-stage I/O.
 ///
 /// Intended to run immediately after SPIR-V front-end parsing and BEFORE `naga::valid::Validator`
 /// and WGSL emission. Never panics on empty modules, malformed handles, or saturated groups.
 pub fn lower_module_for_webgpu(module: &mut naga::Module) -> LoweringReport {
     let push_constant_remaps = lower_push_constants(module);
     let bind_group_remaps = lower_bind_groups(module);
+    let _ = lower_pbr_sampling_and_interpolation(module);
     LoweringReport {
         push_constant_remaps,
         bind_group_remaps,
@@ -302,6 +339,7 @@ pub fn try_lower_module_for_webgpu(
     let result = (|| {
         let push_constant_remaps = try_lower_push_constants_inner(module)?;
         let bind_group_remaps = try_lower_bind_groups_inner(module)?;
+        let _ = lower_pbr_sampling_and_interpolation(module);
         Ok(LoweringReport {
             push_constant_remaps,
             bind_group_remaps,
@@ -331,7 +369,11 @@ pub fn lower_and_emit_wgsl(
         }
     };
 
-    let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+    // Core WebGPU 1.0 baseline capabilities: `pack2x16float`/`unpack2x16float` (no `enable f16;`)
+    // and `texture_cube_array`/`texture_depth_cube_array`.
+    let baseline_caps =
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32.union(Capabilities::CUBE_ARRAY_TEXTURES);
+    let mut validator = Validator::new(ValidationFlags::all(), baseline_caps);
     let info = match validator.validate(module) {
         Ok(info) => info,
         Err(err) => {
@@ -558,6 +600,343 @@ fn try_lower_bind_groups_inner(
     }
 
     Ok(remaps)
+}
+
+/// Pass 3: Normalize 3D PBR texture sampling (`gather4`, `sample_c` depth compare, `cube`/`cube_array`
+/// offsets) and inter-stage interpolation qualifiers (`flat` for integers, valid flat sampling,
+/// baseline `centroid` fallback for sample-rate shading), returning a structured summary including
+/// all fragment multi-MRT and interpolation interfaces.
+pub fn lower_pbr_sampling_and_interpolation(module: &mut naga::Module) -> PbrLoweringSummary {
+    let mut summary = PbrLoweringSummary::default();
+
+    // 1. Normalize `Expression::ImageSample` across helper functions and entry points.
+    let stage_reachability = compute_function_stage_reachability(module).unwrap_or_default();
+    let img_dims = collect_global_image_dims(module);
+
+    let fn_handles: Vec<Handle<Function>> = module.functions.iter().map(|(h, _)| h).collect();
+    for h in fn_handles {
+        let non_fragment = stage_reachability
+            .get(&FnRef::Function(h))
+            .is_some_and(|st| st.iter().any(|&s| s != ShaderStage::Fragment));
+        normalize_function_pbr_sampling(
+            &mut module.functions[h],
+            &img_dims,
+            non_fragment,
+            &mut summary,
+        );
+    }
+    for ep in &mut module.entry_points {
+        let non_fragment = ep.stage != ShaderStage::Fragment;
+        normalize_function_pbr_sampling(&mut ep.function, &img_dims, non_fragment, &mut summary);
+    }
+
+    // 2. Normalize inter-stage interpolation qualifiers on vertex outputs and fragment inputs.
+    let mut struct_types_to_normalize: BTreeSet<Handle<Type>> = BTreeSet::new();
+    for ep in &mut module.entry_points {
+        match ep.stage {
+            ShaderStage::Fragment => {
+                for arg in &mut ep.function.arguments {
+                    let arg_ty = arg.ty;
+                    if let Some(binding) = arg.binding.as_mut() {
+                        normalize_interstage_binding(&module.types, arg_ty, binding, &mut summary);
+                    } else if matches!(
+                        lookup_type_in(&module.types, arg_ty).map(|t| &t.inner),
+                        Some(TypeInner::Struct { .. })
+                    ) {
+                        struct_types_to_normalize.insert(arg_ty);
+                    }
+                }
+            }
+            ShaderStage::Vertex => {
+                if let Some(result) = ep.function.result.as_mut() {
+                    let res_ty = result.ty;
+                    if let Some(binding) = result.binding.as_mut() {
+                        normalize_interstage_binding(&module.types, res_ty, binding, &mut summary);
+                    } else if matches!(
+                        lookup_type_in(&module.types, res_ty).map(|t| &t.inner),
+                        Some(TypeInner::Struct { .. })
+                    ) {
+                        struct_types_to_normalize.insert(res_ty);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !struct_types_to_normalize.is_empty() {
+        let mut updates: Vec<(Handle<Type>, Type)> = Vec::new();
+        for ty_handle in struct_types_to_normalize {
+            let Some(orig_ty) = lookup_type(module, ty_handle).cloned() else {
+                continue;
+            };
+            if let TypeInner::Struct { mut members, span } = orig_ty.inner {
+                let mut changed = false;
+                for member in &mut members {
+                    let m_ty = member.ty;
+                    if let Some(binding) = member.binding.as_mut() {
+                        changed |= normalize_interstage_binding(
+                            &module.types,
+                            m_ty,
+                            binding,
+                            &mut summary,
+                        );
+                    }
+                }
+                if changed {
+                    updates.push((
+                        ty_handle,
+                        Type {
+                            name: orig_ty.name,
+                            inner: TypeInner::Struct { members, span },
+                        },
+                    ));
+                }
+            }
+        }
+        let mut remapped: BTreeMap<Handle<Type>, Handle<Type>> = BTreeMap::new();
+        for (handle, replacement) in updates {
+            if let Some((existing_handle, _)) = module
+                .types
+                .iter()
+                .find(|(_, existing)| **existing == replacement)
+            {
+                if existing_handle != handle {
+                    remapped.insert(handle, existing_handle);
+                }
+            } else {
+                module.types.replace(handle, replacement);
+            }
+        }
+        if !remapped.is_empty() {
+            remap_type_handles_in_module(module, &remapped);
+        }
+    }
+
+    summary.fragment_interfaces = inspect_fragment_interface(module);
+    summary
+}
+
+/// Inspect every fragment entry point's input interpolation qualifiers, MRT output locations,
+/// and `@builtin(frag_depth)` usage.
+pub fn inspect_fragment_interface(module: &naga::Module) -> Vec<FragmentInterfaceSummary> {
+    let mut out = Vec::new();
+    for ep in &module.entry_points {
+        if ep.stage != ShaderStage::Fragment {
+            continue;
+        }
+        let mut input_interpolations = Vec::new();
+        for arg in &ep.function.arguments {
+            if let Some(Binding::Location {
+                location,
+                interpolation,
+                sampling,
+                ..
+            }) = arg.binding
+            {
+                input_interpolations.push(FragmentInputInterpInfo {
+                    location,
+                    interpolation,
+                    sampling,
+                });
+            } else if let Some(Type {
+                inner: TypeInner::Struct { members, .. },
+                ..
+            }) = lookup_type(module, arg.ty)
+            {
+                for member in members {
+                    if let Some(Binding::Location {
+                        location,
+                        interpolation,
+                        sampling,
+                        ..
+                    }) = member.binding
+                    {
+                        input_interpolations.push(FragmentInputInterpInfo {
+                            location,
+                            interpolation,
+                            sampling,
+                        });
+                    }
+                }
+            }
+        }
+        input_interpolations.sort_by_key(|info| info.location);
+
+        let mut mrt_set: BTreeSet<u32> = BTreeSet::new();
+        let mut exports_frag_depth = false;
+        if let Some(result) = &ep.function.result {
+            match result.binding {
+                Some(Binding::Location { location, .. }) => {
+                    mrt_set.insert(location);
+                }
+                Some(Binding::BuiltIn(BuiltIn::FragDepth)) => {
+                    exports_frag_depth = true;
+                }
+                None => {
+                    if let Some(Type {
+                        inner: TypeInner::Struct { members, .. },
+                        ..
+                    }) = lookup_type(module, result.ty)
+                    {
+                        for member in members {
+                            match member.binding {
+                                Some(Binding::Location { location, .. }) => {
+                                    mrt_set.insert(location);
+                                }
+                                Some(Binding::BuiltIn(BuiltIn::FragDepth)) => {
+                                    exports_frag_depth = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        out.push(FragmentInterfaceSummary {
+            entry_point: ep.name.clone(),
+            input_interpolations,
+            mrt_output_locations: mrt_set.into_iter().collect(),
+            exports_frag_depth,
+        });
+    }
+    out
+}
+
+fn collect_global_image_dims(
+    module: &naga::Module,
+) -> BTreeMap<Handle<naga::GlobalVariable>, ImageDimension> {
+    let mut dims = BTreeMap::new();
+    for (h, var) in module.global_variables.iter() {
+        let Some(ty) = lookup_type(module, var.ty) else {
+            continue;
+        };
+        let inner = match ty.inner {
+            TypeInner::BindingArray { base, .. } => match lookup_type(module, base) {
+                Some(bt) => &bt.inner,
+                None => continue,
+            },
+            _ => &ty.inner,
+        };
+        if let TypeInner::Image { dim, .. } = *inner {
+            dims.insert(h, dim);
+        }
+    }
+    dims
+}
+
+fn trace_image_dim(
+    func: &Function,
+    img_expr: Handle<Expression>,
+    img_dims: &BTreeMap<Handle<naga::GlobalVariable>, ImageDimension>,
+) -> Option<ImageDimension> {
+    let root = trace_pointer_root_global(func, img_expr)?;
+    img_dims.get(&root).copied()
+}
+
+fn normalize_function_pbr_sampling(
+    func: &mut Function,
+    img_dims: &BTreeMap<Handle<naga::GlobalVariable>, ImageDimension>,
+    non_fragment: bool,
+    summary: &mut PbrLoweringSummary,
+) {
+    let expr_dims: Vec<(Handle<Expression>, Option<ImageDimension>)> = func
+        .expressions
+        .iter()
+        .filter_map(|(h, expr)| match expr {
+            Expression::ImageSample { image, .. } => Some((h, trace_image_dim(func, *image, img_dims))),
+            _ => None,
+        })
+        .collect();
+
+    for (h, dim) in expr_dims {
+        if let Expression::ImageSample {
+            gather,
+            offset,
+            level,
+            depth_ref,
+            ..
+        } = &mut func.expressions[h]
+        {
+            if gather.is_some() {
+                if *level != SampleLevel::Zero {
+                    *level = SampleLevel::Zero;
+                    summary.normalized_gather_levels += 1;
+                }
+            } else if depth_ref.is_some() {
+                let needs_zero = matches!(
+                    level,
+                    SampleLevel::Exact(_) | SampleLevel::Gradient { .. } | SampleLevel::Bias(_)
+                ) || (non_fragment && matches!(level, SampleLevel::Auto));
+                if needs_zero {
+                    *level = SampleLevel::Zero;
+                    summary.normalized_depth_compare_levels += 1;
+                }
+            }
+            if offset.is_some() && dim == Some(ImageDimension::Cube) {
+                *offset = None;
+                summary.stripped_cube_offsets += 1;
+            }
+        }
+    }
+}
+
+fn lookup_type_in(types: &naga::UniqueArena<Type>, handle: Handle<Type>) -> Option<&Type> {
+    (handle.index() < types.len()).then(|| &types[handle])
+}
+
+fn type_is_integer_scalar_or_vector(types: &naga::UniqueArena<Type>, ty: Handle<Type>) -> bool {
+    let Some(t) = lookup_type_in(types, ty) else {
+        return false;
+    };
+    match t.inner {
+        TypeInner::Scalar(s) | TypeInner::Vector { scalar: s, .. } => {
+            matches!(s.kind, ScalarKind::Sint | ScalarKind::Uint)
+        }
+        _ => false,
+    }
+}
+
+fn normalize_interstage_binding(
+    types: &naga::UniqueArena<Type>,
+    ty: Handle<Type>,
+    binding: &mut Binding,
+    summary: &mut PbrLoweringSummary,
+) -> bool {
+    let Binding::Location {
+        interpolation,
+        sampling,
+        ..
+    } = binding
+    else {
+        return false;
+    };
+    let mut changed = false;
+    if type_is_integer_scalar_or_vector(types, ty) {
+        if *interpolation != Some(Interpolation::Flat) || sampling.is_some() {
+            *interpolation = Some(Interpolation::Flat);
+            *sampling = None;
+            summary.fixed_flat_integer_locations += 1;
+            changed = true;
+        }
+    } else if *interpolation == Some(Interpolation::Flat) {
+        if matches!(
+            *sampling,
+            Some(Sampling::Center | Sampling::Centroid | Sampling::Sample)
+        ) {
+            *sampling = None;
+            summary.sanitized_flat_sampling += 1;
+            changed = true;
+        }
+    } else if *sampling == Some(Sampling::Sample) {
+        *sampling = Some(Sampling::Centroid);
+        summary.degraded_sample_rate_inputs += 1;
+        changed = true;
+    }
+    changed
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1797,44 @@ fn validate_function(
     let reachable_from_non_fragment = stages
         .iter()
         .any(|&s| !matches!(s, ShaderStage::Fragment));
+    let img_dims = collect_global_image_dims(module);
+
+    // Validate fragment output MRT locations (0..=7, unique) when this is a fragment entry point.
+    if stages.len() == 1 && stages.contains(&ShaderStage::Fragment)
+        && let Some(result) = &func.result
+    {
+        let mut seen_mrt_locs = BTreeSet::new();
+        let check_loc = |loc: u32, seen: &mut BTreeSet<u32>| -> Result<(), LoweringError> {
+            if loc >= WEBGPU_MAX_COLOR_ATTACHMENTS {
+                return Err(LoweringError::InvalidResourceBinding {
+                    variable: format!("{fn_name} output @location({loc})"),
+                    detail: format!(
+                        "fragment color output location {loc} exceeds WebGPU baseline maxColorAttachments ({WEBGPU_MAX_COLOR_ATTACHMENTS})"
+                    ),
+                });
+            }
+            if !seen.insert(loc) {
+                return Err(LoweringError::InvalidResourceBinding {
+                    variable: format!("{fn_name} output @location({loc})"),
+                    detail: format!("duplicate fragment output @location({loc})"),
+                });
+            }
+            Ok(())
+        };
+        if let Some(Binding::Location { location, .. }) = result.binding {
+            check_loc(location, &mut seen_mrt_locs)?;
+        } else if let Some(Type {
+            inner: TypeInner::Struct { members, .. },
+            ..
+        }) = lookup_type(module, result.ty)
+        {
+            for member in members {
+                if let Some(Binding::Location { location, .. }) = member.binding {
+                    check_loc(location, &mut seen_mrt_locs)?;
+                }
+            }
+        }
+    }
 
     // Validate all expressions in deterministic arena index order.
     for (expr_handle, expr) in func.expressions.iter() {
@@ -1522,6 +1939,25 @@ fn validate_function(
                     SampleLevel::Gradient { x, y } => {
                         ensure_func_expr_handle(func, x, &expr_ctx)?;
                         ensure_func_expr_handle(func, y, &expr_ctx)?;
+                    }
+                }
+                if let Some(dim) = trace_image_dim(func, *image, &img_dims) {
+                    if gather.is_some() && matches!(dim, ImageDimension::D1 | ImageDimension::D3) {
+                        return Err(LoweringError::InvalidTextureOp {
+                            context: expr_ctx,
+                            detail: format!(
+                                "textureGather is not supported for {dim:?} textures in WebGPU (only 2d, 2d_array, cube, cube_array)"
+                            ),
+                        });
+                    }
+                    if depth_ref.is_some() && matches!(dim, ImageDimension::D1 | ImageDimension::D3)
+                    {
+                        return Err(LoweringError::InvalidTextureOp {
+                            context: expr_ctx,
+                            detail: format!(
+                                "depth comparison sampling is not supported for {dim:?} textures in WebGPU"
+                            ),
+                        });
                     }
                 }
                 // `textureGather` (`gather.is_some()`) does not use implicit derivatives and is
@@ -2328,7 +2764,11 @@ mod tests {
     fn validate_wgsl_roundtrip(wgsl_src: &str) {
         let reparsed = wgsl_in::parse_str(wgsl_src)
             .unwrap_or_else(|err| panic!("emitted WGSL failed to re-parse: {err}\n{wgsl_src}"));
-        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+        // Core WebGPU 1.0 baseline capabilities: `pack2x16float`/`unpack2x16float` (no `enable f16;`)
+    // and `texture_cube_array`/`texture_depth_cube_array`.
+    let baseline_caps =
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32.union(Capabilities::CUBE_ARRAY_TEXTURES);
+    let mut validator = Validator::new(ValidationFlags::all(), baseline_caps);
         validator.validate(&reparsed).unwrap_or_else(|err| {
             panic!(
                 "re-parsed WGSL failed baseline WebGPU validation:\n{}\nWGSL:\n{wgsl_src}",
@@ -2383,7 +2823,11 @@ mod tests {
         }
 
         // Validate under strict baseline WebGPU capabilities (Capabilities::empty()).
-        let mut validator = Validator::new(ValidationFlags::all(), Capabilities::empty());
+        // Core WebGPU 1.0 baseline capabilities: `pack2x16float`/`unpack2x16float` (no `enable f16;`)
+    // and `texture_cube_array`/`texture_depth_cube_array`.
+    let baseline_caps =
+        Capabilities::SHADER_FLOAT16_IN_FLOAT32.union(Capabilities::CUBE_ARRAY_TEXTURES);
+    let mut validator = Validator::new(ValidationFlags::all(), baseline_caps);
         let info = validator
             .validate(&module)
             .expect("lowered module must pass baseline WebGPU validation");

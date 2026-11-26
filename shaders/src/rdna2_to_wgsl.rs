@@ -22,9 +22,9 @@ use naga::valid::{Capabilities, ValidationFlags, Validator};
 use naga::{
     AddressSpace, ArraySize, BinaryOperator, Binding, BuiltIn, EntryPoint, Expression, Function,
     FunctionArgument, FunctionResult, GlobalVariable, Handle, ImageClass, ImageDimension,
-    Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module, Range,
-    ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage, Span,
-    Statement, StorageAccess, StorageFormat, StructMember, SwitchCase, SwitchValue,
+    ImageQuery, Interpolation, Literal, LocalVariable, MathFunction, MemoryDecorations, Module,
+    Range, ResourceBinding, SampleLevel, Sampling, Scalar, ScalarKind, ShaderStage as NagaStage,
+    Span, Statement, StorageAccess, StorageFormat, StructMember, SwitchCase, SwitchValue,
     SwizzleComponent, Type, TypeInner, UnaryOperator, VectorSize,
 };
 
@@ -956,13 +956,25 @@ enum TexDim {
     D2,
     D2Array,
     D3,
+    Cube,
+    CubeArray,
 }
 
 impl TexDim {
     fn from_mimg_dim(dim: u8) -> Self {
         match dim {
-            5 => Self::D2Array,
             2 => Self::D3,
+            3 => Self::Cube,
+            5 => Self::D2Array,
+            7 => Self::CubeArray,
+            _ => Self::D2,
+        }
+    }
+
+    fn from_storage_mimg_dim(dim: u8) -> Self {
+        match dim {
+            2 => Self::D3,
+            3 | 5 | 7 => Self::D2Array,
             _ => Self::D2,
         }
     }
@@ -972,23 +984,104 @@ impl TexDim {
             Self::D2 => "2d",
             Self::D2Array => "2d-array",
             Self::D3 => "3d",
+            Self::Cube => "cube",
+            Self::CubeArray => "cube-array",
         }
     }
 
     fn extra_coord_vgprs(self) -> u8 {
         match self {
             Self::D2 => 0,
-            Self::D2Array | Self::D3 => 1,
+            Self::D2Array | Self::D3 | Self::Cube => 1,
+            Self::CubeArray => 2,
         }
+    }
+
+    const fn has_3d_grad(self) -> bool {
+        matches!(self, Self::D3 | Self::Cube | Self::CubeArray)
+    }
+
+    const fn supports_depth(self) -> bool {
+        matches!(self, Self::D2 | Self::D2Array | Self::Cube | Self::CubeArray)
+    }
+
+    const fn supports_gather(self) -> bool {
+        matches!(self, Self::D2 | Self::D2Array | Self::Cube | Self::CubeArray)
+    }
+
+    const fn supports_texel_offset(self) -> bool {
+        matches!(self, Self::D2 | Self::D2Array | Self::D3)
     }
 
     fn merge(self, other: Self) -> Self {
         match (self, other) {
             (Self::D2, o) => o,
             (s, Self::D2) => s,
+            (Self::Cube, Self::CubeArray) | (Self::CubeArray, Self::Cube) => Self::CubeArray,
             (s, _) => s,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FragAttrInterp {
+    interpolation: Interpolation,
+    sampling: Option<Sampling>,
+}
+
+impl Default for FragAttrInterp {
+    fn default() -> Self {
+        Self {
+            interpolation: Interpolation::Perspective,
+            sampling: Some(Sampling::Center),
+        }
+    }
+}
+
+fn classify_vintrp_barycentric(vsrc: u8) -> FragAttrInterp {
+    // AMD GFX10.3 SPI_PS_INPUT_ADDR canonical barycentric VGPR pair mapping:
+    //   v0/v1 -> PERSP_CENTER
+    //   v2/v3 -> PERSP_CENTROID
+    //   v4/v5 -> LINEAR_CENTER (noperspective)
+    //   v6/v7 -> LINEAR_CENTROID (noperspective centroid)
+    match vsrc {
+        2 | 3 => FragAttrInterp {
+            interpolation: Interpolation::Perspective,
+            sampling: Some(Sampling::Centroid),
+        },
+        4 | 5 => FragAttrInterp {
+            interpolation: Interpolation::Linear,
+            sampling: Some(Sampling::Center),
+        },
+        6 | 7 => FragAttrInterp {
+            interpolation: Interpolation::Linear,
+            sampling: Some(Sampling::Centroid),
+        },
+        _ => FragAttrInterp::default(),
+    }
+}
+
+fn merge_frag_attr_interp(
+    map: &mut BTreeMap<u8, FragAttrInterp>,
+    attr: u8,
+    incoming: FragAttrInterp,
+) {
+    map.entry(attr)
+        .and_modify(|cur| {
+            // Smooth interpolation (Perspective/Linear) overrides Flat if mixed on one vec4 attr;
+            // more specific modes (Linear or Centroid) override the Perspective/Center default.
+            if cur.interpolation == Interpolation::Flat {
+                if incoming.interpolation != Interpolation::Flat {
+                    *cur = incoming;
+                }
+            } else if incoming.interpolation != Interpolation::Flat
+                && *cur == FragAttrInterp::default()
+                && incoming != FragAttrInterp::default()
+            {
+                *cur = incoming;
+            }
+        })
+        .or_insert(incoming);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1015,6 +1108,8 @@ struct ProgramPlan {
     inst_storage_buf_keys: BTreeMap<usize, ResourceKey>,
     inst_storage_tex_keys: BTreeMap<usize, ResourceKey>,
     tex_dims: BTreeMap<ResourceKey, TexDim>,
+    tex_is_depth: BTreeSet<ResourceKey>,
+    samp_is_comparison: BTreeSet<ResourceKey>,
     storage_tex_dims: BTreeMap<ResourceKey, TexDim>,
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
@@ -1026,6 +1121,7 @@ struct ProgramPlan {
     storage_tex_slots: Vec<ResourceKey>,
     uses_lds: bool,
     frag_attrs: Vec<u8>,
+    frag_attr_interp: BTreeMap<u8, FragAttrInterp>,
     vs_params: Vec<u8>,
     ps_mrts: Vec<u8>,
     ps_exports_depth: bool,
@@ -1243,39 +1339,120 @@ fn smem_load_dword_count(op: u8) -> Option<u8> {
 #[derive(Debug, Clone, Copy)]
 struct MimgAddrLayout {
     total_vgprs: u8,
+    offset_off: Option<u8>,
     bias_off: Option<u8>,
     compare_off: Option<u8>,
     grad_off: Option<u8>,
     uv_off: u8,
     lod_off: Option<u8>,
+    #[allow(dead_code)]
+    clamp_off: Option<u8>,
     is_zero_lod: bool,
+    is_gather4: bool,
     is_load: bool,
     is_store: bool,
     is_get_lod: bool,
+}
+
+fn build_mimg_sample_layout(
+    has_offset: bool,
+    has_bias: bool,
+    has_compare: bool,
+    has_grad: bool,
+    has_lod: bool,
+    has_clamp: bool,
+    is_zero_lod: bool,
+    is_gather4: bool,
+) -> MimgAddrLayout {
+    // GFX10.3 MIMG address VGPR ordering (base 2D; extra_grad and extra_coord are added per dim):
+    //   [offset], [bias], [z_compare], [grad (4 for 2D / 6 for 3D/Cube)], u, v, [w/slice], [lod], [clamp]
+    let mut cursor = 0u8;
+    let offset_off = if has_offset {
+        let o = cursor;
+        cursor += 1;
+        Some(o)
+    } else {
+        None
+    };
+    let bias_off = if has_bias {
+        let o = cursor;
+        cursor += 1;
+        Some(o)
+    } else {
+        None
+    };
+    let compare_off = if has_compare {
+        let o = cursor;
+        cursor += 1;
+        Some(o)
+    } else {
+        None
+    };
+    let grad_off = if has_grad {
+        let o = cursor;
+        cursor += 4;
+        Some(o)
+    } else {
+        None
+    };
+    let uv_off = cursor;
+    cursor += 2;
+    let lod_off = if has_lod {
+        let o = cursor;
+        cursor += 1;
+        Some(o)
+    } else {
+        None
+    };
+    let clamp_off = if has_clamp {
+        let o = cursor;
+        cursor += 1;
+        Some(o)
+    } else {
+        None
+    };
+    MimgAddrLayout {
+        total_vgprs: cursor,
+        offset_off,
+        bias_off,
+        compare_off,
+        grad_off,
+        uv_off,
+        lod_off,
+        clamp_off,
+        is_zero_lod,
+        is_gather4,
+        is_load: false,
+        is_store: false,
+        is_get_lod: false,
+    }
 }
 
 /// Decode GFX10.3 2D MIMG address VGPR layout (`[offset], [bias], [z_compare], [grad], u, v, [lod/clamp]`).
 fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
     let base = MimgAddrLayout {
         total_vgprs: 2,
+        offset_off: None,
         bias_off: None,
         compare_off: None,
         grad_off: None,
         uv_off: 0,
         lod_off: None,
+        clamp_off: None,
         is_zero_lod: false,
+        is_gather4: false,
         is_load: false,
         is_store: false,
         is_get_lod: false,
     };
     match op {
-        // image_load: (x, y)
-        0x00 => Some(MimgAddrLayout {
+        // image_load / image_load_pck / image_load_pck_sgn: (x, y)
+        0x00 | 0x02 | 0x03 => Some(MimgAddrLayout {
             is_load: true,
             ..base
         }),
-        // image_load_mip: (x, y, mip)
-        0x01 => Some(MimgAddrLayout {
+        // image_load_mip / image_load_mip_pck / image_load_mip_pck_sgn: (x, y, mip)
+        0x01 | 0x04 | 0x05 => Some(MimgAddrLayout {
             total_vgprs: 3,
             lod_off: Some(2),
             is_load: true,
@@ -1293,117 +1470,89 @@ fn mimg_addr_layout(op: u8) -> Option<MimgAddrLayout> {
             is_store: true,
             ..base
         }),
-        // image_sample: (u, v)
-        0x20 => Some(base),
-        // image_sample_cl: (u, v, clamp)
-        0x21 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            ..base
-        }),
-        // image_sample_d: (dudx, dvdx, dudy, dvdy, u, v)
-        0x22 => Some(MimgAddrLayout {
-            total_vgprs: 6,
-            grad_off: Some(0),
-            uv_off: 4,
-            ..base
-        }),
-        // image_sample_l: (u, v, lod)
-        0x24 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            lod_off: Some(2),
-            ..base
-        }),
-        // image_sample_b: (bias, u, v)
-        0x25 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            bias_off: Some(0),
-            uv_off: 1,
-            ..base
-        }),
-        // image_sample_lz: (u, v)
-        0x27 => Some(MimgAddrLayout {
-            is_zero_lod: true,
-            ..base
-        }),
-        // image_sample_c: (z_ref, u, v)
-        0x28 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            compare_off: Some(0),
-            uv_off: 1,
-            ..base
-        }),
-        // image_sample_c_l: (z_ref, u, v, lod)
-        0x2C => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            compare_off: Some(0),
-            uv_off: 1,
-            lod_off: Some(3),
-            ..base
-        }),
-        // image_sample_c_b: (bias, z_ref, u, v)
-        0x2D => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            bias_off: Some(0),
-            compare_off: Some(1),
-            uv_off: 2,
-            ..base
-        }),
-        // image_sample_c_lz: (z_ref, u, v)
-        0x2F => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            compare_off: Some(0),
-            uv_off: 1,
-            is_zero_lod: true,
-            ..base
-        }),
-        // image_sample_o: (offset, u, v)
-        0x30 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            uv_off: 1,
-            ..base
-        }),
-        // image_sample_l_o: (offset, u, v, lod)
-        0x34 => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            uv_off: 1,
-            lod_off: Some(3),
-            ..base
-        }),
-        // image_sample_b_o: (offset, bias, u, v)
-        0x35 => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            bias_off: Some(1),
-            uv_off: 2,
-            ..base
-        }),
-        // image_sample_lz_o: (offset, u, v)
-        0x37 => Some(MimgAddrLayout {
-            total_vgprs: 3,
-            uv_off: 1,
-            is_zero_lod: true,
-            ..base
-        }),
-        // image_sample_c_o: (offset, z_ref, u, v)
-        0x38 => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            compare_off: Some(1),
-            uv_off: 2,
-            ..base
-        }),
-        // image_sample_c_lz_o: (offset, z_ref, u, v)
-        0x3F => Some(MimgAddrLayout {
-            total_vgprs: 4,
-            compare_off: Some(1),
-            uv_off: 2,
-            is_zero_lod: true,
-            ..base
-        }),
+        // image_sample* (0x20..=0x3F): regular GFX10.3 bitfield
+        //   bit 4 (0x10) = _o (offset)
+        //   bit 3 (0x08) = _c (compare)
+        //   bits [2:0]: 0=base, 1=_cl, 2=_d, 3=_d_cl, 4=_l, 5=_b, 6=_b_cl, 7=_lz
+        0x20..=0x3F => {
+            let has_offset = (op & 0x10) != 0;
+            let has_compare = (op & 0x08) != 0;
+            let mode = op & 0x07;
+            let has_clamp = matches!(mode, 1 | 3 | 6);
+            let has_grad = matches!(mode, 2 | 3);
+            let has_lod = mode == 4;
+            let has_bias = matches!(mode, 5 | 6);
+            let is_zero_lod = mode == 7;
+            Some(build_mimg_sample_layout(
+                has_offset,
+                has_bias,
+                has_compare,
+                has_grad,
+                has_lod,
+                has_clamp,
+                is_zero_lod,
+                false,
+            ))
+        }
+        // image_gather4* (0x40..=0x5F): same bitfield without _d (modes 2 & 3 are unused)
+        0x40..=0x5F => {
+            let mode = op & 0x07;
+            if matches!(mode, 2 | 3) {
+                return None;
+            }
+            let has_offset = (op & 0x10) != 0;
+            let has_compare = (op & 0x08) != 0;
+            let has_clamp = matches!(mode, 1 | 6);
+            let has_lod = mode == 4;
+            let has_bias = matches!(mode, 5 | 6);
+            let is_zero_lod = mode == 7;
+            Some(build_mimg_sample_layout(
+                has_offset,
+                has_bias,
+                has_compare,
+                false,
+                has_lod,
+                has_clamp,
+                is_zero_lod,
+                true,
+            ))
+        }
         // image_get_lod: (u, v) -> mip levels (safe WGSL mip 0.0 fallback)
         0x60 => Some(MimgAddrLayout {
             is_get_lod: true,
             ..base
         }),
+        // image_sample_cd* (0x68..=0x6F): coarse-derivative variants
+        0x68..=0x6F => {
+            let has_offset = (op & 0x04) != 0;
+            let has_compare = (op & 0x02) != 0;
+            let has_clamp = (op & 0x01) != 0;
+            Some(build_mimg_sample_layout(
+                has_offset,
+                false,
+                has_compare,
+                true,
+                false,
+                has_clamp,
+                false,
+                false,
+            ))
+        }
         _ => None,
+    }
+}
+
+fn gather_component_from_dmask(dmask: u8) -> SwizzleComponent {
+    if (dmask & 0x1) != 0 {
+        SwizzleComponent::X
+    } else if (dmask & 0x2) != 0 {
+        SwizzleComponent::Y
+    } else if (dmask & 0x4) != 0 {
+        SwizzleComponent::Z
+    } else if (dmask & 0x8) != 0 {
+        SwizzleComponent::W
+    } else {
+        SwizzleComponent::X
     }
 }
 
@@ -7258,7 +7407,11 @@ fn step_origin_state(
             if let Some(layout) = mimg_addr_layout(*op) {
                 if !layout.is_store {
                     let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
-                    let comp_cnt = eff_mask.count_ones();
+                    let comp_cnt = if layout.is_gather4 {
+                        4
+                    } else {
+                        eff_mask.count_ones()
+                    };
                     let out_cnt = if *d16 { comp_cnt.div_ceil(2) } else { comp_cnt } as u8;
                     for d in 0..out_cnt {
                         if let Some(reg) = checked_vgpr_reg(*vdata, d) {
@@ -8530,13 +8683,20 @@ fn plan_program(
 
     let mut cbv_usage: BTreeMap<CbvKey, CbvUsage> = BTreeMap::new();
     let mut tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
+    let mut tex_has_compare: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut tex_has_non_compare: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut tex_has_load: BTreeSet<ResourceKey> = BTreeSet::new();
     let mut samp_rsrc_set: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut samp_has_compare: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut samp_has_non_compare: BTreeSet<ResourceKey> = BTreeSet::new();
+    let mut compare_tex_samp_pairs: BTreeSet<(ResourceKey, ResourceKey)> = BTreeSet::new();
     let mut storage_buf_usage: BTreeMap<ResourceKey, bool> = BTreeMap::new();
     let mut storage_tex_dims: BTreeMap<ResourceKey, TexDim> = BTreeMap::new();
     let mut uses_lds = false;
     let mut has_buffer_fetch = false;
     let mut vertex_buf_fetches: BTreeMap<(u32, u16), VertexFetchPlan> = BTreeMap::new();
     let mut frag_attr_set: BTreeSet<u8> = BTreeSet::new();
+    let mut frag_attr_interp: BTreeMap<u8, FragAttrInterp> = BTreeMap::new();
     let mut vs_param_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_mrt_set: BTreeSet<u8> = BTreeSet::new();
     let mut ps_exports_depth = false;
@@ -8953,7 +9113,19 @@ fn plan_program(
                 if vop3_is_interp_f16(*op) {
                     let (attr, _, _) = decode_vop3_interp_attr(*src0);
                     if stage == ShaderStage::Fragment {
-                        frag_attr_set.insert(attr % MAX_WEBGPU_LOCATIONS);
+                        let clamped_attr = attr % MAX_WEBGPU_LOCATIONS;
+                        frag_attr_set.insert(clamped_attr);
+                        let interp = if (256..512).contains(src1) {
+                            let bary_vgpr = (*src1 - 256) as u8;
+                            if !written_vgprs.contains(&bary_vgpr) {
+                                classify_vintrp_barycentric(bary_vgpr)
+                            } else {
+                                FragAttrInterp::default()
+                            }
+                        } else {
+                            FragAttrInterp::default()
+                        };
+                        merge_frag_attr_interp(&mut frag_attr_interp, clamped_attr, interp);
                     }
                     vgprs.insert(*vdst);
                     written_vgprs.insert(*vdst);
@@ -9119,9 +9291,28 @@ fn plan_program(
                 vgprs.insert(*vdst);
                 written_vgprs.insert(*vdst);
             }
-            Rdna2Detail::Vintrp { vdst, attr, .. } => {
+            Rdna2Detail::Vintrp {
+                op,
+                vdst,
+                attr,
+                vsrc,
+                ..
+            } => {
                 if stage == ShaderStage::Fragment {
-                    frag_attr_set.insert(*attr % MAX_WEBGPU_LOCATIONS);
+                    let clamped_attr = *attr % MAX_WEBGPU_LOCATIONS;
+                    frag_attr_set.insert(clamped_attr);
+                    let interp = if *op == 2 {
+                        // v_interp_mov_f32 (p0/p10/p20) -> flat interpolation
+                        FragAttrInterp {
+                            interpolation: Interpolation::Flat,
+                            sampling: None,
+                        }
+                    } else if !written_vgprs.contains(vsrc) {
+                        classify_vintrp_barycentric(*vsrc)
+                    } else {
+                        FragAttrInterp::default()
+                    };
+                    merge_frag_attr_interp(&mut frag_attr_interp, clamped_attr, interp);
                 }
                 vgprs.insert(*vdst);
                 written_vgprs.insert(*vdst);
@@ -9168,7 +9359,11 @@ fn plan_program(
                     }
                 } else if let Some(layout) = mimg_addr_layout(*op) {
                     let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
-                    let comp_cnt = eff_mask.count_ones();
+                    let comp_cnt = if layout.is_gather4 {
+                        4
+                    } else {
+                        eff_mask.count_ones()
+                    };
                     let data_vgprs = if *d16 { comp_cnt.div_ceil(2) } else { comp_cnt } as u8;
                     if layout.is_get_lod {
                         for d in 0..data_vgprs {
@@ -9179,8 +9374,20 @@ fn plan_program(
                         }
                         continue;
                     }
-                    let tex_dim = TexDim::from_mimg_dim(*dim);
-                    let addr_vgprs = layout.total_vgprs.saturating_add(tex_dim.extra_coord_vgprs());
+                    let tex_dim = if layout.is_store || layout.is_load {
+                        TexDim::from_storage_mimg_dim(*dim)
+                    } else {
+                        TexDim::from_mimg_dim(*dim)
+                    };
+                    let extra_grad_vgprs = if layout.grad_off.is_some() && tex_dim.has_3d_grad() {
+                        2u8
+                    } else {
+                        0u8
+                    };
+                    let addr_vgprs = layout
+                        .total_vgprs
+                        .saturating_add(extra_grad_vgprs)
+                        .saturating_add(tex_dim.extra_coord_vgprs());
                     if layout.is_store {
                         if stage != ShaderStage::Vertex {
                             let key = desc_analysis
@@ -9193,7 +9400,7 @@ fn plan_program(
                                 .and_modify(|d| *d = d.merge(tex_dim))
                                 .or_insert(tex_dim);
                             for a in 0..addr_vgprs {
-                                if let Some(reg) = checked_vgpr_reg(*vaddr, a) {
+                                if let Some(reg) = mimg_addr_vgpr(*vaddr, *nsize, nsa_vaddrs, a) {
                                     vgprs.insert(reg);
                                     if !written_vgprs.contains(&reg) {
                                         read_before_write_vgprs.insert(reg);
@@ -9219,16 +9426,27 @@ fn plan_program(
                             .entry(key)
                             .and_modify(|d| *d = d.merge(tex_dim))
                             .or_insert(tex_dim);
-                        if !layout.is_load {
+                        if layout.is_load {
+                            tex_has_load.insert(key);
+                            tex_has_non_compare.insert(key);
+                        } else {
                             let skey = desc_analysis
                                 .inst_samp_keys
                                 .get(&inst_idx)
                                 .copied()
                                 .unwrap_or(ResourceKey::RawSlot(*ssamp));
                             samp_rsrc_set.insert(skey);
+                            if layout.compare_off.is_some() {
+                                tex_has_compare.insert(key);
+                                samp_has_compare.insert(skey);
+                                compare_tex_samp_pairs.insert((key, skey));
+                            } else {
+                                tex_has_non_compare.insert(key);
+                                samp_has_non_compare.insert(skey);
+                            }
                         }
                         for a in 0..addr_vgprs {
-                            if let Some(reg) = checked_vgpr_reg(*vaddr, a) {
+                            if let Some(reg) = mimg_addr_vgpr(*vaddr, *nsize, nsa_vaddrs, a) {
                                 vgprs.insert(reg);
                                 if !written_vgprs.contains(&reg) {
                                     read_before_write_vgprs.insert(reg);
@@ -9740,8 +9958,51 @@ fn plan_program(
     }
 
     let mut ps_mrts: Vec<u8> = ps_mrt_set.into_iter().collect();
-    if stage == ShaderStage::Fragment && ps_mrts.is_empty() {
+    if stage == ShaderStage::Fragment && ps_mrts.is_empty() && !ps_exports_depth {
         ps_mrts.push(0);
+    }
+
+    // WGSL forbids `textureLoad` on cube/cube-array textures; downgrade any texture that
+    // also executes `image_load` from Cube/CubeArray to D2Array.
+    for key in &tex_has_load {
+        if let Some(dim) = tex_dims.get_mut(key)
+            && matches!(*dim, TexDim::Cube | TexDim::CubeArray)
+        {
+            *dim = TexDim::D2Array;
+        }
+    }
+
+    // Promote compare-only textures to `texture_depth_*` and compare-only samplers to
+    // `sampler_comparison` iff every compare pair `(tex, samp)` agrees via fixed-point closure.
+    let mut tex_is_depth: BTreeSet<ResourceKey> = tex_has_compare
+        .iter()
+        .copied()
+        .filter(|k| {
+            !tex_has_non_compare.contains(k)
+                && tex_dims.get(k).copied().unwrap_or(TexDim::D2).supports_depth()
+        })
+        .collect();
+    let mut samp_is_comparison: BTreeSet<ResourceKey> = samp_has_compare
+        .iter()
+        .copied()
+        .filter(|k| !samp_has_non_compare.contains(k))
+        .collect();
+    loop {
+        let mut changed = false;
+        for &(tk, sk) in &compare_tex_samp_pairs {
+            let t_depth = tex_is_depth.contains(&tk);
+            let s_cmp = samp_is_comparison.contains(&sk);
+            if t_depth && !s_cmp {
+                tex_is_depth.remove(&tk);
+                changed = true;
+            } else if !t_depth && s_cmp {
+                samp_is_comparison.remove(&sk);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 
     let min_vec4s = options.min_cbv_vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
@@ -9822,6 +10083,8 @@ fn plan_program(
         inst_storage_buf_keys: desc_analysis.inst_storage_buf_keys,
         inst_storage_tex_keys: desc_analysis.inst_storage_tex_keys,
         tex_dims,
+        tex_is_depth,
+        samp_is_comparison,
         storage_tex_dims,
         vertex_storage_buf_insts,
         vertex_fetch_vb_slots,
@@ -9833,6 +10096,7 @@ fn plan_program(
         storage_tex_slots,
         uses_lds,
         frag_attrs: frag_attr_set.into_iter().collect(),
+        frag_attr_interp,
         vs_params: vs_param_set.into_iter().collect(),
         ps_mrts,
         ps_exports_depth,
@@ -9886,8 +10150,8 @@ struct IrEmitter {
     vertex_storage_buf_insts: BTreeSet<usize>,
     vertex_fetch_vb_slots: BTreeMap<usize, u32>,
     cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)>,
-    tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
-    samp_globals: BTreeMap<ResourceKey, Handle<GlobalVariable>>,
+    tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim, bool)>,
+    samp_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
     storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
     storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
     lds_global: Option<Handle<GlobalVariable>>,
@@ -10067,9 +10331,10 @@ impl IrEmitter {
         //   samp0 -> @group(0) @binding(2)
         //   Additional cb1../tex1../samp1.. -> @group(0) @binding(3+)
         let mut cb_globals: BTreeMap<CbvKey, (Handle<GlobalVariable>, u32)> = BTreeMap::new();
-        let mut tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)> =
+        let mut tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim, bool)> =
             BTreeMap::new();
-        let mut samp_globals: BTreeMap<ResourceKey, Handle<GlobalVariable>> = BTreeMap::new();
+        let mut samp_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)> =
+            BTreeMap::new();
         let mut storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)> =
             BTreeMap::new();
         let mut storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)> =
@@ -10190,56 +10455,137 @@ impl IrEmitter {
             let mut tex_2d_ty: Option<Handle<Type>> = None;
             let mut tex_2d_array_ty: Option<Handle<Type>> = None;
             let mut tex_3d_ty: Option<Handle<Type>> = None;
-            let samp_ty = insert_type(
-                &mut module,
-                None,
-                TypeInner::Sampler { comparison: false },
-            );
+            let mut tex_cube_ty: Option<Handle<Type>> = None;
+            let mut tex_cube_array_ty: Option<Handle<Type>> = None;
+            let mut tex_depth_2d_ty: Option<Handle<Type>> = None;
+            let mut tex_depth_2d_array_ty: Option<Handle<Type>> = None;
+            let mut tex_depth_cube_ty: Option<Handle<Type>> = None;
+            let mut tex_depth_cube_array_ty: Option<Handle<Type>> = None;
+            let mut samp_ty: Option<Handle<Type>> = None;
+            let mut cmp_samp_ty: Option<Handle<Type>> = None;
             for (idx, &key) in plan.tex_slots.iter().enumerate() {
                 let tex_dim = plan.tex_dims.get(&key).copied().unwrap_or(TexDim::D2);
-                let tex_ty = match tex_dim {
-                    TexDim::D2Array => *tex_2d_array_ty.get_or_insert_with(|| {
-                        insert_type(
-                            &mut module,
-                            None,
-                            TypeInner::Image {
-                                dim: ImageDimension::D2,
-                                arrayed: true,
-                                class: ImageClass::Sampled {
-                                    kind: ScalarKind::Float,
-                                    multi: false,
+                let is_depth = plan.tex_is_depth.contains(&key) && tex_dim.supports_depth();
+                let tex_ty = if is_depth {
+                    match tex_dim {
+                        TexDim::D2Array => *tex_depth_2d_array_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D2,
+                                    arrayed: true,
+                                    class: ImageClass::Depth { multi: false },
                                 },
-                            },
-                        )
-                    }),
-                    TexDim::D3 => *tex_3d_ty.get_or_insert_with(|| {
-                        insert_type(
-                            &mut module,
-                            None,
-                            TypeInner::Image {
-                                dim: ImageDimension::D3,
-                                arrayed: false,
-                                class: ImageClass::Sampled {
-                                    kind: ScalarKind::Float,
-                                    multi: false,
+                            )
+                        }),
+                        TexDim::Cube => *tex_depth_cube_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::Cube,
+                                    arrayed: false,
+                                    class: ImageClass::Depth { multi: false },
                                 },
-                            },
-                        )
-                    }),
-                    TexDim::D2 => *tex_2d_ty.get_or_insert_with(|| {
-                        insert_type(
-                            &mut module,
-                            None,
-                            TypeInner::Image {
-                                dim: ImageDimension::D2,
-                                arrayed: false,
-                                class: ImageClass::Sampled {
-                                    kind: ScalarKind::Float,
-                                    multi: false,
+                            )
+                        }),
+                        TexDim::CubeArray => *tex_depth_cube_array_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::Cube,
+                                    arrayed: true,
+                                    class: ImageClass::Depth { multi: false },
                                 },
-                            },
-                        )
-                    }),
+                            )
+                        }),
+                        TexDim::D2 | TexDim::D3 => *tex_depth_2d_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D2,
+                                    arrayed: false,
+                                    class: ImageClass::Depth { multi: false },
+                                },
+                            )
+                        }),
+                    }
+                } else {
+                    match tex_dim {
+                        TexDim::D2Array => *tex_2d_array_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D2,
+                                    arrayed: true,
+                                    class: ImageClass::Sampled {
+                                        kind: ScalarKind::Float,
+                                        multi: false,
+                                    },
+                                },
+                            )
+                        }),
+                        TexDim::D3 => *tex_3d_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D3,
+                                    arrayed: false,
+                                    class: ImageClass::Sampled {
+                                        kind: ScalarKind::Float,
+                                        multi: false,
+                                    },
+                                },
+                            )
+                        }),
+                        TexDim::Cube => *tex_cube_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::Cube,
+                                    arrayed: false,
+                                    class: ImageClass::Sampled {
+                                        kind: ScalarKind::Float,
+                                        multi: false,
+                                    },
+                                },
+                            )
+                        }),
+                        TexDim::CubeArray => *tex_cube_array_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::Cube,
+                                    arrayed: true,
+                                    class: ImageClass::Sampled {
+                                        kind: ScalarKind::Float,
+                                        multi: false,
+                                    },
+                                },
+                            )
+                        }),
+                        TexDim::D2 => *tex_2d_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D2,
+                                    arrayed: false,
+                                    class: ImageClass::Sampled {
+                                        kind: ScalarKind::Float,
+                                        multi: false,
+                                    },
+                                },
+                            )
+                        }),
+                    }
                 };
                 let preferred_binding = binding_base.saturating_add(if idx == 0 {
                     1
@@ -10264,7 +10610,7 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                tex_globals.insert(key, (g, tex_dim));
+                tex_globals.insert(key, (g, tex_dim, is_depth));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -10278,6 +10624,24 @@ impl IrEmitter {
                 });
             }
             for (idx, &key) in plan.samp_slots.iter().enumerate() {
+                let is_cmp = plan.samp_is_comparison.contains(&key);
+                let ty = if is_cmp {
+                    *cmp_samp_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Sampler { comparison: true },
+                        )
+                    })
+                } else {
+                    *samp_ty.get_or_insert_with(|| {
+                        insert_type(
+                            &mut module,
+                            None,
+                            TypeInner::Sampler { comparison: false },
+                        )
+                    })
+                };
                 let preferred_binding = binding_base.saturating_add(if idx == 0 {
                     2
                 } else {
@@ -10295,17 +10659,21 @@ impl IrEmitter {
                             group: 0,
                             binding: binding_num,
                         }),
-                        ty: samp_ty,
+                        ty,
                         init: None,
                         memory_decorations: MemoryDecorations::empty(),
                     },
                     Span::UNDEFINED,
                 );
-                samp_globals.insert(key, g);
+                samp_globals.insert(key, (g, is_cmp));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
-                    kind: "sampler",
+                    kind: if is_cmp {
+                        "sampler_comparison"
+                    } else {
+                        "sampler"
+                    },
                     name,
                     view_dimension: None,
                     storage_format: None,
@@ -10385,20 +10753,22 @@ impl IrEmitter {
             for (idx, &key) in plan.storage_tex_slots.iter().enumerate() {
                 let tex_dim = plan.storage_tex_dims.get(&key).copied().unwrap_or(TexDim::D2);
                 let storage_tex_ty = match tex_dim {
-                    TexDim::D2Array => *storage_tex_2d_array_ty.get_or_insert_with(|| {
-                        insert_type(
-                            &mut module,
-                            None,
-                            TypeInner::Image {
-                                dim: ImageDimension::D2,
-                                arrayed: true,
-                                class: ImageClass::Storage {
-                                    format: StorageFormat::Rgba8Unorm,
-                                    access: StorageAccess::STORE,
+                    TexDim::D2Array | TexDim::Cube | TexDim::CubeArray => {
+                        *storage_tex_2d_array_ty.get_or_insert_with(|| {
+                            insert_type(
+                                &mut module,
+                                None,
+                                TypeInner::Image {
+                                    dim: ImageDimension::D2,
+                                    arrayed: true,
+                                    class: ImageClass::Storage {
+                                        format: StorageFormat::Rgba8Unorm,
+                                        access: StorageAccess::STORE,
+                                    },
                                 },
-                            },
-                        )
-                    }),
+                            )
+                        })
+                    }
                     TexDim::D3 => *storage_tex_3d_ty.get_or_insert_with(|| {
                         insert_type(
                             &mut module,
@@ -10717,13 +11087,18 @@ impl IrEmitter {
                     for &attr in &plan.frag_attrs {
                         let member_idx = in_members.len() as u32;
                         frag_attr_member_index.insert(attr, member_idx);
+                        let interp = plan
+                            .frag_attr_interp
+                            .get(&attr)
+                            .copied()
+                            .unwrap_or_default();
                         in_members.push(StructMember {
                             name: Some(format!("attr_{attr}")),
                             ty: vec4_f32_ty,
                             binding: Some(Binding::Location {
                                 location: u32::from(attr),
-                                interpolation: Some(Interpolation::Perspective),
-                                sampling: Some(Sampling::Center),
+                                interpolation: Some(interp.interpolation),
+                                sampling: interp.sampling,
                                 blend_src: None,
                                 per_primitive: false,
                             }),
@@ -10775,7 +11150,7 @@ impl IrEmitter {
                         binding: Some(Binding::BuiltIn(BuiltIn::FragDepth)),
                         offset,
                     });
-                    offset += 16;
+                    offset += if plan.ps_mrts.is_empty() { 4 } else { 16 };
                 }
                 let ps_out_ty = insert_type(
                     &mut module,
@@ -13244,7 +13619,8 @@ impl IrEmitter {
                     )
                 } else {
                     self.translate_mimg(
-                        inst_idx, *op, *dmask, *dim, *d16, *vaddr, *vdata, *srsrc, *ssamp,
+                        inst_idx, *op, *dmask, *dim, *d16, *nsize, *vaddr, nsa_vaddrs, *vdata,
+                        *srsrc, *ssamp,
                     )
                 }
             }
@@ -18383,7 +18759,7 @@ impl IrEmitter {
         true
     }
 
-    // -- MIMG (2D / 2D-Array / 3D Texture sampling, loading & storing) --
+    // -- MIMG (2D / 2D-Array / Cube / Cube-Array / 3D sampling, gather4, load & store) --
 
     #[allow(clippy::too_many_arguments)]
     fn translate_mimg(
@@ -18393,7 +18769,9 @@ impl IrEmitter {
         dmask: u8,
         dim: u8,
         d16: bool,
+        nsize: u8,
         vaddr: u8,
+        nsa_vaddrs: &[u8; 12],
         vdata: u8,
         srsrc: u8,
         ssamp: u8,
@@ -18412,14 +18790,21 @@ impl IrEmitter {
             }
             return true;
         }
-        let inst_dim = TexDim::from_mimg_dim(dim);
+        let inst_dim = if layout.is_store || layout.is_load {
+            TexDim::from_storage_mimg_dim(dim)
+        } else {
+            TexDim::from_mimg_dim(dim)
+        };
         let eff_mask = match dmask & 0xF {
             0 => 0xF,
             m => m,
         };
         let load_addr_f32 = |emitter: &mut Self, base_off: u8, delta: u8| -> Handle<Expression> {
-            match base_off.checked_add(delta) {
-                Some(off) => emitter.load_vgpr_offset_f32(vaddr, off),
+            match base_off
+                .checked_add(delta)
+                .and_then(|idx| mimg_addr_vgpr(vaddr, nsize, nsa_vaddrs, idx))
+            {
+                Some(reg) => emitter.load_vgpr_f32(reg),
                 None => emitter.lit_f32(0.0),
             }
         };
@@ -18461,7 +18846,7 @@ impl IrEmitter {
                         None,
                     )
                 }
-                TexDim::D2Array => {
+                TexDim::D2Array | TexDim::Cube | TexDim::CubeArray => {
                     let arr = if inst_dim == TexDim::D2Array {
                         let s = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(s)
@@ -18546,7 +18931,7 @@ impl IrEmitter {
             .get(&inst_idx)
             .copied()
             .unwrap_or(ResourceKey::RawSlot(srsrc));
-        let Some(&(tex_global, tex_dim)) = self
+        let Some(&(tex_global, tex_dim, tex_is_depth)) = self
             .tex_globals
             .get(&key)
             .or_else(|| self.tex_globals.values().next())
@@ -18554,11 +18939,16 @@ impl IrEmitter {
             return false;
         };
         let image = self.raw_expr(Expression::GlobalVariable(tex_global));
-        let lod_shift = inst_dim.extra_coord_vgprs();
+        let extra_grad_shift = if layout.grad_off.is_some() && inst_dim.has_3d_grad() {
+            2u8
+        } else {
+            0u8
+        };
+        let lod_shift = extra_grad_shift.saturating_add(inst_dim.extra_coord_vgprs());
 
         let sampled = if layout.is_load {
-            // image_load / image_load_mip: coordinate is always vec2<i32> (2D/2DArray) or
-            // vec3<i32> (3D), array_index is Some(i32) iff D2Array, and level is always Some(i32).
+            // image_load / image_load_mip: coordinate is vec2<i32> (2D/2DArray) or
+            // vec3<i32> (3D), array_index is Some(i32) iff D2Array, and level is Some(i32).
             let ux = load_addr_f32(self, layout.uv_off, 0);
             let uy = load_addr_f32(self, layout.uv_off, 1);
             let ix = self.bitcast_f32_to_i32(ux);
@@ -18579,7 +18969,7 @@ impl IrEmitter {
                         None,
                     )
                 }
-                TexDim::D2Array => {
+                TexDim::D2Array | TexDim::Cube | TexDim::CubeArray => {
                     let arr = if inst_dim == TexDim::D2Array {
                         let s = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(s)
@@ -18608,21 +18998,29 @@ impl IrEmitter {
             } else {
                 Some(self.lit_i32(0))
             };
-            self.emit_expr(Expression::ImageLoad {
+            let loaded = self.emit_expr(Expression::ImageLoad {
                 image,
                 coordinate: coord,
                 array_index,
                 sample: None,
                 level,
-            })
+            });
+            if tex_is_depth {
+                self.emit_expr(Expression::Splat {
+                    size: VectorSize::Quad,
+                    value: loaded,
+                })
+            } else {
+                loaded
+            }
         } else {
-            // image_sample* (sampled 2D, 2D-array, or 3D texture)
+            // image_sample* / image_gather4* across 2D, 2D-Array, Cube, Cube-Array, and 3D
             let skey = self
                 .inst_samp_keys
                 .get(&inst_idx)
                 .copied()
                 .unwrap_or(ResourceKey::RawSlot(ssamp));
-            let Some(&samp_global) = self
+            let Some(&(samp_global, samp_is_cmp)) = self
                 .samp_globals
                 .get(&skey)
                 .or_else(|| self.samp_globals.values().next())
@@ -18630,13 +19028,9 @@ impl IrEmitter {
                 return false;
             };
             let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
-            // For 3D `image_sample_d`, GFX10.3 packs 6 gradient VGPRs (dudx,dvdx,dwdx,dudy,dvdy,dwdy)
-            // instead of 4 before (u,v,w), shifting `uv_off` by +2.
-            let uv_base = if layout.grad_off.is_some() && inst_dim == TexDim::D3 {
-                layout.uv_off.checked_add(2)
-            } else {
-                Some(layout.uv_off)
-            };
+            // For 3D / Cube / CubeArray `image_sample_d*`, GFX10.3 packs 6 gradient VGPRs
+            // (dudx,dvdx,dwdx,dudy,dvdy,dwdy) instead of 4 before coords, shifting `uv_off` by +2.
+            let uv_base = layout.uv_off.checked_add(extra_grad_shift);
             let u = match uv_base {
                 Some(base) => load_addr_f32(self, base, 0),
                 None => self.lit_f32(0.0),
@@ -18645,9 +19039,9 @@ impl IrEmitter {
                 Some(base) => load_addr_f32(self, base, 1),
                 None => self.lit_f32(0.0),
             };
-            let (coord, array_index) = match tex_dim {
-                TexDim::D3 => {
-                    let w = if inst_dim == TexDim::D3 {
+            let (mut coord, array_index) = match tex_dim {
+                TexDim::D3 | TexDim::Cube => {
+                    let w = if matches!(inst_dim, TexDim::D3 | TexDim::Cube | TexDim::CubeArray) {
                         match uv_base {
                             Some(base) => load_addr_f32(self, base, 2),
                             None => self.lit_f32(0.0),
@@ -18663,8 +19057,38 @@ impl IrEmitter {
                         None,
                     )
                 }
+                TexDim::CubeArray => {
+                    let w = if matches!(inst_dim, TexDim::D3 | TexDim::Cube | TexDim::CubeArray) {
+                        match uv_base {
+                            Some(base) => load_addr_f32(self, base, 2),
+                            None => self.lit_f32(0.0),
+                        }
+                    } else {
+                        self.lit_f32(0.0)
+                    };
+                    let arr = if inst_dim == TexDim::CubeArray {
+                        let s = match uv_base {
+                            Some(base) => load_addr_f32(self, base, 3),
+                            None => self.lit_f32(0.0),
+                        };
+                        self.emit_expr(Expression::As {
+                            expr: s,
+                            kind: ScalarKind::Sint,
+                            convert: Some(4),
+                        })
+                    } else {
+                        self.lit_i32(0)
+                    };
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_f32_ty,
+                            components: vec![u, v, w],
+                        }),
+                        Some(arr),
+                    )
+                }
                 TexDim::D2Array => {
-                    let arr = if inst_dim == TexDim::D2Array {
+                    let arr = if matches!(inst_dim, TexDim::D2Array | TexDim::D3 | TexDim::Cube) {
                         let s = match uv_base {
                             Some(base) => load_addr_f32(self, base, 2),
                             None => self.lit_f32(0.0),
@@ -18694,127 +19118,332 @@ impl IrEmitter {
                 ),
             };
 
-            // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
-            // in Fragment shaders within uniform control flow; Vertex, Compute, and non-uniform
-            // Fragment branches must use explicit `textureSampleLevel` or `textureSampleGrad`.
-            let allow_implicit_deriv = self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf();
-            let level = if layout.is_zero_lod {
-                SampleLevel::Exact(self.lit_f32(0.0))
-            } else if let Some(lod_off) = layout.lod_off {
-                let lod = load_addr_f32(self, lod_off, lod_shift);
-                SampleLevel::Exact(lod)
-            } else if let Some(grad_off) = layout.grad_off {
-                let dy_base = if inst_dim == TexDim::D3 { 3u8 } else { 2u8 };
-                if tex_dim == TexDim::D3 {
-                    let dudx = load_addr_f32(self, grad_off, 0);
-                    let dvdx = load_addr_f32(self, grad_off, 1);
-                    let dwdx = if inst_dim == TexDim::D3 {
-                        load_addr_f32(self, grad_off, 2)
-                    } else {
-                        self.lit_f32(0.0)
-                    };
-                    let dudy = load_addr_f32(self, grad_off, dy_base);
-                    let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
-                    let dwdy = if inst_dim == TexDim::D3 {
-                        load_addr_f32(self, grad_off, dy_base.saturating_add(2))
-                    } else {
-                        self.lit_f32(0.0)
-                    };
-                    let x = self.emit_expr(Expression::Compose {
-                        ty: self.types.vec3_f32_ty,
-                        components: vec![dudx, dvdx, dwdx],
-                    });
-                    let y = self.emit_expr(Expression::Compose {
-                        ty: self.types.vec3_f32_ty,
-                        components: vec![dudy, dvdy, dwdy],
-                    });
-                    SampleLevel::Gradient { x, y }
-                } else {
-                    let dudx = load_addr_f32(self, grad_off, 0);
-                    let dvdx = load_addr_f32(self, grad_off, 1);
-                    let dudy = load_addr_f32(self, grad_off, dy_base);
-                    let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
-                    let x = self.emit_expr(Expression::Compose {
-                        ty: self.types.vec2_f32_ty,
-                        components: vec![dudx, dvdx],
-                    });
-                    let y = self.emit_expr(Expression::Compose {
-                        ty: self.types.vec2_f32_ty,
-                        components: vec![dudy, dvdy],
-                    });
-                    SampleLevel::Gradient { x, y }
-                }
-            } else if let Some(bias_off) = layout.bias_off {
-                if allow_implicit_deriv {
-                    let raw_bias = load_addr_f32(self, bias_off, 0);
-                    // WGSL requires `textureSampleBias` bias within [-16.0, 15.99].
-                    let bias_lo = self.lit_f32(-16.0);
-                    let bias_hi = self.lit_f32(15.99);
-                    let clamped_bias = self.emit_expr(Expression::Math {
-                        fun: MathFunction::Clamp,
-                        arg: raw_bias,
-                        arg1: Some(bias_lo),
-                        arg2: Some(bias_hi),
-                        arg3: None,
-                    });
-                    SampleLevel::Bias(clamped_bias)
-                } else {
-                    SampleLevel::Exact(self.lit_f32(0.0))
-                }
-            } else if allow_implicit_deriv {
-                SampleLevel::Auto
-            } else {
-                SampleLevel::Exact(self.lit_f32(0.0))
-            };
-
-            let raw_sample = self.emit_expr(Expression::ImageSample {
-                image,
-                sampler,
-                gather: None,
-                coordinate: coord,
-                array_index,
-                offset: None,
-                level,
-                depth_ref: None,
-                clamp_to_edge: false,
-            });
-
-            if let Some(cmp_off) = layout.compare_off {
-                // Depth/shadow comparison on baseline `texture_2d<f32>` + `sampler`:
-                // returns 1.0 when `z_ref <= tex.x`, else 0.0, replicated across channels.
-                let z_ref = load_addr_f32(self, cmp_off, 0);
-                let depth_val = self.emit_expr(Expression::AccessIndex {
-                    base: raw_sample,
-                    index: 0,
+            // Apply GFX10.3 packed 6-bit signed texel offsets (`_o` variants) via texel-space UV shift
+            // (`coord + vecN<f32>(dx, dy[, dz]) / max(vecN<f32>(textureDimensions(tex)), 1.0)`),
+            // which handles both constant and dynamic VGPR offsets cleanly under baseline WGSL.
+            if let Some(off_idx) = layout.offset_off
+                && tex_dim.supports_texel_offset()
+            {
+                let raw_off_f = load_addr_f32(self, off_idx, 0);
+                let raw_off_u = self.bitcast_f32_to_u32(raw_off_f);
+                let sh26 = self.lit_u32(26);
+                let sh18 = self.lit_u32(18);
+                let dx_l = self.emit_bin(BinaryOperator::ShiftLeft, raw_off_u, sh26);
+                let dx_i = self.bitcast_u32_to_i32(dx_l);
+                let dx_s = self.emit_bin(BinaryOperator::ShiftRight, dx_i, sh26);
+                let dx_f = self.emit_expr(Expression::As {
+                    expr: dx_s,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
                 });
-                let passed = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::LessEqual,
-                    left: z_ref,
-                    right: depth_val,
+                let dy_l = self.emit_bin(BinaryOperator::ShiftLeft, raw_off_u, sh18);
+                let dy_i = self.bitcast_u32_to_i32(dy_l);
+                let dy_s = self.emit_bin(BinaryOperator::ShiftRight, dy_i, sh26);
+                let dy_f = self.emit_expr(Expression::As {
+                    expr: dy_s,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
+                });
+                let dims_u = self.emit_expr(Expression::ImageQuery {
+                    image,
+                    query: ImageQuery::Size { level: None },
+                });
+                let dims_f = self.emit_expr(Expression::As {
+                    expr: dims_u,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
                 });
                 let one = self.lit_f32(1.0);
-                let zero = self.lit_f32(0.0);
-                let cmp_f = self.emit_expr(Expression::Select {
-                    condition: passed,
-                    accept: one,
-                    reject: zero,
+                let (off_vec, one_vec) = if tex_dim == TexDim::D3 {
+                    let sh10 = self.lit_u32(10);
+                    let dz_l = self.emit_bin(BinaryOperator::ShiftLeft, raw_off_u, sh10);
+                    let dz_i = self.bitcast_u32_to_i32(dz_l);
+                    let dz_s = self.emit_bin(BinaryOperator::ShiftRight, dz_i, sh26);
+                    let dz_f = self.emit_expr(Expression::As {
+                        expr: dz_s,
+                        kind: ScalarKind::Float,
+                        convert: Some(4),
+                    });
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_f32_ty,
+                            components: vec![dx_f, dy_f, dz_f],
+                        }),
+                        self.emit_expr(Expression::Splat {
+                            size: VectorSize::Tri,
+                            value: one,
+                        }),
+                    )
+                } else {
+                    (
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_f32_ty,
+                            components: vec![dx_f, dy_f],
+                        }),
+                        self.emit_expr(Expression::Splat {
+                            size: VectorSize::Bi,
+                            value: one,
+                        }),
+                    )
+                };
+                let safe_dims = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Max,
+                    arg: dims_f,
+                    arg1: Some(one_vec),
+                    arg2: None,
+                    arg3: None,
+                });
+                let uv_delta = self.emit_bin(BinaryOperator::Divide, off_vec, safe_dims);
+                coord = self.emit_bin(BinaryOperator::Add, coord, uv_delta);
+            }
+
+            let allow_implicit_deriv = self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf();
+            let hw_depth_compare = layout.compare_off.is_some() && tex_is_depth && samp_is_cmp;
+
+            if layout.is_gather4 {
+                let gather_comp = gather_component_from_dmask(dmask);
+                if hw_depth_compare {
+                    // Hardware depth comparison gather: `textureGatherCompare` -> vec4<f32>.
+                    let z_ref = load_addr_f32(self, layout.compare_off.unwrap_or(0), 0);
+                    self.emit_expr(Expression::ImageSample {
+                        image,
+                        sampler,
+                        gather: Some(SwizzleComponent::X),
+                        coordinate: coord,
+                        array_index,
+                        offset: None,
+                        level: SampleLevel::Zero,
+                        depth_ref: Some(z_ref),
+                        clamp_to_edge: false,
+                    })
+                } else if tex_dim.supports_gather() {
+                    // Regular `textureGather(component, tex, sampler, ...)` -> vec4<f32>.
+                    let gathered = self.emit_expr(Expression::ImageSample {
+                        image,
+                        sampler,
+                        gather: Some(gather_comp),
+                        coordinate: coord,
+                        array_index,
+                        offset: None,
+                        level: SampleLevel::Zero,
+                        depth_ref: None,
+                        clamp_to_edge: false,
+                    });
+                    if let Some(cmp_off) = layout.compare_off {
+                        // Mixed-use texture/sampler fallback: compare all 4 gathered depth taps against z_ref.
+                        let z_ref = load_addr_f32(self, cmp_off, 0);
+                        let one = self.lit_f32(1.0);
+                        let zero = self.lit_f32(0.0);
+                        let mut cmp_comps = Vec::with_capacity(4);
+                        for ch in 0..4u32 {
+                            let tap = self.emit_expr(Expression::AccessIndex {
+                                base: gathered,
+                                index: ch,
+                            });
+                            let passed = self.emit_bin(BinaryOperator::LessEqual, z_ref, tap);
+                            let res = self.emit_select(passed, one, zero);
+                            cmp_comps.push(res);
+                        }
+                        self.emit_expr(Expression::Compose {
+                            ty: self.types.vec4_f32_ty,
+                            components: cmp_comps,
+                        })
+                    } else {
+                        gathered
+                    }
+                } else {
+                    // WGSL has no `textureGather` on `texture_3d`; fall back to `textureSampleLevel(..., 0.0)`
+                    // and splat the selected component (or compare result) across 4 lanes.
+                    let zero_lod = self.lit_f32(0.0);
+                    let raw_sample = self.emit_expr(Expression::ImageSample {
+                        image,
+                        sampler,
+                        gather: None,
+                        coordinate: coord,
+                        array_index: None,
+                        offset: None,
+                        level: SampleLevel::Exact(zero_lod),
+                        depth_ref: None,
+                        clamp_to_edge: false,
+                    });
+                    let ch_idx = match gather_comp {
+                        SwizzleComponent::X => 0,
+                        SwizzleComponent::Y => 1,
+                        SwizzleComponent::Z => 2,
+                        SwizzleComponent::W => 3,
+                    };
+                    let val = self.emit_expr(Expression::AccessIndex {
+                        base: raw_sample,
+                        index: ch_idx,
+                    });
+                    let lane_val = if let Some(cmp_off) = layout.compare_off {
+                        let z_ref = load_addr_f32(self, cmp_off, 0);
+                        let passed = self.emit_bin(BinaryOperator::LessEqual, z_ref, val);
+                        let one = self.lit_f32(1.0);
+                        let zero = self.lit_f32(0.0);
+                        self.emit_select(passed, one, zero)
+                    } else {
+                        val
+                    };
+                    self.emit_expr(Expression::Splat {
+                        size: VectorSize::Quad,
+                        value: lane_val,
+                    })
+                }
+            } else if hw_depth_compare {
+                // Hardware shadow PCF on `texture_depth_*` + `sampler_comparison`:
+                // WGSL allows `textureSampleCompare` (`Auto`, fragment uniform CF) or
+                // `textureSampleCompareLevel` (`Zero`, all stages & non-uniform CF; no arbitrary lod/grad/bias).
+                let z_ref = load_addr_f32(self, layout.compare_off.unwrap_or(0), 0);
+                let cmp_level = if layout.is_zero_lod
+                    || layout.lod_off.is_some()
+                    || layout.grad_off.is_some()
+                    || !allow_implicit_deriv
+                {
+                    SampleLevel::Zero
+                } else {
+                    SampleLevel::Auto
+                };
+                let cmp_f = self.emit_expr(Expression::ImageSample {
+                    image,
+                    sampler,
+                    gather: None,
+                    coordinate: coord,
+                    array_index,
+                    offset: None,
+                    level: cmp_level,
+                    depth_ref: Some(z_ref),
+                    clamp_to_edge: false,
                 });
                 self.emit_expr(Expression::Splat {
                     size: VectorSize::Quad,
                     value: cmp_f,
                 })
             } else {
-                raw_sample
+                // Regular sampled texture (`2d`, `2d_array`, `3d`, `cube`, `cube_array`):
+                // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
+                // in Fragment shaders within uniform control flow; Vertex, Compute, and non-uniform
+                // Fragment branches must use explicit `textureSampleLevel` or `textureSampleGrad`.
+                let level = if layout.is_zero_lod {
+                    SampleLevel::Exact(self.lit_f32(0.0))
+                } else if let Some(lod_off) = layout.lod_off {
+                    let lod = load_addr_f32(self, lod_off, lod_shift);
+                    SampleLevel::Exact(lod)
+                } else if let Some(grad_off) = layout.grad_off {
+                    let dy_base = if inst_dim.has_3d_grad() { 3u8 } else { 2u8 };
+                    if tex_dim.has_3d_grad() {
+                        let dudx = load_addr_f32(self, grad_off, 0);
+                        let dvdx = load_addr_f32(self, grad_off, 1);
+                        let dwdx = if inst_dim.has_3d_grad() {
+                            load_addr_f32(self, grad_off, 2)
+                        } else {
+                            self.lit_f32(0.0)
+                        };
+                        let dudy = load_addr_f32(self, grad_off, dy_base);
+                        let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
+                        let dwdy = if inst_dim.has_3d_grad() {
+                            load_addr_f32(self, grad_off, dy_base.saturating_add(2))
+                        } else {
+                            self.lit_f32(0.0)
+                        };
+                        let x = self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_f32_ty,
+                            components: vec![dudx, dvdx, dwdx],
+                        });
+                        let y = self.emit_expr(Expression::Compose {
+                            ty: self.types.vec3_f32_ty,
+                            components: vec![dudy, dvdy, dwdy],
+                        });
+                        SampleLevel::Gradient { x, y }
+                    } else {
+                        let dudx = load_addr_f32(self, grad_off, 0);
+                        let dvdx = load_addr_f32(self, grad_off, 1);
+                        let dudy = load_addr_f32(self, grad_off, dy_base);
+                        let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
+                        let x = self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_f32_ty,
+                            components: vec![dudx, dvdx],
+                        });
+                        let y = self.emit_expr(Expression::Compose {
+                            ty: self.types.vec2_f32_ty,
+                            components: vec![dudy, dvdy],
+                        });
+                        SampleLevel::Gradient { x, y }
+                    }
+                } else if let Some(bias_off) = layout.bias_off {
+                    if allow_implicit_deriv {
+                        let raw_bias = load_addr_f32(self, bias_off, 0);
+                        // WGSL requires `textureSampleBias` bias within [-16.0, 15.99].
+                        let bias_lo = self.lit_f32(-16.0);
+                        let bias_hi = self.lit_f32(15.99);
+                        let clamped_bias = self.emit_expr(Expression::Math {
+                            fun: MathFunction::Clamp,
+                            arg: raw_bias,
+                            arg1: Some(bias_lo),
+                            arg2: Some(bias_hi),
+                            arg3: None,
+                        });
+                        SampleLevel::Bias(clamped_bias)
+                    } else {
+                        SampleLevel::Exact(self.lit_f32(0.0))
+                    }
+                } else if allow_implicit_deriv {
+                    SampleLevel::Auto
+                } else {
+                    SampleLevel::Exact(self.lit_f32(0.0))
+                };
+
+                let raw_sample = self.emit_expr(Expression::ImageSample {
+                    image,
+                    sampler,
+                    gather: None,
+                    coordinate: coord,
+                    array_index,
+                    offset: None,
+                    level,
+                    depth_ref: None,
+                    clamp_to_edge: false,
+                });
+
+                if let Some(cmp_off) = layout.compare_off {
+                    // Mixed-use texture/sampler fallback: compare z_ref <= tex.x, splatted to vec4<f32>.
+                    let z_ref = load_addr_f32(self, cmp_off, 0);
+                    let depth_val = self.emit_expr(Expression::AccessIndex {
+                        base: raw_sample,
+                        index: 0,
+                    });
+                    let passed = self.emit_expr(Expression::Binary {
+                        op: BinaryOperator::LessEqual,
+                        left: z_ref,
+                        right: depth_val,
+                    });
+                    let one = self.lit_f32(1.0);
+                    let zero = self.lit_f32(0.0);
+                    let cmp_f = self.emit_expr(Expression::Select {
+                        condition: passed,
+                        accept: one,
+                        reject: zero,
+                    });
+                    self.emit_expr(Expression::Splat {
+                        size: VectorSize::Quad,
+                        value: cmp_f,
+                    })
+                } else {
+                    raw_sample
+                }
             }
         };
 
+        // For `image_gather4*`, `dmask` selects the gathered channel and hardware always writes all 4 taps.
+        let out_mask = if layout.is_gather4 { 0xF } else { eff_mask };
+
         if d16 {
-            // GFX10.3 packed 16-bit MIMG return: pack enabled dmask channels in LSB-to-MSB order
+            // GFX10.3 packed 16-bit MIMG return: pack enabled output channels in LSB-to-MSB order
             // into consecutive 32-bit VGPRs (2 f16 channels per VGPR via WGSL `pack2x16float`).
             let mut selected_channels = [0u32; 4];
             let mut selected_len = 0usize;
             for ch in 0..4u32 {
-                if (eff_mask & (1 << ch)) != 0 {
+                if (out_mask & (1 << ch)) != 0 {
                     selected_channels[selected_len] = ch;
                     selected_len += 1;
                 }
@@ -18852,7 +19481,7 @@ impl IrEmitter {
         } else {
             let mut dst_offset = 0u8;
             for ch in 0..4u32 {
-                if (eff_mask & (1 << ch)) != 0 {
+                if (out_mask & (1 << ch)) != 0 {
                     if checked_vgpr_reg(vdata, dst_offset).is_some() {
                         let comp = self.emit_expr(Expression::AccessIndex {
                             base: sampled,
@@ -19849,7 +20478,23 @@ impl IrEmitter {
                     return false;
                 };
                 let depth_val = if (en & 1) != 0 {
-                    self.load_vgpr_f32(vsrc[0])
+                    if compr {
+                        let vf = self.load_vgpr_f32(vsrc[0]);
+                        let vu = self.bitcast_f32_to_u32(vf);
+                        let pair = self.emit_expr(Expression::Math {
+                            fun: MathFunction::Unpack2x16float,
+                            arg: vu,
+                            arg1: None,
+                            arg2: None,
+                            arg3: None,
+                        });
+                        self.emit_expr(Expression::AccessIndex {
+                            base: pair,
+                            index: 0,
+                        })
+                    } else {
+                        self.load_vgpr_f32(vsrc[0])
+                    }
                 } else {
                     self.lit_f32(0.0)
                 };
@@ -21307,8 +21952,10 @@ fn validate_emitted_wgsl_structure(
 
 /// Baseline WebGPU capabilities permitted during Naga validation.
 /// `SHADER_FLOAT16_IN_FLOAT32` enables core WGSL `pack2x16float`/`unpack2x16float`
-/// built-ins (no `enable f16;` extension required in WebGPU).
-const BASELINE_WEBGPU_CAPABILITIES: Capabilities = Capabilities::SHADER_FLOAT16_IN_FLOAT32;
+/// built-ins (no `enable f16;` extension required in WebGPU), and `CUBE_ARRAY_TEXTURES`
+/// enables core WebGPU 1.0 `texture_cube_array`/`texture_depth_cube_array` types.
+const BASELINE_WEBGPU_CAPABILITIES: Capabilities =
+    Capabilities::SHADER_FLOAT16_IN_FLOAT32.union(Capabilities::CUBE_ARRAY_TEXTURES);
 
 /// Strip temporary Naga-validation stub definitions for runtime-owned RT prelude helpers
 /// (`fn pg6_load32_stub(...) { ... }` and `fn pg6_bvh_intersect(...) { ... }`) from emitted WGSL
