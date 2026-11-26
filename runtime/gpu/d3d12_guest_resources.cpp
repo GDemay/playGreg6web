@@ -1,5 +1,6 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "gpu/xbox_embedded_native.h"
 
@@ -1396,16 +1397,55 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
             }
         }
         const uint32_t victim = oldest->second.id;
+        const AddressTextureEntry victim_entry = oldest->second;
+        const bool victim_in_frame = oldest_in_frame;
         address_textures_.erase(oldest);
         untrack_guest_texture(victim);
         bridge_->unregister_resource(victim);
+        // Backlog 38: a small texture not referenced by the frame being recorded is parked for reuse
+        // instead of destroyed (it stays counted in the texture budget while parked).
+        std::vector<uint32_t> pool_evicted;
+        std::vector<uint64_t> pool_evicted_bytes;
+        if (!victim_in_frame && victim_entry.budget_bytes != 0 &&
+            small_texture_pool().release(victim_entry.shape, victim, victim_entry.budget_bytes, &pool_evicted,
+                                         &pool_evicted_bytes)) {
+            for (size_t i = 0; i < pool_evicted.size(); ++i) {
+                texture_budget().note_destroyed(pool_evicted_bytes[i]);
+                untrack_guest_texture(pool_evicted[i]);
+                bridge_->unregister_resource(pool_evicted[i]);
+                bridge_->destroy_or_defer_resource(pool_evicted[i], drop);
+            }
+            continue;
+        }
+        if (victim_entry.budget_bytes != 0) {
+            texture_budget().note_destroyed(victim_entry.budget_bytes);
+        }
         bridge_->destroy_or_defer_resource(victim, drop);
     }
     if (drop.size() != 0) {
         submit(drop);
     }
 
-    const uint32_t id = allocate_id();
+    // Backlog 38: the host texture of a released small texture of the same shape is reused; every
+    // texel of every mip is zeroed below, so nothing of its previous content stays visible.
+    const DxgiFormatLayout shape_layout = dxgi_format_layout(dxgi_format);
+    const bool is3d_tex = dim == GpuTextureDimension::Dim3D;
+    const uint64_t chain_bytes =
+        shape_layout.known && shape_layout.block_bytes != 0
+            ? texture_chain_bytes(width, safe_height, safe_depth, safe_mips, shape_layout.block_width,
+                                  shape_layout.block_height, shape_layout.block_bytes)
+            : 0u;
+    SmallTextureShape shape{};
+    shape.owner = reinterpret_cast<uintptr_t>(this);
+    shape.dxgi_format = dxgi_format;
+    shape.width = width;
+    shape.height = safe_height;
+    shape.depth = safe_depth;
+    shape.mip_levels = safe_mips;
+    shape.dim = static_cast<uint8_t>(dim);
+    shape.storage = uav && storage_capable(mapping.format, bridge_->options().features);
+    const uint32_t reused_id = small_texture_pool().acquire(shape, chain_bytes);
+    const uint32_t id = reused_id != 0 ? reused_id : allocate_id();
     GpuCreateTexture2Payload payload{};
     payload.id = id;
     payload.width = width;
@@ -1426,7 +1466,27 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     }
 
     CommandEncoder enc;
-    enc.emit_packet(GpuOpcode::CreateTexture2, &payload, sizeof(payload));
+    if (reused_id != 0) {
+        const std::vector<ZeroWrite> zeros =
+            zero_fill_writes(width, safe_height, safe_depth, safe_mips, is3d_tex, shape_layout.block_width,
+                             shape_layout.block_height, shape_layout.block_bytes);
+        std::vector<uint8_t> zero_bytes;
+        for (const ZeroWrite& z : zeros) {
+            zero_bytes.assign(static_cast<size_t>(z.bytes), 0u);
+            enc.write_texture(id, z.mip, 0, 0, 0, z.width, z.height, z.depth_or_layers, z.bytes_per_row,
+                              z.rows_per_image, zero_bytes.data(), static_cast<uint32_t>(zero_bytes.size()));
+        }
+    } else {
+        const auto t0 = std::chrono::steady_clock::now();
+        enc.emit_packet(GpuOpcode::CreateTexture2, &payload, sizeof(payload));
+        small_texture_pool().note_create(
+            chain_bytes, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                   std::chrono::steady_clock::now() - t0)
+                                                   .count()));
+        if (chain_bytes != 0) {
+            texture_budget().note_created(chain_bytes);
+        }
+    }
     submit(enc);
 
     bridge::TextureInfo info{};
@@ -1475,7 +1535,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         }
     }
 
-    address_textures_.emplace(key, AddressTextureEntry{id, ++address_texture_tick_});
+    address_textures_.emplace(key, AddressTextureEntry{id, ++address_texture_tick_, chain_bytes, shape});
     return id;
 }
 

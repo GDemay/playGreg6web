@@ -22,6 +22,7 @@
 #include "gpu/descriptor_heap.h"
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
+#include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
@@ -2075,6 +2076,20 @@ std::string build_report() {
              ", \"peak_per_epoch\": " + std::to_string(dc.peak_bind_groups_per_epoch) +
              ", \"budget_overflows\": " + std::to_string(dc.bind_group_budget_overflows) +
              ", \"draws_dropped\": " + std::to_string(dc.draws_dropped_no_slot) + "}},\n";
+        // Backlog 38: small host textures recycled instead of destroyed and recreated.
+        const gpu::SmallTexturePoolStats sp = gpu::small_texture_pool().stats();
+        o += "  \"small_texture_pool\": {\"max_chain_bytes\": " + std::to_string(gpu::kSmallTextureMaxBytes) +
+             ", \"hits\": " + std::to_string(sp.hits) + ", \"misses\": " + std::to_string(sp.misses) +
+             ", \"bytes_reused\": " + std::to_string(sp.bytes_reused) +
+             ", \"textures_created\": " + std::to_string(sp.creates) +
+             ", \"bytes_created\": " + std::to_string(sp.bytes_created) +
+             ", \"create_ms\": " + std::to_string(sp.create_ns / 1000000u) +
+             ", \"parked\": " + std::to_string(sp.parked_count) +
+             ", \"parked_bytes\": " + std::to_string(sp.parked_bytes) +
+             ", \"peak_parked_bytes\": " + std::to_string(sp.peak_parked_bytes) +
+             ", \"parked_total\": " + std::to_string(sp.parked_total) +
+             ", \"evicted\": " + std::to_string(sp.evicted) + ", \"rejected\": " + std::to_string(sp.rejected) +
+             "},\n";
     }
     // Schema 2: the import calls up to the first Present, per guest thread and import (null until a
     // Present was reported through mark_first_present), then the extension's members (per-Present samples).
