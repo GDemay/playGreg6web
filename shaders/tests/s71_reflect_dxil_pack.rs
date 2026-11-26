@@ -531,7 +531,7 @@ fn reflect_v3_cross_stage_collision_detection_and_offset_remapping() {
     );
 
     // 1) Default options: detects minBindingSize mismatch (mergeable) + 3 hard conflicts,
-    //    and deterministically remaps the 3 colliding PS bindings to offset >= 32.
+    //    and deterministically remaps the 3 colliding PS bindings to offset >= 64.
     let opts = MultiStageMergeOptions::default();
     let report = merge_multistage_pipeline_with_resolution(&[&vs, &ps], &opts)
         .expect("multi-stage resolution must produce collision-free layout");
@@ -561,8 +561,8 @@ fn reflect_v3_cross_stage_collision_detection_and_offset_remapping() {
         }
     );
 
-    // Remapped PS bindings live at >= 32 and are disjoint from VS bindings.
-    assert!(report.remaps.iter().all(|r| r.stage == ShaderStage::Fragment && r.new_binding >= 32));
+    // Remapped PS bindings live at >= 64 and are disjoint from VS bindings.
+    assert!(report.remaps.iter().all(|r| r.stage == ShaderStage::Fragment && r.new_binding >= 64));
     let resolved_refs: Vec<&EntryPointReflection> = report.resolved_stages.iter().collect();
     let remaining_hard: Vec<_> = detect_cross_stage_binding_collisions(&resolved_refs, &opts)
         .into_iter()
@@ -622,7 +622,7 @@ fn reflect_v3_cross_stage_collision_detection_and_offset_remapping() {
         .expect("MS(Compute)+PS merge must succeed");
     assert_eq!(ms_report.remaps.len(), 1);
     assert_eq!(ms_report.remaps[0].stage, ShaderStage::Fragment);
-    assert_eq!(ms_report.remaps[0].new_binding, 32);
+    assert_eq!(ms_report.remaps[0].new_binding, 64);
     let ms_g0 = &ms_report.layout.bind_group_layouts[0];
     assert_eq!(ms_g0.entries.len(), 2);
     assert_eq!(ms_g0.entries[0].visibility, VISIBILITY_COMPUTE);
