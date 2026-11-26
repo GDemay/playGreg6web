@@ -10,6 +10,7 @@ pub mod jump_survey;
 mod jump_table;
 mod reach;
 pub mod lift;
+pub mod opcode_census;
 pub mod pdata;
 pub mod pe;
 pub mod pipeline;
