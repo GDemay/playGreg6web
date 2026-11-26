@@ -6,8 +6,9 @@ Input: one or more JSON files, each either a `playgta6-shaders translate-rdna2 -
 stage) or a `playgta6-shaders pack-rdna2 --json` summary (its `entries` list). A stage enters the
 sidecar only when its reflection carries the join keys the runtime needs:
   - every binding has a `source` ({user_sgpr, table_byte_offset} | {user_sgpr, root_constants} |
-    {user_sgpr, root_descriptor} | {static_sampler} | {sampler_heap | resource_heap: {base_user_sgpr,
-    stride, index: {user_sgpr, shift}}} (S34: a directly indexed heap, index from a root constant) |
+    {user_sgpr, root_descriptor, table_byte_offset? (v2+, 32-byte aligned)} | {static_sampler} |
+    {sampler_heap | resource_heap: {base_user_sgpr, stride, index: {user_sgpr, shift}}} (S34: a
+    directly indexed heap, index from a root constant) |
     {inline_sampler: {sdwords: [d0, d1, d2, d3]}} (#482: the four GFX10 S# dwords of a sampler the
     stage builds from constants; the runtime decodes them) |
     {cbv_indexed_resource_heap | cbv_indexed_sampler_heap: {cbv: {user_sgpr, root_descriptor: true} |
@@ -18,13 +19,18 @@ sidecar only when its reflection carries the join keys the runtime needs:
     window_base?: {cbv: <as above>, byte_offset, bit_offset?, mask?}}} (G62 / #482: per-lane
     (VGPR / waterfall) bindless, a window of max_count heap descriptors read as a binding_array;
     kept and counted, the runtime refuses the join with a counted reason until it binds arrays) |
-    {unresolved: true | "<reason>"} (G62 / #482, sidecar version 3; added with --unresolved-sources: the translator
-    reflected the binding but could not trace its descriptor, e.g. a bindless heap index read from a
-    constant buffer at an offset computed from a root constant; the runtime binds the worker's
-    default for it and joins the rest of the stage; writable kinds stay skipped));
+    {rt_arena: true} (group 3, bindings 16..21; runtime-owned RT arena prelude binding) |
+    {unresolved: true | "<reason>"} (G62 / #482, sidecar version 3; added with --unresolved-sources:
+    the translator reflected the binding but could not trace its descriptor; the runtime binds the
+    worker's default for it and joins the rest of the stage; writable kinds stay skipped));
+  - optional stage-level `rt_arena: true` (RT arena prelude flag) and compute-only `mesh_output`
+    ({max_vertices: 1..256, max_primitives: 1..256, vertex_words: 4 + 4*n, 0 <= n <= 15});
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
+
+`--verify-pack` stream-validates WGPK v1 (20-byte TOC, 32-bit offsets) and WGPK v2 (>4 GiB,
+24-byte TOC, 64-bit offsets) headers/TOCs in bounded chunks without loading WGSL payloads into RAM.
 
     python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--unresolved-sources] [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--verify-pack <wgsl.pack>] [--json]
 
@@ -39,7 +45,7 @@ import re
 import struct
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 SCHEMA = "playgta6-stage-reflection"
 VERSION = 1
@@ -52,16 +58,18 @@ REPORT_VERSION = 1
 DEFAULT_MAX_SAMPLE_HASHES = 5
 STAGES = ("vertex", "fragment", "compute")
 
-# WGPK v1 binary container constants (matching shaders/src/pack.rs byte-for-byte)
+# WGPK v1/v2 binary container constants (matching shaders/src/pack.rs byte-for-byte)
 WGPK_MAGIC = b"WGPK"
 WGPK_VERSION = 1
 WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
 WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
 WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
-WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
+WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes (v1)
 WGPK_VERSION_V2 = 2
 WGPK_ENTRY_STRUCT_V2 = struct.Struct("<QB3sIQ")  # hash, stage, reserved, length, offset (u64)
-WGPK_ENTRY_BYTES_V2 = WGPK_ENTRY_STRUCT_V2.size  # 24 bytes
+WGPK_ENTRY_BYTES_V2 = WGPK_ENTRY_STRUCT_V2.size  # 24 bytes (v2)
+WGPK_SUPPORTED_VERSIONS = (WGPK_VERSION, WGPK_VERSION_V2)
+WGPK_TOC_CHUNK_ENTRIES = 4096  # <= 96 KiB per streaming TOC read
 WGPK_U32_MAX = 0xFFFFFFFF
 WGPK_U64_MAX = 0xFFFFFFFFFFFFFFFF
 WGPK_STAGE_NAMES: dict[int, str] = {
@@ -70,7 +78,13 @@ WGPK_STAGE_NAMES: dict[int, str] = {
     3: "compute",
 }
 
+# Contract C3 RT arena bindings (matching runtime/gpu/rt_arena.h & stage_reflection.cpp)
+RT_ARENA_BIND_GROUP = 3
+RT_ARENA_BIND_MIN = 16  # 16..19 = pg6_arena0..3, 20 = pg6_arena_dir, 21 = pg6_rt_stats
+RT_ARENA_BIND_MAX = 21
+
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9_.$<>\[\]-]{1,64}$")
+_SAFE_CAUSE_RE = re.compile(r"^[A-Za-z0-9_ .<>'-]{1,96}$")
 _SAFE_HASH_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
@@ -107,7 +121,7 @@ def heap_source_ok(source: dict[str, Any]) -> bool | None:
     if not isinstance(heap, dict) or not isinstance(heap.get("index"), dict):
         return False
     ints = (heap.get("base_user_sgpr"), heap.get("stride"), heap["index"].get("user_sgpr"), heap["index"].get("shift"))
-    return all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in ints) and ints[3] < 32
+    return all(_u32(v) for v in ints) and ints[3] < 32
 
 
 def _u32(value: Any) -> bool:
@@ -178,19 +192,11 @@ def cbv_heap_source_ok(source: dict[str, Any]) -> bool | None:
     heap = source.get("cbv_indexed_resource_heap", source.get("cbv_indexed_sampler_heap"))
     if heap is None:
         return None
-    if not isinstance(heap, dict) or not isinstance(heap.get("cbv"), dict):
+    if not isinstance(heap, dict) or not _cb_dword_ok(heap):
         return False
-    cbv = heap["cbv"]
-    where = [cbv.get("root_descriptor") is True, cbv.get("root_constants") is True, "table_byte_offset" in cbv]
-    if not _u32(cbv.get("user_sgpr")) or sum(where) != 1:
-        return False
-    if where[2] and (not _u32(cbv["table_byte_offset"]) or cbv["table_byte_offset"] % 32 != 0):
-        return False
-    byte_offset, shift = heap.get("byte_offset"), heap.get("shift")
-    if not _u32(byte_offset) or byte_offset % 4 != 0 or not _u32(shift) or shift >= 32:
-        return False
-    bit_offset, mask, stride = heap.get("bit_offset", 0), heap.get("mask", 0xFFFFFFFF), heap.get("stride", 0)
-    return _u32(bit_offset) and bit_offset < 32 and _u32(mask) and mask != 0 and _u32(stride)
+    shift = heap.get("shift")
+    stride = heap.get("stride", 0)
+    return _u32(shift) and shift < 32 and _u32(stride)
 
 
 def root_descriptor_source_ok(source: dict[str, Any]) -> bool | None:
@@ -228,13 +234,31 @@ def is_unresolved_source(source: Any) -> bool:
 
 
 def unresolved_source_ok(source: dict[str, Any], kind: Any) -> bool | None:
-    """None: not an unresolved source; else whether it is exactly {unresolved: true} on a read-only kind."""
+    """None: not an unresolved source; else whether it is {unresolved: true | "<reason>"} on a read-only kind."""
     if "unresolved" not in source:
         return None
     if len(source) != 1 or KIND_MAP.get(str(kind)) not in UNRESOLVABLE_KINDS:
         return False
     mark = source["unresolved"]
     return mark is True or (isinstance(mark, str) and _SAFE_LABEL_RE.match(mark) is not None)
+
+
+def is_rt_arena_source(source: Any) -> bool:
+    return isinstance(source, dict) and "rt_arena" in source
+
+
+def rt_arena_source_ok(source: dict[str, Any], group: Any, binding: Any) -> bool | None:
+    """None: not an rt_arena source; else whether it is {rt_arena: true} at group 3, binding 16..21."""
+    if "rt_arena" not in source:
+        return None
+    if len(source) != 1 or source["rt_arena"] is not True:
+        return False
+    return (
+        _u32(group)
+        and _u32(binding)
+        and group == RT_ARENA_BIND_GROUP
+        and RT_ARENA_BIND_MIN <= binding <= RT_ARENA_BIND_MAX
+    )
 
 
 def _stages_require_v3(stages: dict[str, Any]) -> bool:
@@ -258,6 +282,45 @@ def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
             all(isinstance(w, int) and not isinstance(w, bool) and 0 <= w <= 0xFFFFFFFF for w in words))
 
 
+def _validate_binding_source(
+    source: dict[str, Any],
+    *,
+    kind: Any,
+    group: Any,
+    binding: Any,
+    sidecar_version: int | None = None,
+) -> str:
+    """Validate one binding `source` dict consistently for both `convert()` and `_load_sidecar()`.
+    Returns an empty string when valid, otherwise a sanitized reason string."""
+    rt_ok = rt_arena_source_ok(source, group, binding)
+    if rt_ok is False:
+        return "malformed rt_arena source"
+    if rt_ok is True:
+        return ""
+    unres_ok = unresolved_source_ok(source, kind)
+    if unres_ok is False:
+        return "malformed unresolved source"
+    if unres_ok is True:
+        if sidecar_version is not None and sidecar_version < VERSION_UNRESOLVED:
+            return "malformed unresolved source"
+        return ""
+    if root_descriptor_source_ok(source) is False:
+        if sidecar_version is not None:
+            return f"malformed v{sidecar_version} root_descriptor source"
+        return "malformed root_descriptor source"
+    if heap_source_ok(source) is False:
+        return "malformed heap source"
+    if inline_sampler_ok(source) is False:
+        return "malformed inline sampler"
+    if cbv_heap_source_ok(source) is False:
+        return "malformed CB-indexed heap source"
+    if lane_heap_source_ok(source) is False:
+        return "malformed lane-indexed heap source"
+    if "static_sampler" in source and not _u32(source["static_sampler"]):
+        return "malformed static_sampler source"
+    return ""
+
+
 def convert(entry: dict[str, Any], *, unresolved: bool = False) -> tuple[str | None, dict[str, Any] | None, str]:
     """(key, sidecar stage, reason it was skipped). With `unresolved`, a read-only binding without a
     source is kept with {"unresolved": true} instead of skipping the stage."""
@@ -266,7 +329,21 @@ def convert(entry: dict[str, Any], *, unresolved: bool = False) -> tuple[str | N
     if not key or stage is None:
         return None, None, "no hash or stage"
     out: dict[str, Any] = {"stage": stage, "bindings": []}
-    for b in entry.get("bindings", []):
+    if "rt_arena" in entry:
+        if not isinstance(entry["rt_arena"], bool):
+            return key, None, "malformed rt_arena flag"
+        if entry["rt_arena"] is True:
+            out["rt_arena"] = True
+    raw_bindings = entry.get("bindings", [])
+    if not isinstance(raw_bindings, list):
+        return key, None, "malformed binding"
+    for b in raw_bindings:
+        if not isinstance(b, dict):
+            return key, None, "malformed binding"
+        group = b.get("group", 0)
+        binding_num = b.get("binding")
+        if not (_u32(group) and _u32(binding_num)):
+            return key, None, "malformed binding"
         source = b.get("source")
         if not isinstance(source, dict):
             if not unresolved:
@@ -274,22 +351,30 @@ def convert(entry: dict[str, Any], *, unresolved: bool = False) -> tuple[str | N
             if KIND_MAP.get(str(b.get("kind", ""))) not in UNRESOLVABLE_KINDS:
                 return key, None, "writable binding without source"
             source = dict(UNRESOLVED_SOURCE)
-        if unresolved_source_ok(source, b.get("kind")) is False:
-            return key, None, "malformed unresolved source"
-        if root_descriptor_source_ok(source) is False:
-            return key, None, "malformed root_descriptor source"
-        if heap_source_ok(source) is False:
-            return key, None, "malformed heap source"
-        if inline_sampler_ok(source) is False:
-            return key, None, "malformed inline sampler"
-        if cbv_heap_source_ok(source) is False:
-            return key, None, "malformed CB-indexed heap source"
-        if lane_heap_source_ok(source) is False:
-            return key, None, "malformed lane-indexed heap source"
+        source_err = _validate_binding_source(
+            source,
+            kind=b.get("kind"),
+            group=group,
+            binding=binding_num,
+        )
+        if source_err:
+            return key, None, source_err
+        if is_rt_arena_source(source):
+            item: dict[str, Any] = {"group": group, "binding": binding_num, "source": {"rt_arena": True}}
+            if "kind" in b and b["kind"] is not None:
+                kind = KIND_MAP.get(str(b["kind"]))
+                if kind is None:
+                    return key, None, f"unknown binding kind {_sanitize_label(b.get('kind'), fallback='<invalid>')!r}"
+                item["kind"] = kind
+            for field in ("view_dimension", "sample_type", "multisampled", "storage_format", "min_binding_size_bytes"):
+                if field in b:
+                    item[field] = b[field]
+            out["bindings"].append(item)
+            continue
         kind = KIND_MAP.get(str(b.get("kind", "")))
         if kind is None:
-            return key, None, f"unknown binding kind {b.get('kind')!r}"
-        item: dict[str, Any] = {"group": b.get("group", 0), "binding": b["binding"], "kind": kind, "source": source}
+            return key, None, f"unknown binding kind {_sanitize_label(b.get('kind'), fallback='<invalid>')!r}"
+        item = {"group": group, "binding": binding_num, "kind": kind, "source": source}
         for field in ("view_dimension", "sample_type", "multisampled", "storage_format", "min_binding_size_bytes"):
             if field in b:
                 item[field] = b[field]
@@ -328,6 +413,17 @@ def _sanitize_label(value: Any, *, fallback: str = "") -> str:
     if not text:
         return fallback
     if _SAFE_LABEL_RE.match(text):
+        return text
+    return "<redacted>"
+
+
+def _sanitize_cause(value: Any, *, fallback: str = "<redacted>") -> str:
+    if not isinstance(value, str):
+        return fallback
+    text = value.strip()
+    if not text:
+        return fallback
+    if _SAFE_CAUSE_RE.match(text):
         return text
     return "<redacted>"
 
@@ -371,6 +467,25 @@ def _wgpk_entry_bytes(version: int) -> int:
     return WGPK_ENTRY_BYTES_V2 if version == WGPK_VERSION_V2 else WGPK_ENTRY_BYTES
 
 
+def _read_exact(stream: BinaryIO, size: int) -> bytes:
+    """Read up to `size` bytes from `stream`, looping across short reads until EOF."""
+    if size <= 0:
+        return b""
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining > 0:
+        part = stream.read(remaining)
+        if not part:
+            break
+        chunks.append(part)
+        remaining -= len(part)
+    if not chunks:
+        return b""
+    if len(chunks) == 1:
+        return chunks[0]
+    return b"".join(chunks)
+
+
 def _validate_wgpk_header(
     header: bytes | bytearray | memoryview, total_len: int
 ) -> tuple[int, int, int]:
@@ -383,10 +498,12 @@ def _validate_wgpk_header(
     if magic != WGPK_MAGIC:
         magic_hex = " ".join(f"0x{b:02x}" for b in magic)
         raise ValueError(f"invalid WGPK pack magic [{magic_hex}] (expected 'WGPK')")
-    if version not in (WGPK_VERSION, WGPK_VERSION_V2):
+    if version not in WGPK_SUPPORTED_VERSIONS:
         raise ValueError(f"unsupported WGPK pack version {version} (expected {WGPK_VERSION} or {WGPK_VERSION_V2})")
     if version == WGPK_VERSION and total_len > WGPK_U32_MAX:
         raise ValueError(f"WGPK pack size {total_len} exceeds u32 max ({WGPK_U32_MAX})")
+    if version == WGPK_VERSION_V2 and total_len > WGPK_U64_MAX:
+        raise ValueError(f"WGPK v2 pack size {total_len} exceeds u64 max ({WGPK_U64_MAX})")
     table_bytes = entry_count * _wgpk_entry_bytes(version)
     data_start = WGPK_HEADER_BYTES + table_bytes
     if version == WGPK_VERSION and data_start > WGPK_U32_MAX:
@@ -399,6 +516,92 @@ def _validate_wgpk_header(
     return version, entry_count, data_start
 
 
+class _WgpkTocValidator:
+    """Incremental bounds/overlap/uniqueness validator for WGPK v1 and v2 TOC chunks."""
+
+    def __init__(self, *, version: int, entry_count: int, data_start: int, total_len: int) -> None:
+        self.version = version
+        self.entry_count = entry_count
+        self.data_start = data_start
+        self.total_len = total_len
+        self.entry_bytes = _wgpk_entry_bytes(version)
+        self.limit = WGPK_U64_MAX if version == WGPK_VERSION_V2 else WGPK_U32_MAX
+        self.entries: list[dict[str, Any]] = []
+        self._seen_hashes: dict[int, int] = {}
+        self._spans: list[tuple[int, int, int]] = []
+        self._idx = 0
+
+    def feed_chunk(self, chunk: bytes | bytearray | memoryview, count: int) -> None:
+        entry_bytes = self.entry_bytes
+        is_v2 = self.version == WGPK_VERSION_V2
+        unpack = WGPK_ENTRY_STRUCT_V2.unpack_from if is_v2 else WGPK_ENTRY_STRUCT.unpack_from
+        limit = self.limit
+        data_start = self.data_start
+        total_len = self.total_len
+        seen_hashes = self._seen_hashes
+        spans = self._spans
+        entries = self.entries
+
+        for local_i in range(count):
+            idx = self._idx
+            base = local_i * entry_bytes
+            if is_v2:
+                hash_int, stage_code, _reserved, length, offset = unpack(chunk, base)
+            else:
+                hash_int, stage_code, _reserved, offset, length = unpack(chunk, base)
+            stage = WGPK_STAGE_NAMES.get(stage_code)
+            if stage is None:
+                raise ValueError(f"invalid WGPK shader stage code {stage_code} at entry {idx} (expected 1..3)")
+            end = offset + length
+            if end > limit:
+                raise ValueError(
+                    f"WGPK entry {idx} payload [{offset}..+{length}] overflows u{64 if limit == WGPK_U64_MAX else 32}"
+                )
+            if offset < data_start:
+                raise ValueError(
+                    f"WGPK entry {idx} payload offset {offset} overlaps header/TOC (data_start={data_start})"
+                )
+            if end > total_len:
+                raise ValueError(
+                    f"WGPK entry {idx} payload [{offset}..+{length}] exceeds pack bounds ({total_len} bytes)"
+                )
+            if hash_int in seen_hashes:
+                raise ValueError(
+                    f"WGPK pack contains duplicate shader hash 0x{hash_int:016x} "
+                    f"at entries {seen_hashes[hash_int]} and {idx}"
+                )
+            seen_hashes[hash_int] = idx
+            if length > 0:
+                spans.append((offset, end, idx))
+            entries.append({
+                "hash": f"0x{hash_int:016x}",
+                "stage": stage,
+                "offset": offset,
+                "length": length,
+            })
+            self._idx += 1
+
+    def finalize(self) -> list[dict[str, Any]]:
+        if len(self._spans) > 1:
+            self._spans.sort(key=lambda item: (item[0], item[1]))
+            for prev, curr in zip(self._spans, self._spans[1:]):
+                if curr[0] < prev[1]:
+                    raise ValueError(
+                        f"WGPK entry {prev[2]} payload [{prev[0]}..{prev[1]}) "
+                        f"overlaps entry {curr[2]} payload [{curr[0]}..{curr[1]})"
+                    )
+        return self.entries
+
+
+def _build_pack_meta(*, version: int, total_len: int) -> dict[str, Any]:
+    return {
+        "pack_version": version,
+        "pack_bytes": total_len,
+        "toc_entry_bytes": _wgpk_entry_bytes(version),
+        "is_wgpk_v2": version == WGPK_VERSION_V2,
+    }
+
+
 def _parse_wgpk_toc_entries(
     toc_bytes: bytes | bytearray | memoryview,
     *,
@@ -406,77 +609,109 @@ def _parse_wgpk_toc_entries(
     entry_count: int,
     data_start: int,
     total_len: int,
+    chunk_entries: int = WGPK_TOC_CHUNK_ENTRIES,
 ) -> list[dict[str, Any]]:
     """Decode and bounds-check all WGPK TOC records (v1: 20-byte, v2: 24-byte with a u64 offset)."""
-    entries: list[dict[str, Any]] = []
-    seen_hashes: dict[int, int] = {}
-    spans: list[tuple[int, int, int]] = []
-    entry_bytes = _wgpk_entry_bytes(version)
-    limit = WGPK_U64_MAX if version == WGPK_VERSION_V2 else WGPK_U32_MAX
-
-    for idx in range(entry_count):
-        base = idx * entry_bytes
-        if version == WGPK_VERSION_V2:
-            hash_int, stage_code, _reserved, length, offset = WGPK_ENTRY_STRUCT_V2.unpack_from(toc_bytes, base)
-        else:
-            hash_int, stage_code, _reserved, offset, length = WGPK_ENTRY_STRUCT.unpack_from(toc_bytes, base)
-        stage = WGPK_STAGE_NAMES.get(stage_code)
-        if stage is None:
-            raise ValueError(f"invalid WGPK shader stage code {stage_code} at entry {idx} (expected 1..3)")
-        end = offset + length
-        if end > limit:
-            raise ValueError(f"WGPK entry {idx} payload [{offset}..+{length}] overflows u{64 if limit == WGPK_U64_MAX else 32}")
-        if offset < data_start:
-            raise ValueError(
-                f"WGPK entry {idx} payload offset {offset} overlaps header/TOC (data_start={data_start})"
-            )
-        if end > total_len:
-            raise ValueError(
-                f"WGPK entry {idx} payload [{offset}..+{length}] exceeds pack bounds ({total_len} bytes)"
-            )
-        if hash_int in seen_hashes:
-            raise ValueError(
-                f"WGPK pack contains duplicate shader hash 0x{hash_int:016x} "
-                f"at entries {seen_hashes[hash_int]} and {idx}"
-            )
-        seen_hashes[hash_int] = idx
-        if length > 0:
-            spans.append((offset, end, idx))
-        entries.append({
-            "hash": f"0x{hash_int:016x}",
-            "stage": stage,
-            "offset": offset,
-            "length": length,
-        })
-
-    if len(spans) > 1:
-        spans.sort(key=lambda item: (item[0], item[1]))
-        for prev, curr in zip(spans, spans[1:]):
-            if curr[0] < prev[1]:
-                raise ValueError(
-                    f"WGPK entry {prev[2]} payload [{prev[0]}..{prev[1]}) "
-                    f"overlaps entry {curr[2]} payload [{curr[0]}..{curr[1]})"
-                )
-
-    return entries
-
-
-def parse_wgpk_toc_bytes(data: bytes | bytearray | memoryview) -> list[dict[str, Any]]:
-    """Parse and bounds-check a WGPK v1 header and TOC from an in-memory buffer."""
-    view = memoryview(data)
-    total_len = len(view)
-    version, entry_count, data_start = _validate_wgpk_header(view, total_len)
-    return _parse_wgpk_toc_entries(
-        view[WGPK_HEADER_BYTES:data_start],
+    if chunk_entries < 1:
+        raise ValueError("chunk_entries must be >= 1")
+    validator = _WgpkTocValidator(
         version=version,
         entry_count=entry_count,
         data_start=data_start,
         total_len=total_len,
     )
+    view = memoryview(toc_bytes)
+    entry_bytes = _wgpk_entry_bytes(version)
+    pos = 0
+    remaining = entry_count
+    while remaining > 0:
+        batch = min(chunk_entries, remaining)
+        byte_len = batch * entry_bytes
+        validator.feed_chunk(view[pos : pos + byte_len], batch)
+        pos += byte_len
+        remaining -= batch
+    return validator.finalize()
 
 
-def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
-    """Read and validate a WGPK v1 header and TOC from disk without loading WGSL payloads."""
+def parse_wgpk_toc_bytes_with_meta(
+    data: bytes | bytearray | memoryview,
+    *,
+    chunk_entries: int = WGPK_TOC_CHUNK_ENTRIES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Parse and bounds-check a WGPK v1/v2 header and TOC from an in-memory buffer, returning (entries, meta)."""
+    view = memoryview(data)
+    total_len = len(view)
+    version, entry_count, data_start = _validate_wgpk_header(view, total_len)
+    entries = _parse_wgpk_toc_entries(
+        view[WGPK_HEADER_BYTES:data_start],
+        version=version,
+        entry_count=entry_count,
+        data_start=data_start,
+        total_len=total_len,
+        chunk_entries=chunk_entries,
+    )
+    return entries, _build_pack_meta(version=version, total_len=total_len)
+
+
+def parse_wgpk_toc_bytes(data: bytes | bytearray | memoryview) -> list[dict[str, Any]]:
+    """Parse and bounds-check a WGPK v1/v2 header and TOC from an in-memory buffer."""
+    entries, _meta = parse_wgpk_toc_bytes_with_meta(data)
+    return entries
+
+
+def load_wgpk_toc_stream(
+    stream: BinaryIO,
+    *,
+    label: str = "<stream>",
+    chunk_entries: int = WGPK_TOC_CHUNK_ENTRIES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Stream-validate a WGPK v1/v2 header and TOC in bounded chunks without reading WGSL payloads."""
+    if chunk_entries < 1:
+        raise ValueError("chunk_entries must be >= 1")
+    safe_label = _sanitize_path_label(label)
+    try:
+        stream.seek(0, 2)
+        total_len = stream.tell()
+        if total_len < WGPK_HEADER_BYTES:
+            raise ValueError(
+                f"WGPK pack truncated: {total_len} bytes (minimum header size: {WGPK_HEADER_BYTES})"
+            )
+        stream.seek(0)
+        header = _read_exact(stream, WGPK_HEADER_BYTES)
+        version, entry_count, data_start = _validate_wgpk_header(header, total_len)
+        entry_bytes = _wgpk_entry_bytes(version)
+        table_bytes = data_start - WGPK_HEADER_BYTES
+        validator = _WgpkTocValidator(
+            version=version,
+            entry_count=entry_count,
+            data_start=data_start,
+            total_len=total_len,
+        )
+        remaining = entry_count
+        bytes_read = 0
+        while remaining > 0:
+            batch = min(chunk_entries, remaining)
+            want_bytes = batch * entry_bytes
+            chunk = _read_exact(stream, want_bytes)
+            if len(chunk) < want_bytes:
+                raise ValueError(
+                    f"WGPK pack truncated while reading TOC: got {bytes_read + len(chunk)} of {table_bytes} bytes"
+                )
+            validator.feed_chunk(chunk, batch)
+            bytes_read += len(chunk)
+            remaining -= batch
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        raise ValueError(f"failed to read WGPK pack {safe_label}: {reason}") from None
+    return validator.finalize(), _build_pack_meta(version=version, total_len=total_len)
+
+
+def load_wgpk_toc_with_meta(
+    path: Path,
+    *,
+    chunk_entries: int = WGPK_TOC_CHUNK_ENTRIES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Stream-read and validate a WGPK v1/v2 header and TOC from disk without loading WGSL payloads."""
     label = _sanitize_path_label(path)
     if not path.exists():
         raise ValueError(f"WGPK pack {label} does not exist")
@@ -484,31 +719,16 @@ def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
         raise ValueError(f"WGPK pack {label} is a directory")
     try:
         with path.open("rb") as f:
-            f.seek(0, 2)
-            total_len = f.tell()
-            if total_len < WGPK_HEADER_BYTES:
-                raise ValueError(
-                    f"WGPK pack truncated: {total_len} bytes (minimum header size: {WGPK_HEADER_BYTES})"
-                )
-            f.seek(0)
-            header = f.read(WGPK_HEADER_BYTES)
-            version, entry_count, data_start = _validate_wgpk_header(header, total_len)
-            table_bytes = data_start - WGPK_HEADER_BYTES
-            toc_bytes = f.read(table_bytes)
-            if len(toc_bytes) < table_bytes:
-                raise ValueError(
-                    f"WGPK pack truncated while reading TOC: got {len(toc_bytes)} of {table_bytes} bytes"
-                )
+            return load_wgpk_toc_stream(f, label=label, chunk_entries=chunk_entries)
     except OSError as exc:
         reason = exc.strerror or type(exc).__name__
         raise ValueError(f"failed to read WGPK pack {label}: {reason}") from None
-    return _parse_wgpk_toc_entries(
-        toc_bytes,
-        version=version,
-        entry_count=entry_count,
-        data_start=data_start,
-        total_len=total_len,
-    )
+
+
+def load_wgpk_toc(path: Path) -> list[dict[str, Any]]:
+    """Read and validate a WGPK v1/v2 header and TOC from disk without loading WGSL payloads."""
+    entries, _meta = load_wgpk_toc_with_meta(path)
+    return entries
 
 
 def verify_sidecar_against_pack(
@@ -517,9 +737,31 @@ def verify_sidecar_against_pack(
     *,
     pack_label: str | Path = "<pack>",
     max_samples: int = DEFAULT_MAX_SAMPLE_HASHES,
+    pack_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Cross-check reflection sidecar stage hashes against a parsed WGPK v1 TOC."""
+    """Cross-check reflection sidecar stage hashes against a parsed WGPK v1/v2 TOC."""
     safe_pack_label = _sanitize_path_label(pack_label)
+    if pack_meta is not None:
+        pack_version = int(pack_meta["pack_version"])
+        pack_bytes = int(pack_meta["pack_bytes"])
+        toc_entry_bytes = int(pack_meta["toc_entry_bytes"])
+        is_wgpk_v2 = bool(pack_meta["is_wgpk_v2"])
+    else:
+        inferred_v2 = any(
+            (int(e.get("offset", 0)) > WGPK_U32_MAX)
+            or (int(e.get("offset", 0)) + int(e.get("length", 0)) > WGPK_U32_MAX)
+            for e in pack_entries
+        )
+        pack_version = WGPK_VERSION_V2 if inferred_v2 else WGPK_VERSION
+        toc_entry_bytes = _wgpk_entry_bytes(pack_version)
+        is_wgpk_v2 = pack_version == WGPK_VERSION_V2
+        min_pack_bytes = WGPK_HEADER_BYTES + len(pack_entries) * toc_entry_bytes
+        max_end = max(
+            (int(e.get("offset", 0)) + int(e.get("length", 0)) for e in pack_entries),
+            default=0,
+        )
+        pack_bytes = max(min_pack_bytes, max_end)
+
     pack_by_hash: dict[str, str] = {}
     pack_by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
     for entry in pack_entries:
@@ -530,10 +772,12 @@ def verify_sidecar_against_pack(
             pack_by_stage[stage] += 1
 
     reflection_by_hash: dict[str, str | None] = {}
+    reflection_obj_by_hash: dict[str, Any] = {}
     for raw_key, stage_obj in stages.items():
         norm_key = _normalize_hash_key(raw_key)
         stage_val = stage_obj.get("stage") if isinstance(stage_obj, dict) else None
         reflection_by_hash[norm_key] = stage_val if isinstance(stage_val, str) else None
+        reflection_obj_by_hash[norm_key] = stage_obj
 
     pack_keys = set(pack_by_hash.keys())
     reflection_keys = set(reflection_by_hash.keys())
@@ -548,10 +792,14 @@ def verify_sidecar_against_pack(
         if stage in missing_by_stage:
             missing_by_stage[stage] += 1
 
-    stage_mismatches = sum(
-        1
+    mismatch_keys = [
+        key
         for key in matched_keys
         if reflection_by_hash.get(key) is not None and reflection_by_hash[key] != pack_by_hash[key]
+    ]
+    stage_mismatches = len(mismatch_keys)
+    unresolved_matched_stages = sum(
+        1 for key in matched_keys if _unresolved_count(reflection_obj_by_hash.get(key)) > 0
     )
 
     pack_entry_count = len(pack_entries)
@@ -561,6 +809,10 @@ def verify_sidecar_against_pack(
 
     return {
         "pack_label": safe_pack_label,
+        "pack_version": pack_version,
+        "pack_bytes": pack_bytes,
+        "toc_entry_bytes": toc_entry_bytes,
+        "is_wgpk_v2": is_wgpk_v2,
         "pack_entry_count": pack_entry_count,
         "reflection_stage_count": reflection_stage_count,
         "matched_hashes": matched_count,
@@ -576,14 +828,21 @@ def verify_sidecar_against_pack(
         "pack_by_stage": pack_by_stage,
         "missing_by_stage": missing_by_stage,
         "stage_mismatches": stage_mismatches,
+        "stage_mismatch_samples": _sample_hashes(mismatch_keys, max_samples=max_samples),
+        "gap_counts": {
+            "missing_reflection": len(missing_keys),
+            "stage_mismatches": stage_mismatches,
+            "extra_reflection": len(extra_keys),
+            "unresolved_matched_stages": unresolved_matched_stages,
+        },
     }
 
 
-def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
-    """Load and validate a v1/v2/v3 sidecar JSON file."""
+def _load_sidecar_doc(path: Path, *, label: str, allow_missing: bool) -> tuple[int | None, dict[str, Any]]:
+    """Load and validate a v1/v2/v3 sidecar JSON file, returning (version, stages)."""
     if not path.exists():
         if allow_missing:
-            return {}
+            return None, {}
         raise ValueError(f"{label} file does not exist")
     if path.is_dir():
         raise ValueError(f"{label} path is a directory")
@@ -614,34 +873,52 @@ def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, A
                 f"{label} stage {safe_k!r} has invalid stage "
                 f"{_sanitize_label(v.get('stage'), fallback='<invalid>')!r}"
             )
+        if "rt_arena" in v and not isinstance(v["rt_arena"], bool):
+            raise ValueError(f"{label} stage {safe_k!r} has malformed rt_arena flag")
         bindings = v.get("bindings")
         if not isinstance(bindings, list):
             raise ValueError(f"{label} stage {safe_k!r} must have a 'bindings' list")
-        if version >= 2:
-            for b in bindings:
-                if isinstance(b, dict) and isinstance(b.get("source"), dict):
-                    if root_descriptor_source_ok(b["source"]) is False:
-                        raise ValueError(
-                            f"{label} stage {safe_k!r} has malformed v2 root_descriptor source"
-                        )
         for b in bindings:
-            if isinstance(b, dict) and is_unresolved_source(b.get("source")):
-                if version < VERSION_UNRESOLVED or not unresolved_source_ok(b["source"], b.get("kind")):
-                    raise ValueError(f"{label} stage {safe_k!r} has malformed unresolved source")
+            if not isinstance(b, dict):
+                raise ValueError(f"{label} stage {safe_k!r} binding must be an object")
+            source = b.get("source")
+            if not isinstance(source, dict):
+                raise ValueError(f"{label} stage {safe_k!r} binding has missing or malformed source")
+            source_err = _validate_binding_source(
+                source,
+                kind=b.get("kind"),
+                group=b.get("group", 0),
+                binding=b.get("binding"),
+                sidecar_version=version,
+            )
+            if source_err:
+                raise ValueError(f"{label} stage {safe_k!r} has {source_err}")
+            if is_rt_arena_source(source):
+                if "kind" in b and b["kind"] is not None and KIND_MAP.get(str(b["kind"])) is None:
+                    raise ValueError(
+                        f"{label} stage {safe_k!r} has unknown binding kind "
+                        f"{_sanitize_label(b.get('kind'), fallback='<invalid>')!r}"
+                    )
         if "mesh_output" in v:
             if v.get("stage") != "compute" or not mesh_output_ok(v["mesh_output"]):
                 raise ValueError(f"{label} stage {safe_k!r} has malformed mesh_output")
         validated[k] = v
-    return validated
+    return version, validated
+
+
+def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
+    """Load and validate a v1/v2/v3 sidecar JSON file."""
+    _version, stages = _load_sidecar_doc(path, label=label, allow_missing=allow_missing)
+    return stages
 
 
 def load_existing_sidecar(path: Path) -> dict[str, Any]:
-    """Load and validate an existing v1 sidecar JSON; returns {} if the file does not exist."""
+    """Load and validate an existing v1/v2/v3 sidecar JSON; returns {} if the file does not exist."""
     return _load_sidecar(path, label="existing sidecar", allow_missing=True)
 
 
 def load_baseline_sidecar(path: Path) -> dict[str, Any]:
-    """Load and validate a baseline v1 sidecar JSON; raises ValueError if missing or invalid."""
+    """Load and validate a baseline v1/v2/v3 sidecar JSON; raises ValueError if missing or invalid."""
     return _load_sidecar(path, label="baseline sidecar", allow_missing=False)
 
 
@@ -656,6 +933,17 @@ def _is_vertex_index_stage(stage_obj: dict[str, Any]) -> bool:
     return not isinstance(inputs, list) or len(inputs) == 0
 
 
+def _unresolved_reason_label(source: dict[str, Any]) -> str:
+    mark = source.get("unresolved")
+    if mark is True:
+        return "unspecified"
+    return _sanitize_label(mark, fallback="<redacted>")
+
+
+def _sort_count_map(counts: dict[str, int]) -> dict[str, int]:
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
     """Compute sanitized breakdown telemetry for a sidecar's stages map."""
     by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
@@ -667,10 +955,16 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
     cbv_indexed_heap_bindings = 0
     lane_indexed_heap_stages = 0
     lane_indexed_heap_bindings = 0
+    root_descriptor_table_offset_stages = 0
+    root_descriptor_table_offset_bindings = 0
+    rt_arena_stages = 0
+    rt_arena_bindings = 0
     vertex_index_stages = 0
     mesh_output_stages = 0
     unresolved_stages = 0
     unresolved_bindings = 0
+    unresolved_by_kind_raw: dict[str, int] = {}
+    unresolved_by_reason_raw: dict[str, int] = {}
 
     for stage_obj in stages.values():
         if not isinstance(stage_obj, dict):
@@ -683,6 +977,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         has_resource_heap = False
         has_cbv_indexed_heap = False
         has_lane_indexed_heap = False
+        has_root_descriptor_table_offset = False
+        has_rt_arena = stage_obj.get("rt_arena") is True
         has_unresolved = False
         bindings = stage_obj.get("bindings")
         if isinstance(bindings, list):
@@ -704,9 +1000,21 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
                 if "lane_indexed_resource_heap" in source or "lane_indexed_sampler_heap" in source:
                     lane_indexed_heap_bindings += 1
                     has_lane_indexed_heap = True
+                if source.get("root_descriptor") is True and "table_byte_offset" in source:
+                    root_descriptor_table_offset_bindings += 1
+                    has_root_descriptor_table_offset = True
+                if source.get("rt_arena") is True:
+                    rt_arena_bindings += 1
+                    has_rt_arena = True
                 if "unresolved" in source:
                     unresolved_bindings += 1
                     has_unresolved = True
+                    raw_kind = binding.get("kind")
+                    mapped_kind = KIND_MAP.get(raw_kind) if isinstance(raw_kind, str) else None
+                    kind_label = mapped_kind if mapped_kind is not None else _sanitize_label(raw_kind, fallback="unknown")
+                    unresolved_by_kind_raw[kind_label] = unresolved_by_kind_raw.get(kind_label, 0) + 1
+                    reason_label = _unresolved_reason_label(source)
+                    unresolved_by_reason_raw[reason_label] = unresolved_by_reason_raw.get(reason_label, 0) + 1
 
         if has_inline_sampler:
             inline_sampler_stages += 1
@@ -716,6 +1024,10 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
             cbv_indexed_heap_stages += 1
         if has_lane_indexed_heap:
             lane_indexed_heap_stages += 1
+        if has_root_descriptor_table_offset:
+            root_descriptor_table_offset_stages += 1
+        if has_rt_arena:
+            rt_arena_stages += 1
         if has_unresolved:
             unresolved_stages += 1
         if _is_vertex_index_stage(stage_obj):
@@ -733,11 +1045,61 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         "cbv_indexed_heap_bindings": cbv_indexed_heap_bindings,
         "lane_indexed_heap_stages": lane_indexed_heap_stages,
         "lane_indexed_heap_bindings": lane_indexed_heap_bindings,
+        "root_descriptor_table_offset_stages": root_descriptor_table_offset_stages,
+        "root_descriptor_table_offset_bindings": root_descriptor_table_offset_bindings,
+        "rt_arena_stages": rt_arena_stages,
+        "rt_arena_bindings": rt_arena_bindings,
         "vertex_index_stages": vertex_index_stages,
         "mesh_output_stages": mesh_output_stages,
         "unresolved_stages": unresolved_stages,
         "unresolved_bindings": unresolved_bindings,
+        "unresolved_by_kind": _sort_count_map(unresolved_by_kind_raw),
+        "unresolved_by_reason": _sort_count_map(unresolved_by_reason_raw),
     }
+
+
+def _build_skipped_by_cause(skipped: dict[str, int]) -> tuple[int, list[dict[str, Any]]]:
+    sanitized_counts: dict[str, int] = {}
+    for cause, count in skipped.items():
+        if count <= 0:
+            continue
+        safe_cause = _sanitize_cause(cause)
+        sanitized_counts[safe_cause] = sanitized_counts.get(safe_cause, 0) + int(count)
+    total = sum(sanitized_counts.values())
+    rows = [
+        {
+            "cause": cause,
+            "count": count,
+            "pct_of_skipped": round((count * 100.0) / total, 2) if total > 0 else 0.0,
+        }
+        for cause, count in sorted(sanitized_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
+    return total, rows
+
+
+def build_gap_breakdown(
+    skipped: dict[str, int],
+    stage_summary: dict[str, Any],
+    *,
+    pack_verification: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a deterministic, sanitized, actionable per-cause gap breakdown."""
+    skipped_total, skipped_by_cause = _build_skipped_by_cause(skipped)
+    breakdown: dict[str, Any] = {
+        "skipped_total": skipped_total,
+        "skipped_by_cause": skipped_by_cause,
+        "unresolved_stages": int(stage_summary.get("unresolved_stages", 0)),
+        "unresolved_bindings": int(stage_summary.get("unresolved_bindings", 0)),
+        "unresolved_by_kind": dict(stage_summary.get("unresolved_by_kind", {})),
+        "unresolved_by_reason": dict(stage_summary.get("unresolved_by_reason", {})),
+    }
+    if pack_verification is not None:
+        breakdown["pack_missing_stages"] = int(pack_verification["missing_reflection_hashes"]["count"])
+        breakdown["pack_missing_by_stage"] = dict(pack_verification["missing_by_stage"])
+        breakdown["pack_stage_mismatches"] = int(pack_verification["stage_mismatches"])
+        breakdown["pack_extra_stages"] = int(pack_verification["extra_reflection_hashes"]["count"])
+        breakdown["pack_coverage_pct"] = float(pack_verification["coverage_pct"])
+    return breakdown
 
 
 def _stage_canonical_json(stage_obj: dict[str, Any]) -> str:
@@ -842,16 +1204,36 @@ def build_missing_sources_report(
     docs: list[Any],
     *,
     max_samples: int = DEFAULT_MAX_SAMPLE_HASHES,
+    unresolved: bool = False,
 ) -> dict[str, Any]:
-    """Build a sanitized summary of stages skipped for 'binding without source'."""
+    """Build a sanitized summary of stages skipped for 'binding without source' and per-cause gaps."""
     total_skipped = 0
     by_stage: dict[str, int] = {stage: 0 for stage in STAGES}
     counts_by_pattern: dict[tuple[str, str, str], int] = {}
     samples_by_pattern: dict[tuple[str, str, str], list[str]] = {}
     seen_hashes_by_pattern: dict[tuple[str, str, str], set[str]] = {}
+    missing_by_kind_raw: dict[str, int] = {}
+    skipped_causes: dict[str, int] = {}
+    unresolved_by_kind_raw: dict[str, int] = {}
+    unresolved_by_reason_raw: dict[str, int] = {}
 
     for doc in docs:
         for entry in entries_of(doc):
+            # Per-cause skip/unresolved breakdown under active conversion mode
+            _k_active, active_stage_obj, active_why = convert(entry, unresolved=unresolved)
+            if active_stage_obj is None:
+                skipped_causes[active_why] = skipped_causes.get(active_why, 0) + 1
+            else:
+                for b in active_stage_obj.get("bindings", []):
+                    if isinstance(b, dict) and is_unresolved_source(b.get("source")):
+                        raw_k = b.get("kind")
+                        mapped_k = KIND_MAP.get(raw_k) if isinstance(raw_k, str) else None
+                        k_label = mapped_k if mapped_k is not None else _sanitize_label(raw_k, fallback="unknown")
+                        unresolved_by_kind_raw[k_label] = unresolved_by_kind_raw.get(k_label, 0) + 1
+                        r_label = _unresolved_reason_label(b["source"])
+                        unresolved_by_reason_raw[r_label] = unresolved_by_reason_raw.get(r_label, 0) + 1
+
+            # Missing-source breakdown always reflects what the translator left untraceable
             key, stage_obj, why = convert(entry)
             if stage_obj is not None or why != "binding without source":
                 continue
@@ -868,6 +1250,7 @@ def build_missing_sources_report(
                 mapped_kind = KIND_MAP.get(raw_kind) if isinstance(raw_kind, str) else None
                 kind = mapped_kind if mapped_kind is not None else _sanitize_label(raw_kind, fallback="unknown")
                 name = _sanitize_label(b.get("name"), fallback="")
+                missing_by_kind_raw[kind] = missing_by_kind_raw.get(kind, 0) + 1
                 pat = (stage, kind, name)
                 counts_by_pattern[pat] = counts_by_pattern.get(pat, 0) + 1
                 seen = seen_hashes_by_pattern.setdefault(pat, set())
@@ -889,14 +1272,48 @@ def build_missing_sources_report(
             key=lambda kv: (-kv[1], kv[0][0], kv[0][1], kv[0][2]),
         )
     ]
+    skipped_total, skipped_by_cause = _build_skipped_by_cause(skipped_causes)
 
     return {
         "schema": REPORT_SCHEMA,
         "version": REPORT_VERSION,
         "total_skipped_missing_source": total_skipped,
         "by_stage": by_stage,
+        "missing_by_kind": _sort_count_map(missing_by_kind_raw),
         "top_missing_bindings": top_missing_bindings,
+        "skipped_total": skipped_total,
+        "skipped_by_cause": skipped_by_cause,
+        "unresolved_by_kind": _sort_count_map(unresolved_by_kind_raw),
+        "unresolved_by_reason": _sort_count_map(unresolved_by_reason_raw),
     }
+
+
+def _format_gap_summary_text(gap_breakdown: dict[str, Any]) -> str:
+    parts: list[str] = []
+    skipped_rows = gap_breakdown.get("skipped_by_cause") or []
+    if skipped_rows:
+        causes = ", ".join(
+            f"{row['cause']}:{row['count']} ({row['pct_of_skipped']:.1f}%)" for row in skipped_rows
+        )
+        parts.append(f"skipped={gap_breakdown['skipped_total']} [{causes}]")
+    unres_bindings = gap_breakdown.get("unresolved_bindings", 0)
+    if unres_bindings > 0:
+        kinds = ", ".join(f"{k}:{v}" for k, v in (gap_breakdown.get("unresolved_by_kind") or {}).items())
+        reasons = ", ".join(f"{k}:{v}" for k, v in (gap_breakdown.get("unresolved_by_reason") or {}).items())
+        parts.append(
+            f"unresolved={unres_bindings} ({gap_breakdown.get('unresolved_stages', 0)} stages"
+            f"; kinds=[{kinds}]; reasons=[{reasons}])"
+        )
+    if "pack_missing_by_stage" in gap_breakdown:
+        missing_total = gap_breakdown.get("pack_missing_stages", 0)
+        mismatches = gap_breakdown.get("pack_stage_mismatches", 0)
+        if missing_total > 0 or mismatches > 0:
+            mbs = gap_breakdown["pack_missing_by_stage"]
+            parts.append(
+                f"pack_missing_by_stage=v:{mbs.get('vertex', 0)}/f:{mbs.get('fragment', 0)}/c:{mbs.get('compute', 0)}"
+                f", stage_mismatches={mismatches}"
+            )
+    return "; ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -907,13 +1324,13 @@ def main(argv: list[str] | None = None) -> int:
         "--merge-existing",
         type=Path,
         default=None,
-        help="load an existing v1 sidecar JSON (if present) and merge newly converted stages on top",
+        help="load an existing v1/v2/v3 sidecar JSON (if present) and merge newly converted stages on top",
     )
     parser.add_argument(
         "--diff-baseline",
         type=Path,
         default=None,
-        help="compare the newly generated sidecar against a previous v1 sidecar JSON",
+        help="compare the newly generated sidecar against a previous v1/v2/v3 sidecar JSON",
     )
     parser.add_argument(
         "--fail-on-regressions",
@@ -924,13 +1341,13 @@ def main(argv: list[str] | None = None) -> int:
         "--report-missing-sources",
         type=Path,
         default=None,
-        help="write a sanitized JSON report summarizing skipped 'binding without source' stages",
+        help="write a sanitized JSON report summarizing skipped 'binding without source' stages and per-cause gaps",
     )
     parser.add_argument(
         "--verify-pack",
         type=Path,
         default=None,
-        help="cross-check reflection sidecar hashes against a WGPK v1 .wgsl.pack header/TOC",
+        help="stream-verify reflection sidecar hashes against a WGPK v1/v2 .wgsl.pack header/TOC without loading WGSL payloads",
     )
     parser.add_argument(
         "--unresolved-sources",
@@ -956,7 +1373,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.merge_existing is not None:
         try:
             existing_stages = load_existing_sidecar(args.merge_existing)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            print(
+                f"error: failed to load --merge-existing {_sanitize_path_label(args.merge_existing)}: {reason}",
+                file=sys.stderr,
+            )
+            return 1
+        except ValueError as exc:
             print(f"error: failed to load --merge-existing: {exc}", file=sys.stderr)
             return 1
 
@@ -964,14 +1388,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.diff_baseline is not None:
         try:
             baseline_stages = load_baseline_sidecar(args.diff_baseline)
-        except (OSError, ValueError) as exc:
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            print(
+                f"error: failed to load --diff-baseline {_sanitize_path_label(args.diff_baseline)}: {reason}",
+                file=sys.stderr,
+            )
+            return 1
+        except ValueError as exc:
             print(f"error: failed to load --diff-baseline: {exc}", file=sys.stderr)
             return 1
 
     pack_entries: list[dict[str, Any]] | None = None
+    pack_meta: dict[str, Any] | None = None
     if args.verify_pack is not None:
         try:
-            pack_entries = load_wgpk_toc(args.verify_pack)
+            pack_entries, pack_meta = load_wgpk_toc_with_meta(args.verify_pack)
         except ValueError as exc:
             print(f"error: failed to load --verify-pack: {exc}", file=sys.stderr)
             return 1
@@ -979,8 +1411,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.inputs:
         docs = []
         for path in args.inputs:
-            with path.open(encoding="utf-8-sig") as f:
-                docs.append(json.load(f))
+            try:
+                with path.open(encoding="utf-8-sig") as f:
+                    docs.append(json.load(f))
+            except OSError as exc:
+                reason = exc.strerror or type(exc).__name__
+                print(
+                    f"error: failed to read input {_sanitize_path_label(path)}: {reason}",
+                    file=sys.stderr,
+                )
+                return 1
+            except json.JSONDecodeError as exc:
+                print(
+                    f"error: invalid JSON in input {_sanitize_path_label(path)}: {exc.msg}",
+                    file=sys.stderr,
+                )
+                return 1
 
         sidecar, skipped = build(
             docs,
@@ -991,14 +1437,14 @@ def main(argv: list[str] | None = None) -> int:
         args.out.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
 
         if args.report_missing_sources is not None:
-            report = build_missing_sources_report(docs)
+            report = build_missing_sources_report(docs, unresolved=args.unresolved_sources)
             args.report_missing_sources.parent.mkdir(parents=True, exist_ok=True)
             args.report_missing_sources.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
 
         stages_written = len(sidecar["stages"])
     else:
         try:
-            loaded_stages = _load_sidecar(args.out, label="sidecar", allow_missing=False)
+            loaded_version, loaded_stages = _load_sidecar_doc(args.out, label="sidecar", allow_missing=False)
         except OSError as exc:
             reason = exc.strerror or type(exc).__name__
             print(
@@ -1009,14 +1455,23 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"error: failed to load --out sidecar: {exc}", file=sys.stderr)
             return 1
-        sidecar = {"schema": SCHEMA, "version": VERSION, "stages": loaded_stages}
+        sidecar = {
+            "schema": SCHEMA,
+            "version": loaded_version if loaded_version is not None else VERSION,
+            "stages": loaded_stages,
+        }
         skipped = {}
         stages_written = 0
 
-    counts: dict[str, Any] = {"stages_written": stages_written, "skipped": skipped}
+    stage_summary = summarize_stages(sidecar["stages"])
+    counts: dict[str, Any] = {
+        "sidecar_version": sidecar["version"],
+        "stages_written": stages_written,
+        "skipped": skipped,
+    }
     if args.merge_existing is not None:
         counts["merged_existing"] = len(existing_stages)
-    counts.update(summarize_stages(sidecar["stages"]))
+    counts.update(stage_summary)
 
     diff: dict[str, Any] | None = None
     if baseline_stages is not None:
@@ -1029,8 +1484,16 @@ def main(argv: list[str] | None = None) -> int:
             pack_entries,
             sidecar["stages"],
             pack_label=args.verify_pack,
+            pack_meta=pack_meta,
         )
         counts["pack_verification"] = pack_verification
+
+    gap_breakdown = build_gap_breakdown(
+        skipped,
+        stage_summary,
+        pack_verification=pack_verification,
+    )
+    counts["gap_breakdown"] = gap_breakdown
 
     if args.json:
         print(json.dumps(counts))
@@ -1038,10 +1501,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.merge_existing is not None:
             line = (
                 f"{counts['stages_written']} stage(s) written "
-                f"(merged {counts['merged_existing']} existing); skipped: {skipped or 'none'}"
+                f"(merged {counts['merged_existing']} existing, sidecar v{sidecar['version']}); "
+                f"skipped: {skipped or 'none'}"
             )
         else:
-            line = f"{counts['stages_written']} stage(s) written; skipped: {skipped or 'none'}"
+            line = (
+                f"{counts['stages_written']} stage(s) written "
+                f"(sidecar v{sidecar['version']}); skipped: {skipped or 'none'}"
+            )
         if diff is not None:
             line += (
                 f"; diff: +{diff['added_count']}/-{diff['removed_count']}"
@@ -1054,8 +1521,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"{pack_verification['matched_hashes']}/{pack_verification['pack_entry_count']} matched "
                 f"({pack_verification['coverage_pct']:.2f}%), "
                 f"{pack_verification['missing_reflection_hashes']['count']} missing, "
-                f"{pack_verification['extra_reflection_hashes']['count']} extra"
+                f"{pack_verification['extra_reflection_hashes']['count']} extra, "
+                f"{pack_verification['stage_mismatches']} mismatched "
+                f"[WGPK v{pack_verification['pack_version']}, {pack_verification['pack_bytes']} B, "
+                f"{pack_verification['toc_entry_bytes']} B/entry]"
             )
+        gap_text = _format_gap_summary_text(gap_breakdown)
+        if gap_text:
+            line += f"; gaps: {gap_text}"
         print(line)
 
     if args.fail_on_regressions and diff is not None and diff["removed_count"] > 0:
