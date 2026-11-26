@@ -1750,6 +1750,45 @@ void test_xg() {
         CHECK(fx.vcall(t64, 1) == 0);
     }
 
+    // GetResourceTiling for a 2:1 64KB_D texture: the standard mips end where GFX10 starts the
+    // mip tail, not at the D3D12 packed-mip threshold. 1024x512 BC7, 11 mips: mip 2 (64x32
+    // blocks) is below the D3D12 tile shape (64x64 blocks) but does not fit the GFX10 tail (32x64
+    // blocks), so it has a block of its own and the tail (mips 3..10) is one more block: the
+    // title streams mip 2 and the tail as two 64 KiB reads.
+    {
+        namespace gx = playgta6::gpu::gfx10;
+        const uint64_t tdesc = xg_desc(3, 1024, 512, 1, 11, 98);
+        CHECK(com::write_guest(tdesc + 0x2C, uint32_t{0x10A}));
+        const uint64_t tout = fx.out_slot();
+        CHECK(as_hr(fx.dcall(create, {I(tdesc), I(tout)})) == 0);
+        const uint64_t t64 = load64(tout);
+        uint32_t tcap = 16;
+        CHECK(com::write_guest(count, tcap));
+        fx.vcall(t64, 10, {I(num_tiles), I(packed), I(shape), I(count), I(0), I(tilings)});
+        const gx::TextureLayoutDesc chain{98u, 1024u, 512u, 1u, 11u, 0x10Au, 0u};
+        CHECK(!gx::mip_placement(chain, 2).in_tail && gx::mip_placement(chain, 3).in_tail);
+        ga::XgPackedMipInfo tp{};
+        CHECK(com::read_guest(packed, tp));
+        CHECK(tp.num_standard_mips == 3 && tp.num_packed_mips == 8);
+        CHECK(tp.num_tiles_for_packed_mips == 1 && tp.start_tile_index_in_overall_resource == 0);
+        uint32_t ttiles = 0;
+        CHECK(com::read_guest(num_tiles, ttiles));
+        CHECK(ttiles == 8u + 2u + 1u + 1u);
+        CHECK(uint64_t{ttiles} * 65536u == gx::surface_bytes(chain));
+        for (uint32_t mip = 0; mip < 3; ++mip) {
+            ga::XgSubresourceTiling st{};
+            CHECK(com::read_guest(tilings + 12ull * mip, st));
+            CHECK(st.start_tile_index_in_overall_resource == gx::mip_placement(chain, mip).macro_block_offset / 65536u);
+        }
+        ga::XgSubresourceTiling m2{};
+        ga::XgSubresourceTiling m3{};
+        CHECK(com::read_guest(tilings + 24, m2));
+        CHECK(com::read_guest(tilings + 36, m3));
+        CHECK(m2.width_in_tiles == 1 && m2.height_in_tiles == 1);
+        CHECK(m3.start_tile_index_in_overall_resource == ga::kXgPackedTile);
+        CHECK(fx.vcall(t64, 1) == 0);
+    }
+
     // GetTexelElementOffsetBytes (slot 6): the GFX10 address of an element (the detiler's), plus
     // the slice's chain; bit offset 0; invalid plane / mip / coordinate -> UINT64_MAX.
     {
