@@ -977,6 +977,20 @@ function pickTelemetryBoolean(sources, keys) {
   return { found: false, value: undefined };
 }
 
+function pickTelemetryBooleanOrNull(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (val === null || typeof val === 'boolean') {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
 function pickTelemetryNumberOrNull(sources, keys) {
   for (let i = 0; i < sources.length; i += 1) {
     const src = sources[i];
@@ -1006,6 +1020,39 @@ function pickTelemetryFiniteNumber(sources, keys) {
     }
   }
   return { found: false, value: undefined };
+}
+
+// W358: forward swapchain luminance probe counters and capability flags across
+// first-visible-frame and gpu-telemetry payloads (camelCase, snake_case, nested stats/frameStats).
+function applySwapchainProbeTelemetryFields(target, sources) {
+  const probeCountField = pickTelemetryFiniteNumber(sources, [
+    'swapchainProbeCount',
+    'swapchain_probe_count',
+  ]);
+  if (probeCountField.found) {
+    target.swapchainProbeCount = toNonNegativeInt(probeCountField.value, 0);
+  }
+  const probeInFlightField = pickTelemetryBoolean(sources, [
+    'swapchainProbeInFlight',
+    'swapchain_probe_in_flight',
+  ]);
+  if (probeInFlightField.found) {
+    target.swapchainProbeInFlight = probeInFlightField.value;
+  }
+  const probeSupportedField = pickTelemetryBooleanOrNull(sources, [
+    'swapchainProbeSupported',
+    'swapchain_probe_supported',
+  ]);
+  if (probeSupportedField.found) {
+    target.swapchainProbeSupported = probeSupportedField.value;
+  }
+  const probeErrorCountField = pickTelemetryFiniteNumber(sources, [
+    'swapchainProbeErrorCount',
+    'swapchain_probe_error_count',
+  ]);
+  if (probeErrorCountField.found) {
+    target.swapchainProbeErrorCount = toNonNegativeInt(probeErrorCountField.value, 0);
+  }
 }
 
 /**
@@ -1159,6 +1206,14 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     ) {
       payload.suppressedBlackFrames = toNonNegativeInt(eventData.suppressedBlackFrames, 0);
     }
+    const visibleRawStats =
+      eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+    const visibleRawFrameStats =
+      eventData.frameStats && typeof eventData.frameStats === 'object'
+        ? eventData.frameStats
+        : null;
+    const visibleSources = [eventData, visibleRawStats, visibleRawFrameStats].filter(Boolean);
+    applySwapchainProbeTelemetryFields(payload, visibleSources);
     if (eventData.gpuAdapter !== undefined) {
       const sanitizedAdapter = sanitizeGpuAdapterForTelemetry(eventData.gpuAdapter);
       if (sanitizedAdapter !== undefined) {
@@ -1276,6 +1331,7 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
   if (suppressedBlackField.found) {
     telemetry.suppressedBlackFrames = toNonNegativeInt(suppressedBlackField.value, 0);
   }
+  applySwapchainProbeTelemetryFields(telemetry, telemetrySources);
   const rawGpuAdapter =
     eventData.gpuAdapter !== undefined
       ? eventData.gpuAdapter
