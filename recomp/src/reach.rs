@@ -314,6 +314,190 @@ pub(crate) fn reaching_copies(
     )
 }
 
+/// Most distinct constants tracked per register by [`reaching_constant_sets`].
+pub(crate) const MAX_CONSTANT_SET: usize = 4;
+
+/// What [`reaching_constant_sets`] knows about one register: the exact constants it holds on the
+/// incoming paths (one of them on each path), or nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConstSet {
+    Unvisited,
+    /// Sorted, distinct, at most [`MAX_CONSTANT_SET`] values.
+    Set(Vec<u64>),
+    Unknown,
+}
+
+impl ConstSet {
+    fn join(&self, other: &ConstSet) -> ConstSet {
+        match (self, other) {
+            (ConstSet::Unvisited, x) | (x, ConstSet::Unvisited) => x.clone(),
+            (ConstSet::Set(a), ConstSet::Set(b)) => {
+                let union: BTreeSet<u64> = a.iter().chain(b.iter()).copied().collect();
+                if union.len() > MAX_CONSTANT_SET {
+                    ConstSet::Unknown
+                } else {
+                    ConstSet::Set(union.into_iter().collect())
+                }
+            }
+            _ => ConstSet::Unknown,
+        }
+    }
+}
+
+/// Effect of `instr` on the constant sets: only definitions by a constant (`lea r64, [rip+X]`,
+/// `mov r, imm`, `xor r32, r32`) and full 64-bit register copies keep a set; every other write
+/// of a register (and a call, for the Win64-volatile registers) makes it unknown.
+fn transfer_constants(
+    info: &mut InstructionInfoFactory,
+    instr: &Instruction,
+    state: &mut [ConstSet],
+) {
+    if matches!(
+        instr.flow_control(),
+        FlowControl::Call | FlowControl::IndirectCall
+    ) {
+        for (i, set) in state.iter_mut().enumerate() {
+            if is_win64_volatile(Register::RAX + i as u32) {
+                *set = ConstSet::Unknown;
+            }
+        }
+        return;
+    }
+    let mut written: Vec<usize> = Vec::new();
+    for u in info.info(instr).used_registers() {
+        let full = u.register().full_register();
+        if full.is_gpr64()
+            && matches!(
+                u.access(),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+            && let Some(i) = slot(full)
+            && !written.contains(&i)
+        {
+            written.push(i);
+        }
+    }
+    if written.is_empty() {
+        return;
+    }
+    let dst = (instr.op_count() >= 1 && instr.op0_kind() == OpKind::Register)
+        .then(|| instr.op0_register());
+    let value: Option<(usize, ConstSet)> = dst.and_then(|dst| {
+        let d = slot(dst)?;
+        let d64 = dst.is_gpr64();
+        let d32 = dst.is_gpr32();
+        let imm = (instr.op_count() == 2)
+            .then(|| instr.try_immediate(1).ok())
+            .flatten();
+        let src = (instr.op_count() == 2 && instr.op1_kind() == OpKind::Register)
+            .then(|| instr.op1_register());
+        let set = match instr.mnemonic() {
+            Mnemonic::Lea if d64 && instr.is_ip_rel_memory_operand() => {
+                ConstSet::Set(vec![instr.ip_rel_memory_address()])
+            }
+            Mnemonic::Mov if (d64 || d32) && imm.is_some() => {
+                ConstSet::Set(vec![imm? & mask(if d64 { 64 } else { 32 })])
+            }
+            Mnemonic::Xor if d32 && src == Some(dst) => ConstSet::Set(vec![0]),
+            Mnemonic::Mov if d64 && src.is_some_and(|s| s.is_gpr64()) => state[slot(src?)?].clone(),
+            _ => return None,
+        };
+        Some((d, set))
+    });
+    for i in written {
+        state[i] = match &value {
+            Some((d, set)) if *d == i => set.clone(),
+            _ => ConstSet::Unknown,
+        };
+    }
+}
+
+/// Registers of `regs` that hold one of at most [`MAX_CONSTANT_SET`] exact constants on entry to
+/// `target`: each path into `target` defines the register by one of the returned constants
+/// (sorted, at least two; a single constant is [`reaching_values`]' business). The typical case is
+/// a dispatcher whose table base is loaded by `lea` on every path, from two different tables.
+/// Only constant definitions and 64-bit register copies are followed (no arithmetic, no guards),
+/// so the set is exact: no path brings another value. `None` as for [`reaching_values`].
+pub(crate) fn reaching_constant_sets(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    regs: &[Register],
+) -> Option<Vec<(Register, Vec<u64>)>> {
+    let BackwardSubgraph { blocks: sub, roots } = collect_backward_subgraph_bounded(
+        blocks,
+        preds,
+        is_entry,
+        target,
+        MAX_REACH_BLOCKS,
+        MAX_REACH_DEPTH,
+    )?;
+    let unvisited = || vec![ConstSet::Unvisited; GPR_COUNT];
+    let mut info = InstructionInfoFactory::new();
+    let mut inputs: BTreeMap<u64, Vec<ConstSet>> = sub.iter().map(|&b| (b, unvisited())).collect();
+    let mut queue: VecDeque<u64> = VecDeque::new();
+    let mut queued: BTreeSet<u64> = BTreeSet::new();
+    for b in roots {
+        inputs.insert(b, vec![ConstSet::Unknown; GPR_COUNT]);
+        if queued.insert(b) {
+            queue.push_back(b);
+        }
+    }
+    // Every input only grows (at most `MAX_CONSTANT_SET + 1` changes per register), so the
+    // worklist terminates; the step bound is a defensive guard as in `reaching_state_bounded`.
+    let mut steps: usize = 0;
+    while let Some(b) = queue.pop_front() {
+        queued.remove(&b);
+        if steps >= MAX_WORKLIST_STEPS {
+            return None;
+        }
+        steps += 1;
+        let Some(block) = blocks.get(&b) else {
+            continue;
+        };
+        let mut state = inputs.get(&b).cloned().unwrap_or_else(unvisited);
+        for instr in &block.instructions {
+            transfer_constants(&mut info, instr, &mut state);
+        }
+        let mut next_blocks: Vec<u64> = block
+            .successors
+            .iter()
+            .filter_map(|edge| edge.intra_target())
+            .collect();
+        next_blocks.sort_unstable();
+        next_blocks.dedup();
+        for next in next_blocks {
+            if !sub.contains(&next) || is_entry(next) {
+                continue;
+            }
+            let old = inputs.get(&next).cloned().unwrap_or_else(unvisited);
+            let new: Vec<ConstSet> = old.iter().zip(&state).map(|(a, b)| a.join(b)).collect();
+            if new == old {
+                continue;
+            }
+            inputs.insert(next, new);
+            if queued.insert(next) {
+                queue.push_back(next);
+            }
+        }
+    }
+    let input = inputs.get(&target)?;
+    Some(
+        regs.iter()
+            .filter_map(|&r| match &input[slot(r)?] {
+                ConstSet::Set(values) if values.len() >= 2 => {
+                    Some((r.full_register(), values.clone()))
+                }
+                _ => None,
+            })
+            .collect(),
+    )
+}
+
 fn reaching_state_bounded(
     blocks: &BTreeMap<u64, BasicBlock>,
     preds: &dyn Fn(u64) -> Vec<u64>,
