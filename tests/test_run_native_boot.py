@@ -478,7 +478,12 @@ class RunTests(unittest.TestCase):
         self.assertEqual([e[1] for e in cycle], ["DUp"] * 6 + ["DDown", "DDown", "A"])
         self.assertEqual(lines[i + 17:i + 19], ["end", "capture"])
         self.assertFalse(any("draws_per_frame!=37" in x for x in lines))
-        after = lines[i + 19:]
+        terms = lines[i + 19:i + 34]
+        self.assertEqual(terms[0], "repeat every 16s until draws_per_frame!=33|50|51 for 3s timeout 200s")
+        self.assertEqual([e.split()[1] for e in terms[1:14]],
+                         ["DUp"] * 6 + ["RDown", "A", "DDown", "RDown", "A", "DDown", "A"])
+        self.assertEqual(terms[14], "end")
+        after = lines[i + 34:]
         self.assertEqual(after[:5], ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
                                      "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
         self.assertTrue(after[5].startswith("repeat every 12s until presents>="))
