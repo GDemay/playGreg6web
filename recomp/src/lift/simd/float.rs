@@ -612,36 +612,46 @@ impl FunctionLifter<'_> {
 
     /// `dpps/dppd`: products of the lanes selected by imm8[7:4] (others +0.0), summed in the
     /// hardware's order, broadcast to the lanes selected by imm8[3:0] (others +0.0).
+    /// Uses vector `fmul` + mask shuffle against `zeroinitializer` (avoiding `0.0 * NaN` and
+    /// preserving exact `+0.0` sign) + pairwise vector `fadd` instead of scalar extract/insert.
     fn dot(&mut self, ins: &Instruction, f: Form, e: Elem) -> R<()> {
         let i = Self::imm8(ins)?;
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
-        let t = e.scalar();
         let n = e.lanes();
-        let zero = fconst(0.0);
-        let mut terms = Vec::new();
-        for l in 0..n {
-            if i >> (4 + l) & 1 == 1 {
-                let x = self.extract(&a, e, l);
-                let y = self.extract(&b, e, l);
-                terms.push(self.val(&format!("fmul {t} {x}, {y}")));
-            } else {
-                terms.push(zero.clone());
-            }
+        let all = (1u32 << n) - 1;
+        let in_mask = (i >> 4) & all;
+        let out_mask = i & all;
+        if in_mask == 0 || out_mask == 0 {
+            return self.xset(ins.op_register(f.dst), "zeroinitializer", e);
         }
-        let sum = if n == 4 {
-            let s01 = self.val(&format!("fadd {t} {}, {}", terms[0], terms[1]));
-            let s23 = self.val(&format!("fadd {t} {}, {}", terms[2], terms[3]));
-            self.val(&format!("fadd {t} {s01}, {s23}"))
+        let vt = Ty::v(e).ir();
+        let prod = self.val(&format!("fmul {vt} {a}, {b}"));
+        let masked = if in_mask == all {
+            prod
         } else {
-            self.val(&format!("fadd {t} {}, {}", terms[0], terms[1]))
+            let idx: Vec<u32> = (0..n)
+                .map(|l| if (in_mask >> l) & 1 == 1 { l } else { n })
+                .collect();
+            self.shuffle(&prod, "zeroinitializer", e, &idx)
         };
-        let mut r = "zeroinitializer".to_string();
-        for l in 0..n {
-            if i >> l & 1 == 1 {
-                r = self.insert(&r, e, &sum, l);
-            }
-        }
+        let sum_vec = if n == 4 {
+            let p1 = self.shuffle(&masked, "poison", e, &[1, 0, 3, 2]);
+            let s1 = self.val(&format!("fadd {vt} {masked}, {p1}"));
+            let p2 = self.shuffle(&s1, "poison", e, &[2, 3, 0, 1]);
+            self.val(&format!("fadd {vt} {s1}, {p2}"))
+        } else {
+            let p1 = self.shuffle(&masked, "poison", e, &[1, 0]);
+            self.val(&format!("fadd {vt} {masked}, {p1}"))
+        };
+        let r = if out_mask == all {
+            sum_vec
+        } else {
+            let out_idx: Vec<u32> = (0..n)
+                .map(|l| if (out_mask >> l) & 1 == 1 { 0 } else { n })
+                .collect();
+            self.shuffle(&sum_vec, "zeroinitializer", e, &out_idx)
+        };
         self.xset(ins.op_register(f.dst), &r, e)
     }
 

@@ -165,15 +165,6 @@ impl Elem {
         }
     }
 
-    /// The integer type of twice the width (`I64` stays `I64`).
-    fn wide(self) -> Elem {
-        match self {
-            Elem::I8 => Elem::I16,
-            Elem::I16 => Elem::I32,
-            _ => Elem::I64,
-        }
-    }
-
     fn of_bits(bits: u32) -> Elem {
         match bits {
             8 => Elem::I8,
@@ -306,6 +297,14 @@ pub(in crate::lift) enum Intr {
     Abs,
     /// `llvm.wasm.swizzle` (`i8x16.swizzle`): indices >= 16 select 0.
     Swizzle,
+    /// `llvm.wasm.narrow.signed.<dst>.<src>` (`i8x16.narrow_i16x8_s` / `i16x8.narrow_i32x4_s`).
+    NarrowSigned,
+    /// `llvm.wasm.narrow.unsigned.<dst>.<src>` (`i8x16.narrow_i16x8_u` / `i16x8.narrow_i32x4_u`).
+    NarrowUnsigned,
+    /// `llvm.wasm.dot` (`i32x4.dot_i16x8_s`): pairwise signed `i16 * i16` dot product to `i32`.
+    WasmDot,
+    /// `llvm.wasm.avgr.unsigned.<ty>` (`i8x16.avgr_u` / `i16x8.avgr_u`).
+    AvgrUnsigned,
     /// Internal helper `@__playgta6_fma_f64` (double-precision FMA).
     FmaF64,
     /// Internal helper `@__playgta6_clmul` (carry-less multiplication).
@@ -348,6 +347,26 @@ impl Decl {
             }
             Intr::Abs => "abs",
             Intr::Swizzle => return "llvm.wasm.swizzle".to_string(),
+            Intr::NarrowSigned => {
+                let dst = Ty::v(Elem::of_bits(self.ty.e.bits() / 2));
+                return format!(
+                    "llvm.wasm.narrow.signed.{}.{}",
+                    dst.suffix(),
+                    self.ty.suffix()
+                );
+            }
+            Intr::NarrowUnsigned => {
+                let dst = Ty::v(Elem::of_bits(self.ty.e.bits() / 2));
+                return format!(
+                    "llvm.wasm.narrow.unsigned.{}.{}",
+                    dst.suffix(),
+                    self.ty.suffix()
+                );
+            }
+            Intr::WasmDot => return "llvm.wasm.dot".to_string(),
+            Intr::AvgrUnsigned => {
+                return format!("llvm.wasm.avgr.unsigned.{}", self.ty.suffix());
+            }
             Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
             Intr::Clmul => return "__playgta6_clmul".to_string(),
             Intr::AesTables => return "__playgta6_aes_sbox".to_string(),
@@ -359,6 +378,10 @@ impl Decl {
     fn ret_ir(self) -> String {
         match self.intr {
             Intr::FpToSiSat(dst) => self.ty.with(dst).ir(),
+            Intr::NarrowSigned | Intr::NarrowUnsigned => {
+                Ty::v(Elem::of_bits(self.ty.e.bits() / 2)).ir()
+            }
+            Intr::WasmDot => Ty::v(Elem::I32).ir(),
             _ => self.ty.ir(),
         }
     }
