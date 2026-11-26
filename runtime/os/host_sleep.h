@@ -17,7 +17,7 @@ inline void sleep_for(std::chrono::steady_clock::duration duration) {
     sleep_until(std::chrono::steady_clock::now() + duration);
 }
 
-// Raises the process timer resolution (Windows: ~0.5 ms instead of the 15.6 ms default tick; no-op
+// Raises the process timer resolution (Windows: 1 ms instead of the 15.6 ms default tick; no-op
 // elsewhere). Without it every timed guest wait (WaitForSingleObject / SleepConditionVariable with a
 // few ms timeout, the title's own frame limiter) wakes on the next 15.6 ms tick, so a 16.7 ms frame
 // limit becomes 16-31 ms frames and the title settles near 40 fps. Idempotent; the OS restores the
