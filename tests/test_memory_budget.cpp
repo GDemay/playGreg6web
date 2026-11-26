@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "os/guest_heap.h"
 #include "os/memory_budget.h"
 #include "os/vmem.h"
 #include "os/win32_kernel.h"
@@ -44,6 +45,71 @@ void test_totals_and_json() {
     CHECK(j.front() == '{' && j.back() == '}');
     CHECK(j.find("\"pages_not_backed_bytes\": 3145728") != std::string::npos);
     CHECK(j.find("\"headroom\": -") != std::string::npos);
+}
+
+void test_o54_reclaim_and_slack_telemetry() {
+    // Default inputs keep all new fields 0 (backward compatible).
+    MemoryBudgetInput empty;
+    const MemoryBudgetTotals t0 = memory_budget_totals(empty);
+    CHECK(t0.guest_heap_slack == 0);
+    CHECK(t0.arena_peak_committed == 0);
+    CHECK(t0.arena_reclaimed_bytes == 0);
+    CHECK(t0.guest_heap_reclaimed_bytes == 0);
+
+    // Explicit slack & reclamation numbers.
+    MemoryBudgetInput in;
+    in.arena_reserved = uint64_t{64} << 20;
+    in.arena_committed = uint64_t{10} << 20;
+    in.arena_peak_committed = uint64_t{24} << 20;
+    in.arena_reclaimed_bytes = uint64_t{14} << 20;
+    in.guest_heap_committed = uint64_t{6} << 20;
+    in.guest_heap_live = uint64_t{2} << 20;
+    in.guest_heap_reclaimed_bytes = uint64_t{8} << 20;
+    const MemoryBudgetTotals t = memory_budget_totals(in);
+    CHECK(t.guest_heap_slack == (uint64_t{4} << 20));
+    CHECK(t.arena_peak_committed == (uint64_t{24} << 20));
+    CHECK(t.arena_reclaimed_bytes == (uint64_t{14} << 20));
+    CHECK(t.guest_heap_reclaimed_bytes == (uint64_t{8} << 20));
+
+    // When guest_heap_live > guest_heap_committed (defensive), slack clamps cleanly to 0.
+    MemoryBudgetInput clamped = in;
+    clamped.guest_heap_live = clamped.guest_heap_committed + 1024;
+    CHECK(memory_budget_totals(clamped).guest_heap_slack == 0);
+
+    const std::string j = memory_budget_json(in);
+    CHECK(j.find("\"guest_heap_slack\": 4194304") != std::string::npos);
+    CHECK(j.find("\"arena_peak_committed\": 25165824") != std::string::npos);
+    CHECK(j.find("\"arena_reclaimed_bytes\": 14680064") != std::string::npos);
+    CHECK(j.find("\"guest_heap_reclaimed_bytes\": 8388608") != std::string::npos);
+
+    // Live arena + GuestHeap integration into MemoryBudgetInput.
+    VirtualMemoryArena arena(kDefaultArenaBase, uint64_t{64} << 20, ArenaPlacement::Anywhere);
+    CHECK(arena.valid());
+    if (arena.valid()) {
+        GuestHeap heap(arena);
+        std::vector<uint64_t> ptrs;
+        for (int i = 0; i < 400; ++i) {
+            ptrs.push_back(heap.alloc(16384));
+        }
+        for (uint64_t p : ptrs) {
+            CHECK(heap.free(p));
+        }
+        const GuestHeapStats hs = heap.stats();
+        MemoryBudgetInput live;
+        live.arena_reserved = arena.reserved_bytes();
+        live.arena_committed = arena.committed_bytes();
+        live.arena_peak_committed = arena.peak_committed_bytes();
+        live.arena_reclaimed_bytes = arena.decommitted_bytes_total();
+        live.guest_heap_committed = hs.committed_bytes;
+        live.guest_heap_live = hs.live_bytes;
+        live.guest_heap_reclaimed_bytes = hs.reclaimed_bytes;
+        const MemoryBudgetTotals lt = memory_budget_totals(live);
+        CHECK(lt.arena_peak_committed > lt.host_private);
+        CHECK(lt.arena_reclaimed_bytes >= GuestHeap::kSegmentSize);
+        CHECK(lt.guest_heap_reclaimed_bytes >= GuestHeap::kSegmentSize);
+        CHECK(lt.guest_heap_slack <= GuestHeap::kSegmentSize);
+        heap.reclaim_empty_segments();
+    }
 }
 
 void test_xmem_summary() {
@@ -91,6 +157,7 @@ void test_userdata_range() {
 
 int main() {
     test_totals_and_json();
+    test_o54_reclaim_and_slack_telemetry();
     test_xmem_summary();
     test_userdata_range();
     if (g_failures != 0) {

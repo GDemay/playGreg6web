@@ -693,6 +693,149 @@ void test_write_batch() {
     CHECK(pages == (std::vector<uint64_t>{5 * kWrittenPageSize}));
 }
 
+void test_mem_reset_and_reclaim_telemetry() {
+    VirtualMemoryArena arena;
+    CHECK(arena.valid());
+    CHECK(arena.peak_committed_bytes() == 0);
+    CHECK(arena.decommitted_bytes_total() == 0);
+    CHECK(arena.reclaimed_pages_reused() == 0);
+
+    const uint64_t base = arena.reserve(0, 256 * 1024, PageProtect::ReadWrite);
+    CHECK(base != 0);
+    // MEM_RESET / MEM_RESET_UNDO fail cleanly on uncommitted pages, free addresses, and combined flags.
+    CHECK(arena.virtual_alloc(base, 4 * kPageSize, kMemReset, PageProtect::ReadWrite) == 0);
+    CHECK(arena.virtual_alloc(base, 4 * kPageSize, kMemResetUndo, PageProtect::ReadWrite) == 0);
+    CHECK(arena.virtual_alloc(0, 4 * kPageSize, kMemReset, PageProtect::ReadWrite) == 0);
+    CHECK(arena.virtual_alloc(base + 512 * 1024, kPageSize, kMemReset, PageProtect::ReadWrite) == 0);
+
+    uint64_t newly = 0;
+    CHECK(arena.commit(base, 32 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 32 * kPageSize);
+    CHECK(arena.committed_bytes() == 32 * kPageSize);
+    CHECK(arena.peak_committed_bytes() == 32 * kPageSize);
+    CHECK(arena.reclaimed_pages_reused() == 0);
+
+    // Combined flags with MEM_RESET or MEM_RESET_UNDO are rejected.
+    CHECK(arena.virtual_alloc(base, 4 * kPageSize, kMemReset | kMemCommit, PageProtect::ReadWrite) == 0);
+    CHECK(arena.virtual_alloc(base, 4 * kPageSize, kMemReset | kMemResetUndo, PageProtect::ReadWrite) == 0);
+    // Spanning committed + uncommitted fails cleanly.
+    CHECK(arena.virtual_alloc(base + 30 * kPageSize, 4 * kPageSize, kMemReset, PageProtect::ReadWrite) == 0);
+
+    std::vector<uint8_t> data(32 * kPageSize, 0x5A);
+    CHECK(arena.write(base, data.data(), data.size()));
+
+    // MEM_RESET on committed pages preserves committed state, protection, and committed_bytes.
+    CHECK(arena.virtual_alloc(base + 4 * kPageSize, 8 * kPageSize, kMemReset, PageProtect::ReadWrite) ==
+          base + 4 * kPageSize);
+    const MemoryBasicInfo reset_info = arena.query(base + 4 * kPageSize);
+    CHECK(reset_info.state == MemState::Commit);
+    CHECK(reset_info.protect == PageProtect::ReadWrite);
+    CHECK(arena.committed_bytes() == 32 * kPageSize);
+    // Pages remain writable after MEM_RESET (and MEM_RESET_UNDO may succeed or fail cleanly if OS discarded).
+    const uint64_t undo_ret =
+        arena.virtual_alloc(base + 4 * kPageSize, 8 * kPageSize, kMemResetUndo, PageProtect::ReadWrite);
+    CHECK(undo_ret == 0 || undo_ret == base + 4 * kPageSize);
+    const uint64_t probe = 0xDEADBEEFCAFEBABEULL;
+    CHECK(arena.write(base + 4 * kPageSize, &probe, sizeof(probe)));
+    uint64_t back = 0;
+    CHECK(arena.read(base + 4 * kPageSize, &back, sizeof(back)) && back == probe);
+
+    // MEM_RESET fails cleanly on placeholders.
+    const uint64_t ph =
+        arena.virtual_alloc(0, 2 * kAllocationGranularity, kMemReserve | kMemReservePlaceholder, PageProtect::NoAccess);
+    CHECK(ph != 0);
+    CHECK(arena.virtual_alloc(ph, kPageSize, kMemReset, PageProtect::NoAccess) == 0);
+    CHECK(arena.virtual_free(ph, 0, kMemRelease));
+
+    // MEM_DECOMMIT + recommit zero-guarantee and reuse telemetry.
+    CHECK(arena.decommit(base + 8 * kPageSize, 12 * kPageSize));
+    CHECK(arena.committed_bytes() == 20 * kPageSize);
+    CHECK(arena.peak_committed_bytes() == 32 * kPageSize);
+    CHECK(arena.decommitted_bytes_total() == 12 * kPageSize);
+    CHECK(arena.reclaimed_pages_reused() == 0);
+
+    CHECK(arena.commit(base + 8 * kPageSize, 12 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 12 * kPageSize);
+    CHECK(arena.reclaimed_pages_reused() == 12);
+    std::vector<uint8_t> zeros(12 * kPageSize, 0xFF);
+    CHECK(arena.read(base + 8 * kPageSize, zeros.data(), zeros.size()));
+    CHECK(all_zero(zeros.data(), zeros.size()));
+
+    // Release + re-reserve same VA + commit: counts reused pages across reservation lifetime too.
+    CHECK(arena.release(base));
+    CHECK(arena.committed_bytes() == 0);
+    CHECK(arena.decommitted_bytes_total() == (12 + 32) * kPageSize);
+    CHECK(arena.reserve(base, 256 * 1024, PageProtect::ReadWrite) == base);
+    CHECK(arena.commit(base, 16 * kPageSize, PageProtect::ReadWrite, &newly));
+    CHECK(newly == 16 * kPageSize);
+    CHECK(arena.reclaimed_pages_reused() == 12 + 16);
+    CHECK(arena.read(base, zeros.data(), 12 * kPageSize));
+    CHECK(all_zero(zeros.data(), 12 * kPageSize));
+    CHECK(arena.release(base));
+}
+
+void test_lookup_cache_consistency() {
+    VirtualMemoryArena arena;
+    CHECK(arena.valid());
+
+    // Reserve > 64 regions across > 64 MiB to exercise all cache slots and collisions.
+    constexpr size_t kRegions = 96;
+    std::vector<uint64_t> vas;
+    vas.reserve(kRegions);
+    for (size_t i = 0; i < kRegions; ++i) {
+        const uint64_t va = arena.reserve(0, 1 << 20, PageProtect::ReadWrite);
+        CHECK(va != 0);
+        CHECK(arena.commit(va, 2 * kPageSize, PageProtect::ReadWrite));
+        const uint64_t tag = 0xA500000000000000ULL | static_cast<uint64_t>(i);
+        CHECK(arena.write(va + kPageSize, &tag, sizeof(tag)));
+        vas.push_back(va);
+    }
+
+    // Hot random-access reads & queries across all reservations.
+    for (int round = 0; round < 4; ++round) {
+        for (size_t i = 0; i < kRegions; ++i) {
+            const size_t idx = (i * 29 + static_cast<size_t>(round) * 7) % kRegions;
+            uint64_t got = 0;
+            CHECK(arena.read(vas[idx] + kPageSize, &got, sizeof(got)));
+            CHECK(got == (0xA500000000000000ULL | static_cast<uint64_t>(idx)));
+            CHECK(arena.query(vas[idx] + kPageSize).allocation_base == vas[idx]);
+        }
+    }
+
+    // Release odd reservations: lookup cache must immediately invalidate them.
+    for (size_t i = 1; i < kRegions; i += 2) {
+        CHECK(arena.release(vas[i]));
+        CHECK(arena.host_ptr(vas[i] + kPageSize) == nullptr);
+        CHECK(arena.query(vas[i] + kPageSize).state == MemState::Free);
+    }
+    // Even reservations remain intact and readable.
+    for (size_t i = 0; i < kRegions; i += 2) {
+        uint64_t got = 0;
+        CHECK(arena.read(vas[i] + kPageSize, &got, sizeof(got)));
+        CHECK(got == (0xA500000000000000ULL | static_cast<uint64_t>(i)));
+        CHECK(arena.release(vas[i]));
+    }
+
+    // Placeholder split/replace/revert/coalesce must keep lookup cache consistent.
+    constexpr uint64_t kG = kAllocationGranularity;
+    const uint64_t ph =
+        arena.virtual_alloc(0, 6 * kG, kMemReserve | kMemReservePlaceholder, PageProtect::NoAccess);
+    CHECK(ph != 0);
+    CHECK(arena.query(ph + 3 * kG).allocation_base == ph);  // prime cache with whole placeholder
+    CHECK(arena.virtual_free(ph + 2 * kG, 2 * kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.query(ph + 3 * kG).allocation_base == ph + 2 * kG);  // cache must see split piece
+    CHECK(arena.virtual_alloc(ph + 2 * kG, 2 * kG, kMemReserve | kMemCommit | kMemReplacePlaceholder,
+                              PageProtect::ReadWrite) == ph + 2 * kG);
+    const uint32_t marker = 0x12345678u;
+    CHECK(arena.write(ph + 3 * kG, &marker, sizeof(marker)));
+    CHECK(arena.virtual_free(ph + 2 * kG, 2 * kG, kMemRelease | kMemPreservePlaceholder));
+    CHECK(arena.host_ptr(ph + 3 * kG) == nullptr);
+    CHECK(arena.virtual_free(ph, 6 * kG, kMemRelease | kMemCoalescePlaceholders));
+    CHECK(arena.query(ph + 3 * kG).allocation_base == ph);
+    CHECK(arena.virtual_free(ph, 0, kMemRelease));
+    CHECK(arena.query(ph + 3 * kG).state == MemState::Free);
+}
+
 int main() {
     std::printf("test_vmem_contiguous\n");
     test_translation_and_contiguity();
@@ -708,6 +851,8 @@ int main() {
     test_written_pages();
     test_written_pages_fanout();
     test_write_batch();
+    test_mem_reset_and_reclaim_telemetry();
+    test_lookup_cache_consistency();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;
