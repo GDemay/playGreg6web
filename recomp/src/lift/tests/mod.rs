@@ -9,6 +9,7 @@ mod exec_memory;
 mod exec_native;
 mod exec_simd;
 mod exec_unwind;
+mod exec_x87;
 mod flags_across_calls;
 mod registers_across_calls;
 #[cfg(target_arch = "x86_64")]
