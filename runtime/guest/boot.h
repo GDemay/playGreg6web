@@ -516,6 +516,9 @@ struct BootConfig {
     bool xmem_shared_pages = true;            // os::win32::set_process_shared_zone (--no-xmem-shared-pages)
     bool present_frame_waits = true;          // WaitFrameEventX(PRESENT, token) waits for the token's present
     bool audio_endpoint = true;               // CLSID_MMDeviceEnumerator resolves (default render endpoint)
+    // Optional pipeline/shader dump directory (e.g. "/pg6_dump" in browser MEMFS); empty preserves
+    // any pre-configured DeviceOptions::dump_dir (native --dump-pipelines / PG6_DUMP_PIPELINES).
+    std::string dump_pipelines_dir;
 };
 
 struct BootResult {
@@ -532,10 +535,11 @@ BootResult run_boot(const BootConfig& config);
 // O36/G71: run options of a boot that has no command line (the browser boot), as a JSON object:
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
 //    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
-//    "present_pacing": true, "gpu_memory_budget_mb": 0, "texture_size_cap": 0,
-//    "bind_group_slot_budget": 0, "present_max_interval": 0, "fence_publish_lag": false,
-//    "fence_publish_lag_frames": 1, "fence_publish_cap_ms": 33, "defer_gpu_objects": true,
-//    "xmem_shared_pages": true, "present_frame_waits": true, "audio_endpoint": true}
+//    "present_pacing": true, "present_interval": "min1", "gpu_memory_budget_mb": 0,
+//    "texture_size_cap": 0, "bind_group_slot_budget": 0, "present_max_interval": 0,
+//    "fence_publish_lag": false, "fence_publish_lag_frames": 1, "fence_publish_cap_ms": 33,
+//    "defer_gpu_objects": true, "xmem_shared_pages": true, "present_frame_waits": true,
+//    "audio_endpoint": true, "dump_pipelines_dir": "/pg6_dump"}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to
 // log_report_json. False (config unchanged) if `json` is not a JSON object.
 bool apply_boot_options_json(std::string_view json, BootConfig& config);

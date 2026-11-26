@@ -3607,6 +3607,113 @@ bool json_uint32(std::string_view json, std::string_view key, uint32_t& out) {
     return true;
 }
 
+bool json_string(std::string_view json, std::string_view key, std::string& out) {
+    const std::string quoted = "\"" + std::string(key) + "\"";
+    size_t search_from = 0;
+    while (search_from < json.size()) {
+        const size_t key_pos = json.find(quoted, search_from);
+        if (key_pos == std::string_view::npos) {
+            return false;
+        }
+        size_t at = key_pos + quoted.size();
+        while (at < json.size() && (json[at] == ' ' || json[at] == '\t' || json[at] == '\n' || json[at] == '\r')) {
+            ++at;
+        }
+        if (at >= json.size() || json[at] != ':') {
+            search_from = key_pos + quoted.size();
+            continue;
+        }
+        ++at;
+        while (at < json.size() && (json[at] == ' ' || json[at] == '\t' || json[at] == '\n' || json[at] == '\r')) {
+            ++at;
+        }
+        if (at >= json.size() || json[at] != '"') {
+            return false;
+        }
+        ++at;
+        std::string decoded;
+        while (at < json.size()) {
+            const char c = json[at++];
+            if (c == '"') {
+                out = std::move(decoded);
+                return true;
+            }
+            if (static_cast<unsigned char>(c) < 0x20u) {
+                return false;
+            }
+            if (c != '\\') {
+                decoded.push_back(c);
+                continue;
+            }
+            if (at >= json.size()) {
+                return false;
+            }
+            const char esc = json[at++];
+            switch (esc) {
+                case '"':
+                    decoded.push_back('"');
+                    break;
+                case '\\':
+                    decoded.push_back('\\');
+                    break;
+                case '/':
+                    decoded.push_back('/');
+                    break;
+                case 'b':
+                    decoded.push_back('\b');
+                    break;
+                case 'f':
+                    decoded.push_back('\f');
+                    break;
+                case 'n':
+                    decoded.push_back('\n');
+                    break;
+                case 'r':
+                    decoded.push_back('\r');
+                    break;
+                case 't':
+                    decoded.push_back('\t');
+                    break;
+                case 'u': {
+                    if (at + 4 > json.size()) {
+                        return false;
+                    }
+                    uint32_t cp = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        const char h = json[at++];
+                        uint32_t nibble = 0;
+                        if (h >= '0' && h <= '9') {
+                            nibble = static_cast<uint32_t>(h - '0');
+                        } else if (h >= 'a' && h <= 'f') {
+                            nibble = 10u + static_cast<uint32_t>(h - 'a');
+                        } else if (h >= 'A' && h <= 'F') {
+                            nibble = 10u + static_cast<uint32_t>(h - 'A');
+                        } else {
+                            return false;
+                        }
+                        cp = (cp << 4) | nibble;
+                    }
+                    if (cp < 0x80u) {
+                        decoded.push_back(static_cast<char>(cp));
+                    } else if (cp < 0x800u) {
+                        decoded.push_back(static_cast<char>(0xC0u | (cp >> 6)));
+                        decoded.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+                    } else {
+                        decoded.push_back(static_cast<char>(0xE0u | (cp >> 12)));
+                        decoded.push_back(static_cast<char>(0x80u | ((cp >> 6) & 0x3Fu)));
+                        decoded.push_back(static_cast<char>(0x80u | (cp & 0x3Fu)));
+                    }
+                    break;
+                }
+                default:
+                    return false;
+            }
+        }
+        return false;
+    }
+    return false;
+}
+
 }  // namespace
 
 bool apply_boot_options_json(std::string_view json, BootConfig& config) {
@@ -3655,9 +3762,14 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     if (pacing == "true" || pacing == "false") {
         config.present_pacing = pacing == "true";
     }
-    const std::string_view pace_interval = json_value(json, "present_interval");
-    if (pace_interval == "honor" || pace_interval == "min1") {
+    std::string pace_interval;
+    if (json_string(json, "present_interval", pace_interval) &&
+        (pace_interval == "honor" || pace_interval == "min1")) {
         config.present_honor_interval = pace_interval == "honor";
+    }
+    std::string dump_dir;
+    if (json_string(json, "dump_pipelines_dir", dump_dir) && !dump_dir.empty()) {
+        config.dump_pipelines_dir = std::move(dump_dir);
     }
     const auto read_bool = [&](const char* key, bool& out) {
         const std::string_view v = json_value(json, key);
@@ -3975,19 +4087,28 @@ BootResult run_boot(const BootConfig& config) {
     gpu::d3d12_state::set_bind_group_slot_budget(config.bind_group_slot_budget);
     gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
     // A switched-off defer_gpu_objects disables the harness setting; the fence publish lag (off by
-    // default since #663) and its tuning fields are wired through from BootConfig.
+    // default since #663), its tuning fields, and any non-empty dump_pipelines_dir from
+    // boot-options.json are wired through from BootConfig before the guest creates its D3D12 device.
     {
         gpu::d3d12_guest::DeviceOptions device_options = gpu::d3d12_xs_exports::device_options();
         const bool lag_changed = config.fence_publish_lag != device_options.fence_publish_lag;
         const bool defer_changed = !config.defer_gpu_objects && device_options.defer_gpu_objects;
         const bool lag_frames_changed = device_options.fence_publish_lag_frames != config.fence_publish_lag_frames;
         const bool lag_cap_changed = device_options.fence_publish_cap_ms != config.fence_publish_cap_ms;
-        if (lag_changed || defer_changed || lag_frames_changed || lag_cap_changed) {
+        const bool dump_dir_changed =
+            !config.dump_pipelines_dir.empty() && device_options.dump_dir != config.dump_pipelines_dir;
+        if (lag_changed || defer_changed || lag_frames_changed || lag_cap_changed || dump_dir_changed) {
             device_options.fence_publish_lag = config.fence_publish_lag;
             device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
             device_options.fence_publish_lag_frames = config.fence_publish_lag_frames;
             device_options.fence_publish_cap_ms = config.fence_publish_cap_ms;
+            if (!config.dump_pipelines_dir.empty()) {
+                device_options.dump_dir = config.dump_pipelines_dir;
+            }
             gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+        }
+        if (dump_dir_changed && b.log_progress) {
+            os::log("[boot] PIPELINE_DUMP: " + config.dump_pipelines_dir);
         }
     }
     if (!config.xmem_shared_pages) {
@@ -4310,6 +4431,11 @@ BootResult run_boot(const BootConfig& config) {
     b.running.store(false, std::memory_order_release);
     remove_hooks();
     log_trap();
+    if (!config.dump_pipelines_dir.empty()) {
+        if (auto dev = gpu::d3d12_xs_exports::current_device()) {
+            dev->flush_pipeline_dump();
+        }
+    }
     BootResult result = finish();
     if (b.log_progress) {
         os::log(result.summary);  // not through logf: the summary is longer than its buffer

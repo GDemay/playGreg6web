@@ -253,6 +253,14 @@ _RENDERER_MEMORY_INT_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "wasmLinearMemoryBytes",
         re.compile(r"\b(?:wasmLinearMemoryBytes|wasm_linear_memory_bytes)\s*[=:]\s*(\d+)\b"),
     ),
+    (
+        "jsHeapUsedBytes",
+        re.compile(r"\b(?:jsHeapUsedBytes|js_heap_used_bytes|usedJSHeapSize|used_js_heap_size)\s*[=:]\s*(\d+)\b"),
+    ),
+    (
+        "jsHeapTotalBytes",
+        re.compile(r"\b(?:jsHeapTotalBytes|js_heap_total_bytes|totalJSHeapSize|total_js_heap_size)\s*[=:]\s*(\d+)\b"),
+    ),
 )
 MAX_GPU_ADAPTER_LEN = 96
 _WGPU_ADAPTER_LOG_RE = re.compile(r"\[wgpu_worker\]\s+WebGPU adapter:\s*([^\r\n]+)", re.IGNORECASE)
@@ -308,6 +316,9 @@ _PNG_IEND_CHUNK = b"\x00\x00\x00\x00IEND\xaeB`\x82"
 
 BOOT_OPTIONS_NAME = "boot-options.json"
 DEFAULT_DUMP_PIPELINES_DIR = "/pg6_dump"
+DEFAULT_DUMP_SUBDIR_NAME = "pg6_dump"
+DEFAULT_DUMP_FLUSH_WAIT_S = 3.5
+PREFERRED_SHADER_PACK_NAMES: tuple[str, ...] = ("splash.wgsl.pack", "fallback.wgsl.pack")
 BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
     {
         "max_wall_ms",
@@ -316,6 +327,9 @@ BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
         "import_trace_limit",
         "fence_publish_lag_frames",
         "fence_publish_cap_ms",
+        "gpu_memory_budget_mb",
+        "texture_size_cap",
+        "bind_group_slot_budget",
         "present_max_interval",
     }
 )
@@ -911,12 +925,84 @@ def make_build_plan(
 # ---------------------------------------------------------------------------
 
 
-def plan_shader_staging(shader_pack: Path | None, stage_dir: Path) -> list[dict[str, str]]:
-    """Plan atomic staging of `--shader-pack` plus `<pack>.reflect.json` and `reflection-manifest.json`."""
+def _discover_shader_pack_name_in_dir(shaders_dir: Path) -> str | None:
+    """Return the `.wgsl.pack` filename `serve_local.py` prefers in `shaders_dir`."""
+    if not shaders_dir.is_dir():
+        return None
+    try:
+        root_resolved = shaders_dir.resolve()
+    except OSError:
+        return None
+    names: list[str] = []
+    try:
+        for entry in shaders_dir.iterdir():
+            try:
+                if not entry.name.lower().endswith(".wgsl.pack") or not entry.is_file():
+                    continue
+                resolved = entry.resolve(strict=True)
+                if not resolved.is_relative_to(root_resolved) or not resolved.is_file():
+                    continue
+                names.append(entry.name)
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not names:
+        return None
+    names.sort(key=lambda name: (name.lower(), name))
+    for preferred in PREFERRED_SHADER_PACK_NAMES:
+        match = next((name for name in names if name.lower() == preferred), None)
+        if match is not None:
+            return match
+    return names[0]
+
+
+def can_serve_shader_pack_in_place(shader_pack: Path) -> bool:
+    """Return True when `serve_local.py --shaders <shader_pack.parent>` selects `shader_pack` directly."""
+    if not shader_pack.is_file():
+        return False
+    discovered = _discover_shader_pack_name_in_dir(shader_pack.parent)
+    return discovered == shader_pack.name
+
+
+def _atomic_hardlink_file(
+    src: Path,
+    dst: Path,
+    *,
+    link_fn: Callable[[Path, Path], Any] = os.link,
+) -> None:
+    """Atomically hardlink `src` to `dst` via a same-directory temp name and `os.replace`."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = dst.parent / f".{dst.name}.{os.getpid()}.{time.monotonic_ns()}.link.tmp"
+    tmp_path.unlink(missing_ok=True)
+    try:
+        link_fn(src, tmp_path)
+        os.replace(tmp_path, dst)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def plan_shader_staging(
+    shader_pack: Path | None,
+    stage_dir: Path,
+    *,
+    stream_shaders: bool = False,
+) -> list[dict[str, str]]:
+    """Plan zero-copy/atomic staging of `--shader-pack` plus `<pack>.reflect.json` and `reflection-manifest.json`."""
     if shader_pack is None:
         return []
+    in_place = bool(stream_shaders and can_serve_shader_pack_in_place(shader_pack))
+    target_dir = shader_pack.parent if in_place else stage_dir
+    method = "in_place" if in_place else "hardlink_or_copy"
     entries: list[dict[str, str]] = [
-        {"kind": "shader_pack", "src": str(shader_pack), "dst": str(stage_dir / shader_pack.name), "name": shader_pack.name}
+        {
+            "kind": "shader_pack",
+            "src": str(shader_pack),
+            "dst": str(target_dir / shader_pack.name),
+            "name": shader_pack.name,
+            "method": method,
+        }
     ]
     # Primary sidecar convention (tools/stage_reflection_sidecar.py): `<pack>.reflect.json`
     sidecar_primary = Path(str(shader_pack) + ".reflect.json")
@@ -925,8 +1011,9 @@ def plan_shader_staging(shader_pack: Path | None, stage_dir: Path) -> list[dict[
             {
                 "kind": "stage_reflection",
                 "src": str(sidecar_primary),
-                "dst": str(stage_dir / sidecar_primary.name),
+                "dst": str(target_dir / sidecar_primary.name),
                 "name": sidecar_primary.name,
+                "method": method,
             }
         )
     else:
@@ -936,8 +1023,9 @@ def plan_shader_staging(shader_pack: Path | None, stage_dir: Path) -> list[dict[
                 {
                     "kind": "stage_reflection",
                     "src": str(alt),
-                    "dst": str(stage_dir / alt.name),
+                    "dst": str(target_dir / alt.name),
                     "name": alt.name,
+                    "method": method,
                 }
             )
     manifest = shader_pack.parent / "reflection-manifest.json"
@@ -946,45 +1034,179 @@ def plan_shader_staging(shader_pack: Path | None, stage_dir: Path) -> list[dict[
             {
                 "kind": "reflection_manifest",
                 "src": str(manifest),
-                "dst": str(stage_dir / manifest.name),
+                "dst": str(target_dir / manifest.name),
                 "name": manifest.name,
+                "method": method,
             }
         )
     return entries
 
 
-def stage_shader_pack(shader_pack: Path, stage_dir: Path) -> list[dict[str, Any]]:
-    """Stage shader pack and sibling reflection sidecars into `stage_dir`."""
+def _prune_stale_staged_shader_packs(stage_dir: Path, keep_names: set[str]) -> None:
+    """Remove leftover shader packs in `stage_dir` so they cannot shadow the requested pack."""
+    if not stage_dir.is_dir():
+        return
+    try:
+        for entry in stage_dir.iterdir():
+            if entry.name in keep_names:
+                continue
+            lower = entry.name.lower()
+            if lower.endswith((".wgsl.pack", ".wgpk", ".reflect.json")) and entry.is_file():
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def stage_shader_pack(
+    shader_pack: Path,
+    stage_dir: Path,
+    *,
+    link_fn: Callable[[Path, Path], Any] = os.link,
+    copy_fn: Callable[[Path, Path], None] = atomic_copy_file,
+) -> list[dict[str, Any]]:
+    """Stage shader pack and sibling reflection sidecars into `stage_dir` (hardlink first, copy fallback)."""
     if not shader_pack.is_file():
         raise RunnerError(f"shader pack not found: {basename_label(shader_pack)}")
     stage_dir.mkdir(parents=True, exist_ok=True)
-    planned = plan_shader_staging(shader_pack, stage_dir)
+    planned = plan_shader_staging(shader_pack, stage_dir, stream_shaders=False)
+    _prune_stale_staged_shader_packs(stage_dir, {item["name"] for item in planned})
     staged: list[dict[str, Any]] = []
     for item in planned:
         src = Path(item["src"])
         dst = Path(item["dst"])
-        needs_copy = True
+        needs_stage = True
+        method = "unchanged"
+        copied = False
+        linked = False
         if dst.is_file():
             try:
-                if src.resolve() == dst.resolve():
-                    needs_copy = False
+                if os.path.samefile(src, dst):
+                    needs_stage = False
+                    method = "samefile"
                 else:
                     s_st, d_st = src.stat(), dst.stat()
                     if s_st.st_size == d_st.st_size and int(s_st.st_mtime) == int(d_st.st_mtime):
-                        needs_copy = False
+                        needs_stage = False
+                        method = "unchanged"
             except OSError:
-                needs_copy = True
-        if needs_copy:
-            # Multi-GB std packs: hard-link when on the same volume (instant, no extra disk), else copy.
+                needs_stage = True
+        if needs_stage:
             try:
-                tmp_link = dst.with_name(f".{dst.name}.lnk")
-                tmp_link.unlink(missing_ok=True)
-                os.link(src, tmp_link)
-                os.replace(tmp_link, dst)
+                _atomic_hardlink_file(src, dst, link_fn=link_fn)
+                linked = True
+                method = "hardlink"
             except OSError:
-                atomic_copy_file(src, dst)
-        staged.append({"kind": item["kind"], "name": item["name"], "copied": needs_copy})
+                copy_fn(src, dst)
+                copied = True
+                method = "copy"
+        staged.append(
+            {
+                "kind": item["kind"],
+                "name": item["name"],
+                "copied": copied,
+                "linked": linked,
+                "method": method,
+            }
+        )
     return staged
+
+
+def prepare_shader_serving_dir(
+    shader_pack: Path,
+    stage_dir: Path,
+    *,
+    stream_shaders: bool = False,
+    link_fn: Callable[[Path, Path], Any] = os.link,
+    copy_fn: Callable[[Path, Path], None] = atomic_copy_file,
+) -> tuple[Path, list[dict[str, Any]]]:
+    """Resolve the `/shaders/` serving directory without copying multi-GB packs unnecessarily.
+
+    - With `--stream-shaders`, serves `shader_pack.parent` directly in place whenever `serve_local.py`
+      would discover `shader_pack` as the active pack (zero copy, works across drives).
+    - Otherwise stages into `stage_dir` using zero-copy hardlinks first (`os.link`); if a cross-volume
+      hardlink fails and in-place serving is unambiguous, serves `shader_pack.parent` in place rather
+      than copying multi-GB packs; only falls back to `atomic_copy_file` when isolated staging is required.
+    """
+    if not shader_pack.is_file():
+        raise RunnerError(f"shader pack not found: {basename_label(shader_pack)}")
+
+    in_place_ok = can_serve_shader_pack_in_place(shader_pack)
+    if stream_shaders and in_place_ok:
+        planned = plan_shader_staging(shader_pack, stage_dir, stream_shaders=True)
+        return (
+            shader_pack.parent,
+            [
+                {
+                    "kind": item["kind"],
+                    "name": item["name"],
+                    "copied": False,
+                    "linked": False,
+                    "method": "in_place",
+                }
+                for item in planned
+            ],
+        )
+
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    planned = plan_shader_staging(shader_pack, stage_dir, stream_shaders=False)
+    _prune_stale_staged_shader_packs(stage_dir, {item["name"] for item in planned})
+    staged: list[dict[str, Any]] = []
+    for idx, item in enumerate(planned):
+        src = Path(item["src"])
+        dst = Path(item["dst"])
+        needs_stage = True
+        method = "unchanged"
+        copied = False
+        linked = False
+        if dst.is_file():
+            try:
+                if os.path.samefile(src, dst):
+                    needs_stage = False
+                    method = "samefile"
+                else:
+                    s_st, d_st = src.stat(), dst.stat()
+                    if s_st.st_size == d_st.st_size and int(s_st.st_mtime) == int(d_st.st_mtime):
+                        needs_stage = False
+                        method = "unchanged"
+            except OSError:
+                needs_stage = True
+        if needs_stage:
+            try:
+                _atomic_hardlink_file(src, dst, link_fn=link_fn)
+                linked = True
+                method = "hardlink"
+            except OSError:
+                # Avoid copying a multi-GB pack across drives when in-place serving is unambiguous.
+                if idx == 0 and in_place_ok:
+                    return (
+                        shader_pack.parent,
+                        [
+                            {
+                                "kind": p["kind"],
+                                "name": p["name"],
+                                "copied": False,
+                                "linked": False,
+                                "method": "in_place",
+                            }
+                            for p in planned
+                        ],
+                    )
+                copy_fn(src, dst)
+                copied = True
+                method = "copy"
+        staged.append(
+            {
+                "kind": item["kind"],
+                "name": item["name"],
+                "copied": copied,
+                "linked": linked,
+                "method": method,
+            }
+        )
+    return stage_dir, staged
 
 
 def atomic_write_bytes(payload: bytes, dst: Path) -> None:
@@ -1081,6 +1303,8 @@ def build_target_url(
     stream_threshold_mb: float | None = None,
     hide_hud: bool = False,
     hold_until_visible: str | None = None,
+    dump_pipelines: bool = False,
+    allow_dump_writes: bool = False,
 ) -> str:
     """Construct the local browser boot URL with sanitized query parameters."""
     params: list[tuple[str, str]] = []
@@ -1101,6 +1325,11 @@ def build_target_url(
         params.append(("holdUntilVisible", "1"))
     elif clean_hold == "off":
         params.append(("holdUntilVisible", "0"))
+    if dump_pipelines:
+        params.append(("dumpPipelines", "1"))
+        params.append(("allowDumpWrites", "1"))
+    elif allow_dump_writes:
+        params.append(("allowDumpWrites", "1"))
     base = f"http://{host}:{port}/"
     if not params:
         return base
@@ -1514,6 +1743,7 @@ def build_server_cmd(
     boot_dir: Path | None,
     game_dir: Path | None,
     shaders_dir: Path | None,
+    allow_dump_dir: Path | None = None,
     quiet: bool = False,
 ) -> list[str]:
     """Build the `server/serve_local.py` launch command."""
@@ -1535,6 +1765,8 @@ def build_server_cmd(
         cmd += ["--game", str(game_dir)]
     if shaders_dir is not None:
         cmd += ["--shaders", str(shaders_dir)]
+    if allow_dump_dir is not None:
+        cmd += ["--allow-dump-dir", str(allow_dump_dir)]
     if quiet:
         cmd.append("--quiet")
     return cmd
@@ -1956,7 +2188,11 @@ TELEMETRY_PROBE_JS = r"""(() => {
       (diagnostics && diagnostics.gpuMemory) ||
       (diagnostics && diagnostics.gpu && diagnostics.gpu.gpuMemory) ||
       (app && app.perfMonitor && typeof app.perfMonitor.getGpuMemoryStats === 'function' ? app.perfMonitor.getGpuMemoryStats() : null) ||
-      (app && app.session && typeof app.session.getStats === 'function' ? (app.session.getStats() || {}).gpuMemory : null);
+      (app && app.session && typeof app.session.getStats === 'function' ? (app.session.getStats() || {}).gpuMemory : null) ||
+      (app && app.gpuMemory && typeof app.gpuMemory === 'object' ? app.gpuMemory : null) ||
+      (window.__playgta6GpuMemory && typeof window.__playgta6GpuMemory === 'object' ? window.__playgta6GpuMemory : null) ||
+      (bootState && bootState.gpu && bootState.gpu.frameStats && typeof bootState.gpu.frameStats === 'object' ? bootState.gpu.frameStats : null) ||
+      (diagnostics && diagnostics.gpu && diagnostics.gpu.frameStats && typeof diagnostics.gpu.frameStats === 'object' ? diagnostics.gpu.frameStats : null);
     if (rawGpuMem && typeof rawGpuMem === 'object') {
       gpuMemory = JSON.parse(JSON.stringify(rawGpuMem));
     }
@@ -1968,8 +2204,14 @@ TELEMETRY_PROBE_JS = r"""(() => {
     const loaderStats = (bootState && bootState.loader) || (sessStats && sessStats.loader) || null;
     const rm = {};
     if (memory && typeof memory === 'object') {
-      if (memory.usedJSHeapSize !== null && memory.usedJSHeapSize !== undefined) rm.usedJSHeapSize = memory.usedJSHeapSize;
-      if (memory.totalJSHeapSize !== null && memory.totalJSHeapSize !== undefined) rm.totalJSHeapSize = memory.totalJSHeapSize;
+      if (memory.usedJSHeapSize !== null && memory.usedJSHeapSize !== undefined) {
+        rm.usedJSHeapSize = memory.usedJSHeapSize;
+        rm.jsHeapUsedBytes = Math.floor(memory.usedJSHeapSize);
+      }
+      if (memory.totalJSHeapSize !== null && memory.totalJSHeapSize !== undefined) {
+        rm.totalJSHeapSize = memory.totalJSHeapSize;
+        rm.jsHeapTotalBytes = Math.floor(memory.totalJSHeapSize);
+      }
     }
     const sharedPthreads =
       (loaderStats && loaderStats.sharedModulesDeliveredToPthreads) ??
@@ -1982,8 +2224,12 @@ TELEMETRY_PROBE_JS = r"""(() => {
     const wasmBytes =
       (loaderStats && loaderStats.wasmLinearMemoryBytes) ??
       (bootState && bootState.wasmLinearMemoryBytes) ??
+      (bootState && bootState.memory && bootState.memory.wasmLinearMemoryBytes) ??
       (diagnostics && diagnostics.wasmLinearMemoryBytes) ??
-      (sessStats && sessStats.wasmLinearMemoryBytes);
+      (diagnostics && diagnostics.memory && diagnostics.memory.wasmLinearMemoryBytes) ??
+      (sessStats && sessStats.wasmLinearMemoryBytes) ??
+      (app && app.wasmMemory && app.wasmMemory.buffer && app.wasmMemory.buffer.byteLength) ??
+      (window.Module && window.Module.HEAPU8 && window.Module.HEAPU8.buffer && window.Module.HEAPU8.buffer.byteLength);
     if (typeof wasmBytes === 'number' && Number.isFinite(wasmBytes) && wasmBytes >= 0) {
       rm.wasmLinearMemoryBytes = Math.floor(wasmBytes);
     }
@@ -2052,6 +2298,23 @@ FORCE_SMOKE_JS = r"""(async () => {
   }
 })()"""
 
+FLUSH_PIPELINE_DUMPS_JS = r"""(async () => {
+  try {
+    const app = window.playgta6App;
+    if (app && typeof app.flushPipelineDumps === 'function') {
+      await app.flushPipelineDumps();
+      return 'flushed-app';
+    }
+    if (typeof window.__pg6FlushDumps === 'function') {
+      await window.__pg6FlushDumps();
+      return 'flushed-global';
+    }
+    return 'periodic-only';
+  } catch (err) {
+    return 'error:' + String(err && err.message ? err.message : err);
+  }
+})()"""
+
 
 @dataclass
 class BrowserSessionResult:
@@ -2074,6 +2337,13 @@ class BrowserSessionResult:
     capture_frames_dir: str | None = None
     non_black_canvas_frames: int | None = None
     scripted_inputs_sent: int = 0
+    cdp_inputs_sent: int = 0
+    input_script_presses_sent: int = 0
+    input_script_state: dict[str, Any] | None = None
+    send_input: bool = False
+    input_mode: str = "none"
+    dump_pipelines: bool = False
+    pipeline_dump: dict[str, Any] | None = None
     mp4_path: str | None = None
     mp4_fps: float | None = None
     mp4_skip_black: bool = False
@@ -2201,6 +2471,7 @@ def _extract_input_script(
     script_state = probe.get("inputScriptState")
     if isinstance(script_state, Mapping) and script_state.get("active") is not False:
         candidates.append(script_state.get("preset"))
+        candidates.append(script_state.get("activePreset"))
         candidates.append(script_state.get("name"))
     boot_url_opts = probe.get("bootUrlOptions")
     if isinstance(boot_url_opts, Mapping):
@@ -2223,6 +2494,167 @@ def _extract_input_script(
         if cleaned is not None:
             return cleaned
     return None
+
+
+def _extract_input_script_state(probe: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Extract sanitized browser-side `InputBridge.getScriptState()` telemetry from a probe."""
+    if not isinstance(probe, Mapping):
+        return None
+    raw = probe.get("inputScriptState")
+    if not isinstance(raw, Mapping):
+        return None
+    out: dict[str, Any] = {}
+    active = _sanitize_optional_bool(raw.get("active"))
+    if active is not None:
+        out["active"] = active
+    preset = sanitize_input_script_preset(
+        raw.get("preset") or raw.get("activePreset") or raw.get("name")
+    )
+    if preset is not None:
+        out["preset"] = preset
+    presses = _sanitize_optional_non_negative_int(raw.get("scriptedPressesSent"))
+    press_count = _sanitize_optional_non_negative_int(raw.get("pressCount"))
+    if presses is None and press_count is not None:
+        presses = press_count
+    if presses is not None:
+        out["scriptedPressesSent"] = presses
+    if press_count is not None:
+        out["pressCount"] = press_count
+    elapsed_ms = _sanitize_non_negative_float(
+        raw.get("elapsedScriptMs") if raw.get("elapsedScriptMs") is not None else raw.get("elapsedMs"),
+        digits=2,
+    )
+    if elapsed_ms is not None:
+        out["elapsedScriptMs"] = elapsed_ms
+    last_btn = raw.get("lastScriptedButton")
+    if isinstance(last_btn, str):
+        clean_btn = sanitize_text(last_btn).strip()[:48]
+        if clean_btn:
+            out["lastScriptedButton"] = clean_btn
+    return out or None
+
+
+def _extract_scripted_input_diagnostics(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+    *,
+    input_script: str | None = None,
+) -> dict[str, Any]:
+    """Reconcile CDP Enter inputs and browser-side `InputBridge` scripted presses."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    probe_state = _extract_input_script_state(probe_map)
+    state: dict[str, Any] | None = dict(session.input_script_state) if isinstance(session.input_script_state, Mapping) else None
+    if probe_state is not None:
+        if state is None:
+            state = dict(probe_state)
+        else:
+            prev_presses = _sanitize_optional_non_negative_int(state.get("scriptedPressesSent")) or 0
+            new_presses = _sanitize_optional_non_negative_int(probe_state.get("scriptedPressesSent")) or 0
+            merged = dict(state)
+            merged.update(probe_state)
+            if max(prev_presses, new_presses) > 0:
+                merged["scriptedPressesSent"] = max(prev_presses, new_presses)
+            state = merged
+
+    cdp_sent = max(0, int(session.cdp_inputs_sent or 0))
+    probe_presses = 0
+    if isinstance(state, Mapping):
+        probe_presses = max(
+            _sanitize_optional_non_negative_int(state.get("scriptedPressesSent")) or 0,
+            _sanitize_optional_non_negative_int(state.get("pressCount")) or 0,
+        )
+    bridge_presses = max(0, int(session.input_script_presses_sent or 0), probe_presses)
+    # Preserve direct session.scripted_inputs_sent overrides from unit tests / mocks.
+    total_sent = max(int(session.scripted_inputs_sent or 0), cdp_sent + bridge_presses)
+
+    effective_script = input_script or (state.get("preset") if isinstance(state, Mapping) else None) or session.input_script
+    if effective_script is not None:
+        input_mode = "input-script"
+    elif session.input_mode in ("cdp-enter", "input-script"):
+        input_mode = session.input_mode
+    elif cdp_sent > 0 or session.send_input:
+        input_mode = "cdp-enter"
+    else:
+        input_mode = "none"
+
+    send_input = bool(session.send_input or effective_script is not None or cdp_sent > 0 or total_sent > 0)
+    return {
+        "send_input": send_input,
+        "input_mode": input_mode,
+        "scripted_inputs_sent": total_sent,
+        "cdp_inputs_sent": cdp_sent,
+        "input_script_presses_sent": bridge_presses,
+        "input_script_state": state,
+    }
+
+
+def summarize_pipeline_dump_dir(dump_dir: Path | None, repo_root: Path) -> dict[str, Any] | None:
+    """Summarize captured pipeline dump files in `dump_dir` (counts & bytes only, zero shader payloads)."""
+    if dump_dir is None:
+        return None
+    total_files = 0
+    total_bytes = 0
+    native_bin_files = 0
+    native_meta_files = 0
+    dxil_files = 0
+    has_manifest = False
+    manifest_stats: dict[str, int] = {}
+
+    if dump_dir.is_dir():
+        for root, _dirs, filenames in os.walk(dump_dir):
+            root_path = Path(root)
+            for fname in filenames:
+                if fname.endswith(".tmp"):
+                    continue
+                fpath = root_path / fname
+                try:
+                    st = fpath.stat()
+                except OSError:
+                    continue
+                if not fpath.is_file():
+                    continue
+                total_files += 1
+                total_bytes += int(st.st_size)
+                rel_parts = fpath.relative_to(dump_dir).parts
+                lower_name = fname.lower()
+                if len(rel_parts) >= 2 and rel_parts[0].lower() == "native":
+                    if lower_name.endswith(".bin"):
+                        native_bin_files += 1
+                    elif lower_name.endswith(".meta"):
+                        native_meta_files += 1
+                elif len(rel_parts) >= 2 and rel_parts[0].lower() == "dxil" and lower_name.endswith(".dxbc"):
+                    dxil_files += 1
+                elif rel_parts == ("manifest.json",):
+                    has_manifest = True
+                    try:
+                        parsed = json.loads(fpath.read_text(encoding="utf-8", errors="replace"))
+                        if isinstance(parsed, Mapping):
+                            for src_key, dst_key in (
+                                ("pipelines", "manifest_pipelines"),
+                                ("compute_pipelines", "manifest_compute_pipelines"),
+                                ("native_stages", "manifest_native_stages"),
+                                ("dxil", "manifest_dxil"),
+                            ):
+                                val = parsed.get(src_key)
+                                if isinstance(val, list):
+                                    manifest_stats[dst_key] = len(val)
+                    except (OSError, json.JSONDecodeError):
+                        pass
+
+    out: dict[str, Any] = {
+        "enabled": True,
+        "dir": repo_relative_label(dump_dir, repo_root),
+        "files": total_files,
+        "bytes": total_bytes,
+        "native_bin_files": native_bin_files,
+        "native_meta_files": native_meta_files,
+        "dxil_files": dxil_files,
+        "has_manifest": has_manifest,
+    }
+    out.update(manifest_stats)
+    return sanitize_value(out)
 
 
 def sanitize_gpu_adapter(raw: Any) -> str | None:
@@ -3595,11 +4027,13 @@ def _extract_gpu_memory_stats(
     for candidate in (
         session.gpu_memory,
         gpu.get("gpuMemory"),
+        gpu.get("frameStats"),
         gpu,
         boot_state.get("gpuMemory"),
         probe_map.get("gpuMemory"),
         diag.get("gpuMemory"),
         diag_gpu.get("gpuMemory"),
+        diag_gpu.get("frameStats"),
         diag_gpu,
         diag,
     ):
@@ -3703,6 +4137,8 @@ def _extract_renderer_memory_stats(
 
     shared_vals: list[int] = []
     wasm_mem_vals: list[int] = []
+    heap_used_bytes_vals: list[int] = []
+    heap_total_bytes_vals: list[int] = []
     for src in sources:
         for key in ("sharedModulesDeliveredToPthreads", "shared_modules_delivered_to_pthreads"):
             val = _sanitize_optional_non_negative_int(src.get(key))
@@ -3713,6 +4149,16 @@ def _extract_renderer_memory_stats(
             val = _sanitize_optional_non_negative_int(src.get(key))
             if val is not None:
                 wasm_mem_vals.append(val)
+                break
+        for key in ("jsHeapUsedBytes", "js_heap_used_bytes", "usedJSHeapSize", "used_js_heap_size"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                heap_used_bytes_vals.append(val)
+                break
+        for key in ("jsHeapTotalBytes", "js_heap_total_bytes", "totalJSHeapSize", "total_js_heap_size"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                heap_total_bytes_vals.append(val)
                 break
 
     log_sources: list[Sequence[str]] = [session.console_lines]
@@ -3725,17 +4171,121 @@ def _extract_renderer_memory_stats(
             shared_vals.append(parsed["sharedModulesDeliveredToPthreads"])
         if "wasmLinearMemoryBytes" in parsed:
             wasm_mem_vals.append(parsed["wasmLinearMemoryBytes"])
+        if "jsHeapUsedBytes" in parsed:
+            heap_used_bytes_vals.append(parsed["jsHeapUsedBytes"])
+        if "jsHeapTotalBytes" in parsed:
+            heap_total_bytes_vals.append(parsed["jsHeapTotalBytes"])
 
     out: dict[str, Any] = {}
     if used_mb is not None:
         out["jsHeapUsedMb"] = used_mb
     if total_mb is not None:
         out["jsHeapTotalMb"] = total_mb
+    if heap_used_bytes_vals:
+        out["jsHeapUsedBytes"] = max(heap_used_bytes_vals)
+        if "jsHeapUsedMb" not in out:
+            derived_mb = sanitize_js_heap_mb_from_bytes(out["jsHeapUsedBytes"])
+            if derived_mb is not None:
+                out["jsHeapUsedMb"] = derived_mb
+    if heap_total_bytes_vals:
+        out["jsHeapTotalBytes"] = max(heap_total_bytes_vals)
+        if "jsHeapTotalMb" not in out:
+            derived_mb = sanitize_js_heap_mb_from_bytes(out["jsHeapTotalBytes"])
+            if derived_mb is not None:
+                out["jsHeapTotalMb"] = derived_mb
     if shared_vals:
         out["sharedModulesDeliveredToPthreads"] = max(shared_vals)
     if wasm_mem_vals:
         out["wasmLinearMemoryBytes"] = max(wasm_mem_vals)
     return out or None
+
+
+def _build_memory_stats_summary(
+    gpu_memory: Mapping[str, Any] | None,
+    renderer_memory: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Build a consolidated WebGPU + Wasm64 + JS heap memory summary for `boot-report.json`."""
+    out: dict[str, Any] = {}
+    if isinstance(gpu_memory, Mapping):
+        for key in (
+            "liveBufferBytes",
+            "liveTextureBytes",
+            "peakBufferBytes",
+            "peakTextureBytes",
+            "stagingPoolBytes",
+            "totalLiveGpuBytes",
+            "vramBytes",
+        ):
+            val = _sanitize_optional_non_negative_int(gpu_memory.get(key))
+            if val is not None:
+                out[key] = val
+    if isinstance(renderer_memory, Mapping):
+        for key in ("wasmLinearMemoryBytes", "jsHeapUsedBytes", "jsHeapTotalBytes"):
+            val = _sanitize_optional_non_negative_int(renderer_memory.get(key))
+            if val is not None:
+                out[key] = val
+    return out or None
+
+
+def _merge_gpu_memory_snapshots(
+    acc: dict[str, int] | None,
+    sample: Mapping[str, Any] | None,
+) -> dict[str, int] | None:
+    """Track latest live GPU counters and monotonic peak counters across session polls."""
+    if not isinstance(sample, Mapping) or not sample:
+        return acc
+    merged: dict[str, int] = dict(acc) if acc else {}
+    for key in (
+        "liveBufferBytes",
+        "liveTextureBytes",
+        "stagingPoolBytes",
+        "pendingDeferredDestroys",
+        "pendingDeferredDestroyBytes",
+        "vramBytes",
+        "totalLiveGpuBytes",
+    ):
+        val = _sanitize_optional_non_negative_int(sample.get(key))
+        if val is not None:
+            merged[key] = val
+    for peak_key, live_key in (
+        ("peakBufferBytes", "liveBufferBytes"),
+        ("peakTextureBytes", "liveTextureBytes"),
+    ):
+        candidates = [
+            v
+            for v in (
+                merged.get(peak_key),
+                _sanitize_optional_non_negative_int(sample.get(peak_key)),
+                _sanitize_optional_non_negative_int(sample.get(live_key)),
+            )
+            if v is not None
+        ]
+        if candidates:
+            merged[peak_key] = max(candidates)
+    flushes = _sanitize_optional_non_negative_int(sample.get("deferredHighWaterFlushes"))
+    if flushes is not None:
+        merged["deferredHighWaterFlushes"] = max(merged.get("deferredHighWaterFlushes", 0), flushes)
+    return merged or None
+
+
+def _merge_renderer_memory_snapshots(
+    acc: dict[str, Any] | None,
+    sample: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Track latest/peak renderer & Wasm linear memory counters across session polls."""
+    if not isinstance(sample, Mapping) or not sample:
+        return acc
+    merged: dict[str, Any] = dict(acc) if acc else {}
+    for key in ("jsHeapUsedMb", "jsHeapTotalMb"):
+        val = _sanitize_non_negative_float(sample.get(key), digits=1)
+        if val is not None:
+            merged[key] = val
+    for key in ("jsHeapUsedBytes", "jsHeapTotalBytes", "sharedModulesDeliveredToPthreads", "wasmLinearMemoryBytes"):
+        val = _sanitize_optional_non_negative_int(sample.get(key))
+        if val is not None:
+            prev = _sanitize_optional_non_negative_int(merged.get(key))
+            merged[key] = max(prev, val) if prev is not None else val
+    return merged or None
 
 
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
@@ -4029,6 +4579,9 @@ def run_browser_session(
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
+    dump_pipelines: bool = False,
+    allow_dump_dir: Path | None = None,
+    dump_flush_wait_s: float = DEFAULT_DUMP_FLUSH_WAIT_S,
     quiet_server: bool = False,
     user_data_dir: Path | None = None,
     cleanup_user_data_dir: bool = True,
@@ -4052,6 +4605,20 @@ def run_browser_session(
     effective_hide_hud = bool(hide_hud)
     effective_mp4_skip_black = bool(mp4_skip_black)
     effective_canvas_min_x = 0 if effective_hide_hud else CANVAS_MIN_X
+    effective_dump_pipelines = bool(
+        dump_pipelines
+        or allow_dump_dir is not None
+        or (isinstance(boot_options, Mapping) and bool(boot_options.get("dump_pipelines_dir")))
+    )
+    effective_dump_dir: Path | None = (
+        allow_dump_dir
+        if allow_dump_dir is not None
+        else (run_dir / DEFAULT_DUMP_SUBDIR_NAME if effective_dump_pipelines else None)
+    )
+    # Never dispatch conflicting CDP Enter presses when a browser-side --input-script drives input
+    # (interactive-yield presets like chrome-menu-flow-6 cancel on synthetic Enter events).
+    cdp_send_input = bool(send_input) and (clean_input_script is None)
+    input_mode = "input-script" if clean_input_script is not None else ("cdp-enter" if cdp_send_input else "none")
     target_url = build_target_url(
         host,
         server_port,
@@ -4061,6 +4628,7 @@ def run_browser_session(
         stream_threshold_mb=clean_threshold_mb,
         hide_hud=effective_hide_hud,
         hold_until_visible=clean_hold_until_visible,
+        dump_pipelines=effective_dump_pipelines,
     )
 
     if capture_frames_dir is not None:
@@ -4126,6 +4694,7 @@ def run_browser_session(
         boot_dir=effective_boot_dir,
         game_dir=effective_game_dir,
         shaders_dir=shaders_dir,
+        allow_dump_dir=effective_dump_dir,
         quiet=bool(quiet_server),
     )
     chrome_cmd = build_chrome_args(
@@ -4139,6 +4708,9 @@ def run_browser_session(
     result = BrowserSessionResult(
         target_url=target_url,
         input_script=clean_input_script,
+        send_input=bool(cdp_send_input or clean_input_script is not None),
+        input_mode=input_mode,
+        dump_pipelines=effective_dump_pipelines,
         stream_shaders=bool(stream_shaders or clean_threshold_mb is not None),
         stream_threshold_mb=clean_threshold_mb,
         boot_options=dict(boot_options) if boot_options is not None else None,
@@ -4191,6 +4763,10 @@ def run_browser_session(
             cdp.send("Runtime.enable")
             cdp.send("Log.enable")
             cdp.send("Page.enable")
+            try:
+                cdp.send("Performance.enable")
+            except (CdpError, TimeoutError, OSError):
+                pass
             cdp.send("Page.navigate", {"url": target_url})
         except (CdpError, TimeoutError, OSError) as exc:
             result.ok = False
@@ -4205,9 +4781,34 @@ def run_browser_session(
         end_time = nav_start + duration_s
         next_poll = nav_start + min(DEFAULT_POLL_INTERVAL_S, duration_s)
         next_frame = nav_start + min(effective_frame_interval, duration_s) if want_frames else float("inf")
-        next_input = nav_start + INPUT_START_S if send_input else float("inf")
+        next_input = nav_start + INPUT_START_S if cdp_send_input else float("inf")
         last_present_count = 0
         smoke_triggered = False
+        observed_gpu_memory: dict[str, int] | None = None
+        observed_renderer_memory: dict[str, Any] | None = None
+        observed_input_script_state: dict[str, Any] | None = None
+        observed_input_script_presses = 0
+
+        def observe_probe(probe: Mapping[str, Any]) -> None:
+            nonlocal observed_gpu_memory, observed_renderer_memory
+            nonlocal observed_input_script_state, observed_input_script_presses
+            sample_gpu_mem = _extract_gpu_memory_stats(result, probe)
+            if sample_gpu_mem is not None:
+                observed_gpu_memory = _merge_gpu_memory_snapshots(observed_gpu_memory, sample_gpu_mem)
+            sample_ren_mem = _extract_renderer_memory_stats(result, probe)
+            if sample_ren_mem is not None:
+                observed_renderer_memory = _merge_renderer_memory_snapshots(observed_renderer_memory, sample_ren_mem)
+            script_state = _extract_input_script_state(probe)
+            if script_state is not None:
+                presses = max(
+                    _sanitize_optional_non_negative_int(script_state.get("scriptedPressesSent")) or 0,
+                    _sanitize_optional_non_negative_int(script_state.get("pressCount")) or 0,
+                )
+                observed_input_script_presses = max(observed_input_script_presses, presses)
+                merged_state = dict(script_state)
+                if observed_input_script_presses > 0:
+                    merged_state["scriptedPressesSent"] = observed_input_script_presses
+                observed_input_script_state = merged_state
 
         def capture_one_frame() -> None:
             assert cdp is not None
@@ -4296,6 +4897,7 @@ def run_browser_session(
                 probe = evaluate_probe()
                 if probe:
                     result.final_probe = probe
+                    observe_probe(probe)
                     if smoke and not smoke_triggered and probe.get("readyState") in ("interactive", "complete"):
                         state = (probe.get("bootState") or {}).get("sessionState")
                         if state and state != "running_smoke":
@@ -4323,7 +4925,7 @@ def run_browser_session(
                         break
                 next_poll = now + DEFAULT_POLL_INTERVAL_S
 
-            if send_input and now >= next_input:
+            if cdp_send_input and now >= next_input:
                 try:
                     cdp.send(
                         "Input.dispatchKeyEvent",
@@ -4336,7 +4938,8 @@ def run_browser_session(
                         {"type": "keyUp", "key": "Enter", "code": "Enter", "windowsVirtualKeyCode": 13},
                         timeout=3.0,
                     )
-                    result.scripted_inputs_sent += 1
+                    result.cdp_inputs_sent += 1
+                    result.scripted_inputs_sent = result.cdp_inputs_sent + observed_input_script_presses
                 except (CdpError, TimeoutError, OSError):
                     pass
                 next_input = now + INPUT_PERIOD_S
@@ -4345,22 +4948,65 @@ def run_browser_session(
                 capture_one_frame()
                 next_frame = now + effective_frame_interval
 
-        # Final telemetry sample + drain
+        # Final telemetry sample + drain (plus one short flush cycle when --dump-pipelines is active
+        # so loader.js's periodic MEMFS /pg6_dump syncer completes its HTTP POSTs to serve_local.py).
         if not result.crashed:
+            if effective_dump_pipelines and dump_flush_wait_s > 0.0:
+                try:
+                    cdp.send(
+                        "Runtime.evaluate",
+                        {"expression": FLUSH_PIPELINE_DUMPS_JS, "awaitPromise": True, "returnByValue": True},
+                        timeout=5.0,
+                    )
+                except (CdpError, TimeoutError, OSError):
+                    pass
+                flush_deadline = time.monotonic() + float(dump_flush_wait_s)
+                while time.monotonic() < flush_deadline and not result.crashed:
+                    if chrome_proc.poll() is not None:
+                        break
+                    remaining = max(0.0, flush_deadline - time.monotonic())
+                    process_events(cdp.drain_events(timeout=min(0.15, remaining)))
             process_events(cdp.drain_events(timeout=0.05))
             if want_frames and not result.captured_frames:
                 capture_one_frame()
             final_probe = evaluate_probe()
             if final_probe:
                 result.final_probe = final_probe
+                observe_probe(final_probe)
                 present_count = _extract_present_count(final_probe)
                 wall_ms = (time.monotonic() - nav_start) * 1000.0
                 if present_count > last_present_count:
                     if result.first_present_ms is None:
                         result.first_present_ms = round(wall_ms, 2)
                     result.presents.append(_sample_present_record(final_probe, len(result.presents), wall_ms))
+            # CDP Performance.getMetrics fallback for JSHeapUsedSize / JSHeapTotalSize when
+            # performance.memory is unavailable.
+            try:
+                perf_resp = cdp.send("Performance.getMetrics", timeout=3.0)
+                metrics_list = perf_resp.get("metrics") if isinstance(perf_resp, Mapping) else None
+                if isinstance(metrics_list, list):
+                    perf_map = {
+                        str(item.get("name")): item.get("value")
+                        for item in metrics_list
+                        if isinstance(item, Mapping) and item.get("name")
+                    }
+                    cdp_used = _sanitize_optional_non_negative_int(perf_map.get("JSHeapUsedSize"))
+                    cdp_total = _sanitize_optional_non_negative_int(perf_map.get("JSHeapTotalSize"))
+                    if cdp_used is not None or cdp_total is not None:
+                        observed_renderer_memory = _merge_renderer_memory_snapshots(
+                            observed_renderer_memory,
+                            {
+                                **({"jsHeapUsedBytes": cdp_used} if cdp_used is not None else {}),
+                                **({"jsHeapTotalBytes": cdp_total} if cdp_total is not None else {}),
+                            },
+                        )
+            except (CdpError, TimeoutError, OSError):
+                pass
 
         result.elapsed_ms = round((time.monotonic() - start_mono) * 1000.0, 2)
+        result.input_script_presses_sent = observed_input_script_presses
+        result.input_script_state = observed_input_script_state
+        result.scripted_inputs_sent = result.cdp_inputs_sent + observed_input_script_presses
         if result.gpu_adapter is None:
             result.gpu_adapter = _extract_gpu_adapter(result)
         if result.gpu_adapter is None and chrome_log_fh is not None:
@@ -4386,12 +5032,20 @@ def run_browser_session(
             present_count=max(len(result.presents), _extract_present_count(result.final_probe)),
         )
         result.opfs_telemetry = _extract_opfs_telemetry(result)
+        if observed_gpu_memory is not None:
+            result.gpu_memory = observed_gpu_memory
         result.gpu_memory = _extract_gpu_memory_stats(result)
+        if observed_renderer_memory is not None:
+            result.renderer_memory = observed_renderer_memory
         result.renderer_memory = _extract_renderer_memory_stats(
             result,
             js_heap_used_mb=result.js_heap_used_mb,
             js_heap_total_mb=result.js_heap_total_mb,
         )
+        if result.js_heap_used_mb is None and isinstance(result.renderer_memory, Mapping):
+            result.js_heap_used_mb = _sanitize_non_negative_float(result.renderer_memory.get("jsHeapUsedMb"), digits=1)
+        if result.js_heap_total_mb is None and isinstance(result.renderer_memory, Mapping):
+            result.js_heap_total_mb = _sanitize_non_negative_float(result.renderer_memory.get("jsHeapTotalMb"), digits=1)
         result.present_fps_avg = _extract_present_fps_avg(result)
         rolling_fps = _extract_rolling_fps_stats(result)
         result.fps_steady_avg = rolling_fps["fps_steady_avg"]
@@ -4436,6 +5090,8 @@ def run_browser_session(
                 pass
         terminate_process(chrome_proc)
         terminate_process(server_proc)
+        if effective_dump_pipelines and effective_dump_dir is not None:
+            result.pipeline_dump = summarize_pipeline_dump_dir(effective_dump_dir, repo)
         if server_proc is not None:
             wait_for_port_released(host, server_port)
         for fh in (chrome_log_fh, server_log_fh):
@@ -4633,6 +5289,15 @@ def build_boot_report(
         js_heap_used_mb=effective_js_heap_used_mb,
         js_heap_total_mb=effective_js_heap_total_mb,
     )
+    effective_memory_stats = _build_memory_stats_summary(effective_gpu_memory, effective_renderer_memory)
+    effective_input_diag = _extract_scripted_input_diagnostics(
+        session,
+        probe,
+        input_script=effective_input_script,
+    )
+    effective_pipeline_dump = (
+        dict(session.pipeline_dump) if isinstance(session.pipeline_dump, Mapping) else None
+    )
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
     effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
@@ -4783,6 +5448,18 @@ def build_boot_report(
         summary["gpu_memory"] = dict(effective_gpu_memory)
     if effective_renderer_memory is not None:
         summary["renderer_memory"] = dict(effective_renderer_memory)
+    if effective_memory_stats is not None:
+        summary["memory_stats"] = dict(effective_memory_stats)
+    if effective_input_diag["scripted_inputs_sent"] > 0:
+        summary["send_input"] = effective_input_diag["send_input"]
+        summary["input_mode"] = effective_input_diag["input_mode"]
+        summary["scripted_inputs_sent"] = effective_input_diag["scripted_inputs_sent"]
+        summary["cdp_inputs_sent"] = effective_input_diag["cdp_inputs_sent"]
+        summary["input_script_presses_sent"] = effective_input_diag["input_script_presses_sent"]
+        if effective_input_diag["input_script_state"] is not None:
+            summary["input_script_state"] = dict(effective_input_diag["input_script_state"])
+    if effective_pipeline_dump is not None:
+        summary["pipeline_dump"] = dict(effective_pipeline_dump)
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
     for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
@@ -4802,6 +5479,11 @@ def build_boot_report(
         "mode": boot_mode,
         "smoke": bool(smoke),
         "inputScript": effective_input_script,
+        "send_input": effective_input_diag["send_input"],
+        "input_mode": effective_input_diag["input_mode"],
+        "scripted_inputs_sent": effective_input_diag["scripted_inputs_sent"],
+        "cdp_inputs_sent": effective_input_diag["cdp_inputs_sent"],
+        "input_script_presses_sent": effective_input_diag["input_script_presses_sent"],
         "playabilityState": effective_playability_state,
         "m4_milestones": dict(effective_m4_milestones),
         "gpu_adapter": effective_gpu_adapter,
@@ -4837,6 +5519,7 @@ def build_boot_report(
             "gpu_validation_errors": gpu_counts["validationErrorCount"],
             "page_errors": len(session.page_errors),
             "console_errors": console_errors,
+            "scripted_inputs_sent": effective_input_diag["scripted_inputs_sent"],
         },
         "summary": summary,
         "address_space": {
@@ -4865,6 +5548,12 @@ def build_boot_report(
         report["gpu_memory"] = dict(effective_gpu_memory)
     if effective_renderer_memory is not None:
         report["renderer_memory"] = dict(effective_renderer_memory)
+    if effective_memory_stats is not None:
+        report["memory_stats"] = dict(effective_memory_stats)
+    if effective_input_diag["input_script_state"] is not None:
+        report["input_script_state"] = dict(effective_input_diag["input_script_state"])
+    if effective_pipeline_dump is not None:
+        report["pipeline_dump"] = dict(effective_pipeline_dump)
     if warm_boot is not None:
         report["warm_boot"] = dict(warm_boot)
     if effective_boot_options is not None:
@@ -4922,6 +5611,15 @@ def build_telemetry_payload(
         probe,
         js_heap_used_mb=effective_js_heap_used_mb,
         js_heap_total_mb=effective_js_heap_total_mb,
+    )
+    effective_memory_stats = _build_memory_stats_summary(effective_gpu_memory, effective_renderer_memory)
+    effective_input_diag = _extract_scripted_input_diagnostics(
+        session,
+        probe,
+        input_script=effective_input_script,
+    )
+    effective_pipeline_dump = (
+        dict(session.pipeline_dump) if isinstance(session.pipeline_dump, Mapping) else None
     )
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
@@ -4984,6 +5682,18 @@ def build_telemetry_payload(
         summary["gpu_memory"] = dict(effective_gpu_memory)
     if effective_renderer_memory is not None:
         summary["renderer_memory"] = dict(effective_renderer_memory)
+    if effective_memory_stats is not None:
+        summary["memory_stats"] = dict(effective_memory_stats)
+    if effective_input_diag["scripted_inputs_sent"] > 0:
+        summary["send_input"] = effective_input_diag["send_input"]
+        summary["input_mode"] = effective_input_diag["input_mode"]
+        summary["scripted_inputs_sent"] = effective_input_diag["scripted_inputs_sent"]
+        summary["cdp_inputs_sent"] = effective_input_diag["cdp_inputs_sent"]
+        summary["input_script_presses_sent"] = effective_input_diag["input_script_presses_sent"]
+        if effective_input_diag["input_script_state"] is not None:
+            summary["input_script_state"] = dict(effective_input_diag["input_script_state"])
+    if effective_pipeline_dump is not None:
+        summary["pipeline_dump"] = dict(effective_pipeline_dump)
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
     for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
@@ -5003,6 +5713,8 @@ def build_telemetry_payload(
         "hide_hud": effective_hide_hud,
         "hold_until_visible": effective_hold_until_visible,
         "inputScript": effective_input_script,
+        "send_input": effective_input_diag["send_input"],
+        "input_mode": effective_input_diag["input_mode"],
         "playabilityState": effective_playability_state,
         "m4_milestones": dict(effective_m4_milestones),
         "gpu_adapter": effective_gpu_adapter,
@@ -5032,7 +5744,9 @@ def build_telemetry_payload(
         "summary": summary,
         "presents_sampled": len(session.presents),
         "first_present_ms": session.first_present_ms,
-        "scripted_inputs_sent": session.scripted_inputs_sent,
+        "scripted_inputs_sent": effective_input_diag["scripted_inputs_sent"],
+        "cdp_inputs_sent": effective_input_diag["cdp_inputs_sent"],
+        "input_script_presses_sent": effective_input_diag["input_script_presses_sent"],
         "captured_frames": list(session.captured_frames),
         "capturedFrames": len(session.captured_frames),
         "nonBlackCanvasFrames": session.non_black_canvas_frames,
@@ -5060,6 +5774,12 @@ def build_telemetry_payload(
         telemetry_payload["gpu_memory"] = dict(effective_gpu_memory)
     if effective_renderer_memory is not None:
         telemetry_payload["renderer_memory"] = dict(effective_renderer_memory)
+    if effective_memory_stats is not None:
+        telemetry_payload["memory_stats"] = dict(effective_memory_stats)
+    if effective_input_diag["input_script_state"] is not None:
+        telemetry_payload["input_script_state"] = dict(effective_input_diag["input_script_state"])
+    if effective_pipeline_dump is not None:
+        telemetry_payload["pipeline_dump"] = dict(effective_pipeline_dump)
     if warm_boot is not None:
         telemetry_payload["warm_boot"] = dict(warm_boot)
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
@@ -5370,8 +6090,32 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
             lines.append(f"warm_boot: {', '.join(wb_parts)}")
 
     input_script = report.get("inputScript") or summary.get("inputScript")
+    scripted_inputs_sent = _sanitize_optional_non_negative_int(
+        report.get("scripted_inputs_sent")
+        if "scripted_inputs_sent" in report
+        else summary.get("scripted_inputs_sent")
+    )
     if input_script:
-        lines.append(f"input_script: {input_script}")
+        if scripted_inputs_sent is not None:
+            lines.append(f"input_script: {input_script} (scripted_inputs_sent={scripted_inputs_sent})")
+        else:
+            lines.append(f"input_script: {input_script}")
+    elif scripted_inputs_sent:
+        lines.append(f"scripted_inputs_sent: {scripted_inputs_sent}")
+    pipeline_dump = report.get("pipeline_dump") if isinstance(report.get("pipeline_dump"), Mapping) else (
+        summary.get("pipeline_dump") if isinstance(summary.get("pipeline_dump"), Mapping) else None
+    )
+    if isinstance(pipeline_dump, Mapping) and pipeline_dump:
+        pd_parts = [
+            f"files={pipeline_dump.get('files', 0)}",
+            f"native_bin={pipeline_dump.get('native_bin_files', 0)}",
+            f"dxil={pipeline_dump.get('dxil_files', 0)}",
+            f"manifest={'true' if pipeline_dump.get('has_manifest') else 'false'}",
+            f"bytes={pipeline_dump.get('bytes', 0)}",
+        ]
+        if "manifest_pipelines" in pipeline_dump:
+            pd_parts.append(f"pipelines={pipeline_dump['manifest_pipelines']}")
+        lines.append(f"pipeline_dump: {', '.join(pd_parts)}")
     if "capturedFrames" in summary:
         non_black = summary.get("nonBlackCanvasFrames")
         nb_label = "skipped" if non_black is None else str(non_black)
@@ -5679,6 +6423,10 @@ def _run(
         dump_pipelines=dump_pipelines,
         repo_root=repo,
     )
+    effective_dump_pipelines = bool(
+        dump_pipelines
+        or (isinstance(resolved_boot_options, Mapping) and bool(resolved_boot_options.get("dump_pipelines_dir")))
+    )
 
     preset_cfg = PRESETS[args.preset]
     if args.duration_s is not None:
@@ -5688,7 +6436,9 @@ def _run(
     else:
         duration_s = float(preset_cfg["duration_s"])
     warm_duration_s = warm_duration_override if warm_duration_override is not None else duration_s
-    send_input = bool(preset_cfg["input"])
+    cdp_send_input = bool(preset_cfg["input"]) and (input_script is None)
+    effective_send_input = bool(cdp_send_input or input_script is not None)
+    input_mode = "input-script" if input_script is not None else ("cdp-enter" if cdp_send_input else "none")
 
     build_dir = resolve_against_repo(args.build_dir or DEFAULT_BUILD_DIR_REL, repo)
     runs_dir = resolve_against_repo(args.runs_dir or (build_dir / "runs"), repo)
@@ -5744,14 +6494,25 @@ def _run(
             shard_cache_bytes=lift_cache.shard_cache_max_bytes(env),
         )
 
-    shader_plan = plan_shader_staging(shader_pack, shader_stage_dir) if shader_pack is not None else []
+    effective_stream_shaders_flag = bool(stream_shaders or stream_threshold_mb is not None)
+    shader_plan = (
+        plan_shader_staging(shader_pack, shader_stage_dir, stream_shaders=effective_stream_shaders_flag)
+        if shader_pack is not None
+        else []
+    )
     chrome_path = None if args.build_only else chrome_discoverer(args.chrome, env=env)
     sanitized_plan = plan.sanitized(repo)
 
     for step in sanitized_plan:
         print(f"[plan] {step['stage']}: {step['reason']}", file=sys.stderr)
 
-    effective_shaders_dir = shader_stage_dir if shader_pack is not None else None
+    effective_shaders_dir: Path | None = None
+    if shader_pack is not None:
+        if effective_stream_shaders_flag and can_serve_shader_pack_in_place(shader_pack):
+            effective_shaders_dir = shader_pack.parent
+        else:
+            effective_shaders_dir = shader_stage_dir
+    dump_dir: Path | None = (run_dir / DEFAULT_DUMP_SUBDIR_NAME) if effective_dump_pipelines else None
     if resolved_boot_options is not None and not args.smoke:
         validate_boot_dir_safety(boot_dir, repo)
 
@@ -5766,6 +6527,7 @@ def _run(
             boot_dir=None if args.smoke else boot_dir,
             game_dir=game_dir,
             shaders_dir=effective_shaders_dir,
+            allow_dump_dir=dump_dir,
             quiet=quiet_server,
         )
         boot_options_staging_preview: dict[str, Any] | None = None
@@ -5799,6 +6561,7 @@ def _run(
             stream_threshold_mb=stream_threshold_mb,
             hide_hud=hide_hud,
             hold_until_visible=hold_until_visible,
+            dump_pipelines=effective_dump_pipelines,
         )
         dry_payload = sanitize_value(
             {
@@ -5810,15 +6573,18 @@ def _run(
                 "headless": args.headless,
                 "hide_hud": hide_hud,
                 "hold_until_visible": hold_until_visible,
-                "send_input": send_input,
+                "send_input": effective_send_input,
+                "cdp_send_input": cdp_send_input,
+                "input_mode": input_mode,
                 "input_script": input_script,
                 "inputScript": input_script,
                 "stream_shaders": stream_shaders,
                 "stream_threshold_mb": stream_threshold_mb,
                 "boot_options": resolved_boot_options,
                 "boot_options_staging": boot_options_staging_preview,
-                "dump_pipelines": dump_pipelines,
-                "dumpPipelines": dump_pipelines,
+                "dump_pipelines": effective_dump_pipelines,
+                "dumpPipelines": effective_dump_pipelines,
+                "dump_dir": repo_relative_label(dump_dir, repo) if dump_dir is not None else None,
                 "capture_frames": bool(capture_frames_enabled or args.mp4),
                 "capture_frames_dir": repo_relative_label(capture_frames_dir, repo) if capture_frames_dir is not None else None,
                 "capture_interval_sec": capture_interval_sec,
@@ -5834,7 +6600,7 @@ def _run(
                 "chrome_label": basename_label(chrome_path) if chrome_path else None,
                 "plan": sanitized_plan,
                 "shader_staging": [
-                    {"kind": s["kind"], "name": s["name"]} for s in shader_plan
+                    {"kind": s["kind"], "name": s["name"], "method": s["method"]} for s in shader_plan
                 ],
                 "server_command": sanitize_cmd(server_preview, repo),
                 "url": preview_url,
@@ -5870,7 +6636,11 @@ def _run(
 
     staged_shaders: list[dict[str, Any]] = []
     if shader_pack is not None:
-        staged_shaders = stage_shader_pack(shader_pack, shader_stage_dir)
+        effective_shaders_dir, staged_shaders = prepare_shader_serving_dir(
+            shader_pack,
+            shader_stage_dir,
+            stream_shaders=effective_stream_shaders_flag,
+        )
 
     staged_boot_options: dict[str, Any] | None = None
     if resolved_boot_options is not None and not args.smoke:
@@ -5921,7 +6691,7 @@ def _run(
             "duration_s": duration_s,
             "headless": args.headless,
             "smoke": args.smoke,
-            "send_input": send_input,
+            "send_input": cdp_send_input,
             "capture_frames": capture_frames_enabled,
             "capture_frames_dir": capture_frames_dir,
             "capture_interval_sec": capture_interval_sec,
@@ -5935,6 +6705,8 @@ def _run(
             "stream_shaders": stream_shaders,
             "stream_threshold_mb": stream_threshold_mb,
             "boot_options": resolved_boot_options,
+            "dump_pipelines": effective_dump_pipelines,
+            "allow_dump_dir": dump_dir,
             "quiet_server": quiet_server,
             "runner": runner,
         }
@@ -5979,7 +6751,7 @@ def _run(
                 "duration_s": warm_duration_s,
                 "headless": args.headless,
                 "smoke": args.smoke,
-                "send_input": send_input,
+                "send_input": cdp_send_input,
                 "capture_frames": False,
                 "capture_frames_dir": None,
                 "capture_interval_sec": capture_interval_sec,
@@ -5993,6 +6765,8 @@ def _run(
                 "stream_shaders": stream_shaders,
                 "stream_threshold_mb": stream_threshold_mb,
                 "boot_options": resolved_boot_options,
+                "dump_pipelines": effective_dump_pipelines,
+                "allow_dump_dir": (run_dir / f"warm-{DEFAULT_DUMP_SUBDIR_NAME}") if effective_dump_pipelines else None,
                 "quiet_server": quiet_server,
                 "user_data_dir": shared_profile_dir,
                 "cleanup_user_data_dir": False,
@@ -6068,15 +6842,20 @@ def _run(
             "headless": bool(args.headless),
             "hide_hud": hide_hud,
             "hold_until_visible": hold_until_visible,
-            "send_input": send_input,
+            "send_input": effective_send_input,
+            "cdp_send_input": cdp_send_input,
+            "input_mode": input_mode,
+            "scripted_inputs_sent": telemetry_payload.get("scripted_inputs_sent", session.scripted_inputs_sent),
             "input_script": input_script,
             "inputScript": input_script,
             "stream_shaders": stream_shaders,
             "stream_threshold_mb": stream_threshold_mb,
             "boot_options": resolved_boot_options,
             "staged_boot_options": staged_boot_options,
-            "dump_pipelines": dump_pipelines,
-            "dumpPipelines": dump_pipelines,
+            "dump_pipelines": effective_dump_pipelines,
+            "dumpPipelines": effective_dump_pipelines,
+            "dump_dir": repo_relative_label(dump_dir, repo) if dump_dir is not None else None,
+            "pipeline_dump": session.pipeline_dump,
             "capture_frames": bool(capture_frames_enabled or args.mp4),
             "capture_frames_dir": repo_relative_label(capture_frames_dir, repo) if capture_frames_dir is not None else None,
             "capture_interval_sec": capture_interval_sec,
