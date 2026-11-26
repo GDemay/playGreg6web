@@ -1,14 +1,17 @@
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
+import inspect_wgsl_pack as wgpk  # noqa: E402
 import prepare_local  # noqa: E402
 
 
@@ -493,6 +496,289 @@ class TestPrepareLocal(unittest.TestCase):
             self.assertFalse(parsed_err["ok"])
             self.assertEqual(parsed_err["errorCode"], "missing_game_dir")
             self.assertIn('python tools/local_env.py --set-game "<path>"', parsed_err["error"])
+
+    def test_pack_version_and_pack_shaders_plan_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, _game_dir = self._setup_workspace(base)
+            spirv_dir = repo / "work" / "spirv"
+            spirv_dir.mkdir(parents=True)
+            (spirv_dir / "main.spv").write_bytes(b"\x03\x02\x23\x07")
+            cfg = prepare_local.resolve_config(repo, env={})
+
+            # Default keeps exact legacy command without --pack / --pack-version.
+            default_plan = prepare_local.build_pipeline_plan(cfg, step="shaders")
+            self.assertNotIn("--pack", default_plan[0].command)
+            self.assertNotIn("--pack-version", default_plan[0].command)
+
+            # --pack-version 2 appends --pack and --pack-version 2.
+            v2_plan = prepare_local.build_pipeline_plan(cfg, step="shaders", pack_version="2")
+            expected_pack = (repo / "local-data" / "shaders" / "shaders.wgsl.pack").resolve()
+            self.assertEqual(
+                v2_plan[0].command[-4:],
+                ("--pack", str(expected_pack), "--pack-version", "2"),
+            )
+            self.assertIn(expected_pack, v2_plan[0].outputs)
+
+            # --pack-shaders with default auto also appends --pack and --pack-version auto.
+            auto_pack_plan = prepare_local.build_pipeline_plan(cfg, step="shaders", pack_shaders=True)
+            self.assertEqual(
+                auto_pack_plan[0].command[-4:],
+                ("--pack", str(expected_pack), "--pack-version", "auto"),
+            )
+
+            # Invalid pack_version rejected cleanly.
+            with self.assertRaises(prepare_local.PipelineValidationError) as ctx:
+                prepare_local.build_pipeline_plan(cfg, step="shaders", pack_version="3")
+            self.assertEqual(ctx.exception.code, "invalid_pack_version")
+
+            # CLI --pack-version 2 --dry-run --json includes redacted pack path.
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GTA6_")}
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "prepare_local.py"),
+                    "--repo-root",
+                    str(repo),
+                    "--step",
+                    "shaders",
+                    "--pack-version",
+                    "2",
+                    "--dry-run",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            parsed = json.loads(proc.stdout)
+            self.assertTrue(parsed["ok"])
+            cmd = parsed["steps"][0]["command"]
+            self.assertIn("--pack", cmd)
+            self.assertIn("<GTA6_DATA_DIR>/shaders/shaders.wgsl.pack", cmd)
+            self.assertIn("--pack-version", cmd)
+            self.assertIn("2", cmd)
+            self.assertNotIn(str(base), proc.stdout)
+
+    def test_validate_shader_pack_header_v1_v2_and_over_4gib(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            v1_path = base / "v1.wgsl.pack"
+            v1_path.write_bytes(
+                wgpk.build_wgpk([(0x1111, wgpk.ShaderStage.VERTEX, "@vertex fn vs() {}")], version=1)
+            )
+            meta_v1 = prepare_local.validate_shader_pack_header(v1_path)
+            self.assertTrue(meta_v1["ok"])
+            self.assertEqual(meta_v1["version"], 1)
+            self.assertEqual(meta_v1["entry_bytes"], 20)
+            self.assertFalse(meta_v1["is_v2"])
+            self.assertEqual(meta_v1["entry_count"], 1)
+
+            v2_path = base / "v2.wgsl.pack"
+            v2_path.write_bytes(
+                wgpk.build_wgpk([(0x2222, wgpk.ShaderStage.FRAGMENT, "@fragment fn fs() {}")], version=2)
+            )
+            meta_v2 = prepare_local.validate_shader_pack_header(v2_path)
+            self.assertTrue(meta_v2["ok"])
+            self.assertEqual(meta_v2["version"], 2)
+            self.assertEqual(meta_v2["entry_bytes"], 24)
+            self.assertTrue(meta_v2["is_v2"])
+            self.assertEqual(meta_v2["entry_count"], 1)
+
+            # Simulated >4 GiB v2 pack via mocked get_file_size.
+            huge_path = base / "huge_v2.wgsl.pack"
+            offset_64 = 0x1_5000_0000
+            payload_len = 256
+            header = struct.pack("<4sIII", b"WGPK", 2, 1, 0)
+            entry = struct.pack("<QB3sIQ", 0xABCD, 3, b"\x00\x00\x00", payload_len, offset_64)
+            huge_path.write_bytes(header + entry)
+            with mock.patch.object(
+                prepare_local, "get_file_size", return_value=offset_64 + payload_len
+            ):
+                meta_huge = prepare_local.validate_shader_pack_header(huge_path)
+            self.assertTrue(meta_huge["ok"])
+            self.assertEqual(meta_huge["version"], 2)
+            self.assertTrue(meta_huge["is_v2"])
+            self.assertEqual(meta_huge["size_bytes"], offset_64 + payload_len)
+
+            # Unsupported version 3 rejected.
+            v3_path = base / "v3.wgsl.pack"
+            v3_path.write_bytes(struct.pack("<4sIII", b"WGPK", 3, 0, 0))
+            meta_v3 = prepare_local.validate_shader_pack_header(v3_path)
+            self.assertFalse(meta_v3["ok"])
+            self.assertEqual(meta_v3["version"], 3)
+            self.assertIsNone(meta_v3["entry_bytes"])
+
+    def test_validate_reflect_sidecar_v1_v2_v3_and_rejects_writable_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            valid_v3 = base / "good.wgsl.pack.reflect.json"
+            valid_v3.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 3,
+                        "stages": {
+                            "0x0000000000000001": {
+                                "stage": "fragment",
+                                "bindings": [
+                                    {
+                                        "group": 0,
+                                        "binding": 0,
+                                        "kind": "uniform",
+                                        "source": {"user_sgpr": 2, "root_descriptor": True, "table_byte_offset": 32},
+                                    },
+                                    {
+                                        "group": 0,
+                                        "binding": 1,
+                                        "kind": "read-only-storage",
+                                        "source": {"unresolved": True},
+                                    },
+                                ],
+                            },
+                            "0x0000000000000002": {
+                                "stage": "compute",
+                                "mesh_output": {"max_vertices": 64, "max_primitives": 64, "vertex_words": 8},
+                                "bindings": [],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ok_res = prepare_local.validate_reflect_sidecar_file(valid_v3)
+            self.assertTrue(ok_res["ok"])
+            self.assertEqual(ok_res["version"], 3)
+            self.assertEqual(ok_res["stage_count"], 2)
+            self.assertEqual(ok_res["unresolved_source_stages"], 1)
+            self.assertEqual(ok_res["unresolved_source_bindings"], 1)
+            self.assertEqual(ok_res["mesh_output_stages"], 1)
+
+            bad_v3 = base / "bad.wgsl.pack.reflect.json"
+            bad_v3.write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 3,
+                        "stages": {
+                            "0x0000000000000003": {
+                                "stage": "compute",
+                                "bindings": [
+                                    {
+                                        "group": 0,
+                                        "binding": 0,
+                                        "kind": "storage",
+                                        "source": {"unresolved": True},
+                                    }
+                                ],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            bad_res = prepare_local.validate_reflect_sidecar_file(bad_v3)
+            self.assertFalse(bad_res["ok"])
+            self.assertTrue(any("unresolved" in e for e in bad_res["errors"]))
+
+    def test_stage_shader_bundle_v2_and_v3_copy_dry_run_safety_and_sanitization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, _game_dir = self._setup_workspace(base)
+            src_dir = base / "AliceSecret_ShaderBuild"
+            src_dir.mkdir(parents=True)
+
+            pack_bytes = wgpk.build_wgpk(
+                [
+                    (0xAAA1, wgpk.ShaderStage.VERTEX, "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+                    (0xBBB2, wgpk.ShaderStage.FRAGMENT, "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+                ],
+                version=2,
+            )
+            pack_src = src_dir / "game_v2.wgsl.pack"
+            pack_src.write_bytes(pack_bytes)
+
+            reflect_doc = {
+                "schema": "playgta6-stage-reflection",
+                "version": 3,
+                "stages": {
+                    "0x000000000000aaa1": {
+                        "stage": "vertex",
+                        "bindings": [
+                            {"group": 0, "binding": 0, "kind": "uniform", "source": {"unresolved": True}},
+                        ],
+                    }
+                },
+            }
+            reflect_src = src_dir / "game_v2.wgsl.pack.reflect.json"
+            reflect_src.write_text(json.dumps(reflect_doc), encoding="utf-8")
+
+            fake_env = {"USERNAME": "AliceSecret", "USER": "AliceSecret"}
+            cfg = prepare_local.resolve_config(repo, env=fake_env)
+
+            # 1) dry_run=True validates without copying files.
+            dry_res = prepare_local.stage_shader_bundle(pack_src, cfg, dry_run=True, env=fake_env)
+            self.assertTrue(dry_res["ok"])
+            self.assertTrue(dry_res["dryRun"])
+            self.assertFalse(dry_res["staged"])
+            self.assertEqual(dry_res["pack"]["version"], 2)
+            self.assertTrue(dry_res["pack"]["is_v2"])
+            self.assertEqual(dry_res["reflect"]["version"], 3)
+            self.assertFalse((repo / "local-data" / "shaders" / "game_v2.wgsl.pack").exists())
+
+            # 2) Real atomic copy stages both pack and auto-discovered sibling reflect.json.
+            real_res = prepare_local.stage_shader_bundle(pack_src, cfg, dry_run=False, env=fake_env)
+            self.assertTrue(real_res["ok"])
+            self.assertTrue(real_res["staged"])
+            staged_pack = repo / "local-data" / "shaders" / "game_v2.wgsl.pack"
+            staged_reflect = repo / "local-data" / "shaders" / "game_v2.wgsl.pack.reflect.json"
+            self.assertTrue(staged_pack.is_file())
+            self.assertTrue(staged_reflect.is_file())
+            self.assertEqual(staged_pack.read_bytes(), pack_bytes)
+            self.assertEqual(json.loads(staged_reflect.read_text(encoding="utf-8")), reflect_doc)
+
+            # 3) Strict path/username sanitization in returned dict.
+            serialized = json.dumps(real_res)
+            self.assertIn("<GTA6_DATA_DIR>/shaders/game_v2.wgsl.pack", serialized)
+            self.assertNotIn("AliceSecret", serialized)
+            self.assertNotIn(str(base), serialized)
+            self.assertNotIn(str(src_dir), serialized)
+
+            # 4) Escaping dest_dir rejected with PipelineSafetyError.
+            with self.assertRaises(prepare_local.PipelineSafetyError):
+                prepare_local.stage_shader_bundle(pack_src, cfg, dest_dir=repo / "docs")
+            with self.assertRaises(prepare_local.PipelineSafetyError):
+                prepare_local.stage_shader_bundle(pack_src, cfg, dest_dir=base / "outside")
+
+            # 5) Standalone CLI --stage-pack works even when GTA6_GAME_DIR is NOT set.
+            empty_repo = base / "repo_no_game"
+            empty_repo.mkdir()
+            env_clean = {k: v for k, v in os.environ.items() if not k.startswith("GTA6_")}
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "prepare_local.py"),
+                    "--repo-root",
+                    str(empty_repo),
+                    "--stage-pack",
+                    str(pack_src),
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env_clean,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+            cli_out = json.loads(proc.stdout)
+            self.assertTrue(cli_out["ok"])
+            self.assertTrue(cli_out["stagedShaderBundle"]["staged"])
+            self.assertTrue((empty_repo / "local-data" / "shaders" / "game_v2.wgsl.pack").is_file())
+            self.assertTrue((empty_repo / "local-data" / "shaders" / "game_v2.wgsl.pack.reflect.json").is_file())
+            self.assertNotIn(str(base), proc.stdout)
+            self.assertNotIn("AliceSecret", proc.stdout)
 
 
 if __name__ == "__main__":
