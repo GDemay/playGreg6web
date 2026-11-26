@@ -162,6 +162,35 @@ class BinaryCommandBuilder {
     return this._pushPacket(OPCODES.DRAW, new Uint8Array(buf));
   }
 
+  createBuffer(id, size, usage = 0x30) {
+    const buf = new ArrayBuffer(16);
+    const v = new DataView(buf);
+    v.setUint32(0, id, true);
+    v.setUint32(4, usage, true);
+    v.setBigUint64(8, BigInt(size), true);
+    return this._pushPacket(OPCODES.CREATE_BUFFER, new Uint8Array(buf));
+  }
+
+  setIndexBuffer(bufferId, formatCode = 0, offset = 0) {
+    const buf = new ArrayBuffer(16);
+    const v = new DataView(buf);
+    v.setUint32(0, bufferId, true);
+    v.setUint32(4, formatCode, true);
+    v.setBigUint64(8, BigInt(offset), true);
+    return this._pushPacket(OPCODES.SET_INDEX_BUFFER, new Uint8Array(buf));
+  }
+
+  drawIndexed(indexCount, instanceCount = 1, firstIndex = 0, baseVertex = 0, firstInstance = 0) {
+    const buf = new ArrayBuffer(20);
+    const v = new DataView(buf);
+    v.setUint32(0, indexCount, true);
+    v.setUint32(4, instanceCount, true);
+    v.setUint32(8, firstIndex, true);
+    v.setInt32(12, baseVertex, true);
+    v.setUint32(16, firstInstance, true);
+    return this._pushPacket(OPCODES.DRAW_INDEXED, new Uint8Array(buf));
+  }
+
   dispatchCompute(x, y = 1, z = 1) {
     const buf = new ArrayBuffer(12);
     const v = new DataView(buf);
@@ -255,8 +284,21 @@ function createMockWebGpu() {
             setVertexBuffer(slot, buf, offset) {
               commands.push({ op: 'setVertexBuffer', slot, buf, offset });
             },
+            setIndexBuffer(buf, format, offset) {
+              commands.push({ op: 'setIndexBuffer', buf, format, offset });
+            },
             draw(vertexCount, instanceCount, firstVertex, firstInstance) {
               commands.push({ op: 'draw', vertexCount, instanceCount, firstVertex, firstInstance });
+            },
+            drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
+              commands.push({
+                op: 'drawIndexed',
+                indexCount,
+                instanceCount,
+                firstIndex,
+                baseVertex,
+                firstInstance,
+              });
             },
             end() {
               commands.push({ op: 'endRenderPass' });
@@ -1835,4 +1877,381 @@ test('W185 classic WorkerGlobalScope importScripts wires W165/W167/W168/W179 cle
   assert.equal(telReply.asyncPipelineCompileStats.prioritizeGraphics, true);
   assert.equal(telReply.asyncPipelineCompileStats.maxConcurrentCompiles, 2);
   assert.ok(telReply.missingShaderSummary);
+});
+
+// ---------------------------------------------------------------------------
+// 11. Regression: pending ranged-streaming pipelines skip SetPipeline/DrawIndexed/Dispatch
+//     cleanly with 0 validation errors, materialize on resolve, and still error on unknown IDs
+// ---------------------------------------------------------------------------
+
+test('pending ranged-streaming render pipelines skip SetPipeline/DrawIndexed with 0 validation errors and materialize once shaders settle', async () => {
+  const { buffer, dataStart } = buildSamplePack();
+  const net = createSyntheticRangePackServer(buffer, {
+    reportedTotalBytes: 7_510_000_000, // 7.51 GB WGPK v2 scale
+    dataStartOffset: dataStart,
+    deferDataRanges: true,
+    rejectFullGet: true,
+  });
+  const mock = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+    streamShaders: true,
+  });
+  const rsHandler = installRenderStatePackets(processor);
+
+  await processor.loadShaderPackUrl('/shaders/full-7gb.wgsl.pack', {
+    fetch: net.fetchImpl,
+    initialRangeBytes: dataStart,
+  });
+  assert.equal(processor.rangedPackActive, true);
+
+  // Frame 1: create v1 pipeline 12285 and v2 pipeline 94611 referencing streaming ranged shaders,
+  // then immediately issue SetPipeline + DrawIndexed while HTTP 206 range fetches are in flight.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createBuffer(50, 64, 0x10)
+      .createShaderModule(1, SHADER_STAGE.VERTEX, VS_HASH)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, FS_HASH)
+      .createRenderPipeline(12285, 1, 2, 0)
+      .createRenderPipeline2(94611, 1, 2, 0)
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(12285)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .setPipeline(94611)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+
+  // Zero validation errors while both pipelines are pending async ranged shader fetches.
+  assert.equal(processor.validationErrorCount, 0);
+  assert.equal(processor.getValidationErrors().length, 0);
+  assert.equal(processor.isAsyncPipelinePending(12285), true);
+  assert.equal(processor.isAsyncPipelinePending(94611), true);
+  assert.equal(rsHandler.isAsyncPipelinePending(12285, false), true);
+  assert.equal(rsHandler.isAsyncPipelinePending(94611, false), true);
+  assert.equal(processor.pipelines.has(12285), false);
+  assert.equal(processor.pipelines.has(94611), false);
+  assert.equal(processor.getAsyncPipelineStats().pendingAsyncPipelineSkips, 2);
+
+  // Resolve ranged fetches -> both pipelines materialize automatically with real pack shaders.
+  net.resolveAllDeferred();
+  await processor.flushPendingRangedShaders();
+
+  assert.equal(processor.asyncShaderPendingCount, 0);
+  assert.equal(processor.isAsyncPipelinePending(12285), false);
+  assert.equal(processor.isAsyncPipelinePending(94611), false);
+  assert.equal(rsHandler.isAsyncPipelinePending(12285, false), false);
+  assert.equal(rsHandler.isAsyncPipelinePending(94611, false), false);
+  assert.equal(processor.pipelines.has(12285), true);
+  assert.equal(processor.pipelines.has(94611), true);
+  assert.equal(processor.pipelines.get(12285).desc.vertex.module.code, VS_WGSL);
+  assert.equal(processor.pipelines.get(94611).desc.fragment.module.code, FS_WGSL);
+  assert.equal(processor.validationErrorCount, 0);
+
+  // Frame 2: SetPipeline + DrawIndexed now execute cleanly with real pipelines.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(12285)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .setPipeline(94611)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+
+  assert.equal(processor.getStats().realPackDrawCount, 2);
+  assert.equal(processor.getStats().skippedDrawCount, 0);
+  assert.equal(processor.validationErrorCount, 0);
+
+  processor.destroy();
+});
+
+test('live Chrome streamShaders=1 + asyncPipelines: rejected fallback PSO stays pending with 0 errors and upgrades cleanly; dedupe microtask gap stays pending', async () => {
+  const { buffer, dataStart } = buildSamplePack();
+  const net = createSyntheticRangePackServer(buffer, {
+    reportedTotalBytes: 7_510_000_000,
+    dataStartOffset: dataStart,
+    deferDataRanges: true,
+    rejectFullGet: true,
+  });
+  const mock = createRichW185MockWebGpu({ asyncPipelines: true });
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    streamShaders: true,
+    enableShaderFallback: true,
+  });
+  const rsHandler = installRenderStatePackets(processor);
+  processor.asyncPipelineCache.coalesceByDescriptor = true;
+
+  await processor.loadShaderPackUrl('/shaders/full-live.wgsl.pack', {
+    fetch: net.fetchImpl,
+    initialRangeBytes: dataStart,
+  });
+
+  // Create streaming VS/FS + CreateRenderPipeline2(12285) while fetches are in flight.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createBuffer(50, 64, 0x10)
+      .createShaderModule(1, SHADER_STAGE.VERTEX, VS_HASH)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, FS_HASH)
+      .createRenderPipeline2(12285, 1, 2, 0)
+      .finish()
+  );
+
+  // Simulate Chrome Dawn rejecting the temporary fallback PSO (e.g. MRT/target mismatch).
+  assert.equal(mock.asyncCompiles.length, 1);
+  mock.asyncCompiles[0].reject('GPUValidationError: fallback shader incompatible with target format');
+  await processor.asyncPipelineCache.whenIdle();
+  await new Promise((r) => setImmediate(r));
+
+  // Even after fallback compile rejected, 12285 is still waiting on ranged shaders -> 0 errors!
+  assert.equal(processor.validationErrorCount, 0);
+  assert.equal(rsHandler.telemetry.asyncPipelineFailures, 0);
+  assert.equal(rsHandler.stats.errors, 0);
+  assert.equal(processor.isAsyncPipelinePending(12285), true);
+  assert.equal(rsHandler.isAsyncPipelinePending(12285, false), true);
+
+  // DrawIndexed while ranged shaders are still in flight skips cleanly with 0 validation errors.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(12285)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+  assert.equal(processor.validationErrorCount, 0);
+  assert.equal(processor.getStats().skippedDrawCount, 0);
+  assert.equal(processor.getAsyncPipelineStats().pendingAsyncPipelineSkips, 1);
+
+  // Now ranged shaders resolve -> triggers async compile of the REAL pack pipeline!
+  net.resolveAllDeferred();
+  await processor.flushPendingRangedShaders();
+  assert.equal(mock.asyncCompiles.length, 2);
+  assert.equal(mock.asyncCompiles[1].desc.vertex.module.code, VS_WGSL);
+  assert.equal(mock.asyncCompiles[1].desc.fragment.module.code, FS_WGSL);
+  assert.equal(processor.isAsyncPipelinePending(12285), true);
+
+  // Resolve real async pipeline compile -> 12285 materializes!
+  mock.asyncCompiles[1].resolve();
+  await processor.asyncPipelineCache.whenIdle();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(processor.pipelines.has(12285), true);
+  assert.equal(processor.isAsyncPipelinePending(12285), false);
+
+  // Create second pipeline 56795 with identical descriptor -> hits AsyncPipelineCache dedupe
+  // synchronously (asyncCache.isPending(56795) is false before .then() runs). Verify
+  // processor.isAsyncPipelinePending(56795) stays true during the microtask gap (0 errors)!
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createRenderPipeline2(56795, 1, 2, 0)
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(56795)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+  assert.equal(processor.validationErrorCount, 0);
+  assert.equal(processor.asyncPipelineCache.isPending(56795), false);
+  assert.equal(processor.pipelines.has(56795), false);
+  assert.equal(processor.isAsyncPipelinePending(56795), true);
+
+  await new Promise((r) => setImmediate(r));
+  assert.equal(processor.pipelines.has(56795), true);
+  assert.equal(processor.isAsyncPipelinePending(56795), false);
+
+  // Frame 3: both 12285 and 56795 draw cleanly with real pack shaders.
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(12285)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .setPipeline(56795)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+  assert.equal(processor.getStats().realPackDrawCount, 2);
+  assert.equal(processor.validationErrorCount, 0);
+
+  processor.destroy();
+});
+
+test('pending ranged compute pipeline skips Dispatch cleanly with 0 errors and pipelineCache fast-key upgrades on shader resolve', async () => {
+  const { buffer, dataStart } = buildSamplePack();
+  // Part A: deferred compute pipeline (enableShaderFallback: false) without and with render_state_packets.
+  const netA = createSyntheticRangePackServer(buffer, {
+    reportedTotalBytes: 256 * 1024 * 1024,
+    dataStartOffset: dataStart,
+    deferDataRanges: true,
+    rejectFullGet: true,
+  });
+  const mockA = createMockWebGpu();
+  const procA = new WgpuCommandProcessor(mockA.device, mockA.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  await procA.loadShaderPackUrl('/shaders/comp-a.wgsl.pack', {
+    fetch: netA.fetchImpl,
+    initialRangeBytes: dataStart,
+  });
+
+  procA.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createShaderModule(3, SHADER_STAGE.COMPUTE, CS_HASH)
+      .createComputePipeline(18466, 3)
+      .setComputePipeline(18466)
+      .dispatchCompute(4, 1, 1)
+      .present()
+      .finish()
+  );
+
+  // Must skip cleanly without dispatching on an unbound compute pass or recording validation errors.
+  assert.equal(procA.validationErrorCount, 0);
+  assert.equal(procA.getStats().computeDispatches, 0);
+  assert.equal(procA.isAsyncPipelinePending(18466), true);
+  assert.equal(procA.getAsyncPipelineStats().pendingAsyncPipelineSkips, 1);
+
+  netA.resolveAllDeferred();
+  await procA.flushPendingRangedShaders();
+  assert.equal(procA.computePipelines.has(18466), true);
+  assert.equal(procA.computePipelines.get(18466).desc.compute.module.code, CS_WGSL);
+
+  procA.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .setComputePipeline(18466)
+      .dispatchCompute(4, 1, 1)
+      .present()
+      .finish()
+  );
+  assert.equal(procA.getStats().computeDispatches, 1);
+  assert.equal(procA.validationErrorCount, 0);
+  procA.destroy();
+
+  // Part B: with pipelineCache enabled, ranged shader upgrade bumps shaderModuleGenerations so
+  // getFastComputePipeline compiles the real shader instead of returning the cached fallback!
+  const netB = createSyntheticRangePackServer(buffer, {
+    reportedTotalBytes: 256 * 1024 * 1024,
+    dataStartOffset: dataStart,
+    deferDataRanges: true,
+    rejectFullGet: true,
+  });
+  const mockB = createMockWebGpu();
+  const procB = new WgpuCommandProcessor(mockB.device, mockB.ctx, {
+    format: 'bgra8unorm',
+    enablePipelineCache: true,
+    enableShaderFallback: true,
+  });
+  await procB.loadShaderPackUrl('/shaders/comp-b.wgsl.pack', {
+    fetch: netB.fetchImpl,
+    initialRangeBytes: dataStart,
+  });
+
+  procB.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createShaderModule(3, SHADER_STAGE.COMPUTE, CS_HASH)
+      .createComputePipeline(20, 3)
+      .present()
+      .finish()
+  );
+  const fallbackComp = procB.computePipelines.get(20);
+  assert.ok(fallbackComp);
+  assert.notEqual(fallbackComp.desc.compute.module.code, CS_WGSL);
+
+  netB.resolveAllDeferred();
+  await procB.flushPendingRangedShaders();
+  const realComp = procB.computePipelines.get(20);
+  assert.ok(realComp);
+  assert.notEqual(realComp, fallbackComp);
+  assert.equal(realComp.desc.compute.module.code, CS_WGSL);
+  assert.equal(procB.validationErrorCount, 0);
+  procB.destroy();
+});
+
+test('genuinely unknown and failed pipeline IDs still record SetPipeline and DrawIndexed validation errors', async () => {
+  const { buffer, dataStart } = buildSamplePack();
+  const net = createSyntheticRangePackServer(buffer, {
+    reportedTotalBytes: 256 * 1024 * 1024,
+    dataStartOffset: dataStart,
+    deferDataRanges: true,
+    rejectFullGet: true,
+  });
+  const mock = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    format: 'bgra8unorm',
+    enableShaderFallback: false,
+  });
+  installRenderStatePackets(processor);
+
+  await processor.loadShaderPackUrl('/shaders/full-err.wgsl.pack', {
+    fetch: net.fetchImpl,
+    initialRangeBytes: dataStart,
+  });
+
+  // 1. Genuinely unknown pipeline ID 77777 (never created) MUST still record validation errors!
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .createBuffer(50, 64, 0x10)
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(77777)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+
+  const unknownErrors = processor.getValidationErrors().map((e) => e.message);
+  assert.equal(processor.validationErrorCount, 2);
+  assert.ok(unknownErrors.some((m) => /render pipeline 77777 not found/.test(m)));
+  assert.ok(unknownErrors.some((m) => /skipped draw: render pipeline 77777 is unavailable/.test(m)));
+
+  // 2. Pipeline whose ranged shader fetch genuinely fails MUST record validation errors after failure settles!
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .createShaderModule(1, SHADER_STAGE.VERTEX, VS_HASH)
+      .createShaderModule(2, SHADER_STAGE.FRAGMENT, FS_HASH)
+      .createRenderPipeline(88888, 1, 2, 0)
+      .finish()
+  );
+  assert.equal(processor.isAsyncPipelinePending(88888), true);
+
+  // Reject all deferred range fetches with a non-retryable HTTP 404 error.
+  while (net.deferredRanges.length > 0) {
+    const err = new Error('HTTP 404 range fetch error');
+    err.httpStatus = 404;
+    net.deferredRanges.shift().reject(err);
+  }
+  await processor.flushPendingRangedShaders();
+
+  assert.equal(processor.isAsyncPipelinePending(88888), false);
+  assert.equal(processor.pipelines.has(88888), false);
+
+  const countBeforeDraw = processor.validationErrorCount;
+  processor.executeCommandBuffer(
+    new BinaryCommandBuilder()
+      .beginFrame()
+      .setIndexBuffer(50, 0, 0)
+      .setPipeline(88888)
+      .drawIndexed(6, 1, 0, 0, 0)
+      .present()
+      .finish()
+  );
+  assert.equal(processor.validationErrorCount, countBeforeDraw + 2);
+  const allErrors = processor.getValidationErrors().map((e) => e.message);
+  assert.ok(allErrors.some((m) => /render pipeline 88888 not found/.test(m)));
+  assert.ok(allErrors.some((m) => /skipped draw: render pipeline 88888 is unavailable/.test(m)));
+
+  processor.destroy();
 });

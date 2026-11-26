@@ -2464,6 +2464,8 @@ class WgpuCommandProcessor {
       computePassIdx: 0,
       timerSupported: false,
       activePipelineId: null,
+      activePipeline: null,
+      activeComputePipelineId: null,
       specializedActiveKey: null,
       cachedFrameSummary: null,
     };
@@ -6523,13 +6525,21 @@ class WgpuCommandProcessor {
    * @returns {boolean}
    */
   isAsyncPipelinePending(id) {
-    if (
-      this._pendingRangedPipelines &&
-      this._pendingRangedPipelines.has(id) &&
-      !this.pipelines.has(id) &&
-      !this.computePipelines.has(id)
-    ) {
-      return true;
+    const hasLivePipeline = this.pipelines.has(id) || this.computePipelines.has(id);
+    if (!hasLivePipeline) {
+      if (this._pendingRangedPipelines && this._pendingRangedPipelines.has(id)) {
+        return true;
+      }
+      const renderStateExt = this._getRenderStateExtension();
+      if (
+        renderStateExt &&
+        ((renderStateExt.pendingAsyncRenderPipelines &&
+          renderStateExt.pendingAsyncRenderPipelines.has(id)) ||
+          (renderStateExt.pendingAsyncComputePipelines &&
+            renderStateExt.pendingAsyncComputePipelines.has(id)))
+      ) {
+        return true;
+      }
     }
     const cache = this.asyncPipelineCache;
     if (!cache || typeof cache.isPending !== 'function') {
@@ -8928,11 +8938,15 @@ class WgpuCommandProcessor {
       if (!uniqueShaderIds.includes(sid)) {
         uniqueShaderIds.push(sid);
       }
-      if (this._isRangedShaderPending(sid)) {
+      const sidPending = this._isRangedShaderPending(sid);
+      if (sidPending) {
         anyPending = true;
       }
       const entry = this.shaderModules.get(sid);
-      if (entry && entry.pendingRanged === true) {
+      if (
+        (entry && entry.pendingRanged === true) ||
+        (sidPending && (!entry || entry.rangedFailed === true || (!entry.module && !entry.code)))
+      ) {
         deferredOnly = true;
       }
     }
@@ -8998,7 +9012,7 @@ class WgpuCommandProcessor {
       let allShadersReady = true;
       for (let j = 0; j < rec.shaderIds.length; j += 1) {
         const entry = this.shaderModules.get(rec.shaderIds[j]);
-        if (!entry || entry.pendingRanged) {
+        if (!entry || entry.pendingRanged || entry.rangedFailed) {
           allShadersReady = false;
           break;
         }
@@ -9072,6 +9086,15 @@ class WgpuCommandProcessor {
       const cur = this.shaderModules.get(id);
       if (cur && cur.pendingRanged) {
         cur.pendingRanged = false;
+        cur.rangedFailed = true;
+        if (
+          !cur.module &&
+          cur.source !== 'pack' &&
+          cur.source !== 'builtin' &&
+          cur.source !== 'fallback'
+        ) {
+          this.shaderModules.delete(id);
+        }
       }
       this._rangedShaderErrors += 1;
       if (errMsg !== undefined && errMsg !== null) {
@@ -9136,6 +9159,7 @@ class WgpuCommandProcessor {
           return null;
         }
         this.shaderModules.set(id, compiled);
+        this._shaderModuleGenerations.set(id, ++this._nextShaderModuleGen);
         this._invalidatePipelinesReferencingShader(id);
         this._rangedShaderReady += 1;
         this._onRangedShaderSettled(id, true);
@@ -9206,6 +9230,7 @@ class WgpuCommandProcessor {
       }
     }
 
+    const wasInFlightRanged = this._inFlightRangedShaders.has(id);
     if (!rangedPackCache) {
       this._inFlightRangedShaders.delete(id);
     }
@@ -9253,6 +9278,8 @@ class WgpuCommandProcessor {
           rangedPackCache,
           rangedLookupKey
         );
+      } else if (wasInFlightRanged || this._pendingRangedPipelines.size > 0) {
+        this._onRangedShaderSettled(id, true);
       }
       return;
     }
@@ -9275,6 +9302,8 @@ class WgpuCommandProcessor {
         rangedPackCache,
         rangedLookupKey
       );
+    } else if (compiled && (wasInFlightRanged || this._pendingRangedPipelines.size > 0)) {
+      this._onRangedShaderSettled(id, true);
     }
   }
 
@@ -9443,7 +9472,9 @@ class WgpuCommandProcessor {
         pipeline = this.device.createRenderPipeline(descriptor);
       }
     } catch (err) {
-      this._recordOpValidationError('CreateRenderPipeline', err);
+      if (!pendingRanged.pending) {
+        this._recordOpValidationError('CreateRenderPipeline', err);
+      }
       return;
     }
     if (!pipeline) {
@@ -9809,7 +9840,9 @@ class WgpuCommandProcessor {
         pipeline = this.device.createComputePipeline(built.descriptor);
       }
     } catch (err) {
-      this._recordOpValidationError('CreateComputePipeline', err);
+      if (!this._pendingRangedPipelines.has(built.id)) {
+        this._recordOpValidationError('CreateComputePipeline', err);
+      }
       return;
     }
     if (!pipeline) {
@@ -10066,6 +10099,7 @@ class WgpuCommandProcessor {
     if (!this.extension || typeof this.extension.handlePacket !== 'function') {
       return;
     }
+    let pendingRangedPipeline = false;
     if (opcode === OPCODES.CREATE_RENDER_PIPELINE2 && payloadBytes >= 16 + 376) {
       const pipeId = view.getUint32(payloadOffset, true);
       const vsShaderId = view.getUint32(payloadOffset + 4, true);
@@ -10079,6 +10113,7 @@ class WgpuCommandProcessor {
         payloadOffset,
         payloadBytes
       );
+      pendingRangedPipeline = pendingRanged.pending;
       if (pendingRanged.deferredOnly) {
         return;
       }
@@ -10094,6 +10129,7 @@ class WgpuCommandProcessor {
         payloadOffset,
         payloadBytes
       );
+      pendingRangedPipeline = pendingRanged.pending;
       if (pendingRanged.deferredOnly) {
         return;
       }
@@ -10113,7 +10149,9 @@ class WgpuCommandProcessor {
     try {
       handled = Boolean(this.extension.handlePacket(opcode, view, payloadOffset, payloadBytes));
     } catch (err) {
-      this._recordOpValidationError(opcodeLabel(opcode), err);
+      if (!pendingRangedPipeline) {
+        this._recordOpValidationError(opcodeLabel(opcode), err);
+      }
       return;
     }
 
@@ -10123,10 +10161,12 @@ class WgpuCommandProcessor {
       typeof renderStateExt.stats.errors === 'number' &&
       renderStateExt.stats.errors > prevRsErrors
     ) {
-      this._recordOpValidationError(
-        opcodeLabel(opcode),
-        renderStateExt.lastError || 'malformed or invalid ABI v2 packet'
-      );
+      if (!pendingRangedPipeline) {
+        this._recordOpValidationError(
+          opcodeLabel(opcode),
+          renderStateExt.lastError || 'malformed or invalid ABI v2 packet'
+        );
+      }
       return;
     }
 
@@ -10136,10 +10176,12 @@ class WgpuCommandProcessor {
       typeof this.extension.stats.errors === 'number' &&
       this.extension.stats.errors > prevExtErrors
     ) {
-      this._recordOpValidationError(
-        opcodeLabel(opcode),
-        this.extension.lastError || 'malformed or invalid extension packet'
-      );
+      if (!pendingRangedPipeline) {
+        this._recordOpValidationError(
+          opcodeLabel(opcode),
+          this.extension.lastError || 'malformed or invalid extension packet'
+        );
+      }
       return;
     }
 
@@ -10373,6 +10415,8 @@ class WgpuCommandProcessor {
   _clearPresentPassBindings() {
     const ps = this._presentState;
     ps.activePipelineId = null;
+    ps.activePipeline = null;
+    ps.activeComputePipelineId = null;
     ps.specializedActiveKey = null;
     if (this._boundBindGroups.size > 0) {
       for (const entry of this._boundBindGroups.values()) {
@@ -10570,7 +10614,9 @@ class WgpuCommandProcessor {
     const pipeMeta =
       activePipelineId !== null ? this._pipelineMeta.get(activePipelineId) || null : null;
     const activePipeline =
-      activePipelineId !== null ? this.pipelines.get(activePipelineId) || null : null;
+      activePipelineId !== null
+        ? this.pipelines.get(activePipelineId) || ps.activePipeline || null
+        : null;
     if (activePipelineId !== null && !activePipeline && ps.specializedActiveKey === null) {
       if (this.isAsyncPipelinePending(activePipelineId)) {
         // W103: still compiling; draw normally on a later frame once it is ready.
@@ -10746,6 +10792,8 @@ class WgpuCommandProcessor {
     ps.computePassIdx = 0;
     ps.timerSupported = Boolean(this.passTimer && this.passTimer.supported);
     ps.activePipelineId = null;
+    ps.activePipeline = null;
+    ps.activeComputePipelineId = null;
     ps.specializedActiveKey = null;
     ps.cachedFrameSummary = null;
     this._clearPresentPassBindings();
@@ -10768,11 +10816,13 @@ class WgpuCommandProcessor {
         case 'setPipeline': {
           const pass = this._ensurePresentRenderPass();
           ps.activePipelineId = cmd.pipelineId;
+          ps.activePipeline = null;
           ps.specializedActiveKey = null;
           const pipeline = this.pipelines.get(cmd.pipelineId) || cmd.pipeline || null;
           if (pipeline) {
             try {
               pass.setPipeline(pipeline);
+              ps.activePipeline = pipeline;
             } catch (err) {
               this._recordOpValidationError('SetPipeline', err);
             }
@@ -10844,6 +10894,7 @@ class WgpuCommandProcessor {
         }
         case 'setComputePipeline': {
           const pass = this._ensurePresentComputePass();
+          ps.activeComputePipelineId = cmd.pipelineId;
           const pipeline = this.computePipelines.get(cmd.pipelineId);
           if (pipeline) {
             try {
@@ -10851,10 +10902,27 @@ class WgpuCommandProcessor {
             } catch (err) {
               this._recordOpValidationError('SetComputePipeline', err);
             }
+          } else if (!this.isAsyncPipelinePending(cmd.pipelineId)) {
+            this._recordOpValidationError(
+              'SetComputePipeline',
+              `compute pipeline ${cmd.pipelineId} not found`
+            );
           }
           break;
         }
         case 'dispatchCompute': {
+          const activeComputeId = ps.activeComputePipelineId;
+          if (activeComputeId !== null && !this.computePipelines.get(activeComputeId)) {
+            if (this.isAsyncPipelinePending(activeComputeId)) {
+              this._pendingAsyncPipelineSkips += 1;
+              break;
+            }
+            this._recordOpValidationError(
+              'DispatchCompute',
+              `skipped dispatch: compute pipeline ${activeComputeId} is unavailable`
+            );
+            break;
+          }
           const pass = this._ensurePresentComputePass();
           try {
             pass.dispatchWorkgroups(cmd.workgroupX, cmd.workgroupY, cmd.workgroupZ);
@@ -10880,6 +10948,18 @@ class WgpuCommandProcessor {
           const buffer = this.buffers.get(cmd.bufferId);
           if (!buffer) {
             this._recordOpValidationError('DispatchIndirect', `indirect buffer ${cmd.bufferId} not found`);
+            break;
+          }
+          const activeComputeId = ps.activeComputePipelineId;
+          if (activeComputeId !== null && !this.computePipelines.get(activeComputeId)) {
+            if (this.isAsyncPipelinePending(activeComputeId)) {
+              this._pendingAsyncPipelineSkips += 1;
+              break;
+            }
+            this._recordOpValidationError(
+              'DispatchIndirect',
+              `skipped dispatch: compute pipeline ${activeComputeId} is unavailable`
+            );
             break;
           }
           const pass = this._ensurePresentComputePass();
