@@ -95,8 +95,12 @@
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
 //   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s8 XSpeechSynthesizerEnumerateInstalledVoices(2) h,
-//     s9 XSpeechSynthesizerCreate(1) h (one pointer to a handle field; silent synthesizer: fixed handle,
-//     empty WAVE streams, zero installed voices).
+//     s9 XSpeechSynthesizerCreate(1) h, s10 XSpeechSynthesizerCloseHandle(1) h,
+//     s11 XSpeechSynthesizerSetDefaultVoice(1) h, s12 XSpeechSynthesizerSetCustomVoice(2) h,
+//     s13 XSpeechSynthesizerCreateStreamFromText(3) h, s14 XSpeechSynthesizerCloseStreamHandle(1) h,
+//     s15 XSpeechSynthesizerGetStreamDataSize(2) h, s16 XSpeechSynthesizerGetStreamData(4) h,
+//     s21 XSpeechSynthesizerCreateStreamFromSsml(3) h (silent synthesizer: fixed handle,
+//     empty 16 kHz mono WAVE streams, zero installed voices).
 //   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
 //     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
 //     --save-dir, never any cloud sync; s5/s6 by public header order), s13
@@ -1176,11 +1180,13 @@ public:
     }
 };
 
-// XSpeechSynthesizer: a truthful silent synthesizer. Create returns a fixed handle, every stream
-// (from text or SSML) is a valid 16 kHz mono 16-bit PCM WAVE with no samples, size / get calls
-// report that stream, closing is free, and voice enumeration callbacks never run. Slots after s9
-// follow the public header order (close, stream from text, stream from SSML, close stream, stream
-// size, stream data).
+// XSpeechSynthesizer: a truthful silent synthesizer. Create returns a fixed handle, voice
+// selection (default or custom) succeeds, every stream (from text or SSML) is a valid 16 kHz mono
+// 16-bit PCM WAVE with no samples, size / get calls report that stream, closing is free, and voice
+// enumeration callbacks never run.
+// Verified GDK vtable slots: s8 EnumerateInstalledVoices, s9 Create, s10 CloseHandle,
+// s11 SetDefaultVoice, s12 SetCustomVoice, s13 CreateStreamFromText, s14 CloseStreamHandle,
+// s15 GetStreamDataSize, s16 GetStreamData, s21 CreateStreamFromSsml.
 class SpeechApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XSpeechSynthesizer";
@@ -1223,10 +1229,22 @@ public:
         return S_OK_HR;
     }
 
-    // s10: close (free).
+    // s10: XSpeechSynthesizerCloseHandle(XSpeechSynthesizerHandle).
     int32_t Close(uint64_t /*handle*/) { return S_OK_HR; }
 
-    // s11 / s12: CreateStreamFromText / FromSsml(handle, text, streamHandle*).
+    // s11: XSpeechSynthesizerSetDefaultVoice(XSpeechSynthesizerHandle).
+    int32_t SetDefaultVoice(uint64_t /*handle*/) { return S_OK_HR; }
+
+    // s12: XSpeechSynthesizerSetCustomVoice(XSpeechSynthesizerHandle, const char* voiceId).
+    // Accepts voice selection on the silent synthesizer; rejects a null voiceId.
+    int32_t SetCustomVoice(uint64_t /*handle*/, uint64_t voice_id) {
+        if (voice_id == 0) {
+            return E_INVALIDARG_HR;
+        }
+        return S_OK_HR;
+    }
+
+    // s13 / s21: CreateStreamFromText / CreateStreamFromSsml(handle, text/ssml, streamHandle*).
     int32_t CreateStream(uint64_t /*handle*/, uint64_t /*text*/, GuestPtr<uint64_t> stream) {
         if (stream.is_null()) {
             return E_INVALIDARG_HR;
@@ -1235,10 +1253,10 @@ public:
         return S_OK_HR;
     }
 
-    // s13: close stream (free).
+    // s14: XSpeechSynthesizerCloseStreamHandle(XSpeechSynthesizerStreamHandle).
     int32_t CloseStream(uint64_t /*stream*/) { return S_OK_HR; }
 
-    // s14: GetStreamSize(stream, uint64_t* size).
+    // s15: XSpeechSynthesizerGetStreamDataSize(stream, size_t* size).
     int32_t GetStreamSize(uint64_t /*stream*/, GuestPtr<uint64_t> size) {
         if (size.is_null()) {
             return E_INVALIDARG_HR;
@@ -1247,7 +1265,7 @@ public:
         return S_OK_HR;
     }
 
-    // s15: GetStreamData(stream, bufferSize, buffer, uint64_t* used).
+    // s16: XSpeechSynthesizerGetStreamData(stream, bufferSize, buffer, size_t* used).
     int32_t GetStreamData(uint64_t /*stream*/, uint64_t buffer_size, uint64_t buffer, GuestPtr<uint64_t> used) {
         if (buffer == 0) {
             return E_INVALIDARG_HR;
@@ -2270,15 +2288,17 @@ constexpr auto kPlsTable = slot_table<2>({
 constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
 using SP = M<SpeechApi>;
-constexpr auto kSpeechTable = slot_table<13>({
+constexpr auto kSpeechTable = slot_table<19>({
     {8, SP::method<&SpeechApi::EnumerateInstalledVoices>("XSpeechSynthesizerEnumerateInstalledVoices")},
     {9, SP::method<&SpeechApi::Create>("XSpeechSynthesizerCreate")},
-    {10, SP::method<&SpeechApi::Close>("XSpeechSynthesizerCloseInstance")},
-    {11, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromText")},
-    {12, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromSsml")},
-    {13, SP::method<&SpeechApi::CloseStream>("XSpeechSynthesizerCloseStreamHandle")},
-    {14, SP::method<&SpeechApi::GetStreamSize>("XSpeechSynthesizerGetStreamDataSize")},
-    {15, SP::method<&SpeechApi::GetStreamData>("XSpeechSynthesizerGetStreamData")},
+    {10, SP::method<&SpeechApi::Close>("XSpeechSynthesizerCloseHandle")},
+    {11, SP::method<&SpeechApi::SetDefaultVoice>("XSpeechSynthesizerSetDefaultVoice")},
+    {12, SP::method<&SpeechApi::SetCustomVoice>("XSpeechSynthesizerSetCustomVoice")},
+    {13, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromText")},
+    {14, SP::method<&SpeechApi::CloseStream>("XSpeechSynthesizerCloseStreamHandle")},
+    {15, SP::method<&SpeechApi::GetStreamSize>("XSpeechSynthesizerGetStreamDataSize")},
+    {16, SP::method<&SpeechApi::GetStreamData>("XSpeechSynthesizerGetStreamData")},
+    {21, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromSsml")},
 });
 constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
                                                             kSpeechTable.slots, {.slot_count = 32});

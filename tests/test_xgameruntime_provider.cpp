@@ -507,10 +507,13 @@ void test_query_api() {
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
     {
-        // XSpeechSynthesizer: silent synthesizer. Fixed handle, empty 16 kHz mono WAVE streams,
-        // and no installed voices (slot 8 returns S_OK without invoking the callback).
+        // XSpeechSynthesizer (O39 verified vtable layout): silent synthesizer across all 10 slots
+        // (s8 EnumerateInstalledVoices, s9 Create, s10 CloseHandle, s11 SetDefaultVoice,
+        // s12 SetCustomVoice, s13 CreateStreamFromText, s14 CloseStreamHandle,
+        // s15 GetStreamDataSize, s16 GetStreamData, s21 CreateStreamFromSsml).
         const uint64_t speech = fx.query(com::make_guid("3e241977-6237-41e9-8559-102c2d9983f1"),
                                          com::make_guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"));
+        // s8: XSpeechSynthesizerEnumerateInstalledVoices(context, callback)
         g_record_calls = 0;
         CHECK(hr32(fx.vcall(speech, 8, {0x1234, kRecord})) == playgta6::os::gdk::S_OK_HR);
         CHECK(g_record_calls == 0);
@@ -518,31 +521,65 @@ void test_query_api() {
         CHECK(g_record_calls == 0);
         CHECK(hr32(fx.vcall(speech, 8, {0x1234, 0})) == com::E_INVALIDARG_HR);
         CHECK(g_record_calls == 0);
+
+        // s9: XSpeechSynthesizerCreate(handle*)
         const uint64_t handle = fx.alloc(8);
         CHECK(com::write_guest(handle, uint64_t{0x1234}));
         CHECK(hr32(fx.vcall(speech, 9, {handle})) == playgta6::os::gdk::S_OK_HR);
         const uint64_t h = load64(handle);
         CHECK(h != 0 && h != 0x1234);
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
+
+        // s11: XSpeechSynthesizerSetDefaultVoice(handle)
+        CHECK(hr32(fx.vcall(speech, 11, {h})) == playgta6::os::gdk::S_OK_HR);
+
+        // s12: XSpeechSynthesizerSetCustomVoice(handle, voiceId)
+        const uint64_t voice_id = fx.cstring("en-US-Voice");
+        CHECK(hr32(fx.vcall(speech, 12, {h, voice_id})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 12, {h, 0})) == com::E_INVALIDARG_HR);
+
+        // s13: XSpeechSynthesizerCreateStreamFromText(handle, text, stream*)
         const uint64_t stream_out = fx.alloc(8);
-        CHECK(hr32(fx.vcall(speech, 11, {h, 0, stream_out})) == playgta6::os::gdk::S_OK_HR);
-        const uint64_t stream = load64(stream_out);
-        CHECK(stream != 0);
-        CHECK(hr32(fx.vcall(speech, 12, {h, 0, stream_out})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t text_str = fx.cstring("Hello");
+        CHECK(com::write_guest(stream_out, uint64_t{0}));
+        CHECK(hr32(fx.vcall(speech, 13, {h, text_str, stream_out})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t text_stream = load64(stream_out);
+        CHECK(text_stream != 0);
+        CHECK(hr32(fx.vcall(speech, 13, {h, text_str, 0})) == com::E_INVALIDARG_HR);
+
+        // s21: XSpeechSynthesizerCreateStreamFromSsml(handle, ssml, stream*)
+        const uint64_t ssml_str = fx.cstring("<speak>Hello</speak>");
+        CHECK(com::write_guest(stream_out, uint64_t{0}));
+        CHECK(hr32(fx.vcall(speech, 21, {h, ssml_str, stream_out})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t ssml_stream = load64(stream_out);
+        CHECK(ssml_stream != 0);
+        CHECK(hr32(fx.vcall(speech, 21, {h, ssml_str, 0})) == com::E_INVALIDARG_HR);
+
+        // s15: XSpeechSynthesizerGetStreamDataSize(stream, size*)
         const uint64_t size = fx.alloc(8);
-        CHECK(hr32(fx.vcall(speech, 14, {stream, size})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 15, {ssml_stream, size})) == playgta6::os::gdk::S_OK_HR);
         CHECK(load64(size) == 44);
+        CHECK(hr32(fx.vcall(speech, 15, {ssml_stream, 0})) == com::E_INVALIDARG_HR);
+
+        // s16: XSpeechSynthesizerGetStreamData(stream, bufferSize, buffer, used*)
         const uint64_t buf = fx.alloc(64);
         const uint64_t used = fx.alloc(8);
-        CHECK(hr32(fx.vcall(speech, 15, {stream, 10, buf, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
-        CHECK(hr32(fx.vcall(speech, 15, {stream, 64, buf, used})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 16, {ssml_stream, 10, buf, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(speech, 16, {ssml_stream, 64, 0, used})) == com::E_INVALIDARG_HR);
+        CHECK(hr32(fx.vcall(speech, 16, {ssml_stream, 64, buf, used})) == playgta6::os::gdk::S_OK_HR);
         CHECK(load64(used) == 44);
         uint8_t wav[44] = {};
         CHECK(com::read_guest(buf, wav, sizeof(wav)));
         CHECK(std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVE", 4) == 0);
         CHECK(wav[22] == 1 && wav[24] == 0x80 && wav[25] == 0x3e && wav[34] == 16);
         CHECK(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0);
-        CHECK(hr32(fx.vcall(speech, 13, {stream})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 16, {ssml_stream, 64, buf, 0})) == playgta6::os::gdk::S_OK_HR);
+
+        // s14: XSpeechSynthesizerCloseStreamHandle(stream)
+        CHECK(hr32(fx.vcall(speech, 14, {text_stream})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 14, {ssml_stream})) == playgta6::os::gdk::S_OK_HR);
+
+        // s10: XSpeechSynthesizerCloseHandle(handle)
         CHECK(hr32(fx.vcall(speech, 10, {h})) == playgta6::os::gdk::S_OK_HR);
     }
     {
