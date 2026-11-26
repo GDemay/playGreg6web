@@ -442,6 +442,8 @@ void unregister_dstorage_virtual_file(std::string_view path);
 void clear_dstorage_virtual_files();
 void set_dstorage_host_callbacks(DStorageHostOpenCallback open_cb,
                                  DStorageHostReadCallback read_cb);
+// Direct synchronous read on a Pg6IDStorageFile without a synthetic host queue/status roundtrip.
+Pg6HResult dstorage_file_read_at(Pg6IDStorageFile* file, uint64_t offset, void* dst, uint32_t size);
 void reset_dstorage_for_testing();
 
 // xg_xs tile mode & resource dimension constants.

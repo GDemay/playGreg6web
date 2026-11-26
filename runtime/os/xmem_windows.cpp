@@ -3,10 +3,12 @@
 #include "os/xmem_windows.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 
 namespace playgta6::os::xmem_windows {
@@ -26,8 +28,8 @@ PlacementPolicy default_policy() {
 }
 
 struct State {
-    std::mutex mutex;
-    PlacementPolicy policy = default_policy();
+    std::shared_mutex mutex;
+    std::atomic<PlacementPolicy> policy{default_policy()};
     uint64_t next_phantom = kPhantomBase;
     std::map<uint64_t, uint64_t> phantom;  // base -> size
     std::map<uint64_t, Window> windows;    // base -> window
@@ -78,15 +80,11 @@ bool classify(uint32_t allocation_type, uint32_t protect, uint64_t size, WindowK
 }
 
 PlacementPolicy policy() {
-    State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    return s.policy;
+    return state().policy.load(std::memory_order_acquire);
 }
 
 void set_policy(PlacementPolicy policy) {
-    State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    s.policy = policy;
+    state().policy.store(policy, std::memory_order_release);
 }
 
 bool place_phantom(WindowKind kind) {
@@ -104,7 +102,7 @@ uint64_t reserve_phantom(uint64_t size) {
         return 0;
     }
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
     const uint64_t bytes = align_up(size, kWindowPageSize);
     if (bytes > kPhantomLimit - s.next_phantom) {
         return 0;
@@ -120,7 +118,7 @@ bool is_phantom(uint64_t va, uint64_t len) {
         return false;
     }
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     auto it = s.phantom.upper_bound(va);
     if (it == s.phantom.begin()) {
         return false;
@@ -135,7 +133,7 @@ void note_window(const Window& window) {
     bool paired = false;
     {
         State& s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::unique_lock<std::shared_mutex> lock(s.mutex);
         s.windows[window.base] = window;
         // Pair with an unpaired window of the other kind and the same size (the most recent one).
         for (auto it = s.windows.rbegin(); it != s.windows.rend(); ++it) {
@@ -169,7 +167,7 @@ void note_window(const Window& window) {
 
 bool forget_window(uint64_t base) {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
     auto it = s.windows.find(base);
     if (it == s.windows.end()) {
         return false;
@@ -190,7 +188,7 @@ bool forget_window(uint64_t base) {
 
 std::vector<Window> windows() {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     std::vector<Window> out;
     for (const auto& [base, w] : s.windows) {
         out.push_back(w);
@@ -200,13 +198,13 @@ std::vector<Window> windows() {
 
 std::vector<AliasPair> alias_pairs() {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     return s.pairs;
 }
 
 bool find_window(uint64_t va, uint64_t len, Window* out) {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     return window_containing_locked(s, va, len, out);
 }
 
@@ -215,7 +213,7 @@ uint64_t add_alias_listener(AliasListener listener) {
     uint64_t id = 0;
     {
         State& s = state();
-        std::lock_guard<std::mutex> lock(s.mutex);
+        std::unique_lock<std::shared_mutex> lock(s.mutex);
         id = s.next_listener++;
         s.listeners.emplace(id, listener);
         existing = s.pairs;
@@ -228,14 +226,14 @@ uint64_t add_alias_listener(AliasListener listener) {
 
 void remove_alias_listener(uint64_t id) {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
     s.listeners.erase(id);
 }
 
 PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> ranges, uint64_t, uint64_t pool_pages) {
     PageMappingResult r;
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
     ++s.gpu_mapping_updates;
     for (const PageMappingRange& range : ranges) {
         uint64_t page_va = range.gpu_va & ~(kWindowPageSize - 1);
@@ -284,20 +282,20 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
 
 int64_t gpu_page_pool_index(uint64_t gpu_va) {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     auto it = s.gpu_pages.find(gpu_va & ~(kWindowPageSize - 1));
     return it == s.gpu_pages.end() ? -1 : static_cast<int64_t>(it->second);
 }
 
 void note_cpu_window_mapping(int64_t delta_bytes) {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
     s.cpu_window_mapped += delta_bytes;
 }
 
 Accounting accounting() {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
+    std::shared_lock<std::shared_mutex> lock(s.mutex);
     Accounting a;
     for (const auto& [base, w] : s.windows) {
         if (w.kind == WindowKind::Cpu) {
@@ -369,8 +367,8 @@ FitResult plan_fit(std::span<const PlannedReservation> sequence, uint64_t pool_b
 
 void reset_for_testing() {
     State& s = state();
-    std::lock_guard<std::mutex> lock(s.mutex);
-    s.policy = default_policy();
+    std::unique_lock<std::shared_mutex> lock(s.mutex);
+    s.policy.store(default_policy(), std::memory_order_release);
     s.next_phantom = kPhantomBase;
     s.phantom.clear();
     s.windows.clear();
