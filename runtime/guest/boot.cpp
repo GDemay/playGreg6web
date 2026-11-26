@@ -61,6 +61,8 @@ constexpr uint64_t kDefaultStackSize = uint64_t{1} << 20;
 constexpr size_t kMaxTlsCallbacks = 256;
 constexpr size_t kMaxScanBytes = size_t{16} << 20;
 constexpr uint64_t kWallCheckMask = 255;  // check the wall clock every 256 dispatches
+constexpr uint32_t kDispatchBatchSize = 256;  // per-thread dispatch batch flush threshold
+constexpr size_t kRecentPerThread = 32;       // per-thread lock-free recent-import ring size
 constexpr uint32_t kTlsDirectoryIndex = 9;
 
 // Thrown to leave guest code once a boot outcome is recorded.
@@ -176,6 +178,113 @@ struct RecentImport {
     uint64_t args[5] = {};  // rcx rdx r8 r9 [rsp+0x28] at the call
     uint32_t thread = 0;    // guest thread id (TEB ClientId)
     uint64_t return_address = 0;  // guest return address of the call
+    const GuestThreadContext* ctx = nullptr;  // owning guest thread context (for thread_last)
+};
+
+// Shared dispatch accumulator owned by a single boot run; kept alive via shared_ptr by
+// thread-local observers so thread-exit flushes cannot race with reset_boot() or static teardown.
+struct DispatchBatchTarget {
+    std::atomic<uint64_t> dispatches{0};
+    std::atomic<bool> active{true};
+};
+
+// Per-thread lock-free ring buffer of recent post-present import calls (single writer, concurrent
+// readers via per-entry sequence lock). Eliminates global BootState::mutex contention on steady-
+// state post-present import dispatches.
+struct alignas(64) ThreadSlot {
+    struct Entry {
+        std::atomic<uint64_t> version{0};  // odd = write in progress, even = published
+        std::atomic<uint64_t> seq{0};
+        std::atomic<size_t> import_index{0};
+        std::atomic<uint64_t> args[5] = {};
+        std::atomic<uint32_t> thread{0};
+        std::atomic<uint64_t> return_address{0};
+        std::atomic<const GuestThreadContext*> ctx{nullptr};
+    };
+
+    std::atomic<uint64_t> write_count{0};
+    std::atomic<uint32_t> thread_id{0};
+    Entry ring[kRecentPerThread];
+
+    // Live / exited snapshot of an O16 lazy thread's GuestState (cold path only: touched once
+    // at thread init, once at thread exit, and during report synthesis). Prevents build_report()
+    // from dereferencing a dangling pointer into an exited thread's TLS.
+    std::mutex exit_mutex;
+    const GuestState* live_state = nullptr;
+    GuestState exited_state{};
+    bool has_exited_state = false;
+
+    void record(const RecentImport& entry) noexcept {
+        if (entry.thread != 0) {
+            thread_id.store(entry.thread, std::memory_order_relaxed);
+        }
+        const uint64_t idx = write_count.load(std::memory_order_relaxed);
+        Entry& slot = ring[idx % kRecentPerThread];
+        const uint64_t v = slot.version.load(std::memory_order_relaxed);
+        slot.version.store(v + 1, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
+        slot.seq.store(entry.seq, std::memory_order_relaxed);
+        slot.import_index.store(entry.import_index, std::memory_order_relaxed);
+        for (size_t i = 0; i < 5; ++i) {
+            slot.args[i].store(entry.args[i], std::memory_order_relaxed);
+        }
+        slot.thread.store(entry.thread, std::memory_order_relaxed);
+        slot.return_address.store(entry.return_address, std::memory_order_relaxed);
+        slot.ctx.store(entry.ctx, std::memory_order_relaxed);
+        slot.version.store(v + 2, std::memory_order_release);
+        write_count.store(idx + 1, std::memory_order_release);
+    }
+
+    static bool read_entry(const Entry& slot, RecentImport& out) noexcept {
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            const uint64_t v1 = slot.version.load(std::memory_order_acquire);
+            if (v1 == 0 || (v1 & 1u) != 0) {
+                continue;
+            }
+            RecentImport tmp{};
+            tmp.seq = slot.seq.load(std::memory_order_relaxed);
+            tmp.import_index = slot.import_index.load(std::memory_order_relaxed);
+            for (size_t i = 0; i < 5; ++i) {
+                tmp.args[i] = slot.args[i].load(std::memory_order_relaxed);
+            }
+            tmp.thread = slot.thread.load(std::memory_order_relaxed);
+            tmp.return_address = slot.return_address.load(std::memory_order_relaxed);
+            tmp.ctx = slot.ctx.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            const uint64_t v2 = slot.version.load(std::memory_order_relaxed);
+            if (v1 == v2) {
+                out = tmp;
+                return out.seq != 0;
+            }
+        }
+        return false;
+    }
+
+    void snapshot_ring(std::vector<RecentImport>& out) const {
+        const uint64_t total = write_count.load(std::memory_order_acquire);
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(total, kRecentPerThread));
+        const uint64_t start = total - count;
+        for (uint64_t k = start; k < total; ++k) {
+            RecentImport item;
+            if (read_entry(ring[k % kRecentPerThread], item)) {
+                out.push_back(item);
+            }
+        }
+    }
+
+    bool read_latest(RecentImport& out) const noexcept {
+        const uint64_t total = write_count.load(std::memory_order_acquire);
+        if (total == 0) {
+            return false;
+        }
+        if (read_entry(ring[(total - 1) % kRecentPerThread], out)) {
+            return true;
+        }
+        if (total >= 2) {
+            return read_entry(ring[(total - 2) % kRecentPerThread], out);
+        }
+        return false;
+    }
 };
 
 // First call of an API worth a timeline entry (see kTimelineApis).
@@ -240,8 +349,9 @@ std::atomic<ReportExtension> g_report_extension{nullptr};
 struct BootState {
     std::mutex mutex;  // recent ring, survey list
 
-    bool active = false;   // a boot's process exists (run_boot ran, reset_boot not yet)
-    bool running = false;  // guest code of the boot may run
+    bool active = false;                 // a boot's process exists (run_boot ran, reset_boot not yet)
+    std::atomic<bool> running{false};    // guest code of the boot may run
+    std::atomic<uint64_t> generation{1}; // bumped on every reset_boot()
     VirtualMemoryArena* arena = nullptr;
 
     // Options.
@@ -273,6 +383,7 @@ struct BootState {
     // Imports of all modules.
     std::vector<ImportRecord> imports;
     std::vector<size_t> by_slot;  // import indices sorted by (image_base, slot_rva)
+    std::vector<long> synthetic_to_import;  // O(1) synthetic index -> import index (-1 if none)
     std::unique_ptr<std::atomic<uint64_t>[]> import_counts;
     uint64_t imports_bound = 0;
     uint64_t imports_unresolved = 0;
@@ -286,10 +397,11 @@ struct BootState {
     GuestThreadContext* main_thread = nullptr;
 
     // Counters.
-    std::atomic<uint64_t> dispatches{0};
+    std::shared_ptr<DispatchBatchTarget> dispatch_target = std::make_shared<DispatchBatchTarget>();
     std::atomic<uint64_t> import_calls{0};
-    std::vector<RecentImport> recent;  // ring
+    std::vector<RecentImport> recent;  // ring (pre-present / traced / first-call)
     size_t recent_next = 0;
+    std::vector<std::shared_ptr<ThreadSlot>> thread_slots;  // per-thread post-present rings, guarded by `mutex`
     std::vector<SurveyEntry> survey_called;
     // Code misses (guarded by `mutex`): indirect calls/jumps to no lifted entry, context restores
     // to no resume target, and traps. Every boot thread's fault is counted, even ones not reported.
@@ -303,6 +415,7 @@ struct BootState {
     // Import calls per (guest thread << 32 | import index) until the first Present (mark_first_present).
     std::unordered_map<uint64_t, uint64_t> pre_present_counts;  // guarded by `mutex`
     bool present_seen = false;                                  // guarded by `mutex`
+    std::atomic<bool> present_seen_atomic{false};               // lock-free mirror of `present_seen`
     uint64_t present_import_seq = 0;
     uint64_t present_elapsed_ms = 0;
     gpu::PresentSampleRing present_samples;  // guarded by `mutex` (R40)
@@ -319,8 +432,8 @@ struct BootState {
     size_t trace_limit = 0;
     bool trace_truncated = false;
     std::unordered_map<const GuestThreadContext*, RecentImport> thread_last;  // guarded by `mutex`
-    // The live guest state of contexts whose state lives elsewhere (O16 lazy threads).
-    std::unordered_map<const GuestThreadContext*, const GuestState*> thread_states;
+    // Live/exited guest state slots of contexts whose state lives elsewhere (O16 lazy threads).
+    std::unordered_map<const GuestThreadContext*, std::shared_ptr<ThreadSlot>> thread_state_slots;
 
     // Address-space log of the boot's arena (guarded by `arena_mutex`).
     std::mutex arena_mutex;
@@ -370,6 +483,93 @@ thread_local uint64_t t_last_import_seq = 0;
 constexpr size_t kDispatchRing = 64;
 thread_local DispatchRecord t_dispatch_ring[kDispatchRing];
 thread_local uint64_t t_dispatch_count = 0;
+
+// Per-thread observer state: batches dispatch counter increments and owns a lock-free
+// post-present recent-import ring. Its destructor flushes pending dispatches on thread exit.
+struct ThreadLocalObserver {
+    uint64_t generation = 0;
+    uint32_t dispatch_pending = 0;
+    std::shared_ptr<DispatchBatchTarget> dispatch_target;
+    std::shared_ptr<ThreadSlot> slot;
+
+    void flush_dispatches() noexcept {
+        if (dispatch_pending != 0) {
+            if (dispatch_target && dispatch_target->active.load(std::memory_order_relaxed)) {
+                dispatch_target->dispatches.fetch_add(dispatch_pending, std::memory_order_relaxed);
+            }
+            dispatch_pending = 0;
+        }
+    }
+
+    void reset() noexcept {
+        dispatch_pending = 0;
+        generation = 0;
+        dispatch_target.reset();
+        slot.reset();
+    }
+
+    void snapshot_state_on_exit() noexcept {
+        if (slot) {
+            std::lock_guard<std::mutex> lock(slot->exit_mutex);
+            if (slot->live_state != nullptr) {
+                slot->exited_state = *slot->live_state;
+                slot->live_state = nullptr;
+                slot->has_exited_state = true;
+            }
+        }
+    }
+
+    ~ThreadLocalObserver() {
+        flush_dispatches();
+        snapshot_state_on_exit();
+    }
+};
+
+thread_local ThreadLocalObserver t_observer;
+
+void bind_thread_observer(BootState& b) {
+    t_observer.flush_dispatches();
+    std::lock_guard<std::mutex> lock(b.mutex);
+    const uint64_t gen = b.generation.load(std::memory_order_acquire);
+    t_observer.dispatch_target = b.dispatch_target;
+    t_observer.slot = std::make_shared<ThreadSlot>();
+    b.thread_slots.push_back(t_observer.slot);
+    t_observer.generation = gen;
+    t_last_import = -1;
+    t_last_import_seq = 0;
+    t_dispatch_count = 0;
+}
+
+uint64_t current_dispatches(BootState& b) {
+    std::shared_ptr<DispatchBatchTarget> target;
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        target = b.dispatch_target;
+    }
+    return target ? target->dispatches.load(std::memory_order_relaxed) : 0;
+}
+
+// Merges the shared `b.recent` ring and all per-thread lock-free `ThreadSlot` rings into the
+// newest `b.recent_capacity` import calls in ascending `seq` order. Caller holds `b.mutex`.
+std::vector<RecentImport> collect_recent_imports_locked(const BootState& b) {
+    if (b.recent_capacity == 0) {
+        return {};
+    }
+    std::vector<RecentImport> ordered = b.recent;
+    for (const auto& slot : b.thread_slots) {
+        slot->snapshot_ring(ordered);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+              [](const RecentImport& a, const RecentImport& c) { return a.seq < c.seq; });
+    ordered.erase(std::unique(ordered.begin(), ordered.end(),
+                              [](const RecentImport& a, const RecentImport& c) { return a.seq == c.seq; }),
+                  ordered.end());
+    if (ordered.size() > b.recent_capacity) {
+        ordered.erase(ordered.begin(),
+                      ordered.end() - static_cast<std::ptrdiff_t>(b.recent_capacity));
+    }
+    return ordered;
+}
 
 void logf(const char* fmt, ...) {
     if (!boot().log_progress) {
@@ -529,8 +729,23 @@ long find_import(uint64_t image_base, uint32_t slot_rva) {
 
 // Import index for a synthetic call target bound by this boot, or -1.
 long import_for_target(uint64_t target) {
+    const BootState& b = boot();
+    if (!is_synthetic_address(target)) {
+        return -1;
+    }
+    const uint64_t offset = target - kSyntheticBase;
+    if ((offset & (kSyntheticStride - 1)) != 0) {
+        return -1;
+    }
+    const size_t synth_idx = static_cast<size_t>(offset / kSyntheticStride);
+    if (synth_idx < b.synthetic_to_import.size()) {
+        const long cached = b.synthetic_to_import[synth_idx];
+        if (cached >= 0) {
+            return cached;
+        }
+    }
     SyntheticTarget info;
-    if (!is_synthetic_address(target) || !describe_synthetic(target, &info) || !info.is_import) {
+    if (!describe_synthetic(target, &info) || !info.is_import) {
         return -1;
     }
     return find_import(info.image_base, info.slot_rva);
@@ -882,9 +1097,10 @@ void record_code_miss(FaultKind kind, uint64_t va) {
 
 void boot_fault_handler(const FaultInfo* info) {
     BootState& b = boot();
-    if (!b.running || info == nullptr) {
+    if (!b.running.load(std::memory_order_acquire) || info == nullptr) {
         return;  // the default handler logs and aborts
     }
+    t_observer.flush_dispatches();
     {
         const auto miss_kind = static_cast<FaultKind>(info->kind);
         record_code_miss(miss_kind, miss_kind == FaultKind::UnknownResumeTarget && info->state != nullptr
@@ -917,10 +1133,11 @@ void boot_fault_handler(const FaultInfo* info) {
 
 void stop_on_limit(GuestState* state, const char* kind, uint64_t target) {
     BootState& b = boot();
+    t_observer.flush_dispatches();
     capture_fault(kind, state, target, 0);
     char message[160];
     std::snprintf(message, sizeof(message), "run bound reached (%s) after %" PRIu64 " dispatches",
-                  kind, b.dispatches.load(std::memory_order_relaxed));
+                  kind, current_dispatches(b));
     b.message = message;
     b.status = BootStatus::LimitReached;
     stop_boot();
@@ -997,10 +1214,18 @@ std::string dispatch_label(uint64_t target) {
 
 void boot_dispatch_observer(GuestState* state, uint64_t target) {
     BootState& b = boot();
-    if (!b.running) {
+    if (!b.running.load(std::memory_order_relaxed)) {
         return;
     }
-    const uint64_t n = b.dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t gen = b.generation.load(std::memory_order_acquire);
+    if (t_observer.generation != gen) {
+        bind_thread_observer(b);
+    }
+    if (++t_observer.dispatch_pending >= kDispatchBatchSize) {
+        t_observer.flush_dispatches();
+    }
+    const uint64_t rsp = state->gpr[GuestReg::Rsp];
+    uint64_t return_address = 0;
     {
         // With the fault record off only the latest slot is kept (event-trace caller / import
         // return address), so the write cost stays one slot.
@@ -1012,20 +1237,36 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
         d.target = target;
         d.rcx = state->gpr[GuestReg::Rcx];
         d.rdx = state->gpr[GuestReg::Rdx];
-        d.return_address = 0;
-        const uint64_t rsp = state->gpr[GuestReg::Rsp];
         if (t_active != nullptr && b.arena != nullptr && rsp >= t_active->thread.stack_limit &&
             rsp <= t_active->thread.stack_top - 8) {
             // The thread's own stack is committed read/write for its whole life: read it like
             // lifted code does, without the arena lock (taken on every dispatch, it serialized
             // all guest threads).
-            std::memcpy(&d.return_address, b.arena->translate(rsp), sizeof(d.return_address));
+            std::memcpy(&return_address, b.arena->translate(rsp), sizeof(return_address));
         } else if (b.arena != nullptr) {
-            read_u64(*b.arena, rsp, d.return_address);
+            read_u64(*b.arena, rsp, return_address);
         }
+        d.return_address = return_address;
     }
     if (is_synthetic_address(target)) {
-        const long index = import_for_target(target);
+        // Fast O(1) lookup for statically bound IAT slots; only fall back to describe_synthetic
+        // once for host callables or dynamically bound slots.
+        long index = -1;
+        SyntheticTarget info;
+        bool has_info = false;
+        const uint64_t synth_off = target - kSyntheticBase;
+        if ((synth_off & (kSyntheticStride - 1)) == 0) {
+            const size_t synth_idx = static_cast<size_t>(synth_off / kSyntheticStride);
+            if (synth_idx < b.synthetic_to_import.size()) {
+                index = b.synthetic_to_import[synth_idx];
+            }
+        }
+        if (index < 0 && describe_synthetic(target, &info)) {
+            has_info = true;
+            if (info.is_import) {
+                index = find_import(info.image_base, info.slot_rva);
+            }
+        }
         if (index >= 0) {
             const uint64_t previous =
                 b.import_counts[static_cast<size_t>(index)].fetch_add(1, std::memory_order_relaxed);
@@ -1037,16 +1278,16 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
             entry.args[1] = state->gpr[GuestReg::Rdx];
             entry.args[2] = state->gpr[GuestReg::R8];
             entry.args[3] = state->gpr[GuestReg::R9];
-            if (b.arena != nullptr) {
-                read_u64(*b.arena, state->gpr[GuestReg::Rsp] + 0x28, entry.args[4]);
+            if (t_active != nullptr && b.arena != nullptr && rsp >= t_active->thread.stack_limit &&
+                t_active->thread.stack_top >= 0x30 && rsp <= t_active->thread.stack_top - 0x30) {
+                std::memcpy(&entry.args[4], b.arena->translate(rsp + 0x28), sizeof(entry.args[4]));
+            } else if (b.arena != nullptr) {
+                read_u64(*b.arena, rsp + 0x28, entry.args[4]);
             }
             entry.thread = t_active != nullptr ? t_active->thread_id : 0;
-            entry.return_address = t_dispatch_ring[(t_dispatch_count - 1) % kDispatchRing].return_address;
+            entry.return_address = return_address;
+            entry.ctx = t_active;
             const BootImport& imp = b.imports[static_cast<size_t>(index)].import;
-            std::string strings;
-            if (b.trace_limit != 0) {
-                strings = describe_string_args(entry.args);
-            }
             const char* first_call_milestone = nullptr;
             bool first_call = false;
             if (previous == 0 && imp.symbol != nullptr) {
@@ -1057,7 +1298,14 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                     }
                 }
             }
-            {
+            if (b.present_seen_atomic.load(std::memory_order_relaxed) && b.trace_limit == 0 && !first_call) {
+                // Steady-state post-present fast path: zero global mutex, zero map lookup.
+                t_observer.slot->record(entry);
+            } else {
+                std::string strings;
+                if (b.trace_limit != 0) {
+                    strings = describe_string_args(entry.args);
+                }
                 std::lock_guard<std::mutex> lock(b.mutex);
                 if (b.recent_capacity != 0) {
                     if (b.recent.size() < b.recent_capacity) {
@@ -1088,22 +1336,23 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
             if (first_call_milestone != nullptr) {
                 milestone(first_call_milestone, "first %s (import call #%" PRIu64 ")", imp.symbol, seq);
             }
-        } else {
+        } else if (has_info && !info.is_import && info.name != nullptr) {
             // Host callables handed out by GetProcAddress / providers (QueryApiImpl, ...).
-            SyntheticTarget info;
-            if (describe_synthetic(target, &info) && !info.is_import && info.name != nullptr) {
-                {
-                    // Per-callable call counts with the import-call number of the first call
-                    // (COM methods: D3D12 / xgameruntime milestones and slot statistics).
-                    std::lock_guard<std::mutex> lock(b.callable_mutex);
-                    auto [it, inserted] = b.callable_calls.try_emplace(target);
-                    if (inserted) {
-                        it->second.name = info.name;
-                        it->second.first_import_seq = b.import_calls.load(std::memory_order_relaxed);
-                        it->second.order = b.callable_calls.size();
-                    }
-                    ++it->second.calls;
+            bool inserted = false;
+            {
+                // Per-callable call counts with the import-call number of the first call
+                // (COM methods: D3D12 / xgameruntime milestones and slot statistics).
+                std::lock_guard<std::mutex> lock(b.callable_mutex);
+                auto [it, ins] = b.callable_calls.try_emplace(target);
+                inserted = ins;
+                if (inserted) {
+                    it->second.name = info.name;
+                    it->second.first_import_seq = b.import_calls.load(std::memory_order_relaxed);
+                    it->second.order = b.callable_calls.size();
                 }
+                ++it->second.calls;
+            }
+            if (inserted) {
                 for (const TimelineApi& api : kTimelineApis) {
                     if (std::strcmp(api.name, info.name) != 0) {
                         continue;
@@ -1115,6 +1364,7 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
                         b.first_calls.push_back(FirstCall{info.name, 0, elapsed_ms(),
                                                           t_active != nullptr ? t_active->thread_id : 0});
                     }
+                    break;
                 }
             }
         }
@@ -1122,10 +1372,16 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     if (!t_running_boot) {
         return;  // bounds can only stop the boot's own thread
     }
-    if (b.max_dispatches != 0 && n > b.max_dispatches) {
-        stop_on_limit(state, "dispatch_limit", target);
+    if (b.max_dispatches != 0) {
+        const uint64_t total =
+            t_observer.dispatch_target->dispatches.load(std::memory_order_relaxed) + t_observer.dispatch_pending;
+        if (total > b.max_dispatches) {
+            t_observer.flush_dispatches();
+            stop_on_limit(state, "dispatch_limit", target);
+        }
     }
-    if (b.max_wall_ms != 0 && (n & kWallCheckMask) == 0 && elapsed_ms() > b.max_wall_ms) {
+    if (b.max_wall_ms != 0 && (t_dispatch_count & kWallCheckMask) == 0 && elapsed_ms() > b.max_wall_ms) {
+        t_observer.flush_dispatches();
         stop_on_limit(state, "wall_time_limit", target);
     }
 }
@@ -1184,7 +1440,8 @@ void boot_unresolved_thunk(void* raw_state) {
     if (b.arena != nullptr) {
         read_u64(*b.arena, state->gpr[GuestReg::Rsp], return_address);
     }
-    if (b.running && b.survey && index >= 0) {
+    const bool running = b.running.load(std::memory_order_acquire);
+    if (running && b.survey && index >= 0) {
         const auto i = static_cast<size_t>(index);
         bool first = false;
         {
@@ -1208,7 +1465,8 @@ void boot_unresolved_thunk(void* raw_state) {
         state->gpr[GuestReg::Rsp] += 8;  // like `ret`
         return;
     }
-    if (b.running && t_running_boot) {
+    if (running && t_running_boot) {
+        t_observer.flush_dispatches();
         capture_fault("unresolved_import", state, return_address, state->rip);
         b.fault.import_index = index;
         b.message = "call to unresolved import " +
@@ -1219,7 +1477,8 @@ void boot_unresolved_thunk(void* raw_state) {
     }
     // Another guest thread during a boot: reported like any other off-thread fault (the hook
     // writes the report and parks the thread), once.
-    if (b.running && b.off_thread_fault != nullptr && !b.off_thread_fault_taken.exchange(true)) {
+    if (running && b.off_thread_fault != nullptr && !b.off_thread_fault_taken.exchange(true)) {
+        t_observer.flush_dispatches();
         capture_fault("unresolved_import", state, return_address, state->rip);
         b.fault.import_index = index;
         b.message = "call to unresolved import " +
@@ -1264,12 +1523,13 @@ const char* crt_exit_kind_id(int32_t kind) {
 
 void boot_exit_hook(int32_t code, int32_t kind) {
     BootState& b = boot();
-    if (!b.running || !t_running_boot) {
+    if (!b.running.load(std::memory_order_acquire) || !t_running_boot) {
         if (b.previous_exit_hook != nullptr) {
             b.previous_exit_hook(code, kind);
         }
         return;
     }
+    t_observer.flush_dispatches();
     if (kind == PG6_CRT_EXIT_NORMAL || kind == PG6_CRT_EXIT_QUICK) {
         b.status = BootStatus::Exited;
         b.exit_code = code;
@@ -1327,6 +1587,7 @@ void install_hooks() {
 
 void remove_hooks() {
     BootState& b = boot();
+    t_observer.flush_dispatches();
     if (!b.hooks_installed) {
         return;
     }
@@ -1601,10 +1862,19 @@ void boot_thread_init_hook(GuestThread& thread) {
     thread.state.gs_base = ctx->teb;
     thread.state.mxcsr = kGuestMxcsrDefault;
     GuestThreadContext* raw = ctx.get();
+    const uint64_t gen = b.generation.load(std::memory_order_acquire);
+    if (t_observer.generation != gen) {
+        bind_thread_observer(b);
+    }
+    {
+        std::lock_guard<std::mutex> slock(t_observer.slot->exit_mutex);
+        t_observer.slot->live_state = &thread.state;
+        t_observer.slot->has_exited_state = false;
+    }
     {
         std::lock_guard<std::mutex> lock(b.mutex);
         b.threads.push_back(std::move(ctx));
-        b.thread_states[raw] = &thread.state;
+        b.thread_state_slots[raw] = t_observer.slot;
     }
     activate_guest_thread(raw);
     if (b.guest_thread_started != nullptr) {
@@ -2019,7 +2289,8 @@ std::string build_report() {
     }
 
     // Counters.
-    o += "  \"counters\": {\"dispatches\": " + std::to_string(b.dispatches.load()) +
+    t_observer.flush_dispatches();
+    o += "  \"counters\": {\"dispatches\": " + std::to_string(current_dispatches(b)) +
          ", \"import_calls\": " + std::to_string(b.import_calls.load()) + ", \"imports\": [";
     std::vector<std::pair<uint64_t, size_t>> called;
     for (size_t i = 0; i < b.imports.size(); ++i) {
@@ -2039,9 +2310,7 @@ std::string build_report() {
     o += called.empty() ? "], \"recent\": [" : "\n  ], \"recent\": [";
     {
         std::lock_guard<std::mutex> lock(b.mutex);
-        std::vector<RecentImport> ordered = b.recent;
-        std::sort(ordered.begin(), ordered.end(),
-                  [](const RecentImport& a, const RecentImport& c) { return a.seq < c.seq; });
+        const std::vector<RecentImport> ordered = collect_recent_imports_locked(b);
         for (size_t k = 0; k < ordered.size(); ++k) {
             o += (k == 0 ? "\n    " : ",\n    ");
             o += "{\"seq\": " + std::to_string(ordered[k].seq) + ", " +
@@ -2088,17 +2357,37 @@ std::string build_report() {
                  std::to_string(f.elapsed_ms) + ", \"thread\": " + std::to_string(f.thread) + "}";
         }
         o += "],\n  \"threads\": [";
+        std::unordered_map<const GuestThreadContext*, RecentImport> merged_thread_last = b.thread_last;
+        for (const auto& slot : b.thread_slots) {
+            RecentImport latest;
+            if (slot->read_latest(latest) && latest.ctx != nullptr) {
+                auto it = merged_thread_last.find(latest.ctx);
+                if (it == merged_thread_last.end() || latest.seq > it->second.seq) {
+                    merged_thread_last[latest.ctx] = latest;
+                }
+            }
+        }
         for (size_t k = 0; k < b.threads.size(); ++k) {
             const GuestThreadContext* t = b.threads[k].get();
-            const auto live = b.thread_states.find(t);
-            const GuestState& s = live != b.thread_states.end() ? *live->second : t->thread.state;
+            GuestState snapshot = t->thread.state;
+            const auto slot_it = b.thread_state_slots.find(t);
+            if (slot_it != b.thread_state_slots.end()) {
+                const auto& slot = slot_it->second;
+                std::lock_guard<std::mutex> slock(slot->exit_mutex);
+                if (slot->live_state != nullptr) {
+                    snapshot = *slot->live_state;
+                } else if (slot->has_exited_state) {
+                    snapshot = slot->exited_state;
+                }
+            }
+            const GuestState& s = snapshot;
             o += (k == 0 ? "\n    " : ",\n    ");
             o += "{\"thread_id\": " + std::to_string(t->thread_id) + ", \"teb\": " + hex(t->teb) +
                  ", \"stack_base\": " + hex(t->thread.stack_top) + ", \"stack_limit\": " +
                  hex(t->thread.stack_limit) + ", \"rsp\": " + hex(s.gpr[GuestReg::Rsp]) + ", \"rip\": " +
                  hex(s.rip) + ", \"last_import\": ";
-            const auto last = b.thread_last.find(t);
-            if (last != b.thread_last.end()) {
+            const auto last = merged_thread_last.find(t);
+            if (last != merged_thread_last.end()) {
                 o += "{\"seq\": " + std::to_string(last->second.seq) + ", " +
                      import_name_json(b.imports[last->second.import_index].import) + "}";
             } else {
@@ -2397,9 +2686,10 @@ std::string build_summary() {
             s += line;
         }
     }
+    t_observer.flush_dispatches();
     std::snprintf(line, sizeof(line),
                   "  entry point %s; dispatched calls %" PRIu64 ", import calls %" PRIu64 "\n",
-                  b.entry_started ? "started" : "not started", b.dispatches.load(),
+                  b.entry_started ? "started" : "not started", current_dispatches(b),
                   b.import_calls.load());
     s += line;
     const FaultRecord& f = b.fault;
@@ -2468,10 +2758,8 @@ std::string build_summary() {
     }
     {
         std::lock_guard<std::mutex> lock(b.mutex);
-        if (!b.recent.empty()) {
-            std::vector<RecentImport> ordered = b.recent;
-            std::sort(ordered.begin(), ordered.end(),
-                      [](const RecentImport& a, const RecentImport& c) { return a.seq < c.seq; });
+        const std::vector<RecentImport> ordered = collect_recent_imports_locked(b);
+        if (!ordered.empty()) {
             s += "  last imports called:\n";
             for (const RecentImport& r : ordered) {
                 std::snprintf(line, sizeof(line), "    #%" PRIu64 " %s\n", r.seq,
@@ -2576,7 +2864,8 @@ BootStats collect_stats() {
         st.tls_callbacks += m.tls.callbacks.size();
     }
     st.tls_callbacks_run = b.tls_callbacks_run;
-    st.dispatches = b.dispatches.load();
+    t_observer.flush_dispatches();
+    st.dispatches = current_dispatches(b);
     st.import_calls = b.import_calls.load();
     st.unresolved_called = b.survey_called.size();
     st.entry_started = b.entry_started ? 1 : 0;
@@ -2694,35 +2983,51 @@ const char* boot_status_name(BootStatus status) {
 std::string guest_thread_last_import(uint32_t thread_id) {
     BootState& b = boot();
     std::lock_guard<std::mutex> lock(b.mutex);
-    for (const auto& [thread, entry] : b.thread_last) {
-        if (thread->thread_id == thread_id) {
-            const BootImport& imp = b.imports[entry.import_index].import;
-            std::string label = import_label(imp);
-            // Waits and sleeps: the guest caller and the handle / time argument, so a profile
-            // says which wait a blocked thread is in (--profile).
-            const std::string symbol = import_symbol(imp);
-            const bool sleep = symbol == "Sleep" || symbol == "SleepEx";
-            const bool wait_one = symbol == "WaitForSingleObject" || symbol == "WaitForSingleObjectEx";
-            const bool wait_many = symbol == "WaitForMultipleObjects" || symbol == "WaitForMultipleObjectsEx";
-            if (sleep || wait_one || wait_many) {
-                char text[96];
-                if (sleep) {
-                    std::snprintf(text, sizeof(text), " ms=%" PRIu64, entry.args[0] & 0xFFFFFFFFu);
-                } else if (wait_one) {
-                    std::snprintf(text, sizeof(text), " h=0x%" PRIx64 " ms=%" PRId32, entry.args[0],
-                                  static_cast<int32_t>(entry.args[1]));
-                } else {
-                    std::snprintf(text, sizeof(text), " n=%" PRIu64 " ms=%" PRId32, entry.args[0] & 0xFFFFFFFFu,
-                                  static_cast<int32_t>(entry.args[3]));
-                }
-                label += text;
-                std::snprintf(text, sizeof(text), " ret 0x%" PRIx64, entry.return_address);
-                label += text;
-            }
-            return label;
+    bool found = false;
+    RecentImport entry{};
+    for (const auto& [thread, rec] : b.thread_last) {
+        if (thread->thread_id == thread_id && (!found || rec.seq > entry.seq)) {
+            entry = rec;
+            found = true;
         }
     }
-    return {};
+    for (const auto& slot : b.thread_slots) {
+        if (slot->thread_id.load(std::memory_order_relaxed) != thread_id) {
+            continue;
+        }
+        RecentImport latest;
+        if (slot->read_latest(latest) && latest.thread == thread_id && (!found || latest.seq > entry.seq)) {
+            entry = latest;
+            found = true;
+        }
+    }
+    if (!found || entry.import_index >= b.imports.size()) {
+        return {};
+    }
+    const BootImport& imp = b.imports[entry.import_index].import;
+    std::string label = import_label(imp);
+    // Waits and sleeps: the guest caller and the handle / time argument, so a profile
+    // says which wait a blocked thread is in (--profile).
+    const std::string symbol = import_symbol(imp);
+    const bool sleep = symbol == "Sleep" || symbol == "SleepEx";
+    const bool wait_one = symbol == "WaitForSingleObject" || symbol == "WaitForSingleObjectEx";
+    const bool wait_many = symbol == "WaitForMultipleObjects" || symbol == "WaitForMultipleObjectsEx";
+    if (sleep || wait_one || wait_many) {
+        char text[96];
+        if (sleep) {
+            std::snprintf(text, sizeof(text), " ms=%" PRIu64, entry.args[0] & 0xFFFFFFFFu);
+        } else if (wait_one) {
+            std::snprintf(text, sizeof(text), " h=0x%" PRIx64 " ms=%" PRId32, entry.args[0],
+                          static_cast<int32_t>(entry.args[1]));
+        } else {
+            std::snprintf(text, sizeof(text), " n=%" PRIu64 " ms=%" PRId32, entry.args[0] & 0xFFFFFFFFu,
+                          static_cast<int32_t>(entry.args[3]));
+        }
+        label += text;
+        std::snprintf(text, sizeof(text), " ret 0x%" PRIx64, entry.return_address);
+        label += text;
+    }
+    return label;
 }
 
 uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset) {
@@ -2786,9 +3091,21 @@ bool prepare_guest_thread(uint64_t stack_size, uint32_t thread_id, GuestThreadCo
 
 GuestThreadContext* activate_guest_thread(GuestThreadContext* context) {
     GuestThreadContext* previous = t_active;
+    t_observer.flush_dispatches();
+    BootState& b = boot();
+    if (previous != nullptr && previous != context && t_observer.slot != nullptr &&
+        t_observer.generation == b.generation.load(std::memory_order_acquire)) {
+        RecentImport latest;
+        if (t_observer.slot->read_latest(latest) && latest.ctx == previous) {
+            std::lock_guard<std::mutex> lock(b.mutex);
+            auto it = b.thread_last.find(previous);
+            if (it == b.thread_last.end() || latest.seq > it->second.seq) {
+                b.thread_last[previous] = latest;
+            }
+        }
+    }
     t_active = context;
     uint32_t* slot = nullptr;
-    BootState& b = boot();
     if (context != nullptr && b.arena != nullptr) {
         slot = reinterpret_cast<uint32_t*>(b.arena->host_ptr(
             context->teb + offsetof(win64::Teb64, last_error_value), sizeof(uint32_t)));
@@ -2819,9 +3136,10 @@ size_t run_tls_callbacks(GuestThreadContext& context, uint32_t reason) {
 
 bool request_exit(int32_t exit_code) {
     BootState& b = boot();
-    if (!b.running || !t_running_boot) {
+    if (!b.running.load(std::memory_order_acquire) || !t_running_boot) {
         return false;
     }
+    t_observer.flush_dispatches();
     b.status = BootStatus::Exited;
     b.exit_code = exit_code;
     b.has_exit_code = true;
@@ -2834,6 +3152,7 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
     if (!b.active) {
         return false;
     }
+    t_observer.flush_dispatches();
     const char* name = kind != nullptr ? kind : "host_fault";
     if (b.fault.present && (std::strcmp(name, "host_terminate") == 0 || std::strcmp(name, "host_abort") == 0)) {
         // The guest fault was already recorded (the unwind that should have stopped the boot hit a
@@ -3067,6 +3386,7 @@ void mark_first_present() {
             return;
         }
         b.present_seen = true;
+        b.present_seen_atomic.store(true, std::memory_order_release);
         b.present_import_seq = seq = b.import_calls.load(std::memory_order_relaxed);
         b.present_elapsed_ms = elapsed_ms();
     }
@@ -3090,8 +3410,9 @@ PresentStatus present_status() {
 
 LiveCounters live_counters() {
     BootState& b = boot();
+    t_observer.flush_dispatches();
     LiveCounters c;
-    c.dispatches = b.dispatches.load(std::memory_order_relaxed);
+    c.dispatches = current_dispatches(b);
     c.import_calls = b.import_calls.load(std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(b.arena_mutex);
@@ -3161,7 +3482,7 @@ void reset_boot() {
     reset_guest_exceptions();
     com::set_guest_memory(nullptr);
     b.active = false;
-    b.running = false;
+    b.running.store(false, std::memory_order_release);
     b.arena = nullptr;
     b.modules.clear();
     b.exec.clear();
@@ -3172,6 +3493,7 @@ void reset_boot() {
     b.host_map_built = false;
     b.imports.clear();
     b.by_slot.clear();
+    b.synthetic_to_import.clear();
     b.import_counts.reset();
     b.imports_bound = 0;
     b.imports_unresolved = 0;
@@ -3181,7 +3503,18 @@ void reset_boot() {
     b.tls_modules.clear();
     b.threads.clear();
     b.main_thread = nullptr;
-    b.dispatches.store(0);
+    {
+        std::lock_guard<std::mutex> lock(b.mutex);
+        if (b.dispatch_target) {
+            b.dispatch_target->active.store(false, std::memory_order_release);
+        }
+        b.dispatch_target = std::make_shared<DispatchBatchTarget>();
+        b.thread_slots.clear();
+        b.present_seen = false;
+        b.present_seen_atomic.store(false, std::memory_order_release);
+        b.generation.fetch_add(1, std::memory_order_release);
+    }
+    t_observer.reset();
     b.import_calls.store(0);
     b.recent.clear();
     b.recent_next = 0;
@@ -3194,7 +3527,6 @@ void reset_boot() {
     b.milestones.clear();
     b.first_calls.clear();
     b.pre_present_counts.clear();
-    b.present_seen = false;
     b.present_import_seq = 0;
     b.present_elapsed_ms = 0;
     b.present_samples.clear();
@@ -3207,7 +3539,7 @@ void reset_boot() {
     b.trace_limit = 0;
     b.trace_truncated = false;
     b.thread_last.clear();
-    b.thread_states.clear();
+    b.thread_state_slots.clear();
     t_last_import = -1;
     t_last_import_seq = 0;
     t_dispatch_count = 0;
@@ -3467,6 +3799,23 @@ BootResult run_boot(const BootConfig& config) {
             return finish();
         }
     }
+    // Build O(1) synthetic-index -> import-index table once so boot_dispatch_observer avoids
+    // describe_synthetic() + binary search on every static IAT call.
+    b.synthetic_to_import.clear();
+    const size_t synth_cap = b.imports.size() + 1024;
+    for (size_t i = 0; i < b.imports.size(); ++i) {
+        uint64_t synth_va = 0;
+        if (read_u64(*b.arena, b.imports[i].image_base + b.imports[i].import.slot_rva, synth_va) &&
+            is_synthetic_address(synth_va) && ((synth_va - kSyntheticBase) & (kSyntheticStride - 1)) == 0) {
+            const size_t synth_idx = static_cast<size_t>((synth_va - kSyntheticBase) / kSyntheticStride);
+            if (synth_idx < synth_cap) {
+                if (synth_idx >= b.synthetic_to_import.size()) {
+                    b.synthetic_to_import.resize(synth_idx + 1, -1);
+                }
+                b.synthetic_to_import[synth_idx] = static_cast<long>(i);
+            }
+        }
+    }
     logf("guest boot: %" PRIu64 " lifted functions in %zu table(s) and %zu shard dispatch table(s) (%zu shard(s)); "
          "%zu imports, %" PRIu64 " bound to shims, %" PRIu64 " without a shim%s",
          b.functions_registered, b.tables.size(), b.shard_table_count, shard_dispatch_shard_count(),
@@ -3554,7 +3903,7 @@ BootResult run_boot(const BootConfig& config) {
 
     // 4. Guest code.
     install_hooks();
-    b.running = true;
+    b.running.store(true, std::memory_order_release);
     t_running_boot = true;
 #if PG6_BOOT_HAS_EXCEPTIONS
     try {
@@ -3566,7 +3915,7 @@ BootResult run_boot(const BootConfig& config) {
     run_guest(config);
 #endif
     t_running_boot = false;
-    b.running = false;
+    b.running.store(false, std::memory_order_release);
     remove_hooks();
     log_trap();
     BootResult result = finish();
