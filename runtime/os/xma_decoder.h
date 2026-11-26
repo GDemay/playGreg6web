@@ -145,10 +145,13 @@ bool continue_frame(const uint8_t* data, uint32_t packets, uint32_t count, Frame
 class FrameDecoder {
 public:
     virtual ~FrameDecoder() = default;
+    virtual void reset() {}
     virtual bool decode(const Frame& frame, uint32_t channels, uint32_t sample_rate, int16_t* pcm) = 0;
 };
-// The default: every frame is silence (no WMA Pro decoder yet).
+// Pure silence decoder (writes zeros and returns false).
 std::unique_ptr<FrameDecoder> make_silence_decoder();
+// Dependency-free WMA Pro / XMA2 subframe decoder (default when enable() receives nullptr).
+std::unique_ptr<FrameDecoder> make_wmapro_decoder();
 
 struct VoiceStats {
     uint64_t frames = 0;
