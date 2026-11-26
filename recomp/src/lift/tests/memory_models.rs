@@ -135,10 +135,12 @@ fn table_entries_are_ordinary_loads_and_the_base_stays_invariant() {
 
 #[test]
 fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
-    // `mov [rcx], rax` under window-runs: one hot dirty check for the store's slot (with its
-    // atomic release store behind `icmp eq i8 ..., 0`); the dirty check for the last byte's slot
-    // sits in its own block behind `icmp ne` (taken only by a store that leaves its slot), not on
-    // the hot path.
+    // `mov [rcx], rax` under window-runs (R57 + R63c):
+    // - Primary slot: one hot dirty check (`load atomic i8 ... monotonic`) with its atomic release
+    //   store behind `icmp eq i8 ..., 0` in `gms*`.
+    // - Last byte's slot (R63c): sits in its own cold `gm*` block behind `icmp ne` (taken only by
+    //   a store that leaves its slot) and emits a compact direct `store atomic i8 1 ... release`
+    //   with no extra load/branch diamond.
     use iced_x86::code_asm::*;
     let f = super::asm_function(0x1000, |a| {
         a.mov(qword_ptr(rcx), rax)?;
@@ -160,15 +162,33 @@ fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
             stored.push(label);
         }
     }
-    assert_eq!(checked.len(), 2, "{ir}");
+    assert_eq!(checked.len(), 1, "{ir}");
     assert_eq!(stored.len(), 2, "{ir}");
-    assert_ne!(
-        checked[0], checked[1],
-        "both dirty checks on the hot path:\n{ir}"
+    let primary_set = stored[0];
+    assert!(primary_set.starts_with("gms"), "{ir}");
+    let set_br = ir
+        .lines()
+        .find(|l| l.contains(&format!("label %{primary_set},")))
+        .expect("branch to mark-set block");
+    assert!(
+        set_br.contains("!prof !{!\"branch_weights\", i32 1, i32 2000}"),
+        "{ir}"
     );
-    let cold = checked[1];
-    assert!(cold.starts_with("gm"), "{ir}");
-    // The cold mark block is entered only by an `icmp ne` of the two slot indices.
+    let set_cond = set_br
+        .split_whitespace()
+        .nth(2)
+        .expect("condition")
+        .trim_end_matches(',');
+    assert!(
+        ir.lines()
+            .any(|l| l.trim_start().starts_with(&format!("{set_cond} = icmp eq i8"))
+                && l.ends_with(", 0")),
+        "{ir}"
+    );
+    // The cold cross-slot mark block is entered only by an `icmp ne` of the two slot indices and
+    // stores directly without a second `gms*` diamond.
+    let cold = stored[1];
+    assert!(cold.starts_with("gm") && !cold.starts_with("gms"), "{ir}");
     let branch = ir
         .lines()
         .find(|l| l.contains(&format!("label %{cold},")))
@@ -183,42 +203,21 @@ fn contiguous_runs_store_marks_its_last_slot_only_when_it_crosses() {
             .any(|l| l.trim_start().starts_with(&format!("{cond} = icmp ne i64"))),
         "{ir}"
     );
-    // Both atomic release stores sit in cold `gms*` blocks entered by `icmp eq i8 ..., 0`.
-    for set_block in stored {
-        assert!(set_block.starts_with("gms"), "{ir}");
-        let set_br = ir
-            .lines()
-            .find(|l| l.contains(&format!("label %{set_block},")))
-            .expect("branch to mark-set block");
-        assert!(
-            set_br.contains("!prof !{!\"branch_weights\", i32 1, i32 2000}"),
-            "{ir}"
-        );
-        let set_cond = set_br
-            .split_whitespace()
-            .nth(2)
-            .expect("condition")
-            .trim_end_matches(',');
-        assert!(
-            ir.lines()
-                .any(|l| l.trim_start().starts_with(&format!("{set_cond} = icmp eq i8"))
-                    && l.ends_with(", 0")),
-            "{ir}"
-        );
-    }
 }
 
 #[test]
 fn window_dirty_marks_guard_atomic_release_store_with_monotonic_check() {
-    // R57: every window model guards `store atomic i8 1 ... release` behind a `load atomic i8 ...
-    // monotonic` + `icmp eq i8 ..., 0` cold branch so already-dirty slots avoid `LOCK XCHG`.
+    // R57 + R63c: every primary dirty release store is guarded by a `load atomic i8 ... monotonic`
+    // + `icmp eq i8 ..., 0` cold branch so already-dirty slots avoid `LOCK XCHG`. Under
+    // `window-runs`, the rare (~0.005%) cross-slot fallback for multi-byte stores uses a compact
+    // direct `store atomic i8 1 ... release` inside `%gm`.
     use iced_x86::code_asm::*;
     let f = super::asm_function(0x1000, |a| {
         a.mov(qword_ptr(rcx), rax)?;
         a.lock().xadd(qword_ptr(rdx), rax)?;
         a.ret()
     });
-    for name in ["window", "window-outline", "window-runs"] {
+    for name in ["window", "window-outline"] {
         let model = MemoryModel::from_name(name).expect("model");
         let ir = lift_module_with([&f], model).expect("lifts").ir;
         let loads = ir.matches("load atomic i8, ptr ").count();
@@ -229,6 +228,19 @@ fn window_dirty_marks_guard_atomic_release_store_with_monotonic_check() {
             "{name}: every dirty release store must have a matching monotonic load guard:\n{ir}"
         );
     }
+    let runs_ir = lift_module_with([&f], MemoryModel::from_name("window-runs").expect("model"))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        runs_ir.matches("load atomic i8, ptr ").count(),
+        2,
+        "window-runs: 2 guarded primary marks (store + lock xadd):\n{runs_ir}"
+    );
+    assert_eq!(
+        runs_ir.matches("store atomic i8 1, ptr ").count(),
+        3,
+        "window-runs: 2 primary release stores + 1 compact cross-slot release store:\n{runs_ir}"
+    );
     let select_ir = lift_module_with([&f], window(WindowCheck::Select, false, false))
         .expect("lifts")
         .ir;
@@ -544,6 +556,162 @@ fn avx256_stack_frame_and_burst_optimizations_reduce_window_checks() {
             .count(),
         1,
         "RMW under window-runs must reuse the load's window_table lookup:\n{rmw_ir}"
+    );
+}
+
+#[test]
+fn r63b_dual_base_interleaved_and_long_bursts() {
+    use iced_x86::code_asm::*;
+
+    // 1. Interleaved dual-base read/write burst (>8 instructions: 12 insns total):
+    //    reads `[rcx + 0/16/32/48]` interleaved with writes `[rbx + 0/16/32/48]`.
+    //    Must emit ONE combined fast path (`gbf*`), 2 window_table lookups (1 per base), and 1
+    //    dirty mark (for written base `rbx` only).
+    let dual_f = super::asm_function(0x1000, |a| {
+        a.vmovdqu(xmm1, xmmword_ptr(rcx))?;
+        a.vpaddd(xmm0, xmm1, xmm1)?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.vmovdqu(xmm2, xmmword_ptr(rcx + 16))?;
+        a.vpaddd(xmm0, xmm2, xmm1)?;
+        a.vmovdqu(xmmword_ptr(rbx + 16), xmm0)?;
+        a.vmovdqu(xmm3, xmmword_ptr(rcx + 32))?;
+        a.vpaddd(xmm0, xmm3, xmm2)?;
+        a.vmovdqu(xmmword_ptr(rbx + 32), xmm0)?;
+        a.vmovdqu(xmm4, xmmword_ptr(rcx + 48))?;
+        a.vpaddd(xmm0, xmm4, xmm3)?;
+        a.vmovdqu(xmmword_ptr(rbx + 48), xmm0)?;
+        a.ret()
+    });
+    let dual_ir = lift_module_with([&dual_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        dual_ir.matches("\ngbf").count(),
+        1,
+        "interleaved dual-base burst must emit one combined fast path:\n{dual_ir}"
+    );
+    assert_eq!(
+        dual_ir.matches("\ngbs").count(),
+        1,
+        "interleaved dual-base burst must emit one shared slow fallback:\n{dual_ir}"
+    );
+    assert_eq!(
+        dual_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        2,
+        "dual-base burst must perform exactly 2 window_table lookups (1 per base):\n{dual_ir}"
+    );
+    assert_eq!(
+        dual_ir.matches("load atomic i8, ptr ").count(),
+        1,
+        "only the written base rbx needs a dirty mark:\n{dual_ir}"
+    );
+    assert_eq!(
+        dual_ir.matches("store atomic i8 1, ptr ").count(),
+        1,
+        "single coalesced dirty mark for rbx:\n{dual_ir}"
+    );
+
+    // 2. Long >8-instruction single-base burst (20 instructions, up to MAX_BURST_INSNS = 24):
+    //    10 loads + 10 ALU ops from `[rcx + 0..80]` stay inside ONE burst.
+    let long_f = super::asm_function(0x2000, |a| {
+        a.xor(eax, eax)?;
+        for k in 0..10 {
+            a.mov(rdx, qword_ptr(rcx + (k * 8)))?;
+            a.add(rax, rdx)?;
+        }
+        a.ret()
+    });
+    let long_ir = lift_module_with([&long_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        long_ir.matches("\ngbf").count(),
+        1,
+        "20-instruction single-base burst must stay in one burst (MAX_BURST_INSNS=24):\n{long_ir}"
+    );
+    assert_eq!(
+        long_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        1,
+        "{long_ir}"
+    );
+
+    // 3. Dual-base burst where BOTH bases write emits 2 conditional dirty marks (`gbm*`).
+    let both_write_f = super::asm_function(0x3000, |a| {
+        a.mov(qword_ptr(rcx), rax)?;
+        a.mov(qword_ptr(rbx), rax)?;
+        a.mov(qword_ptr(rcx + 8), rdx)?;
+        a.mov(qword_ptr(rbx + 8), rdx)?;
+        a.ret()
+    });
+    let both_ir = lift_module_with([&both_write_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(both_ir.matches("\ngbf").count(), 1, "{both_ir}");
+    assert_eq!(
+        both_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        2,
+        "{both_ir}"
+    );
+    assert_eq!(both_ir.matches("\ngbm").count(), 2, "{both_ir}");
+    assert_eq!(both_ir.matches("store atomic i8 1, ptr ").count(), 2, "{both_ir}");
+
+    // 4. Stack-flat base (`rbp` copied from `rsp`) is skipped from a dual-base burst so only the
+    //    non-stack base `rcx` pays a window check.
+    let stack_dual_f = super::asm_function(0x4000, |a| {
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.sub(rsp, 0x40)?;
+        a.vmovdqu(xmm0, xmmword_ptr(rcx))?;
+        a.vmovdqu(xmmword_ptr(rbp - 0x10), xmm0)?;
+        a.vmovdqu(xmm1, xmmword_ptr(rcx + 16))?;
+        a.vmovdqu(xmmword_ptr(rbp - 0x20), xmm1)?;
+        a.add(rsp, 0x40)?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+    let stack_dual_ir = lift_module_with([&stack_dual_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        stack_dual_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        1,
+        "stack-flat rbp must be dropped from dual-base burst leaving 1-base burst on rcx:\n{stack_dual_ir}"
+    );
+    assert!(
+        !stack_dual_ir.contains("__playgta6_window_dirty"),
+        "stack-flat rbp stores must not emit window dirty marks:\n{stack_dual_ir}"
+    );
+
+    // 5. Soundness: modifying the second base GPR strictly inside the first base's burst must NOT
+    //    merge it into a dual-base burst.
+    let mod_base_f = super::asm_function(0x5000, |a| {
+        a.vmovdqu(xmm0, xmmword_ptr(rcx))?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.add(rbx, 32)?;
+        a.vmovdqu(xmm1, xmmword_ptr(rcx + 16))?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm1)?;
+        a.ret()
+    });
+    let mod_ir = lift_module_with([&mod_base_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        mod_ir.matches("\ngbf").count(),
+        1,
+        "rcx still forms a 1-base burst:\n{mod_ir}"
+    );
+    assert_eq!(
+        mod_ir.matches("\ngbc").count(),
+        0,
+        "modified rbx must NOT be merged as a second base in rcx's burst:\n{mod_ir}"
     );
 }
 

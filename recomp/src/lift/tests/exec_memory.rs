@@ -988,3 +988,136 @@ fn r58_burst_coalescing_rmw_and_avx256_handle_all_boundaries() {
         }
     }
 }
+
+#[test]
+fn r63_dual_base_burst_and_cross_slot_marks_execute() {
+    if !exec_or_skip("r63_dual_base_burst_and_cross_slot_marks_execute") {
+        return;
+    }
+    // Exercises R63a + R63b + R63c end-to-end under every memory model:
+    //  - 12-instruction (>8) interleaved dual-base SIMD read/write burst:
+    //      [rcx + 0/16/32/48] loads + vpaddd xmm0 (repeated VEX-128 writes to xmm0 -> R63a)
+    //      interleaved with [rbx + 0/16/32/48] stores (R63b dual-base burst!)
+    //  - Followed by a standalone non-burst multi-byte store `[r8]` (R63c compact cross-slot mark).
+    let f = asm_function(CODE_BASE, |a| {
+        a.vmovdqu(xmm1, xmmword_ptr(rcx))?;
+        a.vpaddd(xmm0, xmm1, xmm1)?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.vmovdqu(xmm2, xmmword_ptr(rcx + 16))?;
+        a.vpaddd(xmm0, xmm2, xmm1)?;
+        a.vmovdqu(xmmword_ptr(rbx + 16), xmm0)?;
+        a.vmovdqu(xmm3, xmmword_ptr(rcx + 32))?;
+        a.vpaddd(xmm0, xmm3, xmm2)?;
+        a.vmovdqu(xmmword_ptr(rbx + 32), xmm0)?;
+        a.vmovdqu(xmm4, xmmword_ptr(rcx + 48))?;
+        a.vpaddd(xmm0, xmm4, xmm3)?;
+        a.vmovdqu(xmmword_ptr(rbx + 48), xmm0)?;
+        // Standalone non-burst store (separated by vzeroupper + different base r8) to exercise R63c:
+        a.vzeroupper()?;
+        a.mov(qword_ptr(r8), r9)?;
+        a.ret()
+    });
+
+    // Input: 16 u32 lanes [1..=16].
+    let mut src_bytes = Vec::with_capacity(64);
+    for i in 1u32..=16 {
+        src_bytes.extend_from_slice(&i.to_le_bytes());
+    }
+    // Expected output:
+    //   chunk 0: in[0..4] + in[0..4]
+    //   chunk 1: in[4..8] + in[0..4]
+    //   chunk 2: in[8..12] + in[4..8]
+    //   chunk 3: in[12..16] + in[8..12]
+    let mut want_dst = Vec::with_capacity(64);
+    let lane = |k: usize| (k as u32) + 1;
+    for k in 0..4 {
+        want_dst.extend_from_slice(&(lane(k) + lane(k)).to_le_bytes());
+    }
+    for k in 4..16 {
+        want_dst.extend_from_slice(&(lane(k) + lane(k - 4)).to_le_bytes());
+    }
+    let tail_val = 0xCAFE_BABE_1234_5678u64;
+
+    struct DualScenario {
+        name: &'static str,
+        src: u64,
+        dst: u64,
+        tail: u64,
+        want_slots: Vec<u64>,
+        outside_store: bool,
+    }
+    let scenarios = [
+        // 1. All flat (outside window): fast path, no dirty marks.
+        DualScenario {
+            name: "all_flat",
+            src: FLAT_ADDR,
+            dst: FLAT_ADDR + 0x100,
+            tail: FLAT_ADDR + 0x200,
+            want_slots: vec![],
+            outside_store: true,
+        },
+        // 2. Both bases in-window single-slot (fast path!): dst marks slot 3, tail marks slot 4.
+        DualScenario {
+            name: "both_in_window_single_slot",
+            src: boundary(2) + 0x100,
+            dst: boundary(3) + 0x100,
+            tail: boundary(4) + 0x100,
+            want_slots: vec![3, 4],
+            outside_store: false,
+        },
+        // 3. src straddles 64 KiB boundary (slots 1|2) while dst is single-slot (slot 3):
+        //    forces shared slow fallback! dst still writes cleanly and marks slot 3.
+        DualScenario {
+            name: "src_straddles_slot",
+            src: boundary(2) - 24,
+            dst: boundary(3) + 0x100,
+            tail: boundary(4) + 0x100,
+            want_slots: vec![3, 4],
+            outside_store: false,
+        },
+        // 4. dst straddles 64 KiB boundary (slots 5|6) while src is single-slot (slot 2):
+        //    forces shared slow fallback! Both slots 5 and 6 must be marked dirty.
+        DualScenario {
+            name: "dst_straddles_slot",
+            src: boundary(2) + 0x100,
+            dst: boundary(6) - 24,
+            tail: FLAT_ADDR + 0x200,
+            want_slots: vec![5, 6],
+            outside_store: true,
+        },
+        // 5. Standalone tail store `[r8]` straddles 64 KiB boundary (slots 7|8) -> R63c compact
+        //    cross-slot dirty mark must mark BOTH slots 7 and 8!
+        DualScenario {
+            name: "r63c_tail_cross_slot",
+            src: FLAT_ADDR,
+            dst: FLAT_ADDR + 0x100,
+            tail: boundary(8) - 3,
+            want_slots: vec![7, 8],
+            outside_store: true,
+        },
+    ];
+
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        for sc in &scenarios {
+            let sc_name = sc.name;
+            let case = Case::new(CODE_BASE)
+                .reg(RCX, sc.src)
+                .reg(RBX, sc.dst)
+                .reg(super::exec::R8, sc.tail)
+                .reg(super::exec::R9, tail_val)
+                .mem(sc.src, &src_bytes)
+                .read(sc.dst, 64)
+                .read(sc.tail, 8);
+            let o = run(&built, &[case]);
+            ok(&o, &format!("{name}/{sc_name}"));
+            assert_eq!(o[0].mem[0], want_dst, "{name}/{sc_name}: dst");
+            assert_eq!(le(&o[0].mem[1]), tail_val, "{name}/{sc_name}: tail");
+            assert_eq!(
+                o[0].dirty,
+                expected_marks(name, &sc.want_slots, sc.outside_store),
+                "{name}/{sc_name}: dirty"
+            );
+        }
+    }
+}
