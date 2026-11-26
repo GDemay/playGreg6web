@@ -582,8 +582,9 @@ std::string binding_key(const ReflectedBinding& b) {
 
 // The root-constants parameter holding user SGPR `user_sgpr` and the 32-bit value's index in it
 // (-1 when no constants parameter covers it).
-int root_constant_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr, uint32_t* dword) {
-    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+int root_constant_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr, uint32_t* dword,
+                                uint32_t base = 0) {
+    uint32_t sgpr = base != 0 ? base : compute ? kComputeUserDataBase : kGraphicsUserDataBase;
     for (size_t i = 0; i < rs.parameters.size(); ++i) {
         const uint32_t n = parameter_dwords(rs.parameters[i]);
         if (user_sgpr >= sgpr && user_sgpr < sgpr + n) {
@@ -729,8 +730,8 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
 }
 
 int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
-                                        uint32_t* dword) {
-    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+                                        uint32_t* dword, uint32_t base) {
+    uint32_t sgpr = base != 0 ? base : compute ? kComputeUserDataBase : kGraphicsUserDataBase;
     for (size_t i = 0; i < rs.parameters.size(); ++i) {
         const uint32_t n = parameter_dwords(rs.parameters[i]);
         if (user_sgpr >= sgpr && user_sgpr < sgpr + n) {
@@ -744,8 +745,8 @@ int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool c
     return -1;
 }
 
-int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr) {
-    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr, uint32_t base) {
+    uint32_t sgpr = base != 0 ? base : compute ? kComputeUserDataBase : kGraphicsUserDataBase;
     for (size_t i = 0; i < rs.parameters.size(); ++i) {
         if (sgpr == user_sgpr) {
             return static_cast<int>(i);
@@ -760,8 +761,8 @@ namespace {
 // The constant buffer a CB-indexed index or a lane-indexed window base is read from (G62): the
 // root parameter at b.user_sgpr, checked against b.cbv. False with the reason when it does not fit.
 bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const ReflectedBinding& b, int* pi_out,
-                   d3d::HeapIndexSource* from, uint32_t* cb_table_slot, std::string* why) {
-    const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
+                   d3d::HeapIndexSource* from, uint32_t* cb_table_slot, std::string* why, uint32_t base) {
+    const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr, base);
     if (pi < 0) {
         *why = "no root parameter starts at s" + std::to_string(b.user_sgpr);
         return false;
@@ -835,7 +836,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
             if (b.source == ReflectedSource::SamplerHeap || b.source == ReflectedSource::ResourceHeap) {
                 // Heap-indexed: the index must be a root constant; the class follows the kind.
                 uint32_t dword = 0;
-                const int pi = root_constant_for_user_sgpr(rs, compute, b.heap_index_sgpr, &dword);
+                const int pi = root_constant_for_user_sgpr(rs, compute, b.heap_index_sgpr, &dword, options.user_data_base);
                 if (pi < 0) {
                     fail(b, "s" + std::to_string(b.heap_index_sgpr) + " is not inside a root-constants parameter");
                     continue;
@@ -863,7 +864,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 int pi = -1;
                 d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
                 std::string why;
-                if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &why)) {
+                if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &why, options.user_data_base)) {
                     fail(b, why);
                     continue;
                 }
@@ -905,7 +906,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 uint32_t slot = 0;
                 if (b.lane_has_window_base) {
                     std::string why;
-                    if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why)) {
+                    if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why, options.user_data_base)) {
                         fail(b, "window base: " + why);
                         continue;
                     }
@@ -978,7 +979,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 }
             } else {
                 uint32_t into = 0;
-                const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into);
+                const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into, options.user_data_base);
                 if (pi < 0) {
                     fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
                     continue;
