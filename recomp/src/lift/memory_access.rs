@@ -18,6 +18,23 @@ use crate::lift::{GuestBase, Support};
 /// through non-`rsp` base registers (e.g. frame pointers `mov rbp, rsp; mov [rbp - 0x20], rax`).
 pub(super) const STACK_FRAME_MAX_DISP: i64 = 0x10_0000;
 
+/// Half of [`STACK_FRAME_MAX_DISP`]: bound for merged stack-frame offsets across non-identical
+/// incoming paths so subsequent `[reg + disp]` accesses with `|disp| <= STACK_FRAME_HALF` stay
+/// provably within [`STACK_FRAME_MAX_DISP`] of `entry_rsp`.
+pub(super) const STACK_FRAME_HALF: i64 = STACK_FRAME_MAX_DISP / 2;
+
+/// Proven stack-pointer displacement tracked for an SSA address value in [`FunctionLifter::stack_values`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StackDisp {
+    /// Exact displacement `d` from `rsp` (or `entry_rsp`).
+    Exact(i64),
+    /// Unknown displacement bounded by `|d| <= max_abs` (`0 <= max_abs <= STACK_FRAME_MAX_DISP`).
+    Bounded(i64),
+}
+
+/// Maximum number of dynamic window translations cached simultaneously within one basic block.
+const MAX_WINDOW_LOAD_CACHE: usize = 4;
+
 /// Maximum span (in bytes) of a coalesced same-base window burst.
 pub(super) const BURST_MAX_SPAN: u64 = 4096;
 
@@ -749,8 +766,11 @@ impl FunctionLifter<'_> {
             }
             MemoryModel::Windowed(w) if matches!(access, Access::Store { .. }) => {
                 if (bytes <= 1 || self.contiguous_runs())
-                    && let Some(cached) = self.window_load_cache.clone()
-                    && cached.addr == addr
+                    && let Some(cached) = self
+                        .window_load_cache
+                        .iter()
+                        .find(|c| c.addr == addr)
+                        .cloned()
                 {
                     self.access_at(&cached.ptr, &access);
                     let mark_block = self.new_label("gm");
@@ -770,8 +790,11 @@ impl FunctionLifter<'_> {
             }
             MemoryModel::Windowed(w) => {
                 if (bytes <= 1 || self.contiguous_runs())
-                    && let Some(cached) = self.window_load_cache.clone()
-                    && cached.addr == addr
+                    && let Some(cached) = self
+                        .window_load_cache
+                        .iter()
+                        .find(|c| c.addr == addr)
+                        .cloned()
                 {
                     return self.access_at(&cached.ptr, &access);
                 }
@@ -794,7 +817,10 @@ impl FunctionLifter<'_> {
                     ));
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
-                    self.window_load_cache = Some(CachedWindowAddr {
+                    if self.window_load_cache.len() >= MAX_WINDOW_LOAD_CACHE {
+                        self.window_load_cache.remove(0);
+                    }
+                    self.window_load_cache.push(CachedWindowAddr {
                         addr: addr.to_string(),
                         inside,
                         rel,
@@ -1018,25 +1044,48 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// Notes that `value` is a stack-pointer-relative guest address at `disp` bytes from `rsp`
-    /// (see `stack_flat`).
+    /// Notes that SSA `value` is a stack-pointer-relative guest address at `disp` bytes from `rsp`
+    /// (or `entry_rsp`) (see `stack_flat`). Non-SSA integer literals are ignored so they can never
+    /// alias arbitrary constant addresses.
     pub(super) fn note_stack_value(&mut self, value: &str, disp: i64) {
-        if self.stack_flat().is_some() {
-            self.stack_values.insert(value.to_string(), disp);
+        if self.stack_flat().is_some() && value.starts_with('%') {
+            self.stack_values
+                .insert(value.to_string(), StackDisp::Exact(disp));
+        }
+    }
+
+    /// Notes that SSA `value` is a stack-pointer-relative guest address within `max_abs` bytes of
+    /// `entry_rsp` (`0 <= max_abs <= STACK_FRAME_MAX_DISP`).
+    pub(super) fn note_stack_bounded(&mut self, value: &str, max_abs: i64) {
+        if self.stack_flat().is_some()
+            && value.starts_with('%')
+            && (0..=STACK_FRAME_MAX_DISP).contains(&max_abs)
+        {
+            self.stack_values
+                .insert(value.to_string(), StackDisp::Bounded(max_abs));
         }
     }
 
     /// Propagates bounded stack-pointer provenance from `base` to `derived = base + delta`
     /// (e.g. frame-pointer `[rbp - disp]` or high-half AVX `[rsp + disp + 16]`).
     pub(super) fn propagate_stack_offset(&mut self, base: &str, derived: &str, delta: i64) {
-        if self.stack_flat().is_none() {
+        if self.stack_flat().is_none() || !derived.starts_with('%') {
             return;
         }
-        if let Some(&base_disp) = self.stack_values.get(base)
-            && let Some(total) = base_disp.checked_add(delta)
-            && total.abs() <= STACK_FRAME_MAX_DISP
-        {
-            self.stack_values.insert(derived.to_string(), total);
+        let next = match self.stack_values.get(base).copied() {
+            Some(StackDisp::Exact(base_disp)) => base_disp
+                .checked_add(delta)
+                .filter(|total| total.abs() <= STACK_FRAME_MAX_DISP)
+                .map(StackDisp::Exact),
+            Some(StackDisp::Bounded(max_abs)) => delta
+                .checked_abs()
+                .and_then(|d| max_abs.checked_add(d))
+                .filter(|&total| total <= STACK_FRAME_MAX_DISP)
+                .map(StackDisp::Bounded),
+            None => None,
+        };
+        if let Some(next) = next {
+            self.stack_values.insert(derived.to_string(), next);
         }
     }
 
@@ -1067,15 +1116,15 @@ impl FunctionLifter<'_> {
             return Ok(false);
         }
         // Skip any plain base register already known to be stack-flat (its accesses are already
-        // flat with zero overhead); indexed `[base + idx*scale + disp]` is never assumed stack-flat.
+        // flat with zero overhead) or a compile-time constant whose span lies strictly outside the
+        // window (`const_window_access` already emits direct flat loads/stores with zero checks);
+        // indexed `[base + idx*scale + disp]` is never assumed stack-flat.
         let mut active_bases: Vec<BurstBase> = Vec::with_capacity(MAX_BURST_BASES);
         let mut span_m1s: Vec<u64> = Vec::with_capacity(MAX_BURST_BASES);
         for &b in burst.active_bases() {
             if b.key.index.is_none()
                 && self.stack_flat().is_some()
-                && self
-                    .known_gpr(b.key.base)
-                    .is_some_and(|v| self.stack_values.contains_key(v))
+                && self.is_gpr_stack_proven(b.key.base)
             {
                 continue;
             }
@@ -1090,6 +1139,19 @@ impl FunctionLifter<'_> {
                 return Ok(false);
             }
             let span_m1 = span - 1;
+            if b.key.index.is_none()
+                && let Some(va) = self.known_gpr(b.key.base).and_then(const_addr)
+            {
+                let lo = va.wrapping_add(b.min_d as u64);
+                let hi = lo.wrapping_add(span_m1);
+                let win_end = w.base.wrapping_add(w.size);
+                let outside = lo <= hi
+                    && w.base <= win_end
+                    && (hi < w.base || lo >= win_end);
+                if outside {
+                    continue;
+                }
+            }
             if w.base < span_m1 || w.size > u64::MAX - span_m1 {
                 return Ok(false);
             }
@@ -1121,6 +1183,7 @@ impl FunctionLifter<'_> {
                 base_vals.push(eff_base);
             }
             let entry_known = self.known.clone();
+            let entry_facts = self.block_entry_facts;
             let entry_ymmh_zeroed = self.ymmh_zeroed;
             self.support.insert(Support::Memory(Decl::WindowTable));
             let flat_base = self.flat_base_val(w.flat);
@@ -1192,6 +1255,7 @@ impl FunctionLifter<'_> {
             // Fast path (already positioned at `%fast`): flat outside window OR single window slot
             // for every active base.
             self.known = entry_known.clone();
+            self.block_entry_facts = entry_facts;
             self.ymmh_zeroed = entry_ymmh_zeroed;
             self.clear_window_cache();
             let mut fast_override_bases = Vec::with_capacity(active_bases.len());
@@ -1219,6 +1283,7 @@ impl FunctionLifter<'_> {
                 r?;
             }
             let fast_known = self.known.clone();
+            let fast_facts = self.block_entry_facts;
             let fast_ymmh_zeroed = self.ymmh_zeroed;
             let done_fast = self.burst_override.take();
             let mut marks: Vec<(String, String)> = Vec::new();
@@ -1258,6 +1323,7 @@ impl FunctionLifter<'_> {
             // straddles.
             self.start_internal_block(&slow);
             self.known = entry_known.clone();
+            self.block_entry_facts = entry_facts;
             self.ymmh_zeroed = entry_ymmh_zeroed;
             self.clear_window_cache();
             let slow_override_bases = active_bases
@@ -1284,6 +1350,7 @@ impl FunctionLifter<'_> {
                 r?;
             }
             let slow_known = self.known.clone();
+            let slow_facts = self.block_entry_facts;
             let slow_ymmh_zeroed = self.ymmh_zeroed;
             self.burst_override = None;
             self.emit(&format!("br label %{join}"));
@@ -1293,6 +1360,7 @@ impl FunctionLifter<'_> {
             // and clear modified registers so `mem2reg` merges them via allocas.
             self.start_block(&join);
             self.restore_unchanged_known(&entry_known, &fast_known, &slow_known);
+            self.restore_unchanged_block_entry_facts(&entry_facts, &fast_facts, &slow_facts);
             self.ymmh_zeroed = fast_ymmh_zeroed & slow_ymmh_zeroed;
             Ok(())
         })();

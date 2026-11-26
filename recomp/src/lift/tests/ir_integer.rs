@@ -736,3 +736,115 @@ fn repeated_effective_address_math_in_a_block_is_computed_once() {
     });
     assert_eq!(ir.matches("shl i64 ").count(), 1, "{ir}");
 }
+
+#[test]
+fn r71_bit_ops_const_fast_paths_lzcnt_tzcnt_mulx_and_adcx_adox() {
+    // 1. `bextr` and `bzhi` with known constant control/index emit compact shift/mask ops (no
+    //    `select` bounds clamping from `shift_or`/`low_mask`).
+    let bmi_const = module_ir(|a| {
+        a.mov(ecx, 0x0804)?; // start=4, len=8
+        a.bextr(eax, edx, ecx)?;
+        a.mov(r8d, 12)?;
+        a.bzhi(r9d, edx, r8d)?;
+        a.xor(ecx, ecx)?; // kill flags
+        a.ret()
+    });
+    assert!(
+        !bmi_const.contains("select i1 "),
+        "const bextr/bzhi must avoid dynamic shift_or/low_mask selects:\n{bmi_const}"
+    );
+    assert!(
+        bmi_const.contains("lshr i32 ") && bmi_const.contains(", 4\n"),
+        "const bextr should shift right by 4:\n{bmi_const}"
+    );
+    assert!(
+        bmi_const.contains("and i32 ") && bmi_const.contains(", 255\n"),
+        "const bextr should mask 8 bits:\n{bmi_const}"
+    );
+    assert!(
+        bmi_const.contains("and i32 ") && bmi_const.contains(", 4095\n"),
+        "const bzhi(12) should mask 12 bits:\n{bmi_const}"
+    );
+
+    // 2. `pext` / `pdep` with constant masks (0, all-ones, 1 run, 4 runs) inline without pulling
+    //    in `@__playgta6_pext` or `@__playgta6_pdep`!
+    let pext_fast = module_ir(|a| {
+        a.mov(r8, 0x00FF_00FF_00FF_00FFu64)?; // 4 runs
+        a.pext(rax, rcx, r8)?;
+        a.pdep(rdx, rax, r8)?;
+        a.mov(r9d, 0x00FF_0000u32)?; // 1 run
+        a.pext(r10d, ecx, r9d)?;
+        a.pdep(r11d, r10d, r9d)?;
+        a.ret()
+    });
+    assert!(
+        !pext_fast.contains("__playgta6_pext") && !pext_fast.contains("__playgta6_pdep"),
+        "1..=4 run constant masks must bypass loop helpers:\n{pext_fast}"
+    );
+
+    // 3. `pext` with >4 runs (`0x5555_5555_5555_5555`) falls back to `@__playgta6_pext`.
+    let pext_many = module_ir(|a| {
+        a.mov(r8, 0x5555_5555_5555_5555u64)?;
+        a.pext(rax, rcx, r8)?;
+        a.ret()
+    });
+    assert!(
+        pext_many.contains("@__playgta6_pext("),
+        ">4 runs mask must keep helper call:\n{pext_many}"
+    );
+
+    // 4. `lzcnt`/`tzcnt` compute ZF from `src` directly (breaking dependency on ctlz/cttz).
+    let cnt_ir = module_ir(|a| {
+        a.lzcnt(rax, rcx)?;
+        a.setz(dl)?;
+        a.tzcnt(r8, r9)?;
+        a.setz(r10b)?;
+        a.xor(ecx, ecx)?;
+        a.ret()
+    });
+    assert!(
+        cnt_ir.contains("icmp slt i64 ") && cnt_ir.contains(", 0\n"),
+        "lzcnt ZF should test msb(src) directly:\n{cnt_ir}"
+    );
+    assert!(
+        cnt_ir.contains("trunc i64 ") && cnt_ir.contains(" to i1\n"),
+        "tzcnt ZF should test lsb(src) directly:\n{cnt_ir}"
+    );
+
+    // 5. `mulx` with identical 32-bit destinations skips computing/storing the unused low half
+    //    (only 3 `trunc i64`: `ecx`, `edx`, and `hi` after `lshr 32`; no 4th `trunc` for `lo`).
+    let mulx_ir = module_ir(|a| {
+        a.mulx(r8d, r8d, ecx)?;
+        a.ret()
+    });
+    assert_eq!(
+        mulx_ir.matches("trunc i64 ").count(),
+        3,
+        "equal-dst 32-bit mulx should skip low-half trunc:\n{mulx_ir}"
+    );
+    assert_eq!(
+        mulx_ir.matches(", ptr %r8\n").count(),
+        1,
+        "equal-dst mulx must write %r8 only once (high half):\n{mulx_ir}"
+    );
+
+    // 6. `adcx`/`adox` chain: first limb folds constant CF=0 (no zext), trailing dead-flag limb
+    //    elides carry calculation completely.
+    let adcx_ir = module_ir(|a| {
+        a.xor(eax, eax)?; // CF = 0, OF = 0
+        a.adcx(rcx, rdx)?;
+        a.adcx(r8, r9)?;
+        a.xor(eax, eax)?; // kills trailing CF
+        a.ret()
+    });
+    assert_eq!(
+        adcx_ir.matches("icmp ult i64 ").count(),
+        1,
+        "only the first adcx needs carry-out; trailing dead CF must be elided:\n{adcx_ir}"
+    );
+    assert_eq!(
+        adcx_ir.matches("zext i1 ").count(),
+        1,
+        "first adcx with known CF=0 must skip zext i1:\n{adcx_ir}"
+    );
+}

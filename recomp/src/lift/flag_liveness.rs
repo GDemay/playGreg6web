@@ -349,6 +349,8 @@ enum ProducerKind {
     ZeroOnly,
     /// `tzcnt` / `lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)`.
     BitCount,
+    /// `bt` / `bts` / `btr` / `btc`: `CF = tested bit`.
+    CarryOnly,
 }
 
 impl ProducerKind {
@@ -382,6 +384,7 @@ impl ProducerKind {
             }
             Self::ZeroOnly => matches!(cc, C::e | C::ne),
             Self::BitCount => matches!(cc, C::e | C::ne | C::b | C::ae),
+            Self::CarryOnly => matches!(cc, C::b | C::ae),
         }
     }
 }
@@ -508,6 +511,7 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
         M::Inc => Some(ProducerKind::Inc),
         M::Bsf | M::Bsr | M::Popcnt | M::Bextr => Some(ProducerKind::ZeroOnly),
         M::Tzcnt | M::Lzcnt => Some(ProducerKind::BitCount),
+        M::Bt | M::Bts | M::Btr | M::Btc => Some(ProducerKind::CarryOnly),
         _ => None,
     }
 }
@@ -747,6 +751,7 @@ pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
         {
             Some((0, 0))
         }
+        m if is_cmovcc(m) && same_reg_operands(ins) => Some((0, 0)),
         m if is_setcc(m) || is_cmovcc(m) => Some((read_mask(ins), 0)),
         M::Clc | M::Stc => Some((0, cf)),
         M::Cmc => Some((cf, cf)),

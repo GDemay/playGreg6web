@@ -364,14 +364,39 @@ impl FunctionLifter<'_> {
         let a = self.read_op(ins, 0, bits)?;
         let b = self.read_op(ins, 1, bits)?;
         let c = self.get_flag(flag);
-        let cz = self.val(&format!("zext i1 {c} to {t}"));
-        let s = self.val(&format!("add {t} {a}, {b}"));
-        let r = self.val(&format!("add {t} {s}, {cz}"));
-        let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
-        let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
-        let ceq = self.val(&format!("and i1 {c}, {eq}"));
-        let carry = self.val(&format!("or i1 {lt}, {ceq}"));
-        self.set_flag(flag, &carry);
+        let want_flag = self.flag_live(flag);
+        let r = match c.as_str() {
+            "false" => {
+                let r = self.val(&format!("add {t} {a}, {b}"));
+                if want_flag {
+                    let carry = self.val(&format!("icmp ult {t} {r}, {a}"));
+                    self.set_flag(flag, &carry);
+                }
+                r
+            }
+            "true" => {
+                let s = self.val(&format!("add {t} {a}, {b}"));
+                let r = self.val(&format!("add {t} {s}, 1"));
+                if want_flag {
+                    let carry = self.val(&format!("icmp ule {t} {r}, {a}"));
+                    self.set_flag(flag, &carry);
+                }
+                r
+            }
+            _ => {
+                let cz = self.val(&format!("zext i1 {c} to {t}"));
+                let s = self.val(&format!("add {t} {a}, {b}"));
+                let r = self.val(&format!("add {t} {s}, {cz}"));
+                if want_flag {
+                    let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
+                    let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
+                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                    let carry = self.val(&format!("or i1 {lt}, {ceq}"));
+                    self.set_flag(flag, &carry);
+                }
+                r
+            }
+        };
         self.write_op(ins, 0, &r, bits)
     }
 
