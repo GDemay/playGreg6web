@@ -866,8 +866,10 @@ fn r59_simd_vector_lowering_avoids_scalar_loops() {
                 assert!(ir.contains("@llvm.cttz.i16"), "{ir}");
             }
             "packsswb" => {
-                assert!(ir.contains("@llvm.smax.v8i16"), "{ir}");
-                assert!(ir.contains("@llvm.smin.v8i16"), "{ir}");
+                assert!(
+                    ir.contains("@llvm.wasm.narrow.signed.v16i8.v8i16("),
+                    "{ir}"
+                );
             }
             "pmulhrsw" => {
                 assert!(ir.contains("16384"), "{ir}");
@@ -904,5 +906,223 @@ fn r59_simd_vector_lowering_avoids_scalar_loops() {
     assert!(
         !native_ir.contains("llvm.wasm."),
         "wasm-only intrinsic leaked into native IR"
+    );
+}
+
+#[test]
+fn r66_wasm_simd128_native_lowering_ir() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "packsswb",
+            asm_function(0x1000, |a| {
+                a.packsswb(xmm0, xmm1)?;
+                a.vpacksswb(ymm2, ymm3, ymm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "packuswb",
+            asm_function(0x1100, |a| {
+                a.packuswb(xmm0, xmm1)?;
+                a.vpackuswb(xmm2, xmm3, xmm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "packssdw",
+            asm_function(0x1200, |a| {
+                a.packssdw(xmm0, xmm1)?;
+                a.vpackssdw(ymm2, ymm3, ymm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "packusdw",
+            asm_function(0x1300, |a| {
+                a.packusdw(xmm0, xmm1)?;
+                a.vpackusdw(xmm2, xmm3, xmm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmaddwd",
+            asm_function(0x1400, |a| {
+                a.pmaddwd(xmm0, xmm1)?;
+                a.vpmaddwd(ymm2, ymm3, ymm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pavgb",
+            asm_function(0x1500, |a| {
+                a.pavgb(xmm0, xmm1)?;
+                a.vpavgb(ymm2, ymm3, ymm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pavgw",
+            asm_function(0x1600, |a| {
+                a.pavgw(xmm0, xmm1)?;
+                a.vpavgw(ymm2, ymm3, ymm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "imm_shift_normal",
+            asm_function(0x1700, |a| {
+                a.psrlw(xmm0, 3)?;
+                a.vpslld(xmm1, xmm2, 5)?;
+                a.psraw(xmm3, 7)?;
+                a.ret()
+            }),
+        ),
+        (
+            "imm_shift_zero",
+            asm_function(0x1800, |a| {
+                a.psllw(xmm0, 0)?;
+                a.vpsrlq(xmm1, xmm2, 0)?;
+                a.ret()
+            }),
+        ),
+        (
+            "imm_shift_overshift",
+            asm_function(0x1900, |a| {
+                a.psllw(xmm0, 20)?;
+                a.psrld(xmm1, 32)?;
+                a.psraw(xmm2, 20)?;
+                a.ret()
+            }),
+        ),
+        (
+            "dyn_shift",
+            asm_function(0x1A00, |a| {
+                a.psrlw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "palignr_variants",
+            asm_function(0x1B00, |a| {
+                a.palignr(xmm0, xmm1, 0)?;
+                a.palignr(xmm0, xmm1, 5)?;
+                a.palignr(xmm0, xmm1, 16)?;
+                a.palignr(xmm0, xmm1, 20)?;
+                a.palignr(xmm0, xmm1, 32)?;
+                a.ret()
+            }),
+        ),
+        (
+            "broadcast_reg",
+            asm_function(0x1C00, |a| {
+                a.vbroadcastss(xmm0, xmm1)?;
+                a.vpbroadcastb(ymm2, xmm3)?;
+                a.ret()
+            }),
+        ),
+        (
+            "move_scalar_and_movq",
+            asm_function(0x1D00, |a| {
+                a.movss(xmm0, xmm1)?;
+                a.vmovss_3(xmm2, xmm3, xmm4)?;
+                a.movsd_2(xmm5, xmm6)?;
+                a.vmovsd_3(xmm7, xmm8, xmm9)?;
+                a.movq(xmm10, xmm11)?;
+                a.ret()
+            }),
+        ),
+        (
+            "dot_fp",
+            asm_function(0x1E00, |a| {
+                a.dpps(xmm0, xmm1, 0x7F)?;
+                a.dpps(xmm2, xmm3, 0xF1)?;
+                a.dppd(xmm4, xmm5, 0x33)?;
+                a.dppd(xmm6, xmm7, 0x11)?;
+                a.dpps(xmm8, xmm9, 0x0F)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for ((name, _), f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{name}: {:?}", f.unsupported);
+        let ir = &f.ir;
+        match *name {
+            "packsswb" => assert!(ir.contains("@llvm.wasm.narrow.signed.v16i8.v8i16("), "{ir}"),
+            "packuswb" => assert!(ir.contains("@llvm.wasm.narrow.unsigned.v16i8.v8i16("), "{ir}"),
+            "packssdw" => assert!(ir.contains("@llvm.wasm.narrow.signed.v8i16.v4i32("), "{ir}"),
+            "packusdw" => assert!(ir.contains("@llvm.wasm.narrow.unsigned.v8i16.v4i32("), "{ir}"),
+            "pmaddwd" => assert!(ir.contains("@llvm.wasm.dot("), "{ir}"),
+            "pavgb" => assert!(ir.contains("@llvm.wasm.avgr.unsigned.v16i8("), "{ir}"),
+            "pavgw" => assert!(ir.contains("@llvm.wasm.avgr.unsigned.v8i16("), "{ir}"),
+            "imm_shift_normal" => {
+                assert!(ir.contains("lshr <8 x i16>"), "{ir}");
+                assert!(ir.contains("shl <4 x i32>"), "{ir}");
+                assert!(ir.contains("ashr <8 x i16>"), "{ir}");
+                assert!(!ir.contains("icmp ugt"), "imm shift emitted dynamic clamp:\n{ir}");
+                assert!(!ir.contains("insertelement"), "imm shift emitted splat insert:\n{ir}");
+            }
+            "imm_shift_zero" => {
+                assert!(!ir.contains("shl "), "zero shift emitted shl:\n{ir}");
+                assert!(!ir.contains("lshr "), "zero shift emitted lshr:\n{ir}");
+                assert!(!ir.contains("icmp ugt"), "{ir}");
+            }
+            "imm_shift_overshift" => {
+                assert!(!ir.contains("shl "), "overshift emitted shl:\n{ir}");
+                assert!(!ir.contains("lshr "), "overshift emitted lshr:\n{ir}");
+                assert!(ir.contains("ashr <8 x i16>"), "{ir}");
+                assert!(ir.contains("i16 15"), "{ir}");
+                assert!(!ir.contains("icmp ugt"), "{ir}");
+            }
+            "dyn_shift" => {
+                assert!(ir.contains("icmp ugt i64"), "{ir}");
+            }
+            "palignr_variants" => {
+                assert!(
+                    !ir.contains("<32 x i8>"),
+                    "palignr emitted <32 x i8> intermediate:\n{ir}"
+                );
+                assert_eq!(
+                    ir.matches("shufflevector <16 x i8>").count(),
+                    2,
+                    "only imm=5 and imm=20 should emit shufflevector:\n{ir}"
+                );
+            }
+            "broadcast_reg" => {
+                assert!(
+                    !ir.contains("extractelement") && !ir.contains("insertelement"),
+                    "reg broadcast should emit single shufflevector:\n{ir}"
+                );
+                assert!(ir.contains("<4 x i32> zeroinitializer"), "{ir}");
+                assert!(ir.contains("<16 x i32> zeroinitializer"), "{ir}");
+            }
+            "move_scalar_and_movq" => {
+                assert!(
+                    !ir.contains("extractelement") && !ir.contains("insertelement"),
+                    "reg-reg movss/movsd/movq should emit single shufflevector:\n{ir}"
+                );
+                assert!(ir.contains("<i32 4, i32 1, i32 2, i32 3>"), "{ir}");
+                assert!(ir.contains("<i32 2, i32 1>"), "{ir}");
+                assert!(ir.contains("<i32 0, i32 2>"), "{ir}");
+            }
+            "dot_fp" => {
+                assert!(
+                    !ir.contains("extractelement") && !ir.contains("insertelement"),
+                    "dpps/dppd should not scalarize:\n{ir}"
+                );
+                assert!(ir.contains("fmul <4 x float>"), "{ir}");
+                assert!(ir.contains("fmul <2 x double>"), "{ir}");
+            }
+            _ => {}
+        }
+    }
+
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR:\n{native_ir}"
     );
 }

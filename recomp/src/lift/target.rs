@@ -9,9 +9,10 @@
 //! | `target triple` | [`WASM64_TRIPLE`](super::WASM64_TRIPLE) | the native triple (e.g. `x86_64-pc-windows-msvc`) |
 //! | `attributes #0` | wasm `target-features` (`+simd128`, atomics, bulk memory) | `uwtable "target-cpu"="<cpu>"` |
 //!
-//! The only wasm-specific construct in lifted IR besides those lines is the `llvm.wasm.swizzle`
-//! intrinsic (lifted `pshufb`); a native module defines an internal `@__playgta6_swizzle` with the
-//! same semantics on top of `llvm.x86.ssse3.pshuf.b.128` and calls that instead.
+//! The only wasm-specific constructs in lifted IR besides those lines are the `llvm.wasm.*`
+//! SIMD128 intrinsics (`swizzle`, `narrow.*`, `dot`, `avgr.unsigned.*`); a native module defines
+//! internal `@__playgta6_*` helpers with identical semantics on top of SSE2/SSSE3/SSE4.1
+//! intrinsics (or portable IR) and calls those instead.
 //!
 //! The wasm feature strings mean nothing to the x86 backend, so a native module drops them and
 //! names a CPU instead ([`NATIVE_DEFAULT_CPU`], `x86-64-v3` = AVX2/FMA/BMI2, which the lifted
@@ -29,13 +30,22 @@ use std::fmt;
 /// CPU of native modules unless another one is requested.
 pub const NATIVE_DEFAULT_CPU: &str = "x86-64-v3";
 
-/// Call/declaration marker of the one wasm-only intrinsic lifted SIMD code uses
-/// (`i8x16.swizzle`, for `pshufb`).
-const WASM_SWIZZLE_CALL: &str = "@llvm.wasm.swizzle(";
-const NATIVE_SWIZZLE_CALL: &str = "@__playgta6_swizzle(";
-/// Native replacement: wasm swizzle zeroes lanes whose index is >= 16, x86 `pshufb` lanes whose
-/// index has bit 7 set; map the former onto the latter (needs SSSE3, part of every x86-64-v2+ CPU).
-const NATIVE_SWIZZLE_IR: &str = "\
+/// Mapping from a wasm-only SIMD128 intrinsic to its native x86-64 internal helper.
+struct WasmIntrinsicRewrite {
+    wasm_call: &'static str,
+    native_call: &'static str,
+    native_ir: &'static str,
+}
+
+/// Native replacements for all `llvm.wasm.*` SIMD128 intrinsics emitted by the lifter.
+/// Every helper requires at most SSE4.1 (part of every x86-64-v2+ CPU).
+const WASM_INTRINSICS: &[WasmIntrinsicRewrite] = &[
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.swizzle(",
+        native_call: "@__playgta6_swizzle(",
+        // wasm swizzle zeroes lanes whose index is >= 16, x86 `pshufb` lanes whose index has
+        // bit 7 set; map the former onto the latter.
+        native_ir: "\
 define internal <16 x i8> @__playgta6_swizzle(<16 x i8> %a, <16 x i8> %idx) #0 {
   %big = icmp uge <16 x i8> %idx, <i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16, i8 16>
   %sel = select <16 x i1> %big, <16 x i8> <i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128, i8 -128>, <16 x i8> %idx
@@ -43,7 +53,94 @@ define internal <16 x i8> @__playgta6_swizzle(<16 x i8> %a, <16 x i8> %idx) #0 {
   ret <16 x i8> %r
 }
 declare <16 x i8> @llvm.x86.ssse3.pshuf.b.128(<16 x i8>, <16 x i8>)
-";
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.narrow.signed.v16i8.v8i16(",
+        native_call: "@__playgta6_narrow_s_i8x16(",
+        native_ir: "\
+define internal <16 x i8> @__playgta6_narrow_s_i8x16(<8 x i16> %a, <8 x i16> %b) #0 {
+  %r = call <16 x i8> @llvm.x86.sse2.packsswb.128(<8 x i16> %a, <8 x i16> %b)
+  ret <16 x i8> %r
+}
+declare <16 x i8> @llvm.x86.sse2.packsswb.128(<8 x i16>, <8 x i16>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.narrow.unsigned.v16i8.v8i16(",
+        native_call: "@__playgta6_narrow_u_i8x16(",
+        native_ir: "\
+define internal <16 x i8> @__playgta6_narrow_u_i8x16(<8 x i16> %a, <8 x i16> %b) #0 {
+  %r = call <16 x i8> @llvm.x86.sse2.packuswb.128(<8 x i16> %a, <8 x i16> %b)
+  ret <16 x i8> %r
+}
+declare <16 x i8> @llvm.x86.sse2.packuswb.128(<8 x i16>, <8 x i16>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.narrow.signed.v8i16.v4i32(",
+        native_call: "@__playgta6_narrow_s_i16x8(",
+        native_ir: "\
+define internal <8 x i16> @__playgta6_narrow_s_i16x8(<4 x i32> %a, <4 x i32> %b) #0 {
+  %r = call <8 x i16> @llvm.x86.sse2.packssdw.128(<4 x i32> %a, <4 x i32> %b)
+  ret <8 x i16> %r
+}
+declare <8 x i16> @llvm.x86.sse2.packssdw.128(<4 x i32>, <4 x i32>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.narrow.unsigned.v8i16.v4i32(",
+        native_call: "@__playgta6_narrow_u_i16x8(",
+        native_ir: "\
+define internal <8 x i16> @__playgta6_narrow_u_i16x8(<4 x i32> %a, <4 x i32> %b) #0 {
+  %r = call <8 x i16> @llvm.x86.sse41.packusdw(<4 x i32> %a, <4 x i32> %b)
+  ret <8 x i16> %r
+}
+declare <8 x i16> @llvm.x86.sse41.packusdw(<4 x i32>, <4 x i32>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.dot(",
+        native_call: "@__playgta6_dot_i32x4(",
+        native_ir: "\
+define internal <4 x i32> @__playgta6_dot_i32x4(<8 x i16> %a, <8 x i16> %b) #0 {
+  %r = call <4 x i32> @llvm.x86.sse2.pmadd.wd(<8 x i16> %a, <8 x i16> %b)
+  ret <4 x i32> %r
+}
+declare <4 x i32> @llvm.x86.sse2.pmadd.wd(<8 x i16>, <8 x i16>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.avgr.unsigned.v16i8(",
+        native_call: "@__playgta6_avgr_u_i8x16(",
+        native_ir: "\
+define internal <16 x i8> @__playgta6_avgr_u_i8x16(<16 x i8> %a, <16 x i8> %b) #0 {
+  %wa = zext <16 x i8> %a to <16 x i16>
+  %wb = zext <16 x i8> %b to <16 x i16>
+  %s1 = add nuw <16 x i16> %wa, %wb
+  %s2 = add nuw <16 x i16> %s1, <i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1>
+  %s3 = lshr <16 x i16> %s2, <i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1, i16 1>
+  %r = trunc <16 x i16> %s3 to <16 x i8>
+  ret <16 x i8> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.avgr.unsigned.v8i16(",
+        native_call: "@__playgta6_avgr_u_i16x8(",
+        native_ir: "\
+define internal <8 x i16> @__playgta6_avgr_u_i16x8(<8 x i16> %a, <8 x i16> %b) #0 {
+  %wa = zext <8 x i16> %a to <8 x i32>
+  %wb = zext <8 x i16> %b to <8 x i32>
+  %s1 = add nuw <8 x i32> %wa, %wb
+  %s2 = add nuw <8 x i32> %s1, <i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
+  %s3 = lshr <8 x i32> %s2, <i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
+  %r = trunc <8 x i32> %s3 to <8 x i16>
+  ret <8 x i16> %r
+}
+",
+    },
+];
 
 /// Where a lifted module will be compiled for.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -129,20 +226,25 @@ impl LiftTarget {
         let Self::Native { triple, cpu } = self else {
             return ir;
         };
-        let swizzle = ir.contains(WASM_SWIZZLE_CALL);
+        let has_wasm_intr = ir.contains("@llvm.wasm.");
         let mut out = String::with_capacity(ir.len());
         for line in ir.split_inclusive('\n') {
             let body = line.trim_end_matches(['\n', '\r']);
             if body.starts_with("target datalayout = ") {
                 continue;
             }
-            if swizzle && body.contains(WASM_SWIZZLE_CALL) {
-                if body.starts_with("declare ") {
-                    out.push_str(NATIVE_SWIZZLE_IR);
-                } else {
-                    out.push_str(&line.replace(WASM_SWIZZLE_CALL, NATIVE_SWIZZLE_CALL));
+            if has_wasm_intr && body.contains("@llvm.wasm.") {
+                if let Some(rew) = WASM_INTRINSICS
+                    .iter()
+                    .find(|rew| body.contains(rew.wasm_call))
+                {
+                    if body.starts_with("declare ") {
+                        out.push_str(rew.native_ir);
+                    } else {
+                        out.push_str(&line.replace(rew.wasm_call, rew.native_call));
+                    }
+                    continue;
                 }
-                continue;
             }
             if let Some(with_comdat) = linkonce_global_with_comdat(body) {
                 out.push_str(&with_comdat);
@@ -240,6 +342,75 @@ mod tests {
         assert!(out.contains("define internal <16 x i8> @__playgta6_swizzle("));
         assert!(out.contains("call <16 x i8> @__playgta6_swizzle(<16 x i8> %a, <16 x i8> %b)"));
         assert!(out.contains("@llvm.x86.ssse3.pshuf.b.128"));
+    }
+
+    #[test]
+    fn native_maps_all_wasm_simd_intrinsics() {
+        let ir = format!(
+            "{SAMPLE}\
+declare <16 x i8> @llvm.wasm.swizzle(<16 x i8>, <16 x i8>)
+declare <16 x i8> @llvm.wasm.narrow.signed.v16i8.v8i16(<8 x i16>, <8 x i16>)
+declare <16 x i8> @llvm.wasm.narrow.unsigned.v16i8.v8i16(<8 x i16>, <8 x i16>)
+declare <8 x i16> @llvm.wasm.narrow.signed.v8i16.v4i32(<4 x i32>, <4 x i32>)
+declare <8 x i16> @llvm.wasm.narrow.unsigned.v8i16.v4i32(<4 x i32>, <4 x i32>)
+declare <4 x i32> @llvm.wasm.dot(<8 x i16>, <8 x i16>)
+declare <16 x i8> @llvm.wasm.avgr.unsigned.v16i8(<16 x i8>, <16 x i8>)
+declare <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16>, <8 x i16>)
+  %r0 = call <16 x i8> @llvm.wasm.swizzle(<16 x i8> %a0, <16 x i8> %b0)
+  %r1 = call <16 x i8> @llvm.wasm.narrow.signed.v16i8.v8i16(<8 x i16> %a1, <8 x i16> %b1)
+  %r2 = call <16 x i8> @llvm.wasm.narrow.unsigned.v16i8.v8i16(<8 x i16> %a2, <8 x i16> %b2)
+  %r3 = call <8 x i16> @llvm.wasm.narrow.signed.v8i16.v4i32(<4 x i32> %a3, <4 x i32> %b3)
+  %r4 = call <8 x i16> @llvm.wasm.narrow.unsigned.v8i16.v4i32(<4 x i32> %a4, <4 x i32> %b4)
+  %r5 = call <4 x i32> @llvm.wasm.dot(<8 x i16> %a5, <8 x i16> %b5)
+  %r6 = call <16 x i8> @llvm.wasm.avgr.unsigned.v16i8(<16 x i8> %a6, <16 x i8> %b6)
+  %r7 = call <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16> %a7, <8 x i16> %b7)
+"
+        );
+        assert_eq!(LiftTarget::Wasm64.retarget(ir.clone()), ir);
+        let out = LiftTarget::native_host().retarget(ir);
+        assert!(!out.contains("llvm.wasm."), "leaked wasm intrinsic:\n{out}");
+        for (def_name, call_sig) in [
+            (
+                "define internal <16 x i8> @__playgta6_swizzle(",
+                "call <16 x i8> @__playgta6_swizzle(<16 x i8> %a0, <16 x i8> %b0)",
+            ),
+            (
+                "define internal <16 x i8> @__playgta6_narrow_s_i8x16(",
+                "call <16 x i8> @__playgta6_narrow_s_i8x16(<8 x i16> %a1, <8 x i16> %b1)",
+            ),
+            (
+                "define internal <16 x i8> @__playgta6_narrow_u_i8x16(",
+                "call <16 x i8> @__playgta6_narrow_u_i8x16(<8 x i16> %a2, <8 x i16> %b2)",
+            ),
+            (
+                "define internal <8 x i16> @__playgta6_narrow_s_i16x8(",
+                "call <8 x i16> @__playgta6_narrow_s_i16x8(<4 x i32> %a3, <4 x i32> %b3)",
+            ),
+            (
+                "define internal <8 x i16> @__playgta6_narrow_u_i16x8(",
+                "call <8 x i16> @__playgta6_narrow_u_i16x8(<4 x i32> %a4, <4 x i32> %b4)",
+            ),
+            (
+                "define internal <4 x i32> @__playgta6_dot_i32x4(",
+                "call <4 x i32> @__playgta6_dot_i32x4(<8 x i16> %a5, <8 x i16> %b5)",
+            ),
+            (
+                "define internal <16 x i8> @__playgta6_avgr_u_i8x16(",
+                "call <16 x i8> @__playgta6_avgr_u_i8x16(<16 x i8> %a6, <16 x i8> %b6)",
+            ),
+            (
+                "define internal <8 x i16> @__playgta6_avgr_u_i16x8(",
+                "call <8 x i16> @__playgta6_avgr_u_i16x8(<8 x i16> %a7, <8 x i16> %b7)",
+            ),
+        ] {
+            assert!(out.contains(def_name), "missing {def_name}:\n{out}");
+            assert!(out.contains(call_sig), "missing {call_sig}:\n{out}");
+        }
+        assert_eq!(
+            LiftTarget::native_host().retarget(out.clone()),
+            out,
+            "retarget must be idempotent"
+        );
     }
 
     #[test]
