@@ -47,7 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
+use iced_x86::{
+    Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register,
+};
 
 use crate::cfg::{
     BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
@@ -662,7 +664,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 block.successors.push(Edge::IndirectJump {
                     slot: rip_slot(instr),
                 });
-                if instr.op0_kind() == OpKind::Register {
+                // `jmp reg`, and `jmp qword ptr [base + index*8 (+ disp)]`: a pointer table read
+                // by the jump itself (a 64-bit absolute switch table, e.g. a threaded
+                // interpreter's opcode dispatch). A `[base + disp]` slot without an index is a
+                // vtable/callback tail call and stays on run-time dispatch unexamined.
+                let indexed_table_read = instr.op0_kind() == OpKind::Memory
+                    && !instr.is_ip_rel_memory_operand()
+                    && instr.memory_index() != Register::None;
+                if instr.op0_kind() == OpKind::Register || indexed_table_read {
                     self.pending_jumps.insert(ip);
                 }
                 Some(Terminator::IndirectJump)
