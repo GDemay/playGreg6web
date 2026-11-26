@@ -51,7 +51,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use iced_x86::{
-    Code, ConditionCode, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register,
+    Code, ConditionCode, Instruction, InstructionInfo, InstructionInfoFactory, Mnemonic, OpAccess,
+    OpKind, Register,
 };
 
 use super::memory_access::WindowBurst;
@@ -105,6 +106,8 @@ pub(super) const fn ymmh_state_bit(idx: usize) -> StateMask {
 pub struct FlagSummaries {
     live_in: BTreeMap<u64, FlagMask>,
     touched: BTreeMap<u64, StateMask>,
+    written: BTreeMap<u64, StateMask>,
+    live_in_state: BTreeMap<u64, StateMask>,
 }
 
 impl FlagSummaries {
@@ -112,7 +115,8 @@ impl FlagSummaries {
     /// anything else count as reading every flag.
     pub fn compute<'a>(functions: impl IntoIterator<Item = &'a cfg::Function>) -> Self {
         let functions: Vec<&cfg::Function> = functions.into_iter().collect();
-        let touched = touched_state(&functions);
+        let (touched, written) = state_effects(&functions);
+        let live_in_state = state_live_in(&functions, &touched);
         let functions: BTreeMap<u64, Model> = functions
             .into_iter()
             .map(|f| (f.entry, Model::new(f)))
@@ -143,7 +147,12 @@ impl FlagSummaries {
                 }
             }
         }
-        Self { live_in, touched }
+        Self {
+            live_in,
+            touched,
+            written,
+            live_in_state,
+        }
     }
 
     /// Flags the function at `entry` may observe on entry; `None` for a function outside the set.
@@ -158,9 +167,29 @@ impl FlagSummaries {
         self.touched.get(&entry).copied()
     }
 
-    /// Guest state a direct call to `target` must store before it and reload after it.
-    pub(super) fn touched_by(&self, target: u64) -> StateMask {
-        self.touched(target).unwrap_or(ALL_STATE)
+    /// Guest state a call to the function at `entry` may write (subset of [`Self::touched`]);
+    /// `None` for a function outside the set.
+    pub fn written(&self, entry: u64) -> Option<u64> {
+        self.written.get(&entry).copied()
+    }
+
+    /// Guest state whose value at `entry` may be observed (read before unconditional full
+    /// overwrite, or still unchanged at a return, indirect transfer, trap, or unmodelled
+    /// instruction); `None` for a function outside the set.
+    pub fn live_in_state(&self, entry: u64) -> Option<u64> {
+        self.live_in_state.get(&entry).copied()
+    }
+
+    /// Guest state a direct call to `target` must store before it (`touched & live_in_state`).
+    pub(super) fn sync_out_state_by(&self, target: u64) -> StateMask {
+        let touched = self.touched(target).unwrap_or(ALL_STATE);
+        let live_in = self.live_in_state(target).unwrap_or(ALL_STATE);
+        touched & live_in
+    }
+
+    /// Guest state a direct call to `target` must reload after it (`written`).
+    pub(super) fn written_by(&self, target: u64) -> StateMask {
+        self.written(target).unwrap_or(ALL_STATE)
     }
 
     /// Flags a direct call or tail jump to `target` must store first.
@@ -556,13 +585,16 @@ pub(super) fn dead_flags_for_block(
     for (idx, ins) in body.iter().enumerate().rev() {
         live = match instruction_step(block, ins) {
             Step::Effect { gen_, kill } => {
-                if ins.mnemonic() != Mnemonic::Call && flag_effect(ins).is_some() {
+                if ins.mnemonic() == Mnemonic::Call || flag_effect(ins).is_some() {
                     dead[idx] = ALL_FLAGS & !live;
                 }
                 let effective_gen = if fused_body[idx] { 0 } else { gen_ };
                 effective_gen | (live & !kill)
             }
-            Step::Call(target) => needed(target),
+            Step::Call(target) => {
+                dead[idx] = ALL_FLAGS & !live;
+                needed(target)
+            }
         };
     }
     dead
@@ -830,17 +862,20 @@ fn simd_flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     }
 }
 
-/// [`FlagSummaries::touched`] for every function: least fixed point of "own effects plus the
-/// effects of every direct callee and tail-jump target".
-fn touched_state(functions: &[&cfg::Function]) -> BTreeMap<u64, StateMask> {
+/// [`FlagSummaries::touched`] and [`FlagSummaries::written`] for every function: least fixed point
+/// of "own effects plus the effects of every direct callee and tail-jump target".
+fn state_effects(
+    functions: &[&cfg::Function],
+) -> (BTreeMap<u64, StateMask>, BTreeMap<u64, StateMask>) {
     let mut factory = InstructionInfoFactory::new();
-    let own: BTreeMap<u64, (StateMask, BTreeSet<u64>)> = functions
+    let own: BTreeMap<u64, (StateMask, StateMask, BTreeSet<u64>)> = functions
         .iter()
         .map(|f| (f.entry, own_effects(f, &mut factory)))
         .collect();
     let mut touched: BTreeMap<u64, StateMask> = own.keys().map(|&entry| (entry, 0)).collect();
+    let mut written: BTreeMap<u64, StateMask> = own.keys().map(|&entry| (entry, 0)).collect();
     let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
-    for (&entry, (_, callees)) in &own {
+    for (&entry, (_, _, callees)) in &own {
         for &callee in callees {
             if own.contains_key(&callee) {
                 callers.entry(callee).or_default().insert(entry);
@@ -851,14 +886,18 @@ fn touched_state(functions: &[&cfg::Function]) -> BTreeMap<u64, StateMask> {
     let mut work: VecDeque<u64> = own.keys().copied().collect();
     while let Some(entry) = work.pop_front() {
         queued.remove(&entry);
-        let (mask, callees) = &own[&entry];
-        let old = touched[&entry];
-        let mut new = old | mask;
+        let (own_t, own_w, callees) = &own[&entry];
+        let old_t = touched[&entry];
+        let old_w = written[&entry];
+        let mut new_t = old_t | own_t;
+        let mut new_w = old_w | own_w;
         for callee in callees {
-            new |= touched.get(callee).copied().unwrap_or(ALL_STATE);
+            new_t |= touched.get(callee).copied().unwrap_or(ALL_STATE);
+            new_w |= written.get(callee).copied().unwrap_or(ALL_STATE);
         }
-        if new != old {
-            touched.insert(entry, new);
+        if new_t != old_t || new_w != old_w {
+            touched.insert(entry, new_t);
+            written.insert(entry, new_w);
             for &caller in callers.get(&entry).into_iter().flatten() {
                 if queued.insert(caller) {
                     work.push_back(caller);
@@ -866,56 +905,62 @@ fn touched_state(functions: &[&cfg::Function]) -> BTreeMap<u64, StateMask> {
             }
         }
     }
-    touched
+    (touched, written)
 }
 
-/// The state one function touches itself, and its direct callees and tail-jump targets.
+/// The state one function touches and writes itself, and its direct callees and tail-jump targets.
 fn own_effects(
     func: &cfg::Function,
     factory: &mut InstructionInfoFactory,
-) -> (StateMask, BTreeSet<u64>) {
+) -> (StateMask, StateMask, BTreeSet<u64>) {
     let mut callees = BTreeSet::new();
     if !func.blocks.contains_key(&func.entry) {
-        return (ALL_STATE, callees);
+        return (ALL_STATE, ALL_STATE, callees);
     }
     let rsp: StateMask = 1 << Register::RSP.number();
-    let mut mask: StateMask = 0;
+    let mut touched: StateMask = 0;
+    let mut written: StateMask = 0;
     for block in func.blocks.values() {
         let (body, transfer) = match block.instructions.split_last() {
             Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
             _ => (&block.instructions[..], None),
         };
         for ins in body {
-            mask |= match instruction_step(block, ins) {
+            let (t, w) = match instruction_step(block, ins) {
                 // The call pushes the return address; the callee's own effects come from its
                 // summary.
                 Step::Call(target) => {
                     callees.insert(target);
-                    rsp
+                    (rsp, rsp)
                 }
-                Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => ALL_STATE,
-                Step::Effect { .. } if flag_effect(ins).is_none() => ALL_STATE,
-                Step::Effect { .. } => used_state(ins, factory),
+                Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => (ALL_STATE, ALL_STATE),
+                Step::Effect { .. } if flag_effect(ins).is_none() => (ALL_STATE, ALL_STATE),
+                Step::Effect { .. } => used_and_written_state(ins, factory.info(ins)),
             };
+            touched |= t;
+            written |= w;
         }
-        mask |= match (block.terminator, transfer) {
-            (Terminator::Fallthrough | Terminator::Jump, _) => 0,
-            (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => 0,
+        let (term_t, term_w) = match (block.terminator, transfer) {
+            (Terminator::Fallthrough | Terminator::Jump, _) => (0, 0),
+            (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => (0, 0),
             (Terminator::Return, Some(ins))
                 if matches!(ins.code(), Code::Retnq | Code::Retnq_imm16) =>
             {
-                rsp
+                (rsp, rsp)
             }
             // Indirect jumps (the dispatcher), traps, non-returning calls, invalid code, `loop`,
             // `jrcxz`, `xbegin`, far returns.
-            _ => ALL_STATE,
+            _ => (ALL_STATE, ALL_STATE),
         };
+        touched |= term_t;
+        written |= term_w;
         if matches!(
             block.terminator,
             Terminator::Fallthrough | Terminator::Jump | Terminator::Branch
         ) {
             if block.successors.is_empty() {
-                mask = ALL_STATE;
+                touched = ALL_STATE;
+                written = ALL_STATE;
             }
             for edge in &block.successors {
                 match *edge {
@@ -924,55 +969,78 @@ fn own_effects(
                     }
                     _ => match edge.intra_target() {
                         Some(target) if func.blocks.contains_key(&target) => {}
-                        _ => mask = ALL_STATE,
+                        _ => {
+                            touched = ALL_STATE;
+                            written = ALL_STATE;
+                        }
                     },
                 }
             }
         }
     }
-    (mask, callees)
+    (touched, written, callees)
 }
 
 /// Guest registers (GPRs, `xmm0..15`, `ymmh0..15`) and other state a modelled non-trapping
-/// instruction reads or writes (explicitly, implicitly, in an address, or via VEX-128 upper-half
-/// zeroing). Any non-segment register outside GPR/XMM/YMM/ZMM0..15 sets [`OTHER_STATE`].
-fn used_state(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateMask {
+/// instruction `(touches, writes)` (explicitly, implicitly, in an address, or via VEX-128
+/// upper-half zeroing). Any non-segment register outside GPR/XMM/YMM/ZMM0..15 sets [`OTHER_STATE`].
+fn used_and_written_state(ins: &Instruction, info: &InstructionInfo) -> (StateMask, StateMask) {
     match ins.mnemonic() {
-        Mnemonic::Vzeroall => return ALL_XMM_STATE | ALL_YMMH_STATE,
-        Mnemonic::Vzeroupper => return ALL_YMMH_STATE,
+        Mnemonic::Vzeroall => {
+            let m = ALL_XMM_STATE | ALL_YMMH_STATE;
+            return (m, m);
+        }
+        Mnemonic::Vzeroupper => return (ALL_YMMH_STATE, ALL_YMMH_STATE),
         _ => {}
     }
-    let mut mask: StateMask = 0;
-    for used in factory.info(ins).used_registers() {
+    let mut touched: StateMask = 0;
+    let mut written: StateMask = 0;
+    for used in info.used_registers() {
         let reg = used.register();
-        if reg.is_gpr() && reg.full_register().is_gpr64() {
-            mask |= 1u64 << reg.full_register().number();
+        let is_write = matches!(
+            used.access(),
+            OpAccess::Write
+                | OpAccess::CondWrite
+                | OpAccess::ReadWrite
+                | OpAccess::ReadCondWrite
+        );
+        let bits = if reg.is_gpr() && reg.full_register().is_gpr64() {
+            1u64 << reg.full_register().number()
         } else if (reg.is_xmm() || reg.is_ymm() || reg.is_zmm()) && reg.number() < 16 {
             let idx = reg.number();
-            mask |= xmm_state_bit(idx);
+            let mut b = xmm_state_bit(idx);
             if !reg.is_xmm() {
-                mask |= ymmh_state_bit(idx);
+                b |= ymmh_state_bit(idx);
             }
+            b
         } else if !reg.is_segment_register() {
-            mask |= OTHER_STATE;
+            OTHER_STATE
+        } else {
+            0
+        };
+        touched |= bits;
+        if is_write {
+            written |= bits;
         }
     }
     match ins.mnemonic() {
-        Mnemonic::Pcmpistrm
-        | Mnemonic::Pcmpestrm
-        | Mnemonic::Pcmpestrm64
-        | Mnemonic::Vpcmpistrm
-        | Mnemonic::Vpcmpestrm
-        | Mnemonic::Vpcmpestrm64 => {
+        Mnemonic::Pcmpistrm | Mnemonic::Pcmpestrm | Mnemonic::Pcmpestrm64 => {
             // The byte/word mask result goes to XMM0.
-            mask |= xmm_state_bit(0);
+            touched |= xmm_state_bit(0);
+            written |= xmm_state_bit(0);
+        }
+        Mnemonic::Vpcmpistrm | Mnemonic::Vpcmpestrm | Mnemonic::Vpcmpestrm64 => {
+            // The byte/word mask result goes to XMM0 and VEX-128 zeroes YMMH0.
+            let b = xmm_state_bit(0) | ymmh_state_bit(0);
+            touched |= b;
+            written |= b;
         }
         Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
             // Legacy SSE4.1 variable blends implicitly read XMM0 as the mask.
-            mask |= xmm_state_bit(0);
+            touched |= xmm_state_bit(0);
         }
         Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => {
-            mask |= OTHER_STATE;
+            touched |= OTHER_STATE;
         }
         _ => {}
     }
@@ -985,9 +1053,294 @@ fn used_state(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateM
         && !simd::reads_only_first_operand(ins.mnemonic())
     {
         let idx = ins.op_register(0).number();
-        mask |= xmm_state_bit(idx) | ymmh_state_bit(idx);
+        let b = xmm_state_bit(idx) | ymmh_state_bit(idx);
+        touched |= b;
+        written |= b;
     }
-    mask
+    (touched, written)
+}
+
+/// One backward register-state liveness step of a block.
+#[derive(Debug, Clone, Copy)]
+enum StateStep {
+    /// `live = gen_ | (live & !kill)`.
+    Effect { gen_: StateMask, kill: StateMask },
+    /// A direct returning call: `live = ((touched(target) | live) & live_in_state(target)) | rsp`.
+    Call(u64),
+}
+
+struct StateBlockModel {
+    steps: Vec<StateStep>,
+    exits: Vec<Exit>,
+}
+
+struct StateModel {
+    entry: usize,
+    blocks: Vec<StateBlockModel>,
+}
+
+impl StateModel {
+    fn new(func: &cfg::Function, factory: &mut InstructionInfoFactory) -> Self {
+        let index: BTreeMap<u64, usize> = func
+            .blocks
+            .keys()
+            .enumerate()
+            .map(|(i, &start)| (start, i))
+            .collect();
+        let blocks = func
+            .blocks
+            .values()
+            .map(|block| state_block_model(block, &index, factory))
+            .collect();
+        let entry = index.get(&func.entry).copied().unwrap_or(usize::MAX);
+        Self { entry, blocks }
+    }
+
+    fn callees(&self) -> impl Iterator<Item = u64> + '_ {
+        self.blocks.iter().flat_map(|b| {
+            let calls = b.steps.iter().filter_map(|s| match *s {
+                StateStep::Call(target) => Some(target),
+                StateStep::Effect { .. } => None,
+            });
+            let tails = b.exits.iter().filter_map(|e| match *e {
+                Exit::Function(target) => Some(target),
+                _ => None,
+            });
+            calls.chain(tails)
+        })
+    }
+
+    /// Guest state live at the entry block under the current summaries (least fixed point).
+    fn entry_live(
+        &self,
+        summaries: &BTreeMap<u64, StateMask>,
+        touched: &BTreeMap<u64, StateMask>,
+    ) -> StateMask {
+        if self.entry >= self.blocks.len() {
+            return ALL_STATE;
+        }
+        let rsp: StateMask = 1u64 << Register::RSP.number();
+        let mut live_in = vec![0 as StateMask; self.blocks.len()];
+        loop {
+            let mut changed = false;
+            for (i, block) in self.blocks.iter().enumerate().rev() {
+                let mut live: StateMask = 0;
+                for exit in &block.exits {
+                    live |= match *exit {
+                        Exit::Block(j) => live_in[j],
+                        Exit::Function(target) => {
+                            summaries.get(&target).copied().unwrap_or(ALL_STATE)
+                        }
+                        Exit::Everything => ALL_STATE,
+                    };
+                }
+                for step in block.steps.iter().rev() {
+                    live = match *step {
+                        StateStep::Effect { gen_, kill } => gen_ | (live & !kill),
+                        StateStep::Call(target) => {
+                            let callee_touched =
+                                touched.get(&target).copied().unwrap_or(ALL_STATE);
+                            let callee_live =
+                                summaries.get(&target).copied().unwrap_or(ALL_STATE);
+                            ((callee_touched | live) & callee_live) | rsp
+                        }
+                    };
+                }
+                let grown = live_in[i] | live;
+                if grown != live_in[i] {
+                    live_in[i] = grown;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return live_in[self.entry];
+            }
+        }
+    }
+}
+
+fn state_block_model(
+    block: &cfg::BasicBlock,
+    index: &BTreeMap<u64, usize>,
+    factory: &mut InstructionInfoFactory,
+) -> StateBlockModel {
+    const READS_ALL: StateStep = StateStep::Effect {
+        gen_: ALL_STATE,
+        kill: 0,
+    };
+    let (body, transfer) = match block.instructions.split_last() {
+        Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+        _ => (&block.instructions[..], None),
+    };
+    let mut steps: Vec<StateStep> = Vec::with_capacity(body.len());
+    let mut push = |step: StateStep| {
+        if let (
+            Some(StateStep::Effect { gen_: g1, kill: k1 }),
+            StateStep::Effect { gen_: g2, kill: k2 },
+        ) = (steps.last_mut(), step)
+        {
+            *g1 |= g2 & !*k1;
+            *k1 |= k2;
+        } else {
+            steps.push(step);
+        }
+    };
+    for ins in body {
+        let step = match instruction_step(block, ins) {
+            Step::Call(target) => StateStep::Call(target),
+            Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => READS_ALL,
+            Step::Effect { .. } if flag_effect(ins).is_none() => READS_ALL,
+            Step::Effect { .. } => {
+                let (gen_, kill) = state_rw_masks(ins, factory.info(ins));
+                StateStep::Effect { gen_, kill }
+            }
+        };
+        push(step);
+    }
+    let exits = match (block.terminator, transfer) {
+        (Terminator::Fallthrough | Terminator::Jump, _) => successor_exits(block, index),
+        (Terminator::Branch, Some(ins)) if ins.is_jcc_short_or_near() => {
+            successor_exits(block, index)
+        }
+        // Returns, indirect jumps, traps, non-returning calls, invalid code, `loop`/`jrcxz`:
+        // every register reaching here may be observed.
+        _ => vec![Exit::Everything],
+    };
+    StateBlockModel { steps, exits }
+}
+
+/// [`FlagSummaries::live_in_state`] for every function (least fixed point over the call graph).
+fn state_live_in(
+    functions: &[&cfg::Function],
+    touched: &BTreeMap<u64, StateMask>,
+) -> BTreeMap<u64, StateMask> {
+    let mut factory = InstructionInfoFactory::new();
+    let models: BTreeMap<u64, StateModel> = functions
+        .iter()
+        .map(|f| (f.entry, StateModel::new(f, &mut factory)))
+        .collect();
+    let mut live_in: BTreeMap<u64, StateMask> = models.keys().map(|&entry| (entry, 0)).collect();
+    let mut callers: BTreeMap<u64, BTreeSet<u64>> = BTreeMap::new();
+    for (&entry, model) in &models {
+        for callee in model.callees() {
+            if models.contains_key(&callee) {
+                callers.entry(callee).or_default().insert(entry);
+            }
+        }
+    }
+    let mut queued: BTreeSet<u64> = models.keys().copied().collect();
+    let mut work: VecDeque<u64> = models.keys().copied().collect();
+    while let Some(entry) = work.pop_front() {
+        queued.remove(&entry);
+        let old = live_in[&entry];
+        let mask = old | models[&entry].entry_live(&live_in, touched);
+        live_in.insert(entry, mask);
+        if mask != old {
+            for &caller in callers.get(&entry).into_iter().flatten() {
+                if queued.insert(caller) {
+                    work.push_back(caller);
+                }
+            }
+        }
+    }
+    live_in
+}
+
+/// `(reads, full_writes)` bitmasks over [`StateMask`] for a modelled non-trapping instruction
+/// (`flag_effect(ins).is_some()`). A bit is set in `full_writes` only when `ins` unconditionally
+/// overwrites the entire register (64/32-bit GPR, 128-bit XMM, or 128-bit YMMH) without reading
+/// it first; `rsp` is never killed.
+fn state_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (StateMask, StateMask) {
+    match ins.mnemonic() {
+        Mnemonic::Vzeroall => return (0, ALL_XMM_STATE | ALL_YMMH_STATE),
+        Mnemonic::Vzeroupper => return (0, ALL_YMMH_STATE),
+        _ => {}
+    }
+    let (gpr_reads, gpr_full_writes) = super::gpr_rw_masks(ins, info);
+    let mut reads: StateMask = u64::from(gpr_reads);
+    let mut full_writes: StateMask = u64::from(gpr_full_writes);
+
+    if simd::is_simd(ins) {
+        let (xmm_reads, xmm_full_writes) = simd::xmm_rw_masks(ins, info);
+        reads |= u64::from(xmm_reads) << XMM_STATE_SHIFT;
+        full_writes |= u64::from(xmm_full_writes) << XMM_STATE_SHIFT;
+
+        let mut ymmh_reads: u16 = 0;
+        let mut ymmh_full_writes: u16 = 0;
+        if simd::is_zeroing_idiom(ins)
+            && ins.op_count() > 0
+            && ins.op_kind(0) == OpKind::Register
+        {
+            let r0 = ins.op_register(0);
+            if (r0.is_ymm() || (simd::is_vex_encoded(ins) && r0.is_xmm())) && r0.number() < 16 {
+                ymmh_full_writes |= 1u16 << r0.number();
+            }
+        } else {
+            for ur in info.used_registers() {
+                let r = ur.register();
+                if (r.is_ymm() || r.is_zmm())
+                    && r.number() < 16
+                    && matches!(
+                        ur.access(),
+                        OpAccess::Read
+                            | OpAccess::CondRead
+                            | OpAccess::ReadWrite
+                            | OpAccess::ReadCondWrite
+                            | OpAccess::CondWrite
+                    )
+                {
+                    ymmh_reads |= 1u16 << r.number();
+                }
+            }
+            for i in 1..ins.op_count() {
+                if ins.op_kind(i) == OpKind::Register {
+                    let r = ins.op_register(i);
+                    if (r.is_ymm() || r.is_zmm()) && r.number() < 16 {
+                        ymmh_reads |= 1u16 << r.number();
+                    }
+                }
+            }
+            if ins.op_count() > 0 && ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                if r0.number() < 16 {
+                    let bit = 1u16 << r0.number();
+                    if r0.is_xmm()
+                        && simd::is_vex_encoded(ins)
+                        && !simd::reads_only_first_operand(ins.mnemonic())
+                    {
+                        // VEX-128 with XMM destination unconditionally zeroes ymmhN without reading it.
+                        ymmh_full_writes |= bit;
+                    } else if r0.is_ymm() {
+                        if xmm_full_writes & bit != 0 && ymmh_reads & bit == 0 {
+                            ymmh_full_writes |= bit;
+                        } else {
+                            ymmh_reads |= bit;
+                        }
+                    }
+                }
+            }
+        }
+        if matches!(
+            ins.mnemonic(),
+            Mnemonic::Vpcmpistrm | Mnemonic::Vpcmpestrm | Mnemonic::Vpcmpestrm64
+        ) {
+            // Implicitly writes xmm0 and zeroes ymmh0 (VEX-128).
+            ymmh_full_writes |= 1u16 << 0;
+        }
+        reads |= u64::from(ymmh_reads) << YMMH_STATE_SHIFT;
+        full_writes |= u64::from(ymmh_full_writes & !ymmh_reads) << YMMH_STATE_SHIFT;
+    }
+
+    if matches!(ins.mnemonic(), Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr)
+        || info.used_registers().iter().any(|ur| {
+            let r = ur.register();
+            !(r.is_gpr() || r.is_xmm() || r.is_ymm() || r.is_zmm() || r.is_segment_register())
+        })
+    {
+        reads |= OTHER_STATE;
+    }
+
+    (reads, full_writes & !reads)
 }
 
 fn mask_of(flags: &[usize]) -> FlagMask {

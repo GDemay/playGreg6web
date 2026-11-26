@@ -95,35 +95,56 @@ fn keeps_memory(line: &str) -> bool {
     }
 }
 
-/// One base GPR tracked inside a coalesced window burst (`[reg + min_d .. reg + max_end)`).
+/// Addressing base for one entry in a coalesced window burst:
+/// - `index == None`: plain `[base + disp]` (`base` is a 64-bit GPR index `0..16`).
+/// - `index == Some((idx, scale))`: indexed `[base + idx*scale + disp]` (`base` and `idx` are
+///   64-bit GPR indices `0..16`, `scale` is `1 | 2 | 4 | 8`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct BurstKey {
+    pub(super) base: usize,
+    pub(super) index: Option<(usize, u32)>,
+}
+
+impl BurstKey {
+    /// Bitmask of the 64-bit GPR(s) read by this addressing base (`base`, plus `idx` if indexed).
+    pub(super) const fn gpr_mask(self) -> u16 {
+        let mut mask = 1u16 << self.base;
+        if let Some((idx, _)) = self.index {
+            mask |= 1u16 << idx;
+        }
+        mask
+    }
+}
+
+/// One base tracked inside a coalesced window burst (`[eff_base + min_d .. eff_base + max_end)`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct BurstBase {
-    /// 64-bit GPR index of the base register.
-    pub(super) reg: usize,
-    /// Minimum displacement relative to `reg`.
+    /// Plain `[base + disp]` or indexed `[base + idx*scale + disp]` key.
+    pub(super) key: BurstKey,
+    /// Minimum displacement relative to `eff_base`.
     pub(super) min_d: i64,
-    /// Maximum `disp + access_bytes` relative to `reg`.
+    /// Maximum `disp + access_bytes` relative to `eff_base`.
     pub(super) max_end: i64,
-    /// Whether any instruction in the burst writes through `reg`.
+    /// Whether any instruction in the burst writes through this key.
     pub(super) has_write: bool,
 }
 
 /// Active per-base state while lowering a coalesced window burst.
 #[derive(Clone)]
 pub(super) struct BurstOverrideBase {
-    /// 64-bit GPR index of the base register.
-    pub(super) reg: usize,
-    /// Proven inclusive lower displacement relative to `reg`.
+    /// Plain `[base + disp]` or indexed `[base + idx*scale + disp]` key.
+    pub(super) key: BurstKey,
+    /// Proven inclusive lower displacement relative to `eff_base`.
     pub(super) min_d: i64,
-    /// Proven exclusive upper displacement relative to `reg`.
+    /// Proven exclusive upper displacement relative to `eff_base`.
     pub(super) max_end: i64,
     /// Whether this base is checked and eligible for coalesced burst stores / dirty marking.
     pub(super) has_write: bool,
-    /// Host pointer base (`base_val + delta`) in fast mode; `None` in slow fallback mode.
+    /// Host pointer base (`eff_base + delta`) in fast mode; `None` in slow fallback mode.
     pub(super) base_host: Option<String>,
     /// Whether the fast path actually lowered at least one store through this base.
     pub(super) saw_store: bool,
-    /// Guest address SSA values emitted by `address()` for `[reg + disp]` -> `disp`.
+    /// Guest address SSA values emitted by `address()` for `[eff_base + disp]` -> `disp`.
     pub(super) addrs: BTreeMap<String, i64>,
 }
 
@@ -1045,14 +1066,15 @@ impl FunctionLifter<'_> {
         if (w.base & (SLOT_BYTES - 1)) != 0 || (w.size & (SLOT_BYTES - 1)) != 0 {
             return Ok(false);
         }
-        // Skip any base register already known to be stack-flat (its accesses are already flat
-        // with zero overhead); lift the remaining non-stack-flat bases as a single burst.
+        // Skip any plain base register already known to be stack-flat (its accesses are already
+        // flat with zero overhead); indexed `[base + idx*scale + disp]` is never assumed stack-flat.
         let mut active_bases: Vec<BurstBase> = Vec::with_capacity(MAX_BURST_BASES);
         let mut span_m1s: Vec<u64> = Vec::with_capacity(MAX_BURST_BASES);
         for &b in burst.active_bases() {
-            if self.stack_flat().is_some()
+            if b.key.index.is_none()
+                && self.stack_flat().is_some()
                 && self
-                    .known_gpr(b.reg)
+                    .known_gpr(b.key.base)
                     .is_some_and(|v| self.stack_values.contains_key(v))
             {
                 continue;
@@ -1082,7 +1104,21 @@ impl FunctionLifter<'_> {
         let result: R<()> = (|| {
             let mut base_vals: Vec<String> = Vec::with_capacity(active_bases.len());
             for &b in &active_bases {
-                base_vals.push(self.load_gpr(b.reg)?);
+                let base_val = self.load_gpr(b.key.base)?;
+                let eff_base = match b.key.index {
+                    None => base_val,
+                    Some((idx_reg, scale)) => {
+                        let mut scaled = self.load_gpr(idx_reg)?;
+                        if scale > 1 {
+                            scaled = self.val(&format!(
+                                "shl i64 {scaled}, {}",
+                                scale.trailing_zeros()
+                            ));
+                        }
+                        self.val(&format!("add i64 {base_val}, {scaled}"))
+                    }
+                };
+                base_vals.push(eff_base);
             }
             let entry_known = self.known.clone();
             let entry_ymmh_zeroed = self.ymmh_zeroed;
@@ -1162,7 +1198,7 @@ impl FunctionLifter<'_> {
             for (idx, &b) in active_bases.iter().enumerate() {
                 let base_host = self.val(&format!("add i64 {}, {}", base_vals[idx], deltas[idx]));
                 fast_override_bases.push(BurstOverrideBase {
-                    reg: b.reg,
+                    key: b.key,
                     min_d: b.min_d,
                     max_end: b.max_end,
                     has_write: b.has_write,
@@ -1227,7 +1263,7 @@ impl FunctionLifter<'_> {
             let slow_override_bases = active_bases
                 .iter()
                 .map(|&b| BurstOverrideBase {
-                    reg: b.reg,
+                    key: b.key,
                     min_d: b.min_d,
                     max_end: b.max_end,
                     has_write: b.has_write,
