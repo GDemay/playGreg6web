@@ -59,6 +59,11 @@ struct ExecutorOptions {
     // immediate error handling, and an error scope around every packet. Errors are deduped by text in
     // stats_json()'s "validation" block with the first packet index / opcode. Slower; diagnosis only.
     bool gpu_validation = false;
+    // Live-vs-replay check (tools/live_vs_replay.py): when non-empty, every presented frame's stream image
+    // (before the blit; 4-byte formats) is read back and a line `digest frame N: <16 hex> WxH <format>` is
+    // appended here, N counting presents from 0 - the same digest pg6_native_exec --digest-at prints.
+    // Slow (one synchronous read-back per frame); a window surface then gets CopySrc usage.
+    std::string frame_digest_path;
 };
 
 inline constexpr size_t kOpcodeSlots = 64;

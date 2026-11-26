@@ -294,3 +294,20 @@ playgta6_boot --pgim ... --window [--window-size 1920x1080] [--host-input] [--gp
    the executor handled 100% of the packets (`unhandled` empty). Replaying the first trace natively takes
    about 20 s. The GPU unit test covers a textured draw, a compute dispatch (direct and indirect), a
    pack lookup and a BC7 upload with read-back.
+
+4. **Live vs replay (`tools/live_vs_replay.py`):** one live `playgta6_boot --window` run writes a GPU
+   capture (`--gpu-capture-payloads`, not thinned) and, from the live executor itself, one replay digest
+   per presented frame (`--live-digest FILE`, `ExecutorOptions::frame_digest_path`: the stream image
+   before the blit, hashed exactly like `pg6_native_exec --digest-at`). The script then replays the capture
+   headless with `pg6_native_exec` at the live stream size and compares the digests frame by frame
+   (capture frame i = live present `first_present + i`), printing the first mismatch. The live run
+   exercises the paths a replay never takes (guest-memory read-backs, lazy shader compile, async pipelines
+   + blob cache, the blit), so a mismatch bisects to one of them. Example (local, GPU, game files outside
+   the repo; the capture is large and is deleted afterwards unless `--keep`):
+   `python tools/live_vs_replay.py --exe <exe> --game-dir <dir> --pack <std.wgsl.pack> --preset menu-flow
+   --capture-start 22000 --max-ms 40000`. Result on NVIDIA / D3D12 (1280x720 `rgba8unorm`, real title):
+   600 captured frames starting at live present 1136 (307 distinct images, 21 k draws, 3.9 k dispatches,
+   14 async pipelines, 7 first-use waits), all 600 digests identical; and the first 600 frames from boot
+   (4 distinct images) identical. The blit path was not exercised (window stream size == swapchain size).
+   Note: under `menu-flow` the guest itself faults at about 45 s (present ~2243, null call), so keep
+   `--max-ms` below that.
