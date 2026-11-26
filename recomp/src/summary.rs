@@ -629,6 +629,18 @@ pub const DEFAULT_FAST_BOOT_MAX_SKEW: f64 = 1.50;
 /// Default per-shard byte budget (4 MiB) for fast Wasm64 browser streaming and instantiation.
 pub const DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 
+/// V8 maximum compiled Wasm64 side-module size cap (1024 MiB).
+pub const V8_MAX_WASM_MODULE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// V8 maximum single Wasm function body size (`kV8MaxWasmFunctionSize`, ~7.65 MB).
+pub const V8_MAX_WASM_FUNCTION_BODY_BYTES: u64 = 7_654_321;
+
+/// V8 maximum local variable count per Wasm function (`kV8MaxWasmFunctionLocals`).
+pub const V8_MAX_WASM_FUNCTION_LOCALS: usize = 50_000;
+
+/// Threshold (1 MiB) above which a single lifted Wasm function body is flagged as large.
+pub const LARGE_FUNCTION_BODY_THRESHOLD_BYTES: u64 = 1024 * 1024;
+
 /// Schema identifier emitted by [`FastBootSummary::render_json`].
 pub const FAST_BOOT_SUMMARY_SCHEMA: &str = "playgta6-recomp-fast-boot-summary";
 
@@ -824,6 +836,38 @@ impl FastBootShardStats {
         let num = u128::from(self.max_effective_bytes).saturating_mul(self.shard_count as u128);
         let den = u128::from(self.total_effective_bytes);
         ratio_u128_2dp(num, den)
+    }
+
+    /// Instruction count spread (`max_instructions - min_instructions`).
+    pub fn instruction_spread(&self) -> usize {
+        self.max_instructions.saturating_sub(self.min_instructions)
+    }
+
+    /// Effective byte-size spread (`max_effective_bytes - min_effective_bytes`).
+    pub fn byte_spread(&self) -> u64 {
+        self.max_effective_bytes
+            .saturating_sub(self.min_effective_bytes)
+    }
+
+    /// Remaining per-shard budget headroom for the heaviest shard (`0` when at or over budget).
+    pub fn budget_headroom_bytes(&self) -> u64 {
+        self.shard_budget_bytes
+            .saturating_sub(self.max_effective_bytes)
+    }
+
+    /// Heaviest-shard utilization against `shard_budget_bytes` (`0.00..=100.00`, zero-division safe).
+    pub fn budget_utilization_pct(&self) -> f64 {
+        percentage_u64_2dp(self.max_effective_bytes, self.shard_budget_bytes)
+    }
+
+    /// Remaining total byte headroom under [`V8_MAX_WASM_MODULE_BYTES`] (`0` when at or over cap).
+    pub fn module_cap_headroom_bytes(&self) -> u64 {
+        V8_MAX_WASM_MODULE_BYTES.saturating_sub(self.total_effective_bytes)
+    }
+
+    /// Total effective shard byte utilization against [`V8_MAX_WASM_MODULE_BYTES`] (`0.00..=100.00`).
+    pub fn module_cap_utilization_pct(&self) -> f64 {
+        percentage_u64_2dp(self.total_effective_bytes, V8_MAX_WASM_MODULE_BYTES)
     }
 }
 
@@ -1379,6 +1423,644 @@ fn write_ranked_json(out: &mut String, key: &str, items: &[RankedCount], trailin
         );
     }
     let _ = writeln!(out, "  ]{comma_end}");
+}
+
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() { value } else { 0.0 }
+}
+
+fn nearest_rank_percentile(sorted: &[usize], p: usize) -> usize {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let n = sorted.len() as u128;
+    let idx = n
+        .saturating_mul(p as u128)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(n - 1) as usize;
+    sorted[idx]
+}
+
+/// Sanitized size metrics for one discovered function (addresses and counts only, never code bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FunctionSizeEntry {
+    pub entry: u64,
+    pub blocks: usize,
+    pub instructions: usize,
+    pub indirect_calls: usize,
+    pub diagnostics: usize,
+}
+
+fn sort_function_size_entries(entries: &mut [FunctionSizeEntry]) {
+    entries.sort_by(|a, b| {
+        b.instructions
+            .cmp(&a.instructions)
+            .then_with(|| b.blocks.cmp(&a.blocks))
+            .then_with(|| a.entry.cmp(&b.entry))
+            .then_with(|| b.indirect_calls.cmp(&a.indirect_calls))
+            .then_with(|| b.diagnostics.cmp(&a.diagnostics))
+    });
+}
+
+/// Deterministic function-size distribution and top-N largest-function summary.
+///
+/// Contains addresses, counts, and percentiles only — never code bytes or host paths.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct FunctionSizeStats {
+    pub total_functions: usize,
+    pub total_blocks: usize,
+    pub total_instructions: usize,
+    pub min_instructions: usize,
+    pub max_instructions: usize,
+    pub mean_instructions: f64,
+    pub p50_instructions: usize,
+    pub p95_instructions: usize,
+    pub p99_instructions: usize,
+    pub functions_over_1k_insns: usize,
+    pub functions_over_10k_insns: usize,
+    pub top_functions: Vec<FunctionSizeEntry>,
+}
+
+impl FunctionSizeStats {
+    /// Computes deterministic function-size distribution and top-`top_n` largest functions from [`Analysis`].
+    pub fn from_analysis(analysis: &Analysis, top_n: usize) -> Self {
+        let entries: Vec<FunctionSizeEntry> = analysis
+            .functions
+            .values()
+            .map(|function| FunctionSizeEntry {
+                entry: function.entry,
+                blocks: function.blocks.len(),
+                instructions: function.instruction_count(),
+                indirect_calls: function
+                    .calls()
+                    .filter(|c| matches!(c.target, CallTarget::Indirect { .. }))
+                    .count(),
+                diagnostics: function.diagnostics().count(),
+            })
+            .collect();
+        Self::from_entries(entries, top_n)
+    }
+
+    /// Computes deterministic function-size distribution and top-`top_n` largest functions from
+    /// pre-collected [`FunctionSizeEntry`] records.
+    ///
+    /// Threshold counts `functions_over_1k_insns` and `functions_over_10k_insns` count functions
+    /// strictly exceeding `1_000` and `10_000` instructions respectively. Percentiles use exact
+    /// nearest-rank indexing (`idx = (n * p).div_ceil(100).saturating_sub(1)`, clamped to `n - 1`).
+    pub fn from_entries(mut entries: Vec<FunctionSizeEntry>, top_n: usize) -> Self {
+        if entries.is_empty() {
+            return Self::default();
+        }
+
+        let total_functions = entries.len();
+        let mut total_blocks = 0usize;
+        let mut total_instructions = 0usize;
+        let mut total_instructions_u128 = 0u128;
+        let mut min_instructions = usize::MAX;
+        let mut max_instructions = 0usize;
+        let mut functions_over_1k_insns = 0usize;
+        let mut functions_over_10k_insns = 0usize;
+        let mut sorted_insns = Vec::with_capacity(total_functions);
+
+        for entry in &entries {
+            total_blocks = total_blocks.saturating_add(entry.blocks);
+            total_instructions = total_instructions.saturating_add(entry.instructions);
+            total_instructions_u128 =
+                total_instructions_u128.saturating_add(entry.instructions as u128);
+            min_instructions = min_instructions.min(entry.instructions);
+            max_instructions = max_instructions.max(entry.instructions);
+            if entry.instructions > 1_000 {
+                functions_over_1k_insns = functions_over_1k_insns.saturating_add(1);
+            }
+            if entry.instructions > 10_000 {
+                functions_over_10k_insns = functions_over_10k_insns.saturating_add(1);
+            }
+            sorted_insns.push(entry.instructions);
+        }
+
+        sorted_insns.sort_unstable();
+        let mean_instructions = ratio_u128_2dp(total_instructions_u128, total_functions as u128);
+        let p50_instructions = nearest_rank_percentile(&sorted_insns, 50);
+        let p95_instructions = nearest_rank_percentile(&sorted_insns, 95);
+        let p99_instructions = nearest_rank_percentile(&sorted_insns, 99);
+
+        sort_function_size_entries(&mut entries);
+        entries.truncate(top_n);
+
+        Self {
+            total_functions,
+            total_blocks,
+            total_instructions,
+            min_instructions,
+            max_instructions,
+            mean_instructions,
+            p50_instructions,
+            p95_instructions,
+            p99_instructions,
+            functions_over_1k_insns,
+            functions_over_10k_insns,
+            top_functions: entries,
+        }
+    }
+
+    /// Renders a crisp, deterministic, sanitized one-line function-size summary.
+    pub fn render_one_line(&self) -> String {
+        format!(
+            "functions {} (blocks {}, insns {} | min {}, mean {:.2}, p50 {}, p95 {}, p99 {}, max {} | >1k: {}, >10k: {})",
+            self.total_functions,
+            self.total_blocks,
+            self.total_instructions,
+            self.min_instructions,
+            finite_or_zero(self.mean_instructions),
+            self.p50_instructions,
+            self.p95_instructions,
+            self.p99_instructions,
+            self.max_instructions,
+            self.functions_over_1k_insns,
+            self.functions_over_10k_insns,
+        )
+    }
+
+    /// Renders a deterministic, strictly sanitized multi-line text summary with a trailing newline.
+    pub fn render_text(&self) -> String {
+        let mut sorted_top = self.top_functions.clone();
+        sort_function_size_entries(&mut sorted_top);
+
+        let mut out = String::with_capacity(256);
+        let _ = writeln!(out, "Function Size Distribution");
+        let _ = writeln!(out, "Summary: {}", self.render_one_line());
+        if sorted_top.is_empty() {
+            let _ = writeln!(out, "Top Functions: none");
+        } else {
+            let _ = writeln!(out, "Top Functions ({}):", sorted_top.len());
+            for (idx, func) in sorted_top.iter().enumerate() {
+                let _ = writeln!(
+                    out,
+                    "  #{} 0x{:x} ({} insns, {} blocks, {} indirect_calls, {} diagnostics)",
+                    idx + 1,
+                    func.entry,
+                    func.instructions,
+                    func.blocks,
+                    func.indirect_calls,
+                    func.diagnostics,
+                );
+            }
+        }
+        out
+    }
+
+    /// Renders deterministic, strictly sanitized RFC 8259 JSON with sorted keys and a trailing newline.
+    pub fn render_json(&self) -> String {
+        let mut sorted_top = self.top_functions.clone();
+        sort_function_size_entries(&mut sorted_top);
+
+        let mut out = String::with_capacity(512);
+        out.push_str("{\n");
+        let _ = writeln!(
+            out,
+            "  \"functions_over_10k_insns\": {},",
+            self.functions_over_10k_insns
+        );
+        let _ = writeln!(
+            out,
+            "  \"functions_over_1k_insns\": {},",
+            self.functions_over_1k_insns
+        );
+        let _ = writeln!(out, "  \"max_instructions\": {},", self.max_instructions);
+        let _ = writeln!(
+            out,
+            "  \"mean_instructions\": {:.2},",
+            finite_or_zero(self.mean_instructions)
+        );
+        let _ = writeln!(out, "  \"min_instructions\": {},", self.min_instructions);
+        let _ = writeln!(out, "  \"p50_instructions\": {},", self.p50_instructions);
+        let _ = writeln!(out, "  \"p95_instructions\": {},", self.p95_instructions);
+        let _ = writeln!(out, "  \"p99_instructions\": {},", self.p99_instructions);
+        if sorted_top.is_empty() {
+            out.push_str("  \"top_functions\": [],\n");
+        } else {
+            out.push_str("  \"top_functions\": [\n");
+            for (idx, func) in sorted_top.iter().enumerate() {
+                let comma = if idx + 1 < sorted_top.len() { "," } else { "" };
+                let _ = writeln!(
+                    out,
+                    "    {{\"blocks\": {}, \"diagnostics\": {}, \"entry\": \"0x{:x}\", \"indirect_calls\": {}, \"instructions\": {}}}{comma}",
+                    func.blocks,
+                    func.diagnostics,
+                    func.entry,
+                    func.indirect_calls,
+                    func.instructions,
+                );
+            }
+            out.push_str("  ],\n");
+        }
+        let _ = writeln!(out, "  \"total_blocks\": {},", self.total_blocks);
+        let _ = writeln!(out, "  \"total_functions\": {},", self.total_functions);
+        let _ = writeln!(out, "  \"total_instructions\": {}", self.total_instructions);
+        out.push_str("}\n");
+        out
+    }
+}
+
+/// Sanitized size and shard-count entry for one Wasm64 side module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SideModuleEntry {
+    pub label: String,
+    pub shards: usize,
+    pub bytes: u64,
+}
+
+impl SideModuleEntry {
+    /// Creates a sanitized side-module entry, stripping host directory prefixes from `raw_label`.
+    pub fn new(raw_label: &str, shards: usize, bytes: u64) -> Self {
+        Self {
+            label: sanitize_label(raw_label),
+            shards,
+            bytes,
+        }
+    }
+
+    /// Module size in MiB, rounded half-up to 2 decimal places.
+    pub fn bytes_mib(&self) -> f64 {
+        mib_2dp(self.bytes)
+    }
+
+    /// Remaining byte headroom under `cap` (`0` when at or over `cap`).
+    pub fn headroom_bytes(&self, cap: u64) -> u64 {
+        cap.saturating_sub(self.bytes)
+    }
+
+    /// Percentage of `cap` consumed by this module (`0.00..=100.00`, zero-division safe).
+    pub fn utilization_pct(&self, cap: u64) -> f64 {
+        percentage_u64_2dp(self.bytes, cap)
+    }
+
+    /// Returns `true` if this module's byte size strictly exceeds `cap`.
+    pub fn exceeds_cap(&self, cap: u64) -> bool {
+        self.bytes > cap
+    }
+}
+
+fn sort_side_modules_deterministic(modules: &mut [SideModuleEntry]) {
+    modules.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| b.shards.cmp(&a.shards))
+            .then_with(|| a.label.to_ascii_lowercase().cmp(&b.label.to_ascii_lowercase()))
+            .then_with(|| a.label.cmp(&b.label))
+    });
+}
+
+/// Sanitized Wasm64 side-module and V8 function-body / locals headroom report.
+///
+/// Tracks side-module cap headroom (default 1024 MiB), largest lifted function body size
+/// (default ~7.65 MB), max locals per function (default 50,000), and asymmetric split ratio.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wasm64HeadroomReport {
+    pub module_cap_bytes: u64,
+    pub function_body_cap_bytes: u64,
+    pub function_locals_cap: usize,
+    pub side_modules: Vec<SideModuleEntry>,
+    pub total_module_bytes: u64,
+    pub largest_module_bytes: u64,
+    pub min_module_headroom_bytes: u64,
+    pub largest_function_body_bytes: u64,
+    pub max_function_locals: usize,
+    pub functions_over_1mib: usize,
+}
+
+impl Wasm64HeadroomReport {
+    /// Builds a headroom report using default V8 Wasm64 limits
+    /// ([`V8_MAX_WASM_MODULE_BYTES`], [`V8_MAX_WASM_FUNCTION_BODY_BYTES`],
+    /// [`V8_MAX_WASM_FUNCTION_LOCALS`]).
+    pub fn new(
+        side_modules: Vec<SideModuleEntry>,
+        largest_function_body_bytes: u64,
+        max_function_locals: usize,
+        functions_over_1mib: usize,
+    ) -> Self {
+        Self::with_caps(
+            side_modules,
+            largest_function_body_bytes,
+            max_function_locals,
+            functions_over_1mib,
+            V8_MAX_WASM_MODULE_BYTES,
+            V8_MAX_WASM_FUNCTION_BODY_BYTES,
+            V8_MAX_WASM_FUNCTION_LOCALS,
+        )
+    }
+
+    /// Builds a headroom report with explicit module, function-body, and locals caps.
+    ///
+    /// All side-module labels are re-sanitized and sorted deterministically by
+    /// `bytes desc, shards desc, label asc`.
+    pub fn with_caps(
+        side_modules: Vec<SideModuleEntry>,
+        largest_function_body_bytes: u64,
+        max_function_locals: usize,
+        functions_over_1mib: usize,
+        module_cap_bytes: u64,
+        function_body_cap_bytes: u64,
+        function_locals_cap: usize,
+    ) -> Self {
+        let mut sanitized: Vec<SideModuleEntry> = side_modules
+            .into_iter()
+            .map(|m| SideModuleEntry::new(&m.label, m.shards, m.bytes))
+            .collect();
+        sort_side_modules_deterministic(&mut sanitized);
+
+        let mut total_module_bytes = 0u64;
+        let mut largest_module_bytes = 0u64;
+        for module in &sanitized {
+            total_module_bytes = total_module_bytes.saturating_add(module.bytes);
+            largest_module_bytes = largest_module_bytes.max(module.bytes);
+        }
+        let min_module_headroom_bytes = module_cap_bytes.saturating_sub(largest_module_bytes);
+
+        Self {
+            module_cap_bytes,
+            function_body_cap_bytes,
+            function_locals_cap,
+            side_modules: sanitized,
+            total_module_bytes,
+            largest_module_bytes,
+            min_module_headroom_bytes,
+            largest_function_body_bytes,
+            max_function_locals,
+            functions_over_1mib,
+        }
+    }
+
+    /// Largest side-module utilization against `module_cap_bytes` (`0.00..=100.00`).
+    pub fn module_utilization_pct(&self) -> f64 {
+        percentage_u64_2dp(self.largest_module_bytes, self.module_cap_bytes)
+    }
+
+    /// Remaining byte headroom between `largest_function_body_bytes` and `function_body_cap_bytes`.
+    pub fn function_body_headroom_bytes(&self) -> u64 {
+        self.function_body_cap_bytes
+            .saturating_sub(self.largest_function_body_bytes)
+    }
+
+    /// Largest function-body utilization against `function_body_cap_bytes` (`0.00..=100.00`).
+    pub fn function_body_utilization_pct(&self) -> f64 {
+        percentage_u64_2dp(self.largest_function_body_bytes, self.function_body_cap_bytes)
+    }
+
+    /// Remaining local-variable headroom between `max_function_locals` and `function_locals_cap`.
+    pub fn locals_headroom(&self) -> usize {
+        self.function_locals_cap
+            .saturating_sub(self.max_function_locals)
+    }
+
+    /// Maximum function locals utilization against `function_locals_cap` (`0.00..=100.00`).
+    pub fn locals_utilization_pct(&self) -> f64 {
+        percentage_2dp(self.max_function_locals, self.function_locals_cap)
+    }
+
+    /// Asymmetric split ratio (`max / mean` across side modules), rounded half-up to 2dp.
+    ///
+    /// Returns `0.0` when `side_modules` is empty or `total_module_bytes == 0`.
+    pub fn asymmetric_split_ratio(&self) -> f64 {
+        if self.side_modules.is_empty() || self.total_module_bytes == 0 {
+            return 0.0;
+        }
+        let num = u128::from(self.largest_module_bytes)
+            .saturating_mul(self.side_modules.len() as u128);
+        let den = u128::from(self.total_module_bytes);
+        ratio_u128_2dp(num, den)
+    }
+
+    /// Returns `true` when all side modules, largest function body, and max locals are within caps.
+    pub fn within_v8_caps(&self) -> bool {
+        self.largest_module_bytes <= self.module_cap_bytes
+            && self.largest_function_body_bytes <= self.function_body_cap_bytes
+            && self.max_function_locals <= self.function_locals_cap
+            && self
+                .side_modules
+                .iter()
+                .all(|m| !m.exceeds_cap(self.module_cap_bytes))
+    }
+
+    /// Renders a crisp, deterministic, sanitized one-line V8 headroom summary.
+    pub fn render_one_line(&self) -> String {
+        let status = if self.within_v8_caps() {
+            "within-caps"
+        } else {
+            "over-cap"
+        };
+        format!(
+            "wasm64_headroom: {} side-modules ({:.2} MiB total, max {:.2}/{:.2} MiB [{:.2}%], headroom {:.2} MiB, split {:.2}x) | fn_body {:.2}/{:.2} MiB [{:.2}%] ({} >1MiB) | locals {}/{} [{:.2}%] | {status}",
+            self.side_modules.len(),
+            mib_2dp(self.total_module_bytes),
+            mib_2dp(self.largest_module_bytes),
+            mib_2dp(self.module_cap_bytes),
+            self.module_utilization_pct(),
+            mib_2dp(self.min_module_headroom_bytes),
+            self.asymmetric_split_ratio(),
+            mib_2dp(self.largest_function_body_bytes),
+            mib_2dp(self.function_body_cap_bytes),
+            self.function_body_utilization_pct(),
+            self.functions_over_1mib,
+            self.max_function_locals,
+            self.function_locals_cap,
+            self.locals_utilization_pct(),
+        )
+    }
+
+    /// Renders a deterministic, strictly sanitized multi-line text headroom report with trailing newline.
+    pub fn render_text(&self) -> String {
+        let mut modules_sorted: Vec<SideModuleEntry> = self
+            .side_modules
+            .iter()
+            .map(|m| SideModuleEntry::new(&m.label, m.shards, m.bytes))
+            .collect();
+        sort_side_modules_deterministic(&mut modules_sorted);
+
+        let mut out = String::with_capacity(512);
+        let _ = writeln!(out, "Wasm64 V8 Headroom Report");
+        let _ = writeln!(out, "Summary: {}", self.render_one_line());
+        let _ = writeln!(
+            out,
+            "Module Cap: {} bytes ({:.2} MiB) | Total: {} bytes ({:.2} MiB) | Largest: {} bytes ({:.2} MiB, {:.2}%) | Min Headroom: {} bytes ({:.2} MiB) | Split Ratio: {:.2}x",
+            self.module_cap_bytes,
+            mib_2dp(self.module_cap_bytes),
+            self.total_module_bytes,
+            mib_2dp(self.total_module_bytes),
+            self.largest_module_bytes,
+            mib_2dp(self.largest_module_bytes),
+            self.module_utilization_pct(),
+            self.min_module_headroom_bytes,
+            mib_2dp(self.min_module_headroom_bytes),
+            self.asymmetric_split_ratio(),
+        );
+        let _ = writeln!(
+            out,
+            "Function Body Cap: {} bytes ({:.2} MiB) | Largest: {} bytes ({:.2} MiB, {:.2}%) | Headroom: {} bytes | Functions >1MiB: {}",
+            self.function_body_cap_bytes,
+            mib_2dp(self.function_body_cap_bytes),
+            self.largest_function_body_bytes,
+            mib_2dp(self.largest_function_body_bytes),
+            self.function_body_utilization_pct(),
+            self.function_body_headroom_bytes(),
+            self.functions_over_1mib,
+        );
+        let _ = writeln!(
+            out,
+            "Function Locals Cap: {} | Max Locals: {} ({:.2}%) | Headroom: {}",
+            self.function_locals_cap,
+            self.max_function_locals,
+            self.locals_utilization_pct(),
+            self.locals_headroom(),
+        );
+        if modules_sorted.is_empty() {
+            let _ = writeln!(out, "Side Modules: none");
+        } else {
+            let _ = writeln!(out, "Side Modules ({}):", modules_sorted.len());
+            for module in &modules_sorted {
+                let cap_flag = if module.exceeds_cap(self.module_cap_bytes) {
+                    "OVER-CAP"
+                } else {
+                    "ok"
+                };
+                let _ = writeln!(
+                    out,
+                    "  - {} ({} shards, {} bytes / {:.2} MiB, {:.2}% of cap, headroom {:.2} MiB, {cap_flag})",
+                    module.label,
+                    module.shards,
+                    module.bytes,
+                    module.bytes_mib(),
+                    module.utilization_pct(self.module_cap_bytes),
+                    mib_2dp(module.headroom_bytes(self.module_cap_bytes)),
+                );
+            }
+        }
+        out
+    }
+
+    /// Renders deterministic, strictly sanitized RFC 8259 JSON with sorted keys and a trailing newline.
+    pub fn render_json(&self) -> String {
+        let mut modules_sorted: Vec<SideModuleEntry> = self
+            .side_modules
+            .iter()
+            .map(|m| SideModuleEntry::new(&m.label, m.shards, m.bytes))
+            .collect();
+        sort_side_modules_deterministic(&mut modules_sorted);
+
+        let mut out = String::with_capacity(1024);
+        out.push_str("{\n");
+        let _ = writeln!(
+            out,
+            "  \"asymmetric_split_ratio\": {:.2},",
+            self.asymmetric_split_ratio()
+        );
+        let _ = writeln!(
+            out,
+            "  \"function_body_cap_bytes\": {},",
+            self.function_body_cap_bytes
+        );
+        let _ = writeln!(
+            out,
+            "  \"function_body_headroom_bytes\": {},",
+            self.function_body_headroom_bytes()
+        );
+        let _ = writeln!(
+            out,
+            "  \"function_body_utilization_pct\": {:.2},",
+            self.function_body_utilization_pct()
+        );
+        let _ = writeln!(
+            out,
+            "  \"function_locals_cap\": {},",
+            self.function_locals_cap
+        );
+        let _ = writeln!(
+            out,
+            "  \"functions_over_1mib\": {},",
+            self.functions_over_1mib
+        );
+        let _ = writeln!(
+            out,
+            "  \"largest_function_body_bytes\": {},",
+            self.largest_function_body_bytes
+        );
+        let _ = writeln!(
+            out,
+            "  \"largest_module_bytes\": {},",
+            self.largest_module_bytes
+        );
+        let _ = writeln!(
+            out,
+            "  \"largest_module_mib\": {:.2},",
+            mib_2dp(self.largest_module_bytes)
+        );
+        let _ = writeln!(out, "  \"locals_headroom\": {},", self.locals_headroom());
+        let _ = writeln!(
+            out,
+            "  \"locals_utilization_pct\": {:.2},",
+            self.locals_utilization_pct()
+        );
+        let _ = writeln!(
+            out,
+            "  \"max_function_locals\": {},",
+            self.max_function_locals
+        );
+        let _ = writeln!(
+            out,
+            "  \"min_module_headroom_bytes\": {},",
+            self.min_module_headroom_bytes
+        );
+        let _ = writeln!(
+            out,
+            "  \"min_module_headroom_mib\": {:.2},",
+            mib_2dp(self.min_module_headroom_bytes)
+        );
+        let _ = writeln!(out, "  \"module_cap_bytes\": {},", self.module_cap_bytes);
+        let _ = writeln!(
+            out,
+            "  \"module_cap_mib\": {:.2},",
+            mib_2dp(self.module_cap_bytes)
+        );
+        let _ = writeln!(
+            out,
+            "  \"module_utilization_pct\": {:.2},",
+            self.module_utilization_pct()
+        );
+        if modules_sorted.is_empty() {
+            out.push_str("  \"side_modules\": [],\n");
+        } else {
+            out.push_str("  \"side_modules\": [\n");
+            for (idx, module) in modules_sorted.iter().enumerate() {
+                let comma = if idx + 1 < modules_sorted.len() {
+                    ","
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "    {{\"bytes\": {}, \"bytes_mib\": {:.2}, \"exceeds_cap\": {}, \"headroom_bytes\": {}, \"label\": {}, \"shards\": {}, \"utilization_pct\": {:.2}}}{comma}",
+                    module.bytes,
+                    module.bytes_mib(),
+                    module.exceeds_cap(self.module_cap_bytes),
+                    module.headroom_bytes(self.module_cap_bytes),
+                    json_string(&module.label),
+                    module.shards,
+                    module.utilization_pct(self.module_cap_bytes),
+                );
+            }
+            out.push_str("  ],\n");
+        }
+        let _ = writeln!(out, "  \"total_module_bytes\": {},", self.total_module_bytes);
+        let _ = writeln!(
+            out,
+            "  \"total_module_mib\": {:.2},",
+            mib_2dp(self.total_module_bytes)
+        );
+        let _ = writeln!(out, "  \"within_v8_caps\": {}", self.within_v8_caps());
+        out.push_str("}\n");
+        out
+    }
 }
 
 #[cfg(test)]
@@ -2013,8 +2695,8 @@ mod tests {
             input_size: 4_000_000,
             input_hash: 0x1234_5678,
             image: ImageStats {
-                image_base: 0x14000_0000,
-                entry_point: 0x14000_1000,
+                image_base: 0x0001_4000_0000,
+                entry_point: 0x0001_4000_1000,
                 size_of_image: 0x20_0000,
                 sections: Vec::new(),
                 dir64: 0,
@@ -2072,8 +2754,8 @@ mod tests {
                 shards: vec![
                     ShardRecord {
                         index: 0,
-                        first: 0x14000_1000,
-                        last: 0x14000_2000,
+                        first: 0x0001_4000_1000,
+                        last: 0x0001_4000_2000,
                         functions: 6,
                         instructions: 600,
                         unsupported: BTreeMap::new(),
@@ -2090,8 +2772,8 @@ mod tests {
                     },
                     ShardRecord {
                         index: 1,
-                        first: 0x14000_3000,
-                        last: 0x14000_4000,
+                        first: 0x0001_4000_3000,
+                        last: 0x0001_4000_4000,
                         functions: 4,
                         instructions: 400,
                         unsupported: BTreeMap::new(),
@@ -2179,5 +2861,418 @@ mod tests {
         assert!(json.contains("\"label\": \"xgetbv\", \"count\": 5"));
         assert!(json.contains("\"label\": \"vmovntdq\", \"count\": 2"));
         assert!(json.contains("\"label\": \"d3d12_xs.dll\", \"count\": 3"));
+    }
+
+    #[test]
+    fn function_size_stats_from_analysis_on_synthetic_code_image() {
+        // Build a synthetic multi-function image:
+        //   0x1000: nop; nop; call rax; ret                (1 block, 4 insns, 1 indirect call, 0 diags)
+        //   0x1006: cmp eax, 0; je 0x100c; nop; ret        (3 blocks: 0x1006, 0x100b, 0x100c; 4 insns total)
+        //   0x100d: jmp 0x9000 (unmapped)                  (2 blocks: 0x100d + unmapped 0x9000, 1 insn, 1 diag)
+        //   0x1012: ret                                    (1 block, 1 insn, 0 indirect calls, 0 diags)
+        let code = [
+            0x90, // 0x1000: nop
+            0x90, // 0x1001: nop
+            0xff, 0xd0, // 0x1002: call rax (indirect call)
+            0xc3, // 0x1004: ret
+            0x90, // 0x1005: padding
+            0x83, 0xf8, 0x00, // 0x1006: cmp eax, 0
+            0x74, 0x01, // 0x1009: je 0x100c
+            0x90, // 0x100b: nop (fallthrough to 0x100c)
+            0xc3, // 0x100c: ret
+            0xe9, 0xee, 0x7f, 0x00, 0x00, // 0x100d: jmp 0x9000 (unmapped diagnostic)
+            0xc3, // 0x1012: ret
+        ];
+        let image = CodeImage::new(
+            0x1000,
+            vec![CodeSection::new(0x1000, &code, true)],
+            vec![0x1000, 0x1006, 0x100d, 0x1012],
+        );
+        let analysis = discover(&image);
+        let stats = FunctionSizeStats::from_analysis(&analysis, 3);
+
+        assert_eq!(stats.total_functions, 4);
+        assert_eq!(stats.total_blocks, 7);
+        assert_eq!(stats.total_instructions, 10);
+        assert_eq!(stats.min_instructions, 1);
+        assert_eq!(stats.max_instructions, 4);
+        assert_eq!(stats.mean_instructions, 2.5);
+        // Sorted instruction counts: [1, 1, 4, 4]
+        // n=4: p50 -> idx=(4*50).div_ceil(100)-1 = 1 -> 1
+        //      p95 -> idx=(4*95).div_ceil(100)-1 = 3 -> 4
+        //      p99 -> idx=(4*99).div_ceil(100)-1 = 3 -> 4
+        assert_eq!(stats.p50_instructions, 1);
+        assert_eq!(stats.p95_instructions, 4);
+        assert_eq!(stats.p99_instructions, 4);
+        assert_eq!(stats.functions_over_1k_insns, 0);
+        assert_eq!(stats.functions_over_10k_insns, 0);
+
+        // Top 3 tie-breaking: 0x1006 (4 insns, 3 blocks) > 0x1000 (4 insns, 1 block) > 0x100d (1 insn, 1 block, lower entry than 0x1012)
+        assert_eq!(stats.top_functions.len(), 3);
+        assert_eq!(stats.top_functions[0].entry, 0x1006);
+        assert_eq!(stats.top_functions[0].instructions, 4);
+        assert_eq!(stats.top_functions[0].blocks, 3);
+        assert_eq!(stats.top_functions[1].entry, 0x1000);
+        assert_eq!(stats.top_functions[1].instructions, 4);
+        assert_eq!(stats.top_functions[1].blocks, 1);
+        assert_eq!(stats.top_functions[1].indirect_calls, 1);
+        assert_eq!(stats.top_functions[2].entry, 0x100d);
+        assert_eq!(stats.top_functions[2].instructions, 1);
+        assert_eq!(stats.top_functions[2].diagnostics, 1);
+
+        // Determinism and hex-address formatting
+        let json_a = stats.render_json();
+        let json_b = FunctionSizeStats::from_analysis(&analysis, 3).render_json();
+        assert_eq!(json_a, json_b);
+        assert!(json_a.contains("\"entry\": \"0x1006\""));
+        assert!(json_a.contains("\"entry\": \"0x1000\""));
+        assert!(json_a.contains("\"entry\": \"0x100d\""));
+        assert!(!json_a.contains("\"entry\": \"0x1012\""));
+        assert!(!contains_host_path(&json_a));
+        assert!(!contains_host_path(&stats.render_text()));
+        assert!(!contains_host_path(&stats.render_one_line()));
+    }
+
+    #[test]
+    fn function_size_stats_percentiles_thresholds_empty_single_and_tie_breaking() {
+        // Empty input
+        let empty = FunctionSizeStats::from_entries(Vec::new(), 5);
+        assert_eq!(empty.total_functions, 0);
+        assert_eq!(empty.min_instructions, 0);
+        assert_eq!(empty.max_instructions, 0);
+        assert_eq!(empty.mean_instructions, 0.0);
+        assert_eq!(empty.p50_instructions, 0);
+        assert_eq!(empty.p95_instructions, 0);
+        assert_eq!(empty.p99_instructions, 0);
+        assert!(empty.top_functions.is_empty());
+        assert!(empty.render_text().contains("Top Functions: none\n"));
+        assert!(empty.render_json().contains("\"top_functions\": [],"));
+        assert!(!empty.render_json().contains("NaN"));
+
+        // Single entry
+        let single = FunctionSizeStats::from_entries(
+            vec![FunctionSizeEntry {
+                entry: 0x0001_4000_1000,
+                blocks: 7,
+                instructions: 42,
+                indirect_calls: 2,
+                diagnostics: 0,
+            }],
+            5,
+        );
+        assert_eq!(single.min_instructions, 42);
+        assert_eq!(single.max_instructions, 42);
+        assert_eq!(single.mean_instructions, 42.0);
+        assert_eq!(single.p50_instructions, 42);
+        assert_eq!(single.p95_instructions, 42);
+        assert_eq!(single.p99_instructions, 42);
+        assert_eq!(single.top_functions.len(), 1);
+
+        // Exact nearest-rank percentiles over 1..=100
+        let hundred: Vec<FunctionSizeEntry> = (1usize..=100)
+            .rev()
+            .map(|i| FunctionSizeEntry {
+                entry: 0x2000 + (i as u64) * 16,
+                blocks: 1,
+                instructions: i,
+                indirect_calls: 0,
+                diagnostics: 0,
+            })
+            .collect();
+        let stats_100 = FunctionSizeStats::from_entries(hundred, 2);
+        assert_eq!(stats_100.p50_instructions, 50);
+        assert_eq!(stats_100.p95_instructions, 95);
+        assert_eq!(stats_100.p99_instructions, 99);
+        assert_eq!(stats_100.mean_instructions, 50.5);
+        assert_eq!(stats_100.top_functions.len(), 2);
+        assert_eq!(stats_100.top_functions[0].instructions, 100);
+        assert_eq!(stats_100.top_functions[1].instructions, 99);
+
+        // Threshold boundaries (>1k, >10k) and exact tie-breaking (insns desc, blocks desc, entry asc)
+        let entries_a = vec![
+            FunctionSizeEntry {
+                entry: 0x5000,
+                blocks: 10,
+                instructions: 1_000, // exact 1k: NOT over 1k
+                indirect_calls: 0,
+                diagnostics: 0,
+            },
+            FunctionSizeEntry {
+                entry: 0x4000,
+                blocks: 12,
+                instructions: 1_001, // over 1k only
+                indirect_calls: 1,
+                diagnostics: 0,
+            },
+            FunctionSizeEntry {
+                entry: 0x3000,
+                blocks: 20,
+                instructions: 10_000, // over 1k, NOT over 10k
+                indirect_calls: 0,
+                diagnostics: 0,
+            },
+            FunctionSizeEntry {
+                entry: 0x2000,
+                blocks: 30,
+                instructions: 10_001, // over 1k and >10k
+                indirect_calls: 3,
+                diagnostics: 1,
+            },
+            FunctionSizeEntry {
+                entry: 0x1000,
+                blocks: 30,
+                instructions: 10_001, // tied insns & blocks with 0x2000 -> lower entry wins
+                indirect_calls: 0,
+                diagnostics: 0,
+            },
+        ];
+        let mut entries_b = entries_a.clone();
+        entries_b.reverse();
+
+        let s_a = FunctionSizeStats::from_entries(entries_a, 10);
+        let s_b = FunctionSizeStats::from_entries(entries_b, 10);
+        assert_eq!(s_a, s_b);
+        assert_eq!(s_a.render_json(), s_b.render_json());
+        assert_eq!(s_a.render_text(), s_b.render_text());
+        assert_eq!(s_a.render_one_line(), s_b.render_one_line());
+        assert_eq!(s_a.functions_over_1k_insns, 4);
+        assert_eq!(s_a.functions_over_10k_insns, 2);
+        assert_eq!(s_a.top_functions[0].entry, 0x1000);
+        assert_eq!(s_a.top_functions[1].entry, 0x2000);
+        assert_eq!(s_a.top_functions[2].entry, 0x3000);
+    }
+
+    #[test]
+    fn wasm64_headroom_report_matches_timon_asymmetric_split_and_over_cap_checks() {
+        // Matches #663 12:15Z asymmetric split:
+        //   guest_part_0: 890 MiB / 383 shards (~134 MiB headroom under 1024 MiB cap)
+        //   guest_part_1: 0.14 MiB / 1 shard
+        //   guest_part_2: 6.70 MiB / 1 shard
+        //   largest fn body: 1.70 MB vs 7.65 MB V8 cap, max locals 1306 vs 50,000 cap, 4 bodies > 1 MiB
+        let part0_bytes = 890 * 1024 * 1024;
+        let part1_bytes = 146_801; // 0.14 MiB
+        let part2_bytes = 7_025_459; // 6.70 MiB
+
+        let modules_a = vec![
+            SideModuleEntry::new("guest_part_1.wasm", 1, part1_bytes),
+            SideModuleEntry::new("guest_part_0.wasm", 383, part0_bytes),
+            SideModuleEntry::new("guest_part_2.wasm", 1, part2_bytes),
+        ];
+        let mut modules_b = modules_a.clone();
+        modules_b.reverse();
+
+        let report_a = Wasm64HeadroomReport::new(modules_a, 1_700_000, 1_306, 4);
+        let report_b = Wasm64HeadroomReport::new(modules_b, 1_700_000, 1_306, 4);
+
+        assert_eq!(report_a, report_b);
+        assert_eq!(report_a.render_json(), report_b.render_json());
+        assert_eq!(report_a.render_text(), report_b.render_text());
+        assert_eq!(report_a.render_one_line(), report_b.render_one_line());
+
+        // Deterministic descending byte order
+        let labels: Vec<&str> = report_a
+            .side_modules
+            .iter()
+            .map(|m| m.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["guest_part_0.wasm", "guest_part_2.wasm", "guest_part_1.wasm"]
+        );
+
+        assert_eq!(report_a.module_cap_bytes, V8_MAX_WASM_MODULE_BYTES);
+        assert_eq!(
+            report_a.function_body_cap_bytes,
+            V8_MAX_WASM_FUNCTION_BODY_BYTES
+        );
+        assert_eq!(report_a.function_locals_cap, V8_MAX_WASM_FUNCTION_LOCALS);
+        assert_eq!(report_a.largest_module_bytes, part0_bytes);
+        assert_eq!(report_a.min_module_headroom_bytes, 134 * 1024 * 1024);
+        assert_eq!(mib_2dp(report_a.min_module_headroom_bytes), 134.0);
+        assert_eq!(report_a.module_utilization_pct(), 86.91);
+        assert_eq!(report_a.side_modules[0].bytes_mib(), 890.0);
+        assert_eq!(report_a.side_modules[1].bytes_mib(), 6.7);
+        assert_eq!(report_a.side_modules[2].bytes_mib(), 0.14);
+        assert_eq!(
+            report_a.function_body_headroom_bytes(),
+            V8_MAX_WASM_FUNCTION_BODY_BYTES - 1_700_000
+        );
+        assert_eq!(report_a.function_body_utilization_pct(), 22.21);
+        assert_eq!(report_a.locals_headroom(), 50_000 - 1_306);
+        assert_eq!(report_a.locals_utilization_pct(), 2.61);
+        assert_eq!(report_a.functions_over_1mib, 4);
+        assert_eq!(report_a.asymmetric_split_ratio(), 2.98);
+        assert!(report_a.within_v8_caps());
+        assert!(report_a.render_one_line().ends_with("| within-caps"));
+        assert!(report_a.render_json().contains("\"within_v8_caps\": true"));
+
+        // Over module cap -> within_v8_caps == false
+        let over_module = Wasm64HeadroomReport::new(
+            vec![SideModuleEntry::new(
+                "guest_part_0.wasm",
+                450,
+                V8_MAX_WASM_MODULE_BYTES + 1,
+            )],
+            1_000_000,
+            1_000,
+            0,
+        );
+        assert!(over_module.side_modules[0].exceeds_cap(V8_MAX_WASM_MODULE_BYTES));
+        assert_eq!(over_module.min_module_headroom_bytes, 0);
+        assert_eq!(over_module.module_utilization_pct(), 100.0);
+        assert!(!over_module.within_v8_caps());
+        assert!(over_module.render_one_line().ends_with("| over-cap"));
+        assert!(over_module.render_text().contains("OVER-CAP"));
+
+        // Over function body cap -> within_v8_caps == false
+        let over_body = Wasm64HeadroomReport::new(
+            vec![SideModuleEntry::new("guest_part_0.wasm", 10, 10_000_000)],
+            V8_MAX_WASM_FUNCTION_BODY_BYTES + 1,
+            1_000,
+            1,
+        );
+        assert_eq!(over_body.function_body_headroom_bytes(), 0);
+        assert!(!over_body.within_v8_caps());
+
+        // Over locals cap -> within_v8_caps == false
+        let over_locals = Wasm64HeadroomReport::new(
+            vec![SideModuleEntry::new("guest_part_0.wasm", 10, 10_000_000)],
+            100_000,
+            V8_MAX_WASM_FUNCTION_LOCALS + 1,
+            0,
+        );
+        assert_eq!(over_locals.locals_headroom(), 0);
+        assert!(!over_locals.within_v8_caps());
+
+        // Empty side modules and zero caps never divide by zero
+        let empty_zero_caps = Wasm64HeadroomReport::with_caps(Vec::new(), 0, 0, 0, 0, 0, 0);
+        assert_eq!(empty_zero_caps.asymmetric_split_ratio(), 0.0);
+        assert_eq!(empty_zero_caps.module_utilization_pct(), 0.0);
+        assert_eq!(empty_zero_caps.function_body_utilization_pct(), 0.0);
+        assert_eq!(empty_zero_caps.locals_utilization_pct(), 0.0);
+        assert!(empty_zero_caps.within_v8_caps());
+        assert!(empty_zero_caps.render_text().contains("Side Modules: none\n"));
+        assert!(empty_zero_caps.render_json().contains("\"side_modules\": [],"));
+        assert!(!empty_zero_caps.render_json().contains("NaN"));
+        assert_eq!(LARGE_FUNCTION_BODY_THRESHOLD_BYTES, 1024 * 1024);
+    }
+
+    #[test]
+    fn fast_boot_shard_stats_spread_and_headroom_helpers() {
+        // Empty stats
+        let empty = FastBootShardStats::from_entries(&[], DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES);
+        assert_eq!(empty.instruction_spread(), 0);
+        assert_eq!(empty.byte_spread(), 0);
+        assert_eq!(
+            empty.budget_headroom_bytes(),
+            DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES
+        );
+        assert_eq!(empty.budget_utilization_pct(), 0.0);
+        assert_eq!(empty.module_cap_headroom_bytes(), V8_MAX_WASM_MODULE_BYTES);
+        assert_eq!(empty.module_cap_utilization_pct(), 0.0);
+
+        // Under-budget shards
+        let under = FastBootShardStats::from_entries(
+            &[
+                FastBootShardEntry::new(0, "shard-0.o", 100, 5_000, 3_000_000, Some(1_048_576)),
+                FastBootShardEntry::new(1, "shard-1.o", 150, 12_500, 6_000_000, Some(2_097_152)),
+            ],
+            DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES,
+        );
+        assert_eq!(under.instruction_spread(), 7_500);
+        assert_eq!(under.byte_spread(), 1_048_576);
+        assert_eq!(under.budget_headroom_bytes(), 2_097_152);
+        assert_eq!(under.budget_utilization_pct(), 50.0);
+        assert_eq!(
+            under.module_cap_headroom_bytes(),
+            V8_MAX_WASM_MODULE_BYTES - 3_145_728
+        );
+        assert_eq!(under.module_cap_utilization_pct(), 0.29);
+
+        // Over-budget shard
+        let over_budget = FastBootShardStats::from_entries(
+            &[FastBootShardEntry::new(
+                0,
+                "shard-big.o",
+                400,
+                40_000,
+                9_000_000,
+                Some(DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES + 500_000),
+            )],
+            DEFAULT_FAST_BOOT_SHARD_BUDGET_BYTES,
+        );
+        assert_eq!(over_budget.budget_headroom_bytes(), 0);
+        assert_eq!(over_budget.budget_utilization_pct(), 100.0);
+
+        // Over V8 module cap total bytes
+        let over_v8 = FastBootShardStats::from_entries(
+            &[
+                FastBootShardEntry::new(
+                    0,
+                    "part-0.o",
+                    1000,
+                    100_000,
+                    700 * 1024 * 1024,
+                    Some(600 * 1024 * 1024),
+                ),
+                FastBootShardEntry::new(
+                    1,
+                    "part-1.o",
+                    1000,
+                    100_000,
+                    700 * 1024 * 1024,
+                    Some(500 * 1024 * 1024),
+                ),
+            ],
+            0, // zero budget tests zero-division guard
+        );
+        assert_eq!(over_v8.budget_utilization_pct(), 0.0);
+        assert_eq!(over_v8.module_cap_headroom_bytes(), 0);
+        assert_eq!(over_v8.module_cap_utilization_pct(), 100.0);
+    }
+
+    #[test]
+    fn wasm64_headroom_sanitizes_adversarial_host_paths_in_all_outputs() {
+        let mut report = Wasm64HeadroomReport::new(
+            vec![
+                SideModuleEntry::new(r"C:\Users\alice\GTA6\guest_part_0.wasm", 383, 890_000_000),
+                SideModuleEntry::new("/home/runner/work/secret/guest_part_2.wasm", 1, 6_700_000),
+                SideModuleEntry::new(r"\\buildbox\share\private\guest_part_1.wasm", 1, 140_000),
+                SideModuleEntry::new("file:///Volumes/XboxSSD/hidden_dir/", 0, 0),
+            ],
+            1_700_000,
+            1_306,
+            4,
+        );
+        // Defense-in-depth: mutate a public field after construction
+        report.side_modules[0].label = r"\\?\D:\Private\User\guest_part_0.wasm".to_string();
+
+        let one_line = report.render_one_line();
+        let text = report.render_text();
+        let json = report.render_json();
+        for output in [&one_line, &text, &json] {
+            assert!(
+                !contains_host_path(output),
+                "host path leaked into output:\n{output}"
+            );
+            for forbidden in [
+                "alice",
+                "runner",
+                "buildbox",
+                "XboxSSD",
+                "hidden_dir",
+                "Private",
+                "file://",
+            ] {
+                assert!(
+                    !output.contains(forbidden),
+                    "forbidden token '{forbidden}' leaked into output:\n{output}"
+                );
+            }
+        }
+        assert!(json.contains("\"label\": \"guest_part_0.wasm\""));
+        assert!(json.contains("\"label\": \"guest_part_2.wasm\""));
+        assert!(json.contains("\"label\": \"guest_part_1.wasm\""));
+        assert!(json.contains("\"label\": \"<unknown>\""));
     }
 }
