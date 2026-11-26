@@ -11,12 +11,17 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#endif
 
 #include "os/threading.h"
 
@@ -70,7 +75,18 @@ using Clock = std::chrono::steady_clock;
 struct WaitBlock {
     enum : uint32_t { kWaiting, kClaimed, kSatisfied, kTimedOut };
 
+    WaitBlock() = default;
     WaitBlock(uint32_t waiter_thread, bool all) : thread_id(waiter_thread), wait_all(all) {}
+
+    void reset(uint32_t waiter_thread, bool all) {
+        thread_id = waiter_thread;
+        wait_all = all;
+        state.store(kWaiting, std::memory_order_relaxed);
+        wake_seq.store(0, std::memory_order_relaxed);
+        index = 0;
+        abandoned = false;
+        newly_owned = false;
+    }
 
     // Called with the object lock held; the block outlives that lock because the waiter must take
     // it to deregister before returning.
@@ -89,8 +105,8 @@ struct WaitBlock {
         cv.notify_one();
     }
 
-    const uint32_t thread_id;
-    const bool wait_all;
+    uint32_t thread_id = 0;
+    bool wait_all = false;
     std::mutex mutex;
     std::condition_variable cv;
     std::atomic<uint32_t> state{kWaiting};
@@ -100,6 +116,63 @@ struct WaitBlock {
     bool abandoned = false;
     bool newly_owned = false;
 };
+
+struct ReusableWaitBlockSlot {
+    WaitBlock block;
+    bool in_use = false;
+};
+
+thread_local ReusableWaitBlockSlot t_wait_block;
+
+// Acquires the calling thread's reusable WaitBlock (avoiding per-wait mutex/cv init & destroy),
+// falling back to a stack-allocated WaitBlock if a wait is ever re-entered on the same thread.
+class ScopedWaitBlock {
+public:
+    ScopedWaitBlock(uint32_t thread_id, bool wait_all) {
+        if (!t_wait_block.in_use) {
+            t_wait_block.in_use = true;
+            block_ = &t_wait_block.block;
+            owns_tls_ = true;
+        } else {
+            fallback_.emplace();
+            block_ = &*fallback_;
+            owns_tls_ = false;
+        }
+        block_->reset(thread_id, wait_all);
+    }
+
+    ~ScopedWaitBlock() {
+        if (owns_tls_) {
+            t_wait_block.in_use = false;
+        }
+    }
+
+    ScopedWaitBlock(const ScopedWaitBlock&) = delete;
+    ScopedWaitBlock& operator=(const ScopedWaitBlock&) = delete;
+
+    WaitBlock& get() { return *block_; }
+
+private:
+    WaitBlock* block_ = nullptr;
+    std::optional<WaitBlock> fallback_;
+    bool owns_tls_ = false;
+};
+
+inline void cpu_pause() noexcept {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#if defined(_MSC_VER)
+    __yield();
+#else
+    __asm__ __volatile__("yield");
+#endif
+#else
+    // No-op on Wasm and other targets.
+#endif
+}
 
 struct WaiterLink {
     WaitBlock* block;
@@ -526,22 +599,60 @@ constexpr auto kWaitSpinWindow = std::chrono::microseconds(20);
 // usually signal within microseconds, and a futex sleep + wake costs far more. Only a
 // wake_waiters_locked() on one of the objects ends the spin early; the caller then re-checks the
 // state under the object locks, so no wait is ever skipped.
-void spin_for_signal(const ObjectArray& objects, uint32_t count) {
+void spin_for_single_signal(const DispatcherObject& object,
+                            uint32_t seen,
+                            bool infinite,
+                            Clock::time_point deadline) {
+    if (object.signal_seq.load(std::memory_order_acquire) != seen) {
+        return;
+    }
+    const Clock::time_point now = Clock::now();
+    if (!infinite && now >= deadline) {
+        return;
+    }
+    const Clock::time_point window_end = now + kWaitSpinWindow;
+    const Clock::time_point spin_end =
+        (!infinite && deadline < window_end) ? deadline : window_end;
+    for (uint32_t iter = 1;; ++iter) {
+        if (object.signal_seq.load(std::memory_order_acquire) != seen) {
+            return;
+        }
+        cpu_pause();
+        if ((iter & 63u) == 0 && Clock::now() >= spin_end) {
+            return;
+        }
+        if ((iter & 31u) == 0) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+void spin_for_signal(const ObjectArray& objects,
+                     uint32_t count,
+                     bool infinite,
+                     Clock::time_point deadline) {
     std::array<uint32_t, MAXIMUM_WAIT_OBJECTS> seen{};
     for (uint32_t i = 0; i < count; ++i) {
         seen[i] = objects[i]->signal_seq.load(std::memory_order_acquire);
     }
-    const Clock::time_point spin_end = Clock::now() + kWaitSpinWindow;
+    const Clock::time_point now = Clock::now();
+    if (!infinite && now >= deadline) {
+        return;
+    }
+    const Clock::time_point window_end = now + kWaitSpinWindow;
+    const Clock::time_point spin_end =
+        (!infinite && deadline < window_end) ? deadline : window_end;
     for (uint32_t iter = 1;; ++iter) {
         for (uint32_t i = 0; i < count; ++i) {
             if (objects[i]->signal_seq.load(std::memory_order_acquire) != seen[i]) {
                 return;
             }
         }
-        if ((iter & 31u) == 0 && Clock::now() >= spin_end) {
+        cpu_pause();
+        if ((iter & 63u) == 0 && Clock::now() >= spin_end) {
             return;
         }
-        if ((iter & 7u) == 0) {
+        if ((iter & 31u) == 0) {
             std::this_thread::yield();
         }
     }
@@ -623,17 +734,69 @@ bool try_wait_all(const ObjectArray& objects,
     return satisfied;
 }
 
-uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
-                  uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
-    WaitBlock block(thread_id, false);
-    uint32_t registered = 0;
-    bool claimed = try_wait_any(objects, count, block, false, registered);
-    if (!claimed && timeout_ms != 0) {  // a poll never spins
-        spin_for_signal(objects, count);
-        claimed = try_wait_any(objects, count, block, false, registered);
-        if (!claimed && (infinite || Clock::now() < deadline)) {
-            claimed = try_wait_any(objects, count, block, true, registered);
+// Dedicated single-object wait fast path: avoids constructing the 64-element ObjectArray, avoids
+// Clock::now() and WaitBlock setup on immediate satisfaction or zero-timeout polls, and reuses the
+// thread-local WaitBlock when blocking.
+uint32_t wait_for_single_object(Handle handle, uint32_t timeout_ms) {
+    auto object = lookup_dispatcher_object(handle);
+    if (!object) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return WAIT_FAILED;
+    }
+
+    const uint32_t thread_id = current_thread_info().id;
+
+    uint32_t initial_seq = 0;
+    {
+        AcquireOutcome outcome{};
+        bool acquired = false;
+        {
+            std::lock_guard<std::mutex> guard(object->lock);
+            if (object->is_signaled_for(thread_id)) {
+                outcome = object->acquire(thread_id);
+                acquired = true;
+            } else if (timeout_ms == 0) {
+                return WAIT_TIMEOUT;
+            } else {
+                initial_seq = object->signal_seq.load(std::memory_order_relaxed);
+            }
         }
+        if (acquired) {
+            note_acquired(*object, outcome);
+            return outcome.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0;
+        }
+    }
+
+    const bool infinite = timeout_ms == INFINITE_TIMEOUT;
+    const Clock::time_point deadline =
+        infinite ? Clock::time_point::max() : Clock::now() + std::chrono::milliseconds(timeout_ms);
+
+    spin_for_single_signal(*object, initial_seq, infinite, deadline);
+
+    ScopedWaitBlock scoped_block(thread_id, false);
+    WaitBlock& block = scoped_block.get();
+    bool enqueued = false;
+    {
+        AcquireOutcome outcome{};
+        bool acquired = false;
+        {
+            std::lock_guard<std::mutex> guard(object->lock);
+            if (object->is_signaled_for(thread_id)) {
+                outcome = object->acquire(thread_id);
+                acquired = true;
+            } else if (infinite || Clock::now() < deadline) {
+                object->waiters.push_back({&block, 0});
+                enqueued = true;
+            }
+        }
+        if (acquired) {
+            note_acquired(*object, outcome);
+            return outcome.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0;
+        }
+    }
+
+    if (!enqueued) {
+        return WAIT_TIMEOUT;
     }
 
     {
@@ -641,15 +804,68 @@ uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id
         const auto done = [&]() {
             return block.state.load(std::memory_order_acquire) == WaitBlock::kSatisfied;
         };
-        if (claimed || registered != 0) {
-            if (infinite) {
-                block.cv.wait(guard, done);
-            } else if (!block.cv.wait_until(guard, deadline, done)) {
-                uint32_t expected = WaitBlock::kWaiting;
-                if (!block.state.compare_exchange_strong(expected, WaitBlock::kTimedOut,
-                                                         std::memory_order_acq_rel)) {
-                    block.cv.wait(guard, done);  // a handoff won the race; it completes shortly
-                }
+        if (infinite) {
+            block.cv.wait(guard, done);
+        } else if (!block.cv.wait_until(guard, deadline, done)) {
+            uint32_t expected = WaitBlock::kWaiting;
+            if (!block.state.compare_exchange_strong(expected, WaitBlock::kTimedOut,
+                                                     std::memory_order_acq_rel)) {
+                block.cv.wait(guard, done);  // a handoff won the race; it completes shortly
+            }
+        }
+    }
+
+    if (block.state.load(std::memory_order_acquire) != WaitBlock::kSatisfied) {
+        std::lock_guard<std::mutex> guard(object->lock);
+        std::erase_if(object->waiters, [&](const WaiterLink& link) { return link.block == &block; });
+        return WAIT_TIMEOUT;
+    }
+    note_acquired(*object, {block.abandoned, block.newly_owned});
+    return block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0;
+}
+
+uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
+                  uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
+    ScopedWaitBlock scoped_block(thread_id, false);
+    WaitBlock& block = scoped_block.get();
+    uint32_t registered = 0;
+    bool claimed = try_wait_any(objects, count, block, false, registered);
+    if (claimed) {
+        note_acquired(*objects[block.index], {block.abandoned, block.newly_owned});
+        return (block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + block.index;
+    }
+    if (timeout_ms == 0) {
+        return WAIT_TIMEOUT;
+    }
+
+    spin_for_signal(objects, count, infinite, deadline);
+    claimed = try_wait_any(objects, count, block, false, registered);
+    if (claimed) {
+        note_acquired(*objects[block.index], {block.abandoned, block.newly_owned});
+        return (block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + block.index;
+    }
+    if (!infinite && Clock::now() >= deadline) {
+        return WAIT_TIMEOUT;
+    }
+
+    claimed = try_wait_any(objects, count, block, true, registered);
+    if (claimed && registered == 0) {
+        note_acquired(*objects[block.index], {block.abandoned, block.newly_owned});
+        return (block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + block.index;
+    }
+
+    if (claimed || registered != 0) {
+        std::unique_lock<std::mutex> guard(block.mutex);
+        const auto done = [&]() {
+            return block.state.load(std::memory_order_acquire) == WaitBlock::kSatisfied;
+        };
+        if (infinite) {
+            block.cv.wait(guard, done);
+        } else if (!block.cv.wait_until(guard, deadline, done)) {
+            uint32_t expected = WaitBlock::kWaiting;
+            if (!block.state.compare_exchange_strong(expected, WaitBlock::kTimedOut,
+                                                     std::memory_order_acq_rel)) {
+                block.cv.wait(guard, done);  // a handoff won the race; it completes shortly
             }
         }
     }
@@ -672,7 +888,8 @@ uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id
         return std::less<const DispatcherObject*>()(objects[a].get(), objects[b].get());
     });
 
-    WaitBlock block(thread_id, true);
+    ScopedWaitBlock scoped_block(thread_id, true);
+    WaitBlock& block = scoped_block.get();
     bool registered = false;
     bool spun = timeout_ms == 0;  // a poll never spins
     uint32_t result = WAIT_TIMEOUT;
@@ -682,6 +899,10 @@ uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id
         if (try_wait_all(objects, lock_order, count, block, enqueue, result)) {
             break;
         }
+        if (timeout_ms == 0) {
+            result = WAIT_TIMEOUT;
+            break;
+        }
         registered = registered || enqueue;
         if (!infinite && Clock::now() >= deadline) {
             result = WAIT_TIMEOUT;
@@ -689,7 +910,7 @@ uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id
         }
         if (!spun) {
             spun = true;
-            spin_for_signal(objects, count);
+            spin_for_signal(objects, count, infinite, deadline);
             continue;
         }
         std::unique_lock<std::mutex> guard(block.mutex);
@@ -713,6 +934,9 @@ uint32_t wait_for_objects(uint32_t count,
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || handles == nullptr) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
+    }
+    if (count == 1) {
+        return wait_for_single_object(handles[0], timeout_ms);
     }
 
     // Handle lookups take the handle-table lock, so resolve them before any object lock.
@@ -739,7 +963,8 @@ uint32_t wait_for_objects(uint32_t count,
     const uint32_t thread_id = current_thread_info().id;
     const bool infinite = timeout_ms == INFINITE_TIMEOUT;
     const Clock::time_point deadline =
-        infinite ? Clock::time_point::max() : Clock::now() + std::chrono::milliseconds(timeout_ms);
+        (infinite || timeout_ms == 0) ? Clock::time_point::min()
+                                      : Clock::now() + std::chrono::milliseconds(timeout_ms);
     return wait_all_objects ? wait_all(objects, count, thread_id, timeout_ms, infinite, deadline)
                             : wait_any(objects, count, thread_id, timeout_ms, infinite, deadline);
 }
@@ -754,10 +979,57 @@ struct CvWaiter {
     bool signaled = false;
     CvWaiter* prev = nullptr;
     CvWaiter* next = nullptr;
+
+    void reset(const void* wait_key) {
+        key = wait_key;
+        signaled = false;
+        prev = nullptr;
+        next = nullptr;
+    }
+};
+
+struct ReusableCvWaiterSlot {
+    CvWaiter waiter;
+    bool in_use = false;
+};
+
+thread_local ReusableCvWaiterSlot t_cv_waiter;
+
+class ScopedCvWaiter {
+public:
+    explicit ScopedCvWaiter(const void* key) {
+        if (!t_cv_waiter.in_use) {
+            t_cv_waiter.in_use = true;
+            waiter_ = &t_cv_waiter.waiter;
+            owns_tls_ = true;
+        } else {
+            fallback_.emplace();
+            waiter_ = &*fallback_;
+            owns_tls_ = false;
+        }
+        waiter_->reset(key);
+    }
+
+    ~ScopedCvWaiter() {
+        if (owns_tls_) {
+            t_cv_waiter.in_use = false;
+        }
+    }
+
+    ScopedCvWaiter(const ScopedCvWaiter&) = delete;
+    ScopedCvWaiter& operator=(const ScopedCvWaiter&) = delete;
+
+    CvWaiter& get() { return *waiter_; }
+
+private:
+    CvWaiter* waiter_ = nullptr;
+    std::optional<CvWaiter> fallback_;
+    bool owns_tls_ = false;
 };
 
 struct CvBucket {
     std::mutex mutex;
+    std::atomic<uint32_t> waiter_count{0};
     CvWaiter* head = nullptr;
     CvWaiter* tail = nullptr;
 
@@ -770,6 +1042,7 @@ struct CvBucket {
             head = waiter;
         }
         tail = waiter;
+        waiter_count.fetch_add(1, std::memory_order_seq_cst);
     }
 
     void unlink(CvWaiter* waiter) {
@@ -785,6 +1058,7 @@ struct CvBucket {
         }
         waiter->prev = nullptr;
         waiter->next = nullptr;
+        waiter_count.fetch_sub(1, std::memory_order_release);
     }
 };
 
@@ -807,11 +1081,12 @@ bool sleep_on_condition_variable(const void* key,
                                  Reacquire reacquire_lock) {
     const bool infinite = timeout_ms == INFINITE_TIMEOUT;
     const Clock::time_point deadline =
-        infinite ? Clock::time_point::max() : Clock::now() + std::chrono::milliseconds(timeout_ms);
+        (infinite || timeout_ms == 0) ? Clock::time_point::min()
+                                      : Clock::now() + std::chrono::milliseconds(timeout_ms);
 
     CvBucket& bucket = cv_bucket(key);
-    CvWaiter waiter;
-    waiter.key = key;
+    ScopedCvWaiter scoped_waiter(key);
+    CvWaiter& waiter = scoped_waiter.get();
     {
         std::lock_guard<std::mutex> lock(bucket.mutex);
         bucket.push_back(&waiter);
@@ -824,7 +1099,7 @@ bool sleep_on_condition_variable(const void* key,
         std::unique_lock<std::mutex> lock(bucket.mutex);
         if (infinite) {
             waiter.cv.wait(lock, [&]() { return waiter.signaled; });
-        } else {
+        } else if (timeout_ms != 0) {
             waiter.cv.wait_until(lock, deadline, [&]() { return waiter.signaled; });
         }
         signaled = waiter.signaled;
@@ -842,6 +1117,12 @@ bool sleep_on_condition_variable(const void* key,
 
 void wake_condition_variable(const void* key, bool wake_all) {
     CvBucket& bucket = cv_bucket(key);
+    // Pairs with push_back's seq_cst increment so a wake issued immediately after updating the
+    // predicate and releasing the user lock never misses a waiter queued before lock release.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (bucket.waiter_count.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(bucket.mutex);
     CvWaiter* waiter = bucket.head;
     while (waiter != nullptr) {
@@ -1114,14 +1395,14 @@ bool ReleaseMutex(Handle mutex) {
 // ---------------------------------------------------------------------------
 
 uint32_t WaitForSingleObject(Handle handle, uint32_t timeout_ms) {
-    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_single_object(handle, timeout_ms);
     event_trace_wait(handle, timeout_ms, result);
     return result;
 }
 
 uint32_t WaitForSingleObjectEx(Handle handle, uint32_t timeout_ms, bool alertable) {
     (void)alertable;
-    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_single_object(handle, timeout_ms);
     event_trace_wait(handle, timeout_ms, result);
     return result;
 }

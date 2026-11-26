@@ -62,7 +62,7 @@ bool is_thread_handle(Handle h) {
 }
 
 uint32_t processor_count() {
-    const unsigned hw = std::thread::hardware_concurrency();
+    static const unsigned hw = std::thread::hardware_concurrency();
     uint64_t mask = get_process_affinity_mask();
     uint32_t bits = 0;
     while (mask != 0) {
@@ -604,7 +604,7 @@ int32_t pg6_win32_set_thread_ideal_processor_ex(Pg6Handle thread,
     }
     static std::mutex mutex;
     // Keyed by handle; the current-thread pseudo handle by the calling thread's id.
-    static std::map<uint64_t, uint8_t> ideals;
+    static std::unordered_map<uint64_t, uint8_t> ideals;
     const uint64_t raw = static_cast<uint64_t>(thread);
     const uint64_t id = raw == static_cast<uint64_t>(-2) ? (uint64_t{1} << 63) | pg6_win32_get_current_thread_id() : raw;
     std::lock_guard<std::mutex> lock(mutex);
