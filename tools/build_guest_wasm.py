@@ -165,8 +165,17 @@ BROWSER_BOOT_EXPORT_LINK_FLAGS: tuple[str, ...] = (
     f"-sEXPORTED_FUNCTIONS={BROWSER_BOOT_EXPORTED_FUNCTIONS}",
 )
 
-# Chrome/V8 enforces a hard 1 GiB WebAssembly.instantiate() module size limit.
+# Chrome/V8 enforces hard WebAssembly instantiation and per-function limits:
+#   - kV8MaxWasmModuleSize = 1 GiB (1,073,741,824 bytes)
+#   - kV8MaxWasmFunctionSize = 7,654,321 bytes (~7.65 MB / ~7.30 MiB)
+#   - kV8MaxWasmFunctionLocals = 50,000 locals per function
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024
+V8_MAX_WASM_FUNCTION_BYTES = 7_654_321
+V8_MAX_WASM_FUNCTION_LOCALS = 50_000
+LARGE_FUNC_BODY_THRESHOLD_BYTES = 1024 * 1024
+V8_MODULE_WARN_FRACTION = 0.90
+V8_FUNC_BODY_WARN_FRACTION = 0.75
+V8_FUNC_LOCALS_WARN_FRACTION = 0.80
 
 # Split-module dynamic linking (R28/R31/R37e): -fPIC + -sMAIN_MODULE=1 + -sSIDE_MODULE=1
 # (default) or -sSIDE_MODULE=2 (asymmetric / pruned), with registration tables in an extra
@@ -194,6 +203,7 @@ SIDE_MODULE_PRUNED_LINK_FLAGS: tuple[str, ...] = (
     SIDE_MODULE_CTOR_EXPORT_FLAG,
 )
 SIDE_MODULE_NAME_TEMPLATE = "guest_part_{index}.wasm"
+_SIDE_MODULE_FILENAME_RE = re.compile(r"^guest_part_(\d+)\.wasm$")
 SIDE_RESPONSE_FILE_TEMPLATE = "side_part_{index}.rsp"
 SIDE_EXPORTS_RESPONSE_FILE_TEMPLATE = "side_part_{index}_exports.rsp"
 LLVM_NM_DEFINED_GLOBAL_TYPES: frozenset[str] = frozenset({"T", "W", "D", "B", "R", "C", "V"})
@@ -248,6 +258,7 @@ WASM_SECTION_CUSTOM = 0
 WASM_SECTION_IMPORT = 2
 WASM_SECTION_TABLE = 4
 WASM_SECTION_EXPORT = 7
+WASM_SECTION_CODE = 10
 WASM_KNOWN_SECTION_IDS: frozenset[int] = frozenset(range(0, 14))
 WASM_DYLINK_MEM_INFO = 1
 WASM_REFTYPE_FUNCREF = 0x70
@@ -332,10 +343,50 @@ class WasmModuleMetrics:
     sub_func_imports: int = 0
     got_func_sub_imports: int = 0
     got_func_shard_dispatch_imports: int = 0
+    code_func_count: int = 0
+    max_func_body_bytes: int = 0
+    max_func_locals: int = 0
+    large_func_bodies_over_1mib: int = 0
 
     @property
     def size_mib(self) -> float:
         return round(self.wasm_bytes / (1024 * 1024), 4)
+
+    @property
+    def v8_module_headroom_bytes(self) -> int:
+        return V8_MAX_WASM_MODULE_BYTES - self.wasm_bytes
+
+    @property
+    def v8_module_headroom_mib(self) -> float:
+        return round(self.v8_module_headroom_bytes / (1024 * 1024), 4)
+
+    @property
+    def v8_module_used_pct(self) -> float:
+        return round((self.wasm_bytes / V8_MAX_WASM_MODULE_BYTES) * 100.0, 2)
+
+    @property
+    def max_func_body_mib(self) -> float:
+        return round(self.max_func_body_bytes / (1024 * 1024), 4)
+
+    @property
+    def v8_func_body_headroom_bytes(self) -> int:
+        return V8_MAX_WASM_FUNCTION_BYTES - self.max_func_body_bytes
+
+    @property
+    def v8_func_locals_headroom(self) -> int:
+        return V8_MAX_WASM_FUNCTION_LOCALS - self.max_func_locals
+
+    @property
+    def exceeds_v8_module_limit(self) -> bool:
+        return self.wasm_bytes > V8_MAX_WASM_MODULE_BYTES
+
+    @property
+    def exceeds_v8_func_size_limit(self) -> bool:
+        return self.max_func_body_bytes > V8_MAX_WASM_FUNCTION_BYTES
+
+    @property
+    def exceeds_v8_locals_limit(self) -> bool:
+        return self.max_func_locals > V8_MAX_WASM_FUNCTION_LOCALS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -358,6 +409,19 @@ class WasmModuleMetrics:
             "sub_func_imports": self.sub_func_imports,
             "got_func_sub_imports": self.got_func_sub_imports,
             "got_func_shard_dispatch_imports": self.got_func_shard_dispatch_imports,
+            "code_func_count": self.code_func_count,
+            "max_func_body_bytes": self.max_func_body_bytes,
+            "max_func_body_mib": self.max_func_body_mib,
+            "max_func_locals": self.max_func_locals,
+            "large_func_bodies_over_1mib": self.large_func_bodies_over_1mib,
+            "v8_module_headroom_bytes": self.v8_module_headroom_bytes,
+            "v8_module_headroom_mib": self.v8_module_headroom_mib,
+            "v8_module_used_pct": self.v8_module_used_pct,
+            "v8_func_body_headroom_bytes": self.v8_func_body_headroom_bytes,
+            "v8_func_locals_headroom": self.v8_func_locals_headroom,
+            "exceeds_v8_module_limit": self.exceeds_v8_module_limit,
+            "exceeds_v8_func_size_limit": self.exceeds_v8_func_size_limit,
+            "exceeds_v8_locals_limit": self.exceeds_v8_locals_limit,
         }
 
     def to_manifest_dict(self) -> dict[str, Any]:
@@ -382,6 +446,19 @@ class WasmModuleMetrics:
             "subFuncImports": self.sub_func_imports,
             "gotFuncSubImports": self.got_func_sub_imports,
             "gotFuncShardDispatchImports": self.got_func_shard_dispatch_imports,
+            "codeFuncCount": self.code_func_count,
+            "maxFuncBodyBytes": self.max_func_body_bytes,
+            "maxFuncBodyMiB": self.max_func_body_mib,
+            "maxFuncLocals": self.max_func_locals,
+            "largeFuncBodiesOver1MiB": self.large_func_bodies_over_1mib,
+            "v8ModuleHeadroomBytes": self.v8_module_headroom_bytes,
+            "v8ModuleHeadroomMiB": self.v8_module_headroom_mib,
+            "v8ModuleUsedPct": self.v8_module_used_pct,
+            "v8FuncBodyHeadroomBytes": self.v8_func_body_headroom_bytes,
+            "v8FuncLocalsHeadroom": self.v8_func_locals_headroom,
+            "exceedsV8ModuleLimit": self.exceeds_v8_module_limit,
+            "exceedsV8FuncSizeLimit": self.exceeds_v8_func_size_limit,
+            "exceedsV8LocalsLimit": self.exceeds_v8_locals_limit,
         }
 
 
@@ -448,6 +525,117 @@ class WasmBuildMetrics:
     def got_func_shard_dispatch_imports(self) -> int:
         return sum(m.got_func_shard_dispatch_imports for m in self.modules)
 
+    @property
+    def max_module_bytes(self) -> int:
+        return max((m.wasm_bytes for m in self.modules), default=0)
+
+    @property
+    def max_module_mib(self) -> float:
+        return round(self.max_module_bytes / (1024 * 1024), 4)
+
+    @property
+    def max_module_name(self) -> str | None:
+        if not self.modules:
+            return None
+        return max(self.modules, key=lambda m: m.wasm_bytes).name
+
+    @property
+    def min_module_headroom_bytes(self) -> int:
+        return V8_MAX_WASM_MODULE_BYTES - self.max_module_bytes
+
+    @property
+    def min_module_headroom_mib(self) -> float:
+        return round(self.min_module_headroom_bytes / (1024 * 1024), 4)
+
+    @property
+    def max_func_body_bytes(self) -> int:
+        return max((m.max_func_body_bytes for m in self.modules), default=0)
+
+    @property
+    def max_func_body_mib(self) -> float:
+        return round(self.max_func_body_bytes / (1024 * 1024), 4)
+
+    @property
+    def func_body_headroom_bytes(self) -> int:
+        return V8_MAX_WASM_FUNCTION_BYTES - self.max_func_body_bytes
+
+    @property
+    def max_func_locals(self) -> int:
+        return max((m.max_func_locals for m in self.modules), default=0)
+
+    @property
+    def func_locals_headroom(self) -> int:
+        return V8_MAX_WASM_FUNCTION_LOCALS - self.max_func_locals
+
+    @property
+    def large_func_bodies_over_1mib(self) -> int:
+        return sum(m.large_func_bodies_over_1mib for m in self.modules)
+
+    @property
+    def total_code_func_count(self) -> int:
+        return sum(m.code_func_count for m in self.modules)
+
+    @property
+    def within_all_limits(self) -> bool:
+        return all(
+            not (
+                m.exceeds_v8_module_limit
+                or m.exceeds_v8_func_size_limit
+                or m.exceeds_v8_locals_limit
+            )
+            for m in self.modules
+        )
+
+    def v8_headroom_dict(self) -> dict[str, Any]:
+        return {
+            "max_module_bytes": self.max_module_bytes,
+            "max_module_mib": self.max_module_mib,
+            "max_module_name": self.max_module_name,
+            "min_module_headroom_bytes": self.min_module_headroom_bytes,
+            "min_module_headroom_mib": self.min_module_headroom_mib,
+            "v8_module_limit_bytes": V8_MAX_WASM_MODULE_BYTES,
+            "v8_module_limit_mib": round(V8_MAX_WASM_MODULE_BYTES / (1024 * 1024), 4),
+            "max_func_body_bytes": self.max_func_body_bytes,
+            "max_func_body_mib": self.max_func_body_mib,
+            "v8_func_body_limit_bytes": V8_MAX_WASM_FUNCTION_BYTES,
+            "func_body_headroom_bytes": self.func_body_headroom_bytes,
+            "max_func_locals": self.max_func_locals,
+            "v8_func_locals_limit": V8_MAX_WASM_FUNCTION_LOCALS,
+            "func_locals_headroom": self.func_locals_headroom,
+            "large_func_bodies_over_1mib": self.large_func_bodies_over_1mib,
+            "total_code_func_count": self.total_code_func_count,
+            "total_got_func_imports": self.total_got_func_imports,
+            "total_table_size": self.total_table_size,
+            "main_table_size": self.main_table_size,
+            "side_table_size": self.side_table_size,
+            "within_all_limits": self.within_all_limits,
+        }
+
+    def v8_headroom_manifest_dict(self) -> dict[str, Any]:
+        return {
+            "maxModuleBytes": self.max_module_bytes,
+            "maxModuleMiB": self.max_module_mib,
+            "maxModuleName": self.max_module_name,
+            "minModuleHeadroomBytes": self.min_module_headroom_bytes,
+            "minModuleHeadroomMiB": self.min_module_headroom_mib,
+            "v8ModuleLimitBytes": V8_MAX_WASM_MODULE_BYTES,
+            "v8ModuleLimitMiB": round(V8_MAX_WASM_MODULE_BYTES / (1024 * 1024), 4),
+            "maxFuncBodyBytes": self.max_func_body_bytes,
+            "maxFuncBodyMiB": self.max_func_body_mib,
+            "v8FuncBodyLimitBytes": V8_MAX_WASM_FUNCTION_BYTES,
+            "funcBodyHeadroomBytes": self.func_body_headroom_bytes,
+            "maxFuncLocals": self.max_func_locals,
+            "v8FuncLocalsLimit": V8_MAX_WASM_FUNCTION_LOCALS,
+            "funcLocalsHeadroom": self.func_locals_headroom,
+            "largeFuncBodiesOver1MiB": self.large_func_bodies_over_1mib,
+            "totalCodeFuncCount": self.total_code_func_count,
+            "totalGotFuncImports": self.total_got_func_imports,
+            "totalTableSize": self.total_table_size,
+            "mainTableSize": self.main_table_size,
+            "sideTableSize": self.side_table_size,
+            "withinAllLimits": self.within_all_limits,
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "indirect_dispatch": self.indirect_dispatch,
@@ -469,6 +657,7 @@ class WasmBuildMetrics:
                 "got_func_sub_imports": self.got_func_sub_imports,
                 "got_func_shard_dispatch_imports": self.got_func_shard_dispatch_imports,
             },
+            "v8_headroom": self.v8_headroom_dict(),
         }
 
     def to_manifest_dict(self) -> dict[str, Any]:
@@ -493,6 +682,7 @@ class WasmBuildMetrics:
                 "gotFuncSubImports": self.got_func_sub_imports,
                 "gotFuncShardDispatchImports": self.got_func_shard_dispatch_imports,
             },
+            "v8Headroom": self.v8_headroom_manifest_dict(),
         }
 
 
@@ -715,6 +905,7 @@ class BuildReport:
     guest_manifest: str | None = None
     guest_dll_modules: tuple[str, ...] = ()
     wasm_metrics: WasmBuildMetrics | None = None
+    removed_stale_side_modules: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -737,6 +928,7 @@ class BuildReport:
             "max_side_module_mib": self.max_side_module_mib,
             "side_module_mode": self.side_module_mode,
             "side_modules": [m.to_dict() for m in self.side_modules],
+            "removed_stale_side_modules": list(self.removed_stale_side_modules),
             "node_max_old_space_mb": self.node_max_old_space_mb,
             "proxy_to_pthread": self.proxy_to_pthread,
             "max_concurrent_pthread_loads": self.max_concurrent_pthread_loads,
@@ -3719,6 +3911,10 @@ def _inspect_wasm_stream(
     sub_func_imports = 0
     got_func_sub_imports = 0
     got_func_shard_dispatch_imports = 0
+    code_func_count = 0
+    max_func_body_bytes = 0
+    max_func_locals = 0
+    large_func_bodies_over_1mib = 0
 
     while cursor.remaining > 0:
         sec_id = cursor.read_u8(context="section id")
@@ -3820,8 +4016,48 @@ def _inspect_wasm_stream(
                 elif kind == 0x03:  # global
                     if exp_name.startswith(SHARD_DISPATCH_TABLE_PREFIX):
                         shard_table_exports += 1
+        elif sec_id == WASM_SECTION_CODE:
+            sec_cur = _WasmStreamCursor(fh, sec_start, sec_end)
+            if sec_cur.remaining > 0:
+                func_count = sec_cur.read_u32(context="code function count")
+                code_func_count += func_count
+                for idx in range(func_count):
+                    body_size = sec_cur.read_u32(context=f"code[{idx}] body size")
+                    body_start = sec_cur.pos
+                    body_end = body_start + body_size
+                    if body_end > sec_end:
+                        raise WasmInspectError(
+                            f"{name}: truncated code[{idx}] body "
+                            f"(size {body_size} exceeds code section)"
+                        )
+                    saved_end = sec_cur._end
+                    sec_cur._end = body_end
+                    try:
+                        local_decl_count = sec_cur.read_u32(
+                            context=f"code[{idx}] local decl count"
+                        )
+                        total_locals = 0
+                        for loc_idx in range(local_decl_count):
+                            local_n = sec_cur.read_u32(
+                                context=f"code[{idx}] local[{loc_idx}] count"
+                            )
+                            sec_cur.read_valtype_code(
+                                context=f"code[{idx}] local[{loc_idx}] valtype"
+                            )
+                            total_locals += local_n
+                    finally:
+                        sec_cur._end = saved_end
+                    if body_size > max_func_body_bytes:
+                        max_func_body_bytes = body_size
+                    if total_locals > max_func_locals:
+                        max_func_locals = total_locals
+                    if body_size > LARGE_FUNC_BODY_THRESHOLD_BYTES:
+                        large_func_bodies_over_1mib += 1
+                    remaining_body = body_end - sec_cur._pos
+                    if remaining_body > 0:
+                        sec_cur.skip(remaining_body, context=f"code[{idx}] bytecode")
 
-        # Advance cleanly to the end of the section (O(1) seek over code/data sections).
+        # Advance cleanly to the end of the section (O(1) seek over data/debug sections).
         cursor._pos = sec_end
         fh.seek(sec_end)
 
@@ -3849,6 +4085,10 @@ def _inspect_wasm_stream(
         sub_func_imports=sub_func_imports,
         got_func_sub_imports=got_func_sub_imports,
         got_func_shard_dispatch_imports=got_func_shard_dispatch_imports,
+        code_func_count=code_func_count,
+        max_func_body_bytes=max_func_body_bytes,
+        max_func_locals=max_func_locals,
+        large_func_bodies_over_1mib=large_func_bodies_over_1mib,
     )
 
 
@@ -3858,7 +4098,7 @@ def inspect_wasm_bytes(
     name: str = RUNTIME_WASM,
     role: str = "main",
 ) -> WasmModuleMetrics:
-    """Parse `import`, `export`, `table`, and `dylink.0` sections from Wasm bytes."""
+    """Parse `import`, `export`, `table`, `code` headers, and `dylink.0` sections from Wasm bytes."""
     raw = bytes(data)
     return _inspect_wasm_stream(io.BytesIO(raw), len(raw), name=name, role=role)
 
@@ -3869,7 +4109,7 @@ def inspect_wasm_file(
     name: str | None = None,
     role: str = "main",
 ) -> WasmModuleMetrics:
-    """Stream-inspect a built `.wasm` file without loading `code`/`data` sections into RAM."""
+    """Stream-inspect a built `.wasm` file without loading function bytecode or `data` into RAM."""
     label = name or wasm_path.name
     try:
         total_bytes = wasm_path.stat().st_size
@@ -3933,6 +4173,129 @@ def verify_table_import_limits(
             f"--verify-max-table-imports limit ({limit})"
         )
     return errors
+
+
+def check_v8_headroom_warnings(
+    metrics: WasmBuildMetrics,
+    *,
+    include_module_exceeded: bool = True,
+) -> list[str]:
+    """Return sanitized warnings when any module approaches or exceeds V8 Wasm64 limits.
+
+    Checks per-module:
+      - Module size against `V8_MAX_WASM_MODULE_BYTES` (1024 MiB; warns >= `V8_MODULE_WARN_FRACTION`).
+        Pass `include_module_exceeded=False` when `check_v8_wasm_size()` already reported >1 GiB.
+      - Largest function body size against `V8_MAX_WASM_FUNCTION_BYTES` (`7,654,321` B; warns >= 75%).
+      - Max function locals against `V8_MAX_WASM_FUNCTION_LOCALS` (`50,000`; warns >= 80%).
+    """
+    module_warn_bytes = int(V8_MAX_WASM_MODULE_BYTES * V8_MODULE_WARN_FRACTION)
+    func_body_warn_bytes = int(V8_MAX_WASM_FUNCTION_BYTES * V8_FUNC_BODY_WARN_FRACTION)
+    func_locals_warn_count = int(V8_MAX_WASM_FUNCTION_LOCALS * V8_FUNC_LOCALS_WARN_FRACTION)
+    warnings: list[str] = []
+
+    for mod in metrics.modules:
+        if mod.exceeds_v8_module_limit:
+            if include_module_exceeded:
+                over_mib = (mod.wasm_bytes - V8_MAX_WASM_MODULE_BYTES) / (1024 * 1024)
+                warnings.append(
+                    sanitize_text(
+                        f"{mod.name} size is {mod.wasm_bytes} bytes ({mod.size_mib:.2f} MiB, "
+                        f"{mod.v8_module_used_pct:.1f}% of V8 1024 MiB limit), exceeding "
+                        f"Chrome/V8's {V8_MAX_WASM_MODULE_BYTES} byte module cap by {over_mib:.2f} MiB"
+                    )
+                )
+        elif mod.wasm_bytes >= module_warn_bytes:
+            warnings.append(
+                sanitize_text(
+                    f"{mod.name} size is {mod.wasm_bytes} bytes ({mod.size_mib:.2f} MiB, "
+                    f"{mod.v8_module_used_pct:.1f}% of V8 1024 MiB limit), approaching "
+                    f"Chrome/V8's 1024 MiB module cap ({mod.v8_module_headroom_mib:.2f} MiB headroom remaining)"
+                )
+            )
+
+        if mod.exceeds_v8_func_size_limit:
+            over_bytes = mod.max_func_body_bytes - V8_MAX_WASM_FUNCTION_BYTES
+            warnings.append(
+                sanitize_text(
+                    f"{mod.name} largest function body is {mod.max_func_body_bytes:,} bytes "
+                    f"({mod.max_func_body_bytes / 1_000_000:.2f} MB), exceeding V8's "
+                    f"kV8MaxWasmFunctionSize ({V8_MAX_WASM_FUNCTION_BYTES:,} bytes) by "
+                    f"{over_bytes:,} bytes"
+                )
+            )
+        elif mod.max_func_body_bytes >= func_body_warn_bytes:
+            pct = (mod.max_func_body_bytes / V8_MAX_WASM_FUNCTION_BYTES) * 100.0
+            warnings.append(
+                sanitize_text(
+                    f"{mod.name} largest function body is {mod.max_func_body_bytes:,} bytes "
+                    f"({mod.max_func_body_bytes / 1_000_000:.2f} MB, {pct:.1f}% of V8's "
+                    f"{V8_MAX_WASM_FUNCTION_BYTES:,} byte kV8MaxWasmFunctionSize; "
+                    f"{mod.v8_func_body_headroom_bytes:,} bytes headroom remaining)"
+                )
+            )
+
+        if mod.exceeds_v8_locals_limit:
+            over_locals = mod.max_func_locals - V8_MAX_WASM_FUNCTION_LOCALS
+            warnings.append(
+                sanitize_text(
+                    f"{mod.name} max function locals is {mod.max_func_locals:,}, exceeding V8's "
+                    f"kV8MaxWasmFunctionLocals ({V8_MAX_WASM_FUNCTION_LOCALS:,}) by "
+                    f"{over_locals:,}"
+                )
+            )
+        elif mod.max_func_locals >= func_locals_warn_count:
+            pct = (mod.max_func_locals / V8_MAX_WASM_FUNCTION_LOCALS) * 100.0
+            warnings.append(
+                sanitize_text(
+                    f"{mod.name} max function locals is {mod.max_func_locals:,} "
+                    f"({pct:.1f}% of V8's {V8_MAX_WASM_FUNCTION_LOCALS:,} "
+                    f"kV8MaxWasmFunctionLocals; {mod.v8_func_locals_headroom:,} headroom remaining)"
+                )
+            )
+
+    return warnings
+
+
+def cleanup_stale_side_modules(
+    output_dir: Path,
+    active_side_names: Sequence[str],
+    *,
+    dry_run: bool = False,
+) -> list[str]:
+    """Remove (or report in dry-run) stale `guest_part_<N>.wasm` files not in `active_side_names`.
+
+    Scans top-level entries in `output_dir` matching `_SIDE_MODULE_FILENAME_RE` (only files
+    or symlinks, never directories, never `runtime.wasm` or unrelated `.wasm` files).
+    Returns stale filenames sorted naturally by part index.
+    """
+    if not output_dir.is_dir():
+        return []
+    active = set(active_side_names)
+    stale: list[tuple[int, str, Path]] = []
+    try:
+        entries = list(output_dir.iterdir())
+    except OSError:
+        return []
+    for entry in entries:
+        match = _SIDE_MODULE_FILENAME_RE.match(entry.name)
+        if match is None or entry.name in active:
+            continue
+        is_link = entry.is_symlink()
+        if not is_link and not entry.is_file():
+            continue
+        if entry.is_dir() and not is_link:
+            continue
+        stale.append((int(match.group(1)), entry.name, entry))
+    stale.sort(key=lambda item: (item[0], item[1]))
+    removed: list[str] = []
+    for _, name, path in stale:
+        if not dry_run:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+        removed.append(name)
+    return removed
 
 
 def write_guest_manifest(
@@ -4018,6 +4381,20 @@ def format_wasm_metrics_lines(metrics: WasmBuildMetrics) -> list[str]:
         f"  Table / GOT.func footprint: wasmTable={metrics.total_table_size} "
         f"(main={metrics.main_table_size}, side={metrics.side_table_size}), "
         f"GOT.func={metrics.total_got_func_imports}"
+    )
+    max_mod_label = metrics.max_module_name or "n/a"
+    headroom_status = "OK" if metrics.within_all_limits else "OVER LIMIT"
+    max_body_mb = metrics.max_func_body_bytes / 1_000_000
+    v8_body_mb = V8_MAX_WASM_FUNCTION_BYTES / 1_000_000
+    lines.append(
+        f"  V8 headroom [{headroom_status}]: "
+        f"max module {max_mod_label}={metrics.max_module_mib:.2f} / 1024.00 MiB "
+        f"(headroom {metrics.min_module_headroom_mib:.2f} MiB), "
+        f"largest func={metrics.max_func_body_bytes:,} B ({max_body_mb:.2f} / {v8_body_mb:.2f} MB), "
+        f"max locals={metrics.max_func_locals:,} / {V8_MAX_WASM_FUNCTION_LOCALS:,}, "
+        f"bodies >1 MiB={metrics.large_func_bodies_over_1mib} "
+        f"(code funcs={metrics.total_code_func_count:,}), "
+        f"GOT.func={metrics.total_got_func_imports}, wasmTable={metrics.total_table_size}"
     )
     if metrics.indirect_dispatch == "shard":
         effective = (
@@ -4813,6 +5190,11 @@ def run_build(
             return report
 
         if dry_run:
+            report.removed_stale_side_modules = cleanup_stale_side_modules(
+                output_dir,
+                [plan[0].name for plan in side_plans],
+                dry_run=True,
+            )
             report.ok = True
             return report
 
@@ -4949,6 +5331,11 @@ def run_build(
                 report.warnings.append(side_warning)
             any_exceeds = any_exceeds or side_exceeds
         report.exceeds_v8_1gib_limit = any_exceeds
+        report.removed_stale_side_modules = cleanup_stale_side_modules(
+            output_dir,
+            [side_result.name for side_result in report.side_modules],
+            dry_run=False,
+        )
     else:
         planned_objects = objects if objects else [Path(item.unit.unit_id).with_suffix(".o") for item in ordered]
         rsp_path = None
@@ -4972,6 +5359,11 @@ def run_build(
             return report
 
         if dry_run:
+            report.removed_stale_side_modules = cleanup_stale_side_modules(
+                output_dir,
+                (),
+                dry_run=True,
+            )
             report.ok = True
             return report
 
@@ -4995,6 +5387,11 @@ def run_build(
         report.exceeds_v8_1gib_limit = exceeds_limit
         if size_warning is not None:
             report.warnings.append(size_warning)
+        report.removed_stale_side_modules = cleanup_stale_side_modules(
+            output_dir,
+            (),
+            dry_run=False,
+        )
 
     side_wasm_pairs = [
         (side_result.name, output_dir / side_result.name) for side_result in report.side_modules
@@ -5008,6 +5405,10 @@ def run_build(
     metrics_by_name = {m.name: m for m in report.wasm_metrics.modules}
     for side_result in report.side_modules:
         side_result.wasm_metrics = metrics_by_name.get(side_result.name)
+
+    report.warnings.extend(
+        check_v8_headroom_warnings(report.wasm_metrics, include_module_exceeded=False)
+    )
 
     if report.indirect_dispatch == "shard" and report.wasm_metrics.got_func_sub_imports > 0:
         report.warnings.append(
@@ -5165,6 +5566,13 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append("  Link: " + " ".join(report.link_argv))
     if report.outputs:
         lines.append("  Outputs: " + ", ".join(report.outputs))
+    if report.removed_stale_side_modules:
+        stale_label = (
+            "Stale side modules (would remove)"
+            if report.mode == "dry-run"
+            else "Removed stale side modules"
+        )
+        lines.append(f"  {stale_label}: " + ", ".join(report.removed_stale_side_modules))
     if report.wasm_bytes:
         mib = report.wasm_bytes / (1024 * 1024)
         limit_note = " [EXCEEDS V8 1 GiB LIMIT]" if report.exceeds_v8_1gib_limit else ""
