@@ -24,7 +24,9 @@ MODULE_RE = re.compile(r'#define PG6_MOD_(\w+)\s+"([^"]+)"')
 # Declared shims that are intentionally NOT exported: symbol -> reason. Currently every shim
 # corresponds to a real API export, so this is empty. Add internal helpers here with a reason
 # (e.g. "test hook, not a Win32 API"), never to silence a missing registration.
-EXCLUDED_SHIMS: dict[str, str] = {}
+EXCLUDED_SHIMS: dict[str, str] = {
+    "pg6_win32_set_host_locale": "host-side setter (not a guest import)",
+}
 
 # Registered shims whose API name legitimately differs from the shim symbol under name_key:
 # symbol -> reason. Empty: every export name matches its symbol under the R5 rule.

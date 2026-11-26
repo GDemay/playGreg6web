@@ -561,6 +561,8 @@ int32_t pg6_win32_compare_string_ordinal(const char16_t* string1,
                                          int32_t ignore_case);
 int32_t pg6_win32_get_user_default_locale_name(char16_t* locale_name, int32_t cch_locale_name);
 int32_t pg6_win32_get_user_default_geo_name(char16_t* geo_name, int32_t count);
+// Sets the host user locale ("de-DE", "fr_FR.UTF-8", "ja"); unknown or null falls back to en-US (returns false).
+bool pg6_win32_set_host_locale(const char* name);
 uint32_t pg6_win32_locale_name_to_lcid(const char16_t* name, uint32_t flags);
 uint32_t pg6_win32_format_message_a(uint32_t flags,
                                     const void* source,

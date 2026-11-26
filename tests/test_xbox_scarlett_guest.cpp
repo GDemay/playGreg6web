@@ -1480,6 +1480,53 @@ void test_game_input_readings() {
     CHECK(reported);
 }
 
+// One stable pad (backlog 33): present from boot even with no host input attached, the same device
+// and id for every registration, one callback per registration, neutral when nothing is pressed.
+void test_game_input_stable_pad() {
+    InputFixture fx;
+    const uint64_t gi = fx.game_input();
+    os::scarlett::set_game_input_state(nullptr);  // keyboard-only / no host pad: nothing attached
+
+    HResult hr = 0;
+    const uint64_t r = fx.reading(gi, ga::kGameInputKindGamepad, 0, &hr);
+    CHECK(hr == 0 && r != 0);  // the pad exists without any host input
+    bool ok = false;
+    ga::GameInputGamepadState s = fx.gamepad(r, &ok);
+    CHECK(ok && s.buttons == 0 && s.left_trigger == 0.0f && s.right_trigger == 0.0f);
+    CHECK(s.left_thumbstick_x == 0.0f && s.left_thumbstick_y == 0.0f);
+    CHECK(s.right_thumbstick_x == 0.0f && s.right_thumbstick_y == 0.0f);
+
+    uint64_t first_pad = 0;
+    ga::AppLocalDeviceId first_id{};
+    for (int round = 0; round < 3; ++round) {
+        g_device_cb.calls = 0;
+        const uint64_t token_va = fx.out_slot();
+        CHECK(as_hr(fx.vcall(gi, 9, {I(0), I(ga::kGameInputKindGamepad), I(1), I(2), I(0), I(kGuestDeviceCallback),
+                                     I(token_va)})) == 0);
+        CHECK(g_device_cb.calls.load() == 1);  // exactly one connected report, no repeats
+        CHECK((g_device_cb.current & ga::kGameInputDeviceConnected) != 0);
+        const uint64_t info = fx.vcall(g_device_cb.device, 3);
+        ga::AppLocalDeviceId id{};
+        CHECK(com::read_guest(info + ga::kDeviceInfoDeviceId, id));
+        if (round == 0) {
+            first_pad = g_device_cb.device;
+            first_id = id;
+        }
+        CHECK(g_device_cb.device == first_pad);
+        CHECK(std::memcmp(id.value, first_id.value, sizeof(id.value)) == 0);  // stable identity
+        CHECK(static_cast<uint32_t>(fx.vcall(g_device_cb.device, 4)) ==
+              (ga::kGameInputDeviceConnected | ga::kGameInputDeviceInputEnabled));
+    }
+
+    // Real input appears, then goes away: back to neutral, device unchanged.
+    os::scarlett::set_game_input_state(&fx.shared);
+    fx.set_input(os::input_button::kGamepadA);
+    CHECK(fx.gamepad(fx.reading(gi, ga::kGameInputKindGamepad), &ok).buttons != 0);
+    fx.set_input(0);
+    s = fx.gamepad(fx.reading(gi, ga::kGameInputKindGamepad), &ok);
+    CHECK(ok && s.buttons == 0 && s.left_thumbstick_x == 0.0f && s.left_trigger == 0.0f);
+}
+
 void test_game_input_devices() {
     InputFixture fx;
     const uint64_t gi = fx.game_input();
@@ -2666,6 +2713,7 @@ int main() {
     test_concurrent_queues();
     test_game_input_readings();
     test_game_input_devices();
+    test_game_input_stable_pad();
     test_xg();
     test_acp_hal();
     test_acp_hal_xma_commands();
