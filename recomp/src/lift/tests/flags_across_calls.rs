@@ -434,3 +434,109 @@ fn r67_dead_flags_after_direct_and_indirect_calls_are_not_reloaded() {
     assert_eq!(out[4].regs[RAX], 8, "INDIRECT_LIVE ZF=1 -> dl=1, 7+1=8");
     assert_eq!(out[5].regs[RAX], 7, "INDIRECT_LIVE ZF=0 -> dl=0, 7+0=7");
 }
+
+#[test]
+fn r71_bt_fusion_cmov_noop_and_direct_call_gpr_preservation() {
+    use crate::lift::memory::{Window, WindowCheck};
+    use crate::lift::{GuestBase, MemoryModel, lift_module_with};
+
+    // 1. `bt`/`bts`/`btr` fused with `jc`/`jnc`/`cmovb`/`setae` with overwritten flags after:
+    //    must emit ZERO `%cf` alloca stores and tighten bit 0 (`trunc`) & bit 63 (`icmp slt`/`sge`).
+    let bt_f = asm_function(CODE_BASE, |a| {
+        let mut taken = a.create_label();
+        a.bt(rax, 0)?;
+        a.cmovb(rcx, rdx)?;
+        a.bts(rax, 63)?;
+        a.setae(r8b)?;
+        a.btr(rax, 5)?;
+        a.jb(taken)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        a.set_label(&mut taken)?;
+        a.add(eax, 1)?;
+        a.ret()
+    });
+    let bt_ir = lift_module([&bt_f]).expect("lifts").ir;
+    let entry_body = {
+        let header = format!("bb_{CODE_BASE:X}:\n");
+        let start = bt_ir.find(&header).expect("entry bb") + header.len();
+        let rest = &bt_ir[start..];
+        let end = rest
+            .find(":\n")
+            .map_or(rest.len(), |i| rest[..i].rfind('\n').unwrap_or(0));
+        &rest[..end]
+    };
+    assert!(
+        !entry_body.contains("store i1 ") && !entry_body.contains("ptr %cf"),
+        "fused bt/bts/btr must never touch %cf alloca:\n{entry_body}"
+    );
+    assert!(
+        entry_body.contains("trunc i64 ") && entry_body.contains(" to i1"),
+        "bt reg, 0 should tighten to trunc:\n{entry_body}"
+    );
+    assert!(
+        entry_body.contains("icmp sge i64 ") && entry_body.contains(", 0"),
+        "bts reg, 63 + setae should tighten to icmp sge ..., 0:\n{entry_body}"
+    );
+
+    // 2. Same-register `cmovcc`: 64-bit is a pure no-op (no `select`, preceding `cmp` flags dead!);
+    //    32-bit emits only unconditional zero-extension (`and i64 ..., 4294967295`), no `select`.
+    let cmov_f = asm_function(CODE_BASE + 0x100, |a| {
+        a.cmp(rcx, rdx)?;
+        a.cmove(rax, rax)?;
+        a.cmovne(r8d, r8d)?;
+        a.sub(ecx, ecx)?;
+        a.ret()
+    });
+    let cmov_ir = lift_module([&cmov_f]).expect("lifts").ir;
+    assert!(
+        !cmov_ir.contains("select i1 "),
+        "same-reg cmovcc must not emit select:\n{cmov_ir}"
+    );
+    assert!(
+        !cmov_ir.contains("icmp eq ") && !cmov_ir.contains("sub i64 "),
+        "preceding cmp flags read only by same-reg cmovcc must be elided:\n{cmov_ir}"
+    );
+    assert!(
+        cmov_ir.contains("and i64 ") && cmov_ir.contains(", 4294967295"),
+        "32-bit same-reg cmovcc must still zero-extend to 64-bit:\n{cmov_ir}"
+    );
+
+    // 3. Direct call to a leaf that does not write `rbp` or `rbx` preserves `rbp` stack-flat
+    //    provenance and `rbx` constant base pointer across the call under `window-runs`.
+    const CALLER_PRES: u64 = 0x1_4000_6000;
+    const LEAF_PURE: u64 = 0x1_4000_6100;
+    let g_va = 0x1_4AA0_2000u64;
+    let prog = Program::new()
+        .asm(CALLER_PRES, |a| {
+            a.push(rbp)?;
+            a.mov(rbp, rsp)?;
+            a.sub(rsp, 0x20)?;
+            a.mov(rbx, g_va)?;
+            a.call(LEAF_PURE)?;
+            a.mov(qword_ptr(rbp - 8), rax)?;
+            a.add(rax, qword_ptr(rbx + 8))?;
+            a.add(rsp, 0x20)?;
+            a.pop(rbp)?;
+            a.ret()
+        })
+        .asm(LEAF_PURE, |a| {
+            a.mov(rax, rcx)?;
+            a.add(rax, 1)?;
+            a.ret()
+        });
+    let funcs = prog.discover();
+    let model = MemoryModel::Windowed(Window {
+        flat: GuestBase::Constant(0),
+        base: 0x4_0000_0000,
+        size: 0x6_0000_0000,
+        check: WindowCheck::Branch,
+        stack_flat: true,
+        contiguous_runs: true,
+    });
+    let ir = lift_module_with(funcs.values(), model).expect("lifts").ir;
+    assert!(
+        !ir.contains("__playgta6_window_table") && !ir.contains("__playgta6_window_dirty"),
+        "untouched rbp & constant rbx must survive direct leaf call without window checks:\n{ir}"
+    );
+}

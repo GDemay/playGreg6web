@@ -4,7 +4,7 @@
 //! into the function body inside a checkpoint: if any part of it turns out to be unsupported, the
 //! partial output is rolled back and replaced by an `__playgta6_unimplemented` trap.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Write as _;
 
 use iced_x86::{
@@ -341,7 +341,7 @@ pub(super) fn lift(
         ea: None,
         memory,
         stack_values: BTreeMap::new(),
-        window_load_cache: None,
+        window_load_cache: Vec::new(),
         burst_override: None,
         last_access: None,
         guest_base: None,
@@ -355,6 +355,7 @@ pub(super) fn lift(
         dead_flags: 0,
         ymmh_zeroed: 0,
         known: Known::default(),
+        block_entry_facts: [GprFact::Bottom; 16],
         edge_known: Vec::new(),
         cse: BTreeMap::new(),
     };
@@ -594,12 +595,13 @@ struct FunctionLifter<'a> {
     ea: Option<String>,
     /// Guest -> host address translation (`memory_access.rs`).
     memory: MemoryModel,
-    /// SSA values known to be stack-pointer-relative guest addresses -> cumulative displacement
-    /// from `rsp` (table models with `stack_flat` only).
-    stack_values: BTreeMap<String, i64>,
-    /// R58: cached dynamic window translation for exact same-address RMW / repeated accesses
-    /// within the same basic block (cleared at block boundaries and calls/atomics/fences).
-    window_load_cache: Option<memory_access::CachedWindowAddr>,
+    /// SSA values known to be stack-pointer-relative guest addresses -> proven displacement
+    /// bound from `rsp` / `entry_rsp` (table models with `stack_flat` only).
+    stack_values: BTreeMap<String, memory_access::StackDisp>,
+    /// R58/R71: cached dynamic window translations (up to 4 entries) for same-address RMW /
+    /// repeated accesses within the same basic block (cleared at block boundaries and
+    /// calls/atomics/fences).
+    window_load_cache: Vec<memory_access::CachedWindowAddr>,
     /// R58: active fast-path translation override for a coalesced same-base window burst.
     burst_override: Option<memory_access::BurstOverride>,
     /// The last plain guest load or store, for forwarding its value to a load of the same address
@@ -637,12 +639,56 @@ struct FunctionLifter<'a> {
     /// to the function and never escape, so a later load in the same block reads exactly that
     /// value; every store is still emitted. Cleared at each new block (see [`Self::start_block`]).
     known: Known,
+    /// R71: per-GPR cross-block proven entry facts (`StackOffset`/`StackFrame`/`Const`) for the
+    /// current block, cleared individually on writes/reloads so `load_gpr` and `lift_window_burst`
+    /// preserve stack-pointer provenance across loops and diamond joins.
+    pub(super) block_entry_facts: [GprFact; 16],
     /// [`Self::known`] at each branch emitted so far into a block of this function, as
     /// `(target, known)`: a block whose only predecessor is such an edge starts with it.
     edge_known: Vec<(u64, Known)>,
     /// Local value numbering: pure definitions already emitted in the current dominating region,
     /// by right-hand side. Cleared whenever a block starts or lifting rolls back.
     cse: BTreeMap<String, String>,
+}
+
+/// R71: intra-procedural forward dataflow lattice fact for one 64-bit GPR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GprFact {
+    /// Unvisited / unreachable (identity element for join).
+    Top,
+    /// Provably holds exact 64-bit constant `u64` on all incoming paths.
+    Const(u64),
+    /// Provably equals `entry_rsp.wrapping_add(offset as u64)` with
+    /// `offset.abs() <= STACK_FRAME_MAX_DISP`.
+    StackOffset(i64),
+    /// Provably within `STACK_FRAME_HALF` of `entry_rsp` across non-identical incoming paths.
+    StackFrame,
+    /// Unknown / varying across incoming paths.
+    Bottom,
+}
+
+impl GprFact {
+    fn join(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Top, x) | (x, Self::Top) => x,
+            (Self::Const(a), Self::Const(b)) if a == b => Self::Const(a),
+            (Self::StackOffset(a), Self::StackOffset(b)) if a == b => Self::StackOffset(a),
+            (Self::StackOffset(a), Self::StackOffset(b))
+                if a.abs() <= memory_access::STACK_FRAME_HALF
+                    && b.abs() <= memory_access::STACK_FRAME_HALF =>
+            {
+                Self::StackFrame
+            }
+            (Self::StackOffset(a), Self::StackFrame)
+            | (Self::StackFrame, Self::StackOffset(a))
+                if a.abs() <= memory_access::STACK_FRAME_HALF =>
+            {
+                Self::StackFrame
+            }
+            (Self::StackFrame, Self::StackFrame) => Self::StackFrame,
+            _ => Self::Bottom,
+        }
+    }
 }
 
 /// High-level origin of the current block's live arithmetic flags, used to fuse
@@ -680,14 +726,24 @@ pub(super) enum FlagSource {
     },
     /// `ZF = (val == 0)` (`popcnt`, `bextr`): `e`/`ne` test `val` vs 0.
     ZeroOnly { val: String, bits: u32 },
-    /// Precomputed `ZF = is_zero` (`bsf`, `bsr`): `e` uses `is_zero`, `ne` negates it.
+    /// Precomputed `ZF = is_zero` (`bsf`, `bsr`, constant-zero `bextr`): `e` uses `is_zero`, `ne` negates it.
     ZeroBit { is_zero: String },
-    /// `tzcnt`/`lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)`.
+    /// `tzcnt`/`lzcnt`: `CF = (src == 0)`, `ZF = (lsb/msb(src) == 1)`.
     BitCount {
         src: String,
-        result: String,
+        is_tzcnt: bool,
         bits: u32,
     },
+    /// Precomputed `CF = cf` (`bt`/`bts`/`btr`/`btc` when CF is also live): `b` uses `cf`, `ae` negates it.
+    CarryBit { cf: String },
+    /// Lazy `CF = ((val & mask) != 0)` (`bt`/`bts`/`btr`/`btc` with dynamic bit mask).
+    BitTest {
+        val: String,
+        mask: String,
+        bits: u32,
+    },
+    /// Lazy `CF = ((val >> bit) & 1) != 0` (`bt`/`bts`/`btr`/`btc` with known bit index `bit < bits`).
+    BitTestBit { val: String, bit: u32, bits: u32 },
 }
 
 /// See [`FunctionLifter::known`].
@@ -707,8 +763,9 @@ struct Checkpoint {
     has_shared_ret: bool,
     support: BTreeSet<Support>,
     known: Known,
+    block_entry_facts: [GprFact; 16],
     edge_known: usize,
-    window_load_cache: Option<memory_access::CachedWindowAddr>,
+    window_load_cache: Vec<memory_access::CachedWindowAddr>,
     ymmh_zeroed: u16,
 }
 
@@ -737,6 +794,8 @@ impl FunctionLifter<'_> {
         for &target in std::iter::once(&func.entry).chain(&func.resume_targets) {
             *preds.entry(target).or_default() += 1;
         }
+        let entry_gpr_facts =
+            compute_block_entry_gpr_facts(func, self.flag_summaries, &self.faulting_calls);
         for (&start, block) in &func.blocks {
             let label = block_label(start);
             self.start_block(&label);
@@ -746,6 +805,37 @@ impl FunctionLifter<'_> {
                 && let Some(at) = self.edge_known.iter().position(|(t, _)| *t == start)
             {
                 self.known = self.edge_known.swap_remove(at).1;
+            }
+            if let Some(&raw_facts) = entry_gpr_facts.get(&start) {
+                let mut facts = [GprFact::Bottom; 16];
+                for idx in 0..16 {
+                    let fact = match raw_facts[idx] {
+                        GprFact::Top => GprFact::Bottom,
+                        other => other,
+                    };
+                    facts[idx] = fact;
+                    match fact {
+                        GprFact::Const(c) => {
+                            self.known.gprs[idx] = Some(imm(c, 64));
+                        }
+                        GprFact::StackOffset(d) => {
+                            if let Some(v) = self.known.gprs[idx].clone()
+                                && !self.stack_values.contains_key(&v)
+                            {
+                                self.note_stack_value(&v, d);
+                            }
+                        }
+                        GprFact::StackFrame => {
+                            if let Some(v) = self.known.gprs[idx].clone()
+                                && !self.stack_values.contains_key(&v)
+                            {
+                                self.note_stack_bounded(&v, memory_access::STACK_FRAME_HALF);
+                            }
+                        }
+                        GprFact::Top | GprFact::Bottom => {}
+                    }
+                }
+                self.block_entry_facts = facts;
             }
             if loop_heads.contains(&start) {
                 self.emit(crate::lift::LOOP_BARRIER);
@@ -1113,6 +1203,7 @@ impl FunctionLifter<'_> {
             has_shared_ret: self.has_shared_ret,
             support: self.support.clone(),
             known: self.known.clone(),
+            block_entry_facts: self.block_entry_facts,
             edge_known: self.edge_known.len(),
             window_load_cache: self.window_load_cache.clone(),
             ymmh_zeroed: self.ymmh_zeroed,
@@ -1128,6 +1219,7 @@ impl FunctionLifter<'_> {
         self.has_shared_ret = checkpoint.has_shared_ret;
         self.support = checkpoint.support;
         self.known = checkpoint.known;
+        self.block_entry_facts = checkpoint.block_entry_facts;
         self.cse.clear();
         self.edge_known.truncate(checkpoint.edge_known);
         self.window_load_cache = checkpoint.window_load_cache;
@@ -1170,9 +1262,11 @@ impl FunctionLifter<'_> {
         ));
         // `ok` has this block as its only predecessor: the known values stay valid there.
         let known = std::mem::take(&mut self.known);
+        let facts = self.block_entry_facts;
         let cse = std::mem::take(&mut self.cse);
         self.start_block(&ok);
         self.known = known;
+        self.block_entry_facts = facts;
         self.cse = cse;
     }
 
@@ -1217,7 +1311,8 @@ impl FunctionLifter<'_> {
     fn start_block(&mut self, label: &str) {
         self.cse.clear();
         self.known = Known::default();
-        self.window_load_cache = None;
+        self.block_entry_facts = [GprFact::Bottom; 16];
+        self.window_load_cache.clear();
         self.last_access = None;
         self.ymmh_zeroed = 0;
         self.current_block.clear();
@@ -1236,11 +1331,41 @@ impl FunctionLifter<'_> {
     }
 
     pub(super) fn clear_window_cache(&mut self) {
-        self.window_load_cache = None;
+        self.window_load_cache.clear();
     }
 
     pub(super) fn known_gpr(&self, idx: usize) -> Option<&str> {
         self.known.gprs[idx].as_deref()
+    }
+
+    /// True when GPR `idx` is currently provably stack-pointer-relative (either via its active
+    /// SSA value in `stack_values`, or via cross-block `block_entry_facts` if not yet loaded or
+    /// modified in this block).
+    pub(super) fn is_gpr_stack_proven(&self, idx: usize) -> bool {
+        if idx == RSP {
+            return true;
+        }
+        match self.known.gprs[idx].as_deref() {
+            Some(v) => self.stack_values.contains_key(v),
+            None => matches!(
+                self.block_entry_facts[idx],
+                GprFact::StackOffset(_) | GprFact::StackFrame
+            ),
+        }
+    }
+
+    /// Preserves `block_entry_facts` across a window burst join for GPRs untouched by both arms.
+    pub(super) fn restore_unchanged_block_entry_facts(
+        &mut self,
+        entry: &[GprFact; 16],
+        a: &[GprFact; 16],
+        b: &[GprFact; 16],
+    ) {
+        for i in 0..16 {
+            if a[i] == entry[i] && b[i] == entry[i] {
+                self.block_entry_facts[i] = entry[i];
+            }
+        }
     }
 
     /// Restores entries from `entry` that neither `a` nor `b` modified (the entry block strictly
@@ -1365,6 +1490,7 @@ impl FunctionLifter<'_> {
                 let v = self.val(&format!("load i64, ptr {ptr}"));
                 self.emit(&format!("store i64 {v}, ptr %{name}"));
                 self.known.gprs[idx] = Some(v);
+                self.block_entry_facts[idx] = GprFact::Bottom;
             }
         }
         self.known.flag_source = None;
@@ -1460,6 +1586,15 @@ impl FunctionLifter<'_> {
             None => {
                 let v = self.val(&format!("load i64, ptr {slot}"));
                 self.known.gprs[idx] = Some(v.clone());
+                if idx != RSP {
+                    match self.block_entry_facts[idx] {
+                        GprFact::StackOffset(d) => self.note_stack_value(&v, d),
+                        GprFact::StackFrame => {
+                            self.note_stack_bounded(&v, memory_access::STACK_FRAME_HALF)
+                        }
+                        GprFact::Top | GprFact::Const(_) | GprFact::Bottom => {}
+                    }
+                }
                 v
             }
         };
@@ -1473,6 +1608,7 @@ impl FunctionLifter<'_> {
         let slot = self.gpr_slot(idx)?;
         self.emit(&format!("store i64 {value}, ptr {slot}"));
         self.known.gprs[idx] = Some(value.to_string());
+        self.block_entry_facts[idx] = GprFact::Bottom;
         Ok(())
     }
 
@@ -1482,10 +1618,16 @@ impl FunctionLifter<'_> {
             RegRef::Low(idx, 64) => Ok((self.load_gpr(idx)?, 64)),
             RegRef::Low(idx, bits) => {
                 let full = self.load_gpr(idx)?;
+                if let Some(c) = memory_access::const_addr(&full) {
+                    return Ok((imm(c, bits), bits));
+                }
                 Ok((self.val(&format!("trunc i64 {full} to i{bits}")), bits))
             }
             RegRef::High8(idx) => {
                 let full = self.load_gpr(idx)?;
+                if let Some(c) = memory_access::const_addr(&full) {
+                    return Ok((imm(c >> 8, 8), 8));
+                }
                 let shifted = self.val(&format!("lshr i64 {full}, 8"));
                 Ok((self.val(&format!("trunc i64 {shifted} to i8")), 8))
             }
@@ -1565,10 +1707,23 @@ impl FunctionLifter<'_> {
             let mut scaled = self.read_addr_reg(index)?;
             let scale = ins.memory_index_scale();
             if scale > 1 {
-                scaled = self.val(&format!("shl i64 {scaled}, {}", scale.trailing_zeros()));
+                if let Some(c) = memory_access::const_addr(&scaled) {
+                    scaled = imm(c.wrapping_shl(scale.trailing_zeros()), 64);
+                } else {
+                    scaled = self.val(&format!("shl i64 {scaled}, {}", scale.trailing_zeros()));
+                }
             }
             acc = Some(match acc {
-                Some(sum) => self.val(&format!("add i64 {sum}, {scaled}")),
+                Some(sum) => {
+                    if let (Some(a), Some(b)) = (
+                        memory_access::const_addr(&sum),
+                        memory_access::const_addr(&scaled),
+                    ) {
+                        imm(a.wrapping_add(b), 64)
+                    } else {
+                        self.val(&format!("add i64 {sum}, {scaled}"))
+                    }
+                }
                 None => scaled,
             });
         }
@@ -1578,14 +1733,24 @@ impl FunctionLifter<'_> {
             None
         };
         let mut addr = match acc {
-            Some(sum) if disp != 0 => self.val(&format!("add i64 {sum}, {}", imm(disp, 64))),
+            Some(sum) if disp != 0 => {
+                if let Some(base_va) = memory_access::const_addr(&sum) {
+                    imm(base_va.wrapping_add(disp), 64)
+                } else {
+                    self.val(&format!("add i64 {sum}, {}", imm(disp, 64)))
+                }
+            }
             Some(sum) => sum,
             None => imm(if addr32 { disp & mask(32) } else { disp }, 64),
         };
         let has_fs_gs = with_segment
             && matches!(ins.memory_segment(), Register::FS | Register::GS);
         if addr32 {
-            addr = self.val(&format!("and i64 {addr}, 4294967295"));
+            if let Some(va) = memory_access::const_addr(&addr) {
+                addr = imm(va & mask(32), 64);
+            } else {
+                addr = self.val(&format!("and i64 {addr}, 4294967295"));
+            }
         } else if base == Register::RSP && index == Register::None {
             self.note_stack_value(&addr, disp as i64);
         } else if index == Register::None
@@ -1650,6 +1815,9 @@ impl FunctionLifter<'_> {
             RegRef::Low(idx, 64) => self.load_gpr(idx),
             RegRef::Low(idx, 32) => {
                 let full = self.load_gpr(idx)?;
+                if let Some(c) = memory_access::const_addr(&full) {
+                    return Ok(imm(c & mask(32), 64));
+                }
                 Ok(self.val(&format!("and i64 {full}, 4294967295")))
             }
             _ => {
@@ -2343,13 +2511,67 @@ impl FunctionLifter<'_> {
                 C::ne => Some(self.negate_i1(&is_zero)),
                 _ => None,
             },
-            FlagSource::BitCount { src, result, bits } => {
+            FlagSource::BitCount {
+                src,
+                is_tzcnt,
+                bits,
+            } => {
                 let t = ty(bits);
                 match cc {
-                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
-                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::e => Some(if is_tzcnt {
+                        self.val(&format!("trunc {t} {src} to i1"))
+                    } else {
+                        self.msb(&src, bits)
+                    }),
+                    C::ne => Some(if is_tzcnt {
+                        let hit = self.val(&format!("and {t} {src}, 1"));
+                        self.val(&format!("icmp eq {t} {hit}, 0"))
+                    } else {
+                        self.val(&format!("icmp sge {t} {src}, 0"))
+                    }),
                     C::b => Some(self.val(&format!("icmp eq {t} {src}, 0"))),
                     C::ae => Some(self.val(&format!("icmp ne {t} {src}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::CarryBit { cf } => match cc {
+                C::b => Some(cf),
+                C::ae => Some(self.negate_i1(&cf)),
+                _ => None,
+            },
+            FlagSource::BitTest { val, mask, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::b => {
+                        let hit = self.val(&format!("and {t} {val}, {mask}"));
+                        Some(self.val(&format!("icmp ne {t} {hit}, 0")))
+                    }
+                    C::ae => {
+                        let hit = self.val(&format!("and {t} {val}, {mask}"));
+                        Some(self.val(&format!("icmp eq {t} {hit}, 0")))
+                    }
+                    _ => None,
+                }
+            }
+            FlagSource::BitTestBit { val, bit, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::b => Some(if bit == 0 {
+                        self.val(&format!("trunc {t} {val} to i1"))
+                    } else if bit == bits - 1 {
+                        self.msb(&val, bits)
+                    } else {
+                        let m = imm(1u64 << bit, bits);
+                        let hit = self.val(&format!("and {t} {val}, {m}"));
+                        self.val(&format!("icmp ne {t} {hit}, 0"))
+                    }),
+                    C::ae => Some(if bit == bits - 1 {
+                        self.val(&format!("icmp sge {t} {val}, 0"))
+                    } else {
+                        let m = imm(1u64 << bit, bits);
+                        let hit = self.val(&format!("and {t} {val}, {m}"));
+                        self.val(&format!("icmp eq {t} {hit}, 0"))
+                    }),
                     _ => None,
                 }
             }
@@ -2572,7 +2794,11 @@ impl FunctionLifter<'_> {
             | M::Setle
             | M::Setg => {
                 let c = self.condition(ins.condition_code())?;
-                let byte = self.val(&format!("zext i1 {c} to i8"));
+                let byte = match c.as_str() {
+                    "true" => "1".to_string(),
+                    "false" => "0".to_string(),
+                    _ => self.val(&format!("zext i1 {c} to i8")),
+                };
                 self.write_op(ins, 0, &byte, 8)?;
             }
             M::Cmovo
@@ -2592,6 +2818,26 @@ impl FunctionLifter<'_> {
             | M::Cmovle
             | M::Cmovg => {
                 let bits = self.op_bits(ins, 0)?;
+                if ins.op_kind(0) == OpKind::Register
+                    && ins.op_kind(1) == OpKind::Register
+                    && ins.op_register(0) == ins.op_register(1)
+                {
+                    // Same-register `cmovcc`: 64/16-bit is a pure no-op; 32-bit unconditionally
+                    // zero-extends the 32-bit register into 64-bit regardless of flags.
+                    if bits == 32 {
+                        let RegRef::Low(dst_idx, 32) = reg_ref(ins.op_register(0))? else {
+                            return unsupported("cmov destination");
+                        };
+                        let old64 = self.load_gpr(dst_idx)?;
+                        let wide = if let Some(c) = memory_access::const_addr(&old64) {
+                            imm(c & mask(32), 64)
+                        } else {
+                            self.val(&format!("and i64 {old64}, 4294967295"))
+                        };
+                        self.store_gpr(dst_idx, &wide)?;
+                    }
+                    return Ok(());
+                }
                 let c = self.condition(ins.condition_code())?;
                 if bits == 32
                     && ins.op_kind(0) == OpKind::Register
@@ -2605,14 +2851,28 @@ impl FunctionLifter<'_> {
                     };
                     let src64 = self.load_gpr(src_idx)?;
                     let old64 = self.load_gpr(dst_idx)?;
-                    let sel = self.val(&format!("select i1 {c}, i64 {src64}, i64 {old64}"));
+                    let sel = match c.as_str() {
+                        "true" => src64,
+                        "false" => old64,
+                        _ if src64 == old64 => old64,
+                        _ => self.val(&format!("select i1 {c}, i64 {src64}, i64 {old64}")),
+                    };
                     // A 32-bit cmov zero-extends the destination even when the condition is false.
-                    let wide = self.val(&format!("and i64 {sel}, 4294967295"));
+                    let wide = if let Some(v) = memory_access::const_addr(&sel) {
+                        imm(v & mask(32), 64)
+                    } else {
+                        self.val(&format!("and i64 {sel}, 4294967295"))
+                    };
                     self.store_gpr(dst_idx, &wide)?;
                 } else {
                     let src = self.read_op(ins, 1, bits)?;
                     let old = self.read_op(ins, 0, bits)?;
-                    let v = self.val(&format!("select i1 {c}, i{bits} {src}, i{bits} {old}"));
+                    let v = match c.as_str() {
+                        "true" => src,
+                        "false" => old,
+                        _ if src == old => old,
+                        _ => self.val(&format!("select i1 {c}, i{bits} {src}, i{bits} {old}")),
+                    };
                     // A 32-bit cmov zero-extends the destination even when the condition is false.
                     self.write_op(ins, 0, &v, bits)?;
                 }
@@ -3418,12 +3678,22 @@ impl FunctionLifter<'_> {
             let out_state = self.state_sync_out_by(target);
             let in_state = self.state_written_by(target);
             self.sync_out_parts(out_state, flags);
+            let pre_known_gprs = self.known.gprs.clone();
+            let pre_entry_facts = self.block_entry_facts;
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)
             ));
             self.callees.push(target);
             self.sync_in_parts(in_state, live_flags_after);
+            // `after_call` is dominated solely by the pre-call block: GPRs the callee never writes
+            // (other than `rsp`) still hold their pre-call SSA values and stack/constant facts.
+            for idx in 0..16 {
+                if idx != RSP && self.regs[idx] && in_state & (1u64 << idx) == 0 {
+                    self.known.gprs[idx] = pre_known_gprs[idx].clone();
+                    self.block_entry_facts[idx] = pre_entry_facts[idx];
+                }
+            }
         } else {
             // The target is read before the return address is pushed (`call [rsp+8]`).
             let target = self.indirect_target(ins)?;
@@ -3514,6 +3784,657 @@ impl FunctionLifter<'_> {
         self.emit(&format!("br i1 {c}, label %{taken}, label %{not_taken}"));
         Ok(())
     }
+}
+
+/// R71: intra-procedural forward dataflow analysis computing per-block entry [`GprFact`]s
+/// (compile-time constants and bounded `entry_rsp`-relative stack offsets) over `func.blocks`.
+///
+/// Soundness invariants:
+/// - `func.entry` starts with `RSP = StackOffset(0)` and all other GPRs `Bottom`.
+/// - Every block in `func.resume_targets` starts with all GPRs `Bottom` (re-entry from unwind).
+/// - Direct calls kill `RSP` and every GPR in `flag_summaries.written_by(target)` (or all GPRs
+///   when summaries are absent); indirect calls and runtime helpers kill all GPRs.
+/// - Every unmodelled instruction conservatively kills all GPRs reported written by `iced_x86`.
+fn compute_block_entry_gpr_facts(
+    func: &cfg::Function,
+    flag_summaries: Option<&FlagSummaries>,
+    faulting_calls: &BTreeSet<u64>,
+) -> BTreeMap<u64, [GprFact; 16]> {
+    let mut in_state: BTreeMap<u64, [GprFact; 16]> = func
+        .blocks
+        .keys()
+        .map(|&va| (va, [GprFact::Top; 16]))
+        .collect();
+    let mut work: VecDeque<u64> = VecDeque::new();
+    let mut queued: BTreeSet<u64> = BTreeSet::new();
+
+    if let Some(entry_in) = in_state.get_mut(&func.entry) {
+        *entry_in = [GprFact::Bottom; 16];
+        entry_in[RSP] = GprFact::StackOffset(0);
+        work.push_back(func.entry);
+        queued.insert(func.entry);
+    }
+    for &resume_va in &func.resume_targets {
+        if let Some(resume_in) = in_state.get_mut(&resume_va) {
+            *resume_in = [GprFact::Bottom; 16];
+            if queued.insert(resume_va) {
+                work.push_back(resume_va);
+            }
+        }
+    }
+
+    let mut factory = InstructionInfoFactory::new();
+    while let Some(va) = work.pop_front() {
+        queued.remove(&va);
+        let Some(block) = func.blocks.get(&va) else {
+            continue;
+        };
+        let mut state = in_state[&va];
+        let (body, transfer) = match block.instructions.split_last() {
+            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+            _ => (&block.instructions[..], None),
+        };
+        let mut falls_through = true;
+        for ins in body {
+            if !transfer_gpr_instruction(&mut state, ins, flag_summaries, faulting_calls, &mut factory)
+            {
+                falls_through = false;
+                break;
+            }
+        }
+        if !falls_through {
+            continue;
+        }
+        if let (Terminator::Branch, Some(term)) = (block.terminator, transfer)
+            && matches!(
+                term.code(),
+                Code::Loop_rel8_64_RCX | Code::Loope_rel8_64_RCX | Code::Loopne_rel8_64_RCX
+            )
+        {
+            state[integer::RCX] = GprFact::Bottom;
+        }
+        for target in block.successors.iter().filter_map(Edge::intra_target) {
+            if let Some(succ_in) = in_state.get_mut(&target) {
+                let mut changed = false;
+                for i in 0..16 {
+                    let joined = succ_in[i].join(state[i]);
+                    if joined != succ_in[i] {
+                        succ_in[i] = joined;
+                        changed = true;
+                    }
+                }
+                if changed && queued.insert(target) {
+                    work.push_back(target);
+                }
+            }
+        }
+    }
+    in_state
+}
+
+fn add_stack_offset(base: i64, delta: i64) -> GprFact {
+    base.checked_add(delta)
+        .filter(|total| total.abs() <= memory_access::STACK_FRAME_MAX_DISP)
+        .map_or(GprFact::Bottom, GprFact::StackOffset)
+}
+
+fn add_fact_offset(fact: GprFact, delta: i64) -> GprFact {
+    match fact {
+        GprFact::Const(c) => GprFact::Const(c.wrapping_add(delta as u64)),
+        GprFact::StackOffset(d) => add_stack_offset(d, delta),
+        GprFact::StackFrame if delta == 0 => GprFact::StackFrame,
+        _ => GprFact::Bottom,
+    }
+}
+
+/// True if `m` is a power-of-two stack-alignment mask `-(1 << k)` with `1 <= k <= 12` (<= 4 KiB).
+fn align_mask_slack(m: u64) -> Option<i64> {
+    let slack = (!m) as i64;
+    if slack > 0 && slack <= 4095 && ((slack as u64) & (slack as u64 + 1)) == 0 {
+        Some(slack)
+    } else {
+        None
+    }
+}
+
+fn read_reg_const(state: &[GprFact; 16], reg: Register) -> Option<u64> {
+    match reg_ref(reg).ok()? {
+        RegRef::Low(idx, bits) => match state[idx] {
+            GprFact::Const(c) => Some(c & mask(bits)),
+            _ => None,
+        },
+        RegRef::High8(idx) => match state[idx] {
+            GprFact::Const(c) => Some((c >> 8) & 0xFF),
+            _ => None,
+        },
+    }
+}
+
+fn write_gpr_fact(state: &mut [GprFact; 16], reg: Register, val: GprFact) {
+    let Ok(r) = reg_ref(reg) else {
+        return;
+    };
+    match r {
+        RegRef::Low(idx, 64) => state[idx] = val,
+        RegRef::Low(idx, 32) => {
+            state[idx] = match val {
+                GprFact::Const(c) => GprFact::Const(c & mask(32)),
+                _ => GprFact::Bottom,
+            };
+        }
+        RegRef::Low(idx, bits) => {
+            state[idx] = match (state[idx], val) {
+                (GprFact::Const(old), GprFact::Const(new)) => {
+                    let m = mask(bits);
+                    GprFact::Const((old & !m) | (new & m))
+                }
+                _ => GprFact::Bottom,
+            };
+        }
+        RegRef::High8(idx) => {
+            state[idx] = match (state[idx], val) {
+                (GprFact::Const(old), GprFact::Const(new)) => {
+                    GprFact::Const((old & !0xFF00) | ((new & 0xFF) << 8))
+                }
+                _ => GprFact::Bottom,
+            };
+        }
+    }
+}
+
+fn kill_written_gprs(
+    state: &mut [GprFact; 16],
+    ins: &Instruction,
+    factory: &mut InstructionInfoFactory,
+) {
+    let info = factory.info(ins);
+    for ur in info.used_registers() {
+        if matches!(
+            ur.access(),
+            OpAccess::Write
+                | OpAccess::CondWrite
+                | OpAccess::ReadWrite
+                | OpAccess::ReadCondWrite
+        ) {
+            let r = ur.register();
+            if r.is_gpr() && r.full_register().is_gpr64() {
+                state[r.full_register().number()] = GprFact::Bottom;
+            }
+        }
+    }
+    for i in 0..ins.op_count() {
+        if ins.op_kind(i) == OpKind::Register
+            && matches!(
+                info.op_access(i),
+                OpAccess::Write
+                    | OpAccess::CondWrite
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+            )
+        {
+            let r = ins.op_register(i);
+            if r.is_gpr() && r.full_register().is_gpr64() {
+                state[r.full_register().number()] = GprFact::Bottom;
+            }
+        }
+    }
+}
+
+fn sign_extend_u64(val: u64, from_bits: u32) -> u64 {
+    if from_bits >= 64 {
+        return val;
+    }
+    let shift = 64 - from_bits;
+    (((val << shift) as i64) >> shift) as u64
+}
+
+fn is_cmovcc_mnemonic(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Cmovo
+            | M::Cmovno
+            | M::Cmovb
+            | M::Cmovae
+            | M::Cmove
+            | M::Cmovne
+            | M::Cmovbe
+            | M::Cmova
+            | M::Cmovs
+            | M::Cmovns
+            | M::Cmovp
+            | M::Cmovnp
+            | M::Cmovl
+            | M::Cmovge
+            | M::Cmovle
+            | M::Cmovg
+    )
+}
+
+/// Applies one body instruction to `state`. Returns `false` only when the instruction is known to
+/// trap unconditionally (a direct call into unmapped/non-executable memory).
+fn transfer_gpr_instruction(
+    state: &mut [GprFact; 16],
+    ins: &Instruction,
+    flag_summaries: Option<&FlagSummaries>,
+    faulting_calls: &BTreeSet<u64>,
+    factory: &mut InstructionInfoFactory,
+) -> bool {
+    use Mnemonic as M;
+    if ins.code() == Code::INVALID {
+        *state = [GprFact::Bottom; 16];
+        return true;
+    }
+    let m = ins.mnemonic();
+    if m == M::Call {
+        if ins.op_kind(0) == OpKind::NearBranch64 {
+            if faulting_calls.contains(&ins.ip()) {
+                return false;
+            }
+            let target = ins.near_branch_target();
+            if let Some(summaries) = flag_summaries {
+                let written = summaries.written_by(target);
+                for (idx, slot) in state.iter_mut().enumerate() {
+                    if idx == RSP || (written & (1u64 << idx)) != 0 {
+                        *slot = GprFact::Bottom;
+                    }
+                }
+            } else {
+                *state = [GprFact::Bottom; 16];
+            }
+        } else {
+            *state = [GprFact::Bottom; 16];
+        }
+        return true;
+    }
+    if matches!(m, M::Cpuid | M::Rdtsc | M::Rdtscp | M::Xgetbv) {
+        *state = [GprFact::Bottom; 16];
+        return true;
+    }
+    if ins.has_lock_prefix() || ins.is_string_instruction() {
+        kill_written_gprs(state, ins, factory);
+        return true;
+    }
+    match m {
+        M::Nop
+        | M::Endbr64
+        | M::Cmp
+        | M::Test
+        | M::Bt
+        | M::Mfence
+        | M::Lfence
+        | M::Sfence
+        | M::Pause
+        | M::Prefetchnta
+        | M::Prefetcht0
+        | M::Prefetcht1
+        | M::Prefetcht2
+        | M::Prefetchw
+        | M::Prefetchwt1
+        | M::Prefetch
+        | M::Prefetchit0
+        | M::Prefetchit1
+        | M::Clflush
+        | M::Clflushopt
+        | M::Clwb
+        | M::Cldemote
+        | M::Reservednop
+        | M::Rdsspd
+        | M::Rdsspq
+        | M::Monitorx
+        | M::Mwaitx
+        | M::Cld
+        | M::Std
+        | M::Clc
+        | M::Stc
+        | M::Cmc
+        | M::Fnclex
+        | M::Fclex
+        | M::Fninit
+        | M::Finit
+        | M::Wait
+        | M::Fnop
+        | M::Fldcw
+        | M::Clzero => {}
+        M::Mov => {
+            if ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                let val = match ins.op_kind(1) {
+                    kind if is_immediate(kind) => ins
+                        .try_immediate(1)
+                        .ok()
+                        .map_or(GprFact::Bottom, GprFact::Const),
+                    OpKind::Register => {
+                        let r1 = ins.op_register(1);
+                        if r0.is_gpr64() && r1.is_gpr64() {
+                            state[r1.number()]
+                        } else {
+                            read_reg_const(state, r1).map_or(GprFact::Bottom, GprFact::Const)
+                        }
+                    }
+                    _ => GprFact::Bottom,
+                };
+                write_gpr_fact(state, r0, val);
+            }
+        }
+        M::Movzx | M::Movsx | M::Movsxd => {
+            if ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                let val = if ins.op_kind(1) == OpKind::Register {
+                    let r1 = ins.op_register(1);
+                    let src_bits = (r1.size() * 8) as u32;
+                    read_reg_const(state, r1).map_or(GprFact::Bottom, |c| {
+                        let ext = if m == M::Movzx {
+                            c & mask(src_bits)
+                        } else {
+                            sign_extend_u64(c & mask(src_bits), src_bits)
+                        };
+                        GprFact::Const(ext)
+                    })
+                } else {
+                    GprFact::Bottom
+                };
+                write_gpr_fact(state, r0, val);
+            }
+        }
+        M::Lea => {
+            if ins.op_kind(0) == OpKind::Register && ins.op_kind(1) == OpKind::Memory {
+                let base = ins.memory_base();
+                let index = ins.memory_index();
+                let disp = ins.memory_displacement64();
+                let addr32 = base.is_gpr32() || index.is_gpr32();
+                let res = if base == Register::EIP {
+                    GprFact::Bottom
+                } else if base == Register::RIP && index == Register::None {
+                    GprFact::Const(disp)
+                } else if base == Register::None && index == Register::None {
+                    GprFact::Const(if addr32 { disp & mask(32) } else { disp })
+                } else {
+                    let base_fact = match base {
+                        Register::None | Register::RIP => GprFact::Const(0),
+                        r if r.is_gpr64() => state[r.number()],
+                        r if r.is_gpr32() => match state[r.full_register().number()] {
+                            GprFact::Const(c) => GprFact::Const(c & mask(32)),
+                            _ => GprFact::Bottom,
+                        },
+                        _ => GprFact::Bottom,
+                    };
+                    let idx_fact = match index {
+                        Register::None => GprFact::Const(0),
+                        r if r.is_gpr64() => match state[r.number()] {
+                            GprFact::Const(c) => {
+                                GprFact::Const(c.wrapping_mul(u64::from(ins.memory_index_scale())))
+                            }
+                            _ => GprFact::Bottom,
+                        },
+                        r if r.is_gpr32() => match state[r.full_register().number()] {
+                            GprFact::Const(c) => GprFact::Const(
+                                (c & mask(32)).wrapping_mul(u64::from(ins.memory_index_scale())),
+                            ),
+                            _ => GprFact::Bottom,
+                        },
+                        _ => GprFact::Bottom,
+                    };
+                    match (base_fact, idx_fact) {
+                        (GprFact::Const(a), GprFact::Const(b)) => {
+                            let sum = a.wrapping_add(b).wrapping_add(disp);
+                            GprFact::Const(if addr32 { sum & mask(32) } else { sum })
+                        }
+                        (GprFact::StackOffset(d), GprFact::Const(b)) if !addr32 => {
+                            add_stack_offset(d, b.wrapping_add(disp) as i64)
+                        }
+                        (GprFact::StackFrame, GprFact::Const(b))
+                            if !addr32 && b.wrapping_add(disp) == 0 =>
+                        {
+                            GprFact::StackFrame
+                        }
+                        _ => GprFact::Bottom,
+                    }
+                };
+                write_gpr_fact(state, ins.op_register(0), res);
+            } else {
+                kill_written_gprs(state, ins, factory);
+            }
+        }
+        M::Xor | M::Sub
+            if ins.op_count() == 2
+                && ins.op_kind(0) == OpKind::Register
+                && ins.op_kind(1) == OpKind::Register
+                && ins.op_register(0) == ins.op_register(1) =>
+        {
+            write_gpr_fact(state, ins.op_register(0), GprFact::Const(0));
+        }
+        M::Add | M::Sub | M::And | M::Or | M::Xor => {
+            if ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                let bits = (r0.size() * 8) as u32;
+                let a = if r0.is_gpr64() {
+                    state[r0.number()]
+                } else {
+                    read_reg_const(state, r0).map_or(GprFact::Bottom, GprFact::Const)
+                };
+                let b = match ins.op_kind(1) {
+                    kind if is_immediate(kind) => ins
+                        .try_immediate(1)
+                        .ok()
+                        .map_or(GprFact::Bottom, |v| GprFact::Const(v & mask(bits))),
+                    OpKind::Register => {
+                        let r1 = ins.op_register(1);
+                        if r0.is_gpr64() && r1.is_gpr64() {
+                            state[r1.number()]
+                        } else {
+                            read_reg_const(state, r1).map_or(GprFact::Bottom, GprFact::Const)
+                        }
+                    }
+                    _ => GprFact::Bottom,
+                };
+                let res = match m {
+                    M::Add => match (a, b) {
+                        (GprFact::Const(x), GprFact::Const(y)) => {
+                            GprFact::Const(x.wrapping_add(y) & mask(bits))
+                        }
+                        (GprFact::StackOffset(d), GprFact::Const(y))
+                        | (GprFact::Const(y), GprFact::StackOffset(d))
+                            if bits == 64 =>
+                        {
+                            add_stack_offset(d, y as i64)
+                        }
+                        (GprFact::StackFrame, GprFact::Const(0))
+                        | (GprFact::Const(0), GprFact::StackFrame)
+                            if bits == 64 =>
+                        {
+                            GprFact::StackFrame
+                        }
+                        _ => GprFact::Bottom,
+                    },
+                    M::Sub => match (a, b) {
+                        (GprFact::Const(x), GprFact::Const(y)) => {
+                            GprFact::Const(x.wrapping_sub(y) & mask(bits))
+                        }
+                        (GprFact::StackOffset(d), GprFact::Const(y)) if bits == 64 => d
+                            .checked_sub(y as i64)
+                            .filter(|t| t.abs() <= memory_access::STACK_FRAME_MAX_DISP)
+                            .map_or(GprFact::Bottom, GprFact::StackOffset),
+                        (GprFact::StackOffset(d1), GprFact::StackOffset(d2)) if bits == 64 => {
+                            GprFact::Const(d1.wrapping_sub(d2) as u64)
+                        }
+                        (GprFact::StackFrame, GprFact::Const(0)) if bits == 64 => {
+                            GprFact::StackFrame
+                        }
+                        _ => GprFact::Bottom,
+                    },
+                    M::And => match (a, b) {
+                        (GprFact::Const(x), GprFact::Const(y)) => {
+                            GprFact::Const((x & y) & mask(bits))
+                        }
+                        (GprFact::StackOffset(d), GprFact::Const(y))
+                            if bits == 64
+                                && align_mask_slack(y).is_some_and(|slack| {
+                                    d.abs()
+                                        .checked_add(slack)
+                                        .is_some_and(|t| t <= memory_access::STACK_FRAME_HALF)
+                                }) =>
+                        {
+                            GprFact::StackFrame
+                        }
+                        _ => GprFact::Bottom,
+                    },
+                    M::Or => match (a, b) {
+                        (GprFact::Const(x), GprFact::Const(y)) => {
+                            GprFact::Const((x | y) & mask(bits))
+                        }
+                        _ => GprFact::Bottom,
+                    },
+                    M::Xor => match (a, b) {
+                        (GprFact::Const(x), GprFact::Const(y)) => {
+                            GprFact::Const((x ^ y) & mask(bits))
+                        }
+                        _ => GprFact::Bottom,
+                    },
+                    _ => GprFact::Bottom,
+                };
+                write_gpr_fact(state, r0, res);
+            }
+        }
+        M::Inc | M::Dec | M::Neg | M::Not => {
+            if ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                let bits = (r0.size() * 8) as u32;
+                let a = if r0.is_gpr64() {
+                    state[r0.number()]
+                } else {
+                    read_reg_const(state, r0).map_or(GprFact::Bottom, GprFact::Const)
+                };
+                let res = match (m, a) {
+                    (M::Inc, GprFact::Const(x)) => GprFact::Const(x.wrapping_add(1) & mask(bits)),
+                    (M::Dec, GprFact::Const(x)) => GprFact::Const(x.wrapping_sub(1) & mask(bits)),
+                    (M::Inc, GprFact::StackOffset(d)) if bits == 64 => add_stack_offset(d, 1),
+                    (M::Dec, GprFact::StackOffset(d)) if bits == 64 => add_stack_offset(d, -1),
+                    (M::Neg, GprFact::Const(x)) => GprFact::Const(0u64.wrapping_sub(x) & mask(bits)),
+                    (M::Not, GprFact::Const(x)) => GprFact::Const((!x) & mask(bits)),
+                    _ => GprFact::Bottom,
+                };
+                write_gpr_fact(state, r0, res);
+            }
+        }
+        M::Shl | M::Sal | M::Shr | M::Sar => {
+            if ins.op_kind(0) == OpKind::Register {
+                let r0 = ins.op_register(0);
+                let bits = (r0.size() * 8) as u32;
+                let count_mask = if bits == 64 { 63 } else { 31 };
+                let res = if is_immediate(ins.op_kind(1))
+                    && let Ok(raw) = ins.try_immediate(1)
+                    && let Some(c) = read_reg_const(state, r0)
+                {
+                    let amt = (raw & count_mask) as u32;
+                    let v = match m {
+                        M::Shl | M::Sal => {
+                            if amt >= bits {
+                                0
+                            } else {
+                                (c << amt) & mask(bits)
+                            }
+                        }
+                        M::Shr => {
+                            if amt >= bits {
+                                0
+                            } else {
+                                (c & mask(bits)) >> amt
+                            }
+                        }
+                        M::Sar => {
+                            let sx = sign_extend_u64(c & mask(bits), bits) as i64;
+                            ((sx >> amt.min(63)) as u64) & mask(bits)
+                        }
+                        _ => unreachable!(),
+                    };
+                    GprFact::Const(v)
+                } else {
+                    GprFact::Bottom
+                };
+                write_gpr_fact(state, r0, res);
+            }
+        }
+        M::Push => {
+            let inc = ins.stack_pointer_increment();
+            state[RSP] = if matches!(inc, -8 | -2) {
+                add_fact_offset(state[RSP], i64::from(inc))
+            } else {
+                GprFact::Bottom
+            };
+        }
+        M::Pop => {
+            let inc = ins.stack_pointer_increment();
+            state[RSP] = if matches!(inc, 8 | 2) {
+                add_fact_offset(state[RSP], i64::from(inc))
+            } else {
+                GprFact::Bottom
+            };
+            if ins.op_kind(0) == OpKind::Register {
+                write_gpr_fact(state, ins.op_register(0), GprFact::Bottom);
+            }
+        }
+        M::Pushfq => {
+            state[RSP] = add_fact_offset(state[RSP], -8);
+        }
+        M::Popfq => {
+            state[RSP] = add_fact_offset(state[RSP], 8);
+        }
+        M::Enter if ins.code() == Code::Enterq_imm16_imm8 && (ins.immediate8_2nd() & 31) == 0 => {
+            let frame = add_fact_offset(state[RSP], -8);
+            state[RBP] = frame;
+            state[RSP] = add_fact_offset(frame, -i64::from(ins.immediate16()));
+        }
+        M::Leave if ins.code() == Code::Leaveq => {
+            state[RSP] = add_fact_offset(state[RBP], 8);
+            state[RBP] = GprFact::Bottom;
+        }
+        M::Xchg if ins.op_kind(0) == OpKind::Register && ins.op_kind(1) == OpKind::Register => {
+            let r0 = ins.op_register(0);
+            let r1 = ins.op_register(1);
+            if r0.is_gpr64() && r1.is_gpr64() {
+                state.swap(r0.number(), r1.number());
+            } else {
+                kill_written_gprs(state, ins, factory);
+            }
+        }
+        cm if is_cmovcc_mnemonic(cm) && ins.op_kind(0) == OpKind::Register => {
+            let r0 = ins.op_register(0);
+            if ins.op_kind(1) == OpKind::Register {
+                let r1 = ins.op_register(1);
+                if r0 == r1 {
+                    if r0.is_gpr32() {
+                        let idx = r0.full_register().number();
+                        state[idx] = match state[idx] {
+                            GprFact::Const(c) => GprFact::Const(c & mask(32)),
+                            _ => GprFact::Bottom,
+                        };
+                    }
+                } else if r0.is_gpr64() && r1.is_gpr64() {
+                    let joined = state[r0.number()].join(state[r1.number()]);
+                    state[r0.number()] = joined;
+                } else if r0.is_gpr32() && r1.is_gpr32() {
+                    let a = match state[r0.full_register().number()] {
+                        GprFact::Const(c) => GprFact::Const(c & mask(32)),
+                        _ => GprFact::Bottom,
+                    };
+                    let b = match state[r1.full_register().number()] {
+                        GprFact::Const(c) => GprFact::Const(c & mask(32)),
+                        _ => GprFact::Bottom,
+                    };
+                    state[r0.full_register().number()] = a.join(b);
+                } else {
+                    write_gpr_fact(state, r0, GprFact::Bottom);
+                }
+            } else {
+                write_gpr_fact(state, r0, GprFact::Bottom);
+            }
+        }
+        _ => {
+            kill_written_gprs(state, ins, factory);
+        }
+    }
+    true
 }
 
 /// R65a: for a modelled non-trapping instruction (`flag_liveness::flag_effect(ins).is_some()`),

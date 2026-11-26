@@ -1529,3 +1529,273 @@ fn r65_entry_dead_gpr_flag_elision_and_leaf_inlining_are_bit_exact() {
     assert_eq!(out[5].regs[R9], 0xCAFE_BABE);
     assert_eq!(out[5].regs[RAX], 0x1337_C0DE);
 }
+
+fn ref_pext(src: u64, mask: u64, bits: u32) -> u64 {
+    let width_mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let (s, mut m) = (src & width_mask, mask & width_mask);
+    let (mut r, mut k) = (0u64, 1u64);
+    while m != 0 {
+        let low = m & m.wrapping_neg();
+        if s & low != 0 {
+            r |= k;
+        }
+        m ^= low;
+        k <<= 1;
+    }
+    r
+}
+
+fn ref_pdep(src: u64, mask: u64, bits: u32) -> u64 {
+    let width_mask = if bits == 64 { u64::MAX } else { (1u64 << bits) - 1 };
+    let (mut s, mut m) = (src & width_mask, mask & width_mask);
+    let mut r = 0u64;
+    while m != 0 {
+        let low = m & m.wrapping_neg();
+        if s & 1 != 0 {
+            r |= low;
+        }
+        m ^= low;
+        s >>= 1;
+    }
+    r
+}
+
+#[test]
+fn r71_bit_ops_bt_fusion_cmov_and_adcx_adox_execute() {
+    if !exec_or_skip("r71_bit_ops_bt_fusion_cmov_and_adcx_adox_execute") {
+        return;
+    }
+    const F_BT: u64 = CODE_BASE;
+    const F_CMOV: u64 = CODE_BASE + 0x100;
+    const F_BEXTR_BZHI: u64 = CODE_BASE + 0x200;
+    const F_PEXT_PDEP: u64 = CODE_BASE + 0x300;
+    const F_CNT: u64 = CODE_BASE + 0x400;
+    const F_ADCX: u64 = CODE_BASE + 0x500;
+    const F_MULX: u64 = CODE_BASE + 0x600;
+
+    let funcs = Program::new()
+        // F_BT(rcx=val, rdx=dyn_bit, r8=mem_ptr):
+        // Tests bt bit0 + setb, bt bit63 + setae, bts dyn_bit + cmovb, btr [r8], 3 + jc.
+        .asm(F_BT, |a| {
+            let mut mem_was_set = a.create_label();
+            let mut done = a.create_label();
+            a.xor(eax, eax)?;
+            a.bt(rcx, 0)?;
+            a.setb(al)?;
+            a.bt(rcx, 63)?;
+            a.setae(ah)?;
+            a.mov(r9, rcx)?;
+            a.mov(r10, 0x1000u64)?;
+            a.mov(r11, 0x2000u64)?;
+            a.bts(r9, rdx)?;
+            a.cmovb(r10, r11)?;
+            a.or(rax, r10)?;
+            a.btr(qword_ptr(r8), 3)?;
+            a.jc(mem_was_set)?;
+            a.jmp(done)?;
+            a.set_label(&mut mem_was_set)?;
+            a.or(rax, 0x10000)?;
+            a.set_label(&mut done)?;
+            a.xor(edx, edx)?;
+            a.ret()
+        })
+        // F_CMOV(rcx=a, rdx=b, r8=hi_r8, r9=hi_r9):
+        // Same-reg 64-bit no-op, 32-bit unconditional zext (even when cond false!), multi-cmov chain.
+        .asm(F_CMOV, |a| {
+            a.cmp(rcx, rdx)?;
+            a.cmove(r8, r8)?; // 64-bit no-op (keeps upper 32 bits)
+            a.cmove(r9d, r9d)?; // 32-bit ALWAYS zero-extends even if rcx != rdx
+            a.mov(rax, 10u64)?;
+            a.mov(r10, 20u64)?;
+            a.mov(r11, 30u64)?;
+            a.cmp(rcx, rdx)?;
+            a.cmovl(rax, r10)?;
+            a.cmovg(rax, r11)?;
+            a.ret()
+        })
+        // F_BEXTR_BZHI(rcx=src64):
+        // Constant-operand bextr & bzhi covering zero, mid, top, and >=bits cases + flags.
+        .asm(F_BEXTR_BZHI, |a| {
+            // r8 = bextr64(rcx, start=4, len=12) -> ctrl = 0x0C04
+            a.mov(edx, 0x0C04)?;
+            a.bextr(r8, rcx, rdx)?;
+            // r9d = bextr32(ecx, start=16, len=16) -> top-aligned
+            a.mov(edx, 0x1010)?;
+            a.bextr(r9d, ecx, edx)?;
+            // r10 = bextr64(rcx, start=64, len=8) -> always 0, ZF=1
+            a.mov(edx, 0x0840)?;
+            a.bextr(r10, rcx, rdx)?;
+            a.setz(al)?;
+            // r11 = bzhi64(rcx, 12) -> CF=0
+            a.mov(edx, 12)?;
+            a.bzhi(r11, rcx, rdx)?;
+            a.setb(ah)?;
+            // rbx = bzhi64(rcx, 64) -> rcx, CF=1
+            a.mov(edx, 64)?;
+            a.bzhi(rbx, rcx, rdx)?;
+            a.setb(dl)?;
+            a.shl(rdx, 16)?;
+            a.and(rax, 0xFFFF)?;
+            a.or(rax, rdx)?;
+            // rsi = bzhi64(rcx, 0) -> 0, ZF=1, CF=0
+            a.xor(edx, edx)?;
+            a.bzhi(rsi, rcx, rdx)?;
+            a.setz(dl)?;
+            a.shl(rdx, 24)?;
+            a.or(rax, rdx)?;
+            a.ret()
+        })
+        // F_PEXT_PDEP(rcx=src64):
+        // Constant-mask pext/pdep for 0, all-ones, 1-run, 4-run, and 5-run fallback.
+        .asm(F_PEXT_PDEP, |a| {
+            a.mov(r8, 0x00FF_00FF_00FF_00FFu64)?; // 4 runs
+            a.pext(rax, rcx, r8)?;
+            a.pdep(rdx, rcx, r8)?;
+            a.mov(r9, 0x0000_FFFF_0000_0000u64)?; // 1 run
+            a.pext(r10, rcx, r9)?;
+            a.pdep(r11, rcx, r9)?;
+            a.mov(ebx, 0xFFFF_0000u32)?; // 32-bit top run
+            a.pext(esi, ecx, ebx)?;
+            a.pdep(edi, ecx, ebx)?;
+            a.mov(rbx, 0x5555_5555_5555_5555u64)?; // >4 runs (helper)
+            a.pext(r8, rcx, rbx)?;
+            a.pdep(r9, rcx, rbx)?;
+            a.ret()
+        })
+        // F_CNT(rcx=src64): lzcnt & tzcnt result + fused ZF/CF via setz/setb/setae/setnz.
+        .asm(F_CNT, |a| {
+            a.xor(eax, eax)?;
+            a.lzcnt(r8, rcx)?;
+            a.setz(al)?; // bit 0: lzcnt ZF (msb == 1)
+            a.setb(ah)?; // bit 8: lzcnt CF (src == 0)
+            a.tzcnt(r9, rcx)?;
+            a.setz(dl)?; // bit 16: tzcnt ZF (lsb == 1)
+            a.setnz(dh)?; // bit 24: !tzcnt ZF (lsb == 0)
+            a.movzx(rdx, dx)?;
+            a.shl(rdx, 16)?;
+            a.or(rax, rdx)?;
+            a.ret()
+        })
+        // F_ADCX(rcx=a0, rdx=b0, r8=a1, r9=b1): 128-bit add via adcx (CF=0 start) + adox (OF=0/1).
+        .asm(F_ADCX, |a| {
+            a.xor(eax, eax)?; // CF=0, OF=0
+            a.adcx(rcx, rdx)?;
+            a.adcx(r8, r9)?; // trailing CF dead
+            a.mov(rax, rcx)?;
+            a.mov(rdx, r8)?;
+            a.stc()?; // CF=1 constant path
+            a.adcx(r10, r11)?; // r10 += r11 + 1, live CF
+            a.setb(bl)?;
+            a.movzx(rbx, bl)?;
+            a.ret()
+        })
+        // F_MULX(rdx=a, rcx=b): equal-destination 32-bit and 64-bit mulx.
+        .asm(F_MULX, |a| {
+            a.mulx(r8d, r8d, ecx)?;
+            a.mulx(r9, r9, rcx)?;
+            a.ret()
+        })
+        .discover();
+
+    let built = build("r71_bit_ops", funcs.values());
+    let mem_addr = DATA_ADDR + 0x100;
+    let src64 = 0xDEAD_BEEF_CAFE_BABEu64;
+    let cases = [
+        // 0: F_BT with bit0=1, bit63=1, bit5=0, mem bit3=1
+        Case::new(F_BT)
+            .reg(RCX, 0x8000_0000_0000_0001)
+            .reg(RDX, 5)
+            .reg(R8, mem_addr)
+            .mem(mem_addr, &0x08u64.to_le_bytes())
+            .read(mem_addr, 8),
+        // 1: F_BT with bit0=0, bit63=0, bit5=1, mem bit3=0
+        Case::new(F_BT)
+            .reg(RCX, 0x20)
+            .reg(RDX, 5)
+            .reg(R8, mem_addr)
+            .mem(mem_addr, &0x00u64.to_le_bytes())
+            .read(mem_addr, 8),
+        // 2: F_CMOV with rcx < rdx (cmove FALSE: r8 untouched, r9d STILL zero-extended!)
+        Case::new(F_CMOV)
+            .reg(RCX, 5)
+            .reg(RDX, 9)
+            .reg(R8, 0x1122_3344_5566_7788)
+            .reg(R9, 0xAABB_CCDD_EEFF_0011),
+        // 3: F_CMOV with rcx > rdx
+        Case::new(F_CMOV)
+            .reg(RCX, 9)
+            .reg(RDX, 5)
+            .reg(R8, 0x1122_3344_5566_7788)
+            .reg(R9, 0xAABB_CCDD_EEFF_0011),
+        // 4: F_BEXTR_BZHI
+        Case::new(F_BEXTR_BZHI).reg(RCX, src64),
+        // 5: F_PEXT_PDEP
+        Case::new(F_PEXT_PDEP).reg(RCX, src64),
+        // 6: F_CNT(0)
+        Case::new(F_CNT).reg(RCX, 0),
+        // 7: F_CNT(0x8000_0000_0000_0001) (both msb and lsb set!)
+        Case::new(F_CNT).reg(RCX, 0x8000_0000_0000_0001),
+        // 8: F_CNT(0x0000_0000_0000_0010) (neither msb nor lsb set!)
+        Case::new(F_CNT).reg(RCX, 0x10),
+        // 9: F_ADCX (with carry from low limb + CF=1 on r10/r11)
+        Case::new(F_ADCX)
+            .reg(RCX, u64::MAX)
+            .reg(RDX, 5)
+            .reg(R8, 100)
+            .reg(R9, 200)
+            .reg(R10, u64::MAX)
+            .reg(R11, 0),
+        // 10: F_MULX
+        Case::new(F_MULX)
+            .reg(RDX, 0x1_0000_0000 + 0x8000_0000)
+            .reg(RCX, 0x0000_0002_0000_0004),
+    ];
+
+    let o = run_clean(&built, &cases);
+    // Case 0: bit0=1 (al=1), bit63=1 (ah=0), bit5=0 (r10=0x1000), mem bit3=1 (+0x10000)
+    assert_eq!(o[0].regs[RAX], 0x11001);
+    assert_eq!(o[0].regs[R9], 0x8000_0000_0000_0021);
+    assert_eq!(o[0].mem[0], 0u64.to_le_bytes());
+    // Case 1: bit0=0 (al=0), bit63=0 (ah=1 -> 0x100), bit5=1 (r10=0x2000), mem bit3=0
+    assert_eq!(o[1].regs[RAX], 0x2100);
+    assert_eq!(o[1].regs[R9], 0x20);
+    // Cases 2 & 3: F_CMOV
+    assert_eq!(o[2].regs[R8], 0x1122_3344_5566_7788, "64-bit same-reg cmov no-op");
+    assert_eq!(o[2].regs[R9], 0x0000_0000_EEFF_0011, "32-bit same-reg cmov zext");
+    assert_eq!(o[2].regs[RAX], 20, "rcx < rdx -> cmovl");
+    assert_eq!(o[3].regs[RAX], 30, "rcx > rdx -> cmovg");
+    // Case 4: F_BEXTR_BZHI
+    assert_eq!(o[4].regs[R8], (src64 >> 4) & 0xFFF, "bextr64(4, 12)");
+    assert_eq!(o[4].regs[R9], (src64 as u32 >> 16) as u64, "bextr32(16, 16)");
+    assert_eq!(o[4].regs[R10], 0, "bextr64(64, 8)");
+    assert_eq!(o[4].regs[R11], src64 & 0xFFF, "bzhi64(12)");
+    assert_eq!(o[4].regs[RBX], src64, "bzhi64(64)");
+    assert_eq!(o[4].regs[RSI], 0, "bzhi64(0)");
+    // Flags packed in rax: bit0=1 (bextr ZF), bit8=0 (bzhi12 CF), bit16=1 (bzhi64 CF), bit24=1 (bzhi0 ZF)
+    assert_eq!(o[4].regs[RAX], 0x0101_0001, "bextr/bzhi flags");
+    // Case 5: F_PEXT_PDEP
+    assert_eq!(o[5].regs[RAX], ref_pext(src64, 0x00FF_00FF_00FF_00FF, 64));
+    assert_eq!(o[5].regs[RDX], ref_pdep(src64, 0x00FF_00FF_00FF_00FF, 64));
+    assert_eq!(o[5].regs[R10], ref_pext(src64, 0x0000_FFFF_0000_0000, 64));
+    assert_eq!(o[5].regs[R11], ref_pdep(src64, 0x0000_FFFF_0000_0000, 64));
+    assert_eq!(o[5].regs[RSI], ref_pext(src64, 0xFFFF_0000, 32));
+    assert_eq!(o[5].regs[RDI], ref_pdep(src64, 0xFFFF_0000, 32));
+    assert_eq!(o[5].regs[R8], ref_pext(src64, 0x5555_5555_5555_5555, 64));
+    assert_eq!(o[5].regs[R9], ref_pdep(src64, 0x5555_5555_5555_5555, 64));
+    // Cases 6, 7, 8: F_CNT
+    assert_eq!((o[6].regs[R8], o[6].regs[R9], o[6].regs[RAX]), (64, 64, 0x0100_0100));
+    assert_eq!((o[7].regs[R8], o[7].regs[R9], o[7].regs[RAX]), (0, 0, 0x0001_0001));
+    assert_eq!((o[8].regs[R8], o[8].regs[R9], o[8].regs[RAX]), (59, 4, 0x0100_0000));
+    // Case 9: F_ADCX
+    assert_eq!(o[9].regs[RAX], 4, "u64::MAX + 5 wraps to 4");
+    assert_eq!(o[9].regs[RDX], 301, "100 + 200 + carry(1) = 301");
+    assert_eq!(o[9].regs[R10], 0, "u64::MAX + 0 + 1 wraps to 0");
+    assert_eq!(o[9].regs[RBX], 1, "carry out of u64::MAX + 0 + 1 is 1");
+    // Case 10: F_MULX
+    let a = 0x1_0000_0000u64 + 0x8000_0000;
+    let b = 0x0000_0002_0000_0004u64;
+    let hi32 = ((a as u32 as u64) * (b as u32 as u64)) >> 32;
+    let hi64 = ((u128::from(a) * u128::from(b)) >> 64) as u64;
+    assert_eq!(o[10].regs[R8], hi32, "mulx32 equal dst high half");
+    assert_eq!(o[10].regs[R9], hi64, "mulx64 equal dst high half");
+}

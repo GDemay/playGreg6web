@@ -1449,3 +1449,146 @@ fn r67_extended_64_insn_and_indexed_bursts_execute() {
         }
     }
 }
+
+#[test]
+fn r71_cross_bb_stack_const_and_soundness_execute() {
+    if !exec_or_skip("r71_cross_bb_stack_const_and_soundness_execute") {
+        return;
+    }
+    // 1. Cross-BB stack-frame propagation (`rbp` + diamond-merged `r12`) across a loop.
+    // 2. Soundness: diamond where arm 1 keeps `rbp` on stack and arm 2 overwrites `rbp` with a
+    //    window address `r8`, then reads/writes `[rbp - 8]`.
+    // 3. Hoisted constant base `rbx = FLAT_ADDR` across a loop vs mutated `rbx` walking inside
+    //    the window across a loop.
+    let flat_global = FLAT_ADDR + 0x500;
+    let f_loop = asm_function(CODE_BASE, |a| {
+        let mut arm_b = a.create_label();
+        let mut join = a.create_label();
+        let mut loop_hdr = a.create_label();
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.sub(rsp, 0x40)?;
+        a.mov(qword_ptr(rbp - 0x10), 10)?;
+        a.mov(qword_ptr(rbp - 0x20), 20)?;
+        a.test(ecx, ecx)?;
+        a.jz(arm_b)?;
+        a.lea(r12, qword_ptr(rbp - 0x10))?;
+        a.jmp(join)?;
+        a.set_label(&mut arm_b)?;
+        a.lea(r12, qword_ptr(rbp - 0x20))?;
+        a.set_label(&mut join)?;
+        a.lea(rbx, qword_ptr(flat_global))?;
+        a.xor(eax, eax)?;
+        a.mov(edx, 4)?;
+        a.set_label(&mut loop_hdr)?;
+        a.add(rax, qword_ptr(r12))?;
+        a.add(rax, qword_ptr(rbx))?;
+        a.mov(qword_ptr(rbx + 8), rax)?;
+        a.dec(edx)?;
+        a.jnz(loop_hdr)?;
+        a.add(rsp, 0x40)?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+
+    // Soundness function: if ecx != 0, replace rbp with r8 (window ptr) before join, write `[rbp-8]`.
+    let f_sound = asm_function(CODE_BASE + 0x200, |a| {
+        let mut use_win = a.create_label();
+        let mut join = a.create_label();
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.sub(rsp, 0x20)?;
+        a.mov(qword_ptr(rbp - 8), 100)?;
+        a.test(ecx, ecx)?;
+        a.jnz(use_win)?;
+        a.jmp(join)?;
+        a.set_label(&mut use_win)?;
+        a.mov(rbp, r8)?;
+        a.set_label(&mut join)?;
+        a.mov(rax, qword_ptr(rbp - 8))?;
+        a.add(rax, 1)?;
+        a.mov(qword_ptr(rbp - 8), rax)?;
+        a.add(rsp, 0x20)?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+
+    // Soundness function 2: `rbx` starts at a constant address inside the window and is mutated in
+    // the loop (`add rbx, 8`), writing 3 qwords across slots 2|3.
+    let walk_start = boundary(3) - 8;
+    let f_walk = asm_function(CODE_BASE + 0x400, |a| {
+        let mut loop_hdr = a.create_label();
+        a.mov(rbx, walk_start)?;
+        a.xor(eax, eax)?;
+        a.mov(ecx, 3)?;
+        a.set_label(&mut loop_hdr)?;
+        a.mov(rdx, qword_ptr(rbx))?;
+        a.add(rax, rdx)?;
+        a.add(rdx, 1)?;
+        a.mov(qword_ptr(rbx), rdx)?;
+        a.add(rbx, 8)?;
+        a.dec(ecx)?;
+        a.jnz(loop_hdr)?;
+        a.ret()
+    });
+
+    let win_ptr = boundary(2) + 0x40;
+    let walk_init: Vec<u8> = [10u64, 20, 30]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f_loop, &f_sound, &f_walk], &[], &memory, GUEST_BASE);
+        let cases = [
+            // 0: f_loop with ecx=1 -> uses [rbp-0x10]=10 + [flat_global]=5, 4 iters -> 60
+            Case::new(CODE_BASE)
+                .reg(RCX, 1)
+                .mem(flat_global, &5u64.to_le_bytes())
+                .read(flat_global + 8, 8),
+            // 1: f_loop with ecx=0 -> uses [rbp-0x20]=20 + [flat_global]=5, 4 iters -> 100
+            Case::new(CODE_BASE)
+                .reg(RCX, 0)
+                .mem(flat_global, &5u64.to_le_bytes())
+                .read(flat_global + 8, 8),
+            // 2: f_sound with ecx=0 -> stack arm: 100 + 1 = 101
+            Case::new(CODE_BASE + 0x200)
+                .reg(RCX, 0)
+                .reg(super::exec::R8, win_ptr),
+            // 3: f_sound with ecx=1 -> window arm: [win_ptr - 8] = 500 -> 501, slot 2 dirty!
+            Case::new(CODE_BASE + 0x200)
+                .reg(RCX, 1)
+                .reg(super::exec::R8, win_ptr)
+                .mem(win_ptr - 8, &500u64.to_le_bytes())
+                .read(win_ptr - 8, 8),
+            // 4: f_walk -> reads 10, 20, 30 (sum 60), writes 11, 21, 31 across slots 2 & 3!
+            Case::new(CODE_BASE + 0x400)
+                .mem(walk_start, &walk_init)
+                .read(walk_start, 24),
+        ];
+        let o = run(&built, &cases);
+        ok(&o, name);
+        assert_eq!(o[0].regs[RAX], 60, "{name}: loop arm 1");
+        assert_eq!(le(&o[0].mem[0]), 60, "{name}: loop arm 1 store");
+        assert_eq!(o[1].regs[RAX], 100, "{name}: loop arm 2");
+        assert_eq!(le(&o[1].mem[0]), 100, "{name}: loop arm 2 store");
+        assert_eq!(o[2].regs[RAX], 101, "{name}: sound stack arm");
+        assert_eq!(o[3].regs[RAX], 501, "{name}: sound window arm");
+        assert_eq!(le(&o[3].mem[0]), 501, "{name}: sound window arm store");
+        if name != "base" && name != "page" {
+            assert!(
+                o[3].dirty.contains(&slot(win_ptr - 8)),
+                "{name}: window arm must mark slot 2 dirty: {:?}",
+                o[3].dirty
+            );
+        }
+        assert_eq!(o[4].regs[RAX], 60, "{name}: walk sum");
+        assert_eq!(le(&o[4].mem[0][0..8]), 11, "{name}: walk[0]");
+        assert_eq!(le(&o[4].mem[0][8..16]), 21, "{name}: walk[1]");
+        assert_eq!(le(&o[4].mem[0][16..24]), 31, "{name}: walk[2]");
+        assert_eq!(
+            o[4].dirty,
+            expected_marks(name, &[2, 3], false),
+            "{name}: walk dirty slots"
+        );
+    }
+}
