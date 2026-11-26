@@ -1726,6 +1726,78 @@ std::vector<uint8_t> make_synthetic_wgpk_toc(const std::vector<SyntheticTocEntry
     return out;
 }
 
+struct SyntheticTocEntryV2 {
+    uint64_t hash;
+    uint8_t stage;
+    uint64_t offset;
+    uint32_t length;
+};
+
+// WGPK v2 TOC: 16-byte header (version 2) + 24-byte entries {hash, stage, rsvd[3], u32 length, u64 offset}.
+std::vector<uint8_t> make_synthetic_wgpk_toc_v2(const std::vector<SyntheticTocEntryV2>& entries) {
+    namespace gpu = playgta6::gpu;
+    std::vector<uint8_t> out(gpu::kShaderPackHeaderBytes + entries.size() * gpu::kShaderPackEntryBytesV2, 0);
+    const uint32_t version = 2;
+    const uint32_t count = static_cast<uint32_t>(entries.size());
+    std::memcpy(out.data(), "WGPK", 4);
+    std::memcpy(out.data() + 4, &version, 4);
+    std::memcpy(out.data() + 8, &count, 4);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        uint8_t* e = out.data() + gpu::kShaderPackHeaderBytes + i * gpu::kShaderPackEntryBytesV2;
+        std::memcpy(e, &entries[i].hash, 8);
+        e[8] = entries[i].stage;
+        std::memcpy(e + 12, &entries[i].length, 4);
+        std::memcpy(e + 16, &entries[i].offset, 8);
+    }
+    return out;
+}
+
+void test_shader_pack_index_v2_large_offsets() {
+    namespace gpu = playgta6::gpu;
+    constexpr uint64_t k5GiB = 5ULL << 30;
+    const std::vector<uint8_t> toc = make_synthetic_wgpk_toc_v2({
+        {0xA1ULL, 1, k5GiB, 4096u},
+        {0xA2ULL, 2, 0x1'0000'0000ULL, 100u},   // exactly 4 GiB
+        {0xA3ULL, 3, 112u, 8u},                 // first byte after the 112-byte TOC
+        {0xA4ULL, 1, 0u, 0u},                   // empty entry
+    });
+    uint32_t count = 0, version = 0;
+    std::string err;
+    CHECK(gpu::parse_shader_pack_header(toc.data(), toc.size(), &count, &err, &version));
+    CHECK(count == 4 && version == 2);
+    CHECK(gpu::shader_pack_entry_bytes(1) == 20 && gpu::shader_pack_entry_bytes(2) == 24 &&
+          gpu::shader_pack_entry_bytes(3) == 0);
+
+    gpu::ShaderPackIndex idx;
+    CHECK(gpu::parse_shader_pack_index_toc(toc.data(), toc.size(), 0, &idx, &err));
+    CHECK(idx.size() == 4);
+    CHECK(idx.at(0xA1ULL) == gpu::PackStage::Vertex);
+    CHECK(idx.at(0xA2ULL) == gpu::PackStage::Fragment);
+    CHECK(idx.at(0xA3ULL) == gpu::PackStage::Compute);
+
+    // total_file_size bound is 64-bit: exact fit passes, one byte short fails.
+    CHECK(gpu::parse_shader_pack_index_toc(toc.data(), toc.size(), k5GiB + 4096u, &idx, &err));
+    CHECK(!gpu::parse_shader_pack_index_toc(toc.data(), toc.size(), k5GiB + 4095u, &idx, &err));
+    CHECK(err.find("exceeds the file") != std::string::npos);
+
+    // u64 offset + length overflow is rejected.
+    const std::vector<uint8_t> ovf = make_synthetic_wgpk_toc_v2({{0x1ULL, 1, UINT64_MAX - 4, 16u}});
+    CHECK(!gpu::parse_shader_pack_index_toc(ovf.data(), ovf.size(), 0, &idx, &err));
+    CHECK(err.find("overflow") != std::string::npos);
+
+    // Payload overlapping the (v2-sized) TOC: 1 entry => toc_bytes == 40.
+    const std::vector<uint8_t> ovl = make_synthetic_wgpk_toc_v2({{0x1ULL, 1, 36u, 8u}});
+    CHECK(!gpu::parse_shader_pack_index_toc(ovl.data(), ovl.size(), 0, &idx, &err));
+    CHECK(err.find("overlaps") != std::string::npos);
+
+    // Truncated v2 table: declares 2 entries but only 1 record present.
+    std::vector<uint8_t> trunc = make_synthetic_wgpk_toc_v2({{0x1ULL, 1, 100u, 8u}});
+    const uint32_t two = 2;
+    std::memcpy(trunc.data() + 8, &two, 4);
+    CHECK(!gpu::parse_shader_pack_index_toc(trunc.data(), trunc.size(), 0, &idx, &err));
+    CHECK(err.find("entry table exceeds") != std::string::npos);
+}
+
 void test_shader_pack_index_toc_unit() {
     namespace gpu = playgta6::gpu;
 
@@ -1752,9 +1824,9 @@ void test_shader_pack_index_toc_unit() {
         CHECK(!gpu::parse_shader_pack_header(bad_magic.data(), bad_magic.size(), &count, &err));
         CHECK(err.find("not a WGPK") != std::string::npos);
 
-        const std::vector<uint8_t> bad_ver = make_synthetic_wgpk_toc({}, 2, 0);
+        const std::vector<uint8_t> bad_ver = make_synthetic_wgpk_toc({}, 3, 0);
         CHECK(!gpu::parse_shader_pack_header(bad_ver.data(), bad_ver.size(), &count, &err));
-        CHECK(err.find("unsupported WGPK version 2") != std::string::npos);
+        CHECK(err.find("unsupported WGPK version 3") != std::string::npos);
     }
 
     // 2. TOC-only parsing with payload offsets > 1.83 GiB (0x75200000 > 1,965,031,424 bytes),
@@ -2070,6 +2142,7 @@ int main() {
     test_program_boot_preserves_existing_httpfs_client();
     test_program_boot_shader_pack_loading();
     test_shader_pack_index_toc_unit();
+    test_shader_pack_index_v2_large_offsets();
     test_program_boot_shader_pack_toc_only_loading();
     test_try_load_stage_reflection();
     test_program_boot_stage_reflection_sidecar();

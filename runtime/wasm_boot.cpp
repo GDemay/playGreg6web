@@ -489,14 +489,15 @@ bool try_load_shader_pack(const WasmBootConfig& cfg,
     }
 
     uint32_t entry_count = 0;
+    uint32_t pack_version = 1;
     std::string parse_error;
-    if (!gpu::parse_shader_pack_header(header, header_got, &entry_count, &parse_error)) {
+    if (!gpu::parse_shader_pack_header(header, header_got, &entry_count, &parse_error, &pack_version)) {
         emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
         return false;
     }
 
     const uint64_t entries_bytes =
-        uint64_t{entry_count} * uint64_t{gpu::kShaderPackEntryBytes};
+        uint64_t{entry_count} * uint64_t{gpu::shader_pack_entry_bytes(pack_version)};
     const uint64_t toc_bytes = uint64_t{gpu::kShaderPackHeaderBytes} + entries_bytes;
     const uint64_t toc_cap =
         (cfg.max_file_bytes != 0 && cfg.max_file_bytes < kMaxShaderPackTocBytes)
