@@ -34,6 +34,7 @@
 #include "gpu/native_exec/m2_model.h"
 #include "gpu/native_exec/native_window.h"
 #include "gpu/native_exec/reflection_model.h"
+#include "gpu/native_exec/replay_frames.h"
 #include "gpu/native_exec/stream_model.h"
 
 namespace playgta6::gpu::native_exec {
@@ -894,6 +895,7 @@ struct NativeExecutor::Impl {
         cfg.device = device;
         cfg.format = swap_format;
         cfg.usage = wgpu::TextureUsage::RenderAttachment;
+        if (!options.frame_digest_path.empty()) cfg.usage |= wgpu::TextureUsage::CopySrc;
         cfg.width = w;
         cfg.height = h;
         cfg.alphaMode = wgpu::CompositeAlphaMode::Opaque;  // the worker's DEFAULT_ALPHA_MODE
@@ -3914,6 +3916,26 @@ struct NativeExecutor::Impl {
             if (timer_pass(e, d3d12_guest::GpuPassKind::Render, 0, &tw)) rp.timestampWrites = &tw;
             e.enc.BeginRenderPass(&rp).End();
         }
+        wgpu::Buffer digest_buf;
+        uint32_t digest_padded_row = 0, digest_w = 0, digest_h = 0;
+        wgpu::TextureFormat digest_format = stream_format;
+        if (!options.frame_digest_path.empty() && target.texture && format_bytes(digest_format) == 4) {
+            digest_w = target.blit ? stream_w : swap_width;
+            digest_h = target.blit ? stream_h : swap_height;
+            digest_padded_row = (digest_w * 4 + 255u) & ~255u;
+            wgpu::BufferDescriptor bd{};
+            bd.size = uint64_t{digest_padded_row} * digest_h;
+            bd.usage = wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst;
+            digest_buf = device.CreateBuffer(&bd);
+            wgpu::TexelCopyTextureInfo src{};
+            src.texture = target.texture;
+            wgpu::TexelCopyBufferInfo dst{};
+            dst.buffer = digest_buf;
+            dst.layout.bytesPerRow = digest_padded_row;
+            dst.layout.rowsPerImage = digest_h;
+            wgpu::Extent3D extent{digest_w, digest_h, 1};
+            e.enc.CopyTextureToBuffer(&src, &dst, &extent);
+        }
         if (target.blit) encode_blit(e.enc, target.canvas_view);
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
@@ -3922,6 +3944,7 @@ struct NativeExecutor::Impl {
         queue.Submit(1, &cb);
         timer_collect(e);
         start_recorded_readbacks(true);
+        if (digest_buf) write_frame_digest(digest_buf, digest_padded_row, digest_w, digest_h, digest_format);
         ++frame_count;
         ++stats.frames_submitted;
         const uint64_t tp2 = now_ns();
@@ -3932,6 +3955,26 @@ struct NativeExecutor::Impl {
         early_flushed = false;
         reset_frame_state();
     }
+
+    // frame_digest_path: the replay digest of the frame just submitted (see ExecutorOptions).
+    void write_frame_digest(wgpu::Buffer& buf, uint32_t padded_row, uint32_t w, uint32_t h, wgpu::TextureFormat f) {
+        std::string err;
+        const uint64_t size = uint64_t{padded_row} * h;
+        if (!map_read(buf, size, &err)) {
+            std::fprintf(stderr, "[native_exec] frame %llu digest: %s\n", static_cast<unsigned long long>(frame_count),
+                         err.c_str());
+            return;
+        }
+        const auto* mapped = static_cast<const uint8_t*>(buf.GetConstMappedRange(0, static_cast<size_t>(size)));
+        std::vector<uint8_t> px(size_t{w} * 4 * h);
+        for (uint32_t y = 0; y < h; ++y) std::memcpy(px.data() + size_t{w} * 4 * y, mapped + size_t{padded_row} * y, size_t{w} * 4);
+        buf.Unmap();
+        if (!digest_out.is_open()) digest_out.open(options.frame_digest_path, std::ios::binary | std::ios::app);
+        digest_out << "digest frame " << frame_count << ": " << replay_digest(px.data(), w, h) << " " << w << "x" << h
+                   << " " << format_name(f) << "\n";
+        digest_out.flush();
+    }
+    std::ofstream digest_out;
 
     // ---- read-back helpers ----
 
