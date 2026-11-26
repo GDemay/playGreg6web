@@ -1,14 +1,25 @@
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <span>
 #include <string>
+#include <system_error>
 #include <vector>
+
+#ifndef __EMSCRIPTEN__
+#ifdef _WIN32
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
+#endif
 
 #include "abi/playgta6_abi.h"
 #include <thread>
@@ -415,6 +426,8 @@ enum class Scenario {
     O42PostPresentBatch,
     O42PostPresentFault,
     O42PostPresentConcurrent,
+    DeepTrapWithRegs,
+    OffThreadTrapWithRegs,
 };
 
 // HostCallable: the entry calls a named host callable (like a COM method) twice.
@@ -760,6 +773,45 @@ void sub_entry(GuestState* s) {
             }
             for (std::thread& t : workers) {
                 t.join();
+            }
+            reg(s, GuestReg::Rax) = 0;
+            ret(s);
+            return;
+        }
+        case Scenario::DeepTrapWithRegs: {
+            // 5 verified call-site return addresses (frame[4] is distinct to check the 4-frame cap).
+            push(s, kEntryCallsIat);   // frame[4]: sub_140001000+0x30 (must be omitted from callers=)
+            push(s, kEntryCallsMid);   // frame[3]: sub_140001000+0x10
+            push(s, kMidCallsLeaf);    // frame[2]: sub_140001100+0x20
+            push(s, kEntryCallsMid);   // frame[1]: sub_140001000+0x10
+            push(s, kMidCallsLeaf);    // frame[0]: sub_140001100+0x20
+            reg(s, GuestReg::Rax) = 0x1111222233334444ULL;
+            reg(s, GuestReg::Rcx) = 0x2222333344445555ULL;
+            reg(s, GuestReg::Rdx) = 0x3333444455556666ULL;
+            reg(s, GuestReg::R8) = 0x88889999aaaabbbbULL;
+            reg(s, GuestReg::R9) = 0x9999aaaabbbbccccULL;
+            reg(s, GuestReg::Rbx) = 0xbbbbccccddddeeeeULL;
+            reg(s, GuestReg::Rsi) = 0x5151515151515151ULL;
+            reg(s, GuestReg::Rdi) = 0xd1d1d1d1d1d1d1d1ULL;
+            __playgta6_trap(s, kLeaf + 4);
+        }
+        case Scenario::OffThreadTrapWithRegs: {
+            std::thread([] {
+                GuestState& state = com::current_guest_state();
+                push(&state, kEntryCallsMid);  // frame[1]
+                push(&state, kMidCallsLeaf);   // frame[0]
+                reg(&state, GuestReg::Rax) = 0x1010101010101010ULL;
+                reg(&state, GuestReg::Rcx) = 0x2020202020202020ULL;
+                reg(&state, GuestReg::Rdx) = 0x3030303030303030ULL;
+                reg(&state, GuestReg::R8) = 0x8080808080808080ULL;
+                reg(&state, GuestReg::R9) = 0x9090909090909090ULL;
+                reg(&state, GuestReg::Rbx) = 0xb0b0b0b0b0b0b0b0ULL;
+                reg(&state, GuestReg::Rsi) = 0x5050505050505050ULL;
+                reg(&state, GuestReg::Rdi) = 0xd0d0d0d0d0d0d0d0ULL;
+                __playgta6_trap(&state, kLeaf + 4);
+            }).detach();
+            for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
             }
             reg(s, GuestReg::Rax) = 0;
             ret(s);
@@ -2246,6 +2298,240 @@ void test_lockfree_dispatch_observer() {
     }
 }
 
+#ifndef __EMSCRIPTEN__
+struct ScopedStderrCapture {
+    int saved_fd = -1;
+    std::filesystem::path temp_path;
+
+    ScopedStderrCapture() {
+        std::fflush(stderr);
+        const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+        temp_path = std::filesystem::temp_directory_path() /
+                    ("playgta6_fault_log_test_" + std::to_string(tick) + ".log");
+        FILE* f = std::fopen(temp_path.string().c_str(), "wb");
+        if (f == nullptr) {
+            return;
+        }
+#ifdef _WIN32
+        saved_fd = _dup(_fileno(stderr));
+        if (saved_fd >= 0) {
+            _dup2(_fileno(f), _fileno(stderr));
+        }
+#else
+        saved_fd = dup(fileno(stderr));
+        if (saved_fd >= 0) {
+            dup2(fileno(f), fileno(stderr));
+        }
+#endif
+        std::fclose(f);
+    }
+
+    std::string read_flushed() const {
+        std::string content;
+        if (temp_path.empty()) {
+            return content;
+        }
+        if (FILE* f = std::fopen(temp_path.string().c_str(), "rb")) {
+            char buf[4096];
+            size_t n = 0;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) {
+                content.append(buf, n);
+            }
+            std::fclose(f);
+        }
+        return content;
+    }
+
+    std::string finish() {
+        if (saved_fd >= 0) {
+            std::fflush(stderr);
+#ifdef _WIN32
+            _dup2(saved_fd, _fileno(stderr));
+            _close(saved_fd);
+#else
+            dup2(saved_fd, fileno(stderr));
+            close(saved_fd);
+#endif
+            saved_fd = -1;
+        }
+        std::string content = read_flushed();
+        if (!temp_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(temp_path, ec);
+            temp_path.clear();
+        }
+        return content;
+    }
+
+    ~ScopedStderrCapture() {
+        if (saved_fd >= 0 || !temp_path.empty()) {
+            (void)finish();
+        }
+    }
+};
+
+std::string find_log_line(const std::string& logs, const std::string& prefix) {
+    size_t pos = 0;
+    while (pos < logs.size()) {
+        size_t end = logs.find('\n', pos);
+        if (end == std::string::npos) {
+            end = logs.size();
+        }
+        std::string line = logs.substr(pos, end - pos);
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        if (line.rfind(prefix, 0) == 0) {
+            return line;
+        }
+        pos = end + 1;
+    }
+    return {};
+}
+#endif
+
+// #663: sanitized `[fault]` backward compatibility + `callers=` (up to 4 frames) + `[fault-regs]`
+// integer GPR summary, including off-thread trap flush before `off_thread_fault`.
+void test_fault_log_gprs_and_callers() {
+#ifndef __EMSCRIPTEN__
+    const std::vector<uint8_t> saved = g_image;
+
+    // 1. 5-frame trap without .pdata (stack-scan-call-verified): verify `[fault]` keeps existing
+    //    fields intact, appends `callers=` capped at 4 frames, and logs `[fault-regs]` with exact
+    //    integer register values.
+    {
+        g_image = build_image(true, kBase, {kCallback1, kCallback2}, 0xA0, /*with_pdata=*/false);
+        ScopedStderrCapture capture;
+        const Run run = boot_scenario(Scenario::DeepTrapWithRegs, [](BootConfig& cfg) {
+            cfg.log_progress = true;
+            cfg.fault_record = true;
+        });
+        const std::string logs = capture.finish();
+        g_image = saved;
+
+        CHECK(run.result.status == BootStatus::Fault);
+        CHECK(run.report["backtrace"]["frames"].items.size() == 5);
+        const std::string fault_line = find_log_line(logs, "[fault] ");
+        const std::string regs_line = find_log_line(logs, "[fault-regs] ");
+        CHECK(!fault_line.empty());
+        CHECK(!regs_line.empty());
+
+        // Backward-compatible fields on `[fault]`.
+        CHECK(fault_line.find("[fault] trap rip=0x") == 0);
+        CHECK(fault_line.find(" target=0x140001184 fn=sub_140001180+0x4 thread=") != std::string::npos);
+        CHECK(fault_line.find("ms caller=sub_140001100+0x20 ") != std::string::npos);
+        // Up to 4 frames in `callers=`, 5th frame (`sub_140001000+0x30`) omitted.
+        CHECK(fault_line.find(
+                  " callers=sub_140001100+0x20,sub_140001000+0x10,sub_140001100+0x20,sub_140001000+0x10") !=
+              std::string::npos);
+        CHECK(fault_line.find("sub_140001000+0x30") == std::string::npos);
+
+        // Exact `[fault-regs]` ordering & values (including captured rsp from report).
+        const uint64_t expected_rsp = run.report["registers"]["rsp"].hex();
+        char expected_regs[384];
+        std::snprintf(expected_regs, sizeof(expected_regs),
+                      "[fault-regs] rax=0x1111222233334444 rcx=0x2222333344445555 rdx=0x3333444455556666"
+                      " r8=0x88889999aaaabbbb r9=0x9999aaaabbbbcccc rsp=0x%" PRIx64
+                      " rbx=0xbbbbccccddddeeee rsi=0x5151515151515151 rdi=0xd1d1d1d1d1d1d1d1",
+                      expected_rsp);
+        CHECK(regs_line == expected_regs);
+    }
+
+    // 2. Standard 2-frame `.pdata` trap: `caller=` and 2-entry `callers=` + `[fault-regs]`.
+    {
+        ScopedStderrCapture capture;
+        const Run run = boot_scenario(Scenario::Trap, [](BootConfig& cfg) {
+            cfg.log_progress = true;
+            cfg.fault_record = true;
+        });
+        const std::string logs = capture.finish();
+        CHECK(run.result.status == BootStatus::Fault);
+        const std::string fault_line = find_log_line(logs, "[fault] ");
+        const std::string regs_line = find_log_line(logs, "[fault-regs] ");
+        CHECK(fault_line.find(" caller=sub_140001100+0x20 callers=sub_140001100+0x20,sub_140001000+0x10") !=
+              std::string::npos);
+        CHECK(regs_line.rfind("[fault-regs] rax=0x", 0) == 0);
+    }
+
+    // 3. Off-thread trap: both `[fault]` and `[fault-regs]` must be flushed BEFORE `off_thread_fault` runs.
+    {
+        g_image = build_image(true, kBase, {}, 0xA0, /*with_pdata=*/false);
+        g_off_thread_reported = false;
+        g_off_thread_report.clear();
+        static ScopedStderrCapture* active_capture = nullptr;
+        static std::string flushed_before_hook;
+        flushed_before_hook.clear();
+        ScopedStderrCapture capture;
+        active_capture = &capture;
+        const Run run = boot_scenario(Scenario::OffThreadTrapWithRegs, [](BootConfig& cfg) {
+            cfg.log_progress = true;
+            cfg.fault_record = true;
+            cfg.off_thread_fault = [] {
+                if (active_capture != nullptr) {
+                    flushed_before_hook = active_capture->read_flushed();
+                }
+                g_off_thread_report = last_report_json();
+                g_off_thread_reported = true;
+                for (;;) {
+                    std::this_thread::sleep_for(std::chrono::hours(1));
+                }
+            };
+        });
+        active_capture = nullptr;
+        (void)capture.finish();
+        g_image = saved;
+        (void)run;
+
+        CHECK(g_off_thread_reported.load());
+        const std::string fault_line = find_log_line(flushed_before_hook, "[fault] ");
+        const std::string regs_line = find_log_line(flushed_before_hook, "[fault-regs] ");
+        CHECK(!fault_line.empty());
+        CHECK(!regs_line.empty());
+        CHECK(fault_line.find(" target=0x140001184 fn=sub_140001180+0x4 thread=") != std::string::npos);
+        CHECK(fault_line.find(" caller=sub_140001100+0x20 callers=sub_140001100+0x20,sub_140001000+0x10") !=
+              std::string::npos);
+        CHECK(regs_line.find("rax=0x1010101010101010 rcx=0x2020202020202020 rdx=0x3030303030303030"
+                             " r8=0x8080808080808080 r9=0x9090909090909090 rsp=0x") != std::string::npos);
+        CHECK(regs_line.find(" rbx=0xb0b0b0b0b0b0b0b0 rsi=0x5050505050505050 rdi=0xd0d0d0d0d0d0d0d0") !=
+              std::string::npos);
+    }
+
+    // 4. `fault_record = false`: neither `[fault]` nor `[fault-regs]` is emitted.
+    {
+        ScopedStderrCapture capture;
+        const Run run = boot_scenario(Scenario::Trap, [](BootConfig& cfg) {
+            cfg.log_progress = true;
+            cfg.fault_record = false;
+        });
+        const std::string logs = capture.finish();
+        CHECK(run.result.status == BootStatus::Fault);
+        CHECK(find_log_line(logs, "[fault] ").empty());
+        CHECK(find_log_line(logs, "[fault-regs] ").empty());
+    }
+
+    // 5. Fault without guest registers (`report_host_fault` with no active thread): `[fault]` has
+    //    `rip=0x0` and no `[fault-regs]` line is emitted.
+    {
+        const Run run = boot_scenario(Scenario::ReturnCode, [](BootConfig& cfg) {
+            cfg.log_progress = true;
+            cfg.fault_record = true;
+        });
+        CHECK(run.result.status == BootStatus::Exited);
+        GuestThreadContext* prev = activate_guest_thread(nullptr);
+        ScopedStderrCapture capture;
+        const auto host_mid = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&sub_mid));
+        CHECK(report_host_fault("host_access_violation", 0xDEAD0000, host_mid));
+        const std::string logs = capture.finish();
+        activate_guest_thread(prev);
+
+        const std::string fault_line = find_log_line(logs, "[fault] ");
+        const std::string regs_line = find_log_line(logs, "[fault-regs] ");
+        CHECK(fault_line.find("[fault] host_access_violation rip=0x0 target=0x140001100 fn=sub_140001100+0x0") == 0);
+        CHECK(regs_line.empty());
+    }
+#endif
+}
+
 }  // namespace
 
 void test_minidump_paths() {
@@ -2291,6 +2577,7 @@ int main() {
     test_boot_options_and_report_sink();
     test_fence_lag_and_present_max_interval();
     test_lockfree_dispatch_observer();
+    test_fault_log_gprs_and_callers();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);
