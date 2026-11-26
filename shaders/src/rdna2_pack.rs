@@ -18,7 +18,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{self, Write as _};
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -27,9 +28,11 @@ use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
 use crate::pack::{
     PACK_ENTRY_BYTES, PACK_ENTRY_BYTES_V2, PACK_HEADER_BYTES, PACK_VERSION_V1, PACK_VERSION_V2,
-    PackEntry, PackError, PackVersion, resolve_pack_layout, write_json_string,
+    PackEntry, PackError, PackVersion, ResolvedPackLayout, TocEntry,
+    checked_table_data_start_for_version, encode_pack_toc, resolve_pack_layout, write_json_string,
     write_pack_with_layout_versioned,
 };
+use crate::reflect::{SidecarBuildOptions, SidecarStageInput, StageReflectionSidecar};
 use crate::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
     WgslVertexInputInfo, translate_rdna2_to_wgsl, write_mesh_output_json, write_wgsl_bindings_json,
@@ -2439,6 +2442,1243 @@ pub fn pack_rdna2_sources_to_file(
     let result = pack_rdna2_sources(input_dir, manifest_path, options)?;
     write_pack_bytes_to_file(out_path, &result.pack_bytes)?;
     Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// S71 (#1742, Refs #482, #651, #663): Auto-WGPK-v2 Policy, Zero-OOM Streaming
+// WGPK v1/v2 Writer, and Sidecar v3 Stage Completeness
+// ---------------------------------------------------------------------------
+
+/// Default 4 GiB WGPK v1 byte ceiling (`u32::MAX`) above which `PackVersion::Auto` upgrades to v2.
+pub const DEFAULT_AUTO_V2_THRESHOLD_BYTES: u64 = u32::MAX as u64;
+
+/// Recommended safety margin below 4 GiB (64 MiB) for proactive auto-WGPK-v2 selection when
+/// packing multi-GB shader archives.
+pub const DEFAULT_AUTO_V2_SAFETY_MARGIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Fixed streaming I/O copy buffer size (64 KiB) used when flushing spilled WGSL payloads to disk
+/// so peak RAM stays O(1) during final archive assembly even for 8+ GiB packs.
+const STREAMING_COPY_BUF_BYTES: usize = 64 * 1024;
+
+/// Default maximum number of shaders translated concurrently in one streaming batch before
+/// spilling WGSL payloads to the temporary data file and freeing RAM.
+pub const DEFAULT_STREAMING_BATCH_SIZE: usize = 64;
+
+/// Configurable threshold and margin controlling automatic WGPK v1 -> v2 upgrade when
+/// `PackVersion::Auto` is selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoVersionPolicy {
+    /// Maximum total WGPK v1 archive size (header + TOC + payloads) before upgrading to WGPK v2.
+    /// Clamped to `u32::MAX` (`4_294_967_295` bytes).
+    pub v2_threshold_bytes: u64,
+    /// Safety margin subtracted from `v2_threshold_bytes` so packs approaching 4 GiB upgrade to
+    /// WGPK v2 proactively.
+    pub v2_margin_bytes: u64,
+}
+
+impl Default for AutoVersionPolicy {
+    fn default() -> Self {
+        Self {
+            v2_threshold_bytes: DEFAULT_AUTO_V2_THRESHOLD_BYTES,
+            v2_margin_bytes: 0,
+        }
+    }
+}
+
+impl AutoVersionPolicy {
+    /// Policy with an explicit threshold (useful for custom pack ceilings and synthetic tests).
+    pub const fn with_threshold(v2_threshold_bytes: u64) -> Self {
+        Self {
+            v2_threshold_bytes,
+            v2_margin_bytes: 0,
+        }
+    }
+
+    /// Production 4 GiB policy with a safety margin (e.g. `DEFAULT_AUTO_V2_SAFETY_MARGIN_BYTES`).
+    pub const fn with_safety_margin(v2_margin_bytes: u64) -> Self {
+        Self {
+            v2_threshold_bytes: DEFAULT_AUTO_V2_THRESHOLD_BYTES,
+            v2_margin_bytes,
+        }
+    }
+
+    /// Effective byte ceiling for selecting WGPK v1 under `PackVersion::Auto`.
+    pub const fn effective_v1_limit(self) -> u64 {
+        let clamped = if self.v2_threshold_bytes > DEFAULT_AUTO_V2_THRESHOLD_BYTES {
+            DEFAULT_AUTO_V2_THRESHOLD_BYTES
+        } else {
+            self.v2_threshold_bytes
+        };
+        clamped.saturating_sub(self.v2_margin_bytes)
+    }
+}
+
+/// Resolve the WGPK container version (`1` or `2`) and exact header/TOC/total byte layout using
+/// `policy` whenever `requested == PackVersion::Auto`.
+///
+/// * `PackVersion::Auto`: chooses v1 iff `v1_total <= policy.effective_v1_limit()` and
+///   `entry_count <= u32::MAX`; otherwise upgrades automatically to WGPK v2 (24-byte TOC, 64-bit offsets).
+/// * `PackVersion::V1`: enforces `u32::MAX` hard limit.
+/// * `PackVersion::V2`: always uses WGPK v2.
+pub fn resolve_auto_pack_layout(
+    requested: PackVersion,
+    entry_count: usize,
+    total_payload_bytes: u64,
+    policy: AutoVersionPolicy,
+) -> Result<ResolvedPackLayout, PackError> {
+    let count_u32 = u32::try_from(entry_count)
+        .map_err(|_| PackError::Overflow("entry count exceeds u32::MAX".to_string()))?;
+    let v1_table = u64::from(count_u32) * (PACK_ENTRY_BYTES as u64);
+    let v1_data_start = (PACK_HEADER_BYTES as u64) + v1_table;
+    let v1_total = v1_data_start.checked_add(total_payload_bytes);
+
+    match requested {
+        PackVersion::V1 => resolve_pack_layout(PackVersion::V1, entry_count, total_payload_bytes),
+        PackVersion::V2 => resolve_pack_layout(PackVersion::V2, entry_count, total_payload_bytes),
+        PackVersion::Auto => {
+            let v1_limit = policy.effective_v1_limit();
+            if let Some(total) = v1_total
+                && total <= v1_limit
+            {
+                Ok(ResolvedPackLayout {
+                    version: PACK_VERSION_V1,
+                    entry_bytes: PACK_ENTRY_BYTES,
+                    data_start: v1_data_start,
+                    total_size: total,
+                })
+            } else {
+                resolve_pack_layout(PackVersion::V2, entry_count, total_payload_bytes)
+            }
+        }
+    }
+}
+
+/// Summary returned by [`StreamingWgpkWriter::finish`] and [`write_wgpk_entries_streaming`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamingWriteSummary {
+    pub version: u32,
+    pub flags: u32,
+    pub entry_count: usize,
+    pub data_start: u64,
+    pub total_bytes: u64,
+    pub total_payload_bytes: u64,
+    pub toc_entries: Vec<TocEntry>,
+}
+
+/// Zero-OOM streaming WGPK v1/v2 archive writer operating directly on any `Write + Seek` sink
+/// (such as `BufWriter<File>` or `Cursor<Vec<u8>>`).
+///
+/// Reserves the exact 16-byte header + TOC region (`data_start` bytes) up front, streams each
+/// WGSL entry payload sequentially to the sink without retaining payload bytes in RAM, enforces
+/// strictly ascending canonical 64-bit hash order, and rewinds to offset `0` in [`Self::finish`]
+/// to write the finalized WGPK v1 or v2 header and TOC.
+pub struct StreamingWgpkWriter<W: Write + Seek> {
+    writer: W,
+    version: u32,
+    flags: u32,
+    expected_entries: usize,
+    data_start: u64,
+    current_offset: u64,
+    total_payload_bytes: u64,
+    prev_hash: Option<u64>,
+    toc_entries: Vec<TocEntry>,
+}
+
+impl<W: Write + Seek> StreamingWgpkWriter<W> {
+    /// Start a streaming WGPK write using a pre-resolved [`ResolvedPackLayout`].
+    ///
+    /// Writes a zeroed header+TOC reservation of `layout.data_start` bytes so payloads stream
+    /// directly starting at `layout.data_start` without keeping payload bytes in memory.
+    pub fn begin_with_layout(
+        mut writer: W,
+        flags: u32,
+        layout: ResolvedPackLayout,
+        expected_entries: usize,
+    ) -> Result<Self, Rdna2PackError> {
+        let data_start = checked_table_data_start_for_version(layout.version, expected_entries)
+            .map_err(Rdna2PackError::Pack)?;
+        if data_start != layout.data_start {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "layout data_start mismatch: expected {data_start}, got {}",
+                layout.data_start
+            ))));
+        }
+
+        // Reserve header + TOC bytes sequentially using a small fixed zero buffer.
+        writer
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| Rdna2PackError::Io(format!("failed to seek stream start: {}", e.kind())))?;
+        let zero_chunk = [0u8; 4096];
+        let mut remaining = data_start;
+        while remaining > 0 {
+            let n = remaining.min(zero_chunk.len() as u64) as usize;
+            writer.write_all(&zero_chunk[..n]).map_err(|e| {
+                Rdna2PackError::Io(format!("failed to reserve WGPK TOC space: {}", e.kind()))
+            })?;
+            remaining -= n as u64;
+        }
+
+        Ok(Self {
+            writer,
+            version: layout.version,
+            flags,
+            expected_entries,
+            data_start,
+            current_offset: data_start,
+            total_payload_bytes: 0,
+            prev_hash: None,
+            toc_entries: Vec::with_capacity(expected_entries),
+        })
+    }
+
+    /// Start a streaming WGPK write with automatic v1/v2 selection via [`resolve_auto_pack_layout`].
+    pub fn begin_auto(
+        writer: W,
+        flags: u32,
+        requested_version: PackVersion,
+        policy: AutoVersionPolicy,
+        expected_entries: usize,
+        projected_payload_bytes: u64,
+    ) -> Result<Self, Rdna2PackError> {
+        let layout = resolve_auto_pack_layout(
+            requested_version,
+            expected_entries,
+            projected_payload_bytes,
+            policy,
+        )
+        .map_err(Rdna2PackError::Pack)?;
+        Self::begin_with_layout(writer, flags, layout, expected_entries)
+    }
+
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    pub fn entries_written(&self) -> usize {
+        self.toc_entries.len()
+    }
+
+    pub const fn bytes_written(&self) -> u64 {
+        self.current_offset
+    }
+
+    /// Stream one shader payload directly to the underlying sink.
+    ///
+    /// Enforces strictly ascending canonical `hash` order, valid UTF-8 payload, exact entry count
+    /// bounds, and v1 `u32::MAX` / v2 `u64::MAX` offset checks.
+    pub fn write_entry(
+        &mut self,
+        hash: u64,
+        stage: ShaderStage,
+        wgsl_bytes: &[u8],
+    ) -> Result<TocEntry, Rdna2PackError> {
+        let entry_index = self.toc_entries.len();
+        if entry_index >= self.expected_entries {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "streaming writer exceeded reserved entry count ({})",
+                self.expected_entries
+            ))));
+        }
+
+        if let Some(previous_hash) = self.prev_hash {
+            if hash == previous_hash {
+                return Err(Rdna2PackError::Pack(PackError::DuplicateHash {
+                    first_index: entry_index - 1,
+                    second_index: entry_index,
+                    hash,
+                }));
+            }
+            if hash < previous_hash {
+                return Err(Rdna2PackError::Pack(PackError::NonCanonicalOrder {
+                    entry_index,
+                    previous_hash,
+                    hash,
+                }));
+            }
+        }
+
+        if let Err(err) = std::str::from_utf8(wgsl_bytes) {
+            return Err(Rdna2PackError::Pack(PackError::InvalidUtf8 {
+                entry_index,
+                detail: err.to_string(),
+            }));
+        }
+
+        let length = u32::try_from(wgsl_bytes.len()).map_err(|_| {
+            Rdna2PackError::Pack(PackError::Overflow(format!(
+                "entry {entry_index} payload length {} exceeds u32::MAX",
+                wgsl_bytes.len()
+            )))
+        })?;
+        let offset = self.current_offset;
+        let next_offset = offset.checked_add(u64::from(length)).ok_or_else(|| {
+            Rdna2PackError::Pack(PackError::Overflow(format!(
+                "entry {entry_index} payload [{offset}..+{length}] overflows u64"
+            )))
+        })?;
+        if self.version == PACK_VERSION_V1 && next_offset > u64::from(u32::MAX) {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "WGPK v1 entry {entry_index} payload [{offset}..+{length}] exceeds u32::MAX"
+            ))));
+        }
+
+        self.writer.write_all(wgsl_bytes).map_err(|e| {
+            Rdna2PackError::Io(format!(
+                "failed to stream WGSL payload for entry {entry_index}: {}",
+                e.kind()
+            ))
+        })?;
+
+        let toc = TocEntry {
+            hash,
+            stage,
+            offset,
+            length,
+        };
+        self.toc_entries.push(toc);
+        self.prev_hash = Some(hash);
+        self.current_offset = next_offset;
+        self.total_payload_bytes = self.total_payload_bytes.saturating_add(u64::from(length));
+        Ok(toc)
+    }
+
+    /// Stream one shader payload from any [`Read`] source of exact byte length `length` using a
+    /// fixed 64 KiB stack/heap copy buffer (never allocates a full-entry buffer for huge payloads).
+    pub fn write_entry_from_reader<R: Read>(
+        &mut self,
+        hash: u64,
+        stage: ShaderStage,
+        length: u32,
+        mut reader: R,
+    ) -> Result<TocEntry, Rdna2PackError> {
+        let entry_index = self.toc_entries.len();
+        if entry_index >= self.expected_entries {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "streaming writer exceeded reserved entry count ({})",
+                self.expected_entries
+            ))));
+        }
+        if let Some(previous_hash) = self.prev_hash {
+            if hash == previous_hash {
+                return Err(Rdna2PackError::Pack(PackError::DuplicateHash {
+                    first_index: entry_index - 1,
+                    second_index: entry_index,
+                    hash,
+                }));
+            }
+            if hash < previous_hash {
+                return Err(Rdna2PackError::Pack(PackError::NonCanonicalOrder {
+                    entry_index,
+                    previous_hash,
+                    hash,
+                }));
+            }
+        }
+
+        let offset = self.current_offset;
+        let next_offset = offset.checked_add(u64::from(length)).ok_or_else(|| {
+            Rdna2PackError::Pack(PackError::Overflow(format!(
+                "entry {entry_index} payload [{offset}..+{length}] overflows u64"
+            )))
+        })?;
+        if self.version == PACK_VERSION_V1 && next_offset > u64::from(u32::MAX) {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "WGPK v1 entry {entry_index} payload [{offset}..+{length}] exceeds u32::MAX"
+            ))));
+        }
+
+        let mut copy_buf = [0u8; STREAMING_COPY_BUF_BYTES];
+        let mut remaining = length as usize;
+        while remaining > 0 {
+            let chunk_len = remaining.min(copy_buf.len());
+            reader.read_exact(&mut copy_buf[..chunk_len]).map_err(|e| {
+                Rdna2PackError::Io(format!(
+                    "failed to read spilled payload for entry {entry_index}: {}",
+                    e.kind()
+                ))
+            })?;
+            self.writer.write_all(&copy_buf[..chunk_len]).map_err(|e| {
+                Rdna2PackError::Io(format!(
+                    "failed to stream payload for entry {entry_index}: {}",
+                    e.kind()
+                ))
+            })?;
+            remaining -= chunk_len;
+        }
+
+        let toc = TocEntry {
+            hash,
+            stage,
+            offset,
+            length,
+        };
+        self.toc_entries.push(toc);
+        self.prev_hash = Some(hash);
+        self.current_offset = next_offset;
+        self.total_payload_bytes = self.total_payload_bytes.saturating_add(u64::from(length));
+        Ok(toc)
+    }
+
+    /// Seek back to offset `0`, write the canonical WGPK v1 or v2 header + TOC, and flush.
+    pub fn finish(mut self) -> Result<StreamingWriteSummary, Rdna2PackError> {
+        if self.toc_entries.len() != self.expected_entries {
+            return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
+                "streaming writer finished with {} entries, expected {}",
+                self.toc_entries.len(),
+                self.expected_entries
+            ))));
+        }
+
+        let toc_bytes = encode_pack_toc(self.version, self.flags, &self.toc_entries)
+            .map_err(Rdna2PackError::Pack)?;
+        debug_assert_eq!(toc_bytes.len() as u64, self.data_start);
+
+        self.writer
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| Rdna2PackError::Io(format!("failed to seek to WGPK header: {}", e.kind())))?;
+        self.writer.write_all(&toc_bytes).map_err(|e| {
+            Rdna2PackError::Io(format!("failed to write WGPK header/TOC: {}", e.kind()))
+        })?;
+        self.writer
+            .flush()
+            .map_err(|e| Rdna2PackError::Io(format!("failed to flush WGPK stream: {}", e.kind())))?;
+
+        Ok(StreamingWriteSummary {
+            version: self.version,
+            flags: self.flags,
+            entry_count: self.toc_entries.len(),
+            data_start: self.data_start,
+            total_bytes: self.current_offset,
+            total_payload_bytes: self.total_payload_bytes,
+            toc_entries: self.toc_entries,
+        })
+    }
+}
+
+/// Stream a slice of [`PackEntry`] values directly to any `Write + Seek` sink in canonical
+/// ascending 64-bit hash order, using [`AutoVersionPolicy`] to select WGPK v1 vs v2 automatically.
+pub fn write_wgpk_entries_streaming<W: Write + Seek>(
+    writer: W,
+    entries: &[PackEntry],
+    flags: u32,
+    requested_version: PackVersion,
+    policy: AutoVersionPolicy,
+) -> Result<StreamingWriteSummary, Rdna2PackError> {
+    let mut order: Vec<usize> = (0..entries.len()).collect();
+    order.sort_unstable_by_key(|&idx| entries[idx].hash);
+
+    // Reject duplicate hashes before touching the sink.
+    for pair in order.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if entries[a].hash == entries[b].hash {
+            return Err(Rdna2PackError::Pack(PackError::DuplicateHash {
+                first_index: a.min(b),
+                second_index: a.max(b),
+                hash: entries[a].hash,
+            }));
+        }
+    }
+
+    let mut total_payload_bytes = 0u64;
+    for &idx in &order {
+        let len = entries[idx].wgsl.len();
+        let len_u32 = u32::try_from(len).map_err(|_| {
+            Rdna2PackError::Pack(PackError::Overflow(format!(
+                "entry {idx} payload length {len} exceeds u32::MAX"
+            )))
+        })?;
+        total_payload_bytes = total_payload_bytes
+            .checked_add(u64::from(len_u32))
+            .ok_or_else(|| {
+                Rdna2PackError::Pack(PackError::Overflow(
+                    "total payload size overflows u64".to_string(),
+                ))
+            })?;
+    }
+
+    let mut stream = StreamingWgpkWriter::begin_auto(
+        writer,
+        flags,
+        requested_version,
+        policy,
+        order.len(),
+        total_payload_bytes,
+    )?;
+    for &idx in &order {
+        let entry = &entries[idx];
+        stream.write_entry(entry.hash, entry.stage, entry.wgsl.as_bytes())?;
+    }
+    stream.finish()
+}
+
+/// Options controlling zero-OOM streaming batch packing (`pack_rdna2_*_streaming_to_file`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rdna2StreamingOptions {
+    pub pack: Rdna2PackOptions,
+    /// Policy for automatic WGPK v1 -> v2 upgrade when `pack.pack_version == PackVersion::Auto`.
+    pub auto_version_policy: AutoVersionPolicy,
+    /// Maximum shaders translated per memory-bounded batch before spilling WGSL to disk.
+    pub batch_size: usize,
+}
+
+impl Default for Rdna2StreamingOptions {
+    fn default() -> Self {
+        Self {
+            pack: Rdna2PackOptions::default(),
+            auto_version_policy: AutoVersionPolicy::default(),
+            batch_size: DEFAULT_STREAMING_BATCH_SIZE,
+        }
+    }
+}
+
+/// Result of zero-OOM streaming batch packing to disk (holds ZERO WGSL payload bytes in RAM).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rdna2StreamingPackSummary {
+    pub summary: Rdna2PackSummary,
+    /// Exact written `.wgsl.pack` file size in bytes (64-bit safe even on >4 GiB archives).
+    pub pack_bytes_u64: u64,
+    /// Finalized TOC entries written to the archive in canonical ascending hash order.
+    pub toc_entries: Vec<TocEntry>,
+    /// `true` when `PackVersion::Auto` upgraded this archive from WGPK v1 to WGPK v2.
+    pub auto_upgraded_to_v2: bool,
+    /// Peak WGSL bytes held in RAM during any single translation batch.
+    pub peak_batch_wgsl_bytes: usize,
+}
+
+/// RAII cleanup guard ensuring temporary payload spill files are always deleted on exit.
+struct TempSpillGuard {
+    path: PathBuf,
+}
+
+impl Drop for TempSpillGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+struct SpilledCandidate {
+    source_order: usize,
+    stage: ShaderStage,
+    spill_offset: u64,
+    wgsl_len: u32,
+    entry_summary: Rdna2PackEntrySummary,
+}
+
+struct StreamingSpillState {
+    spill_writer: BufWriter<File>,
+    spill_cursor: u64,
+    candidates_by_hash: BTreeMap<u64, SpilledCandidate>,
+    next_source_order: usize,
+    total_blobs: usize,
+    skipped_or_failed: usize,
+    failed: usize,
+    manifest_duplicates_skipped: usize,
+    skipped_oversize: usize,
+    skipped_budget: usize,
+    peak_batch_wgsl_bytes: usize,
+    failures: Vec<Rdna2PackFailureSummary>,
+}
+
+impl StreamingSpillState {
+    fn new(spill_file: File) -> Self {
+        Self {
+            spill_writer: BufWriter::with_capacity(STREAMING_COPY_BUF_BYTES, spill_file),
+            spill_cursor: 0,
+            candidates_by_hash: BTreeMap::new(),
+            next_source_order: 0,
+            total_blobs: 0,
+            skipped_or_failed: 0,
+            failed: 0,
+            manifest_duplicates_skipped: 0,
+            skipped_oversize: 0,
+            skipped_budget: 0,
+            peak_batch_wgsl_bytes: 0,
+            failures: Vec::new(),
+        }
+    }
+
+    fn record_spilled(
+        &mut self,
+        hash: u64,
+        source_order: usize,
+        data: TranslatedStageData,
+        options: &Rdna2PackOptions,
+    ) -> Result<(), Rdna2PackError> {
+        let wgsl_len_usize = data.wgsl.len();
+        if let Some(max_wgsl) = options.max_wgsl_bytes
+            && wgsl_len_usize > max_wgsl
+        {
+            self.skipped_oversize += 1;
+            self.skipped_or_failed += 1;
+            return Ok(());
+        }
+        let wgsl_len = u32::try_from(wgsl_len_usize).map_err(|_| {
+            Rdna2PackError::Pack(PackError::Overflow(format!(
+                "shader {} WGSL length {wgsl_len_usize} exceeds u32::MAX",
+                format_shader_hash(hash)
+            )))
+        })?;
+        let spill_offset = self.spill_cursor;
+        self.spill_writer
+            .write_all(data.wgsl.as_bytes())
+            .map_err(|e| {
+                Rdna2PackError::Io(format!("failed to write temporary spill file: {}", e.kind()))
+            })?;
+        self.spill_cursor = self
+            .spill_cursor
+            .checked_add(u64::from(wgsl_len))
+            .ok_or_else(|| {
+                Rdna2PackError::Pack(PackError::Overflow("spill offset overflow".to_string()))
+            })?;
+
+        let (_entry, entry_summary) = data.into_pack_parts(hash);
+        // `PackEntry` (and its `String` payload) is dropped immediately here -> zero payload RAM!
+        self.candidates_by_hash.insert(
+            hash,
+            SpilledCandidate {
+                source_order,
+                stage: entry_summary.stage,
+                spill_offset,
+                wgsl_len,
+                entry_summary,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn finalize_streaming_pack(
+    mut state: StreamingSpillState,
+    spill_path: &Path,
+    out_path: &Path,
+    streaming_opts: &Rdna2StreamingOptions,
+) -> Result<Rdna2StreamingPackSummary, Rdna2PackError> {
+    state.spill_writer.flush().map_err(|e| {
+        Rdna2PackError::Io(format!("failed to flush temporary spill file: {}", e.kind()))
+    })?;
+    drop(state.spill_writer);
+
+    let options = &streaming_opts.pack;
+    let policy = streaming_opts.auto_version_policy;
+
+    let mut priority_rank: HashMap<u64, usize> =
+        HashMap::with_capacity(options.priority_hashes.len());
+    for &hash in &options.priority_hashes {
+        let rank = priority_rank.len();
+        priority_rank.entry(hash).or_insert(rank);
+    }
+    let priority_hashes_requested = priority_rank.len();
+
+    let selected_by_hash: BTreeMap<u64, SpilledCandidate> =
+        if let Some(max_pack) = options.max_pack_bytes {
+            let (effective_budget, entry_record_bytes) = match options.pack_version {
+                PackVersion::V1 => (max_pack.min(u64::from(u32::MAX)), PACK_ENTRY_BYTES as u64),
+                PackVersion::V2 => (max_pack, PACK_ENTRY_BYTES_V2 as u64),
+                PackVersion::Auto => {
+                    let v1_limit = policy.effective_v1_limit();
+                    let all_wgsl: u64 = state
+                        .candidates_by_hash
+                        .values()
+                        .fold(0u64, |acc, c| acc.saturating_add(u64::from(c.wgsl_len)));
+                    let all_v1_size = (PACK_HEADER_BYTES as u64)
+                        .saturating_add(
+                            (state.candidates_by_hash.len() as u64)
+                                .saturating_mul(PACK_ENTRY_BYTES as u64),
+                        )
+                        .saturating_add(all_wgsl);
+                    if max_pack <= v1_limit && all_v1_size <= v1_limit {
+                        (max_pack, PACK_ENTRY_BYTES as u64)
+                    } else if all_v1_size <= v1_limit {
+                        (max_pack, PACK_ENTRY_BYTES as u64)
+                    } else {
+                        (max_pack, PACK_ENTRY_BYTES_V2 as u64)
+                    }
+                }
+            };
+
+            let mut priority_candidates: Vec<(usize, u64, SpilledCandidate)> = Vec::new();
+            let mut regular_candidates: Vec<(u64, SpilledCandidate)> =
+                Vec::with_capacity(state.candidates_by_hash.len());
+            for (hash, cand) in state.candidates_by_hash {
+                if let Some(&rank) = priority_rank.get(&hash) {
+                    priority_candidates.push((rank, hash, cand));
+                } else {
+                    regular_candidates.push((hash, cand));
+                }
+            }
+
+            priority_candidates.sort_by_key(|(rank, ..)| *rank);
+            match options.budget_order {
+                BudgetOrder::HashOrder => {}
+                BudgetOrder::SmallestFirst => {
+                    regular_candidates
+                        .sort_by(|a, b| a.1.wgsl_len.cmp(&b.1.wgsl_len).then_with(|| a.0.cmp(&b.0)));
+                }
+                BudgetOrder::ManifestOrder => {
+                    regular_candidates.sort_by(|a, b| {
+                        a.1.source_order
+                            .cmp(&b.1.source_order)
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                }
+            }
+
+            let mut current_pack_bytes = PACK_HEADER_BYTES as u64;
+            let mut selected: BTreeMap<u64, SpilledCandidate> = BTreeMap::new();
+            for (_rank, hash, cand) in priority_candidates {
+                let entry_cost = entry_record_bytes.saturating_add(u64::from(cand.wgsl_len));
+                let projected = current_pack_bytes.saturating_add(entry_cost);
+                if projected <= effective_budget {
+                    current_pack_bytes = projected;
+                    selected.insert(hash, cand);
+                } else {
+                    state.skipped_budget += 1;
+                    state.skipped_or_failed += 1;
+                }
+            }
+
+            let mut budget_exhausted = false;
+            for (hash, cand) in regular_candidates {
+                let entry_cost = entry_record_bytes.saturating_add(u64::from(cand.wgsl_len));
+                let projected = current_pack_bytes.saturating_add(entry_cost);
+                if !budget_exhausted && projected <= effective_budget {
+                    current_pack_bytes = projected;
+                    selected.insert(hash, cand);
+                } else {
+                    if matches!(
+                        options.budget_order,
+                        BudgetOrder::HashOrder | BudgetOrder::SmallestFirst
+                    ) {
+                        budget_exhausted = true;
+                    }
+                    state.skipped_budget += 1;
+                    state.skipped_or_failed += 1;
+                }
+            }
+            selected
+        } else {
+            state.candidates_by_hash
+        };
+
+    let mut vertex_count = 0usize;
+    let mut pixel_count = 0usize;
+    let mut compute_count = 0usize;
+    let mut largest_wgsl_bytes = 0usize;
+    let mut total_wgsl_bytes = 0u64;
+    let mut priority_hashes_packed = 0usize;
+
+    for (&hash, cand) in &selected_by_hash {
+        if priority_rank.contains_key(&hash) {
+            priority_hashes_packed += 1;
+        }
+        match cand.stage {
+            ShaderStage::Vertex => vertex_count += 1,
+            ShaderStage::Fragment => pixel_count += 1,
+            ShaderStage::Compute => compute_count += 1,
+        }
+        let len = cand.wgsl_len as usize;
+        largest_wgsl_bytes = largest_wgsl_bytes.max(len);
+        total_wgsl_bytes = total_wgsl_bytes.saturating_add(u64::from(cand.wgsl_len));
+    }
+
+    let layout = resolve_auto_pack_layout(
+        options.pack_version,
+        selected_by_hash.len(),
+        total_wgsl_bytes,
+        policy,
+    )
+    .map_err(Rdna2PackError::Pack)?;
+    let auto_upgraded_to_v2 =
+        options.pack_version == PackVersion::Auto && layout.version == PACK_VERSION_V2;
+
+    let out_label = sanitize_source_path(out_path, None);
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            Rdna2PackError::Io(format!(
+                "failed to create output directory for '{out_label}': {}",
+                err.kind()
+            ))
+        })?;
+    }
+    let out_file = File::create(out_path).map_err(|err| {
+        Rdna2PackError::Io(format!(
+            "failed to create WGPK pack '{out_label}': {}",
+            err.kind()
+        ))
+    })?;
+    let out_writer = BufWriter::with_capacity(STREAMING_COPY_BUF_BYTES, out_file);
+    let mut spill_reader = BufReader::with_capacity(
+        STREAMING_COPY_BUF_BYTES,
+        File::open(spill_path).map_err(|err| {
+            Rdna2PackError::Io(format!(
+                "failed to reopen temporary spill file: {}",
+                err.kind()
+            ))
+        })?,
+    );
+
+    let mut stream = StreamingWgpkWriter::begin_with_layout(
+        out_writer,
+        options.pack_flags,
+        layout,
+        selected_by_hash.len(),
+    )?;
+
+    let mut entry_summaries = Vec::with_capacity(selected_by_hash.len());
+    for (hash, cand) in selected_by_hash {
+        spill_reader
+            .seek(SeekFrom::Start(cand.spill_offset))
+            .map_err(|e| {
+                Rdna2PackError::Io(format!("failed to seek spill payload: {}", e.kind()))
+            })?;
+        stream.write_entry_from_reader(hash, cand.stage, cand.wgsl_len, &mut spill_reader)?;
+        entry_summaries.push(cand.entry_summary);
+    }
+
+    let write_summary = stream.finish()?;
+
+    let summary = Rdna2PackSummary {
+        pack_version: write_summary.version,
+        total_blobs: state.total_blobs,
+        translated_ok: entry_summaries.len(),
+        skipped_or_failed: state.skipped_or_failed,
+        failed: state.failed,
+        manifest_duplicates_skipped: state.manifest_duplicates_skipped,
+        budget_order: options.budget_order,
+        skipped_oversize: state.skipped_oversize,
+        skipped_budget: state.skipped_budget,
+        omitted_by_budget: state.skipped_budget,
+        priority_hashes_requested,
+        priority_hashes_packed,
+        largest_wgsl_bytes,
+        total_wgsl_bytes,
+        vertex_count,
+        pixel_count,
+        compute_count,
+        vertex_packed: vertex_count,
+        fragment_packed: pixel_count,
+        compute_packed: compute_count,
+        pack_bytes: usize::try_from(write_summary.total_bytes).unwrap_or(usize::MAX),
+        entries: entry_summaries,
+        failures: state.failures,
+    };
+
+    Ok(Rdna2StreamingPackSummary {
+        summary,
+        pack_bytes_u64: write_summary.total_bytes,
+        toc_entries: write_summary.toc_entries,
+        auto_upgraded_to_v2,
+        peak_batch_wgsl_bytes: state.peak_batch_wgsl_bytes,
+    })
+}
+
+fn create_spill_file(out_path: &Path) -> Result<(PathBuf, File, TempSpillGuard), Rdna2PackError> {
+    let out_label = sanitize_source_path(out_path, None);
+    if let Some(parent) = out_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|err| {
+            Rdna2PackError::Io(format!(
+                "failed to create output directory for '{out_label}': {}",
+                err.kind()
+            ))
+        })?;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let file_name = out_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("pack");
+    let spill_name = format!(".{file_name}.{}.{nanos}.wgpk_spill.tmp", std::process::id());
+    let spill_path = match out_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.join(spill_name),
+        _ => PathBuf::from(spill_name),
+    };
+    let spill_file = File::create(&spill_path).map_err(|err| {
+        Rdna2PackError::Io(format!(
+            "failed to create temporary spill file: {}",
+            err.kind()
+        ))
+    })?;
+    let guard = TempSpillGuard {
+        path: spill_path.clone(),
+    };
+    Ok((spill_path, spill_file, guard))
+}
+
+fn stream_blobs_into_spill(
+    blobs: &[Rdna2BlobInput],
+    options: &Rdna2PackOptions,
+    batch_size: usize,
+    state: &mut StreamingSpillState,
+) -> Result<(), Rdna2PackError> {
+    let source_order_base = state.next_source_order;
+    state.next_source_order = state.next_source_order.saturating_add(blobs.len());
+
+    let mut order: Vec<usize> = (0..blobs.len()).collect();
+    order.sort_by(|&a, &b| {
+        blobs[a]
+            .name
+            .cmp(&blobs[b].name)
+            .then_with(|| blobs[a].bytes.len().cmp(&blobs[b].bytes.len()))
+            .then_with(|| blobs[a].bytes.cmp(&blobs[b].bytes))
+    });
+
+    let chunk_size = batch_size.max(1);
+    for chunk in order.chunks(chunk_size) {
+        let mut chunk_candidates: Vec<BlobCandidate<'_>> = Vec::with_capacity(chunk.len());
+        let mut unique_tasks: Vec<BlobTranslateTask<'_>> = Vec::new();
+        let mut task_uses: Vec<usize> = Vec::new();
+        let mut dedup_map: BTreeMap<(u64, u8), Vec<usize>> = BTreeMap::new();
+
+        for &idx in chunk {
+            let blob = &blobs[idx];
+            let hint = parse_filename_hint(&blob.name);
+            let stage = if blob.stage_override != Rdna2StageOverride::Auto {
+                blob.stage_override
+            } else if hint.stage != Rdna2StageOverride::Auto {
+                hint.stage
+            } else {
+                options.translate.stage
+            };
+            let explicit_hash = blob.hash_override.or(hint.hash);
+            let content_hash = fnv1a_64(&blob.bytes);
+            let base_hash = explicit_hash.unwrap_or(content_hash);
+            let final_hash = if stage == Rdna2StageOverride::Mesh {
+                mesh_compute_pack_key(base_hash)
+            } else {
+                base_hash
+            };
+
+            let work_idx = if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
+                None
+            } else {
+                let key = (content_hash, stage_override_key(stage));
+                let bucket = dedup_map.entry(key).or_default();
+                let existing = bucket
+                    .iter()
+                    .copied()
+                    .find(|&task_idx| unique_tasks[task_idx].bytes == blob.bytes.as_slice());
+                let assigned = match existing {
+                    Some(task_idx) => task_idx,
+                    None => {
+                        let task_idx = unique_tasks.len();
+                        unique_tasks.push(BlobTranslateTask {
+                            bytes: &blob.bytes,
+                            stage,
+                        });
+                        task_uses.push(0);
+                        bucket.push(task_idx);
+                        task_idx
+                    }
+                };
+                task_uses[assigned] += 1;
+                Some(assigned)
+            };
+
+            chunk_candidates.push(BlobCandidate {
+                blob,
+                source_order: source_order_base.saturating_add(idx),
+                stage,
+                explicit_hash,
+                final_hash,
+                work_idx,
+            });
+        }
+
+        let mut outcomes: Vec<Option<TranslatedStageOutcome>> = run_parallel_indexed(
+            &unique_tasks,
+            options.effective_jobs(),
+            |_idx, task| translate_blob_task(task, options),
+            |_| false,
+        );
+
+        let batch_wgsl_bytes: usize = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                Some(TranslatedStageOutcome::Translated(d)) => Some(d.wgsl.len()),
+                _ => None,
+            })
+            .sum();
+        state.peak_batch_wgsl_bytes = state.peak_batch_wgsl_bytes.max(batch_wgsl_bytes);
+
+        for candidate in chunk_candidates {
+            let Some(work_idx) = candidate.work_idx else {
+                state.skipped_or_failed += 1;
+                state.failed += 1;
+                state.failures.push(Rdna2PackFailureSummary {
+                    code_identity: candidate.explicit_hash,
+                    stage: override_to_stage(candidate.stage),
+                    reason: format!(
+                        "RDNA2 blob too short ({} bytes, minimum {MIN_RDNA2_BLOB_BYTES})",
+                        candidate.blob.bytes.len()
+                    ),
+                });
+                continue;
+            };
+
+            task_uses[work_idx] = task_uses[work_idx].saturating_sub(1);
+            let remaining_uses = task_uses[work_idx];
+
+            match outcomes[work_idx].as_ref() {
+                Some(TranslatedStageOutcome::Failed { reason, .. }) => {
+                    state.skipped_or_failed += 1;
+                    state.failed += 1;
+                    state.failures.push(Rdna2PackFailureSummary {
+                        code_identity: Some(candidate.final_hash),
+                        stage: override_to_stage(candidate.stage),
+                        reason: reason.clone(),
+                    });
+                }
+                Some(TranslatedStageOutcome::Oversize) => {
+                    if state.candidates_by_hash.contains_key(&candidate.final_hash) {
+                        state.skipped_or_failed += 1;
+                    } else {
+                        state.skipped_oversize += 1;
+                        state.skipped_or_failed += 1;
+                    }
+                }
+                Some(TranslatedStageOutcome::Translated(_)) => {
+                    if let Some(existing) = state.candidates_by_hash.get_mut(&candidate.final_hash) {
+                        existing.source_order = existing.source_order.min(candidate.source_order);
+                        state.skipped_or_failed += 1;
+                        continue;
+                    }
+                    let data = if remaining_uses == 0 {
+                        match outcomes[work_idx].take() {
+                            Some(TranslatedStageOutcome::Translated(d)) => d,
+                            _ => unreachable!(),
+                        }
+                    } else {
+                        match outcomes[work_idx].as_ref() {
+                            Some(TranslatedStageOutcome::Translated(d)) => d.clone(),
+                            _ => unreachable!(),
+                        }
+                    };
+                    state.record_spilled(candidate.final_hash, candidate.source_order, data, options)?;
+                }
+                None => unreachable!("all blob translation tasks must produce an outcome"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn stream_manifest_into_spill(
+    manifest_path: &Path,
+    options: &Rdna2PackOptions,
+    batch_size: usize,
+    state: &mut StreamingSpillState,
+) -> Result<(), Rdna2PackError> {
+    let manifest_label = sanitize_source_path(manifest_path, None);
+    let meta = fs::metadata(manifest_path).map_err(|_| {
+        Rdna2PackError::InvalidManifest(format!(
+            "manifest '{manifest_label}' does not exist or is unreadable"
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(Rdna2PackError::InvalidManifest(format!(
+            "'{manifest_label}' is not a regular file"
+        )));
+    }
+    let json_text = fs::read_to_string(manifest_path).map_err(|err| {
+        Rdna2PackError::Io(format!(
+            "failed to read manifest '{manifest_label}': {}",
+            err.kind()
+        ))
+    })?;
+    let manifest = parse_pipeline_dump_manifest(&json_text)?;
+
+    let parent_dir = match manifest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let canonical_parent = fs::canonicalize(parent_dir).map_err(|_| {
+        Rdna2PackError::Io(format!(
+            "failed to resolve parent directory of manifest '{manifest_label}'"
+        ))
+    })?;
+
+    let mut seen_pack_keys: BTreeSet<u64> = BTreeSet::new();
+    let mut unique_stages: Vec<(usize, PipelineDumpNativeStage)> =
+        Vec::with_capacity(manifest.native_stages.len());
+    for entry in manifest.native_stages {
+        let pack_key = if entry.is_mesh {
+            mesh_compute_pack_key(entry.code_identity)
+        } else {
+            entry.code_identity
+        };
+        if !seen_pack_keys.insert(pack_key) {
+            state.manifest_duplicates_skipped += 1;
+            continue;
+        }
+        let source_order = state.next_source_order;
+        state.next_source_order = state.next_source_order.saturating_add(1);
+        unique_stages.push((source_order, entry));
+    }
+    unique_stages.sort_by_key(|(_, entry)| {
+        if entry.is_mesh {
+            mesh_compute_pack_key(entry.code_identity)
+        } else {
+            entry.code_identity
+        }
+    });
+    state.total_blobs += unique_stages.len();
+
+    let chunk_size = batch_size.max(1);
+    for chunk in unique_stages.chunks(chunk_size) {
+        let outcomes: Vec<Option<TranslatedStageOutcome>> = run_parallel_indexed(
+            chunk,
+            options.effective_jobs(),
+            |_idx, (_, entry)| translate_manifest_stage(entry, &canonical_parent, options),
+            |outcome| !options.best_effort && matches!(outcome, TranslatedStageOutcome::Failed { .. }),
+        );
+
+        let batch_wgsl_bytes: usize = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                Some(TranslatedStageOutcome::Translated(d)) => Some(d.wgsl.len()),
+                _ => None,
+            })
+            .sum();
+        state.peak_batch_wgsl_bytes = state.peak_batch_wgsl_bytes.max(batch_wgsl_bytes);
+
+        for ((source_order, entry), outcome_opt) in chunk.iter().zip(outcomes.into_iter()) {
+            match outcome_opt.expect("manifest stage before strict abort must have an outcome") {
+                TranslatedStageOutcome::Failed { error, reason } => {
+                    if options.best_effort {
+                        state.skipped_or_failed += 1;
+                        state.failed += 1;
+                        state.failures.push(Rdna2PackFailureSummary {
+                            code_identity: Some(entry.code_identity),
+                            stage: Some(entry.stage),
+                            reason,
+                        });
+                    } else {
+                        return Err(
+                            error.expect("manifest stage failure must include Rdna2PackError")
+                        );
+                    }
+                }
+                TranslatedStageOutcome::Oversize => {
+                    state.skipped_oversize += 1;
+                    state.skipped_or_failed += 1;
+                }
+                TranslatedStageOutcome::Translated(data) => {
+                    let pack_key = if entry.is_mesh {
+                        mesh_compute_pack_key(entry.code_identity)
+                    } else {
+                        entry.code_identity
+                    };
+                    state.record_spilled(pack_key, *source_order, data, options)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Zero-OOM streaming batch packer for in-memory RDNA2 blobs, writing directly to `out_path` with
+/// automatic WGPK v1 -> v2 upgrade controlled by `options.auto_version_policy`.
+pub fn pack_rdna2_blobs_streaming_to_file(
+    blobs: &[Rdna2BlobInput],
+    out_path: &Path,
+    options: &Rdna2StreamingOptions,
+) -> Result<Rdna2StreamingPackSummary, Rdna2PackError> {
+    let (spill_path, spill_file, _guard) = create_spill_file(out_path)?;
+    let mut state = StreamingSpillState::new(spill_file);
+    state.total_blobs = blobs.len();
+    stream_blobs_into_spill(blobs, &options.pack, options.batch_size, &mut state)?;
+    finalize_streaming_pack(state, &spill_path, out_path, options)
+}
+
+/// Zero-OOM streaming batch packer for RDNA2 directories and/or `playgta6-pipeline-dump`
+/// manifests, translating in bounded batches, spilling WGSL to a temporary file, and streaming
+/// the finalized WGPK v1/v2 archive directly to `out_path`.
+pub fn pack_rdna2_sources_streaming_to_file(
+    input_dir: Option<&Path>,
+    manifest_path: Option<&Path>,
+    out_path: &Path,
+    options: &Rdna2StreamingOptions,
+) -> Result<Rdna2StreamingPackSummary, Rdna2PackError> {
+    if input_dir.is_none() && manifest_path.is_none() {
+        return Err(Rdna2PackError::InvalidInputDir(
+            "at least one input directory or manifest is required".to_string(),
+        ));
+    }
+
+    let (spill_path, spill_file, _guard) = create_spill_file(out_path)?;
+    let mut state = StreamingSpillState::new(spill_file);
+
+    if let Some(manifest) = manifest_path {
+        stream_manifest_into_spill(manifest, &options.pack, options.batch_size, &mut state)?;
+    }
+
+    if let Some(dir) = input_dir {
+        let (blobs, read_failures) = collect_directory_blobs(dir)?;
+        state.total_blobs += blobs.len() + read_failures;
+        state.skipped_or_failed += read_failures;
+        state.failed += read_failures;
+        stream_blobs_into_spill(&blobs, &options.pack, options.batch_size, &mut state)?;
+    }
+
+    finalize_streaming_pack(state, &spill_path, out_path, options)
+}
+
+/// Zero-OOM streaming convenience wrapper for packing a directory directly to `out_path`.
+pub fn pack_rdna2_directory_streaming_to_file(
+    input_dir: &Path,
+    out_path: &Path,
+    options: &Rdna2StreamingOptions,
+) -> Result<Rdna2StreamingPackSummary, Rdna2PackError> {
+    pack_rdna2_sources_streaming_to_file(Some(input_dir), None, out_path, options)
+}
+
+/// Zero-OOM streaming convenience wrapper for packing a `playgta6-pipeline-dump` manifest directly
+/// to `out_path`.
+pub fn pack_rdna2_manifest_streaming_to_file(
+    manifest_path: &Path,
+    out_path: &Path,
+    options: &Rdna2StreamingOptions,
+) -> Result<Rdna2StreamingPackSummary, Rdna2PackError> {
+    pack_rdna2_sources_streaming_to_file(None, Some(manifest_path), out_path, options)
+}
+
+impl Rdna2PackSummary {
+    /// Build a `playgta6-stage-reflection` v1/v2/v3 sidecar directly from this pack summary,
+    /// explicitly accounting for all vertex, fragment, AND compute (including mesh-compute)
+    /// stages so compute stages are never silently dropped.
+    pub fn to_stage_reflection_sidecar(
+        &self,
+        options: &SidecarBuildOptions,
+    ) -> StageReflectionSidecar {
+        let inputs: Vec<SidecarStageInput<'_>> = self
+            .entries
+            .iter()
+            .map(|e| SidecarStageInput {
+                hash: e.hash_fnv1a64,
+                stage: e.stage,
+                bindings: &e.bindings,
+                vertex_inputs: &e.vertex_inputs,
+                vertex_input_mode: &e.vertex_input_mode,
+                mesh_output: e.mesh_output,
+                rt_arena: e.rt_arena,
+            })
+            .collect();
+        StageReflectionSidecar::build(&inputs, options)
+    }
+
+    /// Render the `playgta6-stage-reflection` v1/v2/v3 sidecar JSON for this pack summary.
+    pub fn to_stage_reflection_sidecar_json(&self, options: &SidecarBuildOptions) -> String {
+        self.to_stage_reflection_sidecar(options).render_json()
+    }
 }
 
 #[cfg(test)]

@@ -139,6 +139,11 @@ use crate::convert::{
 };
 use crate::lower::{LoweringReport, WEBGPU_MAX_BINDINGS_PER_GROUP, lower_module_for_webgpu};
 use crate::pack::write_json_string;
+use crate::rdna2_to_wgsl::{
+    CbvIndexedHeapSource, CbvRefSource, LaneIndexedHeapSource, MAX_LANE_INDEXED_WINDOW,
+    MeshOutputLayout, WgslBindingInfo, WgslBindingSource, WgslVertexInputInfo,
+    write_mesh_output_json, write_wgsl_vertex_inputs_json,
+};
 
 /// Layout manifest schema version (`schema_version`).
 pub const LAYOUT_MANIFEST_SCHEMA_VERSION: u32 = 1;
@@ -2370,6 +2375,1871 @@ fn hash_keyed<V>(map: &BTreeMap<u64, V>) -> Vec<(String, &V)> {
     map.iter()
         .map(|(&key, value)| (format_shader_hash(key), value))
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Reflection v3 Completeness: Multi-Stage Collision Prevention, Bindless
+// Stride Validation & Stage Reflection Sidecar v3 (S71 / #1742, Refs #482, #651)
+// ---------------------------------------------------------------------------
+
+/// Stage-reflection sidecar schema identifier (`runtime/gpu/stage_reflection.h`).
+pub const STAGE_REFLECTION_SCHEMA: &str = "playgta6-stage-reflection";
+
+/// Stage-reflection sidecar schema version 1 (baseline).
+pub const STAGE_REFLECTION_VERSION_V1: u32 = 1;
+
+/// Stage-reflection sidecar schema version 2 (`root_descriptor.table_byte_offset`).
+pub const STAGE_REFLECTION_VERSION_V2: u32 = 2;
+
+/// Stage-reflection sidecar schema version 3 (`unresolved` read-only binding sources).
+pub const STAGE_REFLECTION_VERSION_V3: u32 = 3;
+
+/// Default binding-index base used when deterministically remapping a secondary stage's
+/// colliding bindings (matches `FRAGMENT_REFLECTED_BINDING_OFFSET` in `rdna2_to_wgsl.rs`).
+pub const DEFAULT_SECONDARY_STAGE_BINDING_OFFSET: u32 = 32;
+
+/// AMD GFX10.3 (RDNA2) `S#` sampler descriptor byte size (4 dwords = 16 bytes).
+pub const GFX10_SAMPLER_STRIDE_BYTES: u32 = 16;
+
+/// AMD GFX10.3 (RDNA2) `V#` buffer descriptor byte size (4 dwords = 16 bytes).
+pub const GFX10_BUFFER_STRIDE_BYTES: u32 = 16;
+
+/// AMD GFX10.3 (RDNA2) `T#` image descriptor / D3D12 table slot byte size (8 dwords = 32 bytes).
+pub const GFX10_IMAGE_STRIDE_BYTES: u32 = 32;
+
+/// Maximum aligned GFX10.3 heap descriptor stride accepted by bindless stride validation (64 bytes).
+pub const GFX10_MAX_DESCRIPTOR_STRIDE_BYTES: u32 = 64;
+
+/// Classification of a cross-stage or intra-stage binding collision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BindingCollisionKind {
+    DuplicateWithinStage,
+    ResourceKindMismatch,
+    BufferTypeMismatch,
+    DynamicOffsetMismatch,
+    MinBindingSizeMismatch,
+    SamplerTypeMismatch,
+    TextureSampleTypeMismatch,
+    TextureViewDimensionMismatch,
+    TextureMultisampledMismatch,
+    StorageTextureAccessMismatch,
+    StorageTextureFormatMismatch,
+    StorageTextureViewDimensionMismatch,
+    BindingArrayMismatch,
+}
+
+impl BindingCollisionKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DuplicateWithinStage => "DuplicateWithinStage",
+            Self::ResourceKindMismatch => "ResourceKindMismatch",
+            Self::BufferTypeMismatch => "BufferTypeMismatch",
+            Self::DynamicOffsetMismatch => "DynamicOffsetMismatch",
+            Self::MinBindingSizeMismatch => "MinBindingSizeMismatch",
+            Self::SamplerTypeMismatch => "SamplerTypeMismatch",
+            Self::TextureSampleTypeMismatch => "TextureSampleTypeMismatch",
+            Self::TextureViewDimensionMismatch => "TextureViewDimensionMismatch",
+            Self::TextureMultisampledMismatch => "TextureMultisampledMismatch",
+            Self::StorageTextureAccessMismatch => "StorageTextureAccessMismatch",
+            Self::StorageTextureFormatMismatch => "StorageTextureFormatMismatch",
+            Self::StorageTextureViewDimensionMismatch => "StorageTextureViewDimensionMismatch",
+            Self::BindingArrayMismatch => "BindingArrayMismatch",
+        }
+    }
+}
+
+/// Deterministic diagnostic describing a `(group, binding)` collision across or within stages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingCollision {
+    pub group: u32,
+    pub binding: u32,
+    pub kind: BindingCollisionKind,
+    pub first: BindingSide,
+    pub second: BindingSide,
+    /// `true` when baseline WebGPU layout merging can reconcile both sides without remapping
+    /// (for example taking `max(minBindingSize)` when `strict_min_binding_size == false`, or
+    /// promoting `unfilterable-float` + `float` -> `float`).
+    pub resolvable_by_merge: bool,
+    pub detail: String,
+}
+
+/// Deterministic record of a secondary-stage binding remapped to avoid a cross-stage collision.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StageBindingRemap {
+    pub stage: ShaderStage,
+    pub entry_point: String,
+    pub group: u32,
+    pub old_binding: u32,
+    pub new_binding: u32,
+    pub name: Option<String>,
+}
+
+/// Policy controlling multi-stage reflection collision detection and stage-offset resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultiStageMergeOptions {
+    /// When `true`, mismatched `min_binding_size` across stages is treated as a hard collision
+    /// requiring stage-offset remapping instead of taking `max(min_a, min_b)`.
+    pub strict_min_binding_size: bool,
+    /// When `true`, `TextureSampleType::Float` + `TextureSampleType::UnfilterableFloat` on the
+    /// same `(group, binding)` reconciles to `Float` without remapping.
+    pub allow_float_filterability_promotion: bool,
+    /// When `true`, permits `[Compute, Fragment]` pipelines (mesh shaders lowered to compute
+    /// paired with a fragment shader, e.g. MS+PS in G66/S62).
+    pub allow_mesh_compute_with_fragment: bool,
+    /// Starting binding index for remapping colliding secondary-stage bindings within a group.
+    pub secondary_stage_binding_offset: u32,
+}
+
+impl Default for MultiStageMergeOptions {
+    fn default() -> Self {
+        Self {
+            strict_min_binding_size: false,
+            allow_float_filterability_promotion: true,
+            allow_mesh_compute_with_fragment: true,
+            secondary_stage_binding_offset: DEFAULT_SECONDARY_STAGE_BINDING_OFFSET,
+        }
+    }
+}
+
+/// Complete result of multi-stage collision detection and automatic non-colliding resolution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiStageMergeReport {
+    pub layout: PipelineLayoutDesc,
+    pub collisions: Vec<BindingCollision>,
+    pub remaps: Vec<StageBindingRemap>,
+    pub resolved_stages: Vec<EntryPointReflection>,
+    pub limit_violations: Vec<LimitViolation>,
+}
+
+impl MultiStageMergeReport {
+    /// `true` if any detected collision could not be reconciled by direct layout merging.
+    pub fn has_hard_conflicts(&self) -> bool {
+        self.collisions.iter().any(|c| !c.resolvable_by_merge)
+    }
+
+    /// `true` if any shared buffer binding differed in `min_binding_size` across stages.
+    pub fn has_min_binding_size_mismatches(&self) -> bool {
+        self.collisions
+            .iter()
+            .any(|c| c.kind == BindingCollisionKind::MinBindingSizeMismatch)
+    }
+
+    /// `true` if one or more secondary-stage bindings were remapped to avoid collisions.
+    pub fn was_remapped(&self) -> bool {
+        !self.remaps.is_empty()
+    }
+}
+
+fn classify_binding_pair_collisions(
+    first_binding: &ReflectedBinding,
+    first_side: &BindingSide,
+    second_binding: &ReflectedBinding,
+    second_side: &BindingSide,
+    options: &MultiStageMergeOptions,
+) -> Vec<BindingCollision> {
+    let mut out = Vec::new();
+    let group = first_binding.group;
+    let binding = first_binding.binding;
+
+    if first_binding.binding_array != second_binding.binding_array {
+        out.push(BindingCollision {
+            group,
+            binding,
+            kind: BindingCollisionKind::BindingArrayMismatch,
+            first: first_side.clone(),
+            second: second_side.clone(),
+            resolvable_by_merge: false,
+            detail: format!(
+                "@group({group}) @binding({binding}) binding_array mismatch: {:?} vs {:?}",
+                first_binding.binding_array, second_binding.binding_array
+            ),
+        });
+    }
+
+    if first_binding.resource != second_binding.resource {
+        out.push(BindingCollision {
+            group,
+            binding,
+            kind: BindingCollisionKind::ResourceKindMismatch,
+            first: first_side.clone(),
+            second: second_side.clone(),
+            resolvable_by_merge: false,
+            detail: format!(
+                "@group({group}) @binding({binding}) resource kind mismatch: {} vs {}",
+                first_binding.resource.as_str(),
+                second_binding.resource.as_str()
+            ),
+        });
+        return out;
+    }
+
+    match (first_binding.layout, second_binding.layout) {
+        (
+            Some(BindingLayout::Buffer {
+                ty: ty_a,
+                has_dynamic_offset: dyn_a,
+                min_binding_size: size_a,
+            }),
+            Some(BindingLayout::Buffer {
+                ty: ty_b,
+                has_dynamic_offset: dyn_b,
+                min_binding_size: size_b,
+            }),
+        ) => {
+            if ty_a != ty_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::BufferTypeMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) buffer type mismatch: {} vs {}",
+                        ty_a.as_str(),
+                        ty_b.as_str()
+                    ),
+                });
+            }
+            if dyn_a != dyn_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::DynamicOffsetMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) dynamic offset mismatch: {dyn_a} vs {dyn_b}"
+                    ),
+                });
+            }
+            if size_a != size_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::MinBindingSizeMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: !options.strict_min_binding_size,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) buffer minBindingSize mismatch: {size_a} vs {size_b} bytes"
+                    ),
+                });
+            }
+        }
+        (Some(BindingLayout::Sampler { ty: ty_a }), Some(BindingLayout::Sampler { ty: ty_b })) => {
+            if ty_a != ty_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::SamplerTypeMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) sampler type mismatch: {} vs {}",
+                        ty_a.as_str(),
+                        ty_b.as_str()
+                    ),
+                });
+            }
+        }
+        (
+            Some(BindingLayout::Texture {
+                sample_type: st_a,
+                view_dimension: vd_a,
+                multisampled: ms_a,
+            }),
+            Some(BindingLayout::Texture {
+                sample_type: st_b,
+                view_dimension: vd_b,
+                multisampled: ms_b,
+            }),
+        ) => {
+            if vd_a != vd_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::TextureViewDimensionMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) texture viewDimension mismatch: {} vs {}",
+                        vd_a.as_str(),
+                        vd_b.as_str()
+                    ),
+                });
+            }
+            if ms_a != ms_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::TextureMultisampledMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) texture multisampled mismatch: {ms_a} vs {ms_b}"
+                    ),
+                });
+            }
+            if st_a != st_b {
+                let promotable = options.allow_float_filterability_promotion
+                    && vd_a == vd_b
+                    && ms_a == ms_b
+                    && matches!(
+                        (st_a, st_b),
+                        (TextureSampleType::Float, TextureSampleType::UnfilterableFloat)
+                            | (TextureSampleType::UnfilterableFloat, TextureSampleType::Float)
+                    );
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::TextureSampleTypeMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: promotable,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) texture sampleType mismatch: {} vs {}",
+                        st_a.as_str(),
+                        st_b.as_str()
+                    ),
+                });
+            }
+        }
+        (
+            Some(BindingLayout::StorageTexture {
+                access: acc_a,
+                format: fmt_a,
+                view_dimension: vd_a,
+            }),
+            Some(BindingLayout::StorageTexture {
+                access: acc_b,
+                format: fmt_b,
+                view_dimension: vd_b,
+            }),
+        ) => {
+            if acc_a != acc_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::StorageTextureAccessMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) storageTexture access mismatch: {} vs {}",
+                        acc_a.as_str(),
+                        acc_b.as_str()
+                    ),
+                });
+            }
+            if fmt_a != fmt_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::StorageTextureFormatMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) storageTexture format mismatch: {fmt_a} vs {fmt_b}"
+                    ),
+                });
+            }
+            if vd_a != vd_b {
+                out.push(BindingCollision {
+                    group,
+                    binding,
+                    kind: BindingCollisionKind::StorageTextureViewDimensionMismatch,
+                    first: first_side.clone(),
+                    second: second_side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "@group({group}) @binding({binding}) storageTexture viewDimension mismatch: {} vs {}",
+                        vd_a.as_str(),
+                        vd_b.as_str()
+                    ),
+                });
+            }
+        }
+        (Some(la), Some(lb)) if la.member_name() != lb.member_name() => {
+            out.push(BindingCollision {
+                group,
+                binding,
+                kind: BindingCollisionKind::ResourceKindMismatch,
+                first: first_side.clone(),
+                second: second_side.clone(),
+                resolvable_by_merge: false,
+                detail: format!(
+                    "@group({group}) @binding({binding}) layout category mismatch: {} vs {}",
+                    la.member_name(),
+                    lb.member_name()
+                ),
+            });
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            out.push(BindingCollision {
+                group,
+                binding,
+                kind: BindingCollisionKind::ResourceKindMismatch,
+                first: first_side.clone(),
+                second: second_side.clone(),
+                resolvable_by_merge: false,
+                detail: format!(
+                    "@group({group}) @binding({binding}) lowered/unlowered layout mismatch"
+                ),
+            });
+        }
+        _ => {}
+    }
+
+    out
+}
+
+/// Detect all intra-stage and cross-stage `(group, binding)` collisions across pipeline stages
+/// (`VS+PS`, `MS[Compute]+PS`, `VS`, `CS`), returning deterministic diagnostics sorted by
+/// `(group, binding, kind)`.
+pub fn detect_cross_stage_binding_collisions(
+    stages: &[&EntryPointReflection],
+    options: &MultiStageMergeOptions,
+) -> Vec<BindingCollision> {
+    let mut ordered_stages: Vec<&EntryPointReflection> = stages.to_vec();
+    ordered_stages.sort_by(|a, b| (a.stage, a.name.as_str()).cmp(&(b.stage, b.name.as_str())));
+
+    let mut collisions = Vec::new();
+    let mut seen_cross: BTreeMap<(u32, u32), (&ReflectedBinding, BindingSide)> = BTreeMap::new();
+
+    for ep in ordered_stages {
+        let mut ordered_bindings: Vec<&ReflectedBinding> = ep.bindings.iter().collect();
+        ordered_bindings.sort();
+        let mut seen_stage: BTreeMap<(u32, u32), BindingSide> = BTreeMap::new();
+
+        for b in ordered_bindings {
+            let side = binding_side_for(ep.stage, &ep.name, b);
+            if let Some(prev_side) = seen_stage.get(&(b.group, b.binding)) {
+                collisions.push(BindingCollision {
+                    group: b.group,
+                    binding: b.binding,
+                    kind: BindingCollisionKind::DuplicateWithinStage,
+                    first: prev_side.clone(),
+                    second: side.clone(),
+                    resolvable_by_merge: false,
+                    detail: format!(
+                        "stage {} '{}' declares duplicate @group({}) @binding({})",
+                        ep.stage, ep.name, b.group, b.binding
+                    ),
+                });
+                continue;
+            }
+            seen_stage.insert((b.group, b.binding), side.clone());
+
+            if let Some((first_b, first_side)) = seen_cross.get(&(b.group, b.binding)) {
+                collisions.extend(classify_binding_pair_collisions(
+                    first_b, first_side, b, &side, options,
+                ));
+            } else {
+                seen_cross.insert((b.group, b.binding), (b, side));
+            }
+        }
+    }
+
+    collisions.sort_by(|a, b| {
+        (a.group, a.binding, a.kind, a.detail.as_str()).cmp(&(
+            b.group,
+            b.binding,
+            b.kind,
+            b.detail.as_str(),
+        ))
+    });
+    collisions
+}
+
+/// Validate that all stages in a pipeline have zero incompatible `(group, binding)` overlaps
+/// (including strict `min_binding_size` equality check).
+pub fn validate_stage_disjoint_bindings(
+    stages: &[&EntryPointReflection],
+) -> Vec<BindingCollision> {
+    let opts = MultiStageMergeOptions {
+        strict_min_binding_size: true,
+        allow_float_filterability_promotion: false,
+        ..MultiStageMergeOptions::default()
+    };
+    detect_cross_stage_binding_collisions(stages, &opts)
+}
+
+fn validate_multistage_kinds(
+    stages: &[&EntryPointReflection],
+    allow_mesh_compute_with_fragment: bool,
+) -> Result<(), ReflectError> {
+    let mut kinds: Vec<ShaderStage> = stages.iter().map(|ep| ep.stage).collect();
+    kinds.sort();
+    let valid = matches!(
+        kinds.as_slice(),
+        [ShaderStage::Compute]
+            | [ShaderStage::Vertex]
+            | [ShaderStage::Vertex, ShaderStage::Fragment]
+    ) || (allow_mesh_compute_with_fragment
+        && matches!(
+            kinds.as_slice(),
+            [ShaderStage::Fragment, ShaderStage::Compute]
+        ));
+    if !valid {
+        return Err(ReflectError::InvalidPipelineStages { stages: kinds });
+    }
+    Ok(())
+}
+
+fn allocate_non_colliding_binding(occupied: &mut BTreeSet<u32>, preferred_start: u32) -> u32 {
+    let mut candidate = preferred_start;
+    while occupied.contains(&candidate) {
+        candidate = candidate.saturating_add(1);
+        if candidate == u32::MAX {
+            break;
+        }
+    }
+    if occupied.contains(&candidate) {
+        candidate = 0;
+        while occupied.contains(&candidate) {
+            candidate = candidate.saturating_add(1);
+        }
+    }
+    occupied.insert(candidate);
+    candidate
+}
+
+/// Merge multi-stage pipeline reflections (`VS+PS`, `MS[Compute]+PS`, `VS`, `CS`) with
+/// deterministic collision detection and automatic non-colliding stage-offset remapping for
+/// incompatible cross-stage bindings.
+pub fn merge_multistage_pipeline_with_resolution(
+    stages: &[&EntryPointReflection],
+    options: &MultiStageMergeOptions,
+) -> Result<MultiStageMergeReport, ReflectError> {
+    validate_multistage_kinds(stages, options.allow_mesh_compute_with_fragment)?;
+
+    let collisions = detect_cross_stage_binding_collisions(stages, options);
+
+    // Order primary stage first (Vertex or Compute), secondary stage second (Fragment).
+    let mut resolved: Vec<EntryPointReflection> = stages
+        .iter()
+        .map(|ep| (*ep).canonicalized())
+        .collect();
+    resolved.sort_by(|a, b| {
+        let rank = |s: ShaderStage| match s {
+            ShaderStage::Vertex => 0u8,
+            ShaderStage::Compute => 1u8,
+            ShaderStage::Fragment => 2u8,
+        };
+        (rank(a.stage), a.name.as_str()).cmp(&(rank(b.stage), b.name.as_str()))
+    });
+
+    // Track occupied binding slots per group across all stages so remaps never collide with
+    // existing bindings in either stage.
+    let mut occupied_per_group: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
+    for ep in &resolved {
+        for b in &ep.bindings {
+            if b.group >= MAX_REFLECTED_GROUPS {
+                return Err(ReflectError::GroupIndexTooLarge {
+                    group: b.group,
+                    max: MAX_REFLECTED_GROUPS,
+                });
+            }
+            occupied_per_group
+                .entry(b.group)
+                .or_default()
+                .insert(b.binding);
+        }
+    }
+
+    let mut remaps = Vec::new();
+    let mut accepted_slots: BTreeMap<(u32, u32), (ReflectedBinding, BindingSide)> = BTreeMap::new();
+
+    for ep in &mut resolved {
+        // Reject intra-stage duplicates immediately.
+        let mut intra_seen: BTreeMap<(u32, u32), BindingSide> = BTreeMap::new();
+        for b in &ep.bindings {
+            let side = binding_side_for(ep.stage, &ep.name, b);
+            if let Some(first) = intra_seen.get(&(b.group, b.binding)) {
+                return Err(ReflectError::BindingConflict {
+                    group: b.group,
+                    binding: b.binding,
+                    first: Box::new(first.clone()),
+                    second: Box::new(side),
+                });
+            }
+            intra_seen.insert((b.group, b.binding), side);
+        }
+
+        for b in &mut ep.bindings {
+            let side = binding_side_for(ep.stage, &ep.name, b);
+            let needs_remap = if let Some((existing_b, existing_side)) =
+                accepted_slots.get(&(b.group, b.binding))
+            {
+                let pair_conflicts =
+                    classify_binding_pair_collisions(existing_b, existing_side, b, &side, options);
+                pair_conflicts.iter().any(|c| !c.resolvable_by_merge)
+            } else {
+                false
+            };
+
+            if needs_remap {
+                let old_binding = b.binding;
+                let occupied = occupied_per_group.entry(b.group).or_default();
+                let new_binding =
+                    allocate_non_colliding_binding(occupied, options.secondary_stage_binding_offset);
+                b.binding = new_binding;
+                remaps.push(StageBindingRemap {
+                    stage: ep.stage,
+                    entry_point: ep.name.clone(),
+                    group: b.group,
+                    old_binding,
+                    new_binding,
+                    name: b.name.clone(),
+                });
+                let new_side = binding_side_for(ep.stage, &ep.name, b);
+                accepted_slots.insert((b.group, b.binding), (b.clone(), new_side));
+            } else {
+                accepted_slots
+                    .entry((b.group, b.binding))
+                    .or_insert_with(|| (b.clone(), side));
+            }
+        }
+        ep.bindings.sort();
+    }
+
+    remaps.sort();
+    let stage_refs: Vec<&EntryPointReflection> = resolved.iter().collect();
+    let layout = merge_stages(&stage_refs)?;
+    let limit_violations = check_pipeline_limits(&layout, &stage_refs);
+
+    Ok(MultiStageMergeReport {
+        layout,
+        collisions,
+        remaps,
+        resolved_stages: resolved,
+        limit_violations,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Bindless Texture / Sampler Array Stride Validation
+// ---------------------------------------------------------------------------
+
+/// Descriptor heap family for GFX10.3 bindless descriptor stride validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BindlessHeapKind {
+    /// `SamplerDescriptorHeap` (`S#` = 16 bytes minimum, 16/32/64B aligned).
+    Sampler,
+    /// `ResourceDescriptorHeap` for buffer `V#` descriptors (16 bytes minimum, 16/32/64B aligned).
+    ResourceBuffer,
+    /// `ResourceDescriptorHeap` for image `T#` descriptors (32 bytes minimum, 32/64B aligned).
+    ResourceImage,
+}
+
+impl BindlessHeapKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sampler => "sampler_heap",
+            Self::ResourceBuffer => "resource_buffer_heap",
+            Self::ResourceImage => "resource_image_heap",
+        }
+    }
+
+    pub const fn min_stride_bytes(self) -> u32 {
+        match self {
+            Self::Sampler => GFX10_SAMPLER_STRIDE_BYTES,
+            Self::ResourceBuffer => GFX10_BUFFER_STRIDE_BYTES,
+            Self::ResourceImage => GFX10_IMAGE_STRIDE_BYTES,
+        }
+    }
+
+    /// `true` for sampler heap, `false` for resource heap (used to check cross-binding heap consistency).
+    pub const fn is_sampler_heap(self) -> bool {
+        matches!(self, Self::Sampler)
+    }
+}
+
+/// Specific reason a bindless texture/sampler array descriptor stride failed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BindlessStrideErrorKind {
+    ZeroStride,
+    NotPowerOfTwo,
+    BelowMinDescriptorSize,
+    ExceedsMaxDescriptorSize,
+    ShiftStrideMismatch,
+    InconsistentHeapStride,
+    InvalidWindowCount,
+}
+
+impl BindlessStrideErrorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ZeroStride => "ZeroStride",
+            Self::NotPowerOfTwo => "NotPowerOfTwo",
+            Self::BelowMinDescriptorSize => "BelowMinDescriptorSize",
+            Self::ExceedsMaxDescriptorSize => "ExceedsMaxDescriptorSize",
+            Self::ShiftStrideMismatch => "ShiftStrideMismatch",
+            Self::InconsistentHeapStride => "InconsistentHeapStride",
+            Self::InvalidWindowCount => "InvalidWindowCount",
+        }
+    }
+}
+
+/// Structured diagnostic for an invalid or inconsistent bindless descriptor stride.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BindlessStrideViolation {
+    pub group: u32,
+    pub binding: u32,
+    pub name: String,
+    pub heap_kind: BindlessHeapKind,
+    pub stride: u32,
+    pub expected_min: u32,
+    pub kind: BindlessStrideErrorKind,
+    pub detail: String,
+}
+
+/// Input specification for validating a bindless `binding_array` or heap-indexed descriptor stride.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindlessArrayStrideSpec {
+    pub group: u32,
+    pub binding: u32,
+    pub name: String,
+    pub heap_kind: BindlessHeapKind,
+    pub stride_bytes: u32,
+    pub shift: Option<u32>,
+    pub max_count: Option<u32>,
+}
+
+/// Returns `true` iff `stride` is a valid non-zero power-of-two GFX10.3 descriptor stride for
+/// `heap_kind` (`16`/`32`/`64` for samplers and buffers; `32`/`64` for textures/images).
+pub const fn is_valid_gfx10_descriptor_stride(heap_kind: BindlessHeapKind, stride: u32) -> bool {
+    stride >= heap_kind.min_stride_bytes()
+        && stride <= GFX10_MAX_DESCRIPTOR_STRIDE_BYTES
+        && stride.is_power_of_two()
+}
+
+/// Validate a set of bindless descriptor array / heap-indexed stride specifications for:
+/// * non-zero power-of-two alignment within GFX10.3 bounds (`16`/`32`/`64` B),
+/// * consistency between `shift` and `stride_bytes` (`1 << shift == stride_bytes`),
+/// * valid lane-indexed window count (`1..=MAX_LANE_INDEXED_WINDOW`), and
+/// * consistent stride across all bindings sharing the same `(group, sampler_vs_resource_heap)`.
+pub fn validate_bindless_array_strides(
+    specs: &[BindlessArrayStrideSpec],
+) -> Vec<BindlessStrideViolation> {
+    let mut violations = Vec::new();
+    // Track canonical first-seen valid stride per `(group, is_sampler_heap)`.
+    let mut heap_strides: BTreeMap<(u32, bool), (u32, String)> = BTreeMap::new();
+
+    for spec in specs {
+        let min_stride = spec.heap_kind.min_stride_bytes();
+        let stride = spec.stride_bytes;
+
+        if let Some(count) = spec.max_count
+            && (count == 0 || count > MAX_LANE_INDEXED_WINDOW)
+        {
+            violations.push(BindlessStrideViolation {
+                group: spec.group,
+                binding: spec.binding,
+                name: spec.name.clone(),
+                heap_kind: spec.heap_kind,
+                stride,
+                expected_min: min_stride,
+                kind: BindlessStrideErrorKind::InvalidWindowCount,
+                detail: format!(
+                    "bindless binding '{}' @group({}) @binding({}) has invalid window max_count={} (expected 1..={})",
+                    spec.name, spec.group, spec.binding, count, MAX_LANE_INDEXED_WINDOW
+                ),
+            });
+        }
+
+        if stride == 0 {
+            violations.push(BindlessStrideViolation {
+                group: spec.group,
+                binding: spec.binding,
+                name: spec.name.clone(),
+                heap_kind: spec.heap_kind,
+                stride,
+                expected_min: min_stride,
+                kind: BindlessStrideErrorKind::ZeroStride,
+                detail: format!(
+                    "bindless {} binding '{}' @group({}) @binding({}) has zero descriptor stride (minimum {} bytes)",
+                    spec.heap_kind.as_str(),
+                    spec.name,
+                    spec.group,
+                    spec.binding,
+                    min_stride
+                ),
+            });
+            continue;
+        }
+
+        if !stride.is_power_of_two() {
+            violations.push(BindlessStrideViolation {
+                group: spec.group,
+                binding: spec.binding,
+                name: spec.name.clone(),
+                heap_kind: spec.heap_kind,
+                stride,
+                expected_min: min_stride,
+                kind: BindlessStrideErrorKind::NotPowerOfTwo,
+                detail: format!(
+                    "bindless {} binding '{}' @group({}) @binding({}) has non-power-of-two stride {} bytes (expected 16/32/64)",
+                    spec.heap_kind.as_str(),
+                    spec.name,
+                    spec.group,
+                    spec.binding,
+                    stride
+                ),
+            });
+        } else if stride < min_stride {
+            violations.push(BindlessStrideViolation {
+                group: spec.group,
+                binding: spec.binding,
+                name: spec.name.clone(),
+                heap_kind: spec.heap_kind,
+                stride,
+                expected_min: min_stride,
+                kind: BindlessStrideErrorKind::BelowMinDescriptorSize,
+                detail: format!(
+                    "bindless {} binding '{}' @group({}) @binding({}) stride {} bytes is smaller than GFX10.3 minimum {} bytes",
+                    spec.heap_kind.as_str(),
+                    spec.name,
+                    spec.group,
+                    spec.binding,
+                    stride,
+                    min_stride
+                ),
+            });
+        } else if stride > GFX10_MAX_DESCRIPTOR_STRIDE_BYTES {
+            violations.push(BindlessStrideViolation {
+                group: spec.group,
+                binding: spec.binding,
+                name: spec.name.clone(),
+                heap_kind: spec.heap_kind,
+                stride,
+                expected_min: min_stride,
+                kind: BindlessStrideErrorKind::ExceedsMaxDescriptorSize,
+                detail: format!(
+                    "bindless {} binding '{}' @group({}) @binding({}) stride {} bytes exceeds GFX10.3 maximum {} bytes",
+                    spec.heap_kind.as_str(),
+                    spec.name,
+                    spec.group,
+                    spec.binding,
+                    stride,
+                    GFX10_MAX_DESCRIPTOR_STRIDE_BYTES
+                ),
+            });
+        }
+
+        if let Some(shift) = spec.shift {
+            let expected_from_shift = if shift < 32 {
+                Some(1u32 << shift)
+            } else {
+                None
+            };
+            if expected_from_shift != Some(stride) {
+                violations.push(BindlessStrideViolation {
+                    group: spec.group,
+                    binding: spec.binding,
+                    name: spec.name.clone(),
+                    heap_kind: spec.heap_kind,
+                    stride,
+                    expected_min: min_stride,
+                    kind: BindlessStrideErrorKind::ShiftStrideMismatch,
+                    detail: format!(
+                        "bindless {} binding '{}' @group({}) @binding({}) shift {} (1<<{} = {:?}B) disagrees with stride {}B",
+                        spec.heap_kind.as_str(),
+                        spec.name,
+                        spec.group,
+                        spec.binding,
+                        shift,
+                        shift,
+                        expected_from_shift,
+                        stride
+                    ),
+                });
+            }
+        }
+
+        if is_valid_gfx10_descriptor_stride(spec.heap_kind, stride) {
+            let key = (spec.group, spec.heap_kind.is_sampler_heap());
+            match heap_strides.get(&key) {
+                Some((prev_stride, prev_name)) if *prev_stride != stride => {
+                    violations.push(BindlessStrideViolation {
+                        group: spec.group,
+                        binding: spec.binding,
+                        name: spec.name.clone(),
+                        heap_kind: spec.heap_kind,
+                        stride,
+                        expected_min: *prev_stride,
+                        kind: BindlessStrideErrorKind::InconsistentHeapStride,
+                        detail: format!(
+                            "bindless {} binding '{}' @group({}) @binding({}) uses stride {}B, conflicting with '{}' stride {}B in the same heap/group",
+                            spec.heap_kind.as_str(),
+                            spec.name,
+                            spec.group,
+                            spec.binding,
+                            stride,
+                            prev_name,
+                            prev_stride
+                        ),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    heap_strides.insert(key, (stride, spec.name.clone()));
+                }
+            }
+        }
+    }
+
+    violations.sort();
+    violations
+}
+
+fn infer_resource_heap_kind(wgsl_kind: &str) -> BindlessHeapKind {
+    match wgsl_kind {
+        "uniform" | "storage" | "read-only-storage" | "read_only_storage" => {
+            BindlessHeapKind::ResourceBuffer
+        }
+        "sampler" | "comparison_sampler" | "sampler_comparison" => BindlessHeapKind::Sampler,
+        _ => BindlessHeapKind::ResourceImage,
+    }
+}
+
+/// Validate all heap-indexed (`sampler_heap`, `resource_heap`, `cbv_indexed_*_heap`,
+/// `lane_indexed_*_heap`) descriptor strides on a slice of translated [`WgslBindingInfo`] records.
+pub fn validate_bindless_binding_strides(
+    bindings: &[WgslBindingInfo],
+) -> Vec<BindlessStrideViolation> {
+    let mut specs = Vec::new();
+    for b in bindings {
+        let Some(src) = b.source else {
+            continue;
+        };
+        match src {
+            WgslBindingSource::SamplerHeap {
+                stride,
+                index_shift,
+                ..
+            } => {
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: BindlessHeapKind::Sampler,
+                    stride_bytes: stride,
+                    shift: Some(index_shift),
+                    max_count: None,
+                });
+            }
+            WgslBindingSource::ResourceHeap {
+                stride,
+                index_shift,
+                ..
+            } => {
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: infer_resource_heap_kind(b.kind),
+                    stride_bytes: stride,
+                    shift: Some(index_shift),
+                    max_count: None,
+                });
+            }
+            WgslBindingSource::CbvIndexedSamplerHeap(h) => {
+                let effective_stride = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                    1u32 << h.shift
+                } else {
+                    h.stride
+                };
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: BindlessHeapKind::Sampler,
+                    stride_bytes: effective_stride,
+                    shift: Some(h.shift),
+                    max_count: None,
+                });
+            }
+            WgslBindingSource::CbvIndexedResourceHeap(h) => {
+                let effective_stride = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                    1u32 << h.shift
+                } else {
+                    h.stride
+                };
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: infer_resource_heap_kind(b.kind),
+                    stride_bytes: effective_stride,
+                    shift: Some(h.shift),
+                    max_count: None,
+                });
+            }
+            WgslBindingSource::LaneIndexedSamplerHeap(h) => {
+                let effective_stride = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                    1u32 << h.shift
+                } else {
+                    h.stride
+                };
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: BindlessHeapKind::Sampler,
+                    stride_bytes: effective_stride,
+                    shift: Some(h.shift),
+                    max_count: Some(h.max_count),
+                });
+            }
+            WgslBindingSource::LaneIndexedResourceHeap(h) => {
+                let effective_stride = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                    1u32 << h.shift
+                } else {
+                    h.stride
+                };
+                specs.push(BindlessArrayStrideSpec {
+                    group: b.group,
+                    binding: b.binding,
+                    name: b.name.clone(),
+                    heap_kind: infer_resource_heap_kind(b.kind),
+                    stride_bytes: effective_stride,
+                    shift: Some(h.shift),
+                    max_count: Some(h.max_count),
+                });
+            }
+            _ => {}
+        }
+    }
+    validate_bindless_array_strides(&specs)
+}
+
+// ---------------------------------------------------------------------------
+// Stage Reflection Sidecar v3 (`playgta6-stage-reflection`, v1/v2/v3 compatible)
+// ---------------------------------------------------------------------------
+
+/// Binding kind vocabulary for `playgta6-stage-reflection` sidecars (`stage_reflection.h`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SidecarBindingKind {
+    Uniform,
+    Storage,
+    ReadOnlyStorage,
+    Texture,
+    StorageTexture,
+    Sampler,
+    ComparisonSampler,
+}
+
+impl SidecarBindingKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Uniform => "uniform",
+            Self::Storage => "storage",
+            Self::ReadOnlyStorage => "read_only_storage",
+            Self::Texture => "texture",
+            Self::StorageTexture => "storage_texture",
+            Self::Sampler => "sampler",
+            Self::ComparisonSampler => "comparison_sampler",
+        }
+    }
+
+    pub fn from_wgsl_kind(kind: &str) -> Option<Self> {
+        match kind {
+            "uniform" => Some(Self::Uniform),
+            "storage" => Some(Self::Storage),
+            "read_only_storage" | "read-only-storage" => Some(Self::ReadOnlyStorage),
+            "texture" | "texture_2d" | "texture_3d" | "texture_cube" | "texture_2d_array"
+            | "texture_cube_array" | "texture_1d" | "texture_depth_2d" => Some(Self::Texture),
+            "storage_texture" | "storage-texture" => Some(Self::StorageTexture),
+            "sampler" => Some(Self::Sampler),
+            "comparison_sampler" | "sampler_comparison" => Some(Self::ComparisonSampler),
+            _ => None,
+        }
+    }
+
+    /// `true` for writable bindings (`storage`, `storage_texture`), which CANNOT use `unresolved`.
+    pub const fn is_writable(self) -> bool {
+        matches!(self, Self::Storage | Self::StorageTexture)
+    }
+
+    /// `true` for read-only bindings permitted to carry a v3 `{"unresolved": ...}` source.
+    pub const fn allows_unresolved(self) -> bool {
+        !self.is_writable()
+    }
+}
+
+/// Binding descriptor origin for `playgta6-stage-reflection` v1/v2/v3 sidecars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidecarBindingSource {
+    Table {
+        user_sgpr: u32,
+        table_byte_offset: u32,
+    },
+    RootConstants {
+        user_sgpr: u32,
+    },
+    RootDescriptor {
+        user_sgpr: u32,
+        table_byte_offset: Option<u32>,
+    },
+    StaticSampler {
+        index: u32,
+    },
+    InlineSampler {
+        sdwords: [u32; 4],
+    },
+    SamplerHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
+    ResourceHeap {
+        base_user_sgpr: u32,
+        stride: u32,
+        index_user_sgpr: u32,
+        index_shift: u32,
+    },
+    CbvIndexedResourceHeap(CbvIndexedHeapSource),
+    CbvIndexedSamplerHeap(CbvIndexedHeapSource),
+    LaneIndexedResourceHeap(LaneIndexedHeapSource),
+    LaneIndexedSamplerHeap(LaneIndexedHeapSource),
+    RtArena,
+    /// Sidecar v3 (`version >= 3`) unresolved read-only binding source.
+    Unresolved {
+        reason: Option<String>,
+    },
+}
+
+impl From<WgslBindingSource> for SidecarBindingSource {
+    fn from(src: WgslBindingSource) -> Self {
+        match src {
+            WgslBindingSource::Table {
+                user_sgpr,
+                table_byte_offset,
+            } => Self::Table {
+                user_sgpr,
+                table_byte_offset,
+            },
+            WgslBindingSource::RootConstants { user_sgpr } => Self::RootConstants { user_sgpr },
+            WgslBindingSource::RootDescriptor {
+                user_sgpr,
+                table_byte_offset,
+            } => Self::RootDescriptor {
+                user_sgpr,
+                table_byte_offset,
+            },
+            WgslBindingSource::StaticSampler { index } => Self::StaticSampler { index },
+            WgslBindingSource::InlineSampler { sdwords } => Self::InlineSampler { sdwords },
+            WgslBindingSource::SamplerHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => Self::SamplerHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            },
+            WgslBindingSource::ResourceHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => Self::ResourceHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            },
+            WgslBindingSource::CbvIndexedResourceHeap(h) => Self::CbvIndexedResourceHeap(h),
+            WgslBindingSource::CbvIndexedSamplerHeap(h) => Self::CbvIndexedSamplerHeap(h),
+            WgslBindingSource::LaneIndexedResourceHeap(h) => Self::LaneIndexedResourceHeap(h),
+            WgslBindingSource::LaneIndexedSamplerHeap(h) => Self::LaneIndexedSamplerHeap(h),
+        }
+    }
+}
+
+impl SidecarBindingSource {
+    /// Minimum sidecar schema version required to represent this binding source (`1`, `2`, or `3`).
+    pub const fn min_sidecar_version(&self) -> u32 {
+        match self {
+            Self::Unresolved { .. } => STAGE_REFLECTION_VERSION_V3,
+            Self::RootDescriptor {
+                table_byte_offset: Some(_),
+                ..
+            } => STAGE_REFLECTION_VERSION_V2,
+            _ => STAGE_REFLECTION_VERSION_V1,
+        }
+    }
+
+    pub const fn is_unresolved(&self) -> bool {
+        matches!(self, Self::Unresolved { .. })
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            Self::Table {
+                user_sgpr,
+                table_byte_offset,
+            } => {
+                let _ = write!(
+                    out,
+                    "{{\"user_sgpr\": {user_sgpr}, \"table_byte_offset\": {table_byte_offset}}}"
+                );
+            }
+            Self::RootConstants { user_sgpr } => {
+                let _ = write!(
+                    out,
+                    "{{\"user_sgpr\": {user_sgpr}, \"root_constants\": true}}"
+                );
+            }
+            Self::RootDescriptor {
+                user_sgpr,
+                table_byte_offset,
+            } => {
+                if let Some(off) = table_byte_offset {
+                    let _ = write!(
+                        out,
+                        "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true, \"table_byte_offset\": {off}}}"
+                    );
+                } else {
+                    let _ = write!(
+                        out,
+                        "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true}}"
+                    );
+                }
+            }
+            Self::StaticSampler { index } => {
+                let _ = write!(out, "{{\"static_sampler\": {index}}}");
+            }
+            Self::InlineSampler { sdwords } => {
+                let _ = write!(
+                    out,
+                    "{{\"inline_sampler\": {{\"sdwords\": [{}, {}, {}, {}]}}}}",
+                    sdwords[0], sdwords[1], sdwords[2], sdwords[3]
+                );
+            }
+            Self::SamplerHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => {
+                let _ = write!(
+                    out,
+                    "{{\"sampler_heap\": {{\"base_user_sgpr\": {base_user_sgpr}, \"stride\": {stride}, \"index\": {{\"user_sgpr\": {index_user_sgpr}, \"shift\": {index_shift}}}}}}}"
+                );
+            }
+            Self::ResourceHeap {
+                base_user_sgpr,
+                stride,
+                index_user_sgpr,
+                index_shift,
+            } => {
+                let _ = write!(
+                    out,
+                    "{{\"resource_heap\": {{\"base_user_sgpr\": {base_user_sgpr}, \"stride\": {stride}, \"index\": {{\"user_sgpr\": {index_user_sgpr}, \"shift\": {index_shift}}}}}}}"
+                );
+            }
+            Self::CbvIndexedResourceHeap(h) | Self::CbvIndexedSamplerHeap(h) => {
+                let key = if matches!(self, Self::CbvIndexedSamplerHeap(_)) {
+                    "cbv_indexed_sampler_heap"
+                } else {
+                    "cbv_indexed_resource_heap"
+                };
+                let _ = write!(out, "{{\"{key}\": {{\"cbv\": ");
+                write_sidecar_cbv_ref_json(out, h.cbv);
+                let _ = write!(
+                    out,
+                    ", \"byte_offset\": {}, \"shift\": {}",
+                    h.byte_offset, h.shift
+                );
+                if h.bit_offset != 0 {
+                    let _ = write!(out, ", \"bit_offset\": {}", h.bit_offset);
+                }
+                if h.mask != u32::MAX {
+                    let _ = write!(out, ", \"mask\": {}", h.mask);
+                }
+                if h.stride != 0 {
+                    let _ = write!(out, ", \"stride\": {}", h.stride);
+                }
+                out.push_str("}}");
+            }
+            Self::LaneIndexedResourceHeap(h) | Self::LaneIndexedSamplerHeap(h) => {
+                let key = if matches!(self, Self::LaneIndexedSamplerHeap(_)) {
+                    "lane_indexed_sampler_heap"
+                } else {
+                    "lane_indexed_resource_heap"
+                };
+                let _ = write!(
+                    out,
+                    "{{\"{key}\": {{\"max_count\": {}, \"shift\": {}",
+                    h.max_count, h.shift
+                );
+                if h.stride != 0 {
+                    let _ = write!(out, ", \"stride\": {}", h.stride);
+                }
+                if let Some(base) = h.window_base {
+                    out.push_str(", \"window_base\": {\"cbv\": ");
+                    write_sidecar_cbv_ref_json(out, base.cbv);
+                    let _ = write!(out, ", \"byte_offset\": {}", base.byte_offset);
+                    if base.bit_offset != 0 {
+                        let _ = write!(out, ", \"bit_offset\": {}", base.bit_offset);
+                    }
+                    if base.mask != u32::MAX {
+                        let _ = write!(out, ", \"mask\": {}", base.mask);
+                    }
+                    out.push('}');
+                }
+                out.push_str("}}");
+            }
+            Self::RtArena => {
+                out.push_str("{\"rt_arena\": true}");
+            }
+            Self::Unresolved { reason } => {
+                if let Some(label) = reason.as_deref().filter(|r| is_safe_sidecar_label(r)) {
+                    out.push_str("{\"unresolved\": ");
+                    write_json_string(out, label);
+                    out.push('}');
+                } else {
+                    out.push_str("{\"unresolved\": true}");
+                }
+            }
+        }
+    }
+}
+
+fn write_sidecar_cbv_ref_json(out: &mut String, cbv: CbvRefSource) {
+    match cbv {
+        CbvRefSource::RootDescriptor { user_sgpr } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true}}"
+            );
+        }
+        CbvRefSource::Table {
+            user_sgpr,
+            table_byte_offset,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"table_byte_offset\": {table_byte_offset}}}"
+            );
+        }
+        CbvRefSource::RootConstants { user_sgpr } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"root_constants\": true}}"
+            );
+        }
+    }
+}
+
+fn is_safe_sidecar_label(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 64
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'<' | b'>' | b'[' | b']' | b'-'))
+}
+
+/// One reflected resource binding in a `playgta6-stage-reflection` sidecar stage entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarBinding {
+    pub group: u32,
+    pub binding: u32,
+    pub kind: SidecarBindingKind,
+    pub view_dimension: Option<&'static str>,
+    pub sample_type: Option<&'static str>,
+    pub multisampled: bool,
+    pub storage_format: Option<u8>,
+    pub min_binding_size_bytes: Option<u32>,
+    pub source: SidecarBindingSource,
+}
+
+impl SidecarBinding {
+    fn write_json(&self, out: &mut String) {
+        let _ = write!(
+            out,
+            "{{\"group\": {}, \"binding\": {}, \"kind\": \"{}\"",
+            self.group,
+            self.binding,
+            self.kind.as_str()
+        );
+        if let Some(dim) = self.view_dimension {
+            out.push_str(", \"view_dimension\": ");
+            write_json_string(out, dim);
+        }
+        if let Some(st) = self.sample_type {
+            out.push_str(", \"sample_type\": ");
+            write_json_string(out, st);
+        }
+        if self.multisampled {
+            out.push_str(", \"multisampled\": true");
+        }
+        if let Some(fmt) = self.storage_format {
+            let _ = write!(out, ", \"storage_format\": {fmt}");
+        }
+        if let Some(min_bytes) = self.min_binding_size_bytes {
+            let _ = write!(out, ", \"min_binding_size_bytes\": {min_bytes}");
+        }
+        out.push_str(", \"source\": ");
+        self.source.write_json(out);
+        out.push('}');
+    }
+}
+
+/// One stage record inside a `playgta6-stage-reflection` sidecar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarStageEntry {
+    pub hash: u64,
+    pub stage: ShaderStage,
+    pub bindings: Vec<SidecarBinding>,
+    pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    pub mesh_output: Option<MeshOutputLayout>,
+    pub rt_arena: bool,
+}
+
+/// Borrowed input for building a `StageReflectionSidecar` from translated stages.
+#[derive(Debug, Clone, Copy)]
+pub struct SidecarStageInput<'a> {
+    pub hash: u64,
+    pub stage: ShaderStage,
+    pub bindings: &'a [WgslBindingInfo],
+    pub vertex_inputs: &'a [WgslVertexInputInfo],
+    pub vertex_input_mode: &'a str,
+    pub mesh_output: Option<MeshOutputLayout>,
+    pub rt_arena: bool,
+}
+
+/// Options controlling `StageReflectionSidecar::build`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarBuildOptions {
+    /// Emit `{"unresolved": ...}` (schema v3) for read-only bindings whose descriptor origin was
+    /// not statically traced, instead of dropping the whole stage. Writable bindings (`storage`,
+    /// `storage_texture`) without a source still skip the stage to prevent silent dropped writes.
+    pub allow_unresolved_readonly: bool,
+    /// Run GFX10.3 bindless descriptor stride validation across every stage's heap bindings.
+    pub validate_bindless_strides: bool,
+    /// Optional safe diagnostic label placed in `{"unresolved": "<label>"}` instead of `true`.
+    pub unresolved_reason: Option<String>,
+}
+
+impl Default for SidecarBuildOptions {
+    fn default() -> Self {
+        Self {
+            allow_unresolved_readonly: true,
+            validate_bindless_strides: true,
+            unresolved_reason: None,
+        }
+    }
+}
+
+/// Stage-level accounting for `playgta6-stage-reflection` sidecar generation, ensuring compute
+/// stages and unresolved bindings are always explicitly tracked (Refs `#482`, `#651`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SidecarStageCensus {
+    pub total_input_stages: usize,
+    pub emitted_stages: usize,
+    pub vertex_stages: usize,
+    pub fragment_stages: usize,
+    pub compute_stages: usize,
+    pub mesh_compute_stages: usize,
+    pub stages_with_unresolved: usize,
+    pub unresolved_bindings: usize,
+    pub skipped_stages: usize,
+    pub skipped_compute_stages: usize,
+    pub skipped_writable_without_source: usize,
+}
+
+/// Complete `playgta6-stage-reflection` v1/v2/v3 sidecar document with census & stride validation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StageReflectionSidecar {
+    pub version: u32,
+    pub stages: BTreeMap<u64, SidecarStageEntry>,
+    pub census: SidecarStageCensus,
+    pub stride_violations: Vec<BindlessStrideViolation>,
+}
+
+impl StageReflectionSidecar {
+    /// Build a `playgta6-stage-reflection` sidecar (automatically choosing the minimal schema
+    /// version `1`, `2`, or `3` for full v1/v2 backward compatibility) while preserving vertex,
+    /// fragment, and compute stages and validating bindless descriptor strides.
+    pub fn build(inputs: &[SidecarStageInput<'_>], options: &SidecarBuildOptions) -> Self {
+        let mut sidecar = Self {
+            version: STAGE_REFLECTION_VERSION_V1,
+            stages: BTreeMap::new(),
+            census: SidecarStageCensus::default(),
+            stride_violations: Vec::new(),
+        };
+
+        for input in inputs {
+            sidecar.census.total_input_stages += 1;
+
+            if options.validate_bindless_strides {
+                sidecar
+                    .stride_violations
+                    .extend(validate_bindless_binding_strides(input.bindings));
+            }
+
+            if input.stage == ShaderStage::Vertex
+                && input.vertex_input_mode == "attributes"
+                && input.vertex_inputs.is_empty()
+            {
+                sidecar.census.skipped_stages += 1;
+                continue;
+            }
+
+            if let Some(mo) = input.mesh_output
+                && (input.stage != ShaderStage::Compute || !mo.is_valid())
+            {
+                sidecar.census.skipped_stages += 1;
+                if input.stage == ShaderStage::Compute {
+                    sidecar.census.skipped_compute_stages += 1;
+                }
+                continue;
+            }
+
+            let mut sidecar_bindings = Vec::with_capacity(input.bindings.len());
+            let mut stage_skipped = false;
+            let mut stage_unresolved_count = 0usize;
+
+            for b in input.bindings {
+                let Some(kind) = SidecarBindingKind::from_wgsl_kind(b.kind) else {
+                    stage_skipped = true;
+                    break;
+                };
+                let source = match b.source {
+                    Some(src) => SidecarBindingSource::from(src),
+                    None => {
+                        if !options.allow_unresolved_readonly {
+                            stage_skipped = true;
+                            break;
+                        }
+                        if !kind.allows_unresolved() {
+                            sidecar.census.skipped_writable_without_source += 1;
+                            stage_skipped = true;
+                            break;
+                        }
+                        stage_unresolved_count += 1;
+                        SidecarBindingSource::Unresolved {
+                            reason: options.unresolved_reason.clone(),
+                        }
+                    }
+                };
+                sidecar_bindings.push(SidecarBinding {
+                    group: b.group,
+                    binding: b.binding,
+                    kind,
+                    view_dimension: b.view_dimension,
+                    sample_type: None,
+                    multisampled: false,
+                    storage_format: b.storage_format,
+                    min_binding_size_bytes: b.min_binding_size_bytes,
+                    source,
+                });
+            }
+
+            if stage_skipped {
+                sidecar.census.skipped_stages += 1;
+                if input.stage == ShaderStage::Compute {
+                    sidecar.census.skipped_compute_stages += 1;
+                }
+                continue;
+            }
+
+            sidecar_bindings.sort_by_key(|b| (b.group, b.binding));
+            let entry = SidecarStageEntry {
+                hash: input.hash,
+                stage: input.stage,
+                bindings: sidecar_bindings,
+                vertex_inputs: if input.stage == ShaderStage::Vertex {
+                    input.vertex_inputs.to_vec()
+                } else {
+                    Vec::new()
+                },
+                mesh_output: input.mesh_output,
+                rt_arena: input.rt_arena,
+            };
+            if stage_unresolved_count > 0 {
+                sidecar.census.stages_with_unresolved += 1;
+                sidecar.census.unresolved_bindings += stage_unresolved_count;
+            }
+            sidecar.insert_stage_internal(entry);
+        }
+
+        sidecar.stride_violations.sort();
+        sidecar.stride_violations.dedup();
+        sidecar.version = sidecar.required_version();
+        sidecar
+    }
+
+    /// Insert or replace a single reflected stage (e.g. from DXIL fallback root-parameter
+    /// matching) and recompute schema version and stage census counts cleanly.
+    pub fn insert_stage(&mut self, entry: SidecarStageEntry) {
+        self.census.total_input_stages = self.census.total_input_stages.max(self.stages.len() + 1);
+        self.stages.insert(entry.hash, entry);
+        self.recompute_counts_from_stages();
+        self.version = self.required_version();
+    }
+
+    fn insert_stage_internal(&mut self, entry: SidecarStageEntry) {
+        if self.stages.insert(entry.hash, entry).is_none() {
+            self.recompute_counts_from_stages();
+        } else {
+            self.recompute_counts_from_stages();
+        }
+    }
+
+    fn recompute_counts_from_stages(&mut self) {
+        self.census.emitted_stages = self.stages.len();
+        self.census.vertex_stages = 0;
+        self.census.fragment_stages = 0;
+        self.census.compute_stages = 0;
+        self.census.mesh_compute_stages = 0;
+        self.census.stages_with_unresolved = 0;
+        self.census.unresolved_bindings = 0;
+
+        for entry in self.stages.values() {
+            match entry.stage {
+                ShaderStage::Vertex => self.census.vertex_stages += 1,
+                ShaderStage::Fragment => self.census.fragment_stages += 1,
+                ShaderStage::Compute => {
+                    self.census.compute_stages += 1;
+                    if entry.mesh_output.is_some() {
+                        self.census.mesh_compute_stages += 1;
+                    }
+                }
+            }
+            let unresolved = entry
+                .bindings
+                .iter()
+                .filter(|b| b.source.is_unresolved())
+                .count();
+            if unresolved > 0 {
+                self.census.stages_with_unresolved += 1;
+                self.census.unresolved_bindings += unresolved;
+            }
+        }
+    }
+
+    /// Minimal `playgta6-stage-reflection` version (`1`, `2`, or `3`) needed to encode all
+    /// stages in this sidecar without breaking v1/v2 readers when newer features are unused.
+    pub fn required_version(&self) -> u32 {
+        let mut ver = STAGE_REFLECTION_VERSION_V1;
+        for entry in self.stages.values() {
+            for b in &entry.bindings {
+                ver = ver.max(b.source.min_sidecar_version());
+            }
+        }
+        ver
+    }
+
+    /// Validate all v1/v2/v3 sidecar invariants (no writable `unresolved` bindings, valid
+    /// `mesh_output`, valid `lane_indexed` bounds, and valid bindless descriptor strides).
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let req_ver = self.required_version();
+        if self.version < req_ver {
+            errors.push(format!(
+                "sidecar version {} is lower than required version {} for encoded sources",
+                self.version, req_ver
+            ));
+        }
+
+        for (&hash, entry) in &self.stages {
+            let hash_hex = format_shader_hash(hash);
+            if let Some(mo) = entry.mesh_output
+                && (entry.stage != ShaderStage::Compute || !mo.is_valid())
+            {
+                errors.push(format!(
+                    "stage {hash_hex}: invalid mesh_output ({mo:?}) for stage {}",
+                    entry.stage.as_str()
+                ));
+            }
+            let mut seen_slots = BTreeSet::new();
+            let mut stride_specs = Vec::new();
+            for b in &entry.bindings {
+                if !seen_slots.insert((b.group, b.binding)) {
+                    errors.push(format!(
+                        "stage {hash_hex}: duplicate @group({}) @binding({})",
+                        b.group, b.binding
+                    ));
+                }
+                if b.source.is_unresolved() && !b.kind.allows_unresolved() {
+                    errors.push(format!(
+                        "stage {hash_hex}: writable binding @group({}) @binding({}) ({}) cannot be unresolved",
+                        b.group,
+                        b.binding,
+                        b.kind.as_str()
+                    ));
+                }
+                match &b.source {
+                    SidecarBindingSource::RootDescriptor {
+                        table_byte_offset: Some(tbo),
+                        ..
+                    } if tbo % 32 != 0 => {
+                        errors.push(format!(
+                            "stage {hash_hex}: root_descriptor table_byte_offset {tbo} is not 32-byte aligned"
+                        ));
+                    }
+                    SidecarBindingSource::SamplerHeap {
+                        stride,
+                        index_shift,
+                        ..
+                    } => {
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: BindlessHeapKind::Sampler,
+                            stride_bytes: *stride,
+                            shift: Some(*index_shift),
+                            max_count: None,
+                        });
+                    }
+                    SidecarBindingSource::ResourceHeap {
+                        stride,
+                        index_shift,
+                        ..
+                    } => {
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: infer_resource_heap_kind(b.kind.as_str()),
+                            stride_bytes: *stride,
+                            shift: Some(*index_shift),
+                            max_count: None,
+                        });
+                    }
+                    SidecarBindingSource::CbvIndexedSamplerHeap(h) => {
+                        let s = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                            1u32 << h.shift
+                        } else {
+                            h.stride
+                        };
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: BindlessHeapKind::Sampler,
+                            stride_bytes: s,
+                            shift: Some(h.shift),
+                            max_count: None,
+                        });
+                    }
+                    SidecarBindingSource::CbvIndexedResourceHeap(h) => {
+                        let s = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                            1u32 << h.shift
+                        } else {
+                            h.stride
+                        };
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: infer_resource_heap_kind(b.kind.as_str()),
+                            stride_bytes: s,
+                            shift: Some(h.shift),
+                            max_count: None,
+                        });
+                    }
+                    SidecarBindingSource::LaneIndexedSamplerHeap(h) => {
+                        let s = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                            1u32 << h.shift
+                        } else {
+                            h.stride
+                        };
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: BindlessHeapKind::Sampler,
+                            stride_bytes: s,
+                            shift: Some(h.shift),
+                            max_count: Some(h.max_count),
+                        });
+                    }
+                    SidecarBindingSource::LaneIndexedResourceHeap(h) => {
+                        let s = if h.stride == 0 && h.shift > 0 && h.shift < 32 {
+                            1u32 << h.shift
+                        } else {
+                            h.stride
+                        };
+                        stride_specs.push(BindlessArrayStrideSpec {
+                            group: b.group,
+                            binding: b.binding,
+                            name: format!("g{}_b{}", b.group, b.binding),
+                            heap_kind: infer_resource_heap_kind(b.kind.as_str()),
+                            stride_bytes: s,
+                            shift: Some(h.shift),
+                            max_count: Some(h.max_count),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            for v in validate_bindless_array_strides(&stride_specs) {
+                errors.push(format!("stage {hash_hex}: {}", v.detail));
+            }
+        }
+
+        errors
+    }
+
+    /// Render deterministic `playgta6-stage-reflection` JSON compatible with
+    /// `runtime/gpu/stage_reflection.cpp` (`parse_stage_reflection_json`) and
+    /// `tools/stage_reflection_sidecar.py`.
+    pub fn render_json(&self) -> String {
+        let ver = self.version.max(self.required_version());
+        let mut out = String::new();
+        out.push_str("{\n");
+        let _ = writeln!(out, "  \"schema\": \"{STAGE_REFLECTION_SCHEMA}\",");
+        let _ = writeln!(out, "  \"version\": {ver},");
+        out.push_str("  \"stages\": ");
+        write_object(&mut out, "  ", &hash_keyed(&self.stages), |out, entry| {
+            out.push_str("{\n");
+            let _ = writeln!(out, "      \"stage\": \"{}\",", entry.stage.as_str());
+            if entry.bindings.is_empty() {
+                out.push_str("      \"bindings\": []");
+            } else {
+                out.push_str("      \"bindings\": [\n");
+                for (i, b) in entry.bindings.iter().enumerate() {
+                    out.push_str("        ");
+                    b.write_json(out);
+                    out.push_str(if i + 1 < entry.bindings.len() {
+                        ",\n"
+                    } else {
+                        "\n"
+                    });
+                }
+                out.push_str("      ]");
+            }
+            if !entry.vertex_inputs.is_empty() {
+                out.push_str(",\n      \"vertex_inputs\": ");
+                write_wgsl_vertex_inputs_json(out, &entry.vertex_inputs, "      ");
+            }
+            if let Some(mo) = entry.mesh_output {
+                out.push_str(",\n      \"mesh_output\": ");
+                write_mesh_output_json(out, mo);
+            }
+            if entry.rt_arena {
+                out.push_str(",\n      \"rt_arena\": true");
+            }
+            out.push_str("\n    }");
+        });
+        out.push_str("\n}\n");
+        out
+    }
 }
 
 #[cfg(test)]

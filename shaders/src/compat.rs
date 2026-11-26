@@ -49,6 +49,21 @@ pub const WEBGPU_MAX_SAMPLERS_PER_SHADER_STAGE: usize = 16;
 /// WebGPU baseline default `maxStorageTexturesPerShaderStage`.
 pub const WEBGPU_MAX_STORAGE_TEXTURES_PER_SHADER_STAGE: usize = 4;
 
+/// WebGPU baseline default `maxColorAttachments` (8 MRTs for deferred G-buffer passes).
+pub const WEBGPU_MAX_COLOR_ATTACHMENTS: u32 = 8;
+
+/// WebGPU baseline default `maxInterStageShaderVariables`.
+pub const WEBGPU_MAX_INTER_STAGE_SHADER_VARIABLES: u32 = 16;
+
+/// WebGPU baseline default `maxVertexAttributes`.
+pub const WEBGPU_MAX_VERTEX_ATTRIBUTES: u32 = 16;
+
+/// WebGPU baseline default `maxUniformBufferBindingSize` (64 KiB).
+pub const WEBGPU_MAX_UNIFORM_BUFFER_BINDING_SIZE: u64 = 65_536;
+
+/// WebGPU baseline default `maxStorageBufferBindingSize` (128 MiB).
+pub const WEBGPU_MAX_STORAGE_BUFFER_BINDING_SIZE: u64 = 134_217_728;
+
 // ---------------------------------------------------------------------------
 // SPIR-V Binary Format Constants (Khronos SPIR-V Unified Registry)
 // ---------------------------------------------------------------------------
@@ -251,6 +266,13 @@ pub enum CompatIssueKind {
     SamplerLimitExceeded,
     StorageTextureLimitExceeded,
     OverrideWorkgroupSize,
+    // 3D scene / MRT / interface / RT arena compatibility findings (S71)
+    ColorAttachmentLimitExceeded,
+    InterStageVariablesLimitExceeded,
+    VertexAttributeLimitExceeded,
+    UniformBufferBindingSizeExceeded,
+    StorageBufferBindingSizeExceeded,
+    RtArenaUnsupported,
 }
 
 impl CompatIssueKind {
@@ -283,6 +305,12 @@ impl CompatIssueKind {
             Self::SamplerLimitExceeded => "SamplerLimitExceeded",
             Self::StorageTextureLimitExceeded => "StorageTextureLimitExceeded",
             Self::OverrideWorkgroupSize => "OverrideWorkgroupSize",
+            Self::ColorAttachmentLimitExceeded => "ColorAttachmentLimitExceeded",
+            Self::InterStageVariablesLimitExceeded => "InterStageVariablesLimitExceeded",
+            Self::VertexAttributeLimitExceeded => "VertexAttributeLimitExceeded",
+            Self::UniformBufferBindingSizeExceeded => "UniformBufferBindingSizeExceeded",
+            Self::StorageBufferBindingSizeExceeded => "StorageBufferBindingSizeExceeded",
+            Self::RtArenaUnsupported => "RtArenaUnsupported",
         }
     }
 }
@@ -1940,6 +1968,8 @@ fn collect_calls_in_block(block: &naga::Block, callees: &mut Vec<naga::Handle<na
 pub enum WebGpuFeature {
     /// `bgra8unorm-storage` — `texture_storage_2d<bgra8unorm, ...>` read/write storage textures.
     Bgra8UnormStorage,
+    /// `binding-array` — bindless `binding_array<T, N>` / non-uniform descriptor indexing extension.
+    BindingArray,
     /// `clip-distances` — `@builtin(clip_distances)` vertex clipping planes.
     ClipDistances,
     /// `depth-clip-control` — unclipped depth (`unclippedDepth: true`).
@@ -1972,6 +2002,7 @@ impl WebGpuFeature {
     /// All known optional WebGPU features in canonical ascending order.
     pub const ALL: &'static [Self] = &[
         Self::Bgra8UnormStorage,
+        Self::BindingArray,
         Self::ClipDistances,
         Self::DepthClipControl,
         Self::Depth32FloatStencil8,
@@ -1991,6 +2022,7 @@ impl WebGpuFeature {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Bgra8UnormStorage => "bgra8unorm-storage",
+            Self::BindingArray => "binding-array",
             Self::ClipDistances => "clip-distances",
             Self::DepthClipControl => "depth-clip-control",
             Self::Depth32FloatStencil8 => "depth32float-stencil8",
@@ -2078,6 +2110,16 @@ impl WebGpuFeature {
         }
     }
 
+    /// Return `Some(Float32Filterable)` when `format` is a 32-bit float texture sampled with a
+    /// filtering sampler (`r32float`, `rg32float`, `rgba32float`).
+    pub fn required_for_filterable_float_format(format: &str) -> Option<Self> {
+        let normalized = format.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "r32float" | "rg32float" | "rgba32float" => Some(Self::Float32Filterable),
+            _ => None,
+        }
+    }
+
     /// Deterministically detect optional WebGPU features required by a WGSL source module.
     ///
     /// Safely ignores empty inputs, line comments (`//`), and nested block comments (`/* ... */`).
@@ -2130,6 +2172,9 @@ impl WebGpuFeature {
         }
         if uses_wgsl_subgroups(&stripped) {
             features.insert(Self::Subgroups);
+        }
+        if contains_wgsl_ident(&stripped, "binding_array") {
+            features.insert(Self::BindingArray);
         }
 
         features
@@ -2285,6 +2330,9 @@ impl WebGpuFeature {
                             collect_naga_binding_features(binding, &mut features);
                         }
                     }
+                }
+                naga::TypeInner::BindingArray { .. } => {
+                    features.insert(Self::BindingArray);
                 }
                 _ => {}
             }
@@ -3379,6 +3427,1008 @@ fn first_non_empty_line(text: &str) -> &str {
 
 fn escape_md_cell(text: &str) -> String {
     text.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+// ---------------------------------------------------------------------------
+// 3D Scene / Deferred / Bindless / Mesh / RT WebGPU Compatibility Auditing (S71)
+// ---------------------------------------------------------------------------
+
+/// Extended WebGPU limits profile for 3D PBR, deferred 8-MRT, compute, bindless, mesh, and RT
+/// pipelines (`GPUSupportedLimits`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pipeline3dLimits {
+    pub max_bind_groups: u32,
+    pub max_bindings_per_bind_group: usize,
+    pub max_dynamic_uniform_buffers_per_pipeline_layout: usize,
+    pub max_dynamic_storage_buffers_per_pipeline_layout: usize,
+    pub max_sampled_textures_per_shader_stage: usize,
+    pub max_samplers_per_shader_stage: usize,
+    pub max_storage_buffers_per_shader_stage: usize,
+    pub max_storage_textures_per_shader_stage: usize,
+    pub max_uniform_buffers_per_shader_stage: usize,
+    pub max_color_attachments: u32,
+    pub max_inter_stage_shader_variables: u32,
+    pub max_vertex_attributes: u32,
+    pub max_uniform_buffer_binding_size: u64,
+    pub max_storage_buffer_binding_size: u64,
+    pub max_compute_workgroup_size_x: u32,
+    pub max_compute_workgroup_size_y: u32,
+    pub max_compute_workgroup_size_z: u32,
+    pub max_compute_invocations_per_workgroup: u32,
+    pub max_compute_workgroup_storage_size: u32,
+}
+
+impl Pipeline3dLimits {
+    /// Strict WebGPU spec baseline defaults (including 8 MRTs and 16 inter-stage variables).
+    pub const fn webgpu_baseline() -> Self {
+        Self {
+            max_bind_groups: WEBGPU_MAX_BIND_GROUPS,
+            max_bindings_per_bind_group: WEBGPU_MAX_BINDINGS_PER_BIND_GROUP,
+            max_dynamic_uniform_buffers_per_pipeline_layout:
+                WEBGPU_MAX_DYNAMIC_UNIFORM_BUFFERS_PER_PIPELINE_LAYOUT,
+            max_dynamic_storage_buffers_per_pipeline_layout:
+                WEBGPU_MAX_DYNAMIC_STORAGE_BUFFERS_PER_PIPELINE_LAYOUT,
+            max_sampled_textures_per_shader_stage: WEBGPU_MAX_SAMPLED_TEXTURES_PER_SHADER_STAGE,
+            max_samplers_per_shader_stage: WEBGPU_MAX_SAMPLERS_PER_SHADER_STAGE,
+            max_storage_buffers_per_shader_stage: WEBGPU_MAX_STORAGE_BUFFERS_PER_SHADER_STAGE,
+            max_storage_textures_per_shader_stage: WEBGPU_MAX_STORAGE_TEXTURES_PER_SHADER_STAGE,
+            max_uniform_buffers_per_shader_stage: WEBGPU_MAX_UNIFORM_BUFFERS_PER_SHADER_STAGE,
+            max_color_attachments: WEBGPU_MAX_COLOR_ATTACHMENTS,
+            max_inter_stage_shader_variables: WEBGPU_MAX_INTER_STAGE_SHADER_VARIABLES,
+            max_vertex_attributes: WEBGPU_MAX_VERTEX_ATTRIBUTES,
+            max_uniform_buffer_binding_size: WEBGPU_MAX_UNIFORM_BUFFER_BINDING_SIZE,
+            max_storage_buffer_binding_size: WEBGPU_MAX_STORAGE_BUFFER_BINDING_SIZE,
+            max_compute_workgroup_size_x: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_X,
+            max_compute_workgroup_size_y: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Y,
+            max_compute_workgroup_size_z: WEBGPU_MAX_COMPUTE_WORKGROUP_SIZE_Z,
+            max_compute_invocations_per_workgroup: WEBGPU_MAX_COMPUTE_INVOCATIONS_PER_WORKGROUP,
+            max_compute_workgroup_storage_size: WEBGPU_MAX_COMPUTE_WORKGROUP_STORAGE_SIZE,
+        }
+    }
+
+    /// Promote a [`WebGpuLimits`] into [`Pipeline3dLimits`], using baseline defaults for 3D
+    /// attachment/inter-stage/binding-size ceilings.
+    pub const fn from_webgpu_limits(base: &WebGpuLimits) -> Self {
+        Self {
+            max_bind_groups: base.max_bind_groups,
+            max_bindings_per_bind_group: base.max_bindings_per_bind_group,
+            max_dynamic_uniform_buffers_per_pipeline_layout:
+                base.max_dynamic_uniform_buffers_per_pipeline_layout,
+            max_dynamic_storage_buffers_per_pipeline_layout:
+                base.max_dynamic_storage_buffers_per_pipeline_layout,
+            max_sampled_textures_per_shader_stage: base.max_sampled_textures_per_shader_stage,
+            max_samplers_per_shader_stage: base.max_samplers_per_shader_stage,
+            max_storage_buffers_per_shader_stage: base.max_storage_buffers_per_shader_stage,
+            max_storage_textures_per_shader_stage: base.max_storage_textures_per_shader_stage,
+            max_uniform_buffers_per_shader_stage: base.max_uniform_buffers_per_shader_stage,
+            max_color_attachments: WEBGPU_MAX_COLOR_ATTACHMENTS,
+            max_inter_stage_shader_variables: WEBGPU_MAX_INTER_STAGE_SHADER_VARIABLES,
+            max_vertex_attributes: WEBGPU_MAX_VERTEX_ATTRIBUTES,
+            max_uniform_buffer_binding_size: WEBGPU_MAX_UNIFORM_BUFFER_BINDING_SIZE,
+            max_storage_buffer_binding_size: WEBGPU_MAX_STORAGE_BUFFER_BINDING_SIZE,
+            max_compute_workgroup_size_x: base.max_compute_workgroup_size_x,
+            max_compute_workgroup_size_y: base.max_compute_workgroup_size_y,
+            max_compute_workgroup_size_z: base.max_compute_workgroup_size_z,
+            max_compute_invocations_per_workgroup: base.max_compute_invocations_per_workgroup,
+            max_compute_workgroup_storage_size: base.max_compute_workgroup_storage_size,
+        }
+    }
+
+    /// Convert core fields back into [`WebGpuLimits`].
+    pub const fn to_webgpu_limits(&self) -> WebGpuLimits {
+        WebGpuLimits {
+            max_bind_groups: self.max_bind_groups,
+            max_bindings_per_bind_group: self.max_bindings_per_bind_group,
+            max_dynamic_uniform_buffers_per_pipeline_layout:
+                self.max_dynamic_uniform_buffers_per_pipeline_layout,
+            max_dynamic_storage_buffers_per_pipeline_layout:
+                self.max_dynamic_storage_buffers_per_pipeline_layout,
+            max_storage_buffers_per_shader_stage: self.max_storage_buffers_per_shader_stage,
+            max_uniform_buffers_per_shader_stage: self.max_uniform_buffers_per_shader_stage,
+            max_sampled_textures_per_shader_stage: self.max_sampled_textures_per_shader_stage,
+            max_samplers_per_shader_stage: self.max_samplers_per_shader_stage,
+            max_storage_textures_per_shader_stage: self.max_storage_textures_per_shader_stage,
+            max_compute_workgroup_size_x: self.max_compute_workgroup_size_x,
+            max_compute_workgroup_size_y: self.max_compute_workgroup_size_y,
+            max_compute_workgroup_size_z: self.max_compute_workgroup_size_z,
+            max_compute_invocations_per_workgroup: self.max_compute_invocations_per_workgroup,
+            max_compute_workgroup_storage_size: self.max_compute_workgroup_storage_size,
+        }
+    }
+}
+
+impl Default for Pipeline3dLimits {
+    fn default() -> Self {
+        Self::webgpu_baseline()
+    }
+}
+
+/// Target browser/runtime WebGPU profile for 3D scene pre-flight compatibility checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pipeline3dProfile {
+    pub enabled_features: BTreeSet<WebGpuFeature>,
+    pub limits: Pipeline3dLimits,
+    /// Whether the target WebGPU runtime supports non-uniform descriptor indexing / binding arrays.
+    pub supports_non_uniform_indexing: bool,
+    /// Whether the runtime provides the group-3 RT BVH arena prelude (G80 / S65).
+    pub supports_rt_arena: bool,
+}
+
+impl Pipeline3dProfile {
+    /// Strict WebGPU core baseline (no optional features, spec default limits).
+    pub fn baseline() -> Self {
+        Self {
+            enabled_features: BTreeSet::new(),
+            limits: Pipeline3dLimits::webgpu_baseline(),
+            supports_non_uniform_indexing: false,
+            supports_rt_arena: false,
+        }
+    }
+
+    /// Desktop 3D Main Menu / PBR deferred target profile (`texture-compression-bc`,
+    /// `depth32float-stencil8`, `bgra8unorm-storage`, `float32-filterable`,
+    /// `rg11b10ufloat-renderable`, `shader-f16`, `subgroups`, RT arena enabled).
+    pub fn desktop_3d_target() -> Self {
+        let mut enabled_features = BTreeSet::new();
+        for f in [
+            WebGpuFeature::Bgra8UnormStorage,
+            WebGpuFeature::Depth32FloatStencil8,
+            WebGpuFeature::Float32Filterable,
+            WebGpuFeature::Rg11b10UfloatRenderable,
+            WebGpuFeature::ShaderF16,
+            WebGpuFeature::Subgroups,
+            WebGpuFeature::TextureCompressionBc,
+        ] {
+            enabled_features.insert(f);
+        }
+        Self {
+            enabled_features,
+            limits: Pipeline3dLimits::webgpu_baseline(),
+            supports_non_uniform_indexing: false,
+            supports_rt_arena: true,
+        }
+    }
+
+    /// Full desktop 3D + bindless profile (all desktop 3D features plus `binding-array` and
+    /// non-uniform indexing).
+    pub fn desktop_3d_bindless_target() -> Self {
+        let mut profile = Self::desktop_3d_target();
+        profile.enabled_features.insert(WebGpuFeature::BindingArray);
+        profile.supports_non_uniform_indexing = true;
+        profile
+    }
+
+    /// Lift an existing [`WebGpuDeviceProfile`] into [`Pipeline3dProfile`].
+    pub fn from_device_profile(profile: &WebGpuDeviceProfile) -> Self {
+        let supports_binding_array = profile
+            .enabled_features
+            .contains(&WebGpuFeature::BindingArray);
+        Self {
+            enabled_features: profile.enabled_features.clone(),
+            limits: Pipeline3dLimits::from_webgpu_limits(&profile.limits),
+            supports_non_uniform_indexing: supports_binding_array,
+            supports_rt_arena: true,
+        }
+    }
+}
+
+impl Default for Pipeline3dProfile {
+    fn default() -> Self {
+        Self::baseline()
+    }
+}
+
+/// Per-stage resource counts, interface metrics, and feature requirements for a 3D pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pipeline3dStageSpec {
+    pub stage: crate::convert::ShaderStage,
+    pub label: String,
+    pub sampled_textures: usize,
+    pub samplers: usize,
+    pub storage_buffers: usize,
+    pub storage_textures: usize,
+    pub uniform_buffers: usize,
+    pub max_uniform_buffer_binding_size: u64,
+    pub max_storage_buffer_binding_size: u64,
+    pub vertex_attributes: u32,
+    pub inter_stage_variables: u32,
+    pub color_attachments: u32,
+    pub compute_workgroup_size: Option<[u32; 3]>,
+    pub compute_workgroup_storage_bytes: u32,
+    pub uses_binding_array: bool,
+    pub uses_non_uniform_indexing: bool,
+    pub uses_rt_arena: bool,
+    pub uses_mesh_compute: bool,
+    pub required_features: BTreeSet<WebGpuFeature>,
+}
+
+impl Pipeline3dStageSpec {
+    pub fn new(stage: crate::convert::ShaderStage, label: impl Into<String>) -> Self {
+        Self {
+            stage,
+            label: label.into(),
+            sampled_textures: 0,
+            samplers: 0,
+            storage_buffers: 0,
+            storage_textures: 0,
+            uniform_buffers: 0,
+            max_uniform_buffer_binding_size: 0,
+            max_storage_buffer_binding_size: 0,
+            vertex_attributes: 0,
+            inter_stage_variables: 0,
+            color_attachments: 0,
+            compute_workgroup_size: None,
+            compute_workgroup_storage_bytes: 0,
+            uses_binding_array: false,
+            uses_non_uniform_indexing: false,
+            uses_rt_arena: false,
+            uses_mesh_compute: false,
+            required_features: BTreeSet::new(),
+        }
+    }
+
+    /// Scan WGSL source and attach any required optional WebGPU features (`shader-f16`,
+    /// `subgroups`, `bgra8unorm-storage`, `binding-array`, `clip-distances`, `dual-source-blending`).
+    pub fn add_wgsl_source(&mut self, wgsl: &str) {
+        let feats = WebGpuFeature::required_for_wgsl_source(wgsl);
+        if feats.contains(&WebGpuFeature::BindingArray) {
+            self.uses_binding_array = true;
+        }
+        self.required_features.extend(feats);
+    }
+
+    /// Record texture, storage-texture, render-attachment, and filterable-float format features.
+    pub fn add_formats(
+        &mut self,
+        sampled_formats: &[&str],
+        storage_formats: &[&str],
+        render_attachment_formats: &[&str],
+        filterable_float_formats: &[&str],
+    ) {
+        for &fmt in sampled_formats {
+            if let Some(f) = WebGpuFeature::required_for_texture_format(fmt) {
+                self.required_features.insert(f);
+            }
+        }
+        for &fmt in storage_formats {
+            if let Some(f) = WebGpuFeature::required_for_storage_texture_format(fmt) {
+                self.required_features.insert(f);
+            }
+        }
+        for &fmt in render_attachment_formats {
+            if let Some(f) = WebGpuFeature::required_for_render_attachment_format(fmt) {
+                self.required_features.insert(f);
+            }
+        }
+        for &fmt in filterable_float_formats {
+            if let Some(f) = WebGpuFeature::required_for_filterable_float_format(fmt) {
+                self.required_features.insert(f);
+            }
+        }
+    }
+}
+
+/// Pipeline-wide + per-stage input for [`evaluate_pipeline_3d_compat`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pipeline3dCompatInput {
+    pub pipeline_name: String,
+    pub bind_group_indices: BTreeSet<u32>,
+    pub bindings_per_group: BTreeMap<u32, usize>,
+    pub dynamic_uniform_buffers: usize,
+    pub dynamic_storage_buffers: usize,
+    pub stages: Vec<Pipeline3dStageSpec>,
+}
+
+impl Pipeline3dCompatInput {
+    /// Construct a [`Pipeline3dCompatInput`] directly from a merged [`crate::reflect::PipelineLayoutDesc`]
+    /// and its stage [`crate::reflect::EntryPointReflection`] entries.
+    pub fn from_reflections(
+        pipeline_name: impl Into<String>,
+        layout: &crate::reflect::PipelineLayoutDesc,
+        stages: &[&crate::reflect::EntryPointReflection],
+    ) -> Self {
+        use crate::reflect::{BindingLayout, BufferBindingType, stage_visibility};
+
+        let mut input = Self {
+            pipeline_name: pipeline_name.into(),
+            ..Self::default()
+        };
+
+        for (g_idx, bgl) in layout.bind_group_layouts.iter().enumerate() {
+            if !bgl.entries.is_empty() {
+                input.bind_group_indices.insert(g_idx as u32);
+                input.bindings_per_group.insert(g_idx as u32, bgl.entries.len());
+            }
+            for e in &bgl.entries {
+                if let BindingLayout::Buffer {
+                    ty,
+                    has_dynamic_offset: true,
+                    ..
+                } = e.layout
+                {
+                    if ty == BufferBindingType::Uniform {
+                        input.dynamic_uniform_buffers += 1;
+                    } else {
+                        input.dynamic_storage_buffers += 1;
+                    }
+                }
+            }
+        }
+
+        for ep in stages {
+            let mut spec = Pipeline3dStageSpec::new(ep.stage, &ep.name);
+            let bit = stage_visibility(ep.stage);
+            for bgl in &layout.bind_group_layouts {
+                for e in &bgl.entries {
+                    if (e.visibility & bit) == 0 {
+                        continue;
+                    }
+                    match e.layout {
+                        BindingLayout::Buffer {
+                            ty: BufferBindingType::Uniform,
+                            min_binding_size,
+                            ..
+                        } => {
+                            spec.uniform_buffers += 1;
+                            spec.max_uniform_buffer_binding_size =
+                                spec.max_uniform_buffer_binding_size.max(min_binding_size);
+                        }
+                        BindingLayout::Buffer {
+                            min_binding_size, ..
+                        } => {
+                            spec.storage_buffers += 1;
+                            spec.max_storage_buffer_binding_size =
+                                spec.max_storage_buffer_binding_size.max(min_binding_size);
+                        }
+                        BindingLayout::Sampler { .. } => spec.samplers += 1,
+                        BindingLayout::Texture { .. } => spec.sampled_textures += 1,
+                        BindingLayout::StorageTexture { format, .. } => {
+                            spec.storage_textures += 1;
+                            if let Some(f) = WebGpuFeature::required_for_storage_texture_format(format) {
+                                spec.required_features.insert(f);
+                            }
+                        }
+                    }
+                }
+            }
+            for b in &ep.bindings {
+                if b.binding_array.is_some() {
+                    spec.uses_binding_array = true;
+                    spec.required_features.insert(WebGpuFeature::BindingArray);
+                }
+            }
+            spec.vertex_attributes = ep
+                .vertex_inputs
+                .iter()
+                .map(|io| io.location.saturating_add(1))
+                .max()
+                .unwrap_or(0)
+                .max(ep.vertex_inputs.len() as u32);
+            spec.color_attachments = ep
+                .fragment_outputs
+                .iter()
+                .map(|io| io.location.saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            spec.compute_workgroup_size = ep.workgroup_size;
+            input.stages.push(spec);
+        }
+
+        input
+    }
+}
+
+/// Structured limit violation emitted by [`evaluate_pipeline_3d_compat`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pipeline3dLimitViolation {
+    pub stage: Option<crate::convert::ShaderStage>,
+    pub kind: CompatIssueKind,
+    pub limit_name: &'static str,
+    pub actual: u128,
+    pub limit: u128,
+    pub detail: String,
+}
+
+/// Structured CI/packer pre-flight WebGPU compatibility report for a 3D pipeline.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Pipeline3dCompatReport {
+    pub pipeline_name: String,
+    pub required_features: Vec<WebGpuFeature>,
+    pub missing_features: Vec<WebGpuFeature>,
+    pub limit_violations: Vec<Pipeline3dLimitViolation>,
+    pub audit: CompatAudit,
+    pub uses_binding_array: bool,
+    pub uses_non_uniform_indexing: bool,
+    pub uses_rt_arena: bool,
+    pub uses_mesh_compute: bool,
+}
+
+impl Pipeline3dCompatReport {
+    pub fn is_compatible(&self) -> bool {
+        self.missing_features.is_empty()
+            && self.limit_violations.is_empty()
+            && !self.audit.has_blockers()
+    }
+
+    pub fn required_feature_names(&self) -> Vec<&'static str> {
+        self.required_features.iter().map(|f| f.as_str()).collect()
+    }
+
+    pub fn missing_feature_names(&self) -> Vec<&'static str> {
+        self.missing_features.iter().map(|f| f.as_str()).collect()
+    }
+
+    /// Single-line sanitized CI diagnostic summary.
+    pub fn to_summary_line(&self) -> String {
+        let status = if self.is_compatible() { "PASS" } else { "FAIL" };
+        format!(
+            "[{status}] {} (required_features={}, missing_features={}, limit_violations={}, blockers={}, warnings={})",
+            self.pipeline_name,
+            self.required_features.len(),
+            self.missing_features.len(),
+            self.limit_violations.len(),
+            self.audit.blocker_count(),
+            self.audit.warning_count(),
+        )
+    }
+
+    /// Render a strictly sanitized deterministic JSON report suitable for CI / packer pre-flight.
+    pub fn to_json(&self) -> String {
+        use crate::pack::write_json_string;
+
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str("  \"pipeline\": ");
+        write_json_string(&mut out, &self.pipeline_name);
+        out.push_str(",\n");
+        let _ = writeln!(out, "  \"compatible\": {},", self.is_compatible());
+        let _ = writeln!(out, "  \"uses_binding_array\": {},", self.uses_binding_array);
+        let _ = writeln!(
+            out,
+            "  \"uses_non_uniform_indexing\": {},",
+            self.uses_non_uniform_indexing
+        );
+        let _ = writeln!(out, "  \"uses_rt_arena\": {},", self.uses_rt_arena);
+        let _ = writeln!(out, "  \"uses_mesh_compute\": {},", self.uses_mesh_compute);
+
+        out.push_str("  \"required_features\": [");
+        for (i, f) in self.required_features.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            write_json_string(&mut out, f.as_str());
+        }
+        out.push_str("],\n");
+
+        out.push_str("  \"missing_features\": [");
+        for (i, f) in self.missing_features.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            write_json_string(&mut out, f.as_str());
+        }
+        out.push_str("],\n");
+
+        out.push_str("  \"limit_violations\": [");
+        for (i, v) in self.limit_violations.iter().enumerate() {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            let stage_json = match v.stage {
+                Some(s) => format!("\"{}\"", s.as_str()),
+                None => "null".to_string(),
+            };
+            let _ = write!(
+                out,
+                "{{\"stage\":{stage_json},\"kind\":\"{}\",\"limit\":\"{}\",\"actual\":{},\"max\":{},\"detail\":",
+                v.kind.as_str(),
+                v.limit_name,
+                v.actual,
+                v.limit
+            );
+            write_json_string(&mut out, &v.detail);
+            out.push('}');
+        }
+        out.push_str("],\n");
+
+        let _ = writeln!(out, "  \"blocker_count\": {},", self.audit.blocker_count());
+        let _ = writeln!(out, "  \"warning_count\": {}", self.audit.warning_count());
+        out.push_str("}\n");
+        out
+    }
+}
+
+/// Evaluate a 3D PBR / deferred / compute / bindless / mesh / RT pipeline against a
+/// [`Pipeline3dProfile`], checking all per-stage & pipeline-wide WebGPU limits and optional
+/// features deterministically.
+pub fn evaluate_pipeline_3d_compat(
+    input: &Pipeline3dCompatInput,
+    profile: &Pipeline3dProfile,
+) -> Pipeline3dCompatReport {
+    let limits = &profile.limits;
+    let mut required_set: BTreeSet<WebGpuFeature> = BTreeSet::new();
+    let mut limit_violations: Vec<Pipeline3dLimitViolation> = Vec::new();
+    let mut audit = CompatAudit::default();
+
+    let mut uses_binding_array = false;
+    let mut uses_non_uniform_indexing = false;
+    let mut uses_rt_arena = false;
+    let mut uses_mesh_compute = false;
+
+    for st in &input.stages {
+        required_set.extend(st.required_features.iter().copied());
+        if st.uses_binding_array {
+            uses_binding_array = true;
+            required_set.insert(WebGpuFeature::BindingArray);
+        }
+        if st.uses_non_uniform_indexing {
+            uses_non_uniform_indexing = true;
+            required_set.insert(WebGpuFeature::BindingArray);
+        }
+        if st.uses_rt_arena {
+            uses_rt_arena = true;
+        }
+        if st.uses_mesh_compute {
+            uses_mesh_compute = true;
+        }
+    }
+
+    let required_features: Vec<WebGpuFeature> = required_set.iter().copied().collect();
+    let mut missing_features: Vec<WebGpuFeature> = Vec::new();
+    for &feat in &required_features {
+        if !profile.enabled_features.contains(&feat) {
+            missing_features.push(feat);
+            audit.push_unique(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::RequiredFeatureMissing,
+                message: format!(
+                    "pipeline '{}' requires WebGPU feature '{}', which is absent from target profile",
+                    input.pipeline_name,
+                    feat.as_str()
+                ),
+                hint: Some(format!(
+                    "request '{}' in GPUAdapter.requestDevice(requiredFeatures) or enable fallback path",
+                    feat.as_str()
+                )),
+            });
+        }
+    }
+
+    if uses_non_uniform_indexing && !profile.supports_non_uniform_indexing {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::BindlessDescriptorIndexing,
+            message: format!(
+                "pipeline '{}' uses non-uniform bindless descriptor indexing unsupported by target profile",
+                input.pipeline_name
+            ),
+            hint: Some(
+                "enable binding-array / non-uniform indexing support or lower to bounded waterfall windows"
+                    .to_string(),
+            ),
+        });
+    }
+
+    if uses_rt_arena && !profile.supports_rt_arena {
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::RtArenaUnsupported,
+            message: format!(
+                "pipeline '{}' requires runtime RT BVH arena bindings (group 3 bindings 16..21), disabled on target profile",
+                input.pipeline_name
+            ),
+            hint: Some("enable RT BVH arena support in the WebGPU worker profile".to_string()),
+        });
+    }
+
+    // Pipeline-wide bind group and dynamic buffer limits.
+    if let Some(&max_group) = input.bind_group_indices.last()
+        && max_group >= limits.max_bind_groups
+    {
+        let actual = u128::from(max_group) + 1;
+        let max_g = u128::from(limits.max_bind_groups);
+        let detail = format!(
+            "bind group index {max_group} requires {actual} bind groups, exceeding maxBindGroups ({max_g})"
+        );
+        limit_violations.push(Pipeline3dLimitViolation {
+            stage: None,
+            kind: CompatIssueKind::BindGroupLimitExceeded,
+            limit_name: "maxBindGroups",
+            actual,
+            limit: max_g,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Blocker,
+            kind: CompatIssueKind::BindGroupLimitExceeded,
+            message: detail,
+            hint: Some(format!("pack bindings into <= {} bind groups", limits.max_bind_groups)),
+        });
+    }
+
+    for (&group, &count) in &input.bindings_per_group {
+        if count > limits.max_bindings_per_bind_group {
+            let detail = format!(
+                "@group({group}) uses {count} bindings, exceeding maxBindingsPerBindGroup ({})",
+                limits.max_bindings_per_bind_group
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: None,
+                kind: CompatIssueKind::BindingsPerBindGroupLimitExceeded,
+                limit_name: "maxBindingsPerBindGroup",
+                actual: count as u128,
+                limit: limits.max_bindings_per_bind_group as u128,
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::BindingsPerBindGroupLimitExceeded,
+                message: detail,
+                hint: Some(format!(
+                    "reduce bindings in @group({group}) to <= {}",
+                    limits.max_bindings_per_bind_group
+                )),
+            });
+        }
+    }
+
+    if input.dynamic_uniform_buffers > limits.max_dynamic_uniform_buffers_per_pipeline_layout {
+        let detail = format!(
+            "pipeline uses {} dynamic uniform buffers, exceeding maxDynamicUniformBuffersPerPipelineLayout ({})",
+            input.dynamic_uniform_buffers, limits.max_dynamic_uniform_buffers_per_pipeline_layout
+        );
+        limit_violations.push(Pipeline3dLimitViolation {
+            stage: None,
+            kind: CompatIssueKind::DynamicUniformBufferLimitExceeded,
+            limit_name: "maxDynamicUniformBuffersPerPipelineLayout",
+            actual: input.dynamic_uniform_buffers as u128,
+            limit: limits.max_dynamic_uniform_buffers_per_pipeline_layout as u128,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::DynamicUniformBufferLimitExceeded,
+            message: detail,
+            hint: None,
+        });
+    }
+
+    if input.dynamic_storage_buffers > limits.max_dynamic_storage_buffers_per_pipeline_layout {
+        let detail = format!(
+            "pipeline uses {} dynamic storage buffers, exceeding maxDynamicStorageBuffersPerPipelineLayout ({})",
+            input.dynamic_storage_buffers, limits.max_dynamic_storage_buffers_per_pipeline_layout
+        );
+        limit_violations.push(Pipeline3dLimitViolation {
+            stage: None,
+            kind: CompatIssueKind::DynamicStorageBufferLimitExceeded,
+            limit_name: "maxDynamicStorageBuffersPerPipelineLayout",
+            actual: input.dynamic_storage_buffers as u128,
+            limit: limits.max_dynamic_storage_buffers_per_pipeline_layout as u128,
+            detail: detail.clone(),
+        });
+        audit.push_once_per_kind(CompatIssue {
+            severity: CompatSeverity::Warning,
+            kind: CompatIssueKind::DynamicStorageBufferLimitExceeded,
+            message: detail,
+            hint: None,
+        });
+    }
+
+    let core_limits = limits.to_webgpu_limits();
+
+    // Per-stage resource, attachment, inter-stage, buffer-size, and compute checks.
+    for st in &input.stages {
+        let stage_opt = Some(st.stage);
+        let stage_counts = StageResourceCounts {
+            storage_buffers: st.storage_buffers,
+            uniform_buffers: st.uniform_buffers,
+            sampled_textures: st.sampled_textures,
+            samplers: st.samplers,
+            storage_textures: st.storage_textures,
+        };
+        check_stage_resource_limits(Some(&st.label), &stage_counts, &core_limits, &mut audit);
+
+        if st.sampled_textures > limits.max_sampled_textures_per_shader_stage {
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::SampledTextureLimitExceeded,
+                limit_name: "maxSampledTexturesPerShaderStage",
+                actual: st.sampled_textures as u128,
+                limit: limits.max_sampled_textures_per_shader_stage as u128,
+                detail: format!(
+                    "stage '{}' uses {} sampled textures (max {})",
+                    st.label, st.sampled_textures, limits.max_sampled_textures_per_shader_stage
+                ),
+            });
+        }
+        if st.samplers > limits.max_samplers_per_shader_stage {
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::SamplerLimitExceeded,
+                limit_name: "maxSamplersPerShaderStage",
+                actual: st.samplers as u128,
+                limit: limits.max_samplers_per_shader_stage as u128,
+                detail: format!(
+                    "stage '{}' uses {} samplers (max {})",
+                    st.label, st.samplers, limits.max_samplers_per_shader_stage
+                ),
+            });
+        }
+        if st.storage_buffers > limits.max_storage_buffers_per_shader_stage {
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::StorageBufferLimitExceeded,
+                limit_name: "maxStorageBuffersPerShaderStage",
+                actual: st.storage_buffers as u128,
+                limit: limits.max_storage_buffers_per_shader_stage as u128,
+                detail: format!(
+                    "stage '{}' uses {} storage buffers (max {})",
+                    st.label, st.storage_buffers, limits.max_storage_buffers_per_shader_stage
+                ),
+            });
+        }
+        if st.storage_textures > limits.max_storage_textures_per_shader_stage {
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::StorageTextureLimitExceeded,
+                limit_name: "maxStorageTexturesPerShaderStage",
+                actual: st.storage_textures as u128,
+                limit: limits.max_storage_textures_per_shader_stage as u128,
+                detail: format!(
+                    "stage '{}' uses {} storage textures (max {})",
+                    st.label, st.storage_textures, limits.max_storage_textures_per_shader_stage
+                ),
+            });
+        }
+        if st.uniform_buffers > limits.max_uniform_buffers_per_shader_stage {
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::UniformBufferLimitExceeded,
+                limit_name: "maxUniformBuffersPerShaderStage",
+                actual: st.uniform_buffers as u128,
+                limit: limits.max_uniform_buffers_per_shader_stage as u128,
+                detail: format!(
+                    "stage '{}' uses {} uniform buffers (max {})",
+                    st.label, st.uniform_buffers, limits.max_uniform_buffers_per_shader_stage
+                ),
+            });
+        }
+        if st.max_uniform_buffer_binding_size > limits.max_uniform_buffer_binding_size {
+            let detail = format!(
+                "stage '{}' requires uniform binding size {} bytes (max {})",
+                st.label,
+                st.max_uniform_buffer_binding_size,
+                limits.max_uniform_buffer_binding_size
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::UniformBufferBindingSizeExceeded,
+                limit_name: "maxUniformBufferBindingSize",
+                actual: u128::from(st.max_uniform_buffer_binding_size),
+                limit: u128::from(limits.max_uniform_buffer_binding_size),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::UniformBufferBindingSizeExceeded,
+                message: detail,
+                hint: Some("lower large constant buffers to read-only storage buffers".to_string()),
+            });
+        }
+        if st.max_storage_buffer_binding_size > limits.max_storage_buffer_binding_size {
+            let detail = format!(
+                "stage '{}' requires storage binding size {} bytes (max {})",
+                st.label,
+                st.max_storage_buffer_binding_size,
+                limits.max_storage_buffer_binding_size
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::StorageBufferBindingSizeExceeded,
+                limit_name: "maxStorageBufferBindingSize",
+                actual: u128::from(st.max_storage_buffer_binding_size),
+                limit: u128::from(limits.max_storage_buffer_binding_size),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::StorageBufferBindingSizeExceeded,
+                message: detail,
+                hint: None,
+            });
+        }
+        if st.color_attachments > limits.max_color_attachments {
+            let detail = format!(
+                "stage '{}' writes {} color attachments (MRT), exceeding maxColorAttachments ({})",
+                st.label, st.color_attachments, limits.max_color_attachments
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::ColorAttachmentLimitExceeded,
+                limit_name: "maxColorAttachments",
+                actual: u128::from(st.color_attachments),
+                limit: u128::from(limits.max_color_attachments),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::ColorAttachmentLimitExceeded,
+                message: detail,
+                hint: Some("pack deferred G-buffer outputs into <= 8 MRT attachments".to_string()),
+            });
+        }
+        if st.inter_stage_variables > limits.max_inter_stage_shader_variables {
+            let detail = format!(
+                "stage '{}' uses {} inter-stage shader variables, exceeding maxInterStageShaderVariables ({})",
+                st.label, st.inter_stage_variables, limits.max_inter_stage_shader_variables
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::InterStageVariablesLimitExceeded,
+                limit_name: "maxInterStageShaderVariables",
+                actual: u128::from(st.inter_stage_variables),
+                limit: u128::from(limits.max_inter_stage_shader_variables),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::InterStageVariablesLimitExceeded,
+                message: detail,
+                hint: Some("pack varyings into vec4 channels within <= 16 inter-stage locations".to_string()),
+            });
+        }
+        if st.vertex_attributes > limits.max_vertex_attributes {
+            let detail = format!(
+                "stage '{}' uses {} vertex attributes, exceeding maxVertexAttributes ({})",
+                st.label, st.vertex_attributes, limits.max_vertex_attributes
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::VertexAttributeLimitExceeded,
+                limit_name: "maxVertexAttributes",
+                actual: u128::from(st.vertex_attributes),
+                limit: u128::from(limits.max_vertex_attributes),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::VertexAttributeLimitExceeded,
+                message: detail,
+                hint: Some("fetch extra vertex attributes via storage buffers".to_string()),
+            });
+        }
+
+        if let Some(wg @ [x, y, z]) = st.compute_workgroup_size {
+            check_workgroup_size_with_limits(wg, Some(&st.label), &core_limits, &mut audit);
+            let total = u128::from(x) * u128::from(y) * u128::from(z);
+            if x == 0 || x > limits.max_compute_workgroup_size_x {
+                limit_violations.push(Pipeline3dLimitViolation {
+                    stage: stage_opt,
+                    kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                    limit_name: "maxComputeWorkgroupSizeX",
+                    actual: u128::from(x),
+                    limit: u128::from(limits.max_compute_workgroup_size_x),
+                    detail: format!(
+                        "stage '{}' workgroup_size.x={x} violates 1..={}",
+                        st.label, limits.max_compute_workgroup_size_x
+                    ),
+                });
+            }
+            if y == 0 || y > limits.max_compute_workgroup_size_y {
+                limit_violations.push(Pipeline3dLimitViolation {
+                    stage: stage_opt,
+                    kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                    limit_name: "maxComputeWorkgroupSizeY",
+                    actual: u128::from(y),
+                    limit: u128::from(limits.max_compute_workgroup_size_y),
+                    detail: format!(
+                        "stage '{}' workgroup_size.y={y} violates 1..={}",
+                        st.label, limits.max_compute_workgroup_size_y
+                    ),
+                });
+            }
+            if z == 0 || z > limits.max_compute_workgroup_size_z {
+                limit_violations.push(Pipeline3dLimitViolation {
+                    stage: stage_opt,
+                    kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                    limit_name: "maxComputeWorkgroupSizeZ",
+                    actual: u128::from(z),
+                    limit: u128::from(limits.max_compute_workgroup_size_z),
+                    detail: format!(
+                        "stage '{}' workgroup_size.z={z} violates 1..={}",
+                        st.label, limits.max_compute_workgroup_size_z
+                    ),
+                });
+            }
+            if total == 0 || total > u128::from(limits.max_compute_invocations_per_workgroup) {
+                limit_violations.push(Pipeline3dLimitViolation {
+                    stage: stage_opt,
+                    kind: CompatIssueKind::WorkgroupSizeLimitExceeded,
+                    limit_name: "maxComputeInvocationsPerWorkgroup",
+                    actual: total,
+                    limit: u128::from(limits.max_compute_invocations_per_workgroup),
+                    detail: format!(
+                        "stage '{}' workgroup_size({x},{y},{z})={total} invocations violates 1..={}",
+                        st.label, limits.max_compute_invocations_per_workgroup
+                    ),
+                });
+            }
+        }
+
+        if st.compute_workgroup_storage_bytes > limits.max_compute_workgroup_storage_size {
+            let detail = format!(
+                "stage '{}' uses {} bytes of workgroup storage, exceeding maxComputeWorkgroupStorageSize ({})",
+                st.label, st.compute_workgroup_storage_bytes, limits.max_compute_workgroup_storage_size
+            );
+            limit_violations.push(Pipeline3dLimitViolation {
+                stage: stage_opt,
+                kind: CompatIssueKind::WorkgroupStorageLimitExceeded,
+                limit_name: "maxComputeWorkgroupStorageSize",
+                actual: u128::from(st.compute_workgroup_storage_bytes),
+                limit: u128::from(limits.max_compute_workgroup_storage_size),
+                detail: detail.clone(),
+            });
+            audit.push_once_per_kind(CompatIssue {
+                severity: CompatSeverity::Blocker,
+                kind: CompatIssueKind::WorkgroupStorageLimitExceeded,
+                message: detail,
+                hint: Some(format!(
+                    "reduce LDS/workgroup storage to <= {} bytes",
+                    limits.max_compute_workgroup_storage_size
+                )),
+            });
+        }
+    }
+
+    limit_violations.sort();
+    audit.sort_deterministic();
+
+    Pipeline3dCompatReport {
+        pipeline_name: input.pipeline_name.clone(),
+        required_features,
+        missing_features,
+        limit_violations,
+        audit,
+        uses_binding_array,
+        uses_non_uniform_indexing,
+        uses_rt_arena,
+        uses_mesh_compute,
+    }
+}
+
+/// Render a deterministic batch JSON compatibility pre-flight report across multiple 3D pipelines.
+pub fn render_pipeline_3d_compat_batch_json(reports: &[Pipeline3dCompatReport]) -> String {
+    let mut ordered: Vec<&Pipeline3dCompatReport> = reports.iter().collect();
+    ordered.sort_by(|a, b| a.pipeline_name.cmp(&b.pipeline_name));
+
+    let total = ordered.len();
+    let compatible_count = ordered.iter().filter(|r| r.is_compatible()).count();
+    let incompatible_count = total - compatible_count;
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    let _ = writeln!(out, "  \"total_pipelines\": {total},");
+    let _ = writeln!(out, "  \"compatible_pipelines\": {compatible_count},");
+    let _ = writeln!(out, "  \"incompatible_pipelines\": {incompatible_count},");
+    if ordered.is_empty() {
+        out.push_str("  \"pipelines\": []\n");
+    } else {
+        out.push_str("  \"pipelines\": [\n");
+        for (i, rep) in ordered.iter().enumerate() {
+            let indented = rep
+                .to_json()
+                .trim_end_matches('\n')
+                .lines()
+                .map(|l| format!("    {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&indented);
+            out.push_str(if i + 1 < ordered.len() { ",\n" } else { "\n" });
+        }
+        out.push_str("  ]\n");
+    }
+    out.push_str("}\n");
+    out
 }
 
 // ---------------------------------------------------------------------------
