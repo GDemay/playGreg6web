@@ -97,6 +97,7 @@ struct BufferResource {
     uint32_t index_stride = 0;
     bool add_tid_enable = false;
     bool resource_level = true;
+    uint32_t llc_noalloc = 0;  // GFX10.3 SQ_BUF_RSRC_WORD3[27:26]
     uint32_t oob_select = Oob::IndexAndOffset;
     uint32_t type = 0;
 };
@@ -114,7 +115,7 @@ struct ImageResource {
     uint32_t sw_mode = 0;  // SWIZZLE_MODE_ENUM (0 = SW_LINEAR)
     uint32_t bc_swizzle = 0;
     uint32_t type = ImageType::Tex2D;
-    uint32_t depth = 1;  // depth (3D) or last array slice + 1 (arrays, cubes: faces)
+    uint32_t depth = 1;  // depth (3D), last array slice + 1 (arrays/cubes), or linear pitch (GFX10.3 linear 1D/2D)
     uint32_t base_array = 0;
     uint32_t array_pitch = 0;
     uint32_t max_mip = 0;  // mip levels of the resource - 1
@@ -125,6 +126,7 @@ struct ImageResource {
     bool prt_default = false;
     bool big_page = false;
     uint32_t counter_bank_id = 0;
+    uint32_t llc_noalloc = 0;  // GFX10.3 SQ_IMG_RSRC_WORD6[9:8]
     bool iterate_256 = false;
     uint32_t max_uncompressed_block_size = 0;
     uint32_t max_compressed_block_size = 0;
@@ -211,8 +213,21 @@ bool component_mapping_from(const Swizzle& format_swizzle, const Swizzle& dst_se
 // ---- Samplers ----
 // D3D12_SAMPLER_DESC <-> S#. The border colour is reduced to the three fixed colours (transparent
 // black, opaque black, opaque white); other colours are reported through *exact = false.
+enum class DegammaOverride : uint8_t { None, ForceDegamma, SkipDegamma };
+DegammaOverride sampler_degamma_override(const SamplerState& s) noexcept;
+
 SamplerState sampler_from_d3d12(const d3d12_state::SamplerDesc& desc, bool* exact = nullptr) noexcept;
-d3d12_state::SamplerDesc d3d12_from_sampler(const SamplerState& s) noexcept;
+d3d12_state::SamplerDesc d3d12_from_sampler(const SamplerState& s, bool* exact = nullptr) noexcept;
+// Comparison-aware S# -> D3D12 conversion: GFX10 S# has no comparison-enable bit (the shader
+// image_sample_c* vs image_sample* opcode selects comparison), so depth_compare_func == 0 (NEVER)
+// is preserved as D3D12_COMPARISON_FUNC_NEVER (1) when comparison == true and stripped when false.
+d3d12_state::SamplerDesc d3d12_from_sampler_for_comparison(const SamplerState& s, bool comparison,
+                                                           bool* exact = nullptr) noexcept;
+
+// GFX10.3 linear 1D/2D T# helpers: for non-array Tex1D/Tex2D with sw_mode == 0 (SW_LINEAR),
+// SQ_IMG_RSRC_WORD4[13:0] stores (pitch - 1) in texels rather than array depth.
+uint32_t image_effective_depth(const ImageResource& d) noexcept;
+uint32_t image_linear_pitch_texels(const ImageResource& d) noexcept;
 
 // Fixed-point helpers (exposed for tests).
 uint32_t lod_to_u4_8(float lod) noexcept;          // clamped to [0, 15.996]

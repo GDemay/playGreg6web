@@ -33,10 +33,11 @@ bool valid_sels(uint32_t word3) noexcept {
            valid_sel(bits(word3, 9, 3));
 }
 
-// IMG_FMT values that are reserved on gfx10 (gfx9_plus_merged_enum.h): 78..127, 155, 285..511
-// (285..287 are VRS-only formats).
+// IMG_FMT values that are reserved on gfx10 / gfx10.3 (gfx9_plus_merged_enum.h):
+// 0, 78..127, 155, 294..511. Formats 285..293 are valid GFX10.3 / NV2X formats
+// (285 = 7E3_FLOAT / Xbox R10G10B10_7E3_A2_FLOAT, 286..287 = YCBCR, 288..293 = MM_12_IN_16_*).
 bool valid_image_format(uint32_t f) noexcept {
-    if (f == 0 || f >= 285) {
+    if (f == 0 || f > 293) {
         return false;
     }
     if (f >= 78 && f <= 127) {
@@ -173,14 +174,27 @@ constexpr FormatEntry kFormats[] = {
     {98, 181, kXYZW},  // BC7_UNORM
     {99, 182, kXYZW},  // BC7_UNORM_SRGB
     {97, 181, kXYZW},  // BC7_TYPELESS
-    // Secondary packed depth/stencil GFX10 IMG_FMTs (reverse lookup only; canonical encode entries above
-    // match first in hardware_format()): 142 8_24_UINT, 143 24_8_UNORM, 144 24_8_UINT, 145 X24_8_32_UINT,
-    // 146 X24_8_32_FLOAT.
+    // Xbox Series / GFX10.3 HDR & extended formats:
+    // 116 R10G10B10_7E3_A2_FLOAT -> IMG_FMT_7E3_FLOAT (285)
+    // 117 R10G10B10_6E4_A2_FLOAT -> IMG_FMT_6E4_FLOAT (131)
+    // 189 R10G10B10_SNORM_A2_UNORM -> IMG_FMT_2_10_10_10_SNORM (51)
+    // 190 R4G4_UNORM -> IMG_FMT_4_4_UNORM (137)
+    {116, 285, kXYZW}, // R10G10B10_7E3_A2_FLOAT (Xbox HDR)
+    {117, 131, kXYZW}, // R10G10B10_6E4_A2_FLOAT (Xbox HDR)
+    {189, 51, kXYZW},  // R10G10B10_SNORM_A2_UNORM (Xbox)
+    {190, 137, kXY01}, // R4G4_UNORM (Xbox)
+    // Secondary packed depth/stencil & image-only GFX10 IMG_FMTs (reverse lookup only; canonical
+    // encode entries above match first in hardware_format()): 142 8_24_UINT, 143 24_8_UNORM (24-bit
+    // depth in Y [31:8], MSB-to-LSB), 144 24_8_UINT (8-bit stencil in X [7:0]), 145 X24_8_32_UINT,
+    // 146 X24_8_32_FLOAT, 128 8_SRGB, 129 8_8_SRGB, 140 32_FLOAT_CLAMP.
     {47, 142, kY001},  // X24_TYPELESS_G8_UINT <- IMG_FMT_8_24_UINT (stencil in Y)
-    {46, 143, kX001},  // R24_UNORM_X8_TYPELESS <- IMG_FMT_24_8_UNORM
-    {47, 144, kX001},  // X24_TYPELESS_G8_UINT <- IMG_FMT_24_8_UINT
+    {46, 143, kY001},  // R24_UNORM_X8_TYPELESS <- IMG_FMT_24_8_UNORM (24-bit depth in Y)
+    {47, 144, kX001},  // X24_TYPELESS_G8_UINT <- IMG_FMT_24_8_UINT (8-bit stencil in X)
     {22, 145, kY001},  // X32_TYPELESS_G8X24_UINT <- IMG_FMT_X24_8_32_UINT (stencil in Y)
     {21, 146, kX001},  // R32_FLOAT_X8X24_TYPELESS <- IMG_FMT_X24_8_32_FLOAT
+    {61, 128, kX001},  // R8_UNORM <- IMG_FMT_8_SRGB (no DXGI R8_SRGB)
+    {49, 129, kXY01},  // R8G8_UNORM <- IMG_FMT_8_8_SRGB (no DXGI R8G8_SRGB)
+    {41, 140, kX001},  // R32_FLOAT <- IMG_FMT_32_FLOAT_CLAMP
 };
 
 int32_t to_fixed(float v, float lo, float hi, float scale) noexcept {
@@ -202,7 +216,7 @@ void encode(const BufferResource& d, uint32_t out[kBufferDwords]) noexcept {
     out[2] = d.num_records;
     out[3] = sel_field(d.dst_sel) | field(d.format, 12, 7) | field(d.index_stride, 21, 2) |
              field(d.add_tid_enable ? 1u : 0u, 23, 1) | field(d.resource_level ? 1u : 0u, 24, 1) |
-             field(d.oob_select, 28, 2) | field(d.type, 30, 2);
+             field(d.llc_noalloc, 26, 2) | field(d.oob_select, 28, 2) | field(d.type, 30, 2);
 }
 
 BufferResource decode_buffer(const uint32_t in[kBufferDwords]) noexcept {
@@ -217,17 +231,19 @@ BufferResource decode_buffer(const uint32_t in[kBufferDwords]) noexcept {
     d.index_stride = bits(in[3], 21, 2);
     d.add_tid_enable = bits(in[3], 23, 1) != 0;
     d.resource_level = bits(in[3], 24, 1) != 0;
+    d.llc_noalloc = bits(in[3], 26, 2);
     d.oob_select = bits(in[3], 28, 2);
     d.type = bits(in[3], 30, 2);
     return d;
 }
 
 bool plausible_buffer(const uint32_t w[kBufferDwords]) noexcept {
-    // Type 0, valid selects and format, unused bits 19..20 and 25..27 zero. resource_level is not
-    // checked: the open-source drivers set it on gfx10, the console's own constant-buffer words leave
-    // it 0 (they are read with scalar loads, which ignore format, selects and that bit).
+    // Type 0, valid selects and format, unused bits 19..20 and 25 zero.
+    // Bits 26..27 are LLC_NOALLOC on GFX10.3 / Xbox Series and may be non-zero.
+    // resource_level is not checked: open-source drivers set it on gfx10, while the console's own
+    // constant-buffer words leave it 0 (scalar loads ignore format, selects and that bit).
     return bits(w[3], 30, 2) == 0 && valid_sels(w[3]) && valid_buffer_format(bits(w[3], 12, 7)) &&
-           bits(w[3], 19, 2) == 0 && bits(w[3], 25, 3) == 0;
+           bits(w[3], 19, 2) == 0 && bits(w[3], 25, 1) == 0;
 }
 
 // ---- T# ----
@@ -249,7 +265,7 @@ void encode(const ImageResource& d, uint32_t out[kImageDwords]) noexcept {
              field(d.perf_mod, 20, 3) | field(d.corner_samples ? 1u : 0u, 23, 1) |
              field(d.lod_hdw_cnt_en ? 1u : 0u, 25, 1) | field(d.prt_default ? 1u : 0u, 26, 1) |
              field(d.big_page ? 1u : 0u, 31, 1);
-    out[6] = field(d.counter_bank_id, 0, 8) | field(d.iterate_256 ? 1u : 0u, 10, 1) |
+    out[6] = field(d.counter_bank_id, 0, 8) | field(d.llc_noalloc, 8, 2) | field(d.iterate_256 ? 1u : 0u, 10, 1) |
              field(d.max_uncompressed_block_size, 15, 2) | field(d.max_compressed_block_size, 17, 2) |
              field(d.meta_pipe_aligned ? 1u : 0u, 19, 1) | field(d.write_compress_enable ? 1u : 0u, 20, 1) |
              field(d.compression_en ? 1u : 0u, 21, 1) | field(d.alpha_is_on_msb ? 1u : 0u, 22, 1) |
@@ -282,6 +298,7 @@ ImageResource decode_image(const uint32_t in[kImageDwords]) noexcept {
     d.prt_default = bits(in[5], 26, 1) != 0;
     d.big_page = bits(in[5], 31, 1) != 0;
     d.counter_bank_id = bits(in[6], 0, 8);
+    d.llc_noalloc = bits(in[6], 8, 2);
     d.iterate_256 = bits(in[6], 10, 1) != 0;
     d.max_uncompressed_block_size = bits(in[6], 15, 2);
     d.max_compressed_block_size = bits(in[6], 17, 2);
@@ -409,7 +426,19 @@ uint32_t dxgi_format(uint32_t hw, const Swizzle& dst_sel, bool* exact) noexcept 
     if (exact != nullptr) {
         *exact = false;
     }
-    return first != nullptr ? first->dxgi : 0u;
+    if (first == nullptr) {
+        return 0u;
+    }
+    // Preserve BGR channel order when alpha has a custom swizzle (e.g. {Z, Y, X, Zero}) so BGRA
+    // textures do not fall back to RGBA8 and swap red/blue.
+    if ((hw == 56u || hw == 130u) && dst_sel[0] == Sel::Z && dst_sel[1] == Sel::Y && dst_sel[2] == Sel::X) {
+        return hw == 130u ? 91u : 87u;  // B8G8R8A8_UNORM_SRGB / B8G8R8A8_UNORM
+    }
+    // Preserve alpha-only intent for 8_UNORM masks like {1, 1, 1, X} where X feeds only alpha.
+    if (hw == 1u && dst_sel[3] == Sel::X && dst_sel[0] != Sel::X && dst_sel[1] != Sel::X && dst_sel[2] != Sel::X) {
+        return 65u;  // A8_UNORM
+    }
+    return first->dxgi;
 }
 
 uint32_t buffer_format_bytes(uint32_t f) noexcept {
@@ -454,6 +483,12 @@ Swizzle compose_component_mapping(const Swizzle& format_swizzle, uint32_t mappin
 }
 
 bool component_mapping_from(const Swizzle& format_swizzle, const Swizzle& dst_sel, uint32_t* mapping) noexcept {
+    if (format_swizzle == dst_sel) {
+        if (mapping != nullptr) {
+            *mapping = 0x1688u;  // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (R, G, B, A)
+        }
+        return true;
+    }
     uint32_t m = 1u << 12;  // D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES
     for (uint32_t c = 0; c < 4; ++c) {
         uint32_t src = 0xffu;
@@ -466,6 +501,18 @@ bool component_mapping_from(const Swizzle& format_swizzle, const Swizzle& dst_se
                 if (format_swizzle[k] == dst_sel[c]) {
                     src = k;
                     break;
+                }
+            }
+            // GFX10 hardware supplies implicit defaults (Y=0, Z=0, W=1) for missing channels of
+            // 1/2/3-component formats when referenced in their own canonical output slot (e.g.
+            // R8/BC4 {X,X,X,W}, BC5 {Y,X,Z,W}, R11G11B10/BC6H {Z,Y,X,W}).
+            if (src == 0xffu) {
+                if (c == 1 && dst_sel[1] == Sel::Y && format_swizzle[1] == Sel::Zero) {
+                    src = 1;
+                } else if (c == 2 && dst_sel[2] == Sel::Z && format_swizzle[2] == Sel::Zero) {
+                    src = 2;
+                } else if (c == 3 && dst_sel[3] == Sel::W && format_swizzle[3] == Sel::One) {
+                    src = 3;
                 }
             }
         }
@@ -547,8 +594,8 @@ SamplerState sampler_from_d3d12(const d3d12_state::SamplerDesc& d, bool* exact) 
     const uint32_t mip = f & 3u;
     const uint32_t mag = (f >> 2) & 3u;
     const uint32_t min = (f >> 4) & 3u;
-    s.xy_mag_filter = aniso ? 3u : (mag != 0 ? 1u : 0u);
-    s.xy_min_filter = aniso ? 3u : (min != 0 ? 1u : 0u);
+    s.xy_mag_filter = aniso ? (mag != 0 ? 3u : 2u) : (mag != 0 ? 1u : 0u);
+    s.xy_min_filter = aniso ? (min != 0 ? 3u : 2u) : (min != 0 ? 1u : 0u);
     s.mip_filter = mip != 0 ? 2u : 1u;
     s.z_filter = mag != 0 ? 2u : 1u;
     s.max_aniso_ratio = aniso ? aniso_ratio(d.max_anisotropy) : 0u;
@@ -576,37 +623,91 @@ SamplerState sampler_from_d3d12(const d3d12_state::SamplerDesc& d, bool* exact) 
     return s;
 }
 
-d3d12_state::SamplerDesc d3d12_from_sampler(const SamplerState& s) noexcept {
-    d3d12_state::SamplerDesc d;
-    const bool aniso = s.xy_mag_filter >= 2 || s.xy_min_filter >= 2;
-    uint32_t f = 0;
-    if (aniso) {
-        f = 0x54u | (s.mip_filter == 2 ? 1u : 0u);
-    } else {
-        f = (s.mip_filter == 2 ? 1u : 0u) | ((s.xy_mag_filter & 1u) << 2) | ((s.xy_min_filter & 1u) << 4);
+DegammaOverride sampler_degamma_override(const SamplerState& s) noexcept {
+    if (s.skip_degamma) {
+        return DegammaOverride::SkipDegamma;
     }
+    if (s.force_degamma) {
+        return DegammaOverride::ForceDegamma;
+    }
+    return DegammaOverride::None;
+}
+
+namespace {
+
+bool is_exact_clamp(uint32_t clamp) noexcept {
+    return clamp == 0u || clamp == 1u || clamp == 2u || clamp == 3u || clamp == 6u;
+}
+
+d3d12_state::SamplerDesc convert_sampler_to_d3d12(const SamplerState& s, bool has_comparison_hint,
+                                                  bool comparison_hint, bool* exact) noexcept {
+    d3d12_state::SamplerDesc d;
+    bool ok = !s.force_degamma && !s.skip_degamma && !s.force_unnormalized && s.border_color_type < 3u &&
+              is_exact_clamp(s.clamp_x) && is_exact_clamp(s.clamp_y) && is_exact_clamp(s.clamp_z);
+    const bool aniso = s.xy_mag_filter >= 2 || s.xy_min_filter >= 2;
+    // SQ_TEX_XY_FILTER bit 0 encodes linear (1=BILINEAR, 3=ANISO_BILINEAR) vs point
+    // (0=POINT, 2=ANISO_POINT), preserving ANISO_POINT and asymmetric mag/min filters.
+    uint32_t f = (s.mip_filter == 2 ? 1u : 0u) | ((s.xy_mag_filter & 1u) << 2) | ((s.xy_min_filter & 1u) << 4) |
+                 (aniso ? 0x40u : 0u);
+    const bool use_comparison =
+        s.filter_mode == 0 && (has_comparison_hint ? comparison_hint : (s.depth_compare_func != 0));
     if (s.filter_mode == 1) {
         f |= 2u << 7;
     } else if (s.filter_mode == 2) {
         f |= 3u << 7;
-    } else if (s.depth_compare_func != 0) {
+    } else if (use_comparison) {
         f |= 1u << 7;
     }
     d.filter = f;
-    d.comparison_func = s.depth_compare_func != 0 ? s.depth_compare_func + 1u : 0u;
+    d.comparison_func = use_comparison ? (s.depth_compare_func & 7u) + 1u : 0u;
     d.address_u = d3d12_from_clamp(s.clamp_x);
     d.address_v = d3d12_from_clamp(s.clamp_y);
     d.address_w = d3d12_from_clamp(s.clamp_z);
     d.max_anisotropy = aniso ? (1u << std::min<uint32_t>(s.max_aniso_ratio, 4u)) : 1u;
-    d.min_lod = u4_8_to_lod(s.min_lod);
-    d.max_lod = u4_8_to_lod(s.max_lod);
+    if (s.mip_filter == 0) {
+        // SQ_TEX_MIP_FILTER_NONE disables mip selection on hardware (always samples base_level).
+        d.min_lod = 0.0f;
+        d.max_lod = 0.0f;
+    } else {
+        d.min_lod = u4_8_to_lod(s.min_lod);
+        d.max_lod = u4_8_to_lod(s.max_lod);
+    }
     d.mip_lod_bias = s6_8_to_bias(s.lod_bias);
     const float colors[3][4] = {{0, 0, 0, 0}, {0, 0, 0, 1}, {1, 1, 1, 1}};
     const uint32_t t = s.border_color_type < 3 ? s.border_color_type : 0u;
     for (int i = 0; i < 4; ++i) {
         d.border_color[i] = colors[t][i];
     }
+    if (exact != nullptr) {
+        *exact = ok;
+    }
     return d;
+}
+
+}  // namespace
+
+d3d12_state::SamplerDesc d3d12_from_sampler(const SamplerState& s, bool* exact) noexcept {
+    return convert_sampler_to_d3d12(s, false, false, exact);
+}
+
+d3d12_state::SamplerDesc d3d12_from_sampler_for_comparison(const SamplerState& s, bool comparison,
+                                                           bool* exact) noexcept {
+    return convert_sampler_to_d3d12(s, true, comparison, exact);
+}
+
+uint32_t image_effective_depth(const ImageResource& d) noexcept {
+    if (d.sw_mode == 0 && (d.type == ImageType::Tex1D || d.type == ImageType::Tex2D)) {
+        return 1u;
+    }
+    return d.depth == 0 ? 1u : d.depth;
+}
+
+uint32_t image_linear_pitch_texels(const ImageResource& d) noexcept {
+    if (d.sw_mode == 0 && (d.type == ImageType::Tex1D || d.type == ImageType::Tex2D) && d.depth > 1u) {
+        // GFX10.3 SQ_IMG_RSRC_WORD4[13:0] encodes (pitch - 1) for linear 1D/2D images.
+        return ((d.depth - 1u) & 0x3fffu) + 1u;
+    }
+    return d.width == 0 ? 1u : d.width;
 }
 
 }  // namespace playgta6::gpu::gfx10

@@ -4101,3 +4101,222 @@ test('W373: 3D scene texture uploads — BC7 full mip chain (incl. 2x2 & 1x1 tai
   );
   assert.equal(handler.getStats().errors, 0, handler.lastError);
 });
+
+test('Console texture fidelity: tight-last-row BC7 single/multi-slice uploads and GPU copyBufferToBuffer clamp', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']),
+  });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 128 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // 1) 16x16 BC7-sRGB (code 63) 6-face cubemap with D3D12 tight final row:
+  //    4 block rows/slice, unaligned bytesPerRow = 128 (or aligned 256), tight last row = 64 bytes,
+  //    caller supplies rowsPerImage = height = 16 (pixel rows instead of 4 block rows).
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 5001,
+      width: 16,
+      height: 16,
+      layers: 6,
+      mips: 1,
+      format: 63, // bc7-rgba-unorm-srgb
+      usage: 0x06,
+    })
+  );
+  // 5 full slices * 4 block rows * 128B + 3 full block rows * 128B + 64B tight last row = 3008 bytes (< 3072 full).
+  const tightCubeBytes = new Uint8Array(5 * 4 * 128 + 3 * 128 + 64);
+  tightCubeBytes.fill(0x5a);
+  tightCubeBytes[tightCubeBytes.length - 1] = 0xc3;
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 5001,
+      width: 16,
+      height: 16,
+      layers: 6,
+      bytesPerRow: 128,
+      rowsPerImage: 16, // pixel rows -> must auto-correct to 4 block rows even on tight last row!
+      data: tightCubeBytes,
+    })
+  );
+  const cubeCopy = gpu.calls.find(
+    (c) => c.op === 'copyBufferToTexture' && c.destination.texture === processor.textures.get(5001)
+  );
+  assert.ok(cubeCopy, 'tight-last-row multi-slice BC7 cubemap must stage via copyBufferToTexture');
+  assert.equal(cubeCopy.source.bytesPerRow, 256);
+  assert.equal(
+    cubeCopy.source.rowsPerImage,
+    4,
+    'multi-slice BC7 rowsPerImage must be corrected from 16 texel rows to 4 block rows'
+  );
+  assert.deepEqual(cubeCopy.copySize, { width: 16, height: 16, depthOrArrayLayers: 6 });
+
+  // 2) Tight-last-row copyBufferToTexture (CPU bytes) for 16x16 BC7 (bytesPerRow=128, tight last row=64 -> 448B).
+  const enc = gpu.device.createCommandEncoder();
+  const tightSingle = new Uint8Array(3 * 128 + 64);
+  tightSingle.fill(0x33);
+  const c2tRes = handler.copyBufferToTexture(
+    enc,
+    { bytesPerRow: 128, rowsPerImage: 4 },
+    { texture: processor.textures.get(5001), mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 16, height: 16, depthOrArrayLayers: 1 },
+    tightSingle
+  );
+  assert.equal(c2tRes.error, undefined);
+  assert.equal(c2tRes.staged, true);
+  assert.equal(c2tRes.bytesPerRow, 256);
+
+  // 3) GPU-buffer-only unaligned copyBufferToTexture clamps final row to srcBuffer.size (never reads past EOF).
+  const tightGpuBuf = { id: 'gpu-tight', size: 3 * 128 + 64 };
+  const encGpu = gpu.device.createCommandEncoder();
+  const c2tGpu = handler.copyBufferToTexture(
+    encGpu,
+    { buffer: tightGpuBuf, offset: 0, bytesPerRow: 128, rowsPerImage: 4 },
+    { texture: processor.textures.get(5001), mipLevel: 0, origin: { x: 0, y: 0, z: 0 } },
+    { width: 16, height: 16, depthOrArrayLayers: 1 }
+  );
+  assert.equal(c2tGpu.error, undefined);
+  const b2bCalls = gpu.calls.filter((c) => c.op === 'copyBufferToBuffer' && c.srcBuf === tightGpuBuf);
+  assert.equal(b2bCalls.length, 4);
+  assert.equal(b2bCalls[0].size, 128);
+  assert.equal(b2bCalls[3].size, 64, 'final GPU copyBufferToBuffer row must clamp to remaining srcBuffer.size');
+  assert.equal(handler.getStats().errors, 0, handler.lastError);
+});
+
+test('Console texture fidelity: direct queue.writeTexture flushes earlier staged write on same texture (not other textures)', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 64 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  const eventLog = [];
+  const origFlush = processor._flushPendingUploads.bind(processor);
+  processor._flushPendingUploads = function trackedFlush(retire) {
+    eventLog.push('flushPendingUploads');
+    return origFlush(retire);
+  };
+  const origWriteTexture = gpu.device.queue.writeTexture.bind(gpu.device.queue);
+  gpu.device.queue.writeTexture = function trackedWriteTexture(dest, data, layout, size) {
+    eventLog.push(`writeTexture:${dest.texture === processor.textures.get(5010) ? 'A' : 'B'}`);
+    return origWriteTexture(dest, data, layout, size);
+  };
+
+  // Texture A (UI/font atlas) and Texture B (separate plane).
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 5010, width: 64, height: 4, format: 22, usage: 0x06 }) // rgba8unorm
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 5011, width: 64, height: 4, format: 22, usage: 0x06 }) // rgba8unorm
+  );
+
+  // 1) Unaligned dirty-rect write to Texture A -> staged onto _pendingEncoder.
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 5010,
+      width: 8,
+      height: 2,
+      bytesPerRow: 32,
+      rowsPerImage: 2,
+      data: new Uint8Array(64).fill(1),
+    })
+  );
+  assert.equal(processor._hasPendingUploadCommands, true);
+
+  // 2) 256B-aligned direct write to Texture B (DIFFERENT texture) -> must NOT flush A's pending encoder!
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 5011,
+      width: 64,
+      height: 2,
+      bytesPerRow: 256,
+      rowsPerImage: 2,
+      data: new Uint8Array(512).fill(2),
+    })
+  );
+  assert.deepEqual(eventLog, ['writeTexture:B']);
+  assert.equal(processor._hasPendingUploadCommands, true);
+
+  // 3) 256B-aligned direct write to Texture A (SAME texture!) -> MUST flush pending staged copy BEFORE queue.writeTexture!
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 5010,
+      width: 64,
+      height: 2,
+      bytesPerRow: 256,
+      rowsPerImage: 2,
+      data: new Uint8Array(512).fill(3),
+    })
+  );
+  assert.deepEqual(eventLog, ['writeTexture:B', 'flushPendingUploads', 'writeTexture:A']);
+  assert.equal(handler.getStats().errors, 0, handler.lastError);
+});
+
+test('Console texture fidelity: 3D BC-sRGB fallback preserves sRGB and _create sanitizes illegal WebGPU usages/MSAA', () => {
+  const gpu = createMockWebGpu({
+    strictWebGpu: true,
+    features: new Set(['texture-compression-bc']), // no bc-sliced-3d, no bgra8unorm-storage
+  });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // 1) 3D bc7-rgba-unorm-srgb (code 63) without bc-sliced-3d falls back to rgba8unorm-srgb (preserves sRGB).
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 5020,
+      width: 8,
+      height: 8,
+      layers: 4,
+      dimension: 2, // 3d
+      format: 63, // bc7-rgba-unorm-srgb
+      usage: 0x06 | 0x08 | 0x10, // COPY_DST | TEXTURE_BINDING | illegal STORAGE_BINDING & RENDER_ATTACHMENT
+    })
+  );
+  const tex5020 = processor.textures.get(5020);
+  assert.ok(tex5020);
+  assert.equal(tex5020.desc.format, 'rgba8unorm-srgb');
+  assert.equal(tex5020.desc.usage & 0x08, 0, 'sRGB fallback must strip STORAGE_BINDING');
+
+  // 2) 2D rgba8unorm-srgb (code 23) with STORAGE_BINDING strips STORAGE_BINDING while keeping RENDER_ATTACHMENT.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 5021,
+      width: 32,
+      height: 32,
+      format: 23, // rgba8unorm-srgb
+      usage: 0x06 | 0x08 | 0x10,
+    })
+  );
+  const tex5021 = processor.textures.get(5021);
+  assert.equal(tex5021.desc.format, 'rgba8unorm-srgb');
+  assert.equal(tex5021.desc.usage & 0x08, 0, 'rgba8unorm-srgb must strip STORAGE_BINDING');
+  assert.notEqual(tex5021.desc.usage & 0x10, 0, 'rgba8unorm-srgb keeps RENDER_ATTACHMENT');
+
+  // 3) 2D bgra8unorm (code 27) without bgra8unorm-storage strips STORAGE_BINDING.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 5022,
+      width: 32,
+      height: 32,
+      format: 27, // bgra8unorm
+      usage: 0x06 | 0x08 | 0x10,
+    })
+  );
+  const tex5022 = processor.textures.get(5022);
+  assert.equal(tex5022.desc.usage & 0x08, 0, 'bgra8unorm without bgra8unorm-storage must strip STORAGE_BINDING');
+
+  // 4) 2D bc7-rgba-unorm (code 62) strips both STORAGE_BINDING and RENDER_ATTACHMENT.
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 5023,
+      width: 16,
+      height: 16,
+      format: 62, // bc7-rgba-unorm
+      usage: 0x06 | 0x08 | 0x10,
+    })
+  );
+  const tex5023 = processor.textures.get(5023);
+  assert.equal(tex5023.desc.usage & (0x08 | 0x10), 0, 'BC7 must strip STORAGE_BINDING and RENDER_ATTACHMENT');
+
+  assert.equal(handler.getStats().errors, 0, handler.lastError);
+});

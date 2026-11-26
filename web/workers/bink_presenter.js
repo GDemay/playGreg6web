@@ -20,9 +20,11 @@
   const TRIPLE_BUFFER_SLOTS = 3;
   const UNIFORM_FLAG_FULL_RANGE = 1;
   const UNIFORM_FLAG_SWAP_CHROMA = 2;
+  const UNIFORM_FLAG_OUTPUT_LINEAR = 4;
 
   const BINK_PIXEL_FORMAT = Object.freeze({
     RGBA8: 'rgba8',
+    BGRA8: 'bgra8',
     YUV420P: 'yuv420p',
     YUVA420P: 'yuva420p',
     NV12: 'nv12',
@@ -50,10 +52,19 @@
 
   const PIXEL_FORMAT_MODE = Object.freeze({
     [BINK_PIXEL_FORMAT.RGBA8]: 0,
+    [BINK_PIXEL_FORMAT.BGRA8]: 0,
     [BINK_PIXEL_FORMAT.YUV420P]: 1,
     [BINK_PIXEL_FORMAT.YUVA420P]: 2,
     [BINK_PIXEL_FORMAT.NV12]: 3,
   });
+
+  function isLinearPresentationFormat(format) {
+    if (typeof format !== 'string') {
+      return false;
+    }
+    const normalized = format.trim().toLowerCase();
+    return normalized.endsWith('-srgb') || normalized === 'rgba16float';
+  }
 
   const COLOR_SPACE_ID = Object.freeze({
     [YUV_COLOR_SPACE.BT709]: 0,
@@ -111,6 +122,11 @@
       typeof GPUTextureUsage.TEXTURE_BINDING === 'number'
         ? GPUTextureUsage.TEXTURE_BINDING
         : 0x04,
+    RENDER_ATTACHMENT:
+      typeof GPUTextureUsage !== 'undefined' &&
+      typeof GPUTextureUsage.RENDER_ATTACHMENT === 'number'
+        ? GPUTextureUsage.RENDER_ATTACHMENT
+        : 0x10,
   });
 
   const BUFFER_USAGE = Object.freeze({
@@ -206,23 +222,53 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
   return out;
 }
 
+fn srgb_to_linear(c: vec3<f32>) -> vec3<f32> {
+  let clamped = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
+  let lo = clamped / 12.92;
+  let hi = pow((clamped + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+  return select(hi, lo, clamped <= vec3<f32>(0.04045));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   let uv = in.uv * uniforms.uv_transform.xy + uniforms.uv_transform.zw;
-  let clamped_uv = clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0));
+  let uv_corner0 = uniforms.uv_transform.zw;
+  let uv_corner1 = uniforms.uv_transform.zw + uniforms.uv_transform.xy;
+  let uv_lo = clamp(min(uv_corner0, uv_corner1), vec2<f32>(0.0), vec2<f32>(1.0));
+  let uv_hi = clamp(max(uv_corner0, uv_corner1), vec2<f32>(0.0), vec2<f32>(1.0));
 
-  let primary = textureSample(plane_primary, video_sampler, clamped_uv);
-  let uv_sample = textureSample(plane_u, video_sampler, clamped_uv);
-  let v_sample = textureSample(plane_v, video_sampler, clamped_uv).r;
-  let a_sample = textureSample(plane_a, video_sampler, clamped_uv).r;
+  let luma_dim = vec2<f32>(textureDimensions(plane_primary));
+  let luma_half = vec2<f32>(0.5) / max(luma_dim, vec2<f32>(1.0));
+  let luma_lo = min(uv_lo + luma_half, uv_hi);
+  let luma_hi = max(uv_hi - luma_half, luma_lo);
+  let clamped_luma_uv = clamp(uv, luma_lo, luma_hi);
+
+  let chroma_dim = vec2<f32>(textureDimensions(plane_u));
+  let chroma_scale = luma_dim / max(chroma_dim * 2.0, vec2<f32>(1.0));
+  let chroma_half = vec2<f32>(0.5) / max(chroma_dim, vec2<f32>(1.0));
+  let chroma_lo = min(uv_lo * chroma_scale + chroma_half, uv_hi * chroma_scale);
+  let chroma_hi = max(uv_hi * chroma_scale - chroma_half, chroma_lo);
+  let clamped_chroma_uv = select(
+    clamped_luma_uv,
+    clamp(uv * chroma_scale, chroma_lo, chroma_hi),
+    uniforms.mode != 0u
+  );
+
+  let primary = textureSample(plane_primary, video_sampler, clamped_luma_uv);
+  let uv_sample = textureSample(plane_u, video_sampler, clamped_chroma_uv);
+  let v_sample = textureSample(plane_v, video_sampler, clamped_chroma_uv).r;
+  let a_sample = textureSample(plane_a, video_sampler, clamped_luma_uv).r;
 
   let in_bounds = uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0;
   if (!in_bounds) {
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
   }
 
+  let output_linear = (uniforms.flags & 4u) != 0u;
+
   if (uniforms.mode == 0u) {
-    return vec4<f32>(primary.rgb, primary.a * uniforms.opacity);
+    let out_rgb = select(primary.rgb, srgb_to_linear(primary.rgb), output_linear);
+    return vec4<f32>(out_rgb, primary.a * uniforms.opacity);
   }
 
   let raw_u = uv_sample.r;
@@ -231,7 +277,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   let chroma_u = select(raw_u, raw_v, swap_chroma);
   let chroma_v = select(raw_v, raw_u, swap_chroma);
   let yuv = vec3<f32>(primary.r, chroma_u, chroma_v) - uniforms.yuv_offset.xyz;
-  let rgb = clamp(
+  let srgb = clamp(
     vec3<f32>(
       dot(uniforms.yuv_row0.xyz, yuv),
       dot(uniforms.yuv_row1.xyz, yuv),
@@ -240,6 +286,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     vec3<f32>(0.0),
     vec3<f32>(1.0)
   );
+  let rgb = select(srgb, srgb_to_linear(srgb), output_linear);
   let alpha = select(1.0, a_sample, uniforms.mode == 2u) * uniforms.opacity;
   return vec4<f32>(rgb, alpha);
 }
@@ -310,6 +357,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   function validatePixelFormat(format) {
     if (
       format !== BINK_PIXEL_FORMAT.RGBA8 &&
+      format !== BINK_PIXEL_FORMAT.BGRA8 &&
       format !== BINK_PIXEL_FORMAT.YUV420P &&
       format !== BINK_PIXEL_FORMAT.YUVA420P &&
       format !== BINK_PIXEL_FORMAT.NV12
@@ -469,10 +517,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     validateOpacity(opacity);
 
     const matrix = YUV_RANGE_MATRICES[colorRange][colorSpace];
+    const outputLinear =
+      params.outputLinear !== undefined
+        ? Boolean(params.outputLinear)
+        : isLinearPresentationFormat(params.presentationFormat);
     const packedFlags =
       ((flags >>> 0) |
         (colorRange === YUV_COLOR_RANGE.FULL ? UNIFORM_FLAG_FULL_RANGE : 0) |
-        (chromaOrder === BINK_CHROMA_ORDER.YVU ? UNIFORM_FLAG_SWAP_CHROMA : 0)) >>> 0;
+        (chromaOrder === BINK_CHROMA_ORDER.YVU ? UNIFORM_FLAG_SWAP_CHROMA : 0) |
+        (outputLinear ? UNIFORM_FLAG_OUTPUT_LINEAR : 0)) >>> 0;
 
     // Header (bytes 0..15)
     u32[0] = PIXEL_FORMAT_MODE[pixelFormat];
@@ -664,7 +717,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
   }
 
   function destroyPlaneResource(plane) {
-    if (plane && plane.texture && typeof plane.texture.destroy === 'function') {
+    if (
+      plane &&
+      !plane.external &&
+      plane.texture &&
+      typeof plane.texture.destroy === 'function'
+    ) {
       plane.texture.destroy();
     }
   }
@@ -1180,16 +1238,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       }
     }
 
-    _createPlaneTexture(width, height, format, label) {
+    _createPlaneTexture(width, height, format, label, extraUsage = 0) {
+      const usage = TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST | extraUsage;
       const texture = this._device.createTexture({
         label,
         size: { width, height, depthOrArrayLayers: 1 },
         format,
-        usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+        usage,
       });
       const view =
         texture && typeof texture.createView === 'function' ? texture.createView() : null;
-      return { texture, view, width, height, format };
+      return { texture, view, width, height, format, usage };
     }
 
     _destroyAllSlots() {
@@ -1272,7 +1331,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return (this._activePlaneSlot + 1) % this._planeRingDepth;
     }
 
-    _ensureSlotTextures(slotIndex, format, width, height) {
+    _ensureSlotTextures(slotIndex, format, width, height, requiredExtraUsage = 0) {
       if (this._bindGroupCacheDevice !== this._device) {
         this._destroyAllSlots();
         this._releasePipelineResources();
@@ -1281,13 +1340,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const slot = this._slots[slotIndex];
       const uvWidth = Math.ceil(width / 2);
       const uvHeight = Math.ceil(height / 2);
+      const isPackedRgb =
+        format === BINK_PIXEL_FORMAT.RGBA8 || format === BINK_PIXEL_FORMAT.BGRA8;
+      const rgbaHasRequiredUsage =
+        slot.rgba !== null &&
+        !slot.rgba.external &&
+        ((slot.rgba.usage || 0) & requiredExtraUsage) === requiredExtraUsage;
 
       const matches =
         slot.format === format &&
         slot.width === width &&
         slot.height === height &&
-        (format === BINK_PIXEL_FORMAT.RGBA8
-          ? slot.rgba !== null
+        (isPackedRgb
+          ? rgbaHasRequiredUsage
           : format === BINK_PIXEL_FORMAT.NV12
             ? slot.y !== null && slot.uv !== null
             : slot.y !== null &&
@@ -1301,12 +1366,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       destroySlotResources(slot);
 
-      if (format === BINK_PIXEL_FORMAT.RGBA8) {
+      if (isPackedRgb) {
+        const texFormat = format === BINK_PIXEL_FORMAT.BGRA8 ? 'bgra8unorm' : 'rgba8unorm';
         slot.rgba = this._createPlaneTexture(
           width,
           height,
-          'rgba8unorm',
-          `playgta6-bink-rgba-slot${slotIndex}`
+          texFormat,
+          `playgta6-bink-${format}-slot${slotIndex}`,
+          requiredExtraUsage
         );
       } else if (format === BINK_PIXEL_FORMAT.NV12) {
         slot.y = this._createPlaneTexture(
@@ -1619,7 +1686,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       const strideBytes = options && options.strideBytes !== undefined ? options.strideBytes : tightRowBytes;
       const commandEncoder = options ? options.commandEncoder || options.encoder || null : null;
 
-      validatePlaneBuffer(src, tightRowBytes, height, strideBytes, 'RGBA8');
+      const pixelFormat =
+        options && options.format === BINK_PIXEL_FORMAT.BGRA8
+          ? BINK_PIXEL_FORMAT.BGRA8
+          : BINK_PIXEL_FORMAT.RGBA8;
+      const label = pixelFormat === BINK_PIXEL_FORMAT.BGRA8 ? 'BGRA8' : 'RGBA8';
+      validatePlaneBuffer(src, tightRowBytes, height, strideBytes, label);
 
       const uploadStartMs = this._now();
 
@@ -1627,11 +1699,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         this._droppedFrames += 1;
       }
 
-      const writeSlotIndex = this._selectWriteSlot(BINK_PIXEL_FORMAT.RGBA8, width, height);
-      const slot = this._ensureSlotTextures(writeSlotIndex, BINK_PIXEL_FORMAT.RGBA8, width, height);
+      const writeSlotIndex = this._selectWriteSlot(pixelFormat, width, height);
+      const slot = this._ensureSlotTextures(writeSlotIndex, pixelFormat, width, height);
       this._dropPendingUploadsForSlot(writeSlotIndex);
 
-      const prepared = this._preparePlaneForUpload(src, tightRowBytes, height, strideBytes, 'RGBA8');
+      const prepared = this._preparePlaneForUpload(src, tightRowBytes, height, strideBytes, label);
       const bytesPerRow = prepared.bytesPerRow;
       const totalBytes = prepared.totalBytes;
       const padded = prepared.padded;
@@ -1639,6 +1711,167 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
 
+      const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
+      if (this._pixelFormat !== pixelFormat) {
+        this._uniformsDirty = true;
+      }
+      this._pixelFormat = pixelFormat;
+      this._frameWidth = width;
+      this._frameHeight = height;
+      this._activeSlotIndex = writeSlotIndex;
+      this._activePlaneSlot = writeSlotIndex;
+      if (rotatedSlot) {
+        this._planeSlotRotations += 1;
+      }
+      this._hasFrame = true;
+      this._unpresentedFrame = true;
+      this._uploadedFrames += 1;
+
+      const res = this._rgbaUploadResultScratch;
+      res.format = pixelFormat;
+      res.width = width;
+      res.height = height;
+      res.bytesPerRow = bytesPerRow;
+      res.bytesUploaded = totalBytes;
+      res.zeroCopy = !padded;
+      res.slotIndex = writeSlotIndex;
+      res.uploadedFrames = this._uploadedFrames;
+      res.uploadMs = uploadMs;
+      return res;
+    }
+
+    /**
+     * Upload a BGRA8 video or splash frame without swapping R/B channels (uses native `bgra8unorm`).
+     */
+    uploadBgraFrame(bgraBytes, width, height, options = null) {
+      const opts = options && typeof options === 'object' ? { ...options, format: BINK_PIXEL_FORMAT.BGRA8 } : { format: BINK_PIXEL_FORMAT.BGRA8 };
+      return this.uploadRgbaFrame(bgraBytes, width, height, opts);
+    }
+
+    /**
+     * Bind a caller-owned external RGBA/BGRA GPUTexture (e.g. destination of
+     * `queue.copyExternalImageToTexture`) directly into the active slot without taking
+     * destroy ownership, so GPU-only external images render real pixels without CPU readback.
+     */
+    bindExternalTexture(texture, width, height, format = BINK_PIXEL_FORMAT.RGBA8) {
+      this._assertNotDestroyed();
+      if (!texture || typeof texture !== 'object') {
+        throw new TypeError('bindExternalTexture expects a GPUTexture object');
+      }
+      assertPositiveInteger(width, 'width');
+      assertPositiveInteger(height, 'height');
+      const pixelFormat =
+        format === BINK_PIXEL_FORMAT.BGRA8 ? BINK_PIXEL_FORMAT.BGRA8 : BINK_PIXEL_FORMAT.RGBA8;
+
+      const uploadStartMs = this._now();
+      if (this._unpresentedFrame) {
+        this._droppedFrames += 1;
+      }
+
+      const writeSlotIndex = this._selectWriteSlot(pixelFormat, width, height);
+      const slot = this._slots[writeSlotIndex];
+      destroySlotResources(slot);
+      this._dropPendingUploadsForSlot(writeSlotIndex);
+
+      const view =
+        typeof texture.createView === 'function' ? texture.createView() : null;
+      slot.rgba = {
+        texture,
+        view,
+        width,
+        height,
+        format: pixelFormat === BINK_PIXEL_FORMAT.BGRA8 ? 'bgra8unorm' : 'rgba8unorm',
+        usage: texture.usage || 0,
+        external: true,
+      };
+      this._textureGeneration += 1;
+      slot.generation = this._textureGeneration;
+      slot.format = pixelFormat;
+      slot.width = width;
+      slot.height = height;
+      slot.uvWidth = Math.ceil(width / 2);
+      slot.uvHeight = Math.ceil(height / 2);
+      slot.bindGroup = null;
+      slot.bindGroupGeneration = 0;
+
+      this._bytesUploaded += width * height * 4;
+      this._directZeroCopyUploads += 1;
+
+      const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
+      const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
+      if (this._pixelFormat !== pixelFormat) {
+        this._uniformsDirty = true;
+      }
+      this._pixelFormat = pixelFormat;
+      this._frameWidth = width;
+      this._frameHeight = height;
+      this._activeSlotIndex = writeSlotIndex;
+      this._activePlaneSlot = writeSlotIndex;
+      if (rotatedSlot) {
+        this._planeSlotRotations += 1;
+      }
+      this._hasFrame = true;
+      this._unpresentedFrame = true;
+      this._uploadedFrames += 1;
+
+      const res = this._rgbaUploadResultScratch;
+      res.format = pixelFormat;
+      res.width = width;
+      res.height = height;
+      res.bytesPerRow = width * 4;
+      res.bytesUploaded = width * height * 4;
+      res.zeroCopy = true;
+      res.slotIndex = writeSlotIndex;
+      res.uploadedFrames = this._uploadedFrames;
+      res.uploadMs = uploadMs;
+      return res;
+    }
+
+    /**
+     * Upload an external GPU-copyable image source (`ImageBitmap`, `OffscreenCanvas`, `HTMLVideoElement`)
+     * directly into the active RGBA slot via `queue.copyExternalImageToTexture` (with `RENDER_ATTACHMENT`
+     * usage as required by WebGPU).
+     */
+    uploadExternalImage(source, width, height) {
+      this._assertNotDestroyed();
+      if (!source || typeof source !== 'object') {
+        throw new TypeError('uploadExternalImage expects an external image source object');
+      }
+      assertPositiveInteger(width, 'width');
+      assertPositiveInteger(height, 'height');
+      if (
+        !this._device.queue ||
+        typeof this._device.queue.copyExternalImageToTexture !== 'function'
+      ) {
+        throw new TypeError(
+          'uploadExternalImage requires device.queue.copyExternalImageToTexture()'
+        );
+      }
+
+      const uploadStartMs = this._now();
+      if (this._unpresentedFrame) {
+        this._droppedFrames += 1;
+      }
+
+      const writeSlotIndex = this._selectWriteSlot(BINK_PIXEL_FORMAT.RGBA8, width, height);
+      const slot = this._ensureSlotTextures(
+        writeSlotIndex,
+        BINK_PIXEL_FORMAT.RGBA8,
+        width,
+        height,
+        TEXTURE_USAGE.RENDER_ATTACHMENT
+      );
+      this._dropPendingUploadsForSlot(writeSlotIndex);
+
+      this._device.queue.copyExternalImageToTexture(
+        { source },
+        { texture: slot.rgba.texture },
+        { width, height, depthOrArrayLayers: 1 }
+      );
+      this._bytesUploaded += width * height * 4;
+      this._directZeroCopyUploads += 1;
+
+      const uploadMs = this._recordUploadDuration(uploadStartMs, this._now());
       const rotatedSlot = this._hasFrame && writeSlotIndex !== this._activePlaneSlot;
       if (this._pixelFormat !== BINK_PIXEL_FORMAT.RGBA8) {
         this._uniformsDirty = true;
@@ -1659,9 +1892,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       res.format = BINK_PIXEL_FORMAT.RGBA8;
       res.width = width;
       res.height = height;
-      res.bytesPerRow = bytesPerRow;
-      res.bytesUploaded = totalBytes;
-      res.zeroCopy = !padded;
+      res.bytesPerRow = width * 4;
+      res.bytesUploaded = width * height * 4;
+      res.zeroCopy = true;
       res.slotIndex = writeSlotIndex;
       res.uploadedFrames = this._uploadedFrames;
       res.uploadMs = uploadMs;
@@ -2086,11 +2319,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       ) {
         return this.uploadYuv420Frame(frame);
       }
-      if (format === BINK_PIXEL_FORMAT.RGBA8 || (!format && (frame.rgba || frame.data))) {
+      if (
+        format === BINK_PIXEL_FORMAT.BGRA8 ||
+        format === BINK_PIXEL_FORMAT.RGBA8 ||
+        (!format && (frame.rgba || frame.bgra || frame.data))
+      ) {
         const opts = this._rgbaUploadOptionsScratch;
         opts.strideBytes = frame.strideBytes;
         opts.commandEncoder = frame.commandEncoder || frame.encoder || null;
-        return this.uploadRgbaFrame(frame.rgba || frame.data, frame.width, frame.height, opts);
+        opts.format =
+          format === BINK_PIXEL_FORMAT.BGRA8
+            ? BINK_PIXEL_FORMAT.BGRA8
+            : BINK_PIXEL_FORMAT.RGBA8;
+        return this.uploadRgbaFrame(
+          frame.bgra || frame.rgba || frame.data,
+          frame.width,
+          frame.height,
+          opts
+        );
       }
       validatePixelFormat(format);
       throw new TypeError('uploadFrame could not determine pixel format from frame descriptor');
@@ -2100,59 +2346,65 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       if (this._pipeline !== null && this._pipelineDevice === this._device) {
         return;
       }
-      if (this._pipeline !== null && this._pipelineDevice !== this._device) {
+      if (this._pipelineDevice !== null && this._pipelineDevice !== this._device) {
         this._releasePipelineResources();
         this._invalidateBindGroupCache();
       }
 
-      this._shaderModule = this._device.createShaderModule({
-        label: 'playgta6-bink-presenter-shader',
-        code: BINK_PRESENTER_WGSL,
-      });
+      if (this._shaderModule === null) {
+        this._shaderModule = this._device.createShaderModule({
+          label: 'playgta6-bink-presenter-shader',
+          code: BINK_PRESENTER_WGSL,
+        });
+      }
 
-      this._bindGroupLayout = this._device.createBindGroupLayout({
-        label: 'playgta6-bink-presenter-bgl',
-        entries: [
-          {
-            binding: 0,
-            visibility: SHADER_STAGE.VERTEX | SHADER_STAGE.FRAGMENT,
-            buffer: { type: 'uniform' },
-          },
-          {
-            binding: 1,
-            visibility: SHADER_STAGE.FRAGMENT,
-            sampler: { type: 'filtering' },
-          },
-          {
-            binding: 2,
-            visibility: SHADER_STAGE.FRAGMENT,
-            texture: { sampleType: 'float', viewDimension: '2d' },
-          },
-          {
-            binding: 3,
-            visibility: SHADER_STAGE.FRAGMENT,
-            texture: { sampleType: 'float', viewDimension: '2d' },
-          },
-          {
-            binding: 4,
-            visibility: SHADER_STAGE.FRAGMENT,
-            texture: { sampleType: 'float', viewDimension: '2d' },
-          },
-          {
-            binding: 5,
-            visibility: SHADER_STAGE.FRAGMENT,
-            texture: { sampleType: 'float', viewDimension: '2d' },
-          },
-        ],
-      });
+      if (this._bindGroupLayout === null) {
+        this._bindGroupLayout = this._device.createBindGroupLayout({
+          label: 'playgta6-bink-presenter-bgl',
+          entries: [
+            {
+              binding: 0,
+              visibility: SHADER_STAGE.VERTEX | SHADER_STAGE.FRAGMENT,
+              buffer: { type: 'uniform' },
+            },
+            {
+              binding: 1,
+              visibility: SHADER_STAGE.FRAGMENT,
+              sampler: { type: 'filtering' },
+            },
+            {
+              binding: 2,
+              visibility: SHADER_STAGE.FRAGMENT,
+              texture: { sampleType: 'float', viewDimension: '2d' },
+            },
+            {
+              binding: 3,
+              visibility: SHADER_STAGE.FRAGMENT,
+              texture: { sampleType: 'float', viewDimension: '2d' },
+            },
+            {
+              binding: 4,
+              visibility: SHADER_STAGE.FRAGMENT,
+              texture: { sampleType: 'float', viewDimension: '2d' },
+            },
+            {
+              binding: 5,
+              visibility: SHADER_STAGE.FRAGMENT,
+              texture: { sampleType: 'float', viewDimension: '2d' },
+            },
+          ],
+        });
+      }
 
-      this._pipelineLayout =
-        typeof this._device.createPipelineLayout === 'function'
-          ? this._device.createPipelineLayout({
-              label: 'playgta6-bink-presenter-layout',
-              bindGroupLayouts: [this._bindGroupLayout],
-            })
-          : 'auto';
+      if (this._pipelineLayout === null) {
+        this._pipelineLayout =
+          typeof this._device.createPipelineLayout === 'function'
+            ? this._device.createPipelineLayout({
+                label: 'playgta6-bink-presenter-layout',
+                bindGroupLayouts: [this._bindGroupLayout],
+              })
+            : 'auto';
+      }
 
       this._pipeline = this._device.createRenderPipeline({
         label: 'playgta6-bink-presenter-pipeline',
@@ -2188,43 +2440,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         },
       });
 
-      this._sampler = this._device.createSampler({
-        label: 'playgta6-bink-presenter-sampler',
-        magFilter: 'linear',
-        minFilter: 'linear',
-        addressModeU: 'clamp-to-edge',
-        addressModeV: 'clamp-to-edge',
-      });
+      if (this._sampler === null) {
+        this._sampler = this._device.createSampler({
+          label: 'playgta6-bink-presenter-sampler',
+          magFilter: 'linear',
+          minFilter: 'linear',
+          addressModeU: 'clamp-to-edge',
+          addressModeV: 'clamp-to-edge',
+        });
+      }
 
-      this._uniformBuffer = this._device.createBuffer({
-        label: 'playgta6-bink-presenter-uniforms',
-        size: UNIFORM_BUFFER_SIZE,
-        usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
-      });
+      if (this._uniformBuffer === null) {
+        this._uniformBuffer = this._device.createBuffer({
+          label: 'playgta6-bink-presenter-uniforms',
+          size: UNIFORM_BUFFER_SIZE,
+          usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
+        });
+      }
 
-      // 1x1 neutral fallback texture so all 4 texture bindings remain valid in every mode.
-      this._dummyTexture = this._device.createTexture({
-        label: 'playgta6-bink-presenter-dummy',
-        size: { width: 1, height: 1, depthOrArrayLayers: 1 },
-        format: 'r8unorm',
-        usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
-      });
-      this._dummyTextureView =
-        this._dummyTexture && typeof this._dummyTexture.createView === 'function'
-          ? this._dummyTexture.createView()
-          : null;
+      if (this._dummyTexture === null) {
+        // 1x1 neutral fallback texture so all 4 texture bindings remain valid in every mode.
+        this._dummyTexture = this._device.createTexture({
+          label: 'playgta6-bink-presenter-dummy',
+          size: { width: 1, height: 1, depthOrArrayLayers: 1 },
+          format: 'r8unorm',
+          usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+        });
+        this._dummyTextureView =
+          this._dummyTexture && typeof this._dummyTexture.createView === 'function'
+            ? this._dummyTexture.createView()
+            : null;
 
-      if (this._device.queue && typeof this._device.queue.writeTexture === 'function') {
-        const dummyBytes = new Uint8Array(WEBGPU_BYTES_PER_ROW_ALIGNMENT);
-        dummyBytes[0] = 0xff;
-        this._writeTextureWithScratch(
-          this._dummyTexture,
-          dummyBytes,
-          WEBGPU_BYTES_PER_ROW_ALIGNMENT,
-          1,
-          1,
-          1
-        );
+        if (this._device.queue && typeof this._device.queue.writeTexture === 'function') {
+          const dummyBytes = new Uint8Array(WEBGPU_BYTES_PER_ROW_ALIGNMENT);
+          dummyBytes[0] = 0xff;
+          this._writeTextureWithScratch(
+            this._dummyTexture,
+            dummyBytes,
+            WEBGPU_BYTES_PER_ROW_ALIGNMENT,
+            1,
+            1,
+            1
+          );
+        }
       }
 
       this._pipelineDevice = this._device;
@@ -2347,14 +2605,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     _ensureSlotBindGroup(slotIndex) {
       const slot = this._slots[slotIndex];
-      const primaryView =
-        slot.format === BINK_PIXEL_FORMAT.RGBA8 ? slot.rgba.view : slot.y.view;
-      const uView =
-        slot.format === BINK_PIXEL_FORMAT.RGBA8
-          ? this._dummyTextureView
-          : slot.format === BINK_PIXEL_FORMAT.NV12
-            ? slot.uv.view
-            : slot.u.view;
+      const isPackedRgb =
+        slot.format === BINK_PIXEL_FORMAT.RGBA8 || slot.format === BINK_PIXEL_FORMAT.BGRA8;
+      const primaryView = isPackedRgb ? slot.rgba.view : slot.y.view;
+      const uView = isPackedRgb
+        ? this._dummyTextureView
+        : slot.format === BINK_PIXEL_FORMAT.NV12
+          ? slot.uv.view
+          : slot.u.view;
       const vView =
         slot.format === BINK_PIXEL_FORMAT.YUV420P ||
         slot.format === BINK_PIXEL_FORMAT.YUVA420P
@@ -2397,6 +2655,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       uniformParams.colorSpace = this._colorSpace;
       uniformParams.colorRange = this._colorRange;
       uniformParams.chromaOrder = this._chromaOrder;
+      uniformParams.presentationFormat = this._presentationFormat;
       uniformParams.opacity = opacity;
       uniformParams.uvTransform = this._uvTransform;
 
@@ -2530,8 +2789,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       if (typeof pass.setScissorRect === 'function') {
         const sx = Math.max(0, Math.floor(viewport.x));
         const sy = Math.max(0, Math.floor(viewport.y));
-        const sw = Math.max(1, Math.min(Math.floor(dstWidth) - sx, Math.ceil(viewport.width)));
-        const sh = Math.max(1, Math.min(Math.floor(dstHeight) - sy, Math.ceil(viewport.height)));
+        const sw = Math.max(
+          1,
+          Math.min(Math.floor(dstWidth) - sx, Math.ceil(viewport.x + viewport.width) - sx)
+        );
+        const sh = Math.max(
+          1,
+          Math.min(Math.floor(dstHeight) - sy, Math.ceil(viewport.y + viewport.height) - sy)
+        );
         pass.setScissorRect(sx, sy, sw, sh);
       }
       pass.setBindGroup(0, bindGroup);
@@ -2715,6 +2980,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       if (chromaOrder !== this._chromaOrder) {
         this._chromaOrder = chromaOrder;
         this._invalidateBindGroupCache();
+        this._uniformsDirty = true;
+      }
+    }
+
+    /**
+     * Switch presentation swapchain target format (e.g. `bgra8unorm` <-> `bgra8unorm-srgb` /
+     * `rgba16float`), lazily rebuilding only the render pipeline and updating linear-output
+     * sRGB conversion uniforms.
+     */
+    setPresentationFormat(format) {
+      this._assertNotDestroyed();
+      if (typeof format !== 'string' || format.trim().length === 0) {
+        throw new TypeError('presentationFormat must be a non-empty string');
+      }
+      const normalized = format.trim();
+      if (normalized !== this._presentationFormat) {
+        this._presentationFormat = normalized;
+        this._pipeline = null;
         this._uniformsDirty = true;
       }
     }
@@ -2995,6 +3278,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     UNIFORM_BUFFER_SIZE,
     UNIFORM_FLAG_FULL_RANGE,
     UNIFORM_FLAG_SWAP_CHROMA,
+    UNIFORM_FLAG_OUTPUT_LINEAR,
     DEFAULT_PRESENTATION_FORMAT,
     DEFAULT_TARGET_FPS,
     TARGET_FPS_30_INTERVAL_MS,
@@ -3012,6 +3296,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     BUFFER_USAGE,
     SHADER_STAGE,
     BINK_PRESENTER_WGSL,
+    isLinearPresentationFormat,
     alignUp,
     getYuvMatrix,
     prepareAlignedPlaneData,
