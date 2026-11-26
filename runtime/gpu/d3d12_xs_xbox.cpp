@@ -19,6 +19,7 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/descriptor_words.h"
 #include "gpu/present_pacing.h"
+#include "guest/boot.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/xmem_windows.h"
@@ -525,6 +526,7 @@ bool FramePacer::is_shut_down() const {
 
 namespace {
 std::atomic<bool> g_present_token_waits{true};
+std::atomic<uint32_t> g_present_max_interval{0};
 std::atomic<uint64_t> g_frame_waits{0};
 std::atomic<uint64_t> g_frame_wait_us{0};
 std::atomic<uint64_t> g_frame_polls{0};
@@ -532,6 +534,14 @@ std::atomic<uint64_t> g_frame_timeouts{0};
 }  // namespace
 
 void xbox::set_present_token_waits(bool on) { g_present_token_waits.store(on, std::memory_order_relaxed); }
+
+void xbox::set_present_max_interval(uint32_t max_interval) {
+    g_present_max_interval.store(max_interval, std::memory_order_relaxed);
+}
+
+uint32_t xbox::present_max_interval() {
+    return g_present_max_interval.load(std::memory_order_relaxed);
+}
 
 xbox::FrameWaitTotals xbox::frame_wait_totals() {
     FrameWaitTotals t;
@@ -1357,7 +1367,12 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
     if (parameters != 0 && !com::read_guest(parameters, &immediate, sizeof(immediate))) {
         immediate = 0;
     }
-    present_pacer().present(immediate != 0 ? 0u : device_->present_interval_vblanks());
+    uint32_t interval = immediate != 0 ? 0u : device_->present_interval_vblanks();
+    const uint32_t max_interval = g_present_max_interval.load(std::memory_order_relaxed);
+    if (max_interval > 0) {
+        interval = std::min(interval, max_interval);
+    }
+    present_pacer().present(interval);
     return kSOk;
 }
 

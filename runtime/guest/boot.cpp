@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -2607,9 +2608,22 @@ bool json_uint(std::string_view json, std::string_view key, uint64_t& out) {
         if (c < '0' || c > '9') {
             return false;
         }
-        n = n * 10 + static_cast<uint64_t>(c - '0');
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (n > (std::numeric_limits<uint64_t>::max() - digit) / 10) {
+            return false;
+        }
+        n = n * 10 + digit;
     }
     out = n;
+    return true;
+}
+
+bool json_uint32(std::string_view json, std::string_view key, uint32_t& out) {
+    uint64_t n = 0;
+    if (!json_uint(json, key, n) || n > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    out = static_cast<uint32_t>(n);
     return true;
 }
 
@@ -2633,6 +2647,16 @@ bool apply_boot_options_json(std::string_view json, BootConfig& config) {
     }
     if (json_uint(json, "import_trace_limit", n)) {
         config.import_trace_limit = static_cast<size_t>(n);
+    }
+    uint32_t u32 = 0;
+    if (json_uint32(json, "fence_publish_lag_frames", u32)) {
+        config.fence_publish_lag_frames = u32;
+    }
+    if (json_uint32(json, "fence_publish_cap_ms", u32)) {
+        config.fence_publish_cap_ms = u32;
+    }
+    if (json_uint32(json, "present_max_interval", u32)) {
+        config.present_max_interval = u32;
     }
     const std::string_view verify = json_value(json, "verify_window_marks");
     if (verify == "true" || verify == "false") {
@@ -2911,12 +2935,22 @@ BootResult run_boot(const BootConfig& config) {
     b.report_sink = config.report_sink;
     os::guest_window::set_write_marks_verified(config.verify_window_marks);
     gpu::present_pacer().set_enabled(config.present_pacing);
-    // Only a switched-off option changes anything: the harness sets its own device options.
-    if (!config.fence_publish_lag || !config.defer_gpu_objects) {
+    gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
+    // Only a switched-off bool option disables a harness setting; lag tuning fields are wired
+    // through from BootConfig (defaults match DeviceOptions: 1 frame, 33 ms).
+    {
         gpu::d3d12_guest::DeviceOptions device_options = gpu::d3d12_xs_exports::device_options();
-        device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
-        device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
-        gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+        const bool lag_changed = !config.fence_publish_lag && device_options.fence_publish_lag;
+        const bool defer_changed = !config.defer_gpu_objects && device_options.defer_gpu_objects;
+        const bool lag_frames_changed = device_options.fence_publish_lag_frames != config.fence_publish_lag_frames;
+        const bool lag_cap_changed = device_options.fence_publish_cap_ms != config.fence_publish_cap_ms;
+        if (lag_changed || defer_changed || lag_frames_changed || lag_cap_changed) {
+            device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
+            device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
+            device_options.fence_publish_lag_frames = config.fence_publish_lag_frames;
+            device_options.fence_publish_cap_ms = config.fence_publish_cap_ms;
+            gpu::d3d12_xs_exports::set_device_options(std::move(device_options));
+        }
     }
     if (!config.xmem_shared_pages) {
         os::win32::set_process_shared_zone(false);
