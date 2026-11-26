@@ -74,7 +74,8 @@ bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, st
     return ok;
 }
 
-bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
+static bool take_written_pages_impl(const void* host, uint64_t len, WriteCursor* cursor,
+                                    std::vector<uint64_t>* offsets, bool views_only) {
     uint64_t* commit_seq = cursor != nullptr ? &cursor->commit_seq : nullptr;
     if (host == nullptr || len == 0 || commit_seq == nullptr || offsets == nullptr) {
         return false;
@@ -98,7 +99,16 @@ bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std
         }
         *commit_seq = g_commit_seq;
     }
-    return backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets);
+    return views_only ? backing::take_written_view_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets)
+                      : backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets);
+}
+
+bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
+    return take_written_pages_impl(host, len, cursor, offsets, false);
+}
+
+bool take_written_view_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
+    return take_written_pages_impl(host, len, cursor, offsets, true);
 }
 
 uint64_t shared_view_write_faults() {

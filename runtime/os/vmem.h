@@ -411,6 +411,11 @@ struct WriteCursor {
 };
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+// Like the cursor form, but non-destructive for other readers: only for a range wholly covered by
+// tracked shared page views (never reads MEM_WRITE_WATCH). False when the range is not (or the
+// commit log was overrun): the caller must then treat everything as written. The cursor's commit
+// position only advances on true.
+bool take_written_view_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 // R40: writes to shared page views caught so far (one per page and take interval).
 uint64_t shared_view_write_faults();
 // R40: a host or kernel call about to write [p, p + len) itself (ReadFile/fread into a guest
