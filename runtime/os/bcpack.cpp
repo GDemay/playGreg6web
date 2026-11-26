@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -16,12 +17,14 @@ namespace {
 constexpr uint32_t kModels = 128;
 constexpr uint32_t kMaxBuckets = 9;      // a model of group g uses g + 2 buckets
 constexpr uint32_t kHistoryBlocks = 256;  // back references reach this many blocks
+static_assert((kHistoryBlocks & (kHistoryBlocks - 1)) == 0, "kHistoryBlocks must be power of two");
 constexpr uint32_t kDictionaryEntries = 255;
 constexpr uint32_t kRansFloor = 1u << 24;  // a lane decodes above this state, reads below it
 constexpr uint32_t kRoundBytes = 8;        // input bytes per schedule round, all lanes together
 constexpr uint32_t kMaxLanes = 16;
 constexpr uint32_t kBc7ControlWords = 512;
 constexpr uint32_t kFormats = 8;  // indexed by BC number
+constexpr size_t kChunkBlocks = 128;  // streaming chunk size (<= 4 KiB records on stack)
 
 // Symbols per block record, by BC number (the decoder below reads exactly these positions).
 constexpr size_t record_symbols(uint32_t bc) {
@@ -45,9 +48,11 @@ constexpr size_t record_symbols(uint32_t bc) {
 // ---------------------------------------------------------------------------
 
 struct Model {
-    uint32_t used = 0;                   // buckets in use
-    uint32_t freq[kMaxBuckets] = {};     // per-symbol frequency of each bucket
+    uint32_t used = 0;                     // buckets in use
+    uint32_t freq[kMaxBuckets] = {};       // per-symbol frequency of each bucket
     uint32_t first[kMaxBuckets + 1] = {};  // first slot of each bucket; first[used] = 65536
+    uint64_t recip[kMaxBuckets] = {};      // ceil(2^32 / freq[b]) for exact multiply-shift div
+    uint8_t bucket_hi[256] = {};           // upper-bound bucket index for (slot >> 8)
 };
 
 struct LaneLayout {
@@ -91,6 +96,7 @@ struct Tables {
     uint8_t rank_bc5[64] = {};
     bool has_bc7_control = false;
     uint16_t bc7_control[kBc7ControlWords] = {};
+    bool bc7_control_valid[kBc7ControlWords] = {};
     std::vector<PlainBlock> plain_dictionary[kFormats];
     std::vector<Bc7Block> bc7_dictionary;
     std::vector<Bc6Block> bc6_dictionary;
@@ -179,6 +185,19 @@ bool parse_models(const Section& s, Tables* t, std::string* error) {
         for (uint32_t b = model.used; b <= kMaxBuckets; ++b) {
             model.first[b] = 65536;
         }
+        // Precompute exact multiply-shift reciprocals for into / freq[b] (0 <= into <= 65535, 1 <= freq <= 65535)
+        // and top-byte bucket upper bounds for O(1) bucket search start.
+        for (uint32_t b = 0; b < model.used; ++b) {
+            model.recip[b] = ((uint64_t{1} << 32) + model.freq[b] - 1u) / model.freq[b];
+        }
+        for (uint32_t hi = 0; hi < 256; ++hi) {
+            const uint32_t max_slot = (hi << 8) | 0xFFu;
+            uint32_t b = model.used - 1;
+            while (model.first[b] > max_slot) {
+                --b;
+            }
+            model.bucket_hi[hi] = static_cast<uint8_t>(b);
+        }
     }
     return true;
 }
@@ -239,14 +258,52 @@ bool parse_ranks(const Section& s, Tables* t, std::string* error) {
     return true;
 }
 
+// BC7 (public format): endpoint bits of R, G, B, A per mode, without p-bits.
+constexpr uint8_t kBc7EndpointBits[8][4] = {{4, 4, 4, 0}, {6, 6, 6, 0}, {5, 5, 5, 0}, {7, 7, 7, 0},
+                                            {5, 5, 5, 6}, {7, 7, 7, 8}, {7, 7, 7, 7}, {5, 5, 5, 5}};
+// Index bits of the primary and secondary index sets per mode.
+constexpr uint8_t kBc7IndexBits[8][2] = {{3, 0}, {3, 0}, {2, 0}, {2, 0}, {3, 2}, {2, 2}, {4, 0}, {2, 0}};
+constexpr uint8_t kBc7Subsets[8] = {3, 2, 3, 2, 1, 1, 1, 2};
+constexpr uint8_t kBc7PartitionBits[8] = {4, 6, 6, 6, 0, 0, 0, 6};
+
+// The BC7 control word (from the BC7C table): bits 0-2 mode, 3-4 rotation, 5 index selection,
+// 6-7 subset count, 8-13 partition.
+struct Bc7Control {
+    uint32_t mode, rotation, index_select, subsets, partition;
+};
+inline constexpr Bc7Control bc7_control(uint16_t c) {
+    return {c & 7u, (c >> 3) & 3u, (c >> 5) & 1u, (c >> 6) & 3u, (c >> 8) & 63u};
+}
+inline constexpr bool bc7_control_is_valid(uint16_t control) {
+    if (control == 0) {
+        return false;
+    }
+    const Bc7Control c = bc7_control(control);
+    if (c.subsets != kBc7Subsets[c.mode]) {
+        return false;
+    }
+    if (c.rotation != 0 && c.mode != 4 && c.mode != 5) {
+        return false;
+    }
+    if (c.index_select != 0 && c.mode != 4) {
+        return false;
+    }
+    if (c.partition >= (1u << kBc7PartitionBits[c.mode])) {
+        return false;
+    }
+    return true;
+}
+
 bool parse_bc7_control(const Section& s, Tables* t, std::string* error) {
     if (s.size != kBc7ControlWords * 2) {
         *error = "BC7C section must be 512 u16 control words";
         return false;
     }
     ByteCursor in(s.data, s.size);
-    for (uint16_t& c : t->bc7_control) {
-        c = in.u16();
+    for (uint32_t k = 0; k < kBc7ControlWords; ++k) {
+        const uint16_t c = in.u16();
+        t->bc7_control[k] = c;
+        t->bc7_control_valid[k] = bc7_control_is_valid(c);
     }
     t->has_bc7_control = true;
     return true;
@@ -503,9 +560,13 @@ struct Lane {
 };
 
 // One rANS decode step on `x` (> 2^24) with `model`: the symbol and the next state.
-inline uint8_t rans_decode(const Model& model, uint32_t x, uint32_t* next) {
-    const uint32_t slot = x & 0xFFFF;
-    uint32_t b = model.used - 1;
+// Returns false on a corrupt state (slot == 0 or zero effective symbol frequency).
+inline bool rans_decode(const Model& model, uint32_t x, uint8_t* symbol_out, uint32_t* next) {
+    const uint32_t slot = x & 0xFFFFu;
+    if (slot == 0) {
+        return false;
+    }
+    uint32_t b = model.bucket_hi[slot >> 8];
     while (model.first[b] > slot) {
         --b;
     }
@@ -515,25 +576,30 @@ inline uint8_t rans_decode(const Model& model, uint32_t x, uint32_t* next) {
     if (b == 0) {
         // Symbol 0 owns slots 1 .. freq[0] - 1; slot 0 is never coded.
         symbol = 0;
-        freq = model.freq[0] - 1;
-        offset = slot - 1;
+        freq = model.freq[0] - 1u;
+        if (freq == 0) {
+            return false;
+        }
+        offset = slot - 1u;
     } else {
         const uint32_t into = slot - model.first[b];
-        const uint32_t q = into / model.freq[b];
+        const uint32_t q = static_cast<uint32_t>((static_cast<uint64_t>(into) * model.recip[b]) >> 32);
         symbol = (1u << (b - 1)) + q;
         freq = model.freq[b];
         offset = into - q * freq;
     }
     *next = (x >> 16) * freq + offset;
-    return static_cast<uint8_t>(symbol);
+    *symbol_out = static_cast<uint8_t>(symbol);
+    return true;
 }
 
 // Advances a lane by one step: consumes its input byte as fragment header or length, or, in the
 // payload, reads at most one byte into the state and decodes at most one symbol.
-inline void step(Lane& lane, const Tables& t) {
+// Returns false if a corrupt rANS state (slot == 0 or freq == 0) is encountered.
+inline bool step(Lane& lane, const Tables& t) {
     if (lane.phase != Lane::kPayload) {
         if (!lane.has_input) {
-            return;
+            return true;
         }
         const uint8_t b = lane.input;
         lane.has_input = false;
@@ -556,7 +622,7 @@ inline void step(Lane& lane, const Tables& t) {
             lane.bytes_left = ((static_cast<uint32_t>(b) << 8) | lane.bytes_left) + 257u;
             lane.phase = Lane::kPayload;
         }
-        return;
+        return true;
     }
     uint32_t x = lane.state;
     if (x < kRansFloor && lane.has_input) {
@@ -566,13 +632,15 @@ inline void step(Lane& lane, const Tables& t) {
     }
     lane.wants_byte = lane.bytes_left != 0 && !lane.has_input;
     if (x > kRansFloor) {
-        lane.symbol = rans_decode(t.models[lane.model], x, &lane.state);
+        if (!rans_decode(t.models[lane.model], x, &lane.symbol, &lane.state)) {
+            return false;
+        }
         lane.has_symbol = true;
-        return;
+        return true;
     }
     if (lane.bytes_left != 0) {
         lane.state = x;  // exactly 2^24 stalls the lane; only a lane done with its symbols sits there
-        return;
+        return true;
     }
     // End of the fragment. The state carried on is the one from before this step's read.
     lane.phase = Lane::kHeader;
@@ -580,65 +648,97 @@ inline void step(Lane& lane, const Tables& t) {
     if (lane.clear_state_at_end) {
         lane.state = 0;
     }
-}
-
-// Runs the schedule until every lane has delivered `blocks * per_block` symbols. Each round the
-// lanes step in order; a lane that wants input gets the next byte while the round has budget. A
-// lane that already delivered its symbol for the current position holds the next one back.
-template <typename Fetch>
-bool run_lanes(const Tables& t, const LaneLayout& layout, size_t blocks, Fetch&& fetch, uint8_t* records) {
-    std::array<Lane, kMaxLanes> lanes{};
-    const uint32_t n = layout.lanes;
-    const uint32_t per = layout.per_block;
-    for (uint32_t j = 0; j < n; ++j) {
-        lanes[j].width = layout.width[j];
-    }
-    const size_t record_size = static_cast<size_t>(n) * per;
-    const uint32_t everyone = (1u << n) - 1u;  // n <= 16
-    const size_t positions = blocks * per;
-    size_t position = 0;
-    uint32_t delivered = 0;
-    uint32_t quiet_rounds = 0;
-    while (position < positions) {
-        uint8_t* out = records + (position / per) * record_size + position % per;
-        uint32_t budget_used = 0;
-        bool delivered_any = false;
-        for (uint32_t j = 0; j < n; ++j) {
-            Lane& lane = lanes[j];
-            const uint32_t used_before = budget_used;
-            if (!lane.blocked) {
-                step(lane, t);
-            }
-            const bool holding = lane.has_symbol && (delivered & (1u << j)) != 0;
-            if (lane.wants_byte && !holding && budget_used < kRoundBytes) {
-                uint8_t byte = 0;
-                if (fetch(j, &byte)) {
-                    lane.input = byte;
-                    lane.has_input = true;
-                    ++budget_used;
-                }
-            }
-            lane.blocked = holding || (lane.wants_byte && used_before >= kRoundBytes);
-            if (!lane.blocked && lane.has_symbol) {
-                out[j * per] = lane.symbol;
-                lane.has_symbol = false;
-                delivered |= 1u << j;
-                delivered_any = true;
-            }
-        }
-        if (delivered == everyone) {
-            ++position;
-            delivered = 0;
-            delivered_any = true;
-        }
-        // A valid stream never goes several rounds without reading or delivering anything.
-        quiet_rounds = (budget_used != 0 || delivered_any) ? 0 : quiet_rounds + 1;
-        if (quiet_rounds > 4) {
-            return false;
-        }
-    }
     return true;
 }
+
+// Stateful, resumable lane schedule driver. Decodes arbitrary chunk sizes into a caller-supplied
+// buffer while preserving exact per-lane rANS states across chunk boundaries.
+class LaneRunner {
+public:
+    explicit LaneRunner(const LaneLayout& layout)
+        : n_(layout.lanes),
+          per_(layout.per_block),
+          record_size_(static_cast<size_t>(layout.lanes) * layout.per_block),
+          everyone_((1u << layout.lanes) - 1u) {
+        for (uint32_t j = 0; j < n_; ++j) {
+            lanes_[j].width = layout.width[j];
+        }
+    }
+
+    template <typename Fetch>
+    bool decode_chunk(const Tables& t, size_t blocks, Fetch& fetch, uint8_t* records) {
+        size_t block_idx = 0;
+        uint32_t sym_in_block = 0;
+        uint8_t* out = records;
+        while (block_idx < blocks) {
+            uint32_t budget_used = 0;
+            bool delivered_any = false;
+            for (uint32_t j = 0; j < n_; ++j) {
+                Lane& lane = lanes_[j];
+                const uint32_t used_before = budget_used;
+                if (!lane.blocked) {
+                    if (!step(lane, t)) {
+                        return false;
+                    }
+                }
+                const bool holding = lane.has_symbol && (delivered_ & (1u << j)) != 0;
+                if (lane.wants_byte && !holding && budget_used < kRoundBytes) {
+                    uint8_t byte = 0;
+                    if (fetch(j, &byte)) {
+                        lane.input = byte;
+                        lane.has_input = true;
+                        ++budget_used;
+                    }
+                }
+                lane.blocked = holding || (lane.wants_byte && used_before >= kRoundBytes);
+                if (!lane.blocked && lane.has_symbol) {
+                    out[j * per_] = lane.symbol;
+                    lane.has_symbol = false;
+                    delivered_ |= 1u << j;
+                    delivered_any = true;
+                }
+            }
+            if (delivered_ == everyone_) {
+                delivered_ = 0;
+                delivered_any = true;
+                if (++sym_in_block == per_) {
+                    sym_in_block = 0;
+                    ++block_idx;
+                    out = records + block_idx * record_size_;
+                } else {
+                    ++out;
+                }
+            }
+            // A valid stream never goes several rounds without reading or delivering anything.
+            quiet_rounds_ = (budget_used != 0 || delivered_any) ? 0 : quiet_rounds_ + 1;
+            if (quiet_rounds_ > 4) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    std::array<Lane, kMaxLanes> lanes_{};
+    uint32_t n_ = 0;
+    uint32_t per_ = 0;
+    size_t record_size_ = 0;
+    uint32_t everyone_ = 0;
+    uint32_t delivered_ = 0;
+    uint32_t quiet_rounds_ = 0;
+};
+
+struct CursorFetch {
+    const uint8_t* p;
+    const uint8_t* end;
+    bool operator()(size_t, uint8_t* byte) {
+        if (p == end) {
+            return false;
+        }
+        *byte = *p++;
+        return true;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Block records
@@ -652,13 +752,14 @@ inline uint8_t unzigzag_mod(uint8_t v, uint32_t bits) {
 }
 
 // Two 4-bit symbols merged bitwise: `even` on bits 0, 2, 4, 6 and `odd` on bits 1, 3, 5, 7.
-inline uint8_t merge_nibbles(uint8_t even, uint8_t odd) {
-    uint8_t out = 0;
-    for (uint32_t k = 0; k < 4; ++k) {
-        out |= static_cast<uint8_t>(((even >> k) & 1u) << (2 * k));
-        out |= static_cast<uint8_t>(((odd >> k) & 1u) << (2 * k + 1));
-    }
-    return out;
+inline constexpr uint32_t spread_bits4(uint32_t v) {
+    v &= 0x0Fu;
+    v = (v | (v << 2)) & 0x33u;
+    v = (v | (v << 1)) & 0x55u;
+    return v;
+}
+inline constexpr uint8_t merge_nibbles(uint8_t even, uint8_t odd) {
+    return static_cast<uint8_t>(spread_bits4(even) | (spread_bits4(odd) << 1));
 }
 
 // The record's (endpoint, index) references. The endpoint reference is coded as a zigzag delta
@@ -675,17 +776,21 @@ inline References references(const uint8_t* s, bool four_symbols) {
 }
 
 // Reference `r` of block `i`: 0 is the all-zero block, 1..i earlier blocks, beyond that the
-// dictionary (r = i + 1 is entry 0).
+// dictionary (r = i + 1 is entry 0). Guards against out-of-bounds dictionary access.
 template <typename T>
-const T& referenced(size_t i, uint32_t r, const std::vector<T>& history, const std::vector<T>& dictionary,
-                    const T& zero) {
+const T& referenced(size_t i, uint32_t r, const std::array<T, kHistoryBlocks>& history,
+                    const std::vector<T>& dictionary, const T& zero) {
     if (r == 0) {
         return zero;
     }
     if (r <= i) {
-        return history[(i - r) % kHistoryBlocks];
+        return history[(i - r) & (kHistoryBlocks - 1)];
     }
-    return dictionary[r - i - 1];
+    const size_t dict_idx = static_cast<size_t>(r) - i - 1;
+    if (dict_idx >= dictionary.size()) {
+        return zero;
+    }
+    return dictionary[dict_idx];
 }
 
 // 2-bit index residuals: one symbol per 2x2 quad (quads in raster order), ranked.
@@ -833,27 +938,38 @@ void pack_plain(uint32_t bc, const PlainBlock& v, uint8_t* out) {
     }
 }
 
-DecodeStatus decode_plain(const Tables& t, uint32_t bc, const uint8_t* records, size_t record_size, size_t blocks,
-                          uint8_t* dst) {
+DecodeStatus decode_plain_stream(const Tables& t, uint32_t bc, size_t blocks, CursorFetch& fetch, uint8_t* dst) {
     const PlainFormat f = plain_format(bc);
     const std::vector<PlainBlock>& dictionary = t.plain_dictionary[bc];
     const size_t out_bytes = block_bytes(bc);
-    std::vector<PlainBlock> history(kHistoryBlocks);
+    const size_t record_size = record_symbols(bc);
+    LaneRunner runner(t.layouts[bc]);
+    std::array<PlainBlock, kHistoryBlocks> history{};
     const PlainBlock zero{};
-    for (size_t i = 0; i < blocks; ++i) {
-        const uint8_t* s = records + i * record_size;
-        const References refs = references(s, f.four_reference_symbols);
-        const PlainBlock& ep_ref = referenced(i, refs.endpoints, history, dictionary, zero);
-        const PlainBlock& ix_ref = referenced(i, refs.indices, history, dictionary, zero);
-        PlainBlock v = plain_residual(t, bc, s);
-        for (uint32_t k = 0; k < 8; ++k) {
-            v.ep[k] = static_cast<uint8_t>((v.ep[k] + ep_ref.ep[k]) & ((1u << f.endpoint_bits[k]) - 1u));
+    uint8_t chunk[kChunkBlocks * 32];
+    size_t block_base = 0;
+    while (block_base < blocks) {
+        const size_t count = std::min(blocks - block_base, kChunkBlocks);
+        if (!runner.decode_chunk(t, count, fetch, chunk)) {
+            return DecodeStatus::Truncated;
         }
-        for (uint32_t k = 0; k < 32; ++k) {
-            v.ix[k] = static_cast<uint8_t>((v.ix[k] + ix_ref.ix[k]) & ((1u << f.index_bits[k]) - 1u));
+        for (size_t k = 0; k < count; ++k) {
+            const size_t i = block_base + k;
+            const uint8_t* s = chunk + k * record_size;
+            const References refs = references(s, f.four_reference_symbols);
+            const PlainBlock& ep_ref = referenced(i, refs.endpoints, history, dictionary, zero);
+            const PlainBlock& ix_ref = referenced(i, refs.indices, history, dictionary, zero);
+            PlainBlock v = plain_residual(t, bc, s);
+            for (uint32_t e = 0; e < 8; ++e) {
+                v.ep[e] = static_cast<uint8_t>((v.ep[e] + ep_ref.ep[e]) & ((1u << f.endpoint_bits[e]) - 1u));
+            }
+            for (uint32_t p = 0; p < 32; ++p) {
+                v.ix[p] = static_cast<uint8_t>((v.ix[p] + ix_ref.ix[p]) & ((1u << f.index_bits[p]) - 1u));
+            }
+            history[i & (kHistoryBlocks - 1)] = v;
+            pack_plain(bc, v, dst + i * out_bytes);
         }
-        history[i % kHistoryBlocks] = v;
-        pack_plain(bc, v, dst + i * out_bytes);
+        block_base += count;
     }
     return DecodeStatus::Ok;
 }
@@ -861,14 +977,6 @@ DecodeStatus decode_plain(const Tables& t, uint32_t bc, const uint8_t* records, 
 // ---------------------------------------------------------------------------
 // BC7
 // ---------------------------------------------------------------------------
-
-// BC7 (public format): endpoint bits of R, G, B, A per mode, without p-bits.
-constexpr uint8_t kBc7EndpointBits[8][4] = {{4, 4, 4, 0}, {6, 6, 6, 0}, {5, 5, 5, 0}, {7, 7, 7, 0},
-                                            {5, 5, 5, 6}, {7, 7, 7, 8}, {7, 7, 7, 7}, {5, 5, 5, 5}};
-// Index bits of the primary and secondary index sets per mode.
-constexpr uint8_t kBc7IndexBits[8][2] = {{3, 0}, {3, 0}, {2, 0}, {2, 0}, {3, 2}, {2, 2}, {4, 0}, {2, 0}};
-constexpr uint8_t kBc7Subsets[8] = {3, 2, 3, 2, 1, 1, 1, 2};
-constexpr uint8_t kBc7PartitionBits[8] = {4, 6, 6, 6, 0, 0, 0, 6};
 
 // BC7 anchor ("fix-up") pixels of the second subset (two-subset partitions) and of the second and
 // third subsets (three-subset partitions), from the public BC7 specification. Values as published
@@ -885,15 +993,6 @@ constexpr uint8_t kBc7Anchor3[64][2] = {
     {15, 3},  {3, 15},  {5, 10},  {6, 10}, {10, 8},  {8, 9},   {15, 10}, {15, 6},  {3, 15},  {15, 8},  {5, 15},
     {15, 3},  {15, 6},  {15, 6},  {15, 8}, {3, 15},  {15, 3},  {5, 15},  {5, 15},  {5, 15},  {8, 15},  {5, 15},
     {10, 15}, {5, 15},  {10, 15}, {8, 15}, {13, 15}, {15, 3},  {12, 15}, {3, 15},  {3, 8}};
-
-// The BC7 control word (from the BC7C table): bits 0-2 mode, 3-4 rotation, 5 index selection,
-// 6-7 subset count, 8-13 partition.
-struct Bc7Control {
-    uint32_t mode, rotation, index_select, subsets, partition;
-};
-inline Bc7Control bc7_control(uint16_t c) {
-    return {c & 7u, (c >> 3) & 3u, (c >> 5) & 1u, (c >> 6) & 3u, (c >> 8) & 63u};
-}
 
 inline bool bc7_has_pbits(uint32_t mode) { return mode == 0 || mode == 1 || mode == 3 || mode == 6 || mode == 7; }
 
@@ -913,11 +1012,10 @@ std::array<uint32_t, 4> bc7_precision(const Bc7Control& c) {
 }
 
 // A 4-bit symbol from alternate bits of `b` (starting at bit `first`), zigzag-decoded to signed.
-inline int16_t alternate_bits_signed(uint8_t b, uint32_t first) {
-    uint32_t v = 0;
-    for (uint32_t k = 0; k < 4; ++k) {
-        v |= ((b >> (first + 2 * k)) & 1u) << k;
-    }
+inline constexpr int16_t alternate_bits_signed(uint8_t b, uint32_t first) {
+    uint32_t v = (static_cast<uint32_t>(b) >> first) & 0x55u;
+    v = (v | (v >> 1)) & 0x33u;
+    v = (v | (v >> 2)) & 0x0Fu;
     return static_cast<int16_t>(static_cast<int32_t>(v >> 1) ^ -static_cast<int32_t>(v & 1u));
 }
 
@@ -938,11 +1036,21 @@ inline int16_t add_index(int16_t residual, uint32_t bits, int16_t ref, uint32_t 
 class BlockBits {
 public:
     void put(uint64_t value, uint32_t n) {
-        for (uint32_t k = 0; k < n && at_ < 128; ++k, ++at_) {
-            if ((value >> k) & 1u) {
-                word_[at_ / 64] |= uint64_t{1} << (at_ % 64);
-            }
+        if (n == 0 || at_ >= 128) {
+            return;
         }
+        if (n > 128 - at_) {
+            n = 128 - at_;
+        }
+        const uint32_t count = n > 64 ? 64 : n;
+        const uint64_t masked = count == 64 ? value : (value & ((uint64_t{1} << count) - 1u));
+        const uint32_t idx = at_ >> 6;
+        const uint32_t bit_off = at_ & 63u;
+        word_[idx] |= masked << bit_off;
+        if (bit_off + count > 64 && idx == 0) {
+            word_[1] |= masked >> (64 - bit_off);
+        }
+        at_ += n;
     }
     void store(uint8_t* out) const {
         write_le(out, word_[0], 8);
@@ -1024,72 +1132,85 @@ void pack_bc7(const Bc7Block& b, const std::array<uint32_t, 4>& prec, uint8_t* o
     w.store(out);
 }
 
-DecodeStatus decode_bc7(const Tables& t, const uint8_t* records, size_t blocks, uint8_t* dst) {
-    std::vector<Bc7Block> history(kHistoryBlocks);
+DecodeStatus decode_bc7_stream(const Tables& t, size_t blocks, CursorFetch& fetch, uint8_t* dst) {
+    LaneRunner runner(t.layouts[7]);
+    std::array<Bc7Block, kHistoryBlocks> history{};
     const Bc7Block zero{};
-    for (size_t i = 0; i < blocks; ++i) {
-        const uint8_t* s = records + i * 32;
-        const References refs = references(s, true);
-        const uint16_t control = t.bc7_control[((s[31] & 15u) << 5) | (s[30] & 31u)];
-        const Bc7Control c = bc7_control(control);
-        if (control == 0 || c.subsets != kBc7Subsets[c.mode]) {
-            return DecodeStatus::Corrupt;
+    uint8_t chunk[kChunkBlocks * 32];
+    size_t block_base = 0;
+    while (block_base < blocks) {
+        const size_t count = std::min(blocks - block_base, kChunkBlocks);
+        if (!runner.decode_chunk(t, count, fetch, chunk)) {
+            return DecodeStatus::Truncated;
         }
-        const std::array<uint32_t, 4> prec = bc7_precision(c);
-        const bool three = c.subsets == 3;
-        // Endpoint residual symbols per subset row (R0 R1 G0 G1 B0 B1 A0 A1). Three-subset blocks
-        // have no alpha and use the alpha symbols for the third subset's green and blue.
-        const uint8_t stored[3][8] = {
-            {s[4], s[5], s[6], s[7], s[8], s[9], three ? uint8_t{0} : s[10], three ? uint8_t{0} : s[11]},
-            {s[12], s[13], s[14], s[15], s[16], s[17], three ? uint8_t{0} : s[18], three ? uint8_t{0} : s[19]},
-            {s[20], s[21], three ? s[10] : uint8_t{0}, three ? s[11] : uint8_t{0}, three ? s[18] : uint8_t{0},
-             three ? s[19] : uint8_t{0}, 0, 0}};
-        const Bc7Block& er = referenced(i, refs.endpoints, history, t.bc7_dictionary, zero);
-        Bc7Block v;
-        v.control = control;
-        // Subsets the reference lacks predict from its first subset.
-        const uint32_t shared_rows = std::min(c.subsets, bc7_control(er.control).subsets);
-        const uint32_t columns = prec[3] > 0 ? 8 : 6;
-        for (uint32_t col = 0; col < columns; ++col) {
-            const uint32_t bits = prec[col / 2];
-            if (bits == 0) {
-                continue;
+        for (size_t idx = 0; idx < count; ++idx) {
+            const size_t i = block_base + idx;
+            const uint8_t* s = chunk + idx * 32;
+            const References refs = references(s, true);
+            const uint32_t code = ((s[31] & 15u) << 5) | (s[30] & 31u);
+            if (!t.bc7_control_valid[code]) {
+                return DecodeStatus::Corrupt;
             }
-            const auto mask = static_cast<uint16_t>(0xFFFFu << (16 - bits));
-            for (uint32_t row = 0; row < c.subsets; ++row) {
-                const uint8_t z = stored[row][col];
-                const auto residual =
-                    static_cast<uint16_t>(static_cast<uint16_t>((z >> 1) ^ (0u - (z & 1u))) << (16 - bits));
-                const uint16_t base = er.rows[row < shared_rows ? row : 0][col] & mask;
-                v.rows[row][col] = static_cast<uint16_t>(base + residual);
-            }
-        }
-        const Bc7Block& ir = referenced(i, refs.indices, history, t.bc7_dictionary, zero);
-        v.index_bits[0] = kBc7IndexBits[c.mode][0];
-        v.index_bits[1] = kBc7IndexBits[c.mode][1];
-        // Index residuals: four symbol pairs per set, each byte two signed 4-bit values on
-        // alternate bits; the first three pairs give the odd bits first.
-        constexpr uint32_t kSetSymbols[2][4] = {{22, 24, 26, 28}, {12, 14, 16, 20}};
-        for (uint32_t set = 0; set < 2; ++set) {
-            const uint32_t bits = v.index_bits[set];
-            if (bits == 0) {
-                continue;
-            }
-            for (uint32_t k = 0; k < 4; ++k) {
-                for (uint32_t half = 0; half < 2; ++half) {
-                    const uint8_t byte = s[kSetSymbols[set][k] + half];
-                    const int16_t even = alternate_bits_signed(byte, 0);
-                    const int16_t odd = alternate_bits_signed(byte, 1);
-                    const int16_t first = k < 3 ? odd : even;
-                    const int16_t second = k < 3 ? even : odd;
-                    const uint32_t p = 4 * k + 2 * half;
-                    v.index[set][p] = add_index(first, bits, ir.index[set][p], ir.index_bits[set]);
-                    v.index[set][p + 1] = add_index(second, bits, ir.index[set][p + 1], ir.index_bits[set]);
+            const uint16_t control = t.bc7_control[code];
+            const Bc7Control c = bc7_control(control);
+            const std::array<uint32_t, 4> prec = bc7_precision(c);
+            const bool three = c.subsets == 3;
+            // Endpoint residual symbols per subset row (R0 R1 G0 G1 B0 B1 A0 A1). Three-subset blocks
+            // have no alpha and use the alpha symbols for the third subset's green and blue.
+            const uint8_t stored[3][8] = {
+                {s[4], s[5], s[6], s[7], s[8], s[9], three ? uint8_t{0} : s[10], three ? uint8_t{0} : s[11]},
+                {s[12], s[13], s[14], s[15], s[16], s[17], three ? uint8_t{0} : s[18], three ? uint8_t{0} : s[19]},
+                {s[20], s[21], three ? s[10] : uint8_t{0}, three ? s[11] : uint8_t{0}, three ? s[18] : uint8_t{0},
+                 three ? s[19] : uint8_t{0}, 0, 0}};
+            const Bc7Block& er = referenced(i, refs.endpoints, history, t.bc7_dictionary, zero);
+            Bc7Block v;
+            v.control = control;
+            // Subsets the reference lacks predict from its first subset.
+            const uint32_t shared_rows = std::min(c.subsets, bc7_control(er.control).subsets);
+            const uint32_t columns = prec[3] > 0 ? 8 : 6;
+            for (uint32_t col = 0; col < columns; ++col) {
+                const uint32_t bits = prec[col / 2];
+                if (bits == 0) {
+                    continue;
+                }
+                const auto mask = static_cast<uint16_t>(0xFFFFu << (16 - bits));
+                for (uint32_t row = 0; row < c.subsets; ++row) {
+                    const uint8_t z = stored[row][col];
+                    const auto residual =
+                        static_cast<uint16_t>(static_cast<uint32_t>(static_cast<uint16_t>((z >> 1) ^ (0u - (z & 1u))))
+                                              << (16 - bits));
+                    const uint16_t base = er.rows[row < shared_rows ? row : 0][col] & mask;
+                    v.rows[row][col] = static_cast<uint16_t>(base + residual);
                 }
             }
+            const Bc7Block& ir = referenced(i, refs.indices, history, t.bc7_dictionary, zero);
+            v.index_bits[0] = kBc7IndexBits[c.mode][0];
+            v.index_bits[1] = kBc7IndexBits[c.mode][1];
+            // Index residuals: four symbol pairs per set, each byte two signed 4-bit values on
+            // alternate bits; the first three pairs give the odd bits first.
+            constexpr uint32_t kSetSymbols[2][4] = {{22, 24, 26, 28}, {12, 14, 16, 20}};
+            for (uint32_t set = 0; set < 2; ++set) {
+                const uint32_t bits = v.index_bits[set];
+                if (bits == 0) {
+                    continue;
+                }
+                for (uint32_t k = 0; k < 4; ++k) {
+                    for (uint32_t half = 0; half < 2; ++half) {
+                        const uint8_t byte = s[kSetSymbols[set][k] + half];
+                        const int16_t even = alternate_bits_signed(byte, 0);
+                        const int16_t odd = alternate_bits_signed(byte, 1);
+                        const int16_t first = k < 3 ? odd : even;
+                        const int16_t second = k < 3 ? even : odd;
+                        const uint32_t p = 4 * k + 2 * half;
+                        v.index[set][p] = add_index(first, bits, ir.index[set][p], ir.index_bits[set]);
+                        v.index[set][p + 1] = add_index(second, bits, ir.index[set][p + 1], ir.index_bits[set]);
+                    }
+                }
+            }
+            history[i & (kHistoryBlocks - 1)] = v;
+            pack_bc7(v, prec, dst + i * 16);
         }
-        history[i % kHistoryBlocks] = v;
-        pack_bc7(v, prec, dst + i * 16);
+        block_base += count;
     }
     return DecodeStatus::Ok;
 }
@@ -1137,45 +1258,72 @@ struct Bc6Run {
     uint8_t length;
 };
 
-const std::vector<Bc6Run>& bc6_runs(uint32_t mode) {
-    static const std::array<std::vector<Bc6Run>, 15> all = [] {
-        std::array<std::vector<Bc6Run>, 15> out;
-        for (uint32_t m = 1; m < 15; ++m) {
-            const char* p = kBc6Layout[m];
-            while (*p != 0) {
-                if (*p == ' ') {
-                    ++p;
-                    continue;
-                }
-                Bc6Run run{3, 0, 0, 5};
-                if (*p == 'd') {
-                    ++p;
-                } else {
-                    run.channel = static_cast<uint8_t>(*p == 'r' ? 0 : *p == 'g' ? 1 : 2);
-                    run.endpoint = static_cast<uint8_t>(p[1] == 'w' ? 0 : p[1] == 'x' ? 1 : p[1] == 'y' ? 2 : 3);
-                    p += 2;
-                    uint32_t hi = 0;
-                    while (*p >= '0' && *p <= '9') {
-                        hi = hi * 10 + static_cast<uint32_t>(*p++ - '0');
-                    }
-                    uint32_t lo = hi;
-                    if (*p == ':') {
-                        ++p;
-                        lo = 0;
-                        while (*p >= '0' && *p <= '9') {
-                            lo = lo * 10 + static_cast<uint32_t>(*p++ - '0');
-                        }
-                    }
-                    run.first = static_cast<uint8_t>(lo);
-                    run.length = static_cast<uint8_t>(hi - lo + 1);
-                }
-                out[m].push_back(run);
+constexpr size_t kMaxBc6Runs = 24;
+
+struct Bc6RunTable {
+    uint8_t count = 0;
+    Bc6Run runs[kMaxBc6Runs] = {};
+};
+
+constexpr std::array<Bc6RunTable, 15> build_bc6_runs() {
+    std::array<Bc6RunTable, 15> out{};
+    for (uint32_t m = 1; m < 15; ++m) {
+        const char* p = kBc6Layout[m];
+        Bc6RunTable& table = out[m];
+        while (*p != 0) {
+            if (*p == ' ') {
+                ++p;
+                continue;
             }
+            Bc6Run run{3, 0, 0, 5};
+            if (*p == 'd') {
+                ++p;
+            } else {
+                run.channel = static_cast<uint8_t>(*p == 'r' ? 0 : *p == 'g' ? 1 : 2);
+                run.endpoint = static_cast<uint8_t>(p[1] == 'w' ? 0 : p[1] == 'x' ? 1 : p[1] == 'y' ? 2 : 3);
+                p += 2;
+                uint32_t hi = 0;
+                while (*p >= '0' && *p <= '9') {
+                    hi = hi * 10 + static_cast<uint32_t>(*p++ - '0');
+                }
+                uint32_t lo = hi;
+                if (*p == ':') {
+                    ++p;
+                    lo = 0;
+                    while (*p >= '0' && *p <= '9') {
+                        lo = lo * 10 + static_cast<uint32_t>(*p++ - '0');
+                    }
+                }
+                run.first = static_cast<uint8_t>(lo);
+                run.length = static_cast<uint8_t>(hi - lo + 1);
+            }
+            table.runs[table.count++] = run;
         }
-        return out;
-    }();
-    return all[mode];
+    }
+    return out;
 }
+
+constexpr std::array<Bc6RunTable, 15> kBc6Runs = build_bc6_runs();
+
+constexpr bool verify_bc6_runs() {
+    for (uint32_t m = 1; m < 15; ++m) {
+        if (kBc6Runs[m].count == 0 || kBc6Runs[m].count > kMaxBc6Runs) {
+            return false;
+        }
+        uint32_t bits = kBc6ModeCode[m][1];
+        for (uint8_t k = 0; k < kBc6Runs[m].count; ++k) {
+            bits += kBc6Runs[m].runs[k].length;
+        }
+        const uint32_t ib = m < 11 ? 3u : 4u;
+        const uint32_t anchors = m < 11 ? 2u : 1u;
+        bits += 16u * ib - anchors;
+        if (bits != 128u) {
+            return false;
+        }
+    }
+    return true;
+}
+static_assert(verify_bc6_runs(), "all BC6H mode layouts must total exactly 128 bits");
 
 inline uint32_t bc6_index_bits(uint32_t mode) {
     return mode >= 1 && mode <= 10 ? 3 : mode >= 11 && mode <= 14 ? 4 : 0;
@@ -1185,20 +1333,24 @@ inline uint32_t bc6_index_bits(uint32_t mode) {
 inline uint16_t unzigzag16(uint16_t v) { return static_cast<uint16_t>((v >> 1) ^ (0u - (v & 1u))); }
 
 // Two bytes' bits interleaved: `a` on the even bits of the result, `b` on the odd bits.
-inline uint16_t merge_bytes(uint8_t a, uint8_t b) {
-    uint32_t out = 0;
-    for (uint32_t k = 0; k < 8; ++k) {
-        out |= ((a >> k) & 1u) << (2 * k);
-        out |= ((b >> k) & 1u) << (2 * k + 1);
-    }
-    return static_cast<uint16_t>(out);
+inline constexpr uint32_t spread_bits8(uint32_t v) {
+    v &= 0xFFu;
+    v = (v | (v << 4)) & 0x0F0Fu;
+    v = (v | (v << 2)) & 0x3333u;
+    v = (v | (v << 1)) & 0x5555u;
+    return v;
+}
+inline constexpr uint16_t merge_bytes(uint8_t a, uint8_t b) {
+    return static_cast<uint16_t>(spread_bits8(a) | (spread_bits8(b) << 1));
 }
 
 void pack_bc6(const Bc6Block& b, const uint8_t shift[4], uint8_t partition, uint8_t* out) {
     BlockBits w;
     w.put(kBc6ModeCode[b.mode][0], kBc6ModeCode[b.mode][1]);
     const bool two = b.mode < 11;
-    for (const Bc6Run& run : bc6_runs(b.mode)) {
+    const Bc6RunTable& table = kBc6Runs[b.mode];
+    for (uint8_t r = 0; r < table.count; ++r) {
+        const Bc6Run& run = table.runs[r];
         if (run.channel == 3) {
             w.put(partition, 5);
             continue;
@@ -1216,79 +1368,79 @@ void pack_bc6(const Bc6Block& b, const uint8_t shift[4], uint8_t partition, uint
     w.store(out);
 }
 
-DecodeStatus decode_bc6(const Tables& t, const uint8_t* records, size_t blocks, uint8_t* dst) {
-    std::vector<Bc6Block> history(kHistoryBlocks);
+DecodeStatus decode_bc6_stream(const Tables& t, size_t blocks, CursorFetch& fetch, uint8_t* dst) {
+    LaneRunner runner(t.layouts[6]);
+    std::array<Bc6Block, kHistoryBlocks> history{};
     Bc6Block zero;
     zero.mode = 11;
-    for (size_t i = 0; i < blocks; ++i) {
-        const uint8_t* s = records + i * 32;
-        const References refs = references(s, true);
-        const uint32_t mode = static_cast<uint8_t>(s[30] + 1u);
-        if (mode < 1 || mode > 14) {
-            return DecodeStatus::Corrupt;
+    uint8_t chunk[kChunkBlocks * 32];
+    size_t block_base = 0;
+    while (block_base < blocks) {
+        const size_t count = std::min(blocks - block_base, kChunkBlocks);
+        if (!runner.decode_chunk(t, count, fetch, chunk)) {
+            return DecodeStatus::Truncated;
         }
-        const bool two = mode < 11;
-        uint8_t shift[4];
-        for (uint32_t k = 0; k < 4; ++k) {
-            shift[k] = static_cast<uint8_t>(16 - kBc6Bits[mode][k]);
-        }
-        // Residuals of endpoints 0 and 1 (all modes), 2 and 3 (two-subset modes), per channel.
-        uint16_t res[4][3] = {};
-        for (uint32_t c = 0; c < 3; ++c) {
-            res[0][c] = unzigzag16(merge_bytes(s[4 + 2 * c], s[5 + 2 * c]));
-            res[1][c] = unzigzag16(merge_bytes(s[10 + 2 * c], s[11 + 2 * c]));
-            if (two) {
-                res[2][c] = unzigzag16(s[16 + 2 * c]);
-                res[3][c] = unzigzag16(s[17 + 2 * c]);
+        for (size_t idx = 0; idx < count; ++idx) {
+            const size_t i = block_base + idx;
+            const uint8_t* s = chunk + idx * 32;
+            const References refs = references(s, true);
+            const uint32_t mode = static_cast<uint8_t>(s[30] + 1u);
+            if (mode < 1 || mode > 14) {
+                return DecodeStatus::Corrupt;
             }
-        }
-        const Bc6Block& er = referenced(i, refs.endpoints, history, t.bc6_dictionary, zero);
-        Bc6Block v;
-        v.mode = static_cast<uint8_t>(mode);
-        // Reference plus residual at the channel's precision (the reference is cut after the sum).
-        for (uint32_t k = 0; k < (two ? 4u : 2u); ++k) {
+            const bool two = mode < 11;
+            uint8_t shift[4];
+            for (uint32_t k = 0; k < 4; ++k) {
+                shift[k] = static_cast<uint8_t>(16 - kBc6Bits[mode][k]);
+            }
+            // Residuals of endpoints 0 and 1 (all modes), 2 and 3 (two-subset modes), per channel.
+            uint16_t res[4][3] = {};
             for (uint32_t c = 0; c < 3; ++c) {
-                const uint32_t sh = k == 0 ? shift[0] : shift[1 + c];
-                const auto mask = static_cast<uint16_t>(0xFFFFu << sh);
-                v.ep[k][c] = static_cast<uint16_t>(er.ep[k][c] + static_cast<uint16_t>(res[k][c] << sh)) & mask;
+                res[0][c] = unzigzag16(merge_bytes(s[4 + 2 * c], s[5 + 2 * c]));
+                res[1][c] = unzigzag16(merge_bytes(s[10 + 2 * c], s[11 + 2 * c]));
+                if (two) {
+                    res[2][c] = unzigzag16(s[16 + 2 * c]);
+                    res[3][c] = unzigzag16(s[17 + 2 * c]);
+                }
             }
-        }
-        if (!two) {
-            // A one-subset block leaves endpoints 2 and 3 as endpoint 0 re-expressed at the delta
-            // precision and endpoint 1 again, for later blocks to predict from.
-            for (uint32_t c = 0; c < 3; ++c) {
-                v.ep[2][c] = static_cast<uint16_t>((v.ep[0][c] >> shift[0]) << shift[1]);
-                v.ep[3][c] = v.ep[1][c];
+            const Bc6Block& er = referenced(i, refs.endpoints, history, t.bc6_dictionary, zero);
+            Bc6Block v;
+            v.mode = static_cast<uint8_t>(mode);
+            // Reference plus residual at the channel's precision (the reference is cut after the sum).
+            for (uint32_t k = 0; k < (two ? 4u : 2u); ++k) {
+                for (uint32_t c = 0; c < 3; ++c) {
+                    const uint32_t sh = k == 0 ? shift[0] : shift[1 + c];
+                    const auto mask = static_cast<uint16_t>(0xFFFFu << sh);
+                    const auto delta = static_cast<uint16_t>(static_cast<uint32_t>(res[k][c]) << sh);
+                    v.ep[k][c] = static_cast<uint16_t>(er.ep[k][c] + delta) & mask;
+                }
             }
+            if (!two) {
+                // A one-subset block leaves endpoints 2 and 3 as endpoint 0 re-expressed at the delta
+                // precision and endpoint 1 again, for later blocks to predict from.
+                for (uint32_t c = 0; c < 3; ++c) {
+                    v.ep[2][c] = static_cast<uint16_t>((v.ep[0][c] >> shift[0]) << shift[1]);
+                    v.ep[3][c] = v.ep[1][c];
+                }
+            }
+            const Bc6Block& ir = referenced(i, refs.indices, history, t.bc6_dictionary, zero);
+            const uint32_t bits = bc6_index_bits(mode);
+            const uint32_t ref_bits = bc6_index_bits(ir.mode);
+            for (uint32_t k = 0; k < 8; ++k) {
+                const int16_t even = alternate_bits_signed(s[22 + k], 0);
+                const int16_t odd = alternate_bits_signed(s[22 + k], 1);
+                const int16_t first = k < 6 ? odd : even;
+                const int16_t second = k < 6 ? even : odd;
+                v.ix[2 * k] = add_index(first, bits, ir.ix[2 * k], ref_bits);
+                v.ix[2 * k + 1] = add_index(second, bits, ir.ix[2 * k + 1], ref_bits);
+            }
+            history[i & (kHistoryBlocks - 1)] = v;
+            pack_bc6(v, shift, s[31] & 31u, dst + i * 16);
         }
-        const Bc6Block& ir = referenced(i, refs.indices, history, t.bc6_dictionary, zero);
-        const uint32_t bits = bc6_index_bits(mode);
-        const uint32_t ref_bits = bc6_index_bits(ir.mode);
-        for (uint32_t k = 0; k < 8; ++k) {
-            const int16_t even = alternate_bits_signed(s[22 + k], 0);
-            const int16_t odd = alternate_bits_signed(s[22 + k], 1);
-            const int16_t first = k < 6 ? odd : even;
-            const int16_t second = k < 6 ? even : odd;
-            v.ix[2 * k] = add_index(first, bits, ir.ix[2 * k], ref_bits);
-            v.ix[2 * k + 1] = add_index(second, bits, ir.ix[2 * k + 1], ref_bits);
-        }
-        history[i % kHistoryBlocks] = v;
-        pack_bc6(v, shift, s[31] & 31u, dst + i * 16);
+        block_base += count;
     }
     return DecodeStatus::Ok;
 }
-
-struct CursorFetch {
-    const uint8_t* p;
-    const uint8_t* end;
-    bool operator()(size_t, uint8_t* byte) {
-        if (p == end) {
-            return false;
-        }
-        *byte = *p++;
-        return true;
-    }
-};
 
 std::mutex g_tables_mutex;
 std::shared_ptr<const Tables> g_tables;
@@ -1304,28 +1456,37 @@ DecodeStatus decode(const Tables& t, uint32_t bc, const uint8_t* src, size_t src
     if (dst == nullptr || dst_size == 0 || dst_size % bytes != 0) {
         return DecodeStatus::BadSize;
     }
-    const size_t blocks = dst_size / bytes;
-    const size_t record_size = record_symbols(bc);
-    std::vector<uint8_t> records(blocks * record_size);
-    CursorFetch fetch{src, src + (src != nullptr ? src_size : 0)};
-    if (!run_lanes(t, t.layouts[bc], blocks, fetch, records.data())) {
+    if (src == nullptr && src_size > 0) {
         return DecodeStatus::Truncated;
     }
+    const size_t blocks = dst_size / bytes;
+    const LaneLayout& layout = t.layouts[bc];
+    if (blocks == 0 || blocks > std::numeric_limits<size_t>::max() / layout.per_block) {
+        return DecodeStatus::BadSize;
+    }
+    CursorFetch fetch{src, src != nullptr ? src + src_size : nullptr};
     if (bc == 7) {
-        return decode_bc7(t, records.data(), blocks, dst);
+        return decode_bc7_stream(t, blocks, fetch, dst);
     }
     if (bc == 6) {
-        return decode_bc6(t, records.data(), blocks, dst);
+        return decode_bc6_stream(t, blocks, fetch, dst);
     }
-    return decode_plain(t, bc, records.data(), record_size, blocks, dst);
+    return decode_plain_stream(t, bc, blocks, fetch, dst);
 }
 
 bool decode_lanes(const Tables& t, uint32_t bc, size_t blocks, FetchByte fetch, void* context, uint8_t* records) {
-    if (bc >= kFormats || !t.layouts[bc].present || fetch == nullptr) {
+    if (bc >= kFormats || !t.layouts[bc].present || fetch == nullptr || blocks == 0 || records == nullptr) {
+        return false;
+    }
+    const LaneLayout& layout = t.layouts[bc];
+    const size_t record_size = static_cast<size_t>(layout.lanes) * layout.per_block;
+    if (layout.per_block == 0 || record_size == 0 || blocks > std::numeric_limits<size_t>::max() / layout.per_block ||
+        blocks > std::numeric_limits<size_t>::max() / record_size) {
         return false;
     }
     auto adapter = [fetch, context](size_t lane, uint8_t* byte) { return fetch(context, lane, byte); };
-    return run_lanes(t, t.layouts[bc], blocks, adapter, records);
+    LaneRunner runner(layout);
+    return runner.decode_chunk(t, blocks, adapter, records);
 }
 
 bool load_tables_file(const std::string& path, std::string* error) {
@@ -1336,11 +1497,22 @@ bool load_tables_file(const std::string& path, std::string* error) {
         why = "cannot open " + path;
         return false;
     }
+    constexpr size_t kMaxTableFileBytes = 64u << 20;
     std::vector<uint8_t> bytes;
     std::vector<uint8_t> chunk(65536);
     size_t n = 0;
-    while (bytes.size() < (64u << 20) && (n = std::fread(chunk.data(), 1, chunk.size(), f)) > 0) {
+    while ((n = std::fread(chunk.data(), 1, chunk.size(), f)) > 0) {
+        if (n > kMaxTableFileBytes - bytes.size()) {
+            std::fclose(f);
+            why = path + ": table file exceeds maximum size of 64 MiB";
+            return false;
+        }
         bytes.insert(bytes.end(), chunk.begin(), chunk.begin() + static_cast<std::ptrdiff_t>(n));
+    }
+    if (std::ferror(f) != 0) {
+        std::fclose(f);
+        why = path + ": read error";
+        return false;
     }
     std::fclose(f);
     std::shared_ptr<const Tables> tables = parse_tables(bytes.data(), bytes.size(), &why);
