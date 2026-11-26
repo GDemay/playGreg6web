@@ -25,6 +25,9 @@ param(
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 if ($Web) {
+    # Windows PowerShell 5.1 turns any native stderr line (python progress such as "[plan] ...") into a terminating error under "Stop";
+    # every native call below is checked via $LASTEXITCODE, so do not stop on stderr.
+    $ErrorActionPreference = "Continue"
     $PrebuiltDir = if ($PSBoundParameters.ContainsKey("Dir")) { $Dir } else { $env:PLAYGTA6_PREBUILT_WEB_DIR }
     if (-not $PrebuiltDir) { $PrebuiltDir = Join-Path $env:LOCALAPPDATA "playgta6\prebuilt-web" }
     if (-not $Exe -or -not $GameDir) { throw "Pass -Exe and -GameDir (or set PLAYGTA6_EXE / GTA6_GAME_DIR)." }
