@@ -61,7 +61,10 @@ use std::fmt;
 use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, OpKind};
 
 use crate::code_image::{CodeImage, Region};
-use crate::pdata::ExceptionDirectory;
+use crate::pdata::{
+    ExceptionDirectory, ExceptionHandler, PdataEntry, RUNTIME_FUNCTION_LEN, RuntimeFunction,
+    UnwindInfo,
+};
 use crate::pe::{ImportedSymbol, Pe64};
 
 /// Language-handler imports and the data format they consume.
@@ -103,6 +106,14 @@ const SCOPE_RECORD_LEN: usize = 16;
 const INITIAL_TABLE_CAPACITY: usize = 256;
 /// Instructions decoded per handler when identifying it.
 const HANDLER_SCAN_LIMIT: usize = 96;
+/// Bit 0 of `UnwindInfoAddress`: points at an indirect `RUNTIME_FUNCTION` record at `rva - 1`.
+const RUNTIME_FUNCTION_INDIRECT: u32 = 0x1;
+/// Longest `UNW_FLAG_CHAININFO` / indirect `RUNTIME_FUNCTION` chain followed before giving up.
+const MAX_CHAIN_DEPTH: usize = 32;
+/// Byte length of an `UNWIND_INFO` header before its `UNWIND_CODE` slots.
+const UNWIND_HEADER_LEN: usize = 4;
+/// Maximum direct `jmp rel32`/`rel8` hops followed when identifying an import thunk.
+const MAX_THUNK_HOPS: usize = 4;
 
 // FH4 header bits.
 const FH4_IS_CATCH: u8 = 0x01;
@@ -623,6 +634,94 @@ impl<'f> Reader<'_, 'f> {
         let b = self.read(rva, 4)?;
         le_u32(b, 0)
     }
+
+    fn unwind_info(&self, rva: u32) -> Option<UnwindInfo> {
+        if rva == 0 {
+            return None;
+        }
+        let header = self.read(rva, UNWIND_HEADER_LEN)?;
+        let len = UnwindInfo::encoded_len(header).ok()?;
+        let bytes = self.read(rva, len)?;
+        UnwindInfo::parse(bytes, rva).ok()
+    }
+
+    fn indirect_rf(&self, unwind: u32) -> Option<RuntimeFunction> {
+        let target = unwind.checked_sub(RUNTIME_FUNCTION_INDIRECT)?;
+        if target == 0 {
+            return None;
+        }
+        RuntimeFunction::parse(self.read(target, RUNTIME_FUNCTION_LEN)?)
+    }
+
+    /// Resolve the [`ExceptionHandler`] for `entry`, following `UNW_FLAG_CHAININFO` and indirect
+    /// `RUNTIME_FUNCTION` links (including inline chained records in `.xdata`) up to
+    /// [`MAX_CHAIN_DEPTH`] hops with cycle detection.
+    fn resolve_entry_handler(&self, entry: &PdataEntry) -> Option<ExceptionHandler> {
+        if let Some(eh) = entry.unwind.as_ref().and_then(|u| u.handler) {
+            return Some(eh);
+        }
+
+        let mut visited_unwinds: BTreeSet<u32> = BTreeSet::new();
+        let mut visited_indirects: BTreeSet<u32> = BTreeSet::new();
+        let mut visited_rfs: BTreeSet<RuntimeFunction> = BTreeSet::new();
+        visited_rfs.insert(entry.function);
+
+        let mut cur = if let Some(u) = entry.unwind.as_ref() {
+            let chained = u.chained?;
+            visited_unwinds.insert(entry.function.unwind);
+            if chained.begin >= chained.end
+                || chained.end > self.pe.optional.size_of_image
+                || !visited_rfs.insert(chained)
+            {
+                return None;
+            }
+            chained
+        } else if entry.function.unwind & RUNTIME_FUNCTION_INDIRECT != 0 {
+            entry.function
+        } else {
+            return None;
+        };
+
+        let mut hops = 0usize;
+        loop {
+            if cur.unwind & RUNTIME_FUNCTION_INDIRECT != 0 {
+                if hops >= MAX_CHAIN_DEPTH {
+                    return None;
+                }
+                let target = cur.unwind.checked_sub(RUNTIME_FUNCTION_INDIRECT)?;
+                if !visited_indirects.insert(target) {
+                    return None;
+                }
+                let parent = self.indirect_rf(cur.unwind)?;
+                if parent.begin >= parent.end
+                    || parent.end > self.pe.optional.size_of_image
+                    || !visited_rfs.insert(parent)
+                {
+                    return None;
+                }
+                hops += 1;
+                cur = parent;
+            } else {
+                if !visited_unwinds.insert(cur.unwind) {
+                    return None;
+                }
+                let info = self.unwind_info(cur.unwind)?;
+                if let Some(eh) = info.handler {
+                    return Some(eh);
+                }
+                let parent = info.chained?;
+                if hops >= MAX_CHAIN_DEPTH
+                    || parent.begin >= parent.end
+                    || parent.end > self.pe.optional.size_of_image
+                    || !visited_rfs.insert(parent)
+                {
+                    return None;
+                }
+                hops += 1;
+                cur = parent;
+            }
+        }
+    }
 }
 
 /// Sequential reader over the compressed FH4 encoding.
@@ -770,8 +869,31 @@ impl EhMetadata {
                 .or_insert(kind);
         }
 
-        // Identify every handler routine once in canonical ascending RVA order.
-        let handler_rvas: BTreeSet<u32> = dir.handler_rvas().into_iter().collect();
+        // Process `.pdata` records in canonical ascending RVA order (deduplicating identical
+        // `(begin, end, unwind)` keys) so outputs are invariant to input order or duplicates.
+        let mut ordered_entries: BTreeMap<(u32, u32, u32), &PdataEntry> = BTreeMap::new();
+        for entry in &dir.entries {
+            ordered_entries
+                .entry((
+                    entry.function.begin,
+                    entry.function.end,
+                    entry.function.unwind,
+                ))
+                .or_insert(entry);
+        }
+        let resolved_entries: Vec<(&PdataEntry, Option<ExceptionHandler>)> = ordered_entries
+            .into_values()
+            .map(|entry| (entry, reader.resolve_entry_handler(entry)))
+            .collect();
+
+        // Identify every handler routine (direct and chained/indirect) once in canonical ascending
+        // RVA order.
+        let mut handler_rvas: BTreeSet<u32> = dir.handler_rvas().into_iter().collect();
+        handler_rvas.extend(
+            resolved_entries
+                .iter()
+                .filter_map(|(_, eh)| eh.map(|h| h.rva)),
+        );
         let scans: BTreeMap<u32, HandlerScan> = handler_rvas
             .into_iter()
             .map(|rva| {
@@ -834,24 +956,15 @@ impl EhMetadata {
             }
         }
 
-        // Process `.pdata` records in canonical ascending RVA order (deduplicating identical
-        // `(begin, end, unwind)` keys) so outputs are invariant to input order or duplicates.
-        let mut ordered_entries: BTreeMap<(u32, u32, u32), &crate::pdata::PdataEntry> =
-            BTreeMap::new();
-        for entry in &dir.entries {
-            ordered_entries
-                .entry((
-                    entry.function.begin,
-                    entry.function.end,
-                    entry.function.unwind,
-                ))
-                .or_insert(entry);
-        }
         let mut unrecognised = BTreeSet::new();
-        for entry in ordered_entries.into_values() {
-            let Some(eh) = entry.unwind.as_ref().and_then(|u| u.handler) else {
+        let mut parsed_keys: BTreeSet<(u32, u32, u32)> = BTreeSet::new();
+        for (entry, resolved_eh) in resolved_entries {
+            let Some(eh) = resolved_eh else {
                 continue;
             };
+            if !parsed_keys.insert((entry.function.begin, eh.rva, eh.data_rva)) {
+                continue;
+            }
             let Some(&handler) = out.handlers.get(&eh.rva) else {
                 unrecognised.insert(entry.function.begin);
                 continue;
@@ -874,6 +987,7 @@ impl EhMetadata {
                     &image,
                     eh.data_rva,
                     entry.function.begin,
+                    entry.primary,
                     &mut diags,
                 ),
             };
@@ -946,9 +1060,11 @@ impl EhMetadata {
             .into_iter()
             .collect();
         entries.extend(
-            self.funclets()
-                .into_iter()
-                .filter_map(|(rva, _)| rva_to_va(base, rva))
+            self.handlers
+                .keys()
+                .copied()
+                .chain(self.funclets().into_iter().map(|(rva, _)| rva))
+                .filter_map(|rva| rva_to_va(base, rva))
                 .filter(|&va| image.region_of(va) == Region::Code),
         );
         image.entry_points = entries.into_iter().collect();
@@ -965,7 +1081,10 @@ impl EhMetadata {
                 let Some(owner) = image
                     .function_table
                     .function_at(target)
-                    .or_else(|| rva_to_va(base, function.begin))
+                    .or_else(|| {
+                        let begin_va = rva_to_va(base, function.begin)?;
+                        Some(image.function_table.function_at(begin_va).unwrap_or(begin_va))
+                    })
                 else {
                     continue;
                 };
@@ -1044,15 +1163,32 @@ fn first_instruction(image: &CodeImage<'_>, va: u64) -> Option<Instruction> {
     (!ins.is_invalid()).then_some(ins)
 }
 
-/// Whether `va` is an import thunk `jmp [rip+slot]`; returns the handler kind of its slot.
+/// Whether `va` is an import thunk `jmp [rip+slot]` (possibly reached through up to
+/// [`MAX_THUNK_HOPS`] direct `jmp rel32`/`rel8` hops); returns the handler kind of its slot.
 fn thunk_kind(
     image: &CodeImage<'_>,
     slots: &BTreeMap<u64, String>,
-    va: u64,
+    mut va: u64,
 ) -> Option<Option<HandlerKind>> {
-    let ins = first_instruction(image, va)?;
-    (ins.flow_control() == FlowControl::IndirectBranch && ins.is_ip_rel_memory_operand())
-        .then(|| slot_kind(&ins, slots))
+    let mut seen = BTreeSet::new();
+    for _ in 0..=MAX_THUNK_HOPS {
+        if !seen.insert(va) {
+            return None;
+        }
+        let ins = first_instruction(image, va)?;
+        if ins.flow_control() == FlowControl::IndirectBranch && ins.is_ip_rel_memory_operand() {
+            return Some(slot_kind(&ins, slots));
+        }
+        if ins.flow_control() == FlowControl::UnconditionalBranch
+            && ins.op_count() > 0
+            && ins.op_kind(0) == OpKind::NearBranch64
+        {
+            va = ins.near_branch64();
+            continue;
+        }
+        return None;
+    }
+    None
 }
 
 /// Walks the handler routine at `va` (both sides of branches, at most
@@ -1363,13 +1499,15 @@ fn stream<'f>(reader: &Reader<'_, 'f>, rva: u32, diags: &mut Diags<'_>) -> Optio
     }
 }
 
-/// `__CxxFrameHandler4`: the data is the RVA of a compressed `FuncInfo4`. `function` is the RVA
-/// of the function the data belongs to (base of function-relative offsets).
+/// `__CxxFrameHandler4`: the data is the RVA of a compressed `FuncInfo4`. `segment` is the RVA of
+/// the `.pdata` chunk and `primary` is its primary function RVA (base of function-relative
+/// continuation offsets).
 fn parse_fh4(
     reader: &Reader<'_, '_>,
     image: &CodeImage<'_>,
     data_rva: u32,
-    function: u32,
+    segment: u32,
+    primary: u32,
     diags: &mut Diags<'_>,
 ) -> LanguageData {
     let Some(rva) = reader.u32(data_rva) else {
@@ -1417,31 +1555,35 @@ fn parse_fh4(
     let Some(ip_map) = fields else {
         return truncated(diags);
     };
-    info.ip_map_rva = if info.is_separated() {
-        separated_ip_map(reader, ip_map, function, diags).unwrap_or_default()
+    let (ip_map_rva, ip_base) = if info.is_separated() {
+        separated_ip_map(reader, ip_map, segment, primary, diags).unwrap_or((0, primary))
     } else {
-        ip_map
+        (ip_map, primary)
     };
+    info.ip_map_rva = ip_map_rva;
 
     if info.unwind_map_rva != 0 {
         info.unwind_map = parse_unwind_map4(reader, image, info.unwind_map_rva, diags);
     }
     if info.try_block_map_rva != 0 {
-        info.try_blocks = parse_try_map4(reader, image, info.try_block_map_rva, function, diags);
+        info.try_blocks = parse_try_map4(reader, image, info.try_block_map_rva, primary, diags);
     }
     if info.ip_map_rva != 0 {
-        info.ip_to_state = parse_ip_map4(reader, info.ip_map_rva, function, diags);
+        info.ip_to_state = parse_ip_map4(reader, info.ip_map_rva, ip_base, diags);
     }
     LanguageData::Cxx4(info)
 }
 
-/// Separated code: `{count, [segment RVA (raw), map RVA (raw)]...}`; the map of `function`.
+/// Separated code: `{count, [segment RVA (raw), map RVA (raw)]...}`; the map of `segment` (or,
+/// for a chained chunk whose segment has no dedicated entry, its `primary` function). Returns
+/// `(map_rva, matched_segment_rva)`.
 fn separated_ip_map(
     reader: &Reader<'_, '_>,
     rva: u32,
-    function: u32,
+    segment: u32,
+    primary: u32,
     diags: &mut Diags<'_>,
-) -> Option<u32> {
+) -> Option<(u32, u32)> {
     let mut s = stream(reader, rva, diags)?;
     let Some(n) = s.unsigned() else {
         diags.push(rva, EhDiagnosticKind::Truncated);
@@ -1451,14 +1593,21 @@ fn separated_ip_map(
         diags.push(rva, EhDiagnosticKind::TooLarge);
         return None;
     };
+    let mut primary_match: Option<(u32, u32)> = None;
     for _ in 0..n {
-        let (Some(segment), Some(map)) = (s.int(), s.int()) else {
+        let (Some(seg), Some(map)) = (s.int(), s.int()) else {
             diags.push(rva, EhDiagnosticKind::Truncated);
             return None;
         };
-        if segment == function {
-            return Some(map);
+        if seg == segment {
+            return Some((map, seg));
         }
+        if primary != segment && seg == primary && primary_match.is_none() {
+            primary_match = Some((map, seg));
+        }
+    }
+    if let Some(found) = primary_match {
+        return Some(found);
     }
     diags.push(rva, EhDiagnosticKind::MissingSegment);
     None
@@ -3002,5 +3151,455 @@ mod tests {
             [(UNWIND_SEH + 12, EhDiagnosticKind::Truncated)]
         );
         assert_eq!(function(&eh, F_SEH).data, LanguageData::None);
+    }
+
+    // ----- R73: chained/indirect unwind, multi-hop thunks & separated FH4 chunks ---------------
+
+    /// `jmp rel32` at `at` targeting `target`.
+    fn jmp_rel32(file: &mut [u8], at: u32, target: u32) {
+        put(file, at, &[0xe9]);
+        put(file, at + 1, &le(target.wrapping_sub(at + 5)));
+    }
+
+    /// Encode a 12-byte `RUNTIME_FUNCTION` record.
+    fn rf_bytes(begin: u32, end: u32, unwind: u32) -> [u8; 12] {
+        let mut out = [0u8; 12];
+        out[0..4].copy_from_slice(&le(begin));
+        out[4..8].copy_from_slice(&le(end));
+        out[8..12].copy_from_slice(&le(unwind));
+        out
+    }
+
+    #[test]
+    fn chained_unwind_and_inline_xdata_parent_inherit_seh_scope_table() {
+        use crate::pdata::UNW_FLAG_CHAININFO;
+
+        const PRIMARY: u32 = 0x1020;
+        const COLD_CHUNK: u32 = 0x1060;
+        const INLINE_CHILD: u32 = 0x10a0;
+        const INLINE_PARENT_BEGIN: u32 = 0x10c0;
+        const FILTER_FN: u32 = 0x1140;
+        const FINALLY_FN: u32 = 0x1148;
+        const EXCEPT_BODY: u32 = PRIMARY + 0x18;
+        const OUTSIDE_RESUME: u32 = 0x1150; // in .text, outside any .pdata range
+        const THUNK: u32 = 0x1170;
+
+        const UW_PRIMARY: u32 = 0x25c0;
+        const UW_COLD: u32 = 0x2620;
+        const UW_INLINE_PARENT: u32 = 0x2640;
+        const UW_INLINE_CHILD: u32 = 0x26a0;
+
+        // Note: INLINE_PARENT_BEGIN is NOT a standalone top-level .pdata entry; it exists only as
+        // an inline chained RUNTIME_FUNCTION inside UW_INLINE_CHILD's .xdata!
+        let mut file = pe_with_pdata(&[
+            (PRIMARY, PRIMARY + 0x30, UW_PRIMARY),
+            (COLD_CHUNK, COLD_CHUNK + 0x20, UW_COLD),
+            (INLINE_CHILD, INLINE_CHILD + 0x18, UW_INLINE_CHILD),
+        ]);
+        let slots = set_imports(&mut file, &[("VCRUNTIME140.dll", &["__C_specific_handler"])]);
+        jmp_slot(&mut file, THUNK, slots[0][0]);
+        put(&mut file, FILTER_FN, &[0xb8, 1, 0, 0, 0, 0xc3]);
+        put(&mut file, FINALLY_FN, &[0xc3]);
+        put(&mut file, EXCEPT_BODY, &[0xc3]);
+        put(&mut file, OUTSIDE_RESUME, &[0xc3]);
+
+        let primary_scopes: Vec<u8> = [
+            le(2),
+            le(PRIMARY + 2),
+            le(PRIMARY + 0x10),
+            le(FILTER_FN),
+            le(EXCEPT_BODY),
+            le(PRIMARY + 0x10),
+            le(PRIMARY + 0x18),
+            le(FINALLY_FN),
+            le(0),
+        ]
+        .concat();
+        let flags = UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER;
+        put(
+            &mut file,
+            UW_PRIMARY,
+            &unwind_bytes(flags, &trailer(THUNK, &primary_scopes)),
+        );
+        // COLD_CHUNK chains to PRIMARY's RUNTIME_FUNCTION.
+        put(
+            &mut file,
+            UW_COLD,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(PRIMARY, PRIMARY + 0x30, UW_PRIMARY),
+            ),
+        );
+
+        // Inline parent UNWIND_INFO with a scope whose jump_target lies outside .pdata.
+        let inline_scopes: Vec<u8> = [
+            le(1),
+            le(INLINE_CHILD),
+            le(INLINE_CHILD + 0x10),
+            le(EXCEPTION_EXECUTE_HANDLER),
+            le(OUTSIDE_RESUME),
+        ]
+        .concat();
+        put(
+            &mut file,
+            UW_INLINE_PARENT,
+            &unwind_bytes(flags, &trailer(THUNK, &inline_scopes)),
+        );
+        put(
+            &mut file,
+            UW_INLINE_CHILD,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(
+                    INLINE_PARENT_BEGIN,
+                    INLINE_PARENT_BEGIN + 0x20,
+                    UW_INLINE_PARENT,
+                ),
+            ),
+        );
+
+        let pe = Pe64::parse(&file).expect("PE parses");
+        let dir = ExceptionDirectory::from_pe(&pe, &file);
+        let eh = EhMetadata::from_pe(&pe, &file, &dir);
+
+        assert!(eh.diagnostics.is_empty(), "{:?}", eh.diagnostics);
+        assert_eq!(
+            eh.handlers.get(&THUNK),
+            Some(&Handler {
+                kind: HandlerKind::CSpecific,
+                wrapper: false,
+            })
+        );
+        // All three .pdata records resolve their SEH scope table.
+        let cold = function(&eh, COLD_CHUNK);
+        assert_eq!(cold.handler_rva, THUNK);
+        assert_eq!(
+            cold.funclets(),
+            [
+                (FILTER_FN, FuncletKind::Filter),
+                (FINALLY_FN, FuncletKind::Finally),
+            ]
+        );
+        assert_eq!(
+            cold.resume_targets(),
+            [(EXCEPT_BODY, ResumeKind::ExceptBody)]
+        );
+
+        let inline_fn = function(&eh, INLINE_CHILD);
+        assert_eq!(inline_fn.handler_rva, THUNK);
+        assert_eq!(
+            inline_fn.resume_targets(),
+            [(OUTSIDE_RESUME, ResumeKind::ExceptBody)]
+        );
+
+        // Seed into CodeImage: handler routine, funclets, and resume targets are all seeded,
+        // and OUTSIDE_RESUME falls back to INLINE_CHILD (its primary in function_table).
+        let mut image = CodeImage::from_pe(&pe, &file);
+        dir.seed(&mut image);
+        eh.seed(&mut image);
+        let va = |rva: u32| BASE + u64::from(rva);
+        assert!(image.entry_points.contains(&va(THUNK)));
+        assert!(image.entry_points.contains(&va(FILTER_FN)));
+        assert!(image.entry_points.contains(&va(FINALLY_FN)));
+        assert!(image.eh.resume_targets.contains(&(va(PRIMARY), va(EXCEPT_BODY))));
+        assert!(
+            image
+                .eh
+                .resume_targets
+                .contains(&(va(INLINE_CHILD), va(OUTSIDE_RESUME)))
+        );
+    }
+
+    #[test]
+    fn indirect_runtime_function_resolves_parent_handler() {
+        const PRIMARY: u32 = 0x1020;
+        const CHUNK: u32 = 0x1060;
+        const THUNK: u32 = 0x1170;
+        const FINALLY_FN: u32 = 0x1150;
+        const UW_PRIMARY: u32 = 0x25c0;
+        const RF_INDIRECT_SLOT: u32 = 0x2600;
+
+        // CHUNK uses an indirect UnwindInfoAddress (bit 0 set) pointing at RF_INDIRECT_SLOT.
+        let mut file = pe_with_pdata(&[
+            (PRIMARY, PRIMARY + 0x20, UW_PRIMARY),
+            (CHUNK, CHUNK + 0x10, RF_INDIRECT_SLOT | RUNTIME_FUNCTION_INDIRECT),
+        ]);
+        let slots = set_imports(&mut file, &[("VCRUNTIME140.dll", &["__C_specific_handler"])]);
+        jmp_slot(&mut file, THUNK, slots[0][0]);
+        put(&mut file, FINALLY_FN, &[0xc3]);
+
+        let scopes: Vec<u8> = [
+            le(1),
+            le(PRIMARY),
+            le(PRIMARY + 0x10),
+            le(FINALLY_FN),
+            le(0),
+        ]
+        .concat();
+        put(
+            &mut file,
+            UW_PRIMARY,
+            &unwind_bytes(
+                UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER,
+                &trailer(THUNK, &scopes),
+            ),
+        );
+        put(
+            &mut file,
+            RF_INDIRECT_SLOT,
+            &rf_bytes(PRIMARY, PRIMARY + 0x20, UW_PRIMARY),
+        );
+
+        let pe = Pe64::parse(&file).expect("PE parses");
+        let dir = ExceptionDirectory::from_pe(&pe, &file);
+        assert!(dir.diagnostics.is_empty(), "{:?}", dir.diagnostics);
+        let eh = EhMetadata::from_pe(&pe, &file, &dir);
+        assert!(eh.diagnostics.is_empty(), "{:?}", eh.diagnostics);
+        let chunk_fn = function(&eh, CHUNK);
+        assert_eq!(chunk_fn.handler_rva, THUNK);
+        assert_eq!(chunk_fn.funclets(), [(FINALLY_FN, FuncletKind::Finally)]);
+    }
+
+    #[test]
+    fn multi_hop_handler_thunks_and_gs_wrapper_are_identified() {
+        const F_DIRECT: u32 = 0x1020;
+        const F_WRAP: u32 = 0x1040;
+        const F_LOOP: u32 = 0x1060;
+        const THUNK_IAT: u32 = 0x1100;
+        const THUNK_HOP1: u32 = 0x1110;
+        const THUNK_HOP2: u32 = 0x1120;
+        const WRAPPER: u32 = 0x1130;
+        const HELPER: u32 = 0x1150;
+        const CYCLE_A: u32 = 0x1160;
+        const CYCLE_B: u32 = 0x1168;
+        const UW_DIRECT: u32 = 0x25c0;
+        const UW_WRAP: u32 = 0x25e0;
+        const UW_LOOP: u32 = 0x2600;
+
+        let mut file = pe_with_pdata(&[
+            (F_DIRECT, F_DIRECT + 0x10, UW_DIRECT),
+            (F_WRAP, F_WRAP + 0x10, UW_WRAP),
+            (F_LOOP, F_LOOP + 0x10, UW_LOOP),
+        ]);
+        let slots = set_imports(&mut file, &[("VCRUNTIME140.dll", &["__C_specific_handler"])]);
+        // 2-hop thunk: THUNK_HOP2 -> jmp THUNK_HOP1 -> jmp [rip + iat]
+        jmp_slot(&mut file, THUNK_IAT, slots[0][0]);
+        jmp_rel32(&mut file, THUNK_HOP1, THUNK_IAT);
+        jmp_rel32(&mut file, THUNK_HOP2, THUNK_HOP1);
+        // __GSHandlerCheck_SEH wrapper calling helper then multi-hop thunk.
+        put(&mut file, HELPER, &[0xc3]);
+        call(&mut file, WRAPPER, HELPER);
+        jmp_rel32(&mut file, WRAPPER + 5, THUNK_HOP2);
+        // Cycle in direct jmp thunks must terminate cleanly as UnknownHandler.
+        jmp_rel32(&mut file, CYCLE_A, CYCLE_B);
+        jmp_rel32(&mut file, CYCLE_B, CYCLE_A);
+
+        let empty_scopes = le(0);
+        put(
+            &mut file,
+            UW_DIRECT,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &trailer(THUNK_HOP2, &empty_scopes)),
+        );
+        put(
+            &mut file,
+            UW_WRAP,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &trailer(WRAPPER, &empty_scopes)),
+        );
+        put(
+            &mut file,
+            UW_LOOP,
+            &unwind_bytes(UNW_FLAG_EHANDLER, &trailer(CYCLE_A, &empty_scopes)),
+        );
+
+        let eh = parse(&file);
+        assert_eq!(
+            eh.handlers.get(&THUNK_HOP2),
+            Some(&Handler {
+                kind: HandlerKind::CSpecific,
+                wrapper: false,
+            })
+        );
+        assert_eq!(
+            eh.handlers.get(&WRAPPER),
+            Some(&Handler {
+                kind: HandlerKind::CSpecific,
+                wrapper: true,
+            })
+        );
+        assert!(!eh.handlers.contains_key(&CYCLE_A));
+        assert_eq!(eh.unrecognised, [F_LOOP]);
+        assert_eq!(
+            diag_kinds(&eh),
+            [(CYCLE_A, EhDiagnosticKind::UnknownHandler)]
+        );
+    }
+
+    #[test]
+    fn separated_fh4_chained_chunk_resolves_continuations_against_primary() {
+        use crate::pdata::UNW_FLAG_CHAININFO;
+
+        const PRIMARY: u32 = 0x1020;
+        const COLD: u32 = 0x1080;
+        const CATCH_FN: u32 = 0x1100;
+        const THUNK: u32 = 0x1140;
+
+        const UW_PRIMARY: u32 = 0x25c0;
+        const UW_COLD: u32 = 0x25e0;
+        const INFO4: u32 = 0x2600;
+        const TRY4: u32 = 0x2620;
+        const HANDLERS4: u32 = 0x2630;
+        const SEGMENTS4: u32 = 0x2650;
+        const IP_PRIMARY: u32 = 0x2670;
+        const IP_COLD: u32 = 0x2680;
+
+        let mut file = pe_with_pdata(&[
+            (PRIMARY, PRIMARY + 0x40, UW_PRIMARY),
+            (COLD, COLD + 0x20, UW_COLD),
+        ]);
+        let slots = set_imports(&mut file, &[("VCRUNTIME140_1.dll", &["__CxxFrameHandler4"])]);
+        jmp_slot(&mut file, THUNK, slots[0][0]);
+        put(&mut file, CATCH_FN, &[0xc3]);
+
+        put(
+            &mut file,
+            UW_PRIMARY,
+            &unwind_bytes(
+                UNW_FLAG_EHANDLER | UNW_FLAG_UHANDLER,
+                &trailer(THUNK, &le(INFO4)),
+            ),
+        );
+        // COLD chains to PRIMARY so entry.function.begin == COLD while entry.primary == PRIMARY.
+        put(
+            &mut file,
+            UW_COLD,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(PRIMARY, PRIMARY + 0x40, UW_PRIMARY),
+            ),
+        );
+
+        let info4 = [
+            &[FH4_IS_SEPARATED | FH4_TRY_BLOCK_MAP][..],
+            &le(TRY4),
+            &le(SEGMENTS4),
+        ]
+        .concat();
+        put(&mut file, INFO4, &info4);
+        let try4 = [c(1), c(0), c(0), c(1), le(HANDLERS4).to_vec()].concat();
+        put(&mut file, TRY4, &try4);
+        // Function-relative continuation offset 0x24 -> PRIMARY + 0x24 (NOT COLD + 0x24!).
+        let handlers4 = [
+            c(1),
+            vec![1 << FH4_HANDLER_CONT_SHIFT],
+            le(CATCH_FN).to_vec(),
+            c(0x24),
+        ]
+        .concat();
+        put(&mut file, HANDLERS4, &handlers4);
+        let segments = [
+            c(2),
+            le(PRIMARY).to_vec(),
+            le(IP_PRIMARY).to_vec(),
+            le(COLD).to_vec(),
+            le(IP_COLD).to_vec(),
+        ]
+        .concat();
+        put(&mut file, SEGMENTS4, &segments);
+        put(&mut file, IP_PRIMARY, &[c(1), c(0x04), c(1)].concat());
+        put(&mut file, IP_COLD, &[c(1), c(0x08), c(2)].concat());
+
+        let eh = parse(&file);
+        assert!(eh.diagnostics.is_empty(), "{:?}", eh.diagnostics);
+
+        let cold_fn = function(&eh, COLD);
+        let LanguageData::Cxx4(cold_info) = &cold_fn.data else {
+            panic!("expected FH4 data on chained cold chunk");
+        };
+        // Cold chunk picks its own segment IP map, with IP base == COLD.
+        assert_eq!(cold_info.ip_map_rva, IP_COLD);
+        assert_eq!(cold_info.ip_to_state, [(COLD + 0x08, 1)]);
+        // Function-relative continuation resolves against PRIMARY!
+        assert_eq!(
+            cold_fn.resume_targets(),
+            [(PRIMARY + 0x24, ResumeKind::CatchContinuation)]
+        );
+    }
+
+    #[test]
+    fn cyclic_and_broken_unwind_chains_are_rejected_without_panicking() {
+        use crate::pdata::UNW_FLAG_CHAININFO;
+
+        const F_SELF: u32 = 0x1020;
+        const F_MUTUAL_A: u32 = 0x1040;
+        const F_MUTUAL_B: u32 = 0x1060;
+        const F_IND_SELF: u32 = 0x1080;
+        const F_BROKEN: u32 = 0x10a0;
+
+        const UW_SELF: u32 = 0x25c0;
+        const UW_MUTUAL_A: u32 = 0x25e0;
+        const UW_MUTUAL_B: u32 = 0x2600;
+        const RF_IND_SELF: u32 = 0x2620;
+        const UW_BROKEN: u32 = 0x2640;
+
+        let mut file = pe_with_pdata(&[
+            (F_SELF, F_SELF + 0x10, UW_SELF),
+            (F_MUTUAL_A, F_MUTUAL_A + 0x10, UW_MUTUAL_A),
+            (F_MUTUAL_B, F_MUTUAL_B + 0x10, UW_MUTUAL_B),
+            (F_IND_SELF, F_IND_SELF + 0x10, RF_IND_SELF | RUNTIME_FUNCTION_INDIRECT),
+            (F_BROKEN, F_BROKEN + 0x10, UW_BROKEN),
+        ]);
+
+        // Self-cycle via CHAININFO.
+        put(
+            &mut file,
+            UW_SELF,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(F_SELF, F_SELF + 0x10, UW_SELF),
+            ),
+        );
+        // Mutual 2-cycle via CHAININFO.
+        put(
+            &mut file,
+            UW_MUTUAL_A,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(F_MUTUAL_B, F_MUTUAL_B + 0x10, UW_MUTUAL_B),
+            ),
+        );
+        put(
+            &mut file,
+            UW_MUTUAL_B,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(F_MUTUAL_A, F_MUTUAL_A + 0x10, UW_MUTUAL_A),
+            ),
+        );
+        // Indirect self-cycle.
+        put(
+            &mut file,
+            RF_IND_SELF,
+            &rf_bytes(
+                F_IND_SELF,
+                F_IND_SELF + 0x10,
+                RF_IND_SELF | RUNTIME_FUNCTION_INDIRECT,
+            ),
+        );
+        // Broken chain pointing to unmapped unwind RVA.
+        put(
+            &mut file,
+            UW_BROKEN,
+            &unwind_bytes(
+                UNW_FLAG_CHAININFO,
+                &rf_bytes(F_BROKEN, F_BROKEN + 0x10, 0x9990),
+            ),
+        );
+
+        let pe = Pe64::parse(&file).expect("PE parses");
+        let dir = ExceptionDirectory::from_pe(&pe, &file);
+        let eh = EhMetadata::from_pe(&pe, &file, &dir);
+        assert!(eh.functions.is_empty());
+        assert!(eh.handlers.is_empty());
+        assert!(eh.diagnostics.is_empty());
     }
 }
