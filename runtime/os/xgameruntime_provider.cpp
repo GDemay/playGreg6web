@@ -95,7 +95,7 @@
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
 //   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
-//     pointer to a still-null handle field; fails with E_NOTIMPL: no speech synthesizer).
+//     pointer to a handle field; silent synthesizer: fixed handle, empty WAVE streams).
 //   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
 //     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
 //     --save-dir, never any cloud sync; s5/s6 by public header order), s13
@@ -1175,27 +1175,86 @@ public:
     }
 };
 
-// XSpeechSynthesizer. The runtime has no speech synthesizer: creation fails, and the title's
-// own failure path runs (no handle is invented).
+// XSpeechSynthesizer: a truthful silent synthesizer. Create returns a fixed handle, every stream
+// (from text or SSML) is a valid 16 kHz mono 16-bit PCM WAVE with no samples, size / get calls
+// report that stream, closing is free, and voice enumeration callbacks never run. Slots after s9
+// follow the public header order (close, stream from text, stream from SSML, close stream, stream
+// size, stream data).
 class SpeechApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XSpeechSynthesizer";
+    static constexpr uint64_t kSynthesizerHandle = 0x5350454543480001ull;
+    static constexpr uint64_t kStreamHandle = 0x5350454543530001ull;
+    static constexpr uint64_t kWaveHeaderSize = 44;
 
-    // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*). The executable passes the address
-    // of a handle field that is still null and runs its setup only on success.
+    static void BuildSilentWave(uint8_t (&h)[44]) {
+        auto put32 = [&](size_t o, uint32_t v) { for (int i = 0; i < 4; ++i) h[o + i] = uint8_t(v >> (8 * i)); };
+        auto put16 = [&](size_t o, uint16_t v) { h[o] = uint8_t(v); h[o + 1] = uint8_t(v >> 8); };
+        std::memcpy(h, "RIFF", 4);
+        put32(4, 36);  // no samples
+        std::memcpy(h + 8, "WAVEfmt ", 8);
+        put32(16, 16);
+        put16(20, 1);       // PCM
+        put16(22, 1);       // mono
+        put32(24, 16000);   // sample rate
+        put32(28, 32000);   // byte rate
+        put16(32, 2);       // block align
+        put16(34, 16);      // bits per sample
+        std::memcpy(h + 36, "data", 4);
+        put32(40, 0);
+    }
+
+    // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*).
     int32_t Create(GuestPtr<uint64_t> handle) {
         if (handle.is_null()) {
             return E_INVALIDARG_HR;
         }
-        handle.write(0);
-        if (!logged_.exchange(true)) {
-            os::log("xgameruntime: XSpeechSynthesizerCreate: no speech synthesizer; returning E_NOTIMPL");
-        }
-        return com::E_NOTIMPL_HR;
+        handle.write(kSynthesizerHandle);
+        return S_OK_HR;
     }
 
-private:
-    std::atomic<bool> logged_{false};
+    // s10: close (free).
+    int32_t Close(uint64_t /*handle*/) { return S_OK_HR; }
+
+    // s11 / s12: CreateStreamFromText / FromSsml(handle, text, streamHandle*).
+    int32_t CreateStream(uint64_t /*handle*/, uint64_t /*text*/, GuestPtr<uint64_t> stream) {
+        if (stream.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        stream.write(kStreamHandle);
+        return S_OK_HR;
+    }
+
+    // s13: close stream (free).
+    int32_t CloseStream(uint64_t /*stream*/) { return S_OK_HR; }
+
+    // s14: GetStreamSize(stream, uint64_t* size).
+    int32_t GetStreamSize(uint64_t /*stream*/, GuestPtr<uint64_t> size) {
+        if (size.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        size.write(kWaveHeaderSize);
+        return S_OK_HR;
+    }
+
+    // s15: GetStreamData(stream, bufferSize, buffer, uint64_t* used).
+    int32_t GetStreamData(uint64_t /*stream*/, uint64_t buffer_size, uint64_t buffer, GuestPtr<uint64_t> used) {
+        if (buffer == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (buffer_size < kWaveHeaderSize) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        uint8_t header[44];
+        BuildSilentWave(header);
+        if (!com::write_guest(buffer, header, sizeof(header))) {
+            return E_INVALIDARG_HR;
+        }
+        if (!used.is_null()) {
+            used.write(kWaveHeaderSize);
+        }
+        return S_OK_HR;
+    }
 };
 
 // XGameSave (public header order: s3 XGameSaveInitializeProvider, s4 XGameSaveInitializeProviderAsync,
@@ -2201,8 +2260,14 @@ constexpr auto kPlsTable = slot_table<2>({
 constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
 using SP = M<SpeechApi>;
-constexpr auto kSpeechTable = slot_table<7>({
+constexpr auto kSpeechTable = slot_table<13>({
     {9, SP::method<&SpeechApi::Create>("XSpeechSynthesizerCreate")},
+    {10, SP::method<&SpeechApi::Close>("XSpeechSynthesizerCloseInstance")},
+    {11, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromText")},
+    {12, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromSsml")},
+    {13, SP::method<&SpeechApi::CloseStream>("XSpeechSynthesizerCloseStreamHandle")},
+    {14, SP::method<&SpeechApi::GetStreamSize>("XSpeechSynthesizerGetStreamDataSize")},
+    {15, SP::method<&SpeechApi::GetStreamData>("XSpeechSynthesizerGetStreamData")},
 });
 constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
                                                             kSpeechTable.slots, {.slot_count = 32});
