@@ -3345,3 +3345,509 @@ test('W344 executeCompute caches bind groups across frames, elides redundant sta
   assert.equal(computeCalls.filter((c) => c.op === 'dispatchWorkgroups').length, 3);
   assert.equal(computeCalls.filter((c) => c.op === 'dispatchWorkgroupsIndirect').length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// W378: GPU-Clamped ExecuteIndirect, Mesh Compute-Then-Draw & Multi-Pass Instanced Draws
+// ---------------------------------------------------------------------------
+
+function createMockW378Gpu(options = {}) {
+  const base = createMockWebGpu(options);
+  let nextHandle = 5000;
+  const computePipelines = [];
+  const bindGroupLayouts = [];
+  const pipelineLayouts = [];
+  const encoderPasses = [];
+  const rawWrites = [];
+
+  base.device.features = new Set(options.features || []);
+  base.device.limits = {
+    maxComputeWorkgroupsPerDimension:
+      options.maxComputeWorkgroupsPerDimension !== undefined
+        ? options.maxComputeWorkgroupsPerDimension
+        : 65535,
+  };
+  const origWriteBuffer = base.device.queue.writeBuffer;
+  base.device.queue.writeBuffer = (buffer, offset, data) => {
+    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+    rawWrites.push({ buffer, offset, u32: new Uint32Array(bytes.buffer) });
+    origWriteBuffer(buffer, offset, data);
+  };
+  base.device.createBindGroupLayout = (desc) => {
+    const bgl = { kind: 'GPUBindGroupLayout', handle: nextHandle++, desc };
+    bindGroupLayouts.push(bgl);
+    return bgl;
+  };
+  base.device.createPipelineLayout = (desc) => {
+    const pl = { kind: 'GPUPipelineLayout', handle: nextHandle++, desc };
+    pipelineLayouts.push(pl);
+    return pl;
+  };
+  base.device.createComputePipeline = (desc) => {
+    const pipe = {
+      kind: 'GPUComputePipeline',
+      handle: nextHandle++,
+      label: desc.label || '',
+      desc,
+      getBindGroupLayout(index) {
+        return { kind: 'GPUBindGroupLayout', pipelineHandle: pipe.handle, index };
+      },
+    };
+    computePipelines.push(pipe);
+    return pipe;
+  };
+  base.device.createCommandEncoder = () => {
+    const localPasses = [];
+    return {
+      passes: localPasses,
+      beginComputePass(desc) {
+        const ops = [];
+        const cp = {
+          kind: 'compute',
+          desc,
+          ops,
+          ended: false,
+          setPipeline(pipeline) {
+            ops.push({ op: 'setPipeline', pipeline });
+          },
+          setBindGroup(groupIndex, bindGroup, dynamicOffsets) {
+            ops.push({
+              op: 'setBindGroup',
+              groupIndex,
+              bindGroup,
+              dynamicOffsets: dynamicOffsets ? Array.from(dynamicOffsets) : null,
+            });
+          },
+          dispatchWorkgroups(x, y, z) {
+            ops.push({ op: 'dispatchWorkgroups', x, y, z });
+          },
+          dispatchWorkgroupsIndirect(indirectBuffer, indirectOffset) {
+            ops.push({ op: 'dispatchWorkgroupsIndirect', indirectBuffer, indirectOffset });
+          },
+          end() {
+            this.ended = true;
+            ops.push({ op: 'end' });
+          },
+        };
+        localPasses.push(cp);
+        encoderPasses.push(cp);
+        return cp;
+      },
+      beginRenderPass(desc) {
+        const ops = [];
+        const rp = {
+          kind: 'render',
+          desc,
+          ops,
+          ended: false,
+          setPipeline(pipeline) {
+            ops.push({ op: 'setPipeline', pipeline });
+          },
+          setBindGroup(groupIndex, bindGroup, dynamicOffsets) {
+            ops.push({
+              op: 'setBindGroup',
+              groupIndex,
+              bindGroup,
+              dynamicOffsets: dynamicOffsets ? Array.from(dynamicOffsets) : null,
+            });
+          },
+          setVertexBuffer(slot, buffer, offset, size) {
+            ops.push({ op: 'setVertexBuffer', slot, buffer, offset, size });
+          },
+          setIndexBuffer(buffer, indexFormat, offset, size) {
+            ops.push({ op: 'setIndexBuffer', buffer, indexFormat, offset, size });
+          },
+          draw(vertexCount, instanceCount, firstVertex, firstInstance) {
+            ops.push({ op: 'draw', vertexCount, instanceCount, firstVertex, firstInstance });
+          },
+          drawIndexed(indexCount, instanceCount, firstIndex, baseVertex, firstInstance) {
+            ops.push({
+              op: 'drawIndexed',
+              indexCount,
+              instanceCount,
+              firstIndex,
+              baseVertex,
+              firstInstance,
+            });
+          },
+          drawIndirect(indirectBuffer, indirectOffset) {
+            ops.push({ op: 'drawIndirect', indirectBuffer, indirectOffset });
+          },
+          drawIndexedIndirect(indirectBuffer, indirectOffset) {
+            ops.push({ op: 'drawIndexedIndirect', indirectBuffer, indirectOffset });
+          },
+          end() {
+            this.ended = true;
+            ops.push({ op: 'end' });
+          },
+        };
+        localPasses.push(rp);
+        encoderPasses.push(rp);
+        return rp;
+      },
+    };
+  };
+
+  return {
+    ...base,
+    computePipelines,
+    bindGroupLayouts,
+    pipelineLayouts,
+    encoderPasses,
+    rawWrites,
+  };
+}
+
+test('W378: DrawExecutor GPU-clamped drawIndirect, drawIndexedIndirect, and dispatchIndirect with zero-alloc reuse', () => {
+  const env = createMockW378Gpu({ maxComputeWorkgroupsPerDimension: 16384 });
+  const executor = new DrawExecutor({ device: env.device, reuseDrawResult: true });
+
+  const realRenderPipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8100,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const realComputePipe = {
+    kind: 'GPUComputePipeline',
+    handle: 8101,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const srcIndirectBuf = env.device.createBuffer({
+    size: 256,
+    usage: BUFFER_USAGE.INDIRECT | 0x0080,
+  });
+  const countBuf = env.device.createBuffer({ size: 32, usage: 0x0080 });
+  const ib = env.device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDEX });
+
+  assert.equal(executor.supportsIndirectFirstInstance(), false);
+  const encoder = env.device.createCommandEncoder();
+
+  // 1. GPU-clamped drawIndirect (16B) via executeClampedDrawIndirect
+  executor.beginPass();
+  executor.setPipeline(realRenderPipe);
+  const r1 = executor.executeClampedDrawIndirect(encoder, env.pass, {
+    indirectBuffer: srcIndirectBuf,
+    indirectOffset: 0,
+    maxVertexCount: 3000,
+    maxInstanceCount: 8,
+    countBuffer: countBuf,
+  });
+  assert.equal(r1.executed, true);
+  assert.equal(r1.clamped, true);
+  assert.equal(r1.zeroedFirstInstance, true);
+  assert.notEqual(r1.clampedBuffer, srcIndirectBuf);
+
+  // 2. Inline clamp: true on executeDrawIndexedIndirect reuses the same result object (zero GC alloc)
+  executor.setIndexBuffer(ib, 'uint32', 0);
+  const r2 = executor.executeDrawIndexedIndirect(env.pass, {
+    clamp: true,
+    commandEncoder: encoder,
+    indirectBuffer: srcIndirectBuf,
+    indirectOffset: 20,
+    maxIndexCount: 64,
+  });
+  assert.equal(r2, r1, 'reuseDrawResult reuses indirect result scratch across clamped draws');
+  assert.equal(r2.executed, true);
+  assert.equal(r2.indexed, true);
+  assert.equal(r2.clamped, true);
+  assert.equal(r2.zeroedFirstInstance, true);
+
+  // 3. GPU-clamped dispatchWorkgroupsIndirect via executeCompute(..., { clamp: true, commandEncoder })
+  executor.setComputePipeline(realComputePipe);
+  const c1 = executor.executeCompute(null, {
+    indirect: true,
+    clamp: true,
+    commandEncoder: encoder,
+    indirectBuffer: srcIndirectBuf,
+    indirectOffset: 64,
+    maxWorkgroupsX: 4096,
+  });
+  assert.equal(c1.executed, true);
+  assert.equal(c1.indirect, true);
+  assert.equal(c1.clamped, true);
+
+  // 4. Verify encoder compute passes: [draw clamp, drawIndexed clamp, dispatch clamp, compute dispatch]
+  assert.equal(encoder.passes.length, 4);
+  assert.deepEqual(
+    encoder.passes.map((p) => p.kind),
+    ['compute', 'compute', 'compute', 'compute']
+  );
+  assert.equal(encoder.passes[3].ops.at(-2).op, 'dispatchWorkgroupsIndirect');
+  assert.equal(encoder.passes[3].ops.at(-2).indirectBuffer, c1.clampedBuffer);
+  assert.equal(env.rawWrites[2].u32[8], 4096);
+  assert.equal(env.rawWrites[2].u32[9], 16384);
+
+  const stats = executor.getStats();
+  assert.equal(stats.indirectClampPasses, 3);
+  assert.equal(stats.clampedIndirectDraws, 2);
+  assert.equal(stats.clampedIndirectDispatches, 1);
+  assert.equal(stats.indirectFirstInstanceClamped, 2);
+  assert.equal(stats.indirectDraws, 2);
+  assert.equal(stats.computeDispatches, 1);
+
+  executor.destroy();
+});
+
+test('W378: DrawExecutor executeMeshComputeDraw orchestrates direct & indirect mesh pipelines with zero-alloc hot path and zero-count elision', () => {
+  const env = createMockW378Gpu({ features: ['indirect-first-instance'] });
+  const executor = new DrawExecutor({ device: env.device });
+
+  assert.equal(executor.supportsIndirectFirstInstance(), true);
+
+  const meshPipe = {
+    kind: 'GPUComputePipeline',
+    handle: 8201,
+    getBindGroupLayout: (i) => ({ kind: 'GPUBindGroupLayout', pipelineHandle: 8201, i }),
+  };
+  const renderPipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8202,
+    getBindGroupLayout: (i) => ({ kind: 'GPUBindGroupLayout', pipelineHandle: 8202, i }),
+  };
+  const meshOutVb = env.device.createBuffer({ size: 8192, usage: BUFFER_USAGE.VERTEX | 0x0080 });
+  const meshOutIb = env.device.createBuffer({ size: 2048, usage: BUFFER_USAGE.INDEX | 0x0080 });
+  const dispatchIndBuf = env.device.createBuffer({ size: 64, usage: BUFFER_USAGE.INDIRECT | 0x0080 });
+  const drawIndBuf = env.device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDIRECT | 0x0080 });
+  const renderBg = { kind: 'GPUBindGroup', handle: 8205 };
+
+  const meshOutScratch = {};
+  const enc1 = env.device.createCommandEncoder();
+
+  // 1. Direct mesh compute dispatch -> GPU clamp -> drawIndirect render pass
+  const m1 = executor.executeMeshComputeDraw(
+    enc1,
+    {
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      meshBindGroups: [
+        { groupIndex: 0, entries: [{ binding: 0, resource: { buffer: meshOutVb, offset: 0, size: 8192 } }] },
+      ],
+      renderBindGroups: [{ groupIndex: 0, bindGroup: renderBg }],
+      vertexBuffers: [{ slot: 0, buffer: meshOutVb, offset: 0 }],
+      workgroupCountX: 24,
+      workgroupCountY: 1,
+      workgroupCountZ: 1,
+      drawIndirectBuffer: drawIndBuf,
+      maxVertexCount: 4096,
+    },
+    meshOutScratch
+  );
+  assert.equal(m1, meshOutScratch, 'reuses caller out scratch');
+  assert.equal(m1.ok, true);
+  assert.equal(m1.executed, true);
+  assert.equal(m1.indirectDispatch, false);
+  assert.equal(m1.dispatchClamped, false);
+  assert.equal(m1.drawClamped, true);
+  assert.equal(m1.zeroedFirstInstance, false, 'device supports indirect-first-instance');
+  assert.equal(m1.drawsIssued, 1);
+  assert.deepEqual(
+    enc1.passes.map((p) => p.kind),
+    ['compute', 'compute', 'render']
+  );
+
+  // 2. Indirect mesh compute dispatch -> GPU clamp dispatch + GPU clamp drawIndexedIndirect (2 draws)
+  const enc2 = env.device.createCommandEncoder();
+  const m2 = executor.dispatchMeshComputeDraw(
+    enc2,
+    {
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      meshBindGroups: [
+        { groupIndex: 0, entries: [{ binding: 0, resource: { buffer: meshOutVb, offset: 0, size: 8192 } }] },
+      ],
+      renderBindGroups: [{ groupIndex: 0, bindGroup: renderBg }],
+      vertexBuffers: [{ slot: 0, buffer: meshOutVb, offset: 0 }],
+      indexBuffer: { buffer: meshOutIb, format: 'uint32', offset: 0 },
+      indexed: true,
+      indirectDispatch: true,
+      dispatchIndirectBuffer: dispatchIndBuf,
+      drawIndirectBuffer: drawIndBuf,
+      drawCount: 2,
+      maxIndexCount: 512,
+    },
+    meshOutScratch
+  );
+  assert.equal(m2, meshOutScratch);
+  assert.equal(m2.ok, true);
+  assert.equal(m2.indirectDispatch, true);
+  assert.equal(m2.dispatchClamped, true);
+  assert.equal(m2.drawClamped, true);
+  assert.equal(m2.drawsIssued, 2);
+  assert.deepEqual(
+    enc2.passes.map((p) => p.kind),
+    ['compute', 'compute', 'compute', 'render']
+  );
+  // Second mesh compute pass reused the cached compute bind group!
+  assert.equal(executor.getStats().bindGroupCacheHits, 1);
+
+  // 3. Zero-count elision emits zero passes and increments meshZeroCountElided
+  const enc3 = env.device.createCommandEncoder();
+  const mZero = executor.executeMeshComputeDraw(
+    enc3,
+    {
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      workgroupCountX: 0,
+      drawIndirectBuffer: drawIndBuf,
+    },
+    meshOutScratch
+  );
+  assert.equal(mZero.ok, true);
+  assert.equal(mZero.elided, true);
+  assert.equal(mZero.reason, 'zero-workgroup-count');
+  assert.equal(enc3.passes.length, 0);
+
+  const stats = executor.getStats();
+  assert.equal(stats.meshComputeDraws, 2);
+  assert.equal(stats.meshIndirectComputeDraws, 1);
+  assert.equal(stats.meshZeroCountElided, 1);
+  assert.equal(stats.indirectFirstInstanceClamped, 0);
+
+  executor.destroy();
+});
+
+test('W378: DrawExecutor executeMultiPassInstancedDraw handles signed i32 baseVertex, firstInstance gating policies, state elision, and zero-alloc reuse', () => {
+  const env = createMockW378Gpu(); // lacks indirect-first-instance
+  const executor = new DrawExecutor({ device: env.device });
+
+  const pipe = {
+    kind: 'GPURenderPipeline',
+    handle: 8301,
+    getBindGroupLayout: () => ({ kind: 'GPUBindGroupLayout' }),
+  };
+  const vb = env.device.createBuffer({ size: 1024, usage: BUFFER_USAGE.VERTEX });
+  const ib = env.device.createBuffer({ size: 1024, usage: BUFFER_USAGE.INDEX });
+  const indBuf = env.device.createBuffer({ size: 256, usage: BUFFER_USAGE.INDIRECT | 0x0080 });
+  const bg = { kind: 'GPUBindGroup', handle: 8302 };
+
+  const encoder = env.device.createCommandEncoder();
+  const multiScratch = {};
+
+  // 1. Mixed direct indexed instanced draws (negative baseVertex + non-zero firstInstance) + zero-count elision + GPU-clamped indirect draw
+  executor.beginPass();
+  const res1 = executor.executeMultiPassInstancedDraw(
+    env.pass,
+    {
+      commandEncoder: encoder,
+      firstInstancePolicy: 'clamp',
+      draws: [
+        {
+          pipeline: pipe,
+          bindGroups: [{ groupIndex: 0, bindGroup: bg }],
+          vertexBuffers: [{ slot: 0, buffer: vb }],
+          indexBuffer: { buffer: ib, format: 'uint32' },
+          indexed: true,
+          indexCount: 36,
+          instanceCount: 4,
+          firstIndex: 0,
+          baseVertex: -128,
+          firstInstance: 3,
+        },
+        {
+          indexed: true,
+          indexCount: 24,
+          instanceCount: 2,
+          firstIndex: 36,
+          baseVertex: -2147483648,
+          firstInstance: 7,
+        },
+        {
+          indexed: true,
+          indexCount: 0,
+          instanceCount: 2,
+        },
+        {
+          indexed: true,
+          indirect: true,
+          indirectBuffer: indBuf,
+          indirectOffset: 0,
+          firstInstance: 5,
+          maxIndexCount: 128,
+        },
+      ],
+    },
+    multiScratch
+  );
+
+  assert.equal(res1, multiScratch, 'reuses caller out scratch');
+  assert.equal(res1.ok, true);
+  assert.equal(res1.executed, 3);
+  assert.equal(res1.skipped, 1);
+  assert.equal(res1.elided, 1);
+  assert.equal(res1.clamped, 1);
+  assert.equal(res1.firstInstanceClamped, 1);
+
+  const drawIndexedOps = env.calls.pass.filter((c) => c.op === 'drawIndexed');
+  assert.equal(drawIndexedOps.length, 2);
+  assert.equal(drawIndexedOps[0].baseVertex, -128);
+  assert.equal(drawIndexedOps[0].firstInstance, 3);
+  assert.equal(drawIndexedOps[1].baseVertex, -2147483648);
+  assert.equal(drawIndexedOps[1].firstInstance, 7);
+  // Pipeline, BG0, VB0, IB were bound ONCE and elided across all 3 executed draws!
+  assert.equal(env.calls.pass.filter((c) => c.op === 'setPipeline').length, 1);
+  assert.equal(env.calls.pass.filter((c) => c.op === 'setBindGroup').length, 1);
+  assert.equal(env.calls.pass.filter((c) => c.op === 'setVertexBuffer').length, 1);
+  assert.equal(env.calls.pass.filter((c) => c.op === 'setIndexBuffer').length, 1);
+  assert.equal(env.calls.pass.filter((c) => c.op === 'drawIndexedIndirect').length, 1);
+
+  // 2. fallback-direct policy preserves firstInstance & baseVertex when indirect-first-instance is unavailable
+  const resFallback = executor.executeMultiPassInstancedDraw(
+    env.pass,
+    {
+      firstInstancePolicy: 'fallback-direct',
+      draws: [
+        {
+          indexed: true,
+          indirect: true,
+          indirectBuffer: indBuf,
+          indexCount: 18,
+          instanceCount: 3,
+          baseVertex: -16,
+          firstInstance: 9,
+        },
+      ],
+    },
+    multiScratch
+  );
+  assert.equal(resFallback.executed, 1);
+  assert.equal(resFallback.fallbackDirect, 1);
+  const lastDirect = env.calls.pass.filter((c) => c.op === 'drawIndexed').at(-1);
+  assert.equal(lastDirect.baseVertex, -16);
+  assert.equal(lastDirect.firstInstance, 9);
+
+  // 3. strict policy skips indirect draws requiring firstInstance without the WebGPU feature
+  const resStrict = executor.executeMultiPassInstancedDraw(
+    env.pass,
+    {
+      firstInstancePolicy: 'strict',
+      draws: [
+        {
+          indexed: true,
+          indirect: true,
+          indirectBuffer: indBuf,
+          firstInstance: 4,
+        },
+      ],
+    },
+    multiScratch
+  );
+  assert.equal(resStrict.ok, false);
+  assert.equal(resStrict.executed, 0);
+  assert.equal(resStrict.skipped, 1);
+  assert.equal(resStrict.reason, 'indirect-first-instance-unsupported');
+
+  const stats = executor.getStats();
+  assert.equal(stats.multiPassInstancedDraws, 2);
+  assert.equal(stats.multiPassInstancedSubDraws, 4);
+  assert.equal(stats.indirectFirstInstanceClamped, 1);
+
+  // 4. Classic Worker importScripts IIFE isolation check for draw_executor.js
+  const src = readFileSync(DRAW_EXECUTOR_PATH, 'utf8');
+  assert.ok(!/^\s*(import|export)\b/m.test(src), 'draw_executor.js must have zero ES module syntax');
+  const ctx = vm.createContext({ console });
+  ctx.self = ctx;
+  vm.runInContext(src, ctx, { filename: 'draw_executor.js' });
+  assert.equal(typeof ctx.PlayGta6DrawExecutor.DrawExecutor.prototype.executeMeshComputeDraw, 'function');
+  assert.equal(typeof ctx.PlayGta6DrawExecutor.DrawExecutor.prototype.executeMultiPassInstancedDraw, 'function');
+
+  executor.destroy();
+});

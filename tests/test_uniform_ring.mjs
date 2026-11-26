@@ -3227,3 +3227,223 @@ test('W314: 3-deep partitioning & zero-alloc allocAligned interoperate cleanly w
     assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// W378: Zero-Stall Dynamic Uniform Ring Rollover, Alignment & Zero-Alloc Flush
+// ---------------------------------------------------------------------------
+
+test('W378: autoRollover mid-frame multi-slice rollover preserves earlier draw buffers/offsets and grows cleanly for next frame', () => {
+  const { device, createdBuffers, queueWrites } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 256, maxUniformBufferBindingSize: 65536 },
+  });
+
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 512, // 2 x 256B draws initially
+    maxByteSize: 4096,
+    framesInFlight: 3,
+    autoRollover: true,
+  });
+
+  assert.equal(ring.multiSlice, true);
+  assert.equal(createdBuffers.length, 3);
+
+  ring.beginFrame(0);
+  const drawRecords = [];
+
+  // Push 10 draws (2560B total) -> triggers 2 mid-frame rollovers:
+  // Slice 0: 512B (draws 0..1)
+  // Slice 1: 1024B (draws 2..5)
+  // Slice 2: 2048B (draws 6..9)
+  const payload = new Uint32Array(16);
+  for (let i = 0; i < 10; i += 1) {
+    payload[0] = 0x70000000 + i;
+    payload[1] = i * 37 + 11;
+    const alloc = ring.pushConstants(payload);
+    assert.equal(alloc.dynamicOffset % 256, 0, 'every rolled-over draw offset must be 256B aligned');
+    assert.ok(alloc.dynamicOffset + alloc.alignedSize <= alloc.buffer.size);
+    drawRecords.push({
+      id: i,
+      buffer: alloc.buffer,
+      dynamicOffset: alloc.dynamicOffset,
+      sliceIndex: alloc.sliceIndex,
+    });
+  }
+
+  // Every single earlier slice buffer MUST remain alive (destroyCount === 0)!
+  const distinctBuffers = new Set(drawRecords.map((r) => r.buffer));
+  assert.equal(distinctBuffers.size, 3, '10 draws rolled over cleanly across 3 distinct slice buffers');
+  for (const buf of distinctBuffers) {
+    assert.equal(buf.destroyCount, 0, `earlier slice buffer ${buf.id} must NOT be destroyed mid-frame`);
+  }
+  assert.equal(drawRecords[0].sliceIndex, 0);
+  assert.equal(drawRecords[2].sliceIndex, 1);
+  assert.equal(drawRecords[6].sliceIndex, 2);
+
+  // Inspect active slices diagnostic snapshot before flush
+  const activeSlices = ring.getActiveFrameSlices();
+  assert.equal(activeSlices.length, 3);
+  assert.deepEqual(
+    activeSlices.map((s) => s.kind),
+    ['retired', 'retired', 'primary']
+  );
+
+  // Single flush uploads all 3 slices cleanly with 1 writeBuffer per slice (3 total)
+  const flushScratch = {};
+  const flushed = ring.flush(flushScratch);
+  assert.equal(flushed, flushScratch, 'flush(out) reuses caller scratch object');
+  assert.equal(flushed.uploadedBytes, 10 * 256);
+  assert.equal(flushed.drawCount, 10);
+  assert.equal(flushed.writeBufferCalls, 3);
+  assert.equal(queueWrites.length, 3);
+
+  // Verify EVERY draw's exact bytes landed intact in its original buffer & dynamicOffset!
+  for (const rec of drawRecords) {
+    const u32 = new Uint32Array(rec.buffer._data.buffer, rec.dynamicOffset, 2);
+    assert.equal(u32[0], 0x70000000 + rec.id);
+    assert.equal(u32[1], rec.id * 37 + 11);
+  }
+
+  const statsF0 = ring.getStats();
+  assert.equal(statsF0.rolloverCount, 2);
+  assert.equal(statsF0.sliceRolloverCount, 2);
+  assert.equal(statsF0.spillRolloverCount, 0);
+  assert.equal(statsF0.activeSliceIndex, 2);
+  assert.equal(statsF0.activeFrameSliceCount, 3);
+  assert.equal(statsF0.maxSlicesPerFrame, 3);
+  assert.equal(statsF0.liveRetiredSlices, 2);
+
+  // Frames 1 & 2 rotate to slots 1 & 2 (which resize to grown capacity 4096B -> zero rollovers, 1 writeBuffer each!)
+  ring.endFrame(0);
+  const f1 = ring.beginFrame(1);
+  assert.equal(f1.byteSize, 4096);
+  // Retired slices from frame 0 stay alive while frame 0 is still within the 3-frame in-flight window!
+  for (const buf of distinctBuffers) {
+    assert.equal(buf.destroyCount, 0);
+  }
+  for (let i = 0; i < 10; i += 1) {
+    payload[0] = 0x80000000 + i;
+    ring.pushConstants(payload);
+  }
+  const f1Flush = ring.flushDirty(flushScratch);
+  assert.equal(f1Flush, flushScratch);
+  assert.equal(f1Flush.writeBufferCalls, 1, 'grown steady-state frame uploads in 1 single writeBuffer');
+  ring.endFrame(1);
+
+  ring.beginFrame(2);
+  ring.pushConstants(payload);
+  ring.flush(flushScratch);
+  ring.endFrame(2);
+
+  // Frame 3 wraps back to slot 0: retired slices from Frame 0 are now safely destroyed!
+  ring.beginFrame(3);
+  assert.equal(drawRecords[0].buffer.destroyCount, 1);
+  assert.equal(drawRecords[2].buffer.destroyCount, 1);
+  assert.equal(ring.getStats().liveRetiredSlices, 0);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1, `buffer ${buf.id} must be destroyed exactly once`);
+  }
+});
+
+test('W378: multi-slice + spill rollover enforces 512B alignment, maxBindingSize, typed-array fidelity, and zero-alloc scratch APIs', () => {
+  const { device, createdBuffers } = createMockGpuDevice({
+    limits: { minUniformBufferOffsetAlignment: 512, maxUniformBufferBindingSize: 1024 },
+  });
+
+  const ring = new DynamicUniformRing({
+    device,
+    byteSize: 1024, // 2 x 512B
+    maxByteSize: 2048, // allows 1 multi-slice rollover (1024 + 1024)
+    maxRingBytes: 8192, // then rolls into spill pages up to 8192B
+    framesInFlight: 2,
+    autoRollover: true,
+    allowSpill: true,
+  });
+
+  assert.equal(ring.alignment, 512);
+  assert.equal(ring.maxBindingSize, 1024);
+
+  ring.beginFrame(0);
+  const allocScratch = {};
+  const bgScratch = { binding: 0, resource: {} };
+  const flushScratch = {};
+  const kept = [];
+
+  // Push 8 draws x 512B = 4096B (Slice 0: 1024B -> Slice 1: 1024B -> Spill 0: 2048B)
+  const f32Data = new Float32Array(16);
+  const i32Data = new Int32Array(16);
+  for (let i = 0; i < 8; i += 1) {
+    let res;
+    if ((i & 1) === 0) {
+      f32Data[0] = i + 0.5;
+      f32Data[1] = -i * 2.25;
+      res = ring.write(f32Data, allocScratch);
+    } else {
+      i32Data[0] = -1000 - i;
+      i32Data[1] = 2000 + i;
+      res = ring.write(i32Data, allocScratch);
+    }
+    assert.equal(res, allocScratch, 'write(data, out) reuses scratch across primary, retired-slice, and spill');
+    assert.equal(res.dynamicOffset % 512, 0, 'enforces 512B device minUniformBufferOffsetAlignment');
+    assert.equal(res.alignedSize, 512);
+    assert.ok(res.paddedSize <= ring.maxBindingSize);
+    assert.ok(res.dynamicOffset + res.alignedSize <= res.buffer.size);
+
+    const bgEntry = ring.createBindGroupEntryForAllocation(0, res, bgScratch);
+    assert.equal(bgEntry, bgScratch, 'createBindGroupEntryForAllocation reuses out scratch');
+    assert.equal(bgEntry.resource.buffer, res.buffer);
+    assert.equal(bgEntry.resource.size, 64);
+
+    kept.push({
+      index: i,
+      buffer: res.buffer,
+      offset: res.dynamicOffset,
+      isSpill: res.isSpill,
+    });
+  }
+
+  // Max binding size rejection & misaligned writeStaged rejection increment alignmentViolationsRejected
+  assert.throws(() => ring.writeStaged(256, new Uint32Array(4)), RangeError);
+  assert.throws(() => ring.pushConstants(new Uint8Array(1025)), RangeError);
+
+  const fRes = ring.flushDirty(flushScratch);
+  assert.equal(fRes, flushScratch);
+  assert.equal(fRes.uploadedBytes, 8 * 512);
+  assert.equal(fRes.drawCount, 8);
+  assert.equal(fRes.writeBufferCalls, 3, '1 writeBuffer per touched slice/spill buffer');
+
+  // Verify exact Float32Array and Int32Array bytes across primary, retired slice, and spill pages!
+  for (const item of kept) {
+    assert.equal(item.buffer.destroyCount, 0);
+    if ((item.index & 1) === 0) {
+      const f = new Float32Array(item.buffer._data.buffer, item.offset, 2);
+      assert.equal(f[0], item.index + 0.5);
+      assert.equal(f[1], -item.index * 2.25);
+    } else {
+      const n = new Int32Array(item.buffer._data.buffer, item.offset, 2);
+      assert.equal(n[0], -1000 - item.index);
+      assert.equal(n[1], 2000 + item.index);
+    }
+  }
+
+  const stats = ring.getStats();
+  assert.equal(stats.zeroAllocAllocs, 8);
+  assert.equal(stats.sliceRolloverCount, 1);
+  assert.equal(stats.spillRolloverCount, 1);
+  assert.equal(stats.rolloverCount, 2);
+  assert.equal(stats.maxSlicesPerFrame, 3);
+  assert.equal(stats.alignmentViolationsRejected, 1);
+
+  const reset = ring.resetStats();
+  assert.equal(reset.rolloverCount, 0);
+  assert.equal(reset.sliceRolloverCount, 0);
+  assert.equal(reset.spillRolloverCount, 0);
+  assert.equal(reset.alignmentViolationsRejected, 0);
+
+  ring.destroy();
+  for (const buf of createdBuffers) {
+    assert.equal(buf.destroyCount, 1);
+  }
+});
