@@ -1,5 +1,6 @@
-#include <chrono>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1573,9 +1574,166 @@ static void test_stall_compensation() {
     ResetHostStallForTesting();
 }
 
+static void test_httpfs_stat_cache_and_invalidation() {
+    using playgta6::os::HttpfsMailbox;
+    using playgta6::os::HttpfsMailboxClient;
+    using playgta6::os::HttpfsOp;
+    using playgta6::os::HttpfsStatus;
+
+    HttpfsMailbox mailbox{};
+    HttpfsMailboxClient::init_mailbox(mailbox);
+    const uint64_t kSize = 40963;
+    std::atomic<int> opens{0};
+    std::atomic<int> reads{0};
+    HttpfsMailboxClient client(&mailbox, [&](HttpfsMailbox& mb) {
+        if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
+            const std::string path(reinterpret_cast<const char*>(mb.payload),
+                                   static_cast<size_t>(mb.length));
+            opens.fetch_add(1, std::memory_order_relaxed);
+            if (path == "data/cached.rpf") {
+                HttpfsMailboxClient::complete_response(mb, 5);
+            } else {
+                HttpfsMailboxClient::complete_response(mb, -2, HttpfsStatus::Error);
+            }
+        } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
+            reads.fetch_add(1, std::memory_order_relaxed);
+            const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
+            std::memset(mb.payload, 0x33, static_cast<size_t>(n));
+            HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
+        } else {
+            HttpfsMailboxClient::complete_response(mb, 0);
+        }
+    });
+
+    const uint64_t gen0 = httpfs_client_generation();
+    set_httpfs_client(&client);
+    const uint64_t gen1 = httpfs_client_generation();
+    CHECK(gen1 > gen0);
+
+    // 1. Positive attribute query populates existence cache without probing size.
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\cached.rpf") == FILE_ATTRIBUTE_READONLY);
+    CHECK(opens.load() == 1 && reads.load() == 0);
+    // Repeated W and A attribute queries hit cache with 0 extra opens.
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\cached.rpf") == FILE_ATTRIBUTE_READONLY);
+    CHECK(pg6_win32_get_file_attributes_a("G:/data/cached.rpf") == FILE_ATTRIBUTE_READONLY);
+    CHECK(opens.load() == 1 && reads.load() == 0);
+
+    // 2. Negative probe is cached: second missing query triggers 0 extra opens.
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\absent.rpf") == kInvalidAttrs);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    CHECK(opens.load() == 2);
+    CHECK(pg6_win32_get_file_attributes_a("G:\\data\\absent.rpf") == kInvalidAttrs);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    Pg6Win32FileAttributeData attr_data{};
+    CHECK(pg6_win32_get_file_attributes_ex_w(u"G:\\data\\absent.rpf", 0, &attr_data) == 0);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    Pg6Win32FindDataW find_data{};
+    CHECK(pg6_win32_find_first_file_w(u"G:\\data\\absent.rpf", &find_data) == INVALID_HANDLE_VALUE);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    CHECK(opens.load() == 2 && reads.load() == 0);
+
+    // 3. Size upgrade: GetFileAttributesExW on cached-without-size entry probes size once and upgrades.
+    CHECK(pg6_win32_get_file_attributes_ex_w(u"G:\\data\\cached.rpf", 0, &attr_data) == 1);
+    CHECK(attr_data.file_attributes == FILE_ATTRIBUTE_READONLY);
+    CHECK(((static_cast<uint64_t>(attr_data.file_size_high) << 32) | attr_data.file_size_low) == kSize);
+    CHECK(opens.load() == 3);
+    const int reads_after_upgrade = reads.load();
+    CHECK(reads_after_upgrade > 2);
+
+    // Subsequent GetFileAttributesExW and FindFirstFileW hit the upgraded cache: 0 opens, 0 reads.
+    std::memset(&attr_data, 0, sizeof(attr_data));
+    CHECK(pg6_win32_get_file_attributes_ex_w(u"G:\\data\\cached.rpf", 0, &attr_data) == 1);
+    CHECK(((static_cast<uint64_t>(attr_data.file_size_high) << 32) | attr_data.file_size_low) == kSize);
+    const Handle fh = pg6_win32_find_first_file_w(u"G:\\data\\cached.rpf", &find_data);
+    CHECK(fh != INVALID_HANDLE_VALUE);
+    CHECK(((static_cast<uint64_t>(find_data.file_size_high) << 32) | find_data.file_size_low) == kSize);
+    CHECK(pg6_win32_find_close(fh) == 1);
+    CHECK(opens.load() == 3 && reads.load() == reads_after_upgrade);
+
+    // 4. Re-installing the SAME client pointer still bumps generation and invalidates the cache.
+    set_httpfs_client(&client);
+    CHECK(httpfs_client_generation() > gen1);
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\cached.rpf") == FILE_ATTRIBUTE_READONLY);
+    CHECK(opens.load() == 4);
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\absent.rpf") == kInvalidAttrs);
+    CHECK(opens.load() == 5);
+
+    // 5. Clearing the client bypasses cache (does not return stale positive hit).
+    set_httpfs_client(nullptr);
+    CHECK(pg6_win32_get_file_attributes_w(u"G:\\data\\cached.rpf") == kInvalidAttrs);
+    CHECK(GetLastError() == ERROR_FILE_NOT_FOUND);
+    CHECK(opens.load() == 5);
+}
+
+static void test_concurrent_handles_and_spin_cs() {
+    const KernelHandleCounts baseline = live_kernel_handles();
+
+    Pg6CriticalSection cs{};
+    InitializeCriticalSectionWithSpinCount(&cs, 0x01000200u);  // high bits + spin count 512 (clamped to 256)
+    CHECK((cs.spin_count & 0xFFFFFFu) == 512u);
+
+    constexpr int kThreads = 8;
+    constexpr int kIters = 250;
+    uint64_t shared_counter = 0;
+    std::atomic<int> failures{0};
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&] {
+            std::vector<Handle> local;
+            local.reserve(16);
+            for (int i = 0; i < kIters; ++i) {
+                const Handle ev = CreateEventW(nullptr, true, false, nullptr);
+                if (ev == kNullHandle || ev == INVALID_HANDLE_VALUE) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                if (!SetEvent(ev) || WaitForSingleObject(ev, 0) != WAIT_OBJECT_0 || !ResetEvent(ev)) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                local.push_back(ev);
+                if (local.size() >= 16) {
+                    for (Handle h : local) {
+                        if (!CloseHandle(h)) {
+                            failures.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    local.clear();
+                }
+
+                // Contend on the critical section with spin count (including recursive entry).
+                EnterCriticalSection(&cs);
+                EnterCriticalSection(&cs);
+                ++shared_counter;
+                LeaveCriticalSection(&cs);
+                LeaveCriticalSection(&cs);
+            }
+            for (Handle h : local) {
+                if (!CloseHandle(h)) {
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& th : threads) {
+        th.join();
+    }
+    DeleteCriticalSection(&cs);
+
+    CHECK(failures.load() == 0);
+    CHECK(shared_counter == static_cast<uint64_t>(kThreads) * kIters);
+    const KernelHandleCounts after = live_kernel_handles();
+    CHECK(after.dispatcher == baseline.dispatcher);
+    CHECK(after.file == baseline.file);
+    CHECK(after.opaque == baseline.opaque);
+}
+
 int main() {
     test_stall_compensation();
     test_httpfs_size_cache();
+    test_httpfs_stat_cache_and_invalidation();
+    test_concurrent_handles_and_spin_cs();
     test_httpfs_sparse_64bit_and_retry();
     test_directories_and_attributes();
     test_find_files();

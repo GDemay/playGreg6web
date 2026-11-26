@@ -156,6 +156,7 @@ TlsTable* get_tls_table();
 
 void set_httpfs_client(HttpfsMailboxClient* client);
 HttpfsMailboxClient* get_httpfs_client();
+uint64_t httpfs_client_generation();
 
 // Handle-table seam for os/win32_sync: waitable dispatcher objects (events, semaphores, mutexes,
 // threads) are implemented there but share this HANDLE namespace and CloseHandle.

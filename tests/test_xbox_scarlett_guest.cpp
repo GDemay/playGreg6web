@@ -9,10 +9,12 @@
 #include <cmath>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -29,6 +31,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/bcpack.h"
+#include "os/httpfs_mailbox.h"
 #include "os/vmem.h"
 #include "os/xapu_opus.h"
 #include "os/win32_compat.h"
@@ -2853,10 +2856,291 @@ void test_xapu_decode() {
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
 }
 
+// Helper to emit a valid zlib stream using RFC 1951 fixed Huffman codes with explicit literals and
+// LZ77 (length, distance) matches so we can deterministically exercise every match-copy path.
+struct FixedDeflateBuilder {
+    std::vector<uint8_t> bytes;
+    uint32_t bitbuf = 0;
+    int bitcnt = 0;
+    std::vector<uint8_t> expected;
+
+    FixedDeflateBuilder() {
+        bytes.push_back(0x78);
+        bytes.push_back(0x01);
+        put_bits(1, 1);  // BFINAL = 1
+        put_bits(1, 2);  // BTYPE = 01 (fixed Huffman)
+    }
+
+    void put_bits(uint32_t v, int n) {
+        bitbuf |= (v << bitcnt);
+        bitcnt += n;
+        while (bitcnt >= 8) {
+            bytes.push_back(static_cast<uint8_t>(bitbuf & 0xFFu));
+            bitbuf >>= 8;
+            bitcnt -= 8;
+        }
+    }
+
+    void put_code_msb(uint32_t code, int n) {
+        uint32_t rev = 0;
+        for (int i = 0; i < n; ++i) {
+            rev = (rev << 1) | ((code >> i) & 1u);
+        }
+        put_bits(rev, n);
+    }
+
+    void emit_lit(uint8_t b) {
+        if (b <= 143) {
+            put_code_msb(0x30u + b, 8);
+        } else {
+            put_code_msb(0x190u + (b - 144u), 9);
+        }
+        expected.push_back(b);
+    }
+
+    void emit_match(size_t length, size_t distance) {
+        static constexpr uint16_t kLenBase[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
+                                                  31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+        static constexpr uint8_t kLenExtra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+                                                  2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0};
+        static constexpr uint16_t kDistBase[30] = {1,    2,    3,    4,    5,    7,    9,    13,   17,   25,
+                                                   33,   49,   65,   97,   129,  193,  257,  385,  513,  769,
+                                                   1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577};
+        static constexpr uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
+                                                   6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+        int lidx = 28;
+        for (int i = 0; i < 28; ++i) {
+            if (length < kLenBase[i + 1]) {
+                lidx = i;
+                break;
+            }
+        }
+        const int sym = 257 + lidx;
+        if (sym <= 279) {
+            put_code_msb(static_cast<uint32_t>(sym - 256), 7);
+        } else {
+            put_code_msb(0xC0u + static_cast<uint32_t>(sym - 280), 8);
+        }
+        if (kLenExtra[lidx] != 0) {
+            put_bits(static_cast<uint32_t>(length - kLenBase[lidx]), kLenExtra[lidx]);
+        }
+        int didx = 29;
+        for (int i = 0; i < 29; ++i) {
+            if (distance < kDistBase[i + 1]) {
+                didx = i;
+                break;
+            }
+        }
+        put_code_msb(static_cast<uint32_t>(didx), 5);
+        if (kDistExtra[didx] != 0) {
+            put_bits(static_cast<uint32_t>(distance - kDistBase[didx]), kDistExtra[didx]);
+        }
+        for (size_t i = 0; i < length; ++i) {
+            expected.push_back(expected[expected.size() - distance]);
+        }
+    }
+
+    std::vector<uint8_t> finish() {
+        put_code_msb(0, 7);  // end-of-block 256
+        if (bitcnt > 0) {
+            bytes.push_back(static_cast<uint8_t>(bitbuf & 0xFFu));
+            bitbuf = 0;
+            bitcnt = 0;
+        }
+        uint32_t a = 1;
+        uint32_t b = 0;
+        for (uint8_t v : expected) {
+            a = (a + v) % 65521u;
+            b = (b + a) % 65521u;
+        }
+        const uint32_t adler = (b << 16) | a;
+        bytes.push_back(static_cast<uint8_t>((adler >> 24) & 0xFFu));
+        bytes.push_back(static_cast<uint8_t>((adler >> 16) & 0xFFu));
+        bytes.push_back(static_cast<uint8_t>((adler >> 8) & 0xFFu));
+        bytes.push_back(static_cast<uint8_t>(adler & 0xFFu));
+        return bytes;
+    }
+};
+
+void test_inflate_lz77_fast_paths() {
+    FixedDeflateBuilder b;
+
+    // 1. distance == 1 RLE (memset fast path): short, medium, and max length (258).
+    b.emit_lit(0xA5);
+    b.emit_match(3, 1);
+    b.emit_match(37, 1);
+    b.emit_match(258, 1);
+
+    // 2. 1 < distance < length overlapping repeats for distances 2, 3, 5, 7 with odd/even/max lengths.
+    const size_t overlap_distances[] = {2, 3, 5, 7};
+    const size_t overlap_lengths[] = {5, 7, 13, 64, 258};
+    for (size_t d : overlap_distances) {
+        for (size_t k = 0; k < d; ++k) {
+            b.emit_lit(static_cast<uint8_t>(0x20 + d * 11 + k));
+        }
+        for (size_t len : overlap_lengths) {
+            if (len > d) {
+                b.emit_match(len, d);
+            }
+        }
+    }
+
+    // 3. distance >= length non-overlapping copies: distance == length and distance > length.
+    for (uint8_t c = 0; c < 40; ++c) {
+        b.emit_lit(static_cast<uint8_t>(0x80u + c));
+    }
+    b.emit_match(3, 3);      // exact distance == length (short)
+    b.emit_match(19, 19);    // exact distance == length (odd)
+    b.emit_match(40, 40);    // exact distance == length
+    b.emit_match(17, 63);    // distance > length
+    b.emit_match(258, 300);  // max length non-overlapping
+
+    // 4. Extend past 2 * 5552 bytes (+ non-multiple of 16 tail) to stress multi-chunk 16x unrolled adler32.
+    while (b.expected.size() < 12007) {
+        b.emit_lit(static_cast<uint8_t>(b.expected.size() * 13 + 7));
+        b.emit_match(197, 7);
+        b.emit_match(258, 512);
+    }
+    b.emit_lit(0xFE);
+    b.emit_lit(0x01);
+    b.emit_lit(0x7F);
+
+    const std::vector<uint8_t> zstream = b.finish();
+    std::vector<uint8_t> out(b.expected.size() + 32, 0xCC);
+    size_t produced = 0;
+    const ga::InflateStatus st = ga::inflate_stream(zstream.data(), zstream.size(), out.data(), out.size(), &produced);
+    CHECK(st == ga::InflateStatus::Ok);
+    CHECK(produced == b.expected.size());
+    out.resize(produced);
+    CHECK(out == b.expected);
+}
+
+// O48: multiple DirectStorage worker threads reading from the SAME IDStorageFile backed by a
+// concurrent HttpfsDirectBackend genuinely execute in parallel (shared_mutex in DStorageFileImpl),
+// and worker staging/scratch buffers are safely reused across small, large, and oversized batches.
+void test_dstorage_same_file_parallel_reads_and_buffer_reuse() {
+    Fixture fx;
+    constexpr size_t kFileBytes = 256 * 1024;
+    const std::vector<uint8_t> file_data = pattern_data(kFileBytes);
+
+    std::mutex barrier_mu;
+    std::condition_variable barrier_cv;
+    int in_flight = 0;
+    int max_in_flight = 0;
+    int arrived = 0;
+
+    os::HttpfsDirectBackend backend;
+    backend.concurrent = true;
+    backend.max_chunk_bytes = 64 * 1024;
+    backend.open = [&](std::string_view rel_path) -> int32_t {
+        return rel_path == "data/parallel_shared.rpf" ? 42 : -2;
+    };
+    backend.read = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+        if (handle != 42) {
+            return -1;
+        }
+        {
+            std::unique_lock<std::mutex> lock(barrier_mu);
+            ++in_flight;
+            ++arrived;
+            if (in_flight > max_in_flight) {
+                max_in_flight = in_flight;
+            }
+            barrier_cv.notify_all();
+            // Hold briefly until at least 2 reads are simultaneously in flight on the same file.
+            barrier_cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return arrived >= 2; });
+        }
+        const size_t n = offset >= file_data.size() ? 0 : std::min<size_t>(len, file_data.size() - offset);
+        if (n > 0) {
+            std::memcpy(dst, file_data.data() + offset, n);
+        }
+        {
+            std::lock_guard<std::mutex> lock(barrier_mu);
+            --in_flight;
+        }
+        return static_cast<int64_t>(n);
+    };
+    backend.close = [&](int32_t handle) -> bool { return handle == 42; };
+
+    os::HttpfsMailboxClient client(std::move(backend));
+    win32::set_httpfs_client(&client);
+
+    ga::set_dstorage_worker_threads(4);
+    const uint64_t factory = fx.factory();
+    const uint64_t shared_file = fx.open_file(factory, u"G:\\data\\parallel_shared.rpf");
+    CHECK(shared_file != 0);
+
+    constexpr int kQueues = 4;
+    uint64_t queues[kQueues];
+    uint64_t statuses[kQueues];
+    uint64_t dests[kQueues];
+    constexpr uint32_t kReadSize = 16384;
+    for (int i = 0; i < kQueues; ++i) {
+        queues[i] = fx.create_queue(factory, 16);
+        statuses[i] = fx.create_status(factory, 2);
+        dests[i] = com::guest_alloc(kReadSize);
+        fx.enqueue(queues[i], file_request(shared_file, static_cast<uint64_t>(i) * kReadSize, kReadSize, dests[i], kReadSize));
+        fx.vcall(queues[i], 4, {I(statuses[i]), I(0)});
+    }
+    // Submit all 4 queues targeting the SAME IDStorageFile back-to-back so workers overlap.
+    for (int i = 0; i < kQueues; ++i) {
+        fx.vcall(queues[i], 6);
+    }
+    for (int i = 0; i < kQueues; ++i) {
+        CHECK(fx.wait_complete(statuses[i], 0));
+        CHECK(as_hr(fx.vcall(statuses[i], 4, {I(0)})) == 0);
+        const std::vector<uint8_t> got = guest_bytes(dests[i], kReadSize);
+        CHECK(std::memcmp(got.data(), file_data.data() + static_cast<size_t>(i) * kReadSize, kReadSize) == 0);
+    }
+    CHECK(max_in_flight >= 2);
+
+    // Multi-batch buffer reuse across large coalesced, small, and compressed batches on one queue.
+    const uint64_t big_dest = com::guest_alloc(128 * 1024);
+    for (int round = 0; round < 3; ++round) {
+        // Large coalesced batch (two adjacent 32 KiB reads -> 64 KiB staging buffer)
+        fx.enqueue(queues[0], file_request(shared_file, 0, 32768, big_dest, 32768));
+        fx.enqueue(queues[0], file_request(shared_file, 32768, 32768, big_dest + 32768, 32768));
+        fx.vcall(queues[0], 4, {I(statuses[0]), I(1)});
+        fx.vcall(queues[0], 6);
+        CHECK(fx.wait_complete(statuses[0], 1));
+        CHECK(as_hr(fx.vcall(statuses[0], 4, {I(1)})) == 0);
+        CHECK(std::memcmp(guest_bytes(big_dest, 65536).data(), file_data.data(), 65536) == 0);
+
+        // Small memory-source zlib batch reusing the worker's staging + scratch buffers.
+        const uint64_t zsrc = com::guest_alloc(sizeof(kZlibDynamic));
+        CHECK(com::write_guest(zsrc, kZlibDynamic, sizeof(kZlibDynamic)));
+        ga::DStorageRequest zr{};
+        zr.options = ga::kDStorageOptionSourceMemory | ga::kDStorageOptionZlib;
+        zr.source = zsrc;
+        zr.source_size = sizeof(kZlibDynamic);
+        zr.destination = big_dest;
+        zr.destination_size = 4096;
+        zr.uncompressed_size = 4096;
+        fx.enqueue(queues[0], zr);
+        fx.vcall(queues[0], 4, {I(statuses[0]), I(1)});
+        fx.vcall(queues[0], 6);
+        CHECK(fx.wait_complete(statuses[0], 1));
+        CHECK(as_hr(fx.vcall(statuses[0], 4, {I(1)})) == 0);
+        CHECK(guest_bytes(big_dest, 4096) == pattern_data(4096));
+        com::guest_free(zsrc);
+    }
+
+    for (int i = 0; i < kQueues; ++i) {
+        fx.vcall(queues[i], 8);
+        fx.vcall(statuses[i], 2);
+        fx.vcall(queues[i], 2);
+    }
+    fx.vcall(shared_file, 3);
+    fx.vcall(shared_file, 2);
+    fx.vcall(factory, 2);
+    win32::set_httpfs_client(nullptr);
+}
+
 }  // namespace
 
 int main() {
     test_inflate();
+    test_inflate_lz77_fast_paths();
     test_factory_identity_and_stubs();
     test_open_file_and_information();
     test_requests_round_trip();
@@ -2869,6 +3153,7 @@ int main() {
     test_cancel_close_and_signal();
     test_backpressure_and_leaks();
     test_concurrent_queues();
+    test_dstorage_same_file_parallel_reads_and_buffer_reuse();
     test_game_input_readings();
     test_game_input_devices();
     test_game_input_stable_pad();
