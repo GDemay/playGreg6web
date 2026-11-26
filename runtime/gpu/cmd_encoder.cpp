@@ -1,15 +1,143 @@
 #include "gpu/cmd_encoder.h"
 
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace playgta6::gpu {
 
-void CommandEncoder::clear() {
-    buf_.clear();
+CommandEncoder::~CommandEncoder() noexcept {
+    std::free(data_);
 }
 
-void CommandEncoder::write_packet(GpuOpcode opcode, const void* payload, uint32_t payload_bytes) {
-    write_packet_with_tail(opcode, payload, payload_bytes, nullptr, 0);
+CommandEncoder::CommandEncoder(const CommandEncoder& other) {
+    if (other.size_ > 0) {
+        void* mem = std::malloc(other.size_);
+        if (mem == nullptr) {
+            std::abort();
+        }
+        std::memcpy(mem, other.data_, other.size_);
+        data_ = static_cast<uint8_t*>(mem);
+        size_ = other.size_;
+        capacity_ = other.size_;
+    }
+}
+
+CommandEncoder& CommandEncoder::operator=(const CommandEncoder& other) {
+    if (this == &other) {
+        return *this;
+    }
+    if (other.size_ == 0) {
+        size_ = 0;
+        return *this;
+    }
+    if (other.size_ > capacity_) {
+        void* new_mem = std::malloc(other.size_);
+        if (new_mem == nullptr) {
+            std::abort();
+        }
+        std::free(data_);
+        data_ = static_cast<uint8_t*>(new_mem);
+        capacity_ = other.size_;
+    }
+    std::memcpy(data_, other.data_, other.size_);
+    size_ = other.size_;
+    return *this;
+}
+
+CommandEncoder::CommandEncoder(CommandEncoder&& other) noexcept
+    : data_(other.data_), size_(other.size_), capacity_(other.capacity_) {
+    other.data_ = nullptr;
+    other.size_ = 0;
+    other.capacity_ = 0;
+}
+
+CommandEncoder& CommandEncoder::operator=(CommandEncoder&& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+    std::free(data_);
+    data_ = other.data_;
+    size_ = other.size_;
+    capacity_ = other.capacity_;
+    other.data_ = nullptr;
+    other.size_ = 0;
+    other.capacity_ = 0;
+    return *this;
+}
+
+void CommandEncoder::clear() noexcept {
+    size_ = 0;
+}
+
+void CommandEncoder::reserve(size_t byte_capacity) {
+    if (byte_capacity > capacity_) {
+        grow_for(byte_capacity);
+    }
+}
+
+void CommandEncoder::reset_and_shrink(size_t max_retain_bytes) {
+    size_ = 0;
+    if (max_retain_bytes == 0) {
+        std::free(data_);
+        data_ = nullptr;
+        capacity_ = 0;
+        return;
+    }
+    if (capacity_ > max_retain_bytes) {
+        std::free(data_);
+        data_ = nullptr;
+        capacity_ = 0;
+        void* shrunk = std::malloc(max_retain_bytes);
+        if (shrunk != nullptr) {
+            data_ = static_cast<uint8_t*>(shrunk);
+            capacity_ = max_retain_bytes;
+        }
+    }
+}
+
+void CommandEncoder::append_raw(const void* bytes, size_t byte_size) {
+    if (bytes == nullptr || byte_size == 0) {
+        return;
+    }
+    // Guard against appending a slice from our own buffer across a reallocation.
+    const auto src_addr = reinterpret_cast<uintptr_t>(bytes);
+    const auto base_addr = reinterpret_cast<uintptr_t>(data_);
+    if (data_ != nullptr && src_addr >= base_addr && src_addr < base_addr + capacity_) {
+        const size_t src_offset = static_cast<size_t>(src_addr - base_addr);
+        uint8_t* dst = reserve_append(byte_size);
+        std::memmove(dst, data_ + src_offset, byte_size);
+        return;
+    }
+    uint8_t* dst = reserve_append(byte_size);
+    std::memcpy(dst, bytes, byte_size);
+}
+
+void CommandEncoder::grow_append(size_t extra_bytes) {
+    if (extra_bytes > std::numeric_limits<size_t>::max() - size_) {
+        std::abort();
+    }
+    grow_for(size_ + extra_bytes);
+}
+
+void CommandEncoder::grow_for(size_t required_capacity) {
+    if (required_capacity <= capacity_) {
+        return;
+    }
+    size_t new_cap = (capacity_ < kMinCapacity) ? kMinCapacity : capacity_;
+    while (new_cap < required_capacity) {
+        if (new_cap > std::numeric_limits<size_t>::max() / 2) {
+            new_cap = required_capacity;
+            break;
+        }
+        new_cap *= 2;
+    }
+    void* new_mem = std::realloc(data_, new_cap);
+    if (new_mem == nullptr) {
+        std::abort();
+    }
+    data_ = static_cast<uint8_t*>(new_mem);
+    capacity_ = new_cap;
 }
 
 void CommandEncoder::write_packet_with_tail(
@@ -20,7 +148,14 @@ void CommandEncoder::write_packet_with_tail(
     uint32_t tail_bytes) {
     const uint32_t safe_head_bytes = (head != nullptr) ? head_bytes : 0u;
     const uint32_t safe_tail_bytes = (tail != nullptr) ? tail_bytes : 0u;
+    if (safe_head_bytes > std::numeric_limits<uint32_t>::max() - safe_tail_bytes) {
+        return;
+    }
     const uint32_t payload_bytes = safe_head_bytes + safe_tail_bytes;
+    if (static_cast<size_t>(payload_bytes) >
+        std::numeric_limits<size_t>::max() - sizeof(GpuPacketHeader)) {
+        std::abort();
+    }
 
     const GpuPacketHeader header{
         static_cast<uint16_t>(opcode),
@@ -28,41 +163,54 @@ void CommandEncoder::write_packet_with_tail(
         payload_bytes,
     };
 
-    const size_t offset = buf_.size();
-    buf_.resize(offset + sizeof(GpuPacketHeader) + payload_bytes);
-    std::memcpy(buf_.data() + offset, &header, sizeof(GpuPacketHeader));
+    const size_t total_bytes = sizeof(GpuPacketHeader) + static_cast<size_t>(payload_bytes);
+    uint8_t* dst = reserve_append(total_bytes);
+    std::memcpy(dst, &header, sizeof(GpuPacketHeader));
     if (safe_head_bytes > 0) {
-        std::memcpy(buf_.data() + offset + sizeof(GpuPacketHeader), head, safe_head_bytes);
+        std::memcpy(dst + sizeof(GpuPacketHeader), head, safe_head_bytes);
     }
     if (safe_tail_bytes > 0) {
         std::memcpy(
-            buf_.data() + offset + sizeof(GpuPacketHeader) + safe_head_bytes,
+            dst + sizeof(GpuPacketHeader) + safe_head_bytes,
             tail,
             safe_tail_bytes);
     }
 }
 
 void CommandEncoder::nop() {
-    write_packet(GpuOpcode::Nop, nullptr, 0);
+    write_empty_packet(GpuOpcode::Nop);
 }
 
 void CommandEncoder::nop_padded(uint32_t payload_bytes) {
-    const std::vector<uint8_t> zeros(payload_bytes, 0);
-    write_packet(GpuOpcode::Nop, zeros.data(), payload_bytes);
+    if (static_cast<size_t>(payload_bytes) >
+        std::numeric_limits<size_t>::max() - sizeof(GpuPacketHeader)) {
+        std::abort();
+    }
+    const GpuPacketHeader header{
+        static_cast<uint16_t>(GpuOpcode::Nop),
+        0,
+        payload_bytes,
+    };
+    const size_t total_bytes = sizeof(GpuPacketHeader) + static_cast<size_t>(payload_bytes);
+    uint8_t* dst = reserve_append(total_bytes);
+    std::memcpy(dst, &header, sizeof(GpuPacketHeader));
+    if (payload_bytes > 0) {
+        std::memset(dst + sizeof(GpuPacketHeader), 0, payload_bytes);
+    }
 }
 
 void CommandEncoder::begin_frame() {
-    write_packet(GpuOpcode::BeginFrame, nullptr, 0);
+    write_empty_packet(GpuOpcode::BeginFrame);
 }
 
 void CommandEncoder::clear_color(float r, float g, float b, float a) {
     const GpuClearColorPayload payload{r, g, b, a};
-    write_packet(GpuOpcode::ClearColor, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::ClearColor, payload);
 }
 
 void CommandEncoder::create_buffer(uint32_t id, uint32_t usage_flags, uint64_t byte_size) {
     const GpuCreateBufferPayload payload{id, usage_flags, byte_size};
-    write_packet(GpuOpcode::CreateBuffer, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::CreateBuffer, payload);
 }
 
 void CommandEncoder::write_buffer(
@@ -79,6 +227,9 @@ void CommandEncoder::create_shader_module(
     uint32_t id,
     GpuShaderStage stage,
     std::string_view wgsl_code) {
+    if (wgsl_code.size() > std::numeric_limits<uint32_t>::max()) {
+        return;
+    }
     const auto code_len = static_cast<uint32_t>(wgsl_code.size());
     const GpuCreateShaderModulePayload payload{
         id,
@@ -109,17 +260,17 @@ void CommandEncoder::create_render_pipeline(
         static_cast<uint32_t>(topology),
         flags,
     };
-    write_packet(GpuOpcode::CreateRenderPipeline, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::CreateRenderPipeline, payload);
 }
 
 void CommandEncoder::set_pipeline(uint32_t pipeline_id) {
     const GpuSetPipelinePayload payload{pipeline_id};
-    write_packet(GpuOpcode::SetPipeline, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::SetPipeline, payload);
 }
 
 void CommandEncoder::set_vertex_buffer(uint32_t slot, uint32_t buffer_id, uint64_t offset) {
     const GpuSetVertexBufferPayload payload{slot, buffer_id, offset};
-    write_packet(GpuOpcode::SetVertexBuffer, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::SetVertexBuffer, payload);
 }
 
 void CommandEncoder::draw(
@@ -133,16 +284,16 @@ void CommandEncoder::draw(
         first_vertex,
         first_instance,
     };
-    write_packet(GpuOpcode::Draw, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::Draw, payload);
 }
 
 void CommandEncoder::present() {
-    write_packet(GpuOpcode::Present, nullptr, 0);
+    write_empty_packet(GpuOpcode::Present);
 }
 
 void CommandEncoder::destroy_resource(uint32_t id) {
     const GpuDestroyResourcePayload payload{id};
-    write_packet(GpuOpcode::DestroyResource, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::DestroyResource, payload);
 }
 
 void CommandEncoder::create_texture(
@@ -164,7 +315,7 @@ void CommandEncoder::create_texture(
         usage_flags,
         static_cast<uint32_t>(dimension),
     };
-    write_packet(GpuOpcode::CreateTexture, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::CreateTexture, payload);
 }
 
 void CommandEncoder::write_texture(
@@ -217,7 +368,7 @@ void CommandEncoder::create_sampler(
         static_cast<uint32_t>(mipmap_filter),
         max_anisotropy,
     };
-    write_packet(GpuOpcode::CreateSampler, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::CreateSampler, payload);
 }
 
 void CommandEncoder::create_bind_group(
@@ -227,6 +378,9 @@ void CommandEncoder::create_bind_group(
     const GpuBindGroupEntry* entries,
     uint32_t entry_count) {
     const uint32_t actual_count = (entries != nullptr) ? entry_count : 0u;
+    if (actual_count > std::numeric_limits<uint32_t>::max() / sizeof(GpuBindGroupEntry)) {
+        return;
+    }
     const GpuCreateBindGroupPayload payload{
         id,
         pipeline_id,
@@ -239,7 +393,7 @@ void CommandEncoder::create_bind_group(
 
 void CommandEncoder::set_bind_group(uint32_t group_index, uint32_t bind_group_id) {
     const GpuSetBindGroupPayload payload{group_index, bind_group_id};
-    write_packet(GpuOpcode::SetBindGroup, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::SetBindGroup, payload);
 }
 
 void CommandEncoder::set_index_buffer(
@@ -251,7 +405,7 @@ void CommandEncoder::set_index_buffer(
         static_cast<uint32_t>(index_format),
         offset,
     };
-    write_packet(GpuOpcode::SetIndexBuffer, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::SetIndexBuffer, payload);
 }
 
 void CommandEncoder::draw_indexed(
@@ -267,17 +421,17 @@ void CommandEncoder::draw_indexed(
         base_vertex,
         first_instance,
     };
-    write_packet(GpuOpcode::DrawIndexed, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::DrawIndexed, payload);
 }
 
 void CommandEncoder::create_compute_pipeline(uint32_t id, uint32_t cs_shader_id, uint32_t flags) {
     const GpuCreateComputePipelinePayload payload{id, cs_shader_id, flags, 0u};
-    write_packet(GpuOpcode::CreateComputePipeline, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::CreateComputePipeline, payload);
 }
 
 void CommandEncoder::set_compute_pipeline(uint32_t pipeline_id) {
     const GpuSetComputePipelinePayload payload{pipeline_id};
-    write_packet(GpuOpcode::SetComputePipeline, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::SetComputePipeline, payload);
 }
 
 void CommandEncoder::dispatch_compute(
@@ -285,20 +439,23 @@ void CommandEncoder::dispatch_compute(
     uint32_t workgroup_y,
     uint32_t workgroup_z) {
     const GpuDispatchComputePayload payload{workgroup_x, workgroup_y, workgroup_z};
-    write_packet(GpuOpcode::DispatchCompute, &payload, sizeof(payload));
+    write_pod_packet(GpuOpcode::DispatchCompute, payload);
 }
 
 void CommandEncoder::indirect(GpuOpcode opcode, uint32_t buffer_id, uint64_t offset) {
     const GpuIndirectPayload payload{buffer_id, 0u, offset};
-    write_packet(opcode, &payload, sizeof(payload));
+    write_pod_packet(opcode, payload);
 }
 
 bool CommandEncoder::patch(size_t offset, const void* bytes, size_t size) {
-    if (offset > buf_.size() || size > buf_.size() - offset) {
+    if (offset > size_ || size > size_ - offset) {
         return false;
     }
     if (size != 0) {
-        std::memcpy(buf_.data() + offset, bytes, size);
+        if (bytes == nullptr) {
+            return false;
+        }
+        std::memcpy(data_ + offset, bytes, size);
     }
     return true;
 }
