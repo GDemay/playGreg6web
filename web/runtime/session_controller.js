@@ -1837,9 +1837,6 @@ export class RuntimeSessionController {
         this._recentValidationErrors.shift();
       }
 
-      const level = errorType === 'out-of-memory' || errorType === 'internal' ? 'error' : 'warn';
-      this._hudLog(`[WebGPU ${errorType}] ${message}`, level);
-
       const eventPayload = {
         type: 'gpu-validation-error',
         error: { ...record },
@@ -1851,10 +1848,12 @@ export class RuntimeSessionController {
         mode: this._mode,
       };
 
+      let hudHandledValidation = false;
       if (this._hud) {
         const hudErrFns = ['recordValidationError', 'onValidationError', 'updateGpuValidation'];
         for (const fnName of hudErrFns) {
           if (typeof this._hud[fnName] === 'function') {
+            hudHandledValidation = true;
             try {
               this._hud[fnName]({ ...eventPayload, error: { ...record }, record: { ...record } });
             } catch {
@@ -1870,6 +1869,11 @@ export class RuntimeSessionController {
             // Isolate HUD callback errors.
           }
         }
+      }
+
+      if (!hudHandledValidation) {
+        const level = errorType === 'out-of-memory' || errorType === 'internal' ? 'error' : 'warn';
+        this._hudLog(`[WebGPU ${errorType}] ${message}`, level);
       }
 
       this._reportError(new Error(`[WebGPU ${errorType}] ${message}`), {

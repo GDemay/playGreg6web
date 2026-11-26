@@ -1354,32 +1354,49 @@ export function extractBootAssetUrls(source) {
   return out;
 }
 
+const DEFAULT_MAX_DEVICE_PIXEL_RATIO = 2;
+
 function resolveViewportMetrics(canvas, windowObj, overrides = {}) {
+  const maxDpr = isPositiveFinite(overrides.maxDevicePixelRatio)
+    ? overrides.maxDevicePixelRatio
+    : DEFAULT_MAX_DEVICE_PIXEL_RATIO;
   const dpr = isPositiveFinite(overrides.devicePixelRatio)
     ? overrides.devicePixelRatio
     : isPositiveFinite(windowObj && windowObj.devicePixelRatio)
-      ? windowObj.devicePixelRatio
+      ? Math.min(windowObj.devicePixelRatio, maxDpr)
       : 1;
+
+  const isHtmlDefaultCanvasSize = Boolean(
+    canvas &&
+      !isPositiveFinite(canvas.clientWidth) &&
+      !isPositiveFinite(canvas.clientHeight) &&
+      canvas.width === 300 &&
+      canvas.height === 150
+  );
 
   const width = isPositiveFinite(overrides.width)
     ? overrides.width
     : isPositiveFinite(canvas && canvas.clientWidth)
       ? canvas.clientWidth
-      : isPositiveFinite(canvas && canvas.width)
+      : !isHtmlDefaultCanvasSize && isPositiveFinite(canvas && canvas.width)
         ? canvas.width
         : isPositiveFinite(windowObj && windowObj.innerWidth)
           ? windowObj.innerWidth
-          : DEFAULT_VIEWPORT_WIDTH;
+          : isPositiveFinite(canvas && canvas.width)
+            ? canvas.width
+            : DEFAULT_VIEWPORT_WIDTH;
 
   const height = isPositiveFinite(overrides.height)
     ? overrides.height
     : isPositiveFinite(canvas && canvas.clientHeight)
       ? canvas.clientHeight
-      : isPositiveFinite(canvas && canvas.height)
+      : !isHtmlDefaultCanvasSize && isPositiveFinite(canvas && canvas.height)
         ? canvas.height
         : isPositiveFinite(windowObj && windowObj.innerHeight)
           ? windowObj.innerHeight
-          : DEFAULT_VIEWPORT_HEIGHT;
+          : isPositiveFinite(canvas && canvas.height)
+            ? canvas.height
+            : DEFAULT_VIEWPORT_HEIGHT;
 
   return { width, height, dpr };
 }
@@ -1453,6 +1470,18 @@ function computePhaseProgressRatio(progress) {
   return null;
 }
 
+const PRIMARY_PRELOAD_PROGRESS_ASSETS = new Set(['pgim', 'bundle', 'shaderpack', 'wasm']);
+
+function isPrimaryPreloadProgress(progress) {
+  if (!progress || typeof progress !== 'object') {
+    return false;
+  }
+  if (typeof progress.asset !== 'string' || progress.asset.trim().length === 0) {
+    return true;
+  }
+  return PRIMARY_PRELOAD_PROGRESS_ASSETS.has(progress.asset.trim().toLowerCase());
+}
+
 function createSplashOverlayAdapter(splashOverlay) {
   if (!splashOverlay || typeof splashOverlay !== 'object') {
     return null;
@@ -1490,9 +1519,11 @@ function createSplashOverlayAdapter(splashOverlay) {
       const hasStage = typeof base.stage === 'string' && base.stage.length > 0 && base.stage !== 'NOT_STARTED';
       if (payload.progress && typeof payload.progress === 'object') {
         base.streamingProgress = payload.progress;
-        const ratio = computePhaseProgressRatio(payload.progress);
-        if (ratio !== null && base.phaseProgress === undefined) {
-          base.phaseProgress = ratio;
+        if (isPrimaryPreloadProgress(payload.progress)) {
+          const ratio = computePhaseProgressRatio(payload.progress);
+          if (ratio !== null && base.phaseProgress === undefined) {
+            base.phaseProgress = ratio;
+          }
         }
       }
       if (payload.phase === 'DISCOVERING') {
@@ -1531,10 +1562,12 @@ function createSplashOverlayAdapter(splashOverlay) {
     },
     updateProgress(progress) {
       const patch = { streamingProgress: progress };
-      const ratio = computePhaseProgressRatio(progress);
-      if (ratio !== null) {
-        patch.stage = 'PGIM_LOAD';
-        patch.phaseProgress = ratio;
+      if (isPrimaryPreloadProgress(progress)) {
+        const ratio = computePhaseProgressRatio(progress);
+        if (ratio !== null) {
+          patch.stage = 'PGIM_LOAD';
+          patch.phaseProgress = ratio;
+        }
       }
       splashOverlay.updateBootState(patch);
     },
@@ -1779,7 +1812,7 @@ export function bootstrapPlayGta6App(options = {}) {
   const navigatorObj = resolveDefaultNavigator(options, windowObj);
   const fetchImpl = resolveDefaultFetch(options, windowObj);
 
-  const canvas =
+  let canvas =
     options.canvas !== undefined
       ? options.canvas
       : documentObj && typeof documentObj.getElementById === 'function'
@@ -2706,6 +2739,7 @@ export function bootstrapPlayGta6App(options = {}) {
       globalThis.PlayGta6SplashOverlay.SplashOverlayController) ||
     null;
 
+  let hasExplicitSplashFadeOutMs = false;
   const resolvedSplashFadeOutMs = (() => {
     const candidates = [
       options.splashFadeOutMs,
@@ -2715,11 +2749,16 @@ export function bootstrapPlayGta6App(options = {}) {
     for (let i = 0; i < candidates.length; i += 1) {
       const value = candidates[i];
       if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+        hasExplicitSplashFadeOutMs = true;
         return value;
       }
     }
     return DEFAULT_SPLASH_FADE_OUT_MS;
   })();
+  const hasExplicitVisibleFrameFadeMs =
+    typeof splashOverlayOptions.visibleFrameFadeMs === 'number' &&
+    Number.isFinite(splashOverlayOptions.visibleFrameFadeMs) &&
+    splashOverlayOptions.visibleFrameFadeMs >= 0;
 
   let splashOverlay = null;
   let ownsSplashOverlay = false;
@@ -2733,6 +2772,9 @@ export function bootstrapPlayGta6App(options = {}) {
     splashOverlay = new SplashOverlayCtor({
       ...splashOverlayOptions,
       fadeOutMs: resolvedSplashFadeOutMs,
+      ...(!hasExplicitVisibleFrameFadeMs && !hasExplicitSplashFadeOutMs
+        ? { visibleFrameFadeMs: 450 }
+        : {}),
       nowFn: splashOverlayOptions.nowFn || now,
       holdUntilVisible: resolvedHoldUntilVisible,
       ...(splashOverlayOptions.locationSearch === undefined &&
@@ -2855,6 +2897,8 @@ export function bootstrapPlayGta6App(options = {}) {
   let validationErrorSeq = 0;
   let validationErrorCount = 0;
   const recentValidationErrors = [];
+  const recentValidationEventKeys = new Set();
+  const MAX_VALIDATION_EVENT_DEDUPE_KEYS = 64;
   let wgpuFramesPresented = 0;
   let splashFramesPresented = 0;
   let wasmPerfLastFrames = 0;
@@ -3300,24 +3344,52 @@ export function bootstrapPlayGta6App(options = {}) {
       null;
     const errorCode = sanitizeValidationErrorCode(rawCode, errorType);
 
-    const rawSeq = data.seq ?? (inner ? inner.seq : null);
+    const rawSeq = data.workerSeq ?? data.seq ?? (inner ? inner.workerSeq ?? inner.seq : null);
     const parsedSeq = toNonNegativeInt(rawSeq, null);
-    validationErrorSeq =
-      parsedSeq !== null && parsedSeq > validationErrorSeq ? parsedSeq : validationErrorSeq + 1;
-    validationErrorCount += 1;
-    gpuTelemetry.lastValidationErrorCode = errorCode;
-    gpuTelemetry.lastValidationErrorMessage = message || null;
-
     const rawTs = data.timestampMs ?? data.timestamp ?? (inner ? inner.timestampMs : null);
-    const timestampMs =
-      typeof rawTs === 'number' && Number.isFinite(rawTs) ? rawTs : epochNow();
+    const hasExplicitTs = typeof rawTs === 'number' && Number.isFinite(rawTs);
+    const timestampMs = hasExplicitTs ? rawTs : epochNow();
 
     const rawSource =
       opts.source ?? data.source ?? (inner ? inner.source : null) ?? 'wgpu_worker';
     const source = sanitizeDiagnosticText(rawSource, 64) || 'wgpu_worker';
 
+    // Deduplicate identical worker+loader / dual-channel validation error deliveries.
+    const dedupeKey =
+      parsedSeq !== null && parsedSeq > 0
+        ? `seq:${source}:${parsedSeq}:${hasExplicitTs ? timestampMs : ''}:${errorType}:${message}`
+        : hasExplicitTs && message.length > 0
+          ? `msg:${source}:${timestampMs}:${errorType}:${message}`
+          : null;
+    if (dedupeKey !== null && recentValidationEventKeys.has(dedupeKey)) {
+      return recentValidationErrors.length > 0
+        ? recentValidationErrors[recentValidationErrors.length - 1]
+        : null;
+    }
+    if (dedupeKey !== null) {
+      recentValidationEventKeys.add(dedupeKey);
+      if (recentValidationEventKeys.size > MAX_VALIDATION_EVENT_DEDUPE_KEYS) {
+        const oldest = recentValidationEventKeys.values().next().value;
+        if (oldest !== undefined) {
+          recentValidationEventKeys.delete(oldest);
+        }
+      }
+    }
+
+    validationErrorSeq =
+      parsedSeq !== null && parsedSeq > validationErrorSeq ? parsedSeq : validationErrorSeq + 1;
+    const rawTotalCount = data.totalCount ?? (inner ? inner.totalCount : null);
+    const parsedTotalCount = toNonNegativeInt(rawTotalCount, null);
+    validationErrorCount =
+      parsedTotalCount !== null
+        ? Math.max(validationErrorCount, parsedTotalCount)
+        : validationErrorCount + 1;
+    gpuTelemetry.lastValidationErrorCode = errorCode;
+    gpuTelemetry.lastValidationErrorMessage = message || null;
+
     const record = Object.freeze({
       seq: validationErrorSeq,
+      ...(parsedSeq !== null && parsedSeq > 0 ? { workerSeq: parsedSeq } : {}),
       errorType,
       message,
       timestampMs,
@@ -3329,7 +3401,48 @@ export function bootstrapPlayGta6App(options = {}) {
       recentValidationErrors.shift();
     }
 
-    if (opts.skipCrashReporter !== true) {
+    const eventPayload = Object.freeze({
+      type: 'gpu-validation-error',
+      seq: record.seq,
+      ...(record.workerSeq !== undefined ? { workerSeq: record.workerSeq } : {}),
+      errorType: record.errorType,
+      message: record.message,
+      timestampMs: record.timestampMs,
+      source: record.source,
+      validationErrorCount,
+    });
+
+    let sessionHandledViaRecordMethod = false;
+    if (session) {
+      const sessionMethodNames = [
+        'onGpuValidationError',
+        'recordGpuValidationError',
+        'handleGpuValidationError',
+        'handleWorkerMessage',
+      ];
+      for (let i = 0; i < sessionMethodNames.length; i += 1) {
+        const name = sessionMethodNames[i];
+        const fn = session[name];
+        if (typeof fn === 'function') {
+          if (name === 'recordGpuValidationError') {
+            sessionHandledViaRecordMethod = true;
+          }
+          try {
+            fn.call(session, eventPayload);
+          } catch {
+            // Optional observer hooks must never disrupt bootstrap or runtime execution.
+          }
+          break;
+        }
+      }
+    }
+
+    const sessionRecordedCrash = Boolean(
+      sessionHandledViaRecordMethod &&
+        session &&
+        (session._crashReporter === crashReporter || session._crashReporter === sessionCrashAdapter)
+    );
+    if (opts.skipCrashReporter !== true && !sessionRecordedCrash) {
       const errorName =
         errorType === 'out-of-memory'
           ? 'GPUOutOfMemoryError'
@@ -3343,32 +3456,22 @@ export function bootstrapPlayGta6App(options = {}) {
       );
     }
 
-    const eventPayload = Object.freeze({
-      type: 'gpu-validation-error',
-      seq: record.seq,
-      errorType: record.errorType,
-      message: record.message,
-      timestampMs: record.timestampMs,
-      source: record.source,
-      validationErrorCount,
-    });
-
-    if (session) {
-      invokeFirstHook(
-        session,
-        [
-          'onGpuValidationError',
-          'recordGpuValidationError',
-          'handleGpuValidationError',
-          'handleWorkerMessage',
-        ],
-        eventPayload
-      );
-    }
+    const sessionNotifiedHud = Boolean(
+      sessionHandledViaRecordMethod &&
+        session &&
+        hud &&
+        session._hud === hud &&
+        (typeof hud.recordValidationError === 'function' ||
+          typeof hud.onValidationError === 'function' ||
+          typeof hud.updateGpuValidation === 'function')
+    );
 
     const hudTargets = resolveHudTargets();
     for (let i = 0; i < hudTargets.length; i += 1) {
       const target = hudTargets[i];
+      if (sessionNotifiedHud && target === hud) {
+        continue;
+      }
       const handled = invokeFirstHook(
         target,
         [
@@ -3555,11 +3658,21 @@ export function bootstrapPlayGta6App(options = {}) {
       'visiblePresentsTotal',
       'visible_presents_total',
     ]);
-    if (visiblePresents.found && toSafeNonNegativeInt(visiblePresents.value, 0) > 0) {
-      return {
-        hasExplicitFlag: true,
-        isVisible: true,
-      };
+    if (visiblePresents.found) {
+      const visibleCount = toSafeNonNegativeInt(visiblePresents.value, null);
+      if (visibleCount !== null) {
+        if (visibleCount > 0) {
+          return {
+            hasExplicitFlag: true,
+            isVisible: true,
+          };
+        }
+        sawExplicitVisibleFrameGate = true;
+        return {
+          hasExplicitFlag: true,
+          isVisible: false,
+        };
+      }
     }
     // W349: once the worker has signaled active non-black pixel probing (`firstVisibleFrame: false`),
     // do not let subsequent partial telemetry payloads (without an explicit boolean flag) fall back
@@ -5546,6 +5659,17 @@ export function bootstrapPlayGta6App(options = {}) {
   let firstVisibleFrameNotified = false;
   let sawExplicitVisibleFrameGate = false;
 
+  function setCanvasBootState(state) {
+    if (canvas && typeof canvas === 'object' && canvas.dataset && typeof canvas.dataset === 'object') {
+      try {
+        canvas.dataset.bootState = state;
+      } catch {
+        // Ignore read-only mock dataset objects.
+      }
+    }
+  }
+  setCanvasBootState('loading');
+
   function notifyFirstPresent(meta = {}) {
     if (destroyed) {
       return { ok: false, destroyed: true };
@@ -5556,7 +5680,15 @@ export function bootstrapPlayGta6App(options = {}) {
     // The boot made it to a frame: a later self-relaunch starts a fresh relaunch budget.
     resetGuestRelaunchCount(windowObj);
     firstPresentNotified = true;
+    setCanvasBootState('presenting');
     notifyAudioRingGuestMilestone('first_present');
+    if (inputBridge && typeof inputBridge.notifyFirstPresent === 'function') {
+      try {
+        inputBridge.notifyFirstPresent();
+      } catch {
+        // InputBridge milestone sync must never interrupt presentation.
+      }
+    }
     if (bootOrchestrator && typeof bootOrchestrator.notifyFirstPresent === 'function') {
       try {
         const result = bootOrchestrator.notifyFirstPresent(meta);
@@ -5603,6 +5735,7 @@ export function bootstrapPlayGta6App(options = {}) {
       };
     }
     firstVisibleFrameNotified = true;
+    setCanvasBootState('visible');
     gpuTelemetry.hasVisibleContent = true;
     gpuTelemetry.loadingAssets = false;
 
@@ -5732,6 +5865,14 @@ export function bootstrapPlayGta6App(options = {}) {
         }
       } catch {
         // Overlay errors must never interrupt rendering.
+      }
+    }
+
+    if (inputBridge && typeof inputBridge.notifyFirstVisibleFrame === 'function') {
+      try {
+        inputBridge.notifyFirstVisibleFrame();
+      } catch {
+        // InputBridge milestone sync must never interrupt rendering.
       }
     }
 
@@ -6015,10 +6156,26 @@ export function bootstrapPlayGta6App(options = {}) {
     options.smokeDemoOptions && typeof options.smokeDemoOptions === 'object'
       ? options.smokeDemoOptions
       : {};
-  const initialViewport = resolveViewportMetrics(canvas, windowObj, smokeDemoOptions);
+  const maxDevicePixelRatio = isPositiveFinite(options.maxDevicePixelRatio)
+    ? options.maxDevicePixelRatio
+    : isPositiveFinite(smokeDemoOptions.maxDevicePixelRatio)
+      ? smokeDemoOptions.maxDevicePixelRatio
+      : DEFAULT_MAX_DEVICE_PIXEL_RATIO;
+  const swapchainOptions =
+    options.swapchainOptions &&
+    typeof options.swapchainOptions === 'object' &&
+    !Array.isArray(options.swapchainOptions)
+      ? { ...options.swapchainOptions }
+      : null;
+  const initialViewport = resolveViewportMetrics(canvas, windowObj, {
+    ...smokeDemoOptions,
+    maxDevicePixelRatio,
+  });
   let viewportWidth = initialViewport.width;
   let viewportHeight = initialViewport.height;
   let viewportDpr = initialViewport.dpr;
+  let canvasTransferredToOffscreen = false;
+  let transferredOffscreenCanvas = null;
 
   let activeSmokeRunner = null;
   let activeWasmHandle = null;
@@ -6537,6 +6694,16 @@ export function bootstrapPlayGta6App(options = {}) {
 
     resetWasmPerfTracking();
 
+    // Re-measure live layout dimensions right before launching the GPU worker so late
+    // CSS layout / async preload resizes never lock in a stale initial backing store.
+    if (isPositiveFinite(canvas && canvas.clientWidth) && isPositiveFinite(canvas && canvas.clientHeight)) {
+      viewportWidth = canvas.clientWidth;
+      viewportHeight = canvas.clientHeight;
+      if (isPositiveFinite(windowObj && windowObj.devicePixelRatio)) {
+        viewportDpr = Math.min(windowObj.devicePixelRatio, maxDevicePixelRatio);
+      }
+    }
+
     const pixelWidth = Math.max(1, Math.round(viewportWidth * viewportDpr));
     const pixelHeight = Math.max(1, Math.round(viewportHeight * viewportDpr));
     if (launchContext && launchContext.serverStatus) {
@@ -6719,6 +6886,11 @@ export function bootstrapPlayGta6App(options = {}) {
             }
           }
           if (data.error) {
+            // Skip duplicate worker_error crash/HUD logging when loader.js already
+            // forwards the structured `gpu-validation-error` message over postMessage.
+            if (data.gpuValidationForwarded === true) {
+              return;
+            }
             crashReporter.recordError('worker_error', String(data.error), {
               source: 'loader',
             });
@@ -6825,15 +6997,35 @@ export function bootstrapPlayGta6App(options = {}) {
       let transferCanvas = canvas;
       let transferList = null;
       if (canvas && typeof canvas.transferControlToOffscreen === 'function') {
-        const offscreen = canvas.transferControlToOffscreen();
-        transferCanvas = offscreen;
-        transferList = [offscreen];
+        if (!canvasTransferredToOffscreen) {
+          const offscreen = canvas.transferControlToOffscreen();
+          canvasTransferredToOffscreen = true;
+          transferredOffscreenCanvas = offscreen;
+          transferCanvas = offscreen;
+          transferList = [offscreen];
+        } else if (
+          canvas.parentNode &&
+          typeof canvas.cloneNode === 'function' &&
+          typeof canvas.parentNode.replaceChild === 'function'
+        ) {
+          const freshCanvas = canvas.cloneNode(false);
+          canvas.parentNode.replaceChild(freshCanvas, canvas);
+          canvas = freshCanvas;
+          const offscreen = canvas.transferControlToOffscreen();
+          transferredOffscreenCanvas = offscreen;
+          transferCanvas = offscreen;
+          transferList = [offscreen];
+        } else if (transferredOffscreenCanvas) {
+          transferCanvas = transferredOffscreenCanvas;
+        }
       }
 
       const initPayload = {
         canvas: transferCanvas,
         width: pixelWidth,
         height: pixelHeight,
+        devicePixelRatio: 1,
+        ...(swapchainOptions ? { swapchainOptions } : {}),
         inputSab: inputBridge.sab,
         audioSab: audioEngine.sab,
         dataBase,
@@ -6846,6 +7038,9 @@ export function bootstrapPlayGta6App(options = {}) {
       }
     }
 
+    let lastSentPixelWidth = pixelWidth;
+    let lastSentPixelHeight = pixelHeight;
+
     const wasmHandle = {
       mode: SESSION_MODE.WASM,
       worker,
@@ -6855,7 +7050,12 @@ export function bootstrapPlayGta6App(options = {}) {
         }
         const pw = Math.max(1, Math.round(nextWidth * nextDpr));
         const ph = Math.max(1, Math.round(nextHeight * nextDpr));
+        if (pw === lastSentPixelWidth && ph === lastSentPixelHeight) {
+          return false;
+        }
         if (typeof worker.postMessage === 'function') {
+          lastSentPixelWidth = pw;
+          lastSentPixelHeight = ph;
           worker.postMessage({ resize: true, width: pw, height: ph });
           return true;
         }
@@ -7360,7 +7560,7 @@ export function bootstrapPlayGta6App(options = {}) {
     ownsBootOrchestrator = true;
   }
 
-  // 8. Viewport resize handler (manual API + optional window resize listener).
+  // 8. Viewport resize handler (manual API + optional window resize & ResizeObserver listeners).
   function resize(nextWidth, nextHeight, nextDpr) {
     if (destroyed) {
       return false;
@@ -7372,7 +7572,7 @@ export function bootstrapPlayGta6App(options = {}) {
     const resolvedDpr = isPositiveFinite(nextDpr)
       ? nextDpr
       : isPositiveFinite(windowObj && windowObj.devicePixelRatio)
-        ? windowObj.devicePixelRatio
+        ? Math.min(windowObj.devicePixelRatio, maxDevicePixelRatio)
         : viewportDpr;
 
     viewportWidth = nextWidth;
@@ -7389,24 +7589,48 @@ export function bootstrapPlayGta6App(options = {}) {
   }
 
   let resizeListenerAttached = false;
-  const onWindowResize = () => {
-    if (destroyed || !windowObj) return;
+  let canvasResizeObserver = null;
+
+  const measureAndResizeViewport = () => {
+    if (destroyed) return;
     const w =
       isPositiveFinite(canvas && canvas.clientWidth)
         ? canvas.clientWidth
-        : windowObj.innerWidth;
+        : windowObj && windowObj.innerWidth;
     const h =
       isPositiveFinite(canvas && canvas.clientHeight)
         ? canvas.clientHeight
-        : windowObj.innerHeight;
+        : windowObj && windowObj.innerHeight;
     if (isPositiveFinite(w) && isPositiveFinite(h)) {
-      resize(w, h, windowObj.devicePixelRatio);
+      resize(w, h);
     }
+  };
+
+  const onWindowResize = () => {
+    measureAndResizeViewport();
   };
 
   if (options.autoResize !== false && isEventTargetLike(windowObj)) {
     windowObj.addEventListener('resize', onWindowResize);
     resizeListenerAttached = true;
+  }
+
+  const ResizeObserverCtor =
+    (windowObj && typeof windowObj.ResizeObserver === 'function' && windowObj.ResizeObserver) ||
+    (typeof globalThis !== 'undefined' && typeof globalThis.ResizeObserver === 'function'
+      ? globalThis.ResizeObserver
+      : null);
+  if (options.autoResize !== false && ResizeObserverCtor && canvas && typeof canvas === 'object') {
+    try {
+      canvasResizeObserver = new ResizeObserverCtor(() => {
+        onWindowResize();
+      });
+      if (typeof canvasResizeObserver.observe === 'function') {
+        canvasResizeObserver.observe(canvas);
+      }
+    } catch {
+      canvasResizeObserver = null;
+    }
   }
 
   // 8b. First-user-gesture Web Audio unlock (Click + Key + Gamepad), visibilitychange recovery,
@@ -9207,6 +9431,10 @@ export function bootstrapPlayGta6App(options = {}) {
   async function stop() {
     stopActiveInputScript();
     stopGamepadAudioUnlockPoll();
+    firstPresentNotified = false;
+    firstVisibleFrameNotified = false;
+    sawExplicitVisibleFrameGate = false;
+    setCanvasBootState('loading');
     if (audioRingController && typeof audioRingController.stop === 'function') {
       try {
         audioRingController.stop();
@@ -9310,6 +9538,18 @@ export function bootstrapPlayGta6App(options = {}) {
           cleanup();
         } catch {
           // Ignore external worker teardown errors.
+        }
+      }
+
+      if (canvasResizeObserver) {
+        const observer = canvasResizeObserver;
+        canvasResizeObserver = null;
+        try {
+          if (typeof observer.disconnect === 'function') {
+            observer.disconnect();
+          }
+        } catch {
+          // Ignore ResizeObserver teardown errors.
         }
       }
 

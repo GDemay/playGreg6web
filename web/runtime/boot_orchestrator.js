@@ -2902,8 +2902,11 @@
         meta: enrichedMeta,
         firstPresentSource: this._firstPresentSource,
       });
-      callQuiet(this._splashOverlay, 'dismiss', enrichedMeta);
-      callQuiet(this._splashOverlay, 'hide', enrichedMeta);
+      if (this._splashOverlay && typeof this._splashOverlay.dismiss === 'function') {
+        callQuiet(this._splashOverlay, 'dismiss', enrichedMeta);
+      } else {
+        callQuiet(this._splashOverlay, 'hide', enrichedMeta);
+      }
       invokeQuiet(this._onFirstPresent, {
         ...enrichedMeta,
         status: this._status,
