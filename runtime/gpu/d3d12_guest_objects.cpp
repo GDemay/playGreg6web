@@ -1,4 +1,6 @@
 #include "os/guest_window.h"
+#include "gpu/small_texture_pool.h"
+#include "gpu/texture_budget.h"
 #include "gpu/d3d12_guest_objects.h"
 
 #include <algorithm>
@@ -415,8 +417,19 @@ Device::~Device() {
             ids.reserve(address_textures_.size());
             for (const auto& entry : address_textures_) {
                 ids.push_back(entry.second.id);
+                if (entry.second.budget_bytes != 0) {
+                    texture_budget().note_destroyed(entry.second.budget_bytes);
+                }
             }
             address_textures_.clear();
+        }
+        {
+            // Backlog 38: textures parked for reuse go with the device.
+            std::vector<uint64_t> parked_bytes;
+            small_texture_pool().drain(reinterpret_cast<uintptr_t>(this), &ids, &parked_bytes);
+            for (const uint64_t b : parked_bytes) {
+                texture_budget().note_destroyed(b);
+            }
         }
         if (!ids.empty()) {
             CommandEncoder enc;
