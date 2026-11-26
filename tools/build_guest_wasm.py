@@ -65,6 +65,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Mapping, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import emsdk_locator  # noqa: E402
+
 SCHEMA_VERSION = 1
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CACHE_DIR_REL = Path("work") / "wasm_obj_cache"
@@ -950,6 +953,12 @@ def discover_emscripten(
     if emsdk:
         search_dirs.append(("emsdk", Path(emsdk) / "upstream" / "emscripten"))
     search_dirs.append(("work/emsdk", repo_root / EMSDK_UPSTREAM_REL))
+    if not _first_existing(repo_root / EMSDK_UPSTREAM_REL, _EMCC_NAMES):
+        picked = emsdk_locator.select_work_emsdk(repo_root)
+        if picked is not None:
+            search_dirs.append(("work/**/emsdk", picked[0]))
+            if which("emcc") is None and not (env_map.get("EMSDK") or "").strip():
+                print(emsdk_locator.describe(repo_root, picked), file=sys.stderr)
 
     for label, directory in search_dirs:
         found_cc = _first_existing(directory, _EMCC_NAMES)
@@ -4466,7 +4475,7 @@ def run_build(
 
     if not toolchain.ok:
         report.errors.append(
-            "emcc not found on PATH, EMSDK, or work/emsdk/upstream/emscripten"
+            "emcc not found on PATH, EMSDK, or work/**/emsdk/upstream/emscripten"
         )
         return report
 

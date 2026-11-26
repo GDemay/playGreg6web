@@ -77,6 +77,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import emsdk_locator  # noqa: E402
+
 SCHEMA_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BUILD_DIR_REL = Path("runtime") / "build-wasm64-tests"
@@ -515,6 +518,9 @@ class LocalToolchain:
         if emsdk:
             candidates.append(Path(emsdk) / "upstream" / "emscripten")
         candidates.append(self.config.repo_root / EMSDK_UPSTREAM_REL)
+        picked = emsdk_locator.select_work_emsdk(self.config.repo_root)
+        if picked is not None:
+            candidates.append(picked[0])
         for cand in candidates:
             if cand.is_dir():
                 dirs.insert(0, str(cand))

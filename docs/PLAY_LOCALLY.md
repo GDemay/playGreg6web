@@ -4,7 +4,7 @@ Build and watch the game in a headed Chrome on your own machine. Game files stay
 
 ## Prerequisites
 - Windows, Chrome (or Edge/Chromium), Python 3, Rust (cargo), CMake, Ninja.
-- Emscripten (emsdk) **7.0.1**, on PATH (`emcc`, `emcmake`).
+- Emscripten (emsdk) **7.0.1**, on PATH (`emcc`, `emcmake`), or `EMSDK` set, or installed anywhere under `work/**/emsdk` (e.g. `work/emsdk`, `work/real/o36/emsdk`). The build tooling (`tools/emsdk_locator.py`) picks the install whose `upstream/emscripten/emscripten-version.txt` is 7.0.1, else the newest, and prints which one it uses. If none is found `play_local.ps1` prints a one-line fix (clone emsdk into `work/emsdk`, `emsdk install 7.0.1`, `emsdk activate 7.0.1`).
 - Your own game executable and package directory (never committed).
 - RAM: plan for ~20-30 GB free.
 

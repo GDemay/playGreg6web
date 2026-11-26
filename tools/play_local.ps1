@@ -36,6 +36,13 @@ if (-not $ShaderPack -or -not (Test-Path -LiteralPath $ShaderPack)) {
            "then pass -ShaderPack <file> or set PLAYGTA6_SHADER_PACK (work/splash.wgsl.pack is picked up automatically)."
     if ($DryRun) { Write-Warning $msg } else { throw $msg }
 }
+if (-not $NoBuild -and -not $TrustBuild -and -not (Get-Command emcc -ErrorAction SilentlyContinue) -and -not $env:EMSDK) {
+    & python (Join-Path $PSScriptRoot "emsdk_locator.py")
+    if ($LASTEXITCODE -ne 0) {
+        $m = "No Emscripten found (emcc not on PATH, EMSDK unset, no work/**/emsdk). Fix: git clone https://github.com/emscripten-core/emsdk work/emsdk; cd work/emsdk; .\emsdk install 7.0.1; .\emsdk activate 7.0.1 (or activate an existing emsdk in this shell)."
+        if ($DryRun) { Write-Warning $m } else { throw $m }
+    }
+}
 if (-not $Name) { $Name = "play-local-" + (Get-Date -Format "yyyyMMdd-HHmmss") }
 $argv = @("tools/run_browser_boot.py", "--preset", "long", "--name", $Name, "--headed",
           "--exe", $Exe, "--game-dir", $GameDir, "--port", $Port, "--build-dir", $BuildDir,
