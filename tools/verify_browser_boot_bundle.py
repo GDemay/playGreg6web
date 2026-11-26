@@ -114,19 +114,49 @@ PGIM_SECTION_ENTRY_BYTES = 64
 PGIM_VERSION = 1
 
 WGPK_MAGIC = b"WGPK"
-WGPK_VERSION = 1
+WGPK_VERSION_V1 = 1
+WGPK_VERSION = WGPK_VERSION_V1
+WGPK_VERSION_V2 = 2
+WGPK_SUPPORTED_VERSIONS: tuple[int, ...] = (WGPK_VERSION_V1, WGPK_VERSION_V2)
 WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
 WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
-WGPK_ENTRY_STRUCT = struct.Struct("<QB3sII")
-WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT.size  # 20 bytes
+WGPK_ENTRY_STRUCT_V1 = struct.Struct("<QB3sII")
+WGPK_ENTRY_STRUCT = WGPK_ENTRY_STRUCT_V1
+WGPK_ENTRY_BYTES = WGPK_ENTRY_STRUCT_V1.size  # 20 bytes
+WGPK_ENTRY_STRUCT_V2 = struct.Struct("<QB3sIQ")
+WGPK_ENTRY_BYTES_V2 = WGPK_ENTRY_STRUCT_V2.size  # 24 bytes
 WGPK_VALID_STAGES: frozenset[int] = frozenset({1, 2, 3})
 WGPK_MAX_U32 = 0xFFFFFFFF
+WGPK_MAX_U64 = 0xFFFFFFFFFFFFFFFF
+WGPK_TOC_CHUNK_ENTRIES = 4096
 WGPK_MAX_ENTRY_ERRORS = 8
 SPLASH_PACK_NAME = "splash.wgsl.pack"
 
 REFLECT_SIDECAR_SUFFIX = ".reflect.json"
 REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
 REFLECT_SIDECAR_VERSION = 1
+REFLECT_SIDECAR_SUPPORTED_VERSIONS: tuple[int, ...] = (1, 2, 3)
+REFLECT_KIND_MAP: dict[str, str] = {
+    "uniform": "uniform",
+    "storage": "storage",
+    "read_only_storage": "read_only_storage",
+    "read-only-storage": "read_only_storage",
+    "texture": "texture",
+    "texture_2d": "texture",
+    "storage_texture": "storage_texture",
+    "storage-texture": "storage_texture",
+    "sampler": "sampler",
+    "comparison_sampler": "comparison_sampler",
+    "sampler_comparison": "comparison_sampler",
+}
+REFLECT_READ_ONLY_KINDS: frozenset[str] = frozenset(
+    {"uniform", "read_only_storage", "texture", "sampler", "comparison_sampler"}
+)
+_SAFE_UNRESOLVED_LABEL_RE = re.compile(r"^[A-Za-z0-9_.$<>\[\]-]{1,64}$")
+MAX_MESH_VERTICES = 256
+MAX_MESH_PRIMITIVES = 256
+MAX_MESH_VERTEX_WORDS = 64
+SINGLE_SIDE_REGISTRATION_MAX_BYTES = 4 * 1024 * 1024  # 4 MiB heuristic for registration part
 
 _SAFE_SIDE_MODULE_NAME_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE
@@ -520,12 +550,17 @@ def _empty_guest_manifest_info() -> dict[str, Any]:
         "ok": True,
         "guest_modules": [],
         "bink2scarlett_present": False,
+        "side_modules_declared": False,
+        "side_modules": [],
+        "side_module_sizes": [],
+        "split_strategy": None,
+        "split_modules": None,
         "warnings": [],
     }
 
 
 def inspect_guest_manifest(web_dist: Path) -> tuple[dict[str, Any], list[str]]:
-    """Inspect optional `guest_manifest.json` inside `--web-dist` for lifted guest modules."""
+    """Inspect optional `guest_manifest.json` inside `--web-dist` for lifted guest modules and side-module layout."""
     info = _empty_guest_manifest_info()
     warnings: list[str] = []
 
@@ -607,7 +642,169 @@ def inspect_guest_manifest(web_dist: Path) -> tuple[dict[str, Any], list[str]]:
 
     info["guest_modules"] = guest_modules
     info["bink2scarlett_present"] = any(_is_bink2scarlett_module(m) for m in guest_modules)
+
+    # Optional sideModules (list of safe sibling *.wasm filenames)
+    raw_side_modules = doc.get("sideModules")
+    if raw_side_modules is None and "side_modules" in doc:
+        raw_side_modules = doc.get("side_modules")
+    if raw_side_modules is not None:
+        if not isinstance(raw_side_modules, list):
+            msg = f"{GUEST_MANIFEST_NAME} 'sideModules' must be a list"
+            info["ok"] = False
+            info["warnings"].append(msg)
+            warnings.append(msg)
+        else:
+            info["side_modules_declared"] = True
+            declared_sides: list[str] = []
+            seen_sides: set[str] = set()
+            for idx, item in enumerate(raw_side_modules):
+                if not isinstance(item, str) or not item.strip():
+                    msg = f"{GUEST_MANIFEST_NAME} 'sideModules[{idx}]' must be a non-empty string"
+                    info["ok"] = False
+                    info["warnings"].append(msg)
+                    warnings.append(msg)
+                    continue
+                cleaned_side = _sanitize_guest_module_label(item)
+                if not cleaned_side or not is_safe_side_module_name(cleaned_side):
+                    msg = (
+                        f"{GUEST_MANIFEST_NAME} 'sideModules[{idx}]' has unsafe "
+                        f"side module filename '{sanitize_text(cleaned_side or item)}'"
+                    )
+                    info["ok"] = False
+                    info["warnings"].append(msg)
+                    warnings.append(msg)
+                    continue
+                if cleaned_side.lower() not in seen_sides:
+                    seen_sides.add(cleaned_side.lower())
+                    declared_sides.append(cleaned_side)
+            info["side_modules"] = declared_sides
+
+    # Optional sideModuleSizes (list of objects with sanitized name/role)
+    raw_side_sizes = doc.get("sideModuleSizes")
+    if raw_side_sizes is None and "side_module_sizes" in doc:
+        raw_side_sizes = doc.get("side_module_sizes")
+    if raw_side_sizes is not None:
+        if not isinstance(raw_side_sizes, list):
+            msg = f"{GUEST_MANIFEST_NAME} 'sideModuleSizes' must be a list"
+            info["ok"] = False
+            info["warnings"].append(msg)
+            warnings.append(msg)
+        else:
+            parsed_sizes: list[dict[str, Any]] = []
+            for idx, item in enumerate(raw_side_sizes):
+                if not isinstance(item, Mapping):
+                    msg = f"{GUEST_MANIFEST_NAME} 'sideModuleSizes[{idx}]' must be a JSON object"
+                    info["ok"] = False
+                    info["warnings"].append(msg)
+                    warnings.append(msg)
+                    continue
+                raw_name = item.get("name")
+                clean_name = (
+                    _sanitize_guest_module_label(raw_name)
+                    if isinstance(raw_name, str) and raw_name.strip()
+                    else ""
+                )
+                raw_role = item.get("role")
+                clean_role = (
+                    sanitize_text(raw_role.strip())
+                    if isinstance(raw_role, str) and raw_role.strip()
+                    else None
+                )
+                entry_dict: dict[str, Any] = {
+                    "name": clean_name,
+                    "role": clean_role,
+                }
+                wasm_bytes_val = item.get("wasmBytes")
+                if wasm_bytes_val is None and "wasm_bytes" in item:
+                    wasm_bytes_val = item.get("wasm_bytes")
+                if (
+                    isinstance(wasm_bytes_val, int)
+                    and not isinstance(wasm_bytes_val, bool)
+                    and wasm_bytes_val >= 0
+                ):
+                    entry_dict["wasm_bytes"] = int(wasm_bytes_val)
+                parsed_sizes.append(entry_dict)
+            info["side_module_sizes"] = parsed_sizes
+
+    # Optional splitStrategy
+    raw_strategy = doc.get("splitStrategy")
+    if raw_strategy is None and "split_strategy" in doc:
+        raw_strategy = doc.get("split_strategy")
+    if raw_strategy is not None:
+        if isinstance(raw_strategy, str) and raw_strategy.strip():
+            info["split_strategy"] = sanitize_text(raw_strategy.strip())
+        else:
+            msg = f"{GUEST_MANIFEST_NAME} 'splitStrategy' must be a non-empty string"
+            info["ok"] = False
+            info["warnings"].append(msg)
+            warnings.append(msg)
+
+    # Optional splitModules
+    raw_split_modules = doc.get("splitModules")
+    if raw_split_modules is None and "split_modules" in doc:
+        raw_split_modules = doc.get("split_modules")
+    if raw_split_modules is not None:
+        if (
+            isinstance(raw_split_modules, int)
+            and not isinstance(raw_split_modules, bool)
+            and raw_split_modules >= 0
+        ):
+            info["split_modules"] = int(raw_split_modules)
+        else:
+            msg = f"{GUEST_MANIFEST_NAME} 'splitModules' must be a non-negative integer"
+            info["ok"] = False
+            info["warnings"].append(msg)
+            warnings.append(msg)
+
     return info, warnings
+
+
+def _classify_side_module_layout(
+    side_entries: Sequence[Mapping[str, Any]],
+    guest_manifest_info: Mapping[str, Any],
+) -> str:
+    """Classify the side-module layout as monolithic, single-side-module, or multi-part."""
+    count = len(side_entries)
+    if count == 0:
+        return "monolithic"
+    if count == 1:
+        return "single-side-module"
+    if count == 2:
+        side_sizes = guest_manifest_info.get("side_module_sizes") or []
+        if isinstance(side_sizes, list) and len(side_sizes) == 2:
+            roles = [
+                str(entry.get("role") or "").strip().lower()
+                for entry in side_sizes
+                if isinstance(entry, Mapping)
+            ]
+            if any(roles):
+                reg_count = sum(1 for r in roles if r == "registration" or "reg" in r)
+                if reg_count == 1:
+                    return "single-side-module"
+                if all(r == "code" for r in roles) and guest_manifest_info.get("split_modules") != 1:
+                    return "multi-part"
+
+        if guest_manifest_info.get("split_modules") == 1:
+            return "single-side-module"
+
+        declared = [
+            str(name).lower()
+            for name in (guest_manifest_info.get("side_modules") or [])
+        ]
+        if declared == ["guest_part_0.wasm", "guest_part_1.wasm"]:
+            return "single-side-module"
+
+        disk_by_name = {
+            str(entry.get("name", "")).lower(): int(entry.get("size_bytes", 0))
+            for entry in side_entries
+        }
+        if set(disk_by_name.keys()) == {"guest_part_0.wasm", "guest_part_1.wasm"}:
+            p0 = disk_by_name["guest_part_0.wasm"]
+            p1 = disk_by_name["guest_part_1.wasm"]
+            if p1 <= SINGLE_SIDE_REGISTRATION_MAX_BYTES or (p0 > 0 and p1 < p0):
+                return "single-side-module"
+
+    return "multi-part"
 
 
 def _read_uleb128_u32(
@@ -786,10 +983,14 @@ def verify_web_dist(
     section: dict[str, Any] = {
         "status": "fail",
         "bundle_mode": "unknown",
+        "side_module_layout": "monolithic",
         "runtime_js": runtime_js_info,
         "runtime_wasm": runtime_wasm_info,
         "side_modules": [],
         "side_module_count": 0,
+        "expected_side_modules": [],
+        "missing_side_modules": [],
+        "stale_side_modules": [],
         "skipped_escaping_symlinks": 0,
         "rejected_unsafe_names": [],
         "runtime_wasm_bytes": 0,
@@ -1038,11 +1239,45 @@ def verify_web_dist(
         and all(item["v8_limit_ok"] for item in side_entries)
     )
 
-    # ---- Optional guest_manifest.json (lifted guest modules & Bink2Scarlett readiness) ----
+    # ---- Optional guest_manifest.json (lifted guest modules, sideModules consistency & Bink2Scarlett) ----
     guest_manifest_info, gm_warnings = inspect_guest_manifest(web_dist)
     section["guest_manifest"] = guest_manifest_info
     section["bink2scarlett_present"] = bool(guest_manifest_info["bink2scarlett_present"])
     warnings.extend(gm_warnings)
+
+    section["side_module_layout"] = _classify_side_module_layout(
+        side_entries, guest_manifest_info
+    )
+
+    if guest_manifest_info["present"] and guest_manifest_info["side_modules_declared"]:
+        expected_sides = list(guest_manifest_info["side_modules"])
+        disk_names = [item["name"] for item in side_entries]
+        disk_lower = {name.lower() for name in disk_names}
+        expected_lower = {name.lower() for name in expected_sides}
+
+        missing_sides = [name for name in expected_sides if name.lower() not in disk_lower]
+        stale_sides = [
+            name
+            for name in disk_names
+            if name.lower().startswith("guest_part_")
+            and name.lower().endswith(".wasm")
+            and name.lower() not in expected_lower
+        ]
+
+        section["expected_side_modules"] = expected_sides
+        section["missing_side_modules"] = missing_sides
+        section["stale_side_modules"] = stale_sides
+
+        for missing_name in missing_sides:
+            errors.append(
+                f"{GUEST_MANIFEST_NAME} declares side module '{missing_name}' "
+                f"which is missing in web-dist"
+            )
+        if stale_sides:
+            warnings.append(
+                f"stale side module(s) in web-dist not listed in {GUEST_MANIFEST_NAME} "
+                f"sideModules: " + ", ".join(stale_sides)
+            )
 
     section["status"] = "pass" if len(errors) == 0 else "fail"
 
@@ -1501,7 +1736,7 @@ def verify_boot_dir(boot_dir: Path) -> tuple[dict[str, Any], list[str], list[str
 
 
 def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, Any], list[str]]:
-    """Safely validate a `.wgsl.pack` (`WGPK` v1) binary matching `shaders/src/pack.rs`."""
+    """Safely validate a `.wgsl.pack` (`WGPK` v1 or v2) binary matching `shaders/src/pack.rs`."""
     safe_name = sanitize_text(pack_name)
     errors: list[str] = []
     warnings: list[str] = []
@@ -1511,6 +1746,7 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
     table_ok = False
     bounds_ok = False
     version: int | None = None
+    entry_bytes: int | None = None
     entry_count: int | None = None
     flags: int | None = None
     data_start_offset: int | None = None
@@ -1531,6 +1767,8 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                 "table_ok": False,
                 "bounds_ok": False,
                 "version": None,
+                "entry_bytes": None,
+                "is_v2": False,
                 "entry_count": None,
                 "flags": None,
                 "data_start_offset": None,
@@ -1568,14 +1806,17 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                         entry_count = int(count)
                         flags = int(hdr_flags)
 
-                        if ver != WGPK_VERSION:
+                        if ver not in WGPK_SUPPORTED_VERSIONS:
                             errors.append(
                                 f"{safe_name} has unsupported WGPK version {ver} "
-                                f"(expected {WGPK_VERSION})"
+                                f"(expected 1 or 2)"
                             )
                         else:
                             header_ok = True
-                            table_bytes = count * WGPK_ENTRY_BYTES
+                            is_v2 = ver == WGPK_VERSION_V2
+                            entry_bytes = WGPK_ENTRY_BYTES_V2 if is_v2 else WGPK_ENTRY_BYTES
+                            max_offset_limit = WGPK_MAX_U64 if is_v2 else WGPK_MAX_U32
+                            table_bytes = count * entry_bytes
                             data_start = WGPK_HEADER_BYTES + table_bytes
                             data_start_offset = data_start
                             if data_start > size_bytes:
@@ -1584,24 +1825,43 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                                     f"entry_count={count} requires {data_start} bytes, "
                                     f"file is {size_bytes} bytes"
                                 )
+                            elif not is_v2 and data_start > WGPK_MAX_U32:
+                                errors.append(
+                                    f"{safe_name} entry table size overflows uint32 "
+                                    f"for entry_count={count}"
+                                )
                             else:
-                                # Stream-check every 20-byte entry table record without
-                                # loading the full WGSL payloads into memory.
-                                table_raw = fh.read(table_bytes)
-                                if len(table_raw) < table_bytes:
-                                    errors.append(
-                                        f"{safe_name} truncated while reading entry table"
-                                    )
-                                else:
-                                    table_ok = True
-                                    highest_end = data_start
-                                    entry_errors_reported = 0
-                                    suppressed_entry_errors = 0
-                                    for idx in range(count):
-                                        base = idx * WGPK_ENTRY_BYTES
-                                        _h, stage_raw, _res, offset, length = (
-                                            WGPK_ENTRY_STRUCT.unpack_from(table_raw, base)
+                                # Stream-read the TOC in fixed-size chunks without
+                                # allocating the entire table at once or reading WGSL payloads.
+                                highest_end = data_start
+                                entry_errors_reported = 0
+                                suppressed_entry_errors = 0
+                                processed = 0
+                                table_truncated = False
+
+                                while processed < count:
+                                    batch = min(WGPK_TOC_CHUNK_ENTRIES, count - processed)
+                                    chunk_len = batch * entry_bytes
+                                    chunk = fh.read(chunk_len)
+                                    if len(chunk) < chunk_len:
+                                        errors.append(
+                                            f"{safe_name} truncated while reading entry table"
                                         )
+                                        table_truncated = True
+                                        break
+
+                                    for rel_idx in range(batch):
+                                        idx = processed + rel_idx
+                                        base = rel_idx * entry_bytes
+                                        if is_v2:
+                                            _h, stage_raw, _res, length, offset = (
+                                                WGPK_ENTRY_STRUCT_V2.unpack_from(chunk, base)
+                                            )
+                                        else:
+                                            _h, stage_raw, _res, offset, length = (
+                                                WGPK_ENTRY_STRUCT_V1.unpack_from(chunk, base)
+                                            )
+
                                         if stage_raw not in WGPK_VALID_STAGES:
                                             invalid_stage_entries += 1
                                             if entry_errors_reported < WGPK_MAX_ENTRY_ERRORS:
@@ -1616,7 +1876,7 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                                         payload_end = offset + length
                                         if (
                                             offset < data_start
-                                            or payload_end > WGPK_MAX_U32
+                                            or payload_end > max_offset_limit
                                             or payload_end > size_bytes
                                         ):
                                             out_of_bounds_entries += 1
@@ -1626,9 +1886,10 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                                                         f"overlaps header/entry table "
                                                         f"(offset {offset} < data_start {data_start})"
                                                     )
-                                                elif payload_end > WGPK_MAX_U32:
+                                                elif payload_end > max_offset_limit:
+                                                    bits = 64 if is_v2 else 32
                                                     reason = (
-                                                        f"range overflows uint32 "
+                                                        f"range overflows uint{bits} "
                                                         f"[{offset}..+{length}]"
                                                     )
                                                 else:
@@ -1646,6 +1907,10 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
                                         elif payload_end > highest_end:
                                             highest_end = payload_end
 
+                                    processed += batch
+
+                                if not table_truncated:
+                                    table_ok = True
                                     if suppressed_entry_errors > 0:
                                         errors.append(
                                             f"{safe_name} has {suppressed_entry_errors} "
@@ -1669,6 +1934,8 @@ def inspect_wgsl_pack_file(pack_name: str, pack_path: Path) -> tuple[dict[str, A
             "table_ok": table_ok,
             "bounds_ok": bounds_ok,
             "version": version,
+            "entry_bytes": entry_bytes,
+            "is_v2": bool(version == WGPK_VERSION_V2),
             "entry_count": entry_count,
             "flags": flags,
             "data_start_offset": data_start_offset,
@@ -1708,11 +1975,100 @@ def validate_inline_sampler_source(source: Any) -> bool | None:
     )
 
 
+def validate_root_descriptor_source(source: Any) -> bool | None:
+    """Validate a v2 `root_descriptor` source with optional `table_byte_offset` (multiple of 32).
+
+    Returns:
+    - `None` when `source` is not a `root_descriptor: true` source.
+    - `True` when valid.
+    - `False` when malformed.
+    """
+    if not isinstance(source, Mapping) or source.get("root_descriptor") is not True:
+        return None
+    if "user_sgpr" in source and not _is_valid_uint32(source["user_sgpr"]):
+        return False
+    if "table_byte_offset" in source:
+        tbo = source["table_byte_offset"]
+        return _is_valid_uint32(tbo) and tbo % 32 == 0
+    return True
+
+
+def validate_unresolved_source(source: Any, kind: Any) -> bool | None:
+    """Validate a v3 `unresolved` reflection binding source.
+
+    Returns:
+    - `None` when `source` does not contain `"unresolved"`.
+    - `True` when `source` has sole key `"unresolved"` set to `True` or a safe non-empty
+      label AND `kind` is a read-only binding kind (never writable `storage`/`storage_texture`).
+    - `False` when malformed or used on a writable/unknown binding kind.
+    """
+    if not isinstance(source, Mapping) or "unresolved" not in source:
+        return None
+    if len(source) != 1:
+        return False
+    mark = source["unresolved"]
+    mark_ok = mark is True or (
+        isinstance(mark, str)
+        and bool(mark.strip())
+        and _SAFE_UNRESOLVED_LABEL_RE.match(mark) is not None
+    )
+    if not mark_ok:
+        return False
+    norm_kind = (
+        REFLECT_KIND_MAP.get(kind.strip().lower())
+        if isinstance(kind, str)
+        else None
+    )
+    return norm_kind in REFLECT_READ_ONLY_KINDS
+
+
+def validate_mesh_output(mesh_output: Any) -> bool:
+    """Validate optional `mesh_output` metadata (max_vertices/max_primitives 1..256, vertex_words 4..64 % 4 == 0)."""
+    if not isinstance(mesh_output, Mapping):
+        return False
+    mv = mesh_output.get("max_vertices")
+    mp = mesh_output.get("max_primitives")
+    vw = mesh_output.get("vertex_words")
+    if not (_is_valid_uint32(mv) and _is_valid_uint32(mp) and _is_valid_uint32(vw)):
+        return False
+    return (
+        1 <= mv <= MAX_MESH_VERTICES
+        and 1 <= mp <= MAX_MESH_PRIMITIVES
+        and 4 <= vw <= MAX_MESH_VERTEX_WORDS
+        and vw % 4 == 0
+    )
+
+
+def _empty_reflect_sidecar_result(
+    safe_name: str,
+    size_bytes: int,
+    warnings: list[str],
+) -> dict[str, Any]:
+    return {
+        "name": safe_name,
+        "size_bytes": size_bytes,
+        "schema": None,
+        "version": None,
+        "stage_count": 0,
+        "inline_sampler_stages": 0,
+        "inline_sampler_bindings": 0,
+        "malformed_inline_samplers": 0,
+        "malformed_root_descriptors": 0,
+        "unresolved_source_stages": 0,
+        "unresolved_source_bindings": 0,
+        "malformed_v3_sources": 0,
+        "mesh_output_stages": 0,
+        "malformed_mesh_outputs": 0,
+        "ok": False,
+        "warnings": warnings,
+    }
+
+
 def inspect_reflect_sidecar_file(
     sidecar_name: str,
     sidecar_path: Path,
 ) -> tuple[dict[str, Any], list[str]]:
-    """Inspect a `<pack>.reflect.json` stage-reflection sidecar for `#950` inline samplers."""
+    """Inspect a `<pack>.reflect.json` stage-reflection sidecar (v1/v2/v3)."""
     safe_name = sanitize_text(sidecar_name)
     warnings: list[str] = []
     size_bytes = 0
@@ -1722,89 +2078,44 @@ def inspect_reflect_sidecar_file(
     inline_sampler_stages = 0
     inline_sampler_bindings = 0
     malformed_inline_samplers = 0
+    malformed_root_descriptors = 0
+    unresolved_source_stages = 0
+    unresolved_source_bindings = 0
+    malformed_v3_sources = 0
+    mesh_output_stages = 0
+    malformed_mesh_outputs = 0
 
     try:
         size_bytes = get_file_size(sidecar_path)
     except OSError as exc:
         warnings.append(_sanitize_os_error(sidecar_name, exc))
-        return (
-            {
-                "name": safe_name,
-                "size_bytes": 0,
-                "schema": None,
-                "version": None,
-                "stage_count": 0,
-                "inline_sampler_stages": 0,
-                "inline_sampler_bindings": 0,
-                "malformed_inline_samplers": 0,
-                "ok": False,
-                "warnings": warnings,
-            },
-            warnings,
-        )
+        return _empty_reflect_sidecar_result(safe_name, 0, warnings), warnings
 
     try:
         raw_text = sidecar_path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
         warnings.append(f"{safe_name}: failed to read ({sanitize_text(type(exc).__name__)})")
-        return (
-            {
-                "name": safe_name,
-                "size_bytes": size_bytes,
-                "schema": None,
-                "version": None,
-                "stage_count": 0,
-                "inline_sampler_stages": 0,
-                "inline_sampler_bindings": 0,
-                "malformed_inline_samplers": 0,
-                "ok": False,
-                "warnings": warnings,
-            },
-            warnings,
-        )
+        return _empty_reflect_sidecar_result(safe_name, size_bytes, warnings), warnings
 
     try:
         doc = json.loads(raw_text)
     except json.JSONDecodeError as exc:
         warnings.append(f"{safe_name}: invalid JSON ({sanitize_text(type(exc).__name__)})")
-        return (
-            {
-                "name": safe_name,
-                "size_bytes": size_bytes,
-                "schema": None,
-                "version": None,
-                "stage_count": 0,
-                "inline_sampler_stages": 0,
-                "inline_sampler_bindings": 0,
-                "malformed_inline_samplers": 0,
-                "ok": False,
-                "warnings": warnings,
-            },
-            warnings,
-        )
+        return _empty_reflect_sidecar_result(safe_name, size_bytes, warnings), warnings
 
     if not isinstance(doc, Mapping):
         warnings.append(f"{safe_name}: top-level JSON value must be an object")
-        return (
-            {
-                "name": safe_name,
-                "size_bytes": size_bytes,
-                "schema": None,
-                "version": None,
-                "stage_count": 0,
-                "inline_sampler_stages": 0,
-                "inline_sampler_bindings": 0,
-                "malformed_inline_samplers": 0,
-                "ok": False,
-                "warnings": warnings,
-            },
-            warnings,
-        )
+        return _empty_reflect_sidecar_result(safe_name, size_bytes, warnings), warnings
 
     raw_schema = doc.get("schema")
     if raw_schema is not None:
         if isinstance(raw_schema, str) and raw_schema.strip():
             schema_str = sanitize_text(raw_schema.strip())
+            if schema_str != REFLECT_SIDECAR_SCHEMA:
+                warnings.append(
+                    f"{safe_name}: unsupported reflection sidecar schema '{schema_str}' "
+                    f"(expected '{REFLECT_SIDECAR_SCHEMA}')"
+                )
         else:
             warnings.append(f"{safe_name}: 'schema' must be a non-empty string")
 
@@ -1812,6 +2123,11 @@ def inspect_reflect_sidecar_file(
     if raw_version is not None:
         if isinstance(raw_version, int) and not isinstance(raw_version, bool) and raw_version >= 1:
             version_int = int(raw_version)
+            if version_int not in REFLECT_SIDECAR_SUPPORTED_VERSIONS:
+                warnings.append(
+                    f"{safe_name}: unsupported reflection sidecar version {version_int} "
+                    f"(expected 1, 2, or 3)"
+                )
         else:
             warnings.append(f"{safe_name}: 'version' must be a positive integer")
 
@@ -1825,6 +2141,17 @@ def inspect_reflect_sidecar_file(
             if not isinstance(stage_entry, Mapping):
                 warnings.append(f"{safe_name}: stage '{safe_stage_key}' must be a JSON object")
                 continue
+
+            if "mesh_output" in stage_entry and stage_entry["mesh_output"] is not None:
+                if validate_mesh_output(stage_entry["mesh_output"]):
+                    mesh_output_stages += 1
+                else:
+                    malformed_mesh_outputs += 1
+                    warnings.append(
+                        f"{safe_name}: stage '{safe_stage_key}' has malformed mesh_output "
+                        f"(max_vertices/max_primitives in 1..256, vertex_words in 4..64 multiple of 4)"
+                    )
+
             bindings = stage_entry.get("bindings")
             if bindings is None:
                 continue
@@ -1833,10 +2160,12 @@ def inspect_reflect_sidecar_file(
                 continue
 
             stage_has_inline_sampler = False
+            stage_has_unresolved = False
             for b_idx, binding in enumerate(bindings):
                 if not isinstance(binding, Mapping):
                     continue
-                inline_status = validate_inline_sampler_source(binding.get("source"))
+                source = binding.get("source")
+                inline_status = validate_inline_sampler_source(source)
                 if inline_status is True:
                     inline_sampler_bindings += 1
                     stage_has_inline_sampler = True
@@ -1846,8 +2175,32 @@ def inspect_reflect_sidecar_file(
                         f"{safe_name}: stage '{safe_stage_key}' binding[{b_idx}] has "
                         f"malformed inline_sampler (sdwords must be 4 uint32 integers)"
                     )
+
+                root_desc_status = validate_root_descriptor_source(source)
+                if root_desc_status is False:
+                    malformed_root_descriptors += 1
+                    warnings.append(
+                        f"{safe_name}: stage '{safe_stage_key}' binding[{b_idx}] has "
+                        f"malformed v2 root_descriptor source "
+                        f"(table_byte_offset must be a uint32 multiple of 32)"
+                    )
+
+                unresolved_status = validate_unresolved_source(source, binding.get("kind"))
+                if unresolved_status is True:
+                    unresolved_source_bindings += 1
+                    stage_has_unresolved = True
+                elif unresolved_status is False:
+                    malformed_v3_sources += 1
+                    warnings.append(
+                        f"{safe_name}: stage '{safe_stage_key}' binding[{b_idx}] has "
+                        f"malformed v3 unresolved source (must be sole key with true or "
+                        f"safe label on a read-only binding kind)"
+                    )
+
             if stage_has_inline_sampler:
                 inline_sampler_stages += 1
+            if stage_has_unresolved:
+                unresolved_source_stages += 1
 
     return (
         {
@@ -1859,6 +2212,12 @@ def inspect_reflect_sidecar_file(
             "inline_sampler_stages": inline_sampler_stages,
             "inline_sampler_bindings": inline_sampler_bindings,
             "malformed_inline_samplers": malformed_inline_samplers,
+            "malformed_root_descriptors": malformed_root_descriptors,
+            "unresolved_source_stages": unresolved_source_stages,
+            "unresolved_source_bindings": unresolved_source_bindings,
+            "malformed_v3_sources": malformed_v3_sources,
+            "mesh_output_stages": mesh_output_stages,
+            "malformed_mesh_outputs": malformed_mesh_outputs,
             "ok": len(warnings) == 0,
             "warnings": warnings,
         },
@@ -1867,7 +2226,7 @@ def inspect_reflect_sidecar_file(
 
 
 def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], list[str]]:
-    """Verify `*.wgsl.pack` (`WGPK`) shader bundles and optional `*.reflect.json` sidecars."""
+    """Verify `*.wgsl.pack` (`WGPK` v1/v2) shader bundles and optional `*.reflect.json` sidecars."""
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -1890,6 +2249,12 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
         "inline_sampler_stages": 0,
         "inline_sampler_bindings": 0,
         "malformed_inline_samplers": 0,
+        "malformed_root_descriptors": 0,
+        "unresolved_source_stages": 0,
+        "unresolved_source_bindings": 0,
+        "malformed_v3_sources": 0,
+        "mesh_output_stages": 0,
+        "malformed_mesh_outputs": 0,
         "reflect_sidecars": [],
     }
 
@@ -1964,6 +2329,12 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
     inline_sampler_stages = 0
     inline_sampler_bindings = 0
     malformed_inline_samplers = 0
+    malformed_root_descriptors = 0
+    unresolved_source_stages = 0
+    unresolved_source_bindings = 0
+    malformed_v3_sources = 0
+    mesh_output_stages = 0
+    malformed_mesh_outputs = 0
     for sidecar_name, sidecar_path in sidecar_candidates:
         sc_info, sc_warnings = inspect_reflect_sidecar_file(sidecar_name, sidecar_path)
         sidecars.append(sc_info)
@@ -1972,6 +2343,12 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
         inline_sampler_stages += int(sc_info["inline_sampler_stages"])
         inline_sampler_bindings += int(sc_info["inline_sampler_bindings"])
         malformed_inline_samplers += int(sc_info["malformed_inline_samplers"])
+        malformed_root_descriptors += int(sc_info["malformed_root_descriptors"])
+        unresolved_source_stages += int(sc_info["unresolved_source_stages"])
+        unresolved_source_bindings += int(sc_info["unresolved_source_bindings"])
+        malformed_v3_sources += int(sc_info["malformed_v3_sources"])
+        mesh_output_stages += int(sc_info["mesh_output_stages"])
+        malformed_mesh_outputs += int(sc_info["malformed_mesh_outputs"])
         if sc_info["ok"]:
             valid_sidecars += 1
 
@@ -1982,6 +2359,12 @@ def verify_shaders_dir(shaders_dir: Path) -> tuple[dict[str, Any], list[str], li
     section["inline_sampler_stages"] = inline_sampler_stages
     section["inline_sampler_bindings"] = inline_sampler_bindings
     section["malformed_inline_samplers"] = malformed_inline_samplers
+    section["malformed_root_descriptors"] = malformed_root_descriptors
+    section["unresolved_source_stages"] = unresolved_source_stages
+    section["unresolved_source_bindings"] = unresolved_source_bindings
+    section["malformed_v3_sources"] = malformed_v3_sources
+    section["mesh_output_stages"] = mesh_output_stages
+    section["malformed_mesh_outputs"] = malformed_mesh_outputs
 
     if not candidates:
         errors.append("no .wgsl.pack shader bundles found in shaders-dir")
@@ -2064,6 +2447,12 @@ def _empty_shaders_section() -> dict[str, Any]:
         "inline_sampler_stages": 0,
         "inline_sampler_bindings": 0,
         "malformed_inline_samplers": 0,
+        "malformed_root_descriptors": 0,
+        "unresolved_source_stages": 0,
+        "unresolved_source_bindings": 0,
+        "malformed_v3_sources": 0,
+        "mesh_output_stages": 0,
+        "malformed_mesh_outputs": 0,
         "reflect_sidecars": [],
     }
 
@@ -2157,6 +2546,7 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"Browser Boot Bundle Verification [{status_label}]{strict_tag}",
         f"  Wasm64 [{str(wasm.get('status', 'fail')).upper()}]: {paths.get('web_dist')} "
         f"(mode={wasm.get('bundle_mode')}, "
+        f"layout={wasm.get('side_module_layout', 'monolithic')}, "
         f"side_modules={wasm.get('side_module_count', 0)}, "
         f"total={wasm.get('total_wasm_bytes', 0)} bytes / "
         f"{_format_mib(int(wasm.get('total_wasm_bytes', 0)))}, "
@@ -2215,10 +2605,13 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             f"total={shaders.get('total_pack_bytes', 0)} bytes)"
         )
         for pack in shaders.get("packs") or []:
+            ver = pack.get("version")
+            ver_tag = f"v{ver}" if ver is not None else "v?"
             lines.append(
                 f"    pack {pack.get('name')}: {'OK' if pack.get('ok') else 'FAIL'} "
                 f"({pack.get('size_bytes', 0)} bytes, "
                 f"magic={'WGPK' if pack.get('magic_ok') else 'BAD'}, "
+                f"{ver_tag}, "
                 f"entries={pack.get('entry_count')}, "
                 f"bounds={'OK' if pack.get('bounds_ok') else 'FAIL'})"
             )
@@ -2230,7 +2623,11 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                 f"(stages={shaders.get('reflect_stage_count', 0)}, "
                 f"inline_sampler_stages={shaders.get('inline_sampler_stages', 0)}, "
                 f"inline_sampler_bindings={shaders.get('inline_sampler_bindings', 0)}, "
-                f"malformed_inline_samplers={shaders.get('malformed_inline_samplers', 0)})"
+                f"malformed_inline_samplers={shaders.get('malformed_inline_samplers', 0)}, "
+                f"unresolved_source_stages={shaders.get('unresolved_source_stages', 0)}, "
+                f"unresolved_source_bindings={shaders.get('unresolved_source_bindings', 0)}, "
+                f"malformed_v3_sources={shaders.get('malformed_v3_sources', 0)}, "
+                f"mesh_output_stages={shaders.get('mesh_output_stages', 0)})"
             )
     else:
         lines.append("  Shaders [SKIPPED]: --shaders-dir not specified")
