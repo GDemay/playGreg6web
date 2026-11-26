@@ -39,6 +39,7 @@ const char* work_name(Work w) {
     case Work::DispatchesNoShaderModule: return "dispatches_no_shader_module";
     case Work::DispatchesDroppedByBridge: return "dispatches_dropped_by_bridge";
     case Work::IndirectExecutionsSkipped: return "indirect_executions_skipped";
+    case Work::IndirectExecutionsEmitted: return "indirect_executions_emitted";
     case Work::TextureUploads: return "texture_uploads";
     case Work::BufferUploads: return "buffer_uploads";
     case Work::CopiesSkipped: return "copies_skipped";

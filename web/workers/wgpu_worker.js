@@ -39,6 +39,9 @@ const OPCODES = Object.freeze({
   SET_BIND_GROUP2: 33,
   CREATE_SAMPLER2: 34,
   CREATE_TEXTURE2: 35,
+  DRAW_INDIRECT: 36,
+  DRAW_INDEXED_INDIRECT: 37,
+  DISPATCH_INDIRECT: 38,
 });
 
 const SHADER_STAGE = Object.freeze({
@@ -284,6 +287,9 @@ const OPCODE_NAMES = Object.freeze({
   [OPCODES.SET_BIND_GROUP2]: 'SetBindGroup2',
   [OPCODES.CREATE_SAMPLER2]: 'CreateSampler2',
   [OPCODES.CREATE_TEXTURE2]: 'CreateTexture2',
+  [OPCODES.DRAW_INDIRECT]: 'DrawIndirect',
+  [OPCODES.DRAW_INDEXED_INDIRECT]: 'DrawIndexedIndirect',
+  [OPCODES.DISPATCH_INDIRECT]: 'DispatchIndirect',
 });
 
 function wgslDeclaresGroup0(code) {
@@ -9764,6 +9770,39 @@ class WgpuCommandProcessor {
           }
           break;
         }
+        case 'drawIndirect':
+        case 'drawIndexedIndirect': {
+          const indexed = cmd.type === 'drawIndexedIndirect';
+          const opName = indexed ? 'DrawIndexedIndirect' : 'DrawIndirect';
+          const buffer = this.buffers.get(cmd.bufferId);
+          if (!buffer) {
+            this._recordOpValidationError(opName, `indirect buffer ${cmd.bufferId} not found`);
+            break;
+          }
+          executeRenderDraw(opName, 1, 1, (pass) => {
+            if (indexed) {
+              pass.drawIndexedIndirect(buffer, cmd.offset);
+            } else {
+              pass.drawIndirect(buffer, cmd.offset);
+            }
+          });
+          break;
+        }
+        case 'dispatchIndirect': {
+          const pass = ensureComputePass();
+          const buffer = this.buffers.get(cmd.bufferId);
+          if (!buffer) {
+            this._recordOpValidationError('DispatchIndirect', `indirect buffer ${cmd.bufferId} not found`);
+            break;
+          }
+          try {
+            pass.dispatchWorkgroupsIndirect(buffer, cmd.offset);
+            this._computeDispatchCount += 1;
+          } catch (err) {
+            this._recordOpValidationError('DispatchIndirect', err);
+          }
+          break;
+        }
         default:
           if (typeof cmd.run === 'function') {
             const meta = cmd._wgpuMeta || null;
@@ -10614,6 +10653,25 @@ class WgpuCommandProcessor {
             workgroupY: view.getUint32(payloadOffset + 4, true),
             workgroupZ: view.getUint32(payloadOffset + 8, true),
           });
+        }
+        break;
+      case OPCODES.DRAW_INDIRECT:
+      case OPCODES.DRAW_INDEXED_INDIRECT:
+      case OPCODES.DISPATCH_INDIRECT:
+        // G66 ExecuteIndirect: GpuIndirectPayload { u32 buffer_id, u32 reserved, u64 offset }.
+        if (payloadBytes >= 16) {
+          this._passCommands.push({
+            type:
+              opcode === OPCODES.DRAW_INDIRECT
+                ? 'drawIndirect'
+                : opcode === OPCODES.DRAW_INDEXED_INDIRECT
+                  ? 'drawIndexedIndirect'
+                  : 'dispatchIndirect',
+            bufferId: view.getUint32(payloadOffset, true),
+            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
+          });
+        } else {
+          this._recordOpValidationError(OPCODE_NAMES[opcode], `truncated payload (${payloadBytes}B < 16B)`);
         }
         break;
       default:

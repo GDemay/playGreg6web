@@ -488,6 +488,9 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
     case GpuOpcode::WriteBuffer:
     case GpuOpcode::WriteTexture:
     case GpuOpcode::SetIndexBuffer:
+    case GpuOpcode::DrawIndirect:
+    case GpuOpcode::DrawIndexedIndirect:
+    case GpuOpcode::DispatchIndirect:
         if (len >= 4) {
             fn(read_u32(p));
         }
@@ -1853,8 +1856,14 @@ HResult Device::CreateCommandSignature(const GuestCommandSignatureDesc* desc, ui
         note_bad_argument("CreateCommandSignature: invalid descriptor");
         return kEInvalidArg;
     }
+    // D3D12_INDIRECT_ARGUMENT_DESC is 16 bytes, Type first; the work argument is the last one.
+    uint32_t work_type = CommandSignature::kIndirectArgUnknown;
+    if (!com::read_guest(desc->pArgumentDescs + uint64_t{desc->NumArgumentDescs - 1} * 16u, &work_type,
+                         sizeof(work_type))) {
+        work_type = CommandSignature::kIndirectArgUnknown;
+    }
     auto signature = com::create_object<CommandSignature>(com::implements(kID3D12CommandSignature), device_ref(this),
-                                                          desc->ByteStride, desc->NumArgumentDescs);
+                                                          desc->ByteStride, desc->NumArgumentDescs, work_type);
     return hand_out(std::move(signature), riid, out);
 }
 
