@@ -135,6 +135,7 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "chrome-full-boot": "chrome-full-boot",
     "chrome-menu-flow": "chrome-menu-flow",
     "chrome-menu-flow-2": "chrome-menu-flow-2",
+    "chrome-menu-flow-4": "chrome-menu-flow-4",
     "intro-watch": "intro-watch",
     "legal-notices": "legal-notices",
     "menu-flow": "menu-flow",
@@ -203,6 +204,9 @@ BOOT_OPTIONS_UINT_KEYS: frozenset[str] = frozenset(
         "max_dispatches",
         "arena_log_limit",
         "import_trace_limit",
+        "fence_publish_lag_frames",
+        "fence_publish_cap_ms",
+        "present_max_interval",
     }
 )
 BOOT_OPTIONS_BOOL_KEYS: frozenset[str] = frozenset(
@@ -2678,7 +2682,7 @@ def _extract_rolling_fps_stats(
 
 
 def _extract_swapchain_probe_stats(probe: Mapping[str, Any] | None) -> dict[str, int | float | None]:
-    """Extract swapchain non-black probe telemetry when present in `boot_state.gpu`."""
+    """Extract swapchain non-black probe telemetry across `boot_state.gpu`, `boot_state`, and `diagnostics`."""
     out: dict[str, int | float | None] = {
         "swapchainProbeCount": None,
         "lastSampledMaxLuma": None,
@@ -2692,31 +2696,38 @@ def _extract_swapchain_probe_stats(probe: Mapping[str, Any] | None) -> dict[str,
     boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
     gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
     diag = probe.get("diagnostics") if isinstance(probe.get("diagnostics"), Mapping) else {}
+    diag_gpu = diag.get("gpu") if isinstance(diag.get("gpu"), Mapping) else {}
+    probe_gpu = probe.get("gpu") if isinstance(probe.get("gpu"), Mapping) else {}
 
-    for src in (gpu, boot_state, diag):
-        if out["swapchainProbeCount"] is None:
-            for key in ("swapchainProbeCount", "swapchain_probe_count"):
-                val = _sanitize_optional_non_negative_int(src.get(key))
-                if val is not None:
-                    out["swapchainProbeCount"] = val
-                    break
-        if out["lastSampledMaxLuma"] is None:
-            for key in ("lastSampledMaxLuma", "last_sampled_max_luma"):
-                raw_val = src.get(key)
-                int_val = _sanitize_optional_non_negative_int(raw_val)
-                if int_val is not None:
-                    out["lastSampledMaxLuma"] = int_val
-                    break
-                float_val = _sanitize_non_negative_float(raw_val, digits=2)
-                if float_val is not None:
-                    out["lastSampledMaxLuma"] = float_val
-                    break
-        if out["suppressedBlackFrames"] is None:
-            for key in ("suppressedBlackFrames", "suppressed_black_frames"):
-                val = _sanitize_optional_non_negative_int(src.get(key))
-                if val is not None:
-                    out["suppressedBlackFrames"] = val
-                    break
+    probe_counts: list[int] = []
+    max_lumas: list[int | float] = []
+    suppressed_counts: list[int] = []
+
+    for src in (gpu, boot_state, diag, diag_gpu, probe_gpu, probe):
+        for key in ("swapchainProbeCount", "swapchain_probe_count"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                probe_counts.append(val)
+        for key in ("lastSampledMaxLuma", "last_sampled_max_luma", "maxLuma", "max_luma"):
+            raw_val = src.get(key)
+            int_val = _sanitize_optional_non_negative_int(raw_val)
+            if int_val is not None:
+                max_lumas.append(int_val)
+                continue
+            float_val = _sanitize_non_negative_float(raw_val, digits=2)
+            if float_val is not None:
+                max_lumas.append(float_val)
+        for key in ("suppressedBlackFrames", "suppressed_black_frames"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                suppressed_counts.append(val)
+
+    if probe_counts:
+        out["swapchainProbeCount"] = max(probe_counts)
+    if max_lumas:
+        out["lastSampledMaxLuma"] = max(max_lumas)
+    if suppressed_counts:
+        out["suppressedBlackFrames"] = max(suppressed_counts)
     return out
 
 
