@@ -120,6 +120,7 @@ we cap `maxStorageBufferBindingSize` at 512 MiB (`web/workers/wgpu_worker.js:150
   - An address is a `vec2<u32>` (lo, hi); the page is `addr >> 16`.
   - A load from a page that is not resident returns 0, a store to one is dropped, and each such
     access bumps `rt_fault` (an atomic counter). Nothing traps.
+    The GPU also logs the page in `pg6_rt_stats` (word 1 = log attempts, words 2..31 = page + 1); the runtime reads this back, makes those pages resident for the next dispatch and zeroes words 1..31 (`FaultTracker`).
   - Atomics available on arena words: u32 add, sub, min, max, and, or, xor, exchange and
     compare-exchange.
   - Float min/max (the builder's refit) maps onto u32 min/max through the order-preserving bit
@@ -259,7 +260,10 @@ handles kind-6 instances by transforming the ray. It is **not** used for shading
 - **C2. Reflection.** Per program:
   - `bvh_ops: u32`, `raw_address: bool`, `atomic64: bool`;
   - `address_sources`: the root params, root constants and spilled user-data dwords that feed
-    FLAT/GLOBAL or BVH addresses, so the runtime can make them resident.
+    FLAT/GLOBAL or BVH addresses, so the runtime can make them resident. Wire format (runtime/gpu/rt_residency.h):
+    a JSON array of `{"kind": "root_param"|"root_constants"|"user_data", "index": n, "dword": d (root_constants), "extent": bytes (default 1), "bvh_root": bool}`;
+    the address is the 64-bit value at root param `index`, at dwords `dword`,`dword+1` of root-constant param `index`, or at user-data dwords `index`,`index+1`;
+    `bvh_root` makes the whole structure (and, through a TLAS, its BLASes) resident instead of `extent` bytes.
   - The runtime keys the gate on these fields.
 - **C3. Arena bindings.** Proposal: group 3, bindings 16-21. Group 3 binding 0 is already the
   push-constant block. Names:
