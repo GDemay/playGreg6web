@@ -58,6 +58,9 @@ struct PcmRing {
 
 // Producer side: pushes up to `count` samples, returns how many fitted.
 size_t ring_push(PcmRing& ring, const float* samples, size_t count);
+// Producer side: pushes up to `frame_count` whole interleaved stereo frames (always an even float
+// count so partial overruns never swap L/R channels). Returns how many frames fitted.
+size_t ring_push_frames(PcmRing& ring, const float* samples, size_t frame_count);
 // Consumer side: pops up to `count` samples, returns how many were read.
 size_t ring_pop(PcmRing& ring, float* out, size_t count);
 // Samples currently readable.
@@ -65,6 +68,17 @@ size_t ring_readable(const PcmRing& ring);
 
 // The runtime's one ring (fed by the mixer below).
 PcmRing& runtime_ring();
+
+// Lock-free diagnostic counters for the mixer and output ring, cleared by reset().
+struct AudioDownmixStats {
+    uint64_t periods_flushed = 0;
+    uint64_t frames_pushed = 0;
+    uint64_t frames_dropped = 0;
+    uint64_t staged_spatial_dropped = 0;
+    uint64_t staged_render_dropped = 0;
+    uint64_t non_finite_clamped = 0;
+};
+AudioDownmixStats stats();
 
 // Mixer: stages sources between guest threads and the period tick. push_* may be called from
 // any guest thread; flush_period() (the engine tick) sums one period of every source into the
