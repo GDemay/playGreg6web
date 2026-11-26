@@ -481,6 +481,7 @@ enum class Counter : size_t {
     NativePipelineStatesRefused, // slot 57 with DeviceOptions::refuse_native_pipelines
     DxilStagesJoined,            // DXIL stage joined to an indexed native stage
     DxilStagesNotJoined,
+    DxilStagesEmbeddedNative,    // DXIL stage running the native code its own container carries (G66)
     PlaceholderPipelineStates,
     UnknownOverrideKinds,
     ComputePipelineStatesX,      // slot 62 (DXIL)
