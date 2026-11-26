@@ -1553,6 +1553,9 @@ enum PatchedDescBase {
         user_sgpr: u32,
         table_byte_offset: u32,
     },
+    RootDescriptor {
+        user_sgpr: u32,
+    },
     DynamicHeap(DynamicHeapOrigin),
     CbvIndexedHeap(CbvIndexedHeapSource),
     LaneIndexedHeap(LaneIndexedHeapSource),
@@ -1731,13 +1734,16 @@ impl OriginState {
         }
     }
 
-    fn initial(stage: ShaderStage, is_mesh: bool) -> Self {
+    fn initial(stage: ShaderStage, is_mesh: bool, unreferenced_user_sgprs: &[bool; 32]) -> Self {
         let mut origins = [SgprOrigin::Unwritten; TRACKED_SGPR_COUNT];
         // Seed console ABI initial SGPR origins:
         //   Graphics (including mesh stages translated to compute):
         //             system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
         //             user data starts at s8..s31; scratch SGPRs s32..s105 & vcc start Unwritten.
         //   Compute:  system SGPRs in s0..s3, user data starts at s4..s31; s32..s105 & vcc Unwritten.
+        // Any register in user_base..32 that is never read as a user-data scalar/pointer anywhere
+        // in the program (e.g. a pure scratch SGPR used only to hold a conditionally loaded T#/V#/S#)
+        // stays Unwritten so CFG merges across guarded descriptor loads do not lose provenance.
         let user_base: usize = if stage == ShaderStage::Compute && !is_mesh {
             4
         } else {
@@ -1750,10 +1756,12 @@ impl OriginState {
             origins[0] = SgprOrigin::VbTablePtr { byte_offset: 0 };
         }
         for (sgpr, slot) in origins.iter_mut().enumerate().take(32).skip(user_base) {
-            *slot = SgprOrigin::UserTable {
-                user_sgpr: sgpr as u32,
-                byte_offset: 0,
-            };
+            if !unreferenced_user_sgprs[sgpr] {
+                *slot = SgprOrigin::UserTable {
+                    user_sgpr: sgpr as u32,
+                    byte_offset: 0,
+                };
+            }
         }
         Self {
             origins,
@@ -1772,6 +1780,7 @@ impl OriginState {
         def_aliases: &mut BTreeMap<usize, BTreeSet<usize>>,
     ) -> bool {
         let mut changed = false;
+        let prev_self_vgprs = self.vgpr_uniform_origins;
         for (dst, &src) in self.origins.iter_mut().zip(other.origins.iter()) {
             let joined = join_cfg_origin(*dst, src, Some(def_aliases));
             if joined != *dst {
@@ -1790,22 +1799,20 @@ impl OriginState {
                 changed = true;
             }
         }
-        if !self.lane_origins.is_empty() {
+        if !self.lane_origins.is_empty() || !other.lane_origins.is_empty() {
             let mut to_remove = Vec::new();
             for (&k, dst) in &mut self.lane_origins {
-                match other.lane_origins.get(&k).copied() {
-                    Some(src) => {
-                        let joined = join_cfg_origin(*dst, src, Some(def_aliases));
-                        if matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
-                            to_remove.push(k);
-                        } else if joined != *dst {
-                            *dst = joined;
-                            changed = true;
-                        }
-                    }
-                    None => {
-                        to_remove.push(k);
-                    }
+                let src = other
+                    .lane_origins
+                    .get(&k)
+                    .copied()
+                    .unwrap_or_else(|| other.vgpr_origin(k.0));
+                let joined = join_cfg_origin(*dst, src, Some(def_aliases));
+                if matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
+                    to_remove.push(k);
+                } else if joined != *dst {
+                    *dst = joined;
+                    changed = true;
                 }
             }
             if !to_remove.is_empty() {
@@ -1813,6 +1820,19 @@ impl OriginState {
                     self.lane_origins.remove(&k);
                 }
                 changed = true;
+            }
+            for (&k, &src) in &other.lane_origins {
+                if !self.lane_origins.contains_key(&k) {
+                    let self_default = prev_self_vgprs
+                        .get(usize::from(k.0))
+                        .copied()
+                        .unwrap_or(SgprOrigin::Unknown);
+                    let joined = join_cfg_origin(self_default, src, Some(def_aliases));
+                    if !matches!(joined, SgprOrigin::Unknown | SgprOrigin::Unwritten) {
+                        self.lane_origins.insert(k, joined);
+                        changed = true;
+                    }
+                }
             }
         }
         if self.pending_xor != other.pending_xor && self.pending_xor.is_some() {
@@ -2124,7 +2144,6 @@ fn patched_desc_word_of(origin: SgprOrigin) -> Option<(usize, PatchedDescBase)> 
             def_inst_idx,
             user_sgpr,
             table_byte_offset,
-            addr_offset: 0,
             ..
         } => Some((
             def_inst_idx,
@@ -2318,8 +2337,8 @@ fn combine_add_lane_origins(a: SgprOrigin, b: SgprOrigin) -> Option<SgprOrigin> 
         | (SgprOrigin::UserTable { byte_offset: 0, .. }, SgprOrigin::ScaledLaneIndex(h)) => {
             Some(SgprOrigin::LaneIndexedHeapPtr(h))
         }
-        (SgprOrigin::ScaledLaneIndex(h), SgprOrigin::Unknown)
-        | (SgprOrigin::Unknown, SgprOrigin::ScaledLaneIndex(h))
+        (SgprOrigin::ScaledLaneIndex(h), SgprOrigin::Unknown | SgprOrigin::TableDesc { .. })
+        | (SgprOrigin::Unknown | SgprOrigin::TableDesc { .. }, SgprOrigin::ScaledLaneIndex(h))
             if h.shift > 0 || h.stride > 1 =>
         {
             Some(SgprOrigin::LaneIndexedHeapPtr(h))
@@ -2366,6 +2385,144 @@ fn combine_add_lane_origins(a: SgprOrigin, b: SgprOrigin) -> Option<SgprOrigin> 
             Some(SgprOrigin::ScaledLaneIndex(h))
         }
         _ => None,
+    }
+}
+
+fn combine_add_origins(a: SgprOrigin, b: SgprOrigin) -> Option<SgprOrigin> {
+    match (a, b) {
+        (
+            SgprOrigin::UserTable {
+                user_sgpr: base_user_sgpr,
+                byte_offset: 0,
+            },
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr: index_user_sgpr,
+                stride,
+                shift: index_shift,
+            },
+        )
+        | (
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr: index_user_sgpr,
+                stride,
+                shift: index_shift,
+            },
+            SgprOrigin::UserTable {
+                user_sgpr: base_user_sgpr,
+                byte_offset: 0,
+            },
+        ) => {
+            if base_user_sgpr == index_user_sgpr {
+                stride
+                    .checked_add(1)
+                    .map(|new_stride| make_scaled_user_sgpr(index_user_sgpr, new_stride))
+            } else {
+                Some(SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
+                    base_user_sgpr,
+                    stride,
+                    index_user_sgpr,
+                    index_shift,
+                }))
+            }
+        }
+        (
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+            SgprOrigin::TableDesc { .. },
+        )
+        | (
+            SgprOrigin::TableDesc { .. },
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+        ) if shift > 0 && stride == (1u32 << shift) => {
+            Some(SgprOrigin::CbvIndexedHeapPtr(CbvIndexedHeapSource {
+                cbv: CbvRefSource::RootConstants { user_sgpr },
+                byte_offset: 0,
+                shift,
+                bit_offset: 0,
+                mask: u32::MAX,
+                stride,
+            }))
+        }
+        (
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+            SgprOrigin::Unknown,
+        )
+        | (
+            SgprOrigin::Unknown,
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+        ) if shift >= 4 && stride == (1u32 << shift) => {
+            Some(SgprOrigin::CbvIndexedHeapPtr(CbvIndexedHeapSource {
+                cbv: CbvRefSource::RootConstants { user_sgpr },
+                byte_offset: 0,
+                shift,
+                bit_offset: 0,
+                mask: u32::MAX,
+                stride,
+            }))
+        }
+        (SgprOrigin::UserTable { byte_offset: 0, .. }, SgprOrigin::ScaledCbvDword(h))
+        | (SgprOrigin::ScaledCbvDword(h), SgprOrigin::UserTable { byte_offset: 0, .. }) => {
+            Some(SgprOrigin::CbvIndexedHeapPtr(h))
+        }
+        (SgprOrigin::Unknown | SgprOrigin::TableDesc { .. }, SgprOrigin::ScaledCbvDword(h))
+        | (SgprOrigin::ScaledCbvDword(h), SgprOrigin::Unknown | SgprOrigin::TableDesc { .. })
+            if h.shift > 0 =>
+        {
+            Some(SgprOrigin::CbvIndexedHeapPtr(h))
+        }
+        (
+            SgprOrigin::UserTable { byte_offset: 0, .. },
+            SgprOrigin::CbvDword {
+                cbv,
+                byte_offset,
+                bit_offset,
+                mask,
+            },
+        )
+        | (
+            SgprOrigin::CbvDword {
+                cbv,
+                byte_offset,
+                bit_offset,
+                mask,
+            },
+            SgprOrigin::UserTable { byte_offset: 0, .. },
+        ) => Some(SgprOrigin::CbvIndexedHeapPtr(CbvIndexedHeapSource {
+            cbv,
+            byte_offset,
+            shift: 0,
+            bit_offset,
+            mask,
+            stride: 0,
+        })),
+        _ => {
+            if let Some(lane_combined) = combine_add_lane_origins(a, b) {
+                Some(lane_combined)
+            } else if let (Some((u0, s0)), Some((u1, s1))) =
+                (scaled_user_sgpr_stride(a), scaled_user_sgpr_stride(b))
+                && u0 == u1
+                && let Some(new_stride) = s0.checked_add(s1)
+            {
+                Some(make_scaled_user_sgpr(u0, new_stride))
+            } else {
+                None
+            }
+        }
     }
 }
 
@@ -2481,11 +2638,14 @@ fn join_cfg_origin(
                 def_inst_idx: d2,
                 origin: h2,
             },
-        ) if h1 == h2 => {
+        ) if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base => {
             record_def_alias(def_aliases, d1, d2);
             SgprOrigin::LaneIndexedHeapDesc {
                 def_inst_idx: d1.min(d2),
-                origin: h1,
+                origin: LaneIndexedHeapSource {
+                    max_count: h1.max_count.max(h2.max_count),
+                    ..h1
+                },
             }
         }
         (
@@ -2678,11 +2838,14 @@ fn merge_select_origin(
                 def_inst_idx: d2,
                 origin: h2,
             },
-        ) if h1 == h2 => {
+        ) if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base => {
             record_def_alias(def_aliases, d1, d2);
             SgprOrigin::LaneIndexedHeapDesc {
                 def_inst_idx: d1.min(d2),
-                origin: h1,
+                origin: LaneIndexedHeapSource {
+                    max_count: h1.max_count.max(h2.max_count),
+                    ..h1
+                },
             }
         }
         (
@@ -2831,6 +2994,10 @@ fn apply_const_offset(origin: SgprOrigin, delta: i32) -> SgprOrigin {
         | SgprOrigin::LaneIndexedHeapDesc { .. } => origin,
         SgprOrigin::VbDesc { .. } if delta == 0 => origin,
         SgprOrigin::RawTableDesc { .. } if delta == 0 => origin,
+        SgprOrigin::PatchedDescWord {
+            base: PatchedDescBase::RootDescriptor { .. },
+            ..
+        } => origin,
         SgprOrigin::PatchedDescWord { .. } if delta == 0 => origin,
         _ => SgprOrigin::Unknown,
     }
@@ -2862,6 +3029,18 @@ fn apply_or_const(origin: SgprOrigin, imm: u32, inst_idx: usize) -> SgprOrigin {
                 byte_offset: byte_offset.saturating_add(imm as i32),
             }
         }
+        // GFX10.3 synthesized root V# word-1 attribute/stride patching (e.g. `s_or_b32 w1, w1, stride<<16`).
+        SgprOrigin::UserTable { user_sgpr, .. }
+        | SgprOrigin::MaskedUserSgpr { user_sgpr, .. }
+        | SgprOrigin::CbvDword {
+            cbv: CbvRefSource::RootConstants { user_sgpr },
+            byte_offset: 0,
+            bit_offset: 0,
+            ..
+        } => SgprOrigin::PatchedDescWord {
+            def_inst_idx: inst_idx,
+            base: PatchedDescBase::RootDescriptor { user_sgpr },
+        },
         SgprOrigin::VbTablePtr { byte_offset }
             if imm < 0x0010_0000 && byte_offset >= 0 && ((byte_offset as u32) & imm) == 0 =>
         {
@@ -2891,15 +3070,14 @@ fn apply_or_const(origin: SgprOrigin, imm: u32, inst_idx: usize) -> SgprOrigin {
         {
             origin
         }
-        // GFX10.3 V# word-3 OOB_SELECT attribute patch (`s_or_b32 w3, w3, 0x30000000`).
-        other if matches!(imm, 0x1000_0000 | 0x2000_0000 | 0x3000_0000) => {
+        // GFX10.3 V#/T# in-place descriptor word patching (e.g. OOB_SELECT, format/type/mip/DCC/stride).
+        other => {
             if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
                 SgprOrigin::PatchedDescWord { def_inst_idx, base }
             } else {
                 SgprOrigin::Unknown
             }
         }
-        _ => SgprOrigin::Unknown,
     }
 }
 
@@ -3106,7 +3284,7 @@ fn apply_and_const(origin: SgprOrigin, mask: u32, inst_idx: usize) -> SgprOrigin
             cbv_dword,
         },
         // GFX10.3 structured-buffer V# word-1 stride clear (`0xc000ffff`) and word-3 OOB_SELECT
-        // clear (`0xcfffffff`), preserving descriptor provenance strictly for V# recovery.
+        // clear (`0xcfffffff`), preserving descriptor provenance strictly for V#/T# recovery.
         other if matches!(mask, 0xC000_FFFF | 0xCFFF_FFFF) => {
             if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
                 SgprOrigin::PatchedDescWord { def_inst_idx, base }
@@ -3124,7 +3302,15 @@ fn apply_and_const(origin: SgprOrigin, mask: u32, inst_idx: usize) -> SgprOrigin
             bit_offset: 0,
             mask,
         },
-        _ => SgprOrigin::Unknown,
+        // Non-CBV-dword descriptor words (loaded heap V#/T#/S#, VbDesc, already-patched words,
+        // or non-CBV-dword TableDesc) masked in place retain `PatchedDescWord` for V#/T# recovery.
+        other => {
+            if let Some((def_inst_idx, base)) = patched_desc_word_of(other) {
+                SgprOrigin::PatchedDescWord { def_inst_idx, base }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
     }
 }
 
@@ -3311,6 +3497,13 @@ fn apply_bfe_u32_const(origin: SgprOrigin, param: u32, inst_idx: usize) -> SgprO
     } else {
         (1u32 << width) - 1
     };
+    if matches!(
+        origin,
+        SgprOrigin::ScaledCbvDword(_) | SgprOrigin::ScaledLaneIndex(_)
+    ) {
+        let shifted = apply_lshr_const(origin, off, inst_idx);
+        return apply_and_const(shifted, bfe_mask, inst_idx);
+    }
     let (cbv, byte_offset, prev_bit, prev_mask) = match origin {
         SgprOrigin::CbvDword {
             cbv,
@@ -3712,12 +3905,100 @@ fn is_synthesized_root_vsharp(
         || matches!(w3, SgprOrigin::ConstImmediate { .. })
 }
 
+/// Returns `true` when word 1 of a synthesized root-descriptor V# matches the high 32-bit word
+/// of a 64-bit Root Descriptor VA (`user_sgpr + 1`, optionally masked/OR'd with stride/swizzle
+/// bits) or a 32-bit constant high address word.
+fn is_root_vsharp_hi_word(w1: SgprOrigin, lo_user_sgpr: u32) -> bool {
+    let hi_user_sgpr = lo_user_sgpr.saturating_add(1);
+    match w1 {
+        SgprOrigin::UserTable { user_sgpr, .. }
+        | SgprOrigin::MaskedUserSgpr { user_sgpr, .. }
+        | SgprOrigin::CbvDword {
+            cbv: CbvRefSource::RootConstants { user_sgpr },
+            byte_offset: 0,
+            bit_offset: 0,
+            ..
+        }
+        | SgprOrigin::PatchedDescWord {
+            base: PatchedDescBase::RootDescriptor { user_sgpr },
+            ..
+        } => user_sgpr == hi_user_sgpr,
+        SgprOrigin::ConstImmediate { .. } => true,
+        _ => false,
+    }
+}
+
+fn recover_desc_origin_from_word_pair(
+    origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
+    idx: usize,
+    wi: usize,
+    wj: usize,
+) -> Option<SgprOrigin> {
+    let byte_delta_i = (wi * 4) as u32;
+    let byte_delta_diff = ((wj - wi) * 4) as u32;
+    let (di, bi) = patched_desc_word_of(origin_at(origins, idx + wi))?;
+    let (dj, bj) = patched_desc_word_of(origin_at(origins, idx + wj))?;
+    if di != dj {
+        return None;
+    }
+    match (bi, bj) {
+        (
+            PatchedDescBase::Table {
+                user_sgpr: ui,
+                table_byte_offset: oi,
+            },
+            PatchedDescBase::Table {
+                user_sgpr: uj,
+                table_byte_offset: oj,
+            },
+        ) if ui == uj
+            && oi >= byte_delta_i
+            && oj == oi.saturating_add(byte_delta_diff) =>
+        {
+            Some(SgprOrigin::TableDesc {
+                def_inst_idx: di,
+                user_sgpr: ui,
+                table_byte_offset: oi - byte_delta_i,
+                addr_offset: 0,
+                cbv_dword: None,
+            })
+        }
+        (PatchedDescBase::DynamicHeap(hi), PatchedDescBase::DynamicHeap(hj)) if hi == hj => {
+            Some(SgprOrigin::DynamicHeapDesc {
+                def_inst_idx: di,
+                origin: hi,
+            })
+        }
+        (PatchedDescBase::CbvIndexedHeap(hi), PatchedDescBase::CbvIndexedHeap(hj)) if hi == hj => {
+            Some(SgprOrigin::CbvIndexedHeapDesc {
+                def_inst_idx: di,
+                origin: hi,
+            })
+        }
+        (PatchedDescBase::LaneIndexedHeap(hi), PatchedDescBase::LaneIndexedHeap(hj))
+            if hi == hj =>
+        {
+            Some(SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: di,
+                origin: hi,
+            })
+        }
+        (PatchedDescBase::Vb { vb_slot: vi }, PatchedDescBase::Vb { vb_slot: vj }) if vi == vj => {
+            Some(SgprOrigin::VbDesc {
+                def_inst_idx: di,
+                vb_slot: vi,
+            })
+        }
+        _ => None,
+    }
+}
+
 /// Resolve the 4-SGPR V# or S# descriptor origin at `s[rsrc_sgpr .. rsrc_sgpr+3]`.
 ///
 /// Checks word 0 (`origins[rsrc_sgpr]`) first; when word 0 is `Unknown`/`Unwritten`/`PatchedDescWord`
 /// (e.g. after dynamic base-address arithmetic or partial self-overwrite across a CFG merge), falls
-/// back to matching descriptor word pairs `(2, 3)`, `(1, 3)`, or `(1, 2)` (including GFX10.3
-/// structured-buffer `PatchedDescWord` words) from the same defining instruction.
+/// back to synthesized root-descriptor verification or matching descriptor word pairs (including
+/// GFX10.3 `PatchedDescWord` words) from the same defining instruction.
 fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: u8) -> SgprOrigin {
     let idx = usize::from(rsrc_sgpr);
     let Some(&w0) = origins.get(idx) else {
@@ -3738,82 +4019,37 @@ fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
         return w0;
     }
     if idx.checked_add(3).is_some_and(|end| end < origins.len()) {
-        for (wi, wj) in [(2usize, 3usize), (1, 3), (1, 2)] {
-            let byte_delta_i = (wi * 4) as u32;
-            let byte_delta_diff = ((wj - wi) * 4) as u32;
-            if let (Some((di, bi)), Some((dj, bj))) = (
-                patched_desc_word_of(origin_at(origins, idx + wi)),
-                patched_desc_word_of(origin_at(origins, idx + wj)),
-            ) && di == dj
-            {
-                match (bi, bj) {
-                    (
-                        PatchedDescBase::Table {
-                            user_sgpr: ui,
-                            table_byte_offset: oi,
-                        },
-                        PatchedDescBase::Table {
-                            user_sgpr: uj,
-                            table_byte_offset: oj,
-                        },
-                    ) if ui == uj
-                        && oi >= byte_delta_i
-                        && oj == oi.saturating_add(byte_delta_diff) =>
-                    {
-                        return SgprOrigin::TableDesc {
-                            def_inst_idx: di,
-                            user_sgpr: ui,
-                            table_byte_offset: oi - byte_delta_i,
-                            addr_offset: 0,
-                            cbv_dword: None,
-                        };
-                    }
-                    (PatchedDescBase::DynamicHeap(hi), PatchedDescBase::DynamicHeap(hj))
-                        if hi == hj =>
-                    {
-                        return SgprOrigin::DynamicHeapDesc {
-                            def_inst_idx: di,
-                            origin: hi,
-                        };
-                    }
-                    (PatchedDescBase::CbvIndexedHeap(hi), PatchedDescBase::CbvIndexedHeap(hj))
-                        if hi == hj =>
-                    {
-                        return SgprOrigin::CbvIndexedHeapDesc {
-                            def_inst_idx: di,
-                            origin: hi,
-                        };
-                    }
-                    (PatchedDescBase::LaneIndexedHeap(hi), PatchedDescBase::LaneIndexedHeap(hj))
-                        if hi == hj =>
-                    {
-                        return SgprOrigin::LaneIndexedHeapDesc {
-                            def_inst_idx: di,
-                            origin: hi,
-                        };
-                    }
-                    (
-                        PatchedDescBase::Vb { vb_slot: vi },
-                        PatchedDescBase::Vb { vb_slot: vj },
-                    ) if vi == vj => {
-                        return SgprOrigin::VbDesc {
-                            def_inst_idx: di,
-                            vb_slot: vi,
-                        };
-                    }
-                    _ => {}
-                }
+        if let SgprOrigin::PatchedDescWord {
+            base: PatchedDescBase::RootDescriptor { user_sgpr },
+            ..
+        } = w0
+            && is_synthesized_root_vsharp(origins, rsrc_sgpr)
+            && is_root_vsharp_hi_word(origin_at(origins, idx + 1), user_sgpr)
+        {
+            return SgprOrigin::UserTable {
+                user_sgpr,
+                byte_offset: 0,
+            };
+        }
+        for (wi, wj) in [(2usize, 3usize), (1, 3), (1, 2), (0, 1), (0, 2), (0, 3)] {
+            if let Some(recovered) = recover_desc_origin_from_word_pair(origins, idx, wi, wj) {
+                return recovered;
             }
         }
     }
     w0
 }
 
-/// Resolve the 8-SGPR T# image descriptor origin at `s[rsrc_sgpr .. rsrc_sgpr+7]`.
+/// Resolve the 8-SGPR (or 4-SGPR when `r128 == true`) T# image descriptor origin at
+/// `s[rsrc_sgpr .. rsrc_sgpr + word_count]`.
 ///
-/// Checks word 0 first; if word 0 was overwritten/clobbered, checks consecutive descriptor word
-/// pairs `(2, 3)`, `(4, 5)`, and `(6, 7)` from the same defining instruction.
-fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: u8) -> SgprOrigin {
+/// Checks word 0 first; if word 0 was overwritten/patched/clobbered, recovers from any matching
+/// pair of intact or `PatchedDescWord` words within the T# from the same defining instruction.
+fn resolve_tsharp_origin(
+    origins: &[SgprOrigin; TRACKED_SGPR_COUNT],
+    rsrc_sgpr: u8,
+    r128: bool,
+) -> SgprOrigin {
     let idx = usize::from(rsrc_sgpr);
     let Some(&w0) = origins.get(idx) else {
         return SgprOrigin::Unknown;
@@ -3822,6 +4058,7 @@ fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
         w0,
         SgprOrigin::Unknown
             | SgprOrigin::Unwritten
+            | SgprOrigin::PatchedDescWord { .. }
             | SgprOrigin::CbvDword { .. }
             | SgprOrigin::ScaledCbvDword(_)
             | SgprOrigin::LaneIndex { .. }
@@ -3831,90 +4068,17 @@ fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
     ) {
         return w0;
     }
-    for word_lo in [2usize, 4, 6] {
-        let Some(lo_idx) = idx.checked_add(word_lo) else {
-            break;
-        };
-        let Some(hi_idx) = lo_idx.checked_add(1) else {
-            break;
-        };
-        if hi_idx >= origins.len() {
-            break;
-        }
-        let byte_delta = (word_lo * 4) as u32;
-        match (origin_at(origins, lo_idx), origin_at(origins, hi_idx)) {
-            (
-                SgprOrigin::TableDesc {
-                    def_inst_idx: d_lo,
-                    user_sgpr: u_lo,
-                    table_byte_offset: o_lo,
-                    ..
-                },
-                SgprOrigin::TableDesc {
-                    def_inst_idx: d_hi,
-                    user_sgpr: u_hi,
-                    table_byte_offset: o_hi,
-                    ..
-                },
-            ) if d_lo == d_hi
-                && u_lo == u_hi
-                && o_lo >= byte_delta
-                && o_hi == o_lo + 4 =>
-            {
-                return SgprOrigin::TableDesc {
-                    def_inst_idx: d_lo,
-                    user_sgpr: u_lo,
-                    table_byte_offset: o_lo - byte_delta,
-                    addr_offset: 0,
-                    cbv_dword: None,
-                };
+    let word_count = if r128 { 4usize } else { 8usize };
+    if idx
+        .checked_add(word_count - 1)
+        .is_some_and(|end| end < origins.len())
+    {
+        for wi in 0..word_count {
+            for wj in (wi + 1)..word_count {
+                if let Some(recovered) = recover_desc_origin_from_word_pair(origins, idx, wi, wj) {
+                    return recovered;
+                }
             }
-            (
-                SgprOrigin::DynamicHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                },
-                SgprOrigin::DynamicHeapDesc {
-                    def_inst_idx: d_hi,
-                    origin: h_hi,
-                },
-            ) if d_lo == d_hi && h_lo == h_hi => {
-                return SgprOrigin::DynamicHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                };
-            }
-            (
-                SgprOrigin::CbvIndexedHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                },
-                SgprOrigin::CbvIndexedHeapDesc {
-                    def_inst_idx: d_hi,
-                    origin: h_hi,
-                },
-            ) if d_lo == d_hi && h_lo == h_hi => {
-                return SgprOrigin::CbvIndexedHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                };
-            }
-            (
-                SgprOrigin::LaneIndexedHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                },
-                SgprOrigin::LaneIndexedHeapDesc {
-                    def_inst_idx: d_hi,
-                    origin: h_hi,
-                },
-            ) if d_lo == d_hi && h_lo == h_hi => {
-                return SgprOrigin::LaneIndexedHeapDesc {
-                    def_inst_idx: d_lo,
-                    origin: h_lo,
-                };
-            }
-            _ => {}
         }
     }
     w0
@@ -4109,6 +4273,32 @@ fn resolve_valu_lane_operand(
     }
 }
 
+#[inline]
+fn is_trackable_valu_origin(o: SgprOrigin) -> bool {
+    !matches!(o, SgprOrigin::Unknown | SgprOrigin::Unwritten)
+}
+
+fn eval_valu_add_origins(
+    o0: SgprOrigin,
+    o1: SgprOrigin,
+    c0: Option<u32>,
+    c1: Option<u32>,
+    inst_idx: usize,
+) -> SgprOrigin {
+    if let (Some(v0), Some(v1)) = (c0, c1) {
+        SgprOrigin::ConstImmediate {
+            def_inst_idx: inst_idx,
+            value: Some(v0.wrapping_add(v1)),
+        }
+    } else if let Some(imm) = c0 {
+        apply_const_offset(o1, imm as i32)
+    } else if let Some(imm) = c1 {
+        apply_const_offset(o0, imm as i32)
+    } else {
+        combine_add_origins(o0, o1).unwrap_or(SgprOrigin::Unknown)
+    }
+}
+
 fn eval_valu_lane_origin_vop2_like(
     state: &OriginState,
     vop2_op: u8,
@@ -4122,10 +4312,56 @@ fn eval_valu_lane_origin_vop2_like(
     let c0 = resolve_valu_const_u32(src0, literal, state);
     let c1 = resolve_valu_const_u32(src1, literal, state);
     let res = match vop2_op {
+        // v_cndmask_b32: preserve identical proven origin or 0-clamped lane origin
+        0x00 | 0x01 => {
+            if o0 == o1 {
+                o0
+            } else if is_const_zero(o0) && is_lane_origin(o1) {
+                o1
+            } else if is_const_zero(o1) && is_lane_origin(o0) {
+                o0
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_mul_i32_i24 / v_mul_u32_u24 (RDNA2 full-rate 24-bit integer multiply for heap strides)
+        0x09 | 0x0B => {
+            let mask24 = |v: u32| -> i32 {
+                if vop2_op == 0x09 {
+                    ((v << 8) as i32) >> 8
+                } else {
+                    (v & 0x00FF_FFFF) as i32
+                }
+            };
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(mask24(v0).wrapping_mul(mask24(v1)) as u32),
+                }
+            } else if let Some(v0) = c0 {
+                scale_user_sgpr_by_mul(o1, mask24(v0))
+            } else if let Some(v1) = c1 {
+                scale_user_sgpr_by_mul(o0, mask24(v1))
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
         // v_min_i32 / v_min_u32
         0x11 | 0x13 => {
             let signed = vop2_op == 0x11;
-            if let Some(lim) = c0 {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                let folded = if signed {
+                    (v0 as i32).min(v1 as i32) as u32
+                } else {
+                    v0.min(v1)
+                };
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(folded),
+                }
+            } else if src0 == src1 {
+                o0
+            } else if let Some(lim) = c0 {
                 apply_min_const(o1, lim, signed)
             } else if let Some(lim) = c1 {
                 apply_min_const(o0, lim, signed)
@@ -4133,17 +4369,61 @@ fn eval_valu_lane_origin_vop2_like(
                 SgprOrigin::Unknown
             }
         }
+        // v_max_i32 / v_max_u32
+        0x12 | 0x14 => {
+            let signed = vop2_op == 0x12;
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                let folded = if signed {
+                    (v0 as i32).max(v1 as i32) as u32
+                } else {
+                    v0.max(v1)
+                };
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(folded),
+                }
+            } else if src0 == src1 {
+                o0
+            } else if c0 == Some(0) && matches!(o1, SgprOrigin::LaneIndex { .. }) {
+                o1
+            } else if c1 == Some(0) && matches!(o0, SgprOrigin::LaneIndex { .. }) {
+                o0
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
         // v_lshrrev_b32: src1 >> (src0 & 31)
         0x16 => {
-            if let Some(sh) = c0 {
+            if let (Some(sh), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v1.wrapping_shr(sh & 31)),
+                }
+            } else if let Some(sh) = c0 {
                 apply_lshr_const(o1, sh & 31, inst_idx)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_ashrrev_i32: (src1 as i32) >> (src0 & 31)
+        0x18 => {
+            if let (Some(sh), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(((v1 as i32).wrapping_shr(sh & 31)) as u32),
+                }
             } else {
                 SgprOrigin::Unknown
             }
         }
         // v_lshlrev_b32: src1 << (src0 & 31)
         0x1A => {
-            if let Some(sh) = c0 {
+            if let (Some(sh), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v1.wrapping_shl(sh & 31)),
+                }
+            } else if let Some(sh) = c0 {
                 scale_user_sgpr_by_shift(o1, sh & 31)
             } else {
                 SgprOrigin::Unknown
@@ -4151,7 +4431,14 @@ fn eval_valu_lane_origin_vop2_like(
         }
         // v_and_b32
         0x1B => {
-            if let Some(m) = c0 {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0 & v1),
+                }
+            } else if src0 == src1 {
+                o0
+            } else if let Some(m) = c0 {
                 apply_and_const(o1, m, inst_idx)
             } else if let Some(m) = c1 {
                 apply_and_const(o0, m, inst_idx)
@@ -4159,19 +4446,80 @@ fn eval_valu_lane_origin_vop2_like(
                 SgprOrigin::Unknown
             }
         }
-        // v_add_nc_u32
-        0x25 => {
-            if let Some(imm) = c0 {
-                apply_const_offset(o1, imm as i32)
+        // v_or_b32
+        0x1C => {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0 | v1),
+                }
+            } else if src0 == src1 {
+                o0
+            } else if let Some(imm) = c0 {
+                apply_or_const(o1, imm, inst_idx)
             } else if let Some(imm) = c1 {
-                apply_const_offset(o0, imm as i32)
+                apply_or_const(o0, imm, inst_idx)
             } else {
-                combine_add_lane_origins(o0, o1).unwrap_or(SgprOrigin::Unknown)
+                SgprOrigin::Unknown
+            }
+        }
+        // v_xor_b32
+        0x1D => {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0 ^ v1),
+                }
+            } else if src0 == src1 {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(0),
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add_nc_u32
+        0x25 => eval_valu_add_origins(o0, o1, c0, c1, inst_idx),
+        // v_sub_nc_u32: src0 - src1
+        0x26 => {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0.wrapping_sub(v1)),
+                }
+            } else if src0 == src1 {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(0),
+                }
+            } else if let Some(imm) = c1 {
+                apply_const_offset(o0, (imm as i32).wrapping_neg())
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_subrev_nc_u32: src1 - src0
+        0x27 => {
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v1.wrapping_sub(v0)),
+                }
+            } else if src0 == src1 {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(0),
+                }
+            } else if let Some(imm) = c0 {
+                apply_const_offset(o1, (imm as i32).wrapping_neg())
+            } else {
+                SgprOrigin::Unknown
             }
         }
         _ => SgprOrigin::Unknown,
     };
-    is_lane_origin(res).then_some(res)
+    is_trackable_valu_origin(res).then_some(res)
 }
 
 fn eval_valu_lane_origin_vop3(
@@ -4194,17 +4542,137 @@ fn eval_valu_lane_origin_vop3(
         );
     }
     let res = match op {
+        // v_mad_i32_i24 / v_mad_u32_u24: src0 * src1 + src2 (common RDNA2 heap_base + idx * stride)
+        0x142 | 0x143 => {
+            let mask24 = |v: u32| -> i32 {
+                if op == 0x142 {
+                    ((v << 8) as i32) >> 8
+                } else {
+                    (v & 0x00FF_FFFF) as i32
+                }
+            };
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            let c2 = resolve_valu_const_u32(src2, literal, state);
+            let (prod, prod_c) = if let (Some(v0), Some(v1)) = (c0, c1) {
+                let p = mask24(v0).wrapping_mul(mask24(v1)) as u32;
+                (
+                    SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(p),
+                    },
+                    Some(p),
+                )
+            } else if let Some(v0) = c0 {
+                (scale_user_sgpr_by_mul(o1, mask24(v0)), None)
+            } else if let Some(v1) = c1 {
+                (scale_user_sgpr_by_mul(o0, mask24(v1)), None)
+            } else {
+                (SgprOrigin::Unknown, None)
+            };
+            eval_valu_add_origins(prod, o2, prod_c, c2, inst_idx)
+        }
         // v_bfe_u32 vdst, src0, off(src1), width(src2)
         0x148 => {
             let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
-            if is_lane_origin(o0)
-                && let (Some(off), Some(width)) = (
-                    resolve_valu_const_u32(src1, literal, state),
-                    resolve_valu_const_u32(src2, literal, state),
-                )
-            {
-                let param = (off & 31) | ((width & 0x7F) << 16);
-                apply_bfe_u32_const(o0, param, inst_idx)
+            if let (Some(off), Some(width)) = (
+                resolve_valu_const_u32(src1, literal, state),
+                resolve_valu_const_u32(src2, literal, state),
+            ) {
+                if let Some(v0) = resolve_valu_const_u32(src0, literal, state) {
+                    let o = off & 31;
+                    let w = width & 0x7F;
+                    let folded = if w == 0 {
+                        0
+                    } else if w >= 32 {
+                        v0.wrapping_shr(o)
+                    } else {
+                        v0.wrapping_shr(o) & ((1u32 << w) - 1)
+                    };
+                    SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(folded),
+                    }
+                } else {
+                    let param = (off & 31) | ((width & 0x7F) << 16);
+                    apply_bfe_u32_const(o0, param, inst_idx)
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_min3_i32 / v_min3_u32
+        0x152 | 0x153 => {
+            let signed = op == 0x152;
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            let c2 = resolve_valu_const_u32(src2, literal, state);
+            let non_const: Vec<SgprOrigin> = [(o0, c0), (o1, c1), (o2, c2)]
+                .into_iter()
+                .filter_map(|(o, c)| c.is_none().then_some(o))
+                .collect();
+            let consts: Vec<u32> = [c0, c1, c2].into_iter().flatten().collect();
+            if non_const.is_empty() && consts.len() == 3 {
+                let folded = if signed {
+                    (consts[0] as i32)
+                        .min(consts[1] as i32)
+                        .min(consts[2] as i32) as u32
+                } else {
+                    consts[0].min(consts[1]).min(consts[2])
+                };
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(folded),
+                }
+            } else if non_const.len() == 1 && !consts.is_empty() {
+                let mut cur = non_const[0];
+                for lim in consts {
+                    cur = apply_min_const(cur, lim, signed);
+                }
+                cur
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_med3_i32 / v_med3_u32: HLSL `clamp(x, 0, lim)` lowers to `v_med3_u32/i32(x, 0, lim)`
+        0x158 | 0x159 => {
+            let signed = op == 0x158;
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            let c2 = resolve_valu_const_u32(src2, literal, state);
+            let non_const: Vec<SgprOrigin> = [(o0, c0), (o1, c1), (o2, c2)]
+                .into_iter()
+                .filter_map(|(o, c)| c.is_none().then_some(o))
+                .collect();
+            let consts: Vec<u32> = [c0, c1, c2].into_iter().flatten().collect();
+            if non_const.len() == 1 && consts.len() == 2 {
+                let (lo, hi) = if signed {
+                    let a = consts[0] as i32;
+                    let b = consts[1] as i32;
+                    if a <= b { (a, b) } else { (b, a) }
+                } else {
+                    let a = consts[0];
+                    let b = consts[1];
+                    if a <= b {
+                        (a as i32, b as i32)
+                    } else {
+                        (b as i32, a as i32)
+                    }
+                };
+                if (!signed && lo == 0) || (signed && lo >= 0 && hi >= lo) {
+                    apply_min_const(non_const[0], hi as u32, signed)
+                } else {
+                    SgprOrigin::Unknown
+                }
             } else {
                 SgprOrigin::Unknown
             }
@@ -4213,29 +4681,73 @@ fn eval_valu_lane_origin_vop3(
         0x169 => {
             let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
             let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
-            if let Some(f) = resolve_valu_const_u32(src1, literal, state) {
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0.wrapping_mul(v1)),
+                }
+            } else if let Some(f) = c1 {
                 scale_user_sgpr_by_mul(o0, f as i32)
-            } else if let Some(f) = resolve_valu_const_u32(src0, literal, state) {
+            } else if let Some(f) = c0 {
                 scale_user_sgpr_by_mul(o1, f as i32)
             } else {
                 SgprOrigin::Unknown
             }
         }
-        // v_add_co_u32 vdst, sdst, src0, src1
+        // v_lshlrev_b64 v[vdst:vdst+1], shift(src0), src1_pair: low word shift
+        0x2FF => {
+            if let Some(raw_sh) = resolve_valu_const_u32(src0, literal, state) {
+                let sh = raw_sh & 63;
+                if sh < 32 {
+                    let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+                    if let Some(v1) = resolve_valu_const_u32(src1, literal, state) {
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                            value: Some(v1.wrapping_shl(sh)),
+                        }
+                    } else {
+                        scale_user_sgpr_by_shift(o1, sh)
+                    }
+                } else {
+                    SgprOrigin::Unknown
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32
         0x30F => {
             return eval_valu_lane_origin_vop2_like(state, 0x25, src0, src1, literal, inst_idx);
+        }
+        0x310 => {
+            return eval_valu_lane_origin_vop2_like(state, 0x26, src0, src1, literal, inst_idx);
+        }
+        0x319 => {
+            return eval_valu_lane_origin_vop2_like(state, 0x27, src0, src1, literal, inst_idx);
         }
         // v_lshl_add_u32 vdst, src0, shift(src1), src2: (src0 << shift) + src2
         0x346 => {
             if let Some(sh) = resolve_valu_const_u32(src1, literal, state) {
+                let sh = sh & 31;
                 let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
                 let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
-                let scaled = scale_user_sgpr_by_shift(o0, sh & 31);
-                if resolve_valu_const_u32(src2, literal, state) == Some(0) {
-                    scaled
+                let c0 = resolve_valu_const_u32(src0, literal, state);
+                let c2 = resolve_valu_const_u32(src2, literal, state);
+                let (scaled, scaled_c) = if let Some(v0) = c0 {
+                    let s = v0.wrapping_shl(sh);
+                    (
+                        SgprOrigin::ConstImmediate {
+                            def_inst_idx: inst_idx,
+                            value: Some(s),
+                        },
+                        Some(s),
+                    )
                 } else {
-                    combine_add_lane_origins(scaled, o2).unwrap_or(SgprOrigin::Unknown)
-                }
+                    (scale_user_sgpr_by_shift(o0, sh), None)
+                };
+                eval_valu_add_origins(scaled, o2, scaled_c, c2, inst_idx)
             } else {
                 SgprOrigin::Unknown
             }
@@ -4243,23 +4755,91 @@ fn eval_valu_lane_origin_vop3(
         // v_add_lshl_u32 vdst, src0, src1, shift(src2): (src0 + src1) << shift
         0x347 => {
             if let Some(sh) = resolve_valu_const_u32(src2, literal, state) {
+                let sh = sh & 31;
                 let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
                 let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
-                let sum = if let Some(imm) = resolve_valu_const_u32(src0, literal, state) {
-                    apply_const_offset(o1, imm as i32)
-                } else if let Some(imm) = resolve_valu_const_u32(src1, literal, state) {
-                    apply_const_offset(o0, imm as i32)
+                let c0 = resolve_valu_const_u32(src0, literal, state);
+                let c1 = resolve_valu_const_u32(src1, literal, state);
+                let sum = eval_valu_add_origins(o0, o1, c0, c1, inst_idx);
+                if let SgprOrigin::ConstImmediate { value: Some(v), .. } = sum {
+                    SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(v.wrapping_shl(sh)),
+                    }
                 } else {
-                    combine_add_lane_origins(o0, o1).unwrap_or(SgprOrigin::Unknown)
+                    scale_user_sgpr_by_shift(sum, sh)
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add3_u32: src0 + src1 + src2
+        0x36D => {
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            let c2 = resolve_valu_const_u32(src2, literal, state);
+            let s01 = eval_valu_add_origins(o0, o1, c0, c1, inst_idx);
+            let c01 = match s01 {
+                SgprOrigin::ConstImmediate { value, .. } => value,
+                _ => None,
+            };
+            eval_valu_add_origins(s01, o2, c01, c2, inst_idx)
+        }
+        // v_lshl_or_b32: (src0 << (src1 & 31)) | src2
+        0x36E => {
+            if let Some(sh) = resolve_valu_const_u32(src1, literal, state) {
+                let sh = sh & 31;
+                let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+                let c0 = resolve_valu_const_u32(src0, literal, state);
+                let c2 = resolve_valu_const_u32(src2, literal, state);
+                let scaled = if let Some(v0) = c0 {
+                    SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(v0.wrapping_shl(sh)),
+                    }
+                } else {
+                    scale_user_sgpr_by_shift(o0, sh)
                 };
-                scale_user_sgpr_by_shift(sum, sh & 31)
+                if let Some(imm) = c2 {
+                    apply_or_const(scaled, imm, inst_idx)
+                } else {
+                    SgprOrigin::Unknown
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_and_or_b32: (src0 & src1) | src2
+        0x36F | 0x371 => {
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            let c0 = resolve_valu_const_u32(src0, literal, state);
+            let c1 = resolve_valu_const_u32(src1, literal, state);
+            let c2 = resolve_valu_const_u32(src2, literal, state);
+            let masked = if let (Some(v0), Some(v1)) = (c0, c1) {
+                SgprOrigin::ConstImmediate {
+                    def_inst_idx: inst_idx,
+                    value: Some(v0 & v1),
+                }
+            } else if let Some(m) = c0 {
+                apply_and_const(o1, m, inst_idx)
+            } else if let Some(m) = c1 {
+                apply_and_const(o0, m, inst_idx)
+            } else {
+                SgprOrigin::Unknown
+            };
+            if let Some(imm) = c2 {
+                apply_or_const(masked, imm, inst_idx)
             } else {
                 SgprOrigin::Unknown
             }
         }
         _ => SgprOrigin::Unknown,
     };
-    is_lane_origin(res).then_some(res)
+    is_trackable_valu_origin(res).then_some(res)
 }
 
 fn step_origin_state(
@@ -4413,6 +4993,47 @@ fn step_origin_state(
                                     },
                                 )
                             } else {
+                                let lo = patched_desc_word_of(dst_lo).map_or(
+                                    SgprOrigin::Unknown,
+                                    |(def_inst_idx, base)| SgprOrigin::PatchedDescWord {
+                                        def_inst_idx,
+                                        base,
+                                    },
+                                );
+                                let hi = patched_desc_word_of(dst_hi).map_or(
+                                    SgprOrigin::Unknown,
+                                    |(def_inst_idx, base)| SgprOrigin::PatchedDescWord {
+                                        def_inst_idx,
+                                        base,
+                                    },
+                                );
+                                (lo, hi)
+                            }
+                        }
+                        0x3B => {
+                            // s_bitreplicate_b64_b32: replicate each bit i into bits (2i, 2i+1)
+                            if is_const_src(*ssrc0, &state.origins) {
+                                let val64 = resolve_const_u32(*ssrc0, *literal, &state.origins)
+                                    .map(|v| {
+                                        let mut out = 0u64;
+                                        for i in 0..32u32 {
+                                            if ((v >> i) & 1) != 0 {
+                                                out |= 3u64 << (i * 2);
+                                            }
+                                        }
+                                        out
+                                    });
+                                (
+                                    SgprOrigin::ConstImmediate {
+                                        def_inst_idx: inst_idx,
+                                        value: val64.map(|v| v as u32),
+                                    },
+                                    SgprOrigin::ConstImmediate {
+                                        def_inst_idx: inst_idx,
+                                        value: val64.map(|v| (v >> 32) as u32),
+                                    },
+                                )
+                            } else {
                                 (SgprOrigin::Unknown, SgprOrigin::Unknown)
                             }
                         }
@@ -4503,6 +5124,8 @@ fn step_origin_state(
                                     .zip(bit)
                                     .map(|(v, b)| v & !(1u32 << (b & 31))),
                             }
+                        } else if let Some((def_inst_idx, base)) = patched_desc_word_of(prev) {
+                            SgprOrigin::PatchedDescWord { def_inst_idx, base }
                         } else {
                             SgprOrigin::Unknown
                         }
@@ -4519,6 +5142,8 @@ fn step_origin_state(
                                     .zip(bit)
                                     .map(|(v, b)| v | (1u32 << (b & 31))),
                             }
+                        } else if let Some((def_inst_idx, base)) = patched_desc_word_of(prev) {
+                            SgprOrigin::PatchedDescWord { def_inst_idx, base }
                         } else {
                             SgprOrigin::Unknown
                         }
@@ -4998,19 +5623,27 @@ fn step_origin_state(
                 }
                 let prev_carry_lo = state.last_carry_lo_reg;
                 let next_carry_lo = match *op {
-                    0x00..=0x03 if *sdst <= MAX_TRACKED_SGPR_PAIR => Some(*sdst),
+                    0x00..=0x03 | 0x2E..=0x31 if *sdst <= MAX_TRACKED_SGPR_PAIR => Some(*sdst),
                     0x0A | 0x26 | 0x32..=0x36 => prev_carry_lo,
                     _ => None,
                 };
                 match *op {
                     // s_add_u32 / s_add_i32: constant fold, table pointer + offset,
-                    // heap base + scaled index, index doubling (`idx + idx`), or high-word carry
-                    // propagation (`s_add_u32 s_hi, s_hi, src_scc`).
+                    // heap base + scaled index, index doubling (`idx + idx`), high-word carry
+                    // propagation (`s_add_u32 s_hi, s_hi, src_scc`), or dynamic VA base offset
+                    // preserving `PatchedDescWord` strictly for V#/T# recovery.
                     0x00 | 0x02 => {
                         if let (Some(v0), Some(v1)) = (c0, c1) {
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_add(v1)),
+                            };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
                             };
                         } else if let Some(imm) = c1 {
                             next_origin = apply_const_offset(src0_origin, imm as i32);
@@ -5024,116 +5657,40 @@ fn step_origin_state(
                             && is_valid_carry_hi(*sdst, src1_origin, prev_carry_lo)
                         {
                             next_origin = src1_origin;
-                        } else if let (
-                            SgprOrigin::UserTable {
-                                user_sgpr: base_user_sgpr,
-                                byte_offset: 0,
-                            },
-                            SgprOrigin::ScaledUserSgpr {
-                                user_sgpr: index_user_sgpr,
-                                stride,
-                                shift: index_shift,
-                            },
-                        ) = (src0_origin, src1_origin)
+                        } else if let Some(combined) = combine_add_origins(src0_origin, src1_origin)
                         {
-                            if base_user_sgpr == index_user_sgpr {
-                                if let Some(new_stride) = stride.checked_add(1) {
-                                    next_origin = make_scaled_user_sgpr(index_user_sgpr, new_stride);
-                                }
-                            } else {
-                                next_origin = SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
-                                    base_user_sgpr,
-                                    stride,
-                                    index_user_sgpr,
-                                    index_shift,
-                                });
-                            }
-                        } else if let (
-                            SgprOrigin::ScaledUserSgpr {
-                                user_sgpr: index_user_sgpr,
-                                stride,
-                                shift: index_shift,
-                            },
-                            SgprOrigin::UserTable {
-                                user_sgpr: base_user_sgpr,
-                                byte_offset: 0,
-                            },
-                        ) = (src0_origin, src1_origin)
+                            next_origin = combined;
+                        } else if let Some((def_inst_idx, base)) =
+                            patched_desc_word_of(src0_origin)
+                                .or_else(|| patched_desc_word_of(src1_origin))
                         {
-                            if base_user_sgpr == index_user_sgpr {
-                                if let Some(new_stride) = stride.checked_add(1) {
-                                    next_origin = make_scaled_user_sgpr(index_user_sgpr, new_stride);
-                                }
-                            } else {
-                                next_origin = SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
-                                    base_user_sgpr,
-                                    stride,
-                                    index_user_sgpr,
-                                    index_shift,
-                                });
-                            }
-                        } else if let (
-                            SgprOrigin::UserTable { byte_offset: 0, .. },
-                            SgprOrigin::ScaledCbvDword(h),
-                        )
-                        | (
-                            SgprOrigin::ScaledCbvDword(h),
-                            SgprOrigin::UserTable { byte_offset: 0, .. },
-                        ) = (src0_origin, src1_origin)
-                        {
-                            next_origin = SgprOrigin::CbvIndexedHeapPtr(h);
-                        } else if let (SgprOrigin::Unknown, SgprOrigin::ScaledCbvDword(h))
-                        | (SgprOrigin::ScaledCbvDword(h), SgprOrigin::Unknown) =
-                            (src0_origin, src1_origin)
-                            && h.shift > 0
-                        {
-                            next_origin = SgprOrigin::CbvIndexedHeapPtr(h);
-                        } else if let (
-                            SgprOrigin::UserTable { byte_offset: 0, .. },
-                            SgprOrigin::CbvDword {
-                                cbv,
-                                byte_offset,
-                                bit_offset,
-                                mask,
-                            },
-                        )
-                        | (
-                            SgprOrigin::CbvDword {
-                                cbv,
-                                byte_offset,
-                                bit_offset,
-                                mask,
-                            },
-                            SgprOrigin::UserTable { byte_offset: 0, .. },
-                        ) = (src0_origin, src1_origin)
-                        {
-                            next_origin = SgprOrigin::CbvIndexedHeapPtr(CbvIndexedHeapSource {
-                                cbv,
-                                byte_offset,
-                                shift: 0,
-                                bit_offset,
-                                mask,
-                                stride: 0,
-                            });
-                        } else if let Some(lane_combined) =
-                            combine_add_lane_origins(src0_origin, src1_origin)
-                        {
-                            next_origin = lane_combined;
-                        } else if let (Some((u0, s0)), Some((u1, s1))) = (
-                            scaled_user_sgpr_stride(src0_origin),
-                            scaled_user_sgpr_stride(src1_origin),
-                        ) && u0 == u1
-                            && let Some(new_stride) = s0.checked_add(s1)
-                        {
-                            next_origin = make_scaled_user_sgpr(u0, new_stride);
+                            next_origin = SgprOrigin::PatchedDescWord { def_inst_idx, base };
+                        } else if let SgprOrigin::UserTable { user_sgpr, .. } = src0_origin {
+                            next_origin = SgprOrigin::PatchedDescWord {
+                                def_inst_idx: inst_idx,
+                                base: PatchedDescBase::RootDescriptor { user_sgpr },
+                            };
+                        } else if let SgprOrigin::UserTable { user_sgpr, .. } = src1_origin {
+                            next_origin = SgprOrigin::PatchedDescWord {
+                                def_inst_idx: inst_idx,
+                                base: PatchedDescBase::RootDescriptor { user_sgpr },
+                            };
                         }
                     }
-                    // s_sub_u32 / s_sub_i32: constant fold, self-sub zero, or table pointer - constant offset.
+                    // s_sub_u32 / s_sub_i32: constant fold, self-sub zero, table pointer - offset,
+                    // or dynamic VA base offset preserving `PatchedDescWord`.
                     0x01 | 0x03 => {
                         if let (Some(v0), Some(v1)) = (c0, c1) {
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_sub(v1)),
+                            };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
                             };
                         } else if *ssrc0 == *ssrc1 && *ssrc0 <= MAX_TRACKED_SGPR {
                             next_origin = SgprOrigin::ConstImmediate {
@@ -5146,9 +5703,18 @@ fn step_origin_state(
                             && is_valid_carry_hi(*sdst, src0_origin, prev_carry_lo)
                         {
                             next_origin = src0_origin;
+                        } else if let Some((def_inst_idx, base)) =
+                            patched_desc_word_of(src0_origin)
+                        {
+                            next_origin = SgprOrigin::PatchedDescWord { def_inst_idx, base };
+                        } else if let SgprOrigin::UserTable { user_sgpr, .. } = src0_origin {
+                            next_origin = SgprOrigin::PatchedDescWord {
+                                def_inst_idx: inst_idx,
+                                base: PatchedDescBase::RootDescriptor { user_sgpr },
+                            };
                         }
                     }
-                    // s_addc_u32: 64-bit pointer high-word carry propagation (`s_hi + 0/-1 + SCC`)
+                    // s_addc_u32: 64-bit pointer high-word carry propagation (`s_hi + 0/-1/hi + SCC`)
                     // or constant-with-carry (value stays `None` because SCC is dynamic).
                     0x04 => {
                         if is_const_src(*ssrc0, &state.origins)
@@ -5166,9 +5732,27 @@ fn step_origin_state(
                             && is_valid_carry_hi(*sdst, src1_origin, prev_carry_lo)
                         {
                             next_origin = src1_origin;
+                        } else if is_valid_carry_hi(*sdst, src0_origin, prev_carry_lo) {
+                            if let Some((def_inst_idx, base)) = patched_desc_word_of(src0_origin) {
+                                next_origin = SgprOrigin::PatchedDescWord { def_inst_idx, base };
+                            } else if let SgprOrigin::UserTable { user_sgpr, .. } = src0_origin {
+                                next_origin = SgprOrigin::PatchedDescWord {
+                                    def_inst_idx: inst_idx,
+                                    base: PatchedDescBase::RootDescriptor { user_sgpr },
+                                };
+                            }
+                        } else if is_valid_carry_hi(*sdst, src1_origin, prev_carry_lo) {
+                            if let Some((def_inst_idx, base)) = patched_desc_word_of(src1_origin) {
+                                next_origin = SgprOrigin::PatchedDescWord { def_inst_idx, base };
+                            } else if let SgprOrigin::UserTable { user_sgpr, .. } = src1_origin {
+                                next_origin = SgprOrigin::PatchedDescWord {
+                                    def_inst_idx: inst_idx,
+                                    base: PatchedDescBase::RootDescriptor { user_sgpr },
+                                };
+                            }
                         }
                     }
-                    // s_subb_u32: 64-bit pointer high-word borrow propagation (`s_hi - 0 - SCC`)
+                    // s_subb_u32: 64-bit pointer high-word borrow propagation (`s_hi - 0/hi - SCC`)
                     // or constant-with-borrow.
                     0x05 => {
                         if is_const_src(*ssrc0, &state.origins)
@@ -5182,6 +5766,15 @@ fn step_origin_state(
                             && is_valid_carry_hi(*sdst, src0_origin, prev_carry_lo)
                         {
                             next_origin = src0_origin;
+                        } else if is_valid_carry_hi(*sdst, src0_origin, prev_carry_lo) {
+                            if let Some((def_inst_idx, base)) = patched_desc_word_of(src0_origin) {
+                                next_origin = SgprOrigin::PatchedDescWord { def_inst_idx, base };
+                            } else if let SgprOrigin::UserTable { user_sgpr, .. } = src0_origin {
+                                next_origin = SgprOrigin::PatchedDescWord {
+                                    def_inst_idx: inst_idx,
+                                    base: PatchedDescBase::RootDescriptor { user_sgpr },
+                                };
+                            }
                         }
                     }
                     // s_min_i32 / s_min_u32 / s_max_i32 / s_max_u32
@@ -5353,6 +5946,13 @@ fn step_origin_state(
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_shl(v1 & 31)),
                             };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
+                            };
                         } else if let Some(raw_shift) = c1 {
                             next_origin = scale_user_sgpr_by_shift(src0_origin, raw_shift & 31);
                         }
@@ -5364,6 +5964,13 @@ fn step_origin_state(
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_shr(v1 & 31)),
                             };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
+                            };
                         } else if let Some(raw_sh) = c1 {
                             next_origin = apply_lshr_const(src0_origin, raw_sh & 31, inst_idx);
                         }
@@ -5373,6 +5980,13 @@ fn step_origin_state(
                             next_origin = SgprOrigin::ConstImmediate {
                                 def_inst_idx: inst_idx,
                                 value: Some(((v0 as i32).wrapping_shr(v1 & 31)) as u32),
+                            };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
                             };
                         }
                     }
@@ -5402,6 +6016,13 @@ fn step_origin_state(
                                 def_inst_idx: inst_idx,
                                 value: Some(v0.wrapping_mul(v1)),
                             };
+                        } else if is_const_src(*ssrc0, &state.origins)
+                            && is_const_src(*ssrc1, &state.origins)
+                        {
+                            next_origin = SgprOrigin::ConstImmediate {
+                                def_inst_idx: inst_idx,
+                                value: None,
+                            };
                         } else if let Some(imm) = c1 {
                             next_origin = scale_user_sgpr_by_mul(src0_origin, imm as i32);
                         } else if let Some(imm) = c0 {
@@ -5423,71 +6044,30 @@ fn step_origin_state(
                             let delta = (v0 as i32).wrapping_shl(shift);
                             next_origin = apply_const_offset(src1_origin, delta);
                         } else {
-                            match scale_user_sgpr_by_shift(src0_origin, shift) {
-                                SgprOrigin::ScaledUserSgpr {
-                                    user_sgpr: index_user_sgpr,
+                            let scaled = scale_user_sgpr_by_shift(src0_origin, shift);
+                            if let SgprOrigin::ScaledLaneIndex(h) = scaled
+                                && *ssrc0 == *ssrc1
+                                && *ssrc0 <= MAX_TRACKED_SGPR
+                                && matches!(src0_origin, SgprOrigin::LaneIndex { .. })
+                            {
+                                let stride = (1u32 << shift).saturating_add(1);
+                                next_origin = SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                                    shift: 0,
                                     stride,
-                                    shift: index_shift,
-                                } => {
-                                    if let Some((u1, s1)) = scaled_user_sgpr_stride(src1_origin)
-                                        && u1 == index_user_sgpr
-                                        && let Some(new_stride) = stride.checked_add(s1)
-                                    {
-                                        next_origin =
-                                            make_scaled_user_sgpr(index_user_sgpr, new_stride);
-                                    } else if let SgprOrigin::UserTable {
-                                        user_sgpr: base_user_sgpr,
-                                        byte_offset: 0,
-                                    } = src1_origin
-                                    {
-                                        next_origin =
-                                            SgprOrigin::DynamicHeapPtr(DynamicHeapOrigin {
-                                                base_user_sgpr,
-                                                stride,
-                                                index_user_sgpr,
-                                                index_shift,
-                                            });
-                                    } else if c1 == Some(0) {
-                                        next_origin = SgprOrigin::ScaledUserSgpr {
-                                            user_sgpr: index_user_sgpr,
-                                            stride,
-                                            shift: index_shift,
-                                        };
-                                    }
-                                }
-                                SgprOrigin::ScaledCbvDword(h) => {
-                                    if matches!(
-                                        src1_origin,
-                                        SgprOrigin::UserTable { byte_offset: 0, .. }
-                                            | SgprOrigin::Unknown
-                                    ) {
-                                        next_origin = SgprOrigin::CbvIndexedHeapPtr(h);
-                                    } else if c1 == Some(0) {
-                                        next_origin = SgprOrigin::ScaledCbvDword(h);
-                                    }
-                                }
-                                SgprOrigin::ScaledLaneIndex(h) => {
-                                    if *ssrc0 == *ssrc1
-                                        && *ssrc0 <= MAX_TRACKED_SGPR
-                                        && matches!(src0_origin, SgprOrigin::LaneIndex { .. })
-                                    {
-                                        let stride = (1u32 << shift).saturating_add(1);
-                                        next_origin =
-                                            SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
-                                                shift: 0,
-                                                stride,
-                                                ..h
-                                            });
-                                    } else if let Some(combined) = combine_add_lane_origins(
-                                        SgprOrigin::ScaledLaneIndex(h),
-                                        src1_origin,
-                                    ) {
-                                        next_origin = combined;
-                                    } else if c1 == Some(0) {
-                                        next_origin = SgprOrigin::ScaledLaneIndex(h);
-                                    }
-                                }
-                                _ => {}
+                                    ..h
+                                });
+                            } else if c1 == Some(0)
+                                && matches!(
+                                    scaled,
+                                    SgprOrigin::ScaledUserSgpr { .. }
+                                        | SgprOrigin::ScaledCbvDword(_)
+                                        | SgprOrigin::ScaledLaneIndex(_)
+                                )
+                            {
+                                next_origin = scaled;
+                            } else if let Some(combined) = combine_add_origins(scaled, src1_origin)
+                            {
+                                next_origin = combined;
                             }
                         }
                     }
@@ -5596,11 +6176,12 @@ fn step_origin_state(
 
             // Snapshot base & dynamic-offset origins BEFORE overwriting sdata (since sdata can
             // alias sbase_sgpr and/or soffset, e.g. `s_load_dwordx4 s[8:11], s[8:9], s10`).
+            let raw_base_w0 = sbase_sgpr.map_or(SgprOrigin::Unknown, |sgpr| state.sgpr_origin(sgpr));
             let base_origin = match sbase_sgpr {
                 Some(sgpr) if matches!(*op, 0x08..=0x0C) => {
                     resolve_vsharp_origin(&state.origins, sgpr)
                 }
-                Some(sgpr) => state.sgpr_origin(sgpr),
+                Some(_) => raw_base_w0,
                 None => SgprOrigin::Unknown,
             };
             let base_hi_is_const = sbase_sgpr
@@ -5768,10 +6349,12 @@ fn step_origin_state(
                             SgprOrigin::UserTable {
                                 user_sgpr,
                                 byte_offset,
-                            } => Some((
-                                CbvRefSource::RootDescriptor { user_sgpr },
-                                byte_offset.saturating_add(raw_off),
-                            )),
+                            } if !matches!(raw_base_w0, SgprOrigin::PatchedDescWord { .. }) => {
+                                Some((
+                                    CbvRefSource::RootDescriptor { user_sgpr },
+                                    byte_offset.saturating_add(raw_off),
+                                ))
+                            }
                             _ => None,
                         }
                     } else {
@@ -5846,6 +6429,24 @@ fn step_origin_state(
                 {
                     match soffset_origin {
                         SgprOrigin::ScaledCbvDword(h) => Some(h),
+                        SgprOrigin::ScaledUserSgpr {
+                            user_sgpr,
+                            stride,
+                            shift,
+                        } if shift > 0
+                            && stride == (1u32 << shift)
+                            && (matches!(base_origin, SgprOrigin::TableDesc { .. })
+                                || shift >= 4) =>
+                        {
+                            Some(CbvIndexedHeapSource {
+                                cbv: CbvRefSource::RootConstants { user_sgpr },
+                                byte_offset: 0,
+                                shift,
+                                bit_offset: 0,
+                                mask: u32::MAX,
+                                stride,
+                            })
+                        }
                         SgprOrigin::CbvDword {
                             cbv,
                             byte_offset,
@@ -6612,6 +7213,7 @@ fn step_origin_state(
         }
         Rdna2Detail::Mimg {
             op,
+            r128,
             srsrc,
             ssamp,
             vdata,
@@ -6633,7 +7235,7 @@ fn step_origin_state(
                 if let Some(col) = collector.as_deref_mut() {
                     let tsharp_origin = checked_descriptor_sgpr(*srsrc, 4)
                         .map_or(SgprOrigin::Unknown, |rsrc_sgpr| {
-                            resolve_tsharp_origin(&state.origins, rsrc_sgpr)
+                            resolve_tsharp_origin(&state.origins, rsrc_sgpr, *r128)
                         });
                     match tsharp_origin {
                         SgprOrigin::TableDesc {
@@ -6803,6 +7405,7 @@ fn step_origin_state(
         Rdna2Detail::Mubuf {
             op,
             idxen,
+            glc,
             srsrc,
             soffset,
             vdata,
@@ -6817,6 +7420,8 @@ fn step_origin_state(
                         clear_vgpr_origins(state, reg);
                     }
                 }
+            } else if mubuf_is_atomic(*op) && *glc {
+                clear_vgpr_origins(state, *vdata);
             }
             if let Some(col) = collector.as_deref_mut() {
                 let rsrc_sgpr_opt = checked_descriptor_sgpr(*srsrc, 4);
@@ -7090,6 +7695,241 @@ fn mark_untainted_def_and_parents(
     }
 }
 
+/// Identify SGPRs in `user_base..32` that are never read as scalar/pointer user-data inputs
+/// anywhere in `active` (e.g. pure scratch registers allocated by LLVM for conditionally loaded
+/// T#/V#/S# descriptors or inline samplers). Seeding those registers as `Unwritten` instead of
+/// `UserTable` prevents guarded CFG joins from clobbering proven descriptor origins to `Unknown`.
+fn compute_unreferenced_initial_user_sgprs(
+    active: &[Rdna2Instruction],
+    stage: ShaderStage,
+    is_mesh: bool,
+) -> [bool; 32] {
+    let user_base: usize = if stage == ShaderStage::Compute && !is_mesh {
+        4
+    } else {
+        8
+    };
+    let mut read_as_user = [false; 32];
+    let mut non_smem_written = [false; 32];
+    #[inline]
+    fn mark_read(buf: &mut [bool; 32], reg: u16) {
+        if (reg as usize) < 32 {
+            buf[reg as usize] = true;
+        }
+    }
+    #[inline]
+    fn mark_pair_read(buf: &mut [bool; 32], reg: u16) {
+        mark_read(buf, reg);
+        if let Some(hi) = reg.checked_add(1) {
+            mark_read(buf, hi);
+        }
+    }
+    #[inline]
+    fn mark_non_smem_write(buf: &mut [bool; 32], reg: u8) {
+        if (reg as usize) < 32 {
+            buf[reg as usize] = true;
+        }
+    }
+
+    for inst in active {
+        if inst.truncated {
+            continue;
+        }
+        match &inst.detail {
+            Rdna2Detail::Sopc {
+                op, ssrc0, ssrc1, ..
+            } => {
+                let (p0, p1) = sopc_src_pair_widths(*op);
+                if p0 {
+                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                } else {
+                    mark_read(&mut read_as_user, u16::from(*ssrc0));
+                }
+                if p1 {
+                    mark_pair_read(&mut read_as_user, u16::from(*ssrc1));
+                } else {
+                    mark_read(&mut read_as_user, u16::from(*ssrc1));
+                }
+            }
+            Rdna2Detail::Sop1 {
+                op, sdst, ssrc0, ..
+            } => {
+                if sop1_reads_pair(*op) {
+                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                } else {
+                    mark_read(&mut read_as_user, u16::from(*ssrc0));
+                }
+                if matches!(*op, 0x05 | 0x1B | 0x1D) {
+                    mark_read(&mut read_as_user, u16::from(*sdst));
+                } else if matches!(*op, 0x06 | 0x1C | 0x1E) {
+                    mark_pair_read(&mut read_as_user, u16::from(*sdst));
+                }
+                if sop1_writes_pair(*op) {
+                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                    if let Some(hi) = sdst.checked_add(1) {
+                        mark_non_smem_write(&mut non_smem_written, hi);
+                    }
+                } else {
+                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                }
+            }
+            Rdna2Detail::Sopk { op, sdst, .. } => {
+                if matches!(*op, 0x02..=0x10) {
+                    mark_read(&mut read_as_user, u16::from(*sdst));
+                }
+                if !matches!(*op, 0x03..=0x0E | 0x17..=0x1A) {
+                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                }
+            }
+            Rdna2Detail::Sop2 {
+                op,
+                sdst,
+                ssrc0,
+                ssrc1,
+                ..
+            } => {
+                let (p0, p1) = sop2_src_pair_widths(*op);
+                if p0 {
+                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                } else {
+                    mark_read(&mut read_as_user, u16::from(*ssrc0));
+                }
+                if p1 {
+                    mark_pair_read(&mut read_as_user, u16::from(*ssrc1));
+                } else {
+                    mark_read(&mut read_as_user, u16::from(*ssrc1));
+                }
+                if p0 || *op == 0x25 {
+                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                    if let Some(hi) = sdst.checked_add(1) {
+                        mark_non_smem_write(&mut non_smem_written, hi);
+                    }
+                } else {
+                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                }
+            }
+            Rdna2Detail::Smem {
+                op, sbase, soffset, ..
+            } => {
+                let base_count: u8 = if matches!(*op, 0x08..=0x0C) { 4 } else { 2 };
+                if let Some(sgpr) = checked_descriptor_sgpr(*sbase, 2) {
+                    for k in 0..base_count {
+                        if let Some(r) = sgpr.checked_add(k) {
+                            mark_read(&mut read_as_user, u16::from(r));
+                        }
+                    }
+                }
+                if *soffset != 0x7D {
+                    mark_read(&mut read_as_user, u16::from(*soffset));
+                }
+            }
+            Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
+                mark_read(&mut read_as_user, *src0);
+                if *op == 0x02 {
+                    mark_non_smem_write(&mut non_smem_written, *vdst & 0x7F);
+                }
+            }
+            Rdna2Detail::Vopc { src0, .. } | Rdna2Detail::Vop2 { src0, .. } => {
+                mark_read(&mut read_as_user, *src0);
+            }
+            Rdna2Detail::Vop3 {
+                op,
+                vdst,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                if !vop3_is_interp_f16(*op) {
+                    mark_read(&mut read_as_user, *src0);
+                }
+                if !(0x180..=0x1FF).contains(op) {
+                    if matches!(*op, 0x2FF..=0x301) || *op == 0x364 {
+                        mark_pair_read(&mut read_as_user, *src1);
+                    } else {
+                        mark_read(&mut read_as_user, *src1);
+                    }
+                }
+                if *op == 0x364 {
+                    mark_pair_read(&mut read_as_user, *src0);
+                }
+                if *op != 0x342
+                    && matches!(
+                        *op,
+                        0x100
+                            | 0x101
+                            | 0x128..=0x12A
+                            | 0x140..=0x165
+                            | 0x16D..=0x171
+                            | 0x178
+                            | 0x340..=0x35F
+                            | 0x36D..=0x372
+                            | 0x377
+                            | 0x378
+                    )
+                {
+                    mark_read(&mut read_as_user, *src2);
+                }
+                if matches!(*op, 0x182 | 0x360) {
+                    mark_non_smem_write(&mut non_smem_written, *vdst & 0x7F);
+                }
+            }
+            Rdna2Detail::Vop3P {
+                op,
+                src0,
+                src1,
+                src2,
+                ..
+            } => {
+                mark_read(&mut read_as_user, *src0);
+                mark_read(&mut read_as_user, *src1);
+                if vop3p_is_ternary(*op) {
+                    mark_read(&mut read_as_user, *src2);
+                }
+            }
+            Rdna2Detail::Flat { saddr, .. } => {
+                mark_pair_read(&mut read_as_user, u16::from(*saddr));
+            }
+            Rdna2Detail::Mubuf { soffset, .. } | Rdna2Detail::Mtbuf { soffset, .. } => {
+                mark_read(&mut read_as_user, u16::from(*soffset));
+            }
+            Rdna2Detail::Mimg { .. }
+            | Rdna2Detail::Vintrp { .. }
+            | Rdna2Detail::Ds { .. }
+            | Rdna2Detail::Sopp { .. }
+            | Rdna2Detail::Exp { .. }
+            | Rdna2Detail::Unknown { .. } => {}
+        }
+    }
+
+    // If a MUBUF/MTBUF consumes an in-place synthesized root V# at s[r..r+3] whose words 2/3 were
+    // written by non-SMEM scalar ops (e.g. `s_mov_b32 s10, -1; s_mov_b32 s11, 0x20000`), keep
+    // `s[r..r+1]` as live `UserTable` inputs.
+    for inst in active {
+        if inst.truncated {
+            continue;
+        }
+        let srsrc_opt = match &inst.detail {
+            Rdna2Detail::Mubuf { srsrc, .. } | Rdna2Detail::Mtbuf { srsrc, .. } => Some(*srsrc),
+            _ => None,
+        };
+        if let Some(srsrc) = srsrc_opt
+            && let Some(r) = checked_descriptor_sgpr(srsrc, 4)
+            && (r as usize) + 3 < 32
+            && (non_smem_written[(r as usize) + 2] || non_smem_written[(r as usize) + 3])
+        {
+            read_as_user[r as usize] = true;
+            read_as_user[(r as usize) + 1] = true;
+        }
+    }
+
+    let mut unreferenced = [false; 32];
+    for sgpr in user_base..32 {
+        unreferenced[sgpr] = !read_as_user[sgpr];
+    }
+    unreferenced
+}
+
 /// Detect descriptor-table V#/T#/S# indirections (`s_load_dword*`) and track console user-data
 /// SGPR provenance (`s8+` graphics, `s4+` compute) across CFG basic blocks, SALU address
 /// derivation, 2-level nested table pointers, VGPR lane/uniform spills, hardware VB-table
@@ -7105,6 +7945,7 @@ fn analyze_vsharp_indirections(
     }
 
     let is_wave32 = detect_wave32_program(active);
+    let unreferenced_user_sgprs = compute_unreferenced_initial_user_sgprs(active, stage, is_mesh);
     let cfg = ControlFlowGraph::from_instructions(active);
     let num_blocks = cfg.blocks.len();
 
@@ -7116,7 +7957,7 @@ fn analyze_vsharp_indirections(
     let mut visits: Vec<u8> = vec![0; num_blocks];
     let mut worklist: BTreeSet<BlockId> = BTreeSet::new();
     let mut pass1_def_aliases: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    let entry_state = OriginState::initial(stage, is_mesh);
+    let entry_state = OriginState::initial(stage, is_mesh, &unreferenced_user_sgprs);
     let Some(entry) = cfg.entry() else {
         return DescriptorAnalysis::default();
     };
