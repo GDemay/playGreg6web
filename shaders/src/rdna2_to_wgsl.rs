@@ -1479,9 +1479,11 @@ fn ds_lds_op(op: u8) -> Option<DsLdsOp> {
         0x0D => Some(DsLdsOp::WriteContiguous(1)),
         0x0E => Some(DsLdsOp::Write2 { stride_bytes: 4 }),
         0x0F => Some(DsLdsOp::Write2 { stride_bytes: 256 }),
+        0x1E | 0x1F => Some(DsLdsOp::WriteContiguous(1)),
         0x36 => Some(DsLdsOp::ReadContiguous(1)),
         0x37 => Some(DsLdsOp::Read2 { stride_bytes: 4 }),
         0x38 => Some(DsLdsOp::Read2 { stride_bytes: 256 }),
+        0x39..=0x3C => Some(DsLdsOp::ReadContiguous(1)),
         0x4D => Some(DsLdsOp::WriteContiguous(2)),
         0x76 => Some(DsLdsOp::ReadContiguous(2)),
         0xDE => Some(DsLdsOp::WriteContiguous(3)),
@@ -12292,7 +12294,8 @@ impl IrEmitter {
             // s_nop, s_endpgm, s_waitcnt, s_setprio (scheduling priority hint),
             // s_endpgm_saved, s_endpgm_ordered_ps_done, s_code_end,
             // s_inst_prefetch, s_clause, s_wait_idle, s_waitcnt_depctr, s_round_mode
-            0x00 | 0x01 | 0x0C | 0x0F | 0x1B | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 => {
+            0x00 | 0x01 | 0x03 | 0x0C | 0x0D | 0x0E | 0x0F | 0x13 | 0x14 | 0x15 | 0x16 | 0x1B
+            | 0x1C | 0x1E | 0x1F | 0x20 | 0x21 | 0x22 | 0x23 | 0x24 | 0x25 | 0x28 => {
                 true
             }
             // s_branch / s_cbranch_{scc0,scc1,vccz,vccnz,execz,execnz}: lifted into structured
@@ -12565,6 +12568,21 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_bcnt0_i32_b32: count zero bits in 32-bit src0; scc = (res != 0)
+            0x0D => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let inv = self.emit_bit_not(v);
+                let res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountOneBits,
+                    arg: inv,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
             // s_bcnt1_i32_b32
             0x0F => {
                 let v = self.read_src_u32(u16::from(ssrc0), literal);
@@ -12577,6 +12595,24 @@ impl IrEmitter {
                 });
                 self.store_sgpr_u32(sdst, res);
                 self.update_scc_nonzero(res);
+                true
+            }
+            // s_ff0_i32_b32: find first 0 bit from LSB; returns -1 (0xFFFFFFFF) when src0 == ~0
+            0x11 => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let inv = self.emit_bit_not(v);
+                let ctz = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountTrailingZeros,
+                    arg: inv,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_bin(BinaryOperator::Equal, inv, zero);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let res = self.emit_select(is_zero, neg_one, ctz);
+                self.store_sgpr_u32(sdst, res);
                 true
             }
             // s_ff1_i32_b32: find first 1 bit from LSB; returns -1 (0xFFFFFFFF) when src0 == 0
@@ -12610,6 +12646,13 @@ impl IrEmitter {
                 let is_zero = self.emit_bin(BinaryOperator::Equal, v, zero);
                 let neg_one = self.lit_u32(0xFFFF_FFFF);
                 let res = self.emit_select(is_zero, neg_one, clz);
+                self.store_sgpr_u32(sdst, res);
+                true
+            }
+            // s_flbit_i32: count leading bits matching MSB sign bit; -1 when 0 or -1
+            0x17 => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let res = self.emit_ffbh_i32(v);
                 self.store_sgpr_u32(sdst, res);
                 true
             }
@@ -12649,6 +12692,28 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_quadmask_b32: bit q (0..7) = (any bit in src0[4q+3:4q] != 0); scc = (res != 0)
+            0x2C => {
+                let v = self.read_src_u32(u16::from(ssrc0), literal);
+                let one = self.lit_u32(1);
+                let two = self.lit_u32(2);
+                let v_r1 = self.emit_bin(BinaryOperator::ShiftRight, v, one);
+                let t1 = self.emit_bin(BinaryOperator::InclusiveOr, v, v_r1);
+                let t1_r2 = self.emit_bin(BinaryOperator::ShiftRight, t1, two);
+                let t2 = self.emit_bin(BinaryOperator::InclusiveOr, t1, t1_r2);
+                let mut res = self.emit_bin(BinaryOperator::And, t2, one);
+                for q in 1..8u32 {
+                    let sh = self.lit_u32(q * 4);
+                    let shifted = self.emit_bin(BinaryOperator::ShiftRight, t2, sh);
+                    let bit = self.emit_bin(BinaryOperator::And, shifted, one);
+                    let q_lit = self.lit_u32(q);
+                    let placed = self.emit_bin(BinaryOperator::ShiftLeft, bit, q_lit);
+                    res = self.emit_bin(BinaryOperator::InclusiveOr, res, placed);
+                }
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
             // s_abs_i32
             0x34 => {
                 let v = self.read_src_i32(u16::from(ssrc0), literal);
@@ -12674,6 +12739,17 @@ impl IrEmitter {
             0x00 => {
                 let v = self.lit_u32(imm_u32);
                 self.store_sgpr_u32(sdst, v);
+                true
+            }
+            // s_version: ISA version metadata hint (no-op)
+            0x01 => true,
+            // s_cmovk_i32: scc ? sext16(simm16) : sdst
+            0x02 => {
+                let cond = self.load_scc();
+                let accept = self.lit_u32(imm_u32);
+                let reject = self.load_sgpr_u32(sdst);
+                let res = self.emit_select(cond, accept, reject);
+                self.store_sgpr_u32(sdst, res);
                 true
             }
             // s_cmpk_{eq,lg,gt,ge,lt,le}_{i32,u32}: compare sdst against sign/zero-extended simm16 -> SCC
@@ -12727,8 +12803,9 @@ impl IrEmitter {
                 self.store_sgpr_u32(sdst, res);
                 true
             }
+            // s_setreg_b32 / s_setreg_imm32_b32 (hardware mode/config hints) &
             // s_waitcnt_vscnt / vmcnt / expcnt / lgkmcnt
-            0x17..=0x1A => true,
+            0x12 | 0x15 | 0x17..=0x1A => true,
             _ => false,
         }
     }
@@ -13258,6 +13335,105 @@ impl IrEmitter {
                 self.store_scc(nonzero);
                 true
             }
+            // s_bfe_i32: signed bitfield extract (offset = src1[4:0], width = src1[22:16])
+            0x28 => {
+                let s0_i = self.read_src_i32(s0_u(), literal);
+                let s1 = self.read_src_u32(s1_u(), literal);
+                let mask31 = self.lit_u32(31);
+                let offset = self.emit_bin(BinaryOperator::And, s1, mask31);
+                let shift16 = self.lit_u32(16);
+                let s1_hi = self.emit_bin(BinaryOperator::ShiftRight, s1, shift16);
+                let mask7f = self.lit_u32(0x7F);
+                let width = self.emit_bin(BinaryOperator::And, s1_hi, mask7f);
+                let res_i = self.emit_bfe_i32(s0_i, offset, width);
+                let res_u = self.bitcast_i32_to_u32(res_i);
+                self.store_sgpr_u32(sdst, res_u);
+                self.update_scc_nonzero(res_u);
+                true
+            }
+            // s_bfe_u64: unsigned 64-bit bitfield extract (offset = src1[5:0], width = src1[22:16])
+            0x29 => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let s1 = self.read_src_u32(s1_u(), literal);
+                let mask63 = self.lit_u32(63);
+                let mask31 = self.lit_u32(31);
+                let mask7f = self.lit_u32(0x7F);
+                let shift16 = self.lit_u32(16);
+                let c32 = self.lit_u32(32);
+                let c64 = self.lit_u32(64);
+                let zero = self.lit_u32(0);
+                let one = self.lit_u32(1);
+                let all_ones = self.lit_u32(0xFFFF_FFFF);
+                let offset = self.emit_bin(BinaryOperator::And, s1, mask63);
+                let s1_hi = self.emit_bin(BinaryOperator::ShiftRight, s1, shift16);
+                let width = self.emit_bin(BinaryOperator::And, s1_hi, mask7f);
+                let (s_lo, s_hi) = self.emit_shift64(Shift64Kind::LogicalRight, lo, hi, offset);
+
+                let w_lo_safe = self.emit_bin(BinaryOperator::And, width, mask31);
+                let sh_lo = self.emit_bin(BinaryOperator::ShiftLeft, one, w_lo_safe);
+                let m_lo_part = self.emit_bin(BinaryOperator::Subtract, sh_lo, one);
+                let ge32 = self.emit_bin(BinaryOperator::GreaterEqual, width, c32);
+                let mask_lo = self.emit_select(ge32, all_ones, m_lo_part);
+
+                let w_hi_raw = self.emit_bin(BinaryOperator::Subtract, width, c32);
+                let w_hi_safe = self.emit_bin(BinaryOperator::And, w_hi_raw, mask31);
+                let sh_hi = self.emit_bin(BinaryOperator::ShiftLeft, one, w_hi_safe);
+                let m_hi_part = self.emit_bin(BinaryOperator::Subtract, sh_hi, one);
+                let le32 = self.emit_bin(BinaryOperator::LessEqual, width, c32);
+                let ge64 = self.emit_bin(BinaryOperator::GreaterEqual, width, c64);
+                let m_hi_nz = self.emit_select(ge64, all_ones, m_hi_part);
+                let mask_hi = self.emit_select(le32, zero, m_hi_nz);
+
+                let r_lo = self.emit_bin(BinaryOperator::And, s_lo, mask_lo);
+                let r_hi = self.emit_bin(BinaryOperator::And, s_hi, mask_hi);
+                self.store_sdst_pair(sdst, r_lo, r_hi);
+                self.update_scc_nonzero_pair(r_lo, r_hi);
+                true
+            }
+            // s_bfe_i64: signed 64-bit bitfield extract (offset = src1[5:0], width = src1[22:16])
+            0x2A => {
+                let (lo, hi) = self.read_ssrc_pair(ssrc0, literal);
+                let s1 = self.read_src_u32(s1_u(), literal);
+                let mask63 = self.lit_u32(63);
+                let mask7f = self.lit_u32(0x7F);
+                let shift16 = self.lit_u32(16);
+                let c64 = self.lit_u32(64);
+                let zero = self.lit_u32(0);
+                let offset = self.emit_bin(BinaryOperator::And, s1, mask63);
+                let s1_hi = self.emit_bin(BinaryOperator::ShiftRight, s1, shift16);
+                let width = self.emit_bin(BinaryOperator::And, s1_hi, mask7f);
+                let sum = self.emit_bin(BinaryOperator::Add, offset, width);
+                let is_wide = self.emit_bin(BinaryOperator::GreaterEqual, sum, c64);
+                let is_zero = self.emit_bin(BinaryOperator::Equal, width, zero);
+                let (w_lo, w_hi) = self.emit_shift64(Shift64Kind::ArithmeticRight, lo, hi, offset);
+                let lsh_raw = self.emit_bin(BinaryOperator::Subtract, c64, sum);
+                let lsh = self.emit_bin(BinaryOperator::And, lsh_raw, mask63);
+                let rsh_raw = self.emit_bin(BinaryOperator::Subtract, c64, width);
+                let rsh = self.emit_bin(BinaryOperator::And, rsh_raw, mask63);
+                let (t_lo, t_hi) = self.emit_shift64(Shift64Kind::Left, lo, hi, lsh);
+                let (n_lo, n_hi) = self.emit_shift64(Shift64Kind::ArithmeticRight, t_lo, t_hi, rsh);
+                let nz_lo = self.emit_select(is_wide, w_lo, n_lo);
+                let nz_hi = self.emit_select(is_wide, w_hi, n_hi);
+                let r_lo = self.emit_select(is_zero, zero, nz_lo);
+                let r_hi = self.emit_select(is_zero, zero, nz_hi);
+                self.store_sdst_pair(sdst, r_lo, r_hi);
+                self.update_scc_nonzero_pair(r_lo, r_hi);
+                true
+            }
+            // s_absdiff_i32: unsigned |i32(src0) - i32(src1)|; scc = (res != 0)
+            0x2C => {
+                let a_i = self.read_src_i32(s0_u(), literal);
+                let b_i = self.read_src_i32(s1_u(), literal);
+                let a_u = self.bitcast_i32_to_u32(a_i);
+                let b_u = self.bitcast_i32_to_u32(b_i);
+                let a_ge_b = self.emit_bin(BinaryOperator::GreaterEqual, a_i, b_i);
+                let ab = self.emit_bin(BinaryOperator::Subtract, a_u, b_u);
+                let ba = self.emit_bin(BinaryOperator::Subtract, b_u, a_u);
+                let res = self.emit_select(a_ge_b, ab, ba);
+                self.store_sgpr_u32(sdst, res);
+                self.update_scc_nonzero(res);
+                true
+            }
             // s_lshl{1,2,3,4}_add_u32
             0x2E..=0x31 => {
                 let l = self.read_src_u32(s0_u(), literal);
@@ -13331,6 +13507,10 @@ impl IrEmitter {
         byte_offset: i32,
     ) -> bool {
         if self.vsharp_fetch_insts.contains(&inst_idx) {
+            return true;
+        }
+        // s_gl1_inv / s_dcache_inv / s_atc_probe / s_atc_probe_buffer: cache/probe hints (no-op)
+        if matches!(op, 0x20 | 0x21 | 0x26 | 0x27) {
             return true;
         }
         let Some(count) = smem_load_dword_count(op) else {
@@ -13577,6 +13757,23 @@ impl IrEmitter {
                 self.store_vgpr_i32(vdst, i);
                 true
             }
+            // v_cvt_off_f32_i4: f32(sext4(src0[3:0])) * (1.0 / 16.0)
+            0x0E => {
+                let raw = self.read_src_i32(src0, literal);
+                let sh28 = self.lit_u32(28);
+                let shl = self.emit_bin(BinaryOperator::ShiftLeft, raw, sh28);
+                let i4 = self.emit_bin(BinaryOperator::ShiftRight, shl, sh28);
+                let f = self.emit_expr(Expression::As {
+                    expr: i4,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
+                });
+                let scale = self.lit_f32(0.0625);
+                let scaled = self.emit_bin(BinaryOperator::Multiply, f, scale);
+                let out = self.apply_float_out_mods(scaled, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
             // v_cvt_f32_ubyte0..3: extract byte k as f32
             0x11..=0x14 => {
                 let u = self.read_src_u32(src0, literal);
@@ -13693,6 +13890,132 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_ffbh_u32: count leading zeros from MSB; -1 (0xFFFFFFFF) when src0 == 0
+            0x39 => {
+                let u = self.read_src_u32(src0, literal);
+                let clz = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountLeadingZeros,
+                    arg: u,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_bin(BinaryOperator::Equal, u, zero);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let res = self.emit_select(is_zero, neg_one, clz);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_ffbl_b32: find first 1 bit from LSB; -1 (0xFFFFFFFF) when src0 == 0
+            0x3A => {
+                let u = self.read_src_u32(src0, literal);
+                let ctz = self.emit_expr(Expression::Math {
+                    fun: MathFunction::CountTrailingZeros,
+                    arg: u,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let zero = self.lit_u32(0);
+                let is_zero = self.emit_bin(BinaryOperator::Equal, u, zero);
+                let neg_one = self.lit_u32(0xFFFF_FFFF);
+                let res = self.emit_select(is_zero, neg_one, ctz);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_ffbh_i32: count leading bits matching MSB sign bit; -1 when 0 or -1
+            0x3B => {
+                let u = self.read_src_u32(src0, literal);
+                let res = self.emit_ffbh_i32(u);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_frexp_exp_i32_f32: signed IEEE-754 binary32 exponent (0 for 0/Inf/NaN)
+            0x3F => {
+                let f = self.read_src_f32(src0, literal, abs0, neg0);
+                let exp_i = self.emit_frexp_exp_f32(f);
+                self.store_vgpr_i32(vdst, exp_i);
+                true
+            }
+            // v_frexp_mant_f32: IEEE-754 binary32 mantissa in (-1,-0.5] U [0.5,1)
+            0x40 => {
+                let f = self.read_src_f32(src0, literal, abs0, neg0);
+                let mant = self.emit_frexp_mant_f32(f);
+                let out = self.apply_float_out_mods(mant, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_cvt_f16_u16: unsigned low 16-bit int -> f16 in vdst[15:0]
+            0x50 => {
+                let raw = self.read_src_u32(src0, literal);
+                let mask16 = self.lit_u32(0xFFFF);
+                let u16_val = self.emit_bin(BinaryOperator::And, raw, mask16);
+                let f = self.emit_expr(Expression::As {
+                    expr: u16_val,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
+                });
+                let out = self.apply_float_out_mods(f, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_cvt_f16_i16: signed low 16-bit int -> f16 in vdst[15:0]
+            0x51 => {
+                let raw = self.read_src_i32(src0, literal);
+                let sh16 = self.lit_u32(16);
+                let shl = self.emit_bin(BinaryOperator::ShiftLeft, raw, sh16);
+                let i16_val = self.emit_bin(BinaryOperator::ShiftRight, shl, sh16);
+                let f = self.emit_expr(Expression::As {
+                    expr: i16_val,
+                    kind: ScalarKind::Float,
+                    convert: Some(4),
+                });
+                let out = self.apply_float_out_mods(f, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_cvt_u16_f16: f16 in src0[15:0] -> u16 in vdst[15:0]
+            0x52 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let lo = self.lit_f32(0.0);
+                let hi = self.lit_f32(65535.0);
+                let clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: f,
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                });
+                let u = self.emit_expr(Expression::As {
+                    expr: clamped,
+                    kind: ScalarKind::Uint,
+                    convert: Some(4),
+                });
+                self.store_vgpr_u16_lo(vdst, u);
+                true
+            }
+            // v_cvt_i16_f16: f16 in src0[15:0] -> i16 in vdst[15:0]
+            0x53 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let lo = self.lit_f32(-32768.0);
+                let hi = self.lit_f32(32767.0);
+                let clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: f,
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                });
+                let i = self.emit_expr(Expression::As {
+                    expr: clamped,
+                    kind: ScalarKind::Sint,
+                    convert: Some(4),
+                });
+                let u = self.bitcast_i32_to_u32(i);
+                self.store_vgpr_u16_lo(vdst, u);
+                true
+            }
             // v_rcp_f16 (emulated via f32 + pack2x16float, zero `enable f16;`)
             0x54 => {
                 let one = self.lit_f32(1.0);
@@ -13732,6 +14055,133 @@ impl IrEmitter {
                 self.store_vgpr_f16_lo(vdst, out);
                 true
             }
+            // v_frexp_mant_f16: f16 mantissa in (-1,-0.5] U [0.5,1) stored in vdst[15:0]
+            0x59 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let mant = self.emit_frexp_mant_f32(f);
+                let out = self.apply_float_out_mods(mant, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_frexp_exp_i16_f16: signed f16 exponent stored in vdst[15:0]
+            0x5A => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let exp_i = self.emit_frexp_exp_f32(f);
+                let exp_u = self.bitcast_i32_to_u32(exp_i);
+                self.store_vgpr_u16_lo(vdst, exp_u);
+                true
+            }
+            // v_sin_f16 / v_cos_f16 (input in turns: angle = x * 2*pi)
+            0x60 | 0x61 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let tau = self.lit_f32(std::f32::consts::TAU);
+                let rad = self.emit_bin(BinaryOperator::Multiply, f, tau);
+                let fun = if op == 0x60 {
+                    MathFunction::Sin
+                } else {
+                    MathFunction::Cos
+                };
+                let res = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: rad,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
+            // v_sat_pk_u8_i16: saturate 2 packed i16 lanes to [0, 255] and pack into vdst[15:0]
+            0x62 => {
+                let raw_i = self.read_src_i32(src0, literal);
+                let sh16 = self.lit_u32(16);
+                let lo_shl = self.emit_bin(BinaryOperator::ShiftLeft, raw_i, sh16);
+                let lo_i = self.emit_bin(BinaryOperator::ShiftRight, lo_shl, sh16);
+                let hi_i = self.emit_bin(BinaryOperator::ShiftRight, raw_i, sh16);
+                let c0 = self.lit_i32(0);
+                let c255 = self.lit_i32(255);
+                let lo_cl = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: lo_i,
+                    arg1: Some(c0),
+                    arg2: Some(c255),
+                    arg3: None,
+                });
+                let hi_cl = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: hi_i,
+                    arg1: Some(c0),
+                    arg2: Some(c255),
+                    arg3: None,
+                });
+                let lo_u = self.bitcast_i32_to_u32(lo_cl);
+                let hi_u = self.bitcast_i32_to_u32(hi_cl);
+                let sh8 = self.lit_u32(8);
+                let hi_sh = self.emit_bin(BinaryOperator::ShiftLeft, hi_u, sh8);
+                let packed16 = self.emit_bin(BinaryOperator::InclusiveOr, lo_u, hi_sh);
+                self.store_vgpr_u16_lo(vdst, packed16);
+                true
+            }
+            // v_cvt_norm_i16_f16: round(clamp(f16, -1.0, 1.0) * 32767.0) -> i16 in vdst[15:0]
+            0x63 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let lo = self.lit_f32(-1.0);
+                let hi = self.lit_f32(1.0);
+                let clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: f,
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                });
+                let scale = self.lit_f32(32767.0);
+                let scaled = self.emit_bin(BinaryOperator::Multiply, clamped, scale);
+                let rounded = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Round,
+                    arg: scaled,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let i = self.emit_expr(Expression::As {
+                    expr: rounded,
+                    kind: ScalarKind::Sint,
+                    convert: Some(4),
+                });
+                let u = self.bitcast_i32_to_u32(i);
+                self.store_vgpr_u16_lo(vdst, u);
+                true
+            }
+            // v_cvt_norm_u16_f16: round(clamp(f16, 0.0, 1.0) * 65535.0) -> u16 in vdst[15:0]
+            0x64 => {
+                let f = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let lo = self.lit_f32(0.0);
+                let hi = self.lit_f32(1.0);
+                let clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: f,
+                    arg1: Some(lo),
+                    arg2: Some(hi),
+                    arg3: None,
+                });
+                let scale = self.lit_f32(65535.0);
+                let scaled = self.emit_bin(BinaryOperator::Multiply, clamped, scale);
+                let rounded = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Round,
+                    arg: scaled,
+                    arg1: None,
+                    arg2: None,
+                    arg3: None,
+                });
+                let u = self.emit_expr(Expression::As {
+                    expr: rounded,
+                    kind: ScalarKind::Uint,
+                    convert: Some(4),
+                });
+                self.store_vgpr_u16_lo(vdst, u);
+                true
+            }
             // v_swap_b32: atomically swap v[vdst] and v[vsrc0]
             0x65 => {
                 if (256..=511).contains(&src0) {
@@ -13750,6 +14200,160 @@ impl IrEmitter {
             }
             _ => false,
         }
+    }
+
+    /// Store the low 16 bits of `val_u32` into `v[reg][15:0]`, preserving `v[reg][31:16]`.
+    fn store_vgpr_u16_lo(&mut self, reg: u8, val_u32: Handle<Expression>) {
+        let mask_lo = self.lit_u32(0x0000_FFFF);
+        let mask_hi = self.lit_u32(0xFFFF_0000);
+        let new_lo = self.emit_bin(BinaryOperator::And, val_u32, mask_lo);
+        let old_f = self.load_vgpr_f32(reg);
+        let old_u = self.bitcast_f32_to_u32(old_f);
+        let preserved_hi = self.emit_bin(BinaryOperator::And, old_u, mask_hi);
+        let combined = self.emit_bin(BinaryOperator::InclusiveOr, preserved_hi, new_lo);
+        self.store_vgpr_u32(reg, combined);
+    }
+
+    /// Store the low 16 bits of `val_u32` into `v[reg][31:16]`, preserving `v[reg][15:0]`.
+    fn store_vgpr_u16_hi(&mut self, reg: u8, val_u32: Handle<Expression>) {
+        let mask_lo = self.lit_u32(0x0000_FFFF);
+        let sh16 = self.lit_u32(16);
+        let new_hi = self.emit_bin(BinaryOperator::ShiftLeft, val_u32, sh16);
+        let old_f = self.load_vgpr_f32(reg);
+        let old_u = self.bitcast_f32_to_u32(old_f);
+        let preserved_lo = self.emit_bin(BinaryOperator::And, old_u, mask_lo);
+        let combined = self.emit_bin(BinaryOperator::InclusiveOr, preserved_lo, new_hi);
+        self.store_vgpr_u32(reg, combined);
+    }
+
+    /// Count leading bits matching the MSB sign bit of a 32-bit word (`s_flbit_i32` / `v_ffbh_i32`).
+    /// Returns `0xFFFF_FFFFu` (`-1`) when all 32 bits match (`0` or `-1`).
+    fn emit_ffbh_i32(&mut self, u: Handle<Expression>) -> Handle<Expression> {
+        let i = self.bitcast_u32_to_i32(u);
+        let c31 = self.lit_u32(31);
+        let sign_i = self.emit_bin(BinaryOperator::ShiftRight, i, c31);
+        let sign_mask = self.bitcast_i32_to_u32(sign_i);
+        let norm = self.emit_bin(BinaryOperator::ExclusiveOr, u, sign_mask);
+        let clz = self.emit_expr(Expression::Math {
+            fun: MathFunction::CountLeadingZeros,
+            arg: norm,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+        let zero = self.lit_u32(0);
+        let is_zero = self.emit_bin(BinaryOperator::Equal, norm, zero);
+        let neg_one = self.lit_u32(0xFFFF_FFFF);
+        self.emit_select(is_zero, neg_one, clz)
+    }
+
+    /// Signed 32-bit bitfield extract (`s_bfe_i32` / `v_bfe_i32`) with all WGSL shifts `< 32`.
+    fn emit_bfe_i32(
+        &mut self,
+        src0_i: Handle<Expression>,
+        offset: Handle<Expression>,
+        width: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let c32 = self.lit_u32(32);
+        let mask31 = self.lit_u32(31);
+        let zero_u = self.lit_u32(0);
+        let zero_i = self.lit_i32(0);
+        let sum = self.emit_bin(BinaryOperator::Add, offset, width);
+        let is_wide = self.emit_bin(BinaryOperator::GreaterEqual, sum, c32);
+        let is_zero = self.emit_bin(BinaryOperator::Equal, width, zero_u);
+        let wide_val = self.emit_bin(BinaryOperator::ShiftRight, src0_i, offset);
+        let lsh_raw = self.emit_bin(BinaryOperator::Subtract, c32, sum);
+        let lsh = self.emit_bin(BinaryOperator::And, lsh_raw, mask31);
+        let rsh_raw = self.emit_bin(BinaryOperator::Subtract, c32, width);
+        let rsh = self.emit_bin(BinaryOperator::And, rsh_raw, mask31);
+        let shl = self.emit_bin(BinaryOperator::ShiftLeft, src0_i, lsh);
+        let narrow_val = self.emit_bin(BinaryOperator::ShiftRight, shl, rsh);
+        let non_zero = self.emit_select(is_wide, wide_val, narrow_val);
+        self.emit_select(is_zero, zero_i, non_zero)
+    }
+
+    /// IEEE-754 binary32 `frexp` exponent as `i32` (`0` for `0`, `Inf`, `NaN`; handles subnormals).
+    fn emit_frexp_exp_f32(&mut self, f: Handle<Expression>) -> Handle<Expression> {
+        let bits = self.bitcast_f32_to_u32(f);
+        let s23 = self.lit_u32(23);
+        let exp_mask = self.lit_u32(0xFF);
+        let mant_mask = self.lit_u32(0x007F_FFFF);
+        let zero_u = self.lit_u32(0);
+        let zero_i = self.lit_i32(0);
+        let exp_sh = self.emit_bin(BinaryOperator::ShiftRight, bits, s23);
+        let exp = self.emit_bin(BinaryOperator::And, exp_sh, exp_mask);
+        let mant = self.emit_bin(BinaryOperator::And, bits, mant_mask);
+        let exp_is_zero = self.emit_bin(BinaryOperator::Equal, exp, zero_u);
+        let exp_is_max = self.emit_bin(BinaryOperator::Equal, exp, exp_mask);
+        let mant_is_zero = self.emit_bin(BinaryOperator::Equal, mant, zero_u);
+        let mant_nonzero = self.emit_bin(BinaryOperator::NotEqual, mant, zero_u);
+        let is_zero_val = self.emit_bin(BinaryOperator::LogicalAnd, exp_is_zero, mant_is_zero);
+        let is_special = self.emit_bin(BinaryOperator::LogicalOr, exp_is_max, is_zero_val);
+        let is_subnormal = self.emit_bin(BinaryOperator::LogicalAnd, exp_is_zero, mant_nonzero);
+
+        let exp_i = self.bitcast_u32_to_i32(exp);
+        let bias = self.lit_i32(126);
+        let norm_exp = self.emit_bin(BinaryOperator::Subtract, exp_i, bias);
+
+        let clz = self.emit_expr(Expression::Math {
+            fun: MathFunction::CountLeadingZeros,
+            arg: mant,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+        let clz_i = self.bitcast_u32_to_i32(clz);
+        let sub_base = self.lit_i32(-117);
+        let sub_exp = self.emit_bin(BinaryOperator::Subtract, sub_base, clz_i);
+
+        let finite_exp = self.emit_select(is_subnormal, sub_exp, norm_exp);
+        self.emit_select(is_special, zero_i, finite_exp)
+    }
+
+    /// IEEE-754 binary32 `frexp` mantissa as `f32` in `(-1, -0.5] U [0.5, 1)` (preserves `0/Inf/NaN`).
+    fn emit_frexp_mant_f32(&mut self, f: Handle<Expression>) -> Handle<Expression> {
+        let bits = self.bitcast_f32_to_u32(f);
+        let s23 = self.lit_u32(23);
+        let exp_mask = self.lit_u32(0xFF);
+        let mant_mask = self.lit_u32(0x007F_FFFF);
+        let sign_mask = self.lit_u32(0x8000_0000);
+        let sign_mant_mask = self.lit_u32(0x807F_FFFF);
+        let half_exp_bits = self.lit_u32(0x3F00_0000);
+        let zero_u = self.lit_u32(0);
+        let exp_sh = self.emit_bin(BinaryOperator::ShiftRight, bits, s23);
+        let exp = self.emit_bin(BinaryOperator::And, exp_sh, exp_mask);
+        let mant = self.emit_bin(BinaryOperator::And, bits, mant_mask);
+        let exp_is_zero = self.emit_bin(BinaryOperator::Equal, exp, zero_u);
+        let exp_is_max = self.emit_bin(BinaryOperator::Equal, exp, exp_mask);
+        let mant_is_zero = self.emit_bin(BinaryOperator::Equal, mant, zero_u);
+        let mant_nonzero = self.emit_bin(BinaryOperator::NotEqual, mant, zero_u);
+        let is_zero_val = self.emit_bin(BinaryOperator::LogicalAnd, exp_is_zero, mant_is_zero);
+        let is_special = self.emit_bin(BinaryOperator::LogicalOr, exp_is_max, is_zero_val);
+        let is_subnormal = self.emit_bin(BinaryOperator::LogicalAnd, exp_is_zero, mant_nonzero);
+
+        let norm_kept = self.emit_bin(BinaryOperator::And, bits, sign_mant_mask);
+        let norm_bits = self.emit_bin(BinaryOperator::InclusiveOr, norm_kept, half_exp_bits);
+
+        let clz = self.emit_expr(Expression::Math {
+            fun: MathFunction::CountLeadingZeros,
+            arg: mant,
+            arg1: None,
+            arg2: None,
+            arg3: None,
+        });
+        let c8 = self.lit_u32(8);
+        let mask31 = self.lit_u32(31);
+        let sub_sh_raw = self.emit_bin(BinaryOperator::Subtract, clz, c8);
+        let sub_sh = self.emit_bin(BinaryOperator::And, sub_sh_raw, mask31);
+        let sub_m_sh = self.emit_bin(BinaryOperator::ShiftLeft, mant, sub_sh);
+        let sub_m = self.emit_bin(BinaryOperator::And, sub_m_sh, mant_mask);
+        let sign_bit = self.emit_bin(BinaryOperator::And, bits, sign_mask);
+        let sub_s = self.emit_bin(BinaryOperator::InclusiveOr, sign_bit, half_exp_bits);
+        let sub_bits = self.emit_bin(BinaryOperator::InclusiveOr, sub_s, sub_m);
+
+        let finite_bits = self.emit_select(is_subnormal, sub_bits, norm_bits);
+        let res_bits = self.emit_select(is_special, bits, finite_bits);
+        self.bitcast_u32_to_f32(res_bits)
     }
 
     /// Evaluate any of the 16 IEEE-754 floating-point comparison condition codes (NaN-aware):
@@ -14256,6 +14860,26 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_dot4c_i32_i8: vdst = sum_{k=0..4}(sext8(src0.b[k]) * sext8(src1.b[k])) + vdst
+            0x0D => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let acc_f = self.load_vgpr_f32(vdst);
+                let acc = self.bitcast_f32_to_i32(acc_f);
+                let res = self.emit_dot4_i32_i8(a, b, acc, clamp);
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_dot8c_i32_i4: vdst = sum_{k=0..8}(sext4(src0.n[k]) * sext4(src1.n[k])) + vdst
+            0x0E => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let acc_f = self.load_vgpr_f32(vdst);
+                let acc = self.bitcast_f32_to_i32(acc_f);
+                let res = self.emit_dot8_i32_i4(a, b, acc, clamp);
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
             // v_min_f32 / v_max_f32
             0x0F | 0x10 => {
                 let l = self.read_src_f32(src0, literal, abs0, neg0);
@@ -14633,6 +15257,37 @@ impl IrEmitter {
                 self.store_vgpr_f16_lo(vdst, out);
                 true
             }
+            // v_ldexp_f16: vdst.lo = ldexp(f16(src0.lo), sext16(src1.lo))
+            0x3B => {
+                let mut a =
+                    self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
+                let exp_raw = self.read_src_i32(src1, literal);
+                let sh16 = self.lit_u32(16);
+                let exp_shl = self.emit_bin(BinaryOperator::ShiftLeft, exp_raw, sh16);
+                let exp_i16 = self.emit_bin(BinaryOperator::ShiftRight, exp_shl, sh16);
+                let lo_e = self.lit_i32(-64);
+                let hi_e = self.lit_i32(64);
+                let exp_clamped = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Clamp,
+                    arg: exp_i16,
+                    arg1: Some(lo_e),
+                    arg2: Some(hi_e),
+                    arg3: None,
+                });
+                if self.is_const_expr(a) && self.is_const_expr(exp_clamped) {
+                    a = self.call_pg6_rt_f32(a);
+                }
+                let res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Ldexp,
+                    arg: a,
+                    arg1: Some(exp_clamped),
+                    arg2: None,
+                    arg3: None,
+                });
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f16_lo(vdst, out);
+                true
+            }
             // v_pk_fmac_f16: packed 2xf16 fma(src0, src1, vdst) via unpack2x16float/pack2x16float
             0x3C => {
                 let a = self.read_src_pk_f16(src0, literal, false, true, neg0, neg0);
@@ -14982,6 +15637,18 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_bfe_i32: signed bitfield extract (offset = src1[4:0], width = src2[4:0])
+            0x149 => {
+                let s0_i = self.read_src_i32(src0, literal);
+                let s1 = self.read_src_u32(src1, literal);
+                let s2 = self.read_src_u32(src2, literal);
+                let mask31 = self.lit_u32(31);
+                let offset = self.emit_bin(BinaryOperator::And, s1, mask31);
+                let width = self.emit_bin(BinaryOperator::And, s2, mask31);
+                let res_i = self.emit_bfe_i32(s0_i, offset, width);
+                self.store_vgpr_i32(vdst, res_i);
+                true
+            }
             // v_bfi_b32: (src0 & src1) | (~src0 & src2)
             0x14A => {
                 let mask = self.read_src_u32(src0, literal);
@@ -15009,54 +15676,76 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
-            // v_alignbit_b32: funnel shift right of (src0:src1) by (src2 & 31)
-            0x14E => {
+            // v_lerp_u8: per-byte average ((src0.b[k] + src1.b[k] + (src2.b[k] & 1)) >> 1)
+            0x14D => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask_ff = self.lit_u32(0xFF);
+                let one = self.lit_u32(1);
+                let mut res = self.lit_u32(0);
+                for k in 0..4u32 {
+                    let sh = self.lit_u32(k * 8);
+                    let a_k = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, a, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, a, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let b_k = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, b, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, b, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let c_k = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, c, one)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, c, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, one)
+                    };
+                    let ab = self.emit_bin(BinaryOperator::Add, a_k, b_k);
+                    let abc = self.emit_bin(BinaryOperator::Add, ab, c_k);
+                    let avg = self.emit_bin(BinaryOperator::ShiftRight, abc, one);
+                    let byte_v = self.emit_bin(BinaryOperator::And, avg, mask_ff);
+                    let placed = if k == 0 {
+                        byte_v
+                    } else {
+                        self.emit_bin(BinaryOperator::ShiftLeft, byte_v, sh)
+                    };
+                    res = if k == 0 {
+                        placed
+                    } else {
+                        self.emit_bin(BinaryOperator::InclusiveOr, res, placed)
+                    };
+                }
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_alignbit_b32 (0x14E) / v_alignbyte_b32 (0x14F):
+            //   funnel shift right of (src0:src1) by (src2 & 31) bits or ((src2 & 3) * 8) bits
+            0x14E | 0x14F => {
                 let hi = self.read_src_u32(src0, literal);
                 let lo = self.read_src_u32(src1, literal);
                 let sh_raw = self.read_src_u32(src2, literal);
                 let mask31 = self.lit_u32(31);
-                let sh = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::And,
-                    left: sh_raw,
-                    right: mask31,
-                });
+                let sh = if op == 0x14E {
+                    self.emit_bin(BinaryOperator::And, sh_raw, mask31)
+                } else {
+                    let mask3 = self.lit_u32(3);
+                    let sh3 = self.lit_u32(3);
+                    let bytes = self.emit_bin(BinaryOperator::And, sh_raw, mask3);
+                    self.emit_bin(BinaryOperator::ShiftLeft, bytes, sh3)
+                };
                 let zero = self.lit_u32(0);
-                let is_zero = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::Equal,
-                    left: sh,
-                    right: zero,
-                });
+                let is_zero = self.emit_bin(BinaryOperator::Equal, sh, zero);
                 let c32 = self.lit_u32(32);
-                let inv_sh_raw = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::Subtract,
-                    left: c32,
-                    right: sh,
-                });
-                let inv_sh = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::And,
-                    left: inv_sh_raw,
-                    right: mask31,
-                });
-                let hi_part = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::ShiftLeft,
-                    left: hi,
-                    right: inv_sh,
-                });
-                let lo_part = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::ShiftRight,
-                    left: lo,
-                    right: sh,
-                });
-                let shifted = self.emit_expr(Expression::Binary {
-                    op: BinaryOperator::InclusiveOr,
-                    left: hi_part,
-                    right: lo_part,
-                });
-                let res = self.emit_expr(Expression::Select {
-                    condition: is_zero,
-                    accept: lo,
-                    reject: shifted,
-                });
+                let inv_sh_raw = self.emit_bin(BinaryOperator::Subtract, c32, sh);
+                let inv_sh = self.emit_bin(BinaryOperator::And, inv_sh_raw, mask31);
+                let hi_part = self.emit_bin(BinaryOperator::ShiftLeft, hi, inv_sh);
+                let lo_part = self.emit_bin(BinaryOperator::ShiftRight, lo, sh);
+                let shifted = self.emit_bin(BinaryOperator::InclusiveOr, hi_part, lo_part);
+                let res = self.emit_select(is_zero, lo, shifted);
                 self.store_vgpr_u32(vdst, res);
                 true
             }
@@ -15220,6 +15909,92 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_sad_u8 (0x15A) / v_sad_hi_u8 (0x15B) / v_msad_u8 (0x165):
+            //   sum of absolute differences over 4 unsigned bytes + src2 (shifted <<16 for sad_hi)
+            0x15A | 0x15B | 0x165 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask_ff = self.lit_u32(0xFF);
+                let zero = self.lit_u32(0);
+                let mut acc = zero;
+                for k in 0..4u32 {
+                    let sh = self.lit_u32(k * 8);
+                    let a_k = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, a, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, a, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let b_k = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, b, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, b, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let a_ge_b = self.emit_bin(BinaryOperator::GreaterEqual, a_k, b_k);
+                    let ab = self.emit_bin(BinaryOperator::Subtract, a_k, b_k);
+                    let ba = self.emit_bin(BinaryOperator::Subtract, b_k, a_k);
+                    let diff = self.emit_select(a_ge_b, ab, ba);
+                    let term = if op == 0x165 {
+                        let b_zero = self.emit_bin(BinaryOperator::Equal, b_k, zero);
+                        self.emit_select(b_zero, zero, diff)
+                    } else {
+                        diff
+                    };
+                    acc = if k == 0 {
+                        term
+                    } else {
+                        self.emit_bin(BinaryOperator::Add, acc, term)
+                    };
+                }
+                let sad = if op == 0x15B {
+                    let sh16 = self.lit_u32(16);
+                    self.emit_bin(BinaryOperator::ShiftLeft, acc, sh16)
+                } else {
+                    acc
+                };
+                let res = self.emit_add_sat_u32(sad, c, clamp);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_sad_u16: |a.lo - b.lo| + |a.hi - b.hi| + c
+            0x15C => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask16 = self.lit_u32(0xFFFF);
+                let sh16 = self.lit_u32(16);
+                let a0 = self.emit_bin(BinaryOperator::And, a, mask16);
+                let b0 = self.emit_bin(BinaryOperator::And, b, mask16);
+                let a1 = self.emit_bin(BinaryOperator::ShiftRight, a, sh16);
+                let b1 = self.emit_bin(BinaryOperator::ShiftRight, b, sh16);
+                let ge0 = self.emit_bin(BinaryOperator::GreaterEqual, a0, b0);
+                let ab0 = self.emit_bin(BinaryOperator::Subtract, a0, b0);
+                let ba0 = self.emit_bin(BinaryOperator::Subtract, b0, a0);
+                let d0 = self.emit_select(ge0, ab0, ba0);
+                let ge1 = self.emit_bin(BinaryOperator::GreaterEqual, a1, b1);
+                let ab1 = self.emit_bin(BinaryOperator::Subtract, a1, b1);
+                let ba1 = self.emit_bin(BinaryOperator::Subtract, b1, a1);
+                let d1 = self.emit_select(ge1, ab1, ba1);
+                let sad = self.emit_bin(BinaryOperator::Add, d0, d1);
+                let res = self.emit_add_sat_u32(sad, c, clamp);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_sad_u32: |src0 - src1| + src2
+            0x15D => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let ge = self.emit_bin(BinaryOperator::GreaterEqual, a, b);
+                let ab = self.emit_bin(BinaryOperator::Subtract, a, b);
+                let ba = self.emit_bin(BinaryOperator::Subtract, b, a);
+                let diff = self.emit_select(ge, ab, ba);
+                let res = self.emit_add_sat_u32(diff, c, clamp);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
             // v_cvt_pk_u8_f32: clamp f32 src0 to [0, 255], convert to u8, pack into byte (src1 & 3) of src2
             0x15E => {
                 let f = self.read_src_f32(src0, literal, abs0, neg0);
@@ -15253,6 +16028,39 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
+            // v_div_fixup_f32: IEEE-754 float division completion (src0 = pre-quotient, src1 = den, src2 = num)
+            0x15F => {
+                let _q = self.read_src_f32(src0, literal, abs0, neg0);
+                let den = self.read_src_f32(src1, literal, abs1, neg1);
+                let num = self.read_src_f32(src2, literal, abs2, neg2);
+                let res = self.emit_bin(BinaryOperator::Divide, num, den);
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_div_fmas_f32: fma(src0, src1, src2) * (vcc ? 2^32 : 1.0)
+            0x163 => {
+                let a = self.read_src_f32(src0, literal, abs0, neg0);
+                let b = self.read_src_f32(src1, literal, abs1, neg1);
+                let c = self.read_src_f32(src2, literal, abs2, neg2);
+                let mut res = self.emit_expr(Expression::Math {
+                    fun: MathFunction::Fma,
+                    arg: a,
+                    arg1: Some(b),
+                    arg2: Some(c),
+                    arg3: None,
+                });
+                if self.vcc_local.is_some() {
+                    let vcc = self.load_vcc();
+                    let scale_hi = self.lit_f32(4_294_967_296.0);
+                    let scale_one = self.lit_f32(1.0);
+                    let scale = self.emit_select(vcc, scale_hi, scale_one);
+                    res = self.emit_bin(BinaryOperator::Multiply, res, scale);
+                }
+                let out = self.apply_float_out_mods(res, omod, clamp);
+                self.store_vgpr_f32(vdst, out);
+                true
+            }
             // v_mul_lo_u32
             0x169 => {
                 let a = self.read_src_u32(src0, literal);
@@ -15263,6 +16071,16 @@ impl IrEmitter {
                     right: b,
                 });
                 self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_div_scale_f32 (VOP3B): pass-through operand with unscaled carry flag (sdst = 0)
+            0x16D => {
+                let a = self.read_src_f32(src0, literal, abs0, neg0);
+                self.store_vgpr_f32(vdst, a);
+                if let Some(sd) = sdst {
+                    let f = self.lit_bool(false);
+                    self.store_lane_mask(sd, f);
+                }
                 true
             }
             // v_add_co_u32 / v_sub_co_u32 / v_subrev_co_u32 (VOP3B with carry-out in sdst)
@@ -15355,6 +16173,30 @@ impl IrEmitter {
                 }
                 true
             }
+            // v_mad_u16: u16(src0) * u16(src1) + u16(src2) with op_sel & optional u16 saturation clamp
+            0x340 => {
+                let a = self.read_src_u16_half(src0, literal, (op_sel & 1) != 0);
+                let b = self.read_src_u16_half(src1, literal, (op_sel & 2) != 0);
+                let c = self.read_src_u16_half(src2, literal, (op_sel & 4) != 0);
+                let prod = self.emit_bin(BinaryOperator::Multiply, a, b);
+                let mut res = self.emit_bin(BinaryOperator::Add, prod, c);
+                if clamp {
+                    let max_u16 = self.lit_u32(0xFFFF);
+                    res = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: res,
+                        arg1: Some(max_u16),
+                        arg2: None,
+                        arg3: None,
+                    });
+                }
+                if (op_sel & 8) != 0 {
+                    self.store_vgpr_u16_hi(vdst, res);
+                } else {
+                    self.store_vgpr_u16_lo(vdst, res);
+                }
+                true
+            }
             // v_interp_p1ll_f16 (0x342), v_interp_p1lv_f16 (0x343), v_interp_p2_f16 (0x35A):
             // GFX10.3 VOP3 16-bit fragment attribute interpolation.
             // src0 packs {high[8], attrchan[7:6], attr[5:0]}; op_sel[3] selects dst lo/hi f16 half on p2.
@@ -15389,6 +16231,74 @@ impl IrEmitter {
                 } else {
                     self.store_vgpr_f32(vdst, out);
                 }
+                true
+            }
+            // v_perm_b32: byte permute over 8-byte concat (src0=bytes[4..7], src1=bytes[0..3]) via src2
+            0x344 => {
+                let s0 = self.read_src_u32(src0, literal);
+                let s1 = self.read_src_u32(src1, literal);
+                let s2 = self.read_src_u32(src2, literal);
+                let mask_ff = self.lit_u32(0xFF);
+                let mask3 = self.lit_u32(3);
+                let c0 = self.lit_u32(0);
+                let c1 = self.lit_u32(1);
+                let c2 = self.lit_u32(2);
+                let c3 = self.lit_u32(3);
+                let c4 = self.lit_u32(4);
+                let c8 = self.lit_u32(8);
+                let c12 = self.lit_u32(12);
+                let c15 = self.lit_u32(15);
+                let c31 = self.lit_u32(31);
+                let mut res = c0;
+                for k in 0..4u32 {
+                    let k_sh = self.lit_u32(k * 8);
+                    let sel = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, s2, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, s2, k_sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    // 0..7: byte from s1 (0..3) or s0 (4..7)
+                    let bit2 = self.emit_bin(BinaryOperator::And, sel, c4);
+                    let from_s0 = self.emit_bin(BinaryOperator::NotEqual, bit2, c0);
+                    let src_word = self.emit_select(from_s0, s0, s1);
+                    let lane = self.emit_bin(BinaryOperator::And, sel, mask3);
+                    let lane_sh = self.emit_bin(BinaryOperator::ShiftLeft, lane, c3);
+                    let b_sh = self.emit_bin(BinaryOperator::ShiftRight, src_word, lane_sh);
+                    let b_in = self.emit_bin(BinaryOperator::And, b_sh, mask_ff);
+
+                    // 8..11: sign extension of s1[15], s1[31], s0[15], s0[31]
+                    let sbit1 = self.emit_bin(BinaryOperator::And, sel, c2);
+                    let sign_from_s0 = self.emit_bin(BinaryOperator::NotEqual, sbit1, c0);
+                    let sign_word = self.emit_select(sign_from_s0, s0, s1);
+                    let sbit0 = self.emit_bin(BinaryOperator::And, sel, c1);
+                    let sign_hi = self.emit_bin(BinaryOperator::NotEqual, sbit0, c0);
+                    let sign_pos = self.emit_select(sign_hi, c31, c15);
+                    let sign_sh = self.emit_bin(BinaryOperator::ShiftRight, sign_word, sign_pos);
+                    let sign_lsb = self.emit_bin(BinaryOperator::And, sign_sh, c1);
+                    let is_neg = self.emit_bin(BinaryOperator::NotEqual, sign_lsb, c0);
+                    let b_sign = self.emit_select(is_neg, mask_ff, c0);
+
+                    // 12 -> 0x00, >=13 -> 0xFF
+                    let is_12 = self.emit_bin(BinaryOperator::Equal, sel, c12);
+                    let b_const = self.emit_select(is_12, c0, mask_ff);
+
+                    let lt8 = self.emit_bin(BinaryOperator::Less, sel, c8);
+                    let lt12 = self.emit_bin(BinaryOperator::Less, sel, c12);
+                    let b_hi = self.emit_select(lt12, b_sign, b_const);
+                    let byte_v = self.emit_select(lt8, b_in, b_hi);
+                    let placed = if k == 0 {
+                        byte_v
+                    } else {
+                        self.emit_bin(BinaryOperator::ShiftLeft, byte_v, k_sh)
+                    };
+                    res = if k == 0 {
+                        placed
+                    } else {
+                        self.emit_bin(BinaryOperator::InclusiveOr, res, placed)
+                    };
+                }
+                self.store_vgpr_u32(vdst, res);
                 true
             }
             // v_xad_u32: (src0 ^ src1) + src2
@@ -15449,11 +16359,32 @@ impl IrEmitter {
                 self.store_vgpr_u32(vdst, res);
                 true
             }
-            // v_fma_f16: vdst.lo = fma(src0.lo, src1.lo, src2.lo)
+            // v_fma_f16: vdst.{lo,hi} = fma(src0.{lo,hi}, src1.{lo,hi}, src2.{lo,hi}) per op_sel
             0x34B => {
-                let a = self.read_src_mixed_f16_or_f32(src0, literal, true, false, abs0, neg0);
-                let b = self.read_src_mixed_f16_or_f32(src1, literal, true, false, abs1, neg1);
-                let c = self.read_src_mixed_f16_or_f32(src2, literal, true, false, abs2, neg2);
+                let a = self.read_src_mixed_f16_or_f32(
+                    src0,
+                    literal,
+                    true,
+                    (op_sel & 1) != 0,
+                    abs0,
+                    neg0,
+                );
+                let b = self.read_src_mixed_f16_or_f32(
+                    src1,
+                    literal,
+                    true,
+                    (op_sel & 2) != 0,
+                    abs1,
+                    neg1,
+                );
+                let c = self.read_src_mixed_f16_or_f32(
+                    src2,
+                    literal,
+                    true,
+                    (op_sel & 4) != 0,
+                    abs2,
+                    neg2,
+                );
                 let res = self.emit_expr(Expression::Math {
                     fun: MathFunction::Fma,
                     arg: a,
@@ -15462,7 +16393,37 @@ impl IrEmitter {
                     arg3: None,
                 });
                 let out = self.apply_float_out_mods(res, omod, clamp);
-                self.store_vgpr_f16_lo(vdst, out);
+                if (op_sel & 8) != 0 {
+                    self.store_vgpr_f16_hi(vdst, out);
+                } else {
+                    self.store_vgpr_f16_lo(vdst, out);
+                }
+                true
+            }
+            // v_mad_i16: i16(src0) * i16(src1) + i16(src2) with op_sel & optional i16 saturation clamp
+            0x35E => {
+                let a = self.read_src_i16_half(src0, literal, (op_sel & 1) != 0);
+                let b = self.read_src_i16_half(src1, literal, (op_sel & 2) != 0);
+                let c = self.read_src_i16_half(src2, literal, (op_sel & 4) != 0);
+                let prod = self.emit_bin(BinaryOperator::Multiply, a, b);
+                let mut res = self.emit_bin(BinaryOperator::Add, prod, c);
+                if clamp {
+                    let lo_i16 = self.lit_i32(-32768);
+                    let hi_i16 = self.lit_i32(32767);
+                    res = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: res,
+                        arg1: Some(lo_i16),
+                        arg2: Some(hi_i16),
+                        arg3: None,
+                    });
+                }
+                let res_u = self.bitcast_i32_to_u32(res);
+                if (op_sel & 8) != 0 {
+                    self.store_vgpr_u16_hi(vdst, res_u);
+                } else {
+                    self.store_vgpr_u16_lo(vdst, res_u);
+                }
                 true
             }
             // v_readlane_b32 sdst, vsrc0, ssrc1: read a lane of vsrc0 into scalar sdst.
@@ -15624,6 +16585,216 @@ impl IrEmitter {
         }
     }
 
+    /// Extract one unsigned 16-bit half (`hi_half == false` -> `[15:0]`, `true` -> `[31:16]`) as `u32`.
+    fn read_src_u16_half(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+        hi_half: bool,
+    ) -> Handle<Expression> {
+        let u = self.read_src_u32(src, literal);
+        if hi_half {
+            let sh16 = self.lit_u32(16);
+            self.emit_bin(BinaryOperator::ShiftRight, u, sh16)
+        } else {
+            let mask16 = self.lit_u32(0xFFFF);
+            self.emit_bin(BinaryOperator::And, u, mask16)
+        }
+    }
+
+    /// Extract one signed 16-bit half (`hi_half == false` -> `[15:0]`, `true` -> `[31:16]`) as `i32`.
+    fn read_src_i16_half(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+        hi_half: bool,
+    ) -> Handle<Expression> {
+        let i = self.read_src_i32(src, literal);
+        let sh16 = self.lit_u32(16);
+        if hi_half {
+            self.emit_bin(BinaryOperator::ShiftRight, i, sh16)
+        } else {
+            let shl = self.emit_bin(BinaryOperator::ShiftLeft, i, sh16);
+            self.emit_bin(BinaryOperator::ShiftRight, shl, sh16)
+        }
+    }
+
+    /// Extract packed 2x`u16` lanes as `(lo, hi)` `u32` values respecting `op_sel` / `op_sel_hi`.
+    fn read_pk_u16_lanes(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+        sel_lo: bool,
+        sel_hi: bool,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let u = self.read_src_u32(src, literal);
+        let mask16 = self.lit_u32(0xFFFF);
+        let sh16 = self.lit_u32(16);
+        let lo_raw = self.emit_bin(BinaryOperator::And, u, mask16);
+        let hi_raw = self.emit_bin(BinaryOperator::ShiftRight, u, sh16);
+        (
+            if sel_lo { hi_raw } else { lo_raw },
+            if sel_hi { hi_raw } else { lo_raw },
+        )
+    }
+
+    /// Extract packed 2x`i16` lanes as `(lo, hi)` sign-extended `i32` values respecting `op_sel` / `op_sel_hi`.
+    fn read_pk_i16_lanes(
+        &mut self,
+        src: u16,
+        literal: Option<u32>,
+        sel_lo: bool,
+        sel_hi: bool,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let i = self.read_src_i32(src, literal);
+        let sh16 = self.lit_u32(16);
+        let lo_shl = self.emit_bin(BinaryOperator::ShiftLeft, i, sh16);
+        let lo_raw = self.emit_bin(BinaryOperator::ShiftRight, lo_shl, sh16);
+        let hi_raw = self.emit_bin(BinaryOperator::ShiftRight, i, sh16);
+        (
+            if sel_lo { hi_raw } else { lo_raw },
+            if sel_hi { hi_raw } else { lo_raw },
+        )
+    }
+
+    /// Pack two 16-bit lane values `(lo, hi)` (as `u32`) into a 32-bit VGPR.
+    fn pack_u16_pair_and_store(
+        &mut self,
+        vdst: u8,
+        lo: Handle<Expression>,
+        hi: Handle<Expression>,
+    ) {
+        let mask16 = self.lit_u32(0xFFFF);
+        let sh16 = self.lit_u32(16);
+        let lo_m = self.emit_bin(BinaryOperator::And, lo, mask16);
+        let hi_sh = self.emit_bin(BinaryOperator::ShiftLeft, hi, sh16);
+        let packed = self.emit_bin(BinaryOperator::InclusiveOr, lo_m, hi_sh);
+        self.store_vgpr_u32(vdst, packed);
+    }
+
+    /// Unsigned 32-bit addition with optional saturation to `u32::MAX` (`clamp`).
+    fn emit_add_sat_u32(
+        &mut self,
+        a: Handle<Expression>,
+        b: Handle<Expression>,
+        clamp: bool,
+    ) -> Handle<Expression> {
+        let sum = self.emit_bin(BinaryOperator::Add, a, b);
+        if !clamp {
+            return sum;
+        }
+        let ovf = self.emit_bin(BinaryOperator::Less, sum, a);
+        let max_u = self.lit_u32(u32::MAX);
+        self.emit_select(ovf, max_u, sum)
+    }
+
+    /// Signed 32-bit addition with optional saturation to `[i32::MIN, i32::MAX]` (`clamp`).
+    fn emit_add_sat_i32(
+        &mut self,
+        a: Handle<Expression>,
+        b: Handle<Expression>,
+        clamp: bool,
+    ) -> Handle<Expression> {
+        let sum = self.emit_bin(BinaryOperator::Add, a, b);
+        if !clamp {
+            return sum;
+        }
+        let zero = self.lit_i32(0);
+        let a_pos = self.emit_bin(BinaryOperator::Greater, a, zero);
+        let b_pos = self.emit_bin(BinaryOperator::Greater, b, zero);
+        let sum_neg = self.emit_bin(BinaryOperator::Less, sum, zero);
+        let ab_pos = self.emit_bin(BinaryOperator::LogicalAnd, a_pos, b_pos);
+        let pos_ovf = self.emit_bin(BinaryOperator::LogicalAnd, ab_pos, sum_neg);
+
+        let a_neg = self.emit_bin(BinaryOperator::Less, a, zero);
+        let b_neg = self.emit_bin(BinaryOperator::Less, b, zero);
+        let sum_ge0 = self.emit_bin(BinaryOperator::GreaterEqual, sum, zero);
+        let ab_neg = self.emit_bin(BinaryOperator::LogicalAnd, a_neg, b_neg);
+        let neg_ovf = self.emit_bin(BinaryOperator::LogicalAnd, ab_neg, sum_ge0);
+
+        let max_i = self.lit_i32(i32::MAX);
+        let min_u = self.lit_u32(0x8000_0000);
+        let min_i = self.bitcast_u32_to_i32(min_u);
+        let clamped_neg = self.emit_select(neg_ovf, min_i, sum);
+        self.emit_select(pos_ovf, max_i, clamped_neg)
+    }
+
+    /// Signed 4x8-bit integer dot-product with `i32` accumulate (`v_dot4_i32_i8` / `v_dot4c_i32_i8`).
+    fn emit_dot4_i32_i8(
+        &mut self,
+        a_u: Handle<Expression>,
+        b_u: Handle<Expression>,
+        acc: Handle<Expression>,
+        clamp: bool,
+    ) -> Handle<Expression> {
+        let a_i = self.bitcast_u32_to_i32(a_u);
+        let b_i = self.bitcast_u32_to_i32(b_u);
+        let sh24 = self.lit_u32(24);
+        let mut dot = self.lit_i32(0);
+        for k in 0..4u32 {
+            let lsh = 24 - k * 8;
+            let ak = if lsh == 0 {
+                self.emit_bin(BinaryOperator::ShiftRight, a_i, sh24)
+            } else {
+                let sh = self.lit_u32(lsh);
+                let tmp = self.emit_bin(BinaryOperator::ShiftLeft, a_i, sh);
+                self.emit_bin(BinaryOperator::ShiftRight, tmp, sh24)
+            };
+            let bk = if lsh == 0 {
+                self.emit_bin(BinaryOperator::ShiftRight, b_i, sh24)
+            } else {
+                let sh = self.lit_u32(lsh);
+                let tmp = self.emit_bin(BinaryOperator::ShiftLeft, b_i, sh);
+                self.emit_bin(BinaryOperator::ShiftRight, tmp, sh24)
+            };
+            let prod = self.emit_bin(BinaryOperator::Multiply, ak, bk);
+            dot = if k == 0 {
+                prod
+            } else {
+                self.emit_bin(BinaryOperator::Add, dot, prod)
+            };
+        }
+        self.emit_add_sat_i32(dot, acc, clamp)
+    }
+
+    /// Signed 8x4-bit integer dot-product with `i32` accumulate (`v_dot8_i32_i4` / `v_dot8c_i32_i4`).
+    fn emit_dot8_i32_i4(
+        &mut self,
+        a_u: Handle<Expression>,
+        b_u: Handle<Expression>,
+        acc: Handle<Expression>,
+        clamp: bool,
+    ) -> Handle<Expression> {
+        let a_i = self.bitcast_u32_to_i32(a_u);
+        let b_i = self.bitcast_u32_to_i32(b_u);
+        let sh28 = self.lit_u32(28);
+        let mut dot = self.lit_i32(0);
+        for k in 0..8u32 {
+            let lsh = 28 - k * 4;
+            let ak = if lsh == 0 {
+                self.emit_bin(BinaryOperator::ShiftRight, a_i, sh28)
+            } else {
+                let sh = self.lit_u32(lsh);
+                let tmp = self.emit_bin(BinaryOperator::ShiftLeft, a_i, sh);
+                self.emit_bin(BinaryOperator::ShiftRight, tmp, sh28)
+            };
+            let bk = if lsh == 0 {
+                self.emit_bin(BinaryOperator::ShiftRight, b_i, sh28)
+            } else {
+                let sh = self.lit_u32(lsh);
+                let tmp = self.emit_bin(BinaryOperator::ShiftLeft, b_i, sh);
+                self.emit_bin(BinaryOperator::ShiftRight, tmp, sh28)
+            };
+            let prod = self.emit_bin(BinaryOperator::Multiply, ak, bk);
+            dot = if k == 0 {
+                prod
+            } else {
+                self.emit_bin(BinaryOperator::Add, dot, prod)
+            };
+        }
+        self.emit_add_sat_i32(dot, acc, clamp)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn translate_vop3p(
         &mut self,
@@ -15681,6 +16852,259 @@ impl IrEmitter {
         };
 
         match op {
+            // v_pk_mad_i16: packed 2xi16 a * b + c (optional i16 clamp)
+            0x00 => {
+                let (a0, a1) =
+                    self.read_pk_i16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_i16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let (c0, c1) =
+                    self.read_pk_i16_lanes(src2, literal, (op_sel & 4) != 0, (op_sel_hi & 4) != 0);
+                let p0 = self.emit_bin(BinaryOperator::Multiply, a0, b0);
+                let p1 = self.emit_bin(BinaryOperator::Multiply, a1, b1);
+                let mut r0 = self.emit_bin(BinaryOperator::Add, p0, c0);
+                let mut r1 = self.emit_bin(BinaryOperator::Add, p1, c1);
+                if clamp {
+                    let lo_i16 = self.lit_i32(-32768);
+                    let hi_i16 = self.lit_i32(32767);
+                    r0 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: r0,
+                        arg1: Some(lo_i16),
+                        arg2: Some(hi_i16),
+                        arg3: None,
+                    });
+                    r1 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: r1,
+                        arg1: Some(lo_i16),
+                        arg2: Some(hi_i16),
+                        arg3: None,
+                    });
+                }
+                let u0 = self.bitcast_i32_to_u32(r0);
+                let u1 = self.bitcast_i32_to_u32(r1);
+                self.pack_u16_pair_and_store(vdst, u0, u1);
+                true
+            }
+            // v_pk_mul_lo_u16: packed 2xu16 (a * b) & 0xFFFF
+            0x01 => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_u16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let r0 = self.emit_bin(BinaryOperator::Multiply, a0, b0);
+                let r1 = self.emit_bin(BinaryOperator::Multiply, a1, b1);
+                self.pack_u16_pair_and_store(vdst, r0, r1);
+                true
+            }
+            // v_pk_add_i16 (0x02) / v_pk_sub_i16 (0x03): packed 2xi16 add/sub (optional i16 clamp)
+            0x02 | 0x03 => {
+                let (a0, a1) =
+                    self.read_pk_i16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_i16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let bin = if op == 0x02 {
+                    BinaryOperator::Add
+                } else {
+                    BinaryOperator::Subtract
+                };
+                let mut r0 = self.emit_bin(bin, a0, b0);
+                let mut r1 = self.emit_bin(bin, a1, b1);
+                if clamp {
+                    let lo_i16 = self.lit_i32(-32768);
+                    let hi_i16 = self.lit_i32(32767);
+                    r0 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: r0,
+                        arg1: Some(lo_i16),
+                        arg2: Some(hi_i16),
+                        arg3: None,
+                    });
+                    r1 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: r1,
+                        arg1: Some(lo_i16),
+                        arg2: Some(hi_i16),
+                        arg3: None,
+                    });
+                }
+                let u0 = self.bitcast_i32_to_u32(r0);
+                let u1 = self.bitcast_i32_to_u32(r1);
+                self.pack_u16_pair_and_store(vdst, u0, u1);
+                true
+            }
+            // v_pk_lshlrev_b16 (0x04) / v_pk_lshrrev_b16 (0x05): packed 2xu16 src1 <</>> (src0 & 15)
+            0x04 | 0x05 => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_u16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let mask15 = self.lit_u32(15);
+                let sh0 = self.emit_bin(BinaryOperator::And, a0, mask15);
+                let sh1 = self.emit_bin(BinaryOperator::And, a1, mask15);
+                let bin = if op == 0x04 {
+                    BinaryOperator::ShiftLeft
+                } else {
+                    BinaryOperator::ShiftRight
+                };
+                let r0 = self.emit_bin(bin, b0, sh0);
+                let r1 = self.emit_bin(bin, b1, sh1);
+                self.pack_u16_pair_and_store(vdst, r0, r1);
+                true
+            }
+            // v_pk_ashrrev_i16: packed 2xi16 i16(src1) >> (src0 & 15)
+            0x06 => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_i16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let mask15 = self.lit_u32(15);
+                let sh0 = self.emit_bin(BinaryOperator::And, a0, mask15);
+                let sh1 = self.emit_bin(BinaryOperator::And, a1, mask15);
+                let r0 = self.emit_bin(BinaryOperator::ShiftRight, b0, sh0);
+                let r1 = self.emit_bin(BinaryOperator::ShiftRight, b1, sh1);
+                let u0 = self.bitcast_i32_to_u32(r0);
+                let u1 = self.bitcast_i32_to_u32(r1);
+                self.pack_u16_pair_and_store(vdst, u0, u1);
+                true
+            }
+            // v_pk_max_i16 (0x07) / v_pk_min_i16 (0x08)
+            0x07 | 0x08 => {
+                let (a0, a1) =
+                    self.read_pk_i16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_i16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let fun = if op == 0x07 {
+                    MathFunction::Max
+                } else {
+                    MathFunction::Min
+                };
+                let r0 = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: a0,
+                    arg1: Some(b0),
+                    arg2: None,
+                    arg3: None,
+                });
+                let r1 = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: a1,
+                    arg1: Some(b1),
+                    arg2: None,
+                    arg3: None,
+                });
+                let u0 = self.bitcast_i32_to_u32(r0);
+                let u1 = self.bitcast_i32_to_u32(r1);
+                self.pack_u16_pair_and_store(vdst, u0, u1);
+                true
+            }
+            // v_pk_mad_u16: packed 2xu16 a * b + c (optional u16 clamp)
+            0x09 => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_u16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let (c0, c1) =
+                    self.read_pk_u16_lanes(src2, literal, (op_sel & 4) != 0, (op_sel_hi & 4) != 0);
+                let p0 = self.emit_bin(BinaryOperator::Multiply, a0, b0);
+                let p1 = self.emit_bin(BinaryOperator::Multiply, a1, b1);
+                let mut r0 = self.emit_bin(BinaryOperator::Add, p0, c0);
+                let mut r1 = self.emit_bin(BinaryOperator::Add, p1, c1);
+                if clamp {
+                    let max_u16 = self.lit_u32(0xFFFF);
+                    r0 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: r0,
+                        arg1: Some(max_u16),
+                        arg2: None,
+                        arg3: None,
+                    });
+                    r1 = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Min,
+                        arg: r1,
+                        arg1: Some(max_u16),
+                        arg2: None,
+                        arg3: None,
+                    });
+                }
+                self.pack_u16_pair_and_store(vdst, r0, r1);
+                true
+            }
+            // v_pk_add_u16 (0x0A) / v_pk_sub_u16 (0x0B): packed 2xu16 add/sub (optional u16 clamp)
+            0x0A | 0x0B => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_u16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let (r0, r1) = if op == 0x0A {
+                    let mut s0 = self.emit_bin(BinaryOperator::Add, a0, b0);
+                    let mut s1 = self.emit_bin(BinaryOperator::Add, a1, b1);
+                    if clamp {
+                        let max_u16 = self.lit_u32(0xFFFF);
+                        s0 = self.emit_expr(Expression::Math {
+                            fun: MathFunction::Min,
+                            arg: s0,
+                            arg1: Some(max_u16),
+                            arg2: None,
+                            arg3: None,
+                        });
+                        s1 = self.emit_expr(Expression::Math {
+                            fun: MathFunction::Min,
+                            arg: s1,
+                            arg1: Some(max_u16),
+                            arg2: None,
+                            arg3: None,
+                        });
+                    }
+                    (s0, s1)
+                } else if clamp {
+                    let zero = self.lit_u32(0);
+                    let d0 = self.emit_bin(BinaryOperator::Subtract, a0, b0);
+                    let d1 = self.emit_bin(BinaryOperator::Subtract, a1, b1);
+                    let lt0 = self.emit_bin(BinaryOperator::Less, a0, b0);
+                    let lt1 = self.emit_bin(BinaryOperator::Less, a1, b1);
+                    (
+                        self.emit_select(lt0, zero, d0),
+                        self.emit_select(lt1, zero, d1),
+                    )
+                } else {
+                    (
+                        self.emit_bin(BinaryOperator::Subtract, a0, b0),
+                        self.emit_bin(BinaryOperator::Subtract, a1, b1),
+                    )
+                };
+                self.pack_u16_pair_and_store(vdst, r0, r1);
+                true
+            }
+            // v_pk_max_u16 (0x0C) / v_pk_min_u16 (0x0D)
+            0x0C | 0x0D => {
+                let (a0, a1) =
+                    self.read_pk_u16_lanes(src0, literal, (op_sel & 1) != 0, (op_sel_hi & 1) != 0);
+                let (b0, b1) =
+                    self.read_pk_u16_lanes(src1, literal, (op_sel & 2) != 0, (op_sel_hi & 2) != 0);
+                let fun = if op == 0x0C {
+                    MathFunction::Max
+                } else {
+                    MathFunction::Min
+                };
+                let r0 = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: a0,
+                    arg1: Some(b0),
+                    arg2: None,
+                    arg3: None,
+                });
+                let r1 = self.emit_expr(Expression::Math {
+                    fun,
+                    arg: a1,
+                    arg1: Some(b1),
+                    arg2: None,
+                    arg3: None,
+                });
+                self.pack_u16_pair_and_store(vdst, r0, r1);
+                true
+            }
             // v_pk_fma_f16
             0x0E => {
                 let a = read_pk(self, src0, 0);
@@ -15751,6 +17175,112 @@ impl IrEmitter {
                 });
                 let out = self.apply_float_out_mods(sum, 0, clamp);
                 self.store_vgpr_f32(vdst, out);
+                true
+            }
+            // v_dot2_i32_i16: sext16(src0.lo)*sext16(src1.lo) + sext16(src0.hi)*sext16(src1.hi) + src2
+            0x14 => {
+                let (a0, a1) = self.read_pk_i16_lanes(src0, literal, false, true);
+                let (b0, b1) = self.read_pk_i16_lanes(src1, literal, false, true);
+                let c = self.read_src_i32(src2, literal);
+                let p0 = self.emit_bin(BinaryOperator::Multiply, a0, b0);
+                let p1 = self.emit_bin(BinaryOperator::Multiply, a1, b1);
+                let dot = self.emit_add_sat_i32(p0, p1, clamp);
+                let res = self.emit_add_sat_i32(dot, c, clamp);
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_dot2_u32_u16: zext16(src0.lo)*zext16(src1.lo) + zext16(src0.hi)*zext16(src1.hi) + src2
+            0x15 => {
+                let (a0, a1) = self.read_pk_u16_lanes(src0, literal, false, true);
+                let (b0, b1) = self.read_pk_u16_lanes(src1, literal, false, true);
+                let c = self.read_src_u32(src2, literal);
+                let p0 = self.emit_bin(BinaryOperator::Multiply, a0, b0);
+                let p1 = self.emit_bin(BinaryOperator::Multiply, a1, b1);
+                let dot = self.emit_add_sat_u32(p0, p1, clamp);
+                let res = self.emit_add_sat_u32(dot, c, clamp);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_dot4_i32_i8: sum_{k=0..4}(sext8(src0.b[k]) * sext8(src1.b[k])) + src2
+            0x16 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_i32(src2, literal);
+                let res = self.emit_dot4_i32_i8(a, b, c, clamp);
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_dot4_u32_u8: sum_{k=0..4}(zext8(src0.b[k]) * zext8(src1.b[k])) + src2
+            0x17 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask_ff = self.lit_u32(0xFF);
+                let mut dot = self.lit_u32(0);
+                for k in 0..4u32 {
+                    let sh = self.lit_u32(k * 8);
+                    let ak = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, a, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, a, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let bk = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, b, mask_ff)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, b, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_ff)
+                    };
+                    let prod = self.emit_bin(BinaryOperator::Multiply, ak, bk);
+                    dot = if k == 0 {
+                        prod
+                    } else {
+                        self.emit_bin(BinaryOperator::Add, dot, prod)
+                    };
+                }
+                let res = self.emit_add_sat_u32(dot, c, clamp);
+                self.store_vgpr_u32(vdst, res);
+                true
+            }
+            // v_dot8_i32_i4: sum_{k=0..8}(sext4(src0.n[k]) * sext4(src1.n[k])) + src2
+            0x18 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_i32(src2, literal);
+                let res = self.emit_dot8_i32_i4(a, b, c, clamp);
+                self.store_vgpr_i32(vdst, res);
+                true
+            }
+            // v_dot8_u32_u4: sum_{k=0..8}(zext4(src0.n[k]) * zext4(src1.n[k])) + src2
+            0x19 => {
+                let a = self.read_src_u32(src0, literal);
+                let b = self.read_src_u32(src1, literal);
+                let c = self.read_src_u32(src2, literal);
+                let mask_f = self.lit_u32(0xF);
+                let mut dot = self.lit_u32(0);
+                for k in 0..8u32 {
+                    let sh = self.lit_u32(k * 4);
+                    let ak = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, a, mask_f)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, a, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_f)
+                    };
+                    let bk = if k == 0 {
+                        self.emit_bin(BinaryOperator::And, b, mask_f)
+                    } else {
+                        let tmp = self.emit_bin(BinaryOperator::ShiftRight, b, sh);
+                        self.emit_bin(BinaryOperator::And, tmp, mask_f)
+                    };
+                    let prod = self.emit_bin(BinaryOperator::Multiply, ak, bk);
+                    dot = if k == 0 {
+                        prod
+                    } else {
+                        self.emit_bin(BinaryOperator::Add, dot, prod)
+                    };
+                }
+                let res = self.emit_add_sat_u32(dot, c, clamp);
+                self.store_vgpr_u32(vdst, res);
                 true
             }
             // v_fma_mix_f32 (0x20), v_fma_mixlo_f16 (0x21), v_fma_mixhi_f16 (0x22):
@@ -16654,6 +18184,81 @@ impl IrEmitter {
         let lds_ptr = self.raw_expr(Expression::GlobalVariable(lds_global));
         let addr_f = self.load_vgpr_f32(addr);
         let addr_u = self.bitcast_f32_to_u32(addr_f);
+
+        // Sub-dword byte/short LDS reads & writes:
+        //   0x39 ds_read_i8, 0x3A ds_read_u8, 0x3B ds_read_i16, 0x3C ds_read_u16
+        //   0x1E ds_write_b8, 0x1F ds_write_b16
+        if matches!(op, 0x1E | 0x1F | 0x39..=0x3C) {
+            let imm16 = u32::from(offset0) | (u32::from(offset1) << 8);
+            let eff_addr = if imm16 == 0 {
+                addr_u
+            } else {
+                let off_lit = self.lit_u32(imm16);
+                self.emit_bin(BinaryOperator::Add, addr_u, off_lit)
+            };
+            let idx = self.lds_masked_dword_index(addr_u, imm16);
+            let elem_ptr = self.emit_expr(Expression::Access {
+                base: lds_ptr,
+                index: idx,
+            });
+            let mask3 = self.lit_u32(3);
+            let sh3 = self.lit_u32(3);
+            let byte_lane = self.emit_bin(BinaryOperator::And, eff_addr, mask3);
+            let shift = self.emit_bin(BinaryOperator::ShiftLeft, byte_lane, sh3);
+            let word = self.emit_expr(Expression::Load { pointer: elem_ptr });
+
+            match op {
+                0x39..=0x3C => {
+                    let shifted = self.emit_bin(BinaryOperator::ShiftRight, word, shift);
+                    match op {
+                        0x3A => {
+                            let m8 = self.lit_u32(0xFF);
+                            let val = self.emit_bin(BinaryOperator::And, shifted, m8);
+                            self.store_vgpr_u32(vdst, val);
+                        }
+                        0x39 => {
+                            let s_i = self.bitcast_u32_to_i32(shifted);
+                            let sh24 = self.lit_u32(24);
+                            let shl = self.emit_bin(BinaryOperator::ShiftLeft, s_i, sh24);
+                            let val = self.emit_bin(BinaryOperator::ShiftRight, shl, sh24);
+                            self.store_vgpr_i32(vdst, val);
+                        }
+                        0x3C => {
+                            let m16 = self.lit_u32(0xFFFF);
+                            let val = self.emit_bin(BinaryOperator::And, shifted, m16);
+                            self.store_vgpr_u32(vdst, val);
+                        }
+                        _ => {
+                            let s_i = self.bitcast_u32_to_i32(shifted);
+                            let sh16 = self.lit_u32(16);
+                            let shl = self.emit_bin(BinaryOperator::ShiftLeft, s_i, sh16);
+                            let val = self.emit_bin(BinaryOperator::ShiftRight, shl, sh16);
+                            self.store_vgpr_i32(vdst, val);
+                        }
+                    }
+                    return true;
+                }
+                _ => {
+                    let width_mask = self.lit_u32(if op == 0x1E { 0xFF } else { 0xFFFF });
+                    let vf = self.load_vgpr_f32(data0);
+                    let vu = self.bitcast_f32_to_u32(vf);
+                    let masked_val = self.emit_bin(BinaryOperator::And, vu, width_mask);
+                    let placed = self.emit_bin(BinaryOperator::ShiftLeft, masked_val, shift);
+                    let slot_mask = self.emit_bin(BinaryOperator::ShiftLeft, width_mask, shift);
+                    let inv_mask = self.emit_bit_not(slot_mask);
+                    let cleared = self.emit_bin(BinaryOperator::And, word, inv_mask);
+                    let new_word = self.emit_bin(BinaryOperator::InclusiveOr, cleared, placed);
+                    self.func.body.push(
+                        Statement::Store {
+                            pointer: elem_ptr,
+                            value: new_word,
+                        },
+                        Span::UNDEFINED,
+                    );
+                    return true;
+                }
+            }
+        }
 
         match lds_op {
             DsLdsOp::ReadContiguous(n) => {
