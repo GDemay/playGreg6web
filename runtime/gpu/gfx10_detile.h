@@ -53,6 +53,9 @@ struct TextureLayoutDesc {
     // 2D array slices (depth must be 1 when > 1). Thin layouts repeat the whole mip chain per
     // slice (addrlib: slice stride = mip-chain size), so the surface is chain x array_size.
     uint32_t array_size = 1;
+    // Optional 8-bit pipe/bank XOR seed (bits [0..7]) applied to intra-64KB-block address bits
+    // [8..15] for GFX10 _X swizzle modes (Sw64KBSX/Sw64KBDX/Sw64KBRX/SwVar*X). Ignored on non-XOR modes.
+    uint32_t pipe_bank_xor = 0;
 };
 
 struct FormatGeometry {
@@ -88,6 +91,10 @@ bool is_swizzle_supported(SwizzleMode mode) noexcept;
 // and `pitch_in_blocks` stride. Returns SIZE_MAX if `mode` or `bytes_per_block` is invalid.
 size_t tiled_byte_offset_2d(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t bytes_per_block,
                             uint32_t pitch_in_blocks) noexcept;
+
+// Same as tiled_byte_offset_2d, with an explicit 8-bit pipe/bank XOR seed for _X swizzle modes.
+size_t tiled_byte_offset_2d_xor(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t bytes_per_block,
+                                uint32_t pitch_in_blocks, uint32_t pipe_bank_xor) noexcept;
 
 // Source bytes detile_subresource needs for subresource `mip` (whole tiles; for Linear the pitched
 // rows). 0 if the format, layout or dimensions are not supported.
