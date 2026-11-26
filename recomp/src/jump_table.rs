@@ -2754,6 +2754,96 @@ mod tests {
         assert!(analysis.jump_tables.is_empty());
     }
 
+    /// Threaded bytecode dispatch: `jmp qword ptr [r12 + rbx*8]` with the index a scrambled
+    /// 16-bit opcode (`imul` by an odd constant, then `movzx` of the low word). Case 0 fetches the
+    /// next opcode and re-dispatches through the same table, with the base set before the merge.
+    /// Returns the code, the four case VAs, both dispatch jumps and the VA of a separate function
+    /// placed after the interpreter.
+    fn threaded_dispatch() -> (Vec<u8>, [u64; 4], [u64; 2], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(edi, word_ptr(rcx))?;
+            a.mov(rsi, rcx)?;
+            lea_rip(a, Register::R12, DATA)?;
+            a.imul_3(eax, edi, 0x3315)?;
+            a.movzx(ebx, ax)?;
+            a.jmp(qword_ptr(r12 + rbx * 8))?;
+            a.add(rsi, 2)?;
+            a.movzx(eax, word_ptr(rsi))?;
+            a.imul_3(eax, eax, 0x3315)?;
+            a.movzx(ebx, ax)?;
+            a.jmp(qword_ptr(r12 + rbx * 8))?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            a.mov(eax, 0x99)?;
+            a.ret()
+        });
+        let mut dec = Decoder::with_ip(64, &code, TEXT, DecoderOptions::NONE);
+        let mut jumps = Vec::new();
+        let mut fetch = 0;
+        let mut other = 0;
+        while dec.can_decode() {
+            let instr = dec.decode();
+            if instr.flow_control() == iced_x86::FlowControl::IndirectBranch {
+                jumps.push(instr.ip());
+                if fetch == 0 {
+                    fetch = instr.next_ip();
+                }
+            }
+            if instr.mnemonic() == iced_x86::Mnemonic::Mov
+                && instr.try_immediate(1).ok() == Some(0x99)
+            {
+                other = instr.ip();
+            }
+        }
+        let four = find_four_cases(&code);
+        (
+            code,
+            [fetch, four[0], four[1], four[2]],
+            [jumps[0], jumps[1]],
+            other,
+        )
+    }
+
+    #[test]
+    fn resolves_threaded_dispatch_through_a_pointer_table_with_decoy_entries() {
+        let (code, cases, jumps, other) = threaded_dispatch();
+        let interpreter_end = (other - TEXT) as u32;
+        let ranges = [
+            (0, interpreter_end, 0),
+            (interpreter_end, code.len() as u32, interpreter_end),
+        ];
+        // The handlers, then entries that are no case of this function: another function's entry,
+        // a value outside the image and a data address. They are left to run-time dispatch.
+        let mut data: Vec<u8> = cases.iter().flat_map(|va| va.to_le_bytes()).collect();
+        for decoy in [other, 0x1234_5678_9abc, DATA] {
+            data.extend_from_slice(&decoy.to_le_bytes());
+        }
+        // An in-function address past the first decoy (`mov rsi, rcx`) is not read as a case.
+        let past = TEXT + 3;
+        data.extend_from_slice(&past.to_le_bytes());
+        let analysis = analyze(&code, &data, &[0, interpreter_end], &ranges);
+        let expected: Vec<Edge> = {
+            let mut sorted = cases.to_vec();
+            sorted.sort_unstable();
+            sorted.into_iter().map(Edge::JumpTable).collect()
+        };
+        for jmp in jumps {
+            let table = &analysis.jump_tables[&jmp];
+            assert!(table.inferred, "the word width is the only bound");
+            assert_eq!(table.load_site, jmp, "the jump reads the table itself");
+            assert_eq!(table.table, DATA);
+            assert_eq!(table.targets, cases);
+            assert_eq!(jump_successors(&analysis.functions[&TEXT], jmp), expected);
+        }
+        let blocks = &analysis.functions[&TEXT].blocks;
+        assert!(!blocks.contains_key(&other) && !blocks.contains_key(&past));
+    }
+
     #[test]
     fn resolves_rva_table_with_separate_table_lea_and_lea_target() {
         // `lea rdx, [__ImageBase]; lea r8, [rdx + DATA_RVA]; mov eax, [r8 + rcx*4]; lea rax, [rdx + rax]; jmp rax`
