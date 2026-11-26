@@ -64,6 +64,12 @@ const HTTPFS_DEFAULT_CACHE_MAX_BYTES = 32 * 1024 * 1024; // 32 MiB default bound
 const HTTPFS_DEFAULT_CACHE_CHUNK_SIZE = 256 * 1024;      // 256 KiB default HTTP Range cache chunk
 const HTTPFS_DEFAULT_READAHEAD_CHUNKS = 2;               // 2 chunks sequential read-ahead prefetch
 const HTTPFS_MAX_READAHEAD_CHUNKS = 8;                   // Upper bound for read-ahead chunk count
+const HTTPFS_DEFAULT_MAX_CONCURRENT_PREFETCHES = 4;      // Cap in-flight background prefetches
+const HTTPFS_DEFAULT_RETRY_BACKOFF_MS = 20;              // Base backoff for opt-in transient retries
+const HTTPFS_MAX_RETRY_BACKOFF_MS = 1000;                // Cap for opt-in transient retry backoff
+const HTTPFS_CLIENT_SYNC_SPIN_ITERS = 64;                // Brief user-space spin before Atomics.wait
+const HTTPFS_HOST_SYNC_SPIN_SINGLE_ITERS = 64;           // Brief host spin after sync hit (1 lane)
+const HTTPFS_HOST_SYNC_SPIN_POOL_ITERS = 16;             // Brief host spin after sync hit (pool)
 const HTTPFS_MAX_TRACKED_URLS = 1024;                    // Bounded metadata maps per worker
 const IMMUTABLE_GAME_RPF_RE = /^\/game\/.+\.rpf$/i;
 const IMMUTABLE_SHADERS_RE = /^\/shaders\/.+$/i;
@@ -214,6 +220,7 @@ function normalizeReadAheadConfig(options = {}, defaultEnabled = false) {
     highReadAheadBytes: pickOpt('highReadAheadBytes'),
     rampMidThreshold: pickOpt('rampMidThreshold'),
     rampHighThreshold: pickOpt('rampHighThreshold'),
+    backgroundPrefetch: Boolean(pickOpt('backgroundPrefetch')),
   };
 }
 
@@ -239,6 +246,7 @@ function createHandleTelemetryRecord(handle, isVideoStream = false) {
     isVideoStream: Boolean(isVideoStream),
     closed: false,
     raBuffer: null,
+    nextRaBuffer: null,
     inFlightReadAhead: null,
   };
 }
@@ -440,12 +448,18 @@ function createEmptyCacheStats() {
   };
 }
 
+function isRetryableHttpStatus(status) {
+  return status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
 /**
- * Bounded in-worker LRU chunk cache + sequential read-ahead prefetcher for
+ * Bounded in-worker LRU chunk cache + adaptive sequential read-ahead prefetcher for
  * immutable `/game/*.rpf` and `/shaders/*` HTTP Range reads.
  *
  * - Safe opt-out when `cacheMaxBytes === 0` (direct uncached HTTP Range reads).
  * - Coalesces duplicate in-flight fetches for the same `(url, chunkIndex)`.
+ * - Zero-copy direct SAB write via `tryReadIntoSync()` / `readInto()`.
+ * - Adaptive sequential read-ahead depth with bounded in-flight prefetch concurrency.
  * - Clamps cleanly at range boundaries and EOF (`206`, `200`, and `416`).
  * - Exposes sanitized telemetry via `getStats()` with zero paths or URLs.
  */
@@ -490,14 +504,58 @@ class HttpfsLruChunkCache {
           : 0;
     }
 
+    const rawMaxRa =
+      opts.maxReadAheadChunks !== undefined && opts.maxReadAheadChunks !== null
+        ? Math.floor(Number(opts.maxReadAheadChunks))
+        : HTTPFS_MAX_READAHEAD_CHUNKS;
+    this._maxReadAheadChunks =
+      this._readAheadChunks > 0
+        ? Math.min(
+            HTTPFS_MAX_READAHEAD_CHUNKS,
+            Math.max(
+              this._readAheadChunks,
+              Number.isFinite(rawMaxRa) && rawMaxRa > 0 ? rawMaxRa : HTTPFS_MAX_READAHEAD_CHUNKS,
+            ),
+          )
+        : 0;
+    this._adaptiveReadAhead =
+      this._readAheadChunks > 0 && opts.adaptiveReadAhead !== false;
+
+    const rawMaxConc =
+      opts.maxConcurrentPrefetches !== undefined && opts.maxConcurrentPrefetches !== null
+        ? Math.floor(Number(opts.maxConcurrentPrefetches))
+        : HTTPFS_DEFAULT_MAX_CONCURRENT_PREFETCHES;
+    this._maxConcurrentPrefetches =
+      Number.isFinite(rawMaxConc) && rawMaxConc > 0
+        ? Math.min(rawMaxConc, HTTPFS_MAX_READAHEAD_CHUNKS)
+        : HTTPFS_DEFAULT_MAX_CONCURRENT_PREFETCHES;
+
+    const rawMaxRetries =
+      opts.maxRetries !== undefined && opts.maxRetries !== null
+        ? Math.floor(Number(opts.maxRetries))
+        : 0;
+    this._maxRetries = Number.isFinite(rawMaxRetries) && rawMaxRetries > 0 ? Math.min(rawMaxRetries, 8) : 0;
+
+    const rawRetryBackoff =
+      opts.retryBackoffMs !== undefined && opts.retryBackoffMs !== null
+        ? Math.floor(Number(opts.retryBackoffMs))
+        : HTTPFS_DEFAULT_RETRY_BACKOFF_MS;
+    this._retryBackoffMs =
+      Number.isFinite(rawRetryBackoff) && rawRetryBackoff >= 0
+        ? Math.min(rawRetryBackoff, HTTPFS_MAX_RETRY_BACKOFF_MS)
+        : HTTPFS_DEFAULT_RETRY_BACKOFF_MS;
+
     this._sequentialThreshold = positiveIntOr(opts.sequentialThreshold, 1);
     this._isCacheableFn =
       typeof opts.isCacheableUrl === 'function' ? opts.isCacheableUrl : isCacheableImmutableUrl;
 
     this._cache = new Map();
     this._cacheBytes = 0;
+    this._mruKey = null;
+    this._generation = 0;
     this._inFlight = new Map();
     this._pendingPrefetches = new Set();
+    this._activePrefetchCount = 0;
     this._fileSizes = new Map();
     this._seqState = new Map();
 
@@ -511,6 +569,7 @@ class HttpfsLruChunkCache {
       crossLaneCoalesced: 0,
       bytesServedFromCache: 0,
       bytesFetchedFromNetwork: 0,
+      retryAttempts: 0,
     };
   }
 
@@ -544,8 +603,12 @@ class HttpfsLruChunkCache {
       cacheMaxBytes: this._cacheMaxBytes,
       chunkSize: this._chunkSize,
       readAheadChunks: this._readAheadChunks,
+      adaptiveReadAhead: this._adaptiveReadAhead,
+      maxReadAheadChunks: this._maxReadAheadChunks,
+      maxConcurrentPrefetches: this._maxConcurrentPrefetches,
       cacheEntries: this._cache.size,
       inFlightRequests: this._inFlight.size,
+      activePrefetches: this._activePrefetchCount,
       cacheHits: this._stats.cacheHits,
       cacheMisses: this._stats.cacheMisses,
       cacheBytes: this._cacheBytes,
@@ -556,6 +619,7 @@ class HttpfsLruChunkCache {
       crossLaneCoalesced: this._stats.crossLaneCoalesced,
       bytesServedFromCache: this._stats.bytesServedFromCache,
       bytesFetchedFromNetwork: this._stats.bytesFetchedFromNetwork,
+      retryAttempts: this._stats.retryAttempts,
     };
   }
 
@@ -569,11 +633,14 @@ class HttpfsLruChunkCache {
     this._stats.crossLaneCoalesced = 0;
     this._stats.bytesServedFromCache = 0;
     this._stats.bytesFetchedFromNetwork = 0;
+    this._stats.retryAttempts = 0;
   }
 
   clear(options = {}) {
+    this._generation += 1;
     this._cache.clear();
     this._cacheBytes = 0;
+    this._mruKey = null;
     this._seqState.clear();
     if (options && options.clearFileSizes) {
       this._fileSizes.clear();
@@ -605,11 +672,15 @@ class HttpfsLruChunkCache {
   }
 
   _touchEntry(key, entry) {
+    if (this._mruKey === key) {
+      return;
+    }
     this._cache.delete(key);
     this._cache.set(key, entry);
+    this._mruKey = key;
   }
 
-  _insertEntry(key, url, chunkIndex, bytes, isPrefetch, consumedPrefetch) {
+  _insertEntry(key, url, chunkIndex, bytes, isPrefetch, consumedPrefetch, takeOwnership = false) {
     if (this._cacheMaxBytes <= 0 || !(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
       return;
     }
@@ -621,20 +692,38 @@ class HttpfsLruChunkCache {
     if (existing) {
       this._cacheBytes -= existing.byteLength;
       this._cache.delete(key);
+      if (this._mruKey === key) {
+        this._mruKey = null;
+      }
     }
 
     while (this._cacheBytes + bytes.byteLength > this._cacheMaxBytes && this._cache.size > 0) {
       const oldestKey = this._cache.keys().next().value;
       const oldest = this._cache.get(oldestKey);
       this._cache.delete(oldestKey);
+      if (this._mruKey === oldestKey) {
+        this._mruKey = null;
+      }
       if (oldest) {
         this._cacheBytes -= oldest.byteLength;
       }
       this._stats.cacheEvictions += 1;
     }
 
-    const stored = new Uint8Array(bytes.byteLength);
-    stored.set(bytes);
+    // Take ownership directly for exact-sized freshly fetched network buffers (zero extra copy);
+    // otherwise copy into an exact-sized Uint8Array so oversized backing buffers are never pinned.
+    let stored;
+    if (
+      takeOwnership &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === bytes.buffer.byteLength
+    ) {
+      stored = bytes;
+    } else {
+      stored = new Uint8Array(bytes.byteLength);
+      stored.set(bytes);
+    }
+
     this._cache.set(key, {
       key,
       url,
@@ -644,10 +733,11 @@ class HttpfsLruChunkCache {
       prefetched: Boolean(isPrefetch),
       consumedPrefetch: Boolean(consumedPrefetch),
     });
+    this._mruKey = key;
     this._cacheBytes += stored.byteLength;
   }
 
-  async _fetchRawRange(url, start, end) {
+  async _fetchRawRangeOnce(url, start, end) {
     const fetchFn = this._requireFetch();
     const res = await fetchFn(url, {
       method: 'GET',
@@ -704,6 +794,34 @@ class HttpfsLruChunkCache {
     const err = new Error(`HTTPFS range request failed (HTTP ${res.status})`);
     err.status = res.status;
     throw err;
+  }
+
+  async _fetchRawRange(url, start, end) {
+    const maxRetries = this._maxRetries;
+    if (maxRetries <= 0) {
+      return this._fetchRawRangeOnce(url, start, end);
+    }
+    let attempt = 0;
+    while (true) {
+      try {
+        return await this._fetchRawRangeOnce(url, start, end);
+      } catch (err) {
+        const status = err && typeof err.status === 'number' ? err.status : null;
+        const retryable = status === null || isRetryableHttpStatus(status);
+        if (!retryable || attempt >= maxRetries) {
+          throw err;
+        }
+        const delayMs = Math.min(
+          HTTPFS_MAX_RETRY_BACKOFF_MS,
+          this._retryBackoffMs * (1 << attempt),
+        );
+        attempt += 1;
+        this._stats.retryAttempts += 1;
+        if (delayMs > 0 && typeof setTimeout === 'function') {
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+      }
+    }
   }
 
   async _fetchExactRange(url, start, length) {
@@ -776,19 +894,32 @@ class HttpfsLruChunkCache {
 
   _startChunkFetch(url, chunkIndex, isPrefetch, originLane = -1) {
     const key = makeHttpfsChunkKey(url, chunkIndex);
+    const generation = this._generation;
+    const prefetchFlag = Boolean(isPrefetch);
     const inFlightEntry = {
       promise: null,
-      isPrefetch: Boolean(isPrefetch),
+      isPrefetch: prefetchFlag,
       prefetchHitCounted: false,
       originLane: typeof originLane === 'number' && originLane >= 0 ? Math.floor(originLane) : -1,
     };
 
+    if (prefetchFlag) {
+      this._activePrefetchCount += 1;
+    }
+
     const promise = this._fetchChunkNetwork(url, chunkIndex).then(
       (chunkBytes) => {
+        if (prefetchFlag) {
+          this._activePrefetchCount = Math.max(0, this._activePrefetchCount - 1);
+        }
         if (this._inFlight.get(key) === inFlightEntry) {
           this._inFlight.delete(key);
         }
-        if (chunkBytes.byteLength > 0 && this._cacheMaxBytes > 0) {
+        if (
+          chunkBytes.byteLength > 0 &&
+          this._cacheMaxBytes > 0 &&
+          this._generation === generation
+        ) {
           this._insertEntry(
             key,
             url,
@@ -796,11 +927,15 @@ class HttpfsLruChunkCache {
             chunkBytes,
             inFlightEntry.isPrefetch,
             inFlightEntry.prefetchHitCounted,
+            true,
           );
         }
         return chunkBytes;
       },
       (err) => {
+        if (prefetchFlag) {
+          this._activePrefetchCount = Math.max(0, this._activePrefetchCount - 1);
+        }
         if (this._inFlight.get(key) === inFlightEntry) {
           this._inFlight.delete(key);
         }
@@ -811,7 +946,7 @@ class HttpfsLruChunkCache {
     inFlightEntry.promise = promise;
     this._inFlight.set(key, inFlightEntry);
 
-    if (isPrefetch) {
+    if (prefetchFlag) {
       this._stats.prefetchIssued += 1;
       const tracked = promise.catch(() => {});
       this._pendingPrefetches.add(tracked);
@@ -825,30 +960,76 @@ class HttpfsLruChunkCache {
     return promise;
   }
 
-  _updateSequentialState(url, offset, length) {
+  _updateSequentialState(url, offset, length, laneIndex = -1) {
     const startChunk = Math.floor(offset / this._chunkSize);
     const endChunk = Math.floor((offset + length - 1) / this._chunkSize);
     const prev = this._seqState.get(url) || null;
+    const maxClusterGap = Math.min(this._chunkSize >> 1, 64 * 1024);
 
     let isSequential = false;
     if (prev !== null) {
-      if (offset === prev.lastEndOffset) {
+      if (offset === prev.lastEndOffset || offset === prev.frontierEndOffset) {
         isSequential = true;
-      } else if (startChunk === prev.lastChunkIndex + 1 && offset > prev.lastOffset) {
+      } else if (
+        (startChunk === prev.lastChunkIndex + 1 || startChunk === prev.frontierChunkIndex + 1) &&
+        offset > prev.lastOffset
+      ) {
+        isSequential = true;
+      } else if (
+        offset > prev.lastEndOffset &&
+        offset - prev.lastEndOffset <= maxClusterGap
+      ) {
+        // Forward-clustered reads with small sector/entry alignment gaps (e.g. RPF9 2K/4K padding).
+        isSequential = true;
+      } else if (
+        laneIndex >= 0 &&
+        offset !== prev.lastOffset &&
+        offset > prev.lastOffset - this._chunkSize &&
+        offset <= prev.frontierEndOffset + this._chunkSize &&
+        (offset + length > prev.frontierEndOffset || endChunk >= prev.frontierChunkIndex)
+      ) {
+        // Multi-lane out-of-order sequential bursts advancing within +/-1 chunk of the stream frontier.
         isSequential = true;
       }
     }
 
     const sequentialCount = isSequential ? prev.sequentialCount + 1 : 0;
+    const frontierEndOffset = isSequential
+      ? Math.max(prev.frontierEndOffset, offset + length)
+      : offset + length;
+    const frontierChunkIndex = isSequential
+      ? Math.max(prev.frontierChunkIndex, endChunk)
+      : endChunk;
     const nextState = {
       lastOffset: offset,
       lastLength: length,
       lastEndOffset: offset + length,
       lastChunkIndex: endChunk,
+      frontierEndOffset,
+      frontierChunkIndex,
       sequentialCount,
     };
     setBoundedMapEntry(this._seqState, url, nextState, HTTPFS_MAX_TRACKED_URLS);
-    return { isSequential, sequentialCount, endChunk };
+    return { isSequential, sequentialCount, endChunk: frontierChunkIndex };
+  }
+
+  _computeAdaptivePrefetchCount(sequentialCount, maxBudgetChunks) {
+    const base = this._readAheadChunks;
+    if (base <= 0 || maxBudgetChunks < 2) {
+      return 0;
+    }
+    let desired = base;
+    if (this._adaptiveReadAhead && this._maxReadAheadChunks > base) {
+      if (sequentialCount >= 8) {
+        desired = Math.min(this._maxReadAheadChunks, base * 4);
+      } else if (sequentialCount >= 4) {
+        desired = Math.min(this._maxReadAheadChunks, base * 2);
+      }
+    }
+    // Never let adaptive ramp exceed half the LRU capacity (prevents self-eviction thrash),
+    // while still honoring explicit `readAheadChunks` up to `maxBudgetChunks - 1`.
+    const adaptiveBudgetCap = Math.max(base, Math.floor(maxBudgetChunks / 2));
+    return Math.max(0, Math.min(desired, adaptiveBudgetCap, maxBudgetChunks - 1));
   }
 
   _schedulePrefetches(url, endChunk, sequentialCount) {
@@ -863,10 +1044,16 @@ class HttpfsLruChunkCache {
     if (maxBudgetChunks < 2) {
       return;
     }
-    const prefetchCount = Math.min(this._readAheadChunks, maxBudgetChunks - 1);
+    const prefetchCount = this._computeAdaptivePrefetchCount(sequentialCount, maxBudgetChunks);
+    if (prefetchCount <= 0) {
+      return;
+    }
     const knownTotal = this.getKnownSize(url);
 
     for (let i = 1; i <= prefetchCount; i += 1) {
+      if (this._activePrefetchCount >= this._maxConcurrentPrefetches) {
+        break;
+      }
       const targetChunk = endChunk + i;
       const targetStart = targetChunk * this._chunkSize;
       if (knownTotal !== null && targetStart >= knownTotal) {
@@ -895,7 +1082,149 @@ class HttpfsLruChunkCache {
     return { size: this.getKnownSize(url) };
   }
 
-  tryReadSync(url, offset, length) {
+  _resolveChunkHandle(url, chunkIdx, laneIndex) {
+    const key = makeHttpfsChunkKey(url, chunkIdx);
+    const cached = this._cache.get(key);
+    if (cached) {
+      this._touchEntry(key, cached);
+      this._stats.cacheHits += 1;
+      if (cached.prefetched && !cached.consumedPrefetch) {
+        cached.consumedPrefetch = true;
+        this._stats.prefetchHits += 1;
+      }
+      return { fromCache: true, bytes: cached.bytes, promise: null };
+    }
+
+    const existingInFlight = this._inFlight.get(key);
+    if (existingInFlight) {
+      this._stats.coalescedReads += 1;
+      const sameExplicitDemandLane =
+        laneIndex >= 0 &&
+        existingInFlight.originLane >= 0 &&
+        existingInFlight.originLane === laneIndex &&
+        !existingInFlight.isPrefetch;
+      if (!sameExplicitDemandLane) {
+        this._stats.crossLaneCoalesced += 1;
+      }
+      if (existingInFlight.isPrefetch && !existingInFlight.prefetchHitCounted) {
+        existingInFlight.prefetchHitCounted = true;
+        this._stats.prefetchHits += 1;
+      }
+      return { fromCache: false, bytes: null, promise: existingInFlight.promise };
+    }
+
+    const promise = this._startChunkFetch(url, chunkIdx, false, laneIndex);
+    return { fromCache: false, bytes: null, promise };
+  }
+
+  /**
+   * Zero-copy synchronous cache read directly into caller-provided `dst` at `dstOffset`.
+   * Returns exact bytes written (>= 0) on hit/EOF, or -1 on cache miss/bypass.
+   */
+  tryReadIntoSync(url, offset, length, dst, dstOffset = 0, options = null) {
+    const off = toSafeNonNegNumber(offset, 'offset');
+    const len = toSafeNonNegNumber(length, 'length');
+    if (len === 0) {
+      return 0;
+    }
+    if (this._cacheMaxBytes <= 0 || !this.isCacheableUrl(url)) {
+      return -1;
+    }
+
+    const knownTotal = this.getKnownSize(url);
+    if (knownTotal !== null && off >= knownTotal) {
+      return 0;
+    }
+
+    const effectiveEnd = knownTotal !== null ? Math.min(off + len, knownTotal) : off + len;
+    const effectiveLen = effectiveEnd - off;
+    if (effectiveLen <= 0) {
+      return 0;
+    }
+
+    const laneIndex =
+      options && typeof options.laneIndex === 'number' && options.laneIndex >= 0
+        ? Math.floor(options.laneIndex)
+        : -1;
+    const trackSequential = !(options && options.trackSequential === false);
+
+    const chunkSize = this._chunkSize;
+    const firstChunk = Math.floor(off / chunkSize);
+    const lastChunk = Math.floor((effectiveEnd - 1) / chunkSize);
+
+    // Fast path (99% of reads): single cached chunk -> zero intermediate arrays or buffers!
+    if (firstChunk === lastChunk) {
+      const key = makeHttpfsChunkKey(url, firstChunk);
+      const entry = this._cache.get(key);
+      if (!entry) {
+        return -1;
+      }
+      this._touchEntry(key, entry);
+      this._stats.cacheHits += 1;
+      if (entry.prefetched && !entry.consumedPrefetch) {
+        entry.consumedPrefetch = true;
+        this._stats.prefetchHits += 1;
+      }
+
+      const sliceStart = off - firstChunk * chunkSize;
+      const available = Math.max(0, entry.byteLength - sliceStart);
+      const copyLen = Math.min(effectiveLen, available);
+      if (copyLen > 0) {
+        dst.set(entry.bytes.subarray(sliceStart, sliceStart + copyLen), dstOffset);
+        this._stats.bytesServedFromCache += copyLen;
+        if (trackSequential) {
+          const seq = this._updateSequentialState(url, off, copyLen, laneIndex);
+          if (seq.isSequential) {
+            this._schedulePrefetches(url, seq.endChunk, seq.sequentialCount);
+          }
+        }
+      }
+      return copyLen;
+    }
+
+    // Multi-chunk path: confirm all chunks are resident before mutating dst or LRU state.
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      if (!this._cache.has(makeHttpfsChunkKey(url, idx))) {
+        return -1;
+      }
+    }
+
+    let cursor = 0;
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      const key = makeHttpfsChunkKey(url, idx);
+      const entry = this._cache.get(key);
+      this._touchEntry(key, entry);
+      this._stats.cacheHits += 1;
+      if (entry.prefetched && !entry.consumedPrefetch) {
+        entry.consumedPrefetch = true;
+        this._stats.prefetchHits += 1;
+      }
+
+      const chunkStart = idx * chunkSize;
+      const sliceStart = Math.max(0, off - chunkStart);
+      const remaining = effectiveLen - cursor;
+      const available = Math.max(0, entry.byteLength - sliceStart);
+      const copyLen = Math.min(remaining, available);
+      if (copyLen > 0) {
+        dst.set(entry.bytes.subarray(sliceStart, sliceStart + copyLen), dstOffset + cursor);
+        cursor += copyLen;
+        this._stats.bytesServedFromCache += copyLen;
+      }
+      if (entry.byteLength < chunkSize) {
+        break;
+      }
+    }
+
+    if (cursor > 0 && trackSequential) {
+      const seq = this._updateSequentialState(url, off, cursor, laneIndex);
+      if (seq.isSequential) {
+        this._schedulePrefetches(url, seq.endChunk, seq.sequentialCount);
+      }
+    }
+    return cursor;
+  }
+
+  tryReadSync(url, offset, length, options = null) {
     const off = toSafeNonNegNumber(offset, 'offset');
     const len = toSafeNonNegNumber(length, 'length');
     if (len === 0) {
@@ -916,53 +1245,243 @@ class HttpfsLruChunkCache {
       return new Uint8Array(0);
     }
 
-    const firstChunk = Math.floor(off / this._chunkSize);
-    const lastChunk = Math.floor((effectiveEnd - 1) / this._chunkSize);
+    const chunkSize = this._chunkSize;
+    const firstChunk = Math.floor(off / chunkSize);
+    const lastChunk = Math.floor((effectiveEnd - 1) / chunkSize);
 
-    const entries = [];
-    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
-      const key = makeHttpfsChunkKey(url, idx);
+    // Single-chunk fast path: single native slice copy (isolated from cached chunk, zero array alloc).
+    if (firstChunk === lastChunk) {
+      const key = makeHttpfsChunkKey(url, firstChunk);
       const entry = this._cache.get(key);
       if (!entry) {
         return null;
       }
-      entries.push(entry);
-    }
-
-    const out = new Uint8Array(effectiveLen);
-    let cursor = 0;
-    for (let i = 0; i < entries.length; i += 1) {
-      const entry = entries[i];
-      this._touchEntry(entry.key, entry);
+      this._touchEntry(key, entry);
       this._stats.cacheHits += 1;
       if (entry.prefetched && !entry.consumedPrefetch) {
         entry.consumedPrefetch = true;
         this._stats.prefetchHits += 1;
       }
 
-      const chunkStart = entry.chunkIndex * this._chunkSize;
-      const sliceStart = Math.max(0, off - chunkStart);
-      const remaining = effectiveLen - cursor;
+      const sliceStart = off - firstChunk * chunkSize;
       const available = Math.max(0, entry.byteLength - sliceStart);
-      const copyLen = Math.min(remaining, available);
+      const copyLen = Math.min(effectiveLen, available);
+      const result = copyLen > 0 ? entry.bytes.slice(sliceStart, sliceStart + copyLen) : new Uint8Array(0);
       if (copyLen > 0) {
-        out.set(entry.bytes.subarray(sliceStart, sliceStart + copyLen), cursor);
-        cursor += copyLen;
         this._stats.bytesServedFromCache += copyLen;
+        const laneIndex =
+          options && typeof options.laneIndex === 'number' && options.laneIndex >= 0
+            ? Math.floor(options.laneIndex)
+            : -1;
+        const trackSequential = !(options && options.trackSequential === false);
+        if (trackSequential) {
+          const seq = this._updateSequentialState(url, off, copyLen, laneIndex);
+          if (seq.isSequential) {
+            this._schedulePrefetches(url, seq.endChunk, seq.sequentialCount);
+          }
+        }
       }
-      if (entry.byteLength < this._chunkSize) {
-        break;
+      return result;
+    }
+
+    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+      if (!this._cache.has(makeHttpfsChunkKey(url, idx))) {
+        return null;
       }
     }
 
-    const result = cursor === out.byteLength ? out : out.slice(0, cursor);
-    if (result.byteLength > 0) {
-      const seq = this._updateSequentialState(url, off, result.byteLength);
-      if (seq.isSequential) {
-        this._schedulePrefetches(url, seq.endChunk, seq.sequentialCount);
+    const out = new Uint8Array(effectiveLen);
+    const written = this.tryReadIntoSync(url, off, effectiveLen, out, 0, options);
+    if (written < 0) {
+      return null;
+    }
+    return written === out.byteLength ? out : out.slice(0, written);
+  }
+
+  /**
+   * Zero-copy async read directly into caller-provided `dst` at `dstOffset`.
+   * Resolves to exact bytes written (>= 0) without intermediate payload copies.
+   */
+  async readInto(url, offset, length, dst, dstOffset = 0, options = {}) {
+    const off = toSafeNonNegNumber(offset, 'offset');
+    const len = toSafeNonNegNumber(length, 'length');
+    if (len === 0) {
+      return 0;
+    }
+
+    const trackSequential = !(options && options.trackSequential === false);
+    const laneIndex =
+      options && typeof options.laneIndex === 'number' && options.laneIndex >= 0
+        ? Math.floor(options.laneIndex)
+        : -1;
+    const knownTotalBefore = this.getKnownSize(url);
+    if (knownTotalBefore !== null && off >= knownTotalBefore) {
+      return 0;
+    }
+
+    if (this._cacheMaxBytes <= 0 || !this.isCacheableUrl(url)) {
+      this._stats.cacheMisses += 1;
+      const direct = await this._fetchExactRange(url, off, len);
+      const copyLen = Math.min(direct.byteLength, len);
+      if (copyLen > 0) {
+        dst.set(direct.subarray(0, copyLen), dstOffset);
+      }
+      return copyLen;
+    }
+
+    const effectiveEndBefore =
+      knownTotalBefore !== null ? Math.min(off + len, knownTotalBefore) : off + len;
+    const effectiveLenBefore = effectiveEndBefore - off;
+    if (effectiveLenBefore <= 0) {
+      return 0;
+    }
+
+    const chunkSize = this._chunkSize;
+    const firstChunk = Math.floor(off / chunkSize);
+    let lastChunk = Math.floor((effectiveEndBefore - 1) / chunkSize);
+
+    let seqInfo = null;
+    let prefetchScheduledEarly = false;
+    if (trackSequential) {
+      seqInfo = this._updateSequentialState(url, off, effectiveLenBefore, laneIndex);
+      if (seqInfo.isSequential && knownTotalBefore !== null) {
+        this._schedulePrefetches(url, seqInfo.endChunk, seqInfo.sequentialCount);
+        prefetchScheduledEarly = true;
       }
     }
-    return result;
+
+    let cursor = 0;
+
+    // Single-chunk fast path: zero Map / array allocations!
+    if (firstChunk === lastChunk) {
+      const h = this._resolveChunkHandle(url, firstChunk, laneIndex);
+      const chunkBytes = h.fromCache ? h.bytes : await h.promise;
+      if (chunkBytes && chunkBytes.byteLength > 0) {
+        const sliceStart = off - firstChunk * chunkSize;
+        const available = Math.max(0, chunkBytes.byteLength - sliceStart);
+        const copyLen = Math.min(effectiveLenBefore, available);
+        if (copyLen > 0) {
+          dst.set(chunkBytes.subarray(sliceStart, sliceStart + copyLen), dstOffset);
+          cursor = copyLen;
+          if (h.fromCache) {
+            this._stats.bytesServedFromCache += copyLen;
+          }
+        }
+      }
+    } else {
+      const chunkResults = new Map();
+
+      if (knownTotalBefore === null) {
+        const firstHandle = this._resolveChunkHandle(url, firstChunk, laneIndex);
+        const firstBytes = firstHandle.fromCache ? firstHandle.bytes : await firstHandle.promise;
+        chunkResults.set(firstChunk, { bytes: firstBytes, fromCache: firstHandle.fromCache });
+
+        if (firstBytes.byteLength < chunkSize) {
+          lastChunk = firstChunk;
+        } else {
+          const knownAfterFirst = this.getKnownSize(url);
+          if (knownAfterFirst !== null) {
+            const clampedEnd = Math.min(off + len, knownAfterFirst);
+            lastChunk =
+              clampedEnd <= off ? firstChunk : Math.floor((clampedEnd - 1) / chunkSize);
+          }
+        }
+
+        // Now that file size / EOF status is known from chunk 0, kick off sequential prefetches
+        // immediately so they overlap with the remaining chunks of this read.
+        if (
+          trackSequential &&
+          seqInfo &&
+          seqInfo.isSequential &&
+          !prefetchScheduledEarly &&
+          this.getKnownSize(url) !== null
+        ) {
+          this._schedulePrefetches(url, Math.max(seqInfo.endChunk, lastChunk), seqInfo.sequentialCount);
+          prefetchScheduledEarly = true;
+        }
+
+        if (lastChunk > firstChunk) {
+          const restPromises = [];
+          for (let idx = firstChunk + 1; idx <= lastChunk; idx += 1) {
+            const h = this._resolveChunkHandle(url, idx, laneIndex);
+            if (h.fromCache) {
+              chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
+            } else {
+              restPromises.push(
+                h.promise.then((bytes) => {
+                  chunkResults.set(idx, { bytes, fromCache: false });
+                }),
+              );
+            }
+          }
+          if (restPromises.length > 0) {
+            await Promise.all(restPromises);
+          }
+        }
+      } else {
+        const pending = [];
+        for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+          const h = this._resolveChunkHandle(url, idx, laneIndex);
+          if (h.fromCache) {
+            chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
+          } else {
+            pending.push(
+              h.promise.then((bytes) => {
+                chunkResults.set(idx, { bytes, fromCache: false });
+              }),
+            );
+          }
+        }
+        if (pending.length > 0) {
+          await Promise.all(pending);
+        }
+      }
+
+      for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
+        const item = chunkResults.get(idx);
+        if (!item || !item.bytes || item.bytes.byteLength === 0) {
+          break;
+        }
+        const chunkStart = idx * chunkSize;
+        const sliceStart = Math.max(0, off - chunkStart);
+        const remaining = effectiveLenBefore - cursor;
+        const available = Math.max(0, item.bytes.byteLength - sliceStart);
+        const copyLen = Math.min(remaining, available);
+        if (copyLen > 0) {
+          dst.set(item.bytes.subarray(sliceStart, sliceStart + copyLen), dstOffset + cursor);
+          cursor += copyLen;
+          if (item.fromCache) {
+            this._stats.bytesServedFromCache += copyLen;
+          }
+        }
+        if (item.bytes.byteLength < chunkSize) {
+          break;
+        }
+      }
+    }
+
+    if (trackSequential && seqInfo) {
+      if (cursor < effectiveLenBefore) {
+        const state = this._seqState.get(url);
+        if (state && state.lastOffset === off) {
+          const prevEnd = off + effectiveLenBefore;
+          state.lastLength = cursor;
+          state.lastEndOffset = off + cursor;
+          state.lastChunkIndex =
+            cursor > 0 ? Math.floor((off + cursor - 1) / chunkSize) : firstChunk;
+          if (state.frontierEndOffset === prevEnd) {
+            state.frontierEndOffset = state.lastEndOffset;
+            state.frontierChunkIndex = state.lastChunkIndex;
+          }
+        }
+      }
+      if (seqInfo.isSequential && !prefetchScheduledEarly && cursor > 0) {
+        const finalEndChunk = Math.floor((off + cursor - 1) / chunkSize);
+        this._schedulePrefetches(url, Math.max(seqInfo.endChunk, finalEndChunk), seqInfo.sequentialCount);
+      }
+    }
+
+    return cursor;
   }
 
   async read(url, offset, length, options = {}) {
@@ -972,7 +1491,6 @@ class HttpfsLruChunkCache {
       return new Uint8Array(0);
     }
 
-    const trackSequential = !(options && options.trackSequential === false);
     const knownTotalBefore = this.getKnownSize(url);
     if (knownTotalBefore !== null && off >= knownTotalBefore) {
       return new Uint8Array(0);
@@ -991,161 +1509,9 @@ class HttpfsLruChunkCache {
       return new Uint8Array(0);
     }
 
-    const firstChunk = Math.floor(off / this._chunkSize);
-    let lastChunk = Math.floor((effectiveEndBefore - 1) / this._chunkSize);
-    const laneIndex =
-      options && typeof options.laneIndex === 'number' && options.laneIndex >= 0
-        ? Math.floor(options.laneIndex)
-        : -1;
-
-    const resolveChunk = (chunkIdx) => {
-      const key = makeHttpfsChunkKey(url, chunkIdx);
-      const cached = this._cache.get(key);
-      if (cached) {
-        this._touchEntry(key, cached);
-        this._stats.cacheHits += 1;
-        if (cached.prefetched && !cached.consumedPrefetch) {
-          cached.consumedPrefetch = true;
-          this._stats.prefetchHits += 1;
-        }
-        return { fromCache: true, bytes: cached.bytes, promise: null };
-      }
-
-      const existingInFlight = this._inFlight.get(key);
-      if (existingInFlight) {
-        this._stats.coalescedReads += 1;
-        const sameExplicitDemandLane =
-          laneIndex >= 0 &&
-          existingInFlight.originLane >= 0 &&
-          existingInFlight.originLane === laneIndex &&
-          !existingInFlight.isPrefetch;
-        if (!sameExplicitDemandLane) {
-          this._stats.crossLaneCoalesced += 1;
-        }
-        if (existingInFlight.isPrefetch && !existingInFlight.prefetchHitCounted) {
-          existingInFlight.prefetchHitCounted = true;
-          this._stats.prefetchHits += 1;
-        }
-        return { fromCache: false, bytes: null, promise: existingInFlight.promise };
-      }
-
-      const promise = this._startChunkFetch(url, chunkIdx, false, laneIndex);
-      return { fromCache: false, bytes: null, promise };
-    };
-
-    let seqInfo = null;
-    let prefetchScheduledEarly = false;
-    if (trackSequential) {
-      seqInfo = this._updateSequentialState(url, off, effectiveLenBefore);
-      if (seqInfo.isSequential && knownTotalBefore !== null) {
-        this._schedulePrefetches(url, seqInfo.endChunk, seqInfo.sequentialCount);
-        prefetchScheduledEarly = true;
-      }
-    }
-
-    const chunkResults = new Map();
-
-    // If total file size is unknown and the read spans multiple chunks, fetch the first chunk
-    // first so we learn Content-Range total / EOF and avoid issuing wasted past-EOF requests.
-    if (knownTotalBefore === null && firstChunk < lastChunk) {
-      const firstHandle = resolveChunk(firstChunk);
-      const firstBytes = firstHandle.fromCache ? firstHandle.bytes : await firstHandle.promise;
-      chunkResults.set(firstChunk, { bytes: firstBytes, fromCache: firstHandle.fromCache });
-
-      if (firstBytes.byteLength < this._chunkSize) {
-        lastChunk = firstChunk;
-      } else {
-        const knownAfterFirst = this.getKnownSize(url);
-        if (knownAfterFirst !== null) {
-          const clampedEnd = Math.min(off + len, knownAfterFirst);
-          lastChunk =
-            clampedEnd <= off ? firstChunk : Math.floor((clampedEnd - 1) / this._chunkSize);
-        }
-      }
-
-      if (lastChunk > firstChunk) {
-        const restPromises = [];
-        for (let idx = firstChunk + 1; idx <= lastChunk; idx += 1) {
-          const h = resolveChunk(idx);
-          if (h.fromCache) {
-            chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
-          } else {
-            restPromises.push(
-              h.promise.then((bytes) => {
-                chunkResults.set(idx, { bytes, fromCache: false });
-              }),
-            );
-          }
-        }
-        if (restPromises.length > 0) {
-          await Promise.all(restPromises);
-        }
-      }
-    } else {
-      const pending = [];
-      for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
-        const h = resolveChunk(idx);
-        if (h.fromCache) {
-          chunkResults.set(idx, { bytes: h.bytes, fromCache: true });
-        } else {
-          pending.push(
-            h.promise.then((bytes) => {
-              chunkResults.set(idx, { bytes, fromCache: false });
-            }),
-          );
-        }
-      }
-      if (pending.length > 0) {
-        await Promise.all(pending);
-      }
-    }
-
     const out = new Uint8Array(effectiveLenBefore);
-    let cursor = 0;
-    for (let idx = firstChunk; idx <= lastChunk; idx += 1) {
-      const item = chunkResults.get(idx);
-      if (!item || !item.bytes || item.bytes.byteLength === 0) {
-        break;
-      }
-      const chunkStart = idx * this._chunkSize;
-      const sliceStart = Math.max(0, off - chunkStart);
-      const remaining = effectiveLenBefore - cursor;
-      const available = Math.max(0, item.bytes.byteLength - sliceStart);
-      const copyLen = Math.min(remaining, available);
-      if (copyLen > 0) {
-        out.set(item.bytes.subarray(sliceStart, sliceStart + copyLen), cursor);
-        cursor += copyLen;
-        if (item.fromCache) {
-          this._stats.bytesServedFromCache += copyLen;
-        }
-      }
-      if (item.bytes.byteLength < this._chunkSize) {
-        break;
-      }
-    }
-
-    const result = cursor === out.byteLength ? out : out.slice(0, cursor);
-
-    if (trackSequential && seqInfo) {
-      // Adjust recorded end offset on clamped EOF reads so subsequent reads stay accurate.
-      if (result.byteLength < effectiveLenBefore) {
-        const state = this._seqState.get(url);
-        if (state && state.lastOffset === off) {
-          state.lastLength = result.byteLength;
-          state.lastEndOffset = off + result.byteLength;
-          state.lastChunkIndex =
-            result.byteLength > 0
-              ? Math.floor((off + result.byteLength - 1) / this._chunkSize)
-              : firstChunk;
-        }
-      }
-      if (seqInfo.isSequential && !prefetchScheduledEarly && result.byteLength > 0) {
-        const finalEndChunk = Math.floor((off + result.byteLength - 1) / this._chunkSize);
-        this._schedulePrefetches(url, finalEndChunk, seqInfo.sequentialCount);
-      }
-    }
-
-    return result;
+    const written = await this.readInto(url, off, effectiveLenBefore, out, 0, options);
+    return written === out.byteLength ? out : out.slice(0, written);
   }
 }
 
@@ -1188,6 +1554,11 @@ function createSharedMailboxHostState(options = {}, defaultReadAheadEnabled = fa
       cacheMaxBytes: opts.cacheMaxBytes,
       chunkSize: opts.chunkSize,
       readAheadChunks: opts.readAheadChunks,
+      adaptiveReadAhead: opts.adaptiveReadAhead,
+      maxReadAheadChunks: opts.maxReadAheadChunks,
+      maxConcurrentPrefetches: opts.maxConcurrentPrefetches,
+      maxRetries: opts.maxRetries,
+      retryBackoffMs: opts.retryBackoffMs,
       sequentialThreshold: opts.sequentialThreshold,
       isCacheableUrl: opts.isCacheableUrl,
     });
@@ -1446,9 +1817,23 @@ class HttpfsMailboxHost {
     this._laneIndex =
       Number.isInteger(options._laneIndex) && options._laneIndex >= 0 ? options._laneIndex : -1;
     this._laneReadOptions = { laneIndex: this._laneIndex };
+    const raCfg = this._shared.readAhead;
+    this._raWindowOpts = {
+      path: undefined,
+      isVideoStream: false,
+      maxReadAheadBytes: raCfg.maxReadAheadBytes,
+      baseReadAheadBytes: raCfg.baseReadAheadBytes,
+      minReadAheadBytes: raCfg.minReadAheadBytes,
+      midReadAheadBytes: raCfg.midReadAheadBytes,
+      highReadAheadBytes: raCfg.highReadAheadBytes,
+      rampMidThreshold: raCfg.rampMidThreshold,
+      rampHighThreshold: raCfg.rampHighThreshold,
+    };
     this._inFlight = false;
     this._slotActive = false;
-    this._pendingFinalize = null;
+    this._hasPendingFinalize = false;
+    this._reqStartMs = 0;
+    this._reqHandleRec = null;
     this._running = false;
     this._loopPromise = null;
     this._pollTimer = null;
@@ -1505,6 +1890,7 @@ class HttpfsMailboxHost {
       return;
     }
     rec.raBuffer = null;
+    rec.nextRaBuffer = null;
     rec.inFlightReadAhead = null;
     rec.closed = true;
     const closedIdx = this._shared.closedOrder.indexOf(handle);
@@ -1633,11 +2019,38 @@ class HttpfsMailboxHost {
     return false;
   }
 
+  _finalizeTiming() {
+    if (!this._hasPendingFinalize) {
+      return;
+    }
+    this._hasPendingFinalize = false;
+    this._inFlight = false;
+    if (this._slotActive) {
+      this._slotActive = false;
+      this._stats.activeLanes = Math.max(0, this._stats.activeLanes - 1);
+    }
+    const elapsed = Math.max(0, this._now() - this._reqStartMs);
+    this._stats.activePendingSlots = Math.max(0, this._stats.activePendingSlots - 1);
+    this._stats.totalWaitMs += elapsed;
+    this._stats.waitSamples += 1;
+    if (elapsed > this._stats.maxWaitMs) {
+      this._stats.maxWaitMs = elapsed;
+    }
+    const handleRec = this._reqHandleRec;
+    this._reqHandleRec = null;
+    if (handleRec) {
+      handleRec.activePendingSlots = Math.max(0, handleRec.activePendingSlots - 1);
+      handleRec.totalWaitMs += elapsed;
+      handleRec.waitSamples += 1;
+      if (elapsed > handleRec.maxWaitMs) {
+        handleRec.maxWaitMs = elapsed;
+      }
+    }
+  }
+
   completeResponse(result, status = HttpfsStatus.ResponseReady) {
-    if (this._pendingFinalize) {
-      const fin = this._pendingFinalize;
-      this._pendingFinalize = null;
-      fin();
+    if (this._hasPendingFinalize) {
+      this._finalizeTiming();
     }
     this._headerView.setBigInt64(HttpfsOffsets.RESULT, BigInt(result), true);
     Atomics.store(this._statusView, 0, status);
@@ -1683,8 +2096,7 @@ class HttpfsMailboxHost {
     }
   }
 
-  _tryServeFromReadAheadBuffer(rec, offset, reqLen) {
-    const buf = rec && rec.raBuffer;
+  _tryServeFromSingleBuffer(buf, offset, reqLen) {
     if (!buf || !(buf.bytes instanceof Uint8Array)) {
       return null;
     }
@@ -1700,6 +2112,143 @@ class HttpfsMailboxHost {
       return buf.bytes.subarray(rel, rel + avail);
     }
     return null;
+  }
+
+  _tryServeFromReadAheadBuffer(rec, offset, reqLen) {
+    if (!rec) {
+      return null;
+    }
+    const primary = this._tryServeFromSingleBuffer(rec.raBuffer, offset, reqLen);
+    if (primary !== null) {
+      return primary;
+    }
+    if (rec.nextRaBuffer) {
+      const promoted = this._tryServeFromSingleBuffer(rec.nextRaBuffer, offset, reqLen);
+      if (promoted !== null) {
+        rec.raBuffer = rec.nextRaBuffer;
+        rec.nextRaBuffer = null;
+        return promoted;
+      }
+    }
+    return null;
+  }
+
+  _invokeBackendRead(cache, handle, entryPath, readOffset, readLen) {
+    if (this._customRead) {
+      return this._customRead(handle, readOffset, readLen);
+    }
+    return cache.read(entryPath, readOffset, readLen);
+  }
+
+  _finishReadWithTelemetry(res, expectedReqLen, isReadAheadHit, rec, offset, provisionalNextOffset) {
+    const bytes = extractReadBytes(res);
+    if (bytes === undefined) {
+      this.completeResponse(-9n, HttpfsStatus.Error);
+      return;
+    }
+    if (bytes === null) {
+      this.completeResponse(-5n, HttpfsStatus.Error);
+      return;
+    }
+    const toCopy = Math.min(bytes.byteLength, expectedReqLen);
+    if (toCopy < expectedReqLen && rec.expectedNextOffset === provisionalNextOffset) {
+      rec.expectedNextOffset = offset + toCopy;
+    }
+    if (isReadAheadHit && toCopy > 0) {
+      rec.readAheadHits += 1;
+      rec.readAheadBytesServed += toCopy;
+      this._stats.readAheadHits += 1;
+      this._stats.readAheadBytesServed += toCopy;
+    }
+    if (toCopy > 0) {
+      this._payloadView.set(bytes.subarray(0, toCopy), 0);
+    }
+    this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
+  }
+
+  _maybeScheduleBackgroundReadAhead(rec, cache, handle, entryPath, offset, reqLen) {
+    const raCfg = this._shared.readAhead;
+    if (!raCfg.backgroundPrefetch || !raCfg.enabled || rec.closed) {
+      return;
+    }
+    const buf = rec.raBuffer;
+    if (!buf || buf.eof || rec.nextRaBuffer || rec.inFlightReadAhead) {
+      return;
+    }
+    const bufEnd = buf.startOffset + buf.bytes.byteLength;
+    const consumedEnd = offset + reqLen;
+    // Prefetch next sequential window asynchronously once >= 50% of current window is consumed.
+    if (consumedEnd - buf.startOffset < (buf.bytes.byteLength >> 1)) {
+      return;
+    }
+    const raOpts = this._raWindowOpts;
+    raOpts.path = entryPath || undefined;
+    raOpts.isVideoStream = rec.isVideoStream;
+    const nextWindowBytes = computeReadAheadWindowSize(reqLen, Math.max(1, rec.sequentialCount + 1), raOpts);
+    if (nextWindowBytes <= 0) {
+      return;
+    }
+    let res;
+    try {
+      res = this._invokeBackendRead(cache, handle, entryPath, bufEnd, nextWindowBytes);
+    } catch {
+      return;
+    }
+    rec.readAheadFetches += 1;
+    this._stats.readAheadFetches += 1;
+    if (isThenable(res)) {
+      let inflightEntry = null;
+      const sharedPromise = res.then(
+        (resolved) => {
+          if (rec.inFlightReadAhead === inflightEntry) {
+            rec.inFlightReadAhead = null;
+          }
+          if (rec.closed) {
+            return null;
+          }
+          const bytes = extractReadBytes(resolved);
+          if (!bytes || bytes.byteLength === 0) {
+            if (bytes && bytes.byteLength === 0 && rec.raBuffer === buf) {
+              buf.eof = true;
+            }
+            return null;
+          }
+          const stored = new Uint8Array(bytes.byteLength);
+          stored.set(bytes);
+          rec.nextRaBuffer = {
+            startOffset: bufEnd,
+            bytes: stored,
+            eof: bytes.byteLength < reqLen,
+          };
+          return stored;
+        },
+        () => {
+          if (rec.inFlightReadAhead === inflightEntry) {
+            rec.inFlightReadAhead = null;
+          }
+          return null;
+        },
+      );
+      inflightEntry = {
+        startOffset: bufEnd,
+        endOffset: bufEnd + nextWindowBytes,
+        promise: sharedPromise,
+      };
+      rec.inFlightReadAhead = inflightEntry;
+    } else {
+      const bytes = extractReadBytes(res);
+      if (bytes && bytes.byteLength === 0 && rec.raBuffer === buf) {
+        buf.eof = true;
+      } else if (bytes && bytes.byteLength > 0 && !rec.closed) {
+        const stored = new Uint8Array(bytes.byteLength);
+        stored.set(bytes);
+        rec.nextRaBuffer = {
+          startOffset: bufEnd,
+          bytes: stored,
+          eof: bytes.byteLength < reqLen,
+        };
+      }
+    }
   }
 
   _handleOpen(lengthBig, cap) {
@@ -1868,81 +2417,89 @@ class HttpfsMailboxHost {
     }
 
     const raCfg = this._shared.readAhead;
-    const windowBytes = computeReadAheadWindowSize(reqLen, rec.sequentialCount, {
-      path: entryPath || undefined,
-      isVideoStream: rec.isVideoStream,
-      maxReadAheadBytes: raCfg.maxReadAheadBytes,
-      baseReadAheadBytes: raCfg.baseReadAheadBytes,
-      minReadAheadBytes: raCfg.minReadAheadBytes,
-      midReadAheadBytes: raCfg.midReadAheadBytes,
-      highReadAheadBytes: raCfg.highReadAheadBytes,
-      rampMidThreshold: raCfg.rampMidThreshold,
-      rampHighThreshold: raCfg.rampHighThreshold,
-    });
+    let windowBytes = 0;
+    if (rec.sequentialCount > 0 && raCfg.maxReadAheadBytes > 0) {
+      const raOpts = this._raWindowOpts;
+      raOpts.path = entryPath || undefined;
+      raOpts.isVideoStream = rec.isVideoStream;
+      windowBytes = computeReadAheadWindowSize(reqLen, rec.sequentialCount, raOpts);
+    }
     rec.currentWindowBytes = windowBytes;
-
-    const invokeBackendRead = (readOffset, readLen) => {
-      if (this._customRead) {
-        return this._customRead(handle, readOffset, readLen);
-      }
-      return cache.read(entryPath, readOffset, readLen);
-    };
-
-    const finishWithTelemetry = (res, expectedReqLen, isReadAheadHit) => {
-      const bytes = extractReadBytes(res);
-      if (bytes === undefined) {
-        this.completeResponse(-9n, HttpfsStatus.Error);
-        return;
-      }
-      if (bytes === null) {
-        this.completeResponse(-5n, HttpfsStatus.Error);
-        return;
-      }
-      const toCopy = Math.min(bytes.byteLength, expectedReqLen);
-      if (toCopy < expectedReqLen && rec.expectedNextOffset === provisionalNextOffset) {
-        rec.expectedNextOffset = offset + toCopy;
-      }
-      if (isReadAheadHit && toCopy > 0) {
-        rec.readAheadHits += 1;
-        rec.readAheadBytesServed += toCopy;
-        this._stats.readAheadHits += 1;
-        this._stats.readAheadBytesServed += toCopy;
-      }
-      if (toCopy > 0) {
-        this._payloadView.set(bytes.subarray(0, toCopy), 0);
-      }
-      this.completeResponse(BigInt(toCopy), HttpfsStatus.ResponseReady);
-    };
 
     // Bounded in-worker LRU chunk cache + sequential read-ahead mode (no external RangeCache/custom read).
     if (chunkCache) {
       const url = entryUrl || resolveHttpfsUrl(entryPath, this._shared.urlConfig);
-      const syncBytes = chunkCache.tryReadSync(url, offset, reqLen);
-      if (syncBytes !== null) {
-        finishWithTelemetry(syncBytes, reqLen, false);
-        return;
+      if (typeof chunkCache.tryReadIntoSync === 'function') {
+        const syncWritten = chunkCache.tryReadIntoSync(
+          url,
+          offset,
+          reqLen,
+          this._payloadView,
+          0,
+          this._laneReadOptions,
+        );
+        if (syncWritten >= 0) {
+          if (syncWritten < reqLen && rec.expectedNextOffset === provisionalNextOffset) {
+            rec.expectedNextOffset = offset + syncWritten;
+          }
+          this.completeResponse(BigInt(syncWritten), HttpfsStatus.ResponseReady);
+          return;
+        }
+      } else {
+        const syncBytes = chunkCache.tryReadSync(url, offset, reqLen);
+        if (syncBytes !== null) {
+          this._finishReadWithTelemetry(
+            syncBytes,
+            reqLen,
+            false,
+            rec,
+            offset,
+            provisionalNextOffset,
+          );
+          return;
+        }
+      }
+      if (typeof chunkCache.readInto === 'function') {
+        return chunkCache
+          .readInto(url, offset, reqLen, this._payloadView, 0, this._laneReadOptions)
+          .then((written) => {
+            if (written < reqLen && rec.expectedNextOffset === provisionalNextOffset) {
+              rec.expectedNextOffset = offset + written;
+            }
+            this.completeResponse(BigInt(written), HttpfsStatus.ResponseReady);
+          });
       }
       return chunkCache.read(url, offset, reqLen, this._laneReadOptions).then((resolved) => {
-        finishWithTelemetry(resolved, reqLen, false);
+        this._finishReadWithTelemetry(resolved, reqLen, false, rec, offset, provisionalNextOffset);
       });
     }
 
     // Preserve exact legacy direct pass-through when host-side read-ahead buffering is disabled.
     if (!raCfg.enabled) {
-      const res = invokeBackendRead(offset, reqLen);
+      const res = this._invokeBackendRead(cache, handle, entryPath, offset, reqLen);
       if (isThenable(res)) {
         return res.then((resolved) => {
-          finishWithTelemetry(resolved, reqLen, false);
+          this._finishReadWithTelemetry(
+            resolved,
+            reqLen,
+            false,
+            rec,
+            offset,
+            provisionalNextOffset,
+          );
         });
       }
-      finishWithTelemetry(res, reqLen, false);
+      this._finishReadWithTelemetry(res, reqLen, false, rec, offset, provisionalNextOffset);
       return;
     }
 
     // 1. Synchronous hit from this handle's adaptive read-ahead window buffer.
     const raHit = this._tryServeFromReadAheadBuffer(rec, offset, reqLen);
     if (raHit !== null) {
-      finishWithTelemetry(raHit, reqLen, true);
+      this._finishReadWithTelemetry(raHit, reqLen, true, rec, offset, provisionalNextOffset);
+      if (wasExpected && raCfg.backgroundPrefetch) {
+        this._maybeScheduleBackgroundReadAhead(rec, cache, handle, entryPath, offset, reqLen);
+      }
       return;
     }
 
@@ -1955,17 +2512,38 @@ class HttpfsMailboxHost {
           if (rel >= 0 && rel + reqLen <= bufBytes.byteLength) {
             rec.coalescedSlotReads += 1;
             this._stats.coalescedSlotReads += 1;
-            finishWithTelemetry(bufBytes.subarray(rel, rel + reqLen), reqLen, true);
+            this._finishReadWithTelemetry(
+              bufBytes.subarray(rel, rel + reqLen),
+              reqLen,
+              true,
+              rec,
+              offset,
+              provisionalNextOffset,
+            );
             return;
           }
         }
-        const fallbackRes = invokeBackendRead(offset, reqLen);
+        const fallbackRes = this._invokeBackendRead(cache, handle, entryPath, offset, reqLen);
         if (isThenable(fallbackRes)) {
           return fallbackRes.then((resolved) => {
-            finishWithTelemetry(resolved, reqLen, false);
+            this._finishReadWithTelemetry(
+              resolved,
+              reqLen,
+              false,
+              rec,
+              offset,
+              provisionalNextOffset,
+            );
           });
         }
-        finishWithTelemetry(fallbackRes, reqLen, false);
+        this._finishReadWithTelemetry(
+          fallbackRes,
+          reqLen,
+          false,
+          rec,
+          offset,
+          provisionalNextOffset,
+        );
       });
     }
 
@@ -1980,36 +2558,43 @@ class HttpfsMailboxHost {
     const populateAndFinish = (res) => {
       const bytes = extractReadBytes(res);
       if (bytes === undefined || bytes === null) {
-        finishWithTelemetry(res, reqLen, false);
+        this._finishReadWithTelemetry(res, reqLen, false, rec, offset, provisionalNextOffset);
         return null;
       }
       if (isWindowFetch && bytes.byteLength > reqLen) {
-        const stored = new Uint8Array(bytes.byteLength);
-        stored.set(bytes);
         const existing = rec.raBuffer;
         const existingCoversNew =
           existing &&
           existing.bytes &&
           existing.startOffset <= offset &&
-          existing.startOffset + existing.bytes.byteLength >= offset + stored.byteLength;
-        if (!existingCoversNew) {
-          rec.raBuffer = {
-            startOffset: offset,
-            bytes: stored,
-            eof: bytes.byteLength < reqLen,
-          };
+          existing.startOffset + existing.bytes.byteLength >= offset + bytes.byteLength;
+        if (existingCoversNew) {
+          this._finishReadWithTelemetry(bytes, reqLen, false, rec, offset, provisionalNextOffset);
+          return existing.bytes.subarray(
+            offset - existing.startOffset,
+            offset - existing.startOffset + bytes.byteLength,
+          );
         }
-        finishWithTelemetry(stored, reqLen, false);
+        const stored = new Uint8Array(bytes.byteLength);
+        stored.set(bytes);
+        rec.raBuffer = {
+          startOffset: offset,
+          bytes: stored,
+          eof: bytes.byteLength < reqLen,
+        };
+        rec.nextRaBuffer = null;
+        this._finishReadWithTelemetry(stored, reqLen, false, rec, offset, provisionalNextOffset);
         return stored;
       }
       if (!wasExpected) {
         rec.raBuffer = null;
+        rec.nextRaBuffer = null;
       }
-      finishWithTelemetry(bytes, reqLen, false);
+      this._finishReadWithTelemetry(bytes, reqLen, false, rec, offset, provisionalNextOffset);
       return bytes;
     };
 
-    const res = invokeBackendRead(offset, fetchLen);
+    const res = this._invokeBackendRead(cache, handle, entryPath, offset, fetchLen);
     if (isThenable(res)) {
       let inflightEntry = null;
       const wrapped = res.then(
@@ -2103,34 +2688,9 @@ class HttpfsMailboxHost {
       }
     }
 
-    let finalized = false;
-    const finalizeTiming = () => {
-      if (finalized) {
-        return;
-      }
-      finalized = true;
-      this._inFlight = false;
-      if (this._slotActive) {
-        this._slotActive = false;
-        this._stats.activeLanes = Math.max(0, this._stats.activeLanes - 1);
-      }
-      const elapsed = Math.max(0, this._now() - startMs);
-      this._stats.activePendingSlots = Math.max(0, this._stats.activePendingSlots - 1);
-      this._stats.totalWaitMs += elapsed;
-      this._stats.waitSamples += 1;
-      if (elapsed > this._stats.maxWaitMs) {
-        this._stats.maxWaitMs = elapsed;
-      }
-      if (handleRec) {
-        handleRec.activePendingSlots = Math.max(0, handleRec.activePendingSlots - 1);
-        handleRec.totalWaitMs += elapsed;
-        handleRec.waitSamples += 1;
-        if (elapsed > handleRec.maxWaitMs) {
-          handleRec.maxWaitMs = elapsed;
-        }
-      }
-    };
-    this._pendingFinalize = finalizeTiming;
+    this._reqStartMs = startMs;
+    this._reqHandleRec = handleRec;
+    this._hasPendingFinalize = true;
 
     let pending;
     try {
@@ -2146,8 +2706,7 @@ class HttpfsMailboxHost {
     } catch {
       const errCode = op === HttpfsOp.Open ? -2n : -5n;
       this.completeResponse(errCode, HttpfsStatus.Error);
-      finalizeTiming();
-      this._pendingFinalize = null;
+      this._finalizeTiming();
       this._stats.syncFastPathHits += 1;
       this._slotSyncFastPathHits += 1;
       return true;
@@ -2158,22 +2717,19 @@ class HttpfsMailboxHost {
       this._slotAsyncPathHits += 1;
       return pending.then(
         () => {
-          finalizeTiming();
-          this._pendingFinalize = null;
+          this._finalizeTiming();
           return true;
         },
         () => {
           const errCode = op === HttpfsOp.Open ? -2n : -5n;
           this.completeResponse(errCode, HttpfsStatus.Error);
-          finalizeTiming();
-          this._pendingFinalize = null;
+          this._finalizeTiming();
           return true;
         },
       );
     }
 
-    finalizeTiming();
-    this._pendingFinalize = null;
+    this._finalizeTiming();
     this._stats.syncFastPathHits += 1;
     this._slotSyncFastPathHits += 1;
     return true;
@@ -2209,7 +2765,11 @@ class HttpfsMailboxHost {
     this._running = true;
     this._loopPromise = (async () => {
       let syncBurst = 0;
-      const syncBurstLimit = this._shared.slotCount > 1 ? 16 : 128;
+      const isPool = this._shared.slotCount > 1;
+      const syncBurstLimit = isPool ? 16 : 128;
+      const syncSpinLimit = isPool
+        ? HTTPFS_HOST_SYNC_SPIN_POOL_ITERS
+        : HTTPFS_HOST_SYNC_SPIN_SINGLE_ITERS;
       while (this._running) {
         const status = Atomics.load(this._statusView, 0);
         if (status === HttpfsStatus.Shutdown) {
@@ -2225,6 +2785,18 @@ class HttpfsMailboxHost {
             if (syncBurst >= syncBurstLimit) {
               syncBurst = 0;
               await Promise.resolve();
+            } else if (this._running) {
+              // Brief bounded spin to catch back-to-back synchronous client chunks without
+              // allocating an Atomics.waitAsync Promise or forcing an event-loop turn.
+              for (let s = 0; s < syncSpinLimit; s += 1) {
+                const nextStatus = Atomics.load(this._statusView, 0);
+                if (
+                  nextStatus === HttpfsStatus.RequestReady ||
+                  nextStatus === HttpfsStatus.Shutdown
+                ) {
+                  break;
+                }
+              }
             }
           }
           continue;
@@ -2306,8 +2878,9 @@ class HttpfsMailboxClient {
 
   _resetToIdle(status) {
     if (status !== HttpfsStatus.Shutdown) {
+      // Store Idle without calling Atomics.notify: avoids spuriously waking the responder
+      // only to see Idle and allocate a second Atomics.waitAsync promise.
       Atomics.store(this._statusView, 0, HttpfsStatus.Idle);
-      Atomics.notify(this._statusView, 0, 1);
     }
   }
 
@@ -2320,6 +2893,15 @@ class HttpfsMailboxClient {
     }
 
     let cur = Atomics.load(this._statusView, 0);
+    if (cur === HttpfsStatus.RequestReady && !this._responder) {
+      // Brief bounded spin before entering OS futex sleep to catch fast synchronous cache hits.
+      for (let s = 0; s < HTTPFS_CLIENT_SYNC_SPIN_ITERS; s += 1) {
+        cur = Atomics.load(this._statusView, 0);
+        if (cur !== HttpfsStatus.RequestReady) {
+          break;
+        }
+      }
+    }
     while (cur === HttpfsStatus.RequestReady) {
       const waitResult = Atomics.wait(
         this._statusView,
@@ -2430,17 +3012,20 @@ class HttpfsMailboxClient {
     let remaining = reqLen;
     let outCursor = 0;
     let totalRead = 0;
+    let lastStatus = HttpfsStatus.Idle;
 
     while (remaining > 0) {
       const chunk = Math.min(remaining, cap);
+      const chunkBig = BigInt(chunk);
       this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
       this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
       this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
-      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(chunk), true);
+      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
       this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
       const { status, result } = this._executeRoundtripSync();
-      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > BigInt(chunk)) {
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
         this._resetToIdle(status);
         return result < 0n ? Number(result) : -1;
       }
@@ -2449,7 +3034,6 @@ class HttpfsMailboxClient {
       if (got > 0) {
         dst.set(this._payloadView.subarray(0, got), outCursor);
       }
-      this._resetToIdle(status);
 
       outCursor += got;
       curOffset += BigInt(got);
@@ -2461,6 +3045,7 @@ class HttpfsMailboxClient {
       }
     }
 
+    this._resetToIdle(lastStatus);
     return totalRead;
   }
 
@@ -2479,17 +3064,20 @@ class HttpfsMailboxClient {
     let remaining = reqLen;
     let outCursor = 0;
     let totalRead = 0;
+    let lastStatus = HttpfsStatus.Idle;
 
     while (remaining > 0) {
       const chunk = Math.min(remaining, cap);
+      const chunkBig = BigInt(chunk);
       this._headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Read, true);
       this._headerView.setInt32(HttpfsOffsets.HANDLE, h, true);
       this._headerView.setBigUint64(HttpfsOffsets.OFFSET, curOffset, true);
-      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(chunk), true);
+      this._headerView.setBigUint64(HttpfsOffsets.LENGTH, chunkBig, true);
       this._headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
 
       const { status, result } = await this._executeRoundtripAsync();
-      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > BigInt(chunk)) {
+      lastStatus = status;
+      if (status !== HttpfsStatus.ResponseReady || result < 0n || result > chunkBig) {
         this._resetToIdle(status);
         return result < 0n ? Number(result) : -1;
       }
@@ -2498,7 +3086,6 @@ class HttpfsMailboxClient {
       if (got > 0) {
         dst.set(this._payloadView.subarray(0, got), outCursor);
       }
-      this._resetToIdle(status);
 
       outCursor += got;
       curOffset += BigInt(got);
@@ -2510,6 +3097,7 @@ class HttpfsMailboxClient {
       }
     }
 
+    this._resetToIdle(lastStatus);
     return totalRead;
   }
 
