@@ -800,7 +800,14 @@ void test_queries_and_footprints() {
     CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(3), I(fmt_va), I(12)})) == 0);
     CHECK((load32(fmt_va + 4) & 0x10000) != 0 && (load32(fmt_va + 4) & 0x200) != 0);
     CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(3), I(fmt_va), I(8)})) == dg::kEInvalidArg);
-    CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(99), I(fmt_va), I(12)})) == dg::kEInvalidArg);
+    CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(99), I(fmt_va), I(12)})) == dg::kENotImpl);
+    CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(99), I(fmt_va), I(12)})) == dg::kENotImpl);
+    // OPTIONS5 (ray tracing tier 0) and OPTIONS7 (mesh tier 1, no sampler feedback) answer truthfully.
+    const uint64_t o5 = put_bytes(fmt, 12);
+    CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(27), I(o5), I(12)})) == 0 && load32(o5 + 8) == 0);
+    const uint64_t o7 = put_bytes(fmt, 8);
+    CHECK(hr(fx.vcall(device, Slot::CheckFeatureSupport, {I(32), I(o7), I(8)})) == 0);
+    CHECK(load32(o7) == 10 && load32(o7 + 4) == 0);
 
     // GetCustomHeapProperties (struct return, result pointer first).
     const uint64_t props = put(dg::GuestHeapProperties{});
