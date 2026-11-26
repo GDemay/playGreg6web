@@ -12,6 +12,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <timeapi.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "winmm.lib")
+#endif
 #endif
 
 namespace playgta6::os::host_sleep {
@@ -41,6 +45,22 @@ HANDLE thread_timer() {
 #endif
 
 }  // namespace
+
+void raise_timer_resolution() {
+#ifdef _WIN32
+    static const bool done = [] {
+        timeBeginPeriod(1);  // 1 ms tick; the OS restores it at process exit
+        return true;
+    }();
+    (void)done;
+    // Windows 11: do not let a windowless / occluded process have its timer resolution ignored.
+    PROCESS_POWER_THROTTLING_STATE st{};
+    st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    st.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st));
+#endif
+}
 
 void sleep_until(std::chrono::steady_clock::time_point deadline) {
 #ifdef _WIN32
