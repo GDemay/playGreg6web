@@ -11,6 +11,7 @@ add_library(playgta6_core STATIC
     os/process_memory.cpp
     os/vmem_backing.cpp
     os/threading.cpp
+    os/thread_name.cpp
     os/game_input.cpp
     os/httpfs_mailbox.cpp
     os/win32_kernel.cpp

@@ -1,4 +1,5 @@
 #include "os/threading.h"
+#include "os/thread_name.h"
 
 #include <chrono>
 #include <memory>
@@ -212,6 +213,7 @@ void XTaskQueue::grow_port(Port& port) {
 }
 
 void XTaskQueue::worker_loop(Port& port) {
+    playgta6::os::name_this_thread(L"pg6-xtask-worker");
     while (true) {
         TaskEntry entry;
         {

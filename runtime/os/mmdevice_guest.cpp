@@ -31,6 +31,7 @@
 // the XApu model (acp_hal_guest.cpp) neither decodes nor sends such results.
 
 #include "os/audio_downmix.h"
+#include "os/thread_name.h"
 #include "os/audio_report.h"
 
 #include <algorithm>
@@ -390,6 +391,7 @@ private:
     }
 
     void run() {
+        playgta6::os::name_this_thread(L"pg6-mmdevice");
         host_sleep::raise_timer_resolution();
         const auto origin = std::chrono::steady_clock::now();
         AudioPacer pacer{};

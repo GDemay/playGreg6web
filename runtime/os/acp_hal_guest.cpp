@@ -31,6 +31,7 @@
 // reads nothing back but the HRESULT.
 
 #include <algorithm>
+#include "os/thread_name.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -205,6 +206,7 @@ void pump_enabled_voices() {
 }
 
 void xma_worker() {
+    playgta6::os::name_this_thread(L"pg6-xma");
     auto& x = xma();
     for (;;) {
         {

@@ -1,4 +1,5 @@
 #include "guest/host_input.h"
+#include "os/thread_name.h"
 #include "guest/input_record.h"
 
 #include <chrono>
@@ -207,6 +208,7 @@ bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 #endif
 
 void HostInputSource::run() {
+    playgta6::os::name_this_thread(L"pg6-host-input");
 #ifdef _WIN32
     GetStateFn get_state = nullptr;
     for (const char* dll : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"}) {

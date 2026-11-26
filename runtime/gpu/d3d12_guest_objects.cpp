@@ -1,4 +1,5 @@
 #include "os/guest_window.h"
+#include "os/thread_name.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/texture_budget.h"
 #include "gpu/d3d12_guest_objects.h"
@@ -343,6 +344,7 @@ void Device::register_lag_fence(Fence* fence) {
     if (!lag_publisher_.joinable() && !lag_stop_) {
         // Publishes capped values while no present comes (titles poll the completed-value word).
         lag_publisher_ = std::thread([this] {
+            playgta6::os::name_this_thread(L"pg6-lag-publisher");
             std::unique_lock<std::mutex> l(lag_mutex_);
             while (!lag_stop_) {
                 lag_cv_.wait_for(l, std::chrono::milliseconds(4));
