@@ -184,7 +184,7 @@ struct StorageResolution {
 struct DeviceFeatures {
     bool bc = false, bc_sliced_3d = false, depth32_stencil8 = false, float32_filterable = false,
          float32_blendable = false, bgra8_storage = false, rg11b10_renderable = false, tier1 = false,
-         timestamp_query = false;
+         timestamp_query = false, timestamp_inside_passes = false;
 };
 
 StorageResolution resolve_storage_format(uint8_t f, const DeviceFeatures& d) {
@@ -685,6 +685,14 @@ struct NativeExecutor::Impl {
         time_ring.reset();
         wgpu::RequestAdapterOptions aopts{};
         aopts.compatibleSurface = surface;
+        // Experimental features (timestamps inside passes) are only exposed by an adapter made with unsafe APIs.
+        static const char* const kAdapterUnsafe[] = {"allow_unsafe_apis"};
+        wgpu::DawnTogglesDescriptor adapter_toggles{};
+        if (options.gpu_time_split) {
+            adapter_toggles.enabledToggleCount = 1;
+            adapter_toggles.enabledToggles = kAdapterUnsafe;
+            aopts.nextInChain = &adapter_toggles;
+        }
         struct AdapterResult {
             wgpu::Adapter adapter;
             std::string message;
@@ -775,16 +783,25 @@ struct NativeExecutor::Impl {
             }
         }
         static const char* const kValidationToggles[] = {"enable_immediate_error_handling", "use_user_defined_labels_in_backend"};
-        if (options.gpu_validation) {
-            toggles.enabledToggleCount = 2;
-            toggles.enabledToggles = kValidationToggles;
-        }
+        std::vector<const char*> enabled_toggles;
+        if (options.gpu_validation) enabled_toggles.assign(std::begin(kValidationToggles), std::end(kValidationToggles));
         const bool want_timing = options.gpu_timing && adapter_handle.HasFeature(wgpu::FeatureName::TimestampQuery);
         if (want_timing) {
             required.push_back(wgpu::FeatureName::TimestampQuery);
             features.timestamp_query = true;
+            // gpu_time_split: timestamps inside a pass (an experimental Dawn feature behind allow_unsafe_apis).
+            if (options.gpu_time_split &&
+                adapter_handle.HasFeature(wgpu::FeatureName::ChromiumExperimentalTimestampQueryInsidePasses)) {
+                required.push_back(wgpu::FeatureName::ChromiumExperimentalTimestampQueryInsidePasses);
+                features.timestamp_inside_passes = true;
+                enabled_toggles.push_back("allow_unsafe_apis");
+            }
             toggles.disabledToggleCount = 1;
             toggles.disabledToggles = kDisabledToggles;
+        }
+        if (!enabled_toggles.empty()) {
+            toggles.enabledToggleCount = enabled_toggles.size();
+            toggles.enabledToggles = enabled_toggles.data();
         }
         // Limits (requestNegotiatedDevice): each optional limit above the WebGPU default, capped.
         wgpu::Limits adapter_limits{};
@@ -892,6 +909,9 @@ struct NativeExecutor::Impl {
     void setup_timers(bool adapter_has_feature) {
         time_table = options.gpu_time ? options.gpu_time : &d3d12_guest::gpu_time_table();
         stats.timer_supported = features.timestamp_query;
+        stats.timer_split_supported = features.timestamp_inside_passes;
+        if (options.gpu_time_split && !features.timestamp_inside_passes)
+            std::fprintf(stderr, "[native] gpu_time_split: the adapter lacks timestamp-query-inside-passes; passes are timed whole\n");
         if (!adapter_has_feature) {
             time_table->set_support(d3d12_guest::GpuTimeTable::Support::Unavailable, "adapter lacks timestamp-query");
             return;
@@ -3878,8 +3898,46 @@ struct NativeExecutor::Impl {
         size_t idx = 0;
         int timer_slot = -2;
         size_t timer_passes = 0;
+        // gpu_time_split: the open per-pipeline segment of the active pass (its end query, key and kind).
+        bool seg_open = false;
+        uint32_t seg_end = 0;
+        uint64_t seg_hash = 0;
+
+        // gpu_time_split: the pass-level write keeps only the begin query; the end is written inside the
+        // pass (seg_close) so later segments can follow.
+        void seg_begin(wgpu::PassTimestampWrites& tw, bool timed, uint64_t hash) {
+            seg_open = false;
+            if (!timed || !s.features.timestamp_inside_passes) return;
+            seg_open = true;
+            seg_end = tw.endOfPassWriteIndex;
+            seg_hash = hash;
+            tw.endOfPassWriteIndex = wgpu::kQuerySetIndexUndefined;
+        }
+        wgpu::QuerySet timer_queries() const { return s.timer_slots[static_cast<size_t>(timer_slot)].queries; }
+        void seg_close() {  // writes the open segment's end timestamp into the active pass
+            if (!seg_open) return;
+            seg_open = false;
+            if (rpass) rpass.WriteTimestamp(timer_queries(), seg_end);
+            else if (cpass) cpass.WriteTimestamp(timer_queries(), seg_end);
+        }
+        // A SetPipeline / SetComputePipeline in the active pass: a different timing key closes the segment
+        // and starts the next one.
+        void seg_switch(uint64_t hash, d3d12_guest::GpuPassKind kind) {
+            if (!seg_open || hash == seg_hash) return;
+            seg_close();
+            uint32_t b = 0, en = 0;
+            if (!s.time_ring->add_pass(hash, kind, &b, &en)) return;
+            if (rpass) rpass.WriteTimestamp(timer_queries(), b);
+            else if (cpass) cpass.WriteTimestamp(timer_queries(), b);
+            else return;
+            seg_open = true;
+            seg_end = en;
+            seg_hash = hash;
+            ++s.stats.timer_segments;
+        }
 
         void end_active() {
+            seg_close();
             if (rpass) { rpass.End(); rpass = nullptr; }
             if (cpass) { cpass.End(); cpass = nullptr; }
             explicit_pass = false;
@@ -3898,6 +3956,7 @@ struct NativeExecutor::Impl {
             wgpu::PassTimestampWrites tw{};
             if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Render, s.lookahead_hash(*this, idx, false), &tw))
                 rp.timestampWrites = &tw;
+            seg_begin(tw, rp.timestampWrites != nullptr, s.lookahead_hash(*this, idx, false));
             rpass = enc.BeginRenderPass(&rp);
             render_pass_opened = true;
         }
@@ -3909,6 +3968,7 @@ struct NativeExecutor::Impl {
             wgpu::PassTimestampWrites tw{};
             if (s.timer_pass(*this, d3d12_guest::GpuPassKind::Compute, s.lookahead_hash(*this, idx, true), &tw))
                 cd.timestampWrites = &tw;
+            seg_begin(tw, cd.timestampWrites != nullptr, s.lookahead_hash(*this, idx, true));
             cpass = enc.BeginComputePass(&cd);
         }
         std::optional<AttachmentSize> swapchain_size() const { return AttachmentSize{s.stream_w, s.stream_h}; }
@@ -4009,6 +4069,7 @@ struct NativeExecutor::Impl {
         wgpu::PassTimestampWrites tw{};
         if (timer_pass(e, d3d12_guest::GpuPassKind::Render, lookahead_hash(e, e.idx + 1, false), &tw))
             rp.timestampWrites = &tw;
+        e.seg_begin(tw, rp.timestampWrites != nullptr, lookahead_hash(e, e.idx + 1, false));
         e.rpass = e.enc.BeginRenderPass(&rp);
         e.render_pass_opened = true;
         e.explicit_pass = true;
@@ -4041,6 +4102,7 @@ struct NativeExecutor::Impl {
             const wgpu::RenderPipeline& pl = it != render_pipelines.end() ? resolve(it->second) : sp->at_packet;
             if (pl) e.rpass.SetPipeline(pl);
             else ++stats.op_errors;  // SetPipeline: render pipeline not found
+            if (e.seg_open) e.seg_switch(it != render_pipelines.end() ? it->second.perf_hash : 0, d3d12_guest::GpuPassKind::Render);
         } else if (const auto* vb = std::get_if<SetVertexBufferCmd>(&cmd)) {
             e.ensure_render();
             auto it = buffers.find(vb->id);
@@ -4091,6 +4153,10 @@ struct NativeExecutor::Impl {
             auto it = compute_pipelines.find(sc->id);
             e.compute_valid = it != compute_pipelines.end();
             if (e.compute_valid) e.cpass.SetPipeline(resolve(it->second));
+            if (e.seg_open) {
+                auto hit = compute_hash.find(sc->id);
+                e.seg_switch(hit != compute_hash.end() ? hit->second : 0, d3d12_guest::GpuPassKind::Compute);
+            }
         } else if (const auto* dc = std::get_if<DispatchCmd>(&cmd)) {
             if (e.had_explicit_compute && !e.compute_valid) {
                 ++stats.dispatches_skipped;
@@ -5299,6 +5365,8 @@ std::string NativeExecutor::stats_json() const {
     num("v1_synth_samplers", st.v1_synth_samplers);
     num("timer_frames", st.timer_frames);
     num("timer_passes", st.timer_passes);
+    num("timer_segments", st.timer_segments);
+    num("timer_split_supported", st.timer_split_supported ? 1 : 0);
     num("timer_frames_skipped", st.timer_frames_skipped);
     num("timer_supported", st.timer_supported ? 1 : 0);
     num("limits_raised", st.limits_raised ? 1 : 0);
