@@ -832,6 +832,7 @@ add_subdirectory("{_cmake_path(repo_root / 'runtime')}" runtime EXCLUDE_FROM_ALL
 
 add_executable({HARNESS_TARGET}
     "{_cmake_path(repo_root / 'runtime' / 'guest' / 'boot_main.cpp')}"
+    "{_cmake_path(repo_root / 'runtime' / 'os' / 'audio_out_wasapi.cpp')}"
 {sources}
 {objs}
 )
@@ -841,15 +842,22 @@ set_source_files_properties(
 target_compile_definitions({HARNESS_TARGET} PRIVATE {defines})
 target_include_directories({HARNESS_TARGET} PRIVATE {includes})
 target_link_libraries({HARNESS_TARGET} PRIVATE playgta6_core)
+if(WIN32)
+    target_link_libraries({HARNESS_TARGET} PRIVATE ole32)
+endif()
 # --window (live play through the Dawn-backed native executor): only with -DPLAYGTA6_NATIVE_EXECUTOR=ON.
 if(TARGET playgta6_native_exec)
     target_link_libraries({HARNESS_TARGET} PRIVATE playgta6_native_exec)
     target_compile_definitions({HARNESS_TARGET} PRIVATE PLAYGTA6_NATIVE_EXECUTOR=1)
-    if(WIN32 AND DEFINED dxc_prebuilt_SOURCE_DIR)
+    # dxc_prebuilt_SOURCE_DIR is set in runtime/'s scope only: read the FetchContent property here.
+    if(WIN32)
+        FetchContent_GetProperties(dxc_prebuilt SOURCE_DIR _pg6_dxc_dir)
+    endif()
+    if(WIN32 AND _pg6_dxc_dir)
         add_custom_command(TARGET {HARNESS_TARGET} POST_BUILD
             COMMAND ${{CMAKE_COMMAND}} -E copy_if_different
-                "${{dxc_prebuilt_SOURCE_DIR}}/bin/x64/dxcompiler.dll"
-                "${{dxc_prebuilt_SOURCE_DIR}}/bin/x64/dxil.dll"
+                "${{_pg6_dxc_dir}}/bin/x64/dxcompiler.dll"
+                "${{_pg6_dxc_dir}}/bin/x64/dxil.dll"
                 "$<TARGET_FILE_DIR:{HARNESS_TARGET}>")
     endif()
 endif()
