@@ -38,14 +38,42 @@ static_assert(static_cast<uint32_t>(pso::D3D12ComparisonFunc::Always) == 8);  //
 namespace {
 
 constexpr uint32_t kRootConstantAlignment = 256;  // minUniformBufferOffsetAlignment (default limit)
+constexpr uint64_t kFnv1aOffsetBasis64 = 0xcbf29ce484222325ull;
+constexpr uint64_t kFnv1aPrime64 = 0x100000001b3ull;
 
 uint32_t align_up(uint32_t value, uint32_t alignment) noexcept {
     return (value + alignment - 1u) / alignment * alignment;
 }
 
-template <typename T>
-std::string bytes_key(const T& value) {
-    return std::string(reinterpret_cast<const char*>(&value), sizeof(T));
+float canonical_finite_float(float value) noexcept {
+    if (!std::isfinite(value) || value == 0.0f) {
+        return 0.0f;
+    }
+    return value;
+}
+
+uint32_t canonical_finite_bits(float value) noexcept {
+    const float clean = canonical_finite_float(value);
+    uint32_t bits = 0;
+    std::memcpy(&bits, &clean, sizeof(bits));
+    return bits;
+}
+
+bool is_dual_source_factor_code(uint8_t f) noexcept {
+    using W = pso::WgpuBlendFactor;
+    return f == static_cast<uint8_t>(W::Src1) || f == static_cast<uint8_t>(W::OneMinusSrc1) ||
+           f == static_cast<uint8_t>(W::Src1Alpha) || f == static_cast<uint8_t>(W::OneMinusSrc1Alpha);
+}
+
+uint8_t downgrade_dual_source_factor_code(uint8_t f) noexcept {
+    using W = pso::WgpuBlendFactor;
+    switch (static_cast<W>(f)) {
+    case W::Src1: return static_cast<uint8_t>(W::Src);
+    case W::OneMinusSrc1: return static_cast<uint8_t>(W::OneMinusSrc);
+    case W::Src1Alpha: return static_cast<uint8_t>(W::SrcAlpha);
+    case W::OneMinusSrc1Alpha: return static_cast<uint8_t>(W::OneMinusSrcAlpha);
+    default: return f;
+    }
 }
 
 uint32_t mip_extent(uint32_t extent, uint32_t mip) noexcept {
@@ -78,10 +106,396 @@ GpuAddressMode to_address_mode(uint32_t d3d12_mode, bool* exact) noexcept {
     }
 }
 
+uint64_t hash_shader_binding(uint64_t seed, const d3d::ShaderBinding& b) noexcept {
+    uint64_t h = hash_combine64(seed, b.binding);
+    h = hash_combine64(h, (static_cast<uint64_t>(b.register_class) << 32) | b.shader_register);
+    h = hash_combine64(h, (uint64_t{b.register_space} << 32) | (b.root_constants ? 1u : 0u) |
+                              (b.inline_sampler ? 2u : 0u) | (static_cast<uint64_t>(b.heap) << 8) |
+                              (static_cast<uint64_t>(b.heap_index_source) << 16));
+    h = hash_combine64(h, (uint64_t{b.heap_index_parameter} << 32) | b.heap_index_dword);
+    h = hash_combine64(h, (uint64_t{b.heap_shift} << 32) | b.cb_table_slot);
+    h = hash_combine64(h, (uint64_t{b.cb_byte_offset} << 32) | b.cb_bit_offset);
+    h = hash_combine64(h, (uint64_t{b.cb_mask} << 32) | b.heap_stride);
+    h = hash_combine64(h, (uint64_t{b.array_size} << 32) | b.array_index);
+    h = hash_combine64(h, (uint64_t{b.table_parameter} << 32) | b.table_slot);
+    if (b.inline_sampler) {
+        h = hash_combine64(h, fnv1a_hash64(&b.sampler, sizeof(b.sampler)));
+    }
+    return h;
+}
+
 }  // namespace
+
+uint64_t splitmix64(uint64_t x) noexcept {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+
+uint64_t fnv1a_hash64(const void* data, size_t size, uint64_t seed) noexcept {
+    uint64_t h = seed;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h ^= static_cast<uint64_t>(bytes[i]);
+        h *= kFnv1aPrime64;
+    }
+    return h;
+}
+
+uint64_t hash_combine64(uint64_t seed, uint64_t value) noexcept {
+    return splitmix64(seed ^ (splitmix64(value) + 0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2)));
+}
+
+uint64_t hash_sampler_payload(const GpuCreateSampler2Payload& payload) noexcept {
+    const StateBridgeDevice::SamplerKey key = StateBridgeDevice::make_sampler_key(payload);
+    return splitmix64(fnv1a_hash64(&key, sizeof(key)));
+}
+
+uint64_t hash_view_record(const ViewRecord& record) noexcept {
+    const StateBridgeDevice::ViewKey key = StateBridgeDevice::make_view_key(record);
+    return splitmix64(fnv1a_hash64(&key, sizeof(key)));
+}
+
+uint64_t hash_render_pipeline_key(const GpuRenderPipelineKey& key) noexcept {
+    return splitmix64(fnv1a_hash64(&key, sizeof(key)));
+}
 
 pso::WgpuIndexFormat to_wgpu_index_format(GpuIndexFormat format) noexcept {
     return format == GpuIndexFormat::Uint32 ? pso::WgpuIndexFormat::Uint32 : pso::WgpuIndexFormat::Uint16;
+}
+
+GpuPrimitiveTopology to_gpu_primitive_topology(pso::D3DPrimitiveTopology topology, bool* exact) noexcept {
+    const pso::TopologyMapping tm = pso::map_primitive_topology(topology);
+    if (exact != nullptr) {
+        *exact = (tm.diagnostics == 0);
+    }
+    return static_cast<GpuPrimitiveTopology>(tm.topology);
+}
+
+bool is_strip_topology(GpuPrimitiveTopology topology) noexcept {
+    return topology == GpuPrimitiveTopology::TriangleStrip || topology == GpuPrimitiveTopology::LineStrip;
+}
+
+bool is_strip_topology(pso::WgpuPrimitiveTopology topology) noexcept {
+    return topology == pso::WgpuPrimitiveTopology::TriangleStrip ||
+           topology == pso::WgpuPrimitiveTopology::LineStrip;
+}
+
+pso::WgpuIndexFormat resolve_strip_index_format(pso::WgpuPrimitiveTopology topology,
+                                                pso::WgpuIndexFormat bound_index_format,
+                                                pso::D3D12IndexBufferStripCutValue strip_cut) noexcept {
+    if (!is_strip_topology(topology)) {
+        return pso::WgpuIndexFormat::Undefined;
+    }
+    if (bound_index_format == pso::WgpuIndexFormat::Uint16 || bound_index_format == pso::WgpuIndexFormat::Uint32) {
+        return bound_index_format;
+    }
+    switch (strip_cut) {
+    case pso::D3D12IndexBufferStripCutValue::Value0xFFFF: return pso::WgpuIndexFormat::Uint16;
+    case pso::D3D12IndexBufferStripCutValue::Value0xFFFFFFFF: return pso::WgpuIndexFormat::Uint32;
+    default: return pso::WgpuIndexFormat::Undefined;
+    }
+}
+
+float sanitize_depth_bias_float(float value) noexcept {
+    return canonical_finite_float(value);
+}
+
+uint32_t sanitize_depth_bias_bits(float value) noexcept {
+    return canonical_finite_bits(value);
+}
+
+bool sanitize_render_pipeline_key(GpuRenderPipelineKey* key, uint32_t features) noexcept {
+    if (key == nullptr) {
+        return false;
+    }
+    const GpuRenderPipelineKey before = *key;
+
+    if (key->color_target_count > kGpuMaxColorAttachments) {
+        key->color_target_count = kGpuMaxColorAttachments;
+    }
+    constexpr GpuBlendComponentKey kDefaultBlend{
+        static_cast<uint8_t>(pso::WgpuBlendOperation::Add),
+        static_cast<uint8_t>(pso::WgpuBlendFactor::One),
+        static_cast<uint8_t>(pso::WgpuBlendFactor::Zero),
+        0,
+    };
+    const bool dual_source_ok = (features & pso::WgpuFeature::DualSourceBlending) != 0;
+    for (uint32_t i = 0; i < kGpuMaxColorAttachments; ++i) {
+        GpuColorTargetKey& ct = key->color_targets[i];
+        if (i >= key->color_target_count || ct.format == 0 ||
+            ct.format >= static_cast<uint8_t>(pso::WgpuTextureFormat::Count)) {
+            ct = GpuColorTargetKey{};
+            continue;
+        }
+        ct.write_mask &= 0xFu;
+        ct.reserved = 0;
+        const auto fmt = static_cast<pso::WgpuTextureFormat>(ct.format);
+        if (ct.blend_enabled != 0) {
+            if (!pso::is_blendable(fmt, features)) {
+                ct.blend_enabled = 0;
+            } else {
+                ct.blend_enabled = 1;
+                auto clean_comp = [&](GpuBlendComponentKey& c) {
+                    c.reserved = 0;
+                    if (!dual_source_ok) {
+                        if (is_dual_source_factor_code(c.src_factor)) {
+                            c.src_factor = downgrade_dual_source_factor_code(c.src_factor);
+                        }
+                        if (is_dual_source_factor_code(c.dst_factor)) {
+                            c.dst_factor = downgrade_dual_source_factor_code(c.dst_factor);
+                        }
+                    }
+                    if (c.operation == static_cast<uint8_t>(pso::WgpuBlendOperation::Min) ||
+                        c.operation == static_cast<uint8_t>(pso::WgpuBlendOperation::Max)) {
+                        c.src_factor = static_cast<uint8_t>(pso::WgpuBlendFactor::One);
+                        c.dst_factor = static_cast<uint8_t>(pso::WgpuBlendFactor::One);
+                    }
+                };
+                clean_comp(ct.color);
+                clean_comp(ct.alpha);
+            }
+        }
+        if (ct.blend_enabled == 0) {
+            ct.color = kDefaultBlend;
+            ct.alpha = kDefaultBlend;
+        }
+    }
+
+    // Primitive topology & stripIndexFormat rules.
+    const auto topo = static_cast<pso::WgpuPrimitiveTopology>(key->primitive.topology);
+    const bool strip = is_strip_topology(topo);
+    const bool triangle = topo == pso::WgpuPrimitiveTopology::TriangleList ||
+                          topo == pso::WgpuPrimitiveTopology::TriangleStrip;
+    if (!strip) {
+        key->primitive.strip_index_format = static_cast<uint8_t>(pso::WgpuIndexFormat::Undefined);
+    } else if (key->primitive.strip_index_format > static_cast<uint8_t>(pso::WgpuIndexFormat::Uint32)) {
+        key->primitive.strip_index_format = static_cast<uint8_t>(pso::WgpuIndexFormat::Undefined);
+    }
+    key->primitive.reserved[0] = 0;
+    key->primitive.reserved[1] = 0;
+    key->primitive.reserved[2] = 0;
+
+    // Depth-stencil & depth-bias rules.
+    GpuDepthStencilKey& ds = key->depth_stencil;
+    if (ds.format == 0 || ds.format >= static_cast<uint8_t>(pso::WgpuTextureFormat::Count)) {
+        ds = GpuDepthStencilKey{};
+    } else {
+        const auto ds_fmt = static_cast<pso::WgpuTextureFormat>(ds.format);
+        const bool has_depth = pso::has_depth_aspect(ds_fmt);
+        const bool has_stencil = pso::has_stencil_aspect(ds_fmt);
+        ds.reserved = 0;
+        if (!has_depth) {
+            ds.depth_write_enabled = 0;
+            ds.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+        } else {
+            ds.depth_write_enabled = ds.depth_write_enabled != 0 ? 1 : 0;
+            if (ds.depth_compare == 0 || ds.depth_compare >= static_cast<uint8_t>(pso::WgpuCompareFunction::Count)) {
+                ds.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            }
+        }
+        constexpr GpuStencilFaceKey kDefaultStencil{
+            static_cast<uint8_t>(pso::WgpuCompareFunction::Always),
+            static_cast<uint8_t>(pso::WgpuStencilOperation::Keep),
+            static_cast<uint8_t>(pso::WgpuStencilOperation::Keep),
+            static_cast<uint8_t>(pso::WgpuStencilOperation::Keep),
+        };
+        if (!has_stencil) {
+            ds.stencil_front = kDefaultStencil;
+            ds.stencil_back = kDefaultStencil;
+            ds.stencil_read_mask = 0;
+            ds.stencil_write_mask = 0;
+        } else {
+            if (ds.stencil_front.compare == 0 ||
+                ds.stencil_front.compare >= static_cast<uint8_t>(pso::WgpuCompareFunction::Count)) {
+                ds.stencil_front.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            }
+            if (ds.stencil_back.compare == 0 ||
+                ds.stencil_back.compare >= static_cast<uint8_t>(pso::WgpuCompareFunction::Count)) {
+                ds.stencil_back.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            }
+        }
+        float slope = 0.0f;
+        float clamp = 0.0f;
+        std::memcpy(&slope, &ds.depth_bias_slope_scale_bits, sizeof(slope));
+        std::memcpy(&clamp, &ds.depth_bias_clamp_bits, sizeof(clamp));
+        ds.depth_bias_slope_scale_bits = sanitize_depth_bias_bits(slope);
+        ds.depth_bias_clamp_bits = sanitize_depth_bias_bits(clamp);
+
+        const bool depth_used =
+            has_depth && (ds.depth_write_enabled != 0 ||
+                          ds.depth_compare != static_cast<uint8_t>(pso::WgpuCompareFunction::Always));
+        if (!depth_used || !triangle) {
+            ds.depth_bias = 0;
+            ds.depth_bias_slope_scale_bits = 0;
+            ds.depth_bias_clamp_bits = 0;
+        }
+    }
+    key->reserved = 0;
+    return std::memcmp(&before, key, sizeof(GpuRenderPipelineKey)) != 0;
+}
+
+CompatibleViewFormats compatible_view_formats(pso::WgpuTextureFormat format) noexcept {
+    CompatibleViewFormats out{};
+    const pso::WgpuTextureFormat sibling = pso::srgb_sibling(format);
+    if (sibling != pso::WgpuTextureFormat::Undefined) {
+        out.formats[0] = sibling;
+        out.count = 1;
+    }
+    return out;
+}
+
+CompatibleViewFormats compatible_view_formats_for_dxgi(pso::DxgiFormat dxgi_format,
+                                                       pso::FormatUsage usage,
+                                                       uint32_t features) noexcept {
+    const pso::TextureFormatMapping m = pso::map_texture_format(dxgi_format, usage, features);
+    if (!m.supported()) {
+        return CompatibleViewFormats{};
+    }
+    return compatible_view_formats(m.format);
+}
+
+bool is_compatible_view_format(pso::WgpuTextureFormat texture_format, pso::WgpuTextureFormat view_format) noexcept {
+    if (view_format == pso::WgpuTextureFormat::Undefined) {
+        return true;
+    }
+    if (texture_format == pso::WgpuTextureFormat::Undefined) {
+        return false;
+    }
+    if (texture_format == view_format) {
+        return true;
+    }
+    return pso::srgb_sibling(texture_format) == view_format;
+}
+
+bool is_srgb_format(pso::WgpuTextureFormat format) noexcept {
+    return (pso::texture_format_info(format).caps & pso::TextureFormatCaps::Srgb) != 0;
+}
+
+bool is_hdr_color_format(pso::DxgiFormat format) noexcept {
+    using D = pso::DxgiFormat;
+    switch (format) {
+    case D::R16G16B16A16_FLOAT:
+    case D::R16G16B16A16_TYPELESS:
+    case D::R11G11B10_FLOAT:
+    case D::R10G10B10A2_UNORM:
+    case D::R10G10B10A2_TYPELESS:
+    case D::R32G32B32A32_FLOAT:
+    case D::R32G32B32A32_TYPELESS:
+    case D::R32G32_FLOAT:
+    case D::R32_FLOAT:
+    case D::R16G16_FLOAT:
+    case D::R16_FLOAT:
+    case D::R9G9B9E5_SHAREDEXP:
+    case D::BC6H_UF16:
+    case D::BC6H_SF16:
+    case D::BC6H_TYPELESS:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_depth_stencil_dxgi_format(pso::DxgiFormat format) noexcept {
+    using D = pso::DxgiFormat;
+    switch (format) {
+    case D::D32_FLOAT_S8X24_UINT:
+    case D::R32G8X24_TYPELESS:
+    case D::R32_FLOAT_X8X24_TYPELESS:
+    case D::X32_TYPELESS_G8X24_UINT:
+    case D::D32_FLOAT:
+    case D::D24_UNORM_S8_UINT:
+    case D::R24G8_TYPELESS:
+    case D::R24_UNORM_X8_TYPELESS:
+    case D::X24_TYPELESS_G8_UINT:
+    case D::D16_UNORM:
+    case D::D16_UNORM_S8_UINT:
+    case D::R16_UNORM_X8_TYPELESS:
+    case D::X16_TYPELESS_G8_UINT:
+        return true;
+    default:
+        return false;
+    }
+}
+
+ResolvedViewFormat resolve_sampled_view_format(pso::DxgiFormat texture_dxgi,
+                                               pso::DxgiFormat view_dxgi,
+                                               bool sampled_only,
+                                               uint32_t features,
+                                               bool is_depth_resource) noexcept {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+    using A = pso::WgpuTextureAspect;
+    ResolvedViewFormat out{};
+
+    const bool explicit_depth_tex = is_depth_stencil_dxgi_format(texture_dxgi);
+    const bool typeless_depth_tex =
+        is_depth_resource && (texture_dxgi == D::R32_TYPELESS || texture_dxgi == D::R16_TYPELESS);
+    const bool depth_tex = explicit_depth_tex || typeless_depth_tex ||
+                           ((texture_dxgi == D::R32_TYPELESS && view_dxgi == D::D32_FLOAT) ||
+                            (texture_dxgi == D::R16_TYPELESS && view_dxgi == D::D16_UNORM));
+
+    if (depth_tex) {
+        const pso::TextureFormatMapping dm =
+            pso::map_texture_format(texture_dxgi, pso::FormatUsage::DepthStencil, features);
+        if (dm.supported()) {
+            out.format = dm.format;
+            out.depth_sibling = true;
+            const bool stencil_req = view_dxgi == D::X24_TYPELESS_G8_UINT ||
+                                     view_dxgi == D::X32_TYPELESS_G8X24_UINT ||
+                                     view_dxgi == D::X16_TYPELESS_G8_UINT;
+            if (stencil_req && pso::has_stencil_aspect(dm.format)) {
+                out.aspect = A::StencilOnly;
+            } else if (pso::has_depth_aspect(dm.format)) {
+                out.aspect = A::DepthOnly;
+            } else if (pso::has_stencil_aspect(dm.format)) {
+                out.aspect = A::StencilOnly;
+            }
+            return out;
+        }
+    }
+
+    const pso::FormatUsage usage = sampled_only ? pso::FormatUsage::SampledOnly : pso::FormatUsage::Sampled;
+    const pso::TextureFormatMapping tex_map =
+        texture_dxgi != D::UNKNOWN ? pso::map_texture_format(texture_dxgi, usage, features)
+                                   : pso::TextureFormatMapping{};
+
+    if (view_dxgi == D::UNKNOWN) {
+        out.format = F::Undefined;  // default view uses the texture's own format
+        out.aspect = tex_map.aspect;
+        return out;
+    }
+
+    const pso::TextureFormatMapping view_map = pso::map_texture_format(view_dxgi, usage, features);
+    if (!tex_map.supported()) {
+        out.format = view_map.format;
+        out.aspect = view_map.aspect;
+        return out;
+    }
+    if (!view_map.supported()) {
+        out.format = tex_map.format;
+        out.aspect = tex_map.aspect;
+        out.fallback_to_base = true;
+        return out;
+    }
+    if (view_map.format == tex_map.format) {
+        out.format = view_map.format;
+        out.aspect = view_map.aspect;
+        return out;
+    }
+    if (is_compatible_view_format(tex_map.format, view_map.format)) {
+        out.format = view_map.format;
+        out.aspect = A::All;
+        out.srgb_aliased = true;
+        return out;
+    }
+    // WebGPU rejects cross-type view format reinterpretation (e.g. rgba8unorm texture viewed as
+    // rgba8uint): fall back cleanly to the texture's base format.
+    out.format = tex_map.format;
+    out.aspect = tex_map.aspect;
+    out.fallback_to_base = true;
+    return out;
 }
 
 GpuTextureViewDimension to_view_dimension(uint32_t dim, bool* supported) noexcept {
@@ -129,8 +543,9 @@ GpuCreateSampler2Payload to_sampler_payload(const d3d::SamplerDesc& desc, bool* 
     }
     const float lod_min = std::isfinite(desc.min_lod) ? std::clamp(desc.min_lod, 0.0f, 32.0f) : 0.0f;
     const float lod_max = std::isfinite(desc.max_lod) ? std::clamp(desc.max_lod, lod_min, 32.0f) : 32.0f;
-    p.lod_min_clamp = lod_min;
-    p.lod_max_clamp = std::max(lod_min, lod_max);
+    p.lod_min_clamp = lod_min == 0.0f ? 0.0f : lod_min;
+    const float lod_max_out = std::max(p.lod_min_clamp, lod_max);
+    p.lod_max_clamp = lod_max_out == 0.0f ? 0.0f : lod_max_out;
     if (exact != nullptr) {
         *exact = ok;
     }
@@ -231,6 +646,10 @@ void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo
         }
     }
     if (replaced) {
+        {
+            std::lock_guard vlock(views_mutex_);
+            depth_textures_.erase(resource_id);
+        }
         const std::vector<uint32_t> retired_intermediates =
             retire_intermediates(resource_id);  // a new description: intermediates of the old one are stale
         if (!retired_intermediates.empty()) {
@@ -651,7 +1070,7 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
     std::lock_guard lock(objects_mutex_);
     PipelineLayoutRecord* layout = intern_pipeline_layout_locked(desc);
     if (layout != nullptr) {
-        layouts_by_shaders_[{first_shader, second_shader}] = layout;
+        layouts_by_shaders_[ShaderPairKey{first_shader, second_shader}] = layout;
     }
 }
 
@@ -667,11 +1086,15 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         }
     }
     std::vector<GroupLayoutRecord*> groups;
+    groups.reserve(desc.groups.size() + (desc.rt_arena ? 4u : 0u));
     for (GroupLayoutDesc& g : desc.groups) {
         std::stable_sort(g.bindings.begin(), g.bindings.end(), [](const LayoutBinding& a, const LayoutBinding& b) {
             return a.entry.binding < b.entry.binding;
         });
         auto record = std::make_unique<GroupLayoutRecord>();
+        record->layout_entries.reserve(g.bindings.size());
+        record->entries.reserve(g.bindings.size());
+        record->joins.reserve(g.bindings.size());
         bool modified = false;
         for (LayoutBinding b : g.bindings) {
             b.join.binding = b.entry.binding;
@@ -702,22 +1125,36 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         record->header.content_id = modified ? 0 : g.content_id;
         record->header.entry_count = static_cast<uint32_t>(record->layout_entries.size());
 
+        uint64_t ghash = hash_combine64(splitmix64(record->header.content_id), record->header.flags);
+        ghash = hash_combine64(ghash, record->layout_entries.size());
+        if (!record->layout_entries.empty()) {
+            ghash = hash_combine64(
+                ghash, fnv1a_hash64(record->layout_entries.data(),
+                                    record->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)));
+        }
+        for (const d3d::ShaderBinding& j : record->joins) {
+            ghash = hash_shader_binding(ghash, j);
+        }
+        record->content_hash = ghash;
+
         GroupLayoutRecord* found = nullptr;
-        for (const auto& existing : group_layouts_) {
-            if (!existing->runtime_owned && existing->header.content_id == record->header.content_id &&
-                existing->header.flags == record->header.flags &&
-                existing->entries.size() == record->entries.size() &&
-                existing->layout_entries.size() == record->layout_entries.size() &&
-                // memcmp with null pointers is undefined even for size 0 (both vectors empty).
-                (record->layout_entries.empty() ||
-                 std::memcmp(existing->layout_entries.data(), record->layout_entries.data(),
-                             record->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
-                const bool same_joins = std::equal(
-                    existing->joins.begin(), existing->joins.end(), record->joins.begin(),
-                    [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) { return d3d::same_join(a, b); });
-                if (same_joins) {
-                    found = existing.get();
-                    break;
+        if (const auto bit = group_layouts_by_hash_.find(ghash); bit != group_layouts_by_hash_.end()) {
+            for (GroupLayoutRecord* existing : bit->second) {
+                if (!existing->runtime_owned && existing->header.content_id == record->header.content_id &&
+                    existing->header.flags == record->header.flags &&
+                    existing->entries.size() == record->entries.size() &&
+                    existing->layout_entries.size() == record->layout_entries.size() &&
+                    // memcmp with null pointers is undefined even for size 0 (both vectors empty).
+                    (record->layout_entries.empty() ||
+                     std::memcmp(existing->layout_entries.data(), record->layout_entries.data(),
+                                 record->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)) == 0)) {
+                    const bool same_joins = std::equal(
+                        existing->joins.begin(), existing->joins.end(), record->joins.begin(),
+                        [](const d3d::ShaderBinding& a, const d3d::ShaderBinding& b) { return d3d::same_join(a, b); });
+                    if (same_joins) {
+                        found = existing;
+                        break;
+                    }
                 }
             }
         }
@@ -725,6 +1162,7 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
             record->id = allocate_id();
             record->header.id = record->id;
             found = record.get();
+            group_layouts_by_hash_[ghash].push_back(found);
             group_layouts_.push_back(std::move(record));
         }
         groups.push_back(found);
@@ -740,7 +1178,10 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
                 record->id = allocate_id();
                 record->header.id = record->id;
                 record->runtime_owned = false;
+                record->content_hash = hash_combine64(splitmix64(0), 0);
+                record->content_hash = hash_combine64(record->content_hash, 0);
                 empty_group_layout_ = record.get();
+                group_layouts_by_hash_[record->content_hash].push_back(empty_group_layout_);
                 group_layouts_.push_back(std::move(record));
             }
             groups.push_back(empty_group_layout_);
@@ -768,20 +1209,31 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
         }
         groups.push_back(rt_group_layout_);
     }
+
+    uint64_t pl_hash = hash_combine64(splitmix64(desc.content_id), desc.rt_arena ? 1ull : 0ull);
+    for (const GroupLayoutRecord* grp : groups) {
+        pl_hash = hash_combine64(pl_hash, grp != nullptr ? grp->id : 0u);
+    }
+
     PipelineLayoutRecord* layout = nullptr;
-    for (const auto& existing : pipeline_layouts_) {
-        if (existing->groups == groups && existing->content_id == desc.content_id) {
-            layout = existing.get();
-            break;
+    if (const auto pit = pipeline_layouts_by_hash_.find(pl_hash); pit != pipeline_layouts_by_hash_.end()) {
+        for (PipelineLayoutRecord* existing : pit->second) {
+            if (existing->groups == groups && existing->content_id == desc.content_id &&
+                existing->rt_arena == desc.rt_arena) {
+                layout = existing;
+                break;
+            }
         }
     }
     if (layout == nullptr) {
         auto record = std::make_unique<PipelineLayoutRecord>();
         record->id = allocate_id();
         record->content_id = desc.content_id;
+        record->content_hash = pl_hash;
         record->groups = std::move(groups);
         record->rt_arena = desc.rt_arena;
         layout = record.get();
+        pipeline_layouts_by_hash_[pl_hash].push_back(layout);
         pipeline_layouts_.push_back(std::move(record));
     }
     return layout;
@@ -789,7 +1241,7 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::intern_pipeline_layo
 
 StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::find_layout(uint64_t first_shader, uint64_t second_shader) {
     std::lock_guard lock(objects_mutex_);
-    const auto it = layouts_by_shaders_.find({first_shader, second_shader});
+    const auto it = layouts_by_shaders_.find(ShaderPairKey{first_shader, second_shader});
     return it == layouts_by_shaders_.end() ? nullptr : it->second;
 }
 
@@ -807,8 +1259,16 @@ void StateBridgeDevice::ensure_layout_emitted_impl(PipelineLayoutRecord* layout,
     if (layout->emitted) {
         return;
     }
-    std::vector<uint32_t> group_ids;
-    for (GroupLayoutRecord* group : layout->groups) {
+    std::array<uint32_t, 8> stack_ids{};
+    std::vector<uint32_t> heap_ids;
+    uint32_t* group_ids = stack_ids.data();
+    const size_t n = layout->groups.size();
+    if (n > stack_ids.size()) {
+        heap_ids.resize(n);
+        group_ids = heap_ids.data();
+    }
+    for (size_t i = 0; i < n; ++i) {
+        GroupLayoutRecord* group = layout->groups[i];
         if (!group->emitted) {
             encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &group->header, sizeof(group->header),
                                 group->layout_entries.data(),
@@ -816,16 +1276,31 @@ void StateBridgeDevice::ensure_layout_emitted_impl(PipelineLayoutRecord* layout,
             group->emitted = true;
             group->emitted_by_prewarm = by_prewarm;
         }
-        group_ids.push_back(group->id);
+        group_ids[i] = group->id;
     }
     GpuCreatePipelineLayoutPayload header{};
     header.id = layout->id;
-    header.bind_group_layout_count = static_cast<uint32_t>(group_ids.size());
+    header.bind_group_layout_count = static_cast<uint32_t>(n);
     header.content_id = layout->content_id;
-    encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &header, sizeof(header), group_ids.data(),
-                        static_cast<uint32_t>(group_ids.size() * sizeof(uint32_t)));
+    encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &header, sizeof(header), group_ids,
+                        static_cast<uint32_t>(n * sizeof(uint32_t)));
     layout->emitted = true;
     layout->emitted_by_prewarm = by_prewarm;
+}
+
+StateBridgeDevice::SamplerKey StateBridgeDevice::make_sampler_key(const GpuCreateSampler2Payload& payload) noexcept {
+    SamplerKey key{};
+    key.address_u = payload.address_u;
+    key.address_v = payload.address_v;
+    key.address_w = payload.address_w;
+    key.mag_filter = payload.mag_filter;
+    key.min_filter = payload.min_filter;
+    key.mipmap_filter = payload.mipmap_filter;
+    key.compare = payload.compare;
+    key.max_anisotropy = payload.max_anisotropy;
+    key.lod_min_clamp_bits = canonical_finite_bits(payload.lod_min_clamp);
+    key.lod_max_clamp_bits = canonical_finite_bits(payload.lod_max_clamp);
+    return key;
 }
 
 uint32_t StateBridgeDevice::intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics) {
@@ -834,7 +1309,7 @@ uint32_t StateBridgeDevice::intern_sampler(const d3d::SamplerDesc& desc, Command
     if (!exact && diagnostics != nullptr) {
         *diagnostics |= BridgeDiag::SamplerApproximated;
     }
-    const std::string key = bytes_key(payload);
+    const SamplerKey key = make_sampler_key(payload);
     std::lock_guard lock(objects_mutex_);
     if (const auto it = samplers_.find(key); it != samplers_.end()) {
         return it->second;
@@ -1137,6 +1612,7 @@ PrewarmPipelineResult StateBridgeDevice::prewarm_pipeline(const PrewarmPipelineD
         payload.fs_module_id = fs_module_id;
         payload.pipeline_layout_id = layout_id;
         std::memcpy(&payload.key, &desc.graphics, sizeof(payload.key));
+        sanitize_render_pipeline_key(&payload.key, options_.features);
         enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
     }
     submit(enc);
@@ -1218,7 +1694,7 @@ std::vector<uint32_t> StateBridgeDevice::retire_intermediates(uint32_t resource_
         std::lock_guard lock(objects_mutex_);
         std::vector<uint32_t> gone{resource_id};
         for (auto it = intermediates_.begin(); it != intermediates_.end();) {
-            if (it->first.first == resource_id) {
+            if (it->first.resource_id == resource_id) {
                 gone.push_back(it->second);
                 retired_intermediates.push_back(it->second);
                 to_defer.push_back(it->second);
@@ -1228,8 +1704,8 @@ std::vector<uint32_t> StateBridgeDevice::retire_intermediates(uint32_t resource_
             }
         }
         for (auto it = conversion_groups_.begin(); it != conversion_groups_.end();) {
-            const bool uses = std::find(gone.begin(), gone.end(), it->first[1]) != gone.end() ||
-                              std::find(gone.begin(), gone.end(), it->first[2]) != gone.end();
+            const bool uses = std::find(gone.begin(), gone.end(), it->first.src) != gone.end() ||
+                              std::find(gone.begin(), gone.end(), it->first.dst) != gone.end();
             if (uses) {
                 to_defer.push_back(it->second);
                 it = conversion_groups_.erase(it);
@@ -1248,7 +1724,7 @@ uint32_t StateBridgeDevice::intermediate_storage_texture(uint32_t resource_id, c
                                                          uint8_t format, CommandEncoder& encoder) {
     std::lock_guard lock(objects_mutex_);
     flush_retired_locked(encoder);
-    uint32_t& id = intermediates_[{resource_id, format}];
+    uint32_t& id = intermediates_[IntermediateKey{resource_id, format}];
     if (id == 0) {
         id = allocate_id();
         GpuCreateTexture2Payload p{};
@@ -1309,7 +1785,7 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
                                                      uint8_t dst_format, uint32_t mip, uint32_t base_layer,
                                                      uint32_t layer_count, CommandEncoder& encoder) {
     std::lock_guard lock(objects_mutex_);
-    uint32_t& id = conversion_groups_[{pipeline.group_layout, src, dst, mip, base_layer, layer_count}];
+    uint32_t& id = conversion_groups_[ConversionGroupKey{pipeline.group_layout, src, dst, mip, base_layer, layer_count}];
     if (id == 0) {
         id = allocate_id();
         GpuBindGroupEntry2 e[2] = {};
@@ -1497,8 +1973,8 @@ uint32_t StateBridgeDevice::depth_twin_group(uint32_t layout, uint32_t depth_tex
     std::lock_guard lock(objects_mutex_);
     // Shares the conversion groups' map (so retiring either texture drops it): the layout id tells
     // the two directions apart, the key's mip / layer slots name the subresource.
-    uint32_t& id = conversion_groups_[{layout, into_twin ? depth_texture : twin, into_twin ? twin : depth_texture,
-                                       mip, layer, 1}];
+    uint32_t& id = conversion_groups_[ConversionGroupKey{
+        layout, into_twin ? depth_texture : twin, into_twin ? twin : depth_texture, mip, layer, 1}];
     if (id == 0) {
         id = allocate_id();
         GpuBindGroupEntry2 e[2] = {};
@@ -1718,7 +2194,7 @@ StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::mesh_layout(Pipeline
     if (base == nullptr || base->groups.size() > kMeshOutputGroup) {
         return nullptr;
     }
-    PipelineLayoutRecord*& found = mesh_layouts_[{base, visibility << 8 | binding_type}];
+    PipelineLayoutRecord*& found = mesh_layouts_[MeshLayoutKey{base, visibility << 8 | binding_type}];
     if (found != nullptr) {
         return found;
     }
@@ -1881,7 +2357,7 @@ StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncode
 uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args,
                                                  uint32_t count, CommandEncoder& encoder) {
     std::lock_guard lock(objects_mutex_);
-    uint32_t& id = indirect_groups_[{args, count}];
+    uint32_t& id = indirect_groups_[ResourcePairKey{args, count}];
     if (id == 0) {
         id = allocate_id();
         GpuBindGroupEntry2 e[4] = {};
@@ -1904,7 +2380,7 @@ uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uin
 
 bool StateBridgeDevice::indirect_clamp_group_known(uint32_t args, uint32_t count) {
     std::lock_guard lock(objects_mutex_);
-    const auto it = indirect_groups_.find({args, count});
+    const auto it = indirect_groups_.find(ResourcePairKey{args, count});
     return it != indirect_groups_.end() && it->second != 0;
 }
 
@@ -1919,14 +2395,27 @@ uint32_t StateBridgeDevice::allocate_indirect_window() {
     return offset;
 }
 
+StateBridgeDevice::ViewKey StateBridgeDevice::make_view_key(const ViewRecord& record) noexcept {
+    ViewKey key{};
+    key.texture_id = record.texture_id;
+    key.resource_id = record.resource_id;
+    key.view = record.view;
+    key.view.reserved = 0;
+    key.range = record.range;
+    key.usage = static_cast<uint8_t>(record.usage);
+    return key;
+}
+
+bool StateBridgeDevice::is_depth_resource(uint32_t resource_id) const {
+    if (resource_id == 0) {
+        return false;
+    }
+    std::lock_guard lock(views_mutex_);
+    return depth_textures_.count(resource_id) != 0;
+}
+
 uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
-    std::string key;
-    key.reserve(64);
-    key.append(bytes_key(record.texture_id));
-    key.append(bytes_key(record.resource_id));
-    key.append(bytes_key(record.view));
-    key.append(bytes_key(record.range));
-    key.push_back(static_cast<char>(record.usage));
+    const ViewKey key = make_view_key(record);
     std::lock_guard lock(views_mutex_);
     if (const auto it = view_ids_.find(key); it != view_ids_.end()) {
         return it->second;
@@ -1938,11 +2427,11 @@ uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
         views_[id - 1] = record;
     } else {
         views_.push_back(record);
-        view_keys_.emplace_back();
+        view_live_.push_back(0);
         id = static_cast<uint32_t>(views_.size());
     }
-    view_keys_[id - 1] = key;
-    view_ids_.emplace(std::move(key), id);
+    view_live_[id - 1] = 1;
+    view_ids_.emplace(key, id);
     views_by_texture_[record.texture_id].push_back(id);
     if (record.resource_id != 0 && record.resource_id != record.texture_id) {
         views_by_texture_[record.resource_id].push_back(id);
@@ -1953,6 +2442,7 @@ uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
 
 std::vector<uint32_t> StateBridgeDevice::retire_views(uint32_t texture_id) {
     std::lock_guard lock(views_mutex_);
+    depth_textures_.erase(texture_id);
     std::vector<uint32_t> retired;
     const auto it = views_by_texture_.find(texture_id);
     if (it == views_by_texture_.end()) {
@@ -1962,11 +2452,11 @@ std::vector<uint32_t> StateBridgeDevice::retire_views(uint32_t texture_id) {
     views_by_texture_.erase(it);
     retired.reserve(ids.size());
     for (const uint32_t id : ids) {
-        if (id == 0 || id > view_keys_.size() || view_keys_[id - 1].empty()) {
+        if (id == 0 || id > view_live_.size() || view_live_[id - 1] == 0) {
             continue;  // already retired through its other texture id
         }
-        view_ids_.erase(view_keys_[id - 1]);
-        view_keys_[id - 1].clear();
+        view_ids_.erase(make_view_key(views_[id - 1]));
+        view_live_[id - 1] = 0;
         views_[id - 1] = ViewRecord{};
         free_views_.push_back(id);
         retired.push_back(id);
@@ -1982,7 +2472,7 @@ size_t StateBridgeDevice::live_view_count() const {
 
 const ViewRecord* StateBridgeDevice::view(uint32_t view_id) const {
     std::lock_guard lock(views_mutex_);
-    if (view_id == 0 || view_id > views_.size() || view_keys_[view_id - 1].empty()) {
+    if (view_id == 0 || view_id > views_.size() || view_live_[view_id - 1] == 0) {
         return nullptr;
     }
     return &views_[view_id - 1];
@@ -2032,10 +2522,20 @@ bool StateBridgeDevice::resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewIn
     default:
         break;
     }
+    const pso::WgpuTextureFormat tex_wgpu =
+        pso::map_texture_format(tex.format, pso::FormatUsage::RenderTarget, options_.features).format;
+    pso::WgpuTextureFormat view_wgpu =
+        pso::map_texture_format(format, pso::FormatUsage::RenderTarget, options_.features).format;
+    pso::DxgiFormat resolved_dxgi = format;
+    if (tex_wgpu != pso::WgpuTextureFormat::Undefined && view_wgpu != pso::WgpuTextureFormat::Undefined &&
+        !is_compatible_view_format(tex_wgpu, view_wgpu)) {
+        view_wgpu = tex_wgpu;
+        resolved_dxgi = tex.format;
+    }
     ViewRecord record{};
     record.resource_id = v.resource_id;
     record.texture_id = tex.swapchain ? kGpuSwapchainTextureId : v.resource_id;
-    record.view.format = texture_format_code(format, pso::FormatUsage::RenderTarget, options_.features, nullptr);
+    record.view.format = static_cast<uint8_t>(view_wgpu);
     record.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
     record.view.base_mip_level = static_cast<uint16_t>(mip);
     record.view.mip_level_count = 1;
@@ -2044,7 +2544,7 @@ bool StateBridgeDevice::resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewIn
     record.range = d3d::SubresourceRange{mip, 1, layer, 1, 0, d3d::kAllMips};
     record.usage = d3d::ResourceUsage::RenderTarget;
     out->view_id = intern_view(record);
-    out->format = format;
+    out->format = resolved_dxgi;
     out->width = mip_extent(tex.width, mip);
     out->height = mip_extent(tex.height, mip);
     out->sample_count = tex.sample_count;
@@ -2077,18 +2577,28 @@ bool StateBridgeDevice::resolve_dsv(uint64_t cpu_handle, pso::DepthStencilViewIn
         break;
     }
     const uint32_t flags = v.flags & (d3d::DsvFlags::ReadOnlyDepth | d3d::DsvFlags::ReadOnlyStencil);
+    const pso::WgpuTextureFormat wgpu_fmt =
+        pso::map_texture_format(format, pso::FormatUsage::DepthStencil, options_.features).format;
+    const bool has_depth = pso::has_depth_aspect(wgpu_fmt);
+    const bool has_stencil = pso::has_stencil_aspect(wgpu_fmt);
+    const bool depth_ro = (flags & d3d::DsvFlags::ReadOnlyDepth) != 0;
+    const bool stencil_ro = (flags & d3d::DsvFlags::ReadOnlyStencil) != 0;
+    const bool all_ro = (!has_depth || depth_ro) && (!has_stencil || stencil_ro);
+    {
+        std::lock_guard lock(views_mutex_);
+        depth_textures_.insert(v.resource_id);
+    }
     ViewRecord record{};
     record.resource_id = v.resource_id;
     record.texture_id = tex.swapchain ? kGpuSwapchainTextureId : v.resource_id;
-    record.view.format = texture_format_code(format, pso::FormatUsage::DepthStencil, options_.features, nullptr);
+    record.view.format = static_cast<uint8_t>(wgpu_fmt);
     record.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
     record.view.base_mip_level = static_cast<uint16_t>(mip);
     record.view.mip_level_count = 1;
     record.view.base_array_layer = layer;
     record.view.array_layer_count = 1;
     record.range = d3d::SubresourceRange{mip, 1, layer, 1, 0, d3d::kAllMips};
-    record.usage = (flags & d3d::DsvFlags::ReadOnlyDepth) != 0 ? d3d::ResourceUsage::DepthStencilRead
-                                                               : d3d::ResourceUsage::DepthStencilWrite;
+    record.usage = all_ro ? d3d::ResourceUsage::DepthStencilRead : d3d::ResourceUsage::DepthStencilWrite;
     out->view_id = intern_view(record);
     out->format = format;
     out->width = mip_extent(tex.width, mip);
@@ -2138,7 +2648,14 @@ std::unique_ptr<GraphicsPipelineState> StateBridgeDevice::create_graphics_pipeli
     const d3d::RootSignature* root_signature) {
     pso::PipelineKeyOptions key_options;
     key_options.features = options_.features;
-    std::unique_ptr<GraphicsPipelineState> state(new GraphicsPipelineState(desc, key_options));
+    key_options.max_color_attachment_bytes_per_sample = options_.max_color_attachment_bytes_per_sample;
+    // Sanitize depth-bias float fields (NaN, +/-Inf, -0.0f -> +0.0f) before PSO translation so
+    // non-finite values neither poison WebGPU validation nor fragment the PipelineCache.
+    pso::D3D12GraphicsPsoDesc sanitized = desc;
+    sanitized.RasterizerState.SlopeScaledDepthBias =
+        sanitize_depth_bias_float(desc.RasterizerState.SlopeScaledDepthBias);
+    sanitized.RasterizerState.DepthBiasClamp = sanitize_depth_bias_float(desc.RasterizerState.DepthBiasClamp);
+    std::unique_ptr<GraphicsPipelineState> state(new GraphicsPipelineState(sanitized, key_options));
     state->root_signature_ = root_signature;
     bool vs_known = true;
     bool ps_known = true;
@@ -2599,9 +3116,13 @@ void CommandListBridge::OMSetRenderTargets(uint32_t num_render_target_descriptor
         }
     }
     const uint64_t dsv = depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0;
+    const uint64_t rtv_inc = device_.rtv_descriptor_increment();
     om_attachments_.fill(0);
     for (uint32_t i = 0; i < n; ++i) {
-        om_attachments_[i] = device_.attachment_texture(handles[i], d3d::DescriptorKind::Rtv);
+        const uint64_t h = rts_single_handle_to_descriptor_range
+                               ? (handles[0] != 0 ? handles[0] + i * rtv_inc : 0u)
+                               : handles[i];
+        om_attachments_[i] = device_.attachment_texture(h, d3d::DescriptorKind::Rtv);
     }
     om_attachments_[pso::kMaxColorTargets] = device_.attachment_texture(dsv, d3d::DescriptorKind::Dsv);
     tracker_.OMSetRenderTargets(n, render_target_descriptors != nullptr ? handles.data() : nullptr,
@@ -2644,9 +3165,20 @@ void CommandListBridge::ClearDepthStencilView(d3d::CpuDescriptorHandle dsv,
 }
 
 void CommandListBridge::OMSetBlendFactor(const float blend_factor[4]) {
-    if (writable()) {
-        tracker_.OMSetBlendFactor(blend_factor);
+    if (!writable()) {
+        return;
     }
+    if (blend_factor == nullptr) {
+        tracker_.OMSetBlendFactor(nullptr);
+        return;
+    }
+    const float clean[4] = {
+        canonical_finite_float(blend_factor[0]),
+        canonical_finite_float(blend_factor[1]),
+        canonical_finite_float(blend_factor[2]),
+        canonical_finite_float(blend_factor[3]),
+    };
+    tracker_.OMSetBlendFactor(clean);
 }
 
 void CommandListBridge::OMSetStencilRef(uint32_t stencil_ref) {
@@ -2696,8 +3228,10 @@ void CommandListBridge::IASetIndexBuffer(const d3d12_xs::D3D12IndexBufferView* v
     }
     index_buffer_ = view != nullptr ? *view : d3d12_xs::D3D12IndexBufferView{};
     index_dirty_ = true;
-    if (view != nullptr) {
+    if (view != nullptr && view->buffer_id != 0) {
         tracker_.set_index_format(to_wgpu_index_format(view->format));
+    } else {
+        tracker_.set_index_format(pso::WgpuIndexFormat::Undefined);
     }
 }
 
@@ -2801,6 +3335,7 @@ void CommandListBridge::drain_events() {
                     payload.pipeline_layout_id = graphics_pso_->layout_->id;
                 }
                 std::memcpy(&payload.key, e.pipeline_key, sizeof(payload.key));
+                sanitize_render_pipeline_key(&payload.key, device_.options().features);
                 encoder_.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
                 ++stats_.pipelines_created;
                 diagnostics_ |= graphics_pso_->diagnostics_;
@@ -2823,8 +3358,12 @@ void CommandListBridge::drain_events() {
             break;
         }
         case pso::StateEventType::SetBlendConstant: {
-            const GpuSetBlendConstantPayload p{e.blend_constant[0], e.blend_constant[1], e.blend_constant[2],
-                                               e.blend_constant[3]};
+            const GpuSetBlendConstantPayload p{
+                canonical_finite_float(e.blend_constant[0]),
+                canonical_finite_float(e.blend_constant[1]),
+                canonical_finite_float(e.blend_constant[2]),
+                canonical_finite_float(e.blend_constant[3]),
+            };
             encoder_.emit_packet(GpuOpcode::SetBlendConstant, &p, sizeof(p));
             break;
         }
@@ -2868,16 +3407,20 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
         const pso::DepthStencilAttachmentDesc& d = pass.depth_stencil;
         if (const ViewRecord* v = device_.view(d.view_id); v != nullptr && v->texture_id != 0) {
             GpuRenderPassDepthStencilAttachment& a = p.depth_stencil;
+            const bool has_depth = pso::has_depth_aspect(d.format);
+            const bool has_stencil = pso::has_stencil_aspect(d.format);
             a.texture_id = v->texture_id;
             a.depth_load_op = static_cast<uint8_t>(d.depth_load_op);
             a.depth_store_op = static_cast<uint8_t>(d.depth_store_op);
             a.stencil_load_op = static_cast<uint8_t>(d.stencil_load_op);
             a.stencil_store_op = static_cast<uint8_t>(d.stencil_store_op);
             a.view = v->view;
-            a.depth_clear_value = d.depth_clear_value;
-            a.stencil_clear_value = d.stencil_clear_value;
-            a.depth_read_only = d.depth_read_only ? 1 : 0;
-            a.stencil_read_only = d.stencil_read_only ? 1 : 0;
+            a.depth_clear_value = std::isfinite(d.depth_clear_value)
+                                      ? std::clamp(d.depth_clear_value, 0.0f, 1.0f)
+                                      : 1.0f;
+            a.stencil_clear_value = d.stencil_clear_value & 0xFFu;
+            a.depth_read_only = (has_depth && d.depth_read_only) ? 1 : 0;
+            a.stencil_read_only = (has_stencil && d.stencil_read_only) ? 1 : 0;
             if (!d.depth_read_only) {
                 // A colour twin of the written subresources is behind now.
                 depth_twin_.note_depth_written(v->resource_id, v->view.base_mip_level, v->view.mip_level_count,
@@ -2928,7 +3471,13 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     const bool known = device_.texture_info(v.resource_id, &tex);
     // Views of a SampledOnly texture map the same way, so they name the format it was created with.
     const pso::FormatUsage usage = known && tex.sampled_only ? pso::FormatUsage::SampledOnly : pso::FormatUsage::Sampled;
-    if (v.format != 0) {
+    const bool uav = v.kind == d3d::DescriptorKind::Uav;
+    if (!uav && known) {
+        const ResolvedViewFormat resolved = resolve_sampled_view_format(
+            tex.format, to_dxgi(v.format), tex.sampled_only, features, device_.is_depth_resource(v.resource_id));
+        d.format = static_cast<uint8_t>(resolved.format);
+        aspect = resolved.aspect;
+    } else if (v.format != 0) {
         d.format = texture_format_code(to_dxgi(v.format), usage, features, &aspect);
     } else if (known) {
         texture_format_code(tex.format, usage, features, &aspect);  // aspect of default views
@@ -2941,7 +3490,6 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     if (!supported) {
         diagnostics_ |= BridgeDiag::UnsupportedViewDimension;
     }
-    const bool uav = v.kind == d3d::DescriptorKind::Uav;
     d.base_mip_level = v.first_mip;
     d.mip_level_count = uav ? 1 : (v.mip_levels == 0xffffu ? 0 : v.mip_levels);
     // G66 partly-held mip chains: a sampled view starts at the first held level (and at the view's
@@ -3002,9 +3550,16 @@ uint32_t CommandListBridge::upload_root_constants(d3d::BindPoint bind_point, uin
     if (wrapped) {
         diagnostics_ |= BridgeDiag::RootConstantRingWrapped;
     }
-    std::vector<uint32_t> data(bytes / 4u, 0u);
-    std::copy(values.begin(), values.end(), data.begin());
-    encoder_.write_buffer(buffer_id, offset, data.data(), bytes);
+    const uint32_t words = bytes / 4u;
+    if (words <= 64u) {
+        uint32_t stack_data[64] = {};
+        std::copy(values.begin(), values.end(), stack_data);
+        encoder_.write_buffer(buffer_id, offset, stack_data, bytes);
+    } else {
+        std::vector<uint32_t> data(words, 0u);
+        std::copy(values.begin(), values.end(), data.begin());
+        encoder_.write_buffer(buffer_id, offset, data.data(), bytes);
+    }
     upload.values.assign(values.begin(), values.end());
     upload.offset = offset;
     upload.valid = true;
@@ -3020,7 +3575,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
         diagnostics_ |= BridgeDiag::BindGroupBuildFailed;
         return false;
     }
-    std::vector<GpuBindGroupEntry2> entries;
+    std::vector<GpuBindGroupEntry2>& entries = scratch_gpu_entries_;
     gpu_entries(group, *cached, encoder_, &entries);
     cached->relocations = pending_relocations_;
     cached->relocation_epoch = device_.options().relocation_epoch ? device_.options().relocation_epoch() : 0;
@@ -3192,7 +3747,7 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
         if (changed) {
             m.invalidated = false;
             m.binds_home = binds_relocation_home(m.built);
-            std::vector<GpuBindGroupEntry2> entries;
+            std::vector<GpuBindGroupEntry2>& entries = scratch_gpu_entries_;
             gpu_entries(*m.group, m.built, prelude, &entries);
             m.built.view_ids = pending_view_ids_;
             m.built.null_write_entries = pending_null_writes_;
@@ -3255,16 +3810,7 @@ void CommandListBridge::sync_bound_textures(const StateBridgeDevice::GroupLayout
 
 // Depth and depth-stencil formats: WebGPU cannot bind them as storage textures.
 static bool is_depth_stencil_format(pso::DxgiFormat f) {
-    switch (f) {
-    case pso::DxgiFormat::D32_FLOAT_S8X24_UINT:
-    case pso::DxgiFormat::D32_FLOAT:
-    case pso::DxgiFormat::D24_UNORM_S8_UINT:
-    case pso::DxgiFormat::D16_UNORM:
-    case pso::DxgiFormat::D16_UNORM_S8_UINT:
-        return true;
-    default:
-        return false;
-    }
+    return is_depth_stencil_dxgi_format(f);
 }
 
 void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group,
@@ -3826,7 +4372,9 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             continue;  // G66 mesh output group: bound by the caller
         }
         uint32_t bind_group_id = 0;
-        std::vector<uint32_t> offsets;
+        std::array<uint32_t, 8> stack_offsets{};
+        uint32_t offset_count = 0;
+        std::vector<uint32_t> heap_offsets;
         d3d::CachedBindGroup* cached = nullptr;
         if (group.entries.empty()) {
             auto it = empty_bind_groups_.find(group.id);
@@ -3928,20 +4476,33 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                     continue;
                 }
                 const d3d::BindGroupEntry& e = cached->entries[i];
-                offsets.push_back(e.kind == d3d::BindResourceKind::RootConstants
-                                      ? upload_root_constants(bind_point, e.root_parameter_index)
-                                      : 0u);
+                const uint32_t dyn_off = e.kind == d3d::BindResourceKind::RootConstants
+                                             ? upload_root_constants(bind_point, e.root_parameter_index)
+                                             : 0u;
+                if (heap_offsets.empty() && offset_count < stack_offsets.size()) {
+                    stack_offsets[offset_count++] = dyn_off;
+                } else {
+                    if (heap_offsets.empty()) {
+                        heap_offsets.assign(stack_offsets.begin(), stack_offsets.begin() + offset_count);
+                    }
+                    heap_offsets.push_back(dyn_off);
+                    ++offset_count;
+                }
             }
         }
         BoundGroup& b = (*bound)[g];
         b.null_write_entries = cached != nullptr ? cached->null_write_entries : 0u;
-        if (b.bind_group_id != bind_group_id || b.dynamic_offsets != offsets) {
-            const GpuSetBindGroup2Payload header{static_cast<uint32_t>(g), bind_group_id,
-                                                 static_cast<uint32_t>(offsets.size()), 0u};
-            encoder_.emit_packet(GpuOpcode::SetBindGroup2, &header, sizeof(header), offsets.data(),
-                                 static_cast<uint32_t>(offsets.size() * sizeof(uint32_t)));
+        const uint32_t* offsets_ptr = heap_offsets.empty() ? stack_offsets.data() : heap_offsets.data();
+        const bool same_offsets = b.dynamic_offsets.size() == offset_count &&
+                                  (offset_count == 0 ||
+                                   std::memcmp(b.dynamic_offsets.data(), offsets_ptr,
+                                               offset_count * sizeof(uint32_t)) == 0);
+        if (b.bind_group_id != bind_group_id || !same_offsets) {
+            const GpuSetBindGroup2Payload header{static_cast<uint32_t>(g), bind_group_id, offset_count, 0u};
+            encoder_.emit_packet(GpuOpcode::SetBindGroup2, &header, sizeof(header), offsets_ptr,
+                                 static_cast<uint32_t>(offset_count * sizeof(uint32_t)));
             b.bind_group_id = bind_group_id;
-            b.dynamic_offsets = std::move(offsets);
+            b.dynamic_offsets.assign(offsets_ptr, offsets_ptr + offset_count);
         }
         if (track_usage && cached != nullptr && scoped_bind_groups_.insert(bind_group_id).second) {
             for (size_t i = 0; i < cached->entries.size(); ++i) {
@@ -3972,6 +4533,9 @@ bool CommandListBridge::prepare_render_draw() {
             return false;
         }
         if (!ok) {
+            break;
+        }
+        if (redirects_.empty()) {
             break;
         }
         std::vector<StorageRedirect> active;
