@@ -39,9 +39,10 @@ pub const LLVM_BIN_DIR_ENV: &str = "PLAYGTA6_LLVM_BIN_DIR";
 /// Environment variable overriding the expected LLVM major version.
 pub const LLVM_MAJOR_ENV: &str = "PLAYGTA6_LLVM_MAJOR";
 
-/// LLVM major version the CI runners (`ubuntu-latest` = Ubuntu 24.04, `llvm-18`) provide.
+/// LLVM major the CI runner actually uses: `ubuntu-latest` has no `llc` on PATH, so discovery picks
+/// `/usr/bin/clang` (Ubuntu clang 21.1.8, verified from the CI log of the "Report LLVM tools" step).
 /// `.github/workflows/ci.yml` does not install LLVM itself, so this tracks the runner image.
-pub const EXPECTED_LLVM_MAJOR: u32 = 18;
+pub const EXPECTED_LLVM_MAJOR: u32 = 21;
 
 /// An LLVM tool able to turn `.ll` into a wasm64 object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -389,9 +390,9 @@ mod tests {
     #[test]
     fn mismatch_warning_only_on_difference() {
         let p = Path::new("llc");
-        assert!(version_mismatch_warning(p, 18, 18).is_none());
-        let w = version_mismatch_warning(p, 23, 18).unwrap();
-        assert!(w.contains("LLVM 23") && w.contains("LLVM 18") && w.contains(LLVM_BIN_DIR_ENV));
+        assert!(version_mismatch_warning(p, 21, 21).is_none());
+        let w = version_mismatch_warning(p, 23, 21).unwrap();
+        assert!(w.contains("LLVM 23") && w.contains("LLVM 21") && w.contains(LLVM_BIN_DIR_ENV));
     }
 
     #[test]

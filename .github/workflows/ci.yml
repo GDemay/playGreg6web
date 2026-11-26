@@ -40,6 +40,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Report LLVM tools (which llc/opt the recompiler will use)
+        run: |
+          which -a llc opt clang || true
+          clang --version || true
+          readlink -f /usr/bin/clang || true
+          ls /usr/lib | grep -i llvm || true
       - run: cargo test --workspace
 
   runtime-cpp:
