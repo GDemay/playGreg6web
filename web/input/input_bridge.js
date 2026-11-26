@@ -149,6 +149,22 @@ export function applyDeadzone(x, y, innerDeadzone = 0.15, outerDeadzone = 0.98, 
   const outer = clamp(outerDeadzone, inner + 1e-4, 1);
 
   const mag = Math.hypot(x, y);
+  if (!Number.isFinite(mag)) {
+    const maxAbs = Math.max(Math.abs(x), Math.abs(y));
+    if (maxAbs <= 0) {
+      target.x = 0;
+      target.y = 0;
+      return target;
+    }
+    const sx = x / maxAbs;
+    const sy = y / maxAbs;
+    const smag = Math.hypot(sx, sy);
+    const rx = clamp(sx / smag, -1, 1);
+    const ry = clamp(sy / smag, -1, 1);
+    target.x = rx === 0 ? 0 : rx;
+    target.y = ry === 0 ? 0 : ry;
+    return target;
+  }
   if (mag <= inner || mag <= 0) {
     target.x = 0;
     target.y = 0;
@@ -158,8 +174,10 @@ export function applyDeadzone(x, y, innerDeadzone = 0.15, outerDeadzone = 0.98, 
   const clampedMag = Math.min(mag, outer);
   const normalizedMag = clamp((clampedMag - inner) / (outer - inner), 0, 1);
   const scale = normalizedMag / mag;
-  target.x = clamp(x * scale, -1, 1);
-  target.y = clamp(y * scale, -1, 1);
+  const rx = clamp(x * scale, -1, 1);
+  const ry = clamp(y * scale, -1, 1);
+  target.x = rx === 0 ? 0 : rx;
+  target.y = ry === 0 ? 0 : ry;
   return target;
 }
 
@@ -206,6 +224,24 @@ function readGamepadTrigger(button) {
 
 export const MIN_SCRIPT_HOLD_MS = 180;
 export const CHROME_MENU_FLOW_4_HOLD_MS = 200;
+export const DEFAULT_MIN_PRESS_HOLD_MS = 85;
+export const LIVE_TAP_LATCH_BUTTON_MASK =
+  (~(
+    INPUT_BUTTONS.MOVE_FORWARD |
+    INPUT_BUTTONS.MOVE_BACKWARD |
+    INPUT_BUTTONS.MOVE_LEFT |
+    INPUT_BUTTONS.MOVE_RIGHT
+  )) >>> 0;
+export const DEFAULT_RIGHT_STICK_KEYS = Object.freeze({
+  up: 'PageUp',
+  down: 'PageDown',
+  left: 'Numpad4',
+  right: 'Numpad6',
+  altUp: 'Numpad8',
+  altDown: 'Numpad2',
+});
+export const DEFAULT_MOUSE_LOOK_PIXELS_FOR_FULL = 40;
+export const DEFAULT_MOUSE_LOOK_DECAY = 0.55;
 export const IDLE_GAMEPAD_POLL_INTERVAL_MS = 500;
 export const DEFAULT_VISIBLE_FRAME_FALLBACK_MS = 2000;
 export const FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS = 500;
@@ -391,16 +427,18 @@ function buildChromeMenuFlow5Events() {
 
 function buildChromeToIngameEvents() {
   const events = [];
-  // Phase 1 (5s..145s): Spaced A every 3000 ms (holdMs: 220, 47 presses: 5000..143000 ms)
-  // to advance Start Screen -> 4K Bink2 -> R* -> UI TEXT SIZE -> BRIGHTNESS -> FINISH SETUP?
-  // -> LEGAL NOTICES.
-  for (let atMs = 5000; atMs <= 145000; atMs += 3000) {
+  // Phase 1 (5s..74s): Spaced A every 3000 ms (holdMs: 220, 24 presses: 5000..74000 ms)
+  // to advance Start Screen (~45-55 s warm or immediate when anchored) -> 4K Bink2 -> R* ->
+  // Language / UI Text Size / Subtitles / Brightness / Navigation Experience / Finish Setup.
+  // Stops before ~80 s so plain A never opens Row 0 ("Copyright") on LEGAL NOTICES during warm boots.
+  for (let atMs = 5000; atMs <= 74000; atMs += 3000) {
     events.push(Object.freeze({ atMs, holdMs: 220, button: INPUT_BUTTONS.A }));
   }
-  // Phase 2 (150s..206s): 4 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A)
-  // to click "Next >" into ROCKSTAR GAMES LEGAL TERMS & POLICIES (harmless if already there).
-  for (let round = 0; round < 4; round++) {
-    expandOffsetCycle(events, 150000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  // Phase 2 (80s..206s): 9 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A)
+  // covering BOTH warm boots (~80-110 s) and cold boots (~150-198 s) cleanly to click "Next >"
+  // into ROCKSTAR GAMES LEGAL TERMS & POLICIES (never opens Copyright, also advances earlier screens).
+  for (let round = 0; round < 9; round++) {
+    expandOffsetCycle(events, 80000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
   }
   // Phase 3 (210s..274s): 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS to check BOTH
   // Privacy Policy & Terms of Service checkboxes and click "Confirm >" ("Confirm setup and
@@ -530,14 +568,15 @@ function buildChromeMenuFlow2Events() {
 //   4c: 2 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 320000 ms to check Privacy Policy
 //   + Terms of Service and click "Confirm >", followed by A at 358000 ms), then Phase 5 looping
 //   CHROME_LEGAL_TERMS_ACCEPT_OFFSETS every 16000 ms from 368000 ms (never presses B).
-// - 'chrome-to-ingame': Clean, fast FIRST_VISIBLE_FRAME-anchored Chrome Wasm64 preset driving
-//   Start Screen -> 4K Bink2 -> UI TEXT SIZE / BRIGHTNESS / FINISH SETUP? (Phase 1: spaced A every
-//   3000 ms from 5000 ms through 145000 ms) -> LEGAL NOTICES "Next >" (Phase 2: 4 rounds of 14 s
-//   _menu_cycle from 150000 ms through 206000 ms) -> ROCKSTAR GAMES LEGAL TERMS & POLICIES
-//   2-checkbox + "Confirm >" accept (Phase 3: 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS
-//   from 210000 ms through 274000 ms) -> Main Menu / Story Mode selection & gentle in-game
-//   movement/camera probes (Phase 4: spaced A every 4000 ms through 340000 ms, then A + left-stick
-//   forward / right-stick look sweeps through 420000 ms; bounded, never presses B).
+// - 'chrome-to-ingame': Clean, warm+cold resilient FIRST_VISIBLE_FRAME-anchored Chrome Wasm64 preset
+//   driving Start Screen -> 4K Bink2 -> Language / UI Text Size / Subtitles / Brightness / Navigation
+//   Experience / Finish Setup (Phase 1: spaced A every 3000 ms from 5000 ms through 74000 ms, stopping
+//   before warm LEGAL NOTICES so plain A never opens Row 0 Copyright) -> LEGAL NOTICES "Next >"
+//   (Phase 2: 9 rounds of 14 s _menu_cycle from 80000 ms through 206000 ms covering both warm and cold
+//   boots) -> ROCKSTAR GAMES LEGAL TERMS & POLICIES 2-checkbox + "Confirm >" accept (Phase 3: 4 rounds
+//   of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 210000 ms through 274000 ms) -> Main Menu / Story
+//   Mode selection & gentle in-game movement/camera probes (Phase 4: spaced A every 4000 ms through
+//   340000 ms, then A + left-stick forward / right-stick look sweeps through 420000 ms; bounded, never B).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -2114,6 +2153,58 @@ export class InputBridge {
     this._hasNonZeroGpState = false;
     this._hasCustomNowFn = typeof opts.nowFn === 'function';
     this._nowFn = this._hasCustomNowFn ? opts.nowFn : defaultNowMs;
+    this._setTimeoutFn =
+      opts.setTimeoutFn !== undefined
+        ? opts.setTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.setTimeout === 'function'
+          ? globalThis.setTimeout.bind(globalThis)
+          : null;
+    this._clearTimeoutFn =
+      opts.clearTimeoutFn !== undefined
+        ? opts.clearTimeoutFn
+        : typeof globalThis !== 'undefined' && typeof globalThis.clearTimeout === 'function'
+          ? globalThis.clearTimeout.bind(globalThis)
+          : null;
+    const isRealBrowserWindow =
+      typeof window !== 'undefined' && this._window === window && opts.setTimeoutFn === undefined;
+    this._minPressHoldMs =
+      opts.minPressHoldMs !== undefined && opts.minPressHoldMs !== null
+        ? validateNonNegativeFinite(opts.minPressHoldMs, 'minPressHoldMs')
+        : isRealBrowserWindow
+          ? DEFAULT_MIN_PRESS_HOLD_MS
+          : 0;
+    this._latchMovementKeys = Boolean(opts.latchMovementKeys);
+    this._prevLiveButtons = 0;
+    this._latchedButtons = 0;
+    this._pressedAtByBit = new Float64Array(32);
+    this._latchExpireAtByBit = new Float64Array(32);
+    this._latchTimerId = null;
+    this._tapLatchesTriggered = 0;
+
+    this._rightStickKeys =
+      opts.rightStickKeys === false
+        ? null
+        : opts.rightStickKeys && typeof opts.rightStickKeys === 'object'
+          ? { ...DEFAULT_RIGHT_STICK_KEYS, ...opts.rightStickKeys }
+          : DEFAULT_RIGHT_STICK_KEYS;
+    this._mouseLookToRightStick = Boolean(opts.mouseLookToRightStick);
+    this._wheelToRightStickY = Boolean(opts.wheelToRightStickY);
+    this._mouseLookPixelsForFull =
+      typeof opts.mouseLookPixelsForFullDeflection === 'number' &&
+      Number.isFinite(opts.mouseLookPixelsForFullDeflection) &&
+      opts.mouseLookPixelsForFullDeflection > 0
+        ? opts.mouseLookPixelsForFullDeflection
+        : DEFAULT_MOUSE_LOOK_PIXELS_FOR_FULL;
+    this._mouseLookDecay =
+      typeof opts.mouseLookDecay === 'number' &&
+      Number.isFinite(opts.mouseLookDecay) &&
+      opts.mouseLookDecay >= 0 &&
+      opts.mouseLookDecay < 1
+        ? opts.mouseLookDecay
+        : DEFAULT_MOUSE_LOOK_DECAY;
+    this._mouseLookRx = 0;
+    this._mouseLookRy = 0;
+
     this._idleGamepadPollIntervalMs =
       typeof opts.idleGamepadPollIntervalMs === 'number' &&
       Number.isFinite(opts.idleGamepadPollIntervalMs) &&
@@ -2125,9 +2216,12 @@ export class InputBridge {
 
     // Input source state
     this._pressedKeys = new Set();
+    this._pressedRightStickKeys = new Set();
     this._keyButtons = 0;
     this._keyLx = 0;
     this._keyLy = 0;
+    this._keyRx = 0;
+    this._keyRy = 0;
 
     this._mouseButtonsMask = 0; // bitmask of raw DOM mouse buttons currently held
     this._mouseButtonBits = 0;  // mapped INPUT_BUTTONS bits from mouse
@@ -2234,37 +2328,51 @@ export class InputBridge {
 
     this._boundTick = (rafTimestampMs) => {
       if (!this.running || this.disposed) return;
-      if (!this._hasConnectedGamepad) {
-        const lastIdle = this._lastIdleGamepadPollMs;
-        const intervalMs = this._idleGamepadPollIntervalMs;
-        const nowMs =
-          !this._hasCustomNowFn &&
-          typeof rafTimestampMs === 'number' &&
-          Number.isFinite(rafTimestampMs)
-            ? rafTimestampMs
-            : this._nowFn();
-        if (lastIdle !== null && intervalMs > 0) {
-          const elapsed = nowMs - lastIdle;
-          if (elapsed >= 0 && elapsed < intervalMs) {
-            this._idleGamepadPollsSkipped += 1;
-            const win = this._window;
-            if (win && typeof win.requestAnimationFrame === 'function') {
-              this._rafId = win.requestAnimationFrame(this._boundTick);
-            }
-            return;
-          }
+      const docHidden =
+        Boolean(this._document?.hidden) || this._document?.visibilityState === 'hidden';
+      let docFocused = true;
+      if (this._document && typeof this._document.hasFocus === 'function') {
+        try {
+          docFocused = Boolean(this._document.hasFocus());
+        } catch {
+          docFocused = true;
         }
-        this.pollGamepads();
-        this._lastIdleGamepadPollMs = this._hasConnectedGamepad ? null : nowMs;
-      } else {
-        this.pollGamepads();
+      }
+      if (!docHidden && docFocused) {
         if (!this._hasConnectedGamepad) {
-          this._lastIdleGamepadPollMs =
+          const lastIdle = this._lastIdleGamepadPollMs;
+          const intervalMs = this._idleGamepadPollIntervalMs;
+          const nowMs =
             !this._hasCustomNowFn &&
             typeof rafTimestampMs === 'number' &&
             Number.isFinite(rafTimestampMs)
               ? rafTimestampMs
               : this._nowFn();
+          if (lastIdle !== null && intervalMs > 0) {
+            const elapsed = nowMs - lastIdle;
+            if (elapsed >= 0 && elapsed < intervalMs) {
+              this._idleGamepadPollsSkipped += 1;
+            } else {
+              this.pollGamepads();
+              this._lastIdleGamepadPollMs = this._hasConnectedGamepad ? null : nowMs;
+            }
+          } else {
+            this.pollGamepads();
+            this._lastIdleGamepadPollMs = this._hasConnectedGamepad ? null : nowMs;
+          }
+        } else {
+          this.pollGamepads();
+          if (!this._hasConnectedGamepad) {
+            this._lastIdleGamepadPollMs =
+              !this._hasCustomNowFn &&
+              typeof rafTimestampMs === 'number' &&
+              Number.isFinite(rafTimestampMs)
+                ? rafTimestampMs
+                : this._nowFn();
+          }
+        }
+        if (this._mouseLookRx !== 0 || this._mouseLookRy !== 0) {
+          this._decayMouseLookStick();
         }
       }
       const win = this._window;
@@ -2395,14 +2503,28 @@ export class InputBridge {
       );
       const changed = nowLocked !== this.pointerLocked;
       this.pointerLocked = nowLocked;
+      this._mouseRemX = 0;
+      this._mouseRemY = 0;
       if (!nowLocked) {
-        this._mouseRemX = 0;
-        this._mouseRemY = 0;
-        if (this._mouseButtonsMask !== 0 || this._pressedKeys.size > 0) {
+        const hadMouseDelta =
+          this._atomicLoadI32(INPUT_WORD_INDICES.MOUSE_DX) !== 0 ||
+          this._atomicLoadI32(INPUT_WORD_INDICES.MOUSE_DY) !== 0;
+        const hadLookStick = this._mouseLookRx !== 0 || this._mouseLookRy !== 0;
+        const hadLatched = this._latchedButtons !== 0;
+        const hadInputs =
+          this._mouseButtonsMask !== 0 ||
+          this._pressedKeys.size > 0 ||
+          this._pressedRightStickKeys.size > 0;
+        this._wheelDelta = 0;
+        this._clearMouseLookStick();
+        this._clearLatchedButtons();
+        if (hadInputs || hadMouseDelta || hadLookStick || hadLatched) {
           this._clearMouseButtons();
           this._pressedKeys.clear();
+          this._pressedRightStickKeys.clear();
           this._recomputeKeyboardState();
-          this._commitMergedState(true);
+          this._recomputeRightStickKeyboardState();
+          this._commitMergedState(true, true);
         }
       }
       if (changed && this._onPointerLockChangeCallback) {
@@ -2447,6 +2569,21 @@ export class InputBridge {
       this._atomicAddU32(INPUT_WORD_INDICES.SEQ, 1);
       this._notifySeq();
       this._writesCount += 1;
+
+      if (this._mouseLookToRightStick) {
+        // applyMouseDelta already applied sensitivity & invertLookY to dy; DOM Y-down -> Xbox Y-up.
+        const invScale = 1 / this._mouseLookPixelsForFull;
+        let rx = clamp(dx * invScale, -1, 1);
+        let ry = clamp(-dy * invScale, -1, 1);
+        const mag = Math.hypot(rx, ry);
+        if (mag > 1 && Number.isFinite(mag)) {
+          rx /= mag;
+          ry /= mag;
+        }
+        this._mouseLookRx = rx === 0 ? 0 : rx;
+        this._mouseLookRy = ry === 0 ? 0 : ry;
+        this._commitMergedState(false);
+      }
     });
 
     this._addListener(this._window, 'mousedown', (e) => {
@@ -2458,6 +2595,7 @@ export class InputBridge {
       if ((this._mouseButtonsMask & bit) !== 0) return;
       this._mouseButtonsMask |= bit;
       this._recomputeMouseButtons();
+      this._syncLiveButtonLatches();
       this._recordLiveUserInput('mouse', false);
       this._commitMergedState(false);
     });
@@ -2470,6 +2608,7 @@ export class InputBridge {
       if ((this._mouseButtonsMask & bit) === 0) return;
       this._mouseButtonsMask &= ~bit;
       this._recomputeMouseButtons();
+      this._syncLiveButtonLatches();
       this._commitMergedState(false);
     });
 
@@ -2482,6 +2621,10 @@ export class InputBridge {
       if (deltaY !== 0) {
         this._wheelDelta += deltaY;
         this._recordLiveUserInput('mouse', true);
+        if (this._wheelToRightStickY) {
+          this._mouseLookRy = deltaY > 0 ? -0.95 : 0.95;
+          this._commitMergedState(false);
+        }
       }
     });
 
@@ -2489,7 +2632,19 @@ export class InputBridge {
       if (this.disposed || !e || !e.code) return;
       const code = e.code;
       const binding = this._keyBindings[code] || 0;
-      if (!binding) return;
+      if (!binding) {
+        if (!this._isRightStickKey(code)) return;
+        if (this._shouldIgnoreKeydown(e, code)) return;
+        if (this.isPointerLocked() && typeof e.preventDefault === 'function') {
+          e.preventDefault();
+        }
+        if (this._pressedRightStickKeys.has(code)) return;
+        this._pressedRightStickKeys.add(code);
+        this._recomputeRightStickKeyboardState();
+        this._recordLiveUserInput('keyboard', false);
+        this._commitMergedState(false);
+        return;
+      }
       if (this._shouldIgnoreKeydown(e, code)) return;
 
       if (
@@ -2505,14 +2660,23 @@ export class InputBridge {
 
       this._pressedKeys.add(code);
       this._recomputeKeyboardState();
+      this._syncLiveButtonLatches();
       this._recordLiveUserInput('keyboard', false);
       this._commitMergedState(false);
     });
 
     this._addListener(this._window, 'keyup', (e) => {
       if (this.disposed || !e || !e.code) return;
-      if (!this._pressedKeys.delete(e.code)) return;
-      this._recomputeKeyboardState();
+      const removedKey = this._pressedKeys.delete(e.code);
+      const removedRsKey = this._pressedRightStickKeys.delete(e.code);
+      if (!removedKey && !removedRsKey) return;
+      if (removedKey) {
+        this._recomputeKeyboardState();
+        this._syncLiveButtonLatches();
+      }
+      if (removedRsKey) {
+        this._recomputeRightStickKeyboardState();
+      }
       this._commitMergedState(false);
     });
 
@@ -2545,7 +2709,11 @@ export class InputBridge {
         (this._gamepadIndex === null ||
           (eventPadIndex !== null && this._gamepadIndex === eventPadIndex));
 
-      if (eventPadAllowed && eventPadIndex !== null) {
+      if (
+        eventPadAllowed &&
+        eventPadIndex !== null &&
+        (this._activeGamepadIndex === null || this._gamepadIndex === eventPadIndex)
+      ) {
         this._activeGamepadIndex = eventPadIndex;
       }
 
@@ -2572,12 +2740,21 @@ export class InputBridge {
       const disconnectedIndex =
         typeof e?.gamepad?.index === 'number' ? e.gamepad.index : null;
       if (
+        disconnectedIndex !== null &&
+        this._activeGamepadIndex !== null &&
+        disconnectedIndex !== this._activeGamepadIndex
+      ) {
+        // An inactive secondary pad disconnected: keep active pad state untouched without a spurious write.
+        return;
+      }
+      if (
         disconnectedIndex === null ||
         this._activeGamepadIndex === disconnectedIndex
       ) {
         this._activeGamepadIndex = null;
       }
       this._clearGamepadState();
+      this._syncLiveButtonLatches();
 
       const remaining = this._selectGamepadEntry(disconnectedIndex);
       if (remaining) {
@@ -2769,15 +2946,187 @@ export class InputBridge {
     this._hasNonZeroGpState = false;
   }
 
+  setMinPressHoldMs(ms) {
+    const next = validateNonNegativeFinite(ms, 'minPressHoldMs');
+    this._minPressHoldMs = next;
+    if (next === 0 && this._latchedButtons !== 0) {
+      this._clearLatchedButtons();
+      if (!this.disposed) {
+        this._commitMergedState(false);
+      }
+    }
+    return this._minPressHoldMs;
+  }
+
+  _clearLatchTimer() {
+    if (this._latchTimerId !== null && typeof this._clearTimeoutFn === 'function') {
+      this._clearTimeoutFn(this._latchTimerId);
+    }
+    this._latchTimerId = null;
+  }
+
+  _clearLatchedButtons() {
+    this._clearLatchTimer();
+    this._latchedButtons = 0;
+    this._prevLiveButtons = 0;
+    this._pressedAtByBit.fill(0);
+    this._latchExpireAtByBit.fill(0);
+  }
+
+  _scheduleLatchFlush(nowMs) {
+    this._clearLatchTimer();
+    if (this._latchedButtons === 0 || typeof this._setTimeoutFn !== 'function') return;
+    let earliest = Infinity;
+    for (let bit = 0; bit < 32; bit++) {
+      const exp = this._latchExpireAtByBit[bit];
+      if (exp > 0 && exp < earliest) {
+        earliest = exp;
+      }
+    }
+    if (!Number.isFinite(earliest)) return;
+    const delay = Math.max(0, Math.ceil(earliest - nowMs));
+    this._latchTimerId = this._setTimeoutFn(() => {
+      this._latchTimerId = null;
+      this._flushExpiredLatches();
+    }, delay);
+  }
+
+  _flushExpiredLatches() {
+    if (this.disposed || this._latchedButtons === 0) return;
+    const now = this._nowFn();
+    let remaining = 0;
+    for (let bit = 0; bit < 32; bit++) {
+      const exp = this._latchExpireAtByBit[bit];
+      if (exp > 0) {
+        if (now >= exp) {
+          this._latchExpireAtByBit[bit] = 0;
+        } else {
+          remaining = (remaining | (1 << bit)) >>> 0;
+        }
+      }
+    }
+    this._latchedButtons = remaining;
+    this._scheduleLatchFlush(now);
+    this._commitMergedState(false);
+  }
+
+  _syncLiveButtonLatches() {
+    const rawLive = (this._keyButtons | this._mouseButtonBits | this._gpButtons) >>> 0;
+    if (this._minPressHoldMs <= 0) {
+      this._prevLiveButtons = rawLive;
+      if (this._latchedButtons !== 0) {
+        this._clearLatchedButtons();
+      }
+      return;
+    }
+    const latchMask = this._latchMovementKeys ? 0xffffffff : LIVE_TAP_LATCH_BUTTON_MASK;
+    const prevMasked = (this._prevLiveButtons & latchMask) >>> 0;
+    const nextMasked = (rawLive & latchMask) >>> 0;
+    const now = this._nowFn();
+    let latched = 0;
+
+    for (let bit = 0; bit < 32; bit++) {
+      const bitMask = (1 << bit) >>> 0;
+      if ((latchMask & bitMask) === 0) continue;
+      const isDown = (nextMasked & bitMask) !== 0;
+      const wasDown = (prevMasked & bitMask) !== 0;
+      if (isDown) {
+        if (!wasDown) {
+          this._pressedAtByBit[bit] = now;
+        }
+        this._latchExpireAtByBit[bit] = 0;
+      } else {
+        if (wasDown) {
+          const heldMs = now - this._pressedAtByBit[bit];
+          if (heldMs >= 0 && heldMs < this._minPressHoldMs) {
+            this._latchExpireAtByBit[bit] = this._pressedAtByBit[bit] + this._minPressHoldMs;
+            this._tapLatchesTriggered += 1;
+          }
+        }
+        const exp = this._latchExpireAtByBit[bit];
+        if (exp > 0) {
+          if (now < exp) {
+            latched = (latched | bitMask) >>> 0;
+          } else {
+            this._latchExpireAtByBit[bit] = 0;
+          }
+        }
+      }
+    }
+
+    this._prevLiveButtons = rawLive;
+    this._latchedButtons = latched;
+    this._scheduleLatchFlush(now);
+  }
+
+  _isRightStickKey(code) {
+    const map = this._rightStickKeys;
+    if (!map) return false;
+    return (
+      code === map.up ||
+      code === map.down ||
+      code === map.left ||
+      code === map.right ||
+      code === map.altUp ||
+      code === map.altDown
+    );
+  }
+
+  _recomputeRightStickKeyboardState() {
+    const map = this._rightStickKeys;
+    if (!map || this._pressedRightStickKeys.size === 0) {
+      this._keyRx = 0;
+      this._keyRy = 0;
+      return;
+    }
+    const right = this._pressedRightStickKeys.has(map.right) ? 1 : 0;
+    const left = this._pressedRightStickKeys.has(map.left) ? 1 : 0;
+    const up =
+      this._pressedRightStickKeys.has(map.up) || this._pressedRightStickKeys.has(map.altUp) ? 1 : 0;
+    const down =
+      this._pressedRightStickKeys.has(map.down) || this._pressedRightStickKeys.has(map.altDown)
+        ? 1
+        : 0;
+    let rx = right - left;
+    let ry = up - down;
+    if (rx !== 0 && ry !== 0) {
+      rx *= Math.SQRT1_2;
+      ry *= Math.SQRT1_2;
+    }
+    this._keyRx = rx;
+    this._keyRy = ry;
+  }
+
+  _clearMouseLookStick() {
+    this._mouseLookRx = 0;
+    this._mouseLookRy = 0;
+  }
+
+  _decayMouseLookStick() {
+    let rx = this._mouseLookRx * this._mouseLookDecay;
+    let ry = this._mouseLookRy * this._mouseLookDecay;
+    if (Math.abs(rx) < 0.01) rx = 0;
+    if (Math.abs(ry) < 0.01) ry = 0;
+    if (rx === this._mouseLookRx && ry === this._mouseLookRy) return;
+    this._mouseLookRx = rx;
+    this._mouseLookRy = ry;
+    this._commitMergedState(false);
+  }
+
   _clearTransientInputs() {
     if (this.disposed) return;
     this._blurResets += 1;
     this._stuckResetCount += 1;
 
     this._pressedKeys.clear();
+    this._pressedRightStickKeys.clear();
     this._recomputeKeyboardState();
+    this._recomputeRightStickKeyboardState();
     this._clearMouseButtons();
+    this._clearMouseLookStick();
+    this._wheelDelta = 0;
     this._clearGamepadState();
+    this._clearLatchedButtons();
     this._commitMergedState(true, true);
   }
 
@@ -2911,8 +3260,12 @@ export class InputBridge {
       }
     }
     if (swapTB) {
-      if (isGamepadButtonPressed(buttons[6])) gpMask |= INPUT_BUTTONS.LB;
-      if (isGamepadButtonPressed(buttons[7])) gpMask |= INPUT_BUTTONS.RB;
+      if (applyTriggerDeadzone(readGamepadTrigger(buttons[6]), this._triggerDeadzone, this._triggerOuterDeadzone) >= 0.5) {
+        gpMask |= INPUT_BUTTONS.LB;
+      }
+      if (applyTriggerDeadzone(readGamepadTrigger(buttons[7]), this._triggerDeadzone, this._triggerOuterDeadzone) >= 0.5) {
+        gpMask |= INPUT_BUTTONS.RB;
+      }
     }
     const nextGpButtons = gpMask >>> 0;
 
@@ -2984,6 +3337,7 @@ export class InputBridge {
     this._gpRx = nextGpRx;
     this._gpRy = nextGpRy;
     this._hasNonZeroGpState = hasNonZero;
+    this._syncLiveButtonLatches();
 
     if (hasNonZero) {
       this._recordLiveUserInput('gamepad', false);
@@ -3007,9 +3361,14 @@ export class InputBridge {
 
   _commitMergedState(force = false, clearMouseDelta = false) {
     const mergedButtons =
-      (this._keyButtons | this._mouseButtonBits | this._gpButtons | this._scriptButtons) >>> 0;
+      (this._keyButtons |
+        this._mouseButtonBits |
+        this._gpButtons |
+        this._latchedButtons |
+        this._scriptButtons) >>>
+      0;
 
-    // Priority: keyboard WASD -> gamepad sticks -> scripted sticks.
+    // Priority: keyboard -> gamepad sticks -> mouse-look/wheel right stick -> scripted sticks.
     const lx = clamp(
       this._keyLx !== 0 ? this._keyLx : this._gpLx !== 0 ? this._gpLx : this._scriptLx,
       -1,
@@ -3020,8 +3379,28 @@ export class InputBridge {
       -1,
       1
     );
-    const rx = clamp(this._gpRx !== 0 ? this._gpRx : this._scriptRx, -1, 1);
-    const ry = clamp(this._gpRy !== 0 ? this._gpRy : this._scriptRy, -1, 1);
+    const rx = clamp(
+      this._keyRx !== 0
+        ? this._keyRx
+        : this._gpRx !== 0
+          ? this._gpRx
+          : this._mouseLookRx !== 0
+            ? this._mouseLookRx
+            : this._scriptRx,
+      -1,
+      1
+    );
+    const ry = clamp(
+      this._keyRy !== 0
+        ? this._keyRy
+        : this._gpRy !== 0
+          ? this._gpRy
+          : this._mouseLookRy !== 0
+            ? this._mouseLookRy
+            : this._scriptRy,
+      -1,
+      1
+    );
 
     const lt = clamp(Math.max(this._mouseLt, this._gpLt, this._scriptLt), 0, 1);
     const rt = clamp(Math.max(this._mouseRt, this._gpRt, this._scriptRt), 0, 1);
@@ -3674,6 +4053,9 @@ export class InputBridge {
       stickCurve: this._stickCurve,
       swapSticks: this._swapSticks,
       swapTriggersAndBumpers: this._swapTriggersAndBumpers,
+      minPressHoldMs: this._minPressHoldMs,
+      latchedButtons: this._latchedButtons,
+      tapLatchesTriggered: this._tapLatchesTriggered,
     };
   }
 
@@ -3757,11 +4139,15 @@ export class InputBridge {
     this._scriptRt = 0;
 
     this._pressedKeys.clear();
+    this._pressedRightStickKeys.clear();
     this._recomputeKeyboardState();
+    this._recomputeRightStickKeyboardState();
     this._clearMouseButtons();
+    this._clearMouseLookStick();
     this._wheelDelta = 0;
 
     this._clearGamepadState();
+    this._clearLatchedButtons();
     this._activeGamepadIndex = null;
     this._hasConnectedGamepad = false;
     this._lastIdleGamepadPollMs = null;

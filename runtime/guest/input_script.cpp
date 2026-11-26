@@ -2,11 +2,15 @@
 #include "os/thread_name.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <sstream>
 
 #include "os/game_input.h"
@@ -19,9 +23,18 @@ bool parse_number(const std::string& text, uint64_t& out) {
     if (text.empty()) {
         return false;
     }
+    // Reject leading whitespace or signs (+/-) so negative values never wrap to UINT64_MAX.
+    if (!std::isdigit(static_cast<unsigned char>(text[0]))) {
+        return false;
+    }
+    errno = 0;
     char* end = nullptr;
-    out = std::strtoull(text.c_str(), &end, 0);
-    return end != nullptr && *end == '\0';
+    const unsigned long long v = std::strtoull(text.c_str(), &end, 0);
+    if (errno == ERANGE || end == nullptr || *end != '\0') {
+        return false;
+    }
+    out = static_cast<uint64_t>(v);
+    return true;
 }
 
 bool button_bit(const std::string& name, uint32_t& bit) {
@@ -49,9 +62,13 @@ bool button_bit(const std::string& name, uint32_t& bit) {
     return false;
 }
 
-// Analog names (right stick, triggers): full deflection while held. False when `name` is not one.
+// Analog names (left/right stick, triggers): full deflection while held. False when `name` is not one.
 bool analog_name(const std::string& name, InputScriptEvent& e) {
-    if (name == "RUp") e.right_stick_y = 1.0f;
+    if (name == "LUp") e.left_stick_y = 1.0f;
+    else if (name == "LDown") e.left_stick_y = -1.0f;
+    else if (name == "LLeft") e.left_stick_x = -1.0f;
+    else if (name == "LRight") e.left_stick_x = 1.0f;
+    else if (name == "RUp") e.right_stick_y = 1.0f;
     else if (name == "RDown") e.right_stick_y = -1.0f;
     else if (name == "RLeft") e.right_stick_x = -1.0f;
     else if (name == "RRight") e.right_stick_x = 1.0f;
@@ -109,12 +126,18 @@ bool parse_duration(const std::string& text, uint64_t& out) {
     if (num.empty() || num.find_first_not_of("0123456789.") != std::string::npos) {
         return false;
     }
+    errno = 0;
     char* end = nullptr;
     const double v = std::strtod(num.c_str(), &end);
-    if (end == nullptr || *end != '\0' || v < 0) {
+    if (errno == ERANGE || end == nullptr || *end != '\0' || !std::isfinite(v) || v < 0.0) {
         return false;
     }
-    out = static_cast<uint64_t>(v * scale + 0.5);
+    const double scaled = v * scale;
+    // Cap well below UINT64_MAX (1e18 ms > 31 million years) to avoid float-to-uint64 UB.
+    if (!std::isfinite(scaled) || scaled > 1.0e18) {
+        return false;
+    }
+    out = static_cast<uint64_t>(scaled + 0.5);
     return true;
 }
 
@@ -234,9 +257,12 @@ bool ConditionTracker::update(uint64_t now_ms, const InputStatus& status) {
     const bool holds = condition_holds(*cond_, status);
     if (holds && !holds_) {
         since_ms_ = now_ms;
+    } else if (holds && now_ms < since_ms_) {
+        // Guard against unsigned underflow if a caller feeds a non-monotonic timestamp.
+        since_ms_ = now_ms;
     }
     holds_ = holds;
-    if (holds && now_ms - since_ms_ >= for_ms_) {
+    if (holds && now_ms >= since_ms_ && (now_ms - since_ms_) >= for_ms_) {
         met_ = true;
     }
     return met_;
@@ -298,8 +324,10 @@ bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& 
                 bool ok = parse_number(tok[0], e.present) && parse_number(tok[1], buttons) && buttons <= 0xffffffffull;
                 for (int k = 0; ok && k < 6; ++k) {
                     char* end = nullptr;
-                    *axes[k] = std::strtof(tok[2 + k].c_str(), &end);
-                    ok = !tok[2 + k].empty() && end != nullptr && *end == '\0';
+                    errno = 0;
+                    const float val = std::strtof(tok[2 + k].c_str(), &end);
+                    *axes[k] = val;
+                    ok = !tok[2 + k].empty() && errno != ERANGE && end != nullptr && *end == '\0' && std::isfinite(val);
                 }
                 std::string trailing;
                 if (!ok || (fields >> trailing)) {
@@ -367,6 +395,214 @@ bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& 
     return true;
 }
 
+namespace {
+
+void append_menu_cycle(std::ostringstream& s, uint64_t base_ms) {
+    // Cursor-resetting Legal Notices cycle (DUp x6, DDown x2, A): always lands on "Next >"
+    // (Row 2) without opening Row 0 ("Copyright") and advances earlier setup screens via A.
+    for (uint64_t i = 0; i < 6; ++i) {
+        s << (base_ms + i * 400) << " DUp 200\n";
+    }
+    s << (base_ms + 3000) << " DDown 200\n";
+    s << (base_ms + 4500) << " DDown 200\n";
+    s << (base_ms + 6500) << " A 220\n";
+}
+
+void append_legal_terms_cycle(std::ostringstream& s, uint64_t base_ms) {
+    // Rockstar Games Legal Terms & Policies 2-checkbox + Confirm > cycle (16 s):
+    // DUp x6 -> Right-Stick down scroll (900 ms) -> A (Privacy Policy) ->
+    // DDown -> Right-Stick down scroll (900 ms) -> A (Terms of Service) ->
+    // DDown -> A (Confirm >) -> A (follow-up confirm). Never presses B.
+    for (uint64_t i = 0; i < 6; ++i) {
+        s << (base_ms + i * 450) << " DUp 200\n";
+    }
+    s << (base_ms + 2700) << " RDown 900\n";
+    s << (base_ms + 4000) << " A 220\n";
+    s << (base_ms + 5200) << " DDown 200\n";
+    s << (base_ms + 5800) << " RDown 900\n";
+    s << (base_ms + 7100) << " A 220\n";
+    s << (base_ms + 8300) << " DDown 200\n";
+    s << (base_ms + 9500) << " A 220\n";
+    s << (base_ms + 12000) << " A 220\n";
+}
+
+std::string build_chrome_to_ingame_preset() {
+    std::ostringstream s;
+    s << "# Hardened chrome-to-ingame preset (warm + cold boot resilient, >=200ms holds, zero B)\n";
+    // Phase 1 (5s..74s): Start Screen (~45-55s warm) -> Setup (Language / Subtitles / Brightness /
+    // Navigation Experience ~60-75s) with spaced 220ms A presses. Stops before ~80s so plain A
+    // never opens Row 0 (Copyright) on Legal Notices.
+    for (uint64_t t = 5000; t <= 74000; t += 3000) {
+        s << t << " A 220\n";
+    }
+    // Phase 2 (80s..206s): 9 rounds of 14s cursor-resetting Legal Notices cycle covering both
+    // warm (~80-110s) and cold (~150-198s) boots safely.
+    for (uint64_t round = 0; round < 9; ++round) {
+        append_menu_cycle(s, 80000 + round * 14000);
+    }
+    // Phase 3 (210s..274s): 4 rounds of 16s Legal Terms scroll + 2-checkbox + Confirm > cycle.
+    for (uint64_t round = 0; round < 4; ++round) {
+        append_legal_terms_cycle(s, 210000 + round * 16000);
+    }
+    // Phase 4a (280s..340s): Main Menu -> Play / Story Mode / New Game confirms.
+    for (uint64_t t = 280000; t <= 340000; t += 4000) {
+        s << t << " A 220\n";
+    }
+    // Phase 4b (346s..418s): Gentle in-game movement & camera look sweeps + A confirms.
+    for (uint64_t block = 0; block < 4; ++block) {
+        const uint64_t base = 346000 + block * 18000;
+        s << base << " A 220\n";
+        s << (base + 2000) << " LUp 2000\n";
+        s << (base + 5000) << " RRight 1500\n";
+        s << (base + 7500) << " RLeft 1500\n";
+        s << (base + 10000) << (block % 2 == 0 ? " LUp+LRight+RRight 2000\n" : " LUp+LLeft+RLeft 2000\n");
+        s << (base + 14000) << " A 220\n";
+    }
+    s << "418000 A 220\n";
+    return s.str();
+}
+
+std::string build_menu_to_ingame_preset() {
+    std::ostringstream s;
+    s << "# Hardened screen-synced menu-to-ingame preset (>=200ms holds, Legal Terms scroll, zero B)\n";
+    // Phase 1: Start Screen & initial setup screens (Language / UI Text Size / Subtitles /
+    // Brightness / Navigation Experience / Finish Setup) until Legal Notices (37) or Legal Terms (33|50|51).
+    s << "repeat every 2500ms until draws_per_frame==37|33|50|51 for 2s timeout 180s\n";
+    s << "  0 A 220\n";
+    s << "end\n";
+    // Phase 2: Legal Notices (DUp x6, DDown x2, A -> Next >) until Legal Terms (33|50|51).
+    s << "repeat every 14s until draws_per_frame==33|50|51 for 2s timeout 180s\n";
+    append_menu_cycle(s, 0);
+    s << "end\n";
+    // Phase 3: Rockstar Games Legal Terms & Policies (scroll + 2 checkboxes + Confirm >) until passed.
+    s << "repeat every 16s until draws_per_frame!=33|50|51 for 2s timeout 180s\n";
+    append_legal_terms_cycle(s, 0);
+    s << "end\n";
+    // Phase 4: Main Menu -> Play / Story Mode / New Game selection.
+    s << "repeat every 3s until draws_per_frame>55 for 2s timeout 120s\n";
+    s << "  0 A 220\n";
+    s << "end\n";
+    // Phase 5: Brief in-game movement, camera look, and trigger probes.
+    s << "1000 LUp 1500\n";
+    s << "3000 RRight 1200\n";
+    s << "4700 RLeft 1200\n";
+    s << "6500 LUp+RT 1000\n";
+    s << "8000 RRight+LT 1000\n";
+    return s.str();
+}
+
+std::string build_chrome_menu_flow_6_preset() {
+    std::ostringstream s;
+    s << "# Hardened warm-boot chrome-menu-flow-6 preset (>=200ms holds, Legal Terms scroll, zero B)\n";
+    // Start Screen (~45-55s warm, or immediate after FIRST_VISIBLE_FRAME) + Setup (~60-75s).
+    for (uint64_t t : {2000ull, 4000ull, 6000ull}) {
+        s << t << " A 200\n";
+    }
+    // 3x 15s Legal Notices / Setup cursor-resetting cycles (35s, 50s, 65s).
+    for (uint64_t round = 0; round < 3; ++round) {
+        append_menu_cycle(s, 35000 + round * 15000);
+    }
+    // Legal Terms scroll + 2-checkbox + Confirm > followed by Main Menu confirms.
+    for (uint64_t round = 0; round < 4; ++round) {
+        append_legal_terms_cycle(s, 85000 + round * 16000);
+    }
+    for (uint64_t t = 152000; t <= 200000; t += 4000) {
+        s << t << " A 220\n";
+    }
+    return s.str();
+}
+
+std::string build_calibration_skip_preset() {
+    std::ostringstream s;
+    s << "# Hardened calibration-skip preset (>=200ms holds, zero B)\n";
+    for (uint64_t t = 5000; t <= 120000; t += 2500) {
+        s << t << " A 200\n";
+    }
+    return s.str();
+}
+
+std::string build_legal_notices_preset() {
+    std::ostringstream s;
+    s << "# Hardened legal-notices preset (>=200ms holds, cursor-reset Next > + Legal Terms, zero B)\n";
+    for (uint64_t t = 20000; t <= 62000; t += 2500) {
+        s << t << " A 200\n";
+    }
+    for (uint64_t round = 0; round < 4; ++round) {
+        append_menu_cycle(s, 66000 + round * 14000);
+    }
+    for (uint64_t round = 0; round < 3; ++round) {
+        append_legal_terms_cycle(s, 126000 + round * 16000);
+    }
+    return s.str();
+}
+
+std::string describe_press_event(const InputScriptEvent& e) {
+    if (e.buttons != 0) {
+        return hex(e.buttons);
+    }
+    std::string out;
+    auto add = [&](const char* tag) {
+        if (!out.empty()) out += "+";
+        out += tag;
+    };
+    if (e.left_stick_y > 0.0f) add("LUp");
+    if (e.left_stick_y < 0.0f) add("LDown");
+    if (e.left_stick_x < 0.0f) add("LLeft");
+    if (e.left_stick_x > 0.0f) add("LRight");
+    if (e.right_stick_y > 0.0f) add("RUp");
+    if (e.right_stick_y < 0.0f) add("RDown");
+    if (e.right_stick_x < 0.0f) add("RLeft");
+    if (e.right_stick_x > 0.0f) add("RRight");
+    if (e.left_trigger > 0.0f) add("LT");
+    if (e.right_trigger > 0.0f) add("RT");
+    return out.empty() ? "0x0" : out;
+}
+
+bool event_has_active_input(const InputScriptEvent& e) {
+    return e.buttons != 0 || e.left_stick_x != 0.0f || e.left_stick_y != 0.0f || e.right_stick_x != 0.0f ||
+           e.right_stick_y != 0.0f || e.left_trigger != 0.0f || e.right_trigger != 0.0f;
+}
+
+}  // namespace
+
+std::vector<std::string> builtin_input_script_preset_names() {
+    return {"chrome-to-ingame", "menu-to-ingame", "chrome-menu-flow-6", "calibration-skip", "legal-notices"};
+}
+
+bool builtin_input_script_preset(const std::string& name, std::string& out_script) {
+    if (name == "chrome-to-ingame") {
+        out_script = build_chrome_to_ingame_preset();
+        return true;
+    }
+    if (name == "menu-to-ingame") {
+        out_script = build_menu_to_ingame_preset();
+        return true;
+    }
+    if (name == "chrome-menu-flow-6") {
+        out_script = build_chrome_menu_flow_6_preset();
+        return true;
+    }
+    if (name == "calibration-skip") {
+        out_script = build_calibration_skip_preset();
+        return true;
+    }
+    if (name == "legal-notices") {
+        out_script = build_legal_notices_preset();
+        return true;
+    }
+    return false;
+}
+
+bool parse_input_script_or_preset(const std::string& name_or_text,
+                                  std::vector<InputScriptEvent>& out,
+                                  std::string& error) {
+    std::string preset_script;
+    if (builtin_input_script_preset(name_or_text, preset_script)) {
+        return parse_input_script(preset_script, out, error);
+    }
+    return parse_input_script(name_or_text, out, error);
+}
+
 InputScriptPlayer::InputScriptPlayer(std::vector<InputScriptEvent> events, playgta6::InputState* state)
     : events_(std::move(events)), state_(state) {}
 
@@ -377,6 +613,11 @@ void InputScriptPlayer::start() {
         return;
     }
     stop_.store(false);
+    finished_.store(false);
+    yielded_.store(false);
+    writes_.store(0);
+    waits_done_.store(0);
+    waits_timed_out_.store(0);
     thread_ = std::thread([this] { run(); });
 }
 
@@ -414,11 +655,30 @@ void InputScriptPlayer::run() {
             std::fprintf(stderr, "[input] %llu ms: %s\n", static_cast<unsigned long long>(ms_since_start()), what.c_str());
         }
     };
-    enum class Until { Reached, Met, Stopped };
-    // Sleeps until `at` in short steps so stop() takes effect promptly; with a tracker, also
-    // samples the live status every step and returns Met as soon as its condition is met.
+    enum class Until { Reached, Met, Stopped, TimedOut };
+    bool state_latched = false;
+    auto check_yield = [&]() -> bool {
+        if (live_yield_probe_ && live_yield_probe_()) {
+            yielded_.store(true);
+            stop_.store(true);
+            log("yielded to live user input");
+            return true;
+        }
+        return false;
+    };
+    auto release_if_state_latched = [&]() {
+        if (state_latched) {
+            write(nullptr);
+            state_latched = false;
+        }
+    };
+    // Sleeps until `at` in short steps so stop() and live yield take effect promptly; with a
+    // tracker, also samples the live status every step and returns Met as soon as its condition is met.
     auto wait_until = [&](clock::time_point at, ConditionTracker* tracker, int tracker_step_ms = 10) {
         while (!stop_.load()) {
+            if (check_yield()) {
+                return Until::Stopped;
+            }
             if (tracker != nullptr && tracker->update(ms_since_start(), status())) {
                 return Until::Met;
             }
@@ -431,22 +691,39 @@ void InputScriptPlayer::run() {
         }
         return Until::Stopped;
     };
-    // Presses `e` at base + e.time_ms (skipped while `tracker`'s condition holds).
-    auto press = [&](const InputScriptEvent& e, clock::time_point base, ConditionTracker* tracker) {
+    // Presses `e` at base + e.time_ms (skipped while `tracker`'s condition holds, and bounded by
+    // `limit` when executing inside a timed repeat). Holds for the full effective hold_ms measured
+    // from actual press time so late wakeups or back-to-back presses never collapse to 0 ms.
+    auto press = [&](const InputScriptEvent& e, clock::time_point base, ConditionTracker* tracker,
+                     clock::time_point limit) {
         const clock::time_point at = base + std::chrono::milliseconds(e.time_ms);
-        const Until u = wait_until(at, tracker);
+        const bool has_limit = limit != clock::time_point::max();
+        const clock::time_point wake_at = has_limit ? std::min(at, limit) : at;
+        const Until u = wait_until(wake_at, tracker);
         if (u != Until::Reached) {
             return u;
+        }
+        if (has_limit && clock::now() >= limit) {
+            return Until::TimedOut;
         }
         if (tracker != nullptr && tracker->holds_now()) {
             return Until::Reached;  // already on the target screen: no press
         }
+        const uint64_t effective_hold = std::max(e.hold_ms, min_hold_ms_);
         if (log_) {
-            log("press " + hex(e.buttons) + " " + std::to_string(e.hold_ms));
+            log("press " + describe_press_event(e) + " " + std::to_string(effective_hold));
         }
+        const clock::time_point pressed_at = clock::now();
         write(&e);
-        const Until held = wait_until(at + std::chrono::milliseconds(e.hold_ms), nullptr);
+        const clock::time_point hold_end = pressed_at + std::chrono::milliseconds(effective_hold);
+        const Until held = wait_until(has_limit ? std::min(hold_end, limit) : hold_end, nullptr);
         write(nullptr);
+        if (held == Until::Stopped) {
+            return Until::Stopped;
+        }
+        if (has_limit && clock::now() >= limit) {
+            return Until::TimedOut;
+        }
         return held;
     };
     auto finish_wait = [&](const InputScriptEvent& e, bool met, const std::string& what) {
@@ -463,7 +740,8 @@ void InputScriptPlayer::run() {
         const InputScriptEvent& e = events_[i];
         switch (e.kind) {
             case InputStepKind::Press:
-                if (press(e, base, nullptr) == Until::Stopped) {
+                state_latched = false;
+                if (press(e, base, nullptr, clock::time_point::max()) == Until::Stopped) {
                     return;
                 }
                 break;
@@ -473,6 +751,7 @@ void InputScriptPlayer::run() {
                     e.timeout_ms ? clock::now() + std::chrono::milliseconds(e.timeout_ms) : clock::time_point::max();
                 const Until u = wait_until(limit, &tracker);
                 if (u == Until::Stopped) {
+                    release_if_state_latched();
                     return;
                 }
                 finish_wait(e, u == Until::Met, "wait");
@@ -490,13 +769,14 @@ void InputScriptPlayer::run() {
                      round += std::chrono::milliseconds(e.every_ms)) {
                     ++rounds;
                     for (size_t k = i + 1; k < e.end_index && u == Until::Reached; ++k) {
-                        u = press(events_[k], round, &tracker);
+                        u = press(events_[k], round, &tracker, limit);
                     }
                     if (u == Until::Reached) {
                         u = wait_until(std::min(limit, round + std::chrono::milliseconds(e.every_ms)), &tracker);
                     }
                 }
                 if (u == Until::Stopped) {
+                    release_if_state_latched();
                     return;
                 }
                 finish_wait(e, u == Until::Met, "repeat (" + std::to_string(rounds) + " round(s))");
@@ -511,12 +791,14 @@ void InputScriptPlayer::run() {
                 reached.values = {e.present};
                 ConditionTracker tracker(reached, 0);
                 if (wait_until(clock::time_point::max(), &tracker, 1) == Until::Stopped) {
+                    release_if_state_latched();
                     return;
                 }
                 if (log_) {
                     log("state " + hex(e.buttons) + " at present " + std::to_string(e.present));
                 }
                 write(&e);
+                state_latched = event_has_active_input(e);
                 break;
             }
             case InputStepKind::Capture:
