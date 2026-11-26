@@ -3002,4 +3002,53 @@ test('W321 restart invokes soft reclaim before teardown, maintains phase reset p
   assert.equal(postDestroyCalled, false);
 });
 
+test('W366 getPhaseTelemetry() and getFastStats() match getStats() accurately with defensive phase clones', async () => {
+  const clock = createClock(10_000);
+  const controller = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    now: clock.now,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  await controller.start();
+  clock.advance(250);
+  controller.recordPhase(SESSION_PHASE.START_SCREEN);
+  clock.advance(400);
+  controller.recordPhase(SESSION_PHASE.IN_GAME);
+  clock.advance(150);
+  await controller.requestMemoryReclaim('vram-trim');
+
+  const fullStats = controller.getStats();
+  const phaseTel = controller.getPhaseTelemetry();
+  const fastStats = controller.getFastStats();
+
+  assert.equal(phaseTel.currentPhase, fullStats.currentPhase);
+  assert.deepEqual(phaseTel.phaseDurationsMs, fullStats.phaseDurationsMs);
+  assert.equal(phaseTel.phaseTransitionCount, fullStats.phaseTransitionCount);
+  assert.equal(phaseTel.reclaimRuns, fullStats.reclaimRuns);
+  assert.equal(phaseTel.reclaimFailures, fullStats.reclaimFailures);
+  assert.equal(phaseTel.lastReclaimReason, fullStats.lastReclaimReason);
+  assert.equal(phaseTel.lastReclaimAtMs, fullStats.lastReclaimAtMs);
+
+  // Defensive clone immutability on getPhaseTelemetry().
+  phaseTel.phaseDurationsMs.boot = 999_999;
+  assert.equal(controller.getPhaseTelemetry().phaseDurationsMs.boot, 250);
+
+  // getFastStats() matches core getStats() counters.
+  assert.equal(fastStats.state, fullStats.state);
+  assert.equal(fastStats.mode, fullStats.mode);
+  assert.equal(fastStats.bootMode, fullStats.bootMode);
+  assert.equal(fastStats.currentPhase, fullStats.currentPhase);
+  assert.equal(fastStats.phaseTransitionCount, fullStats.phaseTransitionCount);
+  assert.equal(fastStats.destroyed, fullStats.destroyed);
+  assert.equal(fastStats.uptimeMs, fullStats.uptimeMs);
+  assert.equal(fastStats.reclaimRuns, fullStats.reclaimRuns);
+  assert.equal(fastStats.reclaimFailures, fullStats.reclaimFailures);
+  assert.equal(fastStats.validationErrorCount, fullStats.validationErrorCount);
+  assert.equal(fastStats.splashFramesPresented, fullStats.splashFramesPresented);
+
+  await controller.destroy();
+});
+
 
