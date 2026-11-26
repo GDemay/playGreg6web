@@ -1,9 +1,12 @@
 // Present pacing against a 60 Hz vblank clock (O36, gpu/present_pacing.h), on a fake clock.
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <mutex>
 #include <cstdio>
+#include <limits>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include "gpu/frame_time_hist.h"
@@ -214,6 +217,225 @@ void test_title_driven_interval_zero_remains_immediate() {
     CHECK(s.presents == 6 && s.immediate == 6 && s.waits == 0 && s.wait_us == 0);
 }
 
+void test_interval_clamp_and_overflow_safety() {
+    CHECK(PresentPacer::title_gap_vblanks(30, true) == PresentPacer::kMaxInterval);
+    CHECK(PresentPacer::title_gap_vblanks(UINT32_MAX, true) == PresentPacer::kMaxInterval);
+    CHECK(PresentPacer::title_gap_vblanks(UINT32_MAX, false) == 1u);
+
+    // 1. Vblank-grid mode: huge / malformed intervals clamp to kMaxInterval (100 ms) and recover
+    // cleanly to 60 Hz on subsequent interval=1 presents.
+    {
+        PresentPacer p;
+        FakeClock c;
+        c.install(p);
+        CHECK(p.vblank_start(std::numeric_limits<uint64_t>::max()) <= Clock::time_point::max());
+        CHECK(p.vblank_start(std::numeric_limits<uint64_t>::max()) >= c.origin);
+
+        c.now = c.origin + 5 * kV;
+        CHECK(p.present(1) == 6);
+        const auto before_huge = c.now;
+        CHECK(p.present(30) == 6 + PresentPacer::kMaxInterval);
+        CHECK(c.now - before_huge == PresentPacer::kMaxInterval * kV);
+        CHECK(p.stats().last_interval == 30);
+
+        const auto before_max = c.now;
+        CHECK(p.present(std::numeric_limits<uint32_t>::max()) == 6 + 2 * PresentPacer::kMaxInterval);
+        CHECK(c.now - before_max == PresentPacer::kMaxInterval * kV);
+
+        // Next normal frame paces immediately at 1 vblank (60 Hz), with zero leftover sleep debt.
+        const auto after_max = c.now;
+        CHECK(p.present(1) == 6 + 2 * PresentPacer::kMaxInterval + 1);
+        CHECK(c.now - after_max == kV);
+    }
+
+    // 2. Title-driven honor-interval mode: huge intervals clamp to kMaxInterval without overflow.
+    {
+        PresentPacer p;
+        FakeClock c;
+        c.install(p);
+        p.set_title_driven(true);
+        p.set_honor_interval(true);
+        c.now = c.origin + std::chrono::milliseconds(5);
+        (void)p.present(1);
+        const auto t0 = c.now;
+        (void)p.present(std::numeric_limits<uint32_t>::max());
+        CHECK(c.now - t0 == PresentPacer::kMaxInterval * kV);
+        const auto t1 = c.now;
+        (void)p.present(1);
+        CHECK(c.now - t1 == kV);
+    }
+}
+
+void test_long_stall_and_oversleep_recovery() {
+    // Title-driven mode: 500 ms and 250 s stalls + oversleep produce zero catch-up debt and
+    // record actual oversleep duration in stats().wait_us.
+    {
+        PresentPacer p;
+        Clock::time_point origin = Clock::time_point{} + std::chrono::hours(1);
+        Clock::time_point now = origin;
+        int64_t extra_oversleep_ms = 0;
+        p.set_clock_for_testing([&] { return now; },
+                                [&](Clock::time_point t) {
+                                    if (t > now) now = t;
+                                    now += std::chrono::milliseconds(extra_oversleep_ms);
+                                },
+                                origin);
+        p.set_title_driven(true);
+        (void)p.present(1);
+
+        // Simulate a 250-second long-session stall (e.g. tab pause / shader compile): immediate!
+        now += std::chrono::seconds(250);
+        const auto s_before = p.stats();
+        (void)p.present(1);
+        CHECK(p.stats().immediate == s_before.immediate + 1);
+        CHECK(p.stats().waits == s_before.waits);
+
+        // Next frame arrives 1 ms later and oversleeps by 40 ms: wait_us reflects actual sleep
+        // (~55.6 ms), and the following frame after the oversleep presents immediately (no debt).
+        now += std::chrono::milliseconds(1);
+        extra_oversleep_ms = 40;
+        const auto wait_before = p.stats().wait_us;
+        (void)p.present(1);
+        CHECK(p.stats().wait_us - wait_before >= 50'000);
+        extra_oversleep_ms = 0;
+        const auto imm_before = p.stats().immediate;
+        (void)p.present(1);
+        CHECK(p.stats().immediate == imm_before + 1);
+    }
+
+    // Vblank-grid mode: 250 s stall jumps directly to current + 1 without multi-vblank sleep.
+    {
+        PresentPacer p;
+        FakeClock c;
+        c.install(p);
+        CHECK(p.present(1) == 1);
+        c.now += std::chrono::seconds(250) + kV / 2;
+        const uint64_t cur = p.vblank_at(c.now);
+        const auto t_before = c.now;
+        CHECK(p.present(1) == cur + 1);
+        CHECK(c.now - t_before <= kV);
+    }
+}
+
+void test_early_wakeup_and_backward_clock_step() {
+    // Emscripten Atomics.wait truncation can wake slightly early, or a clock can step backward.
+    // Neither may stack future deadlines or wrap wait_us negative->UINT64_MAX.
+    PresentPacer p;
+    Clock::time_point origin = Clock::time_point{} + std::chrono::hours(1);
+    Clock::time_point now = origin + std::chrono::seconds(10);
+    std::vector<Clock::time_point> sleeps;
+    bool wake_early = false;
+    p.set_clock_for_testing([&] { return now; },
+                            [&](Clock::time_point t) {
+                                sleeps.push_back(t);
+                                if (wake_early) {
+                                    // Wake 2 ms before the deadline.
+                                    now = t - std::chrono::milliseconds(2);
+                                } else if (t > now) {
+                                    now = t;
+                                }
+                            },
+                            origin);
+    p.set_title_driven(true);
+    (void)p.present(1);
+
+    // 10 consecutive early wakeups: every sleep lead stays strictly <= 1 vblank.
+    wake_early = true;
+    for (int i = 0; i < 10; ++i) {
+        const auto before = now;
+        (void)p.present(1);
+        CHECK(sleeps.back() - before <= kV);
+    }
+
+    // Backward clock jump of 5 seconds: sleep lead still <= 1 vblank and wait_us never wraps.
+    wake_early = false;
+    now -= std::chrono::seconds(5);
+    const auto before_jump = now;
+    const auto wait_before = p.stats().wait_us;
+    (void)p.present(1);
+    CHECK(sleeps.back() - before_jump <= kV);
+    CHECK(p.stats().wait_us >= wait_before && p.stats().wait_us - wait_before <= 20'000);
+}
+
+void test_concurrent_callers_and_mid_sleep_reset() {
+    // Two concurrent threads calling present(1) must not stack deadlines to 2 * kV, and
+    // reset_for_testing() mid-sleep must prevent waking threads from corrupting fresh stats.
+    PresentPacer p;
+    const Clock::time_point origin = Clock::time_point{} + std::chrono::hours(1);
+    const Clock::time_point fixed_now = origin + std::chrono::milliseconds(5);
+    std::mutex m;
+    std::condition_variable cv;
+    int sleeping = 0;
+    bool release = false;
+    std::vector<Clock::time_point> observed_deadlines;
+
+    p.set_clock_for_testing([&] { return fixed_now; },
+                            [&](Clock::time_point t) {
+                                std::unique_lock<std::mutex> lk(m);
+                                observed_deadlines.push_back(t);
+                                ++sleeping;
+                                cv.notify_all();
+                                cv.wait(lk, [&] { return release; });
+                            },
+                            origin);
+    p.set_title_driven(true);
+    (void)p.present(1);  // anchor at fixed_now
+
+    std::thread t1([&] { (void)p.present(1); });
+    std::thread t2([&] { (void)p.present(1); });
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return sleeping == 2; });
+        CHECK(observed_deadlines.size() == 2);
+        for (const auto d : observed_deadlines) {
+            CHECK(d - fixed_now <= kV);
+        }
+    }
+    // Reset pacer while both threads are blocked in sleep_until.
+    p.reset_for_testing();
+    {
+        std::lock_guard<std::mutex> lk(m);
+        release = true;
+    }
+    cv.notify_all();
+    t1.join();
+    t2.join();
+
+    // Waking threads belonged to the previous generation: fresh stats must stay clean.
+    const auto s = p.stats();
+    CHECK(s.presents == 0 && s.waits == 0 && s.wait_us == 0);
+}
+
+void test_mode_transitions_and_reset_hygiene() {
+    PresentPacer p;
+    FakeClock c;
+    c.install(p);
+    p.set_title_driven(true);
+    p.set_honor_interval(true);
+
+    const auto t0 = c.origin + std::chrono::milliseconds(5);
+    c.now = t0;
+    (void)p.present(1);
+    // Repeated set_title_driven(true) (as Device::SetFrameIntervalX does) must NOT clear the
+    // burst-capping anchor!
+    p.set_title_driven(true);
+    (void)p.present(1);
+    CHECK(c.now == t0 + kV);
+
+    // Leaving title_driven after 100 s must reset last_flip_ so grid mode has no bogus missed_vblanks.
+    c.now += std::chrono::seconds(100);
+    p.set_title_driven(false);
+    const auto missed_before = p.stats().missed_vblanks;
+    (void)p.present(1);
+    CHECK(p.stats().missed_vblanks == missed_before);
+
+    // reset_for_testing() must also clear honor_interval_.
+    p.reset_for_testing();
+    CHECK(!p.honor_interval());
+    CHECK(!p.title_driven());
+    CHECK(p.enabled());
+}
+
 }  // namespace
 
 void test_frame_time_hist() {
@@ -314,6 +536,11 @@ int main() {
     test_title_driven_caps_unpaced_bursts_at_60hz();
     test_title_driven_honor_interval();
     test_title_driven_interval_zero_remains_immediate();
+    test_interval_clamp_and_overflow_safety();
+    test_long_stall_and_oversleep_recovery();
+    test_early_wakeup_and_backward_clock_step();
+    test_concurrent_callers_and_mid_sleep_reset();
+    test_mode_transitions_and_reset_hygiene();
     test_present_samples_ring();
     test_frame_time_hist();
     test_host_sleep_is_precise();
