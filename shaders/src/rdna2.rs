@@ -307,6 +307,7 @@ pub enum Rdna2Detail {
         d16: bool,
         nsize: u8,
         vaddr: u8,
+        nsa_vaddrs: [u8; 12],
         vdata: u8,
         srsrc: u8,
         ssamp: u8,
@@ -1417,11 +1418,38 @@ fn mimg_info(op: u8) -> (String, bool) {
         0x4F => "image_gather4_c_lz",
         0x60 => "image_get_lod",
         0x68 => "image_sample_cd",
-        0xE0 => "image_bvh_intersect_ray",
-        0xE1 => "image_bvh64_intersect_ray",
+        0xE6 => "image_bvh_intersect_ray",
+        0xE7 => "image_bvh64_intersect_ray",
         other => return (format!("mimg_op_{other:#04x}"), uses_sampler),
     };
     (name.to_string(), uses_sampler)
+}
+
+/// Resolve the `idx`-th address VGPR of an `MIMG` instruction (supporting GFX10.3 NSA).
+pub fn mimg_addr_vgpr(vaddr: u8, nsize: u8, nsa_vaddrs: &[u8; 12], idx: u8) -> Option<u8> {
+    if nsize == 0 {
+        vaddr.checked_add(idx)
+    } else if idx == 0 {
+        Some(vaddr)
+    } else {
+        let explicit_extra = nsize.min(3) * 4;
+        if idx <= explicit_extra {
+            Some(nsa_vaddrs[usize::from(idx - 1)])
+        } else {
+            nsa_vaddrs[usize::from(explicit_extra - 1)].checked_add(idx - explicit_extra)
+        }
+    }
+}
+
+/// Address VGPR count for GFX10.3 BVH MIMG instructions (`0xE6` / `0xE7`).
+pub const fn mimg_bvh_addr_vgpr_count(op: u8, a16: bool) -> Option<u8> {
+    match (op, a16) {
+        (0xE6, false) => Some(11),
+        (0xE6, true) => Some(8),
+        (0xE7, false) => Some(12),
+        (0xE7, true) => Some(9),
+        _ => None,
+    }
 }
 
 fn flat_mnemonic(seg: u8, op: u8) -> String {
@@ -1450,6 +1478,22 @@ fn flat_mnemonic(seg: u8, op: u8) -> String {
         0x31 => "atomic_cmpswap",
         0x32 => "atomic_add",
         0x33 => "atomic_sub",
+        0x50 => "atomic_swap_x2",
+        0x51 => "atomic_cmpswap_x2",
+        0x52 => "atomic_add_x2",
+        0x53 => "atomic_sub_x2",
+        0x54 => "atomic_smin_x2",
+        0x55 => "atomic_umin_x2",
+        0x56 => "atomic_smax_x2",
+        0x57 => "atomic_umax_x2",
+        0x58 => "atomic_and_x2",
+        0x59 => "atomic_or_x2",
+        0x5A => "atomic_xor_x2",
+        0x5B => "atomic_inc_x2",
+        0x5C => "atomic_dec_x2",
+        0x5D => "atomic_fcmpswap_x2",
+        0x5E => "atomic_fmin_x2",
+        0x5F => "atomic_fmax_x2",
         other => return format!("{prefix}_op_{other:#04x}"),
     };
     format!("{prefix}_{suffix}")
@@ -2634,9 +2678,12 @@ fn decode_mimg(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
 
     // Consume GFX10 NSA extra address words if present (nsize in 1..=3) via checked word reads.
+    let mut nsa_vaddrs = [0u8; 12];
     if !truncated && nsize > 0 {
         for extra_idx in 0..usize::from(nsize) {
-            if read_inst_word(bytes, offset, 2 + extra_idx).is_some() {
+            if let Some(word) = read_inst_word(bytes, offset, 2 + extra_idx) {
+                let base = extra_idx * 4;
+                nsa_vaddrs[base..base + 4].copy_from_slice(&word.to_le_bytes());
                 size = size.saturating_add(MIN_RDNA2_INST_BYTES);
             } else {
                 truncated = true;
@@ -2655,7 +2702,8 @@ fn decode_mimg(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let mut operands = String::new();
     if !truncated {
         let srsrc_reg = srsrc.saturating_mul(4);
-        let srsrc_count = if r128 { 4 } else { 8 };
+        let is_bvh = matches!(op, 0xE6 | 0xE7);
+        let srsrc_count = if r128 || is_bvh { 4 } else { 8 };
         let _ = write!(
             operands,
             "v{vdata}, v{vaddr}, {}",
@@ -2717,6 +2765,7 @@ fn decode_mimg(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
             d16,
             nsize,
             vaddr,
+            nsa_vaddrs,
             vdata,
             srsrc,
             ssamp,
@@ -3377,19 +3426,23 @@ pub fn analyze_instructions(
                 op,
                 dmask,
                 r128,
+                a16,
+                nsize,
                 vaddr,
+                nsa_vaddrs,
                 vdata,
                 srsrc,
                 ssamp,
                 ..
             } => {
-                if matches!(*op, 0x08..=0x0B | 0x10..=0x13) {
+                let is_bvh = matches!(*op, 0xE6 | 0xE7);
+                if is_bvh || matches!(*op, 0x08..=0x0B | 0x10..=0x13) {
                     has_compute_mem = true;
                 }
                 if !inst.truncated {
                     let (_, uses_sampler) = mimg_info(*op);
                     let srsrc_sgpr = srsrc.saturating_mul(4);
-                    let srsrc_count = if *r128 { 4 } else { 8 };
+                    let srsrc_count = if *r128 || is_bvh { 4 } else { 8 };
                     record_sgpr_range(&mut max_sgpr, srsrc_sgpr, srsrc_count);
                     let ssamp_sgpr = if uses_sampler {
                         let reg = ssamp.saturating_mul(4);
@@ -3398,9 +3451,18 @@ pub fn analyze_instructions(
                     } else {
                         None
                     };
-                    let data_count = dmask.count_ones().max(1) as u8;
-                    record_vgpr_range(&mut max_vgpr, *vdata, data_count);
-                    record_vgpr(&mut max_vgpr, *vaddr);
+                    if let Some(addr_count) = mimg_bvh_addr_vgpr_count(*op, *a16) {
+                        record_vgpr_range(&mut max_vgpr, *vdata, 4);
+                        for idx in 0..addr_count {
+                            if let Some(reg) = mimg_addr_vgpr(*vaddr, *nsize, nsa_vaddrs, idx) {
+                                record_vgpr(&mut max_vgpr, reg);
+                            }
+                        }
+                    } else {
+                        let data_count = dmask.count_ones().max(1) as u8;
+                        record_vgpr_range(&mut max_vgpr, *vdata, data_count);
+                        record_vgpr(&mut max_vgpr, *vaddr);
+                    }
                     resource_refs.push(Rdna2ResourceRef {
                         offset: inst.offset,
                         encoding: Rdna2Encoding::Mimg,
