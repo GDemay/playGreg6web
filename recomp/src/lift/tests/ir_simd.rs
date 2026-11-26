@@ -230,6 +230,157 @@ fn r62_unread_ymmh_elides_allocas_and_uses_memset_for_vzeroupper() {
 }
 
 #[test]
+fn r63a_elides_redundant_unread_ymmh_zero_stores() {
+    use crate::lift::{MemoryModel, lift_module_with};
+
+    // 1. Multiple VEX-128 writes to the same unread xmm0 in one basic block (even across memory
+    //    stores / atomics that block LLVM DSE) emit only ONE `%state.ymmh0` zero store.
+    let f_same_bb = asm_function(0x1000, |a| {
+        a.vxorps(xmm0, xmm0, xmm0)?;
+        a.mov(qword_ptr(rcx), rax)?;
+        a.vaddps(xmm0, xmm0, xmm1)?;
+        a.lock().xadd(qword_ptr(rcx), rax)?;
+        a.vmulps(xmm0, xmm0, xmm2)?;
+        a.vsubps(xmm0, xmm0, xmm1)?;
+        a.ret()
+    });
+    let ir_same = lift_module_with(
+        [&f_same_bb],
+        MemoryModel::from_name("window-runs").expect("model"),
+    )
+    .expect("lifts")
+    .ir;
+    assert_eq!(
+        ir_same
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8")
+            .count(),
+        1,
+        "repeated VEX-128 writes to xmm0 in one block must coalesce to one ymmh0 zero store:\n{ir_same}"
+    );
+
+    // 2. Calls (direct & indirect) reset `ymmh_zeroed`, so the first VEX-128 write after each
+    //    call emits a zero store again, while subsequent ones in the same block are elided.
+    let prog_call = Program::new()
+        .asm(0x1000, |a| {
+            a.vxorps(xmm0, xmm0, xmm0)?;
+            a.vaddps(xmm0, xmm0, xmm1)?;
+            a.call(0x2000)?;
+            a.vmulps(xmm0, xmm0, xmm1)?;
+            a.vsubps(xmm0, xmm0, xmm1)?;
+            a.call(rax)?;
+            a.vaddps(xmm0, xmm0, xmm1)?;
+            a.vmulps(xmm0, xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(0x2000, |a| a.ret());
+    let ir_call = lift_function(&prog_call.function(0x1000)).expect("lifts").ir;
+    assert_eq!(
+        ir_call
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8")
+            .count(),
+        3,
+        "one zero store before direct call, one after direct call, one after indirect call:\n{ir_call}"
+    );
+
+    // 3. Basic block boundaries reset `ymmh_zeroed`.
+    let f_blocks = asm_function(0x1000, |a| {
+        let mut target = a.create_label();
+        a.vxorps(xmm0, xmm0, xmm0)?;
+        a.vaddps(xmm0, xmm0, xmm1)?;
+        a.test(rcx, rcx)?;
+        a.jz(target)?;
+        a.vmulps(xmm0, xmm0, xmm1)?;
+        a.vsubps(xmm0, xmm0, xmm1)?;
+        a.set_label(&mut target)?;
+        a.vaddps(xmm0, xmm0, xmm1)?;
+        a.vmulps(xmm0, xmm0, xmm1)?;
+        a.ret()
+    });
+    let ir_blocks = lift_function(&f_blocks).expect("lifts").ir;
+    assert_eq!(
+        ir_blocks
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8")
+            .count(),
+        3,
+        "each of the 3 basic blocks emits exactly 1 ymmh0 zero store:\n{ir_blocks}"
+    );
+
+    // 4. A 256-bit write to an unread `ymm0` clears bit 0 of `ymmh_zeroed`, so the next VEX-128
+    //    write to `xmm0` MUST re-zero `%state.ymmh0` (soundness check!).
+    let f_wide_reset = asm_function(0x1000, |a| {
+        a.vxorps(xmm0, xmm0, xmm0)?;
+        a.vaddps(xmm0, xmm0, xmm1)?; // elided
+        a.vmovdqu(ymm0, ymmword_ptr(rcx))?; // non-zero store to %state.ymmh0, clears bit 0
+        a.vaddps(xmm0, xmm0, xmm1)?; // must re-emit zero store!
+        a.vmulps(xmm0, xmm0, xmm1)?; // elided again
+        a.ret()
+    });
+    let ir_wide = lift_function(&f_wide_reset).expect("lifts").ir;
+    assert!(!ir_wide.contains("%ymmh0 = alloca"), "{ir_wide}");
+    assert_eq!(
+        ir_wide
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8")
+            .count(),
+        2,
+        "256-bit write to unread ymm0 must clear ymmh_zeroed bit 0:\n{ir_wide}"
+    );
+    assert_eq!(
+        ir_wide.matches("ptr %state.ymmh0, align 8").count(),
+        3,
+        "2 zero stores + 1 non-zero 256-bit store to %state.ymmh0:\n{ir_wide}"
+    );
+
+    // 5. `vzeroupper` marks all unread `ymmh` slots zeroed, so following VEX-128 ops emit zero
+    //    redundant `%state.ymmh*` stores.
+    let f_vzu_then_vex = asm_function(0x1000, |a| {
+        a.vzeroupper()?;
+        a.vxorps(xmm0, xmm0, xmm0)?;
+        a.vaddps(xmm1, xmm1, xmm2)?;
+        a.ret()
+    });
+    let ir_vzu = lift_function(&f_vzu_then_vex).expect("lifts").ir;
+    assert_eq!(
+        ir_vzu
+            .matches("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)")
+            .count(),
+        1,
+        "{ir_vzu}"
+    );
+    assert_eq!(
+        ir_vzu
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh")
+            .count(),
+        0,
+        "VEX-128 ops after vzeroupper in the same block must elide redundant zero stores:\n{ir_vzu}"
+    );
+
+    // 6. `ymmh_zeroed` survives across a coalesced window burst (entry -> fast & slow -> join).
+    let f_burst_zero = asm_function(0x1000, |a| {
+        a.vxorps(xmm0, xmm0, xmm0)?;
+        a.vmovdqu(xmm1, xmmword_ptr(rcx))?;
+        a.vmovdqu(xmm2, xmmword_ptr(rcx + 16))?;
+        a.vpaddd(xmm0, xmm1, xmm2)?;
+        a.vmovdqu(xmmword_ptr(rbx), xmm0)?;
+        a.vmovdqu(xmmword_ptr(rbx + 16), xmm0)?;
+        a.vpaddd(xmm0, xmm0, xmm1)?;
+        a.ret()
+    });
+    let ir_burst_zero = lift_module_with(
+        [&f_burst_zero],
+        MemoryModel::from_name("window-runs").expect("model"),
+    )
+    .expect("lifts")
+    .ir;
+    assert_eq!(
+        ir_burst_zero
+            .matches("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8")
+            .count(),
+        1,
+        "ymmh0 zeroed before burst must not be re-zeroed inside or after the burst:\n{ir_burst_zero}"
+    );
+}
+
+#[test]
 fn lifted_functions_require_wasm_simd() {
     let func = asm_function(0x1000, |a| {
         a.sqrtps(xmm0, xmm1)?;

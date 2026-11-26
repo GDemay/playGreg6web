@@ -95,40 +95,10 @@ fn keeps_memory(line: &str) -> bool {
     }
 }
 
-/// How `[burst.reg + disp]` accesses are lowered while inside a coalesced burst.
-#[derive(Clone)]
-pub(super) enum BurstMode {
-    /// 99.95% hot path: all bytes are flat or in one 64 KiB window slot; translate via
-    /// `base_host + disp` with zero branches or table loads.
-    Fast { base_host: String, saw_store: bool },
-    /// 0.05% cold boundary-crossing fallback: route through compact cold runtime helpers
-    /// (`__playgta6_guest_read` / `__playgta6_slow_storeN`) so the fallback adds minimal IR.
-    Slow,
-}
-
-/// Active override for a coalesced same-base burst (`[base + d_i]`).
-#[derive(Clone)]
-pub(super) struct BurstOverride {
-    /// 64-bit GPR index of the burst's base register.
-    pub(super) reg: usize,
-    /// Fast vs cold-slow lowering mode.
-    pub(super) mode: BurstMode,
-    /// Proven inclusive lower displacement relative to `reg`.
-    pub(super) min_d: i64,
-    /// Proven exclusive upper displacement relative to `reg`.
-    pub(super) max_end: i64,
-    /// Guest address SSA values emitted by `address()` for `[reg + disp]` -> `disp`.
-    pub(super) addrs: BTreeMap<String, i64>,
-}
-
-/// One same-base access burst detected in a basic block's instruction list.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct WindowBurst {
-    /// First instruction index in `body` (inclusive).
-    pub(super) start: usize,
-    /// Last instruction index in `body` (inclusive).
-    pub(super) end: usize,
-    /// 64-bit GPR index of the shared base register.
+/// One base GPR tracked inside a coalesced window burst (`[reg + min_d .. reg + max_end)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct BurstBase {
+    /// 64-bit GPR index of the base register.
     pub(super) reg: usize,
     /// Minimum displacement relative to `reg`.
     pub(super) min_d: i64,
@@ -136,6 +106,54 @@ pub(super) struct WindowBurst {
     pub(super) max_end: i64,
     /// Whether any instruction in the burst writes through `reg`.
     pub(super) has_write: bool,
+}
+
+/// Active per-base state while lowering a coalesced window burst.
+#[derive(Clone)]
+pub(super) struct BurstOverrideBase {
+    /// 64-bit GPR index of the base register.
+    pub(super) reg: usize,
+    /// Proven inclusive lower displacement relative to `reg`.
+    pub(super) min_d: i64,
+    /// Proven exclusive upper displacement relative to `reg`.
+    pub(super) max_end: i64,
+    /// Whether this base is checked and eligible for coalesced burst stores / dirty marking.
+    pub(super) has_write: bool,
+    /// Host pointer base (`base_val + delta`) in fast mode; `None` in slow fallback mode.
+    pub(super) base_host: Option<String>,
+    /// Whether the fast path actually lowered at least one store through this base.
+    pub(super) saw_store: bool,
+    /// Guest address SSA values emitted by `address()` for `[reg + disp]` -> `disp`.
+    pub(super) addrs: BTreeMap<String, i64>,
+}
+
+/// Active override for a coalesced 1- or 2-base window burst (`[base_k + d_i]`).
+#[derive(Clone)]
+pub(super) struct BurstOverride {
+    /// True in the 99.95% hot path (flat or single 64 KiB slot per base), false in the cold
+    /// boundary-crossing fallback (`__playgta6_guest_read` / `__playgta6_slow_storeN`).
+    pub(super) fast: bool,
+    /// Active base descriptors (1 or 2 entries).
+    pub(super) bases: Vec<BurstOverrideBase>,
+}
+
+/// One coalesced 1- or 2-base access burst detected in a basic block's instruction list.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WindowBurst {
+    /// First instruction index in `body` (inclusive).
+    pub(super) start: usize,
+    /// Last instruction index in `body` (inclusive).
+    pub(super) end: usize,
+    /// Active base descriptors (`bases[..base_count as usize]`).
+    pub(super) bases: [BurstBase; 2],
+    /// Number of active base descriptors (`1` or `2`).
+    pub(super) base_count: u8,
+}
+
+impl WindowBurst {
+    pub(super) fn active_bases(&self) -> &[BurstBase] {
+        &self.bases[..usize::from(self.base_count)]
+    }
 }
 
 /// `!prof` of a branch whose first successor is rarely taken.
@@ -509,22 +527,27 @@ impl FunctionLifter<'_> {
     }
 
     fn guest_access(&mut self, addr: &str, bytes: u64, access: Access<'_>) -> Option<String> {
-        if let Some(burst) = &mut self.burst_override
-            && let Some(&disp) = burst.addrs.get(addr)
-            && disp >= burst.min_d
-            && disp
-                .checked_add(bytes as i64)
-                .is_some_and(|end| end <= burst.max_end)
-        {
-            match &mut burst.mode {
-                BurstMode::Fast {
-                    base_host,
-                    saw_store,
-                } => {
-                    let base_host = base_host.clone();
-                    if matches!(access, Access::Store { .. }) {
-                        *saw_store = true;
+        let is_store = matches!(access, Access::Store { .. });
+        if let Some(burst) = &mut self.burst_override {
+            let mut matched = None;
+            for slot in &mut burst.bases {
+                if let Some(&disp) = slot.addrs.get(addr)
+                    && disp >= slot.min_d
+                    && disp
+                        .checked_add(bytes as i64)
+                        .is_some_and(|end| end <= slot.max_end)
+                    && (!is_store || slot.has_write)
+                {
+                    if burst.fast && is_store {
+                        slot.saw_store = true;
                     }
+                    matched = Some((burst.fast, slot.base_host.clone(), disp));
+                    break;
+                }
+            }
+            if let Some((fast, base_host, disp)) = matched {
+                if fast {
+                    let base_host = base_host.expect("fast burst base_host");
                     let host = if disp == 0 {
                         base_host
                     } else {
@@ -533,18 +556,16 @@ impl FunctionLifter<'_> {
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                     return self.access_at(&ptr, &access);
                 }
-                BurstMode::Slow => {
-                    return match access {
-                        Access::Load { .. } => {
-                            let ptr = self.slow_read_ptr(addr, bytes);
-                            self.access_at(&ptr, &access)
-                        }
-                        Access::Store { ty, value } => {
-                            self.slow_store(addr, bytes, ty, value);
-                            None
-                        }
-                    };
-                }
+                return match access {
+                    Access::Load { .. } => {
+                        let ptr = self.slow_read_ptr(addr, bytes);
+                        self.access_at(&ptr, &access)
+                    }
+                    Access::Store { ty, value } => {
+                        self.slow_store(addr, bytes, ty, value);
+                        None
+                    }
+                };
             }
         }
         match self.memory {
@@ -863,8 +884,9 @@ impl FunctionLifter<'_> {
         if bytes > 1 && self.contiguous_runs() {
             self.window_mark(index);
             // The slot of the last byte needs its own mark only when the store crosses into it
-            // (rare). Re-marking the same slot is an extra dirty check/mark that the consumer
-            // cannot tell apart from the first: skip it behind a cold branch.
+            // (rare, ~0.005%). Emit a compact direct atomic release store inside the cold block
+            // instead of another load-check-branch diamond, while keeping the primary slot's R57
+            // load-before-store guard above.
             let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
             let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
             let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
@@ -873,7 +895,13 @@ impl FunctionLifter<'_> {
                 "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
             ));
             self.start_internal_block(&mark_last);
-            self.window_mark_then_br(&last_index, join);
+            self.support.insert(Support::Memory(Decl::WindowDirty));
+            self.support.insert(Support::Atomics);
+            let m2 = self.val(&format!(
+                "getelementptr i8, ptr @{WINDOW_DIRTY_SYMBOL}, i64 {last_index}"
+            ));
+            self.emit(&format!("store atomic i8 1, ptr {m2} release, align 1"));
+            self.emit(&format!("br label %{join}"));
         } else {
             self.window_mark_then_br(index, join);
         }
@@ -987,14 +1015,14 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// R58: lifts a coalesced same-base window burst (`insns = body[burst.start..=burst.end]`)
-    /// under `WindowCheck::Branch` with a single range/page check for the entire span
+    /// R58/R63: lifts a coalesced 1- or 2-base window burst (`insns = body[burst.start..=burst.end]`)
+    /// under `WindowCheck::Branch` with a single range/page check per active base for its span
     /// `[reg + min_d, reg + max_end)`:
-    /// - Fast path (flat outside `[W, W+S)`, or single 64 KiB window slot): one `delta`, direct
-    ///   `base_host + disp` accesses with zero intervening branches/table loads, and at most one
-    ///   dirty mark after all stores.
-    /// - Cold fallback (span straddles `W`, `W+S`, or a 64 KiB slot boundary inside the window):
-    ///   exact per-access lifting.
+    /// - Fast path (each base is flat outside `[W, W+S)`, or inside a single 64 KiB window slot):
+    ///   one `delta` per base, direct `base_host + disp` accesses with zero intervening branches
+    ///   or table loads, and at most one dirty mark per written base after all stores.
+    /// - Cold fallback (either base's span straddles `W`, `W+S`, or a 64 KiB slot boundary inside
+    ///   the window): compact cold runtime helpers (`guest_read` / `slow_storeN`).
     ///
     /// Returns `Ok(true)` if the burst was lifted, or `Ok(false)` (with state rolled back) if any
     /// instruction in the burst is unsupported so the caller can fall back instruction-by-instruction.
@@ -1010,102 +1038,138 @@ impl FunctionLifter<'_> {
         if w.check != WindowCheck::Branch {
             return Ok(false);
         }
-        let Some(span) = burst
-            .max_end
-            .checked_sub(burst.min_d)
-            .and_then(|s| u64::try_from(s).ok())
-        else {
-            return Ok(false);
-        };
-        if span == 0 || span > BURST_MAX_SPAN {
+        if (w.base & (SLOT_BYTES - 1)) != 0 || (w.size & (SLOT_BYTES - 1)) != 0 {
             return Ok(false);
         }
-        let span_m1 = span - 1;
-        if w.base < span_m1
-            || w.size > u64::MAX - span_m1
-            || (w.base & (SLOT_BYTES - 1)) != 0
-            || (w.size & (SLOT_BYTES - 1)) != 0
-        {
-            return Ok(false);
+        // Skip any base register already known to be stack-flat (its accesses are already flat
+        // with zero overhead); if only 1 non-stack-flat base remains, lift as a 1-base burst.
+        let mut active_bases: Vec<BurstBase> = Vec::with_capacity(2);
+        let mut span_m1s: Vec<u64> = Vec::with_capacity(2);
+        for &b in burst.active_bases() {
+            if self.stack_flat().is_some()
+                && self
+                    .known_gpr(b.reg)
+                    .is_some_and(|v| self.stack_values.contains_key(v))
+            {
+                continue;
+            }
+            let Some(span) = b
+                .max_end
+                .checked_sub(b.min_d)
+                .and_then(|s| u64::try_from(s).ok())
+            else {
+                return Ok(false);
+            };
+            if span == 0 || span > BURST_MAX_SPAN {
+                return Ok(false);
+            }
+            let span_m1 = span - 1;
+            if w.base < span_m1 || w.size > u64::MAX - span_m1 {
+                return Ok(false);
+            }
+            active_bases.push(b);
+            span_m1s.push(span_m1);
         }
-        // If `burst.reg` is already known to be stack-flat, individual accesses already skip the
-        // window check with zero overhead.
-        if self.stack_flat().is_some()
-            && self
-                .known_gpr(burst.reg)
-                .is_some_and(|v| self.stack_values.contains_key(v))
-        {
+        if active_bases.is_empty() {
             return Ok(false);
         }
 
         let checkpoint = self.checkpoint();
         let result: R<()> = (|| {
-            let base_val = self.load_gpr(burst.reg)?;
+            let mut base_vals: Vec<String> = Vec::with_capacity(active_bases.len());
+            for &b in &active_bases {
+                base_vals.push(self.load_gpr(b.reg)?);
+            }
             let entry_known = self.known.clone();
-            let lo = if burst.min_d == 0 {
-                base_val.clone()
-            } else {
-                self.val(&format!(
-                    "add i64 {base_val}, {}",
-                    imm(burst.min_d as u64, 64)
-                ))
-            };
+            let entry_ymmh_zeroed = self.ymmh_zeroed;
             self.support.insert(Support::Memory(Decl::WindowTable));
-            let ext_base = w.base - span_m1;
-            let ext_size = w.size + span_m1;
-            let rel_ext = self.val(&format!("sub i64 {lo}, {}", imm(ext_base, 64)));
-            let touches = self.val(&format!("icmp ult i64 {rel_ext}, {}", imm(ext_size, 64)));
-            let pred = self.current_block.clone();
             let flat_base = self.flat_base_val(w.flat);
-            let win = self.new_label("gbw");
-            let wtbl = self.new_label("gbt");
             let fast = self.new_label("gbf");
             let slow = self.new_label("gbs");
             let join = self.new_label("gbj");
-            self.emit(&format!(
-                "br i1 {touches}, label %{win}, label %{fast}, {UNLIKELY}"
-            ));
 
-            // Window check: all bytes lie in one 64 KiB slot inside [W, W + S).
-            self.start_internal_block(&win);
-            let rel = self.val(&format!("sub i64 {lo}, {}", imm(w.base, 64)));
-            let in_win = self.val(&format!("icmp ult i64 {rel}, {}", imm(w.size, 64)));
-            let off = self.val(&format!("and i64 {lo}, {}", SLOT_BYTES - 1));
-            let fits = self.val(&format!("icmp ule i64 {off}, {}", (SLOT_BYTES - 1) - span_m1));
-            let ok = self.val(&format!("and i1 {in_win}, {fits}"));
-            self.emit(&format!(
-                "br i1 {ok}, label %{wtbl}, label %{slow}, {LIKELY}"
-            ));
+            let mut deltas: Vec<String> = Vec::with_capacity(active_bases.len());
+            let mut write_metas: Vec<Option<(String, String)>> =
+                Vec::with_capacity(active_bases.len());
+            for (idx, (&b, &span_m1)) in active_bases.iter().zip(&span_m1s).enumerate() {
+                let base_val = &base_vals[idx];
+                let lo = if b.min_d == 0 {
+                    base_val.clone()
+                } else {
+                    self.val(&format!(
+                        "add i64 {base_val}, {}",
+                        imm(b.min_d as u64, 64)
+                    ))
+                };
+                let ext_base = w.base - span_m1;
+                let ext_size = w.size + span_m1;
+                let rel_ext = self.val(&format!("sub i64 {lo}, {}", imm(ext_base, 64)));
+                let touches = self.val(&format!("icmp ult i64 {rel_ext}, {}", imm(ext_size, 64)));
+                let pred = self.current_block.clone();
+                let win = self.new_label("gbw");
+                let wtbl = self.new_label("gbt");
+                let next = if idx + 1 == active_bases.len() {
+                    fast.clone()
+                } else {
+                    self.new_label("gbc")
+                };
+                self.emit(&format!(
+                    "br i1 {touches}, label %{win}, label %{next}, {UNLIKELY}"
+                ));
 
-            self.start_internal_block(&wtbl);
-            let slot = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-            let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
-            self.emit(&format!("br label %{fast}"));
+                // Window check: all bytes of base `idx` lie in one 64 KiB slot inside [W, W + S).
+                self.start_internal_block(&win);
+                let rel = self.val(&format!("sub i64 {lo}, {}", imm(w.base, 64)));
+                let in_win = self.val(&format!("icmp ult i64 {rel}, {}", imm(w.size, 64)));
+                let off = self.val(&format!("and i64 {lo}, {}", SLOT_BYTES - 1));
+                let fits =
+                    self.val(&format!("icmp ule i64 {off}, {}", (SLOT_BYTES - 1) - span_m1));
+                let ok = self.val(&format!("and i1 {in_win}, {fits}"));
+                self.emit(&format!(
+                    "br i1 {ok}, label %{wtbl}, label %{slow}, {LIKELY}"
+                ));
 
-            // Fast path: flat outside window OR single window slot.
-            self.start_internal_block(&fast);
+                self.start_internal_block(&wtbl);
+                let slot = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+                let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
+                self.emit(&format!("br label %{next}"));
+
+                self.start_internal_block(&next);
+                let delta = self.val(&format!(
+                    "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{wtbl} ]"
+                ));
+                let write_meta = if b.has_write {
+                    let iw = self.val(&format!("phi i1 [ false, %{pred} ], [ true, %{wtbl} ]"));
+                    let ws = self.val(&format!("phi i64 [ 0, %{pred} ], [ {slot}, %{wtbl} ]"));
+                    Some((iw, ws))
+                } else {
+                    None
+                };
+                deltas.push(delta);
+                write_metas.push(write_meta);
+            }
+
+            // Fast path (already positioned at `%fast`): flat outside window OR single window slot
+            // for every active base.
             self.known = entry_known.clone();
+            self.ymmh_zeroed = entry_ymmh_zeroed;
             self.clear_window_cache();
-            let delta = self.val(&format!(
-                "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{wtbl} ]"
-            ));
-            let (is_win, win_slot) = if burst.has_write {
-                let iw = self.val(&format!("phi i1 [ false, %{pred} ], [ true, %{wtbl} ]"));
-                let ws = self.val(&format!("phi i64 [ 0, %{pred} ], [ {slot}, %{wtbl} ]"));
-                (Some(iw), Some(ws))
-            } else {
-                (None, None)
-            };
-            let base_host = self.val(&format!("add i64 {base_val}, {delta}"));
-            self.burst_override = Some(BurstOverride {
-                reg: burst.reg,
-                mode: BurstMode::Fast {
-                    base_host,
+            let mut fast_override_bases = Vec::with_capacity(active_bases.len());
+            for (idx, &b) in active_bases.iter().enumerate() {
+                let base_host = self.val(&format!("add i64 {}, {}", base_vals[idx], deltas[idx]));
+                fast_override_bases.push(BurstOverrideBase {
+                    reg: b.reg,
+                    min_d: b.min_d,
+                    max_end: b.max_end,
+                    has_write: b.has_write,
+                    base_host: Some(base_host),
                     saw_store: false,
-                },
-                min_d: burst.min_d,
-                max_end: burst.max_end,
-                addrs: BTreeMap::new(),
+                    addrs: BTreeMap::new(),
+                });
+            }
+            self.burst_override = Some(BurstOverride {
+                fast: true,
+                bases: fast_override_bases,
             });
             for (k, ins) in insns.iter().enumerate() {
                 self.ea = None;
@@ -1115,35 +1179,62 @@ impl FunctionLifter<'_> {
                 r?;
             }
             let fast_known = self.known.clone();
-            let saw_store = matches!(
-                self.burst_override.take().map(|b| b.mode),
-                Some(BurstMode::Fast { saw_store: true, .. })
-            );
-            if saw_store
-                && let (Some(iw), Some(ws)) = (is_win, win_slot)
-            {
-                let mark = self.new_label("gbm");
-                self.emit(&format!(
-                    "br i1 {iw}, label %{mark}, label %{join}, {UNLIKELY}"
-                ));
-                self.start_internal_block(&mark);
-                self.window_mark_then_br(&ws, &join);
-            } else {
+            let fast_ymmh_zeroed = self.ymmh_zeroed;
+            let done_fast = self.burst_override.take();
+            let mut marks: Vec<(String, String)> = Vec::new();
+            if let Some(done) = done_fast {
+                for (slot, meta) in done.bases.iter().zip(write_metas) {
+                    if slot.saw_store
+                        && let Some((iw, ws)) = meta
+                    {
+                        marks.push((iw, ws));
+                    }
+                }
+            }
+            if marks.is_empty() {
                 self.emit(&format!("br label %{join}"));
+            } else {
+                for (idx, (iw, ws)) in marks.iter().enumerate() {
+                    let mark = self.new_label("gbm");
+                    let next = if idx + 1 == marks.len() {
+                        join.clone()
+                    } else {
+                        self.new_label("gbn")
+                    };
+                    self.emit(&format!(
+                        "br i1 {iw}, label %{mark}, label %{next}, {UNLIKELY}"
+                    ));
+                    self.start_internal_block(&mark);
+                    self.window_mark_then_br(ws, &next);
+                    if idx + 1 < marks.len() {
+                        self.start_internal_block(&next);
+                    }
+                }
             }
 
-            // Cold fallback: span crosses W, W+S, or a 64 KiB window slot boundary. Route the
-            // burst's `[reg + disp]` accesses through compact cold runtime helpers (`guest_read` /
-            // `slow_storeN`) so the fallback adds minimal IR and handles arbitrary straddles.
+            // Cold fallback: either base's span crosses W, W+S, or a 64 KiB window slot boundary.
+            // Route both bases' `[reg + disp]` accesses through compact cold runtime helpers
+            // (`guest_read` / `slow_storeN`) so the fallback adds minimal IR and handles arbitrary
+            // straddles.
             self.start_internal_block(&slow);
             self.known = entry_known.clone();
+            self.ymmh_zeroed = entry_ymmh_zeroed;
             self.clear_window_cache();
+            let slow_override_bases = active_bases
+                .iter()
+                .map(|&b| BurstOverrideBase {
+                    reg: b.reg,
+                    min_d: b.min_d,
+                    max_end: b.max_end,
+                    has_write: b.has_write,
+                    base_host: None,
+                    saw_store: false,
+                    addrs: BTreeMap::new(),
+                })
+                .collect();
             self.burst_override = Some(BurstOverride {
-                reg: burst.reg,
-                mode: BurstMode::Slow,
-                min_d: burst.min_d,
-                max_end: burst.max_end,
-                addrs: BTreeMap::new(),
+                fast: false,
+                bases: slow_override_bases,
             });
             for (k, ins) in insns.iter().enumerate() {
                 self.ea = None;
@@ -1153,14 +1244,16 @@ impl FunctionLifter<'_> {
                 r?;
             }
             let slow_known = self.known.clone();
+            let slow_ymmh_zeroed = self.ymmh_zeroed;
             self.burst_override = None;
             self.emit(&format!("br label %{join}"));
 
             // Join block: preserve `entry_known` for registers/flags untouched by both arms (keeps
-            // stack provenance like frame pointers intact across bursts), and clear modified ones
-            // so `mem2reg` merges them via allocas.
+            // stack provenance like frame pointers intact across bursts), intersect `ymmh_zeroed`,
+            // and clear modified registers so `mem2reg` merges them via allocas.
             self.start_block(&join);
             self.restore_unchanged_known(&entry_known, &fast_known, &slow_known);
+            self.ymmh_zeroed = fast_ymmh_zeroed & slow_ymmh_zeroed;
             Ok(())
         })();
 
