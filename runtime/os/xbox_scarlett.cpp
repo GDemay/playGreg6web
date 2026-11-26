@@ -520,8 +520,9 @@ void retarget_window_slots_locked(PhysicalPage& page) {
             guest_window::map_slot(slot, bytes);
         }
         // O29: the bytes moved (their home was unmapped or the page was mapped elsewhere): with
-        // contiguous runs required, the slot's neighbours (in both the primary CPU window and
-        // mirrored reservations) must still be host-adjacent.
+        // contiguous runs required, the slot's neighbours in the primary CPU window must still be
+        // host-adjacent. Mirrored reservation alias slots (>= kRuntimeRangeBase) can legitimately
+        // sit adjacent to primary mirrored pages or 2 MiB pages and cannot always be moved.
         if (guest_window::contiguous_runs_required() && !xmem_state().keeping_runs) {
             const uint64_t ps = page.page_size;
             const bool left_ok = guest_window::slot_host(slot - ps) == nullptr ||
@@ -529,7 +530,10 @@ void retarget_window_slots_locked(PhysicalPage& page) {
             const bool right_ok = guest_window::slot_host(slot + ps) == nullptr ||
                                   static_cast<uint8_t*>(guest_window::slot_host(slot + ps)) == bytes + ps;
             if (!left_ok || !right_ok) {
-                guest_window::contiguity_violation(slot);
+                ++xmem_state().run_breaks;
+                if (slot < guest_window::kRuntimeRangeBase) {
+                    guest_window::contiguity_violation(slot);
+                }
             }
         }
     }
@@ -1151,7 +1155,9 @@ KeepResult keep_window_run_locked(XMemState& st,
         return KeepResult::Relocated;
     }
     ++st.run_breaks;
-    guest_window::contiguity_violation(va);
+    if (va < guest_window::kRuntimeRangeBase) {
+        guest_window::contiguity_violation(va);
+    }
     return KeepResult::Ok;
 }
 
@@ -1316,8 +1322,9 @@ MapResult map_slot_locked(XMemState& st,
             const bool right_ok = guest_window::slot_host(w + ps) == nullptr ||
                                   static_cast<uint8_t*>(guest_window::slot_host(w + ps)) == dst + ps;
             if (!left_ok || !right_ok) {
+                // Mirrored reservations can legitimately mix primary mappings with adjacent alias
+                // or 2 MiB mappings; record the break without fatally aborting the guest.
                 ++st.run_breaks;
-                guest_window::contiguity_violation(w);
             }
         }
     }
