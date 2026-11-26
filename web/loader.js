@@ -6117,6 +6117,668 @@ function scheduleAudioRingRetry(moduleOrOptions, targetAudioWorker, maybeOptions
   return controller;
 }
 
+// W377 (#1028): Headed AudioWorklet SharedArrayBuffer & AudioContext state bridge between
+// the main thread (`web/app_bootstrap.js` / `web/audio/audio_engine.js`) and `loader.js`'s
+// child `audioWorker` (`web/workers/audio_worker.js`).
+const AUDIO_CONTEXT_STATE_MAP = Object.freeze({
+  active: 'active',
+  running: 'running',
+  worklet: 'worklet',
+  live: 'live',
+  playing: 'playing',
+  suspended: 'suspended',
+  paused: 'suspended',
+  interrupted: 'interrupted',
+  closed: 'closed',
+  stopped: 'closed',
+  'headless-drain': 'headless-drain',
+  headless: 'headless',
+  unavailable: 'unavailable',
+  unsupported: 'unsupported',
+  error: 'error',
+});
+
+function normalizeAudioContextStateValue(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+  const key = value.trim().toLowerCase();
+  if (!key) {
+    return null;
+  }
+  return Object.prototype.hasOwnProperty.call(AUDIO_CONTEXT_STATE_MAP, key)
+    ? AUDIO_CONTEXT_STATE_MAP[key]
+    : null;
+}
+
+function sanitizeAudioBridgeSampleRate(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    return null;
+  }
+  return Math.floor(value);
+}
+
+function sanitizeAudioBridgeChannels(value) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1 || value > 8) {
+    return null;
+  }
+  return value;
+}
+
+function extractAudioRingSab(msg, options = {}) {
+  if (!msg || typeof msg !== 'object') {
+    return null;
+  }
+  const allowGenericSab = Boolean(options && options.allowGenericSab === true);
+  if (isSharedArrayBuffer(msg.ringSab)) {
+    return msg.ringSab;
+  }
+  if (isSharedArrayBuffer(msg.audioSab)) {
+    return msg.audioSab;
+  }
+  if (allowGenericSab && isSharedArrayBuffer(msg.sab)) {
+    return msg.sab;
+  }
+  return null;
+}
+
+function isGpuRingControlMessage(msg) {
+  return Boolean(
+    msg &&
+      typeof msg === 'object' &&
+      (msg.attachRing ||
+        msg.drainRing ||
+        msg.type === 'attach-ring' ||
+        msg.type === 'drain-ring'),
+  );
+}
+
+function isAudioContextStateMessage(msg) {
+  if (!msg || typeof msg !== 'object') {
+    return false;
+  }
+  return (
+    msg.setOutputState === true ||
+    msg.type === 'audio-context-state' ||
+    msg.type === 'output-state'
+  );
+}
+
+function isAudioRingSabMessage(msg) {
+  if (!msg || typeof msg !== 'object' || isGpuRingControlMessage(msg)) {
+    return false;
+  }
+  if (
+    msg.attachRingSab === true ||
+    msg.type === 'attach-ring-sab' ||
+    msg.type === 'attachRingSab' ||
+    msg.type === 'attach-sab' ||
+    msg.type === 'audio-sab' ||
+    msg.type === 'set-audio-sab'
+  ) {
+    return true;
+  }
+  return isSharedArrayBuffer(msg.audioSab) || isSharedArrayBuffer(msg.ringSab);
+}
+
+function createAudioWorkerInitPayload(msg = {}, pendingState = null) {
+  const safeMsg = msg && typeof msg === 'object' ? msg : {};
+  const pending = pendingState && typeof pendingState === 'object' ? pendingState : null;
+  const pendingAttach =
+    pending && pending.pendingRingAttach && typeof pending.pendingRingAttach === 'object'
+      ? pending.pendingRingAttach
+      : null;
+  const pendingCtx =
+    pending && pending.pendingContextState && typeof pending.pendingContextState === 'object'
+      ? pending.pendingContextState
+      : null;
+
+  const payload = { init: true };
+
+  const bootSab = extractAudioRingSab(safeMsg, { allowGenericSab: false });
+  const pendingSab =
+    (pendingAttach && isSharedArrayBuffer(pendingAttach.ringSab) ? pendingAttach.ringSab : null) ||
+    (pendingCtx && isSharedArrayBuffer(pendingCtx.ringSab) ? pendingCtx.ringSab : null);
+  const ringSab = bootSab || pendingSab;
+  if (ringSab) {
+    payload.ringSab = ringSab;
+  }
+
+  const bootSampleRate = sanitizeAudioBridgeSampleRate(
+    safeMsg.audioSampleRate !== undefined ? safeMsg.audioSampleRate : safeMsg.sampleRate,
+  );
+  const pendingSampleRate = sanitizeAudioBridgeSampleRate(
+    pendingCtx && pendingCtx.sampleRate !== undefined
+      ? pendingCtx.sampleRate
+      : pendingAttach && pendingAttach.sampleRate !== undefined
+        ? pendingAttach.sampleRate
+        : null,
+  );
+  const sampleRate = bootSampleRate !== null ? bootSampleRate : pendingSampleRate;
+  if (sampleRate !== null) {
+    payload.sampleRate = sampleRate;
+  }
+
+  const bootChannels = sanitizeAudioBridgeChannels(
+    safeMsg.audioChannels !== undefined ? safeMsg.audioChannels : safeMsg.channels,
+  );
+  const pendingChannels = sanitizeAudioBridgeChannels(
+    pendingCtx && pendingCtx.channels !== undefined
+      ? pendingCtx.channels
+      : pendingAttach && pendingAttach.channels !== undefined
+        ? pendingAttach.channels
+        : null,
+  );
+  const channels = bootChannels !== null ? bootChannels : pendingChannels;
+  if (channels !== null) {
+    payload.channels = channels;
+  }
+
+  const bootState = normalizeAudioContextStateValue(
+    safeMsg.audioOutputState !== undefined
+      ? safeMsg.audioOutputState
+      : safeMsg.audioContextState !== undefined
+        ? safeMsg.audioContextState
+        : safeMsg.outputState,
+  );
+  const pendingCtxState =
+    pendingCtx && typeof pendingCtx.outputState === 'string'
+      ? normalizeAudioContextStateValue(pendingCtx.outputState)
+      : null;
+  const pendingAttachState =
+    pendingAttach && typeof pendingAttach.outputState === 'string'
+      ? normalizeAudioContextStateValue(pendingAttach.outputState)
+      : null;
+  // Do not let a stale pre-boot `'closed'` state suppress a brand-new boot `audioSab`.
+  const usablePendingState =
+    pendingCtxState === 'closed' && bootSab !== null
+      ? null
+      : pendingCtxState || pendingAttachState;
+  const outputState = bootState || usablePendingState;
+  if (outputState !== null) {
+    payload.outputState = outputState;
+  }
+
+  if (typeof safeMsg.headless === 'boolean') {
+    payload.headless = safeMsg.headless;
+  } else if (pendingAttach && typeof pendingAttach.headless === 'boolean') {
+    payload.headless = pendingAttach.headless;
+  }
+
+  return payload;
+}
+
+/**
+ * Coordinates headed AudioWorklet SAB (`ringSab` / `attach-ring-sab`) and main-thread
+ * `audio-context-state` forwarding from `web/loader.js` to its child `audioWorker`,
+ * handling pre-boot/late-arrival ordering and teardown cleanup without steady-state
+ * per-frame allocations.
+ */
+function createAudioWorkerBridge(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const onResetWorker =
+    typeof safeOpts.onResetWorker === 'function' ? safeOpts.onResetWorker : null;
+
+  let worker = null;
+  let workerReady = false;
+  let initPosted = false;
+  let destroyed = false;
+  let attachedRingSab = null;
+  let pendingRingAttach = null;
+  let pendingContextState = null;
+  let lastOutputState = null;
+  let lastSampleRate = null;
+
+  function canPostNow() {
+    return Boolean(!destroyed && worker && typeof worker.postMessage === 'function' && initPosted);
+  }
+
+  function safePost(targetWorker, payload) {
+    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
+      return false;
+    }
+    try {
+      targetWorker.postMessage(payload);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function buildAttachRingSabPayload(msg) {
+    const explicitAttach = Boolean(
+      msg.attachRingSab === true ||
+        msg.type === 'attach-ring-sab' ||
+        msg.type === 'attachRingSab' ||
+        msg.type === 'attach-sab' ||
+        msg.type === 'audio-sab' ||
+        msg.type === 'set-audio-sab',
+    );
+    const ringSab = extractAudioRingSab(msg, { allowGenericSab: explicitAttach });
+    if (!ringSab) {
+      return null;
+    }
+    const payload = {
+      type: 'attach-ring-sab',
+      attachRingSab: true,
+      ringSab,
+    };
+    const sampleRate = sanitizeAudioBridgeSampleRate(msg.sampleRate);
+    if (sampleRate !== null) {
+      payload.sampleRate = sampleRate;
+    }
+    const channels = sanitizeAudioBridgeChannels(msg.channels);
+    if (channels !== null) {
+      payload.channels = channels;
+    }
+    const state = normalizeAudioContextStateValue(
+      msg.outputState !== undefined
+        ? msg.outputState
+        : msg.state !== undefined
+          ? msg.state
+          : msg.audioContextState,
+    );
+    if (state !== null) {
+      payload.outputState = state;
+    }
+    if (typeof msg.headless === 'boolean') {
+      payload.headless = msg.headless;
+    }
+    if (msg.id !== undefined) {
+      payload.id = msg.id;
+    }
+    return payload;
+  }
+
+  function buildAudioContextStatePayload(msg) {
+    const rawState =
+      msg.outputState !== undefined
+        ? msg.outputState
+        : msg.state !== undefined
+          ? msg.state
+          : msg.audioContextState;
+    const outputState = normalizeAudioContextStateValue(rawState);
+    if (outputState === null) {
+      return null;
+    }
+    const payload = {
+      type: 'audio-context-state',
+      setOutputState: true,
+      outputState,
+    };
+    const sampleRate = sanitizeAudioBridgeSampleRate(msg.sampleRate);
+    if (sampleRate !== null) {
+      payload.sampleRate = sampleRate;
+    }
+    const channels = sanitizeAudioBridgeChannels(msg.channels);
+    if (channels !== null) {
+      payload.channels = channels;
+    }
+    if (outputState !== 'closed') {
+      const ringSab = extractAudioRingSab(msg, { allowGenericSab: false });
+      if (ringSab) {
+        payload.ringSab = ringSab;
+      }
+    }
+    if (typeof msg.unlockedOnGesture === 'boolean') {
+      payload.unlockedOnGesture = msg.unlockedOnGesture;
+    }
+    if (typeof msg.interrupted === 'boolean') {
+      payload.interrupted = msg.interrupted;
+    } else if (outputState === 'interrupted') {
+      payload.interrupted = true;
+    }
+    if (typeof msg.recoveredFromInterruption === 'boolean') {
+      payload.recoveredFromInterruption = msg.recoveredFromInterruption;
+    }
+    if (msg.id !== undefined) {
+      payload.id = msg.id;
+    }
+    return payload;
+  }
+
+  function applyAttachTracking(payload) {
+    attachedRingSab = payload.ringSab;
+    if (payload.sampleRate !== undefined) {
+      lastSampleRate = payload.sampleRate;
+    }
+    if (payload.outputState !== undefined) {
+      lastOutputState = payload.outputState;
+    } else if (payload.headless === true) {
+      lastOutputState = 'headless-drain';
+    } else if (!lastOutputState || lastOutputState === 'headless-drain') {
+      lastOutputState = 'active';
+    }
+  }
+
+  function applyContextStateTracking(payload) {
+    lastOutputState = payload.outputState;
+    if (payload.sampleRate !== undefined) {
+      lastSampleRate = payload.sampleRate;
+    }
+    if (payload.outputState === 'closed') {
+      attachedRingSab = null;
+      pendingRingAttach = null;
+    } else if (payload.ringSab) {
+      attachedRingSab = payload.ringSab;
+    }
+  }
+
+  function flushPendingToActiveWorker() {
+    if (!canPostNow()) {
+      return { flushedRingSab: false, flushedContextState: false };
+    }
+    let flushedRingSab = false;
+    let flushedContextState = false;
+    const queuedAttach = pendingRingAttach;
+    const queuedCtx = pendingContextState;
+    pendingRingAttach = null;
+    pendingContextState = null;
+
+    if (queuedAttach) {
+      const needsSend =
+        queuedAttach.ringSab !== attachedRingSab ||
+        queuedAttach.id !== undefined ||
+        queuedAttach.outputState !== undefined ||
+        queuedAttach.sampleRate !== undefined ||
+        queuedAttach.channels !== undefined ||
+        queuedAttach.headless !== undefined;
+      if (needsSend) {
+        if (safePost(worker, queuedAttach)) {
+          applyAttachTracking(queuedAttach);
+          flushedRingSab = true;
+        } else {
+          pendingRingAttach = queuedAttach;
+        }
+      }
+    }
+
+    if (queuedCtx) {
+      if (safePost(worker, queuedCtx)) {
+        applyContextStateTracking(queuedCtx);
+        flushedContextState = true;
+      } else {
+        pendingContextState = queuedCtx;
+      }
+    }
+
+    return { flushedRingSab, flushedContextState };
+  }
+
+  function handleAttachRingSab(msg) {
+    if (destroyed) {
+      return { forwarded: false, queued: false, reason: 'destroyed', payload: null };
+    }
+    if (!msg || typeof msg !== 'object') {
+      return { forwarded: false, queued: false, reason: 'invalid-message', payload: null };
+    }
+    const payload = buildAttachRingSabPayload(msg);
+    if (!payload) {
+      return { forwarded: false, queued: false, reason: 'invalid-ring-sab', payload: null };
+    }
+
+    if (!canPostNow()) {
+      pendingRingAttach = payload;
+      return { forwarded: false, queued: true, reason: 'worker-not-ready', payload };
+    }
+
+    const force = msg.force === true;
+    const isDuplicate =
+      !force &&
+      payload.ringSab === attachedRingSab &&
+      payload.id === undefined &&
+      payload.outputState === undefined &&
+      payload.sampleRate === undefined &&
+      payload.channels === undefined &&
+      payload.headless === undefined;
+    if (isDuplicate) {
+      return { forwarded: false, queued: false, deduplicated: true, payload };
+    }
+
+    if (!safePost(worker, payload)) {
+      pendingRingAttach = payload;
+      return { forwarded: false, queued: true, reason: 'post-message-error', payload };
+    }
+    pendingRingAttach = null;
+    applyAttachTracking(payload);
+    return { forwarded: true, queued: false, payload };
+  }
+
+  function handleAudioContextState(msg) {
+    if (destroyed) {
+      return { forwarded: false, queued: false, reason: 'destroyed', payload: null };
+    }
+    if (!msg || typeof msg !== 'object') {
+      return { forwarded: false, queued: false, reason: 'invalid-message', payload: null };
+    }
+    const payload = buildAudioContextStatePayload(msg);
+    if (!payload) {
+      const fallbackSab = extractAudioRingSab(msg, { allowGenericSab: false });
+      if (fallbackSab) {
+        return handleAttachRingSab(msg);
+      }
+      return { forwarded: false, queued: false, reason: 'invalid-state', payload: null };
+    }
+
+    if (!canPostNow()) {
+      pendingContextState = payload;
+      if (payload.outputState === 'closed') {
+        pendingRingAttach = null;
+      } else if (payload.ringSab) {
+        pendingRingAttach = {
+          type: 'attach-ring-sab',
+          attachRingSab: true,
+          ringSab: payload.ringSab,
+        };
+      }
+      lastOutputState = payload.outputState;
+      if (payload.sampleRate !== undefined) {
+        lastSampleRate = payload.sampleRate;
+      }
+      return { forwarded: false, queued: true, reason: 'worker-not-ready', payload };
+    }
+
+    if (!safePost(worker, payload)) {
+      pendingContextState = payload;
+      return { forwarded: false, queued: true, reason: 'post-message-error', payload };
+    }
+    pendingContextState = null;
+    applyContextStateTracking(payload);
+    return { forwarded: true, queued: false, payload };
+  }
+
+  function initWorker(nextWorker, bootMsg = {}) {
+    if (!nextWorker || typeof nextWorker.postMessage !== 'function') {
+      return null;
+    }
+    destroyed = false;
+    worker = nextWorker;
+    workerReady = false;
+    initPosted = false;
+    attachedRingSab = null;
+
+    const queuedAttach = pendingRingAttach;
+    const queuedCtx = pendingContextState;
+    const safeBootMsg = bootMsg && typeof bootMsg === 'object' ? bootMsg : {};
+    const bootSab = extractAudioRingSab(safeBootMsg, { allowGenericSab: false });
+    const bootExplicitState = normalizeAudioContextStateValue(
+      safeBootMsg.audioOutputState !== undefined
+        ? safeBootMsg.audioOutputState
+        : safeBootMsg.audioContextState !== undefined
+          ? safeBootMsg.audioContextState
+          : safeBootMsg.outputState,
+    );
+
+    const initPayload = createAudioWorkerInitPayload(safeBootMsg, {
+      pendingRingAttach: queuedAttach,
+      pendingContextState: queuedCtx,
+    });
+
+    // Clear pending slots and commit init state BEFORE calling postMessage so a
+    // synchronous `onmessage({ data: { ready: true } })` re-entry cannot double-flush.
+    initPosted = true;
+    pendingRingAttach = null;
+    pendingContextState = null;
+
+    if (initPayload.ringSab) {
+      attachedRingSab = initPayload.ringSab;
+    }
+    if (initPayload.outputState !== undefined) {
+      lastOutputState = initPayload.outputState;
+    } else if (initPayload.headless === true) {
+      lastOutputState = 'headless-drain';
+    } else if (initPayload.ringSab) {
+      lastOutputState = 'active';
+    } else {
+      lastOutputState = null;
+    }
+    if (initPayload.sampleRate !== undefined) {
+      lastSampleRate = initPayload.sampleRate;
+    }
+
+    const postedInit = safePost(nextWorker, initPayload);
+    if (!postedInit) {
+      initPosted = false;
+      attachedRingSab = null;
+      pendingRingAttach = queuedAttach;
+      pendingContextState = queuedCtx;
+      return null;
+    }
+
+    if (queuedAttach && queuedAttach.id !== undefined && queuedAttach.ringSab === initPayload.ringSab) {
+      safePost(nextWorker, queuedAttach);
+    }
+
+    if (
+      queuedCtx &&
+      bootExplicitState === null &&
+      !(queuedCtx.outputState === 'closed' && bootSab !== null)
+    ) {
+      const ctxToPost =
+        bootSab !== null && queuedCtx.ringSab && queuedCtx.ringSab !== bootSab
+          ? Object.assign({}, queuedCtx, { ringSab: bootSab })
+          : queuedCtx;
+      if (safePost(nextWorker, ctxToPost)) {
+        applyContextStateTracking(ctxToPost);
+      }
+    }
+
+    return initPayload;
+  }
+
+  function setWorker(nextWorker, readyOverride) {
+    if (destroyed) {
+      return false;
+    }
+    const prevWorker = worker;
+    if (prevWorker && prevWorker !== nextWorker && onResetWorker) {
+      try {
+        onResetWorker(prevWorker);
+      } catch {
+        // Ignore worker reset callback errors.
+      }
+    }
+    if (!nextWorker || typeof nextWorker.postMessage !== 'function') {
+      worker = null;
+      workerReady = false;
+      initPosted = false;
+      attachedRingSab = null;
+      return false;
+    }
+    worker = nextWorker;
+    attachedRingSab = null;
+    const isReady = readyOverride !== undefined ? Boolean(readyOverride) : true;
+    workerReady = isReady;
+    initPosted = isReady;
+    if (isReady) {
+      flushPendingToActiveWorker();
+    }
+    return true;
+  }
+
+  function onWorkerReady(readyWorker) {
+    if (destroyed) {
+      return { flushedRingSab: false, flushedContextState: false };
+    }
+    if (readyWorker && typeof readyWorker.postMessage === 'function') {
+      if (!worker) {
+        worker = readyWorker;
+      } else if (worker !== readyWorker) {
+        return { flushedRingSab: false, flushedContextState: false };
+      }
+    }
+    if (!worker) {
+      return { flushedRingSab: false, flushedContextState: false };
+    }
+    workerReady = true;
+    initPosted = true;
+    return flushPendingToActiveWorker();
+  }
+
+  function clearPending() {
+    pendingRingAttach = null;
+    pendingContextState = null;
+  }
+
+  function reset() {
+    const prevWorker = worker;
+    worker = null;
+    workerReady = false;
+    initPosted = false;
+    destroyed = false;
+    attachedRingSab = null;
+    pendingRingAttach = null;
+    pendingContextState = null;
+    lastOutputState = null;
+    lastSampleRate = null;
+    if (prevWorker && onResetWorker) {
+      try {
+        onResetWorker(prevWorker);
+      } catch {
+        // Ignore worker reset callback errors.
+      }
+    }
+  }
+
+  function destroy(destroyOpts = {}) {
+    const opts = destroyOpts && typeof destroyOpts === 'object' ? destroyOpts : {};
+    const prevWorker = worker;
+    if (opts.sendStop === true && prevWorker && typeof prevWorker.postMessage === 'function') {
+      safePost(prevWorker, { type: 'stop', stop: true });
+    }
+    reset();
+    destroyed = true;
+  }
+
+  function getState() {
+    return {
+      hasWorker: worker !== null,
+      workerReady,
+      initPosted,
+      ringSabAttached: attachedRingSab !== null,
+      outputState: lastOutputState,
+      sampleRate: lastSampleRate,
+      hasPendingRingSab: pendingRingAttach !== null,
+      hasPendingContextState: pendingContextState !== null,
+      destroyed,
+    };
+  }
+
+  return {
+    initWorker,
+    setWorker,
+    onWorkerReady,
+    handleAttachRingSab,
+    handleAudioContextState,
+    flushPending: flushPendingToActiveWorker,
+    clearPending,
+    reset,
+    destroy,
+    dispose: destroy,
+    getState,
+  };
+}
+
 function resolveInputStatePointerGetter(mod, explicitGetter) {
   if (typeof explicitGetter === 'function') {
     return explicitGetter;
@@ -8993,12 +9655,58 @@ const coordinatorPthreadPool = createPthreadPoolCoordinator({
   onPthreadTxMessage: handlePthreadTxMessage,
 });
 
+const coordinatorAudioBridge = createAudioWorkerBridge({
+  onResetWorker: (prevWorker) => {
+    resetAttachedRuntimeAudioRing(prevWorker);
+  },
+});
+
+function teardownCoordinatorAudioWorker(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const prevAudioWorker = audioWorker;
+  audioWorker = null;
+  audioWorkerReady = false;
+  if (prevAudioWorker) {
+    try {
+      prevAudioWorker.onmessage = null;
+    } catch {
+      // Ignore non-writable onmessage on mock workers.
+    }
+    try {
+      prevAudioWorker.onerror = null;
+    } catch {
+      // Ignore non-writable onerror on mock workers.
+    }
+    resetAttachedRuntimeAudioRing(prevAudioWorker);
+    if (safeOpts.sendStop !== false && typeof prevAudioWorker.postMessage === 'function') {
+      try {
+        prevAudioWorker.postMessage({ type: 'stop', stop: true });
+      } catch {
+        // Ignore stop postMessage errors during teardown.
+      }
+    }
+    if (safeOpts.terminate === true && typeof prevAudioWorker.terminate === 'function') {
+      try {
+        prevAudioWorker.terminate();
+      } catch {
+        // Ignore terminate errors during teardown.
+      }
+    }
+  }
+  if (safeOpts.destroyBridge === true) {
+    coordinatorAudioBridge.destroy({ sendStop: false });
+  } else {
+    coordinatorAudioBridge.reset();
+  }
+}
+
 function getPthreadTelemetry() {
   return coordinatorPthreadPool.getTelemetry();
 }
 
 function getLoaderStatus() {
   const pthread = coordinatorPthreadPool.getTelemetry();
+  const audioBridgeState = coordinatorAudioBridge.getState();
   const sideModules =
     typeof activeSideModuleProgressGetter === 'function'
       ? activeSideModuleProgressGetter()
@@ -9056,6 +9764,8 @@ function getLoaderStatus() {
     audioRingAttached: audioRingTelemetry ? Boolean(audioRingTelemetry.audioRingAttached) : false,
     audioRingRetryCount: audioRingTelemetry ? audioRingTelemetry.audioRingRetryCount : 0,
     audioRingLastReason: audioRingTelemetry ? audioRingTelemetry.audioRingLastReason : null,
+    audioRingSabAttached: Boolean(audioBridgeState.ringSabAttached),
+    audioContextState: audioBridgeState.outputState,
     renderStateStats: lastRenderStateStats ? Object.assign({}, lastRenderStateStats) : null,
     wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
     droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
@@ -9158,6 +9868,10 @@ async function tryBootWasmRuntime() {
           }
           coordinatorPthreadPool.closeTxPorts();
           coordinatorSharedWasmModules.clear();
+          coordinatorAudioBridge.clearPending();
+          if (audioWorker) {
+            resetAttachedRuntimeAudioRing(audioWorker);
+          }
           pendingPreloadedWasmBinary = null;
           pendingPreloadedGuestBuffers = null;
           activeCoordinatorRuntimeModule = null;
@@ -9421,7 +10135,60 @@ if (typeof self !== 'undefined') {
       return;
     }
 
-    if (!msg.canvas) return;
+    if (!msg.canvas) {
+      if (msg.type === 'audio-teardown') {
+        teardownCoordinatorAudioWorker({ sendStop: true, terminate: true, destroyBridge: false });
+        return;
+      }
+      if (msg.type === 'teardown' || msg.type === 'destroy') {
+        coordinatorPthreadPool.closeTxPorts();
+        coordinatorSharedWasmModules.clear();
+        if (activeCoordinatorInputBridge) {
+          try {
+            activeCoordinatorInputBridge.stop();
+          } catch {
+            // Ignore input bridge teardown errors.
+          }
+          activeCoordinatorInputBridge = null;
+        }
+        if (activeCoordinatorModuleConfig) {
+          try {
+            if (typeof activeCoordinatorModuleConfig.destroy === 'function') {
+              activeCoordinatorModuleConfig.destroy();
+            } else if (typeof activeCoordinatorModuleConfig.resetAudioRingAttachment === 'function') {
+              activeCoordinatorModuleConfig.resetAudioRingAttachment();
+            }
+          } catch {
+            // Ignore module config teardown errors.
+          }
+        }
+        if (activeCoordinatorPipelineDumpSyncer) {
+          try {
+            activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
+          } catch {
+            // Ignore pipeline dump syncer teardown errors.
+          }
+          activeCoordinatorPipelineDumpSyncer = null;
+        }
+        activeCoordinatorRuntimeModule = null;
+        activeCoordinatorModuleConfig = null;
+        teardownCoordinatorAudioWorker({
+          sendStop: true,
+          terminate: true,
+          destroyBridge: msg.type === 'destroy',
+        });
+        return;
+      }
+      if (isAudioContextStateMessage(msg)) {
+        coordinatorAudioBridge.handleAudioContextState(msg);
+        return;
+      }
+      if (isAudioRingSabMessage(msg)) {
+        coordinatorAudioBridge.handleAttachRingSab(msg);
+        return;
+      }
+      return;
+    }
     coordinatorPthreadPool.closeTxPorts();
     if (activeCoordinatorInputBridge) {
       try {
@@ -9444,7 +10211,11 @@ if (typeof self !== 'undefined') {
     }
     activeCoordinatorRuntimeModule = null;
     activeCoordinatorModuleConfig = null;
-    audioWorkerReady = false;
+    if (audioWorker) {
+      teardownCoordinatorAudioWorker({ sendStop: true, terminate: true, destroyBridge: false });
+    } else {
+      audioWorkerReady = false;
+    }
     if (activeCoordinatorPipelineDumpSyncer) {
       try {
         activeCoordinatorPipelineDumpSyncer.stop().catch(() => {});
@@ -9565,6 +10336,7 @@ if (typeof self !== 'undefined') {
       if (data.ready) {
         const wasReady = audioWorkerReady;
         audioWorkerReady = true;
+        coordinatorAudioBridge.onWorkerReady(audioWorker);
         if (
           activeCoordinatorModuleConfig &&
           typeof activeCoordinatorModuleConfig.onAudioWorkerReady === 'function'
@@ -9636,7 +10408,7 @@ if (typeof self !== 'undefined') {
     } else {
       gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
     }
-    audioWorker.postMessage({ init: true });
+    coordinatorAudioBridge.initWorker(audioWorker, msg);
 
     // Clear all binary buffer references from `msg` and `workerInits` immediately after handoff.
     releaseWireBytesFromObject(msg, { recordTelemetry: false });
@@ -9730,6 +10502,12 @@ const exportedApi = {
   attachRuntimeAudioRing,
   resetAttachedRuntimeAudioRing,
   scheduleAudioRingRetry,
+  normalizeAudioContextStateValue,
+  extractAudioRingSab,
+  isAudioContextStateMessage,
+  isAudioRingSabMessage,
+  createAudioWorkerInitPayload,
+  createAudioWorkerBridge,
   startInputSabBridge,
   resolveDumpPipelinesEnabled,
   sanitizeDumpRelPath,
