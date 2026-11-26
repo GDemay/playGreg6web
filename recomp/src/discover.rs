@@ -152,7 +152,10 @@ pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis 
     }
     state.run();
     loop {
-        while state.resolve_jump_tables() || state.revise_jump_tables() {
+        while state.resolve_jump_tables()
+            || state.revise_jump_tables()
+            || state.requeue_changed_jumps()
+        {
             state.run();
         }
         let late = state.add_late_resume_targets();
@@ -295,6 +298,9 @@ fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Ve
     }
 }
 
+/// `(first block, trace length, incoming edges of the first block)` of a jump's slice.
+type JumpShape = (u64, usize, u32);
+
 struct Discovery<'i, 'a> {
     image: &'i CodeImage<'a>,
     /// Threads for the read-only waves ([`par_map`]).
@@ -309,6 +315,12 @@ struct Discovery<'i, 'a> {
     entries: BTreeSet<u64>,
     /// `jmp reg` sites decoded since the last jump-table round.
     pending_jumps: BTreeSet<u64>,
+    /// Jumps that did not resolve: the shape of their slice when last tried
+    /// ([`Self::jump_shape`]). A jump is tried again when it changes, e.g. a merge in front of it
+    /// gained the incoming edge of a table resolved later ([`Self::requeue_changed_jumps`]).
+    failed_jumps: BTreeMap<u64, JumpShape>,
+    /// Retries per jump (at most [`MAX_TABLE_REVISIONS`]).
+    jump_retries: BTreeMap<u64, u32>,
     jump_tables: BTreeMap<u64, JumpTable>,
     /// How often each resolved table was revised (see `revise_jump_tables`).
     table_revisions: BTreeMap<u64, u32>,
@@ -339,6 +351,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             worklist: BTreeSet::new(),
             entries: BTreeSet::new(),
             pending_jumps: BTreeSet::new(),
+            failed_jumps: BTreeMap::new(),
+            jump_retries: BTreeMap::new(),
             jump_tables: BTreeMap::new(),
             table_revisions: BTreeMap::new(),
             setjmp_slots: image.eh.setjmp_slots.iter().copied().collect(),
@@ -1056,6 +1070,14 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .map(|t| clip_inferred(&self.blocks, t, &bases))
             .collect();
         let progress = !resolved.is_empty();
+        let done: BTreeSet<u64> = resolved.iter().map(|t| t.site).collect();
+        for &site in &pending {
+            if done.contains(&site) {
+                self.failed_jumps.remove(&site);
+            } else if let Some(shape) = self.jump_shape(site, &preds) {
+                self.failed_jumps.insert(site, shape);
+            }
+        }
         for table in resolved {
             if let Some(block) = self
                 .jump_block(table.site)
@@ -1070,6 +1092,39 @@ impl<'i, 'a> Discovery<'i, 'a> {
             self.jump_tables.insert(table.site, table);
         }
         progress
+    }
+
+    /// What a jump's match depends on locally: the first block of its slice, the slice length and
+    /// the incoming edges of that block.
+    fn jump_shape(&self, site: u64, preds: &BTreeMap<u64, Pred>) -> Option<JumpShape> {
+        let (trace, first_block) = self.jump_trace(site, preds)?;
+        let incoming = preds.get(&first_block).map_or(0, |p| p.count);
+        Some((first_block, trace.len(), incoming))
+    }
+
+    /// Queue again every unresolved jump whose slice changed since it was last tried. Returns
+    /// whether any was queued.
+    fn requeue_changed_jumps(&mut self) -> bool {
+        if self.failed_jumps.is_empty() {
+            return false;
+        }
+        let preds = self.predecessors();
+        let changed: Vec<u64> = self
+            .failed_jumps
+            .iter()
+            .filter(|(site, shape)| {
+                !self.jump_tables.contains_key(site)
+                    && self.jump_retries.get(site).copied().unwrap_or(0) < MAX_TABLE_REVISIONS
+                    && self.jump_shape(**site, &preds).is_some_and(|now| now != **shape)
+            })
+            .map(|(&site, _)| site)
+            .collect();
+        for &site in &changed {
+            let retries = self.jump_retries.entry(site).or_insert(0);
+            *retries = retries.saturating_add(1);
+            self.pending_jumps.insert(site);
+        }
+        !changed.is_empty()
     }
 
     /// Re-match every resolved table against the current CFG and adopt a changed resolution.
