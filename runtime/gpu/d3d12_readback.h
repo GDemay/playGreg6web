@@ -14,9 +14,10 @@
 // (Fence::signal_from_queue), so the fence publish rules (DeviceOptions::fence_publish_lag) apply
 // unchanged afterwards: this is an extra hold in front of them, not a change to them.
 //
-// Without a consumer that answers (native builds, a worker without guest memory), a hold would
-// never end: a held signal is released after `timeout` (counted), and after `kMaxTimeoutsInARow`
-// timeouts in a row the gate stops holding signals (read-backs are still issued and counted).
+// A held signal is only ever released by the consumer's completion: nothing is published before the
+// bytes landed. `timeout` is a diagnostic: a signal held longer logs a loud warning once and is
+// counted (ReadbackTimeouts), but stays held. Builds without a consumer construct the gate with
+// hold = false, so they never park.
 
 #include <atomic>
 #include <chrono>
@@ -32,13 +33,11 @@ namespace playgta6::gpu::d3d12_guest {
 
 class ReadbackGate {
 public:
-    static constexpr uint32_t kMaxTimeoutsInARow = 4;
-
     struct Stats {
         uint64_t issued = 0;
         uint64_t bytes = 0;
         uint64_t completed = 0;       // counter value seen (completions the consumer reported)
-        uint64_t timeouts = 0;        // held signals released by the timeout
+        uint64_t timeouts = 0;        // held signals that passed the diagnostic timeout
         uint64_t signals_held = 0;    // queue signals parked behind a read-back
         uint64_t signals_pending = 0; // parked now
         bool holding = false;         // signals are held (enabled and not given up)
@@ -72,6 +71,7 @@ private:
         uint64_t needed;  // completion count that releases it
         std::chrono::steady_clock::time_point at;
         std::function<void()> release;
+        bool warned = false;
     };
     struct Range {
         uint64_t va;
@@ -88,13 +88,11 @@ private:
     bool stop_ = false;
     uint64_t issued_ = 0;
     uint64_t bytes_ = 0;
-    uint64_t forced_ = 0;      // completion count assumed after a timeout
     uint64_t seen_ = 0;        // completions whose ranges were marked written
     uint64_t reported_seen_ = 0;  // consumer completions already counted
     uint64_t done_wraps_ = 0;  // 64-bit view of the u32 counter
     uint32_t done_last_ = 0;
     uint64_t timeouts_ = 0;
-    uint32_t timeouts_in_a_row_ = 0;
     uint64_t signals_held_ = 0;
     std::deque<Range> ranges_;  // issued, not yet marked written
     std::deque<Parked> parked_;

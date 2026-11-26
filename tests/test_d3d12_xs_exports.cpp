@@ -2021,8 +2021,8 @@ void test_gpu_readback() {
         CHECK(wait_for([&] { return load64(word) == 4; }));
         scene.release_all({list, gpu_buf, readback, tex, fence});
     }
-    // No consumer answers: the held signal is released at the timeout (counted), so the title
-    // cannot hang on it.
+    // No consumer answers: the held signal stays held (no faked completion); the timeout only logs a
+    // warning and is counted once.
     {
         Fixture fx;
         dg::DeviceOptions options;
@@ -2049,8 +2049,19 @@ void test_gpu_readback() {
         const uint64_t word = fx.vcall(fence, 12);
         CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
         CHECK(load64(word) == 0);
-        CHECK(wait_for([&] { return load64(word) == 1; }));
+        CHECK(wait_for([&] { return work(W::ReadbackTimeouts) == timeouts0 + 1; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(load64(word) == 0);
         CHECK(work(W::ReadbackTimeouts) == timeouts0 + 1);
+        // Many timeouts later the gate still holds (no give-up fallback).
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(load64(word) == 0);
+        // The consumer finally answers: only now does the fence advance.
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(
+            static_cast<uintptr_t>(payload_as<GpuReadbackBufferPayload>(*rbb).done_addr));
+        done->fetch_add(1);
+        CHECK(wait_for([&] { return load64(word) == 2; }));
         scene.release_all({list, gpu_buf, readback, fence});
     }
 }

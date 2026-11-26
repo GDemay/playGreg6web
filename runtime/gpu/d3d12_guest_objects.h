@@ -637,8 +637,8 @@ struct DeviceOptions {
     bool defer_gpu_objects = true;
     // GPU -> CPU read-back (G66, d3d12_readback.h): copies into CPU-visible memory become
     // ReadbackBuffer / ReadbackTexture packets either way. With `gpu_readback_hold` a queue Signal
-    // issued after one is held until the consumer reports the bytes written (at most
-    // `gpu_readback_timeout_ms` per signal). Default: on where a consumer answers (the browser build).
+    // issued after one is held until the consumer reports the bytes written (never released early;
+    // `gpu_readback_timeout_ms` only logs a warning per held signal). Default: on where a consumer answers (the browser build).
 #ifdef __EMSCRIPTEN__
     bool gpu_readback_hold = true;
 #else
