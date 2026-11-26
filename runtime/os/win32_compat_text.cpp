@@ -3,6 +3,9 @@
 // lstr* / CompareString*, locale queries (the user locale is en-US), FormatMessageA and the
 // GetDateFormatEx / GetTimeFormatEx pattern formatter. See os/win32_compat.h.
 
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
 #include <cstring>
 #include <string>
 
@@ -12,6 +15,10 @@
 
 namespace win32 = playgta6::os::win32;
 namespace cd = playgta6::os::win32::compat_detail;
+
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) int __stdcall GetUserDefaultLocaleName(wchar_t* name, int cch);
+#endif
 
 namespace {
 
@@ -254,20 +261,6 @@ std::u16string format_pattern(const Pg6SystemTime& st, std::u16string_view patte
     return out;
 }
 
-bool locale_is_default(const char16_t* name) {
-    if (name == nullptr || name[0] == 0) {
-        return true;  // user default / invariant: both render as en-US here
-    }
-    const char16_t* want = u"en-us";
-    size_t i = 0;
-    for (; want[i] != 0; ++i) {
-        if (cd::fold_char(name[i]) != want[i]) {
-            return false;
-        }
-    }
-    return name[i] == 0;
-}
-
 // The shared "write a string result" protocol of the date/time/locale APIs: cch == 0 queries the
 // size (including the NUL); too small a buffer is ERROR_INSUFFICIENT_BUFFER.
 int32_t return_u16(const std::u16string& text, char16_t* dst, int32_t cch) {
@@ -348,6 +341,66 @@ constexpr LocaleEntry kLocales[] = {
     {u"it", 0x0010, true},     {u"ja", 0x0011, true},     {u"ko", 0x0012, true},
     {u"pt", 0x0016, true},     {u"ru", 0x0019, true},     {u"zh", 0x0004, true},
 };
+
+// The host's user locale (set once from the host settings; en-US until then or when unknown).
+// Date/time patterns stay en-US; only the identity answers follow the host.
+std::atomic<size_t> g_host_locale{0};  // index into kLocales (0 = en-US)
+
+// First use reads the host settings: PG6_LOCALE, LC_ALL, LANG, then the Windows user locale.
+const LocaleEntry& host_locale() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (const char* var : {"PG6_LOCALE", "LC_ALL", "LANG"}) {
+            const char* v = std::getenv(var);
+            if (v != nullptr && v[0] != 0 && std::strcmp(v, "C") != 0 && std::strcmp(v, "POSIX") != 0) {
+                (void)pg6_win32_set_host_locale(v);
+                return;
+            }
+        }
+#if defined(_WIN32)
+        wchar_t w[85]{};
+        if (GetUserDefaultLocaleName(w, 85) > 0) {
+            char n[85]{};
+            for (int i = 0; i < 84 && w[i] != 0; ++i) {
+                n[i] = w[i] < 0x80 ? static_cast<char>(w[i]) : '?';
+            }
+            (void)pg6_win32_set_host_locale(n);
+        }
+#endif
+    });
+    return kLocales[g_host_locale.load(std::memory_order_acquire)];
+}
+
+bool locale_name_equals(const char16_t* name, const char16_t* lower) {
+    size_t i = 0;
+    for (; lower[i] != 0; ++i) {
+        if (name[i] == 0 || cd::fold_char(name[i]) != lower[i]) {
+            return false;
+        }
+    }
+    return name[i] == 0;
+}
+
+std::u16string host_locale_name() {
+    const LocaleEntry& e = host_locale();
+    std::u16string n(e.name);
+    for (size_t i = 0; i < n.size(); ++i) {
+        if (n[i] == u'-') {
+            for (size_t j = i + 1; j < n.size(); ++j) {
+                n[j] = static_cast<char16_t>(n[j] - 0x20);  // region upper-case
+            }
+            break;
+        }
+    }
+    return n;
+}
+
+bool locale_is_default(const char16_t* name) {
+    if (name == nullptr || name[0] == 0) {
+        return true;  // user default / invariant: both render as the host locale here
+    }
+    return locale_name_equals(name, u"en-us") || locale_name_equals(name, host_locale().name);
+}
 
 struct SystemMessage {
     uint32_t id;
@@ -668,11 +721,36 @@ int32_t pg6_win32_compare_string_ordinal(const char16_t* string1,
 }
 
 int32_t pg6_win32_get_user_default_locale_name(char16_t* locale_name, int32_t cch_locale_name) {
-    return return_u16(u"en-US", locale_name, cch_locale_name);
+    return return_u16(host_locale_name(), locale_name, cch_locale_name);
 }
 
 int32_t pg6_win32_get_user_default_geo_name(char16_t* geo_name, int32_t count) {
-    return return_u16(u"US", geo_name, count);
+    const std::u16string n = host_locale_name();
+    const size_t dash = n.find(u'-');
+    return return_u16(dash == std::u16string::npos ? u"US" : n.substr(dash + 1), geo_name, count);
+}
+
+bool pg6_win32_set_host_locale(const char* name) {
+    // Accepts "xx-YY" / "xx_YY" / "xx" (any case, optional ".encoding" suffix); unknown -> en-US.
+    std::u16string want;
+    for (const char* p = name; p != nullptr && *p != 0 && *p != '.' && *p != '@' && want.size() < 16; ++p) {
+        char c = *p == '_' ? '-' : *p;
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c + 0x20);
+        }
+        want.push_back(static_cast<char16_t>(c));
+    }
+    size_t found = 0;
+    bool ok = false;
+    for (size_t i = 0; i < sizeof(kLocales) / sizeof(kLocales[0]); ++i) {
+        if (want == kLocales[i].name) {
+            found = i;
+            ok = true;
+            break;
+        }
+    }
+    g_host_locale.store(found, std::memory_order_release);
+    return ok;
 }
 
 uint32_t pg6_win32_locale_name_to_lcid(const char16_t* name, uint32_t flags) {
@@ -683,7 +761,7 @@ uint32_t pg6_win32_locale_name_to_lcid(const char16_t* name, uint32_t flags) {
     }
     if (name == nullptr) {
         win32::SetLastError(win32::ERROR_SUCCESS);
-        return 0x0409;  // LOCALE_NAME_USER_DEFAULT
+        return host_locale().lcid;  // LOCALE_NAME_USER_DEFAULT
     }
     if (name[0] == 0) {
         win32::SetLastError(win32::ERROR_SUCCESS);
