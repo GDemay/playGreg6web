@@ -12,7 +12,7 @@ use super::{
 use crate::cfg::{self, Edge, Terminator};
 use crate::lift::{
     GUEST_BASE_SYMBOL, GuestBase, HELPER_DIVIDE_ERROR, HELPER_INDIRECT_CALL, HELPER_TRAP,
-    HELPER_UNIMPLEMENTED, LiftError, WASM64_TRIPLE, emit_module, lift_function, lift_module,
+    HELPER_PROBE_HIT, HELPER_UNIMPLEMENTED, LiftError, WASM64_TRIPLE, emit_module, lift_function, lift_module,
     lift_module_with,
 };
 
@@ -115,6 +115,42 @@ fn output_is_deterministic_and_independent_of_input_order() {
         all.ir,
         lift_module(functions.values().rev()).expect("lifts").ir
     );
+}
+
+#[test]
+fn entry_probe_is_emitted_only_for_a_listed_function() {
+    let functions = Program::new()
+        .asm(0x2000, |a| {
+            a.mov(rax, rcx)?;
+            a.call(0x3000)?;
+            a.ret()
+        })
+        .asm(0x3000, |a| {
+            a.add(rcx, rdx)?;
+            a.ret()
+        })
+        .discover();
+    let (a, b) = (&functions[&0x2000], &functions[&0x3000]);
+    let plain = lift_module([a, b]).expect("lifts");
+    assert!(!plain.ir.contains(HELPER_PROBE_HIT));
+
+    // Probing the directly called callee: its entry block starts with the counter call, the
+    // caller and the declaration-free module stay as before.
+    let mut lifted = plain.functions.clone();
+    lifted[1].insert_entry_probe();
+    lifted[1].insert_entry_probe(); // idempotent
+    let ir = emit_module(&lifted).expect("emits");
+    let call = format!("call void @{HELPER_PROBE_HIT}(ptr %state, i64 {})", 0x3000);
+    assert_eq!(ir.matches(&call).count(), 1);
+    assert_eq!(
+        ir.matches(&format!("declare void @{HELPER_PROBE_HIT}(ptr noundef, i64 noundef)"))
+            .count(),
+        1
+    );
+    let callee = &ir[ir.find("define void @sub_3000").expect("sub_3000")..];
+    assert!(callee.contains(&format!("entry:\n  {call}\n")));
+    let caller = &ir[ir.find("define void @sub_2000").expect("sub_2000")..ir.find("define void @sub_3000").unwrap()];
+    assert!(!caller.contains(HELPER_PROBE_HIT));
 }
 
 #[test]

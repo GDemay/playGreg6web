@@ -1847,3 +1847,25 @@ fn shard_dispatch_compiles_links_and_executes_with_shrunk_wasm_table() {
     }
     panic!("running shard-dispatched wasm failed:\n{last_error}");
 }
+
+#[test]
+fn probe_function_list_parses_addresses_and_rejects_garbage() {
+    let set = super::parse_probe_functions(
+        "# audio
+0x144ee95f0 decoder_factory
+
+  145b67eb0
+0X140078560
+145b67eb0
+",
+    )
+    .unwrap();
+    assert_eq!(
+        set.into_iter().collect::<Vec<_>>(),
+        vec![0x140078560, 0x144ee95f0, 0x145b67eb0]
+    );
+    assert!(super::parse_probe_functions("").unwrap().is_empty());
+    assert!(super::parse_probe_functions("0x10
+nothex
+").unwrap_err().contains("line 2"));
+}
