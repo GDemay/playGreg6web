@@ -271,6 +271,59 @@ function resolveSwapchainCopySrcUsage() {
   return null;
 }
 
+const SWAPCHAIN_SRGB_TO_BASE = Object.freeze({
+  'bgra8unorm-srgb': 'bgra8unorm',
+  'rgba8unorm-srgb': 'rgba8unorm',
+});
+
+const SWAPCHAIN_BASE_TO_SRGB = Object.freeze({
+  bgra8unorm: 'bgra8unorm-srgb',
+  rgba8unorm: 'rgba8unorm-srgb',
+});
+
+const SWAPCHAIN_LINEAR_HDR_FORMATS = new Set(['rgba16float', 'rg11b10ufloat', 'rgba32float']);
+const SWAPCHAIN_SDR_BASE_FORMATS = new Set(['bgra8unorm', 'rgba8unorm']);
+
+function normalizeSwapchainAlphaMode(alphaMode) {
+  if (typeof alphaMode === 'string') {
+    const lower = alphaMode.trim().toLowerCase();
+    if (lower === 'premultiplied' || lower === 'opaque') {
+      return lower;
+    }
+  }
+  return 'opaque';
+}
+
+function normalizeSwapchainToneMapMode(mode) {
+  if (mode === undefined || mode === null || mode === '' || mode === 'auto') {
+    return null;
+  }
+  if (typeof mode === 'string') {
+    const lower = mode.trim().toLowerCase();
+    if (lower === 'none' || lower === 'passthrough') {
+      return 'none';
+    }
+    if (lower === 'reinhard' || lower === 'aces') {
+      return lower;
+    }
+  }
+  return null;
+}
+
+function normalizeSwapchainHdrMode(mode, defaultMode = 'auto') {
+  if (typeof mode === 'string') {
+    const lower = mode.trim().toLowerCase();
+    if (lower === 'extended' || lower === 'sdr-tonemap' || lower === 'auto') {
+      return lower;
+    }
+  }
+  return defaultMode;
+}
+
+function normalizeSwapchainExposure(value, fallback = 1.0) {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
 function configureCanvasContextWithCopySrc(ctx, baseConfig) {
   if (!ctx || typeof ctx.configure !== 'function') {
     return { configured: false, copySrcEnabled: false };
@@ -293,6 +346,29 @@ function configureCanvasContextWithCopySrc(ctx, baseConfig) {
     ctx.configure({ ...baseConfig, usage: usageSpec.renderOnly });
     return { configured: true, copySrcEnabled: false };
   }
+}
+
+function configureCanvasContextWithViewFormats(ctx, baseConfig) {
+  if (!ctx || typeof ctx.configure !== 'function') {
+    return { configured: false, copySrcEnabled: false, viewFormatsApplied: false };
+  }
+  const cfg = baseConfig && typeof baseConfig === 'object' ? baseConfig : {};
+  const explicitViews = Array.isArray(cfg.viewFormats) && cfg.viewFormats.length > 0;
+  const srgbSibling =
+    !explicitViews && typeof cfg.format === 'string' ? SWAPCHAIN_BASE_TO_SRGB[cfg.format] : null;
+  if (explicitViews || srgbSibling) {
+    const withViews = explicitViews ? cfg : { ...cfg, viewFormats: [srgbSibling] };
+    try {
+      const res = configureCanvasContextWithCopySrc(ctx, withViews);
+      return { ...res, viewFormatsApplied: true };
+    } catch (_) {
+      const { viewFormats: _ignored, ...withoutViews } = cfg;
+      const res = configureCanvasContextWithCopySrc(ctx, withoutViews);
+      return { ...res, viewFormatsApplied: false };
+    }
+  }
+  const res = configureCanvasContextWithCopySrc(ctx, cfg);
+  return { ...res, viewFormatsApplied: false };
 }
 
 function configureSwapchainWithCopySrc(targetSwapchain, config) {
@@ -1085,13 +1161,72 @@ function callFallbackRouterResolve(router, lookupHashHex, stageName, profile) {
 }
 
 const TEXTURE_FORMAT_BPP = Object.freeze({
-  rgba8unorm: 4,
-  bgra8unorm: 4,
+  r8unorm: 1,
+  r8snorm: 1,
+  r8uint: 1,
+  r8sint: 1,
+  stencil8: 1,
+  r16unorm: 2,
+  r16snorm: 2,
+  r16uint: 2,
+  r16sint: 2,
+  r16float: 2,
+  rg8unorm: 2,
+  rg8snorm: 2,
+  rg8uint: 2,
+  rg8sint: 2,
+  depth16unorm: 2,
+  r32uint: 4,
+  r32sint: 4,
   r32float: 4,
-  rgba16float: 8,
-  rgba32float: 16,
+  rg16unorm: 4,
+  rg16snorm: 4,
+  rg16uint: 4,
+  rg16sint: 4,
+  rg16float: 4,
+  rgba8unorm: 4,
+  'rgba8unorm-srgb': 4,
+  rgba8snorm: 4,
+  rgba8uint: 4,
+  rgba8sint: 4,
+  bgra8unorm: 4,
+  'bgra8unorm-srgb': 4,
+  rgb9e5ufloat: 4,
+  rgb10a2uint: 4,
+  rgb10a2unorm: 4,
+  rg11b10ufloat: 4,
   depth24plus: 4,
+  'depth24plus-stencil8': 4,
   depth32float: 4,
+  rg32uint: 8,
+  rg32sint: 8,
+  rg32float: 8,
+  rgba16unorm: 8,
+  rgba16snorm: 8,
+  rgba16uint: 8,
+  rgba16sint: 8,
+  rgba16float: 8,
+  'depth32float-stencil8': 8,
+  rgba32uint: 16,
+  rgba32sint: 16,
+  rgba32float: 16,
+});
+
+const TEXTURE_BLOCK_FORMAT_BYTES = Object.freeze({
+  'bc1-rgba-unorm': 8,
+  'bc1-rgba-unorm-srgb': 8,
+  'bc2-rgba-unorm': 16,
+  'bc2-rgba-unorm-srgb': 16,
+  'bc3-rgba-unorm': 16,
+  'bc3-rgba-unorm-srgb': 16,
+  'bc4-r-unorm': 8,
+  'bc4-r-snorm': 8,
+  'bc5-rg-unorm': 16,
+  'bc5-rg-snorm': 16,
+  'bc6h-rgb-ufloat': 16,
+  'bc6h-rgb-float': 16,
+  'bc7-rgba-unorm': 16,
+  'bc7-rgba-unorm-srgb': 16,
 });
 
 function fnv1a64Hex(text) {
@@ -1104,15 +1239,25 @@ function fnv1a64Hex(text) {
   return `0x${hash.toString(16).padStart(16, '0')}`;
 }
 
-function estimateTextureBytes(width, height, depthOrArrayLayers, mipLevelCount, format, dimension) {
-  const w0 = Math.max(1, width | 0);
-  const h0 = Math.max(1, height | 0);
-  const d0 = Math.max(1, depthOrArrayLayers | 0);
-  const mips = Math.max(1, mipLevelCount | 0);
+function estimateTextureBytes(
+  width,
+  height,
+  depthOrArrayLayers,
+  mipLevelCount,
+  format,
+  dimension,
+  sampleCount = 1
+) {
+  const w0 = Math.max(1, Math.floor(Number(width) || 1));
   const is1D = dimension === '1d';
   const is3D = dimension === '3d';
-  const isBc7 = format === 'bc7-rgba-unorm';
-  const bpp = TEXTURE_FORMAT_BPP[format] || 4;
+  const h0 = is1D ? 1 : Math.max(1, Math.floor(Number(height) || 1));
+  const d0 = is1D ? 1 : Math.max(1, Math.floor(Number(depthOrArrayLayers) || 1));
+  const mips = Math.max(1, Math.floor(Number(mipLevelCount) || 1));
+  const samples = Math.max(1, Math.floor(Number(sampleCount) || 1));
+  const fmtKey = typeof format === 'string' ? format.trim().toLowerCase() : 'rgba8unorm';
+  const bcBlockBytes = TEXTURE_BLOCK_FORMAT_BYTES[fmtKey] || 0;
+  const bpp = bcBlockBytes > 0 ? 0 : TEXTURE_FORMAT_BPP[fmtKey] || 4;
 
   let total = 0;
   for (let mip = 0; mip < mips; mip += 1) {
@@ -1120,10 +1265,10 @@ function estimateTextureBytes(width, height, depthOrArrayLayers, mipLevelCount, 
     const mw = scale === Infinity ? 1 : Math.max(1, Math.floor(w0 / scale));
     const mh = is1D ? 1 : scale === Infinity ? 1 : Math.max(1, Math.floor(h0 / scale));
     const md = is3D ? (scale === Infinity ? 1 : Math.max(1, Math.floor(d0 / scale))) : d0;
-    if (isBc7) {
-      total += Math.ceil(mw / 4) * Math.ceil(mh / 4) * 16 * md;
+    if (bcBlockBytes > 0) {
+      total += Math.ceil(mw / 4) * Math.ceil(mh / 4) * bcBlockBytes * md * samples;
     } else {
-      total += mw * mh * md * bpp;
+      total += mw * mh * md * bpp * samples;
     }
   }
   return total;
@@ -2399,6 +2544,44 @@ class WgpuCommandProcessor {
     this.device = device;
     this.ctx = ctx;
     this.format = options.format || 'bgra8unorm';
+    this._preferredSdrCanvasFormat = SWAPCHAIN_SDR_BASE_FORMATS.has(this.format)
+      ? this.format
+      : 'bgra8unorm';
+    this._streamSwapchainFormat = null;
+    this._swapchainViewFormat = null;
+    this._alphaMode = normalizeSwapchainAlphaMode(
+      options.alphaMode ?? (options.swapchainOptions && options.swapchainOptions.alphaMode)
+    );
+    this._swapchainHdrMode = normalizeSwapchainHdrMode(
+      options.hdrMode ??
+        options.swapchainHdrMode ??
+        (options.swapchainOptions && options.swapchainOptions.hdrMode),
+      'auto'
+    );
+    this._directSrgbView = Boolean(
+      options.directSrgbView === true ||
+        (options.swapchainOptions && options.swapchainOptions.directSrgbView === true)
+    );
+    this._swapchainToneMapMode = normalizeSwapchainToneMapMode(
+      options.toneMapMode ?? (options.swapchainOptions && options.swapchainOptions.toneMapMode)
+    );
+    this._swapchainExposure = normalizeSwapchainExposure(
+      options.exposure ?? (options.swapchainOptions && options.swapchainOptions.exposure),
+      1.0
+    );
+    this._swapchainApplySrgbEncode =
+      typeof options.applySrgbEncode === 'boolean'
+        ? options.applySrgbEncode
+        : options.swapchainOptions && typeof options.swapchainOptions.applySrgbEncode === 'boolean'
+          ? options.swapchainOptions.applySrgbEncode
+          : null;
+    this._swapchainRgb10a2Transfer =
+      (options.rgb10a2Transfer ??
+        (options.swapchainOptions && options.swapchainOptions.rgb10a2Transfer)) === 'linear'
+        ? 'linear'
+        : 'sdr';
+    this._activeToneMapMode = 'none';
+    this._activeApplySrgbEncode = false;
     this.buffers = new Map();
     this.textures = new Map();
     this.textureViews = new Map();
@@ -3805,7 +3988,7 @@ class WgpuCommandProcessor {
     ) {
       return this._swapchain.streamFormat;
     }
-    return this.format;
+    return this._swapchainViewFormat || this.format;
   }
 
   /**
@@ -4442,6 +4625,33 @@ class WgpuCommandProcessor {
     }
     if (this._splashBridgeExplicitlyDisabled && !this.binkPresenter) {
       return null;
+    }
+    if (
+      this._ownsBinkPresenter &&
+      this.binkPresenter &&
+      typeof this.binkPresenter.presentationFormat === 'string' &&
+      this.binkPresenter.presentationFormat !== this.format
+    ) {
+      if (this.splashFrameBridge && this._ownsSplashFrameBridge) {
+        try {
+          if (typeof this.splashFrameBridge.destroy === 'function') {
+            this.splashFrameBridge.destroy();
+          }
+        } catch (_) {
+          // Ignore teardown errors when reconciling canvas format.
+        }
+        this.splashFrameBridge = null;
+        this._ownsSplashFrameBridge = false;
+      }
+      try {
+        if (typeof this.binkPresenter.destroy === 'function') {
+          this.binkPresenter.destroy();
+        }
+      } catch (_) {
+        // Ignore teardown errors when reconciling canvas format.
+      }
+      this.binkPresenter = null;
+      this._ownsBinkPresenter = false;
     }
     if (!this.binkPresenter) {
       if (!this.device || typeof this.device.createTexture !== 'function') {
@@ -7442,14 +7652,22 @@ class WgpuCommandProcessor {
   }
 
   /**
-   * #709 / W112 / W121: Configure the WebGPU canvas context / swapchain to match the swapchain
-   * attachment format declared by the command stream.
-   *
-   * When an attached `WgpuSwapchain` supports `configureForStreamFormat()`, valid direct canvas
-   * formats (`bgra8unorm`, `rgba8unorm`, `rgba16float`) stay on the zero-overhead direct canvas
-   * path, while non-canvas formats (e.g. `rgb10a2unorm`, `rg11b10ufloat`, `rgba8unorm-srgb`,
-   * `rgba16unorm`) automatically activate the W112 offscreen intermediate texture + fullscreen
-   * blit fallback.
+   * #663 / #709 / W112 / W121: Configure the WebGPU canvas context / swapchain to match the
+   * swapchain attachment format declared by the command stream with console-accurate color
+   * presentation:
+   * - `bgra8unorm-srgb` / `rgba8unorm-srgb`: prefers zero-copy direct sRGB canvas views via
+   *   `viewFormats` (`usesBlitFallback = false`); if the browser rejects `viewFormats`, falls back
+   *   to an offscreen sRGB intermediate with `applySrgbEncode: true` so linear samples are
+   *   re-encoded to sRGB before writing to the non-sRGB SDR canvas (preventing double-darkened
+   *   gamma).
+   * - `rgba16float` / `rg11b10ufloat` / `rgba32float` (linear HDR / scRGB): guards optional
+   *   device features (`rg11b10ufloat-renderable`, `float32-filterable`) and by default renders
+   *   to an offscreen linear HDR intermediate + ACES/Reinhard tonemapped linear->sRGB blit onto
+   *   the SDR canvas (`hdrMode: 'extended'` with `toneMapMode: 'none'` preserves direct
+   *   `rgba16float` canvas output).
+   * - `rgb10a2unorm`: uses offscreen intermediate blit with `applySrgbEncode: false` by default
+   *   (10-bit SDR) or linear tonemapping when explicitly configured via `rgb10a2Transfer: 'linear'`.
+   * - `bgra8unorm` / `rgba8unorm`: direct zero-overhead SDR canvas path.
    *
    * @param {string} declaredFormat
    * @returns {boolean}
@@ -7458,19 +7676,139 @@ class WgpuCommandProcessor {
     if (typeof declaredFormat !== 'string' || declaredFormat.length === 0) {
       return false;
     }
+    const normalizedFormat = declaredFormat.trim().toLowerCase();
+    if (normalizedFormat.length === 0) {
+      return false;
+    }
     const swapchain =
       this._swapchain && !this._swapchain.isDestroyed ? this._swapchain : null;
-    if (swapchain && typeof swapchain.configureForStreamFormat === 'function') {
+    const srgbBaseFormat = SWAPCHAIN_SRGB_TO_BASE[normalizedFormat] || null;
+    const isLinearHdr = SWAPCHAIN_LINEAR_HDR_FORMATS.has(normalizedFormat);
+
+    // Track preferred SDR canvas format so returning from extended rgba16float restores SDR.
+    if (SWAPCHAIN_SDR_BASE_FORMATS.has(this.format)) {
+      this._preferredSdrCanvasFormat = this.format;
+    }
+
+    const applyToneMap = (mode, exposure, applySrgbEncode) => {
+      this._activeToneMapMode = mode;
+      this._activeApplySrgbEncode = Boolean(applySrgbEncode);
+      if (swapchain && typeof swapchain.setToneMapOptions === 'function') {
+        try {
+          swapchain.setToneMapOptions({
+            mode,
+            exposure,
+            applySrgbEncode,
+          });
+        } catch (_) {
+          // Ignore custom swapchain mocks without full tonemap support.
+        }
+      }
+    };
+
+    const deviceHasFeature = (featureName) => {
+      if (!this.device || !this.device.features || typeof this.device.features.has !== 'function') {
+        return true;
+      }
+      return this.device.features.has(featureName);
+    };
+
+    // Case 1: sRGB backbuffer (`bgra8unorm-srgb`, `rgba8unorm-srgb`)
+    if (srgbBaseFormat) {
+      if (this._directSrgbView && swapchain && typeof swapchain.setFormat === 'function') {
+        try {
+          applyToneMap('none', 1.0, null);
+          swapchain.setFormat(srgbBaseFormat, [normalizedFormat]);
+          const viewFormatsAccepted =
+            swapchain.viewFormats === undefined ||
+            (Array.isArray(swapchain.viewFormats) &&
+              swapchain.viewFormats.includes(normalizedFormat));
+          if (viewFormatsAccepted) {
+            this.format =
+              typeof swapchain.format === 'string' && swapchain.format.length > 0
+                ? swapchain.format
+                : srgbBaseFormat;
+            this._swapchainViewFormat = normalizedFormat;
+            this._streamSwapchainFormat = normalizedFormat;
+            this._activeToneMapMode = 'none';
+            this._activeApplySrgbEncode = false;
+            return true;
+          }
+        } catch (err) {
+          this._logDiagnostic(
+            'warn',
+            `[wgpu_worker] direct sRGB swapchain view ${normalizedFormat} failed, falling back to sRGB-encoded blit: ${sanitizeGpuErrorDetail(err)}`
+          );
+        }
+      }
+      // Offscreen sRGB intermediate + explicit linear->sRGB encoding on blit into the non-sRGB SDR
+      // canvas: sampling an `-srgb` intermediate hardware-decodes sRGB->linear, so `applySrgbEncode: true`
+      // is required to re-encode linear->sRGB before writing to `bgra8unorm`/`rgba8unorm` (fixes
+      // crushed/double-darkened midtones).
+      if (swapchain && typeof swapchain.configureForStreamFormat === 'function') {
+        try {
+          applyToneMap('none', 1.0, true);
+          swapchain.configureForStreamFormat(normalizedFormat, { forceBlit: true });
+          this._streamSwapchainFormat = normalizedFormat;
+          this._swapchainViewFormat = null;
+          if (typeof swapchain.format === 'string' && swapchain.format.length > 0) {
+            this.format = swapchain.format;
+          }
+          return true;
+        } catch (err) {
+          this._logDiagnostic(
+            'warn',
+            `[wgpu_worker] failed to configure swapchain for stream format ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
+          );
+          return false;
+        }
+      }
+    }
+
+    // Case 2: Linear HDR backbuffer (`rgba16float`, `rg11b10ufloat`, `rgba32float`)
+    if (isLinearHdr && swapchain && typeof swapchain.configureForStreamFormat === 'function') {
+      let effectiveFormat = normalizedFormat;
+      if (effectiveFormat === 'rg11b10ufloat' && !deviceHasFeature('rg11b10ufloat-renderable')) {
+        effectiveFormat = 'rgba16float';
+      } else if (effectiveFormat === 'rgba32float' && !deviceHasFeature('float32-filterable')) {
+        effectiveFormat = 'rgba16float';
+      }
+      const wantsSdrToneMapBlit =
+        effectiveFormat !== 'rgba16float' ||
+        this._swapchainHdrMode === 'sdr-tonemap' ||
+        this._swapchainToneMapMode === 'aces' ||
+        this._swapchainToneMapMode === 'reinhard' ||
+        this._swapchainApplySrgbEncode === true;
       try {
-        swapchain.configureForStreamFormat(declaredFormat);
+        if (!wantsSdrToneMapBlit) {
+          applyToneMap('none', this._swapchainExposure, false);
+          swapchain.configureForStreamFormat(effectiveFormat);
+        } else {
+          // Keep the canvas in SDR (`bgra8unorm` / `rgba8unorm`) so highlights tonemap cleanly
+          // via ACES/Reinhard + linear->sRGB encoding and the swapchain luminance probe stays active.
+          if (
+            !SWAPCHAIN_SDR_BASE_FORMATS.has(swapchain.format) &&
+            typeof swapchain.setFormat === 'function'
+          ) {
+            const sdrBase = SWAPCHAIN_SDR_BASE_FORMATS.has(this._preferredSdrCanvasFormat)
+              ? this._preferredSdrCanvasFormat
+              : 'bgra8unorm';
+            swapchain.setFormat(sdrBase);
+          }
+          const effectiveToneMap = this._swapchainToneMapMode || 'aces';
+          const effectiveSrgbEncode =
+            this._swapchainApplySrgbEncode !== null ? this._swapchainApplySrgbEncode : true;
+          applyToneMap(effectiveToneMap, this._swapchainExposure, effectiveSrgbEncode);
+          swapchain.configureForStreamFormat(effectiveFormat, { forceBlit: true });
+        }
       } catch (err) {
         this._logDiagnostic(
           'warn',
-          `[wgpu_worker] failed to configure swapchain for stream format ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+          `[wgpu_worker] failed to configure swapchain for HDR stream format ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
         );
         return false;
       }
-      this._streamSwapchainFormat = declaredFormat;
+      this._streamSwapchainFormat = effectiveFormat;
       this._swapchainViewFormat = null;
       if (typeof swapchain.format === 'string' && swapchain.format.length > 0) {
         this.format = swapchain.format;
@@ -7478,8 +7816,65 @@ class WgpuCommandProcessor {
       return true;
     }
 
-    const isSrgb = declaredFormat.endsWith('-srgb');
-    const baseFormat = isSrgb ? declaredFormat.slice(0, -5) : declaredFormat;
+    // Case 3: `rgb10a2unorm` (default 10-bit SDR passthrough unless linear HDR transfer requested)
+    if (
+      normalizedFormat === 'rgb10a2unorm' &&
+      swapchain &&
+      typeof swapchain.configureForStreamFormat === 'function'
+    ) {
+      const wantsLinearToneMap =
+        this._swapchainRgb10a2Transfer === 'linear' ||
+        this._swapchainToneMapMode === 'aces' ||
+        this._swapchainToneMapMode === 'reinhard' ||
+        this._swapchainApplySrgbEncode === true;
+      try {
+        if (wantsLinearToneMap) {
+          const effectiveToneMap = this._swapchainToneMapMode || 'aces';
+          const effectiveSrgbEncode =
+            this._swapchainApplySrgbEncode !== null ? this._swapchainApplySrgbEncode : true;
+          applyToneMap(effectiveToneMap, this._swapchainExposure, effectiveSrgbEncode);
+        } else {
+          applyToneMap('none', 1.0, false);
+        }
+        swapchain.configureForStreamFormat(normalizedFormat);
+      } catch (err) {
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] failed to configure swapchain for stream format ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
+        );
+        return false;
+      }
+      this._streamSwapchainFormat = normalizedFormat;
+      this._swapchainViewFormat = null;
+      if (typeof swapchain.format === 'string' && swapchain.format.length > 0) {
+        this.format = swapchain.format;
+      }
+      return true;
+    }
+
+    // Case 4: Other swapchain-managed formats (`bgra8unorm`, `rgba8unorm`, `rgba16unorm`, etc.)
+    if (swapchain && typeof swapchain.configureForStreamFormat === 'function') {
+      try {
+        applyToneMap('none', 1.0, null);
+        swapchain.configureForStreamFormat(normalizedFormat);
+      } catch (err) {
+        this._logDiagnostic(
+          'warn',
+          `[wgpu_worker] failed to configure swapchain for stream format ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
+        );
+        return false;
+      }
+      this._streamSwapchainFormat = normalizedFormat;
+      this._swapchainViewFormat = null;
+      if (typeof swapchain.format === 'string' && swapchain.format.length > 0) {
+        this.format = swapchain.format;
+      }
+      return true;
+    }
+
+    // Raw canvas context fallback (no WgpuSwapchain attached)
+    const isSrgb = normalizedFormat.endsWith('-srgb');
+    const baseFormat = isSrgb ? normalizedFormat.slice(0, -5) : normalizedFormat;
     if (
       baseFormat !== 'rgba8unorm' &&
       baseFormat !== 'bgra8unorm' &&
@@ -7487,8 +7882,8 @@ class WgpuCommandProcessor {
     ) {
       return false;
     }
-    const viewFormat = isSrgb ? declaredFormat : null;
-    this._streamSwapchainFormat = declaredFormat;
+    const viewFormat = isSrgb ? normalizedFormat : null;
+    this._streamSwapchainFormat = normalizedFormat;
     if (this.format === baseFormat && (this._swapchainViewFormat || null) === viewFormat) {
       return true;
     }
@@ -7501,7 +7896,7 @@ class WgpuCommandProcessor {
       } catch (err) {
         this._logDiagnostic(
           'warn',
-          `[wgpu_worker] failed to reconfigure swapchain format to ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+          `[wgpu_worker] failed to reconfigure swapchain format to ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
         );
         return false;
       }
@@ -7512,22 +7907,89 @@ class WgpuCommandProcessor {
         const cfg = {
           device: this.device,
           format: baseFormat,
-          alphaMode: 'opaque',
+          alphaMode: this._alphaMode || 'opaque',
         };
         if (viewFormats) {
           cfg.viewFormats = viewFormats;
         }
-        configureCanvasContextWithCopySrc(this.ctx, cfg);
+        configureCanvasContextWithViewFormats(this.ctx, cfg);
       } catch (err) {
         this._logDiagnostic(
           'warn',
-          `[wgpu_worker] failed to reconfigure canvas context format to ${declaredFormat}: ${sanitizeGpuErrorDetail(err)}`
+          `[wgpu_worker] failed to reconfigure canvas context format to ${normalizedFormat}: ${sanitizeGpuErrorDetail(err)}`
         );
         return false;
       }
       return true;
     }
     return true;
+  }
+
+  /**
+   * Configure swapchain HDR/SDR tonemapping and transfer options at runtime.
+   * Re-applies the active stream swapchain format immediately when one has been configured.
+   *
+   * @param {{
+   *   mode?: 'auto' | 'none' | 'passthrough' | 'reinhard' | 'aces' | null,
+   *   toneMapMode?: 'auto' | 'none' | 'passthrough' | 'reinhard' | 'aces' | null,
+   *   exposure?: number,
+   *   applySrgbEncode?: boolean | null,
+   *   hdrMode?: 'sdr-tonemap' | 'extended' | 'auto',
+   *   rgb10a2Transfer?: 'sdr' | 'linear',
+   * }} [opts]
+   */
+  setSwapchainToneMapOptions(opts = {}) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    if (o.mode !== undefined || o.toneMapMode !== undefined) {
+      this._swapchainToneMapMode = normalizeSwapchainToneMapMode(
+        o.mode !== undefined ? o.mode : o.toneMapMode
+      );
+    }
+    if (o.exposure !== undefined) {
+      this._swapchainExposure = normalizeSwapchainExposure(o.exposure, this._swapchainExposure);
+    }
+    if (o.applySrgbEncode !== undefined) {
+      this._swapchainApplySrgbEncode =
+        typeof o.applySrgbEncode === 'boolean' ? o.applySrgbEncode : null;
+    }
+    if (o.hdrMode !== undefined) {
+      this._swapchainHdrMode = normalizeSwapchainHdrMode(o.hdrMode);
+    }
+    if (o.rgb10a2Transfer !== undefined) {
+      this._swapchainRgb10a2Transfer = o.rgb10a2Transfer === 'linear' ? 'linear' : 'sdr';
+    }
+    if (this._streamSwapchainFormat) {
+      this.setSwapchainFormat(this._streamSwapchainFormat);
+    } else if (
+      this._swapchain &&
+      !this._swapchain.isDestroyed &&
+      typeof this._swapchain.setToneMapOptions === 'function'
+    ) {
+      const mode = this._swapchainToneMapMode || 'none';
+      this._activeToneMapMode = mode;
+      this._activeApplySrgbEncode = Boolean(this._swapchainApplySrgbEncode);
+      try {
+        this._swapchain.setToneMapOptions({
+          mode,
+          exposure: this._swapchainExposure,
+          applySrgbEncode: this._swapchainApplySrgbEncode,
+        });
+      } catch (_) {
+        // Ignore mock swapchains without tonemap options.
+      }
+    }
+    return {
+      toneMapMode: this._activeToneMapMode,
+      configuredToneMapMode: this._swapchainToneMapMode,
+      exposure: this._swapchainExposure,
+      applySrgbEncode: this._activeApplySrgbEncode,
+      hdrMode: this._swapchainHdrMode,
+      rgb10a2Transfer: this._swapchainRgb10a2Transfer,
+      streamFormat: this._streamSwapchainFormat,
+      canvasFormat: this.format,
+      viewFormat: this._swapchainViewFormat,
+      usesBlitFallback: Boolean(this._swapchain && this._swapchain.usesBlitFallback === true),
+    };
   }
 
   /**
@@ -7580,9 +8042,13 @@ class WgpuCommandProcessor {
         typeof this._swapchain.recover === 'function' &&
         options.recoverSwapchain !== false
     );
-    const effectiveFormat = this._streamSwapchainFormat
+    const savedStreamFormat = this._streamSwapchainFormat;
+    const savedViewFormat = this._swapchainViewFormat;
+    const effectiveFormat = savedStreamFormat
       ? swapchainRecovers
-        ? this._streamSwapchainFormat
+        ? savedViewFormat
+          ? this.format
+          : savedStreamFormat
         : this.format
       : options.format;
     this.bindDevice(newDevice, {
@@ -7597,11 +8063,17 @@ class WgpuCommandProcessor {
     ) {
       this.format = this._swapchain.format;
     }
+    if (swapchainRecovers && savedStreamFormat) {
+      this.setSwapchainFormat(savedStreamFormat);
+    }
     if (!swapchainRecovers && this.ctx && typeof this.ctx.configure === 'function') {
       const cfg = {
         device: newDevice,
         format: this.format,
-        alphaMode: typeof options.alphaMode === 'string' ? options.alphaMode : 'opaque',
+        alphaMode:
+          typeof options.alphaMode === 'string'
+            ? normalizeSwapchainAlphaMode(options.alphaMode)
+            : this._alphaMode || 'opaque',
       };
       if (this._swapchainViewFormat) {
         cfg.viewFormats = [this._swapchainViewFormat];
@@ -7867,6 +8339,7 @@ class WgpuCommandProcessor {
 
     if (streamThresholdBytes > 0 && this._ownsWgslPackCache) {
       let confirmedOverThreshold = false;
+      let confirmedContentLength = null;
       let probeNeedsRangedLoader = false;
       let preloadedBuffer = null;
 
@@ -7879,13 +8352,30 @@ class WgpuCommandProcessor {
         const contentLength = parseNonNegativeHeaderInt(
           readFetchResponseHeader(headResp, 'content-length')
         );
-        if (acceptRanges && acceptRanges.trim().toLowerCase() === 'none') {
-          probeNeedsRangedLoader = false;
-        } else if (contentLength !== null) {
-          if (contentLength > streamThresholdBytes) {
+        confirmedContentLength = contentLength;
+        const rangeDisabled = Boolean(acceptRanges && acceptRanges.trim().toLowerCase() === 'none');
+        const maxFullBufferBytes =
+          typeof options.maxFullFallbackBytes === 'number' &&
+          Number.isInteger(options.maxFullFallbackBytes) &&
+          options.maxFullFallbackBytes >= 0
+            ? options.maxFullFallbackBytes
+            : 256 * 1024 * 1024;
+        if (contentLength !== null && contentLength > streamThresholdBytes) {
+          if (rangeDisabled) {
+            if (maxFullBufferBytes > 0 && contentLength > maxFullBufferBytes) {
+              throw new Error(
+                `WGSL pack "${resolvedUrl}" is ${contentLength} bytes (> ${maxFullBufferBytes} byte full-buffer cap) and server returned Accept-Ranges: none; refusing full-buffer download`
+              );
+            }
+            probeNeedsRangedLoader = false;
+          } else {
             confirmedOverThreshold = true;
             probeNeedsRangedLoader = true;
           }
+        } else if (rangeDisabled) {
+          probeNeedsRangedLoader = false;
+        } else if (contentLength !== null) {
+          probeNeedsRangedLoader = false;
         } else if (typeof headResp.arrayBuffer === 'function') {
           // Simple non-HEAD-aware mock or endpoint already returned the pack body directly.
           const maybeBuf = await headResp.arrayBuffer();
@@ -7908,23 +8398,33 @@ class WgpuCommandProcessor {
       }
 
       if (probeNeedsRangedLoader) {
+        let rangedImportError = null;
+        let nextCache = null;
+        let prevCache = null;
         try {
           const mod = await import('./wgsl_pack_loader.js');
           if (mod && typeof mod.WgslPackCache === 'function') {
-            const prevCache = this.wgslPackCache;
-            const nextCache = new mod.WgslPackCache({
+            prevCache = this.wgslPackCache;
+            nextCache = new mod.WgslPackCache({
               fetch: activeFetch,
               streamThresholdBytes,
             });
-            this.wgslPackCache = nextCache;
-            syncRouterPackLoader(prevCache);
-            if (confirmedOverThreshold && typeof nextCache.loadIndexFromUrl === 'function') {
-              return await nextCache.loadIndexFromUrl(resolvedUrl, buildPackLoadOpts(false));
-            }
-            return await nextCache.loadPackUrl(resolvedUrl, buildPackLoadOpts(true));
           }
-        } catch (_) {
-          // Fall through to full-buffer fetch when dynamic ESM import is unavailable.
+        } catch (importErr) {
+          rangedImportError = importErr;
+        }
+        if (nextCache) {
+          this.wgslPackCache = nextCache;
+          syncRouterPackLoader(prevCache);
+          if (confirmedOverThreshold && typeof nextCache.loadIndexFromUrl === 'function') {
+            return await nextCache.loadIndexFromUrl(resolvedUrl, buildPackLoadOpts(false));
+          }
+          return await nextCache.loadPackUrl(resolvedUrl, buildPackLoadOpts(true));
+        }
+        if (confirmedOverThreshold) {
+          throw new Error(
+            `WGSL pack "${resolvedUrl}" is ${confirmedContentLength} bytes (> ${streamThresholdBytes} byte streaming threshold) and ranged wgsl_pack_loader.js is unavailable${rangedImportError ? `: ${sanitizeGpuErrorDetail(rangedImportError)}` : ''}`
+          );
         }
       }
     }
@@ -8811,21 +9311,23 @@ class WgpuCommandProcessor {
     const existing = this.buffers.get(id);
     if (existing) {
       const meta = this._bufferMeta.get(id);
-      const byteSize =
-        meta && typeof meta.byteSize === 'number' && meta.byteSize > 0
-          ? meta.byteSize
+      const trackedBytes =
+        meta && typeof meta.byteSize === 'number' && meta.byteSize > 0 ? meta.byteSize : 0;
+      const deferredBytes =
+        trackedBytes > 0
+          ? trackedBytes
           : typeof existing.size === 'number' && existing.size > 0
             ? existing.size
             : 0;
-      if (byteSize > 0) {
-        this._liveBufferBytes = Math.max(0, this._liveBufferBytes - byteSize);
+      if (trackedBytes > 0) {
+        this._liveBufferBytes = Math.max(0, this._liveBufferBytes - trackedBytes);
       }
       let retired = false;
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
         retired = Boolean(this.resourceRegistry.retire('buffer', id));
       }
       if (!retired) {
-        this._retireOrDestroyGpuResource(existing, byteSize);
+        this._retireOrDestroyGpuResource(existing, deferredBytes);
       }
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
@@ -9892,30 +10394,26 @@ class WgpuCommandProcessor {
       this.textureViews.set(id, textureView);
     }
     const size = effectiveDescriptor.size || {};
+    const sampleCount = Math.max(1, Math.floor(Number(effectiveDescriptor.sampleCount) || 1));
     const byteSize = estimateTextureBytes(
       size.width || 1,
       size.height || 1,
       size.depthOrArrayLayers || 1,
       effectiveDescriptor.mipLevelCount || 1,
       effectiveDescriptor.format,
-      effectiveDescriptor.dimension
+      effectiveDescriptor.dimension,
+      sampleCount
     );
-    this._textureMeta.set(id, {
+    this._recordTextureByteAccounting(id, texture, {
       byteSize,
       width: size.width || 1,
       height: size.height || 1,
       depthOrArrayLayers: size.depthOrArrayLayers || 1,
       mipLevelCount: effectiveDescriptor.mipLevelCount || 1,
+      sampleCount,
       format: effectiveDescriptor.format || 'rgba8unorm',
       dimension: effectiveDescriptor.dimension || '2d',
     });
-    this._liveTextureBytes += byteSize;
-    if (this._liveTextureBytes > this._peakTextureBytes) {
-      this._peakTextureBytes = this._liveTextureBytes;
-    }
-    if (this._deferredResourceBytes !== null && texture && typeof texture === 'object') {
-      this._deferredResourceBytes.set(texture, byteSize);
-    }
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('texture', id, texture, {
         byteSize,
@@ -9928,6 +10426,168 @@ class WgpuCommandProcessor {
         });
       }
     }
+  }
+
+  _recordTextureByteAccounting(id, texture, meta) {
+    const safeBytes =
+      meta && typeof meta.byteSize === 'number' && Number.isFinite(meta.byteSize) && meta.byteSize > 0
+        ? Math.trunc(meta.byteSize)
+        : 0;
+    const prev = this._textureMeta.get(id);
+    if (prev && prev.texture === texture) {
+      return;
+    }
+    if (prev && typeof prev.byteSize === 'number' && prev.byteSize > 0) {
+      this._liveTextureBytes = Math.max(0, this._liveTextureBytes - prev.byteSize);
+    }
+    this._textureMeta.set(id, {
+      texture,
+      byteSize: safeBytes,
+      width: meta.width || 1,
+      height: meta.height || 1,
+      depthOrArrayLayers: meta.depthOrArrayLayers || 1,
+      mipLevelCount: meta.mipLevelCount || 1,
+      sampleCount: meta.sampleCount || 1,
+      format: meta.format || 'rgba8unorm',
+      dimension: meta.dimension || '2d',
+    });
+    this._liveTextureBytes += safeBytes;
+    if (this._liveTextureBytes > this._peakTextureBytes) {
+      this._peakTextureBytes = this._liveTextureBytes;
+    }
+    if (this._deferredResourceBytes !== null && texture && typeof texture === 'object') {
+      this._deferredResourceBytes.set(texture, safeBytes);
+    }
+  }
+
+  /**
+   * #1077: Reconcile live/peak GPU texture byte accounting for textures created by packet ABI
+   * extensions (`TexturePackets` / `RenderStatePackets`), which register directly into
+   * `this.textures` without going through `_createTrackedTexture`. O(1) no-op when already
+   * accounted for the same `GPUTexture` instance.
+   */
+  _reconcileTrackedTextureAfterExternalCreate(id, view, payloadOffset, isV2) {
+    const texture = this.textures.get(id);
+    if (!texture) {
+      return;
+    }
+    const existing = this._textureMeta.get(id);
+    if (existing && existing.texture === texture) {
+      return;
+    }
+    const renderStateExt = this._getRenderStateExtension();
+    const rsMeta =
+      renderStateExt &&
+      renderStateExt.textureMeta &&
+      typeof renderStateExt.textureMeta.get === 'function'
+        ? renderStateExt.textureMeta.get(id)
+        : null;
+    const texDesc = texture && typeof texture.desc === 'object' ? texture.desc : null;
+    const texDescSize = texDesc && typeof texDesc.size === 'object' ? texDesc.size : null;
+
+    let width =
+      (rsMeta && rsMeta.width > 0 ? rsMeta.width : 0) ||
+      (typeof texture.width === 'number' && texture.width > 0 ? texture.width : 0) ||
+      (texDescSize && texDescSize.width > 0 ? texDescSize.width : 0);
+    let height =
+      (rsMeta && rsMeta.height > 0 ? rsMeta.height : 0) ||
+      (typeof texture.height === 'number' && texture.height > 0 ? texture.height : 0) ||
+      (texDescSize && texDescSize.height > 0 ? texDescSize.height : 0);
+    let depthOrArrayLayers =
+      (rsMeta && rsMeta.depthOrArrayLayers > 0 ? rsMeta.depthOrArrayLayers : 0) ||
+      (typeof texture.depthOrArrayLayers === 'number' && texture.depthOrArrayLayers > 0
+        ? texture.depthOrArrayLayers
+        : 0) ||
+      (texDescSize && texDescSize.depthOrArrayLayers > 0 ? texDescSize.depthOrArrayLayers : 0);
+    let mipLevelCount =
+      (typeof texture.mipLevelCount === 'number' && texture.mipLevelCount > 0
+        ? texture.mipLevelCount
+        : 0) ||
+      (texDesc && texDesc.mipLevelCount > 0 ? texDesc.mipLevelCount : 0);
+    let sampleCount =
+      (rsMeta && rsMeta.sampleCount > 0 ? rsMeta.sampleCount : 0) ||
+      (typeof texture.sampleCount === 'number' && texture.sampleCount > 0
+        ? texture.sampleCount
+        : 0) ||
+      (texDesc && texDesc.sampleCount > 0 ? texDesc.sampleCount : 0);
+    let format =
+      (rsMeta && typeof rsMeta.format === 'string' && rsMeta.format.length > 0
+        ? rsMeta.format
+        : null) ||
+      (typeof texture.format === 'string' && texture.format.length > 0 ? texture.format : null) ||
+      (texDesc && typeof texDesc.format === 'string' && texDesc.format.length > 0
+        ? texDesc.format
+        : null);
+    let dimension =
+      (rsMeta && typeof rsMeta.dimension === 'string' && rsMeta.dimension.length > 0
+        ? rsMeta.dimension
+        : null) ||
+      (typeof texture.dimension === 'string' && texture.dimension.length > 0
+        ? texture.dimension
+        : null) ||
+      (texDesc && typeof texDesc.dimension === 'string' && texDesc.dimension.length > 0
+        ? texDesc.dimension
+        : null);
+
+    if (view && typeof payloadOffset === 'number') {
+      if (isV2 && payloadOffset + 32 <= view.byteLength) {
+        if (!width) width = Math.max(1, view.getUint32(payloadOffset + 4, true));
+        if (!height) height = Math.max(1, view.getUint32(payloadOffset + 8, true));
+        if (!depthOrArrayLayers) {
+          depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 12, true));
+        }
+        if (!mipLevelCount) mipLevelCount = Math.max(1, view.getUint32(payloadOffset + 16, true));
+        if (!sampleCount) sampleCount = Math.max(1, view.getUint32(payloadOffset + 20, true));
+        if (!dimension) {
+          dimension = TEXTURE_DIMENSION_NAMES[view.getUint8(payloadOffset + 28)] || '2d';
+        }
+        if (!format) {
+          const fmtCode = view.getUint8(payloadOffset + 29);
+          format = (fmtCode > 0 && TEXTURE_FORMAT_NAMES_V2[fmtCode]) || 'rgba8unorm';
+        }
+      } else if (!isV2 && payloadOffset + 32 <= view.byteLength) {
+        if (!width) width = Math.max(1, view.getUint32(payloadOffset + 4, true));
+        if (!height) height = Math.max(1, view.getUint32(payloadOffset + 8, true));
+        if (!depthOrArrayLayers) {
+          depthOrArrayLayers = Math.max(1, view.getUint32(payloadOffset + 12, true));
+        }
+        if (!mipLevelCount) mipLevelCount = Math.max(1, view.getUint32(payloadOffset + 16, true));
+        if (!format) {
+          format = TEXTURE_FORMAT_NAMES[view.getUint32(payloadOffset + 20, true)] || 'rgba8unorm';
+        }
+        if (!dimension) {
+          dimension = TEXTURE_DIMENSION_NAMES[view.getUint32(payloadOffset + 28, true)] || '2d';
+        }
+      }
+    }
+
+    width = Math.max(1, width || 1);
+    height = Math.max(1, height || 1);
+    depthOrArrayLayers = Math.max(1, depthOrArrayLayers || 1);
+    mipLevelCount = Math.max(1, mipLevelCount || 1);
+    sampleCount = Math.max(1, sampleCount || 1);
+    format = format || 'rgba8unorm';
+    dimension = dimension || '2d';
+
+    const byteSize = estimateTextureBytes(
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevelCount,
+      format,
+      dimension,
+      sampleCount
+    );
+    this._recordTextureByteAccounting(id, texture, {
+      byteSize,
+      width,
+      height,
+      depthOrArrayLayers,
+      mipLevelCount,
+      sampleCount,
+      format,
+      dimension,
+    });
   }
 
   _handleCreateTexture(view, payloadOffset) {
@@ -10511,6 +11171,13 @@ class WgpuCommandProcessor {
     }
 
     switch (opcode) {
+      case OPCODES.CREATE_TEXTURE2: {
+        if (payloadBytes >= 32) {
+          const id = view.getUint32(payloadOffset, true);
+          this._reconcileTrackedTextureAfterExternalCreate(id, view, payloadOffset, true);
+        }
+        break;
+      }
       case OPCODES.CREATE_BIND_GROUP_LAYOUT: {
         if (payloadBytes >= 24) {
           const id = view.getUint32(payloadOffset, true);
@@ -12139,6 +12806,10 @@ class WgpuCommandProcessor {
       case OPCODES.CREATE_TEXTURE:
         if (payloadBytes >= 32) {
           this._handleCreateTexture(view, payloadOffset);
+          if (this._handleCreateTexture !== WgpuCommandProcessor.prototype._handleCreateTexture) {
+            const texId = view.getUint32(payloadOffset, true);
+            this._reconcileTrackedTextureAfterExternalCreate(texId, view, payloadOffset, false);
+          }
         } else {
           this._recordOpValidationError('CreateTexture', `truncated payload (${payloadBytes}B < 32B)`);
         }
@@ -12477,7 +13148,8 @@ class WgpuCommandProcessor {
       }
     }
     const swapchainFormat = sanitizeSwapchainFormatToken(
-      (swapchain && (swapchain.streamFormat || swapchain.format)) ||
+      (this._swapchainViewFormat && this._streamSwapchainFormat) ||
+        (swapchain && (swapchain.streamFormat || swapchain.format)) ||
         this._streamSwapchainFormat ||
         this.format
     );
@@ -12645,6 +13317,9 @@ class WgpuCommandProcessor {
       binkPresenter,
       swapchain,
       swapchainFormat,
+      swapchainViewFormat: this._swapchainViewFormat,
+      toneMapMode: this._activeToneMapMode,
+      applySrgbEncode: this._activeApplySrgbEncode,
       usesBlitFallback,
       blitCount,
       texturePackets,
@@ -13762,7 +14437,8 @@ function resolveSwapchainTelemetry(processor, stats) {
   }
   const src = raw && typeof raw === 'object' ? raw : {};
   const swapchainFormat = sanitizeSwapchainFormatToken(
-    src.swapchainFormat ||
+    (processor && processor._swapchainViewFormat && processor._streamSwapchainFormat) ||
+      src.swapchainFormat ||
       src.streamFormat ||
       src.format ||
       (stats && stats.swapchainFormat) ||
@@ -14839,7 +15515,7 @@ function createWgpuWorkerHandler(options = {}) {
       }
       targetProcessor.rebindDevice(acquired.device, acquired.ctx, {
         format: acquired.format,
-        alphaMode: 'opaque',
+        alphaMode: targetProcessor._alphaMode || 'opaque',
       });
       installPacketExtensions(targetProcessor);
       // W104/W105: recreate live pre-loss guest resources on the new device in async chunks so
@@ -15098,8 +15774,18 @@ function createWgpuWorkerHandler(options = {}) {
       }
     }
 
+    const resolvedAlphaMode = normalizeSwapchainAlphaMode(
+      initPayload.alphaMode ??
+        options.alphaMode ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.alphaMode) ??
+        (options.swapchainOptions && options.swapchainOptions.alphaMode)
+    );
     if (!activeSwapchain) {
-      configureCanvasContextWithCopySrc(ctx, { device, format, alphaMode: 'opaque' });
+      configureCanvasContextWithCopySrc(ctx, {
+        device,
+        format,
+        alphaMode: resolvedAlphaMode,
+      });
     }
     swapchain = activeSwapchain;
 
@@ -15107,6 +15793,38 @@ function createWgpuWorkerHandler(options = {}) {
 
     processor = new WgpuCommandProcessor(device, ctx, {
       format,
+      alphaMode: resolvedAlphaMode,
+      hdrMode:
+        initPayload.hdrMode ??
+        initPayload.swapchainHdrMode ??
+        options.hdrMode ??
+        options.swapchainHdrMode ??
+        'sdr-tonemap',
+      directSrgbView:
+        initPayload.directSrgbView ??
+        options.directSrgbView ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.directSrgbView) ??
+        (options.swapchainOptions && options.swapchainOptions.directSrgbView),
+      toneMapMode:
+        initPayload.toneMapMode ??
+        options.toneMapMode ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.toneMapMode) ??
+        (options.swapchainOptions && options.swapchainOptions.toneMapMode),
+      exposure:
+        initPayload.exposure ??
+        options.exposure ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.exposure) ??
+        (options.swapchainOptions && options.swapchainOptions.exposure),
+      applySrgbEncode:
+        initPayload.applySrgbEncode ??
+        options.applySrgbEncode ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.applySrgbEncode) ??
+        (options.swapchainOptions && options.swapchainOptions.applySrgbEncode),
+      rgb10a2Transfer:
+        initPayload.rgb10a2Transfer ??
+        options.rgb10a2Transfer ??
+        (initPayload.swapchainOptions && initPayload.swapchainOptions.rgb10a2Transfer) ??
+        (options.swapchainOptions && options.swapchainOptions.rgb10a2Transfer),
       width,
       height,
       now: telemetryNow,
@@ -15489,13 +16207,13 @@ function createWgpuWorkerHandler(options = {}) {
             const resizeCfg = {
               device: processor.device,
               format: processor.format,
-              alphaMode: 'opaque',
+              alphaMode: processor._alphaMode || 'opaque',
             };
             if (processor._swapchainViewFormat) {
               resizeCfg.viewFormats = [processor._swapchainViewFormat];
             }
             try {
-              configureCanvasContextWithCopySrc(processor.ctx, resizeCfg);
+              configureCanvasContextWithViewFormats(processor.ctx, resizeCfg);
             } catch (_) {
               // Ignore best-effort raw canvas reconfigure errors.
             }
@@ -15616,6 +16334,22 @@ function createWgpuWorkerHandler(options = {}) {
             chunkedWriteBufferUploads: stats
               ? toNonNegativeInt(stats.chunkedWriteBufferUploads, 0)
               : 0,
+            gpuMemory:
+              stats && stats.gpuMemory && typeof stats.gpuMemory === 'object'
+                ? { ...stats.gpuMemory }
+                : null,
+            liveBufferBytes: stats ? toNonNegativeInt(stats.liveBufferBytes, 0) : 0,
+            liveTextureBytes: stats ? toNonNegativeInt(stats.liveTextureBytes, 0) : 0,
+            peakBufferBytes: stats ? toNonNegativeInt(stats.peakBufferBytes, 0) : 0,
+            peakTextureBytes: stats ? toNonNegativeInt(stats.peakTextureBytes, 0) : 0,
+            stagingPoolBytes: stats ? toNonNegativeInt(stats.stagingPoolBytes, 0) : 0,
+            pendingDeferredDestroys: stats ? toNonNegativeInt(stats.pendingDeferredDestroys, 0) : 0,
+            pendingDeferredDestroyBytes: stats
+              ? toNonNegativeInt(stats.pendingDeferredDestroyBytes, 0)
+              : 0,
+            deferredHighWaterFlushes: stats
+              ? toNonNegativeInt(stats.deferredHighWaterFlushes, 0)
+              : 0,
             gpuTimer: resolveGpuTimerTelemetry(processor, stats),
             gpuRecorder: resolveGpuRecorderTelemetry(processor, stats),
             ...resolve30FpsTelemetry(processor, stats),
@@ -15631,6 +16365,22 @@ function createWgpuWorkerHandler(options = {}) {
             gpuAdapter: (stats && stats.gpuAdapter) || getActiveGpuAdapter(),
           });
         }
+      } else if (
+        (payload.type === 'set-swapchain-tonemap' || payload.setSwapchainToneMapOptions) &&
+        processor &&
+        typeof processor.setSwapchainToneMapOptions === 'function'
+      ) {
+        const toneMapOpts =
+          payload.setSwapchainToneMapOptions &&
+          typeof payload.setSwapchainToneMapOptions === 'object'
+            ? payload.setSwapchainToneMapOptions
+            : payload;
+        const result = processor.setSwapchainToneMapOptions(toneMapOpts);
+        postMessage({
+          id: payload.id,
+          type: 'swapchain-tonemap-updated',
+          ...result,
+        });
       } else if ((payload.type === 'scene-transition' || payload.sceneTransition) && processor) {
         const reclaimed =
           typeof processor.notifySceneTransition === 'function'
