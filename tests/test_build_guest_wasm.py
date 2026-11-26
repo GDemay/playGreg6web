@@ -3912,7 +3912,7 @@ const CMD_RUN = 'run';
 var LDSO = {
   loadedLibsByName: {
     'guest_part_0.wasm': { exports: { sub_1000: () => 10, keep_meta: 1 } },
-    'guest_part_1.wasm': { exports: { sub_2000: (a, b) => a + b } },
+    'guest_part_1.wasm': { exports: { sub_2000: (state) => state + 2 } },
     'other_plugin.wasm': { exports: { plugin_init: () => 'ok' } },
   },
 };
@@ -3983,7 +3983,7 @@ async function loadDylibs() {
   __createdStubs.sub_missing = part0.envProxy.sub_missing;
 
   // Part 1 loads afterwards and publishes sub_2000 into wasmImports.
-  wasmImports.sub_2000 = (a, b) => a + b;
+  wasmImports.sub_2000 = (state) => state + 2;
   instantiateModule(
     'guest_part_1.wasm',
     { sub_local_1: () => 9 },
@@ -4218,7 +4218,7 @@ var PThread = {
 
   const resolveCallsAfterInit = __debugResolveCalls;
   // Cross-shard lazy stub MUST still invoke resolved target AFTER cleanup without re-resolving!
-  const crossShardResult = __createdStubs.sub_2000(40, 2);
+  const crossShardResult = __createdStubs.sub_2000(40);
   const localScopeResult = __createdStubs.sub_local_0();
   const resolveCallsAfterStubInvocation = __debugResolveCalls;
 
@@ -7885,6 +7885,395 @@ class TestT96LibopusAndOptModule(unittest.TestCase):
                     )
                 self.assertEqual(bad_code, 2, bad_arg)
                 self.assertIn("--opt-module", err_err.getvalue())
+
+
+class TestT97FastSplitStubsAndSingleSideCollapse(unittest.TestCase):
+    """T97 (Refs #663): zero-alloc fixed-arity split stubs and opt-in single code side module collapse."""
+
+    _STUB_FIXTURE = r"""
+var LDSO = { loadedLibsByName: { 'guest_part_0.wasm': { exports: {} } } };
+var wasmImports = {};
+var GOT = {};
+var functionsInTableMap = new Map();
+var __resolveCalls = {};
+
+function instantiateModule(localScope) {
+  var moduleExports;
+  function resolveSymbol(sym) {
+    __resolveCalls[sym] = (__resolveCalls[sym] || 0) + 1;
+    return wasmImports[sym] || (localScope && localScope[sym]) || (moduleExports && moduleExports[sym]);
+  }
+  var proxyHandler = {
+    get(stubs, prop) {
+      if (!(prop in stubs)) {
+        var resolved;
+        stubs[prop] = (...args) => {
+          resolved ||= resolveSymbol(prop);
+          return resolved(...args);
+        };
+      }
+      return stubs[prop];
+    }
+  };
+  moduleExports = {};
+  return new Proxy({}, proxyHandler);
+}
+
+var __envProxy;
+async function loadDylibs() {
+  __envProxy = instantiateModule({});
+}
+async function finishBoot() {
+  await loadDylibs();
+}
+"""
+
+    def _require_node(self) -> str:
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("node executable not available on PATH")
+        return node
+
+    def _run_node(self, script: str) -> dict[str, object]:
+        node = self._require_node()
+        with tempfile.TemporaryDirectory() as tmp:
+            js_path = Path(tmp) / "t97_harness.js"
+            js_path.write_text(script, encoding="utf-8")
+            chk = subprocess.run([node, "--check", str(js_path)], capture_output=True, text=True, check=False)
+            self.assertEqual(chk.returncode, 0, f"node --check failed:\n{chk.stderr}")
+            proc = subprocess.run([node, str(js_path)], capture_output=True, text=True, check=False)
+            self.assertEqual(proc.returncode, 0, f"node run failed:\nstdout={proc.stdout}\nstderr={proc.stderr}")
+            return json.loads(proc.stdout)
+
+    def test_stub_binders_emits_fixed_arity_wrappers_and_executes_eager_and_lazy(self) -> None:
+        patched, status = bgw.optimize_split_runtime_js(
+            self._STUB_FIXTURE,
+            max_concurrent_pthread_loads=0,
+        )
+        self.assertEqual(
+            status,
+            {
+                "already_patched": False,
+                "stub_binders": True,
+                "export_clearers": True,
+                "post_load_dylibs_cleanup": True,
+                "pthread_cmd_load_throttle": False,
+                "pthread_cmd_loaded_dispatch": False,
+            },
+        )
+        self.assertIn(bgw.SPLIT_PTHREAD_OPT_MARKER, patched)
+        self.assertIn("(a) => (resolved || (resolved = resolveSymbol(_p)))(a)", patched)
+        self.assertIn("(a, b) => (resolved || (resolved = resolveSymbol(_p)))(a, b)", patched)
+        self.assertIn("(...args) => (resolved || (resolved = resolveSymbol(_p)))(...args)", patched)
+
+        harness = patched + r"""
+(async () => {
+  // 1) Lazy path BEFORE finishBoot() / __pg6StubBinders runs:
+  const lazyProxy = instantiateModule({});
+  const lazySub = lazyProxy.sub_140001000;
+  const lazyDispatch = lazyProxy.__playgta6_dispatch_shard_main_00000;
+  const lazyOther = lazyProxy.pg6_runtime_vararg;
+  const lazySym = lazyProxy[Symbol('sym_key')];
+
+  // Inspect wrapper arity & source before eager binding overwrites stubs[_p]:
+  const shapes = {
+    subLen: lazySub.length,
+    subSrc: String(lazySub),
+    dispatchLen: lazyDispatch.length,
+    dispatchSrc: String(lazyDispatch),
+    otherLen: lazyOther.length,
+    otherSrc: String(lazyOther),
+    symLen: lazySym.length,
+  };
+
+  // Populate targets AFTER stubs were created (simulating forward cross-part reference).
+  wasmImports.sub_140001000 = (statePtr) => statePtr + 16n;
+  wasmImports.__playgta6_dispatch_shard_main_00000 = (localIdx, statePtr) => `${localIdx}:${statePtr}`;
+  wasmImports.pg6_runtime_vararg = (a, b, c, d) => a + b + c + d;
+
+  // First lazy call resolves & caches; second call reuses cached `resolved`.
+  const lazySubR1 = lazySub(0x1000n).toString();
+  const lazySubR2 = lazySub(0x2000n).toString();
+  const lazyDispatchR1 = lazyDispatch(7, 0x3000n);
+  const lazyDispatchR2 = lazyDispatch(8, 0x4000n);
+  const lazyOtherR1 = lazyOther(1, 2, 3, 4);
+  const lazyOtherR2 = lazyOther(10, 20, 30, 40);
+  const lazyResolveCounts = {
+    sub: __resolveCalls.sub_140001000,
+    dispatch: __resolveCalls.__playgta6_dispatch_shard_main_00000,
+    other: __resolveCalls.pg6_runtime_vararg,
+  };
+
+  // 2) Eager path via finishBoot() -> await loadDylibs() -> __pg6StubBinders:
+  // Create stubs inside loadDylibs(), then resolve them before cleanup runs.
+  const origLoadDylibs = loadDylibs;
+  let capturedEagerSub, capturedEagerDispatch, capturedEagerOther;
+  let targetEagerSub, targetEagerDispatch, targetEagerOther;
+  loadDylibs = async () => {
+    await origLoadDylibs();
+    capturedEagerSub = __envProxy.sub_180002000;
+    capturedEagerDispatch = __envProxy.__playgta6_dispatch_shard_bink2_00001;
+    capturedEagerOther = __envProxy.pg6_win32_multi;
+
+    targetEagerSub = (statePtr) => statePtr * 2n;
+    targetEagerDispatch = (idx, statePtr) => `${idx}@${statePtr}`;
+    targetEagerOther = (a, b, c, d, e) => [a, b, c, d, e].join('-');
+    wasmImports.sub_180002000 = targetEagerSub;
+    wasmImports.__playgta6_dispatch_shard_bink2_00001 = targetEagerDispatch;
+    wasmImports.pg6_win32_multi = targetEagerOther;
+  };
+
+  await finishBoot();
+  const resolveAfterBoot = {
+    sub: __resolveCalls.sub_180002000,
+    dispatch: __resolveCalls.__playgta6_dispatch_shard_bink2_00001,
+    other: __resolveCalls.pg6_win32_multi,
+  };
+
+  // Captured wrappers invoke pre-bound `resolved` with ZERO additional resolveSymbol calls,
+  // even though post_load_dylibs_cleanup deleted wasmImports.sub_180002000!
+  const eagerSubR = capturedEagerSub(50n).toString();
+  const eagerDispatchR = capturedEagerDispatch(3, 99n);
+  const eagerOtherR = capturedEagerOther('a', 'b', 'c', 'd', 'e');
+  const resolveAfterCalls = {
+    sub: __resolveCalls.sub_180002000,
+    dispatch: __resolveCalls.__playgta6_dispatch_shard_bink2_00001,
+    other: __resolveCalls.pg6_win32_multi,
+  };
+
+  // Subsequent property lookups on __envProxy get the raw resolved target directly!
+  const directRebound = {
+    subDirect: __envProxy.sub_180002000 === targetEagerSub,
+    dispatchDirect: __envProxy.__playgta6_dispatch_shard_bink2_00001 === targetEagerDispatch,
+    otherDirect: __envProxy.pg6_win32_multi === targetEagerOther,
+  };
+
+  console.log(JSON.stringify({
+    shapes,
+    lazySubR1,
+    lazySubR2,
+    lazyDispatchR1,
+    lazyDispatchR2,
+    lazyOtherR1,
+    lazyOtherR2,
+    lazyResolveCounts,
+    resolveAfterBoot,
+    resolveAfterCalls,
+    eagerSubR,
+    eagerDispatchR,
+    eagerOtherR,
+    directRebound,
+    bindersCleared: globalThis.__pg6StubBinders === null,
+    subDeletedFromWasmImports: !('sub_180002000' in wasmImports),
+  }));
+})();
+"""
+        res = self._run_node(harness)
+        shapes = res["shapes"]
+        assert isinstance(shapes, dict)
+        self.assertEqual(shapes["subLen"], 1)
+        self.assertNotIn("...", shapes["subSrc"])
+        self.assertNotIn("startsWith", shapes["subSrc"])
+        self.assertEqual(shapes["dispatchLen"], 2)
+        self.assertNotIn("...", shapes["dispatchSrc"])
+        self.assertNotIn("startsWith", shapes["dispatchSrc"])
+        self.assertEqual(shapes["otherLen"], 0)
+        self.assertIn("...", shapes["otherSrc"])
+        self.assertEqual(shapes["symLen"], 0)
+
+        self.assertEqual(res["lazySubR1"], str(0x1010))
+        self.assertEqual(res["lazySubR2"], str(0x2010))
+        self.assertEqual(res["lazyDispatchR1"], f"7:{0x3000}")
+        self.assertEqual(res["lazyDispatchR2"], f"8:{0x4000}")
+        self.assertEqual(res["lazyOtherR1"], 10)
+        self.assertEqual(res["lazyOtherR2"], 100)
+        self.assertEqual(res["lazyResolveCounts"], {"sub": 1, "dispatch": 1, "other": 1})
+
+        self.assertEqual(res["resolveAfterBoot"], {"sub": 1, "dispatch": 1, "other": 1})
+        self.assertEqual(res["resolveAfterCalls"], {"sub": 1, "dispatch": 1, "other": 1})
+        self.assertEqual(res["eagerSubR"], "100")
+        self.assertEqual(res["eagerDispatchR"], "3@99")
+        self.assertEqual(res["eagerOtherR"], "a-b-c-d-e")
+        self.assertEqual(
+            res["directRebound"],
+            {"subDirect": True, "dispatchDirect": True, "otherDirect": True},
+        )
+        self.assertTrue(res["bindersCleared"])
+        self.assertTrue(res["subDeletedFromWasmImports"])
+
+    def test_stub_binders_avoids_parameter_shadowing_with_minified_names(self) -> None:
+        minified_fixture = r"""
+var wasmImports = {};
+function mk() {
+  let moduleExports;
+  function b(k) { return wasmImports[k]; }
+  var h = {
+    get(a, p) {
+      if (!(p in a)) { let r; a[p] = (...c) => { r ||= b(p); return r(...c); }; }
+      return a[p];
+    }
+  };
+  moduleExports = {};
+  return new Proxy({}, h);
+}
+async function loadDylibs() {}
+async function boot() { await loadDylibs(); }
+"""
+        patched, status = bgw.optimize_split_runtime_js(minified_fixture, max_concurrent_pthread_loads=0)
+        self.assertTrue(status["stub_binders"])
+        res = self._run_node(
+            patched
+            + r"""
+(async () => {
+  const px = mk();
+  const s = px.sub_42;
+  const d = px.__playgta6_dispatch_shard_m_0;
+  const o = px.other_fn;
+  wasmImports.sub_42 = (x) => x + 1;
+  wasmImports.__playgta6_dispatch_shard_m_0 = (x, y) => x * y;
+  wasmImports.other_fn = (x, y, z) => x + y + z;
+  await boot();
+  console.log(JSON.stringify({ s: s(41), d: d(6, 7), o: o(10, 20, 30) }));
+})();
+"""
+        )
+        self.assertEqual(res, {"s": 42, "d": 42, "o": 60})
+
+    def test_asymmetric_opt_in_collapse_single_side_module(self) -> None:
+        def _fake(unit_id: str, size: int) -> bgw.UnitBuildResult:
+            p = Path(unit_id)
+            return bgw.UnitBuildResult(
+                unit=bgw.SourceUnit(unit_id, p, "ll"),
+                cache_key="k",
+                cache_hit=True,
+                object_path=p.with_suffix(".o"),
+                argv=(),
+                status="hit",
+                object_bytes=size,
+            )
+
+        items = [_fake(f"lift/shard-{i:05d}.ll", 100) for i in range(4)]
+        # Total = 400 <= 994: default keeps 2 buckets (backwards-compatible), collapse_if_fits collapses to 1.
+        self.assertEqual(len(bgw.partition_shards_asymmetric(items, 2, max_bucket_bytes=994)), 2)
+        collapsed = bgw.partition_shards_asymmetric(
+            items, 2, max_bucket_bytes=994, collapse_if_fits=True
+        )
+        self.assertEqual(len(collapsed), 1)
+        self.assertEqual([it.unit.unit_id for it in collapsed[0]], [it.unit.unit_id for it in items])
+
+        # Exact-n case (2 shards, 2 buckets) also collapses when combined weight fits.
+        collapsed_two = bgw.partition_shards_asymmetric(
+            items[:2], 2, max_bucket_bytes=200, collapse_if_fits=True
+        )
+        self.assertEqual(len(collapsed_two), 1)
+
+        # Total = 400 > 350: still splits into 2 buckets under the cap.
+        still_split = bgw.partition_shards_asymmetric(
+            items, 2, max_bucket_bytes=350, collapse_if_fits=True
+        )
+        self.assertEqual(len(still_split), 2)
+        self.assertEqual(len(still_split[0]), 3)
+        self.assertEqual(len(still_split[1]), 1)
+
+        # End-to-end mocked build + CLI dry-run with --collapse-single-side-module:
+        # 1 code side module (guest_part_0.wasm) + 1 registration module (guest_part_1.wasm),
+        # with ZERO cross-part sub_* exports between shards!
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            orig_lib = _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+            _write(repo / "runtime" / "wasm_boot.cpp", "void wasm_boot() {}\n")
+
+            src = root / "recomp-collapse"
+            _write(src / "lift" / "shard-00000.ll", "; s0\n")
+            _write(src / "lift" / "shard-00001.ll", "; s1\n")
+            _write(src / "lift" / "functions.ll", "; reg\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            nm_outputs = {
+                "shard-00000": "\n".join(
+                    [
+                        "00000000 T sub_140001000",
+                        "00000010 T __playgta6_dispatch_shard_main_00000",
+                        "         U sub_140002000",
+                    ]
+                ),
+                "shard-00001": "\n".join(
+                    [
+                        "00000000 T sub_140002000",
+                        "00000010 T __playgta6_dispatch_shard_main_00001",
+                        "         U sub_140001000",
+                    ]
+                ),
+                "functions": "\n".join(
+                    [
+                        "00000000 D __playgta6_shard_dispatch_main",
+                        "         U __playgta6_dispatch_shard_main_00000",
+                        "         U __playgta6_dispatch_shard_main_00001",
+                    ]
+                ),
+                "pg6_import_thunks": "         U __playgta6_shard_dispatch_main\n",
+            }
+            cache = root / "cache"
+            out_dir = root / "dist"
+            runner = RecordingRunner(nm_outputs=nm_outputs)
+            rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                collapse_single_side_module=True,
+                runtime_lib=orig_lib,
+                run_command=runner,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(rep.ok, rep.errors)
+            self.assertEqual([m.name for m in rep.side_modules], ["guest_part_0.wasm", "guest_part_1.wasm"])
+            self.assertEqual([m.role for m in rep.side_modules], ["shards", "registration"])
+            self.assertEqual(
+                rep.side_modules[0].shards,
+                ("lift/shard-00000.ll", "lift/shard-00001.ll"),
+            )
+            self.assertEqual(rep.side_modules[1].shards, ("lift/functions.ll",))
+
+            # Both sub_140001000 and sub_140002000 are intra-module inside guest_part_0.wasm -> pruned!
+            rsp0_lines = (cache / "side_part_0_exports.rsp").read_text(encoding="utf-8").splitlines()
+            self.assertNotIn("-Wl,--export=sub_140001000", rsp0_lines)
+            self.assertNotIn("-Wl,--export=sub_140002000", rsp0_lines)
+            self.assertIn("-Wl,--export=__playgta6_dispatch_shard_main_00000", rsp0_lines)
+            self.assertIn("-Wl,--export=__playgta6_dispatch_shard_main_00001", rsp0_lines)
+
+            # CLI flag wiring check.
+            code, out, err = _run_cli(
+                [
+                    str(src),
+                    "--dry-run",
+                    "--json",
+                    "--split-modules",
+                    "2",
+                    "--split-strategy",
+                    "asymmetric",
+                    "--collapse-single-side-module",
+                    "--repo-root",
+                    str(repo),
+                    "--cache-dir",
+                    str(cache),
+                    "--out-dir",
+                    str(root / "dist-cli"),
+                ]
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertTrue(payload["ok"])
+            self.assertEqual(
+                [m["name"] for m in payload["side_modules"]],
+                ["guest_part_0.wasm", "guest_part_1.wasm"],
+            )
 
 
 if __name__ == "__main__":

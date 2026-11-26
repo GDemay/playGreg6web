@@ -1882,6 +1882,7 @@ def partition_shards_asymmetric(
     bucket_count: int,
     *,
     max_bucket_bytes: int | None = None,
+    collapse_if_fits: bool = False,
 ) -> list[list[UnitBuildResult]]:
     """Partition shards into up to `bucket_count` asymmetric contiguous slices in VA order.
 
@@ -1891,6 +1892,10 @@ def partition_shards_asymmetric(
     non-empty. When total weight exceeds `bucket_count * max_bucket_bytes`, relaxes the per-bucket
     ceiling only to the exact minimax contiguous bound so remaining buckets stay as small as
     possible under V8's 1 GiB limit (two-part shape ≈ 994/171 MiB).
+
+    When `collapse_if_fits=True` and the combined weight of all shards is `<= max_bucket_bytes`,
+    collapses all code shards into a single bucket (`[ordered]`) so there are zero cross-part
+    `sub_*` imports/exports between code side modules.
     """
     bucket_limit = parse_split_modules(bucket_count)
     if max_bucket_bytes is not None:
@@ -1913,10 +1918,13 @@ def partition_shards_asymmetric(
     k = min(bucket_limit, n)
     if k == 1:
         return [ordered]
+
+    weights = [_partition_weight(item) for item in ordered]
+    if collapse_if_fits and sum(weights) <= ceiling:
+        return [ordered]
     if k == n:
         return [[item] for item in ordered]
 
-    weights = [_partition_weight(item) for item in ordered]
     minimax_cap = _minimax_contiguous_bound(weights, k)
     effective_cap = max(ceiling, minimax_cap)
 
@@ -1945,6 +1953,7 @@ def partition_shard_units(
     *,
     strategy: str = DEFAULT_SPLIT_STRATEGY,
     max_bucket_bytes: int | None = None,
+    collapse_if_fits: bool = False,
 ) -> list[list[UnitBuildResult]]:
     """Deterministically partition `.ll` shard units into up to `split_modules` buckets.
 
@@ -1957,6 +1966,8 @@ def partition_shard_units(
       - `"asymmetric"`: contiguous min-cut via `partition_shards_asymmetric`, packing `part_0`
         up to `max_bucket_bytes` (default 994 MiB) under V8's 1 GiB cap so a two-part guest
         reproduces the proven ~994/171 MiB browser split; pairs with `-sSIDE_MODULE=2`.
+        Pass `collapse_if_fits=True` to collapse all code shards into 1 side module whenever
+        their combined weight fits within `max_bucket_bytes`.
 
     Emits only non-empty buckets when fewer shards exist than `split_modules`.
     """
@@ -1972,6 +1983,7 @@ def partition_shard_units(
             shards,
             bucket_limit,
             max_bucket_bytes=max_bucket_bytes,
+            collapse_if_fits=collapse_if_fits,
         )
     bucket_count = min(bucket_limit, len(shards))
     ranked = sorted(shards, key=lambda item: (-_partition_weight(item), item.unit.unit_id))
@@ -3317,9 +3329,12 @@ def optimize_split_runtime_js(
 ) -> tuple[str, dict[str, bool]]:
     """Apply idempotent R33 V8-cage GC & throttled pthread `CMD_LOAD` patches to split `runtime.js`.
 
-    Patch 1 (V8 4 GiB pointer-compression cage cleanup):
+    Patch 1 (V8 4 GiB pointer-compression cage cleanup + T97 zero-alloc fixed-arity stubs):
       - Registers eager cross-shard stub binders inside `instantiateModule`'s `proxyHandler`
-        (`globalThis.__pg6StubBinders`).
+        (`globalThis.__pg6StubBinders`) and replaces Emscripten's rest-parameter `(...args)`
+        stub wrapper with fixed-arity zero-allocation wrappers chosen once at stub creation time
+        (`(a) => ...` for `sub_*`, `(a, b) => ...` for `__playgta6_dispatch_shard_*`, and
+        `(...args) => ...` fallback for all other symbols).
       - Registers `moduleExports`/`localScope` clearers right after `var moduleExports;`
         (`globalThis.__pg6ExportClearers`).
       - Immediately after `await loadDylibs();`, binds all lazy stubs, clears `moduleExports`
@@ -3357,15 +3372,34 @@ def optimize_split_runtime_js(
     ):
         def _inject_stub_binder(match: re.Match[str]) -> str:
             prop = match.group("prop")
+            stubs = match.group("stubs")
             resolved = match.group("resolved")
             resolve_fn = match.group("resolve_fn")
+            args_name = match.group("args")
+            used = {prop, stubs, resolved, resolve_fn, args_name}
+            p_var = "_p" if "_p" not in used else "_pg6p"
+            used.add(p_var)
+            e_var = "_e" if "_e" not in used else "_pg6e"
+            arg1 = "a" if "a" not in used else "_a0"
+            arg2 = "b" if "b" not in used and "b" != arg1 else "_a1"
             binder = (
-                f"const _p = {prop}; "
+                f"const {p_var} = {prop}; "
                 "(globalThis.__pg6StubBinders ||= []).push(() => { "
-                f"try {{ {resolved} ||= {resolve_fn}(_p); }} catch (_e) {{}} "
+                f"try {{ {resolved} ||= {resolve_fn}({p_var}); "
+                f"if ({resolved}) {stubs}[{p_var}] = {resolved}; }} catch ({e_var}) {{}} "
                 "}); "
             )
-            return f"{match.group('prefix')}{binder}{match.group('stub_assign')}"
+            # T97: specialize hot guest cross-part stubs at creation time to avoid per-call
+            # `...args` rest-array allocation and spread overhead on every invocation.
+            fast_stub_assign = (
+                f"{stubs}[{p_var}] = "
+                f"(typeof {p_var} === 'string' && {p_var}.startsWith('sub_')) "
+                f"? ({arg1}) => ({resolved} || ({resolved} = {resolve_fn}({p_var})))({arg1}) "
+                f": (typeof {p_var} === 'string' && {p_var}.startsWith('{SHARD_DISPATCH_FN_PREFIX}')) "
+                f"? ({arg1}, {arg2}) => ({resolved} || ({resolved} = {resolve_fn}({p_var})))({arg1}, {arg2}) "
+                f": (...{args_name}) => ({resolved} || ({resolved} = {resolve_fn}({p_var})))(...{args_name});"
+            )
+            return f"{match.group('prefix')}{binder}{fast_stub_assign}"
 
         updated, stub_count = _STUB_CREATOR_RE.subn(_inject_stub_binder, updated)
         status["stub_binders"] = stub_count > 0
@@ -4324,6 +4358,7 @@ def run_build(
     split_modules: int = 1,
     split_strategy: str = DEFAULT_SPLIT_STRATEGY,
     max_side_module_mib: int = DEFAULT_MAX_SIDE_MODULE_MIB,
+    collapse_single_side_module: bool = False,
     node_max_old_space_mb: int | None = None,
     proxy_to_pthread: bool = False,
     max_concurrent_pthread_loads: int = DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
@@ -4652,6 +4687,7 @@ def run_build(
             split_count,
             strategy=split_strat,
             max_bucket_bytes=max_bucket_bytes,
+            collapse_if_fits=collapse_single_side_module,
         )
         registration_items = [item for item in ordered if is_registration_unit(item.unit)]
         non_shard_items = [
@@ -5319,6 +5355,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--collapse-single-side-module",
+        action="store_true",
+        help=(
+            "When --split-strategy asymmetric is used and all code shards fit within "
+            "--max-side-module-mib, collapse them into a single code side module "
+            "(guest_part_0.wasm + registration guest_part_1.wasm) to eliminate cross-part "
+            "sub_* JS stub bounces."
+        ),
+    )
+    parser.add_argument(
         "--proxy-to-pthread",
         action="store_true",
         help=(
@@ -5526,6 +5572,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             split_modules=args.split_modules,
             split_strategy=args.split_strategy,
             max_side_module_mib=args.max_side_module_mib,
+            collapse_single_side_module=args.collapse_single_side_module,
             node_max_old_space_mb=args.node_max_old_space_mb,
             proxy_to_pthread=args.proxy_to_pthread,
             max_concurrent_pthread_loads=args.max_concurrent_pthread_loads,
