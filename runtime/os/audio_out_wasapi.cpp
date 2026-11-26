@@ -1,9 +1,13 @@
 #include "os/audio_out_wasapi.h"
 #include "os/thread_name.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -19,6 +23,51 @@
 #endif
 
 namespace playgta6::os::audio_out {
+
+namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
+constexpr float kSoftLimitKnee = 0.9f;
+constexpr uint32_t kTrimCrossfadeFrames = 64;
+constexpr uint32_t kJitterCapacityMs = 400;
+constexpr uint32_t kJitterPrebufferMs = 60;
+constexpr uint32_t kWasapiTargetPadMs = 40;   // strictly < kJitterPrebufferMs to prevent stutter loop
+constexpr uint32_t kTrimHighWatermarkMs = 180;
+constexpr uint32_t kTrimTargetWatermarkMs = 80;
+
+inline float sanitize_and_limit(float v) {
+    if (!std::isfinite(v)) {
+        return 0.0f;
+    }
+    constexpr float kHeadroom = 1.0f - kSoftLimitKnee;
+    if (v > kSoftLimitKnee) {
+        const float c = kSoftLimitKnee + kHeadroom * std::tanh((v - kSoftLimitKnee) / kHeadroom);
+        return c > 1.0f ? 1.0f : c;
+    }
+    if (v < -kSoftLimitKnee) {
+        const float c = kSoftLimitKnee + kHeadroom * std::tanh((-v - kSoftLimitKnee) / kHeadroom);
+        return c > 1.0f ? -1.0f : -c;
+    }
+    return v;
+}
+
+inline float half_cosine_down(uint32_t pos, uint32_t total) {
+    if (total == 0 || pos + 1 >= total) {
+        return 0.0f;
+    }
+    const float t = static_cast<float>(pos + 1) / static_cast<float>(total);
+    return 0.5f * (1.0f + std::cos(kPi * t));
+}
+
+inline float half_cosine_up(uint32_t pos, uint32_t total) {
+    if (total == 0) {
+        return 1.0f;
+    }
+    const float t = static_cast<float>(pos) / static_cast<float>(total);
+    return 0.5f * (1.0f - std::cos(kPi * t));
+}
+
+}  // namespace
 
 struct Wasapi::Impl {
 #ifdef _WIN32
@@ -39,9 +88,7 @@ struct Wasapi::Impl {
         return g;
     }
 
-    bool open_device(uint32_t* rate, std::string* err) {
-        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        com_inited_ = SUCCEEDED(co);
+    bool open_device_interfaces(uint32_t* rate, std::string* err) {
         IMMDeviceEnumerator* en = nullptr;
         HRESULT hr = CoCreateInstance(clsid_enumerator(), nullptr, CLSCTX_ALL, iid_enumerator(),
                                       reinterpret_cast<void**>(&en));
@@ -70,10 +117,12 @@ struct Wasapi::Impl {
         fmt.wBitsPerSample = 32;
         fmt.nBlockAlign = 8;
         fmt.nAvgBytesPerSec = dev_rate * 8;
+        // Request a 100 ms shared-mode buffer; run() writes ahead to at most kWasapiTargetPadMs
+        // (40 ms < 60 ms JitterBuffer prebuffer) so post-underrun re-priming never oscillates.
         // AUTOCONVERTPCM lets the engine accept stereo float even on a surround mix format.
         hr = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
                                  AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                                 2000000 /* 200 ms */, 0, &fmt, nullptr);
+                                 1000000 /* 100 ms */, 0, &fmt, nullptr);
         if (FAILED(hr)) return fail(err, "IAudioClient::Initialize failed", hr);
         hr = client_->GetBufferSize(&buffer_frames_);
         if (FAILED(hr)) return fail(err, "GetBufferSize failed", hr);
@@ -83,6 +132,13 @@ struct Wasapi::Impl {
         return true;
     }
 
+    bool open_device(uint32_t* rate, std::string* err) {
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        com_inited_ = SUCCEEDED(co);
+        com_inited_thread_id_ = com_inited_ ? GetCurrentThreadId() : 0;
+        return open_device_interfaces(rate, err);
+    }
+
     static bool fail(std::string* err, const char* what, HRESULT hr) {
         char b[128];
         std::snprintf(b, sizeof(b), "%s (hr=0x%08lx)", what, static_cast<unsigned long>(hr));
@@ -90,36 +146,238 @@ struct Wasapi::Impl {
         return false;
     }
 
-    void close_device() {
+    void release_interfaces() {
         if (render_) render_->Release();
         if (client_) client_->Release();
         if (dev_) dev_->Release();
         render_ = nullptr;
         client_ = nullptr;
         dev_ = nullptr;
+        buffer_frames_ = 0;
+    }
+
+    void close_device() {
+        release_interfaces();
         device_rate_ = 0;
-        if (com_inited_) CoUninitialize();
+        if (com_inited_ && GetCurrentThreadId() == com_inited_thread_id_) {
+            CoUninitialize();
+        }
         com_inited_ = false;
+        com_inited_thread_id_ = 0;
+    }
+
+    void reset_declick_state(uint32_t rate) {
+        declick_frames_ = std::max<uint32_t>(32, rate * 160 / kSourceRate);
+        last_l_ = 0.0f;
+        last_r_ = 0.0f;
+        has_active_audio_ = false;
+        in_underrun_ = false;
+        fade_out_pos_ = 0;
+        fade_out_total_ = 0;
+        fade_out_start_l_ = 0.0f;
+        fade_out_start_r_ = 0.0f;
+        fade_in_pos_ = 0;
+        fade_in_total_ = 0;
+        fade_in_from_l_ = 0.0f;
+        fade_in_from_r_ = 0.0f;
+        trim_xfade_len_ = 0;
+    }
+
+    // Processes `want` stereo frames from `feed_->buffer()` into `dst`, applying NaN/Inf
+    // sanitization, tanh soft-limiting, bounded backlog trim crossfade, half-cosine underrun
+    // fade-out, and recovery fade-in. Returns true if the entire block is pure steady silence.
+    bool render_frames(float* dst, uint32_t want, uint32_t rate) {
+        const uint32_t high_water = std::max<uint32_t>(rate * kTrimHighWatermarkMs / 1000, want + 256);
+        const uint32_t target_water = std::max<uint32_t>(rate * kTrimTargetWatermarkMs / 1000, rate * kJitterPrebufferMs / 1000);
+        const uint32_t buffered = feed_->buffer().buffered();
+        if (!in_underrun_ && buffered > high_water && buffered > target_water) {
+            const uint32_t excess = buffered - target_water;
+            const uint32_t max_trim = static_cast<uint32_t>(trim_scratch_.size() / 2);
+            const uint32_t to_skip = std::min(excess, max_trim);
+            if (to_skip > 0) {
+                const uint32_t skipped = feed_->buffer().pop(trim_scratch_.data(), to_skip);
+                if (skipped > 0 && has_active_audio_) {
+                    const uint32_t xf = std::min<uint32_t>(kTrimCrossfadeFrames, skipped);
+                    for (uint32_t i = 0; i < xf; ++i) {
+                        trim_xfade_[2 * i] = sanitize_and_limit(trim_scratch_[2 * i]);
+                        trim_xfade_[2 * i + 1] = sanitize_and_limit(trim_scratch_[2 * i + 1]);
+                    }
+                    trim_xfade_len_ = xf;
+                }
+            }
+        }
+
+        const uint32_t got = feed_->buffer().pop(dst, want);
+
+        for (uint32_t i = 0; i < got * 2; ++i) {
+            dst[i] = sanitize_and_limit(dst[i]);
+        }
+
+        if (trim_xfade_len_ > 0 && got > 0) {
+            const uint32_t xf = std::min(trim_xfade_len_, got);
+            for (uint32_t i = 0; i < xf; ++i) {
+                const float t = static_cast<float>(i + 1) / static_cast<float>(xf + 1);
+                const float w_new = 0.5f * (1.0f - std::cos(kPi * t));
+                const float w_old = 1.0f - w_new;
+                dst[2 * i] = trim_xfade_[2 * i] * w_old + dst[2 * i] * w_new;
+                dst[2 * i + 1] = trim_xfade_[2 * i + 1] * w_old + dst[2 * i + 1] * w_new;
+            }
+            trim_xfade_len_ = 0;
+        }
+
+        if (got > 0) {
+            if (in_underrun_) {
+                if (fade_out_total_ > 0 && fade_out_pos_ < fade_out_total_) {
+                    const float g = half_cosine_down(fade_out_pos_, fade_out_total_);
+                    fade_in_from_l_ = fade_out_start_l_ * g;
+                    fade_in_from_r_ = fade_out_start_r_ * g;
+                } else {
+                    fade_in_from_l_ = 0.0f;
+                    fade_in_from_r_ = 0.0f;
+                }
+                fade_out_pos_ = 0;
+                fade_out_total_ = 0;
+                in_underrun_ = false;
+                fade_in_pos_ = 0;
+                fade_in_total_ = declick_frames_;
+            }
+            if (fade_in_total_ > 0 && fade_in_pos_ < fade_in_total_) {
+                const uint32_t rem = fade_in_total_ - fade_in_pos_;
+                const uint32_t ramp = std::min(got, rem);
+                for (uint32_t i = 0; i < ramp; ++i) {
+                    const float w_new = half_cosine_up(fade_in_pos_ + i, fade_in_total_);
+                    const float w_old = 1.0f - w_new;
+                    dst[2 * i] = fade_in_from_l_ * w_old + dst[2 * i] * w_new;
+                    dst[2 * i + 1] = fade_in_from_r_ * w_old + dst[2 * i + 1] * w_new;
+                }
+                fade_in_pos_ += ramp;
+                if (fade_in_pos_ >= fade_in_total_) {
+                    fade_in_pos_ = 0;
+                    fade_in_total_ = 0;
+                }
+            }
+            last_l_ = dst[2 * (got - 1)];
+            last_r_ = dst[2 * (got - 1) + 1];
+            has_active_audio_ = true;
+        }
+
+        bool wrote_fade_out = false;
+        if (got < want) {
+            fade_in_pos_ = 0;
+            fade_in_total_ = 0;
+            trim_xfade_len_ = 0;
+            if (!in_underrun_ && has_active_audio_) {
+                fade_out_start_l_ = last_l_;
+                fade_out_start_r_ = last_r_;
+                fade_out_pos_ = 0;
+                fade_out_total_ = declick_frames_;
+                has_active_audio_ = false;
+            }
+            in_underrun_ = true;
+            uint32_t pos = got;
+            while (pos < want && fade_out_total_ > 0 && fade_out_pos_ < fade_out_total_) {
+                const float g = half_cosine_down(fade_out_pos_, fade_out_total_);
+                dst[2 * pos] = fade_out_start_l_ * g;
+                dst[2 * pos + 1] = fade_out_start_r_ * g;
+                ++fade_out_pos_;
+                ++pos;
+                wrote_fade_out = true;
+            }
+            if (fade_out_total_ > 0 && fade_out_pos_ >= fade_out_total_) {
+                fade_out_pos_ = 0;
+                fade_out_total_ = 0;
+                last_l_ = 0.0f;
+                last_r_ = 0.0f;
+            }
+            if (pos < want) {
+                std::memset(dst + 2 * static_cast<size_t>(pos), 0, sizeof(float) * 2 * (want - pos));
+            }
+        }
+
+        return got == 0 && !wrote_fade_out;
+    }
+
+    static bool is_device_lost(HRESULT hr) {
+        return hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING;
     }
 
     void run() {
         playgta6::os::name_this_thread(L"pg6-audio-out");
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        client_->Start();
+        const HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool thread_com = SUCCEEDED(co);
+        uint32_t active_rate = device_rate_ ? device_rate_ : kSourceRate;
+        reset_declick_state(active_rate);
+
+        bool started = client_ && SUCCEEDED(client_->Start());
         while (running_) {
+            if (!client_ || !render_ || !started) {
+                // Drain excess buffered audio while endpoint is unavailable so guest never backs up.
+                const uint32_t buffered = feed_->buffer().buffered();
+                const uint32_t drain_keep = active_rate * kJitterPrebufferMs / 1000;
+                if (buffered > drain_keep && !trim_scratch_.empty()) {
+                    const uint32_t to_drop =
+                        std::min<uint32_t>(buffered - drain_keep, static_cast<uint32_t>(trim_scratch_.size() / 2));
+                    if (to_drop > 0) {
+                        (void)feed_->buffer().pop(trim_scratch_.data(), to_drop);
+                    }
+                }
+                for (int i = 0; i < 25 && running_; ++i) {
+                    Sleep(10);
+                }
+                if (!running_) break;
+                release_interfaces();
+                uint32_t new_rate = 0;
+                std::string reopen_err;
+                if (open_device_interfaces(&new_rate, &reopen_err)) {
+                    if (new_rate != active_rate) {
+                        active_rate = new_rate;
+                        device_rate_ = new_rate;
+                        feed_->configure(new_rate, kJitterCapacityMs, kJitterPrebufferMs);
+                        trim_scratch_.resize(static_cast<size_t>(new_rate * kJitterCapacityMs / 1000) * 2, 0.0f);
+                    }
+                    reset_declick_state(active_rate);
+                    started = SUCCEEDED(client_->Start());
+                }
+                continue;
+            }
+
             UINT32 padding = 0;
-            if (SUCCEEDED(client_->GetCurrentPadding(&padding)) && buffer_frames_ > padding) {
-                const UINT32 want = buffer_frames_ - padding;
+            HRESULT hr = client_->GetCurrentPadding(&padding);
+            if (FAILED(hr)) {
+                if (is_device_lost(hr)) {
+                    started = false;
+                }
+                Sleep(5);
+                continue;
+            }
+
+            // Cap WASAPI write-ahead strictly below JitterBuffer prebuffer (40 ms vs 60 ms) so
+            // post-underrun re-priming never drains all buffered frames in one GetBuffer() call.
+            const UINT32 target_pad = std::min<UINT32>(
+                buffer_frames_, std::max<UINT32>(active_rate * kWasapiTargetPadMs / 1000, 256));
+            if (target_pad > padding) {
+                const UINT32 want = target_pad - padding;
                 BYTE* data = nullptr;
-                if (SUCCEEDED(render_->GetBuffer(want, &data)) && data) {
-                    feed_->buffer().pop(reinterpret_cast<float*>(data), want);
-                    render_->ReleaseBuffer(want, 0);
+                hr = render_->GetBuffer(want, &data);
+                if (SUCCEEDED(hr) && data) {
+                    const bool silent = render_frames(reinterpret_cast<float*>(data), want, active_rate);
+                    hr = render_->ReleaseBuffer(want, silent ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+                    if (FAILED(hr) && is_device_lost(hr)) {
+                        started = false;
+                    }
+                } else if (FAILED(hr) && is_device_lost(hr)) {
+                    started = false;
                 }
             }
             Sleep(5);
         }
-        client_->Stop();
-        CoUninitialize();
+        if (client_) {
+            client_->Stop();
+            client_->Reset();
+        }
+        if (thread_com) {
+            CoUninitialize();
+        }
     }
 
     IMMDevice* dev_ = nullptr;
@@ -127,6 +385,23 @@ struct Wasapi::Impl {
     IAudioRenderClient* render_ = nullptr;
     UINT32 buffer_frames_ = 0;
     bool com_inited_ = false;
+    DWORD com_inited_thread_id_ = 0;
+    uint32_t declick_frames_ = 160;
+    float last_l_ = 0.0f;
+    float last_r_ = 0.0f;
+    bool has_active_audio_ = false;
+    bool in_underrun_ = false;
+    uint32_t fade_out_pos_ = 0;
+    uint32_t fade_out_total_ = 0;
+    float fade_out_start_l_ = 0.0f;
+    float fade_out_start_r_ = 0.0f;
+    uint32_t fade_in_pos_ = 0;
+    uint32_t fade_in_total_ = 0;
+    float fade_in_from_l_ = 0.0f;
+    float fade_in_from_r_ = 0.0f;
+    std::vector<float> trim_scratch_;
+    float trim_xfade_[kTrimCrossfadeFrames * 2] = {};
+    uint32_t trim_xfade_len_ = 0;
 #endif
     Feed* feed_ = nullptr;
     std::atomic<bool> running_{false};
@@ -145,7 +420,8 @@ struct Wasapi::Impl {
             if (error) *error = err;
             return false;
         }
-        feed.configure(rate, 400, 60);
+        feed.configure(rate, kJitterCapacityMs, kJitterPrebufferMs);
+        trim_scratch_.assign(static_cast<size_t>(rate * kJitterCapacityMs / 1000) * 2, 0.0f);
         device_rate_ = rate;
         running_ = true;
         thread_ = std::thread([this] { run(); });

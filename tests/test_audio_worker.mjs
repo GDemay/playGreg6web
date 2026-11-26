@@ -3136,3 +3136,305 @@ test('Jitter/stutter fix (#1028/#663): active guest pump runs at 8ms cadence, dr
 
   worker.destroy();
 });
+
+test('Orch-07 (#663/#1028): 500ms stall recovery stays click-free with single hysteresis re-prime and zero stuck DC', () => {
+  const { PlayGta6AudioWorkletProcessor } = require('../web/workers/audio_worklet_processor.js');
+  let fakeNow = 1000;
+  const timers = [];
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'active',
+    autoDrain: true,
+    declickFrames: 0,
+    setIntervalFn: (fn, ms) => {
+      const h = { fn, ms };
+      timers.push(h);
+      return h;
+    },
+    clearIntervalFn: () => {},
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 16384,
+    outputState: 'active',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 131072, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
+
+  const proc = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: worker.ring.sab,
+      declickFrames: 160,
+      fadeCurve: 'cosine',
+      prebufferFrames: 3840,
+      maxBufferedFrames: 10080,
+      targetWatermarkFrames: 4608,
+      trimCrossfadeFrames: 64,
+      softLimit: true,
+      softLimitKnee: 0.9,
+    },
+  });
+
+  // Helper to generate continuous 440 Hz stereo sine wave across calls.
+  let phase = 0;
+  const phaseStep = (2 * Math.PI * 440) / 48000;
+  function makeSineFrames(n) {
+    const buf = new Float32Array(n * 2);
+    for (let i = 0; i < n; i++) {
+      const s = 0.65 * Math.sin(phase);
+      phase += phaseStep;
+      buf[i * 2] = s;
+      buf[i * 2 + 1] = s;
+    }
+    return buf;
+  }
+
+  const outL = new Float32Array(128);
+  const outR = new Float32Array(128);
+  const outputs = [[outL, outR]];
+  let prevL = 0;
+  let maxDelta = 0;
+  let nonFiniteCount = 0;
+
+  function stepQuantum() {
+    outL.fill(0);
+    outR.fill(0);
+    proc.process([], outputs);
+    for (let i = 0; i < 128; i++) {
+      const s = outL[i];
+      if (!Number.isFinite(s) || !Number.isFinite(outR[i])) {
+        nonFiniteCount += 1;
+        continue;
+      }
+      const d = Math.abs(s - prevL);
+      if (d > maxDelta) maxDelta = d;
+      prevL = s;
+    }
+  }
+
+  // 1. Prime 120 ms of live audio and play 40 ms steadily.
+  mock.producerPush(makeSineFrames(5760));
+  fakeNow += 8;
+  timers[0].fn();
+  for (let q = 0; q < 15; q++) stepQuantum();
+
+  // 2. Simulate a 500 ms shader-compile / RPF-load stall (producer stops writing).
+  //    Worklet drains remaining buffer, cosine-fades out to exact 0.0, and holds silence.
+  for (let q = 0; q < 188; q++) {
+    stepQuantum();
+  }
+  assert.equal(prevL, 0, 'stall silence must reach exact 0.0 with zero stuck DC');
+  for (let i = 0; i < 128; i++) {
+    assert.equal(outL[i], 0);
+    assert.equal(outR[i], 0);
+  }
+  const fadeInsBefore = proc.fadeInCount;
+
+  // 3. Producer resumes in 10 ms packets (480 frames): worklet must hold through 80 ms
+  //    hysteresis and perform ONE clean recovery with zero machine-gun re-underrun chatter.
+  for (let tick = 0; tick < 30; tick++) {
+    mock.producerPush(makeSineFrames(480));
+    fakeNow += 10;
+    timers[0].fn();
+    for (let q = 0; q < 4; q++) stepQuantum();
+  }
+
+  assert.equal(nonFiniteCount, 0, 'zero NaN/Inf samples across stall and recovery');
+  assert.ok(
+    maxDelta < 0.08,
+    `expected click-free max adjacent sample delta < 0.08, got ${maxDelta}`
+  );
+  assert.equal(
+    proc.fadeInCount - fadeInsBefore,
+    1,
+    'expected single clean hysteresis recovery without chatter'
+  );
+
+  worker.destroy();
+});
+
+test('Orch-07 (#663/#1028): tab-switch 1Hz throttled drain and resume backlog trim bound latency with click-free crossfade', () => {
+  let fakeNow = 2000;
+  const timers = [];
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'suspended',
+    autoDrain: true,
+    declickFrames: 0,
+    setIntervalFn: (fn, ms) => {
+      const h = { fn, ms };
+      timers.push(h);
+      return h;
+    },
+    clearIntervalFn: () => {},
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 16384,
+    outputState: 'suspended',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 131072, baseOffset: 64 }); // 65536 frames = 1.365 s
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
+  const allocsAfterAttach = worker.getScratchStats().allocations;
+
+  // 1. Background tab 1 Hz throttling: push 1.0 s (48,000 frames) into guest ring while suspended,
+  //    then fire a throttled 1000 ms drainTick -> must trim backlog down to <= 80 ms instead of
+  //    letting 1.365 s pile up!
+  mock.producerPush(makeConstantStereoFrames(48000, 0.4));
+  worker._lastDrainMs = fakeNow;
+  fakeNow += 1000;
+  const drained = worker.drainTick(fakeNow);
+  assert.ok(drained > 30000, `expected throttled background drain to trim stale backlog, got ${drained}`);
+  assert.ok(
+    worker._guestRing.availableFrames() <= 4800,
+    `expected <= 100 ms remaining in guest ring after throttled drain, got ${worker._guestRing.availableFrames()}`
+  );
+
+  // 2. Tab return / AudioContext resume with full 1.25 s backlog in guest ring:
+  //    setOutputState('active', { resyncBacklog: true }) must immediately trim stale audio to <= 80 ms.
+  mock.producerPush(makeConstantStereoFrames(55000, -0.3));
+  assert.ok(worker._guestRing.availableFrames() > 50000);
+  worker.setOutputState('active', { resyncBacklog: true });
+  assert.ok(
+    worker._guestRing.availableFrames() <= 3840,
+    `expected <= 80 ms after resume resync, got ${worker._guestRing.availableFrames()}`
+  );
+
+  // 3. Active-mode >250 ms backlog burst trims smoothly with half-cosine crossfade and 0 scratch allocs.
+  //    First establish active audio at +0.6, then push 300 ms (14,400 frames) where old head is +0.6
+  //    and fresh tail is -0.6; the splice must ramp smoothly across 64 frames instead of a 1.2 step!
+  mock.producerPush(makeConstantStereoFrames(1024, 0.6));
+  fakeNow += 8;
+  timers[timers.length - 1].fn();
+  worker.ring.discardFrames(worker.ring.availableFrames()); // clear output ring to inspect splice cleanly
+  const allocsAfterWarmup = worker.getScratchStats().allocations;
+
+  mock.producerPush(makeConstantStereoFrames(9600, 0.6)); // old stale head (200 ms)
+  mock.producerPush(makeConstantStereoFrames(4800, -0.6)); // fresh tail (100 ms) -> total 14,400 > 12,000
+  fakeNow += 8;
+  timers[timers.length - 1].fn();
+
+  assert.ok(worker.getStats().guestTrimCount >= 3);
+  assert.ok(worker.ring.availableFrames() <= 5000, 'active trim must bound queued audio near 96 ms');
+  assert.equal(worker.getScratchStats().allocations, allocsAfterWarmup);
+
+  const spliced = new Float32Array(256 * 2);
+  const pulled = worker.ring.pullSamples(spliced);
+  assert.equal(pulled, 256);
+  let maxStep = 0;
+  let prev = 0.6;
+  for (let f = 0; f < 128; f++) {
+    const v = spliced[f * 2];
+    const step = Math.abs(v - prev);
+    if (step > maxStep) maxStep = step;
+    prev = v;
+  }
+  assert.ok(
+    maxStep < 0.06,
+    `expected click-free crossfade splice across trim boundary (max step < 0.06), got ${maxStep}`
+  );
+
+  worker.destroy();
+});
+
+test('Orch-07 (#663/#1028): active pump preserves SPSC read cursor under 32ms worklet jitter and only evicts after >=60ms stall', () => {
+  let fakeNow = 5000;
+  const timers = [];
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'active',
+    autoDrain: true,
+    declickFrames: 0,
+    setIntervalFn: (fn, ms) => {
+      const h = { fn, ms };
+      timers.push(h);
+      return h;
+    },
+    clearIntervalFn: () => {},
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 2048,
+    outputState: 'active',
+  });
+  const mock = createMockGuestPcmRing({ capacitySamples: 32768, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
+
+  // Fill the SAB ring completely so free === 0, and leave more frames in guest ring.
+  worker.ring.pushSamples(makeConstantStereoFrames(2048, 0.2));
+  mock.producerPush(makeConstantStereoFrames(1024, 0.3));
+  const readCursorBefore = Atomics.load(worker.ring._ctrl, 1);
+
+  // 4 ticks spanning 32 ms of worklet scheduling jitter must NOT mutate HDR_READ_CURSOR!
+  for (let i = 0; i < 4; i++) {
+    fakeNow += 8;
+    timers[0].fn();
+  }
+  assert.equal(
+    Atomics.load(worker.ring._ctrl, 1),
+    readCursorBefore,
+    'producer must not overwrite HDR_READ_CURSOR during brief <60ms worklet jitter'
+  );
+
+  // Once >= 60 ms elapses with a genuinely dead/suspended consumer, fallback eviction unblocks the guest ring.
+  fakeNow += 65;
+  timers[0].fn();
+  assert.notEqual(
+    Atomics.load(worker.ring._ctrl, 1),
+    readCursorBefore,
+    'dead consumer >=60ms should trigger bounded fallback eviction'
+  );
+
+  worker.destroy();
+});
+
+test('Orch-07 (#663/#1028): direct-mode resampled guest drain applies click-free fade-out/in and unsigned SAB counters', () => {
+  const worker = new AudioMixerWorker(() => {}, {
+    outputState: 'active',
+    autoDrain: false,
+    declickFrames: 32,
+    fadeCurve: 'cosine',
+  });
+  worker.handleMessage({
+    init: true,
+    sampleRate: 44100,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'active',
+  });
+  const mock = createMockGuestPcmRing({ capacitySamples: 16384, baseOffset: 64, sampleRate: 48000 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: false });
+
+  // Push ~100 frames (48 kHz -> ~91 frames @ 44.1 kHz) and pull 256 frames -> underrun must cosine fade-out!
+  mock.producerPush(makeConstantStereoFrames(100, 0.5));
+  const out = new Float32Array(256 * 2);
+  const res1 = worker.drainGuestPcmRing(out);
+  assert.equal(res1.underrun, true);
+  assert.ok(res1.outputFrames > 0 && res1.outputFrames < 256);
+  // First sample after real audio should decay smoothly from 0.5 rather than snapping straight to 0.0.
+  assert.ok(
+    out[res1.outputFrames * 2] > 0.3 && out[res1.outputFrames * 2] < 0.5,
+    `expected cosine fade-out sample in (0.3, 0.5), got ${out[res1.outputFrames * 2]}`
+  );
+  // Tail after 32-frame ramp must be exact 0.0.
+  assert.equal(out[(res1.outputFrames + 35) * 2], 0);
+
+  // Unsigned Int32 SAB counter reads above 2^31 must not wrap negative.
+  Atomics.store(worker.ring._ctrl, 5, 0x80000010 | 0);
+  Atomics.store(worker.ring._ctrl, 7, 0x80000020 | 0);
+  assert.equal(worker.ring.underrunFrames, 0x80000010);
+  assert.equal(worker.ring.droppedFrames, 0x80000020);
+
+  worker.destroy();
+});

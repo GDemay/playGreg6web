@@ -936,6 +936,16 @@ export class AudioEngine {
       opts.trimCrossfadeFrames !== undefined
         ? sanitizeFiniteNonNegInt(opts.trimCrossfadeFrames, DEFAULT_TRIM_CROSSFADE_FRAMES)
         : DEFAULT_TRIM_CROSSFADE_FRAMES;
+    this._workletSoftLimit = opts.softLimit !== undefined ? Boolean(opts.softLimit) : true;
+    const rawSoftLimitKnee =
+      opts.softLimitKnee !== undefined ? opts.softLimitKnee : opts.limiterKnee;
+    this._workletSoftLimitKnee =
+      typeof rawSoftLimitKnee === 'number' &&
+      Number.isFinite(rawSoftLimitKnee) &&
+      rawSoftLimitKnee >= 0 &&
+      rawSoftLimitKnee < 1.0
+        ? rawSoftLimitKnee
+        : 0.9;
     this._maxResumeRetries = sanitizeFiniteNonNegInt(
       opts.maxResumeRetries,
       DEFAULT_MAX_RESUME_RETRIES
@@ -1248,17 +1258,29 @@ export class AudioEngine {
     return 0;
   }
 
+  _normalizeCursor(cursor, modulus) {
+    if (!Number.isFinite(cursor) || modulus <= 0) {
+      return 0;
+    }
+    if (cursor >= 0 && cursor < modulus) {
+      return cursor;
+    }
+    const norm = cursor % modulus;
+    return norm < 0 ? norm + modulus : norm;
+  }
+
   _computeBufferedFrames() {
     const ctrl = this._activeCtrl();
     const cap = this._capacityFrames;
     if (!ctrl || cap <= 0) {
       return 0;
     }
-    const write = this._loadHdr(HDR_WRITE_CURSOR);
-    const read = this._loadHdr(HDR_READ_CURSOR);
+    const modulus = cap * 2;
+    const write = this._normalizeCursor(this._loadHdr(HDR_WRITE_CURSOR), modulus);
+    const read = this._normalizeCursor(this._loadHdr(HDR_READ_CURSOR), modulus);
     let used = write - read;
     if (used < 0) {
-      used += cap * 2;
+      used += modulus;
     }
     if (!Number.isFinite(used) || used < 0) {
       return 0;
@@ -1601,14 +1623,22 @@ export class AudioEngine {
           targetWatermarkFrames = maxBufferedFrames;
         }
       }
-    } else if (ringCap > 8192) {
+    } else if (ringCap >= 2048) {
       const desiredHigh = Math.round((this._workletHighWatermarkMs / 1000) * actualSampleRate);
       const desiredTarget = Math.round((this._workletTargetWatermarkMs / 1000) * actualSampleRate);
-      maxBufferedFrames =
-        desiredHigh < ringCap ? desiredHigh : Math.floor(ringCap * 0.85);
+      const capHigh = Math.floor(ringCap * 0.85);
+      const capTarget = Math.floor(ringCap * 0.45);
+      maxBufferedFrames = desiredHigh < capHigh ? desiredHigh : capHigh;
       targetWatermarkFrames = Math.min(
         maxBufferedFrames,
-        Math.max(prebufferFrames, desiredTarget < maxBufferedFrames ? desiredTarget : Math.floor(ringCap * 0.45))
+        Math.max(
+          prebufferFrames,
+          desiredTarget < maxBufferedFrames && desiredTarget <= capTarget
+            ? desiredTarget
+            : desiredTarget < maxBufferedFrames && ringCap > 8192
+              ? desiredTarget
+              : capTarget
+        )
       );
     }
 
@@ -1625,6 +1655,8 @@ export class AudioEngine {
       maxBufferedFrames,
       targetWatermarkFrames,
       trimCrossfadeFrames: this._workletTrimCrossfadeFrames,
+      softLimit: this._workletSoftLimit,
+      softLimitKnee: this._workletSoftLimitKnee,
     };
     if (this._smoothingFrames !== undefined) {
       processorOptions.smoothingFrames = this._smoothingFrames;
@@ -1841,6 +1873,7 @@ export class AudioEngine {
     this._clearGestureListeners();
     this._forwardOutputStateToAudioWorker('active', {
       recoveredFromInterruption: true,
+      resyncBacklog: true,
     });
     return true;
   }
@@ -1977,7 +2010,9 @@ export class AudioEngine {
             );
           }
           if (!this._inUnlockGesture && !this._inAutoRecovery) {
-            this._forwardOutputStateToAudioWorker('active');
+            this._forwardOutputStateToAudioWorker('active', {
+              resyncBacklog: true,
+            });
           }
           return true;
         }
@@ -2163,6 +2198,12 @@ export class AudioEngine {
       return false;
     }
     this._explicitlySuspended = true;
+    const hadMasterGain = Boolean(this._masterGainNode);
+    const prevHeldSilent = this._masterGainHeldSilent;
+    if (hadMasterGain) {
+      this._scheduleMasterGainRamp(0.0, DEFAULT_GAIN_RAMP_MS);
+      this._masterGainHeldSilent = true;
+    }
     try {
       await this._context.suspend();
       if (this._destroyed || !this._context) {
@@ -2172,6 +2213,10 @@ export class AudioEngine {
       this._status = nextState;
       if (nextState !== 'suspended') {
         this._explicitlySuspended = false;
+        if (hadMasterGain && !prevHeldSilent) {
+          this._masterGainHeldSilent = false;
+          this._scheduleMasterGainRamp(this._muted ? 0.0 : this._volume, DEFAULT_GAIN_RAMP_MS);
+        }
       } else {
         this._forwardOutputStateToAudioWorker('suspended');
       }
@@ -2179,6 +2224,10 @@ export class AudioEngine {
       return nextState === 'suspended';
     } catch (err) {
       this._explicitlySuspended = false;
+      if (hadMasterGain && !prevHeldSilent) {
+        this._masterGainHeldSilent = false;
+        this._scheduleMasterGainRamp(this._muted ? 0.0 : this._volume, DEFAULT_GAIN_RAMP_MS);
+      }
       this._error =
         err instanceof Error
           ? err
@@ -2343,6 +2392,7 @@ export class AudioEngine {
               if (!markedRecovery) {
                 this._forwardOutputStateToAudioWorker('active', {
                   unlockedOnGesture: true,
+                  resyncBacklog: true,
                   ...(recovering ? { recoveredFromInterruption: true } : {}),
                 });
               }
@@ -2469,7 +2519,7 @@ export class AudioEngine {
         sampleRate,
         ...extra,
       },
-      [outputState]
+      [outputState, { sampleRate, ...extra }]
     );
   }
 
@@ -3242,8 +3292,8 @@ export class AudioEngine {
     }
 
     const modulus = cap * 2;
-    const write = this._loadHdr(HDR_WRITE_CURSOR);
-    let read = this._loadHdr(HDR_READ_CURSOR);
+    const write = this._normalizeCursor(this._loadHdr(HDR_WRITE_CURSOR), modulus);
+    let read = this._normalizeCursor(this._loadHdr(HDR_READ_CURSOR), modulus);
     let used = write - read;
     if (used < 0) {
       used += modulus;
@@ -3410,8 +3460,8 @@ export class AudioEngine {
     const effectiveGain = applyGain ? (this._muted ? 0.0 : clampVolume(this._volume, 1.0)) : 1.0;
 
     const modulus = cap * 2;
-    const read = this._loadHdr(HDR_READ_CURSOR);
-    const write = this._loadHdr(HDR_WRITE_CURSOR);
+    const read = this._normalizeCursor(this._loadHdr(HDR_READ_CURSOR), modulus);
+    const write = this._normalizeCursor(this._loadHdr(HDR_WRITE_CURSOR), modulus);
     let used = write - read;
     if (used < 0) {
       used += modulus;
@@ -3576,10 +3626,10 @@ export class AudioEngine {
     const ctrl = this._activeCtrl();
     if (ctrl && this._capacityFrames > 0) {
       bufferedFrames = this._computeBufferedFrames();
-      underruns = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUNS), 0);
-      underrunFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUN_FRAMES), 0);
-      overflows = sanitizeFiniteNonNegInt(this._loadHdr(HDR_OVERFLOWS), 0);
-      droppedFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_DROPPED_FRAMES), 0);
+      underruns = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUNS) >>> 0, 0);
+      underrunFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_UNDERRUN_FRAMES) >>> 0, 0);
+      overflows = sanitizeFiniteNonNegInt(this._loadHdr(HDR_OVERFLOWS) >>> 0, 0);
+      droppedFrames = sanitizeFiniteNonNegInt(this._loadHdr(HDR_DROPPED_FRAMES) >>> 0, 0);
     }
 
     const capacityFrames = sanitizeFiniteNonNegInt(
