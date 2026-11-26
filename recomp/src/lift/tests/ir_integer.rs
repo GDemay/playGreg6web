@@ -726,3 +726,13 @@ fn r60_same_block_predicate_fusion_and_scalar_lowering_compactness() {
         "32-bit div/idiv must not pull in 128-bit helpers:\n{scalar}"
     );
 }
+
+#[test]
+fn repeated_effective_address_math_in_a_block_is_computed_once() {
+    let ir = module_ir(|a| {
+        a.mov(eax, dword_ptr(rbx + rcx * 4 + 8))?;
+        a.add(dword_ptr(rbx + rcx * 4 + 8), eax)?;
+        a.ret()
+    });
+    assert_eq!(ir.matches("shl i64 ").count(), 1, "{ir}");
+}

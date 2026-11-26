@@ -346,6 +346,7 @@ pub(super) fn lift(
         dead_flags: 0,
         known: Known::default(),
         edge_known: Vec::new(),
+        cse: BTreeMap::new(),
     };
     lifter.lift_blocks()?;
     Ok(lifter.finish())
@@ -625,6 +626,9 @@ struct FunctionLifter<'a> {
     /// [`Self::known`] at each branch emitted so far into a block of this function, as
     /// `(target, known)`: a block whose only predecessor is such an edge starts with it.
     edge_known: Vec<(u64, Known)>,
+    /// Local value numbering: pure definitions already emitted in the current dominating region,
+    /// by right-hand side. Cleared whenever a block starts or lifting rolls back.
+    cse: BTreeMap<String, String>,
 }
 
 /// High-level origin of the current block's live arithmetic flags, used to fuse
@@ -1074,6 +1078,7 @@ impl FunctionLifter<'_> {
         self.has_shared_ret = checkpoint.has_shared_ret;
         self.support = checkpoint.support;
         self.known = checkpoint.known;
+        self.cse.clear();
         self.edge_known.truncate(checkpoint.edge_known);
         self.window_load_cache = checkpoint.window_load_cache;
         self.simd.clear_mem32();
@@ -1114,8 +1119,10 @@ impl FunctionLifter<'_> {
         ));
         // `ok` has this block as its only predecessor: the known values stay valid there.
         let known = std::mem::take(&mut self.known);
+        let cse = std::mem::take(&mut self.cse);
         self.start_block(&ok);
         self.known = known;
+        self.cse = cse;
     }
 
     // ----- IR emission primitives ---------------------------------------------------------------
@@ -1135,8 +1142,18 @@ impl FunctionLifter<'_> {
 
     /// Emits `%tN = <rhs>` and returns `%tN`.
     fn val(&mut self, rhs: &str) -> String {
+        const CSE_OPS: [&str; 10] = [
+            "add ", "sub ", "and ", "or ", "xor ", "shl ", "lshr ", "trunc ", "zext ", "sext ",
+        ];
+        let cacheable = CSE_OPS.iter().any(|op| rhs.starts_with(op));
+        if cacheable && let Some(prev) = self.cse.get(rhs) {
+            return prev.clone();
+        }
         let name = self.fresh_name();
         self.emit(&format!("{name} = {rhs}"));
+        if cacheable {
+            self.cse.insert(rhs.to_string(), name.clone());
+        }
         name
     }
 
@@ -1147,6 +1164,7 @@ impl FunctionLifter<'_> {
     }
 
     fn start_block(&mut self, label: &str) {
+        self.cse.clear();
         self.known = Known::default();
         self.window_load_cache = None;
         self.last_access = None;
@@ -1159,6 +1177,7 @@ impl FunctionLifter<'_> {
     /// `self.known` or `self.window_load_cache`, which stay valid across single-entry regions that
     /// never write GPR/flag allocas or invoke runtime remapping helpers.
     pub(super) fn start_internal_block(&mut self, label: &str) {
+        self.cse.clear();
         self.current_block.clear();
         self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
