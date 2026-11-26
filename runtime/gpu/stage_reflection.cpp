@@ -753,6 +753,36 @@ pso::WgpuVertexFormat dword_format(ReflectedComponentType cls, uint32_t n) {
     return t[n - 1];
 }
 
+// 16-bit component count of a 16-bit vertex format (0 for any other format).
+uint32_t half_components(pso::WgpuVertexFormat f) {
+    using F = pso::WgpuVertexFormat;
+    switch (f) {
+        case F::Float16: case F::Unorm16: case F::Snorm16: case F::Uint16: case F::Sint16: return 1;
+        case F::Float16x2: case F::Unorm16x2: case F::Snorm16x2: case F::Uint16x2: case F::Sint16x2: return 2;
+        case F::Float16x4: case F::Unorm16x4: case F::Snorm16x4: case F::Uint16x4: case F::Sint16x4: return 4;
+        default: return 0;
+    }
+}
+
+// Same 16-bit format family as `base` with `n` components (n must be 1, 2 or 4).
+pso::WgpuVertexFormat half_format_like(pso::WgpuVertexFormat base, uint32_t n) {
+    using F = pso::WgpuVertexFormat;
+    switch (base) {
+        case F::Float16: case F::Float16x2: case F::Float16x4:
+            return n == 1 ? F::Float16 : n == 2 ? F::Float16x2 : F::Float16x4;
+        case F::Unorm16: case F::Unorm16x2: case F::Unorm16x4:
+            return n == 1 ? F::Unorm16 : n == 2 ? F::Unorm16x2 : F::Unorm16x4;
+        case F::Snorm16: case F::Snorm16x2: case F::Snorm16x4:
+            return n == 1 ? F::Snorm16 : n == 2 ? F::Snorm16x2 : F::Snorm16x4;
+        case F::Uint16: case F::Uint16x2: case F::Uint16x4:
+            return n == 1 ? F::Uint16 : n == 2 ? F::Uint16x2 : F::Uint16x4;
+        case F::Sint16: case F::Sint16x2: case F::Sint16x4:
+            return n == 1 ? F::Sint16 : n == 2 ? F::Sint16x2 : F::Sint16x4;
+        default:
+            return F::Undefined;
+    }
+}
+
 }  // namespace
 
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error) {
@@ -878,6 +908,472 @@ bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const Reflect
     return true;
 }
 
+struct StageJoinedBinding {
+    std::pair<uint32_t, uint32_t> key{};
+    const ReflectedBinding* src = nullptr;
+    bridge::LayoutBinding lb{};
+    bool unresolved = false;
+    bool outside_rs = false;
+    bool lane_array = false;
+    bool lane_scalar = false;
+    bool root_table = false;
+};
+
+// Candidate GFX10.3 shifted user-data bases for a graphics stage whose user SGPRs fall past the
+// default s8 range: try canonical NGG/merged (s16) and 4-SGPR-shifted (s12) bases first, then
+// bases derived by aligning the stage's minimum user SGPR with each root parameter (even bases
+// first, bounded to valid graphics user SGPR bases <= 24).
+std::vector<uint32_t> collect_shifted_user_data_bases(const d3d::RootSignatureDesc& rs, const StageReflection& refl) {
+    constexpr uint32_t kMaxShiftedUserDataBase = 24;
+    uint32_t min_sgpr = UINT32_MAX;
+    for (const ReflectedBinding& b : refl.bindings) {
+        switch (b.source) {
+            case ReflectedSource::Table:
+            case ReflectedSource::RootConstants:
+            case ReflectedSource::RootDescriptor:
+            case ReflectedSource::CbvIndexedSamplerHeap:
+            case ReflectedSource::CbvIndexedResourceHeap:
+                min_sgpr = std::min(min_sgpr, b.user_sgpr);
+                break;
+            case ReflectedSource::LaneIndexedSamplerHeap:
+            case ReflectedSource::LaneIndexedResourceHeap:
+                if (b.lane_has_window_base) {
+                    min_sgpr = std::min(min_sgpr, b.user_sgpr);
+                }
+                break;
+            case ReflectedSource::SamplerHeap:
+            case ReflectedSource::ResourceHeap:
+                min_sgpr = std::min(min_sgpr, b.heap_index_sgpr);
+                break;
+            case ReflectedSource::StaticSampler:
+            case ReflectedSource::InlineSampler:
+            case ReflectedSource::Unresolved:
+                break;
+        }
+    }
+    std::vector<uint32_t> candidates;
+    auto add_unique = [&](uint32_t base) {
+        if (base <= kGraphicsUserDataBase || base > kMaxShiftedUserDataBase) {
+            return;
+        }
+        if (std::find(candidates.begin(), candidates.end(), base) == candidates.end()) {
+            candidates.push_back(base);
+        }
+    };
+    add_unique(kMeshUserDataBase);  // 16: NGG / merged VS
+    add_unique(12);                 // 12: 4-SGPR-shifted VS
+    if (min_sgpr != UINT32_MAX) {
+        std::vector<uint32_t> even_derived;
+        std::vector<uint32_t> odd_derived;
+        uint32_t param_off = 0;
+        for (const d3d::RootParameterDesc& p : rs.parameters) {
+            const uint32_t dwords = parameter_dwords(p);
+            const uint32_t span = p.parameter_type == d3d::RootParameterType::Constants32Bit ? dwords : 1u;
+            for (uint32_t d = 0; d < span; ++d) {
+                const uint32_t off = param_off + d;
+                if (min_sgpr >= off) {
+                    const uint32_t cand = min_sgpr - off;
+                    if (cand > kGraphicsUserDataBase && cand <= kMaxShiftedUserDataBase) {
+                        ((cand % 2u == 0) ? even_derived : odd_derived).push_back(cand);
+                    }
+                }
+            }
+            param_off += dwords;
+        }
+        for (uint32_t b : even_derived) {
+            add_unique(b);
+        }
+        for (uint32_t b : odd_derived) {
+            add_unique(b);
+        }
+    }
+    return candidates;
+}
+
+bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, const ReflectedStageRef& st,
+                            uint32_t stage_base, const JoinOptions& options,
+                            std::vector<StageJoinedBinding>* out_bindings, std::string* stage_report,
+                            bool* had_uncovered_user_sgpr, uint64_t* root_table_coercions) {
+    bool stage_ok = true;
+    auto fail = [&](const ReflectedBinding& b, const std::string& why) {
+        *stage_report += binding_key(b) + ": " + why + "\n";
+        stage_ok = false;
+    };
+    for (const ReflectedBinding& b : st.reflection->bindings) {
+        bridge::LayoutBinding lb;
+        lb.entry.binding = b.binding;
+        lb.entry.visibility = st.visibility;
+        bool is_unresolved = false;
+        bool is_outside_rs = false;
+        bool is_lane_array = false;
+        bool is_lane_scalar = false;
+        bool is_root_table = false;
+        // Where the descriptor comes from, as a root-signature register.
+        d3d::DescriptorRangeType cls = d3d::DescriptorRangeType::Srv;
+        uint32_t reg = 0, space = 0;
+        if (b.source == ReflectedSource::SamplerHeap || b.source == ReflectedSource::ResourceHeap) {
+            if (b.heap_shift >= 32) {
+                fail(b, "heap shift " + std::to_string(b.heap_shift) + " must be < 32");
+                continue;
+            }
+            // Heap-indexed: the index must be a root constant; the class follows the kind.
+            uint32_t dword = 0;
+            const int pi = root_constant_for_user_sgpr(rs, compute, b.heap_index_sgpr, &dword, stage_base);
+            if (pi < 0) {
+                if (root_parameter_containing_user_sgpr(rs, compute, b.heap_index_sgpr, nullptr, stage_base) < 0) {
+                    *had_uncovered_user_sgpr = true;
+                }
+                fail(b, "s" + std::to_string(b.heap_index_sgpr) + " is not inside a root-constants parameter");
+                continue;
+            }
+            const bool sampler_kind =
+                b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+            if ((b.source == ReflectedSource::SamplerHeap) != sampler_kind) {
+                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
+                            (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") + " heap");
+                continue;
+            }
+            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                  : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                  : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                      ? d3d::DescriptorRangeType::Uav
+                      : d3d::DescriptorRangeType::Srv;
+            lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+            lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+            lb.join.heap_index_dword = dword;
+            lb.join.heap_shift = b.heap_shift;
+            if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
+                lb.join.heap_stride = b.heap_stride;
+            }
+        } else if (b.source == ReflectedSource::CbvIndexedSamplerHeap ||
+                   b.source == ReflectedSource::CbvIndexedResourceHeap) {
+            if (b.heap_shift >= 32) {
+                fail(b, "heap shift " + std::to_string(b.heap_shift) + " must be < 32");
+                continue;
+            }
+            // CB-indexed heap (G62): the CB is the root parameter at user_sgpr; the index is read
+            // from it at draw time, the class follows the kind.
+            int pi = -1;
+            d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
+            std::string why;
+            if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &why, stage_base)) {
+                if (root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, nullptr, stage_base) < 0) {
+                    *had_uncovered_user_sgpr = true;
+                }
+                fail(b, why);
+                continue;
+            }
+            const bool sampler_kind =
+                b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+            if ((b.source == ReflectedSource::CbvIndexedSamplerHeap) != sampler_kind) {
+                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
+                            (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") + " heap");
+                continue;
+            }
+            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                  : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                  : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                      ? d3d::DescriptorRangeType::Uav
+                      : d3d::DescriptorRangeType::Srv;
+            lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+            lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+            lb.join.heap_index_source = from;
+            lb.join.heap_shift = b.heap_shift;
+            if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
+                lb.join.heap_stride = b.heap_stride;
+            }
+            lb.join.cb_byte_offset = b.cb_byte_offset;
+            lb.join.cb_bit_offset = b.cb_bit_offset;
+            lb.join.cb_mask = b.cb_mask;
+        } else if (b.source == ReflectedSource::LaneIndexedSamplerHeap ||
+                   b.source == ReflectedSource::LaneIndexedResourceHeap) {
+            if (b.lane_max_count == 0 || b.lane_max_count > kMaxLaneIndexedWindow || b.heap_shift >= 32) {
+                fail(b, "lane-indexed heap needs max_count in 1.." + std::to_string(kMaxLaneIndexedWindow) +
+                            " and shift < 32");
+                continue;
+            }
+            // Lane-indexed heap window (G62): validated like a CB-indexed source. With a consumer
+            // that binds binding arrays (JoinOptions::binding_arrays) it joins as an array of
+            // lane_max_count heap descriptors starting at the window base; otherwise it degrades
+            // to a single scalar heap binding at window_base + 0 (or constant slot 0 without
+            // window_base), keeping telemetry in JoinStats::lane_indexed_bindings.
+            const bool sampler_kind =
+                b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+            if ((b.source == ReflectedSource::LaneIndexedSamplerHeap) != sampler_kind) {
+                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
+                            (b.source == ReflectedSource::LaneIndexedSamplerHeap ? "sampler" : "resource") +
+                            " heap");
+                continue;
+            }
+            int pi = -1;
+            d3d::HeapIndexSource from = d3d::HeapIndexSource::Constant;
+            uint32_t slot = 0;
+            if (b.lane_has_window_base) {
+                std::string why;
+                if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why, stage_base)) {
+                    if (root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, nullptr, stage_base) < 0) {
+                        *had_uncovered_user_sgpr = true;
+                    }
+                    fail(b, "window base: " + why);
+                    continue;
+                }
+            }
+            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                  : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                  : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                      ? d3d::DescriptorRangeType::Uav
+                      : d3d::DescriptorRangeType::Srv;
+            lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+            lb.join.heap_index_source = from;
+            lb.join.heap_shift = b.heap_shift;
+            // S63 emits a non-power-of-two scale (s_mul_i32 * 24) as shift 0 plus that stride;
+            // a power-of-two stride is the shift itself.
+            if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
+                lb.join.heap_stride = b.heap_stride;
+            }
+            if (b.lane_has_window_base) {
+                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+                lb.join.cb_table_slot = slot;
+                lb.join.cb_byte_offset = b.cb_byte_offset;
+                lb.join.cb_bit_offset = b.cb_bit_offset;
+                lb.join.cb_mask = b.cb_mask;
+            }
+            if (options.binding_arrays) {
+                lb.join.array_size = b.lane_max_count;
+                lb.entry.binding_array_size = static_cast<uint16_t>(b.lane_max_count);
+                is_lane_array = true;
+            } else {
+                lb.join.array_size = 0;
+                lb.join.array_index = 0;
+                lb.entry.binding_array_size = 0;
+                is_lane_scalar = true;
+            }
+        } else if (b.source == ReflectedSource::InlineSampler) {
+            if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
+                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
+                continue;
+            }
+            d3d::SamplerDesc desc;
+            const bridge::DecodeStatus st_dec = bridge::decode_sampler_words(b.sampler_words, &desc);
+            if (st_dec != bridge::DecodeStatus::Ok) {
+                fail(b, std::string("the inline sampler words do not decode (") + bridge::decode_status_name(st_dec) +
+                            ")");
+                continue;
+            }
+            cls = d3d::DescriptorRangeType::Sampler;
+            reg = space = d3d::kNoIndex;
+            lb.join.inline_sampler = true;
+            lb.join.sampler = desc;
+        } else if (b.source == ReflectedSource::Unresolved) {
+            if (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture) {
+                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot have an unresolved source");
+                continue;
+            }
+            // The translator could not trace the descriptor (#482): bind the worker's default
+            // for the kind (an unresolved register), so the rest of the stage still joins.
+            const bool sampler_kind =
+                b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                  : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                                                          : d3d::DescriptorRangeType::Srv;
+            reg = space = d3d::kNoIndex;
+            is_unresolved = true;
+        } else if (b.source == ReflectedSource::StaticSampler) {
+            cls = d3d::DescriptorRangeType::Sampler;
+            if (b.static_sampler < rs.static_samplers.size()) {
+                reg = rs.static_samplers[b.static_sampler].shader_register;
+                space = rs.static_samplers[b.static_sampler].register_space;
+            } else {
+                // A sampler the console stage builds from constants in its code: the root
+                // signature has no static sampler for it. Bound as the default sampler (an
+                // unresolved join binds null, i.e. the worker's default), not a join failure.
+                reg = space = d3d::kNoIndex;
+            }
+        } else {
+            uint32_t into = 0;
+            const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into, stage_base);
+            if (pi < 0) {
+                *had_uncovered_user_sgpr = true;
+                fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
+                continue;
+            }
+            if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
+                rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {
+                fail(b, "s" + std::to_string(b.user_sgpr) + " is dword " + std::to_string(into) + " of root parameter " +
+                            std::to_string(pi) + ", not a table pointer or root descriptor");
+                continue;
+            }
+            const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
+            const std::string pname = "root parameter " + std::to_string(pi);
+            ReflectedSource source = b.source;
+            uint32_t table_byte_offset = b.table_byte_offset;
+            if (source == ReflectedSource::RootDescriptor &&
+                p.parameter_type == d3d::RootParameterType::DescriptorTable) {
+                // The stage builds its buffer from the SGPR that holds the table pointer (#482):
+                // join the table's descriptor the sidecar names, else its first one.
+                source = ReflectedSource::Table;
+                table_byte_offset = b.root_table_offset_given ? b.table_byte_offset : 0;
+                is_root_table = true;
+                if (!b.root_table_offset_given) {
+                    ++(*root_table_coercions);
+                }
+            }
+            switch (source) {
+                case ReflectedSource::Table: {
+                    if (p.parameter_type != d3d::RootParameterType::DescriptorTable) {
+                        fail(b, pname + " is not a descriptor table");
+                        continue;
+                    }
+                    if (table_byte_offset % kTableSlotBytes != 0) {
+                        fail(b, pname + ": byte offset " + std::to_string(table_byte_offset) +
+                                    " is not a descriptor boundary");
+                        continue;
+                    }
+                    const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
+                                                b.kind != ReflectedBindingKind::StorageTexture;
+                    const bool declared =
+                        table_slot_register(p, table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
+                    if (!declared || (read_only_kind && !kind_accepts(b.kind, cls)) ||
+                        (!read_only_kind && cls != d3d::DescriptorRangeType::Uav)) {
+                        // A slot the root signature does not declare, or declares as another class:
+                        // console stages read their tables as memory, past and regardless of the
+                        // declared ranges. Join the slot itself, with the class the stage reads.
+                        // That includes a writable binding over a declared SRV or CBV: the stage
+                        // stores through the descriptor (image_store / buffer_store), so the slot
+                        // holds a UAV-capable view on the console (#482: shared root signatures
+                        // whose space-1 table lists a CBV where the stage's compact layout has a
+                        // UAV). It is bound as a storage view; a slot that holds no UAV at draw
+                        // time binds null (translate_view), as does a texture created without
+                        // storage usage (see the state bridge).
+                        const bool sampler_kind = b.kind == ReflectedBindingKind::Sampler ||
+                                                  b.kind == ReflectedBindingKind::ComparisonSampler;
+                        bool sampler_table = false;
+                        for (const d3d::DescriptorRangeDesc& r : p.ranges) {
+                            sampler_table = sampler_table || r.range_type == d3d::DescriptorRangeType::Sampler;
+                        }
+                        if (sampler_kind != sampler_table) {
+                            fail(b, pname + " has no descriptor at byte offset " +
+                                        std::to_string(table_byte_offset) + " and is a " +
+                                        (sampler_table ? "sampler" : "resource") + " table");
+                            continue;
+                        }
+                        cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                              : sampler_kind                         ? d3d::DescriptorRangeType::Sampler
+                              : (b.kind == ReflectedBindingKind::Storage ||
+                                 b.kind == ReflectedBindingKind::StorageTexture)
+                                  ? d3d::DescriptorRangeType::Uav
+                                  : d3d::DescriptorRangeType::Srv;
+                        reg = space = 0;
+                        lb.join.table_parameter = static_cast<uint32_t>(pi);
+                        lb.join.table_slot = table_byte_offset / kTableSlotBytes;
+                        is_outside_rs = true;
+                    }
+                    break;
+                }
+                case ReflectedSource::RootConstants:
+                    if (p.parameter_type != d3d::RootParameterType::Constants32Bit) {
+                        fail(b, pname + " is not root constants");
+                        continue;
+                    }
+                    cls = d3d::DescriptorRangeType::Cbv;
+                    reg = p.shader_register;
+                    space = p.register_space;
+                    lb.join.root_constants = true;
+                    break;
+                case ReflectedSource::RootDescriptor:
+                    if (p.parameter_type == d3d::RootParameterType::Cbv) {
+                        cls = d3d::DescriptorRangeType::Cbv;
+                    } else if (p.parameter_type == d3d::RootParameterType::Srv) {
+                        cls = d3d::DescriptorRangeType::Srv;
+                    } else if (p.parameter_type == d3d::RootParameterType::Uav) {
+                        cls = d3d::DescriptorRangeType::Uav;
+                    } else {
+                        fail(b, pname + " is not a root descriptor");
+                        continue;
+                    }
+                    reg = p.shader_register;
+                    space = p.register_space;
+                    break;
+                case ReflectedSource::StaticSampler:
+                case ReflectedSource::SamplerHeap:
+                case ReflectedSource::ResourceHeap:
+                case ReflectedSource::InlineSampler:
+                case ReflectedSource::CbvIndexedSamplerHeap:
+                case ReflectedSource::CbvIndexedResourceHeap:
+                case ReflectedSource::LaneIndexedSamplerHeap:
+                case ReflectedSource::LaneIndexedResourceHeap:
+                case ReflectedSource::Unresolved:
+                    break;
+            }
+        }
+        if (!lb.join.root_constants && !kind_accepts(b.kind, cls)) {
+            fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take a " +
+                        (cls == d3d::DescriptorRangeType::Cbv   ? "CBV"
+                         : cls == d3d::DescriptorRangeType::Srv ? "SRV"
+                         : cls == d3d::DescriptorRangeType::Uav ? "UAV"
+                                                                : "sampler"));
+            continue;
+        }
+        if (lb.join.root_constants && b.kind != ReflectedBindingKind::Uniform) {
+            fail(b, "root constants bind as a uniform buffer only");
+            continue;
+        }
+        lb.join.register_class = cls;
+        lb.join.shader_register = reg;
+        lb.join.register_space = space;
+        // The WebGPU entry, from the reflection.
+        switch (b.kind) {
+            case ReflectedBindingKind::Uniform:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+                lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+                lb.entry.min_binding_size = b.min_binding_size;
+                break;
+            case ReflectedBindingKind::Storage:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+                lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::Storage);
+                lb.entry.min_binding_size = b.min_binding_size;
+                break;
+            case ReflectedBindingKind::ReadOnlyStorage:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+                lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage);
+                lb.entry.min_binding_size = b.min_binding_size;
+                break;
+            case ReflectedBindingKind::Texture:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+                lb.entry.binding_type = static_cast<uint8_t>(b.sample_type);
+                lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
+                if (b.multisampled) {
+                    lb.entry.flags |= GpuBindGroupLayoutEntryFlags::Multisampled;
+                }
+                break;
+            case ReflectedBindingKind::StorageTexture:
+                if (b.storage_format == 0) {
+                    fail(b, "a storage texture needs its format");
+                    continue;
+                }
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
+                // The translator declares storage textures write-only (texture_storage_*<fmt, write>);
+                // the layout must match, and read-write access is not even allowed for formats
+                // such as rgba8unorm (WebGPU rejects the layout, the pipeline and the frame).
+                lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+                lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
+                lb.entry.storage_format = b.storage_format;
+                break;
+            case ReflectedBindingKind::Sampler:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
+                lb.entry.binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Filtering);
+                break;
+            case ReflectedBindingKind::ComparisonSampler:
+                lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
+                lb.entry.binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Comparison);
+                break;
+        }
+        out_bindings->push_back(StageJoinedBinding{
+            {b.group, b.binding}, &b, lb, is_unresolved, is_outside_rs, is_lane_array, is_lane_scalar, is_root_table});
+    }
+    return stage_ok;
+}
+
 }  // namespace
 
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
@@ -888,10 +1384,12 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         bool unresolved = false;
         bool outside_rs = false;
         bool lane_array = false;
+        bool lane_scalar = false;
         bool root_table = false;
     };
     std::map<std::pair<uint32_t, uint32_t>, JoinedBinding> joined;
-    uint64_t lane_indexed = 0;
+    uint64_t failed_lane_indexed = 0;
+    uint64_t shifted_stages = 0;
     bool rt_arena = false;
     std::vector<rt_residency::AddressSource> rt_sources;
     bool ok = true;
@@ -911,392 +1409,108 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
             rt_arena = true;
         }
         rt_sources.insert(rt_sources.end(), st.reflection->address_sources.begin(), st.reflection->address_sources.end());
-        for (const ReflectedBinding& b : st.reflection->bindings) {
-            bridge::LayoutBinding lb;
-            lb.entry.binding = b.binding;
-            lb.entry.visibility = st.visibility;
-            bool is_unresolved = false;
-            bool is_outside_rs = false;
-            bool is_lane_array = false;
-            bool is_root_table = false;
-            // Where the descriptor comes from, as a root-signature register.
-            d3d::DescriptorRangeType cls = d3d::DescriptorRangeType::Srv;
-            uint32_t reg = 0, space = 0;
-            if (b.source == ReflectedSource::SamplerHeap || b.source == ReflectedSource::ResourceHeap) {
-                if (b.heap_shift >= 32) {
-                    fail(b, "heap shift " + std::to_string(b.heap_shift) + " must be < 32");
-                    continue;
-                }
-                // Heap-indexed: the index must be a root constant; the class follows the kind.
-                uint32_t dword = 0;
-                const int pi = root_constant_for_user_sgpr(rs, compute, b.heap_index_sgpr, &dword, options.user_data_base);
-                if (pi < 0) {
-                    fail(b, "s" + std::to_string(b.heap_index_sgpr) + " is not inside a root-constants parameter");
-                    continue;
-                }
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if ((b.source == ReflectedSource::SamplerHeap) != sampler_kind) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
-                                (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") + " heap");
-                    continue;
-                }
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
-                          ? d3d::DescriptorRangeType::Uav
-                          : d3d::DescriptorRangeType::Srv;
-                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
-                lb.join.heap_index_dword = dword;
-                lb.join.heap_shift = b.heap_shift;
-                if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
-                    lb.join.heap_stride = b.heap_stride;
-                }
-            } else if (b.source == ReflectedSource::CbvIndexedSamplerHeap ||
-                       b.source == ReflectedSource::CbvIndexedResourceHeap) {
-                if (b.heap_shift >= 32) {
-                    fail(b, "heap shift " + std::to_string(b.heap_shift) + " must be < 32");
-                    continue;
-                }
-                // CB-indexed heap (G62): the CB is the root parameter at user_sgpr; the index is read
-                // from it at draw time, the class follows the kind.
-                int pi = -1;
-                d3d::HeapIndexSource from = d3d::HeapIndexSource::CbRootDescriptor;
-                std::string why;
-                if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &why, options.user_data_base)) {
-                    fail(b, why);
-                    continue;
-                }
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if ((b.source == ReflectedSource::CbvIndexedSamplerHeap) != sampler_kind) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
-                                (b.source == ReflectedSource::CbvIndexedSamplerHeap ? "sampler" : "resource") + " heap");
-                    continue;
-                }
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
-                          ? d3d::DescriptorRangeType::Uav
-                          : d3d::DescriptorRangeType::Srv;
-                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
-                lb.join.heap_index_source = from;
-                lb.join.heap_shift = b.heap_shift;
-                if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
-                    lb.join.heap_stride = b.heap_stride;
-                }
-                lb.join.cb_byte_offset = b.cb_byte_offset;
-                lb.join.cb_bit_offset = b.cb_bit_offset;
-                lb.join.cb_mask = b.cb_mask;
-            } else if (b.source == ReflectedSource::LaneIndexedSamplerHeap ||
-                       b.source == ReflectedSource::LaneIndexedResourceHeap) {
-                if (b.lane_max_count == 0 || b.lane_max_count > kMaxLaneIndexedWindow || b.heap_shift >= 32) {
-                    fail(b, "lane-indexed heap needs max_count in 1.." + std::to_string(kMaxLaneIndexedWindow) +
-                                " and shift < 32");
-                    continue;
-                }
-                // Lane-indexed heap window (G62): validated like a CB-indexed source. With a consumer
-                // that binds binding arrays (JoinOptions::binding_arrays) it joins as an array of
-                // lane_max_count heap descriptors starting at the window base; otherwise it is refused
-                // with its own reason.
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                if ((b.source == ReflectedSource::LaneIndexedSamplerHeap) != sampler_kind) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
-                                (b.source == ReflectedSource::LaneIndexedSamplerHeap ? "sampler" : "resource") +
-                                " heap");
-                    continue;
-                }
-                int pi = -1;
-                d3d::HeapIndexSource from = d3d::HeapIndexSource::Constant;
-                uint32_t slot = 0;
-                if (b.lane_has_window_base) {
-                    std::string why;
-                    if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &why, options.user_data_base)) {
-                        fail(b, "window base: " + why);
-                        continue;
-                    }
-                }
-                if (!options.binding_arrays) {
-                    ++lane_indexed;
-                    fail(b, "lane-indexed heap window of " + std::to_string(b.lane_max_count) +
-                                " descriptors needs a binding array; the consumer does not bind binding arrays");
-                    continue;
-                }
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
-                          ? d3d::DescriptorRangeType::Uav
-                          : d3d::DescriptorRangeType::Srv;
-                lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-                lb.join.heap_index_source = from;
-                lb.join.heap_shift = b.heap_shift;
-                // S63 emits a non-power-of-two scale (s_mul_i32 * 24) as shift 0 plus that stride;
-                // a power-of-two stride is the shift itself.
-                if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
-                    lb.join.heap_stride = b.heap_stride;
-                }
-                lb.join.array_size = b.lane_max_count;
-                if (b.lane_has_window_base) {
-                    lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
-                    lb.join.cb_table_slot = slot;
-                    lb.join.cb_byte_offset = b.cb_byte_offset;
-                    lb.join.cb_bit_offset = b.cb_bit_offset;
-                    lb.join.cb_mask = b.cb_mask;
-                }
-                lb.entry.binding_array_size = static_cast<uint16_t>(b.lane_max_count);
-                is_lane_array = true;
-            } else if (b.source == ReflectedSource::InlineSampler) {
-                if (b.kind != ReflectedBindingKind::Sampler && b.kind != ReflectedBindingKind::ComparisonSampler) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take an inline sampler");
-                    continue;
-                }
-                d3d::SamplerDesc desc;
-                const bridge::DecodeStatus st = bridge::decode_sampler_words(b.sampler_words, &desc);
-                if (st != bridge::DecodeStatus::Ok) {
-                    fail(b, std::string("the inline sampler words do not decode (") + bridge::decode_status_name(st) +
-                                ")");
-                    continue;
-                }
-                cls = d3d::DescriptorRangeType::Sampler;
-                reg = space = d3d::kNoIndex;
-                lb.join.inline_sampler = true;
-                lb.join.sampler = desc;
-            } else if (b.source == ReflectedSource::Unresolved) {
-                if (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture) {
-                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot have an unresolved source");
-                    continue;
-                }
-                // The translator could not trace the descriptor (#482): bind the worker's default
-                // for the kind (an unresolved register), so the rest of the stage still joins.
-                const bool sampler_kind =
-                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
-                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
-                                                              : d3d::DescriptorRangeType::Srv;
-                reg = space = d3d::kNoIndex;
-                is_unresolved = true;
-            } else if (b.source == ReflectedSource::StaticSampler) {
-                cls = d3d::DescriptorRangeType::Sampler;
-                if (b.static_sampler < rs.static_samplers.size()) {
-                    reg = rs.static_samplers[b.static_sampler].shader_register;
-                    space = rs.static_samplers[b.static_sampler].register_space;
-                } else {
-                    // A sampler the console stage builds from constants in its code: the root
-                    // signature has no static sampler for it. Bound as the default sampler (an
-                    // unresolved join binds null, i.e. the worker's default), not a join failure.
-                    reg = space = d3d::kNoIndex;
-                }
-            } else {
-                uint32_t into = 0;
-                const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into, options.user_data_base);
-                if (pi < 0) {
-                    fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
-                    continue;
-                }
-                if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
-                    rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {
-                    fail(b, "s" + std::to_string(b.user_sgpr) + " is dword " + std::to_string(into) + " of root parameter " +
-                                std::to_string(pi) + ", not a table pointer or root descriptor");
-                    continue;
-                }
-                const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
-                const std::string pname = "root parameter " + std::to_string(pi);
-                ReflectedSource source = b.source;
-                uint32_t table_byte_offset = b.table_byte_offset;
-                if (source == ReflectedSource::RootDescriptor &&
-                    p.parameter_type == d3d::RootParameterType::DescriptorTable) {
-                    // The stage builds its buffer from the SGPR that holds the table pointer (#482):
-                    // join the table's descriptor the sidecar names, else its first one.
-                    source = ReflectedSource::Table;
-                    table_byte_offset = b.root_table_offset_given ? b.table_byte_offset : 0;
-                    is_root_table = true;
-                }
-                switch (source) {
-                    case ReflectedSource::Table: {
-                        if (p.parameter_type != d3d::RootParameterType::DescriptorTable) {
-                            fail(b, pname + " is not a descriptor table");
-                            continue;
-                        }
-                        if (table_byte_offset % kTableSlotBytes != 0) {
-                            fail(b, pname + ": byte offset " + std::to_string(table_byte_offset) +
-                                        " is not a descriptor boundary");
-                            continue;
-                        }
-                        const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
-                                                    b.kind != ReflectedBindingKind::StorageTexture;
-                        const bool declared =
-                            table_slot_register(p, table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
-                        if (!declared || (read_only_kind && !kind_accepts(b.kind, cls)) ||
-                            (!read_only_kind && cls != d3d::DescriptorRangeType::Uav)) {
-                            // A slot the root signature does not declare, or declares as another class:
-                            // console stages read their tables as memory, past and regardless of the
-                            // declared ranges. Join the slot itself, with the class the stage reads.
-                            // That includes a writable binding over a declared SRV or CBV: the stage
-                            // stores through the descriptor (image_store / buffer_store), so the slot
-                            // holds a UAV-capable view on the console (#482: shared root signatures
-                            // whose space-1 table lists a CBV where the stage's compact layout has a
-                            // UAV). It is bound as a storage view; a slot that holds no UAV at draw
-                            // time binds null (translate_view), as does a texture created without
-                            // storage usage (see the state bridge).
-                            const bool sampler_kind = b.kind == ReflectedBindingKind::Sampler ||
-                                                      b.kind == ReflectedBindingKind::ComparisonSampler;
-                            bool sampler_table = false;
-                            for (const d3d::DescriptorRangeDesc& r : p.ranges) {
-                                sampler_table = sampler_table || r.range_type == d3d::DescriptorRangeType::Sampler;
-                            }
-                            if (sampler_kind != sampler_table) {
-                                fail(b, pname + " has no descriptor at byte offset " +
-                                            std::to_string(table_byte_offset) + " and is a " +
-                                            (sampler_table ? "sampler" : "resource") + " table");
-                                continue;
-                            }
-                            cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
-                                  : sampler_kind                         ? d3d::DescriptorRangeType::Sampler
-                                  : (b.kind == ReflectedBindingKind::Storage ||
-                                     b.kind == ReflectedBindingKind::StorageTexture)
-                                      ? d3d::DescriptorRangeType::Uav
-                                      : d3d::DescriptorRangeType::Srv;
-                            reg = space = 0;
-                            lb.join.table_parameter = static_cast<uint32_t>(pi);
-                            lb.join.table_slot = table_byte_offset / kTableSlotBytes;
-                            is_outside_rs = true;
-                        }
+
+        const uint32_t explicit_base = st.user_data_base != 0 ? st.user_data_base : options.user_data_base;
+        std::vector<StageJoinedBinding> stage_bindings;
+        std::string stage_report;
+        bool had_uncovered_user_sgpr = false;
+        uint64_t root_table_coercions = 0;
+        bool stage_ok = resolve_stage_bindings(rs, compute, st, explicit_base, options, &stage_bindings, &stage_report,
+                                               &had_uncovered_user_sgpr, &root_table_coercions);
+
+        // GFX10.3 shifted-base fallback: on graphics pipelines, NGG/merged or shifted VS stages
+        // place user data starting above s8 (commonly s16 or s12). When resolving at the default s8
+        // base leaves one or more user SGPRs uncovered by the root signature, probe shifted bases
+        // and accept one ONLY when every binding in the stage resolves cleanly under that single
+        // consistent base.
+        const bool is_non_compute_stage =
+            !compute && (st.visibility & GpuShaderStageBits::Compute) == 0 &&
+            st.reflection->stage != ReflectedStage::Compute;
+        if (!stage_ok && had_uncovered_user_sgpr && explicit_base == 0 && is_non_compute_stage &&
+            !rs.parameters.empty()) {
+            bool found_exact = false;
+            bool found_fallback = false;
+            std::vector<StageJoinedBinding> best_bindings;
+            for (const uint32_t cand_base : collect_shifted_user_data_bases(rs, *st.reflection)) {
+                std::vector<StageJoinedBinding> cand_bindings;
+                std::string cand_report;
+                bool cand_uncovered = false;
+                uint64_t cand_coercions = 0;
+                if (resolve_stage_bindings(rs, false, st, cand_base, options, &cand_bindings, &cand_report,
+                                           &cand_uncovered, &cand_coercions)) {
+                    if (cand_coercions == 0) {
+                        best_bindings = std::move(cand_bindings);
+                        found_exact = true;
                         break;
                     }
-                    case ReflectedSource::RootConstants:
-                        if (p.parameter_type != d3d::RootParameterType::Constants32Bit) {
-                            fail(b, pname + " is not root constants");
-                            continue;
-                        }
-                        cls = d3d::DescriptorRangeType::Cbv;
-                        reg = p.shader_register;
-                        space = p.register_space;
-                        lb.join.root_constants = true;
-                        break;
-                    case ReflectedSource::RootDescriptor:
-                        if (p.parameter_type == d3d::RootParameterType::Cbv) {
-                            cls = d3d::DescriptorRangeType::Cbv;
-                        } else if (p.parameter_type == d3d::RootParameterType::Srv) {
-                            cls = d3d::DescriptorRangeType::Srv;
-                        } else if (p.parameter_type == d3d::RootParameterType::Uav) {
-                            cls = d3d::DescriptorRangeType::Uav;
-                        } else {
-                            fail(b, pname + " is not a root descriptor");
-                            continue;
-                        }
-                        reg = p.shader_register;
-                        space = p.register_space;
-                        break;
-                    case ReflectedSource::StaticSampler:
-                    case ReflectedSource::SamplerHeap:
-                    case ReflectedSource::ResourceHeap:
-                    case ReflectedSource::InlineSampler:
-                    case ReflectedSource::CbvIndexedSamplerHeap:
-                    case ReflectedSource::CbvIndexedResourceHeap:
-                    case ReflectedSource::LaneIndexedSamplerHeap:
-                    case ReflectedSource::LaneIndexedResourceHeap:
-                    case ReflectedSource::Unresolved:
-                        break;
+                    if (!found_fallback) {
+                        best_bindings = std::move(cand_bindings);
+                        found_fallback = true;
+                    }
                 }
             }
-            if (!lb.join.root_constants && !kind_accepts(b.kind, cls)) {
-                fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take a " +
-                            (cls == d3d::DescriptorRangeType::Cbv   ? "CBV"
-                             : cls == d3d::DescriptorRangeType::Srv ? "SRV"
-                             : cls == d3d::DescriptorRangeType::Uav ? "UAV"
-                                                                    : "sampler"));
-                continue;
+            if (found_exact || found_fallback) {
+                stage_bindings = std::move(best_bindings);
+                stage_report.clear();
+                stage_ok = true;
+                ++shifted_stages;
             }
-            if (lb.join.root_constants && b.kind != ReflectedBindingKind::Uniform) {
-                fail(b, "root constants bind as a uniform buffer only");
-                continue;
+        }
+
+        if (!stage_ok) {
+            *report += stage_report;
+            ok = false;
+            for (const StageJoinedBinding& sb : stage_bindings) {
+                if (sb.lane_scalar) {
+                    ++failed_lane_indexed;
+                }
             }
-            lb.join.register_class = cls;
-            lb.join.shader_register = reg;
-            lb.join.register_space = space;
-            // The WebGPU entry, from the reflection.
-            switch (b.kind) {
-                case ReflectedBindingKind::Uniform:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::Uniform);
-                    lb.entry.min_binding_size = b.min_binding_size;
-                    break;
-                case ReflectedBindingKind::Storage:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::Storage);
-                    lb.entry.min_binding_size = b.min_binding_size;
-                    break;
-                case ReflectedBindingKind::ReadOnlyStorage:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage);
-                    lb.entry.min_binding_size = b.min_binding_size;
-                    break;
-                case ReflectedBindingKind::Texture:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
-                    lb.entry.binding_type = static_cast<uint8_t>(b.sample_type);
-                    lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
-                    if (b.multisampled) {
-                        lb.entry.flags |= GpuBindGroupLayoutEntryFlags::Multisampled;
-                    }
-                    break;
-                case ReflectedBindingKind::StorageTexture:
-                    if (b.storage_format == 0) {
-                        fail(b, "a storage texture needs its format");
-                        continue;
-                    }
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
-                    // The translator declares storage textures write-only (texture_storage_*<fmt, write>);
-                    // the layout must match, and read-write access is not even allowed for formats
-                    // such as rgba8unorm (WebGPU rejects the layout, the pipeline and the frame).
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
-                    lb.entry.view_dimension = static_cast<uint8_t>(b.view_dimension);
-                    lb.entry.storage_format = b.storage_format;
-                    break;
-                case ReflectedBindingKind::Sampler:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Filtering);
-                    break;
-                case ReflectedBindingKind::ComparisonSampler:
-                    lb.entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
-                    lb.entry.binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Comparison);
-                    break;
-            }
-            const std::pair<uint32_t, uint32_t> key{b.group, b.binding};
-            auto it = joined.find(key);
+            continue;
+        }
+
+        for (const StageJoinedBinding& sb : stage_bindings) {
+            auto it = joined.find(sb.key);
             if (it == joined.end()) {
-                joined.emplace(key, JoinedBinding{lb, is_unresolved, is_outside_rs, is_lane_array, is_root_table});
-            } else if (same_binding(it->second.lb, lb)) {
-                it->second.lb.entry.visibility |= lb.entry.visibility;
+                joined.emplace(sb.key, JoinedBinding{sb.lb, sb.unresolved, sb.outside_rs, sb.lane_array, sb.lane_scalar,
+                                                     sb.root_table});
+            } else if (same_binding(it->second.lb, sb.lb)) {
+                it->second.lb.entry.visibility |= sb.lb.entry.visibility;
                 it->second.lb.entry.min_binding_size =
-                    std::max(it->second.lb.entry.min_binding_size, lb.entry.min_binding_size);
-                it->second.unresolved = it->second.unresolved && is_unresolved;
-                it->second.outside_rs = it->second.outside_rs || is_outside_rs;
-                it->second.lane_array = it->second.lane_array || is_lane_array;
-                it->second.root_table = it->second.root_table || is_root_table;
-            } else if ((it->second.unresolved || is_unresolved) && same_entry(it->second.lb.entry, lb.entry)) {
+                    std::max(it->second.lb.entry.min_binding_size, sb.lb.entry.min_binding_size);
+                it->second.unresolved = it->second.unresolved && sb.unresolved;
+                it->second.outside_rs = it->second.outside_rs || sb.outside_rs;
+                it->second.lane_array = it->second.lane_array || sb.lane_array;
+                it->second.lane_scalar = it->second.lane_scalar || sb.lane_scalar;
+                it->second.root_table = it->second.root_table || sb.root_table;
+            } else if ((it->second.unresolved || sb.unresolved) && same_entry(it->second.lb.entry, sb.lb.entry)) {
                 // One stage traced this binding's descriptor and another could not (version >= 3
                 // "unresolved"): when their WebGPU layout entries agree, keep the resolved source.
                 if (it->second.unresolved) {
-                    const uint32_t vis = it->second.lb.entry.visibility | lb.entry.visibility;
-                    const uint64_t min_sz = std::max(it->second.lb.entry.min_binding_size, lb.entry.min_binding_size);
-                    it->second.lb = lb;
+                    const uint32_t vis = it->second.lb.entry.visibility | sb.lb.entry.visibility;
+                    const uint64_t min_sz =
+                        std::max(it->second.lb.entry.min_binding_size, sb.lb.entry.min_binding_size);
+                    it->second.lb = sb.lb;
                     it->second.lb.entry.visibility = vis;
                     it->second.lb.entry.min_binding_size = min_sz;
                     it->second.unresolved = false;
-                    it->second.outside_rs = is_outside_rs;
-                    it->second.lane_array = is_lane_array;
-                    it->second.root_table = is_root_table;
+                    it->second.outside_rs = sb.outside_rs;
+                    it->second.lane_array = sb.lane_array;
+                    it->second.lane_scalar = sb.lane_scalar;
+                    it->second.root_table = sb.root_table;
                 } else {
-                    it->second.lb.entry.visibility |= lb.entry.visibility;
+                    it->second.lb.entry.visibility |= sb.lb.entry.visibility;
                     it->second.lb.entry.min_binding_size =
-                        std::max(it->second.lb.entry.min_binding_size, lb.entry.min_binding_size);
+                        std::max(it->second.lb.entry.min_binding_size, sb.lb.entry.min_binding_size);
                 }
             } else {
-                fail(b, "the stages disagree on this binding's kind or source");
+                fail(*sb.src, "the stages disagree on this binding's kind or source");
             }
+        }
+    }
+    uint64_t lane_indexed = failed_lane_indexed;
+    for (const auto& [key, jb] : joined) {
+        if (jb.lane_scalar) {
+            ++lane_indexed;
         }
     }
     if (stats != nullptr) {
@@ -1346,6 +1560,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         stats->lane_indexed_arrays += lane_arrays;
         stats->root_descriptor_tables += root_tables;
         stats->unresolved_bindings += unresolved;
+        stats->shifted_user_data_base_stages += shifted_stages;
     }
     return true;
 }
@@ -1434,10 +1649,76 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         } else if (in.fetch_format != pso::WgpuVertexFormat::Undefined) {
             f.format = in.fetch_format;  // the stage's own fetch (inside an element, or a reinterpretation)
         } else {
-            *report += key + ": reads inside element " + std::string(hit->name ? hit->name : "?") +
-                       std::to_string(hit->index) + " and has no fetch_format\n";
-            ok = false;
-            continue;
+            // Sub-element fetch without an explicit fetch_format: infer the format for aligned
+            // reads inside 32-bit dword elements (including spanning adjacent same-class 32-bit
+            // elements) and 2-byte aligned reads inside 16-bit elements when WebGPU alignment holds.
+            const uint32_t rel = in.byte_offset - hit->offset;
+            const uint32_t dw_have = dword_components(hit->format);
+            const uint32_t h_have = half_components(hit->format);
+            const uint32_t want = std::min(std::max(in.components, 1u), 4u);
+            if (dw_have != 0 && rel % 4u == 0 && in.byte_offset % 4u == 0) {
+                ReflectedComponentType hit_cls;
+                element_class(hit->format, &hit_cls);
+                uint32_t covered = dw_have - rel / 4u;
+                bool extended = true;
+                while (covered < want && extended) {
+                    extended = false;
+                    for (const Element& el : placed) {
+                        ReflectedComponentType el_cls;
+                        element_class(el.format, &el_cls);
+                        const uint32_t n = dword_components(el.format);
+                        if (el.slot == hit->slot && el.offset == in.byte_offset + covered * 4u && n != 0 &&
+                            el_cls == hit_cls) {
+                            covered += n;
+                            extended = true;
+                            break;
+                        }
+                    }
+                }
+                const uint32_t count = std::min(want, covered);
+                f.format = dword_format(in.component_type, count);
+            } else if (h_have != 0 && rel % 2u == 0 && in.byte_offset % 2u == 0) {
+                const pso::WgpuVertexFormat base_half = half_format_like(hit->format, 1);
+                uint32_t covered = h_have - rel / 2u;
+                bool extended = true;
+                while (covered < want && extended) {
+                    extended = false;
+                    for (const Element& el : placed) {
+                        const uint32_t n = half_components(el.format);
+                        if (el.slot == hit->slot && el.offset == in.byte_offset + covered * 2u && n != 0 &&
+                            half_format_like(el.format, 1) == base_half) {
+                            covered += n;
+                            extended = true;
+                            break;
+                        }
+                    }
+                }
+                uint32_t count = 0;
+                if (want == 1 && covered >= 1) {
+                    count = 1;
+                } else if (in.byte_offset % 4u == 0) {
+                    if (want >= 3 && covered >= 4) {
+                        count = 4;
+                    } else if (want >= 2 && covered >= 2) {
+                        count = 2;
+                    } else if (covered >= 1) {
+                        count = 1;
+                    }
+                }
+                if (count != 0) {
+                    f.format = half_format_like(hit->format, count);
+                } else {
+                    *report += key + ": reads inside element " + std::string(hit->name ? hit->name : "?") +
+                               std::to_string(hit->index) + " and has no fetch_format\n";
+                    ok = false;
+                    continue;
+                }
+            } else {
+                *report += key + ": reads inside element " + std::string(hit->name ? hit->name : "?") +
+                           std::to_string(hit->index) + " and has no fetch_format\n";
+                ok = false;
+                continue;
+            }
         }
         ReflectedComponentType cls;
         element_class(f.format, &cls);
