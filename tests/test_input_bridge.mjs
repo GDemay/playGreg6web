@@ -1512,6 +1512,7 @@ test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen buil
     'menu-to-ingame',
     'chrome-menu-flow-2',
     'chrome-menu-flow-4',
+    'chrome-to-ingame',
   ]);
   assert.deepEqual(Object.keys(INPUT_SCRIPT_PRESETS), [...INPUT_SCRIPT_PRESET_NAMES]);
 
@@ -3450,6 +3451,7 @@ test('W339 startOffsetMs shifts preset and custom timelines cleanly while keepin
     ['menu-to-ingame', 5000],
     ['chrome-menu-flow-2', 110000],
     ['chrome-menu-flow-4', 5000],
+    ['chrome-to-ingame', 5000],
   ];
   for (const [name, expectedFirstMs] of expectedFirstTransitions) {
     const p = new ScriptedInputPlayer(name);

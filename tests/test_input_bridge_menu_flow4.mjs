@@ -12,6 +12,7 @@ import {
   INPUT_SCRIPT_PRESET_NAMES,
   MIN_SCRIPT_HOLD_MS,
   CHROME_MENU_FLOW_4_HOLD_MS,
+  CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
   DEFAULT_VISIBLE_FRAME_FALLBACK_MS,
   FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS,
   FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
@@ -97,20 +98,26 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   assert.ok(spec);
   assert.equal(Object.isFrozen(spec), true);
   assert.equal(spec.name, 'chrome-menu-flow-4');
-  assert.equal(spec.events.length, 175); // 29 Phase 1 + 63 Phase 2 + 2 Phase 3 + 10 Phase 4a + 63 Phase 4b + 8 Phase 4c
+  assert.equal(spec.events.length, 196); // 29 Phase 1 + 63 Phase 2 + 2 Phase 3 + 10 Phase 4a + 63 Phase 4b + 28 Phase 4c legal-terms + 1 Phase 4c A
   assert.equal(spec.events[0].atMs, 5000);
   assert.equal(spec.events[93].atMs, 180000); // Phase 3 end preserved intact
   assert.equal(spec.events[spec.events.length - 1].atMs, 358000);
   assert.equal(spec.loop.startMs, 368000);
-  assert.equal(spec.loop.periodMs, 14000);
-  assert.equal(spec.loop.events.length, 9);
+  assert.equal(spec.loop.periodMs, 16000);
+  assert.equal(spec.loop.events.length, 14);
 
-  // Every fixed and loop event must have holdMs >= 180 ms, strictly increasing timestamps,
-  // zero overlap, and >= 200 ms released gap between consecutive presses.
+  // Every fixed and loop event must have holdMs >= 180 ms (>= CHROME_MENU_FLOW_4_HOLD_MS),
+  // strictly increasing timestamps, zero overlap, and >= 200 ms released gap between presses.
   for (let i = 0; i < spec.events.length; i++) {
     const ev = spec.events[i];
     assert.ok(ev.holdMs >= 180, `fixed event ${i} holdMs (${ev.holdMs}) must be >= 180 ms`);
-    assert.equal(ev.holdMs, CHROME_MENU_FLOW_4_HOLD_MS);
+    assert.ok(
+      ev.holdMs >= CHROME_MENU_FLOW_4_HOLD_MS,
+      `fixed event ${i} holdMs (${ev.holdMs}) must be >= ${CHROME_MENU_FLOW_4_HOLD_MS}`
+    );
+    if (i < 167) {
+      assert.equal(ev.holdMs, CHROME_MENU_FLOW_4_HOLD_MS);
+    }
     if (i > 0) {
       const prev = spec.events[i - 1];
       assert.ok(
@@ -122,7 +129,10 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   for (let i = 0; i < spec.loop.events.length; i++) {
     const ev = spec.loop.events[i];
     assert.ok(ev.holdMs >= 180, `loop event ${i} holdMs (${ev.holdMs}) must be >= 180 ms`);
-    assert.equal(ev.holdMs, CHROME_MENU_FLOW_4_HOLD_MS);
+    assert.ok(
+      ev.holdMs >= CHROME_MENU_FLOW_4_HOLD_MS,
+      `loop event ${i} holdMs (${ev.holdMs}) must be >= ${CHROME_MENU_FLOW_4_HOLD_MS}`
+    );
     if (i > 0) {
       const prev = spec.loop.events[i - 1];
       assert.ok(
@@ -266,42 +276,64 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
     assert.equal(player.sampleAt(t).buttonsMask, 0, `quiet settle before Phase 4c at ${t}`);
   }
 
-  // Phase 4c (320s..360s, W361): DPAD_UP at 320s, A at 322s, then spaced A at 328s..358s.
-  const expectedPhase4c = [
-    [320000, INPUT_BUTTONS.DPAD_UP],
-    [322000, INPUT_BUTTONS.A],
-    [328000, INPUT_BUTTONS.A],
-    [334000, INPUT_BUTTONS.A],
-    [340000, INPUT_BUTTONS.A],
-    [346000, INPUT_BUTTONS.A],
-    [352000, INPUT_BUTTONS.A],
-    [358000, INPUT_BUTTONS.A],
-  ];
-  for (const [atMs, expectedBtn] of expectedPhase4c) {
-    expectedCount += 1;
-    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0, `Phase 4c idle before ${atMs}`);
-    assert.equal(player.sampleAt(atMs).buttonsMask, expectedBtn, `Phase 4c press at ${atMs}`);
-    assert.equal(player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1).buttonsMask, expectedBtn);
-    assert.equal(player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS).buttonsMask, 0);
-    assert.equal(player.pressCountAt(atMs), expectedCount);
+  // Phase 4c (320s..360s, W362): 2 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS
+  // (Up x6 -> right-stick scroll -> A [Privacy Policy] -> Down -> right-stick scroll ->
+  // A [Terms of Service] -> Down -> A [Confirm >] -> A) followed by A at 358s.
+  for (let round = 0; round < 2; round++) {
+    const base = 320000 + round * 16000;
+    for (const step of CHROME_LEGAL_TERMS_ACCEPT_OFFSETS) {
+      expectedCount += 1;
+      const t = base + step.offsetMs;
+      const before = player.sampleAt(t - 1);
+      assert.equal(before.buttonsMask, 0, `Phase 4c round ${round} idle before +${step.offsetMs}`);
+      assert.equal(before.sticks, undefined, `Phase 4c round ${round} sticks idle before +${step.offsetMs}`);
+      const duringStart = player.sampleAt(t);
+      const duringEnd = player.sampleAt(t + step.holdMs - 1);
+      if (step.button !== undefined) {
+        assert.equal(duringStart.buttonsMask, step.button, `Phase 4c round ${round} press at +${step.offsetMs}`);
+        assert.equal(duringEnd.buttonsMask, step.button);
+      } else {
+        assert.equal(duringStart.buttonsMask, 0);
+        assert.equal(duringStart.sticks?.ry, step.sticks.ry, `Phase 4c round ${round} scroll at +${step.offsetMs}`);
+        assert.equal(duringEnd.sticks?.ry, step.sticks.ry);
+      }
+      const after = player.sampleAt(t + step.holdMs);
+      assert.equal(after.buttonsMask, 0);
+      assert.equal(after.sticks, undefined);
+      assert.equal(player.pressCountAt(t), expectedCount);
+    }
   }
-  assert.equal(expectedCount, 175);
+  expectedCount += 1;
+  assert.equal(player.sampleAt(357999).buttonsMask, 0);
+  assert.equal(player.sampleAt(358000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(358219).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(358220).buttonsMask, 0);
+  assert.equal(player.pressCountAt(358000), expectedCount);
+  assert.equal(expectedCount, 196);
 
-  // Quiet ~10 s settle window (358200..367999 ms) before Phase 5 fallback loop.
-  for (let t = 358200; t < 368000; t += 500) {
+  // Quiet ~10 s settle window (358220..367999 ms) before Phase 5 fallback loop.
+  for (let t = 358500; t < 368000; t += 500) {
     assert.equal(player.sampleAt(t).buttonsMask, 0, `transition settle before Phase 5 loop at ${t}`);
   }
 
-  // Phase 5 (368s+): Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds).
+  // Phase 5 (368s+): Looping 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS.
   for (let cycle = 0; cycle < 3; cycle++) {
-    const base = 368000 + cycle * 14000;
-    for (const [offsetMs, expectedBtn] of expectedCycle) {
+    const base = 368000 + cycle * 16000;
+    for (const step of CHROME_LEGAL_TERMS_ACCEPT_OFFSETS) {
       expectedCount += 1;
-      const t = base + offsetMs;
-      assert.equal(player.sampleAt(t - 1).buttonsMask, 0, `loop ${cycle} idle before +${offsetMs}`);
-      assert.equal(player.sampleAt(t).buttonsMask, expectedBtn, `loop ${cycle} press at +${offsetMs}`);
-      assert.equal(player.sampleAt(t + CHROME_MENU_FLOW_4_HOLD_MS - 1).buttonsMask, expectedBtn);
-      assert.equal(player.sampleAt(t + CHROME_MENU_FLOW_4_HOLD_MS).buttonsMask, 0);
+      const t = base + step.offsetMs;
+      assert.equal(player.sampleAt(t - 1).buttonsMask, 0, `loop ${cycle} idle before +${step.offsetMs}`);
+      const s = player.sampleAt(t);
+      if (step.button !== undefined) {
+        assert.equal(s.buttonsMask, step.button, `loop ${cycle} press at +${step.offsetMs}`);
+        assert.equal(player.sampleAt(t + step.holdMs - 1).buttonsMask, step.button);
+      } else {
+        assert.equal(s.buttonsMask, 0);
+        assert.equal(s.sticks?.ry, step.sticks.ry, `loop ${cycle} scroll at +${step.offsetMs}`);
+        assert.equal(player.sampleAt(t + step.holdMs - 1).sticks?.ry, step.sticks.ry);
+      }
+      assert.equal(player.sampleAt(t + step.holdMs).buttonsMask, 0);
+      assert.equal(player.sampleAt(t + step.holdMs).sticks, undefined);
       assert.equal(player.pressCountAt(t), expectedCount);
     }
   }
@@ -323,18 +355,22 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   assert.equal(player.nextTransitionMs(180200), 184000);
   assert.equal(player.nextTransitionMs(211200), 218000);
   assert.equal(player.nextTransitionMs(308700), 320000);
-  assert.equal(player.nextTransitionMs(320200), 322000);
-  assert.equal(player.nextTransitionMs(322200), 328000);
-  assert.equal(player.nextTransitionMs(358200), 368000);
-  assert.equal(player.nextTransitionMs(374700), 382000);
+  assert.equal(player.nextTransitionMs(320200), 320450);
+  assert.equal(player.nextTransitionMs(322450), 322700);
+  assert.equal(player.nextTransitionMs(323600), 324000);
+  assert.equal(player.nextTransitionMs(358220), 368000);
+  assert.equal(player.nextTransitionMs(380220), 384000);
 
-  // Verify 15 FPS (67 ms frame cadence) and 30 FPS (33 ms frame cadence) sampling catches every press.
+  // Verify 15 FPS (67 ms frame cadence) and 30 FPS (33 ms frame cadence) sampling catches every press & scroll.
   for (const frameMs of [33, 67]) {
     for (const ev of spec.events) {
       let seenFrames = 0;
       const firstFrame = Math.ceil(ev.atMs / frameMs) * frameMs;
       for (let f = firstFrame; f < ev.atMs + ev.holdMs; f += frameMs) {
-        if (player.sampleAt(f).buttonsMask === ev.button) {
+        const s = player.sampleAt(f);
+        if (ev.button !== undefined && s.buttonsMask === ev.button) {
+          seenFrames += 1;
+        } else if (ev.sticks !== undefined && s.sticks?.ry === ev.sticks.ry) {
           seenFrames += 1;
         }
       }
@@ -346,10 +382,10 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   }
 
   // Composes cleanly with maxPresses, endMs, and startOffsetMs.
-  const capped = new ScriptedInputPlayer({ preset: 'chrome-menu-flow-4', maxPresses: 176 });
-  assert.equal(capped.sampleAt(368000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // #176 (1st loop DUp)
-  assert.equal(capped.sampleAt(368400).buttonsMask, 0);
-  assert.equal(capped.pressCountAt(450000), 176);
+  const capped = new ScriptedInputPlayer({ preset: 'chrome-menu-flow-4', maxPresses: 197 });
+  assert.equal(capped.sampleAt(368000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // #197 (1st loop DUp)
+  assert.equal(capped.sampleAt(368450).buttonsMask, 0);
+  assert.equal(capped.pressCountAt(450000), 197);
   assert.equal(capped.nextTransitionMs(368200), null);
 
   const shifted = new ScriptedInputPlayer('chrome-menu-flow-4', { startOffsetMs: 12000 });
@@ -718,27 +754,51 @@ test('W355 InputBridge drives chrome-menu-flow-4 end-to-end through Start Screen
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   assert.equal(bridge.getStats().scriptedPressesSent, 113);
 
-  // Phase 4c (W361): Post-Legal -> Main Menu -> Story/Play probes (320s DPAD_UP #168, 322s A #169 .. 358s A #175).
+  // Phase 4c (W362): 2 rounds of ROCKSTAR GAMES LEGAL TERMS & POLICIES checkbox-accept
+  // (320s DPAD_UP #168, 322.7s ry scroll, 324s A Privacy Policy #174, 325.2s DPAD_DOWN #175,
+  // 325.8s ry scroll, 327.1s A Terms of Service #176, 328.3s DPAD_DOWN #177, 329.5s A Confirm > #178)
+  // followed by A at 358s (#192).
   clock.advanceTo(320000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
   assert.equal(bridge.getStats().scriptedPressesSent, 168);
 
-  clock.advanceTo(322000);
+  clock.advanceTo(322700);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.ok(Math.abs(bridge.getSnapshot().ry - -0.95) < 1e-5);
+
+  clock.advanceTo(324000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
-  assert.equal(bridge.getStats().scriptedPressesSent, 169);
+  assert.equal(bridge.getSnapshot().ry, 0);
+  assert.equal(bridge.getStats().scriptedPressesSent, 174);
+
+  clock.advanceTo(325200);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(bridge.getStats().scriptedPressesSent, 175);
+
+  clock.advanceTo(327100);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 176);
+
+  clock.advanceTo(328300);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  assert.equal(bridge.getStats().scriptedPressesSent, 177);
+
+  clock.advanceTo(329500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 178);
 
   clock.advanceTo(358000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
-  assert.equal(bridge.getStats().scriptedPressesSent, 175);
+  assert.equal(bridge.getStats().scriptedPressesSent, 192);
 
-  // Phase 5: Looping _menu_cycle starts at 368000 ms (#176 DPAD_UP) -> 374500 ms (#184 A).
+  // Phase 5: Looping 16 s legal-terms-accept starts at 368000 ms (#193 DPAD_UP) -> 377500 ms (#203 A Confirm >).
   clock.advanceTo(368000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
-  assert.equal(bridge.getStats().scriptedPressesSent, 176);
+  assert.equal(bridge.getStats().scriptedPressesSent, 193);
 
-  clock.advanceTo(374500);
+  clock.advanceTo(377500);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
-  assert.equal(bridge.getStats().scriptedPressesSent, 184);
+  assert.equal(bridge.getStats().scriptedPressesSent, 203);
 
   bridge.destroy();
   assert.equal(clock.pendingTimeouts(), 0);
@@ -747,6 +807,7 @@ test('W355 InputBridge drives chrome-menu-flow-4 end-to-end through Start Screen
 test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST_PRESENT, fires 220 ms A within 500 ms, and runs Phases 1->4 cleanly', () => {
   assert.deepEqual(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS, [
     'menu-to-ingame',
+    'chrome-to-ingame',
     'chrome-menu-flow-4',
     'chrome-menu-flow-2',
     'chrome-menu-flow',
@@ -851,7 +912,7 @@ test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST
   clock.advanceTo(visibleAt + 180000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
 
-  // Phase 4 (W361): +184000 ms Phase 4a A -> +218000 ms Phase 4b _menu_cycle -> +320000..+358000 ms Phase 4c
+  // Phase 4 (W361/W362): +184000 ms Phase 4a A -> +218000 ms Phase 4b _menu_cycle -> +320000..+358000 ms Phase 4c checkbox accept
   clock.advanceTo(visibleAt + 184000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   clock.advanceTo(visibleAt + 218000);
@@ -860,15 +921,19 @@ test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   clock.advanceTo(visibleAt + 320000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
-  clock.advanceTo(visibleAt + 322000);
+  clock.advanceTo(visibleAt + 324000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 327100);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 329500);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   clock.advanceTo(visibleAt + 358000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
 
-  // Phase 5: +368000 ms Looping _menu_cycle DPAD_UP -> +374500 ms A
+  // Phase 5: +368000 ms Looping legal-terms-accept DPAD_UP -> +377500 ms Confirm > A
   clock.advanceTo(visibleAt + 368000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
-  clock.advanceTo(visibleAt + 374500);
+  clock.advanceTo(visibleAt + 377500);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
 
   // Never presses B at any point in the re-anchored player.
@@ -1153,34 +1218,318 @@ test('W361 chrome-menu-flow-4 Phase 4 drives long-Bink2 runs (t89: UI TEXT SIZE 
     }
   }
 
-  // Phase 4c (320s..360s): Post-Legal List -> Main Menu -> Story/Play probes (DPAD_UP 320s, A 322s,
-  // then spaced A confirmations at 328s, 334s, 340s, 346s, 352s, 358s).
-  for (const [atMs, btn] of [
-    [320000, INPUT_BUTTONS.DPAD_UP],
-    [322000, INPUT_BUTTONS.A],
-    [328000, INPUT_BUTTONS.A],
-    [334000, INPUT_BUTTONS.A],
-    [340000, INPUT_BUTTONS.A],
-    [346000, INPUT_BUTTONS.A],
-    [352000, INPUT_BUTTONS.A],
-    [358000, INPUT_BUTTONS.A],
-  ]) {
-    clock.advanceTo(visibleAt + atMs);
-    assert.equal(bridge.getSnapshot().buttons, btn, `Phase 4c press at +${atMs} ms`);
-    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1);
-    assert.equal(bridge.getSnapshot().buttons, btn);
-    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS);
-    assert.equal(bridge.getSnapshot().buttons, 0);
+  // Phase 4c (320s..360s, W362): 2 rounds of ROCKSTAR GAMES LEGAL TERMS & POLICIES 2-checkbox +
+  // Confirm > sequence (320s..352s: Up x6 -> scroll -> A -> Down -> scroll -> A -> Down -> A -> A)
+  // followed by A at 358s.
+  for (let round = 0; round < 2; round++) {
+    const base = 320000 + round * 16000;
+    for (const step of CHROME_LEGAL_TERMS_ACCEPT_OFFSETS) {
+      const atMs = base + step.offsetMs;
+      clock.advanceTo(visibleAt + atMs);
+      if (step.button !== undefined) {
+        assert.equal(bridge.getSnapshot().buttons, step.button, `Phase 4c round ${round} press at +${atMs} ms`);
+      } else {
+        assert.equal(bridge.getSnapshot().buttons, 0);
+        assert.ok(Math.abs(bridge.getSnapshot().ry - step.sticks.ry) < 1e-5, `Phase 4c round ${round} scroll at +${atMs} ms`);
+      }
+      clock.advanceTo(visibleAt + atMs + step.holdMs - 1);
+      if (step.button !== undefined) {
+        assert.equal(bridge.getSnapshot().buttons, step.button);
+      } else {
+        assert.ok(Math.abs(bridge.getSnapshot().ry - step.sticks.ry) < 1e-5);
+      }
+      clock.advanceTo(visibleAt + atMs + step.holdMs);
+      assert.equal(bridge.getSnapshot().buttons, 0);
+      assert.equal(bridge.getSnapshot().ry, 0);
+    }
   }
+  clock.advanceTo(visibleAt + 358000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 358219);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 358220);
+  assert.equal(bridge.getSnapshot().buttons, 0);
 
   // Zero B presses across the entire 0..380s re-anchored schedule.
   for (let t = 0; t <= 380000; t += 100) {
     assert.equal(
       bridge._scriptPlayer.sampleAt(t).buttonsMask & INPUT_BUTTONS.B,
       0,
-      `W361 schedule must never press B at t=${t}`
+      `W361/W362 schedule must never press B at t=${t}`
     );
   }
+
+  bridge.destroy();
+  assert.equal(clock.pendingTimeouts(), 0);
+});
+
+test('W362 CHROME_LEGAL_TERMS_ACCEPT_OFFSETS executes Up x6 -> scroll -> A -> Down -> scroll -> A -> Down -> A -> A with >= 200 ms holds and zero B', () => {
+  assert.equal(Object.isFrozen(CHROME_LEGAL_TERMS_ACCEPT_OFFSETS), true);
+  assert.equal(CHROME_LEGAL_TERMS_ACCEPT_OFFSETS.length, 14);
+
+  const expectedSequence = [
+    { offsetMs: 0, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 450, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 900, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 1350, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 1800, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 2250, holdMs: 200, button: INPUT_BUTTONS.DPAD_UP },
+    { offsetMs: 2700, holdMs: 900, ry: -0.95 },
+    { offsetMs: 4000, holdMs: 220, button: INPUT_BUTTONS.A },
+    { offsetMs: 5200, holdMs: 200, button: INPUT_BUTTONS.DPAD_DOWN },
+    { offsetMs: 5800, holdMs: 900, ry: -0.95 },
+    { offsetMs: 7100, holdMs: 220, button: INPUT_BUTTONS.A },
+    { offsetMs: 8300, holdMs: 200, button: INPUT_BUTTONS.DPAD_DOWN },
+    { offsetMs: 9500, holdMs: 220, button: INPUT_BUTTONS.A },
+    { offsetMs: 12000, holdMs: 220, button: INPUT_BUTTONS.A },
+  ];
+
+  for (let i = 0; i < expectedSequence.length; i++) {
+    const actual = CHROME_LEGAL_TERMS_ACCEPT_OFFSETS[i];
+    const exp = expectedSequence[i];
+    assert.equal(Object.isFrozen(actual), true);
+    assert.equal(actual.offsetMs, exp.offsetMs);
+    assert.equal(actual.holdMs, exp.holdMs);
+    assert.ok(actual.holdMs >= CHROME_MENU_FLOW_4_HOLD_MS);
+    if (exp.button !== undefined) {
+      assert.equal(actual.button, exp.button);
+      assert.equal(actual.button & INPUT_BUTTONS.B, 0);
+    } else {
+      assert.equal(actual.button, undefined);
+      assert.equal(Object.isFrozen(actual.sticks), true);
+      assert.equal(actual.sticks.ry, exp.ry);
+    }
+    if (i > 0) {
+      const prev = CHROME_LEGAL_TERMS_ACCEPT_OFFSETS[i - 1];
+      assert.ok(actual.offsetMs >= prev.offsetMs + prev.holdMs + 200);
+    }
+  }
+  const last = CHROME_LEGAL_TERMS_ACCEPT_OFFSETS[CHROME_LEGAL_TERMS_ACCEPT_OFFSETS.length - 1];
+  assert.ok(last.offsetMs + last.holdMs < 16000, 'cycle must fit comfortably within 16000 ms');
+});
+
+test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal Terms 2-checkbox + Confirm > -> Main Menu -> in-game probes bounded by 420 s with zero B', () => {
+  assert.ok(INPUT_SCRIPT_PRESET_NAMES.includes('chrome-to-ingame'));
+  assert.ok(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS.includes('chrome-to-ingame'));
+
+  const spec = INPUT_SCRIPT_PRESETS['chrome-to-ingame'];
+  assert.ok(spec);
+  assert.equal(Object.isFrozen(spec), true);
+  assert.equal(spec.name, 'chrome-to-ingame');
+  assert.equal(spec.loop, undefined);
+  // 47 Phase 1 + 36 Phase 2 (4x9) + 56 Phase 3 (4x14) + 16 Phase 4a + 25 Phase 4b (4x6 + 1) = 180 events
+  assert.equal(spec.events.length, 180);
+  assert.equal(spec.events[0].atMs, 5000);
+  assert.equal(spec.events[spec.events.length - 1].atMs, 418000);
+
+  // Every event is frozen, >= 180 ms hold, strictly increasing, >= 200 ms gap, and finishes <= 420000 ms.
+  for (let i = 0; i < spec.events.length; i++) {
+    const ev = spec.events[i];
+    assert.equal(Object.isFrozen(ev), true);
+    assert.ok(ev.holdMs >= MIN_SCRIPT_HOLD_MS, `event ${i} holdMs (${ev.holdMs}) must be >= 180 ms`);
+    assert.ok(ev.atMs + ev.holdMs <= 420000, `event ${i} must complete within 420 s`);
+    if (ev.sticks) {
+      assert.equal(Object.isFrozen(ev.sticks), true);
+    }
+    if (i > 0) {
+      const prev = spec.events[i - 1];
+      assert.ok(
+        ev.atMs >= prev.atMs + prev.holdMs + 200,
+        `event ${i} (${ev.atMs}) must leave >= 200 ms gap after event ${i - 1} end (${prev.atMs + prev.holdMs})`
+      );
+    }
+  }
+
+  const player = new ScriptedInputPlayer('chrome-to-ingame');
+  assert.equal(player.preset, 'chrome-to-ingame');
+  assert.equal(player.nextTransitionMs(0), 5000);
+
+  // Phase 1 (5s..145s): Spaced A every 3000 ms (holdMs: 220, 47 presses: 5000..143000 ms).
+  let expectedCount = 0;
+  for (let atMs = 5000; atMs <= 145000; atMs += 3000) {
+    expectedCount += 1;
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 219).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 220).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), expectedCount);
+  }
+  assert.equal(expectedCount, 47);
+
+  // Phase 2 (150s..206s): 4 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A).
+  const expectedMenuCycle = [
+    [0, INPUT_BUTTONS.DPAD_UP],
+    [400, INPUT_BUTTONS.DPAD_UP],
+    [800, INPUT_BUTTONS.DPAD_UP],
+    [1200, INPUT_BUTTONS.DPAD_UP],
+    [1600, INPUT_BUTTONS.DPAD_UP],
+    [2000, INPUT_BUTTONS.DPAD_UP],
+    [3000, INPUT_BUTTONS.DPAD_DOWN],
+    [4500, INPUT_BUTTONS.DPAD_DOWN],
+    [6500, INPUT_BUTTONS.A],
+  ];
+  for (let round = 0; round < 4; round++) {
+    const base = 150000 + round * 14000;
+    for (const [offsetMs, btn] of expectedMenuCycle) {
+      expectedCount += 1;
+      const t = base + offsetMs;
+      assert.equal(player.sampleAt(t - 1).buttonsMask, 0);
+      assert.equal(player.sampleAt(t).buttonsMask, btn);
+      assert.equal(player.sampleAt(t + 199).buttonsMask, btn);
+      assert.equal(player.sampleAt(t + 200).buttonsMask, 0);
+      assert.equal(player.pressCountAt(t), expectedCount);
+    }
+  }
+  assert.equal(expectedCount, 83);
+
+  // Phase 3 (210s..274s): 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS (Up x6 -> A -> Down -> A -> Down -> A).
+  for (let round = 0; round < 4; round++) {
+    const base = 210000 + round * 16000;
+    for (const step of CHROME_LEGAL_TERMS_ACCEPT_OFFSETS) {
+      expectedCount += 1;
+      const t = base + step.offsetMs;
+      const s = player.sampleAt(t);
+      if (step.button !== undefined) {
+        assert.equal(s.buttonsMask, step.button, `Phase 3 round ${round} +${step.offsetMs}`);
+        assert.equal(player.sampleAt(t + step.holdMs - 1).buttonsMask, step.button);
+      } else {
+        assert.equal(s.buttonsMask, 0);
+        assert.equal(s.sticks?.ry, step.sticks.ry, `Phase 3 round ${round} scroll +${step.offsetMs}`);
+        assert.equal(player.sampleAt(t + step.holdMs - 1).sticks?.ry, step.sticks.ry);
+      }
+      assert.equal(player.sampleAt(t + step.holdMs).buttonsMask, 0);
+      assert.equal(player.sampleAt(t + step.holdMs).sticks, undefined);
+      assert.equal(player.pressCountAt(t), expectedCount);
+    }
+  }
+  assert.equal(expectedCount, 139);
+
+  // Phase 4a (280s..340s): Main Menu -> Story Mode spaced A every 4000 ms (16 presses).
+  for (let atMs = 280000; atMs <= 340000; atMs += 4000) {
+    expectedCount += 1;
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 219).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 220).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), expectedCount);
+  }
+  assert.equal(expectedCount, 155);
+
+  // Phase 4b (346s..420s): Gentle in-game left-stick forward + right-stick look sweeps + A confirms.
+  assert.equal(player.sampleAt(346000).buttonsMask, INPUT_BUTTONS.A);
+  assert.deepEqual(player.sampleAt(348500).sticks, { lx: 0, ly: 0.85, rx: 0, ry: 0 });
+  assert.deepEqual(player.sampleAt(351500).sticks, { lx: 0, ly: 0, rx: 0.7, ry: 0.15 });
+  assert.deepEqual(player.sampleAt(354000).sticks, { lx: 0, ly: 0, rx: -0.7, ry: -0.15 });
+  assert.deepEqual(player.sampleAt(356500).sticks, { lx: 0.5, ly: 0.75, rx: 0.35, ry: 0 });
+  assert.equal(player.sampleAt(360000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(418000).buttonsMask, INPUT_BUTTONS.A);
+  assert.equal(player.sampleAt(418220).buttonsMask, 0);
+  assert.equal(player.nextTransitionMs(418220), null);
+  assert.equal(player.pressCountAt(450000), 180);
+
+  // Zero B presses across entire 425 s window; only A, DPAD_UP, DPAD_DOWN buttons ever used.
+  const allowed = new Set([0, INPUT_BUTTONS.A, INPUT_BUTTONS.DPAD_UP, INPUT_BUTTONS.DPAD_DOWN]);
+  for (let t = 0; t <= 425000; t += 50) {
+    const mask = player.sampleAt(t).buttonsMask;
+    assert.equal(mask & INPUT_BUTTONS.B, 0, `chrome-to-ingame must never press B at t=${t}`);
+    assert.ok(allowed.has(mask), `unexpected mask 0x${mask.toString(16)} at t=${t}`);
+  }
+
+  // Every event spans >= 2 frames at both 15 FPS (67 ms) and 30 FPS (33 ms).
+  for (const frameMs of [33, 67]) {
+    for (const ev of spec.events) {
+      let seenFrames = 0;
+      const firstFrame = Math.ceil(ev.atMs / frameMs) * frameMs;
+      for (let f = firstFrame; f < ev.atMs + ev.holdMs; f += frameMs) {
+        const s = player.sampleAt(f);
+        if (ev.button !== undefined && s.buttonsMask === ev.button) {
+          seenFrames += 1;
+        } else if (ev.sticks !== undefined && s.sticks) {
+          seenFrames += 1;
+        }
+      }
+      assert.ok(seenFrames >= 2, `chrome-to-ingame event at ${ev.atMs} must span >= 2 frames at ${frameMs} ms/frame`);
+    }
+  }
+});
+
+test('W362 InputBridge re-anchors chrome-to-ingame to FIRST_VISIBLE_FRAME, writes Legal Terms checkboxes & in-game sticks to SAB, and completes cleanly', () => {
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+
+  let completed = 0;
+  bridge.startScript('chrome-to-ingame', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+    onComplete: () => {
+      completed += 1;
+    },
+  });
+
+  // Simulate 90 s black asset loading between FIRST_PRESENT and FIRST_VISIBLE_FRAME.
+  clock.advanceTo(45000);
+  bridge.notifyFirstPresent();
+  const visibleAt = 135000;
+  clock.advanceTo(visibleAt);
+  assert.equal(bridge.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+  assert.equal(bridge.getStats().scriptReanchoredCount, 1);
+
+  // Initial +500 ms Start Screen A lands cleanly in SAB.
+  clock.advanceTo(visibleAt + FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 2 LEGAL NOTICES Next > cycle at +150s..+156.5s.
+  clock.advanceTo(visibleAt + 150000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 156500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 3 ROCKSTAR GAMES LEGAL TERMS & POLICIES checkbox sequence at +210s:
+  // Up x6 -> scroll ry:-0.95 -> A (Privacy Policy) -> Down -> scroll ry:-0.95 -> A (ToS) -> Down -> A (Confirm >)
+  clock.advanceTo(visibleAt + 210000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 212700);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.ok(Math.abs(bridge.getSnapshot().ry - -0.95) < 1e-5);
+  clock.advanceTo(visibleAt + 214000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getSnapshot().ry, 0);
+  clock.advanceTo(visibleAt + 215200);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  clock.advanceTo(visibleAt + 215800);
+  assert.ok(Math.abs(bridge.getSnapshot().ry - -0.95) < 1e-5);
+  clock.advanceTo(visibleAt + 217100);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 218300);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  clock.advanceTo(visibleAt + 219500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 4 Main Menu A -> in-game left-stick forward & right-stick look sweeps.
+  clock.advanceTo(visibleAt + 280000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 348000);
+  assert.ok(Math.abs(bridge.getSnapshot().ly - 0.85) < 1e-5);
+  clock.advanceTo(visibleAt + 351000);
+  assert.ok(Math.abs(bridge.getSnapshot().rx - 0.7) < 1e-5);
+  assert.ok(Math.abs(bridge.getSnapshot().ry - 0.15) < 1e-5);
+
+  // Completes cleanly at +418220 ms with all buttons and sticks released.
+  clock.advanceTo(visibleAt + 420000);
+  assert.equal(bridge.getStats().scriptActive, false);
+  assert.equal(completed, 1);
+  const finalSnap = bridge.getSnapshot();
+  assert.equal(finalSnap.buttons, 0);
+  assert.equal(finalSnap.lx, 0);
+  assert.equal(finalSnap.ly, 0);
+  assert.equal(finalSnap.rx, 0);
+  assert.equal(finalSnap.ry, 0);
 
   bridge.destroy();
   assert.equal(clock.pendingTimeouts(), 0);
