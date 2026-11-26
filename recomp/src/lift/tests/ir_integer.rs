@@ -38,6 +38,18 @@ fn unsupported_reason(bytes: &[u8]) -> (String, String) {
 }
 
 #[test]
+fn constant_32_bit_register_writes_fold_the_zero_extension() {
+    let ir = module_ir(|a| {
+        a.xor(r9d, r9d)?;
+        a.mov(eax, -1i32)?;
+        a.ret()
+    });
+    assert!(!ir.contains("zext i32 0 to i64"), "{ir}");
+    assert!(!ir.contains("zext i32 -1 to i64"), "{ir}");
+    assert!(ir.contains("store i64 4294967295, ptr %rax"), "{ir}");
+}
+
+#[test]
 fn non_atomic_modules_keep_the_default_target_features() {
     let ir = module_ir(|a| {
         a.add(rax, rcx)?;
