@@ -453,6 +453,70 @@
   }
 
   /**
+   * Estimate GPU VRAM footprint in bytes for a WebGPU texture across all mip levels,
+   * array layers / 3D depth slices, and MSAA samples (#1077 live VRAM accounting).
+   */
+  function estimateTextureByteSize(
+    width,
+    height,
+    depthOrArrayLayers = 1,
+    mipLevelCount = 1,
+    format = BC_FALLBACK_FORMAT,
+    dimension = '2d',
+    sampleCount = 1
+  ) {
+    const w0 = Math.max(1, Math.floor(Number(width) || 1));
+    const h0 = dimension === '1d' ? 1 : Math.max(1, Math.floor(Number(height) || 1));
+    const d0 = dimension === '1d' ? 1 : Math.max(1, Math.floor(Number(depthOrArrayLayers) || 1));
+    const mips = Math.max(1, Math.floor(Number(mipLevelCount) || 1));
+    const samples = Math.max(1, Math.floor(Number(sampleCount) || 1));
+    const fmt = typeof format === 'string' ? format.toLowerCase() : BC_FALLBACK_FORMAT;
+
+    let blockDim = 1;
+    let bytesPerBlock = 4;
+    if (fmt.startsWith('bc1-') || fmt.startsWith('bc4-')) {
+      blockDim = 4;
+      bytesPerBlock = 8;
+    } else if (
+      fmt.startsWith('bc2-') ||
+      fmt.startsWith('bc3-') ||
+      fmt.startsWith('bc5-') ||
+      fmt.startsWith('bc6h-') ||
+      fmt.startsWith('bc7-')
+    ) {
+      blockDim = 4;
+      bytesPerBlock = 16;
+    } else if (fmt === 'r8unorm' || fmt === 'r8snorm' || fmt === 'r8uint' || fmt === 'r8sint' || fmt === 'stencil8') {
+      bytesPerBlock = 1;
+    } else if (
+      fmt.startsWith('r16') ||
+      fmt.startsWith('rg8') ||
+      fmt === 'depth16unorm'
+    ) {
+      bytesPerBlock = 2;
+    } else if (
+      fmt.startsWith('rg32') ||
+      fmt.startsWith('rgba16') ||
+      fmt === 'depth32float-stencil8'
+    ) {
+      bytesPerBlock = 8;
+    } else if (fmt.startsWith('rgba32')) {
+      bytesPerBlock = 16;
+    }
+
+    let total = 0;
+    for (let mip = 0; mip < mips; mip += 1) {
+      const mw = Math.max(1, Math.floor(w0 / Math.pow(2, mip)));
+      const mh = dimension === '1d' ? 1 : Math.max(1, Math.floor(h0 / Math.pow(2, mip)));
+      const md = dimension === '3d' ? Math.max(1, Math.floor(d0 / Math.pow(2, mip))) : d0;
+      const bw = Math.ceil(mw / blockDim);
+      const bh = Math.ceil(mh / blockDim);
+      total += bw * bh * md * bytesPerBlock * samples;
+    }
+    return total;
+  }
+
+  /**
    * Check whether a WebGPU device supports `texture-compression-bc`.
    * Returns `false` only when `device.features` exists and does not contain
    * `'texture-compression-bc'`.
@@ -1053,12 +1117,23 @@
       this._deferredDestroys = [];
       /** @type {Array<string>} */
       this._deferredDestroyKinds = [];
+      /** @type {Set<object>} */
+      this._deferredDestroySet = new Set();
+      /** @type {WeakMap<object, number> | null} */
+      this._deferredResourceBytes = typeof WeakMap === 'function' ? new WeakMap() : null;
       /** @type {Set<{ items: Array<object>, kinds: Array<string> }>} */
       this._inFlightDeferredBatches = new Set();
       this._deferredDestroyCount = 0;
+      this._pendingDeferredDestroyBytes = 0;
       this._destroyedObjects = typeof WeakSet === 'function' ? new WeakSet() : null;
       this._destroyedBuffers = 0;
       this._destroyedTextures = 0;
+
+      // W371 (#1077): Live & peak GPU buffer/texture byte accounting.
+      this._liveBufferBytes = 0;
+      this._peakBufferBytes = 0;
+      this._liveTextureBytes = 0;
+      this._peakTextureBytes = 0;
 
       // W352: Bounded chunk size for queue.writeBuffer to prevent Dawn upload ring spikes.
       const rawMaxWriteChunk =
@@ -1590,6 +1665,13 @@
         padded: aligned.padded,
         label,
       });
+      this._liveBufferBytes += aligned.alignedSize;
+      if (this._liveBufferBytes > this._peakBufferBytes) {
+        this._peakBufferBytes = this._liveBufferBytes;
+      }
+      if (this._deferredResourceBytes !== null && buffer && typeof buffer === 'object') {
+        this._deferredResourceBytes.set(buffer, aligned.alignedSize);
+      }
 
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
         this.resourceRegistry.register('buffer', id, buffer, {
@@ -1772,6 +1854,16 @@
       if (!resource || typeof resource.destroy !== 'function') {
         return false;
       }
+      if (this._deferredDestroySet.delete(resource)) {
+        const queuedBytes =
+          this._deferredResourceBytes !== null ? this._deferredResourceBytes.get(resource) || 0 : 0;
+        if (queuedBytes > 0) {
+          this._pendingDeferredDestroyBytes = Math.max(
+            0,
+            this._pendingDeferredDestroyBytes - queuedBytes
+          );
+        }
+      }
       if (this._destroyedObjects !== null && this._destroyedObjects.has(resource)) {
         return false;
       }
@@ -1816,9 +1908,18 @@
         return false;
       }
       if (!this._suppressDeferDestroys && (this._inFrame || this._deferDestroys)) {
+        if (this._deferredDestroySet.has(resource)) {
+          return false;
+        }
+        this._deferredDestroySet.add(resource);
         this._deferredDestroys.push(resource);
         this._deferredDestroyKinds.push(kind);
         this._deferredDestroyCount += 1;
+        const queuedBytes =
+          this._deferredResourceBytes !== null ? this._deferredResourceBytes.get(resource) || 0 : 0;
+        if (queuedBytes > 0) {
+          this._pendingDeferredDestroyBytes += queuedBytes;
+        }
         return false;
       }
       return this._destroySingleResourceNow(resource, kind);
@@ -1903,7 +2004,44 @@
           destroyed += this._destroyBatchNow(batches[i]);
         }
       }
+      this._deferredDestroySet.clear();
+      this._pendingDeferredDestroyBytes = 0;
       return destroyed;
+    }
+
+    /**
+     * Release the reusable bounded `writeBuffer` scratch buffer (`_writeScratch`).
+     *
+     * @returns {number} Bytes released from CPU scratch.
+     */
+    trimWriteScratch() {
+      const released =
+        this._writeScratch && typeof this._writeScratch.byteLength === 'number'
+          ? this._writeScratch.byteLength
+          : 0;
+      this._writeScratch = null;
+      return released;
+    }
+
+    /**
+     * Return accurate live/peak GPU buffer, texture, scratch, and deferred-destroy byte accounting (#1077).
+     */
+    getMemoryStats() {
+      const writeScratchBytes =
+        this._writeScratch && typeof this._writeScratch.byteLength === 'number'
+          ? this._writeScratch.byteLength
+          : 0;
+      const pendingDeferredDestroys = this._getPendingDeferredDestroyCount();
+      return {
+        liveBufferBytes: this._liveBufferBytes,
+        peakBufferBytes: this._peakBufferBytes,
+        liveTextureBytes: this._liveTextureBytes,
+        peakTextureBytes: this._peakTextureBytes,
+        pendingDeferredDestroys,
+        pendingDeferredDestroyBytes: this._pendingDeferredDestroyBytes,
+        writeScratchBytes,
+        totalLiveBytes: this._liveBufferBytes + this._liveTextureBytes,
+      };
     }
 
     /**
@@ -2075,6 +2213,15 @@
         this._liveResourceGenerations.textureView.delete(id);
       }
 
+      const estimatedBytes = estimateTextureByteSize(
+        sanitized.descriptor.size.width,
+        sanitized.descriptor.size.height,
+        sanitized.descriptor.size.depthOrArrayLayers,
+        sanitized.descriptor.mipLevelCount,
+        sanitized.effectiveFormat,
+        sanitized.descriptor.dimension,
+        sanitized.descriptor.sampleCount
+      );
       const meta = {
         id,
         width: sanitized.descriptor.size.width,
@@ -2086,6 +2233,7 @@
         format: sanitized.effectiveFormat,
         originalFormat: sanitized.originalFormat,
         usage: sanitized.descriptor.usage,
+        byteSize: estimatedBytes,
         viewFormats: sanitized.descriptor.viewFormats
           ? sanitized.descriptor.viewFormats.slice()
           : [],
@@ -2096,11 +2244,18 @@
         promoted1DTo2D: sanitized.promoted1DTo2D,
       };
       this._textureMeta.set(id, meta);
+      this._liveTextureBytes += estimatedBytes;
+      if (this._liveTextureBytes > this._peakTextureBytes) {
+        this._peakTextureBytes = this._liveTextureBytes;
+      }
+      if (this._deferredResourceBytes !== null && texture && typeof texture === 'object') {
+        this._deferredResourceBytes.set(texture, estimatedBytes);
+      }
 
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
         const label = sanitized.descriptor.label || `texture:${id}`;
         this.resourceRegistry.register('texture', id, texture, {
-          byteSize: 0,
+          byteSize: estimatedBytes,
           label,
         });
         if (textureView) {
@@ -2269,43 +2424,55 @@
               ? Number(rawDesc.usage) >>> 0
               : 0;
 
+      const resolvedMips = Math.max(
+        1,
+        Math.floor(
+          Number(
+            opts.mipLevelCount !== undefined
+              ? opts.mipLevelCount
+              : texture.mipLevelCount !== undefined
+                ? texture.mipLevelCount
+                : rawDesc && rawDesc.mipLevelCount !== undefined
+                  ? rawDesc.mipLevelCount
+                  : 1
+          ) || 1
+        )
+      );
+      const resolvedSamples = Math.max(
+        1,
+        Math.floor(
+          Number(
+            opts.sampleCount !== undefined
+              ? opts.sampleCount
+              : texture.sampleCount !== undefined
+                ? texture.sampleCount
+                : rawDesc && rawDesc.sampleCount !== undefined
+                  ? rawDesc.sampleCount
+                  : 1
+          ) || 1
+        )
+      );
+      const estimatedBytes = estimateTextureByteSize(
+        width,
+        height,
+        depthOrArrayLayers,
+        resolvedMips,
+        format,
+        dimension,
+        resolvedSamples
+      );
       this._textureMeta.set(id, {
         id,
         width,
         height,
         depthOrArrayLayers,
-        mipLevelCount: Math.max(
-          1,
-          Math.floor(
-            Number(
-              opts.mipLevelCount !== undefined
-                ? opts.mipLevelCount
-                : texture.mipLevelCount !== undefined
-                  ? texture.mipLevelCount
-                  : rawDesc && rawDesc.mipLevelCount !== undefined
-                    ? rawDesc.mipLevelCount
-                    : 1
-            ) || 1
-          )
-        ),
-        sampleCount: Math.max(
-          1,
-          Math.floor(
-            Number(
-              opts.sampleCount !== undefined
-                ? opts.sampleCount
-                : texture.sampleCount !== undefined
-                  ? texture.sampleCount
-                  : rawDesc && rawDesc.sampleCount !== undefined
-                    ? rawDesc.sampleCount
-                    : 1
-            ) || 1
-          )
-        ),
+        mipLevelCount: resolvedMips,
+        sampleCount: resolvedSamples,
         dimension,
         format,
         originalFormat: format,
         usage,
+        byteSize: estimatedBytes,
         viewFormats: [],
         bcFormatFallback: false,
         bcDimensionAligned: false,
@@ -2313,11 +2480,18 @@
         sampleClamped: false,
         promoted1DTo2D: false,
       });
+      this._liveTextureBytes += estimatedBytes;
+      if (this._liveTextureBytes > this._peakTextureBytes) {
+        this._peakTextureBytes = this._liveTextureBytes;
+      }
+      if (this._deferredResourceBytes !== null && texture && typeof texture === 'object') {
+        this._deferredResourceBytes.set(texture, estimatedBytes);
+      }
 
       if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
         const label = opts.label || texture.label || `texture:${id}`;
         this.resourceRegistry.register('texture', id, texture, {
-          byteSize: 0,
+          byteSize: estimatedBytes,
           label,
         });
         if (textureView) {
@@ -2598,6 +2772,10 @@
       } else if (typeof existing.destroy === 'function') {
         this._destroyOrDefer(existing, 'buffer');
       }
+      const prevMeta = this._bufferMeta.get(id);
+      if (prevMeta && typeof prevMeta.alignedSize === 'number' && prevMeta.alignedSize > 0) {
+        this._liveBufferBytes = Math.max(0, this._liveBufferBytes - prevMeta.alignedSize);
+      }
       this.buffers.delete(id);
       this._bufferMeta.delete(id);
       this._destroyCount += 1;
@@ -2639,6 +2817,10 @@
       const childViewIds = childViews ? Array.from(childViews) : [];
       this._textureChildViews.delete(id);
 
+      const prevTexMeta = this._textureMeta.get(id);
+      if (prevTexMeta && typeof prevTexMeta.byteSize === 'number' && prevTexMeta.byteSize > 0) {
+        this._liveTextureBytes = Math.max(0, this._liveTextureBytes - prevTexMeta.byteSize);
+      }
       this.textures.delete(id);
       this.textureViews.delete(id);
       this._textureViewParents.delete(id);
@@ -5132,6 +5314,8 @@
         }
         this.flushDeferredDestroys();
         this._writeScratch = null;
+        this._liveBufferBytes = 0;
+        this._liveTextureBytes = 0;
       } finally {
         this._suppressDeferDestroys = prevSuppressDefer;
       }
@@ -5169,6 +5353,12 @@
         totalBindGroupLookups > 0 ? this._bindGroupHits / totalBindGroupLookups : 0;
       const bindGroupHitRate = Math.min(1, Math.max(0, rawHitRate));
 
+      const pendingDeferredDestroys = this._getPendingDeferredDestroyCount();
+      const writeScratchBytes =
+        this._writeScratch && typeof this._writeScratch.byteLength === 'number'
+          ? this._writeScratch.byteLength
+          : 0;
+
       return {
         bcFormatFallbackCount: this._bcFormatFallbackCount,
         bcDimensionAlignCount: this._bcDimensionAlignCount,
@@ -5186,13 +5376,20 @@
         textureViewsActive: this.textureViews.size,
         samplersActive: this.samplers.size,
         shaderModulesActive: this.shaderModules.size,
+        liveBufferBytes: this._liveBufferBytes,
+        peakBufferBytes: this._peakBufferBytes,
+        liveTextureBytes: this._liveTextureBytes,
+        peakTextureBytes: this._peakTextureBytes,
+        writeScratchBytes,
         destroyCount: this._destroyCount,
         destroyedBuffers: this._destroyedBuffers,
         destroyedTextures: this._destroyedTextures,
         chunkedWrites: this._chunkedWrites,
         maxWriteChunkBytes: this._maxWriteChunkBytes,
         deferredDestroyCount: this._deferredDestroyCount,
-        pendingDeferredDestroyCount: this._getPendingDeferredDestroyCount(),
+        pendingDeferredDestroyCount: pendingDeferredDestroys,
+        pendingDeferredDestroys,
+        pendingDeferredDestroyBytes: this._pendingDeferredDestroyBytes,
         viewDimensionGuardCount: this._viewDimensionGuardCount,
         promoted1DTo2DCount: this._promoted1DTo2DCount,
         errors: this._errors,
@@ -5242,6 +5439,8 @@
       this._errors = 0;
       this._lastError = null;
       this._peakLiveHandles = this._getLiveHandleCount();
+      this._peakBufferBytes = this._liveBufferBytes;
+      this._peakTextureBytes = this._liveTextureBytes;
       this._overwrites = 0;
       this._missingLookups = 0;
       this._totalInserts = 0;
@@ -5280,6 +5479,7 @@
     DEFAULT_MAX_BIND_GROUPS,
     DEFAULT_FAST_BIND_GROUP_BUCKETS,
     isBcFormat,
+    estimateTextureByteSize,
     isViewDimensionCompatible,
     deviceSupportsBc,
     computeMaxMipLevels,
@@ -5321,6 +5521,7 @@
       DEFAULT_MAX_BIND_GROUPS,
       DEFAULT_FAST_BIND_GROUP_BUCKETS,
       isBcFormat,
+      estimateTextureByteSize,
       isViewDimensionCompatible,
       deviceSupportsBc,
       computeMaxMipLevels,
