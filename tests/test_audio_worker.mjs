@@ -2643,3 +2643,298 @@ test('W299 sanitized audio-stats telemetry surfaces all new fields, sanitizes di
 
   worker.destroy();
 });
+
+// ---------------------------------------------------------------------------
+// O43 (#1028/#663): Live Guest Opus/Spatial PCM Drain Telemetry & Pump Hardening
+// ---------------------------------------------------------------------------
+
+test('O43 live headless drain broadcasts audio-stats and first-drain milestone on BroadcastChannel("game-progress") with throttling and zero leaked channels', () => {
+  const broadcasts = [];
+  let openChannels = 0;
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.closed = false;
+      openChannels += 1;
+    }
+    postMessage(msg) {
+      if (this.closed) throw new Error('Channel already closed');
+      broadcasts.push({ channel: this.name, msg });
+    }
+    close() {
+      if (!this.closed) {
+        this.closed = true;
+        openChannels -= 1;
+      }
+    }
+  }
+
+  let fakeNow = 10000;
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'headless-drain',
+    autoDrain: false,
+    declickFrames: 0,
+    telemetryBroadcast: true,
+    BroadcastChannelCtor: MockBroadcastChannel,
+    telemetryBroadcastIntervalMs: 1000,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'headless-drain',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 16384, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
+
+  // Attach publishes initial audio-stats snapshot with guestRingAttached: true.
+  assert.equal(openChannels, 0, 'send-only BroadcastChannel must close immediately');
+  assert.equal(broadcasts.length, 1);
+  assert.equal(broadcasts[0].channel, 'game-progress');
+  assert.equal(broadcasts[0].msg.type, 'audio-stats');
+  assert.equal(broadcasts[0].msg.stats.guestRingAttached, true);
+  assert.equal(broadcasts[0].msg.stats.guestFramesDrained, 0);
+
+  // First non-zero guest PCM drain immediately publishes audio-stats AND one-shot milestone label.
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.35)), 1920);
+  worker._lastDrainMs = 10000;
+  fakeNow = 10020; // 20 ms @ 48 kHz = 960 frames
+  const firstDrained = worker.drainTick(fakeNow);
+  assert.equal(firstDrained, 960);
+  assert.equal(openChannels, 0);
+
+  const statsAfterFirst = broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats');
+  const milestoneLogs = broadcasts.filter((b) => b.msg && typeof b.msg.label === 'string');
+  assert.equal(statsAfterFirst.length, 2);
+  assert.equal(statsAfterFirst[1].msg.stats.framesDrained, 960);
+  assert.equal(statsAfterFirst[1].msg.stats.guestFramesDrained, 960);
+  assert.equal(statsAfterFirst[1].msg.stats.outputState, 'headless-drain');
+  assert.equal(milestoneLogs.length, 1);
+  assert.match(milestoneLogs[0].msg.label, /first_guest_pcm_drain/);
+  assert.match(milestoneLogs[0].msg.label, /guest_frames_drained=960/);
+
+  // Draining again within the 1000 ms throttle window must NOT spam BroadcastChannel.
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.25)), 1920);
+  fakeNow = 10040;
+  assert.equal(worker.drainTick(fakeNow), 960);
+  assert.equal(broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats').length, 2);
+  assert.equal(broadcasts.filter((b) => b.msg && typeof b.msg.label === 'string').length, 1);
+
+  // Once >= 1000 ms elapses with new drained frames, updated audio-stats is broadcast.
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.2)), 1920);
+  worker._lastDrainMs = 11020;
+  fakeNow = 11040;
+  assert.equal(worker.drainTick(fakeNow), 960);
+  const statsAfterInterval = broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats');
+  assert.equal(statsAfterInterval.length, 3);
+  assert.equal(statsAfterInterval[2].msg.stats.framesDrained, 2880);
+  assert.equal(statsAfterInterval[2].msg.stats.guestFramesDrained, 2880);
+
+  // Idle tick past another 1000 ms with zero new frames must NOT emit redundant broadcasts.
+  worker._lastDrainMs = 12500;
+  fakeNow = 12520;
+  assert.equal(worker.drainTick(fakeNow), 0);
+  assert.equal(broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats').length, 3);
+
+  // destroy() flushes detach cleanly with zero leaked channels.
+  worker.destroy();
+  assert.equal(openChannels, 0);
+  const lastStats = broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats').pop();
+  assert.equal(lastStats.msg.stats.guestRingAttached, false);
+});
+
+test('O43 chunked headless drain prevents spurious overruns on throttled ticks and active-mode autoPump transfers without discarding', () => {
+  const scheduled = [];
+  let cleared = 0;
+  let fakeNow = 5000;
+
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'headless-drain',
+    autoDrain: false,
+    declickFrames: 0,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'headless-drain',
+  });
+
+  // 1. Throttled 100 ms headless tick (4800 frames > 4096 ring capacity): chunked drain must
+  // drain all 4800 frames with ZERO spurious overruns or dropped frames.
+  const mockLarge = createMockGuestPcmRing({ capacitySamples: 32768, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mockLarge.descriptor, autoPump: true });
+  assert.equal(mockLarge.producerPush(makeConstantStereoFrames(4800, 0.3)), 9600);
+
+  worker._lastDrainMs = 5000;
+  fakeNow = 5100; // 100 ms @ 48 kHz = 4800 frames
+  const drained = worker.drainTick(fakeNow);
+  assert.equal(drained, 4800);
+  const stats = worker.getStats();
+  assert.equal(stats.framesDrained, 4800);
+  assert.equal(stats.guestFramesDrained, 4800);
+  assert.equal(stats.guestOverruns, 0);
+  assert.equal(stats.droppedFrames, 0);
+  assert.equal(Atomics.load(mockLarge.readCtrl, 0), 9600);
+  worker.destroy();
+
+  // 2. Active outputState with autoDrain: true + autoPump: true starts pump timer on attach,
+  // transfers PCM into worker.ring without discarding, and stops timer on detach.
+  const broadcasts = [];
+  class MockBC {
+    constructor(name) { this.name = name; }
+    postMessage(msg) { broadcasts.push({ channel: this.name, msg }); }
+    close() {}
+  }
+
+  let activeNow = 1000;
+  const activeWorker = new AudioMixerWorker(() => {}, {
+    now: () => activeNow,
+    outputState: 'active',
+    autoDrain: true,
+    declickFrames: 0,
+    telemetryBroadcast: true,
+    BroadcastChannelCtor: MockBC,
+    setIntervalFn: (fn, ms) => {
+      const h = { fn, ms };
+      scheduled.push(h);
+      return h;
+    },
+    clearIntervalFn: () => {
+      cleared += 1;
+    },
+  });
+
+  activeWorker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'active',
+  });
+  assert.equal(scheduled.length, 0, 'active mode without guest ring must not schedule timer');
+
+  const mockActive = createMockGuestPcmRing({ capacitySamples: 8192, baseOffset: 64 });
+  activeWorker.attachGuestPcmRing({ ...mockActive.descriptor, autoPump: true });
+  assert.equal(scheduled.length, 1, 'attaching autoPump guest ring in active mode must start pump timer');
+
+  assert.equal(mockActive.producerPush(makeConstantStereoFrames(480, 0.5)), 960);
+  activeNow = 1010; // 10 ms @ 48 kHz = 480 frames
+  scheduled[0].fn();
+
+  assert.equal(activeWorker.getStats().guestFramesDrained, 480);
+  assert.equal(activeWorker.ring.availableFrames(), 480, 'active-mode pump must preserve frames for AudioWorklet');
+  assert.equal(activeWorker.getStats().framesDrained, 0, 'active mode must not discard frames');
+  assert.ok(
+    broadcasts.some((b) => b.msg && b.msg.type === 'audio-stats' && b.msg.stats.guestFramesDrained === 480),
+    'active-mode guest PCM pump must broadcast audio-stats telemetry'
+  );
+
+  activeWorker.detachGuestPcmRing();
+  assert.equal(cleared, 1, 'detaching guest ring in active mode must stop pump timer');
+  activeWorker.destroy();
+});
+
+test('O43 classic Dedicated Worker context broadcasts live guest PCM drain on BroadcastChannel("game-progress")', () => {
+  const posted = [];
+  const broadcasts = [];
+  let timerFn = null;
+  let openChannels = 0;
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.closed = false;
+      openChannels += 1;
+    }
+    postMessage(msg) {
+      broadcasts.push({ channel: this.name, msg });
+    }
+    close() {
+      if (!this.closed) {
+        this.closed = true;
+        openChannels -= 1;
+      }
+    }
+  }
+
+  let fakeNow = 2000;
+  const workerSelf = {
+    onmessage: null,
+    BroadcastChannel: MockBroadcastChannel,
+    postMessage(msg) {
+      posted.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    SharedArrayBuffer,
+    ArrayBuffer,
+    Int32Array,
+    Float32Array,
+    Uint8Array,
+    Atomics,
+    Math,
+    Number,
+    Object,
+    Array,
+    Set,
+    Error,
+    TypeError,
+    RangeError,
+    Date: { now: () => fakeNow },
+    setInterval: (fn) => {
+      timerFn = fn;
+      return 1;
+    },
+    clearInterval: () => {
+      timerFn = null;
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const ctx = vm.createContext(sandbox);
+
+  const workerPath = path.resolve(__dirname, '../web/workers/audio_worker.js');
+  vm.runInContext(fs.readFileSync(workerPath, 'utf8'), ctx, { filename: workerPath });
+
+  // Exact loader.js sequence: { init: true } -> { type: 'attach-guest-pcm-ring', ..., autoPump: true }
+  workerSelf.onmessage({ data: { init: true } });
+  assert.equal(posted[0].ready, true);
+  assert.equal(typeof timerFn, 'function');
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 16384, baseOffset: 64 });
+  workerSelf.onmessage({
+    data: {
+      type: 'attach-guest-pcm-ring',
+      ...mock.descriptor,
+      autoPump: true,
+    },
+  });
+
+  // Guest produces 960 stereo frames (20 ms @ 48 kHz) into playgta6_audio_ring.
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.45)), 1920);
+  fakeNow = 2020;
+  timerFn();
+
+  assert.equal(openChannels, 0);
+  const drainedBroadcast = broadcasts.find(
+    (b) => b.channel === 'game-progress' && b.msg && b.msg.type === 'audio-stats' && b.msg.stats.guestFramesDrained === 960
+  );
+  assert.ok(drainedBroadcast, 'Dedicated Worker must broadcast live guestFramesDrained on game-progress');
+  assert.equal(drainedBroadcast.msg.stats.framesDrained, 960);
+  assert.equal(drainedBroadcast.msg.stats.guestRingAttached, true);
+
+  workerSelf.onmessage({ data: { stop: true } });
+  assert.equal(openChannels, 0);
+});
