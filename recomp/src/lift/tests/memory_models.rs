@@ -1009,6 +1009,165 @@ fn r67_extended_64_insn_and_indexed_window_bursts() {
     );
 }
 
+#[test]
+fn r71_cross_bb_stack_and_const_base_propagation_elides_window_checks() {
+    use iced_x86::code_asm::*;
+
+    // 1. Frame pointer `rbp` + derived stack base `r12` survive across a loop AND a diamond join
+    //    -> ZERO window table lookups and ZERO dirty marks under `window-runs` and `window-stack`.
+    let loop_stack_f = super::asm_function(0x1_4000_1000, |a| {
+        let mut arm_b = a.create_label();
+        let mut join = a.create_label();
+        let mut loop_hdr = a.create_label();
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.sub(rsp, 0x60)?;
+        a.test(ecx, ecx)?;
+        a.jz(arm_b)?;
+        a.lea(r12, qword_ptr(rbp - 0x10))?;
+        a.jmp(join)?;
+        a.set_label(&mut arm_b)?;
+        a.lea(r12, qword_ptr(rbp - 0x20))?;
+        a.set_label(&mut join)?;
+        a.mov(eax, 4)?;
+        a.set_label(&mut loop_hdr)?;
+        a.mov(qword_ptr(rbp - 0x30), rax)?;
+        a.add(rdx, qword_ptr(rbp - 0x30))?;
+        a.mov(qword_ptr(r12 + 8), rdx)?;
+        a.dec(eax)?;
+        a.jnz(loop_hdr)?;
+        a.add(rsp, 0x60)?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+    for (name, model) in [
+        ("window-runs", window(WindowCheck::Branch, true, true)),
+        ("window-stack", window(WindowCheck::Branch, true, false)),
+    ] {
+        let ir = lift_module_with([&loop_stack_f], model).expect("lifts").ir;
+        assert!(
+            !ir.contains("__playgta6_window_table") && !ir.contains("__playgta6_window_dirty"),
+            "{name}: cross-BB rbp & merged stack base r12 must stay flat:\n{ir}"
+        );
+    }
+
+    // 2. Soundness: if one arm of a diamond overwrites `rbp` with a non-stack register `rcx`,
+    //    the join block MUST NOT treat `[rbp - 8]` as stack-flat!
+    let unsound_guard_f = super::asm_function(0x1_4000_2000, |a| {
+        let mut use_rcx = a.create_label();
+        let mut join = a.create_label();
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.test(edx, edx)?;
+        a.jnz(use_rcx)?;
+        a.jmp(join)?;
+        a.set_label(&mut use_rcx)?;
+        a.mov(rbp, rcx)?;
+        a.set_label(&mut join)?;
+        a.mov(rax, qword_ptr(rbp - 8))?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+    let unsound_ir = lift_module_with([&unsound_guard_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert!(
+        unsound_ir.contains("__playgta6_window_table"),
+        "modified rbp on one diamond arm must emit a window check at join:\n{unsound_ir}"
+    );
+
+    // 3. Cross-BB constant base pointer (`lea rbx, [rip + global_below_window]`) hoisted before a
+    //    loop: all accesses `[rbx + 0/8/16]` inside the loop fold to constant out-of-window VAs
+    //    with ZERO window checks and ZERO dirty marks.
+    let g_base = 0x1_4AA0_1000u64;
+    let code_const = 0x1_4000_3000u64;
+    let const_loop_bytes = {
+        use iced_x86::{Code, Instruction, MemoryOperand, Register};
+        // Preheader: lea rbx, [rip + g_base]; xor eax, eax; mov ecx, 4
+        let pre = super::encode(
+            code_const,
+            &[
+                Instruction::with2(
+                    Code::Lea_r64_m,
+                    Register::RBX,
+                    MemoryOperand::with_base_displ(Register::RIP, g_base as i64),
+                )
+                .expect("lea rip"),
+                Instruction::with2(Code::Xor_r32_rm32, Register::EAX, Register::EAX).expect("xor"),
+                Instruction::with2(Code::Mov_r32_imm32, Register::ECX, 4u32).expect("mov ecx"),
+            ],
+        );
+        let loop_va = code_const + pre.len() as u64;
+        let mut a = CodeAssembler::new(64).expect("asm");
+        let mut loop_hdr = a.create_label();
+        a.set_label(&mut loop_hdr).expect("lbl");
+        a.add(rax, qword_ptr(rbx)).expect("add0");
+        a.add(rax, qword_ptr(rbx + 8)).expect("add8");
+        a.mov(qword_ptr(rbx + 16), rax).expect("st16");
+        a.dec(ecx).expect("dec");
+        a.jnz(loop_hdr).expect("jnz");
+        a.ret().expect("ret");
+        let mut out = pre;
+        out.extend_from_slice(&a.assemble(loop_va).expect("assemble loop"));
+        out
+    };
+    let const_loop_f = super::Program::new()
+        .bytes(code_const, &const_loop_bytes)
+        .function(code_const);
+    let const_loop_ir =
+        lift_module_with([&const_loop_f], window(WindowCheck::Branch, true, true))
+            .expect("lifts")
+            .ir;
+    assert!(
+        !const_loop_ir.contains("__playgta6_window_table")
+            && !const_loop_ir.contains("__playgta6_window_dirty"),
+        "loop-invariant constant global base must elide all window checks:\n{const_loop_ir}"
+    );
+
+    // 4. Soundness: modifying `rbx` inside the loop (`add rbx, 8`) invalidates its constant fact
+    //    at the loop header so `[rbx]` MUST emit a window check.
+    let mut_loop_f = super::asm_function(0x1_4000_4000, |a| {
+        let mut loop_hdr = a.create_label();
+        a.mov(rbx, g_base)?;
+        a.xor(eax, eax)?;
+        a.mov(ecx, 4)?;
+        a.set_label(&mut loop_hdr)?;
+        a.add(rax, qword_ptr(rbx))?;
+        a.add(rbx, 8)?;
+        a.dec(ecx)?;
+        a.jnz(loop_hdr)?;
+        a.ret()
+    });
+    let mut_loop_ir = lift_module_with([&mut_loop_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert!(
+        mut_loop_ir.contains("__playgta6_window_table"),
+        "loop-variant rbx must NOT be treated as constant:\n{mut_loop_ir}"
+    );
+
+    // 5. Multi-entry window_load_cache: interleaved loads then stores to `[rcx]` and `[rdx]`
+    //    under `window-runs` reuse both cached translations (only 2 table lookups total).
+    let cache_f = super::asm_function(0x1_4000_5000, |a| {
+        a.mov(rax, qword_ptr(rcx))?;
+        a.mov(r8, qword_ptr(rdx))?;
+        a.add(rax, r8)?;
+        a.mov(qword_ptr(rcx), rax)?;
+        a.mov(qword_ptr(rdx), r8)?;
+        a.ret()
+    });
+    let cache_ir = lift_module_with([&cache_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        cache_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        2,
+        "interleaved load/store on rcx and rdx must reuse both cached translations:\n{cache_ir}"
+    );
+}
+
 /// FNV-1a 64 of a byte string (stable fingerprint of emitted IR).
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {

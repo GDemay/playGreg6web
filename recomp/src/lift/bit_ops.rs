@@ -106,6 +106,26 @@ impl FunctionLifter<'_> {
         }
     }
 
+    /// Parses a lift-time constant integer literal masked to `bits`.
+    fn const_u64(v: &str, bits: u32) -> Option<u64> {
+        v.parse::<i64>().ok().map(|c| (c as u64) & mask(bits))
+    }
+
+    /// Computes `CF = (v >> bit) & 1` for a known bit position `bit < bits`, tightening
+    /// bit 0 to `trunc` and bit `bits - 1` to `icmp slt ..., 0`.
+    fn bit_test_cf_imm(&mut self, v: &str, bit: u32, bits: u32) -> String {
+        let t = ty(bits);
+        if bit == 0 {
+            self.val(&format!("trunc {t} {v} to i1"))
+        } else if bit == bits - 1 {
+            self.msb(v, bits)
+        } else {
+            let m = imm(1u64 << bit, bits);
+            let hit = self.val(&format!("and {t} {v}, {m}"));
+            self.val(&format!("icmp ne {t} {hit}, 0"))
+        }
+    }
+
     /// `bt`/`bts`/`btr`/`btc`. Only CF is defined (ZF unaffected; OF SF AF PF undefined, left
     /// unchanged). A memory operand with a register bit offset addresses
     /// `ea + floor(offset / 8)` with the offset sign-extended from the operand size, so the bit
@@ -121,57 +141,77 @@ impl FunctionLifter<'_> {
         let t = ty(bits);
         let offset_imm = self.imm_operand(ins, 1)?;
         let want_cf = self.flag_live(Flag::Cf);
-        let cf = match ins.op_kind(0) {
+        let (cf, lazy_source) = match ins.op_kind(0) {
             OpKind::Register => {
                 if locked {
                     return unsupported("lock prefix with a register destination (#UD)");
                 }
-                if m == Mnemonic::Bt && !want_cf {
-                    return Ok(());
-                }
                 let v = self.read_op(ins, 0, bits)?;
-                let (one, keep_imm) = match offset_imm {
-                    Some(o) => {
-                        let bit = 1u64 << (o & u64::from(bits - 1));
-                        (imm(bit, bits), Some(imm(!bit, bits)))
-                    }
+                // Register `bt*` masks both immediate and register bit offsets modulo `bits`.
+                let (bit_imm, dyn_offset) = match offset_imm {
+                    Some(o) => (Some((o & u64::from(bits - 1)) as u32), None),
                     None => {
                         let o = self.read_op(ins, 1, bits)?;
-                        let index = self.val(&format!("and {t} {o}, {}", bits - 1));
-                        (self.val(&format!("shl {t} 1, {index}")), None)
+                        if let Some(c) = Self::const_u64(&o, bits) {
+                            (Some((c & u64::from(bits - 1)) as u32), None)
+                        } else {
+                            (None, Some(o))
+                        }
                     }
                 };
-                let cf = if want_cf {
-                    let hit = self.val(&format!("and {t} {v}, {one}"));
-                    Some(self.val(&format!("icmp ne {t} {hit}, 0")))
+                if let Some(bit) = bit_imm {
+                    let bit_mask = 1u64 << bit;
+                    let one = imm(bit_mask, bits);
+                    let keep = imm(!bit_mask, bits);
+                    let cf = want_cf.then(|| self.bit_test_cf_imm(&v, bit, bits));
+                    let new = match m {
+                        Mnemonic::Bts => Some(self.val(&format!("or {t} {v}, {one}"))),
+                        Mnemonic::Btr => Some(self.val(&format!("and {t} {v}, {keep}"))),
+                        Mnemonic::Btc => Some(self.val(&format!("xor {t} {v}, {one}"))),
+                        _ => None,
+                    };
+                    if let Some(new) = new {
+                        self.write_op(ins, 0, &new, bits)?;
+                    }
+                    let lazy = FlagSource::BitTestBit { val: v, bit, bits };
+                    (cf, Some(lazy))
                 } else {
-                    None
-                };
-                let new = match m {
-                    Mnemonic::Bts => Some(self.val(&format!("or {t} {v}, {one}"))),
-                    Mnemonic::Btr => {
-                        let keep = match keep_imm {
-                            Some(k) => k,
-                            None => self.val(&format!("xor {t} {one}, -1")),
-                        };
-                        Some(self.val(&format!("and {t} {v}, {keep}")))
+                    let o = dyn_offset.expect("dynamic bit offset");
+                    let index = self.val(&format!("and {t} {o}, {}", bits - 1));
+                    let one = self.val(&format!("shl {t} 1, {index}"));
+                    let cf = want_cf.then(|| {
+                        let hit = self.val(&format!("and {t} {v}, {one}"));
+                        self.val(&format!("icmp ne {t} {hit}, 0"))
+                    });
+                    let new = match m {
+                        Mnemonic::Bts => Some(self.val(&format!("or {t} {v}, {one}"))),
+                        Mnemonic::Btr => {
+                            let keep = self.val(&format!("xor {t} {one}, -1"));
+                            Some(self.val(&format!("and {t} {v}, {keep}")))
+                        }
+                        Mnemonic::Btc => Some(self.val(&format!("xor {t} {v}, {one}"))),
+                        _ => None,
+                    };
+                    if let Some(new) = new {
+                        self.write_op(ins, 0, &new, bits)?;
                     }
-                    Mnemonic::Btc => Some(self.val(&format!("xor {t} {v}, {one}"))),
-                    _ => None,
-                };
-                if let Some(new) = new {
-                    self.write_op(ins, 0, &new, bits)?;
+                    let lazy = FlagSource::BitTest {
+                        val: v,
+                        mask: one,
+                        bits,
+                    };
+                    (cf, Some(lazy))
                 }
-                cf
             }
             OpKind::Memory => {
                 let ea = self.mem_ea(ins)?;
-                let (addr, one, keep_imm) = match offset_imm {
+                let (addr, one, keep_imm, bit_imm_byte) = match offset_imm {
                     Some(o) => {
                         let o = o & u64::from(bits - 1);
                         let addr = self.offset_addr(&ea, o >> 3);
-                        let bit = 1u64 << (o & 7);
-                        (addr, imm(bit, 8), Some(imm(!bit, 8)))
+                        let bit_pos = (o & 7) as u32;
+                        let bit = 1u64 << bit_pos;
+                        (addr, imm(bit, 8), Some(imm(!bit, 8)), Some(bit_pos))
                     }
                     None => {
                         let o = self.read_op(ins, 1, bits)?;
@@ -185,7 +225,7 @@ impl FunctionLifter<'_> {
                         let low = self.val(&format!("and i64 {wide}, 7"));
                         let pos = self.val(&format!("trunc i64 {low} to i8"));
                         let one = self.val(&format!("shl i8 1, {pos}"));
-                        (addr, one, None)
+                        (addr, one, None, None)
                     }
                 };
                 let old = if locked {
@@ -223,17 +263,40 @@ impl FunctionLifter<'_> {
                     }
                     old
                 };
-                if want_cf {
-                    let hit = self.val(&format!("and i8 {old}, {one}"));
-                    Some(self.val(&format!("icmp ne i8 {hit}, 0")))
-                } else {
+                let cf = want_cf.then(|| {
+                    if let Some(bit) = bit_imm_byte {
+                        self.bit_test_cf_imm(&old, bit, 8)
+                    } else {
+                        let hit = self.val(&format!("and i8 {old}, {one}"));
+                        self.val(&format!("icmp ne i8 {hit}, 0"))
+                    }
+                });
+                let lazy = if locked {
                     None
-                }
+                } else if let Some(bit) = bit_imm_byte {
+                    Some(FlagSource::BitTestBit {
+                        val: old,
+                        bit,
+                        bits: 8,
+                    })
+                } else {
+                    Some(FlagSource::BitTest {
+                        val: old,
+                        mask: one,
+                        bits: 8,
+                    })
+                };
+                (cf, lazy)
             }
             kind => return unsupported(format!("bit test destination {kind:?}")),
         };
         if let Some(cf) = cf {
             self.set_flag(Flag::Cf, &cf);
+            if !locked {
+                self.known.flag_source = Some(FlagSource::CarryBit { cf });
+            }
+        } else if let Some(lazy) = lazy_source {
+            self.known.flag_source = Some(lazy);
         }
         Ok(())
     }
@@ -296,7 +359,8 @@ impl FunctionLifter<'_> {
                 r
             }
             m => {
-                let kind = if m == Mnemonic::Tzcnt {
+                let is_tzcnt = m == Mnemonic::Tzcnt;
+                let kind = if is_tzcnt {
                     BitIntrinsic::Cttz
                 } else {
                     BitIntrinsic::Ctlz
@@ -307,12 +371,18 @@ impl FunctionLifter<'_> {
                     self.set_flag(Flag::Cf, &src_zero);
                 }
                 if self.flag_live(Flag::Zf) {
-                    let r_zero = self.val(&format!("icmp eq {t} {r}, 0"));
+                    // `cttz(src) == 0 <=> lsb(src) == 1`; `ctlz(src) == 0 <=> msb(src) == 1`.
+                    // Checking `src` directly breaks the data dependency on `cttz`/`ctlz`.
+                    let r_zero = if is_tzcnt {
+                        self.val(&format!("trunc {t} {src} to i1"))
+                    } else {
+                        self.msb(&src, bits)
+                    };
                     self.set_flag(Flag::Zf, &r_zero);
                 }
                 self.known.flag_source = Some(FlagSource::BitCount {
                     src,
-                    result: r.clone(),
+                    is_tzcnt,
                     bits,
                 });
                 r
@@ -398,21 +468,51 @@ impl FunctionLifter<'_> {
                 // start = ctrl[7:0], len = ctrl[15:8]; bits past the operand read as zero.
                 let s = self.read_op(ins, 1, bits)?;
                 let ctrl = self.read_op(ins, 2, bits)?;
-                let start = self.val(&format!("and {t} {ctrl}, 255"));
-                let len_hi = self.val(&format!("lshr {t} {ctrl}, 8"));
-                let len = self.val(&format!("and {t} {len_hi}, 255"));
-                let shifted = self.shift_or(&s, &start, bits, "lshr", "0");
-                let low = self.low_mask(&len, bits);
-                let r = self.val(&format!("and {t} {shifted}, {low}"));
-                if self.flag_live(Flag::Zf) {
+                let (r, always_zero) = if let Some(c) = Self::const_u64(&ctrl, bits) {
+                    let start = (c & 0xFF) as u32;
+                    let len = ((c >> 8) & 0xFF) as u32;
+                    if start >= bits || len == 0 {
+                        ("0".to_string(), true)
+                    } else {
+                        let eff_len = len.min(bits - start);
+                        let shifted = if start == 0 {
+                            s
+                        } else {
+                            self.val(&format!("lshr {t} {s}, {start}"))
+                        };
+                        let r = if eff_len >= bits - start {
+                            shifted
+                        } else {
+                            let m = imm(mask(eff_len), bits);
+                            self.val(&format!("and {t} {shifted}, {m}"))
+                        };
+                        (r, false)
+                    }
+                } else {
+                    let start = self.val(&format!("and {t} {ctrl}, 255"));
+                    let len_hi = self.val(&format!("lshr {t} {ctrl}, 8"));
+                    let len = self.val(&format!("and {t} {len_hi}, 255"));
+                    let shifted = self.shift_or(&s, &start, bits, "lshr", "0");
+                    let low = self.low_mask(&len, bits);
+                    (self.val(&format!("and {t} {shifted}, {low}")), false)
+                };
+                if always_zero {
+                    self.set_flag(Flag::Zf, "true");
+                } else if self.flag_live(Flag::Zf) {
                     let zf = self.val(&format!("icmp eq {t} {r}, 0"));
                     self.set_flag(Flag::Zf, &zf);
                 }
                 self.set_flag(Flag::Cf, "false");
                 self.set_flag(Flag::Of, "false");
-                self.known.flag_source = Some(FlagSource::ZeroOnly {
-                    val: r.clone(),
-                    bits,
+                self.known.flag_source = Some(if always_zero {
+                    FlagSource::ZeroBit {
+                        is_zero: "true".to_string(),
+                    }
+                } else {
+                    FlagSource::ZeroOnly {
+                        val: r.clone(),
+                        bits,
+                    }
                 });
                 r
             }
@@ -420,14 +520,36 @@ impl FunctionLifter<'_> {
                 // n = idx[7:0]; n >= width: dst = src, CF = 1; else clear bits n.., CF = 0.
                 let s = self.read_op(ins, 1, bits)?;
                 let idx = self.read_op(ins, 2, bits)?;
-                let n = self.val(&format!("and {t} {idx}, 255"));
-                let low = self.low_mask(&n, bits);
-                let r = self.val(&format!("and {t} {s}, {low}"));
-                if self.flag_live(Flag::Cf) {
-                    let big = self.val(&format!("icmp uge {t} {n}, {bits}"));
-                    self.set_flag(Flag::Cf, &big);
+                let (r, always_zero) = if let Some(c) = Self::const_u64(&idx, bits) {
+                    let n = (c & 0xFF) as u32;
+                    if n >= bits {
+                        self.set_flag(Flag::Cf, "true");
+                        (s, false)
+                    } else if n == 0 {
+                        self.set_flag(Flag::Cf, "false");
+                        ("0".to_string(), true)
+                    } else {
+                        let m = imm(mask(n), bits);
+                        let r = self.val(&format!("and {t} {s}, {m}"));
+                        self.set_flag(Flag::Cf, "false");
+                        (r, false)
+                    }
+                } else {
+                    let n = self.val(&format!("and {t} {idx}, 255"));
+                    let low = self.low_mask(&n, bits);
+                    let r = self.val(&format!("and {t} {s}, {low}"));
+                    if self.flag_live(Flag::Cf) {
+                        let big = self.val(&format!("icmp uge {t} {n}, {bits}"));
+                        self.set_flag(Flag::Cf, &big);
+                    }
+                    (r, false)
+                };
+                if always_zero {
+                    self.set_flag(Flag::Zf, "true");
+                    self.set_flag(Flag::Sf, "false");
+                } else {
+                    self.set_sign_zero(&r, bits);
                 }
-                self.set_sign_zero(&r, bits);
                 self.set_flag(Flag::Of, "false");
                 self.known.flag_source = Some(FlagSource::ResultZeroSign {
                     result: r.clone(),
@@ -470,47 +592,135 @@ impl FunctionLifter<'_> {
                     Register::EDX
                 };
                 let (d, _) = self.read_reg(d_reg)?;
+                let same_dst = ins.op_kind(0) == OpKind::Register
+                    && ins.op_kind(1) == OpKind::Register
+                    && ins.op_register(0) == ins.op_register(1);
                 let (lo, hi) = if bits == 64 {
-                    self.mul128(&d, &src, false)
+                    let (lo, hi) = self.mul128(&d, &src, false);
+                    ((!same_dst).then_some(lo), hi)
                 } else {
                     let wa = self.val(&format!("zext i32 {d} to i64"));
                     let wb = self.val(&format!("zext i32 {src} to i64"));
                     let p = self.val(&format!("mul i64 {wa}, {wb}"));
-                    let lo = self.val(&format!("trunc i64 {p} to i32"));
+                    let lo = (!same_dst).then(|| self.val(&format!("trunc i64 {p} to i32")));
                     let high = self.val(&format!("lshr i64 {p}, 32"));
                     let hi = self.val(&format!("trunc i64 {high} to i32"));
                     (lo, hi)
                 };
-                self.write_op(ins, 1, &lo, bits)?;
+                if let Some(lo) = lo {
+                    self.write_op(ins, 1, &lo, bits)?;
+                }
                 hi
             }
             M::Pdep | M::Pext => {
                 let s = self.read_op(ins, 1, bits)?;
                 let msk = self.read_op(ins, 2, bits)?;
-                let (ws, wm) = if bits == 64 {
-                    (s, msk)
+                if let Some(m_val) = Self::const_u64(&msk, bits)
+                    && let Some(fast) = self.try_const_pdep_pext(m == M::Pdep, &s, m_val, bits)
+                {
+                    fast
                 } else {
-                    (
-                        self.val(&format!("zext i32 {s} to i64")),
-                        self.val(&format!("zext i32 {msk} to i64")),
-                    )
-                };
-                let (name, support) = if m == M::Pdep {
-                    ("__playgta6_pdep", Support::Pdep)
-                } else {
-                    ("__playgta6_pext", Support::Pext)
-                };
-                self.support.insert(support);
-                let r = self.val(&format!("call i64 @{name}(i64 {ws}, i64 {wm})"));
-                if bits == 64 {
-                    r
-                } else {
-                    self.val(&format!("trunc i64 {r} to i32"))
+                    let (ws, wm) = if bits == 64 {
+                        (s, msk)
+                    } else {
+                        (
+                            self.val(&format!("zext i32 {s} to i64")),
+                            self.val(&format!("zext i32 {msk} to i64")),
+                        )
+                    };
+                    let (name, support) = if m == M::Pdep {
+                        ("__playgta6_pdep", Support::Pdep)
+                    } else {
+                        ("__playgta6_pext", Support::Pext)
+                    };
+                    self.support.insert(support);
+                    let r = self.val(&format!("call i64 @{name}(i64 {ws}, i64 {wm})"));
+                    if bits == 64 {
+                        r
+                    } else {
+                        self.val(&format!("trunc i64 {r} to i32"))
+                    }
                 }
             }
             m => return unsupported(format!("instruction {m:?} is not supported yet")),
         };
         self.write_op(ins, 0, &r, bits)
+    }
+
+    /// Fast path for `pdep`/`pext` with a compile-time constant mask `m_val`:
+    /// - `0` -> `0`, `all_ones(bits)` -> `src`
+    /// - 1..=4 contiguous runs of 1-bits -> direct shift + mask + or sequence without calling
+    ///   `@__playgta6_pdep`/`@__playgta6_pext`.
+    fn try_const_pdep_pext(
+        &mut self,
+        is_pdep: bool,
+        src: &str,
+        m_val: u64,
+        bits: u32,
+    ) -> Option<String> {
+        let full = mask(bits);
+        let m_val = m_val & full;
+        if m_val == 0 {
+            return Some("0".to_string());
+        }
+        if m_val == full {
+            return Some(src.to_string());
+        }
+        // Decompose `m_val` into up to 4 contiguous runs `(pos, len)` from LSB to MSB.
+        let mut runs: [(u32, u32); 4] = [(0, 0); 4];
+        let mut run_count = 0usize;
+        let mut rem = m_val;
+        while rem != 0 {
+            if run_count == runs.len() {
+                return None;
+            }
+            let start = rem.trailing_zeros();
+            let shifted = rem >> start;
+            let len = (!shifted).trailing_zeros().min(bits - start);
+            runs[run_count] = (start, len);
+            run_count += 1;
+            if start + len >= bits {
+                break;
+            }
+            rem &= !(mask(len) << start);
+        }
+        let t = ty(bits);
+        let mut packed_pos = 0u32;
+        let mut acc: Option<String> = None;
+        for &(pos, len) in &runs[..run_count] {
+            let shift = pos - packed_pos;
+            let part = if is_pdep {
+                let shifted = if shift == 0 {
+                    src.to_string()
+                } else {
+                    self.val(&format!("shl {t} {src}, {shift}"))
+                };
+                if packed_pos == 0 && pos + len == bits {
+                    shifted
+                } else {
+                    let cm = imm(mask(len) << pos, bits);
+                    self.val(&format!("and {t} {shifted}, {cm}"))
+                }
+            } else {
+                let shifted = if shift == 0 {
+                    src.to_string()
+                } else {
+                    self.val(&format!("lshr {t} {src}, {shift}"))
+                };
+                if packed_pos == 0 && pos + len == bits {
+                    shifted
+                } else {
+                    let cm = imm(mask(len) << packed_pos, bits);
+                    self.val(&format!("and {t} {shifted}, {cm}"))
+                }
+            };
+            acc = Some(match acc {
+                Some(prev) => self.val(&format!("or {t} {prev}, {part}")),
+                None => part,
+            });
+            packed_pos += len;
+        }
+        acc
     }
 
     fn set_sign_zero(&mut self, r: &str, bits: u32) {
