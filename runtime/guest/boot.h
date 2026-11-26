@@ -632,6 +632,12 @@ uint64_t guest_function_for_host_pc(uint64_t host_pc, uint64_t* offset = nullptr
 // "dll!symbol" of the last import the guest thread `thread_id` called ("" if none or unknown).
 std::string guest_thread_last_import(uint32_t thread_id);
 
+// Estimated host bytes of the shader pack key index and the parsed stage reflection (boot report,
+// memory_budget.process); set once by the harness after it loads them, 0 until then.
+void note_host_table_bytes(uint64_t shader_pack_index, uint64_t stage_reflection);
+uint64_t host_shader_pack_index_bytes();
+uint64_t host_stage_reflection_bytes();
+
 }  // namespace playgta6::guest
 
 namespace playgta6::gpu::d3d12_guest::xbox {

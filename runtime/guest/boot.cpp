@@ -29,6 +29,7 @@
 #include "gpu/texture_budget.h"
 #include "os/guest_heap.h"
 #include "os/memory_budget.h"
+#include "os/process_memory.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_crt_exit.h"
 #include "guest/guest_exceptions.h"
@@ -55,6 +56,18 @@
 #endif
 
 namespace playgta6::guest {
+
+namespace {
+std::atomic<uint64_t> g_host_pack_index_bytes{0};
+std::atomic<uint64_t> g_host_stage_reflection_bytes{0};
+}  // namespace
+
+void note_host_table_bytes(uint64_t shader_pack_index, uint64_t stage_reflection) {
+    g_host_pack_index_bytes.store(shader_pack_index, std::memory_order_relaxed);
+    g_host_stage_reflection_bytes.store(stage_reflection, std::memory_order_relaxed);
+}
+uint64_t host_shader_pack_index_bytes() { return g_host_pack_index_bytes.load(std::memory_order_relaxed); }
+uint64_t host_stage_reflection_bytes() { return g_host_stage_reflection_bytes.load(std::memory_order_relaxed); }
 
 namespace {
 std::atomic<bool> g_stop_requested{false};  // request_boot_stop
@@ -2791,6 +2804,14 @@ std::string build_report() {
             const gpu::d3d12_guest::DeviceStats ds = device->stats();
             mb.shadow_covered = ds.shadow_bytes;
             mb.shadow_resident = ds.shadow_resident_bytes;
+        }
+        mb.shader_pack_index_bytes = host_shader_pack_index_bytes();
+        mb.stage_reflection_bytes = host_stage_reflection_bytes();
+        os::process_memory_bytes(&mb.process_private_bytes, &mb.process_working_set_bytes,
+                               &mb.process_peak_private_bytes);
+        if (b.arena != nullptr) {
+            const uint64_t lo = b.arena->guest_base() + b.arena->space_base();
+            os::process_commit_map(lo, lo + b.arena->space_size(), &mb.commit_map);
         }
         mb.gpu_texture_bytes = gpu::texture_budget().stats().used_bytes;
         mb.gpu_parked_bytes = gpu::small_texture_pool().stats().parked_bytes;
