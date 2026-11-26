@@ -20,6 +20,13 @@
   const MAX_TRIM_CROSSFADE_FRAMES = 512;
   const DEFAULT_STATS_INTERVAL_QUANTA = 0; // 0 = periodic port stats disabled by default
 
+  // Hysteresis prebuffer & live jitter absorption defaults (#1028/#663).
+  const DEFAULT_PREBUFFER_FRAMES = 0; // 0 = disabled on bare processor for backward compatibility
+  const DEFAULT_RECOVERY_PREBUFFER_FRAMES = 3840; // 80 ms @ 48 kHz hysteresis recovery target
+  const DEFAULT_LIVE_DECLICK_FRAMES = 160; // ~3.33 ms @ 48 kHz click-free micro-ramp
+  const DEFAULT_LIVE_HIGH_WATERMARK_FRAMES = 10080; // 210 ms @ 48 kHz gentle drift trim ceiling
+  const DEFAULT_LIVE_TARGET_WATERMARK_FRAMES = 4608; // 96 ms @ 48 kHz post-trim steady target
+
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   // Must match web/workers/audio_worker.js byte-for-byte.
   const HDR_WRITE_CURSOR = 0;
@@ -515,6 +522,26 @@
       this._statsIntervalQuanta = statsIntervalQuanta;
       this._statsQuantaCounter = 0;
 
+      // Hysteresis prebuffer / underrun recovery watermark (#1028/#663):
+      // prevents rapid stop-start stutter oscillation under 30-80ms producer hitches.
+      const rawPrebuffer =
+        procOpts.prebufferFrames !== undefined
+          ? procOpts.prebufferFrames
+          : procOpts.underrunRecoveryFrames !== undefined
+            ? procOpts.underrunRecoveryFrames
+            : procOpts.recoveryWatermarkFrames;
+      let prebufferFrames = DEFAULT_PREBUFFER_FRAMES;
+      if (rawPrebuffer === true) {
+        prebufferFrames = DEFAULT_RECOVERY_PREBUFFER_FRAMES;
+      } else if (rawPrebuffer !== undefined && rawPrebuffer !== null && rawPrebuffer !== false) {
+        prebufferFrames = sanitizeNonNegInt(rawPrebuffer, DEFAULT_PREBUFFER_FRAMES);
+      }
+      this._prebufferFrames = prebufferFrames;
+      this._prebufferOnStart = Boolean(procOpts.prebufferOnStart);
+      this._rebufferHold = this._prebufferOnStart && this._prebufferFrames > 0;
+      this._rebufferCount = 0;
+      this._rebufferQuanta = 0;
+
       // Pre-allocated reusable telemetry object for zero-allocation periodic port stats in process().
       this._periodicStatsPayload = {
         type: 'stats',
@@ -528,6 +555,11 @@
         maxBufferedFrames: this._maxBufferedFrames,
         targetWatermarkFrames: this.targetWatermarkFrames,
         trimCrossfadeFrames: this._trimCrossfadeFrames,
+        prebufferFrames: this._prebufferFrames,
+        underrunRecoveryFrames: this._prebufferFrames,
+        inRebuffer: this._rebufferHold,
+        rebufferCount: 0,
+        rebufferQuanta: 0,
         overrunTrimmedFrames: 0,
         overrunTrimCount: 0,
         underruns: 0,
@@ -696,6 +728,49 @@
       return this._statsIntervalQuanta;
     }
 
+    get prebufferFrames() {
+      return this._prebufferFrames;
+    }
+
+    get underrunRecoveryFrames() {
+      return this._prebufferFrames;
+    }
+
+    get inRebuffer() {
+      return this._rebufferHold;
+    }
+
+    get rebufferHold() {
+      return this._rebufferHold;
+    }
+
+    get rebufferCount() {
+      return this._rebufferCount;
+    }
+
+    get rebufferQuanta() {
+      return this._rebufferQuanta;
+    }
+
+    setPrebufferFrames(frames) {
+      if (frames === false || frames === null || frames === 0) {
+        this._prebufferFrames = 0;
+        this._rebufferHold = false;
+      } else if (frames === true) {
+        this._prebufferFrames = DEFAULT_RECOVERY_PREBUFFER_FRAMES;
+      } else {
+        this._prebufferFrames = sanitizeNonNegInt(frames, this._prebufferFrames);
+        if (this._prebufferFrames === 0) {
+          this._rebufferHold = false;
+        }
+      }
+      return this._prebufferFrames;
+    }
+
+    setUnderrunRecoveryFrames(frames) {
+      return this.setPrebufferFrames(frames);
+    }
+
     setMaxBufferedFrames(frames) {
       if (frames === false || frames === null || frames === 0) {
         this._maxBufferedFrames = 0;
@@ -751,6 +826,8 @@
       this._fadeInCount = 0;
       this._overrunTrimmedFrames = 0;
       this._overrunTrimCount = 0;
+      this._rebufferCount = 0;
+      this._rebufferQuanta = 0;
       this._lastFillRatio = 0.0;
       this._peakFillRatio = 0.0;
       this._statsQuantaCounter = 0;
@@ -817,6 +894,7 @@
       this._fadeInFrom.fill(0);
       this._hasActiveAudio = false;
       this._inUnderrun = false;
+      this._rebufferHold = this._prebufferOnStart && this._prebufferFrames > 0;
       this._declickPos = 0;
       this._declickTotal = 0;
       this._fadeInPos = 0;
@@ -944,6 +1022,11 @@
         maxBufferedFrames: this._maxBufferedFrames,
         targetWatermarkFrames: this.targetWatermarkFrames,
         trimCrossfadeFrames: this._trimCrossfadeFrames,
+        prebufferFrames: this._prebufferFrames,
+        underrunRecoveryFrames: this._prebufferFrames,
+        inRebuffer: this._rebufferHold,
+        rebufferCount: this._rebufferCount,
+        rebufferQuanta: this._rebufferQuanta,
         overrunTrimmedFrames: this._overrunTrimmedFrames,
         overrunTrimCount: this._overrunTrimCount,
         statsIntervalQuanta: this._statsIntervalQuanta,
@@ -982,6 +1065,11 @@
       p.maxBufferedFrames = this._maxBufferedFrames;
       p.targetWatermarkFrames = this.targetWatermarkFrames;
       p.trimCrossfadeFrames = this._trimCrossfadeFrames;
+      p.prebufferFrames = this._prebufferFrames;
+      p.underrunRecoveryFrames = this._prebufferFrames;
+      p.inRebuffer = this._rebufferHold;
+      p.rebufferCount = this._rebufferCount;
+      p.rebufferQuanta = this._rebufferQuanta;
       p.overrunTrimmedFrames = this._overrunTrimmedFrames;
       p.overrunTrimCount = this._overrunTrimCount;
       p.underruns = ctrl ? Atomics.load(ctrl, HDR_UNDERRUNS) : this._underruns;
@@ -1187,6 +1275,33 @@
               maxBufferedFrames: this._maxBufferedFrames,
               targetWatermarkFrames: this.targetWatermarkFrames,
               trimCrossfadeFrames: this._trimCrossfadeFrames,
+              id: msg.id,
+            });
+          }
+          break;
+        }
+
+        case 'setPrebufferFrames':
+        case 'setUnderrunRecoveryFrames':
+        case 'setRecoveryWatermark': {
+          const rawPrebuf =
+            msg.prebufferFrames !== undefined
+              ? msg.prebufferFrames
+              : msg.underrunRecoveryFrames !== undefined
+                ? msg.underrunRecoveryFrames
+                : msg.recoveryWatermarkFrames !== undefined
+                  ? msg.recoveryWatermarkFrames
+                  : msg.frames;
+          if (rawPrebuf !== undefined) {
+            this.setPrebufferFrames(rawPrebuf);
+          }
+          if (msg.prebufferOnStart !== undefined) {
+            this._prebufferOnStart = Boolean(msg.prebufferOnStart);
+          }
+          if (msg.id !== undefined) {
+            this._post({
+              type: 'prebufferFrames',
+              prebufferFrames: this._prebufferFrames,
               id: msg.id,
             });
           }
@@ -1477,12 +1592,33 @@
         this._peakFillRatio = preFillRatio;
       }
 
+      // Compute effective hysteresis prebuffer watermark (bounded to <= half ring capacity
+      // and <= 75% of maxBufferedFrames so small rings or drift guards never deadlock).
+      const maxBuffered = this._maxBufferedFrames;
+      let effectivePrebuffer = 0;
+      if (this._prebufferFrames > 0 && cap > 0) {
+        const halfCap = cap >>> 1;
+        let maxSafe = halfCap >= quantumFrames ? halfCap : cap;
+        if (maxBuffered > 0) {
+          const maxForGuard = Math.floor(maxBuffered * 0.75);
+          const guardBound = maxForGuard >= quantumFrames ? maxForGuard : maxBuffered;
+          if (guardBound < maxSafe) {
+            maxSafe = guardBound;
+          }
+        }
+        effectivePrebuffer =
+          this._prebufferFrames <= maxSafe ? this._prebufferFrames : maxSafe;
+        if (effectivePrebuffer < quantumFrames) {
+          effectivePrebuffer = quantumFrames <= cap ? quantumFrames : cap;
+        }
+      }
+
       // W327: Bounded overrun drift guard (high-watermark trim).
       // Advances the read cursor down to target watermark without inducing an
-      // artificial underrun, then crossfades from the discarded head to prevent pops.
+      // artificial underrun or dropping below the hysteresis prebuffer cushion,
+      // then crossfades from the discarded head to prevent pops.
       let trimFrames = 0;
       let trimOldRead = read;
-      const maxBuffered = this._maxBufferedFrames;
       if (maxBuffered > 0 && used > maxBuffered && used > quantumFrames) {
         let target =
           this._targetWatermarkFramesOverride >= 0
@@ -1491,7 +1627,11 @@
         if (target > maxBuffered) {
           target = maxBuffered;
         }
-        const keepFrames = target > quantumFrames ? target : quantumFrames;
+        let minKeep = quantumFrames;
+        if (effectivePrebuffer > minKeep && effectivePrebuffer <= maxBuffered) {
+          minKeep = effectivePrebuffer;
+        }
+        const keepFrames = target > minKeep ? target : minKeep;
         if (used > keepFrames) {
           trimFrames = used - keepFrames;
           trimOldRead = read;
@@ -1505,7 +1645,28 @@
         }
       }
 
-      const framesToRead = quantumFrames <= used ? quantumFrames : used;
+      // Hysteresis rebuffer hold (#1028/#663): after underrun (or on start if
+      // prebufferOnStart is enabled), wait until `used >= effectivePrebuffer` before
+      // resuming playback so bursty/jittery producers cannot trigger stop-start stutter.
+      let holdingForPrebuffer = false;
+      if (effectivePrebuffer > 0 && (this._rebufferHold || this._inUnderrun)) {
+        if (used < effectivePrebuffer) {
+          this._rebufferHold = true;
+          holdingForPrebuffer = true;
+          this._rebufferQuanta++;
+        } else if (this._rebufferHold) {
+          this._rebufferHold = false;
+          this._rebufferCount++;
+        }
+      } else if (this._rebufferHold) {
+        this._rebufferHold = false;
+      }
+
+      const framesToRead = holdingForPrebuffer
+        ? 0
+        : quantumFrames <= used
+          ? quantumFrames
+          : used;
       const lastSamples = this._lastSamples;
       const trackedChannels =
         outChannels < lastSamples.length ? outChannels : lastSamples.length;
@@ -2713,6 +2874,11 @@
     DEFAULT_TRIM_CROSSFADE_FRAMES,
     MAX_TRIM_CROSSFADE_FRAMES,
     DEFAULT_STATS_INTERVAL_QUANTA,
+    DEFAULT_PREBUFFER_FRAMES,
+    DEFAULT_RECOVERY_PREBUFFER_FRAMES,
+    DEFAULT_LIVE_DECLICK_FRAMES,
+    DEFAULT_LIVE_HIGH_WATERMARK_FRAMES,
+    DEFAULT_LIVE_TARGET_WATERMARK_FRAMES,
     HDR_WRITE_CURSOR,
     HDR_READ_CURSOR,
     HDR_CAPACITY_FRAMES,

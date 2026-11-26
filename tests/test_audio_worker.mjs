@@ -3046,3 +3046,93 @@ test('W365 (#663) persistent BroadcastChannel lifecycle on reset/error and zero-
   worker.destroy();
   assert.equal(openChannels, 0);
 });
+
+test('Jitter/stutter fix (#1028/#663): active guest pump runs at 8ms cadence, drains 60-80ms bursts in 1 zero-alloc tick, avoids false guestUnderruns, and deduplicates setOutputState timer restarts', () => {
+  assert.equal(audioMod.DEFAULT_ACTIVE_PUMP_INTERVAL_MS, 8);
+  assert.equal(audioMod.DEFAULT_CAPACITY_FRAMES, 16384);
+  assert.equal(audioMod.GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES, 4096);
+
+  const scheduled = [];
+  let cleared = 0;
+  let fakeNow = 1000;
+
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'active',
+    autoDrain: true,
+    declickFrames: 0,
+    setIntervalFn: (fn, ms) => {
+      const h = { fn, ms };
+      scheduled.push(h);
+      return h;
+    },
+    clearIntervalFn: () => {
+      cleared += 1;
+    },
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    outputState: 'active',
+  });
+  assert.equal(worker.ring.capacityFrames, 16384);
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 65536, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].ms, 8, 'default active guest pump must use 8ms interval');
+
+  // Duplicate setOutputState('active') must NOT tear down & restart the active timer.
+  worker.setOutputState('active');
+  worker.handleMessage({ type: 'audio-context-state', outputState: 'running' });
+  assert.equal(cleared, 0);
+  assert.equal(scheduled.length, 1);
+
+  const allocsAfterAttach = worker.getScratchStats().allocations;
+
+  // Empty ticks return 0 immediately without bumping false guestUnderruns.
+  fakeNow += 8;
+  scheduled[0].fn();
+  fakeNow += 8;
+  scheduled[0].fn();
+  assert.equal(worker.getStats().guestUnderruns, 0);
+
+  // Simulate an 80ms (3840-frame) post-hitch burst arriving in playgta6_audio_ring:
+  // a single 8ms tick must drain ALL 3840 frames immediately (not throttled to 384 frames!)
+  // with zero scratch reallocations and zero dropped frames.
+  const burst80ms = makeConstantStereoFrames(3840, 0.4);
+  assert.equal(mock.producerPush(burst80ms), 3840 * 2);
+  fakeNow += 8;
+  scheduled[0].fn();
+
+  assert.equal(worker.getStats().guestFramesDrained, 3840);
+  assert.equal(worker.ring.availableFrames(), 3840);
+  assert.equal(worker.getStats().droppedFrames, 0);
+  assert.equal(worker.getStats().guestOverruns, 0);
+  assert.equal(worker.getStats().guestUnderruns, 0);
+  assert.equal(worker.getScratchStats().allocations, allocsAfterAttach);
+
+  // Simulate a huge 180ms (8640-frame) catch-up burst -> drains cleanly across chunked loop with 0 allocs!
+  const burst180ms = makeConstantStereoFrames(8640, -0.35);
+  assert.equal(mock.producerPush(burst180ms), 8640 * 2);
+  fakeNow += 8;
+  scheduled[0].fn();
+
+  assert.equal(worker.getStats().guestFramesDrained, 3840 + 8640);
+  assert.equal(worker.ring.availableFrames(), 3840 + 8640);
+  assert.equal(worker.getStats().droppedFrames, 0);
+  assert.equal(worker.getScratchStats().allocations, allocsAfterAttach);
+
+  // Resampled burst near full ring (48 kHz -> 96 kHz) never overflows by 1-2 frames.
+  worker.setSampleRate(96000);
+  worker.ring.discardFrames(worker.ring.availableFrames() - (16384 - 10)); // leave 10 free frames
+  assert.equal(mock.producerPush(makeConstantStereoFrames(200, 0.25)), 400);
+  fakeNow += 8;
+  scheduled[0].fn();
+  assert.equal(worker.getStats().droppedFrames, 0);
+  assert.equal(worker.getStats().guestOverruns, 0);
+
+  worker.destroy();
+});

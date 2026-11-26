@@ -5,7 +5,12 @@
 export const PROCESSOR_NAME = 'playgta6-audio-processor';
 export const DEFAULT_SAMPLE_RATE = 48000;
 export const DEFAULT_CHANNELS = 2;
-export const DEFAULT_CAPACITY_FRAMES = 4096;
+export const DEFAULT_CAPACITY_FRAMES = 16384; // ~341 ms @ 48 kHz for jitter/hitch absorption
+export const DEFAULT_WORKLET_DECLICK_MS = 160 / 48; // ~3.33 ms (160 frames @ 48 kHz)
+export const DEFAULT_PREBUFFER_MS = 80; // 3840 frames @ 48 kHz hysteresis recovery cushion
+export const DEFAULT_HIGH_WATERMARK_MS = 210; // 10080 frames @ 48 kHz gentle drift trim ceiling
+export const DEFAULT_TARGET_WATERMARK_MS = 96; // 4608 frames @ 48 kHz post-trim steady target
+export const DEFAULT_TRIM_CROSSFADE_FRAMES = 64; // ~1.33 ms @ 48 kHz click-free trim splice
 export const DEFAULT_WORKLET_URL = new URL(
   '../workers/audio_worklet_processor.js',
   import.meta.url
@@ -884,6 +889,53 @@ export class AudioEngine {
         : PROCESSOR_NAME;
     this._latencyHint = opts.latencyHint !== undefined ? opts.latencyHint : 'interactive';
     this._smoothingFrames = opts.smoothingFrames;
+    this._workletDeclickFrames =
+      opts.declickFrames !== undefined
+        ? sanitizeFiniteNonNegInt(opts.declickFrames, 0)
+        : null;
+    this._workletDeclickMs =
+      opts.declickMs !== undefined
+        ? sanitizeRampMs(opts.declickMs, DEFAULT_WORKLET_DECLICK_MS)
+        : DEFAULT_WORKLET_DECLICK_MS;
+    this._workletFadeCurve =
+      opts.fadeCurve === 'linear' || opts.fadeCurve === 'cosine' ? opts.fadeCurve : 'cosine';
+    const rawPrebufFrames =
+      opts.prebufferFrames !== undefined
+        ? opts.prebufferFrames
+        : opts.underrunRecoveryFrames;
+    this._workletPrebufferFrames =
+      rawPrebufFrames !== undefined ? sanitizeFiniteNonNegInt(rawPrebufFrames, 0) : null;
+    this._workletPrebufferMs =
+      opts.prebufferMs !== undefined
+        ? sanitizeRampMs(opts.prebufferMs, DEFAULT_PREBUFFER_MS)
+        : DEFAULT_PREBUFFER_MS;
+    this._workletPrebufferOnStart = Boolean(opts.prebufferOnStart);
+    const rawMaxBuffered =
+      opts.maxBufferedFrames !== undefined
+        ? opts.maxBufferedFrames
+        : opts.highWatermarkFrames;
+    this._workletMaxBufferedFrames =
+      rawMaxBuffered === false || rawMaxBuffered === null
+        ? 0
+        : rawMaxBuffered !== undefined
+          ? sanitizeFiniteNonNegInt(rawMaxBuffered, 0)
+          : null;
+    this._workletHighWatermarkMs =
+      opts.highWatermarkMs !== undefined
+        ? sanitizeRampMs(opts.highWatermarkMs, DEFAULT_HIGH_WATERMARK_MS)
+        : DEFAULT_HIGH_WATERMARK_MS;
+    this._workletTargetWatermarkFrames =
+      opts.targetWatermarkFrames !== undefined
+        ? sanitizeFiniteNonNegInt(opts.targetWatermarkFrames, 0)
+        : null;
+    this._workletTargetWatermarkMs =
+      opts.targetWatermarkMs !== undefined
+        ? sanitizeRampMs(opts.targetWatermarkMs, DEFAULT_TARGET_WATERMARK_MS)
+        : DEFAULT_TARGET_WATERMARK_MS;
+    this._workletTrimCrossfadeFrames =
+      opts.trimCrossfadeFrames !== undefined
+        ? sanitizeFiniteNonNegInt(opts.trimCrossfadeFrames, DEFAULT_TRIM_CROSSFADE_FRAMES)
+        : DEFAULT_TRIM_CROSSFADE_FRAMES;
     this._maxResumeRetries = sanitizeFiniteNonNegInt(
       opts.maxResumeRetries,
       DEFAULT_MAX_RESUME_RETRIES
@@ -1261,6 +1313,9 @@ export class AudioEngine {
     if (typeof SharedArrayBuffer === 'undefined' || !(sab instanceof SharedArrayBuffer)) {
       throw new TypeError('AudioEngine.attachSab requires a SharedArrayBuffer');
     }
+    if (sab === this._sab && this._ctrl !== null) {
+      return sab;
+    }
     if (sab.byteLength < RING_HEADER_BYTES) {
       throw new RangeError(
         `SharedArrayBuffer too small (${sab.byteLength} bytes; need > ${RING_HEADER_BYTES})`
@@ -1511,12 +1566,65 @@ export class AudioEngine {
       masterGainNode !== null &&
       (initialCtxState === 'suspended' || initialCtxState === 'interrupted');
 
+    const actualSampleRate =
+      typeof ctx.sampleRate === 'number' && Number.isFinite(ctx.sampleRate) && ctx.sampleRate > 0
+        ? ctx.sampleRate
+        : this._requestedSampleRate;
+    const ringCap = this._capacityFrames;
+
+    const declickFrames =
+      this._workletDeclickFrames !== null
+        ? this._workletDeclickFrames
+        : Math.max(128, Math.round((this._workletDeclickMs / 1000) * actualSampleRate));
+    const rawPrebufferFrames =
+      this._workletPrebufferFrames !== null
+        ? this._workletPrebufferFrames
+        : Math.round((this._workletPrebufferMs / 1000) * actualSampleRate);
+    const prebufferFrames =
+      rawPrebufferFrames > 0 && ringCap > 0
+        ? Math.min(rawPrebufferFrames, Math.max(128, Math.floor(ringCap * 0.5)))
+        : rawPrebufferFrames;
+
+    let maxBufferedFrames = 0;
+    let targetWatermarkFrames = 0;
+    if (this._workletMaxBufferedFrames !== null) {
+      maxBufferedFrames = this._workletMaxBufferedFrames;
+      if (maxBufferedFrames > 0) {
+        targetWatermarkFrames =
+          this._workletTargetWatermarkFrames !== null
+            ? this._workletTargetWatermarkFrames
+            : Math.max(
+                prebufferFrames,
+                Math.round((this._workletTargetWatermarkMs / 1000) * actualSampleRate)
+              );
+        if (targetWatermarkFrames > maxBufferedFrames) {
+          targetWatermarkFrames = maxBufferedFrames;
+        }
+      }
+    } else if (ringCap > 8192) {
+      const desiredHigh = Math.round((this._workletHighWatermarkMs / 1000) * actualSampleRate);
+      const desiredTarget = Math.round((this._workletTargetWatermarkMs / 1000) * actualSampleRate);
+      maxBufferedFrames =
+        desiredHigh < ringCap ? desiredHigh : Math.floor(ringCap * 0.85);
+      targetWatermarkFrames = Math.min(
+        maxBufferedFrames,
+        Math.max(prebufferFrames, desiredTarget < maxBufferedFrames ? desiredTarget : Math.floor(ringCap * 0.45))
+      );
+    }
+
     const processorOptions = {
       sab: this._sab,
       // Keep the worklet at unity gain when a WebAudio master GainNode owns
       // gain/mute ramping so output is never double-attenuated.
       gain: masterGainNode ? 1.0 : this._volume,
       muted: masterGainNode ? false : this._muted,
+      declickFrames,
+      fadeCurve: this._workletFadeCurve,
+      prebufferFrames,
+      prebufferOnStart: this._workletPrebufferOnStart,
+      maxBufferedFrames,
+      targetWatermarkFrames,
+      trimCrossfadeFrames: this._workletTrimCrossfadeFrames,
     };
     if (this._smoothingFrames !== undefined) {
       processorOptions.smoothingFrames = this._smoothingFrames;
