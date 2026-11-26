@@ -55,6 +55,7 @@ add_library(playgta6_core STATIC
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp
+    gpu/gpu_time.cpp
     gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
     gpu/gfx10_detile.cpp
@@ -246,6 +247,9 @@ else()
     add_executable(test_drop_table ../tests/test_drop_table.cpp)
     target_link_libraries(test_drop_table PRIVATE playgta6_core)
     add_test(NAME test_drop_table COMMAND test_drop_table)
+    add_executable(test_gpu_time ../tests/test_gpu_time.cpp)
+    target_link_libraries(test_gpu_time PRIVATE playgta6_core)
+    add_test(NAME test_gpu_time COMMAND test_gpu_time)
 
     add_executable(test_gpu_va_watch ../tests/test_gpu_va_watch.cpp)
     target_link_libraries(test_gpu_va_watch PRIVATE playgta6_core)
