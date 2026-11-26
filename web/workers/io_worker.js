@@ -127,11 +127,12 @@
   const DEFAULT_SLAB_MAX_BYTES = 192 * 1024 * 1024; // 192 MiB bounded LRU cap (96 x 2 MiB slabs; holds ~115 MB shaders.rpf working set without thrashing)
   const MAX_SLAB_SIZE = 16 * 1024 * 1024; // 16 MiB upper safety cap per slab
   const MAX_SLAB_CACHE_BYTES = 256 * 1024 * 1024; // 256 MiB upper safety cap for worker slab RAM
-  const DEFAULT_SLAB_PREFETCH_AHEAD = 0; // Opt-in/tunable sequential read-ahead slab count
+  const DEFAULT_SLAB_PREFETCH_AHEAD = 1; // Lightweight +1 sequential read-ahead slab (opt-out via prefetchAheadSlabs: 0)
+  const DEFAULT_AUTO_PREFETCH_MIN_SLAB_SIZE = 512 * 1024; // Enable default +1 sequential prefetch for production >=512 KiB aligned slabs
   const MAX_SLAB_PREFETCH_AHEAD = 8;
   const DEFAULT_MAX_CONCURRENT_SLAB_FETCHES = 8;
   const MAX_CONCURRENT_SLAB_FETCHES = 16;
-  const DEFAULT_SEQUENTIAL_THRESHOLD_READS = 2;
+  const DEFAULT_SEQUENTIAL_THRESHOLD_READS = 3;
   const MAX_STREAM_TRACKER_ENTRIES = 64;
   const DEFAULT_NEGATIVE_CACHE_TTL_MS = 30 * 1000; // 30s bounded TTL for missing optional files
   const DEFAULT_NEGATIVE_CACHE_MAX_ENTRIES = 512;
@@ -151,6 +152,13 @@
       prefetchAheadSlabs: DEFAULT_SLAB_PREFETCH_AHEAD,
       maxConcurrentSlabFetches: DEFAULT_MAX_CONCURRENT_SLAB_FETCHES,
       sequentialThresholdReads: DEFAULT_SEQUENTIAL_THRESHOLD_READS,
+    }),
+    'fast-boot': Object.freeze({
+      slabSize: DEFAULT_SLAB_SIZE,
+      slabMaxBytes: MAX_SLAB_CACHE_BYTES, // 256 MiB bounded RAM LRU cap for heavy .rpf asset-loading phases
+      prefetchAheadSlabs: 1,
+      maxConcurrentSlabFetches: DEFAULT_MAX_CONCURRENT_SLAB_FETCHES,
+      sequentialThresholdReads: 2,
     }),
     video4k: Object.freeze({
       slabSize: 4 * 1024 * 1024, // 4 MiB slabs for smooth 4K Bink2 sequential reads
@@ -741,6 +749,12 @@
 
     let base = SLAB_TUNING_PROFILES.default;
     if (
+      rawProfile === 'fast-boot' ||
+      rawProfile === 'fast_boot' ||
+      rawProfile === 'high-throughput'
+    ) {
+      base = SLAB_TUNING_PROFILES['fast-boot'];
+    } else if (
       rawProfile === 'video4k' ||
       rawProfile === 'bink2_4k' ||
       rawProfile === 'bink2' ||
@@ -752,14 +766,22 @@
     }
 
     const rawSlabSize =
-      opts.slabSize !== undefined ? opts.slabSize : base.slabSize;
+      opts.slabSize !== undefined
+        ? opts.slabSize
+        : opts.blockSize !== undefined
+          ? opts.blockSize
+          : base.slabSize;
     const slabSize =
       Number.isInteger(rawSlabSize) && rawSlabSize >= 0
         ? Math.min(rawSlabSize, MAX_SLAB_SIZE)
         : base.slabSize;
 
     const rawSlabMaxBytes =
-      opts.slabMaxBytes !== undefined ? opts.slabMaxBytes : base.slabMaxBytes;
+      opts.slabMaxBytes !== undefined
+        ? opts.slabMaxBytes
+        : opts.maxRamCacheBytes !== undefined
+          ? opts.maxRamCacheBytes
+          : base.slabMaxBytes;
     const slabMaxBytes =
       Number.isFinite(rawSlabMaxBytes) && rawSlabMaxBytes >= 0
         ? Math.min(Math.floor(rawSlabMaxBytes), MAX_SLAB_CACHE_BYTES)
@@ -1215,12 +1237,17 @@
       ? createSlabCacheTuningProfile({ profile: options.slabProfile })
       : null;
 
+    const hasValidRecommendedMax =
+      Number.isFinite(options.recommendedSlabMaxBytes) && options.recommendedSlabMaxBytes > 0;
     const explicitChunkOrMax =
       options.chunkSize !== undefined || options.maxBytes !== undefined;
     const slabExplicitlyConfigured =
       hasProfile ||
       options.slabSize !== undefined ||
+      options.blockSize !== undefined ||
       options.slabMaxBytes !== undefined ||
+      options.maxRamCacheBytes !== undefined ||
+      hasValidRecommendedMax ||
       options.slabCacheEnabled === true ||
       options.prefetchAheadSlabs !== undefined;
 
@@ -1234,9 +1261,11 @@
     const rawSlabSize =
       options.slabSize !== undefined
         ? options.slabSize
-        : profileDefaults
-          ? profileDefaults.slabSize
-          : DEFAULT_SLAB_SIZE;
+        : options.blockSize !== undefined
+          ? options.blockSize
+          : profileDefaults
+            ? profileDefaults.slabSize
+            : DEFAULT_SLAB_SIZE;
     const slabSize = !slabEnabled
       ? 0
       : Number.isInteger(rawSlabSize) && rawSlabSize >= 0
@@ -1246,9 +1275,13 @@
     const rawSlabMaxBytes =
       options.slabMaxBytes !== undefined
         ? options.slabMaxBytes
-        : profileDefaults
-          ? profileDefaults.slabMaxBytes
-          : DEFAULT_SLAB_MAX_BYTES;
+        : options.maxRamCacheBytes !== undefined
+          ? options.maxRamCacheBytes
+          : hasValidRecommendedMax
+            ? options.recommendedSlabMaxBytes
+            : profileDefaults
+              ? profileDefaults.slabMaxBytes
+              : DEFAULT_SLAB_MAX_BYTES;
     const slabMaxBytes = !slabEnabled
       ? 0
       : Number.isFinite(rawSlabMaxBytes) && rawSlabMaxBytes >= 0
@@ -1264,7 +1297,9 @@
         ? options.prefetchAheadSlabs
         : profileDefaults
           ? profileDefaults.prefetchAheadSlabs
-          : DEFAULT_SLAB_PREFETCH_AHEAD;
+          : slabSize >= DEFAULT_AUTO_PREFETCH_MIN_SLAB_SIZE
+            ? DEFAULT_SLAB_PREFETCH_AHEAD
+            : 0;
     const prefetchAheadSlabs = !slabEnabled
       ? 0
       : Number.isInteger(rawPrefetch) && rawPrefetch >= 0
@@ -1312,6 +1347,8 @@
     return {
       hits: 0,
       misses: 0,
+      cacheHits: 0,
+      cacheMisses: 0,
       slabCacheHits: 0,
       slabCacheMisses: 0,
       slabEvictions: 0,
@@ -1323,6 +1360,7 @@
       slabPrefetchesScheduled: 0,
       slabPrefetchesCompleted: 0,
       slabPrefetchErrors: 0,
+      prefetchHits: 0,
       prefetchAheadSlabs,
       maxConcurrentSlabFetches,
       activeSlabFetches: 0,
@@ -1332,7 +1370,10 @@
       negativeHits: 0,
       negativeEntries: 0,
       inFlightCoalesced: 0,
+      inflightCoalesced: 0,
       networkFetches: 0,
+      bytesFetched: 0,
+      bytesServedFromCache: 0,
       evictions: 0,
       opfsL2Hits: 0,
       opfsL2Misses: 0,
@@ -1430,6 +1471,9 @@
       this._negativeCache = new Map(); // normalized url -> { errno, status, expiresAt } (LRU order)
       this._inFlightChunks = new Map(); // chunkKey -> Promise<Uint8Array>
       this._inFlightSlabs = new Map(); // slabKey -> Promise<Uint8Array>
+      this._inFlightSlabMeta = new Map(); // slabKey -> { isPrefetch, prefetchHitCounted, waiter }
+      this._prefetchedSlabKeys = new Set(); // slabKey set for unconsumed prefetched slabs in RAM LRU
+      this._opfsL2HitBuffers = new WeakSet(); // WeakSet<Uint8Array> tagging OPFS L2 hit buffers for bytesServedFromCache
       this._inFlightOpen = new Map(); // url -> Promise<{ ok, size, errno, status }>
       this._streamTrackers = new Map(); // url -> { lastOffset, lastEndOffset, lastSlabIndex, sequentialCount }
       this._activeSlabFetches = 0;
@@ -1458,12 +1502,15 @@
         slabPrefetchesScheduled: 0,
         slabPrefetchesCompleted: 0,
         slabPrefetchErrors: 0,
+        prefetchHits: 0,
         peakConcurrentSlabFetches: 0,
         metaHits: 0,
         metaMisses: 0,
         negativeHits: 0,
         inFlightCoalesced: 0,
         networkFetches: 0,
+        bytesFetched: 0,
+        bytesServedFromCache: 0,
         evictions: 0,
         opfsL2Hits: 0,
         opfsL2Misses: 0,
@@ -1584,6 +1631,7 @@
       for (const [key, bytes] of Array.from(this._slabs.entries())) {
         if (key.startsWith(prefix)) {
           this._slabs.delete(key);
+          this._prefetchedSlabKeys.delete(key);
           this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
         }
       }
@@ -1605,6 +1653,7 @@
           (keyNorm && basenameOfPath(keyNorm) === normalizedPath)
         ) {
           this._slabs.delete(key);
+          this._prefetchedSlabKeys.delete(key);
           this._slabBytesCached = Math.max(0, this._slabBytesCached - bytes.byteLength);
         }
       }
@@ -2450,6 +2499,7 @@
 
       this._stats.opfsL2Hits += 1;
       this._opfsL2ValidatedFingerprints.set(normPath, fp);
+      this._opfsL2HitBuffers.add(rawBytes);
 
       if (this.getFileSize(url) === null) {
         if (expectedSize !== null) {
@@ -2624,11 +2674,12 @@
           this._opfsL2WriteQueue.delete(oldestKey);
         }
       }
+      // `bytes` is an immutable owned Uint8Array stored in RAM LRU; avoid a redundant 2 MiB slice copy.
       this._opfsL2WriteQueue.set(writeKey, {
         normalizedPath: normPath,
         offset,
         unitLength,
-        bytes: bytes.slice(),
+        bytes,
         fileFingerprint: fp,
       });
       this._pumpOpfsL2WriteQueue();
@@ -2771,6 +2822,7 @@
         const oldestKey = this._slabs.keys().next().value;
         const oldestBytes = this._slabs.get(oldestKey);
         this._slabs.delete(oldestKey);
+        this._prefetchedSlabKeys.delete(oldestKey);
         this._slabBytesCached -= oldestBytes.byteLength;
         this._stats.slabEvictions += 1;
       }
@@ -2827,6 +2879,7 @@
       }
 
       const raw = new Uint8Array(await res.arrayBuffer());
+      this._stats.bytesFetched += raw.byteLength;
 
       if (status === 206) {
         const cr = parseContentRangeHeader(getResponseHeader(res.headers, 'Content-Range'));
@@ -3167,7 +3220,7 @@
       }
     }
 
-    _acquireSlabSlot(isPrefetch = false) {
+    _acquireSlabSlot(isPrefetch = false, meta = null) {
       const limit = Math.max(1, this.maxConcurrentSlabFetches || DEFAULT_MAX_CONCURRENT_SLAB_FETCHES);
       if (this._activeSlabFetches < limit) {
         this._activeSlabFetches += 1;
@@ -3178,6 +3231,9 @@
       }
       return new Promise((resolve) => {
         const waiter = { resolve, priority: isPrefetch ? 1 : 0 };
+        if (meta) {
+          meta.waiter = waiter;
+        }
         if (waiter.priority === 0) {
           // Insert demand reads ahead of queued background prefetch waiters.
           let insertAt = this._slabWaitQueue.length;
@@ -3192,6 +3248,26 @@
           this._slabWaitQueue.push(waiter);
         }
       });
+    }
+
+    _promoteSlabWaiter(waiter) {
+      if (!waiter || waiter.priority === 0) {
+        return;
+      }
+      const idx = this._slabWaitQueue.indexOf(waiter);
+      if (idx < 0) {
+        return;
+      }
+      waiter.priority = 0;
+      this._slabWaitQueue.splice(idx, 1);
+      let insertAt = this._slabWaitQueue.length;
+      for (let i = 0; i < this._slabWaitQueue.length; i += 1) {
+        if (this._slabWaitQueue[i].priority > 0) {
+          insertAt = i;
+          break;
+        }
+      }
+      this._slabWaitQueue.splice(insertAt, 0, waiter);
     }
 
     _releaseSlabSlot() {
@@ -3220,8 +3296,22 @@
       const existing = this._inFlightSlabs.get(key);
       if (existing) {
         this._stats.inFlightCoalesced += 1;
+        if (!isPrefetch) {
+          const existingMeta = this._inFlightSlabMeta.get(key);
+          if (existingMeta && existingMeta.isPrefetch) {
+            if (!existingMeta.prefetchHitCounted) {
+              existingMeta.prefetchHitCounted = true;
+              this._stats.prefetchHits += 1;
+            }
+            if (existingMeta.waiter) {
+              this._promoteSlabWaiter(existingMeta.waiter);
+            }
+          }
+        }
         return existing;
       }
+
+      const meta = { isPrefetch, prefetchHitCounted: false, waiter: null };
 
       const promise = (async () => {
         const slabStart = slabIndex * this.slabSize;
@@ -3234,11 +3324,15 @@
           const l2Hit = await this._tryReadOpfsL2(url, slabStart, this.slabSize, knownSizeBefore);
           if (l2Hit !== null) {
             this._putSlab(key, l2Hit);
+            if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
+              this._prefetchedSlabKeys.add(key);
+            }
             return l2Hit;
           }
         }
 
-        await this._acquireSlabSlot(isPrefetch);
+        await this._acquireSlabSlot(isPrefetch, meta);
+        meta.waiter = null;
         try {
           const knownSize = this.getFileSize(url);
           if (knownSize !== null && slabStart >= knownSize) {
@@ -3284,6 +3378,9 @@
                   : first.bytes.slice(relStart, relStart + takeLen);
               if (slabBytes.byteLength > 0) {
                 this._putSlab(key, slabBytes);
+                if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
+                  this._prefetchedSlabKeys.add(key);
+                }
                 this._maybeWriteThroughOpfsL2(url, slabStart, this.slabSize, slabBytes);
               }
               return slabBytes;
@@ -3331,6 +3428,9 @@
             }
             if (combined.byteLength > 0) {
               this._putSlab(key, combined);
+              if (meta.isPrefetch && !meta.prefetchHitCounted && this._slabs.has(key)) {
+                this._prefetchedSlabKeys.add(key);
+              }
               this._maybeWriteThroughOpfsL2(url, slabStart, this.slabSize, combined);
             }
             return combined;
@@ -3338,14 +3438,19 @@
 
           return new Uint8Array(0);
         } finally {
+          meta.waiter = null;
           this._releaseSlabSlot();
         }
       })();
 
       this._inFlightSlabs.set(key, promise);
+      this._inFlightSlabMeta.set(key, meta);
       const cleanup = () => {
         if (this._inFlightSlabs.get(key) === promise) {
           this._inFlightSlabs.delete(key);
+        }
+        if (this._inFlightSlabMeta.get(key) === meta) {
+          this._inFlightSlabMeta.delete(key);
         }
       };
       promise.then(cleanup, cleanup);
@@ -3363,7 +3468,7 @@
         const isSequential =
           offset >= tracker.lastOffset &&
           offset <= tracker.lastEndOffset + this.slabSize &&
-          (endOffset > tracker.lastEndOffset || lastSlab >= tracker.lastSlabIndex);
+          (endOffset > tracker.lastEndOffset || lastSlab > tracker.lastSlabIndex);
         if (isSequential) {
           tracker.sequentialCount = Math.min(tracker.sequentialCount + 1, 1024);
         } else {
@@ -3547,6 +3652,7 @@
 
       if (prevSlabSize !== this.slabSize || !this._isSlabModeEnabled()) {
         this._slabs.clear();
+        this._prefetchedSlabKeys.clear();
         this._slabBytesCached = 0;
         this._streamTrackers.clear();
       } else {
@@ -3554,6 +3660,7 @@
           const oldestKey = this._slabs.keys().next().value;
           const oldestBytes = this._slabs.get(oldestKey);
           this._slabs.delete(oldestKey);
+          this._prefetchedSlabKeys.delete(oldestKey);
           this._slabBytesCached -= oldestBytes.byteLength;
           this._stats.slabEvictions += 1;
         }
@@ -3568,19 +3675,35 @@
       };
     }
 
-    _getSlabRange(url, firstSlab, lastSlab) {
-      const resolveSingleSlab = (slabIndex) => {
+    _getSlabRange(url, firstSlab, lastSlab, cacheFlagsOut = null) {
+      const resolveSingleSlab = (slabIndex, slotIdx) => {
         const key = this._slabKey(url, slabIndex);
 
         const memHit = this._touchSlab(key);
         if (memHit !== null) {
           this._stats.slabHits += 1;
+          if (this._prefetchedSlabKeys.delete(key)) {
+            this._stats.prefetchHits += 1;
+          }
+          if (cacheFlagsOut) {
+            cacheFlagsOut[slotIdx] = true;
+          }
           return Promise.resolve(memHit);
         }
 
         const inFlight = this._inFlightSlabs.get(key);
         if (inFlight) {
           this._stats.inFlightCoalesced += 1;
+          const meta = this._inFlightSlabMeta.get(key);
+          if (meta && meta.isPrefetch) {
+            if (!meta.prefetchHitCounted) {
+              meta.prefetchHitCounted = true;
+              this._stats.prefetchHits += 1;
+            }
+            if (meta.waiter) {
+              this._promoteSlabWaiter(meta.waiter);
+            }
+          }
           return inFlight;
         }
 
@@ -3591,7 +3714,7 @@
       const totalSlabs = lastSlab - firstSlab + 1;
       if (totalSlabs > 1 && this.getFileSize(url) === null) {
         return (async () => {
-          const firstBytes = await resolveSingleSlab(firstSlab);
+          const firstBytes = await resolveSingleSlab(firstSlab, 0);
           const results = [firstBytes];
           if (!firstBytes || firstBytes.byteLength < this.slabSize) {
             return results;
@@ -3606,7 +3729,7 @@
           if (clampedLast > firstSlab) {
             const rest = [];
             for (let s = firstSlab + 1; s <= clampedLast; s += 1) {
-              rest.push(resolveSingleSlab(s));
+              rest.push(resolveSingleSlab(s, s - firstSlab));
             }
             const restBytes = await Promise.all(rest);
             for (let i = 0; i < restBytes.length; i += 1) {
@@ -3619,9 +3742,280 @@
 
       const slabPromises = new Array(totalSlabs);
       for (let i = 0; i < totalSlabs; i += 1) {
-        slabPromises[i] = resolveSingleSlab(firstSlab + i);
+        slabPromises[i] = resolveSingleSlab(firstSlab + i, i);
       }
       return Promise.all(slabPromises);
+    }
+
+    hasInFlightOverlap(url, offset, length) {
+      if (
+        typeof url !== 'string' ||
+        url.length === 0 ||
+        !Number.isInteger(offset) ||
+        offset < 0 ||
+        !Number.isInteger(length) ||
+        length <= 0
+      ) {
+        return false;
+      }
+      if (this._inFlightOpen.has(url)) {
+        return true;
+      }
+      if (this._isSlabModeEnabled() && this._inFlightSlabs.size > 0) {
+        const firstSlab = Math.floor(offset / this.slabSize);
+        const lastSlab = Math.floor((offset + length - 1) / this.slabSize);
+        for (let s = firstSlab; s <= lastSlab; s += 1) {
+          if (this._inFlightSlabs.has(this._slabKey(url, s))) {
+            return true;
+          }
+        }
+      }
+      if (this._inFlightChunks.size > 0) {
+        const firstChunk = Math.floor(offset / this.chunkSize);
+        const lastChunk = Math.floor((offset + length - 1) / this.chunkSize);
+        for (let c = firstChunk; c <= lastChunk; c += 1) {
+          if (this._inFlightChunks.has(this._chunkKey(url, c))) {
+            return true;
+          }
+        }
+      }
+      return false;
+    }
+
+    tryReadIntoSync(url, offset, length, dst, dstOffset = 0) {
+      if (
+        !Number.isInteger(offset) ||
+        offset < 0 ||
+        !Number.isInteger(length) ||
+        length < 0 ||
+        !(dst instanceof Uint8Array) ||
+        !Number.isInteger(dstOffset) ||
+        dstOffset < 0 ||
+        dstOffset > dst.byteLength
+      ) {
+        return -1;
+      }
+      if (length === 0) {
+        return 0;
+      }
+      if (this._getNegative(url) !== null) {
+        return -1;
+      }
+
+      let effectiveLen = Math.min(length, dst.byteLength - dstOffset);
+      if (effectiveLen <= 0) {
+        return 0;
+      }
+      const meta = this._touchMeta(url);
+      if (meta && Number.isSafeInteger(meta.size)) {
+        if (offset >= meta.size) {
+          return 0;
+        }
+        effectiveLen = Math.min(effectiveLen, meta.size - offset);
+        if (effectiveLen <= 0) {
+          return 0;
+        }
+      }
+
+      if (this._isSlabModeEnabled() && this._slabs.size > 0) {
+        const firstSlab = Math.floor(offset / this.slabSize);
+        const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
+        if (firstSlab === lastSlab) {
+          const key = this._slabKey(url, firstSlab);
+          const slab = this._touchSlab(key);
+          if (slab === null) {
+            return -1;
+          }
+          this._stats.slabHits += 1;
+          if (this._prefetchedSlabKeys.delete(key)) {
+            this._stats.prefetchHits += 1;
+          }
+          const slabStart = firstSlab * this.slabSize;
+          const sliceStart = offset - slabStart;
+          const sliceEnd = Math.min(slab.byteLength, sliceStart + effectiveLen);
+          const written = sliceEnd > sliceStart ? sliceEnd - sliceStart : 0;
+          if (written > 0) {
+            dst.set(slab.subarray(sliceStart, sliceEnd), dstOffset);
+            this._stats.bytesServedFromCache += written;
+          }
+          if (this.prefetchAheadSlabs > 0) {
+            this._recordSequentialAccess(url, offset, effectiveLen, lastSlab);
+          }
+          return written;
+        }
+
+        for (let s = firstSlab; s <= lastSlab; s += 1) {
+          if (!this._slabs.has(this._slabKey(url, s))) {
+            return -1;
+          }
+        }
+        let totalWritten = 0;
+        for (let s = firstSlab; s <= lastSlab; s += 1) {
+          const key = this._slabKey(url, s);
+          const slab = this._touchSlab(key);
+          this._stats.slabHits += 1;
+          if (this._prefetchedSlabKeys.delete(key)) {
+            this._stats.prefetchHits += 1;
+          }
+          if (!slab || slab.byteLength === 0) {
+            break;
+          }
+          const slabStart = s * this.slabSize;
+          const sliceStart = Math.max(0, offset - slabStart);
+          const sliceEnd = Math.min(slab.byteLength, offset + effectiveLen - slabStart);
+          if (sliceEnd > sliceStart) {
+            dst.set(slab.subarray(sliceStart, sliceEnd), dstOffset + totalWritten);
+            totalWritten += sliceEnd - sliceStart;
+          }
+          if (slab.byteLength < this.slabSize) {
+            break;
+          }
+        }
+        if (totalWritten > 0) {
+          this._stats.bytesServedFromCache += totalWritten;
+        }
+        if (this.prefetchAheadSlabs > 0) {
+          this._recordSequentialAccess(url, offset, effectiveLen, lastSlab);
+        }
+        return totalWritten;
+      }
+
+      if (this._chunks.size > 0) {
+        const firstChunk = Math.floor(offset / this.chunkSize);
+        const lastChunk = Math.floor((offset + effectiveLen - 1) / this.chunkSize);
+        for (let c = firstChunk; c <= lastChunk; c += 1) {
+          if (!this._chunks.has(this._chunkKey(url, c))) {
+            return -1;
+          }
+        }
+        let totalWritten = 0;
+        for (let c = firstChunk; c <= lastChunk; c += 1) {
+          const chunk = this._touchChunk(this._chunkKey(url, c));
+          this._stats.chunkHits += 1;
+          if (!chunk || chunk.byteLength === 0) {
+            break;
+          }
+          const chunkStart = c * this.chunkSize;
+          const sliceStart = Math.max(0, offset - chunkStart);
+          const sliceEnd = Math.min(chunk.byteLength, offset + effectiveLen - chunkStart);
+          if (sliceEnd > sliceStart) {
+            dst.set(chunk.subarray(sliceStart, sliceEnd), dstOffset + totalWritten);
+            totalWritten += sliceEnd - sliceStart;
+          }
+          if (chunk.byteLength < this.chunkSize) {
+            break;
+          }
+        }
+        if (totalWritten > 0) {
+          this._stats.bytesServedFromCache += totalWritten;
+        }
+        return totalWritten;
+      }
+
+      return -1;
+    }
+
+    async readInto(url, offset, length, dst, dstOffset = 0) {
+      if (!Number.isInteger(offset) || offset < 0) {
+        throw createErrnoError(-22, `Invalid read offset: ${offset}`);
+      }
+      if (!Number.isInteger(length) || length < 0) {
+        throw createErrnoError(-22, `Invalid read length: ${length}`);
+      }
+      if (!(dst instanceof Uint8Array) || !Number.isInteger(dstOffset) || dstOffset < 0 || dstOffset > dst.byteLength) {
+        throw createErrnoError(-22, 'Invalid destination buffer for readInto');
+      }
+      if (length === 0) {
+        return 0;
+      }
+
+      const neg = this._getNegative(url);
+      if (neg !== null) {
+        this._stats.negativeHits += 1;
+        throw this._makeHttpError(neg.status || 404, url, `${offset}..${offset + length - 1}`);
+      }
+
+      let effectiveLen = Math.min(length, dst.byteLength - dstOffset);
+      if (effectiveLen <= 0) {
+        return 0;
+      }
+      const meta = this._touchMeta(url);
+      if (meta && Number.isSafeInteger(meta.size)) {
+        if (offset >= meta.size) {
+          return 0;
+        }
+        effectiveLen = Math.min(effectiveLen, meta.size - offset);
+        if (effectiveLen <= 0) {
+          return 0;
+        }
+      }
+
+      const syncWritten = this.tryReadIntoSync(url, offset, effectiveLen, dst, dstOffset);
+      if (syncWritten >= 0) {
+        return syncWritten;
+      }
+
+      if (this._isSlabModeEnabled()) {
+        const firstSlab = Math.floor(offset / this.slabSize);
+        const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
+        const cacheFlags = new Array(lastSlab - firstSlab + 1).fill(false);
+        const slabs = await this._getSlabRange(url, firstSlab, lastSlab, cacheFlags);
+
+        let totalWritten = 0;
+        for (let i = 0; i < slabs.length; i += 1) {
+          const slabIndex = firstSlab + i;
+          const slab = slabs[i];
+          if (!slab || slab.byteLength === 0) {
+            break;
+          }
+          const slabStart = slabIndex * this.slabSize;
+          const sliceStart = Math.max(0, offset - slabStart);
+          const sliceEnd = Math.min(slab.byteLength, offset + effectiveLen - slabStart);
+          if (sliceEnd > sliceStart) {
+            const len = sliceEnd - sliceStart;
+            dst.set(slab.subarray(sliceStart, sliceEnd), dstOffset + totalWritten);
+            totalWritten += len;
+            if (cacheFlags[i] || this._opfsL2HitBuffers.has(slab)) {
+              this._stats.bytesServedFromCache += len;
+            }
+          }
+          if (slab.byteLength < this.slabSize) {
+            break;
+          }
+        }
+        if (this.prefetchAheadSlabs > 0) {
+          this._recordSequentialAccess(url, offset, effectiveLen, lastSlab);
+        }
+        return totalWritten;
+      }
+
+      const firstChunk = Math.floor(offset / this.chunkSize);
+      const lastChunk = Math.floor((offset + effectiveLen - 1) / this.chunkSize);
+      const chunks = await this._getChunkRange(url, firstChunk, lastChunk);
+
+      let totalWritten = 0;
+      for (let i = 0; i < chunks.length; i += 1) {
+        const chunkIndex = firstChunk + i;
+        const chunk = chunks[i];
+        if (!chunk || chunk.byteLength === 0) {
+          break;
+        }
+        const chunkStart = chunkIndex * this.chunkSize;
+        const sliceStart = Math.max(0, offset - chunkStart);
+        const sliceEnd = Math.min(chunk.byteLength, offset + effectiveLen - chunkStart);
+        if (sliceEnd > sliceStart) {
+          const len = sliceEnd - sliceStart;
+          dst.set(chunk.subarray(sliceStart, sliceEnd), dstOffset + totalWritten);
+          totalWritten += len;
+          if (this._opfsL2HitBuffers.has(chunk)) {
+            this._stats.bytesServedFromCache += len;
+          }
+        }
+        if (chunk.byteLength < this.chunkSize) {
+          break;
+        }
+      }
+      return totalWritten;
     }
 
     tryReadSync(url, offset, length, options = {}) {
@@ -3655,6 +4049,30 @@
       if (this._isSlabModeEnabled() && this._slabs.size > 0) {
         const firstSlab = Math.floor(offset / this.slabSize);
         const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
+        if (firstSlab === lastSlab) {
+          const key = this._slabKey(url, firstSlab);
+          const slab = this._touchSlab(key);
+          if (slab === null) {
+            return null;
+          }
+          this._stats.slabHits += 1;
+          if (this._prefetchedSlabKeys.delete(key)) {
+            this._stats.prefetchHits += 1;
+          }
+          const slabStart = firstSlab * this.slabSize;
+          const sliceStart = offset - slabStart;
+          const sliceEnd = Math.min(slab.byteLength, sliceStart + effectiveLen);
+          const part =
+            sliceEnd > sliceStart ? slab.subarray(sliceStart, sliceEnd) : new Uint8Array(0);
+          if (part.byteLength > 0) {
+            this._stats.bytesServedFromCache += part.byteLength;
+          }
+          if (this.prefetchAheadSlabs > 0) {
+            this._recordSequentialAccess(url, offset, effectiveLen, lastSlab);
+          }
+          return copy ? part.slice() : part;
+        }
+
         let allSlabsPresent = true;
         for (let s = firstSlab; s <= lastSlab; s += 1) {
           if (!this._slabs.has(this._slabKey(url, s))) {
@@ -3666,8 +4084,12 @@
           const slices = [];
           let totalBytes = 0;
           for (let s = firstSlab; s <= lastSlab; s += 1) {
-            const slab = this._touchSlab(this._slabKey(url, s));
+            const key = this._slabKey(url, s);
+            const slab = this._touchSlab(key);
             this._stats.slabHits += 1;
+            if (this._prefetchedSlabKeys.delete(key)) {
+              this._stats.prefetchHits += 1;
+            }
             if (!slab || slab.byteLength === 0) {
               break;
             }
@@ -3682,6 +4104,9 @@
             if (slab.byteLength < this.slabSize) {
               break;
             }
+          }
+          if (totalBytes > 0) {
+            this._stats.bytesServedFromCache += totalBytes;
           }
           if (this.prefetchAheadSlabs > 0) {
             this._recordSequentialAccess(url, offset, effectiveLen, lastSlab);
@@ -3729,6 +4154,9 @@
             if (chunk.byteLength < this.chunkSize) {
               break;
             }
+          }
+          if (totalBytes > 0) {
+            this._stats.bytesServedFromCache += totalBytes;
           }
           if (!copy && slices.length === 1) {
             return slices[0];
@@ -3783,7 +4211,8 @@
       if (this._isSlabModeEnabled()) {
         const firstSlab = Math.floor(offset / this.slabSize);
         const lastSlab = Math.floor((offset + effectiveLen - 1) / this.slabSize);
-        const slabs = await this._getSlabRange(url, firstSlab, lastSlab);
+        const cacheFlags = new Array(lastSlab - firstSlab + 1).fill(false);
+        const slabs = await this._getSlabRange(url, firstSlab, lastSlab, cacheFlags);
 
         const slices = [];
         let totalBytes = 0;
@@ -3800,6 +4229,9 @@
             const part = slab.subarray(sliceStart, sliceEnd);
             slices.push(part);
             totalBytes += part.byteLength;
+            if (cacheFlags[i] || this._opfsL2HitBuffers.has(slab)) {
+              this._stats.bytesServedFromCache += part.byteLength;
+            }
           }
           if (slab.byteLength < this.slabSize) {
             break;
@@ -3839,6 +4271,9 @@
           const part = chunk.subarray(sliceStart, sliceEnd);
           slices.push(part);
           totalBytes += part.byteLength;
+          if (this._opfsL2HitBuffers.has(chunk)) {
+            this._stats.bytesServedFromCache += part.byteLength;
+          }
         }
         if (chunk.byteLength < this.chunkSize) {
           break;
@@ -3859,6 +4294,7 @@
     clear() {
       this._chunks.clear();
       this._slabs.clear();
+      this._prefetchedSlabKeys.clear();
       this._fileMeta.clear();
       this._fileFingerprints.clear();
       this._negativeCache.clear();
@@ -3872,9 +4308,14 @@
     }
 
     getStats() {
+      const cacheHits =
+        this._stats.chunkHits + this._stats.slabHits + this._stats.opfsL2Hits;
+      const cacheMisses = this._stats.chunkMisses + this._stats.slabMisses;
       return {
         hits: this._stats.chunkHits,
         misses: this._stats.chunkMisses,
+        cacheHits,
+        cacheMisses,
         slabCacheHits: this._stats.slabHits,
         slabCacheMisses: this._stats.slabMisses,
         slabEvictions: this._stats.slabEvictions,
@@ -3886,6 +4327,7 @@
         slabPrefetchesScheduled: this._stats.slabPrefetchesScheduled,
         slabPrefetchesCompleted: this._stats.slabPrefetchesCompleted,
         slabPrefetchErrors: this._stats.slabPrefetchErrors,
+        prefetchHits: this._stats.prefetchHits,
         prefetchAheadSlabs: this.prefetchAheadSlabs,
         maxConcurrentSlabFetches: this.maxConcurrentSlabFetches,
         activeSlabFetches: this._activeSlabFetches,
@@ -3895,7 +4337,10 @@
         negativeHits: this._stats.negativeHits,
         negativeEntries: this._negativeCache.size,
         inFlightCoalesced: this._stats.inFlightCoalesced,
+        inflightCoalesced: this._stats.inFlightCoalesced,
         networkFetches: this._stats.networkFetches,
+        bytesFetched: this._stats.bytesFetched,
+        bytesServedFromCache: this._stats.bytesServedFromCache,
         evictions: this._stats.evictions,
         opfsL2Hits: this._stats.opfsL2Hits,
         opfsL2Misses: this._stats.opfsL2Misses,
@@ -3956,6 +4401,7 @@
       fallbacks: 0,
       releases: 0,
       bytesFetched: 0,
+      bytesServedFromCache: 0,
       activeEntries: 0,
       activeBytes: 0,
       maxBytes:
@@ -4051,6 +4497,11 @@
       batchedRequests: streamingStats.batchedRequests,
       coalescedFetches: streamingStats.coalescedFetches,
       cacheHits: streamingStats.cacheHits,
+      cacheMisses: 0,
+      inflightCoalesced: immStats.inflightCoalesced,
+      prefetchHits: immStats.prefetchHits,
+      bytesFetched: 0,
+      bytesServedFromCache: 0,
       errorCount: streamingStats.errorCount,
       avgReadMs: streamingStats.avgReadMs,
       rangeCache: cacheStats,
@@ -4384,11 +4835,22 @@
         chunkSize: options.immutableCacheChunkSize,
         maxBytes: options.immutableCacheMaxBytes,
         slabSize:
-          options.slabSize !== undefined ? options.slabSize : options.immutableSlabSize,
+          options.slabSize !== undefined
+            ? options.slabSize
+            : options.immutableSlabSize !== undefined
+              ? options.immutableSlabSize
+              : options.blockSize,
         slabMaxBytes:
           options.slabMaxBytes !== undefined
             ? options.slabMaxBytes
-            : options.immutableSlabMaxBytes,
+            : options.immutableSlabMaxBytes !== undefined
+              ? options.immutableSlabMaxBytes
+              : options.maxRamCacheBytes !== undefined
+                ? options.maxRamCacheBytes
+                : Number.isFinite(options.recommendedSlabMaxBytes) &&
+                    options.recommendedSlabMaxBytes > 0
+                  ? options.recommendedSlabMaxBytes
+                  : undefined,
         slabCacheEnabled: options.slabCacheEnabled,
         slabProfile: options.slabProfile,
         prefetchAheadSlabs: options.prefetchAheadSlabs,
@@ -4443,6 +4905,7 @@
         fallbacks: 0,
         releases: 0,
         bytesFetched: 0,
+        bytesServedFromCache: 0,
       };
       this._dumpWriteStats = {
         dumpWritesCompleted: 0,
@@ -5312,6 +5775,9 @@
         if (hotImmutableBytes !== null) {
           return hotImmutableBytes;
         }
+        if (this.immutableCache.hasInFlightOverlap(group.route.url, group.offset, group.length)) {
+          return this.immutableCache.read(group.route.url, group.offset, group.length);
+        }
       }
       const cachePath = this._routeToCachePath(group.route);
       const cache = this.ensureRangeCache();
@@ -5368,6 +5834,12 @@
               : null;
           if (hotImmutableBytes !== null) {
             bytes = hotImmutableBytes;
+          } else if (
+            this.immutableCache &&
+            this._shouldUseImmutableCache(route) &&
+            this.immutableCache.hasInFlightOverlap(route.url, offset, length)
+          ) {
+            bytes = await this.immutableCache.read(route.url, offset, length);
           } else {
             bytes = await this._scheduledRead(this._routeToCachePath(route), offset, length, {
               priority,
@@ -5877,6 +6349,7 @@
           offset >= buf.byteLength
             ? new Uint8Array(0)
             : buf.subarray(offset, Math.min(buf.byteLength, offset + reqLen));
+        this._wholeFileStats.bytesServedFromCache += out.byteLength;
         this._recordReadSuccess(out.byteLength, Math.max(0, this._now() - startMs));
         return out;
       }
@@ -5956,6 +6429,7 @@
               const end = Math.min(buf.byteLength, offset + reqLen);
               bytes = buf.slice(offset, end);
             }
+            this._wholeFileStats.bytesServedFromCache += bytes.byteLength;
           } else if (entry.useImmutableCache) {
             const immCache = this.ensureImmutableCache();
             bytes = await immCache.read(entry.url, offset, reqLen);
@@ -6357,6 +6831,102 @@
           this._finishOpenResult(pending);
         }
 
+        _handleRead(handle, offsetBig, lengthBig, cap) {
+          // If host-side read-ahead was explicitly opted in, preserve base class path verbatim.
+          if (this._shared && this._shared.readAhead && this._shared.readAhead.enabled) {
+            return super._handleRead(handle, offsetBig, lengthBig, cap);
+          }
+          if (offsetBig > BigInt(Number.MAX_SAFE_INTEGER)) {
+            this.completeResponse(-22n, HttpfsStatus.Error);
+            return;
+          }
+          const offset = Number(offsetBig);
+          const reqLen = lengthBig > BigInt(cap) ? cap : Number(lengthBig);
+          const entry = controller._handles.get(handle);
+          if (!entry || entry.kind === 'dump_write') {
+            controller._streamingStats.errorCount += 1;
+            this.completeResponse(-9n, HttpfsStatus.Error);
+            return;
+          }
+          if (typeof this._getOrCreateHandleRecord === 'function') {
+            const rec = this._getOrCreateHandleRecord(handle, false);
+            if (rec) {
+              rec.reads += 1;
+              rec.lastOffset = offset;
+            }
+          }
+          if (reqLen === 0) {
+            controller._recordReadSuccess(0, 0);
+            this.completeResponse(0n, HttpfsStatus.ResponseReady);
+            return;
+          }
+
+          const startMs = controller._now();
+
+          // Direct zero-copy write into SAB payload view for whole-file buffered assets (.pgim / manifests).
+          if (entry.wholeFileBytes !== null && entry.wholeFileBytes !== undefined) {
+            controller._wholeFileStats.hits += 1;
+            const buf = entry.wholeFileBytes;
+            let copied = 0;
+            if (offset < buf.byteLength) {
+              const end = Math.min(buf.byteLength, offset + reqLen);
+              copied = end - offset;
+              if (copied > 0) {
+                this._payloadView.set(buf.subarray(offset, end), 0);
+              }
+            }
+            controller._wholeFileStats.bytesServedFromCache += copied;
+            controller._recordReadSuccess(copied, Math.max(0, controller._now() - startMs));
+            this.completeResponse(BigInt(copied), HttpfsStatus.ResponseReady);
+            return;
+          }
+
+          // Direct zero-copy write into SAB payload view for ImmutableHttpfsCache handles (zero slice/Uint8Array allocs).
+          if (entry.kind === 'direct' && entry.useImmutableCache && !entry.wholeFilePending) {
+            const immCache = controller.immutableCache;
+            if (immCache) {
+              const syncWritten = immCache.tryReadIntoSync(
+                entry.url,
+                offset,
+                reqLen,
+                this._payloadView,
+                0,
+              );
+              if (syncWritten >= 0) {
+                if (entry.size === null) {
+                  const learnedSize = immCache.getFileSize(entry.url);
+                  if (Number.isSafeInteger(learnedSize)) {
+                    entry.size = learnedSize;
+                  }
+                }
+                controller._recordReadSuccess(syncWritten, Math.max(0, controller._now() - startMs));
+                this.completeResponse(BigInt(syncWritten), HttpfsStatus.ResponseReady);
+                return;
+              }
+            }
+
+            const ensuredImm = controller.ensureImmutableCache();
+            return ensuredImm.readInto(entry.url, offset, reqLen, this._payloadView, 0).then(
+              (written) => {
+                if (entry.size === null) {
+                  const learnedSize = ensuredImm.getFileSize(entry.url);
+                  if (Number.isSafeInteger(learnedSize)) {
+                    entry.size = learnedSize;
+                  }
+                }
+                controller._recordReadSuccess(written, Math.max(0, controller._now() - startMs));
+                this.completeResponse(BigInt(written), HttpfsStatus.ResponseReady);
+              },
+              (err) => {
+                controller._recordReadError(err);
+                this.completeResponse(BigInt(mapErrorToErrno(err, -5)), HttpfsStatus.Error);
+              },
+            );
+          }
+
+          return super._handleRead(handle, offsetBig, lengthBig, cap);
+        }
+
         _dispatchOnce() {
           const status = Atomics.load(this._statusView, 0);
           if (status !== HttpfsStatus.RequestReady) {
@@ -6565,6 +7135,7 @@
         fallbacks: this._wholeFileStats.fallbacks,
         releases: this._wholeFileStats.releases,
         bytesFetched: this._wholeFileStats.bytesFetched,
+        bytesServedFromCache: this._wholeFileStats.bytesServedFromCache || 0,
         activeEntries: this._activeWholeFiles.size,
         activeBytes: activeWholeFileBytes,
         maxBytes: this._wholeFileMaxBytes,
@@ -6593,6 +7164,28 @@
         (Number.isFinite(immutableCacheStats.slabCacheHits) ? immutableCacheStats.slabCacheHits : 0) +
         (Number.isFinite(immutableCacheStats.opfsL2Hits) ? immutableCacheStats.opfsL2Hits : 0) +
         (Number.isFinite(wholeFileStats.hits) ? wholeFileStats.hits : 0);
+      const totalCacheMisses =
+        (Number.isFinite(cacheStats.misses) ? cacheStats.misses : 0) +
+        (Number.isFinite(immutableCacheStats.misses) ? immutableCacheStats.misses : 0) +
+        (Number.isFinite(immutableCacheStats.slabCacheMisses)
+          ? immutableCacheStats.slabCacheMisses
+          : 0);
+      const totalInflightCoalesced = Number.isFinite(immutableCacheStats.inFlightCoalesced)
+        ? immutableCacheStats.inFlightCoalesced
+        : 0;
+      const totalPrefetchHits = Number.isFinite(immutableCacheStats.prefetchHits)
+        ? immutableCacheStats.prefetchHits
+        : 0;
+      const totalBytesFetched =
+        (Number.isFinite(immutableCacheStats.bytesFetched) ? immutableCacheStats.bytesFetched : 0) +
+        (Number.isFinite(wholeFileStats.bytesFetched) ? wholeFileStats.bytesFetched : 0);
+      const totalBytesServedFromCache =
+        (Number.isFinite(immutableCacheStats.bytesServedFromCache)
+          ? immutableCacheStats.bytesServedFromCache
+          : 0) +
+        (Number.isFinite(wholeFileStats.bytesServedFromCache)
+          ? wholeFileStats.bytesServedFromCache
+          : 0);
       const readsCompleted = this._streamingStats.readsCompleted;
       const avgReadMs =
         readsCompleted > 0 ? this._streamingStats.totalReadMs / readsCompleted : 0;
@@ -6630,12 +7223,17 @@
         dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
         dumpBytesWritten: dumpWriteStats.dumpBytesWritten,
         dumpWriteErrors: dumpWriteStats.dumpWriteErrors,
-        // Top-level streaming & batched range dispatch telemetry (W219)
+        // Top-level streaming & batched range dispatch telemetry (W219 / W356)
         readsCompleted: streamingStats.readsCompleted,
         bytesTransferred: streamingStats.bytesTransferred,
         batchedRequests: streamingStats.batchedRequests,
         coalescedFetches: streamingStats.coalescedFetches,
         cacheHits: streamingStats.cacheHits,
+        cacheMisses: totalCacheMisses,
+        inflightCoalesced: totalInflightCoalesced,
+        prefetchHits: totalPrefetchHits,
+        bytesFetched: totalBytesFetched,
+        bytesServedFromCache: totalBytesServedFromCache,
         errorCount: streamingStats.errorCount,
         avgReadMs: streamingStats.avgReadMs,
         // Detailed subsystem telemetry
@@ -6675,6 +7273,7 @@
         fallbacks: 0,
         releases: 0,
         bytesFetched: 0,
+        bytesServedFromCache: 0,
       };
       this._dumpWriteStats = {
         dumpWritesCompleted: 0,
@@ -6779,13 +7378,20 @@
           ? opts.slabSize
           : opts.immutableSlabSize !== undefined
             ? opts.immutableSlabSize
-            : this._immutableCacheOptions.slabSize;
+            : opts.blockSize !== undefined
+              ? opts.blockSize
+              : this._immutableCacheOptions.slabSize;
       const resolvedSlabMaxBytes =
         opts.slabMaxBytes !== undefined
           ? opts.slabMaxBytes
           : opts.immutableSlabMaxBytes !== undefined
             ? opts.immutableSlabMaxBytes
-            : this._immutableCacheOptions.slabMaxBytes;
+            : opts.maxRamCacheBytes !== undefined
+              ? opts.maxRamCacheBytes
+              : Number.isFinite(opts.recommendedSlabMaxBytes) &&
+                  opts.recommendedSlabMaxBytes > 0
+                ? opts.recommendedSlabMaxBytes
+                : this._immutableCacheOptions.slabMaxBytes;
       const resolvedSlabEnabled =
         opts.slabCacheEnabled !== undefined
           ? opts.slabCacheEnabled
@@ -7271,7 +7877,9 @@
     MAX_SLAB_SIZE,
     MAX_SLAB_CACHE_BYTES,
     DEFAULT_SLAB_PREFETCH_AHEAD,
+    DEFAULT_AUTO_PREFETCH_MIN_SLAB_SIZE,
     DEFAULT_MAX_CONCURRENT_SLAB_FETCHES,
+    DEFAULT_SEQUENTIAL_THRESHOLD_READS,
     SLAB_TUNING_PROFILES,
     VIDEO_STREAM_SLAB_PRESET,
     DEFAULT_NEGATIVE_CACHE_TTL_MS,
