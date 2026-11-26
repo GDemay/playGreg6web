@@ -1250,6 +1250,15 @@ void setup_bink_counters(BootState& b) {
     if (b.arena == nullptr) {
         return;
     }
+    struct FallbackLog {
+        const BootState& b;
+        ~FallbackLog() {
+            if (!b.bink_present) {
+                logf("guest boot: no lifted Bink2Scarlett.dll in this program: Bink imports use the no-decoder "
+                     "pg6_mw_bink_* shim fallback (movies are refused)");
+            }
+        }
+    } fallback_log{b};
     for (const ModuleState& m : b.modules) {
         if (!m.loaded || m.image.base == 0 || os::win32::canonical_module_name(m.name) != "bink2scarlett.dll") {
             continue;
@@ -1263,6 +1272,9 @@ void setup_bink_counters(BootState& b) {
         for (const PeExport& e : exports) {
             const os::win32::ExportLookup lookup =
                 handle != 0 ? os::win32::LookupExport(handle, e.name) : os::win32::ExportLookup{};
+            if (handle == 0 || lookup.address == 0) {
+                continue;  // not in the registry at all: neither lifted nor shim
+            }
             (lookup.guest ? b.bink_exports_lifted : b.bink_exports_shim) += 1;
         }
         const size_t n = exports.size();
@@ -3975,7 +3987,6 @@ BootResult run_boot(const BootConfig& config) {
          b.functions_registered, b.tables.size(), b.shard_table_count, shard_dispatch_shard_count(),
          b.imports.size(), b.imports_bound, b.imports_unresolved,
          b.survey ? " [survey mode]" : "");
-    setup_bink_counters(b);
     if (!config.export_thunks.empty()) {
         const ExportThunkStats exports = register_export_thunks(config.export_thunks);
         logf("guest boot: %zu export thunks: %zu new guest-callable entries, %zu sharing an existing "
@@ -3991,6 +4002,9 @@ BootResult run_boot(const BootConfig& config) {
             return finish();
         }
     }
+    // After after_load: the guest modules and their exports enter the module registry there, so the
+    // lifted/shim classification of Bink2Scarlett.dll's exports is only meaningful from here on.
+    setup_bink_counters(b);
     // R11 unwinder: every image's .pdata (RtlLookupFunctionEntry, exception dispatch, backtraces),
     // unless after_load (R12's register_program_modules) registered it already.
     for (ModuleState& m : b.modules) {
