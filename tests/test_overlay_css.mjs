@@ -612,3 +612,30 @@ test('W232/W252 web/ui/overlay.css provides smooth fade-out helpers and Astryx-m
     );
   }
 });
+
+test('viewport preserves 16:9 console aspect ratio with object-fit: contain and pure black letterbox background', () => {
+  const viewportBody = findRuleBody(parsedCss.rules, '#viewport');
+  assert.ok(viewportBody.length > 0, 'Expected #viewport rule in web/ui/overlay.css');
+  assert.match(viewportBody, /\bposition\s*:\s*fixed\s*;/);
+  assert.match(viewportBody, /\binset\s*:\s*0\s*;/);
+  assert.match(viewportBody, /\bwidth\s*:\s*100%\s*;/);
+  assert.match(viewportBody, /\bheight\s*:\s*100%\s*;/);
+  assert.match(
+    viewportBody,
+    /\bobject-fit\s*:\s*contain\s*;/,
+    '#viewport must declare "object-fit: contain;" to prevent non-uniform 16:9 stretching across wide windows'
+  );
+  assert.match(viewportBody, /\bobject-position\s*:\s*center\s*;/);
+  assert.match(
+    viewportBody,
+    /\bbackground\s*:\s*#000(?:000)?\s*;/i,
+    '#viewport must use pure black #000 letterbox/pillarbox background'
+  );
+
+  const fullscreenBody = findRuleBody(parsedCss.rules, '#viewport:fullscreen');
+  assert.match(fullscreenBody, /\bobject-fit\s*:\s*contain\s*;/);
+  assert.match(fullscreenBody, /\bbackground\s*:\s*#000(?:000)?\s*;/i);
+
+  const backdropBody = findRuleBody(parsedCss.rules, '#viewport::backdrop');
+  assert.match(backdropBody, /\bbackground\s*:\s*#000(?:000)?\s*;/i);
+});

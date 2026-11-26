@@ -132,6 +132,56 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 }
 `.trim();
 
+  const BLIT_SRGB_ENCODE_WGSL = /* wgsl */ `
+struct BlitVsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> BlitVsOut {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>(3.0, -1.0),
+    vec2<f32>(-1.0, 3.0)
+  );
+  var uv = array<vec2<f32>, 3>(
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(2.0, 1.0),
+    vec2<f32>(0.0, -1.0)
+  );
+  var out: BlitVsOut;
+  out.pos = vec4<f32>(pos[vid], 0.0, 1.0);
+  out.uv = uv[vid];
+  return out;
+}
+
+@group(0) @binding(0) var blit_tex: texture_2d<f32>;
+@group(0) @binding(1) var blit_sampler: sampler;
+
+fn linear_to_srgb_channel(v: f32) -> f32 {
+  let c = clamp(v, 0.0, 1.0);
+  if (c <= 0.0031308) {
+    return c * 12.92;
+  }
+  return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+fn linear_to_srgb(rgb: vec3<f32>) -> vec3<f32> {
+  return vec3<f32>(
+    linear_to_srgb_channel(rgb.r),
+    linear_to_srgb_channel(rgb.g),
+    linear_to_srgb_channel(rgb.b)
+  );
+}
+
+@fragment
+fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
+  let sampled = textureSample(blit_tex, blit_sampler, in.uv);
+  return vec4<f32>(linear_to_srgb(sampled.rgb), sampled.a);
+}
+`.trim();
+
   const BLIT_TONEMAP_WGSL = /* wgsl */ `
 struct BlitVsOut {
   @builtin(position) pos: vec4<f32>,
@@ -218,11 +268,35 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     return typeof format === 'string' && VALID_CANVAS_FORMAT_SET.has(format);
   }
 
+  function isSrgbFormat(format) {
+    if (typeof format !== 'string' || format.length === 0) {
+      return false;
+    }
+    return format.trim().toLowerCase().endsWith('-srgb');
+  }
+
   function isHdrStreamFormat(format) {
     if (typeof format !== 'string' || format.length === 0) {
       return false;
     }
     return HDR_STREAM_FORMAT_SET.has(format.trim().toLowerCase());
+  }
+
+  function isHdrToneMapBlitRequested(
+    streamFormat,
+    canvasFormat,
+    toneMapMode,
+    exposure,
+    applySrgbEncodeOverride
+  ) {
+    return Boolean(
+      streamFormat === 'rgba16float' &&
+        SDR_NON_SRGB_CANVAS_FORMAT_SET.has(canvasFormat) &&
+        (toneMapMode === 'reinhard' ||
+          toneMapMode === 'aces' ||
+          exposure !== DEFAULT_EXPOSURE ||
+          applySrgbEncodeOverride === true)
+    );
   }
 
   function normalizeToneMapMode(mode) {
@@ -676,10 +750,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       }
 
       if (typeof streamFormat === 'string' && streamFormat.length > 0) {
-        const forceHdrToneMapBlit =
-          streamFormat === 'rgba16float' &&
-          SDR_NON_SRGB_CANVAS_FORMAT_SET.has(resolvedCanvasFormat) &&
-          (resolvedToneMapMode === 'reinhard' || resolvedToneMapMode === 'aces');
+        const forceHdrToneMapBlit = isHdrToneMapBlitRequested(
+          streamFormat,
+          resolvedCanvasFormat,
+          resolvedToneMapMode,
+          resolvedExposure,
+          resolvedApplySrgbEncode
+        );
         if (isValidCanvasFormat(streamFormat) && !forceHdrToneMapBlit) {
           resolvedCanvasFormat = streamFormat;
           resolvedStreamFormat = streamFormat;
@@ -743,6 +820,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._intermediateTextureView = null;
       this._intermediateTextureMeta = null;
       this._blitShaderModule = null;
+      this._blitSrgbShaderModule = null;
       this._blitSampler = null;
       this._blitPipeline = null;
       this._blitPipelineMeta = null;
@@ -1185,6 +1263,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._blitPipeline = null;
       this._blitPipelineMeta = null;
       this._blitShaderModule = null;
+      this._blitSrgbShaderModule = null;
       this._blitSampler = null;
       this._toneMapPipeline = null;
       this._toneMapPipelineMeta = null;
@@ -1210,9 +1289,15 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       if (this._applySrgbEncodeOverride !== null) {
         return this._applySrgbEncodeOverride;
       }
-      return (
-        isHdrStreamFormat(sourceFormat) && SDR_NON_SRGB_CANVAS_FORMAT_SET.has(this._format)
-      );
+      if (!SDR_NON_SRGB_CANVAS_FORMAT_SET.has(this._format)) {
+        return false;
+      }
+      // Sampling an `*-srgb` intermediate texture performs hardware sRGB -> linear decode, and
+      // linear HDR formats (`rgba16float`, `rgb10a2unorm`, `rg11b10ufloat`, ...) already carry
+      // linear values. When presenting onto a non-sRGB SDR canvas (`bgra8unorm` / `rgba8unorm`),
+      // exact IEC 61966-2-1 linear -> sRGB encoding MUST run once so midtones are never double-gamma
+      // crushed (~x^4.84) and pre-encoded SDR (`bgra8unorm` / `rgba8unorm`) is never double-encoded.
+      return isHdrStreamFormat(sourceFormat) || isSrgbFormat(sourceFormat);
     }
 
     _shouldUseToneMapPipeline(sourceFormat = this._streamFormat) {
@@ -1220,7 +1305,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         this._toneMapMode === 'reinhard' ||
         this._toneMapMode === 'aces' ||
         this._exposure !== DEFAULT_EXPOSURE ||
-        this._applySrgbEncodeOverride === true;
+        this._resolveEffectiveApplySrgbEncode(sourceFormat);
       if (!wantsToneMap) {
         return false;
       }
@@ -1524,42 +1609,68 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       return texture;
     }
 
-    _ensureBlitPipeline() {
+    _ensureBlitPipeline(applySrgb = false) {
+      const needsSrgbEncode = Boolean(applySrgb);
       const meta = this._blitPipelineMeta;
+      const activeShaderModule = needsSrgbEncode
+        ? this._blitSrgbShaderModule
+        : this._blitShaderModule;
       if (
         this._blitPipeline &&
-        this._blitShaderModule &&
+        activeShaderModule &&
         this._blitSampler &&
         meta &&
         meta.device === this._device &&
-        meta.canvasFormat === this._format
+        meta.canvasFormat === this._format &&
+        meta.applySrgb === needsSrgbEncode
       ) {
         return this._blitPipeline;
       }
 
       if (!meta || meta.device !== this._device) {
-        this._blitShaderModule = this._device.createShaderModule({
-          label: 'playgta6-swapchain-blit-wgsl',
-          code: BLIT_FULLSCREEN_WGSL,
-        });
-        this._blitSampler = this._device.createSampler({
-          label: 'playgta6-swapchain-blit-sampler',
-          magFilter: 'linear',
-          minFilter: 'linear',
-          addressModeU: 'clamp-to-edge',
-          addressModeV: 'clamp-to-edge',
-        });
+        this._blitShaderModule = null;
+        this._blitSrgbShaderModule = null;
+        if (!this._blitSampler || (meta && meta.device !== this._device)) {
+          this._blitSampler = this._device.createSampler({
+            label: 'playgta6-swapchain-blit-sampler',
+            magFilter: 'linear',
+            minFilter: 'linear',
+            addressModeU: 'clamp-to-edge',
+            addressModeV: 'clamp-to-edge',
+          });
+        }
+      }
+
+      let shaderModule;
+      if (needsSrgbEncode) {
+        if (!this._blitSrgbShaderModule) {
+          this._blitSrgbShaderModule = this._device.createShaderModule({
+            label: 'playgta6-swapchain-blit-srgb-wgsl',
+            code: BLIT_SRGB_ENCODE_WGSL,
+          });
+        }
+        shaderModule = this._blitSrgbShaderModule;
+      } else {
+        if (!this._blitShaderModule) {
+          this._blitShaderModule = this._device.createShaderModule({
+            label: 'playgta6-swapchain-blit-wgsl',
+            code: BLIT_FULLSCREEN_WGSL,
+          });
+        }
+        shaderModule = this._blitShaderModule;
       }
 
       this._blitPipeline = this._device.createRenderPipeline({
-        label: 'playgta6-swapchain-blit-pipeline',
+        label: needsSrgbEncode
+          ? 'playgta6-swapchain-blit-srgb-pipeline'
+          : 'playgta6-swapchain-blit-pipeline',
         layout: 'auto',
         vertex: {
-          module: this._blitShaderModule,
+          module: shaderModule,
           entryPoint: 'vs_main',
         },
         fragment: {
-          module: this._blitShaderModule,
+          module: shaderModule,
           entryPoint: 'fs_main',
           targets: [{ format: this._format }],
         },
@@ -1571,6 +1682,7 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       this._blitPipelineMeta = {
         device: this._device,
         canvasFormat: this._format,
+        applySrgb: needsSrgbEncode,
       };
       this._invalidateBlitBindGroup();
       return this._blitPipeline;
@@ -2058,9 +2170,13 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
 
       const forceBlit = Boolean(
         (options && typeof options === 'object' && options.forceBlit) ||
-          (streamFormat === 'rgba16float' &&
-            SDR_NON_SRGB_CANVAS_FORMAT_SET.has(this._format) &&
-            (this._toneMapMode === 'reinhard' || this._toneMapMode === 'aces'))
+          isHdrToneMapBlitRequested(
+            streamFormat,
+            this._format,
+            this._toneMapMode,
+            this._exposure,
+            this._applySrgbEncodeOverride
+          )
       );
 
       if (isValidCanvasFormat(streamFormat) && !forceBlit) {
@@ -2348,7 +2464,14 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         }
       }
       if (config.streamFormat !== undefined) {
-        if (isValidCanvasFormat(config.streamFormat)) {
+        const forceHdrToneMapBlit = isHdrToneMapBlitRequested(
+          config.streamFormat,
+          this._format,
+          this._toneMapMode,
+          this._exposure,
+          this._applySrgbEncodeOverride
+        );
+        if (isValidCanvasFormat(config.streamFormat) && !forceHdrToneMapBlit) {
           if (this._format !== config.streamFormat) {
             this._blitPipeline = null;
             this._blitPipelineMeta = null;
@@ -2585,7 +2708,8 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
         const uniformBuffer = this._ensureToneMapUniformBuffer(sourceFormat);
         bindGroup = this._ensureToneMapBindGroup(sourceView, this._blitSampler, uniformBuffer);
       } else {
-        pipeline = this._ensureBlitPipeline();
+        const applySrgb = this._resolveEffectiveApplySrgbEncode(sourceFormat);
+        pipeline = this._ensureBlitPipeline(applySrgb);
         bindGroup = this._ensureBlitBindGroup(sourceView, this._blitSampler);
       }
 
@@ -3535,8 +3659,10 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
     DEFAULT_TONE_MAP_MODE,
     DEFAULT_EXPOSURE,
     BLIT_FULLSCREEN_WGSL,
+    BLIT_SRGB_ENCODE_WGSL,
     BLIT_TONEMAP_WGSL,
     isValidCanvasFormat,
+    isSrgbFormat,
     isHdrStreamFormat,
     normalizeToneMapMode,
     normalizeExposure,
