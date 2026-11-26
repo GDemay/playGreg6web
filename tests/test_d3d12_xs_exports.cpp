@@ -14,6 +14,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <limits>
 #include <set>
 #include <string>
 #include <thread>
@@ -7614,6 +7615,526 @@ void test_streaming_texture_hash_skip() {
     playgta6::os::set_write_tracking(true);
 }
 
+// G84 (#1749): Non-blocking GPU->CPU readback ring hardening: typed readbacks (occlusion queries,
+// GPU pass timestamps, compute readbacks), non-blocking try_poll_slot / is_complete / drain,
+// batched completions, bounded ring overflow accounting, zero-byte ranges, 32-bit->64-bit counter
+// wraparound monotonicity, diagnostic timeout once per held signal, FIFO release order, re-entrant
+// callbacks + deadlock-free teardown with pending signals, and concurrent producer/consumer stress.
+void test_g84_readback_ring_hardening() {
+    auto wait_for = [](auto pred) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return pred();
+    };
+
+    // 1) Typed readback ring, non-blocking polling, batched completions, zero-byte ranges, overflow.
+    {
+        dg::ReadbackGate gate(/*hold=*/true, std::chrono::milliseconds(5000), /*ring_capacity=*/16);
+        CHECK(gate.ring_capacity() == 16);
+        CHECK(gate.pending_count() == 0 && gate.completed_count() == 0);
+        CHECK(gate.is_complete(0));
+        dg::ReadbackSlot zero_slot{};
+        CHECK(gate.try_poll_slot(0, &zero_slot) && zero_slot.completed);
+
+        const auto occ = gate.issue_occlusion_query(0x10000, 8, /*query_index=*/7);
+        const auto ts = gate.issue_timestamp_query(0x10010, 16, /*pass_id=*/42);
+        const auto comp = gate.issue_compute_readback(0x10020, 256, /*tag=*/99);
+        const uint64_t zero_seq = gate.issue64(0, 0, dg::ReadbackKind::Buffer, 5);
+        CHECK(occ.seq == 1 && occ.kind == dg::ReadbackKind::OcclusionQuery && occ.tag == 7 && !occ.completed);
+        CHECK(ts.seq == 2 && ts.kind == dg::ReadbackKind::TimestampQuery && ts.tag == 42);
+        CHECK(comp.seq == 3 && comp.kind == dg::ReadbackKind::ComputeReadback && comp.tag == 99);
+        CHECK(zero_seq == 4);
+        CHECK(gate.pending_count() == 4 && !gate.is_complete(1));
+
+        // Non-blocking poll returns immediately when still pending.
+        dg::ReadbackSlot polled{};
+        CHECK(!gate.try_poll_slot(occ.seq, &polled));
+        CHECK(polled.seq == occ.seq && !polled.completed && polled.kind == dg::ReadbackKind::OcclusionQuery);
+        std::vector<dg::ReadbackSlot> drained;
+        CHECK(gate.drain_completed_slots(&drained) == 0 && drained.empty());
+
+        // Park FIFO signals behind specific sequence watermarks.
+        std::vector<int> release_order;
+        std::mutex order_mu;
+        auto record_sig = [&](int id) {
+            return [&, id] {
+                std::lock_guard<std::mutex> lk(order_mu);
+                release_order.push_back(id);
+                // Re-entering stats() inside a release callback must never deadlock.
+                (void)gate.stats();
+            };
+        };
+        CHECK(gate.park(record_sig(1)));
+        const uint64_t tex_seq = gate.issue64(0x20000, 64, dg::ReadbackKind::Texture, 11);
+        CHECK(tex_seq == 5);
+        CHECK(gate.park(record_sig(2)));
+        CHECK(gate.stats().signals_pending == 2);
+
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(gate.done_address()));
+
+        // Partial completion (+1): occlusion query ready, others still pending, signals still held.
+        done->fetch_add(1, std::memory_order_release);
+        CHECK(gate.is_complete(occ.seq) && !gate.is_complete(ts.seq));
+        CHECK(gate.try_poll_slot(occ.seq, &polled) && polled.completed && polled.tag == 7);
+        CHECK(gate.drain_completed_slots(&drained, 1) == 1);
+        CHECK(drained.size() == 1 && drained[0].seq == 1 && drained[0].kind == dg::ReadbackKind::OcclusionQuery);
+        CHECK(gate.poll() == 0);
+
+        // Batched completion (+3): reaches seq 4 -> releases signal 1, signal 2 stays held for seq 5.
+        done->fetch_add(3, std::memory_order_release);
+        CHECK(gate.poll() == 1);
+        CHECK(gate.is_complete(zero_seq) && !gate.is_complete(tex_seq));
+        drained.clear();
+        CHECK(gate.drain_completed_slots(&drained) == 3);
+        CHECK(drained.size() == 3 && drained[0].seq == 2 && drained[1].seq == 3 && drained[2].seq == 4);
+        CHECK(drained[1].kind == dg::ReadbackKind::ComputeReadback && drained[1].bytes == 256);
+
+        // Complete seq 5 and notify poller -> signal 2 releases asynchronously.
+        done->fetch_add(1, std::memory_order_release);
+        gate.notify();
+        CHECK(wait_for([&] {
+            std::lock_guard<std::mutex> lk(order_mu);
+            return release_order.size() == 2;
+        }));
+        CHECK((release_order == std::vector<int>{1, 2}));
+
+        const auto st = gate.stats();
+        CHECK(st.issued == 5 && st.completed == 5 && st.pending == 0);
+        CHECK(st.pending_high_water == 5 && st.ring_capacity == 16 && st.ring_overflows == 0);
+        CHECK(st.issued_by_kind[static_cast<size_t>(dg::ReadbackKind::OcclusionQuery)] == 1);
+        CHECK(st.completed_by_kind[static_cast<size_t>(dg::ReadbackKind::OcclusionQuery)] == 1);
+        CHECK(st.issued_by_kind[static_cast<size_t>(dg::ReadbackKind::TimestampQuery)] == 1);
+        CHECK(st.completed_by_kind[static_cast<size_t>(dg::ReadbackKind::TimestampQuery)] == 1);
+        CHECK(st.issued_by_kind[static_cast<size_t>(dg::ReadbackKind::ComputeReadback)] == 1);
+        CHECK(st.completed_by_kind[static_cast<size_t>(dg::ReadbackKind::ComputeReadback)] == 1);
+        CHECK(st.bytes_by_kind[static_cast<size_t>(dg::ReadbackKind::ComputeReadback)] == 256);
+        CHECK(st.issued_by_kind[static_cast<size_t>(dg::ReadbackKind::Texture)] == 1);
+        CHECK(st.completed_by_kind[static_cast<size_t>(dg::ReadbackKind::Texture)] == 1);
+
+        // Ring overflow tracking when > ring_capacity (16) readbacks are simultaneously pending.
+        for (int i = 0; i < 20; ++i) {
+            gate.issue_compute_readback(0x30000 + static_cast<uint64_t>(i) * 16, 16, static_cast<uint32_t>(i));
+        }
+        const auto ov = gate.stats();
+        CHECK(ov.pending == 20 && ov.pending_high_water == 20 && ov.ring_overflows == 4);
+        done->fetch_add(20, std::memory_order_release);
+        CHECK(gate.try_poll_slot(25) && gate.pending_count() == 0);
+    }
+
+    // 2) 32-bit -> 64-bit wraparound safety across 0xFFFFFFFF -> 0x00000000.
+    {
+        dg::ReadbackGate gate(/*hold=*/true, std::chrono::milliseconds(5000));
+        const uint64_t base = 0x00000000FFFFFFFEull;
+        CHECK(gate.seed_sequence_for_testing(base));
+        const uint64_t s1 = gate.issue64(0x40000, 8, dg::ReadbackKind::OcclusionQuery, 1);   // 0xFFFFFFFF
+        const uint64_t s2 = gate.issue64(0x40008, 8, dg::ReadbackKind::TimestampQuery, 2);   // 0x100000000 (u32 0)
+        const uint64_t s3 = gate.issue64(0x40010, 8, dg::ReadbackKind::ComputeReadback, 3);  // 0x100000001 (u32 1)
+        CHECK(s1 == 0xFFFFFFFFull && s2 == 0x100000000ull && s3 == 0x100000001ull);
+
+        std::vector<int> released;
+        CHECK(gate.park([&] { released.push_back(1); }));
+        const uint64_t s4 = gate.issue64(0x40018, 8, dg::ReadbackKind::Buffer, 4);  // 0x100000002 (u32 2)
+        CHECK(s4 == 0x100000002ull);
+        CHECK(gate.park([&] { released.push_back(2); }));
+
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(gate.done_address()));
+        // Advance across the 32-bit boundary BEFORE calling poll(): stats().completed must NEVER go backwards.
+        done->fetch_add(1, std::memory_order_release);  // 0xFFFFFFFF
+        CHECK(gate.stats().completed == 0xFFFFFFFFull);
+        CHECK(gate.is_complete(s1) && !gate.is_complete(s2));
+
+        done->fetch_add(1, std::memory_order_release);  // wraps u32 to 0x00000000 -> 64-bit 0x100000000!
+        CHECK(gate.stats().completed == 0x100000000ull);
+        CHECK(gate.completed_count() == 0x100000000ull);
+        CHECK(gate.pending_count() == 2);
+        CHECK(gate.is_complete(s2) && !gate.is_complete(s3));
+
+        done->fetch_add(1, std::memory_order_release);  // u32 1 -> 0x100000001 -> releases signal 1
+        CHECK(gate.poll() == 1 && released == std::vector<int>{1});
+        CHECK(gate.stats().completed == 0x100000001ull);
+
+        done->fetch_add(1, std::memory_order_release);  // u32 2 -> 0x100000002 -> releases signal 2
+        CHECK(gate.poll() == 1 && (released == std::vector<int>{1, 2}));
+        CHECK(gate.pending_count() == 0 && gate.completed_count() == 0x100000002ull);
+    }
+
+    // 3) Diagnostic timeout fires once per held signal + deadlock-free teardown with re-entrant dtor.
+    {
+        std::atomic<bool> reentrant_dtor_ran{false};
+        {
+            dg::ReadbackGate gate(/*hold=*/true, std::chrono::milliseconds(15));
+            gate.issue_occlusion_query(0x50000, 8, 1);
+
+            struct ReentrantGuard {
+                dg::ReadbackGate* g;
+                std::atomic<bool>* flag;
+                ~ReentrantGuard() {
+                    if (g != nullptr && flag != nullptr) {
+                        (void)g->stats();  // must not deadlock during ~ReadbackGate()
+                        flag->store(true, std::memory_order_release);
+                    }
+                }
+            };
+            auto guard = std::make_shared<ReentrantGuard>(ReentrantGuard{&gate, &reentrant_dtor_ran});
+            CHECK(gate.park([guard] {}));
+            CHECK(wait_for([&] { return gate.stats().timeouts == 1; }));
+            std::this_thread::sleep_for(std::chrono::milliseconds(40));
+            // Timeout must only fire once for the held signal.
+            CHECK(gate.stats().timeouts == 1 && gate.stats().signals_pending == 1);
+            // Exiting scope destroys gate while signal is still pending; guard dtor re-enters stats().
+        }
+        CHECK(reentrant_dtor_ran.load(std::memory_order_acquire));
+    }
+
+    // 4) Concurrent producer / consumer / poller stress test.
+    {
+        constexpr uint32_t kTotal = 200;
+        dg::ReadbackGate gate(/*hold=*/true, std::chrono::milliseconds(5000), /*ring_capacity=*/64);
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(gate.done_address()));
+        std::atomic<uint32_t> produced{0};
+        std::atomic<uint32_t> released_count{0};
+        std::atomic<uint32_t> last_released_id{0};
+        std::atomic<bool> order_ok{true};
+        std::atomic<bool> stop_observer{false};
+
+        std::thread observer([&] {
+            uint64_t prev_completed = 0;
+            while (!stop_observer.load(std::memory_order_acquire)) {
+                const auto st = gate.stats();
+                if (st.completed < prev_completed) {
+                    order_ok.store(false, std::memory_order_release);
+                }
+                prev_completed = st.completed;
+                std::vector<dg::ReadbackSlot> batch;
+                gate.drain_completed_slots(&batch, 8);
+                std::this_thread::yield();
+            }
+        });
+
+        std::thread consumer([&] {
+            uint32_t completed = 0;
+            while (completed < kTotal) {
+                const uint32_t avail = produced.load(std::memory_order_acquire);
+                if (avail > completed) {
+                    const uint32_t step = std::min<uint32_t>(avail - completed, 4u);
+                    done->fetch_add(step, std::memory_order_release);
+                    completed += step;
+                    gate.notify();
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+
+        for (uint32_t i = 1; i <= kTotal; ++i) {
+            const auto kind = static_cast<dg::ReadbackKind>(i % static_cast<uint32_t>(dg::ReadbackKind::Count));
+            gate.issue64(0x60000 + uint64_t{i} * 16, 16, kind, i);
+            produced.store(i, std::memory_order_release);
+            auto cb = [&, i] {
+                const uint32_t prev = last_released_id.exchange(i, std::memory_order_acq_rel);
+                if (prev >= i) {
+                    order_ok.store(false, std::memory_order_release);
+                }
+                released_count.fetch_add(1, std::memory_order_release);
+            };
+            if (!gate.park(cb)) {
+                cb();
+            }
+        }
+
+        consumer.join();
+        CHECK(wait_for([&] { return released_count.load(std::memory_order_acquire) == kTotal; }));
+        stop_observer.store(true, std::memory_order_release);
+        observer.join();
+        CHECK(order_ok.load(std::memory_order_acquire));
+        CHECK(gate.pending_count() == 0 && gate.completed_count() == kTotal);
+        CHECK(gate.stats().signals_pending == 0);
+    }
+}
+
+// G84 (#1749): Xbox Scarlett ID3D12DeviceX / ID3D12GraphicsCommandListX 3D methods hardening:
+// fast-clear & DCC/CMASK/HTILE metadata registry, predication / conditional rendering evaluation
+// (EQUAL_ZERO, NOT_EQUAL_ZERO, null clear, scopes, guest alias translation), async compute cross-
+// queue fence sync, WriteValue32/WriteValue64, OMSetDepthBounds, RSSetShadingRate/Image, Barrier,
+// multi-plane PresentX token tracking, ExecuteIndirect zero-count, and FramePacer null-safety.
+void test_g84_xbox_3d_methods_hardening() {
+    namespace xb = dg::xbox;
+
+    // 1) Fast clears & DCC / CMASK / HTILE compression metadata registry.
+    {
+        xb::FastClearRegistry reg;
+        reg.register_surface_meta(0x100000, xb::CompressionMetaKind::Dcc, 0x108000, 4096);
+        reg.register_surface_meta(0x200000, xb::CompressionMetaKind::Cmask, 0x208000, 1024);
+        reg.register_surface_meta(0x300000, xb::CompressionMetaKind::Htile, 0x308000, 8192);
+
+        const float clear_rgba[4] = {0.25f, 0.5f, std::numeric_limits<float>::quiet_NaN(), 1.0f};
+        reg.record_color_clear(0x100000, 28 /*R8G8B8A8_UNORM*/, clear_rgba);
+        reg.record_depth_stencil_clear(0x300000, 45 /*D24_UNORM_S8_UINT*/, 3 /*D|S*/, 1.5f, 0x7Au);
+        const float uav_f[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+        reg.record_uav_clear_float(0x200000, uav_f);
+        const uint32_t uav_u[4] = {10u, 20u, 30u, 40u};
+        reg.record_uav_clear_uint(0x400000, uav_u);
+
+        xb::SurfaceCompressionMeta m{};
+        CHECK(reg.lookup(0x100000, &m));
+        CHECK(m.meta_kind == xb::CompressionMetaKind::Dcc && m.meta_va == 0x108000 && m.fast_clear_active);
+        CHECK(m.clear_value.valid && m.clear_value.rgba[0] == 0.25f && m.clear_value.rgba[2] == 0.0f &&
+              m.clear_value.rgba[3] == 1.0f);
+        CHECK(m.clear_generation == 1);
+
+        CHECK(reg.lookup(0x300000, &m));
+        CHECK(m.meta_kind == xb::CompressionMetaKind::Htile && m.clear_value.depth == 1.0f &&
+              m.clear_value.stencil == 0x7Au);
+
+        CHECK(reg.lookup(0x400000, &m));
+        CHECK(m.clear_value.kind == xb::FastClearKind::UnorderedAccessUint && m.clear_value.uint_rgba[3] == 40u);
+
+        CHECK(reg.mark_decompressed(0x100000));   // was active -> now decompressed
+        CHECK(!reg.mark_decompressed(0x100000));  // already decompressed -> returns false
+        CHECK(reg.lookup(0x100000, &m) && !m.fast_clear_active && m.decompress_count == 2);
+
+        const auto st = reg.stats();
+        CHECK(st.color_clears == 1 && st.depth_stencil_clears == 1 && st.uav_clears == 2 && st.decompresses == 2);
+        CHECK(st.active_fast_clears == 3 && st.dcc_surfaces == 1 && st.cmask_surfaces == 1 && st.htile_surfaces == 1);
+        CHECK(reg.erase(0x400000) && reg.size() == 3);
+        reg.clear();
+        CHECK(reg.size() == 0 && reg.stats().color_clears == 0);
+    }
+
+    // 2) Predication / conditional rendering (EQUAL_ZERO, NOT_EQUAL_ZERO, null clear, scopes).
+    {
+        xb::PredicationTracker pred;
+        std::string err;
+        uint64_t mem_value = 0;
+        auto reader = [&](uint64_t, uint64_t* out) {
+            *out = mem_value;
+            return true;
+        };
+
+        // Inactive predication never skips.
+        CHECK(!pred.should_skip_work(reader));
+
+        // Validation: unaligned offset and invalid op are rejected.
+        CHECK(!pred.set(0x1000, 4, 0, &err) && !err.empty());
+        CHECK(!pred.set(0x1000, 8, 99, &err) && !err.empty());
+        CHECK(pred.stats().invalid_calls == 2);
+
+        // EQUAL_ZERO: skips when predicate == 0, passes when != 0.
+        CHECK(pred.set(0x1000, 16, static_cast<uint32_t>(xb::PredicationOp::EqualZero)));
+        mem_value = 0;
+        CHECK(pred.should_skip_work(reader));
+        CHECK(pred.state().last_evaluated && pred.state().last_skip_work && pred.state().last_value == 0);
+        mem_value = 42;
+        CHECK(!pred.should_skip_work(reader));
+        CHECK(!pred.state().last_skip_work && pred.state().last_value == 42);
+
+        // Nested scope save/restore + NOT_EQUAL_ZERO.
+        CHECK(pred.push_scope() && pred.scope_depth() == 1);
+        CHECK(pred.set(0x2000, 0, static_cast<uint32_t>(xb::PredicationOp::NotEqualZero)));
+        mem_value = 1;
+        CHECK(pred.should_skip_work(reader));
+        mem_value = 0;
+        CHECK(!pred.should_skip_work(reader));
+        CHECK(pred.pop_scope() && pred.scope_depth() == 0);
+        // Restored EQUAL_ZERO state:
+        CHECK(pred.state().buffer_va == 0x1000 && pred.state().op == xb::PredicationOp::EqualZero);
+        CHECK(!pred.pop_scope());  // empty pop returns false
+
+        // Fail-safe unreadable memory does not skip draws.
+        CHECK(!pred.should_skip_work([](uint64_t, uint64_t*) { return false; }));
+        CHECK(pred.stats().unreadable_reads == 1);
+
+        // Null buffer clears predication.
+        CHECK(pred.set(0, 0, 0) && !pred.state().active);
+        CHECK(!pred.should_skip_work(reader));
+        CHECK(pred.stats().set_calls == 2 && pred.stats().clear_calls == 1 && pred.stats().work_skipped == 2);
+    }
+
+    // 3) Async compute cross-queue fence synchronization helper.
+    {
+        xb::AsyncComputeSync sync;
+        constexpr uint64_t kDirectQ = 1, kComputeQ = 2, kCopyQ = 3;
+        constexpr uint64_t kFenceA = 100, kFenceB = 200;
+
+        // Compute queue waits on Direct queue's fence before Direct signals it -> deferred.
+        CHECK(!sync.record_wait(kComputeQ, xb::QueueKind::Compute, kFenceA, 5));
+        CHECK(sync.pending_wait_count(kFenceA) == 1);
+
+        // Direct signals 3 (still < 5), then 5 (satisfies Compute wait and counts cross-queue sync).
+        CHECK(sync.record_signal(kDirectQ, xb::QueueKind::Direct, kFenceA, 3) == 0);
+        CHECK(sync.fence_value(kFenceA) == 3 && sync.pending_wait_count(kFenceA) == 1);
+        CHECK(sync.record_signal(kDirectQ, xb::QueueKind::Direct, kFenceA, 5) == 1);
+        CHECK(sync.pending_wait_count(kFenceA) == 0);
+
+        // Immediate satisfaction when Copy queue waits on already-reached fence value.
+        CHECK(sync.record_wait(kCopyQ, xb::QueueKind::Copy, kFenceA, 4));
+
+        // Self-wait detection when Direct waits on a future value of a fence only Direct signalled.
+        CHECK(sync.is_potential_self_wait(kDirectQ, kFenceA, 9));
+        CHECK(!sync.record_wait(kDirectQ, xb::QueueKind::Direct, kFenceA, 9));
+        CHECK(sync.stats().self_waits_detected == 1);
+
+        // Blocking wait_until_satisfied: timeout when unreached, succeeds when signalled from another thread.
+        CHECK(!sync.wait_until_satisfied(kFenceB, 1, std::chrono::milliseconds(5)));
+        CHECK(sync.stats().wait_timeouts == 1);
+        std::thread compute_thread([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            sync.record_signal(kComputeQ, xb::QueueKind::Compute, kFenceB, 1);
+        });
+        CHECK(sync.wait_until_satisfied(kFenceB, 1, std::chrono::milliseconds(1000)));
+        compute_thread.join();
+
+        const auto st = sync.stats();
+        CHECK(st.signals_direct == 2 && st.signals_compute == 1 && st.waits_immediate == 1 &&
+              st.waits_deferred == 2 && st.waits_satisfied == 2 && st.cross_queue_syncs == 2);
+
+        // Shutdown wakes waiters cleanly.
+        sync.shutdown();
+        CHECK(!sync.wait_until_satisfied(kFenceB, 99, std::chrono::milliseconds(1000)));
+        sync.reset();
+        CHECK(sync.fence_value(kFenceA) == 0 && sync.pending_wait_count() == 0);
+    }
+
+    // 4) FramePacer null-pointer safety & event tick tracking.
+    {
+        xb::FramePacer pacer;
+        pacer.set_interval(2000, 2);
+        CHECK(pacer.period() == 2);
+        CHECK(pacer.wait_after(0, 100, nullptr) == xb::FramePacer::WaitResult::Ok);
+        CHECK(pacer.wait_event(1, 100, nullptr) == xb::FramePacer::WaitResult::Ok);
+        CHECK(pacer.last_event_tick(1) >= 1);
+        pacer.reset_event_ticks();
+        CHECK(pacer.last_event_tick(1) == 0);
+        pacer.shutdown();
+        CHECK(pacer.wait_event(1, 100, nullptr) == xb::FramePacer::WaitResult::Shutdown);
+    }
+
+    // 5) Guest-side Xbox 3D command-list / queue slots: WriteValue32/64 (with alias), OMSetDepthBounds,
+    //    RSSetShadingRate/Image, Barrier, ExecuteIndirect (zero-count & bad alignment), multi-plane
+    //    PresentX token handling, and guest predication + clear-color parsing.
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        xb::clear_command_list_xbox_state();
+        int32_t result = -1;
+
+        // Guest clear-color and UAV clear-uint parsers.
+        const float color[4] = {0.1f, 0.2f, 0.3f, 1.0f};
+        float parsed_color[4] = {};
+        CHECK(xb::parse_guest_clear_color(put_bytes(color, sizeof(color)), parsed_color));
+        CHECK(parsed_color[0] == 0.1f && parsed_color[3] == 1.0f);
+        CHECK(!xb::parse_guest_clear_color(0, parsed_color));
+        const uint32_t uvals[4] = {7u, 8u, 9u, 10u};
+        uint32_t parsed_uvals[4] = {};
+        CHECK(xb::parse_guest_uav_clear_uint(put_bytes(uvals, sizeof(uvals)), parsed_uvals));
+        CHECK(parsed_uvals[0] == 7u && parsed_uvals[3] == 10u);
+
+        // GPU alias window + guest predication + WriteValue32 (slot 71) / WriteValue64 (slot 74).
+        const uint64_t cpu_win = com::guest_alloc(4096);
+        const uint64_t gpu_win = 0x00007C0000000000ull;
+        dev->register_gpu_alias(gpu_win, cpu_win, 4096);
+        store64(cpu_win + 0x40, 0);
+        xb::PredicationTracker guest_pred;
+        CHECK(guest_pred.set(gpu_win, 0x40, static_cast<uint32_t>(xb::PredicationOp::EqualZero)));
+        CHECK(guest_pred.should_skip_work_guest(dev));
+        store64(cpu_win + 0x40, 123);
+        CHECK(!guest_pred.should_skip_work_guest(dev));
+
+        const uint64_t list = scene.new_list();
+        const uint64_t buf = committed(fx, scene.device, 1, buffer_desc(1024), 0x800);
+        const uint64_t rt0 = committed(fx, scene.device, 1, texture_desc(16, 16, 28, 1), 0);
+        const uint64_t rt1 = committed(fx, scene.device, 1, texture_desc(16, 16, 28, 1), 0);
+
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+        // WriteValue32 (slot 71) & WriteValue64 (slot 74) into aliased GPU addresses.
+        fx.vcall(list, 71, {I(gpu_win + 0x10), I(0xCAFEBABEu), I(0), I(0)});
+        fx.vcall(list, 74, {I(gpu_win + 0x20), I(7), I(0x0123456789ABCDEFull), I(1)});
+        // Invalid unaligned WriteValue32 is diagnosed and not applied.
+        const uint64_t diag_before = object_of<dg::CommandList>(list)->diagnostics_count();
+        fx.vcall(list, 71, {I(gpu_win + 0x11), I(1), I(0), I(0)});
+        CHECK(object_of<dg::CommandList>(list)->diagnostics_count() == diag_before + 1);
+
+        // OMSetDepthBounds (slot 70): valid range recorded, inverted range diagnosed.
+        fx.vcall(list, XSlot::OMSetDepthBounds, {F32(0.15f), F32(0.85f)});
+        xb::DepthBoundsState db{};
+        CHECK(xb::lookup_command_list_depth_bounds(list, &db) && db.set && db.min_depth == 0.15f &&
+              db.max_depth == 0.85f);
+        const uint64_t db_diag_before = object_of<dg::CommandList>(list)->diagnostics_count();
+        fx.vcall(list, XSlot::OMSetDepthBounds, {F32(0.9f), F32(0.2f)});
+        CHECK(object_of<dg::CommandList>(list)->diagnostics_count() == db_diag_before + 1);
+        CHECK(counter(dev, xb::Counter::DepthBoundsIgnored) == 2);
+
+        // RSSetShadingRate (slot 126) & RSSetShadingRateImage (slot 127).
+        const uint32_t combiners[2] = {1u /*OVERRIDE*/, 3u /*MAX*/};
+        fx.vcall(list, XSlot::RSSetShadingRate, {I(0x5 /*2x2*/), I(put_bytes(combiners, sizeof(combiners)))});
+        fx.vcall(list, XSlot::RSSetShadingRateImage, {I(rt0)});
+        xb::ShadingRateState vrs{};
+        CHECK(xb::lookup_command_list_shading_rate(list, &vrs) && vrs.rate_set && vrs.image_set &&
+              vrs.base_rate == 0x5 && vrs.combiners[0] == 1u && vrs.combiners[1] == 3u && vrs.image_va == rt0);
+        // Invalid shading rate is diagnosed.
+        const uint64_t vrs_diag_before = object_of<dg::CommandList>(list)->diagnostics_count();
+        fx.vcall(list, XSlot::RSSetShadingRate, {I(0xFF), I(0)});
+        CHECK(object_of<dg::CommandList>(list)->diagnostics_count() == vrs_diag_before + 1);
+        CHECK(counter(dev, xb::Counter::ShadingRateIgnored) == 3);
+
+        // Enhanced Barrier (slot 146): global + buffer barrier group.
+        struct BarrierGroup {
+            uint32_t Type;
+            uint32_t NumBarriers;
+            uint64_t pBarriers;
+        };
+        uint8_t global_bar[16] = {};
+        uint8_t buf_bar[40] = {};
+        std::memcpy(buf_bar + 16, &buf, sizeof(buf));
+        BarrierGroup groups[2] = {
+            {0, 1, put_bytes(global_bar, sizeof(global_bar))},
+            {2, 1, put_bytes(buf_bar, sizeof(buf_bar))},
+        };
+        const uint64_t bar_diag_before = object_of<dg::CommandList>(list)->diagnostics_count();
+        fx.vcall(list, 146, {I(2), I(put_bytes(groups, sizeof(groups)))});
+        CHECK(object_of<dg::CommandList>(list)->diagnostics_count() == bar_diag_before);
+
+        // ExecuteIndirect (slot 61): max_count == 0 -> clean IndirectZeroCount no-op.
+        const uint32_t iarg[4] = {dg::CommandSignature::kIndirectArgDraw, 0, 0, 0};
+        dg::GuestCommandSignatureDesc csdesc{16, 1, put_bytes(iarg, sizeof(iarg)), 0};
+        const uint64_t sig = fx.create(scene.device, Slot::CreateCommandSignature, {I(put(csdesc)), I(0)},
+                                       dg::IID_ID3D12CommandSignature, &result);
+        CHECK(result == 0 && sig != 0);
+        fx.vcall(list, XSlot::ExecuteIndirect, {I(sig), I(0), I(buf), I(0), I(0), I(0)});
+        CHECK(counter(dev, xb::Counter::IndirectZeroCount) == 1);
+        // Misaligned args_offset is skipped cleanly.
+        fx.vcall(list, XSlot::ExecuteIndirect, {I(sig), I(1), I(buf), I(2), I(0), I(0)});
+        CHECK(counter(dev, xb::Counter::IndirectSkipped) == 1);
+
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        scene.execute({list});
+        CHECK(load32(cpu_win + 0x10) == 0xCAFEBABEu);
+        CHECK(load64(cpu_win + 0x20) == 0x0123456789ABCDEFull);
+
+        // Multi-plane PresentX (slot 32): plane 0 has token 0, plane 1 carries token 77 ->
+        // last_present_token advances to 77 and MultiPlanePresents == 1.
+        xb::GuestPresentPlaneX planes[2] = {};
+        planes[0].Token = 0;
+        planes[0].ResourceCount = 1;
+        planes[0].ppResources = put<uint64_t>(rt0);
+        planes[1].Token = 77;
+        planes[1].ResourceCount = 1;
+        planes[1].ppResources = put<uint64_t>(rt1);
+        const uint64_t immediate_params = put<uint32_t>(1);
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(2), I(put_bytes(planes, sizeof(planes))), I(immediate_params)})) == 0);
+        CHECK(dev->last_present_token.load() == 77);
+        CHECK(counter(dev, xb::Counter::MultiPlanePresents) == 1);
+        CHECK(counter(dev, xb::Counter::PresentsWithPlanes) == 1);
+
+        xb::clear_command_list_xbox_state();
+        CHECK(!xb::lookup_command_list_depth_bounds(list, &db));
+        scene.release_all({list, sig, buf, rt0, rt1});
+    }
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -7681,6 +8202,8 @@ int main() {
     test_g55_root_sig_layout_caps();
     test_g58_relocate_ia_vb_ib();
     test_storage_relocation_reuse_waits_for_presents();
+    test_g84_readback_ring_hardening();
+    test_g84_xbox_3d_methods_hardening();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;
