@@ -2671,12 +2671,24 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
-                if (base != 0 && view_size != 0 && device_.options().relocate_storage &&
-                    device_.options().relocate_storage(base + e.offset, view_size, &id, &offset)) {
-                    relocated(i, true, base + e.offset, view_size, 0, id, offset);
+                // G66: a root SRV/UAV has no view size (D3D12 bounds it by the end of its
+                // resource). The title's UI vertex stage reads the same root SRV both as a uniform
+                // header and as read-only storage (vertex pulling, LEGAL NOTICES alpha mask): the
+                // uniform was relocated, this binding was left at the unaligned offset and nulled.
+                // Copy the memory that follows, up to the end of the buffer and at most 64 KiB
+                // (the stage clamps its reads to arrayLength).
+                uint64_t copy_size = view_size;
+                if (copy_size == 0) {
+                    const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                    const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                    copy_size = std::min<uint64_t>(room, kMaxUniformBindingSize);
+                }
+                if (base != 0 && copy_size != 0 && device_.options().relocate_storage &&
+                    device_.options().relocate_storage(base + e.offset, copy_size, &id, &offset)) {
+                    relocated(i, true, base + e.offset, copy_size, 0, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
-                    out.size = align_up(view_size, 4u);
+                    out.size = align_up(copy_size, 4u);
                     ++stats_.storage_relocated;
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedStorage;
