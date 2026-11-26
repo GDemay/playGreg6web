@@ -1851,8 +1851,16 @@ bool create_process_block(const BootConfig& config, std::string& error) {
     peb->image_base_address = exe.image.base;
     peb->process_parameters = b.process_parameters;
     peb->process_heap = static_cast<uint64_t>(os::win32::GetProcessHeap());
-    const unsigned cpus = std::thread::hardware_concurrency();
-    peb->number_of_processors = cpus == 0 ? 1 : cpus;
+    static const unsigned hw = std::thread::hardware_concurrency();
+    uint64_t affinity_mask = os::win32::get_process_affinity_mask();
+    uint32_t affinity_bits = 0;
+    while (affinity_mask != 0) {
+        affinity_bits += static_cast<uint32_t>(affinity_mask & 1u);
+        affinity_mask >>= 1;
+    }
+    const uint32_t cpus =
+        std::min<uint32_t>(hw == 0 ? 1u : hw, affinity_bits == 0 ? 1u : affinity_bits);
+    peb->number_of_processors = std::max<uint32_t>(1u, std::min<uint32_t>(cpus, 64u));
     peb->os_major_version = 10;
     peb->os_minor_version = 0;
     peb->os_build_number = 19041;

@@ -1407,6 +1407,504 @@ void test_event_trace_selection() {
     set_event_trace_caller(nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// 9. O47: Single-object fast paths, reusable waiter blocks & CV wake fast path
+// ---------------------------------------------------------------------------
+
+void test_single_object_fast_paths_and_reusable_wait_block() {
+    // Immediate signaled wait & zero-timeout poll across events, semaphores, mutexes, and
+    // count == 1 WaitForMultipleObjects (both wait-any and wait-all).
+    {
+        const Handle manual = CreateEventA(nullptr, true, false, nullptr);
+        const Handle auto_ev = CreateEventA(nullptr, false, true, nullptr);
+        const Handle sem = CreateSemaphoreA(nullptr, 3, 3, nullptr);
+        const Handle mtx = CreateMutexA(nullptr, false, nullptr);
+        CHECK(valid(manual) && valid(auto_ev) && valid(sem) && valid(mtx));
+
+        // Zero-timeout polls on unsignaled vs signaled objects.
+        CHECK(WaitForSingleObject(manual, 0) == WAIT_TIMEOUT);
+        CHECK(WaitForSingleObjectEx(manual, 0, true) == WAIT_TIMEOUT);
+        CHECK(WaitForMultipleObjects(1, &manual, false, 0) == WAIT_TIMEOUT);
+        CHECK(WaitForMultipleObjects(1, &manual, true, 0) == WAIT_TIMEOUT);
+
+        CHECK(SetEvent(manual));
+        CHECK(WaitForSingleObject(manual, 0) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(manual, INFINITE_TIMEOUT) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObjectEx(manual, 100, false) == WAIT_OBJECT_0);
+        CHECK(WaitForMultipleObjects(1, &manual, false, 0) == WAIT_OBJECT_0);
+        CHECK(WaitForMultipleObjects(1, &manual, true, 100) == WAIT_OBJECT_0);
+
+        // Auto-reset event: first immediate wait consumes, second polls WAIT_TIMEOUT.
+        CHECK(WaitForSingleObject(auto_ev, INFINITE_TIMEOUT) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(auto_ev, 0) == WAIT_TIMEOUT);
+
+        // Semaphore: drains count immediately, then polls WAIT_TIMEOUT.
+        CHECK(WaitForSingleObject(sem, 0) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObjectEx(sem, 10, true) == WAIT_OBJECT_0);
+        CHECK(WaitForMultipleObjects(1, &sem, false, INFINITE_TIMEOUT) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(sem, 0) == WAIT_TIMEOUT);
+
+        // Mutex: immediate acquire + recursive acquire + release.
+        CHECK(WaitForSingleObject(mtx, 0) == WAIT_OBJECT_0);
+        CHECK(WaitForSingleObject(mtx, 0) == WAIT_OBJECT_0);
+        CHECK(ReleaseMutex(mtx));
+        CHECK(ReleaseMutex(mtx));
+        CHECK(!ReleaseMutex(mtx));
+        CHECK(GetLastError() == ERROR_NOT_OWNER);
+
+        // Invalid handle on single-object paths.
+        const Handle bad = kNullHandle;
+        CHECK(WaitForSingleObject(bad, 0) == WAIT_FAILED);
+        CHECK(GetLastError() == ERROR_INVALID_HANDLE);
+        CHECK(WaitForMultipleObjects(1, &bad, true, 0) == WAIT_FAILED);
+        CHECK(GetLastError() == ERROR_INVALID_HANDLE);
+
+        // Abandoned mutex: blocking single-object handoff reports WAIT_ABANDONED_0.
+        const Handle m_abandoned = CreateMutexA(nullptr, false, nullptr);
+        const Handle locked = CreateEventA(nullptr, true, false, nullptr);
+        const Handle let_exit = CreateEventA(nullptr, true, false, nullptr);
+        std::thread holder([&]() {
+            if (WaitForSingleObject(m_abandoned, kLongWait) == WAIT_OBJECT_0) {
+                SetEvent(locked);
+                WaitForSingleObject(let_exit, kLongWait);
+            }
+        });
+        CHECK(WaitForSingleObject(locked, kLongWait) == WAIT_OBJECT_0);
+        std::thread releaser([&]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            SetEvent(let_exit);
+        });
+        CHECK(WaitForSingleObject(m_abandoned, kLongWait) == WAIT_ABANDONED_0);
+        CHECK(ReleaseMutex(m_abandoned));
+        holder.join();
+        releaser.join();
+
+        for (Handle h : {manual, auto_ev, sem, mtx, m_abandoned, locked, let_exit}) {
+            CHECK(CloseHandle(h));
+        }
+    }
+
+    // Reusable thread_local WaitBlock across repeated blocking waits, timeouts, handoffs,
+    // wait-any, wait-all, events, semaphores, and mutexes on the same thread.
+    {
+        constexpr int kRounds = 40;
+        const Handle ev = CreateEventA(nullptr, false, false, nullptr);
+        const Handle ev_idle = CreateEventA(nullptr, true, false, nullptr);
+        const Handle sem = CreateSemaphoreA(nullptr, 0, kRounds, nullptr);
+        const Handle mtx = CreateMutexA(nullptr, false, nullptr);
+        const Handle all_a = CreateEventA(nullptr, false, false, nullptr);
+        const Handle all_b = CreateEventA(nullptr, false, false, nullptr);
+        const Handle step_ready = CreateSemaphoreA(nullptr, 0, kRounds * 6, nullptr);
+
+        std::atomic<int> worker_errors{0};
+        std::thread worker([&]() {
+            const Handle any_set[2] = {ev_idle, sem};
+            const Handle all_set[2] = {all_a, all_b};
+            for (int r = 0; r < kRounds; ++r) {
+                // 1. Single-object blocking wait on auto-reset event.
+                ReleaseSemaphore(step_ready, 1, nullptr);
+                if (WaitForSingleObject(ev, kLongWait) != WAIT_OBJECT_0) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 2. Short-timeout single-object wait (exercises kTimedOut -> reset).
+                if (WaitForSingleObject(ev_idle, 1) != WAIT_TIMEOUT) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 3. Single-object blocking wait on semaphore.
+                ReleaseSemaphore(step_ready, 1, nullptr);
+                if (WaitForSingleObject(sem, kLongWait) != WAIT_OBJECT_0) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 4. Single-object blocking wait on mutex + ownership verification via ReleaseMutex.
+                ReleaseSemaphore(step_ready, 1, nullptr);
+                if (WaitForSingleObject(mtx, kLongWait) != WAIT_OBJECT_0 || !ReleaseMutex(mtx)) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 5. Multi-object wait-any blocking wait.
+                ReleaseSemaphore(step_ready, 1, nullptr);
+                if (WaitForMultipleObjects(2, any_set, false, kLongWait) != WAIT_OBJECT_0 + 1) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 6. Multi-object wait-any short timeout + immediate poll.
+                if (WaitForMultipleObjects(2, any_set, false, 0) != WAIT_TIMEOUT ||
+                    WaitForMultipleObjects(2, any_set, false, 1) != WAIT_TIMEOUT) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+                // 7. Multi-object wait-all blocking wait (switches wait_all true -> false next round).
+                ReleaseSemaphore(step_ready, 1, nullptr);
+                if (WaitForMultipleObjects(2, all_set, true, kLongWait) != WAIT_OBJECT_0) {
+                    worker_errors.fetch_add(1);
+                    return;
+                }
+            }
+        });
+
+        for (int r = 0; r < kRounds; ++r) {
+            CHECK(WaitForSingleObject(step_ready, kLongWait) == WAIT_OBJECT_0);
+            CHECK(SetEvent(ev));
+
+            CHECK(WaitForSingleObject(step_ready, kLongWait) == WAIT_OBJECT_0);
+            CHECK(ReleaseSemaphore(sem, 1, nullptr));
+
+            // Hold mutex briefly before handing off to worker.
+            CHECK(WaitForSingleObject(mtx, kLongWait) == WAIT_OBJECT_0);
+            CHECK(WaitForSingleObject(step_ready, kLongWait) == WAIT_OBJECT_0);
+            std::this_thread::yield();
+            CHECK(ReleaseMutex(mtx));
+
+            CHECK(WaitForSingleObject(step_ready, kLongWait) == WAIT_OBJECT_0);
+            CHECK(ReleaseSemaphore(sem, 1, nullptr));
+
+            CHECK(WaitForSingleObject(step_ready, kLongWait) == WAIT_OBJECT_0);
+            CHECK(SetEvent(all_a));
+            CHECK(SetEvent(all_b));
+        }
+
+        worker.join();
+        CHECK(worker_errors.load() == 0);
+        for (Handle h : {ev, ev_idle, sem, mtx, all_a, all_b, step_ready}) {
+            CHECK(CloseHandle(h));
+        }
+    }
+}
+
+void test_wait_timeout_and_handoff_stress() {
+    // Multi-thread stress mixing WaitForSingleObject, WaitForMultipleObjects (wait-any & wait-all),
+    // zero/short timeouts, and concurrent handoffs: every semaphore unit must be acquired once.
+    {
+        constexpr int kTokensPerSem = 3000;
+        const Handle s0 = CreateSemaphoreA(nullptr, 0, kTokensPerSem, nullptr);
+        const Handle s1 = CreateSemaphoreA(nullptr, 0, kTokensPerSem, nullptr);
+        const Handle idle = CreateEventA(nullptr, true, false, nullptr);
+        std::atomic<int> taken0{0};
+        std::atomic<int> taken1{0};
+        std::atomic<int> errors{0};
+        std::atomic<bool> stop{false};
+
+        std::vector<std::thread> workers;
+        // 2 single-object waiters with rotating timeouts (0, 1, 2 ms).
+        for (int w = 0; w < 2; ++w) {
+            workers.emplace_back([&, w]() {
+                const Handle target = (w == 0) ? s0 : s1;
+                std::atomic<int>& counter = (w == 0) ? taken0 : taken1;
+                uint32_t iter = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const uint32_t timeout = iter++ % 3u;
+                    const uint32_t r = WaitForSingleObject(target, timeout);
+                    if (r == WAIT_OBJECT_0) {
+                        counter.fetch_add(1, std::memory_order_relaxed);
+                    } else if (r != WAIT_TIMEOUT) {
+                        errors.fetch_add(1);
+                        return;
+                    }
+                }
+            });
+        }
+        // 2 wait-any waiters racing short timeouts against handoffs.
+        for (int w = 0; w < 2; ++w) {
+            workers.emplace_back([&, w]() {
+                const Handle set[3] = {idle, (w == 0) ? s0 : s1, (w == 0) ? s1 : s0};
+                uint32_t iter = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const uint32_t timeout = iter++ % 3u;
+                    const uint32_t r = WaitForMultipleObjects(3, set, false, timeout);
+                    if (r == WAIT_OBJECT_0 + 1) {
+                        (w == 0 ? taken0 : taken1).fetch_add(1, std::memory_order_relaxed);
+                    } else if (r == WAIT_OBJECT_0 + 2) {
+                        (w == 0 ? taken1 : taken0).fetch_add(1, std::memory_order_relaxed);
+                    } else if (r != WAIT_TIMEOUT) {
+                        errors.fetch_add(1);
+                        return;
+                    }
+                }
+            });
+        }
+        // 2 wait-all waiters acquiring (s0, s1) atomically under short timeouts.
+        for (int w = 0; w < 2; ++w) {
+            workers.emplace_back([&]() {
+                const Handle set[2] = {s0, s1};
+                uint32_t iter = 0;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const uint32_t timeout = iter++ % 3u;
+                    const uint32_t r = WaitForMultipleObjects(2, set, true, timeout);
+                    if (r == WAIT_OBJECT_0) {
+                        taken0.fetch_add(1, std::memory_order_relaxed);
+                        taken1.fetch_add(1, std::memory_order_relaxed);
+                    } else if (r != WAIT_TIMEOUT) {
+                        errors.fetch_add(1);
+                        return;
+                    }
+                }
+            });
+        }
+
+        for (int i = 0; i < kTokensPerSem; ++i) {
+            CHECK(ReleaseSemaphore(s0, 1, nullptr));
+            CHECK(ReleaseSemaphore(s1, 1, nullptr));
+            if ((i & 31) == 0) {
+                std::this_thread::yield();
+            }
+        }
+
+        const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while ((taken0.load() < kTokensPerSem || taken1.load() < kTokensPerSem) &&
+               std::chrono::steady_clock::now() < give_up) {
+            std::this_thread::yield();
+        }
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& t : workers) {
+            t.join();
+        }
+
+        CHECK(errors.load() == 0);
+        CHECK(taken0.load() == kTokensPerSem);
+        CHECK(taken1.load() == kTokensPerSem);
+        CHECK(WaitForSingleObject(s0, 0) == WAIT_TIMEOUT);
+        CHECK(WaitForSingleObject(s1, 0) == WAIT_TIMEOUT);
+        for (Handle h : {s0, s1, idle}) {
+            CHECK(CloseHandle(h));
+        }
+    }
+
+    // Mutex handoff under short-timeout contention across both single- and multi-object waits.
+    {
+        constexpr int kThreads = 4;
+        constexpr int kAcquiresPerThread = 600;
+        const Handle mtx = CreateMutexA(nullptr, false, nullptr);
+        const Handle idle = CreateEventA(nullptr, true, false, nullptr);
+        int shared_counter = 0;
+        std::atomic<int> errors{0};
+
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t]() {
+                const Handle set[2] = {idle, mtx};
+                for (int acquired = 0; acquired < kAcquiresPerThread;) {
+                    const uint32_t timeout = static_cast<uint32_t>((acquired + t) % 2);
+                    uint32_t r = WAIT_FAILED;
+                    if (((acquired + t) & 1) == 0) {
+                        r = WaitForSingleObject(mtx, timeout);
+                        if (r == WAIT_OBJECT_0) {
+                            ++shared_counter;
+                            if (!ReleaseMutex(mtx)) {
+                                errors.fetch_add(1);
+                                return;
+                            }
+                            ++acquired;
+                        } else if (r != WAIT_TIMEOUT) {
+                            errors.fetch_add(1);
+                            return;
+                        }
+                    } else {
+                        r = WaitForMultipleObjects(2, set, false, timeout);
+                        if (r == WAIT_OBJECT_0 + 1) {
+                            ++shared_counter;
+                            if (!ReleaseMutex(mtx)) {
+                                errors.fetch_add(1);
+                                return;
+                            }
+                            ++acquired;
+                        } else if (r != WAIT_TIMEOUT) {
+                            errors.fetch_add(1);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        CHECK(errors.load() == 0);
+        CHECK(shared_counter == kThreads * kAcquiresPerThread);
+        CHECK(CloseHandle(mtx));
+        CHECK(CloseHandle(idle));
+    }
+}
+
+void test_cv_fast_path_and_stress() {
+    // Uncontended WakeConditionVariable / WakeAllConditionVariable fast path (zero waiters).
+    {
+        ConditionVariable cvs[4]{};
+        for (auto& cv : cvs) {
+            InitializeConditionVariable(&cv);
+        }
+        for (int i = 0; i < 10000; ++i) {
+            WakeConditionVariable(&cvs[i & 3]);
+            WakeAllConditionVariable(&cvs[(i + 1) & 3]);
+        }
+        SrwLock srw{};
+        InitializeSRWLock(&srw);
+        AcquireSRWLockExclusive(&srw);
+        for (auto& cv : cvs) {
+            CHECK(!SleepConditionVariableSRW(&cv, &srw, 0, 0));
+            CHECK(GetLastError() == ERROR_TIMEOUT);
+        }
+        ReleaseSRWLockExclusive(&srw);
+    }
+
+    // High-contention multi-thread SRWLock producer-consumer stress (tiny capacity = 2 forces
+    // rapid transitions between 0 and >0 waiters, verifying zero lost wakeups on both the
+    // atomic waiter_count wake fast path and reusable thread_local CvWaiter).
+    {
+        constexpr int kProducers = 4;
+        constexpr int kConsumers = 4;
+        constexpr int kPerProducer = 3000;
+        constexpr size_t kCapacity = 2;
+
+        ConditionVariable not_full{};
+        ConditionVariable not_empty{};
+        SrwLock srw{};
+        InitializeConditionVariable(&not_full);
+        InitializeConditionVariable(&not_empty);
+        InitializeSRWLock(&srw);
+
+        std::deque<int> queue;
+        int producers_done = 0;
+        long long consumed_sum = 0;
+        int consumed_count = 0;
+
+        std::vector<std::thread> threads;
+        for (int p = 0; p < kProducers; ++p) {
+            threads.emplace_back([&, p]() {
+                for (int i = 1; i <= kPerProducer; ++i) {
+                    AcquireSRWLockExclusive(&srw);
+                    while (queue.size() >= kCapacity) {
+                        const uint32_t timeout = ((i + p) & 15) == 0 ? 1u : INFINITE_TIMEOUT;
+                        SleepConditionVariableSRW(&not_full, &srw, timeout, 0);
+                    }
+                    queue.push_back(i);
+                    const bool wake_under_lock = ((i + p) & 7) == 0;
+                    if (wake_under_lock) {
+                        WakeConditionVariable(&not_empty);
+                    }
+                    ReleaseSRWLockExclusive(&srw);
+                    if (!wake_under_lock) {
+                        if (((i + p) & 31) == 0) {
+                            WakeAllConditionVariable(&not_empty);
+                        } else {
+                            WakeConditionVariable(&not_empty);
+                        }
+                    }
+                }
+                AcquireSRWLockExclusive(&srw);
+                ++producers_done;
+                ReleaseSRWLockExclusive(&srw);
+                WakeAllConditionVariable(&not_empty);
+            });
+        }
+        for (int c = 0; c < kConsumers; ++c) {
+            threads.emplace_back([&, c]() {
+                int iter = 0;
+                for (;;) {
+                    AcquireSRWLockExclusive(&srw);
+                    while (queue.empty() && producers_done < kProducers) {
+                        const uint32_t timeout = ((iter++ + c) & 15) == 0 ? 1u : INFINITE_TIMEOUT;
+                        SleepConditionVariableSRW(&not_empty, &srw, timeout, 0);
+                    }
+                    if (queue.empty()) {
+                        ReleaseSRWLockExclusive(&srw);
+                        return;
+                    }
+                    consumed_sum += queue.front();
+                    ++consumed_count;
+                    queue.pop_front();
+                    ReleaseSRWLockExclusive(&srw);
+                    WakeConditionVariable(&not_full);
+                }
+            });
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+
+        constexpr long long kExpectedSum =
+            static_cast<long long>(kProducers) * kPerProducer * (kPerProducer + 1) / 2;
+        CHECK(consumed_count == kProducers * kPerProducer);
+        CHECK(consumed_sum == kExpectedSum);
+    }
+
+    // High-contention multi-thread CriticalSection producer-consumer stress (zero lost wakeups).
+    {
+        constexpr int kProducers = 3;
+        constexpr int kConsumers = 3;
+        constexpr int kPerProducer = 2500;
+        constexpr size_t kCapacity = 2;
+
+        ConditionVariable not_full{};
+        ConditionVariable not_empty{};
+        CriticalSection cs{};
+        InitializeConditionVariable(&not_full);
+        InitializeConditionVariable(&not_empty);
+        InitializeCriticalSection(&cs);
+
+        std::deque<int> queue;
+        int producers_done = 0;
+        long long consumed_sum = 0;
+        int consumed_count = 0;
+
+        std::vector<std::thread> threads;
+        for (int p = 0; p < kProducers; ++p) {
+            threads.emplace_back([&, p]() {
+                for (int i = 1; i <= kPerProducer; ++i) {
+                    EnterCriticalSection(&cs);
+                    while (queue.size() >= kCapacity) {
+                        const uint32_t timeout = ((i + p) & 15) == 0 ? 1u : INFINITE_TIMEOUT;
+                        SleepConditionVariableCS(&not_full, &cs, timeout);
+                    }
+                    queue.push_back(i);
+                    LeaveCriticalSection(&cs);
+                    if (((i + p) & 31) == 0) {
+                        WakeAllConditionVariable(&not_empty);
+                    } else {
+                        WakeConditionVariable(&not_empty);
+                    }
+                }
+                EnterCriticalSection(&cs);
+                ++producers_done;
+                LeaveCriticalSection(&cs);
+                WakeAllConditionVariable(&not_empty);
+            });
+        }
+        for (int c = 0; c < kConsumers; ++c) {
+            threads.emplace_back([&, c]() {
+                int iter = 0;
+                for (;;) {
+                    EnterCriticalSection(&cs);
+                    while (queue.empty() && producers_done < kProducers) {
+                        const uint32_t timeout = ((iter++ + c) & 15) == 0 ? 1u : INFINITE_TIMEOUT;
+                        SleepConditionVariableCS(&not_empty, &cs, timeout);
+                    }
+                    if (queue.empty()) {
+                        LeaveCriticalSection(&cs);
+                        return;
+                    }
+                    consumed_sum += queue.front();
+                    ++consumed_count;
+                    queue.pop_front();
+                    LeaveCriticalSection(&cs);
+                    WakeConditionVariable(&not_full);
+                }
+            });
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        DeleteCriticalSection(&cs);
+
+        constexpr long long kExpectedSum =
+            static_cast<long long>(kProducers) * kPerProducer * (kPerProducer + 1) / 2;
+        CHECK(consumed_count == kProducers * kPerProducer);
+        CHECK(consumed_sum == kExpectedSum);
+    }
+}
+
 int main() {
 #if defined(_WIN32)
     _putenv_s("PG6_EVENT_TRACE", "1");
@@ -1420,6 +1918,9 @@ int main() {
     test_sync_microbench();
     test_sync_contention_microbench();
     test_wait_all_any_stress();
+    test_single_object_fast_paths_and_reusable_wait_block();
+    test_wait_timeout_and_handoff_stress();
+    test_cv_fast_path_and_stress();
     test_semaphores();
     test_live_kernel_handle_counts();
     test_mutexes();
