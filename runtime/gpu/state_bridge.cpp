@@ -166,7 +166,34 @@ StateBridgeDevice::StateBridgeDevice(d3d::DescriptorHeapRegistry& heaps,
     pipeline_cache_ = std::make_unique<pso::PipelineCache>(std::move(cache_options));
 }
 
-StateBridgeDevice::~StateBridgeDevice() = default;
+namespace {
+std::atomic<uint64_t> g_live_views{0};
+std::atomic<uint64_t> g_live_samplers{0};
+std::atomic<uint64_t> g_live_command_lists{0};
+
+void adjust_gauge(std::atomic<uint64_t>& gauge, size_t& tracked, size_t now) noexcept {
+    if (now >= tracked) {
+        gauge.fetch_add(now - tracked, std::memory_order_relaxed);
+    } else {
+        gauge.fetch_sub(tracked - now, std::memory_order_relaxed);
+    }
+    tracked = now;
+}
+}  // namespace
+
+BridgeLiveCounts bridge_live_counts() noexcept {
+    BridgeLiveCounts c;
+    c.interned_views = g_live_views.load(std::memory_order_relaxed);
+    c.samplers = g_live_samplers.load(std::memory_order_relaxed);
+    c.cached_bind_groups = d3d::descriptor_live_counts().cached_bind_groups;
+    c.command_lists = g_live_command_lists.load(std::memory_order_relaxed);
+    return c;
+}
+
+StateBridgeDevice::~StateBridgeDevice() {
+    adjust_gauge(g_live_views, views_tracked_, 0);
+    adjust_gauge(g_live_samplers, samplers_tracked_, 0);
+}
 
 void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo& info) {
     bool replaced = false;
@@ -704,6 +731,7 @@ uint32_t StateBridgeDevice::intern_sampler(const d3d::SamplerDesc& desc, Command
     payload.id = allocate_id();
     encoder.emit_packet(GpuOpcode::CreateSampler2, &payload, sizeof(payload));
     samplers_.emplace(key, payload.id);
+    adjust_gauge(g_live_samplers, samplers_tracked_, samplers_.size());
     return payload.id;
 }
 
@@ -1349,6 +1377,7 @@ uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
     if (record.resource_id != 0 && record.resource_id != record.texture_id) {
         views_by_texture_[record.resource_id].push_back(id);
     }
+    adjust_gauge(g_live_views, views_tracked_, view_ids_.size());
     return id;
 }
 
@@ -1372,6 +1401,7 @@ std::vector<uint32_t> StateBridgeDevice::retire_views(uint32_t texture_id) {
         free_views_.push_back(id);
         retired.push_back(id);
     }
+    adjust_gauge(g_live_views, views_tracked_, view_ids_.size());
     return retired;
 }
 
@@ -1633,12 +1663,29 @@ CommandListBridge::CommandListBridge(StateBridgeDevice& device, CommandEncoder& 
       tracker_(tracker_options(device.options())),
       resource_states_(device.resource_states_) {
     bind_groups_.set_slot_source(device.options().slot_source);
+    g_live_command_lists.fetch_add(1, std::memory_order_relaxed);
     device_.attach_bridge(this);
     Reset();
 }
 
 CommandListBridge::~CommandListBridge() {
+    // A released list takes its cached WebGPU bind groups with it: without this every list the
+    // title creates and releases left its bind groups alive on the host for the rest of the run.
+    // Deferred, because a group may still be referenced by a recording submitted this frame.
+    {
+        std::lock_guard lock(cache_mutex_);
+        std::vector<uint32_t> ids;
+        bind_groups_.clear(&ids);
+        for (const auto& kv : empty_bind_groups_) {
+            ids.push_back(kv.second);
+        }
+        empty_bind_groups_.clear();
+        for (const uint32_t id : ids) {
+            device_.defer_destroy_resource(id);
+        }
+    }
     device_.detach_bridge(this);
+    g_live_command_lists.fetch_sub(1, std::memory_order_relaxed);
 }
 
 void CommandListBridge::invalidate_resources_locked(std::span<const uint32_t> resource_ids,

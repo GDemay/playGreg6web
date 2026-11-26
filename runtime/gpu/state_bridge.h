@@ -222,6 +222,16 @@ inline constexpr uint64_t kMaxUniformBindingSize = 65536;
 // Bind groups one command list keeps cached across Resets (O36); see CommandListBridge::Reset.
 inline constexpr size_t kMaxCachedBindGroups = 4096;
 
+// O36 / backlog 28: process-wide gauges of live bridge-side objects (every StateBridgeDevice and
+// command list), for the boot report and the plateau check of a long run.
+struct BridgeLiveCounts {
+    uint64_t interned_views = 0;
+    uint64_t samplers = 0;
+    uint64_t cached_bind_groups = 0;  // sum over command lists (also d3d12_state::descriptor_live_counts)
+    uint64_t command_lists = 0;       // live CommandListBridge objects
+};
+BridgeLiveCounts bridge_live_counts() noexcept;
+
 class GraphicsPipelineState;
 class ComputePipelineState;
 
@@ -529,6 +539,8 @@ private:
     mutable std::deque<std::string> view_keys_;                               // index = view_id - 1; empty = free
     mutable std::unordered_map<uint32_t, std::vector<uint32_t>> views_by_texture_;
     mutable std::vector<uint32_t> free_views_;
+    mutable size_t views_tracked_ = 0;     // under views_mutex_: this device's share of the live-view gauge
+    size_t samplers_tracked_ = 0;          // under objects_mutex_: its share of the sampler gauge
 
     std::mutex objects_mutex_;  // layouts, samplers, root constant ring
     std::vector<std::unique_ptr<GroupLayoutRecord>> group_layouts_;

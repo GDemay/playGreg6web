@@ -215,6 +215,20 @@ bool DescriptorHeap::range_changed_since(uint32_t first, uint32_t count, uint64_
 // DescriptorHeapRegistry
 // ===========================================================================
 
+namespace {
+std::atomic<uint64_t> g_live_heaps{0};
+std::atomic<uint64_t> g_live_heap_slots{0};
+std::atomic<uint64_t> g_live_cached_bind_groups{0};
+}  // namespace
+
+DescriptorLiveCounts descriptor_live_counts() noexcept {
+    DescriptorLiveCounts c;
+    c.heaps = g_live_heaps.load(std::memory_order_relaxed);
+    c.heap_slots = g_live_heap_slots.load(std::memory_order_relaxed);
+    c.cached_bind_groups = g_live_cached_bind_groups.load(std::memory_order_relaxed);
+    return c;
+}
+
 DescriptorHeapRegistry::DescriptorHeapRegistry()
     : slots_(std::make_unique<std::atomic<DescriptorHeap*>[]>(kMaxDescriptorHeaps)),
       slot_generation_(kMaxDescriptorHeaps, 0) {
@@ -225,7 +239,12 @@ DescriptorHeapRegistry::DescriptorHeapRegistry()
 
 DescriptorHeapRegistry::~DescriptorHeapRegistry() {
     for (uint32_t i = 0; i < next_unused_slot_; ++i) {
-        delete slots_[i].exchange(nullptr, std::memory_order_acq_rel);
+        DescriptorHeap* heap = slots_[i].exchange(nullptr, std::memory_order_acq_rel);
+        if (heap != nullptr) {
+            g_live_heaps.fetch_sub(1, std::memory_order_relaxed);
+            g_live_heap_slots.fetch_sub(heap->capacity(), std::memory_order_relaxed);
+        }
+        delete heap;
     }
 }
 
@@ -289,6 +308,8 @@ Status DescriptorHeapRegistry::create_heap(const DescriptorHeapDesc& desc, Descr
         placed_[desc.cpu_address] = heap;
     }
     live_heaps_.fetch_add(1, std::memory_order_relaxed);
+    g_live_heaps.fetch_add(1, std::memory_order_relaxed);
+    g_live_heap_slots.fetch_add(desc.num_descriptors, std::memory_order_relaxed);
     *out_heap = heap;
     return Status::Ok;
 }
@@ -312,6 +333,8 @@ void DescriptorHeapRegistry::destroy_heap(DescriptorHeap* heap) {
     slot_generation_[slot] = static_cast<uint16_t>((slot_generation_[slot] + 1) & kSlotGenerationMask);
     free_slots_.push_back(slot);
     live_heaps_.fetch_sub(1, std::memory_order_relaxed);
+    g_live_heaps.fetch_sub(1, std::memory_order_relaxed);
+    g_live_heap_slots.fetch_sub(heap->capacity(), std::memory_order_relaxed);
     delete heap;
 }
 
@@ -2269,6 +2292,7 @@ BindGroupLookup BindGroupCache::get_or_build(
         // Hash collision with a different key: replace.
         result.retired_gpu_id = it->second->gpu_id;
         entries_.erase(it);
+        track_size();
     }
     auto entry = std::make_unique<CachedBindGroup>();
     entry->layout_key = layout_key;
@@ -2278,6 +2302,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     result.bind_group = entry.get();
     result.rebuilt = true;
     entries_.emplace(h, std::move(entry));
+    track_size();
     return result;
 }
 
@@ -2405,6 +2430,22 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
         }
     }
     entries_.clear();
+    track_size();
+}
+
+BindGroupCache::~BindGroupCache() {
+    entries_.clear();
+    track_size();
+}
+
+void BindGroupCache::track_size() noexcept {
+    const size_t now = entries_.size();
+    if (now >= tracked_size_) {
+        g_live_cached_bind_groups.fetch_add(now - tracked_size_, std::memory_order_relaxed);
+    } else {
+        g_live_cached_bind_groups.fetch_sub(tracked_size_ - now, std::memory_order_relaxed);
+    }
+    tracked_size_ = now;
 }
 
 uint32_t BindGroupCache::erase(const CachedBindGroup* group) {
@@ -2412,6 +2453,7 @@ uint32_t BindGroupCache::erase(const CachedBindGroup* group) {
         if (it->second.get() == group) {
             const uint32_t id = it->second->gpu_id;
             entries_.erase(it);
+            track_size();
             return id;
         }
     }
@@ -2482,6 +2524,7 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
             ++it;
         }
     }
+    track_size();
     return dropped;
 }
 
@@ -2504,6 +2547,7 @@ size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* reti
             clear(retired);
         }
     }
+    track_size();
     ++epoch_;
     return dropped;
 }

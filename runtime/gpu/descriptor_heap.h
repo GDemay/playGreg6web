@@ -467,6 +467,15 @@ struct ResolvedDescriptor {
     uint32_t index = 0;
 };
 
+// O36 / backlog 28: process-wide gauges of live descriptor objects (every registry and cache in the
+// process), for the boot report and the per-minute plateau check of a long run.
+struct DescriptorLiveCounts {
+    uint64_t heaps = 0;               // live descriptor heaps
+    uint64_t heap_slots = 0;          // descriptor slots across them (capacity)
+    uint64_t cached_bind_groups = 0;  // BindGroupCache entries, each a live WebGPU bind group
+};
+DescriptorLiveCounts descriptor_live_counts() noexcept;
+
 // Device-level owner of all descriptor heaps; resolves opaque handles.
 //
 // Handle encoding (64-bit): high 32 bits = tag(2) | reuse generation(14) | heap
@@ -1069,6 +1078,10 @@ struct BindGroupLookup {
 // did not change, else O(window / kGenerationBlockSize).
 class BindGroupCache {
 public:
+    BindGroupCache() = default;
+    ~BindGroupCache();
+    BindGroupCache(const BindGroupCache&) = delete;
+    BindGroupCache& operator=(const BindGroupCache&) = delete;
     BindGroupLookup get_or_build(
         const RootArgumentState& state,
         BindPoint bind_point,
@@ -1113,6 +1126,10 @@ public:
     uint64_t cb_index_misses() const noexcept { return cb_index_misses_; }
 
 private:
+    // Keeps the process-wide live-entry gauge equal to entries_.size() after a mutation.
+    void track_size() noexcept;
+    size_t tracked_size_ = 0;
+
     void build_entries(
         const RootArgumentState& state,
         BindPoint bind_point,
