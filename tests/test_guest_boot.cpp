@@ -411,6 +411,9 @@ enum class Scenario {
     OffThreadFault,
     HostCallable,
     OffThreadUnresolved,
+    O42PostPresentBatch,
+    O42PostPresentFault,
+    O42PostPresentConcurrent,
 };
 
 // HostCallable: the entry calls a named host callable (like a COM method) twice.
@@ -423,6 +426,14 @@ void host_answer(void* raw) {
 // OffThreadFault: a host thread that runs guest code faults while the boot thread waits.
 std::atomic<bool> g_off_thread_reported{false};
 std::string g_off_thread_report;
+
+// O42 test observations captured mid-run.
+struct O42Observed {
+    uint64_t mid_dispatches = 0;
+    uint32_t main_tid = 0;
+    std::string live_last_import;
+    std::vector<uint32_t> worker_tids;
+} g_o42;
 
 Scenario g_scenario = Scenario::ReturnCode;
 std::vector<std::string> g_events;
@@ -657,6 +668,97 @@ void sub_entry(GuestState* s) {
             }).detach();
             for (int i = 0; i < 5000 && !g_off_thread_reported.load(); ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            reg(s, GuestReg::Rax) = 0;
+            ret(s);
+            return;
+        }
+        case Scenario::O42PostPresentBatch: {
+            g_o42.main_tid = os::win32::GetCurrentThreadId();
+            // 3 pre-present calls (SetLastError x2, GetLastError x1).
+            reg(s, GuestReg::Rcx) = 0x11;
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            reg(s, GuestReg::Rcx) = 0x22;
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            // Mid-run live_counters() must flush the calling thread's pending batch (< 256).
+            g_o42.mid_dispatches = live_counters().dispatches;
+            mark_first_present();
+            // 600 post-present calls (spans 2 full 256-call batches + 88 remainder).
+            for (uint32_t i = 0; i < 600; ++i) {
+                if ((i & 1u) == 0) {
+                    reg(s, GuestReg::Rcx) = 0x1000u + i;
+                    call_iat(s, kSlotSetLastError, kEntryCallsIat);
+                } else {
+                    call_iat(s, kSlotGetLastError, kEntryCallsIat);
+                }
+            }
+            g_o42.live_last_import = guest_thread_last_import(g_o42.main_tid);
+            reg(s, GuestReg::Rax) = 0;
+            ret(s);
+            return;
+        }
+        case Scenario::O42PostPresentFault: {
+            g_o42.main_tid = os::win32::GetCurrentThreadId();
+            reg(s, GuestReg::Rcx) = 0xAA;
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            mark_first_present();
+            reg(s, GuestReg::Rcx) = 0xBB;
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            // Fault with pending dispatches < 256: boot_fault_handler must flush & preserve post-present state.
+            __playgta6_unimplemented(s, kEntry + 0x20);
+        }
+        case Scenario::O42PostPresentConcurrent: {
+            g_o42.main_tid = os::win32::GetCurrentThreadId();
+            // 2 pre-present import calls.
+            reg(s, GuestReg::Rcx) = 0x5;
+            call_iat(s, kSlotSetLastError, kEntryCallsIat);
+            call_iat(s, kSlotGetLastError, kEntryCallsIat);
+            mark_first_present();
+
+            constexpr int kWorkers = 4;
+            constexpr uint32_t kCallsPerWorker = 300;
+            g_o42.worker_tids.assign(kWorkers, 0);
+            std::atomic<int> ready{0};
+            std::atomic<bool> go{false};
+            std::vector<std::thread> workers;
+            workers.reserve(kWorkers);
+            for (int w = 0; w < kWorkers; ++w) {
+                workers.emplace_back([w, &ready, &go] {
+                    GuestState& ws = com::current_guest_state();
+                    g_o42.worker_tids[static_cast<size_t>(w)] = os::win32::GetCurrentThreadId();
+                    ready.fetch_add(1, std::memory_order_release);
+                    while (!go.load(std::memory_order_acquire)) {
+                        std::this_thread::yield();
+                    }
+                    for (uint32_t i = 0; i < kCallsPerWorker; ++i) {
+                        const bool is_last = (i + 1 == kCallsPerWorker);
+                        const bool call_get = is_last ? ((w & 1) == 0) : ((i & 1u) != 0);
+                        if (call_get) {
+                            call_iat(&ws, kSlotGetLastError, kEntryCallsIat);
+                        } else {
+                            reg(&ws, GuestReg::Rcx) = (static_cast<uint64_t>(w) << 16) | i;
+                            call_iat(&ws, kSlotSetLastError, kEntryCallsIat);
+                        }
+                    }
+                });
+            }
+            while (ready.load(std::memory_order_acquire) < kWorkers) {
+                std::this_thread::yield();
+            }
+            go.store(true, std::memory_order_release);
+            // Main thread also runs 100 concurrent post-present calls, ending with SetLastError.
+            for (uint32_t i = 0; i < 100; ++i) {
+                if (i == 99 || (i & 1u) == 0) {
+                    reg(s, GuestReg::Rcx) = 0x9000u + i;
+                    call_iat(s, kSlotSetLastError, kEntryCallsIat);
+                } else {
+                    call_iat(s, kSlotGetLastError, kEntryCallsIat);
+                }
+            }
+            for (std::thread& t : workers) {
+                t.join();
             }
             reg(s, GuestReg::Rax) = 0;
             ret(s);
@@ -1991,6 +2093,132 @@ void test_fence_lag_and_present_max_interval() {
     }
 }
 
+// O42 (#663): per-thread dispatch batching and lock-free post-present import observer.
+void test_lockfree_dispatch_observer() {
+    // 1. Batched dispatch flushing across multiple 256-call batches + remainder, mid-run
+    //    live_counters() flush, and post-present recent/thread_last accuracy.
+    {
+        g_o42 = O42Observed{};
+        const Run run = boot_scenario(Scenario::O42PostPresentBatch);
+        CHECK(run.result.status == BootStatus::Exited);
+        // 2 TLS callbacks + 1 entry + 3 pre-present calls = 6 dispatches at mid-run check.
+        CHECK(g_o42.mid_dispatches == 6);
+        // Total dispatches: 6 + 600 post-present calls = 606 exact.
+        CHECK(run.result.stats.dispatches == 606);
+        CHECK(run.report["counters"]["dispatches"].number == 606);
+        CHECK(run.result.stats.import_calls == 603);
+        CHECK(run.report["counters"]["import_calls"].number == 603);
+        // First present counts only the 3 pre-present calls.
+        const Json& fp = run.report["first_present"];
+        CHECK(fp.type == Json::Object);
+        CHECK(fp["import_seq"].number == 3);
+        uint64_t pre_total = 0;
+        for (const Json& row : fp["imports"].items) {
+            pre_total += static_cast<uint64_t>(row["count"].number);
+        }
+        CHECK(pre_total == 3);
+        // Recent ring has the last 32 post-present calls (seq 572..603) in ascending order.
+        const Json& recent = run.report["counters"]["recent"];
+        CHECK(recent.items.size() == 32);
+        if (recent.items.size() == 32) {
+            CHECK(recent[0]["seq"].number == 572);
+            CHECK(recent[31]["seq"].number == 603);
+            // Call i = 599 is odd -> GetLastError; i = 598 is even -> SetLastError(0x1000 + 598).
+            CHECK(recent[31]["symbol"].text == "GetLastError");
+            CHECK(recent[30]["symbol"].text == "SetLastError");
+            CHECK(recent[30]["args"][0].hex() == 0x1000u + 598u);
+        }
+        // thread_last and live guest_thread_last_import reflect the final post-present call.
+        CHECK(g_o42.live_last_import == "KERNEL32.dll!GetLastError");
+        CHECK(guest_thread_last_import(g_o42.main_tid) == "KERNEL32.dll!GetLastError");
+        const Json& threads = run.report["threads"];
+        CHECK(threads.items.size() == 1);
+        CHECK(threads[0]["last_import"]["seq"].number == 603);
+        CHECK(threads[0]["last_import"]["symbol"].text == "GetLastError");
+        CHECK(run.result.summary.find("#603 KERNEL32.dll!GetLastError") != std::string::npos);
+    }
+
+    // 2. Fault after present_seen with < 256 pending dispatches flushes exact count and preserves
+    //    both pre-present and post-present recent/thread_last entries.
+    {
+        g_o42 = O42Observed{};
+        const Run run = boot_scenario(Scenario::O42PostPresentFault);
+        CHECK(run.result.status == BootStatus::Fault);
+        CHECK(run.report["fault"]["kind"].text == "unimplemented");
+        // 2 TLS callbacks + 1 entry + 3 import calls = 6 dispatches.
+        CHECK(run.result.stats.dispatches == 6);
+        CHECK(run.report["counters"]["dispatches"].number == 6);
+        CHECK(run.result.stats.import_calls == 3);
+        const Json& recent = run.report["counters"]["recent"];
+        CHECK(recent.items.size() == 3);
+        if (recent.items.size() == 3) {
+            CHECK(recent[0]["seq"].number == 1 && recent[0]["args"][0].hex() == 0xAA);
+            CHECK(recent[1]["seq"].number == 2 && recent[1]["args"][0].hex() == 0xBB);
+            CHECK(recent[2]["seq"].number == 3 && recent[2]["symbol"].text == "GetLastError");
+        }
+        const Json& threads = run.report["threads"];
+        CHECK(threads.items.size() == 1);
+        CHECK(threads[0]["last_import"]["seq"].number == 3);
+        CHECK(threads[0]["last_import"]["symbol"].text == "GetLastError");
+        CHECK(guest_thread_last_import(g_o42.main_tid) == "KERNEL32.dll!GetLastError");
+    }
+
+    // 3. Multi-threaded concurrent synthetic import calls after present_seen: exact dispatch &
+    //    import counts across all threads (including thread-exit batch flushes) and accurate
+    //    per-thread last_import + merged recent ring.
+    {
+        const std::vector<uint8_t> saved = g_image;
+        // Empty TLS callbacks so worker threads do not touch non-thread-safe test callback globals.
+        g_image = build_image(true, kBase, {});
+        g_o42 = O42Observed{};
+        const Run run = boot_scenario(Scenario::O42PostPresentConcurrent);
+        g_image = saved;
+
+        CHECK(run.result.status == BootStatus::Exited);
+        // 1 entry + 2 pre-present + 100 main post-present + 4 * 300 worker post-present = 1303 dispatches.
+        CHECK(run.result.stats.dispatches == 1303);
+        CHECK(run.report["counters"]["dispatches"].number == 1303);
+        CHECK(run.result.stats.import_calls == 1302);
+        CHECK(run.report["counters"]["import_calls"].number == 1302);
+        uint64_t sum_imports = 0;
+        for (const Json& row : run.report["counters"]["imports"].items) {
+            sum_imports += static_cast<uint64_t>(row["count"].number);
+        }
+        CHECK(sum_imports == 1302);
+        // First present saw only the 2 pre-present calls.
+        CHECK(run.report["first_present"]["import_seq"].number == 2);
+        // Merged recent ring has exact 32 newest calls (seq 1271..1302), strictly ascending.
+        const Json& recent = run.report["counters"]["recent"];
+        CHECK(recent.items.size() == 32);
+        if (recent.items.size() == 32) {
+            CHECK(recent[0]["seq"].number == 1271);
+            CHECK(recent[31]["seq"].number == 1302);
+            for (size_t i = 1; i < recent.items.size(); ++i) {
+                CHECK(recent[i]["seq"].number == recent[i - 1]["seq"].number + 1);
+            }
+        }
+        // All 5 threads (1 main + 4 workers) report exact post-present last_import.
+        const Json& threads = run.report["threads"];
+        CHECK(threads.items.size() == 5);
+        std::map<uint32_t, std::string> expected_symbol;
+        expected_symbol[g_o42.main_tid] = "SetLastError";
+        for (size_t w = 0; w < g_o42.worker_tids.size(); ++w) {
+            expected_symbol[g_o42.worker_tids[w]] = ((w & 1u) == 0) ? "GetLastError" : "SetLastError";
+        }
+        for (const Json& t : threads.items) {
+            const auto tid = static_cast<uint32_t>(t["thread_id"].number);
+            auto it = expected_symbol.find(tid);
+            CHECK(it != expected_symbol.end());
+            if (it != expected_symbol.end()) {
+                CHECK(t["last_import"].type == Json::Object);
+                CHECK(t["last_import"]["seq"].number > 2);
+                CHECK(t["last_import"]["symbol"].text == it->second);
+                CHECK(guest_thread_last_import(tid) == "KERNEL32.dll!" + it->second);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2022,6 +2250,7 @@ int main() {
     test_shard_dispatch_boot();
     test_boot_options_and_report_sink();
     test_fence_lag_and_present_max_interval();
+    test_lockfree_dispatch_observer();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);
