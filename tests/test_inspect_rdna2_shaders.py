@@ -872,5 +872,392 @@ class TestWholeFileStandaloneIdentityAndManifest(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# T92: Canonical shader summary sorting, zero-division guards & JSON sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestT92StageSummarySortingAndSanitization(unittest.TestCase):
+    def test_canonical_shader_summary_sorting_and_permutation_invariance(self) -> None:
+        vs_a = build_synthetic_vs(extra_param=False, literal_marker=0x10101010)
+        vs_b = build_synthetic_vs(extra_param=True, literal_marker=0x20202020)
+        ps = build_synthetic_ps(include_mimg=True)
+        cs = build_synthetic_cs(saved_terminator=True)
+        unk = pack_words(encode_s_nop(0), encode_s_nop(1), rdna2.S_ENDPGM_WORD)
+
+        # Build FileInspectResults in scrambled order (unknown, compute, pixel, vertex)
+        # including duplicate VS across two files and out-of-order pipeline records (ACCC before ELF).
+        res_unk = rdna2.scan_bytes(unk, source_label="z_unknown.bin")
+        res_cs = rdna2.scan_bytes(cs, source_label="y_compute.bin")
+        res_ps = rdna2.scan_bytes(ps, source_label="m_pixel.bin")
+        res_vs_a = rdna2.scan_bytes(vs_a, source_label="b_vertex_a.bin")
+        res_vs_b = rdna2.scan_bytes(vs_b, source_label="a_vertex_b.bin")
+        res_vs_dup = rdna2.scan_bytes(vs_a, source_label="c_vertex_dup.bin")
+
+        # Also test pipeline record offset sorting when ACCC precedes AMDGPU_ELF in a buffer.
+        accc_first = b"ACCC" + struct.pack("<I", len(ps)) + ps
+        elf_second = build_amdgpu_elf_header(0x36)
+        res_records = rdna2.scan_bytes(
+            accc_first + (b"\x00" * 16) + elf_second,
+            source_label="d_records.bin",
+        )
+        self.assertEqual(
+            [r.kind for r in res_records.pipeline_records],
+            ["ACCC", "AMDGPU_ELF"],
+        )
+        self.assertLess(
+            res_records.pipeline_records[0].offset,
+            res_records.pipeline_records[1].offset,
+        )
+
+        order_1 = [res_unk, res_cs, res_ps, res_vs_a, res_vs_b, res_vs_dup]
+        order_2 = [res_vs_dup, res_ps, res_vs_b, res_unk, res_vs_a, res_cs]
+
+        report_1 = rdna2._build_report(
+            target_label="canonical_test",
+            target_kind="directory",
+            max_bytes=None,
+            max_hits=None,
+            min_dwords=2,
+            all_results=order_1,
+            hit_limit_reached=False,
+            include_empty=False,
+        )
+        report_2 = rdna2._build_report(
+            target_label="canonical_test",
+            target_kind="directory",
+            max_bytes=None,
+            max_hits=None,
+            min_dwords=2,
+            all_results=order_2,
+            hit_limit_reached=False,
+            include_empty=False,
+        )
+
+        # Byte-for-byte identical JSON regardless of input order.
+        json_1 = rdna2.render_json(report_1)
+        json_2 = rdna2.render_json(report_2)
+        self.assertEqual(json_1, json_2)
+
+        payload = json.loads(json_1)
+        summary = payload["summary"]
+
+        # Canonical stage ordering: vertex -> pixel -> compute -> unknown.
+        self.assertEqual(
+            list(summary["stage_counts"].keys()),
+            ["vertex", "pixel", "compute", "unknown"],
+        )
+        self.assertEqual(
+            list(summary["stage_percentages"].keys()),
+            ["vertex", "pixel", "compute", "unknown"],
+        )
+        self.assertEqual(
+            [row["stage"] for row in summary["stage_breakdown"]],
+            ["vertex", "pixel", "compute", "unknown"],
+        )
+
+        # Stage counts and percentages (3 vertex, 1 pixel, 1 compute, 1 unknown = 6 total).
+        self.assertEqual(summary["total_shaders"], 6)
+        self.assertEqual(summary["unique_shader_hashes"], 5)
+        self.assertEqual(summary["stage_percentages"]["vertex"], 50.0)
+        self.assertEqual(summary["stage_percentages"]["pixel"], 16.67)
+        self.assertEqual(summary["stage_percentages"]["compute"], 16.67)
+        self.assertEqual(summary["stage_percentages"]["unknown"], 16.67)
+
+        # Canonical shader_summary sorted by (canonical stage rank, hash_hex).
+        shader_summary = summary["shader_summary"]
+        self.assertEqual(len(shader_summary), 5)
+        self.assertEqual(
+            [row["stage"] for row in shader_summary],
+            ["vertex", "vertex", "pixel", "compute", "unknown"],
+        )
+        vs_hashes = [row["hash"] for row in shader_summary if row["stage"] == "vertex"]
+        self.assertEqual(vs_hashes, sorted(vs_hashes))
+
+        # Duplicate vertex shader aggregated with occurrence count & sorted paths.
+        vs_a_hash = rdna2.format_hash_64(rdna2.fnv1a_64(vs_a))
+        vs_a_row = next(row for row in shader_summary if row["hash"] == vs_a_hash)
+        self.assertEqual(vs_a_row["occurrences"], 2)
+        self.assertEqual(vs_a_row["paths"], ["b_vertex_a.bin", "c_vertex_dup.bin"])
+
+        # Files list deterministically sorted by path.
+        self.assertEqual(
+            [f["path"] for f in payload["files"]],
+            [
+                "a_vertex_b.bin",
+                "b_vertex_a.bin",
+                "c_vertex_dup.bin",
+                "m_pixel.bin",
+                "y_compute.bin",
+                "z_unknown.bin",
+            ],
+        )
+
+        # Markdown renders canonical stage order with share percentages.
+        md = rdna2.render_markdown(report_1)
+        self.assertIn("| Stage | Shaders | Share |", md)
+        self.assertIn("| `vertex` | 3 | 50.00% |", md)
+        self.assertLess(md.index("| `vertex` |"), md.index("| `pixel` |"))
+        self.assertLess(md.index("| `pixel` |"), md.index("| `compute` |"))
+        self.assertLess(md.index("| `compute` |"), md.index("| `unknown` |"))
+
+    def test_zero_shader_zero_division_guards(self) -> None:
+        # Direct helper calls with zero counts, explicit total=0, negative values, and bools.
+        empty_breakdown = rdna2.compute_stage_breakdown({})
+        self.assertEqual(
+            empty_breakdown,
+            [
+                {"stage": "vertex", "count": 0, "percentage": 0.0},
+                {"stage": "pixel", "count": 0, "percentage": 0.0},
+                {"stage": "compute", "count": 0, "percentage": 0.0},
+                {"stage": "unknown", "count": 0, "percentage": 0.0},
+            ],
+        )
+        self.assertEqual(
+            rdna2.compute_stage_percentages({}),
+            {"vertex": 0.0, "pixel": 0.0, "compute": 0.0, "unknown": 0.0},
+        )
+        self.assertEqual(
+            rdna2.compute_stage_percentages({"vertex": 5, "pixel": 2}, total_shaders=0),
+            {"vertex": 0.0, "pixel": 0.0, "compute": 0.0, "unknown": 0.0},
+        )
+        self.assertEqual(
+            rdna2.compute_stage_percentages({"vertex": -4, "pixel": True}),
+            {"vertex": 0.0, "pixel": 0.0, "compute": 0.0, "unknown": 0.0},
+        )
+
+        # End-to-end CLI --json and Markdown on empty dir, empty file, and filtered-out shaders.
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_dir = Path(tmp) / "empty_shaders"
+            empty_dir.mkdir()
+            empty_file = Path(tmp) / "zero.bin"
+            empty_file.write_bytes(b"")
+            filtered_file = Path(tmp) / "short_vs.bin"
+            filtered_file.write_bytes(build_synthetic_vs())
+
+            for argv in (
+                [str(empty_dir), "--json"],
+                [str(empty_file), "--json"],
+                [str(filtered_file), "--json", "--min-dwords", "999"],
+            ):
+                code, raw_json, err = _run_cli(argv)
+                self.assertEqual((code, err), (0, ""))
+                payload = json.loads(raw_json)
+                summary = payload["summary"]
+                self.assertEqual(summary["total_shaders"], 0)
+                self.assertEqual(summary["stage_counts"], {})
+                self.assertEqual(
+                    summary["stage_percentages"],
+                    {"vertex": 0.0, "pixel": 0.0, "compute": 0.0, "unknown": 0.0},
+                )
+                self.assertEqual(summary["stage_breakdown"], empty_breakdown)
+                self.assertEqual(summary["shader_summary"], [])
+
+            code_md, md_out, err_md = _run_cli([str(empty_dir)])
+            self.assertEqual((code_md, err_md), (0, ""))
+            self.assertIn("No RDNA2 / GFX10.3 shaders detected.", md_out)
+
+    def test_strict_host_path_and_username_sanitization_in_json_output(self) -> None:
+        # Helper sanitization for user-home leaves, file://, MSYS, tilde, UNC, PathLike, and bytes.
+        self.assertEqual(rdna2.sanitize_source_label(r"C:\Users\alice"), "<user>")
+        self.assertEqual(rdna2.sanitize_source_label("/home/bob/"), "<user>")
+        self.assertEqual(rdna2.sanitize_source_label("/Users/carol"), "<user>")
+        self.assertEqual(rdna2.sanitize_source_label("/c/Users/dave"), "<user>")
+        self.assertEqual(rdna2.sanitize_source_label("~eve"), "<user>")
+        self.assertEqual(
+            rdna2.sanitize_source_label("file:///C:/Users/frank/dumps/vs.bin"),
+            "vs.bin",
+        )
+
+        scrubbed = rdna2.sanitize_json_value(
+            {
+                "win": r"C:\Users\alice\work\vs.bin",
+                "posix": "/home/bob/work/ps.bin",
+                "posix_lower": "/users/carol/work/cs.bin",
+                "msys": "/c/Users/dave/work/shader.bin",
+                "uri": "file:///C:/Users/eve/work/dump.bin",
+                "tilde": "~frank/work/shader.bin",
+                "unc": r"\\fileserver\share\grace\shader.bin",
+                "unc_fs": "//fileserver/share/heidi/shader.bin",
+                "path_obj": Path("/home/ivan/projects/playgta6web/shader.bin"),
+                "raw_bytes": b"\xde\xad\xbe\xef",
+            }
+        )
+        serialized = json.dumps(scrubbed)
+        for leak in (
+            "alice",
+            "bob",
+            "carol",
+            "dave",
+            "eve",
+            "frank",
+            "grace",
+            "heidi",
+            "ivan",
+            "C:\\",
+            "C:/",
+            "/home/",
+            "/Users/",
+            "/users/",
+            "file://",
+            "fileserver",
+            "deadbeef",
+        ):
+            self.assertNotIn(leak, serialized)
+        self.assertEqual(scrubbed["path_obj"], "shader.bin")
+        self.assertEqual(scrubbed["raw_bytes"], "<bytes:4>")
+
+        # Directly constructed InspectReport with leaked host paths/usernames in every text field
+        # MUST be strictly sanitized by to_dict() and render_json().
+        username = "t92secretuser"
+        vs = build_synthetic_vs()
+        hit = rdna2.analyze_shader_region(vs, abs_offset=0, terminator_word=rdna2.S_ENDPGM_WORD)
+        leaked_file = rdna2.FileInspectResult(
+            path=rf"C:\Users\{username}\PrivateDump\vs_00.bin",
+            file_size=len(vs),
+            bytes_scanned=len(vs),
+            truncated=False,
+            shaders=(hit,),
+            pipeline_records=(
+                rdna2.PipelineRecordHit(
+                    kind="AMDGPU_ELF",
+                    offset=0,
+                    detail=f"/home/{username}/sdk/gfx1030.elf",
+                ),
+            ),
+            error=rf"read failed at \\nas-box\private\{username}\vs_00.bin",
+        )
+        leaked_report = rdna2.InspectReport(
+            schema_version=rdna2.SCHEMA_VERSION,
+            target_label=rf"C:\Users\{username}\PrivateDump",
+            target_kind="directory",
+            max_bytes=None,
+            max_hits=None,
+            min_dwords=2,
+            files_scanned=1,
+            files_with_shaders=1,
+            files_errored=1,
+            total_file_bytes=len(vs),
+            total_bytes_scanned=len(vs),
+            total_shaders=1,
+            unique_shader_hashes=1,
+            total_pipeline_records=1,
+            hit_limit_reached=False,
+            stage_counts={"vertex": 1},
+            terminator_counts={"s_endpgm": 1},
+            export_target_histogram={"pos0": 1},
+            size_histogram={"0..64B": 1},
+            instruction_totals={"exp": 1, "smem": 0, "vintrp": 0, "mimg": 0, "valu": 0, "salu": 0, "sopp": 1, "vmem": 0, "ds": 0, "flat": 0},
+            pipeline_record_counts={"AMDGPU_ELF": 1},
+            files=(leaked_file,),
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "USERNAME": username,
+                "USER": username,
+                "HOME": f"/home/{username}",
+                "USERPROFILE": rf"C:\Users\{username}",
+            },
+        ):
+            rendered_json = rdna2.render_json(leaked_report)
+            rendered_md = rdna2.render_markdown(leaked_report)
+
+            # Also run CLI end-to-end with username inside directory & filename.
+            with tempfile.TemporaryDirectory() as tmp:
+                user_dir = Path(tmp) / "Users" / username
+                sub = user_dir / f"{username}_shaders"
+                sub.mkdir(parents=True)
+                (sub / f"{username}_vs.bin").write_bytes(vs)
+                cli_code, cli_json, cli_err = _run_cli([str(user_dir), "--json"])
+
+        self.assertEqual((cli_code, cli_err), (0, ""))
+        parsed_leaked = json.loads(rendered_json)
+        self.assertEqual(parsed_leaked["target"], "PrivateDump")
+        self.assertEqual(parsed_leaked["files"][0]["path"], "vs_00.bin")
+        self.assertEqual(parsed_leaked["summary"]["shader_summary"][0]["paths"], ["vs_00.bin"])
+        self.assertEqual(json.loads(cli_json)["target"], "<user>")
+
+        for output in (rendered_json, rendered_md, cli_json):
+            self.assertNotIn(username, output)
+            self.assertNotIn("C:\\", output)
+            self.assertNotIn("C:/", output)
+            self.assertNotIn("/home/", output)
+            self.assertNotIn("/Users/", output)
+            self.assertNotIn("nas-box", output)
+            self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
+
+    def test_backward_compatibility_existing_cli_flags_and_legacy_report(self) -> None:
+        vs = build_synthetic_vs(extra_param=True)
+        ps = build_synthetic_ps(include_mimg=True)
+        cs = build_synthetic_cs(saved_terminator=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "compat_shaders"
+            root.mkdir()
+            (root / "01_vs.bin").write_bytes(vs)
+            (root / "02_ps.bin").write_bytes(ps)
+            (root / "03_cs.bin").write_bytes(cs)
+
+            # Verify existing flags (--json, --max-hits, --min-dwords, --max-bytes, --whole-file, --embedded).
+            c1, out1, err1 = _run_cli([str(root), "--json", "--max-hits", "2", "--min-dwords", "2"])
+            self.assertEqual((c1, err1), (0, ""))
+            d1 = json.loads(out1)
+            self.assertEqual(d1["schema_version"], 1)
+            self.assertEqual(d1["max_hits"], 2)
+            self.assertEqual(d1["min_dwords"], 2)
+            self.assertTrue(d1["summary"]["hit_limit_reached"])
+            self.assertEqual(d1["summary"]["total_shaders"], 2)
+
+            c2, out2, err2 = _run_cli([str(root / "01_vs.bin"), "--json", "--whole-file", "--max-bytes", "64K"])
+            self.assertEqual((c2, err2), (0, ""))
+            d2 = json.loads(out2)
+            self.assertEqual(d2["files"][0]["hash_scope"], "whole_file")
+            self.assertEqual(d2["summary"]["stage_percentages"]["vertex"], 100.0)
+
+            c3, out3, err3 = _run_cli([str(root / "01_vs.bin"), "--json", "--embedded"])
+            self.assertEqual((c3, err3), (0, ""))
+            d3 = json.loads(out3)
+            self.assertEqual(d3["files"][0]["hash_scope"], "region")
+
+            # Missing --from-env still returns exit code 1 with actionable message.
+            c4, _out4, err4 = _run_cli(["--from-env", "--json"], env_path=Path(tmp) / "missing.env", env={})
+            self.assertEqual(c4, 1)
+            self.assertIn("GTA6_GAME_DIR", err4)
+
+        # Legacy InspectReport construction without new optional fields populates T92 summary fields automatically.
+        legacy_report = rdna2.InspectReport(
+            schema_version=1,
+            target_label="legacy_target",
+            target_kind="file",
+            max_bytes=None,
+            max_hits=None,
+            min_dwords=2,
+            files_scanned=1,
+            files_with_shaders=1,
+            files_errored=0,
+            total_file_bytes=len(ps),
+            total_bytes_scanned=len(ps),
+            total_shaders=1,
+            unique_shader_hashes=1,
+            total_pipeline_records=0,
+            hit_limit_reached=False,
+            stage_counts={"pixel": 1},
+            terminator_counts={"s_endpgm": 1},
+            export_target_histogram={"mrt0": 1},
+            size_histogram={"0..64B": 1},
+            instruction_totals={"exp": 1, "smem": 0, "vintrp": 1, "mimg": 1, "valu": 0, "salu": 0, "sopp": 1, "vmem": 0, "ds": 0, "flat": 0},
+            pipeline_record_counts={},
+        )
+        legacy_dict = legacy_report.to_dict()
+        self.assertEqual(
+            legacy_dict["summary"]["stage_percentages"],
+            {"vertex": 0.0, "pixel": 100.0, "compute": 0.0, "unknown": 0.0},
+        )
+        self.assertEqual(len(legacy_dict["summary"]["stage_breakdown"]), 4)
+        self.assertEqual(legacy_dict["summary"]["shader_summary"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

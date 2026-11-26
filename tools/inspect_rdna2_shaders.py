@@ -165,6 +165,12 @@ AMDGPU_ELF_MACHINES: dict[int, str] = {
     0x3C: "gfx1036",
 }
 
+# Canonical GFX10.3 / RDNA2 shader stage ordering (T92)
+CANONICAL_STAGE_ORDER: tuple[str, ...] = ("vertex", "pixel", "compute", "unknown")
+_CANONICAL_STAGE_RANK: dict[str, int] = {
+    stage: idx for idx, stage in enumerate(CANONICAL_STAGE_ORDER)
+}
+
 # Size histogram bucket definitions (inclusive upper bound in bytes, label)
 SIZE_HISTOGRAM_BUCKETS: tuple[tuple[int | None, str], ...] = (
     (64, "0..64B"),
@@ -176,12 +182,18 @@ SIZE_HISTOGRAM_BUCKETS: tuple[tuple[int | None, str], ...] = (
     (None, ">65536B"),
 )
 
-# Sanitization patterns (matching tools/scan_shaders.py & tools/extract_dxil_corpus.py)
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
+# Sanitization patterns (matching tools/scan_shaders.py, tools/extract_dxil_corpus.py & T83/T92)
+_FILE_URI_RE = re.compile(r"file://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
-_POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+_UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
+_MSYS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])/[A-Za-z]/(?:Users|users|home|Windows|Program|tmp|var|opt|mnt)/[^\s\"'<>|,;()\[\]]*"
 )
+_POSIX_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])/(?:Users|users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|srv|run|media|cygdrive)/[^\s\"'<>|,;()\[\]]*"
+)
+_TILDE_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9._-]*/[^\s\"'<>|,;()\[\]]*")
 _SIZE_SUFFIX_RE = re.compile(r"^\s*(\d+)\s*([kKmMgG](?:i?[bB])?|[bB])?\s*$")
 
 
@@ -488,6 +500,15 @@ def _current_usernames() -> list[str]:
         cleaned = candidate.strip()
         if len(cleaned) >= 3 and cleaned not in names:
             names.append(cleaned)
+    for env_path_var in ("USERPROFILE", "HOME"):
+        raw_home = os.environ.get(env_path_var, "").strip().rstrip("/\\")
+        if not raw_home:
+            continue
+        parts = [p for p in re.split(r"[/\\]+", raw_home) if p]
+        if len(parts) >= 2 and parts[-2].lower() in ("users", "home"):
+            leaf = parts[-1].strip()
+            if len(leaf) >= 3 and leaf not in names:
+                names.append(leaf)
     try:
         home_name = Path.home().name.strip()
         if len(home_name) >= 3 and home_name not in names:
@@ -498,10 +519,14 @@ def _current_usernames() -> list[str]:
 
 
 def _scrub_sensitive_text(text: str) -> str:
-    """Remove host absolute paths (Windows, UNC, POSIX) and active OS usernames."""
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
+    """Remove host absolute paths (Windows, UNC, POSIX, MSYS, file://, tilde) and active OS usernames."""
+    sanitized = _FILE_URI_RE.sub("<path>", text)
     sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_FS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _MSYS_PATH_RE.sub("<path>", sanitized)
     sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    sanitized = _TILDE_HOME_RE.sub("<path>", sanitized)
     for username in _current_usernames():
         pattern = re.compile(
             rf"(?<![A-Za-z0-9]){re.escape(username)}(?![A-Za-z0-9])",
@@ -509,6 +534,46 @@ def _scrub_sensitive_text(text: str) -> str:
         )
         sanitized = pattern.sub("<user>", sanitized)
     return sanitized
+
+
+def sanitize_text(raw: str | None) -> str:
+    """Public text sanitizer stripping host absolute paths and active OS usernames."""
+    if raw is None:
+        return ""
+    return _scrub_sensitive_text(str(raw))
+
+
+def _is_user_home_leaf(parts: Sequence[str]) -> bool:
+    """Return True if path segments terminate at a host user-home directory leaf."""
+    if len(parts) < 2:
+        return False
+    if parts[-2].lower() not in ("users", "home"):
+        return False
+    if len(parts) == 2:
+        return True
+    if len(parts) == 3:
+        first = parts[0]
+        if not first:
+            return True
+        if len(first) == 2 and first[1] == ":" and first[0].isalpha():
+            return True
+        if len(first) == 1 and first.isalpha():
+            return True
+    return False
+
+
+def _is_host_absolute_path(raw: str) -> bool:
+    """Return True if `raw` looks like a host-local absolute path, URI, UNC, or tilde path."""
+    stripped = raw.strip()
+    if not stripped:
+        return False
+    if stripped.lower().startswith("file://"):
+        return True
+    if stripped.startswith(("\\\\", "//", "/", "~")):
+        return True
+    if len(stripped) >= 2 and stripped[0].isalpha() and stripped[1] == ":":
+        return True
+    return False
 
 
 def sanitize_source_label(source: str | Path | None) -> str:
@@ -520,14 +585,62 @@ def sanitize_source_label(source: str | Path | None) -> str:
         return "<unknown>"
     if raw.startswith("<") and raw.endswith(">"):
         return _scrub_sensitive_text(raw)
+    if raw.lower().startswith("file://"):
+        raw = raw[7:]
+        if raw.lower().startswith("localhost/"):
+            raw = raw[len("localhost") :]
     stripped = raw.rstrip("/\\")
     if not stripped:
         return "<unknown>"
-    parts = re.split(r"[/\\]+", stripped)
+    if stripped.startswith("~") and "/" not in stripped and "\\" not in stripped:
+        return "<user>"
+    parts = [p for p in re.split(r"[/\\]+", stripped) if p]
+    if not parts:
+        return "<unknown>"
     base = parts[-1]
     if not base or (len(base) == 2 and base[1] == ":"):
         return "<unknown>"
+    if _is_user_home_leaf(parts):
+        return "<user>"
     return _scrub_sensitive_text(base)
+
+
+def _sanitize_report_path(path: str | Path | None) -> str:
+    """Sanitize a report file path: preserve clean POSIX relative paths, strip host absolute paths."""
+    if path is None:
+        return "<memory>"
+    raw = str(path).strip()
+    if not raw:
+        return "<unknown>"
+    if raw.startswith("<") and raw.endswith(">"):
+        return _scrub_sensitive_text(raw)
+    if _is_host_absolute_path(raw):
+        return sanitize_source_label(raw)
+    cleaned = raw.replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    cleaned = cleaned.strip("/")
+    if not cleaned:
+        return "<unknown>"
+    return _scrub_sensitive_text(cleaned)
+
+
+def sanitize_json_value(value: Any) -> Any:
+    """Recursively sanitize JSON values, stripping host paths, usernames, PathLike, and raw bytes."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<bytes:{len(value)}>"
+    if isinstance(value, os.PathLike):
+        return sanitize_source_label(os.fspath(value))
+    if isinstance(value, str):
+        return _scrub_sensitive_text(value)
+    if isinstance(value, Mapping):
+        return {
+            _scrub_sensitive_text(str(k)): sanitize_json_value(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json_value(item) for item in value]
+    return value
 
 
 def sanitize_relative_path(path: Path, base_dir: Path | None) -> str:
@@ -737,6 +850,137 @@ class Rdna2ShaderHit:
         return payload
 
 
+def _stage_sort_key(stage: str) -> tuple[int, str]:
+    """Deterministic canonical stage sort key (`vertex`, `pixel`, `compute`, `unknown`, then alpha)."""
+    return (_CANONICAL_STAGE_RANK.get(stage, len(CANONICAL_STAGE_ORDER)), stage)
+
+
+def _shader_hit_sort_key(hit: Rdna2ShaderHit) -> tuple[int, int, int, tuple[int, str]]:
+    """Deterministic sort key for shaders within a file."""
+    return (hit.offset, hit.end_offset, hit.fnv1a_64, _stage_sort_key(hit.stage))
+
+
+def _pipeline_record_sort_key(rec: PipelineRecordHit) -> tuple[int, str, int, str]:
+    """Deterministic sort key for pipeline records within a file."""
+    return (rec.offset, rec.kind, rec.size if rec.size is not None else -1, rec.detail or "")
+
+
+def _non_negative_int(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)
+
+
+def compute_stage_breakdown(
+    stage_counts: Mapping[str, int],
+    *,
+    total_shaders: int | None = None,
+) -> list[dict[str, Any]]:
+    """Compute canonical, zero-division-safe stage breakdown counts and percentages (T92).
+
+    Always includes the canonical RDNA2 stages (`vertex`, `pixel`, `compute`, `unknown`)
+    in canonical order, followed by any additional stage labels sorted alphabetically.
+    When total shaders is 0 (or <= 0), all stage percentages are safely `0.0`.
+    """
+    normalized: dict[str, int] = {stage: 0 for stage in CANONICAL_STAGE_ORDER}
+    for raw_stage, raw_count in stage_counts.items():
+        stage = _scrub_sensitive_text(str(raw_stage))
+        normalized[stage] = normalized.get(stage, 0) + _non_negative_int(raw_count)
+
+    total = (
+        sum(normalized.values())
+        if total_shaders is None
+        else _non_negative_int(total_shaders)
+    )
+    breakdown: list[dict[str, Any]] = []
+    for stage in sorted(normalized.keys(), key=_stage_sort_key):
+        count = normalized[stage]
+        pct = round((count / total) * 100.0, 2) if total > 0 else 0.0
+        breakdown.append(
+            {
+                "stage": stage,
+                "count": count,
+                "percentage": pct,
+            }
+        )
+    return breakdown
+
+
+def compute_stage_percentages(
+    stage_counts: Mapping[str, int],
+    *,
+    total_shaders: int | None = None,
+) -> dict[str, float]:
+    """Return a canonical stage-ordered mapping of stage -> zero-division-safe percentage (T92)."""
+    return {
+        entry["stage"]: entry["percentage"]
+        for entry in compute_stage_breakdown(stage_counts, total_shaders=total_shaders)
+    }
+
+
+def build_canonical_shader_summary(
+    results: Sequence[FileInspectResult],
+) -> list[dict[str, Any]]:
+    """Build a deterministically sorted, strictly sanitized canonical shader summary (T92).
+
+    Groups detected shaders by canonical `(stage, fnv1a_64)` identity, aggregates
+    occurrence counts and sorted sanitized source paths, and sorts deterministically by
+    `(canonical_stage_rank, stage, hash_hex)`.
+    """
+    grouped: dict[tuple[str, int], dict[str, Any]] = {}
+    for res in results:
+        safe_path = _sanitize_report_path(res.path)
+        for shader in res.shaders:
+            stage = _scrub_sensitive_text(shader.stage)
+            key = (stage, shader.fnv1a_64)
+            entry = grouped.get(key)
+            if entry is None:
+                grouped[key] = {
+                    "hash": shader.hash_hex,
+                    "stage": stage,
+                    "byte_size": shader.byte_size,
+                    "dword_count": shader.dword_count,
+                    "instruction_count": shader.instruction_count,
+                    "terminator": _scrub_sensitive_text(shader.terminator),
+                    "export_targets": sorted(
+                        {_scrub_sensitive_text(t) for t in shader.export_targets}
+                    ),
+                    "occurrences": 1,
+                    "paths": {safe_path},
+                }
+            else:
+                entry["occurrences"] += 1
+                entry["paths"].add(safe_path)
+                if shader.byte_size < entry["byte_size"]:
+                    entry["byte_size"] = shader.byte_size
+                    entry["dword_count"] = shader.dword_count
+                    entry["instruction_count"] = shader.instruction_count
+                entry["export_targets"] = sorted(
+                    set(entry["export_targets"])
+                    | {_scrub_sensitive_text(t) for t in shader.export_targets}
+                )
+
+    summary_rows: list[dict[str, Any]] = []
+    for (_stage, _digest), entry in sorted(
+        grouped.items(),
+        key=lambda item: (_stage_sort_key(item[0][0]), format_hash_64(item[0][1])),
+    ):
+        summary_rows.append(
+            {
+                "hash": entry["hash"],
+                "stage": entry["stage"],
+                "byte_size": entry["byte_size"],
+                "dword_count": entry["dword_count"],
+                "instruction_count": entry["instruction_count"],
+                "terminator": entry["terminator"],
+                "export_targets": list(entry["export_targets"]),
+                "occurrences": entry["occurrences"],
+                "paths": sorted(entry["paths"]),
+            }
+        )
+    return summary_rows
+
+
 @dataclass(frozen=True)
 class PipelineRecordHit:
     """Console / AMDGPU pipeline container record detected during scanning."""
@@ -748,12 +992,12 @@ class PipelineRecordHit:
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "kind": self.kind,
+            "kind": _scrub_sensitive_text(self.kind),
             "offset": self.offset,
             "size": self.size,
         }
         if self.detail is not None:
-            payload["detail"] = self.detail
+            payload["detail"] = _scrub_sensitive_text(self.detail)
         return payload
 
 
@@ -775,7 +1019,12 @@ class FileInspectResult:
 
     @property
     def stage_counts(self) -> dict[str, int]:
-        return dict(sorted(Counter(s.stage for s in self.shaders).items()))
+        counts = Counter(s.stage for s in self.shaders)
+        return {stage: counts[stage] for stage in sorted(counts.keys(), key=_stage_sort_key)}
+
+    @property
+    def stage_percentages(self) -> dict[str, float]:
+        return compute_stage_percentages(self.stage_counts, total_shaders=len(self.shaders))
 
     @property
     def export_target_counts(self) -> dict[str, int]:
@@ -786,26 +1035,29 @@ class FileInspectResult:
         return dict(sorted(counts.items()))
 
     def to_dict(self) -> dict[str, Any]:
+        sorted_shaders = sorted(self.shaders, key=_shader_hit_sort_key)
+        sorted_records = sorted(self.pipeline_records, key=_pipeline_record_sort_key)
         payload: dict[str, Any] = {
-            "path": self.path,
+            "path": _sanitize_report_path(self.path),
             "file_size": self.file_size,
             "bytes_scanned": self.bytes_scanned,
             "truncated": self.truncated,
             "hit_limit_reached": self.hit_limit_reached,
             "unaligned_tail_bytes": self.unaligned_tail_bytes,
             "hash_scope": self.hash_scope,
-            "shader_count": len(self.shaders),
-            "pipeline_record_count": len(self.pipeline_records),
+            "shader_count": len(sorted_shaders),
+            "pipeline_record_count": len(sorted_records),
             "stage_counts": self.stage_counts,
+            "stage_percentages": self.stage_percentages,
             "export_target_counts": self.export_target_counts,
-            "shaders": [s.to_dict() for s in self.shaders],
-            "pipeline_records": [r.to_dict() for r in self.pipeline_records],
+            "shaders": [s.to_dict() for s in sorted_shaders],
+            "pipeline_records": [r.to_dict() for r in sorted_records],
         }
         if self.file_hash_fnv1a64 is not None:
             payload["file_hash_fnv1a64"] = format_hash_64(self.file_hash_fnv1a64)
         if self.error is not None:
-            payload["error"] = self.error
-        return payload
+            payload["error"] = _scrub_sensitive_text(self.error)
+        return sanitize_json_value(payload)
 
 
 @dataclass(frozen=True)
@@ -834,11 +1086,43 @@ class InspectReport:
     instruction_totals: dict[str, int]
     pipeline_record_counts: dict[str, int]
     files: tuple[FileInspectResult, ...] = field(default_factory=tuple)
+    stage_breakdown: tuple[dict[str, Any], ...] = field(default_factory=tuple)
+    stage_percentages: dict[str, float] = field(default_factory=dict)
+    shader_summary: tuple[dict[str, Any], ...] = field(default_factory=tuple)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        canonical_stage_counts = {
+            stage: self.stage_counts[stage]
+            for stage in sorted(self.stage_counts.keys(), key=_stage_sort_key)
+        }
+        breakdown = (
+            list(self.stage_breakdown)
+            if self.stage_breakdown
+            else compute_stage_breakdown(
+                canonical_stage_counts,
+                total_shaders=self.total_shaders,
+            )
+        )
+        percentages = (
+            {
+                stage: self.stage_percentages[stage]
+                for stage in sorted(self.stage_percentages.keys(), key=_stage_sort_key)
+            }
+            if self.stage_percentages
+            else {entry["stage"]: entry["percentage"] for entry in breakdown}
+        )
+        sorted_files = sorted(
+            self.files,
+            key=lambda f: (_sanitize_report_path(f.path), f.file_size, f.bytes_scanned),
+        )
+        canonical_shaders = (
+            list(self.shader_summary)
+            if self.shader_summary
+            else build_canonical_shader_summary(sorted_files)
+        )
+        payload: dict[str, Any] = {
             "schema_version": self.schema_version,
-            "target": self.target_label,
+            "target": sanitize_source_label(self.target_label),
             "target_kind": self.target_kind,
             "max_bytes": self.max_bytes,
             "max_hits": self.max_hits,
@@ -853,15 +1137,19 @@ class InspectReport:
                 "unique_shader_hashes": self.unique_shader_hashes,
                 "total_pipeline_records": self.total_pipeline_records,
                 "hit_limit_reached": self.hit_limit_reached,
-                "stage_counts": dict(self.stage_counts),
-                "terminator_counts": dict(self.terminator_counts),
-                "export_target_histogram": dict(self.export_target_histogram),
+                "stage_counts": canonical_stage_counts,
+                "stage_percentages": percentages,
+                "stage_breakdown": breakdown,
+                "terminator_counts": dict(sorted(self.terminator_counts.items())),
+                "export_target_histogram": dict(sorted(self.export_target_histogram.items())),
                 "size_histogram": dict(self.size_histogram),
                 "instruction_totals": dict(self.instruction_totals),
-                "pipeline_record_counts": dict(self.pipeline_record_counts),
+                "pipeline_record_counts": dict(sorted(self.pipeline_record_counts.items())),
+                "shader_summary": canonical_shaders,
             },
-            "files": [f.to_dict() for f in self.files],
+            "files": [f.to_dict() for f in sorted_files],
         }
+        return sanitize_json_value(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -1682,6 +1970,8 @@ def scan_bytes(
             window_file_offset = prev_scanned_end
 
     bytes_scanned = prev_scanned_end
+    shaders.sort(key=_shader_hit_sort_key)
+    records.sort(key=_pipeline_record_sort_key)
     return FileInspectResult(
         path=safe_label,
         file_size=total_len,
@@ -1911,6 +2201,8 @@ def scan_file(
                     file_hash_fnv1a64=standalone_hit.fnv1a_64,
                 )
 
+    shaders.sort(key=_shader_hit_sort_key)
+    records.sort(key=_pipeline_record_sort_key)
     return FileInspectResult(
         path=rel_label,
         file_size=file_size,
@@ -2012,10 +2304,24 @@ def _build_report(
         for _, label in SIZE_HISTOGRAM_BUCKETS
         if size_hist_raw[label] > 0
     }
+    canonical_stage_counts: dict[str, int] = {
+        stage: stage_counts[stage]
+        for stage in sorted(stage_counts.keys(), key=_stage_sort_key)
+    }
+    reported_files.sort(
+        key=lambda f: (_sanitize_report_path(f.path), f.file_size, f.bytes_scanned)
+    )
+    stage_breakdown = tuple(
+        compute_stage_breakdown(canonical_stage_counts, total_shaders=total_shaders)
+    )
+    stage_percentages = {
+        entry["stage"]: entry["percentage"] for entry in stage_breakdown
+    }
+    shader_summary = tuple(build_canonical_shader_summary(all_results))
 
     return InspectReport(
         schema_version=SCHEMA_VERSION,
-        target_label=target_label,
+        target_label=sanitize_source_label(target_label),
         target_kind=target_kind,
         max_bytes=max_bytes,
         max_hits=max_hits,
@@ -2029,13 +2335,16 @@ def _build_report(
         unique_shader_hashes=len(unique_hashes),
         total_pipeline_records=total_pipeline_records,
         hit_limit_reached=hit_limit_reached,
-        stage_counts=dict(sorted(stage_counts.items())),
+        stage_counts=canonical_stage_counts,
         terminator_counts=dict(sorted(terminator_counts.items())),
         export_target_histogram=dict(sorted(export_target_histogram.items())),
         size_histogram=ordered_size_hist,
         instruction_totals=instruction_totals,
         pipeline_record_counts=dict(sorted(pipeline_record_counts.items())),
         files=tuple(reported_files),
+        stage_breakdown=stage_breakdown,
+        stage_percentages=stage_percentages,
+        shader_summary=shader_summary,
     )
 
 
@@ -2174,13 +2483,15 @@ def _escape_md_cell(text: str) -> str:
 
 def render_json(report: InspectReport) -> str:
     """Render a strictly sanitized deterministic JSON report (zero raw shader bytes)."""
-    return json.dumps(report.to_dict(), indent=2) + "\n"
+    payload = sanitize_json_value(report.to_dict())
+    return json.dumps(payload, indent=2, allow_nan=False) + "\n"
 
 
 def render_markdown(report: InspectReport) -> str:
     """Render a strictly sanitized Markdown summary report (zero raw shader bytes)."""
+    safe_target = sanitize_source_label(report.target_label)
     lines: list[str] = [
-        f"# RDNA2 / GFX10.3 Shader Inspection Report: `{_escape_md_cell(report.target_label)}`",
+        f"# RDNA2 / GFX10.3 Shader Inspection Report: `{_escape_md_cell(safe_target)}`",
         "",
         "| Metric | Value |",
         "| :--- | ---: |",
@@ -2198,9 +2509,17 @@ def render_markdown(report: InspectReport) -> str:
     ]
 
     if report.stage_counts:
-        lines.extend(["## Stage Heuristics", "", "| Stage | Shaders |", "| :--- | ---: |"])
-        for stage, count in report.stage_counts.items():
-            lines.append(f"| `{_escape_md_cell(stage)}` | {count} |")
+        pct_map = compute_stage_percentages(
+            report.stage_counts,
+            total_shaders=report.total_shaders,
+        )
+        lines.extend(
+            ["## Stage Heuristics", "", "| Stage | Shaders | Share |", "| :--- | ---: | ---: |"]
+        )
+        for stage in sorted(report.stage_counts.keys(), key=_stage_sort_key):
+            count = report.stage_counts[stage]
+            pct = pct_map.get(stage, 0.0)
+            lines.append(f"| `{_escape_md_cell(stage)}` | {count} | {pct:.2f}% |")
         lines.append("")
 
     if report.export_target_histogram:
@@ -2221,7 +2540,10 @@ def render_markdown(report: InspectReport) -> str:
             lines.append(f"| `{_escape_md_cell(kind)}` | {count} |")
         lines.append("")
 
-    matched = [f for f in report.files if f.shaders or f.pipeline_records or f.error]
+    matched = sorted(
+        (f for f in report.files if f.shaders or f.pipeline_records or f.error),
+        key=lambda f: (_sanitize_report_path(f.path), f.file_size, f.bytes_scanned),
+    )
     if matched:
         lines.extend(
             [
@@ -2232,9 +2554,10 @@ def render_markdown(report: InspectReport) -> str:
             ]
         )
         for entry in matched:
+            safe_path = _sanitize_report_path(entry.path)
             stages = ", ".join(f"{k}:{v}" for k, v in entry.stage_counts.items()) or "-"
             status = (
-                f"error: {entry.error}"
+                f"error: {_scrub_sensitive_text(entry.error)}"
                 if entry.error
                 else (
                     "hit_limit"
@@ -2243,7 +2566,7 @@ def render_markdown(report: InspectReport) -> str:
                 )
             )
             lines.append(
-                f"| `{_escape_md_cell(entry.path)}` | {entry.bytes_scanned}/{entry.file_size} "
+                f"| `{_escape_md_cell(safe_path)}` | {entry.bytes_scanned}/{entry.file_size} "
                 f"| {len(entry.shaders)} | `{_escape_md_cell(stages)}` | {_escape_md_cell(status)} |"
             )
         lines.append("")
