@@ -12,24 +12,31 @@
 //
 // Layout below <save-dir>: <configuration id>/<user>/c-<container>/b-<blob>. Names are
 // percent-encoded so any name is a safe, case-insensitive-filesystem-safe path component.
-// A blob write is a temp file in the container directory renamed over the blob; an update
-// (writes + deletes) is staged completely (and checked against the quota) before the first
-// rename, so a failing update changes nothing.
+// An update (writes + deletes) is checked (16 MiB per update, quota), built as a complete new
+// copy of the container in a temp directory next to it, and committed by swapping directories
+// (old aside, new in, old removed). A crash leaves the old or the new container; the next Store
+// on the same root finishes or rolls back a half-done swap.
 namespace playgta6::os::gdk::gamesave {
 
-// XGameSave error codes (FACILITY 0x283).
+// XGameSave error codes (FACILITY 0x283), values per the public GDK XGameSave documentation
+// ("XGameSave (API contents)", Error Codes).
 inline constexpr HResult E_GS_INVALID_CONTAINER_NAME = static_cast<HResult>(0x80830001u);
-inline constexpr HResult E_GS_NO_MORE_DATA = static_cast<HResult>(0x80830002u);
-inline constexpr HResult E_GS_QUOTA_EXCEEDED = static_cast<HResult>(0x80830003u);
-inline constexpr HResult E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HResult>(0x80830004u);
-inline constexpr HResult E_GS_BLOB_NOT_FOUND = static_cast<HResult>(0x80830005u);
-inline constexpr HResult E_GS_NO_SUCH_CONTAINER = static_cast<HResult>(0x80830006u);
-inline constexpr HResult E_GS_CONTAINER_SYNC_FAILED = static_cast<HResult>(0x80830007u);
+inline constexpr HResult E_GS_NO_ACCESS = static_cast<HResult>(0x80830002u);
+inline constexpr HResult E_GS_OUT_OF_LOCAL_STORAGE = static_cast<HResult>(0x80830003u);
+inline constexpr HResult E_GS_UPDATE_TOO_BIG = static_cast<HResult>(0x80830005u);
+inline constexpr HResult E_GS_QUOTA_EXCEEDED = static_cast<HResult>(0x80830006u);
+inline constexpr HResult E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<HResult>(0x80830007u);
+inline constexpr HResult E_GS_BLOB_NOT_FOUND = static_cast<HResult>(0x80830008u);
+inline constexpr HResult E_GS_CONTAINER_SYNC_FAILED = static_cast<HResult>(0x8083000Bu);
+// Not in the public list; the value the platform runtime is observed to use for a missing container.
+inline constexpr HResult E_GS_NO_SUCH_CONTAINER = static_cast<HResult>(0x80830010u);
 
 inline constexpr uint64_t kDefaultQuotaBytes = 256ull * 1024 * 1024;
 inline constexpr size_t kMaxContainerNameChars = 255;
 inline constexpr size_t kMaxBlobNameChars = 128;
+// GS_MAX_BLOB_SIZE: the total size of the writes of ONE update (so also of one blob).
 inline constexpr uint64_t kMaxBlobBytes = 16ull * 1024 * 1024;
+inline constexpr uint64_t kMaxUpdateBytes = kMaxBlobBytes;
 inline constexpr size_t kMaxDisplayNameChars = 255;
 
 // Host directory that holds all saves (default "pg6-saves", relative to the working directory).
@@ -73,6 +80,11 @@ public:
                           const std::vector<std::string>& deletes);
     // Display name shown for an existing container (kept next to its blobs).
     HResult set_display_name(const std::string& container, const std::string& display_name);
+
+    // Test hook: simulate a crash inside submit_update. 1 = after the new copy is built (nothing
+    // swapped), 2 = after the old container was moved aside but before the new one is in place.
+    // The update then returns E_FAIL without cleaning up. 0 = off.
+    static void set_test_crash_point(int point);
 
 private:
     std::string root_;
