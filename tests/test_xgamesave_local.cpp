@@ -269,6 +269,87 @@ void test_save_dir_survives_restart(const fs::path& base) {
     gs::set_save_dir("");
 }
 
+void test_o52_atomic_story_mode_and_crash3(const fs::path& base) {
+    // Null out-parameter safety.
+    {
+        gs::Store store((base / "nulls").string());
+        CHECK(store.remaining_quota(nullptr) == E_INVALIDARG_HR);
+        CHECK(store.enumerate_containers("", nullptr) == E_INVALIDARG_HR);
+        CHECK(store.get_container_info("Slot", nullptr) == E_INVALIDARG_HR);
+        CHECK(store.enumerate_blobs("Slot", nullptr) == E_INVALIDARG_HR);
+        CHECK(store.read_blob("Slot", "b", nullptr) == E_INVALIDARG_HR);
+    }
+
+    // Atomic create_if_missing + display_name: failed updates leave no container and do not bump generation.
+    {
+        gs::Store store((base / "atomic").string(), 1024);
+        const std::string dn = "Story Mode - Chapter 1";
+        const uint64_t gen_before_fail = gs::storage_generation();
+        CHECK(store.submit_update("AutoSave", {{"big", std::vector<uint8_t>(2048, 0xAA)}}, {}, &dn, true) ==
+              gs::E_GS_QUOTA_EXCEEDED);
+        CHECK(gs::storage_generation() == gen_before_fail);
+        gs::ContainerInfo info;
+        CHECK(store.get_container_info("AutoSave", &info) == gs::E_GS_NO_SUCH_CONTAINER);
+
+        // Oversized multi-blob update (> 16 MiB) also fails cleanly without touching disk.
+        CHECK(store.submit_update("AutoSave",
+                                  {{"a", std::vector<uint8_t>(gs::kMaxBlobBytes / 2 + 1)},
+                                   {"b", std::vector<uint8_t>(gs::kMaxBlobBytes / 2)}},
+                                  {}, &dn, true) == gs::E_GS_UPDATE_TOO_BIG);
+        CHECK(gs::storage_generation() == gen_before_fail);
+        CHECK(store.get_container_info("AutoSave", &info) == gs::E_GS_NO_SUCH_CONTAINER);
+
+        // Atomic create + blobs + display name succeeds in one generation bump.
+        CHECK(store.submit_update("AutoSave", {{"header", bytes("HDR1")}, {"state", bytes("STATE_V1")}}, {}, &dn,
+                                  true) == S_OK_HR);
+        CHECK(gs::storage_generation() == gen_before_fail + 1);
+        CHECK(store.get_container_info("AutoSave", &info) == S_OK_HR && info.display_name == dn &&
+              info.blob_count == 2 && info.total_size == 12);
+
+        // Re-opening existing container via create_container does NOT spuriously bump generation.
+        const uint64_t gen_after_create = gs::storage_generation();
+        CHECK(store.create_container("AutoSave") == S_OK_HR);
+        CHECK(gs::storage_generation() == gen_after_create);
+
+        // Overwrite without display name preserves existing display name; overwrite with new one updates atomically.
+        CHECK(store.submit_update("AutoSave", {{"state", bytes("STATE_V2_LONGER")}}, {}, nullptr, true) == S_OK_HR);
+        CHECK(store.get_container_info("AutoSave", &info) == S_OK_HR && info.display_name == dn &&
+              info.total_size == 4 + 15);
+        const std::string dn2 = "Story Mode - Chapter 2";
+        CHECK(store.submit_update("AutoSave", {{"state", bytes("V3")}}, {}, &dn2, true) == S_OK_HR);
+        CHECK(store.get_container_info("AutoSave", &info) == S_OK_HR && info.display_name == dn2 &&
+              info.total_size == 4 + 2);
+        int64_t rem = 0;
+        CHECK(store.remaining_quota(&rem) == S_OK_HR && rem == 1024 - 6);
+    }
+
+    // Crash point 3: crash after fresh -> dir succeeded, before .old- aside dir was removed.
+    // Reopening Store keeps the NEW version and cleans up .old- and stale .tmp- files.
+    {
+        const fs::path c3 = base / "crash3";
+        gs::Store store(c3.string());
+        CHECK(store.create_container("SlotA") == S_OK_HR);
+        CHECK(store.submit_update("SlotA", {{"hdr", bytes("old")}}, {}) == S_OK_HR);
+        gs::Store::set_test_crash_point(3);
+        const std::string dn_new = "New Display";
+        CHECK(store.submit_update("SlotA", {{"hdr", bytes("new-committed")}}, {}, &dn_new, true) != S_OK_HR);
+        gs::Store::set_test_crash_point(0);
+
+        // Drop a stale .tmp- file inside the container and a malformed .old- entry in root.
+        const fs::path cdir = c3 / "c-^slot^a";
+        { std::ofstream f(cdir / ".tmp-42", std::ios::binary); f << "junk"; }
+        fs::create_directories(c3 / ".old-malformed");
+
+        gs::Store recovered(c3.string());
+        std::vector<uint8_t> out;
+        CHECK(recovered.read_blob("SlotA", "hdr", &out) == S_OK_HR && out == bytes("new-committed"));
+        gs::ContainerInfo info;
+        CHECK(recovered.get_container_info("SlotA", &info) == S_OK_HR && info.display_name == dn_new);
+        CHECK(count_temps(c3) == 0);
+        CHECK(!fs::exists(c3 / ".old-malformed"));
+    }
+}
+
 int main() {
     const fs::path base = fs::temp_directory_path() / "pg6_o34_store_test";
     fs::remove_all(base);
@@ -281,6 +362,7 @@ int main() {
     test_container_info(base);
     test_crash_between_swap_steps(base);
     test_save_dir_survives_restart(base);
+    test_o52_atomic_story_mode_and_crash3(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);

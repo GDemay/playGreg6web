@@ -190,18 +190,22 @@ void sub_work(GuestState* s) {
 constexpr uint64_t kEnumCb = 0x140020500ULL;
 std::vector<std::string> g_enum_names;
 std::vector<uint32_t> g_enum_blobs;
+std::vector<uint64_t> g_enum_modified;
 size_t g_enum_stop_after = 100;
 
 void sub_enum_cb(GuestState* s) {
     const uint64_t info = s->gpr[GuestReg::Rcx];
     uint64_t name_ptr = 0;
     uint32_t blobs = 0;
+    uint64_t last_mod = 0;
     CHECK(g_arena->read(info, &name_ptr, sizeof(name_ptr)));
     CHECK(g_arena->read(info + 16, &blobs, sizeof(blobs)));
+    CHECK(g_arena->read(info + 32, &last_mod, sizeof(last_mod)));
     char name[64] = {};
     CHECK(g_arena->read(name_ptr, name, sizeof(name) - 1));
     g_enum_names.push_back(name);
     g_enum_blobs.push_back(blobs);
+    g_enum_modified.push_back(last_mod);
     CHECK(s->gpr[GuestReg::Rdx] == 0xE11E);
     s->gpr[GuestReg::Rax] = g_enum_names.size() < g_enum_stop_after ? 1 : 0;
     ret(s);
@@ -1489,6 +1493,211 @@ void test_launch_new_game() {
     playgta6::os::win32::set_command_line("game.exe");
 }
 
+// O52: Story Mode local XGameSave edge cases, empty container timestamp (no underflow), null-prefix
+// enumeration, cancelled/abandoned ReadBlobDataAsync & InitializeProviderAsync cleanup, UserApi
+// token/null checks, and multi-thousand-iteration guest XAsync shadow zero-leak stress test.
+void test_o52_story_mode_saves_and_zero_leak() {
+    namespace gdk = playgta6::os::gdk;
+    namespace gs = playgta6::os::gdk::gamesave;
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "pg6_o52_provider_test";
+    std::filesystem::remove_all(dir);
+    gs::set_save_dir(dir.string());
+
+    {
+        Fixture fx;
+        const uint64_t async_api = fx.query(kAsyncQueue, kAsyncQueue);
+        const uint64_t user_api = fx.query(kUser, kUser);
+        const uint64_t save = fx.query(com::make_guid("704c3f58-e629-4cc2-b197-30511b996fe2"),
+                                       com::make_guid("1bfff3af-f14a-40a3-8e35-9ada906593f9"));
+        const uint64_t out = fx.alloc(8);
+        CHECK(hr32(fx.vcall(async_api, 12, {0, 0, out})) == 0);  // Manual / Manual queue
+        const uint64_t queue = load64(out);
+        auto dispatch = [&](uint32_t port) { return (fx.vcall(async_api, 16, {queue, port, 0}) & 0xFF) == 1; };
+
+        // 1. UserApi hardening: change-event token tracking, CheckPrivilege null guard,
+        //    GetTokenAndSignatureResultSize null guard.
+        {
+            const uint64_t ublk = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(user_api, 7, {1, ublk})) == 0);
+            CHECK(dispatch(0) && dispatch(1));
+            CHECK(hr32(fx.vcall(user_api, 8, {ublk, out})) == 0);
+            const uint64_t u = load64(out);
+            CHECK(u != 0);
+            CHECK(hr32(fx.vcall(user_api, 20, {u, 0, 254, 0, 0})) == com::E_INVALIDARG_HR);  // null has_privilege
+            CHECK(hr32(fx.vcall(user_api, 24, {ublk, 0})) == com::E_INVALIDARG_HR);          // null size out
+            CHECK(hr32(fx.vcall(user_api, 33, {0, 0, kRecord, out})) == 0);
+            const uint64_t tok = load64(out);
+            CHECK(tok != 0);
+            CHECK((fx.vcall(user_api, 34, {tok, 1}) & 0xFF) == 1);
+            CHECK((fx.vcall(user_api, 34, {tok, 1}) & 0xFF) == 0);  // double unregister
+            CHECK((fx.vcall(user_api, 34, {0, 1}) & 0xFF) == 0);
+            fx.vcall(user_api, 4, {u});
+        }
+
+        // 2. Empty container enumeration: last_modified must be 0 (never unsigned underflow),
+        //    null prefix on s13/s19 enumerates all entries per GDK spec, close(0) is a clean no-op.
+        const uint64_t cfg = fx.cstring("story-mode-cfg");
+        CHECK(hr32(fx.vcall(save, 3, {0x10, cfg, 0, out})) == 0);
+        const uint64_t prov_h = load64(out);
+        CHECK(hr32(fx.vcall(save, 16, {prov_h, fx.cstring("EmptySlot"), out})) == 0);
+        const uint64_t c_empty = load64(out);
+        CHECK(hr32(fx.vcall(save, 23, {c_empty, fx.cstring("Empty Save"), out})) == 0);
+        const uint64_t u_empty = load64(out);
+        CHECK(hr32(fx.vcall(save, 27, {u_empty})) == 0);  // creates empty container
+        fx.vcall(save, 24, {u_empty});
+        fx.vcall(save, 17, {c_empty});
+
+        // Verify null prefix on s13 enumerates EmptySlot and its last_modified does not underflow.
+        g_enum_names.clear();
+        g_enum_blobs.clear();
+        g_enum_modified.clear();
+        CHECK(hr32(fx.vcall(save, 13, {prov_h, 0, 0xE11E, kEnumCb})) == 0);
+        CHECK(g_enum_names.size() == 1 && g_enum_names[0] == "EmptySlot" && g_enum_blobs[0] == 0);
+        CHECK(g_enum_modified.size() == 1 && g_enum_modified[0] == 0);
+
+        // 3. Cancelled / abandoned ReadBlobDataAsync & InitializeProviderAsync leak ZERO handles or pending reads.
+        {
+            CHECK(hr32(fx.vcall(save, 16, {prov_h, fx.cstring("StorySlot0"), out})) == 0);
+            const uint64_t c0 = load64(out);
+            CHECK(hr32(fx.vcall(save, 23, {c0, fx.cstring("Story 0"), out})) == 0);
+            const uint64_t u0 = load64(out);
+            const uint64_t blob_name = fx.cstring("Save Game Data");
+            const uint64_t blob_bytes = fx.cstring("chapter-one-state");
+            CHECK(hr32(fx.vcall(save, 25, {u0, blob_name, blob_bytes, 17})) == 0);
+            CHECK(hr32(fx.vcall(save, 27, {u0})) == 0);
+            fx.vcall(save, 24, {u0});
+
+            // Null prefix on s19 enumerates all blobs.
+            g_blob_names.clear();
+            CHECK(hr32(fx.vcall(save, 19, {c0, 0, 0xB10B, kBlobCb})) == 0 && g_blob_names.size() == 1);
+
+            // ReadBlobDataAsync for a missing blob: DoWork fails with E_GS_BLOB_NOT_FOUND;
+            // even without calling ReadBlobDataResult, Cleanup clears g_pending_reads!
+            const uint64_t names_arr = fx.alloc(8);
+            CHECK(com::write_guest(names_arr, fx.cstring("NoSuchBlob")));
+            const uint64_t fail_blk = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 21, {c0, names_arr, 1, fail_blk})) == 0);
+            CHECK(dispatch(0) && dispatch(1));
+            CHECK(hr32(fx.vcall(async_api, 3, {fail_blk, 0})) == gs::E_GS_BLOB_NOT_FOUND);
+            CHECK(prov::provider_handle_counts().pending_save_reads == 0);
+            // Mismatched Result identity (calling SubmitUpdateResult on a ReadBlobDataAsync block) is rejected.
+            CHECK(hr32(fx.vcall(save, 29, {fail_blk})) == gs::E_GS_BLOB_NOT_FOUND);
+
+            // Cancelled InitializeProviderAsync: Cleanup releases unclaimed provider handle!
+            const size_t providers_before = prov::provider_handle_counts().save_providers;
+            const uint64_t init_blk = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 4, {0x10, cfg, 0, init_blk})) == 0);
+            CHECK(dispatch(0) && dispatch(1));
+            CHECK(prov::provider_handle_counts().save_providers == providers_before + 1);
+            // Abandon without calling InitializeProviderResult by ending shadow.
+            cbk::async_shadow_end(init_blk);
+            CHECK(prov::provider_handle_counts().save_providers == providers_before);
+
+            fx.vcall(save, 17, {c0});
+        }
+
+        // Null handle closes are clean no-ops.
+        fx.vcall(save, 24, {0});
+        fx.vcall(save, 17, {0});
+        fx.vcall(save, 6, {0});
+
+        // 4. Terminated queue: synchronous begin failures clean up shadows immediately.
+        {
+            const uint64_t dead_out = fx.alloc(8);
+            CHECK(hr32(fx.vcall(async_api, 12, {0, 0, dead_out})) == 0);
+            const uint64_t dead_q = load64(dead_out);
+            CHECK(hr32(fx.vcall(async_api, 22, {dead_q, 1, 0, 0})) == 0);
+            const uint64_t dead_blk = make_guest_block(fx, dead_q);
+            const size_t shadows_before = cbk::live_async_shadows();
+            CHECK(hr32(fx.vcall(save, 8, {prov_h, dead_blk})) == gdk::E_ABORT_HR);
+            CHECK(cbk::live_async_shadows() == shadows_before);
+            CHECK(hr32(fx.vcall(user_api, 7, {1, dead_blk})) == gdk::E_ABORT_HR);
+            CHECK(cbk::live_async_shadows() == shadows_before);
+            CHECK(hr32(fx.vcall(async_api, 6, {dead_blk, kWorkFn})) == gdk::E_ABORT_HR);
+            CHECK(cbk::live_async_shadows() == shadows_before);
+            fx.vcall(async_api, 17, {dead_q});
+        }
+
+        // 5. Multi-thousand-iteration guest XAsyncRun + XGameSaveSubmitUpdateAsync stress test:
+        //    verify bounded shadows, bounded XAsync records, and zero pending-read/handle leaks.
+        {
+            const uint64_t imm_out = fx.alloc(8);
+            CHECK(hr32(fx.vcall(async_api, 12, {3, 3, imm_out})) == 0);  // Immediate / Immediate
+            const uint64_t imm_q = load64(imm_out);
+
+            // Allocate a ring of 256 distinct guest XAsyncBlock addresses (exceeds 64 shadow cap).
+            constexpr size_t kPool = 256;
+            const uint64_t pool_base = fx.alloc(kPool * sizeof(cbk::GuestAsyncBlock));
+            auto block_at = [&](size_t idx) {
+                const uint64_t va = pool_base + (idx % kPool) * sizeof(cbk::GuestAsyncBlock);
+                cbk::GuestAsyncBlock g{};
+                g.queue = imm_q;
+                g.callback = kAsyncDone;
+                CHECK(com::write_guest(va, g));
+                return va;
+            };
+
+            g_work_result = 0;
+            g_work_calls = 0;
+            constexpr size_t kRunIters = 1500;
+            for (size_t i = 0; i < kRunIters; ++i) {
+                const uint64_t blk = block_at(i);
+                CHECK(hr32(fx.vcall(async_api, 6, {blk, kWorkFn})) == 0);
+            }
+            CHECK(g_work_calls.load() == static_cast<int>(kRunIters));
+            CHECK(cbk::live_async_shadows() <= 64);
+            CHECK(gdk::xasync_record_count() <= gdk::kXAsyncMaxObservedCompletedRecords + 64);
+            CHECK(gdk::xasync_task_count() == 0);
+
+            // 100 rapid Story Mode autosave write + async read + result cycles on distinct blocks.
+            CHECK(hr32(fx.vcall(save, 16, {prov_h, fx.cstring("AutoSave"), out})) == 0);
+            const uint64_t c_auto = load64(out);
+            const uint64_t hdr_name = fx.cstring("Save Game Header");
+            const uint64_t names_ptr = fx.alloc(8);
+            CHECK(com::write_guest(names_ptr, hdr_name));
+            const uint64_t data_buf = fx.alloc(64);
+            const uint64_t read_buf = fx.alloc(256);
+            const uint64_t count_out = fx.alloc(4);
+            for (size_t i = 0; i < 100; ++i) {
+                uint64_t payload_val = 0x5A000000ULL + i;
+                CHECK(com::write_guest(data_buf, payload_val));
+                CHECK(hr32(fx.vcall(save, 23, {c_auto, fx.cstring("Autosave"), out})) == 0);
+                const uint64_t u = load64(out);
+                CHECK(hr32(fx.vcall(save, 25, {u, hdr_name, data_buf, sizeof(payload_val)})) == 0);
+                const uint64_t wblk = block_at(i * 2);
+                CHECK(hr32(fx.vcall(save, 28, {u, wblk})) == 0);
+                CHECK(hr32(fx.vcall(save, 29, {wblk})) == 0);
+                fx.vcall(save, 24, {u});
+
+                const uint64_t rblk = block_at(i * 2 + 1);
+                CHECK(hr32(fx.vcall(save, 21, {c_auto, names_ptr, 1, rblk})) == 0);
+                CHECK(hr32(fx.vcall(save, 22, {rblk, 256, read_buf, count_out})) == 0);
+                uint32_t cnt = 0;
+                CHECK(com::read_guest(count_out, cnt) && cnt == 1);
+                CHECK(load64(load64(read_buf + 16)) == payload_val);
+            }
+            fx.vcall(save, 17, {c_auto});
+            fx.vcall(async_api, 17, {imm_q});
+        }
+
+        fx.vcall(save, 6, {prov_h});
+        fx.vcall(async_api, 17, {queue});
+
+        const prov::ProviderHandleCounts counts = prov::provider_handle_counts();
+        CHECK(counts.task_queues == 0);
+        CHECK(counts.users == 0);
+        CHECK(counts.stores == 0);
+        CHECK(counts.save_providers == 0);
+        CHECK(counts.save_containers == 0);
+        CHECK(counts.save_updates == 0);
+        CHECK(counts.pending_save_reads == 0);
+        CHECK(gdk::xasync_task_count() == 0);
+    }
+
+    std::filesystem::remove_all(dir);
+    gs::set_save_dir("");
+}
+
 int main() {
     test_module_and_exports();
     test_query_api();
@@ -1500,6 +1709,7 @@ int main() {
     test_http_client_thunks();
     test_store_ext_slots();
     test_launch_new_game();
+    test_o52_story_mode_saves_and_zero_leak();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime_provider: %d failure(s)\n", g_failures);
         return 1;

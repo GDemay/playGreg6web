@@ -74,6 +74,19 @@ bool parse_user_age_group(const std::string& text, UserAgeGroup* group);
 // Every distinct QueryApiImpl request so far (known and unknown), sorted by GUID.
 std::vector<ApiRequest> api_requests();
 
+// Live host handle / async tracking counts (diagnostics & leak tests).
+struct ProviderHandleCounts {
+    size_t task_queues = 0;
+    size_t users = 0;
+    size_t stores = 0;
+    size_t save_providers = 0;
+    size_t save_containers = 0;
+    size_t save_updates = 0;
+    size_t pending_save_reads = 0;
+    size_t tracked_async_shadows = 0;
+};
+ProviderHandleCounts provider_handle_counts();
+
 // Tests only: forget the singleton objects and request counters (call with reset_com_bridge()).
 void reset_xgameruntime_provider();
 

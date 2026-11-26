@@ -956,6 +956,89 @@ void test_gdk_xuser_offline() {
     CHECK(!XGameRuntimeIsInitialized());
 }
 
+// ---------------------------------------------------------------------------
+// 9. O52: Handle refcounting, null/invalid safety, and zero-leak verification
+// ---------------------------------------------------------------------------
+
+void test_o52_handle_lifecycle_and_zero_leak() {
+    using namespace playgta6::os::gdk;
+
+    CHECK(XGameRuntimeInitialize() == S_OK_HR);
+    const size_t base_users = open_xuser_count();
+    const size_t base_queues = open_xtask_queue_count();
+
+    // Null / invalid out-params are cleanly zeroed.
+    {
+        uint64_t xuid = 0xDEADBEEFULL;
+        CHECK(XUserGetId(nullptr, &xuid) == E_INVALIDARG_HR && xuid == 0);
+        XUserHandle dup = reinterpret_cast<XUserHandle>(static_cast<uintptr_t>(0x1234));
+        CHECK(XUserDuplicateHandle(nullptr, &dup) == E_INVALIDARG_HR && dup == nullptr);
+        size_t used = 99;
+        CHECK(XUserGetGamertag(nullptr, XUserGamertagComponent::Classic, 0, nullptr, &used) == E_INVALIDARG_HR &&
+              used == 0);
+        XUserCloseHandle(nullptr);  // safe no-op
+    }
+
+    // Duplicate + close + abandoned XUserAddAsync (Cleanup frees unclaimed Pg6XUser).
+    {
+        XTaskQueueHandle queue = nullptr;
+        CHECK(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &queue) == S_OK_HR);
+        CHECK(open_xtask_queue_count() == base_queues + 1);
+
+        XAsyncBlock a1{};
+        a1.queue = queue;
+        CHECK(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, &a1) == S_OK_HR);
+        CHECK(XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0));
+        CHECK(XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0));
+        XUserHandle u1 = nullptr;
+        CHECK(XUserAddResult(&a1, &u1) == S_OK_HR && u1 != nullptr);
+        CHECK(open_xuser_count() == base_users + 1);
+
+        XUserHandle u2 = nullptr;
+        CHECK(XUserDuplicateHandle(u1, &u2) == S_OK_HR && u2 != nullptr && u2 != u1);
+        CHECK(open_xuser_count() == base_users + 2);
+        uint64_t xuid = 0;
+        CHECK(XUserGetId(u2, &xuid) == S_OK_HR && xuid == kOfflineUserXuid);
+        XUserCloseHandle(u2);
+        CHECK(open_xuser_count() == base_users + 1);
+        XUserCloseHandle(u1);
+        CHECK(open_xuser_count() == base_users);
+
+        // Abandoned XUserAddAsync: DoWork allocates Pg6XUser, caller never fetches result,
+        // reusing the block triggers Cleanup and frees Pg6XUser with zero leak.
+        XAsyncBlock a2{};
+        a2.queue = queue;
+        CHECK(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, &a2) == S_OK_HR);
+        CHECK(XTaskQueueDispatch(queue, XTaskQueuePort::Work, 0));
+        CHECK(XTaskQueueDispatch(queue, XTaskQueuePort::Completion, 0));
+        CHECK(open_xuser_count() == base_users + 1);
+        // Reuse block for another op -> abandons first result and cleans it up.
+        CHECK(XUserAddAsync(XUserAddOptions::AddDefaultUserSilently, &a2) == S_OK_HR);
+        CHECK(open_xuser_count() == base_users);
+        CHECK(XTaskQueueTerminate(queue, true) == S_OK_HR);
+        CHECK(XAsyncGetStatus(&a2, true) == E_ABORT_HR);
+
+        // Composite queue reference counting returns to exact baseline on close.
+        XTaskQueueHandle q2 = nullptr;
+        CHECK(XTaskQueueCreate(XTaskQueueDispatchMode::Manual, XTaskQueueDispatchMode::Manual, &q2) == S_OK_HR);
+        XTaskQueuePortHandle wp = nullptr;
+        XTaskQueuePortHandle cp = nullptr;
+        CHECK(XTaskQueueGetPort(queue, XTaskQueuePort::Work, &wp) == S_OK_HR);
+        CHECK(XTaskQueueGetPort(q2, XTaskQueuePort::Completion, &cp) == S_OK_HR);
+        XTaskQueueHandle comp = nullptr;
+        CHECK(XTaskQueueCreateComposite(wp, cp, &comp) == S_OK_HR);
+        XTaskQueueCloseHandle(queue);
+        XTaskQueueCloseHandle(q2);
+        CHECK(open_xtask_queue_count() == base_queues + 3);  // composite keeps both owners alive
+        XTaskQueueCloseHandle(comp);
+        CHECK(open_xtask_queue_count() == base_queues);
+        CHECK(open_xuser_count() == base_users);
+    }
+
+    XGameRuntimeUninitialize();
+    CHECK(!XGameRuntimeIsInitialized());
+}
+
 }  // namespace
 
 int main() {
@@ -967,6 +1050,7 @@ int main() {
     test_gdk_runtime_and_system();
     test_gdk_xtask_queue();
     test_gdk_xuser_offline();
+    test_o52_handle_lifecycle_and_zero_leak();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime failed with %d failure(s)\n", g_failures);

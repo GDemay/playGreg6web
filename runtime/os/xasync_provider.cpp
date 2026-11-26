@@ -6,12 +6,15 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
+#include <list>
 #include <map>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "os/os_shim.h"
 
@@ -50,6 +53,7 @@ struct Op {
     bool callback_done = false;
     bool cleaned_up = false;
     bool result_taken = false;
+    bool status_observed = false;
     bool abandoned = false;
     int inflight = 0;  // provider calls running
     std::thread::id callback_thread{};
@@ -57,15 +61,33 @@ struct Op {
 
 using OpRef = std::shared_ptr<Op>;
 
+struct RegistryEntry {
+    OpRef op;
+    uint8_t tier = 0;  // 0 = active/untracked, 1 = observed/consumed, 2 = unobserved completed
+    std::list<XAsyncBlock*>::iterator it{};
+};
+
 struct Registry {
     std::mutex mutex;
-    std::unordered_map<XAsyncBlock*, OpRef> ops;
+    std::unordered_map<XAsyncBlock*, RegistryEntry> ops;
+    std::list<XAsyncBlock*> observed_completed;
+    std::list<XAsyncBlock*> unobserved_completed;
     uint64_t next_id = 1;
 };
 
 Registry& registry() {
     static Registry instance;
     return instance;
+}
+
+void unlink_entry_locked(Registry& reg, RegistryEntry& entry) {
+    if (entry.tier == 1) {
+        reg.observed_completed.erase(entry.it);
+        entry.tier = 0;
+    } else if (entry.tier == 2) {
+        reg.unobserved_completed.erase(entry.it);
+        entry.tier = 0;
+    }
 }
 
 std::string describe(const Op& op) {
@@ -99,10 +121,10 @@ OpRef find_op(XAsyncBlock* block) {
     Registry& reg = registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     auto it = reg.ops.find(block);
-    if (it == reg.ops.end() || !header_matches(block, *it->second)) {
+    if (it == reg.ops.end() || !header_matches(block, *it->second.op)) {
         return nullptr;
     }
-    return it->second;
+    return it->second.op;
 }
 
 // The queue an operation on `block` uses (the process queue for a null block->queue).
@@ -146,12 +168,19 @@ XAsyncProviderImpl* begin_call_locked(Op& op) {
     return op.provider.get();
 }
 
+void track_completed(const OpRef& op);
+
 void end_call(const OpRef& op) {
+    bool ready_to_track = false;
     {
         std::lock_guard<std::mutex> lock(op->mutex);
         --op->inflight;
+        ready_to_track = op->inflight == 0 && op->completed && op->callback_done;
     }
     maybe_cleanup(op);
+    if (ready_to_track) {
+        track_completed(op);
+    }
 }
 
 std::atomic<size_t> g_live_tasks{0};
@@ -187,6 +216,70 @@ void finish_callback(const OpRef& op) {
     op->cv.notify_all();
 }
 
+// Tracks a completed, non-in-flight operation in the bounded FIFO cache so callers that never
+// invoke xasync_forget() cannot leak operation records over long sessions.
+// Lock order: strictly reg.mutex -> op->mutex; caller must hold neither.
+void track_completed(const OpRef& op) {
+    if (!op) {
+        return;
+    }
+    std::vector<OpRef> evicted;
+    {
+        Registry& reg = registry();
+        std::lock_guard<std::mutex> lock(reg.mutex);
+        auto it = reg.ops.find(op->block);
+        if (it == reg.ops.end() || it->second.op != op) {
+            return;
+        }
+        uint8_t target_tier = 0;
+        {
+            std::lock_guard<std::mutex> op_lock(op->mutex);
+            if (!op->completed || !op->callback_done || op->inflight != 0) {
+                return;
+            }
+            const bool observed_done =
+                op->result_taken || op->abandoned || ((failed(op->status) || op->required == 0) && op->status_observed);
+            target_tier = observed_done ? 1 : 2;
+        }
+        RegistryEntry& entry = it->second;
+        unlink_entry_locked(reg, entry);
+        if (target_tier == 1) {
+            reg.observed_completed.push_back(op->block);
+            entry.it = std::prev(reg.observed_completed.end());
+            entry.tier = 1;
+        } else {
+            reg.unobserved_completed.push_back(op->block);
+            entry.it = std::prev(reg.unobserved_completed.end());
+            entry.tier = 2;
+        }
+        auto evict_from = [&](std::list<XAsyncBlock*>& list, size_t cap) {
+            while (list.size() > cap) {
+                XAsyncBlock* oldest = list.front();
+                list.pop_front();
+                auto map_it = reg.ops.find(oldest);
+                if (map_it == reg.ops.end()) {
+                    continue;
+                }
+                map_it->second.tier = 0;
+                OpRef dropped = std::move(map_it->second.op);
+                reg.ops.erase(map_it);
+                if (dropped) {
+                    {
+                        std::lock_guard<std::mutex> drop_lock(dropped->mutex);
+                        dropped->abandoned = true;
+                    }
+                    evicted.push_back(std::move(dropped));
+                }
+            }
+        };
+        evict_from(reg.observed_completed, kXAsyncMaxObservedCompletedRecords);
+        evict_from(reg.unobserved_completed, kXAsyncMaxUnobservedCompletedRecords);
+    }
+    for (const OpRef& dropped : evicted) {
+        maybe_cleanup(dropped);
+    }
+}
+
 void completion_entry(void* context, bool canceled) {
     const std::unique_ptr<Task> task(static_cast<Task*>(context));
     const OpRef op = task->op;
@@ -211,6 +304,7 @@ void completion_entry(void* context, bool canceled) {
         callback(op->block);
         finish_callback(op);
     }
+    track_completed(op);
 }
 
 // `explicit_call`: XAsyncComplete called by a provider (a second one is diagnosed).
@@ -352,15 +446,23 @@ bool register_op(const OpRef& op, OpRef* replaced) {
     std::lock_guard<std::mutex> lock(reg.mutex);
     op->id = reg.next_id++;
     auto it = reg.ops.find(op->block);
-    if (it != reg.ops.end() && header_matches(op->block, *it->second)) {
-        std::lock_guard<std::mutex> old_lock(it->second->mutex);
-        if (!it->second->completed) {
-            return false;
+    if (it != reg.ops.end()) {
+        const bool matches = header_matches(op->block, *it->second.op);
+        {
+            std::lock_guard<std::mutex> old_lock(it->second.op->mutex);
+            if (matches && !it->second.op->completed) {
+                return false;
+            }
+            if (it->second.op->completed) {
+                it->second.op->abandoned = true;
+                *replaced = it->second.op;
+            }
         }
-        it->second->abandoned = true;
-        *replaced = it->second;
+        unlink_entry_locked(reg, it->second);
+        it->second.op = op;
+    } else {
+        reg.ops.emplace(op->block, RegistryEntry{op, 0, {}});
     }
-    reg.ops[op->block] = op;
     write_header(op->block, op->id);
     return true;
 }
@@ -458,6 +560,9 @@ HResult XAsyncBeginWith(XAsyncBlock* async_block,
         op->cv.notify_all();
     }
     end_call(op);
+    if (failed(hr)) {
+        track_completed(op);
+    }
     return failed(hr) ? hr : S_OK_HR;
 }
 
@@ -514,39 +619,47 @@ HResult XAsyncGetResultWith(XAsyncBlock* async_block,
     }
     XAsyncProviderImpl* provider = nullptr;
     size_t required = 0;
+    bool early_done = false;
+    HResult early_hr = S_OK_HR;
     {
         std::lock_guard<std::mutex> lock(op->mutex);
         if (!op->completed) {
             return E_PENDING_HR;
         }
         if (failed(op->status)) {
-            return op->status;
-        }
-        if (identity != op->identity) {
+            op->status_observed = true;
+            early_done = true;
+            early_hr = op->status;
+        } else if (identity != op->identity) {
             diagnostic(describe(*op) + ": XAsyncGetResult with a different identity than XAsyncBegin");
             return E_INVALIDARG_HR;
-        }
-        if (op->required == 0) {
-            return S_OK_HR;
-        }
-        if (op->result_taken || op->cleaned_up) {
+        } else if (op->required == 0) {
+            op->status_observed = true;
+            early_done = true;
+            early_hr = S_OK_HR;
+        } else if (op->result_taken || op->cleaned_up) {
             return E_ILLEGAL_METHOD_CALL_HR;
-        }
-        if (buffer == 0) {
+        } else if (buffer == 0) {
             return E_INVALIDARG_HR;
-        }
-        if (buffer_size < op->required) {
+        } else if (buffer_size < op->required) {
             return E_NOT_SUFFICIENT_BUFFER_HR;
+        } else {
+            provider = begin_call_locked(*op);
+            if (provider == nullptr) {
+                return E_ILLEGAL_METHOD_CALL_HR;
+            }
+            op->result_taken = true;
+            op->status_observed = true;
+            required = op->required;
         }
-        provider = begin_call_locked(*op);
-        if (provider == nullptr) {
-            return E_ILLEGAL_METHOD_CALL_HR;
-        }
-        op->result_taken = true;
-        required = op->required;
+    }
+    if (early_done) {
+        track_completed(op);
+        return early_hr;
     }
     const HResult hr = provider->call(XAsyncOp::GetResult, async_block, required, buffer);
     end_call(op);
+    track_completed(op);
     if (succeeded(hr) && buffer_used != nullptr) {
         *buffer_used = required;
     }
@@ -627,19 +740,25 @@ HResult complete_async_immediately(XAsyncBlock* async_block, HResult status) {
     // the call up front as it did for O8's stubs.
     const HResult hr = submit(op, XTaskQueuePort::Completion, &completion_entry);
     if (failed(hr)) {
-        Registry& reg = registry();
-        std::lock_guard<std::mutex> lock(reg.mutex);
-        auto it = reg.ops.find(async_block);
-        if (it != reg.ops.end() && it->second == op) {
-            if (replaced) {
-                std::lock_guard<std::mutex> old_lock(replaced->mutex);
-                replaced->abandoned = false;
-                it->second = replaced;
-            } else {
-                reg.ops.erase(it);
+        {
+            Registry& reg = registry();
+            std::lock_guard<std::mutex> lock(reg.mutex);
+            auto it = reg.ops.find(async_block);
+            if (it != reg.ops.end() && it->second.op == op) {
+                unlink_entry_locked(reg, it->second);
+                if (replaced) {
+                    std::lock_guard<std::mutex> old_lock(replaced->mutex);
+                    replaced->abandoned = false;
+                    it->second.op = replaced;
+                } else {
+                    reg.ops.erase(it);
+                }
             }
         }
         std::memcpy(async_block->internal, saved, sizeof(saved));
+        if (replaced) {
+            track_completed(replaced);
+        }
         return hr;
     }
     if (replaced) {
@@ -658,13 +777,14 @@ void xasync_forget(XAsyncBlock* async_block) {
             return;
         }
         {
-            std::lock_guard<std::mutex> op_lock(it->second->mutex);
-            if (!it->second->completed) {
+            std::lock_guard<std::mutex> op_lock(it->second.op->mutex);
+            if (!it->second.op->completed) {
                 return;  // still running: the owner must keep the block
             }
-            it->second->abandoned = true;
+            it->second.op->abandoned = true;
         }
-        op = std::move(it->second);
+        unlink_entry_locked(reg, it->second);
+        op = std::move(it->second.op);
         reg.ops.erase(it);
     }
     maybe_cleanup(op);
@@ -698,14 +818,30 @@ HResult XAsyncGetStatus(XAsyncBlock* async_block, bool wait) {
     if (!op) {
         return E_INVALIDARG_HR;
     }
-    std::unique_lock<std::mutex> lock(op->mutex);
-    if (wait && !op->callback_done) {
-        if (op->completed && op->callback_thread == std::this_thread::get_id()) {
-            return op->status;  // asked from inside the completion callback
+    bool observed_after_callback = false;
+    bool done = false;
+    HResult status = E_PENDING_HR;
+    {
+        std::unique_lock<std::mutex> lock(op->mutex);
+        if (wait && !op->callback_done) {
+            if (op->completed && op->callback_thread == std::this_thread::get_id()) {
+                return op->status;  // asked from inside the completion callback
+            }
+            op->cv.wait(lock, [&] { return op->callback_done; });
         }
-        op->cv.wait(lock, [&] { return op->callback_done; });
+        if (op->completed) {
+            done = true;
+            status = op->status;
+            if (op->callback_done) {
+                op->status_observed = true;
+                observed_after_callback = true;
+            }
+        }
     }
-    return op->completed ? op->status : E_PENDING_HR;
+    if (observed_after_callback) {
+        track_completed(op);
+    }
+    return done ? status : E_PENDING_HR;
 }
 
 HResult XAsyncGetResultSize(XAsyncBlock* async_block, size_t* buffer_size) {

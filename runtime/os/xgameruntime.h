@@ -193,6 +193,10 @@ void XUserCloseHandle(XUserHandle user);
 // A second, independently closed handle to the same (local) user.
 HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated);
 
+// Diagnostics / leak accounting (live host handle allocations).
+size_t open_xtask_queue_count();
+size_t open_xuser_count();
+
 // ---------------------------------------------------------------------------
 // XSystem device & analytics info
 // ---------------------------------------------------------------------------
