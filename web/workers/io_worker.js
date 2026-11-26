@@ -430,10 +430,12 @@
   }
 
   function opfsL2PathToken(normalizedPath) {
-    const encoded = utf8ToHex(normalizedPath);
+    const canonical =
+      typeof normalizedPath === 'string' ? normalizedPath.toLowerCase() : String(normalizedPath || '');
+    const encoded = utf8ToHex(canonical);
     return encoded.length <= 128
       ? encoded
-      : `${encoded.slice(0, 64)}_${fnv1a128Hex(normalizedPath)}`;
+      : `${encoded.slice(0, 64)}_${fnv1a128Hex(canonical)}`;
   }
 
   function opfsL2RangeFilePrefix(normalizedPath, offset, length) {
@@ -444,6 +446,22 @@
     const prefix = opfsL2RangeFilePrefix(normalizedPath, offset, length);
     const fp = buildFileFingerprint(fileFingerprint);
     return fp ? `${prefix}_fp_${fp}.bin` : `${prefix}.bin`;
+  }
+
+  function parseOpfsL2RangeFileMeta(fileName) {
+    if (typeof fileName !== 'string' || !fileName.startsWith('r_') || !fileName.endsWith('.bin')) {
+      return null;
+    }
+    const match = /^r_(\d+)_(\d+)_(.+)_fp_([0-9a-zA-Z_-]{1,64})\.bin$/.exec(fileName);
+    if (!match) {
+      return null;
+    }
+    return {
+      offset: Number(match[1]),
+      unitLength: Number(match[2]),
+      pathToken: match[3],
+      fp: match[4],
+    };
   }
 
   function normalizeDataBase(base) {
@@ -1481,13 +1499,17 @@
       this._pendingPrefetches = new Set();
       this._opfsL2WriteQueue = new Map(); // writeKey -> { normalizedPath, offset, unitLength, bytes, fileFingerprint }
       this._activeOpfsL2Writes = new Set(); // Set<Promise>
+      this._inFlightOpfsL2WriteKeys = new Set(); // Set<writeKey> preventing concurrent SyncAccessHandle lock collisions
+      this._inFlightOpfsL2WritePayloads = new Map(); // writeKey -> Uint8Array (serves hot RAM-evicted reads before disk flush)
       this._opfsL2WriteWaiters = [];
       this._opfsL2Entries = new Map(); // fileName -> { normalizedPath, offset, unitLength, byteLength }
-      this._opfsL2ValidatedFingerprints = new Map(); // normalizedPath -> last validated fp
+      this._opfsL2ValidatedFingerprints = new Map(); // normalizedPath.toLowerCase() -> last validated fp
       this._opfsDirKnownFiles = null; // lazily-populated Set<string> of filenames in current opfsDir
+      this._opfsDirPathFingerprints = new Map(); // pathToken -> Set<fp> discovered in current opfsDir
       this._opfsDirIndexPromise = null; // coalesced in-flight directory enumeration promise
       this._opfsDirIndexedStore = null; // opfsDir store reference owning _opfsDirKnownFiles
-      this._opfsL2CheckedFingerprints = new Map(); // normalizedPath -> last fp checked for stale OPFS dir entries
+      this._inFlightFingerprintProbes = new Map(); // url -> Promise<string|null> coalesced warm-boot HEAD validation
+      this._opfsL2CheckedFingerprints = new Map(); // normalizedPath.toLowerCase() -> last fp checked for stale OPFS dir entries
       this._opfsL2QuotaEvictChain = Promise.resolve();
       this._bytesCached = 0;
       this._slabBytesCached = 0;
@@ -1544,9 +1566,66 @@
 
     _resetOpfsDirIndex() {
       this._opfsDirKnownFiles = null;
+      this._opfsDirPathFingerprints.clear();
       this._opfsDirIndexPromise = null;
       this._opfsDirIndexedStore = null;
+      this._inFlightFingerprintProbes.clear();
       this._opfsL2CheckedFingerprints.clear();
+    }
+
+    _recordOpfsDirFileName(fileName) {
+      if (typeof fileName !== 'string' || fileName.length === 0) {
+        return;
+      }
+      if (this._opfsDirKnownFiles !== null) {
+        this._opfsDirKnownFiles.add(fileName);
+      }
+      const parsed = parseOpfsL2RangeFileMeta(fileName);
+      if (parsed && parsed.pathToken && parsed.fp) {
+        let fps = this._opfsDirPathFingerprints.get(parsed.pathToken);
+        if (!fps) {
+          fps = new Set();
+          this._opfsDirPathFingerprints.set(parsed.pathToken, fps);
+        }
+        fps.add(parsed.fp);
+      }
+    }
+
+    _removeOpfsDirFileName(fileName) {
+      if (typeof fileName !== 'string' || fileName.length === 0) {
+        return;
+      }
+      if (this._opfsDirKnownFiles !== null) {
+        this._opfsDirKnownFiles.delete(fileName);
+      }
+      const parsed = parseOpfsL2RangeFileMeta(fileName);
+      if (parsed && parsed.pathToken && parsed.fp) {
+        const fps = this._opfsDirPathFingerprints.get(parsed.pathToken);
+        if (fps && this._opfsDirKnownFiles !== null) {
+          let stillHasFp = false;
+          const needle = `_${parsed.pathToken}_fp_${parsed.fp}.bin`;
+          for (const existing of this._opfsDirKnownFiles) {
+            if (existing.endsWith(needle)) {
+              stillHasFp = true;
+              break;
+            }
+          }
+          if (!stillHasFp) {
+            fps.delete(parsed.fp);
+            if (fps.size === 0) {
+              this._opfsDirPathFingerprints.delete(parsed.pathToken);
+            }
+          }
+        }
+      }
+    }
+
+    warmOpfsIndex() {
+      const backend = this._getOpfsL2Backend();
+      if (!backend || backend.kind !== 'opfsDir' || !this._supportsOpfsDirIndex(backend.store)) {
+        return Promise.resolve(null);
+      }
+      return this._ensureOpfsDirIndex(backend.store);
     }
 
     setOpfsL2(store) {
@@ -1644,13 +1723,15 @@
     }
 
     _evictNormalizedPathFromMemory(normalizedPath) {
+      const targetLower = typeof normalizedPath === 'string' ? normalizedPath.toLowerCase() : '';
       for (const [key, bytes] of Array.from(this._slabs.entries())) {
         const sep = key.indexOf('::');
         const keyUrl = sep >= 0 ? key.slice(0, sep) : key;
         const keyNorm = normalizeOpfsL2Path(keyUrl);
+        const keyLower = keyNorm ? keyNorm.toLowerCase() : '';
         if (
-          keyNorm === normalizedPath ||
-          (keyNorm && basenameOfPath(keyNorm) === normalizedPath)
+          keyLower === targetLower ||
+          (keyLower && basenameOfPath(keyLower) === targetLower)
         ) {
           this._slabs.delete(key);
           this._prefetchedSlabKeys.delete(key);
@@ -1661,18 +1742,20 @@
         const sep = key.indexOf('::');
         const keyUrl = sep >= 0 ? key.slice(0, sep) : key;
         const keyNorm = normalizeOpfsL2Path(keyUrl);
+        const keyLower = keyNorm ? keyNorm.toLowerCase() : '';
         if (
-          keyNorm === normalizedPath ||
-          (keyNorm && basenameOfPath(keyNorm) === normalizedPath)
+          keyLower === targetLower ||
+          (keyLower && basenameOfPath(keyLower) === targetLower)
         ) {
           this._chunks.delete(key);
           this._bytesCached = Math.max(0, this._bytesCached - bytes.byteLength);
         }
       }
       for (const [wKey, task] of Array.from(this._opfsL2WriteQueue.entries())) {
+        const taskLower = task && task.normalizedPath ? task.normalizedPath.toLowerCase() : '';
         if (
-          task.normalizedPath === normalizedPath ||
-          basenameOfPath(task.normalizedPath) === normalizedPath
+          taskLower === targetLower ||
+          (taskLower && basenameOfPath(taskLower) === targetLower)
         ) {
           this._opfsL2WriteQueue.delete(wKey);
         }
@@ -1684,8 +1767,9 @@
       if (!normPath) {
         return null;
       }
+      const pathKey = normPath.toLowerCase();
       const nextFp = buildFileFingerprint(fingerprintOrMeta);
-      const prevRec = this._fileFingerprints.get(normPath) || null;
+      const prevRec = this._fileFingerprints.get(pathKey) || null;
       let metaSize = null;
       let metaEtag = null;
       if (fingerprintOrMeta && typeof fingerprintOrMeta === 'object') {
@@ -1705,9 +1789,9 @@
       }
 
       if (nextFp === null) {
-        this._fileFingerprints.delete(normPath);
+        this._fileFingerprints.delete(pathKey);
       } else {
-        this._fileFingerprints.set(normPath, {
+        this._fileFingerprints.set(pathKey, {
           fp: nextFp,
           explicit: true,
           size: metaSize,
@@ -1718,7 +1802,8 @@
       if (prevRec && prevRec.fp && prevRec.fp !== nextFp) {
         this._evictNormalizedPathFromMemory(normPath);
         for (const [metaUrl, meta] of Array.from(this._fileMeta.entries())) {
-          if (normalizeOpfsL2Path(metaUrl) === normPath) {
+          const metaNorm = normalizeOpfsL2Path(metaUrl);
+          if (metaNorm && metaNorm.toLowerCase() === pathKey) {
             this._fileMeta.set(metaUrl, {
               size: metaSize !== null ? metaSize : meta.size,
               etag: metaEtag !== null ? metaEtag : null,
@@ -1745,12 +1830,13 @@
       if (!normPath) {
         return null;
       }
-      const direct = this._fileFingerprints.get(normPath);
+      const pathKey = normPath.toLowerCase();
+      const direct = this._fileFingerprints.get(pathKey);
       if (direct && direct.fp) {
         return direct.fp;
       }
-      const base = basenameOfPath(normPath);
-      if (base !== normPath) {
+      const base = basenameOfPath(pathKey);
+      if (base !== pathKey) {
         const byBase = this._fileFingerprints.get(base);
         if (byBase && byBase.fp) {
           return byBase.fp;
@@ -1764,18 +1850,19 @@
       if (!normPath) {
         return null;
       }
-      const direct = this._fileFingerprints.get(normPath);
+      const pathKey = normPath.toLowerCase();
+      const direct = this._fileFingerprints.get(pathKey);
       if (direct) {
-        return { normPath, record: direct };
+        return { normPath, pathKey, record: direct };
       }
-      const base = basenameOfPath(normPath);
-      if (base !== normPath) {
+      const base = basenameOfPath(pathKey);
+      if (base !== pathKey) {
         const byBase = this._fileFingerprints.get(base);
         if (byBase) {
-          return { normPath, record: byBase };
+          return { normPath, pathKey, record: byBase };
         }
       }
-      return { normPath, record: null };
+      return { normPath, pathKey, record: null };
     }
 
     _touchMeta(url) {
@@ -1834,6 +1921,7 @@
       const existing = this._fileMeta.get(url) || null;
       const seededLookup = this._lookupSeededFingerprintRecord(url);
       const normPath = seededLookup ? seededLookup.normPath : null;
+      const pathKey = seededLookup ? seededLookup.pathKey : null;
       const seededRec = seededLookup ? seededLookup.record : null;
 
       const prevSize = existing ? existing.size : seededRec ? seededRec.size : null;
@@ -1875,8 +1963,8 @@
       });
       this._negativeCache.delete(url);
 
-      if (normPath && nextFp !== null) {
-        this._fileFingerprints.set(normPath, {
+      if (pathKey && nextFp !== null) {
+        this._fileFingerprints.set(pathKey, {
           fp: nextFp,
           explicit: hadExplicitFp && !explicitFpMismatch,
           size: nextSize,
@@ -1886,17 +1974,18 @@
 
       if (sizeChanged || etagChanged || explicitFpMismatch) {
         this._evictUrlFromMemory(url);
-        if (normPath && nextFp !== null && this._hasOpfsL2ForUrl(url)) {
-          this._opfsL2ValidatedFingerprints.set(normPath, nextFp);
+        if (normPath && pathKey && nextFp !== null && this._hasOpfsL2ForUrl(url)) {
+          this._opfsL2ValidatedFingerprints.set(pathKey, nextFp);
           this._enqueueOpfsL2Invalidation(normPath, nextFp, { countIfNoReport: true });
         }
       } else if (
         normPath &&
+        pathKey &&
         nextFp !== null &&
         this._hasOpfsL2ForUrl(url) &&
-        this._opfsL2ValidatedFingerprints.get(normPath) !== nextFp
+        this._opfsL2ValidatedFingerprints.get(pathKey) !== nextFp
       ) {
-        this._opfsL2ValidatedFingerprints.set(normPath, nextFp);
+        this._opfsL2ValidatedFingerprints.set(pathKey, nextFp);
         this._enqueueOpfsL2Invalidation(normPath, nextFp, { countIfNoReport: false });
       }
 
@@ -1935,6 +2024,7 @@
       }
       if (this._opfsDirIndexedStore !== store) {
         this._opfsDirKnownFiles = null;
+        this._opfsDirPathFingerprints.clear();
         this._opfsDirIndexPromise = null;
         this._opfsDirIndexedStore = store;
         this._opfsL2CheckedFingerprints.clear();
@@ -1948,17 +2038,30 @@
       const targetStore = store;
       const promise = (async () => {
         const known = new Set();
+        const pathFps = new Map();
+        const indexName = (name) => {
+          known.add(name);
+          const parsed = parseOpfsL2RangeFileMeta(name);
+          if (parsed && parsed.pathToken && parsed.fp) {
+            let fps = pathFps.get(parsed.pathToken);
+            if (!fps) {
+              fps = new Set();
+              pathFps.set(parsed.pathToken, fps);
+            }
+            fps.add(parsed.fp);
+          }
+        };
         try {
           if (typeof targetStore.keys === 'function') {
             for await (const name of targetStore.keys()) {
               if (typeof name === 'string') {
-                known.add(name);
+                indexName(name);
               }
             }
           } else if (typeof targetStore.entries === 'function') {
             for await (const pair of targetStore.entries()) {
               if (Array.isArray(pair) && typeof pair[0] === 'string') {
-                known.add(pair[0]);
+                indexName(pair[0]);
               }
             }
           }
@@ -1970,9 +2073,10 @@
         }
         if (this._opfsDirIndexedStore === targetStore && this._opfsDirIndexPromise === promise) {
           for (const fileName of this._opfsL2Entries.keys()) {
-            known.add(fileName);
+            indexName(fileName);
           }
           this._opfsDirKnownFiles = known;
+          this._opfsDirPathFingerprints = pathFps;
           this._opfsDirIndexPromise = null;
           return known;
         }
@@ -1985,7 +2089,7 @@
     async _deleteOpfsDirEntry(store, fileName) {
       if (!store || !fileName) return false;
       if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === store) {
-        this._opfsDirKnownFiles.delete(fileName);
+        this._removeOpfsDirFileName(fileName);
       }
       try {
         if (typeof store.removeEntry === 'function') {
@@ -2063,7 +2167,7 @@
         const knownFiles = await this._ensureOpfsDirIndex(store);
         if (knownFiles !== null) {
           if (specificPrefix === null && expectedFp) {
-            this._opfsL2CheckedFingerprints.set(normalizedPath, expectedFp);
+            this._opfsL2CheckedFingerprints.set(normalizedPath.toLowerCase(), expectedFp);
           }
           for (const fileName of this._opfsL2Entries.keys()) {
             if (isStaleMatch(fileName)) {
@@ -2076,7 +2180,7 @@
             }
           }
           for (const staleName of staleNames) {
-            knownFiles.delete(staleName);
+            this._removeOpfsDirFileName(staleName);
             this._opfsL2Entries.delete(staleName);
           }
           let invalidated = 0;
@@ -2190,7 +2294,7 @@
               }
             }
             if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === store) {
-              this._opfsDirKnownFiles.add(fileName);
+              this._recordOpfsDirFileName(fileName);
             }
             return true;
           } catch (err) {
@@ -2216,7 +2320,7 @@
             throw err;
           }
           if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === store) {
-            this._opfsDirKnownFiles.add(fileName);
+            this._recordOpfsDirFileName(fileName);
           }
           return true;
         }
@@ -2309,6 +2413,59 @@
       });
     }
 
+    _probeOpfsFingerprint(url, normPath) {
+      const alreadyKnown = this.getFileFingerprint(url);
+      if (alreadyKnown) {
+        return Promise.resolve(alreadyKnown);
+      }
+      if (typeof this.fetchImpl !== 'function') {
+        return Promise.resolve(null);
+      }
+      const existingProbe = this._inFlightFingerprintProbes.get(url);
+      if (existingProbe) {
+        return existingProbe;
+      }
+      const probePromise = (async () => {
+        try {
+          const res = await this.fetchImpl(url, { method: 'HEAD' });
+          if (res && res.body && typeof res.body.cancel === 'function') {
+            try {
+              await res.body.cancel();
+            } catch {
+              // Ignore body cancel errors on HEAD responses.
+            }
+          }
+          if (!res || !res.ok) {
+            return null;
+          }
+          const etag = getResponseHeader(res.headers, 'ETag');
+          const clRaw = getResponseHeader(res.headers, 'Content-Length');
+          let headSize = null;
+          if (typeof clRaw === 'string' && /^\d+$/.test(clRaw.trim())) {
+            const parsed = Number(clRaw.trim());
+            if (Number.isSafeInteger(parsed) && parsed >= 0) {
+              headSize = parsed;
+            }
+          }
+          if (etag === null && headSize === null) {
+            return null;
+          }
+          const resolvedFp = this._recordObservedHttpMeta(url, headSize, etag);
+          return resolvedFp || this.getFileFingerprint(url) || null;
+        } catch {
+          // Degrade gracefully when HEAD is unsupported or fails; Range GET will populate metadata.
+          return null;
+        }
+      })();
+      this._inFlightFingerprintProbes.set(url, probePromise);
+      probePromise.finally(() => {
+        if (this._inFlightFingerprintProbes.get(url) === probePromise) {
+          this._inFlightFingerprintProbes.delete(url);
+        }
+      });
+      return probePromise;
+    }
+
     async _tryReadOpfsL2(url, offset, unitLength, knownSize) {
       const backend = this._getOpfsL2Backend();
       if (!backend || !isHotOpfsL2Path(url, this.opfsL2Allowlist)) {
@@ -2318,10 +2475,20 @@
       if (!normPath) {
         return null;
       }
-      const fp = this.getFileFingerprint(url);
+      const pathKey = normPath.toLowerCase();
+      let fp = this.getFileFingerprint(url);
       if (!fp) {
-        this._stats.opfsL2Misses += 1;
-        return null;
+        if (backend.kind === 'opfsDir' && this._supportsOpfsDirIndex(backend.store)) {
+          await this._ensureOpfsDirIndex(backend.store);
+          const cachedFps = this._opfsDirPathFingerprints.get(opfsL2PathToken(normPath));
+          if (cachedFps && cachedFps.size > 0) {
+            fp = await this._probeOpfsFingerprint(url, normPath);
+          }
+        }
+        if (!fp) {
+          this._stats.opfsL2Misses += 1;
+          return null;
+        }
       }
 
       let rawBytes = null;
@@ -2329,8 +2496,20 @@
       let reportedEtag = null;
       let staleInvalidated = false;
 
+      const writeKey = `${pathKey}::${offset}::${unitLength}::${fp}`;
+      const queuedTask = this._opfsL2WriteQueue.get(writeKey);
+      const pendingBytes =
+        queuedTask && queuedTask.bytes instanceof Uint8Array
+          ? queuedTask.bytes
+          : this._inFlightOpfsL2WritePayloads.get(writeKey) || null;
+      if (pendingBytes instanceof Uint8Array && pendingBytes.byteLength > 0) {
+        rawBytes = pendingBytes.slice();
+      }
+
       try {
-        if (backend.kind === 'range') {
+        if (rawBytes !== null) {
+          // Served directly from pending/in-flight OPFS write-through buffer.
+        } else if (backend.kind === 'range') {
           if (typeof backend.store.readRange !== 'function') {
             this._stats.opfsL2Misses += 1;
             return null;
@@ -2376,7 +2555,7 @@
               ? await this._ensureOpfsDirIndex(backend.store)
               : null;
             if (knownFiles !== null && !knownFiles.has(fileName)) {
-              if (this._opfsL2CheckedFingerprints.get(normPath) !== fp) {
+              if (this._opfsL2CheckedFingerprints.get(pathKey) !== fp) {
                 const inv = await this._invalidateStaleOpfsDirPath(
                   backend.store,
                   normPath,
@@ -2396,9 +2575,9 @@
             } catch (err) {
               if (isNotFoundError(err)) {
                 if (knownFiles !== null) {
-                  knownFiles.delete(fileName);
+                  this._removeOpfsDirFileName(fileName);
                   this._opfsL2Entries.delete(fileName);
-                  if (this._opfsL2CheckedFingerprints.get(normPath) !== fp) {
+                  if (this._opfsL2CheckedFingerprints.get(pathKey) !== fp) {
                     const inv = await this._invalidateStaleOpfsDirPath(
                       backend.store,
                       normPath,
@@ -2425,17 +2604,33 @@
               }
               throw err;
             }
-            const file = await handle.getFile();
-            const buf = await file.arrayBuffer();
-            rawBytes = new Uint8Array(buf);
+            if (typeof handle.getFile === 'function') {
+              const file = await handle.getFile();
+              const buf = await file.arrayBuffer();
+              rawBytes = new Uint8Array(buf);
+            } else if (typeof handle.createSyncAccessHandle === 'function') {
+              const syncHandle = await handle.createSyncAccessHandle();
+              try {
+                const sz = typeof syncHandle.getSize === 'function' ? syncHandle.getSize() : 0;
+                if (sz > 0) {
+                  const out = new Uint8Array(sz);
+                  const readLen = syncHandle.read(out, { at: 0 });
+                  rawBytes = readLen === sz ? out : out.slice(0, Math.max(0, readLen));
+                }
+              } finally {
+                if (typeof syncHandle.close === 'function') {
+                  syncHandle.close();
+                }
+              }
+            }
             if (knownFiles !== null) {
-              knownFiles.add(fileName);
+              this._recordOpfsDirFileName(fileName);
             }
             if (this._opfsL2Entries.has(fileName)) {
               const meta = this._opfsL2Entries.get(fileName);
               this._opfsL2Entries.delete(fileName);
               this._opfsL2Entries.set(fileName, meta);
-            } else {
+            } else if (rawBytes instanceof Uint8Array) {
               this._opfsL2Entries.set(fileName, {
                 normalizedPath: normPath,
                 offset,
@@ -2498,7 +2693,7 @@
       }
 
       this._stats.opfsL2Hits += 1;
-      this._opfsL2ValidatedFingerprints.set(normPath, fp);
+      this._opfsL2ValidatedFingerprints.set(pathKey, fp);
       this._opfsL2HitBuffers.add(rawBytes);
 
       if (this.getFileSize(url) === null) {
@@ -2625,6 +2820,13 @@
         if (!nextEntry) break;
         const [writeKey, task] = nextEntry;
         this._opfsL2WriteQueue.delete(writeKey);
+        if (this._inFlightOpfsL2WriteKeys.has(writeKey)) {
+          continue;
+        }
+        this._inFlightOpfsL2WriteKeys.add(writeKey);
+        if (task && task.bytes instanceof Uint8Array) {
+          this._inFlightOpfsL2WritePayloads.set(writeKey, task.bytes);
+        }
 
         const writePromise = (async () => {
           try {
@@ -2636,6 +2838,8 @@
 
         this._activeOpfsL2Writes.add(writePromise);
         writePromise.finally(() => {
+          this._inFlightOpfsL2WriteKeys.delete(writeKey);
+          this._inFlightOpfsL2WritePayloads.delete(writeKey);
           this._activeOpfsL2Writes.delete(writePromise);
           this._pumpOpfsL2WriteQueue();
           if (this._activeOpfsL2Writes.size === 0 && this._opfsL2WriteQueue.size === 0) {
@@ -2649,8 +2853,10 @@
     }
 
     _maybeWriteThroughOpfsL2(url, offset, unitLength, bytes) {
+      const backend = this._getOpfsL2Backend();
       if (
-        !this._hasOpfsL2ForUrl(url) ||
+        !backend ||
+        !isHotOpfsL2Path(url, this.opfsL2Allowlist) ||
         !(bytes instanceof Uint8Array) ||
         bytes.byteLength === 0
       ) {
@@ -2664,7 +2870,21 @@
       if (!fp) {
         return false;
       }
-      const writeKey = `${normPath}::${offset}::${unitLength}::${fp}`;
+      const pathKey = normPath.toLowerCase();
+      const writeKey = `${pathKey}::${offset}::${unitLength}::${fp}`;
+      if (this._inFlightOpfsL2WriteKeys.has(writeKey)) {
+        return false;
+      }
+      if (
+        backend.kind === 'opfsDir' &&
+        this._opfsDirKnownFiles !== null &&
+        this._opfsDirIndexedStore === backend.store
+      ) {
+        const fileName = opfsL2RangeFileName(normPath, offset, unitLength, fp);
+        if (this._opfsDirKnownFiles.has(fileName)) {
+          return false;
+        }
+      }
       if (this._opfsL2WriteQueue.has(writeKey)) {
         this._opfsL2WriteQueue.delete(writeKey);
       } else {
@@ -4300,6 +4520,8 @@
       this._negativeCache.clear();
       this._streamTrackers.clear();
       this._opfsL2WriteQueue.clear();
+      this._inFlightOpfsL2WriteKeys.clear();
+      this._inFlightOpfsL2WritePayloads.clear();
       this._opfsL2Entries.clear();
       this._opfsL2ValidatedFingerprints.clear();
       this._resetOpfsDirIndex();
@@ -4478,6 +4700,9 @@
       hits: cacheStats.hits,
       misses: cacheStats.misses,
       opfsHits: cacheStats.opfsHits,
+      opfsMisses: 0,
+      opfsWrites: 0,
+      opfsErrors: 0,
       evictions: cacheStats.evictions,
       bytesCached: cacheStats.bytesCached,
       entries: cacheStats.entries,
@@ -4487,6 +4712,7 @@
       opfsL2Hits: immStats.opfsL2Hits,
       opfsL2Misses: immStats.opfsL2Misses,
       opfsL2Writes: immStats.opfsL2Writes,
+      opfsL2WriteErrors: immStats.opfsL2WriteErrors,
       opfsL2Invalidations: immStats.opfsL2Invalidations,
       syncFastPathHits: mailboxStats.syncFastPathHits,
       dumpWritesCompleted: dumpWriteStats.dumpWritesCompleted,
@@ -4921,6 +5147,7 @@
       this._rpfMountErrors = 0;
       this._prefetchPromise = null;
       this._prefetchAbortController = null;
+      this._initPromise = null;
     }
 
     get prefetchPromise() {
@@ -7202,11 +7429,29 @@
         maxReadMs: this._streamingStats.maxReadMs,
       };
 
+      const totalOpfsHits =
+        (Number.isFinite(cacheStats.opfsHits) ? cacheStats.opfsHits : 0) +
+        (Number.isFinite(immutableCacheStats.opfsL2Hits) ? immutableCacheStats.opfsL2Hits : 0);
+      const totalOpfsMisses =
+        (Number.isFinite(cacheStats.opfsMisses) ? cacheStats.opfsMisses : 0) +
+        (Number.isFinite(immutableCacheStats.opfsL2Misses) ? immutableCacheStats.opfsL2Misses : 0);
+      const totalOpfsWrites =
+        (Number.isFinite(cacheStats.opfsWrites) ? cacheStats.opfsWrites : 0) +
+        (Number.isFinite(immutableCacheStats.opfsL2Writes) ? immutableCacheStats.opfsL2Writes : 0);
+      const totalOpfsErrors =
+        (Number.isFinite(cacheStats.opfsWriteErrors) ? cacheStats.opfsWriteErrors : 0) +
+        (Number.isFinite(immutableCacheStats.opfsL2WriteErrors)
+          ? immutableCacheStats.opfsL2WriteErrors
+          : 0);
+
       return {
-        // Backwards-compatible top-level RangeCache fields
+        // Backwards-compatible top-level RangeCache + aggregate OPFS fields
         hits: cacheStats.hits,
         misses: cacheStats.misses,
-        opfsHits: cacheStats.opfsHits,
+        opfsHits: totalOpfsHits,
+        opfsMisses: totalOpfsMisses,
+        opfsWrites: totalOpfsWrites,
+        opfsErrors: totalOpfsErrors,
         evictions: cacheStats.evictions,
         bytesCached: cacheStats.bytesCached,
         entries: cacheStats.entries,
@@ -7217,6 +7462,7 @@
         opfsL2Hits: immutableCacheStats.opfsL2Hits,
         opfsL2Misses: immutableCacheStats.opfsL2Misses,
         opfsL2Writes: immutableCacheStats.opfsL2Writes,
+        opfsL2WriteErrors: immutableCacheStats.opfsL2WriteErrors,
         opfsL2Invalidations: immutableCacheStats.opfsL2Invalidations,
         syncFastPathHits: mailboxStats.syncFastPathHits,
         // Top-level opt-in /pg6_dump/* write forwarding telemetry
@@ -7255,7 +7501,18 @@
       };
     }
 
-    async init(options = {}) {
+    init(options = {}) {
+      const initPromise = this._initInternal(options);
+      this._initPromise = initPromise;
+      initPromise.finally(() => {
+        if (this._initPromise === initPromise) {
+          this._initPromise = null;
+        }
+      });
+      return initPromise;
+    }
+
+    async _initInternal(options = {}) {
       const opts = typeof options === 'string' ? { dataBase: options } : options || {};
       this.cancelPrefetch({ abortInFlight: true });
       for (const entry of this._handles.values()) {
@@ -7356,8 +7613,15 @@
         throw new Error('PlayGta6RangeCache unavailable in io_worker');
       }
 
+      const resolvedOpfsL2Enabled =
+        opts.opfsL2Enabled !== undefined
+          ? opts.opfsL2Enabled
+          : this._immutableCacheOptions.opfsL2Enabled;
+
       let opfsDir = null;
-      if (opts.opfsDir !== undefined) {
+      if (resolvedOpfsL2Enabled === false) {
+        opfsDir = null;
+      } else if (opts.opfsDir !== undefined) {
         opfsDir = opts.opfsDir;
       } else if (this._cacheOptions.opfsDir !== undefined) {
         opfsDir = this._cacheOptions.opfsDir;
@@ -7417,10 +7681,6 @@
         opts.opfsL2 !== undefined ? opts.opfsL2 : this._immutableCacheOptions.opfsL2;
       const resolvedOpfsCache =
         opts.opfsCache !== undefined ? opts.opfsCache : this._immutableCacheOptions.opfsCache;
-      const resolvedOpfsL2Enabled =
-        opts.opfsL2Enabled !== undefined
-          ? opts.opfsL2Enabled
-          : this._immutableCacheOptions.opfsL2Enabled;
       const resolvedOpfsL2Allowlist =
         opts.opfsL2Allowlist !== undefined
           ? opts.opfsL2Allowlist
@@ -7449,6 +7709,18 @@
         opts.opfsL2MaxBytes !== undefined
           ? opts.opfsL2MaxBytes
           : this._immutableCacheOptions.opfsL2MaxBytes;
+
+      this._cacheOptions.opfsDir = opfsDir;
+      this._immutableCacheOptions.opfsDir = opfsDir;
+      this._immutableCacheOptions.opfsL2 = resolvedOpfsL2;
+      this._immutableCacheOptions.opfsCache = resolvedOpfsCache;
+      this._immutableCacheOptions.opfsL2Enabled = resolvedOpfsL2Enabled;
+      this._immutableCacheOptions.opfsL2Allowlist = resolvedOpfsL2Allowlist;
+      this._immutableCacheOptions.opfsL2RequireEtag = resolvedOpfsL2RequireEtag;
+      this._immutableCacheOptions.fileFingerprints = resolvedFileFingerprints;
+      this._immutableCacheOptions.maxPendingOpfsL2Writes = resolvedMaxPendingOpfsL2Writes;
+      this._immutableCacheOptions.maxOpfsL2WriteConcurrency = resolvedMaxOpfsL2WriteConcurrency;
+      this._immutableCacheOptions.opfsL2MaxBytes = resolvedOpfsL2MaxBytes;
 
       this.immutableCache =
         opts.immutableCache ||
@@ -7494,6 +7766,16 @@
             typeof opts.now === 'function' ? opts.now : this._immutableCacheOptions.now,
           fetchImpl: fetchFn,
         });
+      if (
+        resolvedOpfsL2Enabled !== false &&
+        opfsDir &&
+        this.immutableCache &&
+        typeof this.immutableCache.warmOpfsIndex === 'function'
+      ) {
+        // Hydrate the O(1) OPFS directory index in the background so warm-boot reads
+        // immediately recognize persisted slabs without adding cold-boot startup latency.
+        this.immutableCache.warmOpfsIndex().catch(() => {});
+      }
       const initRangeCacheOpts = {
         dataBase: this.dataBase,
         chunkSize:
@@ -7632,7 +7914,7 @@
         dumpEndpoint: this.dumpEndpoint,
       };
 
-      if (this.postMessage) {
+      if (this.postMessage && !opts._deferReady) {
         this.postMessage(readyPayload);
       }
 
@@ -7643,19 +7925,42 @@
       const m = msg || {};
       try {
         if (m.init) {
-          if (Array.isArray(m.mailboxSabs) && m.mailboxSabs.length > 0) {
-            await this.attachMailbox(m.mailboxSabs, m);
-          } else if (m.mailboxSab) {
-            await this.attachMailbox(m.mailboxSab, m);
+          const hasInlineMailbox =
+            (Array.isArray(m.mailboxSabs) && m.mailboxSabs.length > 0) || Boolean(m.mailboxSab);
+          if (hasInlineMailbox) {
+            const readyPayload = await this.init(Object.assign({}, m, { _deferReady: true }));
+            if (Array.isArray(m.mailboxSabs) && m.mailboxSabs.length > 0) {
+              await this.attachMailbox(m.mailboxSabs, m);
+            } else if (m.mailboxSab) {
+              await this.attachMailbox(m.mailboxSab, m);
+            }
+            if (this.postMessage) {
+              this.postMessage(readyPayload);
+            }
+          } else {
+            await this.init(m);
           }
-          await this.init(m);
         } else if (m.attachMailboxPool) {
+          if (this._initPromise) {
+            try {
+              await this._initPromise;
+            } catch {
+              // Proceed so mailbox attachment still reports an explicit result if init failed.
+            }
+          }
           const poolSabs = m.sabs || m.mailboxSabs || m.sab || m.mailboxSab;
           await this.attachMailboxPool(poolSabs, m);
           const reply = { mailboxAttached: true, mailboxLanes: this._mailboxLanes };
           if (m.id !== undefined) reply.id = m.id;
           if (this.postMessage) this.postMessage(reply);
         } else if (m.attachMailbox) {
+          if (this._initPromise) {
+            try {
+              await this._initPromise;
+            } catch {
+              // Proceed so mailbox attachment still reports an explicit result if init failed.
+            }
+          }
           const target =
             Array.isArray(m.sabs) && m.sabs.length > 0
               ? m.sabs
