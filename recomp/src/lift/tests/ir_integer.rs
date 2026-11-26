@@ -535,3 +535,194 @@ fn random_integer_family_code_never_panics() {
         );
     }
 }
+
+#[test]
+fn r60_bit_manip_rotates_bswap_and_double_shifts_emit_compact_intrinsics_and_elide_dead_flags() {
+    // Every bit-manipulation/rotate/double-shift/bswap op followed by a flag-overwriting `xor`
+    // must emit native LLVM intrinsics and elide dead flag computations (no parity ctpop.i8, no
+    // constant-count flag selects, constant-folded bit-test masks).
+    let ir = module_ir(|a| {
+        a.bsf(eax, ecx)?;
+        a.bsr(edx, ecx)?;
+        a.tzcnt(r8, rcx)?;
+        a.lzcnt(r9, rcx)?;
+        a.popcnt(r10d, ecx)?;
+        a.popcnt(r11, rcx)?;
+        a.rol(eax, 7)?;
+        a.ror(r8, 13)?;
+        a.shld(eax, edx, 5)?;
+        a.shrd(r8, r9, 9)?;
+        a.bswap(eax)?;
+        a.bswap(r8)?;
+        a.bts(eax, 5)?;
+        a.btr(r8, 17)?;
+        a.rorx(ecx, eax, 0)?;
+        a.andn(r10, r8, r9)?;
+        a.blsi(r11d, eax)?;
+        a.bzhi(edx, eax, ecx)?;
+        // Overwrites CF/OF/ZF/SF/PF so all preceding instructions' flags are dead.
+        a.xor(eax, r10d)?;
+        a.ret()
+    });
+    for intrinsic in [
+        "@llvm.cttz.i32(",
+        "@llvm.ctlz.i32(",
+        "@llvm.cttz.i64(",
+        "@llvm.ctlz.i64(",
+        "@llvm.ctpop.i32(",
+        "@llvm.ctpop.i64(",
+        "@llvm.fshl.i32(",
+        "@llvm.fshr.i64(",
+        "@llvm.bswap.i32(",
+        "@llvm.bswap.i64(",
+    ] {
+        assert!(ir.contains(intrinsic), "missing {intrinsic}:\n{ir}");
+    }
+    let fn_start = ir.find("define void @sub_1000(").expect("sub_1000");
+    let fn_ir = &ir[fn_start..];
+    // Only the final `xor` computes parity (not `shld`/`shrd`!).
+    assert_eq!(
+        fn_ir.matches("@llvm.ctpop.i8(").count(),
+        1,
+        "dead shld/shrd PF must be elided:\n{fn_ir}"
+    );
+    // Constant-count `shld`/`shrd` and `rol`/`ror` never emit `select i1 ..., i1` flag muxes.
+    assert!(
+        !fn_ir.lines().any(|l| l.contains("select i1 ") && l.contains(", i1 ")),
+        "dead/imm shift flags must not emit flag selects:\n{fn_ir}"
+    );
+    // `bts eax, 5` -> `or i32 %..., 32`, `btr r8, 17` -> `and i64 %..., -131073` (no `shl`!).
+    assert!(
+        fn_ir.contains("or i32 ") && fn_ir.contains(", 32\n"),
+        "bts imm mask should be constant-folded:\n{fn_ir}"
+    );
+    assert!(
+        fn_ir.contains("and i64 ") && fn_ir.contains(", -131073\n"),
+        "btr imm mask should be constant-folded:\n{fn_ir}"
+    );
+    // `rorx ecx, eax, 0` must not emit an `fshr.i32` call.
+    assert!(
+        !fn_ir.contains("@llvm.fshr.i32("),
+        "rorx by 0 should not emit fshr:\n{fn_ir}"
+    );
+    // Native retargeting keeps the exact same standard LLVM intrinsics (no llvm.wasm.*).
+    let native = crate::lift::target::LiftTarget::native_host().retarget(ir);
+    assert!(!native.contains("llvm.wasm."), "{native}");
+}
+
+#[test]
+fn r60_same_block_predicate_fusion_and_scalar_lowering_compactness() {
+    // 1. `cmp rax, rbx; jle taken` with flags overwritten in both successors:
+    //    must emit a single `icmp sle i64` and ZERO `sub`, ZERO `OF` chain, ZERO flag stores!
+    let cmp_jle = module_ir(|a| {
+        let mut taken = a.create_label();
+        a.cmp(rax, rbx)?;
+        a.jle(taken)?;
+        a.add(rax, 1)?;
+        a.ret()?;
+        a.set_label(&mut taken)?;
+        a.add(rax, 2)?;
+        a.ret()
+    });
+    let entry_body = {
+        let start = cmp_jle.find("bb_1000:\n").expect("bb_1000");
+        let rest = &cmp_jle[start + "bb_1000:\n".len()..];
+        let end = rest.find(":\n").map_or(rest.len(), |i| rest[..i].rfind('\n').unwrap_or(0));
+        &rest[..end]
+    };
+    assert!(
+        entry_body.contains("icmp sle i64 "),
+        "cmp+jle must fuse to icmp sle:\n{entry_body}"
+    );
+    assert!(
+        !entry_body.contains(" = sub i64 "),
+        "fused cmp+jle with dead flags must not emit sub:\n{entry_body}"
+    );
+    assert!(
+        !entry_body.contains("store i1 "),
+        "fused cmp+jle with dead flags must not store flags:\n{entry_body}"
+    );
+    assert!(
+        !entry_body.contains(" = xor i1 ") && !entry_body.contains(" = or i1 "),
+        "fused cmp+jle must not combine boolean flags:\n{entry_body}"
+    );
+
+    // 2. `test eax, eax; jg taken` with flags overwritten in both successors:
+    //    must emit a single `icmp sgt i32` and ZERO flag stores!
+    let test_jg = module_ir(|a| {
+        let mut taken = a.create_label();
+        a.test(eax, eax)?;
+        a.jg(taken)?;
+        a.xor(eax, eax)?;
+        a.ret()?;
+        a.set_label(&mut taken)?;
+        a.add(eax, 1)?;
+        a.ret()
+    });
+    let test_body = {
+        let start = test_jg.find("bb_1000:\n").expect("bb_1000");
+        let rest = &test_jg[start + "bb_1000:\n".len()..];
+        let end = rest.find(":\n").map_or(rest.len(), |i| rest[..i].rfind('\n').unwrap_or(0));
+        &rest[..end]
+    };
+    assert!(
+        test_body.contains("icmp sgt i32 "),
+        "test+jg must fuse to icmp sgt:\n{test_body}"
+    );
+    assert!(
+        !test_body.contains("store i1 "),
+        "fused test+jg with dead flags must not store flags:\n{test_body}"
+    );
+
+    // 3. `cmp` -> `setl` + `cmovg` + `dec` -> `jle` + `movzx` + `lea r32` + 32-bit shifts + 32-bit div/idiv.
+    let scalar = module_ir(|a| {
+        let mut done = a.create_label();
+        a.movzx(eax, cl)?;
+        a.movzx(edx, byte_ptr(rsi))?;
+        a.lea(r8d, dword_ptr(rcx + rdx * 4 + 16))?;
+        a.shl(eax, 3)?;
+        a.shr(edx, cl)?;
+        a.sar(r8d, 5)?;
+        a.cmp(eax, edx)?;
+        a.setl(r9b)?;
+        a.cmovg(eax, r8d)?;
+        a.xor(edx, edx)?;
+        a.div(r8d)?;
+        a.cdq()?;
+        a.idiv(r8d)?;
+        a.dec(rcx)?;
+        a.jle(done)?;
+        a.add(eax, 1)?;
+        a.ret()?;
+        a.set_label(&mut done)?;
+        a.add(eax, 2)?;
+        a.ret()
+    });
+    let fn_start = scalar.find("define void @sub_1000(").expect("sub_1000");
+    let fn_ir = &scalar[fn_start..];
+    // `movzx eax, cl` -> `and i64 ..., 255` (no trunc + double zext).
+    assert!(fn_ir.contains("and i64 ") && fn_ir.contains(", 255\n"), "{fn_ir}");
+    // `movzx edx, byte ptr [rsi]` -> single `zext i8 ... to i64` (no `zext i8->i32` then `zext i32->i64`).
+    assert!(
+        fn_ir.lines().any(|l| l.contains(" = zext i8 ") && l.ends_with(" to i64")),
+        "32-bit movzx from memory should extend directly to i64:\n{fn_ir}"
+    );
+    // `lea r8d, [rcx + rdx*4 + 16]` -> `and i64 ..., 4294967295`.
+    assert!(fn_ir.contains(", 4294967295\n"), "{fn_ir}");
+    // 32-bit shifts stay natively in `i32`.
+    assert!(fn_ir.contains(" = shl i32 "), "{fn_ir}");
+    assert!(fn_ir.contains(" = lshr i32 "), "{fn_ir}");
+    assert!(fn_ir.contains(" = ashr i32 "), "{fn_ir}");
+    // `cmp` -> `setl` + `cmovg` fused directly to `icmp slt i32` and `icmp sgt i32`.
+    assert!(fn_ir.contains(" = icmp slt i32 "), "{fn_ir}");
+    assert!(fn_ir.contains(" = icmp sgt i32 "), "{fn_ir}");
+    // `dec rcx` -> `jle` fused directly to `icmp sle i64 ..., 1`.
+    assert!(fn_ir.contains(" = icmp sle i64 ") && fn_ir.contains(", 1\n"), "{fn_ir}");
+    // 32-bit `div` / `idiv` use native `udiv i64` / `sdiv i64`, NOT 128-bit software helpers!
+    assert!(fn_ir.contains(" = udiv i64 ") && fn_ir.contains(" = urem i64 "), "{fn_ir}");
+    assert!(fn_ir.contains(" = sdiv i64 ") && fn_ir.contains(" = srem i64 "), "{fn_ir}");
+    assert!(
+        !scalar.contains("__playgta6_udiv128") && !scalar.contains("__playgta6_sdiv128"),
+        "32-bit div/idiv must not pull in 128-bit helpers:\n{scalar}"
+    );
+}
