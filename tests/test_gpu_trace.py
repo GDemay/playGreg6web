@@ -1099,7 +1099,7 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(len(gpu_trace.WGPU_TEXTURE_FORMAT_NAMES), 64)
         self.assertEqual(len(gpu_trace.WGPU_VERTEX_FORMAT_NAMES), 42)
         self.assertEqual(
-            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 39))
+            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 41))
         )
         self.assertEqual(gpu_trace.INDIRECT_STRUCT.size, 16)
         # G66 ExecuteIndirect packets decode their GpuIndirectPayload.

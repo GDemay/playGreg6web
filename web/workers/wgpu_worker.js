@@ -42,6 +42,8 @@ const OPCODES = Object.freeze({
   DRAW_INDIRECT: 36,
   DRAW_INDEXED_INDIRECT: 37,
   DISPATCH_INDIRECT: 38,
+  READBACK_BUFFER: 39,
+  READBACK_TEXTURE: 40,
 });
 
 const SHADER_STAGE = Object.freeze({
@@ -1930,6 +1932,135 @@ function isExternalImageLike(obj) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// G66 GPU -> CPU read-back (docs/gpu_commands.md "Read-back"): ReadbackBuffer / ReadbackTexture
+// copy into a MAP_READ staging buffer in stream order; once mapped, the bytes are written to
+// `dstAddr` in the runtime's memory and only then is the u32 at `doneAddr` incremented (also when
+// the copy failed), which releases the fence signals the runtime held behind it.
+// ---------------------------------------------------------------------------
+
+const READBACK_BUFFER_BYTES = 40;
+const READBACK_TEXTURE_BYTES = 72;
+
+function readU64AsNumber(view, offset) {
+  return Number(view.getBigUint64(offset, true));
+}
+
+/** Decodes a read-back payload; null when it is truncated. */
+function decodeReadbackPayload(opcode, view, payloadOffset, payloadBytes) {
+  if (opcode === OPCODES.READBACK_BUFFER) {
+    if (payloadBytes < READBACK_BUFFER_BYTES) return null;
+    return {
+      kind: 'buffer',
+      seq: view.getUint32(payloadOffset, true),
+      bufferId: view.getUint32(payloadOffset + 4, true),
+      srcOffset: readU64AsNumber(view, payloadOffset + 8),
+      size: readU64AsNumber(view, payloadOffset + 16),
+      dstAddr: readU64AsNumber(view, payloadOffset + 24),
+      doneAddr: readU64AsNumber(view, payloadOffset + 32),
+    };
+  }
+  if (opcode === OPCODES.READBACK_TEXTURE) {
+    if (payloadBytes < READBACK_TEXTURE_BYTES) return null;
+    const u32 = (i) => view.getUint32(payloadOffset + 4 * i, true);
+    return {
+      kind: 'texture',
+      seq: u32(0),
+      textureId: u32(1),
+      mipLevel: u32(2),
+      originX: u32(3),
+      originY: u32(4),
+      originZ: u32(5),
+      width: u32(6),
+      height: u32(7),
+      depthOrLayers: u32(8),
+      bytesPerRow: u32(9),
+      rowsPerImage: u32(10),
+      dstAddr: readU64AsNumber(view, payloadOffset + 48),
+      doneAddr: readU64AsNumber(view, payloadOffset + 56),
+      size: readU64AsNumber(view, payloadOffset + 64),
+    };
+  }
+  return null;
+}
+
+/**
+ * Staging layout of a read-back: the bytes the GPU copy writes, and for textures the rows
+ * (WebGPU wants 256-byte aligned rows; the guest footprint has its own pitch).
+ * `rowBytes` is the width of one row of texel blocks (the dst_size of the last row).
+ */
+function readbackStagingLayout(req, blockHeight = 1) {
+  if (req.kind === 'buffer') {
+    const start = req.srcOffset - (req.srcOffset % 4);
+    const end = req.srcOffset + req.size;
+    const alignedEnd = end + ((4 - (end % 4)) % 4);
+    return { copyOffset: start, skip: req.srcOffset - start, stagingSize: Math.max(4, alignedEnd - start) };
+  }
+  const bh = Math.max(1, blockHeight | 0);
+  const rows = Math.max(1, Math.ceil(req.height / bh));
+  const depth = Math.max(1, req.depthOrLayers);
+  const pitch = req.bytesPerRow;
+  const rowBytes = req.size - ((depth - 1) * req.rowsPerImage + (rows - 1)) * pitch;
+  const stagingRow = Math.ceil(Math.max(1, rowBytes) / 256) * 256;
+  return {
+    rows,
+    depth,
+    rowBytes,
+    stagingRow,
+    stagingRowsPerImage: rows,
+    stagingSize: stagingRow * rows * depth,
+  };
+}
+
+/** Repacks mapped staging bytes into the guest layout: returns [{ offset, bytes }] pieces. */
+function readbackPieces(req, layout, mapped) {
+  if (req.kind === 'buffer') {
+    return [{ offset: 0, bytes: mapped.subarray(layout.skip, layout.skip + req.size) }];
+  }
+  const pieces = [];
+  if (!(layout.rowBytes > 0) || layout.rowBytes > req.bytesPerRow) return pieces;
+  for (let z = 0; z < layout.depth; z += 1) {
+    for (let r = 0; r < layout.rows; r += 1) {
+      const src = (z * layout.stagingRowsPerImage + r) * layout.stagingRow;
+      const dst = (z * req.rowsPerImage + r) * req.bytesPerRow;
+      if (dst + layout.rowBytes > req.size) return pieces;
+      pieces.push({ offset: dst, bytes: mapped.subarray(src, src + layout.rowBytes) });
+    }
+  }
+  return pieces;
+}
+
+/**
+ * Writes the pieces into `memory` (the runtime's SharedArrayBuffer / ArrayBuffer) at req.dstAddr,
+ * then increments the u32 completion counter at req.doneAddr. `pieces` may be null (failed copy:
+ * the counter still advances). Returns true when the bytes were written.
+ */
+function deliverReadback(memory, req, pieces) {
+  if (!memory || typeof memory.byteLength !== 'number') return false;
+  let written = false;
+  if (pieces && req.dstAddr + req.size <= memory.byteLength) {
+    const dst = new Uint8Array(memory, req.dstAddr, req.size);
+    for (const piece of pieces) {
+      dst.set(piece.bytes, piece.offset);
+    }
+    written = true;
+  }
+  if (req.doneAddr % 4 === 0 && req.doneAddr + 4 <= memory.byteLength) {
+    const counter = new Uint32Array(memory, req.doneAddr, 1);
+    if (typeof SharedArrayBuffer !== 'undefined' && memory instanceof SharedArrayBuffer) {
+      Atomics.add(counter, 0, 1);
+      Atomics.notify(new Int32Array(memory, req.doneAddr, 1), 0);
+    } else {
+      counter[0] += 1;
+    }
+  }
+  return written;
+}
+
+function textureFormatBlockHeight(format) {
+  return typeof format === 'string' && /^(bc|etc2|eac|astc)/.test(format) ? 4 : 1;
+}
+
 class WgpuCommandProcessor {
   constructor(device, ctx, options = {}) {
     this.device = device;
@@ -1938,6 +2069,10 @@ class WgpuCommandProcessor {
     this.buffers = new Map();
     this.textures = new Map();
     this.textureViews = new Map();
+    // G66 read-back: runtime memory (attachGuestMemory), copies recorded this frame, and counters.
+    this._guestMemory = options.guestMemory || null;
+    this._recordedReadbacks = [];
+    this.readbackStats = { requested: 0, delivered: 0, failed: 0, bytes: 0 };
     this.samplers = new Map();
     this.bindGroups = new Map();
     this._bindGroupKinds = new Map();
@@ -4596,6 +4731,110 @@ class WgpuCommandProcessor {
         splashFramesPresented: this._splashFramesPresented,
         firstPresent: false,
       };
+    }
+  }
+
+  /** G66: the runtime's memory, where read-back results are written. */
+  attachGuestMemory(buffer) {
+    this._guestMemory = buffer || null;
+  }
+
+  _handleReadback(opcode, view, payloadOffset, payloadBytes) {
+    const req = decodeReadbackPayload(opcode, view, payloadOffset, payloadBytes);
+    if (!req) {
+      this._recordOpValidationError(
+        opcode === OPCODES.READBACK_BUFFER ? 'ReadbackBuffer' : 'ReadbackTexture',
+        `truncated payload (${payloadBytes}B)`
+      );
+      return;
+    }
+    this.readbackStats.requested += 1;
+    // Runs in stream order with the frame's passes: after the work recorded before it.
+    this._passCommands.push({
+      type: 'readback',
+      run: (pc) => this._recordReadbackCopy(pc, req),
+    });
+  }
+
+  _recordReadbackCopy(pc, req) {
+    pc.endPass();
+    const entry = { req, staging: null, layout: null };
+    this._recordedReadbacks.push(entry);
+    const encoder = pc.encoder;
+    const usage =
+      (typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.MAP_READ : BUFFER_USAGE.MAP_READ) |
+      (typeof GPUBufferUsage !== 'undefined' ? GPUBufferUsage.COPY_DST : BUFFER_USAGE.COPY_DST);
+    if (req.kind === 'buffer') {
+      const src = this.buffers.get(req.bufferId);
+      if (!src || !encoder) return;
+      const layout = readbackStagingLayout(req);
+      if (typeof src.size === 'number' && layout.copyOffset + layout.stagingSize > src.size) {
+        layout.stagingSize = Math.max(0, src.size - layout.copyOffset) & ~3;
+      }
+      if (layout.stagingSize <= 0 || layout.skip + req.size > layout.stagingSize) return;
+      const staging = this.device.createBuffer({ size: layout.stagingSize, usage });
+      encoder.copyBufferToBuffer(src, layout.copyOffset, staging, 0, layout.stagingSize);
+      entry.staging = staging;
+      entry.layout = layout;
+      return;
+    }
+    const tex = this.textures.get(req.textureId);
+    if (!tex || !encoder) return;
+    const layout = readbackStagingLayout(req, textureFormatBlockHeight(tex.format));
+    if (!(layout.rowBytes > 0) || layout.rowBytes > req.bytesPerRow) return;
+    const staging = this.device.createBuffer({ size: layout.stagingSize, usage });
+    encoder.copyTextureToBuffer(
+      { texture: tex, mipLevel: req.mipLevel, origin: { x: req.originX, y: req.originY, z: req.originZ } },
+      { buffer: staging, bytesPerRow: layout.stagingRow, rowsPerImage: layout.stagingRowsPerImage },
+      { width: req.width, height: req.height, depthOrArrayLayers: Math.max(1, req.depthOrLayers) }
+    );
+    entry.staging = staging;
+    entry.layout = layout;
+  }
+
+  /** After the frame's submit: map every staging buffer, then deliver (or fail) each read-back. */
+  _startRecordedReadbacks(submitted) {
+    const entries = this._recordedReadbacks;
+    this._recordedReadbacks = [];
+    const mapRead = typeof GPUMapMode !== 'undefined' ? GPUMapMode.READ : 0x0001;
+    for (const entry of entries) {
+      const finish = (pieces) => {
+        const ok = deliverReadback(this._guestMemory, entry.req, pieces);
+        if (ok) {
+          this.readbackStats.delivered += 1;
+          this.readbackStats.bytes += entry.req.size;
+        } else {
+          this.readbackStats.failed += 1;
+        }
+      };
+      const staging = entry.staging;
+      if (!submitted || !staging || typeof staging.mapAsync !== 'function') {
+        finish(null);
+        if (staging && typeof staging.destroy === 'function') staging.destroy();
+        continue;
+      }
+      staging.mapAsync(mapRead).then(
+        () => {
+          let pieces = null;
+          try {
+            const mapped = new Uint8Array(staging.getMappedRange());
+            pieces = readbackPieces(entry.req, entry.layout, mapped);
+            finish(pieces);
+          } catch (err) {
+            this._recordOpValidationError('Readback', err);
+            if (pieces === null) finish(null);
+          }
+          try {
+            staging.unmap();
+            staging.destroy();
+          } catch (_) {
+            // Ignore teardown errors.
+          }
+        },
+        () => {
+          finish(null);
+        }
+      );
     }
   }
 
@@ -9517,6 +9756,7 @@ class WgpuCommandProcessor {
         activeSwapchain && activeSwapchain.width > 0 ? activeSwapchain.width : undefined,
       swapchainHeight:
         activeSwapchain && activeSwapchain.height > 0 ? activeSwapchain.height : undefined,
+      encoder,
       get pass() { return activePass; },
       get passKind() { return activePassKind; },
       endPass: endActivePass,
@@ -9995,6 +10235,7 @@ class WgpuCommandProcessor {
         this._notePresentSubmitFailure(err);
       }
     }
+    this._startRecordedReadbacks(submitted);
 
     let presentSceneTransition = false;
     let presentResolutionChanged = false;
@@ -10644,6 +10885,10 @@ class WgpuCommandProcessor {
             pipelineId: view.getUint32(payloadOffset, true),
           });
         }
+        break;
+      case OPCODES.READBACK_BUFFER:
+      case OPCODES.READBACK_TEXTURE:
+        this._handleReadback(opcode, view, payloadOffset, payloadBytes);
         break;
       case OPCODES.DISPATCH_COMPUTE:
         if (payloadBytes >= 12) {
@@ -12551,6 +12796,7 @@ function createWgpuWorkerHandler(options = {}) {
     typeof options.onValidationError === 'function' ? options.onValidationError : null;
   let canvas = options.canvas || null;
   let processor = options.processor || null;
+  let pendingGuestMemory = null;  // G66: runtime memory attached before the processor exists
   let swapchain = options.swapchain || (processor && processor.swapchain) || null;
   let attachedRing = processor && processor.ring ? processor.ring : null;
   let currentGpuAdapter =
@@ -14035,6 +14281,11 @@ function createWgpuWorkerHandler(options = {}) {
           }
           maybeEmitFrameTelemetry(prevFrames, framesPresented);
         }
+      } else if (payload.type === 'attach-guest-memory') {
+        pendingGuestMemory = payload.buffer || null;
+        if (processor && typeof processor.attachGuestMemory === 'function') {
+          processor.attachGuestMemory(pendingGuestMemory);
+        }
       } else if (payload.destroy && processor) {
         if (unbindValidationListener) {
           try {
@@ -14092,6 +14343,13 @@ function createWgpuWorkerHandler(options = {}) {
           processor.setFrameLuminanceMeta(
             payload.frameLuminance !== undefined ? payload.frameLuminance : payload.luminance
           );
+        }
+        if (
+          pendingGuestMemory &&
+          processor._guestMemory !== pendingGuestMemory &&
+          typeof processor.attachGuestMemory === 'function'
+        ) {
+          processor.attachGuestMemory(pendingGuestMemory);
         }
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.executeCommandBuffer(batchBuffer);
@@ -14169,6 +14427,10 @@ const exportedApi = {
   parseHashOnlyShaderPayload,
   resolveGpuRingBuffer,
   estimateTextureBytes,
+  decodeReadbackPayload,
+  readbackStagingLayout,
+  readbackPieces,
+  deliverReadback,
   fnv1a64Hex,
   OPCODES,
   SHADER_STAGE,

@@ -51,6 +51,7 @@ add_library(playgta6_core STATIC
     gpu/shader_pack_index.cpp
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
+    gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
     gpu/gfx10_detile.cpp
     gpu/descriptor_words.cpp

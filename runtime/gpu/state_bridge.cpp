@@ -3039,6 +3039,20 @@ void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::Resour
     }
 }
 
+size_t CommandListBridge::Readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes,
+                                  uint32_t resource_id) {
+    if (!writable()) {
+        return SIZE_MAX;
+    }
+    tracker_.flush_pending_clears();
+    tracker_.end_render_pass();
+    drain_events();
+    note_recorded_resource(resource_id);
+    const size_t at = encoder_.size() + sizeof(GpuPacketHeader);
+    encoder_.emit_packet(opcode, payload, payload_bytes);
+    return at;
+}
+
 void CommandListBridge::WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
                                      uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,
                                      uint32_t bytes_per_row, uint32_t rows_per_image, const void* data,

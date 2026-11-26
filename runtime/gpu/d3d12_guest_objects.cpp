@@ -242,6 +242,8 @@ std::u16string PrivateData::name() const {
 // ---------------------------------------------------------------------------------------------
 
 Device::Device(DeviceOptions options) : options_(std::move(options)) {
+    readback_gate_ = std::make_unique<ReadbackGate>(options_.gpu_readback_hold,
+                                                    std::chrono::milliseconds(options_.gpu_readback_timeout_ms));
     // The title creates constant-buffer views at 16-byte aligned addresses and sizes (Xbox; PC
     // D3D12 requires 256).
     heaps_.set_cbv_alignment(16);
@@ -376,6 +378,7 @@ void Device::publish_fences() {
 }
 
 Device::~Device() {
+    readback_gate_.reset();  // stops the poller; held signals are dropped
     {
         std::lock_guard<std::mutex> lock(lag_mutex_);
         lag_stop_ = true;
@@ -493,6 +496,12 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
     case GpuOpcode::DispatchIndirect:
         if (len >= 4) {
             fn(read_u32(p));
+        }
+        break;
+    case GpuOpcode::ReadbackBuffer:
+    case GpuOpcode::ReadbackTexture:
+        if (len >= 8) {
+            fn(read_u32(p + 4));  // buffer_id / texture_id
         }
         break;
     case GpuOpcode::SetVertexBuffer:
@@ -2136,8 +2145,16 @@ HResult CommandQueue::Signal(InterfaceArg<IFenceHost> fence, uint64_t value) {
     }
     // Work is handed to the GPU process at ExecuteCommandLists time and executes in submission
     // order; the runtime has no GPU completion feedback, so a queue signal completes when it is
-    // issued (everything submitted before it has been handed off).
-    static_cast<Fence*>(fence.get())->signal_from_queue(value, device_->present_epoch());
+    // issued (everything submitted before it has been handed off). The exception is read-back
+    // (G66): a signal behind an outstanding read-back is held until its bytes are in guest memory.
+    auto* f = static_cast<Fence*>(fence.get());
+    Device* device = device_.get();
+    if (device->readbacks().park([keep = com::Ref<Fence>::share(f), device, value] {
+            keep->signal_from_queue(value, device->present_epoch());
+        })) {
+        return kSOk;
+    }
+    f->signal_from_queue(value, device->present_epoch());
     return kSOk;
 }
 
