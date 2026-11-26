@@ -299,6 +299,7 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
         })
         self.assertEqual(set(written["stages"].keys()), {
             "0x0000000000000001",
@@ -353,6 +354,7 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
+                "mesh_output_stages": 0,
             })
 
             # Second run: in-place merge onto the file written in run 1
@@ -374,6 +376,7 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
+                "mesh_output_stages": 0,
             })
             written = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(set(written["stages"].keys()), {"0x00000000000000a1", "0x00000000000000b2"})
@@ -440,6 +443,7 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
         })
         self.assertNotIn("merged_existing", summary)
         self.assertNotIn("diff", summary)
@@ -692,6 +696,7 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 2,
+            "mesh_output_stages": 0,
         })
 
     def test_summarize_stages_empty_and_explicit_vertex_input_mode(self):
@@ -706,6 +711,7 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
         })
         stages = {
             "0x1": {"stage": "vertex", "bindings": [], "vertex_inputs": []},
@@ -1503,6 +1509,180 @@ class SidecarTests(unittest.TestCase):
                 rc_bad = sidecar.main(["--out", str(bad_v2), "--verify-pack", str(pack_path), "--json"])
             self.assertEqual(rc_bad, 1)
             self.assertIn("malformed v2 root_descriptor source", stderr.getvalue())
+
+    def test_mesh_output_valid_compute_stage_preserved_and_counted(self):
+        # G66 / S62 (#482, #1537): compute stage with valid mesh_output bounds (1..256, 4 + 4*n, n <= 15).
+        cases = [
+            ("0x4d53435300000001", {"max_vertices": 1, "max_primitives": 1, "vertex_words": 4}),
+            ("0x4d53435300000002", {"max_vertices": 64, "max_primitives": 128, "vertex_words": 8}),
+            ("0x4d53435300000003", {"max_vertices": 256, "max_primitives": 256, "vertex_words": 64}),
+        ]
+        entries = [
+            {
+                "hash_fnv1a64": key,
+                "stage": "compute",
+                "bindings": [
+                    {
+                        "group": 0,
+                        "binding": 0,
+                        "kind": "uniform",
+                        "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                    }
+                ],
+                "mesh_output": mesh_out,
+            }
+            for key, mesh_out in cases
+        ]
+        # Regular compute stage without mesh_output must not be counted as mesh_output_stages.
+        entries.append({
+            "hash_fnv1a64": "0x00000000000000c9",
+            "stage": "compute",
+            "bindings": [],
+        })
+
+        doc, skipped = sidecar.build([{"entries": entries}])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["version"], 1)
+        for key, mesh_out in cases:
+            self.assertEqual(doc["stages"][key]["stage"], "compute")
+            self.assertEqual(doc["stages"][key]["mesh_output"], mesh_out)
+        self.assertNotIn("mesh_output", doc["stages"]["0x00000000000000c9"])
+
+        summary = sidecar.summarize_stages(doc["stages"])
+        self.assertEqual(summary["by_stage"], {"vertex": 0, "fragment": 0, "compute": 4})
+        self.assertEqual(summary["mesh_output_stages"], 3)
+
+    def test_mesh_output_invalid_bounds_and_non_compute_rejected(self):
+        bad_mesh_outputs = [
+            # max_vertices out of 1..256
+            {"max_vertices": 0, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": 257, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": -1, "max_primitives": 1, "vertex_words": 4},
+            # max_primitives out of 1..256
+            {"max_vertices": 1, "max_primitives": 0, "vertex_words": 4},
+            {"max_vertices": 1, "max_primitives": 257, "vertex_words": 4},
+            # vertex_words not 4 + 4*n with 0 <= n <= 15
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 0},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 2},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 6},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 68},
+            # Wrong types / missing keys
+            {"max_vertices": True, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": "3", "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": 3, "max_primitives": 1},
+            "not-an-object",
+            [3, 1, 4],
+        ]
+        for idx, bad_mo in enumerate(bad_mesh_outputs):
+            entry = {
+                "hash_fnv1a64": f"0x4d534353000001{idx:02x}",
+                "stage": "compute",
+                "bindings": [],
+                "mesh_output": bad_mo,
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, bad_mo)
+            self.assertEqual(skipped, {"malformed mesh_output": 1}, bad_mo)
+
+        # Valid mesh_output on non-compute stages (vertex / fragment) must be rejected.
+        for bad_stage in ("vertex", "fragment", "pixel"):
+            entry = {
+                "hash_fnv1a64": "0x00000000000000f1",
+                "stage": bad_stage,
+                "bindings": [],
+                "mesh_output": {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, bad_stage)
+            self.assertEqual(skipped, {"malformed mesh_output": 1}, bad_stage)
+
+    def test_mesh_output_roundtrip_with_verify_pack_and_salted_key(self):
+        ms_raw_key = 0x0123456789ABCDEF
+        ms_pack_key = ms_raw_key ^ 0x4D53435300000000
+        ms_pack_hex = f"0x{ms_pack_key:016x}"
+        ps_pack_key = 0x00000000000000B2
+        ps_pack_hex = f"0x{ps_pack_key:016x}"
+
+        pack_bytes = build_synthetic_wgpk([
+            (ps_pack_key, "fragment", b"// fs"),
+            (ms_pack_key, "compute", b"// mesh compute"),
+        ])
+        translator_json = {
+            "entries": [
+                {
+                    "hash_fnv1a64": ms_pack_hex,
+                    "stage": "compute",
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                        }
+                    ],
+                    "mesh_output": {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+                },
+                {
+                    "hash_fnv1a64": ps_pack_hex,
+                    "stage": "fragment",
+                    "bindings": [
+                        {"group": 0, "binding": 32, "kind": "sampler", "source": {"static_sampler": 0}}
+                    ],
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack_summary.json"
+            out = Path(tmp) / "bundle.wgsl.pack.reflect.json"
+            pack_path = Path(tmp) / "bundle.wgsl.pack"
+            src.write_text(json.dumps(translator_json), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["stages_written"], 2)
+            self.assertEqual(summary["mesh_output_stages"], 1)
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 2)
+            self.assertEqual(summary["pack_verification"]["stage_mismatches"], 0)
+            self.assertEqual(summary["pack_verification"]["coverage_pct"], 100.0)
+
+            written = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(
+                written["stages"][ms_pack_hex]["mesh_output"],
+                {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+            )
+
+            # Standalone --verify-pack reloads the sidecar and validates mesh_output cleanly
+            stdout2 = io.StringIO()
+            with redirect_stdout(stdout2):
+                rc2 = sidecar.main(["--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc2, 0)
+            summary2 = json.loads(stdout2.getvalue())
+            self.assertEqual(summary2["mesh_output_stages"], 1)
+            self.assertEqual(summary2["pack_verification"]["coverage_pct"], 100.0)
+
+            # Corrupt mesh_output in an existing sidecar fails cleanly on load
+            bad_sidecar = Path(tmp) / "bad_mesh.reflect.json"
+            bad_sidecar.write_text(json.dumps({
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    ms_pack_hex: {
+                        "stage": "compute",
+                        "bindings": [],
+                        "mesh_output": {"max_vertices": 300, "max_primitives": 1, "vertex_words": 8},
+                    }
+                },
+            }), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc_bad = sidecar.main(["--out", str(bad_sidecar), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("malformed mesh_output", stderr.getvalue())
 
 
 if __name__ == "__main__":

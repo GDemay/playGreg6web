@@ -32,7 +32,8 @@ use crate::convert::{ShaderStage, format_shader_hash};
 use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
-    analyze_instructions, decode_program, decode_vop3_interp_attr, sop2_src_pair_widths,
+    SENDMSG_ID_GS, SENDMSG_ID_GS_ALLOC_REQ, SENDMSG_ID_GS_DONE, analyze_instructions,
+    decode_program, decode_vop3_interp_attr, sendmsg_id, sop2_src_pair_widths,
     sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
 };
 use crate::rdna2_cfg::{
@@ -87,6 +88,83 @@ fn is_safe_wgsl_f32_literal(f: f32) -> bool {
     f.to_bits() == 0 || (f.is_finite() && f.is_normal() && f.abs() < 3.4e38_f32)
 }
 
+/// Pack-key XOR salt for mesh shaders translated to WebGPU compute (`"MSCS"`, matching
+/// `runtime/gpu/state_bridge.h` `bridge::kMeshComputeKeySalt`).
+pub const MESH_COMPUTE_KEY_SALT: u64 = 0x4d53_4353_0000_0000;
+
+/// Compute the WGPK v1 / sidecar pack key of a mesh stage's compute translation
+/// (`ms_key ^ MESH_COMPUTE_KEY_SALT`, matching `bridge::mesh_compute_pack_key`).
+#[inline]
+pub const fn mesh_compute_pack_key(mesh_stage_key: u64) -> u64 {
+    mesh_stage_key ^ MESH_COMPUTE_KEY_SALT
+}
+
+/// Maximum vertices per mesh workgroup supported by the runtime contract (`state_bridge.h`).
+pub const MAX_MESH_VERTICES: u32 = 256;
+
+/// Maximum triangle primitives per mesh workgroup supported by the runtime contract (`state_bridge.h`).
+pub const MAX_MESH_PRIMITIVES: u32 = 256;
+
+/// Maximum per-vertex `vec4<f32>` attribute locations after `SV_Position` (`bridge::kMaxMeshAttributes`).
+pub const MAX_MESH_ATTRIBUTES: u32 = 15;
+
+/// Runtime-owned bind group reserved for the mesh output buffer (`bridge::kMeshOutputGroup`).
+pub const MESH_OUTPUT_GROUP: u32 = 3;
+
+/// Per-group output record layout for a mesh stage translated to compute (`state_bridge.h`
+/// `bridge::MeshOutputLayout`, `stage_reflection.cpp` `"mesh_output"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshOutputLayout {
+    pub max_vertices: u32,
+    pub max_primitives: u32,
+    pub vertex_words: u32,
+}
+
+impl MeshOutputLayout {
+    /// Validate bounds matching `bridge::valid_mesh_output_layout` (`state_bridge.cpp`).
+    #[inline]
+    pub const fn is_valid(self) -> bool {
+        self.max_vertices >= 1
+            && self.max_vertices <= MAX_MESH_VERTICES
+            && self.max_primitives >= 1
+            && self.max_primitives <= MAX_MESH_PRIMITIVES
+            && self.vertex_words >= 4
+            && self.vertex_words.is_multiple_of(4)
+            && self.vertex_words <= 4 + 4 * MAX_MESH_ATTRIBUTES
+    }
+
+    /// Total `u32` words in one mesh group's output record (`bridge::mesh_group_record_words`).
+    #[inline]
+    pub const fn group_record_words(self) -> u32 {
+        4 + self.max_vertices * self.vertex_words + self.max_primitives * 3
+    }
+
+    /// Word offset of the triangle index table within a group record (`INDEX_BASE`).
+    #[inline]
+    pub const fn index_base_words(self) -> u32 {
+        4 + self.max_vertices * self.vertex_words
+    }
+
+    /// Number of `vec4<f32>` attribute locations carried after `SV_Position` (`0..=15`).
+    #[inline]
+    pub const fn attribute_count(self) -> u32 {
+        if self.vertex_words >= 4 {
+            (self.vertex_words - 4) / 4
+        } else {
+            0
+        }
+    }
+}
+
+/// Write a `MeshOutputLayout` as compact JSON matching `stage_reflection.cpp` `"mesh_output"`.
+pub(crate) fn write_mesh_output_json(out: &mut String, layout: MeshOutputLayout) {
+    let _ = write!(
+        out,
+        "{{\"max_vertices\": {}, \"max_primitives\": {}, \"vertex_words\": {}}}",
+        layout.max_vertices, layout.max_primitives, layout.vertex_words
+    );
+}
+
 /// Stage override option for [`translate_rdna2_to_wgsl`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Rdna2StageOverride {
@@ -95,18 +173,20 @@ pub enum Rdna2StageOverride {
     Vertex,
     Pixel,
     Compute,
+    Mesh,
 }
 
 impl Rdna2StageOverride {
-    /// Parse a CLI stage flag value (`auto`, `vertex`, `pixel`, `fragment`, `compute`).
+    /// Parse a CLI stage flag value (`auto`, `vertex`, `pixel`, `fragment`, `compute`, `mesh`).
     pub fn parse_str(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().as_str() {
             "auto" => Ok(Self::Auto),
             "vertex" | "vs" => Ok(Self::Vertex),
             "pixel" | "fragment" | "ps" | "fs" => Ok(Self::Pixel),
             "compute" | "cs" => Ok(Self::Compute),
+            "mesh" | "ms" => Ok(Self::Mesh),
             other => Err(format!(
-                "invalid --stage value '{other}' (expected 'auto', 'vertex', 'pixel', or 'compute')"
+                "invalid --stage value '{other}' (expected 'auto', 'vertex', 'pixel', 'compute', or 'mesh')"
             )),
         }
     }
@@ -117,6 +197,7 @@ impl Rdna2StageOverride {
             Self::Vertex => "vertex",
             Self::Pixel => "pixel",
             Self::Compute => "compute",
+            Self::Mesh => "mesh",
         }
     }
 }
@@ -491,6 +572,7 @@ pub struct Rdna2WgslOutput {
     pub naga_validated: bool,
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    pub mesh_output: Option<MeshOutputLayout>,
     pub binding_summary: Rdna2BindingSummary,
 }
 
@@ -540,6 +622,12 @@ impl Rdna2WgslOutput {
         if !self.vertex_inputs.is_empty() {
             out.push_str("  \"vertex_inputs\": ");
             write_wgsl_vertex_inputs_json(&mut out, &self.vertex_inputs, "  ");
+            out.push_str(",\n");
+        }
+
+        if let Some(mesh_output) = self.mesh_output {
+            out.push_str("  \"mesh_output\": ");
+            write_mesh_output_json(&mut out, mesh_output);
             out.push_str(",\n");
         }
 
@@ -852,13 +940,17 @@ struct ProgramPlan {
     /// Single-lane `exec_mask` model is required (exec-mask SOP1 ops, `exec` SOP1/SOP2
     /// destinations, or `s_cbranch_execz/execnz`).
     needs_exec: bool,
+    /// Dedicated `m0: u32` local is required (`m0` register 124 read/written, or mesh stage).
+    needs_m0: bool,
+    /// Mesh-to-compute output layout (`Some(...)` when `Rdna2StageOverride::Mesh`).
+    mesh_output: Option<MeshOutputLayout>,
 }
 
 fn resolve_stage(inferred: Rdna2InferredStage, override_stage: Rdna2StageOverride) -> ShaderStage {
     match override_stage {
         Rdna2StageOverride::Vertex => ShaderStage::Vertex,
         Rdna2StageOverride::Pixel => ShaderStage::Fragment,
-        Rdna2StageOverride::Compute => ShaderStage::Compute,
+        Rdna2StageOverride::Compute | Rdna2StageOverride::Mesh => ShaderStage::Compute,
         Rdna2StageOverride::Auto => match inferred {
             Rdna2InferredStage::Vertex => ShaderStage::Vertex,
             Rdna2InferredStage::Pixel => ShaderStage::Fragment,
@@ -1546,13 +1638,18 @@ impl OriginState {
         }
     }
 
-    fn initial(stage: ShaderStage) -> Self {
+    fn initial(stage: ShaderStage, is_mesh: bool) -> Self {
         let mut origins = [SgprOrigin::Unwritten; TRACKED_SGPR_COUNT];
         // Seed console ABI initial SGPR origins:
-        //   Graphics: system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
+        //   Graphics (including mesh stages translated to compute):
+        //             system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
         //             user data starts at s8..s31; scratch SGPRs s32..s105 & vcc start Unwritten.
         //   Compute:  system SGPRs in s0..s3, user data starts at s4..s31; s32..s105 & vcc Unwritten.
-        let user_base: usize = if stage == ShaderStage::Compute { 4 } else { 8 };
+        let user_base: usize = if stage == ShaderStage::Compute && !is_mesh {
+            4
+        } else {
+            8
+        };
         for slot in origins.iter_mut().take(user_base) {
             *slot = SgprOrigin::Unknown;
         }
@@ -5886,6 +5983,7 @@ fn mark_untainted_def_and_parents(
 fn analyze_vsharp_indirections(
     active: &[Rdna2Instruction],
     stage: ShaderStage,
+    is_mesh: bool,
 ) -> DescriptorAnalysis {
     if active.is_empty() {
         return DescriptorAnalysis::default();
@@ -5903,7 +6001,7 @@ fn analyze_vsharp_indirections(
     let mut visits: Vec<u8> = vec![0; num_blocks];
     let mut worklist: BTreeSet<BlockId> = BTreeSet::new();
     let mut pass1_def_aliases: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    let entry_state = OriginState::initial(stage);
+    let entry_state = OriginState::initial(stage, is_mesh);
     let Some(entry) = cfg.entry() else {
         return DescriptorAnalysis::default();
     };
@@ -6222,11 +6320,191 @@ fn mtbuf_vertex_format_info(format: u8, folded_4x8: bool) -> (&'static str, Opti
     }
 }
 
+/// Returns `true` if `inst` reads or writes the scalar `m0` register (`124`) or sends
+/// `MSG_GS_ALLOC_REQ` (which implicitly reads `m0`).
+fn inst_uses_m0(inst: &Rdna2Instruction) -> bool {
+    if inst.truncated {
+        return false;
+    }
+    match &inst.detail {
+        Rdna2Detail::Sopp { op, simm16, .. } => {
+            matches!(*op, 0x10 | 0x11) && sendmsg_id(*simm16) == SENDMSG_ID_GS_ALLOC_REQ
+        }
+        Rdna2Detail::Sopc { ssrc0, ssrc1, .. } => *ssrc0 == 124 || *ssrc1 == 124,
+        Rdna2Detail::Sop1 { sdst, ssrc0, .. } => *sdst == 124 || *ssrc0 == 124,
+        Rdna2Detail::Sopk { sdst, .. } => *sdst == 124,
+        Rdna2Detail::Sop2 {
+            sdst, ssrc0, ssrc1, ..
+        } => *sdst == 124 || *ssrc0 == 124 || *ssrc1 == 124,
+        Rdna2Detail::Smem { sdata, soffset, .. } => *sdata == 124 || *soffset == 124,
+        Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
+            *src0 == 124 || (*op == 0x02 && (*vdst & 0x7F) == 124)
+        }
+        Rdna2Detail::Vopc { src0, .. } | Rdna2Detail::Vop2 { src0, .. } => *src0 == 124,
+        Rdna2Detail::Vop3 {
+            op,
+            vdst,
+            src0,
+            src1,
+            src2,
+            ..
+        } => {
+            *src0 == 124
+                || *src1 == 124
+                || *src2 == 124
+                || (*op == 0x360 && (*vdst & 0x7F) == 124)
+        }
+        Rdna2Detail::Vop3P {
+            src0, src1, src2, ..
+        } => *src0 == 124 || *src1 == 124 || *src2 == 124,
+        _ => false,
+    }
+}
+
+/// Evaluate a scalar operand if it is a compile-time constant or tracked constant SGPR/`m0`.
+fn eval_const_ssrc(src: u8, literal: Option<u32>, sgpr_consts: &[Option<u32>; 106], m0: Option<u32>) -> Option<u32> {
+    match src {
+        0..=105 => sgpr_consts[usize::from(src)],
+        124 => m0,
+        128..=192 => Some(u32::from(src - 128)),
+        193..=208 => Some((-(i32::from(src) - 192)) as u32),
+        255 => literal,
+        _ => None,
+    }
+}
+
+/// Best-effort static inference of `(max_vertices, max_primitives)` when every
+/// `s_sendmsg(MSG_GS_ALLOC_REQ)` site in `active` has a statically known constant `m0`
+/// (`verts = m0 & 0x7FF`, `prims = (m0 >> 12) & 0x7FF`) within `1..=256`.
+fn infer_static_mesh_counts(active: &[Rdna2Instruction]) -> Option<(u32, u32)> {
+    let mut branch_targets: BTreeSet<usize> = BTreeSet::new();
+    for inst in active {
+        if let Rdna2Detail::Sopp {
+            branch_target: Some(t),
+            ..
+        } = inst.detail
+            && t >= 0
+        {
+            branch_targets.insert(t as usize);
+        }
+    }
+
+    let mut sgpr_consts: [Option<u32>; 106] = [None; 106];
+    let mut m0_const: Option<u32> = None;
+    let mut saw_alloc = false;
+    let mut max_verts: u32 = 0;
+    let mut max_prims: u32 = 0;
+
+    for inst in active {
+        if inst.truncated {
+            continue;
+        }
+        if branch_targets.contains(&inst.offset) {
+            sgpr_consts.fill(None);
+            m0_const = None;
+        }
+        match &inst.detail {
+            Rdna2Detail::Sopp { op, simm16, .. }
+                if matches!(*op, 0x10 | 0x11)
+                    && sendmsg_id(*simm16) == SENDMSG_ID_GS_ALLOC_REQ =>
+            {
+                let m0 = m0_const?;
+                let verts = m0 & 0x7FF;
+                let prims = (m0 >> 12) & 0x7FF;
+                if !(1..=MAX_MESH_VERTICES).contains(&verts)
+                    || !(1..=MAX_MESH_PRIMITIVES).contains(&prims)
+                {
+                    return None;
+                }
+                saw_alloc = true;
+                max_verts = max_verts.max(verts);
+                max_prims = max_prims.max(prims);
+            }
+            Rdna2Detail::Sop1 {
+                op,
+                sdst,
+                ssrc0,
+                literal,
+            } => {
+                let val = if *op == 0x03 {
+                    eval_const_ssrc(*ssrc0, *literal, &sgpr_consts, m0_const)
+                } else {
+                    None
+                };
+                if *sdst <= 105 {
+                    sgpr_consts[usize::from(*sdst)] = val;
+                } else if *sdst == 124 {
+                    m0_const = val;
+                }
+            }
+            Rdna2Detail::Sopk { op, sdst, simm16, .. } => {
+                let imm = (*simm16 as i16 as i32) as u32;
+                let val = if *op == 0x00 { Some(imm) } else { None };
+                if *sdst <= 105 {
+                    sgpr_consts[usize::from(*sdst)] = val;
+                } else if *sdst == 124 {
+                    m0_const = val;
+                }
+            }
+            Rdna2Detail::Sop2 {
+                op,
+                sdst,
+                ssrc0,
+                ssrc1,
+                literal,
+            } => {
+                let a = eval_const_ssrc(*ssrc0, *literal, &sgpr_consts, m0_const);
+                let b = eval_const_ssrc(*ssrc1, *literal, &sgpr_consts, m0_const);
+                let val = match (*op, a, b) {
+                    (0x00 | 0x02, Some(x), Some(y)) => Some(x.wrapping_add(y)),
+                    (0x0E, Some(x), Some(y)) => Some(x & y),
+                    (0x10, Some(x), Some(y)) => Some(x | y),
+                    (0x1E, Some(x), Some(y)) => Some(x.wrapping_shl(y & 31)),
+                    _ => None,
+                };
+                if *sdst <= 105 {
+                    sgpr_consts[usize::from(*sdst)] = val;
+                } else if *sdst == 124 {
+                    m0_const = val;
+                }
+            }
+            Rdna2Detail::Smem { sdata, .. } => {
+                if *sdata <= 105 {
+                    for k in 0..4u8 {
+                        if let Some(r) = checked_sgpr_reg(*sdata, k) {
+                            sgpr_consts[usize::from(r)] = None;
+                        }
+                    }
+                } else if *sdata == 124 {
+                    m0_const = None;
+                }
+            }
+            Rdna2Detail::Vop1 { op: 0x02, vdst, .. }
+            | Rdna2Detail::Vop3 { op: 0x360, vdst, .. } => {
+                let sd = *vdst & 0x7F;
+                if sd <= 105 {
+                    sgpr_consts[usize::from(sd)] = None;
+                } else if sd == 124 {
+                    m0_const = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if saw_alloc {
+        Some((max_verts, max_prims))
+    } else {
+        None
+    }
+}
+
 fn plan_program(
     summary: &Rdna2ProgramSummary,
     instructions: &[Rdna2Instruction],
     options: &Rdna2TranslateOptions,
 ) -> ProgramPlan {
+    let is_mesh = options.stage == Rdna2StageOverride::Mesh;
     let stage = resolve_stage(summary.inferred_stage, options.stage);
     let entry_point = match &options.entry_point {
         Some(custom) => sanitize_wgsl_ident(custom, default_entry_point(stage)),
@@ -6252,7 +6530,7 @@ fn plan_program(
     }
 
     let active = &instructions[..active_inst_count];
-    let desc_analysis = analyze_vsharp_indirections(active, stage);
+    let desc_analysis = analyze_vsharp_indirections(active, stage, is_mesh);
     let vsharp_fetch_insts = desc_analysis.vsharp_fetch_insts;
     let indirect_smem_cbv_keys = desc_analysis.indirect_smem_cbv_keys;
     let vertex_storage_buf_insts = desc_analysis.vertex_storage_buf_insts;
@@ -7210,7 +7488,7 @@ fn plan_program(
                     }
                 }
                 match target {
-                    Rdna2ExportTarget::Param(n) if stage == ShaderStage::Vertex => {
+                    Rdna2ExportTarget::Param(n) if stage == ShaderStage::Vertex || is_mesh => {
                         // Reserve @builtin(position) + up to 15 param locations.
                         vs_param_set.insert(*n % (MAX_WEBGPU_LOCATIONS - 1));
                     }
@@ -7342,11 +7620,36 @@ fn plan_program(
         VertexInputMode::None
     };
 
-    let workgroup_size = [
-        options.workgroup_size[0].max(1),
-        options.workgroup_size[1].max(1),
-        options.workgroup_size[2].max(1),
-    ];
+    let workgroup_size = if is_mesh {
+        [options.workgroup_size[0].clamp(1, MAX_MESH_VERTICES), 1, 1]
+    } else {
+        [
+            options.workgroup_size[0].max(1),
+            options.workgroup_size[1].max(1),
+            options.workgroup_size[2].max(1),
+        ]
+    };
+    let needs_m0 = is_mesh || active.iter().any(inst_uses_m0);
+    let mesh_output = if is_mesh {
+        let (max_vertices, max_primitives) = infer_static_mesh_counts(active)
+            .unwrap_or((workgroup_size[0], workgroup_size[0]));
+        let vertex_words = match vs_param_set.iter().next_back() {
+            Some(&max_param) => {
+                let attrs = (u32::from(max_param) + 1).min(MAX_MESH_ATTRIBUTES);
+                4 + 4 * attrs
+            }
+            None => 4,
+        };
+        let layout = MeshOutputLayout {
+            max_vertices: max_vertices.clamp(1, MAX_MESH_VERTICES),
+            max_primitives: max_primitives.clamp(1, MAX_MESH_PRIMITIVES),
+            vertex_words,
+        };
+        debug_assert!(layout.is_valid());
+        Some(layout)
+    } else {
+        None
+    };
     let mut compute_seed_wg_sgprs: Vec<(u8, u32)> = Vec::new();
     if stage == ShaderStage::Compute {
         vgprs.insert(0);
@@ -7438,6 +7741,8 @@ fn plan_program(
         needs_vcc,
         needs_scc,
         needs_exec,
+        needs_m0,
+        mesh_output,
     }
 }
 
@@ -7481,6 +7786,8 @@ struct IrEmitter {
     storage_buf_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, bool)>,
     storage_tex_globals: BTreeMap<ResourceKey, (Handle<GlobalVariable>, TexDim)>,
     lds_global: Option<Handle<GlobalVariable>>,
+    mesh_out_global: Option<Handle<GlobalVariable>>,
+    mesh_output: Option<MeshOutputLayout>,
     emitted_bindings: Vec<WgslBindingInfo>,
     stage: ShaderStage,
     workgroup_size: [u32; 3],
@@ -7503,6 +7810,8 @@ struct IrEmitter {
     scc_local: Option<Handle<LocalVariable>>,
     /// Single-lane `exec_mask: u32` (`1u` = this invocation's lane is active).
     exec_local: Option<Handle<LocalVariable>>,
+    /// Scalar `m0: u32` register (`124`), used e.g. by `s_sendmsg(MSG_GS_ALLOC_REQ)`.
+    m0_local: Option<Handle<LocalVariable>>,
     /// `true` when the body is lowered through `rdna2_cfg` structured control flow.
     structured_cf: bool,
     /// Nesting depth of structured `if` / `loop` / `switch` bodies currently being lowered.
@@ -8049,6 +8358,40 @@ impl IrEmitter {
             None
         };
 
+        // Runtime-owned mesh output buffer at `@group(3) @binding(0)` (`state_bridge.h`
+        // `bridge::kMeshOutputGroup`). Intentionally NOT pushed into `emitted_bindings` because
+        // `StateBridgeDevice::mesh_layout` appends group 3 itself and requires the stage's own
+        // reflection bindings to occupy groups 0..2 only.
+        let mesh_out_global = if plan.mesh_output.is_some() {
+            let ms_arr_ty = insert_type(
+                &mut module,
+                None,
+                TypeInner::Array {
+                    base: u32_ty,
+                    size: ArraySize::Dynamic,
+                    stride: 4,
+                },
+            );
+            Some(module.global_variables.append(
+                GlobalVariable {
+                    name: Some("ms_out".to_string()),
+                    space: AddressSpace::Storage {
+                        access: StorageAccess::LOAD | StorageAccess::STORE,
+                    },
+                    binding: Some(ResourceBinding {
+                        group: MESH_OUTPUT_GROUP,
+                        binding: 0,
+                    }),
+                    ty: ms_arr_ty,
+                    init: None,
+                    memory_decorations: MemoryDecorations::empty(),
+                },
+                Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
         emitted_bindings.sort_by(|a, b| {
             (a.group, a.binding, a.kind, a.name.as_str()).cmp(&(
                 b.group,
@@ -8350,6 +8693,13 @@ impl IrEmitter {
                     ty: vec3_u32_ty,
                     binding: Some(Binding::BuiltIn(BuiltIn::GlobalInvocationId)),
                 });
+                if plan.mesh_output.is_some() {
+                    func.arguments.push(FunctionArgument {
+                        name: Some("local_idx".to_string()),
+                        ty: u32_ty,
+                        binding: Some(Binding::BuiltIn(BuiltIn::LocalInvocationIndex)),
+                    });
+                }
             }
         }
 
@@ -8434,6 +8784,19 @@ impl IrEmitter {
             None
         };
 
+        let m0_local = if plan.needs_m0 {
+            Some(func.local_variables.append(
+                LocalVariable {
+                    name: Some("m0".to_string()),
+                    ty: u32_ty,
+                    init: None,
+                },
+                Span::UNDEFINED,
+            ))
+        } else {
+            None
+        };
+
         let mut emitter = Self {
             module,
             types,
@@ -8451,6 +8814,8 @@ impl IrEmitter {
             storage_buf_globals,
             storage_tex_globals,
             lds_global,
+            mesh_out_global,
+            mesh_output: plan.mesh_output,
             emitted_bindings,
             stage: plan.stage,
             workgroup_size: plan.workgroup_size,
@@ -8470,6 +8835,7 @@ impl IrEmitter {
             vcc_local,
             scc_local,
             exec_local,
+            m0_local,
             structured_cf: false,
             cf_depth: 0,
             cf_nonuniform_return: false,
@@ -9566,6 +9932,8 @@ impl IrEmitter {
     fn load_sgpr_u32(&mut self, reg: u8) -> Handle<Expression> {
         if let Some(&local) = self.sgpr_locals.get(&reg) {
             self.load_local(local)
+        } else if reg == 124 {
+            self.load_m0()
         } else {
             self.lit_u32(0)
         }
@@ -9574,9 +9942,25 @@ impl IrEmitter {
     fn store_sgpr_u32(&mut self, reg: u8, val: Handle<Expression>) {
         if let Some(&local) = self.sgpr_locals.get(&reg) {
             self.store_local(local, val);
+        } else if reg == 124 {
+            self.store_m0(val);
         } else if reg == 126 {
             // `exec_lo` destination: keep this lane's bit.
             self.store_exec_lane_bit(val);
+        }
+    }
+
+    fn load_m0(&mut self) -> Handle<Expression> {
+        if let Some(local) = self.m0_local {
+            self.load_local(local)
+        } else {
+            self.lit_u32(0)
+        }
+    }
+
+    fn store_m0(&mut self, val: Handle<Expression>) {
+        if let Some(local) = self.m0_local {
+            self.store_local(local, val);
         }
     }
 
@@ -9658,6 +10042,10 @@ impl IrEmitter {
             // One WGSL invocation models one active wave lane.
             let one = self.lit_u32(1);
             self.store_local(exec, one);
+        }
+        if let Some(m0) = self.m0_local {
+            let z = self.lit_u32(0);
+            self.store_local(m0, z);
         }
 
         // Stage-specific prologue bindings into VGPRs & default output struct values.
@@ -9753,20 +10141,25 @@ impl IrEmitter {
                 }
             }
             ShaderStage::Compute => {
-                // Seed GFX10.3 compute thread ID VGPRs: v0 = local_id.x, v1 = local_id.y, v2 = local_id.z.
-                // (For 1D workgroups `(X, 1, 1)`, `local_id.x` is identical to the packed 1D thread ID.)
+                // Seed GFX10.3 compute/mesh thread ID VGPRs:
+                //   mesh:    v0 = local_invocation_index, v1 = local_id.y, v2 = local_id.z
+                //   compute: v0 = local_id.x, v1 = local_id.y, v2 = local_id.z
                 let local_id = self.raw_expr(Expression::FunctionArgument(0));
                 for c in 0..3u32 {
                     let reg = c as u8;
                     if self.vgpr_locals.contains_key(&reg) {
-                        let comp = self.emit_expr(Expression::AccessIndex {
-                            base: local_id,
-                            index: c,
-                        });
+                        let comp = if c == 0 && self.mesh_output.is_some() {
+                            self.raw_expr(Expression::FunctionArgument(3))
+                        } else {
+                            self.emit_expr(Expression::AccessIndex {
+                                base: local_id,
+                                index: c,
+                            })
+                        };
                         self.store_vgpr_u32(reg, comp);
                     }
                 }
-                // Seed compute workgroup ID SGPRs (`s0`/`s1`/`s2` or configured base) when not overwritten.
+                // Seed compute/mesh workgroup ID SGPRs (`s0`/`s1`/`s2` or configured base) when not overwritten.
                 if !self.compute_seed_wg_sgprs.is_empty() {
                     let wg_id = self.raw_expr(Expression::FunctionArgument(1));
                     let seed_list = self.compute_seed_wg_sgprs.clone();
@@ -9779,6 +10172,28 @@ impl IrEmitter {
                             self.store_sgpr_u32(reg, comp);
                         }
                     }
+                }
+                // Mesh-to-compute: initialize this group's 4-word output header to 0 on thread 0
+                // so early-exiting / culled meshlets never leave stale counts in the shared buffer.
+                if let (Some(layout), Some(ms_global)) = (self.mesh_output, self.mesh_out_global) {
+                    let (rec, rec_ok) = self.mesh_record_base_and_ok(layout, ms_global);
+                    let local_idx = self.raw_expr(Expression::FunctionArgument(3));
+                    let zero = self.lit_u32(0);
+                    let is_lane0 = self.emit_bin(BinaryOperator::Equal, local_idx, zero);
+                    let cond = self.emit_bin(BinaryOperator::LogicalAnd, is_lane0, rec_ok);
+                    let accept = self.lower_nested(|s| {
+                        for word_off in 0..4u32 {
+                            let off = s.lit_u32(word_off);
+                            let idx = s.emit_bin(BinaryOperator::Add, rec, off);
+                            let z = s.lit_u32(0);
+                            s.emit_mesh_store_u32(ms_global, idx, z);
+                        }
+                    });
+                    self.push_stmt(Statement::If {
+                        condition: cond,
+                        accept,
+                        reject: naga::Block::new(),
+                    });
                 }
             }
         }
@@ -9830,6 +10245,7 @@ impl IrEmitter {
                     reject: f,
                 })
             }
+            124 => self.load_m0(),
             126 if self.exec_local.is_some() => self.load_exec(),
             127 if self.exec_local.is_some() => self.lit_u32(0),
             126 | 127 => self.lit_u32(0xFFFF_FFFF),
@@ -10574,7 +10990,7 @@ impl IrEmitter {
                 Some(write) => self.translate_exec_mask_write(write, *sdst, *ssrc0, *literal),
                 None => false,
             },
-            Rdna2Detail::Sopp { op, .. } => self.translate_sopp(*op, inst.offset),
+            Rdna2Detail::Sopp { op, simm16, .. } => self.translate_sopp(*op, *simm16, inst.offset),
             Rdna2Detail::Sopc {
                 op,
                 ssrc0,
@@ -10753,7 +11169,7 @@ impl IrEmitter {
 
     // -- SOPP / SOPC / SOP1 / SOPK / SOP2 / SMEM --
 
-    fn translate_sopp(&mut self, op: u8, offset: usize) -> bool {
+    fn translate_sopp(&mut self, op: u8, simm16: u16, offset: usize) -> bool {
         match op {
             // s_nop, s_endpgm, s_waitcnt, s_setprio (scheduling priority hint),
             // s_endpgm_saved, s_endpgm_ordered_ps_done, s_code_end,
@@ -10786,6 +11202,67 @@ impl IrEmitter {
                 }
                 true
             }
+            // s_sendmsg / s_sendmsghalt: GFX10.3 NGG/Mesh SetMeshOutputCounts (`MSG_GS_ALLOC_REQ`)
+            // writes `m0[10:0]` (vertex count) and `m0[22:12]` (primitive count) to words 0..1 of
+            // the group's record in `ms_out`. `MSG_GS` / `MSG_GS_DONE` are hardware no-ops here.
+            0x10 | 0x11 => match sendmsg_id(simm16) {
+                SENDMSG_ID_GS_ALLOC_REQ => {
+                    if let (Some(layout), Some(ms_global)) = (self.mesh_output, self.mesh_out_global)
+                    {
+                        let (rec, rec_ok) = self.mesh_record_base_and_ok(layout, ms_global);
+                        let local_idx = self.raw_expr(Expression::FunctionArgument(3));
+                        let zero = self.lit_u32(0);
+                        let is_lane0 = self.emit_bin(BinaryOperator::Equal, local_idx, zero);
+                        let cond = self.emit_bin(BinaryOperator::LogicalAnd, is_lane0, rec_ok);
+                        let accept = self.lower_nested(|s| {
+                            let m0 = s.load_m0();
+                            let mask11 = s.lit_u32(0x7FF);
+                            let shift12 = s.lit_u32(12);
+                            let raw_verts = s.emit_bin(BinaryOperator::And, m0, mask11);
+                            let max_v = s.lit_u32(layout.max_vertices);
+                            let verts = s.emit_expr(Expression::Math {
+                                fun: MathFunction::Min,
+                                arg: raw_verts,
+                                arg1: Some(max_v),
+                                arg2: None,
+                                arg3: None,
+                            });
+                            let shifted = s.emit_bin(BinaryOperator::ShiftRight, m0, shift12);
+                            let raw_prims = s.emit_bin(BinaryOperator::And, shifted, mask11);
+                            let max_p = s.lit_u32(layout.max_primitives);
+                            let prims = s.emit_expr(Expression::Math {
+                                fun: MathFunction::Min,
+                                arg: raw_prims,
+                                arg1: Some(max_p),
+                                arg2: None,
+                                arg3: None,
+                            });
+                            let c0 = s.lit_u32(0);
+                            let c1 = s.lit_u32(1);
+                            let c2 = s.lit_u32(2);
+                            let c3 = s.lit_u32(3);
+                            let w0 = s.emit_bin(BinaryOperator::Add, rec, c0);
+                            let w1 = s.emit_bin(BinaryOperator::Add, rec, c1);
+                            let w2 = s.emit_bin(BinaryOperator::Add, rec, c2);
+                            let w3 = s.emit_bin(BinaryOperator::Add, rec, c3);
+                            let z0 = s.lit_u32(0);
+                            let z1 = s.lit_u32(0);
+                            s.emit_mesh_store_u32(ms_global, w0, verts);
+                            s.emit_mesh_store_u32(ms_global, w1, prims);
+                            s.emit_mesh_store_u32(ms_global, w2, z0);
+                            s.emit_mesh_store_u32(ms_global, w3, z1);
+                        });
+                        self.push_stmt(Statement::If {
+                            condition: cond,
+                            accept,
+                            reject: naga::Block::new(),
+                        });
+                    }
+                    true
+                }
+                SENDMSG_ID_GS | SENDMSG_ID_GS_DONE => true,
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -15316,6 +15793,60 @@ impl IrEmitter {
         }
     }
 
+    fn mesh_record_base_and_ok(
+        &mut self,
+        layout: MeshOutputLayout,
+        ms_global: Handle<GlobalVariable>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let wg_id = self.raw_expr(Expression::FunctionArgument(1));
+        let group_x = self.emit_expr(Expression::AccessIndex {
+            base: wg_id,
+            index: 0,
+        });
+        let record_words = self.lit_u32(layout.group_record_words());
+        let rec = self.emit_bin(BinaryOperator::Multiply, group_x, record_words);
+        let rec_end = self.emit_bin(BinaryOperator::Add, rec, record_words);
+        let buf_ptr = self.raw_expr(Expression::GlobalVariable(ms_global));
+        let buf_len = self.emit_expr(Expression::ArrayLength(buf_ptr));
+        let rec_ok = self.emit_bin(BinaryOperator::LessEqual, rec_end, buf_len);
+        (rec, rec_ok)
+    }
+
+    fn emit_mesh_store_u32(
+        &mut self,
+        ms_global: Handle<GlobalVariable>,
+        index: Handle<Expression>,
+        value: Handle<Expression>,
+    ) {
+        let buf_ptr = self.raw_expr(Expression::GlobalVariable(ms_global));
+        let elem_ptr = self.emit_expr(Expression::Access {
+            base: buf_ptr,
+            index,
+        });
+        self.push_stmt(Statement::Store {
+            pointer: elem_ptr,
+            value,
+        });
+    }
+
+    fn mesh_lane_write_guard(
+        &mut self,
+        limit: u32,
+        rec_ok: Handle<Expression>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let local_idx = self.raw_expr(Expression::FunctionArgument(3));
+        let limit_lit = self.lit_u32(limit);
+        let in_bounds = self.emit_bin(BinaryOperator::Less, local_idx, limit_lit);
+        let mut guard = self.emit_bin(BinaryOperator::LogicalAnd, in_bounds, rec_ok);
+        if self.exec_local.is_some() {
+            let exec = self.load_exec();
+            let zero = self.lit_u32(0);
+            let active = self.emit_bin(BinaryOperator::NotEqual, exec, zero);
+            guard = self.emit_bin(BinaryOperator::LogicalAnd, guard, active);
+        }
+        (local_idx, guard)
+    }
+
     fn translate_exp(
         &mut self,
         target: Rdna2ExportTarget,
@@ -15323,6 +15854,114 @@ impl IrEmitter {
         compr: bool,
         vsrc: [u8; 4],
     ) -> bool {
+        if let (Some(layout), Some(ms_global)) = (self.mesh_output, self.mesh_out_global) {
+            return match target {
+                Rdna2ExportTarget::Null | Rdna2ExportTarget::Pos(1..=4) => true,
+                Rdna2ExportTarget::Pos(0) => {
+                    let val = self.build_export_vec4(en, compr, vsrc, 1.0);
+                    let (rec, rec_ok) = self.mesh_record_base_and_ok(layout, ms_global);
+                    let (vert_idx, cond) =
+                        self.mesh_lane_write_guard(layout.max_vertices, rec_ok);
+                    let accept = self.lower_nested(|s| {
+                        let c4 = s.lit_u32(4);
+                        let vwords = s.lit_u32(layout.vertex_words);
+                        let voff = s.emit_bin(BinaryOperator::Multiply, vert_idx, vwords);
+                        let rec4 = s.emit_bin(BinaryOperator::Add, rec, c4);
+                        let vbase = s.emit_bin(BinaryOperator::Add, rec4, voff);
+                        for c in 0..4u32 {
+                            let comp = s.emit_expr(Expression::AccessIndex {
+                                base: val,
+                                index: c,
+                            });
+                            let bits = s.bitcast_f32_to_u32(comp);
+                            let coff = s.lit_u32(c);
+                            let idx = s.emit_bin(BinaryOperator::Add, vbase, coff);
+                            s.emit_mesh_store_u32(ms_global, idx, bits);
+                        }
+                    });
+                    self.push_stmt(Statement::If {
+                        condition: cond,
+                        accept,
+                        reject: naga::Block::new(),
+                    });
+                    true
+                }
+                Rdna2ExportTarget::Param(n) => {
+                    let attr_idx = u32::from(n % (MAX_MESH_ATTRIBUTES as u8));
+                    if attr_idx >= layout.attribute_count() {
+                        return true;
+                    }
+                    let val = self.build_export_vec4(en, compr, vsrc, 0.0);
+                    let (rec, rec_ok) = self.mesh_record_base_and_ok(layout, ms_global);
+                    let (vert_idx, cond) =
+                        self.mesh_lane_write_guard(layout.max_vertices, rec_ok);
+                    let attr_word_off = 4 + 4 * attr_idx;
+                    let accept = self.lower_nested(|s| {
+                        let c4 = s.lit_u32(4);
+                        let vwords = s.lit_u32(layout.vertex_words);
+                        let voff = s.emit_bin(BinaryOperator::Multiply, vert_idx, vwords);
+                        let rec4 = s.emit_bin(BinaryOperator::Add, rec, c4);
+                        let vbase = s.emit_bin(BinaryOperator::Add, rec4, voff);
+                        let aoff = s.lit_u32(attr_word_off);
+                        let abase = s.emit_bin(BinaryOperator::Add, vbase, aoff);
+                        for c in 0..4u32 {
+                            let comp = s.emit_expr(Expression::AccessIndex {
+                                base: val,
+                                index: c,
+                            });
+                            let bits = s.bitcast_f32_to_u32(comp);
+                            let coff = s.lit_u32(c);
+                            let idx = s.emit_bin(BinaryOperator::Add, abase, coff);
+                            s.emit_mesh_store_u32(ms_global, idx, bits);
+                        }
+                    });
+                    self.push_stmt(Statement::If {
+                        condition: cond,
+                        accept,
+                        reject: naga::Block::new(),
+                    });
+                    true
+                }
+                Rdna2ExportTarget::Prim => {
+                    let prim_word = if (en & 1) != 0 {
+                        let f = self.load_vgpr_f32(vsrc[0]);
+                        self.bitcast_f32_to_u32(f)
+                    } else {
+                        self.lit_u32(0)
+                    };
+                    let (rec, rec_ok) = self.mesh_record_base_and_ok(layout, ms_global);
+                    let (prim_idx, cond) =
+                        self.mesh_lane_write_guard(layout.max_primitives, rec_ok);
+                    let accept = self.lower_nested(|s| {
+                        let idx_base = s.lit_u32(layout.index_base_words());
+                        let c3 = s.lit_u32(3);
+                        let poff = s.emit_bin(BinaryOperator::Multiply, prim_idx, c3);
+                        let base_plus = s.emit_bin(BinaryOperator::Add, rec, idx_base);
+                        let pbase = s.emit_bin(BinaryOperator::Add, base_plus, poff);
+                        let mask10 = s.lit_u32(0x3FF);
+                        let sh10 = s.lit_u32(10);
+                        let sh20 = s.lit_u32(20);
+                        let i0 = s.emit_bin(BinaryOperator::And, prim_word, mask10);
+                        let t1 = s.emit_bin(BinaryOperator::ShiftRight, prim_word, sh10);
+                        let i1 = s.emit_bin(BinaryOperator::And, t1, mask10);
+                        let t2 = s.emit_bin(BinaryOperator::ShiftRight, prim_word, sh20);
+                        let i2 = s.emit_bin(BinaryOperator::And, t2, mask10);
+                        for (c, idx_val) in [(0u32, i0), (1u32, i1), (2u32, i2)] {
+                            let coff = s.lit_u32(c);
+                            let dst = s.emit_bin(BinaryOperator::Add, pbase, coff);
+                            s.emit_mesh_store_u32(ms_global, dst, idx_val);
+                        }
+                    });
+                    self.push_stmt(Statement::If {
+                        condition: cond,
+                        accept,
+                        reject: naga::Block::new(),
+                    });
+                    true
+                }
+                _ => false,
+            };
+        }
         match (self.stage, target) {
             (_, Rdna2ExportTarget::Null) => true,
             (ShaderStage::Vertex, Rdna2ExportTarget::Pos(0)) => {
@@ -16202,7 +16841,13 @@ pub fn translate_rdna2_to_wgsl(
     let output_locations: Vec<u32> = match plan.stage {
         ShaderStage::Vertex => plan.vs_params.iter().map(|&p| u32::from(p)).collect(),
         ShaderStage::Fragment => plan.ps_mrts.iter().map(|&m| u32::from(m)).collect(),
-        ShaderStage::Compute => Vec::new(),
+        ShaderStage::Compute => {
+            if plan.mesh_output.is_some() {
+                plan.vs_params.iter().map(|&p| u32::from(p)).collect()
+            } else {
+                Vec::new()
+            }
+        }
     };
 
     let binding_summary = Rdna2BindingSummary {
@@ -16216,7 +16861,7 @@ pub fn translate_rdna2_to_wgsl(
         vertex_input_mode: plan.vertex_input_mode.as_str().to_string(),
         fragment_input_locations: plan.frag_attrs.iter().map(|&a| u32::from(a)).collect(),
         output_locations,
-        exports_position: plan.stage == ShaderStage::Vertex,
+        exports_position: plan.stage == ShaderStage::Vertex || plan.mesh_output.is_some(),
         exports_depth: plan.stage == ShaderStage::Fragment && plan.ps_exports_depth,
     };
 
@@ -16251,6 +16896,7 @@ pub fn translate_rdna2_to_wgsl(
         naga_validated: true,
         bindings,
         vertex_inputs,
+        mesh_output: plan.mesh_output,
         binding_summary,
     })
 }
@@ -23360,5 +24006,153 @@ mod tests {
             st_out.wgsl
         );
         assert_naga_wgsl_valid(&st_out.wgsl);
+    }
+
+    #[test]
+    fn translates_mesh_shader_to_compute_matching_runtime_contract() {
+        // Synthetic GFX10.3 mesh shader:
+        // - Loads a CBV V# from graphics descriptor table at user SGPR s8 (+0 bytes) -> s[16:19]
+        // - Loads 4 dwords from CBV -> s[20:23]
+        // - Sets m0 = (1 << 12) | 3 (3 vertices, 1 triangle) and emits s_sendmsg(MSG_GS_ALLOC_REQ)
+        // - Exports pos0 (v0..v3), param0 (v4..v7), and prim (v8, packed 3x10-bit indices)
+        // - Emits s_sendmsg(MSG_GS_DONE) and s_endpgm
+        let mut words = Vec::new();
+        // s_load_dwordx4 s[16:19], s[8:9], 0x0 (descriptor table at graphics user SGPR s8)
+        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0, false, false));
+        // s_buffer_load_dwordx4 s[20:23], s[16:19], 0x0 (CBV read)
+        words.extend_from_slice(&enc_smem(0x0A, 20, 8, 0x7D, 0, false, false));
+        // s_mov_b32 m0, 0x00001003 (3 vertices, 1 primitive)
+        words.push(enc_sop1(0x03, 124, 0xFF));
+        words.push((1u32 << 12) | 3u32);
+        // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
+        words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ)));
+        // v_mov_b32 v1..v8 from CBV SGPRs & inline constants
+        words.push(enc_vop1(0x01, 1, 20)); // v1 = s20
+        words.push(enc_vop1(0x01, 2, 21)); // v2 = s21
+        words.push(enc_vop1(0x01, 3, 242)); // v3 = 1.0
+        words.push(enc_vop1(0x01, 4, 22)); // v4 = s22
+        words.push(enc_vop1(0x01, 5, 23)); // v5 = s23
+        words.push(enc_vop1(0x01, 6, 242)); // v6 = 1.0
+        words.push(enc_vop1(0x01, 7, 242)); // v7 = 1.0
+        // v_mov_b32 v8, (2 << 20) | (1 << 10) | 0 (triangle indices 0, 1, 2)
+        words.push(enc_vop1(0x01, 8, 0xFF));
+        words.push((2u32 << 20) | (1u32 << 10));
+        // exp pos0 v0, v1, v2, v3
+        words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [0, 1, 2, 3]));
+        // exp param0 v4, v5, v6, v7
+        words.extend_from_slice(&enc_exp(32, 0xF, false, false, false, [4, 5, 6, 7]));
+        // exp prim v8, off, off, off done
+        words.extend_from_slice(&enc_exp(20, 0x1, false, true, false, [8, 0, 0, 0]));
+        // s_sendmsg sendmsg(MSG_GS_DONE)
+        words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_DONE)));
+        // s_endpgm
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let opts = Rdna2TranslateOptions {
+            stage: Rdna2StageOverride::Mesh,
+            workgroup_size: [32, 4, 2], // Y/Z must normalize to 1 for 1D mesh workgroup
+            ..Rdna2TranslateOptions::default()
+        };
+        let out = translate_rdna2_to_wgsl(&bytes, &opts).expect("mesh translation must succeed");
+
+        assert_eq!(out.stage, ShaderStage::Compute);
+        assert_eq!(out.entry_point, "cs_main");
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(!out.wgsl.contains("enable "), "must not emit WGSL enable extensions");
+        assert!(
+            out.wgsl.contains("@compute @workgroup_size(32, 1, 1)"),
+            "expected clamped 1D @workgroup_size(32, 1, 1):\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("@group(3) @binding(0)"),
+            "expected runtime output buffer at @group(3) @binding(0):\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("var<storage, read_write> ms_out: array<u32>;"),
+            "expected ms_out storage buffer declaration:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("@builtin(local_invocation_index)"),
+            "expected local_invocation_index builtin:\n{}",
+            out.wgsl
+        );
+        assert!(
+            out.wgsl.contains("1023u") || out.wgsl.contains("0x3ff"),
+            "expected 10-bit index mask for exp prim unpacking:\n{}",
+            out.wgsl
+        );
+
+        // Runtime contract: group 3 must NOT appear in reflected bindings, and graphics user
+        // data starts at s8 (not compute s4).
+        assert_eq!(out.bindings.len(), 1, "bindings: {:?}", out.bindings);
+        assert_eq!(out.bindings[0].group, 0);
+        assert_eq!(
+            out.bindings[0].source,
+            Some(WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 0,
+            })
+        );
+        assert!(out.bindings.iter().all(|b| b.group < MESH_OUTPUT_GROUP));
+
+        let expected_layout = MeshOutputLayout {
+            max_vertices: 3,
+            max_primitives: 1,
+            vertex_words: 8,
+        };
+        assert_eq!(out.mesh_output, Some(expected_layout));
+        assert!(expected_layout.is_valid());
+        assert_eq!(expected_layout.group_record_words(), 4 + 3 * 8 + 3);
+        assert_eq!(expected_layout.index_base_words(), 4 + 3 * 8);
+        assert_eq!(
+            mesh_compute_pack_key(0x0123_4567_89ab_cdef),
+            0x0123_4567_89ab_cdef ^ 0x4d53_4353_0000_0000
+        );
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"mesh_output\": {\"max_vertices\": 3, \"max_primitives\": 1, \"vertex_words\": 8}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Dynamic m0 + workgroupBarrier (s_barrier) + oversized workgroup clamped to 256.
+        let mut dyn_words = Vec::new();
+        dyn_words.push(enc_sop1(0x03, 124, 0)); // s_mov_b32 m0, s0 (dynamic!)
+        dyn_words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ)));
+        dyn_words.push(enc_sopp(0x0A, 0)); // s_barrier -> workgroupBarrier()
+        dyn_words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [0, 1, 2, 3]));
+        dyn_words.extend_from_slice(&enc_exp(34, 0xF, false, false, false, [4, 5, 6, 7])); // param2 -> 3 attrs -> 16 words
+        dyn_words.extend_from_slice(&enc_exp(20, 0x1, false, true, false, [8, 0, 0, 0]));
+        dyn_words.push(enc_sopp(0x01, 0));
+
+        let dyn_bytes = words_to_bytes(&dyn_words);
+        let dyn_opts = Rdna2TranslateOptions {
+            stage: Rdna2StageOverride::Mesh,
+            workgroup_size: [512, 1, 1], // clamped to 256
+            ..Rdna2TranslateOptions::default()
+        };
+        let dyn_out =
+            translate_rdna2_to_wgsl(&dyn_bytes, &dyn_opts).expect("dynamic mesh must translate");
+        assert!(dyn_out.naga_validated);
+        assert_eq!(dyn_out.unsupported_op_count, 0, "WGSL:\n{}", dyn_out.wgsl);
+        assert!(dyn_out.wgsl.contains("@compute @workgroup_size(256, 1, 1)"));
+        assert!(dyn_out.wgsl.contains("workgroupBarrier()"));
+        assert_eq!(
+            dyn_out.mesh_output,
+            Some(MeshOutputLayout {
+                max_vertices: 256,
+                max_primitives: 256,
+                vertex_words: 16, // 4 + 4 * 3 (param2 -> locations 0..2)
+            })
+        );
+        assert_naga_wgsl_valid(&dyn_out.wgsl);
     }
 }
