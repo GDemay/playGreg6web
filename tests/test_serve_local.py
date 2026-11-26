@@ -5,12 +5,14 @@ import hashlib
 import http.client
 import io
 import json
+import math
 import os
 from pathlib import Path
 import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -954,6 +956,558 @@ class TestServeLocalRangeFastpath(unittest.TestCase):
                 ):
                     serve_local.main()
                 self.assertIs(captured_kwargs.get("quiet"), expected_quiet)
+
+    def test_range_chunk_bytes_and_max_concurrent_fds_validation_and_cli_flags(self) -> None:
+        self.assertEqual(serve_local.RANGE_STREAM_CHUNK_BYTES, 256 * 1024)
+        self.assertEqual(serve_local.DEFAULT_CONCURRENT_FD_POOL_SIZE, 8)
+        self.assertEqual(serve_local.STREAM_CHUNK_BYTES, 1024 * 1024)
+        self.assertEqual(serve_local.STREAM_CHUNK_SIZE, 1024 * 1024)
+
+        for bad_chunk in (0, -1, -4096):
+            with self.subTest(bad_range_chunk=bad_chunk):
+                with self.assertRaises(ValueError):
+                    serve_local.create_server(
+                        "127.0.0.1",
+                        0,
+                        self.web_root,
+                        self.data_root,
+                        range_stream_chunk_bytes=bad_chunk,
+                    )
+
+        for bad_fds in (0, -1, -8):
+            with self.subTest(bad_max_concurrent_fds=bad_fds):
+                with self.assertRaises(ValueError):
+                    serve_local.ReadOnlyFileHandleCache(max_concurrent_fds_per_file=bad_fds)
+                with self.assertRaises(ValueError):
+                    serve_local.create_server(
+                        "127.0.0.1",
+                        0,
+                        self.web_root,
+                        self.data_root,
+                        max_concurrent_fds_per_file=bad_fds,
+                    )
+                with self.assertRaises(ValueError):
+                    serve_local.QuietThreadingHTTPServer(
+                        ("127.0.0.1", 0),
+                        partial(
+                            serve_local.PlayGta6Handler,
+                            web_root=self.web_root,
+                            data_root=self.data_root,
+                        ),
+                        bind_and_activate=False,
+                        max_concurrent_fds_per_file=bad_fds,
+                    )
+
+        # Verify chunk-size precedence: default 206 -> 256 KiB, 200 -> 1 MiB;
+        # explicit stream_chunk_bytes alone applies to both; explicit range_stream_chunk_bytes
+        # overrides 206 only.
+        h_default = object.__new__(serve_local.PlayGta6Handler)
+        h_default._stream_chunk_bytes = None
+        h_default._range_stream_chunk_bytes = None
+        self.assertEqual(h_default._get_stream_chunk_bytes(), 1024 * 1024)
+        self.assertEqual(h_default._get_range_stream_chunk_bytes(), 256 * 1024)
+
+        h_stream_only = object.__new__(serve_local.PlayGta6Handler)
+        h_stream_only._stream_chunk_bytes = 64 * 1024
+        h_stream_only._range_stream_chunk_bytes = None
+        self.assertEqual(h_stream_only._get_stream_chunk_bytes(), 64 * 1024)
+        self.assertEqual(h_stream_only._get_range_stream_chunk_bytes(), 64 * 1024)
+
+        h_range_override = object.__new__(serve_local.PlayGta6Handler)
+        h_range_override._stream_chunk_bytes = None
+        h_range_override._range_stream_chunk_bytes = 128 * 1024
+        self.assertEqual(h_range_override._get_stream_chunk_bytes(), 1024 * 1024)
+        self.assertEqual(h_range_override._get_range_stream_chunk_bytes(), 128 * 1024)
+
+        # Verify live 206 Range transfer streams in 256 KiB chunks while 200 OK streams in 1 MiB chunks.
+        observed_read_sizes: list[int] = []
+        orig_read_at = serve_local._BorrowedFileReader.read_at
+
+        def _spy_read_at(reader_self, offset: int, size: int) -> bytes:
+            observed_read_sizes.append(size)
+            return orig_read_at(reader_self, offset, size)
+
+        with mock.patch.object(serve_local._BorrowedFileReader, "read_at", _spy_read_at):
+            # 1 MiB Range request -> four 256 KiB chunks.
+            st206, _, body206 = self._request(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"Range": f"bytes=0-{1024 * 1024 - 1}"},
+            )
+            self.assertEqual(st206, 206)
+            self.assertEqual(len(body206), 1024 * 1024)
+            range_reads = list(observed_read_sizes)
+            observed_read_sizes.clear()
+
+            # Full 3.5 MiB 200 OK request -> three 1 MiB chunks + one 512 KiB chunk.
+            st200, _, body200 = self._request("GET", "/data/splash.wgsl.pack")
+            self.assertEqual(st200, 200)
+            self.assertEqual(len(body200), self.large_size)
+            full_reads = list(observed_read_sizes)
+
+        self.assertEqual(range_reads, [256 * 1024] * 4)
+        self.assertEqual(full_reads, [1024 * 1024, 1024 * 1024, 1024 * 1024, 512 * 1024])
+
+        # Verify CLI --range-chunk-bytes and --max-concurrent-fds forwarding & validation.
+        for argv_extra, expected_range_chunk, expected_max_fds in (
+            ([], None, serve_local.DEFAULT_CONCURRENT_FD_POOL_SIZE),
+            (["--range-chunk-bytes", "131072", "--max-concurrent-fds", "12"], 131072, 12),
+        ):
+            with self.subTest(argv_extra=argv_extra):
+                captured_kwargs: dict[str, object] = {}
+
+                class _FakeServer:
+                    def serve_forever(self) -> None:
+                        raise KeyboardInterrupt
+
+                    def server_close(self) -> None:
+                        return None
+
+                def _fake_create_server(*args, **kwargs):
+                    captured_kwargs.update(kwargs)
+                    return _FakeServer()
+
+                argv = [
+                    "serve_local.py",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    "0",
+                    "--web",
+                    str(self.web_root),
+                    "--data",
+                    str(self.data_root),
+                    *argv_extra,
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(serve_local, "create_server", side_effect=_fake_create_server),
+                    mock.patch("builtins.print"),
+                ):
+                    serve_local.main()
+                self.assertEqual(captured_kwargs.get("range_stream_chunk_bytes"), expected_range_chunk)
+                self.assertEqual(captured_kwargs.get("max_concurrent_fds_per_file"), expected_max_fds)
+
+        for bad_cli in (["--range-chunk-bytes", "0"], ["--max-concurrent-fds", "0"]):
+            with self.subTest(bad_cli=bad_cli):
+                argv = [
+                    "serve_local.py",
+                    "--web",
+                    str(self.web_root),
+                    "--data",
+                    str(self.data_root),
+                    *bad_cli,
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(sys, "stderr", io.StringIO()),
+                    self.assertRaises(SystemExit) as cm,
+                ):
+                    serve_local.main()
+                self.assertNotEqual(cm.exception.code, 0)
+
+    def test_8lane_httpfs_persistent_keepalive_stress_nodelay_latency_and_zero_fd_leaks(self) -> None:
+        levels_size = 2 * 1024 * 1024  # 2 MiB synthetic levels.rpf
+        bvh4_size = 1 * 1024 * 1024 + 512 * 1024  # 1.5 MiB synthetic core_bvh4.rpf
+        levels_bytes = _make_deterministic_bytes(levels_size)
+        bvh4_bytes = bytes((b ^ 0x3C) for b in _make_deterministic_bytes(bvh4_size))
+
+        levels_path = self.data_root / "levels.rpf"
+        bvh4_path = self.data_root / "core_bvh4.rpf"
+        levels_path.write_bytes(levels_bytes)
+        bvh4_path.write_bytes(bvh4_bytes)
+
+        expected_assets = {
+            "/data/levels.rpf": (levels_bytes, serve_local.compute_etag(levels_path.stat())),
+            "/data/core_bvh4.rpf": (bvh4_bytes, serve_local.compute_etag(bvh4_path.stat())),
+        }
+
+        nodelay_lock = threading.Lock()
+        observed_sockets: dict[int, int] = {}
+        orig_setup = serve_local.PlayGta6Handler.setup
+
+        def _tracking_setup(handler_self) -> None:
+            orig_setup(handler_self)
+            conn = getattr(handler_self, "connection", None)
+            if conn is not None:
+                nodelay = conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+                with nodelay_lock:
+                    observed_sockets[id(conn)] = nodelay
+
+        lanes = 8
+        requests_per_lane = 32  # 8 * 32 = 256 total 206 Range requests (>= 200)
+        start_barrier = threading.Barrier(lanes, timeout=10.0)
+
+        with mock.patch.object(serve_local.PlayGta6Handler, "setup", _tracking_setup):
+            httpd = serve_local.create_server(
+                "127.0.0.1",
+                0,
+                self.web_root,
+                self.data_root,
+                max_concurrent_fds_per_file=lanes,
+                quiet=True,
+            )
+            port = httpd.server_address[1]
+            cache = httpd.file_handle_cache
+            self.assertIsNotNone(cache)
+            assert cache is not None
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                def run_lane(lane_idx: int) -> tuple[list[float], list[float], int]:
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=15)
+                    all_lat_ms: list[float] = []
+                    probe_lat_ms: list[float] = []
+                    first_sock = None
+                    try:
+                        # Synchronize all 8 lanes so connections & Range bursts overlap.
+                        start_barrier.wait()
+                        for req_idx in range(requests_per_lane):
+                            url_path = (
+                                "/data/levels.rpf"
+                                if ((lane_idx + req_idx) % 2 == 0)
+                                else "/data/core_bvh4.rpf"
+                            )
+                            payload, expected_etag = expected_assets[url_path]
+                            file_len = len(payload)
+                            is_probe = (req_idx % 2) == 1
+                            slice_len = (64 * 1024) if is_probe else (256 * 1024)
+                            max_start = file_len - slice_len
+                            offset = ((lane_idx * 131_072) + (req_idx * 65_536)) % (max_start + 1)
+                            end = offset + slice_len - 1
+                            expected_slice = payload[offset : end + 1]
+                            expected_sha = hashlib.sha256(expected_slice).hexdigest()
+
+                            t0 = time.perf_counter()
+                            conn.request(
+                                "GET",
+                                url_path,
+                                headers={"Range": f"bytes={offset}-{end}"},
+                            )
+                            resp = conn.getresponse()
+                            body = resp.read()
+                            elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+                            hdrs = dict(resp.getheaders())
+                            self.assertEqual(resp.status, 206)
+                            self.assertFalse(resp.will_close)
+                            self._assert_coop_coep(hdrs)
+                            etag = hdrs.get("ETag", "")
+                            self.assertEqual(etag, expected_etag)
+                            self.assertTrue(etag.startswith('"') and etag.endswith('"'))
+                            self.assertEqual(
+                                hdrs.get("Content-Range"),
+                                f"bytes {offset}-{end}/{file_len}",
+                            )
+                            self.assertEqual(hdrs.get("Content-Length"), str(slice_len))
+                            self.assertEqual(len(body), slice_len)
+                            self.assertEqual(hashlib.sha256(body).hexdigest(), expected_sha)
+
+                            if first_sock is None:
+                                first_sock = conn.sock
+                                self.assertIsNotNone(first_sock)
+                            else:
+                                self.assertIs(
+                                    conn.sock,
+                                    first_sock,
+                                    msg=f"Lane {lane_idx} failed to reuse keep-alive socket at req {req_idx}",
+                                )
+
+                            all_lat_ms.append(elapsed_ms)
+                            if is_probe:
+                                probe_lat_ms.append(elapsed_ms)
+                        return all_lat_ms, probe_lat_ms, requests_per_lane
+                    finally:
+                        conn.close()
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=lanes) as pool:
+                    lane_results = list(pool.map(run_lane, range(lanes)))
+
+                all_latencies: list[float] = []
+                probe_latencies: list[float] = []
+                total_completed = 0
+                for lane_all, lane_probes, count in lane_results:
+                    all_latencies.extend(lane_all)
+                    probe_latencies.extend(lane_probes)
+                    total_completed += count
+
+                self.assertEqual(total_completed, lanes * requests_per_lane)
+                self.assertGreaterEqual(total_completed, 200)
+
+                # Every one of the 8 concurrent client sockets must have TCP_NODELAY enabled.
+                self.assertEqual(len(observed_sockets), lanes)
+                for sock_id, nodelay_val in observed_sockets.items():
+                    self.assertNotEqual(
+                        nodelay_val,
+                        0,
+                        msg=f"TCP_NODELAY was disabled on client socket {sock_id}",
+                    )
+
+                stats_active = cache.stats()
+                self.assertEqual(stats_active["entries"], 2)
+                self.assertGreaterEqual(stats_active["hits"], total_completed - 2)
+                self.assertLessEqual(
+                    stats_active["open_handles"],
+                    2 * lanes,
+                )
+
+                # Sanity-check p99 loopback Range latency on 64 KiB probes.
+                ordered_probes = sorted(probe_latencies)
+                p99_idx = min(len(ordered_probes) - 1, math.ceil(0.99 * len(ordered_probes)) - 1)
+                probe_p99_ms = ordered_probes[p99_idx]
+                self.assertLess(
+                    probe_p99_ms,
+                    150.0,
+                    msg=f"8-lane 64 KiB loopback probe p99 latency unexpectedly high: {probe_p99_ms:.2f} ms",
+                )
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=2)
+
+        final_stats = cache.stats()
+        self.assertEqual(final_stats["entries"], 0)
+        self.assertEqual(final_stats["open_handles"], 0)
+        self.assertEqual(final_stats["pooled_handles"], 0)
+
+    def test_non_pread_concurrent_fd_pool_parallel_reads_fallback_and_in_flight_invalidation(self) -> None:
+        levels_path = self.data_root / "levels_pool.rpf"
+        bvh4_path = self.data_root / "core_bvh4_pool.rpf"
+        levels_bytes = _make_deterministic_bytes(512 * 1024)
+        bvh4_bytes = bytes((b ^ 0x55) for b in _make_deterministic_bytes(256 * 1024))
+        levels_path.write_bytes(levels_bytes)
+        bvh4_path.write_bytes(bvh4_bytes)
+        levels_st = levels_path.stat()
+        bvh4_st = bvh4_path.stat()
+
+        with mock.patch.object(serve_local, "_HAS_PREAD", False):
+            # Part A: Prove 4 concurrent threads read from the SAME cached .rpf simultaneously
+            # without serializing on io_lock (Barrier(4) inside os.read would deadlock if serialized).
+            cache = serve_local.ReadOnlyFileHandleCache(
+                max_entries=4,
+                max_concurrent_fds_per_file=4,
+            )
+            orig_os_read = os.read
+            read_barrier = threading.Barrier(4, timeout=5.0)
+            overlap_lock = threading.Lock()
+            active_readers = 0
+            max_concurrent_readers = 0
+            observed_fds: set[int] = set()
+            barrier_fds: set[int] = set()
+
+            def _barrier_os_read(fd: int, n: int) -> bytes:
+                nonlocal active_readers, max_concurrent_readers
+                with overlap_lock:
+                    should_barrier = fd in barrier_fds
+                if should_barrier:
+                    with overlap_lock:
+                        active_readers += 1
+                        if active_readers > max_concurrent_readers:
+                            max_concurrent_readers = active_readers
+                        observed_fds.add(fd)
+                    try:
+                        read_barrier.wait()
+                        return orig_os_read(fd, n)
+                    finally:
+                        with overlap_lock:
+                            active_readers -= 1
+                return orig_os_read(fd, n)
+
+            try:
+                def parallel_worker(idx: int) -> bytes:
+                    entry = cache.acquire(levels_path, levels_st)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    try:
+                        with entry.borrow_fd() as reader:
+                            with overlap_lock:
+                                barrier_fds.add(reader.fd)
+                            offset = idx * 65_536
+                            return reader.read_at(offset, 65_536)
+                    finally:
+                        cache.release(entry)
+
+                with mock.patch.object(serve_local.os, "read", side_effect=_barrier_os_read):
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                        chunks = list(pool.map(parallel_worker, range(4)))
+
+                for idx, data in enumerate(chunks):
+                    self.assertEqual(data, levels_bytes[idx * 65_536 : (idx + 1) * 65_536])
+                self.assertEqual(
+                    max_concurrent_readers,
+                    4,
+                    "All 4 non-pread readers must execute os.read concurrently without io_lock serialization",
+                )
+                self.assertEqual(len(observed_fds), 4)
+
+                stats_after_parallel = cache.stats()
+                self.assertEqual(stats_after_parallel["entries"], 1)
+                self.assertEqual(stats_after_parallel["open_handles"], 4)
+                self.assertEqual(stats_after_parallel["pooled_handles"], 3)
+                self.assertEqual(stats_after_parallel["pool_opens"], 3)
+
+                # Part B: Oversubscription (> max_concurrent_fds_per_file) cleanly falls back to
+                # primary FD guarded by io_lock without failing or leaking FDs.
+                oversub_barrier = threading.Barrier(6, timeout=5.0)
+
+                def oversub_worker(idx: int) -> bytes:
+                    entry = cache.acquire(levels_path, levels_st)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    try:
+                        with entry.borrow_fd() as reader:
+                            oversub_barrier.wait()
+                            offset = idx * 32_768
+                            part1 = reader.read_at(offset, 16_384)
+                            part2 = reader.read_at(offset + 16_384, 16_384)
+                            return part1 + part2
+                    finally:
+                        cache.release(entry)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+                    oversub_chunks = list(pool.map(oversub_worker, range(6)))
+
+                for idx, data in enumerate(oversub_chunks):
+                    self.assertEqual(data, levels_bytes[idx * 32_768 : (idx + 1) * 32_768])
+                self.assertEqual(cache.stats()["open_handles"], 4)
+                self.assertEqual(cache.stats()["pooled_handles"], 3)
+
+                # Part C: Invalidation while 4 readers are actively in-flight closes ALL pooled
+                # and primary FDs once the in-flight readers finish, with zero FD leaks.
+                entered_barrier = threading.Barrier(5, timeout=5.0)
+                release_gate = threading.Event()
+
+                def inflight_reader(idx: int) -> bytes:
+                    entry = cache.acquire(levels_path, levels_st)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    try:
+                        with entry.borrow_fd() as reader:
+                            entered_barrier.wait()
+                            self.assertTrue(release_gate.wait(timeout=5.0))
+                            return reader.read_at(idx * 4096, 4096)
+                    finally:
+                        cache.release(entry)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                    futures = [pool.submit(inflight_reader, i) for i in range(4)]
+                    entered_barrier.wait()
+                    cache.invalidate(levels_path)
+                    self.assertEqual(len(cache), 0)
+                    release_gate.set()
+                    inflight_results = [fut.result() for fut in futures]
+
+                for idx, data in enumerate(inflight_results):
+                    self.assertEqual(data, levels_bytes[idx * 4096 : (idx + 1) * 4096])
+
+                stats_post_inv = cache.stats()
+                self.assertEqual(stats_post_inv["entries"], 0)
+                self.assertEqual(stats_post_inv["open_handles"], 0)
+                self.assertEqual(stats_post_inv["pooled_handles"], 0)
+            finally:
+                cache.close_all()
+
+            # Part D: LRU eviction while pooled FDs are in-flight closes all evicted FDs on release.
+            evict_cache = serve_local.ReadOnlyFileHandleCache(
+                max_entries=1,
+                max_concurrent_fds_per_file=4,
+            )
+            evict_barrier = threading.Barrier(4, timeout=5.0)
+            evict_gate = threading.Event()
+            try:
+                def evict_reader(idx: int) -> bytes:
+                    entry = evict_cache.acquire(levels_path, levels_st)
+                    self.assertIsNotNone(entry)
+                    assert entry is not None
+                    try:
+                        with entry.borrow_fd() as reader:
+                            evict_barrier.wait()
+                            self.assertTrue(evict_gate.wait(timeout=5.0))
+                            return reader.read_at(idx * 8192, 8192)
+                    finally:
+                        evict_cache.release(entry)
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+                    futures = [pool.submit(evict_reader, i) for i in range(3)]
+                    evict_barrier.wait()
+                    # Acquire a second file to evict levels_path while its 3 FDs are in-flight.
+                    bvh4_entry = evict_cache.acquire(bvh4_path, bvh4_st)
+                    self.assertIsNotNone(bvh4_entry)
+                    assert bvh4_entry is not None
+                    try:
+                        with bvh4_entry.borrow_fd() as reader:
+                            self.assertEqual(reader.read_at(0, 1024), bvh4_bytes[:1024])
+                    finally:
+                        evict_cache.release(bvh4_entry)
+                    evict_gate.set()
+                    evicted_results = [fut.result() for fut in futures]
+
+                for idx, data in enumerate(evicted_results):
+                    self.assertEqual(data, levels_bytes[idx * 8192 : (idx + 1) * 8192])
+
+                stats_after_evict = evict_cache.stats()
+                self.assertEqual(stats_after_evict["entries"], 1)
+                self.assertEqual(stats_after_evict["evictions"], 1)
+                self.assertEqual(stats_after_evict["open_handles"], 1)
+                self.assertEqual(stats_after_evict["pooled_handles"], 0)
+            finally:
+                evict_cache.close_all()
+
+            self.assertEqual(evict_cache.stats()["open_handles"], 0)
+            self.assertEqual(evict_cache.stats()["pooled_handles"], 0)
+
+    def test_preresolved_roots_avoid_per_request_realpath_and_405_drains_small_bodies(self) -> None:
+        # Confirm Range requests on cached assets invoke os.path.realpath only once (for the
+        # target candidate inside safe_resolve) rather than 3x (root + candidate + cache.acquire),
+        # and forward the already-resolved realpath straight into ReadOnlyFileHandleCache.acquire.
+        orig_realpath = os.path.realpath
+        realpath_calls = 0
+        acquire_realpaths: list[str | None] = []
+        orig_acquire = serve_local.ReadOnlyFileHandleCache.acquire
+
+        def _counting_realpath(path, *, strict=False):
+            nonlocal realpath_calls
+            realpath_calls += 1
+            return orig_realpath(path, strict=strict)
+
+        def _spy_acquire(cache_self, path, st, *, realpath=None):
+            acquire_realpaths.append(realpath)
+            return orig_acquire(cache_self, path, st, realpath=realpath)
+
+        with (
+            mock.patch.object(serve_local.os.path, "realpath", side_effect=_counting_realpath),
+            mock.patch.object(serve_local.ReadOnlyFileHandleCache, "acquire", _spy_acquire),
+        ):
+            st, hdr, body = self._request(
+                "GET",
+                "/data/splash.wgsl.pack",
+                {"Range": "bytes=0-4095"},
+            )
+        self.assertEqual(st, 206)
+        self._assert_coop_coep(hdr)
+        self.assertEqual(body, self.large_payload[:4096])
+        self.assertEqual(
+            realpath_calls,
+            1,
+            f"Expected exactly 1 realpath call (target only, pre-resolved root & cache), got {realpath_calls}",
+        )
+        self.assertEqual(acquire_realpaths, [str(self.large_file.resolve())])
+
+        # Confirm repeated 405 responses with small unread request bodies drain cleanly on Windows
+        # loopback without triggering TCP RST (WinError 10053 / ConnectionAbortedError).
+        for method, path, payload in (
+            ("POST", "/api/status", b'{"x":1}' * 8),
+            ("PUT", "/data/splash.wgsl.pack", b"A" * 4096),
+            ("DELETE", "/index.html", b"B" * 256),
+        ):
+            with self.subTest(method=method, path=path, size=len(payload)):
+                st405, hdr405, body405 = self._request(method, path, body=payload)
+                self.assertEqual(st405, 405)
+                self._assert_coop_coep(hdr405)
+                self.assertEqual(hdr405.get("Content-Length"), "0")
+                self.assertEqual(hdr405.get("Connection", "").lower(), "close")
+                self.assertIn("GET", hdr405.get("Allow", ""))
+                self.assertEqual(body405, b"")
 
 
 if __name__ == "__main__":

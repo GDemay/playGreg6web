@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import contextlib
 import ctypes
+import errno
 import importlib.util
 import json
 import mimetypes
@@ -41,7 +43,7 @@ from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, unquote, urlsplit
 
 if os.name == "nt":
@@ -52,6 +54,7 @@ RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$", re.IGNORECASE)
 BOOT_ALLOWED_SUFFIXES = (".pgim", ".json", ".wasm", ".js")
 CACHEABLE_IMMUTABLE_SUFFIXES = (".rpf", ".pack", ".pgim", ".wasm")
 DEFAULT_FILE_HANDLE_CACHE_SIZE = 32
+DEFAULT_CONCURRENT_FD_POOL_SIZE = 8  # Concurrent read-only FDs per cached file on non-pread OSes
 RUNTIME_WASM_NAME = "runtime.wasm"
 PREFERRED_SHADER_PACK_NAMES = ("splash.wgsl.pack", "fallback.wgsl.pack")
 SAFE_SIDE_MODULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.wasm$", re.IGNORECASE)
@@ -61,9 +64,11 @@ DEFAULT_MAX_DUMP_FILE_BYTES = 64 * 1024 * 1024  # 64 MiB default cap per dumped 
 _DUMP_WRITE_LOCK = threading.Lock()
 _LOG_LOCK = threading.Lock()
 
-STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming buffer for large .pgim/.wasm/Range reads
+STREAM_CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming buffer for large full-file 200 OK reads
 STREAM_CHUNK_SIZE = STREAM_CHUNK_BYTES  # Backwards-compatible alias
+RANGE_STREAM_CHUNK_BYTES = 256 * 1024  # 256 KiB streaming buffer for 206 Partial Content (W368)
 SOCKET_SNDBUF_BYTES = 1024 * 1024  # 1 MiB TCP send buffer hint for loopback Range throughput
+MAX_METHOD_NOT_ALLOWED_DRAIN_BYTES = 65536  # Drain small bodies on 405 to prevent Windows RST races
 _STREAM_BUFFERS = threading.local()
 KEEP_ALIVE_TIMEOUT = 30.0  # Idle socket timeout (seconds) for HTTP/1.1 keep-alive connections
 ALLOWED_METHODS = "GET, HEAD, OPTIONS"
@@ -82,7 +87,22 @@ mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("application/json", ".json")
 
 
-def safe_resolve(root: Path, rel_url_path: str) -> Path | None:
+def _try_resolve_root(root: Path | None) -> Path | None:
+    """Resolve an optional root directory path once, returning None on failure."""
+    if root is None:
+        return None
+    try:
+        return root.resolve()
+    except OSError:
+        return None
+
+
+def safe_resolve(
+    root: Path,
+    rel_url_path: str,
+    *,
+    root_resolved: Path | None = None,
+) -> Path | None:
     """Resolve a URL path strictly inside `root`, rejecting traversal and external symlinks."""
     decoded = unquote(rel_url_path)
     if "\x00" in decoded:
@@ -94,9 +114,9 @@ def safe_resolve(root: Path, rel_url_path: str) -> Path | None:
     if not normalized or normalized.startswith(".."):
         return None
     try:
-        root_resolved = root.resolve()
-        candidate = (root / normalized).resolve()
-        candidate.relative_to(root_resolved)
+        resolved_root = root_resolved if root_resolved is not None else root.resolve()
+        candidate = (resolved_root / normalized).resolve()
+        candidate.relative_to(resolved_root)
     except (OSError, ValueError):
         return None
     return candidate
@@ -274,9 +294,9 @@ def if_modified_since_not_modified(header_value: str, mtime: float) -> bool:
 
 
 def _get_thread_stream_buffer(chunk_bytes: int) -> bytearray:
-    """Return a reusable per-thread `bytearray` of `chunk_bytes` for zero-alloc streaming."""
+    """Return a reusable per-thread `bytearray` of at least `chunk_bytes` for zero-alloc streaming."""
     buf: bytearray | None = getattr(_STREAM_BUFFERS, "buf", None)
-    if buf is None or len(buf) != chunk_bytes:
+    if buf is None or len(buf) < chunk_bytes:
         buf = bytearray(chunk_bytes)
         _STREAM_BUFFERS.buf = buf
     return buf
@@ -351,12 +371,80 @@ def _close_fd_safely(fd: int | None) -> None:
         pass
 
 
+class _BorrowedFileReader:
+    """Per-transfer reader over a borrowed read-only file descriptor."""
+
+    __slots__ = ("_fd", "_io_lock", "_use_pread", "_cursor")
+
+    def __init__(
+        self,
+        fd: int,
+        *,
+        io_lock: threading.Lock | None,
+        use_pread: bool,
+    ) -> None:
+        self._fd = fd
+        self._io_lock = io_lock
+        self._use_pread = use_pread
+        self._cursor: int | None = None
+
+    @property
+    def fd(self) -> int:
+        return self._fd
+
+    def read_at(self, offset: int, size: int) -> bytes:
+        if self._use_pread:
+            return os.pread(self._fd, size, offset)
+        if self._io_lock is not None:
+            with self._io_lock:
+                os.lseek(self._fd, offset, os.SEEK_SET)
+                return os.read(self._fd, size)
+        if self._cursor != offset:
+            os.lseek(self._fd, offset, os.SEEK_SET)
+        chunk = os.read(self._fd, size)
+        self._cursor = offset + len(chunk)
+        return chunk
+
+
 class _CachedFileHandle:
-    """Refcounted read-only file descriptor entry guarded by `(realpath, size, mtime_ns)`."""
+    """Refcounted read-only file descriptor entry guarded by `(realpath, size, mtime_ns)`.
 
-    __slots__ = ("realpath", "size", "mtime_ns", "key", "fd", "io_lock", "refcount", "retired")
+    On platforms with `os.pread`, all concurrent readers share the single primary FD
+    lock-free. On non-`pread` platforms (notably Windows), a bounded lazy per-entry pool
+    grants each concurrent reader its own dedicated read-only FD (up to
+    `max_concurrent_fds`) so 8-lane HTTPFS Range transfers do not serialize on `io_lock`.
+    """
 
-    def __init__(self, realpath: str, size: int, mtime_ns: int, fd: int) -> None:
+    __slots__ = (
+        "realpath",
+        "size",
+        "mtime_ns",
+        "key",
+        "fd",
+        "io_lock",
+        "refcount",
+        "retired",
+        "max_concurrent_fds",
+        "_pool_lock",
+        "_primary_users",
+        "_idle_pool_fds",
+        "_active_pool_fds",
+        "_pending_pool_opens",
+        "_on_pool_fd_opened",
+        "_on_pool_fd_closed",
+    )
+
+    def __init__(
+        self,
+        realpath: str,
+        size: int,
+        mtime_ns: int,
+        fd: int,
+        *,
+        max_concurrent_fds: int = DEFAULT_CONCURRENT_FD_POOL_SIZE,
+        on_pool_fd_opened: Callable[[], None] | None = None,
+        on_pool_fd_closed: Callable[[int], None] | None = None,
+    ) -> None:
         self.realpath = realpath
         self.size = size
         self.mtime_ns = mtime_ns
@@ -365,20 +453,162 @@ class _CachedFileHandle:
         self.io_lock = threading.Lock()
         self.refcount = 1
         self.retired = False
+        self.max_concurrent_fds = max(1, max_concurrent_fds)
+        self._pool_lock = threading.Lock()
+        self._primary_users = 0
+        self._idle_pool_fds: list[int] = []
+        self._active_pool_fds = 0
+        self._pending_pool_opens = 0
+        self._on_pool_fd_opened = on_pool_fd_opened
+        self._on_pool_fd_closed = on_pool_fd_closed
+
+    def mark_retired(self) -> list[int]:
+        """Mark entry retired and detach any idle pooled FDs for immediate closure."""
+        with self._pool_lock:
+            self.retired = True
+            if not self._idle_pool_fds:
+                return []
+            idle = list(self._idle_pool_fds)
+            self._idle_pool_fds.clear()
+            return idle
 
     def detach_fd(self) -> int | None:
-        fd = self.fd
-        if fd < 0:
-            return None
-        self.fd = -1
-        return fd
+        with self._pool_lock:
+            fd = self.fd
+            if fd < 0:
+                return None
+            self.fd = -1
+            return fd
+
+    def detach_all_fds(self) -> tuple[int | None, list[int]]:
+        """Detach primary FD and any remaining idle pooled FDs."""
+        with self._pool_lock:
+            primary_fd: int | None = None
+            if self.fd >= 0:
+                primary_fd = self.fd
+                self.fd = -1
+            if self._idle_pool_fds:
+                idle = list(self._idle_pool_fds)
+                self._idle_pool_fds.clear()
+            else:
+                idle = []
+            return primary_fd, idle
+
+    @contextlib.contextmanager
+    def borrow_fd(self) -> Iterator[_BorrowedFileReader]:
+        """Borrow a dedicated reader for an entire Range transfer.
+
+        - When `_HAS_PREAD` is True, uses lock-free `os.pread(self.fd, ...)` with zero
+          pool expansion.
+        - When `_HAS_PREAD` is False, uses the primary FD when uncontended (sequential
+          reads open only 1 FD), pops an idle pooled FD, or lazily opens a new read-only
+          FD up to `max_concurrent_fds`. If all pooled FDs are busy, cleanly falls back
+          to the primary FD guarded by `self.io_lock`.
+        """
+        if _HAS_PREAD:
+            fd = self.fd
+            if fd < 0:
+                raise OSError(errno.EBADF, "cached file handle is closed")
+            yield _BorrowedFileReader(fd, io_lock=None, use_pread=True)
+            return
+
+        is_pooled = False
+        needs_open = False
+        fd = -1
+        with self._pool_lock:
+            if self.fd < 0:
+                raise OSError(errno.EBADF, "cached file handle is closed")
+            if self._primary_users == 0:
+                self._primary_users = 1
+                fd = self.fd
+            elif self._idle_pool_fds:
+                fd = self._idle_pool_fds.pop()
+                self._active_pool_fds += 1
+                is_pooled = True
+            elif (
+                not self.retired
+                and (
+                    1
+                    + len(self._idle_pool_fds)
+                    + self._active_pool_fds
+                    + self._pending_pool_opens
+                )
+                < self.max_concurrent_fds
+            ):
+                self._pending_pool_opens += 1
+                needs_open = True
+            else:
+                self._primary_users += 1
+                fd = self.fd
+
+        if needs_open:
+            new_fd: int | None = None
+            opened_ok = False
+            try:
+                candidate_fd = _open_readonly_fd(Path(self.realpath))
+                try:
+                    fstat = os.fstat(candidate_fd)
+                    if (
+                        stat.S_ISREG(fstat.st_mode)
+                        and fstat.st_size == self.size
+                        and fstat.st_mtime_ns == self.mtime_ns
+                    ):
+                        new_fd = candidate_fd
+                        opened_ok = True
+                    else:
+                        _close_fd_safely(candidate_fd)
+                except OSError:
+                    _close_fd_safely(candidate_fd)
+            except OSError:
+                opened_ok = False
+
+            discard_fd: int | None = None
+            notify_opened = False
+            with self._pool_lock:
+                self._pending_pool_opens -= 1
+                if opened_ok and new_fd is not None and not self.retired:
+                    self._active_pool_fds += 1
+                    fd = new_fd
+                    is_pooled = True
+                    notify_opened = True
+                else:
+                    if new_fd is not None:
+                        discard_fd = new_fd
+                    self._primary_users += 1
+                    fd = self.fd
+
+            if discard_fd is not None:
+                _close_fd_safely(discard_fd)
+            if notify_opened and self._on_pool_fd_opened is not None:
+                self._on_pool_fd_opened()
+
+        try:
+            yield _BorrowedFileReader(
+                fd,
+                io_lock=None if is_pooled else self.io_lock,
+                use_pread=False,
+            )
+        finally:
+            fd_to_close: int | None = None
+            with self._pool_lock:
+                if is_pooled:
+                    self._active_pool_fds -= 1
+                    if self.retired:
+                        fd_to_close = fd
+                    else:
+                        self._idle_pool_fds.append(fd)
+                else:
+                    self._primary_users -= 1
+            if fd_to_close is not None:
+                _close_fd_safely(fd_to_close)
+                if self._on_pool_fd_closed is not None:
+                    self._on_pool_fd_closed(1)
 
     def read_at(self, offset: int, size: int) -> bytes:
         if _HAS_PREAD:
             return os.pread(self.fd, size, offset)
-        with self.io_lock:
-            os.lseek(self.fd, offset, os.SEEK_SET)
-            return os.read(self.fd, size)
+        with self.borrow_fd() as reader:
+            return reader.read_at(offset, size)
 
 
 class ReadOnlyFileHandleCache:
@@ -388,10 +618,18 @@ class ReadOnlyFileHandleCache:
     stale entries are immediately retired and closed once in-flight reads release them.
     """
 
-    def __init__(self, max_entries: int = DEFAULT_FILE_HANDLE_CACHE_SIZE) -> None:
+    def __init__(
+        self,
+        max_entries: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+        *,
+        max_concurrent_fds_per_file: int = DEFAULT_CONCURRENT_FD_POOL_SIZE,
+    ) -> None:
         if max_entries < 0:
             raise ValueError("max_entries must be >= 0")
+        if max_concurrent_fds_per_file < 1:
+            raise ValueError("max_concurrent_fds_per_file must be >= 1")
         self._max_entries = max_entries
+        self._max_concurrent_fds_per_file = max_concurrent_fds_per_file
         self._lock = threading.Lock()
         self._entries: OrderedDict[str, _CachedFileHandle] = OrderedDict()
         self._closed = False
@@ -400,33 +638,75 @@ class ReadOnlyFileHandleCache:
         self._evictions = 0
         self._invalidations = 0
         self._open_handles = 0
+        self._pooled_handles = 0
+        self._pool_opens = 0
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)
+
+    def _record_pool_fd_opened(self) -> None:
+        with self._lock:
+            self._open_handles += 1
+            self._pooled_handles += 1
+            self._pool_opens += 1
+
+    def _record_pool_fd_closed(self, count: int) -> None:
+        with self._lock:
+            self._open_handles -= count
+            self._pooled_handles -= count
+
+    def _retire_entry_locked(
+        self, entry: _CachedFileHandle, fds_to_close: list[int]
+    ) -> None:
+        """Retire `entry` under `self._lock`, collecting any FDs ready to close."""
+        idle_fds = entry.mark_retired()
+        if idle_fds:
+            self._open_handles -= len(idle_fds)
+            self._pooled_handles -= len(idle_fds)
+            fds_to_close.extend(idle_fds)
+        if entry.refcount <= 0:
+            primary_fd, leftover_idle = entry.detach_all_fds()
+            if primary_fd is not None:
+                self._open_handles -= 1
+                fds_to_close.append(primary_fd)
+            if leftover_idle:
+                self._open_handles -= len(leftover_idle)
+                self._pooled_handles -= len(leftover_idle)
+                fds_to_close.extend(leftover_idle)
 
     def stats(self) -> dict[str, int]:
         with self._lock:
             return {
                 "entries": len(self._entries),
                 "max_entries": self._max_entries,
+                "max_concurrent_fds_per_file": self._max_concurrent_fds_per_file,
                 "hits": self._hits,
                 "misses": self._misses,
                 "evictions": self._evictions,
                 "invalidations": self._invalidations,
                 "open_handles": self._open_handles,
+                "pooled_handles": self._pooled_handles,
+                "pool_opens": self._pool_opens,
             }
 
-    def acquire(self, path: Path, st: os.stat_result) -> _CachedFileHandle | None:
+    def acquire(
+        self,
+        path: Path,
+        st: os.stat_result,
+        *,
+        realpath: str | None = None,
+    ) -> _CachedFileHandle | None:
         """Borrow a refcounted handle matching `(realpath, st.st_size, st.st_mtime_ns)`."""
         if self._max_entries <= 0:
             return None
-        try:
-            realpath = os.path.realpath(path)
-        except OSError:
-            return None
+        if realpath is None:
+            try:
+                realpath = os.path.realpath(path)
+            except OSError:
+                return None
         expected_key = (realpath, st.st_size, st.st_mtime_ns)
-        stale_fd: int | None = None
+        stale_fds: list[int] = []
 
         with self._lock:
             if self._closed:
@@ -439,14 +719,11 @@ class ReadOnlyFileHandleCache:
                     self._hits += 1
                     return existing
                 self._entries.pop(realpath, None)
-                existing.retired = True
                 self._invalidations += 1
-                if existing.refcount <= 0:
-                    stale_fd = existing.detach_fd()
-                    if stale_fd is not None:
-                        self._open_handles -= 1
+                self._retire_entry_locked(existing, stale_fds)
 
-        _close_fd_safely(stale_fd)
+        for stale_fd in stale_fds:
+            _close_fd_safely(stale_fd)
 
         try:
             fd = _open_readonly_fd(path)
@@ -483,73 +760,72 @@ class ReadOnlyFileHandleCache:
                 else:
                     if existing is not None:
                         self._entries.pop(realpath, None)
-                        existing.retired = True
                         self._invalidations += 1
-                        if existing.refcount <= 0:
-                            old_fd = existing.detach_fd()
-                            if old_fd is not None:
-                                self._open_handles -= 1
-                                fds_to_close.append(old_fd)
-                    entry = _CachedFileHandle(realpath, st.st_size, st.st_mtime_ns, fd)
+                        self._retire_entry_locked(existing, fds_to_close)
+                    entry = _CachedFileHandle(
+                        realpath,
+                        st.st_size,
+                        st.st_mtime_ns,
+                        fd,
+                        max_concurrent_fds=self._max_concurrent_fds_per_file,
+                        on_pool_fd_opened=self._record_pool_fd_opened,
+                        on_pool_fd_closed=self._record_pool_fd_closed,
+                    )
                     self._entries[realpath] = entry
                     self._open_handles += 1
                     self._misses += 1
                     while len(self._entries) > self._max_entries:
                         _, evicted = self._entries.popitem(last=False)
-                        evicted.retired = True
                         self._evictions += 1
-                        if evicted.refcount <= 0:
-                            evicted_fd = evicted.detach_fd()
-                            if evicted_fd is not None:
-                                self._open_handles -= 1
-                                fds_to_close.append(evicted_fd)
+                        self._retire_entry_locked(evicted, fds_to_close)
 
         for dead_fd in fds_to_close:
             _close_fd_safely(dead_fd)
         return entry
 
     def release(self, entry: _CachedFileHandle) -> None:
-        """Release a previously acquired handle; closes it immediately if retired."""
-        fd_to_close: int | None = None
+        """Release a previously acquired handle; closes all remaining FDs if retired."""
+        fds_to_close: list[int] = []
         with self._lock:
             entry.refcount -= 1
             if entry.retired and entry.refcount <= 0:
-                fd_to_close = entry.detach_fd()
-                if fd_to_close is not None:
+                primary_fd, idle_fds = entry.detach_all_fds()
+                if primary_fd is not None:
                     self._open_handles -= 1
-        _close_fd_safely(fd_to_close)
+                    fds_to_close.append(primary_fd)
+                if idle_fds:
+                    self._open_handles -= len(idle_fds)
+                    self._pooled_handles -= len(idle_fds)
+                    fds_to_close.extend(idle_fds)
+        for fd in fds_to_close:
+            _close_fd_safely(fd)
 
-    def invalidate(self, path: Path) -> None:
+    def invalidate(self, path: Path, *, realpath: str | None = None) -> None:
         """Evict and retire any cached handle for `path`."""
-        try:
-            realpath = os.path.realpath(path)
-        except OSError:
-            return
-        fd_to_close: int | None = None
+        if realpath is None:
+            try:
+                realpath = os.path.realpath(path)
+            except OSError:
+                return
+        fds_to_close: list[int] = []
         with self._lock:
             existing = self._entries.pop(realpath, None)
             if existing is not None:
-                existing.retired = True
                 self._invalidations += 1
-                if existing.refcount <= 0:
-                    fd_to_close = existing.detach_fd()
-                    if fd_to_close is not None:
-                        self._open_handles -= 1
-        _close_fd_safely(fd_to_close)
+                self._retire_entry_locked(existing, fds_to_close)
+        for fd in fds_to_close:
+            _close_fd_safely(fd)
 
     def invalidate_entry(self, entry: _CachedFileHandle) -> None:
         """Retire a specific cached entry (e.g., on mid-stream truncation)."""
-        fd_to_close: int | None = None
+        fds_to_close: list[int] = []
         with self._lock:
             if self._entries.get(entry.realpath) is entry:
                 self._entries.pop(entry.realpath, None)
-                entry.retired = True
                 self._invalidations += 1
-                if entry.refcount <= 0:
-                    fd_to_close = entry.detach_fd()
-                    if fd_to_close is not None:
-                        self._open_handles -= 1
-        _close_fd_safely(fd_to_close)
+                self._retire_entry_locked(entry, fds_to_close)
+        for fd in fds_to_close:
+            _close_fd_safely(fd)
 
     def close_all(self) -> None:
         """Close all idle cached handles and prevent further caching after shutdown."""
@@ -558,12 +834,7 @@ class ReadOnlyFileHandleCache:
             self._closed = True
             while self._entries:
                 _, entry = self._entries.popitem(last=False)
-                entry.retired = True
-                if entry.refcount <= 0:
-                    fd = entry.detach_fd()
-                    if fd is not None:
-                        self._open_handles -= 1
-                        fds_to_close.append(fd)
+                self._retire_entry_locked(entry, fds_to_close)
         for fd in fds_to_close:
             _close_fd_safely(fd)
 
@@ -932,7 +1203,9 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
         keep_alive_timeout: float | None = None,
         stream_chunk_bytes: int | None = None,
+        range_stream_chunk_bytes: int | None = None,
         quiet: bool = False,
+        _resolved_roots: dict[str, Path | None] | None = None,
         **kwargs,
     ):
         self.web_root = web_root
@@ -945,7 +1218,20 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if keep_alive_timeout is not None:
             self.timeout = keep_alive_timeout
         self._stream_chunk_bytes = stream_chunk_bytes
+        self._range_stream_chunk_bytes = range_stream_chunk_bytes
         self.quiet = bool(quiet)
+        if _resolved_roots is not None:
+            self._web_root_resolved = _resolved_roots.get("web")
+            self._data_root_resolved = _resolved_roots.get("data")
+            self._game_root_resolved = _resolved_roots.get("game")
+            self._shaders_root_resolved = _resolved_roots.get("shaders")
+            self._boot_root_resolved = _resolved_roots.get("boot")
+        else:
+            self._web_root_resolved = _try_resolve_root(self.web_root)
+            self._data_root_resolved = _try_resolve_root(self.data_root)
+            self._game_root_resolved = _try_resolve_root(self.game_root)
+            self._shaders_root_resolved = _try_resolve_root(self.shaders_root)
+            self._boot_root_resolved = _try_resolve_root(self.boot_root)
         self._headers_sent = False
         self._connection_header_sent = False
         self._client_requested_close = False
@@ -1006,6 +1292,15 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         if STREAM_CHUNK_BYTES != 1024 * 1024:
             return STREAM_CHUNK_BYTES
         return STREAM_CHUNK_SIZE
+
+    def _get_range_stream_chunk_bytes(self) -> int:
+        configured_range = getattr(self, "_range_stream_chunk_bytes", None)
+        if configured_range is not None:
+            return configured_range
+        configured_stream = getattr(self, "_stream_chunk_bytes", None)
+        if configured_stream is not None:
+            return configured_stream
+        return RANGE_STREAM_CHUNK_BYTES
 
     def _request_has_unconsumed_body(self) -> bool:
         if not hasattr(self, "headers") or self.headers is None:
@@ -1107,7 +1402,39 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise
 
+    def _drain_small_request_body(
+        self, max_bytes: int = MAX_METHOD_NOT_ALLOWED_DRAIN_BYTES
+    ) -> None:
+        """Drain a small unread request body before closing to avoid Windows TCP RST races."""
+        headers = getattr(self, "headers", None)
+        rfile = getattr(self, "rfile", None)
+        if headers is None or rfile is None:
+            return
+        if headers.get("Transfer-Encoding"):
+            return
+        raw_length = headers.get("Content-Length")
+        if not raw_length:
+            return
+        try:
+            content_length = int(raw_length.strip())
+        except ValueError:
+            return
+        if content_length <= 0 or content_length > max_bytes:
+            return
+        remaining = content_length
+        try:
+            while remaining > 0:
+                chunk = rfile.read(min(remaining, 8192))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except (CLIENT_DISCONNECT_ERRORS, OSError):
+            pass
+
     def _send_method_not_allowed(self) -> None:
+        # Drain small unread bodies before closing so Windows loopback clients do
+        # not hit WinError 10053 TCP RST races while reading the 405 response.
+        self._drain_small_request_body()
         # Close the connection because unsupported methods (e.g. POST/PUT) may
         # carry an unread request body that would desynchronize keep-alive.
         self.close_connection = True
@@ -1117,6 +1444,12 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
+        wfile = getattr(self, "wfile", None)
+        if wfile is not None and hasattr(wfile, "flush"):
+            try:
+                wfile.flush()
+            except CLIENT_DISCONNECT_ERRORS:
+                pass
 
     def handle_one_request(self) -> None:
         """Handle a single HTTP request with quiet disconnect/timeout handling."""
@@ -1165,17 +1498,32 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             explicit error status (e.g. 403 for disallowed `/boot/` extensions).
         """
         if url_path == "/":
-            return (self.web_root / "index.html").resolve()
+            web_resolved = getattr(self, "_web_root_resolved", None)
+            if web_resolved is None:
+                return (self.web_root / "index.html").resolve()
+            return (web_resolved / "index.html").resolve()
         if url_path.startswith("/data/"):
-            return safe_resolve(self.data_root, url_path[len("/data/") :])
+            return safe_resolve(
+                self.data_root,
+                url_path[len("/data/") :],
+                root_resolved=getattr(self, "_data_root_resolved", None),
+            )
         if url_path.startswith("/game/"):
             if self.game_root is None:
                 return None
-            return safe_resolve(self.game_root, url_path[len("/game/") :])
+            return safe_resolve(
+                self.game_root,
+                url_path[len("/game/") :],
+                root_resolved=getattr(self, "_game_root_resolved", None),
+            )
         if url_path.startswith("/shaders/"):
             if self.shaders_root is None:
                 return None
-            return safe_resolve(self.shaders_root, url_path[len("/shaders/") :])
+            return safe_resolve(
+                self.shaders_root,
+                url_path[len("/shaders/") :],
+                root_resolved=getattr(self, "_shaders_root_resolved", None),
+            )
         if url_path.startswith("/boot/"):
             if self.boot_root is None:
                 return None
@@ -1184,13 +1532,21 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             # short-circuit the allowlist via a lucky extension after normpath.
             if ".." in unquote(rel).replace("\\", "/").split("/"):
                 return None
-            target = safe_resolve(self.boot_root, rel)
+            target = safe_resolve(
+                self.boot_root,
+                rel,
+                root_resolved=getattr(self, "_boot_root_resolved", None),
+            )
             if target is None:
                 return None
             if not _boot_extension_allowed(target):
                 return (None, HTTPStatus.FORBIDDEN)
             return target
-        return safe_resolve(self.web_root, url_path.lstrip("/"))
+        return safe_resolve(
+            self.web_root,
+            url_path.lstrip("/"),
+            root_resolved=getattr(self, "_web_root_resolved", None),
+        )
 
     def _serve_status(self, send_body: bool) -> None:
         payload = build_status_payload(
@@ -1250,38 +1606,55 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
         start: int,
         length: int,
         cache: ReadOnlyFileHandleCache,
+        *,
+        chunk_bytes: int | None = None,
     ) -> None:
-        chunk_bytes = max(1, self._get_stream_chunk_bytes())
+        effective_chunk = max(
+            1,
+            chunk_bytes if chunk_bytes is not None else self._get_range_stream_chunk_bytes(),
+        )
         offset = start
         remaining = length
-        while remaining > 0:
-            to_read = chunk_bytes if remaining > chunk_bytes else remaining
-            try:
-                chunk = entry.read_at(offset, to_read)
-            except OSError:
-                cache.invalidate_entry(entry)
-                raise
-            if not chunk:
-                # File shrank mid-stream after Content-Length was emitted:
-                # invalidate handle and force socket close so HTTP/1.1 framing stays synced.
-                cache.invalidate_entry(entry)
-                self.close_connection = True
-                break
-            offset += len(chunk)
-            remaining -= len(chunk)
-            self.wfile.write(chunk)
+        write = self.wfile.write
+        with entry.borrow_fd() as reader:
+            while remaining > 0:
+                to_read = effective_chunk if remaining > effective_chunk else remaining
+                try:
+                    chunk = reader.read_at(offset, to_read)
+                except OSError:
+                    cache.invalidate_entry(entry)
+                    raise
+                if not chunk:
+                    # File shrank mid-stream after Content-Length was emitted:
+                    # invalidate handle and force socket close so HTTP/1.1 framing stays synced.
+                    cache.invalidate_entry(entry)
+                    self.close_connection = True
+                    break
+                chunk_len = len(chunk)
+                offset += chunk_len
+                remaining -= chunk_len
+                write(chunk)
 
-    def _stream_file_range(self, f: Any, length: int) -> None:
-        chunk_bytes = max(1, self._get_stream_chunk_bytes())
+    def _stream_file_range(
+        self,
+        f: Any,
+        length: int,
+        *,
+        chunk_bytes: int | None = None,
+    ) -> None:
+        effective_chunk = max(
+            1,
+            chunk_bytes if chunk_bytes is not None else self._get_stream_chunk_bytes(),
+        )
         readinto = getattr(f, "readinto", None)
         use_fast_buffer = callable(readinto) and hasattr(self.wfile, "_sock")
 
         remaining = length
         if use_fast_buffer:
-            buf = _get_thread_stream_buffer(chunk_bytes)
+            buf = _get_thread_stream_buffer(effective_chunk)
             mv = memoryview(buf)
             while remaining > 0:
-                to_read = chunk_bytes if remaining > chunk_bytes else remaining
+                to_read = effective_chunk if remaining > effective_chunk else remaining
                 n = readinto(mv[:to_read])
                 if not n:
                     # File shrank mid-stream after Content-Length was emitted:
@@ -1298,7 +1671,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             return
 
         while remaining > 0:
-            chunk = f.read(min(chunk_bytes, remaining))
+            chunk = f.read(min(effective_chunk, remaining))
             if not chunk:
                 # File shrank mid-stream after Content-Length was emitted:
                 # force socket close so HTTP/1.1 framing cannot desynchronize.
@@ -1322,17 +1695,20 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
+        target_realpath = (
+            str(target) if (isinstance(target, Path) and target.is_absolute()) else None
+        )
         cache = self._get_file_handle_cache()
         try:
             st = target.stat()
         except OSError:
             if cache is not None and isinstance(target, Path):
-                cache.invalidate(target)
+                cache.invalidate(target, realpath=target_realpath)
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
         if not stat.S_ISREG(st.st_mode):
             if cache is not None and isinstance(target, Path):
-                cache.invalidate(target)
+                cache.invalidate(target, realpath=target_realpath)
             self._send_empty(HTTPStatus.NOT_FOUND)
             return
 
@@ -1408,12 +1784,24 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
             send_file_headers()
             return
 
+        chunk_bytes = (
+            self._get_range_stream_chunk_bytes()
+            if status == HTTPStatus.PARTIAL_CONTENT
+            else self._get_stream_chunk_bytes()
+        )
+
         if cache is not None and isinstance(target, Path) and is_cacheable_file_path(target):
-            cached_entry = cache.acquire(target, st)
+            cached_entry = cache.acquire(target, st, realpath=target_realpath)
             if cached_entry is not None:
                 try:
                     send_file_headers()
-                    self._stream_cached_file_range(cached_entry, start, length, cache)
+                    self._stream_cached_file_range(
+                        cached_entry,
+                        start,
+                        length,
+                        cache,
+                        chunk_bytes=chunk_bytes,
+                    )
                 except CLIENT_DISCONNECT_ERRORS:
                     self.close_connection = True
                     return
@@ -1435,7 +1823,7 @@ class PlayGta6Handler(BaseHTTPRequestHandler):
                 if start > 0:
                     f.seek(start)
                 send_file_headers()
-                self._stream_file_range(f, length)
+                self._stream_file_range(f, length, chunk_bytes=chunk_bytes)
         except CLIENT_DISCONNECT_ERRORS:
             self.close_connection = True
             return
@@ -1692,13 +2080,19 @@ class QuietThreadingHTTPServer(ThreadingHTTPServer):
         bind_and_activate: bool = True,
         *,
         file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+        max_concurrent_fds_per_file: int = DEFAULT_CONCURRENT_FD_POOL_SIZE,
         quiet: bool = False,
     ) -> None:
         if file_handle_cache_size < 0:
             raise ValueError("file_handle_cache_size must be >= 0")
+        if max_concurrent_fds_per_file < 1:
+            raise ValueError("max_concurrent_fds_per_file must be >= 1")
         self.quiet = bool(quiet)
         self.file_handle_cache: ReadOnlyFileHandleCache | None = (
-            ReadOnlyFileHandleCache(max_entries=file_handle_cache_size)
+            ReadOnlyFileHandleCache(
+                max_entries=file_handle_cache_size,
+                max_concurrent_fds_per_file=max_concurrent_fds_per_file,
+            )
             if file_handle_cache_size > 0
             else None
         )
@@ -1738,15 +2132,29 @@ def create_server(
     max_dump_file_bytes: int = DEFAULT_MAX_DUMP_FILE_BYTES,
     keep_alive_timeout: float | None = None,
     stream_chunk_bytes: int | None = None,
+    range_stream_chunk_bytes: int | None = None,
     file_handle_cache_size: int = DEFAULT_FILE_HANDLE_CACHE_SIZE,
+    max_concurrent_fds_per_file: int = DEFAULT_CONCURRENT_FD_POOL_SIZE,
     quiet: bool = False,
 ) -> QuietThreadingHTTPServer:
     if max_dump_file_bytes < 0:
         raise ValueError("max_dump_file_bytes must be >= 0")
     if stream_chunk_bytes is not None and stream_chunk_bytes <= 0:
         raise ValueError("stream_chunk_bytes must be > 0")
+    if range_stream_chunk_bytes is not None and range_stream_chunk_bytes <= 0:
+        raise ValueError("range_stream_chunk_bytes must be > 0")
     if file_handle_cache_size < 0:
         raise ValueError("file_handle_cache_size must be >= 0")
+    if max_concurrent_fds_per_file < 1:
+        raise ValueError("max_concurrent_fds_per_file must be >= 1")
+    effective_shaders_root = shaders_root if shaders_root is not None else (data_root / "shaders")
+    resolved_roots = {
+        "web": _try_resolve_root(web_root),
+        "data": _try_resolve_root(data_root),
+        "game": _try_resolve_root(game_root),
+        "shaders": _try_resolve_root(effective_shaders_root),
+        "boot": _try_resolve_root(boot_root),
+    }
     handler = partial(
         PlayGta6Handler,
         web_root=web_root,
@@ -1758,12 +2166,15 @@ def create_server(
         max_dump_file_bytes=max_dump_file_bytes,
         keep_alive_timeout=keep_alive_timeout,
         stream_chunk_bytes=stream_chunk_bytes,
+        range_stream_chunk_bytes=range_stream_chunk_bytes,
         quiet=quiet,
+        _resolved_roots=resolved_roots,
     )
     return QuietThreadingHTTPServer(
         (host, port),
         handler,
         file_handle_cache_size=file_handle_cache_size,
+        max_concurrent_fds_per_file=max_concurrent_fds_per_file,
         quiet=quiet,
     )
 
@@ -1842,6 +2253,24 @@ def main() -> None:
         help=f"Maximum allowed byte size per file written via POST /__pg6_dump/ (default: {DEFAULT_MAX_DUMP_FILE_BYTES}).",
     )
     parser.add_argument(
+        "--range-chunk-bytes",
+        type=int,
+        default=None,
+        help=(
+            "Streaming chunk size in bytes for HTTP 206 Partial Content responses "
+            f"(default: {RANGE_STREAM_CHUNK_BYTES})."
+        ),
+    )
+    parser.add_argument(
+        "--max-concurrent-fds",
+        type=int,
+        default=DEFAULT_CONCURRENT_FD_POOL_SIZE,
+        help=(
+            "Maximum concurrent read-only file descriptors pooled per cached file on "
+            f"non-pread platforms (default: {DEFAULT_CONCURRENT_FD_POOL_SIZE})."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-request HTTP access logs on stderr.",
@@ -1850,6 +2279,10 @@ def main() -> None:
 
     if args.max_dump_file_bytes < 0:
         parser.error("--max-dump-file-bytes must be >= 0")
+    if args.range_chunk_bytes is not None and args.range_chunk_bytes <= 0:
+        parser.error("--range-chunk-bytes must be > 0")
+    if args.max_concurrent_fds < 1:
+        parser.error("--max-concurrent-fds must be >= 1")
 
     args.data.mkdir(parents=True, exist_ok=True)
     shaders_root = args.shaders if args.shaders is not None else (args.data / "shaders")
@@ -1869,6 +2302,8 @@ def main() -> None:
         boot_root=boot_root,
         dump_root=dump_root,
         max_dump_file_bytes=args.max_dump_file_bytes,
+        range_stream_chunk_bytes=args.range_chunk_bytes,
+        max_concurrent_fds_per_file=args.max_concurrent_fds,
         quiet=args.quiet,
     )
     dump_summary = (
