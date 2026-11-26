@@ -287,6 +287,12 @@ pub(in crate::lift) enum Intr {
     UAddSat,
     SSubSat,
     USubSat,
+    SMin,
+    SMax,
+    UMin,
+    UMax,
+    /// `llvm.fptosi.sat.<dst>.<src>`: saturating float -> signed int conversion.
+    FpToSiSat(Elem),
     /// `llvm.abs` with `is_int_min_poison = false` (`abs(MIN) == MIN`, like `pabs*`).
     Abs,
     /// `llvm.wasm.swizzle` (`i8x16.swizzle`): indices >= 16 select 0.
@@ -318,6 +324,17 @@ impl Decl {
             Intr::UAddSat => "uadd.sat",
             Intr::SSubSat => "ssub.sat",
             Intr::USubSat => "usub.sat",
+            Intr::SMin => "smin",
+            Intr::SMax => "smax",
+            Intr::UMin => "umin",
+            Intr::UMax => "umax",
+            Intr::FpToSiSat(dst) => {
+                return format!(
+                    "llvm.fptosi.sat.{}.{}",
+                    self.ty.with(dst).suffix(),
+                    self.ty.suffix()
+                );
+            }
             Intr::Abs => "abs",
             Intr::Swizzle => return "llvm.wasm.swizzle".to_string(),
             Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
@@ -327,10 +344,19 @@ impl Decl {
         format!("llvm.{base}.{}", self.ty.suffix())
     }
 
+    fn ret_ir(self) -> String {
+        match self.intr {
+            Intr::FpToSiSat(dst) => self.ty.with(dst).ir(),
+            _ => self.ty.ir(),
+        }
+    }
+
     fn params(self) -> String {
         let t = self.ty.ir();
         match self.intr {
-            Intr::Sqrt | Intr::Rint | Intr::Floor | Intr::Ceil | Intr::Trunc => t,
+            Intr::Sqrt | Intr::Rint | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::FpToSiSat(_) => {
+                t
+            }
             Intr::Abs => format!("{t}, i1"),
             _ => format!("{t}, {t}"),
         }
@@ -346,7 +372,7 @@ impl Decl {
         }
         format!(
             "declare {} @{}({})\n",
-            self.ty.ir(),
+            self.ret_ir(),
             self.name(),
             self.params()
         )
@@ -777,11 +803,34 @@ impl FunctionLifter<'_> {
             return v.to_string();
         }
         let t = Ty::vn(e, n).ir();
-        let idx: Vec<u32> = (0..e.lanes()).map(|i| i.min(n)).collect();
-        // Lane `n` of the second operand is zero.
+        // Use consecutive indices `0..2*n` for the second (zero) operand so LLVM recognises
+        // `concat_vectors(v, zero)` and emits native `f32x4.demote_f64x2_zero` /
+        // `i32x4.trunc_sat_f64x2_s_zero`.
+        let idx: Vec<u32> = (0..e.lanes())
+            .map(|i| if i < 2 * n { i } else { n })
+            .collect();
         self.val(&format!(
             "shufflevector {t} {v}, {t} zeroinitializer, {}",
             mask(&idx)
+        ))
+    }
+
+    /// Expands four 32-bit lane indices (`<4 x i32>`, masked by `index_mask` such as `3` or `7`)
+    /// into a `<16 x i8>` byte-index vector `[4*k, 4*k+1, 4*k+2, 4*k+3]` for `llvm.wasm.swizzle`.
+    fn dword_swizzle_indices(&mut self, idx: &str, index_mask: u32) -> String {
+        let i32v = Ty::v(Elem::I32);
+        let k = self.val(&format!(
+            "and <4 x i32> {idx}, {}",
+            i32v.splat(&index_mask.to_string())
+        ));
+        let k4 = self.val(&format!("shl <4 x i32> {k}, {}", i32v.splat("2")));
+        let kb = self.cast(&k4, i32v, Ty::v(Elem::I8));
+        let rep = self.val(&format!(
+            "shufflevector <16 x i8> {kb}, <16 x i8> poison, {}",
+            mask(&[0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12])
+        ));
+        self.val(&format!(
+            "or <16 x i8> {rep}, <i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3>"
         ))
     }
 
@@ -847,7 +896,12 @@ impl FunctionLifter<'_> {
         if intr == Intr::Abs {
             list.push("i1 false".to_string());
         }
-        self.val(&format!("call {t} @{}({})", decl.name(), list.join(", ")))
+        self.val(&format!(
+            "call {} @{}({})",
+            decl.ret_ir(),
+            decl.name(),
+            list.join(", ")
+        ))
     }
 
     // ----- dispatch ------------------------------------------------------------------------------
