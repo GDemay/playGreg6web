@@ -1181,22 +1181,66 @@
     return 1;
   }
 
+  function attachNonEnumerableDecodePool(obj, pool) {
+    Object.defineProperty(obj, '_pool', {
+      value: pool,
+      enumerable: false,
+      configurable: false,
+    });
+    return pool;
+  }
+
+  function createTextureDecodeScratch(isV2) {
+    const size = { width: 1, height: 1, depthOrArrayLayers: 1 };
+    const descriptor = isV2
+      ? {
+          size,
+          mipLevelCount: 1,
+          sampleCount: 1,
+          dimension: '2d',
+          format: 'rgba8unorm',
+          usage: 0,
+        }
+      : {
+          size,
+          mipLevelCount: 1,
+          format: 'rgba8unorm',
+          usage: 0,
+          dimension: '2d',
+        };
+    const out = { id: 0, descriptor };
+    attachNonEnumerableDecodePool(out, { descriptor, size, viewFormats: [] });
+    return out;
+  }
+
   /**
    * Decodes a v1 `CreateTexture` (opcode 12, 32-byte `GpuCreateTexturePayload`)
    * into `{ id, descriptor }` with safely clamped dimensions and `mipLevelCount`,
-   * or `{ id, error }` when truncated.
+   * or `{ id, error }` when truncated. Supports an optional pre-allocated `out`
+   * scratch object (4th arg, or 3rd arg when `payloadBytes` is omitted).
    *
    * @param {DataView} view
    * @param {number} [offset=0]
    * @param {number} [payloadBytes]
+   * @param {object | null} [out=null]
    */
-  function decodeCreateTexture(view, offset = 0, payloadBytes) {
-    const available = payloadBytes !== undefined ? payloadBytes : view.byteLength - offset;
+  function decodeCreateTexture(view, offset = 0, payloadBytes, out = null) {
+    let targetOut = out;
+    let explicitPayloadBytes = payloadBytes;
+    if (typeof payloadBytes === 'object' && payloadBytes !== null && out === null) {
+      targetOut = payloadBytes;
+      explicitPayloadBytes = undefined;
+    }
+    const available = explicitPayloadBytes !== undefined ? explicitPayloadBytes : view.byteLength - offset;
     if (offset < 0 || available < CREATE_TEXTURE_BYTES || offset + CREATE_TEXTURE_BYTES > view.byteLength) {
-      return {
-        id: 0,
-        error: `CreateTexture: payload ${available} < ${CREATE_TEXTURE_BYTES} bytes`,
-      };
+      const error = `CreateTexture: payload ${available} < ${CREATE_TEXTURE_BYTES} bytes`;
+      if (targetOut) {
+        targetOut.id = 0;
+        targetOut.error = error;
+        if ('descriptor' in targetOut) delete targetOut.descriptor;
+        return targetOut;
+      }
+      return { id: 0, error };
     }
 
     const id = view.getUint32(offset, true);
@@ -1220,6 +1264,51 @@
       depthOrArrayLayers,
       dimension
     );
+    const sibling = getSrgbSiblingFormat(format);
+
+    if (targetOut) {
+      let pool = targetOut._pool;
+      if (!pool) {
+        const sizeObj =
+          targetOut.descriptor && targetOut.descriptor.size && typeof targetOut.descriptor.size === 'object'
+            ? targetOut.descriptor.size
+            : { width: 1, height: 1, depthOrArrayLayers: 1 };
+        const descObj =
+          targetOut.descriptor && typeof targetOut.descriptor === 'object'
+            ? targetOut.descriptor
+            : { size: sizeObj, mipLevelCount: 1, format: 'rgba8unorm', usage: 0, dimension: '2d' };
+        descObj.size = sizeObj;
+        pool = attachNonEnumerableDecodePool(targetOut, {
+          descriptor: descObj,
+          size: sizeObj,
+          viewFormats: Array.isArray(descObj.viewFormats) ? descObj.viewFormats : [],
+        });
+      }
+      const size = pool.size;
+      size.width = width;
+      size.height = height;
+      size.depthOrArrayLayers = depthOrArrayLayers;
+      const descriptor = pool.descriptor;
+      descriptor.size = size;
+      descriptor.mipLevelCount = mipLevelCount;
+      descriptor.format = format;
+      descriptor.usage = usage;
+      descriptor.dimension = dimension;
+      if ('sampleCount' in descriptor) delete descriptor.sampleCount;
+      const viewFormats = pool.viewFormats;
+      if (sibling !== null) {
+        viewFormats.length = 1;
+        viewFormats[0] = sibling;
+        descriptor.viewFormats = viewFormats;
+      } else {
+        viewFormats.length = 0;
+        if ('viewFormats' in descriptor) delete descriptor.viewFormats;
+      }
+      targetOut.id = id;
+      targetOut.descriptor = descriptor;
+      if ('error' in targetOut) delete targetOut.error;
+      return targetOut;
+    }
 
     const descriptor = {
       size: { width, height, depthOrArrayLayers },
@@ -1228,7 +1317,6 @@
       usage,
       dimension,
     };
-    const sibling = getSrgbSiblingFormat(format);
     if (sibling !== null) {
       descriptor.viewFormats = [sibling];
     }
@@ -1243,23 +1331,35 @@
    * Decodes an ABI v2 `CreateTexture2` payload (opcode 35, 40-byte
    * `GpuCreateTexture2Payload`) into `{ id, descriptor }` (`GPUTextureDescriptor`)
    * with safely clamped `mipLevelCount` and `sampleCount`, or `{ id, error }` when
-   * the payload is truncated or contains invalid codes.
+   * the payload is truncated or contains invalid codes. Supports an optional
+   * pre-allocated `out` scratch object (4th arg, or 3rd arg when `payloadBytes` is omitted).
    *
    * @param {DataView} view
    * @param {number} [offset=0]
    * @param {number} [payloadBytes]
+   * @param {object | null} [out=null]
    */
-  function decodeCreateTexture2(view, offset = 0, payloadBytes) {
-    const available = payloadBytes !== undefined ? payloadBytes : view.byteLength - offset;
+  function decodeCreateTexture2(view, offset = 0, payloadBytes, out = null) {
+    let targetOut = out;
+    let explicitPayloadBytes = payloadBytes;
+    if (typeof payloadBytes === 'object' && payloadBytes !== null && out === null) {
+      targetOut = payloadBytes;
+      explicitPayloadBytes = undefined;
+    }
+    const available = explicitPayloadBytes !== undefined ? explicitPayloadBytes : view.byteLength - offset;
     if (
       offset < 0 ||
       available < CREATE_TEXTURE2_BYTES ||
       offset + CREATE_TEXTURE2_BYTES > view.byteLength
     ) {
-      return {
-        id: 0,
-        error: `CreateTexture2: payload ${available} < ${CREATE_TEXTURE2_BYTES} bytes`,
-      };
+      const error = `CreateTexture2: payload ${available} < ${CREATE_TEXTURE2_BYTES} bytes`;
+      if (targetOut) {
+        targetOut.id = 0;
+        targetOut.error = error;
+        if ('descriptor' in targetOut) delete targetOut.descriptor;
+        return targetOut;
+      }
+      return { id: 0, error };
     }
 
     const id = view.getUint32(offset, true);
@@ -1275,25 +1375,77 @@
 
     const format = TEXTURE_FORMAT_NAMES[formatCode];
     if (formatCode === 0 || format === undefined) {
-      return { id, error: `CreateTexture2 ${id}: invalid texture format code ${formatCode}` };
+      const error = `CreateTexture2 ${id}: invalid texture format code ${formatCode}`;
+      if (targetOut) {
+        targetOut.id = id;
+        targetOut.error = error;
+        if ('descriptor' in targetOut) delete targetOut.descriptor;
+        return targetOut;
+      }
+      return { id, error };
     }
     const dimension = TEXTURE_DIMENSION_NAMES[dimensionCode];
     if (dimension === undefined) {
-      return { id, error: `CreateTexture2 ${id}: invalid dimension ${dimensionCode}` };
+      const error = `CreateTexture2 ${id}: invalid dimension ${dimensionCode}`;
+      if (targetOut) {
+        targetOut.id = id;
+        targetOut.error = error;
+        if ('descriptor' in targetOut) delete targetOut.descriptor;
+        return targetOut;
+      }
+      return { id, error };
     }
     if (viewFormatCount > MAX_VIEW_FORMATS) {
-      return {
-        id,
-        error: `CreateTexture2 ${id}: view_format_count ${viewFormatCount} > ${MAX_VIEW_FORMATS}`,
-      };
+      const error = `CreateTexture2 ${id}: view_format_count ${viewFormatCount} > ${MAX_VIEW_FORMATS}`;
+      if (targetOut) {
+        targetOut.id = id;
+        targetOut.error = error;
+        if ('descriptor' in targetOut) delete targetOut.descriptor;
+        return targetOut;
+      }
+      return { id, error };
     }
 
-    const viewFormats = [];
+    let pool = targetOut ? targetOut._pool : null;
+    if (targetOut && !pool) {
+      const sizeObj =
+        targetOut.descriptor && targetOut.descriptor.size && typeof targetOut.descriptor.size === 'object'
+          ? targetOut.descriptor.size
+          : { width: 1, height: 1, depthOrArrayLayers: 1 };
+      const descObj =
+        targetOut.descriptor && typeof targetOut.descriptor === 'object'
+          ? targetOut.descriptor
+          : {
+              size: sizeObj,
+              mipLevelCount: 1,
+              sampleCount: 1,
+              dimension: '2d',
+              format: 'rgba8unorm',
+              usage: 0,
+            };
+      descObj.size = sizeObj;
+      pool = attachNonEnumerableDecodePool(targetOut, {
+        descriptor: descObj,
+        size: sizeObj,
+        viewFormats: Array.isArray(descObj.viewFormats) ? descObj.viewFormats : [],
+      });
+    }
+
+    const viewFormats = pool ? pool.viewFormats : [];
+    viewFormats.length = 0;
     for (let i = 0; i < viewFormatCount; i += 1) {
       const code = view.getUint8(offset + 32 + i);
       const name = TEXTURE_FORMAT_NAMES[code];
       if (code === 0 || name === undefined) {
-        return { id, error: `CreateTexture2 ${id}: invalid view format code ${code}` };
+        viewFormats.length = 0;
+        const error = `CreateTexture2 ${id}: invalid view format code ${code}`;
+        if (targetOut) {
+          targetOut.id = id;
+          targetOut.error = error;
+          if ('descriptor' in targetOut) delete targetOut.descriptor;
+          return targetOut;
+        }
+        return { id, error };
       }
       viewFormats.push(name);
     }
@@ -1308,11 +1460,33 @@
       depthOrArrayLayers,
       dimension
     );
-    const sampleCount = clampSampleCount(rawSampleCount, {
-      mipLevelCount,
-      dimension,
-      depthOrArrayLayers,
-    });
+    const geometryAllowsMsaa =
+      dimension === '2d' && mipLevelCount <= 1 && depthOrArrayLayers === 1;
+    const sampleCount =
+      Number.isFinite(rawSampleCount) && rawSampleCount >= 4 && geometryAllowsMsaa ? 4 : 1;
+
+    if (targetOut) {
+      const size = pool.size;
+      size.width = width;
+      size.height = height;
+      size.depthOrArrayLayers = depthOrArrayLayers;
+      const descriptor = pool.descriptor;
+      descriptor.size = size;
+      descriptor.mipLevelCount = mipLevelCount;
+      descriptor.sampleCount = sampleCount;
+      descriptor.dimension = dimension;
+      descriptor.format = format;
+      descriptor.usage = usage;
+      if (viewFormats.length > 0) {
+        descriptor.viewFormats = viewFormats;
+      } else if ('viewFormats' in descriptor) {
+        delete descriptor.viewFormats;
+      }
+      targetOut.id = id;
+      targetOut.descriptor = descriptor;
+      if ('error' in targetOut) delete targetOut.error;
+      return targetOut;
+    }
 
     const descriptor = {
       size: { width, height, depthOrArrayLayers },
@@ -1827,6 +2001,13 @@
         reusedScratch: false,
         usedPooledScratch: false,
       };
+      this._reusableDispatchResult = {
+        copiedFromSab: false,
+        reusedScratch: false,
+        chunked: false,
+      };
+      this._reusableDecodeCreate1 = createTextureDecodeScratch(false);
+      this._reusableDecodeCreate2 = createTextureDecodeScratch(true);
 
       this.stats = this._createEmptyStats();
       this.lastError = null;
@@ -1927,6 +2108,15 @@
       this._reusableRepackResult.copiedFromSab = false;
       this._reusableRepackResult.reusedScratch = false;
       this._reusableRepackResult.usedPooledScratch = false;
+      this._reusableDispatchResult.copiedFromSab = false;
+      this._reusableDispatchResult.reusedScratch = false;
+      this._reusableDispatchResult.chunked = false;
+      this._reusableDecodeCreate1.id = 0;
+      if ('error' in this._reusableDecodeCreate1) delete this._reusableDecodeCreate1.error;
+      this._reusableDecodeCreate1._pool.viewFormats.length = 0;
+      this._reusableDecodeCreate2.id = 0;
+      if ('error' in this._reusableDecodeCreate2) delete this._reusableDecodeCreate2.error;
+      this._reusableDecodeCreate2._pool.viewFormats.length = 0;
     }
 
     _fillCopyTexture(texture, mipLevel, originX, originY, originZ, aspect) {
@@ -2389,7 +2579,12 @@
           this._error(`CreateTexture2: payload ${payloadBytes} < ${CREATE_TEXTURE2_BYTES} bytes`);
           return true;
         }
-        const decoded = decodeCreateTexture2(view, payloadOffset, payloadBytes);
+        const decoded = decodeCreateTexture2(
+          view,
+          payloadOffset,
+          payloadBytes,
+          this._reusableDecodeCreate2
+        );
         if (decoded.error) {
           this._error(decoded.error);
           return true;
@@ -2403,7 +2598,12 @@
           this._error(`CreateTexture: payload ${payloadBytes} < ${CREATE_TEXTURE_BYTES} bytes`);
           return true;
         }
-        const decoded = decodeCreateTexture(view, payloadOffset, payloadBytes);
+        const decoded = decodeCreateTexture(
+          view,
+          payloadOffset,
+          payloadBytes,
+          this._reusableDecodeCreate1
+        );
         if (decoded.error) {
           this._error(decoded.error);
           return true;
@@ -2606,11 +2806,11 @@
             if (textureFormat === 'r8unorm') {
               this.stats.r8unormUploads += 1;
             }
-            return {
-              copiedFromSab: fromSab,
-              reusedScratch: anyReusedScratch,
-              chunked: chunkCount > 1,
-            };
+            const result = this._reusableDispatchResult;
+            result.copiedFromSab = fromSab;
+            result.reusedScratch = anyReusedScratch;
+            result.chunked = chunkCount > 1;
+            return result;
           }
         }
       }
@@ -2644,10 +2844,12 @@
         this.stats.r8unormUploads += 1;
       }
 
-      const copiedFromSab = prepared.copiedFromSab;
-      const reusedScratch = prepared.reusedScratch;
+      const result = this._reusableDispatchResult;
+      result.copiedFromSab = prepared.copiedFromSab;
+      result.reusedScratch = prepared.reusedScratch;
+      result.chunked = false;
       prepared.data = null;
-      return { copiedFromSab, reusedScratch, chunked: false };
+      return result;
     }
 
     /**
@@ -2981,14 +3183,17 @@
       const alignedDstBpr = Math.ceil(unalignedDstBpr / alignBytesPerRow) * alignBytesPerRow;
       const totalDstBytes = alignedDstBpr * effH * effD;
 
-      const acquired = this._acquireScratchBuffer(totalDstBytes);
+      const acquired = this._acquireScratchSlot0(totalDstBytes);
+      const scratchBuf = acquired.buffer;
+      const scratchReused = acquired.reused;
       const expanded = expandA8ToRgba8(a8Bytes, effW, effH, {
         depthOrLayers: effD,
         srcBytesPerRow: opts.srcBytesPerRow !== undefined ? opts.srcBytesPerRow : rawW,
         srcRowsPerImage: opts.srcRowsPerImage !== undefined ? opts.srcRowsPerImage : rawH,
         alignBytesPerRow,
-        scratchBuffer: acquired.buffer,
+        scratchBuffer: scratchBuf,
       });
+      acquired.buffer = null;
 
       if (expanded.copiedFromSab) {
         this.stats.sabCopyCount += 1;
@@ -3000,7 +3205,7 @@
           if (expanded.repacked) {
             this.stats.rowPitchRepackCount += 1;
             this.stats.repackedUploads += 1;
-            if (acquired.buffer !== null) {
+            if (scratchBuf !== null) {
               this.stats.scratchRepackUploads += 1;
             }
           }
@@ -3032,8 +3237,8 @@
             rowsPerImage: expanded.rowsPerImage,
             repacked: expanded.repacked,
             copiedFromSab: expanded.copiedFromSab,
-            reusedScratch: acquired.reused,
-            pooledScratch: acquired.buffer !== null,
+            reusedScratch: scratchReused,
+            pooledScratch: scratchBuf !== null,
             clamped: clampedSubRegion,
           };
         }
@@ -3050,7 +3255,7 @@
       if (expanded.repacked) {
         this.stats.rowPitchRepackCount += 1;
         this.stats.repackedUploads += 1;
-        if (acquired.buffer !== null) {
+        if (scratchBuf !== null) {
           this.stats.scratchRepackUploads += 1;
         }
       }
@@ -3081,8 +3286,8 @@
         rowsPerImage: expanded.rowsPerImage,
         repacked: expanded.repacked,
         copiedFromSab: expanded.copiedFromSab,
-        reusedScratch: acquired.reused,
-        pooledScratch: acquired.buffer !== null,
+        reusedScratch: scratchReused,
+        pooledScratch: scratchBuf !== null,
         clamped: clampedSubRegion,
       };
     }
@@ -3998,6 +4203,37 @@
         promoted1DTo2D = true;
       }
 
+      if (
+        effectiveDescriptor === this._reusableDecodeCreate1.descriptor ||
+        effectiveDescriptor === this._reusableDecodeCreate2.descriptor
+      ) {
+        const copy = {
+          size: {
+            width: effectiveDescriptor.size.width,
+            height: effectiveDescriptor.size.height,
+            depthOrArrayLayers: effectiveDescriptor.size.depthOrArrayLayers,
+          },
+          mipLevelCount: effectiveDescriptor.mipLevelCount,
+          format: effectiveDescriptor.format,
+          usage: effectiveDescriptor.usage,
+          dimension: effectiveDescriptor.dimension,
+        };
+        if (effectiveDescriptor.sampleCount !== undefined) {
+          copy.sampleCount = effectiveDescriptor.sampleCount;
+        }
+        if (Array.isArray(effectiveDescriptor.viewFormats) && effectiveDescriptor.viewFormats.length > 0) {
+          copy.viewFormats = effectiveDescriptor.viewFormats.slice();
+        }
+        effectiveDescriptor = copy;
+      } else if (
+        effectiveDescriptor &&
+        Array.isArray(effectiveDescriptor.viewFormats) &&
+        (effectiveDescriptor.viewFormats === this._reusableDecodeCreate1._pool.viewFormats ||
+          effectiveDescriptor.viewFormats === this._reusableDecodeCreate2._pool.viewFormats)
+      ) {
+        effectiveDescriptor.viewFormats = effectiveDescriptor.viewFormats.slice();
+      }
+
       let texture;
       try {
         texture = p.device.createTexture(effectiveDescriptor);
@@ -4113,7 +4349,12 @@
       }
       if (typeof processor._handleCreateTexture === 'function') {
         processor._handleCreateTexture = function hardenedHandleCreateTexture(view, payloadOffset) {
-          const decoded = decodeCreateTexture(view, payloadOffset);
+          const decoded = decodeCreateTexture(
+            view,
+            payloadOffset,
+            undefined,
+            handler._reusableDecodeCreate1
+          );
           if (decoded.error) {
             handler._error(decoded.error);
             return;

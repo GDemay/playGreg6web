@@ -3808,3 +3808,296 @@ test('W344: handleWriteTexture pre-clamped fast path avoids duplicate clamping a
     }
   }
 });
+
+test('W373: zero-alloc _dispatchDirectWriteTexture result reuse, scratch-backed decodeCreateTexture/decodeCreateTexture2, and writeA8Texture slot0 path', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = tp.installTexturePackets(processor);
+
+  // 1) Pure scratch-backed decodeCreateTexture / decodeCreateTexture2 reuse the exact scratch object
+  const tex1A = createTexture1Packet({ id: 4001, width: 128, height: 64, format: 0, usage: 0x06 }); // rgba8unorm (has sRGB sibling)
+  const tex1B = createTexture1Packet({ id: 4002, width: 32, height: 32, format: 2, usage: 0x06 }); // rgba16float (no sRGB sibling)
+  const scratch1 = {};
+  const d1A = tp.decodeCreateTexture(new DataView(tex1A.buffer, 8), 0, 32, scratch1);
+  assert.equal(d1A, scratch1);
+  assert.equal(d1A.id, 4001);
+  assert.deepEqual(d1A.descriptor.viewFormats, ['rgba8unorm-srgb']);
+  const descRef1 = d1A.descriptor;
+  const sizeRef1 = d1A.descriptor.size;
+  const d1B = tp.decodeCreateTexture(new DataView(tex1B.buffer, 8), 0, 32, scratch1);
+  assert.equal(d1B, scratch1);
+  assert.equal(d1B.descriptor, descRef1);
+  assert.equal(d1B.descriptor.size, sizeRef1);
+  assert.equal(d1B.id, 4002);
+  assert.equal('viewFormats' in d1B.descriptor, false, 'stale viewFormats removed on scratch reuse');
+
+  const tex2A = createTexture2Packet({
+    id: 4010,
+    width: 256,
+    height: 128,
+    mips: 4,
+    format: 62, // bc7-rgba-unorm
+    usage: 0x06,
+    viewFormats: [63],
+  });
+  const tex2B = createTexture2Packet({
+    id: 4011,
+    width: 64,
+    height: 64,
+    mips: 1,
+    samples: 4,
+    format: 16, // r32float
+    usage: 0x14,
+  });
+  const scratch2 = {};
+  const d2A = tp.decodeCreateTexture2(new DataView(tex2A.buffer, 8), 0, 40, scratch2);
+  assert.equal(d2A, scratch2);
+  assert.deepEqual(d2A.descriptor.viewFormats, ['bc7-rgba-unorm-srgb']);
+  const descRef2 = d2A.descriptor;
+  const sizeRef2 = d2A.descriptor.size;
+  const d2B = tp.decodeCreateTexture2(new DataView(tex2B.buffer, 8), 0, 40, scratch2);
+  assert.equal(d2B, scratch2);
+  assert.equal(d2B.descriptor, descRef2);
+  assert.equal(d2B.descriptor.size, sizeRef2);
+  assert.equal(d2B.descriptor.sampleCount, 4);
+  assert.equal('viewFormats' in d2B.descriptor, false);
+
+  // 2) Consecutive CREATE_TEXTURE / CREATE_TEXTURE2 packets must not alias texture.desc in mocks
+  processor.executeCommandBuffer(tex1A);
+  processor.executeCommandBuffer(tex1B);
+  processor.executeCommandBuffer(tex2A);
+  processor.executeCommandBuffer(tex2B);
+  assert.equal(processor.textures.get(4001).desc.format, 'rgba8unorm');
+  assert.deepEqual(processor.textures.get(4001).desc.size, { width: 128, height: 64, depthOrArrayLayers: 1 });
+  assert.equal(processor.textures.get(4002).desc.format, 'rgba16float');
+  assert.deepEqual(processor.textures.get(4002).desc.size, { width: 32, height: 32, depthOrArrayLayers: 1 });
+  assert.equal(processor.textures.get(4010).desc.format, 'bc7-rgba-unorm');
+  assert.equal(processor.textures.get(4011).desc.format, 'r32float');
+
+  // 3) _dispatchDirectWriteTexture returns the pre-allocated _reusableDispatchResult across uploads
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4020, width: 256, height: 4, format: 1, usage: 0x06 }) // r8unorm
+  );
+  const dispatchReturnRefs = [];
+  const origDispatch = handler._dispatchDirectWriteTexture.bind(handler);
+  handler._dispatchDirectWriteTexture = function spiedDispatch(...args) {
+    const res = origDispatch(...args);
+    dispatchReturnRefs.push(res);
+    return res;
+  };
+
+  const rowData = new Uint8Array(256 * 4);
+  rowData.fill(0x5a);
+  const pkt = writeTexturePacket({
+    textureId: 4020,
+    width: 256,
+    height: 4,
+    bytesPerRow: 256,
+    rowsPerImage: 4,
+    data: rowData,
+  });
+  processor.executeCommandBuffer(pkt);
+  processor.executeCommandBuffer(pkt);
+  assert.equal(dispatchReturnRefs.length, 2);
+  assert.equal(dispatchReturnRefs[0], handler._reusableDispatchResult);
+  assert.equal(dispatchReturnRefs[1], handler._reusableDispatchResult);
+
+  // Public writeTexture() still returns a fresh caller-safe object distinct from _reusableDispatchResult
+  const pubRes1 = handler.writeTexture(
+    { texture: processor.textures.get(4020), mipLevel: 0 },
+    rowData,
+    { bytesPerRow: 256, rowsPerImage: 4 },
+    { width: 256, height: 4, depthOrArrayLayers: 1 },
+    4020
+  );
+  const pubRes2 = handler.writeTexture(
+    { texture: processor.textures.get(4020), mipLevel: 0 },
+    rowData,
+    { bytesPerRow: 256, rowsPerImage: 4 },
+    { width: 256, height: 4, depthOrArrayLayers: 1 },
+    4020
+  );
+  assert.notEqual(pubRes1, handler._reusableDispatchResult);
+  assert.notEqual(pubRes1, pubRes2);
+  assert.equal(pubRes1.uploaded, true);
+  assert.equal(pubRes1.zeroCopy, true);
+
+  // 4) writeA8Texture uses _acquireScratchSlot0 directly (never calls _acquireScratchBuffer wrapper)
+  let wrapperCalls = 0;
+  handler._acquireScratchBuffer = () => {
+    wrapperCalls += 1;
+    throw new Error('writeA8Texture must use _acquireScratchSlot0 directly');
+  };
+  const a8Res = handler.writeA8Texture(
+    { texture: processor.textures.get(4001), mipLevel: 0 },
+    new Uint8Array([0x11, 0x22, 0x33, 0x44]),
+    { width: 2, height: 2, depthOrArrayLayers: 1 },
+    { preferDirect: true, textureId: 4001 }
+  );
+  assert.equal(wrapperCalls, 0);
+  assert.equal(a8Res.uploaded, true);
+});
+
+test('W373: 3D scene texture uploads — BC7 full mip chain (incl. 2x2 & 1x1 tail mips), 6-face cubemap / 2D array, 3D volume mip depth halving, and depth/stencil', () => {
+  const gpu = createMockWebGpu({ strictWebGpu: true });
+  const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 256 * 1024 });
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
+  const handler = tp.installTexturePackets(processor);
+
+  // 1) BC7 16x16 full 5-mip chain (16x16, 8x8, 4x4, 2x2 -> 4x4, 1x1 -> 4x4)
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4100, width: 16, height: 16, mips: 5, format: 62, usage: 0x06 })
+  );
+  const bc7Mips = [
+    { mip: 0, w: 16, h: 16, bpr: 64, rpi: 4, expW: 16, expH: 16 },
+    { mip: 1, w: 8, h: 8, bpr: 32, rpi: 2, expW: 8, expH: 8 },
+    { mip: 2, w: 4, h: 4, bpr: 16, rpi: 1, expW: 4, expH: 4 },
+    { mip: 3, w: 2, h: 2, bpr: 16, rpi: 1, expW: 4, expH: 4 }, // tail mip clamped to 4x4
+    { mip: 4, w: 1, h: 1, bpr: 16, rpi: 1, expW: 4, expH: 4 }, // tail mip clamped to 4x4
+  ];
+  for (const m of bc7Mips) {
+    const data = new Uint8Array(m.bpr * m.rpi);
+    data.fill(0x20 + m.mip);
+    processor.executeCommandBuffer(
+      writeTexturePacket({
+        textureId: 4100,
+        mipLevel: m.mip,
+        width: m.w,
+        height: m.h,
+        bytesPerRow: m.bpr,
+        rowsPerImage: m.rpi,
+        data,
+      })
+    );
+  }
+  const bc7Copies = gpu.calls.filter(
+    (c) => c.op === 'copyBufferToTexture' && c.destination.texture === processor.textures.get(4100)
+  );
+  assert.equal(bc7Copies.length, 5);
+  bc7Mips.forEach((m, idx) => {
+    assert.equal(bc7Copies[idx].destination.mipLevel, m.mip);
+    assert.deepEqual(bc7Copies[idx].copySize, { width: m.expW, height: m.expH, depthOrArrayLayers: 1 });
+    assert.equal(bc7Copies[idx].source.bytesPerRow % 256, 0);
+  });
+
+  // 2) 6-face cubemap / 2D array (64x64x6 rgba8unorm, 3 mips): array layers stay 6 at every mip
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4101, width: 64, height: 64, layers: 6, mips: 3, format: 22, usage: 0x06 })
+  );
+  // Mip 0: 64*4 = 256B/row (aligned -> direct zero-copy), 6 faces
+  const cubeMip0 = new Uint8Array(256 * 64 * 6);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4101,
+      mipLevel: 0,
+      width: 64,
+      height: 64,
+      layers: 6,
+      bytesPerRow: 256,
+      rowsPerImage: 64,
+      data: cubeMip0,
+    })
+  );
+  // Mip 2: 16x16x6 (64B/row unaligned -> staged repack), all 6 faces preserved
+  const cubeMip2 = new Uint8Array(64 * 16 * 6);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4101,
+      mipLevel: 2,
+      width: 16,
+      height: 16,
+      layers: 6,
+      bytesPerRow: 64,
+      rowsPerImage: 16,
+      data: cubeMip2,
+    })
+  );
+  const cubeDirect = gpu.calls.filter(
+    (c) => c.op === 'writeTexture' && c.destination.texture === processor.textures.get(4101)
+  );
+  const cubeStaged = gpu.calls.filter(
+    (c) => c.op === 'copyBufferToTexture' && c.destination.texture === processor.textures.get(4101)
+  );
+  assert.equal(cubeDirect.length, 1);
+  assert.deepEqual(cubeDirect[0].size, { width: 64, height: 64, depthOrArrayLayers: 6 });
+  assert.equal(cubeStaged.length, 1);
+  assert.equal(cubeStaged[0].destination.mipLevel, 2);
+  assert.deepEqual(cubeStaged[0].copySize, { width: 16, height: 16, depthOrArrayLayers: 6 });
+
+  // 3) 3D volume texture (16x16x8 rgba16float, 4 mips): depth halves per mip (8 -> 4 -> 2 -> 1)
+  processor.executeCommandBuffer(
+    createTexture2Packet({
+      id: 4102,
+      width: 16,
+      height: 16,
+      layers: 8,
+      mips: 4,
+      dimension: 2, // 3d
+      format: 40, // rgba16float (8 Bpp)
+      usage: 0x06,
+    })
+  );
+  // Mip 2 has logical dimensions 4x4x2; request depth=4 (OOB) -> clamped safely to depth=2
+  const volMip2Data = new Uint8Array(32 * 4 * 4);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4102,
+      mipLevel: 2,
+      width: 4,
+      height: 4,
+      layers: 4,
+      bytesPerRow: 32,
+      rowsPerImage: 4,
+      data: volMip2Data,
+    })
+  );
+  // Mip 3 has logical dimensions 2x2x1
+  const volMip3Data = new Uint8Array(16 * 2 * 1);
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4102,
+      mipLevel: 3,
+      width: 2,
+      height: 2,
+      layers: 1,
+      bytesPerRow: 16,
+      rowsPerImage: 2,
+      data: volMip3Data,
+    })
+  );
+  const volCopies = gpu.calls.filter(
+    (c) => c.op === 'copyBufferToTexture' && c.destination.texture === processor.textures.get(4102)
+  );
+  assert.equal(volCopies.length, 2);
+  assert.deepEqual(volCopies[0].copySize, { width: 4, height: 4, depthOrArrayLayers: 2 });
+  assert.deepEqual(volCopies[1].copySize, { width: 2, height: 2, depthOrArrayLayers: 1 });
+
+  // 4) Depth/stencil formats (depth32float=48, stencil8=44) upload cleanly via direct & staged paths
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4103, width: 64, height: 4, format: 48, usage: 0x16 }) // depth32float (64*4=256B aligned)
+  );
+  processor.executeCommandBuffer(
+    createTexture2Packet({ id: 4104, width: 32, height: 4, format: 44, usage: 0x16 }) // stencil8 (32B unaligned)
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4103,
+      width: 64,
+      height: 4,
+      bytesPerRow: 256,
+      rowsPerImage: 4,
+      data: new Uint8Array(256 * 4),
+    })
+  );
+  processor.executeCommandBuffer(
+    writeTexturePacket({
+      textureId: 4104,
+      width: 32,
+      height: 4,
+      bytesPerRow: 32,
+      rowsPerImage: 4,
+      data: new Uint8Array(32 * 4),
+    })
+  );
+  assert.equal(handler.getStats().errors, 0, handler.lastError);
+});
