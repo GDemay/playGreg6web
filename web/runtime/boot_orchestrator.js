@@ -57,6 +57,19 @@
     return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
   }
 
+  function clampNonNegativeInt(value) {
+    return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  }
+
+  function computeOpfsHitRatePct(hits, misses) {
+    const h = clampNonNegativeInt(hits);
+    const m = clampNonNegativeInt(misses);
+    const total = h + m;
+    if (total <= 0) return 0;
+    const pct = (h / total) * 100;
+    return Number.isFinite(pct) && pct > 0 ? Math.min(100, pct) : 0;
+  }
+
   function normalizeStageTimeoutMs(value) {
     if (value === undefined || value === null) return DEFAULT_STAGE_TIMEOUT_MS;
     if (typeof value !== 'number') {
@@ -1621,6 +1634,59 @@
       };
     }
 
+    _readOpfsTelemetry() {
+      const preloader = this._preloader;
+      let stats = null;
+      if (preloader && typeof preloader.getStats === 'function') {
+        try {
+          stats = preloader.getStats();
+        } catch {
+          stats = null;
+        }
+      }
+      const opfsHits = clampNonNegativeInt(stats && stats.opfsHits);
+      const opfsMisses = clampNonNegativeInt(stats && stats.opfsMisses);
+      const opfsWrites = clampNonNegativeInt(stats && stats.opfsWrites);
+      const opfsInvalidations = clampNonNegativeInt(stats && stats.opfsInvalidations);
+      const bytesFromOpfs = clampNonNegativeInt(stats && stats.bytesFromOpfs);
+      const bytesFromNetwork = clampNonNegativeInt(stats && stats.bytesFromNetwork);
+      const opfsHitRatePct =
+        stats &&
+        typeof stats.opfsHitRatePct === 'number' &&
+        Number.isFinite(stats.opfsHitRatePct) &&
+        stats.opfsHitRatePct >= 0
+          ? Math.min(100, stats.opfsHitRatePct)
+          : computeOpfsHitRatePct(opfsHits, opfsMisses);
+      const opfsEnabled =
+        stats && typeof stats.opfsEnabled === 'boolean'
+          ? stats.opfsEnabled
+          : Boolean(
+              preloader &&
+                (preloader.opfsEnabled === true ||
+                  (preloader._opfsStore !== undefined && preloader._opfsStore !== null))
+            );
+      return {
+        opfsEnabled,
+        opfsHits,
+        opfsMisses,
+        opfsWrites,
+        opfsInvalidations,
+        bytesFromOpfs,
+        bytesFromNetwork,
+        opfsHitRatePct,
+      };
+    }
+
+    /**
+     * Wait for any background non-blocking OPFS write-through tasks owned by the preloader.
+     */
+    async flushOpfsWrites() {
+      const preloader = this._preloader;
+      if (preloader && typeof preloader.flushOpfsWrites === 'function') {
+        await preloader.flushOpfsWrites();
+      }
+    }
+
     /**
      * Return sanitized boot orchestrator timing, concurrency, and overlap savings statistics
      * (`serialEstimateMs`, `parallelWallMs`, `overlapSavedMs`, `parallelStagesCount`) suitable
@@ -1629,6 +1695,7 @@
     getStats() {
       const timing = this._buildTimingSnapshot();
       const { watchdog } = timing;
+      const opfs = this._readOpfsTelemetry();
       return {
         phase: this._phase,
         bootMode: this._bootMode,
@@ -1657,6 +1724,7 @@
         droppedWasmBuffers: this._droppedWasmBuffers,
         droppedPreloadBuffers: this._droppedPreloadBuffers,
         transferredArrayBuffers: this._transferredArrayBuffers,
+        ...opfs,
       };
     }
 
@@ -1896,6 +1964,7 @@
     getDiagnosticSnapshot() {
       const timing = this._buildTimingSnapshot();
       const { watchdog } = timing;
+      const opfs = this._readOpfsTelemetry();
       return {
         phase: this._phase,
         bootMode: this._bootMode,
@@ -1928,6 +1997,7 @@
         droppedWasmBuffers: this._droppedWasmBuffers,
         droppedPreloadBuffers: this._droppedPreloadBuffers,
         transferredArrayBuffers: this._transferredArrayBuffers,
+        ...opfs,
         tracer: tracerSnapshot(this._bootTracer),
       };
     }
@@ -2165,6 +2235,9 @@
       };
 
       const hasBootBundle = Boolean(preloader && typeof preloader.preloadBootBundle === 'function');
+      const canPreloadProgramManifest = Boolean(
+        assets.programManifestUrl && preloader && typeof preloader.preloadProgramModules === 'function'
+      );
       const pgimLoader =
         preloader && typeof preloader.preloadPgim === 'function'
           ? preloader.preloadPgim.bind(preloader)
@@ -2176,7 +2249,12 @@
         throw new TypeError('preloader.preloadBootBundle must be a function');
       }
 
-      const useBootBundle = Boolean(assets.pgimUrl && hasBootBundle && (this._parallelPreload || !pgimLoader));
+      const hasPrimaryGuestAsset = Boolean(assets.pgimUrl || canPreloadProgramManifest);
+      const useBootBundle = Boolean(
+        hasPrimaryGuestAsset &&
+          hasBootBundle &&
+          (this._parallelPreload || (!pgimLoader && !canPreloadProgramManifest))
+      );
       const tasks = [];
 
       if (useBootBundle) {
@@ -2185,17 +2263,35 @@
           asset: 'bundle',
           kind: 'bootBundle',
           optional: false,
-          run: (taskSignal) =>
-            preloader.preloadBootBundle({
+          run: (taskSignal) => {
+            const bundleArgs = {
               pgimUrl: assets.pgimUrl,
               shaderPackUrl: assets.shaderPackUrl,
               reflectionUrl: assets.reflectionManifestUrl,
               onProgress,
               signal: taskSignal,
-            }),
+            };
+            if (assets.programManifestUrl) {
+              bundleArgs.programManifestUrl = assets.programManifestUrl;
+            }
+            return preloader.preloadBootBundle(bundleArgs);
+          },
         });
       } else {
-        if (assets.pgimUrl && pgimLoader) {
+        if (canPreloadProgramManifest) {
+          tasks.push({
+            name: 'pgim',
+            asset: 'pgim',
+            kind: 'pgim',
+            optional: false,
+            run: (taskSignal) =>
+              preloader.preloadProgramModules(assets.programManifestUrl, {
+                fallbackPgimUrl: assets.pgimUrl || null,
+                onProgress: forwardFor('pgim'),
+                signal: taskSignal,
+              }),
+          });
+        } else if (assets.pgimUrl && pgimLoader) {
           tasks.push({
             name: 'pgim',
             asset: 'pgim',
@@ -2576,8 +2672,14 @@
           this._resolveRuntimeWasmLoader() && this._assets.runtimeWasmAvailable && this._assets.runtimeWasmUrl
         );
         const hasOpfsProbe = Boolean(this._resolveOpfsProbe());
+        const hasProgramManifestPreload = Boolean(
+          this._assets.programManifestUrl &&
+            this._preloader &&
+            typeof this._preloader.preloadProgramModules === 'function'
+        );
         const shouldPreload = Boolean(
           this._assets.pgimUrl ||
+          hasProgramManifestPreload ||
           this._assets.shaderPackUrl ||
           this._assets.shaderPackIndexUrl ||
           this._assets.reflectionSidecarUrl ||
