@@ -300,6 +300,8 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         self.assertEqual(set(written["stages"].keys()), {
             "0x0000000000000001",
@@ -355,6 +357,8 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
                 "mesh_output_stages": 0,
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
             })
 
             # Second run: in-place merge onto the file written in run 1
@@ -377,6 +381,8 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
                 "mesh_output_stages": 0,
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
             })
             written = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(set(written["stages"].keys()), {"0x00000000000000a1", "0x00000000000000b2"})
@@ -387,7 +393,7 @@ class SidecarTests(unittest.TestCase):
             json.dumps([1, 2, 3]),
             json.dumps({"schema": "wrong-schema", "version": 1, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": 0, "stages": {}}),
-            json.dumps({"schema": "playgta6-stage-reflection", "version": 3, "stages": {}}),
+            json.dumps({"schema": "playgta6-stage-reflection", "version": 4, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": True, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": 1, "stages": []}),
             json.dumps({
@@ -444,6 +450,8 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         self.assertNotIn("merged_existing", summary)
         self.assertNotIn("diff", summary)
@@ -697,6 +705,8 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 2,
             "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
 
     def test_summarize_stages_empty_and_explicit_vertex_input_mode(self):
@@ -712,6 +722,8 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         stages = {
             "0x1": {"stage": "vertex", "bindings": [], "vertex_inputs": []},
@@ -1683,6 +1695,96 @@ class SidecarTests(unittest.TestCase):
                 rc_bad = sidecar.main(["--out", str(bad_sidecar), "--verify-pack", str(pack_path), "--json"])
             self.assertEqual(rc_bad, 1)
             self.assertIn("malformed mesh_output", stderr.getvalue())
+
+    @staticmethod
+    def _sourceless_fragment(key: str, kinds: list[str]) -> dict:
+        bindings = [{"group": 0, "binding": 0, "kind": "uniform", "name": "cb0",
+                     "source": {"user_sgpr": 8, "table_byte_offset": 288}}]
+        for i, kind in enumerate(kinds, start=1):
+            bindings.append({"group": 0, "binding": i, "kind": kind, "name": f"r{i}", "view_dimension": "2d"})
+        return {"hash_fnv1a64": key, "stage": "fragment", "bindings": bindings,
+                "binding_summary": {"vertex_input_mode": "none"}}
+
+    def test_unresolved_sources_keep_read_only_sourceless_stages(self):
+        # G62 / #482: with unresolved sources on, read-only bindings without a source become
+        # {"unresolved": true} (version 3); writable ones still skip the stage.
+        tex = self._sourceless_fragment("0x00000000000000f1", ["texture_2d", "sampler"])
+        uav = self._sourceless_fragment("0x00000000000000f2", ["storage-texture"])
+        rw = self._sourceless_fragment("0x00000000000000f3", ["storage"])
+        doc, skipped = sidecar.build([{"entries": [tex, uav, rw]}])
+        self.assertEqual(doc["stages"], {})
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(skipped, {"binding without source": 3})
+
+        doc, skipped = sidecar.build([{"entries": [tex, uav, rw]}], unresolved=True)
+        self.assertEqual(doc["version"], 3)
+        self.assertEqual(skipped, {"writable binding without source": 2})
+        bindings = doc["stages"]["0x00000000000000f1"]["bindings"]
+        self.assertEqual(bindings[0]["source"], {"user_sgpr": 8, "table_byte_offset": 288})
+        self.assertEqual(bindings[1]["kind"], "texture")
+        self.assertEqual(bindings[1]["source"], {"unresolved": True})
+        self.assertEqual(bindings[2]["source"], {"unresolved": True})
+        summary = sidecar.summarize_stages(doc["stages"])
+        self.assertEqual((summary["unresolved_stages"], summary["unresolved_bindings"]), (1, 2))
+
+        # A traced entry stays exactly as before (no unresolved marker, version unchanged).
+        doc, skipped = sidecar.build([vertex_entry(True)], unresolved=True)
+        self.assertEqual((doc["version"], skipped), (1, {}))
+
+        # The missing-sources report keeps describing what the translator did not trace.
+        report = sidecar.build_missing_sources_report([{"entries": [tex]}])
+        self.assertEqual(report["total_skipped_missing_source"], 1)
+
+    def test_unresolved_source_from_translator_is_validated(self):
+        ok = self._sourceless_fragment("0x00000000000000f4", [])
+        ok["bindings"].append({"group": 0, "binding": 1, "kind": "texture_2d", "source": {"unresolved": True}})
+        ok["bindings"].append({"group": 0, "binding": 2, "kind": "sampler",
+                               "source": {"unresolved": "cb_dynamic_offset"}})
+        doc, skipped = sidecar.build([ok])
+        self.assertEqual((doc["version"], skipped), (3, {}))
+        self.assertEqual(doc["stages"]["0x00000000000000f4"]["bindings"][2]["source"],
+                         {"unresolved": "cb_dynamic_offset"})
+        for bad_source, kind in (({"unresolved": False}, "texture_2d"), ({"unresolved": True, "x": 1}, "texture_2d"),
+                                 ({"unresolved": True}, "storage"), ({"unresolved": ""}, "texture_2d"),
+                                 ({"unresolved": "C:\\Users\\x"}, "texture_2d")):
+            bad = self._sourceless_fragment("0x00000000000000f5", [])
+            bad["bindings"].append({"group": 0, "binding": 1, "kind": kind, "source": bad_source})
+            doc, skipped = sidecar.build([bad])
+            self.assertEqual(skipped, {"malformed unresolved source": 1})
+
+    def test_unresolved_sources_cli_merge_and_version_checks(self):
+        tex = self._sourceless_fragment("0x00000000000000f6", ["texture_2d"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack.json"
+            out = Path(tmp) / "pk.wgsl.pack.reflect.json"
+            src.write_text(json.dumps({"entries": [tex]}), encoding="utf-8")
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--unresolved-sources", "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual((summary["stages_written"], summary["unresolved_stages"]), (1, 1))
+            written = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(written["version"], 3)
+
+            # A v3 sidecar merges back in and keeps version 3.
+            empty = Path(tmp) / "empty.json"
+            empty.write_text(json.dumps({"entries": []}), encoding="utf-8")
+            merged = Path(tmp) / "merged.reflect.json"
+            with redirect_stdout(io.StringIO()):
+                rc = sidecar.main([str(empty), "--out", str(merged), "--merge-existing", str(out)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(merged.read_text(encoding="utf-8"))["version"], 3)
+
+            # An unresolved source in a version 2 document is rejected.
+            written["version"] = 2
+            bad = Path(tmp) / "bad.reflect.json"
+            bad.write_text(json.dumps(written), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc = sidecar.main([str(empty), "--out", str(merged), "--merge-existing", str(bad)])
+            self.assertEqual(rc, 1)
+            self.assertIn("malformed unresolved source", stderr.getvalue())
 
 
 if __name__ == "__main__":

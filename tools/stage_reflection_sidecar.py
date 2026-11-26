@@ -17,12 +17,16 @@ sidecar only when its reflection carries the join keys the runtime needs:
     {lane_indexed_resource_heap | lane_indexed_sampler_heap: {max_count (1..256), shift, stride?,
     window_base?: {cbv: <as above>, byte_offset, bit_offset?, mask?}}} (G62 / #482: per-lane
     (VGPR / waterfall) bindless, a window of max_count heap descriptors read as a binding_array;
-    kept and counted, the runtime refuses the join with a counted reason until it binds arrays));
+    kept and counted, the runtime refuses the join with a counted reason until it binds arrays) |
+    {unresolved: true | "<reason>"} (G62 / #482, sidecar version 3; added with --unresolved-sources: the translator
+    reflected the binding but could not trace its descriptor, e.g. a bindless heap index read from a
+    constant buffer at an offset computed from a root constant; the runtime binds the worker's
+    default for it and joins the rest of the stage; writable kinds stay skipped));
   - a vertex stage that fetches attributes lists `vertex_inputs` ({location, vb_slot, byte_offset,
     components, component_type, fetch_format?}).
 Stages without them are skipped and counted, so the runtime keeps its conventions for them.
 
-    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--verify-pack <wgsl.pack>] [--json]
+    python tools/stage_reflection_sidecar.py <json>... --out <pack>.reflect.json [--unresolved-sources] [--merge-existing <reflect.json>] [--diff-baseline <reflect.json>] [--fail-on-regressions] [--report-missing-sources <report.json>] [--verify-pack <wgsl.pack>] [--json]
 
 The sidecar is derived from the title's shaders: write it under work/, never into the repository.
 """
@@ -39,8 +43,10 @@ from typing import Any
 
 SCHEMA = "playgta6-stage-reflection"
 VERSION = 1
-MAX_VERSION = 2
-SUPPORTED_VERSIONS = (1, 2)
+VERSION_ROOT_TABLE_OFFSET = 2
+VERSION_UNRESOLVED = 3
+MAX_VERSION = 3
+SUPPORTED_VERSIONS = (1, 2, 3)
 REPORT_SCHEMA = "playgta6-stage-reflection-missing-sources"
 REPORT_VERSION = 1
 DEFAULT_MAX_SAMPLE_HASHES = 5
@@ -77,6 +83,12 @@ KIND_MAP = {
     "comparison_sampler": "comparison_sampler",
     "sampler_comparison": "comparison_sampler",
 }
+
+
+# Kinds that may join with an unresolved source (bound as the worker's default): read-only ones.
+# A writable binding without a source stays skipped, its writes would go nowhere.
+UNRESOLVABLE_KINDS = ("uniform", "read_only_storage", "texture", "sampler", "comparison_sampler")
+UNRESOLVED_SOURCE = {"unresolved": True}
 
 
 def stage_name(stage: str) -> str | None:
@@ -207,6 +219,31 @@ def _stages_require_v2(stages: dict[str, Any]) -> bool:
     return False
 
 
+def is_unresolved_source(source: Any) -> bool:
+    return isinstance(source, dict) and "unresolved" in source
+
+
+def unresolved_source_ok(source: dict[str, Any], kind: Any) -> bool | None:
+    """None: not an unresolved source; else whether it is exactly {unresolved: true} on a read-only kind."""
+    if "unresolved" not in source:
+        return None
+    if len(source) != 1 or KIND_MAP.get(str(kind)) not in UNRESOLVABLE_KINDS:
+        return False
+    mark = source["unresolved"]
+    return mark is True or (isinstance(mark, str) and _SAFE_LABEL_RE.match(mark) is not None)
+
+
+def _stages_require_v3(stages: dict[str, Any]) -> bool:
+    """Return True when any stage binding carries a v3-only unresolved source."""
+    for stage_obj in stages.values():
+        if not isinstance(stage_obj, dict) or not isinstance(stage_obj.get("bindings"), list):
+            continue
+        for binding in stage_obj["bindings"]:
+            if isinstance(binding, dict) and is_unresolved_source(binding.get("source")):
+                return True
+    return False
+
+
 def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
     """None: not an inline sampler; else whether sdwords is four 32-bit unsigned integers."""
     if "inline_sampler" not in source:
@@ -217,8 +254,9 @@ def inline_sampler_ok(source: dict[str, Any]) -> bool | None:
             all(isinstance(w, int) and not isinstance(w, bool) and 0 <= w <= 0xFFFFFFFF for w in words))
 
 
-def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, str]:
-    """(key, sidecar stage, reason it was skipped)."""
+def convert(entry: dict[str, Any], *, unresolved: bool = False) -> tuple[str | None, dict[str, Any] | None, str]:
+    """(key, sidecar stage, reason it was skipped). With `unresolved`, a read-only binding without a
+    source is kept with {"unresolved": true} instead of skipping the stage."""
     key = entry.get("hash_fnv1a64")
     stage = stage_name(str(entry.get("stage", "")))
     if not key or stage is None:
@@ -227,7 +265,13 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
     for b in entry.get("bindings", []):
         source = b.get("source")
         if not isinstance(source, dict):
-            return key, None, "binding without source"
+            if not unresolved:
+                return key, None, "binding without source"
+            if KIND_MAP.get(str(b.get("kind", ""))) not in UNRESOLVABLE_KINDS:
+                return key, None, "writable binding without source"
+            source = dict(UNRESOLVED_SOURCE)
+        if unresolved_source_ok(source, b.get("kind")) is False:
+            return key, None, "malformed unresolved source"
         if root_descriptor_source_ok(source) is False:
             return key, None, "malformed root_descriptor source"
         if heap_source_ok(source) is False:
@@ -518,7 +562,7 @@ def verify_sidecar_against_pack(
 
 
 def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, Any]:
-    """Load and validate a v1/v2 sidecar JSON file."""
+    """Load and validate a v1/v2/v3 sidecar JSON file."""
     if not path.exists():
         if allow_missing:
             return {}
@@ -562,6 +606,10 @@ def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, A
                         raise ValueError(
                             f"{label} stage {safe_k!r} has malformed v2 root_descriptor source"
                         )
+        for b in bindings:
+            if isinstance(b, dict) and is_unresolved_source(b.get("source")):
+                if version < VERSION_UNRESOLVED or not unresolved_source_ok(b["source"], b.get("kind")):
+                    raise ValueError(f"{label} stage {safe_k!r} has malformed unresolved source")
         if "mesh_output" in v:
             if v.get("stage") != "compute" or not mesh_output_ok(v["mesh_output"]):
                 raise ValueError(f"{label} stage {safe_k!r} has malformed mesh_output")
@@ -603,6 +651,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
     lane_indexed_heap_bindings = 0
     vertex_index_stages = 0
     mesh_output_stages = 0
+    unresolved_stages = 0
+    unresolved_bindings = 0
 
     for stage_obj in stages.values():
         if not isinstance(stage_obj, dict):
@@ -615,6 +665,7 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         has_resource_heap = False
         has_cbv_indexed_heap = False
         has_lane_indexed_heap = False
+        has_unresolved = False
         bindings = stage_obj.get("bindings")
         if isinstance(bindings, list):
             for binding in bindings:
@@ -635,6 +686,9 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
                 if "lane_indexed_resource_heap" in source or "lane_indexed_sampler_heap" in source:
                     lane_indexed_heap_bindings += 1
                     has_lane_indexed_heap = True
+                if "unresolved" in source:
+                    unresolved_bindings += 1
+                    has_unresolved = True
 
         if has_inline_sampler:
             inline_sampler_stages += 1
@@ -644,6 +698,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
             cbv_indexed_heap_stages += 1
         if has_lane_indexed_heap:
             lane_indexed_heap_stages += 1
+        if has_unresolved:
+            unresolved_stages += 1
         if _is_vertex_index_stage(stage_obj):
             vertex_index_stages += 1
         if stage == "compute" and isinstance(stage_obj.get("mesh_output"), dict):
@@ -661,6 +717,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         "lane_indexed_heap_bindings": lane_indexed_heap_bindings,
         "vertex_index_stages": vertex_index_stages,
         "mesh_output_stages": mesh_output_stages,
+        "unresolved_stages": unresolved_stages,
+        "unresolved_bindings": unresolved_bindings,
     }
 
 
@@ -730,17 +788,27 @@ def diff_sidecars(
     }
 
 
-def build(docs: list[Any], existing_stages: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, int]]:
+def build(
+    docs: list[Any],
+    existing_stages: dict[str, Any] | None = None,
+    *,
+    unresolved: bool = False,
+) -> tuple[dict[str, Any], dict[str, int]]:
     stages: dict[str, Any] = dict(existing_stages) if existing_stages else {}
     skipped: dict[str, int] = {}
     for doc in docs:
         for entry in entries_of(doc):
-            key, stage, why = convert(entry)
+            key, stage, why = convert(entry, unresolved=unresolved)
             if stage is None:
                 skipped[why] = skipped.get(why, 0) + 1
                 continue
             stages[key] = stage
-    out_version = MAX_VERSION if _stages_require_v2(stages) else VERSION
+    if _stages_require_v3(stages):
+        out_version = VERSION_UNRESOLVED
+    elif _stages_require_v2(stages):
+        out_version = VERSION_ROOT_TABLE_OFFSET
+    else:
+        out_version = VERSION
     return {"schema": SCHEMA, "version": out_version, "stages": stages}, skipped
 
 
@@ -838,6 +906,12 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="cross-check reflection sidecar hashes against a WGPK v1 .wgsl.pack header/TOC",
     )
+    parser.add_argument(
+        "--unresolved-sources",
+        action="store_true",
+        help="keep stages whose read-only bindings have no source, marking those {\"unresolved\": true} "
+        "(sidecar version 3; the runtime binds the worker's default for them)",
+    )
     parser.add_argument("--json", action="store_true", help="print the counts as JSON")
     args = parser.parse_args(argv)
 
@@ -882,7 +956,11 @@ def main(argv: list[str] | None = None) -> int:
             with path.open(encoding="utf-8-sig") as f:
                 docs.append(json.load(f))
 
-        sidecar, skipped = build(docs, existing_stages=existing_stages if args.merge_existing is not None else None)
+        sidecar, skipped = build(
+            docs,
+            existing_stages=existing_stages if args.merge_existing is not None else None,
+            unresolved=args.unresolved_sources,
+        )
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps(sidecar, indent=1) + "\n", encoding="utf-8")
 

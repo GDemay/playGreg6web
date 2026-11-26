@@ -3462,6 +3462,7 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
                 count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
                 count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
                 count_work(Work::ReflectionVertexInputsDefaulted, join_stats.vertex_inputs_defaulted);
+                count_work(Work::ReflectionUnresolvedBindings, join_stats.unresolved_bindings);
             }
         }
         if (!ok) {
@@ -3833,6 +3834,7 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                     reflected = true;
                     count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
                     count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
+                    count_work(Work::ReflectionUnresolvedBindings, join_stats.unresolved_bindings);
                 } else {
                     const uint64_t rs_hash = rs ? rs->signature().hash() : 0;
                     std::lock_guard<std::mutex> lock(pack_mutex_);
