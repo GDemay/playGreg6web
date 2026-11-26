@@ -2837,6 +2837,30 @@ void test_frame_pacer_unit() {
     CHECK(pacer.wait_after(pacer.current_frame() + 100, 0xFFFFFFFFu, &frame) == dg::xbox::FramePacer::WaitResult::Shutdown);
 }
 
+void test_frame_pacer_events() {
+    using WR = dg::xbox::FramePacer::WaitResult;
+    dg::xbox::FramePacer pacer;
+    pacer.set_interval(20000, 1);
+    uint64_t a = 0, b = 0;
+    // Two waits of the same kind never end on one tick.
+    CHECK(pacer.wait_event(1, 1000, &a) == WR::Ok);
+    CHECK(pacer.wait_event(1, 1000, &b) == WR::Ok && b > a);
+    // A different kind has its own memory.
+    uint64_t c = 0;
+    CHECK(pacer.wait_event(2, 1000, &c) == WR::Ok && c >= b);
+    // A late wait (more than one tick behind) returns at once on the overdue tick.
+    std::this_thread::sleep_for(std::chrono::milliseconds(70));
+    const auto t0 = std::chrono::steady_clock::now();
+    uint64_t late = 0;
+    CHECK(pacer.wait_event(1, 1000, &late) == WR::Ok && late == b + 1);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(10));
+    // A timeout shorter than the tick times out.
+    pacer.set_interval(100000, 1);
+    uint64_t t = 0;
+    CHECK(pacer.wait_event(3, 1000, &t) == WR::Ok);
+    CHECK(pacer.wait_event(3, 1, &t) == WR::Timeout);
+}
+
 // Pipeline-state subobject stream (public layout: pointer-aligned subobjects, u32 type first).
 struct StreamBuilder {
     std::vector<uint8_t> bytes;
@@ -6958,6 +6982,7 @@ int main() {
     test_fence_publish_lag();
     test_ring_reuse_waits_for_the_frame();
     test_frame_pacer_unit();
+    test_frame_pacer_events();
     test_xbox_pipeline_streams_and_overrides();
     test_xbox_native_pipelines();
     test_xbox_rect_lists();

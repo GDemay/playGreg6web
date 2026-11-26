@@ -429,10 +429,17 @@ public:
     // limit, which is still bounded by one interval). *frame = the tick reached (current one on
     // timeout or shutdown).
     WaitResult wait_after(uint64_t after, uint32_t timeout_ms, uint64_t* frame);
+    // Frame event of `kind`: remembers the last tick each kind ended on. Ends on the next tick after
+    // both now and that tick, so two waits of a kind never end on one tick; a kind more than one tick
+    // behind ends at once on its overdue tick. Same timeout/result rules as wait_after.
+    WaitResult wait_event(uint32_t kind, uint32_t timeout_ms, uint64_t* frame);
     void shutdown();
     bool is_shut_down() const;
 
 private:
+    static constexpr uint32_t kKinds = 8;
+    WaitResult wait_locked(std::unique_lock<std::mutex>& lock, uint64_t after, uint32_t timeout_ms, uint64_t* frame);
+    uint64_t last_tick_[kKinds] = {};
     uint64_t frame_locked(Clock::time_point now) const;
     Clock::time_point start_of_locked(uint64_t frame) const;
 

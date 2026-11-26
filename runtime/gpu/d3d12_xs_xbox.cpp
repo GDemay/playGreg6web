@@ -483,6 +483,29 @@ uint64_t FramePacer::current_frame() const {
 
 FramePacer::WaitResult FramePacer::wait_after(uint64_t after, uint32_t timeout_ms, uint64_t* frame) {
     std::unique_lock<std::mutex> lock(mutex_);
+    return wait_locked(lock, after, timeout_ms, frame);
+}
+
+FramePacer::WaitResult FramePacer::wait_event(uint32_t kind, uint32_t timeout_ms, uint64_t* frame) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    uint64_t& last = last_tick_[kind % kKinds];
+    const uint64_t current = frame_locked(Clock::now());
+    if (!shutdown_ && last != 0 && current > last + 1) {
+        // More than one tick behind: end at once on the overdue tick.
+        last = last + 1;
+        *frame = last;
+        return WaitResult::Ok;
+    }
+    // Otherwise the next tick after both now and the kind's last tick.
+    const WaitResult r = wait_locked(lock, std::max(current, last), timeout_ms, frame);
+    if (r == WaitResult::Ok) {
+        last = std::max(last, *frame);
+    }
+    return r;
+}
+
+FramePacer::WaitResult FramePacer::wait_locked(std::unique_lock<std::mutex>& lock, uint64_t after,
+                                               uint32_t timeout_ms, uint64_t* frame) {
     const auto start = Clock::now();
     const bool bounded = timeout_ms != kInfinite;
     const auto deadline = start + std::chrono::milliseconds(bounded ? timeout_ms : 0);
@@ -563,6 +586,8 @@ HResult Device::SetFrameIntervalX(uint64_t, uint32_t interval_us, uint32_t perio
     os::log("d3d12_xs: frame interval set to " + std::to_string(interval_us) + " us, period " +
             std::to_string(period));
     pacer_.set_interval(interval_us, period);
+    // The title drives the frame interval: no extra 60 Hz present pacing on top.
+    present_pacer().set_title_driven(true);
     count(xbox::Counter::FrameIntervalChanges);
     return kSOk;
 }
@@ -629,7 +654,7 @@ void Device::stop_frame_event_thread() {
     }
 }
 
-HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, uint32_t, GuestPtr<uint64_t> token) {
+HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, uint32_t flags, GuestPtr<uint64_t> token) {
     if (token.is_null()) {
         note_bad_argument("WaitFrameEventX: null token pointer");
         return kEInvalidArg;
@@ -672,7 +697,10 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
                 }
             }
         }
-        const auto r = pacer_.wait_after(after, timeout_ms, &frame);
+        // A satisfied PRESENT token (after == 0) ends at once; every other wait ends on a tick, once per
+        // tick per event kind (FramePacer::wait_event).
+        const auto r = after == 0 ? pacer_.wait_after(0, timeout_ms, &frame)
+                                  : pacer_.wait_event(type, timeout_ms, &frame);
         g_frame_waits.fetch_add(1, std::memory_order_relaxed);
         g_frame_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                             std::chrono::steady_clock::now() - started)
@@ -681,9 +709,11 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         if (r == xbox::FramePacer::WaitResult::Timeout) {
             g_frame_timeouts.fetch_add(1, std::memory_order_relaxed);
             count(xbox::Counter::FrameWaitTimeouts);
-            const uint64_t out_tok = std::max<uint64_t>(std::max<uint64_t>(frame, 1),
-                                                        last_frame_token_.load(std::memory_order_acquire));
-            token.write(out_tok);
+            // Only the origin wait with flag 2 gets a fresh token on a timeout; other waits leave it.
+            if (type == 0 && (flags & 2) != 0) {
+                token.write(std::max<uint64_t>(std::max<uint64_t>(frame, 1),
+                                               last_frame_token_.load(std::memory_order_acquire)));
+            }
             // A timed-out wait is not a failure: S_FALSE, as a WaitForSingleObject-style timeout
             // (titles trap on a failed HRESULT from this call).
             return kSFalse;
