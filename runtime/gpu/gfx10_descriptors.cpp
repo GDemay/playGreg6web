@@ -60,6 +60,7 @@ constexpr Swizzle kXYZW = {Sel::X, Sel::Y, Sel::Z, Sel::W};
 constexpr Swizzle kXYZ1 = {Sel::X, Sel::Y, Sel::Z, Sel::One};
 constexpr Swizzle kXY01 = {Sel::X, Sel::Y, Sel::Zero, Sel::One};
 constexpr Swizzle kX001 = {Sel::X, Sel::Zero, Sel::Zero, Sel::One};
+constexpr Swizzle kY001 = {Sel::Y, Sel::Zero, Sel::Zero, Sel::One};
 constexpr Swizzle k000X = {Sel::Zero, Sel::Zero, Sel::Zero, Sel::X};
 constexpr Swizzle kZYXW = {Sel::Z, Sel::Y, Sel::X, Sel::W};
 constexpr Swizzle kZYX1 = {Sel::Z, Sel::Y, Sel::X, Sel::One};
@@ -172,6 +173,14 @@ constexpr FormatEntry kFormats[] = {
     {98, 181, kXYZW},  // BC7_UNORM
     {99, 182, kXYZW},  // BC7_UNORM_SRGB
     {97, 181, kXYZW},  // BC7_TYPELESS
+    // Secondary packed depth/stencil GFX10 IMG_FMTs (reverse lookup only; canonical encode entries above
+    // match first in hardware_format()): 142 8_24_UINT, 143 24_8_UNORM, 144 24_8_UINT, 145 X24_8_32_UINT,
+    // 146 X24_8_32_FLOAT.
+    {47, 142, kY001},  // X24_TYPELESS_G8_UINT <- IMG_FMT_8_24_UINT (stencil in Y)
+    {46, 143, kX001},  // R24_UNORM_X8_TYPELESS <- IMG_FMT_24_8_UNORM
+    {47, 144, kX001},  // X24_TYPELESS_G8_UINT <- IMG_FMT_24_8_UINT
+    {22, 145, kY001},  // X32_TYPELESS_G8X24_UINT <- IMG_FMT_X24_8_32_UINT (stencil in Y)
+    {21, 146, kX001},  // R32_FLOAT_X8X24_TYPELESS <- IMG_FMT_X24_8_32_FLOAT
 };
 
 int32_t to_fixed(float v, float lo, float hi, float scale) noexcept {
@@ -359,6 +368,11 @@ SamplerState decode_sampler(const uint32_t in[kSamplerDwords]) noexcept {
     d.border_color_ptr = bits(in[3], 0, 12);
     d.border_color_type = bits(in[3], 30, 2);
     return d;
+}
+
+bool plausible_sampler(const uint32_t w[kSamplerDwords]) noexcept {
+    // Unused dword 3 bits 12..29 must be zero; enumerations in range.
+    return (w[3] & 0x3ffff000u) == 0 && bits(w[0], 9, 3) <= 4 && bits(w[0], 29, 2) <= 2 && bits(w[2], 24, 2) <= 2;
 }
 
 // ---- Formats ----
@@ -567,7 +581,7 @@ d3d12_state::SamplerDesc d3d12_from_sampler(const SamplerState& s) noexcept {
     const bool aniso = s.xy_mag_filter >= 2 || s.xy_min_filter >= 2;
     uint32_t f = 0;
     if (aniso) {
-        f = 0x55u;
+        f = 0x54u | (s.mip_filter == 2 ? 1u : 0u);
     } else {
         f = (s.mip_filter == 2 ? 1u : 0u) | ((s.xy_mag_filter & 1u) << 2) | ((s.xy_min_filter & 1u) << 4);
     }
