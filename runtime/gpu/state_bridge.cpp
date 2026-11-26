@@ -521,7 +521,8 @@ bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, f
     return true;
 }
 
-uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers) noexcept {
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers,
+                        bool streamable) noexcept {
     const auto held = [&](uint32_t mip) {
         for (uint32_t slice = 0; slice < layers; ++slice) {
             const size_t index = mip + size_t{slice} * mips;
@@ -531,7 +532,7 @@ uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mi
         }
         return false;
     };
-    if (mips <= 1u || layers == 0u) {
+    if (!streamable || mips <= 1u || layers == 0u) {
         return 0;
     }
     uint32_t floor = mips;

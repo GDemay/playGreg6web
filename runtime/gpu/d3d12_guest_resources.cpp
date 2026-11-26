@@ -17,6 +17,7 @@
 #include "gpu/gfx10_detile.h"
 #include "os/guest_window.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 #include "os/vmem.h"
 #include "os/surface_blocks.h"
 #include "os/xbox_scarlett.h"
@@ -1115,7 +1116,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             ++out;
         }
         staged.erase(out, staged.end());
-        held_floor = bridge::held_mip_floor(cur.subresource_hashes, mips, layers);
+        held_floor = bridge::held_mip_floor(cur.subresource_hashes, mips, layers, cur.streamable);
     }
     // G66 partly-held mip chains: views of the texture start at its first held level.
     bridge_->set_resident_mip_floor(resource_id, held_floor);
@@ -2083,6 +2084,7 @@ bool Resource::initialize() {
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
                 TrackedTexture tt{};
                 tt.resource_id = id_;
+                tt.streamable = placement_.reserved;
                 tt.gpu_va = gpu_va_;
                 tt.dxgi_format = desc_.Format;
                 tt.width = p.width;
@@ -3184,6 +3186,7 @@ void PipelineState::initialize_guest_payload() {
 }
 
 HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
+    os::win32::HostStallScope stall;  // pipeline/shader builds can block the guest thread
     GuestGraphicsPipelineStateDesc g{};
     if (desc_va == 0 || !com::read_guest(desc_va, g)) {
         note_bad_argument("CreateGraphicsPipelineState: unreadable descriptor");
@@ -3769,6 +3772,7 @@ HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Gu
 }
 
 HResult Device::CreateComputePipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
+    os::win32::HostStallScope stall;  // pipeline/shader builds can block the guest thread
     GuestComputePipelineStateDesc g{};
     if (desc_va == 0 || !com::read_guest(desc_va, g)) {
         note_bad_argument("CreateComputePipelineState: unreadable descriptor");

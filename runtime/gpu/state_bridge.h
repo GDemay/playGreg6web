@@ -122,7 +122,10 @@ bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, f
 // non-zero = that subresource's guest memory was mapped and uploaded): the lowest level from which
 // every smaller level is held in some slice. 0 when the smallest level is not held (nothing
 // streamed, or levels filled on the GPU): such a chain is not clamped.
-uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers) noexcept;
+// Only a streamable (reserved/tiled) resource is clamped: for any other, an all-zero level is a
+// black level the title uploaded, not a level that is not loaded, so the floor is 0.
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers,
+                        bool streamable = true) noexcept;
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
 // layout-manifest.json `bindings` record). `entry.binding` and `join.binding` must match.

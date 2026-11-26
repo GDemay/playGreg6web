@@ -775,6 +775,7 @@ HResult Device::RegisterPagePool_unverified(uint64_t, uint32_t, GuestPtr<uint64_
 }
 
 HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
+    os::win32::HostStallScope stall;  // pipeline builds can block the guest thread
     // Slot 62: (desc, a, b, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (DXIL compute
     // shader). a and b were always 0; other values are recorded and otherwise ignored.
     const uint64_t desc_va = ctx.int_arg(1);

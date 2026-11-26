@@ -1333,6 +1333,7 @@ void test_httpfs_size_cache() {
     const uint64_t kSize = 123457;
     int opens = 0;
     int reads = 0;
+    int slow_read_ms = 0;
     HttpfsMailboxClient client(&mailbox, [&](HttpfsMailbox& mb) {
         if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
             const std::string path(reinterpret_cast<const char*>(mb.payload),
@@ -1345,6 +1346,9 @@ void test_httpfs_size_cache() {
             }
         } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
             ++reads;
+            if (slow_read_ms != 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(slow_read_ms));
+            }
             const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
             std::memset(mb.payload, 0x5A, static_cast<size_t>(n));
             HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
@@ -1383,6 +1387,17 @@ void test_httpfs_size_cache() {
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
     CHECK(GetFileSizeEx(c, &size) && static_cast<uint64_t>(size) == kSize);
     CHECK(reads == 2 * probe_reads);
+
+    // A slow package read counts as a host stall (kept off the guest clocks); a fast one does not.
+    ResetHostStallForTesting();
+    uint8_t buf[16];
+    uint32_t got = 0;
+    CHECK(ReadFile(c, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+    CHECK(TotalHostStallNs() == 0);
+    slow_read_ms = 80;
+    CHECK(ReadFile(c, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+    CHECK(TotalHostStallNs() >= kHostStallThresholdNs);
+    ResetHostStallForTesting();
     CloseHandle(c);
     set_httpfs_client(nullptr);
 }
