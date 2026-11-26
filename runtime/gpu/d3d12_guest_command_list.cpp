@@ -61,6 +61,7 @@ const char* work_name(Work w) {
     case Work::ReadbacksCompleted: return "readbacks_completed";
     case Work::ReadbackSignalsHeld: return "readback_signals_held";
     case Work::ReadbackTimeouts: return "readback_timeouts";
+    case Work::MipClampedBinds: return "mip_clamped_binds";
     case Work::Count: break;
     }
     return "?";
@@ -72,6 +73,7 @@ void count_object_reuse(const bridge::BridgeStats& a, const bridge::BridgeStats&
     count_work(Work::BindGroupCacheMisses, b.bind_group_cache_misses - a.bind_group_cache_misses);
     count_work(Work::BindGroupsCreated, b.bind_groups_created - a.bind_groups_created);
     count_work(Work::PipelinesCreated, b.pipelines_created - a.pipelines_created);
+    count_work(Work::MipClampedBinds, b.mip_clamped_binds - a.mip_clamped_binds);
 }
 
 // Counts the outcome of one recorded draw from the state bridge's statistics: emitted if the

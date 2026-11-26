@@ -1008,6 +1008,10 @@ struct CachedBindGroup {
     uint64_t relocation_epoch = 0;
     // G66 (#691): the bridge's resource retire epoch when the entries were last checked live.
     uint64_t retire_epoch = 0;
+    // G66 partly-held mip chains: the bridge's residency epoch when the entries' mip clamps were
+    // last checked, and a hash of (texture, clamped base mip) over its texture entries.
+    uint64_t residency_epoch = 0;
+    uint64_t residency_key = 0;
     // G70 (#691): bridge-interned view ids backing TextureView entries in this bind group, so
     // retiring a texture's interned views immediately invalidates cached bind groups referencing them.
     std::vector<uint32_t> view_ids;

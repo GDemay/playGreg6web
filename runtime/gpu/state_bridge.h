@@ -105,7 +105,24 @@ struct TextureInfo {
     bool sampled_only = false;
     // Created with STORAGE_BINDING usage (storage views of it are valid).
     bool storage = false;
+    // G66 partly-held mip chains: first mip level from which the chain holds content (the title
+    // streams only the small levels; the larger ones are unmapped or belong to another texture).
+    // Sampled views start no lower than it. 0 = the whole chain is held. Set with
+    // StateBridgeDevice::set_resident_mip_floor, kept when the same description is registered again.
+    uint32_t resident_mip_floor = 0;
 };
+
+// The sampled-view mip range clamped to the held levels: `base` / `count` (count 0 = all remaining
+// levels) of a view of a texture with `mip_levels` levels, raised so the view starts no lower than
+// max(resident_floor, floor(min_lod_clamp)) (D3D12 ResourceMinLODClamp counts from the resource's
+// level 0). At least the view's (or the chain's) last level stays. Returns true when it raised base.
+bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, float min_lod_clamp, uint16_t* base,
+                                 uint16_t* count) noexcept;
+// The first held level of a mip chain from per-subresource upload marks (index mip + slice * mips;
+// non-zero = that subresource's guest memory was mapped and uploaded): the lowest level from which
+// every smaller level is held in some slice. 0 when the smallest level is not held (nothing
+// streamed, or levels filled on the GPU): such a chain is not clamped.
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers) noexcept;
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
 // layout-manifest.json `bindings` record). `entry.binding` and `join.binding` must match.
@@ -353,6 +370,13 @@ public:
     bool texture_info(uint32_t resource_id, TextureInfo* out) const;
     // The texture whose descriptor address (TextureInfo::gpu_va) is exactly `gpu_va` (0 if none).
     uint32_t texture_at(uint64_t gpu_va) const;
+    // G66 partly-held mip chains: records the first held mip level of texture `resource_id` (from the
+    // title's uploads / mappings: the levels whose memory holds content). Sampled views bound after
+    // this start there; cached bind groups over the texture are re-created when it changes.
+    // Returns false for an unknown texture.
+    bool set_resident_mip_floor(uint32_t resource_id, uint32_t first_resident_mip);
+    // Bumped whenever a texture's resident mip floor changes.
+    uint64_t residency_epoch() const noexcept { return residency_epoch_.load(std::memory_order_acquire); }
     // G66 (#691): ids of textures / buffers unregistered since they were registered (destroyed by the
     // device: guest Release, address-texture LRU, relocation teardown). A bind group built while
     // such a resource lived still names it: a cached hit must not bind it again, as WebGPU then
@@ -492,6 +516,7 @@ private:
     std::unordered_map<uint64_t, uint32_t> textures_by_va_;             // descriptor address -> id
     std::unordered_set<uint32_t> retired_resources_;  // see retired(); an id registered again leaves it
     std::atomic<uint64_t> retire_epoch_{0};
+    std::atomic<uint64_t> residency_epoch_{0};
     std::unordered_map<uint64_t, uint32_t> shader_modules_;
 
     mutable std::mutex views_mutex_;
@@ -652,6 +677,11 @@ struct BridgeStats {
     // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
     uint64_t mesh_dispatches = 0;
     uint64_t mesh_skipped = 0;
+    // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
+    // to the texture's first held level or the view's min-LOD clamp, and cached bind groups
+    // re-created because a bound texture's held levels changed.
+    uint64_t mip_clamped_binds = 0;
+    uint64_t bind_groups_residency_changed = 0;
 };
 
 class CommandListBridge {
@@ -794,6 +824,10 @@ private:
     bool relocations_moved(d3d::CachedBindGroup* cached);
     // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
     bool binds_retired(d3d::CachedBindGroup* cached) const;
+    // G66 partly-held mip chains: hash of (texture, clamped base mip) over a group's texture entries,
+    // and whether a cached group's clamps changed since it was emitted (the residency epoch moved).
+    uint64_t residency_key(const d3d::CachedBindGroup& cached) const;
+    bool residency_changed(d3d::CachedBindGroup* cached) const;
     // Relocations and interned views the last gpu_entries call made.
     std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
     std::vector<uint32_t> pending_view_ids_;
