@@ -95,7 +95,7 @@ int main(int argc, char** argv) {
     std::stringstream ss;
     ss << f.rdbuf();
     std::string text = ss.str();
-    text.erase(std::remove(text.begin(), text.end(), ''), text.end());  // checkout may use CRLF
+    text.erase(std::remove(text.begin(), text.end(), '\x0d'), text.end());  // checkout may use CRLF
     if (text != render()) fail("tests/data/bvh_vectors.json is stale: run test_rt_vectors_json --write tests/data/bvh_vectors.json");
 
     js::Value root;
