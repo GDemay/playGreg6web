@@ -724,12 +724,26 @@ impl FunctionLifter<'_> {
                 "register {reg:?} (only 16 vector registers exist without EVEX)"
             ));
         }
-        let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
         if half == 1 && !self.simd.ymmh[idx] {
+            let bit = 1u16 << idx;
+            if v == "zeroinitializer" {
+                if self.ymmh_zeroed & bit != 0 {
+                    return Ok(());
+                }
+                self.ymmh_zeroed |= bit;
+                let ptr = self.state_vec_ptr(6, idx);
+                self.emit(&format!(
+                    "store {XMM_TYPE} zeroinitializer, ptr {ptr}, align 8"
+                ));
+                return Ok(());
+            }
+            self.ymmh_zeroed &= !bit;
+            let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
             let ptr = self.state_vec_ptr(6, idx);
             self.emit(&format!("store {XMM_TYPE} {raw}, ptr {ptr}, align 8"));
             return Ok(());
         }
+        let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
         let slot = self.slot(reg, half)?;
         self.emit(&format!("store {XMM_TYPE} {raw}, ptr {slot}"));
         Ok(())
@@ -743,11 +757,20 @@ impl FunctionLifter<'_> {
     fn zero_all_ymmh(&mut self) -> R<()> {
         let local_count = self.simd.ymmh.iter().filter(|&&used| used).count();
         if local_count <= 13 {
-            self.support.insert(Support::Memset);
-            let ptr = self.state_vec_ptr(6, 0);
-            self.emit(&format!(
-                "call void @llvm.memset.p0.i64(ptr align 8 {ptr}, i8 0, i64 256, i1 false)"
-            ));
+            let mut unread_mask = 0u16;
+            for idx in 0..16 {
+                if !self.simd.ymmh[idx] {
+                    unread_mask |= 1u16 << idx;
+                }
+            }
+            if (self.ymmh_zeroed & unread_mask) != unread_mask {
+                self.support.insert(Support::Memset);
+                let ptr = self.state_vec_ptr(6, 0);
+                self.emit(&format!(
+                    "call void @llvm.memset.p0.i64(ptr align 8 {ptr}, i8 0, i64 256, i1 false)"
+                ));
+                self.ymmh_zeroed |= unread_mask;
+            }
             for idx in 0..16u32 {
                 if self.simd.ymmh[idx as usize] {
                     self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
