@@ -218,6 +218,7 @@
 #include <functional>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -250,6 +251,76 @@ struct GuestPresentPlaneX {  // queue slot 32 plane (0x48 bytes)
 };
 static_assert(sizeof(GuestPresentPlaneX) == 0x48 && offsetof(GuestPresentPlaneX, ppResources) == 0x10 &&
               offsetof(GuestPresentPlaneX, ColorSpace) == 0x28);
+
+// Standard DXGI_COLOR_SPACE_TYPE values passed in GuestPresentPlaneX::ColorSpace.
+enum class PresentColorSpace : uint32_t {
+    RgbFullG22NoneP709 = 0,     // Standard SDR sRGB / Rec.709 full range [0..255]
+    RgbFullG10NoneP709 = 1,     // Linear Rec.709 / scRGB full range (typically FP16)
+    RgbStudioG22NoneP709 = 2,   // SDR Rec.709 studio range [16..235]
+    RgbStudioG22NoneP2020 = 3,  // Rec.2020 G22 studio range
+    RgbFullG2084NoneP2020 = 12, // HDR10 ST.2084 PQ + Rec.2020 full range
+    RgbStudioG2084NoneP2020 = 14, // HDR10 ST.2084 PQ + Rec.2020 studio range
+    RgbFullG22NoneP2020 = 17,   // Rec.2020 G22 full range
+};
+
+// Transfer-function / gamut conversion applied when blitting a PresentX plane onto a direct
+// non-sRGB SDR WebGPU canvas (bgra8unorm / rgba8unorm).
+enum class PresentTransferMode : uint8_t {
+    PassthroughSrgb = 0,       // Raw sRGB bytes -> direct non-sRGB SDR canvas
+    LinearSdrToSrgb = 1,       // Linear Rec.709 [0, 1] -> IEC 61966-2-1 sRGB OETF
+    LinearHdrToSrgb = 2,       // scRGB FP16 / R11G11B10F -> soft-knee roll-off + sRGB OETF
+    Hdr10PqToSrgb = 3,         // ST.2084 PQ -> Rec.2020->Rec.709 -> soft-knee + sRGB OETF
+    Hdr10StudioPqToSrgb = 4,   // Studio expand + ST.2084 PQ -> Rec.2020->Rec.709 -> sRGB OETF
+    StudioSdrToSrgb = 5,       // Studio [16..235] expand -> full-range sRGB
+    Rec2020G22ToSrgb = 6,      // G22 EOTF -> Rec.2020->Rec.709 -> sRGB OETF
+    Rec2020StudioG22ToSrgb = 7,// Studio expand -> G22 EOTF -> Rec.2020->Rec.709 -> sRGB OETF
+    Count = 8,
+};
+
+struct PresentRect {
+    int32_t left = 0;
+    int32_t top = 0;
+    int32_t right = 0;
+    int32_t bottom = 0;
+};
+static_assert(sizeof(PresentRect) == 16);
+
+struct PresentPlaneColorPlan {
+    uint8_t canvas_format = 0;       // Direct non-sRGB WebGPU canvas format (Bgra8Unorm / Rgba8Unorm, or 0)
+    uint8_t sample_view_format = 0;  // Linear sibling for *_UNORM_SRGB (0 = texture's native format)
+    PresentTransferMode transfer = PresentTransferMode::PassthroughSrgb;
+    bool opaque_alpha = false;       // Force alpha = 1.0 (e.g. B8G8R8X8_* with undefined X channel)
+    bool needs_color_compositor = false;
+};
+
+// Classifies a PresentX plane's DXGI format and ColorSpace into a direct non-sRGB SDR canvas
+// composition plan (avoiding WebGPU/Dawn -srgb blit-fallback gamma crush and handling HDR10/scRGB).
+PresentPlaneColorPlan classify_present_plane_color(uint32_t dxgi_format, uint32_t raw_color_space,
+                                                   bool has_sub_rect = false, bool is_overlay_plane = false);
+
+// Per-device cache of color-managed PresentX blit objects (owned by FramePacer so its lifetime
+// matches Device without changing Device's header layout).
+struct PresentColorBlitCache {
+    struct CachedBindGroup {
+        uint32_t group_id = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t dxgi_format = 0;
+    };
+    mutable std::mutex mutex;
+    uint32_t vs = 0;
+    uint32_t vs_rect = 0;
+    uint32_t group_layout = 0;
+    uint32_t pipeline_layout = 0;
+    uint32_t rect_group_layout = 0;
+    uint32_t rect_pipeline_layout = 0;
+    uint32_t sampler = 0;
+    uint32_t rect_uniform_buf = 0;
+    std::array<uint32_t, static_cast<size_t>(PresentTransferMode::Count) * 2> fs{};
+    std::unordered_map<uint32_t, uint32_t> pipelines;       // key -> pipeline id
+    std::unordered_map<uint64_t, CachedBindGroup> groups;   // (texture_id << 8 | view_fmt) -> bind group
+    bool logged_color_profile = false;
+};
 
 struct GuestPipelineStateStreamDesc {  // D3D12_PIPELINE_STATE_STREAM_DESC
     uint64_t SizeInBytes;
@@ -447,8 +518,21 @@ public:
     void shutdown();
     bool is_shut_down() const;
 
+    // Token lifecycle & self-wait protection (prevents WaitFrameEventX type 2 2.0 FPS / 500 ms stalls):
+    // - Only tokens minted by ORIGIN waits (type 0) are eligible to block wait_present_token.
+    // - Tracks the thread that calls PresentX so same-thread PRESENT waits never self-stall 500 ms.
+    // - Applies adaptive backoff on consecutive unpresented cross-thread waits.
+    void record_origin_token(uint64_t token);
+    bool is_recent_origin_token(uint64_t token) const;
+    void note_present_thread(std::thread::id id);
+    bool is_present_thread(std::thread::id id) const;
+    uint32_t present_wait_cap_ms(uint32_t max_cap_ms) const;
+    void note_present_wait_result(bool satisfied);
+    PresentColorBlitCache& present_color_cache() { return present_color_cache_; }
+
 private:
     static constexpr uint32_t kKinds = 8;
+    static constexpr size_t kRecentOriginTokens = 64;
     WaitResult wait_locked(std::unique_lock<std::mutex>& lock, uint64_t after, uint32_t timeout_ms, uint64_t* frame);
     uint64_t last_tick_[kKinds] = {};
     uint64_t frame_locked(Clock::time_point now) const;
@@ -461,6 +545,12 @@ private:
     uint32_t interval_us_ = kDefaultIntervalUs;
     uint32_t period_ = 1;
     bool shutdown_ = false;
+    std::array<uint64_t, kRecentOriginTokens> origin_tokens_{};
+    size_t origin_token_cursor_ = 0;
+    bool has_present_thread_ = false;
+    std::thread::id present_thread_{};
+    uint32_t consecutive_unpresented_waits_ = 0;
+    PresentColorBlitCache present_color_cache_;
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -738,6 +828,10 @@ enum class Counter : size_t {
     // G84 Xbox 3D hardening counters:
     MultiPlanePresents,      // PresentX calls with plane_count > 1
     IndirectZeroCount,       // ExecuteIndirect calls with max_count == 0 (clean no-op)
+    // WaitFrameEventX 2.0 FPS stall elimination & PresentX color-space fidelity counters:
+    PresentWaitsSelfThread,       // PRESENT waits bypassed on the PresentX thread (avoided 500 ms self-stall)
+    PresentWaitsNonOriginToken,   // PRESENT waits bypassed for non-ORIGIN / stale tokens
+    PresentColorManagedPresents,  // PresentX calls composed via the color-space-accurate SDR/HDR pass
     Count
 };
 
