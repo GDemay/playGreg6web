@@ -190,7 +190,7 @@ struct Options {
     uint64_t gpu_capture_start_ms = 0;    // --gpu-capture-start-ms: late start (0 = from boot)
     bool gpu_capture_start_at_script = false;  // --gpu-capture-start-at-script
     bool native_pipelines = false;  // d3d12 DeviceOptions::refuse_native_pipelines = false
-    bool no_fence_lag = false;      // d3d12 DeviceOptions::fence_publish_lag = false
+    bool fence_lag = false;         // d3d12 DeviceOptions::fence_publish_lag = true (#663)
     bool eager_gpu_objects = false; // d3d12 DeviceOptions::defer_gpu_objects = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
@@ -223,7 +223,7 @@ void usage() {
                  "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
-                 "                     [--native-pipelines] [--no-fence-lag] [--eager-gpu-objects]\n"
+                 "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
                  "                     [--dump-pipelines <dir under work/>]\n"
                  "                     [--shader-pack <file.wgsl.pack>] [--input-script <file>] [--host-input]\n"
                  "                     [--wgpu-features <mask>] [--audio-dump <file.wav>]\n"
@@ -265,8 +265,10 @@ bool parse(int argc, char** argv, Options& o) {
             o.gpu_capture_payloads = true;
         } else if (a == "--gpu-capture-start-at-script") {
             o.gpu_capture_start_at_script = true;
+        } else if (a == "--fence-lag") {
+            o.fence_lag = true;
         } else if (a == "--no-fence-lag") {
-            o.no_fence_lag = true;
+            o.fence_lag = false;  // the default since #663; kept for old command lines
         } else if (a == "--eager-gpu-objects") {
             o.eager_gpu_objects = true;
         } else if (a == "--host-input") {
@@ -934,6 +936,7 @@ void run_boot_thread() {
     cfg.max_dispatches = g_options.max_calls;
     cfg.max_wall_ms = g_options.max_ms;
     cfg.present_pacing = g_options.present_pacing;
+    cfg.fence_publish_lag = g_options.fence_lag;  // run_boot applies it to the device options
     cfg.run_tls_callbacks = g_options.tls_callbacks;
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;
@@ -1039,7 +1042,7 @@ int main(int argc, char** argv) {
     {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;
-        device_options.fence_publish_lag = !g_options.no_fence_lag;
+        device_options.fence_publish_lag = g_options.fence_lag;
         device_options.defer_gpu_objects = !g_options.eager_gpu_objects;
         // The features of the WebGPU device that replays the run (by default the browser player's):
         // without them BC and 16-bit normalized textures get substitute formats and their guest

@@ -1711,16 +1711,19 @@ void test_boot_options_and_report_sink() {
     CHECK(apply_boot_options_json("{\"report_to_log\": false, \"max_wall_ms\": \"x\"}", cfg));
     CHECK(!cfg.report_sink && cfg.max_wall_ms == 300000);
 
-    // O36: runtime switches default on; each key flips only its own field.
+    // O36: runtime switches default on (the fence publish lag off, #663); each key flips only its own field.
     {
         BootConfig d;
         CHECK(apply_boot_options_json("{}", d));
+        CHECK(!d.fence_publish_lag);
+        CHECK(apply_boot_options_json("{\"fence_publish_lag\": true}", d) && d.fence_publish_lag);
         CHECK(d.fence_publish_lag && d.defer_gpu_objects && d.xmem_shared_pages && d.present_frame_waits &&
               d.audio_endpoint);
         const char* keys[] = {"fence_publish_lag", "defer_gpu_objects", "xmem_shared_pages",
                               "present_frame_waits", "audio_endpoint"};
         for (int i = 0; i < 5; ++i) {
             BootConfig c;
+            c.fence_publish_lag = true;  // every switch on, so each key flips exactly one off
             CHECK(apply_boot_options_json(std::string("{\"") + keys[i] + "\": false}", c));
             const bool v[] = {c.fence_publish_lag, c.defer_gpu_objects, c.xmem_shared_pages,
                               c.present_frame_waits, c.audio_endpoint};
@@ -1785,7 +1788,7 @@ void test_fence_lag_and_present_max_interval() {
     // 1. Defaults match G69 (#1508) and console-faithful pacing (0 = no clamp).
     {
         BootConfig cfg;
-        CHECK(cfg.fence_publish_lag);
+        CHECK(!cfg.fence_publish_lag);  // R40 (#663): queue fences publish at issue
         CHECK(cfg.fence_publish_lag_frames == 1u);
         CHECK(cfg.fence_publish_cap_ms == 33u);
         CHECK(cfg.present_max_interval == 0u);
@@ -1797,7 +1800,7 @@ void test_fence_lag_and_present_max_interval() {
         CHECK(apply_boot_options_json(
             "{\"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 50, \"present_max_interval\": 1}",
             cfg));
-        CHECK(cfg.fence_publish_lag);
+        CHECK(!cfg.fence_publish_lag);
         CHECK(cfg.fence_publish_lag_frames == 2u);
         CHECK(cfg.fence_publish_cap_ms == 50u);
         CHECK(cfg.present_max_interval == 1u);
@@ -1856,7 +1859,8 @@ void test_fence_lag_and_present_max_interval() {
         gpu::d3d12_xs_exports::reset_for_tests();
         const Run r1 = boot_scenario(Scenario::ReturnCode, [](BootConfig& c) {
             CHECK(apply_boot_options_json(
-                "{\"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 66, \"present_max_interval\": 1}",
+                "{\"fence_publish_lag\": true, \"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 66, "
+                "\"present_max_interval\": 1}",
                 c));
         });
         CHECK(r1.result.status == BootStatus::Exited);
@@ -1893,7 +1897,7 @@ void test_fence_lag_and_present_max_interval() {
         const Run r3 = boot_scenario(Scenario::ReturnCode);
         CHECK(r3.result.status == BootStatus::Exited);
         const gpu::d3d12_guest::DeviceOptions opts3 = gpu::d3d12_xs_exports::device_options();
-        CHECK(opts3.fence_publish_lag);
+        CHECK(!opts3.fence_publish_lag);
         CHECK(opts3.fence_publish_lag_frames == 1u);
         CHECK(opts3.fence_publish_cap_ms == 33u);
         CHECK(gpu::d3d12_guest::xbox::present_max_interval() == 0u);

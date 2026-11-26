@@ -50,7 +50,7 @@ unless noted; they mirror the `playgta6_boot` harness flags, so a regression can
 |---|---|---|
 | `present_pacing` | true | presents do not wait for the 60 Hz vblank (`--no-present-pacing`) |
 | `verify_window_marks` | false | true: readers also compare unmarked window slots |
-| `fence_publish_lag` | true | fences complete at once instead of at the next present (`--no-fence-lag`) |
+| `fence_publish_lag` | false | true: fences complete at the next present instead of at once (`--fence-lag`) |
 | `defer_gpu_objects` | true | GPU objects are written at creation, not on first use (`--eager-gpu-objects`) |
 | `xmem_shared_pages` | true | XMem pages mapped at several addresses get per-address copies (`--no-xmem-shared-pages`) |
 | `present_frame_waits` | true | `WaitFrameEventX(PRESENT, token)` takes the pacer tick instead of waiting for the token's present |

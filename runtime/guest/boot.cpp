@@ -3014,16 +3014,16 @@ BootResult run_boot(const BootConfig& config) {
     gpu::texture_budget().set_base_cap(config.texture_size_cap);
     gpu::d3d12_state::set_bind_group_slot_budget(config.bind_group_slot_budget);
     gpu::d3d12_guest::xbox::set_present_max_interval(config.present_max_interval);
-    // Only a switched-off bool option disables a harness setting; lag tuning fields are wired
-    // through from BootConfig (defaults match DeviceOptions: 1 frame, 33 ms).
+    // A switched-off defer_gpu_objects disables the harness setting; the fence publish lag (off by
+    // default since #663) and its tuning fields are wired through from BootConfig.
     {
         gpu::d3d12_guest::DeviceOptions device_options = gpu::d3d12_xs_exports::device_options();
-        const bool lag_changed = !config.fence_publish_lag && device_options.fence_publish_lag;
+        const bool lag_changed = config.fence_publish_lag != device_options.fence_publish_lag;
         const bool defer_changed = !config.defer_gpu_objects && device_options.defer_gpu_objects;
         const bool lag_frames_changed = device_options.fence_publish_lag_frames != config.fence_publish_lag_frames;
         const bool lag_cap_changed = device_options.fence_publish_cap_ms != config.fence_publish_cap_ms;
         if (lag_changed || defer_changed || lag_frames_changed || lag_cap_changed) {
-            device_options.fence_publish_lag = device_options.fence_publish_lag && config.fence_publish_lag;
+            device_options.fence_publish_lag = config.fence_publish_lag;
             device_options.defer_gpu_objects = device_options.defer_gpu_objects && config.defer_gpu_objects;
             device_options.fence_publish_lag_frames = config.fence_publish_lag_frames;
             device_options.fence_publish_cap_ms = config.fence_publish_cap_ms;
