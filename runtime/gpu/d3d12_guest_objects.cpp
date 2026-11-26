@@ -429,6 +429,7 @@ Device::~Device() {
     flush_pipeline_dump();
     os::xmem_windows::remove_alias_listener(alias_listener_);
     pacer_.shutdown();
+    stop_frame_event_thread();
 }
 
 void Device::initialize_guest_payload() {

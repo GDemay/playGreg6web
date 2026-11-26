@@ -766,6 +766,7 @@ public:
     // Wakes every WaitFrameEventX and makes later ones return at once (shutdown, tests).
     void shutdown_frame_events() {
         pacer_.shutdown();
+        stop_frame_event_thread();
         {
             std::lock_guard<std::mutex> lock(present_mutex_);
             present_shutdown_ = true;
@@ -1244,6 +1245,19 @@ private:
     bool lag_stop_ = false;
     std::thread lag_publisher_;  // publishes capped values while no present comes
     xbox::FramePacer pacer_;
+    // ScheduleFrameEventX with an event handle: signalled at every pacer tick, `offset_us` into it
+    // (one entry per event type; scheduling a type again replaces it).
+    struct ScheduledFrameEvent {
+        uint32_t offset_us = 0;
+        uint64_t handle = 0;
+    };
+    std::mutex frame_event_mutex_;
+    std::condition_variable frame_event_cv_;
+    std::map<uint32_t, ScheduledFrameEvent> frame_events_;
+    bool frame_event_stop_ = false;
+    std::thread frame_event_thread_;
+    void run_frame_events();
+    void stop_frame_event_thread();
     std::atomic<uint64_t> xbox_counters_[static_cast<size_t>(xbox::Counter::Count)] = {};
     std::atomic<uint64_t> last_frame_token_{0};
     struct AliasWindow {
