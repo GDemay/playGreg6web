@@ -8,12 +8,15 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const shaderFallbackMod = require('../web/workers/shader_fallback_router.js');
+const asyncPipelineCacheMod = require('../web/workers/async_pipeline_cache.js');
+const reflectionLoaderMod = require('../web/workers/reflection_loader.js');
 const {
   DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
   DEFAULT_COMPILE_BUDGET_MS,
   DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
   PIPELINE_PRIORITY_TIERS,
   PIPELINE_PRIORITY_RANKS,
+  PIPELINE_FAILURE_REASON,
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_MAX_QUARANTINED_KEYS,
   DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
@@ -39,9 +42,12 @@ const {
   buildFallbackBindGroupLayoutDescriptor,
   normalizeRenderPipelineDescriptor,
   sanitizePipelineErrorMessage,
+  classifyQuarantineReason,
   WebGpuPipelineCache,
 } = pipelineCacheMod;
 const { ShaderFallbackRouter } = shaderFallbackMod;
+const { AsyncPipelineCache, PIPELINE_PRIORITY_TIER } = asyncPipelineCacheMod;
+const { parseStageReflectionSidecar } = reflectionLoaderMod;
 
 function createDeferred() {
   let resolve;
@@ -4357,4 +4363,227 @@ test('W334 validates options, preserves JSON serializability, backward compatibi
     typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.getCompileLatencyStats,
     'function'
   );
+});
+
+// --- W379: Quarantine Reason Breakdown, Drawn-First Forwarding & Reflection v3 Integration ---
+
+test('W379 tracks sanitized quarantine reason breakdown, skips device_lost, supports single-key clearQuarantine, and preserves LRU bounds', async () => {
+  assert.equal(classifyQuarantineReason(new Error('WGSL parse failure in C:\\Users\\bob\\s.wgsl')), PIPELINE_FAILURE_REASON.WGSL_COMPILE);
+  assert.equal(classifyQuarantineReason(new Error('bind group layout mismatch')), PIPELINE_FAILURE_REASON.LAYOUT_MISMATCH);
+  assert.equal(classifyQuarantineReason(new Error('GPUDevice was lost')), PIPELINE_FAILURE_REASON.DEVICE_LOST);
+
+  let mode = 'wgsl';
+  let renderCalls = 0;
+  const device = createMockGpuDevice({
+    renderSyncImpl: () => {
+      renderCalls += 1;
+      if (mode === 'wgsl') throw new Error('Tint WGSL compile failed at /home/user/shader.wgsl');
+      if (mode === 'layout') throw new Error('pipeline layout mismatch at group 0');
+      if (mode === 'lost') throw Object.assign(new Error('GPUDevice was lost'), { name: 'GPUDeviceLostError' });
+      if (mode === 'null') return null;
+      return { kind: 'GPURenderPipeline', ok: true };
+    },
+  });
+
+  const cache = new WebGpuPipelineCache({ device, maxQuarantinedKeys: 2 });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000003791', code: 'vs' });
+  const dWgsl = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_wgsl' } };
+  const dLayout = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_layout' } };
+  const dLost = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_lost' } };
+  const dNull = { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_null' } };
+
+  assert.throws(() => cache.getOrCreateRenderPipeline(dWgsl), /WGSL/);
+  mode = 'layout';
+  assert.throws(() => cache.getOrCreateRenderPipeline(dLayout), /layout/);
+  mode = 'lost';
+  assert.throws(() => cache.getOrCreateRenderPipeline(dLost), /lost/);
+
+  assert.equal(cache.isQuarantined(dWgsl), true);
+  assert.equal(cache.isQuarantined(dLayout), true);
+  assert.equal(cache.isQuarantined(dLost), false, 'device_lost is not quarantined');
+
+  // Hit dWgsl so it becomes MRU before adding dNull (evicting dLayout at maxQuarantinedKeys=2).
+  assert.equal(cache.getOrCreateRenderPipeline(dWgsl), null);
+  assert.equal(renderCalls, 3);
+
+  mode = 'null';
+  assert.equal(cache.getOrCreateRenderPipeline(dNull), null);
+  assert.equal(cache.isQuarantined(dLayout), false, 'LRU quarantined entry evicted');
+  assert.equal(cache.isQuarantined(dWgsl), true);
+  assert.equal(cache.isQuarantined(dNull), true);
+
+  const summary = cache.getQuarantineSummary();
+  assert.equal(summary.totalQuarantined, 2);
+  assert.equal(summary.quarantineHits, 1);
+  assert.equal(summary.evictions, 1);
+  assert.equal(summary.byReason.wgsl_compile, 1);
+  assert.equal(summary.byReason.null_pipeline, 1);
+  assert.equal(summary.byReason.layout_mismatch, 0);
+  assert.equal(summary.hitsByReason.wgsl_compile, 1);
+  assert.equal(summary.failuresByReason.device_lost, 1);
+  assert.doesNotMatch(JSON.stringify(summary), /\/home\/user|shader\.wgsl/);
+
+  // Non-enumerable stats.quarantinedByReason matches summary while keeping JSON stats clean.
+  const stats = cache.getStats();
+  assert.deepEqual(stats.quarantinedByReason, summary.byReason);
+
+  // Single-key clearQuarantine removes only the requested descriptor.
+  assert.equal(cache.clearQuarantine(dWgsl), 1);
+  assert.equal(cache.isQuarantined(dWgsl), false);
+  assert.equal(cache.isQuarantined(dNull), true);
+
+  mode = 'ok';
+  const recovered = cache.getOrCreateRenderPipeline(dWgsl);
+  assert.equal(recovered.ok, true);
+});
+
+test('W379 forwards drawn-first priority promotions to paired AsyncPipelineCache and live prewarm queues', async () => {
+  const asyncCalls = [];
+  const asyncDevice = {
+    createRenderPipelineAsync(desc) {
+      let resolve;
+      const promise = new Promise((r) => {
+        resolve = r;
+      });
+      asyncCalls.push({ desc, resolve });
+      return promise;
+    },
+    createComputePipelineAsync(desc) {
+      return Promise.resolve({ kind: 'GPUComputePipeline', label: desc?.label });
+    },
+  };
+  const asyncCache = new AsyncPipelineCache({ device: asyncDevice, maxConcurrentCompiles: 1 });
+
+  // Occupy single async slot, queue 2 background compiles.
+  const a0 = asyncCache.prewarm('slot_0', { label: 'slot_0' }, { priority: PIPELINE_PRIORITY_TIER.BACKGROUND });
+  const a1 = asyncCache.prewarm('bg_a', { label: 'bg_a' }, { canonicalKey: 'pso-bg-a', priority: PIPELINE_PRIORITY_TIER.BACKGROUND });
+  const a2 = asyncCache.prewarm('bg_b', { label: 'bg_b' }, { canonicalKey: 'pso-bg-b', priority: PIPELINE_PRIORITY_TIER.BACKGROUND });
+
+  const deferreds = [];
+  const prewarmOrder = [];
+  const syncDevice = createMockGpuDevice({
+    renderAsyncImpl: (desc) => {
+      prewarmOrder.push(desc.label);
+      const d = createDeferred();
+      deferreds.push({ label: desc.label, d });
+      return d.promise;
+    },
+  });
+  const cache = new WebGpuPipelineCache({ device: syncDevice, asyncPipelineCache: asyncCache });
+
+  // Promoting 'pso-bg-b' via WebGpuPipelineCache forwards directly to AsyncPipelineCache!
+  assert.equal(cache.promoteOnDraw('pso-bg-b', 'render'), true);
+  assert.equal(asyncCache.getTelemetry().queuedByPriority.critical, 1);
+
+  // Finish asyncCache compiles and verify bg_b preempted bg_a.
+  for (let i = 0; i < 3; i += 1) {
+    asyncCalls[i].resolve({ kind: 'GPURenderPipeline', label: asyncCalls[i].desc.label });
+    await new Promise((r) => setImmediate(r));
+  }
+  await Promise.all([a0, a1, a2]);
+  assert.deepEqual(asyncCalls.map((c) => c.desc.label), ['slot_0', 'bg_b', 'bg_a']);
+
+  // Also test live drawn-first preemption inside prewarmRenderPipelines(concurrency=1)!
+  const vs = syncDevice.createShaderModule({ label: 'wgpk:vertex:0x0000000000003792', code: 'vs' });
+  const d0 = { label: 'pw_0', layout: 'auto', vertex: { module: vs, entryPoint: 'vs0' } };
+  const d1 = { label: 'pw_1', layout: 'auto', vertex: { module: vs, entryPoint: 'vs1' } };
+  const d2 = { label: 'pw_2', layout: 'auto', vertex: { module: vs, entryPoint: 'vs2' } };
+
+  const prewarmPromise = cache.prewarmRenderPipelines(
+    [
+      { descriptor: d0, priority: 'low' },
+      { descriptor: d1, priority: 'low' },
+      { descriptor: d2, priority: 'low' },
+    ],
+    { concurrency: 1 }
+  );
+
+  // pw_0 is active; promote d2 via markDrawn so it jumps ahead of pw_1!
+  assert.equal(prewarmOrder.length, 1);
+  assert.equal(prewarmOrder[0], 'pw_0');
+  assert.equal(cache.markDrawn(d2), true);
+
+  deferreds[0].d.resolve({ kind: 'GPURenderPipeline', label: 'pw_0' });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(prewarmOrder[1], 'pw_2', 'drawn pipeline preempted queued prewarm pipeline');
+  deferreds[1].d.resolve({ kind: 'GPURenderPipeline', label: 'pw_2' });
+  await new Promise((r) => setImmediate(r));
+  deferreds[2].d.resolve({ kind: 'GPURenderPipeline', label: 'pw_1' });
+  const summary = await prewarmPromise;
+  assert.equal(summary.compiled, 3);
+  assert.deepEqual(prewarmOrder, ['pw_0', 'pw_2', 'pw_1']);
+});
+
+test('W379 integrates stage reflection v3 metadata (unresolved, lane_indexed, cbv_indexed, inline_sampler, rt_arena, mesh_output)', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+
+  const sidecar = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 3,
+    stages: {
+      '0x000000000000379a': {
+        stage: 'fragment',
+        rt_arena: true,
+        mesh_output: { max_vertices: 64, max_primitives: 126, vertex_words: 12 },
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'uniform',
+            min_binding_size_bytes: 64,
+            source: { user_sgpr: 16, root_descriptor: true, table_byte_offset: 32 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            kind: 'texture',
+            source: { unresolved: 'dynamic_cb_index' },
+          },
+          {
+            group: 0,
+            binding: 2,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+          {
+            group: 0,
+            binding: 3,
+            kind: 'texture',
+            source: {
+              lane_indexed_resource_heap: {
+                max_count: 64,
+                shift: 5,
+                window_base: { cbv: { user_sgpr: 18, root_descriptor: true }, byte_offset: 16 },
+              },
+            },
+          },
+          {
+            group: 3,
+            binding: 16,
+            source: { rt_arena: true },
+          },
+        ],
+      },
+    },
+  });
+
+  const stage = sidecar.getStage('0x000000000000379a');
+  const bgl = cache.createBindGroupLayoutFromReflection(
+    { bindings: stage.bindings, hasInlineSampler: stage.hasInlineSampler },
+    undefined,
+    { bindingArrays: true }
+  );
+  assert.ok(bgl);
+  assert.equal(cache.getStats().inlineSamplerLayouts, 1);
+
+  const createdDesc = device.calls.createBindGroupLayout[0].desc;
+  assert.equal(createdDesc.entries.length, 4);
+  assert.equal(createdDesc.entries[3].binding, 3);
+  assert.equal(createdDesc.entries[3].bindingArraySize, 64);
+
+  // Fallback sampler synthesis handles v3 stage binding records cleanly (including unresolved/inline samplers).
+  const synth = cache.synthesizeFallbackSamplerEntries({ bindings: stage.bindings }, []);
+  assert.equal(synth.synthesizedCount, 1);
+  assert.equal(synth.synthesized[0].binding, 2);
 });

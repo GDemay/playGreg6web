@@ -29,6 +29,27 @@ const MIN_CONCURRENT_COMPILES = 1;
 const MAX_CONCURRENT_COMPILES = 16;
 const DEFAULT_COMPILE_STALL_THRESHOLD_MS = 16;
 const DEFAULT_COMPILE_LATENCY_RING_SIZE = 128;
+const DEFAULT_MAX_QUARANTINED_PIPELINES = 512;
+
+const PIPELINE_FAILURE_REASON = Object.freeze({
+  VALIDATION: 'validation',
+  WGSL_COMPILE: 'wgsl_compile',
+  LAYOUT_MISMATCH: 'layout_mismatch',
+  UNSUPPORTED_FEATURE: 'unsupported_feature',
+  DEVICE_LOST: 'device_lost',
+  NULL_PIPELINE: 'null_pipeline',
+  OTHER: 'other',
+});
+
+const FAILURE_REASON_BUCKETS = Object.freeze([
+  PIPELINE_FAILURE_REASON.VALIDATION,
+  PIPELINE_FAILURE_REASON.WGSL_COMPILE,
+  PIPELINE_FAILURE_REASON.LAYOUT_MISMATCH,
+  PIPELINE_FAILURE_REASON.UNSUPPORTED_FEATURE,
+  PIPELINE_FAILURE_REASON.DEVICE_LOST,
+  PIPELINE_FAILURE_REASON.NULL_PIPELINE,
+  PIPELINE_FAILURE_REASON.OTHER,
+]);
 
 const PIPELINE_KIND = Object.freeze({ RENDER: 'render', COMPUTE: 'compute' });
 
@@ -257,7 +278,71 @@ function isDeviceLostError(err) {
   const msg = typeof err === 'string'
     ? err
     : (err && typeof err.message === 'string' ? err.message : '');
-  return /\bdevice\s+(was\s+)?(lost|destroyed)\b|\bgpu\s*device\s*lost\b/i.test(msg);
+  return /\b(?:gpu\s*)?device\s+(was\s+)?(lost|destroyed)\b|\bgpu\s*device\s*lost\b/i.test(msg);
+}
+
+/**
+ * Normalize bounded quarantine capacity (0 disables quarantine; invalid values default to 512).
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeMaxQuarantined(value) {
+  if (value === 0) return 0;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_MAX_QUARANTINED_PIPELINES;
+}
+
+/**
+ * Create a fresh zeroed sanitized failure-reason counter object.
+ * @returns {Record<string, number>}
+ */
+function createEmptyReasonCounts() {
+  return {
+    validation: 0,
+    wgsl_compile: 0,
+    layout_mismatch: 0,
+    unsupported_feature: 0,
+    device_lost: 0,
+    null_pipeline: 0,
+    other: 0,
+  };
+}
+
+/**
+ * W379: Classify a pipeline compilation failure into a fixed sanitized reason bucket
+ * (`validation`, `wgsl_compile`, `layout_mismatch`, `unsupported_feature`, `device_lost`,
+ * `null_pipeline`, `other`). Never exposes raw host paths, shader dumps, or error text.
+ * @param {unknown} err
+ * @returns {'validation' | 'wgsl_compile' | 'layout_mismatch' | 'unsupported_feature' | 'device_lost' | 'null_pipeline' | 'other'}
+ */
+function classifyCompileFailureReason(err) {
+  if (isDeviceLostError(err)) {
+    return PIPELINE_FAILURE_REASON.DEVICE_LOST;
+  }
+  const msg = typeof err === 'string'
+    ? err
+    : (err && typeof err.message === 'string' ? err.message : '');
+  const name = err && typeof err === 'object' && typeof err.name === 'string' ? err.name : '';
+
+  if (/\bno\s+gpu\s+device\b|\bdevice\s+unavailable\b|\bdevice\s+lost\b/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.DEVICE_LOST;
+  }
+  if (/\b(?:returned|resolved)\s+(?:no|null|empty|undefined)\s+pipeline\b|\b(?:null|empty)\s+pipeline\b/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.NULL_PIPELINE;
+  }
+  if (/\blayout\b|\bbind\s*group\b|\bbinding\s+mismatch\b|\bpipeline\s*layout\b|\b@group\s*\(/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.LAYOUT_MISMATCH;
+  }
+  if (/\bunsupported\b|\bnot\s+supported\b|\bfeature\b|\blimit\b|\bexceeds\s+max\b|\bextension\b|\bstorage\s+texture\s+format\b/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.UNSUPPORTED_FEATURE;
+  }
+  if (/\bwgsl\b|\btint\b|\bshader\b|\bentry\s*point\b|\bsyntax\b|\bparse\b|\bspir-?v\b|\bnaga\b/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.WGSL_COMPILE;
+  }
+  if (name === 'GPUValidationError' || /\bvalidation\b|\binvalid\b|\bformat\s+mismatch\b|\btype\s+mismatch\b/i.test(msg)) {
+    return PIPELINE_FAILURE_REASON.VALIDATION;
+  }
+  return PIPELINE_FAILURE_REASON.OTHER;
 }
 
 /**
@@ -422,6 +507,10 @@ class AsyncPipelineCache {
     stallThresholdMs = DEFAULT_COMPILE_STALL_THRESHOLD_MS,
     compileLatencyRingSize,
     latencySampleCapacity,
+    quarantineFailed,
+    quarantineFailedKeys,
+    maxQuarantined,
+    maxQuarantinedKeys,
     nowFn = null,
     onReady = null,
     onError = null,
@@ -455,6 +544,12 @@ class AsyncPipelineCache {
     this._latencyRing = new Float64Array(this._latencyRingSize);
     this._latencyRingHead = 0;
     this._latencyRingCount = 0;
+    this._quarantineFailed = quarantineFailed !== undefined
+      ? quarantineFailed !== false
+      : (quarantineFailedKeys !== undefined ? quarantineFailedKeys !== false : true);
+    this._maxQuarantined = normalizeMaxQuarantined(
+      maxQuarantined !== undefined ? maxQuarantined : maxQuarantinedKeys,
+    );
     this._nowFn = typeof nowFn === 'function' ? nowFn : defaultNow;
     this.onReady = typeof onReady === 'function' ? onReady : null;
     this.onError = typeof onError === 'function' ? onError : null;
@@ -466,6 +561,10 @@ class AsyncPipelineCache {
     this._entries = new Map();
     /** `${kind}\0${dedupeKey}` -> pending job, or { kind, done: true, pipeline } once compiled */
     this._dedupe = new Map();
+    /** LRU Set of quarantine records + secondary lookup indexes by id and dedupeMapKey */
+    this._quarantine = new Set();
+    this._quarantineIdIndex = new Map();
+    this._quarantineDedupeIndex = new Map();
     this._queue = [];
     this._nextSeq = 0;
     this._inFlight = 0;
@@ -491,6 +590,7 @@ class AsyncPipelineCache {
     this._lastCompileMs = 0;
     this._priorityPromotions = 0;
     this._queuedPromotions = 0;
+    this._drawPreemptions = 0;
     this._dedupedCount = 0;
     this._inFlightDedupedCount = 0;
     this._queuedDedupedCount = 0;
@@ -498,6 +598,10 @@ class AsyncPipelineCache {
     this._totalQueueWaitMs = 0;
     this._maxQueueWaitMs = 0;
     this._stallCount = 0;
+    this._quarantineHits = 0;
+    this._quarantineEvictions = 0;
+    this._quarantineHitsByReason = createEmptyReasonCounts();
+    this._failuresByReason = createEmptyReasonCounts();
   }
 
   /**
@@ -568,6 +672,165 @@ class AsyncPipelineCache {
     const score = parsePriorityTier(tier);
     if (score === null) return false;
     return this.promote(idOrKey, score, kind);
+  }
+
+  /**
+   * W379: Immediately elevate a queued background/prewarm pipeline to DEMAND/CRITICAL priority
+   * when an active 3D draw needs it, preempting queued background prewarm work without exceeding
+   * bounded concurrency.
+   * @param {unknown} idOrKey
+   * @param {'render' | 'compute' | null} [kind]
+   * @returns {boolean}
+   */
+  promoteOnDraw(idOrKey, kind = null) {
+    const entry = this._entries.get(idOrKey);
+    if (entry && entry.state === PIPELINE_STATUS.PENDING && entry.job) {
+      if (kind !== null && entry.kind !== kind) return false;
+      entry.job.drawn = true;
+      if (!entry.job.started && this._promoteQueuedJob(entry.job, PIPELINE_PRIORITY_LANE.DEMAND)) {
+        this._drawPreemptions += 1;
+        return true;
+      }
+      return false;
+    }
+
+    const canonicalKey = canonicalizePipelineKey(idOrKey);
+    if (canonicalKey !== null) {
+      const kinds = kind === PIPELINE_KIND.RENDER || kind === PIPELINE_KIND.COMPUTE
+        ? [kind]
+        : [PIPELINE_KIND.RENDER, PIPELINE_KIND.COMPUTE];
+      let promoted = false;
+      for (const candidateKind of kinds) {
+        const dedupeMapKey = makeDedupeMapKey(candidateKind, canonicalKey);
+        const shared = this._dedupe.get(dedupeMapKey);
+        if (shared && !shared.done) {
+          shared.drawn = true;
+          if (!shared.started && this._promoteQueuedJob(shared, PIPELINE_PRIORITY_LANE.DEMAND)) {
+            this._drawPreemptions += 1;
+            promoted = true;
+          }
+        }
+      }
+      return promoted;
+    }
+
+    return false;
+  }
+
+  /**
+   * W379: Notify the scheduler that `idOrKey` was requested by an active draw call.
+   * Promotes any queued background/prewarm compilation for `idOrKey` to DEMAND/CRITICAL priority.
+   * @param {unknown} idOrKey
+   * @param {'render' | 'compute' | null} [kind]
+   * @returns {boolean}
+   */
+  markDrawn(idOrKey, kind = null) {
+    return this.promoteOnDraw(idOrKey, kind);
+  }
+
+  /**
+   * W379: Compile a pipeline needed by an active draw call at DEMAND/CRITICAL priority so it
+   * immediately preempts queued background prewarm compiles while honoring `maxConcurrentCompiles`.
+   * @param {unknown} id
+   * @param {GPURenderPipelineDescriptor | GPUComputePipelineDescriptor} descriptor
+   * @param {object} [options]
+   */
+  compileOnDraw(id, descriptor, options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const kind = opts.kind === PIPELINE_KIND.COMPUTE
+      ? PIPELINE_KIND.COMPUTE
+      : PIPELINE_KIND.RENDER;
+    const explicitScore = parsePriorityValue(opts.priority);
+    const compileOpts = {
+      ...opts,
+      drawn: true,
+      demand: true,
+      priority: explicitScore !== null && explicitScore > PIPELINE_PRIORITY_LANE.DEMAND
+        ? explicitScore
+        : PIPELINE_PRIORITY_LANE.DEMAND,
+    };
+    delete compileOpts.kind;
+    delete compileOpts.priorityTier;
+    delete compileOpts.tier;
+    return this._compile(kind, id, descriptor, compileOpts);
+  }
+
+  /**
+   * W379: Check whether a pipeline `id` or `dedupeKey`/`canonicalKey` is currently quarantined
+   * due to a previous permanent compilation failure.
+   * @param {unknown} idOrKey
+   * @param {'render' | 'compute' | null} [kind]
+   * @returns {boolean}
+   */
+  isQuarantined(idOrKey, kind = null) {
+    if (this._quarantine.size === 0) return false;
+    const byId = this._quarantineIdIndex.get(idOrKey);
+    if (byId && (kind === null || byId.kind === kind)) {
+      return true;
+    }
+    const canonicalKey = canonicalizePipelineKey(idOrKey);
+    if (canonicalKey !== null) {
+      const kinds = kind === PIPELINE_KIND.RENDER || kind === PIPELINE_KIND.COMPUTE
+        ? [kind]
+        : [PIPELINE_KIND.RENDER, PIPELINE_KIND.COMPUTE];
+      for (const candidateKind of kinds) {
+        const rec = this._quarantineDedupeIndex.get(makeDedupeMapKey(candidateKind, canonicalKey));
+        if (rec) return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * W379: Clear all quarantined failed pipelines, or a single quarantined `id`/`dedupeKey`.
+   * @param {unknown} [idOrKey]
+   * @param {'render' | 'compute' | null} [kind]
+   * @returns {number} Number of quarantine records removed.
+   */
+  clearQuarantine(idOrKey, kind = null) {
+    if (idOrKey === undefined) {
+      const removed = this._quarantine.size;
+      this._quarantine.clear();
+      this._quarantineIdIndex.clear();
+      this._quarantineDedupeIndex.clear();
+      return removed;
+    }
+    const toRemove = new Set();
+    const byId = this._quarantineIdIndex.get(idOrKey);
+    if (byId && (kind === null || byId.kind === kind)) {
+      toRemove.add(byId);
+    }
+    const canonicalKey = canonicalizePipelineKey(idOrKey);
+    if (canonicalKey !== null) {
+      const kinds = kind === PIPELINE_KIND.RENDER || kind === PIPELINE_KIND.COMPUTE
+        ? [kind]
+        : [PIPELINE_KIND.RENDER, PIPELINE_KIND.COMPUTE];
+      for (const candidateKind of kinds) {
+        const rec = this._quarantineDedupeIndex.get(makeDedupeMapKey(candidateKind, canonicalKey));
+        if (rec) toRemove.add(rec);
+      }
+    }
+    for (const rec of toRemove) {
+      this._deleteQuarantineRecord(rec);
+    }
+    return toRemove.size;
+  }
+
+  /**
+   * W379: Return a sanitized summary of quarantined pipelines (counts by fixed reason bucket,
+   * total quarantined, cumulative quarantine hits, evictions, and failure counts by reason).
+   */
+  getQuarantineSummary() {
+    return {
+      enabled: this._quarantineFailed,
+      maxQuarantined: this._maxQuarantined,
+      totalQuarantined: this._quarantine.size,
+      quarantineHits: this._quarantineHits,
+      evictions: this._quarantineEvictions,
+      byReason: this._getQuarantinedReasonBreakdown(),
+      hitsByReason: { ...this._quarantineHitsByReason },
+      failuresByReason: { ...this._failuresByReason },
+    };
   }
 
   /**
@@ -661,6 +924,14 @@ class AsyncPipelineCache {
    */
   delete(id) {
     const entry = this._entries.get(id);
+    const qRec = this._quarantineIdIndex.get(id);
+    if (qRec) {
+      this._quarantineIdIndex.delete(id);
+      qRec.ids.delete(id);
+      if (qRec.ids.size === 0 && qRec.dedupeMapKey === null) {
+        this._quarantine.delete(qRec);
+      }
+    }
     if (!entry) return false;
     this._entries.delete(id);
     const job = entry.job;
@@ -680,8 +951,8 @@ class AsyncPipelineCache {
   }
 
   /**
-   * Switch to a new device (device loss / re-init). Clears every table and the queue; anything the
-   * old device resolves or rejects later is counted in `discardedStale` and otherwise ignored.
+   * Switch to a new device (device loss / re-init). Clears every table, quarantine, and the queue;
+   * anything the old device resolves or rejects later is counted in `discardedStale` and otherwise ignored.
    * Callers still awaiting a compile from the old generation get { status: 'stale' }.
    * @param {GPUDevice | null} newDevice
    */
@@ -693,6 +964,9 @@ class AsyncPipelineCache {
     }
     this._entries.clear();
     this._dedupe.clear();
+    this._quarantine.clear();
+    this._quarantineIdIndex.clear();
+    this._quarantineDedupeIndex.clear();
     this._queue = [];
     this._inFlight = 0;
     this.device = newDevice;
@@ -714,7 +988,7 @@ class AsyncPipelineCache {
 
   /**
    * W263: Reset all cumulative telemetry counters and the bounded compile-latency ring
-   * without disturbing cached pipelines, queued work, active compiles, or device generation.
+   * without disturbing cached pipelines, queued work, active compiles, quarantined entries, or device generation.
    */
   resetStats() {
     this._stats.peakQueueDepth = this._queue.length;
@@ -735,6 +1009,7 @@ class AsyncPipelineCache {
     this._lastCompileMs = 0;
     this._priorityPromotions = 0;
     this._queuedPromotions = 0;
+    this._drawPreemptions = 0;
     this._dedupedCount = 0;
     this._inFlightDedupedCount = 0;
     this._queuedDedupedCount = 0;
@@ -742,6 +1017,10 @@ class AsyncPipelineCache {
     this._totalQueueWaitMs = 0;
     this._maxQueueWaitMs = 0;
     this._stallCount = 0;
+    this._quarantineHits = 0;
+    this._quarantineEvictions = 0;
+    this._quarantineHitsByReason = createEmptyReasonCounts();
+    this._failuresByReason = createEmptyReasonCounts();
     this._latencyRing.fill(0);
     this._latencyRingHead = 0;
     this._latencyRingCount = 0;
@@ -756,6 +1035,7 @@ class AsyncPipelineCache {
       : 0;
     const { p50CompileMs, p95CompileMs } = this._computeCompileLatencyPercentiles();
     const queuedByPriority = this._getQueuedPriorityBreakdown();
+    const quarantinedByReason = this._getQuarantinedReasonBreakdown();
     const stats = {
       generation: this.generation,
       maxConcurrent: this.maxConcurrent,
@@ -773,10 +1053,11 @@ class AsyncPipelineCache {
       maxCompileMs: this._maxCompileMs,
       priorityPromotions: this._priorityPromotions,
     };
-    // W203 / W263 / W305 canonical telemetry properties exposed on getStats() as non-enumerable
+    // W203 / W263 / W305 / W379 canonical telemetry properties exposed on getStats() as non-enumerable
     // properties so legacy deepEqual snapshots keep their exact own-enumerable shape while callers
     // reading stats.queuedByPriority / peakActiveCompiles / compileStallCount / p50CompileMs /
-    // p95CompileMs / coalescedCompiles / compileErrors / ... work without needing a separate call.
+    // p95CompileMs / coalescedCompiles / compileErrors / quarantinedCount / quarantineHits /
+    // quarantinedByReason / drawPreemptions work without needing a separate call.
     // Use getTelemetry() for an all-enumerable snapshot.
     Object.defineProperties(stats, {
       inFlightCount: { value: this._inFlight, enumerable: false, configurable: true },
@@ -785,6 +1066,7 @@ class AsyncPipelineCache {
       peakActiveCompiles: { value: this._peakInFlightCompiles, enumerable: false, configurable: true },
       compileStallCount: { value: this._stallCount, enumerable: false, configurable: true },
       promotedCount: { value: this._queuedPromotions, enumerable: false, configurable: true },
+      drawPreemptions: { value: this._drawPreemptions, enumerable: false, configurable: true },
       dedupedCount: { value: this._dedupedCount, enumerable: false, configurable: true },
       completedCount: { value: this._stats.compiled, enumerable: false, configurable: true },
       failedCount: { value: this._stats.failed, enumerable: false, configurable: true },
@@ -798,13 +1080,17 @@ class AsyncPipelineCache {
       compileLatencySampleCount: { value: this._latencyRingCount, enumerable: false, configurable: true },
       compileLatencyRingSize: { value: this._latencyRingSize, enumerable: false, configurable: true },
       deviceLostRejections: { value: this._deviceLostRejections, enumerable: false, configurable: true },
+      quarantinedCount: { value: this._quarantine.size, enumerable: false, configurable: true },
+      quarantineHits: { value: this._quarantineHits, enumerable: false, configurable: true },
+      quarantineEvictions: { value: this._quarantineEvictions, enumerable: false, configurable: true },
+      quarantinedByReason: { value: quarantinedByReason, enumerable: false, configurable: true },
     });
     return stats;
   }
 
   /**
-   * W203 / W263 / W305: Return an all-enumerable compile queue, priority tier, coalescing,
-   * latency percentile & stall telemetry snapshot.
+   * W203 / W263 / W305 / W379: Return an all-enumerable compile queue, priority tier, coalescing,
+   * quarantine reason-count, draw-preemption, latency percentile & stall telemetry snapshot.
    */
   getTelemetry() {
     const avgCompileMs = this._asyncCompileCount > 0
@@ -814,6 +1100,7 @@ class AsyncPipelineCache {
       ? this._totalQueueWaitMs / this._startedJobCount
       : 0;
     const { p50CompileMs, p95CompileMs } = this._computeCompileLatencyPercentiles();
+    const quarantinedByReason = this._getQuarantinedReasonBreakdown();
     return {
       generation: this.generation,
       maxConcurrentCompiles: this.maxConcurrentCompiles,
@@ -825,6 +1112,7 @@ class AsyncPipelineCache {
       peakQueuedCount: this._stats.peakQueueDepth,
       promotedCount: this._queuedPromotions,
       priorityPromotions: this._priorityPromotions,
+      drawPreemptions: this._drawPreemptions,
       dedupedCount: this._dedupedCount,
       coalescedCompiles: this._coalescedCompiles,
       inFlightDedupedCount: this._inFlightDedupedCount,
@@ -834,6 +1122,11 @@ class AsyncPipelineCache {
       compileErrors: this._compileErrors,
       failedAsyncCompiles: this._failedAsyncCompiles,
       deviceLostRejections: this._deviceLostRejections,
+      quarantinedCount: this._quarantine.size,
+      quarantineHits: this._quarantineHits,
+      quarantineEvictions: this._quarantineEvictions,
+      quarantinedByReason,
+      failuresByReason: { ...this._failuresByReason },
       maxCompileMs: this._maxCompileMs,
       avgCompileMs,
       p50CompileMs,
@@ -899,8 +1192,9 @@ class AsyncPipelineCache {
       : (opts.tier !== undefined ? parsePriorityTier(opts.tier) : null);
     const parsedPriority = parsedTier !== null ? parsedTier : parsePriorityValue(opts.priority);
     const parsedLane = parsedPriority === null ? parsePriorityValue(opts.lane) : null;
+    const isDrawnDemand = opts.drawn === true || opts.demand === true;
     const semanticPriority = (parsedPriority === null && parsedLane === null)
-      ? (opts.demand === true
+      ? (isDrawnDemand
         ? PIPELINE_PRIORITY_LANE.DEMAND
         : ((opts.warmup === true || opts.isWarmup === true) ? PIPELINE_PRIORITY_LANE.WARMUP : null))
       : null;
@@ -922,21 +1216,45 @@ class AsyncPipelineCache {
         this._dedupedCount += 1;
         this._coalescedCompiles += 1;
         if (existing.job && existing.job.started) {
+          if (isDrawnDemand) existing.job.drawn = true;
           this._inFlightDedupedCount += 1;
         } else {
           this._queuedDedupedCount += 1;
           if (existing.job) {
+            if (isDrawnDemand) existing.job.drawn = true;
             if (!existing.job.fallbackDescriptor && fallbackDescriptor) {
               existing.job.fallbackDescriptor = fallbackDescriptor;
             }
             if (existing.kind === kind || hasExplicitPriority) {
-              this._promoteQueuedJob(existing.job, priority);
+              if (this._promoteQueuedJob(existing.job, priority) && isDrawnDemand) {
+                this._drawPreemptions += 1;
+              }
             }
           }
         }
         return existing.deferred.promise;
       }
       return Promise.resolve({ id, status: PIPELINE_STATUS.READY, pipeline: existing.pipeline });
+    }
+
+    if (this._quarantineFailed && this._maxQuarantined > 0 && opts.bypassQuarantine !== true) {
+      const quarantined = this._findQuarantineRecord(kind, id, dedupeMapKey);
+      if (quarantined) {
+        this._touchQuarantineRecord(quarantined);
+        return Promise.resolve({
+          id,
+          status: PIPELINE_STATUS.FAILED,
+          quarantined: true,
+          reason: quarantined.reason,
+          error: new Error(`AsyncPipelineCache: pipeline quarantined (${quarantined.reason})`),
+          kind,
+          generation: this.generation,
+          dedupeKey,
+          dedupe: false,
+          syncFallback: false,
+          retried: false,
+        });
+      }
     }
 
     const entry = {
@@ -962,6 +1280,7 @@ class AsyncPipelineCache {
           this._coalescedCompiles += 1;
           entry.job = shared;
           shared.ids.add(id);
+          if (isDrawnDemand) shared.drawn = true;
           if (shared.started) {
             this._inFlightDedupedCount += 1;
           } else {
@@ -969,7 +1288,9 @@ class AsyncPipelineCache {
             if (!shared.fallbackDescriptor && fallbackDescriptor) {
               shared.fallbackDescriptor = fallbackDescriptor;
             }
-            this._promoteQueuedJob(shared, priority);
+            if (this._promoteQueuedJob(shared, priority) && isDrawnDemand) {
+              this._drawPreemptions += 1;
+            }
           }
         }
         return entry.deferred.promise;
@@ -983,6 +1304,7 @@ class AsyncPipelineCache {
       dedupeKey,
       dedupeMapKey,
       priority,
+      drawn: isDrawnDemand,
       seq: (this._nextSeq += 1),
       generation: this.generation,
       ownerId: id,
@@ -1020,6 +1342,9 @@ class AsyncPipelineCache {
     this._queue.splice(insertIndex, 0, job);
     if (promotedAhead) {
       this._priorityPromotions += 1;
+      if (job.drawn) {
+        this._drawPreemptions += 1;
+      }
     }
     if (this._queue.length > this._stats.peakQueueDepth) {
       this._stats.peakQueueDepth = this._queue.length;
@@ -1244,19 +1569,148 @@ class AsyncPipelineCache {
   }
 
   _completeJob(job, pipeline, error, syncFallback) {
+    let reason = null;
+    let quarantined = false;
     if (error) {
       this._stats.failed += 1;
       this._compileErrors += 1;
+      reason = classifyCompileFailureReason(error);
+      this._failuresByReason[reason] = (this._failuresByReason[reason] || 0) + 1;
+      if (
+        this._quarantineFailed &&
+        this._maxQuarantined > 0 &&
+        reason !== PIPELINE_FAILURE_REASON.DEVICE_LOST &&
+        !isDeviceLostError(error)
+      ) {
+        this._quarantineJobFailure(job, reason);
+        quarantined = true;
+      }
     } else {
       this._stats.compiled += 1;
     }
     for (const id of job.ids) {
       const entry = this._entries.get(id);
       if (!entry || entry.job !== job) continue;
-      const meta = { dedupe: id !== job.ownerId, syncFallback, retried: job.retried };
+      const meta = {
+        dedupe: id !== job.ownerId,
+        syncFallback,
+        retried: job.retried,
+        reason,
+        quarantined,
+      };
       if (error) this._finishFailed(entry, error, meta);
       else this._finishReady(entry, pipeline, meta);
     }
+  }
+
+  _findQuarantineRecord(kind, id, dedupeMapKey) {
+    if (this._quarantine.size === 0) return null;
+    const byId = this._quarantineIdIndex.get(id);
+    if (byId && byId.kind === kind) {
+      return byId;
+    }
+    if (dedupeMapKey !== null) {
+      const byDedupe = this._quarantineDedupeIndex.get(dedupeMapKey);
+      if (byDedupe && byDedupe.kind === kind) {
+        return byDedupe;
+      }
+    }
+    return null;
+  }
+
+  _touchQuarantineRecord(record) {
+    record.hits += 1;
+    record.lastHitAtMs = this._now();
+    this._quarantineHits += 1;
+    this._quarantineHitsByReason[record.reason] = (this._quarantineHitsByReason[record.reason] || 0) + 1;
+    // Refresh recency in bounded LRU set.
+    this._quarantine.delete(record);
+    this._quarantine.add(record);
+  }
+
+  _deleteQuarantineRecord(record) {
+    if (!record || !this._quarantine.has(record)) return false;
+    this._quarantine.delete(record);
+    for (const id of record.ids) {
+      if (this._quarantineIdIndex.get(id) === record) {
+        this._quarantineIdIndex.delete(id);
+      }
+    }
+    if (record.dedupeMapKey !== null && this._quarantineDedupeIndex.get(record.dedupeMapKey) === record) {
+      this._quarantineDedupeIndex.delete(record.dedupeMapKey);
+    }
+    return true;
+  }
+
+  _quarantineJobFailure(job, reason) {
+    const now = this._now();
+    let record = job.dedupeMapKey !== null ? this._quarantineDedupeIndex.get(job.dedupeMapKey) : null;
+    if (!record) {
+      for (const id of job.ids) {
+        const existing = this._quarantineIdIndex.get(id);
+        if (existing && existing.kind === job.kind) {
+          record = existing;
+          break;
+        }
+      }
+    }
+    if (record) {
+      record.reason = reason;
+      record.failures += 1;
+      for (const id of job.ids) {
+        record.ids.add(id);
+        this._quarantineIdIndex.set(id, record);
+      }
+      if (job.dedupeMapKey !== null) {
+        record.dedupeKey = job.dedupeKey;
+        record.dedupeMapKey = job.dedupeMapKey;
+        this._quarantineDedupeIndex.set(job.dedupeMapKey, record);
+      }
+      this._quarantine.delete(record);
+      this._quarantine.add(record);
+      return;
+    }
+
+    const ids = new Set(job.ids);
+    const fresh = {
+      kind: job.kind,
+      ids,
+      dedupeKey: job.dedupeKey,
+      dedupeMapKey: job.dedupeMapKey,
+      reason,
+      failures: 1,
+      hits: 0,
+      quarantinedAtMs: now,
+      lastHitAtMs: null,
+    };
+    this._quarantine.add(fresh);
+    for (const id of ids) {
+      const prev = this._quarantineIdIndex.get(id);
+      if (prev && prev !== fresh) {
+        prev.ids.delete(id);
+        if (prev.ids.size === 0 && prev.dedupeMapKey === null) {
+          this._quarantine.delete(prev);
+        }
+      }
+      this._quarantineIdIndex.set(id, fresh);
+    }
+    if (fresh.dedupeMapKey !== null) {
+      this._quarantineDedupeIndex.set(fresh.dedupeMapKey, fresh);
+    }
+
+    while (this._quarantine.size > this._maxQuarantined) {
+      const oldest = this._quarantine.values().next().value;
+      if (!this._deleteQuarantineRecord(oldest)) break;
+      this._quarantineEvictions += 1;
+    }
+  }
+
+  _getQuarantinedReasonBreakdown() {
+    const counts = createEmptyReasonCounts();
+    for (const rec of this._quarantine) {
+      counts[rec.reason] = (counts[rec.reason] || 0) + 1;
+    }
+    return counts;
   }
 
   _finishReady(entry, pipeline, meta) {
@@ -1273,6 +1727,12 @@ class AsyncPipelineCache {
     entry.error = error;
     entry.job = null;
     const fullMeta = this._meta(entry, meta);
+    if (meta && meta.reason) {
+      fullMeta.reason = meta.reason;
+    }
+    if (meta && meta.quarantined) {
+      fullMeta.quarantined = true;
+    }
     entry.deferred.resolve({ id: entry.id, status: PIPELINE_STATUS.FAILED, error, ...fullMeta });
     this._invoke(this.onError, 'onError', entry.id, error, fullMeta);
   }
@@ -1355,14 +1815,17 @@ const exportedApi = {
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
   DEFAULT_COMPILE_LATENCY_RING_SIZE,
+  DEFAULT_MAX_QUARANTINED_PIPELINES,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
   PIPELINE_PRIORITY_TIER,
   PIPELINE_STATUS,
+  PIPELINE_FAILURE_REASON,
   canonicalizePipelineKey,
   classifyPriorityTier,
   parsePriorityTier,
   isDeviceLostError,
+  classifyCompileFailureReason,
 };
 
   if (typeof globalThis !== 'undefined') {

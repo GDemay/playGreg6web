@@ -268,7 +268,7 @@ test('dedupe: a later id with a completed dedupeKey reuses the ready pipeline sy
 test('dedupe: a failed compile is not cached, so the key can be compiled again', async () => {
   const device = createManualDevice();
   const cb = recordCallbacks();
-  const cache = new AsyncPipelineCache({ device, ...cb });
+  const cache = new AsyncPipelineCache({ device, quarantineFailed: false, ...cb });
 
   const a = cache.compileRenderPipeline('a', { label: 'x' }, { dedupeKey: 'k' });
   const b = cache.compileRenderPipeline('b', { label: 'x' }, { dedupeKey: 'k' });
@@ -818,7 +818,7 @@ test('W168: graphics-over-compute priority schedules UI render pipelines ahead o
 
 test('W168: explicit numeric priority overrides default render/compute order with FIFO tie-breaking', async () => {
   const device = createManualDevice();
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1, quarantineFailed: false });
 
   // Slot 0 occupied by initial compute job.
   const p0 = cache.compileComputePipeline('c0', { label: 'c0' });
@@ -873,7 +873,7 @@ test('W168: explicit numeric priority overrides default render/compute order wit
 
 test('W168: duplicate key coalescing promotes queued jobs and isolates render/compute dedupe namespaces', async () => {
   const device = createManualDevice();
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1, quarantineFailed: false });
 
   // Slot 0 occupied by active compile.
   const active = cache.compileRenderPipeline('active', { label: 'active' });
@@ -950,7 +950,7 @@ test('W168: failure recovery releases slot, clears failed dedupe key, and drains
     return origRenderAsync(descriptor);
   };
 
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1, quarantineFailed: false });
 
   // Active compute compile with fallbackDescriptor that will fail both primary and fallback.
   const cFail = cache.compileComputePipeline(
@@ -1134,5 +1134,103 @@ test('zero unhandled rejections: throwing APIs, callbacks, and logger are contai
   assert.ok(warnings.some((w) => /onReady callback threw/.test(w)));
   assert.ok(warnings.some((w) => /onError callback rejected/.test(w)));
   assert.equal(cache.getStats().discardedStale, 1);
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W379: compileOnDraw / promoteOnDraw / markDrawn preempt queued background prewarm under bounded concurrency', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  const slot0 = cache.prewarm('bg_0', { label: 'bg_0' });
+  const slot1 = cache.prewarm('bg_1', { label: 'bg_1' });
+  const bg2 = cache.prewarm('bg_2', { label: 'bg_2' }, { dedupeKey: 'k-bg-2' });
+  const bg3 = cache.prewarm('bg_3', { label: 'bg_3' }, { dedupeKey: 'k-bg-3' });
+  const bg4 = cache.prewarm('bg_4', { label: 'bg_4' }, { dedupeKey: 'k-bg-4' });
+
+  // Active 3D draw promotes queued bg_4 via markDrawn and compiles a fresh drawn PSO via compileOnDraw.
+  assert.equal(cache.markDrawn('k-bg-4'), true);
+  assert.equal(cache.promoteOnDraw('k-bg-4'), false, 'already at DEMAND priority');
+  const drawnNew = cache.compileOnDraw('draw_hero', { label: 'draw_hero' });
+
+  assert.equal(device.calls.length, 2, 'bounded concurrency stays capped at 2');
+  assert.equal(cache.getStats().drawPreemptions, 2);
+
+  for (let i = 0; i < 6; i += 1) {
+    assert.ok(device.inFlight <= 2);
+    device.calls[i].resolve();
+    await tick();
+  }
+  const results = await Promise.all([slot0, slot1, bg2, bg3, bg4, drawnNew]);
+  await cache.whenIdle();
+
+  assert.ok(results.every((r) => r.status === PIPELINE_STATUS.READY));
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    ['bg_0', 'bg_1', 'bg_4', 'draw_hero', 'bg_2', 'bg_3'],
+  );
+  assert.equal(device.peakInFlight, 2);
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W379: failed-pipeline quarantine short-circuits hot-loop repeats, skips device_lost, enforces LRU cap, and clears on reset()', async () => {
+  const device = createManualDevice('dev1');
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2, maxQuarantined: 2 });
+
+  const pWgsl = cache.compileRenderPipeline('bad_wgsl', { label: 'bad_wgsl' }, { dedupeKey: 'k-wgsl' });
+  const pLost = cache.compileRenderPipeline('lost_pso', { label: 'lost_pso' }, { dedupeKey: 'k-lost' });
+
+  device.calls[0].reject(new Error('Tint WGSL error at C:\\Users\\secret\\game.wgsl'));
+  device.calls[1].reject(Object.assign(new Error('GPUDevice was lost'), { name: 'GPUDeviceLostError' }));
+  const [rWgsl, rLost] = await Promise.all([pWgsl, pLost]);
+  await cache.whenIdle();
+
+  assert.equal(rWgsl.status, PIPELINE_STATUS.FAILED);
+  assert.equal(rWgsl.reason, 'wgsl_compile');
+  assert.equal(rWgsl.quarantined, true);
+  assert.equal(rLost.status, PIPELINE_STATUS.FAILED);
+  assert.equal(rLost.reason, 'device_lost');
+  assert.equal(cache.isQuarantined('bad_wgsl'), true);
+  assert.equal(cache.isQuarantined('k-wgsl'), true);
+  assert.equal(cache.isQuarantined('lost_pso'), false, 'device_lost is transient and never quarantined');
+  assert.equal(cache.isQuarantined('k-lost'), false);
+
+  // Hot-loop repeat short-circuits without hitting device again.
+  const repeat = await cache.compileRenderPipeline('bad_wgsl_alias', { label: 'bad_wgsl' }, { dedupeKey: 'k-wgsl' });
+  assert.equal(repeat.status, PIPELINE_STATUS.FAILED);
+  assert.equal(repeat.quarantined, true);
+  assert.equal(repeat.reason, 'wgsl_compile');
+  assert.equal(device.calls.length, 2, 'quarantined key did not invoke device');
+
+  // Verify LRU eviction at maxQuarantined = 2: add layout_mismatch and validation failures.
+  const pLayout = cache.compileRenderPipeline('bad_layout', { label: 'bad_layout' });
+  const pVal = cache.compileComputePipeline('bad_val', { label: 'bad_val' });
+  device.calls[2].reject(new Error('pipeline layout mismatch on bind group 1'));
+  device.calls[3].reject(Object.assign(new Error('invalid vertex format'), { name: 'GPUValidationError' }));
+  await Promise.all([pLayout, pVal]);
+  await cache.whenIdle();
+
+  // bad_wgsl was oldest (even after hit, bad_layout and bad_val were added after) -> evicted.
+  assert.equal(cache.isQuarantined('bad_wgsl'), false);
+  assert.equal(cache.isQuarantined('bad_layout'), true);
+  assert.equal(cache.isQuarantined('bad_val'), true);
+
+  const summary = cache.getQuarantineSummary();
+  assert.equal(summary.totalQuarantined, 2);
+  assert.equal(summary.quarantineHits, 1);
+  assert.equal(summary.evictions, 1);
+  assert.equal(summary.byReason.layout_mismatch, 1);
+  assert.equal(summary.byReason.validation, 1);
+  assert.equal(summary.failuresByReason.device_lost, 1);
+  assert.equal(summary.failuresByReason.wgsl_compile, 1);
+  assert.doesNotMatch(JSON.stringify(summary), /Users|secret|game\.wgsl/);
+
+  // clearQuarantine(singleKey) removes only that key; reset(newDevice) clears remaining quarantine.
+  assert.equal(cache.clearQuarantine('bad_layout'), 1);
+  assert.equal(cache.isQuarantined('bad_layout'), false);
+  assert.equal(cache.isQuarantined('bad_val'), true);
+
+  cache.reset(createManualDevice('dev2'));
+  assert.equal(cache.isQuarantined('bad_val'), false);
+  assert.equal(cache.getQuarantineSummary().totalQuarantined, 0);
   assert.deepEqual(unhandledRejections, []);
 });
