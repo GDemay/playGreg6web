@@ -94,6 +94,23 @@ uint64_t shader_identity(const void* data, size_t size);
 uint64_t content_hash(const void* data, size_t size);
 // True when all `size` bytes are zero (word-wise).
 bool all_zero_bytes(const void* data, size_t size);
+
+// Incremental dirty-band / dirty-slice tracking for streamed texture uploads (#691, #1747):
+// splits a 2D subresource into bands of `kUploadBandRows` block rows (or a 3D subresource into
+// single depth slices), hashes each band once, and coalesces adjacent changed bands into minimal
+// upload runs so sparse updates avoid re-uploading unchanged regions.
+struct DirtyBandRun {
+    uint32_t first = 0;
+    uint32_t count = 0;
+};
+uint64_t hash_dirty_bands(const uint8_t* data, uint32_t total_units, uint32_t band_units,
+                          size_t unit_stride, size_t unit_bytes, std::vector<uint64_t>* out_bands);
+uint32_t compute_dirty_band_runs(const std::vector<uint64_t>& prev_bands,
+                                 const std::vector<uint64_t>& cur_bands,
+                                 uint32_t total_units,
+                                 uint32_t band_units,
+                                 const std::vector<uint8_t>* zero_mask,
+                                 std::vector<DirtyBandRun>* out_runs);
 // D3D12_SHADER_RESOURCE_VIEW_DESC / D3D12_UNORDERED_ACCESS_VIEW_DESC -> registry view description
 // (false for an invalid view dimension). Also used by the Xbox views at an address (slots 70 / 71).
 bool parse_srv_desc(const GuestShaderResourceViewDesc& g, d3d::ViewDesc* out);
