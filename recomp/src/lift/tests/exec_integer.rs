@@ -1361,3 +1361,171 @@ fn r60_scalar_bitmanip_div_and_all_16_fused_predicates_are_bit_exact() {
     assert!(win_out[1].error.is_empty());
     assert_eq!(win_out[1].regs[RAX], 1, "INT_MAX > INT_MIN");
 }
+
+/// R65: End-to-end Wasm64 execution verification of entry-block dead GPR/flag load elision (R65a)
+/// and tiny internal leaf `alwaysinline` functions (R65b), including partial-register preservation,
+/// incoming-flag preservation (`adc`/`inc`/`setz`), `bsf` zero-source preservation, and calling
+/// tiny leaf `cmpxchg`/`xchg`/getter helpers.
+#[test]
+fn r65_entry_dead_gpr_flag_elision_and_leaf_inlining_are_bit_exact() {
+    let test = "r65_entry_dead_gpr_flag_elision_and_leaf_inlining_are_bit_exact";
+    if !exec_or_skip(test) {
+        return;
+    }
+
+    const ELIDE_ENTRY: u64 = CODE_BASE;
+    const PARTIAL_AND_BSF: u64 = CODE_BASE + 0x100;
+    const PRESERVE_CF_WRAPPER: u64 = CODE_BASE + 0x200;
+    const PRESERVE_CF_CALLEE: u64 = CODE_BASE + 0x240;
+    const LEAF_GETTER: u64 = CODE_BASE + 0x300;
+    const LEAF_CAS: u64 = CODE_BASE + 0x340;
+    const LEAF_XCHG: u64 = CODE_BASE + 0x380;
+    const CALLER_LEAVES: u64 = CODE_BASE + 0x400;
+
+    let full_functions = Program::new()
+        .asm(ELIDE_ENTRY, |a| {
+            a.sub(rsp, 0x28)?;
+            a.xor(eax, eax)?;
+            a.mov(r8d, ecx)?;
+            a.lea(r9, ptr(rcx + rdx * 2 + 7))?;
+            a.mov(r10, 0x1122_3344_5566_7788u64)?;
+            a.add(rax, r8)?;
+            a.add(rax, r9)?;
+            a.add(rsp, 0x28)?;
+            a.ret()
+        })
+        .asm(PARTIAL_AND_BSF, |a| {
+            a.mov(al, 0x5Au32)?;
+            a.mov(ch, 0xA5u32)?;
+            a.mov(dx, 0x1234u32)?;
+            a.xor(bl, bl)?;
+            a.bsf(r8d, r9d)?;
+            a.ret()
+        })
+        .asm(PRESERVE_CF_CALLEE, |a| {
+            a.inc(rcx)?;
+            a.mov(eax, 10)?;
+            a.adc(eax, 0)?;
+            a.ret()
+        })
+        .asm(PRESERVE_CF_WRAPPER, |a| {
+            let mut set_cf = a.create_label();
+            let mut go = a.create_label();
+            a.test(rdx, rdx)?;
+            a.jnz(set_cf)?;
+            a.clc()?;
+            a.jmp(go)?;
+            a.set_label(&mut set_cf)?;
+            a.stc()?;
+            a.set_label(&mut go)?;
+            a.call(PRESERVE_CF_CALLEE)?;
+            a.ret()
+        })
+        .asm(LEAF_GETTER, |a| {
+            a.mov(eax, dword_ptr(rcx))?;
+            a.ret()
+        })
+        .asm(LEAF_CAS, |a| {
+            a.mov(eax, edx)?;
+            a.cmpxchg(dword_ptr(rcx), r8d)?;
+            a.ret()
+        })
+        .asm(LEAF_XCHG, |a| {
+            a.mov(eax, edx)?;
+            a.xchg(dword_ptr(rcx), eax)?;
+            a.ret()
+        })
+        .asm(CALLER_LEAVES, |a| {
+            a.sub(rsp, 0x28)?;
+            a.mov(r10, rcx)?;
+            a.call(LEAF_GETTER)?;
+            a.mov(r11d, eax)?;
+            a.mov(edx, eax)?;
+            a.mov(r8d, 0xCAFE_BABEu32)?;
+            a.mov(rcx, r10)?;
+            a.call(LEAF_CAS)?;
+            a.mov(edx, 0x1337_C0DEu32)?;
+            a.mov(rcx, r10)?;
+            a.call(LEAF_XCHG)?;
+            a.mov(rcx, r10)?;
+            a.mov(r9d, eax)?;
+            a.call(LEAF_GETTER)?;
+            a.add(rsp, 0x28)?;
+            a.ret()
+        })
+        .discover();
+
+    let built = build("r65_entry_elision_and_leaves", full_functions.values());
+    let init_val = 0xDEAD_BEEFu32.to_le_bytes();
+    let cases = vec![
+        // 0: ELIDE_ENTRY with dirty incoming rax, r8, r9, r10 (must be cleanly overwritten).
+        Case::new(ELIDE_ENTRY)
+            .reg(RAX, 0xFFFF_FFFF_DEAD_BEEF)
+            .reg(RCX, 0xABCD_0000_0000_0010)
+            .reg(RDX, 5)
+            .reg(R8, 0xFFFF_FFFF_FFFF_FFFF)
+            .reg(R9, 0xAAAA_AAAA_AAAA_AAAA)
+            .reg(R10, 0xBBBB_BBBB_BBBB_BBBB),
+        // 1: PARTIAL_AND_BSF with r9d = 0 (bsf must preserve full 64-bit r8!).
+        Case::new(PARTIAL_AND_BSF)
+            .reg(RAX, 0x1122_3344_5566_7788)
+            .reg(RCX, 0xAABB_CCDD_EEFF_0011)
+            .reg(RDX, 0x5555_6666_7777_8888)
+            .reg(RBX, 0xDEAD_BEEF_CAFE_00FF)
+            .reg(R8, 0x9988_7766_5544_3322)
+            .reg(R9, 0),
+        // 2: PARTIAL_AND_BSF with r9d = 0x20 (bsf sets r8 = 5 zero-extended).
+        Case::new(PARTIAL_AND_BSF)
+            .reg(RAX, 0x1122_3344_5566_7788)
+            .reg(RCX, 0xAABB_CCDD_EEFF_0011)
+            .reg(RDX, 0x5555_6666_7777_8888)
+            .reg(RBX, 0xDEAD_BEEF_CAFE_00FF)
+            .reg(R8, 0x9988_7766_5544_3322)
+            .reg(R9, 0x20),
+        // 3: PRESERVE_CF_WRAPPER with CF = 0 -> eax = 10.
+        Case::new(PRESERVE_CF_WRAPPER).reg(RCX, 41).reg(RDX, 0),
+        // 4: PRESERVE_CF_WRAPPER with CF = 1 -> eax = 11.
+        Case::new(PRESERVE_CF_WRAPPER).reg(RCX, 41).reg(RDX, 1),
+        // 5: CALLER_LEAVES calling tiny leaf getter/cmpxchg/xchg.
+        Case::new(CALLER_LEAVES)
+            .reg(RCX, DATA_ADDR)
+            .mem(DATA_ADDR, &init_val),
+    ];
+    let out = run(&built, &cases);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} failed: {}", o.error);
+    }
+
+    // Check case 0: ELIDE_ENTRY
+    let rcx0 = 0xABCD_0000_0000_0010u64;
+    let r8_want = 0x0000_0010u64;
+    let r9_want = rcx0.wrapping_add(5 * 2 + 7);
+    assert_eq!(out[0].regs[R8], r8_want);
+    assert_eq!(out[0].regs[R9], r9_want);
+    assert_eq!(out[0].regs[R10], 0x1122_3344_5566_7788);
+    assert_eq!(out[0].regs[RAX], r8_want.wrapping_add(r9_want));
+
+    // Check cases 1 & 2: PARTIAL_AND_BSF
+    for idx in [1usize, 2] {
+        assert_eq!(out[idx].regs[RAX], 0x1122_3344_5566_775A, "al merge");
+        assert_eq!(out[idx].regs[RCX], 0xAABB_CCDD_EEFF_A511, "ch merge");
+        assert_eq!(out[idx].regs[RDX], 0x5555_6666_7777_1234, "dx merge");
+        assert_eq!(out[idx].regs[RBX], 0xDEAD_BEEF_CAFE_0000, "xor bl,bl merge");
+    }
+    assert_eq!(
+        out[1].regs[R8], 0x9988_7766_5544_3322,
+        "bsf with zero src must preserve full 64-bit r8"
+    );
+    assert_eq!(out[2].regs[R8], 5, "bsf(0x20) == 5 zero-extended");
+
+    // Check cases 3 & 4: PRESERVE_CF_WRAPPER
+    assert_eq!(out[3].regs[RCX], 42);
+    assert_eq!(out[3].regs[RAX], 10, "inc preserves CF=0");
+    assert_eq!(out[4].regs[RCX], 42);
+    assert_eq!(out[4].regs[RAX], 11, "inc preserves CF=1");
+
+    // Check case 5: CALLER_LEAVES
+    assert_eq!(out[5].regs[R11], 0xDEAD_BEEF);
+    assert_eq!(out[5].regs[R9], 0xCAFE_BABE);
+    assert_eq!(out[5].regs[RAX], 0x1337_C0DE);
+}

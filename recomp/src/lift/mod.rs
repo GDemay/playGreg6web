@@ -386,6 +386,10 @@ pub struct LiftedFunction {
     /// Instructions replaced by [`HELPER_UNIMPLEMENTED`] traps, in address order.
     pub unsupported: Vec<UnsupportedInstruction>,
     support: BTreeSet<Support>,
+    /// R65b: true when the function is a tiny (`<= 10` x86 instructions) true leaf with no calls,
+    /// tail calls, unwind handlers, traps, or unsupported instructions, so shard-local `internal`
+    /// emission tags it `alwaysinline`.
+    pub(super) tiny_leaf: bool,
 }
 
 impl LiftedFunction {
@@ -680,7 +684,15 @@ pub fn emit_module_with_dispatch(
             Some(d) if !d.external_entries.contains(&func.entry) => {
                 if let Some(rest) = func.ir.strip_prefix("define ") {
                     out.push_str("define internal ");
-                    out.push_str(rest);
+                    if func.tiny_leaf
+                        && let Some((header, body)) = rest.split_once(" #0 {\n")
+                    {
+                        out.push_str(header);
+                        out.push_str(" alwaysinline #0 {\n");
+                        out.push_str(body);
+                    } else {
+                        out.push_str(rest);
+                    }
                 } else {
                     out.push_str(&func.ir);
                 }

@@ -1061,8 +1061,17 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
         "hoisted base must live in entry:\n{entry}"
     );
     assert!(
-        entry.contains("!range !{i8 0, i8 2}"),
-        "flag loads carry binary range metadata:\n{entry}"
+        !entry.contains("load i8, ptr %state.flag"),
+        "entry `test rcx, rcx` overwrites all tracked flags so dead entry flag loads are elided:\n{entry}"
+    );
+    let flag_reader = asm_function(0x2100, |a| {
+        a.setz(al)?;
+        a.ret()
+    });
+    let flag_reader_entry = block_text(&lift_function(&flag_reader).expect("lifts").ir, "entry");
+    assert!(
+        flag_reader_entry.contains("!range !{i8 0, i8 2}"),
+        "live entry flag loads carry binary range metadata:\n{flag_reader_entry}"
     );
 
     // Shared cold_trap sink: 1 sync_out shared across int3 + ud2 + div (#DE), 1 call per kind.
@@ -1218,8 +1227,10 @@ fn shard_dispatch_emits_switch_internal_linkage_and_empty_shard_trap() {
     )
     .expect("emit shard");
     assert!(
-        shard_ir.contains("define internal void @sub_1000(ptr noalias noundef %state) unnamed_addr #0 {"),
-        "shard-local function should have internal linkage:\n{shard_ir}"
+        shard_ir.contains(
+            "define internal void @sub_1000(ptr noalias noundef %state) unnamed_addr alwaysinline #0 {"
+        ),
+        "shard-local tiny leaf function should have internal linkage and alwaysinline:\n{shard_ir}"
     );
     assert!(
         shard_ir.contains("\ndefine void @sub_2000(ptr noalias noundef %state) unnamed_addr #0 {"),
@@ -1348,4 +1359,341 @@ fn reloads_after_a_call_that_nothing_reads_are_dropped() {
         !ir[call..].contains("load i8, ptr %state.flag"),
         "dead flag reloads after the call:\n{ir}"
     );
+}
+
+#[test]
+fn r65a_entry_dead_gpr_and_flag_load_elision() {
+    let has_entry_gpr = |ir: &str, idx: usize| -> bool {
+        let entry = block_text(ir, "entry");
+        entry.contains(&format!("load i64, ptr %state.gpr{idx}\n"))
+    };
+    let has_entry_flag = |ir: &str, idx: usize| -> bool {
+        let entry = block_text(ir, "entry");
+        entry.contains(&format!("load i8, ptr %state.flag{idx},"))
+    };
+
+    // 1. Entry-block unconditional 64-bit and zero-extending 32-bit GPR overwrites + `sub rsp`
+    //    flag overwrite elide entry loads while keeping allocas, `rsp`, read-first sources, and
+    //    exit `sync_out` stores intact.
+    let f_elide = asm_function(0x1000, |a| {
+        a.sub(rsp, 0x28)?; // overwrites all 6 flags; rsp stays live
+        a.xor(eax, eax)?; // 32-bit zeroing idiom -> rax elided
+        a.sub(r8d, r8d)?; // 32-bit sub self zeroing idiom -> r8 elided
+        a.mov(r9d, ecx)?; // 32-bit zero-extending mov -> r9 elided, rcx kept
+        a.movzx(r10d, dl)?; // 32-bit movzx -> r10 elided, rdx kept
+        a.lea(r11d, ptr(rcx + 8))?; // 32-bit lea -> r11 elided
+        a.mov(r12, rcx)?; // 64-bit mov -> r12 elided
+        a.lea(r13, ptr(rdx * 4 + 16))?; // 64-bit lea -> r13 elided
+        a.mov(r14, qword_ptr(rcx + 8))?; // 64-bit mem load -> r14 elided
+        a.mov(r15, 0x1234u64)?; // 64-bit imm mov -> r15 elided
+        a.pop(rbx)?; // 64-bit pop -> rbx elided
+        a.add(rsp, 0x20)?;
+        a.ret()
+    });
+    let lifted = lift_function(&f_elide).expect("lifts");
+    let ir = &lifted.ir;
+    assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
+    // All 6 entry flag loads are elided by `sub rsp, 0x28`.
+    for f in 0..6 {
+        assert!(
+            !has_entry_flag(ir, f),
+            "dead entry flag{f} load must be elided:\n{ir}"
+        );
+        assert!(
+            ir.contains(&format!("ptr %state.flag{f}\n")),
+            "exit sync_out store must remain for flag{f}:\n{ir}"
+        );
+    }
+    // Overwritten GPRs elide entry loads, keep allocas and exit sync_out stores.
+    for idx in [0usize, 3, 8, 9, 10, 11, 12, 13, 14, 15] {
+        assert!(
+            !has_entry_gpr(ir, idx),
+            "dead entry gpr{idx} load must be elided:\n{ir}"
+        );
+        assert!(
+            ir.contains(&format!("ptr %state.gpr{idx}\n")),
+            "exit sync_out store must remain for gpr{idx}:\n{ir}"
+        );
+    }
+    // `rcx` (1), `rdx` (2), and `rsp` (4) are read first and must preserve entry loads.
+    for idx in [1usize, 2, 4] {
+        assert!(
+            has_entry_gpr(ir, idx),
+            "live entry gpr{idx} must keep its entry load:\n{ir}"
+        );
+    }
+
+    // 2. Partial flag writes (`xor` leaves AF; `inc` leaves CF; `adc` reads CF first).
+    let f_xor_af = asm_function(0x1100, |a| {
+        let mut done = a.create_label();
+        a.xor(eax, eax)?; // overwrites CF, PF, ZF, SF, OF (NOT AF!)
+        a.jz(done)?;
+        a.add(rax, rcx)?; // touches AF so AF is tracked
+        a.set_label(&mut done)?;
+        a.ret()
+    });
+    let ir_xor = lift_function(&f_xor_af).expect("lifts").ir;
+    for f in [0usize, 1, 3, 4, 5] {
+        assert!(
+            !has_entry_flag(&ir_xor, f),
+            "xor overwrites flag{f}:\n{ir_xor}"
+        );
+    }
+    assert!(
+        has_entry_flag(&ir_xor, 2),
+        "xor leaves AF unchanged so AF must preserve entry load:\n{ir_xor}"
+    );
+
+    let f_inc_cf = asm_function(0x1200, |a| {
+        a.inc(rcx)?; // overwrites PF, AF, ZF, SF, OF (NOT CF!)
+        a.adc(rax, 0)?; // reads CF!
+        a.ret()
+    });
+    let ir_inc = lift_function(&f_inc_cf).expect("lifts").ir;
+    assert!(
+        has_entry_flag(&ir_inc, 0),
+        "inc preserves CF so CF must keep its entry load:\n{ir_inc}"
+    );
+    for f in [1usize, 2, 3, 4, 5] {
+        assert!(
+            !has_entry_flag(&ir_inc, f),
+            "inc overwrites flag{f}:\n{ir_inc}"
+        );
+    }
+
+    // 3. Preservation (NO elision) for read-before-write, memory base/index, partial 8/16-bit
+    //    writes, and conditional writes (`cmovcc`, `bsf`/`bsr`).
+    let f_preserve = asm_function(0x2000, |a| {
+        a.cmove(r11d, r14d)?; // conditional write reads r11, r14 AND incoming ZF! -> preserved
+        a.mov(al, 1)?; // 8-bit partial -> rax preserved
+        a.mov(ch, 2)?; // high 8-bit partial -> rcx preserved
+        a.mov(dx, 3)?; // 16-bit partial -> rdx preserved
+        a.xor(bl, bl)?; // 8-bit zeroing merges -> rbx preserved
+        a.sub(si, si)?; // 16-bit zeroing merges -> rsi preserved
+        a.mov(rdi, qword_ptr(rdi + 8))?; // memory base read before write -> rdi preserved
+        a.lea(r8, ptr(r8 + r9 * 2))?; // base & index read before write -> r8, r9 preserved
+        a.mov(r10d, r10d)?; // self-move reads low 32 bits -> r10 preserved
+        a.bsf(r12d, ecx)?; // zero-src preserves dst -> r12 preserved
+        a.bsr(r13, rdx)?; // zero-src preserves dst -> r13 preserved
+        a.push(r14)?; // read before later write -> r14 preserved
+        a.mov(r14, 0u64)?;
+        a.pop(r15)?; // rsp read (rsp preserved)
+        a.sub(rsp, 8)?;
+        a.add(rsp, 8)?;
+        a.ret()
+    });
+    let ir_p = lift_function(&f_preserve).expect("lifts").ir;
+    for idx in [0usize, 1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
+        assert!(
+            has_entry_gpr(&ir_p, idx),
+            "gpr{idx} must preserve its entry load:\n{ir_p}"
+        );
+    }
+    assert!(
+        has_entry_flag(&ir_p, 3),
+        "ZF read by cmove before sub must preserve entry load:\n{ir_p}"
+    );
+
+    // 4. Writes AFTER a branch, call, or trapping/unmodelled instruction MUST preserve entry loads.
+    let f_branch = asm_function(0x3000, |a| {
+        let mut skip = a.create_label();
+        a.jz(skip)?;
+        a.xor(eax, eax)?;
+        a.set_label(&mut skip)?;
+        a.ret()
+    });
+    let ir_b = lift_function(&f_branch).expect("lifts").ir;
+    assert!(has_entry_gpr(&ir_b, 0), "post-branch rax:\n{ir_b}");
+    assert!(has_entry_flag(&ir_b, 3), "branch-read ZF:\n{ir_b}");
+
+    let prog_call = Program::new()
+        .asm(0x4000, |a| {
+            a.mov(r8d, 1)?; // before call -> elided
+            a.call(0x4100)?;
+            a.mov(r9d, 2)?; // after call -> preserved!
+            a.sub(rsp, 8)?; // after call -> flags preserved!
+            a.add(rsp, 8)?;
+            a.ret()
+        })
+        .asm(0x4100, |a| a.ret());
+    let ir_c = lift_function(&prog_call.function(0x4000)).expect("lifts").ir;
+    assert!(!has_entry_gpr(&ir_c, 8), "pre-call r8 elided:\n{ir_c}");
+    assert!(has_entry_gpr(&ir_c, 9), "post-call r9 preserved:\n{ir_c}");
+    for f in 0..6 {
+        assert!(
+            has_entry_flag(&ir_c, f),
+            "post-call flag{f} preserved:\n{ir_c}"
+        );
+    }
+
+    let f_div = asm_function(0x5000, |a| {
+        a.div(rcx)?; // may trap (#DE) -> stop pre-scan before div!
+        a.mov(r8d, 7)?;
+        a.sub(rsp, 8)?;
+        a.add(rsp, 8)?;
+        a.ret()
+    });
+    let ir_d = lift_function(&f_div).expect("lifts").ir;
+    assert!(has_entry_gpr(&ir_d, 8), "post-div r8 preserved:\n{ir_d}");
+    for f in 0..6 {
+        assert!(
+            has_entry_flag(&ir_d, f),
+            "post-div flag{f} preserved:\n{ir_d}"
+        );
+    }
+}
+
+#[test]
+fn r65b_tiny_internal_leaf_functions_get_alwaysinline() {
+    use std::collections::HashSet;
+
+    use crate::lift::compile::{compile_to_wasm64_object, find_llvm_tool};
+    use crate::lift::{ShardDispatch, emit_module_with_dispatch};
+
+    // 1. Tiny internal leaf getter (2 insns) -> alwaysinline.
+    let f_getter = asm_function(0x1000, |a| {
+        a.mov(eax, dword_ptr(rcx + 8))?;
+        a.ret()
+    });
+    // 2. Tiny internal leaf lock cmpxchg helper (3 insns, Bink2Scarlett style) -> alwaysinline.
+    let f_cmpxchg = asm_function(0x1100, |a| {
+        a.mov(eax, edx)?;
+        a.lock().cmpxchg(dword_ptr(rcx), r8d)?;
+        a.ret()
+    });
+    // 3. Tiny internal leaf xchg helper (3 insns) -> alwaysinline.
+    let f_xchg = asm_function(0x1200, |a| {
+        a.mov(eax, edx)?;
+        a.xchg(dword_ptr(rcx), eax)?;
+        a.ret()
+    });
+    // 4. Exactly 10-insn internal leaf -> alwaysinline.
+    let f_ten = asm_function(0x1300, |a| {
+        for _ in 0..9 {
+            a.inc(eax)?;
+        }
+        a.ret()
+    });
+    // 5. 11-insn internal leaf (above cap) -> NO alwaysinline.
+    let f_eleven = asm_function(0x1400, |a| {
+        for _ in 0..10 {
+            a.inc(eax)?;
+        }
+        a.ret()
+    });
+    // 6. Tiny external (cross-shard) leaf -> NO internal, NO alwaysinline.
+    let f_external = asm_function(0x1500, |a| {
+        a.mov(eax, 42)?;
+        a.ret()
+    });
+    // 7. Tiny internal non-leaf (direct call) -> NO alwaysinline.
+    let prog_caller = Program::new()
+        .asm(0x1600, |a| {
+            a.call(0x1000)?;
+            a.ret()
+        })
+        .asm(0x1000, |a| {
+            a.mov(eax, dword_ptr(rcx + 8))?;
+            a.ret()
+        });
+    let f_caller = prog_caller.function(0x1600);
+    // 8. Tiny internal non-leaf (indirect call) -> NO alwaysinline.
+    let f_icall = asm_function(0x1700, |a| {
+        a.call(rax)?;
+        a.ret()
+    });
+    // 9. Tiny internal non-leaf (indirect jump) -> NO alwaysinline.
+    let f_ijmp = asm_function(0x1800, |a| a.jmp(rax));
+    // 10. Tiny internal function with exception/unwind resume target -> NO alwaysinline.
+    let mut f_resume = asm_function(0x1900, |a| {
+        let mut handler = a.create_label();
+        a.test(ecx, ecx)?;
+        a.jz(handler)?;
+        a.mov(eax, 1)?;
+        a.ret()?;
+        a.set_label(&mut handler)?;
+        a.xor(eax, eax)?;
+        a.ret()
+    });
+    let second_block = *f_resume.blocks.keys().nth(1).expect("second block");
+    f_resume.resume_targets.insert(second_block);
+    // 11. Tiny internal function with cold trap (`div`) -> NO alwaysinline.
+    let f_div = asm_function(0x1A00, |a| {
+        a.div(rcx)?;
+        a.ret()
+    });
+
+    let lifted: Vec<_> = [
+        &f_getter,
+        &f_cmpxchg,
+        &f_xchg,
+        &f_ten,
+        &f_eleven,
+        &f_external,
+        &f_caller,
+        &f_icall,
+        &f_ijmp,
+        &f_resume,
+        &f_div,
+    ]
+    .into_iter()
+    .map(|f| lift_function(f).expect("lifts"))
+    .collect();
+
+    let mut external = HashSet::new();
+    external.insert(0x1500);
+    let shard_ir = emit_module_with_dispatch(
+        &lifted,
+        Some(ShardDispatch {
+            dispatcher_symbol: "__playgta6_dispatch_shard_r65",
+            external_entries: &external,
+        }),
+    )
+    .expect("emit shard");
+
+    for va in [0x1000u64, 0x1100, 0x1200, 0x1300] {
+        let header = format!(
+            "define internal void @sub_{va:X}(ptr noalias noundef %state) unnamed_addr alwaysinline #0 {{"
+        );
+        assert!(
+            shard_ir.contains(&header),
+            "tiny internal leaf {va:#x} must have alwaysinline:\n{shard_ir}"
+        );
+    }
+    for va in [0x1400u64, 0x1600, 0x1700, 0x1800, 0x1900, 0x1A00] {
+        let header = format!(
+            "define internal void @sub_{va:X}(ptr noalias noundef %state) unnamed_addr #0 {{"
+        );
+        assert!(
+            shard_ir.contains(&header),
+            "non-eligible internal fn {va:#x} must NOT have alwaysinline:\n{shard_ir}"
+        );
+    }
+    assert!(
+        shard_ir.contains(
+            "\ndefine void @sub_1500(ptr noalias noundef %state) unnamed_addr #0 {"
+        ),
+        "external tiny leaf must stay external without alwaysinline:\n{shard_ir}"
+    );
+
+    // Without shard dispatch, nothing is internal so nothing gets alwaysinline.
+    let plain_ir = emit_module(&lifted).expect("emit plain");
+    assert!(
+        !plain_ir.contains("alwaysinline"),
+        "external functions must not get alwaysinline:\n{plain_ir}"
+    );
+
+    // Compile the shard module through LLVM (with `+atomics` from lock cmpxchg + dispatch switch
+    // tail-calling alwaysinline internal leaves) to verify valid IR and clean lowering.
+    if let Some(tool) = find_llvm_tool() {
+        let dir = std::env::temp_dir().join(format!("playgta6_r65b_shard_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let ll = dir.join("shard.ll");
+        let obj = dir.join("shard.o");
+        std::fs::write(&ll, &shard_ir).expect("write .ll");
+        compile_to_wasm64_object(&tool, &ll, &obj)
+            .unwrap_or_else(|e| panic!("r65b shard failed LLVM compilation: {e}"));
+        assert!(std::fs::metadata(&obj).expect("obj metadata").len() > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
