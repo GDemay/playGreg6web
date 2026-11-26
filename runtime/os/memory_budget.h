@@ -28,6 +28,8 @@
 #include <cstdint>
 #include <string>
 
+#include "os/process_memory.h"
+
 namespace playgta6::os {
 
 inline constexpr uint64_t kWasmLinearMemoryLimit = uint64_t{16} << 30;
@@ -54,6 +56,14 @@ struct MemoryBudgetInput {
     uint64_t arena_peak_committed = 0;
     uint64_t arena_reclaimed_bytes = 0;
     uint64_t guest_heap_reclaimed_bytes = 0;
+    // Process-level view (0 when the platform call is unavailable): private commit and working
+    // set of the whole process, and the estimated size of the shader pack index tables.
+    uint64_t process_private_bytes = 0;
+    uint64_t process_working_set_bytes = 0;
+    uint64_t process_peak_private_bytes = 0;  // high-water mark of private commit since process start
+    uint64_t shader_pack_index_bytes = 0;
+    uint64_t stage_reflection_bytes = 0;
+    ProcessCommitMap commit_map;
 };
 
 struct MemoryBudgetTotals {
@@ -68,6 +78,9 @@ struct MemoryBudgetTotals {
     uint64_t arena_peak_committed = 0;
     uint64_t arena_reclaimed_bytes = 0;
     uint64_t guest_heap_reclaimed_bytes = 0;
+    // Private commit outside the arena that the named host tables (resident shadows, shader pack
+    // index, stage reflection) do not explain: CRT heap, Dawn, staging, decode buffers, stacks.
+    uint64_t host_unattributed = 0;
 };
 
 inline MemoryBudgetTotals memory_budget_totals(const MemoryBudgetInput& in) {
@@ -84,6 +97,8 @@ inline MemoryBudgetTotals memory_budget_totals(const MemoryBudgetInput& in) {
         in.arena_peak_committed >= in.arena_committed ? in.arena_peak_committed : in.arena_committed;
     t.arena_reclaimed_bytes = in.arena_reclaimed_bytes;
     t.guest_heap_reclaimed_bytes = in.guest_heap_reclaimed_bytes;
+    const uint64_t known = in.shadow_resident + in.shader_pack_index_bytes + in.stage_reflection_bytes;
+    t.host_unattributed = in.commit_map.other_private > known ? in.commit_map.other_private - known : 0;
     return t;
 }
 
@@ -111,7 +126,31 @@ inline std::string memory_budget_json(const MemoryBudgetInput& in) {
                     ", \"resident\": " + n(in.shadow_resident) + "}, \"gpu\": {\"textures\": " +
                     n(in.gpu_texture_bytes) + ", \"parked_textures\": " + n(in.gpu_parked_bytes) +
                     "}, \"wasm\": {\"limit\": " + n(kWasmLinearMemoryLimit) + ", \"heap\": " + n(t.wasm_heap) +
-                    ", \"headroom\": " + std::to_string(t.wasm_headroom) + "}}";
+                    ", \"headroom\": " + std::to_string(t.wasm_headroom) +
+                    "}, \"process\": {\"private\": " + n(in.process_private_bytes) +
+                    ", \"working_set\": " + n(in.process_working_set_bytes) +
+                    ", \"peak_private\": " + n(in.process_peak_private_bytes) +
+                    ", \"unattributed\": " + n(t.host_unattributed) +
+                    ", \"shader_pack_index_est\": " + n(in.shader_pack_index_bytes) +
+                    ", \"stage_reflection_est\": " + n(in.stage_reflection_bytes) +
+                    ", \"commit_arena_private\": " + n(in.commit_map.arena_private) +
+                    ", \"commit_arena_mapped\": " + n(in.commit_map.arena_mapped) +
+                    ", \"commit_other_private\": " + n(in.commit_map.other_private) +
+                    ", \"commit_other_mapped\": " + n(in.commit_map.other_mapped) +
+                    ", \"commit_image\": " + n(in.commit_map.image) +
+                    ", \"arena_private_resident\": " + n(in.commit_map.arena_private_resident) +
+                    ", \"other_private_resident\": " + n(in.commit_map.other_private_resident) +
+                    ", \"large_allocs_by_size\": [";
+    for (int i = 0; i < ProcessCommitMap::kSizes && in.commit_map.size_count[i] != 0; ++i) {
+        o += (i ? ", " : "") + std::string("{\"bytes\": ") + n(in.commit_map.size_bytes[i]) +
+             ", \"count\": " + n(in.commit_map.size_count[i]) + "}";
+    }
+    o += "], \"top_private_outside_arena\": [";
+    for (int i = 0; i < ProcessCommitMap::kTop && in.commit_map.top_bytes[i] != 0; ++i) {
+        o += (i ? ", " : "") + std::string("{\"base\": ") + n(in.commit_map.top_base[i]) +
+             ", \"bytes\": " + n(in.commit_map.top_bytes[i]) + "}";
+    }
+    o += "]}}";
     return o;
 }
 

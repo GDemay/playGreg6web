@@ -1537,6 +1537,7 @@ int main(int argc, char** argv) {
                 return kExitUsage;
             }
             std::fprintf(stderr, "[harness] shader pack %s: %zu key(s)\n", g_options.shader_pack.c_str(), index->size());
+            uint64_t index_bytes = uint64_t{index->bucket_count()} * 8 + uint64_t{index->size()} * 32;
             device_options.shader_pack = std::move(index);
             // Stage reflection sidecar (G62): <pack>.reflect.json next to the pack, when present.
             const std::string sidecar = g_options.shader_pack + ".reflect.json";
@@ -1548,6 +1549,14 @@ int main(int argc, char** argv) {
                     return kExitUsage;
                 }
                 std::fprintf(stderr, "[harness] stage reflection %s: %zu stage(s)\n", sidecar.c_str(), reflection->size());
+                uint64_t reflection_bytes = uint64_t{reflection->bucket_count()} * 8;
+                for (const auto& kv : *reflection) {
+                    reflection_bytes += 24 + sizeof(gpu::StageReflection) +
+                                        kv.second.vertex_inputs.capacity() * sizeof(gpu::ReflectedVertexInput) +
+                                        kv.second.bindings.capacity() * sizeof(gpu::ReflectedBinding) +
+                                        kv.second.address_sources.capacity() * sizeof(kv.second.address_sources[0]);
+                }
+                guest::note_host_table_bytes(index_bytes, reflection_bytes);
                 device_options.stage_reflection = std::move(reflection);
             }
         }

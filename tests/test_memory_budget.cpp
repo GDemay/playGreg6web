@@ -47,6 +47,31 @@ void test_totals_and_json() {
     CHECK(j.find("\"headroom\": -") != std::string::npos);
 }
 
+void test_process_view() {
+    MemoryBudgetInput in;
+    // Defaults: the whole process section is zero (no platform call) and the JSON stays well formed.
+    MemoryBudgetTotals t0 = memory_budget_totals(in);
+    CHECK(t0.host_unattributed == 0);
+    const std::string j0 = memory_budget_json(in);
+    CHECK(j0.find("\"process\": {\"private\": 0") != std::string::npos);
+    CHECK(j0.find("\"top_private_outside_arena\": []") != std::string::npos);
+
+    in.shadow_resident = 100;
+    in.shader_pack_index_bytes = 10;
+    in.stage_reflection_bytes = 40;
+    in.commit_map.other_private = 1000;
+    in.commit_map.top_bytes[0] = 600;
+    in.commit_map.top_base[0] = 4096;
+    in.commit_map.size_bytes[0] = 16u << 20;
+    in.commit_map.size_count[0] = 8;
+    CHECK(memory_budget_totals(in).host_unattributed == 850);  // 1000 - (100 + 10 + 40)
+    const std::string j = memory_budget_json(in);
+    CHECK(j.find("\"top_private_outside_arena\": [{\"base\": 4096, \"bytes\": 600}]") != std::string::npos);
+    CHECK(j.find("\"large_allocs_by_size\": [{\"bytes\": 16777216, \"count\": 8}]") != std::string::npos);
+    CHECK(j.find("\"unattributed\": 850") != std::string::npos);
+    CHECK(j.back() == '}');
+}
+
 void test_o54_reclaim_and_slack_telemetry() {
     // Default inputs keep all new fields 0 (backward compatible).
     MemoryBudgetInput empty;
@@ -157,6 +182,7 @@ void test_userdata_range() {
 
 int main() {
     test_totals_and_json();
+    test_process_view();
     test_o54_reclaim_and_slack_telemetry();
     test_xmem_summary();
     test_userdata_range();
