@@ -24,6 +24,9 @@ bool enforces_protection();
 // shared page views are tracked by write protection (R40); other platforms return false.
 // `view_clock`: the caller's position for shared page views (null: report them all written).
 bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets);
+// Like take_written_pages but only for ranges wholly covered by tracked shared page views: it never
+// reads MEM_WRITE_WATCH (a destructive take), and returns false (consuming nothing) otherwise.
+bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets);
 // Whether later reserve() calls ask for write tracking (where the platform has it).
 void set_write_watch(bool on);
 // R40: writes caught on armed shared page views (Windows; 0 elsewhere).

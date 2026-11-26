@@ -88,6 +88,7 @@
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
 #include "os/guest_window.h"
+#include "os/vmem.h"
 
 namespace playgta6::gpu::d3d12_guest {
 
@@ -583,6 +584,13 @@ struct TrackedTexture {
     bool window_indexed = false;
     bool window_checked = false;
     bool window_dirty = true;
+    // Native shared-view write tracking (no translated window): the range the cursor below watches
+    // and whether the last complete check (zero scan or hash) of it is still current. Cleared when
+    // os::take_written_view_pages reports pages written, or does not cover the range.
+    const uint8_t* view_host = nullptr;
+    uint64_t view_size = 0;
+    os::WriteCursor view_cursor{};
+    bool view_checked = false;
 };
 // Block rows per dirty-tracked band of a 2D texture upload (TrackedTexture::subresource_bands).
 constexpr uint32_t kUploadBandRows = 64;
