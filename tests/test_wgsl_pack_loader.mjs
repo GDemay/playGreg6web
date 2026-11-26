@@ -4,8 +4,13 @@ import assert from 'node:assert/strict';
 import {
   WGPK_MAGIC,
   WGPK_VERSION,
+  WGPK_VERSION_V1,
+  WGPK_VERSION_V2,
   WGPK_HEADER_BYTES,
   WGPK_ENTRY_BYTES,
+  WGPK_ENTRY_BYTES_V1,
+  WGPK_ENTRY_BYTES_V2,
+  wgpkEntryBytes,
   DEFAULT_INITIAL_RANGE_BYTES,
   DEFAULT_MAX_CACHED_WGSL_BYTES,
   DEFAULT_MAX_CONCURRENT_RANGE_FETCHES,
@@ -21,6 +26,7 @@ import {
   normalizeHash,
   formatHashHex,
   coalesceEntryRanges,
+  buildWgpkTocBuffer,
   buildWgslPackBuffer,
   parseWgslPack,
   parseWgslPackIndex,
@@ -4746,4 +4752,774 @@ test('W317 coalesced prefetchHashes preserves W259 ETag/size/416/mid-shader stal
   assert.equal(await multiPack.getWgslAsync(h1), wgsl1_v2);
   assert.equal(await multiPack.getWgslAsync(h2), wgsl2_v2);
   assert.equal(await multiPack.getWgslAsync(h3), wgsl3_v2);
+});
+
+// ---------------------------------------------------------------------------
+// W372: WGPK v2 (>4 GiB, 24-byte 64-bit-offset TOC) HTTP Range streaming (#1709)
+// ---------------------------------------------------------------------------
+
+test('W372 WGPK v2 constants, wgpkEntryBytes, and binary wire layout match shaders/src/pack.rs byte-for-byte', () => {
+  assert.equal(WGPK_VERSION, 1);
+  assert.equal(WGPK_VERSION_V1, 1);
+  assert.equal(WGPK_VERSION_V2, 2);
+  assert.equal(WGPK_ENTRY_BYTES, 20);
+  assert.equal(WGPK_ENTRY_BYTES_V1, 20);
+  assert.equal(WGPK_ENTRY_BYTES_V2, 24);
+
+  assert.equal(wgpkEntryBytes(1), 20);
+  assert.equal(wgpkEntryBytes(2), 24);
+  assert.equal(wgpkEntryBytes(0), null);
+  assert.equal(wgpkEntryBytes(3), null);
+  assert.equal(wgpkEntryBytes('2'), null);
+  assert.equal(wgpkEntryBytes(NaN), null);
+
+  // Exact WGPK v2 byte layout matching shaders/src/pack.rs::encode_pack_toc + runtime/gpu/shader_pack_index.cpp:
+  // Header (16 B): "WGPK", version=2 LE, entry_count=1 LE, flags=0x00000007 LE
+  // v2 Entry (24 B): hash=0x1122334455667788 LE, stage=3 (compute), reserved=[0,0,0],
+  //                  length=40 (0x28) at +12, offset=40 (0x28) as u64 LE at +16
+  // Payload (40 B): SAMPLE_CS_WGSL
+  const payloadBytes = new TextEncoder().encode(SAMPLE_CS_WGSL);
+  assert.equal(payloadBytes.byteLength, 40);
+
+  const expectedV2Pack = new Uint8Array([
+    // Header (16 bytes)
+    0x57, 0x47, 0x50, 0x4b,
+    0x02, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00,
+    0x07, 0x00, 0x00, 0x00,
+    // v2 TOC Entry 0 (24 bytes): NOTE length at +12, u64 offset at +16
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+    0x03, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00,
+    0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // Payload (40 bytes)
+    ...payloadBytes,
+  ]);
+  assert.equal(expectedV2Pack.byteLength, 80);
+
+  const builtV2Num = buildWgslPackBuffer(
+    [{ hash: 0x1122334455667788n, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL }],
+    { version: 2, flags: 7 }
+  );
+  assert.deepEqual(new Uint8Array(builtV2Num), expectedV2Pack);
+
+  const builtV2Str = buildWgslPackBuffer(
+    [{ hash: 0x1122334455667788n, stage: 'compute', wgsl: SAMPLE_CS_WGSL }],
+    { version: 'v2', flags: 7 }
+  );
+  assert.deepEqual(new Uint8Array(builtV2Str), expectedV2Pack);
+
+  // Default buildWgslPackBuffer remains WGPK v1 (byte-identical backwards compatibility)
+  const builtDefault = buildWgslPackBuffer([
+    { hash: 0x1122334455667788n, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL },
+  ]);
+  assert.equal(new DataView(builtDefault).getUint32(4, true), 1);
+  assert.equal(builtDefault.byteLength, 16 + 20 + 40);
+
+  // 'auto' selects v1 for small packs
+  const builtAuto = buildWgslPackBuffer(
+    [{ hash: 0x1122334455667788n, stage: SHADER_STAGE.COMPUTE, wgsl: SAMPLE_CS_WGSL }],
+    { version: 'auto' }
+  );
+  assert.deepEqual(new Uint8Array(builtAuto), new Uint8Array(builtDefault));
+
+  // buildWgpkTocBuffer encodes synthetic >4 GiB u64 offsets byte-for-byte without payload allocation
+  const bigOffset = 0x0000_0001_2345_6789n; // ~4.89 GiB
+  const tocV2 = buildWgpkTocBuffer(
+    [{ hash: 0x1122334455667788n, stage: SHADER_STAGE.FRAGMENT, offset: bigOffset, length: 0x0000_0040 }],
+    { version: 2, flags: 3 }
+  );
+  const expectedTocV2 = new Uint8Array([
+    // Header (16 B)
+    0x57, 0x47, 0x50, 0x4b,
+    0x02, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x00,
+    // v2 TOC Entry 0 (24 B): hash, stage=2, reserved, length=0x40 (+12), offset=0x0000000123456789 LE (+16)
+    0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+    0x02, 0x00, 0x00, 0x00,
+    0x40, 0x00, 0x00, 0x00,
+    0x89, 0x67, 0x45, 0x23, 0x01, 0x00, 0x00, 0x00,
+  ]);
+  assert.deepEqual(new Uint8Array(tocV2), expectedTocV2);
+
+  // buildWgpkTocBuffer auto-upgrades to v2 when an offset exceeds u32::MAX, and rejects v1 overflow
+  const tocAutoBig = buildWgpkTocBuffer([
+    { hash: 0x1122334455667788n, stage: 'fragment', offset: Number(bigOffset), length: 64 },
+  ], { flags: 3 });
+  assert.deepEqual(new Uint8Array(tocAutoBig), expectedTocV2);
+
+  assert.throws(
+    () => buildWgpkTocBuffer([{ hash: 1n, stage: 'vertex', offset: 0x1_0000_0000, length: 16 }], { version: 1 }),
+    RangeError
+  );
+  assert.throws(
+    () => buildWgslPackBuffer([], { version: 3 }),
+    RangeError
+  );
+  assert.throws(
+    () => buildWgpkTocBuffer([], { version: 'v9' }),
+    RangeError
+  );
+});
+
+test('W372 WGPK v2 in-memory round-trip supports eager, lazy, SharedArrayBuffer, empty packs, and WgslPackCache', () => {
+  const utf8Frag = `// WGPK v2 UTF-8 shader 日本語 🚀\n${SAMPLE_FS_WGSL}`;
+  const hVs = fnv1a64('w372-v2-vs');
+  const hFs = fnv1a64('w372-v2-fs');
+  const hCs = fnv1a64('w372-v2-cs');
+  const hEmpty = fnv1a64('w372-v2-empty');
+
+  const v2Buf = buildWgslPackBuffer(
+    [
+      { hash: hVs, stage: 'vertex', wgsl: SAMPLE_VS_WGSL },
+      { hash: hFs, stage: SHADER_STAGE.FRAGMENT, wgsl: utf8Frag },
+      { hash: hCs, stage: 'compute', wgsl: SAMPLE_CS_WGSL },
+      { hash: hEmpty, stage: 'compute', wgsl: '' },
+    ],
+    { version: 2, flags: 0x12 }
+  );
+
+  // Set non-zero reserved bytes on entry 0 to confirm forward compatibility on v2 reads
+  const v2Bytes = new Uint8Array(v2Buf);
+  v2Bytes[WGPK_HEADER_BYTES + 9] = 0xde;
+  v2Bytes[WGPK_HEADER_BYTES + 10] = 0xad;
+  v2Bytes[WGPK_HEADER_BYTES + 11] = 0xbe;
+
+  // Eager decode
+  const eager = parseWgslPack(v2Bytes);
+  assert.equal(eager.version, 2);
+  assert.equal(eager.entryBytes, 24);
+  assert.equal(eager.flags, 0x12);
+  assert.equal(eager.dataStart, WGPK_HEADER_BYTES + 4 * WGPK_ENTRY_BYTES_V2);
+  assert.equal(eager.getSource(hVs), SAMPLE_VS_WGSL);
+  assert.equal(eager.getSource(hFs), utf8Frag);
+  assert.equal(eager.getSource(hCs), SAMPLE_CS_WGSL);
+  assert.equal(eager.getSource(hEmpty), '');
+  const eagerStats = eager.stats();
+  assert.equal(eagerStats.version, 2);
+  assert.equal(eagerStats.entryBytes, 24);
+  assert.equal(eagerStats.tableBytes, 4 * 24);
+  assert.equal(eagerStats.entryCount, 4);
+  assert.equal(eagerStats.decodedCount, 4);
+
+  // Lazy decode
+  const lazy = parseWgslPack(v2Bytes, { lazyDecode: true });
+  assert.equal(lazy.version, 2);
+  assert.equal(lazy.entryBytes, 24);
+  assert.equal(lazy.stats().decodedCount, 0);
+  assert.equal(lazy.getSource(hFs), utf8Frag);
+  assert.equal(lazy.stats().decodedCount, 1);
+
+  // SharedArrayBuffer
+  if (typeof SharedArrayBuffer !== 'undefined') {
+    const sab = new SharedArrayBuffer(v2Bytes.byteLength);
+    new Uint8Array(sab).set(v2Bytes);
+    const sabPack = parseWgslPack(sab, { lazyDecode: true });
+    assert.equal(sabPack.version, 2);
+    assert.equal(sabPack.entryBytes, 24);
+    assert.equal(sabPack.getSource(hVs), SAMPLE_VS_WGSL);
+    assert.equal(sabPack.getSource(hFs), utf8Frag);
+  }
+
+  // Empty WGPK v2 pack (0 entries)
+  const emptyV2 = buildWgslPackBuffer([], { version: 2 });
+  assert.equal(emptyV2.byteLength, WGPK_HEADER_BYTES);
+  const emptyPack = parseWgslPack(emptyV2);
+  assert.equal(emptyPack.version, 2);
+  assert.equal(emptyPack.entryBytes, 24);
+  assert.equal(emptyPack.stats().tableBytes, 0);
+  assert.equal(emptyPack.size, 0);
+
+  // WgslPackCache integration
+  const cache = new WgslPackCache({ lazyDecode: true });
+  cache.loadPackBuffer(v2Bytes, 'v2-mem.wgsl.pack');
+  const mockGpu = createMockGpuDevice();
+  const mod = cache.getOrCreateShaderModule(mockGpu.device, hFs, 'v2test');
+  assert.equal(mod.code, utf8Frag);
+  assert.equal(cache.getStats().packs['v2-mem.wgsl.pack'].version, 2);
+  assert.equal(cache.getStats().packs['v2-mem.wgsl.pack'].entryBytes, 24);
+  assert.equal(cache.getStats().packs['v2-mem.wgsl.pack'].tableBytes, 4 * 24);
+});
+
+test('W372 synthetic >4 GiB (5 GiB & 8.8 GB) WGPK v2 TOC streams via HTTP 206 Range without 32-bit truncation', async () => {
+  const enc = new TextEncoder();
+  const TOTAL_8_8_GB = 8_800_000_000; // 0x2_0c85_5800 (> 8 GiB, mirrors real 8.8 GB shader pack!)
+
+  const hLow = fnv1a64('w372-low');
+  const h5GibA = fnv1a64('w372-5gib-a');
+  const h5GibB = fnv1a64('w372-5gib-b');
+  const h8Gib = fnv1a64('w372-8gib');
+  const h88GbA = fnv1a64('w372-88gb-a');
+  const h88GbB = fnv1a64('w372-88gb-b');
+
+  const wgslLow = '@vertex fn vs_low() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const wgsl5GibA = '@fragment fn fs_5gib_a() -> @location(0) vec4<f32> { return vec4<f32>(0.5, 0.1, 0.2, 1.0); }';
+  const wgsl5GibB = '@compute @workgroup_size(4) fn cs_5gib_b() {}';
+  const wgsl8Gib = '@vertex fn vs_8gib() -> @builtin(position) vec4<f32> { return vec4<f32>(0.8, 0.8, 0.0, 1.0); }';
+  const wgsl88GbA = '@fragment fn fs_88gb_a() -> @location(0) vec4<f32> { return vec4<f32>(0.88, 0.2, 0.3, 1.0); }';
+  const wgsl88GbB = '@compute @workgroup_size(8) fn cs_88gb_b() {}';
+
+  const lenLow = enc.encode(wgslLow).byteLength;
+  const len5GibA = enc.encode(wgsl5GibA).byteLength;
+  const len5GibB = enc.encode(wgsl5GibB).byteLength;
+  const len8Gib = enc.encode(wgsl8Gib).byteLength;
+  const len88GbA = enc.encode(wgsl88GbA).byteLength;
+  const len88GbB = enc.encode(wgsl88GbB).byteLength;
+
+  // Offsets strictly > 4 GiB (0x1_0000_0000): note that off5GibA >>> 0 === 0x40000000 and
+  // off8Gib >>> 0 === 0x00000000 — any stray `>>> 0` truncation would immediately request the wrong bytes!
+  const ENTRY_COUNT = 6;
+  const TABLE_END = WGPK_HEADER_BYTES + ENTRY_COUNT * WGPK_ENTRY_BYTES_V2; // 16 + 144 = 160 bytes
+  const offLow = TABLE_END;
+  const off5GibA = 0x1_4000_0000; // 5 GiB (5,368,709,120)
+  const off5GibB = off5GibA + len5GibA + 128; // 128 B gap -> coalesces with off5GibA!
+  const off8Gib = 0x2_0000_0000; // exact 8 GiB (8,589,934,592; low 32 bits == 0!)
+  const off88GbA = TOTAL_8_8_GB - 4096; // near 8.8 GB tail
+  const off88GbB = off88GbA + len88GbA + 256; // 256 B gap -> coalesces with off88GbA!
+
+  const tocBuf = buildWgpkTocBuffer(
+    [
+      { hash: hLow, stage: SHADER_STAGE.VERTEX, offset: offLow, length: lenLow },
+      { hash: h5GibA, stage: SHADER_STAGE.FRAGMENT, offset: off5GibA, length: len5GibA },
+      { hash: h5GibB, stage: SHADER_STAGE.COMPUTE, offset: off5GibB, length: len5GibB },
+      { hash: h8Gib, stage: SHADER_STAGE.VERTEX, offset: BigInt(off8Gib), length: len8Gib },
+      { hash: h88GbA, stage: SHADER_STAGE.FRAGMENT, offset: off88GbA, length: len88GbA },
+      { hash: h88GbB, stage: SHADER_STAGE.COMPUTE, offset: off88GbB, length: len88GbB },
+    ],
+    { version: 2 }
+  );
+  const indexBytes = new Uint8Array(tocBuf);
+  assert.equal(indexBytes.byteLength, TABLE_END);
+
+  const payloadsByOffset = new Map([
+    [offLow, wgslLow],
+    [off5GibA, wgsl5GibA],
+    [off5GibB, wgsl5GibB],
+    [off8Gib, wgsl8Gib],
+    [off88GbA, wgsl88GbA],
+    [off88GbB, wgsl88GbB],
+  ]);
+
+  const createV2SparseMock = ({
+    url: targetUrl,
+    indexBytes: tocBytes,
+    totalBytes,
+    payloads,
+    omitTotalInContentRange = false,
+    beforeResponse = null,
+  }) => {
+    const requests = [];
+    const encodedPayloads = new Map();
+    for (const [off, wgsl] of payloads.entries()) {
+      encodedPayloads.set(off, typeof wgsl === 'string' ? enc.encode(wgsl) : wgsl);
+    }
+    const readHeader = (headers, name) => {
+      if (!headers) return null;
+      if (typeof headers.get === 'function') return headers.get(name);
+      const target = name.toLowerCase();
+      for (const [k, v] of Object.entries(headers)) {
+        if (k.toLowerCase() === target) return String(v);
+      }
+      return null;
+    };
+    const mockFetch = async (url, init = {}) => {
+      const method = (init && init.method ? String(init.method) : 'GET').toUpperCase();
+      const range = readHeader(init && init.headers, 'Range');
+      if (beforeResponse) {
+        const override = await beforeResponse({ url, method, range, init, requests });
+        if (override) {
+          requests.push({ url, method, range, status: override.status });
+          return override;
+        }
+      }
+      assert.equal(url, targetUrl);
+      if (method === 'HEAD') {
+        requests.push({ url, method, range: null, status: 200 });
+        return {
+          ok: true,
+          status: 200,
+          statusText: 'OK',
+          headers: new Headers({
+            'Content-Length': String(totalBytes),
+            'Accept-Ranges': 'bytes',
+          }),
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      assert.ok(range, `Refusing un-ranged full GET of ${totalBytes}-byte WGPK v2 pack`);
+      const m = /^bytes=(\d+)-(\d+)$/i.exec(range.trim());
+      assert.ok(m, `Invalid Range header: ${range}`);
+      const reqStart = Number(m[1]);
+      const reqEnd = Number(m[2]);
+      assert.ok(Number.isSafeInteger(reqStart) && reqStart >= 0 && reqStart < totalBytes);
+      assert.ok(Number.isSafeInteger(reqEnd) && reqEnd >= reqStart);
+      const end = Math.min(reqEnd, totalBytes - 1);
+      const spanLen = end - reqStart + 1;
+      const out = new Uint8Array(spanLen);
+
+      if (reqStart < tocBytes.byteLength) {
+        const tocEnd = Math.min(tocBytes.byteLength, end + 1);
+        out.set(tocBytes.subarray(reqStart, tocEnd), 0);
+      }
+      let matchedPayload = false;
+      for (const [off, payload] of encodedPayloads.entries()) {
+        const pEnd = off + payload.byteLength;
+        const overlapStart = Math.max(reqStart, off);
+        const overlapEnd = Math.min(end + 1, pEnd);
+        if (overlapStart < overlapEnd) {
+          out.set(payload.subarray(overlapStart - off, overlapEnd - off), overlapStart - reqStart);
+          matchedPayload = true;
+        }
+      }
+      if (reqStart >= tocBytes.byteLength) {
+        assert.ok(matchedPayload, `Unexpected payload Range ${range} did not hit any registered >4 GiB entry`);
+      }
+      const totalTag = omitTotalInContentRange ? '*' : String(totalBytes);
+      requests.push({ url, method, range, status: 206, start: reqStart, end, bytesSent: out.byteLength });
+      return {
+        ok: true,
+        status: 206,
+        statusText: 'Partial Content',
+        headers: new Headers({
+          'Content-Range': `bytes ${reqStart}-${end}/${totalTag}`,
+          'Content-Length': String(out.byteLength),
+          'Accept-Ranges': 'bytes',
+        }),
+        async arrayBuffer() {
+          return out.buffer;
+        },
+      };
+    };
+    return { fetch: mockFetch, requests };
+  };
+
+  // 1. Multi-step TOC Range load (initialRangeBytes = 64 < TABLE_END = 160) -> loads ONLY 160B TOC!
+  const multiStepMock = createV2SparseMock({
+    url: '/packs/gta6-v2-88gb.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_8_8_GB,
+    payloads: payloadsByOffset,
+  });
+
+  const pack = await loadIndexFromUrl('/packs/gta6-v2-88gb.wgsl.pack', {
+    fetch: multiStepMock.fetch,
+    initialRangeBytes: 64,
+  });
+  assert.equal(pack.mode, 'ranged');
+  assert.equal(pack.version, 2);
+  assert.equal(pack.entryBytes, 24);
+  assert.equal(pack.dataStart, TABLE_END);
+  assert.equal(pack.totalSize, TOTAL_8_8_GB);
+  assert.equal(multiStepMock.requests.length, 2, 'should load TOC in 2 small Range requests (0-63, 64-159)');
+  assert.equal(multiStepMock.requests[0].range, 'bytes=0-63');
+  assert.equal(multiStepMock.requests[1].range, `bytes=64-${TABLE_END - 1}`);
+
+  const stats = pack.stats();
+  assert.equal(stats.version, 2);
+  assert.equal(stats.entryBytes, 24);
+  assert.equal(stats.tableBytes, ENTRY_COUNT * 24);
+  assert.equal(stats.totalSize, TOTAL_8_8_GB);
+  assert.equal(stats.byteLength, TOTAL_8_8_GB);
+  assert.equal(stats.rangeBytesFetched, TABLE_END);
+
+  // Verify exact >4 GiB Range headers on getWgslAsync (zero 32-bit wraparound!)
+  assert.equal(await pack.getWgslAsync(h8Gib), wgsl8Gib);
+  assert.equal(
+    multiStepMock.requests[2].range,
+    `bytes=${off8Gib}-${off8Gib + len8Gib - 1}`,
+    'exact 8 GiB offset (low 32 bits == 0) must not truncate to 0'
+  );
+  assert.equal(await pack.getWgslAsync(hLow), wgslLow);
+  assert.equal(multiStepMock.requests[3].range, `bytes=${offLow}-${offLow + lenLow - 1}`);
+
+  // 2. Coalesced prefetchHashes across >4 GiB clusters (5 GiB pair + 8.8 GB pair, unsorted input)
+  const reqsBeforePrefetch = multiStepMock.requests.length;
+  const pfRes = await pack.prefetchHashes([h88GbB, h5GibB, h88GbA, h5GibA]);
+  assert.equal(pfRes.requested, 4);
+  assert.equal(pfRes.prefetched, 4);
+  assert.equal(pfRes.batches, 2, '5 GiB pair and 8.8 GB pair must coalesce into 2 HTTP 206 Range fetches');
+  assert.equal(multiStepMock.requests.length, reqsBeforePrefetch + 2);
+
+  const pfRanges = multiStepMock.requests.slice(reqsBeforePrefetch).map((r) => r.range);
+  assert.deepEqual(pfRanges, [
+    `bytes=${off5GibA}-${off5GibB + len5GibB - 1}`,
+    `bytes=${off88GbA}-${off88GbB + len88GbB - 1}`,
+  ]);
+
+  // All 4 prefetched >4 GiB shaders hit cache with 0 extra HTTP requests
+  assert.equal(await pack.getWgslAsync(h5GibA), wgsl5GibA);
+  assert.equal(await pack.getWgslAsync(h5GibB), wgsl5GibB);
+  assert.equal(await pack.getWgslAsync(h88GbA), wgsl88GbA);
+  assert.equal(await pack.getWgslAsync(h88GbB), wgsl88GbB);
+  assert.equal(multiStepMock.requests.length, reqsBeforePrefetch + 2);
+  assert.equal(pack.stats().coalescedRangeFetches, 2);
+  assert.equal(pack.stats().coalescedEntriesFetched, 4);
+  assert.equal(pack.stats().httpRequestsSavedByCoalescing, 2);
+
+  // 3. loadFromUrl({ streamThresholdBytes }) auto-switches to ranged mode via HEAD without full GET
+  const headMock = createV2SparseMock({
+    url: '/packs/gta6-v2-head.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_8_8_GB,
+    payloads: payloadsByOffset,
+  });
+  const loader = new WgslPackLoader({
+    fetch: headMock.fetch,
+    streamThresholdBytes: 64 * 1024 * 1024, // 64 MiB << 8.8 GB
+    initialRangeBytes: 4096,
+  });
+  const headPack = await loader.loadFromUrl('/packs/gta6-v2-head.wgsl.pack');
+  assert.equal(headPack.mode, 'ranged');
+  assert.equal(headPack.version, 2);
+  assert.equal(headPack.entryBytes, 24);
+  assert.equal(headPack.totalSize, TOTAL_8_8_GB);
+  assert.equal(headMock.requests.length, 2, 'HEAD probe + single Range TOC fetch');
+  assert.equal(headMock.requests[0].method, 'HEAD');
+  assert.equal(headMock.requests[1].range, 'bytes=0-4095');
+
+  const gpu = createMockGpuDevice();
+  const compiled88 = await loader.getOrCreateShaderModuleAsync(gpu.device, h88GbA, 'gta6');
+  assert.equal(compiled88.code, wgsl88GbA);
+  assert.equal(headMock.requests[2].range, `bytes=${off88GbA}-${off88GbA + len88GbA - 1}`);
+
+  // 4. loadFromUrl({ streamThresholdBytes }) Range-probe fallback when HEAD returns 405
+  const noHeadMock = createV2SparseMock({
+    url: '/packs/gta6-v2-nohead.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_8_8_GB,
+    payloads: payloadsByOffset,
+    beforeResponse: ({ method }) => {
+      if (method === 'HEAD') {
+        return { ok: false, status: 405, statusText: 'Method Not Allowed', headers: new Headers() };
+      }
+      return null;
+    },
+  });
+  const probePack = await loadFromUrl('/packs/gta6-v2-nohead.wgsl.pack', {
+    fetch: noHeadMock.fetch,
+    streamThresholdBytes: 64 * 1024 * 1024,
+    initialRangeBytes: 4096,
+  });
+  assert.equal(probePack.mode, 'ranged');
+  assert.equal(probePack.version, 2);
+  assert.equal(probePack.totalSize, TOTAL_8_8_GB);
+  assert.equal(await probePack.getWgslAsync(h5GibA), wgsl5GibA);
+
+  // 5. Unknown total size (Content-Range: bytes 0-N/*) still accepts >4 GiB WGPK v2 offsets
+  const unknownTotalMock = createV2SparseMock({
+    url: '/packs/gta6-v2-star.wgsl.pack',
+    indexBytes,
+    totalBytes: TOTAL_8_8_GB,
+    payloads: payloadsByOffset,
+    omitTotalInContentRange: true,
+  });
+  const starPack = await loadIndexFromUrl('/packs/gta6-v2-star.wgsl.pack', {
+    fetch: unknownTotalMock.fetch,
+    initialRangeBytes: TABLE_END,
+  });
+  assert.equal(starPack.version, 2);
+  assert.equal(starPack.totalSize, null);
+  assert.equal(starPack.byteLength, off88GbB + len88GbB);
+  assert.equal(await starPack.getWgslAsync(h88GbB), wgsl88GbB);
+});
+
+test('W372 stale-index auto-reload upgrades v1->v2 (>4 GiB) and refreshes shifted >4 GiB v2 offsets in getWgslAsync & prefetchHashes', async () => {
+  const enc = new TextEncoder();
+  const hA = fnv1a64('w372-reload-a');
+  const hB = fnv1a64('w372-reload-b');
+  const hC = fnv1a64('w372-reload-c');
+
+  const wgslA_v1 = '@vertex fn vs_a_v1() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const wgslB_v1 = '@fragment fn fs_b_v1() -> @location(0) vec4<f32> { return vec4<f32>(0.1, 0.2, 0.3, 1.0); }';
+  const wgslC_v1 = '@compute @workgroup_size(1) fn cs_c_v1() {}';
+
+  const wgslA_v2 = '@vertex fn vs_a_v2_hi() -> @builtin(position) vec4<f32> { return vec4<f32>(0.5, 0.5, 0.0, 1.0); }';
+  const wgslB_v2 = '@fragment fn fs_b_v2_hi() -> @location(0) vec4<f32> { return vec4<f32>(0.9, 0.8, 0.7, 1.0); }';
+  const wgslC_v2 = '@compute @workgroup_size(16) fn cs_c_v2_hi() {}';
+
+  const wgslA_v3 = '@vertex fn vs_a_v3_88gb() -> @builtin(position) vec4<f32> { return vec4<f32>(1.0); }';
+  const wgslB_v3 = '@fragment fn fs_b_v3_88gb() -> @location(0) vec4<f32> { return vec4<f32>(0.2, 0.9, 0.4, 1.0); }';
+  const wgslC_v3 = '@compute @workgroup_size(32) fn cs_c_v3_88gb() {}';
+
+  // Mutable sparse Range server supporting arbitrary >4 GiB virtual packs
+  const makeMutableSparseMock = (initialState) => {
+    const state = { ...initialState };
+    const requests = [];
+    const mockFetch = async (url, init = {}) => {
+      const headersIn = init && init.headers ? init.headers : {};
+      let range = null;
+      if (typeof headersIn.get === 'function') {
+        range = headersIn.get('Range');
+      } else {
+        for (const [k, v] of Object.entries(headersIn)) {
+          if (k.toLowerCase() === 'range') {
+            range = String(v);
+            break;
+          }
+        }
+      }
+      const m = /^bytes=(\d+)-(\d+)$/i.exec(range || '');
+      if (!m) {
+        throw new Error(`Unexpected non-Range request in mutable sparse mock: ${range}`);
+      }
+      const reqStart = Number(m[1]);
+      const reqEnd = Number(m[2]);
+      const clampedEnd = Math.min(reqEnd, state.totalBytes - 1);
+      if (reqStart >= state.totalBytes) {
+        const respHeaders = new Headers({
+          'Content-Range': `bytes */${state.totalBytes}`,
+          ETag: state.etag,
+        });
+        requests.push({ range, status: 416 });
+        return {
+          ok: false,
+          status: 416,
+          statusText: 'Range Not Satisfiable',
+          headers: respHeaders,
+          async arrayBuffer() {
+            return new ArrayBuffer(0);
+          },
+        };
+      }
+      const spanLen = clampedEnd - reqStart + 1;
+      const out = new Uint8Array(spanLen);
+      // Fill TOC overlap if any
+      if (reqStart < state.indexBytes.byteLength) {
+        const tocCopyEnd = Math.min(state.indexBytes.byteLength, clampedEnd + 1);
+        out.set(state.indexBytes.subarray(reqStart, tocCopyEnd), 0);
+      }
+      // Fill sparse payload overlaps
+      for (const [off, payload] of state.payloadsByOffset.entries()) {
+        const pEnd = off + payload.byteLength;
+        const overlapStart = Math.max(reqStart, off);
+        const overlapEnd = Math.min(clampedEnd + 1, pEnd);
+        if (overlapStart < overlapEnd) {
+          out.set(
+            payload.subarray(overlapStart - off, overlapEnd - off),
+            overlapStart - reqStart
+          );
+        }
+      }
+      requests.push({ range, status: 206 });
+      return {
+        ok: true,
+        status: 206,
+        statusText: 'Partial Content',
+        headers: new Headers({
+          'Content-Range': `bytes ${reqStart}-${clampedEnd}/${state.totalBytes}`,
+          'Content-Length': String(out.byteLength),
+          ETag: state.etag,
+        }),
+        async arrayBuffer() {
+          return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength);
+        },
+      };
+    };
+    return { fetch: mockFetch, state, requests };
+  };
+
+  // Generation 1: WGPK v1 (20B/entry, TOC = 16 + 60 = 76B)
+  const v1TableEnd = WGPK_HEADER_BYTES + 3 * WGPK_ENTRY_BYTES_V1;
+  const v1OffA = v1TableEnd;
+  const v1OffB = v1OffA + enc.encode(wgslA_v1).byteLength;
+  const v1OffC = v1OffB + enc.encode(wgslB_v1).byteLength;
+  const v1Total = v1OffC + enc.encode(wgslC_v1).byteLength;
+  const v1Index = new Uint8Array(
+    buildWgpkTocBuffer(
+      [
+        { hash: hA, stage: 'vertex', offset: v1OffA, length: enc.encode(wgslA_v1).byteLength },
+        { hash: hB, stage: 'fragment', offset: v1OffB, length: enc.encode(wgslB_v1).byteLength },
+        { hash: hC, stage: 'compute', offset: v1OffC, length: enc.encode(wgslC_v1).byteLength },
+      ],
+      { version: 1 }
+    )
+  );
+
+  // Generation 2: WGPK v2 (>4 GiB, 24B/entry, TOC = 16 + 72 = 88B — larger than v1TableEnd!)
+  const v2Total = 5_500_000_000;
+  const v2OffA = 0x1_2000_0000; // 4.5 GiB
+  const v2OffB = v2OffA + enc.encode(wgslA_v2).byteLength + 64;
+  const v2OffC = v2OffB + enc.encode(wgslB_v2).byteLength + 64;
+  const v2Index = new Uint8Array(
+    buildWgpkTocBuffer(
+      [
+        { hash: hA, stage: 'vertex', offset: v2OffA, length: enc.encode(wgslA_v2).byteLength },
+        { hash: hB, stage: 'fragment', offset: v2OffB, length: enc.encode(wgslB_v2).byteLength },
+        { hash: hC, stage: 'compute', offset: v2OffC, length: enc.encode(wgslC_v2).byteLength },
+      ],
+      { version: 2 }
+    )
+  );
+
+  // Generation 3: Shifted WGPK v2 at ~8.8 GB
+  const v3Total = 8_800_000_000;
+  const v3OffA = 0x2_0800_0000; // ~8.125 GiB
+  const v3OffB = v3OffA + enc.encode(wgslA_v3).byteLength + 96;
+  const v3OffC = v3OffB + enc.encode(wgslB_v3).byteLength + 96;
+  const v3Index = new Uint8Array(
+    buildWgpkTocBuffer(
+      [
+        { hash: hA, stage: 'vertex', offset: v3OffA, length: enc.encode(wgslA_v3).byteLength },
+        { hash: hB, stage: 'fragment', offset: v3OffB, length: enc.encode(wgslB_v3).byteLength },
+        { hash: hC, stage: 'compute', offset: v3OffC, length: enc.encode(wgslC_v3).byteLength },
+      ],
+      { version: 2 }
+    )
+  );
+
+  const mock = makeMutableSparseMock({
+    indexBytes: v1Index,
+    totalBytes: v1Total,
+    etag: '"pack-gen1-v1"',
+    payloadsByOffset: new Map([
+      [v1OffA, enc.encode(wgslA_v1)],
+      [v1OffB, enc.encode(wgslB_v1)],
+      [v1OffC, enc.encode(wgslC_v1)],
+    ]),
+  });
+
+  // Start with initialRangeBytes sized exactly for v1 TOC (76B) to also exercise multi-step v2 TOC reload (88B)!
+  const pack = await loadIndexFromUrl('/packs/upgrade.wgsl.pack', {
+    fetch: mock.fetch,
+    initialRangeBytes: v1TableEnd,
+  });
+  assert.equal(pack.version, 1);
+  assert.equal(pack.entryBytes, 20);
+  assert.equal(pack.stats().tableBytes, 60);
+
+  // Swap server from v1 -> >4 GiB v2 before calling getWgslAsync(hA)
+  mock.state.indexBytes = v2Index;
+  mock.state.totalBytes = v2Total;
+  mock.state.etag = '"pack-gen2-v2-5gib"';
+  mock.state.payloadsByOffset = new Map([
+    [v2OffA, enc.encode(wgslA_v2)],
+    [v2OffB, enc.encode(wgslB_v2)],
+    [v2OffC, enc.encode(wgslC_v2)],
+  ]);
+
+  assert.equal(await pack.getWgslAsync(hA), wgslA_v2);
+  assert.equal(pack.version, 2);
+  assert.equal(pack.entryBytes, 24);
+  assert.equal(pack.totalSize, v2Total);
+  assert.equal(pack.stats().version, 2);
+  assert.equal(pack.stats().entryBytes, 24);
+  assert.equal(pack.stats().tableBytes, 72);
+  assert.equal(pack.stats().staleIndexReloads, 1);
+  assert.equal(
+    mock.requests[mock.requests.length - 1].range,
+    `bytes=${v2OffA}-${v2OffA + enc.encode(wgslA_v2).byteLength - 1}`
+  );
+
+  // Now swap server from 5.5 GB v2 -> shifted 8.8 GB v2 before coalesced prefetchHashes([hB, hC])!
+  mock.state.indexBytes = v3Index;
+  mock.state.totalBytes = v3Total;
+  mock.state.etag = '"pack-gen3-v2-88gb"';
+  mock.state.payloadsByOffset = new Map([
+    [v3OffA, enc.encode(wgslA_v3)],
+    [v3OffB, enc.encode(wgslB_v3)],
+    [v3OffC, enc.encode(wgslC_v3)],
+  ]);
+
+  const pfRes = await pack.prefetchHashes([hC, hB]);
+  assert.equal(pfRes.prefetched, 2);
+  assert.equal(pfRes.batches, 1);
+  assert.equal(pack.totalSize, v3Total);
+  assert.equal(pack.stats().staleIndexReloads, 2);
+  assert.equal(
+    mock.requests[mock.requests.length - 1].range,
+    `bytes=${v3OffB}-${v3OffC + enc.encode(wgslC_v3).byteLength - 1}`
+  );
+  assert.equal(await pack.getWgslAsync(hB), wgslB_v3);
+  assert.equal(await pack.getWgslAsync(hC), wgslC_v3);
+});
+
+test('W372 validates WGPK v2 errors: unsupported versions, truncated 24B TOC, u64/safe-int overflow, OOB, and >4 GiB overlap', () => {
+  // Unsupported versions (0 and 3) mention expected 1 or 2
+  const validV2 = new Uint8Array(
+    buildWgslPackBuffer([{ hash: 1n, stage: 'vertex', wgsl: SAMPLE_VS_WGSL }], { version: 2 })
+  );
+  for (const badVer of [0, 3]) {
+    const mutated = validV2.slice();
+    new DataView(mutated.buffer).setUint32(4, badVer, true);
+    assert.throws(
+      () => parseWgslPack(mutated),
+      new RegExp(`unsupported wgpk pack version ${badVer}.*1 or 2`, 'i')
+    );
+  }
+
+  // Truncated 24-byte TOC (header + 20 bytes is valid for v1, but truncated for v2!)
+  const truncatedV2Toc = validV2.subarray(0, WGPK_HEADER_BYTES + WGPK_ENTRY_BYTES_V1);
+  assert.throws(() => parseWgslPackIndex(truncatedV2Toc), /truncated.*require at least 40/i);
+
+  // v2 entry overflowing u64::MAX (offset = 0xffffffffffffffffn, length = 16)
+  const u64OverflowToc = new Uint8Array(
+    buildWgpkTocBuffer([{ hash: 1n, stage: 'compute', offset: 0x1_0000_0000n, length: 16 }], { version: 2 })
+  );
+  new DataView(u64OverflowToc.buffer).setBigUint64(WGPK_HEADER_BYTES + 16, 0xffffffffffffffffn, true);
+  assert.throws(() => parseWgslPackIndex(u64OverflowToc), /overflows u64/i);
+
+  // v2 entry exceeding Number.MAX_SAFE_INTEGER (offset > 2^53 - 1)
+  const unsafeOffsetToc = buildWgpkTocBuffer(
+    [{ hash: 1n, stage: 'compute', offset: BigInt(Number.MAX_SAFE_INTEGER) + 1n, length: 16 }],
+    { version: 2 }
+  );
+  assert.throws(() => parseWgslPackIndex(unsafeOffsetToc), /exceeds safe integer/i);
+
+  // v2 entry where offset <= Number.MAX_SAFE_INTEGER but offset + length > Number.MAX_SAFE_INTEGER
+  const unsafeEndToc = buildWgpkTocBuffer(
+    [{ hash: 1n, stage: 'compute', offset: BigInt(Number.MAX_SAFE_INTEGER) - 4n, length: 16 }],
+    { version: 2 }
+  );
+  assert.throws(() => parseWgslPackIndex(unsafeEndToc), /exceeds safe integer/i);
+
+  // Out-of-bounds vs dataStart (offset < 40 in v2)
+  const beforeDataStart = buildWgpkTocBuffer(
+    [{ hash: 1n, stage: 'vertex', offset: 36, length: 16 }],
+    { version: 2 }
+  );
+  assert.throws(() => parseWgslPackIndex(beforeDataStart, { totalBytes: 1000 }), /out of bounds/i);
+
+  // Out-of-bounds vs >4 GiB totalSize
+  const oobHigh = buildWgpkTocBuffer(
+    [{ hash: 1n, stage: 'fragment', offset: 8_800_000_000, length: 64 }],
+    { version: 2 }
+  );
+  assert.throws(
+    () => parseWgslPackIndex(oobHigh, { totalBytes: 8_800_000_032 }),
+    /out of bounds/i
+  );
+
+  // Overlapping >4 GiB payloads (at ~5 GiB)
+  const overlapHigh = buildWgpkTocBuffer(
+    [
+      { hash: 1n, stage: 'vertex', offset: 0x1_4000_0100, length: 200 },
+      { hash: 2n, stage: 'fragment', offset: 0x1_4000_0164, length: 200 },
+    ],
+    { version: 2 }
+  );
+  assert.throws(
+    () => parseWgslPackIndex(overlapHigh, { totalBytes: 0x2_0000_0000 }),
+    /overlapping payload/i
+  );
+
+  // coalesceEntryRanges sorts >4 GiB offsets accurately with < / > comparator
+  const coalescedHigh = coalesceEntryRanges(
+    [
+      { id: 'hi-b', offset: 8_800_000_200, length: 100 },
+      { id: 'hi-a', offset: 8_800_000_000, length: 100 },
+      { id: 'mid', offset: 5_000_000_000, length: 50 },
+    ],
+    { maxCoalesceGapBytes: 256, maxCoalesceSpanBytes: 1024 }
+  );
+  assert.equal(coalescedHigh.length, 2);
+  assert.equal(coalescedHigh[0].start, 5_000_000_000);
+  assert.equal(coalescedHigh[1].start, 8_800_000_000);
+  assert.equal(coalescedHigh[1].end, 8_800_000_300);
+  assert.deepEqual(
+    coalescedHigh[1].entries.map((e) => e.id),
+    ['hi-a', 'hi-b']
+  );
 });
