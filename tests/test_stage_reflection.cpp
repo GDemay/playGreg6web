@@ -872,6 +872,71 @@ void test_lane_indexed_heap_sources() {
     CHECK(mixed.lane_indexed_bindings == 2);
 }
 
+// S63 (#482, #1394): the translator's exact lane-indexed sidecar sources (rdna2_to_wgsl.rs tests)
+// parse at every sidecar version, and join as binding arrays; a non-power-of-two scale (shift 0,
+// stride 24 from s_mul_i32) joins with that stride, a power-of-two stride as the shift.
+void test_s63_lane_indexed_sidecar() {
+    for (int version : {1, 2, 3}) {
+        const std::string doc =
+            std::string(R"({"schema": "playgta6-stage-reflection", "version": )") + std::to_string(version) + R"(,
+  "stages": {"0x00000000000000d1": {"stage": "fragment", "bindings": [
+    {"group": 0, "binding": 0, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 64, "shift": 5, "stride": 32}}},
+    {"group": 0, "binding": 1, "kind": "sampler",
+     "source": {"lane_indexed_sampler_heap": {"max_count": 16, "shift": 4, "stride": 16}}},
+    {"group": 0, "binding": 2, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 64, "shift": 0, "stride": 24}}}]},
+  "0x00000000000000d2": {"stage": "fragment", "bindings": [
+    {"group": 0, "binding": 0, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 32, "shift": 5, "stride": 32, "window_base": {"cbv": {"user_sgpr": 10, "root_descriptor": true}, "byte_offset": 8}}}},
+    {"group": 0, "binding": 1, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "stride": 32, "window_base": {"cbv": {"user_sgpr": 8, "table_byte_offset": 64}, "byte_offset": 4, "bit_offset": 8, "mask": 255}}}}]}}})";
+        StageReflectionIndex index;
+        std::string error;
+        CHECK(parse_stage_reflection_json(doc, &index, &error));
+        if (index.size() != 2) {
+            continue;
+        }
+        const StageReflection& ps = index.at(0xd1);
+        CHECK(ps.bindings.size() == 3);
+        CHECK(ps.bindings[2].source == ReflectedSource::LaneIndexedResourceHeap && ps.bindings[2].heap_shift == 0 &&
+              ps.bindings[2].heap_stride == 24 && ps.bindings[2].lane_max_count == 64);
+        const StageReflection& based = index.at(0xd2);
+        CHECK(based.bindings.size() == 2);
+        const ReflectedBinding& root = based.bindings[0];
+        CHECK(root.lane_has_window_base && root.cbv == ReflectedCbv::RootDescriptor && root.user_sgpr == 10 &&
+              root.cb_byte_offset == 8 && root.cb_bit_offset == 0 && root.cb_mask == 0xffffffffu &&
+              root.lane_max_count == 32);
+        const ReflectedBinding& table = based.bindings[1];
+        CHECK(table.lane_has_window_base && table.cbv == ReflectedCbv::Table && table.user_sgpr == 8 &&
+              table.table_byte_offset == 64 && table.cb_byte_offset == 4 && table.cb_bit_offset == 8 &&
+              table.cb_mask == 255 && table.lane_max_count == 8);
+
+        const d3d::RootSignatureDesc rs = ui_root_signature();
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats,
+                                   JoinOptions{true}));
+        CHECK(report.empty() && stats.lane_indexed_arrays == 3 && stats.lane_indexed_bindings == 0);
+        CHECK(layout.groups.size() == 1 && layout.groups[0].bindings.size() == 3);
+        if (layout.groups.size() == 1 && layout.groups[0].bindings.size() == 3) {
+            const auto& b = layout.groups[0].bindings;
+            CHECK(b[0].entry.binding_array_size == 64 && b[0].join.heap_shift == 5 && b[0].join.heap_stride == 0);
+            CHECK(b[1].entry.binding_array_size == 16 && b[1].join.heap == d3d::HeapAccess::Sampler &&
+                  b[1].join.heap_shift == 4 && b[1].join.heap_stride == 0);
+            CHECK(b[2].entry.binding_array_size == 64 && b[2].join.heap_shift == 0 && b[2].join.heap_stride == 24 &&
+                  b[2].join.array_size == 64);
+        }
+        // Without binding arrays the same stage is refused with the counted lane-indexed reason.
+        report.clear();
+        JoinStats off;
+        CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &off));
+        CHECK(off.lane_indexed_bindings == 3);
+        CHECK(report.find("resource heap[(0 + lane) * 24] x 64") != std::string::npos);
+    }
+}
+
 // Root-descriptor sources over a descriptor table (G62, #482): the user SGPR starts a table, so
 // the binding joins as a table slot: slot 0 by default, the sidecar's table_byte_offset from
 // version 2 (ignored in version 1).
@@ -1068,6 +1133,7 @@ int main() {
     test_heap_sources();
     test_cbv_indexed_heap_sources();
     test_lane_indexed_heap_sources();
+    test_s63_lane_indexed_sidecar();
     test_inline_sampler();
     test_root_descriptor_over_table();
     test_unresolved_source();
