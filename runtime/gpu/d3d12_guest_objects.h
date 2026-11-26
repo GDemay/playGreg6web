@@ -84,6 +84,7 @@
 #include "gpu/log_rate_limiter.h"
 #include "gpu/pso_cache.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/small_texture_pool.h"
 #include "gpu/stage_reflection.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
@@ -1230,6 +1231,8 @@ private:
     struct AddressTextureEntry {
         uint32_t id = 0;
         uint64_t last_use = 0;
+        uint64_t budget_bytes = 0;  // counted in the texture budget (gpu/texture_budget.h); 0 = not counted
+        SmallTextureShape shape;    // the small texture pool key (gpu/small_texture_pool.h)
     };
     std::unordered_map<AddressTextureKey, AddressTextureEntry, AddressTextureKeyHash> address_textures_;
     uint64_t address_texture_tick_ = 0;  // under address_textures_mutex_
