@@ -1398,5 +1398,390 @@ class AudioCompareTests(unittest.TestCase):
         self.assertFalse([e for e in c.failures() if e["field"].startswith("audio")])
 
 
+def _make_phased_browser_report(
+    *,
+    bink2_light_fps: float,
+    bink2_heavy_fps: float,
+    menu_fps: float,
+    spinner_s: float,
+    first_visible_frame_s: float,
+    black_loading_s: float,
+    present_fps_avg: float,
+    fps_steady_avg: float | None = None,
+    fps_p50_window: float | None = None,
+    fps_max_window: float | None = None,
+    windows_ge_30fps_pct: float | None = None,
+    audio_frames_drained: int = 48000,
+    js_heap_used_mb: float = 300.0,
+    gpu_validation_errors: int = 0,
+    gpu_adapter: str | None = "nvidia / turing",
+) -> dict:
+    """Browser boot report fixture with realistic Start -> 4K Bink2 -> Menu -> Loading Spinner presents."""
+    presents: list[dict] = []
+    t_ms = 1000.0
+    total_draws = 0
+    total_res = 2
+
+    def emit(count: int, dt_ms: float, draws_per_frame: int, res_at_start: int = 0) -> None:
+        nonlocal t_ms, total_draws, total_res
+        for idx in range(count):
+            if idx == 0 and res_at_start:
+                total_res += res_at_start
+            total_draws += draws_per_frame
+            presents.append({
+                "index": len(presents),
+                "wall_ms": round(t_ms, 2),
+                "dispatches": 0,
+                "import_calls": 0,
+                "counters": {
+                    "draws_issued": total_draws,
+                    "resources_created": total_res,
+                    "draws_real_pack": total_draws,
+                    "draws_fallback": 0,
+                    "draws_skipped": 0,
+                    "gpu_validation_errors": gpu_validation_errors,
+                },
+            })
+            t_ms += dt_ms
+
+    # Start Screen (pre-Bink2)
+    emit(20, 40.0, 12, res_at_start=2)
+    # 4K Bink2: 10s light + 10s heavy at 4 draws/p
+    emit(int(round(10.0 * bink2_light_fps)), 1000.0 / bink2_light_fps, 4, res_at_start=1)
+    emit(int(round(10.0 * bink2_heavy_fps)) + 1, 1000.0 / bink2_heavy_fps, 4, res_at_start=0)
+    # Post-Bink2 Menu: 10s @ menu_fps (20 draws/p)
+    emit(int(round(10.0 * menu_fps)) + 1, 1000.0 / menu_fps, 20, res_at_start=3)
+    # Loading Spinner: spinner_s @ 30 FPS (1 draw/p)
+    if spinner_s > 0:
+        emit(int(round(spinner_s * 30.0)) + 1, 1000.0 / 30.0, 1, res_at_start=1)
+
+    report = make_browser_report(
+        real_pack_draws=total_draws,
+        fallback_draws=0,
+        skipped_draws=0,
+        gpu_validation_errors=gpu_validation_errors,
+        first_present_ms=1000.0,
+        present_count=len(presents),
+        elapsed_ms=round(t_ms, 2),
+    )
+    report["presents"] = presents
+    report["first_visible_frame_s"] = first_visible_frame_s
+    report["black_loading_s"] = black_loading_s
+    report["present_fps_avg"] = present_fps_avg
+    report["audio_ring_attached"] = audio_frames_drained > 0
+    report["audio_frames_drained"] = audio_frames_drained
+    report["js_heap_used_mb"] = js_heap_used_mb
+    report["js_heap_total_mb"] = 512.0
+    if gpu_adapter is not None:
+        report["gpu_adapter"] = gpu_adapter
+    if fps_steady_avg is not None:
+        report["fps_steady_avg"] = fps_steady_avg
+    if fps_p50_window is not None:
+        report["fps_p50_window"] = fps_p50_window
+    if fps_max_window is not None:
+        report["fps_max_window"] = fps_max_window
+    if windows_ge_30fps_pct is not None:
+        report["windows_ge_30fps_pct"] = windows_ge_30fps_pct
+    return report
+
+
+class PhaseDeltaAndMultiRunTests(unittest.TestCase):
+    tol = cbr.Tolerances()
+
+    def run_cli(self, *args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cbr.main([str(a) for a in args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_two_report_phase_delta_and_optional_fps_window_telemetry(self):
+        ra = _make_phased_browser_report(
+            bink2_light_fps=30.0,
+            bink2_heavy_fps=18.0,
+            menu_fps=20.0,
+            spinner_s=8.0,
+            first_visible_frame_s=35.0,
+            black_loading_s=12.0,
+            present_fps_avg=22.0,
+            fps_steady_avg=24.0,
+            fps_p50_window=23.5,
+            fps_max_window=30.0,
+            windows_ge_30fps_pct=25.0,
+            audio_frames_drained=24000,
+            js_heap_used_mb=420.0,
+            gpu_validation_errors=2,
+        )
+        rb = _make_phased_browser_report(
+            bink2_light_fps=45.0,
+            bink2_heavy_fps=28.0,
+            menu_fps=30.0,
+            spinner_s=4.0,
+            first_visible_frame_s=14.0,
+            black_loading_s=4.0,
+            present_fps_avg=34.0,
+            fps_steady_avg=36.0,
+            fps_p50_window=35.0,
+            fps_max_window=45.0,
+            windows_ge_30fps_pct=85.0,
+            audio_frames_drained=96000,
+            js_heap_used_mb=280.0,
+            gpu_validation_errors=0,
+        )
+
+        # Ignore structural present-count diffs so verdict stays pass while phase_delta is populated
+        c = cbr.compare(ra, rb, self.tol, ignore=["presents.*"])
+        self.assertEqual(c.failures(), [])
+        res = cbr.to_result(c)
+        self.assertEqual(res["verdict"], "pass")
+        self.assertIn("phase_delta", res)
+        pd = res["phase_delta"]
+
+        self.assertAlmostEqual(pd["bink2_fps_min"]["a"], 18.0, delta=0.5)
+        self.assertAlmostEqual(pd["bink2_fps_min"]["b"], 28.0, delta=0.5)
+        self.assertEqual(pd["bink2_fps_min"]["status"], "improved")
+        self.assertAlmostEqual(pd["bink2_fps_max"]["a"], 30.0, delta=0.5)
+        self.assertAlmostEqual(pd["bink2_fps_max"]["b"], 45.0, delta=0.5)
+        self.assertEqual(pd["bink2_fps_max"]["status"], "improved")
+        self.assertEqual(pd["bink2_fps_median"]["status"], "improved")
+        self.assertAlmostEqual(pd["bink2_duration_s"]["a"], 20.0, delta=0.2)
+        self.assertAlmostEqual(pd["menu_fps_median"]["a"], 20.0, delta=0.5)
+        self.assertAlmostEqual(pd["menu_fps_median"]["b"], 30.0, delta=0.5)
+        self.assertEqual(pd["menu_fps_avg"]["status"], "improved")
+        self.assertAlmostEqual(pd["loading_spinner_s"]["a"], 8.0, delta=0.1)
+        self.assertAlmostEqual(pd["loading_spinner_s"]["b"], 4.0, delta=0.1)
+        self.assertEqual(pd["loading_spinner_s"]["status"], "improved")
+
+        # Extended rolling FPS window telemetry also appears when present
+        td = res["telemetry_delta"]
+        self.assertEqual(td["fps_steady_avg"]["status"], "improved")
+        self.assertEqual(td["fps_p50_window"]["status"], "improved")
+        self.assertEqual(td["fps_max_window"]["status"], "improved")
+        self.assertEqual(td["windows_ge_30fps_pct"]["formatted_delta"], "+60.0%")
+
+        text = cbr.format_text(c)
+        self.assertIn("[phase_delta]", text)
+        self.assertIn("bink2_fps_median:", text)
+        self.assertIn("menu_fps_avg:", text)
+        self.assertIn("loading_spinner_s:", text)
+
+        md_default = cbr.format_markdown(c)
+        self.assertIn("### Phase Delta", md_default)
+        self.assertIn("| Metric | Baseline | Candidate | Delta | % | Status |", md_default)
+        self.assertIn("| `bink2_fps_median` |", md_default)
+        self.assertIn("| `loading_spinner_s` |", md_default)
+
+        md_labeled = cbr.format_markdown(c, labels=("t99", "t100"))
+        self.assertIn("| Metric | t99 | t100 | Delta | % | Status |", md_labeled)
+
+        # CLI 2-report --markdown with --labels
+        with tempfile.TemporaryDirectory() as d:
+            pa, pb = Path(d, "t99.json"), Path(d, "t100.json")
+            pa.write_text(json.dumps(ra), encoding="utf-8")
+            pb.write_text(json.dumps(rb), encoding="utf-8")
+            code, out, err = self.run_cli(pa, pb, "--ignore", "presents.*", "--markdown", "--labels", "t99", "t100")
+            self.assertEqual(code, 0, err)
+            self.assertIn("| Metric | t99 | t100 | Delta | % | Status |", out)
+            self.assertIn("### Phase Delta", out)
+
+    def test_multi_run_t99_vs_t100_vs_t102_cli_and_library(self):
+        t99 = _make_phased_browser_report(
+            bink2_light_fps=28.0,
+            bink2_heavy_fps=16.0,
+            menu_fps=18.0,
+            spinner_s=10.0,
+            first_visible_frame_s=48.0,
+            black_loading_s=20.0,
+            present_fps_avg=20.0,
+            fps_steady_avg=21.0,
+            fps_p50_window=20.5,
+            fps_max_window=28.0,
+            windows_ge_30fps_pct=10.0,
+            audio_frames_drained=0,
+            js_heap_used_mb=620.0,
+            gpu_validation_errors=3,
+        )
+        t100 = _make_phased_browser_report(
+            bink2_light_fps=36.0,
+            bink2_heavy_fps=24.0,
+            menu_fps=26.0,
+            spinner_s=6.0,
+            first_visible_frame_s=22.0,
+            black_loading_s=8.0,
+            present_fps_avg=29.0,
+            fps_steady_avg=30.0,
+            fps_p50_window=29.5,
+            fps_max_window=36.0,
+            windows_ge_30fps_pct=55.0,
+            audio_frames_drained=48000,
+            js_heap_used_mb=340.0,
+            gpu_validation_errors=1,
+        )
+        t102 = _make_phased_browser_report(
+            bink2_light_fps=48.0,
+            bink2_heavy_fps=32.0,
+            menu_fps=32.0,
+            spinner_s=3.5,
+            first_visible_frame_s=12.0,
+            black_loading_s=3.0,
+            present_fps_avg=38.0,
+            fps_steady_avg=39.0,
+            fps_p50_window=38.5,
+            fps_max_window=48.0,
+            windows_ge_30fps_pct=92.5,
+            audio_frames_drained=96000,
+            js_heap_used_mb=260.0,
+            gpu_validation_errors=0,
+        )
+
+        summary = cbr.build_multi_run_summary([t99, t100, t102], labels=["t99", "t100", "t102"])
+        self.assertEqual(summary["labels"], ["t99", "t100", "t102"])
+        self.assertEqual(summary["run_count"], 3)
+        self.assertEqual(summary["delta_pair"], ["t99", "t102"])
+        m = summary["metrics"]
+        self.assertEqual(m["first_visible_frame_s"]["values"], [48.0, 22.0, 12.0])
+        self.assertEqual(m["first_visible_frame_s"]["formatted_delta"], "-36.0s")
+        self.assertEqual(m["black_loading_s"]["formatted_delta"], "-17.0s")
+        self.assertAlmostEqual(m["loading_spinner_s"]["first"], 10.0, delta=0.1)
+        self.assertAlmostEqual(m["loading_spinner_s"]["last"], 3.5, delta=0.1)
+        self.assertEqual(m["audio_frames_drained"]["values"], [0, 48000, 96000])
+        self.assertEqual(m["js_heap_used_mb"]["values"], [620.0, 340.0, 260.0])
+        self.assertEqual(m["gpu_validation_errors"]["values"], [3, 1, 0])
+        self.assertEqual(m["gpu_validation_errors"]["delta"], -3)
+
+        md = cbr.format_multi_run_markdown(summary)
+        self.assertIn("## Multi-Run Boot Comparison (t99 vs t100 vs t102)", md)
+        self.assertIn("| Metric | t99 | t100 | t102 | Delta (t99 -> t102) |", md)
+        for metric_name in (
+            "first_visible_frame_s",
+            "black_loading_s",
+            "loading_spinner_s",
+            "bink2_fps_min",
+            "bink2_fps_median",
+            "bink2_fps_max",
+            "bink2_duration_s",
+            "menu_fps_median",
+            "present_fps_avg",
+            "fps_p50_window",
+            "fps_max_window",
+            "windows_ge_30fps_pct",
+            "audio_frames_drained",
+            "js_heap_used_mb",
+            "gpu_validation_errors",
+        ):
+            self.assertIn(f"| `{metric_name}` |", md)
+
+        txt = cbr.format_multi_run_text(summary)
+        self.assertIn("Multi-Run Boot Comparison (t99 vs t100 vs t102)", txt)
+        self.assertIn("Delta (t99 -> t102)", txt)
+        self.assertIn("bink2_fps_median", txt)
+
+        # CLI --reports with --markdown, --json, and default text
+        with tempfile.TemporaryDirectory() as d:
+            p99, p100, p102 = Path(d, "t99.json"), Path(d, "t100.json"), Path(d, "t102.json")
+            p99.write_text(json.dumps(t99), encoding="utf-8")
+            p100.write_text(json.dumps(t100), encoding="utf-8")
+            p102.write_text(json.dumps(t102), encoding="utf-8")
+
+            rc_md, out_md, err_md = self.run_cli(
+                "--reports", p99, p100, p102, "--labels", "t99", "t100", "t102", "--markdown"
+            )
+            self.assertEqual(rc_md, 0, err_md)
+            self.assertIn("| Metric | t99 | t100 | t102 | Delta (t99 -> t102) |", out_md)
+            self.assertIn("-36.0s (-75.0%)", out_md)
+
+            rc_js, out_js, err_js = self.run_cli(
+                "--reports", p99, p100, p102, "--labels", "t99", "t100", "t102", "--json"
+            )
+            self.assertEqual(rc_js, 0, err_js)
+            payload = json.loads(out_js)
+            self.assertEqual(payload["labels"], ["t99", "t100", "t102"])
+            self.assertEqual(payload["metrics"]["gpu_validation_errors"]["values"], [3, 1, 0])
+
+            # Without --labels, derives clean labels from filenames
+            rc_tx, out_tx, err_tx = self.run_cli("--reports", p99, p100, p102)
+            self.assertEqual(rc_tx, 0, err_tx)
+            self.assertIn("t99 vs t100 vs t102", out_tx)
+
+    def test_multi_run_missing_optional_metrics_adapter_mismatch_and_invalid_cli(self):
+        r1 = make_browser_report(gpu_validation_errors=1)
+        r1["first_visible_frame_s"] = 20.0
+        r1["gpu_adapter"] = "nvidia / turing"
+        r2 = make_browser_report(gpu_validation_errors=0)
+        r2["first_visible_frame_s"] = 12.0
+        r2["fps_p50_window"] = 31.5
+        r2["summary"]["loading_spinner_s"] = 4.2
+        r2["gpu_adapter"] = "intel / gen-12lp"
+
+        summary = cbr.build_multi_run_summary([r1, r2], labels=["base", "cand"])
+        self.assertEqual(summary["metrics"]["loading_spinner_s"]["values"], [None, 4.2])
+        self.assertEqual(summary["metrics"]["loading_spinner_s"]["status"], "added")
+        self.assertEqual(summary["metrics"]["fps_p50_window"]["values"], [None, 31.5])
+        self.assertNotIn("bink2_fps_median", summary["metrics"])
+        self.assertTrue(any("gpu_adapter mismatch" in w for w in summary.get("warnings", [])))
+
+        md = cbr.format_multi_run_markdown(summary)
+        self.assertIn("### Warnings", md)
+        self.assertIn("| `loading_spinner_s` | — | 4.2s | — |", md)
+
+        with self.assertRaises(ValueError):
+            cbr.build_multi_run_summary([r1])
+        with self.assertRaises(ValueError):
+            cbr.build_multi_run_summary([r1, r2], labels=["only_one"])
+
+        with tempfile.TemporaryDirectory() as d:
+            p1, p2 = Path(d, "a.json"), Path(d, "b.json")
+            p1.write_text(json.dumps(r1), encoding="utf-8")
+            p2.write_text(json.dumps(r2), encoding="utf-8")
+            self.assertEqual(self.run_cli("--reports", p1)[0], 2)
+            self.assertEqual(self.run_cli("--reports", p1, p2, "--labels", "only_one")[0], 2)
+            self.assertEqual(self.run_cli(p1, p2, "--reports", p1, p2)[0], 2)
+            self.assertEqual(self.run_cli(p1, p2, "--labels", "a", "b", "c")[0], 2)
+            self.assertEqual(self.run_cli("--reports", p1, Path(d, "missing.json"))[0], 2)
+
+    def test_multi_run_strict_host_path_sanitization(self):
+        r1 = make_browser_report(gpu_validation_errors=1)
+        r1["first_visible_frame_s"] = 30.0
+        r2 = make_browser_report(gpu_validation_errors=0)
+        r2["first_visible_frame_s"] = 15.0
+
+        with tempfile.TemporaryDirectory(prefix="playgta6_secret_dir_") as tmp:
+            d1 = Path(tmp) / "Users" / "secret_alice" / "run_a"
+            d2 = Path(tmp) / "Users" / "secret_bob" / "run_b"
+            d1.mkdir(parents=True)
+            d2.mkdir(parents=True)
+            p1 = d1 / "boot-report.json"
+            p2 = d2 / "boot-report.json"
+            p1.write_text(json.dumps(r1), encoding="utf-8")
+            p2.write_text(json.dumps(r2), encoding="utf-8")
+
+            # Derived labels from identical basenames under secret paths must never leak host paths
+            rc1, out_md, err1 = self.run_cli("--reports", p1, p2, "--markdown")
+            self.assertEqual(rc1, 0, err1)
+            for forbidden in ("secret_alice", "secret_bob", "playgta6_secret_dir_", "C:\\", "/home/", "/Users/"):
+                self.assertNotIn(forbidden, out_md)
+            self.assertIn("boot-report#1", out_md)
+            self.assertIn("boot-report#2", out_md)
+
+            # Host paths & Markdown pipes passed via --labels must be scrubbed
+            rc2, out_js, err2 = self.run_cli(
+                "--reports", p1, p2,
+                "--labels", r"C:\Users\secret_alice\t99.json", "/home/secret_bob/t100|pipe.json",
+                "--json",
+            )
+            self.assertEqual(rc2, 0, err2)
+            for forbidden in ("secret_alice", "secret_bob", "C:\\", "/home/", "|"):
+                self.assertNotIn(forbidden, out_js)
+            payload = json.loads(out_js)
+            self.assertEqual(payload["labels"][0], "t99")
+            self.assertEqual(payload["labels"][1], "t100pipe")
+
+            # Missing file error message must also be sanitized
+            missing = d1 / "nope.json"
+            rc3, _, err3 = self.run_cli("--reports", p1, missing)
+            self.assertEqual(rc3, 2)
+            self.assertNotIn("secret_alice", err3)
+            self.assertNotIn("playgta6_secret_dir_", err3)
+
+
 if __name__ == "__main__":
     unittest.main()
