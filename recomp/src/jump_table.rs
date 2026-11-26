@@ -313,6 +313,7 @@ pub(crate) fn resolve_in(
         targets,
         index: bound.index,
         inferred: false,
+        alternates: Vec::new(),
     })
 }
 
@@ -498,6 +499,7 @@ fn infer_extent(
         targets,
         index: None,
         inferred: true,
+        alternates: Vec::new(),
     })
 }
 
@@ -640,8 +642,9 @@ struct Slicer<'t, 'b, 'i, 'a> {
     image: &'i CodeImage<'a>,
     trace: &'t [Step<'b>],
     info: InstructionInfoFactory,
-    /// Set when a bound came only from the width of a zero-extended byte/word (no guard or
-    /// definition narrowed it): the full range `[0, 0xff]` or `[0, 0xffff]`.
+    /// Set when a bound came only from the width of a zero-extended byte/word or of what a
+    /// logical right shift leaves (no guard or definition narrowed it): the full range
+    /// `[0, 0xff]` or `[0, 0xffff]`.
     width_only: bool,
     /// Remaining recursive slice steps before aborting to bound worst-case work.
     steps_remaining: usize,
@@ -1525,6 +1528,11 @@ impl Slicer<'_, '_, '_, '_> {
                     }
                     None => (0, (mask(dst_bits) >> shift).min(wmask)),
                 };
+                // Nothing narrowed the shifted value (`shr eax, 24` of a loaded dword): the bound
+                // is only the width left by the shift, like a zero-extended byte or word.
+                if min == 0 && shift > 0 && max == mask(dst_bits) >> shift {
+                    self.width_only = true;
+                }
                 Some(Bound {
                     min,
                     max,
@@ -2124,6 +2132,7 @@ mod tests {
                     targets: targets.to_vec(),
                     index: None,
                     inferred: false,
+                    alternates: Vec::new(),
                 }]
             );
             assert_eq!(analysis.functions.len(), 1);
@@ -2209,6 +2218,7 @@ mod tests {
                     len: 8,
                 }),
                 inferred: false,
+                alternates: Vec::new(),
             }
         );
         assert_eq!(
@@ -4790,5 +4800,113 @@ mod tests {
             .expect("copy-indexed switch resolves");
         assert!(!table.inferred);
         assert_eq!(table.targets, cases.map(|c| TEXT + u64::from(c)).to_vec());
+    }
+
+    /// A bytecode dispatcher entered through one 64-bit pointer table and looping through
+    /// another: the base `rdx` reaches the dispatch as `TA` on one entry path and `TB` on the
+    /// other path and on the handlers' back edges; the opcode is the top byte of a dword.
+    /// ```text
+    /// entry: mov r15, rcx; test rdx, rdx; je alt
+    ///        lea rdx, [rip+TA]; mov rax, r15; jmp dispatch
+    /// alt:   lea rdx, [rip+TB]; mov rax, r15      (`alt_base` replaces the lea when given)
+    /// dispatch: mov ecx, [rax]; mov eax, ecx; shr eax, 24; jmp [rdx+rax*8]
+    /// h0..h2: add r8d, k; mov rax, r15; add r15, 4; lea rdx, [rip+TB]; jmp dispatch
+    /// h3:    ret
+    /// ```
+    /// Tables at `DATA`: TA = [h0, h1], TB = [h2, h3] at `DATA + 16`, then a zero entry.
+    fn two_table_dispatch(
+        alt_base: Option<fn(&mut CodeAssembler) -> Result<(), iced_x86::IcedError>>,
+    ) -> (Vec<u8>, Vec<u8>, [u64; 4], u64) {
+        let ta = DATA;
+        let tb = DATA + 16;
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut alt = a.create_label();
+            let mut dispatch = a.create_label();
+            let mut h = [
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            ];
+            a.mov(r15, rcx)?;
+            a.test(rdx, rdx)?;
+            a.je(alt)?;
+            lea_rip(a, Register::RDX, ta)?;
+            a.mov(rax, r15)?;
+            a.jmp(dispatch)?;
+            a.set_label(&mut alt)?;
+            match alt_base {
+                Some(f) => f(a)?,
+                None => lea_rip(a, Register::RDX, tb)?,
+            }
+            a.mov(rax, r15)?;
+            a.set_label(&mut dispatch)?;
+            a.mov(ecx, dword_ptr(rax))?;
+            a.mov(eax, ecx)?;
+            a.shr(eax, 24)?;
+            a.jmp(qword_ptr(rdx + rax * 8))?;
+            for (k, label) in h.iter_mut().take(3).enumerate() {
+                a.set_label(label)?;
+                a.add(r8d, k as i32 + 1)?;
+                a.mov(rax, r15)?;
+                a.add(r15, 4)?;
+                lea_rip(a, Register::RDX, tb)?;
+                a.jmp(dispatch)?;
+            }
+            a.set_label(&mut h[3])?;
+            a.ret()?;
+            labels.extend([h[0], h[1], h[2], h[3], dispatch]);
+            Ok(())
+        });
+        let handlers = [ips[0], ips[1], ips[2], ips[3]];
+        let jmp_va = find_indirect_jmp_after(&code, ips[4]);
+        let mut data: Vec<u8> = handlers.iter().flat_map(|va| va.to_le_bytes()).collect();
+        data.extend(0u64.to_le_bytes());
+        (code, data, handlers, jmp_va)
+    }
+
+    #[test]
+    fn resolves_a_dispatch_whose_base_is_one_of_two_tables() {
+        let (code, data, h, jmp_va) = two_table_dispatch(None);
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let jt = analysis
+            .jump_tables
+            .get(&jmp_va)
+            .expect("each base resolves its own table");
+        // Only the width of the shifted opcode bounds the index: both extents are inferred, the
+        // first one cut where the second table starts.
+        assert!(jt.inferred);
+        assert_eq!(jt.table, DATA);
+        assert_eq!(jt.targets, [h[0], h[1]]);
+        assert_eq!(jt.alternates.len(), 1);
+        let alt = &jt.alternates[0];
+        assert!(alt.inferred && alt.alternates.is_empty());
+        assert_eq!((alt.site, alt.load_site), (jmp_va, jmp_va));
+        assert_eq!(alt.table, DATA + 16);
+        assert_eq!(alt.targets, [h[2], h[3]]);
+        let expected: Vec<Edge> = h.iter().copied().map(Edge::JumpTable).collect();
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            expected
+        );
+        // Both tables are data, with a base relocation at the load each.
+        let bases: Vec<u64> = analysis
+            .relocations
+            .entries()
+            .iter()
+            .filter(|r| r.site == jmp_va && r.kind == RelocKind::JumpTable)
+            .map(|r| r.target)
+            .collect();
+        assert_eq!(bases, [DATA, DATA + 16]);
+    }
+
+    #[test]
+    fn dispatch_with_a_loaded_base_on_one_path_stays_unresolved() {
+        // The second entry path loads the base from memory: no constant set, nothing resolved.
+        let (code, data, h, jmp_va) = two_table_dispatch(Some(|a| a.mov(rdx, qword_ptr(rsp + 8))));
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        assert!(!analysis.jump_tables.contains_key(&jmp_va));
+        let blocks = &analysis.functions[&TEXT].blocks;
+        assert!(h.iter().all(|va| !blocks.contains_key(va)));
     }
 }

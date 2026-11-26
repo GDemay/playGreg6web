@@ -217,12 +217,29 @@ pub struct JumpTable {
     /// land inside the jumping function (`.pdata` range). The lifted `switch` on the computed
     /// target sends every other value through the runtime dispatcher, as for an unresolved jump.
     pub inferred: bool,
+    /// The other tables the same jump reads when its table base is one of a few constants (each
+    /// path into the dispatch loads one of them, e.g. a bytecode interpreter entered through a
+    /// first-opcode table and looping through a second one). Each is resolved on its own under
+    /// that base; the jump's cases are the union of all of them, and the lifted `switch` on the
+    /// computed target sends any other value to the runtime dispatcher. Empty for a single table;
+    /// an alternate never has alternates of its own.
+    pub alternates: Vec<JumpTable>,
 }
 
 impl JumpTable {
-    /// Distinct case targets sorted in ascending VA order.
+    /// This table followed by its [`Self::alternates`].
+    pub fn tables(&self) -> impl Iterator<Item = &JumpTable> {
+        std::iter::once(self).chain(self.alternates.iter())
+    }
+
+    /// Case targets of this table and every alternate, in table order (duplicates kept).
+    pub fn all_targets(&self) -> impl Iterator<Item = u64> + '_ {
+        self.tables().flat_map(|t| t.targets.iter().copied())
+    }
+
+    /// Distinct case targets (of every alternate too) sorted in ascending VA order.
     pub fn unique_targets(&self) -> Vec<u64> {
-        let unique: BTreeSet<u64> = self.targets.iter().copied().collect();
+        let unique: BTreeSet<u64> = self.all_targets().collect();
         unique.into_iter().collect()
     }
 }
@@ -1132,6 +1149,7 @@ mod tests {
             targets: vec![0x1030, 0x1010, 0x1030, 0x1020, 0x1010],
             index: None,
             inferred: false,
+            alternates: Vec::new(),
         };
         assert_eq!(jt.unique_targets(), vec![0x1010, 0x1020, 0x1030]);
 

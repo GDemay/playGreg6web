@@ -506,7 +506,7 @@ fn jump_table_ranges(analysis: &Analysis) -> BTreeMap<u64, u64> {
         return BTreeMap::new();
     }
     let mut ranges = BTreeMap::new();
-    for table in analysis.jump_tables.values() {
+    for table in analysis.jump_tables.values().flat_map(|t| t.tables()) {
         if let Some(end) = checked_table_end(table.table, table.targets.len(), 4) {
             insert_merged_range(&mut ranges, table.table, end);
         }
@@ -1312,6 +1312,7 @@ mod probe_tests {
                 len: 4, // nested [0x1008, 0x100c)
             }),
             inferred: false,
+            alternates: Vec::new(),
         };
         let overlapping = JumpTable {
             site: TEXT + 0x10,
@@ -1324,6 +1325,7 @@ mod probe_tests {
                 len: 8, // overflows u64 -> safely skipped
             }),
             inferred: false,
+            alternates: Vec::new(),
         };
         let overflowing = JumpTable {
             site: TEXT + 0x20,
@@ -1332,6 +1334,7 @@ mod probe_tests {
             targets: vec![TEXT; 2], // overflows u64 -> safely skipped
             index: None,
             inferred: false,
+            alternates: Vec::new(),
         };
 
         analysis_a.jump_tables.insert(outer.site, outer.clone());
