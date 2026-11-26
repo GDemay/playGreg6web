@@ -4660,6 +4660,100 @@ mod tests {
             .is_none()
         );
     }
+    /// Two copies of one value made before a merge (`mov ebx, edx; mov r14d, edx`), the guard on
+    /// one and the table indexed by the other. On one incoming path a call clobbers the common
+    /// source: the copies are still copies of each other, so the guard bounds the index.
+    #[test]
+    fn resolves_switch_indexed_by_a_sibling_copy_across_a_call() {
+        let lea_disp = (i64::from(DATA_RVA) - i64::from(TEXT_RVA + 0x1a)) as i32;
+        let code = [
+            &[0x89, 0xd3][..],               // 0: mov ebx, edx
+            &[0x41, 0x89, 0xd6],             // 2: mov r14d, edx
+            &[0x85, 0xc9],                   // 5: test ecx, ecx
+            &[0x74, 0x05],                   // 7: je e
+            &[0xe8, 0x24, 0x00, 0x00, 0x00], // 9: call 32 (clobbers rdx)
+            &[0x83, 0xfb, 0x03],             // e: cmp ebx, 3
+            &[0x77, 0x1c],                   // 11: ja 2f
+            &[0x48, 0x8d, 0x05],             // 13: lea rax, [table]
+            &lea_disp.to_le_bytes(),         //
+            &[0x4a, 0x63, 0x0c, 0xb0],       // 1a: movsxd rcx, [rax+r14*4]
+            &[0x48, 0x01, 0xc1],             // 1e: add rcx, rax
+            &[0xff, 0xe1],                   // 21: jmp rcx
+            &[0x31, 0xc0, 0xc3],             // 23: case 0
+            &[0x31, 0xc0, 0xc3],             // 26: case 1
+            &[0x31, 0xc0, 0xc3],             // 29: case 2
+            &[0x31, 0xc0, 0xc3],             // 2c: case 3
+            &[0x31, 0xc0, 0xc3],             // 2f: default
+            &[0xc3],                         // 32: callee
+        ]
+        .concat();
+        let cases = [0x23u32, 0x26, 0x29, 0x2c];
+        let mut data: Vec<u8> = cases
+            .iter()
+            .flat_map(|&c| ((TEXT_RVA + c) as i32 - DATA_RVA as i32).to_le_bytes())
+            .collect();
+        // A fifth in-code entry past the bound must not be read.
+        data.extend_from_slice(&((TEXT_RVA + 0x2f) as i32 - DATA_RVA as i32).to_le_bytes());
+        let analysis = analyze(&code, &data, &[0], &[]);
+        let table = analysis
+            .jump_tables
+            .get(&(TEXT + 0x21))
+            .expect("sibling-copy-indexed switch resolves");
+        assert!(!table.inferred);
+        assert_eq!(table.targets, cases.map(|c| TEXT + u64::from(c)).to_vec());
+    }
+
+    /// The merge in front of a switch gains its second incoming edge only once an earlier switch
+    /// resolves (its case calls, then falls into the merge). The first match of the later switch
+    /// sees the one early path, whose facts prove no bound; it is matched again once its slice
+    /// changes, and then the guard on a sibling copy bounds it.
+    #[test]
+    fn retries_a_switch_whose_merge_gains_an_edge_from_a_later_table() {
+        let t1 = DATA_RVA;
+        let t2 = DATA_RVA + 16;
+        let lea1 = (i64::from(t1) - i64::from(TEXT_RVA + 0x11)) as i32;
+        let lea2 = (i64::from(t2) - i64::from(TEXT_RVA + 0x2b)) as i32;
+        let code = [
+            &[0x89, 0xd3][..],               // 0: mov ebx, edx
+            &[0x41, 0x89, 0xd6],             // 2: mov r14d, edx
+            &[0x83, 0xfa, 0x04],             // 5: cmp edx, 4
+            &[0x73, 0x15],                   // 8: jae 1f
+            &[0x48, 0x8d, 0x05],             // a: lea rax, [t1]
+            &lea1.to_le_bytes(),             //
+            &[0x4a, 0x63, 0x0c, 0xb0],       // 11: movsxd rcx, [rax+r14*4]
+            &[0x48, 0x01, 0xc1],             // 15: add rcx, rax
+            &[0xff, 0xe1],                   // 18: jmp rcx
+            &[0xe8, 0x24, 0x00, 0x00, 0x00], // 1a: call 43 (the only case of t1)
+            &[0x83, 0xfb, 0x03],             // 1f: cmp ebx, 3 (merge)
+            &[0x77, 0x1c],                   // 22: ja 40
+            &[0x48, 0x8d, 0x05],             // 24: lea rax, [t2]
+            &lea2.to_le_bytes(),             //
+            &[0x4a, 0x63, 0x0c, 0xb0],       // 2b: movsxd rcx, [rax+r14*4]
+            &[0x48, 0x01, 0xc1],             // 2f: add rcx, rax
+            &[0xff, 0xe1],                   // 32: jmp rcx
+            &[0x31, 0xc0, 0xc3],             // 34: case 0
+            &[0x31, 0xc0, 0xc3],             // 37: case 1
+            &[0x31, 0xc0, 0xc3],             // 3a: case 2
+            &[0x31, 0xc0, 0xc3],             // 3d: case 3
+            &[0x31, 0xc0, 0xc3],             // 40: default
+            &[0xc3],                         // 43: callee
+        ]
+        .concat();
+        let rel = |c: u32, base: u32| ((TEXT_RVA + c) as i32 - base as i32).to_le_bytes();
+        let mut data: Vec<u8> = (0..4).flat_map(|_| rel(0x1a, t1)).collect();
+        let cases = [0x34u32, 0x37, 0x3a, 0x3d];
+        data.extend(cases.iter().flat_map(|&c| rel(c, t2)));
+        data.extend_from_slice(&rel(0x40, t2));
+        let analysis = analyze(&code, &data, &[0], &[]);
+        assert_eq!(analysis.jump_tables[&(TEXT + 0x18)].targets, [TEXT + 0x1a; 4]);
+        let table = analysis
+            .jump_tables
+            .get(&(TEXT + 0x32))
+            .expect("switch behind the later merge resolves");
+        assert!(!table.inferred);
+        assert_eq!(table.targets, cases.map(|c| TEXT + u64::from(c)).to_vec());
+    }
+
     /// The index lives in a copy made before a merge (`mov r9d, eax` ahead of a branch around a
     /// block that reaches the guard): the guard on the source bounds the copy.
     #[test]
