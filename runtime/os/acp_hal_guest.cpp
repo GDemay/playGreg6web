@@ -12,15 +12,27 @@
 //   5  () at shutdown, after which the title clears its pointer: release.
 //   3, 4 and the rest: never called by the executable; they trap.
 //
-// Model: there is no audio hardware. Commands are accepted while connected and discarded
-// (counted per command id, the first of each logged); nothing is written back, because the
-// title reads nothing back from these calls.
+// Model: there is no audio hardware. Commands are accepted while connected (counted per command
+// id, the first of each logged). The XMA context commands (behaviour of the SHAPE XMA block,
+// reimplemented here) keep the per-context state the title can observe:
+//   5 / 7   enable / disable one XMA context; the payload's first u32 is the context index.
+//   6 / 8   enable / disable many; the payload is a bitmask of u32 words, bit i = context i,
+//           as many words as the allocated contexts need.
+//   18      (0x12, tag 0xF1F1F1F1, sent by the stream consumer 0x140078120) the title took
+//           `blocks` 256-byte output blocks of context `index` (payload {u32 index, u32 blocks}):
+//           its output read offset (dword 9 bits 0-4) moves forward modulo the output buffer's
+//           block count (dword 0 bits 22-26, 0 = 32).
+// No XMA decoder exists yet, so an enabled context's output write offset never moves; the
+// enable state is what a decode worker will act on. Other commands are discarded; the title
+// reads nothing back but the HRESULT.
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -31,6 +43,7 @@
 #include <vector>
 
 #include "os/xapu_opus.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -45,6 +58,102 @@ constexpr HResult kEUnexpected = static_cast<HResult>(0x8000FFFFu);
 
 void diag(const std::string& message) {
     com::detail::diagnostic(message.c_str());
+}
+
+// The XMA side of the AcpHal commands (contexts are global, allocated by
+// AcpHalAllocateShapeContexts in xbox_middleware.cpp).
+struct XmaState {
+    std::mutex mutex;
+    std::vector<bool> enabled;
+    XmaCommandStats stats;
+    uint64_t test_contexts = 0;  // set_xma_contexts_for_tests
+    uint32_t test_count = 0;
+};
+XmaState& xma() {
+    static XmaState s;
+    return s;
+}
+
+constexpr uint32_t kXmaContextBytes = 64;
+constexpr uint32_t kAcpEnableXma = 5, kAcpEnableXmaMask = 6, kAcpDisableXma = 7, kAcpDisableXmaMask = 8,
+                   kAcpXmaReadAdvance = 18;
+
+void handle_xma_command(uint32_t command, uint64_t payload) {
+    if (command != kAcpEnableXma && command != kAcpEnableXmaMask && command != kAcpDisableXma &&
+        command != kAcpDisableXmaMask && command != kAcpXmaReadAdvance) {
+        return;
+    }
+    uint32_t count = 0;
+    uint64_t contexts = pg6_mw_xma_contexts(&count);
+    if (xma().test_contexts != 0) {
+        contexts = xma().test_contexts;
+        count = xma().test_count;
+    }
+    auto& x = xma();
+    std::lock_guard<std::mutex> lock(x.mutex);
+    if (x.enabled.size() != count) {
+        x.enabled.assign(count, false);
+        x.stats.enabled_now = 0;
+    }
+    auto set = [&x](uint32_t i, bool on) {
+        if (x.enabled[i] != on) {
+            x.enabled[i] = on;
+            if (on) {
+                ++x.stats.enabled_now;
+            } else {
+                --x.stats.enabled_now;
+            }
+        }
+    };
+    uint32_t word[2] = {};
+    if (payload == 0 || count == 0 || !com::read_guest(payload, word, sizeof(uint32_t))) {
+        ++x.stats.rejected;
+        return;
+    }
+    switch (command) {
+        case kAcpEnableXma:
+        case kAcpDisableXma:
+            if (word[0] >= count) {
+                ++x.stats.rejected;
+                return;
+            }
+            set(word[0], command == kAcpEnableXma);
+            ++(command == kAcpEnableXma ? x.stats.enables : x.stats.disables);
+            return;
+        case kAcpEnableXmaMask:
+        case kAcpDisableXmaMask: {
+            std::vector<uint32_t> mask((count + 31) / 32);
+            if (!com::read_guest(payload, mask.data(), mask.size() * sizeof(uint32_t))) {
+                ++x.stats.rejected;
+                return;
+            }
+            for (uint32_t i = 0; i < count; ++i) {
+                if (((mask[i / 32] >> (i % 32)) & 1u) != 0) {
+                    set(i, command == kAcpEnableXmaMask);
+                }
+            }
+            ++(command == kAcpEnableXmaMask ? x.stats.mask_enables : x.stats.mask_disables);
+            return;
+        }
+        default: {  // 18: the title consumed output blocks; advance the read offset
+            if (!com::read_guest(payload, word, sizeof(word)) || word[0] >= count) {
+                ++x.stats.rejected;
+                return;
+            }
+            const uint64_t ctx = contexts + uint64_t{word[0]} * kXmaContextBytes;
+            uint32_t d0 = 0, d9 = 0;
+            if (!com::read_guest(ctx, &d0, 4) || !com::read_guest(ctx + 0x24, &d9, 4)) {
+                ++x.stats.rejected;
+                return;
+            }
+            const uint32_t blocks = (d0 >> 22) & 0x1Fu;
+            const uint32_t ring = blocks != 0 ? blocks : 32u;
+            d9 = (d9 & ~0x1Fu) | (((d9 & 0x1Fu) + word[1]) % ring);
+            com::write_guest(ctx + 0x24, &d9, 4);
+            ++x.stats.read_advances;
+            return;
+        }
+    }
 }
 
 class AcpHalObj : public com::ComObject {
@@ -78,6 +187,7 @@ public:
             diag("AcpHal: command " + std::to_string(command) + " submitted while not connected");
             return kEUnexpected;
         }
+        handle_xma_command(command, payload);
         if (++commands_[command] == 1) {
             char line[200];
             std::snprintf(line, sizeof(line),
@@ -272,10 +382,17 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 //
 // Codec census (R40, menu-flow run of 420 s): the executable sends XApu only types 1, 2 and 3
 // (5 is wired but was not seen); every decode command carries one Opus packet (287 decoded, 0
-// failed, 287 type-3 results). No other codec reaches a hardware model: AcpHalAllocateShapeContexts
-// is called with every count but kind 4 zeroed (xbox_middleware.cpp), so no SHAPE/XMA decoder
-// contexts exist, XDspActivate is never reached, and the executable imports no XAudio2/XMA API;
-// PCM and ADPCM are decoded by the title's own code. The boot report's audio section carries the
+// failed, 287 type-3 results). That Opus path carries only short one-shot sounds: a menu-flow run
+// with PG6_AUDIO_TRACE=1 shows every voice on slot 0, started and freed after 7 or 23 packets
+// (0.1 / 0.56 s), one at a time. Music and ambience are XMA, not Opus: AcpHalAllocateShapeContexts
+// asks for 350 contexts of kind 4 (XMA, 64 bytes each, xbox_middleware.cpp), and the stream
+// consumer at 0x140078120 reads the XMA context's output write / read offsets and only copies PCM
+// out (then sends AcpHal command 0x12, tag 0xF1F1F1F1) once the hardware has advanced the write
+// offset. There is no XMA decoder here, so those voices never produce a sample; the boot report's
+// `xma_contexts*` fields count the contexts with queued input. The streamed banks themselves load
+// fine: in that run all 1043 XCRDAPI requests on audio.rpf (zlib) and 557 ReadFile calls succeed
+// within 1 ms. XDspActivate is never reached and the executable imports no XAudio2 API; PCM and
+// ADPCM are decoded by the title's own code. The boot report's audio section carries the
 // per-type counts and `xapu_unhandled_commands` so a new codec path shows up there first.
 // ---------------------------------------------------------------------------
 
@@ -311,6 +428,8 @@ struct XApuState {
     uint64_t unhandled = 0;       // commands of a type the model does not know (no result)
     bool decode_logged = false;
     bool failure_logged = false;
+    std::map<std::pair<uint64_t, uint32_t>, std::pair<uint64_t, int64_t>> trace_voices;  // packets, start ms
+    uint32_t trace_lines = 0;
 };
 XApuState& xapu() {
     static XApuState s;
@@ -457,6 +576,31 @@ XApuResult decode_command(uint64_t handle, const uint8_t* cmd) {
     return make_result(3, voice, 0);
 }
 
+// PG6_AUDIO_TRACE=1 (the caller holds the lock): one line per voice start (type 1), free (type 2,
+// with the packets decoded since its start) and other non-decode command; at most 400 lines.
+void trace_command(uint64_t handle, uint32_t type, uint32_t voice) {
+    auto& s = xapu();
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    auto& v = s.trace_voices[{handle, voice}];
+    if (type == 3) {
+        ++v.first;
+        return;
+    }
+    if (type == 1) {
+        v = {0, now};
+    }
+    if (s.trace_lines++ >= 400) {
+        return;
+    }
+    char line[200];
+    std::snprintf(line, sizeof(line), "audio-trace: XApu command %u voice %u (t=%" PRId64 "): %" PRIu64
+                  " packets over %" PRId64 " ms since its start",
+                  type, voice, now, v.first, v.second != 0 ? now - v.second : -1);
+    diag(line);
+}
+
 HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags*/) {
     uint32_t head[2] = {};
     if (command == 0 || !com::read_guest(command, head, sizeof(head))) {
@@ -476,6 +620,9 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (++xapu().commands[type] == 1) {
         diag("XApu: first command of type " + std::to_string(type) +
              (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
+    }
+    if (audio_trace_enabled()) {
+        trace_command(handle, type, head[1]);
     }
     if (type == 1 || type == 2) {
         // The voice starts or is freed: its next packet begins a new stream.
@@ -526,6 +673,14 @@ HResult xapu_dequeue_result(uint64_t handle, uint64_t result) {
 
 }  // namespace
 
+bool audio_trace_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("PG6_AUDIO_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    return on;
+}
+
 XApuStats xapu_stats() {
     XApuStats s;
     std::lock_guard<std::mutex> lock(xapu().mutex);
@@ -551,6 +706,28 @@ XApuStats xapu_stats() {
     s.type3_results = xapu().type3_results;
     s.results_posted = xapu().results_posted;
     return s;
+}
+
+XmaCommandStats xma_command_stats() {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    return xma().stats;
+}
+
+bool xma_context_enabled(uint32_t index) {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    return index < xma().enabled.size() && xma().enabled[index];
+}
+
+void reset_xma_commands() {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    xma().enabled.clear();
+    xma().stats = {};
+}
+
+void set_xma_contexts_for_tests(uint64_t va, uint32_t count) {
+    std::lock_guard<std::mutex> lock(xma().mutex);
+    xma().test_contexts = va;
+    xma().test_count = va != 0 ? count : 0;
 }
 
 XDspStats xdsp_stats() {
