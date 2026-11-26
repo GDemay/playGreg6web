@@ -57,11 +57,13 @@
 // and the operation id, written once by XAsyncBegin, so a block that was copied or cleared
 // afterwards (titles may only do that before XAsyncBegin) is not mistaken for the original.
 // The record stays after the operation finished (status and result size remain readable) until
-// the block is begun again or xasync_forget() drops it. Guest XAsyncBlocks (guest memory, guest
-// callbacks) reach the framework through O16's shadow blocks (guest/guest_callbacks.h): the
-// shadow is a host XAsyncBlock whose callback calls the guest callback with the guest block
-// address; the xgameruntime.dll provider (os/xgameruntime_provider.cpp) adapts guest provider
-// functions to XAsyncProviderImpl.
+// the block is begun again, xasync_forget() drops it, or the bounded completed-record cache
+// reclaims older completed entries (keeping active operations untouched and retaining recent
+// completed/unread records so multi-thousand-iteration sessions leak zero memory). Guest
+// XAsyncBlocks (guest memory, guest callbacks) reach the framework through O16's shadow blocks
+// (guest/guest_callbacks.h): the shadow is a host XAsyncBlock whose callback calls the guest
+// callback with the guest block address; the xgameruntime.dll provider
+// (os/xgameruntime_provider.cpp) adapts guest provider functions to XAsyncProviderImpl.
 
 struct Pg6XAsyncProviderData {
     Pg6XAsyncBlock* async;
@@ -138,6 +140,14 @@ bool xasync_in_flight(XAsyncBlock* async_block);
 size_t xasync_record_count();
 // Queued task records (DoWork / completion entries) not yet run or released (leak tests).
 size_t xasync_task_count();
+
+// Bounded retention caps for completed XAsync records whose owners never call xasync_forget():
+// - Observed/consumed records (result fetched, or failed/no-payload status queried) retain a small
+//   recent FIFO window so immediate follow-up GetStatus/GetResultSize/GetResult calls succeed.
+// - Completed records never queried yet (e.g. fire-and-forget XAsyncRun or burst batches) retain a
+//   larger bounded FIFO window before oldest completed entries are abandoned and cleaned up.
+inline constexpr size_t kXAsyncMaxObservedCompletedRecords = 64;
+inline constexpr size_t kXAsyncMaxUnobservedCompletedRecords = 2048;
 
 }  // namespace playgta6::os::gdk
 

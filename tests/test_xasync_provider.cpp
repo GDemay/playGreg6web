@@ -501,6 +501,126 @@ void test_stress() {
     pg6_gdk_xtask_queue_close_handle(q2);
 }
 
+// O52: Multi-thousand-iteration reclamation stress test when callers NEVER invoke xasync_forget().
+// Verifies bounded record counts, zero task leaks, Cleanup invocation on evicted/replaced ops,
+// and strict preservation of active in-flight operations.
+void test_zero_leak_reclamation_stress() {
+    const size_t tasks_before = xasync_task_count();
+
+    // A. 3,000 consumed operations on unique blocks (no xasync_forget): stays <= observed cap.
+    {
+        XTaskQueueHandle queue = make_queue(0, 0);
+        constexpr int kIters = 3000;
+        std::atomic<int> total_cleanups{0};
+        struct LightCtx {
+            std::atomic<int>* cleanups;
+            uint64_t value;
+        };
+        auto provider = [](uint32_t op, const Pg6XAsyncProviderData* data) -> HResult {
+            auto* c = static_cast<LightCtx*>(data->context);
+            switch (static_cast<XAsyncOp>(op)) {
+                case XAsyncOp::Begin:
+                    return pg6_gdk_xasync_schedule(data->async, 0);
+                case XAsyncOp::DoWork:
+                    pg6_gdk_xasync_complete(data->async, S_OK_HR, sizeof(uint64_t));
+                    return E_PENDING_HR;
+                case XAsyncOp::GetResult:
+                    std::memcpy(data->buffer, &c->value, sizeof(uint64_t));
+                    return S_OK_HR;
+                case XAsyncOp::Cleanup:
+                    c->cleanups->fetch_add(1, std::memory_order_relaxed);
+                    return S_OK_HR;
+                default:
+                    return S_OK_HR;
+            }
+        };
+        std::vector<std::unique_ptr<Pg6XAsyncBlock>> blocks;
+        blocks.reserve(kIters);
+        std::vector<LightCtx> ctxs(kIters);
+        for (int i = 0; i < kIters; ++i) {
+            blocks.push_back(std::make_unique<Pg6XAsyncBlock>());
+            Pg6XAsyncBlock* blk = blocks.back().get();
+            blk->queue = queue;
+            ctxs[i] = LightCtx{&total_cleanups, static_cast<uint64_t>(i + 1)};
+            CHECK(pg6_gdk_xasync_begin(blk, &ctxs[i], &kIdentity, "LeakStress", provider) == S_OK_HR);
+            CHECK(pg6_gdk_xtask_queue_dispatch(queue, kWork, 0) == 1);
+            CHECK(pg6_gdk_xtask_queue_dispatch(queue, kCompletion, 0) == 1);
+            uint64_t out = 0;
+            CHECK(pg6_gdk_xasync_get_result(blk, &kIdentity, sizeof(out), &out, nullptr) == S_OK_HR);
+            CHECK(out == static_cast<uint64_t>(i + 1));
+        }
+        CHECK(total_cleanups.load() == kIters);
+        CHECK(xasync_record_count() <= kXAsyncMaxObservedCompletedRecords + kXAsyncMaxUnobservedCompletedRecords);
+        // Almost all observed records were evicted to the observed cap.
+        CHECK(xasync_record_count() <= kXAsyncMaxObservedCompletedRecords + 16);
+        CHECK(xasync_task_count() == tasks_before);
+        pg6_gdk_xtask_queue_close_handle(queue);
+    }
+
+    // B. 3,000 fire-and-forget XAsyncRun operations (never calling GetStatus / GetResult / forget)
+    //    while 32 manual-queue operations stay in flight: in-flight ops are NEVER evicted, and
+    //    total records remain bounded.
+    {
+        XTaskQueueHandle manual = make_queue(0, 0);
+        XTaskQueueHandle immediate = make_queue(3, 3);  // Immediate work & completion
+        constexpr int kInFlight = 32;
+        std::vector<std::unique_ptr<Pg6XAsyncBlock>> pending(kInFlight);
+        std::vector<Script> pending_scripts(kInFlight);
+        for (int i = 0; i < kInFlight; ++i) {
+            pending[i] = std::make_unique<Pg6XAsyncBlock>(make_block(manual, &pending_scripts[i]));
+            CHECK(pg6_gdk_xasync_begin(pending[i].get(), &pending_scripts[i], &kIdentity, nullptr,
+                                       &script_provider) == S_OK_HR);
+        }
+
+        constexpr int kFireForget = 3000;
+        std::vector<std::unique_ptr<Pg6XAsyncBlock>> fire(kFireForget);
+        for (int i = 0; i < kFireForget; ++i) {
+            fire[i] = std::make_unique<Pg6XAsyncBlock>();
+            fire[i]->queue = immediate;
+            CHECK(pg6_gdk_xasync_run(fire[i].get(), [](Pg6XAsyncBlock*) -> HResult { return S_OK_HR; }) == S_OK_HR);
+        }
+        CHECK(xasync_record_count() <=
+              kXAsyncMaxObservedCompletedRecords + kXAsyncMaxUnobservedCompletedRecords + kInFlight);
+
+        // Every one of the 32 in-flight operations is still intact and completes normally.
+        for (int i = 0; i < kInFlight; ++i) {
+            CHECK(pg6_gdk_xtask_queue_dispatch(manual, kWork, 0) == 1);
+            CHECK(pg6_gdk_xtask_queue_dispatch(manual, kCompletion, 0) == 1);
+            uint64_t out = 0;
+            CHECK(pg6_gdk_xasync_get_result(pending[i].get(), &kIdentity, sizeof(out), &out, nullptr) == S_OK_HR);
+            CHECK(out == pending_scripts[i].payload);
+            CHECK(pending_scripts[i].cleanups.load() == 1);
+            xasync_forget(pending[i].get());
+        }
+        CHECK(xasync_task_count() == tasks_before);
+        pg6_gdk_xtask_queue_close_handle(immediate);
+        pg6_gdk_xtask_queue_close_handle(manual);
+    }
+
+    // C. Reusing a block address after clearing block.internal runs Cleanup on the replaced op.
+    {
+        XTaskQueueHandle queue = make_queue(0, 0);
+        Script s1;
+        Script s2;
+        Pg6XAsyncBlock block = make_block(queue, &s1);
+        CHECK(pg6_gdk_xasync_begin(&block, &s1, &kIdentity, nullptr, &script_provider) == S_OK_HR);
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kWork, 0) == 1);
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kCompletion, 0) == 1);
+        CHECK(s1.cleanups.load() == 0);
+        // Simulate caller zeroing/re-constructing a block at the same address without GetResult.
+        block = make_block(queue, &s2);
+        CHECK(pg6_gdk_xasync_begin(&block, &s2, &kIdentity, nullptr, &script_provider) == S_OK_HR);
+        CHECK(s1.cleanups.load() == 1);  // replaced op cleaned up
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kWork, 0) == 1);
+        CHECK(pg6_gdk_xtask_queue_dispatch(queue, kCompletion, 0) == 1);
+        xasync_forget(&block);
+        CHECK(s2.cleanups.load() == 1);
+        pg6_gdk_xtask_queue_close_handle(queue);
+    }
+
+    CHECK(xasync_task_count() == tasks_before);
+}
+
 }  // namespace
 
 int main() {
@@ -516,6 +636,7 @@ int main() {
         {"pending_entries_released_at_queue_destruction", test_pending_entries_released_at_queue_destruction},
         {"ports_and_composite", test_ports_and_composite},
         {"stress", test_stress},
+        {"zero_leak_reclamation_stress", test_zero_leak_reclamation_stress},
     };
     for (const auto& t : tests) {
         std::fprintf(stderr, "test_xasync_provider: %s\n", t.name);

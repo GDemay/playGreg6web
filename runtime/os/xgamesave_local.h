@@ -94,11 +94,17 @@ public:
     HResult read_blob(const std::string& container, const std::string& blob, std::vector<uint8_t>* out) const;
     HResult submit_update(const std::string& container, const std::vector<BlobWrite>& writes,
                           const std::vector<std::string>& deletes);
+    // Atomic container update that can also create the container on first write and persist its
+    // display name in the same directory swap (used by the GDK XGameSave provider).
+    HResult submit_update(const std::string& container, const std::vector<BlobWrite>& writes,
+                          const std::vector<std::string>& deletes, const std::string* display_name,
+                          bool create_if_missing);
     // Display name shown for an existing container (kept next to its blobs).
     HResult set_display_name(const std::string& container, const std::string& display_name);
 
     // Test hook: simulate a crash inside submit_update. 1 = after the new copy is built (nothing
-    // swapped), 2 = after the old container was moved aside but before the new one is in place.
+    // swapped), 2 = after the old container was moved aside but before the new one is in place,
+    // 3 = after the new container is in place but before the old aside directory is removed.
     // The update then returns E_FAIL without cleaning up. 0 = off.
     static void set_test_crash_point(int point);
 

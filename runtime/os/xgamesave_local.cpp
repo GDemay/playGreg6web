@@ -152,15 +152,24 @@ std::map<std::string, uint64_t> list_blobs(const fs::path& container, uint64_t* 
         if (file.compare(0, 2, "b-") != 0 || !decode(file.substr(2), &name) || !it->is_regular_file(ec)) {
             continue;
         }
-        out[name] = static_cast<uint64_t>(it->file_size(ec));
+        const uint64_t sz = static_cast<uint64_t>(it->file_size(ec));
+        if (ec) {
+            ec.clear();
+            continue;
+        }
+        out[name] = sz;
         if (newest_ticks != nullptr) {
             const auto ft = it->last_write_time(ec);
-            const auto sys = std::chrono::system_clock::now() +
-                             std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                                 ft - fs::file_time_type::clock::now());
-            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
-            const uint64_t ticks = secs > 0 ? (static_cast<uint64_t>(secs) + 11644473600ull) * 10000000ull : 0;
-            *newest_ticks = std::max(*newest_ticks, ticks);
+            if (!ec) {
+                const auto sys = std::chrono::system_clock::now() +
+                                 std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                                     ft - fs::file_time_type::clock::now());
+                const auto secs = std::chrono::duration_cast<std::chrono::seconds>(sys.time_since_epoch()).count();
+                const uint64_t ticks = secs > 0 ? (static_cast<uint64_t>(secs) + 11644473600ull) * 10000000ull : 0;
+                *newest_ticks = std::max(*newest_ticks, ticks);
+            } else {
+                ec.clear();
+            }
         }
     }
     return out;
@@ -189,31 +198,59 @@ void remove_stale_temps(const fs::path& container) {
 }
 
 // Finishes or rolls back a swap that a crash interrupted: ".old-<c-dir>-N" is the previous
-// container (restored when the container is missing), ".new-<c-dir>-N" an unfinished copy.
+// container (restored when the container is missing, removed when the new container is in place),
+// ".new-<c-dir>-N" an unfinished copy. Also removes stale ".tmp-*" files inside containers.
 void recover_swaps(const std::string& root) {
     std::error_code ec;
     std::vector<fs::path> olds;
     std::vector<fs::path> news;
+    std::vector<fs::path> containers;
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
         const std::string file = it->path().filename().string();
         if (file.compare(0, 5, ".old-") == 0) {
             olds.push_back(it->path());
         } else if (file.compare(0, 5, ".new-") == 0) {
             news.push_back(it->path());
+        } else if (file.compare(0, 2, "c-") == 0 && it->is_directory(ec)) {
+            containers.push_back(it->path());
         }
     }
+    bool root_changed = false;
     for (const fs::path& p : olds) {
-        std::string target = p.filename().string().substr(5);
-        target = target.substr(0, target.rfind('-'));
+        const std::string body = p.filename().string().substr(5);
+        const size_t dash = body.rfind('-');
+        if (dash == std::string::npos || dash == 0 || dash + 1 >= body.size()) {
+            fs::remove_all(p, ec);
+            continue;
+        }
+        const std::string target = body.substr(0, dash);
+        const std::string suffix = body.substr(dash + 1);
+        const bool numeric_suffix =
+            std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) { return c >= '0' && c <= '9'; });
+        if (target.compare(0, 2, "c-") != 0 || !numeric_suffix) {
+            fs::remove_all(p, ec);
+            continue;
+        }
         const fs::path dest = fs::path(root) / target;
         if (fs::exists(dest, ec)) {
             fs::remove_all(p, ec);
         } else {
             fs::rename(p, dest, ec);
+            if (!ec) {
+                root_changed = true;
+                containers.push_back(dest);
+                mark_changed(dest);
+            }
         }
     }
     for (const fs::path& p : news) {
         fs::remove_all(p, ec);
+    }
+    for (const fs::path& c : containers) {
+        remove_stale_temps(c);
+    }
+    if (root_changed) {
+        sync_path(fs::path(root), true);
     }
 }
 
@@ -294,6 +331,9 @@ Store::Store(const std::string& root, uint64_t quota_bytes) : root_(root), quota
 }
 
 HResult Store::remaining_quota(int64_t* out) const {
+    if (out == nullptr) {
+        return E_INVALIDARG_HR;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     const uint64_t used = used_bytes(root_);
     *out = used >= quota_ ? 0 : static_cast<int64_t>(quota_ - used);
@@ -307,12 +347,15 @@ HResult Store::create_container(const std::string& name) {
     std::lock_guard<std::mutex> lock(g_mutex);
     const fs::path path = container_path(root_, name);
     std::error_code ec;
-    fs::create_directories(path, ec);
+    const bool created = fs::create_directories(path, ec);
     if (ec) {
         return E_FAIL_HR;
     }
     remove_stale_temps(path);
-    mark_changed(path);
+    if (created) {
+        sync_path(fs::path(root_), true);
+        mark_changed(path);
+    }
     return S_OK_HR;
 }
 
@@ -328,12 +371,16 @@ HResult Store::delete_container(const std::string& name) {
     }
     fs::remove_all(path, ec);
     if (!ec) {
+        sync_path(fs::path(root_), true);
         mark_changed(path);
     }
     return ec ? E_FAIL_HR : S_OK_HR;
 }
 
 HResult Store::enumerate_containers(const std::string& prefix, std::vector<ContainerInfo>* out) const {
+    if (out == nullptr) {
+        return E_INVALIDARG_HR;
+    }
     out->clear();
     std::lock_guard<std::mutex> lock(g_mutex);
     std::error_code ec;
@@ -356,6 +403,9 @@ HResult Store::enumerate_containers(const std::string& prefix, std::vector<Conta
 }
 
 HResult Store::get_container_info(const std::string& name, ContainerInfo* out) const {
+    if (out == nullptr) {
+        return E_INVALIDARG_HR;
+    }
     *out = ContainerInfo{};
     if (!valid_name(name, kMaxContainerNameChars)) {
         return E_GS_INVALID_CONTAINER_NAME;
@@ -376,6 +426,9 @@ HResult Store::get_container_info(const std::string& name, ContainerInfo* out) c
 }
 
 HResult Store::enumerate_blobs(const std::string& container, std::vector<BlobInfo>* out) const {
+    if (out == nullptr) {
+        return E_INVALIDARG_HR;
+    }
     out->clear();
     if (!valid_name(container, kMaxContainerNameChars)) {
         return E_GS_INVALID_CONTAINER_NAME;
@@ -393,6 +446,9 @@ HResult Store::enumerate_blobs(const std::string& container, std::vector<BlobInf
 }
 
 HResult Store::read_blob(const std::string& container, const std::string& blob, std::vector<uint8_t>* out) const {
+    if (out == nullptr) {
+        return E_INVALIDARG_HR;
+    }
     out->clear();
     if (!valid_name(container, kMaxContainerNameChars)) {
         return E_GS_INVALID_CONTAINER_NAME;
@@ -411,13 +467,26 @@ HResult Store::read_blob(const std::string& container, const std::string& blob, 
         return E_GS_BLOB_NOT_FOUND;
     }
     out->assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    if (in.bad()) {
+        out->clear();
+        return E_FAIL_HR;
+    }
     return S_OK_HR;
 }
 
 HResult Store::submit_update(const std::string& container, const std::vector<BlobWrite>& writes,
                              const std::vector<std::string>& deletes) {
+    return submit_update(container, writes, deletes, nullptr, false);
+}
+
+HResult Store::submit_update(const std::string& container, const std::vector<BlobWrite>& writes,
+                             const std::vector<std::string>& deletes, const std::string* display_name,
+                             bool create_if_missing) {
     if (!valid_name(container, kMaxContainerNameChars)) {
         return E_GS_INVALID_CONTAINER_NAME;
+    }
+    if (display_name != nullptr && display_name->size() > kMaxDisplayNameChars) {
+        return E_INVALIDARG_HR;
     }
     for (const BlobWrite& w : writes) {
         if (!valid_name(w.name, kMaxBlobNameChars)) {
@@ -426,10 +495,10 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     }
     uint64_t update_bytes = 0;
     for (const BlobWrite& w : writes) {
+        if (w.data.size() > kMaxBlobBytes || update_bytes > kMaxUpdateBytes - w.data.size()) {
+            return E_GS_UPDATE_TOO_BIG;
+        }
         update_bytes += w.data.size();
-    }
-    if (update_bytes > kMaxUpdateBytes) {
-        return E_GS_UPDATE_TOO_BIG;
     }
     for (const std::string& d : deletes) {
         if (!valid_name(d, kMaxBlobNameChars)) {
@@ -439,11 +508,18 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     std::lock_guard<std::mutex> lock(g_mutex);
     const fs::path dir = container_path(root_, container);
     std::error_code ec;
-    if (!fs::is_directory(dir, ec)) {
+    const bool existed = fs::is_directory(dir, ec);
+    if (!existed && !create_if_missing) {
         return E_GS_NO_SUCH_CONTAINER;
     }
+    if (!existed) {
+        fs::create_directories(root_, ec);
+        if (ec) {
+            return E_FAIL_HR;
+        }
+    }
     // Quota: bytes after the update (writes apply first, then deletes).
-    std::map<std::string, uint64_t> sizes = list_blobs(dir);
+    std::map<std::string, uint64_t> sizes = existed ? list_blobs(dir) : std::map<std::string, uint64_t>{};
     uint64_t total = used_bytes(root_);
     auto drop = [&](const std::string& name) {
         auto it = sizes.find(name);
@@ -484,17 +560,23 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     for (const std::string& d : deletes) {
         replaced[blob_path(dir, d).filename().string()] = true;
     }
-    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-        const std::string file = it->path().filename().string();
-        if (file.compare(0, 5, ".tmp-") == 0 || replaced.count(file) != 0 || !it->is_regular_file(ec)) {
-            continue;
-        }
-        std::error_code link_ec;
-        fs::create_hard_link(it->path(), fresh / file, link_ec);
-        if (link_ec) {
-            fs::copy_file(it->path(), fresh / file, fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                return fail();
+    const bool write_display = display_name != nullptr && !display_name->empty();
+    if (write_display) {
+        replaced[kDisplayNameFile] = true;
+    }
+    if (existed) {
+        for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+            const std::string file = it->path().filename().string();
+            if (file.compare(0, 5, ".tmp-") == 0 || replaced.count(file) != 0 || !it->is_regular_file(ec)) {
+                continue;
+            }
+            std::error_code link_ec;
+            fs::create_hard_link(it->path(), fresh / file, link_ec);
+            if (link_ec) {
+                fs::copy_file(it->path(), fresh / file, fs::copy_options::overwrite_existing, ec);
+                if (ec) {
+                    return fail();
+                }
             }
         }
     }
@@ -513,6 +595,22 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
             return fail();
         }
     }
+    if (write_display) {
+        bool ok = false;
+        const fs::path dn = fresh / kDisplayNameFile;
+        {
+            std::ofstream out(dn, std::ios::binary | std::ios::trunc);
+            if (out) {
+                out.write(display_name->data(), static_cast<std::streamsize>(display_name->size()));
+                out.flush();
+                ok = static_cast<bool>(out);
+            }
+        }
+        ok = ok && sync_path(dn, false);
+        if (!ok) {
+            return fail();
+        }
+    }
     // Writes apply first, then deletes (a delete of a written name wins).
     for (const std::string& d : deletes) {
         fs::remove(blob_path(fresh, d), ec);
@@ -520,23 +618,36 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     if (g_crash_point.load() == 1) {
         return E_FAIL_HR;
     }
-    // Commit: old aside, new in, old removed.
-    fs::rename(dir, aside, ec);
-    if (ec) {
-        return fail();
+    // Commit: for an existing container, old aside -> new in -> old removed; for a brand-new
+    // container, rename fresh directly into place so nothing half-created is ever visible.
+    if (existed) {
+        fs::rename(dir, aside, ec);
+        if (ec) {
+            return fail();
+        }
+        if (g_crash_point.load() == 2) {
+            return E_FAIL_HR;
+        }
+        fs::rename(fresh, dir, ec);
+        if (ec) {
+            std::error_code undo;
+            fs::rename(aside, dir, undo);
+            return fail();
+        }
+        sync_path(dir, true);
+        sync_path(fs::path(root_), true);
+        if (g_crash_point.load() == 3) {
+            return E_FAIL_HR;
+        }
+        fs::remove_all(aside, ec);
+    } else {
+        fs::rename(fresh, dir, ec);
+        if (ec) {
+            return fail();
+        }
+        sync_path(dir, true);
+        sync_path(fs::path(root_), true);
     }
-    if (g_crash_point.load() == 2) {
-        return E_FAIL_HR;
-    }
-    fs::rename(fresh, dir, ec);
-    if (ec) {
-        std::error_code undo;
-        fs::rename(aside, dir, undo);
-        return fail();
-    }
-    sync_path(dir, true);
-    sync_path(fs::path(root_), true);
-    fs::remove_all(aside, ec);
     mark_changed(dir);
     return S_OK_HR;
 }
@@ -578,6 +689,7 @@ HResult Store::set_display_name(const std::string& container, const std::string&
         return E_FAIL_HR;
     }
     sync_path(dir / kDisplayNameFile, false);
+    sync_path(dir, true);
     mark_changed(dir);
     return S_OK_HR;
 }
