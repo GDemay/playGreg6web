@@ -1,10 +1,12 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -136,6 +138,8 @@ inline constexpr uint32_t kMemReserve = 0x00002000u;
 inline constexpr uint32_t kMemDecommit = 0x00004000u;
 inline constexpr uint32_t kMemRelease = 0x00008000u;
 inline constexpr uint32_t kMemFree = 0x00010000u;
+inline constexpr uint32_t kMemReset = 0x00080000u;
+inline constexpr uint32_t kMemResetUndo = 0x01000000u;
 // Placeholders (VirtualAlloc2 / VirtualFree, Windows 10 1803+; the Xbox OS takes the same flags):
 // a placeholder is a no-access reservation that can only be split, coalesced, replaced by a
 // real reservation of exactly its range, or released.
@@ -315,12 +319,34 @@ public:
 
     uint64_t reserved_bytes() const;
     uint64_t committed_bytes() const;
+    uint64_t peak_committed_bytes() const;
+    uint64_t decommitted_bytes_total() const;
+    uint64_t reclaimed_pages_reused() const;
     size_t reservation_count() const;
 
 private:
+    static constexpr size_t kLookupCacheSize = 64;
+    static constexpr uint64_t kDecommitChunkShift = 24;  // 16 MiB = 4096 pages = 64 * u64
+    static constexpr size_t kDecommitChunkWords = 64;
+
+    struct DecommitChunk {
+        std::array<uint64_t, kDecommitChunkWords> bits{};
+        uint16_t count = 0;
+    };
+
     struct PageMeta {
-        MemState state = MemState::Reserve;
-        PageProtect protect = PageProtect::NoAccess;
+        uint8_t state_raw = 0;  // 0 = Reserve, 1 = Commit
+        uint8_t protect_raw = static_cast<uint8_t>(PageProtect::NoAccess);
+
+        PageMeta() = default;
+        PageMeta(MemState s, PageProtect p)
+            : state_raw(s == MemState::Commit ? 1 : 0),
+              protect_raw(static_cast<uint8_t>(p)) {}
+
+        MemState state() const { return state_raw != 0 ? MemState::Commit : MemState::Reserve; }
+        void set_state(MemState s) { state_raw = s == MemState::Commit ? 1 : 0; }
+        PageProtect protect() const { return static_cast<PageProtect>(protect_raw); }
+        void set_protect(PageProtect p) { protect_raw = static_cast<uint8_t>(p); }
     };
 
     struct Reservation {
@@ -344,6 +370,10 @@ private:
     bool decommit_locked(uint64_t addr, uint64_t size);
     bool release_locked(uint64_t base_addr);
 
+    void invalidate_lookup_cache_locked() const;
+    void mark_decommitted_page_locked(uint64_t va, uint64_t& cached_key, DecommitChunk*& cached_chunk);
+    bool consume_reclaimed_page_locked(uint64_t va, uint64_t& cached_key, DecommitChunk*& cached_chunk);
+
     Reservation* find_reservation_locked(uint64_t addr);
     const Reservation* find_reservation_locked(uint64_t addr) const;
     bool pages_allow_locked(uint64_t addr, size_t len, bool need_write) const;
@@ -362,8 +392,14 @@ private:
     uint64_t shared_zone_size_ = 0;
     mutable std::mutex mutex_;
     std::map<uint64_t, Reservation> reservations_;
+    mutable const Reservation* last_res_ = nullptr;
+    mutable std::array<const Reservation*, kLookupCacheSize> lookup_cache_{};
+    std::unordered_map<uint64_t, DecommitChunk> decommitted_chunks_;
     uint64_t reserved_bytes_ = 0;
     uint64_t committed_bytes_ = 0;
+    uint64_t peak_committed_bytes_ = 0;
+    uint64_t decommitted_bytes_total_ = 0;
+    uint64_t reclaimed_pages_reused_ = 0;
 };
 
 // O36: shared page objects for VirtualMemoryArena::map_shared (native hosts; nullptr elsewhere).

@@ -1,11 +1,12 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <mutex>
-#include <set>
 #include <unordered_map>
+#include <vector>
 
 #include "os/vmem.h"
 
@@ -120,6 +121,10 @@ struct GuestHeapStats {
     uint64_t lock_acquisitions = 0;
     uint64_t lock_contended = 0;
     uint64_t lock_wait_ns = 0;
+    // O54: empty 2 MiB segment reclamation telemetry.
+    uint64_t active_segments = 0;
+    uint64_t segments_reclaimed = 0;
+    uint64_t reclaimed_bytes = 0;
 };
 
 struct HeapBlockInfo {
@@ -187,8 +192,13 @@ public:
     void abandon();
     // Release every block and segment back to the arena.
     void release_all();
+    // O54: release all currently empty small/medium segments (including the hot cached one) back
+    // to the arena, returning total reclaimed bytes.
+    uint64_t reclaim_empty_segments();
 
 private:
+    static constexpr size_t kNumSizeBins = 64;
+
     struct Block {
         uint64_t size = 0;       // requested
         uint64_t extent = 0;     // small: 16-byte footprint; large: reserved bytes
@@ -196,6 +206,19 @@ private:
         uint64_t alignment = kMinAlignment;
         HeapFamily family = HeapFamily::Crt;
         bool large = false;
+    };
+
+    struct FreeRange {
+        uint64_t size = 0;
+        uint8_t bin = 0;
+        size_t bin_index = 0;
+    };
+    using FreeAddrMap = std::map<uint64_t, FreeRange>;
+
+    struct BinEntry {
+        uint64_t addr = 0;
+        uint64_t size = 0;
+        FreeAddrMap::iterator addr_it;
     };
 
     bool charge_locked(uint64_t size, HeapFamily family);
@@ -207,8 +230,9 @@ private:
     uint64_t take_free_locked(uint64_t capacity, uint64_t alignment);
     bool grow_locked(uint64_t capacity, uint64_t alignment);
     void insert_free_locked(uint64_t addr, uint64_t size);
-    void erase_free_locked(std::map<uint64_t, uint64_t>::iterator it);
+    FreeAddrMap::iterator erase_free_locked(FreeAddrMap::iterator it);
     void add_free_locked(uint64_t addr, uint64_t size);
+    std::map<uint64_t, uint64_t>::iterator find_segment_locked(uint64_t addr);
     uint64_t segment_base_locked(uint64_t addr) const;
 
     uint64_t reserve_large(uint64_t size, uint64_t alignment);
@@ -228,9 +252,11 @@ private:
     uint64_t soft_limit_ = 0;
     uint32_t invalid_logged_ = 0;
 
-    std::map<uint64_t, uint64_t> segments_;                 // base -> size
-    std::map<uint64_t, uint64_t> free_by_addr_;             // maximal free ranges
-    std::set<std::pair<uint64_t, uint64_t>> free_by_size_;  // (size, addr)
+    std::map<uint64_t, uint64_t> segments_;          // base -> size
+    FreeAddrMap free_by_addr_;                       // maximal free ranges
+    std::array<std::vector<BinEntry>, kNumSizeBins> bins_;
+    uint64_t free_bin_mask_ = 0;
+    uint64_t cached_empty_segment_ = 0;              // hot 1-segment empty cache
     std::unordered_map<uint64_t, Block> live_;
 
     GuestHeapStats stats_;

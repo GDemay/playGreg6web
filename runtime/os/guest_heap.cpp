@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cerrno>
 #include <cstdio>
 #include <chrono>
@@ -51,6 +52,35 @@ bool is_pow2(uint64_t v) {
 
 uint64_t small_capacity(uint64_t size) {
     return round_up(size == 0 ? 1 : size, kSmallAlign);
+}
+
+// 64 segregated size-class bins:
+//   0..14: exact 16-byte classes [16, 32, ..., 240]
+//  15..62: 4 sub-bins per power of two from 256 B (2^8) up to < 1 MiB (2^20)
+//      63: >= 1 MiB (including full 2 MiB segments)
+uint8_t bin_for_size(uint64_t size) {
+    if (size < 256) {
+        return static_cast<uint8_t>((size >> 4) - 1);
+    }
+    if (size >= (uint64_t{1} << 20)) {
+        return 63;
+    }
+    const unsigned exp = 63u - static_cast<unsigned>(std::countl_zero(size));
+    const unsigned sub = static_cast<unsigned>((size >> (exp - 2u)) & 3u);
+    return static_cast<uint8_t>(15u + (exp - 8u) * 4u + sub);
+}
+
+uint64_t bin_min_size(uint8_t bin) {
+    if (bin < 15) {
+        return (uint64_t{bin} + 1u) << 4;
+    }
+    if (bin >= 63) {
+        return uint64_t{1} << 20;
+    }
+    const unsigned off = static_cast<unsigned>(bin) - 15u;
+    const unsigned exp = 8u + (off >> 2);
+    const unsigned sub = off & 3u;
+    return uint64_t{4u + sub} << (exp - 2u);
 }
 
 uint64_t arena_alloc(VirtualMemoryArena& arena, uint64_t addr, uint64_t size) {
@@ -138,17 +168,42 @@ void GuestHeap::zero(uint64_t va, uint64_t len) const {
 }
 
 // ---------------------------------------------------------------------------
-// Small / medium backend
+// Small / medium backend (segregated size-class bins + O(1) bitmask scan)
 // ---------------------------------------------------------------------------
 
 void GuestHeap::insert_free_locked(uint64_t addr, uint64_t size) {
-    free_by_addr_.emplace(addr, size);
-    free_by_size_.emplace(size, addr);
+    const uint8_t b = bin_for_size(size);
+    auto& vec = bins_[b];
+    const size_t idx = vec.size();
+    auto [it, inserted] = free_by_addr_.emplace(addr, FreeRange{size, b, idx});
+    (void)inserted;
+    vec.push_back(BinEntry{addr, size, it});
+    free_bin_mask_ |= (uint64_t{1} << b);
 }
 
-void GuestHeap::erase_free_locked(std::map<uint64_t, uint64_t>::iterator it) {
-    free_by_size_.erase({it->second, it->first});
-    free_by_addr_.erase(it);
+GuestHeap::FreeAddrMap::iterator GuestHeap::erase_free_locked(FreeAddrMap::iterator it) {
+    const uint8_t b = it->second.bin;
+    const size_t idx = it->second.bin_index;
+    auto& vec = bins_[b];
+    if (idx + 1 < vec.size()) {
+        const BinEntry moved = vec.back();
+        vec[idx] = moved;
+        moved.addr_it->second.bin_index = idx;
+    }
+    vec.pop_back();
+    if (vec.empty()) {
+        free_bin_mask_ &= ~(uint64_t{1} << b);
+    }
+    return free_by_addr_.erase(it);
+}
+
+std::map<uint64_t, uint64_t>::iterator GuestHeap::find_segment_locked(uint64_t addr) {
+    auto it = segments_.upper_bound(addr);
+    if (it == segments_.begin()) {
+        return segments_.end();
+    }
+    --it;
+    return addr < it->first + it->second ? it : segments_.end();
 }
 
 uint64_t GuestHeap::segment_base_locked(uint64_t addr) const {
@@ -161,53 +216,134 @@ uint64_t GuestHeap::segment_base_locked(uint64_t addr) const {
 }
 
 void GuestHeap::add_free_locked(uint64_t addr, uint64_t size) {
-    const uint64_t seg = segment_base_locked(addr);
-    auto next = free_by_addr_.find(addr + size);
-    if (next != free_by_addr_.end() && segment_base_locked(next->first) == seg) {
-        size += next->second;
-        erase_free_locked(next);
-    }
+    auto seg_it = find_segment_locked(addr);
+    const uint64_t seg_base = seg_it != segments_.end() ? seg_it->first : 0;
+    const uint64_t seg_size = seg_it != segments_.end() ? seg_it->second : 0;
+    const uint64_t seg_end = seg_base + seg_size;
+
+    // Bi-directional address coalescing within the same segment (single map lookup).
     auto it = free_by_addr_.lower_bound(addr);
+    if (it != free_by_addr_.end() && it->first == addr + size && it->first < seg_end) {
+        size += it->second.size;
+        it = erase_free_locked(it);
+    }
     if (it != free_by_addr_.begin()) {
         auto prev = std::prev(it);
-        if (prev->first + prev->second == addr && segment_base_locked(prev->first) == seg) {
+        if (prev->first + prev->second.size == addr && prev->first >= seg_base) {
             addr = prev->first;
-            size += prev->second;
+            size += prev->second.size;
             erase_free_locked(prev);
         }
+    }
+
+    // O54: When a segment becomes completely free, retain at most 1 hot cached empty segment to
+    // avoid alloc/free thrashing and immediately release any excess empty segments to the arena.
+    if (seg_it != segments_.end() && addr == seg_base && size == seg_size) {
+        if (cached_empty_segment_ == 0 || cached_empty_segment_ == seg_base) {
+            cached_empty_segment_ = seg_base;
+            insert_free_locked(addr, size);
+        } else {
+            segments_.erase(seg_it);
+            stats_.committed_bytes -= seg_size;
+            stats_.active_segments = segments_.size();
+            stats_.segments_reclaimed += 1;
+            stats_.reclaimed_bytes += seg_size;
+            arena_.release(seg_base);
+        }
+        return;
     }
     insert_free_locked(addr, size);
 }
 
 uint64_t GuestHeap::take_free_locked(uint64_t capacity, uint64_t alignment) {
-    // Free ranges start 16-byte aligned, so any range of capacity + alignment - 16 bytes fits an
-    // aligned block wherever it lies; smaller ranges only fit by luck, so look at a few of those
-    // first and then jump straight to the guaranteed fits.
+    if (free_bin_mask_ == 0) {
+        return 0;
+    }
+    auto try_take_from_bin = [&](uint8_t b, size_t max_scan) -> uint64_t {
+        auto& vec = bins_[b];
+        const size_t n = vec.size();
+        const size_t limit = max_scan == 0 ? n : std::min(n, max_scan);
+        for (size_t k = 0; k < limit; ++k) {
+            const BinEntry& e = vec[n - 1 - k];
+            if (e.size < capacity) {
+                continue;
+            }
+            const uint64_t start = alignment == kSmallAlign ? e.addr : round_up(e.addr, alignment);
+            if (start - e.addr + capacity > e.size) {
+                continue;
+            }
+            const uint64_t addr = e.addr;
+            const uint64_t size = e.size;
+            const auto addr_it = e.addr_it;
+            erase_free_locked(addr_it);
+            if (addr == cached_empty_segment_) {
+                cached_empty_segment_ = 0;
+            }
+            if (start > addr) {
+                insert_free_locked(addr, start - addr);
+            }
+            const uint64_t tail = addr + size - (start + capacity);
+            if (tail != 0) {
+                insert_free_locked(start + capacity, tail);
+            }
+            return start;
+        }
+        return 0;
+    };
+
+    // Free ranges start 16-byte aligned, so any range of capacity + alignment - 16 bytes is
+    // guaranteed to fit an aligned block. Probe a few entries in smaller bins first, then jump in
+    // O(1) via bitmask scan to the smallest non-empty bin whose minimum size >= guaranteed.
     const uint64_t guaranteed = capacity + (alignment > kSmallAlign ? alignment - kSmallAlign : 0);
-    auto it = free_by_size_.lower_bound({capacity, 0});
-    for (int tries = 0; it != free_by_size_.end(); ++it, ++tries) {
-        if (tries == 16 && it->first < guaranteed) {
-            it = free_by_size_.lower_bound({guaranteed, 0});
-            if (it == free_by_size_.end()) {
-                break;
+    const uint8_t start_bin = bin_for_size(capacity);
+    const uint8_t guar_bin = bin_for_size(guaranteed);
+    const uint8_t first_always_fit =
+        guaranteed <= bin_min_size(guar_bin)
+            ? guar_bin
+            : static_cast<uint8_t>(std::min<unsigned>(guar_bin + 1u, kNumSizeBins));
+
+    uint64_t partial_mask = free_bin_mask_ & (~uint64_t{0} << start_bin);
+    if (first_always_fit < kNumSizeBins) {
+        partial_mask &= (uint64_t{1} << first_always_fit) - 1u;
+    }
+    int tries_left = 16;
+    while (partial_mask != 0 && tries_left > 0) {
+        const uint8_t b = static_cast<uint8_t>(std::countr_zero(partial_mask));
+        partial_mask &= partial_mask - 1u;
+        const size_t scan = static_cast<size_t>(tries_left);
+        const size_t avail = bins_[b].size();
+        if (const uint64_t got = try_take_from_bin(b, scan); got != 0) {
+            return got;
+        }
+        tries_left -= static_cast<int>(std::min(avail, scan));
+    }
+
+    if (first_always_fit < kNumSizeBins) {
+        const uint64_t guar_mask = free_bin_mask_ & (~uint64_t{0} << first_always_fit);
+        if (guar_mask != 0) {
+            const uint8_t b = static_cast<uint8_t>(std::countr_zero(guar_mask));
+            if (const uint64_t got = try_take_from_bin(b, 1); got != 0) {
+                return got;
+            }
+            // Fallback in case guaranteed > bin_min_size(63) (cannot happen for small blocks).
+            if (const uint64_t got = try_take_from_bin(b, 0); got != 0) {
+                return got;
             }
         }
-        const uint64_t size = it->first;
-        const uint64_t addr = it->second;
-        const uint64_t start = round_up(addr, alignment);
-        if (start - addr + capacity > size) {
-            continue;
+    }
+
+    // No guaranteed bin was non-empty: exhaustively check remaining partial-bin entries before
+    // growing a new 2 MiB segment.
+    uint64_t fallback_mask = free_bin_mask_ & (~uint64_t{0} << start_bin);
+    if (first_always_fit < kNumSizeBins) {
+        fallback_mask &= (uint64_t{1} << first_always_fit) - 1u;
+    }
+    while (fallback_mask != 0) {
+        const uint8_t b = static_cast<uint8_t>(std::countr_zero(fallback_mask));
+        fallback_mask &= fallback_mask - 1u;
+        if (const uint64_t got = try_take_from_bin(b, 0); got != 0) {
+            return got;
         }
-        free_by_size_.erase(it);
-        free_by_addr_.erase(addr);
-        if (start > addr) {
-            insert_free_locked(addr, start - addr);
-        }
-        const uint64_t tail = addr + size - (start + capacity);
-        if (tail != 0) {
-            insert_free_locked(start + capacity, tail);
-        }
-        return start;
     }
     return 0;
 }
@@ -221,6 +357,7 @@ bool GuestHeap::grow_locked(uint64_t capacity, uint64_t alignment) {
     }
     segments_.emplace(base, seg);
     stats_.committed_bytes += seg;
+    stats_.active_segments = segments_.size();
     insert_free_locked(base, seg);
     return true;
 }
@@ -435,10 +572,10 @@ int GuestHeap::resize_in_place_locked(uint64_t va, Block& block, uint64_t size, 
             auto nf = free_by_addr_.find(va + block.extent);
             if (nf == free_by_addr_.end() ||
                 segment_base_locked(nf->first) != segment_base_locked(va) ||
-                block.extent + nf->second < cap) {
+                block.extent + nf->second.size < cap) {
                 return 1;
             }
-            const uint64_t remainder = block.extent + nf->second - cap;
+            const uint64_t remainder = block.extent + nf->second.size - cap;
             erase_free_locked(nf);
             if (remainder != 0) {
                 insert_free_locked(va + cap, remainder);
@@ -577,6 +714,7 @@ GuestHeapStats GuestHeap::stats() const {
     copy.lock_acquisitions = lock_acquisitions_;
     copy.lock_contended = lock_contended_;
     copy.lock_wait_ns = lock_wait_ns_;
+    copy.active_segments = segments_.size();
     return copy;
 }
 
@@ -590,13 +728,43 @@ uint64_t GuestHeap::soft_limit() const {
     return soft_limit_;
 }
 
+uint64_t GuestHeap::reclaim_empty_segments() {
+    HeapLock lock(*this);
+    uint64_t reclaimed = 0;
+    for (auto it = segments_.begin(); it != segments_.end();) {
+        const uint64_t base = it->first;
+        const uint64_t seg_size = it->second;
+        auto free_it = free_by_addr_.find(base);
+        if (free_it != free_by_addr_.end() && free_it->second.size == seg_size) {
+            erase_free_locked(free_it);
+            if (cached_empty_segment_ == base) {
+                cached_empty_segment_ = 0;
+            }
+            it = segments_.erase(it);
+            stats_.committed_bytes -= seg_size;
+            stats_.segments_reclaimed += 1;
+            stats_.reclaimed_bytes += seg_size;
+            reclaimed += seg_size;
+            arena_.release(base);
+        } else {
+            ++it;
+        }
+    }
+    stats_.active_segments = segments_.size();
+    return reclaimed;
+}
+
 void GuestHeap::abandon() {
     HeapLock lock(*this);
     abandoned_ = true;
     live_.clear();
     segments_.clear();
     free_by_addr_.clear();
-    free_by_size_.clear();
+    for (auto& bin : bins_) {
+        bin.clear();
+    }
+    free_bin_mask_ = 0;
+    cached_empty_segment_ = 0;
     stats_ = GuestHeapStats{};
 }
 
@@ -614,7 +782,11 @@ void GuestHeap::release_all() {
     live_.clear();
     segments_.clear();
     free_by_addr_.clear();
-    free_by_size_.clear();
+    for (auto& bin : bins_) {
+        bin.clear();
+    }
+    free_bin_mask_ = 0;
+    cached_empty_segment_ = 0;
     stats_ = GuestHeapStats{};
 }
 

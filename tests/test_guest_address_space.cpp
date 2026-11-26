@@ -187,8 +187,14 @@ void run_scenario(const char* what, VirtualMemoryArena& arena, bool use_process_
                 arena.is_identity() ? "identity" : "offset",
                 static_cast<unsigned long long>(pushed_at));
 
+    const uint64_t peak_before_unload = arena.peak_committed_bytes();
+    const uint64_t committed_while_loaded = arena.committed_bytes();
+    const uint64_t decommitted_before = arena.decommitted_bytes_total();
+    CHECK(peak_before_unload >= committed_while_loaded && committed_while_loaded > 0);
+
     guest::destroy_guest_thread(arena, thread);
     CHECK(unload_image(arena, image));
+    CHECK(arena.decommitted_bytes_total() > decommitted_before);
     guest::reset_guest_runtime();
     win32::set_vmem_arena(nullptr);
 }

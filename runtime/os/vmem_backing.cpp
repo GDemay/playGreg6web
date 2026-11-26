@@ -548,6 +548,27 @@ bool decommit(uint8_t* p, uint64_t len) {
     return VirtualFree(p, static_cast<SIZE_T>(len), MEM_DECOMMIT) != 0;
 }
 
+#ifndef MEM_RESET
+#define MEM_RESET 0x00080000
+#endif
+#ifndef MEM_RESET_UNDO
+#define MEM_RESET_UNDO 0x01000000
+#endif
+
+bool reset_pages(uint8_t* p, uint64_t len) {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    return VirtualAlloc(p, static_cast<SIZE_T>(len), MEM_RESET, PAGE_NOACCESS) != nullptr;
+}
+
+bool reset_undo_pages(uint8_t* p, uint64_t len) {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    return VirtualAlloc(p, static_cast<SIZE_T>(len), MEM_RESET_UNDO, PAGE_NOACCESS) != nullptr;
+}
+
 bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
     track_protect(p, len, win_protect(protect) == PAGE_READWRITE);
     DWORD old = 0;
@@ -1019,10 +1040,10 @@ void release(uint8_t* base, uint64_t /*size*/) {
 
 bool commit(uint8_t* p, uint64_t len, PageProtect /*protect*/) {
     const uint64_t start = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
-    const uint64_t end = start + len;
-    if (start < kPoolStart || end > kPoolLimit) {
+    if (start < kPoolStart || len > kPoolLimit - start) {
         return false;
     }
+    const uint64_t end = start + len;
     // Grow linear memory to cover the run (it never shrinks). With threads another thread may
     // grow it concurrently; emscripten_resize_heap then reports failure, so re-check the size.
     while (static_cast<uint64_t>(emscripten_get_heap_size()) < end) {
@@ -1031,19 +1052,48 @@ bool commit(uint8_t* p, uint64_t len, PageProtect /*protect*/) {
             return false;
         }
     }
-    for (uint64_t page = (start - kPoolStart) / kPageSize; page < (end - kPoolStart) / kPageSize;
-         ++page) {
+    // O36 zero-skip: never-committed pages stay zero from memory.grow and are NOT touched.
+    // Previously-committed (dirty) pages are coalesced into contiguous runs and zeroed on recommit.
+    const uint64_t first_page = (start - kPoolStart) / kPageSize;
+    const uint64_t last_page = (end - kPoolStart) / kPageSize;
+    uint64_t zero_run_start = last_page;
+    auto flush_zero_run = [&](uint64_t run_end) {
+        if (zero_run_start < run_end) {
+            std::memset(reinterpret_cast<void*>(
+                            static_cast<uintptr_t>(kPoolStart + zero_run_start * kPageSize)),
+                        0, static_cast<size_t>((run_end - zero_run_start) * kPageSize));
+            zero_run_start = last_page;
+        }
+    };
+    for (uint64_t page = first_page; page < last_page; ++page) {
         const uint64_t bit = uint64_t{1} << (page % 64);
         if ((g_dirty[page / 64].fetch_or(bit, std::memory_order_relaxed) & bit) != 0) {
-            std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(kPoolStart + page * kPageSize)),
-                        0, kPageSize);
+            if (zero_run_start == last_page) {
+                zero_run_start = page;
+            }
+        } else {
+            flush_zero_run(page);
         }
     }
+    flush_zero_run(last_page);
     return true;
 }
 
 bool decommit(uint8_t* /*p*/, uint64_t /*len*/) {
     return true;  // linear memory cannot shrink; the pages are zeroed when committed again
+}
+
+bool reset_pages(uint8_t* p, uint64_t len) {
+    const uint64_t start = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p));
+    if (len == 0 || start < kPoolStart || len > kPoolLimit - start) {
+        return false;
+    }
+    // Linear memory cannot discard physical pages; committed state and g_dirty stay intact.
+    return start + len <= static_cast<uint64_t>(emscripten_get_heap_size());
+}
+
+bool reset_undo_pages(uint8_t* p, uint64_t len) {
+    return reset_pages(p, len);
 }
 
 bool protect(uint8_t* /*p*/, uint64_t /*len*/, PageProtect /*protect*/) {
@@ -1140,6 +1190,24 @@ bool decommit(uint8_t* p, uint64_t len) {
     // Replace the run with fresh inaccessible pages: frees the memory, contents read as zero
     // after the next commit (portable, unlike MADV_DONTNEED / MADV_FREE).
     return mmap(p, static_cast<size_t>(len), PROT_NONE, kReserveFlags | MAP_FIXED, -1, 0) == p;
+}
+
+bool reset_pages(uint8_t* p, uint64_t len) {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+    return madvise(p, static_cast<size_t>(len), MADV_DONTNEED) == 0;
+}
+
+bool reset_undo_pages(uint8_t* p, uint64_t len) {
+    if (p == nullptr || len == 0) {
+        return false;
+    }
+#ifdef MADV_WILLNEED
+    return madvise(p, static_cast<size_t>(len), MADV_WILLNEED) == 0;
+#else
+    return true;
+#endif
 }
 
 bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
