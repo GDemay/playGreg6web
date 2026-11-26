@@ -85,6 +85,18 @@ struct PrewarmUse {
     uint32_t pipelines_wasted = 0;
 };
 
+// Detailed diagnostics for prewarm queue efficiency and build latency distribution.
+struct PrewarmDiagnostics {
+    uint32_t races_lost = 0;           // complete_lost() calls (title beat in-flight prewarm)
+    uint32_t retired_queued = 0;       // queued entries retired because the title reached them first
+    uint32_t pack_skipped = 0;         // warm-list entries skipped because the pack could not resolve them
+    uint32_t priority_queued = 0;      // entries enqueued or promoted into the priority lane
+    uint32_t builds_completed = 0;     // complete() calls (ok or failed)
+    uint64_t avg_build_ns = 0;         // total_ns / builds_completed (0 when none)
+    uint64_t longest_build_ns = 0;     // longest single build reported
+    uint32_t latency_buckets[5] = {};  // <1ms, 1..10ms, 10..50ms, 50..200ms, >=200ms
+};
+
 using PrewarmDetail = std::shared_ptr<const std::vector<uint8_t>>;
 
 class PipelinePrewarm {
@@ -115,6 +127,10 @@ public:
     // Detail of a taken task (null for module-only entries or an unknown id).
     PrewarmDetail detail_of(uint32_t task_id) const;
 
+    // Enqueues a pipeline in the high-priority lane (drained before the normal warm-list queue),
+    // or promotes an already-queued entry into the priority lane.
+    bool enqueue_priority(uint32_t kind, uint64_t key0, uint64_t key1, std::vector<uint8_t> detail = {});
+
     // Hands up to `max` tasks to the host in queue order, never exceeding the in-flight cap.
     size_t take(PrewarmTask* out, size_t max);
 
@@ -126,6 +142,7 @@ public:
 
     PrewarmProgress progress() const;
     PrewarmUse use_stats() const;
+    PrewarmDiagnostics diagnostics() const;
 
     void reset();
 
@@ -152,21 +169,39 @@ private:
         Identity id;
         State state;
         PrewarmDetail detail;
+        bool in_priority = false;
     };
 
     bool resolvable(const Identity& i) const;
     bool note_locked(const Identity& id, PrewarmDetail detail);
+    void adjust_state_counters(const Slot& s, State state, int32_t delta) noexcept;
+    void set_slot_state(Slot& s, State next) noexcept;
 
     mutable std::mutex mu_;
     std::shared_ptr<const ShaderPackIndex> pack_;
     std::vector<Slot> slots_;                                           // task id - 1 -> slot
     std::unordered_map<Identity, uint32_t, IdentityHash> by_identity_;  // -> task id
+    std::deque<uint32_t> priority_queue_;                               // high-priority task ids, drained first
     std::deque<uint32_t> queue_;                                        // task ids, queue order
     std::vector<Identity> observed_;                                    // title creations in first-use order
     std::vector<PrewarmDetail> observed_detail_;                        // parallel to observed_
     std::unordered_map<Identity, uint32_t, IdentityHash> observed_set_;
     uint32_t max_in_flight_ = kPrewarmDefaultMaxInFlight;
+    uint32_t queued_count_ = 0;
     uint32_t in_flight_ = 0;
+    uint32_t done_count_ = 0;
+    uint32_t failed_count_ = 0;
+    uint32_t skipped_count_ = 0;
+    uint32_t mod_done_ = 0;
+    uint32_t mod_used_ = 0;
+    uint32_t full_done_ = 0;
+    uint32_t full_used_ = 0;
+    uint32_t races_lost_ = 0;
+    uint32_t retired_queued_ = 0;
+    uint32_t pack_skipped_ = 0;
+    uint32_t priority_queued_ = 0;
+    uint32_t builds_completed_ = 0;
+    uint32_t latency_buckets_[5] = {};
     uint64_t longest_ns_ = 0;
     uint64_t total_ns_ = 0;
 };

@@ -1,5 +1,8 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
+#include <unordered_set>
 #include <vector>
 
 #include "gpu/small_texture_pool.h"
@@ -116,6 +119,235 @@ void test_budget_counting() {
     }
     CHECK(ev.size() == 1 && b.stats().used_bytes == 50);
 }
+
+void test_lifo_per_shape_interleaved() {
+    SmallTexturePool p;
+    const SmallTextureShape a = shape(8, 8, 28, 1);
+    const SmallTextureShape b = shape(16, 16, 28, 1);
+    CHECK(p.distinct_shapes() == 0);
+    CHECK(p.release(a, 101, 256, nullptr, nullptr));
+    CHECK(p.distinct_shapes() == 1);
+    CHECK(p.release(b, 201, 512, nullptr, nullptr));
+    CHECK(p.distinct_shapes() == 2);
+    CHECK(p.release(a, 102, 256, nullptr, nullptr));
+    CHECK(p.release(b, 202, 512, nullptr, nullptr));
+    CHECK(p.release(a, 103, 256, nullptr, nullptr));
+    CHECK(p.distinct_shapes() == 2);
+    CHECK(p.stats().parked_count == 5);
+
+    // LIFO within shape A despite interleaved B entries.
+    CHECK(p.acquire(a, 256) == 103);
+    CHECK(p.acquire(a, 256) == 102);
+    CHECK(p.distinct_shapes() == 2);
+    CHECK(p.acquire(a, 256) == 101);
+    CHECK(p.distinct_shapes() == 1);
+    CHECK(p.acquire(a, 256) == 0);
+
+    // LIFO within shape B.
+    CHECK(p.acquire(b, 512) == 202);
+    CHECK(p.acquire(b, 512) == 201);
+    CHECK(p.distinct_shapes() == 0);
+    CHECK(p.stats().parked_count == 0 && p.stats().parked_bytes == 0);
+}
+
+void test_global_oldest_first_eviction_mixed_shapes() {
+    SmallTexturePool p;
+    p.set_limits(3, 10000);
+    const SmallTextureShape a = shape(4, 4, 28, 1);
+    const SmallTextureShape b = shape(8, 4, 28, 1);
+    const SmallTextureShape c = shape(12, 4, 28, 1);
+    const SmallTextureShape d = shape(16, 4, 28, 1);
+
+    std::vector<uint32_t> ev;
+    std::vector<uint64_t> evb;
+    CHECK(p.release(a, 1, 100, &ev, &evb));  // global: [A1]
+    CHECK(p.release(b, 2, 100, &ev, &evb));  // global: [A1, B2]
+    CHECK(p.release(a, 3, 100, &ev, &evb));  // global: [A1, B2, A3]
+    CHECK(p.distinct_shapes() == 2);
+    CHECK(ev.empty());
+
+    // Evicts oldest globally (A1), leaving A3 still intact in bucket A.
+    CHECK(p.release(c, 4, 100, &ev, &evb));  // global: [B2, A3, C4]
+    CHECK(ev.size() == 1 && ev[0] == 1 && evb[0] == 100);
+    CHECK(p.distinct_shapes() == 3);
+
+    // Evicts oldest globally (B2), removing bucket B entirely.
+    ev.clear();
+    evb.clear();
+    CHECK(p.release(d, 5, 100, &ev, &evb));  // global: [A3, C4, D5]
+    CHECK(ev.size() == 1 && ev[0] == 2 && evb[0] == 100);
+    CHECK(p.distinct_shapes() == 3);
+    CHECK(p.acquire(b, 100) == 0);
+    CHECK(p.acquire(a, 100) == 3);
+    CHECK(p.distinct_shapes() == 2);
+}
+
+void test_trim_and_distinct_shapes() {
+    SmallTexturePool p;
+    CHECK(p.release(shape(1, 1), 10, 100, nullptr, nullptr));
+    CHECK(p.release(shape(2, 1), 20, 100, nullptr, nullptr));
+    CHECK(p.release(shape(1, 1), 30, 100, nullptr, nullptr));
+    CHECK(p.release(shape(3, 1), 40, 100, nullptr, nullptr));
+    CHECK(p.release(shape(2, 1), 50, 100, nullptr, nullptr));
+    CHECK(p.distinct_shapes() == 3 && p.stats().parked_count == 5 && p.stats().parked_bytes == 500);
+
+    std::vector<uint32_t> ev;
+    std::vector<uint64_t> evb;
+    // No-op trim when already within limits.
+    CHECK(p.trim(5, 500, &ev, &evb) == 0 && ev.empty());
+    // Trim by count: oldest two (10, 20) evicted.
+    CHECK(p.trim(3, 1000, &ev, &evb) == 2);
+    CHECK(ev == (std::vector<uint32_t>{10, 20}) && evb == (std::vector<uint64_t>{100, 100}));
+    CHECK(p.distinct_shapes() == 3 && p.stats().parked_count == 3 && p.stats().parked_bytes == 300);
+
+    // Trim by bytes: evict oldest two (30, 40) to get <= 150 bytes.
+    ev.clear();
+    evb.clear();
+    CHECK(p.trim(10, 150, &ev, &evb) == 2);
+    CHECK(ev == (std::vector<uint32_t>{30, 40}));
+    CHECK(p.distinct_shapes() == 1 && p.stats().parked_count == 1 && p.stats().parked_bytes == 100);
+
+    // Trim to zero.
+    ev.clear();
+    evb.clear();
+    CHECK(p.trim(0, 0, &ev, &evb) == 1);
+    CHECK(ev == (std::vector<uint32_t>{50}));
+    CHECK(p.distinct_shapes() == 0 && p.stats().parked_count == 0 && p.stats().parked_bytes == 0);
+    CHECK(p.stats().evicted == 5);
+}
+
+void test_disabled_fast_path() {
+    SmallTexturePool p;
+    const SmallTextureShape s = shape(8, 8);
+    CHECK(p.release(s, 77, 256, nullptr, nullptr));
+    p.set_enabled(false);
+    // Disabled acquire must return 0 without incrementing misses.
+    CHECK(p.acquire(s, 256) == 0);
+    CHECK(p.acquire(shape(16, 16), 512) == 0);
+    CHECK(p.stats().misses == 0 && p.stats().hits == 0 && p.stats().parked_count == 1);
+    CHECK(!p.release(s, 78, 256, nullptr, nullptr));
+    CHECK(p.stats().rejected == 1);
+    // Re-enabling makes parked entries reusable again.
+    p.set_enabled(true);
+    CHECK(p.acquire(s, 256) == 77);
+    CHECK(p.stats().hits == 1 && p.stats().misses == 0);
+}
+
+void test_stress_2000_ops_matches_reference() {
+    struct RefEntry {
+        SmallTextureShape shape;
+        uint32_t id;
+        uint64_t bytes;
+    };
+    SmallTexturePool pool;
+    std::deque<RefEntry> ref;
+    uint32_t max_count = 32;
+    uint64_t max_bytes = 32768;
+    pool.set_limits(max_count, max_bytes);
+
+    uint64_t ref_parked_bytes = 0;
+    uint64_t ref_hits = 0;
+    uint64_t ref_misses = 0;
+    uint64_t ref_evicted = 0;
+    uint64_t rng = 0x9E3779B97F4A7C15ull;
+    auto next_u32 = [&]() -> uint32_t {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        return static_cast<uint32_t>((rng * 0x2545F4914F6CDD1Dull) >> 32);
+    };
+
+    uint32_t next_id = 1;
+    for (int step = 0; step < 2500; ++step) {
+        const uint32_t op = next_u32() % 100;
+        const uint64_t owner = 1 + (next_u32() % 3);
+        const uint32_t w = 4u << (next_u32() % 4);
+        const uint32_t h = 4u << (next_u32() % 3);
+        const uint32_t fmt = 28u + (next_u32() % 3);
+        SmallTextureShape sh = shape(w, h, fmt, owner);
+        sh.mip_levels = 1u + (next_u32() % 2);
+        sh.storage = (next_u32() % 4) == 0;
+        const uint64_t bytes = uint64_t{w} * h * 4u;
+
+        if (op < 48) {
+            // Release
+            std::vector<uint32_t> ev, ref_ev;
+            std::vector<uint64_t> evb, ref_evb;
+            const uint32_t id = next_id++;
+            const bool ok = pool.release(sh, id, bytes, &ev, &evb);
+            while (!ref.empty() && (ref.size() >= max_count || ref_parked_bytes + bytes > max_bytes)) {
+                ref_ev.push_back(ref.front().id);
+                ref_evb.push_back(ref.front().bytes);
+                ref_parked_bytes -= ref.front().bytes;
+                ref.pop_front();
+                ++ref_evicted;
+            }
+            ref.push_back(RefEntry{sh, id, bytes});
+            ref_parked_bytes += bytes;
+            CHECK(ok);
+            CHECK(ev == ref_ev && evb == ref_evb);
+        } else if (op < 90) {
+            // Acquire
+            const uint32_t got = pool.acquire(sh, bytes);
+            uint32_t ref_got = 0;
+            for (auto it = ref.rbegin(); it != ref.rend(); ++it) {
+                if (it->shape == sh) {
+                    ref_got = it->id;
+                    ref_parked_bytes -= it->bytes;
+                    ref.erase(std::next(it).base());
+                    ++ref_hits;
+                    break;
+                }
+            }
+            if (ref_got == 0) ++ref_misses;
+            CHECK(got == ref_got);
+        } else if (op < 95) {
+            // Trim
+            const uint32_t tc = next_u32() % 20;
+            const uint64_t tb = uint64_t{next_u32() % 16384};
+            std::vector<uint32_t> ev, ref_ev;
+            std::vector<uint64_t> evb, ref_evb;
+            const size_t n = pool.trim(tc, tb, &ev, &evb);
+            while (!ref.empty() && (ref.size() > tc || ref_parked_bytes > tb)) {
+                ref_ev.push_back(ref.front().id);
+                ref_evb.push_back(ref.front().bytes);
+                ref_parked_bytes -= ref.front().bytes;
+                ref.pop_front();
+                ++ref_evicted;
+            }
+            CHECK(n == ref_ev.size());
+            CHECK(ev == ref_ev && evb == ref_evb);
+        } else {
+            // Drain one owner
+            std::vector<uint32_t> ids, ref_ids;
+            std::vector<uint64_t> bts, ref_bts;
+            pool.drain(owner, &ids, &bts);
+            for (auto it = ref.begin(); it != ref.end();) {
+                if (it->shape.owner == owner) {
+                    ref_ids.push_back(it->id);
+                    ref_bts.push_back(it->bytes);
+                    ref_parked_bytes -= it->bytes;
+                    it = ref.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            CHECK(ids == ref_ids && bts == ref_bts);
+        }
+
+        if ((step % 50) == 49) {
+            const SmallTexturePoolStats st = pool.stats();
+            std::unordered_set<SmallTextureShape, SmallTextureShapeHash> distinct;
+            for (const RefEntry& e : ref) distinct.insert(e.shape);
+            CHECK(st.parked_count == ref.size());
+            CHECK(st.parked_bytes == ref_parked_bytes);
+            CHECK(st.hits == ref_hits);
+            CHECK(st.misses == ref_misses);
+            CHECK(st.evicted == ref_evicted);
+            CHECK(pool.distinct_shapes() == distinct.size());
+        }
+    }
+}
 }  // namespace
 
 int main() {
@@ -124,6 +356,11 @@ int main() {
     test_eviction_and_drain();
     test_zero_fill_covers_everything();
     test_budget_counting();
+    test_lifo_per_shape_interleaved();
+    test_global_oldest_first_eviction_mixed_shapes();
+    test_trim_and_distinct_shapes();
+    test_disabled_fast_path();
+    test_stress_2000_ops_matches_reference();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

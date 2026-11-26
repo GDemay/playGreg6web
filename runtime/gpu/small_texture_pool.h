@@ -17,9 +17,11 @@
 //
 // Thread-safe.
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace playgta6::gpu {
@@ -41,6 +43,20 @@ struct SmallTextureShape {
     bool operator==(const SmallTextureShape& o) const noexcept {
         return owner == o.owner && dxgi_format == o.dxgi_format && width == o.width && height == o.height && depth == o.depth &&
                mip_levels == o.mip_levels && dim == o.dim && storage == o.storage;
+    }
+};
+
+struct SmallTextureShapeHash {
+    size_t operator()(const SmallTextureShape& s) const noexcept {
+        auto mix = [](uint64_t h, uint64_t v) noexcept -> uint64_t {
+            h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+            return h;
+        };
+        uint64_t h = s.owner * 0x9E3779B97F4A7C15ull;
+        h = mix(h, (uint64_t{s.dxgi_format} << 32) | s.width);
+        h = mix(h, (uint64_t{s.height} << 32) | s.depth);
+        h = mix(h, (uint64_t{s.mip_levels} << 16) | (uint64_t{s.dim} << 8) | (s.storage ? 1ull : 0ull));
+        return static_cast<size_t>(h);
     }
 };
 
@@ -81,22 +97,46 @@ public:
     // Removes every parked texture of `owner` (device teardown, memory pressure).
     void drain(uint64_t owner, std::vector<uint32_t>* ids, std::vector<uint64_t>* bytes);
 
+    // Immediately evicts oldest parked textures until parked_count <= max_count and parked_bytes <= max_bytes.
+    // Returns the number of textures evicted.
+    size_t trim(uint32_t max_count, uint64_t max_bytes, std::vector<uint32_t>* evicted,
+                std::vector<uint64_t>* evicted_bytes);
+
     // The owner reports a real host texture creation.
     void note_create(uint64_t chain_bytes, uint64_t ns) noexcept;
+
+    // Number of distinct shapes currently parked in the pool.
+    size_t distinct_shapes() const;
 
     SmallTexturePoolStats stats() const;
 
 private:
-    struct Entry {
+    static constexpr uint32_t kInvalidNode = UINT32_MAX;
+    struct Node {
         SmallTextureShape shape;
         uint32_t id = 0;
         uint64_t bytes = 0;
+        uint32_t lru_prev = kInvalidNode;
+        uint32_t lru_next = kInvalidNode;
+        uint32_t bucket_prev = kInvalidNode;
+        uint32_t bucket_next = kInvalidNode;
+        bool active = false;
     };
+
+    uint32_t alloc_node_locked();
+    void unlink_lru_locked(uint32_t idx) noexcept;
+    void unlink_and_free_locked(uint32_t idx) noexcept;
+
     mutable std::mutex mutex_;
-    std::deque<Entry> entries_;  // oldest first
+    std::vector<Node> nodes_;
+    std::vector<uint32_t> free_nodes_;
+    std::unordered_map<SmallTextureShape, uint32_t, SmallTextureShapeHash> buckets_;  // shape -> newest (LIFO head)
+    uint32_t lru_head_ = kInvalidNode;                                                 // oldest
+    uint32_t lru_tail_ = kInvalidNode;                                                 // newest
     uint32_t max_count_ = kSmallTexturePoolMaxCount;
     uint64_t max_bytes_ = kSmallTexturePoolMaxBytes;
     bool enabled_ = true;
+    std::atomic<bool> enabled_atomic_{true};
     SmallTexturePoolStats stats_;
 };
 
