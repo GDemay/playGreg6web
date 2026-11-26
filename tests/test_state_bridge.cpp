@@ -6327,7 +6327,149 @@ void test_g81_zero_alloc_deterministic_hashing() {
     CHECK(device.live_view_count() == 1);
 }
 
+void test_ui_a8_blend_fidelity() {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+
+    // 1. resolve_sampled_view_format refuses sRGB aliasing of A8_UNORM textures.
+    {
+        const auto ok_a8 = bridge::resolve_sampled_view_format(D::A8_UNORM, D::A8_UNORM, false, 0);
+        CHECK(ok_a8.format == F::Rgba8Unorm && !ok_a8.srgb_aliased && !ok_a8.fallback_to_base);
+        const auto bad_srgb = bridge::resolve_sampled_view_format(D::A8_UNORM, D::R8G8B8A8_UNORM_SRGB, false, 0);
+        CHECK(bad_srgb.format == F::Rgba8Unorm && !bad_srgb.srgb_aliased && bad_srgb.fallback_to_base);
+    }
+
+    // 2. End-to-end A8_UNORM RTV resolution, clear RGB zeroing, and bound-view write_mask narrowing.
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps, counting_options(37000));
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 4, false);
+    device.register_texture(900, {D::A8_UNORM, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(901, {D::R8G8B8A8_UNORM, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+
+    // Slot 0: default A8_UNORM RTV. Slot 1: A8_UNORM texture with mismatched sRGB view format -> stays A8_UNORM.
+    CHECK(heaps.create_render_target_view(900, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    d3d::ViewDesc bad_rtv{};
+    bad_rtv.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM_SRGB);
+    bad_rtv.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(heaps.create_render_target_view(900, &bad_rtv, rtv_heap->cpu_handle(1)) == d3d::Status::Ok);
+    CHECK(heaps.create_render_target_view(901, nullptr, rtv_heap->cpu_handle(2)) == d3d::Status::Ok);
+
+    pso::RenderTargetViewInfo rtv_info{};
+    CHECK(device.resolve_rtv(rtv_heap->cpu_handle(1).ptr, &rtv_info));
+    CHECK(rtv_info.format == D::A8_UNORM);
+    const bridge::ViewRecord* vr = device.view(rtv_info.view_id);
+    CHECK(vr != nullptr && vr->view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+
+    device.register_shader_module(0xA801, 501);
+    device.register_shader_module(0xA802, 502);
+    device.register_shader_module(0xA803, 503);
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, &rs).ok());
+    device.register_pipeline_layout(0xA801, 0xA802, bridge::PipelineLayoutDesc{});
+    device.register_pipeline_layout(0xA801, 0xA803, bridge::PipelineLayoutDesc{});
+
+    // PSO declaring R8G8B8A8_UNORM with AlphaFactor color blend; bound to A8_UNORM RTV in Pass 1 and RGBA8 in Pass 2.
+    pso::D3D12GraphicsPsoDesc af_desc{};
+    af_desc.vs = 0xA801;
+    af_desc.ps = 0xA802;
+    af_desc.NumRenderTargets = 1;
+    af_desc.RTVFormats[0] = D::R8G8B8A8_UNORM;
+    af_desc.BlendState.RenderTarget[0].BlendEnable = true;
+    af_desc.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::AlphaFactor;
+    af_desc.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvAlphaFactor;
+    af_desc.BlendState.RenderTarget[0].SrcBlendAlpha = pso::D3D12Blend::SrcAlpha;
+    af_desc.BlendState.RenderTarget[0].DestBlendAlpha = pso::D3D12Blend::InvSrcAlpha;
+    af_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = pso::D3D12ColorWriteEnable::All;
+    auto af_pso = device.create_graphics_pipeline_state(af_desc, &rs);
+
+    pso::D3D12GraphicsPsoDesc bf_desc = af_desc;
+    bf_desc.ps = 0xA803;
+    bf_desc.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::BlendFactor;
+    bf_desc.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvBlendFactor;
+    auto bf_pso = device.create_graphics_pipeline_state(bf_desc, &rs);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    const d3d::CpuDescriptorHandle a8_rtv = rtv_heap->cpu_handle(0);
+    const d3d::CpuDescriptorHandle rgba_rtv = rtv_heap->cpu_handle(2);
+    const float dirty_a8_clear[4] = {1.0f, 0.75f, 0.5f, 0.4f};
+    const float blend_factor[4] = {0.0f, 0.0f, 0.0f, 0.5f};
+
+    // Pass 1: Clear A8_UNORM RTV with non-zero RGB, set BlendFactor/StencilRef before BeginRenderPass, draw with af_pso.
+    list.ClearRenderTargetView(a8_rtv, dirty_a8_clear);
+    list.OMSetBlendFactor(blend_factor);
+    list.OMSetStencilRef(0x42);
+    list.OMSetRenderTargets(1, &a8_rtv, false, nullptr);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list.SetPipelineState(af_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // Pass 2: Switch to RGBA8 RTV -> af_pso broadcasts alpha (0.5) to RGB, then bf_pso restores {0,0,0,0.5};
+    // StencilRef (0x42) is re-emitted on the new pass.
+    const size_t pass2_mark = enc.size();
+    list.OMSetRenderTargets(1, &rgba_rtv, false, nullptr);
+    list.SetPipelineState(af_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+    list.SetPipelineState(bf_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    // Verify Pass 1 packets: A8 clear has RGB=0, A=0.4; pipeline write_mask narrowed to Alpha; SetBlendConstant & StencilRef emitted.
+    const std::vector<Packet> p1 = decode(enc, 0);
+    CHECK(!p1.empty() && p1[0].opcode == GpuOpcode::BeginRenderPass);
+    const auto bp1 = pod<GpuBeginRenderPassPayload>(p1[0]);
+    CHECK(bp1.color_count == 1);
+    CHECK(bp1.color[0].load_op == static_cast<uint8_t>(GpuLoadOp::Clear));
+    CHECK(bp1.color[0].clear_value[0] == 0.0f && bp1.color[0].clear_value[1] == 0.0f &&
+          bp1.color[0].clear_value[2] == 0.0f && bp1.color[0].clear_value[3] == 0.4f);
+    bool got_rp1 = false, got_bc1 = false, got_sr1 = false;
+    for (const Packet& pk : p1) {
+        if (pk.opcode == GpuOpcode::EndRenderPass) break;
+        if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            const auto rp = pod<GpuCreateRenderPipeline2Payload>(pk);
+            CHECK(rp.key.color_targets[0].format == static_cast<uint8_t>(F::Rgba8Unorm));
+            CHECK(rp.key.color_targets[0].write_mask == pso::D3D12ColorWriteEnable::Alpha);
+            got_rp1 = true;
+        } else if (pk.opcode == GpuOpcode::SetBlendConstant) {
+            const auto bc = pod<GpuSetBlendConstantPayload>(pk);
+            CHECK(bc.r == 0.0f && bc.g == 0.0f && bc.b == 0.0f && bc.a == 0.5f);
+            got_bc1 = true;
+        } else if (pk.opcode == GpuOpcode::SetStencilReference) {
+            CHECK(pod<GpuSetStencilReferencePayload>(pk).reference == 0x42u);
+            got_sr1 = true;
+        }
+    }
+    CHECK(got_rp1 && got_bc1 && got_sr1);
+
+    // Verify Pass 2 packets: first SetBlendConstant is {0.5,0.5,0.5,0.5} (AlphaFactor), second is {0,0,0,0.5} (BlendFactor);
+    // SetStencilReference (0x42) is re-emitted; pipeline write_mask is All on RGBA8 target.
+    const std::vector<Packet> p2 = decode(enc, pass2_mark);
+    std::vector<GpuSetBlendConstantPayload> bcs2;
+    bool got_sr2 = false;
+    bool got_rp2_all_mask = false;
+    for (const Packet& pk : p2) {
+        if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            const auto rp = pod<GpuCreateRenderPipeline2Payload>(pk);
+            if (rp.key.color_targets[0].write_mask == pso::D3D12ColorWriteEnable::All) {
+                got_rp2_all_mask = true;
+            }
+        } else if (pk.opcode == GpuOpcode::SetBlendConstant) {
+            bcs2.push_back(pod<GpuSetBlendConstantPayload>(pk));
+        } else if (pk.opcode == GpuOpcode::SetStencilReference) {
+            CHECK(pod<GpuSetStencilReferencePayload>(pk).reference == 0x42u);
+            got_sr2 = true;
+        }
+    }
+    CHECK(got_rp2_all_mask && got_sr2);
+    CHECK(bcs2.size() == 2);
+    if (bcs2.size() == 2) {
+        CHECK(bcs2[0].r == 0.5f && bcs2[0].g == 0.5f && bcs2[0].b == 0.5f && bcs2[0].a == 0.5f);
+        CHECK(bcs2[1].r == 0.0f && bcs2[1].g == 0.0f && bcs2[1].b == 0.0f && bcs2[1].a == 0.5f);
+    }
+}
+
 int main() {
+    test_ui_a8_blend_fidelity();
     test_g81_depth_bias_and_shadow_map_parity();
     test_g81_eight_mrt_blend_and_integer_guards();
     test_g81_stencil_faces_masks_and_dynamic_reemission();

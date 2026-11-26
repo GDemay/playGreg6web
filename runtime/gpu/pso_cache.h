@@ -1019,6 +1019,9 @@ struct GraphicsPsoTranslation {
     uint32_t sample_count = 1;   // raw D3D12 count
     uint32_t sample_mask = kD3D12DefaultSampleMask;
     uint32_t ps_output_mask = 0;
+    uint8_t raw_write_masks[kMaxColorTargets] = {};  // post-LogicOp write masks before A8_UNORM narrowing
+    uint8_t color_alpha_factor_mask = 0;             // bit i: target i color blend uses AlphaFactor/InvAlphaFactor
+    uint8_t color_blend_factor_mask = 0;             // bit i: target i color blend uses BlendFactor/InvBlendFactor
     uint32_t used_vertex_slots = 0;            // slots that carry at least one attribute
     uint32_t instance_stride_zero_slots = 0;   // per-instance slots with InstanceDataStepRate 0
     uint32_t default_vertex_slot_mask = 0;     // spare slot bound to the shared (0,0,0,1) buffer (G62)
