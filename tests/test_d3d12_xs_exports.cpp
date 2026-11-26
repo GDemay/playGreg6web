@@ -8765,6 +8765,356 @@ void test_g79_resolve_subresource_msaa() {
     scene.release_all({list, msaa_color, dst_color, msaa_depth, dst_depth, non_rt_dst});
 }
 
+// Regression test for WaitFrameEventX / PresentX 2.0 FPS (500 ms/frame) stall elimination:
+// 1. Reused &token variable feeding WaitFrameEventX(PRESENT) output tokens back into itself never
+//    latches at 500 ms/frame.
+// 2. Same-thread PRESENT wait on the PresentX thread never self-stalls for 500 ms.
+// 3. Zero-token PresentX / suspend-flush PresentX(0) falls back to last_execute_token and wakes
+//    cross-thread PRESENT waiters promptly.
+// 4. Sentinel UINT64_MAX plane token never saturates last_present_token.
+// 5. Repeated cross-thread unpresented waits back off to ~1 frame interval and recover on PresentX.
+void test_xbox_wait_frame_event_no_2fps_stall() {
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(5000), I(1), I(0)})) == 0);
+
+    const uint64_t rt_slot = put<uint64_t>(scene.rt);
+    const uint64_t immediate_params = put<uint32_t>(1);  // immediate flip (no 60 Hz sleep)
+    auto present_with_token = [&](uint64_t tok) {
+        dg::xbox::GuestPresentPlaneX plane{};
+        plane.Token = tok;
+        plane.ResourceCount = 1;
+        plane.ppResources = rt_slot;
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(immediate_params)})) == 0);
+    };
+
+    // 1) Reused &token slot feedback loop (type-2 output token fed back as next type-2 input):
+    {
+        const uint64_t origin_slot = put<uint64_t>(0);
+        const uint64_t reused_present_slot = put<uint64_t>(0);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 10; ++i) {
+            store64(origin_slot, 0);
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(origin_slot)})) == 0);
+            const uint64_t frame_tok = load64(origin_slot);
+            // Intentionally do NOT overwrite reused_present_slot: on frame >= 1 it holds the
+            // previous WaitFrameEventX(2) output token (which is never presented).
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent,
+                              {I(2), I(0xFFFFFFFFu), I(0), I(0), I(reused_present_slot)})) == 0);
+            present_with_token(frame_tok);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        CHECK(elapsed < std::chrono::milliseconds(1500));
+        CHECK(counter(dev, dg::xbox::Counter::PresentWaitsNonOriginToken) >= 9);
+    }
+
+    // 2) Same-thread self-wait on the PresentX thread for an unpresented ORIGIN token:
+    {
+        const uint64_t tok_slot = put<uint64_t>(0);
+        const uint64_t self_before = counter(dev, dg::xbox::Counter::PresentWaitsSelfThread);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 8; ++i) {
+            store64(tok_slot, 0);
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+            const uint64_t curr_tok = load64(tok_slot);
+            // Waiting for curr_tok on the PresentX thread BEFORE presenting curr_tok:
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent,
+                              {I(2), I(0xFFFFFFFFu), I(0), I(0), I(tok_slot)})) == 0);
+            present_with_token(curr_tok);
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        CHECK(elapsed < std::chrono::milliseconds(1500));
+        CHECK(counter(dev, dg::xbox::Counter::PresentWaitsSelfThread) >= self_before + 8);
+    }
+
+    // 3) Zero-token PresentX & suspend-flush PresentX(0) fall back to last_execute_token:
+    GuestThread worker{};
+    CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
+    {
+        const uint64_t tok_slot = put<uint64_t>(0);
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+        const uint64_t exec_tok = load64(tok_slot);
+        scene.record(fx.thread, list);
+        std::vector<uint64_t> lists{list};
+        fx.vcall(scene.queue, Slot2::ExecuteCommandLists, {I(1), I(put_bytes(lists.data(), 8)), I(exec_tok), I(3)});
+        CHECK(dev->last_execute_token.load() == exec_tok);
+
+        const uint64_t wait_slot = put<uint64_t>(exec_tok);
+        const uint64_t sat_before = counter(dev, dg::xbox::Counter::PresentWaitsSatisfied);
+        std::atomic<bool> entered{false};
+        std::atomic<bool> woke{false};
+        std::thread t([&] {
+            entered.store(true, std::memory_order_release);
+            CHECK(hr(fx.vcall_on(worker, scene.device, XSlot::WaitFrameEvent,
+                                 {I(2), I(0xFFFFFFFFu), I(0), I(0), I(wait_slot)})) == 0);
+            woke.store(true, std::memory_order_release);
+        });
+        while (!entered.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+        CHECK(!woke.load(std::memory_order_acquire));
+        // Plane passes Token == 0 (D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL):
+        present_with_token(0);
+        t.join();
+        CHECK(woke.load(std::memory_order_acquire));
+        CHECK(dev->last_present_token.load() >= exec_tok);
+        CHECK(counter(dev, dg::xbox::Counter::PresentWaitsSatisfied) == sat_before + 1);
+
+        // Suspend flush PresentX(0, 0, 0) also completes an executed token:
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+        const uint64_t flush_tok = load64(tok_slot);
+        scene.record(fx.thread, list);
+        fx.vcall(scene.queue, Slot2::ExecuteCommandLists, {I(1), I(put_bytes(lists.data(), 8)), I(flush_tok), I(3)});
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(0), I(0), I(0)})) == 0);
+        CHECK(dev->last_present_token.load() >= flush_tok);
+    }
+
+    // 4) Sentinel UINT64_MAX plane token must not saturate last_present_token:
+    {
+        const uint64_t before = dev->last_present_token.load();
+        present_with_token(UINT64_MAX);
+        CHECK(dev->last_present_token.load() != UINT64_MAX);
+        CHECK(dev->last_present_token.load() >= before);
+    }
+
+    // 5) Cross-thread adaptive backoff on repeated unpresented ORIGIN waits & recovery:
+    {
+        const uint64_t tok_slot = put<uint64_t>(0);
+        // Prime one unpresented wait so consecutive_unpresented_waits_ >= 1:
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+        const uint64_t prime_tok = load64(tok_slot);
+        const uint64_t wait_slot = put<uint64_t>(prime_tok);
+        std::thread prime_worker([&] {
+            CHECK(hr(fx.vcall_on(worker, scene.device, XSlot::WaitFrameEvent,
+                                 {I(2), I(100), I(0), I(0), I(wait_slot)})) == dg::kSFalse);
+        });
+        prime_worker.join();
+
+        // Now 5 consecutive INFINITE waits on unpresented ORIGIN tokens from the worker thread
+        // must back off to ~1 frame interval (<= 33 ms) instead of 5 * 500 ms = 2500 ms!
+        CHECK(dev->frame_pacer().present_wait_cap_ms(500) <= 33);
+        std::array<uint64_t, 5> unpresented_toks{};
+        for (int i = 0; i < 5; ++i) {
+            CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+            unpresented_toks[i] = load64(tok_slot);
+        }
+        const auto t_backoff = std::chrono::steady_clock::now();
+        std::thread backoff_worker([&] {
+            for (int i = 0; i < 5; ++i) {
+                store64(wait_slot, unpresented_toks[i]);
+                CHECK(hr(fx.vcall_on(worker, scene.device, XSlot::WaitFrameEvent,
+                                     {I(2), I(0xFFFFFFFFu), I(0), I(0), I(wait_slot)})) == 0);
+            }
+        });
+        backoff_worker.join();
+        CHECK(std::chrono::steady_clock::now() - t_backoff < std::chrono::milliseconds(1200));
+
+        // Presenting a token resets backoff so legitimate cross-thread wait protection recovers:
+        CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(0), I(0), I(2), I(tok_slot)})) == 0);
+        const uint64_t good_tok = load64(tok_slot);
+        present_with_token(good_tok);
+        store64(wait_slot, good_tok);
+        std::thread ok_worker([&] {
+            CHECK(hr(fx.vcall_on(worker, scene.device, XSlot::WaitFrameEvent,
+                                 {I(2), I(0xFFFFFFFFu), I(0), I(0), I(wait_slot)})) == 0);
+        });
+        ok_worker.join();
+        CHECK(dev->frame_pacer().present_wait_cap_ms(500) == 500);
+    }
+
+    destroy_guest_thread(fx.arena, worker);
+    CHECK(t_balanced);
+    scene.release_all({list});
+}
+
+// Regression test for PresentX swapchain color-space / gamma / multi-plane / HDR10 / scRGB / DRS:
+void test_xbox_presentx_color_space_and_planes() {
+    namespace xb = dg::xbox;
+    using F = playgta6::gpu::pso::WgpuTextureFormat;
+    using CS = xb::PresentColorSpace;
+    using TM = xb::PresentTransferMode;
+
+    // 1) Unit checks on classify_present_plane_color:
+    {
+        const auto srgb_rgba = xb::classify_present_plane_color(29 /* R8G8B8A8_UNORM_SRGB */, 0);
+        CHECK(srgb_rgba.canvas_format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(srgb_rgba.sample_view_format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(srgb_rgba.transfer == TM::PassthroughSrgb && srgb_rgba.needs_color_compositor);
+
+        const auto srgb_bgra = xb::classify_present_plane_color(91 /* B8G8R8A8_UNORM_SRGB */, 0);
+        CHECK(srgb_bgra.canvas_format == static_cast<uint8_t>(F::Bgra8Unorm));
+        CHECK(srgb_bgra.sample_view_format == static_cast<uint8_t>(F::Bgra8Unorm));
+        CHECK(srgb_bgra.transfer == TM::PassthroughSrgb && srgb_bgra.needs_color_compositor);
+
+        const auto scrgb = xb::classify_present_plane_color(10 /* R16G16B16A16_FLOAT */, 0);
+        CHECK(scrgb.canvas_format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(scrgb.transfer == TM::LinearHdrToSrgb && scrgb.needs_color_compositor);
+
+        const auto hdr10 =
+            xb::classify_present_plane_color(24 /* R10G10B10A2_UNORM */, static_cast<uint32_t>(CS::RgbFullG2084NoneP2020));
+        CHECK(hdr10.canvas_format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(hdr10.transfer == TM::Hdr10PqToSrgb && hdr10.needs_color_compositor);
+
+        const auto linear10 =
+            xb::classify_present_plane_color(24 /* R10G10B10A2_UNORM */, static_cast<uint32_t>(CS::RgbFullG10NoneP709));
+        CHECK(linear10.transfer == TM::LinearSdrToSrgb && linear10.needs_color_compositor);
+
+        const auto studio =
+            xb::classify_present_plane_color(28 /* R8G8B8A8_UNORM */, static_cast<uint32_t>(CS::RgbStudioG22NoneP709));
+        CHECK(studio.transfer == TM::StudioSdrToSrgb && studio.needs_color_compositor);
+
+        // Unknown/unverified ColorSpace word falls back defensively to format-inferred SDR.
+        const auto unknown_cs = xb::classify_present_plane_color(28 /* R8G8B8A8_UNORM */, 0xDEADBEEFu);
+        CHECK(unknown_cs.canvas_format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(unknown_cs.transfer == TM::PassthroughSrgb && !unknown_cs.needs_color_compositor);
+
+        // B8G8R8X8_UNORM as an overlay forces opaque alpha (ignores undefined X bits).
+        const auto bgrx_overlay = xb::classify_present_plane_color(88 /* B8G8R8X8_UNORM */, 0, false, true);
+        CHECK(bgrx_overlay.opaque_alpha && bgrx_overlay.needs_color_compositor);
+    }
+
+    // 2) End-to-end PresentX command-stream verification:
+    Fixture fx;
+    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t immediate_params = put<uint32_t>(1);
+
+    const uint64_t srgb_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 29, 1), 4);   // R8G8B8A8_UNORM_SRGB
+    const uint64_t hdr10_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 24, 1), 4);  // R10G10B10A2_UNORM
+    const uint64_t fp16_rt = committed(fx, scene.device, 1, texture_desc(64, 64, 10, 1), 4);   // R16G16B16A16_FLOAT
+
+    auto find_shader_containing = [](const std::vector<Packet>& ps, const char* needle) {
+        for (const Packet& p : ps) {
+            if (p.opcode == GpuOpcode::CreateShaderModule && p.payload.size() > sizeof(GpuCreateShaderModulePayload)) {
+                const std::string code(reinterpret_cast<const char*>(p.payload.data() + sizeof(GpuCreateShaderModulePayload)),
+                                       p.payload.size() - sizeof(GpuCreateShaderModulePayload));
+                if (code.find(needle) != std::string::npos) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // 2a) sRGB back buffer: targets direct non-sRGB Rgba8Unorm canvas (no -srgb blit gamma crush)
+    //     and samples through its linear Rgba8Unorm sibling view.
+    {
+        const uint64_t slot = put<uint64_t>(srgb_rt);
+        xb::GuestPresentPlaneX plane{};
+        plane.Token = 1;
+        plane.ResourceCount = 1;
+        plane.ppResources = slot;
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        const Packet* pass = find_op(ps, GpuOpcode::BeginRenderPass);
+        const Packet* bg = find_op(ps, GpuOpcode::CreateBindGroup2);
+        CHECK(pass != nullptr && bg != nullptr && !ps.empty() && ps.back().opcode == GpuOpcode::Present);
+        if (pass != nullptr) {
+            const auto rp = payload_as<GpuBeginRenderPassPayload>(*pass);
+            CHECK(rp.color[0].texture_id == kGpuSwapchainTextureId);
+            CHECK(rp.color[0].view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+        }
+        if (bg != nullptr) {
+            const auto entry0 = payload_as<GpuBindGroupEntry2>(*bg, sizeof(GpuCreateBindGroup2Payload));
+            CHECK(entry0.resource_id == object_of<dg::Resource>(srgb_rt)->id());
+            CHECK(entry0.view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+        }
+        CHECK(counter(dev, xb::Counter::PresentColorManagedPresents) == 1);
+        CHECK(counter(dev, xb::Counter::PresentPlanesDrawn) == 1);
+    }
+
+    // 2b) Multi-plane mixed sRGB overlay (plane 0) over B8G8R8A8_UNORM scene (plane 1):
+    {
+        const uint64_t slots = put_bytes(std::array<uint64_t, 2>{srgb_rt, scene.rt}.data(), 16);
+        xb::GuestPresentPlaneX planes[2] = {};
+        for (uint32_t i = 0; i < 2; ++i) {
+            planes[i].Token = 2;
+            planes[i].ResourceCount = 1;
+            planes[i].ppResources = slots + 8 * i;
+        }
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX,
+                          {I(2), I(put_bytes(planes, sizeof(planes))), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        const Packet* pass = find_op(ps, GpuOpcode::BeginRenderPass);
+        CHECK(pass != nullptr && count_op(ps, GpuOpcode::Draw) == 2);
+        if (pass != nullptr) {
+            // Bottom plane (scene.rt, B8G8R8A8_UNORM) picks direct non-sRGB Bgra8Unorm canvas.
+            CHECK(payload_as<GpuBeginRenderPassPayload>(*pass).color[0].view.format ==
+                  static_cast<uint8_t>(F::Bgra8Unorm));
+        }
+        CHECK(counter(dev, xb::Counter::PresentColorManagedPresents) == 2);
+        CHECK(counter(dev, xb::Counter::PresentPlanesDrawn) == 3);
+    }
+
+    // 2c) HDR10 (R10G10B10A2_UNORM + RGB_FULL_G2084_NONE_P2020): ST.2084 PQ + Rec.2020->709 -> Rgba8Unorm.
+    {
+        const uint64_t slot = put<uint64_t>(hdr10_rt);
+        xb::GuestPresentPlaneX plane{};
+        plane.Token = 3;
+        plane.ResourceCount = 1;
+        plane.ppResources = slot;
+        plane.ColorSpace = static_cast<uint32_t>(CS::RgbFullG2084NoneP2020);
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        const Packet* pass = find_op(ps, GpuOpcode::BeginRenderPass);
+        CHECK(pass != nullptr &&
+              payload_as<GpuBeginRenderPassPayload>(*pass).color[0].view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(find_shader_containing(ps, "pq_to_linear_sdr"));
+        CHECK(find_shader_containing(ps, "rec2020_to_rec709"));
+        CHECK(find_shader_containing(ps, "linear_to_srgb"));
+    }
+
+    // 2d) scRGB FP16 (R16G16B16A16_FLOAT): soft-knee tone-map + linear->sRGB -> direct Rgba8Unorm canvas.
+    {
+        const uint64_t slot = put<uint64_t>(fp16_rt);
+        xb::GuestPresentPlaneX plane{};
+        plane.Token = 4;
+        plane.ResourceCount = 1;
+        plane.ppResources = slot;
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        const Packet* pass = find_op(ps, GpuOpcode::BeginRenderPass);
+        CHECK(pass != nullptr &&
+              payload_as<GpuBeginRenderPassPayload>(*pass).color[0].view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+        CHECK(find_shader_containing(ps, "tonemap_soft_knee"));
+        CHECK(find_shader_containing(ps, "linear_to_srgb"));
+    }
+
+    // 2e) Dynamic Resolution Scaling sub-rect via pSrcRects: emits uniform UV rect {0, 0, 0.5, 0.5}.
+    {
+        const uint64_t slot = put<uint64_t>(scene.rt);
+        const xb::PresentRect rect{0, 0, 32, 32};
+        xb::GuestPresentPlaneX plane{};
+        plane.Token = 5;
+        plane.ResourceCount = 1;
+        plane.ppResources = slot;
+        plane.pSrcRects = put(rect);
+        const size_t mark = fx.captured.size();
+        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(immediate_params)})) == 0);
+        const auto ps = packets_since(fx, mark);
+        CHECK(find_shader_containing(ps, "u_rect"));
+        const Packet* wb = find_op(ps, GpuOpcode::WriteBuffer);
+        CHECK(wb != nullptr);
+        if (wb != nullptr) {
+            const float u0 = payload_as<float>(*wb, sizeof(GpuWriteBufferPayload) + 0);
+            const float v0 = payload_as<float>(*wb, sizeof(GpuWriteBufferPayload) + 4);
+            const float du = payload_as<float>(*wb, sizeof(GpuWriteBufferPayload) + 8);
+            const float dv = payload_as<float>(*wb, sizeof(GpuWriteBufferPayload) + 12);
+            CHECK(u0 == 0.0f && v0 == 0.0f && std::fabs(du - 0.5f) < 1e-5f && std::fabs(dv - 0.5f) < 1e-5f);
+        }
+    }
+
+    CHECK(t_balanced);
+    scene.release_all({srgb_rt, hdr10_rt, fp16_rt});
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -8841,6 +9191,8 @@ int main() {
     test_g79_multi_viewport_scissor_stencil_blend_and_clear_state();
     test_g79_draw_instanced_and_indexed_parity();
     test_g79_resolve_subresource_msaa();
+    test_xbox_wait_frame_event_no_2fps_stall();
+    test_xbox_presentx_color_space_and_planes();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;
