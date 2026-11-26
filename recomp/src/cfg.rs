@@ -629,6 +629,160 @@ impl Function {
         order
     }
 
+    /// Deterministic, cycle-safe immediate dominator map for every reachable non-entry block
+    /// computed via the iterative Cooper-Harvey-Kennedy algorithm over [`Self::reverse_postorder`].
+    ///
+    /// Maps every reachable block VA (excluding `self.entry`) to its immediate dominator VA.
+    /// Returns an empty map if `self.entry` is missing from `self.blocks` or has no reachable
+    /// non-entry descendants.
+    pub fn immediate_dominators(&self) -> BTreeMap<u64, u64> {
+        let rpo = self.reverse_postorder();
+        let n = rpo.len();
+        if n <= 1 {
+            return BTreeMap::new();
+        }
+        let rpo_index: BTreeMap<u64, usize> = rpo
+            .iter()
+            .enumerate()
+            .map(|(idx, &va)| (va, idx))
+            .collect();
+        let mut preds: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (src_idx, &va) in rpo.iter().enumerate() {
+            for succ in self.intra_successors(va) {
+                if let Some(&dst_idx) = rpo_index.get(&succ) {
+                    preds[dst_idx].push(src_idx);
+                }
+            }
+        }
+
+        let mut idom: Vec<Option<usize>> = vec![None; n];
+        idom[0] = Some(0);
+
+        let max_intersect_steps = n.saturating_mul(2);
+        let intersect = |idom: &[Option<usize>], mut b1: usize, mut b2: usize| -> usize {
+            let mut steps = 0usize;
+            while b1 != b2 {
+                while b1 > b2 {
+                    steps += 1;
+                    if steps > max_intersect_steps {
+                        return 0;
+                    }
+                    match idom[b1] {
+                        Some(next) if next < b1 => b1 = next,
+                        _ => return 0,
+                    }
+                }
+                while b2 > b1 {
+                    steps += 1;
+                    if steps > max_intersect_steps {
+                        return 0;
+                    }
+                    match idom[b2] {
+                        Some(next) if next < b2 => b2 = next,
+                        _ => return 0,
+                    }
+                }
+            }
+            b1
+        };
+
+        for _ in 0..=n {
+            let mut changed = false;
+            for i in 1..n {
+                let mut new_idom: Option<usize> = None;
+                for &p in &preds[i] {
+                    if idom[p].is_some() {
+                        new_idom = Some(match new_idom {
+                            None => p,
+                            Some(cur) => intersect(&idom, p, cur),
+                        });
+                    }
+                }
+                if new_idom.is_some() && idom[i] != new_idom {
+                    idom[i] = new_idom;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut out = BTreeMap::new();
+        for i in 1..n {
+            if let Some(dom_idx) = idom[i] {
+                out.insert(rpo[i], rpo[dom_idx]);
+            }
+        }
+        out
+    }
+
+    /// Whether `dominator` dominates `node` in the reachable CFG rooted at `self.entry`.
+    ///
+    /// Returns `false` if `self.entry` is missing or `node` is unreachable from `self.entry`.
+    pub fn dominates(&self, dominator: u64, node: u64) -> bool {
+        if !self.blocks.contains_key(&self.entry) {
+            return false;
+        }
+        if node == self.entry {
+            return dominator == self.entry;
+        }
+        let idoms = self.immediate_dominators();
+        if !idoms.contains_key(&node) {
+            return false;
+        }
+        if dominator == node {
+            return true;
+        }
+        let mut cur = node;
+        let mut steps = 0usize;
+        while let Some(&parent) = idoms.get(&cur) {
+            if parent == dominator {
+                return true;
+            }
+            if parent == cur || steps >= idoms.len() {
+                break;
+            }
+            cur = parent;
+            steps += 1;
+        }
+        false
+    }
+
+    /// Strict path from `self.entry` down to `node` along immediate dominators, or an empty
+    /// `Vec` if `self.entry` is missing or `node` is unreachable from `self.entry`.
+    pub fn dominator_chain(&self, node: u64) -> Vec<u64> {
+        if !self.blocks.contains_key(&self.entry) {
+            return Vec::new();
+        }
+        if node == self.entry {
+            return vec![self.entry];
+        }
+        let idoms = self.immediate_dominators();
+        if !idoms.contains_key(&node) {
+            return Vec::new();
+        }
+        let mut chain = Vec::new();
+        let mut cur = node;
+        let mut steps = 0usize;
+        loop {
+            chain.push(cur);
+            if cur == self.entry {
+                break;
+            }
+            let Some(&parent) = idoms.get(&cur) else {
+                return Vec::new();
+            };
+            if parent == cur || steps >= idoms.len() {
+                return Vec::new();
+            }
+            cur = parent;
+            steps += 1;
+        }
+        chain.reverse();
+        chain
+    }
+
     /// Deterministic, iterative DFS back-edge detection across the entire function (starting at
     /// `self.entry` when present, then any remaining blocks in ascending VA order).
     ///
@@ -1173,5 +1327,155 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn dominators_empty_missing_entry_and_single_block() {
+        let empty = Function::new(0x1000);
+        assert!(empty.immediate_dominators().is_empty());
+        assert!(!empty.dominates(0x1000, 0x1000));
+        assert!(empty.dominator_chain(0x1000).is_empty());
+
+        let missing_entry = Function::from_blocks(
+            0x9000,
+            [make_block(0x1000, 0x1004, Terminator::Return, vec![Edge::Return])],
+        );
+        assert!(missing_entry.immediate_dominators().is_empty());
+        assert!(!missing_entry.dominates(0x1000, 0x1000));
+        assert!(!missing_entry.dominates(0x9000, 0x1000));
+        assert!(missing_entry.dominator_chain(0x1000).is_empty());
+
+        let single = Function::from_blocks(
+            0x1000,
+            [make_block(0x1000, 0x1004, Terminator::Return, vec![Edge::Return])],
+        );
+        assert!(single.immediate_dominators().is_empty());
+        assert!(single.dominates(0x1000, 0x1000));
+        assert!(!single.dominates(0x1000, 0x2000));
+        assert!(!single.dominates(0x2000, 0x1000));
+        assert_eq!(single.dominator_chain(0x1000), vec![0x1000]);
+        assert!(single.dominator_chain(0x2000).is_empty());
+    }
+
+    #[test]
+    fn dominators_linear_and_diamond_cfgs() {
+        // Linear: 0x1000 -> 0x1010 -> 0x1020 -> 0x1030
+        let linear = Function::from_blocks(
+            0x1000,
+            [
+                make_block(0x1000, 0x1010, Terminator::Fallthrough, vec![Edge::Fallthrough(0x1010)]),
+                make_block(0x1010, 0x1020, Terminator::Jump, vec![Edge::Jump(0x1020)]),
+                make_block(0x1020, 0x1030, Terminator::Jump, vec![Edge::Jump(0x1030)]),
+                make_block(0x1030, 0x1031, Terminator::Return, vec![Edge::Return]),
+            ],
+        );
+        assert_eq!(
+            linear.immediate_dominators(),
+            BTreeMap::from([(0x1010, 0x1000), (0x1020, 0x1010), (0x1030, 0x1020)])
+        );
+        assert!(linear.dominates(0x1000, 0x1030));
+        assert!(linear.dominates(0x1010, 0x1030));
+        assert!(!linear.dominates(0x1030, 0x1010));
+        assert_eq!(
+            linear.dominator_chain(0x1030),
+            vec![0x1000, 0x1010, 0x1020, 0x1030]
+        );
+
+        // Diamond with guard prefix: 0x1000 -> {0x1010, 0x1050(def)}, 0x1010 -> {0x1020, 0x1030} -> 0x1040
+        let diamond = Function::from_blocks(
+            0x1000,
+            [
+                make_block(
+                    0x1000,
+                    0x1010,
+                    Terminator::Branch,
+                    vec![Edge::Taken(0x1050), Edge::Fallthrough(0x1010)],
+                ),
+                make_block(
+                    0x1010,
+                    0x1020,
+                    Terminator::Branch,
+                    vec![Edge::Taken(0x1030), Edge::Fallthrough(0x1020)],
+                ),
+                make_block(0x1020, 0x1030, Terminator::Jump, vec![Edge::Jump(0x1040)]),
+                make_block(0x1030, 0x1040, Terminator::Jump, vec![Edge::Jump(0x1040)]),
+                make_block(0x1040, 0x1044, Terminator::Return, vec![Edge::Return]),
+                make_block(0x1050, 0x1051, Terminator::Return, vec![Edge::Return]),
+            ],
+        );
+        assert_eq!(
+            diamond.immediate_dominators(),
+            BTreeMap::from([
+                (0x1010, 0x1000),
+                (0x1020, 0x1010),
+                (0x1030, 0x1010),
+                (0x1040, 0x1010),
+                (0x1050, 0x1000),
+            ])
+        );
+        assert!(diamond.dominates(0x1000, 0x1040));
+        assert!(diamond.dominates(0x1010, 0x1040));
+        assert!(!diamond.dominates(0x1020, 0x1040));
+        assert!(!diamond.dominates(0x1030, 0x1040));
+        assert_eq!(diamond.dominator_chain(0x1040), vec![0x1000, 0x1010, 0x1040]);
+        assert_eq!(diamond.dominator_chain(0x1020), vec![0x1000, 0x1010, 0x1020]);
+    }
+
+    #[test]
+    fn dominators_loops_irreducible_cycles_and_unreachable_blocks() {
+        // Irreducible multi-entry loop + unreachable cycle:
+        // E(0x1000) -> {A(0x1010), C(0x1030)}
+        // A(0x1010) -> B(0x1020)
+        // B(0x1020) -> {C(0x1030), Exit(0x1040)}
+        // C(0x1030) -> B(0x1020) (irreducible: B and C enter each other from E/A and E)
+        // Unreachable: U1(0x2000) <-> U2(0x2010), U3(0x2020) -> Exit(0x1040)
+        let blocks = vec![
+            make_block(
+                0x1000,
+                0x1008,
+                Terminator::Branch,
+                vec![Edge::Taken(0x1030), Edge::Fallthrough(0x1010)],
+            ),
+            make_block(0x1010, 0x1014, Terminator::Jump, vec![Edge::Jump(0x1020)]),
+            make_block(
+                0x1020,
+                0x1028,
+                Terminator::Branch,
+                vec![Edge::Taken(0x1030), Edge::Fallthrough(0x1040)],
+            ),
+            make_block(0x1030, 0x1034, Terminator::Jump, vec![Edge::Jump(0x1020)]),
+            make_block(0x1040, 0x1041, Terminator::Return, vec![Edge::Return]),
+            make_block(0x2000, 0x2004, Terminator::Jump, vec![Edge::Jump(0x2010)]),
+            make_block(0x2010, 0x2014, Terminator::Jump, vec![Edge::Jump(0x2000)]),
+            make_block(0x2020, 0x2024, Terminator::Jump, vec![Edge::Jump(0x1040)]),
+        ];
+        let func = Function::from_blocks(0x1000, blocks.clone());
+        let reversed = Function::from_blocks(0x1000, blocks.into_iter().rev());
+
+        // Permuted construction yields identical dominators.
+        assert_eq!(func.immediate_dominators(), reversed.immediate_dominators());
+        // In the irreducible loop, neither A nor C dominates B (E -> C -> B and E -> A -> B),
+        // so idom(B) = E, idom(C) = E, and B dominates Exit (all reachable paths to Exit go via B).
+        assert_eq!(
+            func.immediate_dominators(),
+            BTreeMap::from([
+                (0x1010, 0x1000),
+                (0x1020, 0x1000),
+                (0x1030, 0x1000),
+                (0x1040, 0x1020),
+            ])
+        );
+        assert!(func.dominates(0x1020, 0x1040));
+        assert!(!func.dominates(0x1010, 0x1020));
+        assert!(!func.dominates(0x1030, 0x1020));
+        assert_eq!(func.dominator_chain(0x1040), vec![0x1000, 0x1020, 0x1040]);
+
+        // Unreachable blocks are absent from dominator results and never dominated.
+        assert!(!func.dominates(0x1000, 0x2000));
+        assert!(!func.dominates(0x2000, 0x2000));
+        assert!(!func.dominates(0x2020, 0x1040));
+        assert!(func.dominator_chain(0x2000).is_empty());
+        assert!(func.dominator_chain(0x2010).is_empty());
+        assert!(func.dominator_chain(0x2020).is_empty());
     }
 }
