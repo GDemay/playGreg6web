@@ -63,6 +63,16 @@ enum class GpuOpcode : uint16_t {
     CreateSampler2 = 34,
     // v2 texture creation: full texture format codes, sample count and view formats.
     CreateTexture2 = 35,
+    // Indirect work (G66, ExecuteIndirect): the arguments are read by the GPU from a buffer
+    // (GpuIndirectPayload), in WebGPU's drawIndirect / drawIndexedIndirect / dispatchWorkgroupsIndirect
+    // layouts (16 / 20 / 12 bytes).
+    DrawIndirect = 36,
+    DrawIndexedIndirect = 37,
+    DispatchIndirect = 38,
+    // GPU -> CPU read-back (G66): copy a buffer range / texture region into a map-read staging buffer,
+    // map it and write the bytes to runtime memory, then add 1 to the completion counter.
+    ReadbackBuffer = 39,
+    ReadbackTexture = 40,
 };
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
@@ -315,6 +325,15 @@ struct GpuDispatchComputePayload {
     uint32_t workgroup_z;
 };
 static_assert(sizeof(GpuDispatchComputePayload) == 12, "GpuDispatchComputePayload layout must stay 12 bytes");
+
+// DrawIndirect / DrawIndexedIndirect / DispatchIndirect: the argument record at `offset` (a multiple
+// of 4) in buffer `buffer_id` (created with GpuBufferUsage::Indirect).
+struct GpuIndirectPayload {
+    uint32_t buffer_id;
+    uint32_t reserved;
+    uint64_t offset;
+};
+static_assert(sizeof(GpuIndirectPayload) == 16, "GpuIndirectPayload layout must stay 16 bytes");
 
 // Guest x86-64 CPU state of recompiled code (recomp/src/lift, `%playgta6.GuestState`).
 // 704 bytes, little endian, one per guest thread. Every lifted function is
@@ -870,6 +889,43 @@ struct GpuCreateTexture2Payload {
     uint8_t view_formats[kGpuMaxTextureViewFormats];  // first view_format_count entries used, rest 0
 };
 static_assert(sizeof(GpuCreateTexture2Payload) == 40, "GpuCreateTexture2Payload layout must stay 40 bytes");
+
+// Read-back (opcodes 39 / 40, G66). The consumer runs the copy in stream order (after every packet
+// before it), maps the staging buffer and writes the bytes to `dst_addr`, an address in the
+// producer's memory (the browser build: a wasm linear-memory offset). Only then does it atomically
+// add 1 to the u32 at `done_addr`, also when the copy failed (nothing written). Completions are
+// counted, not matched: the producer waits until the counter reaches the number it issued.
+struct GpuReadbackBufferPayload {
+    uint32_t seq;        // 1-based issue number (diagnostics)
+    uint32_t buffer_id;  // source buffer
+    uint64_t src_offset;
+    uint64_t size;       // bytes to read back and write at dst_addr
+    uint64_t dst_addr;
+    uint64_t done_addr;
+};
+static_assert(sizeof(GpuReadbackBufferPayload) == 40, "GpuReadbackBufferPayload layout must stay 40 bytes");
+
+// Texture region -> linear rows at dst_addr: `bytes_per_row` apart, `rows_per_image` block rows per
+// image (the D3D12 placed footprint); `dst_size` bytes in all. `origin_z` is the array layer of a 2D
+// texture or the depth slice of a 3D one.
+struct GpuReadbackTexturePayload {
+    uint32_t seq;
+    uint32_t texture_id;
+    uint32_t mip_level;
+    uint32_t origin_x;
+    uint32_t origin_y;
+    uint32_t origin_z;
+    uint32_t width;
+    uint32_t height;
+    uint32_t depth_or_layers;
+    uint32_t bytes_per_row;
+    uint32_t rows_per_image;
+    uint32_t reserved;
+    uint64_t dst_addr;
+    uint64_t done_addr;
+    uint64_t dst_size;
+};
+static_assert(sizeof(GpuReadbackTexturePayload) == 72, "GpuReadbackTexturePayload layout must stay 72 bytes");
 
 }  // namespace playgta6
 

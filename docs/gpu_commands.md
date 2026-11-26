@@ -127,6 +127,11 @@ v2 adds explicit bind group / pipeline layouts, full render pipeline keys, expli
 | `33` | `SetBindGroup2` | `16 + 4 * dynamic_offset_count` | `{ u32 group_index, u32 bind_group_id, u32 dynamic_offset_count, u32 reserved }` (`GpuSetBindGroup2Payload`) followed by `dynamic_offset_count` `u32` dynamic offsets |
 | `34` | `CreateSampler2` | `24` | `{ u32 id, u8 address_u, u8 address_v, u8 address_w, u8 mag_filter, u8 min_filter, u8 mipmap_filter, u8 compare, u8 reserved0, u16 max_anisotropy, u16 reserved1, f32 lod_min_clamp, f32 lod_max_clamp }` (`GpuCreateSampler2Payload`) |
 | `35` | `CreateTexture2` | `40` | `{ u32 id, u32 width, u32 height, u32 depth_or_layers, u32 mip_levels, u32 sample_count, u32 usage_flags, u8 dimension, u8 format, u8 view_format_count, u8 reserved, u8 view_formats[8] }` (`GpuCreateTexture2Payload`) |
+| `36` | `DrawIndirect` | `16` | `{ u32 buffer_id, u32 reserved, u64 offset }` (`GpuIndirectPayload`): `drawIndirect(buffer, offset)`, a 16-byte `{ vertex_count, instance_count, first_vertex, first_instance }` record |
+| `37` | `DrawIndexedIndirect` | `16` | `GpuIndirectPayload`: `drawIndexedIndirect(buffer, offset)`, a 20-byte `{ index_count, instance_count, first_index, base_vertex, first_instance }` record |
+| `38` | `DispatchIndirect` | `16` | `GpuIndirectPayload`: `dispatchWorkgroupsIndirect(buffer, offset)`, a 12-byte `{ x, y, z }` record |
+| `39` | `ReadbackBuffer` | `40` | `{ u32 seq, u32 buffer_id, u64 src_offset, u64 size, u64 dst_addr, u64 done_addr }` (`GpuReadbackBufferPayload`) |
+| `40` | `ReadbackTexture` | `72` | `{ u32 seq, u32 texture_id, u32 mip_level, u32 origin_x, u32 origin_y, u32 origin_z, u32 width, u32 height, u32 depth_or_layers, u32 bytes_per_row, u32 rows_per_image, u32 reserved, u64 dst_addr, u64 done_addr, u64 dst_size }` (`GpuReadbackTexturePayload`) |
 
 ### Ids
 - All ids share the v1 `u32` resource id namespace (`0` = none). `DestroyResource` also destroys bind group layouts, pipeline layouts and v2 bind groups, samplers and pipelines.
@@ -224,6 +229,9 @@ Byte codes used inside the v2 payloads (the numbering of the `pso::Wgpu*` enums 
 
 ### `CreateTexture2`
 A `GPUTextureDescriptor` for textures the v1 `CreateTexture` cannot describe (D3D12 resources created by the `d3d12_xs` layer). `format` and `view_formats` are v2 texture format codes ("WebGPU enum codes" below; `0` is invalid for `format`), `dimension` is `GpuTextureDimension`, `usage_flags` is `GpuTextureUsage`, `sample_count` is `1` or `4` (`0` is read as `1`), `depth_or_layers` is the depth of a 3D texture and the array layer count otherwise. `viewFormats` is `view_formats[0..view_format_count)` (`view_format_count <= 8`; the remaining entries are `0`). The texture lives in the same `u32` id namespace as v1 textures: `WriteTexture`, `DestroyResource`, bind group entries and render pass attachments accept the id, and the default view is created the same way as for `CreateTexture`. Re-creating an existing id replaces the texture. A consumer that cannot create the texture (unsupported format or feature) reports it and leaves the id unbound.
+
+### Read-back (`ReadbackBuffer`, `ReadbackTexture`)
+GPU -> CPU copies for memory the title reads on the CPU (readback-heap buffers, texture regions copied into a placed footprint). The consumer ends any open pass, copies the source (buffer range, or texture region at `mip_level` / origin with the given size) into a `MAP_READ` staging buffer in stream order, maps it, and writes the bytes to `dst_addr` in the producer's memory (wasm linear-memory offset; texture rows land `bytes_per_row` apart, `rows_per_image` block rows per image, `dst_size` bytes in all). After the bytes are written it does `Atomics.add(u32 at done_addr, 1)`, also when the copy failed. The producer counts issued read-backs and holds every queue fence signal issued after one until the counter has caught up, so the title never sees the fence complete before the data is in its memory. `seq` is the 1-based issue number, for diagnostics only.
 
 ### Explicit Pass Semantics (v2)
 - `BeginRenderPass` ends any open pass (v1 lazy render pass, compute pass or explicit render pass) and begins a render pass with exactly the given attachments; `EndRenderPass` ends it. `ClearColor` only affects v1 lazy passes.

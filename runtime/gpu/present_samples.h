@@ -44,6 +44,14 @@ public:
     }
 
     uint64_t total() const { return total_; }
+    // The newest sample (a zero sample before the first record): the live screen state the input
+    // script's `wait` steps read.
+    PresentSample last() const {
+        if (samples_.empty()) {
+            return PresentSample{};
+        }
+        return samples_[samples_.size() < capacity_ ? samples_.size() - 1 : (next_ + capacity_ - 1) % capacity_];
+    }
     size_t size() const { return samples_.size(); }
     size_t capacity() const { return capacity_; }
 

@@ -97,6 +97,23 @@ if (typeof importScripts === 'function') {
   importScripts('./workers/httpfs_mailbox.js');
 }
 
+// kRelaunchSelfExitCode (runtime/os/win32_compat.h, ASCII "RELN"): the title called XLaunchNewGame
+// on itself. The runtime exits with it and the page relaunches the boot with the same URL/arguments.
+const RELAUNCH_SELF_EXIT_CODE = 0x52454c4e;
+const GUEST_RELAUNCH_MESSAGE_TYPE = 'guest-relaunch';
+
+/** Progress payload asking the page to relaunch the guest, or null for any other exit status. */
+function guestRelaunchPayload(status) {
+  // Emscripten may report the int32 status sign-extended; compare as uint32.
+  if (typeof status !== 'number' || !Number.isFinite(status)) {
+    return null;
+  }
+  if (status >>> 0 !== RELAUNCH_SELF_EXIT_CODE) {
+    return null;
+  }
+  return { type: GUEST_RELAUNCH_MESSAGE_TYPE, exitCode: RELAUNCH_SELF_EXIT_CODE };
+}
+
 function postProgress(payload) {
   if (typeof self === 'undefined') {
     return false;
@@ -125,6 +142,8 @@ const BOOT_INIT_FORWARD_KEYS = Object.freeze([
   'bootBase',
   'gameBase',
   'programManifestUrl',
+  // #1077: opt-in `?opfsL2=0` bypass of the io_worker OPFS L2 hot-file cache.
+  'opfsL2Enabled',
 ]);
 const GAME_PACKAGE_HTTPFS_EXT_RE = /\.(?:rpf|ttpf|dll|png|xvd|xvc|bin|pri)$/i;
 const WIN32_DRIVE_PATH_RE = /^(?:\\\\[?.]\\|\/\/[?.]\/)?([A-Za-z]):(.*)$/;
@@ -281,11 +300,69 @@ function copyMemoryBytes(buf, ptr, len) {
   return copy;
 }
 
+function isSharedArrayBuffer(value) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+    return true;
+  }
+  return Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
+}
+
+function isTransferableArrayBuffer(value) {
+  if (!value || typeof value !== 'object' || isSharedArrayBuffer(value)) {
+    return false;
+  }
+  return (
+    value instanceof ArrayBuffer ||
+    Object.prototype.toString.call(value) === '[object ArrayBuffer]'
+  );
+}
+
+/**
+ * Return a standalone transferable `ArrayBuffer` for a GPU command batch.
+ *
+ * When `bytes` is already a standalone non-shared `ArrayBuffer` or a view covering
+ * the full length of a non-shared `ArrayBuffer` (such as the fresh `Uint8Array`
+ * returned by `copyMemoryBytes()`), its backing buffer is returned directly with
+ * zero extra allocation or memcpy. Subviews and `SharedArrayBuffer`-backed views
+ * fall back to copying into a fresh `ArrayBuffer`.
+ */
+function toTransferableArrayBuffer(bytes) {
+  if (!bytes) {
+    return null;
+  }
+  if (isTransferableArrayBuffer(bytes)) {
+    return bytes;
+  }
+  if (ArrayBuffer.isView(bytes)) {
+    const buf = bytes.buffer;
+    if (
+      isTransferableArrayBuffer(buf) &&
+      bytes.byteOffset === 0 &&
+      bytes.byteLength === buf.byteLength
+    ) {
+      return buf;
+    }
+    const copy = new Uint8Array(bytes.byteLength);
+    if (bytes.byteLength > 0) {
+      copy.set(new Uint8Array(buf, bytes.byteOffset, bytes.byteLength));
+    }
+    return copy.buffer;
+  }
+  if (isSharedArrayBuffer(bytes)) {
+    const copy = new Uint8Array(bytes.byteLength);
+    if (bytes.byteLength > 0) {
+      copy.set(new Uint8Array(bytes));
+    }
+    return copy.buffer;
+  }
+  return null;
+}
+
 function asDataView(bytes) {
-  if (
-    bytes instanceof ArrayBuffer ||
-    (typeof SharedArrayBuffer !== 'undefined' && bytes instanceof SharedArrayBuffer)
-  ) {
+  if (isTransferableArrayBuffer(bytes) || isSharedArrayBuffer(bytes)) {
     return new DataView(bytes);
   }
   if (ArrayBuffer.isView(bytes)) {
@@ -857,10 +934,131 @@ function formatGpuWorkerError(err) {
   return String(err);
 }
 
+function sanitizeGpuAdapterForTelemetry(raw) {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (raw === null) {
+    return null;
+  }
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+  if (typeof raw === 'object' && !Array.isArray(raw)) {
+    const out = {};
+    let hasField = false;
+    for (const key of ['vendor', 'architecture', 'device', 'description', 'label']) {
+      if (typeof raw[key] === 'string') {
+        out[key] = raw[key];
+        hasField = true;
+      }
+    }
+    if (typeof raw.isFallbackAdapter === 'boolean') {
+      out.isFallbackAdapter = raw.isFallbackAdapter;
+      hasField = true;
+    }
+    return hasField ? out : null;
+  }
+  return undefined;
+}
+
+function pickTelemetryBoolean(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (typeof val === 'boolean') {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickTelemetryBooleanOrNull(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (val === null || typeof val === 'boolean') {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickTelemetryNumberOrNull(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (val === null) {
+        return { found: true, value: null };
+      }
+      if (typeof val === 'number' && Number.isFinite(val) && val >= 0) {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+function pickTelemetryFiniteNumber(sources, keys) {
+  for (let i = 0; i < sources.length; i += 1) {
+    const src = sources[i];
+    if (!src || typeof src !== 'object') continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      const val = src[keys[j]];
+      if (typeof val === 'number' && Number.isFinite(val)) {
+        return { found: true, value: val };
+      }
+    }
+  }
+  return { found: false, value: undefined };
+}
+
+// W358: forward swapchain luminance probe counters and capability flags across
+// first-visible-frame and gpu-telemetry payloads (camelCase, snake_case, nested stats/frameStats).
+function applySwapchainProbeTelemetryFields(target, sources) {
+  const probeCountField = pickTelemetryFiniteNumber(sources, [
+    'swapchainProbeCount',
+    'swapchain_probe_count',
+  ]);
+  if (probeCountField.found) {
+    target.swapchainProbeCount = toNonNegativeInt(probeCountField.value, 0);
+  }
+  const probeInFlightField = pickTelemetryBoolean(sources, [
+    'swapchainProbeInFlight',
+    'swapchain_probe_in_flight',
+  ]);
+  if (probeInFlightField.found) {
+    target.swapchainProbeInFlight = probeInFlightField.value;
+  }
+  const probeSupportedField = pickTelemetryBooleanOrNull(sources, [
+    'swapchainProbeSupported',
+    'swapchain_probe_supported',
+  ]);
+  if (probeSupportedField.found) {
+    target.swapchainProbeSupported = probeSupportedField.value;
+  }
+  const probeErrorCountField = pickTelemetryFiniteNumber(sources, [
+    'swapchainProbeErrorCount',
+    'swapchain_probe_error_count',
+  ]);
+  if (probeErrorCountField.found) {
+    target.swapchainProbeErrorCount = toNonNegativeInt(probeErrorCountField.value, 0);
+  }
+}
+
 /**
  * Inspect a message emitted by `wgpu_worker.js`, sanitize/normalize GPU frame,
- * shader-fallback, missing-shader, and validation-error telemetry, and forward
- * to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
+ * shader-fallback, missing-shader, first-visible-frame, and validation-error telemetry,
+ * and forward to the main thread via `postMessageFn`. Returns the forwarded payload or `null` when ignored.
  */
 function forwardGpuWorkerMessage(eventData, postMessageFn) {
   if (
@@ -925,12 +1123,143 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     return payload;
   }
 
+  // W349: forward explicit first-visible-frame / visible-frame events straight through to main thread.
+  if (
+    eventData &&
+    typeof eventData === 'object' &&
+    !Array.isArray(eventData) &&
+    (eventData.type === 'first-visible-frame' || eventData.type === 'visible-frame')
+  ) {
+    const payload = {
+      type: eventData.type,
+      firstVisibleFrame:
+        typeof eventData.firstVisibleFrame === 'boolean' ? eventData.firstVisibleFrame : true,
+    };
+    if (
+      eventData.firstVisibleFrameMs === null ||
+      (typeof eventData.firstVisibleFrameMs === 'number' &&
+        Number.isFinite(eventData.firstVisibleFrameMs) &&
+        eventData.firstVisibleFrameMs >= 0)
+    ) {
+      payload.firstVisibleFrameMs = eventData.firstVisibleFrameMs;
+    }
+    if (
+      eventData.firstPresentMs === null ||
+      (typeof eventData.firstPresentMs === 'number' &&
+        Number.isFinite(eventData.firstPresentMs) &&
+        eventData.firstPresentMs >= 0)
+    ) {
+      payload.firstPresentMs = eventData.firstPresentMs;
+    }
+    if (
+      eventData.blackLoadingMs === null ||
+      (typeof eventData.blackLoadingMs === 'number' &&
+        Number.isFinite(eventData.blackLoadingMs) &&
+        eventData.blackLoadingMs >= 0)
+    ) {
+      payload.blackLoadingMs = eventData.blackLoadingMs;
+    }
+    if (typeof eventData.presentCount === 'number' && Number.isFinite(eventData.presentCount)) {
+      payload.presentCount = toNonNegativeInt(eventData.presentCount, 0);
+    }
+    if (
+      typeof eventData.framesPresented === 'number' &&
+      Number.isFinite(eventData.framesPresented)
+    ) {
+      payload.framesPresented = toNonNegativeInt(eventData.framesPresented, 0);
+    }
+    if (
+      typeof eventData.realPackDrawsThisFrame === 'number' &&
+      Number.isFinite(eventData.realPackDrawsThisFrame)
+    ) {
+      payload.realPackDrawsThisFrame = toNonNegativeInt(eventData.realPackDrawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.fallbackDrawsThisFrame === 'number' &&
+      Number.isFinite(eventData.fallbackDrawsThisFrame)
+    ) {
+      payload.fallbackDrawsThisFrame = toNonNegativeInt(eventData.fallbackDrawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.drawsThisFrame === 'number' &&
+      Number.isFinite(eventData.drawsThisFrame)
+    ) {
+      payload.drawsThisFrame = toNonNegativeInt(eventData.drawsThisFrame, 0);
+    }
+    if (
+      typeof eventData.realPackDrawCount === 'number' &&
+      Number.isFinite(eventData.realPackDrawCount)
+    ) {
+      payload.realPackDrawCount = toNonNegativeInt(eventData.realPackDrawCount, 0);
+    }
+    if (typeof eventData.source === 'string' && eventData.source.length > 0) {
+      payload.source = eventData.source;
+    }
+    const rawMaxLuma =
+      eventData.maxLuma !== undefined ? eventData.maxLuma : eventData.lastSampledMaxLuma;
+    if (typeof rawMaxLuma === 'number' && Number.isFinite(rawMaxLuma)) {
+      payload.maxLuma = Math.max(0, Math.min(255, Math.floor(rawMaxLuma)));
+    }
+    if (
+      typeof eventData.suppressedBlackFrames === 'number' &&
+      Number.isFinite(eventData.suppressedBlackFrames)
+    ) {
+      payload.suppressedBlackFrames = toNonNegativeInt(eventData.suppressedBlackFrames, 0);
+    }
+    const visibleRawStats =
+      eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+    const visibleRawFrameStats =
+      eventData.frameStats && typeof eventData.frameStats === 'object'
+        ? eventData.frameStats
+        : null;
+    const visibleSources = [eventData, visibleRawStats, visibleRawFrameStats].filter(Boolean);
+    applySwapchainProbeTelemetryFields(payload, visibleSources);
+    if (eventData.gpuAdapter !== undefined) {
+      const sanitizedAdapter = sanitizeGpuAdapterForTelemetry(eventData.gpuAdapter);
+      if (sanitizedAdapter !== undefined) {
+        payload.gpuAdapter = sanitizedAdapter;
+      }
+    }
+    if (
+      typeof eventData.elapsedMs === 'number' &&
+      Number.isFinite(eventData.elapsedMs) &&
+      eventData.elapsedMs >= 0
+    ) {
+      payload.elapsedMs = eventData.elapsedMs;
+    }
+    if (typeof eventData.fadeOutMs === 'number' && Number.isFinite(eventData.fadeOutMs)) {
+      payload.fadeOutMs = eventData.fadeOutMs;
+    }
+    if (
+      typeof eventData.fadeDurationMs === 'number' &&
+      Number.isFinite(eventData.fadeDurationMs)
+    ) {
+      payload.fadeDurationMs = eventData.fadeDurationMs;
+    }
+    if (typeof eventData.fadeMs === 'number' && Number.isFinite(eventData.fadeMs)) {
+      payload.fadeMs = eventData.fadeMs;
+    }
+    if (typeof eventData.timestamp === 'number' && Number.isFinite(eventData.timestamp)) {
+      payload.timestamp = eventData.timestamp;
+    }
+    if (typeof postMessageFn === 'function') {
+      try {
+        postMessageFn(payload);
+      } catch {
+        // Telemetry forwarding must never disrupt the GPU worker loop.
+      }
+    }
+    return payload;
+  }
+
   if (!isGpuTelemetryMessage(eventData)) {
     return null;
   }
 
   const rawStats =
     eventData.stats && typeof eventData.stats === 'object' ? eventData.stats : null;
+  const rawFrameStats =
+    eventData.frameStats && typeof eventData.frameStats === 'object' ? eventData.frameStats : null;
   const rawFallback =
     eventData.fallbackStats ||
     eventData.shaderFallbackStats ||
@@ -966,6 +1295,58 @@ function forwardGpuWorkerMessage(eventData, postMessageFn) {
     lastRenderStateStats = renderStateStats;
   }
 
+  // W349: preserve explicit non-black probe & adapter fields on gpu-telemetry payloads.
+  const telemetrySources = [eventData, rawStats, rawFrameStats].filter(Boolean);
+  const firstVisibleField = pickTelemetryBoolean(telemetrySources, [
+    'firstVisibleFrame',
+    'first_visible_frame',
+  ]);
+  if (firstVisibleField.found) {
+    telemetry.firstVisibleFrame = firstVisibleField.value;
+  }
+  const firstVisibleMsField = pickTelemetryNumberOrNull(telemetrySources, [
+    'firstVisibleFrameMs',
+    'first_visible_frame_ms',
+  ]);
+  if (firstVisibleMsField.found) {
+    telemetry.firstVisibleFrameMs = firstVisibleMsField.value;
+  }
+  const blackLoadingMsField = pickTelemetryNumberOrNull(telemetrySources, [
+    'blackLoadingMs',
+    'black_loading_ms',
+  ]);
+  if (blackLoadingMsField.found) {
+    telemetry.blackLoadingMs = blackLoadingMsField.value;
+  }
+  const maxLumaField = pickTelemetryFiniteNumber(telemetrySources, [
+    'maxLuma',
+    'lastSampledMaxLuma',
+  ]);
+  if (maxLumaField.found) {
+    telemetry.maxLuma = Math.max(0, Math.min(255, Math.floor(maxLumaField.value)));
+  }
+  const suppressedBlackField = pickTelemetryFiniteNumber(telemetrySources, [
+    'suppressedBlackFrames',
+  ]);
+  if (suppressedBlackField.found) {
+    telemetry.suppressedBlackFrames = toNonNegativeInt(suppressedBlackField.value, 0);
+  }
+  applySwapchainProbeTelemetryFields(telemetry, telemetrySources);
+  const rawGpuAdapter =
+    eventData.gpuAdapter !== undefined
+      ? eventData.gpuAdapter
+      : rawStats && rawStats.gpuAdapter !== undefined
+        ? rawStats.gpuAdapter
+        : rawFrameStats && rawFrameStats.gpuAdapter !== undefined
+          ? rawFrameStats.gpuAdapter
+          : undefined;
+  if (rawGpuAdapter !== undefined) {
+    const sanitizedAdapter = sanitizeGpuAdapterForTelemetry(rawGpuAdapter);
+    if (sanitizedAdapter !== undefined) {
+      telemetry.gpuAdapter = sanitizedAdapter;
+    }
+  }
+
   if (typeof postMessageFn === 'function') {
     try {
       postMessageFn(telemetry);
@@ -993,12 +1374,104 @@ function collectBootBridgeInitFields(src) {
 
 function createWorkerBootInitPayloads(msg = {}) {
   const bootFields = collectBootBridgeInitFields(msg);
+  // W345: disable per-batch resource replay shadow-copying in live Wasm64 browser
+  // sessions unless explicitly opted in, while keeping standalone WgpuCommandProcessor
+  // unit tests backward-compatible.
+  const enableResourceReplay =
+    msg && typeof msg === 'object' && typeof msg.enableResourceReplay === 'boolean'
+      ? msg.enableResourceReplay
+      : false;
   return {
     ioInit: Object.assign({ init: true, dataBase: msg.dataBase }, bootFields),
     gpuInit: Object.assign(
-      { init: true, canvas: msg.canvas, width: msg.width, height: msg.height },
+      {
+        init: true,
+        canvas: msg.canvas,
+        width: msg.width,
+        height: msg.height,
+        enableResourceReplay,
+      },
       bootFields,
     ),
+  };
+}
+
+/**
+ * Build worker init payloads plus zero-copy transfer lists for any preloaded non-SAB
+ * `ArrayBuffer`s (`pgimBuffer`/`pgimBytes` -> `ioWorker`, `shaderPackBuffer`/`shaderPackBytes`
+ * -> `gpuWorker`) alongside `msg.canvas`, avoiding structured-clone duplication.
+ */
+function createWorkerBootInitPayloadsWithTransfers(msg = {}) {
+  const base = createWorkerBootInitPayloads(msg);
+  const ioTransferList = [];
+  const gpuTransferList = [];
+  const seenTransfers = new Set();
+
+  const tryQueueTransfer = (buf, list) => {
+    if (!isTransferableArrayBuffer(buf) || buf.detached || buf.byteLength <= 0 || seenTransfers.has(buf)) {
+      return false;
+    }
+    seenTransfers.add(buf);
+    list.push(buf);
+    return true;
+  };
+
+  if (msg && typeof msg === 'object') {
+    const rawPgim = msg.pgimBuffer !== undefined && msg.pgimBuffer !== null
+      ? msg.pgimBuffer
+      : msg.pgimBytes !== undefined && msg.pgimBytes !== null
+        ? msg.pgimBytes
+        : msg.bundle && msg.bundle.pgim
+          ? msg.bundle.pgim.buffer || msg.bundle.pgim.bytes || null
+          : null;
+    if (rawPgim) {
+      if (isSharedArrayBuffer(rawPgim) || (ArrayBuffer.isView(rawPgim) && isSharedArrayBuffer(rawPgim.buffer))) {
+        base.ioInit.pgimBuffer = ArrayBuffer.isView(rawPgim) ? rawPgim.buffer : rawPgim;
+      } else {
+        const pgimBuf = toTransferableArrayBuffer(rawPgim);
+        if (pgimBuf && pgimBuf.byteLength > 0) {
+          base.ioInit.pgimBuffer = pgimBuf;
+          tryQueueTransfer(pgimBuf, ioTransferList);
+        }
+      }
+    }
+
+    const rawShaderPack = msg.shaderPackBuffer !== undefined && msg.shaderPackBuffer !== null
+      ? msg.shaderPackBuffer
+      : msg.shaderPackBytes !== undefined && msg.shaderPackBytes !== null
+        ? msg.shaderPackBytes
+        : msg.bundle && msg.bundle.shaderPackBytes
+          ? msg.bundle.shaderPackBytes.buffer || msg.bundle.shaderPackBytes.bytes || msg.bundle.shaderPackBytes
+          : null;
+    if (rawShaderPack) {
+      if (
+        isSharedArrayBuffer(rawShaderPack) ||
+        (ArrayBuffer.isView(rawShaderPack) && isSharedArrayBuffer(rawShaderPack.buffer))
+      ) {
+        base.gpuInit.shaderPackBuffer = ArrayBuffer.isView(rawShaderPack)
+          ? rawShaderPack.buffer
+          : rawShaderPack;
+      } else {
+        const shaderBuf = toTransferableArrayBuffer(rawShaderPack);
+        if (shaderBuf && shaderBuf.byteLength > 0) {
+          base.gpuInit.shaderPackBuffer = shaderBuf;
+          tryQueueTransfer(shaderBuf, gpuTransferList);
+        }
+      }
+    }
+
+    if (msg.canvas) {
+      gpuTransferList.unshift(msg.canvas);
+    }
+  }
+
+  return {
+    ioInit: base.ioInit,
+    gpuInit: base.gpuInit,
+    ioTransferList,
+    gpuTransferList,
+    transferredArrayBufferCount:
+      ioTransferList.length + (msg && msg.canvas ? Math.max(0, gpuTransferList.length - 1) : gpuTransferList.length),
   };
 }
 
@@ -1792,9 +2265,11 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     log: (msg) => pthreadReport(`[wasm] ${msg}`),
     report: () => {},
     wgpuSubmit: (bytes) => {
+      const cmdBuffer = toTransferableArrayBuffer(bytes);
+      if (!cmdBuffer) {
+        return;
+      }
       if (txPort && !txPortClosed) {
-        const copy = bytes.slice();
-        const cmdBuffer = copy.buffer;
         try {
           txPort.postMessage(
             { type: PTHREAD_TX_MSG_WGPU_SUBMIT, cmdBuffer },
@@ -1808,10 +2283,9 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       if (typeof BroadcastChannelCtor !== 'function') {
         return;
       }
-      const copy = bytes.slice();
       postBroadcastOnce(BroadcastChannelCtor, PTHREAD_WGPU_CHANNEL_NAME, {
         type: PTHREAD_TX_MSG_WGPU_SUBMIT,
-        cmdBuffer: copy.buffer,
+        cmdBuffer,
       });
     },
     getHttpfsClient: () => pthreadHttpfsClient,
@@ -2624,6 +3098,731 @@ function mergeHostImportsIntoWasmImports(imports, hostEnv) {
   return merged;
 }
 
+const WASM_WIRE_BINARY_KEYS = Object.freeze([
+  'wasmBinary',
+  'wireBytes',
+  'rawBytes',
+  'bytes',
+  'buffer',
+  'arrayBuffer',
+  'data',
+  'wasmBytes',
+  'wasmBuffer',
+  'pgimBytes',
+  'pgimBuffer',
+  'shaderPackBytes',
+  'shaderPackBuffer',
+]);
+const WASM_WIRE_COLLECTION_KEYS = Object.freeze([
+  'preloadedBuffers',
+  'guestModuleBytes',
+  'sideModuleBytes',
+  'sideModules',
+  'guestModules',
+  'wasmModules',
+  'modules',
+  'modulesByName',
+  'sidecars',
+  'bundle',
+  'program',
+  'runtimeWasm',
+  'pgim',
+]);
+const WASM_KEY_HINT_RE = /(?:wasm|guest_?part|guestmodule|sidemodule|wirebytes)/i;
+
+const wasmMemoryTelemetry = {
+  wireBytesReleased: 0,
+  droppedWasmBuffers: 0,
+  droppedPreloadBuffers: 0,
+  transferredArrayBuffers: 0,
+  streamingCompiles: 0,
+  fallbackCompiles: 0,
+};
+
+let activeSharedWasmModuleCount = 0;
+
+function isCompiledWasmModule(value, wasmNs) {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const ModuleCtor =
+    (wasmNs && typeof wasmNs.Module === 'function' ? wasmNs.Module : null) ||
+    (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Module === 'function'
+      ? WebAssembly.Module
+      : null);
+  return Boolean(ModuleCtor && value instanceof ModuleCtor);
+}
+
+function getBinaryWireInfo(value, wasmNs) {
+  if (!value || typeof value !== 'object' || isCompiledWasmModule(value, wasmNs)) {
+    return null;
+  }
+  if (isTransferableArrayBuffer(value)) {
+    return { backingBuffer: value, byteLength: value.byteLength, isShared: false };
+  }
+  if (isSharedArrayBuffer(value)) {
+    return { backingBuffer: value, byteLength: value.byteLength, isShared: true };
+  }
+  if (ArrayBuffer.isView(value)) {
+    return {
+      backingBuffer: value.buffer,
+      byteLength: value.byteLength,
+      isShared: isSharedArrayBuffer(value.buffer),
+    };
+  }
+  return null;
+}
+
+function recordDroppedWasmWireBytes(byteLength, count = 1) {
+  const bytes = toNonNegativeInt(byteLength, 0);
+  const buffers = toNonNegativeInt(count, 0);
+  if (bytes > 0) {
+    wasmMemoryTelemetry.wireBytesReleased += bytes;
+  }
+  if (buffers > 0) {
+    wasmMemoryTelemetry.droppedWasmBuffers += buffers;
+  }
+}
+
+function recordDroppedPreloadBytes(byteLength, count = 1) {
+  const bytes = toNonNegativeInt(byteLength, 0);
+  const buffers = toNonNegativeInt(count, 0);
+  if (bytes > 0) {
+    wasmMemoryTelemetry.wireBytesReleased += bytes;
+  }
+  if (buffers > 0) {
+    wasmMemoryTelemetry.droppedPreloadBuffers += buffers;
+  }
+}
+
+function recordTransferredArrayBuffers(count = 1) {
+  const n = toNonNegativeInt(count, 0);
+  if (n > 0) {
+    wasmMemoryTelemetry.transferredArrayBuffers += n;
+  }
+}
+
+function getWasmMemoryTelemetry() {
+  return {
+    wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
+    droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
+    droppedPreloadBuffers: wasmMemoryTelemetry.droppedPreloadBuffers,
+    transferredArrayBuffers: wasmMemoryTelemetry.transferredArrayBuffers,
+    streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
+    fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
+    sharedModuleCount: activeSharedWasmModuleCount,
+  };
+}
+
+function resetWasmMemoryTelemetry() {
+  wasmMemoryTelemetry.wireBytesReleased = 0;
+  wasmMemoryTelemetry.droppedWasmBuffers = 0;
+  wasmMemoryTelemetry.droppedPreloadBuffers = 0;
+  wasmMemoryTelemetry.transferredArrayBuffers = 0;
+  wasmMemoryTelemetry.streamingCompiles = 0;
+  wasmMemoryTelemetry.fallbackCompiles = 0;
+  return getWasmMemoryTelemetry();
+}
+
+function isWritableOwnProp(obj, key) {
+  if (!obj || typeof obj !== 'object') {
+    return false;
+  }
+  if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+    return false;
+  }
+  const desc = Object.getOwnPropertyDescriptor(obj, key);
+  if (!desc) {
+    return false;
+  }
+  if ('get' in desc || 'set' in desc) {
+    return typeof desc.set === 'function';
+  }
+  return desc.writable === true;
+}
+
+/**
+ * Collect unique standalone non-SAB `ArrayBuffer`s reachable inside `payload` for
+ * zero-copy `postMessage(msg, transferList)`. Skips `SharedArrayBuffer`, `WebAssembly.Module`,
+ * detached buffers, and subviews that do not cover their entire backing buffer.
+ */
+function collectTransferableArrayBuffers(payload, wasmNs) {
+  const unique = new Set();
+  const visited = new Set();
+
+  const visit = (value) => {
+    if (!value || typeof value !== 'object' || isCompiledWasmModule(value, wasmNs)) {
+      return;
+    }
+    if (isTransferableArrayBuffer(value)) {
+      if (!value.detached && value.byteLength > 0) {
+        unique.add(value);
+      }
+      return;
+    }
+    if (isSharedArrayBuffer(value)) {
+      return;
+    }
+    if (ArrayBuffer.isView(value)) {
+      const buf = value.buffer;
+      if (
+        isTransferableArrayBuffer(buf) &&
+        !buf.detached &&
+        value.byteOffset === 0 &&
+        value.byteLength === buf.byteLength &&
+        buf.byteLength > 0
+      ) {
+        unique.add(buf);
+      }
+      return;
+    }
+    if (visited.has(value)) {
+      return;
+    }
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i += 1) {
+        visit(value[i]);
+      }
+      return;
+    }
+    if (value instanceof Map || value instanceof Set) {
+      value.forEach((v) => visit(v));
+      return;
+    }
+    const keys = Object.keys(value);
+    for (let i = 0; i < keys.length; i += 1) {
+      let child;
+      try {
+        child = value[keys[i]];
+      } catch {
+        continue;
+      }
+      visit(child);
+    }
+  };
+
+  visit(payload);
+  return Array.from(unique);
+}
+
+/**
+ * Immediately drop raw `.wasm` / preload `ArrayBuffer` & `Uint8Array` references from a
+ * message, map, array, or bundle (`= null` / `Map.delete` / `array.length = 0`) while
+ * preserving compiled `WebAssembly.Module` objects and lightweight metadata.
+ */
+function releaseWireBytesFromObject(target, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const recordTelemetry = safeOpts.recordTelemetry !== false;
+  const assumeWasm = safeOpts.assumeWasm === true;
+  const wasmNs = safeOpts.wasmApi || (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+  const releasedFields = [];
+  let releasedBytes = 0;
+  let droppedWasmCount = 0;
+  let droppedPreloadCount = 0;
+
+  if (!target || typeof target !== 'object' || isCompiledWasmModule(target, wasmNs)) {
+    return { releasedFields, releasedBytes, droppedWasmBuffers: 0, droppedPreloadBuffers: 0 };
+  }
+
+  const countedByBuffer = new Map();
+  const visited = new Set();
+
+  const countBuffer = (info, path) => {
+    if (!info || !info.backingBuffer) {
+      return;
+    }
+    const isWasm = assumeWasm || WASM_KEY_HINT_RE.test(path);
+    const len = info.byteLength > 0 ? info.byteLength : 0;
+    const prev = countedByBuffer.get(info.backingBuffer);
+    if (prev === undefined) {
+      countedByBuffer.set(info.backingBuffer, len);
+      releasedBytes += len;
+      if (isWasm) {
+        droppedWasmCount += 1;
+      } else {
+        droppedPreloadCount += 1;
+      }
+    } else if (len > prev) {
+      releasedBytes += len - prev;
+      countedByBuffer.set(info.backingBuffer, len);
+    }
+  };
+
+  const nullBinaryProp = (obj, key, path) => {
+    if (!isWritableOwnProp(obj, key)) {
+      return false;
+    }
+    let val;
+    try {
+      val = obj[key];
+    } catch {
+      return false;
+    }
+    const info = getBinaryWireInfo(val, wasmNs);
+    if (!info) {
+      return false;
+    }
+    try {
+      obj[key] = null;
+    } catch {
+      return false;
+    }
+    releasedFields.push(path);
+    countBuffer(info, path);
+    return true;
+  };
+
+  const walk = (node, prefix) => {
+    if (!node || typeof node !== 'object' || isCompiledWasmModule(node, wasmNs) || visited.has(node)) {
+      return;
+    }
+    visited.add(node);
+
+    if (node instanceof Map) {
+      const entries = Array.from(node.entries());
+      for (let i = 0; i < entries.length; i += 1) {
+        const [k, v] = entries[i];
+        const label = typeof k === 'string' || typeof k === 'number' ? String(k) : 'entry';
+        const path = prefix ? `${prefix}.${label}` : label;
+        const info = getBinaryWireInfo(v, wasmNs);
+        if (info) {
+          node.delete(k);
+          releasedFields.push(path);
+          countBuffer(info, path);
+        } else if (v && typeof v === 'object' && !isCompiledWasmModule(v, wasmNs)) {
+          walk(v, path);
+        }
+      }
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      let allDirectBinary = node.length > 0;
+      for (let i = 0; i < node.length; i += 1) {
+        const item = node[i];
+        const path = prefix ? `${prefix}[${i}]` : `[${i}]`;
+        const info = getBinaryWireInfo(item, wasmNs);
+        if (info) {
+          if (isWritableOwnProp(node, String(i))) {
+            node[i] = null;
+            releasedFields.push(path);
+            countBuffer(info, path);
+          }
+        } else {
+          allDirectBinary = false;
+          if (item && typeof item === 'object' && !isCompiledWasmModule(item, wasmNs)) {
+            walk(item, path);
+          }
+        }
+      }
+      if (allDirectBinary && !Object.isFrozen(node)) {
+        try {
+          node.length = 0;
+        } catch {
+          // Ignore non-resizable arrays.
+        }
+      }
+      return;
+    }
+
+    for (let i = 0; i < WASM_WIRE_BINARY_KEYS.length; i += 1) {
+      const k = WASM_WIRE_BINARY_KEYS[i];
+      if (Object.prototype.hasOwnProperty.call(node, k)) {
+        const path = prefix ? `${prefix}.${k}` : k;
+        if (!nullBinaryProp(node, k, path)) {
+          const child = node[k];
+          if (child && typeof child === 'object' && !isCompiledWasmModule(child, wasmNs)) {
+            walk(child, path);
+          }
+        }
+      }
+    }
+
+    for (let i = 0; i < WASM_WIRE_COLLECTION_KEYS.length; i += 1) {
+      const k = WASM_WIRE_COLLECTION_KEYS[i];
+      if (!Object.prototype.hasOwnProperty.call(node, k)) {
+        continue;
+      }
+      let child;
+      try {
+        child = node[k];
+      } catch {
+        continue;
+      }
+      if (!child || typeof child !== 'object' || isCompiledWasmModule(child, wasmNs)) {
+        continue;
+      }
+      const path = prefix ? `${prefix}.${k}` : k;
+      if (getBinaryWireInfo(child, wasmNs)) {
+        nullBinaryProp(node, k, path);
+      } else {
+        walk(child, path);
+      }
+    }
+
+    // For plain maps (e.g. `preloadedBuffers` / `guestModuleBytes`), also drop direct binary keys.
+    if (
+      prefix &&
+      /(?:preloadedBuffers|guestModuleBytes|sideModuleBytes|sidecars|modulesByName)$/i.test(prefix)
+    ) {
+      const keys = Object.keys(node);
+      for (let i = 0; i < keys.length; i += 1) {
+        const k = keys[i];
+        const path = `${prefix}.${k}`;
+        if (!nullBinaryProp(node, k, path)) {
+          const child = node[k];
+          if (child && typeof child === 'object' && !isCompiledWasmModule(child, wasmNs)) {
+            walk(child, path);
+          }
+        }
+      }
+    }
+  };
+
+  walk(target, '');
+
+  if (recordTelemetry && (releasedBytes > 0 || droppedWasmCount > 0 || droppedPreloadCount > 0)) {
+    if (droppedWasmCount > 0) {
+      recordDroppedWasmWireBytes(releasedBytes, droppedWasmCount);
+      if (droppedPreloadCount > 0) {
+        wasmMemoryTelemetry.droppedPreloadBuffers += droppedPreloadCount;
+      }
+    } else if (droppedPreloadCount > 0) {
+      recordDroppedPreloadBytes(releasedBytes, droppedPreloadCount);
+    } else if (releasedBytes > 0) {
+      wasmMemoryTelemetry.wireBytesReleased += releasedBytes;
+    }
+  }
+
+  return {
+    releasedFields,
+    releasedBytes,
+    droppedWasmBuffers: droppedWasmCount,
+    droppedPreloadBuffers: droppedPreloadCount,
+  };
+}
+
+/**
+ * Strip any raw wire-byte `ArrayBuffer` / `Uint8Array` payloads from an Emscripten
+ * `sharedModules` list, map, or object so compiled `WebAssembly.Module` instances are
+ * shared across pthreads WITHOUT ever keeping or cloning raw `.wasm` wire bytes.
+ */
+function stripWireBytesFromSharedModules(sharedModules, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const wasmNs = safeOpts.wasmApi || (typeof WebAssembly !== 'undefined' ? WebAssembly : null);
+  if (!sharedModules || typeof sharedModules !== 'object') {
+    return { releasedFields: [], releasedBytes: 0, droppedWasmBuffers: 0, droppedPreloadBuffers: 0 };
+  }
+  const result = releaseWireBytesFromObject(sharedModules, {
+    wasmApi: wasmNs,
+    assumeWasm: true,
+    recordTelemetry: safeOpts.recordTelemetry !== false,
+  });
+  return result;
+}
+
+/**
+ * Compile a WebAssembly module preferring `WebAssembly.compileStreaming` so large
+ * `guest_part_*.wasm` binaries never materialize as 1 GB JS `ArrayBuffer`s.
+ *
+ * Falls back cleanly to `response.arrayBuffer()` + `WebAssembly.compile(bytes)` and
+ * immediately drops all raw wire-byte references once compilation settles.
+ */
+async function compileWasmModuleStreaming(source, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const wasmNs =
+    safeOpts.wasmApi && typeof safeOpts.wasmApi === 'object'
+      ? safeOpts.wasmApi
+      : typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null;
+  if (!wasmNs || typeof wasmNs.compile !== 'function') {
+    throw new Error('WebAssembly.compile is unavailable');
+  }
+  const fetchFn =
+    typeof safeOpts.fetchFn === 'function'
+      ? safeOpts.fetchFn
+      : typeof fetch === 'function'
+        ? fetch
+        : null;
+
+  if (isCompiledWasmModule(source, wasmNs)) {
+    return { module: source, streaming: false, wireBytesReleased: 0 };
+  }
+
+  const releaseOwnerSlot = () => {
+    if (!safeOpts.owner || safeOpts.ownerKey === undefined) {
+      return;
+    }
+    try {
+      if (safeOpts.owner instanceof Map) {
+        safeOpts.owner.delete(safeOpts.ownerKey);
+      } else if (isWritableOwnProp(safeOpts.owner, safeOpts.ownerKey)) {
+        safeOpts.owner[safeOpts.ownerKey] = null;
+      }
+    } catch {
+      // Ignore release errors on frozen/exotic containers.
+    }
+  };
+
+  const directBinary = getBinaryWireInfo(source, wasmNs);
+  if (directBinary) {
+    let localBytes = source;
+    const byteLength = directBinary.byteLength;
+    releaseOwnerSlot();
+    let mod;
+    try {
+      const compilePromise = wasmNs.compile(localBytes);
+      localBytes = null;
+      mod = await compilePromise;
+    } finally {
+      localBytes = null;
+      releaseOwnerSlot();
+      if (byteLength > 0) {
+        recordDroppedWasmWireBytes(byteLength, 1);
+      }
+    }
+    wasmMemoryTelemetry.fallbackCompiles += 1;
+    return { module: mod, streaming: false, wireBytesReleased: byteLength };
+  }
+
+  let resp = source;
+  if (typeof source === 'string') {
+    if (!fetchFn) {
+      throw new Error(`fetch unavailable while compiling ${source}`);
+    }
+    const fetchInit = { credentials: 'same-origin' };
+    if (safeOpts.signal) {
+      fetchInit.signal = safeOpts.signal;
+    }
+    resp = await fetchFn(source, fetchInit);
+  } else if (resp && typeof resp.then === 'function') {
+    resp = await resp;
+  }
+
+  if (!resp || resp.ok === false) {
+    const status = resp && resp.status !== undefined ? resp.status : 'unknown';
+    throw new Error(`Failed to fetch Wasm module (HTTP ${status})`);
+  }
+
+  const contentType =
+    resp.headers && typeof resp.headers.get === 'function'
+      ? String(resp.headers.get('content-type') || '')
+      : '';
+  const isRealResponse = typeof Response === 'undefined' || resp instanceof Response;
+  const canStream =
+    typeof wasmNs.compileStreaming === 'function' &&
+    (isRealResponse || safeOpts.allowStreamingWithoutContentType === true) &&
+    (contentType.toLowerCase().includes('application/wasm') ||
+      safeOpts.allowStreamingWithoutContentType === true);
+
+  if (canStream) {
+    try {
+      const mod = await wasmNs.compileStreaming(Promise.resolve(resp));
+      wasmMemoryTelemetry.streamingCompiles += 1;
+      return { module: mod, streaming: true, wireBytesReleased: 0 };
+    } catch (streamErr) {
+      if (resp.bodyUsed) {
+        throw streamErr;
+      }
+      // Fall back to arrayBuffer() + compile() when streaming was rejected before consuming body.
+    }
+  }
+
+  let wireBytes = await resp.arrayBuffer();
+  const byteLength = wireBytes && typeof wireBytes.byteLength === 'number' ? wireBytes.byteLength : 0;
+  let mod;
+  try {
+    const compilePromise = wasmNs.compile(wireBytes);
+    wireBytes = null;
+    mod = await compilePromise;
+  } finally {
+    wireBytes = null;
+    if (byteLength > 0) {
+      recordDroppedWasmWireBytes(byteLength, 1);
+    }
+  }
+  wasmMemoryTelemetry.fallbackCompiles += 1;
+  return { module: mod, streaming: false, wireBytesReleased: byteLength };
+}
+
+/**
+ * Shared compiled `WebAssembly.Module` cache for Emscripten side modules (`guest_part_*.wasm`).
+ * Compiles each module at most once, deduplicates concurrent requests, shares the compiled
+ * `WebAssembly.Module` across all `em-pthread` workers, and NEVER retains raw wire bytes.
+ */
+function createSharedWasmModuleCache(options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const modulesByKey = new Map();
+  const inFlightByKey = new Map();
+  const trackGlobalCount = safeOpts.trackGlobalCount === true;
+
+  const normalizeKey = (rawKey) => {
+    if (typeof rawKey !== 'string') {
+      return '';
+    }
+    const base = extractWasmBasename(rawKey) || rawKey.trim();
+    return base.toLowerCase();
+  };
+
+  const syncGlobalCount = () => {
+    if (trackGlobalCount) {
+      activeSharedWasmModuleCount = modulesByKey.size;
+    }
+  };
+
+  function setModule(nameOrUrl, mod) {
+    const key = normalizeKey(nameOrUrl);
+    if (!key || !isCompiledWasmModule(mod, safeOpts.wasmApi)) {
+      return false;
+    }
+    modulesByKey.set(key, mod);
+    syncGlobalCount();
+    return true;
+  }
+
+  function getModule(nameOrUrl) {
+    const key = normalizeKey(nameOrUrl);
+    return key ? modulesByKey.get(key) || null : null;
+  }
+
+  function hasModule(nameOrUrl) {
+    const key = normalizeKey(nameOrUrl);
+    return key ? modulesByKey.has(key) : false;
+  }
+
+  async function compileAndShare(nameOrUrl, source, callOpts = {}) {
+    const key = normalizeKey(nameOrUrl);
+    if (!key) {
+      throw new TypeError('Shared Wasm module key must be a non-empty string');
+    }
+    const existing = modulesByKey.get(key);
+    if (existing) {
+      // Even on cache hit, immediately release any raw wire bytes passed by caller.
+      if (callOpts && callOpts.owner && callOpts.ownerKey !== undefined) {
+        const info = getBinaryWireInfo(source, callOpts.wasmApi || safeOpts.wasmApi);
+        if (callOpts.owner instanceof Map) {
+          callOpts.owner.delete(callOpts.ownerKey);
+        } else if (isWritableOwnProp(callOpts.owner, callOpts.ownerKey)) {
+          callOpts.owner[callOpts.ownerKey] = null;
+        }
+        if (info && info.byteLength > 0) {
+          recordDroppedWasmWireBytes(info.byteLength, 1);
+        }
+      }
+      return existing;
+    }
+    const pending = inFlightByKey.get(key);
+    if (pending) {
+      return pending;
+    }
+    const promise = compileWasmModuleStreaming(source, {
+      wasmApi: callOpts.wasmApi || safeOpts.wasmApi,
+      fetchFn: callOpts.fetchFn || safeOpts.fetchFn,
+      signal: callOpts.signal,
+      allowStreamingWithoutContentType: callOpts.allowStreamingWithoutContentType,
+      owner: callOpts.owner,
+      ownerKey: callOpts.ownerKey,
+    })
+      .then((res) => {
+        if (res && res.module) {
+          modulesByKey.set(key, res.module);
+          syncGlobalCount();
+          return res.module;
+        }
+        return null;
+      })
+      .finally(() => {
+        inFlightByKey.delete(key);
+      });
+    inFlightByKey.set(key, promise);
+    return promise;
+  }
+
+  async function ingestPreloadedBuffers(container, callOpts = {}) {
+    if (!container || typeof container !== 'object') {
+      return [];
+    }
+    const compiled = [];
+    const entries =
+      container instanceof Map
+        ? Array.from(container.entries())
+        : Object.keys(container).map((k) => [k, container[k]]);
+    for (let i = 0; i < entries.length; i += 1) {
+      const [key, raw] = entries[i];
+      if (!raw) {
+        continue;
+      }
+      const wasmNs = callOpts.wasmApi || safeOpts.wasmApi;
+      if (isCompiledWasmModule(raw, wasmNs)) {
+        setModule(key, raw);
+        compiled.push(raw);
+        continue;
+      }
+      let wireCandidate = raw;
+      if (!getBinaryWireInfo(raw, wasmNs) && typeof raw === 'object') {
+        if (isCompiledWasmModule(raw.module, wasmNs)) {
+          setModule(key, raw.module);
+          compiled.push(raw.module);
+          releaseWireBytesFromObject(raw, { wasmApi: wasmNs, assumeWasm: true });
+          continue;
+        }
+        wireCandidate =
+          raw.wasmBinary || raw.wireBytes || raw.bytes || raw.buffer || raw.arrayBuffer || null;
+      }
+      if (getBinaryWireInfo(wireCandidate, wasmNs)) {
+        const mod = await compileAndShare(key, wireCandidate, {
+          ...callOpts,
+          owner: container,
+          ownerKey: key,
+        });
+        if (mod) {
+          compiled.push(mod);
+        }
+        if (raw && typeof raw === 'object' && raw !== wireCandidate) {
+          releaseWireBytesFromObject(raw, { wasmApi: wasmNs, assumeWasm: true });
+        }
+      }
+    }
+    return compiled;
+  }
+
+  function getSharedModulesArray() {
+    return Array.from(modulesByKey.values());
+  }
+
+  function getSharedModulesMap() {
+    return new Map(modulesByKey);
+  }
+
+  function clear() {
+    modulesByKey.clear();
+    inFlightByKey.clear();
+    syncGlobalCount();
+  }
+
+  return {
+    setModule,
+    getModule,
+    hasModule,
+    compileAndShare,
+    ingestPreloadedBuffers,
+    getSharedModulesArray,
+    getSharedModulesMap,
+    clear,
+    get size() {
+      return modulesByKey.size;
+    },
+    getStats() {
+      return {
+        sharedModuleCount: modulesByKey.size,
+        inFlightCompiles: inFlightByKey.size,
+      };
+    },
+  };
+}
+
 function createInstantiateWasmHandler(options = {}) {
   const locateFile =
     typeof options.locateFile === 'function' ? options.locateFile : (f) => `dist/${f}`;
@@ -2635,13 +3834,30 @@ function createInstantiateWasmHandler(options = {}) {
       : typeof fetch === 'function'
         ? fetch
         : null;
-  const wasmBinary = options.wasmBinary || null;
+  const wasmNs =
+    options.wasmApi && typeof options.wasmApi === 'object'
+      ? options.wasmApi
+      : typeof WebAssembly !== 'undefined'
+        ? WebAssembly
+        : null;
+  const precompiledModule = isCompiledWasmModule(options.wasmBinary, wasmNs)
+    ? options.wasmBinary
+    : null;
+  // Hold raw wire bytes in a mutable slot (never captured by `finish`) and clear immediately
+  // upon handing to `WebAssembly.instantiate` so the closure retains 0 wire bytes.
+  let pendingWireBytes = precompiledModule ? null : options.wasmBinary || null;
   const onError = typeof options.onError === 'function' ? options.onError : null;
+  const onMemory = typeof options.onMemory === 'function' ? options.onMemory : null;
 
   return function instantiateWasm(imports, receiveInstance) {
     const importedMemory = extractMemoryFromImports(imports);
-    if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
-      hostImports.setMemory(importedMemory);
+    if (importedMemory) {
+      if (hostImports && typeof hostImports.setMemory === 'function') {
+        hostImports.setMemory(importedMemory);
+      }
+      if (onMemory) {
+        onMemory(importedMemory);
+      }
     }
 
     const mergedImports = mergeHostImportsIntoWasmImports(
@@ -2654,17 +3870,14 @@ function createInstantiateWasmHandler(options = {}) {
       const mod =
         result && result.module
           ? result.module
-          : typeof WebAssembly !== 'undefined' && wasmBinary instanceof WebAssembly.Module
-            ? wasmBinary
-            : undefined;
-      if (
-        instance &&
-        instance.exports &&
-        instance.exports.memory &&
-        hostImports &&
-        typeof hostImports.setMemory === 'function'
-      ) {
-        hostImports.setMemory(instance.exports.memory);
+          : precompiledModule || undefined;
+      if (instance && instance.exports && instance.exports.memory) {
+        if (hostImports && typeof hostImports.setMemory === 'function') {
+          hostImports.setMemory(instance.exports.memory);
+        }
+        if (onMemory) {
+          onMemory(instance.exports.memory);
+        }
       }
       if (typeof receiveInstance === 'function') {
         receiveInstance(instance, mod);
@@ -2688,8 +3901,21 @@ function createInstantiateWasmHandler(options = {}) {
 
     const wasmUrl = locateFile('runtime.wasm');
     let instantiatePromise;
-    if (wasmBinary) {
-      instantiatePromise = WebAssembly.instantiate(wasmBinary, mergedImports);
+    if (precompiledModule) {
+      instantiatePromise = wasmNs.instantiate(precompiledModule, mergedImports);
+    } else if (pendingWireBytes) {
+      let localWireBytes = pendingWireBytes;
+      pendingWireBytes = null;
+      const wireInfo = getBinaryWireInfo(localWireBytes, wasmNs);
+      const wireLen = wireInfo ? wireInfo.byteLength : 0;
+      const rawPromise = wasmNs.instantiate(localWireBytes, mergedImports);
+      localWireBytes = null;
+      instantiatePromise = rawPromise.finally(() => {
+        if (wireLen > 0) {
+          recordDroppedWasmWireBytes(wireLen, 1);
+        }
+        wasmMemoryTelemetry.fallbackCompiles += 1;
+      });
     } else if (!fetchFn) {
       handleFailure(new Error(`fetch unavailable while loading ${wasmUrl}`));
       return {};
@@ -2705,14 +3931,34 @@ function createInstantiateWasmHandler(options = {}) {
             resp.headers && typeof resp.headers.get === 'function'
               ? String(resp.headers.get('content-type') || '')
               : '';
-          const canStream =
-            typeof WebAssembly.instantiateStreaming === 'function' &&
-            (typeof Response === 'undefined' || resp instanceof Response) &&
-            contentType.toLowerCase().includes('application/wasm');
-          if (canStream) {
-            return WebAssembly.instantiateStreaming(Promise.resolve(resp), mergedImports);
+          const isRealResponse = typeof Response === 'undefined' || resp instanceof Response;
+          const isWasmMime = contentType.toLowerCase().includes('application/wasm');
+          const canInstantiateStreaming =
+            typeof wasmNs.instantiateStreaming === 'function' && isRealResponse && isWasmMime;
+          if (canInstantiateStreaming) {
+            wasmMemoryTelemetry.streamingCompiles += 1;
+            return wasmNs.instantiateStreaming(Promise.resolve(resp), mergedImports);
           }
-          return resp.arrayBuffer().then((bytes) => WebAssembly.instantiate(bytes, mergedImports));
+          const canCompileStreaming =
+            typeof wasmNs.compileStreaming === 'function' && isRealResponse && isWasmMime;
+          if (canCompileStreaming) {
+            wasmMemoryTelemetry.streamingCompiles += 1;
+            return wasmNs.compileStreaming(Promise.resolve(resp)).then((mod) =>
+              wasmNs.instantiate(mod, mergedImports).then((instance) => ({ instance, module: mod })),
+            );
+          }
+          return resp.arrayBuffer().then((bytes) => {
+            let localBytes = bytes;
+            const wireLen = localBytes && typeof localBytes.byteLength === 'number' ? localBytes.byteLength : 0;
+            const p = wasmNs.instantiate(localBytes, mergedImports);
+            localBytes = null;
+            return p.finally(() => {
+              if (wireLen > 0) {
+                recordDroppedWasmWireBytes(wireLen, 1);
+              }
+              wasmMemoryTelemetry.fallbackCompiles += 1;
+            });
+          });
         });
     }
 
@@ -4873,15 +6119,69 @@ function buildRuntimeModuleConfig(options = {}) {
     options.httpfsClient !== undefined ? options.httpfsClient : httpfsClient;
   const activeUserdataStore =
     options.userdataStore !== undefined ? options.userdataStore : userdataStore;
-  const activeGpuWorker = options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
+  const resolveTargetGpuWorker = () =>
+    options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
+
+  // G66 / W360 read-back: the GPU worker writes ReadbackBuffer / ReadbackTexture results straight
+  // into the runtime's shared memory, so it must receive the current SharedArrayBuffer on ALL live
+  // paths (including SPSC gpu_ring, instantiateWasm, preRun, onRuntimeInitialized, and after any
+  // WebAssembly.Memory.grow() — O(1) reference equality check when unchanged).
+  let instantiatedMemory = null;
+  let attachedGuestMemory = null;
+  let attachedGuestMemoryWorker = null;
+  const resolveRuntimeMemory = (modOverride, memoryOverride) => {
+    const targetMod =
+      modOverride && typeof modOverride === 'object' ? modOverride : boundModule;
+    return (
+      memoryOverride ||
+      options.memory ||
+      (targetMod &&
+        (targetMod.wasmMemory ||
+          (targetMod.HEAPU8 && targetMod.HEAPU8.buffer) ||
+          (targetMod.HEAP32 && targetMod.HEAP32.buffer) ||
+          (targetMod.asm && targetMod.asm.memory) ||
+          (targetMod.wasmExports && targetMod.wasmExports.memory))) ||
+      instantiatedMemory ||
+      null
+    );
+  };
+  const attachGuestMemoryToGpuWorker = (modOverride, memoryOverride) => {
+    const targetWorker = resolveTargetGpuWorker();
+    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
+      return false;
+    }
+    let buffer = null;
+    try {
+      buffer = resolveBuffer(resolveRuntimeMemory(modOverride, memoryOverride));
+    } catch {
+      buffer = null;
+    }
+    if (
+      !buffer ||
+      (buffer === attachedGuestMemory && targetWorker === attachedGuestMemoryWorker) ||
+      typeof SharedArrayBuffer === 'undefined' ||
+      !(buffer instanceof SharedArrayBuffer)
+    ) {
+      return false;
+    }
+    attachedGuestMemory = buffer;
+    attachedGuestMemoryWorker = targetWorker;
+    targetWorker.postMessage({ type: 'attach-guest-memory', buffer });
+    return true;
+  };
+  // Attach immediately when options.memory is already a SharedArrayBuffer / shared Wasm memory.
+  attachGuestMemoryToGpuWorker();
 
   const wgpuSubmit =
     typeof options.wgpuSubmit === 'function'
       ? options.wgpuSubmit
       : (bytes) => {
-          if (!activeGpuWorker) return;
-          const copy = bytes.slice().buffer;
-          activeGpuWorker.postMessage({ cmdBuffer: copy }, [copy]);
+          const targetWorker = resolveTargetGpuWorker();
+          if (!targetWorker || typeof targetWorker.postMessage !== 'function') return;
+          const cmdBuffer = toTransferableArrayBuffer(bytes);
+          if (!cmdBuffer) return;
+          attachGuestMemoryToGpuWorker();
+          targetWorker.postMessage({ cmdBuffer }, [cmdBuffer]);
         };
 
   const userLogFn =
@@ -4925,11 +6225,11 @@ function buildRuntimeModuleConfig(options = {}) {
       ? options.hostImports
       : createHostImports({
           memory: options.memory || null,
-          getMemory: () =>
-            options.memory ||
-            (boundModule &&
-              (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
-            null,
+          getMemory: () => {
+            const mem = resolveRuntimeMemory();
+            attachGuestMemoryToGpuWorker(null, mem);
+            return mem;
+          },
           log: logFn,
           report: activeReportFn,
           wgpuSubmit,
@@ -5058,17 +6358,16 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const preRun = Array.isArray(options.preRun)
-    ? pipelineDumpSyncer && pipelineDumpSyncer.enabled
-      ? [
-          (mod) => {
-            if (mod && !boundModule) {
-              boundModule = mod;
-            }
-            attachPipelineDumpSyncer(mod);
-          },
-          ...options.preRun,
-        ]
-      : options.preRun
+    ? [
+        (mod) => {
+          if (mod && !boundModule) {
+            boundModule = mod;
+          }
+          attachGuestMemoryToGpuWorker(mod);
+          attachPipelineDumpSyncer(mod);
+        },
+        ...options.preRun,
+      ]
     : [
         (mod) => {
           boundModule = mod || null;
@@ -5082,6 +6381,7 @@ function buildRuntimeModuleConfig(options = {}) {
           ) {
             activeHostImports.setMemory(mod.wasmMemory || mod.HEAPU8.buffer);
           }
+          attachGuestMemoryToGpuWorker(mod);
           attachPipelineDumpSyncer(mod);
           if (!activeUserdataStore || !mod || !mod.FS) return;
           const useRunDep =
@@ -5115,16 +6415,6 @@ function buildRuntimeModuleConfig(options = {}) {
   const activeInputSab = options.inputSab !== undefined ? options.inputSab : inputSab;
   let activeInputBridge = null;
 
-  const resolveRuntimeMemory = () =>
-    options.memory ||
-    (boundModule &&
-      (boundModule.wasmMemory ||
-        (boundModule.HEAPU8 && boundModule.HEAPU8.buffer) ||
-        (boundModule.HEAP32 && boundModule.HEAP32.buffer) ||
-        (boundModule.asm && boundModule.asm.memory) ||
-        (boundModule.wasmExports && boundModule.wasmExports.memory))) ||
-    null;
-
   const stopInputBridge = () => {
     if (activeInputBridge) {
       try {
@@ -5147,15 +6437,11 @@ function buildRuntimeModuleConfig(options = {}) {
     const bridge = startInputSabBridge({
       inputSab: activeInputSab,
       module: targetMod,
-      getMemory: () =>
-        resolveRuntimeMemory() ||
-        (targetMod &&
-          (targetMod.wasmMemory ||
-            (targetMod.HEAPU8 && targetMod.HEAPU8.buffer) ||
-            (targetMod.HEAP32 && targetMod.HEAP32.buffer) ||
-            (targetMod.asm && targetMod.asm.memory) ||
-            (targetMod.wasmExports && targetMod.wasmExports.memory))) ||
-        null,
+      getMemory: () => {
+        const mem = resolveRuntimeMemory(targetMod);
+        attachGuestMemoryToGpuWorker(targetMod, mem);
+        return mem;
+      },
       pollIntervalMs: options.inputPollIntervalMs,
     });
     if (bridge && bridge.active) {
@@ -5277,6 +6563,9 @@ function buildRuntimeModuleConfig(options = {}) {
     stopInputBridge();
     audioRingController.destroy();
     boundModule = null;
+    instantiatedMemory = null;
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -5286,6 +6575,8 @@ function buildRuntimeModuleConfig(options = {}) {
   const resetRuntimeConfig = () => {
     stopInputBridge();
     audioRingController.reset();
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
   };
 
   const userOnRuntimeInitialized =
@@ -5297,6 +6588,17 @@ function buildRuntimeModuleConfig(options = {}) {
     if (mod && !boundModule) {
       boundModule = mod;
     }
+    // W351 (#1077): Drop raw Emscripten `Module.wasmBinary` wire bytes once compiled/initialized.
+    if (mod && typeof mod === 'object' && Object.prototype.hasOwnProperty.call(mod, 'wasmBinary')) {
+      const binInfo = getBinaryWireInfo(mod.wasmBinary);
+      if (binInfo && isWritableOwnProp(mod, 'wasmBinary')) {
+        mod.wasmBinary = null;
+        if (binInfo.byteLength > 0) {
+          recordDroppedWasmWireBytes(binInfo.byteLength, 1);
+        }
+      }
+    }
+    attachGuestMemoryToGpuWorker(mod);
     attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
     attachAudioRing(mod);
@@ -5310,6 +6612,9 @@ function buildRuntimeModuleConfig(options = {}) {
     stopInputBridge();
     resetAudioRingAttachment();
     boundModule = null;
+    instantiatedMemory = null;
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -5335,6 +6640,7 @@ function buildRuntimeModuleConfig(options = {}) {
       ? options.httpfsMailboxSabs.slice()
       : httpfsMailboxSabs.slice(),
     inputSab: activeInputSab,
+    attachGuestMemory: attachGuestMemoryToGpuWorker,
     attachInputBridge,
     stopInputBridge,
     getInputBridge: () => activeInputBridge,
@@ -5372,6 +6678,13 @@ function buildRuntimeModuleConfig(options = {}) {
     config.dynamicLibraries = combinedDynamicLibraries.slice();
     config.sideModuleUrls = resolvedSideModuleUrls.slice();
   }
+  if (Array.isArray(options.sharedModules) && options.sharedModules.length > 0) {
+    stripWireBytesFromSharedModules(options.sharedModules);
+    const compiledOnly = options.sharedModules.filter((entry) => isCompiledWasmModule(entry));
+    if (compiledOnly.length > 0) {
+      config.sharedModules = compiledOnly;
+    }
+  }
   if (manifestSummary) {
     config.indirectDispatch = manifestSummary.indirectDispatch;
     config.wasmMetrics = manifestSummary.wasmMetrics
@@ -5400,6 +6713,10 @@ function buildRuntimeModuleConfig(options = {}) {
       fetchFn: options.fetchFn,
       wasmBinary: options.wasmBinary,
       onError: options.onWasmError,
+      onMemory: (mem) => {
+        instantiatedMemory = mem || null;
+        attachGuestMemoryToGpuWorker(null, mem);
+      },
     });
   }
 
@@ -5586,6 +6903,12 @@ function createPthreadPoolCoordinator(options = {}) {
         : null;
   const onPthreadTxMessage =
     typeof options.onPthreadTxMessage === 'function' ? options.onPthreadTxMessage : null;
+  const getSharedModules =
+    typeof options.getSharedModules === 'function'
+      ? options.getSharedModules
+      : Array.isArray(options.sharedModules)
+        ? () => options.sharedModules
+        : null;
   const explicitMessageChannelCtor = options.MessageChannelCtor;
   const onTelemetryChange =
     typeof options.onTelemetryChange === 'function' ? options.onTelemetryChange : null;
@@ -6063,6 +7386,41 @@ function createPthreadPoolCoordinator(options = {}) {
         }
         if (isPthreadLoadMessage(msg)) {
           if (entry.state === 'spawned') {
+            // W351 (#1077): Share compiled WebAssembly.Module objects across pthreads and never
+            // carry or clone raw wire-byte ArrayBuffers alongside compiled modules in CMD_LOAD.
+            if (msg && typeof msg === 'object') {
+              if (msg.sharedModules) {
+                stripWireBytesFromSharedModules(msg.sharedModules);
+              } else if (getSharedModules) {
+                const shared = getSharedModules();
+                if (Array.isArray(shared) && shared.length > 0) {
+                  const compiledOnly = shared.filter((m) => isCompiledWasmModule(m));
+                  if (compiledOnly.length > 0) {
+                    msg.sharedModules = compiledOnly;
+                  }
+                }
+              }
+              if (isCompiledWasmModule(msg.wasmModule)) {
+                if (
+                  Object.prototype.hasOwnProperty.call(msg, 'wasmBinary') &&
+                  getBinaryWireInfo(msg.wasmBinary)
+                ) {
+                  const info = getBinaryWireInfo(msg.wasmBinary);
+                  if (isWritableOwnProp(msg, 'wasmBinary')) {
+                    msg.wasmBinary = null;
+                    if (info && info.byteLength > 0) {
+                      recordDroppedWasmWireBytes(info.byteLength, 1);
+                    }
+                  }
+                }
+                if (msg.guestModuleBytes) {
+                  releaseWireBytesFromObject(msg.guestModuleBytes, { assumeWasm: true });
+                }
+                if (msg.preloadedBuffers) {
+                  releaseWireBytesFromObject(msg.preloadedBuffers, { assumeWasm: true });
+                }
+              }
+            }
             entry.loadArgs = callArgs;
             enqueueLoad(entry);
             emitTelemetry();
@@ -6231,32 +7589,63 @@ let configuredDumpMaxConcurrentUploads = undefined;
 let activeCoordinatorPipelineDumpSyncer = null;
 let activeGuestManifestSummary = null;
 let activeSideModuleProgressGetter = null;
+let pendingPreloadedWasmBinary = null;
+let pendingPreloadedGuestBuffers = null;
+const coordinatorSharedWasmModules = createSharedWasmModuleCache({ trackGlobalCount: true });
 
+function attachActiveCoordinatorGuestMemory(modOverride) {
+  if (
+    activeCoordinatorModuleConfig &&
+    typeof activeCoordinatorModuleConfig.attachGuestMemory === 'function'
+  ) {
+    try {
+      return activeCoordinatorModuleConfig.attachGuestMemory(
+        modOverride !== undefined ? modOverride : activeCoordinatorRuntimeModule,
+      );
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+// W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
+// so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
+// and `pthreadActiveTxPorts` telemetry stay intact, while transferring the received
+// `ArrayBuffer` straight through to `gpuWorker` with zero extra copy.
 function handlePthreadWgpuSubmit(data, options = {}) {
   const raw =
     data &&
     typeof data === 'object' &&
-    !(data instanceof ArrayBuffer) &&
+    !isTransferableArrayBuffer(data) &&
+    !isSharedArrayBuffer(data) &&
     !ArrayBuffer.isView(data)
       ? data.cmdBuffer || data.bytes || null
       : data;
-  const view = asDataView(raw);
-  if (!view || view.byteLength === 0) {
+  let transferBuf = null;
+  if (options.ownedArrayBuffer !== false && isTransferableArrayBuffer(raw)) {
+    if (raw.byteLength === 0) {
+      return false;
+    }
+    transferBuf = raw;
+  } else {
+    const view = asDataView(raw);
+    if (!view || view.byteLength === 0) {
+      return false;
+    }
+    if (options.ownedArrayBuffer !== false) {
+      transferBuf = toTransferableArrayBuffer(raw);
+    } else {
+      const copyBytes = new Uint8Array(view.byteLength);
+      copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+      transferBuf = copyBytes.buffer;
+    }
+  }
+  if (!transferBuf || transferBuf.byteLength === 0) {
     return false;
   }
-  let transferBuf;
-  let inspectBytes;
-  if (options.ownedArrayBuffer && raw instanceof ArrayBuffer) {
-    transferBuf = raw;
-    inspectBytes = new Uint8Array(raw);
-  } else {
-    const copyBytes = new Uint8Array(view.byteLength);
-    copyBytes.set(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
-    transferBuf = copyBytes.buffer;
-    inspectBytes = copyBytes;
-  }
   if (!coordinatorFirstPresentEmitted) {
-    const info = inspectGpuPacketBatchForPresent(inspectBytes);
+    const info = inspectGpuPacketBatchForPresent(transferBuf);
     if (info.hasPresent) {
       coordinatorFirstPresentEmitted = true;
       if (
@@ -6273,6 +7662,7 @@ function handlePthreadWgpuSubmit(data, options = {}) {
     }
   }
   if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
+    attachActiveCoordinatorGuestMemory();
     gpuWorker.postMessage({ cmdBuffer: transferBuf }, [transferBuf]);
     return true;
   }
@@ -6301,6 +7691,7 @@ function handlePthreadTxMessage(data) {
 const coordinatorPthreadPool = createPthreadPoolCoordinator({
   getHttpfsMailboxSab: () => httpfsMailboxSab,
   getHttpfsMailboxSabs: () => httpfsMailboxSabs,
+  getSharedModules: () => coordinatorSharedWasmModules.getSharedModulesArray(),
   onPthreadTxMessage: handlePthreadTxMessage,
 });
 
@@ -6368,6 +7759,13 @@ function getLoaderStatus() {
     audioRingRetryCount: audioRingTelemetry ? audioRingTelemetry.audioRingRetryCount : 0,
     audioRingLastReason: audioRingTelemetry ? audioRingTelemetry.audioRingLastReason : null,
     renderStateStats: lastRenderStateStats ? Object.assign({}, lastRenderStateStats) : null,
+    wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
+    droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
+    droppedPreloadBuffers: wasmMemoryTelemetry.droppedPreloadBuffers,
+    transferredArrayBuffers: wasmMemoryTelemetry.transferredArrayBuffers,
+    streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
+    fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
+    sharedModuleCount: coordinatorSharedWasmModules.size,
   };
 }
 
@@ -6416,12 +7814,29 @@ async function tryBootWasmRuntime() {
     report('Loading Emscripten Wasm64 runtime (dist/runtime.js)...');
     importScripts('./dist/runtime.js');
     if (typeof self.createRuntimeModule === 'function') {
+      if (pendingPreloadedGuestBuffers) {
+        const toIngest = pendingPreloadedGuestBuffers;
+        pendingPreloadedGuestBuffers = null;
+        try {
+          await coordinatorSharedWasmModules.ingestPreloadedBuffers(toIngest, { fetchFn: fetch });
+        } finally {
+          releaseWireBytesFromObject(toIngest, { assumeWasm: true });
+        }
+      }
+
       const runtimeOptions = {
         onFirstPresent: () => {
           coordinatorFirstPresentEmitted = true;
         },
-        onExit: () => {
+        onExit: (status) => {
+          const relaunch = guestRelaunchPayload(status);
+          if (relaunch) {
+            postProgress(relaunch);
+          }
           coordinatorPthreadPool.closeTxPorts();
+          coordinatorSharedWasmModules.clear();
+          pendingPreloadedWasmBinary = null;
+          pendingPreloadedGuestBuffers = null;
           activeCoordinatorRuntimeModule = null;
           activeCoordinatorModuleConfig = null;
         },
@@ -6431,6 +7846,14 @@ async function tryBootWasmRuntime() {
           postProgress({ error: `runtime wasm: ${err}` });
         },
       };
+      if (pendingPreloadedWasmBinary) {
+        runtimeOptions.wasmBinary = pendingPreloadedWasmBinary;
+        pendingPreloadedWasmBinary = null;
+      }
+      const precompiledSharedModules = coordinatorSharedWasmModules.getSharedModulesArray();
+      if (precompiledSharedModules.length > 0) {
+        runtimeOptions.sharedModules = precompiledSharedModules;
+      }
       if (manifestSummary) {
         runtimeOptions.guestManifest = manifestSummary;
       }
@@ -6493,6 +7916,9 @@ async function tryBootWasmRuntime() {
       }
       const runtimeMod = await self.createRuntimeModule(moduleConfig);
       activeCoordinatorRuntimeModule = runtimeMod;
+      if (typeof moduleConfig.attachGuestMemory === 'function') {
+        moduleConfig.attachGuestMemory(runtimeMod);
+      }
       if (typeof moduleConfig.attachInputBridge === 'function') {
         const attached = moduleConfig.attachInputBridge(runtimeMod);
         if (attached && attached.active) {
@@ -6646,6 +8072,18 @@ if (typeof self !== 'undefined') {
       gpuWorker.postMessage({ resize: true, width: msg.width, height: msg.height });
       return;
     }
+    if (
+      (msg.attachRing ||
+        msg.drainRing ||
+        msg.type === 'attach-ring' ||
+        msg.type === 'drain-ring') &&
+      gpuWorker &&
+      typeof gpuWorker.postMessage === 'function'
+    ) {
+      attachActiveCoordinatorGuestMemory();
+      gpuWorker.postMessage(msg);
+      return;
+    }
 
     if (!msg.canvas) return;
     coordinatorPthreadPool.closeTxPorts();
@@ -6751,10 +8189,20 @@ if (typeof self !== 'undefined') {
       const data = e && e.data;
       if (!data || typeof data !== 'object') return;
       if (data.ready) {
+        attachActiveCoordinatorGuestMemory();
         onWorkerReady('wgpu_worker', data.adapter);
         return;
       }
+      if (data.ringAttached) {
+        attachActiveCoordinatorGuestMemory();
+      }
+      if (data.type === 'first-visible-frame' || data.type === 'visible-frame') {
+        attachActiveCoordinatorGuestMemory();
+        forwardGpuWorkerMessage(data, postToMain);
+        return;
+      }
       if (data.frame) {
+        attachActiveCoordinatorGuestMemory();
         if (
           activeCoordinatorModuleConfig &&
           typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
@@ -6797,8 +8245,45 @@ if (typeof self !== 'undefined') {
       }
     };
 
-    const workerInits = createWorkerBootInitPayloads(msg);
-    ioWorker.postMessage(workerInits.ioInit);
+    const workerInits = createWorkerBootInitPayloadsWithTransfers(msg);
+    if (workerInits.transferredArrayBufferCount > 0) {
+      recordTransferredArrayBuffers(workerInits.transferredArrayBufferCount);
+    }
+
+    // Consume any preloaded Wasm binary / side-module wire buffers from `msg` and immediately
+    // null out all raw binary properties on `msg` so `self.onmessage`'s closure retains 0 bytes.
+    coordinatorSharedWasmModules.clear();
+    pendingPreloadedWasmBinary =
+      msg.wasmBinary !== undefined && msg.wasmBinary !== null ? msg.wasmBinary : null;
+    if (msg.wasmBinary !== undefined && isWritableOwnProp(msg, 'wasmBinary')) {
+      msg.wasmBinary = null;
+    }
+    if (Array.isArray(msg.sharedModules)) {
+      stripWireBytesFromSharedModules(msg.sharedModules);
+      for (let i = 0; i < msg.sharedModules.length; i += 1) {
+        if (isCompiledWasmModule(msg.sharedModules[i])) {
+          coordinatorSharedWasmModules.setModule(`shared_${i}.wasm`, msg.sharedModules[i]);
+        }
+      }
+    }
+    pendingPreloadedGuestBuffers = null;
+    if (msg.guestModuleBytes && typeof msg.guestModuleBytes === 'object') {
+      pendingPreloadedGuestBuffers = msg.guestModuleBytes;
+      if (isWritableOwnProp(msg, 'guestModuleBytes')) {
+        msg.guestModuleBytes = null;
+      }
+    } else if (msg.preloadedBuffers && typeof msg.preloadedBuffers === 'object') {
+      pendingPreloadedGuestBuffers = msg.preloadedBuffers;
+      if (isWritableOwnProp(msg, 'preloadedBuffers')) {
+        msg.preloadedBuffers = null;
+      }
+    }
+
+    if (workerInits.ioTransferList.length > 0) {
+      ioWorker.postMessage(workerInits.ioInit, workerInits.ioTransferList);
+    } else {
+      ioWorker.postMessage(workerInits.ioInit);
+    }
     if (httpfsMailboxSab) {
       const attachMailboxMsg = { attachMailbox: true, sab: httpfsMailboxSab };
       if (httpfsMailboxSabs.length > 0) {
@@ -6806,8 +8291,19 @@ if (typeof self !== 'undefined') {
       }
       ioWorker.postMessage(attachMailboxMsg);
     }
-    gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
+    if (workerInits.gpuTransferList.length > 0) {
+      gpuWorker.postMessage(workerInits.gpuInit, workerInits.gpuTransferList);
+    } else {
+      gpuWorker.postMessage(workerInits.gpuInit, [msg.canvas]);
+    }
     audioWorker.postMessage({ init: true });
+
+    // Clear all binary buffer references from `msg` and `workerInits` immediately after handoff.
+    releaseWireBytesFromObject(msg, { recordTelemetry: false });
+    workerInits.ioInit = null;
+    workerInits.gpuInit = null;
+    workerInits.ioTransferList = null;
+    workerInits.gpuTransferList = null;
   };
 }
 
@@ -6856,12 +8352,20 @@ const exportedApi = {
   installPthreadWorkerProxy,
   getPthreadTelemetry,
   getLoaderStatus,
+  getWasmMemoryTelemetry,
+  resetWasmMemoryTelemetry,
+  collectTransferableArrayBuffers,
+  releaseWireBytesFromObject,
+  stripWireBytesFromSharedModules,
+  compileWasmModuleStreaming,
+  createSharedWasmModuleCache,
   parseGuestManifest,
   loadGuestManifest,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
+  createWorkerBootInitPayloadsWithTransfers,
   forwardGpuWorkerMessage,
   sanitizeRenderStateStats,
   createHostImports,
@@ -6882,7 +8386,11 @@ const exportedApi = {
   createRuntimeModuleOptions,
   encodeTestFramePacket,
   postBroadcastOnce,
+  toTransferableArrayBuffer,
   ptrToNumber,
+  RELAUNCH_SELF_EXIT_CODE,
+  GUEST_RELAUNCH_MESSAGE_TYPE,
+  guestRelaunchPayload,
 };
 
 if (typeof globalThis !== 'undefined') {

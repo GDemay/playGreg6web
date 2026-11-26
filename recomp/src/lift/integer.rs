@@ -7,7 +7,7 @@
 use iced_x86::{Code, Instruction, Mnemonic, OpKind, Register};
 
 use super::{Flag, FunctionLifter, R, RBP, RSP, imm, unsupported};
-use crate::lift::{GUEST_STATE_TYPE, RuntimeHelper, Support};
+use crate::lift::{RuntimeHelper, Support};
 
 pub(super) const RAX: usize = 0;
 pub(super) const RCX: usize = 1;
@@ -127,6 +127,7 @@ impl FunctionLifter<'_> {
             M::Xgetbv => self.runtime_helper(RuntimeHelper::Xgetbv),
             // Ordering only: one sequentially consistent fence (`atomic.fence` on wasm).
             M::Mfence | M::Lfence | M::Sfence => {
+                self.clear_window_cache();
                 self.support.insert(Support::Atomics);
                 self.emit("fence seq_cst");
                 Ok(())
@@ -134,6 +135,7 @@ impl FunctionLifter<'_> {
             // `pause` marks a spin-wait: a compiler barrier, like every loop header (see
             // `LOOP_BARRIER`).
             M::Pause => {
+                self.clear_window_cache();
                 self.emit(crate::lift::LOOP_BARRIER);
                 Ok(())
             }
@@ -167,9 +169,7 @@ impl FunctionLifter<'_> {
     /// DF is not cached in an alloca: it lives only in the guest state (it changes rarely and
     /// is read only by string instructions and `pushfq`).
     fn df_ptr(&mut self) -> String {
-        self.val(&format!(
-            "getelementptr inbounds {GUEST_STATE_TYPE}, ptr %state, i64 0, i32 2, i64 {DF_INDEX}"
-        ))
+        self.state_ptr(2, Some(DF_INDEX as usize))
     }
 
     /// Loads DF as an `i1`.
@@ -407,6 +407,7 @@ impl FunctionLifter<'_> {
     /// the helper reads/writes the state's GPRs (see the module docs for each contract) and the
     /// registers are reloaded.
     fn runtime_helper(&mut self, helper: RuntimeHelper) -> R<()> {
+        self.clear_window_cache();
         self.support.insert(Support::Helper(helper));
         self.sync_out();
         self.emit(&format!("call void @{}(ptr %state)", helper.symbol()));

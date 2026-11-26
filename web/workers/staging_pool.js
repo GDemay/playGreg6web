@@ -7,6 +7,8 @@
 
 (function (root) {
   const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024; // 4 MiB
+  const DEFAULT_MAX_WRITE_CHUNK_BYTES = 4 * 1024 * 1024; // 4 MiB cap per queue.writeBuffer / chunked buffer upload
+  const DEFAULT_MAX_SCRATCH_BYTES = 16 * 1024 * 1024; // 16 MiB cap for reusable CPU upload scratch
   const DEFAULT_MAX_POOL_BYTES = 64 * 1024 * 1024; // 64 MiB
   const DEFAULT_FRAMES_IN_FLIGHT = 3;
   const DEFAULT_MAX_FRAMES_IN_FLIGHT = DEFAULT_FRAMES_IN_FLIGHT;
@@ -362,9 +364,12 @@
     };
   }
 
-  function normalizeOrigin(origin) {
+  function fillNormalizedOriginInto(target, origin) {
     if (origin === undefined || origin === null) {
-      return { x: 0, y: 0, z: 0 };
+      target.x = 0;
+      target.y = 0;
+      target.z = 0;
+      return target;
     }
     if (Array.isArray(origin)) {
       const x = origin[0] ?? 0;
@@ -373,7 +378,10 @@
       assertNonNegativeInteger(x, 'origin[0]');
       assertNonNegativeInteger(y, 'origin[1]');
       assertNonNegativeInteger(z, 'origin[2]');
-      return { x, y, z };
+      target.x = x;
+      target.y = y;
+      target.z = z;
+      return target;
     }
     if (typeof origin === 'object') {
       const x = origin.x ?? 0;
@@ -382,7 +390,10 @@
       assertNonNegativeInteger(x, 'origin.x');
       assertNonNegativeInteger(y, 'origin.y');
       assertNonNegativeInteger(z, 'origin.z');
-      return { x, y, z };
+      target.x = x;
+      target.y = y;
+      target.z = z;
+      return target;
     }
     throw new TypeError('origin must be an object { x, y, z } or [x, y, z] array');
   }
@@ -422,6 +433,8 @@
         maxBucketBytes = DEFAULT_POW2_MAX_BUCKET_BYTES,
         largeSlabMinBytes,
         largeSlabBuckets,
+        maxWriteChunkBytes = DEFAULT_MAX_WRITE_CHUNK_BYTES,
+        maxScratchBytes = DEFAULT_MAX_SCRATCH_BYTES,
         now,
       } = options;
 
@@ -478,6 +491,9 @@
       assertNonNegativeInteger(idleShrinkFrames, 'idleShrinkFrames');
       assertNonNegativeInteger(maxLargeSlabs, 'maxLargeSlabs');
       assertPositiveInteger(maxBucketBytes, 'maxBucketBytes');
+      assertPositiveInteger(maxWriteChunkBytes, 'maxWriteChunkBytes');
+      assertNonNegativeInteger(maxScratchBytes, 'maxScratchBytes');
+      const resolvedMaxWriteChunkBytes = alignBufferSize(maxWriteChunkBytes);
 
       if (maxSlabsPerBucket !== undefined && maxSlabsPerBucket !== null) {
         assertNonNegativeInteger(maxSlabsPerBucket, 'maxSlabsPerBucket');
@@ -608,6 +624,8 @@
       this.maxBucketBytes = maxBucketBytes;
       this.largeSlabMinBytes = resolvedLargeSlabMinBytes;
       this.largeSlabBuckets = resolvedLargeSlabBuckets;
+      this.maxWriteChunkBytes = resolvedMaxWriteChunkBytes;
+      this.maxScratchBytes = maxScratchBytes;
       this._now = now || defaultNowMs;
 
       this._destroyed = false;
@@ -627,6 +645,7 @@
       this._currentChunk = null;
       this._pendingMapPromises = new Set();
       this._lastAcquireFresh = false;
+      this._uploadScratch = null;
       this._internalSliceScratch = {
         buffer: null,
         offset: 0,
@@ -635,6 +654,29 @@
         isLargeSlab: false,
         slabBucketSize: 0,
         view: undefined,
+      };
+      this._texCopyOrigin = { x: 0, y: 0, z: 0 };
+      this._texCopySource = {
+        buffer: null,
+        offset: 0,
+        bytesPerRow: 0,
+        rowsPerImage: 0,
+      };
+      this._texCopyDest = {
+        texture: null,
+        mipLevel: 0,
+        origin: this._texCopyOrigin,
+      };
+      this._texCopyDestWithAspect = {
+        texture: null,
+        mipLevel: 0,
+        origin: this._texCopyOrigin,
+        aspect: 'all',
+      };
+      this._texCopySize = {
+        width: 1,
+        height: 1,
+        depthOrArrayLayers: 1,
       };
 
       // Pool-wide telemetry.
@@ -668,6 +710,9 @@
       this._stallAvoidedCount = 0;
       this._zeroAllocAcquires = 0;
       this._sceneTransitionTrimBytes = 0;
+      this._chunkedWrites = 0;
+      this._trimmedStagingBytes = 0;
+      this._destroyedBuffers = 0;
 
       // Upload throughput & per-frame telemetry.
       this._framesCompleted = 0;
@@ -817,6 +862,7 @@
       if (reclaimedChunks > 0) {
         this._reclaimedChunks += reclaimedChunks;
         this._reclaimedBytes += reclaimedBytes;
+        this._trimmedStagingBytes += reclaimedBytes;
       }
 
       return { reclaimedChunks, reclaimedBytes };
@@ -940,6 +986,7 @@
       this._allocatedBytes = Math.max(0, this._allocatedBytes - chunk.size);
       if (chunk.buffer && typeof chunk.buffer.destroy === 'function') {
         chunk.buffer.destroy();
+        this._destroyedBuffers += 1;
       }
     }
 
@@ -1131,6 +1178,7 @@
       if (shrunkSlabs > 0) {
         this._reclaimedChunks += shrunkSlabs;
         this._reclaimedBytes += shrunkBytes;
+        this._trimmedStagingBytes += shrunkBytes;
       }
 
       return { shrunkSlabs, shrunkBytes };
@@ -1236,7 +1284,9 @@
         this._reclaimedChunks += reclaimedSlabs;
         this._reclaimedBytes += reclaimedBytes;
         this._sceneTransitionTrimBytes += reclaimedBytes;
+        this._trimmedStagingBytes += reclaimedBytes;
       }
+      this._uploadScratch = null;
 
       if (reclaimedInFlight > 0) {
         this._enforceLargeSlabCap();
@@ -1348,6 +1398,7 @@
       if (reclaimedChunks > 0) {
         this._reclaimedChunks += reclaimedChunks;
         this._reclaimedBytes += reclaimedBytes;
+        this._trimmedStagingBytes += reclaimedBytes;
       }
 
       return { reclaimedChunks, reclaimedBytes };
@@ -2115,10 +2166,50 @@
       return this.allocate(byteSize, alignmentOrOptions, out);
     }
 
+    _acquireUploadScratch(requiredBytes) {
+      if (requiredBytes <= 0) {
+        return null;
+      }
+      if (this._uploadScratch && this._uploadScratch.byteLength >= requiredBytes) {
+        return this._uploadScratch;
+      }
+      if (requiredBytes > this.maxScratchBytes) {
+        return null;
+      }
+      const allocBytes = this._uploadScratch
+        ? Math.min(this.maxScratchBytes, Math.max(requiredBytes, this._uploadScratch.byteLength * 2))
+        : requiredBytes;
+      this._uploadScratch = new Uint8Array(allocBytes);
+      return this._uploadScratch;
+    }
+
+    _writeBufferChunked(dstBuffer, dstOffset, bytes) {
+      const len = bytes.byteLength;
+      if (len === 0) {
+        return false;
+      }
+      const chunkMax = this.maxWriteChunkBytes;
+      if (len <= chunkMax) {
+        this.device.queue.writeBuffer(dstBuffer, dstOffset, bytes);
+        return false;
+      }
+      for (let off = 0; off < len; off += chunkMax) {
+        const chunkLen = Math.min(chunkMax, len - off);
+        this.device.queue.writeBuffer(dstBuffer, dstOffset + off, bytes.subarray(off, off + chunkLen));
+      }
+      this._chunkedWrites += 1;
+      return true;
+    }
+
     /**
      * Stage `srcBytes` into the pool (with 4-byte aligned length per WebGPU
      * `copyBufferToBuffer` requirements and SharedArrayBuffer-safe copies) and
      * record `encoder.copyBufferToBuffer(...)`.
+     *
+     * Uploads larger than `maxWriteChunkBytes` (default 4 MiB) are automatically
+     * split across bounded staging slices & chunked `queue.writeBuffer` calls so
+     * Dawn's internal upload ring and pool chunks never spike to multi-hundred-MiB
+     * allocations.
      *
      * Supports both `device.queue.writeBuffer` staging-ring mode and mapped
      * `copyBufferToBuffer` mode transparently. Pass an optional `out` scratch
@@ -2181,41 +2272,118 @@
 
       const copySize = alignBufferSize(src.byteLength);
       const needsPad = copySize !== src.byteLength;
-      const slice = this._allocateInternal(
-        copySize,
-        WEBGPU_BUFFER_COPY_ALIGNMENT,
-        this._internalSliceScratch,
-        false
-      );
-      const sliceBuffer = slice.buffer;
-      const sliceOffset = slice.offset;
-      const sliceView = slice.view;
-      this._internalSliceScratch.buffer = null;
-      this._internalSliceScratch.view = undefined;
+      const fromSab = isSharedBuffer(src.buffer);
+      const chunkMax = this.maxWriteChunkBytes;
 
-      if (sliceView) {
-        sliceView.set(src, 0);
-        if (needsPad) {
-          sliceView.fill(0, src.byteLength, copySize);
-          this._alignPadCount += 1;
-        }
-      } else {
-        if (!this.device.queue || typeof this.device.queue.writeBuffer !== 'function') {
-          throw new TypeError(
-            'stageBufferUpload in writeBuffer mode requires device.queue.writeBuffer()'
-          );
-        }
-        const prepared = sanitizeWriteBufferPayload(src);
-        this.device.queue.writeBuffer(sliceBuffer, sliceOffset, prepared.bytes);
-        if (prepared.padded) {
-          this._alignPadCount += 1;
-        }
-        if (prepared.copiedFromSab) {
-          this._sabCopyCount += 1;
-        }
+      if (
+        this.mode !== STAGING_MODE.MAPPED &&
+        (!this.device.queue || typeof this.device.queue.writeBuffer !== 'function')
+      ) {
+        throw new TypeError(
+          'stageBufferUpload in writeBuffer mode requires device.queue.writeBuffer()'
+        );
       }
 
-      encoder.copyBufferToBuffer(sliceBuffer, sliceOffset, dstBuffer, dstOffset, copySize);
+      let firstBuffer = null;
+      let firstOffset = 0;
+
+      if (copySize > chunkMax) {
+        for (let off = 0; off < src.byteLength; off += chunkMax) {
+          const rawChunkLen = Math.min(chunkMax, src.byteLength - off);
+          const alignedChunkLen = alignBufferSize(rawChunkLen);
+          const chunkNeedsPad = alignedChunkLen !== rawChunkLen;
+          const slice = this._allocateInternal(
+            alignedChunkLen,
+            WEBGPU_BUFFER_COPY_ALIGNMENT,
+            this._internalSliceScratch,
+            false
+          );
+          const sliceBuffer = slice.buffer;
+          const sliceOffset = slice.offset;
+          const sliceView = slice.view;
+          this._internalSliceScratch.buffer = null;
+          this._internalSliceScratch.view = undefined;
+
+          if (firstBuffer === null) {
+            firstBuffer = sliceBuffer;
+            firstOffset = sliceOffset;
+          }
+
+          const srcChunk = src.subarray(off, off + rawChunkLen);
+          if (sliceView) {
+            sliceView.set(srcChunk, 0);
+            if (chunkNeedsPad) {
+              sliceView.fill(0, rawChunkLen, alignedChunkLen);
+            }
+          } else if (!fromSab && !chunkNeedsPad) {
+            this.device.queue.writeBuffer(sliceBuffer, sliceOffset, srcChunk);
+          } else {
+            const scratch = this._acquireUploadScratch(alignedChunkLen);
+            const dst = scratch
+              ? scratch.byteLength === alignedChunkLen
+                ? scratch
+                : scratch.subarray(0, alignedChunkLen)
+              : new Uint8Array(alignedChunkLen);
+            dst.set(srcChunk, 0);
+            if (chunkNeedsPad) {
+              dst.fill(0, rawChunkLen, alignedChunkLen);
+            }
+            this.device.queue.writeBuffer(sliceBuffer, sliceOffset, dst);
+          }
+
+          encoder.copyBufferToBuffer(sliceBuffer, sliceOffset, dstBuffer, dstOffset + off, alignedChunkLen);
+        }
+
+        if (needsPad) {
+          this._alignPadCount += 1;
+        }
+        if (fromSab && this.mode !== STAGING_MODE.MAPPED) {
+          this._sabCopyCount += 1;
+        }
+        this._chunkedWrites += 1;
+      } else {
+        const slice = this._allocateInternal(
+          copySize,
+          WEBGPU_BUFFER_COPY_ALIGNMENT,
+          this._internalSliceScratch,
+          false
+        );
+        firstBuffer = slice.buffer;
+        firstOffset = slice.offset;
+        const sliceView = slice.view;
+        this._internalSliceScratch.buffer = null;
+        this._internalSliceScratch.view = undefined;
+
+        if (sliceView) {
+          sliceView.set(src, 0);
+          if (needsPad) {
+            sliceView.fill(0, src.byteLength, copySize);
+            this._alignPadCount += 1;
+          }
+        } else {
+          if (!fromSab && !needsPad) {
+            this.device.queue.writeBuffer(firstBuffer, firstOffset, src);
+          } else {
+            const scratch = this._acquireUploadScratch(copySize);
+            const dst = scratch
+              ? scratch.byteLength === copySize
+                ? scratch
+                : scratch.subarray(0, copySize)
+              : new Uint8Array(copySize);
+            dst.set(src, 0);
+            if (needsPad) {
+              dst.fill(0, src.byteLength, copySize);
+              this._alignPadCount += 1;
+            }
+            if (fromSab) {
+              this._sabCopyCount += 1;
+            }
+            this.device.queue.writeBuffer(firstBuffer, firstOffset, dst);
+          }
+        }
+
+        encoder.copyBufferToBuffer(firstBuffer, firstOffset, dstBuffer, dstOffset, copySize);
+      }
 
       this._bytesUploaded += copySize;
       this._frameBytesUploaded += copySize;
@@ -2223,16 +2391,16 @@
 
       if (outTarget !== null) {
         this._zeroAllocAcquires += 1;
-        outTarget.buffer = sliceBuffer;
-        outTarget.offset = sliceOffset;
+        outTarget.buffer = firstBuffer;
+        outTarget.offset = firstOffset;
         outTarget.size = copySize;
         outTarget.srcByteLength = src.byteLength;
         return outTarget;
       }
 
       return {
-        buffer: sliceBuffer,
-        offset: sliceOffset,
+        buffer: firstBuffer,
+        offset: firstOffset,
         size: copySize,
         srcByteLength: src.byteLength,
       };
@@ -2241,6 +2409,11 @@
     /**
      * Stage texture texel/block rows into the pool, enforcing WebGPU's 256-byte
      * `bytesPerRow` alignment, and record `encoder.copyBufferToTexture(...)`.
+     *
+     * Reuses a bounded internal scratch buffer and pre-allocated copy descriptors
+     * for zero per-frame temporary allocations on steady-state uploads, and chunks
+     * `queue.writeBuffer` calls at `maxWriteChunkBytes` (default 4 MiB) so Dawn's
+     * internal upload ring never spikes on 4K/8K textures.
      *
      * Pass an optional `out` scratch target (via `layout.out` or 5th argument) to
      * avoid per-upload return wrapper allocations.
@@ -2303,7 +2476,7 @@
       assertPositiveInteger(depthOrLayers, 'depthOrLayers');
       assertPositiveInteger(rowsPerImage, 'rowsPerImage');
       assertNonNegativeInteger(mipLevel, 'mipLevel');
-      const normOrigin = normalizeOrigin(origin);
+      const normOrigin = fillNormalizedOriginInto(this._texCopyOrigin, origin);
 
       const totalRows = rowsPerImage * depthOrLayers;
       let unalignedBytesPerRow = layout.bytesPerRow;
@@ -2361,51 +2534,121 @@
           );
         }
         const fromSab = isSharedBuffer(src.buffer);
-        let payload;
+        const chunkMax = this.maxWriteChunkBytes;
         if (alignedBytesPerRow === unalignedBytesPerRow) {
-          if (fromSab) {
-            payload = new Uint8Array(stagedBytes);
+          if (!fromSab) {
+            const payload = src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes);
+            this._writeBufferChunked(sliceBuffer, sliceOffset, payload);
+          } else if (stagedBytes <= chunkMax) {
+            const scratch = this._acquireUploadScratch(stagedBytes);
+            const payload = scratch
+              ? scratch.byteLength === stagedBytes
+                ? scratch
+                : scratch.subarray(0, stagedBytes)
+              : new Uint8Array(stagedBytes);
             payload.set(src.subarray(0, stagedBytes), 0);
+            this.device.queue.writeBuffer(sliceBuffer, sliceOffset, payload);
           } else {
-            payload = src.byteLength === stagedBytes ? src : src.subarray(0, stagedBytes);
+            const scratch = this._acquireUploadScratch(chunkMax);
+            for (let off = 0; off < stagedBytes; off += chunkMax) {
+              const len = Math.min(chunkMax, stagedBytes - off);
+              const payload = scratch
+                ? scratch.byteLength === len
+                  ? scratch
+                  : scratch.subarray(0, len)
+                : new Uint8Array(len);
+              payload.set(src.subarray(off, off + len), 0);
+              this.device.queue.writeBuffer(sliceBuffer, sliceOffset + off, payload);
+            }
+            this._chunkedWrites += 1;
           }
         } else {
-          payload = new Uint8Array(stagedBytes);
-          for (let row = 0; row < totalRows; row += 1) {
-            const srcRowStart = row * unalignedBytesPerRow;
-            payload.set(
-              src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
-              row * alignedBytesPerRow
-            );
+          const rowsPerChunk = Math.max(1, Math.floor(chunkMax / alignedBytesPerRow));
+          if (rowsPerChunk >= totalRows) {
+            const scratch = this._acquireUploadScratch(stagedBytes);
+            const payload = scratch
+              ? scratch.byteLength === stagedBytes
+                ? scratch
+                : scratch.subarray(0, stagedBytes)
+              : new Uint8Array(stagedBytes);
+            const mustZeroPad = scratch !== null;
+            for (let row = 0; row < totalRows; row += 1) {
+              const srcRowStart = row * unalignedBytesPerRow;
+              const dstRowStart = row * alignedBytesPerRow;
+              payload.set(
+                src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
+                dstRowStart
+              );
+              if (mustZeroPad) {
+                payload.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
+              }
+            }
+            this._writeBufferChunked(sliceBuffer, sliceOffset, payload);
+          } else {
+            const maxStripBytes = rowsPerChunk * alignedBytesPerRow;
+            const scratch = this._acquireUploadScratch(maxStripBytes);
+            const mustZeroPad = scratch !== null;
+            for (let rowStart = 0; rowStart < totalRows; rowStart += rowsPerChunk) {
+              const count = Math.min(rowsPerChunk, totalRows - rowStart);
+              const stripBytes = count * alignedBytesPerRow;
+              const dst = scratch
+                ? scratch.byteLength === stripBytes
+                  ? scratch
+                  : scratch.subarray(0, stripBytes)
+                : new Uint8Array(stripBytes);
+              for (let r = 0; r < count; r += 1) {
+                const srcRowStart = (rowStart + r) * unalignedBytesPerRow;
+                const dstRowStart = r * alignedBytesPerRow;
+                dst.set(
+                  src.subarray(srcRowStart, srcRowStart + unalignedBytesPerRow),
+                  dstRowStart
+                );
+                if (mustZeroPad) {
+                  dst.fill(0, dstRowStart + unalignedBytesPerRow, dstRowStart + alignedBytesPerRow);
+                }
+              }
+              this.device.queue.writeBuffer(
+                sliceBuffer,
+                sliceOffset + rowStart * alignedBytesPerRow,
+                dst
+              );
+            }
+            this._chunkedWrites += 1;
           }
         }
-        this.device.queue.writeBuffer(sliceBuffer, sliceOffset, payload);
         if (fromSab) {
           this._sabCopyCount += 1;
         }
       }
 
-      const source = {
-        buffer: sliceBuffer,
-        offset: sliceOffset,
-        bytesPerRow: alignedBytesPerRow,
-        rowsPerImage,
-      };
-      const destination = {
-        texture: dstTexture,
-        mipLevel,
-        origin: normOrigin,
-      };
+      const source = this._texCopySource;
+      source.buffer = sliceBuffer;
+      source.offset = sliceOffset;
+      source.bytesPerRow = alignedBytesPerRow;
+      source.rowsPerImage = rowsPerImage;
+
+      let destination;
       if (aspect !== undefined) {
+        destination = this._texCopyDestWithAspect;
+        destination.texture = dstTexture;
+        destination.mipLevel = mipLevel;
+        destination.origin = normOrigin;
         destination.aspect = aspect;
+      } else {
+        destination = this._texCopyDest;
+        destination.texture = dstTexture;
+        destination.mipLevel = mipLevel;
+        destination.origin = normOrigin;
       }
-      const copySize = {
-        width,
-        height,
-        depthOrArrayLayers: depthOrLayers,
-      };
+
+      const copySize = this._texCopySize;
+      copySize.width = width;
+      copySize.height = height;
+      copySize.depthOrArrayLayers = depthOrLayers;
 
       encoder.copyBufferToTexture(source, destination, copySize);
+      source.buffer = null;
+      destination.texture = null;
 
       this._bytesUploaded += stagedBytes;
       this._frameBytesUploaded += stagedBytes;
@@ -2570,6 +2813,10 @@
         stallAvoidedCount: sanitizeNonNegativeCounter(this._stallAvoidedCount),
         zeroAllocAcquires: sanitizeNonNegativeCounter(this._zeroAllocAcquires),
         sceneTransitionTrimBytes: sanitizeNonNegativeCounter(this._sceneTransitionTrimBytes),
+        chunkedWrites: sanitizeNonNegativeCounter(this._chunkedWrites),
+        trimmedStagingBytes: sanitizeNonNegativeCounter(this._trimmedStagingBytes),
+        destroyedBuffers: sanitizeNonNegativeCounter(this._destroyedBuffers),
+        maxWriteChunkBytes: this.maxWriteChunkBytes,
         destroyed: this._destroyed,
       };
     }
@@ -2609,6 +2856,9 @@
       this._stallAvoidedCount = 0;
       this._zeroAllocAcquires = 0;
       this._sceneTransitionTrimBytes = 0;
+      this._chunkedWrites = 0;
+      this._trimmedStagingBytes = 0;
+      this._destroyedBuffers = 0;
       this._framesCompleted = 0;
       this._lastFrameBytesUploaded = 0;
       this._peakFrameBytesUploaded = 0;
@@ -2644,8 +2894,12 @@
       this._recycledChunks = [];
       this._inFlightChunks = [];
       this._currentChunk = null;
+      this._uploadScratch = null;
       this._internalSliceScratch.buffer = null;
       this._internalSliceScratch.view = undefined;
+      this._texCopySource.buffer = null;
+      this._texCopyDest.texture = null;
+      this._texCopyDestWithAspect.texture = null;
       this._allocatedBytes = 0;
       this._inFrame = false;
     }
@@ -2653,6 +2907,8 @@
 
   const exportsObj = Object.freeze({
     DEFAULT_CHUNK_SIZE,
+    DEFAULT_MAX_WRITE_CHUNK_BYTES,
+    DEFAULT_MAX_SCRATCH_BYTES,
     DEFAULT_MAX_POOL_BYTES,
     DEFAULT_FRAMES_IN_FLIGHT,
     DEFAULT_MAX_FRAMES_IN_FLIGHT,

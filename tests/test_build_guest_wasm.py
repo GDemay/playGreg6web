@@ -447,7 +447,7 @@ class TestBuildOrchestrator(unittest.TestCase):
             self.assertEqual(report.outputs, (bgw.RUNTIME_JS, bgw.RUNTIME_WASM))
             self.assertTrue((root / "dist" / "runtime.js").is_file())
             self.assertTrue((root / "dist" / "runtime.wasm").is_file())
-            self.assertEqual(bgw.LINK_FLAGS, report.link_flags)
+            self.assertEqual((*bgw.LINK_FLAGS, "-sASSERTIONS=0", "-sSAFE_HEAP=0"), report.link_flags)
 
             compile_cmd = runner.compile_calls[0]
             self.assertIn("-sMEMORY64=1", compile_cmd)
@@ -4074,7 +4074,7 @@ var PThread = {
     def test_proxy_to_pthread_flag_api_and_cli_backwards_compatibility(self) -> None:
         # Default preserves existing flags identically (no -sPROXY_TO_PTHREAD=1).
         default_flags = bgw.resolve_link_flags()
-        self.assertEqual(default_flags, bgw.LINK_FLAGS)
+        self.assertEqual(default_flags, (*bgw.LINK_FLAGS, "-sASSERTIONS=0", "-sSAFE_HEAP=0"))
         self.assertNotIn("-sPROXY_TO_PTHREAD=1", default_flags)
         self.assertNotIn("-sPROXY_TO_PTHREAD=1", bgw.LINK_FLAGS)
 
@@ -7582,6 +7582,309 @@ class TestMultiModuleBink2AsymmetricSplit(unittest.TestCase):
 
             text_summary = bgw.format_report_text(report, sanitize=True)
             self.assertIn("Guest DLL modules: vcruntime140, bink2scarlett", text_summary)
+
+
+class TestT96LibopusAndOptModule(unittest.TestCase):
+    """T96 (Refs #663): sibling libopus.a auto-linking and --opt-module overrides."""
+
+    def _repo(self, root: Path) -> Path:
+        repo = root / "repo"
+        _fake_emsdk(repo)
+        _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+        _write(repo / "runtime" / "main.cpp", "int main() { return 0; }\n")
+        _write(repo / "runtime" / "wasm_boot.cpp", "void pg6_boot() {}\n")
+        return repo
+
+    def _program_with_bink(self, root: Path) -> Path:
+        src = root / "program-out"
+        manifest = {
+            "schema_version": 1,
+            "modules": ["main", "bink2scarlett", "vcruntime140"],
+            "indirect_dispatch": "shard",
+        }
+        _write(src / "program_manifest.json", json.dumps(manifest))
+        _write(src / "pg6_program.cpp", "void pg6_program_init() {}\n")
+        _write(src / "program_modules.cpp", "void pg6_modules() {}\n")
+        _write(src / "exports" / "pg6_export_thunks.cpp", "void exp() {}\n")
+        _write(src / "main" / "lift" / "shard-00000.ll", "; main shard 0\n" + ("; pad\n" * 40))
+        _write(src / "main" / "lift" / "functions.ll", "; main reg\n")
+        _write(src / "main" / "stubs" / "pg6_import_thunks.cpp", "void imp() {}\n")
+        _write(src / "bink2scarlett" / "lift" / "shard-00000.ll", "; bink shard 0\n" + ("; pad\n" * 60))
+        _write(src / "bink2scarlett" / "lift" / "functions.ll", "; bink reg\n")
+        _write(src / "vcruntime140" / "lift" / "shard-00000.ll", "; vc shard 0\n")
+        _write(src / "vcruntime140" / "lift" / "functions.ll", "; vc reg\n")
+        return src
+
+    def test_resolve_runtime_libs_auto_links_sibling_libopus_and_deduplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            core = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            extra_obj = _write(root / "extra.o", "obj")
+
+            # 1. Absent: unchanged when no sibling libopus.a exists.
+            libs_absent = bgw.resolve_runtime_libs(
+                repo_root=repo,
+                runtime_lib=core,
+                extra_objects=[extra_obj],
+            )
+            self.assertEqual(libs_absent, [core, extra_obj])
+
+            # 2. Secondary fallback (<lib.parent>/libopus.a).
+            fallback_opus = _touch_lib(core.parent / "libopus.a")
+            libs_fallback = bgw.resolve_runtime_libs(
+                repo_root=repo,
+                runtime_lib=core,
+                extra_objects=[extra_obj],
+            )
+            self.assertEqual(libs_fallback, [core, fallback_opus, extra_obj])
+
+            # 3. Primary CMake FetchContent path (<lib.parent>/_deps/opus-build/libopus.a) preferred.
+            fetch_opus = _touch_lib(core.parent / "_deps" / "opus-build" / "libopus.a")
+            libs_fetch = bgw.resolve_runtime_libs(
+                repo_root=repo,
+                runtime_lib=core,
+                extra_objects=[extra_obj],
+            )
+            self.assertEqual(libs_fetch, [core, fetch_opus, extra_obj])
+
+            # 4. Auto-discovery (runtime_lib=None) also picks up sibling libopus.a.
+            libs_auto = bgw.resolve_runtime_libs(
+                repo_root=repo,
+                runtime_lib=None,
+                extra_objects=[],
+            )
+            self.assertEqual(
+                [p.resolve() for p in libs_auto],
+                [core.resolve(), fetch_opus.resolve()],
+            )
+
+            # 5. Deduplication when libopus.a is also passed via extra_objects (even non-normalized).
+            non_norm_opus = core.parent / "_deps" / "opus-build" / ".." / "opus-build" / "libopus.a"
+            libs_dedup = bgw.resolve_runtime_libs(
+                repo_root=repo,
+                runtime_lib=core,
+                extra_objects=[non_norm_opus, extra_obj, fetch_opus],
+            )
+            self.assertEqual(libs_dedup, [core, fetch_opus, extra_obj])
+
+    def test_split_and_monolithic_builds_preserve_libopus_without_stripping(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            core = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            opus = _touch_lib(core.parent / "_deps" / "opus-build" / "libopus.a")
+            opus_sentinel = b"!<arch>\nlibopus-real-bytes\n"
+            opus.write_bytes(opus_sentinel)
+            src = self._program_with_bink(root)
+
+            # Monolithic link: libopus.a immediately follows libplaygta6_core.a.
+            mono_runner = RecordingRunner()
+            mono_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-mono",
+                out_dir=root / "dist-mono",
+                jobs=2,
+                runtime_lib=core,
+                run_command=mono_runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(mono_report.ok, mono_report.errors)
+            self.assertEqual(len(mono_runner.link_calls), 1)
+            mono_names = [Path(tok).name for tok in mono_runner.link_calls[0]]
+            self.assertIn("libplaygta6_core.a", mono_names)
+            self.assertIn("libopus.a", mono_names)
+            self.assertEqual(
+                mono_names.index("libopus.a"),
+                mono_names.index("libplaygta6_core.a") + 1,
+            )
+
+            # Split-module link: libplaygta6_core.a is filtered with emar d + --whole-archive,
+            # while libopus.a is preserved directly after it without emar d stripping or dropping.
+            split_cache = root / "cache-split"
+            split_runner = RecordingRunner()
+            split_report = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=split_cache,
+                out_dir=root / "dist-split",
+                jobs=2,
+                split_modules=2,
+                link_guest_boot=True,
+                runtime_lib=core,
+                run_command=split_runner,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(split_report.ok, split_report.errors)
+            # emar d ran ONLY on libplaygta6_core_split.a, never on libopus.a.
+            self.assertEqual(len(split_runner.ar_calls), 1)
+            self.assertEqual(
+                Path(split_runner.ar_calls[0][2]).name,
+                "libplaygta6_core_split.a",
+            )
+            self.assertFalse((split_cache / "libopus_split.a").exists())
+            self.assertEqual(opus.read_bytes(), opus_sentinel)
+
+            self.assertEqual(len(split_runner.link_calls), 1)
+            main_call = split_runner.link_calls[0]
+            wa_idx = main_call.index("-Wl,--whole-archive")
+            self.assertEqual(Path(main_call[wa_idx + 1]).name, "libplaygta6_core_split.a")
+            self.assertEqual(main_call[wa_idx + 2], "-Wl,--no-whole-archive")
+            self.assertEqual(Path(main_call[wa_idx + 3]).resolve(), opus.resolve())
+            self.assertIn("libopus.a", split_report.link_argv)
+            self.assertNotIn("libopus_split.a", split_report.link_argv)
+
+    def test_opt_module_validation_and_per_module_compilation_and_cache(self) -> None:
+        # Validation checks.
+        self.assertEqual(bgw.parse_opt_modules(None), {})
+        self.assertEqual(
+            bgw.parse_opt_modules(["bink2scarlett=O3", "main=-O2", "vcruntime140=z"]),
+            {"bink2scarlett": "O3", "main": "O2", "vcruntime140": "Oz"},
+        )
+        self.assertEqual(
+            bgw.parse_opt_modules(["bink2scarlett=O1", "bink2scarlett=O3"]),
+            {"bink2scarlett": "O3"},
+        )
+        for bad in ("bink2scarlett", "=O3", "bink2scarlett=", "bink2scarlett=O4", "bink2scarlett=Ofast", "bad mod=O3"):
+            with self.assertRaises(bgw.BuildGuestWasmError, msg=bad):
+                bgw.parse_opt_modules([bad])
+
+        # Prefix-before-__ fallback when SourceUnit.module is None.
+        flat_unit = bgw.SourceUnit(
+            unit_id="bink2scarlett__shard-00000.ll",
+            path=Path("bink2scarlett__shard-00000.ll"),
+            kind="ll",
+            module=None,
+        )
+        other_flat = bgw.SourceUnit(
+            unit_id="lift/shard-00000.ll",
+            path=Path("lift/shard-00000.ll"),
+            kind="ll",
+            module=None,
+        )
+        self.assertEqual(
+            bgw.opt_level_for_unit(
+                flat_unit,
+                default_opt="O2",
+                opt_modules={"bink2scarlett": "O3"},
+            ),
+            "O3",
+        )
+        self.assertEqual(
+            bgw.opt_level_for_unit(
+                other_flat,
+                default_opt="O2",
+                opt_modules={"bink2scarlett": "O3"},
+            ),
+            "O2",
+        )
+
+        # End-to-end build with --opt O2 and --opt-module bink2scarlett=O3 (+ warm cache delta).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = self._repo(root)
+            core = repo / "runtime" / "build-wasm64" / "libplaygta6_core.a"
+            src = self._program_with_bink(root)
+            cache = root / "cache"
+
+            # Warm build at uniform O2.
+            runner1 = RecordingRunner()
+            rep1 = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist1",
+                jobs=2,
+                opt="O2",
+                runtime_lib=core,
+                run_command=runner1,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep1.ok, rep1.errors)
+            by_id_1 = {u.unit.unit_id: u for u in rep1.sources}
+            self.assertIn("-O2", by_id_1["bink2scarlett/lift/shard-00000.ll"].argv)
+            self.assertIn("-O2", by_id_1["main/lift/shard-00000.ll"].argv)
+
+            # Rebuild with opt_modules=["bink2scarlett=O3"] and shrink_largest_shards=1:
+            # bink2scarlett gets -O3 (cache miss; overrides shrink_largest_shards),
+            # while main/vcruntime140 remain at -O2 (cache hits where unchanged).
+            runner2 = RecordingRunner()
+            rep2 = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=cache,
+                out_dir=root / "dist2",
+                jobs=2,
+                opt="O2",
+                opt_modules=["bink2scarlett=O3"],
+                shrink_largest_shards=1,
+                runtime_lib=core,
+                run_command=runner2,
+                which_fn=lambda _name: None,
+            )
+            self.assertTrue(rep2.ok, rep2.errors)
+            self.assertEqual(rep2.opt_modules, {"bink2scarlett": "O3"})
+            by_id_2 = {u.unit.unit_id: u for u in rep2.sources}
+            for bink_id in ("bink2scarlett/lift/shard-00000.ll", "bink2scarlett/lift/functions.ll"):
+                self.assertIn("-O3", by_id_2[bink_id].argv)
+                self.assertNotIn("-O2", by_id_2[bink_id].argv)
+                self.assertNotIn("-Oz", by_id_2[bink_id].argv)
+                self.assertFalse(by_id_2[bink_id].cache_hit)
+                self.assertNotEqual(by_id_2[bink_id].cache_key, by_id_1[bink_id].cache_key)
+            for other_id in ("main/lift/shard-00000.ll", "vcruntime140/lift/shard-00000.ll"):
+                self.assertIn("-O2", by_id_2[other_id].argv)
+                self.assertNotIn("-O3", by_id_2[other_id].argv)
+                self.assertTrue(by_id_2[other_id].cache_hit)
+                self.assertEqual(by_id_2[other_id].cache_key, by_id_1[other_id].cache_key)
+
+            # CLI integration: dry-run JSON and text output + invalid CLI flag exits 2.
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = bgw.main(
+                    [
+                        str(src),
+                        "--repo-root",
+                        str(repo),
+                        "--cache-dir",
+                        str(cache),
+                        "--out-dir",
+                        str(root / "dist-cli"),
+                        "--opt",
+                        "O2",
+                        "--opt-module",
+                        "bink2scarlett=O3",
+                        "--dry-run",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0, buf_err.getvalue())
+            payload = json.loads(buf_out.getvalue())
+            self.assertEqual(payload["opt_modules"], {"bink2scarlett": "O3"})
+            by_cli_id = {u["id"]: u for u in payload["sources"]}
+            self.assertIn("-O3", by_cli_id["bink2scarlett/lift/shard-00000.ll"]["argv"])
+            self.assertIn("-O2", by_cli_id["main/lift/shard-00000.ll"]["argv"])
+
+            text_report = bgw.format_report_text(rep2, sanitize=True)
+            self.assertIn("Module opt overrides: bink2scarlett=-O3", text_report)
+
+            for bad_arg in ("bink2scarlett=O4", "bink2scarlett"):
+                err_out = io.StringIO()
+                err_err = io.StringIO()
+                with redirect_stdout(err_out), redirect_stderr(err_err):
+                    bad_code = bgw.main(
+                        [
+                            str(src),
+                            "--repo-root",
+                            str(repo),
+                            "--opt-module",
+                            bad_arg,
+                            "--dry-run",
+                        ]
+                    )
+                self.assertEqual(bad_code, 2, bad_arg)
+                self.assertIn("--opt-module", err_err.getvalue())
 
 
 if __name__ == "__main__":

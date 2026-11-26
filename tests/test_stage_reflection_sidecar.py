@@ -12,6 +12,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
 import stage_reflection_sidecar as sidecar  # noqa: E402
 
+_STAGE_TO_CODE = {"vertex": 1, "fragment": 2, "compute": 3}
+
+
+def build_synthetic_wgpk(entries: list[tuple[int, str, bytes]], *, flags: int = 0) -> bytes:
+    """Build a valid WGPK v1 binary archive from (hash_int, stage_name, payload_bytes) tuples."""
+    data_start = sidecar.WGPK_HEADER_BYTES + len(entries) * sidecar.WGPK_ENTRY_BYTES
+    header = sidecar.WGPK_HEADER_STRUCT.pack(sidecar.WGPK_MAGIC, sidecar.WGPK_VERSION, len(entries), flags)
+    toc = bytearray()
+    payloads = bytearray()
+    cursor = data_start
+    for hash_int, stage_name, payload in entries:
+        toc.extend(
+            sidecar.WGPK_ENTRY_STRUCT.pack(
+                hash_int,
+                _STAGE_TO_CODE[stage_name],
+                b"\x00\x00\x00",
+                cursor,
+                len(payload),
+            )
+        )
+        payloads.extend(payload)
+        cursor += len(payload)
+    return bytes(header) + bytes(toc) + bytes(payloads)
+
 
 def vertex_entry(with_keys: bool) -> dict:
     entry = {
@@ -275,6 +299,9 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         self.assertEqual(set(written["stages"].keys()), {
             "0x0000000000000001",
@@ -329,6 +356,9 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
+                "mesh_output_stages": 0,
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
             })
 
             # Second run: in-place merge onto the file written in run 1
@@ -350,6 +380,9 @@ class SidecarTests(unittest.TestCase):
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
                 "vertex_index_stages": 0,
+                "mesh_output_stages": 0,
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
             })
             written = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(set(written["stages"].keys()), {"0x00000000000000a1", "0x00000000000000b2"})
@@ -359,7 +392,8 @@ class SidecarTests(unittest.TestCase):
             "{not valid json",
             json.dumps([1, 2, 3]),
             json.dumps({"schema": "wrong-schema", "version": 1, "stages": {}}),
-            json.dumps({"schema": "playgta6-stage-reflection", "version": 2, "stages": {}}),
+            json.dumps({"schema": "playgta6-stage-reflection", "version": 0, "stages": {}}),
+            json.dumps({"schema": "playgta6-stage-reflection", "version": 4, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": True, "stages": {}}),
             json.dumps({"schema": "playgta6-stage-reflection", "version": 1, "stages": []}),
             json.dumps({
@@ -415,6 +449,9 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         self.assertNotIn("merged_existing", summary)
         self.assertNotIn("diff", summary)
@@ -667,6 +704,9 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 2,
+            "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
 
     def test_summarize_stages_empty_and_explicit_vertex_input_mode(self):
@@ -681,6 +721,9 @@ class SidecarTests(unittest.TestCase):
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
             "vertex_index_stages": 0,
+            "mesh_output_stages": 0,
+            "unresolved_stages": 0,
+            "unresolved_bindings": 0,
         })
         stages = {
             "0x1": {"stage": "vertex", "bindings": [], "vertex_inputs": []},
@@ -999,6 +1042,749 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(summary["diff"]["added_sample_hashes"], ["<redacted>"])
         self.assertEqual(summary["diff"]["removed_sample_hashes"], ["<redacted>"])
         self.assertEqual(summary["diff"]["changed_sample_hashes"], ["<redacted>"])
+
+    def test_verify_pack_100_percent_match_and_cli_output(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+            (0x00000000000000B2, "fragment", b"@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+            (0x00000000000000C3, "compute", b"@compute @workgroup_size(1) fn cs() {}"),
+        ])
+        entries = {
+            "entries": [
+                # Uppercase hex hash verifies canonical hash matching against WGPK lowercase hex
+                {**vertex_entry(True), "hash_fnv1a64": "0x00000000000000A1"},
+                {
+                    "hash_fnv1a64": "0x00000000000000b2",
+                    "stage": "fragment",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+                {
+                    "hash_fnv1a64": "0x00000000000000c3",
+                    "stage": "compute",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "storage",
+                                  "source": {"user_sgpr": 4, "table_byte_offset": 0}}],
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "shaders.wgsl.pack.reflect.json"
+            pack_path = Path(tmp) / "shaders.wgsl.pack"
+            src.write_text(json.dumps(entries), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["pack_verification"], {
+                "pack_label": "shaders.wgsl.pack",
+                "pack_entry_count": 3,
+                "reflection_stage_count": 3,
+                "matched_hashes": 3,
+                "missing_reflection_hashes": {"count": 0, "samples": []},
+                "extra_reflection_hashes": {"count": 0, "samples": []},
+                "coverage_pct": 100.0,
+                "pack_by_stage": {"vertex": 1, "fragment": 1, "compute": 1},
+                "missing_by_stage": {"vertex": 0, "fragment": 0, "compute": 0},
+                "stage_mismatches": 0,
+            })
+
+            # Human-readable output includes concise pack verification summary
+            stdout_text = io.StringIO()
+            with redirect_stdout(stdout_text):
+                rc_text = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                ])
+            self.assertEqual(rc_text, 0)
+            self.assertIn(
+                "pack verify (shaders.wgsl.pack): 3/3 matched (100.00%), 0 missing, 0 extra",
+                stdout_text.getvalue(),
+            )
+
+    def test_verify_pack_partial_match_bounded_samples_extra_and_stage_mismatch(self):
+        # 8 pack entries: 2 matched (1 with stage mismatch), 6 missing (tests 5-sample cap)
+        pack_entries = [
+            (0x0000000000000001, "vertex", b"// vs1"),
+            (0x0000000000000002, "vertex", b"// vs2 - mismatched in sidecar"),
+        ] + [
+            (0x0000000000001000 + i, "fragment" if i < 4 else "compute", f"// miss {i}".encode("utf-8"))
+            for i in range(6)
+        ]
+        pack_bytes = build_synthetic_wgpk(pack_entries)
+
+        # 9 reflection stages: 2 matched + 7 extra (tests 5-sample cap on extra_reflection_hashes too)
+        stages = {
+            "0x0000000000000001": {"stage": "vertex", "bindings": []},
+            "0x0000000000000002": {"stage": "fragment", "bindings": []},
+            **{
+                f"0x000000000000200{i}": {"stage": "compute", "bindings": []}
+                for i in range(7)
+            },
+        }
+        toc = sidecar.parse_wgpk_toc_bytes(pack_bytes)
+        result = sidecar.verify_sidecar_against_pack(toc, stages, pack_label="partial.wgsl.pack")
+        self.assertEqual(result, {
+            "pack_label": "partial.wgsl.pack",
+            "pack_entry_count": 8,
+            "reflection_stage_count": 9,
+            "matched_hashes": 2,
+            "missing_reflection_hashes": {
+                "count": 6,
+                "samples": [f"0x000000000000100{i}" for i in range(5)],
+            },
+            "extra_reflection_hashes": {
+                "count": 7,
+                "samples": [f"0x000000000000200{i}" for i in range(5)],
+            },
+            "coverage_pct": 25.0,
+            "pack_by_stage": {"vertex": 2, "fragment": 4, "compute": 2},
+            "missing_by_stage": {"vertex": 0, "fragment": 4, "compute": 2},
+            "stage_mismatches": 1,
+        })
+
+    def test_verify_pack_empty_pack_zero_division_guard(self):
+        empty_pack = build_synthetic_wgpk([])
+        toc = sidecar.parse_wgpk_toc_bytes(empty_pack)
+        self.assertEqual(toc, [])
+
+        # Empty pack + empty sidecar -> 0.0% coverage (no ZeroDivisionError)
+        res_empty = sidecar.verify_sidecar_against_pack(toc, {}, pack_label="empty.wgsl.pack")
+        self.assertEqual(res_empty["pack_entry_count"], 0)
+        self.assertEqual(res_empty["reflection_stage_count"], 0)
+        self.assertEqual(res_empty["matched_hashes"], 0)
+        self.assertEqual(res_empty["missing_reflection_hashes"], {"count": 0, "samples": []})
+        self.assertEqual(res_empty["extra_reflection_hashes"], {"count": 0, "samples": []})
+        self.assertEqual(res_empty["coverage_pct"], 0.0)
+
+        # Empty pack + non-empty sidecar via CLI -> 0.0% coverage and extra hash reported
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "out.reflect.json"
+            pack_path = Path(tmp) / "empty.wgsl.pack"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(empty_pack)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc, 0)
+            verify = json.loads(stdout.getvalue())["pack_verification"]
+        self.assertEqual(verify["pack_entry_count"], 0)
+        self.assertEqual(verify["reflection_stage_count"], 1)
+        self.assertEqual(verify["matched_hashes"], 0)
+        self.assertEqual(verify["extra_reflection_hashes"], {"count": 1, "samples": ["0x00000000000000a1"]})
+        self.assertEqual(verify["coverage_pct"], 0.0)
+
+    def test_verify_pack_malformed_bounds_and_header_rejection(self):
+        bad_packs: list[tuple[str, bytes]] = [
+            ("truncated_header", b"WGPK\x01\x00"),
+            ("bad_magic", sidecar.WGPK_HEADER_STRUCT.pack(b"NOPE", 1, 0, 0)),
+            ("unsupported_version", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 2, 0, 0)),
+            ("truncated_toc", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)),
+            ("toc_u32_overflow", sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 0x10000000, 0)),
+            (
+                "invalid_stage",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 4, b"\x00\x00\x00", 36, 4)
+                + b"abcd",
+            ),
+            (
+                "offset_overlaps_toc",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 12, 4)
+                + b"abcd",
+            ),
+            (
+                "payload_exceeds_eof",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 36, 16)
+                + b"abcd",
+            ),
+            (
+                "payload_range_u32_overflow",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 0xFFFFFFF0, 32)
+                + b"abcd",
+            ),
+            (
+                "overlapping_payloads",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x1, 1, b"\x00\x00\x00", 56, 6)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x2, 2, b"\x00\x00\x00", 60, 4)
+                + b"0123456789",
+            ),
+            (
+                "duplicate_hash",
+                sidecar.WGPK_HEADER_STRUCT.pack(b"WGPK", 1, 2, 0)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x99, 1, b"\x00\x00\x00", 56, 2)
+                + sidecar.WGPK_ENTRY_STRUCT.pack(0x99, 2, b"\x00\x00\x00", 58, 2)
+                + b"abcd",
+            ),
+        ]
+
+        for name, raw in bad_packs:
+            with self.subTest(case=name):
+                with self.assertRaises(ValueError):
+                    sidecar.parse_wgpk_toc_bytes(raw)
+
+        # CLI must fail cleanly with exit code 1 and not write --out on malformed/missing/directory pack
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+
+            for name, raw in bad_packs:
+                pack_path = Path(tmp) / f"{name}.wgsl.pack"
+                out_path = Path(tmp) / f"out_{name}.reflect.json"
+                pack_path.write_bytes(raw)
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    rc = sidecar.main([str(src), "--out", str(out_path), "--verify-pack", str(pack_path), "--json"])
+                self.assertEqual(rc, 1, name)
+                self.assertIn("error: failed to load --verify-pack:", stderr.getvalue(), name)
+                self.assertFalse(out_path.exists(), name)
+
+            # Missing pack file and directory path
+            for label, bad_target in (
+                ("missing", Path(tmp) / "secret_user_dir" / "absent.wgsl.pack"),
+                ("directory", Path(tmp)),
+            ):
+                out_path = Path(tmp) / f"out_{label}.reflect.json"
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    rc = sidecar.main([str(src), "--out", str(out_path), "--verify-pack", str(bad_target), "--json"])
+                self.assertEqual(rc, 1, label)
+                self.assertIn("error: failed to load --verify-pack:", stderr.getvalue(), label)
+                self.assertNotIn("secret_user_dir", stderr.getvalue(), label)
+                self.assertNotIn(str(tmp), stderr.getvalue(), label)
+                self.assertFalse(out_path.exists(), label)
+
+    def test_verify_pack_json_sanitizes_host_paths_and_usernames(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000F9, "fragment", b"// fs"),
+        ])
+        hostile_entries = {
+            "input_path": r"C:\Users\secret_user\games\shaders.bin",
+            "entries": [
+                vertex_entry(True),
+                {
+                    "hash_fnv1a64": "/home/secret_user/extra_shader.wgsl",
+                    "stage": "compute",
+                    "wgsl": "@compute fn cs_secret() {}",
+                    "bindings": [{"group": 0, "binding": 0, "kind": "sampler", "source": {"static_sampler": 0}}],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_dir = Path(tmp) / "Users" / "secret_user" / "private_build"
+            secret_dir.mkdir(parents=True)
+            src = secret_dir / "in.json"
+            out = secret_dir / "out.reflect.json"
+            pack_path = secret_dir / "title_shaders.wgsl.pack"
+            src.write_text(json.dumps(hostile_entries), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                rc = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            raw_out = stdout.getvalue()
+            raw_err = stderr.getvalue()
+
+        for forbidden in (
+            "secret_user",
+            "private_build",
+            "cs_secret",
+            "@compute",
+            "/home/",
+            "C:\\Users",
+            str(tmp),
+            str(secret_dir),
+        ):
+            self.assertNotIn(forbidden, raw_out)
+            self.assertNotIn(forbidden, raw_err)
+
+        summary = json.loads(raw_out)
+        verify = summary["pack_verification"]
+        self.assertEqual(verify["pack_label"], "title_shaders.wgsl.pack")
+        self.assertEqual(verify["matched_hashes"], 1)
+        self.assertEqual(verify["missing_reflection_hashes"], {"count": 1, "samples": ["0x00000000000000f9"]})
+        self.assertEqual(verify["extra_reflection_hashes"], {"count": 1, "samples": ["<redacted>"]})
+        self.assertEqual(verify["coverage_pct"], 50.0)
+
+        # Path label sanitizer unit edge cases
+        self.assertEqual(sidecar._sanitize_path_label(r"C:\Users\alice\work\game.wgsl.pack"), "game.wgsl.pack")
+        self.assertEqual(sidecar._sanitize_path_label("/home/alice/work/game.wgsl.pack"), "game.wgsl.pack")
+        self.assertEqual(sidecar._sanitize_path_label(r"C:\Users\alice\my secret pack.pack"), "<redacted>")
+        self.assertEqual(sidecar._sanitize_path_label("C:\\"), "<unknown>")
+        self.assertEqual(sidecar._sanitize_path_label(".."), "<unknown>")
+
+    def test_verify_pack_standalone_existing_sidecar_and_omitted_without_flag(self):
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000B2, "fragment", b"// fs"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.json"
+            out = Path(tmp) / "existing.reflect.json"
+            pack_path = Path(tmp) / "pack.wgsl.pack"
+            src.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            # Without --verify-pack: pack_verification key must be absent
+            stdout_plain = io.StringIO()
+            with redirect_stdout(stdout_plain):
+                rc_plain = sidecar.main([str(src), "--out", str(out), "--json"])
+            self.assertEqual(rc_plain, 0)
+            self.assertNotIn("pack_verification", json.loads(stdout_plain.getvalue()))
+            original_content = out.read_text(encoding="utf-8")
+
+            # Standalone verify mode (no positional inputs): reads --out without modifying it
+            stdout_verify = io.StringIO()
+            with redirect_stdout(stdout_verify):
+                rc_verify = sidecar.main(["--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_verify, 0)
+            self.assertEqual(out.read_text(encoding="utf-8"), original_content)
+            summary = json.loads(stdout_verify.getvalue())
+            self.assertEqual(summary["stages_written"], 0)
+            self.assertEqual(summary["pack_verification"]["pack_entry_count"], 2)
+            self.assertEqual(summary["pack_verification"]["reflection_stage_count"], 1)
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 1)
+            self.assertEqual(summary["pack_verification"]["coverage_pct"], 50.0)
+
+    def test_v2_root_descriptor_table_byte_offset_accepted_and_upgrades_version(self):
+        # G62 (#1471 / #482): v2 root_descriptor sources may include a 32-byte-aligned table_byte_offset.
+        v2_entry = {
+            "hash_fnv1a64": "0x00000000000000e1",
+            "stage": "fragment",
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 32,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 64},
+                },
+                {
+                    "group": 0,
+                    "binding": 33,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 10, "root_descriptor": True},
+                },
+                {
+                    "group": 0,
+                    "binding": 34,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 12, "root_descriptor": True, "table_byte_offset": 0},
+                },
+            ],
+        }
+        doc, skipped = sidecar.build([v2_entry])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["schema"], "playgta6-stage-reflection")
+        self.assertEqual(doc["version"], 2)
+        bindings = doc["stages"]["0x00000000000000e1"]["bindings"]
+        self.assertEqual(bindings[0]["source"], {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 64})
+        self.assertEqual(bindings[1]["source"], {"user_sgpr": 10, "root_descriptor": True})
+        self.assertEqual(bindings[2]["source"], {"user_sgpr": 12, "root_descriptor": True, "table_byte_offset": 0})
+
+        # Pure v1 root_descriptor (without table_byte_offset) stays version 1 for backward compatibility.
+        v1_only = {
+            "hash_fnv1a64": "0x00000000000000e2",
+            "stage": "compute",
+            "bindings": [
+                {
+                    "group": 0,
+                    "binding": 0,
+                    "kind": "uniform",
+                    "source": {"user_sgpr": 4, "root_descriptor": True},
+                }
+            ],
+        }
+        doc_v1, skipped_v1 = sidecar.build([v1_only])
+        self.assertEqual(skipped_v1, {})
+        self.assertEqual(doc_v1["version"], 1)
+
+    def test_v2_root_descriptor_non_multiple_of_32_offset_is_rejected(self):
+        bad_sources = [
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 4},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 16},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 36},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": -32},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": "32"},
+            {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": True},
+            {"root_descriptor": True, "table_byte_offset": 32},
+        ]
+        for idx, source in enumerate(bad_sources):
+            entry = {
+                "hash_fnv1a64": f"0x{idx + 128:016x}",
+                "stage": "fragment",
+                "bindings": [{"group": 0, "binding": 0, "kind": "uniform", "source": source}],
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, source)
+            self.assertEqual(skipped, {"malformed root_descriptor source": 1}, source)
+
+    def test_v2_sidecar_merge_diff_and_standalone_verify_roundtrip(self):
+        v2_doc = {
+            "schema": "playgta6-stage-reflection",
+            "version": 2,
+            "stages": {
+                "0x00000000000000e1": {
+                    "stage": "fragment",
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 32,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32},
+                        }
+                    ],
+                }
+            },
+        }
+        pack_bytes = build_synthetic_wgpk([
+            (0x00000000000000A1, "vertex", b"// vs"),
+            (0x00000000000000E1, "fragment", b"// fs"),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            existing_v2 = Path(tmp) / "existing_v2.reflect.json"
+            src_v1 = Path(tmp) / "in_v1.json"
+            out_merged = Path(tmp) / "merged.reflect.json"
+            pack_path = Path(tmp) / "test.wgsl.pack"
+            existing_v2.write_text(json.dumps(v2_doc), encoding="utf-8")
+            src_v1.write_text(json.dumps(vertex_entry(True)), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            # Merging a v1 entry onto an existing v2 sidecar preserves v2 and bumps output version to 2
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(src_v1),
+                    "--out", str(out_merged),
+                    "--merge-existing", str(existing_v2),
+                    "--diff-baseline", str(existing_v2),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            written = json.loads(out_merged.read_text(encoding="utf-8"))
+            self.assertEqual(written["version"], 2)
+            self.assertEqual(
+                written["stages"]["0x00000000000000e1"]["bindings"][0]["source"],
+                {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32},
+            )
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 2)
+            self.assertEqual(summary["diff"]["added_count"], 1)
+
+            # Standalone --verify-pack accepts v2 sidecar directly
+            stdout2 = io.StringIO()
+            with redirect_stdout(stdout2):
+                rc2 = sidecar.main(["--out", str(out_merged), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(json.loads(stdout2.getvalue())["pack_verification"]["coverage_pct"], 100.0)
+
+            # Loading a v2 sidecar with a misaligned root_descriptor table_byte_offset fails cleanly
+            bad_v2 = Path(tmp) / "bad_v2.reflect.json"
+            bad_v2.write_text(json.dumps({
+                "schema": "playgta6-stage-reflection",
+                "version": 2,
+                "stages": {
+                    "0x00000000000000e9": {
+                        "stage": "fragment",
+                        "bindings": [{
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 12},
+                        }],
+                    }
+                },
+            }), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc_bad = sidecar.main(["--out", str(bad_v2), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("malformed v2 root_descriptor source", stderr.getvalue())
+
+    def test_mesh_output_valid_compute_stage_preserved_and_counted(self):
+        # G66 / S62 (#482, #1537): compute stage with valid mesh_output bounds (1..256, 4 + 4*n, n <= 15).
+        cases = [
+            ("0x4d53435300000001", {"max_vertices": 1, "max_primitives": 1, "vertex_words": 4}),
+            ("0x4d53435300000002", {"max_vertices": 64, "max_primitives": 128, "vertex_words": 8}),
+            ("0x4d53435300000003", {"max_vertices": 256, "max_primitives": 256, "vertex_words": 64}),
+        ]
+        entries = [
+            {
+                "hash_fnv1a64": key,
+                "stage": "compute",
+                "bindings": [
+                    {
+                        "group": 0,
+                        "binding": 0,
+                        "kind": "uniform",
+                        "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                    }
+                ],
+                "mesh_output": mesh_out,
+            }
+            for key, mesh_out in cases
+        ]
+        # Regular compute stage without mesh_output must not be counted as mesh_output_stages.
+        entries.append({
+            "hash_fnv1a64": "0x00000000000000c9",
+            "stage": "compute",
+            "bindings": [],
+        })
+
+        doc, skipped = sidecar.build([{"entries": entries}])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["version"], 1)
+        for key, mesh_out in cases:
+            self.assertEqual(doc["stages"][key]["stage"], "compute")
+            self.assertEqual(doc["stages"][key]["mesh_output"], mesh_out)
+        self.assertNotIn("mesh_output", doc["stages"]["0x00000000000000c9"])
+
+        summary = sidecar.summarize_stages(doc["stages"])
+        self.assertEqual(summary["by_stage"], {"vertex": 0, "fragment": 0, "compute": 4})
+        self.assertEqual(summary["mesh_output_stages"], 3)
+
+    def test_mesh_output_invalid_bounds_and_non_compute_rejected(self):
+        bad_mesh_outputs = [
+            # max_vertices out of 1..256
+            {"max_vertices": 0, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": 257, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": -1, "max_primitives": 1, "vertex_words": 4},
+            # max_primitives out of 1..256
+            {"max_vertices": 1, "max_primitives": 0, "vertex_words": 4},
+            {"max_vertices": 1, "max_primitives": 257, "vertex_words": 4},
+            # vertex_words not 4 + 4*n with 0 <= n <= 15
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 0},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 2},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 6},
+            {"max_vertices": 3, "max_primitives": 1, "vertex_words": 68},
+            # Wrong types / missing keys
+            {"max_vertices": True, "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": "3", "max_primitives": 1, "vertex_words": 4},
+            {"max_vertices": 3, "max_primitives": 1},
+            "not-an-object",
+            [3, 1, 4],
+        ]
+        for idx, bad_mo in enumerate(bad_mesh_outputs):
+            entry = {
+                "hash_fnv1a64": f"0x4d534353000001{idx:02x}",
+                "stage": "compute",
+                "bindings": [],
+                "mesh_output": bad_mo,
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, bad_mo)
+            self.assertEqual(skipped, {"malformed mesh_output": 1}, bad_mo)
+
+        # Valid mesh_output on non-compute stages (vertex / fragment) must be rejected.
+        for bad_stage in ("vertex", "fragment", "pixel"):
+            entry = {
+                "hash_fnv1a64": "0x00000000000000f1",
+                "stage": bad_stage,
+                "bindings": [],
+                "mesh_output": {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+            }
+            doc, skipped = sidecar.build([entry])
+            self.assertEqual(doc["stages"], {}, bad_stage)
+            self.assertEqual(skipped, {"malformed mesh_output": 1}, bad_stage)
+
+    def test_mesh_output_roundtrip_with_verify_pack_and_salted_key(self):
+        ms_raw_key = 0x0123456789ABCDEF
+        ms_pack_key = ms_raw_key ^ 0x4D53435300000000
+        ms_pack_hex = f"0x{ms_pack_key:016x}"
+        ps_pack_key = 0x00000000000000B2
+        ps_pack_hex = f"0x{ps_pack_key:016x}"
+
+        pack_bytes = build_synthetic_wgpk([
+            (ps_pack_key, "fragment", b"// fs"),
+            (ms_pack_key, "compute", b"// mesh compute"),
+        ])
+        translator_json = {
+            "entries": [
+                {
+                    "hash_fnv1a64": ms_pack_hex,
+                    "stage": "compute",
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                        }
+                    ],
+                    "mesh_output": {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+                },
+                {
+                    "hash_fnv1a64": ps_pack_hex,
+                    "stage": "fragment",
+                    "bindings": [
+                        {"group": 0, "binding": 32, "kind": "sampler", "source": {"static_sampler": 0}}
+                    ],
+                },
+            ]
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack_summary.json"
+            out = Path(tmp) / "bundle.wgsl.pack.reflect.json"
+            pack_path = Path(tmp) / "bundle.wgsl.pack"
+            src.write_text(json.dumps(translator_json), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["stages_written"], 2)
+            self.assertEqual(summary["mesh_output_stages"], 1)
+            self.assertEqual(summary["pack_verification"]["matched_hashes"], 2)
+            self.assertEqual(summary["pack_verification"]["stage_mismatches"], 0)
+            self.assertEqual(summary["pack_verification"]["coverage_pct"], 100.0)
+
+            written = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(
+                written["stages"][ms_pack_hex]["mesh_output"],
+                {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8},
+            )
+
+            # Standalone --verify-pack reloads the sidecar and validates mesh_output cleanly
+            stdout2 = io.StringIO()
+            with redirect_stdout(stdout2):
+                rc2 = sidecar.main(["--out", str(out), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc2, 0)
+            summary2 = json.loads(stdout2.getvalue())
+            self.assertEqual(summary2["mesh_output_stages"], 1)
+            self.assertEqual(summary2["pack_verification"]["coverage_pct"], 100.0)
+
+            # Corrupt mesh_output in an existing sidecar fails cleanly on load
+            bad_sidecar = Path(tmp) / "bad_mesh.reflect.json"
+            bad_sidecar.write_text(json.dumps({
+                "schema": "playgta6-stage-reflection",
+                "version": 1,
+                "stages": {
+                    ms_pack_hex: {
+                        "stage": "compute",
+                        "bindings": [],
+                        "mesh_output": {"max_vertices": 300, "max_primitives": 1, "vertex_words": 8},
+                    }
+                },
+            }), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc_bad = sidecar.main(["--out", str(bad_sidecar), "--verify-pack", str(pack_path), "--json"])
+            self.assertEqual(rc_bad, 1)
+            self.assertIn("malformed mesh_output", stderr.getvalue())
+
+    @staticmethod
+    def _sourceless_fragment(key: str, kinds: list[str]) -> dict:
+        bindings = [{"group": 0, "binding": 0, "kind": "uniform", "name": "cb0",
+                     "source": {"user_sgpr": 8, "table_byte_offset": 288}}]
+        for i, kind in enumerate(kinds, start=1):
+            bindings.append({"group": 0, "binding": i, "kind": kind, "name": f"r{i}", "view_dimension": "2d"})
+        return {"hash_fnv1a64": key, "stage": "fragment", "bindings": bindings,
+                "binding_summary": {"vertex_input_mode": "none"}}
+
+    def test_unresolved_sources_keep_read_only_sourceless_stages(self):
+        # G62 / #482: with unresolved sources on, read-only bindings without a source become
+        # {"unresolved": true} (version 3); writable ones still skip the stage.
+        tex = self._sourceless_fragment("0x00000000000000f1", ["texture_2d", "sampler"])
+        uav = self._sourceless_fragment("0x00000000000000f2", ["storage-texture"])
+        rw = self._sourceless_fragment("0x00000000000000f3", ["storage"])
+        doc, skipped = sidecar.build([{"entries": [tex, uav, rw]}])
+        self.assertEqual(doc["stages"], {})
+        self.assertEqual(doc["version"], 1)
+        self.assertEqual(skipped, {"binding without source": 3})
+
+        doc, skipped = sidecar.build([{"entries": [tex, uav, rw]}], unresolved=True)
+        self.assertEqual(doc["version"], 3)
+        self.assertEqual(skipped, {"writable binding without source": 2})
+        bindings = doc["stages"]["0x00000000000000f1"]["bindings"]
+        self.assertEqual(bindings[0]["source"], {"user_sgpr": 8, "table_byte_offset": 288})
+        self.assertEqual(bindings[1]["kind"], "texture")
+        self.assertEqual(bindings[1]["source"], {"unresolved": True})
+        self.assertEqual(bindings[2]["source"], {"unresolved": True})
+        summary = sidecar.summarize_stages(doc["stages"])
+        self.assertEqual((summary["unresolved_stages"], summary["unresolved_bindings"]), (1, 2))
+
+        # A traced entry stays exactly as before (no unresolved marker, version unchanged).
+        doc, skipped = sidecar.build([vertex_entry(True)], unresolved=True)
+        self.assertEqual((doc["version"], skipped), (1, {}))
+
+        # The missing-sources report keeps describing what the translator did not trace.
+        report = sidecar.build_missing_sources_report([{"entries": [tex]}])
+        self.assertEqual(report["total_skipped_missing_source"], 1)
+
+    def test_unresolved_source_from_translator_is_validated(self):
+        ok = self._sourceless_fragment("0x00000000000000f4", [])
+        ok["bindings"].append({"group": 0, "binding": 1, "kind": "texture_2d", "source": {"unresolved": True}})
+        ok["bindings"].append({"group": 0, "binding": 2, "kind": "sampler",
+                               "source": {"unresolved": "cb_dynamic_offset"}})
+        doc, skipped = sidecar.build([ok])
+        self.assertEqual((doc["version"], skipped), (3, {}))
+        self.assertEqual(doc["stages"]["0x00000000000000f4"]["bindings"][2]["source"],
+                         {"unresolved": "cb_dynamic_offset"})
+        for bad_source, kind in (({"unresolved": False}, "texture_2d"), ({"unresolved": True, "x": 1}, "texture_2d"),
+                                 ({"unresolved": True}, "storage"), ({"unresolved": ""}, "texture_2d"),
+                                 ({"unresolved": "C:\\Users\\x"}, "texture_2d")):
+            bad = self._sourceless_fragment("0x00000000000000f5", [])
+            bad["bindings"].append({"group": 0, "binding": 1, "kind": kind, "source": bad_source})
+            doc, skipped = sidecar.build([bad])
+            self.assertEqual(skipped, {"malformed unresolved source": 1})
+
+    def test_unresolved_sources_cli_merge_and_version_checks(self):
+        tex = self._sourceless_fragment("0x00000000000000f6", ["texture_2d"])
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "pack.json"
+            out = Path(tmp) / "pk.wgsl.pack.reflect.json"
+            src.write_text(json.dumps({"entries": [tex]}), encoding="utf-8")
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([str(src), "--out", str(out), "--unresolved-sources", "--json"])
+            self.assertEqual(rc, 0)
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual((summary["stages_written"], summary["unresolved_stages"]), (1, 1))
+            written = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual(written["version"], 3)
+
+            # A v3 sidecar merges back in and keeps version 3.
+            empty = Path(tmp) / "empty.json"
+            empty.write_text(json.dumps({"entries": []}), encoding="utf-8")
+            merged = Path(tmp) / "merged.reflect.json"
+            with redirect_stdout(io.StringIO()):
+                rc = sidecar.main([str(empty), "--out", str(merged), "--merge-existing", str(out)])
+            self.assertEqual(rc, 0)
+            self.assertEqual(json.loads(merged.read_text(encoding="utf-8"))["version"], 3)
+
+            # An unresolved source in a version 2 document is rejected.
+            written["version"] = 2
+            bad = Path(tmp) / "bad.reflect.json"
+            bad.write_text(json.dumps(written), encoding="utf-8")
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                rc = sidecar.main([str(empty), "--out", str(merged), "--merge-existing", str(bad)])
+            self.assertEqual(rc, 1)
+            self.assertIn("malformed unresolved source", stderr.getvalue())
 
 
 if __name__ == "__main__":

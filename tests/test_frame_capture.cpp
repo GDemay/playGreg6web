@@ -213,12 +213,85 @@ void test_capture_thins_large_uploads() {
     std::filesystem::remove(path + ".json");
 }
 
+void test_capture_deferred_start() {
+    // Late start: before frame_capture_begin, objects are written, writes held (a buffer merged,
+    // a texture region replaced by a covering write, a destroyed one dropped), commands dropped.
+    const std::string path = (std::filesystem::temp_directory_path() / "pg6_test_capture_late.pg6trace").string();
+    fc::FrameCaptureConfig config;
+    config.path = path;
+    config.frames = 1;
+    config.keep_payloads = true;
+    config.deferred = true;
+    CHECK(fc::frame_capture_start(config));
+    const uint8_t a[4] = {1, 2, 3, 4}, b[2] = {9, 9}, px[16] = {5}, px2[64] = {6};
+    CommandEncoder e;
+    e.begin_frame();
+    e.create_buffer(1, 0x28, 64);
+    e.write_buffer(1, 8, a, 4);
+    e.create_texture(2, 4, 4, 1, 1, GpuTextureFormat::Rgba8Unorm, 0x6);
+    e.write_texture(2, 0, 0, 0, 0, 2, 2, 1, 8, 2, px, 16);   // replaced by the full write below
+    e.create_buffer(3, 0x28, 16);
+    e.write_buffer(3, 0, b, 2);
+    e.destroy_resource(3);                                   // its held write goes with it
+    e.draw(3);
+    e.present();                                             // present 0: dropped
+    e.write_buffer(1, 10, b, 2);                             // merged into buffer 1: 1 2 9 9
+    e.write_texture(2, 0, 0, 0, 0, 4, 4, 1, 16, 4, px2, 64);
+    e.draw(6);
+    e.present();                                             // present 1: dropped
+    submit(e);
+    CHECK(fc::frame_capture_frames() == 0);
+    fc::frame_capture_begin();
+    e.clear();
+    e.draw(9);
+    e.present();                                             // present 2: the start (flush)
+    e.begin_frame();
+    e.draw(12);
+    e.present();                                             // present 3: ends frame 0
+    e.draw(15);
+    e.present();                                             // present 4: not captured
+    submit(e);
+    CHECK(fc::frame_capture_frames() == 1);
+    fc::frame_capture_finish();
+
+    bool ok = false;
+    const std::vector<uint8_t> trace = read_file(path);
+    const std::vector<Packet> ps = packets_of(trace, &ok);
+    CHECK(ok);
+    // create 1, create texture 2, create 3, destroy 3 | write 1, write 2 | begin, draw 12, present
+    const GpuOpcode want[] = {GpuOpcode::CreateBuffer, GpuOpcode::CreateTexture, GpuOpcode::CreateBuffer,
+                              GpuOpcode::DestroyResource, GpuOpcode::WriteBuffer, GpuOpcode::WriteTexture,
+                              GpuOpcode::BeginFrame, GpuOpcode::Draw, GpuOpcode::Present};
+    CHECK(ps.size() == std::size(want));
+    for (size_t i = 0; i < ps.size() && i < std::size(want); ++i) {
+        CHECK(ps[i].opcode == static_cast<uint16_t>(want[i]));
+    }
+    if (ps.size() == std::size(want)) {
+        GpuWriteBufferPayload wb{};
+        std::memcpy(&wb, trace.data() + ps[4].offset + sizeof(GpuPacketHeader), sizeof(wb));
+        CHECK(wb.id == 1 && wb.dst_offset == 8 && wb.data_len == 4);
+        const uint8_t* data = trace.data() + ps[4].offset + sizeof(GpuPacketHeader) + sizeof(wb);
+        CHECK(data[0] == 1 && data[1] == 2 && data[2] == 9 && data[3] == 9);
+        GpuWriteTexturePayload wt{};
+        std::memcpy(&wt, trace.data() + ps[5].offset + sizeof(GpuPacketHeader), sizeof(wt));
+        CHECK(wt.texture_id == 2 && wt.width == 4 && wt.data_len == 64);
+    }
+    const std::vector<uint8_t> side_bytes = read_file(path + ".json");
+    const std::string side(side_bytes.begin(), side_bytes.end());
+    CHECK(side.find("\"first_present\": 3") != std::string::npos);
+    CHECK(side.find("\"frames_complete\": 1") != std::string::npos);
+    CHECK(side.find("\"presents_seen\": 5") != std::string::npos);
+    std::filesystem::remove(path);
+    std::filesystem::remove(path + ".json");
+}
+
 }  // namespace
 
 int main() {
     test_capture_omits_payloads_and_stops();
     test_capture_keeps_payloads_on_request();
     test_capture_thins_large_uploads();
+    test_capture_deferred_start();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_frame_capture: %d failure(s)\n", g_failures);
         return 1;

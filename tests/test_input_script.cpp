@@ -1,4 +1,5 @@
 // Scripted controller input for the native boot harness (runtime/guest/input_script.h).
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -22,7 +23,11 @@ int g_failures = 0;
         }                                                                    \
     } while (0)
 
+using playgta6::guest::ConditionTracker;
+using playgta6::guest::InputCondition;
 using playgta6::guest::InputScriptEvent;
+using playgta6::guest::InputStatus;
+using playgta6::guest::InputStepKind;
 using playgta6::guest::parse_input_script;
 namespace button = playgta6::os::input_button;
 
@@ -138,6 +143,146 @@ void test_player_presses_and_releases() {
     CHECK(later.writes() == 0 && idle.buttons == 0);
 }
 
+void test_parse_screen_steps() {
+    std::vector<InputScriptEvent> ev;
+    std::string error;
+    CHECK(parse_input_script("2000 A\n"
+                             "1000 B\n"
+                             "wait draws_per_frame==33|50 for 2s timeout 1.5s\n"
+                             "500 DUp 150\n"
+                             "0 A\n"
+                             "repeat every 14s until draws==33 for 500ms timeout 400s\n"
+                             "  6500 A\n"
+                             "  0 DUp\n"
+                             "end\n"
+                             "capture\n"
+                             "wait presents>=1200\n"
+                             "100 A\n",
+                             ev, error));
+    CHECK(ev.size() == 12);
+    if (ev.size() == 12) {
+        // Presses are sorted only within their run.
+        CHECK(ev[0].time_ms == 1000 && ev[1].time_ms == 2000);
+        CHECK(ev[2].kind == InputStepKind::Wait && ev[2].for_ms == 2000 && ev[2].timeout_ms == 1500);
+        CHECK(ev[2].cond.metric == InputCondition::Metric::DrawsPerFrame && ev[2].cond.op == InputCondition::Op::Eq);
+        CHECK(ev[2].cond.values == std::vector<uint64_t>({33, 50}));
+        CHECK(ev[3].time_ms == 0 && ev[4].time_ms == 500 && ev[4].buttons == button::kDPadUp && ev[4].hold_ms == 150);
+        CHECK(ev[5].kind == InputStepKind::RepeatBegin && ev[5].every_ms == 14000 && ev[5].for_ms == 500 &&
+              ev[5].timeout_ms == 400000 && ev[5].end_index == 8);
+        CHECK(ev[6].time_ms == 0 && ev[7].time_ms == 6500);
+        CHECK(ev[8].kind == InputStepKind::RepeatEnd && ev[9].kind == InputStepKind::Capture);
+        CHECK(ev[10].cond.metric == InputCondition::Metric::Presents && ev[10].cond.op == InputCondition::Op::Ge &&
+              ev[10].cond.values[0] == 1200 && ev[10].for_ms == 0 && ev[10].timeout_ms == 0);
+        CHECK(playgta6::guest::condition_text(ev[2].cond) == "draws_per_frame==33|50");
+    }
+    // Operators, durations.
+    CHECK(parse_input_script("wait draws!=4|0 for 250\nwait presents<10\nwait presents>3 timeout 2s\n", ev, error) &&
+          ev.size() == 3 && ev[0].cond.op == InputCondition::Op::Ne && ev[0].for_ms == 250 &&
+          ev[1].cond.op == InputCondition::Op::Lt && ev[2].cond.op == InputCondition::Op::Gt);
+    // Malformed steps.
+    CHECK(!parse_input_script("wait fps==30\n", ev, error) && error.find("bad condition") != std::string::npos);
+    CHECK(!parse_input_script("wait draws>=3|4\n", ev, error));  // alternatives only for == / !=
+    CHECK(!parse_input_script("wait draws==\n", ev, error));
+    CHECK(!parse_input_script("wait draws==3 for\n", ev, error) && error.find("bad duration") != std::string::npos);
+    CHECK(!parse_input_script("wait draws==3 for 2m\n", ev, error));
+    CHECK(!parse_input_script("wait draws==3 soon 2s\n", ev, error) && error.find("unexpected") != std::string::npos);
+    CHECK(!parse_input_script("repeat until draws==3\n0 A\nend\n", ev, error));
+    CHECK(!parse_input_script("repeat every 0s until draws==3\nend\n", ev, error));
+    CHECK(!parse_input_script("repeat every 1s until draws==3\n0 A\n", ev, error) && error.find("without 'end'") != std::string::npos);
+    CHECK(!parse_input_script("end\n", ev, error) && error.find("without 'repeat'") != std::string::npos);
+    CHECK(!parse_input_script("repeat every 1s until draws==3\nrepeat every 1s until draws==4\nend\nend\n", ev, error));
+    CHECK(!parse_input_script("capture now\n", ev, error));
+}
+
+void test_condition_tracker() {
+    InputCondition c;
+    c.op = InputCondition::Op::Eq;
+    c.values = {33, 50};
+    CHECK(playgta6::guest::condition_holds(c, InputStatus{0, 33}));
+    CHECK(!playgta6::guest::condition_holds(c, InputStatus{0, 4}));
+    // Held continuously for 2 s; a blip restarts the clock.
+    ConditionTracker t(c, 2000);
+    CHECK(!t.update(0, InputStatus{10, 4}));
+    CHECK(!t.update(100, InputStatus{11, 33}) && t.holds_now());
+    CHECK(!t.update(1500, InputStatus{20, 50}));
+    CHECK(!t.update(1600, InputStatus{21, 3}) && !t.holds_now());
+    CHECK(!t.update(1700, InputStatus{22, 33}));
+    CHECK(!t.update(3600, InputStatus{40, 33}));
+    CHECK(t.update(3700, InputStatus{41, 33}) && t.met());
+    CHECK(t.update(3800, InputStatus{42, 4}));  // stays met
+    // for 0: met at the first sample that holds.
+    InputCondition p;
+    p.metric = InputCondition::Metric::Presents;
+    p.op = InputCondition::Op::Ge;
+    p.values = {100};
+    ConditionTracker now(p, 0);
+    CHECK(!now.update(5, InputStatus{99, 0}) && now.update(6, InputStatus{100, 0}));
+}
+
+void test_player_waits_for_the_screen() {
+    // A fake present counter: the "screen" switches to 33 draws once `screen` is set.
+    static std::atomic<uint64_t> draws{4};
+    static std::atomic<uint64_t> presents{0};
+    std::vector<InputScriptEvent> ev;
+    std::string error;
+    CHECK(parse_input_script("wait draws_per_frame==33 for 50ms\n"
+                             "0 A 20\n"
+                             "capture\n"
+                             "wait presents>=1000000 timeout 30ms\n"
+                             "0 B 20\n",
+                             ev, error));
+    playgta6::InputState state{};
+    playgta6::os::GameInputReader reader(&state);
+    std::atomic<int> captured{0};
+    playgta6::guest::InputScriptPlayer player(ev, &state);
+    player.set_status_probe([] { return InputStatus{presents.fetch_add(1), draws.load()}; });
+    player.set_on_capture([&] { captured.fetch_add(1); });
+    player.start();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    CHECK(player.writes() == 0 && state.seq == 0);  // still on the 4-draw screen: nothing pressed
+    draws.store(33);
+    bool done = false;
+    for (int i = 0; i < 400 && !done; ++i) {
+        done = player.finished();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(done);
+    CHECK(player.writes() == 4);  // A down/up, B down/up
+    CHECK(captured.load() == 1);
+    CHECK(player.waits_done() == 2 && player.waits_timed_out() == 1);
+    CHECK(reader.buttons() == 0);
+}
+
+void test_player_repeat_stops_on_the_target_screen() {
+    // The body presses A every round until the status reads 33 draws; the screen flips after the
+    // second press, so exactly two presses go out and the repeat ends met.
+    static std::atomic<uint64_t> draws{20};
+    draws.store(20);
+    std::vector<InputScriptEvent> ev;
+    std::string error;
+    CHECK(parse_input_script("repeat every 200ms until draws==33 for 30ms timeout 5s\n"
+                             "0 A 10\n"
+                             "end\n",
+                             ev, error));
+    playgta6::InputState state{};
+    playgta6::guest::InputScriptPlayer player(ev, &state);
+    player.set_status_probe([&player] {
+        if (player.writes() >= 4) {
+            draws.store(33);  // the second press (writes 3 and 4) changed the screen
+        }
+        return InputStatus{0, draws.load()};
+    });
+    player.start();
+    bool done = false;
+    for (int i = 0; i < 400 && !done; ++i) {
+        done = player.finished();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    CHECK(done);
+    CHECK(player.writes() == 4);  // two presses, two releases
+    CHECK(player.waits_done() == 1 && player.waits_timed_out() == 0);
+}
+
 void test_title_reads_the_script_through_game_input() {
     // The harness attaches the script's InputState the way the browser bridge attaches its buffer.
     playgta6::InputState state{};
@@ -156,6 +301,10 @@ void test_title_reads_the_script_through_game_input() {
 int main() {
     test_parse();
     test_player_presses_and_releases();
+    test_parse_screen_steps();
+    test_condition_tracker();
+    test_player_waits_for_the_screen();
+    test_player_repeat_stops_on_the_target_screen();
     test_title_reads_the_script_through_game_input();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_input_script: %d failure(s)\n", g_failures);

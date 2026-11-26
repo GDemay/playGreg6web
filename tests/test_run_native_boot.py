@@ -66,6 +66,7 @@ class Fixture:
         touch(self.recomp, base + 10)
         touch(self.manifest, base + 20)
         self.base = base
+        self.lift_cache = root / "liftcache"
 
     def run(self, *argv, runner=None, env=None):
         calls = []
@@ -81,8 +82,83 @@ class Fixture:
             code = rnb.main(
                 ["--exe", str(self.exe), "--game-dir", str(self.pkg), "--build-dir", str(self.build),
                  "--harness", str(self.harness), *argv],
-                runner=runner or default_runner, env=env or {}, repo_root=self.repo)
+                runner=runner or default_runner,
+                env=env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache)}, repo_root=self.repo)
         return code, out.getvalue(), err.getvalue(), calls
+
+
+class LiftCacheTests(unittest.TestCase):
+    BASE = ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"},
+            {"runtime/os/x.h": "d"}, ["--target", "native"])
+
+    def test_any_input_change_changes_the_key(self):
+        base = rnb.lift_key(*self.BASE)
+        self.assertEqual(base, rnb.lift_key(*self.BASE))
+        variants = [
+            ({"recomp/src/main.rs": "A", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b", "recomp/src/new.rs": "z"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "B"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe2", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "C"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "D"}, ["--target", "native"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "wasm64"]),
+            ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "exe", {"bink.dll": "c"}, {"runtime/os/x.h": "d"}, ["--target", "native", "--x"]),
+            # the same hash under another name (a file moved to another table) is another input
+            ({"recomp/src/main.rs": "a"}, "exe", {"bink.dll": "c", "cargo.lock": "b"}, {"runtime/os/x.h": "d"}, ["--target", "native"]),
+        ]
+        keys = {rnb.lift_key(*v) for v in variants}
+        self.assertEqual(len(keys), len(variants))
+        self.assertNotIn(base, keys)
+
+    def test_inputs_key_follows_file_contents(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            key = lambda: rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg, ["--target", "native"])  # noqa: E731
+            seen = {key()}
+            for path, text in ((fx.repo / "recomp" / "src" / "main.rs", "fn main() {}"), (fx.exe, "MZ2"),
+                               (fx.pkg / "a.dll", "dll"), (fx.repo / "runtime" / "os" / "x.h", "#pragma once")):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+                seen.add(key())
+            self.assertEqual(len(seen), 5)
+            self.assertEqual(rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg, ["--target", "native"]), key())
+
+    def test_miss_stores_and_a_hit_skips_recomp_and_lift(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 100)
+
+            def lifting_runner(cmd, cwd, log, timeout):
+                if len(cmd) > 1 and cmd[1] == "build-program":
+                    out = Path(cmd[cmd.index("--out") + 1])
+                    (out / "main" / "lift").mkdir(parents=True)
+                    (out / "main" / "lift" / "shard-00000.ll").write_text("ir")
+                    (out / "program-manifest.json").write_text("{}")
+                return 0 if log is None else rnb.run_command(cmd, cwd, log, timeout)
+
+            code, _, err, _ = fx.run("--name", "r1", runner=lifting_runner)
+            self.assertEqual(code, 0, err)
+            entries = [e for e in fx.lift_cache.iterdir()]
+            self.assertEqual(len(entries), 1)
+            self.assertTrue((entries[0] / "main" / "lift" / "shard-00000.ll").is_file())
+            # The harness deletes IR it no longer needs: the cache keeps its own link.
+            (fx.build / "program" / "main" / "lift" / "shard-00000.ll").unlink()
+            # Same inputs, recompiler sources newer again (another checkout): nothing to redo.
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 200)
+            code, _, err, calls = fx.run("--name", "r2")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(calls), 1, calls)  # stamp matches: only the harness
+            # A fresh build dir takes the program from the cache.
+            fx.build = Path(d) / "build2"
+            code, _, err, calls = fx.run("--name", "r3")
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(calls), 1, calls)
+            self.assertIn("lift cache hit", err)
+            self.assertEqual((fx.build / "program" / "main" / "lift" / "shard-00000.ll").read_text(), "ir")
+            # --rebuild-program lifts again.
+            code, _, err, calls = fx.run("--name", "r4", "--rebuild-program", runner=lifting_runner)
+            self.assertIn("[plan] program: forced", err)
 
 
 class StalenessTests(unittest.TestCase):
@@ -185,6 +261,50 @@ class StalenessTests(unittest.TestCase):
             self.assertIn("program failed", err)
 
 
+class RelaunchTests(unittest.TestCase):
+    def fake_runner(self, run_dir: Path, exit_codes: list[int]):
+        calls = []
+
+        def runner(cmd, cwd, log, timeout):
+            calls.append(list(cmd))
+            code = exit_codes[min(len(calls) - 1, len(exit_codes) - 1)]
+            (run_dir / "boot-report.json").write_text(json.dumps({"status": "exited", "exit_code": code}))
+            log.write_text(f"launch {len(calls)}")
+            return 0
+
+        return runner, calls
+
+    def test_self_relaunch_reruns_with_the_same_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [rnb.RELAUNCH_SELF_EXIT_CODE, 0])
+            with redirect_stderr(io.StringIO()) as err:
+                code, report, relaunches = rnb.run_with_relaunch(["h", "--x"], run_dir, run_dir, runner, 5)
+            self.assertEqual((code, report["exit_code"], relaunches), (0, 0, 1))
+            self.assertEqual(calls, [["h", "--x"], ["h", "--x"]])
+            self.assertEqual(json.loads((run_dir / "boot-report.launch1.json").read_text())["exit_code"],
+                             rnb.RELAUNCH_SELF_EXIT_CODE)
+            self.assertEqual((run_dir / "boot.launch1.log").read_text(), "launch 1")
+            self.assertEqual((run_dir / "boot.log").read_text(), "launch 2")
+            self.assertIn("relaunched itself", err.getvalue())
+
+    def test_relaunches_are_capped_and_other_exits_do_not_relaunch(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [rnb.RELAUNCH_SELF_EXIT_CODE])
+            with redirect_stderr(io.StringIO()):
+                _, report, relaunches = rnb.run_with_relaunch(["h"], run_dir, run_dir, runner, 5)
+            self.assertEqual(relaunches, rnb.MAX_RELAUNCHES)
+            self.assertEqual(len(calls), rnb.MAX_RELAUNCHES + 1)
+            self.assertTrue(rnb.is_relaunch_request(report))
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = Path(d)
+            runner, calls = self.fake_runner(run_dir, [3])
+            _, _, relaunches = rnb.run_with_relaunch(["h"], run_dir, run_dir, runner, 5)
+            self.assertEqual((relaunches, len(calls)), (0, 1))
+        self.assertFalse(rnb.is_relaunch_request(None))
+
+
 class RunTests(unittest.TestCase):
     def test_paths_required_and_from_env(self):
         out, err = io.StringIO(), io.StringIO()
@@ -274,54 +394,123 @@ class RunTests(unittest.TestCase):
         self.assertEqual(rnb.timeline_presents({"presents": cap, "present_samples": samples}), cap)
         self.assertEqual(rnb.timeline_presents({}), [])
 
+    @staticmethod
+    def _sections(script: str):
+        """(timed presses before the repeat, repeat header, repeat body, steps after `end`)."""
+        lines = [line.strip() for line in script.splitlines() if line.strip() and not line.startswith("#")]
+        r = next(i for i, line in enumerate(lines) if line.startswith("repeat "))
+        e = lines.index("end")
+        return ([line.split() for line in lines[:r]], lines[r], [line.split() for line in lines[r + 1:e]],
+                lines[e + 1:])
+
+    def _check_to_list_screen(self, script: str):
+        before, header, body, after = self._sections(script)
+        self.assertEqual(before[0], ["20000", "A", "100"])
+        self.assertEqual(before[-1], ["57500", "A", "100"])
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual([e[1] for e in body], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(body[-1], ["6500", "A", "100"])
+        self.assertEqual(after[0], "capture")
+        return [line.split() for line in after[1:]]
+
     def test_menu_flow_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow"]["max_ms"], 240_000)
-        script = rnb.input_script_text(240_000, "menu-flow").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        self.assertEqual(events[0], ["20000", "A", "100"])
-        # Down, Down, A for LEGAL NOTICES' "Next >", every 12 s from 64 s.
-        i = events.index(["64000", "DDown", "150"])
-        self.assertEqual(events[i + 1], ["66000", "DDown", "150"])
-        self.assertEqual(events[i + 2], ["68500", "A", "100"])
-        times = [int(e[0]) for e in events]
-        self.assertEqual(times, sorted(times))
-        self.assertLess(times[-1], 240_000)
+        tail = self._check_to_list_screen(rnb.input_script_text(240_000, "menu-flow"))
+        self.assertEqual(tail[0], ["3000", "A", "100"])
+        self.assertEqual({e[1] for e in tail}, {"A"})
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
             code, _, _, _ = fx.run("--preset", "menu-flow", "--name", "mf")
             self.assertEqual(code, 0)
-            written = (fx.build / "runs" / "mf" / "input-script.txt").read_text().splitlines()
-            self.assertIn("68500 A 100", written)
+            written = (fx.build / "runs" / "mf" / "input-script.txt").read_text()
+            self.assertIn("repeat every 14s until draws_per_frame==33|50 for 1500ms", written)
             args = json.loads((fx.build / "runs" / "mf" / "boot-report.json").read_text())["args"]
             self.assertEqual(args[args.index("--max-ms") + 1], "240000")
 
     def test_menu_flow_2_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow-2"]["max_ms"], 360_000)
-        script = rnb.input_script_text(360_000, "menu-flow-2").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        self.assertEqual(events[0], ["20000", "A", "100"])
-        times = [int(e[0]) for e in events]
+        tail = self._check_to_list_screen(rnb.input_script_text(360_000, "menu-flow-2"))
+        # After the list screen: every 14 s Up x6 reset, then Down, Down, A.
+        self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(tail[0], ["2000", "DUp", "100"])
+        self.assertEqual(tail[8], ["8500", "A", "100"])
+        self.assertIn(["16000", "DUp", "100"], tail)
+        times = [int(e[0]) for e in tail]
         self.assertEqual(times, sorted(times))
         self.assertLess(times[-1], 360_000)
-        # Each cycle: Up x6 reset, then Down, Down, A (the list screen's third entry).
-        i = events.index(["64000", "DUp", "100"])
-        self.assertEqual([e[1] for e in events[i:i + 9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
-        self.assertEqual(events[i + 8], ["70500", "A", "100"])
-        self.assertIn(["78000", "DUp", "100"], events)
-        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown"})
 
     def test_menu_flow_3_preset(self):
         self.assertEqual(rnb.PRESETS["menu-flow-3"]["max_ms"], 420_000)
-        script = rnb.input_script_text(420_000, "menu-flow-3").splitlines()
-        events = [line.split() for line in script if not line.startswith("#")]
-        times = [int(e[0]) for e in events]
+        tail = self._check_to_list_screen(rnb.input_script_text(420_000, "menu-flow-3"))
+        self.assertEqual(tail[:2], [["0", "RDown", "1200"], ["1500", "DDown", "150"]])
+        self.assertIn(["102000", "A", "100"], tail)
+        self.assertEqual({e[1] for e in tail}, {"A", "DDown", "RDown"})
+        self.assertFalse([e for e in tail if e[1] == "A" and int(e[0]) < 102_000])
+        times = [int(e[0]) for e in tail]
         self.assertEqual(times, sorted(times))
         self.assertLess(times[-1], 420_000)
-        self.assertIn(["64000", "DUp", "100"], events)
-        self.assertIn(["200000", "RDown", "1200"], events)
-        self.assertIn(["302000", "A", "100"], events)
-        self.assertEqual({e[1] for e in events}, {"A", "DUp", "DDown", "RDown"})
-        self.assertFalse([e for e in events if e[1] == "DUp" and 200_000 <= int(e[0]) < 302_000])
+
+    def test_menu_flow_4_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-flow-4"]["max_ms"], 420_000)
+        script = rnb.input_script_text(420_000, "menu-flow-4")
+        before, header, body, after = self._sections(script)
+        self.assertEqual(header, "repeat every 14s until draws_per_frame==33|50 for 1500ms")
+        self.assertEqual(after[:4], ["capture", "1000 DUp 150", "3000 A 100",
+                                     "wait draws_per_frame==34 for 2s timeout 30s"])
+        tail = [line.split() for line in after[4:]]
+        self.assertEqual([e[1] for e in tail[:9]], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertLess(int(tail[-1][0]), 420_000)
+
+    def test_menu_to_ingame_preset(self):
+        self.assertEqual(rnb.PRESETS["menu-to-ingame"]["max_ms"], 900_000)
+        script = rnb.input_script_text(900_000, "menu-to-ingame")
+        lines = [x.strip() for x in script.splitlines() if x.strip() and not x.startswith("#")]
+        i = lines.index("repeat every 14s until draws_per_frame==37 for 500ms timeout 240s")
+        self.assertEqual(lines[i + 1:i + 3], ["0 A 100", "end"])
+        # No A between reaching LEGAL NOTICES and the menu cycle: a plain wait, B only while not 37.
+        self.assertEqual(lines[i + 3:i + 8],
+                         ["wait draws_per_frame==37 for 2s timeout 30s",
+                          "repeat every 3s until draws_per_frame==37 for 1s timeout 30s", "0 B 150", "end",
+                          "repeat every 14s until draws_per_frame==33|50|51 for 1500ms timeout 240s"])
+        # Up x6 (cursor on Copyright), Down, Down ("Next >"), A; repeated until the next screen holds
+        # (44 is LEGAL NOTICES with the cursor moved, so "!= 37" is not a pass).
+        cycle = [e.split() for e in lines[i + 8:i + 17]]
+        self.assertEqual([e[1] for e in cycle], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(lines[i + 17:i + 19], ["end", "capture"])
+        self.assertFalse(any("draws_per_frame!=37" in x for x in lines))
+        after = lines[i + 19:]
+        self.assertEqual(after[:5], ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
+                                     "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
+        self.assertTrue(after[5].startswith("repeat every 12s until presents>="))
+        self.assertIn("7000 Up+RT 1000", after)
+        self.assertEqual(after[-1], "end")
+
+    def test_logged_input_times_and_wait_line(self):
+        log = ("[harness] input script x: 12 event(s)\n"
+               "[input] 20000 ms: press 0x1 100\n"
+               "[input] 141600 ms: repeat (7 round(s)) draws_per_frame==33|50 met (presents 1900, draws_per_frame 50)\n"
+               "[input] 141600 ms: capture\n"
+               "[input] 141600 ms: press 0x100 1200\n"
+               "[input] 170000 ms: wait draws_per_frame!=33|50 timed out (presents 2300, draws_per_frame 33)\n")
+        self.assertEqual(rnb.logged_input_times(log), [20000.0, 141600.0])
+        self.assertEqual(rnb.input_wait_line(log),
+                         "input waits: repeat (7 round(s)) draws_per_frame==33|50 met @ 141.6 s; "
+                         "wait draws_per_frame!=33|50 timed out @ 170.0 s")
+        self.assertIsNone(rnb.input_wait_line("[input] 5 ms: press 0x1 100\n"))
+
+    def test_capture_start_flags_pass_through(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            fx.run("--name", "late", "--gpu-capture-frames", "500", "--gpu-capture-payloads",
+                   "--gpu-capture-start-ms", "120000")
+            args = json.loads((fx.build / "runs" / "late" / "boot-report.json").read_text())["args"]
+            self.assertEqual(args[args.index("--gpu-capture-start-ms") + 1], "120000")
+            self.assertNotIn("--gpu-capture-start-at-script", args)
+            fx.run("--preset", "menu-flow-3", "--name", "late2", "--gpu-capture-frames", "500",
+                   "--gpu-capture-start-at-script")
+            args = json.loads((fx.build / "runs" / "late2" / "boot-report.json").read_text())["args"]
+            self.assertIn("--gpu-capture-start-at-script", args)
+            self.assertNotIn("--gpu-capture-start-ms", args)
 
     def test_presets(self):
         self.assertEqual(rnb.PRESETS["long"]["max_ms"], 600_000)
@@ -333,6 +522,13 @@ class RunTests(unittest.TestCase):
             self.assertEqual(args[args.index("--max-ms") + 1], "1234")
             self.assertEqual(args[args.index("--watchdog-ms") + 1], "99")
             self.assertNotIn("--input-script", args)
+
+    def test_watchdog_follows_max_ms_override(self):
+        pre = rnb.PRESETS["menu-flow"]
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, None, None), 270_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 300_000, None), 330_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 100_000, None), 270_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 300_000, 99), 99)
 
     def test_missing_report_and_existing_run_dir(self):
         with tempfile.TemporaryDirectory() as d:
@@ -412,6 +608,17 @@ class ThumbnailTests(unittest.TestCase):
     def test_selection_skips_uncaptured_frames(self):
         self.assertEqual(rnb.thumbnail_frames(self.SEGS, total_presents=9), [])
 
+    def test_selection_with_late_capture(self):
+        # Frame i of a capture started at present 7 is present 7 + i: the middle of the captured
+        # part of segment 1 (presents 7..14) is present 10, trace frame 3.
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS, first_present=7), [(1, 3, 120, 2.0)])
+        self.assertEqual(rnb.thumbnail_frames(self.SEGS, first_present=15), [])
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d)
+            self.assertEqual(rnb.capture_first_present(run), 0)
+            (run / "capture.pg6trace.json").write_text('{"first_present": 7}')
+            self.assertEqual(rnb.capture_first_present(run), 7)
+
     def test_name(self):
         self.assertEqual(rnb.thumbnail_name(1, 2.0, 120), "seg01_2s_120d.png")
 
@@ -460,6 +667,10 @@ class AudioLineTests(unittest.TestCase):
             "audio: 4800 frames, 50.0% non-silent (1/3 windows), spatial passes 3, "
             "xapu decoded 9 / failed 1 / results 10")
         self.assertIn(line, rnb.digest(report, 0))
+
+    def test_audio_line_flags_unhandled_xapu_commands(self):
+        report = {"audio": {"xapu_results_posted": 2, "xapu_unhandled_commands": 3}}
+        self.assertTrue(rnb.audio_line(report).endswith("/ results 2 / unhandled commands 3"))
 
     def test_no_audio_section_no_line(self):
         self.assertIsNone(rnb.audio_line({}))

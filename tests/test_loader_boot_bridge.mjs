@@ -49,6 +49,7 @@ const {
   buildRuntimeModuleConfig,
   createRuntimeModuleOptions,
   encodeTestFramePacket,
+  toTransferableArrayBuffer,
 } = require('../web/loader.js');
 
 function packet(opcode, payloadBytes = 0, flags = 0) {
@@ -262,7 +263,9 @@ test('collectBootBridgeInitFields and worker payloads omit optional URLs when ab
     'bootBase',
     'gameBase',
     'programManifestUrl',
+    'opfsL2Enabled',
   ]);
+  assert.deepEqual(collectBootBridgeInitFields({ opfsL2Enabled: false }), { opfsL2Enabled: false });
   assert.deepEqual(collectBootBridgeInitFields({ canvas: true, dataBase: '/data/' }), {});
   const payloads = createWorkerBootInitPayloads({
     canvas: 'offscreen',
@@ -276,7 +279,9 @@ test('collectBootBridgeInitFields and worker payloads omit optional URLs when ab
     canvas: 'offscreen',
     width: 1280,
     height: 720,
+    enableResourceReplay: false,
   });
+  assert.equal('enableResourceReplay' in payloads.ioInit, false);
   assert.equal('shaderPackUrl' in payloads.ioInit, false);
   assert.equal('bootBase' in payloads.gpuInit, false);
   assert.equal('gameBase' in payloads.ioInit, false);
@@ -3341,4 +3346,897 @@ test('W180/#918 buildRuntimeModuleConfig hooks preRun timer + onExit final flush
   ]);
   assert.equal(syncer2.getStats().filesUploaded, 2);
   assert.equal(syncer2.getStats().pendingCount, 0);
+});
+
+test('W345 createWorkerBootInitPayloads disables enableResourceReplay by default and honors explicit overrides', () => {
+  const defaultPayloads = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+  });
+  assert.equal(defaultPayloads.gpuInit.enableResourceReplay, false);
+  assert.equal('enableResourceReplay' in defaultPayloads.ioInit, false);
+
+  const optedIn = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: true,
+  });
+  assert.equal(optedIn.gpuInit.enableResourceReplay, true);
+  assert.equal('enableResourceReplay' in optedIn.ioInit, false);
+
+  const optedOut = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: false,
+  });
+  assert.equal(optedOut.gpuInit.enableResourceReplay, false);
+
+  // Non-boolean values fall back safely to false.
+  const nonBoolean = createWorkerBootInitPayloads({
+    canvas: 'c',
+    width: 1920,
+    height: 1080,
+    dataBase: '/data/',
+    enableResourceReplay: 'yes',
+  });
+  assert.equal(nonBoolean.gpuInit.enableResourceReplay, false);
+});
+
+test('W345 toTransferableArrayBuffer avoids copying standalone non-shared buffers and safely copies subviews/SABs', () => {
+  // 1. Standalone ArrayBuffer -> returned directly (same reference, zero copy).
+  const standaloneAb = new ArrayBuffer(16);
+  new Uint8Array(standaloneAb).set([1, 2, 3, 4]);
+  assert.equal(toTransferableArrayBuffer(standaloneAb), standaloneAb);
+
+  // 2. Full-span Uint8Array / DataView / Int32Array -> backing ArrayBuffer returned directly.
+  const fullU8 = new Uint8Array([10, 20, 30, 40]);
+  assert.equal(toTransferableArrayBuffer(fullU8), fullU8.buffer);
+  const fullDv = new DataView(fullU8.buffer);
+  assert.equal(toTransferableArrayBuffer(fullDv), fullU8.buffer);
+  const fullI32 = new Int32Array(fullU8.buffer);
+  assert.equal(toTransferableArrayBuffer(fullI32), fullU8.buffer);
+
+  // 3. Empty standalone Uint8Array -> backing ArrayBuffer returned directly.
+  const emptyU8 = new Uint8Array(0);
+  assert.equal(toTransferableArrayBuffer(emptyU8), emptyU8.buffer);
+
+  // 4. Subview of larger ArrayBuffer -> copied into an exact-length standalone ArrayBuffer.
+  const big = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7]);
+  const sub = big.subarray(2, 6);
+  const subBuf = toTransferableArrayBuffer(sub);
+  assert.ok(subBuf instanceof ArrayBuffer);
+  assert.notEqual(subBuf, big.buffer);
+  assert.deepEqual(new Uint8Array(subBuf), new Uint8Array([2, 3, 4, 5]));
+
+  // 5. SharedArrayBuffer and SharedArrayBuffer-backed view -> copied into a non-shared ArrayBuffer.
+  const sab = new SharedArrayBuffer(8);
+  new Uint8Array(sab).set([9, 8, 7, 6, 5, 4, 3, 2]);
+  const sabCopy = toTransferableArrayBuffer(sab);
+  assert.ok(sabCopy instanceof ArrayBuffer);
+  assert.equal(sabCopy instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(sabCopy), new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]));
+
+  const sabView = new Uint8Array(sab, 0, 8);
+  const sabViewCopy = toTransferableArrayBuffer(sabView);
+  assert.ok(sabViewCopy instanceof ArrayBuffer);
+  assert.equal(sabViewCopy instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(sabViewCopy), new Uint8Array([9, 8, 7, 6, 5, 4, 3, 2]));
+
+  // 6. Nullish / invalid inputs return null.
+  assert.equal(toTransferableArrayBuffer(null), null);
+  assert.equal(toTransferableArrayBuffer(undefined), null);
+  assert.equal(toTransferableArrayBuffer({}), null);
+});
+
+test('W345 coordinator wgpuSubmit transfers standalone ArrayBuffer with zero extra copy and copies subviews/SAB views', () => {
+  const posted = [];
+  const mockGpuWorker = {
+    postMessage(msg, transfer) {
+      posted.push({ msg, transfer });
+    },
+  };
+
+  const cfg = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker,
+    reportFn: () => {},
+  });
+
+  // Standalone Uint8Array (same shape produced by copyMemoryBytes) -> zero copy, exact buffer identity!
+  const standalone = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0]);
+  let sliceCalls = 0;
+  standalone.slice = () => {
+    sliceCalls += 1;
+    throw new Error('W345 regression: redundant bytes.slice() called on standalone Uint8Array');
+  };
+  cfg.hostCallbacks.wgpuSubmit(standalone);
+  assert.equal(sliceCalls, 0);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].msg.cmdBuffer, standalone.buffer);
+  assert.deepEqual(posted[0].transfer, [standalone.buffer]);
+
+  // Subview -> safely copied into a standalone exact-length ArrayBuffer.
+  const backing = new Uint8Array([99, 98, 7, 0, 0, 0, 0, 0, 0, 0, 97]);
+  const subview = backing.subarray(2, 10);
+  cfg.hostCallbacks.wgpuSubmit(subview);
+  assert.equal(posted.length, 2);
+  assert.notEqual(posted[1].msg.cmdBuffer, backing.buffer);
+  assert.equal(posted[1].msg.cmdBuffer.byteLength, 8);
+  assert.deepEqual(new Uint8Array(posted[1].msg.cmdBuffer), subview);
+  assert.deepEqual(posted[1].transfer, [posted[1].msg.cmdBuffer]);
+
+  // SharedArrayBuffer-backed view -> safely copied into a transferable ArrayBuffer.
+  const sab = new SharedArrayBuffer(8);
+  const sabView = new Uint8Array(sab);
+  sabView.set([7, 0, 0, 0, 0, 0, 0, 0]);
+  cfg.hostCallbacks.wgpuSubmit(sabView);
+  assert.equal(posted.length, 3);
+  assert.ok(posted[2].msg.cmdBuffer instanceof ArrayBuffer);
+  assert.equal(posted[2].msg.cmdBuffer instanceof SharedArrayBuffer, false);
+  assert.deepEqual(new Uint8Array(posted[2].msg.cmdBuffer), new Uint8Array([7, 0, 0, 0, 0, 0, 0, 0]));
+  assert.deepEqual(posted[2].transfer, [posted[2].msg.cmdBuffer]);
+});
+
+test('W349 forwardGpuWorkerMessage forwards first-visible-frame/visible-frame and preserves firstVisibleFrame fields on gpu-telemetry', () => {
+  const posted = [];
+  const post = (msg) => posted.push(msg);
+
+  // 1. Explicit first-visible-frame message from wgpu_worker is forwarded verbatim with all probe fields.
+  const adapterObj = {
+    vendor: 'nvidia',
+    architecture: 'turing',
+    device: 'geforce',
+    description: 'NVIDIA GeForce',
+    label: 'nvidia turing',
+    isFallbackAdapter: false,
+  };
+  const visibleMsg = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 45120.5,
+      firstPresentMs: 320.25,
+      blackLoadingMs: 44800.25,
+      presentCount: 2700,
+      realPackDrawsThisFrame: 18,
+      fallbackDrawsThisFrame: 2,
+      drawsThisFrame: 20,
+      source: 'swapchain_probe',
+      maxLuma: 235,
+      suppressedBlackFrames: 2699,
+      gpuAdapter: adapterObj,
+    },
+    post,
+  );
+  assert.equal(posted.length, 1);
+  assert.deepEqual(visibleMsg, posted[0]);
+  assert.equal(visibleMsg.type, 'first-visible-frame');
+  assert.equal(visibleMsg.firstVisibleFrame, true);
+  assert.equal(visibleMsg.firstVisibleFrameMs, 45120.5);
+  assert.equal(visibleMsg.firstPresentMs, 320.25);
+  assert.equal(visibleMsg.blackLoadingMs, 44800.25);
+  assert.equal(visibleMsg.presentCount, 2700);
+  assert.equal(visibleMsg.realPackDrawsThisFrame, 18);
+  assert.equal(visibleMsg.fallbackDrawsThisFrame, 2);
+  assert.equal(visibleMsg.drawsThisFrame, 20);
+  assert.equal(visibleMsg.source, 'swapchain_probe');
+  assert.equal(visibleMsg.maxLuma, 235);
+  assert.equal(visibleMsg.suppressedBlackFrames, 2699);
+  assert.deepEqual(visibleMsg.gpuAdapter, adapterObj);
+
+  // 2. visible-frame alias is also forwarded preserving string gpuAdapter & timing fields.
+  const visibleAlias = forwardGpuWorkerMessage(
+    {
+      type: 'visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 1200,
+      firstPresentMs: 100,
+      blackLoadingMs: 1100,
+      presentCount: 60,
+      source: 'pixel_readback',
+      maxLuma: 192,
+      suppressedBlackFrames: 59,
+      gpuAdapter: 'amd rdna2',
+    },
+    post,
+  );
+  assert.equal(posted.length, 2);
+  assert.equal(visibleAlias.type, 'visible-frame');
+  assert.equal(visibleAlias.firstVisibleFrame, true);
+  assert.equal(visibleAlias.firstVisibleFrameMs, 1200);
+  assert.equal(visibleAlias.firstPresentMs, 100);
+  assert.equal(visibleAlias.blackLoadingMs, 1100);
+  assert.equal(visibleAlias.presentCount, 60);
+  assert.equal(visibleAlias.source, 'pixel_readback');
+  assert.equal(visibleAlias.maxLuma, 192);
+  assert.equal(visibleAlias.suppressedBlackFrames, 59);
+  assert.equal(visibleAlias.gpuAdapter, 'amd rdna2');
+
+  // 3. gpu-telemetry from nested wgpu_worker { id, stats } preserves explicit firstVisibleFrame: false!
+  const blackLoadingStats = forwardGpuWorkerMessage(
+    {
+      id: 11,
+      stats: {
+        frameCount: 45,
+        drawCalls: 120,
+        realPackDrawCount: 42,
+        firstVisibleFrame: false,
+        firstVisibleFrameMs: null,
+        blackLoadingMs: null,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 45,
+        gpuAdapter: adapterObj,
+      },
+      gpuAdapter: adapterObj,
+      timestamp: 1700000010000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 3);
+  assert.equal(blackLoadingStats.type, 'gpu-telemetry');
+  assert.equal(blackLoadingStats.frameStats.realPackDrawCount, 42);
+  assert.equal(blackLoadingStats.firstVisibleFrame, false);
+  assert.equal(blackLoadingStats.firstVisibleFrameMs, null);
+  assert.equal(blackLoadingStats.blackLoadingMs, null);
+  assert.equal(blackLoadingStats.maxLuma, 0);
+  assert.equal(blackLoadingStats.suppressedBlackFrames, 45);
+  assert.deepEqual(blackLoadingStats.gpuAdapter, adapterObj);
+
+  // 4. Flat gpu-stats / gpu-telemetry with firstVisibleFrame: true preserves timing & adapter fields.
+  const visibleStats = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-stats',
+      framesPresented: 90,
+      realPackDrawCount: 250,
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 8400,
+      blackLoadingMs: 8100,
+      maxLuma: 224,
+      suppressedBlackFrames: 89,
+      gpuAdapter: 'nvidia turing',
+      timestamp: 1700000020000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 4);
+  assert.equal(visibleStats.type, 'gpu-telemetry');
+  assert.equal(visibleStats.firstVisibleFrame, true);
+  assert.equal(visibleStats.firstVisibleFrameMs, 8400);
+  assert.equal(visibleStats.blackLoadingMs, 8100);
+  assert.equal(visibleStats.maxLuma, 224);
+  assert.equal(visibleStats.suppressedBlackFrames, 89);
+  assert.equal(visibleStats.gpuAdapter, 'nvidia turing');
+});
+
+test('W349 loader.js gpuWorker.onmessage forwards firstVisibleFrame: false telemetry and first-visible-frame events end-to-end', () => {
+  const mainMessages = [];
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker && typeof gpuWorker.onmessage === 'function');
+
+  // 1. Black-frame stats reply preserves explicit firstVisibleFrame: false despite realPackDrawCount > 0.
+  gpuWorker.onmessage({
+    data: {
+      id: 1,
+      stats: {
+        frameCount: 15,
+        realPackDrawCount: 42,
+        firstVisibleFrame: false,
+        firstVisibleFrameMs: null,
+        blackLoadingMs: null,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 15,
+      },
+      gpuAdapter: { vendor: 'nvidia', architecture: 'turing', label: 'nvidia turing' },
+    },
+  });
+
+  // 2. First non-black frame event from wgpu_worker arrives verbatim on mainMessages.
+  gpuWorker.onmessage({
+    data: {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 45100,
+      firstPresentMs: 250,
+      blackLoadingMs: 44850,
+      presentCount: 2700,
+      source: 'swapchain_probe',
+      maxLuma: 235,
+      suppressedBlackFrames: 2699,
+      gpuAdapter: { vendor: 'nvidia', architecture: 'turing', label: 'nvidia turing' },
+    },
+  });
+
+  assert.equal(mainMessages.length, 2);
+  assert.equal(mainMessages[0].type, 'gpu-telemetry');
+  assert.equal(mainMessages[0].firstVisibleFrame, false);
+  assert.equal(mainMessages[0].frameStats.realPackDrawCount, 42);
+  assert.equal(mainMessages[0].suppressedBlackFrames, 15);
+  assert.equal(mainMessages[0].maxLuma, 0);
+  assert.equal(mainMessages[0].gpuAdapter.label, 'nvidia turing');
+
+  assert.equal(mainMessages[1].type, 'first-visible-frame');
+  assert.equal(mainMessages[1].firstVisibleFrame, true);
+  assert.equal(mainMessages[1].firstVisibleFrameMs, 45100);
+  assert.equal(mainMessages[1].firstPresentMs, 250);
+  assert.equal(mainMessages[1].blackLoadingMs, 44850);
+  assert.equal(mainMessages[1].presentCount, 2700);
+  assert.equal(mainMessages[1].source, 'swapchain_probe');
+  assert.equal(mainMessages[1].maxLuma, 235);
+  assert.equal(mainMessages[1].suppressedBlackFrames, 2699);
+  assert.equal(mainMessages[1].gpuAdapter.label, 'nvidia turing');
+});
+
+test('guestRelaunchPayload only answers the self-relaunch exit code', () => {
+  const { guestRelaunchPayload, RELAUNCH_SELF_EXIT_CODE, GUEST_RELAUNCH_MESSAGE_TYPE } = require('../web/loader.js');
+  assert.equal(RELAUNCH_SELF_EXIT_CODE, 0x52454c4e);
+  assert.deepEqual(guestRelaunchPayload(0x52454c4e), {
+    type: GUEST_RELAUNCH_MESSAGE_TYPE,
+    exitCode: RELAUNCH_SELF_EXIT_CODE,
+  });
+  assert.equal(guestRelaunchPayload(0), null);
+  assert.equal(guestRelaunchPayload(1), null);
+  assert.equal(guestRelaunchPayload(undefined), null);
+  assert.equal(guestRelaunchPayload(Number.NaN), null);
+});
+
+test('W358 forwardGpuWorkerMessage forwards swapchainProbe* telemetry on first-visible-frame, visible-frame, and gpu-telemetry', () => {
+  const posted = [];
+  const post = (msg) => posted.push(msg);
+
+  // 1. first-visible-frame with top-level camelCase non-zero probe counts & booleans.
+  const visibleNonZero = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 12345,
+      source: 'swapchain_probe',
+      maxLuma: 210,
+      suppressedBlackFrames: 40,
+      swapchainProbeCount: 14,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: true,
+      swapchainProbeErrorCount: 2,
+    },
+    post,
+  );
+  assert.equal(posted.length, 1);
+  assert.deepEqual(visibleNonZero, posted[0]);
+  assert.equal(visibleNonZero.swapchainProbeCount, 14);
+  assert.equal(visibleNonZero.swapchainProbeInFlight, false);
+  assert.equal(visibleNonZero.swapchainProbeSupported, true);
+  assert.equal(visibleNonZero.swapchainProbeErrorCount, 2);
+
+  // 2. first-visible-frame preserves explicit 0, false, and null (not dropped as falsy).
+  const visibleZerosAndNull = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      swapchainProbeCount: 0,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: null,
+      swapchainProbeErrorCount: 0,
+    },
+    post,
+  );
+  assert.equal(posted.length, 2);
+  assert.equal(visibleZerosAndNull.swapchainProbeCount, 0);
+  assert.equal(visibleZerosAndNull.swapchainProbeInFlight, false);
+  assert.equal(visibleZerosAndNull.swapchainProbeSupported, null);
+  assert.equal(visibleZerosAndNull.swapchainProbeErrorCount, 0);
+
+  // 3. visible-frame alias with snake_case fields nested inside stats.
+  const visibleSnakeNested = forwardGpuWorkerMessage(
+    {
+      type: 'visible-frame',
+      firstVisibleFrame: true,
+      stats: {
+        swapchain_probe_count: 7,
+        swapchain_probe_in_flight: true,
+        swapchain_probe_supported: false,
+        swapchain_probe_error_count: 3,
+      },
+    },
+    post,
+  );
+  assert.equal(posted.length, 3);
+  assert.equal(visibleSnakeNested.type, 'visible-frame');
+  assert.equal(visibleSnakeNested.swapchainProbeCount, 7);
+  assert.equal(visibleSnakeNested.swapchainProbeInFlight, true);
+  assert.equal(visibleSnakeNested.swapchainProbeSupported, false);
+  assert.equal(visibleSnakeNested.swapchainProbeErrorCount, 3);
+
+  // 4. gpu-telemetry from nested wgpu_worker { id, stats } preserves 0, false, and null.
+  const statsZeroNull = forwardGpuWorkerMessage(
+    {
+      id: 21,
+      stats: {
+        frameCount: 10,
+        firstVisibleFrame: false,
+        swapchainProbeCount: 0,
+        swapchainProbeInFlight: false,
+        swapchainProbeSupported: null,
+        swapchainProbeErrorCount: 0,
+      },
+      timestamp: 1700000030000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 4);
+  assert.equal(statsZeroNull.type, 'gpu-telemetry');
+  assert.equal(statsZeroNull.swapchainProbeCount, 0);
+  assert.equal(statsZeroNull.swapchainProbeInFlight, false);
+  assert.equal(statsZeroNull.swapchainProbeSupported, null);
+  assert.equal(statsZeroNull.swapchainProbeErrorCount, 0);
+
+  // 5. gpu-telemetry from nested wgpu_worker { id, stats } forwards active non-zero probe state.
+  const statsActive = forwardGpuWorkerMessage(
+    {
+      id: 22,
+      stats: {
+        frameCount: 95,
+        firstVisibleFrame: false,
+        swapchainProbeCount: 19,
+        swapchainProbeInFlight: true,
+        swapchainProbeSupported: true,
+        swapchainProbeErrorCount: 1,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 95,
+      },
+      timestamp: 1700000031000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 5);
+  assert.equal(statsActive.type, 'gpu-telemetry');
+  assert.equal(statsActive.swapchainProbeCount, 19);
+  assert.equal(statsActive.swapchainProbeInFlight, true);
+  assert.equal(statsActive.swapchainProbeSupported, true);
+  assert.equal(statsActive.swapchainProbeErrorCount, 1);
+
+  // 6. gpu-telemetry with snake_case fields in nested frameStats sanitizes integers & booleans.
+  const frameStatsSnake = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: {
+        framesPresented: 30,
+        swapchain_probe_count: 5.9,
+        swapchain_probe_in_flight: false,
+        swapchain_probe_supported: false,
+        swapchain_probe_error_count: 2.4,
+      },
+      timestamp: 1700000032000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 6);
+  assert.equal(frameStatsSnake.type, 'gpu-telemetry');
+  assert.equal(frameStatsSnake.swapchainProbeCount, 5);
+  assert.equal(frameStatsSnake.swapchainProbeInFlight, false);
+  assert.equal(frameStatsSnake.swapchainProbeSupported, false);
+  assert.equal(frameStatsSnake.swapchainProbeErrorCount, 2);
+
+  // 7. Invalid top-level values fall through cleanly to nested stats; absent fields stay omitted.
+  const fallbackFromInvalid = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-stats',
+      framesPresented: 40,
+      swapchainProbeCount: Number.NaN,
+      swapchainProbeInFlight: 'yes',
+      swapchainProbeSupported: 123,
+      swapchainProbeErrorCount: null,
+      stats: {
+        swapchain_probe_count: 8,
+        swapchain_probe_in_flight: true,
+        swapchain_probe_supported: null,
+        swapchain_probe_error_count: 4,
+      },
+    },
+    post,
+  );
+  assert.equal(posted.length, 7);
+  assert.equal(fallbackFromInvalid.swapchainProbeCount, 8);
+  assert.equal(fallbackFromInvalid.swapchainProbeInFlight, true);
+  assert.equal(fallbackFromInvalid.swapchainProbeSupported, null);
+  assert.equal(fallbackFromInvalid.swapchainProbeErrorCount, 4);
+
+  const withoutProbeFields = forwardGpuWorkerMessage({ framesPresented: 12 }, post);
+  assert.equal(posted.length, 8);
+  assert.equal('swapchainProbeCount' in withoutProbeFields, false);
+  assert.equal('swapchainProbeInFlight' in withoutProbeFields, false);
+  assert.equal('swapchainProbeSupported' in withoutProbeFields, false);
+  assert.equal('swapchainProbeErrorCount' in withoutProbeFields, false);
+});
+
+test('W358 loader.js gpuWorker.onmessage forwards swapchainProbe* telemetry end-to-end', () => {
+  const mainMessages = [];
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker && typeof gpuWorker.onmessage === 'function');
+
+  // 1. gpu-telemetry stats message with live swapchain probe counts.
+  gpuWorker.onmessage({
+    data: {
+      id: 101,
+      stats: {
+        frameCount: 64,
+        firstVisibleFrame: false,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 64,
+        swapchainProbeCount: 11,
+        swapchainProbeInFlight: true,
+        swapchainProbeSupported: true,
+        swapchainProbeErrorCount: 0,
+      },
+    },
+  });
+
+  // 2. first-visible-frame message with final probe counts.
+  gpuWorker.onmessage({
+    data: {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 18400,
+      source: 'swapchain_probe',
+      maxLuma: 228,
+      suppressedBlackFrames: 64,
+      swapchainProbeCount: 12,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: true,
+      swapchainProbeErrorCount: 1,
+    },
+  });
+
+  assert.equal(mainMessages.length, 2);
+  assert.equal(mainMessages[0].type, 'gpu-telemetry');
+  assert.equal(mainMessages[0].swapchainProbeCount, 11);
+  assert.equal(mainMessages[0].swapchainProbeInFlight, true);
+  assert.equal(mainMessages[0].swapchainProbeSupported, true);
+  assert.equal(mainMessages[0].swapchainProbeErrorCount, 0);
+
+  assert.equal(mainMessages[1].type, 'first-visible-frame');
+  assert.equal(mainMessages[1].swapchainProbeCount, 12);
+  assert.equal(mainMessages[1].swapchainProbeInFlight, false);
+  assert.equal(mainMessages[1].swapchainProbeSupported, true);
+  assert.equal(mainMessages[1].swapchainProbeErrorCount, 1);
+});
+
+test('W360 buildRuntimeModuleConfig posts attach-guest-memory without wgpuSubmit and re-posts after WebAssembly.Memory.grow()', () => {
+  // 1. options.memory already provided -> attaches immediately, no duplicate on unchanged check, re-attaches after grow().
+  const posted1 = [];
+  const mockGpuWorker1 = {
+    postMessage(msg) {
+      posted1.push(msg);
+    },
+  };
+  const sharedMem1 = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const initialBuf1 = sharedMem1.buffer;
+  const cfg1 = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker1,
+    memory: sharedMem1,
+    reportFn: () => {},
+  });
+
+  assert.equal(posted1.length, 1);
+  assert.equal(posted1[0].type, 'attach-guest-memory');
+  assert.equal(posted1[0].buffer, initialBuf1);
+
+  // Repeated check with unchanged buffer is an O(1) no-op.
+  assert.equal(cfg1.attachGuestMemory(), false);
+  assert.equal(posted1.length, 1);
+
+  // Growing shared memory produces a new SharedArrayBuffer; re-attaching posts the new buffer.
+  sharedMem1.grow(1);
+  const grownBuf1 = sharedMem1.buffer;
+  assert.notEqual(grownBuf1, initialBuf1);
+  assert.equal(cfg1.attachGuestMemory(), true);
+  assert.equal(posted1.length, 2);
+  assert.equal(posted1[1].type, 'attach-guest-memory');
+  assert.equal(posted1[1].buffer, grownBuf1);
+
+  // 2. Real-Chrome path (no options.memory): preRun / onRuntimeInitialized attach without wgpuSubmit ever being called.
+  const posted2 = [];
+  const mockGpuWorker2 = {
+    postMessage(msg) {
+      posted2.push(msg);
+    },
+  };
+  const sharedMem2 = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const cfg2 = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker2,
+    reportFn: () => {},
+  });
+  assert.equal(posted2.length, 0);
+
+  const mockRuntimeMod = { wasmMemory: sharedMem2 };
+  cfg2.preRun[0](mockRuntimeMod);
+  assert.equal(posted2.length, 1);
+  assert.equal(posted2[0].type, 'attach-guest-memory');
+  assert.equal(posted2[0].buffer, sharedMem2.buffer);
+
+  // onRuntimeInitialized with unchanged memory does not duplicate.
+  cfg2.onRuntimeInitialized.call(mockRuntimeMod);
+  assert.equal(posted2.length, 1);
+
+  // After Memory.grow(), host_log (or onRuntimeInitialized) automatically re-sends the grown SAB.
+  sharedMem2.grow(1);
+  const grownBuf2 = sharedMem2.buffer;
+  cfg2.hostImports.env.host_log(0, 0);
+  assert.equal(posted2.length, 2);
+  assert.equal(posted2[1].type, 'attach-guest-memory');
+  assert.equal(posted2[1].buffer, grownBuf2);
+});
+
+test('W360 loader.js SPSC gpu_ring boot attaches guest memory on runtime boot and re-attaches after grow() without wgpuSubmit', async () => {
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const sharedMem = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const initialBuf = sharedMem.buffer;
+  let runtimeBootedResolve = null;
+  const runtimeBooted = new Promise((resolve) => {
+    runtimeBootedResolve = resolve;
+  });
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage() {},
+    createRuntimeModule: async (moduleConfig) => {
+      const mod = { wasmMemory: sharedMem };
+      if (Array.isArray(moduleConfig.preRun)) {
+        for (const fn of moduleConfig.preRun) fn(mod);
+      }
+      if (typeof moduleConfig.onRuntimeInitialized === 'function') {
+        moduleConfig.onRuntimeInitialized.call(mod);
+      }
+      runtimeBootedResolve(mod);
+      return mod;
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    WebAssembly,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url) => {
+      if (String(url).includes('dist/runtime.js')) {
+        return { ok: true, status: 200 };
+      }
+      return { ok: false, status: 404 };
+    },
+    importScripts(scriptPath) {
+      if (String(scriptPath).includes('dist/runtime.js')) {
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const ioWorker = workersByScript.get('./workers/io_worker.js');
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  const audioWorker = workersByScript.get('./workers/audio_worker.js');
+  assert.ok(ioWorker && gpuWorker && audioWorker);
+
+  // Mark all 3 workers ready to trigger tryBootWasmRuntime() — wgpuSubmit is NEVER called!
+  ioWorker.onmessage({ data: { ready: true, summary: 'ok' } });
+  gpuWorker.onmessage({ data: { ready: true, adapter: 'mock' } });
+  audioWorker.onmessage({ data: { ready: true } });
+
+  await runtimeBooted;
+  await new Promise((r) => setTimeout(r, 10));
+
+  const attachPosts1 = gpuWorker.posted.filter((m) => m && m.type === 'attach-guest-memory');
+  assert.equal(attachPosts1.length, 1);
+  assert.equal(attachPosts1[0].buffer, initialBuf);
+
+  // Grow guest memory, then notify GPU ring drain via loader -> new SAB must be posted BEFORE drain-ring!
+  sharedMem.grow(1);
+  const grownBuf = sharedMem.buffer;
+  assert.notEqual(grownBuf, initialBuf);
+
+  workerSelf.onmessage({ data: { type: 'drain-ring' } });
+  const attachPosts2 = gpuWorker.posted.filter((m) => m && m.type === 'attach-guest-memory');
+  assert.equal(attachPosts2.length, 2);
+  assert.equal(attachPosts2[1].buffer, grownBuf);
+  const lastTwo = gpuWorker.posted.slice(-2);
+  assert.equal(lastTwo[0].type, 'attach-guest-memory');
+  assert.equal(lastTwo[0].buffer, grownBuf);
+  assert.equal(lastTwo[1].type, 'drain-ring');
 });

@@ -22,11 +22,13 @@
 #endif
 
 #include "abi/playgta6_abi.h"
+#include "bcpack_synthetic.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/gfx10_detile.h"
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
+#include "os/bcpack.h"
 #include "os/vmem.h"
 #include "os/xapu_opus.h"
 #include "os/win32_compat.h"
@@ -748,6 +750,159 @@ void test_requests_round_trip() {
     CHECK(fx.vcall(factory, 2) == 1);
 }
 
+void test_dstorage_option_parsing() {
+    static_assert(ga::parse_dstorage_options(0x200001u).zlib);
+    const ga::DStorageOptions z = ga::parse_dstorage_options(0x200001u);
+    CHECK(z.zlib && z.physical_pages && z.bcpack_mode == 0 && !z.source_memory && z.unknown_bits == 0);
+    const ga::DStorageOptions plain = ga::parse_dstorage_options(0);
+    CHECK(!plain.compressed() && !plain.physical_pages && plain.unknown_bits == 0);
+    for (uint64_t mode = 1; mode < 16; ++mode) {
+        const ga::DStorageOptions b = ga::parse_dstorage_options(mode << 1);
+        CHECK(b.bcpack_mode == mode && !b.zlib && b.compressed() && b.unknown_bits == 0);
+    }
+    const ga::DStorageOptions m = ga::parse_dstorage_options(ga::kDStorageOptionSourceMemory | 1);
+    CHECK(m.source_memory && m.zlib && m.unknown_bits == 0);
+    CHECK(ga::parse_dstorage_options(1ull << 5).unknown_bits == (1ull << 5));  // the old 0xFF mask hid these
+    CHECK(ga::parse_dstorage_options(1ull << 9).unknown_bits == (1ull << 9));
+}
+
+void test_physical_page_scatter() {
+    using namespace playgta6::os::scarlett;
+    size_t count = 3;
+    uint64_t pfn[3] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &count, pfn) == 1);
+    std::vector<uint8_t> data(2 * 65536 + 100);
+    for (size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<uint8_t>(i * 7 + (i >> 16));
+    }
+    // Entries as physical addresses and as frame numbers, out of order.
+    const std::vector<uint64_t> entries = {pfn[2] << 12, pfn[0], pfn[1] << 12};
+    auto entry_at = [&](size_t i, uint64_t* e) {
+        if (i >= entries.size()) {
+            return false;
+        }
+        *e = entries[i];
+        return true;
+    };
+    CHECK(xmem_write_physical_pages(entry_at, data.data(), data.size()));
+    const uint64_t order[3] = {pfn[2], pfn[0], pfn[1]};
+    for (size_t k = 0; k < 3; ++k) {
+        auto* p = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &order[k]));
+        CHECK(p != nullptr);
+        const size_t n = std::min<size_t>(65536, data.size() - k * 65536);
+        CHECK(std::memcmp(p, data.data() + k * 65536, n) == 0);
+        if (n < 65536) {
+            CHECK(p[n] == 0);  // the tail of the last page is untouched
+        }
+        CHECK(xmem_unmap_physical_pages(p));
+    }
+    // An unknown page or an unreadable array entry writes nothing.
+    const std::vector<uint64_t> bogus = {pfn[0], 0xDEAD0000ull};
+    auto bogus_at = [&](size_t i, uint64_t* e) {
+        if (i >= bogus.size()) {
+            return false;
+        }
+        *e = bogus[i];
+        return true;
+    };
+    std::vector<uint8_t> ones(4 * 65536, 0xFF);
+    CHECK(!xmem_write_physical_pages(bogus_at, ones.data(), 65536 + 1));
+    CHECK(!xmem_write_physical_pages(entry_at, ones.data(), ones.size()));  // a 4th entry is missing
+    auto* p0 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+    CHECK(p0 != nullptr && std::memcmp(p0, data.data() + 65536, 65536) == 0);
+    CHECK(xmem_unmap_physical_pages(p0));
+
+    // A start offset into the first page (small resources share a page): the bytes before it stay,
+    // the first page takes only its remaining room and the rest spills into the next entry.
+    std::vector<uint8_t> small(70000);
+    for (size_t i = 0; i < small.size(); ++i) {
+        small[i] = static_cast<uint8_t>(i * 13 + 5);
+    }
+    const std::vector<uint64_t> two = {pfn[1], pfn[2] << 12};
+    auto two_at = [&](size_t i, uint64_t* e) {
+        if (i >= two.size()) {
+            return false;
+        }
+        *e = two[i];
+        return true;
+    };
+    constexpr size_t kSkip = 0x3000;
+    CHECK(xmem_write_physical_pages(two_at, small.data(), small.size(), kSkip));
+    {
+        auto* a = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        std::vector<uint8_t> head(kSkip, 0);  // untouched: the last 100 bytes of `data`, then zeros
+        std::copy(data.begin() + 2 * 65536, data.end(), head.begin());
+        CHECK(a != nullptr && std::memcmp(a, head.data(), kSkip) == 0);
+        CHECK(std::memcmp(a + kSkip, small.data(), 65536 - kSkip) == 0);
+        CHECK(xmem_unmap_physical_pages(a));
+        auto* b = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[2]));
+        CHECK(b != nullptr && std::memcmp(b, small.data() + (65536 - kSkip), small.size() - (65536 - kSkip)) == 0);
+        CHECK(xmem_unmap_physical_pages(b));
+    }
+    CHECK(!xmem_write_physical_pages(two_at, small.data(), 16, 65536));  // offset past the first page
+    CHECK(pg6_xbox_XMemFreePhysicalPages(3, pfn) == 1);
+}
+
+// Requests start only at Submit (the title fills physical-page lists inside its own Submit), and
+// a physical-page destination honours the start offset into its first page.
+void test_requests_wait_for_submit() {
+    Fixture fx;
+    const std::vector<uint8_t> data = pattern_data(8192);
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\late.bin", data);
+    const uint64_t factory = fx.factory();
+    const uint64_t file = fx.open_file(factory, u"G:\\data\\late.bin");
+    const uint64_t queue = fx.create_queue(factory, 8);
+    const uint64_t status = fx.create_status(factory, 1);
+
+    size_t page_count = 1;
+    uint64_t pfn[1] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(8);
+    const uint64_t zero = 0;
+    CHECK(com::write_guest(page_array, &zero, 8));  // not filled in yet
+    ga::DStorageRequest pp = file_request(file, 0, 1000, page_array, 1000);
+    pp.options = ga::kDStorageOptionDestinationIsPhysicalPages;
+    pp.destination_reserved = 0x2000;
+    const uint64_t dest = com::guest_alloc(8 * 1000);
+    std::vector<uint8_t> zeros(8 * 1000, 0);
+    CHECK(com::write_guest(dest, zeros.data(), zeros.size()));
+
+    const uint64_t submits_before = ga::dstorage_stats().submits;
+    fx.enqueue(queue, pp);
+    for (int i = 0; i < 6; ++i) {  // past half capacity: still nothing may start
+        fx.enqueue(queue, file_request(file, 1000 + i * 1000, 1000, dest + i * 1000, 1000));
+    }
+    fx.vcall(queue, 4, {I(status), I(0)});  // the 8th entry fills the queue exactly
+    CHECK(ga::dstorage_stats().submits == submits_before);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    CHECK(guest_bytes(dest, zeros.size()) == zeros);
+    CHECK((fx.vcall(status, 3, {I(0)}) & 0xFF) == 0);
+
+    const uint64_t entry = pfn[0] << 12;  // the title fills the page list just before Submit
+    CHECK(com::write_guest(page_array, &entry, 8));
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 0));
+    CHECK(as_hr(fx.vcall(status, 4, {I(0)})) == 0);
+    CHECK(ga::dstorage_stats().submits == submits_before + 1);
+    for (int i = 0; i < 6; ++i) {
+        CHECK(std::memcmp(guest_bytes(dest + i * 1000, 1000).data(), data.data() + 1000 + i * 1000, 1000) == 0);
+    }
+    {
+        auto* p = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+        CHECK(p != nullptr);
+        CHECK(std::all_of(p, p + 0x2000, [](uint8_t b) { return b == 0; }));
+        CHECK(std::memcmp(p + 0x2000, data.data(), 1000) == 0);
+        CHECK(os::scarlett::xmem_unmap_physical_pages(p));
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(1, pfn) == 1);
+
+    fx.vcall(queue, 8);
+    CHECK(fx.vcall(status, 2) == 0);
+    CHECK(fx.vcall(queue, 2) == 0);
+    CHECK(fx.vcall(file, 2) == 0);
+    CHECK(fx.vcall(factory, 2) == 1);
+}
+
 void test_compressed_and_memory_sources() {
     Fixture fx;
     std::vector<uint8_t> blob(100, 0xEE);
@@ -760,7 +915,7 @@ void test_compressed_and_memory_sources() {
     const uint64_t dest = com::guest_alloc(65536);
 
     ga::DStorageRequest r = file_request(file, 100, sizeof(kZlibPage64k), dest, 65536);
-    r.options = ga::kDStorageFormatZlib;  // bit 0: the title's hardware-decompressed format
+    r.options = ga::kDStorageOptionZlib;  // bit 0: the title's hardware-decompressed format
     fx.enqueue(queue, r);
     fx.vcall(queue, 4, {I(status), I(1)});
     // Memory source (bit 22): copy 64 bytes of guest memory.
@@ -781,7 +936,7 @@ void test_compressed_and_memory_sources() {
     // A truncated compressed stream fails with ERROR_INVALID_DATA.
     const uint64_t dest3 = com::guest_alloc(65536);
     ga::DStorageRequest bad = file_request(file, 100, sizeof(kZlibPage64k) - 20, dest3, 65536);
-    bad.options = ga::kDStorageFormatZlib;
+    bad.options = ga::kDStorageOptionZlib;
     fx.enqueue(queue, bad);
     fx.vcall(queue, 4, {I(status), I(2)});
     fx.vcall(queue, 6);
@@ -792,6 +947,54 @@ void test_compressed_and_memory_sources() {
     CHECK(guest_bytes(dest, 65536) == pattern_data(65536));
     CHECK(guest_bytes(dest2, 64) == mem);
     CHECK(ga::dstorage_stats().decompressed_requests == 1);
+
+    // DestinationIsPhysicalPages (bit 21, the title's 0x200001): `destination` is a guest array of
+    // physical page addresses; the inflated bytes go into those pages, not over the array.
+    size_t page_count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(16);
+    const uint64_t entries[2] = {pfn[1] << 12, pfn[0] << 12};  // scattered: second page first
+    CHECK(com::write_guest(page_array, entries, sizeof(entries)));
+    ga::DStorageRequest pp = file_request(file, 100, sizeof(kZlibPage64k), page_array, 65536);
+    pp.options = ga::kDStorageOptionZlib | ga::kDStorageOptionDestinationIsPhysicalPages;
+    CHECK(pp.options == 0x200001u);
+    const uint64_t pp_before = ga::dstorage_stats().physical_page_requests;
+    fx.enqueue(queue, pp);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == 0);
+    CHECK(ga::dstorage_stats().physical_page_requests == pp_before + 1);
+    std::vector<uint8_t> array_after(16);
+    CHECK(com::read_guest(page_array, array_after.data(), 16));
+    CHECK(std::memcmp(array_after.data(), entries, 16) == 0);  // the array is left alone
+    {
+        auto* p1 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        CHECK(p1 != nullptr && std::vector<uint8_t>(p1, p1 + 65536) == pattern_data(65536));
+        CHECK(os::scarlett::xmem_unmap_physical_pages(p1));
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+
+    // BCPack (bits 1-4) fails truthfully.
+    ga::DStorageRequest bc = file_request(file, 100, 16, dest, 65536);
+    bc.options = 3ull << 1;
+    const uint64_t bc_before = ga::dstorage_stats().bcpack_requests;
+    fx.enqueue(queue, bc);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+    CHECK(ga::dstorage_stats().bcpack_requests == bc_before + 1);  // counted (the title fails them by the hundred)
+    bc.options = (7ull << 1) | ga::kDStorageOptionDestinationIsPhysicalPages;  // the title's 0x20000e
+    CHECK(bc.options == 0x20000eu);
+    CHECK(ga::parse_dstorage_options(bc.options).bcpack_mode == 7);
+    fx.enqueue(queue, bc);
+    fx.vcall(queue, 4, {I(status), I(3)});
+    fx.vcall(queue, 6);
+    CHECK(fx.wait_complete(status, 3));
+    CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+    CHECK(ga::dstorage_stats().bcpack_requests == bc_before + 2);
 
     // Unsupported compression format and option bits.
     ga::DStorageRequest f2 = file_request(file, 100, 16, dest, 65536);
@@ -808,6 +1011,143 @@ void test_compressed_and_memory_sources() {
     fx.vcall(queue, 6);
     CHECK(fx.wait_complete(status, 3));
     CHECK(as_hr(fx.vcall(status, 4, {I(3)})) == com::E_NOTIMPL_HR);
+}
+
+// BCPack (option bits 1-4) with SYNTHETIC tables (tests/bcpack_synthetic.h; the real format
+// tables are user-supplied and never in the repository): without tables E_NOTIMPL, then unpacked
+// into a buffer, into physical pages and after a zlib stage, and a truncated stream.
+std::vector<uint8_t> zlib_stored(const std::vector<uint8_t>& data) {
+    std::vector<uint8_t> out = {0x78, 0x01};
+    size_t at = 0;
+    do {
+        const size_t n = std::min<size_t>(65535, data.size() - at);
+        const bool last = at + n == data.size();
+        out.push_back(last ? 1 : 0);
+        out.push_back(static_cast<uint8_t>(n));
+        out.push_back(static_cast<uint8_t>(n >> 8));
+        out.push_back(static_cast<uint8_t>(~n));
+        out.push_back(static_cast<uint8_t>(~n >> 8));
+        out.insert(out.end(), data.begin() + static_cast<std::ptrdiff_t>(at),
+                   data.begin() + static_cast<std::ptrdiff_t>(at + n));
+        at += n;
+    } while (at < data.size());
+    uint32_t a = 1;
+    uint32_t b = 0;
+    for (uint8_t v : data) {
+        a = (a + v) % 65521;
+        b = (b + a) % 65521;
+    }
+    const uint32_t adler = (b << 16) | a;
+    for (int k = 3; k >= 0; --k) {
+        out.push_back(static_cast<uint8_t>(adler >> (8 * k)));
+    }
+    return out;
+}
+
+void test_bcpack_requests() {
+    namespace bp = playgta6::os::bcpack;
+    namespace sy = bcpack_synthetic;
+    bp::set_active_tables(nullptr);
+    const std::shared_ptr<const bp::Tables> tables = sy::Builder::full().tables();
+    CHECK(tables != nullptr);
+    if (!tables) {
+        return;
+    }
+    constexpr uint32_t kBlocks = 10000;  // 80000 bytes of BC4: more than one 64 KiB page
+    std::vector<std::vector<uint8_t>> records;
+    for (uint32_t i = 0; i < kBlocks; ++i) {
+        std::vector<uint8_t> r(12, 0);
+        r[1] = static_cast<uint8_t>(i % 3);  // none, the previous block, two back
+        r[2] = static_cast<uint8_t>(i * 7);
+        r[3] = static_cast<uint8_t>(i * 13 + 5);
+        for (uint32_t k = 4; k < 12; ++k) {
+            r[k] = static_cast<uint8_t>((i + k) % 64);
+        }
+        records.push_back(r);
+    }
+    const std::vector<uint8_t> packed = sy::stream(*tables, sy::default_layouts()[2], records);
+    CHECK(!packed.empty());
+    std::vector<uint8_t> want(kBlocks * 8);
+    CHECK(bp::decode(*tables, 4, packed.data(), packed.size(), want.data(), want.size()) == bp::DecodeStatus::Ok);
+    const std::vector<uint8_t> zpacked = zlib_stored(packed);
+    std::vector<uint8_t> blob(100, 0xEE);
+    blob.insert(blob.end(), packed.begin(), packed.end());
+    Fixture fx;
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\bcpack.ttpf", blob);
+    os::scarlett::register_dstorage_virtual_file("G:\\data\\bcpack_z.ttpf", zpacked);
+    const uint64_t factory = fx.factory();
+    const uint64_t file = fx.open_file(factory, u"G:\\data\\bcpack.ttpf");
+    const uint64_t zfile = fx.open_file(factory, u"G:\\data\\bcpack_z.ttpf");
+    const uint64_t queue = fx.create_queue(factory, 64);
+    const uint64_t status = fx.create_status(factory, 8);
+    const uint64_t dest = com::guest_alloc(want.size());
+    const uint32_t size = static_cast<uint32_t>(want.size());
+    auto run = [&](const ga::DStorageRequest& req, uint32_t index) {
+        fx.enqueue(queue, req);
+        fx.vcall(queue, 4, {I(status), I(index)});
+        fx.vcall(queue, 6);
+        CHECK(fx.wait_complete(status, index));
+        return as_hr(fx.vcall(status, 4, {I(index)}));
+    };
+    const uint64_t requests_before = ga::dstorage_stats().bcpack_requests;
+    const uint64_t decoded_before = ga::dstorage_stats().bcpack_decoded;
+
+    // No tables: fails truthfully and says how to supply them.
+    ga::DStorageRequest r = file_request(file, 100, static_cast<uint32_t>(packed.size()), dest, size);
+    r.options = 4ull << 1;
+    CHECK(run(r, 0) == com::E_NOTIMPL_HR);
+    CHECK(diag_contains("--bcpack-tables"));
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before);
+
+    bp::set_active_tables(tables);
+    CHECK(run(r, 1) == 0);
+    CHECK(guest_bytes(dest, want.size()) == want);
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before + 1);
+
+    // A format the tables (and this decoder) do not cover: still E_NOTIMPL.
+    ga::DStorageRequest bc2 = r;
+    bc2.options = 2ull << 1;
+    CHECK(run(bc2, 2) == com::E_NOTIMPL_HR);
+
+    // Physical-page destination (the title's 0x2000xx options).
+    size_t page_count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0, &page_count, pfn) == 1);
+    const uint64_t page_array = com::guest_alloc(16);
+    const uint64_t entries[2] = {pfn[1] << 12, pfn[0] << 12};
+    CHECK(com::write_guest(page_array, entries, sizeof(entries)));
+    ga::DStorageRequest pp = file_request(file, 100, static_cast<uint32_t>(packed.size()), page_array, size);
+    pp.options = (4ull << 1) | ga::kDStorageOptionDestinationIsPhysicalPages;
+    CHECK(run(pp, 3) == 0);
+    {
+        auto* p1 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[1]));
+        auto* p0 = static_cast<uint8_t*>(pg6_xbox_XMemMapPhysicalPages(nullptr, 1, &pfn[0]));
+        CHECK(p1 != nullptr && p0 != nullptr);
+        if (p1 != nullptr && p0 != nullptr) {
+            CHECK(std::memcmp(p1, want.data(), 65536) == 0);
+            CHECK(std::memcmp(p0, want.data() + 65536, want.size() - 65536) == 0);
+            CHECK(os::scarlett::xmem_unmap_physical_pages(p1));
+            CHECK(os::scarlett::xmem_unmap_physical_pages(p0));
+        }
+    }
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+
+    // zlib, then BCPack: uncompressed_size is the intermediate (packed) size.
+    const uint64_t dest2 = com::guest_alloc(want.size());
+    ga::DStorageRequest z = file_request(zfile, 0, static_cast<uint32_t>(zpacked.size()), dest2, size);
+    z.options = ga::kDStorageOptionZlib | (4ull << 1);
+    z.uncompressed_size = static_cast<uint32_t>(packed.size());
+    CHECK(run(z, 4) == 0);
+    CHECK(guest_bytes(dest2, want.size()) == want);
+
+    // A truncated stream fails with ERROR_INVALID_DATA.
+    ga::DStorageRequest cut = r;
+    cut.source_size = static_cast<uint32_t>(packed.size() / 2);
+    CHECK(run(cut, 5) == ga::kHrInvalidData);
+    CHECK(diag_contains("BCPack request (mode 4"));
+    CHECK(ga::dstorage_stats().bcpack_requests == requests_before + 6);
+    CHECK(ga::dstorage_stats().bcpack_decoded == decoded_before + 3);
+    bp::set_active_tables(nullptr);
 }
 
 void test_errors_and_error_record() {
@@ -921,7 +1261,7 @@ void test_backpressure_and_leaks() {
     CHECK(std::memcmp(guest_bytes(dest, 1000000).data(), data.data(), 1000000) == 0);
     const ga::DStorageStats st = ga::dstorage_stats();
     CHECK(st.requests_completed == 1000);
-    CHECK(st.submits > 100);  // auto-submits at half capacity
+    CHECK(st.submits > 100);  // auto-submits when an enqueue finds the queue full
 
     CHECK(fx.vcall(status, 2) == 0);
     CHECK(fx.vcall(queue, 2) == 0);
@@ -1516,6 +1856,145 @@ void test_acp_hal() {
     CHECK(as_hr(fx.dcall(create, {I(0)})) == com::E_POINTER_HR);
 }
 
+// R40: the AcpHal XMA context commands against 40 kind-4 contexts: 5 / 7 enable / disable one,
+// 6 / 8 enable / disable by bitmask, 18 advances the output read offset modulo the block count.
+void test_acp_hal_xma_commands() {
+    Fixture fx;
+    ga::reset_xma_commands();
+    ga::set_xma_worker_allowed_for_tests(false);
+    // The contexts AcpHalAllocateShapeContexts would hand out (its own test is in
+    // test_xbox_middleware), here in the fixture's guest memory.
+    const uint64_t contexts = com::guest_alloc(40 * 64);
+    CHECK(contexts != 0);
+    ga::set_xma_contexts_for_tests(contexts, 40);
+
+    const uint64_t create = fx.export_address("AcpHal.dll", "AcpHalCreate");
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(out)})) == 0);
+    const uint64_t hal = load64(out);
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0x1000), I(0x1000)})) == 0);
+    const uint64_t payload = com::guest_alloc(16);
+    auto submit = [&](uint32_t command, uint32_t w0, uint32_t w1) {
+        const uint32_t words[2] = {w0, w1};
+        CHECK(com::write_guest(payload, words, sizeof(words)));
+        CHECK(as_hr(fx.vcall(hal, 2, {I(command), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    };
+
+    submit(5, 3, 0);
+    CHECK(ga::xma_context_enabled(3) && !ga::xma_context_enabled(4));
+    submit(5, 40, 0);  // out of range
+    CHECK(ga::xma_command_stats().rejected == 1);
+    submit(6, 0x5u, 1u << 1);  // contexts 0, 2 and 33
+    CHECK(ga::xma_context_enabled(0) && ga::xma_context_enabled(2) && ga::xma_context_enabled(33));
+    CHECK(ga::xma_command_stats().enabled_now == 4);
+    submit(7, 3, 0);
+    submit(8, 0x1u, 0);
+    CHECK(!ga::xma_context_enabled(3) && !ga::xma_context_enabled(0) && ga::xma_context_enabled(2));
+    CHECK(ga::xma_command_stats().enabled_now == 2);
+
+    // Context 2: an output ring of 4 blocks, read offset 3; taking 2 blocks wraps to 1.
+    const uint32_t d0 = 4u << 22;
+    const uint32_t d9 = 0xABCD0000u | 3u;
+    CHECK(com::write_guest(contexts + 2 * 64, d0));
+    CHECK(com::write_guest(contexts + 2 * 64 + 0x24, d9));
+    submit(18, 2, 2);
+    CHECK(load32(contexts + 2 * 64 + 0x24) == (0xABCD0000u | 1u));
+    CHECK(ga::xma_command_stats().read_advances == 1);
+    const ga::XmaCommandStats st = ga::xma_command_stats();
+    CHECK(st.enables == 1 && st.disables == 1 && st.mask_enables == 1 && st.mask_disables == 1);
+
+    CHECK(as_hr(fx.vcall(hal, 1)) == 0);
+    CHECK(fx.vcall(hal, 5) == 0);
+    ga::set_xma_contexts_for_tests(0, 0);
+    ga::reset_xma_commands();
+}
+
+// R40: an enabled XMA context is decoded into its output ring (silence until a WMA Pro decoder
+// exists): the write block moves, "writable" drops when the ring is full, and command 18 re-arms
+// it. Input / output buffers sit in a fake APU address space.
+void test_acp_hal_xma_decode_worker() {
+    Fixture fx;
+    ga::reset_xma_commands();
+    ga::set_xma_worker_allowed_for_tests(false);
+    const uint64_t contexts = com::guest_alloc(2 * 64);
+    CHECK(contexts != 0);
+    ga::set_xma_contexts_for_tests(contexts, 2);
+
+    // One packet: two frames of 3000 bits at the start of the payload, then padding.
+    std::vector<uint8_t> input(2048, 0xFF);
+    const uint32_t header = (2u << 26) | (0u << 11);
+    input[0] = static_cast<uint8_t>(header >> 24);
+    input[1] = static_cast<uint8_t>(header >> 16);
+    input[2] = static_cast<uint8_t>(header >> 8);
+    input[3] = static_cast<uint8_t>(header);
+    auto put_length = [&](uint32_t bit, uint32_t len) {
+        for (uint32_t j = 0; j < 15; ++j) {
+            const uint32_t a = bit + j;
+            const uint8_t m = static_cast<uint8_t>(0x80u >> (a % 8));
+            input[a / 8] = ((len >> (14 - j)) & 1u) != 0 ? (input[a / 8] | m) : (input[a / 8] & ~m);
+        }
+    };
+    put_length(32, 3000);
+    put_length(32 + 3000, 3000);
+    std::vector<uint8_t> output(4 * 256, 0x77);
+    ga::set_xma_apu_map_for_tests([&](uint32_t apu, size_t bytes) -> uint8_t* {
+        if (apu >= 0x1000 && apu + bytes <= 0x1000 + input.size()) {
+            return input.data() + (apu - 0x1000);
+        }
+        if (apu >= 0x9000 && apu + bytes <= 0x9000 + output.size()) {
+            return output.data() + (apu - 0x9000);
+        }
+        return nullptr;
+    });
+    uint32_t words[16] = {};
+    words[0] = 1u | (1u << 20) | (4u << 22);  // 1 packet, input 0 valid, ring of 4 blocks
+    words[1] = (3u << 27) | (1u << 31);       // 48 kHz mono, output writable
+    words[5] = 0x1000;
+    words[7] = 0x9000;
+    const uint64_t ctx = contexts + 64;
+    CHECK(com::write_guest(ctx, words, sizeof(words)));
+
+    const uint64_t create = fx.export_address("AcpHal.dll", "AcpHalCreate");
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(create, {I(out)})) == 0);
+    const uint64_t hal = load64(out);
+    CHECK(as_hr(fx.vcall(hal, 0, {I(0x1000), I(0x1000)})) == 0);
+    const uint64_t payload = com::guest_alloc(16);
+    auto submit = [&](uint32_t command, uint32_t w0, uint32_t w1) {
+        const uint32_t p[2] = {w0, w1};
+        CHECK(com::write_guest(payload, p, sizeof(p)));
+        CHECK(as_hr(fx.vcall(hal, 2, {I(command), I(0xF6F6F6F6u), I(0xFFFFFFFFu), I(payload), I(0)})) == 0);
+    };
+    submit(5, 1, 0);
+    ga::pump_xma_for_tests();
+    // A frame is 512 mono samples = 4 blocks: the ring is full, write block back at the read block.
+    uint32_t d0 = load32(ctx), d1 = load32(ctx + 4);
+    CHECK((d0 >> 27) == 0 && (d1 >> 31) == 0);
+    CHECK(output[0] == 0 && output[4 * 256 - 1] == 0);
+    CHECK(ga::xma_command_stats().blocks_written == 4 && ga::xma_command_stats().frames == 1);
+
+    submit(18, 1, 3);  // the title took 3 blocks
+    CHECK((load32(ctx + 4) >> 31) == 1 && (load32(ctx + 0x24) & 0x1F) == 3);
+    ga::pump_xma_for_tests();
+    CHECK((load32(ctx) >> 27) == 3);
+    CHECK(ga::xma_command_stats().blocks_written == 7);
+    submit(18, 1, 4);
+    ga::pump_xma_for_tests();
+    // Both frames written (8 blocks); input 0 used up, then the "input ran out" error.
+    const ga::XmaCommandStats st = ga::xma_command_stats();
+    CHECK(st.blocks_written == 8 && st.frames == 2 && st.input_exhausted == 1);
+    d0 = load32(ctx);
+    const uint32_t d2 = load32(ctx + 8);
+    CHECK(((d0 >> 20) & 1u) == 0 && ((d2 >> 26) & 0x1Fu) == 4 && (d2 >> 31) == 1);
+
+    submit(7, 1, 0);
+    CHECK(as_hr(fx.vcall(hal, 1)) == 0);
+    CHECK(fx.vcall(hal, 5) == 0);
+    ga::set_xma_apu_map_for_tests(nullptr);
+    ga::set_xma_contexts_for_tests(0, 0);
+    ga::reset_xma_commands();
+}
+
 // ---------------------------------------------------------------------------
 // MMDevice: the default audio render endpoint
 // ---------------------------------------------------------------------------
@@ -1927,19 +2406,94 @@ void test_xapu() {
         CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
     };
     command(5, 7);
-    command(9, 3);  // not acknowledged
+    command(9, 3);  // unknown type: still acknowledged
     command(2, 7);
-    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 2);
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 3);
     const uint64_t result = com::guest_alloc(0x38);
     CHECK(com::write_guest(result + 0x30, uint64_t{~0ull}));
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
     CHECK(load32(result) == 5 && load32(result + 4) == 7 && load64(result + 0x30) == 0);
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
+    CHECK(load32(result) == 9 && load32(result + 4) == 3);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0);
     CHECK(load32(result) == 2 && load32(result + 4) == 7);
     CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) < 0);  // empty
     CHECK(ga::xapu_stats().commands == 3 && ga::xapu_stats().pending_results == 0);
+    // Per-type census: the unknown type 9 is counted as unhandled and posts nothing.
+    const ga::XApuStats census = ga::xapu_stats();
+    CHECK(census.type5_commands == 1 && census.type2_commands == 1 && census.type1_commands == 0);
+    CHECK(census.unhandled_commands == 1 && census.results_posted == 3 && census.type3_results == 0);
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
     CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 0);
+}
+
+// Connect parameters {process, streams, commands per stream, memory bytes, frames, options} (os/xapu_connect.h): a result event in
+// the second qword of the output struct (set for every result), the requested memory size, and
+// queue-full past streams * commands outstanding results.
+void test_xapu_connect_params() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t dequeue = fx.export_address("xapu.dll", "XApuDequeueResult");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint32_t words[6] = {1, 1, 3, 0x400000, 0, 8};
+    CHECK(com::write_guest(params, words, sizeof(words)));
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t shared = load64(p2);
+    const uint64_t event = load64(p2 + 8);
+    CHECK(handle != 0 && shared != 0 && event != 0);
+    // The requested 4 MiB is allocated and zeroed.
+    CHECK(load64(shared + 0x400000 - 8) == 0);
+    namespace w32 = playgta6::os::win32;
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) != 0);  // not signalled yet
+    const uint64_t c = com::guest_alloc(0x40);
+    auto send = [&](uint32_t type, uint32_t voice) {
+        const uint32_t head[2] = {type, voice};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        return as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)}));
+    };
+    CHECK(send(4, 1) == 0);  // reset-style type without a model: still a result and a wake-up
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) == 0);
+    CHECK(w32::WaitForSingleObject(static_cast<w32::Handle>(event), 0) != 0);  // auto-reset
+    CHECK(send(1, 2) == 0 && send(5, 2) == 0);
+    CHECK(send(2, 2) < 0);  // 3 outstanding: queue full
+    const uint64_t result = com::guest_alloc(0x38);
+    CHECK(as_hr(fx.dcall(dequeue, {I(handle), I(result)})) == 0 && load32(result) == 4);
+    CHECK(send(2, 2) == 0);  // room again
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
+
+    // Zero parameters keep the fixed layout and no event.
+    const uint64_t zero = com::guest_alloc(0x18);
+    const uint64_t q2 = com::guest_alloc(0x10);
+    CHECK(as_hr(fx.dcall(connect, {I(zero), I(q2), I(fx.out_slot())})) == 0);
+    CHECK(load64(q2) != 0 && load64(q2 + 8) == 0);
+}
+
+// O36: a title that never dequeues cannot grow the result queue without limit.
+void test_xapu_bounded_queue() {
+    Fixture fx;
+    const uint64_t connect = fx.export_address("xapu.dll", "XApuConnect");
+    const uint64_t enqueue = fx.export_address("xapu.dll", "XApuEnqueueCommand");
+    const uint64_t count = fx.export_address("xapu.dll", "XApuGetResultCount");
+    const uint64_t disconnect = fx.export_address("xapu.dll", "XApuDisconnect");
+    const uint64_t params = com::guest_alloc(0x18);
+    const uint64_t p2 = com::guest_alloc(0x10);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.dcall(connect, {I(params), I(p2), I(out)})) == 0);
+    const uint64_t handle = load64(out);
+    const uint64_t c = com::guest_alloc(0x40);
+    for (uint32_t n = 0; n < 20000; ++n) {
+        const uint32_t head[2] = {5, n & 0x7F};
+        CHECK(com::write_guest(c, head, sizeof(head)));
+        CHECK(as_hr(fx.dcall(enqueue, {I(handle), I(c), I(0)})) == 0);
+        CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) <= 4096);
+    }
+    CHECK(static_cast<uint32_t>(fx.dcall(count, {I(handle), I(0)})) == 4096);
+    CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
 }
 
 bool xapu_opus_available() { return playgta6::os::xapu_opus::available(); }
@@ -2086,6 +2640,11 @@ void test_xapu_decode() {
     CHECK(after.failed_packets - before.failed_packets == (xapu_opus_available() ? 2u : 1u));
     CHECK(after.decoded_bytes - before.decoded_bytes == (4 * 960 * 4 + (960 - 312) * 4) + 3 * 0x1E00);
     CHECK(after.pending_results == 0);
+    // Every decode command posts exactly one type-3 result, decoded or not.
+    CHECK(after.type3_results - before.type3_results == after.type3_commands - before.type3_commands);
+    CHECK(after.type3_results - before.type3_results ==
+          (after.decoded_packets - before.decoded_packets) + (after.failed_packets - before.failed_packets));
+    CHECK(after.unhandled_commands == before.unhandled_commands);
     CHECK(as_hr(fx.dcall(disconnect, {I(handle)})) == 0);
 }
 
@@ -2096,7 +2655,11 @@ int main() {
     test_factory_identity_and_stubs();
     test_open_file_and_information();
     test_requests_round_trip();
+    test_dstorage_option_parsing();
+    test_physical_page_scatter();
+    test_requests_wait_for_submit();
     test_compressed_and_memory_sources();
+    test_bcpack_requests();
     test_errors_and_error_record();
     test_cancel_close_and_signal();
     test_backpressure_and_leaks();
@@ -2105,8 +2668,12 @@ int main() {
     test_game_input_devices();
     test_xg();
     test_acp_hal();
+    test_acp_hal_xma_commands();
+    test_acp_hal_xma_decode_worker();
     test_xdsp();
     test_xapu();
+    test_xapu_connect_params();
+    test_xapu_bounded_queue();
     test_xapu_decode();
     test_mmdevice();
     if (g_failures != 0) {

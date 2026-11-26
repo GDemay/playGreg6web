@@ -21,6 +21,34 @@
   const DEFAULT_COLOR_FORMAT = 'bgra8unorm';
   const FRAME1_VERTEX_STRIDE_24B = 24;
   const FRAME1_CBV_MIN_BINDING_SIZE = 256;
+  const DEFAULT_COMPILE_BUDGET_MS = 33.333;
+  const DEFAULT_COMPILE_LATENCY_WINDOW_SIZE = 128;
+
+  const PIPELINE_PRIORITY_TIERS = Object.freeze({
+    CRITICAL: 'critical',
+    HIGH: 'high',
+    NORMAL: 'normal',
+    LOW: 'low',
+  });
+
+  const PIPELINE_PRIORITY_RANKS = Object.freeze({
+    low: 0,
+    normal: 1,
+    high: 2,
+    critical: 3,
+  });
+
+  const PIPELINE_PRIORITY_ALIASES = Object.freeze({
+    critical: 'critical',
+    urgent: 'critical',
+    high: 'high',
+    normal: 'normal',
+    default: 'normal',
+    medium: 'normal',
+    low: 'low',
+    background: 'low',
+    idle: 'low',
+  });
 
   // WebGPU GPUShaderStage bitmask values with headless/Node fallbacks.
   const SHADER_STAGE_BITS = Object.freeze({
@@ -4018,6 +4046,77 @@
     return msg;
   }
 
+  function validatePositiveNumber(value, name) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new RangeError(`${name} must be a finite positive number, got: ${value}`);
+    }
+    return value;
+  }
+
+  function validateNonNegativeInt(value, name) {
+    if (!Number.isInteger(value) || value < 0) {
+      throw new RangeError(`${name} must be a non-negative integer, got: ${value}`);
+    }
+    return value;
+  }
+
+  /**
+   * Normalize an optional pipeline priority hint (`'critical'`, `'high'`, `'normal'`, or `'low'`).
+   * Unknown or omitted values resolve safely to `'normal'`.
+   *
+   * @param {string | null | undefined} priority
+   * @returns {'critical' | 'high' | 'normal' | 'low'}
+   */
+  function normalizePipelinePriority(priority) {
+    if (typeof priority !== 'string') {
+      return PIPELINE_PRIORITY_TIERS.NORMAL;
+    }
+    const key = priority.trim().toLowerCase();
+    if (key.length === 0) {
+      return PIPELINE_PRIORITY_TIERS.NORMAL;
+    }
+    if (Object.prototype.hasOwnProperty.call(PIPELINE_PRIORITY_ALIASES, key)) {
+      return PIPELINE_PRIORITY_ALIASES[key];
+    }
+    return PIPELINE_PRIORITY_TIERS.NORMAL;
+  }
+
+  function extractPriorityOption(options) {
+    if (!options || typeof options !== 'object') {
+      return null;
+    }
+    if (options.priority !== undefined && options.priority !== null) {
+      return normalizePipelinePriority(options.priority);
+    }
+    if (options.priorityTier !== undefined && options.priorityTier !== null) {
+      return normalizePipelinePriority(options.priorityTier);
+    }
+    return null;
+  }
+
+  function hasRenderNormalizationOptions(options) {
+    if (!options || typeof options !== 'object') {
+      return false;
+    }
+    for (const k in options) {
+      if (!Object.prototype.hasOwnProperty.call(options, k)) continue;
+      if (k === 'priority' || k === 'priorityTier') continue;
+      const v = options[k];
+      if (v !== undefined && typeof v !== 'function') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function percentileFromSorted(sorted, count, fraction) {
+    if (count <= 0) {
+      return 0;
+    }
+    const idx = Math.min(count - 1, Math.max(0, Math.ceil(fraction * count) - 1));
+    return sorted[idx];
+  }
+
   function isDescriptorWrapper(item) {
     return (
       Boolean(item) &&
@@ -4077,12 +4176,28 @@
           : DEFAULT_MAX_BIND_GROUP_LAYOUTS,
         'maxBindGroupLayouts'
       );
+      this._maxEntries =
+        options.maxEntries !== undefined && options.maxEntries !== null
+          ? validatePositiveInt(options.maxEntries, 'maxEntries')
+          : null;
       this._maxFastLookupEntries = validatePositiveInt(
         options.maxFastLookupEntries !== undefined
           ? options.maxFastLookupEntries
           : DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
         'maxFastLookupEntries'
       );
+      this._compileBudgetMs =
+        options.compileBudgetMs !== undefined
+          ? validatePositiveNumber(options.compileBudgetMs, 'compileBudgetMs')
+          : options.slowCompileBudgetMs !== undefined
+            ? validatePositiveNumber(options.slowCompileBudgetMs, 'slowCompileBudgetMs')
+            : DEFAULT_COMPILE_BUDGET_MS;
+      this._compileLatencyWindowSize =
+        options.compileLatencyWindowSize !== undefined
+          ? validatePositiveInt(options.compileLatencyWindowSize, 'compileLatencyWindowSize')
+          : options.latencyWindowSize !== undefined
+            ? validatePositiveInt(options.latencyWindowSize, 'latencyWindowSize')
+            : DEFAULT_COMPILE_LATENCY_WINDOW_SIZE;
       this._maxErrorHistory = validatePositiveInt(
         options.maxErrorHistory !== undefined
           ? options.maxErrorHistory
@@ -4159,9 +4274,18 @@
       this._defaultSamplers = new Map();
       this._inFlightRender = new Map();
       this._inFlightCompute = new Map();
+      this._inFlightPriorities = new Map();
       this._quarantinedKeys = new Map();
       this._generation = 0;
       this._shaderPackGeneration = 0;
+      this._accessSeq = 0;
+      this._hasNonDefaultPriority = false;
+
+      // Pre-allocated rolling compile-latency window & reusable sort scratch buffer (zero-alloc percentiles).
+      this._compileLatencyWindow = new Float64Array(this._compileLatencyWindowSize);
+      this._compileLatencyScratch = new Float64Array(this._compileLatencyWindowSize);
+      this._compileLatencyHead = 0;
+      this._compileLatencyCount = 0;
 
       this._pipelineErrors = [];
       this._pipelineErrorSeq = 0;
@@ -4180,9 +4304,11 @@
         fastLookupMisses: 0,
         inFlightDedupes: 0,
         evictions: 0,
+        reclaimedCount: 0,
         compileCount: 0,
         totalCompileMs: 0,
         maxCompileMs: 0,
+        slowCompilesOverBudget: 0,
         quarantineHits: 0,
         negativeCacheEvictions: 0,
         fallbackNormalizedCount: 0,
@@ -4552,20 +4678,219 @@
       return hashDescriptorKey(descriptor);
     }
 
-    _getLru(map, key) {
+    _promoteEntryPriority(entry, priority) {
+      if (!entry || priority === null || priority === undefined) {
+        return;
+      }
+      const rank = PIPELINE_PRIORITY_RANKS[priority];
+      if (rank !== undefined && rank > entry.priorityRank) {
+        entry.priority = priority;
+        entry.priorityRank = rank;
+        if (rank !== PIPELINE_PRIORITY_RANKS.normal) {
+          this._hasNonDefaultPriority = true;
+        }
+      }
+    }
+
+    _recordInFlightPriority(kind, key, priority) {
+      if (priority === null || priority === undefined) {
+        return;
+      }
+      const mapKey = `${kind}:${key}`;
+      const existing = this._inFlightPriorities.get(mapKey);
+      if (
+        existing === undefined ||
+        PIPELINE_PRIORITY_RANKS[priority] > PIPELINE_PRIORITY_RANKS[existing]
+      ) {
+        this._inFlightPriorities.set(mapKey, priority);
+      }
+    }
+
+    _consumeInFlightPriority(kind, key, basePriority) {
+      const mapKey = `${kind}:${key}`;
+      const promoted = this._inFlightPriorities.get(mapKey);
+      if (promoted === undefined) {
+        return basePriority;
+      }
+      this._inFlightPriorities.delete(mapKey);
+      if (basePriority === null || basePriority === undefined) {
+        return promoted;
+      }
+      return PIPELINE_PRIORITY_RANKS[promoted] > PIPELINE_PRIORITY_RANKS[basePriority]
+        ? promoted
+        : basePriority;
+    }
+
+    _clearInFlightPriority(kind, key) {
+      this._inFlightPriorities.delete(`${kind}:${key}`);
+    }
+
+    _totalCachedEntries() {
+      return this._renderPipelines.size + this._computePipelines.size + this._bindGroupLayouts.size;
+    }
+
+    _evictOneFromMap(map, excludeKey) {
+      if (map.size === 0) {
+        return false;
+      }
+      let victimKey;
+      let victimEntry;
+
+      if (!this._hasNonDefaultPriority) {
+        for (const [k, entry] of map.entries()) {
+          if (k === excludeKey) {
+            continue;
+          }
+          victimKey = k;
+          victimEntry = entry;
+          break;
+        }
+      } else {
+        let bestRank = Infinity;
+        for (const [k, entry] of map.entries()) {
+          if (k === excludeKey) {
+            continue;
+          }
+          const rank = entry.priorityRank;
+          if (rank < bestRank) {
+            bestRank = rank;
+            victimKey = k;
+            victimEntry = entry;
+            if (bestRank === PIPELINE_PRIORITY_RANKS.low) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (victimKey === undefined) {
+        return false;
+      }
+      if (victimEntry !== undefined) {
+        victimEntry.alive = false;
+      }
+      map.delete(victimKey);
+      this._stats.evictions += 1;
+      this._stats.reclaimedCount += 1;
+      return true;
+    }
+
+    _evictOneAcrossAllMaps(excludeMap, excludeKey, maxAllowedRank) {
+      const maps = [this._renderPipelines, this._computePipelines, this._bindGroupLayouts];
+      let bestMap = null;
+      let bestKey;
+      let bestEntry = null;
+      let bestRank = Infinity;
+      let bestSeq = Infinity;
+
+      for (let i = 0; i < maps.length; i += 1) {
+        const map = maps[i];
+        if (map.size === 0) {
+          continue;
+        }
+        if (!this._hasNonDefaultPriority) {
+          if (PIPELINE_PRIORITY_RANKS.normal > maxAllowedRank) {
+            continue;
+          }
+          for (const [k, entry] of map.entries()) {
+            if (map === excludeMap && k === excludeKey) {
+              continue;
+            }
+            if (entry.accessSeq < bestSeq) {
+              bestMap = map;
+              bestKey = k;
+              bestEntry = entry;
+              bestRank = entry.priorityRank;
+              bestSeq = entry.accessSeq;
+            }
+            break;
+          }
+          continue;
+        }
+
+        let mapBestRank = maxAllowedRank + 1;
+        for (const [k, entry] of map.entries()) {
+          if (map === excludeMap && k === excludeKey) {
+            continue;
+          }
+          const rank = entry.priorityRank;
+          if (rank < mapBestRank) {
+            mapBestRank = rank;
+            if (
+              rank < bestRank ||
+              (rank === bestRank && entry.accessSeq < bestSeq)
+            ) {
+              bestMap = map;
+              bestKey = k;
+              bestEntry = entry;
+              bestRank = rank;
+              bestSeq = entry.accessSeq;
+            }
+            if (rank === PIPELINE_PRIORITY_RANKS.low) {
+              break;
+            }
+          }
+        }
+      }
+
+      if (bestMap === null || bestKey === undefined) {
+        return false;
+      }
+      if (bestEntry !== null) {
+        bestEntry.alive = false;
+      }
+      bestMap.delete(bestKey);
+      this._stats.evictions += 1;
+      this._stats.reclaimedCount += 1;
+      return true;
+    }
+
+    _enforceMaxEntries(excludeMap, excludeKey) {
+      if (this._maxEntries === null) {
+        return 0;
+      }
+      let removed = 0;
+      while (this._totalCachedEntries() > this._maxEntries) {
+        if (
+          !this._evictOneAcrossAllMaps(
+            excludeMap,
+            excludeKey,
+            PIPELINE_PRIORITY_RANKS.critical
+          )
+        ) {
+          break;
+        }
+        removed += 1;
+      }
+      return removed;
+    }
+
+    _getLru(map, key, priority = null) {
       const entry = map.get(key);
       if (entry === undefined) {
         return undefined;
       }
       entry.lastAccessedAt = this._now();
+      entry.accessSeq = ++this._accessSeq;
+      if (priority !== null && priority !== undefined) {
+        this._promoteEntryPriority(entry, priority);
+      }
       // Refresh LRU recency by reinserting at the tail of the Map.
       map.delete(key);
       map.set(key, entry);
       return entry.value;
     }
 
-    _setLru(map, key, value, compileMs, maxSize) {
+    _setLru(map, key, value, compileMs, maxSize, priority = null) {
       const ts = this._now();
+      const canonicalPriority =
+        priority !== null && priority !== undefined
+          ? normalizePipelinePriority(priority)
+          : PIPELINE_PRIORITY_TIERS.NORMAL;
+      const priorityRank = PIPELINE_PRIORITY_RANKS[canonicalPriority];
+      if (priorityRank !== PIPELINE_PRIORITY_RANKS.normal) {
+        this._hasNonDefaultPriority = true;
+      }
       const prev = map.get(key);
       if (prev !== undefined) {
         prev.alive = false;
@@ -4575,18 +4900,20 @@
         value,
         createdAt: ts,
         lastAccessedAt: ts,
+        accessSeq: ++this._accessSeq,
         compileMs,
+        priority: canonicalPriority,
+        priorityRank,
         alive: true,
       };
       map.set(key, entry);
       while (map.size > maxSize) {
-        const oldestKey = map.keys().next().value;
-        const evicted = map.get(oldestKey);
-        if (evicted !== undefined) {
-          evicted.alive = false;
+        if (!this._evictOneFromMap(map, key)) {
+          break;
         }
-        map.delete(oldestKey);
-        this._stats.evictions += 1;
+      }
+      if (this._maxEntries !== null) {
+        this._enforceMaxEntries(map, key);
       }
       return entry;
     }
@@ -4610,8 +4937,12 @@
       return typeof fastKey === 'bigint';
     }
 
-    _touchBackingLru(lruMap, canonicalKey, entry) {
+    _touchBackingLru(lruMap, canonicalKey, entry, priority = null) {
       entry.lastAccessedAt = this._now();
+      entry.accessSeq = ++this._accessSeq;
+      if (priority !== null && priority !== undefined) {
+        this._promoteEntryPriority(entry, priority);
+      }
       lruMap.delete(canonicalKey);
       lruMap.set(canonicalKey, entry);
     }
@@ -4635,7 +4966,7 @@
       }
     }
 
-    _getFastLookup(map, lruMap, fastKey) {
+    _getFastLookup(map, lruMap, fastKey, priority = null) {
       const normalizedKey = typeof fastKey === 'number' && fastKey === 0 ? 0 : fastKey;
       const rec = map.get(normalizedKey);
       if (rec === undefined) {
@@ -4647,7 +4978,7 @@
       }
       map.delete(normalizedKey);
       map.set(normalizedKey, rec);
-      this._touchBackingLru(lruMap, rec.canonicalKey, rec.entry);
+      this._touchBackingLru(lruMap, rec.canonicalKey, rec.entry, priority);
       return rec.entry.value;
     }
 
@@ -4671,7 +5002,7 @@
       }
     }
 
-    _tryFastRenderLookupByDescriptor(descriptor) {
+    _tryFastRenderLookupByDescriptor(descriptor, priority = null) {
       if (!descriptor || typeof descriptor !== 'object') {
         return undefined;
       }
@@ -4683,7 +5014,7 @@
           memo.regVer === shaderModuleRegistryVersion &&
           matchesRenderSnapshot(descriptor, memo.snapshot)
         ) {
-          this._touchBackingLru(this._renderPipelines, memo.canonicalKey, memo.entry);
+          this._touchBackingLru(this._renderPipelines, memo.canonicalKey, memo.entry, priority);
           return memo.entry.value;
         }
         this._renderDescriptorMemo.delete(descriptor);
@@ -4713,12 +5044,12 @@
       }
       this._fastRenderIntHash.delete(intHash);
       this._fastRenderIntHash.set(intHash, rec);
-      this._touchBackingLru(this._renderPipelines, rec.canonicalKey, rec.entry);
+      this._touchBackingLru(this._renderPipelines, rec.canonicalKey, rec.entry, priority);
       this._renderDescriptorMemo.set(descriptor, rec);
       return rec.entry.value;
     }
 
-    _tryFastComputeLookupByDescriptor(descriptor) {
+    _tryFastComputeLookupByDescriptor(descriptor, priority = null) {
       if (!descriptor || typeof descriptor !== 'object') {
         return undefined;
       }
@@ -4730,7 +5061,7 @@
           memo.regVer === shaderModuleRegistryVersion &&
           matchesComputeSnapshot(descriptor, memo.snapshot)
         ) {
-          this._touchBackingLru(this._computePipelines, memo.canonicalKey, memo.entry);
+          this._touchBackingLru(this._computePipelines, memo.canonicalKey, memo.entry, priority);
           return memo.entry.value;
         }
         this._computeDescriptorMemo.delete(descriptor);
@@ -4760,7 +5091,7 @@
       }
       this._fastComputeIntHash.delete(intHash);
       this._fastComputeIntHash.set(intHash, rec);
-      this._touchBackingLru(this._computePipelines, rec.canonicalKey, rec.entry);
+      this._touchBackingLru(this._computePipelines, rec.canonicalKey, rec.entry, priority);
       this._computeDescriptorMemo.set(descriptor, rec);
       return rec.entry.value;
     }
@@ -4777,7 +5108,7 @@
       ) {
         this._setFastLookup(this._fastRenderLookup, keyHint, canonicalKey, entry);
       }
-      const hasCustomOpts = Boolean(opts && hasEnumerableDataKeys(opts));
+      const hasCustomOpts = hasRenderNormalizationOptions(opts);
       if ((keyHint === undefined || keyHint === null) && !hasCustomOpts && rawDescriptor) {
         if (isFastRenderDescriptor(rawDescriptor)) {
           const snapshot = captureRenderSnapshot(rawDescriptor);
@@ -4858,6 +5189,73 @@
       if (durationMs > this._stats.maxCompileMs) {
         this._stats.maxCompileMs = durationMs;
       }
+      this._compileLatencyWindow[this._compileLatencyHead] = durationMs;
+      this._compileLatencyHead = (this._compileLatencyHead + 1) % this._compileLatencyWindowSize;
+      if (this._compileLatencyCount < this._compileLatencyWindowSize) {
+        this._compileLatencyCount += 1;
+      }
+      if (durationMs > this._compileBudgetMs) {
+        this._stats.slowCompilesOverBudget += 1;
+      }
+    }
+
+    _computeCompileLatencyStats() {
+      const slowCompilesOverBudget =
+        typeof this._stats.slowCompilesOverBudget === 'number' &&
+        Number.isFinite(this._stats.slowCompilesOverBudget) &&
+        this._stats.slowCompilesOverBudget > 0
+          ? this._stats.slowCompilesOverBudget
+          : 0;
+      const count = this._compileLatencyCount;
+      if (count <= 0) {
+        return {
+          p50Ms: 0,
+          p95Ms: 0,
+          maxMs: 0,
+          slowCompilesOverBudget,
+          budgetMs: this._compileBudgetMs,
+          sampleCount: 0,
+          windowSize: this._compileLatencyWindowSize,
+        };
+      }
+      const ring = this._compileLatencyWindow;
+      const scratch = this._compileLatencyScratch;
+      for (let i = 0; i < count; i += 1) {
+        scratch[i] = ring[i];
+      }
+      const view = scratch.subarray(0, count);
+      view.sort();
+      const rawP50 = percentileFromSorted(view, count, 0.5);
+      const rawP95 = percentileFromSorted(view, count, 0.95);
+      const rawMax = view[count - 1];
+      return {
+        p50Ms: Number.isFinite(rawP50) && rawP50 > 0 ? rawP50 : 0,
+        p95Ms: Number.isFinite(rawP95) && rawP95 > 0 ? rawP95 : 0,
+        maxMs: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 0,
+        slowCompilesOverBudget,
+        budgetMs: this._compileBudgetMs,
+        sampleCount: count,
+        windowSize: this._compileLatencyWindowSize,
+      };
+    }
+
+    /**
+     * Return rolling compile-latency percentiles (`p50Ms`, `p95Ms`, `maxMs`) and
+     * over-budget compile count (`slowCompilesOverBudget`) computed via a reusable
+     * pre-allocated `Float64Array` scratch buffer.
+     *
+     * @returns {{
+     *   p50Ms: number,
+     *   p95Ms: number,
+     *   maxMs: number,
+     *   slowCompilesOverBudget: number,
+     *   budgetMs: number,
+     *   sampleCount: number,
+     *   windowSize: number,
+     * }}
+     */
+    getCompileLatencyStats() {
+      return this._computeCompileLatencyStats();
     }
 
     _quarantineKey(key, kind, err) {
@@ -5093,6 +5491,7 @@
         this._computePipelines.clear();
         this._inFlightRender.clear();
         this._inFlightCompute.clear();
+        this._inFlightPriorities.clear();
         this._invalidateFastLookups();
       }
 
@@ -5107,7 +5506,7 @@
       };
     }
 
-    _getOrCreateBindGroupLayout(descriptor, keyHint, hasInlineSamplerMeta) {
+    _getOrCreateBindGroupLayout(descriptor, keyHint, hasInlineSamplerMeta, priority = null) {
       if (!descriptor || typeof descriptor !== 'object') {
         throw new TypeError('getOrCreateBindGroupLayout requires a descriptor object');
       }
@@ -5116,7 +5515,7 @@
       }
 
       const key = this._resolveKey(descriptor, keyHint);
-      const cached = this._getLru(this._bindGroupLayouts, key);
+      const cached = this._getLru(this._bindGroupLayouts, key, priority);
       if (cached !== undefined) {
         this._stats.layoutHits += 1;
         return cached;
@@ -5140,7 +5539,14 @@
       if (layout && (typeof layout === 'object' || typeof layout === 'function')) {
         setRegisteredObjectId(layout, `bgl:${key}`);
       }
-      this._setLru(this._bindGroupLayouts, key, layout, compileMs, this._maxBindGroupLayouts);
+      this._setLru(
+        this._bindGroupLayouts,
+        key,
+        layout,
+        compileMs,
+        this._maxBindGroupLayouts,
+        priority
+      );
       return layout;
     }
 
@@ -5149,10 +5555,16 @@
      *
      * @param {GPUBindGroupLayoutDescriptor} descriptor
      * @param {string | bigint | number | object} [keyHint]
+     * @param {{ priority?: 'critical' | 'high' | 'normal' | 'low' }} [options]
      * @returns {GPUBindGroupLayout}
      */
-    getOrCreateBindGroupLayout(descriptor, keyHint) {
-      return this._getOrCreateBindGroupLayout(descriptor, keyHint, false);
+    getOrCreateBindGroupLayout(descriptor, keyHint, options) {
+      return this._getOrCreateBindGroupLayout(
+        descriptor,
+        keyHint,
+        false,
+        extractPriorityOption(options)
+      );
     }
 
     /**
@@ -5162,9 +5574,10 @@
      *
      * @param {object | Array<object>} reflectionGroup
      * @param {string | bigint | number | object} [keyHint]
+     * @param {{ priority?: 'critical' | 'high' | 'normal' | 'low' }} [options]
      * @returns {GPUBindGroupLayout}
      */
-    createBindGroupLayoutFromReflection(reflectionGroup, keyHint) {
+    createBindGroupLayoutFromReflection(reflectionGroup, keyHint, options) {
       let rawEntries;
       let label;
       let hasInlineSampler = false;
@@ -5218,7 +5631,12 @@
       entries.sort((a, b) => a.binding - b.binding);
 
       const descriptor = label !== undefined ? { label, entries } : { entries };
-      return this._getOrCreateBindGroupLayout(descriptor, keyHint, hasInlineSampler);
+      return this._getOrCreateBindGroupLayout(
+        descriptor,
+        keyHint,
+        hasInlineSampler,
+        extractPriorityOption(options)
+      );
     }
 
     /**
@@ -5238,6 +5656,7 @@
      * @returns {GPURenderPipeline | null}
      */
     getFastRenderPipeline(fastKeyOrDescriptor, descriptor, options) {
+      const priority = extractPriorityOption(options);
       if (
         typeof fastKeyOrDescriptor === 'string' ||
         typeof fastKeyOrDescriptor === 'number' ||
@@ -5250,7 +5669,8 @@
         const hit = this._getFastLookup(
           this._fastRenderLookup,
           this._renderPipelines,
-          fastKeyOrDescriptor
+          fastKeyOrDescriptor,
+          priority
         );
         if (hit !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -5265,7 +5685,7 @@
       }
 
       if (fastKeyOrDescriptor && typeof fastKeyOrDescriptor === 'object') {
-        const hit = this._tryFastRenderLookupByDescriptor(fastKeyOrDescriptor);
+        const hit = this._tryFastRenderLookupByDescriptor(fastKeyOrDescriptor, priority);
         if (hit !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.renderHits += 1;
@@ -5297,6 +5717,7 @@
         throw new TypeError('device must provide a createRenderPipeline(descriptor) method');
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
@@ -5308,7 +5729,8 @@
         const fastCached = this._getFastLookup(
           this._fastRenderLookup,
           this._renderPipelines,
-          keyHint
+          keyHint,
+          priority
         );
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -5318,9 +5740,9 @@
         this._stats.fastLookupMisses += 1;
       } else if (
         (keyHint === undefined || keyHint === null) &&
-        (!options || typeof options !== 'object' || !hasEnumerableDataKeys(options))
+        !hasRenderNormalizationOptions(options)
       ) {
-        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor);
+        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor, priority);
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.renderHits += 1;
@@ -5339,13 +5761,14 @@
         throw new TypeError('device must provide a createRenderPipeline(descriptor) method');
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
         const hintKey = this._resolveKey(null, keyHint);
-        const hintCached = this._getLru(this._renderPipelines, hintKey);
+        const hintCached = this._getLru(this._renderPipelines, hintKey, priority);
         if (hintCached !== undefined) {
           const lruEntry = this._renderPipelines.get(hintKey);
           this._setFastLookup(this._fastRenderLookup, hintKey, hintKey, lruEntry);
@@ -5363,7 +5786,7 @@
       const effectiveDescriptor = norm.descriptor;
 
       const key = this._resolveKey(effectiveDescriptor, keyHint);
-      const cached = this._getLru(this._renderPipelines, key);
+      const cached = this._getLru(this._renderPipelines, key, priority);
       if (cached !== undefined) {
         this._populateFastRenderEntry(
           descriptor,
@@ -5510,7 +5933,8 @@
         key,
         pipeline,
         compileMs,
-        this._maxRenderPipelines
+        this._maxRenderPipelines,
+        priority
       );
       this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
       return pipeline;
@@ -5533,6 +5957,7 @@
         );
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
@@ -5548,7 +5973,8 @@
         const fastCached = this._getFastLookup(
           this._fastRenderLookup,
           this._renderPipelines,
-          keyHint
+          keyHint,
+          priority
         );
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -5563,7 +5989,7 @@
         } catch (err) {
           return Promise.reject(err);
         }
-        const hintCached = this._getLru(this._renderPipelines, hintKey);
+        const hintCached = this._getLru(this._renderPipelines, hintKey, priority);
         if (hintCached !== undefined) {
           const lruEntry = this._renderPipelines.get(hintKey);
           this._setFastLookup(this._fastRenderLookup, hintKey, hintKey, lruEntry);
@@ -5573,6 +5999,7 @@
         }
         const hintInFlight = this._inFlightRender.get(hintKey);
         if (hintInFlight !== undefined) {
+          this._recordInFlightPriority('render', hintKey, priority);
           this._stats.inFlightDedupes += 1;
           return hintInFlight;
         }
@@ -5581,9 +6008,9 @@
         }
       } else if (
         (keyHint === undefined || keyHint === null) &&
-        (!options || typeof options !== 'object' || !hasEnumerableDataKeys(options))
+        !hasRenderNormalizationOptions(options)
       ) {
-        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor);
+        const fastCached = this._tryFastRenderLookupByDescriptor(descriptor, priority);
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.renderHits += 1;
@@ -5605,7 +6032,7 @@
       }
 
       const effectiveDescriptor = norm.descriptor;
-      const cached = this._getLru(this._renderPipelines, key);
+      const cached = this._getLru(this._renderPipelines, key, priority);
       if (cached !== undefined) {
         this._populateFastRenderEntry(
           descriptor,
@@ -5621,6 +6048,7 @@
 
       const existing = this._inFlightRender.get(key);
       if (existing !== undefined) {
+        this._recordInFlightPriority('render', key, priority);
         this._stats.inFlightDedupes += 1;
         return existing;
       }
@@ -5724,7 +6152,8 @@
             key,
             pipeline,
             compileMs,
-            this._maxRenderPipelines
+            this._maxRenderPipelines,
+            priority
           );
           this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
           return Promise.resolve(pipeline);
@@ -5747,6 +6176,7 @@
         if (this._inFlightRender.get(key) === trackedPromise) {
           this._inFlightRender.delete(key);
         }
+        const effectivePriority = this._consumeInFlightPriority('render', key, priority);
         if (!pipeline) {
           const emptyErr = new Error('createRenderPipelineAsync returned empty pipeline');
           this._recordPipelineError('render', emptyErr, {
@@ -5768,7 +6198,8 @@
             key,
             pipeline,
             compileMs,
-            this._maxRenderPipelines
+            this._maxRenderPipelines,
+            effectivePriority
           );
           this._populateFastRenderEntry(descriptor, norm, key, keyHint, opts, lruEntry);
         }
@@ -5786,6 +6217,7 @@
                   if (this._inFlightRender.get(key) === trackedPromise) {
                     this._inFlightRender.delete(key);
                   }
+                  this._clearInFlightPriority('render', key);
                   const emptyErr = new Error('createRenderPipelineAsync returned empty pipeline');
                   this._recordPipelineError('render', err, {
                     key,
@@ -5823,6 +6255,7 @@
                 if (this._inFlightRender.get(key) === trackedPromise) {
                   this._inFlightRender.delete(key);
                 }
+                this._clearInFlightPriority('render', key);
                 this._recordPipelineError('render', err, {
                   key,
                   fallbackProfile: norm.fallbackProfile,
@@ -5847,6 +6280,7 @@
           if (this._inFlightRender.get(key) === trackedPromise) {
             this._inFlightRender.delete(key);
           }
+          this._clearInFlightPriority('render', key);
           this._recordPipelineError('render', err, {
             key,
             fallbackProfile: norm.fallbackProfile,
@@ -5913,7 +6347,8 @@
      * @param {GPUComputePipelineDescriptor} [descriptor]
      * @returns {GPUComputePipeline | null}
      */
-    getFastComputePipeline(fastKeyOrDescriptor, descriptor) {
+    getFastComputePipeline(fastKeyOrDescriptor, descriptor, options) {
+      const priority = extractPriorityOption(options);
       if (
         typeof fastKeyOrDescriptor === 'string' ||
         typeof fastKeyOrDescriptor === 'number' ||
@@ -5926,7 +6361,8 @@
         const hit = this._getFastLookup(
           this._fastComputeLookup,
           this._computePipelines,
-          fastKeyOrDescriptor
+          fastKeyOrDescriptor,
+          priority
         );
         if (hit !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -5935,13 +6371,13 @@
         }
         this._stats.fastLookupMisses += 1;
         if (descriptor && typeof descriptor === 'object') {
-          return this._getOrCreateComputePipelineSlow(descriptor, fastKeyOrDescriptor);
+          return this._getOrCreateComputePipelineSlow(descriptor, fastKeyOrDescriptor, options);
         }
         return null;
       }
 
       if (fastKeyOrDescriptor && typeof fastKeyOrDescriptor === 'object') {
-        const hit = this._tryFastComputeLookupByDescriptor(fastKeyOrDescriptor);
+        const hit = this._tryFastComputeLookupByDescriptor(fastKeyOrDescriptor, priority);
         if (hit !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.computeHits += 1;
@@ -5960,9 +6396,10 @@
      *
      * @param {GPUComputePipelineDescriptor} descriptor
      * @param {string | bigint | number | object} [keyHint]
+     * @param {{ priority?: 'critical' | 'high' | 'normal' | 'low' }} [options]
      * @returns {GPUComputePipeline}
      */
-    getOrCreateComputePipeline(descriptor, keyHint) {
+    getOrCreateComputePipeline(descriptor, keyHint, options) {
       if (!descriptor || typeof descriptor !== 'object') {
         throw new TypeError('getOrCreateComputePipeline requires a descriptor object');
       }
@@ -5970,6 +6407,7 @@
         throw new TypeError('device must provide a createComputePipeline(descriptor) method');
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
@@ -5981,7 +6419,8 @@
         const fastCached = this._getFastLookup(
           this._fastComputeLookup,
           this._computePipelines,
-          keyHint
+          keyHint,
+          priority
         );
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -5990,7 +6429,7 @@
         }
         this._stats.fastLookupMisses += 1;
       } else if (keyHint === undefined || keyHint === null) {
-        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor);
+        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor, priority);
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.computeHits += 1;
@@ -6001,21 +6440,22 @@
         this._stats.fastLookupMisses += 1;
       }
 
-      return this._getOrCreateComputePipelineSlow(descriptor, keyHint);
+      return this._getOrCreateComputePipelineSlow(descriptor, keyHint, options);
     }
 
-    _getOrCreateComputePipelineSlow(descriptor, keyHint) {
+    _getOrCreateComputePipelineSlow(descriptor, keyHint, options) {
       if (typeof this._device.createComputePipeline !== 'function') {
         throw new TypeError('device must provide a createComputePipeline(descriptor) method');
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
         (typeof keyHint === 'string' || typeof keyHint === 'bigint' || typeof keyHint === 'number')
       ) {
         const hintKey = this._resolveKey(null, keyHint);
-        const hintCached = this._getLru(this._computePipelines, hintKey);
+        const hintCached = this._getLru(this._computePipelines, hintKey, priority);
         if (hintCached !== undefined) {
           const lruEntry = this._computePipelines.get(hintKey);
           this._setFastLookup(this._fastComputeLookup, hintKey, hintKey, lruEntry);
@@ -6032,7 +6472,7 @@
       const effectiveDescriptor = norm.descriptor;
 
       const key = this._resolveKey(effectiveDescriptor, keyHint);
-      const cached = this._getLru(this._computePipelines, key);
+      const cached = this._getLru(this._computePipelines, key, priority);
       if (cached !== undefined) {
         this._populateFastComputeEntry(
           descriptor,
@@ -6075,7 +6515,8 @@
         key,
         pipeline,
         compileMs,
-        this._maxComputePipelines
+        this._maxComputePipelines,
+        priority
       );
       this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
       return pipeline;
@@ -6088,15 +6529,17 @@
      *
      * @param {GPUComputePipelineDescriptor} descriptor
      * @param {string | bigint | number | object} [keyHint]
+     * @param {{ priority?: 'critical' | 'high' | 'normal' | 'low' }} [options]
      * @returns {Promise<GPUComputePipeline | null>}
      */
-    getOrCreateComputePipelineAsync(descriptor, keyHint) {
+    getOrCreateComputePipelineAsync(descriptor, keyHint, options) {
       if (!descriptor || typeof descriptor !== 'object') {
         return Promise.reject(
           new TypeError('getOrCreateComputePipelineAsync requires a descriptor object')
         );
       }
 
+      const priority = extractPriorityOption(options);
       if (
         keyHint !== undefined &&
         keyHint !== null &&
@@ -6112,7 +6555,8 @@
         const fastCached = this._getFastLookup(
           this._fastComputeLookup,
           this._computePipelines,
-          keyHint
+          keyHint,
+          priority
         );
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
@@ -6127,7 +6571,7 @@
         } catch (err) {
           return Promise.reject(err);
         }
-        const hintCached = this._getLru(this._computePipelines, hintKey);
+        const hintCached = this._getLru(this._computePipelines, hintKey, priority);
         if (hintCached !== undefined) {
           const lruEntry = this._computePipelines.get(hintKey);
           this._setFastLookup(this._fastComputeLookup, hintKey, hintKey, lruEntry);
@@ -6137,6 +6581,7 @@
         }
         const hintInFlight = this._inFlightCompute.get(hintKey);
         if (hintInFlight !== undefined) {
+          this._recordInFlightPriority('compute', hintKey, priority);
           this._stats.inFlightDedupes += 1;
           return hintInFlight;
         }
@@ -6144,7 +6589,7 @@
           return Promise.resolve(null);
         }
       } else if (keyHint === undefined || keyHint === null) {
-        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor);
+        const fastCached = this._tryFastComputeLookupByDescriptor(descriptor, priority);
         if (fastCached !== undefined) {
           this._stats.fastLookupHits += 1;
           this._stats.computeHits += 1;
@@ -6165,7 +6610,7 @@
       }
 
       const effectiveDescriptor = norm.descriptor;
-      const cached = this._getLru(this._computePipelines, key);
+      const cached = this._getLru(this._computePipelines, key, priority);
       if (cached !== undefined) {
         this._populateFastComputeEntry(
           descriptor,
@@ -6180,6 +6625,7 @@
 
       const existing = this._inFlightCompute.get(key);
       if (existing !== undefined) {
+        this._recordInFlightPriority('compute', key, priority);
         this._stats.inFlightDedupes += 1;
         return existing;
       }
@@ -6216,7 +6662,8 @@
             key,
             pipeline,
             compileMs,
-            this._maxComputePipelines
+            this._maxComputePipelines,
+            priority
           );
           this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
           return Promise.resolve(pipeline);
@@ -6243,6 +6690,7 @@
           if (this._inFlightCompute.get(key) === trackedPromise) {
             this._inFlightCompute.delete(key);
           }
+          const effectivePriority = this._consumeInFlightPriority('compute', key, priority);
           if (!pipeline) {
             const emptyErr = new Error('createComputePipelineAsync returned empty pipeline');
             this._recordPipelineError('compute', emptyErr, { key });
@@ -6262,7 +6710,8 @@
               key,
               pipeline,
               compileMs,
-              this._maxComputePipelines
+              this._maxComputePipelines,
+              effectivePriority
             );
             this._populateFastComputeEntry(descriptor, norm, key, keyHint, lruEntry);
           }
@@ -6272,6 +6721,7 @@
           if (this._inFlightCompute.get(key) === trackedPromise) {
             this._inFlightCompute.delete(key);
           }
+          this._clearInFlightPriority('compute', key);
           this._recordPipelineError('compute', err, { key });
           if (
             generation === this._generation &&
@@ -6293,21 +6743,73 @@
         opts.concurrency !== undefined ? opts.concurrency : DEFAULT_PREWARM_CONCURRENCY,
         'concurrency'
       );
+      const defaultPriority = extractPriorityOption(opts);
 
       const list = Array.from(descriptors || []);
       const pipelines = new Array(list.length);
+      const itemPriorities = new Array(list.length);
+      let hasExplicitPriority = defaultPriority !== null;
+
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[i];
+        const wrapped = isDescriptorWrapper(item);
+        let p = null;
+        if (wrapped) {
+          if (item.priority !== undefined && item.priority !== null) {
+            p = normalizePipelinePriority(item.priority);
+          } else if (item.priorityTier !== undefined && item.priorityTier !== null) {
+            p = normalizePipelinePriority(item.priorityTier);
+          } else {
+            p = extractPriorityOption(item.options);
+          }
+        }
+        if (p === null) {
+          p = defaultPriority;
+        }
+        if (p !== null) {
+          hasExplicitPriority = true;
+        }
+        itemPriorities[i] = p;
+      }
+
+      const workOrder = new Array(list.length);
+      for (let i = 0; i < list.length; i += 1) {
+        workOrder[i] = i;
+      }
+      if (hasExplicitPriority && list.length > 1) {
+        workOrder.sort((a, b) => {
+          const rankA =
+            itemPriorities[a] !== null
+              ? PIPELINE_PRIORITY_RANKS[itemPriorities[a]]
+              : PIPELINE_PRIORITY_RANKS.normal;
+          const rankB =
+            itemPriorities[b] !== null
+              ? PIPELINE_PRIORITY_RANKS[itemPriorities[b]]
+              : PIPELINE_PRIORITY_RANKS.normal;
+          return rankB - rankA || a - b;
+        });
+      }
+
       let cursor = 0;
       let compiled = 0;
       let cached = 0;
       let deduped = 0;
 
       const worker = async () => {
-        while (cursor < list.length) {
-          const idx = cursor++;
-          const item = list[idx];
-          const desc = isDescriptorWrapper(item) ? item.descriptor : item;
-          const keyHint = isDescriptorWrapper(item) ? item.keyHint : undefined;
-          const itemOpts = isDescriptorWrapper(item) ? item.options : undefined;
+        while (cursor < workOrder.length) {
+          const origIdx = workOrder[cursor++];
+          const item = list[origIdx];
+          const wrapped = isDescriptorWrapper(item);
+          const desc = wrapped ? item.descriptor : item;
+          const keyHint = wrapped ? item.keyHint : undefined;
+          const rawItemOpts = wrapped ? item.options : undefined;
+          const effectivePriority = itemPriorities[origIdx];
+          const itemOpts =
+            effectivePriority !== null
+              ? rawItemOpts && typeof rawItemOpts === 'object'
+                ? { ...rawItemOpts, priority: effectivePriority }
+                : { priority: effectivePriority }
+              : rawItemOpts;
           const norm = isRender
             ? this.normalizeRenderDescriptor(desc, itemOpts)
             : normalizeComputePipelineDescriptor(desc);
@@ -6317,9 +6819,7 @@
           const wasInFlight = !wasCached && inFlightMap.has(key);
           const wasQuarantined =
             !wasCached && !wasInFlight && this._isQuarantinedKey(key, isRender ? 'render' : 'compute');
-          const pipeline = isRender
-            ? await getterAsync.call(this, desc, key, itemOpts)
-            : await getterAsync.call(this, desc, key);
+          const pipeline = await getterAsync.call(this, desc, key, itemOpts);
           if (pipeline && keyHint === undefined) {
             const entry = cacheMap.get(key);
             if (entry !== undefined) {
@@ -6330,7 +6830,7 @@
               }
             }
           }
-          pipelines[idx] = pipeline;
+          pipelines[origIdx] = pipeline;
           if (wasCached) {
             cached += 1;
           } else if (wasInFlight) {
@@ -6422,6 +6922,92 @@
       prune(this._bindGroupLayouts);
 
       this._stats.evictions += removed;
+      this._stats.reclaimedCount += removed;
+      return removed;
+    }
+
+    /**
+     * Bounded LRU reclaim: trim total cached render pipelines, compute pipelines, and bind group
+     * layouts down to at most `limit` entries, evicting lowest-priority (`low` -> `normal` ->
+     * `high` -> `critical`) least-recently-used entries first.
+     *
+     * @param {number} limit
+     * @returns {number} Number of entries reclaimed
+     */
+    trimTo(limit) {
+      const target = validateNonNegativeInt(limit, 'limit');
+      const total = this._totalCachedEntries();
+      if (total <= target) {
+        return 0;
+      }
+      if (target === 0) {
+        const maps = [this._renderPipelines, this._computePipelines, this._bindGroupLayouts];
+        let removed = 0;
+        for (let i = 0; i < maps.length; i += 1) {
+          const map = maps[i];
+          for (const entry of map.values()) {
+            entry.alive = false;
+            removed += 1;
+          }
+          map.clear();
+        }
+        this._hasNonDefaultPriority = false;
+        this._stats.evictions += removed;
+        this._stats.reclaimedCount += removed;
+        return removed;
+      }
+
+      let removed = 0;
+      while (this._totalCachedEntries() > target) {
+        if (!this._evictOneAcrossAllMaps(null, undefined, PIPELINE_PRIORITY_RANKS.critical)) {
+          break;
+        }
+        removed += 1;
+      }
+      return removed;
+    }
+
+    /**
+     * Evict up to `count` (or all when `count` is omitted) cached `'low'`-priority entries in
+     * least-recently-used order across render pipelines, compute pipelines, and bind group layouts
+     * without evicting `'normal'`, `'high'`, or `'critical'` entries.
+     *
+     * @param {number} [count]
+     * @returns {number} Number of low-priority entries reclaimed
+     */
+    evictLowPriority(count) {
+      if (count === undefined) {
+        if (!this._hasNonDefaultPriority) {
+          return 0;
+        }
+        const maps = [this._renderPipelines, this._computePipelines, this._bindGroupLayouts];
+        let removed = 0;
+        for (let i = 0; i < maps.length; i += 1) {
+          const map = maps[i];
+          for (const [k, entry] of map.entries()) {
+            if (entry.priorityRank === PIPELINE_PRIORITY_RANKS.low) {
+              entry.alive = false;
+              map.delete(k);
+              removed += 1;
+            }
+          }
+        }
+        this._stats.evictions += removed;
+        this._stats.reclaimedCount += removed;
+        return removed;
+      }
+
+      const maxToEvict = validateNonNegativeInt(count, 'count');
+      if (maxToEvict === 0 || !this._hasNonDefaultPriority) {
+        return 0;
+      }
+      let removed = 0;
+      while (removed < maxToEvict) {
+        if (!this._evictOneAcrossAllMaps(null, undefined, PIPELINE_PRIORITY_RANKS.low)) {
+          break;
+        }
+        removed += 1;
+      }
       return removed;
     }
 
@@ -6439,9 +7025,11 @@
       this._stats.fastLookupMisses = 0;
       this._stats.inFlightDedupes = 0;
       this._stats.evictions = 0;
+      this._stats.reclaimedCount = 0;
       this._stats.compileCount = 0;
       this._stats.totalCompileMs = 0;
       this._stats.maxCompileMs = 0;
+      this._stats.slowCompilesOverBudget = 0;
       this._stats.quarantineHits = 0;
       this._stats.negativeCacheEvictions = 0;
       this._stats.fallbackNormalizedCount = 0;
@@ -6453,6 +7041,8 @@
       this._stats.fallbackSamplerBindingsSynthesized = 0;
       this._stats.blendPipelineVariants = 0;
       this._stats.srgbPipelineVariants = 0;
+      this._compileLatencyHead = 0;
+      this._compileLatencyCount = 0;
       this._pipelineErrors.length = 0;
       this._pipelineErrorSeq = 0;
     }
@@ -6481,7 +7071,9 @@
       this._defaultSamplers.clear();
       this._inFlightRender.clear();
       this._inFlightCompute.clear();
+      this._inFlightPriorities.clear();
       this._quarantinedKeys.clear();
+      this._hasNonDefaultPriority = false;
       this._invalidateFastLookups();
 
       if (options && options.resetStats) {
@@ -6584,6 +7176,13 @@
           ? this._stats.maxCompileMs
           : 0;
       const totalHitRate = computeClampedHitRate(totalHits, totalMisses);
+      const compileLatency = this._computeCompileLatencyStats();
+      const reclaimedCount =
+        typeof this._stats.reclaimedCount === 'number' &&
+        Number.isFinite(this._stats.reclaimedCount) &&
+        this._stats.reclaimedCount > 0
+          ? this._stats.reclaimedCount
+          : 0;
 
       return {
         hits: totalHits,
@@ -6612,6 +7211,7 @@
         samplerMisses,
         inFlightDedupes: this._stats.inFlightDedupes,
         evictions: this._stats.evictions,
+        reclaimedCount,
         renderCount: this._renderPipelines.size,
         computeCount: this._computePipelines.size,
         layoutCount: this._bindGroupLayouts.size,
@@ -6619,6 +7219,11 @@
         compileCount,
         totalCompileMs,
         maxCompileMs,
+        p50Ms: compileLatency.p50Ms,
+        p95Ms: compileLatency.p95Ms,
+        maxMs: compileLatency.maxMs,
+        slowCompilesOverBudget: compileLatency.slowCompilesOverBudget,
+        compileLatency,
         quarantineHits: this._stats.quarantineHits,
         quarantinedKeys: this._quarantinedKeys.size,
         fallbackNormalizedCount: this._stats.fallbackNormalizedCount,
@@ -6669,6 +7274,10 @@
     DEFAULT_MAX_BIND_GROUP_LAYOUTS,
     DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
     DEFAULT_PREWARM_CONCURRENCY,
+    DEFAULT_COMPILE_BUDGET_MS,
+    DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
+    PIPELINE_PRIORITY_TIERS,
+    PIPELINE_PRIORITY_RANKS,
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_MAX_QUARANTINED_KEYS,
     DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
@@ -6690,6 +7299,7 @@
     registerShaderModuleId,
     normalizeVisibility,
     normalizeFallbackProfile,
+    normalizePipelinePriority,
     normalizeDefaultSamplerKind,
     buildDefaultSamplerDescriptor,
     isSrgbColorFormat,

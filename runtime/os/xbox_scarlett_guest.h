@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <type_traits>
 
 #include "guest/com_bridge.h"
@@ -171,10 +172,42 @@ inline constexpr HResult kHrPending = static_cast<HResult>(0x8000000Au);
 inline constexpr HResult kHrAbort = static_cast<HResult>(0x80004004u);
 inline constexpr HResult kHrHandle = static_cast<HResult>(0x80070006u);
 
-inline constexpr uint64_t kDStorageOptionFormatMask = 0xFFu;
+// DSTORAGE_REQUEST_OPTIONS, public GDK layout:
+//   bit 0      ZlibDecompress
+//   bits 1-4   BcpackMode: the BC format of a BCPack stream (os/bcpack.h). Decoded only with
+//              user-supplied format tables (docs/BCPACK.md); without them the request fails
+//              E_NOTIMPL. With bit 0 too, zlib runs first into uncompressed_size bytes.
+//   bit 21     DestinationIsPhysicalPages: `destination` is a guest array of physical page
+//              addresses (one per page of the destination) instead of a contiguous buffer
+//   bit 22     source is memory (not an IDStorageFile)
+// Any other bit set fails the request with E_NOTIMPL.
+inline constexpr uint64_t kDStorageOptionZlib = 1ull << 0;
+inline constexpr uint64_t kDStorageOptionBcpackShift = 1;
+inline constexpr uint64_t kDStorageOptionBcpackMask = 0xFull << kDStorageOptionBcpackShift;
+inline constexpr uint64_t kDStorageOptionDestinationIsPhysicalPages = 1ull << 21;
 inline constexpr uint64_t kDStorageOptionSourceMemory = 1ull << 22;
-inline constexpr uint32_t kDStorageFormatNone = 0;
-inline constexpr uint32_t kDStorageFormatZlib = 1;
+inline constexpr uint64_t kDStorageOptionKnownBits = kDStorageOptionZlib | kDStorageOptionBcpackMask |
+                                                     kDStorageOptionDestinationIsPhysicalPages |
+                                                     kDStorageOptionSourceMemory;
+
+struct DStorageOptions {
+    bool zlib = false;
+    uint32_t bcpack_mode = 0;  // 0: none
+    bool physical_pages = false;
+    bool source_memory = false;
+    uint64_t unknown_bits = 0;
+    bool compressed() const { return zlib || bcpack_mode != 0; }
+};
+
+constexpr DStorageOptions parse_dstorage_options(uint64_t options) {
+    DStorageOptions o;
+    o.zlib = (options & kDStorageOptionZlib) != 0;
+    o.bcpack_mode = static_cast<uint32_t>((options & kDStorageOptionBcpackMask) >> kDStorageOptionBcpackShift);
+    o.physical_pages = (options & kDStorageOptionDestinationIsPhysicalPages) != 0;
+    o.source_memory = (options & kDStorageOptionSourceMemory) != 0;
+    o.unknown_bits = options & ~kDStorageOptionKnownBits;
+    return o;
+}
 
 struct DStorageQueueDesc {
     uint64_t source_type;  // 0 file, 1 memory
@@ -260,6 +293,9 @@ struct DStorageStats {
     uint64_t decompressed_requests = 0;
     uint64_t submits = 0;             // explicit + automatic
     uint64_t live_queues = 0;
+    uint64_t physical_page_requests = 0;  // requests with DestinationIsPhysicalPages (option bit 21)
+    uint64_t bcpack_requests = 0;  // BCPack requests (option bits 1-4)
+    uint64_t bcpack_decoded = 0;   // ... unpacked into their destination (needs the user's tables)
 };
 
 DStorageStats dstorage_stats();
@@ -424,6 +460,29 @@ struct AcpHalState {
 };
 AcpHalState acp_hal_state(uint64_t hal);
 
+// The AcpHal XMA context commands (acp_hal_guest.cpp): 5 / 7 enable / disable one context
+// (payload word: index), 6 / 8 enable / disable many (payload: bitmask words, bit i = context i),
+// 18 advance a context's output read offset (payload: index, blocks consumed). A worker thread
+// fills enabled contexts' output rings (os/xma_decoder.h; silence until a WMA Pro decoder exists).
+struct XmaCommandStats {
+    uint64_t enables = 0, disables = 0, mask_enables = 0, mask_disables = 0, read_advances = 0;
+    uint64_t rejected = 0;     // bad payload or context index
+    uint32_t enabled_now = 0;  // contexts enabled at the moment
+    // The decode worker: XMA frames walked, 256-byte output blocks written, loops taken, times a
+    // voice ran out of input, frames or buffers it could not walk.
+    uint64_t frames = 0, blocks_written = 0, loops = 0, input_exhausted = 0, bad_frames = 0;
+};
+XmaCommandStats xma_command_stats();
+bool xma_context_enabled(uint32_t index);
+void reset_xma_commands();  // tests only
+// Tests only: use this context array instead of AcpHalAllocateShapeContexts' (va 0: back to it).
+void set_xma_contexts_for_tests(uint64_t va, uint32_t count);
+// Tests only: resolve APU addresses with `map` (empty: the APU heap again), keep the worker
+// thread from starting, and run one decode pass on the calling thread.
+void set_xma_apu_map_for_tests(std::function<uint8_t*(uint32_t, size_t)> map);
+void set_xma_worker_allowed_for_tests(bool allowed);
+void pump_xma_for_tests();
+
 // chad.dll XDsp guest model (acp_hal_guest.cpp): open connections and commands accepted.
 struct XDspStats {
     uint64_t connections = 0;
@@ -441,8 +500,14 @@ struct XApuStats {
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
     uint64_t type3_results = 0;  // type-3 results posted (one per decode command)
+    uint64_t results_posted = 0;  // results of every type posted
+    uint64_t type1_commands = 0, type2_commands = 0, type3_commands = 0, type5_commands = 0;
+    uint64_t unhandled_commands = 0;  // commands of an unknown type (accepted, no result)
 };
 XApuStats xapu_stats();
+
+// PG6_AUDIO_TRACE=1 (read once): audio diagnostics (XApu voice lifetimes, audio file requests).
+bool audio_trace_enabled();
 
 // The default audio render endpoint (mmdevice_guest.cpp): combase!CoCreateInstance(
 // CLSID_MMDeviceEnumerator) -> IMMDeviceEnumerator with one active eRender endpoint, its
@@ -468,6 +533,7 @@ struct AudioEndpointStats {
     // What the title actually wrote (tells "the title renders silence" from "we lose its audio"):
     uint64_t spatial_object_buffers = 0;   // static-object buffers read at EndUpdatingAudioObjects
     uint64_t spatial_nonzero_buffers = 0;  // ... of them holding a non-zero sample
+    uint64_t spatial_nonzero_passes = 0;   // passes with a non-zero sample in any object buffer
     uint64_t render_nonzero_frames = 0;    // released render frames of buffers with a non-zero sample
     uint64_t render_silent_releases = 0;   // ReleaseBuffer calls with AUDCLNT_BUFFERFLAGS_SILENT
 };

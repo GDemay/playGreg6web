@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1268,6 +1269,24 @@ void test_heap_indexed_bind_groups() {
     BindGroupLookup no_heap = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
     CHECK(no_heap.status == Status::Ok && no_heap.bind_group->entries[0].kind == BindResourceKind::Null);
     CHECK(no_heap.bind_group->entries[1].resource_id == 701 && cache.heap_index_misses() == 3);
+
+    // O36 end_epoch: under the bound nothing is dropped; above it, entries this epoch did not use
+    // are dropped (their gpu ids retired), and a full epoch above the bound empties the cache.
+    {
+        std::vector<uint32_t> retired;
+        const size_t before = cache.size();
+        CHECK(before >= 3);
+        CHECK(cache.end_epoch(before, &retired) == 0 && retired.empty() && cache.size() == before);
+        CHECK(st.set_root_constants(G, 0, 2, k1, 0) == Status::Ok);
+        BindGroupLookup used = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);  // used this epoch
+        CHECK(used.bind_group != nullptr);
+        used.bind_group->gpu_id = 99;
+        const size_t cached = cache.size();
+        CHECK(cache.end_epoch(1, &retired) == cached - 1 && cache.size() == 1);
+        CHECK(std::find(retired.begin(), retired.end(), 99u) == retired.end());
+        CHECK(cache.end_epoch(0, &retired) == 1 && cache.size() == 0);
+        CHECK(std::find(retired.begin(), retired.end(), 99u) != retired.end());
+    }
 }
 
 // Binding array elements (G62, lane-indexed heap windows): element k reads the heap index plus k;
@@ -1329,6 +1348,57 @@ void test_heap_indexed_binding_array() {
     BindGroupLookup moved = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
     CHECK(moved.rebuilt && moved.bind_group != nullptr && moved.bind_group->entries[0].resource_id == 101 &&
           moved.bind_group->entries[2].resource_id == 103);
+}
+
+// Non-power-of-two heap stride (G62, S63 lane-indexed windows scaled with s_mul_i32): the byte
+// offset is index * heap_stride, not index << heap_shift; the stride is part of the join identity.
+void test_heap_indexed_stride() {
+    DescriptorHeapRegistry reg;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, 16, true);
+    RootSignatureDesc d;
+    d.flags = 0x400;
+    d.parameters.push_back(constants(0, 1));
+    RootSignature rs;
+    CHECK(RootSignature::build(d, &rs).ok());
+    fill_srvs(reg, heap, 0, 16, 100);  // slot i -> resource 100 + i
+
+    std::vector<ShaderBinding> bindings;
+    for (uint32_t k = 0; k < 3; ++k) {
+        ShaderBinding b;  // window base in root constant 0, 96-byte step (3 descriptors of 32 bytes)
+        b.binding = 0;
+        b.register_class = DescriptorRangeType::Srv;
+        b.heap = HeapAccess::Resource;
+        b.heap_index_parameter = 0;
+        b.heap_shift = 0;
+        b.heap_stride = 96;
+        b.array_size = 3;
+        b.array_index = k;
+        bindings.push_back(b);
+    }
+    ShaderBinding shifted = bindings[0];
+    shifted.heap_stride = 0;
+    CHECK(!same_join(bindings[0], shifted));
+    const BindGroupPlan plan = BindGroupPlan::build(rs, bindings, WebGpuStage::Fragment);
+    CHECK(plan.unresolved_count() == 0);
+    const std::vector<ShaderBinding> shifted_bindings = {shifted};
+    const BindGroupPlan shift_plan = BindGroupPlan::build(rs, shifted_bindings, WebGpuStage::Fragment);
+    CHECK(plan.hash() != shift_plan.hash());
+
+    RootArgumentState st;
+    BindGroupCache cache;
+    const BindPoint G = BindPoint::Graphics;
+    DescriptorHeap* heaps[1] = {heap};
+    CHECK(st.set_descriptor_heaps(1, heaps) == Status::Ok);
+    CHECK(st.set_root_signature(G, &rs) == Status::Ok);
+    CHECK(st.set_root_constant(G, 0, 1, 0) == Status::Ok);  // window base 1
+    BindGroupLookup g = cache.get_or_build(st, G, plan, 1, test_resolver, nullptr);
+    CHECK(g.status == Status::Ok && g.bind_group != nullptr && g.bind_group->entries.size() == 3);
+    if (g.bind_group != nullptr && g.bind_group->entries.size() == 3) {
+        // (1 + k) * 96 / 32 = slots 3, 6, 9.
+        CHECK(g.bind_group->entries[0].resource_id == 103 && g.bind_group->entries[1].resource_id == 106 &&
+              g.bind_group->entries[2].resource_id == 109);
+        CHECK(g.bind_group->null_entries == 0);
+    }
 }
 
 // CB-indexed heaps (G62, #482): SM 6.6 ResourceDescriptorHeap[cb.index], the index read from a
@@ -2199,6 +2269,7 @@ int main() {
     test_bind_group_cache();
     test_heap_indexed_bind_groups();
     test_heap_indexed_binding_array();
+    test_heap_indexed_stride();
     test_cb_indexed_heap_bind_groups();
     test_inline_sampler_plan();
     test_state_tracker_basic();

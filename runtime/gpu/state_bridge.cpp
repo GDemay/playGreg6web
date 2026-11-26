@@ -170,6 +170,7 @@ StateBridgeDevice::~StateBridgeDevice() = default;
 
 void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo& info) {
     bool replaced = false;
+    uint32_t kept_floor = 0;
     {
         std::unique_lock lock(resources_mutex_);
         if (auto it = textures_.find(resource_id); it != textures_.end()) {
@@ -177,19 +178,34 @@ void StateBridgeDevice::register_texture(uint32_t resource_id, const TextureInfo
             replaced = old.format != info.format || old.width != info.width || old.height != info.height ||
                        old.depth_or_array_size != info.depth_or_array_size || old.mip_levels != info.mip_levels ||
                        old.dimension != info.dimension;
+            kept_floor = replaced ? 0u : old.resident_mip_floor;
             if (auto v = textures_by_va_.find(it->second.gpu_va);
                 it->second.gpu_va != 0 && v != textures_by_va_.end() && v->second == resource_id) {
                 textures_by_va_.erase(v);
             }
         }
-        textures_[resource_id] = info;
+        TextureInfo& stored = textures_[resource_id];
+        stored = info;
+        if (stored.resident_mip_floor == 0) {
+            stored.resident_mip_floor = kept_floor;  // the same texture registered again keeps its held levels
+        }
+        retired_resources_.erase(resource_id);
         if (info.gpu_va != 0) {
             textures_by_va_[info.gpu_va] = resource_id;
         }
     }
     if (replaced) {
-        retire_intermediates(resource_id);  // a new description: intermediates of the old one are stale
+        const std::vector<uint32_t> retired_intermediates =
+            retire_intermediates(resource_id);  // a new description: intermediates of the old one are stale
+        if (!retired_intermediates.empty()) {
+            notify_bridges_invalidated(retired_intermediates, {});
+        }
     }
+}
+
+bool StateBridgeDevice::retired(uint32_t resource_id) const {
+    std::shared_lock lock(resources_mutex_);
+    return retired_resources_.count(resource_id) != 0;
 }
 
 uint32_t StateBridgeDevice::texture_at(uint64_t gpu_va) const {
@@ -205,6 +221,7 @@ void StateBridgeDevice::register_buffer(uint32_t resource_id, uint64_t gpu_va, u
         buffers_by_va_.erase(it->second);
     }
     buffers_by_va_[gpu_va] = {resource_id, byte_size};
+    retired_resources_.erase(resource_id);
     buffer_va_[resource_id] = gpu_va;
     buffer_allocated_[resource_id] = std::max(byte_size, allocated_size);
 }
@@ -222,27 +239,307 @@ uint64_t StateBridgeDevice::buffer_gpu_va(uint32_t resource_id) const {
 }
 
 void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
     {
         std::unique_lock lock(resources_mutex_);
+        bool known = false;
         if (auto it = textures_.find(resource_id); it != textures_.end()) {
             if (auto v = textures_by_va_.find(it->second.gpu_va);
                 v != textures_by_va_.end() && v->second == resource_id) {
                 textures_by_va_.erase(v);
             }
             textures_.erase(it);
+            known = true;
         }
         if (auto it = buffer_va_.find(resource_id); it != buffer_va_.end()) {
             buffers_by_va_.erase(it->second);
             buffer_va_.erase(it);
+            known = true;
         }
         buffer_allocated_.erase(resource_id);
+        if (known && resource_id != 0) {
+            retired_resources_.insert(resource_id);
+            retire_epoch_.fetch_add(1, std::memory_order_acq_rel);
+        }
     }
-    retire_intermediates(resource_id);
+    {
+        std::lock_guard lock(retire_mutex_);
+        resource_last_use_.erase(resource_id);
+    }
+    const std::vector<uint32_t> retired_views = retire_views(resource_id);
+    const std::vector<uint32_t> retired_intermediates = retire_intermediates(resource_id);
+    {
+        // G66: ExecuteIndirect clamp bind groups over the buffer.
+        std::vector<uint32_t> stale;
+        {
+            std::lock_guard lock(objects_mutex_);
+            for (auto it = indirect_groups_.begin(); it != indirect_groups_.end();) {
+                if (it->first.first == resource_id || it->first.second == resource_id) {
+                    stale.push_back(it->second);
+                    it = indirect_groups_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (const uint32_t id : stale) {
+            defer_destroy_resource(id);
+        }
+    }
+    std::vector<uint32_t> invalidated_resources;
+    invalidated_resources.reserve(1 + retired_intermediates.size());
+    invalidated_resources.push_back(resource_id);
+    invalidated_resources.insert(invalidated_resources.end(), retired_intermediates.begin(),
+                                 retired_intermediates.end());
+    notify_bridges_invalidated(invalidated_resources, retired_views);
+}
+
+void StateBridgeDevice::attach_bridge(CommandListBridge* bridge) {
+    if (bridge == nullptr) {
+        return;
+    }
+    std::lock_guard lock(bridges_mutex_);
+    bridges_.push_back(bridge);
+}
+
+void StateBridgeDevice::detach_bridge(CommandListBridge* bridge) {
+    std::lock_guard lock(bridges_mutex_);
+    bridges_.erase(std::remove(bridges_.begin(), bridges_.end(), bridge), bridges_.end());
+}
+
+void StateBridgeDevice::notify_bridges_invalidated(std::span<const uint32_t> resource_ids,
+                                                   std::span<const uint32_t> view_ids) {
+    if (resource_ids.empty() && view_ids.empty()) {
+        return;
+    }
+    std::vector<uint32_t> retired_bgs;
+    {
+        std::lock_guard lock(bridges_mutex_);
+        for (CommandListBridge* b : bridges_) {
+            if (!b->try_invalidate_immediately(resource_ids, view_ids, &retired_bgs)) {
+                b->queue_invalidation(resource_ids, view_ids);
+            }
+        }
+    }
+    for (const uint32_t bg_id : retired_bgs) {
+        defer_destroy_resource(bg_id);
+    }
+}
+
+void StateBridgeDevice::note_resource_used(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    std::lock_guard lock(retire_mutex_);
+    frame_used_resources_.insert(resource_id);
+    resource_last_use_[resource_id] = ++resource_use_tick_;
+}
+
+bool StateBridgeDevice::is_resource_used_in_frame(uint32_t resource_id) const {
+    if (resource_id == 0) {
+        return false;
+    }
+    std::lock_guard lock(retire_mutex_);
+    return frame_used_resources_.count(resource_id) != 0;
+}
+
+uint64_t StateBridgeDevice::resource_last_use_tick(uint32_t resource_id) const {
+    if (resource_id == 0) {
+        return 0;
+    }
+    std::lock_guard lock(retire_mutex_);
+    const auto it = resource_last_use_.find(resource_id);
+    return it != resource_last_use_.end() ? it->second : 0u;
+}
+
+bool StateBridgeDevice::destroy_or_defer_resource(uint32_t resource_id, CommandEncoder& encoder) {
+    if (resource_id == 0) {
+        return false;
+    }
+    {
+        std::lock_guard lock(retire_mutex_);
+        if (frame_used_resources_.count(resource_id) != 0) {
+            if (deferred_destroy_set_.insert(resource_id).second) {
+                deferred_destroys_.push_back(resource_id);
+            }
+            return true;
+        }
+    }
+    encoder.destroy_resource(resource_id);
+    return false;
+}
+
+void StateBridgeDevice::defer_destroy_resource(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    std::lock_guard lock(retire_mutex_);
+    if (deferred_destroy_set_.insert(resource_id).second) {
+        deferred_destroys_.push_back(resource_id);
+    }
+}
+
+bool StateBridgeDevice::take_deferred_destroy(uint32_t resource_id, CommandEncoder& encoder) {
+    if (resource_id == 0) {
+        return false;
+    }
+    bool found = false;
+    {
+        std::lock_guard lock(retire_mutex_);
+        if (deferred_destroy_set_.erase(resource_id) != 0) {
+            deferred_destroys_.erase(
+                std::remove(deferred_destroys_.begin(), deferred_destroys_.end(), resource_id),
+                deferred_destroys_.end());
+            found = true;
+        }
+    }
+    if (found) {
+        encoder.destroy_resource(resource_id);
+    }
+    return found;
+}
+
+size_t StateBridgeDevice::flush_deferred_destroys_impl(CommandEncoder& encoder, bool respect_unexecuted) {
+    std::unordered_set<uint32_t> pinned;
+    if (respect_unexecuted) {
+        std::lock_guard lock(bridges_mutex_);
+        for (const CommandListBridge* b : bridges_) {
+            b->collect_unexecuted_resources(&pinned);
+        }
+    }
+    std::vector<uint32_t> to_destroy;
+    {
+        std::lock_guard lock(objects_mutex_);
+        if (!retired_ids_.empty()) {
+            std::lock_guard rlock(retire_mutex_);
+            for (const uint32_t id : retired_ids_) {
+                if (id != 0 && deferred_destroy_set_.insert(id).second) {
+                    deferred_destroys_.push_back(id);
+                }
+            }
+            retired_ids_.clear();
+        }
+    }
+    {
+        std::lock_guard lock(retire_mutex_);
+        if (pinned.empty()) {
+            to_destroy.swap(deferred_destroys_);
+            deferred_destroy_set_.clear();
+            frame_used_resources_.clear();
+        } else {
+            std::vector<uint32_t> still_deferred;
+            still_deferred.reserve(deferred_destroys_.size());
+            for (const uint32_t id : deferred_destroys_) {
+                if (pinned.count(id) != 0) {
+                    still_deferred.push_back(id);
+                } else {
+                    deferred_destroy_set_.erase(id);
+                    to_destroy.push_back(id);
+                }
+            }
+            deferred_destroys_.swap(still_deferred);
+            frame_used_resources_ = std::move(pinned);
+        }
+    }
+    for (const uint32_t id : to_destroy) {
+        encoder.destroy_resource(id);
+    }
+    return to_destroy.size();
+}
+
+size_t StateBridgeDevice::flush_deferred_destroys(CommandEncoder& encoder) {
+    return flush_deferred_destroys_impl(encoder, false);
+}
+
+void StateBridgeDevice::present(CommandEncoder& encoder) {
+    encoder.present();
+    flush_deferred_destroys_impl(encoder, false);
+}
+
+bool StateBridgeDevice::advance_present_frame(uint64_t present_count, CommandEncoder& encoder) {
+    bool advanced = false;
+    {
+        std::lock_guard lock(retire_mutex_);
+        if (present_count > synced_present_count_) {
+            synced_present_count_ = present_count;
+            advanced = true;
+        }
+    }
+    if (!advanced) {
+        return false;
+    }
+    flush_deferred_destroys_impl(encoder, true);
+    return true;
+}
+
+size_t StateBridgeDevice::deferred_destroy_count() const {
+    std::lock_guard lock(retire_mutex_);
+    return deferred_destroys_.size();
 }
 
 void StateBridgeDevice::register_shader_module(uint64_t shader_identity, uint32_t module_id) {
     std::unique_lock lock(resources_mutex_);
     shader_modules_[shader_identity] = module_id;
+}
+
+bool StateBridgeDevice::set_resident_mip_floor(uint32_t resource_id, uint32_t first_resident_mip) {
+    std::unique_lock lock(resources_mutex_);
+    const auto it = textures_.find(resource_id);
+    if (it == textures_.end()) {
+        return false;
+    }
+    const uint32_t floor = std::min(first_resident_mip, std::max(it->second.mip_levels, 1u) - 1u);
+    if (it->second.resident_mip_floor != floor) {
+        it->second.resident_mip_floor = floor;
+        residency_epoch_.fetch_add(1, std::memory_order_acq_rel);
+    }
+    return true;
+}
+
+bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, float min_lod_clamp, uint16_t* base,
+                                 uint16_t* count) noexcept {
+    const uint32_t levels = std::max(mip_levels, 1u);
+    uint32_t floor = resident_floor;
+    if (min_lod_clamp > 0.0f) {  // false for NaN
+        floor = std::max(floor, static_cast<uint32_t>(std::floor(std::min(min_lod_clamp, 65535.0f))));
+    }
+    const uint32_t b = *base;
+    if (floor <= b || b >= levels) {
+        return false;
+    }
+    const uint32_t end = *count == 0 ? levels : std::min(levels, b + *count);  // one past the view's last level
+    const uint32_t raised = std::min(floor, end - 1u);
+    if (raised <= b) {
+        return false;
+    }
+    *base = static_cast<uint16_t>(raised);
+    if (*count != 0) {
+        *count = static_cast<uint16_t>(end - raised);
+    }
+    return true;
+}
+
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers,
+                        bool streamable) noexcept {
+    const auto held = [&](uint32_t mip) {
+        for (uint32_t slice = 0; slice < layers; ++slice) {
+            const size_t index = mip + size_t{slice} * mips;
+            if (index < subresource_marks.size() && subresource_marks[index] != 0) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!streamable || mips <= 1u || layers == 0u) {
+        return 0;
+    }
+    uint32_t floor = mips;
+    while (floor > 0u && held(floor - 1u)) {
+        --floor;
+    }
+    return floor == mips ? 0u : floor;
 }
 
 bool StateBridgeDevice::texture_info(uint32_t resource_id, TextureInfo* out) const {
@@ -316,7 +613,7 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
 
         GroupLayoutRecord* found = nullptr;
         for (const auto& existing : group_layouts_) {
-            if (existing->header.content_id == record->header.content_id &&
+            if (!existing->runtime_owned && existing->header.content_id == record->header.content_id &&
                 existing->header.flags == record->header.flags &&
                 existing->entries.size() == record->entries.size() &&
                 existing->layout_entries.size() == record->layout_entries.size() &&
@@ -420,6 +717,20 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
     return ring_buffer_id_;
 }
 
+uint32_t StateBridgeDevice::ensure_default_vertex_buffer(CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    if (default_vertex_buffer_id_ == 0) {
+        default_vertex_buffer_id_ = allocate_id();
+        encoder.create_buffer(default_vertex_buffer_id_, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst,
+                              pso::kDefaultVertexBufferBytes);
+        const float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        const uint32_t u[4] = {0, 0, 0, 1};
+        encoder.write_buffer(default_vertex_buffer_id_, 0, f, sizeof(f));
+        encoder.write_buffer(default_vertex_buffer_id_, pso::kDefaultVertexIntOffset, u, sizeof(u));
+    }
+    return default_vertex_buffer_id_;
+}
+
 uint32_t StateBridgeDevice::allocate_root_constants(uint32_t bytes, bool* wrapped) {
     std::lock_guard lock(objects_mutex_);
     const uint32_t size = align_up(std::max(bytes, 1u), kRootConstantAlignment);
@@ -500,33 +811,42 @@ std::string storage_conversion_wgsl(uint8_t dst_format, uint8_t dimension) {
 
 void StateBridgeDevice::flush_retired_locked(CommandEncoder& encoder) {
     for (const uint32_t id : retired_ids_) {
-        encoder.destroy_resource(id);
+        destroy_or_defer_resource(id, encoder);
     }
     retired_ids_.clear();
 }
 
-void StateBridgeDevice::retire_intermediates(uint32_t resource_id) {
-    std::lock_guard lock(objects_mutex_);
-    std::vector<uint32_t> gone{resource_id};
-    for (auto it = intermediates_.begin(); it != intermediates_.end();) {
-        if (it->first.first == resource_id) {
-            gone.push_back(it->second);
-            retired_ids_.push_back(it->second);
-            it = intermediates_.erase(it);
-        } else {
-            ++it;
+std::vector<uint32_t> StateBridgeDevice::retire_intermediates(uint32_t resource_id) {
+    std::vector<uint32_t> retired_intermediates;
+    std::vector<uint32_t> to_defer;
+    {
+        std::lock_guard lock(objects_mutex_);
+        std::vector<uint32_t> gone{resource_id};
+        for (auto it = intermediates_.begin(); it != intermediates_.end();) {
+            if (it->first.first == resource_id) {
+                gone.push_back(it->second);
+                retired_intermediates.push_back(it->second);
+                to_defer.push_back(it->second);
+                it = intermediates_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = conversion_groups_.begin(); it != conversion_groups_.end();) {
+            const bool uses = std::find(gone.begin(), gone.end(), it->first[1]) != gone.end() ||
+                              std::find(gone.begin(), gone.end(), it->first[2]) != gone.end();
+            if (uses) {
+                to_defer.push_back(it->second);
+                it = conversion_groups_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
-    for (auto it = conversion_groups_.begin(); it != conversion_groups_.end();) {
-        const bool uses = std::find(gone.begin(), gone.end(), it->first[1]) != gone.end() ||
-                          std::find(gone.begin(), gone.end(), it->first[2]) != gone.end();
-        if (uses) {
-            retired_ids_.push_back(it->second);
-            it = conversion_groups_.erase(it);
-        } else {
-            ++it;
-        }
+    for (const uint32_t id : to_defer) {
+        defer_destroy_resource(id);
     }
+    return retired_intermediates;
 }
 
 uint32_t StateBridgeDevice::intermediate_storage_texture(uint32_t resource_id, const TextureInfo& info,
@@ -620,6 +940,387 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
     return id;
 }
 
+// ---- G66: ExecuteIndirect clamp pass ----
+
+const char* indirect_clamp_wgsl() noexcept {
+    // One invocation per command. Params: the source record (word index and stride), the command
+    // count, the count buffer word (when has_count), the record kind and the index buffer's element
+    // count. Commands at or past the count buffer's value, or whose record does not fit in the
+    // source buffer, are written as all zeros (no work). Indexed draws are clamped to the index
+    // buffer, dispatches to the per-dimension workgroup limit.
+    return R"(struct Params {
+    src_word: u32,
+    stride_words: u32,
+    count: u32,
+    count_word: u32,
+    has_count: u32,
+    kind: u32,
+    index_limit: u32,
+    group_limit: u32,
+}
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read> cnt: array<u32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<u32>;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= p.count) {
+        return;
+    }
+    var words = 4u;
+    var out_words = 4u;
+    if (p.kind == 1u) {
+        words = 5u;
+        out_words = 5u;
+    } else if (p.kind == 2u) {
+        words = 3u;
+        out_words = 3u;
+    } else if (p.kind == 3u) {
+        words = 3u;
+        out_words = 7u;
+    }
+    var n = p.count;
+    if (p.has_count != 0u) {
+        n = 0u;
+        if (p.count_word < arrayLength(&cnt)) {
+            n = min(cnt[p.count_word], p.count);
+        }
+    }
+    let base = p.src_word + i * p.stride_words;
+    let live = i < n && base < arrayLength(&src) && words <= arrayLength(&src) - base;
+    let out = i * out_words;
+    for (var k = 0u; k < out_words; k = k + 1u) {
+        var v = 0u;
+        if (live && k < words) {
+            v = src[base + k];
+        }
+        dst[out + k] = v;
+    }
+    if (!live) {
+        return;
+    }
+    if (p.kind == 1u) {
+        let first = dst[out + 2u];
+        var indices = 0u;
+        if (first < p.index_limit) {
+            indices = min(dst[out], p.index_limit - first);
+        }
+        dst[out] = indices;
+    } else if (p.kind == 2u) {
+        dst[out] = min(dst[out], p.group_limit);
+        dst[out + 1u] = min(dst[out + 1u], p.group_limit);
+        dst[out + 2u] = min(dst[out + 2u], p.group_limit);
+    } else if (p.kind == 3u) {
+        // Mesh dispatch: x-dimension groups only (y = z = 1), at most group_limit; the draw that
+        // follows covers index_limit (max primitives * 3) vertices per group.
+        var groups = 0u;
+        if (dst[out + 1u] == 1u && dst[out + 2u] == 1u) {
+            groups = min(dst[out], p.group_limit);
+        }
+        dst[out] = groups;
+        dst[out + 1u] = 1u;
+        dst[out + 2u] = 1u;
+        dst[out + 3u] = groups * p.index_limit;
+        dst[out + 4u] = 1u;
+    }
+}
+)";
+}
+
+uint32_t indirect_output_bytes(IndirectKind kind) noexcept {
+    switch (kind) {
+    case IndirectKind::Draw: return 16u;
+    case IndirectKind::DrawIndexed: return 20u;
+    case IndirectKind::Dispatch: return 12u;
+    case IndirectKind::DispatchMesh: return 28u;
+    }
+    return 16u;
+}
+
+// ---- G66: mesh pipelines ----
+
+bool valid_mesh_output_layout(const MeshOutputLayout& l) noexcept {
+    return l.max_vertices >= 1 && l.max_vertices <= 256 && l.max_primitives >= 1 && l.max_primitives <= 256 &&
+           l.vertex_words >= 4 && l.vertex_words % 4 == 0 && l.vertex_words <= 4 + 4 * kMaxMeshAttributes;
+}
+
+uint32_t mesh_group_record_words(const MeshOutputLayout& l) noexcept {
+    return 4u + l.max_vertices * l.vertex_words + l.max_primitives * 3u;
+}
+
+uint32_t mesh_max_groups(const MeshOutputLayout& l) noexcept {
+    if (!valid_mesh_output_layout(l)) {
+        return 0;
+    }
+    const uint64_t fit = kMeshOutputBytes / (uint64_t{mesh_group_record_words(l)} * 4u);
+    return static_cast<uint32_t>(std::min<uint64_t>(fit, kMaxIndirectWorkgroups));
+}
+
+std::string mesh_draw_vertex_wgsl(const MeshOutputLayout& l) {
+    const uint32_t attributes = l.vertex_words >= 4 ? (l.vertex_words - 4u) / 4u : 0u;
+    std::string w;
+    w += "struct VsOut {\n    @builtin(position) position: vec4<f32>,\n";
+    for (uint32_t a = 0; a < attributes; ++a) {
+        w += "    @location(" + std::to_string(a) + ") a" + std::to_string(a) + ": vec4<f32>,\n";
+    }
+    w += "}\n";
+    w += "@group(" + std::to_string(kMeshOutputGroup) + ") @binding(0) var<storage, read> ms_out: array<u32>;\n";
+    w += "const RECORD_WORDS: u32 = " + std::to_string(mesh_group_record_words(l)) + "u;\n";
+    w += "const MAX_VERTICES: u32 = " + std::to_string(l.max_vertices) + "u;\n";
+    w += "const MAX_PRIMITIVES: u32 = " + std::to_string(l.max_primitives) + "u;\n";
+    w += "const VERTEX_WORDS: u32 = " + std::to_string(l.vertex_words) + "u;\n";
+    w += "const INDEX_BASE: u32 = " + std::to_string(4u + l.max_vertices * l.vertex_words) + "u;\n";
+    w += R"(fn load4(w: u32) -> vec4<f32> {
+    return bitcast<vec4<f32>>(vec4<u32>(ms_out[w], ms_out[w + 1u], ms_out[w + 2u], ms_out[w + 3u]));
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
+    var o: VsOut;
+    // Unused primitives: all three corners at one point outside the depth range (no fragments).
+    o.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    let per_group = MAX_PRIMITIVES * 3u;
+    let g = vertex_index / per_group;
+    let k = vertex_index % per_group;
+    let prim = k / 3u;
+    let rec = g * RECORD_WORDS;
+    if (rec + RECORD_WORDS > arrayLength(&ms_out)) {
+        return o;
+    }
+    let vertices = min(ms_out[rec], MAX_VERTICES);
+    let primitives = min(ms_out[rec + 1u], MAX_PRIMITIVES);
+    if (prim >= primitives) {
+        return o;
+    }
+    let tri = rec + INDEX_BASE + prim * 3u;
+    if (max(ms_out[tri], max(ms_out[tri + 1u], ms_out[tri + 2u])) >= vertices) {
+        return o;
+    }
+    let v = rec + 4u + ms_out[tri + k % 3u] * VERTEX_WORDS;
+    o.position = load4(v);
+)";
+    for (uint32_t a = 0; a < attributes; ++a) {
+        w += "    o.a" + std::to_string(a) + " = load4(v + " + std::to_string(4u + 4u * a) + "u);\n";
+    }
+    w += "    return o;\n}\n";
+    return w;
+}
+
+uint64_t mesh_draw_vertex_identity(const MeshOutputLayout& l) noexcept {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint32_t words[4] = {0x4d534456u /* "MSDV" */, l.max_vertices, l.max_primitives, l.vertex_words};
+    for (uint32_t word : words) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (word >> (8 * b)) & 0xFFu;
+            h *= 0x100000001b3ull;
+        }
+    }
+    return h;
+}
+
+StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::mesh_layout(PipelineLayoutRecord* base, uint32_t visibility,
+                                                                        uint8_t binding_type) {
+    std::lock_guard lock(objects_mutex_);
+    if (base == nullptr || base->groups.size() > kMeshOutputGroup) {
+        return nullptr;
+    }
+    PipelineLayoutRecord*& found = mesh_layouts_[{base, visibility << 8 | binding_type}];
+    if (found != nullptr) {
+        return found;
+    }
+    std::vector<GroupLayoutRecord*> groups = base->groups;
+    while (groups.size() < kMeshOutputGroup) {
+        if (empty_group_layout_ == nullptr) {
+            auto record = std::make_unique<GroupLayoutRecord>();
+            record->id = allocate_id();
+            record->header.id = record->id;
+            record->runtime_owned = false;
+            empty_group_layout_ = record.get();
+            group_layouts_.push_back(std::move(record));
+        }
+        groups.push_back(empty_group_layout_);
+    }
+    GpuBindGroupLayoutEntry entry{};
+    entry.binding = 0;
+    entry.visibility = visibility;
+    entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+    entry.binding_type = binding_type;
+    GroupLayoutRecord* output = nullptr;
+    for (const auto& existing : group_layouts_) {
+        if (existing->runtime_owned && existing->layout_entries.size() == 1 &&
+            std::memcmp(&existing->layout_entries[0], &entry, sizeof(entry)) == 0) {
+            output = existing.get();
+            break;
+        }
+    }
+    if (output == nullptr) {
+        auto record = std::make_unique<GroupLayoutRecord>();
+        record->id = allocate_id();
+        record->header.id = record->id;
+        record->header.entry_count = 1;
+        record->entries.push_back(entry);
+        record->layout_entries.push_back(entry);
+        record->joins.push_back(d3d::ShaderBinding{});
+        record->runtime_owned = true;
+        output = record.get();
+        group_layouts_.push_back(std::move(record));
+    }
+    groups.push_back(output);
+    auto layout = std::make_unique<PipelineLayoutRecord>();
+    layout->id = allocate_id();
+    layout->groups = std::move(groups);
+    found = layout.get();
+    pipeline_layouts_.push_back(std::move(layout));
+    return found;
+}
+
+uint32_t StateBridgeDevice::mesh_output_group(const GroupLayoutRecord& group, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    if (mesh_output_buffer_ == 0) {
+        mesh_output_buffer_ = allocate_id();
+        encoder.create_buffer(mesh_output_buffer_, GpuBufferUsage::Storage, kMeshOutputBytes);
+    }
+    uint32_t& id = mesh_output_groups_[group.id];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e{};
+        e.binding = 0;
+        e.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+        e.resource_id = mesh_output_buffer_;
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = group.id;
+        g.entry_count = 1;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), &e, sizeof(e));
+    }
+    return id;
+}
+
+std::unique_ptr<MeshPipelineState> StateBridgeDevice::create_mesh_pipeline_state(
+    const pso::D3D12GraphicsPsoDesc& draw_desc, uint64_t mesh_shader, const MeshOutputLayout& output,
+    const d3d::RootSignature* root_signature) {
+    std::unique_ptr<MeshPipelineState> state(new MeshPipelineState());
+    state->output_ = output;
+    if (!valid_mesh_output_layout(output)) {
+        state->diagnostics_ |= BridgeDiag::MissingPipelineLayout;
+    }
+    pso::D3D12ComputePsoDesc stage_desc{};
+    stage_desc.cs = mesh_shader;
+    stage_desc.root_signature_id = draw_desc.root_signature_id;
+    state->stage_ = create_compute_pipeline_state(stage_desc, root_signature);
+    state->draw_ = create_graphics_pipeline_state(draw_desc, root_signature);
+    // Both pipelines get the runtime's output group after their own (bound from the graphics root
+    // arguments: the mesh stage is a graphics stage).
+    const auto extend = [&](PipelineLayoutRecord** layout, std::vector<d3d::BindGroupPlan>* plans, uint32_t visibility,
+                            GpuBufferBindingType type, uint64_t* diagnostics) {
+        if (*layout == nullptr) {
+            return;
+        }
+        PipelineLayoutRecord* extended = mesh_layout(*layout, visibility, static_cast<uint8_t>(type));
+        if (extended == nullptr) {
+            *diagnostics |= BridgeDiag::MissingPipelineLayout;
+            *layout = nullptr;
+            plans->clear();
+            return;
+        }
+        *layout = extended;
+        if (!plans->empty()) {
+            plans->resize(extended->groups.size());  // padding and output groups have no plan
+        }
+    };
+    extend(&state->stage_->layout_, &state->stage_->plans_, GpuShaderStageBits::Compute, GpuBufferBindingType::Storage,
+           &state->stage_->diagnostics_);
+    extend(&state->draw_->layout_, &state->draw_->plans_, GpuShaderStageBits::Vertex,
+           GpuBufferBindingType::ReadOnlyStorage, &state->draw_->diagnostics_);
+    state->diagnostics_ |= state->stage_->diagnostics_ | state->draw_->diagnostics_;
+    return state;
+}
+
+void StateBridgeDevice::release_mesh_pipeline_state(std::unique_ptr<MeshPipelineState> state, CommandEncoder& encoder) {
+    if (state != nullptr) {
+        release_pipeline_state(std::move(state->draw_), encoder);
+    }
+}
+
+StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    IndirectClamp& c = indirect_clamp_;
+    if (c.pipeline == 0) {
+        const uint32_t module = allocate_id();
+        encoder.create_shader_module(module, GpuShaderStage::Compute, indirect_clamp_wgsl());
+        GpuBindGroupLayoutEntry entries[4] = {};
+        const uint8_t types[4] = {static_cast<uint8_t>(GpuBufferBindingType::Uniform),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::Storage)};
+        for (uint32_t i = 0; i < 4; ++i) {
+            entries[i].binding = i;
+            entries[i].visibility = GpuShaderStageBits::Compute;
+            entries[i].type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+            entries[i].binding_type = types[i];
+        }
+        entries[0].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // params slot in the root constant ring
+        entries[0].min_binding_size = 32;
+        entries[3].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // output window in the indirect ring
+        c.group_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.group_layout;
+        layout.entry_count = 4;
+        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = allocate_id();
+        pl.bind_group_layout_count = 1;
+        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+        GpuCreateComputePipeline2Payload cp{};
+        cp.id = allocate_id();
+        cp.cs_module_id = module;
+        cp.pipeline_layout_id = pl.id;
+        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &cp, sizeof(cp));
+        c.pipeline = cp.id;
+        c.ring = allocate_id();
+        encoder.create_buffer(c.ring, GpuBufferUsage::Storage | GpuBufferUsage::Indirect,
+                              kIndirectRingBytes + kIndirectWindowBytes);
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args,
+                                                 uint32_t count, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    uint32_t& id = indirect_groups_[{args, count}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[4] = {};
+        const uint32_t ids[4] = {params_ring, args, count != 0 ? count : args, clamp.ring};
+        const uint64_t sizes[4] = {32, 0, 0, kIndirectWindowBytes};
+        for (uint32_t i = 0; i < 4; ++i) {
+            e[i].binding = i;
+            e[i].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            e[i].resource_id = ids[i];
+            e[i].size = sizes[i];
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = clamp.group_layout;
+        g.entry_count = 4;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    }
+    return id;
+}
+
+uint32_t StateBridgeDevice::allocate_indirect_window() {
+    std::lock_guard lock(objects_mutex_);
+    // GPU-ordered: the clamp pass that overwrites a reused window runs after the work that read it.
+    if (indirect_cursor_ + kIndirectWindowBytes > kIndirectRingBytes) {
+        indirect_cursor_ = 0;
+    }
+    const uint32_t offset = indirect_cursor_;
+    indirect_cursor_ += (kIndirectWindowBytes + 255u) & ~255u;
+    return offset;
+}
+
 uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
     std::string key;
     key.reserve(64);
@@ -632,15 +1333,59 @@ uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
     if (const auto it = view_ids_.find(key); it != view_ids_.end()) {
         return it->second;
     }
-    views_.push_back(record);
-    const auto id = static_cast<uint32_t>(views_.size());
+    uint32_t id = 0;
+    if (!free_views_.empty()) {
+        id = free_views_.back();
+        free_views_.pop_back();
+        views_[id - 1] = record;
+    } else {
+        views_.push_back(record);
+        view_keys_.emplace_back();
+        id = static_cast<uint32_t>(views_.size());
+    }
+    view_keys_[id - 1] = key;
     view_ids_.emplace(std::move(key), id);
+    views_by_texture_[record.texture_id].push_back(id);
+    if (record.resource_id != 0 && record.resource_id != record.texture_id) {
+        views_by_texture_[record.resource_id].push_back(id);
+    }
     return id;
+}
+
+std::vector<uint32_t> StateBridgeDevice::retire_views(uint32_t texture_id) {
+    std::lock_guard lock(views_mutex_);
+    std::vector<uint32_t> retired;
+    const auto it = views_by_texture_.find(texture_id);
+    if (it == views_by_texture_.end()) {
+        return retired;
+    }
+    const std::vector<uint32_t> ids = std::move(it->second);
+    views_by_texture_.erase(it);
+    retired.reserve(ids.size());
+    for (const uint32_t id : ids) {
+        if (id == 0 || id > view_keys_.size() || view_keys_[id - 1].empty()) {
+            continue;  // already retired through its other texture id
+        }
+        view_ids_.erase(view_keys_[id - 1]);
+        view_keys_[id - 1].clear();
+        views_[id - 1] = ViewRecord{};
+        free_views_.push_back(id);
+        retired.push_back(id);
+    }
+    return retired;
+}
+
+size_t StateBridgeDevice::live_view_count() const {
+    std::lock_guard lock(views_mutex_);
+    return view_ids_.size();
 }
 
 const ViewRecord* StateBridgeDevice::view(uint32_t view_id) const {
     std::lock_guard lock(views_mutex_);
-    return (view_id == 0 || view_id > views_.size()) ? nullptr : &views_[view_id - 1];
+    if (view_id == 0 || view_id > views_.size() || view_keys_[view_id - 1].empty()) {
+        return nullptr;
+    }
+    return &views_[view_id - 1];
 }
 
 bool StateBridgeDevice::resolve_view_descriptor(uint64_t cpu_handle, d3d::DescriptorKind kind,
@@ -858,6 +1603,20 @@ void StateBridgeDevice::release_pipeline_state(std::unique_ptr<GraphicsPipelineS
 
 namespace {
 
+// Tracks which CommandListBridge is currently executing BindGroupCache::get_or_build /
+// refresh_table_entries on this thread so a re-entrant unregister_resource (e.g. from
+// Device::ensure_address_texture LRU eviction during MemorySlotSource::view) queues its
+// invalidation instead of mutating BindGroupCache mid-lookup.
+thread_local CommandListBridge* t_building_bridge = nullptr;
+
+struct BuildingBridgeGuard {
+    CommandListBridge* prev = nullptr;
+    explicit BuildingBridgeGuard(CommandListBridge* self) noexcept : prev(t_building_bridge) {
+        t_building_bridge = self;
+    }
+    ~BuildingBridgeGuard() noexcept { t_building_bridge = prev; }
+};
+
 pso::TrackerOptions tracker_options(const BridgeOptions& options) {
     pso::TrackerOptions t;
     t.mid_pass_clear = options.mid_pass_clear;
@@ -874,10 +1633,244 @@ CommandListBridge::CommandListBridge(StateBridgeDevice& device, CommandEncoder& 
       tracker_(tracker_options(device.options())),
       resource_states_(device.resource_states_) {
     bind_groups_.set_slot_source(device.options().slot_source);
+    device_.attach_bridge(this);
     Reset();
 }
 
+CommandListBridge::~CommandListBridge() {
+    device_.detach_bridge(this);
+}
+
+void CommandListBridge::invalidate_resources_locked(std::span<const uint32_t> resource_ids,
+                                                    std::span<const uint32_t> view_ids,
+                                                    std::vector<uint32_t>* retired_bgs) {
+    if (resource_ids.empty() && view_ids.empty()) {
+        return;
+    }
+    std::vector<uint32_t> local_retired;
+    std::vector<uint64_t> evicted_hashes;
+    bind_groups_.evict_resources_and_views(resource_ids, view_ids, &local_retired, &evicted_hashes);
+    for (const uint64_t h : evicted_hashes) {
+        invalidated_key_hashes_.insert(h);
+    }
+    auto contains = [](std::span<const uint32_t> ids, uint32_t id) noexcept -> bool {
+        if (id == 0) {
+            return false;
+        }
+        for (const uint32_t candidate : ids) {
+            if (candidate == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (auto it = redirects_.begin(); it != redirects_.end();) {
+        const bool match = std::any_of(it->second.begin(), it->second.end(), [&](const StorageRedirect& r) {
+            return contains(resource_ids, r.texture) || contains(resource_ids, r.intermediate);
+        });
+        if (match) {
+            if (it->first != 0 && std::find(local_retired.begin(), local_retired.end(), it->first) == local_retired.end()) {
+                local_retired.push_back(it->first);
+            }
+            it = redirects_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (const uint32_t bg_id : local_retired) {
+        redirects_.erase(bg_id);
+        scoped_bind_groups_.erase(bg_id);
+        for (BoundGroup& b : render_groups_) {
+            if (b.bind_group_id == bg_id) {
+                b.bind_group_id = 0;
+                b.dynamic_offsets.clear();
+            }
+        }
+        for (BoundGroup& b : compute_groups_) {
+            if (b.bind_group_id == bg_id) {
+                b.bind_group_id = 0;
+                b.dynamic_offsets.clear();
+            }
+        }
+        for (MemoryBindGroup& m : memory_groups_) {
+            if (m.built.gpu_id == bg_id) {
+                m.invalidated = true;
+            }
+        }
+        ++stats_.bind_groups_invalidated;
+        invalidated_bgs_to_retire_.push_back(bg_id);
+        if (retired_bgs != nullptr) {
+            retired_bgs->push_back(bg_id);
+        }
+    }
+    for (MemoryBindGroup& m : memory_groups_) {
+        if (m.invalidated) {
+            continue;
+        }
+        bool stale = false;
+        for (const d3d::BindGroupEntry& e : m.built.entries) {
+            if (contains(resource_ids, e.resource_id) || contains(resource_ids, e.view.resource_id) ||
+                contains(resource_ids, e.view.counter_resource_id)) {
+                stale = true;
+                break;
+            }
+        }
+        if (!stale && !view_ids.empty()) {
+            for (const uint32_t vid : m.built.view_ids) {
+                if (contains(view_ids, vid)) {
+                    stale = true;
+                    break;
+                }
+            }
+        }
+        if (stale) {
+            m.invalidated = true;
+        }
+    }
+}
+
+bool CommandListBridge::try_invalidate_immediately(std::span<const uint32_t> resource_ids,
+                                                   std::span<const uint32_t> view_ids,
+                                                   std::vector<uint32_t>* retired_bgs) {
+    if (t_building_bridge == this) {
+        return false;
+    }
+    std::unique_lock lock(cache_mutex_, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    invalidate_resources_locked(resource_ids, view_ids, retired_bgs);
+    return true;
+}
+
+void CommandListBridge::queue_invalidation(std::span<const uint32_t> resource_ids,
+                                           std::span<const uint32_t> view_ids) {
+    std::lock_guard lock(pending_mutex_);
+    pending_invalidated_resources_.insert(pending_invalidated_resources_.end(), resource_ids.begin(),
+                                          resource_ids.end());
+    pending_invalidated_views_.insert(pending_invalidated_views_.end(), view_ids.begin(), view_ids.end());
+    pending_invalidation_epoch_.fetch_add(1, std::memory_order_release);
+}
+
+void CommandListBridge::drain_invalidations_locked() {
+    const uint64_t epoch = pending_invalidation_epoch_.load(std::memory_order_acquire);
+    if (epoch == seen_invalidation_epoch_) {
+        return;
+    }
+    std::vector<uint32_t> resources;
+    std::vector<uint32_t> views;
+    {
+        std::lock_guard lock(pending_mutex_);
+        resources.swap(pending_invalidated_resources_);
+        views.swap(pending_invalidated_views_);
+        seen_invalidation_epoch_ = pending_invalidation_epoch_.load(std::memory_order_relaxed);
+    }
+    std::vector<uint32_t> retired_bgs;
+    invalidate_resources_locked(resources, views, &retired_bgs);
+    for (const uint32_t bg_id : retired_bgs) {
+        device_.defer_destroy_resource(bg_id);
+    }
+}
+
+void CommandListBridge::flush_invalidations() {
+    std::lock_guard lock(cache_mutex_);
+    drain_invalidations_locked();
+}
+
+size_t CommandListBridge::cached_bind_group_count() const {
+    std::lock_guard lock(cache_mutex_);
+    return bind_groups_.size();
+}
+
+void CommandListBridge::note_recorded_resource(uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    {
+        std::lock_guard lock(recorded_mutex_);
+        recorded_resources_.insert(resource_id);
+    }
+    device_.note_resource_used(resource_id);
+}
+
+void CommandListBridge::clear_recorded_resources(bool executed) {
+    std::lock_guard lock(recorded_mutex_);
+    recorded_resources_.clear();
+    executed_ = executed;
+}
+
+void CommandListBridge::collect_unexecuted_resources(std::unordered_set<uint32_t>* out) const {
+    std::lock_guard lock(recorded_mutex_);
+    if (executed_) {
+        return;
+    }
+    out->insert(recorded_resources_.begin(), recorded_resources_.end());
+}
+
+void CommandListBridge::mark_executed_and_pin_in_frame() {
+    std::vector<uint32_t> snapshot;
+    {
+        std::lock_guard lock(recorded_mutex_);
+        executed_ = true;
+        snapshot.assign(recorded_resources_.begin(), recorded_resources_.end());
+    }
+    for (const uint32_t id : snapshot) {
+        device_.note_resource_used(id);
+    }
+}
+
+void CommandListBridge::note_bind_group_used_locked(const d3d::CachedBindGroup& cached, uint32_t bind_group_id) {
+    note_recorded_resource(bind_group_id);
+    for (const d3d::BindGroupEntry& e : cached.entries) {
+        if (e.resource_id != 0) {
+            note_recorded_resource(e.resource_id);
+        }
+        if (e.view.resource_id != 0 && e.view.resource_id != e.resource_id) {
+            note_recorded_resource(e.view.resource_id);
+        }
+        if (e.view.counter_resource_id != 0) {
+            note_recorded_resource(e.view.counter_resource_id);
+        }
+    }
+    for (const d3d::CachedBindGroup::Relocation& r : cached.relocations) {
+        if (r.buffer_id != 0) {
+            note_recorded_resource(r.buffer_id);
+        }
+    }
+    if (const auto it = redirects_.find(bind_group_id); it != redirects_.end()) {
+        for (const StorageRedirect& r : it->second) {
+            note_recorded_resource(r.texture);
+            note_recorded_resource(r.intermediate);
+        }
+    }
+}
+
 void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
+    // O36: bound the per-list bind group cache. Its keys change per draw (ring-allocated root CBVs,
+    // descriptor table bases), so it grew for the whole run, each entry a live WebGPU bind group,
+    // until the browser renderer process ran out of memory (~215 s, #726). The previous recording
+    // is finished here, so dropped bind groups are destroyed at the head of the new one (or
+    // deferred past Present if still referenced in the current frame).
+    clear_recorded_resources(false);
+    {
+        std::lock_guard lock(cache_mutex_);
+        drain_invalidations_locked();
+        std::vector<uint32_t> retired_bgs;
+        retired_bgs.swap(invalidated_bgs_to_retire_);
+        for (const uint32_t bg_id : retired_bgs) {
+            device_.take_deferred_destroy(bg_id, encoder_);
+        }
+        std::vector<uint32_t> evicted;
+        bind_groups_.end_epoch(kMaxCachedBindGroups, &evicted);
+        for (const uint32_t id : evicted) {
+            redirects_.erase(id);
+            device_.destroy_or_defer_resource(id, encoder_);
+        }
+        render_groups_.clear();
+        compute_groups_.clear();
+        scoped_bind_groups_.clear();
+        memory_groups_.clear();
+    }
     tracker_.reset();
     root_args_.reset();
     resource_states_.reset();
@@ -890,10 +1883,6 @@ void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
     index_buffer_ = {};
     index_dirty_ = false;
     render_pass_open_ = false;
-    render_groups_.clear();
-    compute_groups_.clear();
-    scoped_bind_groups_.clear();
-    memory_groups_.clear();
     compute_pass_valid_ = false;
     compute_pipeline_bound_ = 0;
     for (auto& point : root_uploads_) {
@@ -923,7 +1912,26 @@ void CommandListBridge::Close() {
     }
     tracker_.close();
     drain_events();
+    {
+        std::lock_guard lock(cache_mutex_);
+        drain_invalidations_locked();
+    }
     open_ = false;
+}
+
+void CommandListBridge::Present() {
+    if (open_) {
+        tracker_.flush_pending_clears();
+        tracker_.end_render_pass();
+        drain_events();
+    }
+    {
+        std::lock_guard lock(cache_mutex_);
+        drain_invalidations_locked();
+        invalidated_bgs_to_retire_.clear();
+    }
+    clear_recorded_resources(true);
+    device_.present(encoder_);
 }
 
 void CommandListBridge::SetPipelineState(GraphicsPipelineState* state) {
@@ -931,7 +1939,17 @@ void CommandListBridge::SetPipelineState(GraphicsPipelineState* state) {
         return;
     }
     graphics_pso_ = state;
+    mesh_pso_ = nullptr;
     tracker_.SetPipelineState(state != nullptr ? &state->pso_ : nullptr);
+}
+
+void CommandListBridge::SetMeshPipelineState(MeshPipelineState* state) {
+    if (!writable()) {
+        return;
+    }
+    graphics_pso_ = state != nullptr ? state->draw_.get() : nullptr;
+    mesh_pso_ = state;
+    tracker_.SetPipelineState(graphics_pso_ != nullptr ? &graphics_pso_->pso_ : nullptr);
 }
 
 void CommandListBridge::SetComputePipelineState(ComputePipelineState* state) {
@@ -957,6 +1975,11 @@ void CommandListBridge::OMSetRenderTargets(uint32_t num_render_target_descriptor
         }
     }
     const uint64_t dsv = depth_stencil_descriptor != nullptr ? depth_stencil_descriptor->ptr : 0;
+    om_attachments_.fill(0);
+    for (uint32_t i = 0; i < n; ++i) {
+        om_attachments_[i] = device_.attachment_texture(handles[i], d3d::DescriptorKind::Rtv);
+    }
+    om_attachments_[pso::kMaxColorTargets] = device_.attachment_texture(dsv, d3d::DescriptorKind::Dsv);
     tracker_.OMSetRenderTargets(n, render_target_descriptors != nullptr ? handles.data() : nullptr,
                                 rts_single_handle_to_descriptor_range,
                                 depth_stencil_descriptor != nullptr ? &dsv : nullptr, device_);
@@ -1130,6 +2153,18 @@ void CommandListBridge::drain_events() {
             encoder_.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
             end_usage_scope();
             render_pass_open_ = false;
+            // Fragment storage bindings redirected to intermediates: what the pass wrote goes back.
+            for (const StorageRedirect& r : pass_redirects_) {
+                if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly)) {
+                    emit_storage_conversion(r, false);
+                }
+            }
+            if (!pass_redirects_.empty()) {
+                pass_redirects_.clear();
+                compute_pipeline_bound_ = 0;
+                compute_groups_.clear();
+                compute_pass_valid_ = false;
+            }
             break;
         case pso::StateEventType::SetPipeline:
             if (e.pipeline_key != nullptr && graphics_pso_ != nullptr) {
@@ -1188,7 +2223,7 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
     for (uint32_t i = 0; i < p.color_count; ++i) {
         const pso::ColorAttachmentDesc& c = pass.color[i];
         const ViewRecord* v = c.view_id != 0 ? device_.view(c.view_id) : nullptr;
-        if (v == nullptr) {
+        if (v == nullptr || v->texture_id == 0) {
             continue;
         }
         GpuRenderPassColorAttachment& a = p.color[i];
@@ -1198,10 +2233,12 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
         a.view = v->view;
         std::memcpy(a.clear_value, c.clear_value.data(), sizeof(a.clear_value));
         usage_scope_.add(v->resource_id, v->range, v->usage);
+        note_recorded_resource(v->texture_id);
+        note_recorded_resource(v->resource_id);
     }
     if (pass.has_depth_stencil) {
         const pso::DepthStencilAttachmentDesc& d = pass.depth_stencil;
-        if (const ViewRecord* v = device_.view(d.view_id); v != nullptr) {
+        if (const ViewRecord* v = device_.view(d.view_id); v != nullptr && v->texture_id != 0) {
             GpuRenderPassDepthStencilAttachment& a = p.depth_stencil;
             a.texture_id = v->texture_id;
             a.depth_load_op = static_cast<uint8_t>(d.depth_load_op);
@@ -1214,6 +2251,8 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
             a.depth_read_only = d.depth_read_only ? 1 : 0;
             a.stencil_read_only = d.stencil_read_only ? 1 : 0;
             usage_scope_.add(v->resource_id, v->range, v->usage);
+            note_recorded_resource(v->texture_id);
+            note_recorded_resource(v->resource_id);
         }
     }
     encoder_.emit_packet(GpuOpcode::BeginRenderPass, &p, sizeof(p));
@@ -1272,6 +2311,13 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     const bool uav = v.kind == d3d::DescriptorKind::Uav;
     d.base_mip_level = v.first_mip;
     d.mip_level_count = uav ? 1 : (v.mip_levels == 0xffffu ? 0 : v.mip_levels);
+    // G66 partly-held mip chains: a sampled view starts at the first held level (and at the view's
+    // min-LOD clamp), so the shader never samples a level the title did not stream in.
+    if (v.kind == d3d::DescriptorKind::Srv && known && (tex.resident_mip_floor != 0 || v.min_lod_clamp > 0.0f) &&
+        clamp_view_to_resident_mips(tex.mip_levels, tex.resident_mip_floor, v.min_lod_clamp, &d.base_mip_level,
+                                    &d.mip_level_count)) {
+        ++stats_.mip_clamped_binds;
+    }
     switch (v.dimension) {
     case V::Texture1D:
     case V::Texture2D:
@@ -1339,6 +2385,12 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     }
     std::vector<GpuBindGroupEntry2> entries;
     gpu_entries(group, *cached, encoder_, &entries);
+    cached->relocations = pending_relocations_;
+    cached->relocation_epoch = device_.options().relocation_epoch ? device_.options().relocation_epoch() : 0;
+    cached->retire_epoch = device_.retire_epoch();
+    cached->residency_epoch = device_.residency_epoch();
+    cached->residency_key = residency_key(*cached);
+    cached->view_ids = pending_view_ids_;
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
     header.layout_id = group.id;
@@ -1359,6 +2411,78 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     return true;
 }
 
+bool CommandListBridge::binds_retired(d3d::CachedBindGroup* cached) const {
+    const uint64_t epoch = device_.retire_epoch();
+    if (epoch == cached->retire_epoch) {
+        return false;
+    }
+    for (const d3d::BindGroupEntry& e : cached->entries) {
+        if ((e.kind == d3d::BindResourceKind::TextureView || e.kind == d3d::BindResourceKind::Buffer) &&
+            e.resource_id != 0 && device_.retired(e.resource_id)) {
+            return true;
+        }
+    }
+    cached->retire_epoch = epoch;
+    return false;
+}
+
+uint64_t CommandListBridge::residency_key(const d3d::CachedBindGroup& cached) const {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (const d3d::BindGroupEntry& e : cached.entries) {
+        if (e.kind != d3d::BindResourceKind::TextureView || e.resource_id == 0 ||
+            e.view.kind != d3d::DescriptorKind::Srv) {
+            continue;
+        }
+        TextureInfo tex{};
+        if (!device_.texture_info(e.resource_id, &tex) || tex.resident_mip_floor == 0) {
+            continue;
+        }
+        h = (h ^ e.resource_id) * 0x100000001b3ull;
+        h = (h ^ tex.resident_mip_floor) * 0x100000001b3ull;
+    }
+    return h;
+}
+
+bool CommandListBridge::residency_changed(d3d::CachedBindGroup* cached) const {
+    const uint64_t epoch = device_.residency_epoch();
+    if (epoch == cached->residency_epoch) {
+        return false;
+    }
+    if (residency_key(*cached) != cached->residency_key) {
+        return true;  // emit_bind_group records the new epoch and key
+    }
+    cached->residency_epoch = epoch;
+    return false;
+}
+
+bool CommandListBridge::relocations_moved(d3d::CachedBindGroup* cached) {
+    const BridgeOptions& options = device_.options();
+    if (cached->relocations.empty() || !options.relocation_epoch) {
+        return false;
+    }
+    const uint64_t epoch = options.relocation_epoch();
+    if (epoch == cached->relocation_epoch) {
+        return false;
+    }
+    // Resolve each relocation again (a hit also marks the home used, so the LRU keeps it).
+    bool moved = false;
+    for (const d3d::CachedBindGroup::Relocation& r : cached->relocations) {
+        uint32_t id = 0;
+        uint64_t offset = 0;
+        const bool ok = r.storage ? options.relocate_storage && options.relocate_storage(r.va, r.size, &id, &offset)
+                                  : options.relocate_uniform &&
+                                        options.relocate_uniform(r.va, r.size, r.binding_size, &id, &offset);
+        if (!ok || id != r.buffer_id || offset != r.offset) {
+            moved = true;
+            break;
+        }
+    }
+    if (!moved) {
+        cached->relocation_epoch = options.relocation_epoch();
+    }
+    return moved;
+}
+
 void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group,
                                           const d3d::BindGroupPlan& plan,
                                           const d3d::CachedBindGroup& cached,
@@ -1377,17 +2501,38 @@ void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRe
 }
 
 uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) {
+    mark_executed_and_pin_in_frame();
     const d3d::DescriptorSlotSource* source = device_.options().slot_source;
     if (source == nullptr) {
         return 0;
     }
+    std::lock_guard lock(cache_mutex_);
+    drain_invalidations_locked();
     uint32_t refreshed = 0;
     for (MemoryBindGroup& m : memory_groups_) {
-        const bool changed = d3d::refresh_table_entries(device_.heaps(), *source, m.plan,
-                                                        &StateBridgeDevice::gpu_va_trampoline, &device_, &m.built);
+        bool force_rebuild = m.invalidated;
+        if (!force_rebuild) {
+            TextureInfo tmp{};
+            for (const d3d::BindGroupEntry& e : m.built.entries) {
+                if (e.kind == d3d::BindResourceKind::TextureView && e.resource_id != 0 &&
+                    !device_.texture_info(e.resource_id, &tmp)) {
+                    force_rebuild = true;
+                    break;
+                }
+            }
+        }
+        bool changed = false;
+        {
+            BuildingBridgeGuard guard(this);
+            changed = d3d::refresh_table_entries(device_.heaps(), *source, m.plan,
+                                                 &StateBridgeDevice::gpu_va_trampoline, &device_, &m.built,
+                                                 force_rebuild);
+        }
         if (changed) {
+            m.invalidated = false;
             std::vector<GpuBindGroupEntry2> entries;
             gpu_entries(*m.group, m.built, prelude, &entries);
+            m.built.view_ids = pending_view_ids_;
             // The conversions were recorded with the dispatches: a redirect the recording did not
             // make has none, so that binding is bound null as before (#482).
             const auto recorded = redirects_.find(m.built.gpu_id);
@@ -1420,8 +2565,10 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
             ++refreshed;
             ++stats_.memory_bind_groups_refreshed;
         }
+        note_bind_group_used_locked(m.built, m.built.gpu_id);
         sync_bound_textures(*m.group, m.built, prelude);
     }
+    drain_invalidations_locked();
     return refreshed;
 }
 
@@ -1450,6 +2597,12 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
     std::vector<GpuBindGroupEntry2>& entries = *result;
     entries.assign(cached.entries.size(), GpuBindGroupEntry2{});
     pending_redirects_.clear();
+    pending_relocations_.clear();
+    pending_view_ids_.clear();
+    const auto relocated = [this](size_t entry, bool storage, uint64_t va, uint64_t size, uint64_t binding_size,
+                                  uint32_t id, uint64_t offset) {
+        pending_relocations_.push_back({static_cast<uint32_t>(entry), storage, va, size, binding_size, id, offset});
+    };
     for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
         const d3d::BindGroupEntry& e = cached.entries[i];
         const GpuBindGroupLayoutEntry& layout = group.entries[i];
@@ -1459,30 +2612,55 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             out.array_index = static_cast<uint16_t>(group.joins[i].array_index);  // 0 outside binding arrays
         }
         switch (e.kind) {
-        case d3d::BindResourceKind::Buffer:
+        case d3d::BindResourceKind::Buffer: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
+                diagnostics_ |= BridgeDiag::NullBinding;  // G66 (#691): destroyed buffer, see TextureView
+                ++stats_.retired_resources_nulled;
+                break;
+            }
             out.resource_id = e.resource_id;
             out.offset = e.offset;
-            out.size = e.size;
+            const bool uniform_layout =
+                layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+            // G66 (#691): a constant-buffer view with no size (a console descriptor of zero
+            // records) would bind "to the end of the buffer": past WebGPU's 64 KiB uniform limit,
+            // and at the view's 16-byte offset it skipped the relocation below and invalidated the
+            // bind group (every draw using it). Bind the stage's block (or the 64 KiB a uniform
+            // binding may cover) from the view's start, within the buffer.
+            uint64_t view_size = e.size;
+            if (uniform_layout && view_size == 0) {
+                const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                const uint64_t block = layout.min_binding_size != 0 ? align_up(layout.min_binding_size, 16u)
+                                                                    : kMaxUniformBindingSize;
+                view_size = std::min<uint64_t>({room, block, kMaxUniformBindingSize});
+            }
+            out.size = view_size;
             // WebGPU binds uniform buffers only at 256-byte aligned offsets; the title's constant
             // buffers are 16-byte aligned (Xbox). Relocate to a copy at an aligned offset.
-            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
-                layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
-                e.offset % kUniformOffsetAlignment != 0) {
+            if (uniform_layout && e.offset % kUniformOffsetAlignment != 0) {
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
                 // A reflected stage (G62) gives the binding's minimum size: the home covers it,
                 // zero past the view's bytes.
-                const uint64_t home = std::max<uint64_t>(e.size, layout.min_binding_size);
-                if (base != 0 && e.size != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, e.size, home, &id, &offset)) {
+                const uint64_t home = std::max<uint64_t>(view_size, layout.min_binding_size);
+                if (base != 0 && view_size != 0 && device_.options().relocate_uniform &&
+                    device_.options().relocate_uniform(base + e.offset, view_size, home, &id, &offset)) {
+                    relocated(i, false, base + e.offset, view_size, home, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     // The relocated home is a whole multiple of 256 bytes (zero past the view).
                     out.size = align_up(home, kUniformOffsetAlignment);
                 } else {
-                    diagnostics_ |= BridgeDiag::UnalignedUniform;
+                    // No copy (GPU-only memory, no bytes): an unaligned uniform offset would
+                    // invalidate the bind group and every draw using it. Bound null instead.
+                    diagnostics_ |= BridgeDiag::UnalignedUniform | BridgeDiag::NullBinding;
+                    out.resource_id = 0;
+                    out.offset = 0;
+                    out.size = 0;
                 }
             } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
                        layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage) &&
@@ -1493,20 +2671,33 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
                 uint32_t id = 0;
                 uint64_t offset = 0;
-                if (base != 0 && e.size != 0 && device_.options().relocate_storage &&
-                    device_.options().relocate_storage(base + e.offset, e.size, &id, &offset)) {
+                // G66: a root SRV/UAV has no view size (D3D12 bounds it by the end of its
+                // resource). The title's UI vertex stage reads the same root SRV both as a uniform
+                // header and as read-only storage (vertex pulling, LEGAL NOTICES alpha mask): the
+                // uniform was relocated, this binding was left at the unaligned offset and nulled.
+                // Copy the memory that follows, up to the end of the buffer and at most 64 KiB
+                // (the stage clamps its reads to arrayLength).
+                uint64_t copy_size = view_size;
+                if (copy_size == 0) {
+                    const uint64_t allocated = device_.buffer_allocated_size(e.resource_id);
+                    const uint64_t room = allocated > e.offset ? allocated - e.offset : 0;
+                    copy_size = std::min<uint64_t>(room, kMaxUniformBindingSize);
+                }
+                if (base != 0 && copy_size != 0 && device_.options().relocate_storage &&
+                    device_.options().relocate_storage(base + e.offset, copy_size, &id, &offset)) {
+                    relocated(i, true, base + e.offset, copy_size, 0, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
-                    out.size = align_up(e.size, 4u);
+                    out.size = align_up(copy_size, 4u);
                     ++stats_.storage_relocated;
                 } else {
                     diagnostics_ |= BridgeDiag::UnalignedStorage;
                 }
-            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && e.size != 0 &&
+            } else if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && view_size != 0 &&
                        (layout.min_binding_size != 0
-                            ? layout.min_binding_size > e.size
+                            ? layout.min_binding_size > view_size
                             : layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
-                                  e.size % kUniformOffsetAlignment != 0)) {
+                                  view_size % kUniformOffsetAlignment != 0)) {
                 // Xbox constant-buffer views are 16-byte multiples, and a stage may declare a larger
                 // uniform block than the view (on the console it reads whatever memory follows).
                 // WebGPU needs the binding to cover the block: bind up to the stage's reflected
@@ -1516,7 +2707,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 // Extend the range when the buffer has the room; otherwise bind a relocated copy
                 // whose bytes past the view are zero (the zero-extension WebGPU needs, not data).
                 const uint64_t target = layout.min_binding_size != 0 ? layout.min_binding_size
-                                                                     : align_up(e.size, kUniformOffsetAlignment);
+                                                                     : align_up(view_size, kUniformOffsetAlignment);
                 // Room: the WebGPU buffer behind the view, including the zero padding a buffer
                 // smaller than a uniform block is allocated with (Resource::initialize).
                 const uint64_t base = device_.buffer_gpu_va(e.resource_id);
@@ -1532,7 +2723,8 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 uint32_t id = 0;
                 uint64_t offset = 0;
                 if (uniform && room < target && base != 0 && device_.options().relocate_uniform &&
-                    device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    device_.options().relocate_uniform(base + e.offset, view_size, target, &id, &offset)) {
+                    relocated(i, false, base + e.offset, view_size, target, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = align_up(target, kUniformOffsetAlignment);
@@ -1558,22 +2750,44 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     out.size = std::min<uint64_t>(room, kMaxUniformBindingSize);
                 } else if (base != 0 && device_.options().relocate_uniform &&
                            device_.options().relocate_uniform(base + e.offset, e.size, target, &id, &offset)) {
+                    relocated(i, false, base + e.offset, e.size, target, id, offset);
                     out.resource_id = id;
                     out.offset = offset;
                     out.size = target;
                     ++stats_.uniforms_zero_extended;
                 }
             }
+            // G66 (#691): WebGPU binds uniform and storage buffers only at 256-byte aligned
+            // offsets; any other offset invalidates the bind group and every draw using it (a
+            // zero-record console view at a 16-byte offset turned a whole capture black). What is
+            // still unaligned here (no relocated copy) is bound null: a zero resource, as the
+            // console reads a view without records.
+            if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) && out.resource_id != 0 &&
+                out.offset % kUniformOffsetAlignment != 0) {
+                diagnostics_ |= (uniform_layout ? BridgeDiag::UnalignedUniform : BridgeDiag::UnalignedStorage) |
+                                BridgeDiag::NullBinding;
+                out.resource_id = 0;
+                out.offset = 0;
+                out.size = 0;
+            }
             break;
-        case d3d::BindResourceKind::TextureView:
+        }
+        case d3d::BindResourceKind::TextureView: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
+                // G66 / G70 (#691): a stale descriptor of a destroyed texture (the title released it
+                // and left the slot): binding it would invalidate the whole submit. Bound null.
+                diagnostics_ |= BridgeDiag::UnknownTexture | BridgeDiag::NullBinding;
+                ++stats_.retired_resources_nulled;
+                break;
+            }
             out.resource_id = e.resource_id;
             out.view = texture_view_desc(e.view);
+            TextureInfo info{};
+            const bool known = e.resource_id != 0 && device_.texture_info(e.resource_id, &info);
             if (layout.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture)) {
                 // A storage view needs a texture created with STORAGE_BINDING; binding one of a
                 // texture without it would invalidate the whole command buffer. Bound null instead.
-                TextureInfo info;
-                const bool known = e.resource_id != 0 && device_.texture_info(e.resource_id, &info);
                 // The texture's own format (or its sRGB sibling) must be the stage's storage format.
                 const uint8_t own =
                     known ? texture_format_code(info.format,
@@ -1614,8 +2828,24 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     // storage format (storage views cannot be sRGB).
                     out.view.format = layout.storage_format;
                 }
+            } else if (e.resource_id != 0 && !known) {
+                // G70 (#691): texture was unregistered / destroyed; bind null instead of emitting
+                // a bind group referencing a destroyed GPUTexture that fails queue.submit().
+                out.resource_id = 0;
+                out.view = GpuTextureViewDesc{};
+                diagnostics_ |= BridgeDiag::UnknownTexture | BridgeDiag::NullBinding;
+            }
+            if (out.resource_id != 0) {
+                ViewRecord vr{};
+                vr.texture_id = out.resource_id;
+                vr.resource_id = e.resource_id;
+                vr.view = out.view;
+                vr.range = d3d::view_subresource_range(e.view);
+                vr.usage = d3d::view_usage(e.view);
+                pending_view_ids_.push_back(device_.intern_view(vr));
             }
             break;
+        }
         case d3d::BindResourceKind::Sampler: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
             bool dropped = false;
@@ -1659,9 +2889,12 @@ bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, 
                                          const TextureInfo& info, uint8_t own_format, const GpuTextureViewDesc& view,
                                          CommandEncoder& side, StorageRedirect* out) {
     using D = GpuTextureViewDimension;
-    // Compute only: the conversion runs as dispatches next to the stage's own.
-    if ((layout.visibility & GpuShaderStageBits::Compute) == 0 ||
-        (layout.visibility & ~GpuShaderStageBits::Compute) != 0 || info.sample_count > 1 ||
+    // Compute or fragment only: the conversions run as dispatches next to the stage's own (compute),
+    // or around the render pass (fragment).
+    // Vertex and mixed vertex/fragment bindings are converted the same way as fragment ones.
+    const bool compute_only = (layout.visibility & ~GpuShaderStageBits::Compute) == 0;
+    const bool render_only = (layout.visibility & GpuShaderStageBits::Compute) == 0;
+    if (layout.visibility == 0 || (!compute_only && !render_only) || info.sample_count > 1 ||
         !convertible_storage_format(own_format) || !convertible_storage_format(layout.storage_format)) {
         return false;
     }
@@ -1709,6 +2942,9 @@ void CommandListBridge::emit_storage_conversion(const StorageRedirect& r, bool i
     encoder_.set_compute_pipeline(pipeline.pipeline);
     const GpuSetBindGroup2Payload set{0u, group, 0u, 0u};
     encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    note_recorded_resource(r.texture);
+    note_recorded_resource(r.intermediate);
+    note_recorded_resource(group);
     const bool volume = r.dimension == static_cast<uint8_t>(GpuTextureViewDimension::Dim3D);
     const uint32_t xy = volume ? 4u : 8u;
     encoder_.dispatch_compute((r.extent[0] + xy - 1) / xy, (r.extent[1] + xy - 1) / xy,
@@ -1738,9 +2974,14 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                                           const std::vector<d3d::BindGroupPlan>& plans,
                                           std::vector<BoundGroup>* bound,
                                           bool track_usage) {
+    std::lock_guard cache_lock(cache_mutex_);
+    drain_invalidations_locked();
     bound->resize(layout->groups.size());
     for (size_t g = 0; g < layout->groups.size(); ++g) {
         const StateBridgeDevice::GroupLayoutRecord& group = *layout->groups[g];
+        if (group.runtime_owned) {
+            continue;  // G66 mesh output group: bound by the caller
+        }
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> offsets;
         d3d::CachedBindGroup* cached = nullptr;
@@ -1756,14 +2997,43 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                 it = empty_bind_groups_.emplace(group.id, header.id).first;
             }
             bind_group_id = it->second;
+            note_recorded_resource(bind_group_id);
         } else {
             const uint64_t heap_misses_before = bind_groups_.heap_index_misses();
             const uint64_t cb_misses_before = bind_groups_.cb_index_misses();
-            const d3d::BindGroupLookup lookup = bind_groups_.get_or_build(
-                root_args_, bind_point, plans[g], group.id, &StateBridgeDevice::gpu_va_trampoline, &device_);
+            const uint64_t hits_before = bind_groups_.hits();
+            const uint64_t misses_before = bind_groups_.misses();
+            d3d::BindGroupLookup lookup;
+            {
+                BuildingBridgeGuard guard(this);
+                lookup = bind_groups_.get_or_build(
+                    root_args_, bind_point, plans[g], group.id, &StateBridgeDevice::gpu_va_trampoline, &device_);
+                if (lookup.status == d3d::Status::Ok && lookup.bind_group != nullptr && !lookup.rebuilt &&
+                    lookup.bind_group->gpu_id != 0 && binds_retired(lookup.bind_group)) {
+                    // G66 (#691): defense-in-depth fallback if a cached entry still names a retired
+                    // resource: rebuild it from the descriptors and retire the old bind group.
+                    const uint32_t old_id = bind_groups_.erase(lookup.bind_group);
+                    lookup = bind_groups_.get_or_build(root_args_, bind_point, plans[g], group.id,
+                                                       &StateBridgeDevice::gpu_va_trampoline, &device_);
+                    if (lookup.retired_gpu_id == 0) {
+                        lookup.retired_gpu_id = old_id;
+                    } else if (old_id != 0) {
+                        redirects_.erase(old_id);
+                        encoder_.destroy_resource(old_id);
+                    }
+                    ++stats_.bind_groups_resource_retired;
+                }
+            }
+            if (lookup.status == d3d::Status::Ok && lookup.bind_group != nullptr && lookup.rebuilt &&
+                invalidated_key_hashes_.erase(lookup.bind_group->key_hash) != 0) {
+                ++stats_.bind_groups_resource_retired;
+            }
+            stats_.bind_group_cache_hits += bind_groups_.hits() - hits_before;
+            stats_.bind_group_cache_misses += bind_groups_.misses() - misses_before;
             stats_.heap_index_misses += bind_groups_.heap_index_misses() - heap_misses_before;
             stats_.cb_index_misses += bind_groups_.cb_index_misses() - cb_misses_before;
             if (lookup.status != d3d::Status::Ok || lookup.bind_group == nullptr) {
+                drain_invalidations_locked();
                 diagnostics_ |= lookup.status == d3d::Status::RootArgumentNotSet ? BridgeDiag::RootArgumentNotSet
                                                                                   : BridgeDiag::BindGroupBuildFailed;
                 return false;
@@ -1772,6 +3042,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             if (lookup.rebuilt || cached->gpu_id == 0) {
                 device_.ensure_layout_emitted(layout, encoder_);
                 if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
+                    drain_invalidations_locked();
                     return false;
                 }
                 if (lookup.retired_gpu_id != 0) {
@@ -1779,11 +3050,36 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
                     encoder_.destroy_resource(lookup.retired_gpu_id);
                     ++stats_.bind_groups_retired;
                 }
+            } else if (relocations_moved(cached)) {
+                // G66 (#691): a relocated home of this cached group now holds another range (the
+                // LRU evicted it while the group sat in the cache): bind a group over the new homes.
+                const uint32_t old_id = cached->gpu_id;
+                device_.ensure_layout_emitted(layout, encoder_);
+                if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
+                    drain_invalidations_locked();
+                    return false;
+                }
+                redirects_.erase(old_id);
+                encoder_.destroy_resource(old_id);
+                ++stats_.bind_groups_relocation_moved;
+            } else if (residency_changed(cached)) {
+                // G66 partly-held mip chains: a bound texture's held levels changed since this group
+                // was created: bind a group whose views start at the new first held level.
+                const uint32_t old_id = cached->gpu_id;
+                device_.ensure_layout_emitted(layout, encoder_);
+                if (!emit_bind_group(bind_point, group, cached, &plans[g])) {
+                    drain_invalidations_locked();
+                    return false;
+                }
+                redirects_.erase(old_id);
+                encoder_.destroy_resource(old_id);
+                ++stats_.bind_groups_residency_changed;
             } else if (cached->from_memory) {
                 note_memory_group(group, plans[g], *cached, kNoPacket);  // created by an earlier recording
             }
             sync_bound_textures(group, *cached, encoder_);
             bind_group_id = cached->gpu_id;
+            note_bind_group_used_locked(*cached, bind_group_id);
             for (size_t i = 0; i < group.entries.size(); ++i) {
                 if ((group.entries[i].flags & GpuBindGroupLayoutEntryFlags::HasDynamicOffset) == 0) {
                     continue;
@@ -1803,14 +3099,13 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             b.bind_group_id = bind_group_id;
             b.dynamic_offsets = std::move(offsets);
         }
-        if (track_usage && cached != nullptr &&
-            std::find(scoped_bind_groups_.begin(), scoped_bind_groups_.end(), bind_group_id) ==
-                scoped_bind_groups_.end()) {
-            scoped_bind_groups_.push_back(bind_group_id);
+        if (track_usage && cached != nullptr && scoped_bind_groups_.insert(bind_group_id).second) {
             for (size_t i = 0; i < cached->entries.size(); ++i) {
                 add_usage(cached->entries[i], group.joins[i]);
             }
         }
+        // Drain any re-entrant invalidation that arrived while building this group.
+        drain_invalidations_locked();
     }
     return true;
 }
@@ -1818,15 +3113,69 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
 // ---- Work ----
 
 bool CommandListBridge::prepare_render_draw() {
-    const bool ok = tracker_.prepare_draw(&device_.pipeline_cache());
-    drain_events();
-    if (ok && graphics_pso_ != nullptr && graphics_pso_->layout_ != nullptr &&
-        graphics_pso_->plans_.size() == graphics_pso_->layout_->groups.size() &&
-        !apply_bind_groups(d3d::BindPoint::Graphics, graphics_pso_->layout_, graphics_pso_->plans_, &render_groups_,
-                           true)) {
-        ++stats_.draws_skipped;
-        diagnostics_ |= BridgeDiag::DrawSkipped;
-        return false;
+    bool ok = false;
+    // Attempt 1 may find fragment storage bindings redirected to intermediates that the pass has not
+    // copied in yet: the pass ends, the conversions run, and attempt 2 reopens it (loadOp load).
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        ok = tracker_.prepare_draw(&device_.pipeline_cache());
+        drain_events();
+        if (ok && graphics_pso_ != nullptr && graphics_pso_->layout_ != nullptr &&
+            graphics_pso_->plans_.size() == graphics_pso_->layout_->groups.size() &&
+            !apply_bind_groups(d3d::BindPoint::Graphics, graphics_pso_->layout_, graphics_pso_->plans_,
+                               &render_groups_, true)) {
+            ++stats_.draws_skipped;
+            diagnostics_ |= BridgeDiag::DrawSkipped;
+            return false;
+        }
+        if (!ok) {
+            break;
+        }
+        std::vector<StorageRedirect> active;
+        for (const BoundGroup& b : render_groups_) {
+            if (const auto it = redirects_.find(b.bind_group_id); it != redirects_.end()) {
+                active.insert(active.end(), it->second.begin(), it->second.end());
+            }
+        }
+        // The same texture as a render attachment of this pass: detected and counted, not converted.
+        active.erase(std::remove_if(active.begin(), active.end(),
+                                    [&](const StorageRedirect& r) {
+                                        const bool alias = std::find(om_attachments_.begin(), om_attachments_.end(),
+                                                                     r.texture) != om_attachments_.end();
+                                        stats_.storage_views_attachment_alias += alias ? 1u : 0u;
+                                        return alias;
+                                    }),
+                     active.end());
+        if (active.empty()) {
+            break;
+        }
+        const auto tracked = [&](const StorageRedirect& r) {
+            return std::any_of(pass_redirects_.begin(), pass_redirects_.end(),
+                               [&](const StorageRedirect& o) { return o.same_target(r); });
+        };
+        bool need_in = false;
+        for (const StorageRedirect& r : active) {
+            need_in |= !tracked(r) && r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+        }
+        if (!need_in || attempt == 1) {
+            for (const StorageRedirect& r : active) {
+                if (!tracked(r)) {
+                    pass_redirects_.push_back(r);
+                }
+            }
+            break;
+        }
+        tracker_.flush_pending_clears();
+        tracker_.end_render_pass();
+        drain_events();  // converts out what the pass wrote so far
+        for (const StorageRedirect& r : active) {
+            if (r.access != static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly)) {
+                emit_storage_conversion(r, true);  // real texture -> intermediate
+            }
+        }
+        compute_pipeline_bound_ = 0;
+        compute_groups_.clear();
+        compute_pass_valid_ = false;
+        pass_redirects_ = std::move(active);
     }
     if (!ok) {
         ++stats_.draws_skipped;
@@ -1836,15 +3185,29 @@ bool CommandListBridge::prepare_render_draw() {
 }
 
 void CommandListBridge::apply_input_assembler(bool indexed) {
+    if (graphics_pso_ != nullptr) {
+        const uint32_t mask = graphics_pso_->pso().translation().default_vertex_slot_mask;
+        for (uint32_t slot = 0; mask != 0 && slot < pso::kMaxVertexBuffers; ++slot) {
+            if ((mask & (1u << slot)) != 0) {
+                encoder_.set_vertex_buffer(slot, device_.ensure_default_vertex_buffer(encoder_), 0);
+            }
+        }
+    }
     for (uint32_t slot = 0; slot < pso::kMaxVertexBuffers; ++slot) {
+        if (vertex_buffers_[slot].buffer_id != 0) {
+            note_recorded_resource(vertex_buffers_[slot].buffer_id);
+        }
         if ((vertex_dirty_ & (1u << slot)) != 0 && vertex_buffers_[slot].buffer_id != 0) {
             encoder_.set_vertex_buffer(slot, vertex_buffers_[slot].buffer_id, vertex_buffers_[slot].offset);
         }
     }
     vertex_dirty_ = 0;
-    if (indexed && index_dirty_ && index_buffer_.buffer_id != 0) {
-        encoder_.set_index_buffer(index_buffer_.buffer_id, index_buffer_.format, index_buffer_.offset);
-        index_dirty_ = false;
+    if (indexed && index_buffer_.buffer_id != 0) {
+        note_recorded_resource(index_buffer_.buffer_id);
+        if (index_dirty_) {
+            encoder_.set_index_buffer(index_buffer_.buffer_id, index_buffer_.format, index_buffer_.offset);
+            index_dirty_ = false;
+        }
     }
 }
 
@@ -1882,20 +3245,19 @@ void CommandListBridge::DrawIndexedInstanced(uint32_t index_count_per_instance,
     ++stats_.draws;
 }
 
-void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
-                                 uint32_t thread_group_count_y,
-                                 uint32_t thread_group_count_z) {
-    if (!writable()) {
-        return;
-    }
+ComputePipelineState* CommandListBridge::prepare_compute_dispatch() {
+    return prepare_compute_dispatch(compute_pso_, d3d::BindPoint::Compute);
+}
+
+ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelineState* state,
+                                                                  d3d::BindPoint bind_point) {
     // G7: pending clears must land and the render pass must end before compute work.
     tracker_.flush_pending_clears();
     tracker_.end_render_pass();
     drain_events();
-    ComputePipelineState* state = compute_pso_;
     if (state == nullptr || state->pipeline_id_ == 0) {
         diagnostics_ |= BridgeDiag::NoComputePipeline;
-        return;
+        return nullptr;
     }
     if (device_.claim_compute_creation(state->pipeline_id_)) {
         GpuCreateComputePipeline2Payload payload{};
@@ -1917,7 +3279,84 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
         compute_pipeline_bound_ = state->pipeline_id_;
     }
     if (state->layout_ != nullptr && state->plans_.size() == state->layout_->groups.size() &&
-        !apply_bind_groups(d3d::BindPoint::Compute, state->layout_, state->plans_, &compute_groups_, false)) {
+        !apply_bind_groups(bind_point, state->layout_, state->plans_, &compute_groups_, false)) {
+        return nullptr;
+    }
+    return state;
+}
+
+bool CommandListBridge::prepare_mesh_stage() {
+    ComputePipelineState* stage = mesh_pso_->stage_.get();
+    if (stage->layout_ == nullptr || stage->plans_.size() != stage->layout_->groups.size() ||
+        prepare_compute_dispatch(stage, d3d::BindPoint::Graphics) == nullptr) {
+        return false;
+    }
+    const uint32_t group = device_.mesh_output_group(*stage->layout_->groups[kMeshOutputGroup], encoder_);
+    const GpuSetBindGroup2Payload set{kMeshOutputGroup, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    compute_groups_[kMeshOutputGroup].bind_group_id = group;
+    return true;
+}
+
+bool CommandListBridge::prepare_mesh_draw() {
+    GraphicsPipelineState* draw = mesh_pso_->draw_.get();
+    if (draw->layout_ == nullptr || draw->plans_.size() != draw->layout_->groups.size()) {
+        return false;
+    }
+    // The emulated mesh output is a triangle list whatever topology the list has set.
+    const pso::D3DPrimitiveTopology topology = tracker_.variant_state().topology;
+    tracker_.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const bool ok = prepare_render_draw();
+    tracker_.IASetPrimitiveTopology(topology);
+    if (!ok) {
+        return false;
+    }
+    const uint32_t group = device_.mesh_output_group(*draw->layout_->groups[kMeshOutputGroup], encoder_);
+    const GpuSetBindGroup2Payload set{kMeshOutputGroup, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    if (render_groups_.size() > kMeshOutputGroup) {
+        render_groups_[kMeshOutputGroup].bind_group_id = group;
+    }
+    return true;
+}
+
+bool CommandListBridge::DispatchMesh(uint32_t x, uint32_t y, uint32_t z) {
+    if (!writable()) {
+        return false;
+    }
+    if (mesh_pso_ == nullptr || y != 1 || z != 1 || x > mesh_max_groups(mesh_pso_->output_)) {
+        ++stats_.mesh_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    }
+    if (x == 0) {
+        return true;  // no groups
+    }
+    if (!prepare_mesh_stage()) {
+        ++stats_.mesh_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    }
+    encoder_.dispatch_compute(x, 1, 1);
+    ++stats_.dispatches;
+    if (!prepare_mesh_draw()) {
+        ++stats_.mesh_skipped;
+        return false;
+    }
+    encoder_.draw(x * mesh_pso_->output_.max_primitives * 3u, 1, 0, 0);
+    ++stats_.draws;
+    ++stats_.mesh_dispatches;
+    return true;
+}
+
+void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
+                                 uint32_t thread_group_count_y,
+                                 uint32_t thread_group_count_z) {
+    if (!writable()) {
+        return;
+    }
+    ComputePipelineState* state = prepare_compute_dispatch();
+    if (state == nullptr) {
         return;
     }
     // #482: storage bindings redirected to an intermediate texture. Dispatches in one compute pass
@@ -1958,6 +3397,139 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
 }
 
+bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring,
+                                            uint32_t* out_offset) {
+    const StateBridgeDevice::IndirectClamp clamp = device_.indirect_clamp(encoder_);
+    const uint32_t params_ring = device_.ensure_root_constant_ring(encoder_);
+    uint32_t index_limit = 0xFFFFFFFFu;
+    uint32_t group_limit = kMaxIndirectWorkgroups;
+    if (e.kind == IndirectKind::DrawIndexed && index_buffer_.size_in_bytes != 0) {
+        index_limit = index_buffer_.size_in_bytes / (index_buffer_.format == GpuIndexFormat::Uint32 ? 4u : 2u);
+    } else if (e.kind == IndirectKind::DispatchMesh && mesh_pso_ != nullptr) {
+        index_limit = mesh_pso_->output_.max_primitives * 3u;  // draw vertices per group
+        group_limit = mesh_max_groups(mesh_pso_->output_);
+    }
+    const uint32_t params[8] = {static_cast<uint32_t>(e.args_offset / 4u),
+                                e.stride / 4u,
+                                count,
+                                static_cast<uint32_t>(e.count_offset / 4u),
+                                e.count_buffer != 0 ? 1u : 0u,
+                                static_cast<uint32_t>(e.kind),
+                                index_limit,
+                                group_limit};
+    bool wrapped = false;
+    const uint32_t params_offset = device_.allocate_root_constants(sizeof(params), &wrapped);
+    if (wrapped) {
+        diagnostics_ |= BridgeDiag::RootConstantRingWrapped;
+    }
+    encoder_.write_buffer(params_ring, params_offset, params, sizeof(params));
+    const uint32_t group = device_.indirect_clamp_group(clamp, params_ring, e.args_buffer, e.count_buffer, encoder_);
+    const uint32_t window = device_.allocate_indirect_window();
+    note_recorded_resource(e.args_buffer);
+    note_recorded_resource(e.count_buffer);
+    encoder_.set_compute_pipeline(clamp.pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 2u, 0u};
+    const uint32_t offsets[2] = {params_offset, window};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set), offsets, sizeof(offsets));
+    encoder_.dispatch_compute((count + 63u) / 64u, 1, 1);
+    // The stage's pipeline and bind groups are set again by the next dispatch.
+    compute_pipeline_bound_ = 0;
+    compute_groups_.clear();
+    *ring = clamp.ring;
+    *out_offset = window;
+    return true;
+}
+
+bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
+    if (!writable()) {
+        return false;
+    }
+    const uint32_t record = e.kind == IndirectKind::DrawIndexed                                        ? 20u
+                            : e.kind == IndirectKind::Dispatch || e.kind == IndirectKind::DispatchMesh ? 12u
+                                                                                                       : 16u;
+    const uint32_t out_record = indirect_output_bytes(e.kind);
+    const auto skip = [&] {
+        ++stats_.indirect_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    };
+    if (e.args_buffer == 0 || e.stride < record || e.stride % 4u != 0 || e.args_offset % 4u != 0 ||
+        e.count_offset % 4u != 0 || e.args_offset / 4u > 0xFFFFFFFFull || e.count_offset / 4u > 0xFFFFFFFFull) {
+        return skip();
+    }
+    if (e.max_count == 0) {
+        ++stats_.indirect_executions;
+        return true;  // no commands
+    }
+    const uint32_t count = std::min(e.max_count, kMaxIndirectCommands);
+    if (e.kind == IndirectKind::DispatchMesh) {
+        if (mesh_pso_ == nullptr || mesh_pso_->stage_->pipeline_id_ == 0 || mesh_max_groups(mesh_pso_->output_) == 0) {
+            ++stats_.mesh_skipped;
+            return skip();
+        }
+    } else if (e.kind == IndirectKind::Dispatch) {
+        if (compute_pso_ == nullptr || compute_pso_->pipeline_id_ == 0) {
+            diagnostics_ |= BridgeDiag::NoComputePipeline;
+            return skip();
+        }
+    } else if (graphics_pso_ == nullptr || (e.kind == IndirectKind::DrawIndexed && index_buffer_.buffer_id == 0)) {
+        return skip();
+    }
+    stats_.indirect_truncated += e.max_count - count;
+    // The clamp pass is compute work: the render pass ends first.
+    tracker_.flush_pending_clears();
+    tracker_.end_render_pass();
+    drain_events();
+    uint32_t ring = 0;
+    uint32_t base = 0;
+    emit_indirect_clamp(e, count, &ring, &base);
+    if (e.kind == IndirectKind::DispatchMesh) {
+        // Per command: the mesh stage as compute (dispatch record), then the draw over its output.
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t at = uint64_t{base} + uint64_t{i} * out_record;
+            if (!prepare_mesh_stage()) {
+                ++stats_.mesh_skipped;
+                return skip();
+            }
+            encoder_.indirect(GpuOpcode::DispatchIndirect, ring, at);
+            if (!prepare_mesh_draw()) {
+                ++stats_.mesh_skipped;
+                return skip();
+            }
+            encoder_.indirect(GpuOpcode::DrawIndirect, ring, at + 12u);
+            ++stats_.mesh_dispatches;
+        }
+        stats_.indirect_commands += count;
+        ++stats_.indirect_executions;
+        return true;
+    }
+    GpuOpcode opcode = GpuOpcode::DispatchIndirect;
+    if (e.kind == IndirectKind::Dispatch) {
+        if (prepare_compute_dispatch() == nullptr) {
+            return skip();
+        }
+        // Storage bindings redirected to an intermediate texture (#482) need conversions around the
+        // stage, which only direct dispatches run: such an execution is skipped.
+        for (const BoundGroup& b : compute_groups_) {
+            if (redirects_.count(b.bind_group_id) != 0) {
+                return skip();
+            }
+        }
+    } else {
+        if (!prepare_render_draw()) {
+            return skip();
+        }
+        apply_input_assembler(e.kind == IndirectKind::DrawIndexed);
+        opcode = e.kind == IndirectKind::DrawIndexed ? GpuOpcode::DrawIndexedIndirect : GpuOpcode::DrawIndirect;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * out_record);
+    }
+    stats_.indirect_commands += count;
+    ++stats_.indirect_executions;
+    return true;
+}
+
 void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers) {
     if (!writable()) {
         return;
@@ -1972,6 +3544,20 @@ void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::Resour
     }
 }
 
+size_t CommandListBridge::Readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes,
+                                  uint32_t resource_id) {
+    if (!writable()) {
+        return SIZE_MAX;
+    }
+    tracker_.flush_pending_clears();
+    tracker_.end_render_pass();
+    drain_events();
+    note_recorded_resource(resource_id);
+    const size_t at = encoder_.size() + sizeof(GpuPacketHeader);
+    encoder_.emit_packet(opcode, payload, payload_bytes);
+    return at;
+}
+
 void CommandListBridge::WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
                                      uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,
                                      uint32_t bytes_per_row, uint32_t rows_per_image, const void* data,
@@ -1979,6 +3565,7 @@ void CommandListBridge::WriteTexture(uint32_t texture_id, uint32_t mip_level, ui
     if (!writable()) {
         return;
     }
+    note_recorded_resource(texture_id);
     encoder_.write_texture(texture_id, mip_level, origin_x, origin_y, origin_z, width, height, depth_or_layers,
                            bytes_per_row, rows_per_image, data, data_len);
 }

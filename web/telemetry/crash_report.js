@@ -38,6 +38,9 @@ const MAX_BOOT_MILESTONES = 32;
 const MAX_BOOT_TRAPS = 32;
 const MAX_BOOT_UNRESOLVED_IMPORTS = 64;
 const MAX_GPU_MISSING_SHADERS = 64;
+const MAX_ERROR_MESSAGE_LENGTH = 4096;
+const MAX_ERROR_STACK_LENGTH = 16384;
+const MAX_LOG_MESSAGE_LENGTH = 4096;
 
 const WASM_MODULE_TOO_LARGE_RE =
   /\b(?:exceeds\s+maximum\s+size\s+of\s+1073741824|buffer\s+source\s+exceeds\s+maximum\s+size|(?:wasm\s+)?module\s+(?:size\s+)?exceeds\s+(?:the\s+)?(?:1\s*gib|1073741824|maximum\s+size))\b/i;
@@ -53,10 +56,12 @@ const WORKER_SCRIPT_COLLISION_RE =
 
 const HTTPFS_PGIM_RE = /\b(?:httpfs|pgim)\b|\.pgim\b/i;
 
+const QUOTED_FILE_URL_RE = /(["'`])(file:\/\/[^"'`\r\n]+?)(:\d+:\d+)?\1/gi;
+
 const FILE_URL_RE =
   /\bfile:\/\/[^\s"'`<>)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]}]|$)/gi;
 
-const URL_USERINFO_RE = /\b((?:https?|wss?|ftp):\/\/)([^\s/@"'`<>]+):([^\s/@"'`<>]*)@/gi;
+const URL_USERINFO_RE = /\b((?:https?|wss?|ftps?|sftp|smb|ssh):\/\/)([^\s/@"'`<>]+)@/gi;
 
 const URL_QUERY_RE =
   /((?:https?|wss?|ftp):\/\/[^\s"'`<>?#]+)\?(?!\[REDACTED\])[^\s"'`<>#)\]}]+?(?=:\d+:\d+(?:[)\s"'`<>\]}]|$)|[\s"'`<>#)\]}]|$)/gi;
@@ -66,11 +71,14 @@ const STANDALONE_QUERY_RE =
 
 const AUTH_SCHEME_RE = /\b(Bearer|Basic)\s+(?!\[REDACTED\])[A-Za-z0-9\-._~+/=:]+/gi;
 
+const PEM_PRIVATE_KEY_RE =
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
+
 const SECRET_KV_RE =
-  /\b(authorization|api[_-]?key|apikey|api[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|client[_-]?secret|private[_-]?key|secret[_-]?key|signing[_-]?key|session[_-]?token|session[_-]?id|csrf[_-]?token|sas[_-]?token|x-api-key|x-auth-token|x-access-token|x-session-token|x-amz-signature|x-amz-security-token|x-amz-credential|cookie|set-cookie|password|passwd|secret|token|jwt)(["']?\s*[:=]\s*)(?!(?:(?:Bearer|Basic)\s+)?\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s,;}\])&]+)/gi;
+  /\b(authorization|api[_-]?key|apikey|api[_-]?secret|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|oauth[_-]?token|bearer[_-]?token|github[_-]?token|npm[_-]?token|client[_-]?secret|private[_-]?key|secret[_-]?key|signing[_-]?key|secret[_-]?token|session[_-]?token|session[_-]?id|csrf[_-]?token|x-csrf-token|sas[_-]?token|aws[_-]?secret[_-]?access[_-]?key|aws[_-]?access[_-]?key[_-]?id|aws[_-]?session[_-]?token|x-api-key|x-auth-token|x-access-token|x-session-token|x-amz-signature|x-amz-security-token|x-amz-credential|cookie|set-cookie|password|passwd|secret|token|jwt|username|user[_-]?name|os[_-]?user|host[_-]?user|user[_-]?profile|home[_-]?dir|homedir)(["']?\s*[:=]\s*)(?!(?:(?:Bearer|Basic)\s+)?\[REDACTED\])(?:"[^"]*"|'[^']*'|[^\s,;}\])&]+)/gi;
 
 const BARE_TOKEN_RE =
-  /\b(?:eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|AKIA[0-9A-Z]{16})\b/g;
+  /\b(?:eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}|sk_(?:live|test)_[A-Za-z0-9]{12,}|sk-(?:proj-|ant-)?[A-Za-z0-9_-]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35,})\b/g;
 
 const DATA_URI_BASE64_RE =
   /\bdata:[a-z0-9.+-]+\/[a-z0-9.+-]+(?:;[^,\s"'`<>]*)?;base64,[A-Za-z0-9+/=\r\n_-]{16,}/gi;
@@ -83,19 +91,29 @@ const LONG_HEX_PAYLOAD_RE = /(?<![0-9a-fA-F])(?:0x)?[0-9a-fA-F]{65,}(?![0-9a-fA-
 const BINARY_CONTROL_CHAR_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/;
 const BINARY_CONTROL_RUN_RE = /[^\r\n\t\x20-\x7e]*[\x00-\x08\x0b\x0c\x0e-\x1f][^\r\n\t\x20-\x7e]*/g;
 
-const QUOTED_WIN_PATH_RE = /(["'`])((?:\\\\[?.]\\)?[A-Za-z]:[\\/][^"'`\r\n]+?)(:\d+:\d+)?\1/g;
+const QUOTED_WIN_PATH_RE =
+  /(["'`])((?:\\{2,}[?.]\\{1,2})?[A-Za-z]:(?:\\{1,2}|\/)[^"'`\r\n]+?)(:\d+:\d+)?\1/g;
+
+const QUOTED_UNC_PATH_RE =
+  /(["'`])(\\{2,}(?:[?.]\\{1,2})?[^\s\\"'`\r\n][^"'`\r\n]*?\\[^"'`\r\n]+?)(:\d+:\d+)?\1/g;
+
+const QUOTED_FWD_UNC_PATH_RE =
+  /(["'`])(\/\/[A-Za-z0-9._-]+\/[^"'`\r\n]+?)(:\d+:\d+)?\1/g;
 
 const WIN_DEVICE_PATH_RE =
-  /(^|[\s"'`(\[={<,:;|])(\\\\[?.]\\[^\s"'`<>|)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|)\]},;]|$)/g;
+  /(^|[\s"'`(\[={<,:;|])(\\{2,}[?.]\\+[^\s"'`<>|)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|)\]},;]|$)/g;
 
 const WIN_DRIVE_PATH_RE =
   /(?<![A-Za-z0-9_])([A-Za-z]:(?:\\|\/(?!\/))[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
 
 const WIN_UNC_PATH_RE =
-  /(^|[\s"'`(\[={<,:;|])(\\\\[^\s\\"'`<>|*?)\]},;]+\\[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
+  /(^|[\s"'`(\[={<,:;|])(\\{2,}[^\s\\"'`<>|*?)\]},;]+\\+[^\s"'`<>|*?)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>|*?)\]},;]|$)/g;
+
+const FWD_UNC_PATH_RE =
+  /(^|[\s"'`(\[={<,;|])(?<![A-Za-z0-9_:/])(\/\/[A-Za-z0-9._-]+\/[^\s/"'`<>)\]},;]+(?:\/[^\s"'`<>)\]},;]+)*)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
 
 const POSIX_ROOTS =
-  'home|Users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|private|srv|proc|sys|dev|run|Library|Applications|cygdrive';
+  'home|Home|Users|users|root|tmp|var|etc|opt|usr|mnt|media|Volumes|volumes|private|srv|proc|sys|dev|run|Library|library|Applications|applications|cygdrive|wsl\\.localhost|wsl\\$';
 
 const QUOTED_POSIX_PATH_RE = new RegExp(
   `(["'\`])(\\/(?:${POSIX_ROOTS})(?:\\/[^"'\`\\r\\n]*?)?)(:\\d+:\\d+)?\\1`,
@@ -108,19 +126,22 @@ const POSIX_ABS_PATH_RE = new RegExp(
 );
 
 const MSYS_DRIVE_USER_PATH_RE =
-  /(^|[\s"'`(\[={<,:;|])(\/[a-zA-Z]\/(?:Users|Windows|Program(?:\s+Files)?|Documents\s+and\s+Settings)(?:\/[^\s"'`<>)\]},;]+?)?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
+  /(^|[\s"'`(\[={<,:;|])(\/[a-zA-Z]\/(?:Users|Windows|Program(?:\s+Files)?|Documents\s+and\s+Settings)(?:\/[^\s"'`<>)\]},;]+?)?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/gi;
+
+const QUOTED_TILDE_HOME_PATH_RE = /(["'`])(~[A-Za-z0-9._-]*\/[^"'`\r\n]+?)(:\d+:\d+)?\1/g;
 
 const TILDE_HOME_PATH_RE =
   /(^|[\s"'`(\[={<,:;|])(~[A-Za-z0-9._-]*\/[^\s"'`<>)\]},;]+?)(?=:\d+:\d+(?:[)\s"'`<>\]};,]|$)|[\s"'`<>)\]},;]|$)/g;
 
 const SENSITIVE_KEY_RE =
-  /^(?:authorization|cookie|set[_-]?cookie|password|passwd|secret|client[_-]?secret|api[_-]?key|apikey|api[_-]?secret|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|bearer[_-]?token|session[_-]?token|session[_-]?id|csrf[_-]?token|sas[_-]?token|private[_-]?key|secret[_-]?key|signing[_-]?key|x[_-]?api[_-]?key|x[_-]?auth[_-]?token|x[_-]?access[_-]?token|x[_-]?session[_-]?token|x[_-]?amz[_-]?(?:signature|security[_-]?token|credential)|jwt|token)$/i;
+  /^(?:authorization|cookie|set[_-]?cookie|password|passwd|secret|client[_-]?secret|api[_-]?key|apikey|api[_-]?secret|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|oauth[_-]?token|bearer[_-]?token|github[_-]?token|npm[_-]?token|session[_-]?token|session[_-]?id|csrf[_-]?token|x[_-]?csrf[_-]?token|sas[_-]?token|private[_-]?key|secret[_-]?key|signing[_-]?key|secret[_-]?token|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id|session[_-]?token)|x[_-]?api[_-]?key|x[_-]?auth[_-]?token|x[_-]?access[_-]?token|x[_-]?session[_-]?token|x[_-]?amz[_-]?(?:signature|security[_-]?token|credential)|jwt|token|username|user[_-]?name|os[_-]?user|host[_-]?user|user[_-]?profile|home[_-]?dir|homedir)$/i;
 
 /**
- * Strips Windows paths (`C:\Users\...`), POSIX host paths (`/home/...`, `/Users/...`),
- * `file://` URLs, query strings (`?token=...`), URL credentials, bearer/auth tokens,
- * and raw binary payloads (data URIs, multi-byte hex dumps, binary control bytes)
- * while preserving sanitized hex VAs (`0x...`), instruction offsets, and shader hashes.
+ * Strips Windows paths (`C:\Users\...`), UNC paths (`\\server\share\...`, `//server/share/...`),
+ * POSIX host paths (`/home/...`, `/Users/...`), `file://` URLs, query strings (`?token=...`),
+ * URL credentials, bearer/auth tokens, usernames, and raw binary payloads (data URIs, multi-byte
+ * hex dumps, binary control bytes) while preserving sanitized hex VAs (`0x...`), instruction
+ * offsets, and shader hashes.
  *
  * @param {unknown} text
  * @returns {string}
@@ -157,17 +178,21 @@ export function sanitizeString(text) {
   out = out.replace(HEX_DUMP_BYTES_RE, '[REDACTED_BUFFER]');
   out = out.replace(LONG_HEX_PAYLOAD_RE, '[REDACTED_BUFFER]');
 
-  // 1. Redact file:// URLs completely (preserving optional :line:col in stack frames).
+  // 1. Redact file:// URLs completely (quoted first to catch spaces, preserving optional :line:col).
+  out = out.replace(QUOTED_FILE_URL_RE, (_, quote, _url, lineCol) => {
+    return `${quote}[REDACTED_FILE_URL]${lineCol || ''}${quote}`;
+  });
   out = out.replace(FILE_URL_RE, '[REDACTED_FILE_URL]');
 
-  // 2. Redact embedded URL credentials (scheme://user:pass@host).
+  // 2. Redact embedded URL credentials (scheme://user:pass@host and scheme://user@host).
   out = out.replace(URL_USERINFO_RE, '$1[REDACTED]@');
 
   // 3. Redact query strings on HTTP/WS/FTP URLs and standalone ?key=value tokens.
   out = out.replace(URL_QUERY_RE, '$1?[REDACTED]');
   out = out.replace(STANDALONE_QUERY_RE, '?[REDACTED]');
 
-  // 4. Redact Bearer/Basic tokens, inline credential key=value / header pairs, and bare JWTs/PATs.
+  // 4. Redact PEM private keys, Bearer/Basic tokens, inline credential/username pairs, and bare JWTs/PATs.
+  out = out.replace(PEM_PRIVATE_KEY_RE, '[REDACTED_TOKEN]');
   out = out.replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
   out = out.replace(SECRET_KV_RE, '$1$2[REDACTED]');
   out = out.replace(BARE_TOKEN_RE, '[REDACTED_TOKEN]');
@@ -176,9 +201,16 @@ export function sanitizeString(text) {
   out = out.replace(QUOTED_WIN_PATH_RE, (_, quote, _path, lineCol) => {
     return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
   });
+  out = out.replace(QUOTED_UNC_PATH_RE, (_, quote, _path, lineCol) => {
+    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+  });
+  out = out.replace(QUOTED_FWD_UNC_PATH_RE, (_, quote, _path, lineCol) => {
+    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+  });
   out = out.replace(WIN_DEVICE_PATH_RE, '$1[REDACTED_PATH]');
   out = out.replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]');
   out = out.replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]');
+  out = out.replace(FWD_UNC_PATH_RE, '$1[REDACTED_PATH]');
 
   // 6. Redact POSIX host absolute paths, MSYS drive user paths, and ~ home paths (preserving app routes like /api/status).
   out = out.replace(QUOTED_POSIX_PATH_RE, (_, quote, _path, lineCol) => {
@@ -186,6 +218,9 @@ export function sanitizeString(text) {
   });
   out = out.replace(POSIX_ABS_PATH_RE, '$1[REDACTED_PATH]');
   out = out.replace(MSYS_DRIVE_USER_PATH_RE, '$1[REDACTED_PATH]');
+  out = out.replace(QUOTED_TILDE_HOME_PATH_RE, (_, quote, _path, lineCol) => {
+    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+  });
   out = out.replace(TILDE_HOME_PATH_RE, '$1[REDACTED_PATH]');
 
   return out;
@@ -1180,6 +1215,10 @@ function sanitizeBootSnapshot(raw) {
 
   const stage = clipSanitizedString(source.stage, 64);
   if (stage !== undefined) out.stage = stage;
+  const bootPhase = clipSanitizedString(source.bootPhase, 64);
+  if (bootPhase !== undefined) out.bootPhase = bootPhase;
+  const phase = clipSanitizedString(source.phase, 64);
+  if (phase !== undefined) out.phase = phase;
   const mode = clipSanitizedString(source.mode, 64);
   if (mode !== undefined) out.mode = mode;
   const bootMode = clipSanitizedString(source.bootMode, 64);
@@ -1193,6 +1232,18 @@ function sanitizeBootSnapshot(raw) {
 
   const elapsedMs = pickNonNegNumber(source, 'elapsedMs');
   if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  const phaseElapsedMs = pickNonNegNumber(source, 'phaseElapsedMs');
+  if (phaseElapsedMs !== undefined) out.phaseElapsedMs = phaseElapsedMs;
+  const presentFpsAvg = pickNonNegNumber(source, 'presentFpsAvg');
+  if (presentFpsAvg !== undefined) out.presentFpsAvg = presentFpsAvg;
+  const budgetCompliancePct = pickPct(source, 'budgetCompliancePct');
+  if (budgetCompliancePct !== undefined) out.budgetCompliancePct = budgetCompliancePct;
+  const targetFps = pickNonNegNumber(source, 'targetFps');
+  if (targetFps !== undefined) out.targetFps = targetFps;
+  const budgetMs = pickNonNegNumber(source, 'budgetMs') ?? pickNonNegNumber(source, 'frameBudgetMs');
+  if (budgetMs !== undefined) out.budgetMs = budgetMs;
+  const dominantBottleneck = clipSanitizedString(source.dominantBottleneck, 64);
+  if (dominantBottleneck !== undefined) out.dominantBottleneck = dominantBottleneck;
   if (source.firstPresentMs === null) {
     out.firstPresentMs = null;
   } else {
@@ -1539,15 +1590,35 @@ function sanitizeGpuTelemetry(raw) {
     'packetCount',
     'bytesProcessed',
     'vramBytes',
+    'framesWithin30FpsBudget',
+    'framesOver30FpsBudget',
   ]) {
     const val = pickNonNegInt(raw, intKey);
     if (val !== undefined) out[intKey] = val;
   }
 
-  for (const numKey of ['fps', 'onePercentLowFps', 'fps1PctLow', 'p95FrameMs', 'p99FrameMs', 'maxFrameMs']) {
+  for (const numKey of [
+    'fps',
+    'presentFpsAvg',
+    'onePercentLowFps',
+    'fps1PctLow',
+    'p95FrameMs',
+    'p99FrameMs',
+    'maxFrameMs',
+    'targetFps',
+    'budgetMs',
+    'frameBudgetMs',
+  ]) {
     const val = pickNonNegNumber(raw, numKey);
     if (val !== undefined) out[numKey] = val;
   }
+
+  const gpuBudgetCompliancePct = pickPct(raw, 'budgetCompliancePct');
+  if (gpuBudgetCompliancePct !== undefined) out.budgetCompliancePct = gpuBudgetCompliancePct;
+  const gpuComplianceRate = pickUnitLevel(raw, 'fps30ComplianceRate');
+  if (gpuComplianceRate !== undefined) out.fps30ComplianceRate = gpuComplianceRate;
+  const gpuDominantBottleneck = clipSanitizedString(raw.dominantBottleneck, 64);
+  if (gpuDominantBottleneck !== undefined) out.dominantBottleneck = gpuDominantBottleneck;
 
   if (isPlainObject(raw.frameStats)) {
     const fs = {};
@@ -1568,6 +1639,8 @@ function sanitizeGpuTelemetry(raw) {
       'ringBytesDrained',
       'width',
       'height',
+      'framesWithin30FpsBudget',
+      'framesOver30FpsBudget',
     ]) {
       const val = pickNonNegInt(raw.frameStats, intKey);
       if (val !== undefined) fs[intKey] = val;
@@ -1576,11 +1649,15 @@ function sanitizeGpuTelemetry(raw) {
       'lastFrameMs',
       'avgFrameMs',
       'fps',
+      'presentFpsAvg',
       'onePercentLowFps',
       'fps1PctLow',
       'p95FrameMs',
       'p99FrameMs',
       'maxFrameMs',
+      'targetFps',
+      'budgetMs',
+      'frameBudgetMs',
       'firstPresentMs',
       'firstVisibleFrameMs',
       'blackLoadingMs',
@@ -1588,6 +1665,12 @@ function sanitizeGpuTelemetry(raw) {
       const val = pickNonNegNumber(raw.frameStats, numKey);
       if (val !== undefined) fs[numKey] = val;
     }
+    const fsBudgetCompliancePct = pickPct(raw.frameStats, 'budgetCompliancePct');
+    if (fsBudgetCompliancePct !== undefined) fs.budgetCompliancePct = fsBudgetCompliancePct;
+    const fsComplianceRate = pickUnitLevel(raw.frameStats, 'fps30ComplianceRate');
+    if (fsComplianceRate !== undefined) fs.fps30ComplianceRate = fsComplianceRate;
+    const fsDominantBottleneck = clipSanitizedString(raw.frameStats.dominantBottleneck, 64);
+    if (fsDominantBottleneck !== undefined) fs.dominantBottleneck = fsDominantBottleneck;
     out.frameStats = fs;
   }
 
@@ -1655,11 +1738,401 @@ function sanitizeGpuTelemetry(raw) {
   return out;
 }
 
+function sanitizeBootPhaseContext(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  if (typeof raw === 'string') {
+    const cleanPhase = clipSanitizedString(raw.trim(), 64);
+    return cleanPhase ? { phase: cleanPhase } : null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getSummary === 'function') {
+    try {
+      source = source.getSummary();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+
+  const out = {};
+  const phase =
+    clipSanitizedString(
+      typeof source.phase === 'string'
+        ? source.phase.trim()
+        : typeof source.bootPhase === 'string'
+          ? source.bootPhase.trim()
+          : typeof source.currentPhase === 'string'
+            ? source.currentPhase.trim()
+            : undefined,
+      64
+    );
+  if (phase) out.phase = phase;
+  const stage = clipSanitizedString(typeof source.stage === 'string' ? source.stage.trim() : undefined, 64);
+  if (stage) out.stage = stage;
+  const mode = clipSanitizedString(
+    typeof source.mode === 'string'
+      ? source.mode.trim()
+      : typeof source.bootMode === 'string'
+        ? source.bootMode.trim()
+        : undefined,
+    64
+  );
+  if (mode) out.mode = mode;
+  const status = clipSanitizedString(typeof source.status === 'string' ? source.status.trim() : undefined, 64);
+  if (status) out.status = status;
+
+  const progressPct = pickPct(source, 'progressPct');
+  if (progressPct !== undefined) out.progressPct = progressPct;
+  const elapsedMs = pickNonNegNumber(source, 'elapsedMs');
+  if (elapsedMs !== undefined) out.elapsedMs = elapsedMs;
+  const phaseElapsedMs = pickNonNegNumber(source, 'phaseElapsedMs');
+  if (phaseElapsedMs !== undefined) out.phaseElapsedMs = phaseElapsedMs;
+  if (typeof source.readyForSplash === 'boolean') out.readyForSplash = source.readyForSplash;
+  const milestonesReached = pickNonNegInt(source, 'milestonesReached');
+  if (milestonesReached !== undefined) out.milestonesReached = milestonesReached;
+  const trapCount = pickNonNegInt(source, 'trapCount');
+  if (trapCount !== undefined) out.trapCount = trapCount;
+
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+function deriveBudgetCompliancePct(source) {
+  if (!isPlainObject(source)) {
+    return undefined;
+  }
+  const budgetObj = isPlainObject(source.budget) ? source.budget : null;
+  const framesObj = isPlainObject(source.frames) ? source.frames : null;
+
+  const explicitPct =
+    pickPct(source, 'budgetCompliancePct') ??
+    (budgetObj ? pickPct(budgetObj, 'budgetCompliancePct') : undefined) ??
+    (framesObj ? pickPct(framesObj, 'budgetCompliancePct') : undefined);
+  if (explicitPct !== undefined) {
+    return roundTo2(explicitPct);
+  }
+
+  const within =
+    pickNonNegInt(source, 'framesWithinBudget') ??
+    pickNonNegInt(source, 'framesWithin30FpsBudget') ??
+    (budgetObj ? pickNonNegInt(budgetObj, 'framesWithin30FpsBudget') : undefined) ??
+    (framesObj ? pickNonNegInt(framesObj, 'framesWithin30FpsBudget') : undefined);
+  const over =
+    pickNonNegInt(source, 'framesOverBudget') ??
+    pickNonNegInt(source, 'framesOver30FpsBudget') ??
+    (budgetObj ? pickNonNegInt(budgetObj, 'framesOver30FpsBudget') : undefined) ??
+    (framesObj ? pickNonNegInt(framesObj, 'framesOver30FpsBudget') : undefined);
+
+  if (within !== undefined && over !== undefined) {
+    const total = within + over;
+    if (total > 0) {
+      return roundTo2(Math.min(100, Math.max(0, (within / total) * 100)));
+    }
+    return undefined;
+  }
+
+  const rate =
+    pickUnitLevel(source, 'fps30ComplianceRate') ??
+    (budgetObj ? pickUnitLevel(budgetObj, 'fps30ComplianceRate') : undefined) ??
+    (framesObj ? pickUnitLevel(framesObj, 'fps30ComplianceRate') : undefined);
+  if (rate !== undefined) {
+    return roundTo2(rate * 100);
+  }
+  return undefined;
+}
+
+/**
+ * Strictly allowlists and sanitizes a 30 FPS frame-budget telemetry snapshot
+ * (or duck-typed `PerfMonitor` instance via `getSnapshot()`).
+ * Drops unknown keys, raw buffers, host paths, and secrets.
+ *
+ * @param {unknown} raw
+ * @returns {object|null}
+ */
+function sanitizeFrameBudget(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let source = raw;
+  if (typeof source === 'object' && typeof source.getSnapshot === 'function') {
+    try {
+      source = source.getSnapshot();
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(source)) {
+    return null;
+  }
+
+  const budgetObj = isPlainObject(source.budget) ? source.budget : null;
+  const framesObj = isPlainObject(source.frames) ? source.frames : null;
+  const out = {};
+
+  const explicitPresentFps =
+    pickNonNegNumber(source, 'presentFpsAvg') ??
+    (framesObj ? pickNonNegNumber(framesObj, 'presentFpsAvg') : undefined);
+  if (explicitPresentFps !== undefined) {
+    out.presentFpsAvg = roundTo2(explicitPresentFps);
+  } else {
+    const derivedFps =
+      (framesObj && (pickNonNegInt(framesObj, 'totalFrames') ?? 1) > 0
+        ? pickNonNegNumber(framesObj, 'fps')
+        : undefined) ?? pickNonNegNumber(source, 'fps');
+    if (derivedFps !== undefined && (derivedFps > 0 || !framesObj)) {
+      out.presentFpsAvg = roundTo2(derivedFps);
+    }
+  }
+
+  const budgetCompliancePct = deriveBudgetCompliancePct(source);
+  if (budgetCompliancePct !== undefined) {
+    out.budgetCompliancePct = budgetCompliancePct;
+  }
+
+  const targetFps =
+    pickNonNegNumber(source, 'targetFps') ??
+    (budgetObj ? pickNonNegNumber(budgetObj, 'targetFps') : undefined) ??
+    (framesObj ? pickNonNegNumber(framesObj, 'targetFps') : undefined);
+  if (targetFps !== undefined) out.targetFps = targetFps;
+
+  const budgetMs =
+    pickNonNegNumber(source, 'budgetMs') ??
+    pickNonNegNumber(source, 'frameBudgetMs') ??
+    (budgetObj ? pickNonNegNumber(budgetObj, 'budgetMs') : undefined) ??
+    (framesObj ? pickNonNegNumber(framesObj, 'budgetMs') : undefined);
+  if (budgetMs !== undefined) out.budgetMs = budgetMs;
+
+  const framesWithinBudget =
+    pickNonNegInt(source, 'framesWithinBudget') ??
+    pickNonNegInt(source, 'framesWithin30FpsBudget') ??
+    (budgetObj ? pickNonNegInt(budgetObj, 'framesWithin30FpsBudget') : undefined) ??
+    (framesObj ? pickNonNegInt(framesObj, 'framesWithin30FpsBudget') : undefined);
+  if (framesWithinBudget !== undefined) out.framesWithinBudget = framesWithinBudget;
+
+  const framesOverBudget =
+    pickNonNegInt(source, 'framesOverBudget') ??
+    pickNonNegInt(source, 'framesOver30FpsBudget') ??
+    (budgetObj ? pickNonNegInt(budgetObj, 'framesOver30FpsBudget') : undefined) ??
+    (framesObj ? pickNonNegInt(framesObj, 'framesOver30FpsBudget') : undefined);
+  if (framesOverBudget !== undefined) out.framesOverBudget = framesOverBudget;
+
+  const onePercentLowFps =
+    pickNonNegNumber(source, 'onePercentLowFps') ??
+    pickNonNegNumber(source, 'fps1PctLow') ??
+    (framesObj
+      ? pickNonNegNumber(framesObj, 'onePercentLowFps') ?? pickNonNegNumber(framesObj, 'fps1PctLow')
+      : undefined);
+  if (onePercentLowFps !== undefined) out.onePercentLowFps = roundTo2(onePercentLowFps);
+
+  const p95FrameMs =
+    pickNonNegNumber(source, 'p95FrameMs') ??
+    pickNonNegNumber(source, 'p95FrameTimeMs') ??
+    (framesObj
+      ? pickNonNegNumber(framesObj, 'p95FrameTimeMs') ?? pickNonNegNumber(framesObj, 'p95FrameMs')
+      : undefined);
+  if (p95FrameMs !== undefined) out.p95FrameMs = p95FrameMs;
+
+  const p99FrameMs =
+    pickNonNegNumber(source, 'p99FrameMs') ??
+    pickNonNegNumber(source, 'p99FrameTimeMs') ??
+    (framesObj
+      ? pickNonNegNumber(framesObj, 'p99FrameTimeMs') ?? pickNonNegNumber(framesObj, 'p99FrameMs')
+      : undefined);
+  if (p99FrameMs !== undefined) out.p99FrameMs = p99FrameMs;
+
+  const dominantBottleneck = clipSanitizedString(
+    source.dominantBottleneck ??
+      (budgetObj ? budgetObj.dominantBottleneck : undefined) ??
+      (framesObj ? framesObj.dominantBottleneck : undefined),
+    64
+  );
+  if (dominantBottleneck !== undefined) out.dominantBottleneck = dominantBottleneck;
+
+  return out;
+}
+
+function resolveFrameBudgetContext({
+  explicitFrameBudget,
+  storedFrameBudget,
+  explicitPresentFpsAvg,
+  explicitBudgetCompliancePct,
+  perfSnapshot,
+  gpuTelemetry,
+  bootSnapshot,
+}) {
+  const gpuFs = gpuTelemetry && isPlainObject(gpuTelemetry.frameStats) ? gpuTelemetry.frameStats : null;
+  const perfBudget = isPlainObject(perfSnapshot) ? sanitizeFrameBudget(perfSnapshot) : null;
+  const gpuBudget = isPlainObject(gpuTelemetry) ? sanitizeFrameBudget(gpuTelemetry) : null;
+  const gpuFsBudget = gpuFs ? sanitizeFrameBudget(gpuFs) : null;
+
+  let base = null;
+  if (explicitFrameBudget === null) {
+    base = null;
+  } else if (explicitFrameBudget !== undefined) {
+    base = sanitizeFrameBudget(explicitFrameBudget);
+  } else if (storedFrameBudget !== null) {
+    base = sanitizeValue(storedFrameBudget);
+  }
+
+  let presentFpsAvg = null;
+  if (explicitPresentFpsAvg === null) {
+    presentFpsAvg = null;
+  } else if (
+    typeof explicitPresentFpsAvg === 'number' &&
+    Number.isFinite(explicitPresentFpsAvg) &&
+    explicitPresentFpsAvg >= 0
+  ) {
+    presentFpsAvg = roundTo2(explicitPresentFpsAvg);
+  } else {
+    const candidate =
+      (base ? pickNonNegNumber(base, 'presentFpsAvg') : undefined) ??
+      (gpuTelemetry ? pickNonNegNumber(gpuTelemetry, 'presentFpsAvg') : undefined) ??
+      (gpuFs ? pickNonNegNumber(gpuFs, 'presentFpsAvg') : undefined) ??
+      (bootSnapshot ? pickNonNegNumber(bootSnapshot, 'presentFpsAvg') : undefined) ??
+      (perfBudget ? pickNonNegNumber(perfBudget, 'presentFpsAvg') : undefined);
+    presentFpsAvg = candidate !== undefined ? roundTo2(candidate) : null;
+  }
+
+  let budgetCompliancePct = null;
+  if (explicitBudgetCompliancePct === null) {
+    budgetCompliancePct = null;
+  } else if (typeof explicitBudgetCompliancePct === 'number' && Number.isFinite(explicitBudgetCompliancePct)) {
+    budgetCompliancePct = roundTo2(Math.min(100, Math.max(0, explicitBudgetCompliancePct)));
+  } else {
+    const candidate =
+      (base ? pickPct(base, 'budgetCompliancePct') : undefined) ??
+      (gpuBudget ? pickPct(gpuBudget, 'budgetCompliancePct') : undefined) ??
+      (gpuFsBudget ? pickPct(gpuFsBudget, 'budgetCompliancePct') : undefined) ??
+      (bootSnapshot ? pickPct(bootSnapshot, 'budgetCompliancePct') : undefined) ??
+      (perfBudget ? pickPct(perfBudget, 'budgetCompliancePct') : undefined);
+    budgetCompliancePct = candidate !== undefined ? roundTo2(candidate) : null;
+  }
+
+  let frameBudget = null;
+  const hasExplicitOrStored = base !== null && Object.keys(base).length > 0;
+  const hasAnyBudgetMetric =
+    hasExplicitOrStored || presentFpsAvg !== null || budgetCompliancePct !== null;
+
+  if (hasAnyBudgetMetric) {
+    frameBudget = {};
+    const mergeFrom = [perfBudget, gpuFsBudget, gpuBudget, bootSnapshot, base];
+    for (let i = 0; i < mergeFrom.length; i += 1) {
+      const src = mergeFrom[i];
+      if (!isPlainObject(src)) continue;
+      for (const key of [
+        'targetFps',
+        'budgetMs',
+        'framesWithinBudget',
+        'framesOverBudget',
+        'onePercentLowFps',
+        'p95FrameMs',
+        'p99FrameMs',
+        'dominantBottleneck',
+      ]) {
+        if (src[key] !== undefined) {
+          frameBudget[key] = src[key];
+        }
+      }
+    }
+    if (presentFpsAvg !== null) {
+      frameBudget.presentFpsAvg = presentFpsAvg;
+    } else if (explicitPresentFpsAvg === null) {
+      delete frameBudget.presentFpsAvg;
+    }
+    if (budgetCompliancePct !== null) {
+      frameBudget.budgetCompliancePct = budgetCompliancePct;
+    } else if (explicitBudgetCompliancePct === null) {
+      delete frameBudget.budgetCompliancePct;
+    }
+    if (Object.keys(frameBudget).length === 0) {
+      frameBudget = null;
+    }
+  }
+
+  return {
+    presentFpsAvg,
+    budgetCompliancePct,
+    frameBudget,
+  };
+}
+
+function resolveBootPhaseState({
+  explicitBootPhase,
+  explicitBootPhaseContext,
+  storedBootPhase,
+  storedBootPhaseContext,
+  bootSnapshot,
+  perfSnapshot,
+}) {
+  let bootPhaseContext = null;
+  if (explicitBootPhaseContext === null) {
+    bootPhaseContext = null;
+  } else if (explicitBootPhaseContext !== undefined) {
+    bootPhaseContext = sanitizeBootPhaseContext(explicitBootPhaseContext);
+  } else if (isPlainObject(explicitBootPhase)) {
+    bootPhaseContext = sanitizeBootPhaseContext(explicitBootPhase);
+  } else if (storedBootPhaseContext !== null) {
+    bootPhaseContext = sanitizeValue(storedBootPhaseContext);
+  }
+
+  let bootPhase = null;
+  if (explicitBootPhase === null) {
+    bootPhase = null;
+  } else if (typeof explicitBootPhase === 'string') {
+    const cleaned = clipSanitizedString(explicitBootPhase.trim(), 64);
+    bootPhase = cleaned || null;
+  } else if (isPlainObject(explicitBootPhase) && bootPhaseContext) {
+    bootPhase = bootPhaseContext.phase ?? bootPhaseContext.stage ?? null;
+  } else if (storedBootPhase !== null) {
+    bootPhase = storedBootPhase;
+  } else if (bootPhaseContext && typeof bootPhaseContext.phase === 'string') {
+    bootPhase = bootPhaseContext.phase;
+  } else if (bootSnapshot && typeof bootSnapshot.bootPhase === 'string') {
+    bootPhase = bootSnapshot.bootPhase;
+  } else if (bootSnapshot && typeof bootSnapshot.phase === 'string') {
+    bootPhase = bootSnapshot.phase;
+  } else if (isPlainObject(perfSnapshot) && typeof perfSnapshot.currentPhase === 'string') {
+    const cleaned = clipSanitizedString(perfSnapshot.currentPhase.trim(), 64);
+    bootPhase = cleaned || null;
+  }
+
+  if (bootPhase !== null && bootPhaseContext === null && explicitBootPhaseContext !== null) {
+    const ctx = { phase: bootPhase };
+    if (bootSnapshot) {
+      if (bootSnapshot.stage !== undefined) ctx.stage = bootSnapshot.stage;
+      const mode = bootSnapshot.mode ?? bootSnapshot.bootMode;
+      if (mode !== undefined) ctx.mode = mode;
+      if (bootSnapshot.progressPct !== undefined) ctx.progressPct = bootSnapshot.progressPct;
+      if (bootSnapshot.elapsedMs !== undefined) ctx.elapsedMs = bootSnapshot.elapsedMs;
+      if (bootSnapshot.phaseElapsedMs !== undefined) ctx.phaseElapsedMs = bootSnapshot.phaseElapsedMs;
+      if (bootSnapshot.readyForSplash !== undefined) ctx.readyForSplash = bootSnapshot.readyForSplash;
+    }
+    bootPhaseContext = ctx;
+  } else if (bootPhase !== null && bootPhaseContext !== null && bootPhaseContext.phase === undefined) {
+    bootPhaseContext = { phase: bootPhase, ...bootPhaseContext };
+  }
+
+  return {
+    bootPhase,
+    bootPhaseContext,
+  };
+}
+
+function clipBoundedText(text, maxLen) {
+  if (typeof text !== 'string') {
+    return '';
+  }
+  return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+}
+
 function extractErrorFields(errorOrMessage) {
   if (typeof errorOrMessage === 'string') {
     return {
       name: 'Error',
-      message: sanitizeString(errorOrMessage),
+      message: clipBoundedText(sanitizeString(errorOrMessage), MAX_ERROR_MESSAGE_LENGTH),
       stack: null,
     };
   }
@@ -1686,15 +2159,15 @@ function extractErrorFields(errorOrMessage) {
     const rawStack = typeof errorOrMessage.stack === 'string' ? errorOrMessage.stack : null;
 
     return {
-      name: sanitizeString(rawName),
-      message: sanitizeString(rawMessage),
-      stack: rawStack !== null ? sanitizeString(rawStack) : null,
+      name: clipBoundedText(sanitizeString(rawName), 128),
+      message: clipBoundedText(sanitizeString(rawMessage), MAX_ERROR_MESSAGE_LENGTH),
+      stack: rawStack !== null ? clipBoundedText(sanitizeString(rawStack), MAX_ERROR_STACK_LENGTH) : null,
     };
   }
 
   return {
     name: 'Error',
-    message: sanitizeString(errorOrMessage == null ? '' : String(errorOrMessage)),
+    message: clipBoundedText(sanitizeString(errorOrMessage == null ? '' : String(errorOrMessage)), MAX_ERROR_MESSAGE_LENGTH),
     stack: null,
   };
 }
@@ -1821,6 +2294,9 @@ export class CrashReporter {
     this._categoryCounts = Object.create(null);
     this._errorClassifications = new WeakMap();
     this._bootSnapshot = null;
+    this._bootPhase = null;
+    this._bootPhaseContext = null;
+    this._frameBudget = null;
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
     this._audioTelemetry = null;
@@ -1901,10 +2377,80 @@ export class CrashReporter {
     this._coalescedErrorCount = 0;
     this._categoryCounts = Object.create(null);
     this._bootSnapshot = null;
+    this._bootPhase = null;
+    this._bootPhaseContext = null;
+    this._frameBudget = null;
     this._gpuTelemetry = null;
     this._binkTelemetry = null;
     this._audioTelemetry = null;
     this._gpuAdapter = null;
+  }
+
+  /**
+   * Stores a sanitized boot phase string (e.g. `'boot'`, `'loading_assets'`, `'menu'`, `'gameplay'`)
+   * or an allowlisted boot-phase context snapshot object to include in exported crash reports.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {string|object|null|undefined} phaseOrContext
+   * @returns {string|object|null}
+   */
+  setBootPhase(phaseOrContext) {
+    if (phaseOrContext === null || phaseOrContext === undefined) {
+      this._bootPhase = null;
+      this._bootPhaseContext = null;
+      return null;
+    }
+    if (typeof phaseOrContext === 'string') {
+      const cleanPhase = clipSanitizedString(phaseOrContext.trim(), 64);
+      this._bootPhase = cleanPhase || null;
+      this._bootPhaseContext = null;
+      return this._bootPhase;
+    }
+    const cleanContext = sanitizeBootPhaseContext(phaseOrContext);
+    this._bootPhaseContext = cleanContext;
+    this._bootPhase = cleanContext ? cleanContext.phase ?? cleanContext.stage ?? null : null;
+    return this.getBootPhaseContext();
+  }
+
+  /**
+   * Returns the stored sanitized boot phase label, or `null` when unset.
+   *
+   * @returns {string|null}
+   */
+  getBootPhase() {
+    return this._bootPhase;
+  }
+
+  /**
+   * Returns a sanitized clone of the stored boot-phase context object, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getBootPhaseContext() {
+    return this._bootPhaseContext ? sanitizeValue(this._bootPhaseContext) : null;
+  }
+
+  /**
+   * Stores an allowlisted, sanitized 30 FPS frame-budget telemetry snapshot
+   * (`presentFpsAvg`, `budgetCompliancePct`, target FPS / budget ms / bottleneck)
+   * or duck-typed `PerfMonitor` instance via `getSnapshot()`.
+   * Pass `null` or `undefined` to clear.
+   *
+   * @param {object|null|undefined} snapshot
+   * @returns {object|null}
+   */
+  setFrameBudget(snapshot) {
+    this._frameBudget = sanitizeFrameBudget(snapshot);
+    return this.getFrameBudget();
+  }
+
+  /**
+   * Returns a sanitized clone of the attached 30 FPS frame-budget snapshot, or `null` when unset.
+   *
+   * @returns {object|null}
+   */
+  getFrameBudget() {
+    return this._frameBudget ? sanitizeValue(this._frameBudget) : null;
   }
 
   /**
@@ -2032,8 +2578,8 @@ export class CrashReporter {
       timestamp: formatIsoTimestamp(ts),
       timestampMs: Number.isFinite(ts) ? ts : 0,
       level: normalizeLogLevel(level),
-      source: sanitizeString(source || 'runtime'),
-      message: sanitizeString(message),
+      source: clipBoundedText(sanitizeString(source || 'runtime'), 128),
+      message: clipBoundedText(sanitizeString(message), MAX_LOG_MESSAGE_LENGTH),
     };
     this._logs.push(entry);
     return entry;
@@ -2042,8 +2588,9 @@ export class CrashReporter {
   /**
    * Records and classifies a runtime error into the bounded error ring buffer.
    * When duplicate coalescing is enabled (default), repeated identical
-   * `(category, message)` errors increment `occurrences` and update `lastSeenAtMs`
-   * on the existing buffered entry instead of evicting earlier root-cause errors.
+   * `(category, message)` errors increment `occurrences` / `count` and update
+   * `lastSeenAtMs` / `lastSeenMs` on the existing buffered entry instead of
+   * evicting earlier root-cause errors or growing the JS heap unboundedly.
    *
    * @param {string|null|undefined} category
    * @param {unknown} errorOrMessage
@@ -2064,7 +2611,10 @@ export class CrashReporter {
       const existing = this._errorIndex.get(coalesceKey);
       if (existing) {
         existing.occurrences += 1;
-        existing.lastSeenAtMs = Math.max(existing.lastSeenAtMs, safeTs);
+        existing.count = existing.occurrences;
+        const nextLastSeen = Math.max(existing.lastSeenAtMs, safeTs);
+        existing.lastSeenAtMs = nextLastSeen;
+        existing.lastSeenMs = nextLastSeen;
         this._coalescedErrorCount += 1;
         return { ...existing };
       }
@@ -2092,13 +2642,19 @@ export class CrashReporter {
       timestampMs: safeTs,
       firstSeenAtMs: safeTs,
       lastSeenAtMs: safeTs,
+      firstSeenMs: safeTs,
+      lastSeenMs: safeTs,
       occurrences: 1,
+      count: 1,
       category: resolvedCategory,
       name: fields.name,
       message: fields.message,
       stack: fields.stack,
       context: sanitizedContext,
     };
+    if (this._bootPhase !== null) {
+      entry.bootPhase = this._bootPhase;
+    }
 
     this._errorClassifications.set(entry, classifyBootError(errorOrMessage));
     const evicted = this._errors.pushWithEvicted(entry);
@@ -2248,6 +2804,11 @@ export class CrashReporter {
    * @param {object} [options.serverStatus]
    * @param {object} [options.bootSnapshot] Optional per-report boot summary override.
    * @param {object} [options.bootSummary] Alias for `bootSnapshot`.
+   * @param {string|object|null} [options.bootPhase] Optional per-report boot-phase label or context override.
+   * @param {object|null} [options.bootPhaseContext] Optional per-report boot-phase context snapshot override.
+   * @param {object|null} [options.frameBudget] Optional per-report 30 FPS frame-budget snapshot override.
+   * @param {number|null} [options.presentFpsAvg] Optional per-report average present FPS override.
+   * @param {number|null} [options.budgetCompliancePct] Optional per-report 30 FPS budget compliance percentage override (0..100).
    * @param {object} [options.gpuTelemetry] Optional per-report GPU telemetry override.
    * @param {object} [options.binkTelemetry] Optional per-report Bink2/splash telemetry override.
    * @param {object} [options.audioTelemetry] Optional per-report `#1027` guest audio PCM ring telemetry override.
@@ -2263,6 +2824,11 @@ export class CrashReporter {
     serverStatus,
     bootSnapshot,
     bootSummary,
+    bootPhase,
+    bootPhaseContext,
+    frameBudget,
+    presentFpsAvg,
+    budgetCompliancePct,
     gpuTelemetry,
     binkTelemetry,
     audioTelemetry,
@@ -2288,13 +2854,16 @@ export class CrashReporter {
     for (let i = 0; i < recentErrors.length; i += 1) {
       const errEntry = recentErrors[i];
       const classified = this._errorClassifications.get(errEntry) || classifyBootError(errEntry);
-      const occurrences = errEntry.occurrences || 1;
+      const occurrences = errEntry.occurrences || errEntry.count || 1;
       classifiedErrors.push({
         timestamp: errEntry.timestamp,
         timestampMs: errEntry.timestampMs,
         firstSeenAtMs: errEntry.firstSeenAtMs,
         lastSeenAtMs: errEntry.lastSeenAtMs,
+        firstSeenMs: errEntry.firstSeenMs ?? errEntry.firstSeenAtMs,
+        lastSeenMs: errEntry.lastSeenMs ?? errEntry.lastSeenAtMs,
         occurrences,
+        count: occurrences,
         errorCategory: errEntry.category,
         code: classified.code,
         category: classified.category,
@@ -2344,6 +2913,30 @@ export class CrashReporter {
         gpuTelemetry: resolvedGpuTelemetry,
       });
 
+    const { bootPhase: resolvedBootPhase, bootPhaseContext: resolvedBootPhaseContext } =
+      resolveBootPhaseState({
+        explicitBootPhase: bootPhase,
+        explicitBootPhaseContext: bootPhaseContext,
+        storedBootPhase: this._bootPhase,
+        storedBootPhaseContext: this._bootPhaseContext,
+        bootSnapshot: resolvedBootSnapshot,
+        perfSnapshot: resolvedPerf,
+      });
+
+    const {
+      presentFpsAvg: resolvedPresentFpsAvg,
+      budgetCompliancePct: resolvedBudgetCompliancePct,
+      frameBudget: resolvedFrameBudget,
+    } = resolveFrameBudgetContext({
+      explicitFrameBudget: frameBudget,
+      storedFrameBudget: this._frameBudget,
+      explicitPresentFpsAvg: presentFpsAvg,
+      explicitBudgetCompliancePct: budgetCompliancePct,
+      perfSnapshot: resolvedPerf,
+      gpuTelemetry: resolvedGpuTelemetry,
+      bootSnapshot: resolvedBootSnapshot,
+    });
+
     const report = {
       schemaVersion: SCHEMA_VERSION,
       generatedAt: formatIsoTimestamp(ts),
@@ -2361,6 +2954,11 @@ export class CrashReporter {
         gpuAdapter: resolvedGpuAdapter,
         firstVisibleFrameMs: resolvedFirstVisibleFrameMs,
         blackLoadingMs: resolvedBlackLoadingMs,
+        bootPhase: resolvedBootPhase,
+        bootPhaseContext: resolvedBootPhaseContext,
+        presentFpsAvg: resolvedPresentFpsAvg,
+        budgetCompliancePct: resolvedBudgetCompliancePct,
+        frameBudget: resolvedFrameBudget,
         bootSnapshot: resolvedBootSnapshot,
         gpuTelemetry: resolvedGpuTelemetry,
         binkTelemetry: resolvedBinkTelemetry,
@@ -2412,6 +3010,18 @@ export class CrashReporter {
             : 2;
 
     return JSON.stringify(this.buildReport(opts), null, indent);
+  }
+
+  /**
+   * Formats `buildReport(options)` as a strictly sanitized plain-text diagnostic report
+   * (zero host paths, UNC paths, `file://` URLs, usernames, or auth tokens).
+   *
+   * @param {object} [options]
+   * @returns {string}
+   */
+  toText(options = {}) {
+    const opts = options && typeof options === 'object' ? options : {};
+    return formatTextReport(this.buildReport(opts), opts);
   }
 
   /**
@@ -2702,6 +3312,54 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
       gpuTelemetry,
     });
 
+  const { bootPhase: resolvedBootPhase } = resolveBootPhaseState({
+    explicitBootPhase:
+      rawBootDiag && rawBootDiag.bootPhase !== undefined
+        ? rawBootDiag.bootPhase
+        : isPlainObject(rawSource)
+          ? rawSource.bootPhase
+          : undefined,
+    explicitBootPhaseContext:
+      rawBootDiag && rawBootDiag.bootPhaseContext !== undefined
+        ? rawBootDiag.bootPhaseContext
+        : isPlainObject(rawSource)
+          ? rawSource.bootPhaseContext
+          : undefined,
+    storedBootPhase: null,
+    storedBootPhaseContext: null,
+    bootSnapshot,
+    perfSnapshot: isPlainObject(safeReport.perf) ? safeReport.perf : null,
+  });
+
+  const {
+    presentFpsAvg: resolvedPresentFpsAvg,
+    budgetCompliancePct: resolvedBudgetCompliancePct,
+    frameBudget: resolvedFrameBudget,
+  } = resolveFrameBudgetContext({
+    explicitFrameBudget:
+      rawBootDiag && rawBootDiag.frameBudget !== undefined
+        ? rawBootDiag.frameBudget
+        : isPlainObject(rawSource)
+          ? rawSource.frameBudget
+          : undefined,
+    storedFrameBudget: null,
+    explicitPresentFpsAvg:
+      rawBootDiag && rawBootDiag.presentFpsAvg !== undefined
+        ? rawBootDiag.presentFpsAvg
+        : isPlainObject(rawSource)
+          ? rawSource.presentFpsAvg
+          : undefined,
+    explicitBudgetCompliancePct:
+      rawBootDiag && rawBootDiag.budgetCompliancePct !== undefined
+        ? rawBootDiag.budgetCompliancePct
+        : isPlainObject(rawSource)
+          ? rawSource.budgetCompliancePct
+          : undefined,
+    perfSnapshot: isPlainObject(safeReport.perf) ? safeReport.perf : null,
+    gpuTelemetry,
+    bootSnapshot,
+  });
+
   const title =
     typeof opts.title === 'string' && opts.title.trim().length > 0
       ? sanitizeString(opts.title.trim())
@@ -2744,11 +3402,15 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
   // Boot summary
   if (
     (bootSnapshot && Object.keys(bootSnapshot).length > 0) ||
+    resolvedBootPhase !== null ||
     resolvedFirstVisibleFrameMs !== null ||
     resolvedBlackLoadingMs !== null
   ) {
     const bootParts = [];
     if (bootSnapshot && bootSnapshot.stage) bootParts.push(`stage=${escapeMdInlineCode(bootSnapshot.stage, 64)}`);
+    if (resolvedBootPhase !== null && (!bootSnapshot || bootSnapshot.stage !== resolvedBootPhase)) {
+      bootParts.push(`phase=${escapeMdInlineCode(resolvedBootPhase, 64)}`);
+    }
     if (bootSnapshot && bootSnapshot.progressPct !== undefined) {
       bootParts.push(`progress=${formatCompactNumber(bootSnapshot.progressPct)}%`);
     }
@@ -2773,7 +3435,7 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
     }
   }
 
-  // Performance / Frame pacing (including 1%-low FPS)
+  // Performance / Frame pacing (including 1%-low FPS and 30 FPS budget)
   const perf = isPlainObject(safeReport.perf) ? safeReport.perf : null;
   const perfFrames = perf && isPlainObject(perf.frames) ? perf.frames : null;
   const gpuFrameStats = gpuTelemetry && isPlainObject(gpuTelemetry.frameStats) ? gpuTelemetry.frameStats : null;
@@ -2798,6 +3460,15 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
 
   const perfParts = [];
   if (fpsVal !== undefined) perfParts.push(`FPS=${escapeMdInlineCode(formatCompactNumber(fpsVal))}`);
+  if (resolvedPresentFpsAvg !== null && (fpsVal === undefined || roundTo2(fpsVal) !== resolvedPresentFpsAvg)) {
+    perfParts.push(`presentFpsAvg=${escapeMdInlineCode(formatCompactNumber(resolvedPresentFpsAvg))}`);
+  }
+  if (resolvedBudgetCompliancePct !== null) {
+    perfParts.push(`budgetCompliancePct=${formatCompactNumber(resolvedBudgetCompliancePct)}%`);
+  }
+  if (resolvedFrameBudget && resolvedFrameBudget.dominantBottleneck) {
+    perfParts.push(`bottleneck=${escapeMdInlineCode(resolvedFrameBudget.dominantBottleneck, 64)}`);
+  }
   if (onePctLowFps !== null) {
     perfParts.push(`1%-low FPS=${escapeMdInlineCode(formatCompactNumber(onePctLowFps))}`);
   }
@@ -3066,8 +3737,13 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
       const classified = isPlainObject(safeClassified[i]) ? safeClassified[i] : classifyBootError(err);
       const catCell = err.category ? escapeMdInlineCode(err.category, 32) : '`runtime`';
       const codeCell = classified && classified.code ? escapeMdInlineCode(classified.code, 40) : '-';
-      const occCell =
-        typeof err.occurrences === 'number' && Number.isFinite(err.occurrences) ? String(err.occurrences) : '1';
+      const occVal =
+        typeof err.occurrences === 'number' && Number.isFinite(err.occurrences)
+          ? err.occurrences
+          : typeof err.count === 'number' && Number.isFinite(err.count)
+            ? err.count
+            : 1;
+      const occCell = String(occVal);
       const ctx = isPlainObject(err.context) ? err.context : null;
       const ctxVa = resolveTrapVaDisplay(ctx);
       const ctxOff = resolveTrapOffsetDisplay(ctx);
@@ -3077,6 +3753,197 @@ export function formatGitHubIssueMarkdown(report, options = {}) {
       const locCell = locParts.length > 0 ? locParts.join(' / ') : '-';
       const msgCell = escapeMdTableCell(err.message || err.name || '', 160) || '-';
       lines.push(`| ${catCell} | ${codeCell} | ${occCell} | ${locCell} | ${msgCell} |`);
+    }
+  }
+
+  return sanitizeString(lines.join('\n'));
+}
+
+/**
+ * Formats a diagnostic report (or `CrashReporter` instance, or raw unsanitized
+ * report-shaped object) into a compact, strictly sanitized plain-text report
+ * with zero host paths, UNC paths, `file://` URLs, usernames, or auth tokens.
+ *
+ * @param {object|null|undefined} report
+ * @param {object} [options]
+ * @param {string} [options.title='PlayGTA6Web Sanitized Crash Report']
+ * @param {number} [options.maxErrors=10]
+ * @param {number} [options.maxLogs=0]
+ * @returns {string}
+ */
+export function formatTextReport(report, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const maxErrors = Number.isInteger(opts.maxErrors) && opts.maxErrors >= 0 ? opts.maxErrors : 10;
+  const maxLogs = Number.isInteger(opts.maxLogs) && opts.maxLogs >= 0 ? opts.maxLogs : 0;
+
+  let rawSource = report;
+  if (rawSource && typeof rawSource === 'object' && typeof rawSource.buildReport === 'function') {
+    try {
+      rawSource = rawSource.buildReport();
+    } catch {
+      rawSource = null;
+    }
+  }
+
+  const safeReport = isPlainObject(rawSource) ? sanitizeValue(rawSource) : {};
+  const rawBootDiag =
+    isPlainObject(rawSource) && isPlainObject(rawSource.bootDiagnostics) ? rawSource.bootDiagnostics : null;
+
+  const bootSnapshot = sanitizeBootSnapshot(
+    rawBootDiag && rawBootDiag.bootSnapshot !== undefined
+      ? rawBootDiag.bootSnapshot
+      : isPlainObject(rawSource)
+        ? rawSource.bootSnapshot ?? rawSource.bootSummary
+        : null
+  );
+  const gpuTelemetry = sanitizeGpuTelemetry(
+    rawBootDiag && rawBootDiag.gpuTelemetry !== undefined
+      ? rawBootDiag.gpuTelemetry
+      : isPlainObject(rawSource)
+        ? rawSource.gpuTelemetry
+        : null
+  );
+
+  const { bootPhase: resolvedBootPhase } = resolveBootPhaseState({
+    explicitBootPhase:
+      rawBootDiag && rawBootDiag.bootPhase !== undefined
+        ? rawBootDiag.bootPhase
+        : isPlainObject(rawSource)
+          ? rawSource.bootPhase
+          : undefined,
+    explicitBootPhaseContext:
+      rawBootDiag && rawBootDiag.bootPhaseContext !== undefined
+        ? rawBootDiag.bootPhaseContext
+        : isPlainObject(rawSource)
+          ? rawSource.bootPhaseContext
+          : undefined,
+    storedBootPhase: null,
+    storedBootPhaseContext: null,
+    bootSnapshot,
+    perfSnapshot: isPlainObject(safeReport.perf) ? safeReport.perf : null,
+  });
+
+  const {
+    presentFpsAvg: resolvedPresentFpsAvg,
+    budgetCompliancePct: resolvedBudgetCompliancePct,
+    frameBudget: resolvedFrameBudget,
+  } = resolveFrameBudgetContext({
+    explicitFrameBudget:
+      rawBootDiag && rawBootDiag.frameBudget !== undefined
+        ? rawBootDiag.frameBudget
+        : isPlainObject(rawSource)
+          ? rawSource.frameBudget
+          : undefined,
+    storedFrameBudget: null,
+    explicitPresentFpsAvg:
+      rawBootDiag && rawBootDiag.presentFpsAvg !== undefined
+        ? rawBootDiag.presentFpsAvg
+        : isPlainObject(rawSource)
+          ? rawSource.presentFpsAvg
+          : undefined,
+    explicitBudgetCompliancePct:
+      rawBootDiag && rawBootDiag.budgetCompliancePct !== undefined
+        ? rawBootDiag.budgetCompliancePct
+        : isPlainObject(rawSource)
+          ? rawSource.budgetCompliancePct
+          : undefined,
+    perfSnapshot: isPlainObject(safeReport.perf) ? safeReport.perf : null,
+    gpuTelemetry,
+    bootSnapshot,
+  });
+
+  const title =
+    typeof opts.title === 'string' && opts.title.trim().length > 0
+      ? sanitizeString(opts.title.trim())
+      : 'PlayGTA6Web Sanitized Crash Report';
+
+  const lines = [title];
+  const metaParts = [];
+  if (typeof safeReport.appVersion === 'string' && safeReport.appVersion.length > 0) {
+    metaParts.push(`app=${safeReport.appVersion}`);
+  }
+  if (typeof safeReport.schemaVersion === 'number' && Number.isFinite(safeReport.schemaVersion)) {
+    metaParts.push(`schema=v${Math.floor(safeReport.schemaVersion)}`);
+  }
+  if (typeof safeReport.generatedAt === 'string' && safeReport.generatedAt.length > 0) {
+    metaParts.push(`generatedAt=${safeReport.generatedAt}`);
+  }
+  if (metaParts.length > 0) {
+    lines.push(`Meta: ${metaParts.join(' | ')}`);
+  }
+
+  const bootParts = [];
+  if (bootSnapshot && bootSnapshot.stage) bootParts.push(`stage=${bootSnapshot.stage}`);
+  if (resolvedBootPhase !== null) bootParts.push(`phase=${resolvedBootPhase}`);
+  if (bootSnapshot && bootSnapshot.progressPct !== undefined) {
+    bootParts.push(`progress=${formatCompactNumber(bootSnapshot.progressPct)}%`);
+  }
+  const mode = bootSnapshot ? bootSnapshot.mode || bootSnapshot.bootMode : undefined;
+  if (mode) bootParts.push(`mode=${mode}`);
+  if (bootParts.length > 0) {
+    lines.push(`Boot: ${bootParts.join(', ')}`);
+  }
+
+  const budgetParts = [];
+  if (resolvedPresentFpsAvg !== null) {
+    budgetParts.push(`presentFpsAvg=${formatCompactNumber(resolvedPresentFpsAvg)}`);
+  }
+  if (resolvedBudgetCompliancePct !== null) {
+    budgetParts.push(`budgetCompliancePct=${formatCompactNumber(resolvedBudgetCompliancePct)}%`);
+  }
+  if (resolvedFrameBudget && resolvedFrameBudget.targetFps !== undefined) {
+    budgetParts.push(`targetFps=${formatCompactNumber(resolvedFrameBudget.targetFps)}`);
+  }
+  if (resolvedFrameBudget && resolvedFrameBudget.dominantBottleneck) {
+    budgetParts.push(`bottleneck=${resolvedFrameBudget.dominantBottleneck}`);
+  }
+  if (budgetParts.length > 0) {
+    lines.push(`FrameBudget: ${budgetParts.join(', ')}`);
+  }
+
+  const safeErrors = Array.isArray(safeReport.errors) ? safeReport.errors : [];
+  if (maxErrors > 0 && safeErrors.length > 0) {
+    lines.push(`Errors (${safeErrors.length}):`);
+    for (let i = 0; i < safeErrors.length && i < maxErrors; i += 1) {
+      const err = safeErrors[i];
+      if (!isPlainObject(err)) continue;
+      const count =
+        typeof err.count === 'number' && Number.isFinite(err.count)
+          ? err.count
+          : typeof err.occurrences === 'number' && Number.isFinite(err.occurrences)
+            ? err.occurrences
+            : 1;
+      const firstSeen =
+        typeof err.firstSeenMs === 'number' && Number.isFinite(err.firstSeenMs)
+          ? err.firstSeenMs
+          : typeof err.firstSeenAtMs === 'number' && Number.isFinite(err.firstSeenAtMs)
+            ? err.firstSeenAtMs
+            : null;
+      const lastSeen =
+        typeof err.lastSeenMs === 'number' && Number.isFinite(err.lastSeenMs)
+          ? err.lastSeenMs
+          : typeof err.lastSeenAtMs === 'number' && Number.isFinite(err.lastSeenAtMs)
+            ? err.lastSeenAtMs
+            : null;
+      const timing =
+        firstSeen !== null && lastSeen !== null ? ` [firstSeenMs=${firstSeen} lastSeenMs=${lastSeen}]` : '';
+      const category = err.category || 'runtime';
+      const msg = String(err.message || err.name || '').replace(/[\r\n\t]+/g, ' ').trim();
+      lines.push(`- [${category}] x${count}${timing} ${msg}`);
+    }
+  }
+
+  const safeLogs = Array.isArray(safeReport.recentLogs) ? safeReport.recentLogs : [];
+  if (maxLogs > 0 && safeLogs.length > 0) {
+    lines.push(`RecentLogs (${Math.min(safeLogs.length, maxLogs)}):`);
+    const slice = safeLogs.slice(-maxLogs);
+    for (let i = 0; i < slice.length; i += 1) {
+      const log = slice[i];
+      if (!isPlainObject(log)) continue;
+      const lvl = log.level || 'info';
+      const src = log.source || 'runtime';
+      const msg = String(log.message || '').replace(/[\r\n\t]+/g, ' ').trim();
+      lines.push(`- [${lvl}] ${src}: ${msg}`);
     }
   }
 

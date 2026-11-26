@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recompilation coverage and boot-path bottleneck profiler (Track 1 / R15, T52, T68).
+"""Recompilation coverage and boot-path bottleneck profiler (Track 1 / R15, T52, T68, T83).
 
 Parses exact JSON produced by `playgta6-recomp build` (`build-manifest.json`,
 schema `playgta6-recomp-build`), `playgta6-recomp build-program`
@@ -62,7 +62,8 @@ DEFAULT_TOP = 15
 EXIT_THRESHOLD_FAILED = 2
 BOOT_TARGETS = ("D3D12XboxCreateDevice", "PresentX")
 
-# Browser fast-boot Wasm64 audit constants (T68).
+# Browser fast-boot Wasm64 audit constants (T68 / T83).
+MIB_BYTES = 1024 * 1024
 V8_MAX_WASM_MODULE_BYTES = 1024 * 1024 * 1024  # 1 GiB Chromium/V8 single-module cap
 DEFAULT_SPLIT_BALANCE_WARN_RATIO = 1.5
 WASM_MAGIC = b"\x00asm"
@@ -102,12 +103,17 @@ DISCOVER_JSON_NAMES = (
     "coverage.json",
 )
 
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
+_FILE_URI_RE = re.compile(r"file://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
 _UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
 _UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
-_POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+_MSYS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])/[A-Za-z]/(?:Users|users|home|Windows|Program|tmp|var|opt|mnt)/[^\s\"'<>|,;()\[\]]*"
 )
+_POSIX_PATH_RE = re.compile(
+    r"/(?:Users|users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|srv|run|media|cygdrive)/[^\s\"'<>|,;()\[\]]*"
+)
+_TILDE_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9._-]*/[^\s\"'<>|,;()\[\]]*")
 _REPORT_MNEMONIC_RE = re.compile(r"^\s{2,}([A-Za-z][A-Za-z0-9./]+)\s+(\d+)\s*$")
 
 
@@ -134,6 +140,15 @@ def _current_usernames() -> list[str]:
         cleaned = candidate.strip()
         if len(cleaned) >= 3 and cleaned not in names:
             names.append(cleaned)
+    for env_path_var in ("USERPROFILE", "HOME"):
+        raw_home = os.environ.get(env_path_var, "").strip().rstrip("/\\")
+        if not raw_home:
+            continue
+        parts = [p for p in re.split(r"[/\\]+", raw_home) if p]
+        if len(parts) >= 2 and parts[-2].lower() in ("users", "home"):
+            leaf = parts[-1].strip()
+            if len(leaf) >= 3 and leaf not in names:
+                names.append(leaf)
     try:
         home_name = Path.home().name.strip()
         if len(home_name) >= 3 and home_name not in names:
@@ -147,13 +162,14 @@ def sanitize_text(raw: str | None) -> str:
     """Strip host absolute paths (both `\\` and `/`) and active usernames."""
     if raw is None:
         return ""
-    text = _UNC_PATH_RE.sub("<path>", str(raw))
+    text = _FILE_URI_RE.sub("<path>", str(raw))
+    text = _UNC_PATH_RE.sub("<path>", text)
     text = text.replace("\\", "/")
     sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
     sanitized = _UNC_FS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _MSYS_PATH_RE.sub("<path>", sanitized)
     sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
-    # Catch remaining drive-letter paths after slash normalization.
-    sanitized = re.sub(r"[A-Za-z]:/(?:[^\s\"'<>|,;()\[\]]+)", "<path>", sanitized)
+    sanitized = _TILDE_HOME_RE.sub("<path>", sanitized)
     for username in _current_usernames():
         pattern = re.compile(
             rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
@@ -161,6 +177,19 @@ def sanitize_text(raw: str | None) -> str:
         )
         sanitized = pattern.sub("<user>", sanitized)
     return sanitized
+
+
+def _is_user_home_leaf(parts: Sequence[str]) -> bool:
+    if len(parts) < 2:
+        return False
+    if parts[-2].lower() not in ("users", "home"):
+        return False
+    if len(parts) == 2:
+        return True
+    first = parts[0]
+    if not first:
+        return True
+    return len(first) == 2 and first[1] == ":" and first[0].isalpha()
 
 
 def basename_label(source: str | Path | None) -> str:
@@ -177,15 +206,19 @@ def basename_label(source: str | Path | None) -> str:
     base = parts[-1]
     if not base or (len(base) == 2 and base[1] == ":"):
         return "<unknown>"
+    if _is_user_home_leaf(parts):
+        return "<user>"
     return sanitize_text(base)
 
 
 def sanitize_value(value: Any) -> Any:
-    """Recursively sanitize strings; drop raw bytes from reports."""
+    """Recursively sanitize strings; drop raw bytes and host Path objects from reports."""
     if isinstance(value, bytes):
         return f"<bytes:{len(value)}>"
     if isinstance(value, bytearray):
         return f"<bytes:{len(value)}>"
+    if isinstance(value, os.PathLike):
+        return basename_label(os.fspath(value))
     if isinstance(value, str):
         return sanitize_text(value)
     if isinstance(value, Mapping):
@@ -999,14 +1032,57 @@ def _shard_sizes(manifest: Mapping[str, Any] | None) -> list[int]:
     return sizes
 
 
+def compute_shard_balance_summary(shard_sizes_bytes: Sequence[int]) -> dict[str, Any]:
+    """Compute deterministic fast-boot shard balance summary metrics (T83).
+
+    Returns a sanitized summary with:
+    - `shard_count`: number of shards (`int`, >= 0)
+    - `max_shard_mib`: largest shard size in MiB (`float`, 4 decimals)
+    - `total_mib`: sum of shard sizes in MiB (`float`, 4 decimals)
+    - `balance_ratio`: `max_bytes / mean_bytes` (`float`, 4 decimals;
+      0.0 when `shard_count == 0` or `total_bytes == 0`, zero-division safe).
+    """
+    sizes = [max(as_int(sz, 0), 0) for sz in shard_sizes_bytes]
+    count = len(sizes)
+    if count == 0:
+        return {
+            "shard_count": 0,
+            "max_shard_mib": 0.0,
+            "total_mib": 0.0,
+            "balance_ratio": 0.0,
+        }
+    total_bytes = sum(sizes)
+    max_bytes = max(sizes)
+    mean_bytes = total_bytes / count
+    balance_ratio = round(max_bytes / mean_bytes, 4) if mean_bytes > 0.0 else 0.0
+    return {
+        "shard_count": count,
+        "max_shard_mib": round(max_bytes / MIB_BYTES, 4),
+        "total_mib": round(total_bytes / MIB_BYTES, 4),
+        "balance_ratio": balance_ratio,
+    }
+
+
 def _shard_stats_from_sizes(sizes: Sequence[int], unit: str = "instructions") -> dict[str, Any]:
     if not sizes:
-        return {"count": 0, "min": 0, "median": 0.0, "max": 0, "unit": unit}
+        return {
+            "count": 0,
+            "min": 0,
+            "median": 0.0,
+            "max": 0,
+            "balance_ratio": 0.0,
+            "unit": unit,
+        }
+    total = sum(sizes)
+    max_val = max(sizes)
+    mean_val = total / len(sizes)
+    balance_ratio = round(max_val / mean_val, 4) if mean_val > 0.0 else 0.0
     return {
         "count": len(sizes),
         "min": min(sizes),
         "median": median(sizes),
-        "max": max(sizes),
+        "max": max_val,
+        "balance_ratio": balance_ratio,
         "unit": unit,
     }
 
@@ -1241,8 +1317,11 @@ def _unresolved_import_names(manifest: Mapping[str, Any] | None) -> list[str]:
         return names
     for item in slots.get("referenced_unresolved") or []:
         if isinstance(item, Mapping):
-            imported = str(item.get("import") or "").strip()
-            dll = str(item.get("dll") or "").strip()
+            imported = sanitize_text(str(item.get("import") or "").strip())
+            raw_dll = str(item.get("dll") or "").strip()
+            dll = basename_label(raw_dll) if raw_dll else ""
+            if dll == "<unknown>":
+                dll = ""
             if imported and dll:
                 label = f"{dll}!{imported}"
             else:
@@ -1333,6 +1412,7 @@ def _summarize_wasm_footprint(
             "got_func_shard_dispatch_imports": None,
             "estimated_got_func_entries": estimated,
             "any_exceeds_v8_1gib_limit": False,
+            "shard_balance": compute_shard_balance_summary([]),
             "modules": [],
             "side_modules": [],
         }
@@ -1524,6 +1604,12 @@ def _summarize_wasm_footprint(
         sum(m["got_func_shard_dispatch_imports"] for m in wasm_mod_rows),
     )
     any_exceeds_v8 = any(s["exceeds_v8_1gib_limit"] for s in side_modules)
+    side_wasm_bytes = [s["wasm_bytes"] for s in side_modules]
+    if not any(b > 0 for b in side_wasm_bytes):
+        side_row_bytes = [m["wasm_bytes"] for m in wasm_mod_rows if m["role"] == "side"]
+        if side_row_bytes:
+            side_wasm_bytes = side_row_bytes
+    shard_balance = compute_shard_balance_summary(side_wasm_bytes)
 
     return {
         "available": True,
@@ -1548,6 +1634,7 @@ def _summarize_wasm_footprint(
         "got_func_shard_dispatch_imports": got_func_shard_dispatch_imports,
         "estimated_got_func_entries": total_got_func_imports,
         "any_exceeds_v8_1gib_limit": any_exceeds_v8,
+        "shard_balance": shard_balance,
         "modules": wasm_mod_rows,
         "side_modules": side_modules,
     }
@@ -1759,7 +1846,13 @@ def _audit_single_module_core(
 
     module = ""
     if manifest and isinstance(manifest.get("module"), str):
-        module = sanitize_text(manifest["module"])
+        raw_module = manifest["module"].strip()
+        if raw_module:
+            module = (
+                basename_label(raw_module)
+                if ("/" in raw_module or "\\" in raw_module or re.match(r"^[A-Za-z]:", raw_module))
+                else sanitize_text(raw_module)
+            )
 
     return {
         "schema": SCHEMA_AUDIT,
@@ -1867,10 +1960,16 @@ def _audit_program_inputs(
         mod_discover = artifact.discover
         mod_report = artifact.report_text
 
-        mod_name = sanitize_text(str(entry.get("module") or "").strip())
-        if not mod_name and mod_manifest and isinstance(mod_manifest.get("module"), str):
-            mod_name = sanitize_text(mod_manifest["module"].strip())
-        if not mod_name:
+        raw_mod_name = str(entry.get("module") or "").strip()
+        if not raw_mod_name and mod_manifest and isinstance(mod_manifest.get("module"), str):
+            raw_mod_name = mod_manifest["module"].strip()
+        if raw_mod_name:
+            mod_name = (
+                basename_label(raw_mod_name)
+                if ("/" in raw_mod_name or "\\" in raw_mod_name or re.match(r"^[A-Za-z]:", raw_mod_name))
+                else sanitize_text(raw_mod_name)
+            )
+        else:
             mod_name = basename_label(entry.get("dll") or entry.get("file"))
         if not first_module_name:
             first_module_name = mod_name
@@ -2162,11 +2261,13 @@ def _audit_program_inputs(
             if as_int(s.get("shard_count"), 0) > 0
         ]
         if side_counts:
+            mean_sc = sum(side_counts) / len(side_counts)
             shards = {
                 "count": sum(side_counts),
                 "min": min(side_counts),
                 "median": median(side_counts),
                 "max": max(side_counts),
+                "balance_ratio": round(max(side_counts) / mean_sc, 4) if mean_sc > 0.0 else 0.0,
                 "unit": "shards_per_side_module",
             }
         else:
@@ -2678,32 +2779,39 @@ def _compute_split_balance(
     *,
     warn_ratio: float = DEFAULT_SPLIT_BALANCE_WARN_RATIO,
 ) -> dict[str, Any]:
-    count = len(part_sizes)
+    summary = compute_shard_balance_summary(part_sizes)
+    count = summary["shard_count"]
     if count == 0:
         return {
             "part_count": 0,
+            "shard_count": 0,
             "min_bytes": 0,
             "median_bytes": 0.0,
             "mean_bytes": 0.0,
             "max_bytes": 0,
+            "total_bytes": 0,
+            "max_shard_mib": 0.0,
+            "total_mib": 0.0,
             "max_to_mean_ratio": 0.0,
             "max_to_min_ratio": 0.0,
             "max_share_ratio": 0.0,
             "split_balance_ratio": 0.0,
+            "balance_ratio": 0.0,
             "warn_threshold_ratio": round(warn_ratio, 4),
             "has_empty_part": False,
             "dominant_shard_warning": False,
             "balanced": False,
         }
 
-    total = sum(part_sizes)
-    min_b = min(part_sizes)
-    max_b = max(part_sizes)
+    sizes = [max(as_int(sz, 0), 0) for sz in part_sizes]
+    total = sum(sizes)
+    min_b = min(sizes)
+    max_b = max(sizes)
     mean_b = total / count
-    med_b = median(part_sizes)
+    med_b = median(sizes)
     has_empty = min_b == 0
 
-    max_to_mean = round(max_b / mean_b, 4) if mean_b > 0 else 0.0
+    max_to_mean = summary["balance_ratio"]
     if min_b > 0:
         max_to_min: float | None = round(max_b / min_b, 4)
     elif max_b == 0:
@@ -2723,14 +2831,19 @@ def _compute_split_balance(
 
     return {
         "part_count": count,
+        "shard_count": summary["shard_count"],
         "min_bytes": min_b,
         "median_bytes": round(med_b, 2),
         "mean_bytes": round(mean_b, 2),
         "max_bytes": max_b,
+        "total_bytes": total,
+        "max_shard_mib": summary["max_shard_mib"],
+        "total_mib": summary["total_mib"],
         "max_to_mean_ratio": max_to_mean,
         "max_to_min_ratio": max_to_min,
         "max_share_ratio": max_share,
         "split_balance_ratio": max_to_mean,
+        "balance_ratio": summary["balance_ratio"],
         "warn_threshold_ratio": round(warn_ratio, 4),
         "has_empty_part": has_empty,
         "dominant_shard_warning": dominant_warning,
@@ -3184,6 +3297,7 @@ def audit_wasm64_fast_boot(
     }
 
     split_balance = _compute_split_balance(part_sizes, warn_ratio=balance_warn_ratio)
+    shard_balance = compute_shard_balance_summary(part_sizes)
 
     boot_manifest_report = _audit_boot_manifest_consistency(
         target,
@@ -3238,6 +3352,7 @@ def audit_wasm64_fast_boot(
             "warning_count": len(warnings),
             "warnings": warnings,
             "artifacts": artifacts,
+            "shard_balance": shard_balance,
             "split_balance": split_balance,
             "exports": exports,
             "boot_manifest": boot_manifest_report,
@@ -3489,11 +3604,13 @@ def audit_recomp_build(
                 if as_int(s.get("shard_count"), 0) > 0
             ]
             if side_counts:
+                mean_sc = sum(side_counts) / len(side_counts)
                 report["shards"] = {
                     "count": sum(side_counts),
                     "min": min(side_counts),
                     "median": median(side_counts),
                     "max": max(side_counts),
+                    "balance_ratio": round(max(side_counts) / mean_sc, 4) if mean_sc > 0.0 else 0.0,
                     "unit": "shards_per_side_module",
                 }
         program_summary = _program_summary_from_guest_manifest(wasm_footprint, report)
@@ -3536,10 +3653,22 @@ def audit_recomp_build(
 def _format_fast_boot_text_lines(fast_boot: Mapping[str, Any]) -> list[str]:
     artifacts = fast_boot.get("artifacts") or {}
     balance = fast_boot.get("split_balance") or {}
+    shard_bal = fast_boot.get("shard_balance") or {}
     exports = fast_boot.get("exports") or {}
     manifest = fast_boot.get("boot_manifest") or {}
     warnings = fast_boot.get("warnings") or []
     req = exports.get("required") or {}
+
+    shard_count = as_int(
+        shard_bal.get("shard_count", balance.get("shard_count", balance.get("part_count"))),
+        0,
+    )
+    max_shard_mib = _as_float(shard_bal.get("max_shard_mib", balance.get("max_shard_mib")), 0.0)
+    total_mib = _as_float(shard_bal.get("total_mib", balance.get("total_mib")), 0.0)
+    balance_ratio = _as_float(
+        shard_bal.get("balance_ratio", balance.get("balance_ratio", balance.get("split_balance_ratio"))),
+        0.0,
+    )
 
     max_to_min = balance.get("max_to_min_ratio")
     max_to_min_str = f"{_as_float(max_to_min, 0.0):.2f}x" if max_to_min is not None else "inf"
@@ -3558,6 +3687,8 @@ def _format_fast_boot_text_lines(fast_boot: Mapping[str, Any]) -> list[str]:
         f"parts bytes {as_int(artifacts.get('guest_parts_total_bytes'), 0)}, "
         f"total wasm bytes {as_int(artifacts.get('total_wasm_bytes'), 0)} "
         f"({_as_float(artifacts.get('total_wasm_mib'), 0.0):.4f} MiB)",
+        f"  shard balance: shards {shard_count}, max_shard_mib {max_shard_mib:.4f} MiB, "
+        f"total_mib {total_mib:.4f} MiB, balance_ratio {balance_ratio:.4f}x",
         f"  split balance: ratio {_as_float(balance.get('split_balance_ratio'), 0.0):.4f}x "
         f"(max/min {max_to_min_str}, largest share {_as_float(balance.get('max_share_ratio'), 0.0) * 100.0:.2f}%, "
         f"threshold {_as_float(balance.get('warn_threshold_ratio'), DEFAULT_SPLIT_BALANCE_WARN_RATIO):.2f}x, "
@@ -3584,10 +3715,22 @@ def _format_fast_boot_text_lines(fast_boot: Mapping[str, Any]) -> list[str]:
 def _format_fast_boot_markdown_lines(fast_boot: Mapping[str, Any]) -> list[str]:
     artifacts = fast_boot.get("artifacts") or {}
     balance = fast_boot.get("split_balance") or {}
+    shard_bal = fast_boot.get("shard_balance") or {}
     exports = fast_boot.get("exports") or {}
     manifest = fast_boot.get("boot_manifest") or {}
     warnings = fast_boot.get("warnings") or []
     req = exports.get("required") or {}
+
+    shard_count = as_int(
+        shard_bal.get("shard_count", balance.get("shard_count", balance.get("part_count"))),
+        0,
+    )
+    max_shard_mib = _as_float(shard_bal.get("max_shard_mib", balance.get("max_shard_mib")), 0.0)
+    total_mib = _as_float(shard_bal.get("total_mib", balance.get("total_mib")), 0.0)
+    balance_ratio = _as_float(
+        shard_bal.get("balance_ratio", balance.get("balance_ratio", balance.get("split_balance_ratio"))),
+        0.0,
+    )
 
     max_to_min = balance.get("max_to_min_ratio")
     max_to_min_str = f"{_as_float(max_to_min, 0.0):.2f}x" if max_to_min is not None else "inf"
@@ -3605,6 +3748,8 @@ def _format_fast_boot_markdown_lines(fast_boot: Mapping[str, Any]) -> list[str]:
         f"({as_int(artifacts.get('guest_parts_total_bytes'), 0)} bytes), "
         f"total Wasm: **{as_int(artifacts.get('total_wasm_bytes'), 0)}** bytes "
         f"({_as_float(artifacts.get('total_wasm_mib'), 0.0):.4f} MiB)",
+        f"- Shard balance: **{shard_count}** shards, max **{max_shard_mib:.4f} MiB**, "
+        f"total **{total_mib:.4f} MiB**, balance ratio **{balance_ratio:.4f}x**",
         f"- Split balance: **{_as_float(balance.get('split_balance_ratio'), 0.0):.4f}x** "
         f"(max/min {max_to_min_str}, largest share {_as_float(balance.get('max_share_ratio'), 0.0) * 100.0:.2f}%, "
         f"dominant shard warning: `{bool(balance.get('dominant_shard_warning'))}`)",
@@ -3745,6 +3890,14 @@ def format_text_report(report: Mapping[str, Any]) -> str:
                 f"  total size: {_as_float(wasm_fp.get('total_size_mib'), 0.0):.2f} MiB "
                 f"({as_int(wasm_fp.get('total_wasm_bytes'), 0)} bytes)"
             )
+            fp_bal = wasm_fp.get("shard_balance")
+            if isinstance(fp_bal, Mapping):
+                lines.append(
+                    f"  shard balance: shards {as_int(fp_bal.get('shard_count'), 0)}, "
+                    f"max_shard_mib {_as_float(fp_bal.get('max_shard_mib'), 0.0):.4f} MiB, "
+                    f"total_mib {_as_float(fp_bal.get('total_mib'), 0.0):.4f} MiB, "
+                    f"balance_ratio {_as_float(fp_bal.get('balance_ratio'), 0.0):.4f}x"
+                )
             lines.append(
                 f"  GOT.func imports: {as_int(wasm_fp.get('total_got_func_imports'), 0)} "
                 f"(sub_*: {as_int(wasm_fp.get('got_func_sub_imports'), 0)}, "
@@ -3889,6 +4042,16 @@ def format_markdown_report(report: Mapping[str, Any]) -> str:
                     f"- Side modules: {wasm_fp.get('side_module_count', 0)} "
                     f"({wasm_fp.get('side_module_shard_count', 0)} shards)",
                     f"- Total Wasm size: {_as_float(wasm_fp.get('total_size_mib'), 0.0):.2f} MiB",
+                    *(
+                        [
+                            f"- Shard balance: **{as_int(wasm_fp['shard_balance'].get('shard_count'), 0)}** shards, "
+                            f"max **{_as_float(wasm_fp['shard_balance'].get('max_shard_mib'), 0.0):.4f} MiB**, "
+                            f"total **{_as_float(wasm_fp['shard_balance'].get('total_mib'), 0.0):.4f} MiB**, "
+                            f"balance ratio **{_as_float(wasm_fp['shard_balance'].get('balance_ratio'), 0.0):.4f}x**"
+                        ]
+                        if isinstance(wasm_fp.get("shard_balance"), Mapping)
+                        else []
+                    ),
                     f"- `GOT.func` imports: **{as_int(wasm_fp.get('total_got_func_imports'), 0)}** "
                     f"(`sub_*`: {as_int(wasm_fp.get('got_func_sub_imports'), 0)}, "
                     f"shard dispatch: {as_int(wasm_fp.get('got_func_shard_dispatch_imports'), 0)})",

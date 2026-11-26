@@ -425,5 +425,349 @@ class TestCliAndSanitization(unittest.TestCase):
             self.assertNotIn(str(valid_dir), proc_json.stdout)
 
 
+class TestDeterministicArchiveInventoryAndSummary(unittest.TestCase):
+    def test_archive_inventory_sorted_deterministically_independent_of_iterdir_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            game_dir = Path(tmp) / "synth_pkg"
+            (game_dir / "Data" / "SubB").mkdir(parents=True)
+            (game_dir / "Data" / "SubA").mkdir(parents=True)
+            (game_dir / "Bin").mkdir(parents=True)
+
+            minimal_cfg = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                '<Game configVersion="1">'
+                '<Identity Name="Synth.OrderTest" Publisher="CN=Synth" Version="1.0.0.0" />'
+                "<TitleId>11223344</TitleId>"
+                "</Game>"
+            )
+            (game_dir / "MicrosoftGame.Config").write_text(minimal_cfg, encoding="utf-8")
+
+            # Synthetic DLLs in multiple directories
+            (game_dir / "z_last.dll").write_bytes(PE_STUB)
+            (game_dir / "Bin" / "a_first.dll").write_bytes(PE_STUB)
+
+            # Synthetic RPFs with distinct and tied sizes, plus empty & zero-filled partials
+            (game_dir / "Data" / "SubB" / "zebra_large_asset.rpf").write_bytes(RPF9_STUB + b"\x33" * 200)
+            (game_dir / "Data" / "SubA" / "alpha_tie_asset.rpf").write_bytes(RPF9_STUB)
+            (game_dir / "Data" / "SubB" / "beta_tie_asset.rpf").write_bytes(RPF9_STUB)
+            (game_dir / "Data" / "partial_zero_asset.rpf").write_bytes(b"\x00" * 128)
+            (game_dir / "Data" / "empty_zero_asset.rpf").write_bytes(b"")
+
+            report_normal = iga.inspect_game_directory(game_dir)
+
+            orig_iterdir = Path.iterdir
+
+            def reversed_iterdir(path_self: Path):
+                return iter(list(orig_iterdir(path_self))[::-1])
+
+            with mock.patch.object(Path, "iterdir", reversed_iterdir):
+                report_reversed = iga.inspect_game_directory(game_dir)
+
+            json_normal = json.dumps(report_normal, indent=2)
+            json_reversed = json.dumps(report_reversed, indent=2)
+            self.assertEqual(json_normal, json_reversed)
+
+            # Verify zero .rpf filenames leak into serialized JSON output.
+            for secret_name in (
+                "zebra_large_asset",
+                "alpha_tie_asset",
+                "beta_tie_asset",
+                "partial_zero_asset",
+                "empty_zero_asset",
+            ):
+                self.assertNotIn(secret_name, json_normal)
+
+            inv = report_normal["inventory"]
+            # DLLs strictly sorted by relativePath
+            self.assertEqual(
+                [item["relativePath"] for item in inv["dlls"]],
+                ["Bin/a_first.dll", "z_last.dll"],
+            )
+            self.assertEqual(inv["dllTotalBytes"], 2 * len(PE_STUB))
+
+            # Archives strictly sorted by (-sizeBytes, pathHash)
+            archives = inv["archives"]
+            self.assertEqual(len(archives), 5)
+            sort_keys = [(-item["sizeBytes"], item["pathHash"]) for item in archives]
+            self.assertEqual(sort_keys, sorted(sort_keys))
+            self.assertEqual(archives[0]["sizeBytes"], len(RPF9_STUB) + 200)
+            self.assertEqual(archives[-1]["sizeBytes"], 0)
+            self.assertEqual(archives[-1]["status"], "empty")
+            for item in archives:
+                self.assertEqual(len(item["pathHash"]), 16)
+                self.assertEqual(item["extension"], ".rpf")
+                self.assertGreaterEqual(item["sizeRatio"], 0.0)
+                self.assertLessEqual(item["sizeRatio"], 1.0)
+
+            # Summary metrics match exact counts and ratios
+            summary = inv["archiveSummary"]
+            expected_complete_bytes = (len(RPF9_STUB) + 200) + 2 * len(RPF9_STUB)
+            expected_incomplete_bytes = 128
+            expected_total_bytes = expected_complete_bytes + expected_incomplete_bytes
+            self.assertEqual(summary["archiveCount"], 5)
+            self.assertEqual(summary["completeCount"], 3)
+            self.assertEqual(summary["incompleteCount"], 2)
+            self.assertEqual(summary["emptyCount"], 1)
+            self.assertEqual(summary["zeroHeaderCount"], 1)
+            self.assertEqual(summary["unreadableCount"], 0)
+            self.assertEqual(summary["totalBytes"], expected_total_bytes)
+            self.assertEqual(summary["completeBytes"], expected_complete_bytes)
+            self.assertEqual(summary["incompleteBytes"], expected_incomplete_bytes)
+            self.assertEqual(summary["minBytes"], 0)
+            self.assertEqual(summary["maxBytes"], len(RPF9_STUB) + 200)
+            self.assertAlmostEqual(summary["avgBytes"], round(expected_total_bytes / 5, 2))
+            self.assertAlmostEqual(summary["completeCountRatio"], 0.6)
+            self.assertAlmostEqual(summary["incompleteCountRatio"], 0.4)
+            self.assertAlmostEqual(
+                summary["completeByteRatio"],
+                round(expected_complete_bytes / expected_total_bytes, 6),
+            )
+            self.assertAlmostEqual(
+                summary["incompleteByteRatio"],
+                round(expected_incomplete_bytes / expected_total_bytes, 6),
+            )
+            self.assertEqual(
+                summary["statusCounts"],
+                {"empty": 1, "incomplete_zero_header": 1, "ok": 3},
+            )
+            self.assertEqual(
+                summary["headerFormatCounts"],
+                {"empty": 1, "rpf": 3, "zero_filled": 1},
+            )
+
+            rd = report_normal["readiness"]
+            self.assertAlmostEqual(rd["dllCompleteRatio"], 1.0)
+            self.assertAlmostEqual(rd["archiveCompleteRatio"], 0.6)
+            self.assertAlmostEqual(rd["archiveCompleteByteRatio"], summary["completeByteRatio"])
+
+    def test_zero_archive_and_zero_byte_zero_division_guards(self) -> None:
+        self.assertEqual(iga.safe_ratio(42, 0), 0.0)
+        self.assertEqual(iga.safe_ratio(42, -10), 0.0)
+        self.assertEqual(iga.safe_ratio(0, 0), 0.0)
+
+        empty_summary = iga.summarize_archive_inventory([])
+        self.assertEqual(empty_summary["archiveCount"], 0)
+        self.assertEqual(empty_summary["totalBytes"], 0)
+        self.assertEqual(empty_summary["minBytes"], 0)
+        self.assertEqual(empty_summary["maxBytes"], 0)
+        self.assertEqual(empty_summary["avgBytes"], 0.0)
+        self.assertEqual(empty_summary["completeCountRatio"], 0.0)
+        self.assertEqual(empty_summary["incompleteCountRatio"], 0.0)
+        self.assertEqual(empty_summary["completeByteRatio"], 0.0)
+        self.assertEqual(empty_summary["incompleteByteRatio"], 0.0)
+        self.assertEqual(empty_summary["largestArchiveByteRatio"], 0.0)
+        self.assertEqual(empty_summary["statusCounts"], {})
+        self.assertEqual(empty_summary["headerFormatCounts"], {})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+
+            # 1. Missing directory -> zero-division safe
+            missing_report = iga.inspect_game_directory(base / "does_not_exist")
+            self.assertEqual(missing_report["status"], "missing_game_dir")
+            self.assertEqual(missing_report["inventory"]["archiveSummary"]["avgBytes"], 0.0)
+            self.assertEqual(missing_report["readiness"]["archiveCompleteRatio"], 0.0)
+
+            # 2. Empty directory (0 files, 0 archives) -> zero-division safe
+            empty_dir = base / "empty_dir"
+            empty_dir.mkdir()
+            empty_report = iga.inspect_game_directory(empty_dir)
+            self.assertEqual(empty_report["status"], "missing_config")
+            self.assertEqual(empty_report["inventory"]["archives"], [])
+            self.assertEqual(empty_report["inventory"]["archiveSummary"]["completeByteRatio"], 0.0)
+            self.assertEqual(empty_report["readiness"]["dllCompleteRatio"], 0.0)
+
+            # 3. Valid minimal config with 0 executables, 0 visuals, 0 DLLs, 0 RPFs
+            zero_assets_dir = base / "zero_assets"
+            zero_assets_dir.mkdir()
+            (zero_assets_dir / "MicrosoftGame.Config").write_text(
+                '<Game configVersion="1"><Identity Name="Zero.Assets" Publisher="CN=Zero" Version="1.0.0.0" /></Game>',
+                encoding="utf-8",
+            )
+            zero_report = iga.inspect_game_directory(zero_assets_dir)
+            self.assertTrue(zero_report["ok"])
+            self.assertTrue(zero_report["readiness"]["allDeclaredAssetsComplete"])
+            self.assertEqual(zero_report["readiness"]["executableCompleteRatio"], 0.0)
+            self.assertEqual(zero_report["readiness"]["visualCompleteRatio"], 0.0)
+            self.assertEqual(zero_report["readiness"]["archiveCompleteRatio"], 0.0)
+            self.assertEqual(zero_report["readiness"]["archiveCompleteByteRatio"], 0.0)
+
+            # 4. Multiple 0-byte empty archives (archiveCount > 0, totalBytes == 0)
+            zero_bytes_dir = base / "zero_byte_archives"
+            zero_bytes_dir.mkdir()
+            (zero_bytes_dir / "MicrosoftGame.Config").write_text(
+                '<Game configVersion="1"><Identity Name="Zero.Bytes" Publisher="CN=Zero" Version="1.0.0.0" /></Game>',
+                encoding="utf-8",
+            )
+            (zero_bytes_dir / "a.rpf").write_bytes(b"")
+            (zero_bytes_dir / "b.rpf").write_bytes(b"")
+            zb_report = iga.inspect_game_directory(zero_bytes_dir)
+            zb_summary = zb_report["inventory"]["archiveSummary"]
+            self.assertEqual(zb_summary["archiveCount"], 2)
+            self.assertEqual(zb_summary["emptyCount"], 2)
+            self.assertEqual(zb_summary["totalBytes"], 0)
+            self.assertEqual(zb_summary["avgBytes"], 0.0)
+            self.assertEqual(zb_summary["completeCountRatio"], 0.0)
+            self.assertEqual(zb_summary["incompleteCountRatio"], 1.0)
+            self.assertEqual(zb_summary["completeByteRatio"], 0.0)
+            self.assertEqual(zb_summary["incompleteByteRatio"], 0.0)
+            self.assertEqual(zb_summary["largestArchiveByteRatio"], 0.0)
+            for arch in zb_report["inventory"]["archives"]:
+                self.assertEqual(arch["sizeRatio"], 0.0)
+
+
+class TestStrictHostPathSanitizationAndBackwardsCompat(unittest.TestCase):
+    def test_json_sanitizes_windows_posix_unc_file_url_tilde_and_usernames(self) -> None:
+        hostile_xml = """<?xml version="1.0" encoding="utf-8"?>
+<Game configVersion="1">
+  <Identity Name="MockDevUser99.DemoTitle"
+            Publisher="CN=Built by mock_unix_user99 at C:\\Users\\AliceSecret\\Build"
+            Version="1.0.0.0" />
+  <TitleId>DEADBEEF</TitleId>
+  <StoreId>file:///C:/Users/AliceSecret/store.txt</StoreId>
+  <MSAAppId>//corp-nas02/private_share/BobSecret/app</MSAAppId>
+  <ExecutableList>
+    <Executable Name="C:\\Users\\AliceSecret\\My Games\\evil.exe" Id="WinAbs" TargetDeviceFamily="PC" />
+    <Executable Name="\\\\corp-nas01\\private_share\\AliceSecret\\unc.exe" Id="UncBs" TargetDeviceFamily="PC" />
+    <Executable Name="//corp-nas02/private_share/BobSecret/unc2.exe" Id="UncFs" TargetDeviceFamily="PC" />
+    <Executable Name="/home/bob_dev/secret_project/linux.exe" Id="PosixHome" TargetDeviceFamily="Scarlett" />
+    <Executable Name="~/private_keys/tilde.exe" Id="TildePath" TargetDeviceFamily="Scarlett" />
+  </ExecutableList>
+  <ShellVisuals DefaultDisplayName="Build from /Users/carol_dev/Desktop/pkg for MockDevUser99"
+                SplashScreenImage="file:///C:/Users/AliceSecret/splash.png"
+                StoreLogo="D:/XboxDumps/SecretBuild/store.png" />
+  <VirtualMachine HostHint="\\\\corp-nas01\\share\\vm.vhdx">
+    <ScratchDir>/home/bob_dev/vm_scratch</ScratchDir>
+  </VirtualMachine>
+  <ModFolder Name="C:\\Users\\AliceSecret\\Mods" ReadOnly="true" />
+</Game>
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            game_dir = Path(tmp) / "HostSecretDumpDir_99"
+            (game_dir / "MockDevUser99").mkdir(parents=True)
+            (game_dir / "Data").mkdir(parents=True)
+            (game_dir / "MicrosoftGame.Config").write_text(hostile_xml, encoding="utf-8")
+            (game_dir / "MockDevUser99" / "helper.dll").write_bytes(PE_STUB)
+            (game_dir / "Data" / "SecretCopyrightedArchiveName.rpf").write_bytes(RPF9_STUB)
+
+            fake_env = dict(os.environ)
+            fake_env["USERNAME"] = "MockDevUser99"
+            fake_env["USER"] = "mock_unix_user99"
+
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, fake_env, clear=True), redirect_stdout(buf):
+                rc = iga.main(["--dir", str(game_dir), "--json"])
+
+            self.assertEqual(rc, 0)
+            raw_json = buf.getvalue()
+            payload = json.loads(raw_json)
+            self.assertTrue(payload["ok"])
+
+            for forbidden in (
+                str(game_dir),
+                "HostSecretDumpDir_99",
+                "C:\\Users",
+                "C:/Users",
+                "D:/XboxDumps",
+                "corp-nas01",
+                "corp-nas02",
+                "private_share",
+                "/home/bob_dev",
+                "/Users/carol_dev",
+                "file:///",
+                "~/private_keys",
+                "AliceSecret",
+                "BobSecret",
+                "bob_dev",
+                "carol_dev",
+                "MockDevUser99",
+                "mock_unix_user99",
+                "My Games",
+                "SecretCopyrightedArchiveName",
+            ):
+                self.assertNotIn(forbidden, raw_json, msg=f"Leaked forbidden token: {forbidden}")
+
+            # Unsafe paths are all rejected cleanly
+            for exe in payload["executables"]:
+                self.assertEqual(exe["status"], "unsafe_path")
+                self.assertEqual(exe["declaredPath"], "<path>")
+                self.assertFalse(exe["present"])
+            self.assertEqual(payload["config"]["modFolder"], {"name": "<path>", "readOnly": True})
+
+            # Verify recursive sanitize_report handles bytes and Path values cleanly
+            sanitized_misc = iga.sanitize_report(
+                {
+                    "raw": b"\x01\x02\x03",
+                    "p": Path("/home/bob_dev/secret.bin"),
+                    "msg": "path=\\\\server\\share\\file and /home/bob_dev/x and C:\\Users\\alice\\y",
+                }
+            )
+            self.assertEqual(sanitized_misc["raw"], "<bytes:3>")
+            self.assertEqual(sanitized_misc["p"], "secret.bin")
+            self.assertNotIn("bob_dev", sanitized_misc["msg"])
+            self.assertNotIn("server", sanitized_misc["msg"])
+            self.assertNotIn("C:\\Users", sanitized_misc["msg"])
+
+    def test_backwards_compatibility_for_sanitize_text_and_legacy_text_format(self) -> None:
+        self.assertIsNone(iga.sanitize_text(None))
+        # Relative package paths containing words like "home" or "tmp" are preserved intact.
+        self.assertEqual(iga.sanitize_text("Assets/home/logo.png"), "Assets/home/logo.png")
+        self.assertEqual(iga.sanitize_text("Tools/tmp/helper.dll"), "Tools/tmp/helper.dll")
+
+        # Legacy report dict without T88 additive keys still renders cleanly via format_report_text.
+        legacy_report = {
+            "schemaVersion": 1,
+            "ok": True,
+            "status": "ok",
+            "configFound": True,
+            "configValid": True,
+            "configRelativePath": "MicrosoftGame.Config",
+            "error": None,
+            "config": {
+                "configVersion": "1",
+                "identity": {"name": "Legacy.Title", "publisher": "CN=Legacy", "version": "1.0"},
+                "titleId": "AABBCCDD",
+                "storeId": None,
+                "msaAppId": None,
+                "executables": [],
+                "shellVisuals": {"defaultDisplayName": "Legacy Display"},
+                "resources": {"languages": ["en-US"]},
+                "virtualMachine": None,
+                "modFolder": None,
+                "desktopRegistration": None,
+            },
+            "executables": [],
+            "shellVisuals": [],
+            "inventory": {
+                "dlls": [],
+                "dllCount": 0,
+                "dllCompleteCount": 0,
+                "dllIncompleteCount": 0,
+                "rpfCount": 0,
+                "rpfCompleteCount": 0,
+                "rpfIncompleteCount": 0,
+                "rpfTotalBytes": 0,
+            },
+            "readiness": {
+                "allDeclaredAssetsComplete": True,
+                "hasPartialDownloads": False,
+                "declaredExecutableCount": 0,
+                "presentExecutableCount": 0,
+                "completeExecutableCount": 0,
+                "missingExecutableCount": 0,
+                "incompleteExecutableCount": 0,
+                "declaredVisualCount": 0,
+                "presentVisualCount": 0,
+                "completeVisualCount": 0,
+                "missingVisualCount": 0,
+                "incompleteVisualCount": 0,
+            },
+        }
+        rendered = iga.format_report_text(legacy_report)
+        self.assertIn("Legacy Display", rendered)
+        self.assertIn("AABBCCDD", rendered)
+        self.assertIn("RPFs : 0 total", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -337,6 +338,34 @@ bool QueryPerformanceCounter(int64_t* performance_count);
 bool QueryPerformanceFrequency(int64_t* frequency);
 uint64_t GetTickCount64();
 void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time);
+
+// Stall compensation: host work that knowingly blocks guest threads (pipeline builds, capture
+// flushes, synchronous loads) must not count against guest watchdogs. Stalls of at least
+// kHostStallThresholdNs are subtracted from QueryPerformanceCounter/GetTickCount64 for all
+// threads; the guest clock stays monotonic. Shorter stalls are ignored (off unless a stall happens).
+constexpr int64_t kHostStallThresholdNs = 50'000'000LL;
+void ReportHostStall(int64_t stall_ns);
+int64_t TotalHostStallNs();
+void ResetHostStallForTesting();
+
+// RAII: times a host-side region with a steady clock and reports it when >= the threshold.
+class HostStallScope {
+public:
+    HostStallScope() : start_(std::chrono::steady_clock::now()) {}
+    ~HostStallScope() {
+        const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - start_)
+                               .count();
+        if (ns >= kHostStallThresholdNs) {
+            ReportHostStall(ns);
+        }
+    }
+    HostStallScope(const HostStallScope&) = delete;
+    HostStallScope& operator=(const HostStallScope&) = delete;
+
+private:
+    std::chrono::steady_clock::time_point start_;
+};
 
 uint32_t GetLastError();
 void SetLastError(uint32_t error_code);

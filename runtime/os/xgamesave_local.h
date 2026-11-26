@@ -65,6 +65,8 @@ public:
     HResult create_container(const std::string& name);  // opens an existing one as well
     HResult delete_container(const std::string& name);
     HResult enumerate_containers(const std::string& prefix, std::vector<ContainerInfo>* out) const;
+    // One container's info (what enumerate_containers reports for it); E_GS_NO_SUCH_CONTAINER when absent.
+    HResult get_container_info(const std::string& name, ContainerInfo* out) const;
     HResult enumerate_blobs(const std::string& container, std::vector<BlobInfo>* out) const;
     HResult read_blob(const std::string& container, const std::string& blob, std::vector<uint8_t>* out) const;
     HResult submit_update(const std::string& container, const std::vector<BlobWrite>& writes,

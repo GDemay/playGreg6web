@@ -227,6 +227,61 @@ void test_gpu_page_table() {
     reset();
 }
 
+// O33: the four page-mapping kinds. 0 maps consecutive pool pages, 1 repeats one pool page at
+// every destination page, 2 unmaps, 3 leaves the pages alone; every kind advances the destination.
+void test_gpu_page_mapping_kinds() {
+    reset();
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuWindows);
+    const uint64_t S = window_size();
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x21u, kCpuProtect);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, S, kWindowType, 0x3u, kGpuProtect);
+    const uint64_t G = va_of(gpu);
+    auto page = [&](uint64_t n) { return xw::gpu_page_pool_index(G + n * k64K); };
+
+    // Kind 0: pool pages 10, 11, 12 at GPU pages 0..2.
+    std::vector<xw::PageMappingRange> ranges(1);
+    ranges[0].gpu_va = G;
+    ranges[0].entries = {{0, 10, 3}};
+    auto r = xw::apply_gpu_page_mappings(ranges, 0, 64);
+    CHECK(r.mapped_pages == 3 && r.kind_entries[0] == 1 && r.skipped_entries == 0);
+    CHECK(page(0) == 10 && page(1) == 11 && page(2) == 12 && page(3) == -1);
+
+    // Kind 1: pool page 7 at every one of GPU pages 3..6.
+    ranges[0].gpu_va = G + 3 * k64K;
+    ranges[0].entries = {{1, 7, 4}};
+    r = xw::apply_gpu_page_mappings(ranges, 0, 64);
+    CHECK(r.mapped_pages == 4 && r.kind_entries[1] == 1 && r.repeated_single_runs == 1);
+    CHECK(page(3) == 7 && page(4) == 7 && page(5) == 7 && page(6) == 7 && page(7) == -1);
+
+    // Kind 3 then kind 2: keep pages 0..1, unmap pages 2..3, keep 4, then kind 0 at page 5.
+    ranges[0].gpu_va = G;
+    ranges[0].entries = {{3, 99, 2}, {2, 0, 2}, {3, 0, 1}, {0, 20, 1}};
+    r = xw::apply_gpu_page_mappings(ranges, 0, 64);
+    CHECK(r.kept_pages == 3 && r.unmapped_pages == 2 && r.mapped_pages == 1 && r.outside_window == 0);
+    CHECK(r.kind_entries[0] == 1 && r.kind_entries[2] == 1 && r.kind_entries[3] == 2);
+    CHECK(page(0) == 10 && page(1) == 11 && page(2) == -1 && page(3) == -1 && page(4) == 7 && page(5) == 20);
+    CHECK(page(6) == 7);
+
+    // Pool bounds: kind 0 runs past the pool on its last page only; kind 1 checks its one page.
+    ranges[0].entries = {{0, 62, 3}, {1, 64, 2}};
+    r = xw::apply_gpu_page_mappings(ranges, 0, 64);
+    CHECK(r.mapped_pages == 2 && r.outside_window == 3);
+    CHECK(page(0) == 62 && page(1) == 63 && page(2) == -1 && page(3) == -1);
+
+    // Unknown kinds are skipped and counted; they do not advance the destination.
+    ranges[0].entries = {{4, 0, 5}, {0, 30, 1}};
+    r = xw::apply_gpu_page_mappings(ranges, 0, 64);
+    CHECK(r.skipped_entries == 1 && r.mapped_pages == 1 && page(0) == 30);
+
+    const auto a = xw::accounting();
+    CHECK(a.gpu_mapping_kind_entries[0] == 4 && a.gpu_mapping_kind_entries[1] == 2);
+    CHECK(a.gpu_mapping_kind_entries[2] == 1 && a.gpu_mapping_kind_entries[3] == 2);
+    CHECK(a.gpu_mapping_repeated_single_runs == 2 && a.gpu_mapping_skipped_entries == 1);
+    CHECK(xmem_virtual_free(gpu) && xmem_virtual_free(cpu));
+    reset();
+    CHECK(xw::accounting().gpu_mapping_kind_entries[1] == 0);
+}
+
 // O30: physical page frame numbers count 4 KiB frames. The title's streaming code keeps
 // pfn >> 4 per 64 KiB pool page and maps window slots with (pfn >> 4) << 4, one scatter entry per
 // 64 KiB slot; the same window pages reach the GPU window through queue slot 31 by pool page
@@ -590,6 +645,7 @@ int main() {
     test_phantom_gpu_window();
     test_pool_pages_in_windows();
     test_gpu_page_table();
+    test_gpu_page_mapping_kinds();
     test_title_shaped_streaming();
     test_exhaustion();
     test_browser_budget_replay();

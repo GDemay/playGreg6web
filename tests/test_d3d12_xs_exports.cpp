@@ -975,7 +975,7 @@ constexpr uint32_t Map = 8, Unmap = 9, GetDesc = 10, GetGPUVirtualAddress = 11, 
 constexpr uint32_t ExecuteCommandLists = 35;
 // ID3D12GraphicsCommandList
 constexpr uint32_t Close = 9, Reset = 10, DrawInstanced = 12, DrawIndexedInstanced = 13, CopyBufferRegion = 15,
-                   CopyTextureRegion = 16, IASetPrimitiveTopology = 20, RSSetViewports = 21, RSSetScissorRects = 22,
+                   CopyTextureRegion = 16, CopyResource = 17, IASetPrimitiveTopology = 20, RSSetViewports = 21, RSSetScissorRects = 22,
                    SetPipelineState = 25, ResourceBarrier = 26, SetGraphicsRootSignature = 34, IASetIndexBuffer = 47,
                    IASetVertexBuffers = 48, OMSetRenderTargets = 50, ClearDepthStencilView = 51,
                    ClearRenderTargetView = 52;  // Xbox order (G27)
@@ -1255,6 +1255,12 @@ void test_resources() {
     const dg::TextureProbeTotals probe3 = dg::probe_texture_contents(1 << 20);
     CHECK(probe3.views_with_data == probe2.views_with_data + 1 && probe3.with_data == probe2.with_data + 1);
     CHECK(dg::probe_texture_contents(1 << 20).views_with_data == probe3.views_with_data);
+    // O36: address-only textures are bounded: N distinct VAs keep the table at its cap.
+    for (uint64_t n = 0; n < dg::Device::kMaxAddressTextures + 300; ++n) {
+        CHECK(dev->ensure_address_texture(view_memory + 0x100000 + n * 0x1000, 77, 4, 4, 1, 1, 0x105,
+                                          GpuTextureDimension::Dim2D, false) != 0);
+        CHECK(dev->address_texture_count() <= dg::Device::kMaxAddressTextures);
+    }
     // An Xbox D16_UNORM_S8_UINT (118) depth-stencil texture at title memory is accepted.
     dg::GuestResourceDesc d16s8 = texture_desc(256, 256, 118, 0x2);
     const uint64_t ds16 = fx.create(device, Slot2::CreatePlacedResourceX, {I(tex_memory), I(put(d16s8)), I(0), I(0)},
@@ -1902,6 +1908,164 @@ void test_copies_and_barriers() {
     scene.release_all({list, upload, gpu_buf, tex});
 }
 
+// G66: GPU -> CPU read-back. A copy from GPU memory into a readback-heap buffer (buffer range or a
+// texture region into a placed footprint) becomes a ReadbackBuffer / ReadbackTexture packet that
+// names the source, the guest bytes' host address and the completion counter. A queue signal behind
+// it is held until the consumer has written the bytes and counted them, so the title never sees
+// the fence complete before its data; without an answer the hold ends at the timeout (counted).
+void test_gpu_readback() {
+    using W = dg::Work;
+    auto work = [](W w) { return dg::work_total(w); };
+    auto wait_for = [](auto pred) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return pred();
+    };
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = false;  // the read-back hold alone decides
+        options.gpu_readback_hold = true;
+        options.gpu_readback_timeout_ms = 60000;
+        dx::set_device_options(options);
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t list = scene.new_list();
+        const uint64_t gpu_buf = committed(fx, scene.device, 1, buffer_desc(256), 0x800);  // DEFAULT, COPY_SOURCE
+        const uint64_t readback = committed(fx, scene.device, 3, buffer_desc(4096), 0x400);  // READBACK
+        const uint64_t tex = committed(fx, scene.device, 1, texture_desc(16, 4, 28, 0), 0x800);  // RGBA8
+        const uint64_t rb_cpu = object_of<dg::Resource>(readback)->cpu_address();
+        CHECK(rb_cpu != 0 && object_of<dg::Resource>(gpu_buf)->cpu_address() == 0);
+        const uint64_t issued0 = work(W::ReadbacksIssued), bytes0 = work(W::ReadbackBytes);
+        const uint64_t held0 = work(W::ReadbackSignalsHeld), done0 = work(W::ReadbacksCompleted);
+
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::CopyBufferRegion, {I(readback), I(16), I(gpu_buf), I(8), I(32)});
+        dg::GuestTextureCopyLocation dst{};
+        dst.pResource = readback;
+        dst.Type = 1;
+        dst.PlacedFootprint = {1024, {28, 16, 4, 1, 256}};
+        dg::GuestTextureCopyLocation src{};
+        src.pResource = tex;
+        src.Type = 0;  // SubresourceIndex 0
+        fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        CHECK(dev->stats().unsupported_copies == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        const Packet* rbb = find_op(ps, GpuOpcode::ReadbackBuffer);
+        const Packet* rbt = find_op(ps, GpuOpcode::ReadbackTexture);
+        CHECK(rbb != nullptr && rbt != nullptr);
+        if (rbb == nullptr || rbt == nullptr) {
+            return;
+        }
+        const auto b = payload_as<GpuReadbackBufferPayload>(*rbb);
+        CHECK(b.seq == 1 && b.buffer_id == object_of<dg::Resource>(gpu_buf)->id() && b.src_offset == 8 && b.size == 32);
+        CHECK(b.dst_addr == reinterpret_cast<uintptr_t>(com::guest_to_host(rb_cpu + 16, 32)));
+        CHECK(b.done_addr == dev->readbacks().done_address());
+        const auto t = payload_as<GpuReadbackTexturePayload>(*rbt);
+        CHECK(t.seq == 2 && t.texture_id == object_of<dg::Resource>(tex)->id() && t.mip_level == 0);
+        CHECK(t.width == 16 && t.height == 4 && t.depth_or_layers == 1 && t.bytes_per_row == 256 &&
+              t.rows_per_image == 4 && t.dst_size == 256 * 3 + 64);
+        CHECK(t.dst_addr == reinterpret_cast<uintptr_t>(com::guest_to_host(rb_cpu + 1024, t.dst_size)));
+        CHECK(work(W::ReadbacksIssued) == issued0 + 2 && work(W::ReadbackBytes) == bytes0 + 32 + 256 * 3 + 64);
+
+        // Signal after the read-backs: held (word and GetCompletedValue stay 0) until both landed.
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(work(W::ReadbackSignalsHeld) == held0 + 1);
+        CHECK(load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);
+        // A later signal queues behind it (in order).
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        CHECK(dev->readbacks().stats().signals_pending == 2);
+
+        // The consumer: bytes first, then the counter (one per read-back).
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(b.done_addr));
+        std::vector<uint8_t> data(32);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint8_t>(0xA0 + i);
+        }
+        std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(b.dst_addr)), data.data(), data.size());
+        done->fetch_add(1);
+        dev->readbacks().poll();
+        CHECK(load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);  // texture still out
+        std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(t.dst_addr)), 0x5C, static_cast<size_t>(t.dst_size));
+        done->fetch_add(1);
+        CHECK(wait_for([&] { return load64(word) == 2; }));
+        CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 2);
+        std::vector<uint8_t> got(32);
+        CHECK(com::read_guest(rb_cpu + 16, got.data(), got.size()) && got == data);
+        uint8_t texel = 0;
+        CHECK(com::read_guest(rb_cpu + 1024 + 256 * 3, &texel, 1) && texel == 0x5C);
+        CHECK(work(W::ReadbacksCompleted) == done0 + 2);
+
+        // Nothing outstanding: a signal completes at once.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
+        CHECK(load64(word) == 3 && dev->readbacks().stats().signals_pending == 0);
+
+        // Executing the list again issues (and numbers) its read-backs again.
+        const size_t mark2 = fx.captured.size();
+        scene.execute({list});
+        const auto ps2 = packets_since(fx, mark2);
+        const Packet* again = find_op(ps2, GpuOpcode::ReadbackBuffer);
+        CHECK(again != nullptr && payload_as<GpuReadbackBufferPayload>(*again).seq == 3);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(4)})) == 0);
+        CHECK(load64(word) == 3);
+        done->fetch_add(2);
+        CHECK(wait_for([&] { return load64(word) == 4; }));
+        scene.release_all({list, gpu_buf, readback, tex, fence});
+    }
+    // No consumer answers: the held signal stays held (no faked completion); the timeout only logs a
+    // warning and is counted once.
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = false;
+        options.gpu_readback_hold = true;
+        options.gpu_readback_timeout_ms = 20;
+        dx::set_device_options(options);
+        Scene scene(fx);
+        const uint64_t list = scene.new_list();
+        const uint64_t gpu_buf = committed(fx, scene.device, 1, buffer_desc(256), 0x800);
+        const uint64_t readback = committed(fx, scene.device, 3, buffer_desc(256), 0x400);
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::CopyResource, {I(readback), I(gpu_buf)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        const Packet* rbb = find_op(ps, GpuOpcode::ReadbackBuffer);
+        CHECK(rbb != nullptr && payload_as<GpuReadbackBufferPayload>(*rbb).size == 256);
+        const uint64_t timeouts0 = work(W::ReadbackTimeouts);
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(load64(word) == 0);
+        CHECK(wait_for([&] { return work(W::ReadbackTimeouts) == timeouts0 + 1; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(load64(word) == 0);
+        CHECK(work(W::ReadbackTimeouts) == timeouts0 + 1);
+        // Many timeouts later the gate still holds (no give-up fallback).
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CHECK(load64(word) == 0);
+        // The consumer finally answers: only now does the fence advance.
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(
+            static_cast<uintptr_t>(payload_as<GpuReadbackBufferPayload>(*rbb).done_addr));
+        done->fetch_add(1);
+        CHECK(wait_for([&] { return load64(word) == 2; }));
+        scene.release_all({list, gpu_buf, readback, fence});
+    }
+}
+
 void test_concurrent_recording() {
     Fixture fx;
     Scene scene(fx);
@@ -2326,94 +2490,208 @@ void test_ring_reuse_waits_for_the_frame() {
     scene.release_all({list, fence});
 }
 
-// G66 (#691) fence completion latency: a queue signal's value is published (completed-value word,
-// GetCompletedValue) once the next frame has been presented, or after the cap; blocking waits
-// complete on the executed value and publish it.
+// G66 (#691) / G69 (#663, PR #1500) fence completion latency:
+// - Default (`fence_publish_lag_frames = 1`, `fence_publish_cap_ms = 33`): holds queue signals
+//   within the submitting frame's epoch to protect mid-frame upload-ring reads, then publishes on
+//   that frame's PresentX (unlocking 30+ FPS instead of stalling 2 presents / ~66 ms).
+// - Configurable `fence_publish_lag_frames = 2` retains the conservative 2-present lag.
+// - Configurable `fence_publish_lag_frames = 0` publishes at issue (same as --no-fence-lag).
+// - Blocking waits complete on the executed value and publish it at once.
 void test_fence_publish_lag() {
-    Fixture fx;
-    Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
-    dg::Device* dev = host_device(scene.device);
-    CHECK(dev->fence_publish_lag());
-    const uint64_t list = scene.new_list();
-    const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
-    auto uploaded_first = [&](const std::vector<Packet>& ps) {
-        float v = std::numeric_limits<float>::quiet_NaN();
-        for (const Packet& p : ps) {
-            if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
-                payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
-                v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+    // Part A: default behavior (lag_frames = 1, cap_ms = 33).
+    {
+        Fixture fx;
+        Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->fence_publish_lag());
+        CHECK(dev->fence_publish_lag_frames() == 1);
+        CHECK(dev->fence_publish_cap_ms() == 33);
+        const uint64_t list = scene.new_list();
+        const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
+        auto uploaded_first = [&](const std::vector<Packet>& ps) {
+            float v = std::numeric_limits<float>::quiet_NaN();
+            for (const Packet& p : ps) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
+                    payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
+                    v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+                }
             }
-        }
-        return v;
-    };
-    const uint64_t rt_slot = put<uint64_t>(scene.rt);
-    auto present = [&] {
-        dg::xbox::GuestPresentPlaneX plane{};
-        plane.ResourceCount = 1;
-        plane.ppResources = rt_slot;
-        CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
-    };
-    int32_t result = -1;
-    const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
-    CHECK(result == 0 && fence != 0);
-    const uint64_t word = fx.vcall(fence, 12);  // Xbox slot 12: the completed-value word
-    CHECK(word != 0 && load64(word) == 0);
+            return v;
+        };
+        const uint64_t rt_slot = put<uint64_t>(scene.rt);
+        auto present = [&] {
+            dg::xbox::GuestPresentPlaneX plane{};
+            plane.ResourceCount = 1;
+            plane.ppResources = rt_slot;
+            CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+        };
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);  // Xbox slot 12: the completed-value word
+        CHECK(word != 0 && load64(word) == 0);
 
-    // 1. Ring reuse under polling: frame N signals 1 and presents; a worker polling the word reuses
-    // the ring once it sees 1. Frame N+1's submission (data written during N) must still upload
-    // its own data: 1 is published only once frame N+1 has been presented.
-    GuestThread worker{};
-    CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
-    std::atomic<bool> reused{false};
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // end of frame N
-    present();                                                                     // frame N
-    const float data = 111.0f;  // written during frame N for a list executed in frame N+1
-    CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
-    std::thread poller([&] {
+        // 1. Mid-frame upload-ring protection + 1-present publish (30+ FPS):
+        // Frame N signals 1 mid-frame before its PresentX. While Frame N is still submitting later
+        // command lists (same epoch), 1 stays unpublished so a polling worker cannot overwrite the
+        // upload ring. As soon as Frame N's PresentX runs (epoch E -> E+1), 1 publishes at once.
+        GuestThread worker{};
+        CHECK(create_guest_thread(fx.arena, 512 * 1024, worker));
+        std::atomic<bool> reused{false};
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // mid-frame N (epoch E)
+        const float data = 111.0f;  // written during frame N for a later list in frame N
+        CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
+        std::thread poller([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+                std::this_thread::yield();
+            }
+            const float next = 222.0f;
+            CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+            reused = true;
+        });
+        CHECK(!reused && load64(word) == 0 && hr(fx.vcall(fence, Slot::GetCompletedValue)) == 0);
+        scene.record(fx.thread, list);
+        size_t mark = fx.captured.size();
+        scene.execute({list});  // later list in frame N (still epoch E)
+        CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
+        present();  // frame N presented (epoch E -> E+1): 1 is published immediately
+        poller.join();
+        CHECK(reused && load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 1);
+
+        // 2. A signal issued after Frame N's PresentX (already in epoch E+1) is held until Frame
+        // N+1's PresentX (epoch E+2) or the cap.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        CHECK(load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        present();  // frame N+1 presented (epoch E+1 -> E+2): 2 is published
+        CHECK(load64(word) == 2 && fx.vcall(fence, Slot::GetCompletedValue) == 2);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 2);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 2);
+
+        // 3. A thread blocking on a value it later satisfies itself (CPU waits on the executed
+        // value): no deadlock, and the wait publishes the value at once (no present needed).
+        std::atomic<bool> woke{false};
+        std::thread blocker([&] {
+            CHECK(hr(fx.vcall_on(worker, fence, Slot::SetEventOnCompletion, {I(3), I(0)})) == 0);
+            woke = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        CHECK(!woke);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
+        blocker.join();
+        CHECK(woke && load64(word) == 3 && counter(dev, dg::xbox::Counter::FencePublishesByWait) >= 1);
+
+        // 4. The cap (33 ms default) publishes with no presents.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(4)})) == 0);
+        CHECK(load64(word) == 3);
         const auto t0 = std::chrono::steady_clock::now();
-        while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
-            std::this_thread::yield();
+        while (load64(word) < 4 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
         }
-        const float next = 222.0f;
-        CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
-        reused = true;
-    });
-    CHECK(!reused && load64(word) == 0 && hr(fx.vcall(fence, Slot::GetCompletedValue)) == 0);
-    scene.record(fx.thread, list);
-    size_t mark = fx.captured.size();
-    scene.execute({list});  // frame N+1
-    CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
-    present();  // frame N+1 presented: 1 is published
-    poller.join();
-    CHECK(reused && load64(word) == 1);
-    CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(load64(word) == 4 && counter(dev, dg::xbox::Counter::FencePublishesByCap) == 1);
+        CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(20));
 
-    // 2. A thread blocking on a value it later satisfies itself (CPU waits on the executed value):
-    // no deadlock, and the wait publishes the value at once (no present needed).
-    std::atomic<bool> woke{false};
-    std::thread blocker([&] {
-        CHECK(hr(fx.vcall_on(worker, fence, Slot::SetEventOnCompletion, {I(2), I(0)})) == 0);
-        woke = true;
-    });
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    CHECK(!woke);
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
-    blocker.join();
-    CHECK(woke && load64(word) == 2 && counter(dev, dg::xbox::Counter::FencePublishesByWait) >= 1);
-
-    // 3. The cap publishes with no presents.
-    CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
-    CHECK(load64(word) == 2);
-    const auto t0 = std::chrono::steady_clock::now();
-    while (load64(word) < 3 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        destroy_guest_thread(fx.arena, worker);
+        CHECK(t_balanced);
+        scene.release_all({list, fence});
     }
-    CHECK(load64(word) == 3 && counter(dev, dg::xbox::Counter::FencePublishesByCap) == 1);
-    CHECK(std::chrono::steady_clock::now() - t0 >= std::chrono::milliseconds(50));
 
-    destroy_guest_thread(fx.arena, worker);
-    CHECK(t_balanced);
-    scene.release_all({list, fence});
+    // Part B: configurable override `fence_publish_lag_frames = 2` (conservative 2-present lag).
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = true;
+        options.fence_publish_lag_frames = 2;
+        options.fence_publish_cap_ms = 500;
+        dx::set_device_options(options);
+        Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
+        dg::Device* dev = host_device(scene.device);
+        CHECK(dev->fence_publish_lag() && dev->fence_publish_lag_frames() == 2);
+        const uint64_t list = scene.new_list();
+        const uint32_t vb_id = object_of<dg::Resource>(scene.vb)->id();
+        auto uploaded_first = [&](const std::vector<Packet>& ps) {
+            float v = std::numeric_limits<float>::quiet_NaN();
+            for (const Packet& p : ps) {
+                if (p.opcode == GpuOpcode::WriteBuffer && payload_as<GpuWriteBufferPayload>(p).id == vb_id &&
+                    payload_as<GpuWriteBufferPayload>(p).dst_offset == 0) {
+                    v = payload_as<float>(p, sizeof(GpuWriteBufferPayload));
+                }
+            }
+            return v;
+        };
+        const uint64_t rt_slot = put<uint64_t>(scene.rt);
+        auto present = [&] {
+            dg::xbox::GuestPresentPlaneX plane{};
+            plane.ResourceCount = 1;
+            plane.ppResources = rt_slot;
+            CHECK(hr(fx.vcall(scene.queue, Slot::PresentX, {I(1), I(put(plane)), I(0)})) == 0);
+        };
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(word != 0 && load64(word) == 0);
+
+        std::atomic<bool> reused{false};
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);  // frame N
+        present();  // frame N presented (epoch 0 -> 1): held under lag_frames = 2
+        const float data = 111.0f;
+        CHECK(com::write_guest(scene.vb_cpu, &data, sizeof(data)));
+        std::thread poller([&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (load64(word) < 1 && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+                std::this_thread::yield();
+            }
+            const float next = 222.0f;
+            CHECK(com::write_guest(scene.vb_cpu, &next, sizeof(next)));
+            reused = true;
+        });
+        CHECK(!reused && load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);
+        scene.record(fx.thread, list);
+        size_t mark = fx.captured.size();
+        scene.execute({list});  // frame N+1
+        CHECK(uploaded_first(packets_since(fx, mark)) == 111.0f);
+        present();  // frame N+1 presented (epoch 1 -> 2): 1 is published
+        poller.join();
+        CHECK(reused && load64(word) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishLagFrames) == 2);
+
+        CHECK(t_balanced);
+        scene.release_all({list, fence});
+    }
+
+    // Part C: configurable override `fence_publish_lag_frames = 0` publishes immediately at issue.
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = true;
+        options.fence_publish_lag_frames = 0;
+        dx::set_device_options(options);
+        const uint64_t device = fx.create_device();
+        dg::Device* dev = host_device(device);
+        CHECK(!dev->fence_publish_lag() && dev->fence_publish_lag_frames() == 0);
+        int32_t result = -1;
+        const uint64_t queue =
+            fx.create(device, Slot::CreateCommandQueue, {I(put(dg::GuestCommandQueueDesc{}))}, dg::IID_ID3D12CommandQueue, &result);
+        CHECK(result == 0 && queue != 0);
+        const uint64_t fence = fx.create(device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        CHECK(result == 0 && fence != 0);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(word != 0 && load64(word) == 0);
+        CHECK(hr(fx.vcall(queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(load64(word) == 1 && fx.vcall(fence, Slot::GetCompletedValue) == 1);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByPresent) == 0);
+        CHECK(counter(dev, dg::xbox::Counter::FencePublishesByCap) == 0);
+        fx.vcall(fence, Slot::Release);
+        fx.vcall(queue, Slot::Release);
+        fx.vcall(device, Slot::Release);
+        CHECK(t_balanced);
+    }
 }
 
 void test_present_alternating_back_buffers() {
@@ -3045,6 +3323,13 @@ void test_xbox_unaligned_constant_buffers() {
         }
     }
     CHECK(small_writes == 1);
+    // O36: per-draw VAs (a ring of constants) must not grow the table; evicted homes are reused.
+    for (uint64_t sz = 1; sz <= 9500; ++sz) {
+        uint32_t bid = 0;
+        uint64_t boff = 0;
+        CHECK(dev->relocate_uniform(scene.vb_va + 16, sz, sz, &bid, &boff));
+        CHECK(dev->relocated_uniform_count() <= 8192);
+    }
 
     CHECK(t_balanced);
     scene.release_all({list, heap});
@@ -3526,7 +3811,7 @@ void test_stage_reflection_join() {
     const std::vector<uint8_t> pack = wgpk({{vs_good_key, 1}, {vs_bad_key, 1}, {ps_key, 2}});
     CHECK(playgta6::gpu::parse_shader_pack_index(pack.data(), pack.size(), index.get(), &error));
     // The good vertex stage reads 2 floats inside POSITION (R32G32B32_FLOAT at offset 0) at
-    // @location(3); the bad one reads past the element. Neither stage binds anything (the scene's
+    // @location(3); the bad one reads inside it without a fetch_format (an uncovered offset would default). Neither stage binds anything (the scene's
     // root signature is empty).
     const std::string json = "{\"schema\": \"playgta6-stage-reflection\", \"version\": 1, \"stages\": {\"" +
                              playgta6::gpu::pack_key_code(vs_good_key) +
@@ -3535,7 +3820,7 @@ void test_stage_reflection_join() {
                              "\"fetch_format\": \"float32x2\"}]}, \"" +
                              playgta6::gpu::pack_key_code(vs_bad_key) +
                              "\": {\"stage\": \"vertex\", \"vertex_inputs\": [{\"location\": 0, \"vb_slot\": 0, "
-                             "\"byte_offset\": 40, \"components\": 2, \"component_type\": \"f32\"}]}, \"" +
+                             "\"byte_offset\": 4, \"components\": 2, \"component_type\": \"f32\"}]}, \"" +
                              playgta6::gpu::pack_key_code(ps_key) + "\": {\"stage\": \"fragment\", \"bindings\": []}}}";
     auto reflection = std::make_shared<playgta6::gpu::StageReflectionIndex>();
     CHECK(playgta6::gpu::parse_stage_reflection_json(json, reflection.get(), &error));
@@ -4387,6 +4672,33 @@ void test_xbox_wait_frame_event_monotonic_tokens() {
         prev = tok;
     }
 
+    CHECK(t_balanced);
+    scene.release_all();
+}
+
+// ScheduleFrameEventX with an event handle signals it at every pacer tick; a timed-out
+// WaitFrameEventX returns S_FALSE (not a failure) with a token.
+void test_xbox_schedule_frame_event_signals_handle() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    namespace w = playgta6::os::win32;
+    const w::Handle ev = w::CreateEventW(nullptr, false, false, nullptr);
+    CHECK(ev != 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(2000), I(1), I(0)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::ScheduleFrameEvent, {I(0), I(100), I(ev), I(0)})) == 0);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(w::WaitForSingleObject(ev, 500) == w::WAIT_OBJECT_0);
+    }
+
+    // 100 ms interval, 1 ms timeout: the ORIGIN wait times out.
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(100000), I(1), I(0)})) == 0);
+    const uint64_t tok_va = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(1), I(0), I(0), I(tok_va)})) == dg::kSFalse);
+    CHECK(load64(tok_va) != 0);
+
+    dev->shutdown_frame_events();
+    w::CloseHandle(ev);
     CHECK(t_balanced);
     scene.release_all();
 }
@@ -5979,6 +6291,530 @@ void test_window_write_marks_flush() {
     playgta6::os::set_write_tracking(true);
 }
 
+// G68 (#663): window write-mark early-out, shared MarkPass with CPU buffers, cross-submission
+// dirty propagation, verify-mode miss detection, and in-place hashing / zero-copy staging for
+// tightly-packed 256B-aligned linear textures (such as 4K Bink2 Y/U/V planes).
+void test_window_texture_sync_markpass_and_inplace_hash() {
+    namespace gw = playgta6::os::guest_window;
+    namespace xw = playgta6::os::xmem_windows;
+    namespace sc = playgta6::os::scarlett;
+    constexpr uint64_t k64K = 64ull << 10, k16G = 16ull << 30;
+    constexpr uint32_t kType = 0x20402000u;
+    constexpr uint32_t kW = 256, kH = 192;  // 3 bands of 64 rows, 256B-aligned R8_UNORM (48 KiB)
+    constexpr uint32_t kDxgiR8Unorm = 61;
+
+    playgta6::os::set_write_tracking(false);
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x21u, 0x4u);
+    void* gpu = pg6_xbox_XMemVirtualAlloc(nullptr, k16G, kType, 0x3u, 0x801u);
+    const uint64_t C = playgta6::os::win32::get_vmem_arena()->guest_address(cpu);
+    const uint64_t G = playgta6::os::win32::get_vmem_arena()->guest_address(gpu);
+    CHECK(C == gw::kWindowBase && xw::is_phantom(G, k16G));
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+    const uint64_t slots[] = {C + 4 * k64K, C + 5 * k64K};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(slots, 2, pfn) == 1);
+
+    auto decode_encoder = [](const gpu::CommandEncoder& enc) {
+        std::vector<Packet> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            out.push_back(std::move(p));
+        }
+        CHECK(off == enc.size());
+        return out;
+    };
+    auto write_texture_packets = [&](const gpu::CommandEncoder& enc, uint32_t tex_id) {
+        std::vector<Packet> out;
+        for (const Packet& p : decode_encoder(enc)) {
+            if (p.opcode == GpuOpcode::WriteTexture &&
+                payload_as<GpuWriteTexturePayload>(p).texture_id == tex_id) {
+                out.push_back(p);
+            }
+        }
+        return out;
+    };
+    auto write_buffer_packets = [&](const gpu::CommandEncoder& enc, uint32_t buf_id) {
+        std::vector<Packet> out;
+        for (const Packet& p : decode_encoder(enc)) {
+            if (p.opcode == GpuOpcode::WriteBuffer &&
+                payload_as<GpuWriteBufferPayload>(p).id == buf_id) {
+                out.push_back(p);
+            }
+        }
+        return out;
+    };
+
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        int32_t result = -1;
+
+        // Buffer and texture share 64 KiB slot 4: buffer at +0x0000 (4 KiB), texture at +0x2000 (48 KiB).
+        const uint64_t buf_gpu = G + 4 * k64K;
+        const uint64_t buf_cpu = C + 4 * k64K;
+        const uint64_t tex_gpu = G + 4 * k64K + 0x2000;
+        const uint64_t tex_cpu = C + 4 * k64K + 0x2000;
+
+        const uint64_t buf_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(buf_gpu), I(put(buffer_desc(0x1000))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0 && object_of<dg::Resource>(buf_obj)->cpu_address() == buf_cpu);
+        const uint32_t buf_id = object_of<dg::Resource>(buf_obj)->id();
+
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(tex_gpu), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x11u);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), pixels.size()));
+
+        // (a) Initial submission indexes and uploads the full 256x192 texture (and warms up buf).
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.width == kW && wt.height == kH && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + pixels.size());
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload), pixels.data(),
+                                  pixels.size()) == 0);
+            }
+        }
+
+        // Steady state: no slot marks -> skips immediately.
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // Unmarked direct mutation in band 1 (rows 64..127) must be skipped when marks are not verified,
+        // proving the write-mark early-out bypassed scanning/hashing.
+        auto* raw_tex = static_cast<uint8_t*>(gw::translate(tex_cpu));
+        CHECK(raw_tex != nullptr);
+        std::memset(raw_tex + size_t{64} * kW, 0x22u, size_t{64} * kW);
+        std::memset(pixels.data() + size_t{64} * kW, 0x22u, size_t{64} * kW);
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // (b) Marking the slot triggers re-upload of ONLY the changed 64-row band (band 1).
+        gw::mark_written(tex_cpu + size_t{64} * kW, size_t{64} * kW);
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 64 && wt.width == kW && wt.height == 64 && wt.bytes_per_row == kW);
+                CHECK(wts[0].payload.size() == sizeof(GpuWriteTexturePayload) + size_t{64} * kW);
+                CHECK(std::memcmp(wts[0].payload.data() + sizeof(GpuWriteTexturePayload),
+                                  pixels.data() + size_t{64} * kW, size_t{64} * kW) == 0);
+            }
+        }
+
+        // (c) Shared 64 KiB slot between buffer and texture in the same submission:
+        // writing both must notify BOTH flush_cpu_buffers and sync_bound_texture_memory via shared MarkPass.
+        const uint32_t buf_val = 0xCAFEBABEu;
+        CHECK(com::write_guest(buf_cpu + 0x100, buf_val));
+        std::memset(pixels.data(), 0x33u, size_t{64} * kW);
+        CHECK(com::write_guest(tex_cpu, pixels.data(), size_t{64} * kW));
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wbs = write_buffer_packets(buf_enc, buf_id);
+            CHECK(wbs.size() == 1);
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 0 && wt.height == 64);
+            }
+        }
+
+        // Cross-submission persistence: a submission that flushes buffers (clearing window marks)
+        // without binding `tex` must still leave `tex` dirty for the next submission that binds it.
+        std::memset(pixels.data() + size_t{128} * kW, 0x44u, size_t{64} * kW);
+        CHECK(com::write_guest(tex_cpu + size_t{128} * kW, pixels.data() + size_t{128} * kW, size_t{64} * kW));
+        {
+            gpu::CommandEncoder buf_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            dev->end_submission();
+        }
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+                CHECK(wt.origin_y == 128 && wt.height == 64);
+            }
+        }
+
+        // (d) In-place hash skips upload when a marked slot's content is unchanged.
+        CHECK(com::write_guest(tex_cpu, pixels.data(), size_t{64} * kW));  // same bytes, marks slot 4
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(!dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(write_texture_packets(tex_enc, tex_id).empty());
+        }
+
+        // Write-mark verification mode detects unmarked texture writes and still uploads them.
+        std::memset(raw_tex, 0x55u, size_t{64} * kW);
+        gw::set_write_marks_verified(true);
+        const uint64_t misses_before = gw::verify_misses();
+        {
+            gpu::CommandEncoder buf_enc, tex_enc;
+            dev->begin_submission();
+            dev->flush_cpu_buffers(buf_enc);
+            CHECK(dev->sync_bound_texture_memory(tex_id, tex_enc));
+            dev->end_submission();
+            CHECK(gw::verify_misses() == misses_before + 1);
+            const auto wts = write_texture_packets(tex_enc, tex_id);
+            CHECK(wts.size() == 1 && payload_as<GpuWriteTexturePayload>(wts[0]).origin_y == 0);
+        }
+        gw::set_write_marks_verified(false);
+
+        fx.vcall(tex_obj, Slot::Release);
+        fx.vcall(buf_obj, Slot::Release);
+        scene.release_all();
+    }
+
+    sc::xmem_reset_for_testing();
+    gw::reset_for_testing();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    playgta6::os::set_write_tracking(true);
+
+    // Non-window contiguous arena texture: in-place hash skips copy when unchanged and band-wise
+    // direct staging uploads only the modified band.
+    {
+        Fixture fx;
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t arena_mem = com::guest_alloc(size_t{kW} * kH);
+        CHECK(arena_mem != 0);
+        int32_t result = -1;
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(arena_mem), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x7Au);
+        CHECK(com::write_guest(arena_mem, pixels.data(), pixels.size()));
+        gpu::CommandEncoder e1, e2, e3;
+        CHECK(dev->sync_bound_texture_memory(tex_id, e1));
+        CHECK(write_texture_packets(e1, tex_id).size() == 1);
+        CHECK(!dev->sync_bound_texture_memory(tex_id, e2));
+        CHECK(write_texture_packets(e2, tex_id).empty());
+
+        std::memset(pixels.data() + size_t{64} * kW, 0x8Bu, size_t{64} * kW);
+        CHECK(com::write_guest(arena_mem + size_t{64} * kW, pixels.data() + size_t{64} * kW, size_t{64} * kW));
+        CHECK(dev->sync_bound_texture_memory(tex_id, e3));
+        const auto wts = write_texture_packets(e3, tex_id);
+        CHECK(wts.size() == 1);
+        if (wts.size() == 1) {
+            const auto wt = payload_as<GpuWriteTexturePayload>(wts[0]);
+            CHECK(wt.origin_y == 64 && wt.height == 64 && wt.bytes_per_row == kW);
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+        scene.release_all();
+    }
+}
+
+// G72 (#663): single-subresource linear textures whose tight row width is not 256B-aligned
+// (e.g., 4K Bink2 1920x1080 R8 U/V planes, or 300x192 R8) perform single-pass band hashing
+// directly over tight rows and lazily row-pad only changed runs into a 256B-aligned payload
+// with zeroed padding tails.
+void test_g72_non256_linear_texture_single_pass_and_lazy_pad() {
+    constexpr uint32_t kDxgiR8Unorm = 61;
+
+    auto decode_write_textures = [](const gpu::CommandEncoder& enc, uint32_t tex_id) {
+        std::vector<Packet> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            if (p.opcode == GpuOpcode::WriteTexture &&
+                payload_as<GpuWriteTexturePayload>(p).texture_id == tex_id) {
+                out.push_back(std::move(p));
+            }
+        }
+        CHECK(off == enc.size());
+        return out;
+    };
+
+    auto verify_padded_rows = [](const Packet& pkt, uint32_t expected_origin_y, uint32_t width,
+                                 uint32_t expected_height, uint32_t expected_pitch,
+                                 const std::vector<uint8_t>& full_src) {
+        const auto wt = payload_as<GpuWriteTexturePayload>(pkt);
+        CHECK(wt.origin_x == 0 && wt.origin_y == expected_origin_y && wt.origin_z == 0);
+        CHECK(wt.width == width && wt.height == expected_height && wt.depth_or_layers == 1);
+        CHECK(wt.bytes_per_row == expected_pitch && wt.rows_per_image == expected_height);
+        const size_t expected_len = size_t{expected_height} * expected_pitch;
+        CHECK(wt.data_len == expected_len);
+        CHECK(pkt.payload.size() == sizeof(GpuWriteTexturePayload) + expected_len);
+        if (pkt.payload.size() != sizeof(GpuWriteTexturePayload) + expected_len) {
+            return;
+        }
+        const uint8_t* dst = pkt.payload.data() + sizeof(GpuWriteTexturePayload);
+        const std::vector<uint8_t> zeros(expected_pitch - width, 0u);
+        for (uint32_t r = 0; r < expected_height; ++r) {
+            const uint8_t* dst_row = dst + size_t{r} * expected_pitch;
+            const uint8_t* src_row = full_src.data() + size_t{expected_origin_y + r} * width;
+            if (std::memcmp(dst_row, src_row, width) != 0) {
+                CHECK(false);
+                return;
+            }
+            if (std::memcmp(dst_row + width, zeros.data(), zeros.size()) != 0) {
+                CHECK(false);
+                return;
+            }
+        }
+    };
+
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+
+    // 1) 300x192 R8_UNORM (row_bytes = 300, row_pitch = 512, 3 bands of 64 rows).
+    {
+        constexpr uint32_t kW = 300, kH = 192, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kW} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH);
+        for (uint32_t y = 0; y < kH; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                pixels[size_t{y} * kW + x] = static_cast<uint8_t>(((y * 7u + x * 3u) & 0xFEu) | 1u);
+            }
+        }
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+
+        // Initial full upload: exact pixels + zeroed padding tail [300..512).
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 0, kW, kH, kPitch, pixels);
+            }
+        }
+
+        // Unchanged: skips completely.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+
+        // Partial band update: modify ONLY rows 64..127 (band 1).
+        for (uint32_t y = 64; y < 128; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                pixels[size_t{y} * kW + x] = static_cast<uint8_t>(0xA0u ^ ((y + x) & 0x3Fu));
+            }
+        }
+        CHECK(com::write_guest(mem + size_t{64} * kW, pixels.data() + size_t{64} * kW, size_t{64} * kW));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 64, kW, 64, kPitch, pixels);
+            }
+        }
+
+        // Re-sync after partial update: unchanged -> skips.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+
+        // Non-adjacent band update (band 0 + band 2, band 1 untouched): 2 separate WriteTexture packets.
+        std::memset(pixels.data(), 0x5Au, size_t{64} * kW);
+        std::memset(pixels.data() + size_t{128} * kW, 0xC3u, size_t{64} * kW);
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 2);
+            if (wts.size() == 2) {
+                verify_padded_rows(wts[0], 0, kW, 64, kPitch, pixels);
+                verify_padded_rows(wts[1], 128, kW, 64, kPitch, pixels);
+            }
+        }
+
+        // Multi-band full update: all 3 bands modified -> coalesces into 1 WriteTexture covering all 192 rows.
+        for (size_t i = 0; i < pixels.size(); ++i) {
+            pixels[i] = static_cast<uint8_t>((i * 17u + 9u) | 1u);
+        }
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 0, kW, kH, kPitch, pixels);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    // 2) 4K Bink2 U/V plane dimensions: 1920x1080 R8_UNORM (row_bytes = 1920, row_pitch = 2048,
+    //    16 full 64-row bands + 1 trailing 56-row band).
+    {
+        constexpr uint32_t kW = 1920, kH = 1080, kPitch = 2048;
+        const uint64_t mem = com::guest_alloc(size_t{kW} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH);
+        for (uint32_t y = 0; y < kH; ++y) {
+            std::memset(pixels.data() + size_t{y} * kW, static_cast<uint8_t>((y & 0x7Fu) | 0x80u), kW);
+            pixels[size_t{y} * kW] = static_cast<uint8_t>(y & 0xFFu);
+            pixels[size_t{y} * kW + (kW - 1u)] = static_cast<uint8_t>((y ^ 0x55u) & 0xFFu);
+        }
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 0, kW, kH, kPitch, pixels);
+            }
+        }
+
+        // Mutate only the trailing short band (rows 1024..1079, height 56).
+        for (uint32_t y = 1024; y < kH; ++y) {
+            std::memset(pixels.data() + size_t{y} * kW, static_cast<uint8_t>(0x33u + (y - 1024u)), kW);
+        }
+        CHECK(com::write_guest(mem + size_t{1024} * kW, pixels.data() + size_t{1024} * kW,
+                               size_t{kH - 1024u} * kW));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 1024, kW, kH - 1024u, kPitch, pixels);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    // 3) Single-band non-256B linear texture (300x48 R8_UNORM, blocks_y <= kUploadBandRows).
+    {
+        constexpr uint32_t kW = 300, kH = 48, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kW} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(texture_desc(kW, kH, kDxgiR8Unorm, 0))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> pixels(size_t{kW} * kH, 0x6Du);
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 0, kW, kH, kPitch, pixels);
+            }
+        }
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+        pixels[10 * kW + 17] = 0xE5u;
+        CHECK(com::write_guest(mem, pixels.data(), pixels.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_padded_rows(wts[0], 0, kW, kH, kPitch, pixels);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    scene.release_all();
+}
+
 // R40: native CPU-window pages are shared page views (O36), which carry no MEM_WRITE_WATCH: their
 // writes are tracked by write protection (os::take_written_pages). After the first flush only
 // pages written since are compared and uploaded, including writes through another address of the
@@ -6094,6 +6930,8 @@ int main() {
     test_same_bytes();
     test_compare_shadow_pages();
     test_window_write_marks_flush();
+    test_window_texture_sync_markpass_and_inplace_hash();
+    test_g72_non256_linear_texture_single_pass_and_lazy_pad();
     test_shared_view_write_tracking_flush();
     test_export_registration();
     test_create_device();
@@ -6107,6 +6945,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_gpu_readback();
     test_a8_upload_widened();
     test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();
@@ -6136,6 +6975,7 @@ int main() {
     test_xbox_compute_pipeline_dump_and_pack_resolve();
     test_slot70_71_address_texture_view_registry();
     test_xbox_wait_frame_event_monotonic_tokens();
+    test_xbox_schedule_frame_event_signals_handle();
     test_g49c_default_detile_rgba8_and_bc7();
     test_g49c_slot70_address_texture_draw();
     test_g49c_raw_tsharp_descriptor_memory_draw();

@@ -17,6 +17,7 @@ import CrashReporterDefault, {
   classifyBootError,
   formatGitHubIssueMarkdown,
   formatMarkdownReport,
+  formatTextReport,
 } from '../web/telemetry/crash_report.js';
 import { PerfMonitor } from '../web/telemetry/perf_monitor.js';
 
@@ -1999,4 +2000,350 @@ test('W247 formatMarkdownReport and formatGitHubIssueMarkdown render sanitized g
   for (const forbidden of ['alice', 'bob', 'topsecret', 'iris_dri.so', 'audio.rpf']) {
     assert.ok(!rawMd.includes(forbidden), `Raw formatMarkdownReport leaked "${forbidden}"`);
   }
+});
+
+test('W335 bounded fault deduplication tracks count/firstSeenMs/lastSeenMs and caps heap under high-frequency bursts', () => {
+  const clock = createDeterministicClock(1700010000000);
+  const reporter = new CrashReporter({ maxErrors: 4, maxLogs: 5, now: clock.now });
+
+  // 1. High-frequency identical GPU validation burst collapses into a single entry
+  const firstGpu = reporter.recordError('webgpu_validation', 'Bind group 2 buffer size too small');
+  assert.equal(firstGpu.count, 1);
+  assert.equal(firstGpu.occurrences, 1);
+  assert.equal(firstGpu.firstSeenMs, 1700010000000);
+  assert.equal(firstGpu.lastSeenMs, 1700010000000);
+  assert.equal(firstGpu.firstSeenAtMs, 1700010000000);
+  assert.equal(firstGpu.lastSeenAtMs, 1700010000000);
+
+  for (let i = 0; i < 4999; i += 1) {
+    clock.advance(1);
+    reporter.recordError('webgpu_validation', 'Bind group 2 buffer size too small');
+  }
+  assert.equal(reporter.errorCount, 1);
+  assert.equal(reporter.recordedErrorCount, 5000);
+  assert.equal(reporter.coalescedCount, 4999);
+
+  const [burstEntry] = reporter.getErrors();
+  assert.equal(burstEntry.count, 5000);
+  assert.equal(burstEntry.occurrences, 5000);
+  assert.equal(burstEntry.firstSeenMs, 1700010000000);
+  assert.equal(burstEntry.lastSeenMs, 1700010004999);
+  assert.equal(burstEntry.firstSeenAtMs, burstEntry.firstSeenMs);
+  assert.equal(burstEntry.lastSeenAtMs, burstEntry.lastSeenMs);
+
+  // 2. Flood distinct faults past maxErrors — ring and internal dedup map stay strictly capped
+  for (let i = 0; i < 50; i += 1) {
+    clock.advance(2);
+    reporter.recordError('io_error', `HTTPFS chunk timeout #${i}`);
+    clock.advance(1);
+    reporter.recordError('io_error', `HTTPFS chunk timeout #${i}`);
+  }
+  assert.equal(reporter.errorCount, 4);
+  assert.equal(reporter._errorIndex.size, 4);
+  assert.equal(reporter.recordedErrorCount, 5100);
+  assert.equal(reporter.coalescedCount, 5049);
+
+  const retained = reporter.getErrors();
+  assert.deepEqual(
+    retained.map((e) => e.message),
+    [
+      'HTTPFS chunk timeout #46',
+      'HTTPFS chunk timeout #47',
+      'HTTPFS chunk timeout #48',
+      'HTTPFS chunk timeout #49',
+    ]
+  );
+  for (const entry of retained) {
+    assert.equal(entry.count, 2);
+    assert.equal(entry.occurrences, 2);
+    assert.equal(entry.lastSeenMs - entry.firstSeenMs, 1);
+  }
+
+  // 3. Re-recording evicted GPU fault starts a fresh entry (count === 1)
+  clock.advance(10);
+  const reseen = reporter.recordError('webgpu_validation', 'Bind group 2 buffer size too small');
+  assert.equal(reseen.count, 1);
+  assert.equal(reseen.firstSeenMs, clock.now());
+  assert.equal(reseen.lastSeenMs, clock.now());
+  assert.equal(reporter.errorCount, 4);
+  assert.equal(reporter._errorIndex.size, 4);
+
+  // 4. Oversized error messages, stacks, and logs are clipped to bounded lengths after sanitization
+  const hugeErr = new Error(`Path C:\\Users\\alice\\secret.bin ${'X'.repeat(10000)}`);
+  hugeErr.stack = `Error: boom\n${'    at fn (/home/bob/app.js:1:1)\n'.repeat(1000)}`;
+  const clippedErr = reporter.recordError('runtime', hugeErr);
+  assert.ok(clippedErr.message.length <= 4096);
+  assert.ok(clippedErr.stack.length <= 16384);
+  assert.ok(!clippedErr.message.includes('alice'));
+  assert.ok(!clippedErr.stack.includes('bob'));
+
+  const clippedLog = reporter.recordLog('warn', 'worker', `Leak /Users/charlie/a.bin ${'Y'.repeat(10000)}`);
+  assert.ok(clippedLog.message.length <= 4096);
+  assert.ok(!clippedLog.message.includes('charlie'));
+
+  // 5. Classified errors in buildReport() also mirror count / firstSeenMs / lastSeenMs
+  const report = reporter.buildReport();
+  assert.equal(report.bootDiagnostics.classifiedErrors.length, 4);
+  const gpuClassified = report.bootDiagnostics.classifiedErrors.find(
+    (e) => e.errorCategory === 'webgpu_validation'
+  );
+  assert.ok(gpuClassified);
+  assert.equal(gpuClassified.count, 1);
+  assert.equal(gpuClassified.firstSeenMs, reseen.firstSeenMs);
+  assert.equal(gpuClassified.lastSeenMs, reseen.lastSeenMs);
+});
+
+test('W335 strict adversarial host-path, UNC, file://, username, and token sanitization across JSON, Markdown, and text exports', () => {
+  const clock = createDeterministicClock(1700011000000);
+  const reporter = new CrashReporter({ appVersion: '0.6.0-w335', now: clock.now });
+
+  // Quoted UNC paths with spaces, extended UNC device paths, JSON-escaped UNC paths, and forward-slash UNC paths
+  assert.equal(
+    sanitizeString('Opened "\\\\fileserver\\Shared Drives\\Alice Smith\\GTA6\\dump.bin"'),
+    'Opened "[REDACTED_PATH]"'
+  );
+  assert.equal(
+    sanitizeString('Extended "\\\\?\\UNC\\nas01\\Team Share\\Bob Jones\\chunk.rpf:12:4"'),
+    'Extended "[REDACTED_PATH]:12:4"'
+  );
+  assert.equal(
+    sanitizeString('JSON {"unc":"\\\\\\\\fileserver\\\\private\\\\alice\\\\dump.bin"}'),
+    'JSON {"unc":"[REDACTED_PATH]"}'
+  );
+  assert.equal(
+    sanitizeString('Mirror //fileserver/private/alice/dump.bin failed'),
+    'Mirror [REDACTED_PATH] failed'
+  );
+  assert.equal(
+    sanitizeString('Quoted "//nas02/My Share/Charlie Brown/game.xvd"'),
+    'Quoted "[REDACTED_PATH]"'
+  );
+
+  // Quoted file:// URLs with spaces & unquoted file:// UNC / localhost URLs
+  assert.equal(
+    sanitizeString('Loaded "file:///C:/Users/Alice Smith/GTA6/loader.js:42:10"'),
+    'Loaded "[REDACTED_FILE_URL]:42:10"'
+  );
+  assert.equal(
+    sanitizeString('Origin file://fileserver/share/bob/index.html failed'),
+    'Origin [REDACTED_FILE_URL] failed'
+  );
+
+  // Lowercase POSIX /users/, /wsl.localhost/, /c/users/, quoted tilde with spaces
+  const posixAdversarial = sanitizeString(
+    'Failed in /users/alice/local.bin and /wsl.localhost/Ubuntu/home/bob/data and /c/users/charlie/x.exe and "~/My Docs/dave/key.pem"'
+  );
+  for (const leaked of ['alice', 'bob', 'charlie', 'dave', 'local.bin', 'My Docs', 'key.pem']) {
+    assert.ok(!posixAdversarial.includes(leaked), `Leaked "${leaked}" in: ${posixAdversarial}`);
+  }
+
+  // URL userinfo without password (https://alice@host, smb://bob@nas), inline username/homedir, PEM key, bare tokens
+  assert.equal(
+    sanitizeString('Fetch https://alice@proxy.local/api and smb://bob:pass@nas/share'),
+    'Fetch https://[REDACTED]@proxy.local/api and smb://[REDACTED]@nas/share'
+  );
+  const tokenAdversarial = sanitizeString(
+    'username=alice_admin user_name="Bob Smith" homedir=/home/alice ' +
+      'aws=ASIAIOSFODNN7EXAMPLE slack=xoxb-1234567890-abcdef123456 ' +
+      'google=AIzaSyA1234567890abcdefghijklmnopqrstuvw ' +
+      'key=sk-proj-1234567890abcdefghijklmnop ' +
+      '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAsecretkeydata\n-----END RSA PRIVATE KEY-----'
+  );
+  for (const leaked of [
+    'alice_admin',
+    'Bob Smith',
+    'alice',
+    'ASIAIOSFODNN7EXAMPLE',
+    'xoxb-1234567890-abcdef123456',
+    'AIzaSyA1234567890abcdefghijklmnopqrstuvw',
+    'sk-proj-1234567890abcdefghijklmnop',
+    'MIIEpAIBAAKCAQEAsecretkeydata',
+  ]) {
+    assert.ok(!tokenAdversarial.includes(leaked), `Leaked "${leaked}" in: ${tokenAdversarial}`);
+  }
+
+  // Benign HTTP URLs, app routes, hex VAs, instruction offsets, and shader hashes remain intact
+  const safePreserved =
+    'GET https://localhost:8080/api/status route=/game/boot.pgim guestVa=0x140045678 offset=+0x2c hash=0x123456789abcdef0';
+  assert.equal(sanitizeString(safePreserved), safePreserved);
+  assert.equal(sanitizeString(posixAdversarial), posixAdversarial);
+  assert.equal(sanitizeString(tokenAdversarial), tokenAdversarial);
+
+  // Full end-to-end leak test across JSON, Markdown, and plain-text crash reports
+  reporter.recordLog('error', 'httpfs', 'UNC "\\\\nas01\\Private Share\\Alice Smith\\boot.pgim" username=alice_admin');
+  reporter.recordError(
+    'io_error',
+    new Error('Failed file:///C:/Users/Alice%20Smith/GTA6/a.rpf via https://bob@proxy.local/r?token=tok999'),
+    {
+      username: 'alice_admin',
+      homedir: '/Users/alice_admin',
+      uncPath: '//fileserver/private/charlie/dump.bin',
+      github_token: 'ghp_1234567890abcdef1234567890abcdef',
+      guestVa: '0x140012340',
+    }
+  );
+
+  const jsonOut = reporter.toJson({ extra: { os_user: 'dave_host', local: '\\\\nas\\share\\dave\\x.bin' } });
+  const mdOut = reporter.toGitHubIssueMarkdown();
+  const txtOut = reporter.toText({ maxLogs: 5 });
+
+  // Plain text report includes count/firstSeenMs/lastSeenMs and preserves safe guestVa / app version
+  assert.ok(txtOut.startsWith('PlayGTA6Web Sanitized Crash Report'));
+  assert.ok(txtOut.includes('app=0.6.0-w335'));
+  assert.ok(txtOut.includes('x1 [firstSeenMs=1700011000000 lastSeenMs=1700011000000]'));
+  assert.equal(formatTextReport(reporter, { maxLogs: 5 }), txtOut);
+
+  const combined = `${jsonOut}\n${mdOut}\n${txtOut}`;
+  for (const forbidden of [
+    'Alice',
+    'alice_admin',
+    'bob',
+    'charlie',
+    'dave_host',
+    'nas01',
+    'fileserver',
+    'file://',
+    'tok999',
+    'ghp_1234567890abcdef1234567890abcdef',
+    'Private Share',
+  ]) {
+    assert.ok(!combined.includes(forbidden), `Export leaked forbidden token "${forbidden}"`);
+  }
+  assert.ok(jsonOut.includes('0x140012340'));
+});
+
+test('W335 optional 30 FPS frame-budget (presentFpsAvg, budgetCompliancePct) and boot-phase context snapshots', () => {
+  const clock = createDeterministicClock(1700012000000);
+  const reporter = new CrashReporter({ appVersion: '0.6.0-w335', now: clock.now });
+
+  // 1. Default state is null and backwards compatible when unset
+  assert.equal(reporter.getBootPhase(), null);
+  assert.equal(reporter.getBootPhaseContext(), null);
+  assert.equal(reporter.getFrameBudget(), null);
+  const emptyReport = reporter.buildReport();
+  assert.equal(emptyReport.schemaVersion, SCHEMA_VERSION);
+  assert.equal(emptyReport.bootDiagnostics.bootPhase, null);
+  assert.equal(emptyReport.bootDiagnostics.bootPhaseContext, null);
+  assert.equal(emptyReport.bootDiagnostics.presentFpsAvg, null);
+  assert.equal(emptyReport.bootDiagnostics.budgetCompliancePct, null);
+  assert.equal(emptyReport.bootDiagnostics.frameBudget, null);
+
+  // 2. setBootPhase accepts object context with strict allowlisting & sanitization, and tags recorded faults
+  const storedPhaseCtx = reporter.setBootPhase({
+    phase: 'loading_assets',
+    stage: 'PGIM_LOAD',
+    mode: 'real-wasm',
+    progressPct: 62.5,
+    elapsedMs: 1850,
+    phaseElapsedMs: 640,
+    readyForSplash: false,
+    // Disallowed keys that must be dropped
+    hostPath: 'C:\\Users\\alice\\GTA6',
+    rawMem: new Uint8Array([1, 2, 3]),
+    token: 'secret-phase-token',
+  });
+  assert.equal(reporter.getBootPhase(), 'loading_assets');
+  assert.deepEqual(storedPhaseCtx, {
+    phase: 'loading_assets',
+    stage: 'PGIM_LOAD',
+    mode: 'real-wasm',
+    progressPct: 62.5,
+    elapsedMs: 1850,
+    phaseElapsedMs: 640,
+    readyForSplash: false,
+  });
+  assert.equal('hostPath' in storedPhaseCtx, false);
+  assert.equal('rawMem' in storedPhaseCtx, false);
+  assert.equal('token' in storedPhaseCtx, false);
+
+  const taggedFault = reporter.recordError('io_error', 'PGIM segment retry');
+  assert.equal(taggedFault.bootPhase, 'loading_assets');
+
+  // 3. setFrameBudget accepts explicit presentFpsAvg & budgetCompliancePct and strips unknown/secret fields
+  const storedBudget = reporter.setFrameBudget({
+    presentFpsAvg: 29.42,
+    budgetCompliancePct: 94.5,
+    targetFps: 30,
+    budgetMs: 33.333,
+    framesWithinBudget: 189,
+    framesOverBudget: 11,
+    onePercentLowFps: 24.8,
+    p95FrameMs: 32.1,
+    p99FrameMs: 40.32,
+    dominantBottleneck: 'shader_compile_bound',
+    // Disallowed keys that must be dropped
+    wgslSource: 'secret-shader',
+    frameBuf: new ArrayBuffer(64),
+    userDir: '/home/bob/gta6',
+  });
+  assert.deepEqual(storedBudget, {
+    presentFpsAvg: 29.42,
+    budgetCompliancePct: 94.5,
+    targetFps: 30,
+    budgetMs: 33.333,
+    framesWithinBudget: 189,
+    framesOverBudget: 11,
+    onePercentLowFps: 24.8,
+    p95FrameMs: 32.1,
+    p99FrameMs: 40.32,
+    dominantBottleneck: 'shader_compile_bound',
+  });
+
+  const report = reporter.buildReport();
+  assert.equal(report.bootDiagnostics.bootPhase, 'loading_assets');
+  assert.equal(report.bootDiagnostics.bootPhaseContext.stage, 'PGIM_LOAD');
+  assert.equal(report.bootDiagnostics.presentFpsAvg, 29.42);
+  assert.equal(report.bootDiagnostics.budgetCompliancePct, 94.5);
+  assert.equal(report.bootDiagnostics.frameBudget.dominantBottleneck, 'shader_compile_bound');
+
+  const md = reporter.toGitHubIssueMarkdown();
+  assert.ok(md.includes('phase=`loading_assets`'));
+  assert.ok(md.includes('presentFpsAvg=`29.42`'));
+  assert.ok(md.includes('budgetCompliancePct=94.5%'));
+  assert.ok(md.includes('bottleneck=`shader_compile_bound`'));
+
+  const txt = reporter.toText();
+  assert.ok(txt.includes('phase=loading_assets'));
+  assert.ok(txt.includes('presentFpsAvg=29.42'));
+  assert.ok(txt.includes('budgetCompliancePct=94.5%'));
+
+  for (const forbidden of ['alice', 'bob', 'secret-phase-token', 'secret-shader']) {
+    assert.ok(!md.includes(forbidden));
+    assert.ok(!txt.includes(forbidden));
+  }
+
+  // 4. Per-call overrides do not mutate stored state and clamp budgetCompliancePct to [0, 100]
+  const overrideReport = reporter.buildReport({
+    bootPhase: 'gameplay',
+    presentFpsAvg: 30.0,
+    budgetCompliancePct: 125.5,
+  });
+  assert.equal(overrideReport.bootDiagnostics.bootPhase, 'gameplay');
+  assert.equal(overrideReport.bootDiagnostics.presentFpsAvg, 30);
+  assert.equal(overrideReport.bootDiagnostics.budgetCompliancePct, 100);
+  assert.equal(reporter.getBootPhase(), 'loading_assets');
+  assert.equal(reporter.getFrameBudget().presentFpsAvg, 29.42);
+
+  // 5. Seamless derivation from PerfMonitor instance without explicit setFrameBudget / setBootPhase
+  reporter.clear();
+  assert.equal(reporter.getBootPhase(), null);
+  assert.equal(reporter.getBootPhaseContext(), null);
+  assert.equal(reporter.getFrameBudget(), null);
+
+  const perf = new PerfMonitor({ windowSize: 10, targetFps: 30, initialPhase: 'gameplay', now: clock.now });
+  perf.recordFrameTimeMs(20.0); // within 33.333ms budget
+  perf.recordFrameTimeMs(25.0); // within budget
+  perf.recordFrameTimeMs(30.0); // within budget
+  perf.recordFrameTimeMs(45.0, { gpuMs: 35.0, cpuMs: 10.0 }); // over budget -> 3/4 = 75% compliance
+
+  const perfDerivedReport = reporter.buildReport({ perfSnapshot: perf });
+  assert.equal(perfDerivedReport.bootDiagnostics.bootPhase, 'gameplay');
+  assert.equal(perfDerivedReport.bootDiagnostics.presentFpsAvg, 33.33); // 1000 / 30ms avg = 33.33 FPS
+  assert.equal(perfDerivedReport.bootDiagnostics.budgetCompliancePct, 75);
+  assert.equal(perfDerivedReport.bootDiagnostics.frameBudget.targetFps, 30);
+  assert.equal(perfDerivedReport.bootDiagnostics.frameBudget.dominantBottleneck, 'gpu_bound');
+
+  // Raw binary buffers rejected safely
+  assert.equal(reporter.setBootPhase(new Uint8Array([1, 2])), null);
+  assert.equal(reporter.setFrameBudget(new ArrayBuffer(16)), null);
 });
