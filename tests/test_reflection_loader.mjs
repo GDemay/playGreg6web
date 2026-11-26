@@ -10,10 +10,23 @@ const {
   LAYOUT_MANIFEST_SCHEMA_VERSION,
   STAGE_REFLECTION_SCHEMA,
   STAGE_REFLECTION_VERSION,
+  STAGE_REFLECTION_MIN_VERSION,
+  STAGE_REFLECTION_VERSION_ROOT_TABLE_OFFSET,
+  STAGE_REFLECTION_VERSION_UNRESOLVED,
+  STAGE_REFLECTION_MAX_VERSION,
   MAX_HEAP_INDEX_SHIFT,
+  MAX_LANE_INDEXED_WINDOW,
+  MAX_MESH_VERTICES,
+  MAX_MESH_PRIMITIVES,
+  MAX_MESH_ATTRIBUTES,
+  RT_ARENA_BIND_GROUP,
+  RT_ARENA_FIRST_BINDING,
+  RT_ARENA_LAST_BINDING,
+  RT_ARENA_FULL_MASK,
   INLINE_SAMPLER_SDWORD_COUNT,
   GRAPHICS_USER_DATA_BASE,
   COMPUTE_USER_DATA_BASE,
+  MESH_USER_DATA_BASE,
   TABLE_SLOT_BYTES,
   UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
   STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
@@ -31,6 +44,7 @@ const {
   computeBindGroupLayoutHash,
   computePipelineLayoutHash,
   parseBindingSource,
+  parseMeshOutputLayout,
   parseReflectionManifest,
   parseStageReflectionSidecar,
   buildBindGroupLayoutDescriptors,
@@ -2754,7 +2768,11 @@ test('W215 parseStageReflectionSidecar rejects bad schema, version, duplicate ha
     (err) => err instanceof ManifestValidationError && /unsupported stage reflection schema/.test(err.message)
   );
   assert.throws(
-    () => parseStageReflectionSidecar({ schema: 'playgta6-stage-reflection', version: 2, stages: {} }),
+    () => parseStageReflectionSidecar({ schema: 'playgta6-stage-reflection', version: 0, stages: {} }),
+    (err) => err instanceof ManifestValidationError && /unsupported stage reflection version/.test(err.message)
+  );
+  assert.throws(
+    () => parseStageReflectionSidecar({ schema: 'playgta6-stage-reflection', version: 4, stages: {} }),
     (err) => err instanceof ManifestValidationError && /unsupported stage reflection version/.test(err.message)
   );
   // Duplicate hash across 0x and bare 16-hex keys
@@ -3786,4 +3804,441 @@ test('W318 preserves W275 9,574-stage interning parity, fast-path telemetry sani
   assert.equal(stats.fastHashLookups, 0);
   assert.equal(stats.fastHashHits, 0);
   assert.equal(stats.negativeLookupHits, 0);
+});
+
+// ---------------------------------------------------------------------------
+// W379: Full Stage Reflection v1 / v2 / v3 Support (runtime/gpu/stage_reflection.h)
+// ---------------------------------------------------------------------------
+
+test('W379 exports v1/v2/v3 reflection constants and parses v1, v2, and v3 sidecars with version rules', () => {
+  assert.equal(STAGE_REFLECTION_VERSION, 1);
+  assert.equal(STAGE_REFLECTION_MIN_VERSION, 1);
+  assert.equal(STAGE_REFLECTION_VERSION_ROOT_TABLE_OFFSET, 2);
+  assert.equal(STAGE_REFLECTION_VERSION_UNRESOLVED, 3);
+  assert.equal(STAGE_REFLECTION_MAX_VERSION, 3);
+  assert.equal(MESH_USER_DATA_BASE, 16);
+  assert.equal(MAX_LANE_INDEXED_WINDOW, 256);
+  assert.equal(MAX_MESH_VERTICES, 256);
+  assert.equal(MAX_MESH_PRIMITIVES, 256);
+  assert.equal(MAX_MESH_ATTRIBUTES, 15);
+  assert.equal(RT_ARENA_BIND_GROUP, 3);
+  assert.equal(RT_ARENA_FIRST_BINDING, 16);
+  assert.equal(RT_ARENA_LAST_BINDING, 21);
+  assert.equal(RT_ARENA_FULL_MASK, 0x3f);
+
+  // Version 1: root_descriptor ignores table_byte_offset (matching stage_reflection.cpp:506)
+  const v1 = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 1,
+    stages: {
+      '0x0000000000000001': {
+        stage: 'fragment',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'uniform',
+            source: { user_sgpr: 8, root_descriptor: true, table_byte_offset: 64 },
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(v1.version, 1);
+  assert.deepEqual(v1.getStage(1n).bindings[0].source, { kind: 'root_descriptor', userSgpr: 8 });
+
+  // Version 2: root_descriptor preserves table_byte_offset and rootTableOffsetGiven
+  const v2 = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 2,
+    stages: {
+      '0x0000000000000002': {
+        stage: 'fragment',
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'uniform',
+            source: { user_sgpr: 8, root_descriptor: true, table_byte_offset: 64 },
+          },
+        ],
+      },
+    },
+  });
+  assert.equal(v2.version, 2);
+  assert.deepEqual(v2.getStage(2n).bindings[0].source, {
+    kind: 'root_descriptor',
+    userSgpr: 8,
+    tableByteOffset: 64,
+    rootTableOffsetGiven: true,
+  });
+
+  // Unresolved rejected in v1 and v2
+  for (const oldVer of [1, 2]) {
+    assert.throws(
+      () =>
+        parseStageReflectionSidecar({
+          schema: 'playgta6-stage-reflection',
+          version: oldVer,
+          stages: {
+            '0x0000000000000003': {
+              stage: 'fragment',
+              bindings: [{ group: 0, binding: 0, kind: 'texture', source: { unresolved: true } }],
+            },
+          },
+        }),
+      (err) => err instanceof ManifestValidationError && /version >= 3/.test(err.message)
+    );
+  }
+
+  // Unresolved rejected in v3 for writable storage and storage_texture
+  for (const writableKind of ['storage', 'storage_texture']) {
+    assert.throws(
+      () =>
+        parseStageReflectionSidecar({
+          schema: 'playgta6-stage-reflection',
+          version: 3,
+          stages: {
+            '0x0000000000000004': {
+              stage: 'compute',
+              bindings: [
+                {
+                  group: 0,
+                  binding: 0,
+                  kind: writableKind,
+                  storage_format: writableKind === 'storage_texture' ? 'rgba8unorm' : undefined,
+                  source: { unresolved: 'indirect_uav' },
+                },
+              ],
+            },
+          },
+        }),
+      (err) => err instanceof ManifestValidationError && /cannot have an unresolved source/.test(err.message)
+    );
+  }
+
+  // Unresolved allowed in v3 for all read-only binding kinds (boolean true or non-empty reason string)
+  const v3 = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 3,
+    stages: {
+      '0x0000000000000005': {
+        stage: 'fragment',
+        bindings: [
+          { group: 0, binding: 0, kind: 'uniform', source: { unresolved: true } },
+          { group: 0, binding: 1, kind: 'read_only_storage', source: { unresolved: 'computed_cb_off' } },
+          { group: 0, binding: 2, kind: 'texture', source: { unresolved: 'bindless_dynamic' } },
+          { group: 0, binding: 3, kind: 'sampler', source: { unresolved: true } },
+          { group: 0, binding: 4, kind: 'comparison_sampler', source: { unresolved: 'dynamic_cmp' } },
+        ],
+      },
+    },
+  });
+  assert.equal(v3.version, 3);
+  assert.equal(v3.unresolvedBindings, 5);
+  assert.equal(v3.getStats().unresolvedBindings, 5);
+  const st5 = v3.getStageByHashFast(5n, 'fragment');
+  assert.equal(st5.unresolvedBindings, 5);
+  assert.deepEqual(st5.bindings[0].source, { kind: 'unresolved', unresolved: true, reason: null });
+  assert.deepEqual(st5.bindings[1].source, {
+    kind: 'unresolved',
+    unresolved: true,
+    reason: 'computed_cb_off',
+  });
+});
+
+test('W379 parses and validates cbv_indexed_*_heap, lane_indexed_*_heap, inline_sampler, mesh_output, and rt_arena', () => {
+  const v3Sidecar = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 3,
+    stages: {
+      '0x0000000000003790': {
+        stage: 'compute',
+        mesh_output: { max_vertices: 128, max_primitives: 256, vertex_words: 16 },
+        rt_arena: true,
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'texture',
+            source: {
+              cbv_indexed_resource_heap: {
+                cbv: { user_sgpr: 16, root_descriptor: true },
+                byte_offset: 12,
+                shift: 5,
+                bit_offset: 4,
+                mask: 0xffff,
+                stride: 32,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 1,
+            kind: 'sampler',
+            source: {
+              cbv_indexed_sampler_heap: {
+                cbv: { user_sgpr: 18, table_byte_offset: 32 },
+                byte_offset: 0,
+                shift: 4,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 2,
+            kind: 'texture',
+            source: {
+              lane_indexed_resource_heap: {
+                max_count: 128,
+                shift: 5,
+                stride: 32,
+                window_base: {
+                  cbv: { user_sgpr: 19, root_constants: true },
+                  byte_offset: 4,
+                  bit_offset: 0,
+                  mask: 0xff,
+                },
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            kind: 'sampler',
+            source: {
+              lane_indexed_sampler_heap: {
+                max_count: 16,
+                shift: 4,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 4,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+      '0x0000000000003791': {
+        stage: 'compute',
+        bindings: [
+          { group: 3, binding: 16, source: { rt_arena: true } },
+          { group: 3, binding: 19, source: { rt_arena: true } },
+          { group: 3, binding: 21, source: { rt_arena: true } },
+          // Identical cbv_indexed + lane_indexed + inline_sampler to verify parse-local source interning!
+          {
+            group: 0,
+            binding: 0,
+            kind: 'texture',
+            source: {
+              cbv_indexed_resource_heap: {
+                cbv: { user_sgpr: 16, root_descriptor: true },
+                byte_offset: 12,
+                shift: 5,
+                bit_offset: 4,
+                mask: 0xffff,
+                stride: 32,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            kind: 'sampler',
+            source: {
+              lane_indexed_sampler_heap: {
+                max_count: 16,
+                shift: 4,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 4,
+            kind: 'sampler',
+            source: { inline_sampler: { sdwords: [146, 15728640, 139460608, 0] } },
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(v3Sidecar.meshOutputStages, 1);
+  assert.equal(v3Sidecar.rtArenaStages, 2);
+  assert.equal(v3Sidecar.cbvIndexedHeapBindings, 3);
+  assert.equal(v3Sidecar.laneIndexedHeapBindings, 3);
+  assert.equal(v3Sidecar.inlineSamplerBindings, 2);
+
+  const s0 = v3Sidecar.getStageByHashFast(0x3790n, 'compute');
+  const s1 = v3Sidecar.getStageByHashFast(0x3791n, 'compute');
+  assert.equal(s0.hasMeshOutput, true);
+  assert.deepEqual(s0.meshOutput, {
+    maxVertices: 128,
+    maxPrimitives: 256,
+    vertexWords: 16,
+    max_vertices: 128,
+    max_primitives: 256,
+    vertex_words: 16,
+  });
+  assert.equal(s0.rtArenaMask, 0x3f);
+  assert.equal(s1.rtArenaMask, (1 << 0) | (1 << 3) | (1 << 5));
+  assert.equal(s1.bindings.length, 3, 'rt_arena bindings are runtime-owned and excluded from joined bindings');
+
+  // Verify compact parse-local source interning works across v2/v3 source kinds.
+  assert.strictEqual(s0.bindings[0].source, s1.bindings[0].source);
+  assert.strictEqual(s0.bindings[3].source, s1.bindings[1].source);
+  assert.strictEqual(s0.bindings[4].source, s1.bindings[2].source);
+  assert.equal(Object.isFrozen(s0.bindings[0].source), true);
+  assert.equal(Object.isFrozen(s0.bindings[0].source.cbv), true);
+  assert.equal(Object.isFrozen(s0.bindings[2].source.windowBase), true);
+  assert.deepEqual(s0.bindings[2].bindingArray, { count: 128 });
+
+  // Verify ReflectionRegistry accumulates and resets v3 telemetry cleanly.
+  const registry = new ReflectionRegistry();
+  registry.loadStageReflection({
+    schema: 'playgta6-stage-reflection',
+    version: 3,
+    stages: {
+      '0x0000000000003790': {
+        stage: 'compute',
+        mesh_output: { max_vertices: 64, max_primitives: 126, vertex_words: 8 },
+        rt_arena: true,
+        bindings: [{ group: 0, binding: 0, kind: 'texture', source: { unresolved: true } }],
+      },
+    },
+  });
+  const regStats = registry.getStats();
+  assert.equal(regStats.meshOutputStages, 1);
+  assert.equal(regStats.rtArenaStages, 1);
+  assert.equal(regStats.unresolvedBindings, 1);
+  assert.strictEqual(registry.getStageByHashFast(0x3790n).hasMeshOutput, true);
+
+  // Rejection cases for malformed v2/v3 payloads
+  assert.throws(
+    () => parseBindingSource({ cbv_indexed_resource_heap: { cbv: { user_sgpr: 8, root_descriptor: true }, byte_offset: 3, shift: 5 } }),
+    (err) => err instanceof ManifestValidationError && /byte_offset/.test(err.message)
+  );
+  assert.throws(
+    () => parseBindingSource({ cbv_indexed_resource_heap: { cbv: { user_sgpr: 8, root_descriptor: true }, byte_offset: 0, shift: 5, mask: 0 } }),
+    (err) => err instanceof ManifestValidationError && /mask/.test(err.message)
+  );
+  assert.throws(
+    () => parseBindingSource({ lane_indexed_resource_heap: { max_count: 0, shift: 5 } }),
+    (err) => err instanceof ManifestValidationError && /max_count/.test(err.message)
+  );
+  assert.throws(
+    () => parseBindingSource({ lane_indexed_resource_heap: { max_count: 257, shift: 5 } }),
+    (err) => err instanceof ManifestValidationError && /max_count/.test(err.message)
+  );
+  assert.throws(
+    () => parseMeshOutputLayout({ max_vertices: 0, max_primitives: 16, vertex_words: 4 }, 'mesh_output'),
+    (err) => err instanceof ManifestValidationError && /max_vertices/.test(err.message)
+  );
+  assert.throws(
+    () => parseMeshOutputLayout({ max_vertices: 16, max_primitives: 16, vertex_words: 6 }, 'mesh_output'),
+    (err) => err instanceof ManifestValidationError && /vertex_words/.test(err.message)
+  );
+  assert.throws(
+    () => parseMeshOutputLayout({ max_vertices: 16, max_primitives: 16, vertex_words: 68 }, 'mesh_output'),
+    (err) => err instanceof ManifestValidationError && /vertex_words/.test(err.message)
+  );
+  assert.throws(
+    () =>
+      parseStageReflectionSidecar({
+        schema: 'playgta6-stage-reflection',
+        version: 3,
+        stages: {
+          '0x0000000000003799': {
+            stage: 'compute',
+            bindings: [{ group: 2, binding: 16, source: { rt_arena: true } }],
+          },
+        },
+      }),
+    (err) => err instanceof ManifestValidationError && /group 3, binding 16..21/.test(err.message)
+  );
+});
+
+test('W379 diagnoseStageBindings supports MESH_USER_DATA_BASE=16, root_descriptor.table_byte_offset, cbv/lane heap, unresolved, and rt_arena', () => {
+  const sidecar = parseStageReflectionSidecar({
+    schema: 'playgta6-stage-reflection',
+    version: 3,
+    stages: {
+      '0x0000000000003795': {
+        stage: 'compute',
+        mesh_output: { max_vertices: 64, max_primitives: 64, vertex_words: 8 },
+        rt_arena: true,
+        bindings: [
+          {
+            group: 0,
+            binding: 0,
+            kind: 'uniform',
+            source: { user_sgpr: 16, root_descriptor: true, table_byte_offset: 32 },
+          },
+          {
+            group: 0,
+            binding: 1,
+            kind: 'texture',
+            source: {
+              cbv_indexed_resource_heap: {
+                cbv: { user_sgpr: 17, root_descriptor: true },
+                byte_offset: 8,
+                shift: 5,
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 2,
+            kind: 'texture',
+            source: {
+              lane_indexed_resource_heap: {
+                max_count: 32,
+                shift: 5,
+                window_base: { cbv: { user_sgpr: 19, root_constants: true }, byte_offset: 0 },
+              },
+            },
+          },
+          {
+            group: 0,
+            binding: 3,
+            kind: 'texture',
+            source: { unresolved: 'bindless_fallback' },
+          },
+        ],
+      },
+    },
+  });
+
+  const meshStage = sidecar.getStage(0x3795n);
+  // Root signature starts at s16 automatically because meshStage.hasMeshOutput === true!
+  const rs = {
+    parameters: [
+      { type: 'table', ranges: [{ type: 'cbv', count: 4, base_register: 0, space: 0 }] }, // s16
+      { type: 'cbv', shader_register: 1, register_space: 0 },                            // s17..s18
+      { type: 'constants', num_32bit_values: 4, shader_register: 2, register_space: 0 }, // s19..s22
+    ],
+  };
+
+  // Without bindingArrays option: lane_indexed binding fails with BINDING_ARRAYS_UNSUPPORTED
+  const diagNoArrays = diagnoseStageBindings(meshStage, rs);
+  assert.equal(diagNoArrays.userDataBase, MESH_USER_DATA_BASE);
+  assert.equal(diagNoArrays.ok, false);
+  assert.equal(diagNoArrays.summary.laneIndexedBindings, 1);
+  assert.equal(diagNoArrays.summary.rootDescriptorTables, 1);
+  assert.equal(diagNoArrays.summary.unresolvedBindings, 1);
+  assert.equal(diagNoArrays.diagnostics[0].code, DIAGNOSTIC_CODES.BINDING_ARRAYS_UNSUPPORTED);
+
+  // With bindingArrays: true: all 4 bindings resolve cleanly!
+  const diagOk = diagnoseStageBindings(meshStage, rs, { bindingArrays: true });
+  assert.equal(diagOk.ok, true);
+  assert.equal(diagOk.userDataBase, MESH_USER_DATA_BASE);
+  assert.equal(diagOk.rtArenaMask, 0x3f);
+  assert.equal(diagOk.summary.resolvedCount, 4);
+  assert.equal(diagOk.summary.rootDescriptorTables, 1);
+  assert.equal(diagOk.summary.laneIndexedArrays, 1);
+  assert.equal(diagOk.summary.unresolvedBindings, 1);
+  assert.equal(diagOk.resolvedBindings[2].bindingArraySize, 32);
+  assert.equal(diagOk.resolvedBindings[3].unresolved, true);
 });

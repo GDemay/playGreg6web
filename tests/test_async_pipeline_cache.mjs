@@ -16,14 +16,17 @@ const {
   DEFAULT_PIPELINE_PRIORITY,
   DEFAULT_COMPILE_STALL_THRESHOLD_MS,
   DEFAULT_COMPILE_LATENCY_RING_SIZE,
+  DEFAULT_MAX_QUARANTINED_PIPELINES,
   PIPELINE_KIND,
   PIPELINE_PRIORITY_LANE,
   PIPELINE_PRIORITY_TIER,
   PIPELINE_STATUS,
+  PIPELINE_FAILURE_REASON,
   canonicalizePipelineKey,
   classifyPriorityTier,
   parsePriorityTier,
   isDeviceLostError,
+  classifyCompileFailureReason,
 } = require('../web/workers/async_pipeline_cache.js');
 
 const unhandledRejections = [];
@@ -369,7 +372,7 @@ test('W203: failure cleanup frees slots, clears dedupe keys, preserves priority 
     return origRender(desc);
   };
 
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1, quarantineFailed: false });
 
   const pFail = cache.compileRenderPipeline('bad_1', { label: 'bad_1' }, { dedupeKey: 'bad-key' });
   const pFailAlias = cache.compileRenderPipeline('bad_2', { label: 'bad_1' }, { dedupeKey: 'bad-key' });
@@ -701,6 +704,7 @@ test('W263: device-loss and compile rejections remove failed in-flight keys, inc
   const cache = new AsyncPipelineCache({
     device,
     maxConcurrentCompiles: 2,
+    quarantineFailed: false,
     onError: (id, err) => errors.push({ id, msg: err.message }),
   });
 
@@ -1125,7 +1129,7 @@ test('W305: error recovery under priority tiers frees slots, evicts failed keys,
     return origRender(desc);
   };
 
-  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1 });
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 1, quarantineFailed: false });
 
   const failCrit = cache.prewarm('fail_crit', { label: 'fail_crit' }, {
     canonicalKey: 'key-crit-fail',
@@ -1270,5 +1274,164 @@ test('W305: sanitized additive telemetry (queuedByPriority, activeCompiles, peak
   assert.equal(umd.MAX_CONCURRENT_COMPILES, 16);
   assert.equal(typeof new umd.AsyncPipelineCache().prewarm, 'function');
   assert.equal(typeof new umd.AsyncPipelineCache().promoteTier, 'function');
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W379: 3D scene-transition drawn-first scheduling (compileOnDraw / promoteOnDraw / markDrawn) with bounded concurrency', async () => {
+  const device = createManualDevice();
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 2 });
+
+  // Fill active slots and queue a burst of 6 background world-load prewarm shaders.
+  const active0 = cache.prewarm('world_slot_0', { label: 'world_slot_0' });
+  const active1 = cache.prewarm('world_slot_1', { label: 'world_slot_1' });
+  const prewarmList = [];
+  for (let i = 0; i < 6; i += 1) {
+    prewarmList.push(
+      cache.prewarm(`world_bg_${i}`, { label: `world_bg_${i}` }, {
+        canonicalKey: `key-world-${i}`,
+        priority: PIPELINE_PRIORITY_TIER.BACKGROUND,
+      }),
+    );
+  }
+
+  // Scene enters 3D world: active draw calls need world_bg_4 (via dedupeKey), world_bg_2 (via id),
+  // and a brand-new character shader via compileOnDraw.
+  assert.equal(cache.promoteOnDraw('key-world-4'), true);
+  assert.equal(cache.markDrawn('world_bg_2'), true);
+  const drawChar = cache.compileOnDraw('char_skin', { label: 'char_skin' });
+  const drawComp = cache.compileOnDraw('cull_cs', { label: 'cull_cs' }, { kind: PIPELINE_KIND.COMPUTE });
+
+  assert.equal(device.calls.length, 2, 'bounded concurrency never exceeded');
+  const tel = cache.getTelemetry();
+  assert.equal(tel.queuedByPriority.critical, 4);
+  assert.equal(tel.queuedByPriority.background, 4);
+  assert.equal(tel.drawPreemptions, 4);
+
+  for (let i = 0; i < 10; i += 1) {
+    assert.ok(device.inFlight <= 2, `concurrency cap 2 violated: ${device.inFlight}`);
+    device.calls[i].resolve();
+    await tick();
+  }
+  await Promise.all([active0, active1, ...prewarmList, drawChar, drawComp]);
+  await cache.whenIdle();
+
+  // Drawn-first shaders (world_bg_2 seq=5, world_bg_4 seq=7, char_skin seq=9, cull_cs seq=10)
+  // MUST all compile strictly ahead of remaining background prewarm shaders (0, 1, 3, 5).
+  assert.deepEqual(
+    device.calls.map((c) => c.descriptor.label),
+    [
+      'world_slot_0',
+      'world_slot_1',
+      'world_bg_2',
+      'world_bg_4',
+      'char_skin',
+      'cull_cs',
+      'world_bg_0',
+      'world_bg_1',
+      'world_bg_3',
+      'world_bg_5',
+    ],
+  );
+  assert.equal(device.peakInFlight, 2);
+  assert.deepEqual(unhandledRejections, []);
+});
+
+test('W379: sanitized failure-reason classification, quarantine short-circuiting, LRU eviction, clearQuarantine, and UMD exports', async () => {
+  assert.equal(DEFAULT_MAX_QUARANTINED_PIPELINES, 512);
+  assert.equal(classifyCompileFailureReason(Object.assign(new Error('GPUDevice was lost'), { name: 'GPUDeviceLostError' })), PIPELINE_FAILURE_REASON.DEVICE_LOST);
+  assert.equal(classifyCompileFailureReason(new Error('AsyncPipelineCache: createRenderPipelineAsync resolved no pipeline')), PIPELINE_FAILURE_REASON.NULL_PIPELINE);
+  assert.equal(classifyCompileFailureReason(new Error('bind group layout mismatch at @group(1)')), PIPELINE_FAILURE_REASON.LAYOUT_MISMATCH);
+  assert.equal(classifyCompileFailureReason(new Error('unsupported storage texture format bgra8unorm')), PIPELINE_FAILURE_REASON.UNSUPPORTED_FEATURE);
+  assert.equal(classifyCompileFailureReason(new Error('Tint WGSL syntax error in C:\\Users\\dev\\secret.wgsl')), PIPELINE_FAILURE_REASON.WGSL_COMPILE);
+  assert.equal(classifyCompileFailureReason(Object.assign(new Error('bad state'), { name: 'GPUValidationError' })), PIPELINE_FAILURE_REASON.VALIDATION);
+  assert.equal(classifyCompileFailureReason(new Error('opaque driver glitch')), PIPELINE_FAILURE_REASON.OTHER);
+
+  const device = createManualDevice('quarantine-dev');
+  const cache = new AsyncPipelineCache({ device, maxConcurrentCompiles: 4, maxQuarantined: 3 });
+
+  const f1 = cache.compileRenderPipeline('q_wgsl', { label: 'q_wgsl' }, { canonicalKey: 'ck-wgsl' });
+  const f2 = cache.compileRenderPipeline('q_layout', { label: 'q_layout' }, { canonicalKey: 'ck-layout' });
+  const f3 = cache.compileComputePipeline('q_feat', { label: 'q_feat' }, { canonicalKey: 'ck-feat' });
+  const fLost = cache.compileRenderPipeline('q_lost', { label: 'q_lost' }, { canonicalKey: 'ck-lost' });
+
+  device.calls[0].reject(new Error('WGSL compile error in /Users/alice/gta6/shader.wgsl'));
+  device.calls[1].reject(new Error('pipeline layout mismatch'));
+  device.calls[2].reject(new Error('feature shader-f16 not supported'));
+  device.calls[3].reject(new Error('GPUDevice was lost'));
+
+  await Promise.all([f1, f2, f3, fLost]);
+  await cache.whenIdle();
+
+  assert.equal(cache.isQuarantined('q_wgsl'), true);
+  assert.equal(cache.isQuarantined('ck-wgsl', PIPELINE_KIND.RENDER), true);
+  assert.equal(cache.isQuarantined('ck-wgsl', PIPELINE_KIND.COMPUTE), false, 'namespaces isolated');
+  assert.equal(cache.isQuarantined('q_lost'), false, 'device_lost not quarantined');
+
+  // Hit q_wgsl twice so it refreshes to MRU in the bounded LRU quarantine set!
+  const h1 = await cache.compileRenderPipeline('q_wgsl', { label: 'q_wgsl' });
+  const h2 = await cache.compileRenderPipeline('q_wgsl_dup', { label: 'q_wgsl' }, { canonicalKey: 'ck-wgsl' });
+  assert.equal(h1.status, PIPELINE_STATUS.FAILED);
+  assert.equal(h1.quarantined, true);
+  assert.equal(h1.reason, PIPELINE_FAILURE_REASON.WGSL_COMPILE);
+  assert.equal(h2.quarantined, true);
+  assert.equal(h2.reason, PIPELINE_FAILURE_REASON.WGSL_COMPILE);
+  assert.equal(device.calls.length, 4, 'zero duplicate device calls for quarantined pipelines');
+
+  // Adding a 4th quarantined pipeline with maxQuarantined=3 must evict q_layout (LRU), keeping q_wgsl (touched!).
+  const f4 = cache.compileRenderPipeline('q_null', { label: 'q_null' });
+  device.calls[4].resolve(null);
+  const r4 = await f4;
+  assert.equal(r4.status, PIPELINE_STATUS.FAILED);
+  assert.equal(r4.reason, PIPELINE_FAILURE_REASON.NULL_PIPELINE);
+  assert.equal(cache.isQuarantined('q_layout'), false, 'LRU entry evicted');
+  assert.equal(cache.isQuarantined('q_wgsl'), true, 'recently hit entry protected by LRU');
+  assert.equal(cache.isQuarantined('q_feat'), true);
+  assert.equal(cache.isQuarantined('q_null'), true);
+
+  const summary = cache.getQuarantineSummary();
+  assert.equal(summary.totalQuarantined, 3);
+  assert.equal(summary.quarantineHits, 2);
+  assert.equal(summary.evictions, 1);
+  assert.equal(summary.byReason.wgsl_compile, 1);
+  assert.equal(summary.byReason.unsupported_feature, 1);
+  assert.equal(summary.byReason.null_pipeline, 1);
+  assert.equal(summary.byReason.layout_mismatch, 0);
+  assert.equal(summary.hitsByReason.wgsl_compile, 2);
+  assert.equal(summary.failuresByReason.device_lost, 1);
+  assert.doesNotMatch(JSON.stringify(summary), /Users|alice|gta6|shader\.wgsl/);
+
+  const tel = cache.getTelemetry();
+  assert.equal(tel.quarantinedCount, 3);
+  assert.equal(tel.quarantineHits, 2);
+  assert.equal(tel.quarantineEvictions, 1);
+  assert.deepEqual(tel.quarantinedByReason, summary.byReason);
+
+  // resetStats() zeroes hit/eviction counters while keeping active quarantine entries intact.
+  cache.resetStats();
+  assert.equal(cache.getQuarantineSummary().quarantineHits, 0);
+  assert.equal(cache.getQuarantineSummary().totalQuarantined, 3);
+
+  // clearQuarantine() removes all and allows recompilation.
+  assert.equal(cache.clearQuarantine(), 3);
+  assert.equal(cache.getQuarantineSummary().totalQuarantined, 0);
+  const retry = cache.compileRenderPipeline('q_wgsl', { label: 'q_wgsl_ok' }, { canonicalKey: 'ck-wgsl' });
+  device.calls[5].resolve();
+  assert.equal((await retry).status, PIPELINE_STATUS.READY);
+
+  // UMD classic-worker sandbox check for W379 symbols.
+  const source = readFileSync(new URL('../web/workers/async_pipeline_cache.js', import.meta.url), 'utf8');
+  const sandbox = {};
+  sandbox.self = sandbox;
+  sandbox.globalThis = sandbox;
+  vm.runInNewContext(source, sandbox, { filename: 'async_pipeline_cache.js' });
+  const umd = sandbox.PlayGta6AsyncPipelineCache;
+  assert.equal(umd.DEFAULT_MAX_QUARANTINED_PIPELINES, 512);
+  assert.equal(typeof umd.classifyCompileFailureReason, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.compileOnDraw, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.promoteOnDraw, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.markDrawn, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.isQuarantined, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.clearQuarantine, 'function');
+  assert.equal(typeof umd.AsyncPipelineCache.prototype.getQuarantineSummary, 'function');
   assert.deepEqual(unhandledRejections, []);
 });
