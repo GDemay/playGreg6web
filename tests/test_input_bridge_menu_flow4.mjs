@@ -13,6 +13,9 @@ import {
   MIN_SCRIPT_HOLD_MS,
   CHROME_MENU_FLOW_4_HOLD_MS,
   DEFAULT_VISIBLE_FRAME_FALLBACK_MS,
+  FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS,
+  FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+  FIRST_VISIBLE_FRAME_ANCHOR_PRESETS,
   INPUT_SCRIPT_START_TRIGGERS,
   ScriptedInputPlayer,
   InputBridge,
@@ -439,10 +442,28 @@ test('W355 InputBridge starts chrome-menu-flow-4 cleanly on FIRST_PRESENT and ne
   assert.equal(bridge2.getSnapshot().buttons, INPUT_BUTTONS.A);
   assert.equal(bridge2.getStats().scriptedPressesSent, 1);
 
-  // Late notifyFirstVisibleFrame() after fallback already started is a safe no-op (no restart).
-  assert.equal(bridge2.notifyFirstVisibleFrame(), false);
-  assert.equal(bridge2.getStats().scriptedPressesSent, 1);
+  // W357: Late notifyFirstVisibleFrame() after fallback already started re-anchors
+  // chrome-menu-flow-4 cleanly to FIRST_VISIBLE_FRAME, releases any held fallback button,
+  // and fires a crisp 220 ms A press at +500 ms so slow-loading boots never miss Start Screen.
+  assert.equal(bridge2.notifyFirstVisibleFrame(), true);
   assert.equal(bridge2.getStats().firstVisibleFrameNotified, true);
+  assert.equal(bridge2.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+  assert.equal(bridge2.getStats().scriptReanchoredCount, 1);
+  assert.equal(bridge2.getStats().elapsedScriptMs, 0);
+  assert.equal(bridge2.getSnapshot().buttons, 0);
+
+  // Duplicate notifyFirstVisibleFrame() is an idempotent no-op (no double restart).
+  assert.equal(bridge2.notifyFirstVisibleFrame(), false);
+  assert.equal(bridge2.getStats().scriptReanchoredCount, 1);
+
+  // +500 ms after FIRST_VISIBLE_FRAME -> crisp 220 ms A press lands in SAB!
+  clock2.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridge2.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge2.getStats().scriptedPressesSent, 2);
+  clock2.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS - 1);
+  assert.equal(bridge2.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock2.advanceBy(1);
+  assert.equal(bridge2.getSnapshot().buttons, 0);
 
   bridge2.destroy();
   assert.equal(clock2.pendingTimeouts(), 0);
@@ -614,4 +635,335 @@ test('W355 InputBridge drives chrome-menu-flow-4 end-to-end through Start Screen
 
   bridge.destroy();
   assert.equal(clock.pendingTimeouts(), 0);
+});
+
+test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST_PRESENT, fires 220 ms A within 500 ms, and runs Phases 1->4 cleanly', () => {
+  assert.deepEqual(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS, [
+    'menu-to-ingame',
+    'chrome-menu-flow-4',
+    'chrome-menu-flow-2',
+    'chrome-menu-flow',
+  ]);
+  assert.ok(FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS <= 500);
+  assert.ok(FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS >= 200);
+
+  const clock = createFakeClockAndTimers(0);
+  const notifyCalls = [];
+  const spyAtomics = {
+    load: (arr, idx) => Atomics.load(arr, idx),
+    store: (arr, idx, val) => Atomics.store(arr, idx, val),
+    add: (arr, idx, val) => Atomics.add(arr, idx, val),
+    notify: (arr, idx, count) => {
+      notifyCalls.push({ idx, count, seq: Atomics.load(arr, idx) });
+      return Atomics.notify(arr, idx, count);
+    },
+  };
+
+  const bridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+    atomicsObj: spyAtomics,
+  });
+
+  bridge.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+
+  // Simulate live Chrome t86: FIRST_PRESENT fires at 45.1 s, black asset loading lasts 90 s.
+  clock.advanceTo(45100);
+  assert.equal(bridge.notifyFirstPresent(), false);
+
+  // Fallback starts at FIRST_PRESENT + 2000 ms (W355 compatibility if visible frame never fires).
+  clock.advanceBy(DEFAULT_VISIBLE_FRAME_FALLBACK_MS);
+  assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_PRESENT_FALLBACK');
+  assert.equal(bridge.getStats().scriptActive, true);
+
+  // Advance 90 s after FIRST_PRESENT (t = 135100 ms): Phase 1 (5s..75s) already finished!
+  // Fallback is now deep in Phase 2 (88 s elapsed since fallback).
+  clock.advanceTo(45100 + 90000);
+  assert.equal(bridge.getStats().elapsedScriptMs, 88000);
+  const pressesBeforeVisible = bridge.getStats().scriptedPressesSent;
+  assert.ok(pressesBeforeVisible >= 29, 'Phase 1 already elapsed before FIRST_VISIBLE_FRAME');
+
+  // FIRST_VISIBLE_FRAME finally arrives at FIRST_PRESENT + 90 s (Start Screen OFFLINEPLAYER [A] visible!).
+  assert.equal(bridge.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+  assert.equal(bridge.getStats().scriptReanchoredCount, 1);
+  assert.equal(bridge.getStats().elapsedScriptMs, 0);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Crisp >= 200 ms (220 ms) A press fires within <= 600 ms (at +500 ms) of FIRST_VISIBLE_FRAME!
+  const notifiesBefore = notifyCalls.length;
+  clock.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS - 1);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  clock.advanceBy(1);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  const dv = new DataView(bridge.sab);
+  assert.equal(dv.getUint32(INPUT_OFFSETS.BUTTONS, true), INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().lastScriptedButton, 'A');
+  assert.equal(bridge.getStats().scriptedPressesSent, pressesBeforeVisible + 1);
+  assert.ok(notifyCalls.length > notifiesBefore, 'Re-anchored Start Screen A must wake SAB via Atomics.notify');
+
+  // Held for the full 220 ms (>= 200 ms), then cleanly released.
+  clock.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS - 1);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceBy(1);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Second Start Screen safety A press at +2500 ms (still before 3.2 s 0x144DCBC9D watchdog!).
+  const visibleAt = 45100 + 90000;
+  clock.advanceTo(visibleAt + 2500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 2500 + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS - 1);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 2500 + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Phases 1 -> 2 -> 3 -> 4 all run cleanly synchronized from FIRST_VISIBLE_FRAME!
+  // Phase 1: +5000 ms A (200 ms hold)
+  clock.advanceTo(visibleAt + 5000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 5200);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Phase 2: +80000 ms Round 0 cursor-reset DPAD_UP, +83000 ms DPAD_DOWN, +86500 ms A
+  clock.advanceTo(visibleAt + 80000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 83000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+  clock.advanceTo(visibleAt + 86500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 3: +178000 ms Post-Legal List Screen DPAD_UP, +180000 ms A
+  clock.advanceTo(visibleAt + 178000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 180000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 4: +190000 ms Looping _menu_cycle DPAD_UP -> +196500 ms A
+  clock.advanceTo(visibleAt + 190000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 196500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Never presses B at any point in the re-anchored player.
+  for (let t = 0; t <= 220000; t += 100) {
+    assert.equal(
+      bridge._scriptPlayer.sampleAt(t).buttonsMask & INPUT_BUTTONS.B,
+      0,
+      `re-anchored chrome-menu-flow-4 must never press B at t=${t}`
+    );
+  }
+
+  bridge.destroy();
+  assert.equal(clock.pendingTimeouts(), 0);
+});
+
+test('W357 menu-to-ingame re-anchors & reactivates cleanly even if it already auto-completed 90 s after FIRST_PRESENT', () => {
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+
+  let completionCount = 0;
+  bridge.startScript('menu-to-ingame', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+    onComplete: () => {
+      completionCount += 1;
+    },
+  });
+
+  // FIRST_PRESENT at 45.1 s.
+  clock.advanceTo(45100);
+  assert.equal(bridge.notifyFirstPresent(), true);
+  assert.equal(bridge.getStats().scriptActive, true);
+
+  // Advance 90 s (t = 135.1 s): menu-to-ingame (59.3 s total) already auto-completed on the black loading screen!
+  const visibleAt = 45100 + 90000;
+  clock.advanceTo(visibleAt);
+  assert.equal(bridge.getStats().scriptActive, false);
+  assert.equal(completionCount, 1);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // FIRST_VISIBLE_FRAME arrives at +90 s -> re-anchors & reactivates cleanly!
+  assert.equal(bridge.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge.getStats().scriptActive, true);
+  assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+  assert.equal(bridge.getStats().scriptReanchoredCount, 1);
+  assert.equal(bridge.getStats().elapsedScriptMs, 0);
+
+  // Crisp 220 ms A press fires at +500 ms (<= 600 ms) of FIRST_VISIBLE_FRAME!
+  clock.advanceTo(visibleAt + FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS - 1);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  // Second Start Screen safety A press at +2500 ms (< 3.2 s watchdog).
+  clock.advanceTo(visibleAt + 2500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phases 1 -> 5 run cleanly from the FIRST_VISIBLE_FRAME anchor:
+  clock.advanceTo(visibleAt + 5000); // Phase 1 Start Screen A
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  clock.advanceTo(visibleAt + 20000); // Phase 2 Legal Notices DPAD_DOWN
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_DOWN);
+
+  clock.advanceTo(visibleAt + 32500); // Phase 3 Intro skip MENU
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.MENU);
+
+  clock.advanceTo(visibleAt + 45500); // Phase 4 Main Menu A
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  clock.advanceTo(visibleAt + 50000); // Phase 5 In-game left stick forward
+  assert.ok(Math.abs(bridge.getSnapshot().ly - 0.85) < 1e-5);
+
+  // Completes cleanly at +59300 ms from FIRST_VISIBLE_FRAME.
+  clock.advanceTo(visibleAt + 59300);
+  assert.equal(bridge.getStats().scriptActive, false);
+  assert.equal(completionCount, 2);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  assert.equal(bridge.getSnapshot().ly, 0);
+
+  bridge.destroy();
+  assert.equal(clock.pendingTimeouts(), 0);
+});
+
+test('W357 chrome-menu-flow-2, chrome-menu-flow, immediate-started scripts, mid-hold release, opt-out, and manual stop behave cleanly', () => {
+  // 1. chrome-menu-flow-2 and chrome-menu-flow also re-anchor and schedule +0.5s, +2.5s, +4.5s A presses.
+  for (const [preset, phase1AtMs] of [
+    ['chrome-menu-flow-2', 110000],
+    ['chrome-menu-flow', 165000],
+  ]) {
+    const clock = createFakeClockAndTimers(0);
+    const bridge = new InputBridge({
+      windowObj: null,
+      documentObj: null,
+      navigatorObj: null,
+    });
+    bridge.startScript(preset, {
+      startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT,
+      nowFn: clock.nowFn,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+    });
+    clock.advanceTo(30000);
+    bridge.notifyFirstPresent();
+    clock.advanceBy(90000);
+    const visibleAt = clock.nowFn();
+    assert.equal(bridge.notifyFirstVisibleFrame(), true, `${preset} must re-anchor on FIRST_VISIBLE_FRAME`);
+    assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+
+    for (const offset of [500, 2500, 4500]) {
+      clock.advanceTo(visibleAt + offset);
+      assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, `${preset} initial A at +${offset} ms`);
+      clock.advanceTo(visibleAt + offset + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS - 1);
+      assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+      clock.advanceTo(visibleAt + offset + FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS);
+      assert.equal(bridge.getSnapshot().buttons, 0);
+    }
+
+    // Original Phase 1 runs synchronized from FIRST_VISIBLE_FRAME.
+    clock.advanceTo(visibleAt + phase1AtMs);
+    assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, `${preset} Phase 1 A at +${phase1AtMs} ms`);
+    bridge.destroy();
+    assert.equal(clock.pendingTimeouts(), 0);
+  }
+
+  // 2. Immediate-started chrome-menu-flow-4 (e.g. app_bootstrap.js default) releases a mid-hold
+  //    button cleanly and re-anchors when FIRST_VISIBLE_FRAME fires 90 s after FIRST_PRESENT.
+  const clockImm = createFakeClockAndTimers(0);
+  const bridgeImm = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+  bridgeImm.startScript('chrome-menu-flow-4', {
+    nowFn: clockImm.nowFn,
+    setTimeoutFn: clockImm.setTimeoutFn,
+    clearTimeoutFn: clockImm.clearTimeoutFn,
+  });
+  clockImm.advanceTo(10000);
+  bridgeImm.notifyFirstPresent();
+  // Advance directly into a held DPAD_UP in Phase 2 (t = 80050 ms).
+  clockImm.advanceTo(80050);
+  assert.equal(bridgeImm.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  // FIRST_VISIBLE_FRAME fires mid-hold -> immediately clears DPAD_UP to 0 and schedules +500 ms A!
+  assert.equal(bridgeImm.notifyFirstVisibleFrame(), true);
+  assert.equal(bridgeImm.getSnapshot().buttons, 0);
+  clockImm.advanceBy(FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridgeImm.getSnapshot().buttons, INPUT_BUTTONS.A);
+  bridgeImm.destroy();
+  assert.equal(clockImm.pendingTimeouts(), 0);
+
+  // 3. Non-anchor preset ('start-screen'), explicit opt-out (reanchorOnFirstVisibleFrame: false),
+  //    and manually stopped scripts do NOT re-anchor or revive on late notifyFirstVisibleFrame().
+  const clockNoop = createFakeClockAndTimers(0);
+  const bridgeStartScreen = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+  bridgeStartScreen.startScript('start-screen', {
+    startOn: 'FIRST_PRESENT',
+    nowFn: clockNoop.nowFn,
+    setTimeoutFn: clockNoop.setTimeoutFn,
+    clearTimeoutFn: clockNoop.clearTimeoutFn,
+  });
+  bridgeStartScreen.notifyFirstPresent();
+  clockNoop.advanceBy(5000);
+  assert.equal(bridgeStartScreen.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridgeStartScreen.notifyFirstVisibleFrame(), false);
+  assert.equal(bridgeStartScreen.getStats().scriptStartedOn, 'FIRST_PRESENT');
+  assert.equal(bridgeStartScreen.getStats().scriptReanchoredCount, 0);
+  bridgeStartScreen.destroy();
+
+  const bridgeOptOut = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+  bridgeOptOut.startScript('chrome-menu-flow-4', {
+    startOn: 'FIRST_PRESENT',
+    reanchorOnFirstVisibleFrame: false,
+    nowFn: clockNoop.nowFn,
+    setTimeoutFn: clockNoop.setTimeoutFn,
+    clearTimeoutFn: clockNoop.clearTimeoutFn,
+  });
+  bridgeOptOut.notifyFirstPresent();
+  clockNoop.advanceBy(10000);
+  assert.equal(bridgeOptOut.notifyFirstVisibleFrame(), false);
+  assert.equal(bridgeOptOut.getStats().scriptStartedOn, 'FIRST_PRESENT');
+  assert.equal(bridgeOptOut.getStats().scriptReanchoredCount, 0);
+  bridgeOptOut.destroy();
+
+  const bridgeStopped = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+  bridgeStopped.startScript('chrome-menu-flow-4', {
+    startOn: 'FIRST_PRESENT',
+    nowFn: clockNoop.nowFn,
+    setTimeoutFn: clockNoop.setTimeoutFn,
+    clearTimeoutFn: clockNoop.clearTimeoutFn,
+  });
+  bridgeStopped.notifyFirstPresent();
+  bridgeStopped.stopScript();
+  assert.equal(bridgeStopped.notifyFirstVisibleFrame(), false);
+  assert.equal(bridgeStopped.getStats().scriptActive, false);
+  assert.equal(bridgeStopped.getStats().scriptReanchoredCount, 0);
+  bridgeStopped.destroy();
+  assert.equal(clockNoop.pendingTimeouts(), 0);
 });

@@ -195,6 +195,35 @@ function readGamepadTrigger(button) {
 export const MIN_SCRIPT_HOLD_MS = 180;
 export const CHROME_MENU_FLOW_4_HOLD_MS = 200;
 export const DEFAULT_VISIBLE_FRAME_FALLBACK_MS = 2000;
+export const FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS = 500;
+export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
+
+export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
+  'menu-to-ingame',
+  'chrome-menu-flow-4',
+  'chrome-menu-flow-2',
+  'chrome-menu-flow',
+]);
+const FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET = new Set(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS);
+const FIRST_VISIBLE_FRAME_MIN_GAP_MS = 500;
+
+export const FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS = Object.freeze([
+  Object.freeze({
+    atMs: FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+  Object.freeze({
+    atMs: 2500,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+  Object.freeze({
+    atMs: 4500,
+    holdMs: FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS,
+    button: INPUT_BUTTONS.A,
+  }),
+]);
 
 export const INPUT_SCRIPT_START_TRIGGERS = Object.freeze({
   IMMEDIATE: 'immediate',
@@ -1026,6 +1055,7 @@ export class ScriptedInputPlayer {
     this._timerId = null;
     this._intervalId = null;
     this._runToken = 0;
+    this._reanchoredInitialEventsApplied = false;
   }
 
   _setBridgeSink(sinkFn) {
@@ -1490,6 +1520,119 @@ export class ScriptedInputPlayer {
   }
 
   /**
+   * Re-anchors (resets) playback to `elapsedMs = 0` at the current clock time (`nowFn()`),
+   * e.g. when `FIRST_VISIBLE_FRAME` arrives after a slow black asset-loading screen.
+   * Optionally prepends non-overlapping `initialEvents` (such as an immediate 220 ms `A`
+   * press within 500 ms so the Start Screen 3.2 s idle watchdog never fires) while keeping
+   * subsequent script phases synchronized from the new anchor.
+   */
+  reanchor(options = {}) {
+    const opts = options || {};
+    const initialEvents = Array.isArray(opts.initialEvents) ? opts.initialEvents : null;
+    const preservePressCount = opts.preservePressCount !== false;
+
+    if (
+      this._mode === 'events' &&
+      initialEvents &&
+      initialEvents.length > 0 &&
+      !this._reanchoredInitialEventsApplied &&
+      this._maxPresses !== 0
+    ) {
+      const merged = this._events.slice();
+      const added = [];
+      for (let i = 0; i < initialEvents.length; i++) {
+        const raw = initialEvents[i];
+        if (!raw || typeof raw !== 'object') continue;
+        const atMs = validateNonNegativeFinite(
+          raw.atMs !== undefined ? raw.atMs : raw.startMs,
+          `initialEvents[${i}].atMs`
+        );
+        if (this._endMs !== null && atMs >= this._endMs) continue;
+        const rawHoldMs = validatePositiveFinite(raw.holdMs, `initialEvents[${i}].holdMs`);
+        const holdMs = this.minHoldMs > 0 ? Math.max(rawHoldMs, this.minHoldMs) : rawHoldMs;
+        const evEnd = this._endMs !== null ? Math.min(atMs + holdMs, this._endMs) : atMs + holdMs;
+        if (evEnd <= atMs) continue;
+
+        let overlaps = false;
+        for (let j = 0; j < merged.length; j++) {
+          const existing = merged[j];
+          if (
+            atMs < existing.endMs + FIRST_VISIBLE_FRAME_MIN_GAP_MS &&
+            evEnd + FIRST_VISIBLE_FRAME_MIN_GAP_MS > existing.atMs
+          ) {
+            overlaps = true;
+            break;
+          }
+        }
+        if (overlaps) continue;
+
+        const normalizedEv = Object.freeze({
+          atMs,
+          holdMs: evEnd - atMs,
+          endMs: evEnd,
+          buttonsMask: resolveScriptButtonMask(raw.button, raw.buttonsMask),
+          sticks: normalizeScriptSticks(raw.sticks),
+          triggers: normalizeScriptTriggers(raw.triggers),
+        });
+        merged.push(normalizedEv);
+        added.push(normalizedEv);
+      }
+      if (added.length > 0) {
+        merged.sort((a, b) => a.atMs - b.atMs);
+        const finalEvents =
+          this._maxPresses !== null ? merged.slice(0, this._maxPresses) : merged;
+        this._events = Object.freeze(finalEvents);
+      }
+      this._reanchoredInitialEventsApplied = true;
+    }
+
+    const hadHeldState =
+      this._currentMask !== 0 ||
+      this._currentSticks !== null ||
+      this._currentTriggers !== null;
+    this._clearTimers();
+    this._runToken += 1;
+    const token = this._runToken;
+
+    this._startedAt = this._nowFn();
+    this._stoppedElapsedMs = 0;
+    this._pressCount = 0;
+    if (!preservePressCount) {
+      this._scriptedPressesSent = 0;
+      this._lastScriptedButton = null;
+    }
+    this._currentMask = 0;
+    this._currentSticks = null;
+    this._currentTriggers = null;
+    this._active = true;
+
+    this._tick(token, 0);
+
+    if (
+      hadHeldState &&
+      this._currentMask === 0 &&
+      this._currentSticks === null &&
+      this._currentTriggers === null &&
+      token === this._runToken
+    ) {
+      this._emitSample({ buttonsMask: 0, activeEventCount: 0 });
+    }
+
+    if (
+      this._active &&
+      token === this._runToken &&
+      this._useInterval &&
+      typeof this._setIntervalFn === 'function'
+    ) {
+      this._intervalId = this._setIntervalFn(() => {
+        this._tick(token);
+      }, this._tickMs);
+    }
+
+    return this;
+  }
+
+  /**
    * Manually advances playback to `elapsedMs` (or `nowFn() - startedAt` when omitted).
    */
   step(elapsedMs) {
@@ -1701,6 +1844,9 @@ export class InputBridge {
     this._scriptPlayer = null;
     this._pendingScript = null;
     this._scriptStartedOn = null;
+    this._scriptManuallyStopped = false;
+    this._scriptReanchorOnFirstVisibleFrame = false;
+    this._scriptReanchoredCount = 0;
     this._firstPresentNotified = false;
     this._firstVisibleFrameNotified = false;
     this._scriptButtons = 0;
@@ -2429,7 +2575,18 @@ export class InputBridge {
     this._clearPendingScript();
     this._scriptPlayer = pending.player;
     this._scriptStartedOn = reason;
-    pending.player.start();
+    this._scriptManuallyStopped = false;
+    if (
+      reason === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+      pending.reanchorOnFirstVisibleFrame
+    ) {
+      pending.player.reanchor({
+        initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+        preservePressCount: false,
+      });
+    } else {
+      pending.player.start();
+    }
     return true;
   }
 
@@ -2482,14 +2639,38 @@ export class InputBridge {
    * Notifies the bridge that the guest runtime has produced its first non-black visible
    * frame (`FIRST_VISIBLE_FRAME`, which also implies `FIRST_PRESENT`).
    * Starts any pending milestone-armed script immediately and cancels any fallback timer.
-   * Returns `true` if a pending script started synchronously.
+   * When an anchorable menu preset (`menu-to-ingame`, `chrome-menu-flow-4`,
+   * `chrome-menu-flow-2`, `chrome-menu-flow`) already started earlier (e.g. via
+   * `FIRST_PRESENT`, `FIRST_PRESENT_FALLBACK`, or `immediate`) during a slow black
+   * asset-loading screen, cleanly re-anchors the script clock to `FIRST_VISIBLE_FRAME`
+   * and schedules an initial 220 ms `A` press within 500 ms so the Start Screen 3.2 s
+   * watchdog never fires.
+   * Returns `true` if a script started or re-anchored synchronously.
    */
   notifyFirstVisibleFrame() {
     if (this.disposed) return false;
+    const alreadyVisible = this._firstVisibleFrameNotified;
     this._firstPresentNotified = true;
     this._firstVisibleFrameNotified = true;
-    if (!this._pendingScript) return false;
-    return this._activatePendingScript(INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME);
+    if (alreadyVisible) return false;
+    if (this._pendingScript) {
+      return this._activatePendingScript(INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME);
+    }
+    if (
+      this._scriptPlayer &&
+      !this._scriptManuallyStopped &&
+      this._scriptReanchorOnFirstVisibleFrame &&
+      this._scriptStartedOn !== INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME
+    ) {
+      this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
+      this._scriptReanchoredCount += 1;
+      this._scriptPlayer.reanchor({
+        initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+        preservePressCount: true,
+      });
+      return true;
+    }
+    return false;
   }
 
   /**
@@ -2552,8 +2733,18 @@ export class InputBridge {
       });
     }
 
+    const isDefaultAnchorPreset =
+      typeof player.preset === 'string' &&
+      FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET.has(player.preset);
+    const reanchorOnFirstVisibleFrame =
+      typeof opts.reanchorOnFirstVisibleFrame === 'boolean'
+        ? opts.reanchorOnFirstVisibleFrame
+        : isDefaultAnchorPreset;
+
     this._scriptPlayer = player;
     this._scriptStartedOn = null;
+    this._scriptManuallyStopped = false;
+    this._scriptReanchorOnFirstVisibleFrame = reanchorOnFirstVisibleFrame;
 
     if (startTrigger === INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE) {
       this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE;
@@ -2575,7 +2766,14 @@ export class InputBridge {
       this._firstVisibleFrameNotified
     ) {
       this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
-      player.start();
+      if (reanchorOnFirstVisibleFrame) {
+        player.reanchor({
+          initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+          preservePressCount: false,
+        });
+      } else {
+        player.start();
+      }
       return player;
     }
 
@@ -2597,6 +2795,7 @@ export class InputBridge {
       trigger: startTrigger,
       visibleFrameFallbackMs,
       firstPresentTimeoutMs,
+      reanchorOnFirstVisibleFrame,
       setTimeoutFn,
       clearTimeoutFn,
       timerId: null,
@@ -2620,6 +2819,7 @@ export class InputBridge {
    * scripted button bits immediately from the SharedArrayBuffer while preserving live inputs.
    */
   stopScript() {
+    this._scriptManuallyStopped = true;
     this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer.stop();
@@ -2681,6 +2881,7 @@ export class InputBridge {
       scriptActive: script.active,
       scriptPending: Boolean(this._pendingScript),
       scriptStartedOn: this._scriptStartedOn,
+      scriptReanchoredCount: this._scriptReanchoredCount,
       firstPresentNotified: this._firstPresentNotified,
       firstVisibleFrameNotified: this._firstVisibleFrameNotified,
       activePreset: script.activePreset,
@@ -2758,6 +2959,7 @@ export class InputBridge {
   }
 
   reset() {
+    this._scriptManuallyStopped = true;
     this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer._stopWithoutSink();
