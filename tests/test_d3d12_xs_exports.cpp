@@ -14,6 +14,7 @@
 #include <fstream>
 #include <initializer_list>
 #include <iterator>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -2491,16 +2492,22 @@ void test_ring_reuse_waits_for_the_frame() {
 }
 
 // G66 (#691) / G69 (#663, PR #1500) fence completion latency:
-// - Default (`fence_publish_lag_frames = 1`, `fence_publish_cap_ms = 33`): holds queue signals
+// - Default (`fence_publish_lag = false`, R40 #663): queue signals publish at issue.
+// - `fence_publish_lag = true` (`fence_publish_lag_frames = 1`, `fence_publish_cap_ms = 33`): holds queue signals
 //   within the submitting frame's epoch to protect mid-frame upload-ring reads, then publishes on
 //   that frame's PresentX (unlocking 30+ FPS instead of stalling 2 presents / ~66 ms).
 // - Configurable `fence_publish_lag_frames = 2` retains the conservative 2-present lag.
-// - Configurable `fence_publish_lag_frames = 0` publishes at issue (same as --no-fence-lag).
+// - Configurable `fence_publish_lag_frames = 0` publishes at issue (same as the default).
 // - Blocking waits complete on the executed value and publish it at once.
 void test_fence_publish_lag() {
-    // Part A: default behavior (lag_frames = 1, cap_ms = 33).
+    CHECK(!dg::DeviceOptions{}.fence_publish_lag);
+    // Part A: --fence-lag behavior (lag_frames = 1, cap_ms = 33).
     {
         Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = true;
+        dx::set_device_options(options);
         Scene scene(fx, /*register_shaders=*/true, /*name_back_buffer=*/false);
         dg::Device* dev = host_device(scene.device);
         CHECK(dev->fence_publish_lag());
@@ -5891,6 +5898,50 @@ void test_g55_root_sig_layout_caps() {
 // ID3D12Resource) through IASetVertexBuffers / IASetIndexBuffer. They get runtime-owned
 // Vertex|Index|CopyDst mirrors uploaded at bind time; an advanced ring-buffer pointer inside a
 // mirrored range reuses the buffer at an offset; guest writes are re-uploaded at execute time.
+// #663: a storage relocation home is not handed to another range while a submission of the current
+// or the previous frames may still bind it (the browser worker applies a frame's buffer writes
+// before its draws); once three presents have passed, the least recently used home is reused.
+void test_storage_relocation_reuse_waits_for_presents() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    constexpr size_t kEntries = 512;  // Device::relocate_storage_buffer's soft bound
+    std::vector<uint8_t> ring((kEntries + 2) * 256);
+    for (size_t i = 0; i < ring.size(); ++i) {
+        ring[i] = static_cast<uint8_t>(i * 7u + 1u);
+    }
+    const uint64_t base = put_aligned(ring, 256);
+    std::set<std::pair<uint32_t, uint64_t>> homes;
+    std::pair<uint32_t, uint64_t> first{};
+    for (size_t i = 0; i < kEntries; ++i) {
+        uint32_t id = 0;
+        uint64_t offset = 0;
+        CHECK(dev->relocate_storage_buffer(base + i * 256, 256, &id, &offset, false));
+        homes.insert({id, offset});
+        if (i == 0) {
+            first = {id, offset};
+        }
+    }
+    CHECK(homes.size() == kEntries);
+    CHECK(dev->relocated_storage_count() == kEntries);
+    // Same frame: every home may still be bound, so a new range gets a fresh one.
+    uint32_t id = 0;
+    uint64_t offset = 0;
+    CHECK(dev->relocate_storage_buffer(base + kEntries * 256, 256, &id, &offset, false));
+    CHECK(homes.count({id, offset}) == 0);
+    CHECK(dev->relocated_storage_count() == kEntries + 1);
+    // Two presents later the homes may still be read by a pipelined frame; after three the oldest
+    // one is reused.
+    dev->on_frame_presented();
+    dev->on_frame_presented();
+    CHECK(dev->relocate_storage_buffer(base + (kEntries + 1) * 256, 256, &id, &offset, false));
+    CHECK(homes.count({id, offset}) == 0);
+    dev->on_frame_presented();
+    CHECK(dev->relocate_storage_buffer(base + 0x40, 256, &id, &offset, false));
+    CHECK(id == first.first && offset == first.second);
+    scene.release_all();
+}
+
 void test_g58_relocate_ia_vb_ib() {
     Fixture fx;
     Scene scene(fx);
@@ -7319,6 +7370,7 @@ int main() {
     test_g54_copy_texture_region_x_slot85();
     test_g55_root_sig_layout_caps();
     test_g58_relocate_ia_vb_ib();
+    test_storage_relocation_reuse_waits_for_presents();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

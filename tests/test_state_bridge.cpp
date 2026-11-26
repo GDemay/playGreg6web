@@ -2498,8 +2498,12 @@ void test_memory_backed_tables() {
     } forward;
     forward.h = &holder;
     options.slot_source = &forward;
-    bridge::StateBridgeDevice device(heaps, options, &states);
     constexpr uint32_t kTarget = 100, kCb = 300, kTexture = 301, kVsModule = 1, kFsModule = 2;
+    // #663: kCb stands in for a buffer of relocation homes bound straight from descriptor memory.
+    uint64_t relocation_epoch = 0;
+    options.relocation_epoch = [&relocation_epoch] { return relocation_epoch; };
+    options.relocation_home = [](uint32_t buffer_id) { return buffer_id == kCb; };
+    bridge::StateBridgeDevice device(heaps, options, &states);
     constexpr uint64_t kVs = 0xD1, kPs = 0xD2, kCbVa = 0x10000, kTextureVa = 0x7E00'0001'0000ull;
     device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
     bridge::TextureInfo tex{pso::DxgiFormat::R8G8B8A8_UNORM, 128, 64, 1, 8, 1, GpuTextureDimension::Dim2D, false};
@@ -2638,6 +2642,10 @@ void test_memory_backed_tables() {
     e = last_bind_group_entry(enc, &id2);
     // Widened through to the end of the 4 KiB buffer (no reflected block size: the bytes that follow).
     CHECK(id2 == id && e.resource_id == kCb && e.offset == 0x100 && e.size == 4096 - 0x100);
+    CHECK(list.refresh_memory_bind_groups(prelude) == 0);
+    // #663: same words, but a relocation home was handed to another range: resolved again once.
+    ++relocation_epoch;
+    CHECK(list.refresh_memory_bind_groups(prelude) == 1);
     CHECK(list.refresh_memory_bind_groups(prelude) == 0);
 
     // Words the runtime cannot read as a descriptor bind null.
