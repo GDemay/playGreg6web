@@ -765,6 +765,14 @@ void live_title_tick(ne::NativeExecutor& exec) {
         double fps = 0, draws_per_frame = 0;
     };
     static Sample last;
+    // Recent stats for a report written after a guest fault (the finish hook only runs on a clean stop).
+    static auto last_snapshot = std::chrono::steady_clock::time_point{};
+    if (std::chrono::steady_clock::now() - last_snapshot >= std::chrono::seconds(1)) {
+        last_snapshot = std::chrono::steady_clock::now();
+        std::string json = exec.stats_json();
+        std::lock_guard<std::mutex> lock(g_live_final_mutex);
+        g_live_final_stats = std::move(json);
+    }
     const ne::ExecutorStats& st = exec.stats();
     const auto now = std::chrono::steady_clock::now();
     if (last.t.time_since_epoch().count() != 0) {
@@ -822,6 +830,14 @@ bool start_live_window() {
             ne::NativeExecutor::CreateStatus status;
             auto exec = ne::NativeExecutor::create(options, &status, err);
             if (exec) {
+                // The same WGPK the guest-side index uses (v1 or v2): hash-only shader payloads resolve to WGSL here.
+                if (!g_options.shader_pack.empty()) {
+                    std::string pack_error;
+                    if (exec->load_wgsl_pack(g_options.shader_pack, &pack_error))
+                        std::fprintf(stderr, "[harness] native executor shader pack loaded: %s\n", g_options.shader_pack.c_str());
+                    else
+                        std::fprintf(stderr, "[harness] native executor: shader pack %s: %s\n", g_options.shader_pack.c_str(), pack_error.c_str());
+                }
                 // The producer's read-back packets carry absolute host addresses (ReadbackGate /
                 // CommandList::readback_target), so the results land straight in the running guest.
                 ne::GuestMemory mem;
@@ -1283,11 +1299,30 @@ int main(int argc, char** argv) {
             device_options.dump_dir = dir.string();
         }
         if (!g_options.shader_pack.empty()) {
+            // Only the header + entry table are read (a merged pack is several GB).
             std::ifstream in(g_options.shader_pack, std::ios::binary);
-            const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            std::vector<uint8_t> bytes(gpu::kShaderPackHeaderBytes);
+            in.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            bytes.resize(static_cast<size_t>(in.gcount()));
+            uint32_t pack_count = 0, pack_version = 0;
             auto index = std::make_shared<gpu::ShaderPackIndex>();
             std::string error;
-            if (!gpu::parse_shader_pack_index(bytes.data(), bytes.size(), index.get(), &error)) {
+            bool pack_ok = gpu::parse_shader_pack_header(bytes.data(), bytes.size(), &pack_count, &error, &pack_version);
+            if (pack_ok) {
+                const size_t toc_bytes = gpu::kShaderPackHeaderBytes + size_t{pack_count} * gpu::shader_pack_entry_bytes(pack_version);
+                bytes.resize(toc_bytes);
+                in.read(reinterpret_cast<char*>(bytes.data() + gpu::kShaderPackHeaderBytes),
+                        static_cast<std::streamsize>(toc_bytes - gpu::kShaderPackHeaderBytes));
+                std::error_code size_ec;
+                const uint64_t file_size = std::filesystem::file_size(g_options.shader_pack, size_ec);
+                if (size_ec || static_cast<size_t>(in.gcount()) != toc_bytes - gpu::kShaderPackHeaderBytes) {
+                    error = "WGPK entry table exceeds the file";
+                    pack_ok = false;
+                } else {
+                    pack_ok = gpu::parse_shader_pack_index_toc(bytes.data(), bytes.size(), file_size, index.get(), &error);
+                }
+            }
+            if (!pack_ok) {
                 std::fprintf(stderr, "[harness] --shader-pack %s: %s\n", g_options.shader_pack.c_str(), error.c_str());
                 return kExitUsage;
             }
@@ -1352,8 +1387,11 @@ int main(int argc, char** argv) {
             o += "}";
             o += ",\n  \"pipeline_prewarm\": " + gpu::prewarm_host_report_json();
 #ifdef PLAYGTA6_NATIVE_EXECUTOR
-            if (g_live_started) {
-                o += ",\n  \"native_executor\": " + g_live.stats_json();
+            {
+                // stop_live_window() ran before the report: use the stats it captured on the executor thread.
+                std::lock_guard<std::mutex> lock(g_live_final_mutex);
+                if (g_live_final_stats != "null") o += ",\n  \"native_executor\": " + g_live_final_stats;
+                else if (g_live_started) o += ",\n  \"native_executor\": " + g_live.stats_json();
             }
 #endif
             o += ",\n  \"rt\": " + gpu::rt_arena::report_json();
