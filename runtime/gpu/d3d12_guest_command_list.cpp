@@ -382,6 +382,813 @@ void erase_aux(const CommandList* list) {
     g_aux_map.erase(list);
 }
 
+// ---------------------------------------------------------------------------------------------
+// GPU-to-GPU texture copy passes (ABI v2 render-pass blit & compute-pass storage copy)
+// ---------------------------------------------------------------------------------------------
+
+enum class CopySampleKind : uint8_t {
+    Unsupported = 0,
+    Float,
+    Uint,
+    Sint,
+    Depth,
+};
+
+CopySampleKind copy_sample_kind(pso::WgpuTextureFormat fmt) noexcept {
+    using F = pso::WgpuTextureFormat;
+    switch (fmt) {
+    case F::Depth16Unorm:
+    case F::Depth24Plus:
+    case F::Depth24PlusStencil8:
+    case F::Depth32Float:
+    case F::Depth32FloatStencil8:
+        return CopySampleKind::Depth;
+    case F::R8Uint:
+    case F::R16Uint:
+    case F::R32Uint:
+    case F::Rg8Uint:
+    case F::Rg16Uint:
+    case F::Rg32Uint:
+    case F::Rgba8Uint:
+    case F::Rgba16Uint:
+    case F::Rgba32Uint:
+    case F::Rgb10a2Uint:
+        return CopySampleKind::Uint;
+    case F::R8Sint:
+    case F::R16Sint:
+    case F::R32Sint:
+    case F::Rg8Sint:
+    case F::Rg16Sint:
+    case F::Rg32Sint:
+    case F::Rgba8Sint:
+    case F::Rgba16Sint:
+    case F::Rgba32Sint:
+        return CopySampleKind::Sint;
+    case F::R8Unorm:
+    case F::R8Snorm:
+    case F::R16Unorm:
+    case F::R16Snorm:
+    case F::R16Float:
+    case F::R32Float:
+    case F::Rg8Unorm:
+    case F::Rg8Snorm:
+    case F::Rg16Unorm:
+    case F::Rg16Snorm:
+    case F::Rg16Float:
+    case F::Rg32Float:
+    case F::Rgba8Unorm:
+    case F::Rgba8UnormSrgb:
+    case F::Rgba8Snorm:
+    case F::Bgra8Unorm:
+    case F::Bgra8UnormSrgb:
+    case F::Rgb10a2Unorm:
+    case F::Rg11b10Ufloat:
+    case F::Rgb9e5Ufloat:
+    case F::Rgba16Unorm:
+    case F::Rgba16Snorm:
+    case F::Rgba16Float:
+    case F::Rgba32Float:
+        return CopySampleKind::Float;
+    default:
+        return CopySampleKind::Unsupported;
+    }
+}
+
+pso::WgpuTextureFormat linear_copy_view_format(pso::WgpuTextureFormat fmt) noexcept {
+    if (fmt == pso::WgpuTextureFormat::Rgba8UnormSrgb) {
+        return pso::WgpuTextureFormat::Rgba8Unorm;
+    }
+    if (fmt == pso::WgpuTextureFormat::Bgra8UnormSrgb) {
+        return pso::WgpuTextureFormat::Bgra8Unorm;
+    }
+    return fmt;
+}
+
+const char* wgsl_storage_format_name(pso::WgpuTextureFormat fmt, uint32_t features) noexcept {
+    using F = pso::WgpuTextureFormat;
+    switch (fmt) {
+    case F::Rgba8Unorm: return "rgba8unorm";
+    case F::Rgba8Snorm: return "rgba8snorm";
+    case F::Rgba8Uint: return "rgba8uint";
+    case F::Rgba8Sint: return "rgba8sint";
+    case F::Rgba16Uint: return "rgba16uint";
+    case F::Rgba16Sint: return "rgba16sint";
+    case F::Rgba16Float: return "rgba16float";
+    case F::R32Uint: return "r32uint";
+    case F::R32Sint: return "r32sint";
+    case F::R32Float: return "r32float";
+    case F::Rg32Uint: return "rg32uint";
+    case F::Rg32Sint: return "rg32sint";
+    case F::Rg32Float: return "rg32float";
+    case F::Rgba32Uint: return "rgba32uint";
+    case F::Rgba32Sint: return "rgba32sint";
+    case F::Rgba32Float: return "rgba32float";
+    case F::Bgra8Unorm:
+        return (features & pso::WgpuFeature::Bgra8UnormStorage) != 0u ? "bgra8unorm" : nullptr;
+    default:
+        return nullptr;
+    }
+}
+
+pso::WgpuTextureFormat resource_wgpu_format(const Resource* r, uint32_t features) noexcept {
+    if (r == nullptr || r->is_buffer()) {
+        return pso::WgpuTextureFormat::Undefined;
+    }
+    const bool depth = (r->desc().Flags & ResourceFlags::AllowDepthStencil) != 0u;
+    const bool rt = (r->desc().Flags & ResourceFlags::AllowRenderTarget) != 0u;
+    const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
+                                         : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
+    const pso::TextureFormatMapping m =
+        pso::map_texture_format(static_cast<pso::DxgiFormat>(r->desc().Format), usage, features);
+    return m.supported() ? m.format : pso::WgpuTextureFormat::Undefined;
+}
+
+bool copy_kinds_compatible(CopySampleKind src_kind, CopySampleKind dst_kind, bool allow_depth_cross) noexcept {
+    if (src_kind == CopySampleKind::Unsupported || dst_kind == CopySampleKind::Unsupported) {
+        return false;
+    }
+    if (src_kind == dst_kind) {
+        return true;
+    }
+    if (allow_depth_cross) {
+        return (src_kind == CopySampleKind::Depth && dst_kind == CopySampleKind::Float) ||
+               (src_kind == CopySampleKind::Float && dst_kind == CopySampleKind::Depth);
+    }
+    return false;
+}
+
+uint32_t pack_signed_delta_i16(int32_t dx, int32_t dy) noexcept {
+    const uint32_t ux = static_cast<uint32_t>(static_cast<uint16_t>(dx));
+    const uint32_t uy = static_cast<uint32_t>(static_cast<uint16_t>(dy));
+    return ux | (uy << 16u);
+}
+
+constexpr const char* kTexCopyBlitVs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) inst: u32) -> VsOut {
+  let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+  let raw_x = i32(inst & 0xffffu);
+  let raw_y = i32((inst >> 16u) & 0xffffu);
+  let dx = select(raw_x, raw_x - 65536, raw_x >= 32768);
+  let dy = select(raw_y, raw_y - 65536, raw_y >= 32768);
+  return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), vec2<i32>(dx, dy));
+}
+)";
+
+constexpr const char* kTexCopyFloatFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  return textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0);
+}
+)";
+
+constexpr const char* kTexCopyUintFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+@group(0) @binding(0) var src_tex: texture_2d<u32>;
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<u32> {
+  return textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0);
+}
+)";
+
+constexpr const char* kTexCopySintFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+@group(0) @binding(0) var src_tex: texture_2d<i32>;
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<i32> {
+  return textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0);
+}
+)";
+
+constexpr const char* kTexCopyDepthFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+struct FsOut { @builtin(frag_depth) depth: f32 };
+@group(0) @binding(0) var src_tex: texture_depth_2d;
+@fragment fn fs_main(in: VsOut) -> FsOut {
+  return FsOut(textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0));
+}
+)";
+
+constexpr const char* kTexCopyDepthToFloatFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+@group(0) @binding(0) var src_tex: texture_depth_2d;
+@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+  let d = textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0);
+  return vec4<f32>(d, 0.0, 0.0, 1.0);
+}
+)";
+
+constexpr const char* kTexCopyFloatToDepthFs = R"(
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) @interpolate(flat) delta: vec2<i32>,
+};
+struct FsOut { @builtin(frag_depth) depth: f32 };
+@group(0) @binding(0) var src_tex: texture_2d<f32>;
+@fragment fn fs_main(in: VsOut) -> FsOut {
+  let v = textureLoad(src_tex, vec2<i32>(in.pos.xy) + in.delta, 0);
+  return FsOut(clamp(v.x, 0.0, 1.0));
+}
+)";
+
+std::string build_compute_copy_wgsl(const char* storage_fmt_name, CopySampleKind src_kind, bool is_3d,
+                                    bool with_params) {
+    const bool depth_src = src_kind == CopySampleKind::Depth;
+    const char* scalar = src_kind == CopySampleKind::Uint ? "u32" : (src_kind == CopySampleKind::Sint ? "i32" : "f32");
+    std::string s;
+    if (with_params) {
+        s += "struct CopyParams { src_origin: vec4<u32>, dst_origin: vec4<u32>, extent: vec4<u32>, };\n";
+    }
+    if (depth_src) {
+        s += "@group(0) @binding(0) var src_tex: texture_depth_2d;\n";
+    } else if (is_3d) {
+        s += std::string("@group(0) @binding(0) var src_tex: texture_3d<") + scalar + ">;\n";
+    } else {
+        s += std::string("@group(0) @binding(0) var src_tex: texture_2d<") + scalar + ">;\n";
+    }
+    s += std::string("@group(0) @binding(1) var dst_tex: ") +
+         (is_3d ? "texture_storage_3d<" : "texture_storage_2d<") + storage_fmt_name + ", write>;\n";
+    if (with_params) {
+        s += "@group(0) @binding(2) var<uniform> params: CopyParams;\n";
+    }
+    s += is_3d ? "@compute @workgroup_size(4, 4, 4)\n" : "@compute @workgroup_size(8, 8, 1)\n";
+    s += "fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {\n";
+    if (with_params) {
+        if (is_3d) {
+            s += "  if (any(id >= params.extent.xyz)) { return; }\n";
+            s += "  let sc = vec3<i32>(params.src_origin.xyz + id);\n";
+            s += "  let dc = vec3<i32>(params.dst_origin.xyz + id);\n";
+            s += "  textureStore(dst_tex, dc, textureLoad(src_tex, sc, 0));\n";
+        } else {
+            s += "  if (any(id.xy >= params.extent.xy)) { return; }\n";
+            s += "  let sc = vec2<i32>(params.src_origin.xy + id.xy);\n";
+            s += "  let dc = vec2<i32>(params.dst_origin.xy + id.xy);\n";
+            if (depth_src) {
+                s += "  let d = textureLoad(src_tex, sc, 0);\n";
+                s += "  textureStore(dst_tex, dc, vec4<f32>(d, 0.0, 0.0, 1.0));\n";
+            } else {
+                s += "  textureStore(dst_tex, dc, textureLoad(src_tex, sc, 0));\n";
+            }
+        }
+    } else {
+        if (is_3d) {
+            s += "  if (any(id >= textureDimensions(dst_tex))) { return; }\n";
+            s += "  textureStore(dst_tex, vec3<i32>(id), textureLoad(src_tex, vec3<i32>(id), 0));\n";
+        } else {
+            s += "  if (any(id.xy >= textureDimensions(dst_tex))) { return; }\n";
+            if (depth_src) {
+                s += "  let d = textureLoad(src_tex, vec2<i32>(id.xy), 0);\n";
+                s += "  textureStore(dst_tex, vec2<i32>(id.xy), vec4<f32>(d, 0.0, 0.0, 1.0));\n";
+            } else {
+                s += "  textureStore(dst_tex, vec2<i32>(id.xy), textureLoad(src_tex, vec2<i32>(id.xy), 0));\n";
+            }
+        }
+    }
+    s += "}\n";
+    return s;
+}
+
+struct CopyParamsKey {
+    uint32_t sx = 0, sy = 0, sz = 0;
+    uint32_t dx = 0, dy = 0, dz = 0;
+    uint32_t ex = 0, ey = 0, ez = 0;
+    bool operator==(const CopyParamsKey& o) const noexcept {
+        return sx == o.sx && sy == o.sy && sz == o.sz && dx == o.dx && dy == o.dy && dz == o.dz && ex == o.ex &&
+               ey == o.ey && ez == o.ez;
+    }
+};
+
+struct CopyParamsKeyHash {
+    size_t operator()(const CopyParamsKey& k) const noexcept {
+        size_t h = 14695981039346656037ull;
+        const uint32_t vals[9] = {k.sx, k.sy, k.sz, k.dx, k.dy, k.dz, k.ex, k.ey, k.ez};
+        for (uint32_t v : vals) {
+            h ^= v;
+            h *= 1099511628211ull;
+        }
+        return h;
+    }
+};
+
+// Per-Device cache of ABI v2 texture-copy shader modules, layouts, pipelines, and uniform buffers.
+// Refcounted by live CommandList instances (which hold com::Ref<Device>), so the entry is always
+// erased before Device destruction — avoiding both leaks and pointer-reuse ABA hazards in tests.
+struct DeviceTexCopyCache {
+    uint64_t live_lists = 0;
+    uint32_t blit_vs = 0;
+    // Keyed by (src_kind << 4) | dst_kind.
+    std::unordered_map<uint32_t, uint32_t> blit_fs;
+    // Keyed by src_kind (1=Float, 2=Uint, 3=Sint, 4=Depth).
+    std::unordered_map<uint8_t, uint32_t> blit_bgl;
+    std::unordered_map<uint8_t, uint32_t> blit_pl;
+    // Keyed by (dst_wgpu_code << 16) | (src_kind << 8) | dst_kind.
+    std::unordered_map<uint32_t, uint32_t> blit_pipelines;
+
+    struct ComputeCopyPipeline {
+        uint32_t bgl = 0;
+        uint32_t pipeline = 0;
+    };
+    // Keyed by (dst_wgpu_code << 16) | (src_kind << 8) | (is_3d ? 2 : 0) | (with_params ? 1 : 0).
+    std::unordered_map<uint32_t, ComputeCopyPipeline> compute_pipelines;
+    std::unordered_map<CopyParamsKey, uint32_t, CopyParamsKeyHash> params_buffers;
+};
+
+std::mutex g_tex_copy_cache_mutex;
+std::unordered_map<const Device*, std::unique_ptr<DeviceTexCopyCache>> g_tex_copy_cache;
+
+void retain_device_copy_cache(const Device* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_tex_copy_cache_mutex);
+    auto& entry = g_tex_copy_cache[dev];
+    if (!entry) {
+        entry = std::make_unique<DeviceTexCopyCache>();
+    }
+    ++entry->live_lists;
+}
+
+void release_device_copy_cache(const Device* dev) {
+    if (dev == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_tex_copy_cache_mutex);
+    auto it = g_tex_copy_cache.find(dev);
+    if (it == g_tex_copy_cache.end() || !it->second) {
+        return;
+    }
+    if (it->second->live_lists <= 1u) {
+        g_tex_copy_cache.erase(it);
+    } else {
+        --it->second->live_lists;
+    }
+}
+
+struct SubresourceCopySpec {
+    uint32_t src_mip = 0;
+    uint32_t src_layer = 0;
+    uint32_t src_x = 0;
+    uint32_t src_y = 0;
+    uint32_t src_z = 0;
+    uint32_t dst_mip = 0;
+    uint32_t dst_layer = 0;
+    uint32_t dst_x = 0;
+    uint32_t dst_y = 0;
+    uint32_t dst_z = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t depth = 1;
+    bool full_subresource = false;
+};
+
+struct TextureCopyPlan {
+    enum class Mode : uint8_t { None, RenderBlit, ComputeStorage };
+    Mode mode = Mode::None;
+    CopySampleKind src_kind = CopySampleKind::Unsupported;
+    CopySampleKind dst_kind = CopySampleKind::Unsupported;
+    pso::WgpuTextureFormat src_view_fmt = pso::WgpuTextureFormat::Undefined;
+    pso::WgpuTextureFormat dst_view_fmt = pso::WgpuTextureFormat::Undefined;
+    const char* storage_fmt_name = nullptr;
+    bool is_3d = false;
+    bool dst_swapchain = false;
+};
+
+TextureCopyPlan plan_gpu_texture_copy(Device& dev, const Resource* dst, const Resource* src) {
+    TextureCopyPlan plan{};
+    if (dst == nullptr || src == nullptr || dst->is_buffer() || src->is_buffer() || !dst->has_gpu_texture() ||
+        !src->has_gpu_texture()) {
+        return plan;
+    }
+    if (src->desc().SampleCount > 1u || dst->desc().SampleCount > 1u) {
+        return plan;
+    }
+    if ((src->desc().Flags & ResourceFlags::DenyShaderResource) != 0u) {
+        return plan;
+    }
+    bridge::TextureInfo dst_info{}, src_info{};
+    if (!dev.state_bridge().texture_info(dst->id(), &dst_info) ||
+        !dev.state_bridge().texture_info(src->id(), &src_info)) {
+        return plan;
+    }
+    if (src_info.swapchain) {
+        return plan;  // canvas context lacks TEXTURE_BINDING
+    }
+    const uint32_t features = dev.state_bridge().options().features;
+    const pso::WgpuTextureFormat src_wgpu = resource_wgpu_format(src, features);
+    const pso::WgpuTextureFormat dst_wgpu = resource_wgpu_format(dst, features);
+    const CopySampleKind src_kind = copy_sample_kind(src_wgpu);
+    const CopySampleKind dst_kind = copy_sample_kind(dst_wgpu);
+    if (!copy_kinds_compatible(src_kind, dst_kind, /*allow_depth_cross=*/true)) {
+        return plan;
+    }
+    // Use linear view formats for sRGB textures so the copy is bit-exact (no gamma decode/encode).
+    const pso::WgpuTextureFormat src_view_fmt = linear_copy_view_format(src_wgpu);
+    const pso::WgpuTextureFormat dst_view_fmt = dst_info.swapchain ? dst_wgpu : linear_copy_view_format(dst_wgpu);
+
+    const bool both_2d = src_info.dimension == GpuTextureDimension::Dim2D &&
+                         dst_info.dimension == GpuTextureDimension::Dim2D;
+    const bool both_3d = src_info.dimension == GpuTextureDimension::Dim3D &&
+                         dst_info.dimension == GpuTextureDimension::Dim3D;
+
+    // Path 1: Render-pass blit for 2D / 2D-Array / Cube RT or Depth-Stencil destinations.
+    if (both_2d) {
+        const bool dst_is_depth = dst_kind == CopySampleKind::Depth;
+        const bool can_render =
+            dst_is_depth
+                ? ((dst->desc().Flags & ResourceFlags::AllowDepthStencil) != 0u && pso::has_depth_aspect(dst_view_fmt))
+                : (((dst->desc().Flags & ResourceFlags::AllowRenderTarget) != 0u || dst_info.swapchain) &&
+                   pso::is_color_renderable(dst_view_fmt, features));
+        if (can_render) {
+            plan.mode = TextureCopyPlan::Mode::RenderBlit;
+            plan.src_kind = src_kind;
+            plan.dst_kind = dst_kind;
+            plan.src_view_fmt = src_view_fmt;
+            plan.dst_view_fmt = dst_view_fmt;
+            plan.is_3d = false;
+            plan.dst_swapchain = dst_info.swapchain;
+            return plan;
+        }
+    }
+
+    // Path 2: Compute-pass copy for 2D or 3D StorageBinding (UAV) destinations.
+    if ((both_2d || both_3d) && dst_info.storage && !dst_info.swapchain && dst_kind != CopySampleKind::Depth &&
+        !(both_3d && src_kind == CopySampleKind::Depth)) {
+        const char* storage_name = wgsl_storage_format_name(dst_view_fmt, features);
+        if (storage_name != nullptr) {
+            plan.mode = TextureCopyPlan::Mode::ComputeStorage;
+            plan.src_kind = src_kind;
+            plan.dst_kind = dst_kind;
+            plan.src_view_fmt = src_view_fmt;
+            plan.dst_view_fmt = dst_view_fmt;
+            plan.storage_fmt_name = storage_name;
+            plan.is_3d = both_3d;
+            plan.dst_swapchain = false;
+            return plan;
+        }
+    }
+
+    return plan;
+}
+
+bool emit_gpu_texture_subresource_copy(Device& dev, const TextureCopyPlan& plan, uint32_t dst_id, uint32_t src_id,
+                                       const SubresourceCopySpec& spec, CommandEncoder& enc) {
+    if (plan.mode == TextureCopyPlan::Mode::None || spec.width == 0 || spec.height == 0 || spec.depth == 0) {
+        return false;
+    }
+    uint32_t host_src_mip = spec.src_mip;
+    uint32_t host_dst_mip = spec.dst_mip;
+    if (!dev.state_bridge().translate_host_mip(src_id, &host_src_mip) ||
+        !dev.state_bridge().translate_host_mip(dst_id, &host_dst_mip)) {
+        return true;  // mip trimmed by texture_budget: cleanly skipped
+    }
+
+    if (plan.mode == TextureCopyPlan::Mode::RenderBlit) {
+        const int32_t dx = static_cast<int32_t>(spec.src_x) - static_cast<int32_t>(spec.dst_x);
+        const int32_t dy = static_cast<int32_t>(spec.src_y) - static_cast<int32_t>(spec.dst_y);
+        if (dx < -32768 || dx > 32767 || dy < -32768 || dy > 32767) {
+            return false;
+        }
+        const uint8_t src_kind_u8 = static_cast<uint8_t>(plan.src_kind);
+        const uint8_t dst_kind_u8 = static_cast<uint8_t>(plan.dst_kind);
+        const uint8_t dst_fmt_code = static_cast<uint8_t>(plan.dst_view_fmt);
+        const uint32_t fs_key = (uint32_t{src_kind_u8} << 4u) | dst_kind_u8;
+        const uint32_t pipe_key = (uint32_t{dst_fmt_code} << 16u) | (uint32_t{src_kind_u8} << 8u) | dst_kind_u8;
+
+        uint32_t group_layout_id = 0;
+        uint32_t pipeline_id = 0;
+        CommandEncoder setup;
+        {
+            std::lock_guard<std::mutex> lock(g_tex_copy_cache_mutex);
+            auto& entry_ptr = g_tex_copy_cache[&dev];
+            if (!entry_ptr) {
+                entry_ptr = std::make_unique<DeviceTexCopyCache>();
+            }
+            DeviceTexCopyCache& cache = *entry_ptr;
+            if (cache.blit_vs == 0) {
+                cache.blit_vs = dev.allocate_id();
+                setup.create_shader_module(cache.blit_vs, GpuShaderStage::Vertex, kTexCopyBlitVs);
+            }
+            uint32_t& fs_id = cache.blit_fs[fs_key];
+            if (fs_id == 0) {
+                const char* fs_wgsl = kTexCopyFloatFs;
+                if (plan.src_kind == CopySampleKind::Depth && plan.dst_kind == CopySampleKind::Depth) {
+                    fs_wgsl = kTexCopyDepthFs;
+                } else if (plan.src_kind == CopySampleKind::Depth && plan.dst_kind == CopySampleKind::Float) {
+                    fs_wgsl = kTexCopyDepthToFloatFs;
+                } else if (plan.src_kind == CopySampleKind::Float && plan.dst_kind == CopySampleKind::Depth) {
+                    fs_wgsl = kTexCopyFloatToDepthFs;
+                } else if (plan.src_kind == CopySampleKind::Uint) {
+                    fs_wgsl = kTexCopyUintFs;
+                } else if (plan.src_kind == CopySampleKind::Sint) {
+                    fs_wgsl = kTexCopySintFs;
+                }
+                fs_id = dev.allocate_id();
+                setup.create_shader_module(fs_id, GpuShaderStage::Fragment, fs_wgsl);
+            }
+            uint32_t& bgl_id = cache.blit_bgl[src_kind_u8];
+            uint32_t& pl_id = cache.blit_pl[src_kind_u8];
+            if (bgl_id == 0) {
+                GpuBindGroupLayoutEntry e{};
+                e.binding = 0;
+                e.visibility = GpuShaderStageBits::Fragment;
+                e.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+                e.binding_type = static_cast<uint8_t>(
+                    plan.src_kind == CopySampleKind::Depth
+                        ? GpuTextureSampleType::Depth
+                        : (plan.src_kind == CopySampleKind::Uint
+                               ? GpuTextureSampleType::Uint
+                               : (plan.src_kind == CopySampleKind::Sint ? GpuTextureSampleType::Sint
+                                                                        : GpuTextureSampleType::UnfilterableFloat)));
+                e.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+                bgl_id = dev.allocate_id();
+                GpuCreateBindGroupLayoutPayload bgl{};
+                bgl.id = bgl_id;
+                bgl.entry_count = 1;
+                setup.emit_packet(GpuOpcode::CreateBindGroupLayout, &bgl, sizeof(bgl), &e, sizeof(e));
+                pl_id = dev.allocate_id();
+                GpuCreatePipelineLayoutPayload pl{};
+                pl.id = pl_id;
+                pl.bind_group_layout_count = 1;
+                setup.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &bgl_id, sizeof(uint32_t));
+            }
+            group_layout_id = bgl_id;
+            uint32_t& pipe = cache.blit_pipelines[pipe_key];
+            if (pipe == 0) {
+                pipe = dev.allocate_id();
+                GpuCreateRenderPipeline2Payload rp{};
+                rp.id = pipe;
+                rp.vs_module_id = cache.blit_vs;
+                rp.fs_module_id = fs_id;
+                rp.pipeline_layout_id = pl_id;
+                rp.key.vs_shader = 1;
+                rp.key.ps_shader = 1;
+                if (plan.dst_kind == CopySampleKind::Depth) {
+                    rp.key.color_target_count = 0;
+                    rp.key.depth_stencil.format = dst_fmt_code;
+                    rp.key.depth_stencil.depth_write_enabled = 1;
+                    rp.key.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+                    rp.key.depth_stencil.stencil_front.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+                    rp.key.depth_stencil.stencil_back.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+                } else {
+                    rp.key.color_target_count = 1;
+                    rp.key.color_targets[0].format = dst_fmt_code;
+                    rp.key.color_targets[0].write_mask = 0xFu;
+                }
+                rp.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+                rp.key.multisample.count = 1;
+                rp.key.multisample.mask = 0xFFFFFFFFu;
+                setup.emit_packet(GpuOpcode::CreateRenderPipeline2, &rp, sizeof(rp));
+            }
+            pipeline_id = pipe;
+        }
+        if (!setup.empty()) {
+            dev.submit(setup);
+        }
+
+        const uint32_t group_id = dev.allocate_id();
+        GpuBindGroupEntry2 entry{};
+        entry.binding = 0;
+        entry.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+        entry.resource_id = src_id;
+        entry.view.format =
+            plan.src_kind == CopySampleKind::Depth ? 0u : static_cast<uint8_t>(plan.src_view_fmt);
+        entry.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entry.view.aspect = static_cast<uint8_t>(
+            plan.src_kind == CopySampleKind::Depth ? GpuTextureAspect::DepthOnly : GpuTextureAspect::All);
+        entry.view.base_mip_level = static_cast<uint16_t>(host_src_mip);
+        entry.view.mip_level_count = 1;
+        entry.view.base_array_layer = spec.src_layer;
+        entry.view.array_layer_count = 1;
+        GpuCreateBindGroup2Payload bg{};
+        bg.id = group_id;
+        bg.layout_id = group_layout_id;
+        bg.entry_count = 1;
+        enc.emit_packet(GpuOpcode::CreateBindGroup2, &bg, sizeof(bg), &entry, sizeof(entry));
+
+        GpuBeginRenderPassPayload pass{};
+        const uint8_t load_op =
+            static_cast<uint8_t>(spec.full_subresource ? GpuLoadOp::Clear : GpuLoadOp::Load);
+        if (plan.dst_kind == CopySampleKind::Depth) {
+            pass.color_count = 0;
+            GpuRenderPassDepthStencilAttachment& d = pass.depth_stencil;
+            d.texture_id = dst_id;
+            d.depth_load_op = load_op;
+            d.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+            d.depth_clear_value = 0.0f;
+            if (pso::has_stencil_aspect(plan.dst_view_fmt)) {
+                d.stencil_read_only = 1;
+            }
+            d.view.format = dst_fmt_code;
+            d.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+            d.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+            d.view.base_mip_level = static_cast<uint16_t>(host_dst_mip);
+            d.view.mip_level_count = 1;
+            d.view.base_array_layer = spec.dst_layer;
+            d.view.array_layer_count = 1;
+        } else {
+            pass.color_count = 1;
+            GpuRenderPassColorAttachment& c = pass.color[0];
+            c.texture_id = plan.dst_swapchain ? kGpuSwapchainTextureId : dst_id;
+            c.load_op = load_op;
+            c.store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+            c.view.format = dst_fmt_code;
+            c.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+            c.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+            c.view.base_mip_level = static_cast<uint16_t>(host_dst_mip);
+            c.view.mip_level_count = 1;
+            c.view.base_array_layer = spec.dst_layer;
+            c.view.array_layer_count = 1;
+        }
+        enc.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+        enc.set_pipeline(pipeline_id);
+        const GpuSetBindGroup2Payload set{0u, group_id, 0u, 0u};
+        enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+        if (!spec.full_subresource) {
+            GpuSetViewportPayload vp{};
+            vp.x = static_cast<float>(spec.dst_x);
+            vp.y = static_cast<float>(spec.dst_y);
+            vp.width = static_cast<float>(spec.width);
+            vp.height = static_cast<float>(spec.height);
+            vp.min_depth = 0.0f;
+            vp.max_depth = 1.0f;
+            enc.emit_packet(GpuOpcode::SetViewport, &vp, sizeof(vp));
+            GpuSetScissorRectPayload sc{};
+            sc.x = spec.dst_x;
+            sc.y = spec.dst_y;
+            sc.width = spec.width;
+            sc.height = spec.height;
+            enc.emit_packet(GpuOpcode::SetScissorRect, &sc, sizeof(sc));
+        }
+        enc.draw(3, 1, 0, pack_signed_delta_i16(dx, dy));
+        enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        return true;
+    }
+
+    // Path 2: Compute-pass copy for 2D / 3D storage-capable destinations.
+    const bool with_params = !spec.full_subresource || spec.src_x != 0 || spec.src_y != 0 || spec.src_z != 0 ||
+                             spec.dst_x != 0 || spec.dst_y != 0 || spec.dst_z != 0;
+    const uint8_t dst_fmt_code = static_cast<uint8_t>(plan.dst_view_fmt);
+    const uint8_t src_kind_u8 = static_cast<uint8_t>(plan.src_kind);
+    const uint8_t dim_code = static_cast<uint8_t>(plan.is_3d ? GpuTextureViewDimension::Dim3D
+                                                             : GpuTextureViewDimension::Dim2D);
+    const uint32_t cs_key = (uint32_t{dst_fmt_code} << 16u) | (uint32_t{src_kind_u8} << 8u) |
+                            (plan.is_3d ? 2u : 0u) | (with_params ? 1u : 0u);
+
+    uint32_t group_layout_id = 0;
+    uint32_t pipeline_id = 0;
+    uint32_t params_buf_id = 0;
+    CommandEncoder setup;
+    {
+        std::lock_guard<std::mutex> lock(g_tex_copy_cache_mutex);
+        auto& entry_ptr = g_tex_copy_cache[&dev];
+        if (!entry_ptr) {
+            entry_ptr = std::make_unique<DeviceTexCopyCache>();
+        }
+        DeviceTexCopyCache& cache = *entry_ptr;
+        auto& cp = cache.compute_pipelines[cs_key];
+        if (cp.pipeline == 0) {
+            const uint32_t mod_id = dev.allocate_id();
+            setup.create_shader_module(
+                mod_id, GpuShaderStage::Compute,
+                build_compute_copy_wgsl(plan.storage_fmt_name, plan.src_kind, plan.is_3d, with_params));
+            GpuBindGroupLayoutEntry entries[3] = {};
+            entries[0].binding = 0;
+            entries[0].visibility = GpuShaderStageBits::Compute;
+            entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+            entries[0].binding_type = static_cast<uint8_t>(
+                plan.src_kind == CopySampleKind::Depth
+                    ? GpuTextureSampleType::Depth
+                    : (plan.src_kind == CopySampleKind::Uint
+                           ? GpuTextureSampleType::Uint
+                           : (plan.src_kind == CopySampleKind::Sint ? GpuTextureSampleType::Sint
+                                                                    : GpuTextureSampleType::UnfilterableFloat)));
+            entries[0].view_dimension = dim_code;
+            entries[1].binding = 1;
+            entries[1].visibility = GpuShaderStageBits::Compute;
+            entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture);
+            entries[1].binding_type = static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly);
+            entries[1].view_dimension = dim_code;
+            entries[1].storage_format = dst_fmt_code;
+            uint32_t entry_count = 2;
+            if (with_params) {
+                entries[2].binding = 2;
+                entries[2].visibility = GpuShaderStageBits::Compute;
+                entries[2].type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+                entries[2].binding_type = static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+                entries[2].min_binding_size = 48;
+                entry_count = 3;
+            }
+            cp.bgl = dev.allocate_id();
+            GpuCreateBindGroupLayoutPayload bgl{};
+            bgl.id = cp.bgl;
+            bgl.entry_count = entry_count;
+            setup.emit_packet(GpuOpcode::CreateBindGroupLayout, &bgl, sizeof(bgl), entries,
+                              entry_count * sizeof(GpuBindGroupLayoutEntry));
+            const uint32_t pl_id = dev.allocate_id();
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = pl_id;
+            pl.bind_group_layout_count = 1;
+            setup.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &cp.bgl, sizeof(uint32_t));
+            cp.pipeline = dev.allocate_id();
+            GpuCreateComputePipeline2Payload pipe{};
+            pipe.id = cp.pipeline;
+            pipe.cs_module_id = mod_id;
+            pipe.pipeline_layout_id = pl_id;
+            setup.emit_packet(GpuOpcode::CreateComputePipeline2, &pipe, sizeof(pipe));
+        }
+        group_layout_id = cp.bgl;
+        pipeline_id = cp.pipeline;
+        if (with_params) {
+            const CopyParamsKey pk{spec.src_x, spec.src_y, spec.src_z, spec.dst_x, spec.dst_y,
+                                   spec.dst_z, spec.width, spec.height, spec.depth};
+            auto it = cache.params_buffers.find(pk);
+            if (it != cache.params_buffers.end()) {
+                params_buf_id = it->second;
+            } else {
+                params_buf_id = dev.allocate_id();
+                const uint32_t words[12] = {spec.src_x, spec.src_y, spec.src_z, 0u,
+                                            spec.dst_x, spec.dst_y, spec.dst_z, 0u,
+                                            spec.width, spec.height, spec.depth, 0u};
+                setup.create_buffer(params_buf_id, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, sizeof(words));
+                setup.write_buffer(params_buf_id, 0, words, sizeof(words));
+                if (cache.params_buffers.size() < 256u) {
+                    cache.params_buffers.emplace(pk, params_buf_id);
+                }
+            }
+        }
+    }
+    if (!setup.empty()) {
+        dev.submit(setup);
+    }
+
+    const uint32_t group_id = dev.allocate_id();
+    GpuBindGroupEntry2 e[3] = {};
+    e[0].binding = 0;
+    e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+    e[0].resource_id = src_id;
+    e[0].view.format = plan.src_kind == CopySampleKind::Depth ? 0u : static_cast<uint8_t>(plan.src_view_fmt);
+    e[0].view.dimension = dim_code;
+    e[0].view.aspect = static_cast<uint8_t>(
+        plan.src_kind == CopySampleKind::Depth ? GpuTextureAspect::DepthOnly : GpuTextureAspect::All);
+    e[0].view.base_mip_level = static_cast<uint16_t>(host_src_mip);
+    e[0].view.mip_level_count = 1;
+    e[0].view.base_array_layer = plan.is_3d ? 0u : spec.src_layer;
+    e[0].view.array_layer_count = 1;
+
+    e[1].binding = 1;
+    e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+    e[1].resource_id = dst_id;
+    e[1].view.format = dst_fmt_code;
+    e[1].view.dimension = dim_code;
+    e[1].view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+    e[1].view.base_mip_level = static_cast<uint16_t>(host_dst_mip);
+    e[1].view.mip_level_count = 1;
+    e[1].view.base_array_layer = plan.is_3d ? 0u : spec.dst_layer;
+    e[1].view.array_layer_count = 1;
+
+    uint32_t entry_count = 2;
+    if (with_params) {
+        e[2].binding = 2;
+        e[2].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+        e[2].resource_id = params_buf_id;
+        e[2].offset = 0;
+        e[2].size = 48;
+        entry_count = 3;
+    }
+    GpuCreateBindGroup2Payload bg{};
+    bg.id = group_id;
+    bg.layout_id = group_layout_id;
+    bg.entry_count = entry_count;
+    enc.emit_packet(GpuOpcode::CreateBindGroup2, &bg, sizeof(bg), e, entry_count * sizeof(GpuBindGroupEntry2));
+
+    enc.set_compute_pipeline(pipeline_id);
+    const GpuSetBindGroup2Payload set{0u, group_id, 0u, 0u};
+    enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    const uint32_t wg_xy = plan.is_3d ? 4u : 8u;
+    const uint32_t gx = (spec.width + wg_xy - 1u) / wg_xy;
+    const uint32_t gy = (spec.height + wg_xy - 1u) / wg_xy;
+    const uint32_t gz = plan.is_3d ? (spec.depth + 3u) / 4u : 1u;
+    enc.dispatch_compute(gx, gy, gz);
+    return true;
+}
+
 // Synchronizes any depth-as-SRV descriptor table bindings against `aux.depth_twin` so pending twin
 // writes are flushed and stale SRV twins are refreshed accurately across mip levels and array layers.
 void sync_depth_srvs_for_tables(Device& dev, CommandListAux& aux, const d3d::RootSignature* rs,
@@ -614,11 +1421,13 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
 
 CommandList::CommandList(com::Ref<Device> device, uint32_t type)
     : ChildBase(std::move(device)), type_(type), bridge_(device_->state_bridge(), encoder_) {
+    retain_device_copy_cache(device_.get());
     device_->command_lists.fetch_add(1);
 }
 
 CommandList::~CommandList() {
     erase_aux(this);
+    release_device_copy_cache(device_.get());
     device_->command_lists.fetch_sub(1);
 }
 
@@ -1545,8 +2354,61 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
         }
         return;
     }
-    if (!dst->is_buffer() && is_depth_dxgi_format(dst->desc().Format)) {
-        aux_of(this).depth_twin.note_depth_copied(dst->id(), 0, 0, 0, 0);
+    if (!dst->is_buffer() && !src->is_buffer()) {
+        if (src == dst) {
+            return;  // self-copy is a no-op
+        }
+        if (dst->desc().Dimension != src->desc().Dimension || dst->desc().Width != src->desc().Width ||
+            dst->desc().Height != src->desc().Height ||
+            dst->desc().DepthOrArraySize != src->desc().DepthOrArraySize ||
+            dst->mip_levels() != src->mip_levels() || dst->desc().SampleCount != src->desc().SampleCount) {
+            note("CopyResource: incompatible source and destination texture dimensions");
+            return;
+        }
+        const TextureCopyPlan plan = plan_gpu_texture_copy(*device_, dst, src);
+        if (plan.mode != TextureCopyPlan::Mode::None) {
+            pinned_.push_back(com::Ref<com::ComObject>::share(src));
+            pinned_.push_back(com::Ref<com::ComObject>::share(dst));
+            device_->sync_bound_texture_memory(src->id(), encoder_);
+            bridge_.ResourceBarrier(0, nullptr);
+            const uint32_t mips = std::max<uint32_t>(1u, dst->mip_levels());
+            const uint32_t layers = plan.is_3d ? 1u : std::max<uint32_t>(1u, dst->array_layers());
+            bool all_ok = true;
+            for (uint32_t mip = 0; mip < mips && all_ok; ++mip) {
+                const uint32_t mw = std::max<uint32_t>(1u, static_cast<uint32_t>(dst->desc().Width >> mip));
+                const uint32_t mh = std::max<uint32_t>(1u, dst->desc().Height >> mip);
+                const uint32_t md =
+                    plan.is_3d ? std::max<uint32_t>(1u, static_cast<uint32_t>(dst->desc().DepthOrArraySize) >> mip) : 1u;
+                for (uint32_t layer = 0; layer < layers; ++layer) {
+                    SubresourceCopySpec spec{};
+                    spec.src_mip = mip;
+                    spec.src_layer = layer;
+                    spec.dst_mip = mip;
+                    spec.dst_layer = layer;
+                    spec.width = mw;
+                    spec.height = mh;
+                    spec.depth = md;
+                    spec.full_subresource = true;
+                    if (!emit_gpu_texture_subresource_copy(*device_, plan, dst->id(), src->id(), spec, encoder_)) {
+                        all_ok = false;
+                        break;
+                    }
+                }
+            }
+            if (is_depth_dxgi_format(dst->desc().Format)) {
+                aux_of(this).depth_twin.note_depth_copied(dst->id(), 0, 0, 0, 0);
+            }
+            device_->note_texture_copy_destination(dst->id());
+            if (all_ok) {
+                return;
+            }
+        }
+        if (is_depth_dxgi_format(dst->desc().Format)) {
+            aux_of(this).depth_twin.note_depth_copied(dst->id(), 0, 0, 0, 0);
+        }
+        device_->note_unsupported_copy(
+            "CopyResource: GPU texture-to-texture copy requires render-attachment or storage destination (skipped)");
+        return;
     }
     device_->note_unsupported_copy("CopyResource: only CPU-visible buffer sources are supported (skipped)");
 }
@@ -1571,23 +2433,119 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
         return;
     }
     if (dst.Type == 0 && src.Type == 0 && tex != nullptr && buf != nullptr && !tex->is_buffer() && !buf->is_buffer()) {
-        // Texture -> texture subresource copy: validate subresources and update depth-twin state.
-        const DxgiFormatLayout dst_l = dxgi_format_layout(tex->desc().Format);
-        const DxgiFormatLayout src_l = dxgi_format_layout(buf->desc().Format);
+        // Texture -> texture subresource copy: validate subresources, box, and emit GPU copy pass.
+        Resource* dst_tex = tex;
+        Resource* src_tex = buf;
+        const DxgiFormatLayout dst_l = dxgi_format_layout(dst_tex->desc().Format);
+        const DxgiFormatLayout src_l = dxgi_format_layout(src_tex->desc().Format);
         SubresourceInfo dst_sub{}, src_sub{};
         const uint32_t dst_sub_idx = static_cast<uint32_t>(dst.PlacedFootprint.Offset);
         const uint32_t src_sub_idx = static_cast<uint32_t>(src.PlacedFootprint.Offset);
-        if (!dst_l.known || !src_l.known || !decode_texture_subresource(tex, dst_sub_idx, dst_l, &dst_sub) ||
-            !decode_texture_subresource(buf, src_sub_idx, src_l, &src_sub)) {
+        if (!dst_l.known || !src_l.known || !decode_texture_subresource(dst_tex, dst_sub_idx, dst_l, &dst_sub) ||
+            !decode_texture_subresource(src_tex, src_sub_idx, src_l, &src_sub)) {
             note("CopyTextureRegion: texture-to-texture subresource or format invalid");
             return;
         }
-        if (is_depth_dxgi_format(tex->desc().Format)) {
-            const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
-            aux_of(this).depth_twin.note_depth_copied(tex->id(), dst_sub.mip, 1u,
-                                                      dst_sub.is_3d ? dst_z : dst_sub.layer, 1u);
+        const uint32_t dst_x = static_cast<uint32_t>(ctx.int_arg(2));
+        const uint32_t dst_y = static_cast<uint32_t>(ctx.int_arg(3));
+        const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
+        if ((dst_x % dst_l.block_width) != 0 || (dst_y % dst_l.block_height) != 0) {
+            note("CopyTextureRegion: destination origin not aligned to format block size");
+            return;
         }
-        device_->note_unsupported_copy("CopyTextureRegion: GPU texture-to-texture copy has no packet (skipped)");
+        if ((dst_sub.is_1d && (dst_y != 0 || dst_z != 0)) || (!dst_sub.is_3d && dst_z != 0)) {
+            note("CopyTextureRegion: texture-to-texture destination origin invalid for texture dimension");
+            return;
+        }
+        if (dst_x >= dst_sub.phys_w || dst_y >= dst_sub.phys_h || (dst_sub.is_3d && dst_z >= dst_sub.mip_d)) {
+            note("CopyTextureRegion: texture-to-texture destination origin exceeds subresource dimensions");
+            return;
+        }
+        GuestBox box{0, 0, 0, src_sub.phys_w, src_sub.phys_h, src_sub.mip_d};
+        if (ctx.int_arg(6) != 0 && !com::read_guest(ctx.int_arg(6), box)) {
+            note("CopyTextureRegion: unreadable source box");
+            return;
+        }
+        if (box.right <= box.left || box.bottom <= box.top || box.back <= box.front) {
+            return;  // empty box is a valid no-op
+        }
+        if ((box.left % src_l.block_width) != 0 || (box.top % src_l.block_height) != 0) {
+            note("CopyTextureRegion: source box origin not aligned to format block size");
+            return;
+        }
+        if (box.left >= src_sub.phys_w || box.top >= src_sub.phys_h || box.front >= src_sub.mip_d) {
+            note("CopyTextureRegion: source box origin exceeds subresource dimensions");
+            return;
+        }
+        box.right = std::min(box.right, src_sub.phys_w);
+        box.bottom = std::min(box.bottom, src_sub.phys_h);
+        box.back = std::min(box.back, src_sub.mip_d);
+
+        uint32_t copy_w = align_up_u32(box.right - box.left, src_l.block_width);
+        uint32_t copy_h = align_up_u32(box.bottom - box.top, src_l.block_height);
+        uint32_t copy_d = box.back - box.front;
+        copy_w = std::min(copy_w, std::min(src_sub.phys_w - box.left, dst_sub.phys_w - dst_x));
+        copy_h = std::min(copy_h, std::min(src_sub.phys_h - box.top, dst_sub.phys_h - dst_y));
+        copy_d = std::min(copy_d, (src_sub.is_3d && dst_sub.is_3d)
+                                      ? std::min(src_sub.mip_d - box.front, dst_sub.mip_d - dst_z)
+                                      : 1u);
+        if (copy_w == 0 || copy_h == 0 || copy_d == 0) {
+            return;
+        }
+        const bool same_subresource =
+            src_tex == dst_tex && src_sub.mip == dst_sub.mip &&
+            ((!src_sub.is_3d && !dst_sub.is_3d && src_sub.layer == dst_sub.layer) || (src_sub.is_3d && dst_sub.is_3d));
+        if (same_subresource) {
+            if (box.left == dst_x && box.top == dst_y && (!src_sub.is_3d || box.front == dst_z)) {
+                return;  // identical in-place copy is a no-op
+            }
+            if (is_depth_dxgi_format(dst_tex->desc().Format)) {
+                aux_of(this).depth_twin.note_depth_copied(dst_tex->id(), dst_sub.mip, 1u,
+                                                          dst_sub.is_3d ? dst_z : dst_sub.layer, copy_d);
+            }
+            device_->note_unsupported_copy(
+                "CopyTextureRegion: same-subresource overlapping texture copy cannot alias in WebGPU (skipped)");
+            return;
+        }
+
+        const TextureCopyPlan plan = plan_gpu_texture_copy(*device_, dst_tex, src_tex);
+        if (plan.mode != TextureCopyPlan::Mode::None) {
+            SubresourceCopySpec spec{};
+            spec.src_mip = src_sub.mip;
+            spec.src_layer = src_sub.layer;
+            spec.src_x = box.left;
+            spec.src_y = box.top;
+            spec.src_z = src_sub.is_3d ? box.front : 0u;
+            spec.dst_mip = dst_sub.mip;
+            spec.dst_layer = dst_sub.layer;
+            spec.dst_x = dst_x;
+            spec.dst_y = dst_y;
+            spec.dst_z = dst_sub.is_3d ? dst_z : 0u;
+            spec.width = std::min(copy_w, dst_sub.mip_w - std::min(dst_x, dst_sub.mip_w));
+            spec.height = std::min(copy_h, dst_sub.mip_h - std::min(dst_y, dst_sub.mip_h));
+            spec.depth = copy_d;
+            spec.full_subresource =
+                dst_x == 0 && dst_y == 0 && (!dst_sub.is_3d || dst_z == 0) && spec.width >= dst_sub.mip_w &&
+                spec.height >= dst_sub.mip_h && (!dst_sub.is_3d || spec.depth >= dst_sub.mip_d);
+            pinned_.push_back(com::Ref<com::ComObject>::share(src_tex));
+            pinned_.push_back(com::Ref<com::ComObject>::share(dst_tex));
+            device_->sync_bound_texture_memory(src_tex->id(), encoder_);
+            bridge_.ResourceBarrier(0, nullptr);
+            if (emit_gpu_texture_subresource_copy(*device_, plan, dst_tex->id(), src_tex->id(), spec, encoder_)) {
+                if (is_depth_dxgi_format(dst_tex->desc().Format)) {
+                    aux_of(this).depth_twin.note_depth_copied(dst_tex->id(), dst_sub.mip, 1u,
+                                                              dst_sub.is_3d ? dst_z : dst_sub.layer, copy_d);
+                }
+                device_->note_texture_copy_destination(dst_tex->id());
+                return;
+            }
+        }
+        if (is_depth_dxgi_format(dst_tex->desc().Format)) {
+            aux_of(this).depth_twin.note_depth_copied(dst_tex->id(), dst_sub.mip, 1u,
+                                                      dst_sub.is_3d ? dst_z : dst_sub.layer, copy_d);
+        }
+        device_->note_unsupported_copy(
+            "CopyTextureRegion: GPU texture-to-texture copy requires render-attachment or storage destination (skipped)");
         return;
     }
     if (tex == nullptr || buf == nullptr || dst.Type != 0 || src.Type != 1 || tex->is_buffer() || !buf->is_buffer()) {

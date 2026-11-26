@@ -46,8 +46,9 @@ WordsStatus image_words(uint64_t address, const TextureShape& t, const d3d::View
     hw::ImageResource img;
     img.base = address;
     img.format = f.format;
-    img.dst_sel = v.kind == d3d::DescriptorKind::Srv ? hw::compose_component_mapping(f.swizzle, v.component_mapping)
-                                                     : f.swizzle;
+    img.dst_sel = v.kind == d3d::DescriptorKind::Srv
+                      ? hw::compose_component_mapping(f.swizzle, normalize_component_mapping(v.component_mapping))
+                      : f.swizzle;
     img.width = std::max(1u, t.width);
     img.height = std::max(1u, t.height);
     const uint32_t mips = std::max(1u, t.mips);
@@ -145,6 +146,18 @@ void constant_buffer_words(uint64_t address, uint32_t size, uint32_t out[4]) noe
     out[3] = kConsoleCbvWord3;
 }
 
+bool srv_component_swizzle(uint32_t dxgi_format, uint32_t shader_4_component_mapping,
+                           hw::Swizzle* out) noexcept {
+    hw::HardwareFormat f;
+    if (!hw::hardware_format(dxgi_format, &f)) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = hw::compose_component_mapping(f.swizzle, normalize_component_mapping(shader_4_component_mapping));
+    }
+    return true;
+}
+
 const char* words_status_name(WordsStatus status) noexcept {
     switch (status) {
     case WordsStatus::Ok: return "ok";
@@ -225,8 +238,9 @@ WordsStatus buffer_words_at_address(uint64_t va, const d3d::ViewDescriptor& v, u
         b.stride = bytes;
         b.num_records = v.num_elements_or_size;
         b.format = f.format;
-        b.dst_sel = v.kind == d3d::DescriptorKind::Srv ? hw::compose_component_mapping(f.swizzle, v.component_mapping)
-                                                       : f.swizzle;
+        b.dst_sel = v.kind == d3d::DescriptorKind::Srv
+                        ? hw::compose_component_mapping(f.swizzle, normalize_component_mapping(v.component_mapping))
+                        : f.swizzle;
         b.oob_select = hw::Oob::IndexAndOffset;
     }
     hw::encode(b, out);
@@ -328,8 +342,89 @@ uint32_t resolve_view_format(uint32_t own, uint32_t hw_fmt, uint32_t decoded_dxg
             if (hw_fmt == fam.linear_hw) {
                 return fam.linear;
             }
+            if (own == 27) {  // R8G8B8A8_TYPELESS viewed as integer / snorm
+                if (hw_fmt == 60) return 30;  // R8G8B8A8_UINT
+                if (hw_fmt == 57) return 31;  // R8G8B8A8_SNORM
+                if (hw_fmt == 61) return 32;  // R8G8B8A8_SINT
+            }
             return 0;
         }
+    }
+    // Non-sRGB typeless texture families: resolve concrete view DXGI format from hw_fmt so custom
+    // swizzles (such as R8_TYPELESS viewed as R8_UNORM with 000R, which shares hw_fmt 1 and
+    // swizzle {0,0,0,X} with A8_UNORM) preserve both the concrete format and component mapping.
+    switch (own) {
+    case 1:  // R32G32B32A32_TYPELESS
+        if (hw_fmt == 77) return 2;   // FLOAT
+        if (hw_fmt == 75) return 3;   // UINT
+        if (hw_fmt == 76) return 4;   // SINT
+        break;
+    case 5:  // R32G32B32_TYPELESS
+        if (hw_fmt == 74) return 6;   // FLOAT
+        if (hw_fmt == 72) return 7;   // UINT
+        if (hw_fmt == 73) return 8;   // SINT
+        break;
+    case 9:  // R16G16B16A16_TYPELESS
+        if (hw_fmt == 71) return 10;  // FLOAT
+        if (hw_fmt == 65) return 11;  // UNORM
+        if (hw_fmt == 69) return 12;  // UINT
+        if (hw_fmt == 66) return 13;  // SNORM
+        if (hw_fmt == 70) return 14;  // SINT
+        break;
+    case 15:  // R32G32_TYPELESS
+        if (hw_fmt == 64) return 16;  // FLOAT
+        if (hw_fmt == 62) return 17;  // UINT
+        if (hw_fmt == 63) return 18;  // SINT
+        break;
+    case 23:  // R10G10B10A2_TYPELESS
+        if (hw_fmt == 50) return 24;  // UNORM
+        if (hw_fmt == 54) return 25;  // UINT
+        break;
+    case 33:  // R16G16_TYPELESS
+        if (hw_fmt == 29) return 34;  // FLOAT
+        if (hw_fmt == 23) return 35;  // UNORM
+        if (hw_fmt == 27) return 36;  // UINT
+        if (hw_fmt == 24) return 37;  // SNORM
+        if (hw_fmt == 28) return 38;  // SINT
+        break;
+    case 39:  // R32_TYPELESS
+        if (hw_fmt == 22) return 41;  // FLOAT
+        if (hw_fmt == 20) return 42;  // UINT
+        if (hw_fmt == 21) return 43;  // SINT
+        break;
+    case 48:  // R8G8_TYPELESS
+        if (hw_fmt == 14) return 49;  // UNORM
+        if (hw_fmt == 18) return 50;  // UINT
+        if (hw_fmt == 15) return 51;  // SNORM
+        if (hw_fmt == 19) return 52;  // SINT
+        break;
+    case 53:  // R16_TYPELESS
+        if (hw_fmt == 13) return 54;  // FLOAT
+        if (hw_fmt == 7)  return 56;  // UNORM
+        if (hw_fmt == 11) return 57;  // UINT
+        if (hw_fmt == 8)  return 58;  // SNORM
+        if (hw_fmt == 12) return 59;  // SINT
+        break;
+    case 60:  // R8_TYPELESS (never A8_UNORM in D3D12)
+        if (hw_fmt == 1) return 61;   // R8_UNORM
+        if (hw_fmt == 5) return 62;   // R8_UINT
+        if (hw_fmt == 2) return 63;   // R8_SNORM
+        if (hw_fmt == 6) return 64;   // R8_SINT
+        break;
+    case 79:  // BC4_TYPELESS
+        if (hw_fmt == 175) return 80; // UNORM
+        if (hw_fmt == 176) return 81; // SNORM
+        break;
+    case 82:  // BC5_TYPELESS
+        if (hw_fmt == 177) return 83; // UNORM
+        if (hw_fmt == 178) return 84; // SNORM
+        break;
+    case 94:  // BC6H_TYPELESS
+        if (hw_fmt == 179) return 95; // UF16
+        if (hw_fmt == 180) return 96; // SF16
+        break;
+    default:
+        break;
     }
     if (decoded_dxgi == own) {
         return decoded_dxgi;
@@ -420,7 +515,7 @@ DecodeStatus decode_view_words(const StateBridgeDevice& device, const uint32_t w
             if (f.swizzle != img.dst_sel) {
                 hw::component_mapping_from(f.swizzle, img.dst_sel, &mapping);
             }
-        } else if (!exact && hw::hardware_format(dxgi, &f)) {
+        } else if (hw::hardware_format(dxgi, &f) && f.format == img.format && f.swizzle != img.dst_sel) {
             hw::component_mapping_from(f.swizzle, img.dst_sel, &mapping);
         }
         out->component_mapping = mapping;
