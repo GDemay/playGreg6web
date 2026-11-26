@@ -8,14 +8,43 @@ export const WGPK_MAGIC = 'WGPK';
 /** Binary pack magic as raw ASCII bytes. */
 export const WGPK_MAGIC_BYTES = Object.freeze([0x57, 0x47, 0x50, 0x4b]);
 
-/** Supported WGPK format version (matches PACK_VERSION in shaders/src/pack.rs). */
+/** Default WGPK format version (matches PACK_VERSION in shaders/src/pack.rs). */
 export const WGPK_VERSION = 1;
+
+/** WGPK v1 format version (20-byte TOC records, 32-bit byte offsets). */
+export const WGPK_VERSION_V1 = 1;
+
+/** WGPK v2 format version (24-byte TOC records, 64-bit byte offsets for >4 GiB packs). */
+export const WGPK_VERSION_V2 = 2;
 
 /** Fixed header size in bytes: magic(4) + version(4) + entry_count(4) + flags(4). */
 export const WGPK_HEADER_BYTES = 16;
 
-/** Fixed entry table record size in bytes: hash(8) + stage(1) + reserved(3) + offset(4) + length(4). */
+/** Fixed WGPK v1 entry table record size in bytes: hash(8) + stage(1) + reserved(3) + offset(4) + length(4). */
 export const WGPK_ENTRY_BYTES = 20;
+
+/** Fixed WGPK v1 entry table record size in bytes (explicit alias). */
+export const WGPK_ENTRY_BYTES_V1 = 20;
+
+/** Fixed WGPK v2 entry table record size in bytes: hash(8) + stage(1) + reserved(3) + length(4) + offset(8). */
+export const WGPK_ENTRY_BYTES_V2 = 24;
+
+/**
+ * Return the TOC entry record byte size for a supported WGPK version (`20` for v1, `24` for v2),
+ * or `null` for unsupported versions (matches `pack_entry_bytes` in `shaders/src/pack.rs`).
+ *
+ * @param {number} version
+ * @returns {number | null}
+ */
+export function wgpkEntryBytes(version) {
+  if (version === WGPK_VERSION_V1) {
+    return WGPK_ENTRY_BYTES_V1;
+  }
+  if (version === WGPK_VERSION_V2) {
+    return WGPK_ENTRY_BYTES_V2;
+  }
+  return null;
+}
 
 /** Default initial byte window for HTTP 206 Range index loading (64 KiB: header + ~3,276 entries in 1 roundtrip). */
 export const DEFAULT_INITIAL_RANGE_BYTES = 64 * 1024;
@@ -75,6 +104,59 @@ const FNV1A_64_PRIME = 0x00000100000001b3n;
 const U64_MAX = 0xffffffffffffffffn;
 const U32_MAX = 0xffffffff;
 const U32_RANGE_LIMIT = 0x100000000;
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+function normalizeSafeOffset(value, label = 'offset') {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new RangeError(`Invalid WGPK ${label}: ${value}`);
+  }
+  return value;
+}
+
+function normalizeU64Offset(value, label = 'offset') {
+  if (typeof value === 'bigint') {
+    if (value < 0n || value > U64_MAX) {
+      throw new RangeError(`WGPK ${label} out of u64 range: ${value.toString()}`);
+    }
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError(
+        `WGPK ${label} must be a non-negative safe integer or BigInt, got: ${value}`
+      );
+    }
+    return BigInt(value);
+  }
+  throw new TypeError(`WGPK ${label} must be a number or BigInt`);
+}
+
+function resolvePackVersionOption(versionOption, defaultVersion = WGPK_VERSION_V1) {
+  if (versionOption === undefined || versionOption === null) {
+    return defaultVersion;
+  }
+  if (versionOption === WGPK_VERSION_V1 || versionOption === '1') {
+    return WGPK_VERSION_V1;
+  }
+  if (versionOption === WGPK_VERSION_V2 || versionOption === '2') {
+    return WGPK_VERSION_V2;
+  }
+  if (typeof versionOption === 'string') {
+    const normalized = versionOption.trim().toLowerCase();
+    if (normalized === 'v1' || normalized === '1') {
+      return WGPK_VERSION_V1;
+    }
+    if (normalized === 'v2' || normalized === '2') {
+      return WGPK_VERSION_V2;
+    }
+    if (normalized === 'auto') {
+      return 'auto';
+    }
+  }
+  throw new RangeError(
+    `Unsupported WGPK version option: ${JSON.stringify(versionOption)} (expected 1, 2, 'v1', 'v2', or 'auto')`
+  );
+}
 
 function sanitizeNonNegativeInt(value, fallback = 0) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
@@ -593,7 +675,9 @@ export function coalesceEntryRanges(entries, options = {}) {
     return [];
   }
 
-  normalized.sort((a, b) => a.start - b.start || a.end - b.end);
+  normalized.sort((a, b) =>
+    a.start < b.start ? -1 : a.start > b.start ? 1 : a.end < b.end ? -1 : a.end > b.end ? 1 : 0
+  );
 
   const spans = [];
   let current = {
@@ -718,20 +802,34 @@ function parseWgpkHeader(bytes) {
 
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const version = view.getUint32(4, true) >>> 0;
-  if (version !== WGPK_VERSION) {
-    throw new Error(`Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION})`);
+  const entryBytes = wgpkEntryBytes(version);
+  if (entryBytes === null) {
+    throw new Error(
+      `Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION_V1} or ${WGPK_VERSION_V2})`
+    );
   }
 
   const entryCount = view.getUint32(8, true) >>> 0;
   const flags = view.getUint32(12, true) >>> 0;
-  const tableBytes = entryCount * WGPK_ENTRY_BYTES;
+  const tableBytes = entryCount * entryBytes;
   const dataStart = WGPK_HEADER_BYTES + tableBytes;
+  if (!Number.isSafeInteger(tableBytes) || !Number.isSafeInteger(dataStart)) {
+    throw new Error(
+      `WGPK entry table size overflows safe integer bounds for ${entryCount} entries`
+    );
+  }
 
-  return { version, entryCount, flags, tableBytes, dataStart };
+  return { version, entryBytes, entryCount, flags, tableBytes, dataStart };
 }
 
 function parseWgpkEntryTable(bytes, header, totalFileBytes) {
-  const { entryCount, dataStart } = header;
+  const { version, entryCount, dataStart } = header;
+  const entryBytes = header.entryBytes ?? wgpkEntryBytes(version);
+  if (entryBytes === null) {
+    throw new Error(
+      `Unsupported WGPK pack version ${version} (expected ${WGPK_VERSION_V1} or ${WGPK_VERSION_V2})`
+    );
+  }
   if (bytes.byteLength < dataStart) {
     throw new Error(
       `WGPK pack truncated: ${bytes.byteLength} bytes (header + ${entryCount} entry table records require at least ${dataStart} bytes)`
@@ -743,6 +841,7 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
     );
   }
 
+  const isV2 = version === WGPK_VERSION_V2;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const rawEntries = new Array(entryCount);
   const ranges = [];
@@ -750,13 +849,20 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
   let totalPayloadBytes = 0;
   let maxEnd = dataStart;
 
-  // When totalFileBytes is unknown (e.g. Content-Range: bytes 0-N/*), allow full unsigned 32-bit
-  // byte indices [0..0xFFFFFFFF] up to the exact 4 GiB exclusive end (0x100000000).
+  // When totalFileBytes is unknown (e.g. Content-Range: bytes 0-N/*):
+  // - WGPK v1 allows unsigned 32-bit byte indices [0..0xFFFFFFFF] up to exact 4 GiB (0x100000000).
+  // - WGPK v2 allows 64-bit byte offsets up to Number.MAX_SAFE_INTEGER (~8 PiB).
   const upperBound =
-    totalFileBytes !== null && totalFileBytes !== undefined ? totalFileBytes : U32_RANGE_LIMIT;
+    totalFileBytes !== null && totalFileBytes !== undefined
+      ? isV2
+        ? totalFileBytes
+        : Math.min(totalFileBytes, U32_RANGE_LIMIT)
+      : isV2
+        ? Number.MAX_SAFE_INTEGER
+        : U32_RANGE_LIMIT;
 
   for (let idx = 0; idx < entryCount; idx += 1) {
-    const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
+    const base = WGPK_HEADER_BYTES + idx * entryBytes;
     const hash = view.getBigUint64(base, true);
     const stageCode = bytes[base + 8];
     const stage = STAGE_NAMES[stageCode];
@@ -764,9 +870,30 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
       throw new Error(`Invalid WGPK shader stage value ${stageCode} at entry ${idx}`);
     }
     // bytes[base + 9 .. base + 12] are reserved for forward compatibility.
-    const offset = view.getUint32(base + 12, true) >>> 0;
-    const length = view.getUint32(base + 16, true) >>> 0;
-    const end = offset + length;
+    let offset;
+    let length;
+    let end;
+    if (isV2) {
+      length = view.getUint32(base + 12, true) >>> 0;
+      const offsetBig = view.getBigUint64(base + 16, true);
+      const endBig = offsetBig + BigInt(length);
+      if (endBig > U64_MAX) {
+        throw new Error(
+          `WGPK v2 entry ${idx} payload [${offsetBig}..+${length}] overflows u64 bounds`
+        );
+      }
+      if (endBig > MAX_SAFE_INTEGER_BIGINT) {
+        throw new Error(
+          `WGPK v2 entry ${idx} payload [${offsetBig}..+${length}] exceeds safe integer offset limit (${Number.MAX_SAFE_INTEGER})`
+        );
+      }
+      offset = Number(offsetBig);
+      end = Number(endBig);
+    } else {
+      offset = view.getUint32(base + 12, true) >>> 0;
+      length = view.getUint32(base + 16, true) >>> 0;
+      end = offset + length;
+    }
 
     if (!Number.isSafeInteger(end) || offset < dataStart || end > upperBound) {
       throw new Error(
@@ -799,7 +926,9 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
 
   // Reject overlapping non-empty payload ranges across entries.
   if (ranges.length > 1) {
-    ranges.sort((a, b) => a.start - b.start || a.end - b.end);
+    ranges.sort((a, b) =>
+      a.start < b.start ? -1 : a.start > b.start ? 1 : a.end < b.end ? -1 : a.end > b.end ? 1 : 0
+    );
     for (let i = 1; i < ranges.length; i += 1) {
       const prev = ranges[i - 1];
       const curr = ranges[i];
@@ -1067,18 +1196,28 @@ function formatDynamicLookupRecord(entry, overridesStatic) {
 }
 
 /**
- * Serialize shader entries into a binary `.wgsl.pack` `ArrayBuffer` matching
- * `write_pack` / `write_pack_with_layout` in `shaders/src/pack.rs` byte-for-byte.
+ * Encode the 16-byte WGPK header and version-appropriate TOC records (`20` bytes per entry for
+ * v1, `24` bytes per entry for v2) directly from `{ hash, stage, offset, length }` descriptors
+ * without materializing payload buffers (matches `encode_pack_toc` in `shaders/src/pack.rs`).
  *
- * @param {Array<{ hash: bigint | string | number, stage: number | string, wgsl: string | Uint8Array }>} entries
- * @param {{ flags?: number }} [options]
+ * @param {Array<{
+ *   hash: bigint | string | number,
+ *   stage: number | string,
+ *   offset: number | bigint,
+ *   length: number | bigint,
+ * }>} entries
+ * @param {{
+ *   version?: 1 | 2 | '1' | '2' | 'v1' | 'v2' | 'auto',
+ *   flags?: number,
+ * }} [options]
  * @returns {ArrayBuffer}
  */
-export function buildWgslPackBuffer(entries, options = {}) {
+export function buildWgpkTocBuffer(entries, options = {}) {
   if (!Array.isArray(entries)) {
     throw new TypeError('entries must be an array');
   }
-  const flags = options.flags === undefined ? 0 : options.flags;
+  const opts = options && typeof options === 'object' ? options : {};
+  const flags = opts.flags === undefined ? 0 : opts.flags;
   if (!Number.isInteger(flags) || flags < 0 || flags > U32_MAX) {
     throw new RangeError(`flags must be a uint32 integer, got: ${flags}`);
   }
@@ -1086,8 +1225,142 @@ export function buildWgslPackBuffer(entries, options = {}) {
     throw new RangeError('entry count exceeds u32::MAX');
   }
 
+  const requestedVersion = resolvePackVersionOption(opts.version, 'auto');
+  const normalizedEntries = new Array(entries.length);
+  const u32MaxBig = BigInt(U32_MAX);
+  let requiresV2 = false;
+
+  const v1DataStart = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES_V1;
+  if (v1DataStart > U32_MAX) {
+    requiresV2 = true;
+  }
+
+  for (let i = 0; i < entries.length; i += 1) {
+    const item = entries[i];
+    if (!item || typeof item !== 'object') {
+      throw new TypeError(`Entry ${i} must be an object`);
+    }
+    const hash = normalizeHash(item.hash);
+    const stageCode = resolveStageCode(item.stage);
+    const offsetBig = normalizeU64Offset(item.offset, `entry ${i} offset`);
+
+    let length;
+    if (typeof item.length === 'bigint') {
+      if (item.length < 0n || item.length > u32MaxBig) {
+        throw new RangeError(`Entry ${i} length out of u32 range: ${item.length.toString()}`);
+      }
+      length = Number(item.length);
+    } else if (
+      typeof item.length === 'number' &&
+      Number.isInteger(item.length) &&
+      item.length >= 0 &&
+      item.length <= U32_MAX
+    ) {
+      length = item.length;
+    } else {
+      throw new RangeError(`Entry ${i} length must be a uint32 integer, got: ${item.length}`);
+    }
+
+    const endBig = offsetBig + BigInt(length);
+    if (endBig > U64_MAX) {
+      throw new RangeError(`Entry ${i} payload range [${offsetBig}..+${length}] overflows u64`);
+    }
+    if (offsetBig > u32MaxBig || endBig > u32MaxBig) {
+      requiresV2 = true;
+    }
+    normalizedEntries[i] = { hash, stageCode, offsetBig, length, endBig };
+  }
+
+  const version =
+    requestedVersion === 'auto'
+      ? requiresV2
+        ? WGPK_VERSION_V2
+        : WGPK_VERSION_V1
+      : requestedVersion;
+
+  if (version === WGPK_VERSION_V1) {
+    if (v1DataStart > U32_MAX) {
+      throw new RangeError('WGPK v1 header + entry table size exceeds u32::MAX');
+    }
+    for (let i = 0; i < normalizedEntries.length; i += 1) {
+      const e = normalizedEntries[i];
+      if (e.offsetBig > u32MaxBig || e.endBig > u32MaxBig) {
+        throw new RangeError(
+          `Entry ${i} payload range [${e.offsetBig}..+${e.length}] overflows WGPK v1 u32 byte offsets`
+        );
+      }
+    }
+  }
+
+  const entryBytes = wgpkEntryBytes(version);
+  const tocBytes = WGPK_HEADER_BYTES + normalizedEntries.length * entryBytes;
+  if (!Number.isSafeInteger(tocBytes)) {
+    throw new RangeError('WGPK TOC byte size exceeds safe integer bounds');
+  }
+
+  const buffer = new ArrayBuffer(tocBytes);
+  const out = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+
+  // Header (16 bytes)
+  out[0] = WGPK_MAGIC_BYTES[0];
+  out[1] = WGPK_MAGIC_BYTES[1];
+  out[2] = WGPK_MAGIC_BYTES[2];
+  out[3] = WGPK_MAGIC_BYTES[3];
+  view.setUint32(4, version >>> 0, true);
+  view.setUint32(8, normalizedEntries.length >>> 0, true);
+  view.setUint32(12, flags >>> 0, true);
+
+  // Entry table (20 bytes per record for v1, 24 bytes per record for v2)
+  for (let i = 0; i < normalizedEntries.length; i += 1) {
+    const { hash, stageCode, offsetBig, length } = normalizedEntries[i];
+    const base = WGPK_HEADER_BYTES + i * entryBytes;
+
+    view.setBigUint64(base, hash, true);
+    out[base + 8] = stageCode;
+    out[base + 9] = 0;
+    out[base + 10] = 0;
+    out[base + 11] = 0;
+    if (version === WGPK_VERSION_V2) {
+      view.setUint32(base + 12, length >>> 0, true);
+      view.setBigUint64(base + 16, offsetBig, true);
+    } else {
+      view.setUint32(base + 12, Number(offsetBig) >>> 0, true);
+      view.setUint32(base + 16, length >>> 0, true);
+    }
+  }
+
+  return buffer;
+}
+
+/**
+ * Serialize shader entries into a binary `.wgsl.pack` `ArrayBuffer` matching
+ * `write_pack` / `write_pack_with_layout` in `shaders/src/pack.rs` byte-for-byte.
+ *
+ * @param {Array<{ hash: bigint | string | number, stage: number | string, wgsl: string | Uint8Array }>} entries
+ * @param {{
+ *   flags?: number,
+ *   version?: 1 | 2 | '1' | '2' | 'v1' | 'v2' | 'auto',
+ * }} [options]
+ * @returns {ArrayBuffer}
+ */
+export function buildWgslPackBuffer(entries, options = {}) {
+  if (!Array.isArray(entries)) {
+    throw new TypeError('entries must be an array');
+  }
+  const opts = options && typeof options === 'object' ? options : {};
+  const flags = opts.flags === undefined ? 0 : opts.flags;
+  if (!Number.isInteger(flags) || flags < 0 || flags > U32_MAX) {
+    throw new RangeError(`flags must be a uint32 integer, got: ${flags}`);
+  }
+  if (entries.length > U32_MAX) {
+    throw new RangeError('entry count exceeds u32::MAX');
+  }
+
+  // Default to WGPK v1 so all existing callers remain 100% byte-identical.
+  const requestedVersion = resolvePackVersionOption(opts.version, WGPK_VERSION_V1);
+
   const encodedEntries = new Array(entries.length);
-  const dataStart = WGPK_HEADER_BYTES + entries.length * WGPK_ENTRY_BYTES;
   let totalPayloadBytes = 0;
 
   for (let i = 0; i < entries.length; i += 1) {
@@ -1109,9 +1382,23 @@ export function buildWgslPackBuffer(entries, options = {}) {
     encodedEntries[i] = { hash, stageCode, payload };
   }
 
+  const v1DataStart = WGPK_HEADER_BYTES + encodedEntries.length * WGPK_ENTRY_BYTES_V1;
+  const v1TotalSize = v1DataStart + totalPayloadBytes;
+  const version =
+    requestedVersion === 'auto'
+      ? v1TotalSize <= U32_MAX
+        ? WGPK_VERSION_V1
+        : WGPK_VERSION_V2
+      : requestedVersion;
+
+  const entryBytes = wgpkEntryBytes(version);
+  const dataStart = WGPK_HEADER_BYTES + encodedEntries.length * entryBytes;
   const totalSize = dataStart + totalPayloadBytes;
-  if (totalSize > U32_MAX) {
+  if (version === WGPK_VERSION_V1 && totalSize > U32_MAX) {
     throw new RangeError('Total WGPK pack size exceeds u32::MAX byte offsets');
+  }
+  if (!Number.isSafeInteger(totalSize)) {
+    throw new RangeError('Total WGPK pack size exceeds safe integer bounds');
   }
 
   const buffer = new ArrayBuffer(totalSize);
@@ -1123,23 +1410,28 @@ export function buildWgslPackBuffer(entries, options = {}) {
   out[1] = WGPK_MAGIC_BYTES[1];
   out[2] = WGPK_MAGIC_BYTES[2];
   out[3] = WGPK_MAGIC_BYTES[3];
-  view.setUint32(4, WGPK_VERSION >>> 0, true);
+  view.setUint32(4, version >>> 0, true);
   view.setUint32(8, encodedEntries.length >>> 0, true);
   view.setUint32(12, flags >>> 0, true);
 
-  // Entry table (20 bytes each) + payloads
+  // Entry table (20 bytes each for v1, 24 bytes each for v2) + payloads
   let cursor = dataStart;
   for (let i = 0; i < encodedEntries.length; i += 1) {
     const { hash, stageCode, payload } = encodedEntries[i];
-    const base = WGPK_HEADER_BYTES + i * WGPK_ENTRY_BYTES;
+    const base = WGPK_HEADER_BYTES + i * entryBytes;
 
     view.setBigUint64(base, hash, true);
     out[base + 8] = stageCode;
     out[base + 9] = 0;
     out[base + 10] = 0;
     out[base + 11] = 0;
-    view.setUint32(base + 12, cursor >>> 0, true);
-    view.setUint32(base + 16, payload.byteLength >>> 0, true);
+    if (version === WGPK_VERSION_V2) {
+      view.setUint32(base + 12, payload.byteLength >>> 0, true);
+      view.setBigUint64(base + 16, BigInt(cursor), true);
+    } else {
+      view.setUint32(base + 12, cursor >>> 0, true);
+      view.setUint32(base + 16, payload.byteLength >>> 0, true);
+    }
 
     out.set(payload, cursor);
     cursor += payload.byteLength;
@@ -1157,6 +1449,7 @@ export class WgslPack {
    */
   constructor({
     version,
+    entryBytes,
     flags,
     byteLength,
     dataStart,
@@ -1194,6 +1487,7 @@ export class WgslPack {
     rangedDecodeCounter = null,
   }) {
     this.version = version;
+    this.entryBytes = entryBytes ?? wgpkEntryBytes(version) ?? WGPK_ENTRY_BYTES;
     this.flags = flags;
     this.byteLength = byteLength;
     this.dataStart = dataStart;
@@ -2017,6 +2311,7 @@ export class WgslPack {
       );
 
       this.version = header.version;
+      this.entryBytes = header.entryBytes;
       this.flags = header.flags;
       this.byteLength = totalBytes !== null ? totalBytes : Math.max(header.dataStart, maxEnd);
       this.dataStart = header.dataStart;
@@ -2133,9 +2428,9 @@ export class WgslPack {
       throw new Error('No fetch implementation available for ranged getWgslAsync');
     }
 
-    // Use unsigned 32-bit offsets + safe IEEE-754 float64 addition so offsets past 2 GiB
-    // (0x80000000..0xFFFFFFFF) never wrap negative.
-    const start = staticEntry.offset >>> 0;
+    // Preserve full non-negative safe integer byte offsets (WGPK v1 u32 and WGPK v2 >4 GiB u64
+    // offsets up to Number.MAX_SAFE_INTEGER) without 32-bit wraparound.
+    const start = normalizeSafeOffset(staticEntry.offset);
     const end = start + length - 1;
     const generationBeforeFetch = this._indexGeneration;
 
@@ -2177,7 +2472,7 @@ export class WgslPack {
                 this._putWgslCache(key, '', 0);
                 return '';
               }
-              currentStart = refreshed.offset >>> 0;
+              currentStart = normalizeSafeOffset(refreshed.offset);
               currentEnd = currentStart + currentLength - 1;
               continue;
             }
@@ -2256,7 +2551,7 @@ export class WgslPack {
               this._putWgslCache(key, '', 0);
               return '';
             }
-            currentStart = refreshed.offset >>> 0;
+            currentStart = normalizeSafeOffset(refreshed.offset);
             currentEnd = currentStart + currentLength - 1;
             continue;
           }
@@ -2397,7 +2692,7 @@ export class WgslPack {
         continue;
       }
 
-      const start = staticEntry.offset >>> 0;
+      const start = normalizeSafeOffset(staticEntry.offset);
       toFetch.push({
         key,
         entry: staticEntry,
@@ -2503,7 +2798,7 @@ export class WgslPack {
             decodedResults[i] = { ok: true, wgsl: '' };
             continue;
           }
-          const rStart = refreshed.offset >>> 0;
+          const rStart = normalizeSafeOffset(refreshed.offset);
           refreshedItems.push({
             deferredIndex: i,
             key: item.key,
@@ -2927,6 +3222,7 @@ export class WgslPack {
 
     const computed = {
       version: this.version,
+      entryBytes: this.entryBytes,
       flags: this.flags,
       mode: this.mode,
       etag: this.etag,
@@ -2935,7 +3231,7 @@ export class WgslPack {
       entryCount,
       byteLength: this.byteLength,
       headerBytes: WGPK_HEADER_BYTES,
-      tableBytes: entryCount * WGPK_ENTRY_BYTES,
+      tableBytes: entryCount * this.entryBytes,
       payloadBytes: this.payloadBytes,
       decodedCount,
       lazyDecode: this.lazyDecode,
@@ -3075,6 +3371,7 @@ export function parseWgslPack(buffer, options = {}) {
 
   return new WgslPack({
     version: header.version,
+    entryBytes: header.entryBytes,
     flags: header.flags,
     byteLength: bytes.byteLength,
     dataStart: header.dataStart,
@@ -3223,6 +3520,7 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
 
   return new WgslPack({
     version: header.version,
+    entryBytes: header.entryBytes,
     flags: header.flags,
     byteLength: totalBytes !== null ? totalBytes : Math.max(header.dataStart, maxEnd),
     dataStart: header.dataStart,
@@ -5318,7 +5616,7 @@ export class WgslPackCache {
 }
 
 /**
- * Alias for `WgslPackCache` (multi-pack WGPK v1 loader, bounded LRU cache,
+ * Alias for `WgslPackCache` (multi-pack WGPK v1/v2 loader, bounded LRU cache,
  * hot-hash pinning, coalesced range prefetch, and WebGPU shader module cache).
  */
 export const WgslPackLoader = WgslPackCache;
