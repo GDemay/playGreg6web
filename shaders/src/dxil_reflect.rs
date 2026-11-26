@@ -30,13 +30,18 @@ use crate::dxbc::{
 };
 use crate::lower::WEBGPU_MAX_BINDINGS_PER_GROUP;
 use crate::pack::write_json_string;
+use crate::rdna2_to_wgsl::{
+    DEFAULT_LANE_INDEXED_WINDOW, LaneIndexedHeapSource, WgslVertexInputInfo,
+};
 use crate::reflect::{
     BindGroupLayoutDesc, BindingArraySize, BindingLayout, BufferBindingType, D3dRegister,
-    EntryPointReflection, LAYOUT_MANIFEST_SCHEMA_VERSION, LayoutEntry, LayoutManifest,
-    LimitViolation, LoweringKind, LoweringNeed, PipelineLayoutDesc, ReflectedBinding,
-    RegisterClass, RegisterConvention, ResourceKind, SamplerBindingType, ShaderIo,
-    ShaderLayoutRecord, TextureSampleType, TextureViewDimension, VISIBILITY_COMPUTE,
-    VISIBILITY_FRAGMENT, VISIBILITY_VERTEX, check_pipeline_limits,
+    EntryPointReflection, GFX10_IMAGE_STRIDE_BYTES, GFX10_SAMPLER_STRIDE_BYTES,
+    LAYOUT_MANIFEST_SCHEMA_VERSION, LayoutEntry, LayoutManifest, LimitViolation, LoweringKind,
+    LoweringNeed, PipelineLayoutDesc, ReflectedBinding, RegisterClass, RegisterConvention,
+    ResourceKind, SamplerBindingType, ShaderIo, ShaderLayoutRecord, SidecarBinding,
+    SidecarBindingKind, SidecarBindingSource, SidecarStageEntry, StorageTextureAccess,
+    TextureSampleType, TextureViewDimension, VISIBILITY_COMPUTE, VISIBILITY_FRAGMENT,
+    VISIBILITY_VERTEX, check_pipeline_limits,
 };
 
 /// Minimum size of an `RTS0` serialized root signature header in bytes (6 x `u32`).
@@ -1614,6 +1619,7 @@ pub fn reflect_dxil_bytes_with_options(
     let mut osg1: Option<StageSignature> = None;
     let mut osgn: Option<StageSignature> = None;
     let mut psv: Option<PsvInfo> = None;
+    let mut rdef: Option<RdefInfo> = None;
 
     for chunk in chunk_refs {
         match &chunk.fourcc {
@@ -1656,6 +1662,11 @@ pub fn reflect_dxil_bytes_with_options(
                     psv = Some(parse_psv0_chunk(chunk.payload)?);
                 }
             }
+            b"RDEF" => {
+                if rdef.is_none() {
+                    rdef = parse_rdef_chunk(chunk.payload).ok();
+                }
+            }
             _ => {}
         }
     }
@@ -1670,7 +1681,11 @@ pub fn reflect_dxil_bytes_with_options(
 
     let shader_kind = info
         .shader_kind()
-        .or_else(|| psv.as_ref().and_then(|p| p.shader_stage));
+        .or_else(|| psv.as_ref().and_then(|p| p.shader_stage))
+        .or_else(|| {
+            rdef.as_ref()
+                .map(|r| DxilShaderKind::from_u16(r.program_type))
+        });
     let shader_model = info.shader_model();
 
     let (stage, stage_lowering_note) = infer_webgpu_stage(
@@ -1690,11 +1705,13 @@ pub fn reflect_dxil_bytes_with_options(
         .map(|p| p.resources.as_slice())
         .unwrap_or(&[]);
 
-    // Extract D3D12 resource slots from RTS0 (authoritative) or fallback to PSV0 if RTS0 absent.
+    // Extract D3D12 resource slots from RTS0 (authoritative), fallback to PSV0, then RDEF.
     let extracted = if let Some(rs) = &root_signature {
         extract_slots_from_rts0(rs, stage, shader_kind, psv_resources)?
     } else if !psv_resources.is_empty() {
         extract_slots_from_psv0(psv_resources, stage)?
+    } else if let Some(rdef_info) = &rdef {
+        extract_slots_from_rdef(rdef_info, stage)?
     } else {
         Vec::new()
     };
@@ -3321,6 +3338,1534 @@ fn write_hash_object<V>(
     }
     out.push_str(indent);
     out.push('}');
+}
+
+// ---------------------------------------------------------------------------
+// S71 (#1742, Refs #482, #651): DXIL Fallback Reflection (RDEF / STAT / PSV0 /
+// ISGN / OSGN / DXIL bitcode) & External Root-Parameter Matching
+// ---------------------------------------------------------------------------
+
+/// Console graphics first root-parameter user-data SGPR (`runtime/gpu/stage_reflection.h`).
+pub const CONSOLE_GRAPHICS_USER_DATA_BASE: u32 = 8;
+
+/// Console compute first root-parameter user-data SGPR (`runtime/gpu/stage_reflection.h`).
+pub const CONSOLE_COMPUTE_USER_DATA_BASE: u32 = 4;
+
+/// Console mesh (lowered to compute) first root-parameter user-data SGPR.
+pub const CONSOLE_MESH_USER_DATA_BASE: u32 = 16;
+
+/// Console descriptor table slot stride in bytes (`stage_reflection.h::kTableSlotBytes`).
+pub const CONSOLE_TABLE_SLOT_BYTES: u32 = 32;
+
+const RDEF_MIN_HEADER_BYTES: usize = 28;
+const RDEF_RD11_HEADER_BYTES: usize = 60;
+const RDEF_CBUFFER_BYTES: usize = 24;
+const RDEF_BINDING_SM4_BYTES: usize = 32;
+const RDEF_BINDING_RD11_BYTES: usize = 40;
+const D3D_SIF_COMPARISON_SAMPLER: u32 = 0x02;
+const D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND: u32 = u32::MAX;
+
+/// `D3D_SHADER_INPUT_TYPE` values encoded in `RDEF` resource binding records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RdefInputType {
+    CBuffer,
+    TBuffer,
+    Texture,
+    Sampler,
+    UavRwTyped,
+    Structured,
+    UavRwStructured,
+    ByteAddress,
+    UavRwByteAddress,
+    UavAppendStructured,
+    UavConsumeStructured,
+    UavRwStructuredWithCounter,
+    RtAccelerationStructure,
+    Other(u32),
+}
+
+impl RdefInputType {
+    pub const fn from_u32(raw: u32) -> Self {
+        match raw {
+            0 => Self::CBuffer,
+            1 => Self::TBuffer,
+            2 => Self::Texture,
+            3 => Self::Sampler,
+            4 => Self::UavRwTyped,
+            5 => Self::Structured,
+            6 => Self::UavRwStructured,
+            7 => Self::ByteAddress,
+            8 => Self::UavRwByteAddress,
+            9 => Self::UavAppendStructured,
+            10 => Self::UavConsumeStructured,
+            11 => Self::UavRwStructuredWithCounter,
+            12 => Self::RtAccelerationStructure,
+            other => Self::Other(other),
+        }
+    }
+
+    pub const fn register_class(self) -> Option<RegisterClass> {
+        match self {
+            Self::CBuffer => Some(RegisterClass::B),
+            Self::TBuffer
+            | Self::Texture
+            | Self::Structured
+            | Self::ByteAddress
+            | Self::RtAccelerationStructure => Some(RegisterClass::T),
+            Self::Sampler => Some(RegisterClass::S),
+            Self::UavRwTyped
+            | Self::UavRwStructured
+            | Self::UavRwByteAddress
+            | Self::UavAppendStructured
+            | Self::UavConsumeStructured
+            | Self::UavRwStructuredWithCounter => Some(RegisterClass::U),
+            Self::Other(_) => None,
+        }
+    }
+}
+
+/// `D3D_SRV_DIMENSION` values encoded in `RDEF` resource binding records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RdefResourceDimension {
+    Unknown,
+    Buffer,
+    Texture1D,
+    Texture1DArray,
+    Texture2D,
+    Texture2DArray,
+    Texture2DMS,
+    Texture2DMSArray,
+    Texture3D,
+    TextureCube,
+    TextureCubeArray,
+    BufferEx,
+    Other(u32),
+}
+
+impl RdefResourceDimension {
+    pub const fn from_u32(raw: u32) -> Self {
+        match raw {
+            0 => Self::Unknown,
+            1 => Self::Buffer,
+            2 => Self::Texture1D,
+            3 => Self::Texture1DArray,
+            4 => Self::Texture2D,
+            5 => Self::Texture2DArray,
+            6 => Self::Texture2DMS,
+            7 => Self::Texture2DMSArray,
+            8 => Self::Texture3D,
+            9 => Self::TextureCube,
+            10 => Self::TextureCubeArray,
+            11 => Self::BufferEx,
+            other => Self::Other(other),
+        }
+    }
+
+    pub const fn to_view_dimension(self) -> TextureViewDimension {
+        match self {
+            Self::Texture1D => TextureViewDimension::D1,
+            Self::Texture2D | Self::Texture2DMS => TextureViewDimension::D2,
+            Self::Texture2DArray | Self::Texture2DMSArray | Self::Texture1DArray => {
+                TextureViewDimension::D2Array
+            }
+            Self::Texture3D => TextureViewDimension::D3,
+            Self::TextureCube => TextureViewDimension::Cube,
+            Self::TextureCubeArray => TextureViewDimension::CubeArray,
+            _ => TextureViewDimension::D2,
+        }
+    }
+
+    pub const fn is_multisampled(self) -> bool {
+        matches!(self, Self::Texture2DMS | Self::Texture2DMSArray)
+    }
+}
+
+/// Constant buffer reflection descriptor extracted from an `RDEF` chunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdefCBufferDesc {
+    pub name: String,
+    pub size_bytes: u32,
+    pub variable_count: u32,
+    pub flags: u32,
+    pub cb_type: u32,
+}
+
+/// Resource binding reflection descriptor extracted from an `RDEF` chunk (SM4/5 or SM5.1 `RD11`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdefResourceBinding {
+    pub name: String,
+    pub input_type: RdefInputType,
+    pub return_type: u32,
+    pub dimension: RdefResourceDimension,
+    pub num_samples: u32,
+    pub bind_point: u32,
+    /// Number of bound registers (`0` in SM5.1 `RD11` indicates an unbounded bindless array).
+    pub bind_count: u32,
+    pub flags: u32,
+    pub space: u32,
+    pub id: u32,
+}
+
+impl RdefResourceBinding {
+    pub const fn is_comparison_sampler(&self) -> bool {
+        (self.flags & D3D_SIF_COMPARISON_SAMPLER) != 0
+    }
+
+    pub const fn is_unbounded(&self) -> bool {
+        self.bind_count == 0 || self.bind_count == u32::MAX
+    }
+}
+
+/// Full parsed `RDEF` (Resource Definition) chunk metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdefInfo {
+    pub target_major: u8,
+    pub target_minor: u8,
+    pub program_type: u16,
+    pub is_rd11: bool,
+    pub creator: Option<String>,
+    pub cbuffers: Vec<RdefCBufferDesc>,
+    pub resources: Vec<RdefResourceBinding>,
+}
+
+/// Parsed `STAT` (Shader Statistics) chunk metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatInfo {
+    pub instruction_count: u32,
+    pub temp_register_count: u32,
+    pub def_count: u32,
+    pub dcl_count: u32,
+    pub float_instruction_count: u32,
+    pub int_instruction_count: u32,
+    pub uint_instruction_count: u32,
+    pub texture_normal_instructions: Option<u32>,
+    pub texture_load_instructions: Option<u32>,
+    pub texture_comp_instructions: Option<u32>,
+    pub texture_bias_instructions: Option<u32>,
+    pub texture_gradient_instructions: Option<u32>,
+}
+
+/// Parse an `RDEF` chunk (SM4/5 and SM5.1 `RD11`) with full bounds and overflow checks.
+pub fn parse_rdef_chunk(payload: &[u8]) -> Result<RdefInfo, DxilReflectError> {
+    const TAG: &str = "RDEF";
+    if payload.len() < RDEF_MIN_HEADER_BYTES {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc: TAG,
+            actual: payload.len(),
+            expected_min: RDEF_MIN_HEADER_BYTES,
+        });
+    }
+
+    let cbuffer_count = read_u32_checked(TAG, payload, 0)? as usize;
+    let cbuffer_offset = read_u32_checked(TAG, payload, 4)? as usize;
+    let resource_count = read_u32_checked(TAG, payload, 8)? as usize;
+    let resource_offset = read_u32_checked(TAG, payload, 12)? as usize;
+    let target_minor = read_u8_checked(TAG, payload, 16)?;
+    let target_major = read_u8_checked(TAG, payload, 17)?;
+    let program_type = u16::from_le_bytes([
+        read_u8_checked(TAG, payload, 18)?,
+        read_u8_checked(TAG, payload, 19)?,
+    ]);
+    let creator_offset = read_u32_checked(TAG, payload, 24)?;
+
+    let is_rd11 = payload.get(28..32) == Some(b"RD11".as_slice());
+    let binding_stride = if is_rd11 && payload.len() >= RDEF_RD11_HEADER_BYTES {
+        let declared = read_u32_checked(TAG, payload, 48)? as usize;
+        if declared >= RDEF_BINDING_RD11_BYTES {
+            declared
+        } else {
+            RDEF_BINDING_RD11_BYTES
+        }
+    } else if is_rd11 {
+        RDEF_BINDING_RD11_BYTES
+    } else {
+        RDEF_BINDING_SM4_BYTES
+    };
+    let cbuffer_stride = if is_rd11 && payload.len() >= RDEF_RD11_HEADER_BYTES {
+        let declared = read_u32_checked(TAG, payload, 36)? as usize;
+        if declared >= RDEF_CBUFFER_BYTES {
+            declared
+        } else {
+            RDEF_CBUFFER_BYTES
+        }
+    } else {
+        RDEF_CBUFFER_BYTES
+    };
+
+    if cbuffer_count > MAX_TOTAL_DESCRIPTOR_RANGES {
+        return Err(DxilReflectError::TooManyDescriptorRanges {
+            count: cbuffer_count,
+            max: MAX_TOTAL_DESCRIPTOR_RANGES,
+        });
+    }
+    if resource_count > MAX_TOTAL_DESCRIPTOR_RANGES {
+        return Err(DxilReflectError::TooManyDescriptorRanges {
+            count: resource_count,
+            max: MAX_TOTAL_DESCRIPTOR_RANGES,
+        });
+    }
+
+    let creator = if creator_offset as usize >= RDEF_MIN_HEADER_BYTES {
+        read_bounded_c_string(TAG, payload, creator_offset, RDEF_MIN_HEADER_BYTES, 0, MAX_SEMANTIC_NAME_LEN).ok()
+    } else {
+        None
+    };
+
+    let mut cbuffers = Vec::new();
+    if cbuffer_count > 0 {
+        let total_cb_bytes =
+            checked_mul_size(TAG, cbuffer_count, cbuffer_stride, "RDEF cbuffer table overflow")?;
+        ensure_slice(TAG, payload, cbuffer_offset, total_cb_bytes)?;
+        cbuffers.reserve(cbuffer_count);
+        for i in 0..cbuffer_count {
+            let delta = checked_mul_size(TAG, i, cbuffer_stride, "RDEF cbuffer offset overflow")?;
+            let off = checked_add_offset(TAG, cbuffer_offset, delta, "RDEF cbuffer offset overflow")?;
+            let name_off = read_u32_checked(TAG, payload, off)?;
+            let name = read_bounded_c_string(
+                TAG,
+                payload,
+                name_off,
+                RDEF_MIN_HEADER_BYTES,
+                i,
+                MAX_SEMANTIC_NAME_LEN,
+            )
+            .unwrap_or_else(|_| format!("cbuffer_{i}"));
+            let variable_count = read_u32_checked(TAG, payload, off + 4)?;
+            let size_bytes = read_u32_checked(TAG, payload, off + 12)?;
+            let flags = read_u32_checked(TAG, payload, off + 16)?;
+            let cb_type = read_u32_checked(TAG, payload, off + 20)?;
+            cbuffers.push(RdefCBufferDesc {
+                name,
+                size_bytes,
+                variable_count,
+                flags,
+                cb_type,
+            });
+        }
+    }
+
+    let mut resources = Vec::new();
+    if resource_count > 0 {
+        let total_res_bytes = checked_mul_size(
+            TAG,
+            resource_count,
+            binding_stride,
+            "RDEF resource binding table overflow",
+        )?;
+        ensure_slice(TAG, payload, resource_offset, total_res_bytes)?;
+        resources.reserve(resource_count);
+        for i in 0..resource_count {
+            let delta = checked_mul_size(TAG, i, binding_stride, "RDEF resource offset overflow")?;
+            let off =
+                checked_add_offset(TAG, resource_offset, delta, "RDEF resource offset overflow")?;
+            let name_off = read_u32_checked(TAG, payload, off)?;
+            let name = read_bounded_c_string(
+                TAG,
+                payload,
+                name_off,
+                RDEF_MIN_HEADER_BYTES,
+                i,
+                MAX_SEMANTIC_NAME_LEN,
+            )
+            .unwrap_or_else(|_| format!("res_{i}"));
+            let input_type = RdefInputType::from_u32(read_u32_checked(TAG, payload, off + 4)?);
+            let return_type = read_u32_checked(TAG, payload, off + 8)?;
+            let dimension =
+                RdefResourceDimension::from_u32(read_u32_checked(TAG, payload, off + 12)?);
+            let num_samples = read_u32_checked(TAG, payload, off + 16)?;
+            let bind_point = read_u32_checked(TAG, payload, off + 20)?;
+            let bind_count = read_u32_checked(TAG, payload, off + 24)?;
+            let flags = read_u32_checked(TAG, payload, off + 28)?;
+            let (space, id) = if is_rd11 && binding_stride >= RDEF_BINDING_RD11_BYTES {
+                (
+                    read_u32_checked(TAG, payload, off + 32)?,
+                    read_u32_checked(TAG, payload, off + 36)?,
+                )
+            } else {
+                (0, i as u32)
+            };
+            resources.push(RdefResourceBinding {
+                name,
+                input_type,
+                return_type,
+                dimension,
+                num_samples,
+                bind_point,
+                bind_count,
+                flags,
+                space,
+                id,
+            });
+        }
+    }
+
+    Ok(RdefInfo {
+        target_major,
+        target_minor,
+        program_type,
+        is_rd11,
+        creator,
+        cbuffers,
+        resources,
+    })
+}
+
+/// Parse a `STAT` shader statistics chunk cleanly with bounds checks.
+pub fn parse_stat_chunk(payload: &[u8]) -> Result<StatInfo, DxilReflectError> {
+    const TAG: &str = "STAT";
+    if payload.len() < 28 {
+        return Err(DxilReflectError::TruncatedChunk {
+            fourcc: TAG,
+            actual: payload.len(),
+            expected_min: 28,
+        });
+    }
+    let opt_u32 = |off: usize| -> Option<u32> { read_u32_checked(TAG, payload, off).ok() };
+    Ok(StatInfo {
+        instruction_count: read_u32_checked(TAG, payload, 0)?,
+        temp_register_count: read_u32_checked(TAG, payload, 4)?,
+        def_count: read_u32_checked(TAG, payload, 8)?,
+        dcl_count: read_u32_checked(TAG, payload, 12)?,
+        float_instruction_count: read_u32_checked(TAG, payload, 16)?,
+        int_instruction_count: read_u32_checked(TAG, payload, 20)?,
+        uint_instruction_count: read_u32_checked(TAG, payload, 24)?,
+        texture_normal_instructions: opt_u32(44),
+        texture_load_instructions: opt_u32(48),
+        texture_comp_instructions: opt_u32(52),
+        texture_bias_instructions: opt_u32(56),
+        texture_gradient_instructions: opt_u32(60),
+    })
+}
+
+fn rdef_resource_layout(
+    res: &RdefResourceBinding,
+    cbuffer_sizes: &BTreeMap<String, u32>,
+) -> (ResourceKind, Option<BindingLayout>, Option<u32>, bool) {
+    let sample_type_for_return = |ret: u32, multisampled: bool| -> TextureSampleType {
+        match ret {
+            3 => TextureSampleType::Sint,
+            4 => TextureSampleType::Uint,
+            _ if multisampled => TextureSampleType::UnfilterableFloat,
+            _ => TextureSampleType::Float,
+        }
+    };
+    match res.input_type {
+        RdefInputType::CBuffer => {
+            let min_size = cbuffer_sizes.get(&res.name).copied().unwrap_or(0);
+            (
+                ResourceKind::Buffer,
+                Some(BindingLayout::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: u64::from(min_size),
+                }),
+                (min_size > 0).then_some(min_size),
+                false,
+            )
+        }
+        RdefInputType::Sampler => (
+            ResourceKind::Sampler,
+            Some(BindingLayout::Sampler {
+                ty: if res.is_comparison_sampler() {
+                    SamplerBindingType::Comparison
+                } else {
+                    SamplerBindingType::Filtering
+                },
+            }),
+            None,
+            false,
+        ),
+        RdefInputType::Structured | RdefInputType::ByteAddress | RdefInputType::TBuffer => (
+            ResourceKind::Buffer,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::ReadOnlyStorage,
+                has_dynamic_offset: false,
+                min_binding_size: 0,
+            }),
+            None,
+            false,
+        ),
+        RdefInputType::Texture => {
+            let multisampled = res.dimension.is_multisampled();
+            let view_dimension = if multisampled {
+                TextureViewDimension::D2
+            } else {
+                res.dimension.to_view_dimension()
+            };
+            let sample_type = sample_type_for_return(res.return_type, multisampled);
+            (
+                ResourceKind::Texture,
+                Some(BindingLayout::Texture {
+                    sample_type,
+                    view_dimension,
+                    multisampled,
+                }),
+                None,
+                false,
+            )
+        }
+        RdefInputType::UavRwTyped => {
+            let view_dimension = match res.dimension {
+                RdefResourceDimension::Texture1D => TextureViewDimension::D1,
+                RdefResourceDimension::Texture2DArray | RdefResourceDimension::Texture1DArray => {
+                    TextureViewDimension::D2Array
+                }
+                RdefResourceDimension::Texture3D => TextureViewDimension::D3,
+                _ => TextureViewDimension::D2,
+            };
+            (
+                ResourceKind::StorageTexture,
+                Some(BindingLayout::StorageTexture {
+                    access: StorageTextureAccess::WriteOnly,
+                    format: "rgba8unorm",
+                    view_dimension,
+                }),
+                None,
+                true,
+            )
+        }
+        RdefInputType::UavRwStructured
+        | RdefInputType::UavRwByteAddress
+        | RdefInputType::UavAppendStructured
+        | RdefInputType::UavConsumeStructured
+        | RdefInputType::UavRwStructuredWithCounter => (
+            ResourceKind::Buffer,
+            Some(BindingLayout::Buffer {
+                ty: BufferBindingType::Storage,
+                has_dynamic_offset: false,
+                min_binding_size: 0,
+            }),
+            None,
+            true,
+        ),
+        RdefInputType::RtAccelerationStructure => {
+            (ResourceKind::AccelerationStructure, None, None, false)
+        }
+        RdefInputType::Other(_) => (ResourceKind::Buffer, None, None, false),
+    }
+}
+
+fn extract_slots_from_rdef(
+    rdef: &RdefInfo,
+    container_stage: ShaderStage,
+) -> Result<Vec<ExtractedSlot>, DxilReflectError> {
+    let (vis, d3d_vis) = match container_stage {
+        ShaderStage::Vertex => (VISIBILITY_VERTEX, D3dShaderVisibility::Vertex.d3d_stage_mask()),
+        ShaderStage::Fragment => (VISIBILITY_FRAGMENT, D3dShaderVisibility::Pixel.d3d_stage_mask()),
+        ShaderStage::Compute => (VISIBILITY_COMPUTE, D3dShaderVisibility::All.d3d_stage_mask()),
+    };
+    let cbuffer_sizes: BTreeMap<String, u32> = rdef
+        .cbuffers
+        .iter()
+        .map(|cb| (cb.name.clone(), cb.size_bytes))
+        .collect();
+
+    let mut slots = Vec::new();
+    for res in &rdef.resources {
+        let Some(class) = res.input_type.register_class() else {
+            continue;
+        };
+        let (resource, layout, _min_size, _writable) = rdef_resource_layout(res, &cbuffer_sizes);
+        if res.is_unbounded() {
+            slots.push(ExtractedSlot {
+                register: D3dRegister {
+                    class,
+                    index: res.bind_point,
+                    space: res.space,
+                },
+                range_end: u32::MAX,
+                d3d_visibility_mask: d3d_vis,
+                name: res.name.clone(),
+                visibility: vis,
+                resource,
+                layout: None,
+                root_constants: false,
+                binding_array: Some(BindingArraySize::Unbounded),
+                lowering_need: Some((
+                    LoweringKind::UnboundedBindingArray,
+                    format!("'{}': unbounded RDEF resource binding", res.name),
+                )),
+            });
+            continue;
+        }
+        if res.bind_count > MAX_EXPANDED_RANGE_DESCRIPTORS {
+            let range_end = res
+                .bind_point
+                .checked_add(res.bind_count - 1)
+                .ok_or_else(|| DxilReflectError::Overflow {
+                    fourcc: "RDEF",
+                    detail: format!(
+                        "RDEF resource '{}' register index overflow (base={}, count={})",
+                        res.name, res.bind_point, res.bind_count
+                    ),
+                })?;
+            slots.push(ExtractedSlot {
+                register: D3dRegister {
+                    class,
+                    index: res.bind_point,
+                    space: res.space,
+                },
+                range_end,
+                d3d_visibility_mask: d3d_vis,
+                name: res.name.clone(),
+                visibility: vis,
+                resource,
+                layout: None,
+                root_constants: false,
+                binding_array: Some(BindingArraySize::Fixed(res.bind_count)),
+                lowering_need: Some((
+                    LoweringKind::BindingArray,
+                    format!(
+                        "'{}': RDEF resource array of {} elements exceeds expansion limit",
+                        res.name, res.bind_count
+                    ),
+                )),
+            });
+            continue;
+        }
+        for offset in 0..res.bind_count {
+            let reg_idx = res
+                .bind_point
+                .checked_add(offset)
+                .ok_or_else(|| DxilReflectError::Overflow {
+                    fourcc: "RDEF",
+                    detail: format!(
+                        "RDEF resource '{}' register index overflow (base={}, offset={offset})",
+                        res.name, res.bind_point
+                    ),
+                })?;
+            let slot_name = if res.bind_count == 1 {
+                res.name.clone()
+            } else {
+                format!("{}_{offset}", res.name)
+            };
+            slots.push(ExtractedSlot {
+                register: D3dRegister {
+                    class,
+                    index: reg_idx,
+                    space: res.space,
+                },
+                range_end: reg_idx,
+                d3d_visibility_mask: d3d_vis,
+                name: slot_name,
+                visibility: vis,
+                resource,
+                layout,
+                root_constants: false,
+                binding_array: None,
+                lowering_need: if layout.is_none() {
+                    Some((
+                        LoweringKind::UnsupportedResource,
+                        format!("'{}': unsupported RDEF resource kind", res.name),
+                    ))
+                } else {
+                    None
+                },
+            });
+        }
+    }
+    Ok(slots)
+}
+
+/// One resource binding extracted from DXIL/DXBC fallback metadata (`RTS0`, `PSV0`, `RDEF`, or
+/// DXIL bitcode resource metadata) prior to external root-signature matching.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxilFallbackResource {
+    pub name: String,
+    pub class: RegisterClass,
+    pub base_register: u32,
+    pub register_space: u32,
+    /// `Some(count)` for bounded resources, `None` for unbounded bindless arrays.
+    pub count: Option<u32>,
+    pub resource_kind: ResourceKind,
+    pub layout: Option<BindingLayout>,
+    pub min_binding_size_bytes: Option<u32>,
+    pub is_comparison_sampler: bool,
+    pub is_writable: bool,
+    /// Chunk tag from which this resource was extracted (`"RTS0"`, `"PSV0"`, `"RDEF"`).
+    pub source_chunk: &'static str,
+}
+
+/// Complete DXIL fallback reflection extracted from a DXBC/DXIL container (even when native
+/// RDNA2 ISA and embedded `RTS0` are absent, as in `LEGAL NOTICES -> Spinner` pairs in `#482`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxilFallbackReflection {
+    pub hash: u64,
+    pub container_digest: String,
+    pub shader_kind: Option<DxilShaderKind>,
+    pub stage: ShaderStage,
+    pub shader_model: Option<(u8, u8)>,
+    pub has_embedded_rts0: bool,
+    pub has_dxil_bitcode: bool,
+    pub resources: Vec<DxilFallbackResource>,
+    pub input_signature: Option<StageSignature>,
+    pub output_signature: Option<StageSignature>,
+    pub vertex_inputs: Vec<ShaderIo>,
+    pub fragment_outputs: Vec<ShaderIo>,
+    pub workgroup_size: Option<[u32; 3]>,
+    pub rdef: Option<RdefInfo>,
+    pub psv: Option<PsvInfo>,
+    pub stat: Option<StatInfo>,
+}
+
+/// Extract fallback reflection metadata (`RDEF`/`STAT`/`ISG1`/`ISGN`/`OSG1`/`OSGN`/`PSV0`/
+/// optional `RTS0` and `DXIL` program header) from a DXBC/DXIL container without requiring an
+/// embedded `RTS0` chunk or native RDNA2 ISA.
+pub fn extract_dxil_fallback_reflection(
+    bytes: &[u8],
+) -> Result<DxilFallbackReflection, DxilReflectError> {
+    let info = parse_dxbc(bytes)?;
+    let chunk_refs = parse_dxbc_chunks(bytes)?;
+
+    let mut root_signature: Option<RootSignature> = None;
+    let mut isg1: Option<StageSignature> = None;
+    let mut isgn: Option<StageSignature> = None;
+    let mut osg1: Option<StageSignature> = None;
+    let mut osgn: Option<StageSignature> = None;
+    let mut psv: Option<PsvInfo> = None;
+    let mut rdef: Option<RdefInfo> = None;
+    let mut stat: Option<StatInfo> = None;
+
+    for chunk in chunk_refs {
+        match &chunk.fourcc {
+            b"DXIL" => validate_dxil_chunk(chunk.payload)?,
+            b"SHDR" => validate_legacy_shader_chunk("SHDR", chunk.payload)?,
+            b"SHEX" => validate_legacy_shader_chunk("SHEX", chunk.payload)?,
+            b"RTS0" => {
+                if root_signature.is_none() {
+                    root_signature = Some(parse_rts0_chunk(chunk.payload)?);
+                }
+            }
+            b"ISG1" => {
+                if isg1.is_none() {
+                    isg1 = Some(parse_signature_elements(chunk.fourcc, chunk.payload)?);
+                }
+            }
+            b"ISGN" => {
+                if isgn.is_none() {
+                    isgn = Some(parse_signature_elements(chunk.fourcc, chunk.payload)?);
+                }
+            }
+            b"OSG1" => {
+                if osg1.is_none() {
+                    osg1 = Some(parse_signature_elements(chunk.fourcc, chunk.payload)?);
+                }
+            }
+            b"OSGN" => {
+                if osgn.is_none() {
+                    osgn = Some(parse_signature_elements(chunk.fourcc, chunk.payload)?);
+                }
+            }
+            b"PSV0" => {
+                if psv.is_none() {
+                    psv = Some(parse_psv0_chunk(chunk.payload)?);
+                }
+            }
+            b"RDEF" => {
+                if rdef.is_none() {
+                    rdef = Some(parse_rdef_chunk(chunk.payload)?);
+                }
+            }
+            b"STAT" => {
+                if stat.is_none() {
+                    stat = parse_stat_chunk(chunk.payload).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let input_signature = isg1.or(isgn);
+    let output_signature = osg1.or(osgn);
+    let shader_kind = info
+        .shader_kind()
+        .or_else(|| psv.as_ref().and_then(|p| p.shader_stage))
+        .or_else(|| {
+            rdef.as_ref()
+                .map(|r| DxilShaderKind::from_u16(r.program_type))
+        });
+    let shader_model = info.shader_model().or_else(|| {
+        rdef.as_ref()
+            .map(|r| (r.target_major, r.target_minor))
+    });
+    let (stage, _) = infer_webgpu_stage(
+        shader_kind,
+        root_signature.as_ref(),
+        input_signature.as_ref(),
+        output_signature.as_ref(),
+    );
+
+    let (vertex_inputs, fragment_outputs, _) =
+        lower_stage_io(stage, input_signature.as_ref(), output_signature.as_ref());
+
+    let workgroup_size = if stage == ShaderStage::Compute {
+        psv.as_ref().and_then(|p| p.workgroup_size)
+    } else {
+        None
+    };
+
+    // Merge resource definitions cleanly: prefer RDEF names/sizes/dimensions when present,
+    // supplement with PSV0 entries for any register not covered by RDEF, and include RTS0
+    // entries when neither PSV0 nor RDEF supplied resources.
+    let mut by_key: BTreeMap<(u32, RegisterClass, u32), DxilFallbackResource> = BTreeMap::new();
+
+    if let Some(rdef_info) = &rdef {
+        let cb_sizes: BTreeMap<String, u32> = rdef_info
+            .cbuffers
+            .iter()
+            .map(|cb| (cb.name.clone(), cb.size_bytes))
+            .collect();
+        for res in &rdef_info.resources {
+            let Some(class) = res.input_type.register_class() else {
+                continue;
+            };
+            let (resource_kind, layout, min_binding_size_bytes, is_writable) =
+                rdef_resource_layout(res, &cb_sizes);
+            let count = if res.is_unbounded() {
+                None
+            } else {
+                Some(res.bind_count)
+            };
+            by_key.insert(
+                (res.space, class, res.bind_point),
+                DxilFallbackResource {
+                    name: res.name.clone(),
+                    class,
+                    base_register: res.bind_point,
+                    register_space: res.space,
+                    count,
+                    resource_kind,
+                    layout: if count == Some(1) { layout } else { None },
+                    min_binding_size_bytes,
+                    is_comparison_sampler: res.is_comparison_sampler(),
+                    is_writable,
+                    source_chunk: "RDEF",
+                },
+            );
+        }
+    }
+
+    if let Some(psv_info) = &psv {
+        for res in &psv_info.resources {
+            let range_type = match res.res_type {
+                1 => DescriptorRangeType::Sampler,
+                2 => DescriptorRangeType::Cbv,
+                3 | 4 | 5 | 10 => DescriptorRangeType::Srv,
+                6 | 7 | 8 | 9 | 11 => DescriptorRangeType::Uav,
+                _ => continue,
+            };
+            let class = range_type.register_class();
+            let key = (res.space, class, res.lower_bound);
+            if by_key.contains_key(&key) {
+                continue;
+            }
+            let count = if res.upper_bound == u32::MAX {
+                None
+            } else {
+                res.upper_bound
+                    .checked_sub(res.lower_bound)
+                    .and_then(|d| d.checked_add(1))
+            };
+            let (resource_kind, layout) = classify_table_range_resource(
+                range_type,
+                res.lower_bound,
+                res.space,
+                &psv_info.resources,
+            );
+            let is_writable = matches!(range_type, DescriptorRangeType::Uav);
+            by_key.insert(
+                key,
+                DxilFallbackResource {
+                    name: format!("psv_{}{}_space{}", class.as_str(), res.lower_bound, res.space),
+                    class,
+                    base_register: res.lower_bound,
+                    register_space: res.space,
+                    count,
+                    resource_kind,
+                    layout: if count == Some(1) { Some(layout) } else { None },
+                    min_binding_size_bytes: None,
+                    is_comparison_sampler: false,
+                    is_writable,
+                    source_chunk: "PSV0",
+                },
+            );
+        }
+    }
+
+    if by_key.is_empty()
+        && let Some(rs) = &root_signature
+    {
+        let psv_res = psv.as_ref().map(|p| p.resources.as_slice()).unwrap_or(&[]);
+        for slot in extract_slots_from_rts0(rs, stage, shader_kind, psv_res)? {
+            let count = match slot.binding_array {
+                Some(BindingArraySize::Unbounded) => None,
+                Some(BindingArraySize::Fixed(n)) => Some(n),
+                None => Some(1),
+            };
+            let min_size = match slot.layout {
+                Some(BindingLayout::Buffer {
+                    min_binding_size, ..
+                }) if min_binding_size > 0 => u32::try_from(min_binding_size).ok(),
+                _ => None,
+            };
+            let is_writable = matches!(
+                slot.layout,
+                Some(
+                    BindingLayout::Buffer {
+                        ty: BufferBindingType::Storage,
+                        ..
+                    } | BindingLayout::StorageTexture { .. }
+                )
+            ) || slot.register.class == RegisterClass::U;
+            let is_comparison_sampler = matches!(
+                slot.layout,
+                Some(BindingLayout::Sampler {
+                    ty: SamplerBindingType::Comparison
+                })
+            );
+            by_key.entry((slot.register.space, slot.register.class, slot.register.index)).or_insert(
+                DxilFallbackResource {
+                    name: slot.name,
+                    class: slot.register.class,
+                    base_register: slot.register.index,
+                    register_space: slot.register.space,
+                    count,
+                    resource_kind: slot.resource,
+                    layout: slot.layout,
+                    min_binding_size_bytes: min_size,
+                    is_comparison_sampler,
+                    is_writable,
+                    source_chunk: "RTS0",
+                },
+            );
+        }
+    }
+
+    Ok(DxilFallbackReflection {
+        hash: info.fnv1a_hash,
+        container_digest: info.digest_hex(),
+        shader_kind,
+        stage,
+        shader_model,
+        has_embedded_rts0: root_signature.is_some(),
+        has_dxil_bitcode: info.has_llvm_bitcode(),
+        resources: by_key.into_values().collect(),
+        input_signature,
+        output_signature,
+        vertex_inputs,
+        fragment_outputs,
+        workgroup_size,
+        rdef,
+        psv,
+        stat,
+    })
+}
+
+/// Default console user-data SGPR base for a pipeline stage (`s8` graphics, `s4` compute,
+/// `s16` mesh-compute; matching `runtime/gpu/stage_reflection.h`).
+pub const fn default_user_data_base(
+    stage: ShaderStage,
+    shader_kind: Option<DxilShaderKind>,
+) -> u32 {
+    if matches!(shader_kind, Some(DxilShaderKind::Mesh)) {
+        return CONSOLE_MESH_USER_DATA_BASE;
+    }
+    match stage {
+        ShaderStage::Compute => CONSOLE_COMPUTE_USER_DATA_BASE,
+        ShaderStage::Vertex | ShaderStage::Fragment => CONSOLE_GRAPHICS_USER_DATA_BASE,
+    }
+}
+
+/// How a DXIL fallback resource matched an external D3D12 [`RootSignature`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DxilRootParamMatchKind {
+    RootConstants {
+        param_index: usize,
+        user_sgpr: u32,
+        num_32bit_values: u32,
+    },
+    RootDescriptor {
+        param_index: usize,
+        user_sgpr: u32,
+    },
+    DescriptorTableSlot {
+        param_index: usize,
+        range_index: usize,
+        user_sgpr: u32,
+        table_slot: u32,
+        table_byte_offset: u32,
+        is_unbounded: bool,
+    },
+    StaticSampler {
+        static_sampler_index: u32,
+    },
+}
+
+/// One DXIL resource matched to an external D3D12 root-signature parameter and lowered to a
+/// `playgta6-stage-reflection` v3 [`SidecarBindingSource`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxilMatchedBinding {
+    pub resource: DxilFallbackResource,
+    pub webgpu_group: u32,
+    pub webgpu_binding: u32,
+    pub match_kind: DxilRootParamMatchKind,
+    pub sidecar_source: SidecarBindingSource,
+}
+
+/// Complete result of matching a DXIL-only shader's fallback reflection against an external
+/// D3D12 [`RootSignature`] (producing joinable `playgta6-stage-reflection` v3 entries for
+/// `runtime/gpu/`, Refs `#482`, `#651`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DxilRootMatchReport {
+    pub hash: u64,
+    pub stage: ShaderStage,
+    pub user_data_base: u32,
+    pub matched: Vec<DxilMatchedBinding>,
+    pub unmatched_readonly: Vec<DxilFallbackResource>,
+    pub unmatched_writable: Vec<DxilFallbackResource>,
+    pub sidecar_entry: SidecarStageEntry,
+    pub pipeline_layout: PipelineLayoutDesc,
+    pub bind_group_remaps: Vec<DxilBindGroupRemap>,
+}
+
+impl DxilRootMatchReport {
+    /// `true` when every writable binding matched a root parameter (so the stage is safe to join
+    /// in `runtime/gpu/stage_reflection.cpp`, with read-only unmatched bindings using v3 `unresolved`).
+    pub fn is_joinable_v3(&self) -> bool {
+        self.unmatched_writable.is_empty()
+    }
+}
+
+fn d3d_vis_covers_stage(vis: D3dShaderVisibility, stage: ShaderStage) -> bool {
+    match (vis, stage) {
+        (D3dShaderVisibility::All, _) => true,
+        (D3dShaderVisibility::Vertex, ShaderStage::Vertex) => true,
+        (D3dShaderVisibility::Pixel, ShaderStage::Fragment) => true,
+        (D3dShaderVisibility::Mesh | D3dShaderVisibility::Amplification, ShaderStage::Compute) => true,
+        _ => false,
+    }
+}
+
+fn fallback_resource_to_sidecar_kind(res: &DxilFallbackResource) -> SidecarBindingKind {
+    match res.layout {
+        Some(BindingLayout::Buffer {
+            ty: BufferBindingType::Uniform,
+            ..
+        }) => SidecarBindingKind::Uniform,
+        Some(BindingLayout::Buffer {
+            ty: BufferBindingType::Storage,
+            ..
+        }) => SidecarBindingKind::Storage,
+        Some(BindingLayout::Buffer {
+            ty: BufferBindingType::ReadOnlyStorage,
+            ..
+        }) => SidecarBindingKind::ReadOnlyStorage,
+        Some(BindingLayout::Sampler {
+            ty: SamplerBindingType::Comparison,
+        }) => SidecarBindingKind::ComparisonSampler,
+        Some(BindingLayout::Sampler { .. }) => SidecarBindingKind::Sampler,
+        Some(BindingLayout::Texture { .. }) => SidecarBindingKind::Texture,
+        Some(BindingLayout::StorageTexture { .. }) => SidecarBindingKind::StorageTexture,
+        None => match res.class {
+            RegisterClass::B => SidecarBindingKind::Uniform,
+            RegisterClass::S => {
+                if res.is_comparison_sampler {
+                    SidecarBindingKind::ComparisonSampler
+                } else {
+                    SidecarBindingKind::Sampler
+                }
+            }
+            RegisterClass::U => {
+                if res.resource_kind == ResourceKind::StorageTexture {
+                    SidecarBindingKind::StorageTexture
+                } else {
+                    SidecarBindingKind::Storage
+                }
+            }
+            RegisterClass::T => {
+                if res.resource_kind == ResourceKind::Buffer {
+                    SidecarBindingKind::ReadOnlyStorage
+                } else {
+                    SidecarBindingKind::Texture
+                }
+            }
+        },
+    }
+}
+
+fn signature_to_sidecar_vertex_inputs(sig: Option<&StageSignature>) -> Vec<WgslVertexInputInfo> {
+    let Some(isig) = sig else {
+        return Vec::new();
+    };
+    let mut ordered: Vec<&SignatureElement> = isig
+        .elements
+        .iter()
+        .filter(|e| !e.is_system_value() && e.component_count() > 0)
+        .collect();
+    ordered.sort_by_key(|e| (e.register, e.semantic_index, e.semantic_name.clone()));
+
+    let mut out = Vec::new();
+    let mut byte_offset = 0u32;
+    let mut seen = BTreeSet::new();
+    for elem in ordered {
+        if !seen.insert(elem.register) {
+            continue;
+        }
+        let comps = elem.component_count() as u8;
+        let component_type = match elem.component_type {
+            SignatureComponentType::Uint32 => "u32",
+            SignatureComponentType::Sint32 => "i32",
+            _ => "f32",
+        };
+        let (_, fetch_format) = elem.to_wgsl_io_type();
+        out.push(WgslVertexInputInfo {
+            location: elem.register,
+            vb_slot: 0,
+            byte_offset,
+            components: comps,
+            component_type,
+            fetch_format,
+        });
+        byte_offset = byte_offset.saturating_add(u32::from(comps) * 4);
+    }
+    out
+}
+
+/// Match DXIL fallback resource bindings `(register_space, base_register, class)` against an
+/// external D3D12 [`RootSignature`] (root constants, root descriptors, descriptor table ranges,
+/// and static samplers) and emit a `playgta6-stage-reflection` v3 [`SidecarStageEntry`] plus
+/// WebGPU [`PipelineLayoutDesc`].
+pub fn match_dxil_to_root_signature(
+    fallback: &DxilFallbackReflection,
+    rs: &RootSignature,
+    convention: &RegisterConvention,
+) -> Result<DxilRootMatchReport, DxilReflectError> {
+    let user_data_base = default_user_data_base(fallback.stage, fallback.shader_kind);
+
+    // Precompute console user-data SGPR starting index for each root parameter.
+    let mut param_sgprs: Vec<u32> = Vec::with_capacity(rs.parameters.len());
+    let mut next_sgpr = user_data_base;
+    for param in &rs.parameters {
+        param_sgprs.push(next_sgpr);
+        let width = match &param.kind {
+            RootParameterKind::DescriptorTable(_) => 1,
+            RootParameterKind::Constants32Bit {
+                num_32bit_values, ..
+            } => (*num_32bit_values).max(1),
+            RootParameterKind::Cbv { .. }
+            | RootParameterKind::Srv { .. }
+            | RootParameterKind::Uav { .. } => 2,
+        };
+        next_sgpr = next_sgpr.saturating_add(width);
+    }
+
+    // Lower fallback resources to WebGPU group/binding indices deterministically.
+    let (vis_bit, d3d_vis) = match fallback.stage {
+        ShaderStage::Vertex => (VISIBILITY_VERTEX, D3dShaderVisibility::Vertex.d3d_stage_mask()),
+        ShaderStage::Fragment => (VISIBILITY_FRAGMENT, D3dShaderVisibility::Pixel.d3d_stage_mask()),
+        ShaderStage::Compute => (VISIBILITY_COMPUTE, D3dShaderVisibility::All.d3d_stage_mask()),
+    };
+
+    let mut raw_slots = Vec::with_capacity(fallback.resources.len());
+    for res in &fallback.resources {
+        let (range_end, binding_array, lowering_need) = match res.count {
+            None => (
+                u32::MAX,
+                Some(BindingArraySize::Unbounded),
+                Some((
+                    LoweringKind::UnboundedBindingArray,
+                    format!("'{}': unbounded DXIL fallback resource", res.name),
+                )),
+            ),
+            Some(c) if c > MAX_EXPANDED_RANGE_DESCRIPTORS => (
+                res.base_register.saturating_add(c.saturating_sub(1)),
+                Some(BindingArraySize::Fixed(c)),
+                Some((
+                    LoweringKind::BindingArray,
+                    format!("'{}': large DXIL fallback array ({c} elements)", res.name),
+                )),
+            ),
+            Some(c) => (res.base_register.saturating_add(c.saturating_sub(1)), None, None),
+        };
+        raw_slots.push(ExtractedSlot {
+            register: D3dRegister {
+                class: res.class,
+                index: res.base_register,
+                space: res.register_space,
+            },
+            range_end,
+            d3d_visibility_mask: d3d_vis,
+            name: res.name.clone(),
+            visibility: vis_bit,
+            resource: res.resource_kind,
+            layout: res.layout,
+            root_constants: false,
+            binding_array,
+            lowering_need,
+        });
+    }
+
+    let (reflected_bindings, pipeline_layout, bind_group_remaps, _) =
+        lower_slots_to_webgpu(raw_slots, convention)?;
+
+    // Build lookup from D3D register to assigned WebGPU (group, binding).
+    let mut reg_to_wgpu: BTreeMap<(u32, RegisterClass, u32), (u32, u32)> = BTreeMap::new();
+    for b in &reflected_bindings {
+        if let Some(reg) = b.register {
+            reg_to_wgpu.insert((reg.space, reg.class, reg.index), (b.group, b.binding));
+        }
+    }
+
+    let mut matched = Vec::new();
+    let mut unmatched_readonly = Vec::new();
+    let mut unmatched_writable = Vec::new();
+    let mut sidecar_bindings = Vec::new();
+
+    for res in &fallback.resources {
+        let &(webgpu_group, webgpu_binding) = reg_to_wgpu
+            .get(&(res.register_space, res.class, res.base_register))
+            .unwrap_or(&(res.register_space.min(WEBGPU_MAX_BIND_GROUPS - 1), res.base_register));
+        let kind = fallback_resource_to_sidecar_kind(res);
+        let (view_dimension, sample_type, multisampled) = match res.layout {
+            Some(BindingLayout::Texture {
+                sample_type,
+                view_dimension,
+                multisampled,
+            }) => (
+                Some(view_dimension.as_str()),
+                Some(match sample_type {
+                    TextureSampleType::Float => "float",
+                    TextureSampleType::UnfilterableFloat => "unfilterable_float",
+                    TextureSampleType::Depth => "depth",
+                    TextureSampleType::Sint => "sint",
+                    TextureSampleType::Uint => "uint",
+                }),
+                multisampled,
+            ),
+            Some(BindingLayout::StorageTexture { view_dimension, .. }) => {
+                (Some(view_dimension.as_str()), None, false)
+            }
+            _ => (None, None, false),
+        };
+
+        let found_match = find_matching_root_param(res, fallback.stage, rs, &param_sgprs);
+        match found_match {
+            Some((match_kind, mut sidecar_source, root_const_min_bytes)) => {
+                // If an unbounded DXIL bindless resource matched a table range, represent it with
+                // a validated GFX10.3 lane-indexed heap source (stride 16B sampler / 32B resource).
+                if res.count.is_none()
+                    && let DxilRootParamMatchKind::DescriptorTableSlot { .. } = match_kind
+                {
+                    if res.class == RegisterClass::S {
+                        sidecar_source =
+                            SidecarBindingSource::LaneIndexedSamplerHeap(LaneIndexedHeapSource {
+                                max_count: DEFAULT_LANE_INDEXED_WINDOW,
+                                shift: 4,
+                                stride: GFX10_SAMPLER_STRIDE_BYTES,
+                                window_base: None,
+                            });
+                    } else {
+                        sidecar_source =
+                            SidecarBindingSource::LaneIndexedResourceHeap(LaneIndexedHeapSource {
+                                max_count: DEFAULT_LANE_INDEXED_WINDOW,
+                                shift: 5,
+                                stride: GFX10_IMAGE_STRIDE_BYTES,
+                                window_base: None,
+                            });
+                    }
+                }
+                let min_bytes = res.min_binding_size_bytes.or(root_const_min_bytes);
+                sidecar_bindings.push(SidecarBinding {
+                    group: webgpu_group,
+                    binding: webgpu_binding,
+                    kind,
+                    view_dimension,
+                    sample_type,
+                    multisampled,
+                    storage_format: None,
+                    min_binding_size_bytes: min_bytes,
+                    source: sidecar_source.clone(),
+                });
+                matched.push(DxilMatchedBinding {
+                    resource: res.clone(),
+                    webgpu_group,
+                    webgpu_binding,
+                    match_kind,
+                    sidecar_source,
+                });
+            }
+            None => {
+                if kind.allows_unresolved() {
+                    unmatched_readonly.push(res.clone());
+                    sidecar_bindings.push(SidecarBinding {
+                        group: webgpu_group,
+                        binding: webgpu_binding,
+                        kind,
+                        view_dimension,
+                        sample_type,
+                        multisampled,
+                        storage_format: None,
+                        min_binding_size_bytes: res.min_binding_size_bytes,
+                        source: SidecarBindingSource::Unresolved {
+                            reason: Some("dxil_unmatched_root_param".to_string()),
+                        },
+                    });
+                } else {
+                    unmatched_writable.push(res.clone());
+                }
+            }
+        }
+    }
+
+    sidecar_bindings.sort_by_key(|b| (b.group, b.binding));
+    let vertex_inputs = if fallback.stage == ShaderStage::Vertex {
+        signature_to_sidecar_vertex_inputs(fallback.input_signature.as_ref())
+    } else {
+        Vec::new()
+    };
+
+    let sidecar_entry = SidecarStageEntry {
+        hash: fallback.hash,
+        stage: fallback.stage,
+        bindings: sidecar_bindings,
+        vertex_inputs,
+        mesh_output: None,
+        rt_arena: false,
+    };
+
+    Ok(DxilRootMatchReport {
+        hash: fallback.hash,
+        stage: fallback.stage,
+        user_data_base,
+        matched,
+        unmatched_readonly,
+        unmatched_writable,
+        sidecar_entry,
+        pipeline_layout,
+        bind_group_remaps,
+    })
+}
+
+fn find_matching_root_param(
+    res: &DxilFallbackResource,
+    stage: ShaderStage,
+    rs: &RootSignature,
+    param_sgprs: &[u32],
+) -> Option<(DxilRootParamMatchKind, SidecarBindingSource, Option<u32>)> {
+    // 1. Check root parameters (root constants, root descriptors, descriptor tables).
+    for (param_index, param) in rs.parameters.iter().enumerate() {
+        if !d3d_vis_covers_stage(param.visibility, stage) {
+            continue;
+        }
+        let user_sgpr = param_sgprs[param_index];
+        match &param.kind {
+            RootParameterKind::Constants32Bit {
+                shader_register,
+                register_space,
+                num_32bit_values,
+            } => {
+                if res.class == RegisterClass::B
+                    && res.register_space == *register_space
+                    && res.base_register == *shader_register
+                {
+                    let min_bytes = num_32bit_values.saturating_mul(4);
+                    return Some((
+                        DxilRootParamMatchKind::RootConstants {
+                            param_index,
+                            user_sgpr,
+                            num_32bit_values: *num_32bit_values,
+                        },
+                        SidecarBindingSource::RootConstants { user_sgpr },
+                        (min_bytes > 0).then_some(min_bytes),
+                    ));
+                }
+            }
+            RootParameterKind::Cbv {
+                shader_register,
+                register_space,
+                ..
+            } => {
+                if res.class == RegisterClass::B
+                    && res.register_space == *register_space
+                    && res.base_register == *shader_register
+                {
+                    return Some((
+                        DxilRootParamMatchKind::RootDescriptor {
+                            param_index,
+                            user_sgpr,
+                        },
+                        SidecarBindingSource::RootDescriptor {
+                            user_sgpr,
+                            table_byte_offset: None,
+                        },
+                        None,
+                    ));
+                }
+            }
+            RootParameterKind::Srv {
+                shader_register,
+                register_space,
+                ..
+            } => {
+                if res.class == RegisterClass::T
+                    && res.register_space == *register_space
+                    && res.base_register == *shader_register
+                {
+                    return Some((
+                        DxilRootParamMatchKind::RootDescriptor {
+                            param_index,
+                            user_sgpr,
+                        },
+                        SidecarBindingSource::RootDescriptor {
+                            user_sgpr,
+                            table_byte_offset: None,
+                        },
+                        None,
+                    ));
+                }
+            }
+            RootParameterKind::Uav {
+                shader_register,
+                register_space,
+                ..
+            } => {
+                if res.class == RegisterClass::U
+                    && res.register_space == *register_space
+                    && res.base_register == *shader_register
+                {
+                    return Some((
+                        DxilRootParamMatchKind::RootDescriptor {
+                            param_index,
+                            user_sgpr,
+                        },
+                        SidecarBindingSource::RootDescriptor {
+                            user_sgpr,
+                            table_byte_offset: None,
+                        },
+                        None,
+                    ));
+                }
+            }
+            RootParameterKind::DescriptorTable(ranges) => {
+                let mut append_slot = 0u32;
+                for (range_index, range) in ranges.iter().enumerate() {
+                    let range_start_slot = if range.offset_in_descriptors_from_table_start
+                        == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND
+                    {
+                        append_slot
+                    } else {
+                        range.offset_in_descriptors_from_table_start
+                    };
+                    let is_unbounded = range.num_descriptors == u32::MAX;
+                    let class_matches = range.range_type.register_class() == res.class;
+                    let space_matches = range.register_space == res.register_space;
+                    let reg_matches = if !class_matches || !space_matches || range.num_descriptors == 0 {
+                        false
+                    } else if is_unbounded {
+                        res.base_register >= range.base_shader_register
+                    } else {
+                        let range_end = range
+                            .base_shader_register
+                            .saturating_add(range.num_descriptors - 1);
+                        res.base_register >= range.base_shader_register
+                            && res.base_register <= range_end
+                    };
+
+                    if reg_matches {
+                        let delta = res.base_register - range.base_shader_register;
+                        let table_slot = range_start_slot.saturating_add(delta);
+                        let table_byte_offset =
+                            table_slot.saturating_mul(CONSOLE_TABLE_SLOT_BYTES);
+                        return Some((
+                            DxilRootParamMatchKind::DescriptorTableSlot {
+                                param_index,
+                                range_index,
+                                user_sgpr,
+                                table_slot,
+                                table_byte_offset,
+                                is_unbounded,
+                            },
+                            SidecarBindingSource::Table {
+                                user_sgpr,
+                                table_byte_offset,
+                            },
+                            None,
+                        ));
+                    }
+
+                    if !is_unbounded {
+                        append_slot = range_start_slot.saturating_add(range.num_descriptors);
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check static samplers for `s#` registers.
+    if res.class == RegisterClass::S {
+        for (idx, sampler) in rs.static_samplers.iter().enumerate() {
+            if d3d_vis_covers_stage(sampler.shader_visibility, stage)
+                && sampler.register_space == res.register_space
+                && sampler.shader_register == res.base_register
+            {
+                let static_sampler_index = idx as u32;
+                return Some((
+                    DxilRootParamMatchKind::StaticSampler {
+                        static_sampler_index,
+                    },
+                    SidecarBindingSource::StaticSampler {
+                        index: static_sampler_index,
+                    },
+                    None,
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Convenience helper: extract DXIL fallback reflection from `dxil_bytes` and match it against a
+/// serialized external `RTS0` root signature payload.
+pub fn match_dxil_bytes_to_external_rts0(
+    dxil_bytes: &[u8],
+    rts0_payload: &[u8],
+    convention: &RegisterConvention,
+) -> Result<DxilRootMatchReport, DxilReflectError> {
+    let fallback = extract_dxil_fallback_reflection(dxil_bytes)?;
+    let rs = parse_rts0_chunk(rts0_payload)?;
+    match_dxil_to_root_signature(&fallback, &rs, convention)
+}
+
+/// Reflect a DXIL-only container without embedded `RTS0` by supplying an external [`RootSignature`]
+/// (e.g. from `playgta6-pipeline-dump`'s `manifest.json` or standalone `RTS0` blob).
+pub fn reflect_dxil_bytes_with_external_root_signature(
+    dxil_bytes: &[u8],
+    rs: &RootSignature,
+    source: Option<&str>,
+    convention: &RegisterConvention,
+) -> Result<DxilShaderReflection, DxilReflectError> {
+    let mut base = reflect_dxil_bytes_with_options(dxil_bytes, source, convention)?;
+    if base.root_signature.is_some() {
+        return Ok(base);
+    }
+    let psv_resources: &[PsvResourceBinding] = base
+        .psv
+        .as_ref()
+        .map(|p| p.resources.as_slice())
+        .unwrap_or(&[]);
+    let extracted = extract_slots_from_rts0(rs, base.entry.stage, base.shader_kind, psv_resources)?;
+    let (bindings, pipeline_layout, bind_group_remaps, slot_lowering) =
+        lower_slots_to_webgpu(extracted, convention)?;
+    base.root_signature = Some(rs.clone());
+    base.entry.bindings = bindings;
+    base.entry.requires_lowering.extend(slot_lowering);
+    base.entry.requires_lowering.sort();
+    base.entry.requires_lowering.dedup();
+    base.pipeline_layout = pipeline_layout;
+    base.bind_group_remaps = bind_group_remaps;
+    base.limit_violations = check_pipeline_limits(&base.pipeline_layout, &[&base.entry]);
+    Ok(base)
 }
 
 // ---------------------------------------------------------------------------
