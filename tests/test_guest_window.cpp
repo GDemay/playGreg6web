@@ -1335,6 +1335,64 @@ void test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap() {
     gw::reset_for_testing();
 }
 
+// Regression: mapping a 2 MiB physical page into an uncommitted mirrored MEM_PHYSICAL reservation
+// must populate ALL 32 x 64 KiB guest-window slots (not just slot 0), and unmapping must clear
+// all 32 slots cleanly.
+void test_xmem_mirrored_2mb_page_maps_all_32_slots() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);
+    constexpr uint64_t k2M = 2ull << 20;
+    void* mirror_2m = pg6_xbox_XMemVirtualAlloc(nullptr, 4 * k2M, kWindowType, 0x23u, kCpuProtect);
+    CHECK(cpu != nullptr && pool != nullptr && mirror_2m != nullptr);
+    const uint64_t wm = va_of(mirror_2m);
+    CHECK(wm >= gw::kRuntimeRangeBase);
+
+    // 0x20000000 = MEM_LARGE_PAGES (2 MiB pages) in XMemAllocatePhysicalPages.
+    size_t count = 1;
+    uint64_t pfn[1] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x20000380u, &count, pfn) == 1 && count == 1);
+
+    // Uncommitted mirrored MEM_PHYSICAL reservation starts unmapped.
+    CHECK(gw::slot_host(wm) == nullptr);
+    CHECK(gw::slot_host(wm + 31 * k64K) == nullptr);
+
+    // Map the 2 MiB page: ALL 32 64 KiB slots must become mapped and host-contiguous!
+    CHECK(pg6_xbox_XMemMapPhysicalPages(mirror_2m, 1, pfn) == mirror_2m);
+    CHECK(g_violation == 0);
+    auto* base_host = static_cast<uint8_t*>(gw::slot_host(wm));
+    CHECK(base_host != nullptr);
+    for (uint64_t s = 0; s < 32; ++s) {
+        CHECK(gw::slot_host(wm + s * k64K) == base_host + s * k64K);
+    }
+    // Full 2 MiB range must be directly host-contiguous (no kTrapDelta in slots 1..31).
+    CHECK(gw::contiguous(wm, static_cast<size_t>(k2M)) == base_host);
+    const uint32_t sentinel = 0xCAFEBABEu;
+    CHECK(gw::copy_to_guest(wm + 31 * k64K + 4096, &sentinel, sizeof(sentinel)));
+    uint32_t back = 0;
+    CHECK(gw::copy_from_guest(&back, wm + 31 * k64K + 4096, sizeof(back)) && back == sentinel);
+
+    // Unmap the 2 MiB page: ALL 32 slots must return to unmapped.
+    CHECK(pg6_xbox_XMemMapPhysicalPages(mirror_2m, 1, nullptr) == mirror_2m);
+    for (uint64_t s = 0; s < 32; ++s) {
+        CHECK(gw::slot_host(wm + s * k64K) == nullptr);
+    }
+
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(mirror_2m));
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(1, pfn) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 // A GuestRangeView over a window range holds the arena lock (a concurrent decommit of the arena
@@ -1383,6 +1441,7 @@ int main() {
     test_xmem_concurrent_write_pin_and_relocation();
     test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap();
     test_range_view_holds_the_arena_lock_in_the_window();
+    test_xmem_mirrored_2mb_page_maps_all_32_slots();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
