@@ -4559,4 +4559,41 @@ mod tests {
             .is_none()
         );
     }
+    /// The index lives in a copy made before a merge (`mov r9d, eax` ahead of a branch around a
+    /// block that reaches the guard): the guard on the source bounds the copy.
+    #[test]
+    fn resolves_switch_on_register_copy_made_before_a_merge() {
+        let lea_disp = (i64::from(DATA_RVA) - i64::from(TEXT_RVA + 0x14)) as i32;
+        let code = [
+            &[0x41, 0x89, 0xc1][..],   // 0: mov r9d, eax
+            &[0x85, 0xc9],             // 3: test ecx, ecx
+            &[0x74, 0x01],             // 5: je 8
+            &[0x90],                   // 7: nop
+            &[0x83, 0xf8, 0x03],       // 8: cmp eax, 3
+            &[0x77, 0x1d],             // b: ja 2a
+            &[0x48, 0x8d, 0x15],       // d: lea rdx, [table]
+            &lea_disp.to_le_bytes(),   //
+            &[0x4e, 0x63, 0x0c, 0x8a], // 14: movsxd r9, [rdx+r9*4]
+            &[0x49, 0x01, 0xd1],       // 18: add r9, rdx
+            &[0x41, 0xff, 0xe1],       // 1b: jmp r9
+            &[0x31, 0xc0, 0xc3],       // 1e: case 0
+            &[0x31, 0xc0, 0xc3],       // 21: case 1
+            &[0x31, 0xc0, 0xc3],       // 24: case 2
+            &[0x31, 0xc0, 0xc3],       // 27: case 3
+            &[0x31, 0xc0, 0xc3],       // 2a: default
+        ]
+        .concat();
+        let cases = [0x1eu32, 0x21, 0x24, 0x27];
+        let data: Vec<u8> = cases
+            .iter()
+            .flat_map(|&c| ((TEXT_RVA + c) as i32 - DATA_RVA as i32).to_le_bytes())
+            .collect();
+        let analysis = analyze(&code, &data, &[0], &[]);
+        let table = analysis
+            .jump_tables
+            .get(&(TEXT + 0x1b))
+            .expect("copy-indexed switch resolves");
+        assert!(!table.inferred);
+        assert_eq!(table.targets, cases.map(|c| TEXT + u64::from(c)).to_vec());
+    }
 }
