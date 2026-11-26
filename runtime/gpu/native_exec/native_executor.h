@@ -50,6 +50,11 @@ struct ExecutorOptions {
     // device without it (r16float depth twins, r32float dummies) run on real hardware.
     bool disable_float32_filterable = false;
     bool gpu_timing = true;
+    // Per-pipeline attribution inside a pass (--gpu-time-split): a pass is timed as segments, one per
+    // run of the same pipeline, with a timestamp written inside the pass at every pipeline change
+    // (Dawn's chromium-experimental-timestamp-query-inside-passes). Off: a pass is one measurement,
+    // keyed to the pipeline its first SetPipeline selects. Needs gpu_timing and the adapter feature.
+    bool gpu_time_split = false;
     d3d12_guest::GpuTimeTable* gpu_time = nullptr;
     // Persistent Dawn blob cache (blob_cache.h): compiled shaders / pipelines are stored under
     // <blob_cache_root>/<blob_cache_title>/<Dawn build>-<adapter>/ and loaded by later runs, so DXC and
@@ -200,6 +205,8 @@ struct ExecutorStats {
     std::string last_reflection_error;
     uint64_t timer_frames = 0;            // submits with timestamp queries attached
     uint64_t timer_passes = 0;            // passes that carried timestamp writes
+    uint64_t timer_segments = 0;          // extra per-pipeline segments written inside passes (gpu_time_split)
+    bool timer_split_supported = false;   // the device has timestamp-query-inside-passes (gpu_time_split)
     uint64_t timer_frames_skipped = 0;    // no free query slot (the previous one was still in flight)
     bool timer_supported = false;
     bool limits_raised = false;  // device created with requestNegotiatedDevice's raised limits
