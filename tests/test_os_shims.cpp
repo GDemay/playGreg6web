@@ -367,6 +367,40 @@ void test_xtask_queue() {
         CHECK(order[0] == 1 && order[1] == 2 && order[2] == 10 && order[3] == 20);
     }
 
+    // 4a'. A pool port grows: callback A waits for callback B on the same port (no deadlock),
+    // and a serialized port stays single-threaded.
+    {
+        XTaskQueue q(XTaskQueue::DispatchMode::ThreadPool, XTaskQueue::DispatchMode::Manual, 1);
+        std::atomic<bool> b_ran{false};
+        std::atomic<bool> a_saw_b{false};
+        CHECK(q.submit_work([&]() {
+            for (int i = 0; i < 2000 && !b_ran.load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            a_saw_b = b_ran.load();
+        }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        CHECK(q.submit_work([&]() { b_ran = true; }));
+        q.terminate(true, false);
+        CHECK(a_saw_b.load());
+    }
+    {
+        XTaskQueue q(XTaskQueue::DispatchMode::ThreadPool, XTaskQueue::DispatchMode::Manual, 1, true);
+        std::atomic<int> running{0};
+        std::atomic<int> max_running{0};
+        for (int i = 0; i < 6; ++i) {
+            CHECK(q.submit_work([&]() {
+                const int now = ++running;
+                int prev = max_running.load();
+                while (now > prev && !max_running.compare_exchange_weak(prev, now)) {}
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                --running;
+            }));
+        }
+        q.terminate(true, false);
+        CHECK(max_running.load() == 1);
+    }
+
     // 4b. ThreadPool worker drain + manual completion dispatch.
     {
         XTaskQueue q(XTaskQueue::DispatchMode::ThreadPool,

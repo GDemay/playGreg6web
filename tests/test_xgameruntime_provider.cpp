@@ -507,15 +507,35 @@ void test_query_api() {
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
     {
-        // XSpeechSynthesizer slot 9 (XSpeechSynthesizerCreate): no synthesizer, so it fails and
-        // leaves the handle null; a null out pointer is invalid.
+        // XSpeechSynthesizer: silent synthesizer. Fixed handle, empty 16 kHz mono WAVE streams.
         const uint64_t speech = fx.query(com::make_guid("3e241977-6237-41e9-8559-102c2d9983f1"),
                                          com::make_guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"));
         const uint64_t handle = fx.alloc(8);
         CHECK(com::write_guest(handle, uint64_t{0x1234}));
-        CHECK(hr32(fx.vcall(speech, 9, {handle})) == com::E_NOTIMPL_HR);
-        CHECK(load64(handle) == 0);
+        CHECK(hr32(fx.vcall(speech, 9, {handle})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t h = load64(handle);
+        CHECK(h != 0 && h != 0x1234);
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
+        const uint64_t stream_out = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 11, {h, 0, stream_out})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t stream = load64(stream_out);
+        CHECK(stream != 0);
+        CHECK(hr32(fx.vcall(speech, 12, {h, 0, stream_out})) == playgta6::os::gdk::S_OK_HR);
+        const uint64_t size = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 14, {stream, size})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(load64(size) == 44);
+        const uint64_t buf = fx.alloc(64);
+        const uint64_t used = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 15, {stream, 10, buf, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(speech, 15, {stream, 64, buf, used})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(load64(used) == 44);
+        uint8_t wav[44] = {};
+        CHECK(com::read_guest(buf, wav, sizeof(wav)));
+        CHECK(std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVE", 4) == 0);
+        CHECK(wav[22] == 1 && wav[24] == 0x80 && wav[25] == 0x3e && wav[34] == 16);
+        CHECK(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0);
+        CHECK(hr32(fx.vcall(speech, 13, {stream})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 10, {h})) == playgta6::os::gdk::S_OK_HR);
     }
     {
         // XGameSave (O34): a local provider. s3 hands out a handle, s4 completes through the
