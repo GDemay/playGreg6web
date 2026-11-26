@@ -582,7 +582,13 @@ bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, st
 
 }  // namespace
 
-bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets) {
+namespace {
+
+// views_only: report only through shared page views (never MEM_WRITE_WATCH, whose take is
+// destructive for other readers of the same pages); false when any part of the range is not
+// covered by tracked views. On false nothing is consumed (the caller's clock stays).
+bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets,
+                     bool views_only) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kWrittenPageSize} - 1);
     const uintptr_t end = reinterpret_cast<uintptr_t>(p) + static_cast<uintptr_t>(len);
     {
@@ -608,8 +614,13 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
             for (; it != g_views.end() && it->first < end; ++it) {
                 const uintptr_t lo = std::max<uintptr_t>(it->first, start);
                 const uintptr_t hi = std::min<uintptr_t>(it->first + static_cast<uintptr_t>(it->second.size), end);
-                if (at < lo && !written_pages_by_watch(at, lo, start, offsets)) {
-                    all_written(at, lo, start, offsets);
+                if (at < lo) {
+                    if (views_only) {
+                        return false;
+                    }
+                    if (!written_pages_by_watch(at, lo, start, offsets)) {
+                        all_written(at, lo, start, offsets);
+                    }
                 }
                 TrackedPage& page = *it->second.tracked;
                 std::lock_guard<std::mutex> page_lock(page.mutex);
@@ -622,8 +633,13 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
                 }
                 at = hi;
             }
-            if (at < end && !written_pages_by_watch(at, end, start, offsets)) {
-                all_written(at, end, start, offsets);
+            if (at < end) {
+                if (views_only) {
+                    return false;
+                }
+                if (!written_pages_by_watch(at, end, start, offsets)) {
+                    all_written(at, end, start, offsets);
+                }
             }
             if (view_clock != nullptr) {
                 *view_clock = clock;
@@ -631,7 +647,20 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, st
             return true;
         }
     }
+    if (views_only) {
+        return false;
+    }
     return written_pages_by_watch(start, end, start, offsets);
+}
+
+}  // namespace
+
+bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets) {
+    return take_pages_impl(p, len, view_clock, offsets, false);
+}
+
+bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets) {
+    return view_clock != nullptr && take_pages_impl(p, len, view_clock, offsets, true);
 }
 
 #elif defined(__EMSCRIPTEN__)
@@ -777,6 +806,10 @@ bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_
     return false;  // no write tracking in linear memory
 }
 
+bool take_written_view_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
+    return false;
+}
+
 uint64_t tracked_view_faults() {
     return 0;
 }
@@ -864,6 +897,10 @@ bool enforces_protection() {
 
 bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
     return false;  // not tracked on POSIX hosts
+}
+
+bool take_written_view_pages(const uint8_t*, uint64_t, uint64_t*, std::vector<uint64_t>*) {
+    return false;
 }
 
 uint64_t tracked_view_faults() {

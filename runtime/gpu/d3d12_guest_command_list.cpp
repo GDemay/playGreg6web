@@ -41,6 +41,9 @@ const char* work_name(Work w) {
     case Work::IndirectExecutionsSkipped: return "indirect_executions_skipped";
     case Work::IndirectExecutionsEmitted: return "indirect_executions_emitted";
     case Work::TextureUploads: return "texture_uploads";
+    case Work::TextureSyncViewSkips: return "texture_sync_view_skips";
+    case Work::TextureSyncViewTracked: return "texture_sync_view_tracked";
+    case Work::TextureSyncUntracked: return "texture_sync_untracked";
     case Work::BufferUploads: return "buffer_uploads";
     case Work::CopiesSkipped: return "copies_skipped";
     case Work::ResourcesCreated: return "resources_created";

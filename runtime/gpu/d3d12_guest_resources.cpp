@@ -3,6 +3,9 @@
 #include "gpu/xbox_embedded_native.h"
 
 #include <algorithm>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
@@ -418,6 +421,18 @@ uint64_t content_hash(const void* data, size_t size) {
 bool all_zero_bytes(const void* data, size_t size) {
     const auto* p = static_cast<const uint8_t*>(data);
     size_t i = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+    // 128 bytes per step (eight 16-byte loads OR-ed), one branch per step.
+    for (; i + 128 <= size; i += 128) {
+        __m128i acc = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i));
+        for (size_t k = 16; k < 128; k += 16) {
+            acc = _mm_or_si128(acc, _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + k)));
+        }
+        if (_mm_movemask_epi8(_mm_cmpeq_epi8(acc, _mm_setzero_si128())) != 0xFFFF) {
+            return false;
+        }
+    }
+#endif
     for (; i + 64 <= size; i += 64) {
         uint64_t acc = 0;
         for (size_t k = 0; k < 64; k += 8) {
@@ -858,7 +873,64 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
+    // Native shared page views (no translated window): the same skip, from the per-page write
+    // stamps of os::take_written_view_pages (non-destructive for other readers; false where the
+    // range is not wholly view-backed, which keeps the full read). A texture whose last full check
+    // (zero scan / hash) is still current and whose pages were not written since is unchanged.
+    bool view_tracked = false;
+    if (!in_window && primary_size > 0) {
+        if (const auto* host = static_cast<const uint8_t*>(com::guest_to_host(cpu_va, static_cast<size_t>(primary_size)))) {
+            os::WriteCursor cursor{};
+            bool same_range = false;
+            {
+                std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+                const auto it = tracked_textures_.find(resource_id);
+                if (it == tracked_textures_.end()) {
+                    return false;
+                }
+                same_range = it->second.view_host == host && it->second.view_size == primary_size;
+                if (same_range) {
+                    cursor = it->second.view_cursor;
+                }
+            }
+            std::vector<uint64_t> pages;
+            const bool tracked = os::take_written_view_pages(host, primary_size, &cursor, &pages);
+            bool skip = false;
+            {
+                std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+                const auto it = tracked_textures_.find(resource_id);
+                if (it == tracked_textures_.end()) {
+                    return false;
+                }
+                TrackedTexture& cur = it->second;
+                skip = tracked && same_range && cur.view_checked && pages.empty();
+                if (!skip) {
+                    cur.view_checked = false;  // set again once a full check of this call completes
+                }
+                cur.view_host = host;
+                cur.view_size = primary_size;
+                cur.view_cursor = cursor;  // also after a refusal: its commit position is current, never stale
+            }
+            count_work(tracked ? Work::TextureSyncViewTracked : Work::TextureSyncUntracked);
+            if (skip) {
+                count_work(Work::TextureSyncViewSkips);
+                return false;
+            }
+            view_tracked = tracked;
+        }
+    }
+    auto note_view_checked = [&]() {
+        if (!view_tracked) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        if (auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
+            it->second.view_checked = true;
+        }
+    };
+
     auto note_window_checked = [&]() {
+        note_view_checked();
         if (!needs_window_checked) {
             return;
         }
@@ -1109,6 +1181,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         TrackedTexture& cur = it->second;
         if (cur.ever_uploaded && cur.last_upload_hash == hash) {
+            if (view_tracked) {
+                cur.view_checked = true;
+            }
             if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
                 cur.window_indexed_size == primary_size) {
                 cur.window_checked = true;
@@ -1117,6 +1192,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         cur.last_upload_hash = hash;
         cur.ever_uploaded = true;
+        if (view_tracked) {
+            cur.view_checked = true;
+        }
         if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
             cur.window_indexed_size == primary_size) {
             cur.window_checked = true;

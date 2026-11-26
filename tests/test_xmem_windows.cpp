@@ -493,6 +493,55 @@ void test_native_shared_page_aliases() {
     reset();
 }
 
+// O36 (texture sync): take_written_view_pages is the non-destructive form for callers that only
+// skip work while nothing was written (a known-zero or already-hashed texture). Over view-backed
+// memory it matches take_written_pages (a first take reports everything, then only writes, one
+// reader never hides a write from another); over a range not wholly covered by views it answers
+// false so the caller keeps its full read.
+void test_view_only_write_tracking() {
+    if (!arena().has_shared_zone()) {
+        return;
+    }
+#if defined(_WIN32)
+    reset();
+    xw::set_policy(xw::PlacementPolicy::Arena);
+    void* res = pg6_xbox_XMemVirtualAlloc(nullptr, 4 * k64K, kWindowType, 0x23u, kCpuProtect);
+    CHECK(res != nullptr);
+    size_t count = 1;
+    uint64_t pfn[1] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 1);
+    const uint64_t R = va_of(res);
+    const uint64_t at[] = {R};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(at, 1, pfn) == 1);
+    uint8_t* a = arena().translate(R);
+    std::vector<uint64_t> pages;
+    WriteCursor cur;
+    WriteCursor other;
+    // The first take reports the new mapping (or answers false when the commit log is behind; it
+    // then brings the cursor up to date), then nothing until a write.
+    take_written_view_pages(a, k64K, &cur, &pages);
+    pages.clear();
+    CHECK(take_written_view_pages(a, k64K, &cur, &pages));
+    CHECK(pages.empty() || pages.size() == k64K / kWrittenPageSize);
+    pages.clear();
+    CHECK(take_written_view_pages(a, k64K, &cur, &pages) && pages.empty());
+    a[40] = 0x7;
+    CHECK(take_written_view_pages(a, k64K, &cur, &pages) && pages.size() == k64K / kWrittenPageSize);
+    pages.clear();
+    CHECK(take_written_view_pages(a, k64K, &cur, &pages) && pages.empty());
+    // A second reader at its own position still sees that write (stamps are per cursor).
+    take_written_view_pages(a, k64K, &other, &pages);
+    pages.clear();
+    CHECK(take_written_view_pages(a, k64K, &other, &pages));
+    // A range reaching past the view (an unmapped neighbour slot) is refused, never guessed.
+    pages.clear();
+    CHECK(!take_written_view_pages(a, 2 * k64K, &cur, &pages));
+    CHECK(xmem_virtual_free(res));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(1, pfn) == 1);
+    reset();
+#endif
+}
+
 // R40: shared page views carry no MEM_WRITE_WATCH; take_written_pages tracks them by write
 // protection instead. A page with one address reports its written 4 KiB pages; a second address
 // keeps the contents, both addresses stay one memory, and a write through either is reported to a
@@ -652,6 +701,7 @@ int main() {
     test_native_full_size_sequence();
     test_native_shared_page_aliases();
     test_native_shared_view_write_tracking();
+    test_view_only_write_tracking();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xmem_windows: %d failure(s)\n", g_failures);
         return 1;
