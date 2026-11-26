@@ -43,6 +43,8 @@ const GPU_OPCODE_PRESENT = 7;
 const INPUT_STATE_BYTES = 40;
 const INPUT_STATE_WORDS = 10;
 const DEFAULT_INPUT_BRIDGE_POLL_MS = 16;
+const DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_TIMEOUT_MS = 250;
+const DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_FALLBACK_POLL_MS = 50;
 const INPUT_SNAPSHOT_MAX_RETRIES = 64;
 // Playgta6AudioRing (runtime/os/audio_downmix.h): 40 bytes on Wasm64 (8-byte uintptr_t + 4-byte
 // padding at +20), 24 bytes on Wasm32 (4-byte uintptr_t).
@@ -5246,9 +5248,10 @@ function makeInactiveInputBridgeHandle() {
  *   build does not export `_playgta6_get_input_state_ptr` (or returns 0 / 0n).
  * - Re-acquires `Int32Array(wasmMemory.buffer, ptr, 10)` automatically whenever linear memory
  *   grows or its backing buffer is replaced.
- * - Uses `Atomics.waitAsync` for instant wakeups when available, paired with a periodic fallback
- *   interval (`pollIntervalMs`, default 16 ms) so writers that omit `Atomics.notify` (such as
- *   `web/input/input_bridge.js`) never miss an edge.
+ * - Uses `Atomics.waitAsync` (default 250 ms timeout, woken instantaneously via `Atomics.notify`)
+ *   when available, paired with a lightweight periodic fallback interval (50 ms default when
+ *   `waitAsync` is active, or `pollIntervalMs` when explicitly specified / `waitAsync` unavailable)
+ *   so writers that omit `Atomics.notify` never miss an edge without burning loader CPU when idle.
  */
 function startInputSabBridge(options = {}) {
   const srcBuf = options && options.inputSab ? options.inputSab : null;
@@ -5282,12 +5285,19 @@ function startInputSabBridge(options = {}) {
     return makeInactiveInputBridgeHandle();
   }
 
-  const pollIntervalMs =
+  const hasExplicitPollInterval =
     typeof options.pollIntervalMs === 'number' &&
     Number.isFinite(options.pollIntervalMs) &&
-    options.pollIntervalMs > 0
-      ? Math.max(1, Math.floor(options.pollIntervalMs))
-      : DEFAULT_INPUT_BRIDGE_POLL_MS;
+    options.pollIntervalMs > 0;
+  const pollIntervalMs = hasExplicitPollInterval
+    ? Math.max(1, Math.floor(options.pollIntervalMs))
+    : DEFAULT_INPUT_BRIDGE_POLL_MS;
+  const waitAsyncTimeoutMs =
+    typeof options.waitAsyncTimeoutMs === 'number' &&
+    Number.isFinite(options.waitAsyncTimeoutMs) &&
+    options.waitAsyncTimeoutMs > 0
+      ? Math.max(1, Math.floor(options.waitAsyncTimeoutMs))
+      : Math.max(pollIntervalMs, DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_TIMEOUT_MS);
 
   const atomics =
     options.atomicsObj !== undefined
@@ -5503,6 +5513,26 @@ function startInputSabBridge(options = {}) {
     return true;
   }
 
+  function onWaitAsyncFulfilled(outcome) {
+    waitAsyncInFlight = false;
+    if (stopped) {
+      return;
+    }
+    if (outcome === 'ok') {
+      waitAsyncWakeups += 1;
+    }
+    const curSeq = (useSrcAtomics ? atomics.load(srcI32, 0) : srcI32[0]) >>> 0;
+    if (!hasSynced || curSeq !== lastSrcSeq || (curSeq & 1) !== 0) {
+      syncNow(false);
+    }
+    armWaitAsync(0);
+  }
+
+  function onWaitAsyncRejected() {
+    waitAsyncInFlight = false;
+    waitAsyncEnabled = false;
+  }
+
   function armWaitAsync(syncDepth = 0) {
     if (stopped || !waitAsyncEnabled || waitAsyncInFlight) {
       return;
@@ -5510,7 +5540,7 @@ function startInputSabBridge(options = {}) {
     const expectedSeq = (hasSynced ? lastSrcSeq : 0) | 0;
     let res;
     try {
-      res = atomics.waitAsync(srcI32, 0, expectedSeq, pollIntervalMs);
+      res = atomics.waitAsync(srcI32, 0, expectedSeq, waitAsyncTimeoutMs);
     } catch {
       waitAsyncEnabled = false;
       return;
@@ -5529,23 +5559,7 @@ function startInputSabBridge(options = {}) {
     }
     if (res.value && typeof res.value.then === 'function') {
       waitAsyncInFlight = true;
-      res.value.then(
-        (outcome) => {
-          waitAsyncInFlight = false;
-          if (stopped) {
-            return;
-          }
-          if (outcome === 'ok') {
-            waitAsyncWakeups += 1;
-          }
-          syncNow(false);
-          armWaitAsync(0);
-        },
-        () => {
-          waitAsyncInFlight = false;
-          waitAsyncEnabled = false;
-        },
-      );
+      res.value.then(onWaitAsyncFulfilled, onWaitAsyncRejected);
     }
   }
 
@@ -5553,17 +5567,29 @@ function startInputSabBridge(options = {}) {
   syncNow(false);
   armWaitAsync(0);
 
+  const fallbackIntervalMs =
+    !hasExplicitPollInterval && waitAsyncEnabled
+      ? Math.max(pollIntervalMs, DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_FALLBACK_POLL_MS)
+      : pollIntervalMs;
+
   if (options.disableFallbackInterval !== true && typeof setIntervalFn === 'function') {
     intervalId = setIntervalFn(() => {
       if (stopped) {
         return;
       }
       pollTicks += 1;
+      const curSeq = (useSrcAtomics ? atomics.load(srcI32, 0) : srcI32[0]) >>> 0;
+      if (hasSynced && curSeq === lastSrcSeq && (curSeq & 1) === 0) {
+        if (!waitAsyncInFlight && waitAsyncEnabled) {
+          armWaitAsync(0);
+        }
+        return;
+      }
       syncNow(false);
       if (!waitAsyncInFlight && waitAsyncEnabled) {
         armWaitAsync(0);
       }
-    }, pollIntervalMs);
+    }, fallbackIntervalMs);
   }
 
   function stop() {
@@ -8609,6 +8635,8 @@ const exportedApi = {
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
+  DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_TIMEOUT_MS,
+  DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_FALLBACK_POLL_MS,
   AUDIO_RING_STRUCT_BYTES_WASM64,
   AUDIO_RING_STRUCT_BYTES_WASM32,
   AUDIO_RING_CHANNELS,

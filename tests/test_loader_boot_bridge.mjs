@@ -21,6 +21,8 @@ const {
   INPUT_STATE_BYTES,
   INPUT_STATE_WORDS,
   DEFAULT_INPUT_BRIDGE_POLL_MS,
+  DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_TIMEOUT_MS,
+  DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_FALLBACK_POLL_MS,
   DEFAULT_MEMFS_PIPELINE_DUMP_DIR,
   DEFAULT_MEMFS_PIPELINE_DUMP_ENDPOINT,
   DEFAULT_MEMFS_PIPELINE_DUMP_INTERVAL_MS,
@@ -2740,6 +2742,129 @@ test('O36/#796 buildRuntimeModuleConfig wires onRuntimeInitialized and onExit to
   assert.equal(userExitCalled, 1);
   assert.equal(cfg.getInputBridge(), null);
   assert.equal(bridge.getStats().stopped, true);
+});
+
+test('W365 (#663) startInputSabBridge uses 250ms waitAsync timeout, 50ms fallback cadence when waitAsync is active, and 1-load idle fast-exit', async () => {
+  assert.equal(DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_TIMEOUT_MS, 250);
+  assert.equal(DEFAULT_INPUT_BRIDGE_WAIT_ASYNC_FALLBACK_POLL_MS, 50);
+
+  const sab = new SharedArrayBuffer(INPUT_STATE_BYTES);
+  const wasmMemory = new WebAssembly.Memory({ initial: 1, maximum: 2 });
+
+  const waitAsyncTimeouts = [];
+  let resolveWait = null;
+  let srcLoadCount = 0;
+  let getMemoryCount = 0;
+  const scheduledIntervals = [];
+
+  const mockAtomics = {
+    load: (arr, idx) => {
+      if (arr.buffer === sab && idx === 0) {
+        srcLoadCount += 1;
+      }
+      return Atomics.load(arr, idx);
+    },
+    store: (arr, idx, val) => Atomics.store(arr, idx, val),
+    add: (arr, idx, val) => Atomics.add(arr, idx, val),
+    exchange: (arr, idx, val) => Atomics.exchange(arr, idx, val),
+    notify: (arr, idx, count) => Atomics.notify(arr, idx, count),
+    waitAsync: (_arr, _idx, _expected, timeoutMs) => {
+      waitAsyncTimeouts.push(timeoutMs);
+      const promise = new Promise((resolve) => {
+        resolveWait = resolve;
+      });
+      return { async: true, value: promise };
+    },
+  };
+
+  // 1. Default options with waitAsync enabled: waitAsync timeout >= 250ms, fallback setInterval = 50ms.
+  const bridge = startInputSabBridge({
+    inputSab: sab,
+    module: { _playgta6_get_input_state_ptr: () => 128n },
+    getMemory: () => {
+      getMemoryCount += 1;
+      return wasmMemory;
+    },
+    atomicsObj: mockAtomics,
+    setIntervalFn: (fn, ms) => {
+      const entry = { fn, ms };
+      scheduledIntervals.push(entry);
+      return entry;
+    },
+    clearIntervalFn: () => {},
+  });
+
+  assert.equal(bridge.active, true);
+  assert.deepEqual(waitAsyncTimeouts, [250], 'default waitAsync timeout must be 250ms');
+  assert.equal(scheduledIntervals.length, 1);
+  assert.equal(scheduledIntervals[0].ms, 50, 'default fallback cadence must relax to 50ms when waitAsync is active');
+
+  // Idle fallback ticks must fast-exit after 1 single Atomics.load(srcI32, 0) with zero getMemory or waitAsync re-arm.
+  srcLoadCount = 0;
+  getMemoryCount = 0;
+  scheduledIntervals[0].fn();
+  scheduledIntervals[0].fn();
+  scheduledIntervals[0].fn();
+  assert.equal(srcLoadCount, 3, 'each idle tick must execute exactly 1 atomic seq load');
+  assert.equal(getMemoryCount, 0, 'idle ticks must not call getMemory()');
+  assert.equal(waitAsyncTimeouts.length, 1, 'idle ticks must not re-arm waitAsync while in flight');
+  assert.equal(bridge.getStats().pollTicks, 3);
+
+  // Writer omitting Atomics.notify is still synced on the next fallback tick.
+  writeTestInputSnapshot(sab, { buttons: 1 << 9, lx: 0.75 });
+  scheduledIntervals[0].fn();
+  const dstI32 = new Int32Array(wasmMemory.buffer, 128, INPUT_STATE_WORDS);
+  assert.equal(dstI32[1] >>> 0, 1 << 9);
+  assert.equal(bridge.getStats().syncCount, 1);
+
+  // When waitAsync resolves with 'ok' after a new write, it wakes and re-arms with 250ms timeout.
+  writeTestInputSnapshot(sab, { buttons: 1 << 10, rt: 0.5 });
+  resolveWait('ok');
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(dstI32[1] >>> 0, 1 << 10);
+  assert.equal(bridge.getStats().waitAsyncWakeups, 1);
+  assert.deepEqual(waitAsyncTimeouts, [250, 250]);
+
+  bridge.stop();
+
+  // 2. Explicit pollIntervalMs and waitAsyncTimeoutMs are honored verbatim, and disabled waitAsync keeps 16ms default.
+  const explicitIntervals = [];
+  const explicitWaitTimeouts = [];
+  const bExplicit = startInputSabBridge({
+    inputSab: sab,
+    module: { wasmMemory, _playgta6_get_input_state_ptr: () => 128n },
+    pollIntervalMs: 16,
+    waitAsyncTimeoutMs: 400,
+    atomicsObj: {
+      ...mockAtomics,
+      waitAsync: (_arr, _idx, _expected, timeoutMs) => {
+        explicitWaitTimeouts.push(timeoutMs);
+        return { async: true, value: new Promise(() => {}) };
+      },
+    },
+    setIntervalFn: (fn, ms) => {
+      explicitIntervals.push(ms);
+      return 1;
+    },
+    clearIntervalFn: () => {},
+  });
+  assert.deepEqual(explicitIntervals, [16], 'explicit pollIntervalMs must be preserved');
+  assert.deepEqual(explicitWaitTimeouts, [400], 'explicit waitAsyncTimeoutMs must be preserved');
+  bExplicit.stop();
+
+  const noWaitIntervals = [];
+  const bNoWait = startInputSabBridge({
+    inputSab: sab,
+    module: { wasmMemory, _playgta6_get_input_state_ptr: () => 128n },
+    useWaitAsync: false,
+    setIntervalFn: (fn, ms) => {
+      noWaitIntervals.push(ms);
+      return 2;
+    },
+    clearIntervalFn: () => {},
+  });
+  assert.deepEqual(noWaitIntervals, [16], 'fallback cadence must stay 16ms when waitAsync is disabled');
+  bNoWait.stop();
 });
 
 function createFakeMemfs({ withMkdirTree = true } = {}) {
