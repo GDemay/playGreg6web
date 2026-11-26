@@ -2905,3 +2905,363 @@ test('W309 preserves W258 buffer release across all concurrent preload stages an
   assert.equal(afterReset.preloadStats.taskCount, 0);
   assert.deepEqual(afterReset.preloadTaskTimingsMs, {});
 });
+
+// ---------------------------------------------------------------------------------------------
+// Orch-23: Skip full shader-pack preload when streamShaders=true or pack >= 128 MiB threshold
+// ---------------------------------------------------------------------------------------------
+
+const pgimPreloaderMod = require('../web/runtime/pgim_preloader.js');
+const {
+  PgimPreloader,
+  PGIM_MAGIC_BYTES,
+  PGIM_VERSION,
+  PGIM_HEADER_BYTES,
+  PGIM_SECTION_ENTRY_BYTES,
+  PGIM_PAGE_SIZE,
+  PGIM_FLAGS,
+  PGIM_SECTION_FLAGS,
+  PGIM_PROT,
+  pgimFnv1a64,
+  DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES: PRELOADER_AUTO_STREAM_THRESHOLD,
+} = pgimPreloaderMod;
+
+function buildSyntheticPgimBytes() {
+  const sectionData = new Uint8Array(0x400);
+  sectionData.fill(0x5a);
+  const tablesEnd = PGIM_HEADER_BYTES + PGIM_SECTION_ENTRY_BYTES;
+  const sectionOff = Math.ceil(tablesEnd / PGIM_PAGE_SIZE) * PGIM_PAGE_SIZE;
+  const fileSize = sectionOff + sectionData.byteLength;
+  const out = new Uint8Array(fileSize);
+  const view = new DataView(out.buffer);
+  out.set(PGIM_MAGIC_BYTES, 0);
+  view.setUint32(4, PGIM_VERSION, true);
+  view.setUint32(8, PGIM_HEADER_BYTES, true);
+  view.setUint32(12, PGIM_SECTION_ENTRY_BYTES, true);
+  view.setUint32(16, PGIM_FLAGS.HEADERS_MAPPED, true);
+  view.setUint32(20, PGIM_PAGE_SIZE, true);
+  view.setBigUint64(24, 0x140000000n, true);
+  view.setUint32(32, 0x2000, true); // size_of_image
+  view.setUint32(36, 0x1000, true); // section_alignment
+  view.setUint32(40, 0x1000, true); // entry_point_rva
+  view.setUint32(44, 1, true); // section_count
+  view.setUint32(48, 0, true); // dir64_count
+  view.setUint32(52, 0, true); // highlow_count
+  view.setBigUint64(56, BigInt(fileSize), true);
+
+  const at = PGIM_HEADER_BYTES;
+  out.set(new TextEncoder().encode('<headers>'), at);
+  view.setUint32(at + 16, 0, true); // rva
+  view.setUint32(at + 20, sectionData.byteLength, true); // virtual_size
+  view.setUint32(at + 24, PGIM_PROT.READ, true); // protection
+  view.setUint32(at + 28, PGIM_SECTION_FLAGS.HEADERS, true); // flags
+  view.setBigUint64(at + 32, BigInt(sectionOff), true); // file_offset
+  view.setBigUint64(at + 40, BigInt(sectionData.byteLength), true); // file_size
+  view.setBigUint64(at + 48, pgimFnv1a64(sectionData), true); // checksum
+  view.setUint32(at + 56, 0, true);
+  view.setUint32(at + 60, 0, true);
+  out.set(sectionData, sectionOff);
+  return out;
+}
+
+function buildSyntheticWgpkBytes() {
+  const wgsl = new TextEncoder().encode('@vertex fn main() -> @builtin(position) vec4f { return vec4f(0.0); }');
+  const headerAndTable = 16 + 20;
+  const buf = new ArrayBuffer(headerAndTable + wgsl.byteLength);
+  const bytes = new Uint8Array(buf);
+  const view = new DataView(buf);
+  bytes.set([0x57, 0x47, 0x50, 0x4b], 0); // "WGPK"
+  view.setUint32(4, 1, true); // version 1
+  view.setUint32(8, 1, true); // entry_count
+  view.setUint32(12, 0, true); // reserved
+  view.setBigUint64(16, 0x1234n, true); // hash
+  view.setUint32(24, 0, true); // stage
+  view.setUint32(28, headerAndTable, true); // offset
+  view.setUint32(32, wgsl.byteLength, true); // length
+  bytes.set(wgsl, headerAndTable);
+  return bytes;
+}
+
+test('Orch-23 streamShaders=true omits shaderPackUrl from preloadBootBundle and granular preloadShaderPack while keeping sidecar', async () => {
+  const headOrGetShaderCalls = [];
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    if (String(url).includes('splash.wgsl.pack')) {
+      headOrGetShaderCalls.push({ url, method });
+      throw new Error(`Unexpected ${method} on ${url} when streamShaders=true`);
+    }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return readyStatus({
+          shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+          reflectionManifestUrl: '/data/shaders/reflection-manifest.json',
+        });
+      },
+    };
+  };
+
+  // 1. preloadBootBundle path
+  const preloader = createPreloader();
+  const sidecarUrls = [];
+  const overlay = createOverlay();
+  const launches = [];
+  const orchestrator = new BootOrchestrator({
+    fetchImpl,
+    preloader,
+    splashOverlay: overlay,
+    streamShaders: true,
+    releasePreloadBuffers: false,
+    preloadReflectionSidecar: async (url) => {
+      sidecarUrls.push(url);
+      return { schema_version: 1, url, bytesLoaded: 128 };
+    },
+    onLaunchRuntime: async (payload) => {
+      launches.push(payload);
+    },
+  });
+
+  const res = await orchestrator.start();
+  assert.equal(res.ok, true);
+  assert.equal(headOrGetShaderCalls.length, 0, 'streamShaders=true must not fetch or HEAD splash.wgsl.pack');
+  assert.equal(preloader.calls.length, 1);
+  assert.equal(preloader.calls[0].shaderPackUrl, null, 'shaderPackUrl must be omitted from preloadBootBundle');
+  assert.equal(preloader.calls[0].pgimUrl, '/data/boot/GTA6.pgim');
+  assert.equal(preloader.calls[0].reflectionUrl, '/data/shaders/reflection-manifest.json');
+  assert.deepEqual(sidecarUrls, ['/data/shaders/splash.wgsl.pack.reflect.json']);
+  assert.equal(launches[0].assets.shaderPackUrl, '/data/shaders/splash.wgsl.pack');
+  assert.equal(launches[0].bundle.shaderPackSkipped, true);
+  assert.equal(launches[0].bundle.shaderPackSkipReason, 'stream-shaders');
+  assert.ok(
+    overlay.progresses.some((e) => e.phase === 'skipped' && e.asset === 'shaderPack' && e.reason === 'stream-shaders')
+  );
+
+  // 2. Granular preloadShaderPack path
+  let granularShaderPackCalls = 0;
+  const granularOrchestrator = new BootOrchestrator({
+    fetchImpl,
+    streamShaders: true,
+    releasePreloadBuffers: false,
+    preloader: {
+      preloadPgim: async () => ({ header: { magic: 'PGIM' }, bytesLoaded: 64 }),
+      preloadShaderPack: async () => {
+        granularShaderPackCalls += 1;
+        return new Uint8Array([1, 2, 3]);
+      },
+    },
+    onLaunchRuntime: async () => {},
+  });
+  const granularRes = await granularOrchestrator.start();
+  assert.equal(granularRes.ok, true);
+  assert.equal(granularShaderPackCalls, 0, 'streamShaders=true must skip granular preloadShaderPack');
+  assert.equal(granularRes.bundle.shaderPackBytes, null);
+  assert.equal(granularRes.bundle.shaderPackSkipped, true);
+});
+
+test('Orch-23 default plain URL probes HEAD Content-Length and skips 7.51 GB shader pack with 0 GETs', async () => {
+  const SEVEN_POINT_FIVE_GB = 8_063_800_000;
+  const pgimBytes = buildSyntheticPgimBytes();
+  const reflectionJson = new TextEncoder().encode(JSON.stringify({ schema_version: 1, shaders: [] }));
+  const shaderRequests = [];
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    const u = String(url);
+    if (u === '/api/status') {
+      return new Response(
+        JSON.stringify(
+          readyStatus({
+            pgimUrl: '/data/boot/GTA6.pgim',
+            shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+            reflectionManifestUrl: '/data/shaders/reflection-manifest.json',
+          })
+        ),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+    if (u === '/data/shaders/splash.wgsl.pack') {
+      shaderRequests.push(method);
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: {
+            'content-length': String(SEVEN_POINT_FIVE_GB),
+            'accept-ranges': 'bytes',
+          },
+        });
+      }
+      throw new Error(`BUG: Attempted ${method} download of 7.51 GB shader pack!`);
+    }
+    if (u === '/data/boot/GTA6.pgim') {
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: { 'content-length': String(pgimBytes.byteLength), 'accept-ranges': 'bytes' },
+        });
+      }
+      return new Response(pgimBytes, {
+        status: 200,
+        headers: { 'content-length': String(pgimBytes.byteLength) },
+      });
+    }
+    if (u === '/data/shaders/reflection-manifest.json') {
+      return new Response(reflectionJson, {
+        status: 200,
+        headers: { 'content-length': String(reflectionJson.byteLength) },
+      });
+    }
+    return new Response(null, { status: 404 });
+  };
+
+  assert.equal(orchestratorMod.DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES, 128 * 1024 * 1024);
+  assert.equal(PRELOADER_AUTO_STREAM_THRESHOLD, 128 * 1024 * 1024);
+
+  const preloader = new PgimPreloader({ fetchImpl, opfsCache: false });
+  const launches = [];
+  const orchestrator = new BootOrchestrator({
+    fetchImpl,
+    preloader,
+    releasePreloadBuffers: false,
+    onLaunchRuntime: async (payload) => {
+      launches.push(payload);
+    },
+  });
+
+  const res = await orchestrator.start();
+  assert.equal(res.ok, true);
+  assert.deepEqual(shaderRequests, ['HEAD'], 'must only probe HEAD and issue 0 GET requests for 7.51 GB pack');
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].assets.shaderPackUrl, '/data/shaders/splash.wgsl.pack');
+  assert.equal(launches[0].bundle.shaderPackBytes, null);
+  assert.equal(launches[0].bundle.shaderPackSkipped, true);
+  assert.equal(launches[0].bundle.shaderPackSkipReason, 'exceeds-preload-threshold');
+  assert.equal(launches[0].bundle.shaderPackStreamedBytes, SEVEN_POINT_FIVE_GB);
+  assert.equal(launches[0].bundle.pgimHeader.magic, 'PGIM');
+  assert.deepEqual(launches[0].bundle.reflectionManifest, { schema_version: 1, shaders: [] });
+});
+
+test('Orch-23 small (<128 MiB) shader pack still preloads normally under default threshold', async () => {
+  const pgimBytes = buildSyntheticPgimBytes();
+  const smallPackBytes = buildSyntheticWgpkBytes();
+  const shaderRequests = [];
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    const u = String(url);
+    if (u === '/api/status') {
+      return new Response(
+        JSON.stringify(
+          readyStatus({
+            pgimUrl: '/data/boot/GTA6.pgim',
+            shaderPackUrl: '/data/shaders/small.wgsl.pack',
+            reflectionManifestUrl: null,
+          })
+        ),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    }
+    if (u === '/data/shaders/small.wgsl.pack') {
+      shaderRequests.push(method);
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: { 'content-length': String(smallPackBytes.byteLength), 'accept-ranges': 'bytes' },
+        });
+      }
+      return new Response(smallPackBytes, {
+        status: 200,
+        headers: { 'content-length': String(smallPackBytes.byteLength) },
+      });
+    }
+    if (u === '/data/boot/GTA6.pgim') {
+      if (method === 'HEAD') {
+        return new Response(null, {
+          status: 200,
+          headers: { 'content-length': String(pgimBytes.byteLength) },
+        });
+      }
+      return new Response(pgimBytes, {
+        status: 200,
+        headers: { 'content-length': String(pgimBytes.byteLength) },
+      });
+    }
+    return new Response(null, { status: 404 });
+  };
+
+  const preloader = new PgimPreloader({ fetchImpl, opfsCache: false });
+  let launchShaderBytesLen = 0;
+  const orchestrator = new BootOrchestrator({
+    fetchImpl,
+    preloader,
+    onLaunchRuntime: async (payload) => {
+      launchShaderBytesLen = payload.bundle.shaderPackBytes ? payload.bundle.shaderPackBytes.byteLength : 0;
+    },
+  });
+
+  const res = await orchestrator.start();
+  assert.equal(res.ok, true);
+  assert.ok(shaderRequests.includes('GET'), 'small <128 MiB shader pack must still preload via GET');
+  assert.equal(launchShaderBytesLen, smallPackBytes.byteLength);
+});
+
+test('Orch-23 PgimPreloader skips 7.51 GB shader pack on GET Content-Length when HEAD returns 405 without reading body', async () => {
+  const SEVEN_POINT_FIVE_GB = 8_063_800_000;
+  const pgimBytes = buildSyntheticPgimBytes();
+  let bodyReadAttempted = false;
+  let bodyCancelled = false;
+
+  const fetchImpl = async (url, init = {}) => {
+    const method = (init.method || 'GET').toUpperCase();
+    const u = String(url);
+    if (u === '/data/shaders/splash.wgsl.pack') {
+      if (method === 'HEAD') {
+        return new Response(null, { status: 405 });
+      }
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ 'content-length': String(SEVEN_POINT_FIVE_GB) }),
+        body: {
+          getReader() {
+            bodyReadAttempted = true;
+            throw new Error('Should never read body of 7.51 GB response');
+          },
+          async cancel() {
+            bodyCancelled = true;
+          },
+        },
+        async arrayBuffer() {
+          bodyReadAttempted = true;
+          throw new Error('Should never buffer 7.51 GB response');
+        },
+      };
+    }
+    if (u === '/data/boot/GTA6.pgim') {
+      if (method === 'HEAD') {
+        return new Response(null, { status: 200, headers: { 'content-length': String(pgimBytes.byteLength) } });
+      }
+      return new Response(pgimBytes, { status: 200, headers: { 'content-length': String(pgimBytes.byteLength) } });
+    }
+    return new Response(null, { status: 404 });
+  };
+
+  const preloader = new PgimPreloader({ fetchImpl, opfsCache: false });
+  const bundle = await preloader.preloadBootBundle({
+    pgimUrl: '/data/boot/GTA6.pgim',
+    shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+  });
+
+  assert.equal(bodyReadAttempted, false, 'must abort before reading/allocating 7.51 GB GET body');
+  assert.equal(bodyCancelled, true, 'must cancel oversized GET response body stream');
+  assert.equal(bundle.shaderPackBytes, null);
+  assert.equal(bundle.shaderPackSkipped, true);
+  assert.equal(bundle.shaderPackSkipReason, 'exceeds-preload-threshold');
+  assert.equal(bundle.shaderPackStreamedBytes, SEVEN_POINT_FIVE_GB);
+
+  const direct = await preloader.preloadShaderPack('/data/shaders/splash.wgsl.pack');
+  assert.equal(direct.bytes, null);
+  assert.equal(direct.buffer, null);
+  assert.equal(direct.skipped, true);
+  assert.equal(direct.bytesLoaded, 0);
+  assert.equal(direct.totalBytes, SEVEN_POINT_FIVE_GB);
+});

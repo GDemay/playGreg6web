@@ -13,6 +13,10 @@
   const DEFAULT_PARALLEL_PRELOAD = true;
   const DEFAULT_PRELOAD_CONCURRENCY = 8;
   const DEFAULT_RELEASE_PRELOAD_BUFFERS = true;
+  /** Explicit `?streamShaders=1` default threshold (matches web/workers/wgpu_worker.js). */
+  const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES = 64 * 1024 * 1024;
+  /** Default auto-stream threshold for plain URLs without `?streamShaders` (matches web/workers/wgpu_worker.js). */
+  const DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES = 128 * 1024 * 1024;
   const MAX_DIAGNOSTIC_TEXT_LENGTH = 512;
   const FORBIDDEN_TASK_NAMES = Object.freeze(new Set(['__proto__', 'constructor', 'prototype']));
 
@@ -118,6 +122,114 @@
       throw new TypeError('releasePreloadBuffers must be a boolean');
     }
     return value;
+  }
+
+  function normalizeOptionalStreamShaders(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'boolean') {
+      throw new TypeError('streamShaders must be a boolean or null');
+    }
+    return value;
+  }
+
+  function normalizeOptionalStreamThresholdBytes(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'number') {
+      throw new TypeError('streamThresholdBytes must be a non-negative safe integer or null');
+    }
+    if (!Number.isFinite(value) || !Number.isSafeInteger(value) || value < 0) {
+      throw new RangeError('streamThresholdBytes must be a non-negative safe integer');
+    }
+    return value;
+  }
+
+  function resolveShaderPackStreamPolicy({ streamShaders, streamThresholdBytes } = {}) {
+    const validThreshold =
+      typeof streamThresholdBytes === 'number' &&
+      Number.isSafeInteger(streamThresholdBytes) &&
+      streamThresholdBytes >= 0
+        ? streamThresholdBytes
+        : undefined;
+    if (streamShaders === true) {
+      return {
+        streamShaders: true,
+        skipFullPreload: true,
+        maxPreloadBytes:
+          validThreshold !== undefined && validThreshold > 0
+            ? validThreshold
+            : DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+      };
+    }
+    if (streamShaders === false) {
+      return {
+        streamShaders: false,
+        skipFullPreload: false,
+        maxPreloadBytes: 0,
+      };
+    }
+    if (validThreshold !== undefined) {
+      return {
+        streamShaders: undefined,
+        skipFullPreload: false,
+        maxPreloadBytes: validThreshold,
+      };
+    }
+    return {
+      streamShaders: undefined,
+      skipFullPreload: false,
+      maxPreloadBytes: DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
+    };
+  }
+
+  function readResponseHeader(response, name) {
+    if (!response || !response.headers) return null;
+    if (typeof response.headers.get === 'function') {
+      const val = response.headers.get(name);
+      return val !== null && val !== undefined ? String(val) : null;
+    }
+    if (typeof response.headers === 'object') {
+      const lower = name.toLowerCase();
+      for (const [k, v] of Object.entries(response.headers)) {
+        if (String(k).toLowerCase() === lower && v !== null && v !== undefined) {
+          return String(v);
+        }
+      }
+    }
+    return null;
+  }
+
+  function parseResponseContentLength(response) {
+    const encoding = readResponseHeader(response, 'content-encoding');
+    if (encoding && encoding.trim().toLowerCase() !== 'identity') {
+      return null;
+    }
+    const raw = readResponseHeader(response, 'content-length');
+    if (raw === null) return null;
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const n = Number(trimmed);
+    return Number.isSafeInteger(n) && n >= 0 ? n : null;
+  }
+
+  function extractStatusShaderPackSizeBytes(status) {
+    if (!status || typeof status !== 'object') return null;
+    const candidates = [
+      status.shaderPackSizeBytes,
+      status.shaderPackBytes,
+      status.shaderPackSize,
+      status.splashShaderPackBytes,
+      status.splashShaderPackSize,
+      status.wgslPack && typeof status.wgslPack === 'object' ? status.wgslPack.size ?? status.wgslPack.bytes : null,
+      status.splashShaderPack && typeof status.splashShaderPack === 'object'
+        ? status.splashShaderPack.size ?? status.splashShaderPack.bytes
+        : null,
+    ];
+    for (const candidate of candidates) {
+      if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate > 0) {
+        return candidate;
+      }
+    }
+    return null;
   }
 
   const WASM_FIELD_PATH_RE = /(?:wasm|guest_?part|guestmodule|sidemodule|wirebytes)/i;
@@ -1478,6 +1590,9 @@
         preloadShaderPackHeader = null,
         preloadReflectionSidecar = null,
         preloadTasks = null,
+        streamShaders = undefined,
+        streamThresholdBytes = undefined,
+        getStreamConfig = null,
       } = options;
 
       if (fetchImpl !== null && fetchImpl !== undefined && typeof fetchImpl !== 'function') {
@@ -1496,6 +1611,9 @@
       const resolvedPreloadShaderPackHeader = optionalFn(preloadShaderPackHeader, 'preloadShaderPackHeader');
       const resolvedPreloadReflectionSidecar = optionalFn(preloadReflectionSidecar, 'preloadReflectionSidecar');
       const resolvedPreloadTasks = normalizePreloadTasks(preloadTasks);
+      const resolvedStreamShaders = normalizeOptionalStreamShaders(streamShaders);
+      const resolvedStreamThresholdBytes = normalizeOptionalStreamThresholdBytes(streamThresholdBytes);
+      const resolvedGetStreamConfig = optionalFn(getStreamConfig, 'getStreamConfig');
 
       this._fetchImpl = fetchImpl || null;
       this._statusUrl = statusUrl;
@@ -1517,6 +1635,11 @@
       this._preloadShaderPackHeader = resolvedPreloadShaderPackHeader;
       this._preloadReflectionSidecar = resolvedPreloadReflectionSidecar;
       this._preloadTasks = resolvedPreloadTasks;
+      this._streamShaders = resolvedStreamShaders;
+      this._streamThresholdBytes = resolvedStreamThresholdBytes;
+      this._getStreamConfig = resolvedGetStreamConfig;
+      this._activeStartStreamConfig = null;
+      this._statusResponseHasHeaders = false;
       this._lastClockMs = 0;
 
       this._phase = BOOT_PHASE.IDLE;
@@ -2105,6 +2228,9 @@
         loadedBytes: Number.isFinite(progress.loadedBytes) ? progress.loadedBytes : 0,
         totalBytes: Number.isFinite(progress.totalBytes) ? progress.totalBytes : null,
         pct: Number.isFinite(progress.pct) ? progress.pct : 0,
+        ...(typeof progress.reason === 'string' && progress.reason.length > 0
+          ? { reason: progress.reason }
+          : {}),
       };
       callQuiet(this._bootTracer, 'recordProgress', this._progress);
       callQuiet(this._bootTracer, 'updateProgress', this._progress);
@@ -2148,6 +2274,7 @@
         err.status = response.status ?? null;
         throw err;
       }
+      this._statusResponseHasHeaders = Boolean(response.headers && typeof response.headers.get === 'function');
       const payload = await response.json();
       throwIfAborted(signal);
       if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -2211,6 +2338,74 @@
       return null;
     }
 
+    _resolveEffectiveShaderStreamPolicy() {
+      let dynamicConfig = null;
+      if (typeof this._getStreamConfig === 'function') {
+        try {
+          const raw = this._getStreamConfig();
+          if (raw && typeof raw === 'object') {
+            dynamicConfig = raw;
+          }
+        } catch {
+          dynamicConfig = null;
+        }
+      }
+      const startConfig = this._activeStartStreamConfig;
+      const effectiveStreamShaders =
+        startConfig && startConfig.streamShaders !== undefined
+          ? startConfig.streamShaders
+          : dynamicConfig && dynamicConfig.streamShaders !== undefined
+            ? normalizeOptionalStreamShaders(dynamicConfig.streamShaders)
+            : this._streamShaders;
+      const effectiveStreamThresholdBytes =
+        startConfig && startConfig.streamThresholdBytes !== undefined
+          ? startConfig.streamThresholdBytes
+          : dynamicConfig && dynamicConfig.streamThresholdBytes !== undefined
+            ? normalizeOptionalStreamThresholdBytes(dynamicConfig.streamThresholdBytes)
+            : this._streamThresholdBytes;
+      return resolveShaderPackStreamPolicy({
+        streamShaders: effectiveStreamShaders,
+        streamThresholdBytes: effectiveStreamThresholdBytes,
+      });
+    }
+
+    async _probeShaderPackSizeBytes(url, signal) {
+      const fromStatus = extractStatusShaderPackSizeBytes(this._status);
+      if (fromStatus !== null) {
+        return fromStatus;
+      }
+      if (this._preloader && typeof this._preloader.probeShaderPackSize === 'function') {
+        throwIfAborted(signal);
+        try {
+          const size = await this._preloader.probeShaderPackSize(url, { signal });
+          throwIfAborted(signal);
+          return typeof size === 'number' && Number.isSafeInteger(size) && size >= 0 ? size : null;
+        } catch (err) {
+          if ((signal && signal.aborted) || isAbortError(err)) {
+            throw err;
+          }
+          return null;
+        }
+      }
+      if (!this._statusResponseHasHeaders || typeof this._fetchImpl !== 'function') {
+        return null;
+      }
+      throwIfAborted(signal);
+      try {
+        const response = await this._fetchImpl(url, { method: 'HEAD', signal });
+        throwIfAborted(signal);
+        if (!response || !response.ok) {
+          return null;
+        }
+        return parseResponseContentLength(response);
+      } catch (err) {
+        if ((signal && signal.aborted) || isAbortError(err)) {
+          throw err;
+        }
+        return null;
+      }
+    }
+
     async _preloadBundle(assets, signal) {
       const preloader = this._preloader;
       const shaderPackIndexLoader = this._resolveShaderPackHeaderLoader();
@@ -2218,9 +2413,41 @@
       const runtimeWasmLoader = this._resolveRuntimeWasmLoader();
       const opfsProbe = this._resolveOpfsProbe();
 
+      const shaderStreamPolicy = this._resolveEffectiveShaderStreamPolicy();
+      let skipShaderPackFullPreload = false;
+      let shaderPackSkipReason = null;
+      let shaderPackProbedBytes = null;
+
+      if (assets.shaderPackUrl) {
+        if (shaderStreamPolicy.skipFullPreload) {
+          skipShaderPackFullPreload = true;
+          shaderPackSkipReason = 'stream-shaders';
+        } else if (shaderStreamPolicy.maxPreloadBytes > 0) {
+          const probedBytes = await this._probeShaderPackSizeBytes(assets.shaderPackUrl, signal);
+          if (probedBytes !== null && probedBytes >= shaderStreamPolicy.maxPreloadBytes) {
+            skipShaderPackFullPreload = true;
+            shaderPackSkipReason = 'exceeds-preload-threshold';
+            shaderPackProbedBytes = probedBytes;
+          }
+        }
+      }
+
+      if (skipShaderPackFullPreload) {
+        this._forwardProgress({
+          phase: 'skipped',
+          asset: 'shaderPack',
+          reason: shaderPackSkipReason,
+          loadedBytes: 0,
+          totalBytes: shaderPackProbedBytes || 0,
+          pct: 100,
+        });
+      }
+
+      const effectiveShaderPackUrl = skipShaderPackFullPreload ? null : assets.shaderPackUrl;
+
       const needsPreloader = Boolean(
         assets.pgimUrl ||
-        (assets.shaderPackUrl && !this._preloadShaderPackHeader && !this._preloadReflectionSidecar) ||
+        (effectiveShaderPackUrl && !this._preloadShaderPackHeader && !this._preloadReflectionSidecar) ||
         (assets.shaderPackIndexUrl && !this._preloadShaderPackHeader) ||
         (assets.reflectionSidecarUrl && !this._preloadReflectionSidecar)
       );
@@ -2266,13 +2493,19 @@
           run: (taskSignal) => {
             const bundleArgs = {
               pgimUrl: assets.pgimUrl,
-              shaderPackUrl: assets.shaderPackUrl,
+              shaderPackUrl: effectiveShaderPackUrl,
               reflectionUrl: assets.reflectionManifestUrl,
               onProgress,
               signal: taskSignal,
             };
             if (assets.programManifestUrl) {
               bundleArgs.programManifestUrl = assets.programManifestUrl;
+            }
+            if (effectiveShaderPackUrl) {
+              if (typeof shaderStreamPolicy.streamShaders === 'boolean') {
+                bundleArgs.streamShaders = shaderStreamPolicy.streamShaders;
+              }
+              bundleArgs.streamThresholdBytes = shaderStreamPolicy.maxPreloadBytes;
             }
             return preloader.preloadBootBundle(bundleArgs);
           },
@@ -2300,17 +2533,23 @@
             run: (taskSignal) => pgimLoader(assets.pgimUrl, { onProgress: forwardFor('pgim'), signal: taskSignal }),
           });
         }
-        if (assets.shaderPackUrl && preloader && typeof preloader.preloadShaderPack === 'function') {
+        if (effectiveShaderPackUrl && preloader && typeof preloader.preloadShaderPack === 'function') {
           tasks.push({
             name: 'shaderPack',
             asset: 'shaderPack',
             kind: 'shaderPack',
             optional: Boolean(assets.pgimUrl),
-            run: (taskSignal) =>
-              preloader.preloadShaderPack(assets.shaderPackUrl, {
+            run: (taskSignal) => {
+              const shaderOpts = {
                 onProgress: forwardFor('shaderPack'),
                 signal: taskSignal,
-              }),
+                streamThresholdBytes: shaderStreamPolicy.maxPreloadBytes,
+              };
+              if (typeof shaderStreamPolicy.streamShaders === 'boolean') {
+                shaderOpts.streamShaders = shaderStreamPolicy.streamShaders;
+              }
+              return preloader.preloadShaderPack(effectiveShaderPackUrl, shaderOpts);
+            },
           });
         }
         if (assets.reflectionManifestUrl && preloader && typeof preloader.preloadReflectionManifest === 'function') {
@@ -2426,6 +2665,13 @@
         return {
           pgim: null,
           shaderPackBytes: null,
+          ...(skipShaderPackFullPreload
+            ? {
+                shaderPackSkipped: true,
+                shaderPackSkipReason,
+                shaderPackStreamedBytes: shaderPackProbedBytes,
+              }
+            : {}),
           reflectionManifest: null,
           bytesLoaded: 0,
         };
@@ -2471,11 +2717,19 @@
 
       if (useBootBundle) {
         const baseBundle = results.get('bootBundle') || null;
-        if (tasks.length === 1) {
+        if (tasks.length === 1 && !skipShaderPackFullPreload) {
           cleanupExecutionContainers();
           return baseBundle;
         }
         const merged = baseBundle && typeof baseBundle === 'object' ? { ...baseBundle } : { pgim: null };
+        if (skipShaderPackFullPreload) {
+          if (merged.shaderPackBytes === undefined) {
+            merged.shaderPackBytes = null;
+          }
+          merged.shaderPackSkipped = true;
+          merged.shaderPackSkipReason = shaderPackSkipReason;
+          merged.shaderPackStreamedBytes = shaderPackProbedBytes;
+        }
         let extraBytes = 0;
         if (results.has('shaderPackIndex')) {
           merged.shaderPackIndex = results.get('shaderPackIndex');
@@ -2527,12 +2781,28 @@
         }
       }
 
+      const shaderPackSkippedByLoader = Boolean(
+        shaderPackResult && typeof shaderPackResult === 'object' && shaderPackResult.skipped === true
+      );
       const bundle = {
         pgim: pgimResult,
-        shaderPackBytes: shaderPackResult,
+        shaderPackBytes: shaderPackSkippedByLoader ? null : shaderPackResult,
         reflectionManifest: reflectionResult,
         bytesLoaded,
       };
+      if (skipShaderPackFullPreload || shaderPackSkippedByLoader) {
+        bundle.shaderPackSkipped = true;
+        bundle.shaderPackSkipReason =
+          shaderPackSkipReason ||
+          (shaderPackSkippedByLoader && shaderPackResult.skipReason) ||
+          'exceeds-preload-threshold';
+        bundle.shaderPackStreamedBytes =
+          shaderPackProbedBytes !== null
+            ? shaderPackProbedBytes
+            : shaderPackSkippedByLoader && typeof shaderPackResult.totalBytes === 'number'
+              ? shaderPackResult.totalBytes
+              : null;
+      }
       if (results.has('shaderPackIndex')) {
         bundle.shaderPackIndex = shaderPackIndexResult;
       }
@@ -2611,6 +2881,18 @@
       if (outerSignal && typeof outerSignal.aborted !== 'boolean') {
         throw new TypeError('start({ signal }) requires an AbortSignal');
       }
+      const startStreamShaders =
+        options && Object.prototype.hasOwnProperty.call(options, 'streamShaders')
+          ? normalizeOptionalStreamShaders(options.streamShaders)
+          : undefined;
+      const startStreamThresholdBytes =
+        options && Object.prototype.hasOwnProperty.call(options, 'streamThresholdBytes')
+          ? normalizeOptionalStreamThresholdBytes(options.streamThresholdBytes)
+          : undefined;
+      this._activeStartStreamConfig =
+        startStreamShaders !== undefined || startStreamThresholdBytes !== undefined
+          ? { streamShaders: startStreamShaders, streamThresholdBytes: startStreamThresholdBytes }
+          : null;
 
       const token = ++this._sessionToken;
       const linked = linkSignal(outerSignal);
@@ -3031,6 +3313,8 @@
     DEFAULT_PARALLEL_PRELOAD,
     DEFAULT_PRELOAD_CONCURRENCY,
     DEFAULT_RELEASE_PRELOAD_BUFFERS,
+    DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+    DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
     BootOrchestrator,
     discoverBootAssets,
     isRealGuestBoot,
