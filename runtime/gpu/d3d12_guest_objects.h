@@ -623,19 +623,25 @@ struct DeviceOptions {
     std::shared_ptr<const StageReflectionIndex> stage_reflection;
     // Optional detiling hook for tiled console layouts (layout >= 0x101).
     DetileFn detile_texture;
-    // Fence completion latency (G66, #691; G69, #663 / PR #1500): a queue Signal's value is
-    // published (the fence's completed-value word and GetCompletedValue) once `present_epoch` has
-    // advanced by `fence_publish_lag_frames` presents (default 1: on the frame's own PresentX,
-    // after all of its ExecuteCommandLists have already snapshotted upload-ring memory), or after
+    // Fence completion latency (R40, #663 / #1500): by default (`fence_publish_lag = false`) a
+    // queue Signal's value is published at issue, when its work has been handed off. The lag below
+    // guarded #691's grey frames, whose real causes were #1503 / #1507; it held the render worker's
+    // completed-value poll (guest 0x144fb0c27) for up to two presents (~15 presents/s). It also hid
+    // the menu-text corruption of publishing at issue: storage relocation homes handed to another
+    // range while still bound (relocate_storage_buffer, refresh_memory_bind_groups; #663).
+    // With `fence_publish_lag = true` (boot harness: --fence-lag) the old rule applies: a queue
+    // Signal's value is published (the fence's completed-value word and GetCompletedValue) once
+    // `present_epoch` has advanced by `fence_publish_lag_frames` presents (default 1: on the frame's
+    // own PresentX, after all of its ExecuteCommandLists have already snapshotted upload-ring
+    // memory), or after
     // `fence_publish_cap_ms` without a present (default 33 ms, one 30 Hz frame). Holding signals
     // within the submitting frame's epoch prevents mid-frame overwrites between earlier and later
     // ExecuteCommandLists, while publishing on that frame's PresentX avoids the 2-present (~66 ms)
     // 15 FPS stall when the render worker polls the completed-value word. Set
-    // `fence_publish_lag_frames = 2` for the conservative next-frame lag, or `0` /
-    // `fence_publish_lag = false` (boot harness: --no-fence-lag) to publish at issue. Blocking
-    // waits (fence events, a null-event SetEventOnCompletion, queue Wait) for an executed value
-    // complete at once and publish it.
-    bool fence_publish_lag = true;
+    // `fence_publish_lag_frames = 2` for the conservative next-frame lag, or `0` to publish at
+    // issue. Blocking waits (fence events, a null-event SetEventOnCompletion, queue Wait) for an
+    // executed value complete at once and publish it.
+    bool fence_publish_lag = false;
     uint32_t fence_publish_lag_frames = 1;
     uint32_t fence_publish_cap_ms = 33;
     // Lazy GPU objects (G66, #1077): a guest resource's CreateBuffer / CreateTexture2 packet is held
@@ -899,6 +905,8 @@ public:
     bool relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset,
                                  bool require_zero_offset = false);
     size_t relocated_storage_count() const;
+    // #663: true for a buffer that holds storage relocation homes (BridgeOptions::relocation_home).
+    bool storage_relocation_home(uint32_t buffer_id) const;
     // Index / vertex buffer views at address-only GPU VAs (G58: dynamic guest-RAM ring buffers
     // with no ID3D12Resource): the bytes at [va, va + size) (readable guest/alias memory only, at
     // most 16 MiB) get a dedicated Vertex|Index|CopyDst buffer at offset 0, uploaded immediately
@@ -1134,6 +1142,7 @@ private:
         uint64_t slot_capacity = 0;
         uint64_t last_hash = 0;
         uint64_t last_used_seq = 0;
+        uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
         bool ever_uploaded = false;
         bool dedicated = false;
     };

@@ -2552,8 +2552,24 @@ void CommandListBridge::note_memory_group(const StateBridgeDevice::GroupLayoutRe
             return;
         }
     }
-    memory_groups_.push_back(MemoryBindGroup{entries_offset, &group, plan, cached});
+    MemoryBindGroup m{entries_offset, &group, plan, cached};
+    m.binds_home = binds_relocation_home(cached);
+    m.relocation_epoch = cached.relocation_epoch;
+    memory_groups_.push_back(std::move(m));
     ++stats_.memory_bind_groups;
+}
+
+bool CommandListBridge::binds_relocation_home(const d3d::CachedBindGroup& cached) const {
+    const BridgeOptions& options = device_.options();
+    if (!options.relocation_home) {
+        return false;
+    }
+    for (const d3d::BindGroupEntry& e : cached.entries) {
+        if (e.kind == d3d::BindResourceKind::Buffer && e.resource_id != 0 && options.relocation_home(e.resource_id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) {
@@ -2564,9 +2580,14 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
     }
     std::lock_guard lock(cache_mutex_);
     drain_invalidations_locked();
+    const BridgeOptions& options = device_.options();
+    // Read before any slot is decoded: a home handed to another range meanwhile is seen next time.
+    const uint64_t relocation_epoch = options.relocation_epoch ? options.relocation_epoch() : 0;
     uint32_t refreshed = 0;
     for (MemoryBindGroup& m : memory_groups_) {
-        bool force_rebuild = m.invalidated;
+        // #663: a home bound straight from descriptor memory may have been handed to another range
+        // since these entries were resolved (unchanged slot words do not show it): resolve again.
+        bool force_rebuild = m.invalidated || (m.binds_home && m.relocation_epoch != relocation_epoch);
         if (!force_rebuild) {
             TextureInfo tmp{};
             for (const d3d::BindGroupEntry& e : m.built.entries) {
@@ -2584,8 +2605,10 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
                                                  &StateBridgeDevice::gpu_va_trampoline, &device_, &m.built,
                                                  force_rebuild);
         }
+        m.relocation_epoch = relocation_epoch;
         if (changed) {
             m.invalidated = false;
+            m.binds_home = binds_relocation_home(m.built);
             std::vector<GpuBindGroupEntry2> entries;
             gpu_entries(*m.group, m.built, prelude, &entries);
             m.built.view_ids = pending_view_ids_;

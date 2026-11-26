@@ -495,8 +495,9 @@ struct BootConfig {
     // e.g. 1 for 60 Hz cap).
     uint32_t present_max_interval = 0;
     // O36: runtime switches mirroring the playgta6_boot harness flags (A/B runs of a browser
-    // regression without a rebuild). All on by default.
-    bool fence_publish_lag = true;            // d3d12 DeviceOptions::fence_publish_lag (--no-fence-lag)
+    // regression without a rebuild). All on by default, except the fence publish lag (#663): queue
+    // fence values publish at issue unless it is on; its frames / cap apply only then.
+    bool fence_publish_lag = false;           // d3d12 DeviceOptions::fence_publish_lag (--fence-lag)
     uint32_t fence_publish_lag_frames = 1;    // G69/G71: DeviceOptions::fence_publish_lag_frames
     uint32_t fence_publish_cap_ms = 33;       // G69/G71: DeviceOptions::fence_publish_cap_ms
     bool defer_gpu_objects = true;            // d3d12 DeviceOptions::defer_gpu_objects (--eager-gpu-objects)
@@ -520,7 +521,7 @@ BootResult run_boot(const BootConfig& config);
 //   {"max_wall_ms": 300000, "max_dispatches": 0, "arena_log_limit": 4096,
 //    "import_trace_limit": 0, "report_to_log": true, "verify_window_marks": false,
 //    "present_pacing": true, "gpu_memory_budget_mb": 0, "texture_size_cap": 0,
-//    "bind_group_slot_budget": 0, "present_max_interval": 0, "fence_publish_lag": true,
+//    "bind_group_slot_budget": 0, "present_max_interval": 0, "fence_publish_lag": false,
 //    "fence_publish_lag_frames": 1, "fence_publish_cap_ms": 33, "defer_gpu_objects": true,
 //    "xmem_shared_pages": true, "present_frame_waits": true, "audio_endpoint": true}
 // Every key is optional, unknown keys are ignored; "report_to_log" sets report_sink to

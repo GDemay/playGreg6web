@@ -206,6 +206,10 @@ struct BridgeOptions {
     // eviction). A cached bind group bound to a relocated home re-resolves its relocations when it
     // changed and is re-created if one moved; otherwise it would read another draw's bytes.
     std::function<uint64_t()> relocation_epoch;
+    // #663: true for a buffer holding storage relocation homes. A slot source decoding descriptor
+    // memory binds these homes directly (no recorded relocation), so a memory-backed bind group
+    // that binds one is rebuilt from its slots when relocation_epoch changed.
+    std::function<bool(uint32_t buffer_id)> relocation_home;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -857,6 +861,7 @@ private:
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
     // G66 (#691): true when a relocation `cached` was emitted with now resolves to another home.
     bool relocations_moved(d3d::CachedBindGroup* cached);
+    bool binds_relocation_home(const d3d::CachedBindGroup& cached) const;
     // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
     bool binds_retired(d3d::CachedBindGroup* cached) const;
     // G66 partly-held mip chains: hash of (texture, clamped base mip) over a group's texture entries,
@@ -946,6 +951,10 @@ private:
         d3d::BindGroupPlan plan;
         d3d::CachedBindGroup built;
         bool invalidated = false;
+        // #663: binds a relocation home (BridgeOptions::relocation_home), and the relocation
+        // epoch its entries were resolved at.
+        bool binds_home = false;
+        uint64_t relocation_epoch = 0;
     };
     std::vector<MemoryBindGroup> memory_groups_;
     mutable std::mutex cache_mutex_;

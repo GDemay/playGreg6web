@@ -258,6 +258,7 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
         return relocate_storage_buffer(va, size, id, offset, /*require_zero_offset=*/false);
     };
     bo.relocation_epoch = [this] { return relocation_evictions_.load(std::memory_order_relaxed); };
+    bo.relocation_home = [this](uint32_t buffer_id) { return storage_relocation_home(buffer_id); };
     bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
