@@ -14,7 +14,7 @@ param(
     [int]$Port = 8141,
     [string]$BuildDir = "work/browser-boot",
     [string]$Chrome = $env:CHROME_PATH,
-    [ValidateSet("none", "start-screen", "menu-flow", "calibration-skip", "intro-watch", "legal-notices", "chrome-menu-flow")]
+    [ValidateSet("none", "start-screen", "menu-flow", "calibration-skip", "intro-watch", "legal-notices", "chrome-menu-flow", "chrome-menu-flow-2", "chrome-menu-flow-4", "chrome-menu-flow-5", "chrome-full-boot", "menu-to-ingame", "chrome-to-ingame")]
     [string]$InputScript = "calibration-skip",
     [string]$ShaderPack = $env:PLAYGTA6_SHADER_PACK,
     [string]$Name = "",

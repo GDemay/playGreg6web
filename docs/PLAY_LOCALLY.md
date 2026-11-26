@@ -16,7 +16,9 @@ This calls `tools/run_browser_boot.py --preset long --headed`: it rebuilds stale
 guest Wasm, shader pack, staging), starts the local COOP/COEP server and launches Chrome with its own profile.
 Useful switches: `-NoBuild` (fail on stale), `-TrustBuild` (reuse artifacts), `-DryRun` (print plan),
 `-Chrome <path>`, `-DurationS`. Input presets: start-screen, menu-flow, calibration-skip, intro-watch,
-legal-notices, chrome-menu-flow. Defaults come from the env vars `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH` and `PLAYGTA6_SHADER_PACK`.
+legal-notices, chrome-menu-flow, chrome-menu-flow-2, chrome-menu-flow-4, chrome-menu-flow-5, chrome-full-boot,
+menu-to-ingame, chrome-to-ingame (every preset `tools/run_browser_boot.py` accepts; `chrome-to-ingame` goes through
+the LEGAL NOTICES and ROCKSTAR GAMES LEGAL TERMS screens automatically, then into the Main Menu / in-game). Defaults come from the env vars `PLAYGTA6_EXE`, `GTA6_GAME_DIR`, `CHROME_PATH` and `PLAYGTA6_SHADER_PACK`.
 `-InputScript` defaults to `calibration-skip` (`-InputScript none` turns it off). `-ShaderPack` defaults to
 `$env:PLAYGTA6_SHADER_PACK`, else `work/splash.wgsl.pack`; if none exists the script prints the build command and stops.
 Each run gets a unique name (`play-local-YYYYMMDD-HHMMSS`, override with `-Name`), so reruns never collide.
