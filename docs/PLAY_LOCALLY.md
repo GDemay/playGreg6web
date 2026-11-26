@@ -80,6 +80,21 @@ no window of its own, so the flag is opt-in and keys are read globally. It uses 
 stick), Shift / Ctrl (L3 / R3) and Z / C (LT / RT). Raw values pass through; the title's adapter applies the deadzones;
 the pad wins per axis when it is deflected more. `--input-script` takes precedence when both are given.
 
+## Native play: one command
+
+```powershell
+$env:PLAYGTA6_NATIVE_SHADER_PACK = "H:\path	o\std.wgsl.pack"   # once
+.	ools\play_native.ps1            # PLAYGTA6_EXE / GTA6_GAME_DIR as for play_local.ps1
+```
+
+Builds what is stale (recompiler, lift, harness with the Dawn executor on, all from the content-keyed caches below),
+then runs `playgta6_boot --window --audio-out --host-input --shader-pack <pack>`: a window with the live frames, WASAPI
+audio, keyboard and pad. Options: `-InputScript none|start-screen|menu-flow|menu-flow-2|menu-flow-3|menu-flow-4|menu-to-ingame`
+(scripted setup input instead of waiting for you; default `none`), `-SaveDir`, `-MaxMs` (default 2 h; closes the window
+when reached), `-NoBuild`, `-TrustBuild`, `-DryRun`, `-BuildDir`. The report lands in `<build-dir>/runs/<name>/`
+(`boot-report.json`: presents, `audio_out` counters). Stop with Ctrl+C or by closing the window.
+Same thing from Python: `python tools/run_native_boot.py --play ...` (or `--native-executor` for just the build).
+
 ## Native boot: fast, safe repeat builds
 
 `python tools/run_native_boot.py --build-only ...` runs only the (timed) build stages
