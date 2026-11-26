@@ -92,6 +92,11 @@ const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
 
 const SWAPCHAIN_TEXTURE_ID = 0xffffffff;
 const MANIFEST_REFERENCE_FLAG = 0x1;
+const BINDING_ARRAYS_LAYOUT_FLAG = 0x2;
+const BINDING_ARRAYS_BG_FLAG = 0x1;
+const RT_ARENA_GROUP_INDEX = 3;
+const RT_ARENA_BINDING_MIN = 16;
+const RT_ARENA_BINDING_MAX = 21;
 const KEY_OFFSET = 16; // CreateRenderPipeline2: header, then the 376-byte key
 const KEY_SIZE = 376;
 const CREATE_TEXTURE2_BYTES = 40;
@@ -1194,6 +1199,34 @@ function isExplicitLayoutCompatibleWithWgsl(group0Entries, wgslBindings) {
   return true;
 }
 
+function isBufferBindingResource(res) {
+  return Boolean(res && typeof res === 'object' && 'buffer' in res && res.buffer);
+}
+
+function isNonBufferBindingResource(res) {
+  return Boolean(res && !(typeof res === 'object' && 'buffer' in res));
+}
+
+function isSamplerResource(res) {
+  return Boolean(
+    res &&
+      ((typeof GPUSampler === 'function' && res instanceof GPUSampler) ||
+        (typeof res === 'object' && res.kind === 'GPUSampler'))
+  );
+}
+
+function isTextureViewResource(res) {
+  return Boolean(
+    res &&
+      ((typeof GPUTextureView === 'function' && res instanceof GPUTextureView) ||
+        (typeof res === 'object' && res.kind === 'GPUTextureView'))
+  );
+}
+
+function isRtArenaBinding(binding) {
+  return binding >= RT_ARENA_BINDING_MIN && binding <= RT_ARENA_BINDING_MAX;
+}
+
 // W101/W354: normalize a setBindGroup dynamicOffsets argument (Array / typed array / null) into a
 // plain array of uint32 offsets; empty/invalid input returns shared frozen EMPTY_DYNAMIC_OFFSETS.
 function normalizeDynamicOffsets(raw) {
@@ -2150,6 +2183,7 @@ function decodeBindGroupLayoutEntry(view, offset = 0, out = null) {
   const dimension = view.getUint8(offset + 10);
   const flags = view.getUint8(offset + 11);
   const storageFormat = view.getUint8(offset + 12);
+  const bindingArraySize = view.getUint16(offset + 14, true);
   const viewDimension = dimension !== 0 ? nameOf(VIEW_DIMENSION_NAMES, dimension) : '2d';
 
   let bufferType;
@@ -2254,6 +2288,11 @@ function decodeBindGroupLayoutEntry(view, offset = 0, out = null) {
         viewDimension,
       };
     }
+  }
+  if (bindingArraySize >= 1) {
+    entry.bindingArraySize = bindingArraySize;
+  } else if (out && 'bindingArraySize' in entry) {
+    delete entry.bindingArraySize;
   }
   return entry;
 }
@@ -2897,10 +2936,11 @@ class BeginRenderPassCommand {
     this.kind = 'beginRenderPass';
     this._rsPassOp = 'beginRenderPass';
     this._wgpuMeta = this;
-    this._decoded = decoded;
-    this._resolvers = resolvers;
-    this._targetIsSwapchain = targetAttachmentIsSwapchain;
-    this._staticTargetSize = staticTargetSize;
+    this._decoded = decoded || { colors: [], depthStencil: null };
+    this._resolvers = resolvers || { colors: [], depthStencil: null };
+    this._targetIsSwapchain = Boolean(targetAttachmentIsSwapchain);
+    this._staticTargetSizeSlot = { width: 0, height: 0 };
+    this._staticTargetSize = staticTargetSize || null;
   }
   run(ctl) {
     const h = this._handler;
@@ -2970,6 +3010,11 @@ class RenderStatePackets {
     this._remappedSbgCmdPoolUsed = 0;
     this._noopGroup0CmdPool = [];
     this._noopGroup0CmdPoolUsed = 0;
+    // W373: Per-frame pooled BeginRenderPassCommand + SetBindGroup2 dynamic-offsets arrays.
+    this._brpCmdPool = [];
+    this._brpCmdPoolUsed = 0;
+    this._dynOffsetsPool = [];
+    this._dynOffsetsPoolUsed = 0;
     // W186: hot-path PresentX multi-plane cache keyed by (planeTextureId, viewFormat, sampler, pipeline/layout).
     this.presentxBindGroupCache = new Map();
     this.presentxBindGroupCacheLimit =
@@ -3037,6 +3082,20 @@ class RenderStatePackets {
     this._scratchSwapchainFormatDesc = { format: '' };
     this._scratchLastRenderGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
     this._scratchLastComputeGroup0 = { bindGroupId: 0, bindGroupDesc: null, dynamicOffsets: EMPTY_DYNAMIC_OFFSETS };
+    this._scratchRemapResult = { status: 'empty', bindGroup: null };
+    this._scratchColorSizes = [];
+    this._scratchColorSizeSlots = [
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+      { width: 0, height: 0 },
+    ];
+    this._scratchDepthSizeSlot = { width: 0, height: 0 };
+    this._scratchAttachmentSizes = { colors: this._scratchColorSizes, depthStencil: null };
     this.textureMeta = new Map(); // textureId -> { id, requestedFormat, format, bcFallback, usage, width, height }
     this.dummies = new Map();
     this.emptyLayout = null;
@@ -3077,6 +3136,9 @@ class RenderStatePackets {
       elidedBindGroupSets: 0,
       textureViewCacheHits: 0,
       textureViewCacheMisses: 0,
+      bindingArrayLayouts: 0,
+      bindingArrayBindGroups: 0,
+      rtArenaGroup3Binds: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -3271,6 +3333,9 @@ class RenderStatePackets {
       elidedBindGroupSets: this.telemetry.elidedBindGroupSets,
       textureViewCacheHits: this.telemetry.textureViewCacheHits,
       textureViewCacheMisses: this.telemetry.textureViewCacheMisses,
+      bindingArrayLayouts: this.telemetry.bindingArrayLayouts,
+      bindingArrayBindGroups: this.telemetry.bindingArrayBindGroups,
+      rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
     };
   }
 
@@ -3310,6 +3375,9 @@ class RenderStatePackets {
       elidedBindGroupSets: this.telemetry.elidedBindGroupSets,
       textureViewCacheHits: this.telemetry.textureViewCacheHits,
       textureViewCacheMisses: this.telemetry.textureViewCacheMisses,
+      bindingArrayLayouts: this.telemetry.bindingArrayLayouts,
+      bindingArrayBindGroups: this.telemetry.bindingArrayBindGroups,
+      rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -3538,6 +3606,30 @@ class RenderStatePackets {
     return cmd;
   }
 
+  _acquireDynamicOffsetsArray(count) {
+    const idx = this._dynOffsetsPoolUsed;
+    this._dynOffsetsPoolUsed = idx + 1;
+    let arr;
+    if (idx < this._dynOffsetsPool.length) {
+      arr = this._dynOffsetsPool[idx];
+      arr.length = count;
+    } else {
+      arr = new Array(count);
+      this._dynOffsetsPool.push(arr);
+    }
+    return arr;
+  }
+
+  _peekBeginRenderPassCommand() {
+    const idx = this._brpCmdPoolUsed;
+    if (idx < this._brpCmdPool.length) {
+      return this._brpCmdPool[idx];
+    }
+    const cmd = new BeginRenderPassCommand(this, null, null, false, null);
+    this._brpCmdPool.push(cmd);
+    return cmd;
+  }
+
   _releaseFramePools() {
     for (let i = 0; i < this._sbg2CmdPoolUsed; i += 1) {
       const cmd = this._sbg2CmdPool[i];
@@ -3549,6 +3641,15 @@ class RenderStatePackets {
     for (let i = 0; i < this._remappedSbgCmdPoolUsed; i += 1) {
       this._remappedSbgCmdPool[i].bindGroup = null;
     }
+    for (let i = 0; i < this._brpCmdPoolUsed; i += 1) {
+      const cmd = this._brpCmdPool[i];
+      cmd._resolvers.colors.length = 0;
+      cmd._resolvers.depthStencil = null;
+      cmd._decoded.colors.length = 0;
+      cmd._decoded.depthStencil = null;
+      cmd._targetIsSwapchain = false;
+      cmd._staticTargetSize = null;
+    }
     this._vpCmdPoolUsed = 0;
     this._scCmdPoolUsed = 0;
     this._bcCmdPoolUsed = 0;
@@ -3556,6 +3657,8 @@ class RenderStatePackets {
     this._sbg2CmdPoolUsed = 0;
     this._remappedSbgCmdPoolUsed = 0;
     this._noopGroup0CmdPoolUsed = 0;
+    this._brpCmdPoolUsed = 0;
+    this._dynOffsetsPoolUsed = 0;
     const MAX_POOL = 2048;
     if (this._vpCmdPool.length > MAX_POOL) this._vpCmdPool.length = MAX_POOL;
     if (this._scCmdPool.length > MAX_POOL) this._scCmdPool.length = MAX_POOL;
@@ -3564,6 +3667,8 @@ class RenderStatePackets {
     if (this._sbg2CmdPool.length > MAX_POOL) this._sbg2CmdPool.length = MAX_POOL;
     if (this._remappedSbgCmdPool.length > MAX_POOL) this._remappedSbgCmdPool.length = MAX_POOL;
     if (this._noopGroup0CmdPool.length > MAX_POOL) this._noopGroup0CmdPool.length = MAX_POOL;
+    if (this._brpCmdPool.length > MAX_POOL) this._brpCmdPool.length = MAX_POOL;
+    if (this._dynOffsetsPool.length > MAX_POOL) this._dynOffsetsPool.length = MAX_POOL;
   }
 
   _parseRemappedBgKeyPipeline(key) {
@@ -4046,23 +4151,32 @@ class RenderStatePackets {
     const count = view.getUint32(offset + 4, true);
     const flags = view.getUint32(offset + 8, true);
     const contentId = view.getBigUint64(offset + 16, true);
+    const hasBindingArrays = (flags & BINDING_ARRAYS_LAYOUT_FLAG) !== 0;
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       const layout = this.resolveManifestLayout && this.resolveManifestLayout('bindGroupLayout', contentId);
       if (!layout) {
         this._packetError = `manifest bind group layout 0x${contentId.toString(16)} unavailable`;
         return false;
       }
-      this.bindGroupLayouts.set(id, { layout, entries: null });
+      this.bindGroupLayouts.set(id, {
+        layout,
+        entries: null,
+        entryByBinding: null,
+        hasBindingArrays,
+        hasRtArenaBindings: false,
+      });
+      if (hasBindingArrays) this.telemetry.bindingArrayLayouts += 1;
       return true;
     }
     if (24 + count * 24 > payloadBytes) return false;
     const entries = [];
-    const seenBindings = new Set();
+    const entryByBinding = new Map();
     let sequentialBindings = true;
+    let hasRtArenaBindings = false;
     for (let i = 0; i < count; i++) {
       const entry = decodeBindGroupLayoutEntry(view, offset + 24 + i * 24);
       if (!entry) return false;
-      if (seenBindings.has(entry.binding)) {
+      if (entryByBinding.has(entry.binding)) {
         this._packetError = `bind group layout ${id}: duplicate binding ${entry.binding}`;
         return false;
       }
@@ -4098,8 +4212,9 @@ class RenderStatePackets {
           );
         }
       }
-      seenBindings.add(entry.binding);
+      entryByBinding.set(entry.binding, entry);
       if (entry.binding !== i) sequentialBindings = false;
+      if (isRtArenaBinding(entry.binding)) hasRtArenaBindings = true;
       entries.push(entry);
     }
     const contentKey = contentId !== 0n ? `bgl:${contentId.toString(16)}` : null;
@@ -4116,9 +4231,13 @@ class RenderStatePackets {
     this.bindGroupLayouts.set(id, {
       layout,
       entries,
+      entryByBinding,
+      hasBindingArrays,
+      hasRtArenaBindings,
       sequentialBindings,
       dynamicOffsetIndices: dynamicOffsetIndicesForLayoutEntries(entries),
     });
+    if (hasBindingArrays) this.telemetry.bindingArrayLayouts += 1;
     return true;
   }
 
@@ -4140,6 +4259,8 @@ class RenderStatePackets {
       sequentialGroup0: false,
       group0HasEntries: false,
       group0Entries: null,
+      group3HasEntries: false,
+      hasRtArenaGroup3: false,
     };
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       layout = this.resolveManifestLayout && this.resolveManifestLayout('pipelineLayout', contentId);
@@ -4151,6 +4272,7 @@ class RenderStatePackets {
       if (24 + count * 4 > payloadBytes) return false;
       const bindGroupLayouts = [];
       let group0Record = null;
+      let group3Record = null;
       for (let g = 0; g < count; g++) {
         const bglId = view.getUint32(offset + 24 + g * 4, true);
         const record = bglId !== 0 ? this.bindGroupLayouts.get(bglId) : null;
@@ -4159,6 +4281,7 @@ class RenderStatePackets {
           return false;
         }
         if (g === 0) group0Record = record;
+        else if (g === RT_ARENA_GROUP_INDEX) group3Record = record;
         bindGroupLayouts.push(record ? record.layout : this._emptyBindGroupLayout());
       }
       try {
@@ -4177,6 +4300,12 @@ class RenderStatePackets {
               (Array.isArray(group0Record.entries) && group0Record.entries.length > 0))
         ),
         group0Entries: group0Record ? group0Record.entries : null,
+        group3HasEntries: Boolean(
+          group3Record &&
+            (group3Record.entries === null ||
+              (Array.isArray(group3Record.entries) && group3Record.entries.length > 0))
+        ),
+        hasRtArenaGroup3: Boolean(group3Record && group3Record.hasRtArenaBindings),
       };
     }
     this.pipelineLayouts.set(id, layout);
@@ -4777,36 +4906,61 @@ class RenderStatePackets {
     wgslBindings,
     bindGroupId,
     bindGroupDesc,
-    dynamicOffsets
+    dynamicOffsets,
+    out = null
   ) {
     if (!pipeline || typeof pipeline.getBindGroupLayout !== 'function') {
+      if (out) {
+        out.status = 'unsupported';
+        out.bindGroup = null;
+        return out;
+      }
       return { status: 'unsupported', bindGroup: null };
     }
     if (!Array.isArray(wgslBindings) || wgslBindings.length === 0) {
+      if (out) {
+        out.status = 'empty';
+        out.bindGroup = null;
+        return out;
+      }
       return { status: 'empty', bindGroup: null };
     }
 
     const available =
-      bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : [];
+      bindGroupDesc && Array.isArray(bindGroupDesc.resources) ? bindGroupDesc.resources : EMPTY_DYNAMIC_OFFSETS;
 
-    // W186: fast path for 2-binding PresentX plane blits (texture_2d<f32> + sampler) on layout:'auto'
-    // render pipelines: reuse the per-(planeTextureId, viewFormat, sampler, pipeline) cache even when
-    // bindGroupId rotates every frame.
+    // W186/W373: fast path for 2-binding PresentX plane blits (texture_2d<f32> + sampler) on
+    // layout:'auto' render pipelines without allocating .find() closures.
     if (!isCompute && wgslBindings.length === 2) {
-      const texBinding = wgslBindings.find(
-        (b) =>
-          b &&
+      let texBinding = null;
+      let smpBinding = null;
+      for (let i = 0; i < 2; i += 1) {
+        const b = wgslBindings[i];
+        if (!b) continue;
+        if (
+          !texBinding &&
           b.kind === 'texture' &&
           !b.multisampled &&
           (b.viewDimension || '2d') === '2d' &&
           (!b.sampleType || b.sampleType === 'float')
-      );
-      const smpBinding = wgslBindings.find((b) => b && b.kind === 'sampler');
+        ) {
+          texBinding = b;
+        } else if (!smpBinding && b.kind === 'sampler') {
+          smpBinding = b;
+        }
+      }
       if (texBinding && smpBinding) {
-        const texRes = available.find(
-          (r) => r && r.kind === 'texture' && !r.isDummy && Number.isInteger(r.planeTextureId) && r.planeTextureId > 0
-        );
-        const smpRes = available.find((r) => r && r.kind === 'sampler' && !r.isDummy && r.resource);
+        let texRes = null;
+        let smpRes = null;
+        for (let i = 0; i < available.length; i += 1) {
+          const r = available[i];
+          if (!r || r.isDummy) continue;
+          if (!texRes && r.kind === 'texture' && Number.isInteger(r.planeTextureId) && r.planeTextureId > 0) {
+            texRes = r;
+          } else if (!smpRes && r.kind === 'sampler' && r.resource) {
+            smpRes = r;
+          }
+        }
         if (texRes) {
           const cachedPx = this.getOrCreatePresentXPlaneBindGroup({
             planeTextureId: texRes.planeTextureId,
@@ -4821,35 +4975,54 @@ class RenderStatePackets {
             samplerBinding: smpBinding.binding,
           });
           if (cachedPx && cachedPx.bindGroup) {
+            if (out) {
+              out.status = 'ok';
+              out.bindGroup = cachedPx.bindGroup;
+              return out;
+            }
             return { status: 'ok', bindGroup: cachedPx.bindGroup };
           }
         }
       }
     }
 
-    const dynOffsets = normalizeDynamicOffsets(dynamicOffsets);
-    const dynOffsetFor = (r) =>
-      r &&
-      r.hasDynamicOffset &&
-      Number.isInteger(r.dynamicOffsetIndex) &&
-      r.dynamicOffsetIndex >= 0 &&
-      r.dynamicOffsetIndex < dynOffsets.length
-        ? dynOffsets[r.dynamicOffsetIndex]
-        : 0;
-    // Only offsets that land on a real dynamic-offset buffer entry split the cache; all-zero
-    // offsets share the plain '<c|r>:<pipeId>:<bgId>' key.
+    // W373: Zero-alloc cache-hit fast path: compute dynKey without normalizing into a fresh array,
+    // without allocating `parts`, and without defining per-call closures before checking the cache.
+    const hasRawOffsets =
+      dynamicOffsets !== null &&
+      dynamicOffsets !== undefined &&
+      (Array.isArray(dynamicOffsets) || ArrayBuffer.isView(dynamicOffsets)) &&
+      dynamicOffsets.length > 0;
     let dynKey = '';
-    if (dynOffsets.some((v) => v > 0)) {
-      const parts = [];
-      let anyNonZero = false;
-      for (let i = 0; i < available.length; i += 1) {
-        const r = available[i];
-        if (!r || !r.hasDynamicOffset || r.isDummy) continue;
-        const v = dynOffsetFor(r);
-        if (v > 0) anyNonZero = true;
-        parts.push(`${r.binding}=${v}`);
+    let hasAnyNonZeroDyn = false;
+    if (hasRawOffsets) {
+      const dynLen = dynamicOffsets.length;
+      for (let i = 0; i < dynLen; i += 1) {
+        const v = Number(dynamicOffsets[i]);
+        if (Number.isFinite(v) && v > 0) {
+          hasAnyNonZeroDyn = true;
+          break;
+        }
       }
-      if (anyNonZero) dynKey = parts.join(',');
+      if (hasAnyNonZeroDyn) {
+        // Only offsets that land on a real dynamic-offset buffer entry split the cache; all-zero
+        // offsets share the plain '<c|r>:<pipeId>:<bgId>' key.
+        let anyMatchedNonZero = false;
+        let keyStr = '';
+        for (let i = 0; i < available.length; i += 1) {
+          const r = available[i];
+          if (!r || !r.hasDynamicOffset || r.isDummy) continue;
+          let v = 0;
+          const dIdx = r.dynamicOffsetIndex;
+          if (Number.isInteger(dIdx) && dIdx >= 0 && dIdx < dynLen) {
+            const rawV = Number(dynamicOffsets[dIdx]);
+            v = Number.isFinite(rawV) && rawV > 0 ? Math.floor(rawV) >>> 0 : 0;
+          }
+          if (v > 0) anyMatchedNonZero = true;
+          keyStr = keyStr.length > 0 ? `${keyStr},${r.binding}=${v}` : `${r.binding}=${v}`;
+        }
+        if (anyMatchedNonZero) dynKey = keyStr;
+      }
     }
 
     const effectiveBgId = bindGroupId || 0;
@@ -4857,10 +5030,15 @@ class RenderStatePackets {
       effectiveBgId === 0 ||
       (bindGroupDesc && this.bindGroupDescriptors.get(effectiveBgId) === bindGroupDesc);
     const pipelineKey = `${isCompute ? 'c' : 'r'}:${pipelineId}`;
-    const cacheKey = `${pipelineKey}:${effectiveBgId}${dynKey ? `@${dynKey}` : ''}`;
+    const cacheKey = dynKey.length > 0 ? `${pipelineKey}:${effectiveBgId}@${dynKey}` : `${pipelineKey}:${effectiveBgId}`;
     if (isLiveDesc && this.remappedBindGroups.has(cacheKey)) {
       const cached = this.remappedBindGroups.get(cacheKey);
       this._cacheRemappedBindGroup(cacheKey, cached, pipelineKey, effectiveBgId);
+      if (out) {
+        out.status = cached ? 'ok' : 'empty';
+        out.bindGroup = cached || null;
+        return out;
+      }
       return cached ? { status: 'ok', bindGroup: cached } : { status: 'empty', bindGroup: null };
     }
 
@@ -4869,19 +5047,32 @@ class RenderStatePackets {
       autoBgl = pipeline.getBindGroupLayout(0);
     } catch (_) {
       if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null, pipelineKey, effectiveBgId);
+      if (out) {
+        out.status = 'empty';
+        out.bindGroup = null;
+        return out;
+      }
       return { status: 'empty', bindGroup: null };
     }
     if (!autoBgl) {
       if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null, pipelineKey, effectiveBgId);
+      if (out) {
+        out.status = 'empty';
+        out.bindGroup = null;
+        return out;
+      }
       return { status: 'empty', bindGroup: null };
     }
 
+    const dynOffsets = hasAnyNonZeroDyn ? normalizeDynamicOffsets(dynamicOffsets) : EMPTY_DYNAMIC_OFFSETS;
     const usedIndices = new Set();
 
     // Folds r's dynamic offset into a static { buffer, offset, size } binding, clamped so that
     // offset + size never exceeds the GPUBuffer size; an out-of-bounds offset binds a dummy.
     const bufferResourceWithDynamicOffset = (r, b) => {
-      const dyn = dynOffsetFor(r);
+      const dIdx = r && r.hasDynamicOffset ? r.dynamicOffsetIndex : -1;
+      const dyn =
+        Number.isInteger(dIdx) && dIdx >= 0 && dIdx < dynOffsets.length ? dynOffsets[dIdx] : 0;
       if (dyn <= 0) return r.resource;
       const base = r.resource;
       const effectiveOffset = (Number(base.offset) || 0) + dyn;
@@ -4912,27 +5103,10 @@ class RenderStatePackets {
         }
       }
       this.telemetry.dynamicOffsetRemaps += 1;
-      const out = { buffer: base.buffer, offset: effectiveOffset };
-      if (size !== null) out.size = size;
-      return out;
+      const folded = { buffer: base.buffer, offset: effectiveOffset };
+      if (size !== null) folded.size = size;
+      return folded;
     };
-
-    const isBufferBindingResource = (res) =>
-      Boolean(res && typeof res === 'object' && 'buffer' in res && res.buffer);
-    const isNonBufferBindingResource = (res) =>
-      Boolean(res && !(typeof res === 'object' && 'buffer' in res));
-    const isSamplerResource = (res) =>
-      Boolean(
-        res &&
-          ((typeof GPUSampler === 'function' && res instanceof GPUSampler) ||
-            (typeof res === 'object' && res.kind === 'GPUSampler'))
-      );
-    const isTextureViewResource = (res) =>
-      Boolean(
-        res &&
-          ((typeof GPUTextureView === 'function' && res instanceof GPUTextureView) ||
-            (typeof res === 'object' && res.kind === 'GPUTextureView'))
-      );
 
     const pickResourceForBinding = (b) => {
       for (let pass = 0; pass < 2; pass += 1) {
@@ -5088,6 +5262,11 @@ class RenderStatePackets {
     if (isLiveDesc) {
       this._cacheRemappedBindGroup(cacheKey, remapped, pipelineKey, effectiveBgId);
     }
+    if (out) {
+      out.status = remapped ? 'ok' : 'empty';
+      out.bindGroup = remapped || null;
+      return out;
+    }
     return remapped ? { status: 'ok', bindGroup: remapped } : { status: 'empty', bindGroup: null };
   }
 
@@ -5231,14 +5410,19 @@ class RenderStatePackets {
         let bindGroupId;
         let bindGroupDesc;
         let dynamicOffsets;
-        if (cmd._rsSetBindGroup) {
+        if (cmd instanceof SetBindGroup2Command) {
+          groupIndex = cmd.groupIndex;
+          bindGroupId = cmd.bindGroupId;
+          bindGroupDesc = cmd.bindGroupDesc || this._resolveBindGroupDescriptor(bindGroupId);
+          // W373: SetBindGroup2Command.offsets comes directly from _setBindGroup (already normalized uint32 array or EMPTY_DYNAMIC_OFFSETS).
+          dynamicOffsets = cmd.offsets;
+        } else if (cmd._rsSetBindGroup) {
           groupIndex = cmd._rsSetBindGroup.groupIndex;
           bindGroupId = cmd._rsSetBindGroup.bindGroupId;
           bindGroupDesc =
             cmd._rsSetBindGroup.bindGroupDesc || this._resolveBindGroupDescriptor(bindGroupId);
-          dynamicOffsets = normalizeDynamicOffsets(
-            cmd._rsSetBindGroup.offsets || cmd._rsSetBindGroup.dynamicOffsets
-          );
+          const rawOff = cmd._rsSetBindGroup.offsets || cmd._rsSetBindGroup.dynamicOffsets;
+          dynamicOffsets = rawOff === EMPTY_DYNAMIC_OFFSETS ? EMPTY_DYNAMIC_OFFSETS : normalizeDynamicOffsets(rawOff);
         } else if (isSetBgV1) {
           groupIndex = cmd.groupIndex;
           bindGroupId = cmd.bindGroupId;
@@ -5268,7 +5452,8 @@ class RenderStatePackets {
                 activeComputeAutoLayout.wgslBindings,
                 bindGroupId,
                 bindGroupDesc,
-                dynamicOffsets
+                dynamicOffsets,
+                this._scratchRemapResult
               );
               group0BoundForCompute = true;
               if (res.status === 'ok') {
@@ -5294,7 +5479,8 @@ class RenderStatePackets {
                 activeRenderAutoLayout.wgslBindings,
                 bindGroupId,
                 bindGroupDesc,
-                dynamicOffsets
+                dynamicOffsets,
+                this._scratchRemapResult
               );
               group0BoundForRender = true;
               if (res.status === 'ok') {
@@ -5321,7 +5507,12 @@ class RenderStatePackets {
         continue;
       }
 
-      if (cmd.type === 'draw' || cmd.type === 'drawIndexed') {
+      if (
+        cmd.type === 'draw' ||
+        cmd.type === 'drawIndexed' ||
+        cmd.type === 'drawIndirect' ||
+        cmd.type === 'drawIndexedIndirect'
+      ) {
         activePassMode = 'render';
         activeComputePipelineId = null;
         activeComputePipelineValid = false;
@@ -5347,7 +5538,8 @@ class RenderStatePackets {
             activeRenderAutoLayout.wgslBindings,
             srcBgId,
             srcBgDesc,
-            srcDynOff
+            srcDynOff,
+            this._scratchRemapResult
           );
           group0BoundForRender = true;
           if (res.status === 'ok') {
@@ -5360,7 +5552,7 @@ class RenderStatePackets {
         continue;
       }
 
-      if (cmd.type === 'dispatchCompute') {
+      if (cmd.type === 'dispatchCompute' || cmd.type === 'dispatchIndirect') {
         if (activeComputePending) {
           this.telemetry.pendingAsyncPipelineSkips += 1;
           ensureFiltered(i);
@@ -5375,28 +5567,30 @@ class RenderStatePackets {
           ensureFiltered(i);
           continue;
         }
-        const rawX = cmd.workgroupX;
-        const rawY = cmd.workgroupY;
-        const rawZ = cmd.workgroupZ;
-        const check = validateComputeDispatch(rawX, rawY, rawZ, this.device, this._scratch.computeDispatch);
-        if (check.skip) {
-          this.telemetry.skippedComputeDispatchCount += 1;
-          this._recordTelemetryWarningOnce(
-            `skip-dispatch-zero:${rawX}x${rawY}x${rawZ}`,
-            `skipped compute dispatch with zero or invalid workgroups (${rawX}x${rawY}x${rawZ})`
-          );
-          ensureFiltered(i);
-          continue;
-        }
-        if (check.clamped) {
-          cmd.workgroupX = check.x;
-          cmd.workgroupY = check.y;
-          cmd.workgroupZ = check.z;
-          this.telemetry.clampedComputeDispatchCount += 1;
-          this._recordTelemetryWarningOnce(
-            `clamp-dispatch:${rawX}x${rawY}x${rawZ}:${check.maxWorkgroupsPerDimension}`,
-            `clamped compute dispatch from ${rawX}x${rawY}x${rawZ} to ${check.x}x${check.y}x${check.z} (limit=${check.maxWorkgroupsPerDimension})`
-          );
+        if (cmd.type === 'dispatchCompute') {
+          const rawX = cmd.workgroupX;
+          const rawY = cmd.workgroupY;
+          const rawZ = cmd.workgroupZ;
+          const check = validateComputeDispatch(rawX, rawY, rawZ, this.device, this._scratch.computeDispatch);
+          if (check.skip) {
+            this.telemetry.skippedComputeDispatchCount += 1;
+            this._recordTelemetryWarningOnce(
+              `skip-dispatch-zero:${rawX}x${rawY}x${rawZ}`,
+              `skipped compute dispatch with zero or invalid workgroups (${rawX}x${rawY}x${rawZ})`
+            );
+            ensureFiltered(i);
+            continue;
+          }
+          if (check.clamped) {
+            cmd.workgroupX = check.x;
+            cmd.workgroupY = check.y;
+            cmd.workgroupZ = check.z;
+            this.telemetry.clampedComputeDispatchCount += 1;
+            this._recordTelemetryWarningOnce(
+              `clamp-dispatch:${rawX}x${rawY}x${rawZ}:${check.maxWorkgroupsPerDimension}`,
+              `clamped compute dispatch from ${rawX}x${rawY}x${rawZ} to ${check.x}x${check.y}x${check.z} (limit=${check.maxWorkgroupsPerDimension})`
+            );
+          }
         }
         if (activeComputeAutoLayout && !group0BoundForCompute) {
           const pipeline = this.processor.computePipelines.get(activeComputePipelineId);
@@ -5410,7 +5604,8 @@ class RenderStatePackets {
             activeComputeAutoLayout.wgslBindings,
             srcBgId,
             srcBgDesc,
-            srcDynOff
+            srcDynOff,
+            this._scratchRemapResult
           );
           group0BoundForCompute = true;
           if (res.status === 'ok') {
@@ -5783,14 +5978,14 @@ class RenderStatePackets {
     return entry;
   }
 
-  _textureAttachmentSize(textureId, viewDesc) {
+  _textureAttachmentSize(textureId, viewDesc, out = null) {
     const textures = this.processor && this.processor.textures;
     const texture = textures && typeof textures.get === 'function' ? textures.get(textureId) : null;
-    let base = texture ? validTargetSize(texture.width, texture.height) : null;
+    let base = texture ? validTargetSize(texture.width, texture.height, out) : null;
     if (!base) {
       const meta = this.textureMeta.get(textureId);
       if (meta) {
-        base = validTargetSize(meta.width, meta.height);
+        base = validTargetSize(meta.width, meta.height, out);
       }
     }
     if (!base) return null;
@@ -5800,10 +5995,9 @@ class RenderStatePackets {
         : 0;
     if (mip === 0) return base;
     const scale = mip >= 31 ? Infinity : Math.pow(2, mip);
-    return {
-      width: scale === Infinity ? 1 : Math.max(1, Math.floor(base.width / scale)),
-      height: scale === Infinity ? 1 : Math.max(1, Math.floor(base.height / scale)),
-    };
+    base.width = scale === Infinity ? 1 : Math.max(1, Math.floor(base.width / scale));
+    base.height = scale === Infinity ? 1 : Math.max(1, Math.floor(base.height / scale));
+    return base;
   }
 
   _resolveSwapchainSize(ctl, out = null) {
@@ -5878,7 +6072,9 @@ class RenderStatePackets {
   // The exact GPURenderPassDescriptor for a decoded BeginRenderPass (views resolved via `ctl`).
   buildRenderPassDescriptor(decoded, resolvers, ctl) {
     const colorCount = decoded.colors.length;
-    const colorSizes = new Array(colorCount);
+    const colorSizes = this._scratchColorSizes;
+    colorSizes.length = colorCount;
+    const colorSizeSlots = this._scratchColorSizeSlots;
     const colorAttachments = new Array(colorCount);
     for (let i = 0; i < colorCount; i += 1) {
       const c = decoded.colors[i];
@@ -5887,10 +6083,11 @@ class RenderStatePackets {
         colorAttachments[i] = null;
         continue;
       }
+      const sizeSlot = i < colorSizeSlots.length ? colorSizeSlots[i] : null;
       colorSizes[i] =
         c.textureId === SWAPCHAIN_TEXTURE_ID
-          ? this._resolveSwapchainSize(ctl)
-          : this._textureAttachmentSize(c.textureId, c.view);
+          ? this._resolveSwapchainSize(ctl, sizeSlot)
+          : this._textureAttachmentSize(c.textureId, c.view, sizeSlot);
       const loadOp = c.loadOp === 'clear' || c.loadOp === 'load' ? c.loadOp : 'load';
       const storeOp = c.storeOp === 'discard' || c.storeOp === 'store' ? c.storeOp : 'store';
       const attachment = {
@@ -5914,8 +6111,8 @@ class RenderStatePackets {
     if (d) {
       depthStencilSize =
         d.textureId === SWAPCHAIN_TEXTURE_ID
-          ? this._resolveSwapchainSize(ctl)
-          : this._textureAttachmentSize(d.textureId, d.view);
+          ? this._resolveSwapchainSize(ctl, this._scratchDepthSizeSlot)
+          : this._textureAttachmentSize(d.textureId, d.view, this._scratchDepthSizeSlot);
       const ds = { view: this._resolveAttachmentEntry(resolvers.depthStencil, ctl) };
       if (d.depthLoadOp !== 0) {
         ds.depthLoadOp = nameOf(LOAD_OP_NAMES, d.depthLoadOp);
@@ -5931,10 +6128,11 @@ class RenderStatePackets {
       if (d.stencilReadOnly) ds.stencilReadOnly = true;
       descriptor.depthStencilAttachment = ds;
     }
-    const sanitized = sanitizeRenderPassAttachments(descriptor, {
-      colors: colorSizes,
-      depthStencil: depthStencilSize,
-    });
+    this._scratchAttachmentSizes.colors = colorSizes;
+    this._scratchAttachmentSizes.depthStencil = depthStencilSize;
+    const sanitized = sanitizeRenderPassAttachments(descriptor, this._scratchAttachmentSizes);
+    colorSizes.length = 0;
+    this._scratchAttachmentSizes.depthStencil = null;
     this._lastPassReferenceSize = sanitized.referenceSize;
     if (sanitized.sanitizedCount > 0) {
       this.telemetry.sanitizedAttachments += sanitized.sanitizedCount;
@@ -5967,9 +6165,12 @@ class RenderStatePackets {
   }
 
   _beginRenderPass(view, offset) {
-    const decoded = decodeBeginRenderPass(view, offset);
+    const cmd = this._peekBeginRenderPassCommand();
+    const decoded = decodeBeginRenderPass(view, offset, cmd._decoded);
     const colorCount = decoded.colors.length;
-    const colorResolvers = new Array(colorCount);
+    const colorResolvers = cmd._resolvers.colors;
+    colorResolvers.length = colorCount;
+    cmd._resolvers.depthStencil = null;
     let targetAttachment = null;
     for (let i = 0; i < colorCount; i += 1) {
       const c = decoded.colors[i];
@@ -5990,6 +6191,10 @@ class RenderStatePackets {
       }
       const resolver = this._attachmentView(c.textureId, c.view);
       if (!resolver) {
+        colorResolvers.length = 0;
+        cmd._resolvers.depthStencil = null;
+        decoded.colors.length = 0;
+        decoded.depthStencil = null;
         return this._missingRenderPassTexture(c.textureId);
       }
       colorResolvers[i] = resolver;
@@ -5999,23 +6204,27 @@ class RenderStatePackets {
       if (!targetAttachment) targetAttachment = decoded.depthStencil;
       dsResolver = this._attachmentView(decoded.depthStencil.textureId, decoded.depthStencil.view);
       if (!dsResolver) {
+        colorResolvers.length = 0;
+        cmd._resolvers.depthStencil = null;
+        decoded.colors.length = 0;
+        decoded.depthStencil = null;
         return this._missingRenderPassTexture(decoded.depthStencil.textureId);
       }
     }
+    cmd._resolvers.depthStencil = dsResolver;
     const targetIsSwapchain = Boolean(targetAttachment && targetAttachment.textureId === SWAPCHAIN_TEXTURE_ID);
     const staticTargetSize =
       targetAttachment && !targetIsSwapchain
-        ? this._textureAttachmentSize(targetAttachment.textureId, targetAttachment.view)
+        ? this._textureAttachmentSize(
+            targetAttachment.textureId,
+            targetAttachment.view,
+            cmd._staticTargetSizeSlot
+          )
         : null;
-    this.processor._passCommands.push(
-      new BeginRenderPassCommand(
-        this,
-        decoded,
-        { colors: colorResolvers, depthStencil: dsResolver },
-        targetIsSwapchain,
-        staticTargetSize
-      )
-    );
+    cmd._targetIsSwapchain = targetIsSwapchain;
+    cmd._staticTargetSize = staticTargetSize;
+    this._brpCmdPoolUsed += 1;
+    this.processor._passCommands.push(cmd);
     return true;
   }
 
@@ -6086,6 +6295,8 @@ class RenderStatePackets {
     const id = view.getUint32(offset, true);
     const layoutId = view.getUint32(offset + 4, true);
     const count = view.getUint32(offset + 8, true);
+    const flags = view.getUint32(offset + 12, true);
+    const isBindingArrayBg = (flags & BINDING_ARRAYS_BG_FLAG) !== 0;
     if (16 + count * 48 > payloadBytes) return false;
     const record = this.bindGroupLayouts.get(layoutId);
     if (!record) {
@@ -6095,17 +6306,24 @@ class RenderStatePackets {
     const entries = [];
     const descriptorResources = [];
     const seenBindings = new Set();
+    const entryByBinding = record.entryByBinding || null;
     for (let i = 0; i < count; i++) {
       const o = offset + 16 + i * 48;
       const binding = view.getUint32(o, true);
-      if (seenBindings.has(binding)) {
-        this._packetError = `bind group ${id}: duplicate binding ${binding}`;
+      const arrayIndex = isBindingArrayBg ? view.getUint16(o + 12, true) : 0;
+      const effectiveBinding = isBindingArrayBg ? binding + arrayIndex : binding;
+      if (seenBindings.has(effectiveBinding)) {
+        this._packetError = `bind group ${id}: duplicate binding ${effectiveBinding}`;
         return false;
       }
-      seenBindings.add(binding);
+      seenBindings.add(effectiveBinding);
       const type = view.getUint32(o + 4, true);
       const resourceId = view.getUint32(o + 8, true);
-      const layoutEntry = record.entries ? record.entries.find((e) => e.binding === binding) : null;
+      const layoutEntry = entryByBinding
+        ? entryByBinding.get(binding) || null
+        : record.entries
+          ? record.entries.find((e) => e.binding === binding) || null
+          : null;
       const layoutExpectsBuffer = Boolean(layoutEntry && layoutEntry.buffer);
       const layoutExpectsTexture = Boolean(
         layoutEntry && (layoutEntry.texture || layoutEntry.storageTexture)
@@ -6410,10 +6628,10 @@ class RenderStatePackets {
         }
       }
       if (!entryResource) {
-        this._packetError = `bind group ${id}: binding ${binding} resource ${resourceId} unavailable`;
+        this._packetError = `bind group ${id}: binding ${effectiveBinding} resource ${resourceId} unavailable`;
         return false;
       }
-      entries.push({ binding, resource: entryResource });
+      entries.push({ binding: effectiveBinding, resource: entryResource });
 
       const descResource = realResource || entryResource;
       const descIsDummy = !realResource;
@@ -6473,7 +6691,7 @@ class RenderStatePackets {
       }
 
       if (resourceKind) {
-        const descEntry = { binding, kind: resourceKind, resource: descResource, isDummy: descIsDummy };
+        const descEntry = { binding: effectiveBinding, kind: resourceKind, resource: descResource, isDummy: descIsDummy };
         if (bufferUsage !== null) descEntry.bufferUsage = bufferUsage;
         if (textureUsage !== null) descEntry.textureUsage = textureUsage;
         if (textureFormat !== null && !descIsDummy) descEntry.textureFormat = textureFormat;
@@ -6510,7 +6728,7 @@ class RenderStatePackets {
     if (Array.isArray(record.entries) && this._getPipelineCache()) {
       for (let i = 0; i < record.entries.length; i += 1) {
         const le = record.entries[i];
-        if (!le || !le.sampler || seenBindings.has(le.binding)) continue;
+        if (!le || !le.sampler || le.bindingArraySize >= 1 || seenBindings.has(le.binding)) continue;
         const samplerKind = le.sampler.type || 'filtering';
         const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
         if (!fallbackSampler) continue;
@@ -6537,6 +6755,8 @@ class RenderStatePackets {
     let presentxCacheKey = null;
     let presentxCacheMeta = null;
     if (
+      !isBindingArrayBg &&
+      !record.hasBindingArrays &&
       entries.length === 2 &&
       Array.isArray(record.entries) &&
       record.entries.length === 2 &&
@@ -6634,7 +6854,13 @@ class RenderStatePackets {
       }
     }
     this.processor.bindGroups.set(id, bindGroup);
-    this.bindGroupDescriptors.set(id, { id, layoutId, resources: descriptorResources });
+    this.bindGroupDescriptors.set(id, {
+      id,
+      layoutId,
+      resources: descriptorResources,
+      hasRtArenaBindings: Boolean(record.hasRtArenaBindings),
+    });
+    if (isBindingArrayBg) this.telemetry.bindingArrayBindGroups += 1;
     this._invalidateRemappedBindGroupsForBindGroup(id);
     return true;
   }
@@ -6645,22 +6871,25 @@ class RenderStatePackets {
     const bindGroupId = view.getUint32(offset + 4, true);
     const count = view.getUint32(offset + 8, true);
     if (16 + count * 4 > payloadBytes) return false;
-    let offsets;
-    if (count === 0) {
-      offsets = EMPTY_DYNAMIC_OFFSETS;
-    } else {
-      offsets = new Array(count);
-      for (let i = 0; i < count; i += 1) {
-        offsets[i] = view.getUint32(offset + 16 + i * 4, true);
-      }
-    }
     // Resolved now: a later DestroyResource (bind group retired by the runtime) must not affect it.
     const bindGroup = this.processor.bindGroups.get(bindGroupId);
     if (!bindGroup) {
       this._packetError = `unknown bind group ${bindGroupId}`;
       return false;
     }
+    let offsets;
+    if (count === 0) {
+      offsets = EMPTY_DYNAMIC_OFFSETS;
+    } else {
+      offsets = this._acquireDynamicOffsetsArray(count);
+      for (let i = 0; i < count; i += 1) {
+        offsets[i] = view.getUint32(offset + 16 + i * 4, true);
+      }
+    }
     const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
+    if (index === RT_ARENA_GROUP_INDEX && bindGroupDesc && bindGroupDesc.hasRtArenaBindings) {
+      this.telemetry.rtArenaGroup3Binds += 1;
+    }
     this.processor._passCommands.push(
       this._acquireSetBindGroup2Command(index, bindGroupId, bindGroup, bindGroupDesc, offsets)
     );
@@ -6776,6 +7005,11 @@ const exportedApi = {
   VERTEX_FORMAT_BYTE_SIZES,
   V2_OPCODES,
   SWAPCHAIN_TEXTURE_ID,
+  BINDING_ARRAYS_LAYOUT_FLAG,
+  BINDING_ARRAYS_BG_FLAG,
+  RT_ARENA_GROUP_INDEX,
+  RT_ARENA_BINDING_MIN,
+  RT_ARENA_BINDING_MAX,
   TEXTURE_FORMAT_NAMES,
   TEXTURE_DIMENSION_NAMES,
   VERTEX_FORMAT_NAMES,
