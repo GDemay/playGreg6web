@@ -843,6 +843,67 @@ void test_rumble_forwarder() {
     t.last_high_frequency = -1.0f;
     g.update(t, 1, true, 0);
     CHECK(g_fake.calls.size() == 1 && g_fake.calls[0].pad == 1 && g_fake.calls[0].low == 65535 && g_fake.calls[0].high == 0);
+
+    // Non-monotonic timestamp regression must not underflow rate limiter.
+    g_fake.calls.clear();
+    hi::RumbleForwarder mono(&fake_set_state, 16);
+    t.last_low_frequency = 0.5f;
+    t.last_high_frequency = 0.0f;
+    mono.update(t, 0, true, 100);
+    CHECK(g_fake.calls.size() == 1);
+    t.last_low_frequency = 0.75f;
+    mono.update(t, 0, true, 50);  // regressed below last_send_ms_ = 100 -> must not underflow
+    CHECK(g_fake.calls.size() == 2 && mono.stats().rate_limited == 0);
+}
+
+void test_host_input_hardening() {
+    // 1. merge() suppresses resting pad drift (|pad| <= 0.15) when keyboard stick is active
+    //    so pressing pure W does not drift sideways, while preserving tie-break when pad is deflected.
+    {
+        InputState pad{};
+        pad.left_stick_x = 0.06f;
+        pad.left_stick_y = 0.04f;
+        pad.right_stick_x = -0.05f;
+        pad.right_stick_y = 0.07f;
+
+        InputState kb{};
+        kb.left_stick_x = 0.0f;
+        kb.left_stick_y = 1.0f;
+        kb.right_stick_x = 0.8f;
+        kb.right_stick_y = 0.0f;
+
+        const InputState merged = hi::merge(pad, kb);
+        CHECK(near(merged.left_stick_x, 0.0f));
+        CHECK(near(merged.left_stick_y, 1.0f));
+        CHECK(near(merged.right_stick_x, 0.8f));
+        CHECK(near(merged.right_stick_y, 0.0f));
+
+        // When keyboard is idle, raw pad values still pass through to GameInputReader deadzone.
+        const InputState pad_only = hi::merge(pad, InputState{});
+        CHECK(near(pad_only.left_stick_x, 0.06f));
+        CHECK(near(pad_only.left_stick_y, 0.04f));
+    }
+
+    // 2. HostInputSource null state safety, double-start safety, idle write dedup, and tear-free seqlock.
+    {
+        hi::HostInputSource null_src(nullptr);
+        null_src.start();
+        null_src.stop();
+        CHECK(null_src.writes() == 0);
+
+        InputState shared{};
+        hi::HostInputSource src(&shared);
+        src.set_keyboard_enabled(false);  // deterministic idle state regardless of host keyboard
+        src.start();
+        src.start();  // second start() must be a safe no-op (no std::terminate)
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        const uint64_t writes_idle = src.writes();
+        src.stop();
+        // Idle dedup: 60 ms at 8 ms/poll would have done ~7-8 redundant writes before; now stays <= 2.
+        CHECK(writes_idle <= 2);
+        // Tear-free write_seqlock always leaves seq even.
+        CHECK((shared.seq & 1u) == 0u);
+    }
 }
 
 }  // namespace
@@ -850,6 +911,7 @@ void test_rumble_forwarder() {
 int main() {
     test_rumble_forwarder();
     test_host_input_mapping();
+    test_host_input_hardening();
     test_deadzone_curves_and_mouse_look();
     test_guest_game_input_3d_gameplay();
 

@@ -2,8 +2,11 @@
 #include "os/thread_name.h"
 #include "guest/input_record.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 
 #include "os/game_input.h"
 #include "os/raw_mouse.h"
@@ -89,12 +92,25 @@ InputState convert_keyboard(uint32_t k) {
 
 InputState merge(const InputState& pad, const InputState& kb) {
     auto pick = [](float a, float b) { return std::fabs(b) > std::fabs(a) ? b : a; };
+    auto pick_stick = [&](float px, float py, float kx, float ky, float& ox, float& oy) {
+        // Prevent sub-deadzone pad resting drift (|pad| <= 0.15) from bleeding into an active
+        // keyboard/mouse stick axis and defeating radial deadzone downstream.
+        constexpr float kPadDriftEps = 0.15f;
+        const float pad_mag = std::hypot(px, py);
+        const float kb_mag = std::hypot(kx, ky);
+        if (kb_mag > 0.0f && pad_mag <= kPadDriftEps) {
+            ox = kx;
+            oy = ky;
+            return;
+        }
+        ox = pick(px, kx);
+        oy = pick(py, ky);
+    };
     InputState s{};
     s.buttons = pad.buttons | kb.buttons;
-    s.left_stick_x = pick(pad.left_stick_x, kb.left_stick_x);
-    s.left_stick_y = pick(pad.left_stick_y, kb.left_stick_y);
-    s.right_stick_x = pick(pad.right_stick_x, kb.right_stick_x);
-    s.right_stick_y = pick(pad.right_stick_y, kb.right_stick_y);
+    pick_stick(pad.left_stick_x, pad.left_stick_y, kb.left_stick_x, kb.left_stick_y, s.left_stick_x, s.left_stick_y);
+    pick_stick(pad.right_stick_x, pad.right_stick_y, kb.right_stick_x, kb.right_stick_y, s.right_stick_x,
+               s.right_stick_y);
     s.left_trigger = pad.left_trigger > kb.left_trigger ? pad.left_trigger : kb.left_trigger;
     s.right_trigger = pad.right_trigger > kb.right_trigger ? pad.right_trigger : kb.right_trigger;
     return s;
@@ -141,7 +157,7 @@ void RumbleForwarder::update(const playgta6::os::RumbleTelemetry& t, int pad, bo
         return;
     }
     const bool stopping = low == 0 && high == 0;
-    if (!stopping && sent_any_ && now_ms - last_send_ms_ < min_interval_ms_) {
+    if (!stopping && sent_any_ && now_ms >= last_send_ms_ && (now_ms - last_send_ms_) < min_interval_ms_) {
         ++stats_.rate_limited;
         return;
     }
@@ -169,6 +185,9 @@ void silence_host_rumble() {
 
 void HostInputSource::start() {
 #ifdef _WIN32
+    if (state_ == nullptr || thread_.joinable()) {
+        return;
+    }
     stop_.store(false);
     thread_ = std::thread([this] { run(); });
 #endif
@@ -197,13 +216,89 @@ struct RawVibration {
     WORD left, right;
 };
 using SetStateFn = DWORD(WINAPI*)(DWORD, RawVibration*);
-SetStateFn g_set_state = nullptr;
+std::atomic<SetStateFn> g_set_state{nullptr};
 uint32_t xinput_set_state(uint32_t pad, uint16_t low, uint16_t high) {
     RawVibration v{low, high};
-    return g_set_state != nullptr ? g_set_state(pad, &v) : 1;
+    const SetStateFn fn = g_set_state.load(std::memory_order_acquire);
+    return fn != nullptr ? fn(pad, &v) : 1;
 }
 
 bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+bool input_state_payload_equal(const InputState& a, const InputState& b) {
+    return a.buttons == b.buttons && a.mouse_dx == b.mouse_dx && a.mouse_dy == b.mouse_dy &&
+           std::memcmp(&a.left_stick_x, &b.left_stick_x, sizeof(float) * 6) == 0;
+}
+
+// Holds discrete button taps for a minimum window so rapid 16-30 ms keyboard/pad taps are never
+// dropped between low-FPS guest polls. Movement bits (WASD) stay unlatched for crisp release.
+class ButtonHoldLatch {
+public:
+    static constexpr uint32_t kMovementMask =
+        button::kMoveForward | button::kMoveBackward | button::kMoveLeft | button::kMoveRight;
+    static constexpr uint64_t kDefaultHoldMs = 64;
+
+    explicit ButtonHoldLatch(uint64_t hold_ms = kDefaultHoldMs) : hold_ms_(hold_ms) {}
+
+    void reset() {
+        prev_raw_ = 0;
+        pressed_at_.fill(0);
+        latch_until_.fill(0);
+    }
+
+    uint32_t apply(uint32_t raw_buttons, uint64_t now_ms) {
+        if (hold_ms_ == 0) {
+            prev_raw_ = raw_buttons;
+            return raw_buttons;
+        }
+        const uint32_t discrete_raw = raw_buttons & ~kMovementMask;
+        const uint32_t discrete_prev = prev_raw_ & ~kMovementMask;
+        uint32_t latched = 0;
+        for (uint32_t bit = 0; bit < 32; ++bit) {
+            const uint32_t mask = 1u << bit;
+            const bool is_down = (discrete_raw & mask) != 0;
+            const bool was_down = (discrete_prev & mask) != 0;
+            if (is_down) {
+                if (!was_down) {
+                    pressed_at_[bit] = now_ms;
+                }
+                latch_until_[bit] = 0;
+            } else {
+                if (was_down && now_ms >= pressed_at_[bit] && (now_ms - pressed_at_[bit]) < hold_ms_) {
+                    latch_until_[bit] = pressed_at_[bit] + hold_ms_;
+                }
+                if (latch_until_[bit] != 0) {
+                    if (now_ms < latch_until_[bit]) {
+                        latched |= mask;
+                    } else {
+                        latch_until_[bit] = 0;
+                    }
+                }
+            }
+        }
+        prev_raw_ = raw_buttons;
+        return raw_buttons | latched;
+    }
+
+private:
+    uint64_t hold_ms_;
+    uint32_t prev_raw_ = 0;
+    std::array<uint64_t, 32> pressed_at_{};
+    std::array<uint64_t, 32> latch_until_{};
+};
+
+void clamp_look_unit_disk(float& x, float& y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        x = 0.0f;
+        y = 0.0f;
+        return;
+    }
+    const float mag = std::hypot(x, y);
+    if (mag > 1.0f && std::isfinite(mag)) {
+        x /= mag;
+        y /= mag;
+    }
+}
 }  // namespace
 #endif
 
@@ -215,28 +310,34 @@ void HostInputSource::run() {
         if (HMODULE m = LoadLibraryA(dll)) {
             get_state = reinterpret_cast<GetStateFn>(GetProcAddress(m, "XInputGetState"));
             if (get_state != nullptr) {
-                g_set_state = reinterpret_cast<SetStateFn>(GetProcAddress(m, "XInputSetState"));
+                g_set_state.store(reinterpret_cast<SetStateFn>(GetProcAddress(m, "XInputSetState")),
+                                  std::memory_order_release);
                 break;
             }
         }
     }
     RumbleForwarder rumble(&xinput_set_state);
-    if (g_set_state != nullptr) {
+    if (g_set_state.load(std::memory_order_acquire) != nullptr) {
         g_silence_fn.store(&xinput_set_state);
     }
     int pad_index = -1;
     POINT last_cursor{};
     bool have_cursor = false;
+    bool prev_kb_enabled = keyboard_enabled_.load();
+    ButtonHoldLatch tap_latch;
+    bool has_published = false;
+    InputState last_published{};
     while (!stop_.load()) {
+        const uint64_t now_ms = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+                .count());
         XPadSample sample;
         bool have_pad = false;
         if (get_state != nullptr) {
-            // Stick to the connected pad; rescan the slots only while none is.
-            for (int n = 0; n < 4 && !have_pad; ++n) {
-                const int i = pad_index >= 0 ? pad_index : n;
+            auto try_slot = [&](int slot) -> bool {
                 RawState raw{};
-                if (get_state(static_cast<DWORD>(i), &raw) == ERROR_SUCCESS) {
-                    pad_index = i;
+                if (get_state(static_cast<DWORD>(slot), &raw) == ERROR_SUCCESS) {
+                    pad_index = slot;
                     have_pad = true;
                     sample.buttons = raw.pad.buttons;
                     sample.left_trigger = raw.pad.lt;
@@ -245,61 +346,98 @@ void HostInputSource::run() {
                     sample.thumb_ly = raw.pad.ly;
                     sample.thumb_rx = raw.pad.rx;
                     sample.thumb_ry = raw.pad.ry;
-                } else {
+                    return true;
+                }
+                return false;
+            };
+            // Stick to the connected pad; on disconnect, rescan all other slots (including slot 0) immediately.
+            int failed_slot = -1;
+            if (pad_index >= 0) {
+                if (!try_slot(pad_index)) {
+                    failed_slot = pad_index;
                     pad_index = -1;
                 }
             }
+            if (!have_pad) {
+                for (int i = 0; i < 4 && !have_pad; ++i) {
+                    if (i != failed_slot) {
+                        try_slot(i);
+                    }
+                }
+            }
         }
-        if (g_set_state != nullptr) {
+        const bool kb = keyboard_enabled_.load();
+        if (g_set_state.load(std::memory_order_acquire) != nullptr) {
             // Rumble only while the window has focus (the same gate as the keyboard).
-            const uint64_t now_ms = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-            rumble.update(playgta6::os::game_input_rumble_telemetry(), have_pad ? pad_index : -1, keyboard_enabled_.load(), now_ms);
+            rumble.update(playgta6::os::game_input_rumble_telemetry(), have_pad ? pad_index : -1, kb, now_ms);
             g_silence_pad.store(have_pad ? pad_index : -1);
         }
+        if (!kb && prev_kb_enabled) {
+            tap_latch.reset();
+        }
+        prev_kb_enabled = kb;
+
         float look_x = 0.0f, look_y = 0.0f;
-        const bool kb = keyboard_enabled_.load();
         if (keymap_.mouse_look) {
             namespace rm = playgta6::os::raw_mouse;
-            float mdx = 0.0f, mdy = 0.0f;
-            if (kb && rm::state().window_ready.load()) {
-                // Live window: relative Raw Input deltas (zero while the cursor is released).
-                int32_t dx = 0, dy = 0;
-                rm::take(&dx, &dy);
-                mdx = static_cast<float>(dx);
-                mdy = static_cast<float>(dy);
-            } else if (kb) {
-                // No window to capture the cursor: real cursor movement since the last poll.
-                POINT p{};
-                if (GetCursorPos(&p)) {
-                    if (have_cursor) {
-                        mdx = static_cast<float>(p.x - last_cursor.x);
-                        mdy = static_cast<float>(p.y - last_cursor.y);
-                    }
-                    last_cursor = p;
-                    have_cursor = true;
+            const bool win_ready = rm::state().window_ready.load();
+            const bool capturing = win_ready ? rm::state().capturing.load() : true;
+            if (!kb || !capturing) {
+                if (win_ready) {
+                    int32_t dx = 0, dy = 0;
+                    rm::take(&dx, &dy);
                 }
-            } else {
+                look_x_ = 0.0f;
+                look_y_ = 0.0f;
                 have_cursor = false;
+            } else {
+                float mdx = 0.0f, mdy = 0.0f;
+                if (win_ready) {
+                    // Live window: relative Raw Input deltas.
+                    int32_t dx = 0, dy = 0;
+                    rm::take(&dx, &dy);
+                    mdx = static_cast<float>(dx);
+                    mdy = static_cast<float>(dy);
+                } else {
+                    // No window to capture the cursor: real cursor movement since the last poll.
+                    POINT p{};
+                    if (GetCursorPos(&p)) {
+                        if (have_cursor) {
+                            mdx = static_cast<float>(p.x - last_cursor.x);
+                            mdy = static_cast<float>(p.y - last_cursor.y);
+                        }
+                        last_cursor = p;
+                        have_cursor = true;
+                    }
+                }
+                look_x = keymap::mouse_stick_step(look_x_, mdx, keymap_.mouse_sensitivity);
+                look_y = keymap::mouse_stick_step(look_y_, keymap_.mouse_invert_y ? mdy : -mdy, keymap_.mouse_sensitivity);
+                clamp_look_unit_disk(look_x, look_y);
+                look_x_ = look_x;
+                look_y_ = look_y;
             }
-            look_x = keymap::mouse_stick_step(look_x_, mdx, keymap_.mouse_sensitivity);
-            look_y = keymap::mouse_stick_step(look_y_, keymap_.mouse_invert_y ? mdy : -mdy, keymap_.mouse_sensitivity);
-            look_x_ = look_x;
-            look_y_ = look_y;
         }
         const InputState keys = kb ? keymap::evaluate_look(keymap_, key_down, look_x, look_y) : InputState{};
-        const InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, keys);
+        InputState values = merge(have_pad ? convert_pad(sample) : InputState{}, keys);
+        values.buttons = tap_latch.apply(values.buttons, now_ms);
         if (recorder_ != nullptr) {
             recorder_->record(values);
         }
-        playgta6::os::GameInputReader::write_monotonic(*state_, values);
-        writes_.fetch_add(1);
+        if (!has_published || !input_state_payload_equal(values, last_published)) {
+            playgta6::os::GameInputReader::write_seqlock(*state_, values);
+            last_published = values;
+            has_published = true;
+            writes_.fetch_add(1);
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
     }
     rumble.stop();
     g_silence_pad.store(-1);
     const InputState zero{};
-    playgta6::os::GameInputReader::write_monotonic(*state_, zero);
+    if (!has_published || !input_state_payload_equal(zero, last_published)) {
+        playgta6::os::GameInputReader::write_seqlock(*state_, zero);
+        writes_.fetch_add(1);
+    }
 #endif
 }
 

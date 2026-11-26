@@ -12,7 +12,8 @@
 //
 // `time_ms` counts from the start of the player; `buttons` is `+`-separated names (A, B, X, Y,
 // LB, RB, Menu, View, LS, RS; DUp, DDown, DLeft, DRight the D-pad; Up, Down, Left, Right push the
-// left stick; RUp, RDown, RLeft, RRight push the right stick fully; LT, RT pull a trigger fully)
+// left stick via movement bits; LUp, LDown, LLeft, LRight push the analog left stick directly;
+// RUp, RDown, RLeft, RRight push the right stick fully; LT, RT pull a trigger fully)
 // or a number (hex with 0x) of
 // playgta6::os::input_button bits; `hold_ms`
 // (default 100) is how long the buttons stay down before they are released.
@@ -114,10 +115,23 @@ struct InputScriptEvent {
     size_t end_index = 0;     // RepeatBegin: index of its RepeatEnd
 };
 
+// Minimum press hold duration recommended for 5-15 FPS browser/native menu progression.
+inline constexpr uint64_t kDefaultScriptMinHoldMs = 200;
+
 // Parses a script. Returns false with `error` set ("line N: ...") on the first malformed line.
 // Presses come back sorted by time within each run between two other steps (all of them when the
 // script has none).
 bool parse_input_script(const std::string& text, std::vector<InputScriptEvent>& out, std::string& error);
+
+// Built-in hardened menu -> in-game presets ("chrome-to-ingame", "menu-to-ingame",
+// "chrome-menu-flow-6", "calibration-skip", "legal-notices"). All built-in presets enforce
+// >= 200 ms holds, cursor-resetting Legal Notices navigation, Right-Stick Legal Terms scroll +
+// checkbox acceptance, and zero unintended Back (B) presses.
+std::vector<std::string> builtin_input_script_preset_names();
+bool builtin_input_script_preset(const std::string& name, std::string& out_script);
+bool parse_input_script_or_preset(const std::string& name_or_text,
+                                  std::vector<InputScriptEvent>& out,
+                                  std::string& error);
 
 // Plays events into `state` on its own thread. Each event writes its buttons, then clears them
 // after its hold time. stop() (or destruction) ends playback early.
@@ -131,6 +145,11 @@ public:
     // Live counters for wait/repeat (without one they see a zero status); the capture step's action.
     void set_status_probe(InputStatusProbe probe) { probe_ = std::move(probe); }
     void set_on_capture(std::function<void()> on_capture) { on_capture_ = std::move(on_capture); }
+    // Optional minimum press hold floor (ms) enforced for every Press step (0 = use event hold_ms).
+    void set_min_hold_ms(uint64_t min_hold_ms) { min_hold_ms_ = min_hold_ms; }
+    // Optional cooperative yield probe: when it returns true (live user input detected),
+    // playback immediately releases any held scripted buttons/axes and stops cleanly.
+    void set_live_yield_probe(std::function<bool()> probe) { live_yield_probe_ = std::move(probe); }
     // Log presses and wait results to stderr ("[input] <ms> ms: ...").
     void set_log(bool log) { log_ = log; }
 
@@ -143,6 +162,8 @@ public:
     uint64_t waits_timed_out() const { return waits_timed_out_.load(); }
     // True once playback reached the end of the script.
     bool finished() const { return finished_.load(); }
+    // True if playback yielded early due to live_yield_probe_.
+    bool yielded() const { return yielded_.load(); }
 
 private:
     void run();
@@ -152,10 +173,13 @@ private:
     std::vector<InputScriptEvent> events_;
     InputStatusProbe probe_;
     std::function<void()> on_capture_;
+    std::function<bool()> live_yield_probe_;
+    uint64_t min_hold_ms_ = 0;
     bool log_ = false;
     std::atomic<uint64_t> waits_done_{0};
     std::atomic<uint64_t> waits_timed_out_{0};
     std::atomic<bool> finished_{false};
+    std::atomic<bool> yielded_{false};
     playgta6::InputState* state_;
     std::thread thread_;
     std::atomic<bool> stop_{false};
