@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 
 use iced_x86::{
     Code, ConditionCode, FlowControl, Formatter, Instruction, InstructionInfoFactory,
-    IntelFormatter, Mnemonic, OpKind, Register, RflagsBits,
+    IntelFormatter, Mnemonic, OpAccess, OpKind, Register, RflagsBits,
 };
 
 use super::{
@@ -331,7 +331,9 @@ pub(super) fn lift(
         unsupported: Vec::new(),
         ea: None,
         memory,
-        stack_values: BTreeSet::new(),
+        stack_values: BTreeMap::new(),
+        window_load_cache: None,
+        burst_override: None,
         guest_base: None,
         cold_traps: Vec::new(),
         share_ret: return_blocks > 1,
@@ -465,8 +467,14 @@ struct FunctionLifter<'a> {
     ea: Option<String>,
     /// Guest -> host address translation (`memory_access.rs`).
     memory: MemoryModel,
-    /// SSA values known to be stack-pointer-relative guest addresses (table models only).
-    stack_values: BTreeSet<String>,
+    /// SSA values known to be stack-pointer-relative guest addresses -> cumulative displacement
+    /// from `rsp` (table models with `stack_flat` only).
+    stack_values: BTreeMap<String, i64>,
+    /// R58: cached dynamic window translation for exact same-address RMW / repeated accesses
+    /// within the same basic block (cleared at block boundaries and calls/atomics/fences).
+    window_load_cache: Option<memory_access::CachedWindowAddr>,
+    /// R58: active fast-path translation override for a coalesced same-base window burst.
+    burst_override: Option<memory_access::BurstOverride>,
     /// SSA value holding `@__playgta6_guest_base`, loaded once in `entry:` when needed.
     pub(super) guest_base: Option<String>,
     /// Incoming edges `(kind, va, pred_block)` into this function's shared `cold_trap` sink.
@@ -516,6 +524,7 @@ struct Checkpoint {
     support: BTreeSet<Support>,
     known: Known,
     edge_known: usize,
+    window_load_cache: Option<memory_access::CachedWindowAddr>,
 }
 
 impl FunctionLifter<'_> {
@@ -561,12 +570,44 @@ impl FunctionLifter<'_> {
                 _ => (&block.instructions[..], None),
             };
             let mut trapped = false;
-            for ins in body {
+            let bursts = self.find_window_bursts(body);
+            let mut burst_cursor = 0usize;
+            let mut idx = 0usize;
+            while idx < body.len() {
+                let ins = &body[idx];
                 if is_control_transfer(ins) {
                     return Err(LiftError::InstructionAfterTerminator {
                         block: start,
                         address: ins.ip(),
                     });
+                }
+                while burst_cursor < bursts.len() && bursts[burst_cursor].start < idx {
+                    burst_cursor += 1;
+                }
+                if let Some(&burst) = bursts.get(burst_cursor)
+                    && burst.start == idx
+                {
+                    let slice = &body[burst.start..=burst.end];
+                    if let Some(bad) = slice.iter().find(|i| is_control_transfer(i)) {
+                        return Err(LiftError::InstructionAfterTerminator {
+                            block: start,
+                            address: bad.ip(),
+                        });
+                    }
+                    match self.lift_window_burst(burst, slice) {
+                        Ok(true) => {
+                            idx = burst.end + 1;
+                            burst_cursor += 1;
+                            continue;
+                        }
+                        Ok(false) => {
+                            burst_cursor += 1;
+                        }
+                        Err(InsnError::Cfg(err)) => return Err(err),
+                        Err(InsnError::Unsupported(_)) => {
+                            burst_cursor += 1;
+                        }
+                    }
                 }
                 let checkpoint = self.checkpoint();
                 self.ea = None;
@@ -584,6 +625,7 @@ impl FunctionLifter<'_> {
                         break;
                     }
                 }
+                idx += 1;
             }
             if !trapped {
                 self.lift_terminator(block, transfer)?;
@@ -841,6 +883,7 @@ impl FunctionLifter<'_> {
             support: self.support.clone(),
             known: self.known.clone(),
             edge_known: self.edge_known.len(),
+            window_load_cache: self.window_load_cache.clone(),
         }
     }
 
@@ -854,6 +897,8 @@ impl FunctionLifter<'_> {
         self.support = checkpoint.support;
         self.known = checkpoint.known;
         self.edge_known.truncate(checkpoint.edge_known);
+        self.window_load_cache = checkpoint.window_load_cache;
+        self.simd.clear_mem32();
     }
 
     fn trap_unsupported(&mut self, ins: &Instruction, reason: String) {
@@ -925,9 +970,48 @@ impl FunctionLifter<'_> {
 
     fn start_block(&mut self, label: &str) {
         self.known = Known::default();
+        self.window_load_cache = None;
         self.current_block.clear();
         self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
+    }
+
+    /// Starts an internal CFG block (e.g. a memory-access slow path or join) without discarding
+    /// `self.known` or `self.window_load_cache`, which stay valid across single-entry regions that
+    /// never write GPR/flag allocas or invoke runtime remapping helpers.
+    pub(super) fn start_internal_block(&mut self, label: &str) {
+        self.current_block.clear();
+        self.current_block.push_str(label);
+        let _ = writeln!(self.body, "{label}:");
+    }
+
+    pub(super) fn clear_window_cache(&mut self) {
+        self.window_load_cache = None;
+    }
+
+    pub(super) fn known_gpr(&self, idx: usize) -> Option<&str> {
+        self.known.gprs[idx].as_deref()
+    }
+
+    /// Restores entries from `entry` that neither `a` nor `b` modified (the entry block strictly
+    /// dominates the join block, so unchanged SSA values remain valid and still match their allocas).
+    pub(super) fn restore_unchanged_known(&mut self, entry: &Known, a: &Known, b: &Known) {
+        for i in 0..16 {
+            if entry.gprs[i].is_some()
+                && a.gprs[i] == entry.gprs[i]
+                && b.gprs[i] == entry.gprs[i]
+            {
+                self.known.gprs[i] = entry.gprs[i].clone();
+            }
+        }
+        for i in 0..6 {
+            if entry.flags[i].is_some()
+                && a.flags[i] == entry.flags[i]
+                && b.flags[i] == entry.flags[i]
+            {
+                self.known.flags[i] = entry.flags[i].clone();
+            }
+        }
     }
 
     // ----- guest state ---------------------------------------------------------------------------
@@ -1065,7 +1149,7 @@ impl FunctionLifter<'_> {
             }
         };
         if idx == RSP {
-            self.note_stack_value(&v);
+            self.note_stack_value(&v, 0);
         }
         Ok(v)
     }
@@ -1161,15 +1245,35 @@ impl FunctionLifter<'_> {
                 None => scaled,
             });
         }
+        let acc_base = if index == Register::None {
+            acc.clone()
+        } else {
+            None
+        };
         let mut addr = match acc {
             Some(sum) if disp != 0 => self.val(&format!("add i64 {sum}, {}", imm(disp, 64))),
             Some(sum) => sum,
             None => imm(if addr32 { disp & mask(32) } else { disp }, 64),
         };
+        let has_fs_gs = with_segment
+            && matches!(ins.memory_segment(), Register::FS | Register::GS);
         if addr32 {
             addr = self.val(&format!("and i64 {addr}, 4294967295"));
         } else if base == Register::RSP && index == Register::None {
-            self.note_stack_value(&addr);
+            self.note_stack_value(&addr, disp as i64);
+        } else if index == Register::None
+            && let Some(base_val) = &acc_base
+        {
+            self.propagate_stack_offset(base_val, &addr, disp as i64);
+        }
+        if !addr32
+            && !has_fs_gs
+            && index == Register::None
+            && base.is_gpr64()
+            && let Some(burst) = &mut self.burst_override
+            && base.number() == burst.reg
+        {
+            burst.addrs.insert(addr.clone(), disp as i64);
         }
         if with_segment {
             let field = match ins.memory_segment() {
@@ -1183,6 +1287,26 @@ impl FunctionLifter<'_> {
             }
         }
         Ok(addr)
+    }
+
+    /// Computes `addr + offset` (64-bit wrapping), folding at lift time when `addr` is a constant
+    /// literal and preserving bounded stack-pointer provenance and burst-override tracking.
+    pub(super) fn offset_addr(&mut self, addr: &str, offset: u64) -> String {
+        if offset == 0 {
+            return addr.to_string();
+        }
+        if let Some(va) = memory_access::const_addr(addr) {
+            return imm(va.wrapping_add(offset), 64);
+        }
+        let out = self.val(&format!("add i64 {addr}, {}", imm(offset, 64)));
+        self.propagate_stack_offset(addr, &out, offset as i64);
+        if let Some(burst) = &mut self.burst_override
+            && let Some(&base_disp) = burst.addrs.get(addr)
+            && let Some(new_disp) = base_disp.checked_add(offset as i64)
+        {
+            burst.addrs.insert(out.clone(), new_disp);
+        }
+        out
     }
 
     fn read_addr_reg(&mut self, reg: Register) -> R<String> {
@@ -1219,9 +1343,165 @@ impl FunctionLifter<'_> {
     fn push(&mut self, value: &str, bits: u32) -> R<()> {
         let rsp = self.load_gpr(RSP)?;
         let new_rsp = self.val(&format!("sub i64 {rsp}, {}", bits / 8));
-        self.note_stack_value(&new_rsp);
+        self.note_stack_value(&new_rsp, -i64::from(bits / 8));
         self.store_mem(&new_rsp, value, bits);
         self.store_gpr(RSP, &new_rsp)
+    }
+
+    /// R58: scans a basic block body for non-overlapping bursts of consecutive plain memory
+    /// accesses sharing one 64-bit base GPR under `WindowCheck::Branch` (`window`, `window-stack`,
+    /// `window-runs`), so the entire burst pays one window range/page check instead of one per
+    /// access.
+    fn find_window_bursts(&self, body: &[Instruction]) -> Vec<memory_access::WindowBurst> {
+        use crate::lift::memory::WindowCheck;
+        let MemoryModel::Windowed(w) = self.memory else {
+            return Vec::new();
+        };
+        if w.check != WindowCheck::Branch || body.len() < 2 {
+            return Vec::new();
+        }
+        const MAX_BURST_INSNS: usize = 8;
+        #[derive(Clone, Copy)]
+        struct Active {
+            start: usize,
+            end: usize,
+            min_d: i64,
+            max_end: i64,
+            count: usize,
+            has_write: bool,
+            has_simd_mem: bool,
+        }
+        let mut active: [Option<Active>; 16] = [None; 16];
+        let mut candidates: Vec<memory_access::WindowBurst> = Vec::new();
+        let mut factory = InstructionInfoFactory::new();
+
+        let close_reg = |slot: &mut Option<Active>,
+                         reg: usize,
+                         out: &mut Vec<memory_access::WindowBurst>| {
+            if let Some(a) = slot.take()
+                && a.end > a.start
+                && a.end - a.start < MAX_BURST_INSNS
+                && (a.count >= 3 || (a.count >= 2 && (a.has_write || a.has_simd_mem)))
+                && let Some(span) = a
+                    .max_end
+                    .checked_sub(a.min_d)
+                    .and_then(|s| u64::try_from(s).ok())
+                && span > 0
+                && span <= memory_access::BURST_MAX_SPAN
+            {
+                out.push(memory_access::WindowBurst {
+                    start: a.start,
+                    end: a.end,
+                    reg,
+                    min_d: a.min_d,
+                    max_end: a.max_end,
+                    has_write: a.has_write,
+                });
+            }
+        };
+        let close_all = |active: &mut [Option<Active>; 16],
+                         out: &mut Vec<memory_access::WindowBurst>| {
+            for (r, slot) in active.iter_mut().enumerate() {
+                close_reg(slot, r, out);
+            }
+        };
+
+        for (i, ins) in body.iter().enumerate() {
+            if is_burst_barrier(ins) {
+                close_all(&mut active, &mut candidates);
+                continue;
+            }
+            let info = factory.info(ins);
+            let mut written_gprs = 0u16;
+            for ur in info.used_registers() {
+                if matches!(
+                    ur.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                ) {
+                    let r = ur.register();
+                    if r.is_gpr() && r.full_register().is_gpr64() {
+                        written_gprs |= 1u16 << r.full_register().number();
+                    }
+                }
+            }
+            // Check if this instruction performs a plain `[base64 + disp]` memory access.
+            let mem_access = plain_burst_mem_access(ins, info, w.stack_flat);
+            let mem_base_reg = mem_access.map(|(r, _, _, _, _)| r);
+
+            // Any register written WITHOUT first being used as this instruction's memory base
+            // closes BEFORE instruction `i`.
+            for r in 0..16 {
+                if written_gprs & (1u16 << r) != 0 && mem_base_reg != Some(r) {
+                    close_reg(&mut active[r], r, &mut candidates);
+                }
+            }
+
+            if let Some((reg, disp, size, is_write, is_simd_mem)) = mem_access {
+                let end_d = disp.saturating_add(size as i64);
+                let extend = match active[reg] {
+                    Some(a) if i - a.start < MAX_BURST_INSNS => {
+                        let new_min = a.min_d.min(disp);
+                        let new_max = a.max_end.max(end_d);
+                        let span_ok = new_max
+                            .checked_sub(new_min)
+                            .and_then(|s| u64::try_from(s).ok())
+                            .is_some_and(|s| s <= memory_access::BURST_MAX_SPAN);
+                        if span_ok {
+                            Some(Active {
+                                start: a.start,
+                                end: i,
+                                min_d: new_min,
+                                max_end: new_max,
+                                count: a.count + 1,
+                                has_write: a.has_write || is_write,
+                                has_simd_mem: a.has_simd_mem || is_simd_mem,
+                            })
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(updated) = extend {
+                    active[reg] = Some(updated);
+                } else {
+                    close_reg(&mut active[reg], reg, &mut candidates);
+                    active[reg] = Some(Active {
+                        start: i,
+                        end: i,
+                        min_d: disp,
+                        max_end: end_d,
+                        count: 1,
+                        has_write: is_write,
+                        has_simd_mem: is_simd_mem,
+                    });
+                }
+            }
+
+            // If this instruction also wrote its own memory base register (e.g. `mov rdx, [rdx+8]`),
+            // close its burst right AFTER `i` so `i` is the final instruction of the burst.
+            if let Some(r) = mem_base_reg
+                && written_gprs & (1u16 << r) != 0
+            {
+                close_reg(&mut active[r], r, &mut candidates);
+            }
+        }
+        close_all(&mut active, &mut candidates);
+
+        // Pick non-overlapping bursts in program order (preferring earlier start, then larger span).
+        candidates.sort_by_key(|b| (b.start, std::cmp::Reverse(b.end)));
+        let mut chosen: Vec<memory_access::WindowBurst> = Vec::new();
+        let mut last_end: Option<usize> = None;
+        for b in candidates {
+            if last_end.is_none_or(|prev| b.start > prev) {
+                last_end = Some(b.end);
+                chosen.push(b);
+            }
+        }
+        chosen
     }
 
     // ----- operands ------------------------------------------------------------------------------
@@ -1692,10 +1972,14 @@ impl FunctionLifter<'_> {
                     let cz = self.val(&format!("zext i1 {c} to {t}"));
                     let s = self.val(&format!("add {t} {a}, {b}"));
                     let r = self.val(&format!("add {t} {s}, {cz}"));
-                    let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
-                    let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
-                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                    let cf = if self.flag_live(Flag::Cf) {
+                        let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
+                        let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
+                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                        self.val(&format!("or i1 {lt}, {ceq}"))
+                    } else {
+                        String::new()
+                    };
                     (r, cf)
                 };
                 self.set_flag(Flag::Cf, &cf);
@@ -1709,10 +1993,14 @@ impl FunctionLifter<'_> {
                     let cz = self.val(&format!("zext i1 {c} to {t}"));
                     let d = self.val(&format!("sub {t} {a}, {b}"));
                     let r = self.val(&format!("sub {t} {d}, {cz}"));
-                    let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
-                    let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
-                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                    let cf = if self.flag_live(Flag::Cf) {
+                        let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
+                        let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
+                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                        self.val(&format!("or i1 {lt}, {ceq}"))
+                    } else {
+                        String::new()
+                    };
                     (r, cf)
                 } else {
                     let r = self.val(&format!("sub {t} {a}, {b}"));
@@ -1789,12 +2077,18 @@ impl FunctionLifter<'_> {
             _ => {
                 // neg
                 let r = self.val(&format!("sub {t} 0, {a}"));
-                let cf = self.val(&format!("icmp ne {t} {a}, 0"));
-                let of = self.val(&format!("icmp eq {t} {a}, {min}"));
-                let af = self.aux_flag("0", a, &r, bits);
-                self.set_flag(Flag::Cf, &cf);
-                self.set_flag(Flag::Of, &of);
-                self.set_flag(Flag::Af, &af);
+                if self.flag_live(Flag::Cf) {
+                    let cf = self.val(&format!("icmp ne {t} {a}, 0"));
+                    self.set_flag(Flag::Cf, &cf);
+                }
+                if self.flag_live(Flag::Of) {
+                    let of = self.val(&format!("icmp eq {t} {a}, {min}"));
+                    self.set_flag(Flag::Of, &of);
+                }
+                if self.flag_live(Flag::Af) {
+                    let af = self.aux_flag("0", a, &r, bits);
+                    self.set_flag(Flag::Af, &af);
+                }
                 r
             }
         };
@@ -1984,16 +2278,18 @@ impl FunctionLifter<'_> {
                 updates.push((Flag::Pf, pf));
             }
         }
-        if imm_count.is_some() {
-            for (flag, new) in updates {
-                self.set_flag(flag, &new);
-            }
-        } else {
-            let nonzero = self.val(&format!("icmp ne i64 {count}, 0"));
-            for (flag, new) in updates {
-                let old = self.get_flag(flag);
-                let v = self.val(&format!("select i1 {nonzero}, i1 {new}, i1 {old}"));
-                self.set_flag(flag, &v);
+        if !updates.is_empty() {
+            if imm_count.is_some() {
+                for (flag, new) in updates {
+                    self.set_flag(flag, &new);
+                }
+            } else {
+                let nonzero = self.val(&format!("icmp ne i64 {count}, 0"));
+                for (flag, new) in updates {
+                    let old = self.get_flag(flag);
+                    let v = self.val(&format!("select i1 {nonzero}, i1 {new}, i1 {old}"));
+                    self.set_flag(flag, &v);
+                }
             }
         }
         self.write_op(ins, 0, &r, bits)
@@ -2323,6 +2619,129 @@ impl FunctionLifter<'_> {
         self.emit(&format!("br i1 {c}, label %{taken}, label %{not_taken}"));
         Ok(())
     }
+}
+
+/// True if `ins` cannot appear inside a coalesced window burst (control flow, calls, atomics,
+/// fences, trapping/helper instructions, string/stack/masked-vector ops, or bit-test offsets).
+fn is_burst_barrier(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    if ins.code() == Code::INVALID
+        || ins.has_lock_prefix()
+        || ins.is_string_instruction()
+        || is_control_transfer(ins)
+        || ins.is_vsib()
+    {
+        return true;
+    }
+    if ins.mnemonic() == M::Xchg
+        && (ins.op_kind(0) == OpKind::Memory || ins.op_kind(1) == OpKind::Memory)
+    {
+        return true;
+    }
+    matches!(
+        ins.mnemonic(),
+        M::Call
+            | M::Div
+            | M::Idiv
+            | M::Cmpxchg
+            | M::Cmpxchg8b
+            | M::Cmpxchg16b
+            | M::Bt
+            | M::Bts
+            | M::Btr
+            | M::Btc
+            | M::Push
+            | M::Pop
+            | M::Pushfq
+            | M::Popfq
+            | M::Pushf
+            | M::Popf
+            | M::Enter
+            | M::Leave
+            | M::Xlatb
+            | M::Clzero
+            | M::Cpuid
+            | M::Rdtsc
+            | M::Rdtscp
+            | M::Xgetbv
+            | M::Mfence
+            | M::Lfence
+            | M::Sfence
+            | M::Pause
+            | M::Ldmxcsr
+            | M::Vldmxcsr
+            | M::Stmxcsr
+            | M::Vstmxcsr
+            | M::Vmaskmovps
+            | M::Vmaskmovpd
+            | M::Vpmaskmovd
+            | M::Vpmaskmovq
+            | M::Maskmovdqu
+            | M::Emms
+            | M::Int3
+            | M::Ud2
+            | M::Hlt
+    )
+}
+
+/// If `ins` performs a plain `[base64 + disp]` memory access (no index, no `fs:`/`gs:`, not
+/// `rsp` when `stack_flat` is enabled, fixed byte width 1..=32), returns
+/// `(base_gpr_idx, disp, bytes, is_write, is_simd_mem)`.
+fn plain_burst_mem_access(
+    ins: &Instruction,
+    info: &iced_x86::InstructionInfo,
+    stack_flat: bool,
+) -> Option<(usize, i64, usize, bool, bool)> {
+    use Mnemonic as M;
+    if matches!(
+        ins.mnemonic(),
+        M::Lea
+            | M::Nop
+            | M::Endbr64
+            | M::Prefetchnta
+            | M::Prefetcht0
+            | M::Prefetcht1
+            | M::Prefetcht2
+            | M::Prefetchw
+            | M::Prefetchwt1
+            | M::Prefetch
+            | M::Prefetchit0
+            | M::Prefetchit1
+            | M::Clflush
+            | M::Clflushopt
+            | M::Clwb
+            | M::Cldemote
+            | M::Reservednop
+    ) {
+        return None;
+    }
+    let has_mem_op = (0..ins.op_count()).any(|i| ins.op_kind(i) == OpKind::Memory);
+    if !has_mem_op {
+        return None;
+    }
+    let base = ins.memory_base();
+    if !base.is_gpr64() || ins.memory_index() != Register::None {
+        return None;
+    }
+    if matches!(ins.memory_segment(), Register::FS | Register::GS) {
+        return None;
+    }
+    let reg = base.number();
+    if stack_flat && reg == RSP {
+        return None;
+    }
+    let bytes = ins.memory_size().size();
+    if bytes == 0 || bytes > 32 {
+        return None;
+    }
+    let is_write = info.used_memory().iter().any(|m| {
+        matches!(
+            m.access(),
+            OpAccess::Write | OpAccess::CondWrite | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+        )
+    });
+    let is_simd_mem = bytes >= 16 || simd::is_simd(ins);
+    Some((reg, ins.memory_displacement64() as i64, bytes, is_write, is_simd_mem))
 }
 
 /// `{lo, hi} = a * b` (unsigned 64x64 -> 128) built from 32-bit halves, so no `i128` multiply

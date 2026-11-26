@@ -127,6 +127,7 @@ impl FunctionLifter<'_> {
             M::Xgetbv => self.runtime_helper(RuntimeHelper::Xgetbv),
             // Ordering only: one sequentially consistent fence (`atomic.fence` on wasm).
             M::Mfence | M::Lfence | M::Sfence => {
+                self.clear_window_cache();
                 self.support.insert(Support::Atomics);
                 self.emit("fence seq_cst");
                 Ok(())
@@ -134,6 +135,7 @@ impl FunctionLifter<'_> {
             // `pause` marks a spin-wait: a compiler barrier, like every loop header (see
             // `LOOP_BARRIER`).
             M::Pause => {
+                self.clear_window_cache();
                 self.emit(crate::lift::LOOP_BARRIER);
                 Ok(())
             }
@@ -405,6 +407,7 @@ impl FunctionLifter<'_> {
     /// the helper reads/writes the state's GPRs (see the module docs for each contract) and the
     /// registers are reloaded.
     fn runtime_helper(&mut self, helper: RuntimeHelper) -> R<()> {
+        self.clear_window_cache();
         self.support.insert(Support::Helper(helper));
         self.sync_out();
         self.emit(&format!("call void @{}(ptr %state)", helper.symbol()));

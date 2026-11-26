@@ -79,6 +79,7 @@ fn accumulator(bits: u32) -> Register {
 impl FunctionLifter<'_> {
     /// `atomicrmw <op> ptr, iN value seq_cst` (natural alignment); returns the old value.
     pub(super) fn atomic_rmw(&mut self, op: &str, ptr: &str, value: &str, bits: u32) -> String {
+        self.clear_window_cache();
         self.support.insert(Support::Atomics);
         self.val(&format!(
             "atomicrmw {op} ptr {ptr}, i{bits} {value} seq_cst, align {}",
@@ -94,6 +95,7 @@ impl FunctionLifter<'_> {
         new: &str,
         bits: u32,
     ) -> (String, String) {
+        self.clear_window_cache();
         self.support.insert(Support::Atomics);
         let pair = self.val(&format!(
             "cmpxchg ptr {ptr}, i{bits} {expected}, i{bits} {new} seq_cst seq_cst, align {}",
@@ -329,6 +331,7 @@ impl FunctionLifter<'_> {
             let rbx = self.load_gpr(RBX)?;
             let rcx = self.load_gpr(RCX)?;
             if locked {
+                self.clear_window_cache();
                 self.support.insert(Support::Atomics);
                 self.support.insert(Support::Cmpxchg16b);
                 let (ptr, mark) = self.guest_ptr_write(&ea);
@@ -341,7 +344,7 @@ impl FunctionLifter<'_> {
                 let eq = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 2"));
                 (eq, lo, hi)
             } else {
-                let hi_addr = self.val(&format!("add i64 {ea}, 8"));
+                let hi_addr = self.offset_addr(&ea, 8);
                 let lo = self.load_mem(&ea, 64);
                 let hi = self.load_mem(&hi_addr, 64);
                 let lo_eq = self.val(&format!("icmp eq i64 {lo}, {rax}"));

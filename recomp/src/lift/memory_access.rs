@@ -2,6 +2,10 @@
 //! `lift/memory.rs`). With [`MemoryModel::Base`] every function here emits exactly the IR the
 //! lifter emitted before the table models existed.
 
+use std::collections::BTreeMap;
+
+use iced_x86::Instruction;
+
 use super::{FunctionLifter, R, imm};
 use crate::lift::memory::{
     Decl, HELPER_GUEST_MEMMOVE, HELPER_GUEST_MEMSET, HELPER_GUEST_READ, MemoryModel,
@@ -9,6 +13,74 @@ use crate::lift::memory::{
     WindowCheck, helper_value_type, slow_store_helper, window_helper,
 };
 use crate::lift::{GuestBase, Support};
+
+/// Maximum cumulative displacement from `rsp` allowed when propagating stack-pointer provenance
+/// through non-`rsp` base registers (e.g. frame pointers `mov rbp, rsp; mov [rbp - 0x20], rax`).
+pub(super) const STACK_FRAME_MAX_DISP: i64 = 0x10_0000;
+
+/// Maximum span (in bytes) of a coalesced same-base window burst.
+pub(super) const BURST_MAX_SPAN: u64 = 4096;
+
+/// If `addr` is a lift-time constant integer literal (e.g. a RIP-relative global address from
+/// `FunctionLifter::address`), returns its 64-bit guest VA.
+pub(super) fn const_addr(addr: &str) -> Option<u64> {
+    addr.parse::<i64>().ok().map(|v| v as u64)
+}
+
+/// Cached translation of a dynamic address from a prior `guest_load` in the same basic block
+/// (`WindowCheck::Branch` with `contiguous_runs`): lets an immediate read-modify-write store
+/// (e.g. `add [rcx], rax`) or repeated load reuse `delta`, `inside`, `rel`, and `ptr` without a
+/// second window range check or table lookup. Cleared on block boundaries and any call/atomic/fence.
+#[derive(Clone)]
+pub(super) struct CachedWindowAddr {
+    pub(super) addr: String,
+    pub(super) inside: String,
+    pub(super) rel: String,
+    pub(super) ptr: String,
+}
+
+/// How `[burst.reg + disp]` accesses are lowered while inside a coalesced burst.
+#[derive(Clone)]
+pub(super) enum BurstMode {
+    /// 99.95% hot path: all bytes are flat or in one 64 KiB window slot; translate via
+    /// `base_host + disp` with zero branches or table loads.
+    Fast { base_host: String, saw_store: bool },
+    /// 0.05% cold boundary-crossing fallback: route through compact cold runtime helpers
+    /// (`__playgta6_guest_read` / `__playgta6_slow_storeN`) so the fallback adds minimal IR.
+    Slow,
+}
+
+/// Active override for a coalesced same-base burst (`[base + d_i]`).
+#[derive(Clone)]
+pub(super) struct BurstOverride {
+    /// 64-bit GPR index of the burst's base register.
+    pub(super) reg: usize,
+    /// Fast vs cold-slow lowering mode.
+    pub(super) mode: BurstMode,
+    /// Proven inclusive lower displacement relative to `reg`.
+    pub(super) min_d: i64,
+    /// Proven exclusive upper displacement relative to `reg`.
+    pub(super) max_end: i64,
+    /// Guest address SSA values emitted by `address()` for `[reg + disp]` -> `disp`.
+    pub(super) addrs: BTreeMap<String, i64>,
+}
+
+/// One same-base access burst detected in a basic block's instruction list.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct WindowBurst {
+    /// First instruction index in `body` (inclusive).
+    pub(super) start: usize,
+    /// Last instruction index in `body` (inclusive).
+    pub(super) end: usize,
+    /// 64-bit GPR index of the shared base register.
+    pub(super) reg: usize,
+    /// Minimum displacement relative to `reg`.
+    pub(super) min_d: i64,
+    /// Maximum `disp + access_bytes` relative to `reg`.
+    pub(super) max_end: i64,
+    /// Whether any instruction in the burst writes through `reg`.
+    pub(super) has_write: bool,
+}
 
 /// `!prof` of a branch whose first successor is rarely taken.
 pub(super) const UNLIKELY: &str = "!prof !{!\"branch_weights\", i32 1, i32 2000}";
@@ -98,7 +170,7 @@ impl FunctionLifter<'_> {
         self.emit(&format!(
             "br i1 {clean}, label %{set}, label %{done}, {UNLIKELY}"
         ));
-        self.start_block(&set);
+        self.start_internal_block(&set);
         self.emit(&format!("store atomic i8 1, ptr {m} release, align 1"));
         self.emit(&format!("br label %{done}"));
     }
@@ -107,7 +179,7 @@ impl FunctionLifter<'_> {
     fn window_mark(&mut self, index: &str) {
         let done = self.new_label("gmd");
         self.window_mark_then_br(index, &done);
-        self.start_block(&done);
+        self.start_internal_block(&done);
     }
 
     /// O37: [`Self::guest_ptr`] for an access that writes (atomics, `lock`ed bit operations).
@@ -118,8 +190,16 @@ impl FunctionLifter<'_> {
     pub(super) fn guest_ptr_write(&mut self, addr: &str) -> (String, WriteMark) {
         match self.memory {
             MemoryModel::Windowed(w)
-                if !(self.stack_flat().is_some() && self.stack_values.contains(addr)) =>
+                if !(self.stack_flat().is_some() && self.stack_values.contains_key(addr)) =>
             {
+                if let Some(va) = const_addr(addr) {
+                    let rel = va.wrapping_sub(w.base);
+                    if rel >= w.size {
+                        return (self.guest_ptr(addr), WriteMark::None);
+                    }
+                    let slot = imm(rel >> SLOT_SHIFT, 64);
+                    return (self.guest_ptr(addr), WriteMark::Always(slot));
+                }
                 let (inside, rel) = self.window_test(addr, w);
                 let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
                 let spare = w.size >> SLOT_SHIFT;
@@ -147,9 +227,9 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {inside}, label %{mark_block}, label %{cont}, {UNLIKELY}"
                 ));
-                self.start_block(&mark_block);
+                self.start_internal_block(&mark_block);
                 self.window_mark_then_br(&index, &cont);
-                self.start_block(&cont);
+                self.start_internal_block(&cont);
             }
         }
     }
@@ -159,14 +239,31 @@ impl FunctionLifter<'_> {
     pub(super) fn guest_ptr(&mut self, addr: &str) -> String {
         let host = match self.memory {
             MemoryModel::Base(base) => self.flat_host(addr, base),
-            _ if self.stack_flat().is_some() && self.stack_values.contains(addr) => {
+            _ if self.stack_flat().is_some() && self.stack_values.contains_key(addr) => {
                 let base = self.stack_flat().unwrap_or_default();
                 self.flat_host(addr, base)
             }
             MemoryModel::PageTable { pages, .. } => {
-                let index = self.page_index(addr, pages);
+                let index = if let Some(va) = const_addr(addr) {
+                    self.support.insert(Support::Memory(Decl::PageTable));
+                    imm((va >> SLOT_SHIFT).min(pages), 64)
+                } else {
+                    self.page_index(addr, pages)
+                };
                 let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
                 self.val(&format!("add i64 {addr}, {delta}"))
+            }
+            MemoryModel::Windowed(w) if const_addr(addr).is_some() => {
+                let va = const_addr(addr).unwrap();
+                let rel = va.wrapping_sub(w.base);
+                if rel >= w.size {
+                    self.flat_host(addr, w.flat)
+                } else {
+                    self.support.insert(Support::Memory(Decl::WindowTable));
+                    let slot = imm(rel >> SLOT_SHIFT, 64);
+                    let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
+                    self.val(&format!("add i64 {addr}, {delta}"))
+                }
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
                 let (_, delta) = self.window_select_delta(addr, w);
@@ -181,11 +278,11 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                 ));
-                self.start_block(&win);
+                self.start_internal_block(&win);
                 let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
                 let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 let delta = self.val(&format!(
                     "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{win} ]"
                 ));
@@ -308,18 +405,78 @@ impl FunctionLifter<'_> {
     }
 
     fn guest_access(&mut self, addr: &str, bytes: u64, access: Access<'_>) -> Option<String> {
+        if let Some(burst) = &mut self.burst_override
+            && let Some(&disp) = burst.addrs.get(addr)
+            && disp >= burst.min_d
+            && disp
+                .checked_add(bytes as i64)
+                .is_some_and(|end| end <= burst.max_end)
+        {
+            match &mut burst.mode {
+                BurstMode::Fast {
+                    base_host,
+                    saw_store,
+                } => {
+                    let base_host = base_host.clone();
+                    if matches!(access, Access::Store { .. }) {
+                        *saw_store = true;
+                    }
+                    let host = if disp == 0 {
+                        base_host
+                    } else {
+                        self.val(&format!("add i64 {base_host}, {}", imm(disp as u64, 64)))
+                    };
+                    let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    return self.access_at(&ptr, &access);
+                }
+                BurstMode::Slow => {
+                    return match access {
+                        Access::Load { .. } => {
+                            let ptr = self.slow_read_ptr(addr, bytes);
+                            self.access_at(&ptr, &access)
+                        }
+                        Access::Store { ty, value } => {
+                            self.slow_store(addr, bytes, ty, value);
+                            None
+                        }
+                    };
+                }
+            }
+        }
         match self.memory {
             MemoryModel::Base(_) => {
                 let ptr = self.guest_ptr(addr);
                 self.access_at(&ptr, &access)
             }
-            _ if self.stack_flat().is_some() && self.stack_values.contains(addr) => {
+            _ if self.stack_flat().is_some() && self.stack_values.contains_key(addr) => {
                 let base = self.stack_flat().unwrap_or_default();
                 let host = self.flat_host(addr, base);
                 let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                 self.access_at(&ptr, &access)
             }
             MemoryModel::PageTable { pages, .. } => {
+                if let Some(va) = const_addr(addr) {
+                    let offset = va & (SLOT_BYTES - 1);
+                    let straddles = bytes > 1 && offset > SLOT_BYTES - bytes;
+                    if straddles && !self.contiguous_runs() {
+                        return match access {
+                            Access::Load { .. } => {
+                                let ptr = self.slow_read_ptr(addr, bytes);
+                                self.access_at(&ptr, &access)
+                            }
+                            Access::Store { ty, value } => {
+                                self.slow_store(addr, bytes, ty, value);
+                                None
+                            }
+                        };
+                    }
+                    self.support.insert(Support::Memory(Decl::PageTable));
+                    let index = imm((va >> SLOT_SHIFT).min(pages), 64);
+                    let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
+                    let host = self.val(&format!("add i64 {addr}, {delta}"));
+                    let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    return self.access_at(&ptr, &access);
+                }
                 if bytes <= 1 || self.contiguous_runs() {
                     let index = self.page_index(addr, pages);
                     let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
@@ -335,7 +492,7 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {fits}, label %{fast}, label %{slow}, {LIKELY}"
                 ));
-                self.start_block(&fast);
+                self.start_internal_block(&fast);
                 let index = self.page_index(addr, pages);
                 let delta = self.table_delta(PAGE_TABLE_SYMBOL, &index);
                 let host = self.val(&format!("add i64 {addr}, {delta}"));
@@ -344,7 +501,7 @@ impl FunctionLifter<'_> {
                     self.access_at(&p_fast, &access);
                 }
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&slow);
+                self.start_internal_block(&slow);
                 let p_slow = match access {
                     Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
                     Access::Store { ty, value } => {
@@ -353,7 +510,7 @@ impl FunctionLifter<'_> {
                     }
                 };
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 if let Some(p_slow) = p_slow {
                     let ptr = self.val(&format!(
                         "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
@@ -362,6 +519,10 @@ impl FunctionLifter<'_> {
                 } else {
                     None
                 }
+            }
+            MemoryModel::Windowed(w) if const_addr(addr).is_some() => {
+                let va = const_addr(addr).unwrap();
+                self.const_window_access(addr, va, bytes, w, &access)
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
                 let (inside, delta) = self.window_select_delta(addr, w);
@@ -384,7 +545,7 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {slow_cond}, label %{slow}, label %{fast}, {UNLIKELY}"
                 ));
-                self.start_block(&fast);
+                self.start_internal_block(&fast);
                 let host = self.val(&format!("add i64 {addr}, {delta}"));
                 let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
                 if let Access::Store { .. } = access {
@@ -392,7 +553,7 @@ impl FunctionLifter<'_> {
                     self.select_marks(&inside, addr, w, 1);
                 }
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&slow);
+                self.start_internal_block(&slow);
                 let p_slow = match access {
                     Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
                     Access::Store { ty, value } => {
@@ -401,7 +562,7 @@ impl FunctionLifter<'_> {
                     }
                 };
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 if let Some(p_slow) = p_slow {
                     let ptr = self.val(&format!(
                         "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
@@ -419,15 +580,15 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {inside}, label %{win}, label %{flat}, {UNLIKELY}"
                 ));
-                self.start_block(&flat);
+                self.start_internal_block(&flat);
                 let host = self.flat_host(addr, w.flat);
                 let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                 let v_flat = self.access_at(&ptr, &access);
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&win);
+                self.start_internal_block(&win);
                 let v_win = self.window_outlined(addr, bytes, w.base, &access);
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 match (access, v_flat, v_win) {
                     (Access::Load { ty }, Some(vf), Some(vw)) => {
                         Some(self.val(&format!("phi {ty} [ {vf}, %{flat} ], [ {vw}, %{win} ]")))
@@ -436,10 +597,33 @@ impl FunctionLifter<'_> {
                 }
             }
             MemoryModel::Windowed(w) if matches!(access, Access::Store { .. }) => {
+                if (bytes <= 1 || self.contiguous_runs())
+                    && let Some(cached) = self.window_load_cache.clone()
+                    && cached.addr == addr
+                {
+                    self.access_at(&cached.ptr, &access);
+                    let mark_block = self.new_label("gm");
+                    let join = self.new_label("gj");
+                    self.emit(&format!(
+                        "br i1 {}, label %{mark_block}, label %{join}, {UNLIKELY}",
+                        cached.inside
+                    ));
+                    self.start_internal_block(&mark_block);
+                    let index = self.val(&format!("lshr i64 {}, {SLOT_SHIFT}", cached.rel));
+                    self.emit_window_store_marks(&index, &cached.rel, bytes, &join);
+                    self.start_internal_block(&join);
+                    return None;
+                }
                 self.window_store(addr, bytes, w, &access);
                 None
             }
             MemoryModel::Windowed(w) => {
+                if (bytes <= 1 || self.contiguous_runs())
+                    && let Some(cached) = self.window_load_cache.clone()
+                    && cached.addr == addr
+                {
+                    return self.access_at(&cached.ptr, &access);
+                }
                 let (inside, rel) = self.window_test(addr, w);
                 let pred = self.current_block.clone();
                 let flat_base = self.flat_base_val(w.flat);
@@ -449,16 +633,22 @@ impl FunctionLifter<'_> {
                     self.emit(&format!(
                         "br i1 {inside}, label %{win}, label %{join}, {UNLIKELY}"
                     ));
-                    self.start_block(&win);
+                    self.start_internal_block(&win);
                     let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
                     let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
                     self.emit(&format!("br label %{join}"));
-                    self.start_block(&join);
+                    self.start_internal_block(&join);
                     let delta = self.val(&format!(
                         "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{win} ]"
                     ));
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    self.window_load_cache = Some(CachedWindowAddr {
+                        addr: addr.to_string(),
+                        inside,
+                        rel,
+                        ptr: ptr.clone(),
+                    });
                     return self.access_at(&ptr, &access);
                 }
                 let win = self.new_label("gw");
@@ -469,17 +659,17 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {inside}, label %{win}, label %{fast}, {UNLIKELY}"
                 ));
-                self.start_block(&win);
+                self.start_internal_block(&win);
                 let offset = self.val(&format!("and i64 {addr}, {}", SLOT_BYTES - 1));
                 let fits = self.val(&format!("icmp ule i64 {offset}, {}", SLOT_BYTES - bytes));
                 self.emit(&format!(
                     "br i1 {fits}, label %{wtbl}, label %{slow}, {LIKELY}"
                 ));
-                self.start_block(&wtbl);
+                self.start_internal_block(&wtbl);
                 let index = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
                 let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
                 self.emit(&format!("br label %{fast}"));
-                self.start_block(&fast);
+                self.start_internal_block(&fast);
                 let delta = self.val(&format!(
                     "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{wtbl} ]"
                 ));
@@ -489,7 +679,7 @@ impl FunctionLifter<'_> {
                     self.access_at(&p_fast, &access);
                 }
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&slow);
+                self.start_internal_block(&slow);
                 let p_slow = match access {
                     Access::Load { .. } => Some(self.slow_read_ptr(addr, bytes)),
                     Access::Store { ty, value } => {
@@ -498,7 +688,7 @@ impl FunctionLifter<'_> {
                     }
                 };
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 if let Some(p_slow) = p_slow {
                     let ptr = self.val(&format!(
                         "phi ptr [ {p_fast}, %{fast} ], [ {p_slow}, %{slow} ]"
@@ -508,6 +698,79 @@ impl FunctionLifter<'_> {
                     None
                 }
             }
+        }
+    }
+
+    /// R58: guest access to a lift-time constant VA under [`MemoryModel::Windowed`].
+    /// - Outside `[w.base, w.base + w.size)` (all `[rip + disp]` executable globals): direct flat
+    ///   translation with zero window check, branch, table load, or dirty mark.
+    /// - Inside `[w.base, w.base + w.size)`: direct slot lookup (or direct slow path if straddling
+    ///   when `!contiguous_runs`), with static `last_slot != slot_idx` crossing check on stores.
+    fn const_window_access(
+        &mut self,
+        addr: &str,
+        va: u64,
+        bytes: u64,
+        w: Window,
+        access: &Access<'_>,
+    ) -> Option<String> {
+        let rel = va.wrapping_sub(w.base);
+        if rel >= w.size {
+            let host = self.flat_host(addr, w.flat);
+            let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+            return self.access_at(&ptr, access);
+        }
+        let offset = va & (SLOT_BYTES - 1);
+        let straddles = bytes > 1 && offset > SLOT_BYTES - bytes;
+        if straddles && !self.contiguous_runs() {
+            return match *access {
+                Access::Load { .. } => {
+                    let ptr = self.slow_read_ptr(addr, bytes);
+                    self.access_at(&ptr, access)
+                }
+                Access::Store { ty, value } => {
+                    self.slow_store(addr, bytes, ty, value);
+                    None
+                }
+            };
+        }
+        self.support.insert(Support::Memory(Decl::WindowTable));
+        let slot_idx = rel >> SLOT_SHIFT;
+        let slot_imm = imm(slot_idx, 64);
+        let delta = self.table_delta(WINDOW_TABLE_SYMBOL, &slot_imm);
+        let host = self.val(&format!("add i64 {addr}, {delta}"));
+        let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+        let v = self.access_at(&ptr, access);
+        if matches!(access, Access::Store { .. }) {
+            self.window_mark(&slot_imm);
+            if bytes > 1 && self.contiguous_runs() {
+                let last_slot = rel.wrapping_add(bytes - 1) >> SLOT_SHIFT;
+                if last_slot != slot_idx {
+                    self.window_mark(&imm(last_slot, 64));
+                }
+            }
+        }
+        v
+    }
+
+    /// Emits the dirty mark(s) for a confirmed in-window store and branches to `join`.
+    fn emit_window_store_marks(&mut self, index: &str, rel: &str, bytes: u64, join: &str) {
+        if bytes > 1 && self.contiguous_runs() {
+            self.window_mark(index);
+            // The slot of the last byte needs its own mark only when the store crosses into it
+            // (rare). Re-marking the same slot is an extra dirty check/mark that the consumer
+            // cannot tell apart from the first: skip it behind a cold branch.
+            let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
+            let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
+            let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
+            let mark_last = self.new_label("gm");
+            self.emit(&format!(
+                "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
+            ));
+            self.start_internal_block(&mark_last);
+            self.window_mark_then_br(&last_index, join);
+        } else {
+            self.window_mark_then_br(index, join);
         }
     }
 
@@ -524,12 +787,12 @@ impl FunctionLifter<'_> {
         self.emit(&format!(
             "br i1 {inside}, label %{win}, label %{flat}, {UNLIKELY}"
         ));
-        self.start_block(&flat);
+        self.start_internal_block(&flat);
         let host_flat = self.flat_host(addr, w.flat);
         let p_flat = self.val(&format!("inttoptr i64 {host_flat} to ptr"));
         self.access_at(&p_flat, access);
         self.emit(&format!("br label %{join}"));
-        self.start_block(&win);
+        self.start_internal_block(&win);
         let straddle_checked = bytes > 1 && !self.contiguous_runs();
         let slow = if straddle_checked {
             let table = self.new_label("gt");
@@ -539,7 +802,7 @@ impl FunctionLifter<'_> {
             self.emit(&format!(
                 "br i1 {fits}, label %{table}, label %{slow}, {LIKELY}"
             ));
-            self.start_block(&table);
+            self.start_internal_block(&table);
             Some(slow)
         } else {
             None
@@ -549,29 +812,13 @@ impl FunctionLifter<'_> {
         let host = self.val(&format!("add i64 {addr}, {delta}"));
         let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
         self.access_at(&ptr, access);
-        if bytes > 1 && self.contiguous_runs() {
-            self.window_mark(&index);
-            // The slot of the last byte needs its own mark only when the store crosses into it
-            // (rare). Re-marking the same slot is an extra dirty check/mark that the consumer
-            // cannot tell apart from the first: skip it behind a cold branch.
-            let last = self.val(&format!("add i64 {rel}, {}", bytes - 1));
-            let last_index = self.val(&format!("lshr i64 {last}, {SLOT_SHIFT}"));
-            let crosses = self.val(&format!("icmp ne i64 {last_index}, {index}"));
-            let mark_last = self.new_label("gm");
-            self.emit(&format!(
-                "br i1 {crosses}, label %{mark_last}, label %{join}, {UNLIKELY}"
-            ));
-            self.start_block(&mark_last);
-            self.window_mark_then_br(&last_index, &join);
-        } else {
-            self.window_mark_then_br(&index, &join);
-        }
+        self.emit_window_store_marks(&index, &rel, bytes, &join);
         if let (Some(slow), Access::Store { ty, value }) = (slow, access) {
-            self.start_block(&slow);
+            self.start_internal_block(&slow);
             self.slow_store(addr, bytes, ty, value);
             self.emit(&format!("br label %{join}"));
         }
-        self.start_block(&join);
+        self.start_internal_block(&join);
     }
 
     /// O37: marks of a store under the branch-free window check: the slot (the spare entry
@@ -611,10 +858,215 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// Notes that `value` is a stack-pointer-relative guest address (see `stack_flat`).
-    pub(super) fn note_stack_value(&mut self, value: &str) {
+    /// Notes that `value` is a stack-pointer-relative guest address at `disp` bytes from `rsp`
+    /// (see `stack_flat`).
+    pub(super) fn note_stack_value(&mut self, value: &str, disp: i64) {
         if self.stack_flat().is_some() {
-            self.stack_values.insert(value.to_string());
+            self.stack_values.insert(value.to_string(), disp);
+        }
+    }
+
+    /// Propagates bounded stack-pointer provenance from `base` to `derived = base + delta`
+    /// (e.g. frame-pointer `[rbp - disp]` or high-half AVX `[rsp + disp + 16]`).
+    pub(super) fn propagate_stack_offset(&mut self, base: &str, derived: &str, delta: i64) {
+        if self.stack_flat().is_none() {
+            return;
+        }
+        if let Some(&base_disp) = self.stack_values.get(base)
+            && let Some(total) = base_disp.checked_add(delta)
+            && total.abs() <= STACK_FRAME_MAX_DISP
+        {
+            self.stack_values.insert(derived.to_string(), total);
+        }
+    }
+
+    /// R58: lifts a coalesced same-base window burst (`insns = body[burst.start..=burst.end]`)
+    /// under `WindowCheck::Branch` with a single range/page check for the entire span
+    /// `[reg + min_d, reg + max_end)`:
+    /// - Fast path (flat outside `[W, W+S)`, or single 64 KiB window slot): one `delta`, direct
+    ///   `base_host + disp` accesses with zero intervening branches/table loads, and at most one
+    ///   dirty mark after all stores.
+    /// - Cold fallback (span straddles `W`, `W+S`, or a 64 KiB slot boundary inside the window):
+    ///   exact per-access lifting.
+    ///
+    /// Returns `Ok(true)` if the burst was lifted, or `Ok(false)` (with state rolled back) if any
+    /// instruction in the burst is unsupported so the caller can fall back instruction-by-instruction.
+    pub(super) fn lift_window_burst(
+        &mut self,
+        burst: WindowBurst,
+        insns: &[Instruction],
+    ) -> R<bool> {
+        let MemoryModel::Windowed(w) = self.memory else {
+            return Ok(false);
+        };
+        if w.check != WindowCheck::Branch {
+            return Ok(false);
+        }
+        let Some(span) = burst
+            .max_end
+            .checked_sub(burst.min_d)
+            .and_then(|s| u64::try_from(s).ok())
+        else {
+            return Ok(false);
+        };
+        if span == 0 || span > BURST_MAX_SPAN {
+            return Ok(false);
+        }
+        let span_m1 = span - 1;
+        if w.base < span_m1
+            || w.size > u64::MAX - span_m1
+            || (w.base & (SLOT_BYTES - 1)) != 0
+            || (w.size & (SLOT_BYTES - 1)) != 0
+        {
+            return Ok(false);
+        }
+        // If `burst.reg` is already known to be stack-flat, individual accesses already skip the
+        // window check with zero overhead.
+        if self.stack_flat().is_some()
+            && self
+                .known_gpr(burst.reg)
+                .is_some_and(|v| self.stack_values.contains_key(v))
+        {
+            return Ok(false);
+        }
+
+        let checkpoint = self.checkpoint();
+        let result: R<()> = (|| {
+            let base_val = self.load_gpr(burst.reg)?;
+            let entry_known = self.known.clone();
+            let lo = if burst.min_d == 0 {
+                base_val.clone()
+            } else {
+                self.val(&format!(
+                    "add i64 {base_val}, {}",
+                    imm(burst.min_d as u64, 64)
+                ))
+            };
+            self.support.insert(Support::Memory(Decl::WindowTable));
+            let ext_base = w.base - span_m1;
+            let ext_size = w.size + span_m1;
+            let rel_ext = self.val(&format!("sub i64 {lo}, {}", imm(ext_base, 64)));
+            let touches = self.val(&format!("icmp ult i64 {rel_ext}, {}", imm(ext_size, 64)));
+            let pred = self.current_block.clone();
+            let flat_base = self.flat_base_val(w.flat);
+            let win = self.new_label("gbw");
+            let wtbl = self.new_label("gbt");
+            let fast = self.new_label("gbf");
+            let slow = self.new_label("gbs");
+            let join = self.new_label("gbj");
+            self.emit(&format!(
+                "br i1 {touches}, label %{win}, label %{fast}, {UNLIKELY}"
+            ));
+
+            // Window check: all bytes lie in one 64 KiB slot inside [W, W + S).
+            self.start_internal_block(&win);
+            let rel = self.val(&format!("sub i64 {lo}, {}", imm(w.base, 64)));
+            let in_win = self.val(&format!("icmp ult i64 {rel}, {}", imm(w.size, 64)));
+            let off = self.val(&format!("and i64 {lo}, {}", SLOT_BYTES - 1));
+            let fits = self.val(&format!("icmp ule i64 {off}, {}", (SLOT_BYTES - 1) - span_m1));
+            let ok = self.val(&format!("and i1 {in_win}, {fits}"));
+            self.emit(&format!(
+                "br i1 {ok}, label %{wtbl}, label %{slow}, {LIKELY}"
+            ));
+
+            self.start_internal_block(&wtbl);
+            let slot = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+            let delta_win = self.table_delta(WINDOW_TABLE_SYMBOL, &slot);
+            self.emit(&format!("br label %{fast}"));
+
+            // Fast path: flat outside window OR single window slot.
+            self.start_internal_block(&fast);
+            self.known = entry_known.clone();
+            self.clear_window_cache();
+            let delta = self.val(&format!(
+                "phi i64 [ {flat_base}, %{pred} ], [ {delta_win}, %{wtbl} ]"
+            ));
+            let (is_win, win_slot) = if burst.has_write {
+                let iw = self.val(&format!("phi i1 [ false, %{pred} ], [ true, %{wtbl} ]"));
+                let ws = self.val(&format!("phi i64 [ 0, %{pred} ], [ {slot}, %{wtbl} ]"));
+                (Some(iw), Some(ws))
+            } else {
+                (None, None)
+            };
+            let base_host = self.val(&format!("add i64 {base_val}, {delta}"));
+            self.burst_override = Some(BurstOverride {
+                reg: burst.reg,
+                mode: BurstMode::Fast {
+                    base_host,
+                    saw_store: false,
+                },
+                min_d: burst.min_d,
+                max_end: burst.max_end,
+                addrs: BTreeMap::new(),
+            });
+            for ins in insns {
+                self.ea = None;
+                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                let r = self.lift_instruction(ins);
+                self.dead_flags = 0;
+                r?;
+            }
+            let fast_known = self.known.clone();
+            let saw_store = matches!(
+                self.burst_override.take().map(|b| b.mode),
+                Some(BurstMode::Fast { saw_store: true, .. })
+            );
+            if saw_store
+                && let (Some(iw), Some(ws)) = (is_win, win_slot)
+            {
+                let mark = self.new_label("gbm");
+                self.emit(&format!(
+                    "br i1 {iw}, label %{mark}, label %{join}, {UNLIKELY}"
+                ));
+                self.start_internal_block(&mark);
+                self.window_mark_then_br(&ws, &join);
+            } else {
+                self.emit(&format!("br label %{join}"));
+            }
+
+            // Cold fallback: span crosses W, W+S, or a 64 KiB window slot boundary. Route the
+            // burst's `[reg + disp]` accesses through compact cold runtime helpers (`guest_read` /
+            // `slow_storeN`) so the fallback adds minimal IR and handles arbitrary straddles.
+            self.start_internal_block(&slow);
+            self.known = entry_known.clone();
+            self.clear_window_cache();
+            self.burst_override = Some(BurstOverride {
+                reg: burst.reg,
+                mode: BurstMode::Slow,
+                min_d: burst.min_d,
+                max_end: burst.max_end,
+                addrs: BTreeMap::new(),
+            });
+            for ins in insns {
+                self.ea = None;
+                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                let r = self.lift_instruction(ins);
+                self.dead_flags = 0;
+                r?;
+            }
+            let slow_known = self.known.clone();
+            self.burst_override = None;
+            self.emit(&format!("br label %{join}"));
+
+            // Join block: preserve `entry_known` for registers/flags untouched by both arms (keeps
+            // stack provenance like frame pointers intact across bursts), and clear modified ones
+            // so `mem2reg` merges them via allocas.
+            self.start_block(&join);
+            self.restore_unchanged_known(&entry_known, &fast_known, &slow_known);
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => Ok(true),
+            Err(super::InsnError::Cfg(err)) => {
+                self.burst_override = None;
+                Err(super::InsnError::Cfg(err))
+            }
+            Err(super::InsnError::Unsupported(_)) => {
+                self.burst_override = None;
+                self.rollback(checkpoint);
+                Ok(false)
+            }
         }
     }
 
@@ -701,7 +1153,7 @@ impl FunctionLifter<'_> {
                 self.emit(&format!(
                     "br i1 {touches}, label %{slow}, label %{fast}, {UNLIKELY}"
                 ));
-                self.start_block(&fast);
+                self.start_internal_block(&fast);
                 let mut ptrs = Vec::new();
                 for a in addrs {
                     let host = self.flat_host(a, w.flat);
@@ -709,10 +1161,10 @@ impl FunctionLifter<'_> {
                 }
                 emit(self, Some(&ptrs));
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&slow);
+                self.start_internal_block(&slow);
                 emit(self, None);
                 self.emit(&format!("br label %{join}"));
-                self.start_block(&join);
+                self.start_internal_block(&join);
                 Ok(true)
             }
         }

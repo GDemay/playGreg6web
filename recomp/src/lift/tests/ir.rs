@@ -1080,23 +1080,23 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
     assert_eq!(ir.matches("br label %ret_epilog").count(), 2, "{ir}");
 
     // Compact windowed accesses: 2 non-stack loads -> 2 `align 1` loads total (not 6!),
-    // 2 non-stack stores -> one `align 1` store on the flat and one on the window path each
-    // (O37/R57: the window path checks its dirty slot with a monotonic load before the cold
-    // release store) + outlined cold slow_store helpers.
+    // 2 coalesced same-base stores (`[rdx]`, `[rdx+8]`) -> 2 fast `align 1` stores sharing one
+    // O37/R57 guarded dirty mark (1 monotonic load + 1 cold release store) + outlined cold
+    // slow_store helpers for the boundary-crossing fallback.
     assert_eq!(
         fn_ir.matches(", align 1\n").count(),
-        10,
-        "2 loads + 2 x 2 stores + 2 mark loads + 2 mark stores = 10 align-1 accesses total:\n{fn_ir}"
+        6,
+        "2 loads + 2 coalesced stores + 1 mark load + 1 mark store = 6 align-1 accesses total:\n{fn_ir}"
     );
     assert_eq!(
         fn_ir.matches("load atomic i8, ptr ").count(),
-        2,
-        "each window store checks its dirty slot before storing:\n{fn_ir}"
+        1,
+        "coalesced same-base window stores share one dirty-slot check:\n{fn_ir}"
     );
     assert_eq!(
         fn_ir.matches("store atomic i8 1, ptr ").count(),
-        2,
-        "each window store marks its slot:\n{fn_ir}"
+        1,
+        "coalesced same-base window stores share one dirty-slot mark:\n{fn_ir}"
     );
     assert!(
         ir.contains("define internal void @__playgta6_slow_store8(i64 noundef %va, i64 noundef %v) unnamed_addr noinline cold #0 {"),
