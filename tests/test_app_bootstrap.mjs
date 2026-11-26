@@ -6787,3 +6787,276 @@ test('Orch-13 viewport metrics (300x150 fallback + DPR clamp), initPayload devic
     await detachedApp.destroy();
   }
 });
+
+test('Orch-23 FIRST_VISIBLE_FRAME anchor presets pass startOn FIRST_VISIBLE_FRAME and activate on notifyFirstVisibleFrame()', async () => {
+  for (const preset of ['chrome-to-ingame', 'chrome-menu-flow-6', 'menu-to-ingame']) {
+    const clock = createClock(50000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const hud = createMockHud();
+
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.location = {
+      origin: 'https://playgta6.local',
+      search: `?inputScript=${preset}`,
+    };
+
+    const mockWorker = createFakeEventTarget({
+      postMessage() {},
+      terminate() {},
+    });
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+      canvas: webgpu.canvas,
+      hud,
+      now: clock.now,
+      raf: raf.raf,
+      cancelRaf: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      inputScriptOptions: {
+        nowFn: clock.now,
+        setIntervalFn: timers.setInterval,
+        clearIntervalFn: timers.clearInterval,
+      },
+      createWasmWorker() {
+        return mockWorker;
+      },
+    });
+
+    try {
+      const startScriptCalls = [];
+      const origStartScript = app.inputBridge.startScript.bind(app.inputBridge);
+      app.inputBridge.startScript = (...args) => {
+        startScriptCalls.push(args);
+        return origStartScript(...args);
+      };
+
+      const started = await app.start();
+      assert.equal(started.ok, true);
+      assert.equal(startScriptCalls.length, 1);
+      assert.equal(startScriptCalls[0][0], preset);
+      assert.equal(
+        startScriptCalls[0][1]?.startOn,
+        'FIRST_VISIBLE_FRAME',
+        `${preset} must pass startOn: 'FIRST_VISIBLE_FRAME'`
+      );
+
+      // Before FIRST_VISIBLE_FRAME, script is armed/pending and does NOT fire inputs yet.
+      assert.equal(app.inputBridge.getScriptState().active, false);
+      assert.equal(app.inputBridge.getStats().scriptPending, true);
+      assert.equal(app.getDiagnosticsSnapshot().inputScript, preset);
+      clock.advance(1000);
+      timers.tickAll();
+      assert.equal(app.inputBridge.getScriptState().scriptedPressesSent, 0);
+
+      // Triggering FIRST_VISIBLE_FRAME activates the anchored script reliably.
+      app.notifyFirstVisibleFrame({ source: 'test-visible-frame' });
+      assert.equal(app.inputBridge.getScriptState().active, true);
+      assert.equal(app.inputBridge.getStats().scriptPending, false);
+      assert.equal(app.inputBridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+
+      // Advancing past initial +500ms FIRST_VISIBLE_FRAME A press emits scripted inputs.
+      clock.advance(600);
+      timers.tickAll();
+      assert.ok(
+        app.inputBridge.getScriptState().scriptedPressesSent > 0,
+        `${preset} must send scripted inputs after notifyFirstVisibleFrame()`
+      );
+    } finally {
+      await app.destroy();
+    }
+  }
+});
+
+test('Orch-23 explicit inputScriptOptions.startOn override is respected and stop() cancels pending anchored scripts', async () => {
+  const clock = createClock(60000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = {
+    origin: 'https://playgta6.local',
+    search: '?inputScript=chrome-to-ingame',
+  };
+
+  // 1. Explicit startOn: 'immediate' override is preserved.
+  const appImmediate = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    inputScriptOptions: { startOn: 'immediate' },
+    createWasmWorker: () => createFakeEventTarget({ postMessage() {}, terminate() {} }),
+  });
+
+  try {
+    assert.equal((await appImmediate.start()).ok, true);
+    assert.equal(appImmediate.inputBridge.getScriptState().active, true);
+    assert.equal(appImmediate.inputBridge.getStats().scriptPending, false);
+  } finally {
+    await appImmediate.destroy();
+  }
+
+  // 2. Pending anchored script is cleanly stopped by app.stop().
+  const appPending = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    now: clock.now,
+    raf: raf.raf,
+    cancelRaf: raf.cancelRaf,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker: () => createFakeEventTarget({ postMessage() {}, terminate() {} }),
+  });
+
+  try {
+    assert.equal((await appPending.start()).ok, true);
+    assert.equal(appPending.inputBridge.getStats().scriptPending, true);
+    assert.equal((await appPending.stop()).ok, true);
+    assert.equal(appPending.inputBridge.getStats().scriptPending, false);
+    assert.equal(appPending.inputBridge.getScriptState().active, false);
+  } finally {
+    await appPending.destroy();
+  }
+});
+
+test('Orch-23 bootstrapPlayGta6App wires stream config into BootOrchestrator so 7.51 GB shader pack is never GET-downloaded', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+  const { PgimPreloader } = require('../web/runtime/pgim_preloader.js');
+  const SEVEN_POINT_FIVE_GB = 8_063_800_000;
+
+  for (const search of ['', '?streamShaders=1']) {
+    const clock = createClock(70000);
+    const raf = createFakeRaf(clock);
+    const timers = createFakeTimers();
+    const webgpu = createMockWebGpuEnv();
+    const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+      clock,
+      raf,
+      timers,
+      gpu: webgpu.gpu,
+    });
+    windowObj.location = {
+      origin: 'https://playgta6.local',
+      search,
+    };
+
+    const shaderMethods = [];
+    const fetchImpl = async (url, init = {}) => {
+      const method = (init.method || 'GET').toUpperCase();
+      const u = String(url);
+      if (u === '/api/status') {
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          async json() {
+            return {
+              ok: true,
+              coopCoep: true,
+              hasWasmBinary: true,
+              pgimUrl: '/data/boot/GTA6.pgim',
+              shaderPackUrl: '/data/shaders/splash.wgsl.pack',
+              runtimeWasm: '/dist/runtime.wasm',
+            };
+          },
+        };
+      }
+      if (u === '/data/shaders/splash.wgsl.pack') {
+        shaderMethods.push(method);
+        if (method === 'HEAD') {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({
+              'content-length': String(SEVEN_POINT_FIVE_GB),
+              'accept-ranges': 'bytes',
+            }),
+          };
+        }
+        throw new Error(`Unexpected ${method} on 7.51 GB shader pack for search="${search}"`);
+      }
+      return { ok: false, status: 404, headers: new Headers() };
+    };
+
+    const mockPreloader = {
+      calls: [],
+      async preloadBootBundle(args) {
+        this.calls.push(args);
+        return {
+          pgim: { header: { magic: 'PGIM' }, bytesLoaded: 64 },
+          shaderPackBytes: null,
+          reflectionManifest: null,
+          bytesLoaded: 64,
+        };
+      },
+    };
+
+    const app = bootstrapPlayGta6App({
+      windowObj,
+      documentObj,
+      navigatorObj,
+      fetchImpl,
+      canvas: webgpu.canvas,
+      hud: createMockHud(),
+      now: clock.now,
+      raf: raf.raf,
+      cancelRaf: raf.cancelRaf,
+      setInterval: timers.setInterval,
+      clearInterval: timers.clearInterval,
+      enableBootOrchestrator: true,
+      BootOrchestratorCtor: BootOrchestrator,
+      PgimPreloaderCtor: PgimPreloader,
+      pgimPreloader: mockPreloader,
+      createWasmWorker: () => createFakeEventTarget({ postMessage() {}, terminate() {} }),
+    });
+
+    try {
+      const res = await app.start();
+      assert.equal(res.ok, true);
+      assert.equal(mockPreloader.calls.length, 1);
+      assert.equal(
+        mockPreloader.calls[0].shaderPackUrl,
+        null,
+        `search="${search}" must omit 7.51 GB shaderPackUrl from preloadBootBundle`
+      );
+      if (search === '?streamShaders=1') {
+        assert.deepEqual(shaderMethods, [], '?streamShaders=1 should skip without even HEAD');
+      } else {
+        assert.deepEqual(shaderMethods, ['HEAD'], 'plain URL should probe HEAD and skip GET');
+      }
+    } finally {
+      await app.destroy();
+    }
+  }
+});
