@@ -5784,6 +5784,21 @@ class RenderStatePackets {
       }
     }
 
+    if (effAspect === 'depth-only') {
+      if (effFormat === 'depth32float-stencil8') {
+        effFormat = 'depth32float';
+        modified = true;
+      } else if (effFormat === 'depth24plus-stencil8') {
+        effFormat = 'depth24plus';
+        modified = true;
+      }
+    } else if (effAspect === 'stencil-only') {
+      if (effFormat === 'depth32float-stencil8' || effFormat === 'depth24plus-stencil8') {
+        effFormat = 'stencil8';
+        modified = true;
+      }
+    }
+
     const actualTexDim = this._resolveActualTextureDimension(texture, meta);
     const isPromoted1DTo2D = Boolean(
       (meta && meta.promoted1DTo2D === true) ||
