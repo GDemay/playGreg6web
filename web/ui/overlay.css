@@ -148,8 +148,22 @@ body {
   inset: 0;
   width: 100%;
   height: 100%;
+  object-fit: contain;
+  object-position: center;
   display: block;
-  background: var(--color-background-body);
+  background: #000;
+}
+
+#viewport:fullscreen {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: center;
+  background: #000;
+}
+
+#viewport::backdrop {
+  background: #000;
 }
 
 /* ============================================================================
