@@ -7794,9 +7794,13 @@ void test_g84_readback_ring_hardening() {
         constexpr uint32_t kTotal = 200;
         dg::ReadbackGate gate(/*hold=*/true, std::chrono::milliseconds(5000), /*ring_capacity=*/64);
         auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(gate.done_address()));
+        const auto producer_tid = std::this_thread::get_id();
         std::atomic<uint32_t> produced{0};
         std::atomic<uint32_t> released_count{0};
-        std::atomic<uint32_t> last_released_id{0};
+        std::array<std::atomic<uint32_t>, kTotal + 1> seen{};
+        std::atomic<bool> duplicate_ok{true};
+        std::atomic<uint32_t> poller_last_id{0};
+        std::atomic<uint32_t> producer_last_id{0};
         std::atomic<bool> order_ok{true};
         std::atomic<bool> stop_observer{false};
 
@@ -7833,8 +7837,17 @@ void test_g84_readback_ring_hardening() {
             const auto kind = static_cast<dg::ReadbackKind>(i % static_cast<uint32_t>(dg::ReadbackKind::Count));
             gate.issue64(0x60000 + uint64_t{i} * 16, 16, kind, i);
             produced.store(i, std::memory_order_release);
+            // ReadbackGate::poll() invokes ready callbacks after releasing its mutex, so a
+            // callback popped by the poller thread can run concurrently with a later callback
+            // invoked on the producer thread (via park()->poll() or immediate inline fallback).
+            // Verify what is strictly guaranteed: every ID 1..kTotal fires exactly once, and
+            // each thread's released callbacks fire in strictly monotonic order.
             auto cb = [&, i] {
-                const uint32_t prev = last_released_id.exchange(i, std::memory_order_acq_rel);
+                if (seen[i].fetch_add(1, std::memory_order_acq_rel) != 0) {
+                    duplicate_ok.store(false, std::memory_order_release);
+                }
+                auto& thread_last = (std::this_thread::get_id() == producer_tid) ? producer_last_id : poller_last_id;
+                const uint32_t prev = thread_last.exchange(i, std::memory_order_acq_rel);
                 if (prev >= i) {
                     order_ok.store(false, std::memory_order_release);
                 }
@@ -7849,6 +7862,16 @@ void test_g84_readback_ring_hardening() {
         CHECK(wait_for([&] { return released_count.load(std::memory_order_acquire) == kTotal; }));
         stop_observer.store(true, std::memory_order_release);
         observer.join();
+        CHECK(duplicate_ok.load(std::memory_order_acquire));
+        CHECK(released_count.load(std::memory_order_acquire) == kTotal);
+        bool all_seen_once = true;
+        for (uint32_t i = 1; i <= kTotal; ++i) {
+            if (seen[i].load(std::memory_order_acquire) != 1) {
+                all_seen_once = false;
+                break;
+            }
+        }
+        CHECK(all_seen_once);
         CHECK(order_ok.load(std::memory_order_acquire));
         CHECK(gate.pending_count() == 0 && gate.completed_count() == kTotal);
         CHECK(gate.stats().signals_pending == 0);
