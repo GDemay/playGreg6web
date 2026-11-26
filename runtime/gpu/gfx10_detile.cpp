@@ -1065,20 +1065,27 @@ namespace {
 
 constexpr uint32_t kAllSlices = 0xFFFFFFFFu;
 
-// Shared walk for the surface detile/tile functions: calls fn(linear_offset, surface_offset,
-// bytes) for every element of mip `mip` in array slice `array_slice` (kAllSlices: every array
-// slice, in order). 3D textures: every depth slice of the mip (array_slice 0 or kAllSlices).
-template <typename Fn>
-const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice, size_t surface_size,
-                             size_t* linear_size, uint32_t* row_pitch, uint32_t* rows, uint32_t* slices, Fn&& fn) {
-    const ChainLayout c = build_chain(desc);
-    if (!c.ok) {
-        return c.error;
+struct PreparedSurfaceMip {
+    ChainLayout c{};
+    uint32_t z0 = 0;
+    uint32_t nz = 0;
+    uint32_t bx = 0;
+    uint32_t by = 0;
+    uint32_t bpe = 0;
+    uint32_t row_pitch = 0;
+    size_t linear_size = 0;
+};
+
+const char* prepare_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32_t array_slice,
+                                size_t surface_size, PreparedSurfaceMip* out) noexcept {
+    out->c = build_chain(desc);
+    if (!out->c.ok) {
+        return out->c.error;
     }
-    if (mip >= c.mips) {
+    if (mip >= out->c.mips) {
         return "mip level out of range";
     }
-    if (surface_size < c.total_bytes) {
+    if (surface_size < out->c.total_bytes) {
         return "source buffer truncated for surface footprint";
     }
     const uint32_t mip_w = std::max(1u, desc.width >> std::min(mip, 31u));
@@ -1101,45 +1108,83 @@ const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32
         z0 = array_slice;
         nz = 1;
     }
-    const uint32_t bx = (mip_w + c.fmt.block_width - 1u) / c.fmt.block_width;
-    const uint32_t by = (mip_h + c.fmt.block_height - 1u) / c.fmt.block_height;
-    const uint32_t bpe = c.fmt.bytes_per_block;
-    *row_pitch = bx * bpe;
-    *rows = by;
-    *slices = nz;
-    *linear_size = size_t{*row_pitch} * by * nz;
+    const uint32_t bx = (mip_w + out->c.fmt.block_width - 1u) / out->c.fmt.block_width;
+    const uint32_t by = (mip_h + out->c.fmt.block_height - 1u) / out->c.fmt.block_height;
+    const uint32_t bpe = out->c.fmt.bytes_per_block;
+    out->z0 = z0;
+    out->nz = nz;
+    out->bx = bx;
+    out->by = by;
+    out->bpe = bpe;
+    out->row_pitch = bx * bpe;
+    out->linear_size = size_t{out->row_pitch} * by * nz;
+
+    if (out->c.linear && by > 0u && out->row_pitch > 0u) {
+        const uint64_t src_row_pitch = uint64_t{out->c.pitch[mip]} * bpe;
+        uint64_t last_row_off = 0;
+        if (!checked_mul_u64(uint64_t{by - 1u}, src_row_pitch, &last_row_off)) {
+            return "tiled source offset out of bounds";
+        }
+        for (uint32_t z = 0; z < nz; ++z) {
+            uint64_t slice_off = 0;
+            if (!checked_mul_u64(out->c.slice_stride, uint64_t{z0} + z, &slice_off) ||
+                out->c.offset[mip] > std::numeric_limits<uint64_t>::max() - slice_off) {
+                return "tiled source offset out of bounds";
+            }
+            const uint64_t slice_base = slice_off + out->c.offset[mip];
+            if (slice_base > surface_size || last_row_off > surface_size - slice_base ||
+                out->row_pitch > surface_size - slice_base - last_row_off) {
+                return "tiled source offset out of bounds";
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Shared walk for the surface detile/tile functions: calls fn(linear_offset, surface_offset,
+// bytes) for mip `mip` of a prepared surface walk. Console-linear surfaces (layout 0x100) copy
+// whole slices or rows instead of walking per element; tiled surfaces use the per-axis split of
+// chain_address so column/row contributions are computed once per column/row.
+template <typename Fn>
+const char* walk_surface_mip(const PreparedSurfaceMip& p, uint32_t mip, size_t surface_size, Fn&& fn) {
+    const ChainLayout& c = p.c;
+    if (c.linear) {
+        const uint64_t src_row_pitch = uint64_t{c.pitch[mip]} * p.bpe;
+        const size_t copy_row_bytes = p.row_pitch;
+        if (p.by == 0u || copy_row_bytes == 0u) {
+            return nullptr;
+        }
+        const size_t slice_linear_bytes = size_t{p.by} * copy_row_bytes;
+        for (uint32_t z = 0; z < p.nz; ++z) {
+            const uint64_t slice_base = c.slice_stride * (uint64_t{p.z0} + z) + c.offset[mip];
+            if (src_row_pitch == copy_row_bytes) {
+                fn(size_t{z} * slice_linear_bytes, static_cast<size_t>(slice_base), slice_linear_bytes);
+            } else {
+                for (uint32_t y = 0; y < p.by; ++y) {
+                    fn((size_t{z} * p.by + y) * copy_row_bytes,
+                       static_cast<size_t>(slice_base + uint64_t{y} * src_row_pitch), copy_row_bytes);
+                }
+            }
+        }
+        return nullptr;
+    }
     // chain_address, split by axis: every bit of the block equation (or _R mask) takes one
     // coordinate bit, so the x part of the block-local address and of the block index is computed
     // once per column and the y / z part once per row; the XOR swizzle is applied to their union
     // per element as chain_address applies it. Same addresses, without the per-element equation.
     const TileShape& s = c.shape;
-    std::vector<uint32_t> col_intra;
-    std::vector<uint64_t> col_block;
-    if (!c.linear) {
-        col_intra.resize(bx);
-        col_block.resize(bx);
-        for (uint32_t x = 0; x < bx; ++x) {
-            const uint32_t tx = x + c.tail_x[mip];
-            col_intra[x] = s.eq != nullptr ? apply_equation(s.eq, s.blk_size_log2, tx, 0u, 0u)
-                                           : deposit_bits((tx & (c.bw - 1u)) << c.bpp_log2, s.x_mask);
-            col_block[x] = c.in_tail[mip] ? 0u : uint64_t{x / c.bw} << s.blk_size_log2;
-        }
+    std::vector<uint32_t> col_intra(p.bx);
+    std::vector<uint64_t> col_block(p.bx);
+    for (uint32_t x = 0; x < p.bx; ++x) {
+        const uint32_t tx = x + c.tail_x[mip];
+        col_intra[x] = s.eq != nullptr ? apply_equation(s.eq, s.blk_size_log2, tx, 0u, 0u)
+                                       : deposit_bits((tx & (c.bw - 1u)) << c.bpp_log2, s.x_mask);
+        col_block[x] = c.in_tail[mip] ? 0u : uint64_t{x / c.bw} << s.blk_size_log2;
     }
-    for (uint32_t z = 0; z < nz; ++z) {
-        const uint32_t zz = z0 + z;
-        for (uint32_t y = 0; y < by; ++y) {
-            const size_t lin_row = (size_t{z} * by + y) * *row_pitch;
-            if (c.linear) {
-                const uint64_t row = c.slice_stride * zz + c.offset[mip] + uint64_t{y} * c.pitch[mip] * bpe;
-                for (uint32_t x = 0; x < bx; ++x) {
-                    const uint64_t addr = row + uint64_t{x} * bpe;
-                    if (addr > surface_size || bpe > surface_size - addr) {
-                        return "tiled source offset out of bounds";
-                    }
-                    fn(lin_row + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
-                }
-                continue;
-            }
+    for (uint32_t z = 0; z < p.nz; ++z) {
+        const uint32_t zz = p.z0 + z;
+        for (uint32_t y = 0; y < p.by; ++y) {
+            const size_t lin_row = (size_t{z} * p.by + y) * p.row_pitch;
             const uint32_t ty = y + c.tail_y[mip];
             const uint32_t row_intra = s.eq != nullptr
                                            ? apply_equation(s.eq, s.blk_size_log2, 0u, ty, s.thick_3d ? zz : 0u)
@@ -1148,25 +1193,25 @@ const char* walk_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uint32
             const uint64_t row_block =
                 c.in_tail[mip] ? 0u : (uint64_t{y / c.bh} * (c.pitch[mip] / c.bw)) << s.blk_size_log2;
             const uint64_t row = c.slice_stride * slice + c.macro_offset[mip] + row_block;
-            for (uint32_t x = 0; x < bx; ++x) {
+            for (uint32_t x = 0; x < p.bx; ++x) {
                 uint32_t intra = col_intra[x] | row_intra;
                 if (s.xor_mode) {
                     intra = apply_gfx10_xor_64k(intra);
                 }
                 const uint64_t addr = row + col_block[x] + intra;
-                if (addr > surface_size || bpe > surface_size - addr) {
+                if (addr > surface_size || p.bpe > surface_size - addr) {
                     return "tiled source offset out of bounds";
                 }
-                fn(lin_row + size_t{x} * bpe, static_cast<size_t>(addr), bpe);
+                fn(lin_row + size_t{x} * p.bpe, static_cast<size_t>(addr), size_t{p.bpe});
             }
         }
     }
     return nullptr;
 }
 
-// One element copy; the element sizes of the supported formats get a fixed-size copy the
-// compiler inlines instead of a memcpy call per element.
-inline void copy_element(uint8_t* dst, const uint8_t* src, uint32_t n) noexcept {
+// One element (or row/slice) copy; the element sizes of the supported formats get a fixed-size
+// copy the compiler inlines instead of a memcpy call per element.
+inline void copy_element(uint8_t* dst, const uint8_t* src, size_t n) noexcept {
     switch (n) {
         case 1: std::memcpy(dst, src, 1); break;
         case 2: std::memcpy(dst, src, 2); break;
@@ -1241,30 +1286,29 @@ DetileResult detile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, ui
         res.error = "null source pointer";
         return res;
     }
-    size_t linear_size = 0;
-    uint32_t row_pitch = 0, rows = 0, slices = 0;
-    // One walk validates and copies: the walk sets linear_size before its first element, and on
-    // an out-of-bounds element the partial output is dropped (the same result as validating first).
-    uint8_t* out = nullptr;
-    const char* err = walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                                       [&](size_t lin, size_t src, uint32_t n) {
-                                           if (out == nullptr) {
-                                               linear_out.resize(linear_size);
-                                               out = linear_out.data();
-                                           }
-                                           copy_element(out + lin, surface + src, n);
-                                       });
+    PreparedSurfaceMip p{};
+    const char* err = prepare_surface_mip(desc, mip, array_slice, surface_size, &p);
     if (err != nullptr) {
         linear_out.clear();
         res.error = err;
         return res;
     }
-    linear_out.resize(linear_size);
+    // One walk validates and copies (console-linear bounds are already checked per slice in
+    // prepare_surface_mip; on a tiled out-of-bounds element, partial output is dropped).
+    linear_out.resize(p.linear_size);
+    uint8_t* const out = linear_out.data();
+    err = walk_surface_mip(p, mip, surface_size,
+                           [&](size_t lin, size_t src, size_t n) { copy_element(out + lin, surface + src, n); });
+    if (err != nullptr) {
+        linear_out.clear();
+        res.error = err;
+        return res;
+    }
     res.ok = true;
-    res.row_pitch_bytes = row_pitch;
-    res.rows = rows;
-    res.slices = slices;
-    res.tiled_bytes_consumed = surface_bytes(desc);
+    res.row_pitch_bytes = p.row_pitch;
+    res.rows = p.by;
+    res.slices = p.nz;
+    res.tiled_bytes_consumed = static_cast<size_t>(p.c.total_bytes);
     return res;
 }
 
@@ -1273,15 +1317,19 @@ bool tile_surface_impl(const TextureLayoutDesc& desc, uint32_t mip, uint32_t arr
     if (linear_src == nullptr || surface == nullptr || is_linear_layout(desc)) {
         return false;
     }
-    size_t linear_size = 0;
-    uint32_t row_pitch = 0, rows = 0, slices = 0;
-    const char* err = walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                                       [](size_t, size_t, uint32_t) {});
-    if (err != nullptr || linear_src_bytes < linear_size) {
+    PreparedSurfaceMip p{};
+    const char* err = prepare_surface_mip(desc, mip, array_slice, surface_size, &p);
+    if (err != nullptr || linear_src_bytes < p.linear_size) {
         return false;
     }
-    walk_surface_mip(desc, mip, array_slice, surface_size, &linear_size, &row_pitch, &rows, &slices,
-                     [&](size_t lin, size_t dst, uint32_t n) { copy_element(surface + dst, linear_src + lin, n); });
+    if (!p.c.linear) {
+        err = walk_surface_mip(p, mip, surface_size, [](size_t, size_t, size_t) {});
+        if (err != nullptr) {
+            return false;
+        }
+    }
+    walk_surface_mip(p, mip, surface_size,
+                     [&](size_t lin, size_t dst, size_t n) { copy_element(surface + dst, linear_src + lin, n); });
     return true;
 }
 

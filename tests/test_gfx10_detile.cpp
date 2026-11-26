@@ -419,6 +419,8 @@ void test_mip_chain_placement() {
 }
 
 void verify_surface_round_trip(const TextureLayoutDesc& desc, uint32_t seed);
+void verify_subresource_round_trip(TextureLayoutDesc desc, uint32_t layers, uint32_t seed);
+void verify_element_offsets(TextureLayoutDesc desc, uint32_t layers, uint32_t seed);
 
 // Console linear (0x100): addrlib gfx10 ADDR_SW_LINEAR (Gfx10Lib::HwlComputeSurfaceInfoLinear).
 void test_console_linear_chain() {
@@ -469,6 +471,119 @@ void test_console_linear_chain() {
     verify_surface_round_trip({71u, 100u, 60u, 1u, 5u, 0x100u, 0u}, 13600u);
     verify_surface_round_trip({10u, 20u, 12u, 6u, 3u, 0x100u, 0u}, 13700u);
     verify_surface_round_trip({61u, 4096u, 1u, 1u, 13u, 0x100u, 0u}, 13800u);
+}
+
+// G73 (#663): fast row/slice path for console-linear (layout == 0x100) surfaces, covering aligned
+// whole-slice copies (e.g. 512x128 & 3840x2160 R8), padded row copies (e.g. 300x128 & 1920x1080
+// R8), multi-mip chains, 2D arrays, and truncated-buffer rejection.
+void test_console_linear_fast_path() {
+    // 1) Aligned pitch (src_row_pitch == copy_row_bytes): 512x128 R8_UNORM + 3840x2160 R8_UNORM.
+    {
+        const TextureLayoutDesc desc{61u, 512u, 128u, 1u, 1u, 0x100u, 0u};
+        CHECK(surface_bytes(desc) == 512u * 128u);
+        const std::vector<uint8_t> linear_in = make_synthetic_linear(512u * 128u, 15100u);
+        std::vector<uint8_t> surface(surface_bytes(desc), 0xA5u);
+        CHECK(tile_surface_subresource(desc, 0u, 0u, linear_in.data(), linear_in.size(), surface.data(),
+                                       surface.size()));
+        CHECK(surface == linear_in);
+
+        std::vector<uint8_t> out;
+        const DetileResult r = detile_surface_subresource(desc, 0u, 0u, surface.data(), surface.size(), out);
+        CHECK(r.ok && r.row_pitch_bytes == 512u && r.rows == 128u && r.slices == 1u);
+        CHECK(r.tiled_bytes_consumed == surface.size());
+        CHECK(out == linear_in);
+
+        // Truncated buffer rejected without populating output or mutating surface.
+        std::vector<uint8_t> bad_out = {1u, 2u, 3u};
+        CHECK(!detile_surface_subresource(desc, 0u, 0u, surface.data(), surface.size() - 1u, bad_out).ok);
+        CHECK(bad_out.empty());
+        CHECK(!detile_surface_subresource(desc, 0u, 0u, surface.data(), 0u, bad_out).ok);
+        std::vector<uint8_t> trunc_dst(surface.size() - 1u, 0xCCu);
+        CHECK(!tile_surface_subresource(desc, 0u, 0u, linear_in.data(), linear_in.size(), trunc_dst.data(),
+                                        trunc_dst.size()));
+        CHECK(trunc_dst[0] == 0xCCu);
+    }
+
+    // 4K Bink2 Y plane: 3840x2160 R8_UNORM (pitch == 3840 == width, single >8 MiB whole-slice copy).
+    {
+        const TextureLayoutDesc y4k{61u, 3840u, 2160u, 1u, 1u, 0x100u, 0u};
+        constexpr size_t kBytes = size_t{3840u} * 2160u;
+        CHECK(surface_bytes(y4k) == kBytes);
+        std::vector<uint8_t> src(kBytes);
+        for (size_t i = 0; i < kBytes; i += 257u) {
+            src[i] = static_cast<uint8_t>((i * 31u + 7u) & 0xFFu);
+        }
+        src[0] = 0x11u;
+        src[kBytes - 1u] = 0xEEu;
+        std::vector<uint8_t> out;
+        const DetileResult r = detile_surface_subresource(y4k, 0u, 0u, src.data(), src.size(), out);
+        CHECK(r.ok && r.row_pitch_bytes == 3840u && r.rows == 2160u && r.slices == 1u);
+        CHECK(r.tiled_bytes_consumed == kBytes);
+        CHECK(out.size() == kBytes && std::memcmp(out.data(), src.data(), kBytes) == 0);
+        CHECK(!detile_surface_subresource(y4k, 0u, 0u, src.data(), kBytes - 1u, out).ok);
+        CHECK(out.empty());
+    }
+
+    // 2) Padded pitch (src_row_pitch > copy_row_bytes): 300x128 R8_UNORM (pitch 512) + 1920x1080 R8 (pitch 2048).
+    {
+        const TextureLayoutDesc desc{61u, 300u, 128u, 1u, 1u, 0x100u, 0u};
+        CHECK(surface_bytes(desc) == 512u * 128u);
+        const std::vector<uint8_t> linear_in = make_synthetic_linear(300u * 128u, 15200u);
+        std::vector<uint8_t> surface(512u * 128u, 0xEEu);
+        CHECK(tile_surface_subresource(desc, 0u, 0u, linear_in.data(), linear_in.size(), surface.data(),
+                                       surface.size()));
+        // Padding tail [300..512) stays untouched and does not leak into detiled linear_out.
+        bool pad_intact = true;
+        for (uint32_t y = 0; y < 128u; ++y) {
+            if (std::memcmp(surface.data() + size_t{y} * 512u, linear_in.data() + size_t{y} * 300u, 300u) != 0) {
+                pad_intact = false;
+            }
+            for (uint32_t x = 300u; x < 512u; ++x) {
+                if (surface[size_t{y} * 512u + x] != 0xEEu) {
+                    pad_intact = false;
+                }
+            }
+        }
+        CHECK(pad_intact);
+
+        std::vector<uint8_t> out;
+        const DetileResult r = detile_surface_subresource(desc, 0u, 0u, surface.data(), surface.size(), out);
+        CHECK(r.ok && r.row_pitch_bytes == 300u && r.rows == 128u && r.slices == 1u);
+        CHECK(r.tiled_bytes_consumed == 512u * 128u);
+        CHECK(out == linear_in);
+
+        // Truncated padded surface rejected.
+        CHECK(!detile_surface_subresource(desc, 0u, 0u, surface.data(), surface.size() - 1u, out).ok);
+        CHECK(out.empty());
+    }
+
+    // 4K Bink2 U/V plane: 1920x1080 R8_UNORM (pitch 2048, tight row 1920).
+    {
+        const TextureLayoutDesc uv4k{61u, 1920u, 1080u, 1u, 1u, 0x100u, 0u};
+        CHECK(surface_bytes(uv4k) == size_t{2048u} * 1080u);
+        std::vector<uint8_t> surface(size_t{2048u} * 1080u, 0xDDu);
+        std::vector<uint8_t> expected(size_t{1920u} * 1080u);
+        for (uint32_t y = 0; y < 1080u; ++y) {
+            const uint8_t fill = static_cast<uint8_t>((y * 13u + 5u) & 0xFFu);
+            std::memset(expected.data() + size_t{y} * 1920u, fill, 1920u);
+            expected[size_t{y} * 1920u] = static_cast<uint8_t>(y & 0xFFu);
+            expected[size_t{y} * 1920u + 1919u] = static_cast<uint8_t>((y ^ 0xA5u) & 0xFFu);
+            std::memcpy(surface.data() + size_t{y} * 2048u, expected.data() + size_t{y} * 1920u, 1920u);
+        }
+        std::vector<uint8_t> out;
+        const DetileResult r = detile_surface_subresource(uv4k, 0u, 0u, surface.data(), surface.size(), out);
+        CHECK(r.ok && r.row_pitch_bytes == 1920u && r.rows == 1080u && r.slices == 1u);
+        CHECK(r.tiled_bytes_consumed == size_t{2048u} * 1080u);
+        CHECK(out == expected);
+    }
+
+    // 3) Multi-mip (mixed aligned mip 0 + padded mips 1..4) and multi-layer 2D array round-trip.
+    {
+        verify_surface_round_trip({61u, 512u, 128u, 1u, 5u, 0x100u, 0u}, 15300u);
+        verify_subresource_round_trip({61u, 300u, 64u, 1u, 3u, 0x100u, 0u}, 3u, 15400u);
+        verify_subresource_round_trip({61u, 512u, 64u, 1u, 3u, 0x100u, 0u}, 2u, 15500u);
+        verify_element_offsets({61u, 300u, 64u, 1u, 3u, 0x100u, 0u}, 2u, 15600u);
+    }
 }
 
 // Every mip of a chain written into one surface must read back unchanged (no overlaps).
@@ -798,6 +913,7 @@ int main() {
     test_mip_chain_placement();
     test_mip_chain_round_trips();
     test_console_linear_chain();
+    test_console_linear_fast_path();
     test_subresource_round_trips();
     test_tail_coordinates();
     test_element_offsets();
