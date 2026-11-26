@@ -1337,8 +1337,8 @@ class TestWgpkEntryBoundsIntegrity(unittest.TestCase):
                 entries.extend(struct.pack("<QB3sII", i + 1, stage, b"\x00\x00\x00", offset, length))
             (shaders_dir / "corrupt_many.wgsl.pack").write_bytes(header + bytes(entries) + b"abcd")
 
-            # Pack 2: unsupported version 2.
-            (shaders_dir / "v2.wgsl.pack").write_bytes(struct.pack("<4sIII", b"WGPK", 2, 0, 0))
+            # Pack 2: unsupported version 3.
+            (shaders_dir / "v3.wgsl.pack").write_bytes(struct.pack("<4sIII", b"WGPK", 3, 0, 0))
 
             # Pack 3: truncated < 16 bytes header.
             (shaders_dir / "short.wgsl.pack").write_bytes(b"WGPK\x01\x00")
@@ -1356,16 +1356,468 @@ class TestWgpkEntryBoundsIntegrity(unittest.TestCase):
             self.assertEqual(corrupt["invalid_stage_entries"], 1)
             self.assertTrue(any("additional invalid/out-of-bounds" in e for e in corrupt["errors"]))
 
-            v2 = by_name["v2.wgsl.pack"]
-            self.assertTrue(v2["magic_ok"])
-            self.assertFalse(v2["header_ok"])
-            self.assertFalse(v2["bounds_ok"])
-            self.assertTrue(any("unsupported WGPK version 2" in e for e in v2["errors"]))
+            v3 = by_name["v3.wgsl.pack"]
+            self.assertTrue(v3["magic_ok"])
+            self.assertFalse(v3["header_ok"])
+            self.assertFalse(v3["bounds_ok"])
+            self.assertIsNone(v3["entry_bytes"])
+            self.assertFalse(v3["is_v2"])
+            self.assertTrue(any("unsupported WGPK version 3" in e for e in v3["errors"]))
 
             short = by_name["short.wgsl.pack"]
             self.assertFalse(short["magic_ok"])
             self.assertFalse(short["header_ok"])
             self.assertFalse(short["bounds_ok"])
+
+
+class TestWgpkV2Support(unittest.TestCase):
+    def test_valid_wgpk_v2_pack_passes_strict_and_reports_v2_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            pack_bytes = wgpk.build_wgpk(
+                [
+                    (0x1111, wgpk.ShaderStage.VERTEX, "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }"),
+                    (0x2222, wgpk.ShaderStage.FRAGMENT, "@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }"),
+                    (0x3333, wgpk.ShaderStage.COMPUTE, "@compute @workgroup_size(1) fn cs() {}"),
+                ],
+                version=2,
+            )
+            (shaders_dir / "large_shaders.wgsl.pack").write_bytes(pack_bytes)
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(report["warnings"], [])
+            pack = report["shaders"]["packs"][0]
+            self.assertEqual(pack["version"], 2)
+            self.assertEqual(pack["entry_bytes"], 24)
+            self.assertTrue(pack["is_v2"])
+            self.assertTrue(pack["header_ok"])
+            self.assertTrue(pack["table_ok"])
+            self.assertTrue(pack["bounds_ok"])
+            self.assertEqual(pack["entry_count"], 3)
+            self.assertEqual(pack["data_start_offset"], 16 + 3 * 24)
+            self.assertEqual(pack["max_payload_end"], len(pack_bytes))
+
+            text = vbb.format_report_text(report)
+            self.assertIn("pack large_shaders.wgsl.pack: OK", text)
+            self.assertIn("v2", text)
+
+    def test_wgpk_v2_over_4gib_64bit_offsets_and_chunked_toc_streaming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            # Build a real WGPK v2 header + 4100 TOC entries (exceeding 4096 chunk size)
+            # with final entries placed beyond the 4 GiB (u32::MAX) boundary.
+            entry_count = 4100
+            data_start = 16 + entry_count * 24
+            simulated_base_offset = 0x1_2000_0000  # 4.5 GiB
+            payload_len = 512
+            simulated_total_size = simulated_base_offset + entry_count * payload_len
+
+            toc = bytearray(data_start)
+            struct.pack_into("<4sIII", toc, 0, b"WGPK", 2, entry_count, 0)
+            for i in range(entry_count):
+                offset = simulated_base_offset + i * payload_len
+                stage = (i % 3) + 1
+                struct.pack_into(
+                    "<QB3sIQ",
+                    toc,
+                    16 + i * 24,
+                    0x1000000 + i,
+                    stage,
+                    b"\x00\x00\x00",
+                    payload_len,
+                    offset,
+                )
+            pack_path = shaders_dir / "huge_v2.wgsl.pack"
+            pack_path.write_bytes(bytes(toc))
+
+            orig_get_size = vbb.get_file_size
+
+            def fake_get_size(path: Path) -> int:
+                if path.name == "huge_v2.wgsl.pack":
+                    return simulated_total_size
+                return orig_get_size(path)
+
+            with mock.patch.object(vbb, "get_file_size", side_effect=fake_get_size):
+                report = vbb.verify_browser_boot_bundle(
+                    web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+                )
+
+            self.assertTrue(report["ok"])
+            pack = report["shaders"]["packs"][0]
+            self.assertEqual(pack["version"], 2)
+            self.assertEqual(pack["entry_bytes"], 24)
+            self.assertTrue(pack["is_v2"])
+            self.assertTrue(pack["table_ok"])
+            self.assertTrue(pack["bounds_ok"])
+            self.assertEqual(pack["entry_count"], entry_count)
+            self.assertEqual(pack["max_payload_end"], simulated_total_size)
+
+    def test_wgpk_v2_oob_corrupt_and_invalid_stage_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            shaders_dir.mkdir(parents=True)
+
+            # 3 entries in v2:
+            #  0: overlaps TOC (offset 12 < data_start 88)
+            #  1: invalid stage 9 + uint64 overflow (offset = u64::MAX - 4, length = 16)
+            #  2: exceeds file size
+            count = 3
+            header = struct.pack("<4sIII", b"WGPK", 2, count, 0)
+            e0 = struct.pack("<QB3sIQ", 1, 1, b"\x00\x00\x00", 16, 12)
+            e1 = struct.pack("<QB3sIQ", 2, 9, b"\x00\x00\x00", 16, vbb.WGPK_MAX_U64 - 4)
+            e2 = struct.pack("<QB3sIQ", 3, 2, b"\x00\x00\x00", 64, 0x1_0000_0000)
+            (shaders_dir / "bad_v2.wgsl.pack").write_bytes(header + e0 + e1 + e2 + b"0123456789")
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir
+            )
+            self.assertFalse(report["ok"])
+            pack = report["shaders"]["packs"][0]
+            self.assertEqual(pack["version"], 2)
+            self.assertEqual(pack["entry_bytes"], 24)
+            self.assertTrue(pack["is_v2"])
+            self.assertTrue(pack["header_ok"])
+            self.assertTrue(pack["table_ok"])
+            self.assertFalse(pack["bounds_ok"])
+            self.assertEqual(pack["out_of_bounds_entries"], 3)
+            self.assertEqual(pack["invalid_stage_entries"], 1)
+            self.assertTrue(any("overlaps header/entry table" in e for e in pack["errors"]))
+            self.assertTrue(any("overflows uint64" in e for e in pack["errors"]))
+            self.assertTrue(any("exceeds pack bounds" in e for e in pack["errors"]))
+            self.assertTrue(any("invalid shader stage 9" in e for e in pack["errors"]))
+
+
+class TestReflectSidecarV2V3Validation(unittest.TestCase):
+    def test_valid_v2_and_v3_sidecars_with_root_descriptor_unresolved_and_mesh_output_pass_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            _write_valid_shaders_dir(shaders_dir)
+
+            sidecar_v2 = {
+                "schema": "playgta6-stage-reflection",
+                "version": 2,
+                "stages": {
+                    "0x00000000000000a1": {
+                        "stage": "vertex",
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "uniform",
+                                "source": {
+                                    "user_sgpr": 4,
+                                    "root_descriptor": True,
+                                    "table_byte_offset": 64,
+                                },
+                            },
+                        ],
+                    }
+                },
+            }
+            sidecar_v3 = {
+                "schema": "playgta6-stage-reflection",
+                "version": 3,
+                "stages": {
+                    "0x00000000000000b2": {
+                        "stage": "fragment",
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "uniform",
+                                "source": {"unresolved": True},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 1,
+                                "kind": "read-only-storage",
+                                "source": {"unresolved": "cbv_dynamic_index"},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 2,
+                                "kind": "texture_2d",
+                                "source": {"unresolved": True},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 3,
+                                "kind": "sampler_comparison",
+                                "source": {"unresolved": "heap_unknown"},
+                            },
+                        ],
+                    },
+                    "0x00000000000000c3": {
+                        "stage": "compute",
+                        "mesh_output": {
+                            "max_vertices": 64,
+                            "max_primitives": 128,
+                            "vertex_words": 16,
+                        },
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "read_only_storage",
+                                "source": {"unresolved": True},
+                            }
+                        ],
+                    },
+                },
+            }
+            (shaders_dir / "pack_v2.wgsl.pack.reflect.json").write_text(
+                json.dumps(sidecar_v2), encoding="utf-8"
+            )
+            (shaders_dir / "pack_v3.wgsl.pack.reflect.json").write_text(
+                json.dumps(sidecar_v3), encoding="utf-8"
+            )
+
+            report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(report["warnings"], [])
+            shaders = report["shaders"]
+            self.assertEqual(shaders["reflect_sidecar_count"], 2)
+            self.assertEqual(shaders["valid_reflect_sidecar_count"], 2)
+            self.assertEqual(shaders["unresolved_source_stages"], 2)
+            self.assertEqual(shaders["unresolved_source_bindings"], 5)
+            self.assertEqual(shaders["malformed_v3_sources"], 0)
+            self.assertEqual(shaders["mesh_output_stages"], 1)
+            self.assertEqual(shaders["malformed_mesh_outputs"], 0)
+            self.assertEqual(shaders["malformed_root_descriptors"], 0)
+
+            text = vbb.format_report_text(report)
+            self.assertIn("unresolved_source_stages=2", text)
+            self.assertIn("unresolved_source_bindings=5", text)
+            self.assertIn("malformed_v3_sources=0", text)
+            self.assertIn("mesh_output_stages=1", text)
+
+    def test_v3_unresolved_on_writable_kinds_bad_v2_root_descriptor_mesh_output_and_v4_warn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            web_dist = base / "dist"
+            shaders_dir = base / "shaders"
+            _write_valid_web_dist(web_dist)
+            _write_valid_shaders_dir(shaders_dir)
+
+            bad_sidecar = {
+                "schema": "playgta6-stage-reflection",
+                "version": 4,  # unsupported version -> warning
+                "stages": {
+                    "0x000000000000bad0": {
+                        "stage": "compute",
+                        "mesh_output": {
+                            "max_vertices": 300,  # > 256
+                            "max_primitives": 128,
+                            "vertex_words": 6,  # not multiple of 4
+                        },
+                        "bindings": [
+                            {
+                                "group": 0,
+                                "binding": 0,
+                                "kind": "storage",  # writable -> forbidden for unresolved!
+                                "source": {"unresolved": True},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 1,
+                                "kind": "storage_texture",  # writable -> forbidden!
+                                "source": {"unresolved": True},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 2,
+                                "kind": "storage-texture",  # hyphenated writable -> forbidden!
+                                "source": {"unresolved": "rw_tex"},
+                            },
+                            {
+                                "group": 0,
+                                "binding": 3,
+                                "kind": "uniform",
+                                "source": {"unresolved": True, "extra": 1},  # len != 1
+                            },
+                            {
+                                "group": 0,
+                                "binding": 4,
+                                "kind": "uniform",
+                                "source": {"unresolved": ""},  # empty string
+                            },
+                            {
+                                "group": 0,
+                                "binding": 5,
+                                "kind": "uniform",
+                                "source": {
+                                    "user_sgpr": 2,
+                                    "root_descriptor": True,
+                                    "table_byte_offset": 40,  # not multiple of 32
+                                },
+                            },
+                        ],
+                    }
+                },
+            }
+            (shaders_dir / "bad_v3.wgsl.pack.reflect.json").write_text(
+                json.dumps(bad_sidecar), encoding="utf-8"
+            )
+
+            non_strict = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=False
+            )
+            self.assertTrue(non_strict["ok"])
+            shaders = non_strict["shaders"]
+            self.assertEqual(shaders["valid_reflect_sidecar_count"], 0)
+            self.assertEqual(shaders["unresolved_source_bindings"], 0)
+            self.assertEqual(shaders["malformed_v3_sources"], 5)
+            self.assertEqual(shaders["malformed_root_descriptors"], 1)
+            self.assertEqual(shaders["malformed_mesh_outputs"], 1)
+            self.assertTrue(any("unsupported reflection sidecar version 4" in w for w in non_strict["warnings"]))
+
+            strict_report = vbb.verify_browser_boot_bundle(
+                web_dist=web_dist, shaders_dir=shaders_dir, strict=True
+            )
+            self.assertFalse(strict_report["ok"])
+
+
+class TestSingleSideModuleLayoutAndManifestConsistency(unittest.TestCase):
+    def test_single_side_module_two_file_layout_with_manifest_passes_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(
+                web_dist,
+                side_modules={
+                    "guest_part_0.wasm": _make_minimal_side_wasm(b"C" * 2048),
+                    "guest_part_1.wasm": _make_minimal_side_wasm(b"R" * 32),
+                },
+            )
+            (web_dist / "guest_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "runtimeJs": "runtime.js",
+                        "runtimeWasm": "runtime.wasm",
+                        "splitModules": 1,
+                        "splitStrategy": "single-side-module",
+                        "sideModules": ["guest_part_0.wasm", "guest_part_1.wasm"],
+                        "sideModuleSizes": [
+                            {"index": 0, "name": "guest_part_0.wasm", "role": "code", "wasmBytes": 2048},
+                            {"index": 1, "name": "guest_part_1.wasm", "role": "registration", "wasmBytes": 32},
+                        ],
+                        "guest_dll_modules": ["bink2scarlett"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["errors"], [])
+            self.assertEqual(report["warnings"], [])
+            wasm_sec = report["wasm"]
+            self.assertEqual(wasm_sec["bundle_mode"], "split")
+            self.assertEqual(wasm_sec["side_module_layout"], "single-side-module")
+            self.assertEqual(
+                wasm_sec["expected_side_modules"],
+                ["guest_part_0.wasm", "guest_part_1.wasm"],
+            )
+            self.assertEqual(wasm_sec["missing_side_modules"], [])
+            self.assertEqual(wasm_sec["stale_side_modules"], [])
+            gm = wasm_sec["guest_manifest"]
+            self.assertEqual(gm["split_strategy"], "single-side-module")
+            self.assertEqual(gm["split_modules"], 1)
+            self.assertEqual(len(gm["side_module_sizes"]), 2)
+
+            text = vbb.format_report_text(report)
+            self.assertIn("layout=single-side-module", text)
+
+    def test_single_side_module_detected_without_manifest_for_part0_and_small_part1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(
+                web_dist,
+                side_modules={
+                    "guest_part_0.wasm": _make_minimal_side_wasm(b"A" * 1024),
+                    "guest_part_1.wasm": _make_minimal_side_wasm(b"B" * 16),
+                },
+            )
+            report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertTrue(report["ok"])
+            self.assertEqual(report["wasm"]["side_module_layout"], "single-side-module")
+
+    def test_missing_manifest_side_module_is_an_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(
+                web_dist,
+                side_modules={"guest_part_0.wasm": _make_minimal_side_wasm(b"A" * 256)},
+            )
+            (web_dist / "guest_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "sideModules": ["guest_part_0.wasm", "guest_part_1.wasm"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=False)
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["wasm"]["missing_side_modules"], ["guest_part_1.wasm"])
+            self.assertEqual(report["wasm"]["stale_side_modules"], [])
+            self.assertTrue(any("guest_part_1.wasm" in e and "missing" in e for e in report["errors"]))
+
+    def test_stale_guest_part_2_warns_and_fails_strict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            web_dist = Path(tmp) / "dist"
+            _write_valid_web_dist(
+                web_dist,
+                side_modules={
+                    "guest_part_0.wasm": _make_minimal_side_wasm(b"A" * 512),
+                    "guest_part_1.wasm": _make_minimal_side_wasm(b"B" * 32),
+                    "guest_part_2.wasm": _make_minimal_side_wasm(b"STALE" * 64),
+                },
+            )
+            (web_dist / "guest_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "sideModules": ["guest_part_0.wasm", "guest_part_1.wasm"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            non_strict = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=False)
+            self.assertTrue(non_strict["ok"])
+            self.assertEqual(non_strict["wasm"]["side_module_layout"], "multi-part")
+            self.assertEqual(non_strict["wasm"]["missing_side_modules"], [])
+            self.assertEqual(non_strict["wasm"]["stale_side_modules"], ["guest_part_2.wasm"])
+            self.assertTrue(any("stale side module" in w and "guest_part_2.wasm" in w for w in non_strict["warnings"]))
+
+            strict_report = vbb.verify_browser_boot_bundle(web_dist=web_dist, strict=True)
+            self.assertFalse(strict_report["ok"])
 
 
 if __name__ == "__main__":

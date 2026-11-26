@@ -23,8 +23,10 @@ import argparse
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -34,7 +36,51 @@ SCHEMA_VERSION = 1
 
 PIPELINE_STEPS: tuple[str, ...] = ("scan", "manifest", "bootset", "recomp", "shaders")
 STEP_CHOICES: tuple[str, ...] = (*PIPELINE_STEPS, "all")
+PACK_VERSION_CHOICES: tuple[str, ...] = ("auto", "1", "2")
 ALLOWED_OUTPUT_DIR_NAMES: tuple[str, ...] = ("local-data", "work")
+
+# WGPK binary pack format constants (matching shaders/src/pack.rs byte-for-byte)
+WGPK_MAGIC = b"WGPK"
+WGPK_VERSION_V1 = 1
+WGPK_VERSION_V2 = 2
+WGPK_SUPPORTED_VERSIONS: tuple[int, ...] = (WGPK_VERSION_V1, WGPK_VERSION_V2)
+WGPK_HEADER_STRUCT = struct.Struct("<4sIII")
+WGPK_HEADER_BYTES = WGPK_HEADER_STRUCT.size  # 16 bytes
+WGPK_ENTRY_STRUCT_V1 = struct.Struct("<QB3sII")
+WGPK_ENTRY_BYTES_V1 = WGPK_ENTRY_STRUCT_V1.size  # 20 bytes
+WGPK_ENTRY_STRUCT_V2 = struct.Struct("<QB3sIQ")
+WGPK_ENTRY_BYTES_V2 = WGPK_ENTRY_STRUCT_V2.size  # 24 bytes
+WGPK_VALID_STAGES: frozenset[int] = frozenset({1, 2, 3})
+WGPK_MAX_U32 = 0xFFFFFFFF
+WGPK_MAX_U64 = 0xFFFFFFFFFFFFFFFF
+WGPK_TOC_CHUNK_ENTRIES = 4096
+WGPK_MAX_ENTRY_ERRORS = 8
+_COPY_CHUNK_BYTES = 1024 * 1024  # 1 MiB streaming copy buffer for >4 GiB packs
+
+# Reflection sidecar v1/v2/v3 constants (matching tools/stage_reflection_sidecar.py)
+REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
+REFLECT_SIDECAR_SUPPORTED_VERSIONS: tuple[int, ...] = (1, 2, 3)
+REFLECT_KIND_MAP: dict[str, str] = {
+    "uniform": "uniform",
+    "storage": "storage",
+    "read_only_storage": "read_only_storage",
+    "read-only-storage": "read_only_storage",
+    "texture": "texture",
+    "texture_2d": "texture",
+    "storage_texture": "storage_texture",
+    "storage-texture": "storage_texture",
+    "sampler": "sampler",
+    "comparison_sampler": "comparison_sampler",
+    "sampler_comparison": "comparison_sampler",
+}
+REFLECT_READ_ONLY_KINDS: frozenset[str] = frozenset(
+    {"uniform", "read_only_storage", "texture", "sampler", "comparison_sampler"}
+)
+_SAFE_UNRESOLVED_LABEL_RE = re.compile(r"^[A-Za-z0-9_.$<>\[\]-]{1,64}$")
+_SAFE_PACK_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MAX_MESH_VERTICES = 256
+MAX_MESH_PRIMITIVES = 256
+MAX_MESH_VERTEX_WORDS = 64
 
 SET_GAME_HINT = 'python tools/local_env.py --set-game "<path>"'
 MAX_OUTPUT_CHARS = 4000
@@ -242,12 +288,19 @@ def build_pipeline_plan(
     *,
     step: str = "all",
     skip_incomplete: bool = False,
+    pack_version: str = "auto",
+    pack_shaders: bool = False,
 ) -> list[PlannedStep]:
     """Build the validated, inspectable execution plan for the requested pipeline step(s)."""
     if step not in STEP_CHOICES:
         raise PipelineValidationError(
             f"Unknown step '{step}'. Expected one of: {', '.join(STEP_CHOICES)}.",
             code="invalid_step",
+        )
+    if pack_version not in PACK_VERSION_CHOICES:
+        raise PipelineValidationError(
+            f"Unknown pack_version '{pack_version}'. Expected one of: {', '.join(PACK_VERSION_CHOICES)}.",
+            code="invalid_pack_version",
         )
 
     validate_config(config)
@@ -389,23 +442,33 @@ def build_pipeline_plan(
                     )
                 )
             else:
+                shader_cmd = [
+                    "cargo",
+                    "run",
+                    "-p",
+                    "playgta6-shaders",
+                    "--",
+                    "convert",
+                    "--spirv",
+                    str(spirv_dir),
+                    "--out",
+                    str(shaders_out),
+                ]
+                shader_outputs: list[Path] = [shaders_out]
+                if pack_shaders or pack_version != "auto":
+                    pack_out = validate_output_path(
+                        shaders_out / "shaders.wgsl.pack",
+                        config.repo_root,
+                        label="shader pack output",
+                    )
+                    shader_cmd.extend(["--pack", str(pack_out), "--pack-version", pack_version])
+                    shader_outputs.append(pack_out)
                 plan.append(
                     PlannedStep(
                         name="shaders",
                         description="Convert local SPIR-V shaders into WGSL in local-data/shaders/",
-                        command=(
-                            "cargo",
-                            "run",
-                            "-p",
-                            "playgta6-shaders",
-                            "--",
-                            "convert",
-                            "--spirv",
-                            str(spirv_dir),
-                            "--out",
-                            str(shaders_out),
-                        ),
-                        outputs=(shaders_out,),
+                        command=tuple(shader_cmd),
+                        outputs=tuple(shader_outputs),
                     )
                 )
 
@@ -641,6 +704,533 @@ def _config_summary(config: PipelineConfig, *, env: Mapping[str, str] | None = N
     }
 
 
+def get_file_size(path: Path) -> int:
+    """Return the byte size of `path` (isolated helper for clean unit-test mocking)."""
+    return int(path.stat().st_size)
+
+
+def _is_valid_uint32(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 0xFFFFFFFF
+
+
+def _safe_basename(path: Path | str) -> str:
+    raw = str(path).strip().rstrip("/\\")
+    if not raw:
+        return "<unknown>"
+    parts = re.split(r"[/\\]+", raw)
+    base = parts[-1]
+    if not base or (len(base) == 2 and base[1] == ":"):
+        return "<unknown>"
+    return base
+
+
+def _sanitize_standalone_text(raw: str) -> str:
+    """Redact host filesystem paths and active OS usernames without requiring a PipelineConfig."""
+    if not raw:
+        return raw
+    text = str(raw)
+    text = _UNC_PATH_RE.sub("<HOST_PATH>", text)
+    text = text.replace("\\", "/")
+    text = _WINDOWS_PATH_RE.sub("<HOST_PATH>", text)
+    text = _POSIX_PATH_RE.sub("<HOST_PATH>", text)
+    for username in _current_usernames():
+        user_re = re.compile(
+            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+            re.IGNORECASE,
+        )
+        text = user_re.sub("<USER>", text)
+    return text
+
+
+def validate_shader_pack_header(pack_path: Path) -> dict[str, Any]:
+    """Quick-validate a WGPK v1 (20B TOC) or v2 (24B TOC, >4 GiB) pack without loading payloads."""
+    path = Path(pack_path)
+    label = _sanitize_standalone_text(_safe_basename(path))
+    errors: list[str] = []
+    version: int | None = None
+    entry_bytes: int | None = None
+    entry_count: int | None = None
+    size_bytes = 0
+
+    if not path.exists():
+        errors.append(f"{label}: shader pack file does not exist")
+        return {
+            "ok": False,
+            "version": None,
+            "entry_bytes": None,
+            "entry_count": None,
+            "size_bytes": 0,
+            "is_v2": False,
+            "errors": errors,
+        }
+    if not path.is_file():
+        errors.append(f"{label}: shader pack path is not a regular file")
+        return {
+            "ok": False,
+            "version": None,
+            "entry_bytes": None,
+            "entry_count": None,
+            "size_bytes": 0,
+            "is_v2": False,
+            "errors": errors,
+        }
+
+    try:
+        size_bytes = get_file_size(path)
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        errors.append(_sanitize_standalone_text(f"{label}: failed to stat shader pack: {reason}"))
+        return {
+            "ok": False,
+            "version": None,
+            "entry_bytes": None,
+            "entry_count": None,
+            "size_bytes": 0,
+            "is_v2": False,
+            "errors": errors,
+        }
+
+    if size_bytes < WGPK_HEADER_BYTES:
+        errors.append(
+            f"{label}: truncated header ({size_bytes} bytes, minimum {WGPK_HEADER_BYTES} bytes)"
+        )
+        return {
+            "ok": False,
+            "version": None,
+            "entry_bytes": None,
+            "entry_count": None,
+            "size_bytes": size_bytes,
+            "is_v2": False,
+            "errors": errors,
+        }
+
+    try:
+        with path.open("rb") as fh:
+            header = fh.read(WGPK_HEADER_BYTES)
+            if len(header) < WGPK_HEADER_BYTES:
+                errors.append(f"{label}: truncated while reading WGPK header")
+            else:
+                magic, ver, count, _flags = WGPK_HEADER_STRUCT.unpack_from(header, 0)
+                if magic != WGPK_MAGIC:
+                    errors.append(f"{label}: invalid WGPK magic (expected 'WGPK')")
+                else:
+                    version = int(ver)
+                    entry_count = int(count)
+                    if ver not in WGPK_SUPPORTED_VERSIONS:
+                        errors.append(
+                            f"{label}: unsupported WGPK version {ver} (expected 1 or 2)"
+                        )
+                    else:
+                        is_v2 = ver == WGPK_VERSION_V2
+                        entry_bytes = WGPK_ENTRY_BYTES_V2 if is_v2 else WGPK_ENTRY_BYTES_V1
+                        max_offset_limit = WGPK_MAX_U64 if is_v2 else WGPK_MAX_U32
+                        table_bytes = count * entry_bytes
+                        data_start = WGPK_HEADER_BYTES + table_bytes
+                        if data_start > size_bytes:
+                            errors.append(
+                                f"{label}: truncated entry table (entry_count={count} "
+                                f"requires {data_start} bytes, file is {size_bytes} bytes)"
+                            )
+                        elif not is_v2 and data_start > WGPK_MAX_U32:
+                            errors.append(
+                                f"{label}: WGPK v1 entry table overflows uint32 for {count} entries"
+                            )
+                        else:
+                            processed = 0
+                            reported = 0
+                            suppressed = 0
+                            while processed < count:
+                                batch = min(WGPK_TOC_CHUNK_ENTRIES, count - processed)
+                                chunk_len = batch * entry_bytes
+                                chunk = fh.read(chunk_len)
+                                if len(chunk) < chunk_len:
+                                    errors.append(f"{label}: truncated while reading entry table")
+                                    break
+                                for rel_idx in range(batch):
+                                    idx = processed + rel_idx
+                                    base = rel_idx * entry_bytes
+                                    if is_v2:
+                                        _h, stage_raw, _res, length, offset = (
+                                            WGPK_ENTRY_STRUCT_V2.unpack_from(chunk, base)
+                                        )
+                                    else:
+                                        _h, stage_raw, _res, offset, length = (
+                                            WGPK_ENTRY_STRUCT_V1.unpack_from(chunk, base)
+                                        )
+                                    if stage_raw not in WGPK_VALID_STAGES:
+                                        if reported < WGPK_MAX_ENTRY_ERRORS:
+                                            errors.append(
+                                                f"{label}: entry {idx} has invalid shader stage {stage_raw}"
+                                            )
+                                            reported += 1
+                                        else:
+                                            suppressed += 1
+                                    payload_end = offset + length
+                                    if (
+                                        offset < data_start
+                                        or payload_end > max_offset_limit
+                                        or payload_end > size_bytes
+                                    ):
+                                        if reported < WGPK_MAX_ENTRY_ERRORS:
+                                            errors.append(
+                                                f"{label}: entry {idx} payload [{offset}..+{length}] "
+                                                f"out of bounds for [{data_start}..{size_bytes}]"
+                                            )
+                                            reported += 1
+                                        else:
+                                            suppressed += 1
+                                processed += batch
+                            if suppressed > 0:
+                                errors.append(
+                                    f"{label}: {suppressed} additional invalid/out-of-bounds entry error(s)"
+                                )
+    except OSError as exc:
+        reason = exc.strerror or type(exc).__name__
+        errors.append(_sanitize_standalone_text(f"{label}: failed to read shader pack: {reason}"))
+
+    return {
+        "ok": len(errors) == 0,
+        "version": version,
+        "entry_bytes": entry_bytes,
+        "entry_count": entry_count,
+        "size_bytes": size_bytes,
+        "is_v2": bool(version == WGPK_VERSION_V2),
+        "errors": errors,
+    }
+
+
+def validate_reflect_sidecar_file(sidecar_path: Path) -> dict[str, Any]:
+    """Validate a `playgta6-stage-reflection` sidecar (v1, v2, or v3)."""
+    path = Path(sidecar_path)
+    label = _sanitize_standalone_text(_safe_basename(path))
+    errors: list[str] = []
+    schema_str: str | None = None
+    version_int: int | None = None
+    stage_count = 0
+    unresolved_source_stages = 0
+    unresolved_source_bindings = 0
+    mesh_output_stages = 0
+    size_bytes = 0
+
+    if not path.exists():
+        errors.append(f"{label}: reflection sidecar file does not exist")
+        return {
+            "ok": False,
+            "schema": None,
+            "version": None,
+            "stage_count": 0,
+            "unresolved_source_stages": 0,
+            "unresolved_source_bindings": 0,
+            "mesh_output_stages": 0,
+            "size_bytes": 0,
+            "errors": errors,
+        }
+    if not path.is_file():
+        errors.append(f"{label}: reflection sidecar path is not a regular file")
+        return {
+            "ok": False,
+            "schema": None,
+            "version": None,
+            "stage_count": 0,
+            "unresolved_source_stages": 0,
+            "unresolved_source_bindings": 0,
+            "mesh_output_stages": 0,
+            "size_bytes": 0,
+            "errors": errors,
+        }
+
+    try:
+        size_bytes = get_file_size(path)
+        raw_text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        errors.append(f"{label}: failed to read reflection sidecar ({type(exc).__name__})")
+        return {
+            "ok": False,
+            "schema": None,
+            "version": None,
+            "stage_count": 0,
+            "unresolved_source_stages": 0,
+            "unresolved_source_bindings": 0,
+            "mesh_output_stages": 0,
+            "size_bytes": size_bytes,
+            "errors": errors,
+        }
+
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        errors.append(f"{label}: invalid JSON ({type(exc).__name__})")
+        return {
+            "ok": False,
+            "schema": None,
+            "version": None,
+            "stage_count": 0,
+            "unresolved_source_stages": 0,
+            "unresolved_source_bindings": 0,
+            "mesh_output_stages": 0,
+            "size_bytes": size_bytes,
+            "errors": errors,
+        }
+
+    if not isinstance(doc, Mapping):
+        errors.append(f"{label}: top-level JSON value must be an object")
+        return {
+            "ok": False,
+            "schema": None,
+            "version": None,
+            "stage_count": 0,
+            "unresolved_source_stages": 0,
+            "unresolved_source_bindings": 0,
+            "mesh_output_stages": 0,
+            "size_bytes": size_bytes,
+            "errors": errors,
+        }
+
+    raw_schema = doc.get("schema")
+    if isinstance(raw_schema, str) and raw_schema.strip():
+        schema_str = _sanitize_standalone_text(raw_schema.strip())
+    if schema_str != REFLECT_SIDECAR_SCHEMA:
+        errors.append(
+            f"{label}: invalid schema '{schema_str or '<missing>'}' "
+            f"(expected '{REFLECT_SIDECAR_SCHEMA}')"
+        )
+
+    raw_version = doc.get("version")
+    if isinstance(raw_version, int) and not isinstance(raw_version, bool):
+        version_int = int(raw_version)
+    if version_int not in REFLECT_SIDECAR_SUPPORTED_VERSIONS:
+        errors.append(
+            f"{label}: unsupported version {raw_version!r} (expected 1, 2, or 3)"
+        )
+
+    stages = doc.get("stages")
+    if not isinstance(stages, Mapping):
+        errors.append(f"{label}: missing or invalid 'stages' object")
+    else:
+        stage_count = len(stages)
+        for stage_key, stage_entry in stages.items():
+            safe_stage_key = _sanitize_standalone_text(str(stage_key))
+            if not isinstance(stage_entry, Mapping):
+                errors.append(f"{label}: stage '{safe_stage_key}' must be an object")
+                continue
+
+            if "mesh_output" in stage_entry and stage_entry["mesh_output"] is not None:
+                mo = stage_entry["mesh_output"]
+                mo_ok = (
+                    isinstance(mo, Mapping)
+                    and _is_valid_uint32(mo.get("max_vertices"))
+                    and 1 <= mo["max_vertices"] <= MAX_MESH_VERTICES
+                    and _is_valid_uint32(mo.get("max_primitives"))
+                    and 1 <= mo["max_primitives"] <= MAX_MESH_PRIMITIVES
+                    and _is_valid_uint32(mo.get("vertex_words"))
+                    and 4 <= mo["vertex_words"] <= MAX_MESH_VERTEX_WORDS
+                    and mo["vertex_words"] % 4 == 0
+                )
+                if mo_ok:
+                    mesh_output_stages += 1
+                else:
+                    errors.append(f"{label}: stage '{safe_stage_key}' has malformed mesh_output")
+
+            bindings = stage_entry.get("bindings")
+            if bindings is None:
+                continue
+            if not isinstance(bindings, list):
+                errors.append(f"{label}: stage '{safe_stage_key}' 'bindings' must be a list")
+                continue
+
+            stage_has_unresolved = False
+            for b_idx, binding in enumerate(bindings):
+                if not isinstance(binding, Mapping):
+                    continue
+                source = binding.get("source")
+                if not isinstance(source, Mapping):
+                    continue
+
+                if "inline_sampler" in source:
+                    sampler = source["inline_sampler"]
+                    words = sampler.get("sdwords") if isinstance(sampler, Mapping) else None
+                    if not (
+                        isinstance(words, list)
+                        and len(words) == 4
+                        and all(_is_valid_uint32(w) for w in words)
+                    ):
+                        errors.append(
+                            f"{label}: stage '{safe_stage_key}' binding[{b_idx}] "
+                            f"has malformed inline_sampler"
+                        )
+
+                if source.get("root_descriptor") is True and "table_byte_offset" in source:
+                    tbo = source["table_byte_offset"]
+                    if not (_is_valid_uint32(tbo) and tbo % 32 == 0):
+                        errors.append(
+                            f"{label}: stage '{safe_stage_key}' binding[{b_idx}] "
+                            f"has malformed v2 root_descriptor table_byte_offset"
+                        )
+
+                if "unresolved" in source:
+                    mark = source["unresolved"]
+                    mark_ok = mark is True or (
+                        isinstance(mark, str)
+                        and bool(mark.strip())
+                        and _SAFE_UNRESOLVED_LABEL_RE.match(mark) is not None
+                    )
+                    raw_kind = binding.get("kind")
+                    norm_kind = (
+                        REFLECT_KIND_MAP.get(raw_kind.strip().lower())
+                        if isinstance(raw_kind, str)
+                        else None
+                    )
+                    if len(source) != 1 or not mark_ok or norm_kind not in REFLECT_READ_ONLY_KINDS:
+                        errors.append(
+                            f"{label}: stage '{safe_stage_key}' binding[{b_idx}] "
+                            f"has invalid v3 unresolved source (must be read-only kind)"
+                        )
+                    else:
+                        unresolved_source_bindings += 1
+                        stage_has_unresolved = True
+
+            if stage_has_unresolved:
+                unresolved_source_stages += 1
+
+    return {
+        "ok": len(errors) == 0,
+        "schema": schema_str,
+        "version": version_int,
+        "stage_count": stage_count,
+        "unresolved_source_stages": unresolved_source_stages,
+        "unresolved_source_bindings": unresolved_source_bindings,
+        "mesh_output_stages": mesh_output_stages,
+        "size_bytes": size_bytes,
+        "errors": errors,
+    }
+
+
+def _atomic_copy_file(src: Path, dst: Path) -> None:
+    """Atomically copy `src` to `dst` using a temp file in `dst.parent` + `os.replace`."""
+    resolved_src = src.resolve()
+    resolved_dst = dst.resolve()
+    if resolved_src == resolved_dst:
+        return
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=str(dst.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as out_fh, src.open("rb") as in_fh:
+            while True:
+                chunk = in_fh.read(_COPY_CHUNK_BYTES)
+                if not chunk:
+                    break
+                out_fh.write(chunk)
+            out_fh.flush()
+        os.replace(tmp_path, dst)
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def stage_shader_bundle(
+    pack_path: Path,
+    config: PipelineConfig,
+    *,
+    dest_dir: Path | None = None,
+    reflect_path: Path | None = None,
+    dry_run: bool = False,
+    env: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Validate and atomically stage a WGPK v1/v2 pack + optional v1-v3 `.reflect.json` sidecar."""
+    src_pack = Path(pack_path).expanduser()
+    target_dir = Path(dest_dir) if dest_dir is not None else (config.data_dir / "shaders")
+    resolved_target_dir = validate_output_path(
+        target_dir,
+        config.repo_root,
+        label="shader staging directory",
+    )
+
+    pack_name = _safe_basename(src_pack)
+    if not _SAFE_PACK_FILENAME_RE.match(pack_name) or ".." in pack_name:
+        raise PipelineValidationError(
+            "Invalid shader pack filename for staging.",
+            code="invalid_pack_filename",
+        )
+    pack_dest = validate_output_path(
+        resolved_target_dir / pack_name,
+        config.repo_root,
+        label="staged shader pack",
+    )
+    pack_meta = validate_shader_pack_header(src_pack)
+
+    active_reflect: Path | None = None
+    if reflect_path is not None:
+        active_reflect = Path(reflect_path).expanduser()
+    else:
+        sibling_reflect = src_pack.parent / f"{src_pack.name}.reflect.json"
+        if sibling_reflect.is_file():
+            active_reflect = sibling_reflect
+
+    reflect_meta: dict[str, Any] | None = None
+    reflect_dest: Path | None = None
+    reflect_name: str | None = None
+    if active_reflect is not None:
+        reflect_name = _safe_basename(active_reflect)
+        if not _SAFE_PACK_FILENAME_RE.match(reflect_name) or ".." in reflect_name:
+            raise PipelineValidationError(
+                "Invalid reflection sidecar filename for staging.",
+                code="invalid_reflect_filename",
+            )
+        reflect_dest = validate_output_path(
+            resolved_target_dir / reflect_name,
+            config.repo_root,
+            label="staged reflection sidecar",
+        )
+        reflect_meta = validate_reflect_sidecar_file(active_reflect)
+
+    all_errors: list[str] = list(pack_meta["errors"])
+    if reflect_meta is not None:
+        all_errors.extend(reflect_meta["errors"])
+
+    ok = len(all_errors) == 0
+    staged = False
+    if ok and not dry_run:
+        try:
+            _atomic_copy_file(src_pack, pack_dest)
+            if active_reflect is not None and reflect_dest is not None:
+                _atomic_copy_file(active_reflect, reflect_dest)
+            staged = True
+        except OSError as exc:
+            reason = exc.strerror or type(exc).__name__
+            all_errors.append(f"failed to stage shader bundle: {reason}")
+            ok = False
+
+    safe_pack_name = sanitize_text(pack_name, config, env=env)
+    pack_summary: dict[str, Any] = {
+        "name": safe_pack_name,
+        "dest": sanitize_path(pack_dest, config, env=env),
+        **pack_meta,
+    }
+    reflect_summary: dict[str, Any] | None = None
+    if reflect_meta is not None and reflect_name is not None and reflect_dest is not None:
+        safe_reflect_name = sanitize_text(reflect_name, config, env=env)
+        reflect_summary = {
+            "name": safe_reflect_name,
+            "dest": sanitize_path(reflect_dest, config, env=env),
+            **reflect_meta,
+        }
+
+    result: dict[str, Any] = {
+        "ok": ok,
+        "dryRun": bool(dry_run),
+        "staged": staged,
+        "targetDir": sanitize_path(resolved_target_dir, config, env=env),
+        "pack": pack_summary,
+        "reflect": reflect_summary,
+        "errors": all_errors,
+    }
+    return _sanitize_payload(result, config, env=env)
+
+
 def run_pipeline(
     repo_root: Path | str = DEFAULT_REPO_ROOT,
     *,
@@ -649,13 +1239,23 @@ def run_pipeline(
     skip_incomplete: bool = False,
     dry_run: bool = False,
     runner: Runner | None = None,
+    pack_version: str = "auto",
+    pack_shaders: bool = False,
+    stage_pack: Path | str | None = None,
+    stage_reflect: Path | str | None = None,
 ) -> dict[str, Any]:
     """Validate config, build plan, optionally execute via `runner`, and return a sanitized report."""
     config = resolve_config(repo_root, env=env)
     cfg_summary = _config_summary(config, env=env)
 
     try:
-        plan = build_pipeline_plan(config, step=step, skip_incomplete=skip_incomplete)
+        plan = build_pipeline_plan(
+            config,
+            step=step,
+            skip_incomplete=skip_incomplete,
+            pack_version=pack_version,
+            pack_shaders=pack_shaders,
+        )
     except PipelineValidationError as exc:
         report: dict[str, Any] = {
             "schemaVersion": SCHEMA_VERSION,
@@ -790,14 +1390,42 @@ def run_pipeline(
                 }
             )
 
+    staged_bundle: dict[str, Any] | None = None
+    stage_error: str | None = None
+    stage_error_code: str | None = None
+    if stage_pack is not None and failed_count == 0:
+        try:
+            staged_bundle = stage_shader_bundle(
+                Path(stage_pack),
+                config,
+                reflect_path=Path(stage_reflect) if stage_reflect is not None else None,
+                dry_run=dry_run,
+                env=env,
+            )
+            if not staged_bundle["ok"]:
+                stage_error = (
+                    staged_bundle["errors"][0]
+                    if staged_bundle["errors"]
+                    else "Shader bundle staging failed."
+                )
+                stage_error_code = "stage_shader_bundle_failed"
+        except PipelineValidationError as exc:
+            stage_error = str(exc)
+            stage_error_code = exc.code
+
+    overall_ok = failed_count == 0 and stage_error is None
     report = {
         "schemaVersion": SCHEMA_VERSION,
-        "ok": failed_count == 0,
+        "ok": overall_ok,
         "dryRun": dry_run,
         "step": step,
         "skipIncomplete": skip_incomplete,
-        "error": top_error,
-        "errorCode": "step_failed" if failed_step is not None else None,
+        "error": top_error if top_error is not None else stage_error,
+        "errorCode": (
+            "step_failed"
+            if failed_step is not None
+            else stage_error_code
+        ),
         "hint": None,
         "failedStep": failed_step,
         "config": cfg_summary,
@@ -811,6 +1439,57 @@ def run_pipeline(
             "notRun": not_run_count,
         },
     }
+    if staged_bundle is not None:
+        report["stagedShaderBundle"] = staged_bundle
+    return _sanitize_payload(report, config, env=env)
+
+
+def run_stage_shader_bundle(
+    pack_path: Path | str,
+    *,
+    repo_root: Path | str = DEFAULT_REPO_ROOT,
+    env: Mapping[str, str] | None = None,
+    dest_dir: Path | str | None = None,
+    reflect_path: Path | str | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Standalone wrapper for `--stage-pack` that does not require `GTA6_GAME_DIR`."""
+    config = resolve_config(repo_root, env=env)
+    cfg_summary = _config_summary(config, env=env)
+    try:
+        staged = stage_shader_bundle(
+            Path(pack_path),
+            config,
+            dest_dir=Path(dest_dir) if dest_dir is not None else None,
+            reflect_path=Path(reflect_path) if reflect_path is not None else None,
+            dry_run=dry_run,
+            env=env,
+        )
+    except PipelineValidationError as exc:
+        report: dict[str, Any] = {
+            "schemaVersion": SCHEMA_VERSION,
+            "ok": False,
+            "dryRun": dry_run,
+            "step": "stage-pack",
+            "error": str(exc),
+            "errorCode": exc.code,
+            "hint": exc.hint,
+            "config": cfg_summary,
+            "stagedShaderBundle": None,
+        }
+        return _sanitize_payload(report, config, env=env)
+
+    report = {
+        "schemaVersion": SCHEMA_VERSION,
+        "ok": bool(staged["ok"]),
+        "dryRun": dry_run,
+        "step": "stage-pack",
+        "error": staged["errors"][0] if staged["errors"] else None,
+        "errorCode": None if staged["ok"] else "stage_shader_bundle_failed",
+        "hint": None,
+        "config": cfg_summary,
+        "stagedShaderBundle": staged,
+    }
     return _sanitize_payload(report, config, env=env)
 
 
@@ -819,7 +1498,7 @@ def format_report_text(report: Mapping[str, Any]) -> str:
     mode = " (DRY RUN)" if report.get("dryRun") else ""
     lines: list[str] = [f"=== playgta6web Local Asset Pipeline{mode} ==="]
 
-    if report.get("error") and not report.get("steps"):
+    if report.get("error") and not report.get("steps") and not report.get("stagedShaderBundle"):
         lines.append(f"ERROR: {report['error']}")
         if report.get("hint"):
             lines.append(f"Hint : {report['hint']}")
@@ -848,17 +1527,36 @@ def format_report_text(report: Mapping[str, Any]) -> str:
                 first_err = str(entry["stderr"]).splitlines()[0]
                 lines.append(f"         stderr: {first_err}")
 
-    summary = report.get("summary", {})
-    lines.append("")
-    lines.append(
-        "Summary: "
-        f"total={summary.get('total', 0)}, "
-        f"planned={summary.get('planned', 0)}, "
-        f"succeeded={summary.get('succeeded', 0)}, "
-        f"failed={summary.get('failed', 0)}, "
-        f"skipped={summary.get('skipped', 0)}, "
-        f"notRun={summary.get('notRun', 0)}"
-    )
+    staged = report.get("stagedShaderBundle")
+    if isinstance(staged, Mapping):
+        pack = staged.get("pack") or {}
+        tag = "[PLAN]" if staged.get("dryRun") else ("[OK]  " if staged.get("ok") else "[FAIL]")
+        ver = pack.get("version")
+        ver_tag = f"WGPK v{ver}" if ver is not None else "WGPK v?"
+        lines.append(
+            f"  {tag} stage-pack {pack.get('name', '<pack>')} "
+            f"({ver_tag}, entries={pack.get('entry_count')}, dest={pack.get('dest')})"
+        )
+        reflect = staged.get("reflect")
+        if isinstance(reflect, Mapping):
+            lines.append(
+                f"         reflect: {reflect.get('name', '<reflect>')} "
+                f"(v{reflect.get('version')}, stages={reflect.get('stage_count')}, "
+                f"dest={reflect.get('dest')})"
+            )
+
+    if "summary" in report:
+        summary = report.get("summary", {})
+        lines.append("")
+        lines.append(
+            "Summary: "
+            f"total={summary.get('total', 0)}, "
+            f"planned={summary.get('planned', 0)}, "
+            f"succeeded={summary.get('succeeded', 0)}, "
+            f"failed={summary.get('failed', 0)}, "
+            f"skipped={summary.get('skipped', 0)}, "
+            f"notRun={summary.get('notRun', 0)}"
+        )
     if report.get("error"):
         lines.append(f"ERROR: {report['error']}")
     return "\n".join(lines)
@@ -898,19 +1596,56 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help="Run only one pipeline step or 'all' (default: all).",
     )
+    parser.add_argument(
+        "--pack-version",
+        choices=PACK_VERSION_CHOICES,
+        default="auto",
+        help="WGPK pack version policy for the shaders step: auto, 1, or 2 (default: auto).",
+    )
+    parser.add_argument(
+        "--pack-shaders",
+        action="store_true",
+        help="Also emit <data_dir>/shaders/shaders.wgsl.pack during the shaders step.",
+    )
+    parser.add_argument(
+        "--stage-pack",
+        type=Path,
+        default=None,
+        help="Validate and atomically stage an existing WGPK v1/v2 .wgsl.pack (+ sibling .reflect.json) into local-data/shaders/.",
+    )
+    parser.add_argument(
+        "--stage-reflect",
+        type=Path,
+        default=None,
+        help="Optional explicit reflection sidecar (.reflect.json, v1/v2/v3) to stage alongside --stage-pack.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_arg_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
-    report = run_pipeline(
-        repo_root=args.repo_root,
-        step=args.step,
-        skip_incomplete=args.skip_incomplete,
-        dry_run=args.dry_run,
-    )
+    explicit_step = any(tok == "--step" or tok.startswith("--step=") for tok in raw_argv)
+    if args.stage_pack is not None and not explicit_step:
+        report = run_stage_shader_bundle(
+            args.stage_pack,
+            repo_root=args.repo_root,
+            reflect_path=args.stage_reflect,
+            dry_run=args.dry_run,
+        )
+    else:
+        report = run_pipeline(
+            repo_root=args.repo_root,
+            step=args.step,
+            skip_incomplete=args.skip_incomplete,
+            dry_run=args.dry_run,
+            pack_version=args.pack_version,
+            pack_shaders=args.pack_shaders,
+            stage_pack=args.stage_pack,
+            stage_reflect=args.stage_reflect,
+        )
 
     if args.json:
         print(json.dumps(report, indent=2))
