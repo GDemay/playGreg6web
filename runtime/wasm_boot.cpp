@@ -328,9 +328,9 @@ struct ScopedActiveBootConfig {
 
 // Bridges Win32 CreateFile/GetFileAttributes and Xbox DirectStorage (XCRDAPI) onto
 // open_path/read_path/close_path whenever no Win32 HTTPFS client is already installed.
-// Direct mode: reads go straight into the caller's buffer (no mailbox staging copy), one chunk
-// per FIFO lock turn, so a bulk DirectStorage read no longer holds every other reader (Bink,
-// ReadFile on the title's threads) off for its whole length.
+// Concurrent multi-lane direct mode (O46/W368): reads go straight into the caller's buffer in
+// 256 KiB chunks without holding a global C++ lock, letting multiple pthreads drive the 8-lane
+// browser HTTPFS pool in parallel (each shared lane coordinates via atomic SAB claiming in JS).
 class ScopedWin32HttpfsBridge {
 public:
     explicit ScopedWin32HttpfsBridge(const WasmBootConfig& cfg) : cfg_(&cfg) {
@@ -350,6 +350,8 @@ public:
             close_path(*cfg_, handle);
             return true;
         };
+        backend.concurrent = true;
+        backend.max_chunk_bytes = 256 * 1024;
         client_ = std::make_unique<os::HttpfsMailboxClient>(std::move(backend));
         os::win32::set_httpfs_client(client_.get());
         installed_ = true;
