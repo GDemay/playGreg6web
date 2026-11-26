@@ -46,6 +46,9 @@
   const DEFAULT_MAX_BIND_GROUP_CACHE_ENTRIES = 1024;
   const DEFAULT_MAX_WGSL_HASH_CACHE_ENTRIES = 256;
   const MAX_VIEWS_PER_TEXTURE = 64;
+  const I32_MIN = -0x80000000;
+  const I32_MAX = 0x7fffffff;
+  const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
 
   const PASSTHROUGH_DRAW_STATE_KEYS = Object.freeze([
     'hasBoundCbv',
@@ -632,6 +635,51 @@
     }
 
     return FALLBACK_PROFILE.DEFAULT;
+  }
+
+  function resolveIndirectDrawModule() {
+    if (
+      typeof globalThis !== 'undefined' &&
+      globalThis.PlayGta6IndirectDraw &&
+      typeof globalThis.PlayGta6IndirectDraw.GpuIndirectClampPass === 'function'
+    ) {
+      return globalThis.PlayGta6IndirectDraw;
+    }
+    if (typeof importScripts === 'function') {
+      try {
+        importScripts('./indirect_draw.js');
+      } catch (_err) {
+        // Optional helper unavailable in this worker context.
+      }
+      if (
+        typeof globalThis !== 'undefined' &&
+        globalThis.PlayGta6IndirectDraw &&
+        typeof globalThis.PlayGta6IndirectDraw.GpuIndirectClampPass === 'function'
+      ) {
+        return globalThis.PlayGta6IndirectDraw;
+      }
+    }
+    if (typeof require === 'function') {
+      try {
+        const mod = require('./indirect_draw.js');
+        if (mod && typeof mod.GpuIndirectClampPass === 'function') {
+          return mod;
+        }
+      } catch (_err) {
+        // Optional helper unavailable in this Node context.
+      }
+    }
+    return null;
+  }
+
+  function normalizeSignedBaseVertex(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      return 0;
+    }
+    const t = Math.trunc(value);
+    if (t < I32_MIN) return I32_MIN;
+    if (t > I32_MAX) return I32_MAX;
+    return t | 0;
   }
 
   function resolveShaderFallbackRouterCtor() {
@@ -1402,6 +1450,15 @@
       bindGroupErrors: 0,
       passErrors: 0,
       legacyRouterFallbacks: 0,
+      clampedIndirectDraws: 0,
+      clampedIndirectDispatches: 0,
+      indirectClampPasses: 0,
+      indirectFirstInstanceClamped: 0,
+      meshComputeDraws: 0,
+      meshIndirectComputeDraws: 0,
+      meshZeroCountElided: 0,
+      multiPassInstancedDraws: 0,
+      multiPassInstancedSubDraws: 0,
     };
   }
 
@@ -1499,6 +1556,17 @@
           : defaultElide;
       this._reuseDrawResult = opts.reuseDrawResult === true;
       this._onWarning = typeof opts.onWarning === 'function' ? opts.onWarning : null;
+      this._indirectClampExecutor =
+        opts.indirectClampExecutor !== undefined ? opts.indirectClampExecutor : null;
+      this._ownsIndirectClampExecutor = false;
+      this._indirectFirstInstanceOverride =
+        opts.indirectFirstInstance !== undefined ? Boolean(opts.indirectFirstInstance) : null;
+      this._maxComputeWorkgroupsOverride =
+        typeof opts.maxComputeWorkgroupsPerDimension === 'number' &&
+        Number.isInteger(opts.maxComputeWorkgroupsPerDimension) &&
+        opts.maxComputeWorkgroupsPerDimension >= 1
+          ? opts.maxComputeWorkgroupsPerDimension
+          : null;
 
       if (opts.shaderFallbackRouter !== undefined) {
         this._shaderFallbackRouter = opts.shaderFallbackRouter;
@@ -1627,6 +1695,87 @@
         fallbackDrawsThisFrame: 0,
         drawsThisFrame: 0,
       };
+      this._scratchClampOptions = {
+        srcBuffer: null,
+        srcOffset: 0,
+        dstBuffer: null,
+        dstOffset: 0,
+        countBuffer: null,
+        countOffset: 0,
+        commandCount: 1,
+        stride: undefined,
+        maxVertexCount: undefined,
+        maxIndexCount: undefined,
+        maxInstanceCount: undefined,
+        maxWorkgroupsX: undefined,
+        maxWorkgroupsY: undefined,
+        maxWorkgroupsZ: undefined,
+        maxMeshVerticesPerGroup: undefined,
+        maxMeshTotalVertices: undefined,
+        indirectFirstInstance: undefined,
+        maxIndirectBatchCount: undefined,
+        clampBatch: true,
+      };
+      this._scratchClampResult = {
+        ok: false,
+        encoded: false,
+        kind: 'draw',
+        commandCount: 0,
+        workgroupsX: 0,
+        dstBuffer: null,
+        dstOffset: 0,
+        dstByteLength: 0,
+        recordBytes: 0,
+        stride: 0,
+        zeroedFirstInstance: false,
+        hasCountBuffer: false,
+        cacheHit: false,
+        reason: null,
+      };
+      this._reusableMeshResult = {
+        ok: false,
+        executed: false,
+        skipped: false,
+        elided: false,
+        reason: null,
+        indirectDispatch: false,
+        dispatchClamped: false,
+        drawClamped: false,
+        indexed: false,
+        drawsIssued: 0,
+        drawIndirectBuffer: null,
+        drawIndirectOffset: 0,
+        zeroedFirstInstance: false,
+      };
+      this._reusableMultiPassResult = {
+        ok: false,
+        executed: 0,
+        skipped: 0,
+        elided: 0,
+        clamped: 0,
+        fallbackDirect: 0,
+        firstInstanceClamped: 0,
+        reason: null,
+      };
+      this._scratchMeshComputeArgs = {
+        pipeline: null,
+        bindGroups: null,
+        workgroupCountX: 0,
+        workgroupCountY: 1,
+        workgroupCountZ: 1,
+        indirect: false,
+        indirectBuffer: null,
+        indirectOffset: 0,
+        reuseResult: true,
+      };
+      this._scratchMeshDrawArgs = {
+        pipeline: null,
+        indirect: true,
+        indirectBuffer: null,
+        indirectOffset: 0,
+        reuseResult: true,
+      };
+      this._scratchReuseDrawOpts = { reuseResult: true };
 
       // Device-scoped resource caches & object identity maps (WeakMap avoids retention leaks).
       this._fallbackPipelineCache = new Map();
@@ -2935,6 +3084,15 @@
     setDevice(device) {
       if (this._device !== device) {
         this._destroySyntheticResources();
+        if (this._ownsIndirectClampExecutor && this._indirectClampExecutor) {
+          try {
+            this._indirectClampExecutor.destroy();
+          } catch (_err) {
+            // Ignore cleanup errors on previous device.
+          }
+          this._indirectClampExecutor = null;
+          this._ownsIndirectClampExecutor = false;
+        }
         this._fallbackPipelineCache.clear();
         this._fallbackShaderModuleCache.clear();
         this._clearBgCacheInternal();
@@ -2957,6 +3115,52 @@
     }
 
     /**
+     * Check whether the active WebGPU device supports `indirect-first-instance`.
+     */
+    supportsIndirectFirstInstance() {
+      if (this._indirectFirstInstanceOverride !== null) {
+        return this._indirectFirstInstanceOverride;
+      }
+      return Boolean(
+        this._device &&
+          this._device.features &&
+          typeof this._device.features.has === 'function' &&
+          this._device.features.has('indirect-first-instance')
+      );
+    }
+
+    /**
+     * Lazily obtain (or create) the device-scoped `GpuIndirectClampPass` executor used
+     * for GPU-clamped `drawIndirect`, `drawIndexedIndirect`, and `dispatchIndirect`.
+     */
+    getIndirectClampExecutor() {
+      if (this._indirectClampExecutor && this._indirectClampExecutor.destroyed !== true) {
+        return this._indirectClampExecutor;
+      }
+      if (
+        !this._device ||
+        typeof this._device.createShaderModule !== 'function' ||
+        typeof this._device.createComputePipeline !== 'function'
+      ) {
+        return null;
+      }
+      const mod = resolveIndirectDrawModule();
+      if (!mod || typeof mod.GpuIndirectClampPass !== 'function') {
+        return null;
+      }
+      this._indirectClampExecutor = new mod.GpuIndirectClampPass({
+        device: this._device,
+        indirectFirstInstance: this.supportsIndirectFirstInstance(),
+        maxComputeWorkgroupsPerDimension:
+          this._maxComputeWorkgroupsOverride !== null
+            ? this._maxComputeWorkgroupsOverride
+            : undefined,
+      });
+      this._ownsIndirectClampExecutor = true;
+      return this._indirectClampExecutor;
+    }
+
+    /**
      * Reset per-frame draw-visibility counters with zero heap allocations
      * (call at the start of each frame before recording render passes).
      */
@@ -2965,6 +3169,13 @@
       this._frameRealPackDraws = 0;
       this._frameFallbackDraws = 0;
       this._frameDraws = 0;
+      if (
+        this._indirectClampExecutor &&
+        this._indirectClampExecutor.destroyed !== true &&
+        typeof this._indirectClampExecutor.resetFrame === 'function'
+      ) {
+        this._indirectClampExecutor.resetFrame();
+      }
     }
 
     /**
@@ -6048,6 +6259,18 @@
     executeCompute(pass, computeArgs = {}) {
       const args = computeArgs && typeof computeArgs === 'object' ? computeArgs : null;
       const indirect = Boolean(args && (args.indirect === true || args.indirectBuffer));
+      if (
+        indirect &&
+        args &&
+        args.clamp === true &&
+        (args.commandEncoder || args.clampComputePass)
+      ) {
+        return this.executeClampedDispatchIndirect(
+          args.commandEncoder || null,
+          pass,
+          args
+        );
+      }
       const x = args
         ? toNonNegativeInt(args.workgroupCountX !== undefined ? args.workgroupCountX : args.x, 0)
         : 0;
@@ -6314,6 +6537,1017 @@
     }
 
     /**
+     * Encode a GPU-side compute clamp pass for `draw`, `drawIndexed`, `dispatch`, or
+     * `dispatchMesh` indirect argument buffers without CPU readbacks.
+     * Pass a preallocated `out` object for zero per-draw GC allocations.
+     *
+     * @param {object} passOrEncoder GPUCommandEncoder or GPUComputePassEncoder
+     * @param {string} kind 'draw' | 'drawIndexed' | 'dispatch' | 'dispatchMesh'
+     * @param {object} indirectBuffer Source GPU-written indirect buffer
+     * @param {number} [indirectOffset=0]
+     * @param {object} [options]
+     * @param {object} [out]
+     */
+    clampIndirectArgs(passOrEncoder, kind, indirectBuffer, indirectOffset = 0, options, out) {
+      const target =
+        out !== undefined && out !== null && typeof out === 'object'
+          ? out
+          : options && options.reuseResult === true
+            ? this._scratchClampResult
+            : null;
+      const clampExec =
+        (options && options.clampExecutor) || this.getIndirectClampExecutor();
+      if (!clampExec) {
+        if (target) {
+          target.ok = false;
+          target.encoded = false;
+          target.kind = kind;
+          target.commandCount = 0;
+          target.workgroupsX = 0;
+          target.dstBuffer = null;
+          target.dstOffset = 0;
+          target.dstByteLength = 0;
+          target.recordBytes = 0;
+          target.stride = 0;
+          target.zeroedFirstInstance = false;
+          target.hasCountBuffer = false;
+          target.cacheHit = false;
+          target.reason = 'clamp-executor-unavailable';
+          return target;
+        }
+        return {
+          ok: false,
+          encoded: false,
+          kind,
+          commandCount: 0,
+          workgroupsX: 0,
+          dstBuffer: null,
+          dstOffset: 0,
+          dstByteLength: 0,
+          recordBytes: 0,
+          stride: 0,
+          zeroedFirstInstance: false,
+          hasCountBuffer: false,
+          cacheHit: false,
+          reason: 'clamp-executor-unavailable',
+        };
+      }
+
+      const opts = this._scratchClampOptions;
+      opts.srcBuffer = indirectBuffer;
+      opts.srcOffset = indirectOffset;
+      opts.dstBuffer = options && options.dstBuffer !== undefined ? options.dstBuffer : null;
+      opts.dstOffset = options && options.dstOffset !== undefined ? options.dstOffset : 0;
+      opts.countBuffer = options && options.countBuffer !== undefined ? options.countBuffer : null;
+      opts.countOffset = options && options.countOffset !== undefined ? options.countOffset : 0;
+      opts.commandCount =
+        options && options.commandCount !== undefined
+          ? options.commandCount
+          : options && options.count !== undefined
+            ? options.count
+            : 1;
+      opts.stride = options && options.stride !== undefined ? options.stride : undefined;
+      opts.maxVertexCount =
+        options && options.maxVertexCount !== undefined ? options.maxVertexCount : undefined;
+      opts.maxIndexCount =
+        options && options.maxIndexCount !== undefined ? options.maxIndexCount : undefined;
+      opts.maxInstanceCount =
+        options && options.maxInstanceCount !== undefined ? options.maxInstanceCount : undefined;
+      opts.maxWorkgroupsX =
+        options && options.maxWorkgroupsX !== undefined ? options.maxWorkgroupsX : undefined;
+      opts.maxWorkgroupsY =
+        options && options.maxWorkgroupsY !== undefined ? options.maxWorkgroupsY : undefined;
+      opts.maxWorkgroupsZ =
+        options && options.maxWorkgroupsZ !== undefined ? options.maxWorkgroupsZ : undefined;
+      opts.maxMeshVerticesPerGroup =
+        options && options.maxMeshVerticesPerGroup !== undefined
+          ? options.maxMeshVerticesPerGroup
+          : undefined;
+      opts.maxMeshTotalVertices =
+        options && options.maxMeshTotalVertices !== undefined
+          ? options.maxMeshTotalVertices
+          : undefined;
+      opts.indirectFirstInstance =
+        options && options.indirectFirstInstance !== undefined
+          ? options.indirectFirstInstance
+          : this.supportsIndirectFirstInstance();
+      opts.maxIndirectBatchCount =
+        options && options.maxIndirectBatchCount !== undefined
+          ? options.maxIndirectBatchCount
+          : undefined;
+      opts.clampBatch = !options || options.clampBatch !== false;
+
+      const res = clampExec.encodeClamp(passOrEncoder, kind, opts, target);
+      if (res.ok && res.encoded) {
+        this._stats.indirectClampPasses += 1;
+        if (res.zeroedFirstInstance) {
+          this._stats.indirectFirstInstanceClamped += res.commandCount;
+        }
+      }
+      return res;
+    }
+
+    /**
+     * Execute a GPU-clamped `drawIndirect` (or `drawIndexedIndirect` when `drawArgs.indexed`
+     * is true): runs the compute clamp pass on `encoder` (or `drawArgs.clampComputePass`),
+     * then executes the indirect render draw on `renderPass` from the validated output buffer.
+     * Zero per-draw GC allocations when `reuseResult: true` is set or `this._reuseDrawResult` is true.
+     */
+    executeClampedDrawIndirect(encoder, renderPass, drawArgs = {}) {
+      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : null;
+      const indexed = Boolean(args && args.indexed);
+      const srcBuf = args && args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const srcOff = args && args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      const clampTarget = args && args.clampComputePass ? args.clampComputePass : encoder;
+
+      const clampRes = this.clampIndirectArgs(
+        clampTarget,
+        indexed ? 'drawIndexed' : 'draw',
+        srcBuf,
+        srcOff,
+        args,
+        this._scratchClampResult
+      );
+      if (!clampRes.ok) {
+        const result = this._acquireDrawResult(
+          indexed,
+          true,
+          0,
+          0,
+          Number.isInteger(srcOff) && srcOff >= 0 ? srcOff : 0,
+          args !== null ? args.reuseResult : false
+        );
+        this._recordSkip('invalid-indirect-buffer', true);
+        result.skipped = true;
+        result.reason = clampRes.reason || 'indirect-clamp-failed';
+        return result;
+      }
+      if (!clampRes.encoded) {
+        const result = this._acquireDrawResult(
+          indexed,
+          true,
+          0,
+          0,
+          clampRes.dstOffset,
+          args !== null ? args.reuseResult : false
+        );
+        this._recordSkip('zero-draw-count', false);
+        result.skipped = true;
+        result.reason = 'zero-draw-count';
+        return result;
+      }
+
+      const drawRes = this._executeDrawIndirectCore(
+        renderPass,
+        args,
+        indexed,
+        clampRes.dstBuffer,
+        clampRes.dstOffset
+      );
+      if (drawRes.executed) {
+        this._stats.clampedIndirectDraws += 1;
+      }
+      drawRes.clamped = true;
+      drawRes.clampedBuffer = clampRes.dstBuffer;
+      drawRes.clampedOffset = clampRes.dstOffset;
+      drawRes.zeroedFirstInstance = clampRes.zeroedFirstInstance;
+      return drawRes;
+    }
+
+    /**
+     * Convenience wrapper for GPU-clamped `drawIndexedIndirect` (20B record).
+     */
+    executeClampedDrawIndexedIndirect(encoder, renderPass, drawArgs = {}) {
+      const args = drawArgs && typeof drawArgs === 'object' ? drawArgs : null;
+      const srcBuf = args && args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const srcOff = args && args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      const clampTarget = args && args.clampComputePass ? args.clampComputePass : encoder;
+
+      const clampRes = this.clampIndirectArgs(
+        clampTarget,
+        'drawIndexed',
+        srcBuf,
+        srcOff,
+        args,
+        this._scratchClampResult
+      );
+      if (!clampRes.ok) {
+        const result = this._acquireDrawResult(
+          true,
+          true,
+          0,
+          0,
+          Number.isInteger(srcOff) && srcOff >= 0 ? srcOff : 0,
+          args !== null ? args.reuseResult : false
+        );
+        this._recordSkip('invalid-indirect-buffer', true);
+        result.skipped = true;
+        result.reason = clampRes.reason || 'indirect-clamp-failed';
+        return result;
+      }
+      if (!clampRes.encoded) {
+        const result = this._acquireDrawResult(
+          true,
+          true,
+          0,
+          0,
+          clampRes.dstOffset,
+          args !== null ? args.reuseResult : false
+        );
+        this._recordSkip('zero-draw-count', false);
+        result.skipped = true;
+        result.reason = 'zero-draw-count';
+        return result;
+      }
+
+      const drawRes = this._executeDrawIndirectCore(
+        renderPass,
+        args,
+        true,
+        clampRes.dstBuffer,
+        clampRes.dstOffset
+      );
+      if (drawRes.executed) {
+        this._stats.clampedIndirectDraws += 1;
+      }
+      drawRes.clamped = true;
+      drawRes.clampedBuffer = clampRes.dstBuffer;
+      drawRes.clampedOffset = clampRes.dstOffset;
+      drawRes.zeroedFirstInstance = clampRes.zeroedFirstInstance;
+      return drawRes;
+    }
+
+    /**
+     * Execute a GPU-clamped `dispatchWorkgroupsIndirect` (12B record): clamps workgroup
+     * X/Y/Z against `device.limits.maxComputeWorkgroupsPerDimension` (+ optional count buffer)
+     * before dispatching on `computePass` (or an encoder-opened compute pass).
+     */
+    executeClampedDispatchIndirect(encoder, computePass, computeArgs = {}) {
+      const args = computeArgs && typeof computeArgs === 'object' ? computeArgs : null;
+      const srcBuf = args && args.indirectBuffer !== undefined ? args.indirectBuffer : null;
+      const srcOff = args && args.indirectOffset !== undefined ? args.indirectOffset : 0;
+      const clampTarget = args && args.clampComputePass ? args.clampComputePass : encoder;
+
+      const clampRes = this.clampIndirectArgs(
+        clampTarget,
+        'dispatch',
+        srcBuf,
+        srcOff,
+        args,
+        this._scratchClampResult
+      );
+      if (!clampRes.ok) {
+        this._stats.skippedComputeDispatches += 1;
+        const reuse = this._reuseDrawResult || (args !== null && args.reuseResult === true);
+        const r = reuse
+          ? this._reusableComputeResult
+          : {
+              executed: false,
+              skipped: true,
+              reason: null,
+              indirect: true,
+              indirectOffset: 0,
+              workgroupCountX: 0,
+              workgroupCountY: 0,
+              workgroupCountZ: 0,
+              pipelineElided: false,
+              bindGroupsElided: 0,
+              bindGroupCacheHits: 0,
+              bindGroupCacheMisses: 0,
+            };
+        r.executed = false;
+        r.skipped = true;
+        r.reason = clampRes.reason || 'indirect-clamp-failed';
+        r.indirect = true;
+        r.indirectOffset = 0;
+        r.clamped = false;
+        return r;
+      }
+      if (!clampRes.encoded) {
+        this._stats.skippedComputeDispatches += 1;
+        const reuse = this._reuseDrawResult || (args !== null && args.reuseResult === true);
+        const r = reuse
+          ? this._reusableComputeResult
+          : {
+              executed: false,
+              skipped: true,
+              reason: null,
+              indirect: true,
+              indirectOffset: 0,
+              workgroupCountX: 0,
+              workgroupCountY: 0,
+              workgroupCountZ: 0,
+              pipelineElided: false,
+              bindGroupsElided: 0,
+              bindGroupCacheHits: 0,
+              bindGroupCacheMisses: 0,
+            };
+        r.executed = false;
+        r.skipped = true;
+        r.reason = 'zero-workgroup-count';
+        r.indirect = true;
+        r.indirectOffset = clampRes.dstOffset;
+        r.clamped = false;
+        return r;
+      }
+
+      const ownedPass = !computePass;
+      const targetPass =
+        computePass ||
+        (encoder && typeof encoder.beginComputePass === 'function'
+          ? encoder.beginComputePass(args && args.computePassDescriptor)
+          : null);
+
+      const cArgs = this._scratchMeshComputeArgs;
+      cArgs.pipeline = args && args.pipeline !== undefined ? args.pipeline : this._activeComputePipeline;
+      cArgs.bindGroups = args && args.bindGroups !== undefined ? args.bindGroups : null;
+      cArgs.workgroupCountX = 0;
+      cArgs.workgroupCountY = 0;
+      cArgs.workgroupCountZ = 0;
+      cArgs.indirect = true;
+      cArgs.indirectBuffer = clampRes.dstBuffer;
+      cArgs.indirectOffset = clampRes.dstOffset;
+      cArgs.reuseResult = Boolean(this._reuseDrawResult || (args !== null && args.reuseResult === true));
+
+      const execRes = this.executeCompute(targetPass, cArgs);
+      if (ownedPass && targetPass && typeof targetPass.end === 'function') {
+        targetPass.end();
+      }
+      if (execRes.executed) {
+        this._stats.clampedIndirectDispatches += 1;
+      }
+      execRes.clamped = true;
+      execRes.clampedBuffer = clampRes.dstBuffer;
+      execRes.clampedOffset = clampRes.dstOffset;
+      return execRes;
+    }
+
+    /**
+     * Orchestrate a lowered mesh-shader compute-then-draw pipeline (#1537 / #1552):
+     * 1. Runs the lowered mesh compute shader (direct `dispatchWorkgroups` or indirect
+     *    `dispatchWorkgroupsIndirect` with optional GPU clamping).
+     * 2. Optionally clamps the mesh-generated `drawIndirect` / `drawIndexedIndirect` buffer.
+     * 3. Executes the render pass draw(s) over the generated mesh geometry buffers.
+     *
+     * Zero per-draw heap allocations when `out` (or `meshSpec.out` / `reuseResult: true`) is used.
+     *
+     * @param {object} commandEncoder GPUCommandEncoder (optional if caller passes both computePass and renderPass)
+     * @param {object} meshSpec
+     * @param {object} [out]
+     */
+    executeMeshComputeDraw(commandEncoder, meshSpec, out) {
+      const spec = meshSpec && typeof meshSpec === 'object' ? meshSpec : null;
+      const reuse =
+        this._reuseDrawResult || (spec !== null && spec.reuseResult === true);
+      const result =
+        out !== undefined && out !== null && typeof out === 'object'
+          ? out
+          : spec && spec.out && typeof spec.out === 'object'
+            ? spec.out
+            : reuse
+              ? this._reusableMeshResult
+              : {
+                  ok: false,
+                  executed: false,
+                  skipped: false,
+                  elided: false,
+                  reason: null,
+                  indirectDispatch: false,
+                  dispatchClamped: false,
+                  drawClamped: false,
+                  indexed: false,
+                  drawsIssued: 0,
+                  drawIndirectBuffer: null,
+                  drawIndirectOffset: 0,
+                  zeroedFirstInstance: false,
+                };
+
+      result.ok = false;
+      result.executed = false;
+      result.skipped = false;
+      result.elided = false;
+      result.reason = null;
+      result.indirectDispatch = false;
+      result.dispatchClamped = false;
+      result.drawClamped = false;
+      result.indexed = false;
+      result.drawsIssued = 0;
+      result.drawIndirectBuffer = null;
+      result.drawIndirectOffset = 0;
+      result.zeroedFirstInstance = false;
+
+      if (this._destroyed) {
+        this._recordSkip('executor-destroyed', false);
+        result.skipped = true;
+        result.reason = 'executor-destroyed';
+        return result;
+      }
+      if (!spec) {
+        this._recordSkip('invalid-mesh-spec', false);
+        result.skipped = true;
+        result.reason = 'invalid-mesh-spec';
+        return result;
+      }
+
+      const indexed = Boolean(spec.indexed);
+      const indirectDispatch = Boolean(
+        spec.indirectDispatch === true || spec.dispatchIndirectBuffer
+      );
+      result.indexed = indexed;
+      result.indirectDispatch = indirectDispatch;
+
+      const drawCount =
+        spec.drawCount !== undefined ? toNonNegativeInt(spec.drawCount, -1) : 1;
+      if (drawCount < 0) {
+        this._recordSkip('invalid-draw-count', true);
+        result.skipped = true;
+        result.reason = 'invalid-draw-count';
+        return result;
+      }
+      if (drawCount === 0) {
+        this._stats.meshZeroCountElided += 1;
+        result.ok = true;
+        result.elided = true;
+        result.skipped = true;
+        result.reason = 'zero-draw-count';
+        return result;
+      }
+
+      let gx = 0;
+      let gy = 1;
+      let gz = 1;
+      if (!indirectDispatch) {
+        gx = toNonNegativeInt(
+          spec.workgroupCountX !== undefined
+            ? spec.workgroupCountX
+            : spec.meshGroupsX !== undefined
+              ? spec.meshGroupsX
+              : spec.x,
+          0
+        );
+        gy = toNonNegativeInt(
+          spec.workgroupCountY !== undefined
+            ? spec.workgroupCountY
+            : spec.meshGroupsY !== undefined
+              ? spec.meshGroupsY
+              : spec.y !== undefined
+                ? spec.y
+                : 1,
+          0
+        );
+        gz = toNonNegativeInt(
+          spec.workgroupCountZ !== undefined
+            ? spec.workgroupCountZ
+            : spec.meshGroupsZ !== undefined
+              ? spec.meshGroupsZ
+              : spec.z !== undefined
+                ? spec.z
+                : 1,
+          0
+        );
+        if (gx <= 0 || gy <= 0 || gz <= 0) {
+          this._stats.meshZeroCountElided += 1;
+          result.ok = true;
+          result.elided = true;
+          result.skipped = true;
+          result.reason = 'zero-workgroup-count';
+          return result;
+        }
+        const maxWg =
+          this._maxComputeWorkgroupsOverride !== null
+            ? this._maxComputeWorkgroupsOverride
+            : this._device &&
+                this._device.limits &&
+                typeof this._device.limits.maxComputeWorkgroupsPerDimension === 'number' &&
+                this._device.limits.maxComputeWorkgroupsPerDimension >= 1
+              ? Math.floor(this._device.limits.maxComputeWorkgroupsPerDimension)
+              : DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION;
+        if (gx > maxWg) gx = maxWg;
+        if (gy > maxWg) gy = maxWg;
+        if (gz > maxWg) gz = maxWg;
+      }
+
+      const meshPipeline =
+        spec.meshPipeline !== undefined ? spec.meshPipeline : this._activeComputePipeline;
+      if (!meshPipeline || typeof meshPipeline !== 'object' || meshPipeline.destroyed === true) {
+        this._stats.skippedComputeDispatches += 1;
+        this._recordSkip('no-mesh-pipeline', false);
+        result.skipped = true;
+        result.reason = 'no-mesh-pipeline';
+        return result;
+      }
+
+      const renderPipeline =
+        spec.renderPipeline !== undefined ? spec.renderPipeline : this._activePipeline;
+
+      // Stage 1: Optional GPU clamp of indirect mesh dispatch buffer.
+      let dispatchBuf = spec.dispatchIndirectBuffer || null;
+      let dispatchOff = spec.dispatchIndirectOffset || 0;
+      const canClamp = Boolean(spec.clampExecutor || this.getIndirectClampExecutor());
+
+      if (indirectDispatch && spec.clampDispatch !== false && canClamp) {
+        const clampTarget = spec.clampComputePass || commandEncoder;
+        if (
+          clampTarget &&
+          (typeof clampTarget.beginComputePass === 'function' ||
+            typeof clampTarget.dispatchWorkgroups === 'function')
+        ) {
+          const clampOpts = this._scratchClampOptions;
+          clampOpts.srcBuffer = dispatchBuf;
+          clampOpts.srcOffset = dispatchOff;
+          clampOpts.dstBuffer = spec.clampedDispatchBuffer || null;
+          clampOpts.dstOffset = spec.clampedDispatchOffset || 0;
+          clampOpts.countBuffer = spec.dispatchCountBuffer || null;
+          clampOpts.countOffset = spec.dispatchCountOffset || 0;
+          clampOpts.commandCount = 1;
+          clampOpts.stride = 12;
+          clampOpts.maxVertexCount = undefined;
+          clampOpts.maxIndexCount = undefined;
+          clampOpts.maxInstanceCount = undefined;
+          clampOpts.maxWorkgroupsX = spec.maxWorkgroupsX;
+          clampOpts.maxWorkgroupsY = spec.maxWorkgroupsY;
+          clampOpts.maxWorkgroupsZ = spec.maxWorkgroupsZ;
+          clampOpts.maxMeshVerticesPerGroup = undefined;
+          clampOpts.maxMeshTotalVertices = undefined;
+          clampOpts.indirectFirstInstance = undefined;
+          clampOpts.maxIndirectBatchCount = undefined;
+          clampOpts.clampBatch = true;
+
+          const exec = spec.clampExecutor || this.getIndirectClampExecutor();
+          const cRes = exec.encodeClamp(
+            clampTarget,
+            'dispatch',
+            clampOpts,
+            this._scratchClampResult
+          );
+          if (!cRes.ok) {
+            this._stats.skippedComputeDispatches += 1;
+            this._recordSkip('invalid-indirect-buffer', true);
+            result.skipped = true;
+            result.reason = cRes.reason || 'dispatch-clamp-failed';
+            return result;
+          }
+          if (cRes.encoded) {
+            this._stats.indirectClampPasses += 1;
+            this._stats.clampedIndirectDispatches += 1;
+            dispatchBuf = cRes.dstBuffer;
+            dispatchOff = cRes.dstOffset;
+            result.dispatchClamped = true;
+          }
+        }
+      }
+
+      // Stage 2: Mesh compute pass (writes generated geometry + draw-indirect args).
+      const ownedComputePass = !spec.computePass;
+      const computePass =
+        spec.computePass ||
+        (commandEncoder && typeof commandEncoder.beginComputePass === 'function'
+          ? commandEncoder.beginComputePass(spec.computePassDescriptor)
+          : null);
+      if (!computePass || typeof computePass.setPipeline !== 'function') {
+        this._stats.skippedComputeDispatches += 1;
+        this._recordSkip('invalid-compute-pass', false);
+        result.skipped = true;
+        result.reason = 'invalid-compute-pass';
+        return result;
+      }
+
+      const cArgs = this._scratchMeshComputeArgs;
+      cArgs.pipeline = meshPipeline;
+      cArgs.bindGroups = Array.isArray(spec.meshBindGroups) ? spec.meshBindGroups : null;
+      cArgs.workgroupCountX = indirectDispatch ? 0 : gx;
+      cArgs.workgroupCountY = indirectDispatch ? 0 : gy;
+      cArgs.workgroupCountZ = indirectDispatch ? 0 : gz;
+      cArgs.indirect = indirectDispatch;
+      cArgs.indirectBuffer = indirectDispatch ? dispatchBuf : null;
+      cArgs.indirectOffset = indirectDispatch ? dispatchOff : 0;
+      cArgs.reuseResult = true;
+
+      const compRes = this.executeCompute(computePass, cArgs);
+      if (ownedComputePass && typeof computePass.end === 'function') {
+        computePass.end();
+      }
+      if (!compRes.executed) {
+        this._recordSkip(compRes.reason || 'mesh-compute-failed', false);
+        result.skipped = true;
+        result.reason = compRes.reason || 'mesh-compute-failed';
+        return result;
+      }
+
+      // Stage 3: Optional GPU clamp of generated draw-indirect arguments.
+      const recordBytes = indexed ? 20 : 16;
+      let drawBuf = spec.drawIndirectBuffer || null;
+      let drawOff = spec.drawIndirectOffset || 0;
+      let drawStride = spec.drawStride !== undefined ? spec.drawStride : recordBytes;
+
+      if (spec.clampDrawIndirect !== false && canClamp) {
+        const clampTarget = spec.drawClampComputePass || commandEncoder;
+        if (
+          clampTarget &&
+          (typeof clampTarget.beginComputePass === 'function' ||
+            typeof clampTarget.dispatchWorkgroups === 'function')
+        ) {
+          const clampOpts = this._scratchClampOptions;
+          clampOpts.srcBuffer = drawBuf;
+          clampOpts.srcOffset = drawOff;
+          clampOpts.dstBuffer = spec.clampedDrawBuffer || null;
+          clampOpts.dstOffset = spec.clampedDrawOffset || 0;
+          clampOpts.countBuffer = spec.drawCountBuffer || null;
+          clampOpts.countOffset = spec.drawCountOffset || 0;
+          clampOpts.commandCount = drawCount;
+          clampOpts.stride = drawStride;
+          clampOpts.maxVertexCount = spec.maxVertexCount;
+          clampOpts.maxIndexCount = spec.maxIndexCount;
+          clampOpts.maxInstanceCount = spec.maxInstanceCount;
+          clampOpts.maxWorkgroupsX = undefined;
+          clampOpts.maxWorkgroupsY = undefined;
+          clampOpts.maxWorkgroupsZ = undefined;
+          clampOpts.maxMeshVerticesPerGroup = undefined;
+          clampOpts.maxMeshTotalVertices = undefined;
+          clampOpts.indirectFirstInstance =
+            spec.indirectFirstInstance !== undefined
+              ? spec.indirectFirstInstance
+              : this.supportsIndirectFirstInstance();
+          clampOpts.maxIndirectBatchCount = spec.maxIndirectBatchCount;
+          clampOpts.clampBatch = spec.clampBatch !== false;
+
+          const exec = spec.clampExecutor || this.getIndirectClampExecutor();
+          const dClamp = exec.encodeClamp(
+            clampTarget,
+            indexed ? 'drawIndexed' : 'draw',
+            clampOpts,
+            this._scratchClampResult
+          );
+          if (!dClamp.ok) {
+            this._recordSkip('invalid-indirect-buffer', true);
+            result.skipped = true;
+            result.reason = dClamp.reason || 'draw-clamp-failed';
+            return result;
+          }
+          if (dClamp.encoded) {
+            this._stats.indirectClampPasses += 1;
+            if (dClamp.zeroedFirstInstance) {
+              this._stats.indirectFirstInstanceClamped += dClamp.commandCount;
+            }
+            drawBuf = dClamp.dstBuffer;
+            drawOff = dClamp.dstOffset;
+            drawStride = dClamp.stride;
+            result.drawClamped = true;
+            result.zeroedFirstInstance = dClamp.zeroedFirstInstance;
+          }
+        }
+      }
+
+      // Stage 4: Render pass over generated mesh vertex/index buffers + indirect draw args.
+      const ownedRenderPass = !spec.renderPass;
+      const renderPass =
+        spec.renderPass ||
+        (commandEncoder && typeof commandEncoder.beginRenderPass === 'function'
+          ? commandEncoder.beginRenderPass(spec.renderPassDescriptor)
+          : null);
+      if (!renderPass || typeof renderPass.setPipeline !== 'function') {
+        this._recordSkip('invalid-render-pass', false);
+        result.skipped = true;
+        result.reason = 'invalid-render-pass';
+        return result;
+      }
+
+      if (renderPipeline !== undefined && renderPipeline !== null) {
+        this.setPipeline(renderPipeline);
+      }
+      if (Array.isArray(spec.renderBindGroups)) {
+        for (let i = 0; i < spec.renderBindGroups.length; i += 1) {
+          const bg = spec.renderBindGroups[i];
+          if (!bg) continue;
+          const groupIndex = Number.isInteger(bg.groupIndex) ? bg.groupIndex : i;
+          const handle = bg.bindGroup !== undefined ? bg.bindGroup : bg;
+          this.setBindGroup(groupIndex, handle, bg.dynamicOffsets || null);
+        }
+      }
+      if (Array.isArray(spec.vertexBuffers)) {
+        for (let i = 0; i < spec.vertexBuffers.length; i += 1) {
+          const vb = spec.vertexBuffers[i];
+          if (!vb) continue;
+          const slot = Number.isInteger(vb.slot) ? vb.slot : i;
+          const buf = vb.buffer !== undefined ? vb.buffer : vb;
+          this.setVertexBuffer(slot, buf, vb.offset || 0, vb.size !== undefined ? vb.size : null);
+        }
+      }
+      if (indexed && spec.indexBuffer) {
+        const ib = spec.indexBuffer;
+        const ibBuf = ib.buffer !== undefined ? ib.buffer : ib;
+        const ibFmt = ib.format || ib.indexFormat || 'uint32';
+        this.setIndexBuffer(ibBuf, ibFmt, ib.offset || 0, ib.size !== undefined ? ib.size : null);
+      }
+
+      const dArgs = this._scratchMeshDrawArgs;
+      dArgs.pipeline = renderPipeline;
+      dArgs.indirect = true;
+      dArgs.reuseResult = true;
+
+      let drawsIssued = 0;
+      let lastFailReason = null;
+      for (let i = 0, off = drawOff; i < drawCount; i += 1, off += drawStride) {
+        dArgs.indirectBuffer = drawBuf;
+        dArgs.indirectOffset = off;
+        const dr = this._executeDrawIndirectCore(renderPass, dArgs, indexed, drawBuf, off);
+        if (dr.executed) {
+          drawsIssued += 1;
+        } else if (lastFailReason === null) {
+          lastFailReason = dr.reason;
+        }
+      }
+
+      if (ownedRenderPass && typeof renderPass.end === 'function') {
+        renderPass.end();
+      }
+
+      if (drawsIssued > 0) {
+        this._stats.meshComputeDraws += 1;
+        if (indirectDispatch) {
+          this._stats.meshIndirectComputeDraws += 1;
+        }
+        if (result.drawClamped) {
+          this._stats.clampedIndirectDraws += drawsIssued;
+        }
+      }
+
+      result.ok = drawsIssued > 0;
+      result.executed = drawsIssued > 0;
+      result.skipped = drawsIssued === 0;
+      result.drawsIssued = drawsIssued;
+      result.drawIndirectBuffer = drawBuf;
+      result.drawIndirectOffset = drawOff;
+      result.reason = drawsIssued > 0 ? null : lastFailReason || 'mesh-draw-failed';
+      return result;
+    }
+
+    /**
+     * Alias for `executeMeshComputeDraw`.
+     */
+    dispatchMeshComputeDraw(commandEncoder, meshSpec, out) {
+      return this.executeMeshComputeDraw(commandEncoder, meshSpec, out);
+    }
+
+    /**
+     * Execute multi-pass / multi-subdraw instanced draws with signed i32 `baseVertex`
+     * normalization and safe `firstInstance` gating when `device.features` lacks
+     * `indirect-first-instance`. Preserves redundant state elision and zero per-draw GC
+     * allocations on the hot path.
+     *
+     * @param {object} pass GPURenderPassEncoder (can be overridden per entry via `draw.pass`)
+     * @param {{
+     *   draws: Array<object>,
+     *   commandEncoder?: object,
+     *   clampComputePass?: object,
+     *   firstInstancePolicy?: 'clamp' | 'zero' | 'fallback-direct' | 'strict',
+     *   reuseResult?: boolean,
+     *   out?: object,
+     * }} spec
+     * @param {object} [out]
+     */
+    executeMultiPassInstancedDraw(pass, spec, out) {
+      const hasSpec = spec && typeof spec === 'object';
+      const reuse =
+        this._reuseDrawResult || (hasSpec && spec.reuseResult === true);
+      const result =
+        out !== undefined && out !== null && typeof out === 'object'
+          ? out
+          : hasSpec && spec.out && typeof spec.out === 'object'
+            ? spec.out
+            : reuse
+              ? this._reusableMultiPassResult
+              : {
+                  ok: false,
+                  executed: 0,
+                  skipped: 0,
+                  elided: 0,
+                  clamped: 0,
+                  fallbackDirect: 0,
+                  firstInstanceClamped: 0,
+                  reason: null,
+                };
+
+      result.ok = false;
+      result.executed = 0;
+      result.skipped = 0;
+      result.elided = 0;
+      result.clamped = 0;
+      result.fallbackDirect = 0;
+      result.firstInstanceClamped = 0;
+      result.reason = null;
+
+      if (this._destroyed) {
+        this._recordSkip('executor-destroyed', false);
+        result.reason = 'executor-destroyed';
+        return result;
+      }
+
+      const draws = hasSpec
+        ? Array.isArray(spec.draws)
+          ? spec.draws
+          : Array.isArray(spec.passes)
+            ? spec.passes
+            : null
+        : null;
+      if (!draws) {
+        result.reason = 'invalid-draws-list';
+        return result;
+      }
+      if (draws.length === 0) {
+        result.ok = true;
+        return result;
+      }
+
+      const policy =
+        hasSpec && typeof spec.firstInstancePolicy === 'string'
+          ? spec.firstInstancePolicy
+          : 'clamp';
+      const hasFirstInstanceFeature = this.supportsIndirectFirstInstance();
+      const clampEncoder =
+        hasSpec && (spec.clampComputePass || spec.commandEncoder)
+          ? spec.clampComputePass || spec.commandEncoder
+          : null;
+
+      for (let i = 0; i < draws.length; i += 1) {
+        const entry = draws[i];
+        if (!entry || typeof entry !== 'object') {
+          result.skipped += 1;
+          continue;
+        }
+        const targetPass = entry.pass || pass;
+        if (entry.pipeline !== undefined && entry.pipeline !== null) {
+          this.setPipeline(entry.pipeline);
+        }
+        if (Array.isArray(entry.bindGroups)) {
+          for (let b = 0; b < entry.bindGroups.length; b += 1) {
+            const bg = entry.bindGroups[b];
+            if (!bg) continue;
+            const groupIdx = Number.isInteger(bg.groupIndex) ? bg.groupIndex : b;
+            const handle = bg.bindGroup !== undefined ? bg.bindGroup : bg;
+            this.setBindGroup(groupIdx, handle, bg.dynamicOffsets || null);
+          }
+        }
+        if (Array.isArray(entry.vertexBuffers)) {
+          for (let v = 0; v < entry.vertexBuffers.length; v += 1) {
+            const vb = entry.vertexBuffers[v];
+            if (!vb) continue;
+            const slot = Number.isInteger(vb.slot) ? vb.slot : v;
+            const buf = vb.buffer !== undefined ? vb.buffer : vb;
+            this.setVertexBuffer(slot, buf, vb.offset || 0, vb.size !== undefined ? vb.size : null);
+          }
+        }
+        if (entry.indexBuffer) {
+          const ib = entry.indexBuffer;
+          const ibBuf = ib.buffer !== undefined ? ib.buffer : ib;
+          const ibFmt = ib.format || ib.indexFormat || 'uint32';
+          this.setIndexBuffer(ibBuf, ibFmt, ib.offset || 0, ib.size !== undefined ? ib.size : null);
+        }
+
+        const indexed = Boolean(entry.indexed);
+        const indirect = Boolean(entry.indirect === true || entry.indirectBuffer);
+        const baseVertex = normalizeSignedBaseVertex(entry.baseVertex);
+        const firstInstance = toNonNegativeInt(entry.firstInstance, 0);
+
+        if (!indirect) {
+          const count = indexed
+            ? toNonNegativeInt(entry.indexCount, 0)
+            : toNonNegativeInt(entry.vertexCount, 0);
+          const instanceCount = toNonNegativeInt(
+            entry.instanceCount !== undefined ? entry.instanceCount : 1,
+            0
+          );
+          if (count <= 0 || instanceCount <= 0) {
+            this._recordSkip('zero-draw-count', false);
+            result.elided += 1;
+            result.skipped += 1;
+            continue;
+          }
+          const dr = this._executeDrawCore(
+            targetPass,
+            this._scratchReuseDrawOpts,
+            indexed,
+            count,
+            instanceCount,
+            toNonNegativeInt(entry.firstVertex, 0),
+            toNonNegativeInt(entry.firstIndex, 0),
+            baseVertex,
+            firstInstance
+          );
+          if (dr.executed) {
+            result.executed += 1;
+          } else {
+            result.skipped += 1;
+            if (result.reason === null) result.reason = dr.reason;
+          }
+          continue;
+        }
+
+        // Indirect draw entry inside multi-pass instanced batch.
+        const needsFirstInstanceGate =
+          !hasFirstInstanceFeature &&
+          (firstInstance > 0 || entry.clamp === true || entry.gpuWritten === true);
+
+        if (needsFirstInstanceGate && policy === 'strict') {
+          this._recordSkip('indirect-first-instance-unsupported', false);
+          result.skipped += 1;
+          if (result.reason === null) result.reason = 'indirect-first-instance-unsupported';
+          continue;
+        }
+
+        if (
+          needsFirstInstanceGate &&
+          policy === 'fallback-direct' &&
+          (indexed ? entry.indexCount > 0 : entry.vertexCount > 0)
+        ) {
+          const count = indexed
+            ? toNonNegativeInt(entry.indexCount, 0)
+            : toNonNegativeInt(entry.vertexCount, 0);
+          const instanceCount = toNonNegativeInt(
+            entry.instanceCount !== undefined ? entry.instanceCount : 1,
+            0
+          );
+          const dr = this._executeDrawCore(
+            targetPass,
+            this._scratchReuseDrawOpts,
+            indexed,
+            count,
+            instanceCount,
+            toNonNegativeInt(entry.firstVertex, 0),
+            toNonNegativeInt(entry.firstIndex, 0),
+            baseVertex,
+            firstInstance
+          );
+          if (dr.executed) {
+            result.executed += 1;
+            result.fallbackDirect += 1;
+          } else {
+            result.skipped += 1;
+            if (result.reason === null) result.reason = dr.reason;
+          }
+          continue;
+        }
+
+        let drawBuf = entry.indirectBuffer || null;
+        let drawOff = entry.indirectOffset || 0;
+        const entryClampTarget =
+          entry.clampComputePass || entry.commandEncoder || clampEncoder;
+
+        if ((entry.clamp === true || needsFirstInstanceGate) && entryClampTarget) {
+          const clampRes = this.clampIndirectArgs(
+            entryClampTarget,
+            indexed ? 'drawIndexed' : 'draw',
+            drawBuf,
+            drawOff,
+            entry,
+            this._scratchClampResult
+          );
+          if (!clampRes.ok) {
+            this._recordSkip('invalid-indirect-buffer', true);
+            result.skipped += 1;
+            if (result.reason === null) result.reason = clampRes.reason || 'indirect-clamp-failed';
+            continue;
+          }
+          if (!clampRes.encoded) {
+            result.elided += 1;
+            result.skipped += 1;
+            continue;
+          }
+          drawBuf = clampRes.dstBuffer;
+          drawOff = clampRes.dstOffset;
+          result.clamped += 1;
+          if (clampRes.zeroedFirstInstance) {
+            result.firstInstanceClamped += 1;
+          }
+        }
+
+        const dArgs = this._scratchMeshDrawArgs;
+        dArgs.pipeline = entry.pipeline !== undefined ? entry.pipeline : this._activePipeline;
+        dArgs.indirect = true;
+        dArgs.indirectBuffer = drawBuf;
+        dArgs.indirectOffset = drawOff;
+        dArgs.reuseResult = true;
+        const dr = this._executeDrawIndirectCore(targetPass, dArgs, indexed, drawBuf, drawOff);
+        if (dr.executed) {
+          result.executed += 1;
+          if (entry.clamp === true || (needsFirstInstanceGate && entryClampTarget)) {
+            this._stats.clampedIndirectDraws += 1;
+          }
+        } else {
+          result.skipped += 1;
+          if (result.reason === null) result.reason = dr.reason;
+        }
+      }
+
+      if (result.executed > 0) {
+        this._stats.multiPassInstancedDraws += 1;
+        this._stats.multiPassInstancedSubDraws += result.executed;
+      }
+      result.ok = result.executed > 0 || (result.skipped === 0 && result.elided > 0);
+      return result;
+    }
+
+    /**
      * Execute a non-indexed draw (`DrawInstanced`) with automatic fallback profile routing
      * and hardened bind-group / vertex-buffer guards.
      *
@@ -6343,6 +7577,13 @@
      * @param {object} drawArgs `{ indirectBuffer, indirectOffset?, ...overrides }`
      */
     executeDrawIndirect(pass, drawArgs = {}) {
+      if (
+        drawArgs &&
+        drawArgs.clamp === true &&
+        (drawArgs.commandEncoder || drawArgs.clampComputePass)
+      ) {
+        return this.executeClampedDrawIndirect(drawArgs.commandEncoder || null, pass, drawArgs);
+      }
       return this._executeDrawIndirectInternal(pass, drawArgs, false);
     }
 
@@ -6354,6 +7595,17 @@
      * @param {object} drawArgs `{ indirectBuffer, indirectOffset?, ...overrides }`
      */
     executeDrawIndexedIndirect(pass, drawArgs = {}) {
+      if (
+        drawArgs &&
+        drawArgs.clamp === true &&
+        (drawArgs.commandEncoder || drawArgs.clampComputePass)
+      ) {
+        return this.executeClampedDrawIndexedIndirect(
+          drawArgs.commandEncoder || null,
+          pass,
+          drawArgs
+        );
+      }
       return this._executeDrawIndirectInternal(pass, drawArgs, true);
     }
 
@@ -7046,6 +8298,15 @@
         bindGroupErrors: this._stats.bindGroupErrors,
         passErrors: this._stats.passErrors,
         legacyRouterFallbacks: this._stats.legacyRouterFallbacks,
+        clampedIndirectDraws: this._stats.clampedIndirectDraws,
+        clampedIndirectDispatches: this._stats.clampedIndirectDispatches,
+        indirectClampPasses: this._stats.indirectClampPasses,
+        indirectFirstInstanceClamped: this._stats.indirectFirstInstanceClamped,
+        meshComputeDraws: this._stats.meshComputeDraws,
+        meshIndirectComputeDraws: this._stats.meshIndirectComputeDraws,
+        meshZeroCountElided: this._stats.meshZeroCountElided,
+        multiPassInstancedDraws: this._stats.multiPassInstancedDraws,
+        multiPassInstancedSubDraws: this._stats.multiPassInstancedSubDraws,
       };
     }
 
@@ -7086,6 +8347,15 @@
     destroy() {
       this._destroyed = true;
       this._destroySyntheticResources();
+      if (this._ownsIndirectClampExecutor && this._indirectClampExecutor) {
+        try {
+          this._indirectClampExecutor.destroy();
+        } catch (_err) {
+          // Ignore cleanup errors on already-lost devices.
+        }
+        this._indirectClampExecutor = null;
+        this._ownsIndirectClampExecutor = false;
+      }
       this._fallbackPipelineCache.clear();
       this._fallbackShaderModuleCache.clear();
       this._clearBgCacheInternal();
