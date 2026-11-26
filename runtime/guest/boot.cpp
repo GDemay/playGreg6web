@@ -1045,11 +1045,16 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
     }
 }
 
+void log_trap();
+void finish_report();
+
 [[noreturn]] void stop_boot() {
 #if PG6_BOOT_HAS_EXCEPTIONS
     throw BootStop{};
 #else
+    log_trap();
     os::log("guest boot: stopping without exception support; aborting the process");
+    std::fflush(stderr);
     std::abort();
 #endif
 }
@@ -1097,9 +1102,6 @@ const char* fault_kind_id(FaultKind kind) {
     }
     return "unknown";
 }
-
-void log_trap();
-void finish_report();
 
 void record_code_miss(FaultKind kind, uint64_t va) {
     BootState& b = boot();
@@ -3019,7 +3021,7 @@ void log_trap() {
     text += " (" + f.kind + ", " + function_text(f.va) + ")";
     logf("%s", text.c_str());
     if (b.fault_record) {
-        // One compact line next to the trap line; tools/fault_report.py prints the full record.
+        // Compact sanitized lines next to the trap line; tools/fault_report.py prints the full record.
         ExportHit sym;
         const bool has_sym = nearest_export(f.va, sym);
         char line[512];
@@ -3034,8 +3036,30 @@ void log_trap() {
         }
         if (!f.frames.empty()) {
             out += " caller=" + function_text(f.frames.front().return_address);
+            constexpr size_t kMaxCallers = 4;
+            const size_t caller_count = std::min(f.frames.size(), kMaxCallers);
+            out += " callers=";
+            for (size_t i = 0; i < caller_count; ++i) {
+                if (i != 0) {
+                    out += ",";
+                }
+                out += function_text(f.frames[i].return_address);
+            }
         }
-        logf("%s", out.c_str());
+        if (b.log_progress) {
+            os::log(out);
+        }
+        if (f.has_registers) {
+            const GuestState& r = f.registers;
+            logf("[fault-regs] rax=0x%" PRIx64 " rcx=0x%" PRIx64 " rdx=0x%" PRIx64 " r8=0x%" PRIx64
+                 " r9=0x%" PRIx64 " rsp=0x%" PRIx64 " rbx=0x%" PRIx64 " rsi=0x%" PRIx64 " rdi=0x%" PRIx64,
+                 r.gpr[GuestReg::Rax], r.gpr[GuestReg::Rcx], r.gpr[GuestReg::Rdx], r.gpr[GuestReg::R8],
+                 r.gpr[GuestReg::R9], r.gpr[GuestReg::Rsp], r.gpr[GuestReg::Rbx], r.gpr[GuestReg::Rsi],
+                 r.gpr[GuestReg::Rdi]);
+        }
+    }
+    if (b.log_progress) {
+        std::fflush(stderr);
     }
 }
 
