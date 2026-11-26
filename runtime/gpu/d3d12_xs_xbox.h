@@ -208,15 +208,24 @@
 // (ray-traced reflections, shadows, global illumination) stay off; acceleration-structure builds
 // and DispatchRays are never reached.
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include "gpu/d3d12_guest_structs.h"
+
+namespace playgta6::gpu::d3d12_guest {
+class Device;
+}  // namespace playgta6::gpu::d3d12_guest
 
 namespace playgta6::gpu::d3d12_guest::xbox {
 
@@ -433,6 +442,8 @@ public:
     // both now and that tick, so two waits of a kind never end on one tick; a kind more than one tick
     // behind ends at once on its overdue tick. Same timeout/result rules as wait_after.
     WaitResult wait_event(uint32_t kind, uint32_t timeout_ms, uint64_t* frame);
+    uint64_t last_event_tick(uint32_t kind) const;
+    void reset_event_ticks();
     void shutdown();
     bool is_shut_down() const;
 
@@ -451,6 +462,224 @@ private:
     uint32_t period_ = 1;
     bool shutdown_ = false;
 };
+
+// ---------------------------------------------------------------------------------------------
+// Xbox Scarlett 3D helpers (G84): fast clears & compression metadata, predication / conditional
+// rendering, async compute fence sync, and per-command-list depth-bounds / VRS state tracking.
+// ---------------------------------------------------------------------------------------------
+
+// Fast-clear & DCC / CMASK / HTILE metadata tracking.
+enum class FastClearKind : uint8_t {
+    Color = 0,
+    DepthStencil = 1,
+    UnorderedAccessFloat = 2,
+    UnorderedAccessUint = 3,
+};
+
+enum class CompressionMetaKind : uint8_t {
+    None = 0,
+    Cmask = 1,
+    Dcc = 2,
+    Htile = 3,
+};
+
+struct FastClearValue {
+    FastClearKind kind = FastClearKind::Color;
+    uint32_t dxgi_format = 0;
+    float rgba[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    uint32_t uint_rgba[4] = {0, 0, 0, 0};
+    float depth = 1.0f;
+    uint8_t stencil = 0;
+    uint32_t clear_flags = 0;  // D3D12_CLEAR_FLAG_DEPTH (1) | D3D12_CLEAR_FLAG_STENCIL (2)
+    bool valid = false;
+};
+
+struct SurfaceCompressionMeta {
+    uint64_t surface_key = 0;  // resource GPU VA or resource id
+    uint64_t meta_va = 0;      // CMASK / DCC / HTILE metadata GPU VA (0 if implicit)
+    uint64_t meta_bytes = 0;
+    CompressionMetaKind meta_kind = CompressionMetaKind::None;
+    FastClearValue clear_value{};
+    bool fast_clear_active = false;
+    uint64_t clear_generation = 0;
+    uint64_t decompress_count = 0;
+};
+
+class FastClearRegistry {
+public:
+    struct Stats {
+        uint64_t color_clears = 0;
+        uint64_t depth_stencil_clears = 0;
+        uint64_t uav_clears = 0;
+        uint64_t decompresses = 0;
+        uint64_t active_fast_clears = 0;
+        uint64_t dcc_surfaces = 0;
+        uint64_t cmask_surfaces = 0;
+        uint64_t htile_surfaces = 0;
+    };
+
+    void register_surface_meta(uint64_t surface_key, CompressionMetaKind kind, uint64_t meta_va, uint64_t meta_bytes);
+    void record_color_clear(uint64_t surface_key, uint32_t dxgi_format, const float rgba[4]);
+    void record_depth_stencil_clear(uint64_t surface_key, uint32_t dxgi_format, uint32_t flags, float depth,
+                                    uint8_t stencil);
+    void record_uav_clear_float(uint64_t surface_key, const float rgba[4]);
+    void record_uav_clear_uint(uint64_t surface_key, const uint32_t rgba[4]);
+    // Simulates a DCC/CMASK/HTILE decompress (fast-clear eliminate). Returns true if a fast clear
+    // was active on the surface.
+    bool mark_decompressed(uint64_t surface_key);
+    bool lookup(uint64_t surface_key, SurfaceCompressionMeta* out) const;
+    bool erase(uint64_t surface_key);
+    void clear();
+    size_t size() const;
+    Stats stats() const;
+
+private:
+    mutable std::mutex mutex_;
+    std::unordered_map<uint64_t, SurfaceCompressionMeta> surfaces_;
+    uint64_t color_clears_ = 0;
+    uint64_t depth_stencil_clears_ = 0;
+    uint64_t uav_clears_ = 0;
+    uint64_t decompresses_ = 0;
+};
+
+// Process-wide fast-clear / compression metadata registry (cleared in tests via clear()).
+FastClearRegistry& fast_clear_registry();
+bool parse_guest_clear_color(uint64_t color_va, float out_rgba[4]);
+bool parse_guest_uav_clear_uint(uint64_t values_va, uint32_t out_rgba[4]);
+
+// Predication / conditional rendering (D3D12_PREDICATION_OP).
+enum class PredicationOp : uint32_t {
+    EqualZero = 0,     // skip draws/dispatches when the 64-bit predicate value == 0
+    NotEqualZero = 1,  // skip draws/dispatches when the 64-bit predicate value != 0
+};
+
+struct PredicationState {
+    bool active = false;
+    uint64_t buffer_va = 0;
+    uint64_t aligned_offset = 0;
+    PredicationOp op = PredicationOp::EqualZero;
+    bool last_evaluated = false;
+    bool last_skip_work = false;
+    uint64_t last_value = 0;
+};
+
+class PredicationTracker {
+public:
+    static constexpr size_t kMaxScopeDepth = 16;
+
+    struct Stats {
+        uint64_t set_calls = 0;
+        uint64_t clear_calls = 0;
+        uint64_t invalid_calls = 0;
+        uint64_t evaluations = 0;
+        uint64_t work_skipped = 0;
+        uint64_t work_passed = 0;
+        uint64_t unreadable_reads = 0;
+    };
+
+    // Sets or clears (buffer_va == 0) predication. Returns false on unaligned offset or bad op.
+    bool set(uint64_t buffer_va, uint64_t aligned_offset, uint32_t raw_op, std::string* error = nullptr);
+    void reset();
+    bool push_scope();
+    bool pop_scope();
+    size_t scope_depth() const { return scopes_.size(); }
+
+    // Evaluates the active predicate using a caller-provided 64-bit reader. Fails safe (does not
+    // skip) if the predicate address cannot be read.
+    bool should_skip_work(const std::function<bool(uint64_t va, uint64_t* value)>& reader);
+    // Evaluates the active predicate directly from guest memory (translating GPU alias windows via
+    // `device` when non-null).
+    bool should_skip_work_guest(const Device* device = nullptr);
+
+    const PredicationState& state() const { return state_; }
+    Stats stats() const { return stats_; }
+
+private:
+    PredicationState state_{};
+    std::vector<PredicationState> scopes_;
+    Stats stats_{};
+};
+
+// Async compute / Direct / Copy cross-queue fence synchronization helper.
+enum class QueueKind : uint8_t {
+    Direct = 0,
+    Compute = 2,
+    Copy = 3,
+};
+
+class AsyncComputeSync {
+public:
+    struct Stats {
+        uint64_t signals_direct = 0;
+        uint64_t signals_compute = 0;
+        uint64_t signals_copy = 0;
+        uint64_t waits_immediate = 0;
+        uint64_t waits_deferred = 0;
+        uint64_t waits_satisfied = 0;
+        uint64_t cross_queue_syncs = 0;
+        uint64_t wait_timeouts = 0;
+        uint64_t self_waits_detected = 0;
+    };
+
+    // Records a GPU queue Signal(fence_id, value); returns how many pending waits became satisfied.
+    size_t record_signal(uint64_t queue_id, QueueKind kind, uint64_t fence_id, uint64_t value);
+    // Records a GPU queue Wait(fence_id, value); returns true if already satisfied, false if queued.
+    bool record_wait(uint64_t queue_id, QueueKind kind, uint64_t fence_id, uint64_t value);
+    // Non-spinning condition-variable wait until fence_id reaches value, shutdown, or timeout.
+    bool wait_until_satisfied(uint64_t fence_id, uint64_t value, std::chrono::milliseconds timeout);
+    // Returns true if `queue_id` would deadlock waiting on an unreached fence whose last signaller
+    // is itself (or has no other signaller and is already waiting on itself).
+    bool is_potential_self_wait(uint64_t queue_id, uint64_t fence_id, uint64_t value) const;
+    uint64_t fence_value(uint64_t fence_id) const;
+    size_t pending_wait_count(uint64_t fence_id = 0) const;
+    void shutdown();
+    void reset();
+    Stats stats() const;
+
+private:
+    struct FenceState {
+        uint64_t value = 0;
+        uint64_t last_signaller_queue = 0;
+        QueueKind last_signaller_kind = QueueKind::Direct;
+        bool ever_signalled = false;
+    };
+    struct PendingWait {
+        uint64_t order_seq = 0;
+        uint64_t queue_id = 0;
+        QueueKind queue_kind = QueueKind::Direct;
+        uint64_t fence_id = 0;
+        uint64_t value = 0;
+    };
+
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    bool shutdown_ = false;
+    uint64_t next_seq_ = 1;
+    std::unordered_map<uint64_t, FenceState> fences_;
+    std::deque<PendingWait> pending_waits_;
+    Stats stats_{};
+};
+
+// Command-list Xbox 3D state (OMSetDepthBounds / RSSetShadingRate / RSSetShadingRateImage).
+struct DepthBoundsState {
+    float min_depth = 0.0f;
+    float max_depth = 1.0f;
+    bool set = false;
+};
+
+struct ShadingRateState {
+    uint32_t base_rate = 0;          // D3D12_SHADING_RATE_1X1
+    uint32_t combiners[2] = {0, 0};  // D3D12_SHADING_RATE_COMBINER_PASSTHROUGH
+    uint64_t image_va = 0;           // ID3D12Resource* guest pointer (0 = cleared)
+    bool rate_set = false;
+    bool image_set = false;
+};
+
+bool is_valid_shading_rate(uint32_t rate);
+bool is_valid_shading_rate_combiner(uint32_t combiner);
+bool lookup_command_list_depth_bounds(uint64_t list_identity, DepthBoundsState* out);
+bool lookup_command_list_shading_rate(uint64_t list_identity, ShadingRateState* out);
+void clear_command_list_xbox_state();
 
 // ---------------------------------------------------------------------------------------------
 // Counters (Device::counter)
@@ -506,6 +735,9 @@ enum class Counter : size_t {
     Resumes,
     FeatureToggles,
     XboxNoOps,
+    // G84 Xbox 3D hardening counters:
+    MultiPlanePresents,      // PresentX calls with plane_count > 1
+    IndirectZeroCount,       // ExecuteIndirect calls with max_count == 0 (clean no-op)
     Count
 };
 
