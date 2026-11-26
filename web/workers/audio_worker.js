@@ -64,6 +64,13 @@
   const GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES = 480; // 10 ms @ 48 kHz
   const GUEST_PCM_RING_MAX_QUANTUM_FRAMES = 65536;
 
+  // O43 (#1028/#663): Live audio-stats BroadcastChannel telemetry defaults matching
+  // web/loader.js & web/app_bootstrap.js ('game-progress').
+  const PROGRESS_CHANNEL_NAME = 'game-progress';
+  const DEFAULT_TELEMETRY_BROADCAST_INTERVAL_MS = 1000;
+  const MIN_TELEMETRY_BROADCAST_INTERVAL_MS = 50;
+  const MAX_TELEMETRY_BROADCAST_INTERVAL_MS = 60000;
+
   // Atomic Int32 header layout at byte offset 0..32 of the SharedArrayBuffer.
   const HDR_WRITE_CURSOR = 0;
   const HDR_READ_CURSOR = 1;
@@ -256,6 +263,44 @@
     // Strip control characters and clamp length to prevent noisy/leaky error strings.
     const clean = raw.replace(/[\r\n\t]+/g, ' ').trim();
     return clean.length > 200 ? clean.slice(0, 200) : clean;
+  }
+
+  /**
+   * Sends one payload on a short-lived BroadcastChannel and closes it immediately
+   * so send-only workers never retain open BroadcastChannel receive queues.
+   *
+   * @param {Function|null} BroadcastChannelCtor
+   * @param {string} channelName
+   * @param {object} payload
+   * @returns {boolean}
+   */
+  function postBroadcastOnce(BroadcastChannelCtor, channelName, payload) {
+    if (
+      typeof BroadcastChannelCtor !== 'function' ||
+      typeof channelName !== 'string' ||
+      channelName.length === 0
+    ) {
+      return false;
+    }
+    let ch = null;
+    try {
+      ch = new BroadcastChannelCtor(channelName);
+      if (ch && typeof ch.postMessage === 'function') {
+        ch.postMessage(payload);
+        return true;
+      }
+      return false;
+    } catch (_err) {
+      return false;
+    } finally {
+      if (ch && typeof ch.close === 'function') {
+        try {
+          ch.close();
+        } catch (_closeErr) {
+          // Ignore BroadcastChannel close errors.
+        }
+      }
+    }
   }
 
   /**
@@ -3584,6 +3629,30 @@
       this._guestPeakLevel = 0.0;
       this._guestUnderrunFadeCount = 0;
       this._guestRecoveryFadeCount = 0;
+      this._inDrainTick = false;
+
+      // O43 (#1028/#663): Live BroadcastChannel audio-stats telemetry state.
+      this._telemetryBroadcast =
+        opts.telemetryBroadcast !== undefined
+          ? Boolean(opts.telemetryBroadcast)
+          : opts.BroadcastChannelCtor !== undefined || opts.broadcastChannelName !== undefined;
+      this._broadcastChannelName =
+        typeof opts.broadcastChannelName === 'string' && opts.broadcastChannelName.length > 0
+          ? opts.broadcastChannelName
+          : PROGRESS_CHANNEL_NAME;
+      this._BroadcastChannelCtor =
+        typeof opts.BroadcastChannelCtor === 'function' ? opts.BroadcastChannelCtor : null;
+      this._telemetryBroadcastIntervalMs = sanitizePositiveInt(
+        opts.telemetryBroadcastIntervalMs,
+        DEFAULT_TELEMETRY_BROADCAST_INTERVAL_MS,
+        MIN_TELEMETRY_BROADCAST_INTERVAL_MS,
+        MAX_TELEMETRY_BROADCAST_INTERVAL_MS
+      );
+      this._lastTelemetryBroadcastMs = null;
+      this._lastBroadcastFramesDrained = -1;
+      this._lastBroadcastGuestFramesDrained = -1;
+      this._firstGuestDrainBroadcasted = false;
+      this._telemetryBroadcastCount = 0;
       this._guestReadOpts = {
         softClip: true,
         limiterKnee: this._limiterKnee,
@@ -3650,9 +3719,84 @@
       );
     }
 
+    _shouldRunTimer() {
+      return this._shouldDrain() || (this._guestRing !== null && this._guestRingAutoPump);
+    }
+
+    _resolveBroadcastChannelCtor() {
+      if (typeof this._BroadcastChannelCtor === 'function') {
+        return this._BroadcastChannelCtor;
+      }
+      if (typeof self !== 'undefined' && typeof self.BroadcastChannel === 'function') {
+        return self.BroadcastChannel;
+      }
+      if (typeof BroadcastChannel === 'function') {
+        return BroadcastChannel;
+      }
+      return null;
+    }
+
+    _publishAudioStats(options = {}) {
+      if (!this._telemetryBroadcast) {
+        return false;
+      }
+      const force = Boolean(options && options.force);
+      const milestone = Boolean(options && options.milestone);
+      const nowMs =
+        options && typeof options.nowMs === 'number' && Number.isFinite(options.nowMs)
+          ? options.nowMs
+          : this._now();
+      const framesChanged =
+        this.framesDrained !== this._lastBroadcastFramesDrained ||
+        this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained;
+      if (!force && !milestone) {
+        if (!framesChanged) {
+          return false;
+        }
+        if (
+          this._lastTelemetryBroadcastMs !== null &&
+          nowMs - this._lastTelemetryBroadcastMs < this._telemetryBroadcastIntervalMs
+        ) {
+          return false;
+        }
+      }
+      const ctor = this._resolveBroadcastChannelCtor();
+      if (!ctor) {
+        return false;
+      }
+      const snapshot = buildAudioTelemetrySnapshot(this, { now: () => nowMs });
+      const sent = postBroadcastOnce(ctor, this._broadcastChannelName, snapshot);
+      if (!sent) {
+        return false;
+      }
+      if (milestone && this._guestFramesDrained > 0) {
+        const rate = this._guestRing ? this._guestRing.sampleRate : this.sampleRate;
+        const peak = Number.isFinite(this._guestPeakLevel) ? this._guestPeakLevel.toFixed(4) : '0.0000';
+        postBroadcastOnce(ctor, this._broadcastChannelName, {
+          label: `[audio] first_guest_pcm_drain guest_frames_drained=${this._guestFramesDrained} sampleRate=${rate} peak=${peak}`,
+        });
+      }
+      this._lastTelemetryBroadcastMs = nowMs;
+      this._lastBroadcastFramesDrained = this.framesDrained;
+      this._lastBroadcastGuestFramesDrained = this._guestFramesDrained;
+      this._telemetryBroadcastCount += 1;
+      return true;
+    }
+
+    _maybeBroadcastAudioStats(nowMs) {
+      if (!this._telemetryBroadcast) {
+        return false;
+      }
+      if (this._guestFramesDrained > 0 && !this._firstGuestDrainBroadcasted) {
+        this._firstGuestDrainBroadcasted = true;
+        return this._publishAudioStats({ force: true, milestone: true, nowMs });
+      }
+      return this._publishAudioStats({ nowMs });
+    }
+
     _startDrainTimer() {
       this._stopDrainTimer();
-      if (!this.initialized || !this.ring || !this._autoDrain || !this._shouldDrain()) {
+      if (!this.initialized || !this.ring || !this._autoDrain || !this._shouldRunTimer()) {
         return;
       }
       if (!this._setInterval) {
@@ -3661,7 +3805,11 @@
       this._lastDrainMs = this._now();
       const handle = this._setInterval(() => {
         try {
-          this.drainTick();
+          if (this._shouldDrain()) {
+            this.drainTick();
+          } else if (this._guestRing && this._guestRingAutoPump) {
+            this._pumpActiveGuestTick();
+          }
         } catch (_err) {
           // Never throw from background drain timer.
         }
@@ -3685,7 +3833,7 @@
 
     setOutputState(state) {
       this.outputState = normalizeOutputState(state, OUTPUT_STATES.HEADLESS_DRAIN);
-      if (this._shouldDrain()) {
+      if (this._shouldRunTimer()) {
         this._startDrainTimer();
       } else {
         this._stopDrainTimer();
@@ -3725,13 +3873,91 @@
         timeBudgetFrames = 1;
       }
       const maxFrames = Math.min(timeBudgetFrames, this._effectiveMaxDrainFramesPerTick());
-      if (this._guestRing && this._guestRingAutoPump && maxFrames > 0) {
-        this.drainGuestPcmRing(maxFrames);
+      let drained = 0;
+      const prevInDrainTick = this._inDrainTick;
+      this._inDrainTick = true;
+      try {
+        if (this._guestRing && this._guestRingAutoPump && maxFrames > 0) {
+          // Chunk by this.ring.capacityFrames so slow/throttled browser timer ticks
+          // (e.g. 100 ms = 4800 frames > 4096 ring capacity) never trigger spurious overruns.
+          const chunkCap = Math.max(1, this.ring.capacityFrames);
+          let remaining = maxFrames;
+          while (remaining > 0) {
+            const step = remaining <= chunkCap ? remaining : chunkCap;
+            const pumpRes = this.drainGuestPcmRing(step);
+            const stepDrained = this.ring.discardFrames(step);
+            drained += stepDrained;
+            remaining -= step;
+            if (pumpRes.framesDrained < step && this.ring.availableFrames() === 0) {
+              break;
+            }
+          }
+        } else if (maxFrames > 0) {
+          drained = this.ring.discardFrames(maxFrames);
+        }
+      } finally {
+        this._inDrainTick = prevInDrainTick;
       }
-      const drained = maxFrames > 0 ? this.ring.discardFrames(maxFrames) : 0;
       this._drainTicks += 1;
       this.framesDrained += drained;
+      this._maybeBroadcastAudioStats(now);
       return drained;
+    }
+
+    /**
+     * Time-paced active-mode guest PCM ring pump: transfers stereo frames from
+     * `playgta6_audio_ring` into `this.ring` up to available free space without
+     * discarding unread samples so AudioWorkletProcessor plays them seamlessly.
+     *
+     * @param {number} [nowMs] Optional monotonic timestamp in ms.
+     * @returns {number} Number of guest stereo frames pumped.
+     */
+    _pumpActiveGuestTick(nowMs) {
+      if (!this.ring || !this._guestRing || !this._guestRingAutoPump || this._shouldDrain()) {
+        return 0;
+      }
+      const now =
+        typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : this._now();
+      let elapsedMs;
+      if (this._lastDrainMs === null) {
+        elapsedMs = this._drainIntervalMs;
+      } else {
+        elapsedMs = now - this._lastDrainMs;
+        if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+          elapsedMs = this._drainIntervalMs;
+        } else if (elapsedMs > MAX_DRAIN_ELAPSED_MS) {
+          elapsedMs = MAX_DRAIN_ELAPSED_MS;
+        }
+      }
+      this._lastDrainMs = now;
+
+      const free = this.ring.freeFrames();
+      if (free <= 0) {
+        return 0;
+      }
+      let timeBudgetFrames = Math.floor((this.sampleRate * elapsedMs) / 1000);
+      if (elapsedMs > 0 && timeBudgetFrames <= 0) {
+        timeBudgetFrames = 1;
+      }
+      const maxFrames = Math.min(
+        free,
+        timeBudgetFrames,
+        this._effectiveMaxDrainFramesPerTick()
+      );
+      if (maxFrames <= 0) {
+        return 0;
+      }
+      const prevInDrainTick = this._inDrainTick;
+      this._inDrainTick = true;
+      let pumped = 0;
+      try {
+        const pumpRes = this.drainGuestPcmRing(maxFrames);
+        pumped = pumpRes.framesDrained;
+      } finally {
+        this._inDrainTick = prevInDrainTick;
+      }
+      this._maybeBroadcastAudioStats(now);
+      return pumped;
     }
 
     /**
@@ -4073,6 +4299,18 @@
         prewarmFrames * GUEST_PCM_RING_CHANNELS
       );
 
+      if (
+        this.initialized &&
+        this.ring &&
+        this._autoDrain &&
+        this._drainTimer === null &&
+        this._shouldRunTimer()
+      ) {
+        this._startDrainTimer();
+      }
+
+      this._publishAudioStats({ force: true });
+
       return {
         attached: true,
         guestRingAttached: true,
@@ -4093,6 +4331,12 @@
       this._guestRingExplicitQuantum = false;
       this._guestRingAutoPump = false;
       this._guestResamplerState = { phase: 0.0 };
+      if (!this._shouldRunTimer()) {
+        this._stopDrainTimer();
+      }
+      if (wasAttached) {
+        this._publishAudioStats({ force: true });
+      }
       return {
         detached: true,
         wasAttached,
@@ -4508,6 +4752,10 @@
         this._zeroAllocDrains += 1;
       }
 
+      if (!this._inDrainTick && readRes.framesRead > 0) {
+        this._maybeBroadcastAudioStats(this._now());
+      }
+
       return {
         framesDrained: readRes.framesRead,
         requestedFrames,
@@ -4554,6 +4802,11 @@
       this._guestPeakLevel = 0.0;
       this._guestUnderrunFadeCount = 0;
       this._guestRecoveryFadeCount = 0;
+      this._lastTelemetryBroadcastMs = null;
+      this._lastBroadcastFramesDrained = -1;
+      this._lastBroadcastGuestFramesDrained = -1;
+      this._firstGuestDrainBroadcasted = false;
+      this._telemetryBroadcastCount = 0;
       if (this._guestRing) {
         this._guestRing.resetFadeState();
       }
@@ -4569,11 +4822,23 @@
 
     stop() {
       this._stopDrainTimer();
+      if (
+        this.framesDrained !== this._lastBroadcastFramesDrained ||
+        this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained
+      ) {
+        this._publishAudioStats({ force: true });
+      }
       this.reset();
     }
 
     destroy() {
       this._stopDrainTimer();
+      if (
+        this.framesDrained !== this._lastBroadcastFramesDrained ||
+        this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained
+      ) {
+        this._publishAudioStats({ force: true });
+      }
       this.detachGuestPcmRing();
     }
 
@@ -4880,7 +5145,7 @@
           this.initialized = true;
           this._resetTelemetryAndCounters();
 
-          if (this._shouldDrain()) {
+          if (this._shouldRunTimer()) {
             this._startDrainTimer();
           }
 
@@ -5518,6 +5783,8 @@
     GUEST_PCM_RING_CHANNELS,
     GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES,
     GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES,
+    PROGRESS_CHANNEL_NAME,
+    DEFAULT_TELEMETRY_BROADCAST_INTERVAL_MS,
     ITU_BS775_CENTER_GAIN,
     ITU_BS775_SURROUND_GAIN,
     ITU_BS775_LFE_GAIN,
@@ -5557,14 +5824,17 @@
     typeof window === 'undefined';
 
   if (isDedicatedWorker) {
-    const worker = new AudioMixerWorker((payload, transfer) => {
-      const safeTransfer = sanitizeTransferList(transfer);
-      if (safeTransfer.length > 0) {
-        self.postMessage(payload, safeTransfer);
-      } else {
-        self.postMessage(payload);
-      }
-    });
+    const worker = new AudioMixerWorker(
+      (payload, transfer) => {
+        const safeTransfer = sanitizeTransferList(transfer);
+        if (safeTransfer.length > 0) {
+          self.postMessage(payload, safeTransfer);
+        } else {
+          self.postMessage(payload);
+        }
+      },
+      { telemetryBroadcast: true }
+    );
     self.playGta6AudioWorker = worker;
     self.onmessage = (ev) => {
       try {

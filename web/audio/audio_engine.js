@@ -964,6 +964,55 @@ export class AudioEngine {
     this._guestOverruns = 0;
     this._guestPeakLevel = 0;
 
+    // O43 (#1028/#663): Subscribe to live 'audio-stats' broadcasts from audio_worker.js
+    // on BroadcastChannel('game-progress') so AudioEngine.getStats()/getTelemetry()
+    // reflect real guest PCM ring drainage even when loader.js owns the audio worker.
+    this._telemetryChannel = null;
+    const explicitTelemetryOpt =
+      opts.listenTelemetryBroadcast !== undefined
+        ? Boolean(opts.listenTelemetryBroadcast)
+        : opts.BroadcastChannelCtor !== undefined || opts.telemetryChannelName !== undefined
+          ? true
+          : typeof globalThis !== 'undefined' &&
+            typeof globalThis.window !== 'undefined' &&
+            typeof globalThis.BroadcastChannel === 'function';
+    if (explicitTelemetryOpt) {
+      const TelemetryChannelCtor =
+        typeof opts.BroadcastChannelCtor === 'function'
+          ? opts.BroadcastChannelCtor
+          : typeof globalThis !== 'undefined' && typeof globalThis.BroadcastChannel === 'function'
+            ? globalThis.BroadcastChannel
+            : null;
+      const telemetryChannelName =
+        typeof opts.telemetryChannelName === 'string' && opts.telemetryChannelName.length > 0
+          ? opts.telemetryChannelName
+          : 'game-progress';
+      if (TelemetryChannelCtor) {
+        try {
+          const ch = new TelemetryChannelCtor(telemetryChannelName);
+          if (ch && typeof ch.unref === 'function') {
+            ch.unref();
+          }
+          ch.onmessage = (event) => {
+            if (this._destroyed) {
+              return;
+            }
+            const data = event && event.data;
+            if (
+              data &&
+              typeof data === 'object' &&
+              (data.type === 'audio-stats' || data.type === 'guest-audio-telemetry')
+            ) {
+              this.updateGuestAudioTelemetry(data);
+            }
+          };
+          this._telemetryChannel = ch;
+        } catch {
+          this._telemetryChannel = null;
+        }
+      }
+    }
+
     this._resumeAttempts = 0;
     this._resumeSuccesses = 0;
     this._resumeFailures = 0;
@@ -3599,6 +3648,18 @@ export class AudioEngine {
     this._pendingAutoRecovery = false;
     this._wasPlaying = false;
     this._explicitlySuspended = false;
+
+    if (this._telemetryChannel) {
+      try {
+        this._telemetryChannel.onmessage = null;
+        if (typeof this._telemetryChannel.close === 'function') {
+          this._telemetryChannel.close();
+        }
+      } catch {
+        // Ignore telemetry BroadcastChannel close errors.
+      }
+      this._telemetryChannel = null;
+    }
 
     this._clearGestureListeners();
 
