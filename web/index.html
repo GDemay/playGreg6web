@@ -233,6 +233,7 @@
             </div>
             <div class="controls-grid">
               <button id="btn-smoke-demo" class="astryx-button" data-variant="secondary" data-size="xs" type="button" aria-pressed="false">Smoke Demo</button>
+              <button id="btn-pointer-lock" class="astryx-button" data-variant="secondary" data-size="xs" type="button" data-locked="false" aria-pressed="false" title="Toggle 3D camera Pointer Lock (click viewport or press Esc to release)">Lock Mouse</button>
               <button id="btn-record-trace" class="astryx-button" data-variant="secondary" data-size="xs" type="button" data-recording="false" aria-pressed="false">Record Trace</button>
               <button id="btn-export-trace" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Export .pg6trace</button>
               <button id="btn-clear-cache" class="astryx-button" data-variant="secondary" data-size="xs" type="button">Clear Cache</button>
@@ -292,6 +293,7 @@
     const bootProgressFillEl = document.getElementById('hud-boot-progress-fill');
 
     const smokeDemoBtn = document.getElementById('btn-smoke-demo');
+    const pointerLockBtn = document.getElementById('btn-pointer-lock');
     const restartBtn = document.getElementById('btn-restart-session');
     const recordTraceBtn = document.getElementById('btn-record-trace');
     const exportTraceBtn = document.getElementById('btn-export-trace');
@@ -1003,6 +1005,7 @@
           ? metrics.pointerLock
           : (locked ? 'Locked' : 'Unlocked');
         setValue(metricEls.pointerLock, label, locked ? 'ok' : '');
+        syncPointerLockButton(locked);
       }
 
       if (metrics.gamepad !== undefined) {
@@ -1174,6 +1177,7 @@
       setSideModuleProgress: updateSideModuleDisplay,
       recordValidationError: recordGpuValidationErrorDisplay,
       onGpuValidationError: recordGpuValidationErrorDisplay,
+      togglePointerLock: () => togglePointerLockFromUi(),
     };
     window.playgta6Hud = hudApi;
     window.playgta6App = null;
@@ -1230,16 +1234,83 @@
       bootElapsedEl.textContent = formatElapsed(now - bootStartedAt);
     }, 100);
 
-    function updatePointerLockState() {
-      const locked = document.pointerLockElement === canvas;
-      updateMetrics({ pointerLock: locked });
+    let lastPointerLockedState = null;
+    function syncPointerLockButton(locked) {
+      if (!pointerLockBtn) return;
+      const isLocked = Boolean(locked);
+      pointerLockBtn.dataset.locked = isLocked ? 'true' : 'false';
+      pointerLockBtn.setAttribute('aria-pressed', isLocked ? 'true' : 'false');
+      pointerLockBtn.textContent = isLocked ? 'Unlock Mouse' : 'Lock Mouse';
     }
-    document.addEventListener('pointerlockchange', updatePointerLockState);
+
+    function updatePointerLockState(logTransition = false) {
+      const locked = document.pointerLockElement === canvas;
+      const changed = lastPointerLockedState !== null && lastPointerLockedState !== locked;
+      lastPointerLockedState = locked;
+      updateMetrics({ pointerLock: locked });
+      syncPointerLockButton(locked);
+      if (logTransition && changed) {
+        appendLog(
+          locked ? 'Pointer lock active (press Esc to release).' : 'Pointer lock released.',
+          locked ? 'ok' : 'info'
+        );
+      }
+    }
+    document.addEventListener('pointerlockchange', () => updatePointerLockState(true));
     document.addEventListener('pointerlockerror', () => {
       appendLog('Pointer lock request denied by browser.', 'warn');
-      updatePointerLockState();
+      updatePointerLockState(false);
     });
-    updatePointerLockState();
+    updatePointerLockState(false);
+
+    function togglePointerLockFromUi() {
+      const activeApp = window.playgta6App;
+      if (activeApp && typeof activeApp.unlockAudio === 'function') {
+        void activeApp.unlockAudio({ source: 'pointer-lock-button' });
+      }
+      if (activeApp && typeof activeApp.togglePointerLock === 'function') {
+        return activeApp.togglePointerLock();
+      }
+      if (document.pointerLockElement === canvas) {
+        if (typeof document.exitPointerLock === 'function') {
+          try {
+            document.exitPointerLock();
+          } catch {
+            // Ignore exitPointerLock errors.
+          }
+        }
+        return Promise.resolve({ ok: true, locked: false });
+      }
+      if (canvas && typeof canvas.requestPointerLock === 'function') {
+        try {
+          const res = canvas.requestPointerLock();
+          if (res && typeof res.catch === 'function') {
+            return res.then(
+              () => ({ ok: true, locked: document.pointerLockElement === canvas }),
+              () => {
+                appendLog('Pointer lock request denied by browser.', 'warn');
+                updatePointerLockState(false);
+                return { ok: false, locked: false };
+              }
+            );
+          }
+          return Promise.resolve({ ok: true, locked: document.pointerLockElement === canvas });
+        } catch {
+          appendLog('Pointer lock request denied by browser.', 'warn');
+          updatePointerLockState(false);
+          return Promise.resolve({ ok: false, locked: false });
+        }
+      }
+      return Promise.resolve({ ok: false, locked: false });
+    }
+
+    if (pointerLockBtn) {
+      pointerLockBtn.addEventListener('click', (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        void togglePointerLockFromUi();
+      });
+    }
 
     function updateGamepadState() {
       if (typeof navigator.getGamepads !== 'function') {
