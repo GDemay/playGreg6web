@@ -414,9 +414,11 @@ def menu_to_ingame_script_text(duration_ms: int) -> str:
               f"repeat every 14s until draws_per_frame=={VIEWER_SCREEN} for 1500ms timeout 240s"]
     lines += ["  " + line for line in _lines(_menu_cycle())]
     lines += ["end", "capture"]
-    # Terms screen (VIEWER_SCREEN draws/frame): one round per 16 s until the screen changes (a pass leaves it; the
-    # round also toggles the checkboxes, so it stops as soon as the screen has left for 3 s).
-    lines += [f"repeat every 16s until draws_per_frame!={VIEWER_SCREEN} for 3s timeout 200s"]
+    # Terms screen: one round per 16 s until Confirm has taken (the loading screen after it, TERMS_PASSED, held 3 s).
+    # Not "until draws/frame leaves VIEWER_SCREEN": the terms screen's draws/frame jump between ~17 and ~86 while
+    # its cursor and document panel animate, and a `repeat` sends no press while its condition holds even for
+    # one frame, so that gate dropped the round's checkbox A / Down / Confirm presses (#663).
+    lines += [f"repeat every 16s until {TERMS_PASSED} for 3s timeout 200s"]
     lines += ["  " + line for line in _lines(_terms_round())]
     lines += ["end"]
     lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
@@ -424,6 +426,11 @@ def menu_to_ingame_script_text(duration_ms: int) -> str:
               "repeat every 12s until presents>=999999999 timeout 800s",
               "  0 A 100", "  1500 Up 1500", "  3500 RRight 1200", "  5500 LT 1000", "  7000 Up+RT 1000", "end"]
     return "\n".join(lines) + "\n"
+
+
+# After "Confirm >" on the terms screen: a black loading screen (2-3 draws/frame). The terms screen itself never
+# drops this low (measured natively: 17 or more draws/frame through its rounds).
+TERMS_PASSED = "draws_per_frame<=4"
 
 
 def _terms_round() -> list[tuple[int, str, int]]:
