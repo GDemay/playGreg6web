@@ -397,18 +397,23 @@ def menu_to_ingame_script_text(duration_ms: int) -> str:
     """The menu-to-ingame preset: A (every 14 s) to LEGAL NOTICES (37 draws/frame), then a plain wait until it
     is steady (no A may go out there: a round-start A opened Copyright and the R40 run stayed in the
     viewer to 900 s); B every 3 s only while the screen is not 37 (a document viewer that got opened
-    closes); then D-pad Down, Down, A on "Next >" with short gaps and a wait until 37 is left. After that
-    everything is screen-synced: the browser preset's skip / confirm round (A hold, Menu, A) until the
-    screen leaves 34 draws/frame, then the movement round (A, left stick forward, right stick, LT, RT)
-    every 12 s until the time limit."""
+    closes); then the menu cycle (Up x6, Down, Down, A on "Next >") every 14 s until the screen after
+    it (VIEWER_SCREEN) holds. Measured natively, "Next >" did not react early on LEGAL NOTICES (one
+    Down, Down, A ~9 s after it appeared did nothing; the first cycle ~18 s in did nothing, the
+    second ~32 s in passed), and 44 draws/frame is LEGAL NOTICES with the cursor moved, so neither a
+    single press nor "left 37" counts as having passed it. After that everything is screen-synced: the browser
+    preset's skip / confirm round (A hold, Menu, A) until the screen leaves 34 draws/frame, then the
+    movement round (A, left stick forward, right stick, LT, RT) every 12 s until the time limit."""
     lines = ["# menu-to-ingame (tools/run_native_boot.py): A to LEGAL NOTICES (" + LEGAL_SCREEN + " draws/frame),",
-             "# wait (no A), B if a viewer is open, Down, Down, A on \"Next >\", then screen-synced rounds"]
+             "# wait (no A), B if a viewer is open, then Up x6, Down, Down, A on \"Next >\" every 14 s until "
+             + VIEWER_SCREEN + ", then screen-synced rounds"]
     lines += _lines([(t, "A", INPUT_HOLD_MS) for t in range(20_000, 60_000, 2_500)])
     lines += [f"repeat every 14s until draws_per_frame=={LEGAL_SCREEN} for 500ms timeout 240s", "  0 A 100", "end",
               f"wait draws_per_frame=={LEGAL_SCREEN} for 2s timeout 30s",
               f"repeat every 3s until draws_per_frame=={LEGAL_SCREEN} for 1s timeout 30s", "  0 B 150", "end",
-              "500 DDown 150", "1200 DDown 150", "1900 A 100",
-              f"wait draws_per_frame!={LEGAL_SCREEN} for 2s timeout 60s", "capture"]
+              f"repeat every 14s until draws_per_frame=={VIEWER_SCREEN} for 1500ms timeout 240s"]
+    lines += ["  " + line for line in _lines(_menu_cycle())]
+    lines += ["end", "capture"]
     lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
               "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end",
               "repeat every 12s until presents>=999999999 timeout 800s",
