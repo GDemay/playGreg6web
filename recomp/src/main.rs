@@ -84,9 +84,30 @@ enum Command {
     Lift(lift_cmd::LiftArgs),
     SurveyInterfaces(playgta6_recomp::survey::cli::Args),
     SurveyJumps(playgta6_recomp::jump_survey::Args),
+    OpcodeCensus(PathBuf),
     Build(BuildArgs),
     BuildProgram(program_cmd::ProgramArgs),
     ExportThunks(export_cmd::ExportArgs),
+}
+
+/// Lifts every discovered function and reports the instructions the lifter cannot translate
+/// (counts by mnemonic and CPU feature, and how many sit in boot-reachable functions).
+fn run_opcode_census(path: &Path) -> Result<String, String> {
+    let bytes = fs::read(path).map_err(|e| format!("failed to read '{}': {e}", path.display()))?;
+    let pe = Pe64::parse(&bytes).map_err(|e| format!("failed to parse PE64: {e}"))?;
+    let seeded = pipeline::seed(&pe, &bytes);
+    let analysis = discover(&seeded.image);
+    let base = pe.optional.image_base;
+    let mut roots = Vec::new();
+    if pe.optional.entry_point_rva != 0 {
+        roots.push(base + u64::from(pe.optional.entry_point_rva));
+    }
+    if let Some(tls) = &pe.tls {
+        roots.extend(tls.callbacks.iter().map(|cb| cb.va));
+    }
+    let boot = playgta6_recomp::opcode_census::reachable(&analysis.functions, &roots);
+    let census = playgta6_recomp::opcode_census::census(&analysis.functions, &boot);
+    Ok(playgta6_recomp::opcode_census::render(&census))
 }
 
 fn print_usage() {
@@ -101,6 +122,7 @@ fn print_usage() {
         "  playgta6-recomp stubs <pe-path>|--import-list <file> --shims <header>... --out <dir> [--include-root <dir>]"
     );
     eprintln!("  playgta6-recomp lift <pe-path> --out <dir> [--entry <va>]... [--emit-obj]");
+    eprintln!("  playgta6-recomp opcode-census <pe-path>");
     eprintln!("  playgta6-recomp {}", playgta6_recomp::survey::cli::USAGE);
     eprintln!("  playgta6-recomp {}", playgta6_recomp::jump_survey::USAGE);
     eprintln!(
@@ -166,6 +188,13 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "lift" => {
             lift_cmd::parse_lift_args(&args[1..]).map(|a| a.map_or(Command::Help, Command::Lift))
         }
+        "opcode-census" => match args.get(1).map(String::as_str) {
+            Some("-h" | "--help") | None => Ok(Command::Help),
+            Some(path) if !path.starts_with('-') && args.len() == 2 => {
+                Ok(Command::OpcodeCensus(PathBuf::from(path)))
+            }
+            Some(other) => Err(format!("unexpected argument '{other}' for 'opcode-census'")),
+        },
         "survey-interfaces" => playgta6_recomp::survey::cli::parse_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::SurveyInterfaces)),
         "survey-jumps" => playgta6_recomp::jump_survey::parse_args(&args[1..])
@@ -176,7 +205,7 @@ fn parse_cli(args: &[String]) -> Result<Command, String> {
         "export-thunks" => export_cmd::parse_export_args(&args[1..])
             .map(|a| a.map_or(Command::Help, Command::ExportThunks)),
         other => Err(format!(
-            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'survey-interfaces', 'survey-jumps', 'build', 'build-program' or 'export-thunks'. Run with --help for usage."
+            "unknown subcommand '{other}'. Expected 'inspect', 'discover', 'pack-image', 'stubs', 'lift', 'opcode-census', 'survey-interfaces', 'survey-jumps', 'build', 'build-program' or 'export-thunks'. Run with --help for usage."
         )),
     }
 }
@@ -1001,6 +1030,16 @@ fn main() -> ExitCode {
             }
         },
         Ok(Command::SurveyJumps(a)) => match playgta6_recomp::jump_survey::run(&a) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                eprintln!("Error: {err}");
+                ExitCode::FAILURE
+            }
+        },
+        Ok(Command::OpcodeCensus(path)) => match run_opcode_census(&path) {
             Ok(report) => {
                 print!("{report}");
                 ExitCode::SUCCESS
