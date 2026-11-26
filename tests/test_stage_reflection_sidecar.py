@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 
@@ -286,6 +287,7 @@ class SidecarTests(unittest.TestCase):
             written = json.loads(out_path.read_text(encoding="utf-8"))
 
         self.assertEqual(summary, {
+            "sidecar_version": 1,
             "stages_written": 3,
             "skipped": {"binding without source": 1},
             "merged_existing": 2,
@@ -298,10 +300,26 @@ class SidecarTests(unittest.TestCase):
             "cbv_indexed_heap_bindings": 0,
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
+            "root_descriptor_table_offset_stages": 0,
+            "root_descriptor_table_offset_bindings": 0,
+            "rt_arena_stages": 0,
+            "rt_arena_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
             "unresolved_stages": 0,
             "unresolved_bindings": 0,
+            "unresolved_by_kind": {},
+            "unresolved_by_reason": {},
+            "gap_breakdown": {
+                "skipped_total": 1,
+                "skipped_by_cause": [
+                    {"cause": "binding without source", "count": 1, "pct_of_skipped": 100.0}
+                ],
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
+                "unresolved_by_kind": {},
+                "unresolved_by_reason": {},
+            },
         })
         self.assertEqual(set(written["stages"].keys()), {
             "0x0000000000000001",
@@ -343,6 +361,7 @@ class SidecarTests(unittest.TestCase):
                 rc1 = sidecar.main([str(in1), "--out", str(out), "--merge-existing", str(out), "--json"])
             self.assertEqual(rc1, 0)
             self.assertEqual(json.loads(stdout1.getvalue()), {
+                "sidecar_version": 1,
                 "stages_written": 1,
                 "skipped": {},
                 "merged_existing": 0,
@@ -355,10 +374,24 @@ class SidecarTests(unittest.TestCase):
                 "cbv_indexed_heap_bindings": 0,
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
+                "root_descriptor_table_offset_stages": 0,
+                "root_descriptor_table_offset_bindings": 0,
+                "rt_arena_stages": 0,
+                "rt_arena_bindings": 0,
                 "vertex_index_stages": 0,
                 "mesh_output_stages": 0,
                 "unresolved_stages": 0,
                 "unresolved_bindings": 0,
+                "unresolved_by_kind": {},
+                "unresolved_by_reason": {},
+                "gap_breakdown": {
+                    "skipped_total": 0,
+                    "skipped_by_cause": [],
+                    "unresolved_stages": 0,
+                    "unresolved_bindings": 0,
+                    "unresolved_by_kind": {},
+                    "unresolved_by_reason": {},
+                },
             })
 
             # Second run: in-place merge onto the file written in run 1
@@ -367,6 +400,7 @@ class SidecarTests(unittest.TestCase):
                 rc2 = sidecar.main([str(in2), "--out", str(out), "--merge-existing", str(out), "--json"])
             self.assertEqual(rc2, 0)
             self.assertEqual(json.loads(stdout2.getvalue()), {
+                "sidecar_version": 1,
                 "stages_written": 2,
                 "skipped": {},
                 "merged_existing": 1,
@@ -379,10 +413,24 @@ class SidecarTests(unittest.TestCase):
                 "cbv_indexed_heap_bindings": 0,
                 "lane_indexed_heap_stages": 0,
                 "lane_indexed_heap_bindings": 0,
+                "root_descriptor_table_offset_stages": 0,
+                "root_descriptor_table_offset_bindings": 0,
+                "rt_arena_stages": 0,
+                "rt_arena_bindings": 0,
                 "vertex_index_stages": 0,
                 "mesh_output_stages": 0,
                 "unresolved_stages": 0,
                 "unresolved_bindings": 0,
+                "unresolved_by_kind": {},
+                "unresolved_by_reason": {},
+                "gap_breakdown": {
+                    "skipped_total": 0,
+                    "skipped_by_cause": [],
+                    "unresolved_stages": 0,
+                    "unresolved_bindings": 0,
+                    "unresolved_by_kind": {},
+                    "unresolved_by_reason": {},
+                },
             })
             written = json.loads(out.read_text(encoding="utf-8"))
         self.assertEqual(set(written["stages"].keys()), {"0x00000000000000a1", "0x00000000000000b2"})
@@ -437,6 +485,7 @@ class SidecarTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             summary = json.loads(stdout.getvalue())
         self.assertEqual(summary, {
+            "sidecar_version": 1,
             "stages_written": 1,
             "skipped": {},
             "by_stage": {"vertex": 1, "fragment": 0, "compute": 0},
@@ -448,10 +497,24 @@ class SidecarTests(unittest.TestCase):
             "cbv_indexed_heap_bindings": 0,
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
+            "root_descriptor_table_offset_stages": 0,
+            "root_descriptor_table_offset_bindings": 0,
+            "rt_arena_stages": 0,
+            "rt_arena_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
             "unresolved_stages": 0,
             "unresolved_bindings": 0,
+            "unresolved_by_kind": {},
+            "unresolved_by_reason": {},
+            "gap_breakdown": {
+                "skipped_total": 0,
+                "skipped_by_cause": [],
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
+                "unresolved_by_kind": {},
+                "unresolved_by_reason": {},
+            },
         })
         self.assertNotIn("merged_existing", summary)
         self.assertNotIn("diff", summary)
@@ -692,6 +755,7 @@ class SidecarTests(unittest.TestCase):
         self.assertEqual(written["version"], 1)
 
         self.assertEqual(summary, {
+            "sidecar_version": 1,
             "stages_written": 5,
             "skipped": {},
             "by_stage": {"vertex": 3, "fragment": 1, "compute": 1},
@@ -703,10 +767,24 @@ class SidecarTests(unittest.TestCase):
             "cbv_indexed_heap_bindings": 0,
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
+            "root_descriptor_table_offset_stages": 0,
+            "root_descriptor_table_offset_bindings": 0,
+            "rt_arena_stages": 0,
+            "rt_arena_bindings": 0,
             "vertex_index_stages": 2,
             "mesh_output_stages": 0,
             "unresolved_stages": 0,
             "unresolved_bindings": 0,
+            "unresolved_by_kind": {},
+            "unresolved_by_reason": {},
+            "gap_breakdown": {
+                "skipped_total": 0,
+                "skipped_by_cause": [],
+                "unresolved_stages": 0,
+                "unresolved_bindings": 0,
+                "unresolved_by_kind": {},
+                "unresolved_by_reason": {},
+            },
         })
 
     def test_summarize_stages_empty_and_explicit_vertex_input_mode(self):
@@ -720,10 +798,16 @@ class SidecarTests(unittest.TestCase):
             "cbv_indexed_heap_bindings": 0,
             "lane_indexed_heap_stages": 0,
             "lane_indexed_heap_bindings": 0,
+            "root_descriptor_table_offset_stages": 0,
+            "root_descriptor_table_offset_bindings": 0,
+            "rt_arena_stages": 0,
+            "rt_arena_bindings": 0,
             "vertex_index_stages": 0,
             "mesh_output_stages": 0,
             "unresolved_stages": 0,
             "unresolved_bindings": 0,
+            "unresolved_by_kind": {},
+            "unresolved_by_reason": {},
         })
         stages = {
             "0x1": {"stage": "vertex", "bindings": [], "vertex_inputs": []},
@@ -1085,6 +1169,10 @@ class SidecarTests(unittest.TestCase):
             summary = json.loads(stdout.getvalue())
             self.assertEqual(summary["pack_verification"], {
                 "pack_label": "shaders.wgsl.pack",
+                "pack_version": 1,
+                "pack_bytes": len(pack_bytes),
+                "toc_entry_bytes": sidecar.WGPK_ENTRY_BYTES,
+                "is_wgpk_v2": False,
                 "pack_entry_count": 3,
                 "reflection_stage_count": 3,
                 "matched_hashes": 3,
@@ -1094,6 +1182,13 @@ class SidecarTests(unittest.TestCase):
                 "pack_by_stage": {"vertex": 1, "fragment": 1, "compute": 1},
                 "missing_by_stage": {"vertex": 0, "fragment": 0, "compute": 0},
                 "stage_mismatches": 0,
+                "stage_mismatch_samples": [],
+                "gap_counts": {
+                    "missing_reflection": 0,
+                    "stage_mismatches": 0,
+                    "extra_reflection": 0,
+                    "unresolved_matched_stages": 0,
+                },
             })
 
             # Human-readable output includes concise pack verification summary
@@ -1134,6 +1229,10 @@ class SidecarTests(unittest.TestCase):
         result = sidecar.verify_sidecar_against_pack(toc, stages, pack_label="partial.wgsl.pack")
         self.assertEqual(result, {
             "pack_label": "partial.wgsl.pack",
+            "pack_version": 1,
+            "pack_bytes": len(pack_bytes),
+            "toc_entry_bytes": sidecar.WGPK_ENTRY_BYTES,
+            "is_wgpk_v2": False,
             "pack_entry_count": 8,
             "reflection_stage_count": 9,
             "matched_hashes": 2,
@@ -1149,6 +1248,13 @@ class SidecarTests(unittest.TestCase):
             "pack_by_stage": {"vertex": 2, "fragment": 4, "compute": 2},
             "missing_by_stage": {"vertex": 0, "fragment": 4, "compute": 2},
             "stage_mismatches": 1,
+            "stage_mismatch_samples": ["0x0000000000000002"],
+            "gap_counts": {
+                "missing_reflection": 6,
+                "stage_mismatches": 1,
+                "extra_reflection": 7,
+                "unresolved_matched_stages": 0,
+            },
         })
 
     def test_verify_pack_empty_pack_zero_division_guard(self):
@@ -1797,6 +1903,94 @@ class SidecarTests(unittest.TestCase):
             self.assertIn("malformed unresolved source", stderr.getvalue())
 
 
+class _VirtualWgpkStream:
+    """Seekable virtual BinaryIO stream with a real header+TOC prefix and an arbitrary 64-bit
+    virtual total_len (e.g. >4 GiB) so tests can verify streaming WGPK v2 validation with zero RAM
+    or disk blowup while asserting that no payload bytes are ever read."""
+
+    def __init__(
+        self,
+        prefix: bytes,
+        total_len: int,
+        *,
+        max_return_bytes: int | None = None,
+        allow_eof: bool = False,
+    ) -> None:
+        self._prefix = prefix
+        self._total_len = total_len
+        self._pos = 0
+        self._max_return_bytes = max_return_bytes
+        self._allow_eof = allow_eof
+        self.read_sizes: list[int] = []
+        self.max_pos_read = 0
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            self._pos = offset
+        elif whence == 1:
+            self._pos += offset
+        elif whence == 2:
+            self._pos = self._total_len + offset
+        else:
+            raise ValueError(f"unsupported whence {whence}")
+        if self._pos < 0:
+            raise ValueError("negative seek position")
+        return self._pos
+
+    def tell(self) -> int:
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise AssertionError("unbounded read() must not be called on streaming WGPK reader")
+        self.read_sizes.append(size)
+        if self._pos >= len(self._prefix):
+            if self._allow_eof:
+                return b""
+            raise AssertionError(
+                f"attempted to read payload bytes at pos={self._pos} >= prefix_len={len(self._prefix)}"
+            )
+        end = min(self._pos + size, len(self._prefix))
+        if self._max_return_bytes is not None:
+            end = min(end, self._pos + self._max_return_bytes)
+        data = self._prefix[self._pos:end]
+        self._pos = end
+        self.max_pos_read = max(self.max_pos_read, self._pos)
+        return data
+
+    def __enter__(self) -> "_VirtualWgpkStream":
+        return self
+
+    def __exit__(self, *_exc: object) -> bool:
+        return False
+
+
+def build_synthetic_wgpk_v2_prefix(
+    entries: list[tuple[int, str, int, int]],
+    *,
+    flags: int = 0,
+) -> bytes:
+    """Build a WGPK v2 header + TOC prefix from (hash_int, stage_name, offset_u64, length_u32)."""
+    header = sidecar.WGPK_HEADER_STRUCT.pack(
+        sidecar.WGPK_MAGIC,
+        sidecar.WGPK_VERSION_V2,
+        len(entries),
+        flags,
+    )
+    toc = bytearray()
+    for hash_int, stage_name, offset, length in entries:
+        toc.extend(
+            sidecar.WGPK_ENTRY_STRUCT_V2.pack(
+                hash_int,
+                _STAGE_TO_CODE[stage_name],
+                b"\x00\x00\x00",
+                length,
+                offset,
+            )
+        )
+    return bytes(header) + bytes(toc)
+
+
 class WgpkV2Tests(unittest.TestCase):
     def _v2_pack(self, entries):
         import inspect_wgsl_pack as w
@@ -1804,11 +1998,25 @@ class WgpkV2Tests(unittest.TestCase):
 
     def test_v2_toc_parses_and_verifies(self):
         raw = self._v2_pack([(1, "vertex", b"// a"), (2, "compute", b"// bb")])
-        toc = sidecar.parse_wgpk_toc_bytes(raw)
+        toc, meta = sidecar.parse_wgpk_toc_bytes_with_meta(raw)
         self.assertEqual([(e["hash"], e["stage"], e["length"]) for e in toc],
                          [("0x0000000000000001", "vertex", 4), ("0x0000000000000002", "compute", 5)])
-        res = sidecar.verify_sidecar_against_pack(toc, {"0x0000000000000001": {"stage": "vertex"}})
+        self.assertEqual(meta, {
+            "pack_version": 2,
+            "pack_bytes": len(raw),
+            "toc_entry_bytes": 24,
+            "is_wgpk_v2": True,
+        })
+        res = sidecar.verify_sidecar_against_pack(
+            toc,
+            {"0x0000000000000001": {"stage": "vertex"}},
+            pack_meta=meta,
+        )
         self.assertEqual(res["matched_hashes"], 1)
+        self.assertEqual(res["pack_version"], 2)
+        self.assertEqual(res["pack_bytes"], len(raw))
+        self.assertEqual(res["toc_entry_bytes"], 24)
+        self.assertTrue(res["is_wgpk_v2"])
 
     def test_v2_load_from_disk(self):
         with tempfile.TemporaryDirectory() as t:
@@ -1820,6 +2028,633 @@ class WgpkV2Tests(unittest.TestCase):
         raw = self._v2_pack([(1, "vertex", b"// a")])
         with self.assertRaises(ValueError):
             sidecar.parse_wgpk_toc_bytes(raw[:-2])
+
+    def test_streaming_wgpk_v2_over_4gib_bounded_chunks_and_short_reads(self):
+        # Synthetic 5 GiB WGPK v2 archive (> 0xFFFFFFFF) validated without reading any payload bytes.
+        five_gib = 5 * 1024 * 1024 * 1024  # 0x1_4000_0000
+        entries_spec = [
+            (0x00000000000000A1, "vertex", 16 + 5 * 24, 128),
+            (0x00000000000000B2, "fragment", 0x00000000FFFFF000, 4096),
+            (0x00000000000000C3, "compute", 0x0000000100000000, 8192),  # exactly 4 GiB offset
+            (0x00000000000000D4, "fragment", 0x0000000120000000, 65536),
+            (0x00000000000000E5, "compute", five_gib - 64, 64),
+        ]
+        prefix = build_synthetic_wgpk_v2_prefix(entries_spec)
+        # chunk_entries=2 forces 3 chunk reads (2 + 2 + 1 entries), and max_return_bytes=11 exercises short reads.
+        stream = _VirtualWgpkStream(prefix, five_gib, max_return_bytes=11)
+        toc, meta = sidecar.load_wgpk_toc_stream(stream, label="huge.wgsl.pack", chunk_entries=2)
+
+        self.assertEqual(len(toc), 5)
+        self.assertEqual(toc[2]["offset"], 0x100000000)
+        self.assertEqual(toc[4]["offset"], five_gib - 64)
+        self.assertEqual(meta, {
+            "pack_version": 2,
+            "pack_bytes": five_gib,
+            "toc_entry_bytes": 24,
+            "is_wgpk_v2": True,
+        })
+        # Never read past the TOC prefix and never requested > chunk_entries * 24 bytes in a single read.
+        self.assertEqual(stream.max_pos_read, len(prefix))
+        self.assertTrue(all(sz <= 2 * 24 for sz in stream.read_sizes))
+
+        # Inferred metadata without pack_meta still detects WGPK v2 from >4 GiB offsets.
+        inferred = sidecar.verify_sidecar_against_pack(
+            toc,
+            {"0x00000000000000c3": {"stage": "compute"}},
+            pack_label="huge.wgsl.pack",
+        )
+        self.assertEqual(inferred["pack_version"], 2)
+        self.assertTrue(inferred["is_wgpk_v2"])
+        self.assertEqual(inferred["toc_entry_bytes"], 24)
+        self.assertEqual(inferred["pack_bytes"], five_gib)
+        self.assertEqual(inferred["matched_hashes"], 1)
+        self.assertEqual(inferred["coverage_pct"], 20.0)
+
+    def test_streaming_wgpk_v2_over_4gib_errors(self):
+        five_gib = 5 * 1024 * 1024 * 1024
+        data_start_2 = 16 + 2 * 24
+        bad_streams: list[tuple[str, bytes, int]] = [
+            (
+                "v1_exceeds_4gib",
+                sidecar.WGPK_HEADER_STRUCT.pack(sidecar.WGPK_MAGIC, sidecar.WGPK_VERSION, 0, 0),
+                five_gib,
+            ),
+            (
+                "v2_truncated_toc_mid_chunk",
+                build_synthetic_wgpk_v2_prefix([
+                    (1, "vertex", data_start_2, 4),
+                    (2, "fragment", 0x100000000, 4),
+                ])[:-10],
+                five_gib,
+            ),
+            (
+                "v2_offset_overlaps_toc",
+                build_synthetic_wgpk_v2_prefix([(1, "vertex", 16, 4)]),
+                five_gib,
+            ),
+            (
+                "v2_payload_exceeds_5gib_eof",
+                build_synthetic_wgpk_v2_prefix([(1, "compute", five_gib - 4, 16)]),
+                five_gib,
+            ),
+            (
+                "v2_payload_u64_overflow",
+                build_synthetic_wgpk_v2_prefix([(1, "compute", sidecar.WGPK_U64_MAX - 2, 16)]),
+                sidecar.WGPK_U64_MAX,
+            ),
+            (
+                "v2_overlapping_64bit_payloads",
+                build_synthetic_wgpk_v2_prefix([
+                    (1, "vertex", 0x100000000, 32),
+                    (2, "fragment", 0x100000010, 32),
+                ]),
+                five_gib,
+            ),
+            (
+                "v2_duplicate_hash",
+                build_synthetic_wgpk_v2_prefix([
+                    (0xDEAD, "vertex", 0x100000000, 8),
+                    (0xDEAD, "compute", 0x100000010, 8),
+                ]),
+                five_gib,
+            ),
+            (
+                "v2_invalid_stage_code",
+                sidecar.WGPK_HEADER_STRUCT.pack(sidecar.WGPK_MAGIC, sidecar.WGPK_VERSION_V2, 1, 0)
+                + sidecar.WGPK_ENTRY_STRUCT_V2.pack(1, 9, b"\x00\x00\x00", 4, 0x100000000),
+                five_gib,
+            ),
+        ]
+        for case, prefix, total_len in bad_streams:
+            with self.subTest(case=case):
+                with self.assertRaises(ValueError):
+                    sidecar.load_wgpk_toc_stream(
+                        _VirtualWgpkStream(prefix, total_len, allow_eof=(case == "v2_truncated_toc_mid_chunk")),
+                        chunk_entries=1,
+                    )
+
+    def test_cli_verify_pack_v2_over_4gib_and_verify_only_preserves_sidecar_version(self):
+        six_gib = 6 * 1024 * 1024 * 1024
+        prefix = build_synthetic_wgpk_v2_prefix([
+            (0x00000000000000A1, "vertex", 0x100000000, 64),
+            (0x00000000000000F6, "fragment", 0x140000000, 128),
+            (0x00000000000000C9, "compute", 0x17FFFFFC0, 64),
+        ])
+        with tempfile.TemporaryDirectory() as tmp:
+            pack_path = Path(tmp) / "mega_v2.wgsl.pack"
+            pack_path.write_bytes(prefix)  # stub file on disk; open() is mocked to serve 6 GiB virtual stream
+
+            real_open = Path.open
+
+            def fake_open(path_self: Path, mode: str = "r", *args, **kwargs):
+                if path_self == pack_path and "b" in mode:
+                    return _VirtualWgpkStream(prefix, six_gib)
+                return real_open(path_self, mode, *args, **kwargs)
+
+            # Verify standalone (verify-only) mode preserves v1, v2, and v3 sidecar versions accurately.
+            sidecar_docs = [
+                (
+                    1,
+                    {
+                        "schema": sidecar.SCHEMA,
+                        "version": 1,
+                        "stages": {
+                            "0x00000000000000a1": {
+                                "stage": "vertex",
+                                "bindings": [
+                                    {"group": 0, "binding": 0, "kind": "uniform",
+                                     "source": {"user_sgpr": 8, "table_byte_offset": 0}}
+                                ],
+                            }
+                        },
+                    },
+                ),
+                (
+                    2,
+                    {
+                        "schema": sidecar.SCHEMA,
+                        "version": 2,
+                        "stages": {
+                            "0x00000000000000a1": {
+                                "stage": "vertex",
+                                "bindings": [
+                                    {"group": 0, "binding": 0, "kind": "uniform",
+                                     "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32}}
+                                ],
+                            }
+                        },
+                    },
+                ),
+                (
+                    3,
+                    {
+                        "schema": sidecar.SCHEMA,
+                        "version": 3,
+                        "stages": {
+                            "0x00000000000000a1": {
+                                "stage": "vertex",
+                                "bindings": [
+                                    {"group": 0, "binding": 0, "kind": "uniform",
+                                     "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 32}}
+                                ],
+                            },
+                            "0x00000000000000f6": {
+                                "stage": "fragment",
+                                "bindings": [
+                                    {"group": 0, "binding": 0, "kind": "texture",
+                                     "source": {"unresolved": "cb_dynamic_offset"}}
+                                ],
+                            },
+                        },
+                    },
+                ),
+            ]
+            with mock.patch.object(Path, "open", autospec=True, side_effect=fake_open):
+                for expected_ver, doc in sidecar_docs:
+                    sidecar_path = Path(tmp) / f"v{expected_ver}.reflect.json"
+                    sidecar_path.write_text(json.dumps(doc), encoding="utf-8")
+
+                    stdout = io.StringIO()
+                    with redirect_stdout(stdout):
+                        rc = sidecar.main(["--out", str(sidecar_path), "--verify-pack", str(pack_path), "--json"])
+                    self.assertEqual(rc, 0)
+                    summary = json.loads(stdout.getvalue())
+                    self.assertEqual(summary["sidecar_version"], expected_ver)
+                    pv = summary["pack_verification"]
+                    self.assertEqual(pv["pack_version"], 2)
+                    self.assertEqual(pv["pack_bytes"], six_gib)
+                    self.assertEqual(pv["toc_entry_bytes"], 24)
+                    self.assertTrue(pv["is_wgpk_v2"])
+                    if expected_ver == 3:
+                        self.assertEqual(pv["matched_hashes"], 2)
+                        self.assertEqual(pv["gap_counts"]["unresolved_matched_stages"], 1)
+                        self.assertEqual(summary["root_descriptor_table_offset_stages"], 1)
+                        self.assertEqual(summary["root_descriptor_table_offset_bindings"], 1)
+
+                # Text output surfaces WGPK v2 metadata, sidecar version, and actionable gaps.
+                stdout_txt = io.StringIO()
+                with redirect_stdout(stdout_txt):
+                    rc_txt = sidecar.main([
+                        "--out", str(Path(tmp) / "v3.reflect.json"),
+                        "--verify-pack", str(pack_path),
+                    ])
+                self.assertEqual(rc_txt, 0)
+                text = stdout_txt.getvalue()
+                self.assertIn("sidecar v3", text)
+                self.assertIn(f"[WGPK v2, {six_gib} B, 24 B/entry]", text)
+                self.assertIn("unresolved=1 (1 stages; kinds=[texture:1]; reasons=[cb_dynamic_offset:1])", text)
+                self.assertIn("pack_missing_by_stage=v:0/f:0/c:1", text)
+
+
+class V3SchemaAndGapBreakdownTests(unittest.TestCase):
+    def test_rt_arena_stage_flag_and_group3_bindings_with_and_without_kind(self):
+        entries = [
+            # Stage-level rt_arena: true with empty bindings
+            {
+                "hash_fnv1a64": "0x000000000000007b",
+                "stage": "compute",
+                "rt_arena": True,
+                "bindings": [],
+            },
+            # Stage-level rt_arena: false must be omitted in output
+            {
+                "hash_fnv1a64": "0x000000000000007c",
+                "stage": "compute",
+                "rt_arena": False,
+                "bindings": [],
+            },
+            # Per-binding group 3, bindings 16..21: both WITH kind and WITHOUT kind
+            {
+                "hash_fnv1a64": "0x000000000000007a",
+                "stage": "compute",
+                "bindings": [
+                    {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": True}},
+                    {"group": 3, "binding": 20, "kind": "read-only-storage", "source": {"rt_arena": True}},
+                    {"group": 3, "binding": 21, "source": {"rt_arena": True}},
+                    {"group": 0, "binding": 0, "kind": "uniform",
+                     "source": {"user_sgpr": 4, "root_constants": True}},
+                ],
+            },
+            # Both stage flag AND per-binding rt_arena must count as 1 rt_arena_stage (not 2)
+            {
+                "hash_fnv1a64": "0x000000000000007d",
+                "stage": "fragment",
+                "rt_arena": True,
+                "bindings": [
+                    {"group": 3, "binding": 17, "source": {"rt_arena": True}},
+                    {"group": 3, "binding": 18, "kind": "storage", "source": {"rt_arena": True}},
+                ],
+            },
+        ]
+        doc, skipped = sidecar.build([{"entries": entries}])
+        self.assertEqual(skipped, {})
+        self.assertEqual(doc["version"], 1)
+        self.assertTrue(doc["stages"]["0x000000000000007b"]["rt_arena"])
+        self.assertNotIn("rt_arena", doc["stages"]["0x000000000000007c"])
+        b_7a = doc["stages"]["0x000000000000007a"]["bindings"]
+        self.assertEqual(b_7a[0], {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": True}})
+        self.assertEqual(b_7a[1], {"group": 3, "binding": 20, "kind": "read_only_storage", "source": {"rt_arena": True}})
+        self.assertEqual(b_7a[2], {"group": 3, "binding": 21, "source": {"rt_arena": True}})
+        self.assertNotIn("kind", b_7a[2])
+
+        summary = sidecar.summarize_stages(doc["stages"])
+        self.assertEqual(summary["rt_arena_stages"], 3)
+        self.assertEqual(summary["rt_arena_bindings"], 5)
+
+        # Round-trip through _load_sidecar succeeds for both with-kind and without-kind bindings.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "rt.reflect.json"
+            p.write_text(json.dumps(doc), encoding="utf-8")
+            loaded = sidecar._load_sidecar(p, label="sidecar", allow_missing=False)
+            self.assertEqual(loaded, doc["stages"])
+
+    def test_rt_arena_invalid_group_binding_and_types_rejected_in_convert_and_load(self):
+        bad_bindings = [
+            {"group": 2, "binding": 16, "kind": "storage", "source": {"rt_arena": True}},
+            {"group": 4, "binding": 16, "kind": "storage", "source": {"rt_arena": True}},
+            {"group": 3, "binding": 15, "kind": "storage", "source": {"rt_arena": True}},
+            {"group": 3, "binding": 22, "kind": "storage", "source": {"rt_arena": True}},
+            {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": False}},
+            {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": 1}},
+            {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": "true"}},
+            {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": True, "extra": 1}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for idx, bad_b in enumerate(bad_bindings):
+                entry = {"hash_fnv1a64": f"0x{idx + 1:016x}", "stage": "compute", "bindings": [bad_b]}
+                doc, skipped = sidecar.build([entry])
+                self.assertEqual(doc["stages"], {}, bad_b)
+                self.assertEqual(skipped, {"malformed rt_arena source": 1}, bad_b)
+
+                p = Path(tmp) / f"bad_rt_{idx}.reflect.json"
+                p.write_text(json.dumps({
+                    "schema": sidecar.SCHEMA,
+                    "version": 3,
+                    "stages": {"0x1": {"stage": "compute", "bindings": [bad_b]}},
+                }), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "malformed rt_arena source"):
+                    sidecar._load_sidecar(p, label="sidecar", allow_missing=False)
+
+            # Invalid stage-level rt_arena flag (non-bool) rejected in both convert and load
+            for idx, bad_flag in enumerate((1, "true", None, [])):
+                entry = {"hash_fnv1a64": "0x0000000000000099", "stage": "compute", "rt_arena": bad_flag, "bindings": []}
+                doc, skipped = sidecar.build([entry])
+                self.assertEqual(doc["stages"], {}, bad_flag)
+                self.assertEqual(skipped, {"malformed rt_arena flag": 1}, bad_flag)
+
+                p = Path(tmp) / f"bad_flag_{idx}.reflect.json"
+                p.write_text(json.dumps({
+                    "schema": sidecar.SCHEMA,
+                    "version": 3,
+                    "stages": {"0x1": {"stage": "compute", "rt_arena": bad_flag, "bindings": []}},
+                }), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "malformed rt_arena flag"):
+                    sidecar._load_sidecar(p, label="sidecar", allow_missing=False)
+
+    def test_load_sidecar_consistently_validates_all_v1_v2_v3_sources(self):
+        # Every source schema validated by convert() must also be enforced by _load_sidecar().
+        bad_cases: list[tuple[str, int, dict, str]] = [
+            # Writable kinds with unresolved rejected even in v3
+            (
+                "unresolved_storage_v3",
+                3,
+                {"stage": "compute", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "storage", "source": {"unresolved": True}}
+                ]},
+                "malformed unresolved source",
+            ),
+            (
+                "unresolved_storage_texture_v3",
+                3,
+                {"stage": "compute", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "storage_texture", "source": {"unresolved": "rw_uav"}}
+                ]},
+                "malformed unresolved source",
+            ),
+            (
+                "unresolved_in_v1",
+                1,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": True}}
+                ]},
+                "malformed unresolved source",
+            ),
+            # root_descriptor.table_byte_offset malformed rejected in v1, v2, and v3
+            (
+                "root_descriptor_bad_offset_v1",
+                1,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "uniform",
+                     "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 12}}
+                ]},
+                "malformed v1 root_descriptor source",
+            ),
+            (
+                "root_descriptor_bad_offset_v3",
+                3,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "uniform",
+                     "source": {"user_sgpr": 8, "root_descriptor": True, "table_byte_offset": 16}}
+                ]},
+                "malformed v3 root_descriptor source",
+            ),
+            # lane_indexed_*_heap malformed on load
+            (
+                "lane_heap_bad_count",
+                3,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "texture",
+                     "source": {"lane_indexed_resource_heap": {"max_count": 300, "shift": 5}}}
+                ]},
+                "malformed lane-indexed heap source",
+            ),
+            (
+                "lane_sampler_bad_window_base",
+                3,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "sampler",
+                     "source": {"lane_indexed_sampler_heap": {
+                         "max_count": 16, "shift": 4,
+                         "window_base": {"cbv": {"user_sgpr": 8, "root_descriptor": True}, "byte_offset": 6},
+                     }}}
+                ]},
+                "malformed lane-indexed heap source",
+            ),
+            # cbv_indexed_*_heap malformed on load
+            (
+                "cbv_heap_bad_shift",
+                3,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "texture",
+                     "source": {"cbv_indexed_resource_heap": {
+                         "cbv": {"user_sgpr": 8, "root_descriptor": True}, "byte_offset": 0, "shift": 32,
+                     }}}
+                ]},
+                "malformed CB-indexed heap source",
+            ),
+            # inline_sampler malformed on load
+            (
+                "inline_sampler_bad_sdwords",
+                3,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "sampler",
+                     "source": {"inline_sampler": {"sdwords": [1, 2, 3]}}}
+                ]},
+                "malformed inline sampler",
+            ),
+            # direct heap malformed on load
+            (
+                "heap_bad_shift",
+                1,
+                {"stage": "fragment", "bindings": [
+                    {"group": 0, "binding": 0, "kind": "texture",
+                     "source": {"resource_heap": {"base_user_sgpr": 4, "stride": 32,
+                                                  "index": {"user_sgpr": 5, "shift": 40}}}}
+                ]},
+                "malformed heap source",
+            ),
+            # non-compute mesh_output rejected on load
+            (
+                "mesh_output_on_fragment",
+                3,
+                {"stage": "fragment", "bindings": [],
+                 "mesh_output": {"max_vertices": 3, "max_primitives": 1, "vertex_words": 8}},
+                "malformed mesh_output",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, ver, stage_obj, expected_err in bad_cases:
+                with self.subTest(case=name):
+                    p = Path(tmp) / f"{name}.reflect.json"
+                    p.write_text(json.dumps({
+                        "schema": sidecar.SCHEMA,
+                        "version": ver,
+                        "stages": {"0x00000000000000aa": stage_obj},
+                    }), encoding="utf-8")
+                    with self.assertRaisesRegex(ValueError, expected_err):
+                        sidecar._load_sidecar(p, label="sidecar", allow_missing=False)
+
+    def test_merge_existing_preserves_fewer_unresolved_and_upgrades_more_traced(self):
+        # Regression guard for PR #1735: fewer unresolved bindings always wins, and a fully traced
+        # stage upgrades an existing unresolved stage.
+        one_unresolved = {
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": True}},
+                {"group": 0, "binding": 1, "kind": "sampler", "source": {"static_sampler": 0}},
+            ],
+        }
+        two_unresolved_entry = {
+            "hash_fnv1a64": "0x00000000000000bb",
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "texture"},
+                {"group": 0, "binding": 1, "kind": "sampler"},
+            ],
+        }
+        fully_traced_entry = {
+            "hash_fnv1a64": "0x00000000000000bb",
+            "stage": "fragment",
+            "bindings": [
+                {"group": 0, "binding": 0, "kind": "texture", "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+                {"group": 0, "binding": 1, "kind": "sampler", "source": {"static_sampler": 0}},
+            ],
+        }
+        # Existing has 1 unresolved, new has 2 -> existing preserved
+        doc1, _ = sidecar.build([two_unresolved_entry], existing_stages={"0x00000000000000bb": one_unresolved}, unresolved=True)
+        self.assertEqual(doc1["stages"]["0x00000000000000bb"], one_unresolved)
+        # Existing has 1 unresolved, new has 0 (fully traced) -> new wins and version drops to 1
+        doc2, _ = sidecar.build([fully_traced_entry], existing_stages={"0x00000000000000bb": one_unresolved}, unresolved=True)
+        self.assertEqual(doc2["version"], 1)
+        self.assertEqual(doc2["stages"]["0x00000000000000bb"]["bindings"][0]["source"], {"user_sgpr": 8, "table_byte_offset": 0})
+
+    def test_actionable_per_cause_gap_breakdown_and_strict_sanitization(self):
+        # Pack with 7 entries: 1 matched valid, 6 stage mismatches (tests 5-sample cap on mismatch samples)
+        pack_entries = [(0x00000000000000A1, "vertex", b"// vs")] + [
+            (0x0000000000003000 + i, "compute", f"// cs {i}".encode("utf-8")) for i in range(6)
+        ] + [(0x0000000000004001, "fragment", b"// missing fs")]
+        pack_bytes = build_synthetic_wgpk(pack_entries)
+
+        entries = [
+            # Matched valid vertex stage
+            vertex_entry(True),
+            # 6 fragment stages matching compute hashes in pack (6 stage mismatches, 2 unresolved kinds/reasons)
+            *[
+                {
+                    "hash_fnv1a64": f"0x000000000000300{i}",
+                    "stage": "fragment",
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "texture_2d" if i < 4 else "sampler",
+                            "source": {"unresolved": "cb_dynamic_offset" if i < 3 else True},
+                        }
+                    ],
+                }
+                for i in range(6)
+            ],
+            # Skipped stages across multiple causes (including hostile path/WGSL in kind!)
+            {
+                "hash_fnv1a64": "0x0000000000005001",
+                "stage": "compute",
+                "bindings": [{"group": 0, "binding": 0, "kind": "storage", "name": "rw0"}],
+            },
+            {
+                "hash_fnv1a64": "0x0000000000005002",
+                "stage": "compute",
+                "bindings": [{"group": 0, "binding": 0, "kind": "storage_texture", "name": "uav0"}],
+            },
+            {
+                "hash_fnv1a64": "0x0000000000005003",
+                "stage": "fragment",
+                "bindings": [{"group": 0, "binding": 0, "kind": r"C:\Users\secret_user\bad_kind",
+                              "source": {"user_sgpr": 8, "table_byte_offset": 0}}],
+            },
+            {
+                "hash_fnv1a64": "0x0000000000005004",
+                "stage": "fragment",
+                "wgsl": "@fragment fn leak_wgsl() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }",
+                "bindings": [{"group": 3, "binding": 99, "kind": "storage", "source": {"rt_arena": True}}],
+            },
+        ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            secret_dir = Path(tmp) / "Users" / "secret_user" / "private_ws"
+            secret_dir.mkdir(parents=True)
+            src = secret_dir / "in.json"
+            out = secret_dir / "out.reflect.json"
+            report_path = secret_dir / "gaps.json"
+            pack_path = secret_dir / "game.wgsl.pack"
+            src.write_text(json.dumps({"entries": entries}), encoding="utf-8")
+            pack_path.write_bytes(pack_bytes)
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                rc = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--unresolved-sources",
+                    "--report-missing-sources", str(report_path),
+                    "--verify-pack", str(pack_path),
+                    "--json",
+                ])
+            self.assertEqual(rc, 0)
+            raw_json = stdout.getvalue()
+            raw_report = report_path.read_text(encoding="utf-8")
+
+            stdout_text = io.StringIO()
+            with redirect_stdout(stdout_text):
+                rc_text = sidecar.main([
+                    str(src),
+                    "--out", str(out),
+                    "--unresolved-sources",
+                    "--verify-pack", str(pack_path),
+                ])
+            self.assertEqual(rc_text, 0)
+            raw_text = stdout_text.getvalue()
+
+            # Missing input file OSError must not leak host directory or username
+            stderr_err = io.StringIO()
+            with redirect_stderr(stderr_err):
+                rc_err = sidecar.main([str(secret_dir / "missing_input.json"), "--out", str(out)])
+            self.assertEqual(rc_err, 1)
+            raw_err = stderr_err.getvalue()
+
+        for blob in (raw_json, raw_report, raw_text, raw_err):
+            for forbidden in ("secret_user", "private_ws", "leak_wgsl", "@fragment", "C:\\Users", str(tmp)):
+                self.assertNotIn(forbidden, blob)
+
+        summary = json.loads(raw_json)
+        self.assertEqual(summary["sidecar_version"], 3)
+        self.assertEqual(summary["unresolved_by_kind"], {"texture": 4, "sampler": 2})
+        self.assertEqual(summary["unresolved_by_reason"], {"cb_dynamic_offset": 3, "unspecified": 3})
+
+        gb = summary["gap_breakdown"]
+        self.assertEqual(gb["skipped_total"], 4)
+        self.assertEqual(gb["skipped_by_cause"], [
+            {"cause": "writable binding without source", "count": 2, "pct_of_skipped": 50.0},
+            {"cause": "malformed rt_arena source", "count": 1, "pct_of_skipped": 25.0},
+            {"cause": "unknown binding kind '<redacted>'", "count": 1, "pct_of_skipped": 25.0},
+        ])
+        self.assertEqual(gb["pack_missing_stages"], 1)
+        self.assertEqual(gb["pack_missing_by_stage"], {"vertex": 0, "fragment": 1, "compute": 0})
+        self.assertEqual(gb["pack_stage_mismatches"], 6)
+
+        pv = summary["pack_verification"]
+        self.assertEqual(pv["stage_mismatches"], 6)
+        self.assertEqual(len(pv["stage_mismatch_samples"]), 5)
+        self.assertEqual(pv["stage_mismatch_samples"], [f"0x000000000000300{i}" for i in range(5)])
+        self.assertEqual(pv["gap_counts"], {
+            "missing_reflection": 1,
+            "stage_mismatches": 6,
+            "extra_reflection": 0,
+            "unresolved_matched_stages": 6,
+        })
+
+        report = json.loads(raw_report)
+        self.assertEqual(report["total_skipped_missing_source"], 2)
+        self.assertEqual(report["missing_by_kind"], {"storage": 1, "storage_texture": 1})
+        self.assertEqual(report["skipped_total"], 4)
+        self.assertEqual(report["skipped_by_cause"], gb["skipped_by_cause"])
+        self.assertEqual(report["unresolved_by_kind"], {"texture": 4, "sampler": 2})
+        self.assertEqual(report["unresolved_by_reason"], {"cb_dynamic_offset": 3, "unspecified": 3})
+
+        # Text summary includes actionable gap causes
+        self.assertIn("writable binding without source:2 (50.0%)", raw_text)
+        self.assertIn("stage_mismatches=6", raw_text)
+
+    def test_cli_help_reflects_wgpk_v1_v2_and_sidecar_v1_v2_v3(self):
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            with self.assertRaises(SystemExit) as ctx:
+                sidecar.main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+        help_text = " ".join(stdout.getvalue().split())
+        self.assertIn("WGPK v1/v2", help_text)
+        self.assertIn("v1/v2/v3 sidecar", help_text)
+        self.assertNotIn("WGPK v1 .wgsl.pack", help_text)
+        self.assertNotIn("existing v1 sidecar", help_text)
 
 
 if __name__ == "__main__":
