@@ -800,12 +800,41 @@ void StateBridgeDevice::note_resource_used(uint32_t resource_id) {
     resource_last_use_[resource_id] = ++resource_use_tick_;
 }
 
+void StateBridgeDevice::note_encoder_resource_used(const CommandEncoder& encoder, uint32_t resource_id) {
+    if (resource_id == 0) {
+        return;
+    }
+    {
+        std::lock_guard lock(bridges_mutex_);
+        for (CommandListBridge* b : bridges_) {
+            if (&b->encoder() == &encoder) {
+                b->note_recorded_resource(resource_id);
+                return;
+            }
+        }
+    }
+    note_resource_used(resource_id);
+}
+
 bool StateBridgeDevice::is_resource_used_in_frame(uint32_t resource_id) const {
     if (resource_id == 0) {
         return false;
     }
     std::lock_guard lock(retire_mutex_);
     return frame_used_resources_.count(resource_id) != 0;
+}
+
+bool StateBridgeDevice::is_resource_recorded(uint32_t resource_id) const {
+    if (resource_id == 0) {
+        return false;
+    }
+    std::lock_guard lock(bridges_mutex_);
+    for (const CommandListBridge* b : bridges_) {
+        if (b->has_recorded_resource(resource_id)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 uint64_t StateBridgeDevice::resource_last_use_tick(uint32_t resource_id) const {
@@ -1279,9 +1308,16 @@ void StateBridgeDevice::ensure_layout_emitted_impl(PipelineLayoutRecord* layout,
     for (size_t i = 0; i < n; ++i) {
         GroupLayoutRecord* group = layout->groups[i];
         if (!group->emitted) {
-            encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &group->header, sizeof(group->header),
+            auto emit_group = [&](CommandEncoder& dst) {
+                dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &group->header, sizeof(group->header),
                                 group->layout_entries.data(),
                                 static_cast<uint32_t>(group->layout_entries.size() * sizeof(GpuBindGroupLayoutEntry)));
+            };
+            if (by_prewarm) {
+                emit_group(encoder);
+            } else {
+                emit_device_object(group->id, encoder, emit_group);
+            }
             group->emitted = true;
             group->emitted_by_prewarm = by_prewarm;
         }
@@ -1291,8 +1327,15 @@ void StateBridgeDevice::ensure_layout_emitted_impl(PipelineLayoutRecord* layout,
     header.id = layout->id;
     header.bind_group_layout_count = static_cast<uint32_t>(n);
     header.content_id = layout->content_id;
-    encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &header, sizeof(header), group_ids,
+    auto emit_pl = [&](CommandEncoder& dst) {
+        dst.emit_packet(GpuOpcode::CreatePipelineLayout, &header, sizeof(header), group_ids,
                         static_cast<uint32_t>(n * sizeof(uint32_t)));
+    };
+    if (by_prewarm) {
+        emit_pl(encoder);
+    } else {
+        emit_device_object(layout->id, encoder, emit_pl);
+    }
     layout->emitted = true;
     layout->emitted_by_prewarm = by_prewarm;
 }
@@ -1324,7 +1367,9 @@ uint32_t StateBridgeDevice::intern_sampler(const d3d::SamplerDesc& desc, Command
         return it->second;
     }
     payload.id = allocate_id();
-    encoder.emit_packet(GpuOpcode::CreateSampler2, &payload, sizeof(payload));
+    emit_device_object(payload.id, encoder, [&](CommandEncoder& dst) {
+        dst.emit_packet(GpuOpcode::CreateSampler2, &payload, sizeof(payload));
+    });
     samplers_.emplace(key, payload.id);
     adjust_gauge(g_live_samplers, samplers_tracked_, samplers_.size());
     return payload.id;
@@ -1334,8 +1379,10 @@ uint32_t StateBridgeDevice::ensure_root_constant_ring(CommandEncoder& encoder) {
     std::lock_guard lock(objects_mutex_);
     if (ring_buffer_id_ == 0) {
         ring_buffer_id_ = allocate_id();
-        encoder.create_buffer(ring_buffer_id_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst,
+        emit_device_object(ring_buffer_id_, encoder, [&](CommandEncoder& dst) {
+            dst.create_buffer(ring_buffer_id_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst,
                               options_.root_constant_ring_bytes);
+        });
     }
     return ring_buffer_id_;
 }
@@ -1546,12 +1593,14 @@ uint32_t StateBridgeDevice::ensure_default_vertex_buffer(CommandEncoder& encoder
     std::lock_guard lock(objects_mutex_);
     if (default_vertex_buffer_id_ == 0) {
         default_vertex_buffer_id_ = allocate_id();
-        encoder.create_buffer(default_vertex_buffer_id_, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst,
+        emit_device_object(default_vertex_buffer_id_, encoder, [&](CommandEncoder& dst) {
+            dst.create_buffer(default_vertex_buffer_id_, GpuBufferUsage::Vertex | GpuBufferUsage::CopyDst,
                               pso::kDefaultVertexBufferBytes);
-        const float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-        const uint32_t u[4] = {0, 0, 0, 1};
-        encoder.write_buffer(default_vertex_buffer_id_, 0, f, sizeof(f));
-        encoder.write_buffer(default_vertex_buffer_id_, pso::kDefaultVertexIntOffset, u, sizeof(u));
+            const float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+            const uint32_t u[4] = {0, 0, 0, 1};
+            dst.write_buffer(default_vertex_buffer_id_, 0, f, sizeof(f));
+            dst.write_buffer(default_vertex_buffer_id_, pso::kDefaultVertexIntOffset, u, sizeof(u));
+        });
     }
     return default_vertex_buffer_id_;
 }
@@ -1848,7 +1897,9 @@ uint32_t StateBridgeDevice::intermediate_storage_texture(uint32_t resource_id, c
         p.usage_flags = GpuTextureUsage::TextureBinding | GpuTextureUsage::StorageBinding;
         p.dimension = static_cast<uint8_t>(info.dimension);
         p.format = format;
-        encoder.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateTexture2, &p, sizeof(p));
+        });
     }
     return id;
 }
@@ -1858,8 +1909,6 @@ StateBridgeDevice::StorageConversionPipeline StateBridgeDevice::storage_conversi
     std::lock_guard lock(objects_mutex_);
     StorageConversionPipeline& c = conversion_pipelines_[uint32_t{dst_format} << 8 | dimension];
     if (c.pipeline == 0) {
-        const uint32_t module = allocate_id();
-        encoder.create_shader_module(module, GpuShaderStage::Compute, storage_conversion_wgsl(dst_format, dimension));
         GpuBindGroupLayoutEntry entries[2] = {};
         entries[0].binding = 0;
         entries[0].visibility = GpuShaderStageBits::Compute;
@@ -1873,20 +1922,26 @@ StateBridgeDevice::StorageConversionPipeline StateBridgeDevice::storage_conversi
         entries[1].view_dimension = dimension;
         entries[1].storage_format = dst_format;
         c.group_layout = allocate_id();
-        GpuCreateBindGroupLayoutPayload layout{};
-        layout.id = c.group_layout;
-        layout.entry_count = 2;
-        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
-        GpuCreatePipelineLayoutPayload pl{};
-        pl.id = allocate_id();
-        pl.bind_group_layout_count = 1;
-        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
-        GpuCreateComputePipeline2Payload p{};
-        p.id = allocate_id();
-        p.cs_module_id = module;
-        p.pipeline_layout_id = pl.id;
-        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
-        c.pipeline = p.id;
+        emit_device_object(c.group_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.group_layout;
+            layout.entry_count = 2;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        });
+        c.pipeline = allocate_id();
+        emit_device_object(c.pipeline, encoder, [&](CommandEncoder& dst) {
+            const uint32_t module = allocate_id();
+            dst.create_shader_module(module, GpuShaderStage::Compute, storage_conversion_wgsl(dst_format, dimension));
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+            GpuCreateComputePipeline2Payload p{};
+            p.id = c.pipeline;
+            p.cs_module_id = module;
+            p.pipeline_layout_id = pl.id;
+            dst.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
+        });
     }
     return c;
 }
@@ -1917,7 +1972,9 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
         g.id = id;
         g.layout_id = pipeline.group_layout;
         g.entry_count = 2;
-        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        emit_device_object(id, encoder, [&](CommandEncoder& out) {
+            out.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        });
     }
     return id;
 }
@@ -2003,8 +2060,6 @@ StateBridgeDevice::DepthTwinPipelines StateBridgeDevice::depth_twin_pipelines(ui
     const bool uint_twin = twin_format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Uint);
     // depth -> twin: a compute pass sampling the depth aspect, storing into the twin.
     {
-        const uint32_t module = allocate_id();
-        encoder.create_shader_module(module, GpuShaderStage::Compute, depth_twin_in_wgsl(depth_format, twin_format));
         GpuBindGroupLayoutEntry entries[2] = {};
         entries[0].binding = 0;
         entries[0].visibility = GpuShaderStageBits::Compute;
@@ -2018,28 +2073,29 @@ StateBridgeDevice::DepthTwinPipelines StateBridgeDevice::depth_twin_pipelines(ui
         entries[1].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
         entries[1].storage_format = twin_format;
         c.in_layout = allocate_id();
-        GpuCreateBindGroupLayoutPayload layout{};
-        layout.id = c.in_layout;
-        layout.entry_count = 2;
-        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
-        GpuCreatePipelineLayoutPayload pl{};
-        pl.id = allocate_id();
-        pl.bind_group_layout_count = 1;
-        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.in_layout, sizeof(uint32_t));
-        GpuCreateComputePipeline2Payload p{};
-        p.id = allocate_id();
-        p.cs_module_id = module;
-        p.pipeline_layout_id = pl.id;
-        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
-        c.in_pipeline = p.id;
+        emit_device_object(c.in_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.in_layout;
+            layout.entry_count = 2;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        });
+        c.in_pipeline = allocate_id();
+        emit_device_object(c.in_pipeline, encoder, [&](CommandEncoder& dst) {
+            const uint32_t module = allocate_id();
+            dst.create_shader_module(module, GpuShaderStage::Compute, depth_twin_in_wgsl(depth_format, twin_format));
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.in_layout, sizeof(uint32_t));
+            GpuCreateComputePipeline2Payload p{};
+            p.id = c.in_pipeline;
+            p.cs_module_id = module;
+            p.pipeline_layout_id = pl.id;
+            dst.emit_packet(GpuOpcode::CreateComputePipeline2, &p, sizeof(p));
+        });
     }
     // twin -> depth: a fullscreen triangle whose fragment writes frag_depth from the twin.
     {
-        const std::string wgsl = depth_twin_out_wgsl(depth_format, twin_format);
-        const uint32_t vs = allocate_id();
-        const uint32_t fs = allocate_id();
-        encoder.create_shader_module(vs, GpuShaderStage::Vertex, wgsl);
-        encoder.create_shader_module(fs, GpuShaderStage::Fragment, wgsl);
         GpuBindGroupLayoutEntry entry{};
         entry.binding = 0;
         entry.visibility = GpuShaderStageBits::Fragment;
@@ -2048,32 +2104,41 @@ StateBridgeDevice::DepthTwinPipelines StateBridgeDevice::depth_twin_pipelines(ui
                                                             : GpuTextureSampleType::UnfilterableFloat);
         entry.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
         c.out_layout = allocate_id();
-        GpuCreateBindGroupLayoutPayload layout{};
-        layout.id = c.out_layout;
-        layout.entry_count = 1;
-        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), &entry, sizeof(entry));
-        GpuCreatePipelineLayoutPayload pl{};
-        pl.id = allocate_id();
-        pl.bind_group_layout_count = 1;
-        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.out_layout, sizeof(uint32_t));
-        GpuCreateRenderPipeline2Payload p{};
-        p.id = allocate_id();
-        p.vs_module_id = vs;
-        p.fs_module_id = fs;
-        p.pipeline_layout_id = pl.id;
-        GpuRenderPipelineKey& k = p.key;
-        k.ps_shader = 1;
-        k.color_target_count = 0;
-        k.depth_stencil.format = depth_format;
-        k.depth_stencil.depth_write_enabled = 1;
-        k.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
-        k.depth_stencil.stencil_front.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
-        k.depth_stencil.stencil_back.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
-        k.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
-        k.multisample.count = 1;
-        k.multisample.mask = 0xFFFFFFFFu;
-        encoder.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
-        c.out_pipeline = p.id;
+        emit_device_object(c.out_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.out_layout;
+            layout.entry_count = 1;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), &entry, sizeof(entry));
+        });
+        c.out_pipeline = allocate_id();
+        emit_device_object(c.out_pipeline, encoder, [&](CommandEncoder& dst) {
+            const std::string wgsl = depth_twin_out_wgsl(depth_format, twin_format);
+            const uint32_t vs = allocate_id();
+            const uint32_t fs = allocate_id();
+            dst.create_shader_module(vs, GpuShaderStage::Vertex, wgsl);
+            dst.create_shader_module(fs, GpuShaderStage::Fragment, wgsl);
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.out_layout, sizeof(uint32_t));
+            GpuCreateRenderPipeline2Payload p{};
+            p.id = c.out_pipeline;
+            p.vs_module_id = vs;
+            p.fs_module_id = fs;
+            p.pipeline_layout_id = pl.id;
+            GpuRenderPipelineKey& k = p.key;
+            k.ps_shader = 1;
+            k.color_target_count = 0;
+            k.depth_stencil.format = depth_format;
+            k.depth_stencil.depth_write_enabled = 1;
+            k.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            k.depth_stencil.stencil_front.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            k.depth_stencil.stencil_back.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+            k.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+            k.multisample.count = 1;
+            k.multisample.mask = 0xFFFFFFFFu;
+            dst.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+        });
     }
     return c;
 }
@@ -2114,7 +2179,9 @@ uint32_t StateBridgeDevice::depth_twin_group(uint32_t layout, uint32_t depth_tex
         g.id = id;
         g.layout_id = layout;
         g.entry_count = count;
-        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, count * sizeof(GpuBindGroupEntry2));
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, count * sizeof(GpuBindGroupEntry2));
+        });
     }
     return id;
 }
@@ -2359,7 +2426,9 @@ uint32_t StateBridgeDevice::mesh_output_group(const GroupLayoutRecord& group, Co
     std::lock_guard lock(objects_mutex_);
     if (mesh_output_buffer_ == 0) {
         mesh_output_buffer_ = allocate_id();
-        encoder.create_buffer(mesh_output_buffer_, GpuBufferUsage::Storage, kMeshOutputBytes);
+        emit_device_object(mesh_output_buffer_, encoder, [&](CommandEncoder& dst) {
+            dst.create_buffer(mesh_output_buffer_, GpuBufferUsage::Storage, kMeshOutputBytes);
+        });
     }
     uint32_t& id = mesh_output_groups_[group.id];
     if (id == 0) {
@@ -2372,7 +2441,9 @@ uint32_t StateBridgeDevice::mesh_output_group(const GroupLayoutRecord& group, Co
         g.id = id;
         g.layout_id = group.id;
         g.entry_count = 1;
-        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), &e, sizeof(e));
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), &e, sizeof(e));
+        });
     }
     return id;
 }
@@ -2427,8 +2498,6 @@ StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncode
     std::lock_guard lock(objects_mutex_);
     IndirectClamp& c = indirect_clamp_;
     if (c.pipeline == 0) {
-        const uint32_t module = allocate_id();
-        encoder.create_shader_module(module, GpuShaderStage::Compute, indirect_clamp_wgsl());
         GpuBindGroupLayoutEntry entries[4] = {};
         const uint8_t types[4] = {static_cast<uint8_t>(GpuBufferBindingType::Uniform),
                                   static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
@@ -2444,23 +2513,31 @@ StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncode
         entries[0].min_binding_size = 32;
         entries[3].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // output window in the indirect ring
         c.group_layout = allocate_id();
-        GpuCreateBindGroupLayoutPayload layout{};
-        layout.id = c.group_layout;
-        layout.entry_count = 4;
-        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
-        GpuCreatePipelineLayoutPayload pl{};
-        pl.id = allocate_id();
-        pl.bind_group_layout_count = 1;
-        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
-        GpuCreateComputePipeline2Payload cp{};
-        cp.id = allocate_id();
-        cp.cs_module_id = module;
-        cp.pipeline_layout_id = pl.id;
-        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &cp, sizeof(cp));
-        c.pipeline = cp.id;
+        emit_device_object(c.group_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.group_layout;
+            layout.entry_count = 4;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        });
+        c.pipeline = allocate_id();
+        emit_device_object(c.pipeline, encoder, [&](CommandEncoder& dst) {
+            const uint32_t module = allocate_id();
+            dst.create_shader_module(module, GpuShaderStage::Compute, indirect_clamp_wgsl());
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+            GpuCreateComputePipeline2Payload cp{};
+            cp.id = c.pipeline;
+            cp.cs_module_id = module;
+            cp.pipeline_layout_id = pl.id;
+            dst.emit_packet(GpuOpcode::CreateComputePipeline2, &cp, sizeof(cp));
+        });
         c.ring = allocate_id();
-        encoder.create_buffer(c.ring, GpuBufferUsage::Storage | GpuBufferUsage::Indirect,
+        emit_device_object(c.ring, encoder, [&](CommandEncoder& dst) {
+            dst.create_buffer(c.ring, GpuBufferUsage::Storage | GpuBufferUsage::Indirect,
                               kIndirectRingBytes + kIndirectWindowBytes);
+        });
     }
     return c;
 }
@@ -2484,7 +2561,9 @@ uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uin
         g.id = id;
         g.layout_id = clamp.group_layout;
         g.entry_count = 4;
-        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        });
     }
     return id;
 }
@@ -2517,9 +2596,26 @@ StateBridgeDevice::ViewKey StateBridgeDevice::make_view_key(const ViewRecord& re
     return key;
 }
 
+static pso::WgpuTextureFormat host_texture_format(const TextureInfo& tex, uint32_t features) noexcept {
+    if (tex.created_format != pso::WgpuTextureFormat::Undefined) {
+        return tex.created_format;
+    }
+    const pso::FormatUsage usage = tex.depth_stencil  ? pso::FormatUsage::DepthStencil
+                                   : tex.render_target ? pso::FormatUsage::RenderTarget
+                                   : tex.sampled_only  ? pso::FormatUsage::SampledOnly
+                                                       : pso::FormatUsage::Sampled;
+    return pso::map_texture_format(tex.format, usage, features).format;
+}
+
 bool StateBridgeDevice::is_depth_resource(uint32_t resource_id) const {
     if (resource_id == 0) {
         return false;
+    }
+    {
+        std::shared_lock lock(resources_mutex_);
+        if (const auto it = textures_.find(resource_id); it != textures_.end() && it->second.depth_stencil) {
+            return true;
+        }
     }
     std::lock_guard lock(views_mutex_);
     return depth_textures_.count(resource_id) != 0;
@@ -2634,7 +2730,9 @@ bool StateBridgeDevice::resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewIn
         break;
     }
     const pso::WgpuTextureFormat tex_wgpu =
-        pso::map_texture_format(tex.format, pso::FormatUsage::RenderTarget, options_.features).format;
+        tex.created_format != pso::WgpuTextureFormat::Undefined
+            ? tex.created_format
+            : pso::map_texture_format(tex.format, pso::FormatUsage::RenderTarget, options_.features).format;
     pso::WgpuTextureFormat view_wgpu =
         pso::map_texture_format(format, pso::FormatUsage::RenderTarget, options_.features).format;
     pso::DxgiFormat resolved_dxgi = format;
@@ -3047,6 +3145,14 @@ void CommandListBridge::note_recorded_resource(uint32_t resource_id) {
     device_.note_resource_used(resource_id);
 }
 
+bool CommandListBridge::has_recorded_resource(uint32_t resource_id) const {
+    if (resource_id == 0) {
+        return false;
+    }
+    std::lock_guard lock(recorded_mutex_);
+    return !executed_ && recorded_resources_.count(resource_id) != 0;
+}
+
 void CommandListBridge::clear_recorded_resources(bool executed) {
     std::lock_guard lock(recorded_mutex_);
     recorded_resources_.clear();
@@ -3452,7 +3558,9 @@ void CommandListBridge::drain_events() {
                 }
                 std::memcpy(&payload.key, e.pipeline_key, sizeof(payload.key));
                 sanitize_render_pipeline_key(&payload.key, device_.options().features);
-                encoder_.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
+                device_.emit_device_object(payload.id, encoder_, [&](CommandEncoder& dst) {
+                    dst.emit_packet(GpuOpcode::CreateRenderPipeline2, &payload, sizeof(payload));
+                });
                 ++stats_.pipelines_created;
                 diagnostics_ |= graphics_pso_->diagnostics_;
                 device_.record_graphics_pipeline(*e.pipeline_key, graphics_pso_->vs_module_id_,
@@ -3593,7 +3701,16 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     if (!uav && known) {
         const ResolvedViewFormat resolved = resolve_sampled_view_format(
             tex.format, to_dxgi(v.format), tex.sampled_only, features, device_.is_depth_resource(v.resource_id));
-        d.format = static_cast<uint8_t>(resolved.format);
+        pso::WgpuTextureFormat fmt = resolved.format;
+        // Reconcile against the host texture's actual created format (e.g. R11G11B10_FLOAT or
+        // RGBA8_SNORM render targets promoted to rgba16float cannot take a rg11b10ufloat view).
+        if (!resolved.depth_sibling && fmt != pso::WgpuTextureFormat::Undefined) {
+            const pso::WgpuTextureFormat host_fmt = host_texture_format(tex, features);
+            if (host_fmt != pso::WgpuTextureFormat::Undefined && !is_compatible_view_format(host_fmt, fmt)) {
+                fmt = host_fmt;
+            }
+        }
+        d.format = static_cast<uint8_t>(fmt);
         aspect = resolved.aspect;
     } else if (v.format != 0) {
         d.format = texture_format_code(to_dxgi(v.format), usage, features, &aspect);
@@ -3631,14 +3748,15 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
     case V::Texture2DArray:
     case V::Texture2DMsArray:
         d.base_array_layer = v.first_array_slice;
-        d.array_layer_count = v.array_size;
+        d.array_layer_count = v.array_size == 0xFFFFFFFFu ? 0u : v.array_size;
         break;
     case V::TextureCube:
         d.array_layer_count = 6;
         break;
     case V::TextureCubeArray:
         d.base_array_layer = v.first_array_slice;  // First2DArrayFace
-        d.array_layer_count = v.array_size * 6u;   // NumCubes
+        d.array_layer_count =
+            (v.array_size == 0xFFFFFFFFu || v.array_size > 0xFFFFFFFFu / 6u) ? 0u : v.array_size * 6u;  // NumCubes
         break;
     default:  // default view / 3D: whole texture
         break;
@@ -3956,10 +4074,15 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         switch (e.kind) {
         case d3d::BindResourceKind::Buffer: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
-            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
-                diagnostics_ |= BridgeDiag::NullBinding;  // G66 (#691): destroyed buffer, see TextureView
-                ++stats_.retired_resources_nulled;
-                break;
+            if (e.resource_id != 0) {
+                // Pin before the retired() check so a concurrent Resource::~Resource either sees
+                // the pin (and defers destroy / preserves a deferred create) or we see retired().
+                note_recorded_resource(e.resource_id);
+                if (device_.retired(e.resource_id)) {
+                    diagnostics_ |= BridgeDiag::NullBinding;  // G66 (#691): destroyed buffer, see TextureView
+                    ++stats_.retired_resources_nulled;
+                    break;
+                }
             }
             out.resource_id = e.resource_id;
             out.offset = e.offset;
@@ -4116,12 +4239,15 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         }
         case d3d::BindResourceKind::TextureView: {
             out.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
-            if (e.resource_id != 0 && device_.retired(e.resource_id)) {
-                // G66 / G70 (#691): a stale descriptor of a destroyed texture (the title released it
-                // and left the slot): binding it would invalidate the whole submit. Bound null.
-                diagnostics_ |= BridgeDiag::UnknownTexture | BridgeDiag::NullBinding;
-                ++stats_.retired_resources_nulled;
-                break;
+            if (e.resource_id != 0) {
+                note_recorded_resource(e.resource_id);
+                if (device_.retired(e.resource_id)) {
+                    // G66 / G70 (#691): a stale descriptor of a destroyed texture (the title released it
+                    // and left the slot): binding it would invalidate the whole submit. Bound null.
+                    diagnostics_ |= BridgeDiag::UnknownTexture | BridgeDiag::NullBinding;
+                    ++stats_.retired_resources_nulled;
+                    break;
+                }
             }
             out.resource_id = e.resource_id;
             out.view = texture_view_desc(e.view);
@@ -4132,22 +4258,21 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                 // texture without it would invalidate the whole command buffer. Bound null instead.
                 // The texture's own format (or its sRGB sibling) must be the stage's storage format.
                 const uint8_t own =
-                    known ? texture_format_code(info.format,
-                                                info.sampled_only ? pso::FormatUsage::SampledOnly
-                                                                  : pso::FormatUsage::Sampled,
-                                                device_.options().features, nullptr)
-                          : 0;
+                    known ? static_cast<uint8_t>(host_texture_format(info, device_.options().features)) : 0u;
                 const bool format_ok =
                     layout.storage_format == 0 || own == layout.storage_format ||
                     own == static_cast<uint8_t>(
                                pso::srgb_sibling(static_cast<pso::WgpuTextureFormat>(layout.storage_format)));
-                const bool depth_texture = e.resource_id != 0 && known && is_depth_stencil_format(info.format);
+                const bool depth_texture = e.resource_id != 0 && known &&
+                                           (is_depth_stencil_format(info.format) ||
+                                            device_.is_depth_resource(e.resource_id));
                 StorageRedirect twin;
                 if (depth_texture && depth_twin_redirect(layout, e.resource_id, info, out.view, side, &twin)) {
                     // Backlog 35: WebGPU has no storage access on depth formats. The stage's
                     // writes go to a colour twin, copied into the depth plane after the dispatch.
                     twin.entry = i;
                     out.resource_id = twin.intermediate;
+                    note_recorded_resource(twin.intermediate);
                     out.view = GpuTextureViewDesc{};
                     out.view.format = twin.storage_format;
                     out.view.dimension = twin.dimension;
@@ -4175,6 +4300,7 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     // texture in the declared format, converted into the real one after the dispatch.
                     r.entry = i;
                     out.resource_id = r.intermediate;
+                    note_recorded_resource(r.intermediate);
                     out.view.format = r.storage_format;
                     pending_redirects_.push_back(r);
                 } else if (e.resource_id != 0 && !format_ok) {
@@ -4185,12 +4311,15 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
                     ++stats_.storage_views_format_mismatch;
                 } else if (e.resource_id != 0 && layout.storage_format != 0 &&
-                           (out.view.format == 0 ||
-                            out.view.format == static_cast<uint8_t>(pso::srgb_sibling(
-                                                   static_cast<pso::WgpuTextureFormat>(layout.storage_format))))) {
-                    // An sRGB (or default) view of a storage-capable texture: view it in the stage's
-                    // storage format (storage views cannot be sRGB).
+                           out.view.format != layout.storage_format) {
+                    // Storage views must match the stage's storage format (never sRGB or a
+                    // reinterpreted typeless view format that createView would reject).
                     out.view.format = layout.storage_format;
+                } else if (e.resource_id != 0 && layout.storage_format == 0 && own != 0 &&
+                           out.view.format != 0 && out.view.format != own) {
+                    // Conventional layout without an explicit storage format: keep the texture's
+                    // own format so WebGPU createView does not fail on sRGB or typeless aliases.
+                    out.view.format = own;
                 }
             } else if (e.resource_id != 0 && !known) {
                 // G70 (#691): texture was unregistered / destroyed; bind null instead of emitting
@@ -4795,7 +4924,9 @@ ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelin
             payload.pipeline_layout_id = state->layout_->id;
         }
         std::memcpy(&payload.key, &state->key_, sizeof(payload.key));
-        encoder_.emit_packet(GpuOpcode::CreateComputePipeline2, &payload, sizeof(payload));
+        device_.emit_device_object(payload.id, encoder_, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateComputePipeline2, &payload, sizeof(payload));
+        });
         ++stats_.pipelines_created;
         diagnostics_ |= state->diagnostics_;
         device_.record_compute_pipeline(state->key_, state->cs_module_id_, state->layout_);

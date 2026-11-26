@@ -855,6 +855,9 @@ public:
     // placeholder otherwise (and for amplification shaders).
     HResult create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
                             bool amplification, const Guid& riid, OutPtr out);
+    // True when at least one Compute entry in the shader pack has a reflection entry with
+    // mesh_output (the only stages create_mesh_pso can resolve). Computed once lazily.
+    bool mesh_pipelines_possible() const;
     // A console-native graphics pipeline (Xbox slot 57, d3d12_xs_xbox.h): unresolved, with one
     // identity per stage (native_stage_identity).
     HResult create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out);
@@ -892,6 +895,10 @@ public:
     // The indexed native stage whose metadata carries `digest` (a DXIL container's HASH digest).
     bool find_native_stage(const DxilDigest& digest, NativeStageRecord* out) const;
     size_t native_index_size() const;
+    // Bounded content-addressed cache of embedded native stages extracted from DXIL containers
+    // (keyed by FNV-1a 64 shader identity and stage kind) so repeated PSOs skip re-inflating XDAT.
+    bool find_cached_embedded_native(uint64_t identity, uint8_t want, NativeStageRecord* out) const;
+    void cache_embedded_native(uint64_t identity, uint8_t want, const NativeStageRecord& record);
     // Pipeline dump (DeviceOptions::dump_dir), null when off. flush_pipeline_dump rewrites the
     // manifest (also done every 60 presents and when the device is destroyed).
     PipelineDump* pipeline_dump() const { return dump_.get(); }
@@ -1019,9 +1026,11 @@ public:
     void note_skipped_draw() { skipped_draws_.fetch_add(1, std::memory_order_relaxed); }
     void note_unsupported_copy(const std::string& message);
     // True when a texture of `dxgi_format` gets a substitute WebGPU format whose texels differ from
-    // the guest's (BC without texture-compression-bc, packed 16-bit RGBA): the guest's bytes cannot
-    // be uploaded as they are, and no CPU conversion exists yet, so uploads to it are skipped.
-    bool upload_needs_conversion(uint32_t dxgi_format) const;
+    // the guest's (BC without texture-compression-bc, packed 16-bit RGBA, promoted RT formats): the
+    // guest's bytes cannot be uploaded as they are, and no CPU conversion exists yet, so uploads to
+    // it are skipped.
+    bool upload_needs_conversion(uint32_t dxgi_format,
+                                 pso::FormatUsage usage = pso::FormatUsage::Sampled) const;
 
     // ---- Descriptor words in descriptor memory (bridge/descriptor_words.h, G48) ----
     // After a registry write at `cpu_handle`: writes the words the console's D3D12 leaves in the
@@ -1077,6 +1086,9 @@ public:
     // submitted packet that references `id` (submit, submit_parts and present all check), or at once
     // when deferral is off.
     void defer_create(uint32_t id, const CommandEncoder& create);
+    // Holds a device-global bridge object's creation packet(s) (layouts, samplers, pipelines,
+    // runtime helper buffers/textures/bind groups) until the first submitted packet references `id`.
+    void defer_device_object(uint32_t id, const CommandEncoder& create);
     // Re-creates texture `p.id` (the id's create packet replaces the texture): rewrites its held create
     // when that was never written, else appends a CreateTexture2 to `encoder` (stream order).
     void replace_host_texture(const GpuCreateTexture2Payload& p, CommandEncoder& encoder);
@@ -1113,7 +1125,8 @@ private:
     // before the first packet that references its id (emit_locked), or as they are (write_sink_locked).
     void emit_locked(const uint8_t* bytes, size_t n);
     void write_sink_locked(const uint8_t* bytes, size_t n);
-    std::unordered_map<uint32_t, std::vector<uint8_t>> deferred_creates_;  // under submit_mutex_
+    std::unordered_map<uint32_t, std::vector<uint8_t>> deferred_creates_;         // under submit_mutex_
+    std::unordered_map<uint32_t, std::vector<uint8_t>> deferred_device_objects_;  // under submit_mutex_
     uint64_t gpu_objects_created_on_use_ = 0;                              // under submit_mutex_
     uint64_t gpu_objects_never_created_ = 0;                               // under submit_mutex_
     bool frame_open_ = false;
@@ -1125,7 +1138,7 @@ private:
     struct PresentBlit {
         uint32_t vs = 0, fs = 0, group_layout = 0, pipeline_layout = 0, sampler = 0;
         std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
-        std::unordered_map<uint32_t, uint32_t> groups;     // presented texture id -> bind group
+        std::unordered_map<uint64_t, uint32_t> groups;     // (texture id << 8) | view format -> bind group
     } present_blit_;
     // G79: MSAA resolve pipelines (color float/unorm/srgb & depth), created lazily once per device.
     mutable std::mutex resolve_mutex_;
@@ -1165,6 +1178,21 @@ private:
     };
     std::unordered_map<DxilDigest, NativeStageRecord, DigestHash> native_by_digest_;  // under shader_mutex_
     std::unordered_set<uint64_t> indexed_native_;                                     // under shader_mutex_
+    struct EmbeddedCacheKey {
+        uint64_t identity = 0;
+        uint8_t want = 0;
+        bool operator==(const EmbeddedCacheKey& o) const noexcept { return identity == o.identity && want == o.want; }
+    };
+    struct EmbeddedCacheKeyHash {
+        size_t operator()(const EmbeddedCacheKey& k) const noexcept {
+            return static_cast<size_t>(k.identity ^ (uint64_t{k.want} * 0x9E3779B97F4A7C15ull));
+        }
+    };
+    static constexpr size_t kMaxEmbeddedNativeCache = 4096;
+    std::unordered_map<EmbeddedCacheKey, NativeStageRecord, EmbeddedCacheKeyHash>
+        embedded_native_cache_;  // under shader_mutex_
+    mutable std::once_flag mesh_possible_once_;
+    mutable bool mesh_possible_ = false;
     std::unique_ptr<PipelineDump> dump_;
     struct RelocatedUniform {
         uint64_t va = 0;

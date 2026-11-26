@@ -173,6 +173,13 @@ struct TextureInfo {
     bool sampled_only = false;
     // Created with STORAGE_BINDING usage (storage views of it are valid).
     bool storage = false;
+    // Created with AllowRenderTarget / AllowDepthStencil (Resource::initialize): its host texture
+    // format was mapped with RenderTarget / DepthStencil usage (which can promote formats like
+    // R11G11B10_FLOAT / RGBA8_SNORM / R32_TYPELESS to a different WebGPU format than Sampled).
+    bool render_target = false;
+    bool depth_stencil = false;
+    // Actual WebGPU texture format passed to CreateTexture2 (Undefined when omitted by tests).
+    pso::WgpuTextureFormat created_format = pso::WgpuTextureFormat::Undefined;
     // G66 partly-held mip chains: first mip level from which the chain holds content (the title
     // streams only the small levels; the larger ones are unmapped or belong to another texture).
     // Sampled views start no lower than it. 0 = the whole chain is held. Set with
@@ -316,6 +323,13 @@ struct BridgeOptions {
     // WebGPU device limit maxColorAttachmentBytesPerSample (G81: 128 supports full 8-MRT HDR
     // G-buffers such as RGBA16F/RGBA32F; callers may lower to 32 for strict core WebGPU validation).
     uint32_t max_color_attachment_bytes_per_sample = 128;
+    // Optional device-level deferred creation hook for device-global objects (layouts, samplers,
+    // root-constant ring, default VB, conversion/indirect/mesh helpers, pipelines). When set, those
+    // creation packets are registered on the device by id and spliced immediately before the first
+    // submitted packet that references them (from any command list, in any execution order), so
+    // out-of-order execution or resetting an unexecuted list never orphans an id while keeping
+    // recording side-effect-free before ExecuteCommandLists.
+    std::function<void(uint32_t, CommandEncoder&)> defer_device_object;
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
@@ -543,7 +557,12 @@ public:
     // Records that GPU resource `resource_id` (texture, buffer, intermediate, or bind group) is
     // referenced by commands in the current frame (since the last Present) and updates its LRU tick.
     void note_resource_used(uint32_t resource_id);
+    // Pins `resource_id` on the CommandListBridge owning `encoder` (if any) so an unexecuted list
+    // protects it across advance_present_frame; falls back to note_resource_used otherwise.
+    void note_encoder_resource_used(const CommandEncoder& encoder, uint32_t resource_id);
     bool is_resource_used_in_frame(uint32_t resource_id) const;
+    // True when any attached unexecuted CommandListBridge recorded a reference to `resource_id`.
+    bool is_resource_recorded(uint32_t resource_id) const;
     uint64_t resource_last_use_tick(uint32_t resource_id) const;
     // Holds the retire lock once across a scan over many resources (an LRU eviction loop), instead
     // of two lock round trips per candidate through is_resource_used_in_frame / resource_last_use_tick.
@@ -854,6 +873,18 @@ private:
     uint32_t depth_twin_group(uint32_t layout, uint32_t depth_texture, uint32_t twin, bool into_twin,
                               uint8_t twin_format, uint32_t mip, uint32_t layer, CommandEncoder& encoder);
     void flush_retired_locked(CommandEncoder& encoder);
+    template <typename Fn>
+    void emit_device_object(uint32_t id, CommandEncoder& fallback, Fn&& fn) {
+        if (options_.defer_device_object && id != 0) {
+            CommandEncoder create;
+            fn(create);
+            if (create.size() != 0) {
+                options_.defer_device_object(id, create);
+            }
+        } else {
+            fn(fallback);
+        }
+    }
 
     d3d::DescriptorHeapRegistry& heaps_;
     BridgeOptions options_;
@@ -1254,6 +1285,8 @@ private:
     void queue_invalidation(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
     void drain_invalidations_locked();
     void note_recorded_resource(uint32_t resource_id);
+    bool has_recorded_resource(uint32_t resource_id) const;
+    const CommandEncoder& encoder() const noexcept { return encoder_; }
     void clear_recorded_resources(bool executed);
     void collect_unexecuted_resources(std::unordered_set<uint32_t>* out) const;
     void mark_executed_and_pin_in_frame();
