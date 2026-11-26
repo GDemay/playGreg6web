@@ -675,3 +675,316 @@ fn default_output_has_no_write_marks() {
     assert!(windowed.ir.contains("store atomic i8 1"), "{}", windowed.ir);
     assert!(windowed.requires_shared_memory());
 }
+
+#[test]
+fn r58_const_addr_in_out_and_boundary_execute_identically() {
+    if !exec_or_skip("r58_const_addr_in_out_and_boundary_execute_identically") {
+        return;
+    }
+    use iced_x86::{Code, Instruction, MemoryOperand, Register};
+    // Harness window is [0x10_0000, 0x20_0000); code is at CODE_BASE (0x30_0000).
+    // (Note: [0x10_0000, 0x10_02C0) holds GuestState in runner.js, so slot-0 test uses +0x1000.)
+    // Test constant RIP-relative addresses:
+    //   - flat_below:  WINDOW_BASE - 8 (exact last qword before W)
+    //   - win_slot0:   WINDOW_BASE + 0x1000 (inside slot 0)
+    //   - win_strad:   boundary(2) - 4 (straddles slots 1 | 2)
+    //   - win_end:     WINDOW_BASE + WINDOW_SIZE - 8 (exact last qword inside W + S, slot 15)
+    //   - flat_after:  WINDOW_BASE + WINDOW_SIZE (exact first qword past W + S)
+    //   - flat_atomic: FLAT_ADDR + 0x100 (outside window, locked xadd)
+    //   - win_atomic:  boundary(3) + 0x20 (inside window, slot 3, locked xadd)
+    let flat_below = WINDOW_BASE - 8;
+    let win_start = WINDOW_BASE + 0x1000;
+    let win_strad = boundary(2) - 4;
+    let win_end = WINDOW_BASE + WINDOW_SIZE - 8;
+    let flat_after = WINDOW_BASE + WINDOW_SIZE;
+    let flat_atomic = FLAT_ADDR + 0x100;
+    let win_atomic = boundary(3) + 0x20;
+
+    let mut lock_flat = Instruction::with2(
+        Code::Xadd_rm64_r64,
+        MemoryOperand::with_base_displ(Register::RIP, flat_atomic as i64),
+        Register::R8,
+    )
+    .expect("xadd flat");
+    lock_flat.set_has_lock_prefix(true);
+    let mut lock_win = Instruction::with2(
+        Code::Xadd_rm64_r64,
+        MemoryOperand::with_base_displ(Register::RIP, win_atomic as i64),
+        Register::R9,
+    )
+    .expect("xadd win");
+    lock_win.set_has_lock_prefix(true);
+
+    let bytes = super::encode(
+        CODE_BASE,
+        &[
+            // rax = [flat_below] + [win_start] + [win_strad] + [win_end] + [flat_after]
+            Instruction::with2(
+                Code::Mov_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ(Register::RIP, flat_below as i64),
+            )
+            .expect("ld1"),
+            Instruction::with2(
+                Code::Add_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ(Register::RIP, win_start as i64),
+            )
+            .expect("ld2"),
+            Instruction::with2(
+                Code::Add_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ(Register::RIP, win_strad as i64),
+            )
+            .expect("ld3"),
+            Instruction::with2(
+                Code::Add_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ(Register::RIP, win_end as i64),
+            )
+            .expect("ld4"),
+            Instruction::with2(
+                Code::Add_r64_rm64,
+                Register::RAX,
+                MemoryOperand::with_base_displ(Register::RIP, flat_after as i64),
+            )
+            .expect("ld5"),
+            // Store modified values back to flat_below, win_start, win_strad, flat_after.
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::RIP, flat_below as i64),
+                Register::RAX,
+            )
+            .expect("st1"),
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::RIP, win_start as i64),
+                Register::RAX,
+            )
+            .expect("st2"),
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::RIP, win_strad as i64),
+                Register::RAX,
+            )
+            .expect("st3"),
+            Instruction::with2(
+                Code::Mov_rm64_r64,
+                MemoryOperand::with_base_displ(Register::RIP, flat_after as i64),
+                Register::RAX,
+            )
+            .expect("st4"),
+            lock_flat,
+            lock_win,
+            Instruction::with(Code::Retnq),
+        ],
+    );
+    let f = super::Program::new()
+        .bytes(CODE_BASE, &bytes)
+        .function(CODE_BASE);
+
+    let vals = [0x11u64, 0x2200, 0x33_0000, 0x4400_0000, 0x55_0000_0000];
+    let sum: u64 = vals.iter().sum();
+
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        let case = Case::new(CODE_BASE)
+            .reg(super::exec::R8, 10)
+            .reg(super::exec::R9, 20)
+            .mem(flat_below, &vals[0].to_le_bytes())
+            .mem(win_start, &vals[1].to_le_bytes())
+            .mem(win_strad, &vals[2].to_le_bytes())
+            .mem(win_end, &vals[3].to_le_bytes())
+            .mem(flat_after, &vals[4].to_le_bytes())
+            .mem(flat_atomic, &100u64.to_le_bytes())
+            .mem(win_atomic, &200u64.to_le_bytes())
+            .read(flat_below, 8)
+            .read(win_start, 8)
+            .read(win_strad, 8)
+            .read(flat_after, 8)
+            .read(flat_atomic, 8)
+            .read(win_atomic, 8);
+        let o = run(&built, &[case]);
+        ok(&o, name);
+        assert_eq!(o[0].regs[RAX], sum, "{name}: sum");
+        assert_eq!(le(&o[0].mem[0]), sum, "{name}: flat_below");
+        assert_eq!(le(&o[0].mem[1]), sum, "{name}: win_start");
+        assert_eq!(le(&o[0].mem[2]), sum, "{name}: win_strad");
+        assert_eq!(le(&o[0].mem[3]), sum, "{name}: flat_after");
+        assert_eq!(le(&o[0].mem[4]), 110, "{name}: flat_atomic");
+        assert_eq!(le(&o[0].mem[5]), 220, "{name}: win_atomic");
+        // Constant out-of-window stores elide the spare mark even in window_select.
+        let want_dirty = match name {
+            "base" | "page" => Vec::new(),
+            _ => vec![0, 1, 2, 3],
+        };
+        assert_eq!(o[0].dirty, want_dirty, "{name}: dirty slots");
+    }
+}
+
+#[test]
+fn r58_burst_coalescing_rmw_and_avx256_handle_all_boundaries() {
+    if !exec_or_skip("r58_burst_coalescing_rmw_and_avx256_handle_all_boundaries") {
+        return;
+    }
+    // Exercises:
+    //  1. 4-field struct burst `[rcx + 0/8/16/24]` (loads + store)
+    //  2. 2x256-bit AVX load burst `[rsi + 0/32]` + 2x256-bit store burst `[rdi + 0/32]`
+    //  3. Read-modify-write `add [r8], r9`
+    //  4. Frame-pointer `[rbp - 0x10]` + AVX256 stack spill `[rsp + 0x20]`
+    let f = asm_function(CODE_BASE, |a| {
+        a.push(rbp)?;
+        a.mov(rbp, rsp)?;
+        a.sub(rsp, 0x60)?;
+        // Struct burst on rcx:
+        a.mov(rax, qword_ptr(rcx))?;
+        a.add(rax, qword_ptr(rcx + 8))?;
+        a.add(rax, qword_ptr(rcx + 16))?;
+        a.mov(qword_ptr(rcx + 24), rax)?;
+        // Frame pointer round-trip:
+        a.mov(qword_ptr(rbp - 0x10), rax)?;
+        // AVX256 load burst on rsi + stack spill + AVX256 store burst on rdi:
+        a.vmovdqu(ymm0, ymmword_ptr(rsi))?;
+        a.vmovdqu(ymm1, ymmword_ptr(rsi + 32))?;
+        a.vmovdqu(ymmword_ptr(rsp + 0x20), ymm0)?;
+        a.vpaddq(ymm2, ymm1, ymmword_ptr(rsp + 0x20))?;
+        a.vmovdqu(ymmword_ptr(rdi), ymm2)?;
+        a.vmovdqu(ymmword_ptr(rdi + 32), ymm1)?;
+        a.vzeroupper()?;
+        // RMW on r8:
+        a.add(qword_ptr(r8), r9)?;
+        a.mov(rax, qword_ptr(rbp - 0x10))?;
+        a.add(rsp, 0x60)?;
+        a.pop(rbp)?;
+        a.ret()
+    });
+
+    let struct_in: Vec<u8> = [10u64, 20, 30, 0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let vec_in: Vec<u8> = (0u64..8)
+        .map(|i| i.wrapping_mul(0x0101_0101_0000_0001).wrapping_add(1))
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let mut vec_sum = Vec::with_capacity(64);
+    for i in 0..4 {
+        let a = le(&vec_in[i * 8..(i + 1) * 8]);
+        let b = le(&vec_in[(i + 4) * 8..(i + 5) * 8]);
+        vec_sum.extend_from_slice(&a.wrapping_add(b).to_le_bytes());
+    }
+    vec_sum.extend_from_slice(&vec_in[32..64]);
+
+    struct BurstScenario {
+        name: &'static str,
+        struct_addr: u64,
+        vec_src: u64,
+        vec_dst: u64,
+        rmw_addr: u64,
+        want_slots: Vec<u64>,
+        outside_store: bool,
+    }
+    let scenarios = [
+        // 1. All flat (outside window)
+        BurstScenario {
+            name: "flat",
+            struct_addr: FLAT_ADDR,
+            vec_src: FLAT_ADDR + 0x100,
+            vec_dst: FLAT_ADDR + 0x200,
+            rmw_addr: FLAT_ADDR + 0x300,
+            want_slots: vec![],
+            outside_store: true,
+        },
+        // 2. All in-window single-slot (fast path!)
+        BurstScenario {
+            name: "in_window_single_slot",
+            struct_addr: boundary(1) + 0x100,
+            vec_src: boundary(2) + 0x100,
+            vec_dst: boundary(3) + 0x100,
+            rmw_addr: boundary(4) + 0x100,
+            want_slots: vec![1, 3, 4],
+            outside_store: false,
+        },
+        // 3. Straddling 64 KiB slot boundaries inside window (cold fallback!)
+        //    Note: struct writes at [struct_addr + 24] = boundary(2) + 12 (slot 2),
+        //    vec_dst writes [boundary(6) - 20 .. boundary(6) + 44) (slots 5, 6),
+        //    rmw writes [boundary(8) - 3 .. boundary(8) + 5) (slots 7, 8).
+        BurstScenario {
+            name: "straddle_slots",
+            struct_addr: boundary(2) - 12,
+            vec_src: boundary(4) - 20,
+            vec_dst: boundary(6) - 20,
+            rmw_addr: boundary(8) - 3,
+            want_slots: vec![2, 5, 6, 7, 8],
+            outside_store: false,
+        },
+        // 4. Struct burst spanning WINDOW_BASE + WINDOW_SIZE upper boundary:
+        //    struct [W+S-16 .. W+S+16) straddles slot 15 | flat (cold fallback!),
+        //    rmw at W+S-0x100 (inside slot 15, disjoint from struct).
+        BurstScenario {
+            name: "span_window_end_struct",
+            struct_addr: WINDOW_BASE + WINDOW_SIZE - 16,
+            vec_src: FLAT_ADDR + 0x100,
+            vec_dst: FLAT_ADDR + 0x200,
+            rmw_addr: WINDOW_BASE + WINDOW_SIZE - 0x100,
+            want_slots: vec![15],
+            outside_store: true,
+        },
+        // 5. AVX256 store burst spanning WINDOW_BASE + WINDOW_SIZE upper boundary:
+        //    vec_dst [W+S-32 .. W+S+32) straddles slot 15 | flat (cold fallback!).
+        BurstScenario {
+            name: "span_window_end_avx",
+            struct_addr: FLAT_ADDR,
+            vec_src: FLAT_ADDR + 0x100,
+            vec_dst: WINDOW_BASE + WINDOW_SIZE - 32,
+            rmw_addr: WINDOW_BASE + WINDOW_SIZE - 0x100,
+            want_slots: vec![15],
+            outside_store: true,
+        },
+    ];
+
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        for sc in &scenarios {
+            let sc_name = sc.name;
+            let case = Case::new(CODE_BASE)
+                .reg(RCX, sc.struct_addr)
+                .reg(super::exec::RSI, sc.vec_src)
+                .reg(RDI, sc.vec_dst)
+                .reg(super::exec::R8, sc.rmw_addr)
+                .reg(super::exec::R9, 77)
+                .mem(sc.struct_addr, &struct_in)
+                .mem(sc.vec_src, &vec_in)
+                .mem(sc.rmw_addr, &1000u64.to_le_bytes())
+                .read(sc.struct_addr + 24, 8)
+                .read(sc.vec_dst, 64)
+                .read(sc.rmw_addr, 8);
+            let o = run(&built, &[case]);
+            ok(&o, &format!("{name}/{sc_name}"));
+            assert_eq!(o[0].regs[RAX], 60, "{name}/{sc_name}: rax");
+            assert_eq!(le(&o[0].mem[0]), 60, "{name}/{sc_name}: struct[3]");
+            assert_eq!(o[0].mem[1], vec_sum, "{name}/{sc_name}: avx256 dst");
+            assert_eq!(le(&o[0].mem[2]), 1077, "{name}/{sc_name}: rmw");
+            if !sc_name.starts_with("span_window_end") {
+                // STACK_TOP (0x1F_0000) lies in slot 14 of the harness window: models with
+                // `stack_flat = false` mark slot 14 for `push rbp` / `[rbp-0x10]` / `[rsp+0x20]`,
+                // while `window_runs` (`stack_flat = true`) keeps all of them flat (no slot 14!).
+                let mut slots = sc.want_slots.clone();
+                if matches!(name, "window" | "window_select" | "window_outline") {
+                    slots.push(14);
+                }
+                assert_eq!(
+                    o[0].dirty,
+                    expected_marks(name, &slots, sc.outside_store),
+                    "{name}/{sc_name}: dirty"
+                );
+            } else if name != "base" && name != "page" {
+                assert!(
+                    o[0].dirty.contains(&15),
+                    "{name}/{sc_name}: slot 15 must be marked: {:?}",
+                    o[0].dirty
+                );
+            }
+        }
+    }
+}

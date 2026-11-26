@@ -154,11 +154,7 @@ impl FunctionLifter<'_> {
                 let (addr, pos) = match offset_imm {
                     Some(o) => {
                         let o = o & u64::from(bits - 1);
-                        let addr = if o >= 8 {
-                            self.val(&format!("add i64 {ea}, {}", o >> 3))
-                        } else {
-                            ea
-                        };
+                        let addr = self.offset_addr(&ea, o >> 3);
                         (addr, (o & 7).to_string())
                     }
                     None => {
