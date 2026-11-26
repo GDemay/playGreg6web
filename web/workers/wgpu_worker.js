@@ -2244,6 +2244,15 @@ class WgpuCommandProcessor {
     this._executeResultScratch = { frameCount: 0, presents: 0 };
     this._onZeroAllocDrainSpan = (bytesView, byteOffset, byteLength, span) => {
       this._zeroAllocDrainSpanBytes = byteLength;
+      if (this.executeCommandBuffer !== WgpuCommandProcessor.prototype.executeCommandBuffer) {
+        const viewBytes =
+          byteOffset === 0 && byteLength === bytesView.byteLength
+            ? bytesView
+            : bytesView.subarray(byteOffset, byteOffset + byteLength);
+        const execRes = this.executeCommandBuffer(viewBytes, DRAIN_RING_REUSE_OPTS);
+        this._zeroAllocDrainPresents += execRes.presents;
+        return;
+      }
       if (span && span.dataView instanceof DataView) {
         const viewStart = typeof span.viewOffset === 'number' ? span.viewOffset : 0;
         this._zeroAllocDrainPresents += this._executeCommandView(
@@ -10898,6 +10907,11 @@ class WgpuCommandProcessor {
       return { frameCount: this.frameCount, presents, bytesDrained };
     }
     const bytesDrained = this.ring.drainTo((bytes) => {
+      if (this.executeCommandBuffer !== WgpuCommandProcessor.prototype.executeCommandBuffer) {
+        const result = this.executeCommandBuffer(bytes, DRAIN_RING_REUSE_OPTS);
+        presents += result.presents;
+        return;
+      }
       const view = this._getCachedDataView(bytes.buffer);
       presents += this._executeCommandView(
         view,

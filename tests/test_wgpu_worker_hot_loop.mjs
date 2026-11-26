@@ -643,6 +643,22 @@ test('W359: GpuRingBuffer wrap-around drains reuse persistent wrapScratch + cach
   assert.equal(mock.counts.draw, 80);
   assert.equal(consumer._wrapScratch.buffer, initialWrapBuf);
   assert.equal(consumer.wrapScratchView, initialWrapView);
+
+  // Verify monkey-patched executeCommandBuffer (e.g. GpuFrameRecorder.createInterceptor)
+  // still intercepts ring-drained spans with exact byteLength, then returns to fast path on detach.
+  const interceptedLengths = [];
+  const origExec = proc.executeCommandBuffer;
+  proc.executeCommandBuffer = function wrappedExec(bytes, opts) {
+    interceptedLengths.push(bytes.byteLength);
+    return origExec.call(this, bytes, opts);
+  };
+  assert.equal(producer.writeBytes(frameStream), true);
+  proc.drainRing({ reuseResult: true });
+  assert.deepEqual(interceptedLengths, [frameStream.byteLength]);
+  delete proc.executeCommandBuffer;
+  assert.equal(producer.writeBytes(frameStream), true);
+  proc.drainRing({ reuseResult: true });
+  assert.deepEqual(interceptedLengths, [frameStream.byteLength]);
 });
 
 test('W359: W342 mid-frame deferred destroys remain intact across hot-loop pooled frames', async () => {
