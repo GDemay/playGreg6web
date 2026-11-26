@@ -18,6 +18,8 @@ void AudioProbes::configure(std::vector<AudioProbe> probes) {
     count_ = probes_.size();
     calls_.reset(count_ == 0 ? nullptr : new std::atomic<uint64_t>[count_]());
     small_.reset(count_ == 0 ? nullptr : new std::atomic<uint64_t>[count_ * kArgs * kSmall]());
+    entry_calls_.reset(count_ == 0 ? nullptr : new std::atomic<uint64_t>[count_]());
+    entry_small_.reset(count_ == 0 ? nullptr : new std::atomic<uint64_t>[count_ * kArgs * kSmall]());
     min_ = count_ == 0 ? 0 : probes_.front().address;
     max_ = count_ == 0 ? 0 : probes_.back().address;
 }
@@ -28,6 +30,31 @@ void AudioProbes::clear() {
     probes_.clear();
     calls_.reset();
     small_.reset();
+    entry_calls_.reset();
+    entry_small_.reset();
+}
+
+long AudioProbes::entry_hit(uint64_t target, const uint64_t args[kArgs], bool* first) noexcept {
+    if (count_ == 0 || target < min_ || target > max_) {
+        return -1;
+    }
+    const auto it = std::lower_bound(probes_.begin(), probes_.end(), target,
+                                     [](const AudioProbe& p, uint64_t t) { return p.address < t; });
+    if (it == probes_.end() || it->address != target) {
+        return -1;
+    }
+    const auto i = static_cast<size_t>(it - probes_.begin());
+    const uint64_t before = entry_calls_[i].fetch_add(1, std::memory_order_relaxed);
+    if (first != nullptr) {
+        *first = before == 0;
+    }
+    for (size_t a = 0; a < kArgs; ++a) {
+        if (args[a] < kSmall) {
+            entry_small_[(i * kArgs + a) * kSmall + static_cast<size_t>(args[a])].fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    return static_cast<long>(i);
 }
 
 long AudioProbes::hit(uint64_t target, const uint64_t args[kArgs], bool* first) noexcept {
@@ -67,13 +94,29 @@ std::string AudioProbes::to_json() const {
     for (size_t i = 0; i < count_; ++i) {
         char head[160];
         std::snprintf(head, sizeof head, "%s{\"name\": \"%s\", \"address\": \"0x%" PRIx64 "\", \"calls\": %" PRIu64
-                      ", \"small_args\": {", i == 0 ? "" : ", ", probes_[i].name.c_str(), probes_[i].address, calls(i));
+                      ", \"entry_calls\": %" PRIu64 ", \"small_args\": {", i == 0 ? "" : ", ", probes_[i].name.c_str(),
+                      probes_[i].address, calls(i), entry_calls(i));
         o += head;
         bool first_arg = true;
         for (size_t a = 0; a < kArgs; ++a) {
             std::string vals;
             for (size_t v = 0; v < kSmall; ++v) {
                 const uint64_t n = small_value(i, a, v);
+                if (n != 0) {
+                    vals += (vals.empty() ? "" : ", ") + std::string("\"") + std::to_string(v) + "\": " + std::to_string(n);
+                }
+            }
+            if (!vals.empty()) {
+                o += std::string(first_arg ? "" : ", ") + "\"" + kArgNames[a] + "\": {" + vals + "}";
+                first_arg = false;
+            }
+        }
+        o += "}, \"entry_small_args\": {";
+        first_arg = true;
+        for (size_t a = 0; a < kArgs; ++a) {
+            std::string vals;
+            for (size_t v = 0; v < kSmall; ++v) {
+                const uint64_t n = entry_small_value(i, a, v);
                 if (n != 0) {
                     vals += (vals.empty() ? "" : ", ") + std::string("\"") + std::to_string(v) + "\": " + std::to_string(n);
                 }

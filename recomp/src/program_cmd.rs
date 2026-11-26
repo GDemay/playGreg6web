@@ -35,9 +35,11 @@ pub struct ProgramArgs {
     /// Recorded indirect-call targets to seed (`--seed-targets`) and the report file (`--seed-report`).
     pub seed_targets: Option<PathBuf>,
     pub seed_report: Option<PathBuf>,
+    /// File of function entry VAs that count their executions (`--probe-functions`).
+    pub probe_functions: Option<PathBuf>,
 }
 
-pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>]";
+pub const USAGE: &str = "  playgta6-recomp build-program <exe> --out <dir> [--dll <file>]... [--dll-dir <dir>]... [--guest-dll <name>]... [--host-dll <name>]... [--bind <dll>!<symbol>=guest|host|prefer-host]... [--policy <file>]... [--allow-allocator-split] [--address-pool <lo>-<hi>] [--shims <header>...] [--emit-obj] [--jobs N] [--shard-size N] [--shard-instructions N] [--target wasm64|native|native:<triple>] [--target-cpu <cpu>] [--memory-model <m>] [--indirect-dispatch table|shard] [--seed-targets <file>] [--seed-report <file>] [--probe-functions <file>]";
 
 pub const OPTIONS: &[&str] = &[
     "  --target <t> / --target-cpu <cpu> build-program: code-generation target of every module (as for build)",
@@ -52,6 +54,7 @@ pub const OPTIONS: &[&str] = &[
     "  --allow-allocator-split build-program: report heap functions bound to different allocators instead of failing",
     "  --seed-targets <file>  build-program: indirect-call targets recorded by a boot (playgta6_boot --record-indirect-targets); validated, then lifted as function entries",
     "  --seed-report <file>   build-program: with --seed-targets, a JSON line per module: rejected targets and targets inside functions with unresolved jump tables",
+    "  --probe-functions <file> build-program: hex function entry VAs (one per line) that call the runtime's __playgta6_probe_hit on entry, so direct calls are counted too; keep the file outside git",
     "  --address-pool <lo>-<hi> build-program: hex range every module image must lie in (default 0x100000000-0x400000000)",
 ];
 
@@ -78,6 +81,7 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
         indirect_dispatch: IndirectDispatch::default(),
         seed_targets: None,
         seed_report: None,
+        probe_functions: None,
     };
     let value = |i: usize, flag: &str, what: &str| -> Result<String, String> {
         args.get(i)
@@ -145,6 +149,10 @@ pub fn parse_program_args(args: &[String]) -> Result<Option<ProgramArgs>, String
             "--seed-targets" => {
                 i += 1;
                 parsed.seed_targets = Some(PathBuf::from(value(i, flag, "<file>")?));
+            }
+            "--probe-functions" => {
+                i += 1;
+                parsed.probe_functions = Some(PathBuf::from(value(i, flag, "<file>")?));
             }
             "--seed-report" => {
                 i += 1;
@@ -273,6 +281,12 @@ pub fn run_program(args: &ProgramArgs) -> Result<String, String> {
     } else if args.seed_report.is_some() {
         return Err("--seed-report needs --seed-targets".to_string());
     }
+    if let Some(file) = &args.probe_functions {
+        let text = fs::read_to_string(file)
+            .map_err(|e| format!("failed to read '{}': {e}", file.display()))?;
+        build.probe_functions = playgta6_recomp::pipeline::parse_probe_functions(&text)
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+    }
     let start = Instant::now();
     let report = program::build_program(&options, &mut |module, stage| {
         let module = if module.is_empty() { "program" } else { module };
@@ -311,6 +325,11 @@ mod tests {
         assert!(parse_program_args(&args(&["a.exe", "--out", "x", "--seed-targets"])).is_err());
         let none = parse_program_args(&args(&["a.exe", "--out", "x"])).unwrap().unwrap();
         assert_eq!(none.seed_targets, None);
+        assert_eq!(none.probe_functions, None);
+        let p = parse_program_args(&args(&["a.exe", "--out", "x", "--probe-functions", "p.txt"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.probe_functions, Some(PathBuf::from("p.txt")));
     }
 
     #[test]

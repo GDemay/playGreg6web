@@ -331,7 +331,8 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
               rebuild_program: bool = False, cache_dir: Path | None = None,
               lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP,
               recomp_cache: Path | None = None, toolchain: str | None = None,
-              seed_targets: Path | None = None, native_executor: bool = False) -> tuple[Plan, Path, Path]:
+              seed_targets: Path | None = None, native_executor: bool = False,
+              probe_functions: Path | None = None) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
     `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
     `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
@@ -380,9 +381,11 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
     shim_time = max([mtime(p) or 0.0 for p in shim_inputs(repo)] + [0.0])
     reason = "forced (--rebuild-program)" if rebuild_program else None
     seed_time = (mtime(seed_targets) or 0.0) if seed_targets else 0.0
+    probe_time = (mtime(probe_functions) or 0.0) if probe_functions else 0.0
     reason = reason or stale("program", manifest, [("the recompiler", mtime(recomp) or 0.0), ("the exe", exe_time or 0.0),
                                          ("the runtime shim headers or export tables", shim_time),
-                                         ("the recorded targets", seed_time)])
+                                         ("the recorded targets", seed_time),
+                                         ("the probe function list", probe_time)])
     if reason is None and plan.has("recomp"):
         reason = "the recompiler is rebuilt"
     lift_options = list(NATIVE_LIFT_OPTIONS)
@@ -391,6 +394,10 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
         # The lift depends on the file's content: it is part of the cache key (the report path is not).
         key_options += ["seed-targets", file_digest(seed_targets)]
         lift_options += ["--seed-targets", str(seed_targets), "--seed-report", str(build_dir / "seed-report.jsonl")]
+    if probe_functions is not None:
+        # Entry counters change the lifted code: the list's content is part of the cache key.
+        key_options += ["probe-functions", file_digest(probe_functions)]
+        lift_options += ["--probe-functions", str(probe_functions)]
     key = None
     if reason and lift_cache is not None and exe is not None and exe.is_file() and game_dir is not None:
         key = lift_inputs_key(repo, exe, game_dir, key_options)
@@ -851,6 +858,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed-targets", nargs="?", const="auto", metavar="FILE",
                    help="lift with the recorded indirect-call targets as function entries (default file: this "
                         "title's recorded targets, see PLAYGTA6_INDIRECT_TARGETS)")
+    p.add_argument("--probe-functions", type=Path, metavar="FILE",
+                   help="lift with an entry counter in each function whose hex VA is listed in FILE (one per line; "
+                        "keep the file outside git), so direct calls show in the boot report's audio_probes")
     p.add_argument("--no-record-targets", action="store_true",
                    help="do not record the indirect-call targets this run dispatches")
     p.add_argument("--dump-pipelines", help="harness --dump-pipelines (a directory outside the repo, or under work/)")
@@ -983,7 +993,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
                                       args.rebuild_program, args.cache_dir, lift_cache,
                                       lift_cache_keep(env), recomp_cache, seed_targets=seed_file,
-                                      native_executor=args.native_executor or args.play)
+                                      native_executor=args.native_executor or args.play,
+                                      probe_functions=args.probe_functions)
     if args.trust_build:
         plan.steps = []
     if args.play:
