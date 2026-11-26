@@ -184,6 +184,10 @@ else()
     target_link_libraries(os_shim_tests PRIVATE playgta6_core)
     add_test(NAME os_shim_tests COMMAND os_shim_tests)
 
+    add_executable(test_httpfs_mailbox ../tests/test_httpfs_mailbox.cpp)
+    target_link_libraries(test_httpfs_mailbox PRIVATE playgta6_core)
+    add_test(NAME playgta6_httpfs_mailbox_tests COMMAND test_httpfs_mailbox)
+
     add_executable(test_xgameruntime ../tests/test_xgameruntime.cpp)
     target_link_libraries(test_xgameruntime PRIVATE playgta6_core)
     add_test(NAME playgta6_xgameruntime_tests COMMAND test_xgameruntime)
