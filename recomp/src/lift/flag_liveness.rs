@@ -657,14 +657,10 @@ fn instruction_step(block: &cfg::BasicBlock, ins: &Instruction) -> Step {
     }
 }
 
-/// Whether `ins` is a modelled, non-trapping, non-calling instruction whose lifting cannot
-/// branch to `cold_trap` or call another function.
-pub(super) fn is_modelled_non_trapping(ins: &Instruction) -> bool {
-    flag_effect(ins).is_some()
-}
-
-/// `(read, written)` flags of the modelled instructions; `None` for everything else.
-fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
+/// `(read, written)` flags of the modelled non-trapping, non-calling instructions; `None` for
+/// everything else (anything that may branch to `cold_trap`, call another function, or touch
+/// unmodelled state).
+pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     use Mnemonic as M;
     if ins.code() == Code::INVALID || ins.has_lock_prefix() || ins.is_string_instruction() {
         return None;

@@ -54,6 +54,10 @@ const GPR_NAMES: [&str; 16] = [
 const RSP: usize = 4;
 const RBP: usize = 5;
 
+/// Maximum x86 instruction count for a tiny internal true-leaf function to receive the LLVM
+/// `alwaysinline` function attribute (R65b).
+const TINY_LEAF_MAX_INSNS: usize = 10;
+
 /// Arithmetic flags in guest-state order (`STATE_FLAGS_OFFSET + index`).
 #[derive(Debug, Clone, Copy)]
 enum Flag {
@@ -941,6 +945,7 @@ impl FunctionLifter<'_> {
             self.emit("ret void");
         }
 
+        let has_cold_traps = !self.cold_traps.is_empty();
         self.emit_cold_trap_sink();
 
         let body = std::mem::take(&mut self.body);
@@ -964,8 +969,8 @@ impl FunctionLifter<'_> {
         // The emit helpers write to `self.body`, which is empty again here: build the entry
         // block's state loads there and splice them in front of the lifted blocks.
         self.known = Known::default();
-        let entry_dead_xmm = self.entry_overwritten_xmms();
-        self.sync_in_parts(ALL_STATE & !entry_dead_xmm);
+        let (entry_dead_state, entry_dead_flags) = self.entry_overwritten_state();
+        self.sync_in_parts(ALL_STATE & !entry_dead_state, ALL_FLAGS & !entry_dead_flags);
         self.unwind_entry();
         if self.support.contains(&Support::GuestBase)
             && let Some(base_name) = &self.guest_base
@@ -994,6 +999,37 @@ impl FunctionLifter<'_> {
         let ir = drop_overwritten_slot_stores(&ir);
         let ir = drop_unused_values(&ir);
 
+        // R65b: tag tiny internal true-leaf functions (no calls, tail calls, unwind handlers,
+        // traps, or unsupported ops, and `<= TINY_LEAF_MAX_INSNS` x86 instructions) for
+        // `alwaysinline` when emitted with `internal` linkage in a dispatch shard.
+        let total_insns: usize = self
+            .func
+            .blocks
+            .values()
+            .map(|b| b.instructions.len())
+            .sum();
+        let has_non_leaf_block = self.func.blocks.values().any(|b| {
+            matches!(
+                b.terminator,
+                Terminator::IndirectJump
+                    | Terminator::NoReturnCall
+                    | Terminator::Trap
+                    | Terminator::Invalid
+            ) || !b.calls.is_empty()
+                || b.instructions
+                    .iter()
+                    .any(|ins| ins.mnemonic() == Mnemonic::Call)
+        });
+        let tiny_leaf = total_insns > 0
+            && total_insns <= TINY_LEAF_MAX_INSNS
+            && self.callees.is_empty()
+            && exits.is_empty()
+            && self.unwind_sites == 0
+            && self.func.resume_targets.is_empty()
+            && !has_cold_traps
+            && self.unsupported.is_empty()
+            && !has_non_leaf_block;
+
         let mut unsupported = std::mem::take(&mut self.unsupported);
         unsupported.sort_by_key(|u| u.address);
         LiftedFunction {
@@ -1003,6 +1039,7 @@ impl FunctionLifter<'_> {
             callees: self.callees.iter().copied().collect(),
             unsupported,
             support: std::mem::take(&mut self.support),
+            tiny_leaf,
         }
     }
 
@@ -1264,52 +1301,64 @@ impl FunctionLifter<'_> {
         self.state_ptr(2, Some(flag as usize))
     }
 
-    /// R64a: bitmask of `StateMask` XMM bits (`xmm0..15`) that the function's entry block
-    /// unconditionally overwrites (all 128 bits) before any read, call, branch, or potentially
-    /// trapping instruction. Skipping their entry-block `%state.xmmN` loads is 100% sound because
-    /// every path from `entry:` stores into `%xmmN` before any read or `sync_out()`.
-    fn entry_overwritten_xmms(&self) -> StateMask {
+    /// R64a + R65a: `(dead_state, dead_flags)` that the function's entry block unconditionally
+    /// overwrites before any read, call, branch, or potentially trapping/unmodelled instruction.
+    /// Skipping their entry-block `%state.gprN` / `%state.flagN` / `%state.xmmN` loads is 100%
+    /// sound because every path from `entry:` writes the full slot before any read or `sync_out()`
+    /// (and `rsp` is never elided).
+    fn entry_overwritten_state(&self) -> (StateMask, FlagMask) {
         let Some(entry_block) = self.func.blocks.get(&self.func.entry) else {
-            return 0;
+            return (0, 0);
         };
         let body = match entry_block.instructions.split_last() {
             Some((_, rest)) if ends_in_transfer(entry_block.terminator) => rest,
             _ => &entry_block.instructions[..],
         };
         let mut factory = InstructionInfoFactory::new();
-        let mut read_before_write: u16 = 0;
-        let mut written_first: u16 = 0;
+        let mut gpr_read_before_write: u16 = 1u16 << RSP;
+        let mut gpr_written_first: u16 = 0;
+        let mut flag_read_before_write: FlagMask = 0;
+        let mut flag_written_first: FlagMask = 0;
+        let mut xmm_read_before_write: u16 = 0;
+        let mut xmm_written_first: u16 = 0;
         for ins in body {
-            if is_control_transfer(ins)
-                || !flag_liveness::is_modelled_non_trapping(ins)
-                || self.unsupported.iter().any(|u| u.address == ins.ip())
-            {
+            if is_control_transfer(ins) || self.unsupported.iter().any(|u| u.address == ins.ip()) {
                 break;
             }
+            let Some((flag_reads, flag_writes)) = flag_liveness::flag_effect(ins) else {
+                break;
+            };
+            flag_read_before_write |= flag_reads & !flag_written_first;
+            flag_written_first |= flag_writes & !flag_read_before_write;
+
+            let info = factory.info(ins);
+            let (gpr_reads, gpr_full_writes) = gpr_rw_masks(ins, info);
+            gpr_read_before_write |= gpr_reads & !gpr_written_first;
+            gpr_written_first |= gpr_full_writes & !gpr_read_before_write;
+
             if simd::is_simd(ins) {
-                let info = factory.info(ins);
-                let (reads, full_writes) = simd::xmm_rw_masks(ins, info);
-                read_before_write |= reads & !written_first;
-                written_first |= full_writes & !read_before_write;
+                let (xmm_reads, xmm_full_writes) = simd::xmm_rw_masks(ins, info);
+                xmm_read_before_write |= xmm_reads & !xmm_written_first;
+                xmm_written_first |= xmm_full_writes & !xmm_read_before_write;
             }
         }
-        let mut state_mask: StateMask = 0;
+        let mut state_mask: StateMask = u64::from(gpr_written_first & !(1u16 << RSP));
         for idx in 0..16 {
-            if written_first & (1u16 << idx) != 0 {
+            if xmm_written_first & (1u16 << idx) != 0 {
                 state_mask |= flag_liveness::xmm_state_bit(idx);
             }
         }
-        state_mask
+        (state_mask, flag_written_first)
     }
 
     /// Loads all tracked registers and flags from `%state` into their allocas.
     fn sync_in(&mut self) {
-        self.sync_in_parts(ALL_STATE);
+        self.sync_in_parts(ALL_STATE, ALL_FLAGS);
     }
 
-    /// [`Self::sync_in`] loading only the GPRs, `xmm` and `ymmh` registers in `state`; the flags
-    /// are always loaded.
-    fn sync_in_parts(&mut self, state: StateMask) {
+    /// [`Self::sync_in`] loading only the GPRs, `xmm` and `ymmh` registers in `state` and the
+    /// flags in `flags`.
+    fn sync_in_parts(&mut self, state: StateMask, flags: FlagMask) {
         for (idx, name) in GPR_NAMES.iter().enumerate() {
             if self.regs[idx] && state & (1u64 << idx) != 0 {
                 let ptr = self.state_gpr_ptr(idx);
@@ -1320,7 +1369,7 @@ impl FunctionLifter<'_> {
         }
         self.known.flag_source = None;
         for flag in FLAGS {
-            if self.flags[flag as usize] {
+            if self.flags[flag as usize] && flags & (1 << flag as usize) != 0 {
                 let ptr = self.state_flag_ptr(flag);
                 let byte = self.val(&format!("load i8, ptr {ptr}, !range !{{i8 0, i8 2}}"));
                 let bit = self.val(&format!("trunc i8 {byte} to i1"));
@@ -3346,7 +3395,7 @@ impl FunctionLifter<'_> {
                 function_symbol(target)
             ));
             self.callees.push(target);
-            self.sync_in_parts(state);
+            self.sync_in_parts(state, ALL_FLAGS);
         } else {
             // The target is read before the return address is pushed (`call [rsp+8]`).
             let target = self.indirect_target(ins)?;
@@ -3437,6 +3486,168 @@ impl FunctionLifter<'_> {
         self.emit(&format!("br i1 {c}, label %{taken}, label %{not_taken}"));
         Ok(())
     }
+}
+
+/// R65a: for a modelled non-trapping instruction (`flag_liveness::flag_effect(ins).is_some()`),
+/// returns `(reads, full_writes)` bitmasks over GPRs `rax..r15` (`0..15`):
+/// - `reads`: superset of every GPR whose `%gpr` alloca lifting `ins` may load (including memory
+///   base/index registers, implicit sources, and partial 8/16-bit or conditional destinations).
+/// - `full_writes`: subset of every GPR (excluding `rsp`) whose full 64-bit `%gpr` alloca lifting
+///   `ins` unconditionally overwrites (64-bit writes and zero-extending 32-bit writes) without
+///   loading `%gpr` first.
+fn gpr_rw_masks(ins: &Instruction, info: &iced_x86::InstructionInfo) -> (u16, u16) {
+    use Mnemonic as M;
+    let rsp_bit = 1u16 << RSP;
+    // Register zeroing idioms (`xor r32/r64, r32/r64` and `sub r32/r64, r32/r64`) write 0
+    // directly in `alu()` without loading the register. 8/16-bit forms go through `merge_gpr`
+    // and therefore read the full 64-bit register.
+    if matches!(ins.mnemonic(), M::Xor | M::Sub)
+        && ins.op_count() == 2
+        && ins.op_kind(0) == OpKind::Register
+        && ins.op_kind(1) == OpKind::Register
+        && ins.op_register(0) == ins.op_register(1)
+    {
+        let r = ins.op_register(0);
+        if r.is_gpr() && r.full_register().is_gpr64() {
+            let bit = 1u16 << r.full_register().number();
+            return if r.is_gpr64() || r.is_gpr32() {
+                (0, bit & !rsp_bit)
+            } else {
+                (bit, 0)
+            };
+        }
+    }
+
+    let mut reads = 0u16;
+    for ur in info.used_registers() {
+        let r = ur.register();
+        if r.is_gpr() && r.full_register().is_gpr64() {
+            let bit = 1u16 << r.full_register().number();
+            let access = ur.access();
+            let is_read = matches!(
+                access,
+                OpAccess::Read
+                    | OpAccess::CondRead
+                    | OpAccess::ReadWrite
+                    | OpAccess::ReadCondWrite
+                    | OpAccess::CondWrite
+            );
+            let is_partial_write =
+                access == OpAccess::Write && !(r.is_gpr64() || r.is_gpr32());
+            if is_read || is_partial_write {
+                reads |= bit;
+            }
+        }
+    }
+    for mem_reg in [ins.memory_base(), ins.memory_index()] {
+        if mem_reg.is_gpr() && mem_reg.full_register().is_gpr64() {
+            reads |= 1u16 << mem_reg.full_register().number();
+        }
+    }
+    for i in 1..ins.op_count() {
+        if ins.op_kind(i) == OpKind::Register {
+            let r = ins.op_register(i);
+            if r.is_gpr()
+                && r.full_register().is_gpr64()
+                && !matches!(info.op_access(i), OpAccess::Write | OpAccess::None)
+            {
+                reads |= 1u16 << r.full_register().number();
+            }
+        }
+    }
+
+    let mut full_writes = 0u16;
+    let is_unconditional_op0_full_write = matches!(
+        ins.mnemonic(),
+        M::Mov
+            | M::Movzx
+            | M::Movsx
+            | M::Movsxd
+            | M::Lea
+            | M::Movbe
+            | M::Pop
+            | M::Shlx
+            | M::Shrx
+            | M::Sarx
+            | M::Rorx
+            | M::Mulx
+            | M::Andn
+            | M::Blsi
+            | M::Blsr
+            | M::Blsmsk
+            | M::Bzhi
+            | M::Bextr
+            | M::Tzcnt
+            | M::Lzcnt
+            | M::Popcnt
+            | M::Movd
+            | M::Vmovd
+            | M::Movq
+            | M::Vmovq
+            | M::Movmskps
+            | M::Vmovmskps
+            | M::Movmskpd
+            | M::Vmovmskpd
+            | M::Pmovmskb
+            | M::Vpmovmskb
+            | M::Cvtss2si
+            | M::Vcvtss2si
+            | M::Cvttss2si
+            | M::Vcvttss2si
+            | M::Cvtsd2si
+            | M::Vcvtsd2si
+            | M::Cvttsd2si
+            | M::Vcvttsd2si
+            | M::Pextrd
+            | M::Vpextrd
+            | M::Pextrq
+            | M::Vpextrq
+    ) || (ins.mnemonic() == M::Imul && ins.op_count() == 3);
+
+    if is_unconditional_op0_full_write
+        && ins.op_count() > 0
+        && ins.op_kind(0) == OpKind::Register
+        && info.op_access(0) == OpAccess::Write
+    {
+        let r0 = ins.op_register(0);
+        if r0.is_gpr() && (r0.is_gpr64() || r0.is_gpr32()) {
+            let bit = 1u16 << r0.full_register().number();
+            if reads & bit == 0 {
+                full_writes |= bit;
+            }
+        }
+    }
+    if ins.mnemonic() == M::Mulx
+        && ins.op_count() >= 2
+        && ins.op_kind(1) == OpKind::Register
+        && info.op_access(1) == OpAccess::Write
+    {
+        let r1 = ins.op_register(1);
+        if r1.is_gpr() && (r1.is_gpr64() || r1.is_gpr32()) {
+            let bit = 1u16 << r1.full_register().number();
+            if reads & bit == 0 {
+                full_writes |= bit;
+            }
+        }
+    }
+    if matches!(ins.mnemonic(), M::Cdq | M::Cqo) {
+        let rdx_bit = 1u16 << 2;
+        if reads & rdx_bit == 0 {
+            full_writes |= rdx_bit;
+        }
+    }
+    // Any other GPR destination (e.g. `bsf`/`bsr`, `cmovcc`, 8/16-bit writes) is conservatively
+    // treated as a read so a later full write cannot bypass an earlier partial/conditional access.
+    if ins.op_count() > 0 && ins.op_kind(0) == OpKind::Register {
+        let r0 = ins.op_register(0);
+        if r0.is_gpr() && r0.full_register().is_gpr64() {
+            let bit = 1u16 << r0.full_register().number();
+            if full_writes & bit == 0 {
+                reads |= bit;
+            }
+        }
+    }
+    (reads, full_writes & !rsp_bit)
 }
 
 /// True if `ins` cannot appear inside a coalesced window burst (control flow, calls, atomics,
