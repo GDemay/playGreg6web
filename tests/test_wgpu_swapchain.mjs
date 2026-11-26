@@ -6,9 +6,15 @@ const require = createRequire(import.meta.url);
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const {
   BLIT_FULLSCREEN_WGSL,
+  BLIT_TONEMAP_WGSL,
+  BUFFER_USAGE_COPY_DST,
+  BUFFER_USAGE_UNIFORM,
   COMPATIBLE_VIEW_FORMATS,
   DEFAULT_DEPTH_FORMAT,
   DEFAULT_DROPPED_FRAME_THRESHOLD_MS,
+  DEFAULT_EXPOSURE,
+  DEFAULT_TONE_MAP_MODE,
+  HDR_STREAM_FORMATS,
   TARGET_30FPS_BUDGET_MS,
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_USAGE,
@@ -19,10 +25,14 @@ const {
   TEXTURE_USAGE_COPY_SRC,
   TEXTURE_USAGE_RENDER_ATTACHMENT,
   TEXTURE_USAGE_TEXTURE_BINDING,
+  TONE_MAP_MODES,
   VALID_CANVAS_FORMATS,
   WgpuSwapchain,
   getCompatibleViewFormats,
+  isHdrStreamFormat,
   isValidCanvasFormat,
+  normalizeExposure,
+  normalizeToneMapMode,
 } = swapchainMod;
 
 function createMockWebGpuEnv({ limits, withUnconfigure = true } = {}) {
@@ -2996,5 +3006,256 @@ test('W348 confirmVisibleFrame transitions gated black presents to visible witho
   assert.equal(swapchain.presentCount, 3);
   assert.equal(swapchain.firstVisiblePresentMs, 4200);
   assert.equal(fired.length, 1);
+  swapchain.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W380 (#1763): HDR Tone-Map Blit Pipeline (Passthrough / Reinhard / ACES),
+//               Preallocated Uniform Buffer & Zero-Alloc blitToCanvas
+// ---------------------------------------------------------------------------
+
+function attachMockToneMapBufferSupport(device, events) {
+  let nextBufId = 1;
+  device.createdBuffers = [];
+  device.queueWrites = [];
+  device.createBuffer = function createBuffer(desc) {
+    const buf = {
+      kind: 'GPUBuffer',
+      id: nextBufId++,
+      deviceLabel: device.label,
+      desc: { ...desc },
+      destroyed: false,
+      destroyCalls: 0,
+      destroy() {
+        this.destroyed = true;
+        this.destroyCalls += 1;
+        events.push({ op: 'buffer.destroy', id: this.id });
+      },
+    };
+    device.createdBuffers.push(buf);
+    events.push({ op: 'device.createBuffer', id: buf.id, desc: buf.desc });
+    return buf;
+  };
+  device.queue = {
+    writeBuffer(buffer, bufferOffset, data) {
+      const bytes =
+        data instanceof ArrayBuffer
+          ? new Uint8Array(data.slice(0))
+          : new Uint8Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+      device.queueWrites.push({ buffer, bufferOffset, bytes });
+      events.push({ op: 'queue.writeBuffer', bufferId: buffer.id, byteLength: bytes.byteLength });
+    },
+  };
+  return device;
+}
+
+test('W380 exposes BLIT_TONEMAP_WGSL, HDR stream format detection, and tone-map option validators', () => {
+  assert.deepEqual(TONE_MAP_MODES, ['none', 'passthrough', 'reinhard', 'aces']);
+  assert.equal(DEFAULT_TONE_MAP_MODE, 'none');
+  assert.equal(DEFAULT_EXPOSURE, 1.0);
+  assert.ok(typeof BLIT_TONEMAP_WGSL === 'string');
+  assert.ok(BLIT_TONEMAP_WGSL.includes('vs_main'));
+  assert.ok(BLIT_TONEMAP_WGSL.includes('fs_main'));
+  assert.ok(BLIT_TONEMAP_WGSL.includes('tonemap_reinhard'));
+  assert.ok(BLIT_TONEMAP_WGSL.includes('tonemap_aces'));
+  assert.ok(BLIT_TONEMAP_WGSL.includes('linear_to_srgb'));
+
+  for (const hdrFmt of ['rgba16float', 'rg11b10ufloat', 'r16float', 'rgba32float', 'rgb10a2unorm']) {
+    assert.ok(HDR_STREAM_FORMATS.includes(hdrFmt));
+    assert.equal(isHdrStreamFormat(hdrFmt), true);
+  }
+  assert.equal(isHdrStreamFormat('bgra8unorm'), false);
+  assert.equal(isHdrStreamFormat('rgba8unorm-srgb'), false);
+  assert.equal(isHdrStreamFormat(null), false);
+
+  assert.equal(normalizeToneMapMode(undefined), 'none');
+  assert.equal(normalizeToneMapMode('ACES'), 'aces');
+  assert.equal(normalizeToneMapMode('reinhard'), 'reinhard');
+  assert.equal(normalizeToneMapMode('passthrough'), 'passthrough');
+  assert.throws(() => normalizeToneMapMode('filmic-unknown'), RangeError);
+  assert.throws(() => normalizeToneMapMode(42), TypeError);
+
+  assert.equal(normalizeExposure(undefined), 1.0);
+  assert.equal(normalizeExposure(2.5), 2.5);
+  assert.throws(() => normalizeExposure(0), RangeError);
+  assert.throws(() => normalizeExposure(-1), RangeError);
+  assert.throws(() => normalizeExposure(Number.NaN), RangeError);
+  assert.throws(() => normalizeExposure(Number.POSITIVE_INFINITY), RangeError);
+});
+
+test('W380 ACES/Reinhard tone-map blit updates preallocated uniform buffer only on param change with zero per-frame allocs', () => {
+  const { canvas, context, device, events } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+  attachMockToneMapBufferSupport(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    streamFormat: 'rgba16float',
+    toneMapMode: 'aces',
+    exposure: 1.5,
+    enableDepth: false,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  // HDR rgba16float stream with ACES tone-mapping onto SDR bgra8unorm keeps canvas SDR and activates blit fallback!
+  assert.equal(swapchain.usesBlitFallback, true);
+  assert.equal(swapchain.canvasFormat, 'bgra8unorm');
+  assert.equal(swapchain.streamFormat, 'rgba16float');
+  assert.equal(swapchain.isHdrStream, true);
+  assert.equal(swapchain.toneMapMode, 'aces');
+  assert.equal(swapchain.exposure, 1.5);
+  assert.equal(swapchain.applySrgbEncode, true); // auto-enabled for linear HDR -> SDR non-sRGB canvas
+  assert.equal(swapchain.toneMapActive, true);
+
+  const encoder = createMockCommandEncoder();
+  const canvasView = { kind: 'GPUTextureView', id: 'sdr-canvas-view' };
+
+  // First present creates tone-map shader, pipeline, 16B uniform buffer, 3-entry bind group, and uploads uniform ONCE.
+  assert.equal(swapchain.present(encoder, canvasView), true);
+  assert.equal(device.createdBuffers.length, 1);
+  assert.equal(device.createdBuffers[0].desc.size, 16);
+  assert.equal(
+    device.createdBuffers[0].desc.usage,
+    BUFFER_USAGE_UNIFORM | BUFFER_USAGE_COPY_DST
+  );
+  assert.equal(device.createdShaderModules[0].desc.code, BLIT_TONEMAP_WGSL);
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(device.createdBindGroups[0].desc.entries.length, 3);
+  assert.equal(device.createdBindGroups[0].desc.entries[2].resource.buffer, device.createdBuffers[0]);
+  assert.equal(device.queueWrites.length, 1);
+
+  // Verify exact uniform payload: mode=2 (aces), exposure=1.5f, apply_srgb=1.
+  const u32_0 = new Uint32Array(device.queueWrites[0].bytes.buffer);
+  const f32_0 = new Float32Array(device.queueWrites[0].bytes.buffer);
+  assert.equal(u32_0[0], 2);
+  assert.equal(f32_0[1], 1.5);
+  assert.equal(u32_0[2], 1);
+
+  // 50 steady-state frames: ZERO extra uniform uploads, ZERO extra bind groups, ZERO extra pipelines, exact descriptor reuse!
+  const firstPassDesc = encoder.passes[0].desc;
+  const firstBg = encoder.passes[0].bindGroups[0].bindGroup;
+  for (let i = 0; i < 50; i += 1) {
+    assert.equal(swapchain.present(encoder, canvasView), true);
+    const p = encoder.passes[encoder.passes.length - 1];
+    assert.strictEqual(p.desc, firstPassDesc);
+    assert.strictEqual(p.bindGroups[0].bindGroup, firstBg);
+  }
+  assert.equal(device.queueWrites.length, 1);
+  assert.equal(device.createdBindGroups.length, 1);
+  assert.equal(device.createdRenderPipelines.length, 1);
+  assert.equal(swapchain.toneMapBlitCount, 51);
+  assert.equal(swapchain.toneMapUniformUploads, 1);
+
+  // Changing tone-map options via setToneMapOptions marks dirty and triggers exactly 1 new upload on next blit.
+  const updated = swapchain.setToneMapOptions({
+    mode: 'reinhard',
+    exposure: 2.0,
+    applySrgbEncode: false,
+  });
+  assert.deepEqual(updated, {
+    toneMapMode: 'reinhard',
+    exposure: 2.0,
+    applySrgbEncode: false,
+    toneMapActive: true,
+  });
+  assert.equal(swapchain.present(encoder, canvasView), true);
+  assert.equal(device.queueWrites.length, 2);
+  assert.equal(device.createdBindGroups.length, 1); // same uniform buffer -> same bind group reused!
+
+  const u32_1 = new Uint32Array(device.queueWrites[1].bytes.buffer);
+  const f32_1 = new Float32Array(device.queueWrites[1].bytes.buffer);
+  assert.equal(u32_1[0], 1); // reinhard
+  assert.equal(f32_1[1], 2.0);
+  assert.equal(u32_1[2], 0); // applySrgbEncode overridden to false
+
+  // Calling setToneMapOptions with identical values does NOT re-upload.
+  swapchain.setToneMapOptions({ mode: 'reinhard', exposure: 2.0, applySrgbEncode: false });
+  assert.equal(swapchain.present(encoder, canvasView), true);
+  assert.equal(device.queueWrites.length, 2);
+
+  // Telemetry exposed cleanly in getStats() and reset cleanly in resetStats().
+  const stats = swapchain.getStats();
+  assert.equal(stats.toneMapMode, 'reinhard');
+  assert.equal(stats.exposure, 2.0);
+  assert.equal(stats.applySrgbEncode, false);
+  assert.equal(stats.isHdrStream, true);
+  assert.equal(stats.toneMapActive, true);
+  assert.equal(stats.toneMapBlitCount, 53);
+  assert.equal(stats.toneMapUniformUploads, 2);
+
+  swapchain.resetStats();
+  assert.equal(swapchain.getStats().toneMapBlitCount, 0);
+  assert.equal(swapchain.getStats().toneMapUniformUploads, 0);
+
+  // destroy() destroys the preallocated uniform buffer cleanly.
+  const uniformBuf = device.createdBuffers[0];
+  swapchain.destroy();
+  assert.equal(uniformBuf.destroyed, true);
+  assert.equal(uniformBuf.destroyCalls, 1);
+});
+
+test('W380 blitToCanvas blits arbitrary external HDR RT view onto SDR canvas and survives device.lost + recover()', async () => {
+  const { canvas, context, device, events, makeDevice } = createMockWebGpuEnv();
+  attachMockBlitCapabilities(device, events);
+  attachMockToneMapBufferSupport(device, events);
+
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    toneMapMode: 'aces',
+  });
+  swapchain.configure({ width: 1920, height: 1080 });
+  assert.equal(swapchain.usesBlitFallback, false); // direct SDR swapchain
+
+  const externalHdrView = { kind: 'GPUTextureView', id: 'rt-pool-hdr-rgba16f' };
+  const canvasView = { kind: 'GPUTextureView', id: 'swapchain-bgra8' };
+  const enc = createMockCommandEncoder();
+
+  // Explicit blitToCanvas with sourceFormat='rgba16float' auto-enables sRGB encode & ACES tone-mapping.
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba16float'), true);
+  assert.equal(swapchain.blitCount, 1);
+  assert.equal(swapchain.toneMapBlitCount, 1);
+  assert.equal(device.queueWrites.length, 1);
+  const u32 = new Uint32Array(device.queueWrites[0].bytes.buffer);
+  assert.equal(u32[0], 2); // aces
+  assert.equal(u32[2], 1); // auto apply_srgb for rgba16float -> bgra8unorm
+
+  // Switching to passthrough/none + exposure 1.0 switches back to zero-uniform passthrough blit.
+  swapchain.setToneMapOptions({ mode: 'passthrough', exposure: 1.0, applySrgbEncode: null });
+  assert.equal(swapchain.toneMapActive, false);
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba8unorm-srgb'), true);
+  assert.equal(swapchain.blitCount, 2);
+  assert.equal(swapchain.toneMapBlitCount, 1);
+
+  // Device loss destroys old uniform buffer; recover() rebuilds cleanly on new device.
+  const oldBuf = device.createdBuffers[0];
+  device.triggerLost({ reason: 'unknown', message: 'gpu reset' });
+  await device.lost;
+  await Promise.resolve();
+  assert.equal(oldBuf.destroyed, true);
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba16float'), false);
+
+  const newDevice = attachMockToneMapBufferSupport(
+    attachMockBlitCapabilities(makeDevice('device-1'), events),
+    events
+  );
+  swapchain.recover(newDevice, 'rgba8unorm');
+  swapchain.setToneMapOptions({ mode: 'aces', exposure: 1.25 });
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rg11b10ufloat'), true);
+  assert.equal(newDevice.createdBuffers.length, 1);
+  assert.equal(newDevice.queueWrites.length, 1);
+
+  // Validation errors on invalid setToneMapOptions inputs.
+  assert.throws(() => swapchain.setToneMapOptions(null), TypeError);
+  assert.throws(() => swapchain.setToneMapOptions({ mode: 'invalid' }), RangeError);
+  assert.throws(() => swapchain.setToneMapOptions({ exposure: -2 }), RangeError);
+  assert.throws(() => swapchain.setToneMapOptions({ applySrgbEncode: 'yes' }), TypeError);
+
   swapchain.destroy();
 });

@@ -18,7 +18,14 @@ const {
   FORMAT_BYTES_PER_PIXEL,
   DXGI_FORMAT_ALIASES,
   COMPATIBLE_VIEW_FORMATS,
+  REQUIRED_3D_RT_FORMATS,
   normalizeRenderTargetFormat,
+  isHdrRenderTargetFormat,
+  isDepthRenderTargetFormat,
+  hasStencilComponent,
+  getCompatibleSrgbSiblingFormat,
+  withSrgbSiblingViewFormat,
+  resolveRenderTargetFormatForDevice,
   isCompatibleViewFormat,
   normalizeViewFormats,
   normalizeSampleCount,
@@ -3010,4 +3017,301 @@ test('W285 exposes clamped vramBudgetUtilization, intraFrameAliasHits, and recla
     vm.runInContext(source, ctx, { filename: rtPoolPath });
     vm.runInContext('const DEFAULT_OVERSIZED_RECLAIM_IDLE_FRAMES = 99;', ctx);
   });
+});
+
+// ---------------------------------------------------------------------------
+// W380 (#1763): 3D HDR/Depth/sRGB RT Pool, Device-Feature Fallbacks & 3D/Cube/Array Views
+// ---------------------------------------------------------------------------
+
+test('W380 supports all 14 required 3D render-target formats, classification helpers, and shorthand aliases', () => {
+  const expectedRequired = [
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+    'rgba16float',
+    'rg11b10ufloat',
+    'r16float',
+    'rgb10a2unorm',
+    'rgba8unorm-srgb',
+    'rgba8unorm',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rg16float',
+    'r32float',
+    'depth16unorm',
+  ];
+  assert.ok(Object.isFrozen(REQUIRED_3D_RT_FORMATS));
+  for (const fmt of expectedRequired) {
+    assert.ok(REQUIRED_3D_RT_FORMATS.includes(fmt), `missing required 3D format: ${fmt}`);
+    assert.ok(FORMAT_BYTES_PER_PIXEL[fmt] > 0, `missing bpp for ${fmt}`);
+  }
+
+  // Shorthand aliases resolve canonically.
+  assert.equal(normalizeRenderTargetFormat('rgba16f'), 'rgba16float');
+  assert.equal(normalizeRenderTargetFormat('rg11b10f'), 'rg11b10ufloat');
+  assert.equal(normalizeRenderTargetFormat('r16f'), 'r16float');
+  assert.equal(normalizeRenderTargetFormat('rg16f'), 'rg16float');
+  assert.equal(normalizeRenderTargetFormat('r32f'), 'r32float');
+  assert.equal(normalizeRenderTargetFormat('d32f'), 'depth32float');
+  assert.equal(normalizeRenderTargetFormat('d32fs8'), 'depth32float-stencil8');
+  assert.equal(normalizeRenderTargetFormat('d24s8'), 'depth24plus-stencil8');
+  assert.equal(normalizeRenderTargetFormat('d16'), 'depth16unorm');
+
+  // Classification helpers.
+  assert.equal(isHdrRenderTargetFormat('rgba16float'), true);
+  assert.equal(isHdrRenderTargetFormat('rg11b10ufloat'), true);
+  assert.equal(isHdrRenderTargetFormat('r16float'), true);
+  assert.equal(isHdrRenderTargetFormat('rgb10a2unorm'), true);
+  assert.equal(isHdrRenderTargetFormat('rgba8unorm'), false);
+  assert.equal(isHdrRenderTargetFormat('depth32float'), false);
+
+  assert.equal(isDepthRenderTargetFormat('depth24plus-stencil8'), true);
+  assert.equal(isDepthRenderTargetFormat('depth32float'), true);
+  assert.equal(isDepthRenderTargetFormat('depth32float-stencil8'), true);
+  assert.equal(isDepthRenderTargetFormat('depth16unorm'), true);
+  assert.equal(isDepthRenderTargetFormat('rgba16float'), false);
+
+  assert.equal(hasStencilComponent('depth24plus-stencil8'), true);
+  assert.equal(hasStencilComponent('depth32float-stencil8'), true);
+  assert.equal(hasStencilComponent('depth32float'), false);
+  assert.equal(hasStencilComponent('depth16unorm'), false);
+
+  // Acquire & pool every required format across 2 frames with zero duplicate allocations.
+  const { device, createdTextures } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device });
+
+  for (let frame = 0; frame < 2; frame += 1) {
+    const acquired = expectedRequired.map((format) =>
+      pool.acquire({ width: 256, height: 256, format }, `rt-${format}`)
+    );
+    for (let i = 0; i < acquired.length; i += 1) {
+      assert.equal(acquired[i].desc.format, expectedRequired[i]);
+      assert.equal(acquired[i].reused, frame > 0);
+      pool.release(acquired[i]);
+    }
+    pool.endFrame();
+  }
+
+  assert.equal(createdTextures.length, expectedRequired.length);
+  const stats = pool.getStats();
+  assert.equal(stats.hits, expectedRequired.length);
+  assert.equal(stats.misses, expectedRequired.length);
+  assert.equal(stats.hdrAcquires, 12); // 6 HDR formats * 2 frames
+  assert.equal(stats.depthAcquires, 8); // 4 depth formats * 2 frames
+  assert.equal(stats.srgbAcquires, 4); // 2 sRGB formats * 2 frames
+  assert.equal(stats.idleHdrCount, 6);
+  assert.equal(stats.idleDepthCount, 4);
+  assert.equal(stats.activeHdrCount, 0);
+  assert.equal(stats.activeDepthCount, 0);
+  assert.equal(stats.formatFallbackCount, 0);
+
+  pool.destroy();
+});
+
+test('W380 device-feature-aware format resolution falls back safely when optional features are absent and preserves exact format when supported or unspecified', () => {
+  // 1. Unspecified features preserves exact format (mock compatibility).
+  const noFeaturesRes = resolveRenderTargetFormatForDevice('depth32float-stencil8');
+  assert.equal(noFeaturesRes.format, 'depth32float-stencil8');
+  assert.equal(noFeaturesRes.formatFallback, false);
+
+  // 2. Empty device.features falls back depth32float-stencil8 -> depth24plus-stencil8
+  //    and rg11b10ufloat (render attachment) -> rgba16float.
+  const limitedDevice = createMockGpuDevice().device;
+  limitedDevice.features = new Set();
+
+  const d32Fallback = sanitizeRenderTargetDesc(
+    { width: 1280, height: 720, format: 'depth32float-stencil8' },
+    { device: limitedDevice }
+  );
+  assert.equal(d32Fallback.desc.format, 'depth24plus-stencil8');
+  assert.equal(d32Fallback.formatFallback, true);
+  assert.equal(d32Fallback.requestedFormat, 'depth32float-stencil8');
+  assert.equal(d32Fallback.fallbackReason, 'missing-depth32float-stencil8');
+
+  const rg11Fallback = sanitizeRenderTargetDesc(
+    {
+      width: 1280,
+      height: 720,
+      format: 'rg11b10ufloat',
+      usage: TEXTURE_USAGE.RENDER_ATTACHMENT | TEXTURE_USAGE.TEXTURE_BINDING,
+    },
+    { device: limitedDevice }
+  );
+  assert.equal(rg11Fallback.desc.format, 'rgba16float');
+  assert.equal(rg11Fallback.formatFallback, true);
+  assert.equal(rg11Fallback.fallbackReason, 'missing-rg11b10ufloat-renderable');
+
+  // Non-render-attachment rg11b10ufloat (sampling-only) does NOT need rg11b10ufloat-renderable!
+  const rg11SampleOnly = sanitizeRenderTargetDesc(
+    {
+      width: 256,
+      height: 256,
+      format: 'rg11b10ufloat',
+      usage: TEXTURE_USAGE.TEXTURE_BINDING | TEXTURE_USAGE.COPY_DST,
+    },
+    { device: limitedDevice }
+  );
+  assert.equal(rg11SampleOnly.desc.format, 'rg11b10ufloat');
+  assert.equal(rg11SampleOnly.formatFallback, false);
+
+  // 16-bit unorm falls back to float16 when texture-formats-tier1 is absent.
+  const norm16Fallback = resolveRenderTargetFormatForDevice('rgba16unorm', {
+    deviceFeatures: new Set(),
+  });
+  assert.equal(norm16Fallback.format, 'rgba16float');
+  assert.equal(norm16Fallback.formatFallback, true);
+
+  // 3. Pool tracks formatFallbackCount and live activeHdrCount / activeDepthCount accurately.
+  const poolLimited = new RenderTargetPool({ device: limitedDevice });
+  const rtDepth = poolLimited.acquire({ width: 512, height: 512, format: 'depth32float-stencil8' });
+  const rtHdr = poolLimited.acquire({ width: 512, height: 512, format: 'rg11b10ufloat' });
+  assert.equal(rtDepth.desc.format, 'depth24plus-stencil8');
+  assert.equal(rtHdr.desc.format, 'rgba16float');
+  assert.equal(rtDepth.byteSize, 512 * 512 * 4);
+  assert.equal(rtHdr.byteSize, 512 * 512 * 8);
+
+  let stats = poolLimited.getStats();
+  assert.equal(stats.formatFallbackCount, 2);
+  assert.equal(stats.activeHdrCount, 1);
+  assert.equal(stats.activeDepthCount, 1);
+  assert.equal(stats.hdrAcquires, 1);
+  assert.equal(stats.depthAcquires, 1);
+
+  // resetStats() zeroes cumulative counters while keeping live active HDR/depth counts intact.
+  const cleared = poolLimited.resetStats();
+  assert.equal(cleared.formatFallbackCount, 0);
+  assert.equal(cleared.hdrAcquires, 0);
+  assert.equal(cleared.depthAcquires, 0);
+  assert.equal(cleared.activeHdrCount, 1);
+  assert.equal(cleared.activeDepthCount, 1);
+
+  poolLimited.release(rtDepth);
+  poolLimited.release(rtHdr);
+  poolLimited.destroy();
+
+  // 4. Device WITH both features preserves exact requested formats with zero fallbacks.
+  const fullDevice = createMockGpuDevice().device;
+  fullDevice.features = new Set(['depth32float-stencil8', 'rg11b10ufloat-renderable']);
+  const poolFull = new RenderTargetPool({ device: fullDevice });
+  const rtD32 = poolFull.acquire({ width: 512, height: 512, format: 'depth32float-stencil8' });
+  const rtRg11 = poolFull.acquire({ width: 512, height: 512, format: 'rg11b10ufloat' });
+  assert.equal(rtD32.desc.format, 'depth32float-stencil8');
+  assert.equal(rtRg11.desc.format, 'rg11b10ufloat');
+  assert.equal(poolFull.getStats().formatFallbackCount, 0);
+  poolFull.release(rtD32);
+  poolFull.release(rtRg11);
+  poolFull.destroy();
+});
+
+test('W380 supports sibling viewFormats helpers, depth/stencil aspect views, and 3D/cube/2d-array slice view caching without duplicates', () => {
+  assert.equal(getCompatibleSrgbSiblingFormat('rgba8unorm'), 'rgba8unorm-srgb');
+  assert.equal(getCompatibleSrgbSiblingFormat('rgba8unorm-srgb'), 'rgba8unorm');
+  assert.equal(getCompatibleSrgbSiblingFormat('bgra8unorm'), 'bgra8unorm-srgb');
+  assert.equal(getCompatibleSrgbSiblingFormat('bgra8unorm-srgb'), 'bgra8unorm');
+  assert.equal(getCompatibleSrgbSiblingFormat('rgba16float'), null);
+
+  const withSibling = withSrgbSiblingViewFormat({ width: 512, height: 512, format: 'bgra8unorm' });
+  assert.deepEqual(withSibling.viewFormats, ['bgra8unorm-srgb']);
+  assert.equal(
+    makeRenderTargetKey({ width: 512, height: 512, format: 'rgba8unorm', includeSrgbSibling: true }),
+    makeRenderTargetKey({
+      width: 512,
+      height: 512,
+      format: 'rgba8unorm',
+      viewFormats: ['rgba8unorm-srgb'],
+    })
+  );
+
+  const { device } = createMockGpuDevice();
+  const pool = new RenderTargetPool({ device, autoIncludeSrgbSibling: true });
+
+  // 1. Auto-included sRGB sibling viewFormats + cached getSrgbView().
+  const colorRt = pool.acquire({ width: 512, height: 512, format: 'rgba8unorm' }, 'albedo');
+  assert.deepEqual(colorRt.desc.viewFormats, ['rgba8unorm-srgb']);
+  const srgbView1 = colorRt.getSrgbView();
+  const srgbView2 = colorRt.getView({ format: 'rgba8unorm-srgb' });
+  assert.strictEqual(srgbView1, srgbView2);
+  assert.equal(colorRt.texture.viewCreateCount, 2); // default + sRGB view only
+
+  // 2. Depth/stencil aspect views (depth-only & stencil-only) cached with zero duplicates.
+  const dsRt = pool.acquire(
+    { width: 512, height: 512, format: 'depth24plus-stencil8' },
+    'scene-depth-stencil'
+  );
+  const depthOnly1 = dsRt.getDepthView();
+  const depthOnly2 = dsRt.getView({ aspect: 'depth-only' });
+  const stencilOnly1 = dsRt.getStencilView();
+  const stencilOnly2 = dsRt.getView({ aspect: 'stencil-only' });
+  assert.strictEqual(depthOnly1, depthOnly2);
+  assert.strictEqual(stencilOnly1, stencilOnly2);
+  assert.notStrictEqual(depthOnly1, stencilOnly1);
+  assert.equal(depthOnly1.viewDesc.aspect, 'depth-only');
+  assert.equal(stencilOnly1.viewDesc.aspect, 'stencil-only');
+  assert.equal(dsRt.texture.viewCreateCount, 3); // default + depth-only + stencil-only
+
+  // 3. Cube texture (6 layers) & per-face 2D slice views cached without duplicate GPU views.
+  const cubeRt = pool.acquire(
+    {
+      width: 256,
+      height: 256,
+      depthOrArrayLayers: 6,
+      mipLevelCount: 3,
+      format: 'rgba16float',
+    },
+    'env-cubemap'
+  );
+  const cubeViewA = cubeRt.getView({ dimension: 'cube' });
+  const cubeViewB = cubeRt.getView({
+    dimension: 'cube',
+    baseArrayLayer: 0,
+    arrayLayerCount: 6,
+    baseMipLevel: 0,
+    mipLevelCount: 3,
+  });
+  assert.strictEqual(cubeViewA, cubeViewB, 'equivalent full-range cube views must hit cache');
+  const face2Mip1A = cubeRt.getSliceView(2, 1, '2d');
+  const face2Mip1B = cubeRt.getView({
+    dimension: '2d',
+    baseArrayLayer: 2,
+    arrayLayerCount: 1,
+    baseMipLevel: 1,
+    mipLevelCount: 1,
+  });
+  assert.strictEqual(face2Mip1A, face2Mip1B);
+  assert.equal(cubeRt.texture.viewCreateCount, 3); // default + cube + face2Mip1
+
+  // 4. 2D-array shadow cascade views & 3D volume mip views cached without duplicates.
+  const shadowCascades = pool.acquire(
+    { width: 1024, height: 1024, depthOrArrayLayers: 4, format: 'depth32float' },
+    'csm-array'
+  );
+  const cascade0 = shadowCascades.getSliceView(0, 0, '2d');
+  const cascade3 = shadowCascades.getSliceView(3, 0, '2d');
+  assert.strictEqual(shadowCascades.getSliceView(0, 0, '2d'), cascade0);
+  assert.notStrictEqual(cascade0, cascade3);
+  assert.equal(shadowCascades.texture.viewCreateCount, 3); // default + cascade0 + cascade3
+
+  const volumeRt = pool.acquire(
+    {
+      width: 32,
+      height: 32,
+      depthOrArrayLayers: 16,
+      dimension: '3d',
+      mipLevelCount: 3,
+      format: 'rgba16float',
+    },
+    'volumetric-fog'
+  );
+  // Requesting default 3D view returns cached default view with 0 extra createView calls.
+  assert.strictEqual(volumeRt.getView({ dimension: '3d' }), volumeRt.view);
+  const volMip1 = volumeRt.getSliceView(0, 1, '3d');
+  assert.strictEqual(volumeRt.getView({ baseMipLevel: 1, mipLevelCount: 1 }), volMip1);
+  assert.equal(volumeRt.texture.viewCreateCount, 2); // default + mip1
+
+  pool.release(colorRt);
+  pool.release(dsRt);
+  pool.release(cubeRt);
+  pool.release(shadowCascades);
+  pool.release(volumeRt);
+  pool.destroy();
 });

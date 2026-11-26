@@ -16,6 +16,8 @@
   const CHROMIUM_UNORM16_FEATURE = 'chromium-experimental-unorm16-texture-formats';
   const DEPTH32FLOAT_STENCIL8_FEATURE = 'depth32float-stencil8';
   const BGRA8UNORM_STORAGE_FEATURE = 'bgra8unorm-storage';
+  const RG11B10UFLOAT_RENDERABLE_FEATURE = 'rg11b10ufloat-renderable';
+  const FLOAT32_FILTERABLE_FEATURE = 'float32-filterable';
 
   const SRGB_SIBLING_FORMATS = Object.freeze({
     rgba8unorm: 'rgba8unorm-srgb',
@@ -100,6 +102,114 @@
   const BC_FORMAT_PATTERN = /^bc[1-7]/;
   const COMPRESSED_FORMAT_PATTERN = /^(bc[1-7]|etc2-|eac-|astc-)/;
 
+  const CORE_RENDERABLE_FORMATS = new Set([
+    'r8unorm',
+    'r8uint',
+    'r8sint',
+    'r16uint',
+    'r16sint',
+    'r16float',
+    'rg8unorm',
+    'rg8uint',
+    'rg8sint',
+    'r32uint',
+    'r32sint',
+    'r32float',
+    'rg16uint',
+    'rg16sint',
+    'rg16float',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'rgba8uint',
+    'rgba8sint',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgb10a2uint',
+    'rgb10a2unorm',
+    'rg32uint',
+    'rg32sint',
+    'rg32float',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+    'stencil8',
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+  ]);
+
+  const CORE_MULTISAMPLEABLE_FORMATS = new Set([
+    'r8unorm',
+    'r8uint',
+    'r8sint',
+    'r16uint',
+    'r16sint',
+    'r16float',
+    'rg8unorm',
+    'rg8uint',
+    'rg8sint',
+    'rg16uint',
+    'rg16sint',
+    'rg16float',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'rgba8uint',
+    'rgba8sint',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgb10a2uint',
+    'rgb10a2unorm',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'stencil8',
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+  ]);
+
+  const FLOAT32_FORMATS = new Set(['r32float', 'rg32float', 'rgba32float']);
+
+  function inferChannelsAndComponentType(webgpuFormat, isDepth, hasStencil) {
+    if (webgpuFormat === 'stencil8') {
+      return { channels: 1, componentType: 'stencil' };
+    }
+    if (isDepth) {
+      return {
+        channels: hasStencil ? 2 : 1,
+        componentType: hasStencil ? 'depth-stencil' : 'depth',
+      };
+    }
+    let channels = 4;
+    if (/^(r8|r16|r32|bc4-r-)/.test(webgpuFormat)) {
+      channels = 1;
+    } else if (/^(rg8|rg16|rg32|bc5-rg-)/.test(webgpuFormat)) {
+      channels = 2;
+    } else if (/^(rgb9|rg11b10|bc6h-rgb-)/.test(webgpuFormat)) {
+      channels = 3;
+    }
+    let componentType = 'unorm';
+    if (webgpuFormat.includes('ufloat')) {
+      componentType = 'ufloat';
+    } else if (webgpuFormat.includes('float')) {
+      componentType = 'float';
+    } else if (webgpuFormat.includes('snorm')) {
+      componentType = 'snorm';
+    } else if (webgpuFormat.includes('uint')) {
+      componentType = 'uint';
+    } else if (webgpuFormat.includes('sint')) {
+      componentType = 'sint';
+    }
+    return { channels, componentType };
+  }
+
   function makeWebGpuInfo(
     webgpuFormat,
     blockWidth,
@@ -109,6 +219,7 @@
   ) {
     const isDepth = Boolean(options.isDepth);
     const hasStencil = Boolean(options.hasStencil);
+    const isCompressed = Boolean(options.isCompressed);
     const aspect =
       options.aspect ||
       (hasStencil && !isDepth
@@ -116,17 +227,58 @@
         : isDepth && !hasStencil
           ? 'depth-only'
           : 'all');
+    const inferred = inferChannelsAndComponentType(webgpuFormat, isDepth, hasStencil);
+    const channels = options.channels !== undefined ? options.channels : inferred.channels;
+    const componentType =
+      options.componentType !== undefined ? options.componentType : inferred.componentType;
+    const renderable =
+      options.renderable !== undefined
+        ? Boolean(options.renderable)
+        : CORE_RENDERABLE_FORMATS.has(webgpuFormat);
+    const filterable =
+      options.filterable !== undefined
+        ? Boolean(options.filterable)
+        : !isDepth &&
+          !hasStencil &&
+          componentType !== 'uint' &&
+          componentType !== 'sint' &&
+          !FLOAT32_FORMATS.has(webgpuFormat);
+    const multisampleable =
+      options.multisampleable !== undefined
+        ? Boolean(options.multisampleable)
+        : CORE_MULTISAMPLEABLE_FORMATS.has(webgpuFormat);
+    const storageCompatible =
+      options.storageCompatible !== undefined
+        ? Boolean(options.storageCompatible)
+        : CORE_STORAGE_TEXTURE_FORMATS.has(webgpuFormat);
+    const supportsBcSliced3d = isCompressed && BC_FORMAT_PATTERN.test(webgpuFormat);
+    const supports3d = !isDepth && !hasStencil && !isCompressed;
+    const supportsCube = true;
+    const supports2dArray = true;
+    const isRenderTarget = renderable || webgpuFormat === 'rg11b10ufloat' || NORM16_TEXTURE_FORMATS.has(webgpuFormat);
+
     return Object.freeze({
       webgpuFormat,
       blockWidth,
       blockHeight,
       bytesPerBlock,
+      channels,
+      componentType,
       aspect,
-      isCompressed: Boolean(options.isCompressed),
+      isCompressed,
       isDepth,
       hasStencil,
       isSrgb: Boolean(options.isSrgb),
       isHdr: Boolean(options.isHdr),
+      renderable,
+      isRenderTarget,
+      filterable,
+      multisampleable,
+      storageCompatible,
+      supports3d,
+      supportsCube,
+      supports2dArray,
+      supportsBcSliced3d,
       requiresFeature: options.requiresFeature || null,
     });
   }
@@ -1678,6 +1830,394 @@
   }
 
   /**
+   * Describe full WebGPU 3D/cube/2d-array/render/filter/MSAA/storage capabilities for
+   * a texture format (accepting WebGPU format name, DXGI numeric code/name, or format
+   * descriptor), taking optional `deviceFeatures` into account.
+   *
+   * @param {string | number | object} formatOrInfo
+   * @param {{
+   *   deviceFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   supportedFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   dimension?: '1d' | '2d' | '3d',
+   * }} [options]
+   */
+  function describeTextureFormatCapabilities(formatOrInfo, options = {}) {
+    const rawInfo = getWebGpuFormatInfo(formatOrInfo);
+    if (!rawInfo) {
+      return null;
+    }
+    const fmt = rawInfo.webgpuFormat;
+    const info = Object.prototype.hasOwnProperty.call(WEBGPU_FORMAT_INFO, fmt)
+      ? WEBGPU_FORMAT_INFO[fmt]
+      : null;
+    if (!info) {
+      return null;
+    }
+
+    const opts = options && typeof options === 'object' ? options : {};
+    const deviceFeatures = extractDeviceFeatures(opts);
+    const dimension = typeof opts.dimension === 'string' ? opts.dimension.trim().toLowerCase() : '2d';
+
+    const support = classifyTextureFormatSupport(fmt, { dimension, deviceFeatures });
+    const storageRes = resolveStorageCompatibleFormat(fmt, { deviceFeatures });
+    const hasNorm16 =
+      hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE) ||
+      hasSupportedFeature(deviceFeatures, CHROMIUM_UNORM16_FEATURE);
+    const hasTier1 = hasSupportedFeature(deviceFeatures, TEXTURE_FORMATS_TIER1_FEATURE);
+    const hasRg11Renderable = hasSupportedFeature(deviceFeatures, RG11B10UFLOAT_RENDERABLE_FEATURE);
+    const hasFloat32Filterable = hasSupportedFeature(deviceFeatures, FLOAT32_FILTERABLE_FEATURE);
+    const hasBcSliced3d = hasSupportedFeature(
+      deviceFeatures,
+      TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE
+    );
+
+    const renderable =
+      fmt === 'rg11b10ufloat'
+        ? hasRg11Renderable
+        : NORM16_TEXTURE_FORMATS.has(fmt)
+          ? hasNorm16
+          : fmt === 'depth32float-stencil8'
+            ? support.supported
+            : info.renderable;
+
+    const filterable = FLOAT32_FORMATS.has(fmt)
+      ? hasFloat32Filterable
+      : info.filterable;
+
+    const multisampleable =
+      fmt === 'rg11b10ufloat'
+        ? hasRg11Renderable
+        : NORM16_TEXTURE_FORMATS.has(fmt)
+          ? hasTier1
+          : fmt === 'depth32float-stencil8'
+            ? support.supported
+            : info.multisampleable;
+
+    const supports3d = info.supportsBcSliced3d ? hasBcSliced3d : info.supports3d;
+
+    return Object.freeze({
+      webgpuFormat: info.webgpuFormat,
+      channels: info.channels,
+      componentType: info.componentType,
+      blockWidth: info.blockWidth,
+      blockHeight: info.blockHeight,
+      bytesPerBlock: info.bytesPerBlock,
+      aspect: info.aspect,
+      isCompressed: info.isCompressed,
+      isDepth: info.isDepth,
+      hasStencil: info.hasStencil,
+      isSrgb: info.isSrgb,
+      isHdr: info.isHdr,
+      renderable,
+      isRenderTarget: renderable,
+      filterable,
+      multisampleable,
+      storageCompatible: storageRes.supportsStorageBinding && !storageRes.needsLinearSiblingView,
+      supportsStorageLinearSibling: storageRes.needsLinearSiblingView,
+      supports3d,
+      supportsCube: info.supportsCube,
+      supports2dArray: info.supports2dArray,
+      supportsBcSliced3d: info.supportsBcSliced3d,
+      requiresFeature: support.requiredFeature || info.requiresFeature,
+      supported: support.supported,
+    });
+  }
+
+  /**
+   * Validate WebGPU texture dimension (`'1d'`, `'2d'`, `'3d'`), optional view dimension
+   * (`'1d'`, `'2d'`, `'2d-array'`, `'cube'`, `'cube-array'`, `'3d'`), extent, MSAA, and
+   * format compatibility against optional device features.
+   *
+   * Enforces:
+   * - Depth/stencil formats disallowed on `'3d'` and `'1d'` textures.
+   * - BC compressed formats disallowed on `'1d'`, require `'texture-compression-bc'` on `'2d'`,
+   *   and require `'texture-compression-bc-sliced-3d'` on `'3d'`.
+   * - `'cube'` requires `'2d'` backing, `width === height`, and `depthOrArrayLayers === 6`;
+   *   `'cube-array'` requires `width === height` and `depthOrArrayLayers >= 6` (multiple of 6).
+   * - Optional `sampleCount === 4` requires `'2d'`, `depthOrArrayLayers === 1`,
+   *   `mipLevelCount === 1`, and a multisampleable format.
+   *
+   * @param {{
+   *   format: string | number | object,
+   *   dimension?: '1d' | '2d' | '3d' | 'cube' | 'cube-array' | '2d-array',
+   *   viewDimension?: '1d' | '2d' | '2d-array' | 'cube' | 'cube-array' | '3d',
+   *   width?: number,
+   *   height?: number,
+   *   depthOrArrayLayers?: number,
+   *   mipLevelCount?: number,
+   *   sampleCount?: number,
+   * }} desc
+   * @param {{
+   *   deviceFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   supportedFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   * }} [options]
+   */
+  function validateTextureDimensionAndFormat(desc, options = {}) {
+    if (!desc || typeof desc !== 'object') {
+      return {
+        valid: false,
+        reason: 'invalid-descriptor',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: null,
+        dimension: '2d',
+        viewDimension: '2d',
+      };
+    }
+
+    const rawInfo = getWebGpuFormatInfo(desc.format);
+    if (!rawInfo) {
+      return {
+        valid: false,
+        reason: 'invalid-format',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: null,
+        dimension: '2d',
+        viewDimension: '2d',
+      };
+    }
+
+    const fmt = rawInfo.webgpuFormat;
+    const info = WEBGPU_FORMAT_INFO[fmt] || rawInfo;
+    const deviceFeatures = extractDeviceFeatures(options);
+
+    const rawDim =
+      typeof desc.dimension === 'string' && desc.dimension.trim().length > 0
+        ? desc.dimension.trim().toLowerCase()
+        : '2d';
+    let textureDimension = rawDim;
+    let viewDimension =
+      typeof desc.viewDimension === 'string' && desc.viewDimension.trim().length > 0
+        ? desc.viewDimension.trim().toLowerCase()
+        : rawDim;
+
+    if (rawDim === 'cube' || rawDim === 'cube-array' || rawDim === '2d-array') {
+      textureDimension = '2d';
+    }
+
+    if (textureDimension !== '1d' && textureDimension !== '2d' && textureDimension !== '3d') {
+      return {
+        valid: false,
+        reason: 'invalid-dimension',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+
+    if (
+      viewDimension !== '1d' &&
+      viewDimension !== '2d' &&
+      viewDimension !== '2d-array' &&
+      viewDimension !== 'cube' &&
+      viewDimension !== 'cube-array' &&
+      viewDimension !== '3d'
+    ) {
+      return {
+        valid: false,
+        reason: 'invalid-view-dimension',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+
+    // View dimension must match backing texture dimension family.
+    if (
+      (textureDimension === '1d' && viewDimension !== '1d') ||
+      (textureDimension === '3d' && viewDimension !== '3d') ||
+      (textureDimension === '2d' && (viewDimension === '1d' || viewDimension === '3d'))
+    ) {
+      return {
+        valid: false,
+        reason: 'incompatible-view-dimension',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+
+    // Depth/stencil formats are only valid on 2D textures (never 1D or 3D).
+    if (info.isDepth || info.hasStencil) {
+      if (textureDimension === '3d') {
+        return {
+          valid: false,
+          reason: 'depth-stencil-unsupported-on-3d',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+      if (textureDimension === '1d') {
+        return {
+          valid: false,
+          reason: 'depth-stencil-unsupported-on-1d',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+    }
+
+    // Block-compressed formats are disallowed on 1D textures; 2D requires BC, 3D requires BC-sliced-3D.
+    if (info.isCompressed) {
+      if (textureDimension === '1d') {
+        return {
+          valid: false,
+          reason: 'compressed-unsupported-on-1d',
+          requiredFeature: null,
+          fallbackFormat: info.isSrgb ? 'rgba8unorm-srgb' : 'rgba8unorm',
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+    }
+
+    const support = classifyTextureFormatSupport(fmt, {
+      dimension: textureDimension,
+      deviceFeatures,
+    });
+    if (!support.supported) {
+      return {
+        valid: false,
+        reason: support.reason,
+        requiredFeature: support.requiredFeature,
+        fallbackFormat: support.fallbackFormat,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+
+    const width = desc.width;
+    const height = desc.height;
+    const depthOrArrayLayers =
+      desc.depthOrArrayLayers !== undefined
+        ? desc.depthOrArrayLayers
+        : desc.depthOrLayers !== undefined
+          ? desc.depthOrLayers
+          : viewDimension === 'cube' || viewDimension === 'cube-array'
+            ? 6
+            : 1;
+
+    if (width !== undefined && (!Number.isInteger(width) || width < 1)) {
+      return {
+        valid: false,
+        reason: 'invalid-width',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+    if (height !== undefined && (!Number.isInteger(height) || height < 1)) {
+      return {
+        valid: false,
+        reason: 'invalid-height',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+    if (!Number.isInteger(depthOrArrayLayers) || depthOrArrayLayers < 1) {
+      return {
+        valid: false,
+        reason: 'invalid-depth-or-array-layers',
+        requiredFeature: null,
+        fallbackFormat: null,
+        normalizedFormat: fmt,
+        dimension: textureDimension,
+        viewDimension,
+      };
+    }
+
+    if (viewDimension === 'cube' || viewDimension === 'cube-array') {
+      if (width !== undefined && height !== undefined && width !== height) {
+        return {
+          valid: false,
+          reason: 'cube-requires-square-dimensions',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+      if (viewDimension === 'cube' && depthOrArrayLayers !== 6) {
+        return {
+          valid: false,
+          reason: 'cube-requires-6-layers',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+      if (viewDimension === 'cube-array' && (depthOrArrayLayers < 6 || depthOrArrayLayers % 6 !== 0)) {
+        return {
+          valid: false,
+          reason: 'cube-array-requires-multiple-of-6-layers',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+    }
+
+    const sampleCount = desc.sampleCount === undefined ? 1 : desc.sampleCount;
+    if (sampleCount !== 1) {
+      const caps = describeTextureFormatCapabilities(fmt, { deviceFeatures, dimension: textureDimension });
+      const mipLevelCount = desc.mipLevelCount === undefined ? 1 : desc.mipLevelCount;
+      if (
+        sampleCount !== 4 ||
+        textureDimension !== '2d' ||
+        depthOrArrayLayers !== 1 ||
+        mipLevelCount > 1 ||
+        !caps ||
+        !caps.multisampleable
+      ) {
+        return {
+          valid: false,
+          reason: 'multisample-unsupported',
+          requiredFeature: null,
+          fallbackFormat: null,
+          normalizedFormat: fmt,
+          dimension: textureDimension,
+          viewDimension,
+        };
+      }
+    }
+
+    return {
+      valid: true,
+      reason: null,
+      requiredFeature: support.requiredFeature,
+      fallbackFormat: null,
+      normalizedFormat: fmt,
+      dimension: textureDimension,
+      viewDimension,
+    };
+  }
+
+  /**
    * Compute mip-level dimensions clamped down to 1x1.
    * By default `depthOrLayers` is treated as array layers (unchanged across mips);
    * pass `is3D = true` for 3D volume textures whose depth halves per mip level.
@@ -2119,6 +2659,334 @@
 
     const bytesPerRow = alignBytesPerRowValue(unalignedBytesPerRow, align);
     return bytesPerRow * blocksY * layers;
+  }
+
+  /**
+   * Compute full 3D / cube / cube-array / 2D-array / 1D subresource layout for a given
+   * mip level, halving depth ONLY for `'3d'` textures while keeping array layers / cube
+   * faces constant across mips. Supports zero-alloc reusable `out` object.
+   *
+   * Accepts either:
+   * - `calcSubresourceLayout(format, { width, height, depthOrArrayLayers, mipLevel, dimension, alignBytesPerRow }, out)`
+   * - `calcSubresourceLayout(format, width, height, depthOrLayers, mipLevel, is3D, alignBytesPerRow, out)`
+   *
+   * @param {number | string | object} dxgiOrWebGpuFormat
+   */
+  function calcSubresourceLayout(
+    dxgiOrWebGpuFormat,
+    descOrWidth,
+    heightArg,
+    depthOrLayersArg,
+    mipLevelArg,
+    is3DArg,
+    alignArg,
+    outArg
+  ) {
+    let baseWidth;
+    let baseHeight;
+    let baseDepth;
+    let mipLevel;
+    let dimension;
+    let is3D;
+    let alignBytesPerRow;
+    let target;
+
+    if (descOrWidth && typeof descOrWidth === 'object') {
+      baseWidth = descOrWidth.width;
+      baseHeight = descOrWidth.height !== undefined ? descOrWidth.height : 1;
+      dimension =
+        typeof descOrWidth.dimension === 'string' && descOrWidth.dimension.trim().length > 0
+          ? descOrWidth.dimension.trim().toLowerCase()
+          : '2d';
+      is3D = dimension === '3d';
+      const defaultDepth = dimension === 'cube' || dimension === 'cube-array' ? 6 : 1;
+      baseDepth =
+        descOrWidth.depthOrArrayLayers !== undefined
+          ? descOrWidth.depthOrArrayLayers
+          : descOrWidth.depthOrLayers !== undefined
+            ? descOrWidth.depthOrLayers
+            : defaultDepth;
+      mipLevel = descOrWidth.mipLevel !== undefined ? descOrWidth.mipLevel : 0;
+      alignBytesPerRow =
+        descOrWidth.alignBytesPerRow !== undefined
+          ? descOrWidth.alignBytesPerRow
+          : WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+      target = heightArg && typeof heightArg === 'object' ? heightArg : null;
+    } else {
+      baseWidth = descOrWidth;
+      baseHeight = heightArg !== undefined ? heightArg : 1;
+      baseDepth = depthOrLayersArg !== undefined ? depthOrLayersArg : 1;
+      mipLevel = mipLevelArg !== undefined ? mipLevelArg : 0;
+      is3D = Boolean(is3DArg);
+      dimension = is3D ? '3d' : baseDepth > 1 ? '2d-array' : '2d';
+      alignBytesPerRow =
+        alignArg !== undefined ? alignArg : WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+      target = outArg && typeof outArg === 'object' ? outArg : null;
+    }
+
+    const info = getWebGpuFormatInfo(dxgiOrWebGpuFormat);
+    const mip = sanitizeMipLevel(mipLevel);
+    const validDims =
+      info &&
+      typeof baseWidth === 'number' &&
+      typeof baseHeight === 'number' &&
+      typeof baseDepth === 'number' &&
+      Number.isFinite(baseWidth) &&
+      Number.isFinite(baseHeight) &&
+      Number.isFinite(baseDepth) &&
+      Math.floor(baseWidth) >= 1 &&
+      Math.floor(baseHeight) >= 1 &&
+      Math.floor(baseDepth) >= 1;
+
+    if (!validDims) {
+      const dst = target || {};
+      dst.width = 0;
+      dst.height = 0;
+      dst.depthOrArrayLayers = 0;
+      dst.mipLevel = mip;
+      dst.dimension = dimension;
+      dst.copyWidth = 0;
+      dst.copyHeight = 0;
+      dst.blocksX = 0;
+      dst.blocksY = 0;
+      dst.blockWidth = info ? info.blockWidth : 0;
+      dst.blockHeight = info ? info.blockHeight : 0;
+      dst.bytesPerBlock = info ? info.bytesPerBlock : 0;
+      dst.unalignedBytesPerRow = 0;
+      dst.bytesPerRow = 0;
+      dst.rowsPerImage = 0;
+      dst.sliceTightBytes = 0;
+      dst.sliceAlignedBytes = 0;
+      dst.tightBytes = 0;
+      dst.totalBytes = 0;
+      return dst;
+    }
+
+    const w0 = Math.floor(baseWidth);
+    const h0 = dimension === '1d' ? 1 : Math.floor(baseHeight);
+    const d0 = dimension === '1d' ? 1 : Math.floor(baseDepth);
+    const mipWidth = shrinkDimForMip(w0, mip);
+    const mipHeight = dimension === '1d' ? 1 : shrinkDimForMip(h0, mip);
+    const mipDepth = is3D ? shrinkDimForMip(d0, mip) : d0;
+
+    const blockWidth = info.blockWidth;
+    const blockHeight = info.blockHeight;
+    const bytesPerBlock = info.bytesPerBlock;
+
+    let blocksX;
+    let blocksY;
+    if (blockWidth === 1 && blockHeight === 1) {
+      blocksX = mipWidth;
+      blocksY = mipHeight;
+    } else if (
+      blockWidth === 4 &&
+      blockHeight === 4 &&
+      mipWidth <= 0x7ffffffc &&
+      mipHeight <= 0x7ffffffc
+    ) {
+      blocksX = (mipWidth + 3) >>> 2;
+      blocksY = (mipHeight + 3) >>> 2;
+    } else {
+      blocksX = Math.ceil(mipWidth / blockWidth);
+      blocksY = Math.ceil(mipHeight / blockHeight);
+    }
+
+    const align =
+      typeof alignBytesPerRow === 'number' &&
+      Number.isFinite(alignBytesPerRow) &&
+      alignBytesPerRow >= 1
+        ? Math.floor(alignBytesPerRow)
+        : WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+
+    const copyWidth = blocksX * blockWidth;
+    const copyHeight = blocksY * blockHeight;
+    const unalignedBytesPerRow = blocksX * bytesPerBlock;
+    const bytesPerRow = alignBytesPerRowValue(unalignedBytesPerRow, align);
+    const rowsPerImage = blocksY;
+    const sliceTightBytes = unalignedBytesPerRow * rowsPerImage;
+    const sliceAlignedBytes = bytesPerRow * rowsPerImage;
+    const tightBytes = sliceTightBytes * mipDepth;
+    const totalBytes = sliceAlignedBytes * mipDepth;
+
+    const dst = target || {};
+    dst.width = mipWidth;
+    dst.height = mipHeight;
+    dst.depthOrArrayLayers = mipDepth;
+    dst.mipLevel = mip;
+    dst.dimension = dimension;
+    dst.copyWidth = copyWidth;
+    dst.copyHeight = copyHeight;
+    dst.blocksX = blocksX;
+    dst.blocksY = blocksY;
+    dst.blockWidth = blockWidth;
+    dst.blockHeight = blockHeight;
+    dst.bytesPerBlock = bytesPerBlock;
+    dst.unalignedBytesPerRow = unalignedBytesPerRow;
+    dst.bytesPerRow = bytesPerRow;
+    dst.rowsPerImage = rowsPerImage;
+    dst.sliceTightBytes = sliceTightBytes;
+    dst.sliceAlignedBytes = sliceAlignedBytes;
+    dst.tightBytes = tightBytes;
+    dst.totalBytes = totalBytes;
+    return dst;
+  }
+
+  /**
+   * Zero-allocation total mip-chain byte-size calculator for 1D, 2D, 2D-array, cube,
+   * cube-array, and 3D textures (both uncompressed and BC1..BC7 block-compressed).
+   *
+   * Returns 0 on degenerate dimensions or unknown formats (never throws).
+   * Defaults to tightly-packed VRAM footprint (`aligned: false`); pass `{ aligned: true }`
+   * (or `{ alignBytesPerRow: 256 }`) for 256-byte row-aligned upload buffer sizing.
+   *
+   * @param {number | string | object} dxgiOrWebGpuFormat
+   * @param {number | {
+   *   width: number,
+   *   height?: number,
+   *   depthOrArrayLayers?: number,
+   *   depthOrLayers?: number,
+   *   mipLevelCount?: number,
+   *   dimension?: '1d' | '2d' | '2d-array' | 'cube' | 'cube-array' | '3d',
+   *   sampleCount?: number,
+   *   aligned?: boolean,
+   *   alignBytesPerRow?: number,
+   * }} descOrWidth
+   * @returns {number}
+   */
+  function calcTextureMemoryBytes(
+    dxgiOrWebGpuFormat,
+    descOrWidth,
+    heightArg,
+    depthOrLayersArg,
+    mipLevelCountArg,
+    dimensionArg,
+    optionsArg
+  ) {
+    const info = getWebGpuFormatInfo(dxgiOrWebGpuFormat);
+    if (!info) {
+      return 0;
+    }
+
+    let width;
+    let height;
+    let depthOrLayers;
+    let mipLevelCount;
+    let dimension;
+    let sampleCount = 1;
+    let alignBytesPerRow = 1;
+
+    if (descOrWidth && typeof descOrWidth === 'object') {
+      width = descOrWidth.width;
+      dimension =
+        typeof descOrWidth.dimension === 'string' && descOrWidth.dimension.trim().length > 0
+          ? descOrWidth.dimension.trim().toLowerCase()
+          : '2d';
+      height = descOrWidth.height !== undefined ? descOrWidth.height : dimension === '1d' ? 1 : 0;
+      const defaultDepth = dimension === 'cube' || dimension === 'cube-array' ? 6 : 1;
+      depthOrLayers =
+        descOrWidth.depthOrArrayLayers !== undefined
+          ? descOrWidth.depthOrArrayLayers
+          : descOrWidth.depthOrLayers !== undefined
+            ? descOrWidth.depthOrLayers
+            : defaultDepth;
+      mipLevelCount = descOrWidth.mipLevelCount !== undefined ? descOrWidth.mipLevelCount : 1;
+      if (descOrWidth.sampleCount !== undefined) {
+        sampleCount = descOrWidth.sampleCount;
+      }
+      if (descOrWidth.alignBytesPerRow !== undefined) {
+        alignBytesPerRow = descOrWidth.alignBytesPerRow;
+      } else if (descOrWidth.aligned === true) {
+        alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+      }
+    } else {
+      width = descOrWidth;
+      dimension =
+        typeof dimensionArg === 'string' && dimensionArg.trim().length > 0
+          ? dimensionArg.trim().toLowerCase()
+          : '2d';
+      height = heightArg !== undefined ? heightArg : dimension === '1d' ? 1 : 0;
+      const defaultDepth = dimension === 'cube' || dimension === 'cube-array' ? 6 : 1;
+      depthOrLayers = depthOrLayersArg !== undefined ? depthOrLayersArg : defaultDepth;
+      mipLevelCount = mipLevelCountArg !== undefined ? mipLevelCountArg : 1;
+      if (optionsArg && typeof optionsArg === 'object') {
+        if (optionsArg.sampleCount !== undefined) {
+          sampleCount = optionsArg.sampleCount;
+        }
+        if (optionsArg.alignBytesPerRow !== undefined) {
+          alignBytesPerRow = optionsArg.alignBytesPerRow;
+        } else if (optionsArg.aligned === true) {
+          alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+        }
+      } else if (optionsArg === true) {
+        alignBytesPerRow = WEBGPU_BYTES_PER_ROW_ALIGNMENT;
+      }
+    }
+
+    if (
+      typeof width !== 'number' ||
+      typeof height !== 'number' ||
+      typeof depthOrLayers !== 'number' ||
+      typeof mipLevelCount !== 'number' ||
+      typeof sampleCount !== 'number' ||
+      !Number.isFinite(width) ||
+      !Number.isFinite(height) ||
+      !Number.isFinite(depthOrLayers) ||
+      !Number.isFinite(mipLevelCount) ||
+      !Number.isFinite(sampleCount)
+    ) {
+      return 0;
+    }
+
+    const w0 = Math.floor(width);
+    const h0 = dimension === '1d' ? 1 : Math.floor(height);
+    const d0 = dimension === '1d' ? 1 : Math.floor(depthOrLayers);
+    const mips = Math.floor(mipLevelCount);
+    const samples = Math.floor(sampleCount);
+    if (w0 < 1 || h0 < 1 || d0 < 1 || mips < 1 || samples < 1) {
+      return 0;
+    }
+
+    const is1D = dimension === '1d';
+    const is3D = dimension === '3d';
+    const maxExtent = is1D ? w0 : is3D ? Math.max(w0, h0, d0) : Math.max(w0, h0);
+    const maxValidMips = Math.floor(Math.log2(maxExtent)) + 1;
+    const clampedMips = mips > maxValidMips ? maxValidMips : mips;
+
+    const align =
+      typeof alignBytesPerRow === 'number' &&
+      Number.isFinite(alignBytesPerRow) &&
+      alignBytesPerRow >= 1
+        ? Math.floor(alignBytesPerRow)
+        : 1;
+
+    const blockWidth = info.blockWidth;
+    const blockHeight = info.blockHeight;
+    const bytesPerBlock = info.bytesPerBlock;
+
+    let total = 0;
+    for (let mip = 0; mip < clampedMips; mip += 1) {
+      const mw = shrinkDimForMip(w0, mip);
+      const mh = is1D ? 1 : shrinkDimForMip(h0, mip);
+      const md = is3D ? shrinkDimForMip(d0, mip) : d0;
+
+      let bx;
+      let by;
+      if (blockWidth === 1 && blockHeight === 1) {
+        bx = mw;
+        by = mh;
+      } else if (blockWidth === 4 && blockHeight === 4 && mw <= 0x7ffffffc && mh <= 0x7ffffffc) {
+        bx = (mw + 3) >>> 2;
+        by = (mh + 3) >>> 2;
+      } else {
+        bx = Math.ceil(mw / blockWidth);
+        by = Math.ceil(mh / blockHeight);
+      }
+
+      const rowBytes = alignBytesPerRowValue(bx * bytesPerBlock, align);
+      total += rowBytes * by * md * samples;
+    }
+
+    return total;
   }
 
   /**
@@ -2627,8 +3495,12 @@
     CHROMIUM_UNORM16_FEATURE,
     DEPTH32FLOAT_STENCIL8_FEATURE,
     BGRA8UNORM_STORAGE_FEATURE,
+    RG11B10UFLOAT_RENDERABLE_FEATURE,
+    FLOAT32_FILTERABLE_FEATURE,
     TextureScratchPool,
     getWebGpuFormatInfo,
+    describeTextureFormatCapabilities,
+    validateTextureDimensionAndFormat,
     lookupDxgiFormat,
     mapDxgiFormatToWebGpu,
     getSrgbSiblingFormat,
@@ -2640,6 +3512,8 @@
     calcMipUploadLayout,
     computeMipLayout,
     computeMipByteSize,
+    calcSubresourceLayout,
+    calcTextureMemoryBytes,
     padTextureRowsForWriteTexture,
     expandA8ToRgba8,
     expandA8ToRgba8Layout,

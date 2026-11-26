@@ -12,6 +12,7 @@ const {
   DEFAULT_FRAME_BUDGET_MS,
   DEFAULT_PASS_BUDGET_MS,
   DEFAULT_30FPS_BUDGET_MS,
+  PASS_KINDS,
   BUFFER_USAGE,
   MAP_MODE,
   computePercentiles,
@@ -1991,6 +1992,200 @@ test('W324: preserves W277 device-loss / mapAsync guards and clears histogram + 
   assert.equal(env.resolveCalls.length, resolveCountBeforeLoss);
   assert.equal(timer.getStats().droppedQueryFrames, 1);
   assert.equal(timer.getPassStats('after_loss'), null);
+
+  timer.destroy();
+});
+
+// ---------------------------------------------------------------------------
+// W380 (#1763): High-Pass-Count 3D Category Tracking, Zero-Alloc `out` Reuse,
+//               CPU Budget Overflow & Pending-Slot Device-Loss Hardening
+// ---------------------------------------------------------------------------
+
+test('W380 tracks render/compute pass categories and supports zero-alloc out object reuse on getFrameSummary(out), getStats(out), and getCategoryStats(out)', async () => {
+  assert.deepEqual(PASS_KINDS, ['unknown', 'render', 'compute']);
+
+  const env = createMockWebGpu({ supported: true });
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 16,
+    readbackSlots: 3,
+    historySize: 8,
+  });
+
+  // High-pass-count 3D frame: 2 compute passes + 5 render passes + 1 unlabeled pass = 8 passes.
+  const passes = [
+    ['compute_cull', 'compute', 1.0],
+    ['compute_mesh', 'compute', 1.5],
+    ['shadow_csm', 'render', 2.0],
+    ['gbuffer', 'render', 3.0],
+    ['lighting', 'render', 2.5],
+    ['post_fx', 'render', 1.0],
+    ['ui_blit', 'render', 0.5],
+    [undefined, undefined, 0.25], // unlabeled -> uses pre-allocated 'pass_7'
+  ];
+
+  const reusableSummary = {};
+  const reusableStats = {};
+  const reusableCategories = {};
+
+  for (let frame = 0; frame < 3; frame += 1) {
+    timer.beginFrame();
+    const timestamps = [];
+    let cursorNs = 10_000_000n;
+    for (const [label, kind, durMs] of passes) {
+      const ts = timer.beginPass(label, kind);
+      assert.ok(ts);
+      assert.equal(timer.endPass(), null);
+      timestamps.push(cursorNs);
+      cursorNs += BigInt(Math.round(durMs * 1_000_000));
+      timestamps.push(cursorNs);
+    }
+    env.setFrameTimestamps(timestamps);
+    assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+    const res = await timer.collectCompletedReadback();
+    assert.equal(res.passes.length, 8);
+    assert.equal(res.passes[7].name, 'pass_7');
+    assert.ok(Math.abs(res.totalGpuMs - 11.75) < 1e-9);
+
+    const summaryRef = timer.getFrameSummary(reusableSummary);
+    assert.strictEqual(summaryRef, reusableSummary);
+    assert.equal(summaryRef.mode, 'gpu');
+    assert.equal(summaryRef.supported, true);
+    assert.equal(summaryRef.deviceLost, false);
+    assert.equal(summaryRef.lastFramePassCount, 8);
+    assert.ok(Math.abs(summaryRef.lastFrameRenderMs - 9.0) < 1e-9);
+    assert.ok(Math.abs(summaryRef.lastFrameComputeMs - 2.5) < 1e-9);
+    assert.ok(Math.abs(summaryRef.lastFrameOtherMs - 0.25) < 1e-9);
+
+    const prevPassStatsObj = reusableStats.passStats;
+    const prevGbufSlot = prevPassStatsObj ? prevPassStatsObj.gbuffer : null;
+    const statsRef = timer.getStats(reusableStats);
+    assert.strictEqual(statsRef, reusableStats);
+    if (frame > 0) {
+      // Steady-state out reuse preserves exact nested passStats & per-pass object identities!
+      assert.strictEqual(statsRef.passStats, prevPassStatsObj);
+      assert.strictEqual(statsRef.passStats.gbuffer, prevGbufSlot);
+    }
+
+    const prevRenderObj = reusableCategories.render;
+    const catRef = timer.getCategoryStats(reusableCategories);
+    assert.strictEqual(catRef, reusableCategories);
+    if (frame > 0) {
+      assert.strictEqual(catRef.render, prevRenderObj);
+    }
+  }
+
+  assert.equal(timer.getPassKind('compute_cull'), 'compute');
+  assert.equal(timer.getPassKind('gbuffer'), 'render');
+  assert.equal(timer.getPassKind('pass_7'), 'unknown');
+  assert.equal(timer.getPassKind('nonexistent'), null);
+
+  assert.equal(reusableCategories.render.count, 15); // 5 render passes * 3 frames
+  assert.equal(reusableCategories.compute.count, 6); // 2 compute passes * 3 frames
+  assert.equal(reusableCategories.other.count, 3); // 1 unknown pass * 3 frames
+  assert.ok(Math.abs(reusableCategories.render.avgFrameMs - 9.0) < 1e-9);
+  assert.ok(Math.abs(reusableCategories.compute.avgFrameMs - 2.5) < 1e-9);
+
+  // reset() cleans up stale keys in reusable out.passStats cleanly.
+  timer.reset();
+  timer.getStats(reusableStats);
+  assert.deepEqual(reusableStats.passStats, {});
+  assert.equal(timer.getFrameSummary(reusableSummary).lastFrameRenderMs, 0);
+  assert.equal(timer.getFrameSummary(reusableSummary).lastFrameComputeMs, 0);
+
+  timer.destroy();
+});
+
+test('W380 CPU fallback mode tracks categories, enforces maxPassesPerFrame overflow cleanly, and supports zero-alloc getFrameSummary(out)', () => {
+  let clockMs = 0;
+  const timer = new GpuPassTimer({
+    device: null,
+    maxPassesPerFrame: 3,
+    historySize: 4,
+    now: () => clockMs,
+  });
+
+  timer.beginFrame();
+  timer.beginPass('cull', 'compute');
+  clockMs += 1.5;
+  assert.equal(timer.endPass(), 1.5);
+
+  timer.beginPass('shadow', 'render');
+  clockMs += 2.5;
+  assert.equal(timer.endPass(), 2.5);
+
+  timer.beginPass(undefined, 'render'); // uses pre-allocated 'pass_2'
+  clockMs += 1.0;
+  assert.equal(timer.endPass(), 1.0);
+
+  // 4th pass exceeds maxPassesPerFrame=3 -> dropped cleanly and increments droppedPasses!
+  assert.equal(timer.beginPass('overflow_pass', 'render'), undefined);
+  assert.equal(timer.endPass(), null);
+  assert.equal(timer.endFrame(), true);
+
+  const summary = timer.getFrameSummary({});
+  assert.equal(summary.mode, 'cpu');
+  assert.equal(summary.supported, false);
+  assert.equal(summary.droppedPasses, 1);
+  assert.equal(summary.lastFramePassCount, 3);
+  assert.equal(summary.lastFrameComputeMs, 1.5);
+  assert.equal(summary.lastFrameRenderMs, 3.5);
+  assert.equal(summary.lastFrameOtherMs, 0);
+  assert.equal(timer.getPassKind('cull'), 'compute');
+  assert.equal(timer.getPassKind('pass_2'), 'render');
+  assert.equal(timer.getPassKind('overflow_pass'), null);
+
+  timer.destroy();
+});
+
+test('W380 device.lost while readback buffers are pending and mapping drops safely with zero unhandled rejections or leaked slots', async () => {
+  let triggerLost;
+  const env = createMockWebGpu({ supported: true, deferMap: true });
+  env.device.lost = new Promise((resolve) => {
+    triggerLost = resolve;
+  });
+
+  const timer = new GpuPassTimer({
+    device: env.device,
+    maxPassesPerFrame: 4,
+    readbackSlots: 3,
+  });
+
+  // Queue 2 frames: start mapping Frame 1, leave Frame 2 pending in ring.
+  timer.beginFrame();
+  timer.beginPass('gbuffer', 'render');
+  timer.endPass();
+  env.setFrameTimestamps([0n, 3_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+
+  timer.beginFrame();
+  timer.beginPass('lighting', 'render');
+  timer.endPass();
+  env.setFrameTimestamps([0n, 4_000_000n]);
+  assert.equal(timer.resolveFrame(env.device.createCommandEncoder()), true);
+
+  // Start async mapping on slot 0 while slot 1 stays queued in pendingRing.
+  const inFlightMap = timer.collectCompletedReadback();
+  assert.equal(timer.getFrameSummary().pendingReadbacks, 1);
+
+  // Trigger device.lost while slot 0 is mapping and slot 1 is pending!
+  triggerLost({ reason: 'unknown', message: 'driver timeout' });
+  await env.device.lost;
+  await Promise.resolve();
+
+  // Queued pending slot 1 was flushed cleanly with zero leaked pending entries.
+  assert.equal(timer.isDeviceLost, true);
+  assert.equal(timer.getFrameSummary().deviceLost, true);
+  assert.equal(timer.getFrameSummary().pendingReadbacks, 0);
+  assert.equal(await timer.collectCompletedReadback(), null);
+
+  // Rejecting the in-flight mapAsync resolves cleanly to null with zero unhandled rejections.
+  env.pendingMaps.shift().reject(new DOMException('Device lost', 'AbortError'));
+  assert.equal(await inFlightMap, null);
+
+  // All readback slots returned to unmapped/idle state.
+  assert.equal(env.buffers[1].mapState, 'unmapped');
+  assert.equal(env.buffers[2].mapState, 'unmapped');
 
   timer.destroy();
 });

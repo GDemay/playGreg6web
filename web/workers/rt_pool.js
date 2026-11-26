@@ -116,6 +116,20 @@
     r32g32b32a32_float: 'rgba32float',
     r32g32b32a32_uint: 'rgba32uint',
     r32g32b32a32_sint: 'rgba32sint',
+
+    // Common shorthand 3D HDR / depth aliases
+    rgba16f: 'rgba16float',
+    rg16f: 'rg16float',
+    r16f: 'r16float',
+    rg11b10f: 'rg11b10ufloat',
+    rgb10a2: 'rgb10a2unorm',
+    r32f: 'r32float',
+    rg32f: 'rg32float',
+    rgba32f: 'rgba32float',
+    d32f: 'depth32float',
+    d32fs8: 'depth32float-stencil8',
+    d24s8: 'depth24plus-stencil8',
+    d16: 'depth16unorm',
   });
 
   /**
@@ -194,6 +208,52 @@
     bgra8unorm: Object.freeze(['bgra8unorm-srgb']),
     'bgra8unorm-srgb': Object.freeze(['bgra8unorm']),
   });
+
+  const REQUIRED_3D_RT_FORMATS = Object.freeze([
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+    'rgba16float',
+    'rg11b10ufloat',
+    'r16float',
+    'rgb10a2unorm',
+    'rgba8unorm-srgb',
+    'rgba8unorm',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rg16float',
+    'r32float',
+    'depth16unorm',
+  ]);
+
+  const HDR_RENDER_TARGET_FORMATS = new Set([
+    'rgba16float',
+    'rg11b10ufloat',
+    'r16float',
+    'rg16float',
+    'r32float',
+    'rg32float',
+    'rgba32float',
+    'rgb10a2unorm',
+    'rgb9e5ufloat',
+  ]);
+
+  const DEPTH_RENDER_TARGET_FORMATS = new Set([
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+    'stencil8',
+  ]);
+
+  const STENCIL_RENDER_TARGET_FORMATS = new Set([
+    'depth24plus-stencil8',
+    'depth32float-stencil8',
+    'stencil8',
+  ]);
+
+  const SRGB_RENDER_TARGET_FORMATS = new Set(['rgba8unorm-srgb', 'bgra8unorm-srgb']);
 
   const EMPTY_VIEW_FORMATS = Object.freeze([]);
 
@@ -332,6 +392,248 @@
    */
   function normalizeRenderTargetFormat(format) {
     return _normalizeFormatWithMeta(format).format;
+  }
+
+  function isHdrRenderTargetFormat(format) {
+    if (typeof format !== 'string' || format.trim().length === 0) {
+      return false;
+    }
+    return HDR_RENDER_TARGET_FORMATS.has(_normalizeFormatWithMeta(format).format);
+  }
+
+  function isDepthRenderTargetFormat(format) {
+    if (typeof format !== 'string' || format.trim().length === 0) {
+      return false;
+    }
+    return DEPTH_RENDER_TARGET_FORMATS.has(_normalizeFormatWithMeta(format).format);
+  }
+
+  function hasStencilComponent(format) {
+    if (typeof format !== 'string' || format.trim().length === 0) {
+      return false;
+    }
+    return STENCIL_RENDER_TARGET_FORMATS.has(_normalizeFormatWithMeta(format).format);
+  }
+
+  function getCompatibleSrgbSiblingFormat(format) {
+    if (typeof format !== 'string' || format.trim().length === 0) {
+      return null;
+    }
+    const canonical = _normalizeFormatWithMeta(format).format;
+    const compatible = COMPATIBLE_VIEW_FORMATS[canonical];
+    return Array.isArray(compatible) && compatible.length > 0 ? compatible[0] : null;
+  }
+
+  /**
+   * Return a copy of `desc` with its compatible sRGB/linear sibling format included in
+   * `viewFormats` (when `desc.format` has one, e.g. `rgba8unorm` <-> `rgba8unorm-srgb`
+   * or `bgra8unorm` <-> `bgra8unorm-srgb`).
+   *
+   * @param {object} desc
+   * @returns {object}
+   */
+  function withSrgbSiblingViewFormat(desc) {
+    if (!desc || typeof desc !== 'object') {
+      throw new TypeError('Render target descriptor must be an object');
+    }
+    const canonical = _normalizeFormatWithMeta(desc.format).format;
+    const sibling = getCompatibleSrgbSiblingFormat(canonical);
+    if (!sibling) {
+      return { ...desc };
+    }
+    const existing =
+      desc.viewFormats !== undefined && desc.viewFormats !== null
+        ? Array.from(desc.viewFormats)
+        : [];
+    if (!existing.includes(sibling)) {
+      existing.push(sibling);
+    }
+    return {
+      ...desc,
+      viewFormats: existing,
+    };
+  }
+
+  function _extractFeatureSource(options) {
+    if (!options || typeof options !== 'object') {
+      return null;
+    }
+    if (options.deviceFeatures !== undefined && options.deviceFeatures !== null) {
+      return options.deviceFeatures;
+    }
+    if (
+      options.device &&
+      typeof options.device === 'object' &&
+      options.device.features !== undefined &&
+      options.device.features !== null
+    ) {
+      return options.device.features;
+    }
+    return null;
+  }
+
+  function _hasDeviceFeature(features, featureName) {
+    if (!features || !featureName) {
+      return false;
+    }
+    if (typeof features.has === 'function') {
+      return Boolean(features.has(featureName));
+    }
+    if (Array.isArray(features)) {
+      return features.includes(featureName);
+    }
+    if (typeof features[Symbol.iterator] === 'function') {
+      for (const item of features) {
+        if (item === featureName) {
+          return true;
+        }
+      }
+      return false;
+    }
+    if (typeof features === 'object') {
+      return Boolean(features[featureName]);
+    }
+    return false;
+  }
+
+  /**
+   * Resolve a canonical WebGPU render-target format against optional device feature support,
+   * falling back safely when a device lacks an optional feature (e.g.
+   * `depth32float-stencil8` -> `depth24plus-stencil8`,
+   * `rg11b10ufloat` with `RENDER_ATTACHMENT` -> `rgba16float`,
+   * 16-bit unorm/snorm -> matching float16 format).
+   *
+   * When neither `options.device.features` nor `options.deviceFeatures` is supplied (as in
+   * headless mock devices without feature sets), preserves the requested canonical format
+   * unless `options.requireFeatureSupport === true`.
+   *
+   * @param {string} format
+   * @param {{
+   *   device?: object | null,
+   *   deviceFeatures?: Set<string> | string[] | Iterable<string> | Record<string, boolean> | null,
+   *   usage?: number,
+   *   requireFeatureSupport?: boolean,
+   * }} [options]
+   * @returns {{
+   *   format: string,
+   *   requestedFormat: string,
+   *   formatFallback: boolean,
+   *   fallbackReason: string | null,
+   *   requiredFeature: string | null,
+   * }}
+   */
+  function resolveRenderTargetFormatForDevice(format, options = {}) {
+    const requestedFormat = _normalizeFormatWithMeta(format).format;
+    const opts = options && typeof options === 'object' ? options : {};
+    const features = _extractFeatureSource(opts);
+    const enforce = features !== null || Boolean(opts.requireFeatureSupport);
+    const usage =
+      typeof opts.usage === 'number' && Number.isInteger(opts.usage) && opts.usage > 0
+        ? opts.usage
+        : DEFAULT_TEXTURE_USAGE;
+
+    if (!enforce) {
+      return {
+        format: requestedFormat,
+        requestedFormat,
+        formatFallback: false,
+        fallbackReason: null,
+        requiredFeature: null,
+      };
+    }
+
+    if (requestedFormat === 'depth32float-stencil8') {
+      if (!_hasDeviceFeature(features, 'depth32float-stencil8')) {
+        return {
+          format: 'depth24plus-stencil8',
+          requestedFormat,
+          formatFallback: true,
+          fallbackReason: 'missing-depth32float-stencil8',
+          requiredFeature: 'depth32float-stencil8',
+        };
+      }
+      return {
+        format: requestedFormat,
+        requestedFormat,
+        formatFallback: false,
+        fallbackReason: null,
+        requiredFeature: 'depth32float-stencil8',
+      };
+    }
+
+    if (requestedFormat === 'rg11b10ufloat') {
+      const wantsRenderAttachment = (usage & TEXTURE_USAGE.RENDER_ATTACHMENT) !== 0;
+      if (wantsRenderAttachment && !_hasDeviceFeature(features, 'rg11b10ufloat-renderable')) {
+        return {
+          format: 'rgba16float',
+          requestedFormat,
+          formatFallback: true,
+          fallbackReason: 'missing-rg11b10ufloat-renderable',
+          requiredFeature: 'rg11b10ufloat-renderable',
+        };
+      }
+      return {
+        format: requestedFormat,
+        requestedFormat,
+        formatFallback: false,
+        fallbackReason: null,
+        requiredFeature: wantsRenderAttachment ? 'rg11b10ufloat-renderable' : null,
+      };
+    }
+
+    if (requestedFormat === 'rgb9e5ufloat') {
+      if ((usage & TEXTURE_USAGE.RENDER_ATTACHMENT) !== 0) {
+        return {
+          format: 'rgba16float',
+          requestedFormat,
+          formatFallback: true,
+          fallbackReason: 'rgb9e5ufloat-not-renderable',
+          requiredFeature: null,
+        };
+      }
+    }
+
+    if (
+      requestedFormat === 'r16unorm' ||
+      requestedFormat === 'r16snorm' ||
+      requestedFormat === 'rg16unorm' ||
+      requestedFormat === 'rg16snorm' ||
+      requestedFormat === 'rgba16unorm' ||
+      requestedFormat === 'rgba16snorm'
+    ) {
+      const hasNorm16 =
+        _hasDeviceFeature(features, 'texture-formats-tier1') ||
+        _hasDeviceFeature(features, 'chromium-experimental-unorm16-texture-formats');
+      if (!hasNorm16) {
+        const fallback = requestedFormat.startsWith('rgba')
+          ? 'rgba16float'
+          : requestedFormat.startsWith('rg')
+            ? 'rg16float'
+            : 'r16float';
+        return {
+          format: fallback,
+          requestedFormat,
+          formatFallback: true,
+          fallbackReason: 'missing-unorm16',
+          requiredFeature: 'texture-formats-tier1',
+        };
+      }
+      return {
+        format: requestedFormat,
+        requestedFormat,
+        formatFallback: false,
+        fallbackReason: null,
+        requiredFeature: 'texture-formats-tier1',
+      };
+    }
+
+    return {
+      format: requestedFormat,
+      requestedFormat,
+      formatFallback: false,
+      fallbackReason: null,
+      requiredFeature: null,
+    };
   }
 
   /**
@@ -575,15 +877,41 @@
     const dimensionClamped =
       widthResult.clamped || heightResult.clamped || depthResult.clamped;
 
-    const formatResult = _normalizeFormatWithMeta(desc.format);
-    const viewFormatsResult = _normalizeViewFormatsWithMeta(
-      desc.viewFormats,
-      formatResult.format,
-      { filterIncompatible: true }
-    );
-
     const usage = desc.usage === undefined ? DEFAULT_TEXTURE_USAGE : desc.usage;
     assertPositiveInteger(usage, 'usage');
+
+    const formatResult = _normalizeFormatWithMeta(desc.format);
+    const deviceFormatResult = resolveRenderTargetFormatForDevice(formatResult.format, {
+      device: options.device,
+      deviceFeatures: options.deviceFeatures,
+      usage,
+      requireFeatureSupport: options.requireFeatureSupport,
+    });
+    const resolvedFormat = deviceFormatResult.format;
+
+    let rawViewFormats = desc.viewFormats;
+    const includeSrgbSibling = Boolean(desc.includeSrgbSibling || options.includeSrgbSibling);
+    if (includeSrgbSibling) {
+      const sibling = getCompatibleSrgbSiblingFormat(resolvedFormat);
+      if (sibling) {
+        if (rawViewFormats === undefined || rawViewFormats === null) {
+          rawViewFormats = [sibling];
+        } else if (
+          typeof rawViewFormats !== 'string' &&
+          typeof rawViewFormats[Symbol.iterator] === 'function'
+        ) {
+          const list = Array.from(rawViewFormats);
+          if (!list.includes(sibling)) {
+            list.push(sibling);
+          }
+          rawViewFormats = list;
+        }
+      }
+    }
+
+    const viewFormatsResult = _normalizeViewFormatsWithMeta(rawViewFormats, resolvedFormat, {
+      filterIncompatible: true,
+    });
 
     const maxExtent =
       dimension === '1d'
@@ -617,7 +945,7 @@
       desc: Object.freeze({
         width: widthResult.value,
         height: heightResult.value,
-        format: formatResult.format,
+        format: resolvedFormat,
         usage,
         sampleCount: sampleResult.sampleCount,
         mipLevelCount,
@@ -626,7 +954,13 @@
         viewFormats: viewFormatsResult.viewFormats,
       }),
       dimensionClamped,
-      formatNormalized: formatResult.normalized || viewFormatsResult.formatNormalized,
+      formatNormalized:
+        formatResult.normalized ||
+        viewFormatsResult.formatNormalized ||
+        deviceFormatResult.formatFallback,
+      formatFallback: deviceFormatResult.formatFallback,
+      requestedFormat: deviceFormatResult.requestedFormat,
+      fallbackReason: deviceFormatResult.fallbackReason,
       sampleCountNormalized: sampleResult.normalized,
       viewFormatsNormalized: viewFormatsResult.viewFormatsNormalized,
     };
@@ -687,7 +1021,25 @@
     assertPositiveInteger(depthOrArrayLayers, 'depthOrArrayLayers');
 
     const format = _normalizeFormatWithMeta(desc.format).format;
-    const viewFormats = _normalizeViewFormatsWithMeta(desc.viewFormats, format, {
+    let rawViewFormats = desc.viewFormats;
+    if (desc.includeSrgbSibling === true) {
+      const sibling = getCompatibleSrgbSiblingFormat(format);
+      if (sibling) {
+        if (rawViewFormats === undefined || rawViewFormats === null) {
+          rawViewFormats = [sibling];
+        } else if (
+          typeof rawViewFormats !== 'string' &&
+          typeof rawViewFormats[Symbol.iterator] === 'function'
+        ) {
+          const list = Array.from(rawViewFormats);
+          if (!list.includes(sibling)) {
+            list.push(sibling);
+          }
+          rawViewFormats = list;
+        }
+      }
+    }
+    const viewFormats = _normalizeViewFormatsWithMeta(rawViewFormats, format, {
       filterIncompatible: false,
     }).viewFormats;
 
@@ -738,7 +1090,7 @@
    * @param {string} [baseFormat]
    * @returns {{ isDefault: boolean, key: string, descriptor: object | null }}
    */
-  function makeTextureViewKey(viewDesc, baseFormat) {
+  function makeTextureViewKey(viewDesc, baseFormat, textureDesc) {
     if (viewDesc === undefined || viewDesc === null) {
       return { isDefault: true, key: 'default', descriptor: null };
     }
@@ -799,6 +1151,37 @@
 
     const usage = viewDesc.usage === undefined ? 0 : viewDesc.usage;
     assertNonNegativeInteger(usage, 'usage');
+
+    // Canonicalize equivalent full-range / default-dimension descriptors against the owning
+    // texture so e.g. `{ dimension: 'cube' }` and `{ dimension: 'cube', baseArrayLayer: 0, arrayLayerCount: 6 }`
+    // share the exact same cached GPUTextureView without creating duplicate GPU views.
+    if (textureDesc && typeof textureDesc === 'object') {
+      const texDim = textureDesc.dimension || '2d';
+      const texMips = textureDesc.mipLevelCount || 1;
+      const texLayers = textureDesc.depthOrArrayLayers || 1;
+      const defaultViewDim =
+        texDim === '2d' && texLayers > 1 ? '2d-array' : texDim;
+
+      if (dimension === defaultViewDim) {
+        dimension = null;
+      }
+      if (mipLevelCount !== undefined && baseMipLevel === 0 && mipLevelCount === texMips) {
+        mipLevelCount = undefined;
+      }
+      if (
+        arrayLayerCount !== undefined &&
+        baseArrayLayer === 0 &&
+        texDim !== '3d' &&
+        arrayLayerCount === texLayers
+      ) {
+        // Only collapse full layer count when the effective view dimension covers all layers
+        // (i.e. not a single-layer '2d' view of a multi-layer texture, which can't happen here
+        // anyway since arrayLayerCount === texLayers > 1 wouldn't be '2d').
+        if (dimension !== '2d' || texLayers === 1) {
+          arrayLayerCount = undefined;
+        }
+      }
+    }
 
     const isDefault =
       format === null &&
@@ -916,6 +1299,8 @@
         oversizedIdleFrameTtl = null,
         strictBudget = true,
         autoReleaseLeaked = true,
+        autoIncludeSrgbSibling = false,
+        deviceFeatures = null,
         onLeak = null,
         warn = null,
       } = options;
@@ -971,6 +1356,8 @@
         oversizedIdleFrameTtl === undefined ? null : oversizedIdleFrameTtl;
       this._strictBudget = Boolean(strictBudget);
       this._autoReleaseLeaked = Boolean(autoReleaseLeaked);
+      this._autoIncludeSrgbSibling = Boolean(autoIncludeSrgbSibling);
+      this._deviceFeatures = deviceFeatures || null;
       this._onLeak = onLeak;
       this._warn = warn;
 
@@ -1016,7 +1403,11 @@
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
+      this._formatFallbackCount = 0;
       this._sampleCountNormalizeCount = 0;
+      this._hdrAcquires = 0;
+      this._depthAcquires = 0;
+      this._srgbAcquires = 0;
     }
 
     get isDestroyed() {
@@ -1140,7 +1531,7 @@
       if (!this._isRecordTextureAlive(record)) {
         return null;
       }
-      const normalized = makeTextureViewKey(viewDesc, record.desc.format);
+      const normalized = makeTextureViewKey(viewDesc, record.desc.format, record.desc);
       if (normalized.isDefault) {
         if (record.view !== null) {
           this._viewCacheHits += 1;
@@ -1419,6 +1810,34 @@
       return true;
     }
 
+    _recordAcquireSanitizationAndClass(normalizedDesc, sanitized) {
+      if (sanitized.dimensionClamped) {
+        this._dimensionClampCount += 1;
+      }
+      if (sanitized.formatNormalized) {
+        this._formatNormalizeCount += 1;
+      }
+      if (sanitized.formatFallback) {
+        this._formatFallbackCount += 1;
+      }
+      if (sanitized.sampleCountNormalized) {
+        this._sampleCountNormalizeCount += 1;
+      }
+      if (HDR_RENDER_TARGET_FORMATS.has(normalizedDesc.format)) {
+        this._hdrAcquires += 1;
+      }
+      if (DEPTH_RENDER_TARGET_FORMATS.has(normalizedDesc.format)) {
+        this._depthAcquires += 1;
+      }
+      if (
+        SRGB_RENDER_TARGET_FORMATS.has(normalizedDesc.format) ||
+        (normalizedDesc.viewFormats.length > 0 &&
+          normalizedDesc.viewFormats.some((vf) => SRGB_RENDER_TARGET_FORMATS.has(vf)))
+      ) {
+        this._srgbAcquires += 1;
+      }
+    }
+
     _claimIdleRecord(record, label, sanitized, isIntraFrame) {
       this._transientAliases.delete(record);
       record.transientAliasFrame = -1;
@@ -1440,15 +1859,7 @@
         this._viewCacheHits += 1;
       }
 
-      if (sanitized.dimensionClamped) {
-        this._dimensionClampCount += 1;
-      }
-      if (sanitized.formatNormalized) {
-        this._formatNormalizeCount += 1;
-      }
-      if (sanitized.sampleCountNormalized) {
-        this._sampleCountNormalizeCount += 1;
-      }
+      this._recordAcquireSanitizationAndClass(record.desc, sanitized);
 
       return this._makeHandle(record, true);
     }
@@ -1468,6 +1879,43 @@
         },
         getView(viewDesc) {
           return pool._getOrCreateRecordView(record, viewDesc);
+        },
+        getDepthView(viewDesc) {
+          const opts =
+            viewDesc && typeof viewDesc === 'object'
+              ? { ...viewDesc, aspect: 'depth-only' }
+              : { aspect: 'depth-only' };
+          return pool._getOrCreateRecordView(record, opts);
+        },
+        getStencilView(viewDesc) {
+          const opts =
+            viewDesc && typeof viewDesc === 'object'
+              ? { ...viewDesc, aspect: 'stencil-only' }
+              : { aspect: 'stencil-only' };
+          return pool._getOrCreateRecordView(record, opts);
+        },
+        getSrgbView() {
+          const sibling = getCompatibleSrgbSiblingFormat(record.desc.format);
+          return pool._getOrCreateRecordView(record, sibling ? { format: sibling } : undefined);
+        },
+        getSliceView(baseArrayLayer = 0, mipLevel = 0, viewDimension) {
+          const texDim = record.desc.dimension;
+          const resolvedDim =
+            viewDimension !== undefined
+              ? viewDimension
+              : texDim === '3d'
+                ? '3d'
+                : '2d';
+          const desc = {
+            dimension: resolvedDim,
+            baseMipLevel: mipLevel,
+            mipLevelCount: 1,
+          };
+          if (texDim !== '3d' && resolvedDim !== '3d') {
+            desc.baseArrayLayer = baseArrayLayer;
+            desc.arrayLayerCount = resolvedDim === 'cube' ? 6 : 1;
+          }
+          return pool._getOrCreateRecordView(record, desc);
         },
         get destroyed() {
           return !pool._isRecordTextureAlive(record);
@@ -1508,7 +1956,9 @@
       const maxDim2D = this._effectiveMaxTextureDimension2D();
       const sanitized = sanitizeRenderTargetDesc(desc, {
         device: this._device,
+        deviceFeatures: this._deviceFeatures,
         maxTextureDimension2D: maxDim2D,
+        includeSrgbSibling: this._autoIncludeSrgbSibling,
       });
       const normalizedDesc = sanitized.desc;
       const key = makeRenderTargetKey(normalizedDesc);
@@ -1641,15 +2091,7 @@
         this._viewCacheMisses += 1;
       }
 
-      if (sanitized.dimensionClamped) {
-        this._dimensionClampCount += 1;
-      }
-      if (sanitized.formatNormalized) {
-        this._formatNormalizeCount += 1;
-      }
-      if (sanitized.sampleCountNormalized) {
-        this._sampleCountNormalizeCount += 1;
-      }
+      this._recordAcquireSanitizationAndClass(normalizedDesc, sanitized);
 
       const totalBytes = this._activeBytes + this._idleBytes;
       if (totalBytes > this._peakBytes) {
@@ -2011,6 +2453,28 @@
       const intraFrameAliasHits = sanitizeNonNegativeCounter(this._intraFrameAliasHits);
       const vramBudgetUtilization = clampUnitRate(totalBytes, this._maxPoolBytes);
 
+      let activeHdrCount = 0;
+      let activeDepthCount = 0;
+      for (const rec of this._activeEntries.values()) {
+        if (HDR_RENDER_TARGET_FORMATS.has(rec.desc.format)) {
+          activeHdrCount += 1;
+        }
+        if (DEPTH_RENDER_TARGET_FORMATS.has(rec.desc.format)) {
+          activeDepthCount += 1;
+        }
+      }
+
+      let idleHdrCount = 0;
+      let idleDepthCount = 0;
+      for (const rec of this._idleLru.values()) {
+        if (HDR_RENDER_TARGET_FORMATS.has(rec.desc.format)) {
+          idleHdrCount += 1;
+        }
+        if (DEPTH_RENDER_TARGET_FORMATS.has(rec.desc.format)) {
+          idleDepthCount += 1;
+        }
+      }
+
       return {
         hits: poolHits,
         misses: poolMisses,
@@ -2028,6 +2492,10 @@
         idleCount: this._idleLru.size,
         activeTargets: this._activeEntries.size,
         idleTargets: this._idleLru.size,
+        activeHdrCount,
+        activeDepthCount,
+        idleHdrCount,
+        idleDepthCount,
         activeBytes,
         idleBytes,
         totalBytes,
@@ -2050,7 +2518,11 @@
         leakedReleases: sanitizeNonNegativeCounter(this._leakedReleases),
         dimensionClampCount: sanitizeNonNegativeCounter(this._dimensionClampCount),
         formatNormalizeCount: sanitizeNonNegativeCounter(this._formatNormalizeCount),
+        formatFallbackCount: sanitizeNonNegativeCounter(this._formatFallbackCount),
         sampleCountNormalizeCount: sanitizeNonNegativeCounter(this._sampleCountNormalizeCount),
+        hdrAcquires: sanitizeNonNegativeCounter(this._hdrAcquires),
+        depthAcquires: sanitizeNonNegativeCounter(this._depthAcquires),
+        srgbAcquires: sanitizeNonNegativeCounter(this._srgbAcquires),
         maxTextureDimension2D: this._effectiveMaxTextureDimension2D(),
         currentFrame: sanitizeNonNegativeCounter(this._currentFrame),
       };
@@ -2080,7 +2552,11 @@
       this._leakedReleases = 0;
       this._dimensionClampCount = 0;
       this._formatNormalizeCount = 0;
+      this._formatFallbackCount = 0;
       this._sampleCountNormalizeCount = 0;
+      this._hdrAcquires = 0;
+      this._depthAcquires = 0;
+      this._srgbAcquires = 0;
       return this.getStats();
     }
 
@@ -2122,7 +2598,14 @@
     FORMAT_BYTES_PER_PIXEL,
     DXGI_FORMAT_ALIASES,
     COMPATIBLE_VIEW_FORMATS,
+    REQUIRED_3D_RT_FORMATS,
     normalizeRenderTargetFormat,
+    isHdrRenderTargetFormat,
+    isDepthRenderTargetFormat,
+    hasStencilComponent,
+    getCompatibleSrgbSiblingFormat,
+    withSrgbSiblingViewFormat,
+    resolveRenderTargetFormatForDevice,
     isCompatibleViewFormat,
     normalizeViewFormats,
     normalizeSampleCount,
