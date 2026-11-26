@@ -3754,3 +3754,294 @@ test('guestRelaunchPayload only answers the self-relaunch exit code', () => {
   assert.equal(guestRelaunchPayload(undefined), null);
   assert.equal(guestRelaunchPayload(Number.NaN), null);
 });
+
+test('W358 forwardGpuWorkerMessage forwards swapchainProbe* telemetry on first-visible-frame, visible-frame, and gpu-telemetry', () => {
+  const posted = [];
+  const post = (msg) => posted.push(msg);
+
+  // 1. first-visible-frame with top-level camelCase non-zero probe counts & booleans.
+  const visibleNonZero = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 12345,
+      source: 'swapchain_probe',
+      maxLuma: 210,
+      suppressedBlackFrames: 40,
+      swapchainProbeCount: 14,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: true,
+      swapchainProbeErrorCount: 2,
+    },
+    post,
+  );
+  assert.equal(posted.length, 1);
+  assert.deepEqual(visibleNonZero, posted[0]);
+  assert.equal(visibleNonZero.swapchainProbeCount, 14);
+  assert.equal(visibleNonZero.swapchainProbeInFlight, false);
+  assert.equal(visibleNonZero.swapchainProbeSupported, true);
+  assert.equal(visibleNonZero.swapchainProbeErrorCount, 2);
+
+  // 2. first-visible-frame preserves explicit 0, false, and null (not dropped as falsy).
+  const visibleZerosAndNull = forwardGpuWorkerMessage(
+    {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      swapchainProbeCount: 0,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: null,
+      swapchainProbeErrorCount: 0,
+    },
+    post,
+  );
+  assert.equal(posted.length, 2);
+  assert.equal(visibleZerosAndNull.swapchainProbeCount, 0);
+  assert.equal(visibleZerosAndNull.swapchainProbeInFlight, false);
+  assert.equal(visibleZerosAndNull.swapchainProbeSupported, null);
+  assert.equal(visibleZerosAndNull.swapchainProbeErrorCount, 0);
+
+  // 3. visible-frame alias with snake_case fields nested inside stats.
+  const visibleSnakeNested = forwardGpuWorkerMessage(
+    {
+      type: 'visible-frame',
+      firstVisibleFrame: true,
+      stats: {
+        swapchain_probe_count: 7,
+        swapchain_probe_in_flight: true,
+        swapchain_probe_supported: false,
+        swapchain_probe_error_count: 3,
+      },
+    },
+    post,
+  );
+  assert.equal(posted.length, 3);
+  assert.equal(visibleSnakeNested.type, 'visible-frame');
+  assert.equal(visibleSnakeNested.swapchainProbeCount, 7);
+  assert.equal(visibleSnakeNested.swapchainProbeInFlight, true);
+  assert.equal(visibleSnakeNested.swapchainProbeSupported, false);
+  assert.equal(visibleSnakeNested.swapchainProbeErrorCount, 3);
+
+  // 4. gpu-telemetry from nested wgpu_worker { id, stats } preserves 0, false, and null.
+  const statsZeroNull = forwardGpuWorkerMessage(
+    {
+      id: 21,
+      stats: {
+        frameCount: 10,
+        firstVisibleFrame: false,
+        swapchainProbeCount: 0,
+        swapchainProbeInFlight: false,
+        swapchainProbeSupported: null,
+        swapchainProbeErrorCount: 0,
+      },
+      timestamp: 1700000030000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 4);
+  assert.equal(statsZeroNull.type, 'gpu-telemetry');
+  assert.equal(statsZeroNull.swapchainProbeCount, 0);
+  assert.equal(statsZeroNull.swapchainProbeInFlight, false);
+  assert.equal(statsZeroNull.swapchainProbeSupported, null);
+  assert.equal(statsZeroNull.swapchainProbeErrorCount, 0);
+
+  // 5. gpu-telemetry from nested wgpu_worker { id, stats } forwards active non-zero probe state.
+  const statsActive = forwardGpuWorkerMessage(
+    {
+      id: 22,
+      stats: {
+        frameCount: 95,
+        firstVisibleFrame: false,
+        swapchainProbeCount: 19,
+        swapchainProbeInFlight: true,
+        swapchainProbeSupported: true,
+        swapchainProbeErrorCount: 1,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 95,
+      },
+      timestamp: 1700000031000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 5);
+  assert.equal(statsActive.type, 'gpu-telemetry');
+  assert.equal(statsActive.swapchainProbeCount, 19);
+  assert.equal(statsActive.swapchainProbeInFlight, true);
+  assert.equal(statsActive.swapchainProbeSupported, true);
+  assert.equal(statsActive.swapchainProbeErrorCount, 1);
+
+  // 6. gpu-telemetry with snake_case fields in nested frameStats sanitizes integers & booleans.
+  const frameStatsSnake = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: {
+        framesPresented: 30,
+        swapchain_probe_count: 5.9,
+        swapchain_probe_in_flight: false,
+        swapchain_probe_supported: false,
+        swapchain_probe_error_count: 2.4,
+      },
+      timestamp: 1700000032000,
+    },
+    post,
+  );
+  assert.equal(posted.length, 6);
+  assert.equal(frameStatsSnake.type, 'gpu-telemetry');
+  assert.equal(frameStatsSnake.swapchainProbeCount, 5);
+  assert.equal(frameStatsSnake.swapchainProbeInFlight, false);
+  assert.equal(frameStatsSnake.swapchainProbeSupported, false);
+  assert.equal(frameStatsSnake.swapchainProbeErrorCount, 2);
+
+  // 7. Invalid top-level values fall through cleanly to nested stats; absent fields stay omitted.
+  const fallbackFromInvalid = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-stats',
+      framesPresented: 40,
+      swapchainProbeCount: Number.NaN,
+      swapchainProbeInFlight: 'yes',
+      swapchainProbeSupported: 123,
+      swapchainProbeErrorCount: null,
+      stats: {
+        swapchain_probe_count: 8,
+        swapchain_probe_in_flight: true,
+        swapchain_probe_supported: null,
+        swapchain_probe_error_count: 4,
+      },
+    },
+    post,
+  );
+  assert.equal(posted.length, 7);
+  assert.equal(fallbackFromInvalid.swapchainProbeCount, 8);
+  assert.equal(fallbackFromInvalid.swapchainProbeInFlight, true);
+  assert.equal(fallbackFromInvalid.swapchainProbeSupported, null);
+  assert.equal(fallbackFromInvalid.swapchainProbeErrorCount, 4);
+
+  const withoutProbeFields = forwardGpuWorkerMessage({ framesPresented: 12 }, post);
+  assert.equal(posted.length, 8);
+  assert.equal('swapchainProbeCount' in withoutProbeFields, false);
+  assert.equal('swapchainProbeInFlight' in withoutProbeFields, false);
+  assert.equal('swapchainProbeSupported' in withoutProbeFields, false);
+  assert.equal('swapchainProbeErrorCount' in withoutProbeFields, false);
+});
+
+test('W358 loader.js gpuWorker.onmessage forwards swapchainProbe* telemetry end-to-end', () => {
+  const mainMessages = [];
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker && typeof gpuWorker.onmessage === 'function');
+
+  // 1. gpu-telemetry stats message with live swapchain probe counts.
+  gpuWorker.onmessage({
+    data: {
+      id: 101,
+      stats: {
+        frameCount: 64,
+        firstVisibleFrame: false,
+        lastSampledMaxLuma: 0,
+        suppressedBlackFrames: 64,
+        swapchainProbeCount: 11,
+        swapchainProbeInFlight: true,
+        swapchainProbeSupported: true,
+        swapchainProbeErrorCount: 0,
+      },
+    },
+  });
+
+  // 2. first-visible-frame message with final probe counts.
+  gpuWorker.onmessage({
+    data: {
+      type: 'first-visible-frame',
+      firstVisibleFrame: true,
+      firstVisibleFrameMs: 18400,
+      source: 'swapchain_probe',
+      maxLuma: 228,
+      suppressedBlackFrames: 64,
+      swapchainProbeCount: 12,
+      swapchainProbeInFlight: false,
+      swapchainProbeSupported: true,
+      swapchainProbeErrorCount: 1,
+    },
+  });
+
+  assert.equal(mainMessages.length, 2);
+  assert.equal(mainMessages[0].type, 'gpu-telemetry');
+  assert.equal(mainMessages[0].swapchainProbeCount, 11);
+  assert.equal(mainMessages[0].swapchainProbeInFlight, true);
+  assert.equal(mainMessages[0].swapchainProbeSupported, true);
+  assert.equal(mainMessages[0].swapchainProbeErrorCount, 0);
+
+  assert.equal(mainMessages[1].type, 'first-visible-frame');
+  assert.equal(mainMessages[1].swapchainProbeCount, 12);
+  assert.equal(mainMessages[1].swapchainProbeInFlight, false);
+  assert.equal(mainMessages[1].swapchainProbeSupported, true);
+  assert.equal(mainMessages[1].swapchainProbeErrorCount, 1);
+});
