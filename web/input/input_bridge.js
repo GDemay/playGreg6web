@@ -290,6 +290,48 @@ function buildChromeMenuFlow4Events() {
   events.push(
     Object.freeze({ atMs: 180000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
   );
+  // Phase 4 (184s..360s, W361): Extended long-Bink2 continuation so Wasm64 browser runs where
+  // 4K Bink2 takes 30-160 s never run out of scripted inputs after UI TEXT SIZE.
+  // Phase 4a (184s..212s): 10 spaced A confirmations every 3000 ms (holdMs: 200, never B) to
+  // advance through UI TEXT SIZE -> BRIGHTNESS / HDR / SUBTITLES -> FINISH SETUP? -> LEGAL NOTICES.
+  for (let i = 0; i < 10; i++) {
+    events.push(
+      Object.freeze({
+        atMs: 184000 + i * 3000,
+        holdMs: CHROME_MENU_FLOW_4_HOLD_MS,
+        button: INPUT_BUTTONS.A,
+      })
+    );
+  }
+  // Phase 4b (218s..316s): 7 rounds of Timon's 14 s _menu_cycle (Up x6, Down, Down, A) every
+  // 14000 ms to deterministically highlight & confirm "Next >" on LEGAL NOTICES (and advance any
+  // remaining setup screen).
+  for (let round = 0; round < 7; round++) {
+    const base = 218000 + round * 14000;
+    for (let i = 0; i < CHROME_MENU_FLOW_4_CYCLE_OFFSETS.length; i++) {
+      const step = CHROME_MENU_FLOW_4_CYCLE_OFFSETS[i];
+      events.push(
+        Object.freeze({
+          atMs: base + step.offsetMs,
+          holdMs: step.holdMs,
+          button: step.button,
+        })
+      );
+    }
+  }
+  // Phase 4c (320s..360s): Post-Legal List -> Main Menu -> Story/Play probes: DPAD_UP at 320s,
+  // A at 322s, then spaced A confirmations (328s, 334s, 340s, 346s, 352s, 358s; never B).
+  events.push(
+    Object.freeze({ atMs: 320000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP })
+  );
+  events.push(
+    Object.freeze({ atMs: 322000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+  );
+  for (const atMs of [328000, 334000, 340000, 346000, 352000, 358000]) {
+    events.push(
+      Object.freeze({ atMs, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+    );
+  }
   return Object.freeze(events);
 }
 
@@ -360,13 +402,15 @@ function buildChromeMenuFlow2Events() {
 //   9000 ms from 360000 ms into Main Menu / In-Game (never presses B or DPAD_UP).
 // - 'chrome-menu-flow-4': Mirrors native menu-flow-4 (tools/run_native_boot.py, PR #1483)
 //   for Chrome Wasm64 boots with >= 180 ms (200 ms) holds for 15-30 FPS & #1501 press latch:
-//   early A every 2500 ms from 5000 ms through 75000 ms (starts right after FIRST_PRESENT so
-//   a dark Start Screen never stalls while splash waits for FIRST_VISIBLE_FRAME, continuing
-//   through 6-star -> Bink2 -> Rockstar -> UI TEXT SIZE -> FINISH SETUP?), 7 rounds of 14 s
-//   cursor-resetting _menu_cycle (DPAD_UP x6, DPAD_DOWN, DPAD_DOWN, A) from 80000 ms for
-//   LEGAL NOTICES ("Next >"), Post-Legal List Screen DPAD_UP (178000 ms) + A (180000 ms)
-//   with ~10 s settle, then looping _menu_cycle every 14000 ms from 190000 ms into Main Menu
-//   (never presses B).
+//   Phase 1 early A every 2500 ms from 5000 ms through 75000 ms (starts right after FIRST_PRESENT
+//   so a dark Start Screen never stalls while splash waits for FIRST_VISIBLE_FRAME, continuing
+//   through 6-star -> Bink2 -> Rockstar -> UI TEXT SIZE -> FINISH SETUP?), Phase 2 7 rounds of
+//   14 s cursor-resetting _menu_cycle (DPAD_UP x6, DPAD_DOWN, DPAD_DOWN, A) from 80000 ms for
+//   LEGAL NOTICES ("Next >"), Phase 3 Post-Legal List Screen DPAD_UP (178000 ms) + A (180000 ms),
+//   Phase 4 (W361, 184000..358000 ms) extended long-Bink2 continuation (4a: 10 spaced A every
+//   3000 ms from 184000 ms through 211000 ms; 4b: 7 rounds of 14 s _menu_cycle from 218000 ms;
+//   4c: Post-Legal DPAD_UP 320000 ms, A 322000 ms, spaced A at 328s..358s), then Phase 5 looping
+//   _menu_cycle every 14000 ms from 368000 ms into Main Menu / In-Game (never presses B).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -551,10 +595,10 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'chrome-menu-flow-4': Object.freeze({
     name: 'chrome-menu-flow-4',
     events: buildChromeMenuFlow4Events(),
-    // Phase 4: Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds) from 190000 ms
-    // matching tools/run_native_boot.py::menu_flow_4_script_text (PR #1483; never presses B).
+    // Phase 5: Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds) from 368000 ms
+    // after the Phase 4 long-Bink2 continuation settles (~10 s after 358000 ms; never presses B).
     loop: Object.freeze({
-      startMs: 190000,
+      startMs: 368000,
       periodMs: 14000,
       events: CHROME_MENU_FLOW_4_CYCLE_OFFSETS,
     }),

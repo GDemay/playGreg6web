@@ -97,10 +97,11 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   assert.ok(spec);
   assert.equal(Object.isFrozen(spec), true);
   assert.equal(spec.name, 'chrome-menu-flow-4');
-  assert.equal(spec.events.length, 94); // 29 Phase 1 + 63 Phase 2 (7 x 9) + 2 Phase 3
+  assert.equal(spec.events.length, 175); // 29 Phase 1 + 63 Phase 2 + 2 Phase 3 + 10 Phase 4a + 63 Phase 4b + 8 Phase 4c
   assert.equal(spec.events[0].atMs, 5000);
-  assert.equal(spec.events[spec.events.length - 1].atMs, 180000);
-  assert.equal(spec.loop.startMs, 190000);
+  assert.equal(spec.events[93].atMs, 180000); // Phase 3 end preserved intact
+  assert.equal(spec.events[spec.events.length - 1].atMs, 358000);
+  assert.equal(spec.loop.startMs, 368000);
   assert.equal(spec.loop.periodMs, 14000);
   assert.equal(spec.loop.events.length, 9);
 
@@ -219,14 +220,81 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   assert.equal(player.pressCountAt(180000), expectedCount);
   assert.equal(expectedCount, 94);
 
-  // Quiet ~10 s settle window (180200..189999 ms) for the 34-draw screen / Main Menu transition.
-  for (let t = 180200; t < 190000; t += 500) {
-    assert.equal(player.sampleAt(t).buttonsMask, 0, `transition settle at ${t}`);
+  // Quiet transition pause (180200..183999 ms) before Phase 4a (W361).
+  for (let t = 180200; t < 184000; t += 200) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `transition settle before Phase 4a at ${t}`);
   }
 
-  // Phase 4 (190s+): Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds).
+  // Phase 4a (184s..212s, W361): 10 spaced A confirmations every 3000 ms (holdMs: 200, never B).
+  for (let i = 0; i < 10; i++) {
+    expectedCount += 1;
+    const atMs = 184000 + i * 3000;
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0, `Phase 4a idle before ${atMs}`);
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `Phase 4a A press at ${atMs}`);
+    assert.equal(
+      player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1).buttonsMask,
+      INPUT_BUTTONS.A,
+      `Phase 4a A held 200 ms at ${atMs}`
+    );
+    assert.equal(player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), expectedCount);
+  }
+  assert.equal(expectedCount, 104);
+
+  // Quiet transition pause (211200..217999 ms) before Phase 4b LEGAL NOTICES rounds.
+  for (let t = 211200; t < 218000; t += 200) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `quiet pause before Phase 4b at ${t}`);
+  }
+
+  // Phase 4b (218s..316s, W361): 7 rounds of Timon's 14 s _menu_cycle (Up x6, Down, Down, A).
+  for (let round = 0; round < 7; round++) {
+    const base = 218000 + round * 14000;
+    for (const [offsetMs, expectedBtn] of expectedCycle) {
+      expectedCount += 1;
+      const t = base + offsetMs;
+      assert.equal(player.sampleAt(t - 1).buttonsMask, 0, `Phase 4b round ${round} idle before +${offsetMs}`);
+      assert.equal(player.sampleAt(t).buttonsMask, expectedBtn, `Phase 4b round ${round} press at +${offsetMs}`);
+      assert.equal(player.sampleAt(t + CHROME_MENU_FLOW_4_HOLD_MS - 1).buttonsMask, expectedBtn);
+      assert.equal(player.sampleAt(t + CHROME_MENU_FLOW_4_HOLD_MS).buttonsMask, 0);
+      assert.equal(player.pressCountAt(t), expectedCount);
+    }
+  }
+  assert.equal(expectedCount, 167);
+
+  // Quiet settle window (308700..319999 ms) before Phase 4c Post-Legal -> Main Menu probes.
+  for (let t = 308700; t < 320000; t += 300) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `quiet settle before Phase 4c at ${t}`);
+  }
+
+  // Phase 4c (320s..360s, W361): DPAD_UP at 320s, A at 322s, then spaced A at 328s..358s.
+  const expectedPhase4c = [
+    [320000, INPUT_BUTTONS.DPAD_UP],
+    [322000, INPUT_BUTTONS.A],
+    [328000, INPUT_BUTTONS.A],
+    [334000, INPUT_BUTTONS.A],
+    [340000, INPUT_BUTTONS.A],
+    [346000, INPUT_BUTTONS.A],
+    [352000, INPUT_BUTTONS.A],
+    [358000, INPUT_BUTTONS.A],
+  ];
+  for (const [atMs, expectedBtn] of expectedPhase4c) {
+    expectedCount += 1;
+    assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0, `Phase 4c idle before ${atMs}`);
+    assert.equal(player.sampleAt(atMs).buttonsMask, expectedBtn, `Phase 4c press at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1).buttonsMask, expectedBtn);
+    assert.equal(player.sampleAt(atMs + CHROME_MENU_FLOW_4_HOLD_MS).buttonsMask, 0);
+    assert.equal(player.pressCountAt(atMs), expectedCount);
+  }
+  assert.equal(expectedCount, 175);
+
+  // Quiet ~10 s settle window (358200..367999 ms) before Phase 5 fallback loop.
+  for (let t = 358200; t < 368000; t += 500) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `transition settle before Phase 5 loop at ${t}`);
+  }
+
+  // Phase 5 (368s+): Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds).
   for (let cycle = 0; cycle < 3; cycle++) {
-    const base = 190000 + cycle * 14000;
+    const base = 368000 + cycle * 14000;
     for (const [offsetMs, expectedBtn] of expectedCycle) {
       expectedCount += 1;
       const t = base + offsetMs;
@@ -238,9 +306,9 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
     }
   }
 
-  // Full 300-second invariant: NEVER presses B; only A, DPAD_UP, or DPAD_DOWN.
+  // Full 420-second invariant: NEVER presses B; only A, DPAD_UP, or DPAD_DOWN.
   const allowed = new Set([0, INPUT_BUTTONS.A, INPUT_BUTTONS.DPAD_UP, INPUT_BUTTONS.DPAD_DOWN]);
-  for (let t = 0; t <= 300000; t += 50) {
+  for (let t = 0; t <= 420000; t += 50) {
     const mask = player.sampleAt(t).buttonsMask;
     assert.equal(mask & INPUT_BUTTONS.B, 0, `chrome-menu-flow-4 must never press B at t=${t}`);
     assert.ok(allowed.has(mask), `unexpected button mask 0x${mask.toString(16)} at t=${t}`);
@@ -252,8 +320,13 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   assert.equal(player.nextTransitionMs(75200), 80000);
   assert.equal(player.nextTransitionMs(170700), 178000);
   assert.equal(player.nextTransitionMs(178200), 180000);
-  assert.equal(player.nextTransitionMs(180200), 190000);
-  assert.equal(player.nextTransitionMs(196700), 204000);
+  assert.equal(player.nextTransitionMs(180200), 184000);
+  assert.equal(player.nextTransitionMs(211200), 218000);
+  assert.equal(player.nextTransitionMs(308700), 320000);
+  assert.equal(player.nextTransitionMs(320200), 322000);
+  assert.equal(player.nextTransitionMs(322200), 328000);
+  assert.equal(player.nextTransitionMs(358200), 368000);
+  assert.equal(player.nextTransitionMs(374700), 382000);
 
   // Verify 15 FPS (67 ms frame cadence) and 30 FPS (33 ms frame cadence) sampling catches every press.
   for (const frameMs of [33, 67]) {
@@ -273,18 +346,21 @@ test('W355 chrome-menu-flow-4 matches native menu-flow-4 sequence (tools/run_nat
   }
 
   // Composes cleanly with maxPresses, endMs, and startOffsetMs.
-  const capped = new ScriptedInputPlayer({ preset: 'chrome-menu-flow-4', maxPresses: 95 });
-  assert.equal(capped.sampleAt(190000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // #95 (1st loop DUp)
-  assert.equal(capped.sampleAt(190400).buttonsMask, 0);
-  assert.equal(capped.pressCountAt(300000), 95);
-  assert.equal(capped.nextTransitionMs(190200), null);
+  const capped = new ScriptedInputPlayer({ preset: 'chrome-menu-flow-4', maxPresses: 176 });
+  assert.equal(capped.sampleAt(368000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // #176 (1st loop DUp)
+  assert.equal(capped.sampleAt(368400).buttonsMask, 0);
+  assert.equal(capped.pressCountAt(450000), 176);
+  assert.equal(capped.nextTransitionMs(368200), null);
 
   const shifted = new ScriptedInputPlayer('chrome-menu-flow-4', { startOffsetMs: 12000 });
   assert.equal(shifted.sampleAt(5000).buttonsMask, 0);
   assert.equal(shifted.sampleAt(17000).buttonsMask, INPUT_BUTTONS.A);
   assert.equal(shifted.sampleAt(190000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // 178000 + 12000
   assert.equal(shifted.sampleAt(192000).buttonsMask, INPUT_BUTTONS.A);       // 180000 + 12000
-  assert.equal(shifted.sampleAt(202000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // loop 190000 + 12000
+  assert.equal(shifted.sampleAt(196000).buttonsMask, INPUT_BUTTONS.A);       // 184000 + 12000
+  assert.equal(shifted.sampleAt(230000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // 218000 + 12000
+  assert.equal(shifted.sampleAt(370000).buttonsMask, INPUT_BUTTONS.A);       // 358000 + 12000
+  assert.equal(shifted.sampleAt(380000).buttonsMask, INPUT_BUTTONS.DPAD_UP); // loop 368000 + 12000
 });
 
 test('W355 minHoldMs upgrades legacy presets (chrome-menu-flow, chrome-menu-flow-2, start-screen) to >= 180 ms without breaking defaults', () => {
@@ -624,14 +700,45 @@ test('W355 InputBridge drives chrome-menu-flow-4 end-to-end through Start Screen
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   assert.equal(bridge.getStats().scriptedPressesSent, 94);
 
-  // Phase 4: Looping _menu_cycle starts at 190000 ms (#95 DPAD_UP) -> 196500 ms (#103 A).
-  clock.advanceTo(190000);
-  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  // Phase 4a (W361): 10 spaced A confirmations from 184000 ms (#95) through 211000 ms (#104).
+  clock.advanceTo(184000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
   assert.equal(bridge.getStats().scriptedPressesSent, 95);
 
-  clock.advanceTo(196500);
+  clock.advanceTo(211000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
-  assert.equal(bridge.getStats().scriptedPressesSent, 103);
+  assert.equal(bridge.getStats().scriptedPressesSent, 104);
+
+  // Phase 4b (W361): 7 rounds of 14 s _menu_cycle from 218000 ms (#105 DPAD_UP -> #113 A).
+  clock.advanceTo(218000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(bridge.getStats().scriptedPressesSent, 105);
+
+  clock.advanceTo(224500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 113);
+
+  // Phase 4c (W361): Post-Legal -> Main Menu -> Story/Play probes (320s DPAD_UP #168, 322s A #169 .. 358s A #175).
+  clock.advanceTo(320000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(bridge.getStats().scriptedPressesSent, 168);
+
+  clock.advanceTo(322000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 169);
+
+  clock.advanceTo(358000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 175);
+
+  // Phase 5: Looping _menu_cycle starts at 368000 ms (#176 DPAD_UP) -> 374500 ms (#184 A).
+  clock.advanceTo(368000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  assert.equal(bridge.getStats().scriptedPressesSent, 176);
+
+  clock.advanceTo(374500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  assert.equal(bridge.getStats().scriptedPressesSent, 184);
 
   bridge.destroy();
   assert.equal(clock.pendingTimeouts(), 0);
@@ -744,14 +851,28 @@ test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST
   clock.advanceTo(visibleAt + 180000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
 
-  // Phase 4: +190000 ms Looping _menu_cycle DPAD_UP -> +196500 ms A
-  clock.advanceTo(visibleAt + 190000);
+  // Phase 4 (W361): +184000 ms Phase 4a A -> +218000 ms Phase 4b _menu_cycle -> +320000..+358000 ms Phase 4c
+  clock.advanceTo(visibleAt + 184000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 218000);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
-  clock.advanceTo(visibleAt + 196500);
+  clock.advanceTo(visibleAt + 224500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 320000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 322000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  clock.advanceTo(visibleAt + 358000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Phase 5: +368000 ms Looping _menu_cycle DPAD_UP -> +374500 ms A
+  clock.advanceTo(visibleAt + 368000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP);
+  clock.advanceTo(visibleAt + 374500);
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
 
   // Never presses B at any point in the re-anchored player.
-  for (let t = 0; t <= 220000; t += 100) {
+  for (let t = 0; t <= 400000; t += 100) {
     assert.equal(
       bridge._scriptPlayer.sampleAt(t).buttonsMask & INPUT_BUTTONS.B,
       0,
@@ -966,4 +1087,101 @@ test('W357 chrome-menu-flow-2, chrome-menu-flow, immediate-started scripts, mid-
   assert.equal(bridgeStopped.getStats().scriptReanchoredCount, 0);
   bridgeStopped.destroy();
   assert.equal(clockNoop.pendingTimeouts(), 0);
+});
+
+test('W361 chrome-menu-flow-4 Phase 4 drives long-Bink2 runs (t89: UI TEXT SIZE at +175.2 s) through LEGAL NOTICES and Main Menu to 358 s', () => {
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+
+  bridge.startScript('chrome-menu-flow-4', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+
+  // Simulate live Chrome t89: FIRST_VISIBLE_FRAME fires at 176.8 s after page load.
+  const visibleAt = 176800;
+  clock.advanceTo(45000);
+  bridge.notifyFirstPresent();
+  clock.advanceTo(visibleAt);
+  assert.equal(bridge.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+
+  // +500 ms initial A press clears Start Screen into 6-star -> 4K Bink2 -> Rockstar -> UI TEXT SIZE.
+  clock.advanceTo(visibleAt + FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+
+  // Suppose 4K Bink2 finishes late so UI TEXT SIZE appears at +175.2 s (352 s wall clock):
+  // Phases 1-3 remain intact through +180 s, and Phase 4a seamlessly continues with 10 spaced A
+  // confirmations (184s..211s every 3000 ms, 200 ms hold) through UI TEXT SIZE -> FINISH SETUP?.
+  for (let i = 0; i < 10; i++) {
+    const atMs = 184000 + i * 3000;
+    clock.advanceTo(visibleAt + atMs);
+    assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, `Phase 4a A #${i} at +${atMs} ms`);
+    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1);
+    assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, `Phase 4a A #${i} held >= 180 ms`);
+    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS);
+    assert.equal(bridge.getSnapshot().buttons, 0, `Phase 4a A #${i} released cleanly`);
+  }
+
+  // Phase 4b (218s..316s): 7 rounds of Up x6, Down, Down, A every 14000 ms for LEGAL NOTICES ("Next >").
+  const expectedCycle = [
+    [0, INPUT_BUTTONS.DPAD_UP],
+    [400, INPUT_BUTTONS.DPAD_UP],
+    [800, INPUT_BUTTONS.DPAD_UP],
+    [1200, INPUT_BUTTONS.DPAD_UP],
+    [1600, INPUT_BUTTONS.DPAD_UP],
+    [2000, INPUT_BUTTONS.DPAD_UP],
+    [3000, INPUT_BUTTONS.DPAD_DOWN],
+    [4500, INPUT_BUTTONS.DPAD_DOWN],
+    [6500, INPUT_BUTTONS.A],
+  ];
+  for (let round = 0; round < 7; round++) {
+    const base = 218000 + round * 14000;
+    for (const [offsetMs, btn] of expectedCycle) {
+      clock.advanceTo(visibleAt + base + offsetMs);
+      assert.equal(bridge.getSnapshot().buttons, btn, `Phase 4b round ${round} +${offsetMs} ms`);
+      clock.advanceTo(visibleAt + base + offsetMs + CHROME_MENU_FLOW_4_HOLD_MS - 1);
+      assert.equal(bridge.getSnapshot().buttons, btn);
+      clock.advanceTo(visibleAt + base + offsetMs + CHROME_MENU_FLOW_4_HOLD_MS);
+      assert.equal(bridge.getSnapshot().buttons, 0);
+    }
+  }
+
+  // Phase 4c (320s..360s): Post-Legal List -> Main Menu -> Story/Play probes (DPAD_UP 320s, A 322s,
+  // then spaced A confirmations at 328s, 334s, 340s, 346s, 352s, 358s).
+  for (const [atMs, btn] of [
+    [320000, INPUT_BUTTONS.DPAD_UP],
+    [322000, INPUT_BUTTONS.A],
+    [328000, INPUT_BUTTONS.A],
+    [334000, INPUT_BUTTONS.A],
+    [340000, INPUT_BUTTONS.A],
+    [346000, INPUT_BUTTONS.A],
+    [352000, INPUT_BUTTONS.A],
+    [358000, INPUT_BUTTONS.A],
+  ]) {
+    clock.advanceTo(visibleAt + atMs);
+    assert.equal(bridge.getSnapshot().buttons, btn, `Phase 4c press at +${atMs} ms`);
+    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS - 1);
+    assert.equal(bridge.getSnapshot().buttons, btn);
+    clock.advanceTo(visibleAt + atMs + CHROME_MENU_FLOW_4_HOLD_MS);
+    assert.equal(bridge.getSnapshot().buttons, 0);
+  }
+
+  // Zero B presses across the entire 0..380s re-anchored schedule.
+  for (let t = 0; t <= 380000; t += 100) {
+    assert.equal(
+      bridge._scriptPlayer.sampleAt(t).buttonsMask & INPUT_BUTTONS.B,
+      0,
+      `W361 schedule must never press B at t=${t}`
+    );
+  }
+
+  bridge.destroy();
+  assert.equal(clock.pendingTimeouts(), 0);
 });
