@@ -51,6 +51,9 @@ export function wgpkEntryBytes(version) {
 /** Default initial byte window for HTTP 206 Range index loading (64 KiB: header + ~3,276 entries in 1 roundtrip). */
 export const DEFAULT_INITIAL_RANGE_BYTES = 64 * 1024;
 
+/** Default upper cap for falling back to a full HTTP 200 OK buffer during ranged pack loading (256 MiB). */
+export const DEFAULT_MAX_FULL_FALLBACK_BYTES = 256 * 1024 * 1024;
+
 /** Default bounded in-memory LRU cache budget for on-demand WGSL strings in ranged mode (32 MiB). */
 export const DEFAULT_MAX_CACHED_WGSL_BYTES = 32 * 1024 * 1024;
 
@@ -474,6 +477,16 @@ function validateStreamThresholdBytes(value, defaultValue = 0) {
   return value;
 }
 
+function validateMaxFullFallbackBytes(value, defaultValue = DEFAULT_MAX_FULL_FALLBACK_BYTES) {
+  if (value === undefined || value === null) {
+    return defaultValue;
+  }
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new RangeError(`maxFullFallbackBytes must be a non-negative integer, got: ${value}`);
+  }
+  return value;
+}
+
 function validateMaxConcurrentRangeFetches(
   value,
   defaultValue = DEFAULT_MAX_CONCURRENT_RANGE_FETCHES
@@ -743,11 +756,39 @@ function normalizeHashIterable(hashes) {
   return keys;
 }
 
-function defaultSleep(ms) {
+function createAbortError(signal) {
+  if (signal && signal.reason instanceof Error) {
+    return signal.reason;
+  }
+  const err = new Error('The operation was aborted.');
+  err.name = 'AbortError';
+  err.code = 'ABORT_ERR';
+  return err;
+}
+
+function defaultSleep(ms, signal = null) {
+  if (signal && signal.aborted) {
+    return Promise.reject(createAbortError(signal));
+  }
   if (ms <= 0) {
     return Promise.resolve();
   }
-  return new Promise((resolve) => setTimeout(resolve, ms));
+  return new Promise((resolve, reject) => {
+    let onAbort = null;
+    const timer = setTimeout(() => {
+      if (signal && onAbort && typeof signal.removeEventListener === 'function') {
+        signal.removeEventListener('abort', onAbort);
+      }
+      resolve();
+    }, ms);
+    if (signal && typeof signal.addEventListener === 'function') {
+      onAbort = () => {
+        clearTimeout(timer);
+        reject(createAbortError(signal));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
 }
 
 function computeRangeRetryDelayMs(baseDelayMs, attemptIndex) {
@@ -766,6 +807,9 @@ function isRetryableRangeFetchError(err, fetchInit) {
     return false;
   }
   if (err.name === 'AbortError' || err.code === 'ABORT_ERR') {
+    return false;
+  }
+  if (err.code === 'WGPK_FULL_FALLBACK_REJECTED') {
     return false;
   }
   if (err.name === 'AssertionError' || err.code === 'ERR_ASSERTION') {
@@ -846,7 +890,10 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
   const isV2 = version === WGPK_VERSION_V2;
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const rawEntries = new Array(entryCount);
-  const ranges = [];
+  let ranges = null;
+  let prevNonEmptyEnd = dataStart;
+  let prevNonEmptyStart = -1;
+  let prevNonEmptyIndex = -1;
   const stageCounts = { vertex: 0, fragment: 0, compute: 0 };
   let totalPayloadBytes = 0;
   let maxEnd = dataStart;
@@ -904,7 +951,28 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
     }
 
     if (length > 0) {
-      ranges.push({ start: offset, end, index: idx });
+      if (ranges !== null) {
+        ranges.push({ start: offset, end, index: idx });
+      } else if (offset < prevNonEmptyEnd) {
+        if (offset >= prevNonEmptyStart) {
+          throw new Error(
+            `WGPK overlapping payload ranges detected between entry ${prevNonEmptyIndex} [${prevNonEmptyStart}..${prevNonEmptyEnd}) and entry ${idx} [${offset}..${end})`
+          );
+        }
+        // Out-of-order TOC entries: materialize ranges array and fall back to O(N log N) sort check.
+        ranges = [];
+        for (let k = 0; k < idx; k += 1) {
+          const e = rawEntries[k];
+          if (e.length > 0) {
+            ranges.push({ start: e.offset, end: e.end, index: e.index });
+          }
+        }
+        ranges.push({ start: offset, end, index: idx });
+      } else {
+        prevNonEmptyStart = offset;
+        prevNonEmptyEnd = end;
+        prevNonEmptyIndex = idx;
+      }
     }
 
     if (end > maxEnd) {
@@ -926,8 +994,8 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
     };
   }
 
-  // Reject overlapping non-empty payload ranges across entries.
-  if (ranges.length > 1) {
+  // Reject overlapping non-empty payload ranges across out-of-order entries.
+  if (ranges !== null && ranges.length > 1) {
     ranges.sort((a, b) =>
       a.start < b.start ? -1 : a.start > b.start ? 1 : a.end < b.end ? -1 : a.end > b.end ? 1 : 0
     );
@@ -945,9 +1013,12 @@ function parseWgpkEntryTable(bytes, header, totalFileBytes) {
   return { rawEntries, stageCounts, totalPayloadBytes, maxEnd };
 }
 
-async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
+async function fetchRangeChunk(fetcher, url, start, end, fetchInit, rangeOptions = {}) {
   if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
     throw new RangeError(`Invalid HTTP byte range: bytes=${start}-${end}`);
+  }
+  if (fetchInit && fetchInit.signal && fetchInit.signal.aborted) {
+    throw createAbortError(fetchInit.signal);
   }
   const rangeHeader = `bytes=${start}-${end}`;
   const response = await fetcher(
@@ -967,12 +1038,46 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
     throw err;
   }
 
-  const buffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
   const contentRange = parseContentRange(getResponseHeader(response, 'content-range'));
   const contentLength = parseNonNegativeInt(getResponseHeader(response, 'content-length'));
   const etag = normalizeHeaderString(getResponseHeader(response, 'etag'));
   const lastModified = normalizeHeaderString(getResponseHeader(response, 'last-modified'));
+
+  if (response.status !== 206) {
+    const requirePartial = Boolean(rangeOptions && rangeOptions.requirePartialContent === true);
+    const maxFullFallbackBytes =
+      rangeOptions && typeof rangeOptions.maxFullFallbackBytes === 'number'
+        ? rangeOptions.maxFullFallbackBytes
+        : DEFAULT_MAX_FULL_FALLBACK_BYTES;
+    const exceedsCap =
+      maxFullFallbackBytes > 0 && contentLength !== null && contentLength > maxFullFallbackBytes;
+    if (requirePartial || exceedsCap) {
+      if (response.body && typeof response.body.cancel === 'function') {
+        try {
+          const cancelResult = response.body.cancel();
+          if (cancelResult && typeof cancelResult.catch === 'function') {
+            cancelResult.catch(() => {});
+          }
+        } catch (_) {
+          // Best-effort cancellation of oversized 200 OK body.
+        }
+      }
+      const sizeDetail =
+        contentLength !== null ? `${contentLength} bytes` : 'unknown size';
+      const err = new Error(
+        `WGSL pack range request (${rangeHeader}) from "${url}" received HTTP ${response.status} (${sizeDetail}) instead of 206 Partial Content; refusing full-pack buffer fallback`
+      );
+      err.httpStatus = response.status;
+      err.code = 'WGPK_FULL_FALLBACK_REJECTED';
+      err.contentLength = contentLength;
+      err.etag = etag;
+      err.lastModified = lastModified;
+      throw err;
+    }
+  }
+
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
   const totalSize =
     contentRange && contentRange.total !== null
       ? contentRange.total
@@ -996,17 +1101,25 @@ async function fetchRangeChunk(fetcher, url, start, end, fetchInit) {
 async function fetchRangeChunkWithRetry(fetcher, url, start, end, fetchInit, retryOptions = {}) {
   const maxRetries = validateMaxRangeFetchRetries(retryOptions.maxRangeFetchRetries);
   const baseDelayMs = validateRangeRetryDelayMs(retryOptions.rangeRetryDelayMs);
-  const sleep = validateSleepFn(retryOptions.sleepFn) || defaultSleep;
+  const customSleep = validateSleepFn(retryOptions.sleepFn);
   const onAttempt = typeof retryOptions.onAttempt === 'function' ? retryOptions.onAttempt : null;
   const onRetry = typeof retryOptions.onRetry === 'function' ? retryOptions.onRetry : null;
+  const rangeOptions = {
+    maxFullFallbackBytes: validateMaxFullFallbackBytes(retryOptions.maxFullFallbackBytes),
+    requirePartialContent: Boolean(retryOptions.requirePartialContent === true),
+  };
+  const signal = fetchInit && fetchInit.signal ? fetchInit.signal : null;
 
   let attempt = 0;
   for (;;) {
+    if (signal && signal.aborted) {
+      throw createAbortError(signal);
+    }
     if (onAttempt) {
       onAttempt();
     }
     try {
-      return await fetchRangeChunk(fetcher, url, start, end, fetchInit);
+      return await fetchRangeChunk(fetcher, url, start, end, fetchInit, rangeOptions);
     } catch (err) {
       if (attempt >= maxRetries || !isRetryableRangeFetchError(err, fetchInit)) {
         throw err;
@@ -1016,9 +1129,13 @@ async function fetchRangeChunkWithRetry(fetcher, url, start, end, fetchInit, ret
       }
       const delayMs = computeRangeRetryDelayMs(baseDelayMs, attempt);
       attempt += 1;
-      await sleep(delayMs);
-      if (fetchInit && fetchInit.signal && fetchInit.signal.aborted) {
-        throw err;
+      if (customSleep) {
+        await customSleep(delayMs);
+      } else {
+        await defaultSleep(delayMs, signal);
+      }
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
       }
     }
   }
@@ -1481,6 +1598,7 @@ export class WgslPack {
     initialRangeBytesFetched = 0,
     initialRangeFetchRetries = 0,
     initialRangeBytes = DEFAULT_INITIAL_RANGE_BYTES,
+    maxFullFallbackBytes = DEFAULT_MAX_FULL_FALLBACK_BYTES,
     etag = null,
     lastModified = null,
     totalSize = null,
@@ -1523,6 +1641,8 @@ export class WgslPack {
     this._fetchInit = fetchInit;
     this._initialRangeBytes =
       mode === 'ranged' ? validateInitialRangeBytes(initialRangeBytes) : null;
+    this._maxFullFallbackBytes =
+      mode === 'ranged' ? validateMaxFullFallbackBytes(maxFullFallbackBytes) : null;
     this._maxCachedWgslBytes =
       mode === 'ranged'
         ? resolveMaxCacheBytes({ maxCacheBytes, maxCachedWgslBytes })
@@ -2056,7 +2176,10 @@ export class WgslPack {
     return count;
   }
 
-  _acquireRangeFetchSlot() {
+  _acquireRangeFetchSlot(priority = false, signal = null) {
+    if (signal && signal.aborted) {
+      return Promise.reject(createAbortError(signal));
+    }
     const limit = this._maxConcurrentRangeFetches;
     if (limit === null || limit === 0 || this._activeRangeFetches < limit) {
       this._activeRangeFetches += 1;
@@ -2066,18 +2189,45 @@ export class WgslPack {
       this._statsVersion += 1;
       return null;
     }
-    return new Promise((resolve) => {
-      this._rangeFetchWaiters.push(resolve);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve: () => {
+          if (signal && onAbort && typeof signal.removeEventListener === 'function') {
+            signal.removeEventListener('abort', onAbort);
+          }
+          resolve();
+        },
+      };
+      let onAbort = null;
+      if (signal && typeof signal.addEventListener === 'function') {
+        onAbort = () => {
+          const idx = this._rangeFetchWaiters.indexOf(waiter);
+          if (idx !== -1) {
+            this._rangeFetchWaiters.splice(idx, 1);
+            reject(createAbortError(signal));
+          }
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      if (priority) {
+        this._rangeFetchWaiters.unshift(waiter);
+      } else {
+        this._rangeFetchWaiters.push(waiter);
+      }
     });
   }
 
   _releaseRangeFetchSlot() {
     const limit = this._maxConcurrentRangeFetches;
     if (limit !== null && limit > 0 && this._rangeFetchWaiters.length > 0) {
-      // Transfer the slot directly to the next FIFO waiter so _activeRangeFetches never
+      // Transfer the slot directly to the next queued waiter so _activeRangeFetches never
       // exceeds the configured limit and new arrivals cannot jump ahead in the queue.
       const next = this._rangeFetchWaiters.shift();
-      next();
+      if (typeof next === 'function') {
+        next();
+      } else if (next && typeof next.resolve === 'function') {
+        next.resolve();
+      }
       return;
     }
     if (this._activeRangeFetches > 0) {
@@ -2086,8 +2236,10 @@ export class WgslPack {
     }
   }
 
-  async _withRangeFetchSlot(fn) {
-    const waitPromise = this._acquireRangeFetchSlot();
+  async _withRangeFetchSlot(fn, opts = null) {
+    const priority = Boolean(opts && opts.priority === true);
+    const signal = opts && opts.signal ? opts.signal : null;
+    const waitPromise = this._acquireRangeFetchSlot(priority, signal);
     if (waitPromise !== null) {
       await waitPromise;
     }
@@ -2098,19 +2250,40 @@ export class WgslPack {
     }
   }
 
-  async _fetchRangeChunkBounded(fetcher, start, end) {
+  async _fetchRangeChunkBounded(fetcher, start, end, opts = null) {
     const maxRetries = this._maxRangeFetchRetries ?? 0;
     const baseDelayMs = this._rangeRetryDelayMs ?? DEFAULT_RANGE_RETRY_DELAY_MS;
-    const sleep = this._sleepFn || defaultSleep;
+    const customSleep = this._sleepFn || null;
+    const priority = Boolean(opts && opts.priority === true);
+    const signal = this._fetchInit && this._fetchInit.signal ? this._fetchInit.signal : null;
+    const maxFullFallbackBytes =
+      typeof this._maxFullFallbackBytes === 'number'
+        ? this._maxFullFallbackBytes
+        : DEFAULT_MAX_FULL_FALLBACK_BYTES;
+    const requirePartialContent = Boolean(
+      this.totalSize !== null &&
+        maxFullFallbackBytes > 0 &&
+        this.totalSize > maxFullFallbackBytes
+    );
+    const rangeOptions = { maxFullFallbackBytes, requirePartialContent };
 
     let attempt = 0;
     for (;;) {
+      if (signal && signal.aborted) {
+        throw createAbortError(signal);
+      }
       try {
-        return await this._withRangeFetchSlot(() => {
-          this._rangeFetches += 1;
-          this._statsVersion += 1;
-          return fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit);
-        });
+        return await this._withRangeFetchSlot(
+          () => {
+            if (signal && signal.aborted) {
+              throw createAbortError(signal);
+            }
+            this._rangeFetches += 1;
+            this._statsVersion += 1;
+            return fetchRangeChunk(fetcher, this.url, start, end, this._fetchInit, rangeOptions);
+          },
+          { priority, signal }
+        );
       } catch (err) {
         if (attempt >= maxRetries || !isRetryableRangeFetchError(err, this._fetchInit)) {
           throw err;
@@ -2119,9 +2292,13 @@ export class WgslPack {
         this._statsVersion += 1;
         const delayMs = computeRangeRetryDelayMs(baseDelayMs, attempt);
         attempt += 1;
-        await sleep(delayMs);
-        if (this._fetchInit && this._fetchInit.signal && this._fetchInit.signal.aborted) {
-          throw err;
+        if (customSleep) {
+          await customSleep(delayMs);
+        } else {
+          await defaultSleep(delayMs, signal);
+        }
+        if (signal && signal.aborted) {
+          throw createAbortError(signal);
         }
       }
     }
@@ -2203,7 +2380,9 @@ export class WgslPack {
         WGPK_HEADER_BYTES,
         this._initialRangeBytes || DEFAULT_INITIAL_RANGE_BYTES
       );
-      const initialChunk = await this._fetchRangeChunkBounded(fetcher, 0, initialBytes - 1);
+      const initialChunk = await this._fetchRangeChunkBounded(fetcher, 0, initialBytes - 1, {
+        priority: true,
+      });
       this._rangeBytesFetched += sanitizeNonNegativeInt(initialChunk.bytes.byteLength, 0);
       this._statsVersion += 1;
 
@@ -2242,7 +2421,9 @@ export class WgslPack {
           let have = initialChunk.bytes.byteLength;
 
           while (have < tableEnd) {
-            const remainder = await this._fetchRangeChunkBounded(fetcher, have, tableEnd - 1);
+            const remainder = await this._fetchRangeChunkBounded(fetcher, have, tableEnd - 1, {
+              priority: true,
+            });
             this._rangeBytesFetched += sanitizeNonNegativeInt(remainder.bytes.byteLength, 0);
             this._statsVersion += 1;
 
@@ -2526,15 +2707,26 @@ export class WgslPack {
             if (staleReason === null) {
               const entryIdx =
                 currentEntry._index !== undefined ? currentEntry._index : currentEntry.hashHex;
-              const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
-              if (!reloaded && this.url && looksLikeMidShaderCorruption(wgsl)) {
-                staleReason = 'mid-shader offset corruption detected';
-              } else {
-                if (this._rangedDecodeCounter) {
-                  this._rangedDecodeCounter.count += 1;
+              let wgsl = null;
+              try {
+                wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+              } catch (decodeErr) {
+                if (!reloaded && this.url) {
+                  staleReason = 'invalid UTF-8 payload (possible shifted offsets)';
+                } else {
+                  throw decodeErr;
                 }
-                this._putWgslCache(key, wgsl, currentLength);
-                return wgsl;
+              }
+              if (staleReason === null) {
+                if (!reloaded && this.url && looksLikeMidShaderCorruption(wgsl)) {
+                  staleReason = 'mid-shader offset corruption detected';
+                } else {
+                  if (this._rangedDecodeCounter) {
+                    this._rangedDecodeCounter.count += 1;
+                  }
+                  this._putWgslCache(key, wgsl, currentLength);
+                  return wgsl;
+                }
               }
             }
           }
@@ -2753,15 +2945,32 @@ export class WgslPack {
       const deferreds = batch.entries.map((item) => {
         let resolve;
         let reject;
+        let settled = false;
         const promise = new Promise((res, rej) => {
-          resolve = res;
-          reject = rej;
+          resolve = (val) => {
+            if (!settled) {
+              settled = true;
+              res(val);
+            }
+          };
+          reject = (err) => {
+            if (!settled) {
+              settled = true;
+              rej(err);
+            }
+          };
         });
         // Prevent unhandled rejection noise if the batch fails and only prefetchHashes() catches.
         promise.catch(() => {});
         this._inFlightFetches.set(item.key, promise);
         this._statsVersion += 1;
-        return { item, promise, resolve, reject };
+        return {
+          item,
+          promise,
+          resolve,
+          reject,
+          isSettled: () => settled,
+        };
       });
 
       const clearInFlight = () => {
@@ -2938,138 +3147,155 @@ export class WgslPack {
       };
 
       return (async () => {
-        let chunk;
         try {
-          chunk = await this._fetchRangeChunkBounded(fetcher, batch.start, batch.rangeEnd);
-        } catch (err) {
+          let chunk;
+          try {
+            chunk = await this._fetchRangeChunkBounded(fetcher, batch.start, batch.rangeEnd);
+          } catch (err) {
+            if (
+              this.url &&
+              (this._detectErrorStaleReason(err) !== null ||
+                this._indexGeneration !== generationBeforeFetch)
+            ) {
+              await runStaleReload();
+              return;
+            }
+            clearInFlight();
+            for (let i = 0; i < deferreds.length; i += 1) {
+              deferreds[i].reject(err);
+            }
+            throw err;
+          }
+
+          const chunkBytes = sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
+          this._rangeBytesFetched += chunkBytes;
+          this._statsVersion += 1;
+          bytesFetched += chunkBytes;
+
           if (
             this.url &&
-            (this._detectErrorStaleReason(err) !== null ||
+            (this._detectChunkStaleReason(chunk) !== null ||
               this._indexGeneration !== generationBeforeFetch)
           ) {
             await runStaleReload();
             return;
           }
-          clearInFlight();
-          for (let i = 0; i < deferreds.length; i += 1) {
-            deferreds[i].reject(err);
-          }
-          throw err;
-        }
 
-        const chunkBytes = sanitizeNonNegativeInt(chunk.bytes.byteLength, 0);
-        this._rangeBytesFetched += chunkBytes;
-        this._statsVersion += 1;
-        bytesFetched += chunkBytes;
-
-        if (
-          this.url &&
-          (this._detectChunkStaleReason(chunk) !== null ||
-            this._indexGeneration !== generationBeforeFetch)
-        ) {
-          await runStaleReload();
-          return;
-        }
-
-        const expectedSpan = batch.spanBytes;
-        let truncatedStale = false;
-        try {
-          if (chunk.status === 206) {
-            if (chunk.contentRange && chunk.contentRange.start !== batch.start) {
-              throw new Error(
-                `WGPK ranged prefetch mismatch: expected start byte ${batch.start}, got ${chunk.contentRange.start}`
-              );
-            }
-            if (chunk.bytes.byteLength < expectedSpan) {
-              if (
-                this.url &&
-                (this.etag !== null || this.totalSize !== null || this.lastModified !== null)
-              ) {
-                truncatedStale = true;
-              } else {
+          const expectedSpan = batch.spanBytes;
+          let truncatedStale = false;
+          try {
+            if (chunk.status === 206) {
+              if (chunk.contentRange && chunk.contentRange.start !== batch.start) {
                 throw new Error(
-                  `WGPK ranged prefetch truncated: expected ${expectedSpan} bytes for [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength}`
+                  `WGPK ranged prefetch mismatch: expected start byte ${batch.start}, got ${chunk.contentRange.start}`
                 );
               }
+              if (chunk.bytes.byteLength < expectedSpan) {
+                if (
+                  this.url &&
+                  (this.etag !== null || this.totalSize !== null || this.lastModified !== null)
+                ) {
+                  truncatedStale = true;
+                } else {
+                  throw new Error(
+                    `WGPK ranged prefetch truncated: expected ${expectedSpan} bytes for [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength}`
+                  );
+                }
+              }
+            } else if (chunk.bytes.byteLength < batch.end) {
+              throw new Error(
+                `WGPK full prefetch response truncated: need byte range [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength} bytes`
+              );
             }
-          } else if (chunk.bytes.byteLength < batch.end) {
-            throw new Error(
-              `WGPK full prefetch response truncated: need byte range [${batch.start}..${batch.end}), received ${chunk.bytes.byteLength} bytes`
-            );
+          } catch (err) {
+            clearInFlight();
+            for (let i = 0; i < deferreds.length; i += 1) {
+              deferreds[i].reject(err);
+            }
+            throw err;
           }
-        } catch (err) {
+
+          if (truncatedStale) {
+            await runStaleReload();
+            return;
+          }
+
+          const decodedResults = new Array(deferreds.length);
+          let firstDecodeError = null;
+          let detectedMidShaderCorruption = false;
+          for (let i = 0; i < deferreds.length; i += 1) {
+            const { item } = deferreds[i];
+            const relStart = chunk.status === 206 ? item.start - batch.start : item.start;
+            const payloadBytes = chunk.bytes.subarray(relStart, relStart + item.length);
+            const entryIdx =
+              item.entry._index !== undefined ? item.entry._index : item.entry.hashHex;
+            try {
+              const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
+              if (this.url && looksLikeMidShaderCorruption(wgsl)) {
+                detectedMidShaderCorruption = true;
+                break;
+              }
+              decodedResults[i] = { ok: true, wgsl };
+            } catch (decodeErr) {
+              if (firstDecodeError === null) {
+                firstDecodeError = decodeErr;
+              }
+              decodedResults[i] = { ok: false, err: decodeErr };
+            }
+          }
+
+          if (detectedMidShaderCorruption) {
+            await runStaleReload();
+            return;
+          }
+
+          for (let i = 0; i < deferreds.length; i += 1) {
+            const res = decodedResults[i];
+            if (res.ok) {
+              const { item } = deferreds[i];
+              if (this._rangedDecodeCounter) {
+                this._rangedDecodeCounter.count += 1;
+              }
+              this._putWgslCache(item.key, res.wgsl, item.length);
+              prefetched += 1;
+              this._prefetchShaders += 1;
+              this._statsVersion += 1;
+            }
+          }
+
+          recordCoalescedSpanStats(batch);
+          this._prefetchBatches += 1;
+          this._statsVersion += 1;
+          completedBatches += 1;
+          clearInFlight();
+
+          for (let i = 0; i < deferreds.length; i += 1) {
+            const res = decodedResults[i];
+            if (res.ok) {
+              deferreds[i].resolve(res.wgsl);
+            } else {
+              deferreds[i].reject(res.err);
+            }
+          }
+
+          if (firstDecodeError !== null) {
+            throw firstDecodeError;
+          }
+        } catch (unexpectedErr) {
           clearInFlight();
           for (let i = 0; i < deferreds.length; i += 1) {
-            deferreds[i].reject(err);
-          }
-          throw err;
-        }
-
-        if (truncatedStale) {
-          await runStaleReload();
-          return;
-        }
-
-        const decodedResults = new Array(deferreds.length);
-        let firstDecodeError = null;
-        let detectedMidShaderCorruption = false;
-        for (let i = 0; i < deferreds.length; i += 1) {
-          const { item } = deferreds[i];
-          const relStart = chunk.status === 206 ? item.start - batch.start : item.start;
-          const payloadBytes = chunk.bytes.subarray(relStart, relStart + item.length);
-          const entryIdx =
-            item.entry._index !== undefined ? item.entry._index : item.entry.hashHex;
-          try {
-            const wgsl = decodeUtf8Strict(payloadBytes, entryIdx);
-            if (this.url && looksLikeMidShaderCorruption(wgsl)) {
-              detectedMidShaderCorruption = true;
-              break;
+            if (!deferreds[i].isSettled()) {
+              deferreds[i].reject(unexpectedErr);
             }
-            decodedResults[i] = { ok: true, wgsl };
-          } catch (decodeErr) {
-            if (firstDecodeError === null) {
-              firstDecodeError = decodeErr;
+          }
+          throw unexpectedErr;
+        } finally {
+          clearInFlight();
+          for (let i = 0; i < deferreds.length; i += 1) {
+            if (!deferreds[i].isSettled()) {
+              deferreds[i].reject(new Error('WGPK prefetch batch exited without settling shader promise'));
             }
-            decodedResults[i] = { ok: false, err: decodeErr };
           }
-        }
-
-        if (detectedMidShaderCorruption) {
-          await runStaleReload();
-          return;
-        }
-
-        for (let i = 0; i < deferreds.length; i += 1) {
-          const res = decodedResults[i];
-          if (res.ok) {
-            const { item } = deferreds[i];
-            if (this._rangedDecodeCounter) {
-              this._rangedDecodeCounter.count += 1;
-            }
-            this._putWgslCache(item.key, res.wgsl, item.length);
-            prefetched += 1;
-            this._prefetchShaders += 1;
-            this._statsVersion += 1;
-          }
-        }
-
-        recordCoalescedSpanStats(batch);
-        this._prefetchBatches += 1;
-        this._statsVersion += 1;
-        completedBatches += 1;
-        clearInFlight();
-
-        for (let i = 0; i < deferreds.length; i += 1) {
-          const res = decodedResults[i];
-          if (res.ok) {
-            deferreds[i].resolve(res.wgsl);
-          } else {
-            deferreds[i].reject(res.err);
-          }
-        }
-
-        if (firstDecodeError !== null) {
-          throw firstDecodeError;
         }
       })();
     });
@@ -3505,6 +3731,9 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
   const initialRangeBytes = validateInitialRangeBytes(
     options ? options.initialRangeBytes : undefined
   );
+  const maxFullFallbackBytes = validateMaxFullFallbackBytes(
+    options ? options.maxFullFallbackBytes : undefined
+  );
   const initialRangeFetches = sanitizeNonNegativeInt(
     options ? options.initialRangeFetches : 0,
     0
@@ -3546,6 +3775,7 @@ export function parseWgslPackIndex(indexBuffer, options = {}) {
     prefetchMaxGapBytes,
     prefetchMaxSpanBytes,
     initialRangeBytes,
+    maxFullFallbackBytes,
     initialRangeFetches,
     initialRangeBytesFetched,
     initialRangeFetchRetries,
@@ -3579,6 +3809,9 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
   const prefetchMaxSpanBytes = resolvePrefetchMaxSpanBytes(options);
   const initialRangeBytes = validateInitialRangeBytes(
     options ? options.initialRangeBytes : undefined
+  );
+  const maxFullFallbackBytes = validateMaxFullFallbackBytes(
+    options ? options.maxFullFallbackBytes : undefined
   );
 
   // If the server returned 200 OK instead of 206 Partial Content, fall back seamlessly to buffer mode.
@@ -3643,6 +3876,10 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
           maxRangeFetchRetries,
           rangeRetryDelayMs,
           sleepFn,
+          maxFullFallbackBytes,
+          requirePartialContent: Boolean(
+            totalBytes !== null && maxFullFallbackBytes > 0 && totalBytes > maxFullFallbackBytes
+          ),
           onAttempt: () => {
             rangeFetches += 1;
           },
@@ -3715,6 +3952,7 @@ async function finishPackIndexFromInitialChunk(url, fetcher, initialChunk, optio
     etag,
     lastModified,
     initialRangeBytes,
+    maxFullFallbackBytes,
     fetch: fetcher,
     fetchInit: options.fetchInit,
     maxCachedWgslBytes,
@@ -3766,6 +4004,7 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
   }
 
   const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
+  const maxFullFallbackBytes = validateMaxFullFallbackBytes(options.maxFullFallbackBytes);
   resolveMaxCacheBytes(options);
   validateMaxCacheEntries(options.maxCacheEntries, null);
   validateMaxConcurrentRangeFetches(options.maxConcurrentRangeFetches);
@@ -3787,6 +4026,8 @@ export async function loadIndexFromUrl(url, fetchImplOrOptions, maybeOptions) {
       maxRangeFetchRetries,
       rangeRetryDelayMs,
       sleepFn,
+      maxFullFallbackBytes,
+      requirePartialContent: Boolean(options.requirePartialContent === true),
       onAttempt: () => {
         initialRangeFetches += 1;
       },
@@ -3835,6 +4076,7 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
 
   if (streamThresholdBytes > 0) {
     const initialRangeBytes = validateInitialRangeBytes(options.initialRangeBytes);
+    const maxFullFallbackBytes = validateMaxFullFallbackBytes(options.maxFullFallbackBytes);
     resolveMaxCacheBytes(options);
     validateMaxCacheEntries(options.maxCacheEntries, null);
     validateMaxConcurrentRangeFetches(options.maxConcurrentRangeFetches);
@@ -3855,18 +4097,30 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
     );
     if (headResponse && headResponse.ok) {
       const acceptRanges = getResponseHeader(headResponse, 'accept-ranges');
-      if (acceptRanges && acceptRanges.trim().toLowerCase() === 'none') {
+      const contentLength = parseNonNegativeInt(getResponseHeader(headResponse, 'content-length'));
+      const rangeDisabled = Boolean(acceptRanges && acceptRanges.trim().toLowerCase() === 'none');
+      if (rangeDisabled) {
+        if (
+          contentLength !== null &&
+          contentLength > streamThresholdBytes &&
+          maxFullFallbackBytes > 0 &&
+          contentLength > maxFullFallbackBytes
+        ) {
+          const err = new Error(
+            `WGSL pack "${url}" is ${contentLength} bytes (> ${maxFullFallbackBytes} byte full-buffer cap) and server returned Accept-Ranges: none; refusing full-pack download`
+          );
+          err.code = 'WGPK_FULL_FALLBACK_REJECTED';
+          err.contentLength = contentLength;
+          throw err;
+        }
         headResolved = true;
         useFullGet = true;
-      } else {
-        const contentLength = parseNonNegativeInt(getResponseHeader(headResponse, 'content-length'));
-        if (contentLength !== null) {
-          headResolved = true;
-          if (contentLength > streamThresholdBytes) {
-            useRanged = true;
-          } else {
-            useFullGet = true;
-          }
+      } else if (contentLength !== null) {
+        headResolved = true;
+        if (contentLength > streamThresholdBytes) {
+          useRanged = true;
+        } else {
+          useFullGet = true;
         }
       }
     } else if (headResponse && headResponse.status !== 405 && headResponse.status !== 501) {
@@ -3893,6 +4147,7 @@ export async function loadFromUrl(url, fetchImplOrOptions, maybeOptions) {
           maxRangeFetchRetries,
           rangeRetryDelayMs,
           sleepFn,
+          maxFullFallbackBytes,
           onAttempt: () => {
             probeFetches += 1;
           },
