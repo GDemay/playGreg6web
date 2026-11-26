@@ -370,6 +370,7 @@ const FALLBACK_PROFILE = Object.freeze({
   DEFAULT: 'default',
   FULLSCREEN_TRIANGLE_CBV: 'fullscreen_triangle_cbv',
   TEXTURED_QUAD_24B: 'textured_quad_24b',
+  SPLASH_RECT_24B: 'splash_rect_24b',
 });
 
 const FALLBACK_PROFILE_ALIASES = Object.freeze({
@@ -383,6 +384,12 @@ const FALLBACK_PROFILE_ALIASES = Object.freeze({
   textured_24b: FALLBACK_PROFILE.TEXTURED_QUAD_24B,
   'textured-quad-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
   'textured-24b': FALLBACK_PROFILE.TEXTURED_QUAD_24B,
+  splash_rect_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+  'splash-rect-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
+  rectlist_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+  'rectlist-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
+  frame1_splash_24b: FALLBACK_PROFILE.SPLASH_RECT_24B,
+  'frame1-splash-24b': FALLBACK_PROFILE.SPLASH_RECT_24B,
 });
 
 const TEXTURED_QUAD_24B_STRIDE = 24;
@@ -395,6 +402,140 @@ const FALLBACK_VERTEX_LAYOUT_24B = Object.freeze({
     Object.freeze({ shaderLocation: 1, offset: 16, format: 'float32x2' }),
   ]),
 });
+
+const FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B = Object.freeze({
+  arrayStride: TEXTURED_QUAD_24B_STRIDE,
+  stepMode: 'vertex',
+  attributes: Object.freeze([
+    Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x3' }),
+    Object.freeze({ shaderLocation: 1, offset: 12, format: 'unorm8x4' }),
+    Object.freeze({ shaderLocation: 2, offset: 16, format: 'float32x2' }),
+  ]),
+});
+
+const COMPACT_WGSL_THRESHOLD_CHARS = 2048;
+const COMPACT_WGSL_GROUP0_VAR_RE =
+  /(?:@group\s*\(\s*0[ui]?\s*\)\s*@binding\s*\(\s*\d+[ui]?\s*\)|@binding\s*\(\s*\d+[ui]?\s*\)\s*@group\s*\(\s*0[ui]?\s*\))\s*var(?:\s*<\s*[^>]+\s*>)?\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^;]+;/g;
+const COMPACT_WGSL_STAGE_ENTRY_RE =
+  /@(vertex|fragment|compute)\b(?:\s*@[A-Za-z_][A-Za-z0-9_]*(?:\s*\([^)]*\))?)*\s*fn\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function stripWgslCommentsCompact(code) {
+  let out = '';
+  let blockDepth = 0;
+  for (let i = 0; i < code.length; i += 1) {
+    const ch = code[i];
+    const next = i + 1 < code.length ? code[i + 1] : '';
+    if (blockDepth > 0) {
+      if (ch === '/' && next === '*') {
+        blockDepth += 1;
+        i += 1;
+      } else if (ch === '*' && next === '/') {
+        blockDepth -= 1;
+        i += 1;
+        out += ' ';
+      } else if (ch === '\n') {
+        out += '\n';
+      }
+      continue;
+    }
+    if (ch === '/' && next === '/') {
+      i += 2;
+      while (i < code.length && code[i] !== '\n') i += 1;
+      if (i < code.length && code[i] === '\n') out += '\n';
+      continue;
+    }
+    if (ch === '/' && next === '*') {
+      blockDepth = 1;
+      i += 1;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * #1077: Compact a compiled WGSL source string down to a minimal stub that preserves exact
+ * `@group(0) @binding(N)` statically-referenced declarations and stage entry-point names so
+ * `render_state_packets.js` (`parseWgslGroup0Bindings`, `findWgslStageEntryPoints`,
+ * `wgslDeclaresGroup0`) yields identical metadata while freeing 95-99% of worker JS heap.
+ */
+function compactWgslForMetadata(wgslSource) {
+  if (typeof wgslSource !== 'string' || wgslSource.length === 0) {
+    return wgslSource;
+  }
+  const cleaned = stripWgslCommentsCompact(wgslSource);
+  const fnRe = /\bfn\s+[A-Za-z_][A-Za-z0-9_]*\s*\(/g;
+  let bodies = '';
+  let hasFunction = false;
+  let match;
+  while ((match = fnRe.exec(cleaned)) !== null) {
+    let i = match.index + match[0].length;
+    let parenDepth = 1;
+    while (i < cleaned.length && parenDepth > 0) {
+      if (cleaned[i] === '(') parenDepth += 1;
+      else if (cleaned[i] === ')') parenDepth -= 1;
+      i += 1;
+    }
+    while (i < cleaned.length && cleaned[i] !== '{') {
+      if (cleaned[i] === ';') break;
+      i += 1;
+    }
+    if (i >= cleaned.length || cleaned[i] !== '{') continue;
+    hasFunction = true;
+    const bodyStart = i + 1;
+    let braceDepth = 1;
+    i += 1;
+    while (i < cleaned.length && braceDepth > 0) {
+      if (cleaned[i] === '{') braceDepth += 1;
+      else if (cleaned[i] === '}') braceDepth -= 1;
+      i += 1;
+    }
+    bodies += cleaned.slice(bodyStart, Math.max(bodyStart, i - 1)) + '\n';
+    fnRe.lastIndex = i;
+  }
+
+  const declLines = [];
+  const usedVarNames = [];
+  COMPACT_WGSL_GROUP0_VAR_RE.lastIndex = 0;
+  while ((match = COMPACT_WGSL_GROUP0_VAR_RE.exec(cleaned)) !== null) {
+    const varName = match[1];
+    if (hasFunction) {
+      const refRe = new RegExp(`(?:^|[^A-Za-z0-9_.])${varName}(?![A-Za-z0-9_])`);
+      if (!refRe.test(bodies)) {
+        continue;
+      }
+    }
+    declLines.push(match[0]);
+    usedVarNames.push(varName);
+  }
+
+  const entryLines = [];
+  const seenEntries = new Set();
+  COMPACT_WGSL_STAGE_ENTRY_RE.lastIndex = 0;
+  const bodyRefLine = usedVarNames.length > 0 ? ` _ = ${usedVarNames.join('; _ = ')}; ` : '';
+  while ((match = COMPACT_WGSL_STAGE_ENTRY_RE.exec(cleaned)) !== null) {
+    const stageAttr = match[1];
+    const fnName = match[2];
+    const key = `${stageAttr}:${fnName}`;
+    if (seenEntries.has(key)) continue;
+    seenEntries.add(key);
+    const body = entryLines.length === 0 ? bodyRefLine : '';
+    entryLines.push(`@${stageAttr} fn ${fnName}() {${body}}`);
+  }
+
+  if (entryLines.length === 0 && usedVarNames.length > 0) {
+    entryLines.push(`fn _meta_ref() {${bodyRefLine}}`);
+  }
+
+  const parts = declLines.concat(entryLines);
+  if (parts.length === 0) {
+    // Preserve @group(0) signal if present in unusual syntax so wgslDeclaresGroup0 stays accurate.
+    return WGSL_GROUP0_RE.test(cleaned) ? '@group(0) // compacted' : '';
+  }
+  const stub = parts.join('\n');
+  return stub.length < wgslSource.length ? stub : wgslSource;
+}
 
 const FNV1A_64_OFFSET_BASIS = 0xcbf29ce484222325n;
 const FNV1A_64_PRIME = 0x00000100000001b3n;
@@ -1367,10 +1508,15 @@ function loadWgslPackIntoCache(packCache, buffer, packName) {
  * Classic-worker-compatible WGPK v1 (.wgsl.pack) parser & in-memory cache.
  * Binary layout matches shaders/src/pack.rs and web/workers/wgsl_pack_loader.js byte-for-byte.
  */
+const INLINE_WGSL_PACK_MAX_DECODED_BYTES = 16 * 1024 * 1024;
+
 class InlineWgslPackCache {
   constructor() {
     this._packs = new Map();
     this._entries = new Map();
+    this._decodedCache = new Map();
+    this._decodedBytes = 0;
+    this._maxDecodedBytes = INLINE_WGSL_PACK_MAX_DECODED_BYTES;
     this._nextPackId = 0;
     this._strictDecoder = new TextDecoder('utf-8', { fatal: true });
   }
@@ -1389,6 +1535,33 @@ class InlineWgslPackCache {
       return new Uint8Array(buffer);
     }
     throw new TypeError('WGPK buffer must be an ArrayBuffer, SharedArrayBuffer, or ArrayBufferView');
+  }
+
+  _decodeEntryWgsl(hash, packBytes, offset, length) {
+    const cached = this._decodedCache.get(hash);
+    if (cached !== undefined) {
+      this._decodedCache.delete(hash);
+      this._decodedCache.set(hash, cached);
+      return cached;
+    }
+    const slice = packBytes.subarray(offset, offset + length);
+    const isShared =
+      typeof SharedArrayBuffer !== 'undefined' && packBytes.buffer instanceof SharedArrayBuffer;
+    const wgsl = this._strictDecoder.decode(isShared ? slice.slice() : slice);
+    const bytes = wgsl.length * 2;
+    if (bytes > 0 && bytes <= this._maxDecodedBytes) {
+      while (this._decodedBytes + bytes > this._maxDecodedBytes && this._decodedCache.size > 0) {
+        const oldestKey = this._decodedCache.keys().next().value;
+        const oldestVal = this._decodedCache.get(oldestKey);
+        this._decodedCache.delete(oldestKey);
+        if (typeof oldestVal === 'string') {
+          this._decodedBytes = Math.max(0, this._decodedBytes - oldestVal.length * 2);
+        }
+      }
+      this._decodedCache.set(hash, wgsl);
+      this._decodedBytes += bytes;
+    }
+    return wgsl;
   }
 
   loadPackBuffer(buffer, packName) {
@@ -1425,6 +1598,7 @@ class InlineWgslPackCache {
     const ranges = [];
     const isShared =
       typeof SharedArrayBuffer !== 'undefined' && bytes.buffer instanceof SharedArrayBuffer;
+    const selfCache = this;
 
     for (let idx = 0; idx < entryCount; idx += 1) {
       const base = WGPK_HEADER_BYTES + idx * WGPK_ENTRY_BYTES;
@@ -1444,16 +1618,24 @@ class InlineWgslPackCache {
         ranges.push({ start: offset, end, index: idx });
       }
       const slice = bytes.subarray(offset, end);
-      const wgsl = this._strictDecoder.decode(isShared ? slice.slice() : slice);
-      parsedEntries[idx] = {
+      // Validate strict UTF-8 eagerly without pinning decoded UTF-16 strings for every shader (#1077).
+      this._strictDecoder.decode(isShared ? slice.slice() : slice);
+      const entryObj = {
         hash,
         hashHex: formatShaderHashHex(hash),
         stage,
         stageCode,
         offset,
         length,
-        wgsl,
       };
+      Object.defineProperty(entryObj, 'wgsl', {
+        enumerable: true,
+        configurable: true,
+        get() {
+          return selfCache._decodeEntryWgsl(hash, bytes, offset, length);
+        },
+      });
+      parsedEntries[idx] = entryObj;
     }
 
     if (ranges.length > 1) {
@@ -1474,6 +1656,11 @@ class InlineWgslPackCache {
       for (const [key, rec] of this._entries.entries()) {
         if (rec.packName === name) {
           this._entries.delete(key);
+          const prevDecoded = this._decodedCache.get(key);
+          if (prevDecoded !== undefined) {
+            this._decodedCache.delete(key);
+            this._decodedBytes = Math.max(0, this._decodedBytes - prevDecoded.length * 2);
+          }
         }
       }
     }
@@ -1489,7 +1676,7 @@ class InlineWgslPackCache {
     this._packs.set(name, packInfo);
     for (let i = 0; i < parsedEntries.length; i += 1) {
       const entry = parsedEntries[i];
-      this._entries.set(entry.hash, { entry, packName: name });
+      this._entries.set(entry.hash, { entry, packName: name, packBytes: bytes });
     }
     return packInfo;
   }
@@ -1519,8 +1706,11 @@ class InlineWgslPackCache {
   }
 
   getShaderSource(hash) {
-    const entry = this.getByHash(hash);
-    return entry ? entry.wgsl : undefined;
+    const key = normalizeShaderHashBigInt(hash);
+    if (key === null) return undefined;
+    const rec = this._entries.get(key);
+    if (!rec) return undefined;
+    return this._decodeEntryWgsl(rec.entry.hash, rec.packBytes, rec.entry.offset, rec.entry.length);
   }
 
   getSource(hash) {
@@ -1538,6 +1728,8 @@ class InlineWgslPackCache {
   clear() {
     this._packs.clear();
     this._entries.clear();
+    this._decodedCache.clear();
+    this._decodedBytes = 0;
   }
 
   getStats() {
@@ -3009,6 +3201,7 @@ class WgpuCommandProcessor {
     this._bindGroupMeta = new Map();
     this._specializedFallbackPipelines = new Map();
     this._specializedFallbackBindGroups = new Map();
+    this._specializedFallbackShaderModules = new Map();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
     this._pendingCommandStreamStartOffset = 0;
@@ -3019,6 +3212,7 @@ class WgpuCommandProcessor {
       [FALLBACK_PROFILE.DEFAULT]: 0,
       [FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV]: 0,
       [FALLBACK_PROFILE.TEXTURED_QUAD_24B]: 0,
+      [FALLBACK_PROFILE.SPLASH_RECT_24B]: 0,
     };
     this._lastFallbackProfile = null;
 
@@ -3897,7 +4091,10 @@ class WgpuCommandProcessor {
 
     const cacheKey = `${pipeMeta.id}|${canonicalProfile}`;
     if (this._specializedFallbackPipelines.has(cacheKey)) {
-      return this._specializedFallbackPipelines.get(cacheKey);
+      const hit = this._specializedFallbackPipelines.get(cacheKey);
+      this._specializedFallbackPipelines.delete(cacheKey);
+      this._specializedFallbackPipelines.set(cacheKey, hit);
+      return hit;
     }
 
     const vsOrig = this.ensureShaderModule(pipeMeta.vsShaderId);
@@ -3906,9 +4103,19 @@ class WgpuCommandProcessor {
       return null;
     }
 
+    const getOrCreateFallbackStageModule = (stageKey, code) => {
+      const modKey = `${stageKey}:${canonicalProfile}`;
+      const cachedMod = this._specializedFallbackShaderModules.get(modKey);
+      if (cachedMod && cachedMod.code === code) {
+        return cachedMod.module;
+      }
+      const mod = this.device.createShaderModule({ code });
+      this._specializedFallbackShaderModules.set(modKey, { code, module: mod });
+      return mod;
+    };
+
     let vsModule = vsOrig.module;
     let vsEntryPoint = vsOrig.entryPoint || 'vs_main';
-    let vsCode = vsOrig.code;
     let changed = false;
 
     if (vsOrig.source === 'builtin') {
@@ -3921,8 +4128,8 @@ class WgpuCommandProcessor {
       );
       if (resolvedVs && typeof resolvedVs.wgsl === 'string' && resolvedVs.wgsl.length > 0) {
         if (resolvedVs.wgsl !== vsOrig.code) {
-          vsCode = applyRtBvhPreludeIfNeeded(resolvedVs.wgsl);
-          vsModule = this.device.createShaderModule({ code: vsCode });
+          const vsCode = applyRtBvhPreludeIfNeeded(resolvedVs.wgsl);
+          vsModule = getOrCreateFallbackStageModule('vertex', vsCode);
           vsEntryPoint = resolvedVs.entryPoint || extractWgslEntryPoint(vsCode, SHADER_STAGE.VERTEX) || 'vs_main';
           changed = true;
         }
@@ -3932,7 +4139,6 @@ class WgpuCommandProcessor {
 
     let fsModule = fsOrig ? fsOrig.module : null;
     let fsEntryPoint = fsOrig ? fsOrig.entryPoint || 'fs_main' : 'fs_main';
-    let fsCode = fsOrig ? fsOrig.code : null;
 
     if (fsOrig && fsOrig.source === 'builtin') {
       const fsHash = fsOrig.requestedHash || fsOrig.hashHex || fnv1a64Hex(`empty:fragment:${pipeMeta.fsShaderId}`);
@@ -3944,8 +4150,8 @@ class WgpuCommandProcessor {
       );
       if (resolvedFs && typeof resolvedFs.wgsl === 'string' && resolvedFs.wgsl.length > 0) {
         if (resolvedFs.wgsl !== fsOrig.code) {
-          fsCode = applyRtBvhPreludeIfNeeded(resolvedFs.wgsl);
-          fsModule = this.device.createShaderModule({ code: fsCode });
+          const fsCode = applyRtBvhPreludeIfNeeded(resolvedFs.wgsl);
+          fsModule = getOrCreateFallbackStageModule('fragment', fsCode);
           fsEntryPoint = resolvedFs.entryPoint || extractWgslEntryPoint(fsCode, SHADER_STAGE.FRAGMENT) || 'fs_main';
           changed = true;
         }
@@ -3967,7 +4173,15 @@ class WgpuCommandProcessor {
     }
 
     let vertexBuffers = [];
-    if (canonicalProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B) {
+    if (canonicalProfile === FALLBACK_PROFILE.SPLASH_RECT_24B) {
+      vertexBuffers = [
+        {
+          arrayStride: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.arrayStride,
+          stepMode: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.stepMode,
+          attributes: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.attributes.map((a) => ({ ...a })),
+        },
+      ];
+    } else if (canonicalProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B) {
       vertexBuffers = [
         {
           arrayStride: FALLBACK_VERTEX_LAYOUT_24B.arrayStride,
@@ -3979,6 +4193,8 @@ class WgpuCommandProcessor {
       vertexBuffers = [];
     }
 
+    const topology = pipeMeta.topology || 'triangle-list';
+    const targetFormat = this._getRenderTargetFormat();
     const descriptor = {
       layout: 'auto',
       vertex: {
@@ -3987,18 +4203,22 @@ class WgpuCommandProcessor {
         buffers: vertexBuffers,
       },
       primitive: {
-        topology: pipeMeta.topology || 'triangle-list',
+        topology,
       },
     };
     if (fsOrig && fsModule) {
       descriptor.fragment = {
         module: fsModule,
         entryPoint: fsEntryPoint,
-        targets: [{ format: this._getRenderTargetFormat() }],
+        targets: [{ format: targetFormat }],
       };
     }
 
-    const specFastKey = `spec:${pipeMeta.id}:${canonicalProfile}:${this._getRenderTargetFormat()}`;
+    const allBuiltinStages =
+      vsOrig.source === 'builtin' && (!fsOrig || fsOrig.source === 'builtin');
+    const specFastKey = allBuiltinStages
+      ? `spec:${canonicalProfile}:${topology}:${fsOrig ? targetFormat : 'none'}`
+      : `spec:${pipeMeta.id}:${canonicalProfile}:${topology}:${fsOrig ? targetFormat : 'none'}`;
     let pipeline;
     if (this.pipelineCache && typeof this.pipelineCache.getFastRenderPipeline === 'function') {
       pipeline = this.pipelineCache.getFastRenderPipeline(specFastKey, descriptor);
@@ -4013,7 +4233,7 @@ class WgpuCommandProcessor {
     if (!pipeline) {
       return null;
     }
-    const entry = { pipeline, profile: canonicalProfile, changed: true, vsCode, fsCode };
+    const entry = { pipeline, profile: canonicalProfile, changed: true };
     if (this._specializedFallbackPipelines.size >= MAX_SPECIALIZED_FALLBACK_PIPELINES) {
       const oldestKey = this._specializedFallbackPipelines.keys().next().value;
       if (oldestKey !== undefined) {
@@ -4037,7 +4257,10 @@ class WgpuCommandProcessor {
     }
     const key = `${pipeId}|${profile}|${bgMeta.id}`;
     if (this._specializedFallbackBindGroups.has(key)) {
-      return this._specializedFallbackBindGroups.get(key);
+      const hit = this._specializedFallbackBindGroups.get(key);
+      this._specializedFallbackBindGroups.delete(key);
+      this._specializedFallbackBindGroups.set(key, hit);
+      return hit;
     }
     try {
       const layout = specPipeline.getBindGroupLayout(groupIndex);
@@ -4046,13 +4269,15 @@ class WgpuCommandProcessor {
       }
       let entries = bgMeta.entries;
       if (
-        profile === FALLBACK_PROFILE.TEXTURED_QUAD_24B &&
+        (profile === FALLBACK_PROFILE.TEXTURED_QUAD_24B ||
+          profile === FALLBACK_PROFILE.SPLASH_RECT_24B) &&
         groupIndex === 0 &&
         !bgMeta.hasSampler &&
         typeof this.device.createSampler === 'function'
       ) {
+        const samplerBinding = profile === FALLBACK_PROFILE.SPLASH_RECT_24B ? 2 : 1;
         const synth = this.synthesizeFallbackSamplerEntries(
-          [{ binding: 1, sampler: { type: 'filtering' } }],
+          [{ binding: samplerBinding, sampler: { type: 'filtering' } }],
           entries
         );
         if (synth && Array.isArray(synth.entries)) {
@@ -5251,6 +5476,13 @@ class WgpuCommandProcessor {
           }
         },
         () => {
+          try {
+            if (typeof staging.destroy === 'function') {
+              staging.destroy();
+            }
+          } catch (_) {
+            // Ignore teardown errors on failed readback staging buffers.
+          }
           finish(null);
         }
       );
@@ -7103,6 +7335,12 @@ class WgpuCommandProcessor {
     for (const texture of this.textures.values()) {
       safeDestroy(texture);
     }
+    if (Array.isArray(this._recordedReadbacks) && this._recordedReadbacks.length > 0) {
+      for (let i = 0; i < this._recordedReadbacks.length; i += 1) {
+        safeDestroy(this._recordedReadbacks[i] && this._recordedReadbacks[i].staging);
+      }
+      this._recordedReadbacks = [];
+    }
 
     this.buffers.clear();
     this._bufferMeta.clear();
@@ -7126,6 +7364,7 @@ class WgpuCommandProcessor {
     this._pipelineMeta.clear();
     this._specializedFallbackPipelines.clear();
     this._specializedFallbackBindGroups.clear();
+    this._specializedFallbackShaderModules.clear();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
     this._pendingCommandStreamStartOffset = 0;
@@ -7917,6 +8156,13 @@ class WgpuCommandProcessor {
     ) {
       return [{ binding: 1, sampler: { type: 'filtering' } }];
     }
+    if (
+      pipeMeta &&
+      pipeMeta.fallbackProfile === FALLBACK_PROFILE.SPLASH_RECT_24B &&
+      groupIndex === 0
+    ) {
+      return [{ binding: 2, sampler: { type: 'filtering' } }];
+    }
     return null;
   }
 
@@ -8152,6 +8398,11 @@ class WgpuCommandProcessor {
       scratchBytesReleased += this._directWriteScratch.byteLength;
       this._directWriteScratch = null;
     }
+    if (this._cachedCmdBuffer && this._cachedCmdBuffer.byteLength > 4 * 1024 * 1024) {
+      scratchBytesReleased += this._cachedCmdBuffer.byteLength;
+      this._cachedCmdBuffer = null;
+      this._cachedCmdView = null;
+    }
     if (
       this.resourceTable &&
       !this.resourceTable._destroyed &&
@@ -8161,6 +8412,38 @@ class WgpuCommandProcessor {
         scratchBytesReleased += toNonNegativeInt(this.resourceTable.trimWriteScratch(), 0);
       } catch (_) {
         // Ignore scratch trim errors.
+      }
+    }
+
+    // #1077: Reclaim evicted low-priority (and optionally stale) pipelines on scene transitions.
+    if (this.pipelineCache) {
+      try {
+        if (typeof this.pipelineCache.evictLowPriority === 'function') {
+          this.pipelineCache.evictLowPriority();
+        }
+        if (
+          typeof opts.pipelineMaxAgeMs === 'number' &&
+          Number.isFinite(opts.pipelineMaxAgeMs) &&
+          opts.pipelineMaxAgeMs >= 0 &&
+          typeof this.pipelineCache.evictOlderThan === 'function'
+        ) {
+          this.pipelineCache.evictOlderThan(opts.pipelineMaxAgeMs);
+        }
+      } catch (_) {
+        // Pipeline cache trimming must never disrupt scene transitions.
+      }
+    }
+
+    // #1077: Trim replay shadow buffer copies down to 16 MiB during scene transitions.
+    const shadowTrimTargetBytes = 16 * 1024 * 1024;
+    if (this._shadowBuffers && this._shadowBufferBytes > shadowTrimTargetBytes) {
+      while (this._shadowBufferBytes > shadowTrimTargetBytes && this._shadowBuffers.size > 0) {
+        const oldestKey = this._shadowBuffers.keys().next().value;
+        const oldestBuf = this._shadowBuffers.get(oldestKey);
+        this._shadowBuffers.delete(oldestKey);
+        if (oldestBuf && typeof oldestBuf.byteLength === 'number') {
+          this._shadowBufferBytes = Math.max(0, this._shadowBufferBytes - oldestBuf.byteLength);
+        }
       }
     }
 
@@ -8333,6 +8616,9 @@ class WgpuCommandProcessor {
           this._deferredGpuDestroys.length >= this._maxDeferredGpuDestroys ||
           this._pendingDeferredDestroyBytes >= this._maxDeferredGpuDestroyBytes
         ) {
+          if (this._pendingEncoder !== null && !this._hasPendingUploadCommands) {
+            this._pendingEncoder = null;
+          }
           if (this._pendingEncoder !== null && this._hasPendingUploadCommands) {
             this._deferredHighWaterFlushes += 1;
             this._flushPendingUploads(false);
@@ -8876,6 +9162,15 @@ class WgpuCommandProcessor {
         label: `shaderModule:${id}`,
       });
     }
+    // #1077: Release full WGSL text after GPUShaderModule compilation, retaining only a compact
+    // metadata stub (@group(0) bindings + stage entry points) for downstream pipeline creation.
+    if (
+      entry.source !== 'builtin' &&
+      typeof entry.code === 'string' &&
+      entry.code.length > COMPACT_WGSL_THRESHOLD_CHARS
+    ) {
+      entry.code = compactWgslForMetadata(entry.code);
+    }
     return entry;
   }
 
@@ -8953,6 +9248,12 @@ class WgpuCommandProcessor {
     if (!anyPending) {
       this._pendingRangedPipelines.delete(id);
       return { pending: false, deferredOnly: false };
+    }
+    if (!this._pendingRangedPipelines.has(id) && this._pendingRangedPipelines.size >= 2048) {
+      const oldestId = this._pendingRangedPipelines.keys().next().value;
+      if (oldestId !== undefined) {
+        this._pendingRangedPipelines.delete(oldestId);
+      }
     }
     this._pendingRangedPipelines.set(id, {
       id,
@@ -9302,8 +9603,8 @@ class WgpuCommandProcessor {
         rangedPackCache,
         rangedLookupKey
       );
-    } else if (compiled && (wasInFlightRanged || this._pendingRangedPipelines.size > 0)) {
-      this._onRangedShaderSettled(id, true);
+    } else if (wasInFlightRanged || this._pendingRangedPipelines.size > 0) {
+      this._onRangedShaderSettled(id, Boolean(compiled));
     }
   }
 
@@ -9386,6 +9687,18 @@ class WgpuCommandProcessor {
     let vertexBuffers;
     if (effectiveFallbackProfile === FALLBACK_PROFILE.FULLSCREEN_TRIANGLE_CBV && !vsRefl) {
       vertexBuffers = [];
+    } else if (
+      effectiveFallbackProfile === FALLBACK_PROFILE.SPLASH_RECT_24B &&
+      vertexStride === TEXTURED_QUAD_24B_STRIDE &&
+      !vsRefl
+    ) {
+      vertexBuffers = [
+        {
+          arrayStride: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.arrayStride,
+          stepMode: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.stepMode,
+          attributes: FALLBACK_VERTEX_LAYOUT_SPLASH_RECT_24B.attributes.map((a) => ({ ...a })),
+        },
+      ];
     } else if (
       effectiveFallbackProfile === FALLBACK_PROFILE.TEXTURED_QUAD_24B &&
       vertexStride === TEXTURED_QUAD_24B_STRIDE &&
@@ -9737,9 +10050,17 @@ class WgpuCommandProcessor {
           stageLayout.mipLevel = mipLevel;
           stageLayout.bytesPerRow = bytesPerRow > 0 ? bytesPerRow : undefined;
           stageLayout.rowsPerImage = rowsPerImage > 0 ? rowsPerImage : undefined;
-          this.stagingPool.stageTextureUpload(encoder, texture, data, stageLayout);
-          this._hasPendingUploadCommands = true;
-          return;
+          try {
+            this.stagingPool.stageTextureUpload(encoder, texture, data, stageLayout);
+            this._hasPendingUploadCommands = true;
+            return;
+          } catch (err) {
+            if (err instanceof RangeError) {
+              this._flushPendingUploads(true);
+            } else {
+              throw err;
+            }
+          }
         }
         if (!this._hasPendingUploadCommands) {
           this._pendingEncoder = null;
@@ -11447,6 +11768,12 @@ class WgpuCommandProcessor {
         },
         () => null
       );
+      if (this._pendingTimerReadbacks.size >= 64) {
+        const oldestPromise = this._pendingTimerReadbacks.values().next().value;
+        if (oldestPromise !== undefined) {
+          this._pendingTimerReadbacks.delete(oldestPromise);
+        }
+      }
       this._pendingTimerReadbacks.add(readbackPromise);
       readbackPromise.finally(() => {
         this._pendingTimerReadbacks.delete(readbackPromise);
@@ -12397,6 +12724,19 @@ class WgpuCommandProcessor {
         texture.destroy();
       }
     }
+    if (Array.isArray(this._recordedReadbacks) && this._recordedReadbacks.length > 0) {
+      for (let i = 0; i < this._recordedReadbacks.length; i += 1) {
+        const staging = this._recordedReadbacks[i] && this._recordedReadbacks[i].staging;
+        if (staging && typeof staging.destroy === 'function') {
+          try {
+            staging.destroy();
+          } catch (_) {
+            // Ignore teardown errors on readback staging buffers.
+          }
+        }
+      }
+      this._recordedReadbacks = [];
+    }
     this._flushAllDeferredGpuDestroysImmediate(destroyedByRegistry);
 
     this.buffers.clear();
@@ -12422,6 +12762,7 @@ class WgpuCommandProcessor {
     this._pipelineMeta.clear();
     this._specializedFallbackPipelines.clear();
     this._specializedFallbackBindGroups.clear();
+    this._specializedFallbackShaderModules.clear();
     this._pendingCommandStreamShaderProfiles = null;
     this._pendingCommandStreamView = null;
     this._pendingCommandStreamStartOffset = 0;
@@ -15610,6 +15951,13 @@ function createWgpuWorkerHandler(options = {}) {
             } catch (_) {
               // Ignore transfer errors if the buffer was detached or the channel closed.
             }
+          } else if (
+            isRawArrayBuffer &&
+            rawBatchBuffer.byteLength > 4 * 1024 * 1024 &&
+            processor._cachedCmdBuffer === rawBatchBuffer
+          ) {
+            processor._cachedCmdBuffer = null;
+            processor._cachedCmdView = null;
           }
         }
         if (result.presents > 0) {

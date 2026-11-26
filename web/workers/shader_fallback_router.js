@@ -42,6 +42,8 @@
   const DEFAULT_MAX_TRACKED_MISSING_HASHES = 2048;
   const DEFAULT_MAX_CATEGORIZED_MISSING_HASHES = 8192;
   const DEFAULT_MAX_RESOLVE_CACHE_ENTRIES = 8192;
+  const DEFAULT_MAX_RESOLVE_CACHE_PACK_WGSL_BYTES = 8 * 1024 * 1024;
+  const DEFAULT_MAX_REAL_SHADERS = 4096;
   const DEFAULT_MAX_COMPILE_FAILURE_ENTRIES = 2048;
   const DEFAULT_TOP_MISSING_LIMIT = 16;
   const DEFAULT_MISSING_SUMMARY_TOP_LIMIT = 32;
@@ -988,6 +990,32 @@
       }
       this._maxResolveCacheEntries = maxResolveCache;
 
+      let maxResolveCachePackWgslBytes = DEFAULT_MAX_RESOLVE_CACHE_PACK_WGSL_BYTES;
+      if (opts.maxResolveCachePackWgslBytes !== undefined) {
+        if (
+          !Number.isInteger(opts.maxResolveCachePackWgslBytes) ||
+          opts.maxResolveCachePackWgslBytes < 0
+        ) {
+          throw new RangeError(
+            `maxResolveCachePackWgslBytes must be a non-negative integer, got ${opts.maxResolveCachePackWgslBytes}`
+          );
+        }
+        maxResolveCachePackWgslBytes = opts.maxResolveCachePackWgslBytes;
+      }
+      this._maxResolveCachePackWgslBytes = maxResolveCachePackWgslBytes;
+      this._resolveCachePackWgslBytes = 0;
+
+      let maxRealShaders = DEFAULT_MAX_REAL_SHADERS;
+      if (opts.maxRealShaders !== undefined) {
+        if (!Number.isInteger(opts.maxRealShaders) || opts.maxRealShaders < 1) {
+          throw new RangeError(
+            `maxRealShaders must be a positive integer, got ${opts.maxRealShaders}`
+          );
+        }
+        maxRealShaders = opts.maxRealShaders;
+      }
+      this._maxRealShaders = maxRealShaders;
+
       let maxCompileFailures = DEFAULT_MAX_COMPILE_FAILURE_ENTRIES;
       if (opts.maxCompileFailureEntries !== undefined) {
         if (
@@ -1151,6 +1179,7 @@
       this._resolveCacheByStage[2].clear();
       this._resolveCacheByStage[3].clear();
       this._resolveCacheEntries.clear();
+      this._resolveCachePackWgslBytes = 0;
       this._resolveCacheInvalidations += 1;
     }
 
@@ -1168,7 +1197,18 @@
       if (entry.key4 !== undefined && stageCache.get(entry.key4) === entry) {
         stageCache.delete(entry.key4);
       }
-      this._resolveCacheEntries.delete(entry);
+      if (this._resolveCacheEntries.delete(entry) && entry.packWgslBytes > 0) {
+        this._resolveCachePackWgslBytes = Math.max(
+          0,
+          this._resolveCachePackWgslBytes - entry.packWgslBytes
+        );
+      }
+    }
+
+    _touchResolveCacheEntry(entry) {
+      if (this._resolveCacheEntries.delete(entry)) {
+        this._resolveCacheEntries.set(entry, entry);
+      }
     }
 
     _evictResolveCacheForHash(hashBigInt, hashHex) {
@@ -1413,10 +1453,39 @@
         return;
       }
 
+      const packWgslBytes =
+        source === 'pack' && result && typeof result.wgsl === 'string'
+          ? result.wgsl.length * 2
+          : 0;
+      if (packWgslBytes > 0) {
+        if (
+          this._maxResolveCachePackWgslBytes <= 0 ||
+          packWgslBytes > this._maxResolveCachePackWgslBytes
+        ) {
+          return;
+        }
+      }
+
       const stageCache = this._resolveCacheByStage[stageCode];
       const existing = stageCache.get(hashBigInt) || stageCache.get(hashHex) || stageCache.get(rawHash);
       if (existing !== undefined) {
         this._evictResolveCacheEntry(existing);
+      }
+
+      if (packWgslBytes > 0) {
+        while (this._resolveCachePackWgslBytes + packWgslBytes > this._maxResolveCachePackWgslBytes) {
+          let evictedPack = false;
+          for (const candidate of this._resolveCacheEntries.keys()) {
+            if (candidate.packWgslBytes > 0) {
+              this._evictResolveCacheEntry(candidate);
+              evictedPack = true;
+              break;
+            }
+          }
+          if (!evictedPack) {
+            break;
+          }
+        }
       }
 
       if (this._resolveCacheEntries.size >= this._maxResolveCacheEntries) {
@@ -1441,6 +1510,7 @@
         source,
         profile,
         result,
+        packWgslBytes,
         missingRow,
         categorizedRow,
         priorityRow: priorityRow !== undefined ? priorityRow : null,
@@ -1460,6 +1530,9 @@
         stageCache.set(key4, entry);
       }
       this._resolveCacheEntries.set(entry, entry);
+      if (packWgslBytes > 0) {
+        this._resolveCachePackWgslBytes += packWgslBytes;
+      }
     }
 
     /**
@@ -1704,7 +1777,16 @@
         label,
         registeredAtMs: this._now(),
       };
-      this._realShaders.set(`${hashHex}|${stageKey}`, record);
+      const realKey = `${hashHex}|${stageKey}`;
+      if (this._realShaders.has(realKey)) {
+        this._realShaders.delete(realKey);
+      } else if (this._realShaders.size >= this._maxRealShaders) {
+        const oldestKey = this._realShaders.keys().next().value;
+        if (oldestKey !== undefined) {
+          this._realShaders.delete(oldestKey);
+        }
+      }
+      this._realShaders.set(realKey, record);
       this._summaryVersion += 1;
       this._clearResolveCache();
 
@@ -2000,6 +2082,7 @@
         }
         if (cached !== undefined) {
           if (cached.source === 'pack') {
+            this._touchResolveCacheEntry(cached);
             this._stats.totalLookups += 1;
             this._stats.packHits += 1;
             this._resolveCacheHits += 1;
@@ -2011,6 +2094,7 @@
               opts !== null && opts.frame !== undefined && opts.frame !== null
                 ? normalizeFrameNumber(opts.frame)
                 : this._currentFrame;
+            this._touchResolveCacheEntry(cached);
             this._stats.totalLookups += 1;
             this._stats.fallbackHits += 1;
             this._resolveCacheHits += 1;
@@ -2030,6 +2114,7 @@
                 opts !== null && opts.frame !== undefined && opts.frame !== null
                   ? normalizeFrameNumber(opts.frame)
                   : this._currentFrame;
+              this._touchResolveCacheEntry(cached);
               this._stats.totalLookups += 1;
               this._stats.builtinHits += 1;
               this._resolveCacheHits += 1;
