@@ -5609,6 +5609,9 @@ def main(
         args = build_arg_parser().parse_args(argv)
     except SystemExit as exc:
         return 0 if exc.code in (0, None) else 2
+    if env_map is os.environ and runner is run_command:  # real runs only: free disk under PLAYGTA6_MIN_FREE_GB trims the caches first
+        import trim_caches  # noqa: PLC0415
+        trim_caches.auto_trim_if_low(env_map, repo_root)
     try:
         return _run(
             args,
