@@ -90,7 +90,9 @@
 //     s6 CloseInstallationMonitorHandle(1) h, s7 GetInstallationProgress(2) h,
 //     s9 RegisterInstallationProgressChanged(4) h (the local package is complete: progress is
 //     always finished and launchable, and never changes), s39 EnumeratePackages(4) h (no local
-//     content packages; game-package enumeration returns E_NOTIMPL).
+//     content packages; game-package enumeration returns E_NOTIMPL), s37/s38 MountWithUiAsync(2)/
+//     MountWithUiResult(2) h, s25 GetMountPath(3) h, s26 CloseMountHandle(1) h (the title's own
+//     installed package mounts at the game-data root "G:\\"; any other identifier is not found).
 //   {f4faf4d4-...}/{41a4e10c-...} XPersistentLocalStorage: s3 GetPathSize, s5 GetSpaceInfo, s6/s7 EnsureSpace; s4 GetPath(3) h ("T:\userdata\pls\",
 //     a directory of the /userdata overlay).
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
@@ -191,6 +193,10 @@ HandleTable& ports() {
     return t;
 }
 HandleTable& installation_monitors() {
+    static HandleTable t;
+    return t;
+}
+HandleTable& package_mounts() {
     static HandleTable t;
     return t;
 }
@@ -1326,6 +1332,81 @@ public:
     // is read-only game data here, so nothing is removed.
     int32_t UninstallChunks(uint64_t identifier, uint64_t count, uint64_t selectors) {
         return selectors_ok(identifier, count, selectors) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // Mount of the title's own, fully installed package (call sites: an object holds the package
+    // identifier string, a 0x38-byte XAsyncBlock and a mount handle; it calls s37(identifier,
+    // block), waits with XAsyncGetStatus, then s38(block, &mount), s25(mount, 0x100, path) and
+    // strips one trailing '/'; s26(mount) when done). Mounting a local directory asserts no
+    // licence: only the running title's own identifier (see GetCurrentProcessPackageIdentifier)
+    // is accepted; every other identifier is not found.
+    struct PackageMount {
+        uint64_t unused = 0;
+    };
+    static constexpr char kMountPath[] = "G:\\";
+
+    static bool is_own_package(uint64_t identifier) {
+        constexpr size_t kIdentifierChars = 32;
+        char id[kIdentifierChars + 1] = {};
+        if (identifier == 0 || !com::read_guest(identifier, id, sizeof(id))) {
+            return false;
+        }
+        for (size_t i = 0; i < kIdentifierChars; ++i) {
+            if (id[i] != '0') {
+                return false;
+            }
+        }
+        return id[kIdentifierChars] == ' ';
+    }
+
+    // s37: XPackageMountWithUiAsync(packageIdentifier, XAsyncBlock*). No UI is ever needed.
+    int32_t MountWithUiAsync(uint64_t identifier, uint64_t async) {
+        constexpr int32_t kNotFound = static_cast<int32_t>(0x80070490u);  // HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+        if (identifier == 0 || async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (!is_own_package(identifier)) {
+            return kNotFound;
+        }
+        return begin_ready_async(async, "XPackageMountWithUiAsync", S_OK_HR, sizeof(uint64_t),
+                                 [](uint64_t buffer) -> HResult {
+                                     auto* handle = new PackageMount{};
+                                     package_mounts().add(handle);
+                                     if (!com::write_guest(buffer, to_guest(handle))) {
+                                         package_mounts().remove(handle);
+                                         delete handle;
+                                         return E_INVALIDARG_HR;
+                                     }
+                                     return S_OK_HR;
+                                 });
+    }
+
+    // s38: XPackageMountWithUiResult(XAsyncBlock*, XPackageMountHandle*).
+    int32_t MountWithUiResult(uint64_t async, uint64_t mount) {
+        if (mount == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(mount, uint64_t{0});
+        return finish_ready_async(async, sizeof(uint64_t), mount);
+    }
+
+    // s25: XPackageGetMountPath(mount, pathSize, path): the game-data root, NUL-terminated.
+    int32_t GetMountPath(uint64_t mount, uint64_t size, uint64_t path) {
+        if (!check_handle(package_mounts(), mount, "XPackageMountHandle") || path == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (size < sizeof(kMountPath)) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        return com::write_guest(path, kMountPath, sizeof(kMountPath)) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // s26: XPackageCloseMountHandle(mount).
+    void CloseMountHandle(uint64_t mount) {
+        if (check_handle(package_mounts(), mount, "XPackageMountHandle")) {
+            package_mounts().remove(from_guest<void>(mount));
+            delete from_guest<PackageMount>(mount);
+        }
     }
 
     // s34: XPackageUninstallPackage(id): refused, the title's own package cannot be removed.
@@ -2507,7 +2588,11 @@ constexpr auto kPackageTable = slot_table<37>({
     {17, PK::method<&PackageApi::InstallChunksResult>("XPackageInstallChunksResult")},
     {18, PK::method<&PackageApi::EstimateDownloadSize>("XPackageEstimateDownloadSize")},
     {19, PK::method<&PackageApi::UninstallChunks>("XPackageUninstallChunks")},
+    {25, PK::method<&PackageApi::GetMountPath>("XPackageGetMountPath")},
+    {26, PK::method<&PackageApi::CloseMountHandle>("XPackageCloseMountHandle")},
     {34, PK::method<&PackageApi::UninstallPackage>("XPackageUninstallPackage")},
+    {37, PK::method<&PackageApi::MountWithUiAsync>("XPackageMountWithUiAsync")},
+    {38, PK::method<&PackageApi::MountWithUiResult>("XPackageMountWithUiResult")},
     {39, PK::method<&PackageApi::EnumeratePackages>("XPackageEnumeratePackages")},
 });
 constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPackage", kPackageIid,

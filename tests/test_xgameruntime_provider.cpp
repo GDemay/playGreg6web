@@ -548,6 +548,33 @@ void test_query_api() {
             CHECK(com::read_guest(progress + 16, flags, sizeof(flags)) && flags[0] == 1 && flags[1] == 1);
             fx.vcall(package, 6, {load64(mon)});
             CHECK(hr32(fx.vcall(package, 16, {ident, 1, sel, 5000, 0, 0})) == com::E_INVALIDARG_HR);
+
+            // s37 / s38 / s25 / s26: mount the title's own package at the game-data root.
+            const uint64_t mblock = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(package, 37, {ident, mblock})) == 0);
+            g_done_block = 0;
+            CHECK((fx.vcall(queue_api, 16, {queue, 0, 0}) & 0xFF) == 1);
+            CHECK((fx.vcall(queue_api, 16, {queue, 1, 0}) & 0xFF) == 1);
+            CHECK(g_done_block == mblock);
+            const uint64_t mount_out = fx.alloc(8);
+            CHECK(hr32(fx.vcall(package, 38, {mblock, mount_out})) == 0);
+            const uint64_t mount = load64(mount_out);
+            CHECK(mount != 0);
+            const uint64_t mpath = fx.alloc(256);
+            CHECK(hr32(fx.vcall(package, 25, {mount, 256, mpath})) == 0);
+            char mtext[8] = {};
+            CHECK(com::read_guest(mpath, mtext, sizeof(mtext)) && std::strcmp(mtext, "G:\\") == 0);
+            CHECK(hr32(fx.vcall(package, 25, {mount, 2, mpath})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+            CHECK(hr32(fx.vcall(package, 25, {mount, 256, 0})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(package, 25, {0x5555, 256, mpath})) == com::E_INVALIDARG_HR);
+            fx.vcall(package, 26, {mount});
+            CHECK(hr32(fx.vcall(package, 25, {mount, 256, mpath})) == com::E_INVALIDARG_HR);  // closed
+            CHECK(hr32(fx.vcall(package, 38, {mblock, 0})) == com::E_POINTER_HR);
+            // Only the title's own identifier mounts; arguments are validated.
+            const uint64_t other = fx.cstring("11111111111111111111111111111111");
+            CHECK(hr32(fx.vcall(package, 37, {other, mblock})) == static_cast<int32_t>(0x80070490u));
+            CHECK(hr32(fx.vcall(package, 37, {0, mblock})) == com::E_INVALIDARG_HR);
+            CHECK(hr32(fx.vcall(package, 37, {ident, 0})) == com::E_INVALIDARG_HR);
         }
     }
     {
