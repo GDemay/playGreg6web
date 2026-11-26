@@ -808,19 +808,20 @@ public:
 };
 
 // {8836fe87-edb9-4fe3-8dad-05f0d2cd5b40}: XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature).
-// Answers true only for areas this runtime really serves (public feature numbering). Everything
-// store, licence, sign-in-UI, invite, streaming or thread related stays false, and so does any
-// id that is not listed. Every distinct id the title asks for is logged once (census).
+// R-verify: the numbering is the public XGameRuntimeFeature enum, zero based in declaration order
+// (Accessibility 0, AppCapture 1, Async 2, AsyncProvider 3, Display 4, Game 5, GameInvite 6, GameSave 7,
+// GameUI 8, Launcher 9, Networking 10, Package 11, PersistentLocalStorage 12, SpeechSynthesizer 13,
+// Store 14, System 15, TaskQueue 16, Thread 17, User 18; later areas follow). Static survey of the
+// executable: the title reaches this interface through exactly one wrapper (one GUID reference) and
+// that wrapper has exactly two call sites, so exactly two ids are ever asked:
+//   10 (XNetworking): gates one helper that calls only XNetworkingGetConnectivityHint (s15) and reads
+//      the networkInitialized flag; implemented, and the answer it reads is the offline hint. TRUE.
+//   20: gates the Events wrapper (event write, 6 arguments), telemetry only. Left false (R40, #1576).
+// The bundled libHttpClient.GDK.dll holds an unreferenced copy of the same wrapper. Every other id
+// (including all store, licence, sign-in, invite, streaming and thread areas) stays false: the title
+// never asks, and a wrong number would route it into code paths that are not served.
 constexpr uint32_t kAvailableFeatures[] = {
-    3,   // XAsync
-    6,   // XGame (title id, relaunch of itself)
-    8,   // XGameSave (local provider)
-    11,  // XNetworking (connectivity hint)
-    12,  // XPackage (the local package is installed in full)
-    13,  // XPersistentLocalStorage
-    14,  // XSpeechSynthesizer (silent)
-    18,  // XTaskQueue
-    19,  // XUser (local offline user)
+    10,  // XNetworking (connectivity hint, offline)
 };
 
 bool feature_is_served(uint32_t feature) {

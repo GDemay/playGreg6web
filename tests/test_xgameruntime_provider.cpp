@@ -452,12 +452,12 @@ void test_query_api() {
 
     // Simple mapped slots.
     const uint64_t feature = fx.query(kFeature, kFeature);
-    // Feature availability: only served areas answer true; store, licence, streaming, thread,
-    // invite, UI and unknown ids stay false.
-    for (uint32_t id : {3u, 6u, 8u, 11u, 12u, 13u, 14u, 18u, 19u}) {
-        CHECK((fx.vcall(feature, 3, {id}) & 0xFF) == 1);
-    }
-    for (uint32_t id : {0u, 1u, 2u, 4u, 5u, 7u, 9u, 10u, 15u, 16u, 17u, 20u, 21u, 22u, 23u, 1000u}) {
+    // Feature availability (public zero-based XGameRuntimeFeature numbering): the title asks only for
+    // 10 (XNetworking, served) and 20 (Events, left false). Everything else stays false: store 14,
+    // system 15, thread 17, user 18 and any unknown id.
+    CHECK((fx.vcall(feature, 3, {10u}) & 0xFF) == 1);
+    for (uint32_t id : {0u, 1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 11u, 12u, 13u, 14u, 15u, 16u, 17u, 18u, 19u, 20u,
+                        21u, 22u, 23u, 1000u}) {
         CHECK((fx.vcall(feature, 3, {id}) & 0xFF) == 0);
     }
     const uint64_t package = fx.query(kPackageProvider, kPackageIid);
