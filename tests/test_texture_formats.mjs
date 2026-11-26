@@ -18,7 +18,11 @@ const {
   CHROMIUM_UNORM16_FEATURE,
   DEPTH32FLOAT_STENCIL8_FEATURE,
   BGRA8UNORM_STORAGE_FEATURE,
+  RG11B10UFLOAT_RENDERABLE_FEATURE,
+  FLOAT32_FILTERABLE_FEATURE,
   getWebGpuFormatInfo,
+  describeTextureFormatCapabilities,
+  validateTextureDimensionAndFormat,
   lookupDxgiFormat,
   mapDxgiFormatToWebGpu,
   getSrgbSiblingFormat,
@@ -28,6 +32,8 @@ const {
   calcMipLayout,
   computeMipLayout,
   computeMipByteSize,
+  calcSubresourceLayout,
+  calcTextureMemoryBytes,
   padTextureRowsForWriteTexture,
   decodeBc1ToRgba8,
   decodeBc3ToRgba8,
@@ -1466,4 +1472,265 @@ test('W301 computeMipLayout and computeMipByteSize handle BC 4x4 rounding, 256B 
   const nanMip = computeMipLayout(DXGI_FORMAT.R8G8B8A8_UNORM, 64, 32, NaN);
   assert.equal(nanMip.mipLevel, 0);
   assert.equal(nanMip.width, 64);
+});
+
+// ---------------------------------------------------------------------------
+// W380 (#1763): Full 3D / Cube / 2D-Array / BC Format Capabilities & Layout
+// ---------------------------------------------------------------------------
+
+test('W380 exposes per-format capability flags on WEBGPU_FORMAT_INFO and feature-aware describeTextureFormatCapabilities()', () => {
+  assert.equal(RG11B10UFLOAT_RENDERABLE_FEATURE, 'rg11b10ufloat-renderable');
+  assert.equal(FLOAT32_FILTERABLE_FEATURE, 'float32-filterable');
+
+  // rgba16float: 4ch float, renderable, filterable, multisampleable, storageCompatible, supports3d/cube/2d-array
+  const rgba16f = getWebGpuFormatInfo('rgba16float');
+  assert.equal(rgba16f.channels, 4);
+  assert.equal(rgba16f.componentType, 'float');
+  assert.equal(rgba16f.renderable, true);
+  assert.equal(rgba16f.isRenderTarget, true);
+  assert.equal(rgba16f.filterable, true);
+  assert.equal(rgba16f.multisampleable, true);
+  assert.equal(rgba16f.storageCompatible, true);
+  assert.equal(rgba16f.supports3d, true);
+  assert.equal(rgba16f.supportsCube, true);
+  assert.equal(rgba16f.supports2dArray, true);
+  assert.equal(rgba16f.supportsBcSliced3d, false);
+
+  // depth32float: 1ch depth, renderable, NOT filterable, multisampleable, NOT storage, NOT supports3d
+  const d32f = getWebGpuFormatInfo('depth32float');
+  assert.equal(d32f.channels, 1);
+  assert.equal(d32f.componentType, 'depth');
+  assert.equal(d32f.renderable, true);
+  assert.equal(d32f.filterable, false);
+  assert.equal(d32f.multisampleable, true);
+  assert.equal(d32f.storageCompatible, false);
+  assert.equal(d32f.supports3d, false);
+  assert.equal(d32f.supportsCube, true);
+  assert.equal(d32f.supports2dArray, true);
+
+  // depth24plus-stencil8: 2ch depth-stencil
+  const d24s8 = getWebGpuFormatInfo('depth24plus-stencil8');
+  assert.equal(d24s8.channels, 2);
+  assert.equal(d24s8.componentType, 'depth-stencil');
+  assert.equal(d24s8.supports3d, false);
+
+  // bc7-rgba-unorm-srgb: 4ch unorm, NOT renderable, filterable, NOT multisampleable, supportsBcSliced3d
+  const bc7 = getWebGpuFormatInfo('bc7-rgba-unorm-srgb');
+  assert.equal(bc7.channels, 4);
+  assert.equal(bc7.componentType, 'unorm');
+  assert.equal(bc7.renderable, false);
+  assert.equal(bc7.filterable, true);
+  assert.equal(bc7.multisampleable, false);
+  assert.equal(bc7.storageCompatible, false);
+  assert.equal(bc7.supports3d, false);
+  assert.equal(bc7.supportsBcSliced3d, true);
+
+  // Feature-aware describeTextureFormatCapabilities()
+  const rg11NoFeat = describeTextureFormatCapabilities('rg11b10ufloat', { deviceFeatures: new Set() });
+  assert.equal(rg11NoFeat.channels, 3);
+  assert.equal(rg11NoFeat.componentType, 'ufloat');
+  assert.equal(rg11NoFeat.renderable, false);
+  assert.equal(rg11NoFeat.multisampleable, false);
+  assert.equal(rg11NoFeat.filterable, true);
+
+  const rg11WithFeat = describeTextureFormatCapabilities('rg11b10ufloat', {
+    deviceFeatures: new Set([RG11B10UFLOAT_RENDERABLE_FEATURE, TEXTURE_FORMATS_TIER1_FEATURE]),
+  });
+  assert.equal(rg11WithFeat.renderable, true);
+  assert.equal(rg11WithFeat.isRenderTarget, true);
+  assert.equal(rg11WithFeat.multisampleable, true);
+  assert.equal(rg11WithFeat.storageCompatible, true);
+
+  const r32fCore = describeTextureFormatCapabilities('r32float', { deviceFeatures: new Set() });
+  assert.equal(r32fCore.filterable, false);
+  assert.equal(r32fCore.multisampleable, false);
+  assert.equal(r32fCore.renderable, true);
+  const r32fFilt = describeTextureFormatCapabilities('r32float', {
+    deviceFeatures: new Set([FLOAT32_FILTERABLE_FEATURE]),
+  });
+  assert.equal(r32fFilt.filterable, true);
+
+  const bc3dWithFeat = describeTextureFormatCapabilities('bc3-rgba-unorm', {
+    dimension: '3d',
+    deviceFeatures: new Set([TEXTURE_COMPRESSION_BC_FEATURE, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE]),
+  });
+  assert.equal(bc3dWithFeat.supports3d, true);
+  assert.equal(bc3dWithFeat.supported, true);
+
+  // Invalid format returns null cleanly.
+  assert.equal(describeTextureFormatCapabilities('unknown-format'), null);
+});
+
+test('W380 validateTextureDimensionAndFormat enforces 3D, cube, cube-array, 2d-array, BC-sliced-3D, depth/stencil, and MSAA rules', () => {
+  const bc2dOnly = new Set([TEXTURE_COMPRESSION_BC_FEATURE]);
+  const bc3dFeatures = new Set([
+    TEXTURE_COMPRESSION_BC_FEATURE,
+    TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE,
+  ]);
+
+  // 1. Depth/stencil formats are disallowed on 3D and 1D textures, allowed on 2D / 2d-array / cube.
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'depth32float', dimension: '3d', width: 64, height: 64, depthOrArrayLayers: 16 }).reason,
+    'depth-stencil-unsupported-on-3d'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'depth24plus-stencil8', dimension: '1d', width: 64 }).reason,
+    'depth-stencil-unsupported-on-1d'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'depth32float', dimension: '2d', viewDimension: '2d-array', width: 1024, height: 1024, depthOrArrayLayers: 4 }).valid,
+    true
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'depth32float', dimension: 'cube', width: 512, height: 512, depthOrArrayLayers: 6 }).valid,
+    true
+  );
+
+  // 2. BC formats on 3D require texture-compression-bc-sliced-3d; disallowed on 1D.
+  const bc3dMissing = validateTextureDimensionAndFormat(
+    { format: 'bc7-rgba-unorm', dimension: '3d', width: 64, height: 64, depthOrArrayLayers: 16 },
+    { deviceFeatures: bc2dOnly }
+  );
+  assert.equal(bc3dMissing.valid, false);
+  assert.equal(bc3dMissing.reason, 'missing-bc-sliced-3d');
+  assert.equal(bc3dMissing.requiredFeature, TEXTURE_COMPRESSION_BC_SLICED_3D_FEATURE);
+
+  const bc3dOk = validateTextureDimensionAndFormat(
+    { format: 'bc7-rgba-unorm', dimension: '3d', width: 64, height: 64, depthOrArrayLayers: 16 },
+    { deviceFeatures: bc3dFeatures }
+  );
+  assert.equal(bc3dOk.valid, true);
+
+  assert.equal(
+    validateTextureDimensionAndFormat(
+      { format: 'bc1-rgba-unorm', dimension: '1d', width: 64 },
+      { deviceFeatures: bc3dFeatures }
+    ).reason,
+    'compressed-unsupported-on-1d'
+  );
+
+  // 3. Cube and cube-array rules: square dimensions & 6 / multiple-of-6 layers.
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: 'cube', width: 256, height: 128, depthOrArrayLayers: 6 }).reason,
+    'cube-requires-square-dimensions'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: 'cube', width: 256, height: 256, depthOrArrayLayers: 4 }).reason,
+    'cube-requires-6-layers'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: 'cube-array', width: 256, height: 256, depthOrArrayLayers: 10 }).reason,
+    'cube-array-requires-multiple-of-6-layers'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: 'cube-array', width: 256, height: 256, depthOrArrayLayers: 18 }).valid,
+    true
+  );
+
+  // 4. MSAA 4x validation.
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: '2d', width: 1280, height: 720, sampleCount: 4 }).valid,
+    true
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba32float', dimension: '2d', width: 1280, height: 720, sampleCount: 4 }).reason,
+    'multisample-unsupported'
+  );
+  assert.equal(
+    validateTextureDimensionAndFormat({ format: 'rgba16float', dimension: '3d', width: 32, height: 32, depthOrArrayLayers: 16, sampleCount: 4 }).reason,
+    'multisample-unsupported'
+  );
+});
+
+test('W380 calcSubresourceLayout and calcTextureMemoryBytes compute exact 3D, cube, 2D-array, and BC mip-chain sizes with zero-alloc out reuse', () => {
+  // 1. 3D volume texture halves depth per mip (32x16x8 rgba16float -> mip 2 is 8x4x2).
+  const scratch = {};
+  const volMip2 = calcSubresourceLayout(
+    'rgba16float',
+    { width: 32, height: 16, depthOrArrayLayers: 8, mipLevel: 2, dimension: '3d' },
+    scratch
+  );
+  assert.strictEqual(volMip2, scratch);
+  assert.equal(volMip2.width, 8);
+  assert.equal(volMip2.height, 4);
+  assert.equal(volMip2.depthOrArrayLayers, 2);
+  assert.equal(volMip2.unalignedBytesPerRow, 64); // 8 * 8B
+  assert.equal(volMip2.bytesPerRow, 256);
+  assert.equal(volMip2.sliceTightBytes, 256); // 64 * 4
+  assert.equal(volMip2.sliceAlignedBytes, 1024); // 256 * 4
+  assert.equal(volMip2.tightBytes, 512); // 256 * 2 slices
+  assert.equal(volMip2.totalBytes, 2048); // 1024 * 2 slices
+
+  // 2. Cube texture keeps 6 faces constant across mips (BC7 64x64x6 -> mip 5 is 2x2x6 -> 1x1 block per face).
+  const cubeMip5 = calcSubresourceLayout(
+    'bc7-rgba-unorm',
+    { width: 64, height: 64, depthOrArrayLayers: 6, mipLevel: 5, dimension: 'cube' },
+    scratch
+  );
+  assert.strictEqual(cubeMip5, scratch);
+  assert.equal(cubeMip5.width, 2);
+  assert.equal(cubeMip5.height, 2);
+  assert.equal(cubeMip5.depthOrArrayLayers, 6);
+  assert.equal(cubeMip5.copyWidth, 4);
+  assert.equal(cubeMip5.copyHeight, 4);
+  assert.equal(cubeMip5.blocksX, 1);
+  assert.equal(cubeMip5.blocksY, 1);
+  assert.equal(cubeMip5.tightBytes, 16 * 6);
+  assert.equal(cubeMip5.totalBytes, 256 * 6);
+
+  // 3. calcTextureMemoryBytes across full mip chains:
+  // 3D 4x4x4 rgba8unorm with 3 mips (4x4x4 + 2x2x2 + 1x1x1 = 73 texels * 4 = 292 B tight).
+  assert.equal(
+    calcTextureMemoryBytes('rgba8unorm', {
+      width: 4,
+      height: 4,
+      depthOrArrayLayers: 4,
+      mipLevelCount: 3,
+      dimension: '3d',
+    }),
+    292
+  );
+
+  // Cube 8x8 BC1 with 4 mips:
+  // mip0: 8x8 -> 2x2 blocks * 8B * 6 = 192
+  // mip1: 4x4 -> 1x1 block * 8B * 6 = 48
+  // mip2: 2x2 -> 1x1 block * 8B * 6 = 48
+  // mip3: 1x1 -> 1x1 block * 8B * 6 = 48
+  // Total tight = 336 B; aligned (256B/row): (256*2 + 256*1 + 256*1 + 256*1) * 6 = 7680 B.
+  assert.equal(
+    calcTextureMemoryBytes('bc1-rgba-unorm', {
+      width: 8,
+      height: 8,
+      mipLevelCount: 4,
+      dimension: 'cube',
+    }),
+    336
+  );
+  assert.equal(
+    calcTextureMemoryBytes('bc1-rgba-unorm', {
+      width: 8,
+      height: 8,
+      mipLevelCount: 4,
+      dimension: 'cube',
+      aligned: true,
+    }),
+    7680
+  );
+
+  // 2D-array 4-cascade shadow map 1024x1024x4 depth32float with 2 mips: (1024^2 + 512^2) * 4B * 4 layers
+  assert.equal(
+    calcTextureMemoryBytes('depth32float', {
+      width: 1024,
+      height: 1024,
+      depthOrArrayLayers: 4,
+      mipLevelCount: 2,
+      dimension: '2d-array',
+    }),
+    (1024 * 1024 + 512 * 512) * 4 * 4
+  );
+
+  // Degenerate dimensions & unknown format return 0 without throwing.
+  assert.equal(calcTextureMemoryBytes('rgba8unorm', { width: 0, height: 64 }), 0);
+  assert.equal(calcTextureMemoryBytes('invalid-fmt', { width: 64, height: 64 }), 0);
+  assert.equal(calcSubresourceLayout('invalid-fmt', { width: 64, height: 64 }, scratch).totalBytes, 0);
 });
