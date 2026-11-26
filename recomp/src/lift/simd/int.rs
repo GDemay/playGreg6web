@@ -6,7 +6,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
 use super::super::{FunctionLifter, R, unsupported};
-use super::{Elem, Form, Intr, Ty};
+use super::{Elem, Form, Intr, Ty, is_identity_mask, same_reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IOp {
@@ -269,45 +269,60 @@ impl FunctionLifter<'_> {
             M::Pslldq | M::Vpslldq | M::Psrldq | M::Vpsrldq => {
                 // pslldq xmm, imm / vpslldq xmm1, xmm2, imm
                 let i = Self::imm8(ins)?;
+                if i > 15 {
+                    self.xset(ins.op_register(0), "zeroinitializer", I8)?;
+                    return Ok(true);
+                }
                 let src = if ins.op_count() == 3 { 1 } else { 0 };
                 let v = self.v128(ins, src, I8)?;
-                let left = matches!(m, M::Pslldq | M::Vpslldq);
-                // Index 16 of the second operand is a zero byte.
-                let idx: Vec<u32> = (0..16)
-                    .map(|b| {
-                        if i > 15 {
-                            16
-                        } else if left {
-                            if b >= i { b - i } else { 16 }
-                        } else if b + i < 16 {
-                            b + i
-                        } else {
-                            16
-                        }
-                    })
-                    .collect();
-                let r = self.shuffle(&v, "zeroinitializer", I8, &idx);
+                let r = if i == 0 {
+                    v
+                } else {
+                    let left = matches!(m, M::Pslldq | M::Vpslldq);
+                    // Index 16 of the second operand is a zero byte.
+                    let idx: Vec<u32> = (0..16)
+                        .map(|b| {
+                            if left {
+                                if b >= i { b - i } else { 16 }
+                            } else if b + i < 16 {
+                                b + i
+                            } else {
+                                16
+                            }
+                        })
+                        .collect();
+                    self.shuffle(&v, "zeroinitializer", I8, &idx)
+                };
                 self.xset(ins.op_register(0), &r, I8)?;
             }
             M::Pshufd | M::Vpshufd => {
                 let i = Self::imm8(ins)?;
                 let v = self.v128(ins, 1, I32)?;
-                let idx: Vec<u32> = (0..4).map(|l| (i >> (2 * l)) & 3).collect();
-                let r = self.shuffle(&v, &v, I32, &idx);
+                let idx: [u32; 4] = std::array::from_fn(|l| (i >> (2 * l)) & 3);
+                let r = if is_identity_mask(&idx) {
+                    v
+                } else {
+                    self.shuffle(&v, "poison", I32, &idx)
+                };
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Pshuflw | M::Vpshuflw | M::Pshufhw | M::Vpshufhw => {
                 let i = Self::imm8(ins)?;
                 let v = self.v128(ins, 1, I16)?;
                 let high = matches!(m, M::Pshufhw | M::Vpshufhw);
-                let idx: Vec<u32> = (0..8)
-                    .map(|l| match (high, l < 4) {
+                let idx: [u32; 8] = std::array::from_fn(|l| {
+                    let l = l as u32;
+                    match (high, l < 4) {
                         (false, true) => (i >> (2 * l)) & 3,
                         (true, false) => 4 + ((i >> (2 * (l - 4))) & 3),
                         _ => l,
-                    })
-                    .collect();
-                let r = self.shuffle(&v, &v, I16, &idx);
+                    }
+                });
+                let r = if is_identity_mask(&idx) {
+                    v
+                } else {
+                    self.shuffle(&v, "poison", I16, &idx)
+                };
                 self.xset(ins.op_register(0), &r, I16)?;
             }
             M::Pshufb | M::Vpshufb => {
@@ -699,12 +714,23 @@ impl FunctionLifter<'_> {
         saturate: bool,
     ) -> R<()> {
         let a = self.v128(ins, f.a, e)?;
-        let b = self.v128(ins, f.b, e)?;
         let n = e.lanes();
-        let even: Vec<u32> = (0..n).map(|l| 2 * l).collect();
-        let odd: Vec<u32> = (0..n).map(|l| 2 * l + 1).collect();
-        let lo = self.shuffle(&a, &b, e, &even);
-        let hi = self.shuffle(&a, &b, e, &odd);
+        let (lo, hi) = if same_reg(ins, f.a, f.b) {
+            let even: Vec<u32> = (0..n).map(|l| (2 * l) % n).collect();
+            let odd: Vec<u32> = (0..n).map(|l| (2 * l + 1) % n).collect();
+            (
+                self.shuffle(&a, "poison", e, &even),
+                self.shuffle(&a, "poison", e, &odd),
+            )
+        } else {
+            let b = self.v128(ins, f.b, e)?;
+            let even: Vec<u32> = (0..n).map(|l| 2 * l).collect();
+            let odd: Vec<u32> = (0..n).map(|l| 2 * l + 1).collect();
+            (
+                self.shuffle(&a, &b, e, &even),
+                self.shuffle(&a, &b, e, &odd),
+            )
+        };
         let r = if saturate {
             let intr = if op == "add" {
                 Intr::SAddSat
