@@ -1817,15 +1817,18 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         auto oldest = address_textures_.end();
         bool oldest_in_frame = true;
         uint64_t oldest_use = UINT64_MAX;
-        for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
-            const bool in_frame = bridge_->is_resource_used_in_frame(i->second.id);
-            const uint64_t use = std::max(i->second.last_use, bridge_->resource_last_use_tick(i->second.id));
-            if (oldest == address_textures_.end() ||
-                (oldest_in_frame && !in_frame) ||
-                (in_frame == oldest_in_frame && use < oldest_use)) {
-                oldest = i;
-                oldest_in_frame = in_frame;
-                oldest_use = use;
+        {
+            const bridge::StateBridgeDevice::ResourceUseScan use_scan(*bridge_);
+            for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
+                const bool in_frame = use_scan.in_frame(i->second.id);
+                const uint64_t use = std::max(i->second.last_use, use_scan.last_use_tick(i->second.id));
+                if (oldest == address_textures_.end() ||
+                    (oldest_in_frame && !in_frame) ||
+                    (in_frame == oldest_in_frame && use < oldest_use)) {
+                    oldest = i;
+                    oldest_in_frame = in_frame;
+                    oldest_use = use;
+                }
             }
         }
         const uint32_t victim = oldest->second.id;
@@ -2517,15 +2520,18 @@ bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id,
         auto lru = ia_relocations_.end();
         bool lru_in_frame = true;
         uint64_t lru_use = UINT64_MAX;
-        for (auto it = ia_relocations_.begin(); it != ia_relocations_.end(); ++it) {
-            const bool in_frame = bridge_->is_resource_used_in_frame(it->second.buffer_id);
-            const uint64_t use = std::max(it->second.last_used_seq, bridge_->resource_last_use_tick(it->second.buffer_id));
-            if (lru == ia_relocations_.end() ||
-                (lru_in_frame && !in_frame) ||
-                (in_frame == lru_in_frame && use < lru_use)) {
-                lru = it;
-                lru_in_frame = in_frame;
-                lru_use = use;
+        {
+            const bridge::StateBridgeDevice::ResourceUseScan use_scan(*bridge_);
+            for (auto it = ia_relocations_.begin(); it != ia_relocations_.end(); ++it) {
+                const bool in_frame = use_scan.in_frame(it->second.buffer_id);
+                const uint64_t use = std::max(it->second.last_used_seq, use_scan.last_use_tick(it->second.buffer_id));
+                if (lru == ia_relocations_.end() ||
+                    (lru_in_frame && !in_frame) ||
+                    (in_frame == lru_in_frame && use < lru_use)) {
+                    lru = it;
+                    lru_in_frame = in_frame;
+                    lru_use = use;
+                }
             }
         }
         bridge_->destroy_or_defer_resource(lru->second.buffer_id, enc);
