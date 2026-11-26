@@ -4758,18 +4758,31 @@ function createSharedWasmModuleCache(options = {}) {
       return [];
     }
     const results = new Array(sideModuleUrls.length);
+    const orderedKeys = new Array(sideModuleUrls.length);
     await Promise.all(
       sideModuleUrls.map(async (entry, idx) => {
         const url = extractSideModuleEntryUrl(entry);
         if (!url) {
           results[idx] = null;
+          orderedKeys[idx] = '';
           return;
         }
+        orderedKeys[idx] = normalizeKey(url);
         const resolvedUrl =
           typeof callOpts.resolveUrl === 'function' ? callOpts.resolveUrl(url) : url;
         results[idx] = await compileAndShare(url, resolvedUrl, callOpts);
       }),
     );
+    // Re-order modulesByKey entries to match deterministic manifest order even when tiny
+    // asymmetric parts (e.g. 0.14 MiB guest_part_1) finish compiling before 890 MiB guest_part_0.
+    for (let i = 0; i < orderedKeys.length; i += 1) {
+      const k = orderedKeys[i];
+      if (k && modulesByKey.has(k)) {
+        const mod = modulesByKey.get(k);
+        modulesByKey.delete(k);
+        modulesByKey.set(k, mod);
+      }
+    }
     return results.filter((m) => isCompiledWasmModule(m, callOpts.wasmApi || safeOpts.wasmApi));
   }
 

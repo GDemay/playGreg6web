@@ -534,6 +534,7 @@ test('W371 #663 checklist 3: runtime.wasm without _main uses fast-boot exports c
   assert.equal(summary.mode, 'fast-boot');
   assert.equal(summary.fastBootExports.length, 5);
   assert.equal(reports.length, 0, 'absence of _main must produce zero warnings');
+  cfg.destroy();
 });
 
 test('W371 #663 checklist 4: __indirect_function_table growth & GOT.func accounting handle 384 dispatchers, >= 5103 slots, 0 GOT.func, BigInt tableBase, and Proxy GOT.func', async () => {
