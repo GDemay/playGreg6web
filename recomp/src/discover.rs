@@ -55,7 +55,7 @@ use crate::cfg::{
     BasicBlock, CallSite, CallTarget, Diagnostic, DiagnosticKind, Edge, Function, JumpTable,
     Terminator, UnresolvedJump,
 };
-use crate::code_image::CodeImage;
+use crate::code_image::{CodeImage, Region};
 use crate::jump_table::{self, Step};
 use crate::pointer_slot;
 use crate::reach;
@@ -73,6 +73,9 @@ const MAX_TRACE_BLOCKS: usize = 4;
 
 /// Times one resolved jump table may be replaced by a changed resolution.
 const MAX_TABLE_REVISIONS: u32 = 8;
+
+/// Maximum consecutive 8-byte relocated pointer entries walked per `.rdata` vtable/callback table.
+const MAX_VTABLE_ENTRIES: usize = 1024;
 
 /// Incoming intra-function edges of a block: how many, one of them, and every source block
 /// (`others` holds the sources beyond `from`).
@@ -160,7 +163,8 @@ pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis 
         }
         let late = state.add_late_resume_targets();
         let seeded = state.seed_pointer_slots();
-        if !late && !seeded {
+        let vtables = state.seed_vtable_callbacks();
+        if !late && !seeded && !vtables {
             break;
         }
         state.run();
@@ -343,8 +347,12 @@ struct Discovery<'i, 'a> {
     return_sites: BTreeSet<u64>,
     /// Pointer-slot tail calls seen so far: jump VA -> `(slot, seeded target)`.
     pointer_slots: BTreeMap<u64, (u64, u64)>,
-    /// Unresolved jumps whose pointer slot was already seeded by `seed_pointer_slots`.
+    /// Unresolved jumps/calls whose pointer slot was already checked by `seed_pointer_slots`.
     slot_checked: BTreeSet<u64>,
+    /// Referenced `Region::Data` VAs already scanned for vtables / function pointer tables.
+    scanned_data_refs: BTreeSet<u64>,
+    /// `(block.start, block.end)` snapshots already scanned for RIP-relative vtable/callback refs.
+    vtable_scanned_blocks: BTreeSet<(u64, u64)>,
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
@@ -369,6 +377,8 @@ impl<'i, 'a> Discovery<'i, 'a> {
             return_sites: BTreeSet::new(),
             pointer_slots: BTreeMap::new(),
             slot_checked: BTreeSet::new(),
+            scanned_data_refs: BTreeSet::new(),
+            vtable_scanned_blocks: BTreeSet::new(),
         }
     }
 
@@ -735,6 +745,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
             FlowControl::UnconditionalBranch if instr.op_kind(0) == OpKind::NearBranch64 => {
                 let target = instr.near_branch64();
                 block.successors.push(Edge::Jump(target));
+                self.seed_cross_function_tail_call(ip, target);
                 self.add_leader(target);
                 Some(Terminator::Jump)
             }
@@ -786,9 +797,28 @@ impl<'i, 'a> Discovery<'i, 'a> {
         let taken = instr.near_branch_target();
         block.successors.push(Edge::Taken(taken));
         block.successors.push(Edge::Fallthrough(next));
+        self.seed_cross_function_tail_call(instr.ip(), taken);
         self.add_leader(taken);
         self.add_leader(next);
         Some(Terminator::Branch)
+    }
+
+    /// If a direct branch at `ip` inside a `.pdata`-owned function jumps straight to the entry of
+    /// a different `.pdata` function, seed that target as a function entry so it is discovered
+    /// separately and classified as `Edge::TailCall`.
+    fn seed_cross_function_tail_call(&mut self, ip: u64, target: u64) {
+        let table = &self.image.function_table;
+        if table.is_empty() {
+            return;
+        }
+        if let Some(src_fn) = table.function_at(ip)
+            && let Some(dst_fn) = table.function_at(target)
+            && dst_fn != src_fn
+            && target == dst_fn
+            && self.image.code_bytes(dst_fn).is_ok()
+        {
+            self.add_function(dst_fn);
+        }
     }
 
     /// Incoming intra-function edges of every block.
@@ -897,27 +927,38 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 || self.return_sites.contains(&b)
                 || self.resume_targets.contains(&b)
         };
-        let values =
-            reach::reaching_values(&self.blocks, &preds_of, &is_entry, first_block, &live)?;
+        let facts =
+            reach::reaching_facts(&self.blocks, &preds_of, &is_entry, first_block, &live)?;
         let contains = |va: u64| self.image.contains(va);
-        let constants: Vec<(Instruction, bool)> = values
+        let constants: Vec<(Instruction, bool)> = facts
+            .values
             .iter()
-            .filter(|(_, known)| matches!(known, reach::Known::Range { lo, hi } if lo == hi && contains(*lo)))
+            .filter(|(_, known)| {
+                matches!(known, reach::Known::Range { lo, hi } if lo == hi && contains(*lo))
+            })
             .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains))
             .collect();
-        // Register copies (`mov r9d, eax` before a loop or merge) go in front of the bounds, so a
-        // guard on the source reaches an index held in the copy.
-        let mut all: Vec<(Instruction, bool)> =
-            reach::reaching_copies(&self.blocks, &preds_of, &is_entry, first_block, &live)
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|(dst, src)| reach::synthesize_copy(dst, src))
-                .collect();
-        all.extend(
-            values
-                .iter()
-                .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains)),
-        );
+        // Register copies (`mov r9d, eax` / `mov r9, rax` before a loop or merge) go in front of
+        // the bounds, so a guard on the source reaches an index held in the copy.
+        let mut all: Vec<(Instruction, bool)> = facts
+            .copies
+            .iter()
+            .filter_map(|&(dst, src, is_64)| {
+                if is_64 {
+                    reach::synthesize_copy64(dst, src)
+                } else {
+                    reach::synthesize_copy(dst, src)
+                }
+            })
+            .collect();
+        for (&(reg, known), &(_, u32_known)) in facts.values.iter().zip(&facts.u32_values) {
+            let synth = reach::synthesize(reg, known, &contains);
+            if !synth.is_empty() {
+                all.extend(synth);
+            } else {
+                all.extend(reach::synthesize_u32(reg, u32_known));
+            }
+        }
         Some((constants, all))
     }
 
@@ -1089,9 +1130,42 @@ impl<'i, 'a> Discovery<'i, 'a> {
         .collect()
     }
 
-    /// Tail calls through a pointer loaded from a statically initialised slot: when the slot
-    /// holds a relocated code address, that address is a real function entry, so seed it ahead
-    /// of time. The jump stays on run-time dispatch. Returns whether any new entry was added.
+    /// Validates a relocated 64-bit pointer slot in `Region::Data` and returns its code target if
+    /// it lands on a valid, non-padding, non-interior code instruction.
+    fn relocated_code_target(&self, slot: u64) -> Option<u64> {
+        if !self.image.data_relocs.contains(&slot) || self.image.region_of(slot) != Region::Data {
+            return None;
+        }
+        let bytes = self.image.bytes_at(slot, 8)?;
+        let target = u64::from_le_bytes(bytes.try_into().ok()?);
+        if self.image.region_of(target) != Region::Code {
+            return None;
+        }
+        let code = self.image.code_bytes(target).ok()?;
+        if !self.image.function_table.is_empty()
+            && self
+                .image
+                .function_table
+                .function_at(target)
+                .is_some_and(|owner| owner != target)
+        {
+            return None;
+        }
+        let mut decoder = Decoder::with_ip(64, code, target, DecoderOptions::NONE);
+        if !decoder.can_decode() {
+            return None;
+        }
+        let instr = decoder.decode();
+        if instr.is_invalid() || matches!(instr.mnemonic(), Mnemonic::Int3 | Mnemonic::Ud2) {
+            return None;
+        }
+        Some(target)
+    }
+
+    /// Tail calls and indirect calls through a statically initialised, relocated pointer slot:
+    /// when the slot holds a relocated code address, that address is a real function entry, so
+    /// seed it ahead of time. The jump/call stays on run-time dispatch. Returns whether any new
+    /// entry was added.
     fn seed_pointer_slots(&mut self) -> bool {
         let preds = self.predecessors();
         let jumps: Vec<u64> = self
@@ -1122,6 +1196,127 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     self.add_function(target);
                     progress = true;
                 }
+            }
+        }
+
+        if self.image.data_relocs.is_empty() {
+            return progress;
+        }
+
+        let mut rip_jumps: Vec<(u64, u64)> = Vec::new();
+        let mut rip_calls: Vec<(u64, u64)> = Vec::new();
+        for block in self.blocks.values() {
+            if block.terminator == Terminator::IndirectJump
+                && let Some(site) = block.instructions.last().map(Instruction::ip)
+                && !self.slot_checked.contains(&site)
+            {
+                for edge in &block.successors {
+                    if let Edge::IndirectJump { slot: Some(slot) } = *edge {
+                        rip_jumps.push((site, slot));
+                    }
+                }
+            }
+            for call in &block.calls {
+                if let CallTarget::Indirect { slot: Some(slot) } = call.target
+                    && !self.slot_checked.contains(&call.site)
+                {
+                    rip_calls.push((call.site, slot));
+                }
+            }
+        }
+        for (site, slot) in rip_jumps {
+            self.slot_checked.insert(site);
+            if let Some(target) = self.relocated_code_target(slot) {
+                self.pointer_slots.insert(site, (slot, target));
+                if !self.entries.contains(&target) {
+                    self.add_function(target);
+                    progress = true;
+                }
+            }
+        }
+        for (site, slot) in rip_calls {
+            self.slot_checked.insert(site);
+            if let Some(target) = self.relocated_code_target(slot)
+                && !self.entries.contains(&target)
+            {
+                self.add_function(target);
+                progress = true;
+            }
+        }
+        progress
+    }
+
+    /// Scans newly decoded blocks for RIP-relative references to `.rdata`/data vtables and
+    /// function-pointer tables (strictly gated by PE `DIR64` `data_relocs`) as well as direct
+    /// address-taken `.pdata` function entries (`lea reg, [rip + code_va]`). Returns whether any
+    /// new function entry was seeded.
+    fn seed_vtable_callbacks(&mut self) -> bool {
+        let has_relocs = !self.image.data_relocs.is_empty();
+        let table = &self.image.function_table;
+        if !has_relocs && table.is_empty() {
+            return false;
+        }
+        let mut data_vas: BTreeSet<u64> = BTreeSet::new();
+        let mut code_entries: BTreeSet<u64> = BTreeSet::new();
+        for block in self.blocks.values() {
+            if !self.vtable_scanned_blocks.insert((block.start, block.end)) {
+                continue;
+            }
+            for instr in &block.instructions {
+                if !instr.is_ip_rel_memory_operand() {
+                    continue;
+                }
+                let next_ip = instr.next_ip();
+                let target = instr.ip_rel_memory_address();
+                let rel = target.wrapping_sub(next_ip) as i64;
+                if !(i64::from(i32::MIN)..=i64::from(i32::MAX)).contains(&rel)
+                    || next_ip.checked_add_signed(rel) != Some(target)
+                {
+                    continue;
+                }
+                match self.image.region_of(target) {
+                    Region::Data if has_relocs && !self.scanned_data_refs.contains(&target) => {
+                        data_vas.insert(target);
+                    }
+                    Region::Code
+                        if instr.mnemonic() == Mnemonic::Lea
+                            && !table.is_empty()
+                            && !self.entries.contains(&target)
+                            && table.function_at(target) == Some(target)
+                            && self.image.code_bytes(target).is_ok() =>
+                    {
+                        code_entries.insert(target);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut progress = false;
+        for data_va in data_vas {
+            self.scanned_data_refs.insert(data_va);
+            if !data_va.is_multiple_of(8) && !self.image.data_relocs.contains(&data_va) {
+                continue;
+            }
+            let mut slot = data_va;
+            for _ in 0..MAX_VTABLE_ENTRIES {
+                let Some(target) = self.relocated_code_target(slot) else {
+                    break;
+                };
+                if !self.entries.contains(&target) {
+                    self.add_function(target);
+                    progress = true;
+                }
+                let Some(next_slot) = slot.checked_add(8) else {
+                    break;
+                };
+                slot = next_slot;
+            }
+        }
+        for code_va in code_entries {
+            if !self.entries.contains(&code_va) {
+                self.add_function(code_va);
+                progress = true;
             }
         }
         progress
@@ -2590,5 +2785,228 @@ mod tests {
         assert_eq!(first_block, TEXT + 2);
         let ips: Vec<u64> = trace.iter().map(|s| s.instr.ip() - TEXT).collect();
         assert_eq!(ips, [2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn cross_function_pdata_jmp_and_jcc_tail_calls_are_seeded() {
+        // Entry at 0x00 only; 0x10 (callee A) and 0x20 (callee B) are in .pdata but NOT initially
+        // in `image.entry_points`. 0x30 is a cold chunk owned by 0x00 (must stay intra-function!).
+        //   0x00: test ecx, ecx; je 0x10 (jcc tail call); jmp 0x30 (same primary -> intra)
+        //   0x10: mov eax, 1; ret
+        //   0x20: mov eax, 2; ret
+        //   0x30: jmp 0x20 (unconditional tail call to another .pdata function)
+        let mut code = vec![0xccu8; 0x40];
+        code[0x00..0x09].copy_from_slice(&[
+            0x85, 0xc9, // 0x00: test ecx, ecx
+            0x74, 0x0c, // 0x02: je 0x10
+            0xe9, 0x27, 0x00, 0x00, 0x00, // 0x04: jmp 0x30
+        ]);
+        code[0x10..0x16].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+        code[0x20..0x26].copy_from_slice(&[0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+        code[0x30..0x35].copy_from_slice(&[0xe9, 0xeb, 0xff, 0xff, 0xff]); // jmp 0x20
+
+        let table = crate::pdata::FunctionTable::new(vec![
+            crate::pdata::FunctionRange {
+                start: TEXT,
+                end: TEXT + 0x10,
+                function: TEXT,
+            },
+            crate::pdata::FunctionRange {
+                start: TEXT + 0x10,
+                end: TEXT + 0x20,
+                function: TEXT + 0x10,
+            },
+            crate::pdata::FunctionRange {
+                start: TEXT + 0x20,
+                end: TEXT + 0x30,
+                function: TEXT + 0x20,
+            },
+            crate::pdata::FunctionRange {
+                start: TEXT + 0x30,
+                end: TEXT + 0x40,
+                function: TEXT, // cold chunk of TEXT
+            },
+        ]);
+
+        let analysis = analyze_eh(&code, &[0], Default::default(), table);
+        assert_eq!(
+            analysis.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x10, TEXT + 0x20]
+        );
+        let main_fn = func(&analysis, 0);
+        // Cold chunk 0x30 remains part of main_fn; 0x10 and 0x20 are tail calls.
+        assert_eq!(block_starts(main_fn), [0x0, 0x4, 0x30]);
+        assert_eq!(
+            block(main_fn, 0x0).successors,
+            [Edge::TailCall(TEXT + 0x10), Edge::Fallthrough(TEXT + 0x4)]
+        );
+        assert_eq!(block(main_fn, 0x4).successors, [Edge::Jump(TEXT + 0x30)]);
+        assert_eq!(
+            block(main_fn, 0x30).successors,
+            [Edge::TailCall(TEXT + 0x20)]
+        );
+        assert_eq!(block_starts(func(&analysis, 0x10)), [0x10]);
+        assert_eq!(block_starts(func(&analysis, 0x20)), [0x20]);
+    }
+
+    #[test]
+    fn rdata_vtable_and_direct_code_callbacks_are_discovered_and_reloc_gated() {
+        // Code layout:
+        //   0x00: lea rax, [rip -> DATA+0x00]; mov [rcx], rax; lea rdx, [rip -> TEXT+0x40]; ret
+        //   0x20: virtual method 0 (.pdata function): mov eax, 1; ret
+        //   0x30: virtual method 1 (leaf function in gap): mov eax, 2; ret
+        //   0x40: direct address-taken .pdata callback: mov eax, 3; ret
+        //   0x50: padding (`int3`): must NOT be seeded even if relocated
+        //   0x60: method after stopper: must NOT be reached past the padding/non-reloc entry
+        let mut code = vec![0xccu8; 0x70];
+        let lea_vtable = (DATA as i64 - (TEXT as i64 + 7)) as i32;
+        let lea_cb = ((TEXT + 0x40) as i64 - (TEXT as i64 + 0x11)) as i32;
+        code[0x00..0x03].copy_from_slice(&[0x48, 0x8d, 0x05]);
+        code[0x03..0x07].copy_from_slice(&lea_vtable.to_le_bytes());
+        code[0x07..0x0a].copy_from_slice(&[0x48, 0x89, 0x01]); // mov [rcx], rax
+        code[0x0a..0x0d].copy_from_slice(&[0x48, 0x8d, 0x15]);
+        code[0x0d..0x11].copy_from_slice(&lea_cb.to_le_bytes());
+        code[0x11] = 0xc3; // ret
+        code[0x20..0x26].copy_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+        code[0x30..0x36].copy_from_slice(&[0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+        code[0x40..0x46].copy_from_slice(&[0xb8, 0x03, 0x00, 0x00, 0x00, 0xc3]);
+        code[0x50] = 0xcc; // int3 padding
+        code[0x60..0x66].copy_from_slice(&[0xb8, 0x04, 0x00, 0x00, 0x00, 0xc3]);
+
+        // VTable at DATA+0x00:
+        //   [0]: TEXT+0x20 (.pdata entry, relocated) -> SEEDED
+        //   [1]: TEXT+0x30 (leaf function, relocated) -> SEEDED
+        //   [2]: TEXT+0x50 (int3 padding, relocated) -> STOPS walk
+        //   [3]: TEXT+0x60 (valid code past stopper, relocated) -> NOT reached
+        let mut data = vec![0u8; 0x40];
+        data[0x00..0x08].copy_from_slice(&(TEXT + 0x20).to_le_bytes());
+        data[0x08..0x10].copy_from_slice(&(TEXT + 0x30).to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&(TEXT + 0x50).to_le_bytes());
+        data[0x18..0x20].copy_from_slice(&(TEXT + 0x60).to_le_bytes());
+
+        let pdata = crate::pdata::FunctionTable::new(vec![
+            crate::pdata::FunctionRange {
+                start: TEXT,
+                end: TEXT + 0x18,
+                function: TEXT,
+            },
+            crate::pdata::FunctionRange {
+                start: TEXT + 0x20,
+                end: TEXT + 0x28,
+                function: TEXT + 0x20,
+            },
+            crate::pdata::FunctionRange {
+                start: TEXT + 0x40,
+                end: TEXT + 0x48,
+                function: TEXT + 0x40,
+            },
+        ]);
+
+        // 1) With data_relocs set: discovers vtable entries [0], [1] and direct callback 0x40.
+        let mut img_ok = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        img_ok.function_table = pdata.clone();
+        for off in [0x00u64, 0x08, 0x10, 0x18] {
+            img_ok.data_relocs.insert(DATA + off);
+        }
+        let a1 = discover_with_threads(&img_ok, 1);
+        let a4 = discover_with_threads(&img_ok, 4);
+        assert_eq!(a1, a4, "discovery must be thread-count invariant");
+        assert_eq!(
+            a1.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x20, TEXT + 0x30, TEXT + 0x40]
+        );
+
+        // 2) Without data_relocs: vtable entries are NOT seeded (only direct .pdata callback 0x40).
+        let mut img_no_reloc = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        img_no_reloc.function_table = pdata.clone();
+        let a_no_reloc = discover(&img_no_reloc);
+        assert_eq!(
+            a_no_reloc.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x40]
+        );
+
+        // 3) Interior pointer to a .pdata function (TEXT+0x25, inside [0x20, 0x28)) stops the walk.
+        let mut bad_data = data.clone();
+        bad_data[0x00..0x08].copy_from_slice(&(TEXT + 0x25).to_le_bytes());
+        let mut img_interior = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &bad_data, false),
+            ],
+            vec![TEXT],
+        );
+        img_interior.function_table = pdata;
+        img_interior.data_relocs.insert(DATA);
+        img_interior.data_relocs.insert(DATA + 0x08);
+        let a_interior = discover(&img_interior);
+        assert_eq!(
+            a_interior.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x40]
+        );
+    }
+
+    #[test]
+    fn rip_relative_indirect_call_and_jmp_pointer_slots_seed_targets() {
+        // 0x00: call [rip -> DATA+0x00] (relocated -> TEXT+0x20)
+        // 0x06: call [rip -> DATA+0x08] (NOT relocated, e.g. IAT -> ignored)
+        // 0x0c: jmp  [rip -> DATA+0x10] (relocated -> TEXT+0x30)
+        let mut code = vec![0xccu8; 0x40];
+        let d_call_ok = (DATA as i64 - (TEXT as i64 + 6)) as i32;
+        let d_call_iat = ((DATA + 8) as i64 - (TEXT as i64 + 0x0c)) as i32;
+        let d_jmp_ok = ((DATA + 0x10) as i64 - (TEXT as i64 + 0x12)) as i32;
+        code[0x00..0x02].copy_from_slice(&[0xff, 0x15]);
+        code[0x02..0x06].copy_from_slice(&d_call_ok.to_le_bytes());
+        code[0x06..0x08].copy_from_slice(&[0xff, 0x15]);
+        code[0x08..0x0c].copy_from_slice(&d_call_iat.to_le_bytes());
+        code[0x0c..0x0e].copy_from_slice(&[0xff, 0x25]);
+        code[0x0e..0x12].copy_from_slice(&d_jmp_ok.to_le_bytes());
+        code[0x20] = 0xc3;
+        code[0x28] = 0xc3;
+        code[0x30] = 0xc3;
+
+        let mut data = vec![0u8; 0x20];
+        data[0x00..0x08].copy_from_slice(&(TEXT + 0x20).to_le_bytes());
+        data[0x08..0x10].copy_from_slice(&(TEXT + 0x28).to_le_bytes());
+        data[0x10..0x18].copy_from_slice(&(TEXT + 0x30).to_le_bytes());
+
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        // Relocate only DATA+0x00 and DATA+0x10; leave DATA+0x08 unrelocated (like an IAT slot).
+        image.data_relocs.insert(DATA);
+        image.data_relocs.insert(DATA + 0x10);
+
+        let a1 = discover_with_threads(&image, 1);
+        let a4 = discover_with_threads(&image, 4);
+        assert_eq!(a1, a4);
+        assert_eq!(
+            a1.functions.keys().copied().collect::<Vec<_>>(),
+            [TEXT, TEXT + 0x20, TEXT + 0x30]
+        );
+        assert_eq!(
+            a1.pointer_slots.get(&(TEXT + 0x0c)),
+            Some(&(DATA + 0x10, TEXT + 0x30))
+        );
+        assert!(!a1.functions.contains_key(&(TEXT + 0x28)));
     }
 }

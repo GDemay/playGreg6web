@@ -50,10 +50,11 @@ pub(crate) const MAX_REACH_DEPTH: usize = MAX_REACH_BLOCKS;
 const WIDEN_AFTER: u32 = 8;
 
 /// Hard upper bound on forward worklist pops per query (defensive livelock/cycle guard).
-/// Each block in a monotone `GPR_COUNT`-register lattice with widening after `WIDEN_AFTER`
-/// updates can change at most `WIDEN_AFTER + GPR_COUNT` times after its initial visit.
+/// Each block in a monotone `GPR_COUNT`-register lattice (tracking both 64-bit and 32-bit
+/// intervals) with widening after `WIDEN_AFTER` updates can change at most
+/// `WIDEN_AFTER + 2 * GPR_COUNT` times after its initial visit.
 pub(crate) const MAX_WORKLIST_STEPS: usize =
-    MAX_REACH_BLOCKS * (WIDEN_AFTER as usize + GPR_COUNT + 2);
+    MAX_REACH_BLOCKS * (WIDEN_AFTER as usize + 2 * GPR_COUNT + 2);
 
 /// What is known about a full 64-bit register on every path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,44 +90,111 @@ impl Known {
 
 const GPR_COUNT: usize = 16;
 
-/// Register file state: one [`Known`] per 64-bit GPR (index = `Register::number()` of RAX..R15).
+/// Copy-alias relation for one register slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct State([Known; GPR_COUNT], [u8; GPR_COUNT]);
+enum Alias {
+    /// No path seen yet (only during the analysis).
+    Unvisited,
+    /// Zero-extended 32-bit copy (`reg == zext32(src)`).
+    Copy32(u8),
+    /// Full 64-bit copy (`reg == src`).
+    Copy64(u8),
+    /// No register copy known.
+    None,
+}
 
-/// [`State`] alias slot: no register copy known.
-const NO_ALIAS: u8 = 0xff;
-/// [`State`] alias slot: no path seen yet (only during the analysis).
-const ALIAS_UNVISITED: u8 = 0xfe;
+/// Register file state: per-GPR full 64-bit unsigned intervals, low 32-bit unsigned intervals,
+/// and register copy aliases (index = `Register::number()` of RAX..R15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct State {
+    ranges: [Known; GPR_COUNT],
+    u32_ranges: [Known; GPR_COUNT],
+    aliases: [Alias; GPR_COUNT],
+}
+
+/// Low 32-bit interval implied by a full 64-bit [`Known`] value.
+fn low32_of(k: Known) -> Known {
+    match k {
+        Known::Unvisited => Known::Unvisited,
+        Known::Unknown => Known::Unknown,
+        Known::Range { lo, hi } if (lo >> 32) == (hi >> 32) => Known::Range {
+            lo: lo & mask(32),
+            hi: hi & mask(32),
+        },
+        Known::Range { .. } => Known::Unknown,
+    }
+}
+
+fn is_high_byte(reg: Register) -> bool {
+    matches!(
+        reg,
+        Register::AH | Register::BH | Register::CH | Register::DH
+    )
+}
 
 impl State {
     fn unvisited() -> Self {
-        Self([Known::Unvisited; GPR_COUNT], [ALIAS_UNVISITED; GPR_COUNT])
+        Self {
+            ranges: [Known::Unvisited; GPR_COUNT],
+            u32_ranges: [Known::Unvisited; GPR_COUNT],
+            aliases: [Alias::Unvisited; GPR_COUNT],
+        }
     }
     fn unknown() -> Self {
-        Self([Known::Unknown; GPR_COUNT], [NO_ALIAS; GPR_COUNT])
+        Self {
+            ranges: [Known::Unknown; GPR_COUNT],
+            u32_ranges: [Known::Unknown; GPR_COUNT],
+            aliases: [Alias::None; GPR_COUNT],
+        }
     }
     fn get(&self, reg: Register) -> Known {
-        slot(reg).map_or(Known::Unknown, |i| self.0[i])
+        slot(reg).map_or(Known::Unknown, |i| self.ranges[i])
     }
-    fn set(&mut self, reg: Register, value: Known) {
+    fn get_u32(&self, reg: Register) -> Known {
+        slot(reg).map_or(Known::Unknown, |i| self.u32_ranges[i])
+    }
+    fn set(&mut self, reg: Register, value: Known, u32_value: Known) {
         if let Some(i) = slot(reg) {
-            self.0[i] = value;
+            self.ranges[i] = value;
+            self.u32_ranges[i] = u32_value;
         }
     }
     fn join(&self, other: &State) -> State {
         let mut out = *self;
-        for (o, x) in out.0.iter_mut().zip(other.0.iter()) {
+        for (o, x) in out.ranges.iter_mut().zip(other.ranges.iter()) {
             *o = o.join(*x);
         }
-        for (i, o) in out.1.iter_mut().enumerate() {
-            *o = match (self.1[i], other.1[i]) {
-                (ALIAS_UNVISITED, y) | (y, ALIAS_UNVISITED) => y,
+        for (o, x) in out.u32_ranges.iter_mut().zip(other.u32_ranges.iter()) {
+            *o = o.join(*x);
+        }
+        for (i, o) in out.aliases.iter_mut().enumerate() {
+            *o = match (self.aliases[i], other.aliases[i]) {
+                (Alias::Unvisited, y) | (y, Alias::Unvisited) => y,
                 (a, b) if a == b => a,
-                // Copies of one source on one path, of each other on the other: `i = a` and
-                // `b = a` on the first path make `i` a copy of `b` there too (and symmetrically).
-                (a, b) if b < GPR_COUNT as u8 && self.1[usize::from(b)] == a => b,
-                (a, b) if a < GPR_COUNT as u8 && other.1[usize::from(a)] == b => a,
-                _ => NO_ALIAS,
+                // Copies of one source on one path, of each other on the other: `i = zext32(a)`
+                // and `b = zext32(a)` on the first path make `i = zext32(b)` there too (and
+                // symmetrically), and likewise for full 64-bit copies.
+                (Alias::Copy32(a), Alias::Copy32(b))
+                    if self.aliases[usize::from(b)] == Alias::Copy32(a) =>
+                {
+                    Alias::Copy32(b)
+                }
+                (Alias::Copy32(a), Alias::Copy32(b))
+                    if other.aliases[usize::from(a)] == Alias::Copy32(b) =>
+                {
+                    Alias::Copy32(a)
+                }
+                (Alias::Copy64(a), Alias::Copy64(b))
+                    if self.aliases[usize::from(b)] == Alias::Copy64(a) =>
+                {
+                    Alias::Copy64(b)
+                }
+                (Alias::Copy64(a), Alias::Copy64(b))
+                    if other.aliases[usize::from(a)] == Alias::Copy64(b) =>
+                {
+                    Alias::Copy64(a)
+                }
+                _ => Alias::None,
             };
         }
         out
@@ -225,11 +293,63 @@ fn collect_backward_subgraph_bounded(
     Some(BackwardSubgraph { blocks: sub, roots })
 }
 
+/// Combined reaching facts on entry to a block: full 64-bit intervals, low 32-bit intervals,
+/// and register copies (`(dst, src, is_64bit)`).
+pub(crate) struct ReachingFacts {
+    pub values: Vec<(Register, Known)>,
+    pub u32_values: Vec<(Register, Known)>,
+    pub copies: Vec<(Register, Register, bool)>,
+}
+
+/// Compute full 64-bit intervals, low 32-bit intervals, and register copy aliases on entry to
+/// `target` in one forward dataflow pass.
+pub(crate) fn reaching_facts(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    regs: &[Register],
+) -> Option<ReachingFacts> {
+    let input = reaching_state_bounded(
+        blocks,
+        preds,
+        is_entry,
+        target,
+        MAX_REACH_BLOCKS,
+        MAX_REACH_DEPTH,
+        MAX_WORKLIST_STEPS,
+    )?;
+    let normalize = |k: Known| if k == Known::Unvisited { Known::Unknown } else { k };
+    let values = regs.iter().map(|&r| (r, normalize(input.get(r)))).collect();
+    let u32_values = regs
+        .iter()
+        .map(|&r| (r, normalize(input.get_u32(r))))
+        .collect();
+    let copies = regs
+        .iter()
+        .filter_map(|&r| match input.aliases[slot(r)?] {
+            Alias::Copy32(a) if usize::from(a) < GPR_COUNT => {
+                Some((r.full_register(), Register::RAX + u32::from(a), false))
+            }
+            Alias::Copy64(a) if usize::from(a) < GPR_COUNT => {
+                Some((r.full_register(), Register::RAX + u32::from(a), true))
+            }
+            _ => None,
+        })
+        .collect();
+    Some(ReachingFacts {
+        values,
+        u32_values,
+        copies,
+    })
+}
+
 /// Values of `regs` on entry to `target`, over every intra-function path that reaches it.
 /// `preds(b)` lists the blocks with an intra-function edge into `b`; `is_entry(b)` marks function
 /// entries (where every register is unknown). `None` when the reachable subgraph exceeds
 /// [`MAX_REACH_BLOCKS`] / [`MAX_REACH_DEPTH`], the worklist exceeds [`MAX_WORKLIST_STEPS`], or
 /// `target` (or a backward-reachable predecessor) is unknown.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reaching_values(
     blocks: &BTreeMap<u64, BasicBlock>,
     preds: &dyn Fn(u64) -> Vec<u64>,
@@ -249,6 +369,7 @@ pub(crate) fn reaching_values(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 fn reaching_values_bounded(
     blocks: &BTreeMap<u64, BasicBlock>,
@@ -288,6 +409,7 @@ fn reaching_values_bounded(
 
 /// Registers of `regs` that are a zero-extended 32-bit copy (`mov dst32, src32`) of another
 /// register on every path into `target`, as `(dst, src)` full registers.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn reaching_copies(
     blocks: &BTreeMap<u64, BasicBlock>,
     preds: &dyn Fn(u64) -> Vec<u64>,
@@ -306,9 +428,11 @@ pub(crate) fn reaching_copies(
     )?;
     Some(
         regs.iter()
-            .filter_map(|&r| {
-                let a = input.1[slot(r)?];
-                (a < GPR_COUNT as u8).then(|| (r.full_register(), Register::RAX + u32::from(a)))
+            .filter_map(|&r| match input.aliases[slot(r)?] {
+                Alias::Copy32(a) if usize::from(a) < GPR_COUNT => {
+                    Some((r.full_register(), Register::RAX + u32::from(a)))
+                }
+                _ => None,
             })
             .collect(),
     )
@@ -568,9 +692,19 @@ fn reaching_state_bounded(
             let n = changes.entry(next).or_insert(0);
             *n += 1;
             if *n > WIDEN_AFTER {
-                for (i, k) in new.0.iter_mut().enumerate() {
-                    if *k != old.0[i] {
+                for (i, k) in new.ranges.iter_mut().enumerate() {
+                    if *k != old.ranges[i] {
                         *k = Known::Unknown;
+                    }
+                }
+                for (i, k) in new.u32_ranges.iter_mut().enumerate() {
+                    if *k != old.u32_ranges[i] {
+                        *k = Known::Unknown;
+                    }
+                }
+                for (i, a) in new.aliases.iter_mut().enumerate() {
+                    if *a != old.aliases[i] {
+                        *a = Alias::None;
                     }
                 }
             }
@@ -598,29 +732,79 @@ fn writes(info: &mut InstructionInfoFactory, instr: &Instruction, reg: Register)
     })
 }
 
-/// Apply `instr` to `state`.
 /// Register `i` is overwritten: it is no longer a copy of anything, and the registers that were
-/// copies of it (`j = zext(i32)`) and survive the write (`keeps(j)`) stay copies of each other.
-/// The first of them takes the place of `i` as their source; the rest lose their relation.
+/// copies of it (`j = zext32(i)` or `j = i`) and survive the write (`keeps(j)`) stay copies of
+/// each other within their own width class. The first survivor takes the place of `i` as their
+/// source; the rest lose their relation.
 fn unlink(state: &mut State, i: usize, keeps: &dyn Fn(usize) -> bool) {
-    state.1[i] = NO_ALIAS;
-    let mut rep: Option<u8> = None;
+    state.aliases[i] = Alias::None;
+    let mut rep32: Option<u8> = None;
+    let mut rep64: Option<u8> = None;
     for j in 0..GPR_COUNT {
-        if j == i || usize::from(state.1[j]) != i {
+        if j == i {
             continue;
         }
-        if !keeps(j) {
-            state.1[j] = NO_ALIAS;
-            continue;
-        }
-        match rep {
-            None => {
-                rep = Some(j as u8);
-                state.1[j] = NO_ALIAS;
+        match state.aliases[j] {
+            Alias::Copy32(src) if usize::from(src) == i => {
+                if !keeps(j) {
+                    state.aliases[j] = Alias::None;
+                } else if let Some(r) = rep32 {
+                    state.aliases[j] = Alias::Copy32(r);
+                } else {
+                    rep32 = Some(j as u8);
+                    state.aliases[j] = Alias::None;
+                }
             }
-            Some(r) => state.1[j] = r,
+            Alias::Copy64(src) if usize::from(src) == i => {
+                if !keeps(j) {
+                    state.aliases[j] = Alias::None;
+                } else if let Some(r) = rep64 {
+                    state.aliases[j] = Alias::Copy64(r);
+                } else {
+                    rep64 = Some(j as u8);
+                    state.aliases[j] = Alias::None;
+                }
+            }
+            _ => {}
         }
     }
+}
+
+/// Detect whether `instr` makes its destination a 32-bit zero-extended copy or 64-bit full copy
+/// of another GPR (`mov r32, r32`, `mov r64, r64`, or `lea r32/r64, [src64 + 0]`).
+fn copy_relation(instr: &Instruction) -> Option<(Register, Register, bool)> {
+    if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
+        return None;
+    }
+    let dst = instr.op0_register();
+    if !(dst.is_gpr32() || dst.is_gpr64()) {
+        return None;
+    }
+    let is_64 = dst.is_gpr64();
+    let src = match instr.mnemonic() {
+        Mnemonic::Mov if instr.op1_kind() == OpKind::Register => {
+            let s = instr.op1_register();
+            if (is_64 && s.is_gpr64()) || (!is_64 && s.is_gpr32()) {
+                s
+            } else {
+                return None;
+            }
+        }
+        Mnemonic::Lea
+            if instr.op1_kind() == OpKind::Memory
+                && !instr.is_ip_rel_memory_operand()
+                && !matches!(instr.memory_segment(), Register::FS | Register::GS)
+                && instr.memory_base().is_gpr64()
+                && instr.memory_index() == Register::None
+                && instr.memory_displacement64() == 0 =>
+        {
+            instr.memory_base()
+        }
+        _ => return None,
+    };
+    let dst_full = dst.full_register();
+    let src_full = src.full_register();
+    (dst_full != src_full).then_some((dst_full, src_full, is_64))
 }
 
 fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut State) {
@@ -628,9 +812,10 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
         instr.flow_control(),
         FlowControl::Call | FlowControl::IndirectCall
     ) {
-        for (i, known) in state.0.iter_mut().enumerate() {
+        for i in 0..GPR_COUNT {
             if is_win64_volatile(Register::RAX + i as u32) {
-                *known = Known::Unknown;
+                state.ranges[i] = Known::Unknown;
+                state.u32_ranges[i] = Known::Unknown;
             }
         }
         for i in 0..GPR_COUNT {
@@ -663,43 +848,67 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
     if written.is_empty() {
         return;
     }
-    // A `mov r32, r32` between distinct registers leaves the destination a zero-extended copy of
-    // the source; any other write ends the copy relations of the written register.
-    let copy = (instr.mnemonic() == Mnemonic::Mov
-        && instr.op_count() == 2
-        && instr.op0_kind() == OpKind::Register
-        && instr.op1_kind() == OpKind::Register
-        && instr.op0_register().is_gpr32()
-        && instr.op1_register().is_gpr32()
-        && instr.op0_register().full_register() != instr.op1_register().full_register())
-    .then(|| {
-        (
-            instr.op0_register().full_register(),
-            instr.op1_register().full_register(),
-        )
-    });
+    let copy = copy_relation(instr);
     let written_slots: Vec<usize> = written.iter().filter_map(|r| slot(*r)).collect();
     for &i in &written_slots {
         unlink(state, i, &|j| !written_slots.contains(&j));
     }
-    if let Some((dst, src)) = copy
+    if let Some((dst, src, is_64)) = copy
         && let (Some(d), Some(sr)) = (slot(dst), slot(src))
     {
-        state.1[d] = sr as u8;
+        state.aliases[d] = if is_64 {
+            Alias::Copy64(sr as u8)
+        } else {
+            Alias::Copy32(sr as u8)
+        };
     }
     // The one register an exactly modelled instruction writes (operand 0).
     let modelled = model(instr, state);
     for reg in written {
-        let value = match modelled {
-            Some((dst, v)) if dst == reg => v,
-            _ => Known::Unknown,
+        let (full_v, u32_v) = match modelled {
+            Some((dst, fv, uv)) if dst == reg => (fv, uv),
+            _ => (Known::Unknown, Known::Unknown),
         };
-        state.set(reg, value);
+        state.set(reg, full_v, u32_v);
     }
 }
 
-/// Exact effect of `instr` on its destination register (operand 0), if modelled.
-fn model(instr: &Instruction, state: &State) -> Option<(Register, Known)> {
+/// Shift `base` by signed `delta` within `[0, mask(width)]`.
+fn shift_range(base: Known, delta: i128, width: u32) -> Known {
+    let fallback = if width == 32 {
+        Known::Range {
+            lo: 0,
+            hi: mask(32),
+        }
+    } else {
+        Known::Unknown
+    };
+    let Known::Range { lo, hi } = base else {
+        return fallback;
+    };
+    let nlo = i128::from(lo) + delta;
+    let nhi = i128::from(hi) + delta;
+    if nlo < 0 || nhi > i128::from(mask(width)) {
+        fallback
+    } else {
+        Known::Range {
+            lo: nlo as u64,
+            hi: nhi as u64,
+        }
+    }
+}
+
+/// Exact effect of `instr` on its destination register (operand 0), if modelled:
+/// `(full_reg, full_64_known, u32_known)`.
+fn model(instr: &Instruction, state: &State) -> Option<(Register, Known, Known)> {
+    if instr.mnemonic() == Mnemonic::Cdqe {
+        let u32_v = state.get_u32(Register::RAX);
+        let full_v = match u32_v {
+            Known::Range { lo, hi } if hi <= 0x7fff_ffff => Known::Range { lo, hi },
+            _ => Known::Unknown,
+        };
+        return Some((Register::RAX, full_v, u32_v));
+    }
     if instr.op_count() < 1 || instr.op0_kind() != OpKind::Register {
         return None;
     }
@@ -721,35 +930,74 @@ fn model(instr: &Instruction, state: &State) -> Option<(Register, Known)> {
         .then(|| instr.try_immediate(1).ok())
         .flatten();
     let cur = state.get(full);
-    let known = match instr.mnemonic() {
+    let cur_u32 = state.get_u32(full);
+    let (full_v, u32_v) = match instr.mnemonic() {
         Mnemonic::Lea if d64 && instr.is_ip_rel_memory_operand() => {
-            Known::exact(instr.ip_rel_memory_address())
+            let k = Known::exact(instr.ip_rel_memory_address());
+            (k, low32_of(k))
         }
-        Mnemonic::Mov if imm.is_some() => Known::exact(imm? & mask(width)),
-        Mnemonic::Xor if src_reg == Some(dst) => Known::exact(0),
-        Mnemonic::Mov if src_reg.is_some_and(|s| s.is_gpr64()) && d64 => state.get(src_reg?),
+        Mnemonic::Lea
+            if instr.op_count() == 2
+                && instr.op1_kind() == OpKind::Memory
+                && !instr.is_ip_rel_memory_operand()
+                && !matches!(instr.memory_segment(), Register::FS | Register::GS)
+                && instr.memory_base().is_gpr64()
+                && instr.memory_index() == Register::None =>
+        {
+            let src = instr.memory_base();
+            let disp = instr.memory_displacement64() as i64;
+            if d32 {
+                let r = shift_range(state.get_u32(src), i128::from(disp as i32), 32);
+                (r, r)
+            } else {
+                let fv = shift_range(state.get(src), i128::from(disp), 64);
+                let uv = match state.get_u32(src) {
+                    Known::Range { .. } => {
+                        let s = shift_range(state.get_u32(src), i128::from(disp as i32), 32);
+                        if s == (Known::Range { lo: 0, hi: mask(32) }) {
+                            low32_of(fv)
+                        } else {
+                            s
+                        }
+                    }
+                    _ => low32_of(fv),
+                };
+                (fv, uv)
+            }
+        }
+        Mnemonic::Mov if imm.is_some() => {
+            let k = Known::exact(imm? & mask(width));
+            (k, low32_of(k))
+        }
+        Mnemonic::Xor if src_reg == Some(dst) => (Known::exact(0), Known::exact(0)),
+        Mnemonic::Mov if src_reg.is_some_and(|s| s.is_gpr64()) && d64 => {
+            let s = src_reg?;
+            (state.get(s), state.get_u32(s))
+        }
         Mnemonic::Mov if src_reg.is_some_and(|s| s.is_gpr32()) && d32 => {
-            let s = state.get(src_reg?);
-            if s.within_u32() {
+            let s = state.get_u32(src_reg?);
+            let r = if s.within_u32() {
                 s
             } else {
                 Known::Range {
                     lo: 0,
                     hi: mask(32),
                 }
-            }
+            };
+            (r, r)
         }
         Mnemonic::Mov if instr.op_count() == 2 && instr.op1_kind() == OpKind::Memory && d32 => {
-            Known::Range {
+            let r = Known::Range {
                 lo: 0,
                 hi: mask(32),
-            }
+            };
+            (r, r)
         }
         Mnemonic::Movzx if instr.op_count() == 2 => {
             let bits = match instr.op1_kind() {
                 OpKind::Register => {
                     let s = instr.op1_register();
-                    if matches!(s, Register::AH | Register::BH | Register::CH | Register::DH) {
+                    if is_high_byte(s) {
                         8
                     } else {
                         s.size() as u32 * 8
@@ -759,64 +1007,87 @@ fn model(instr: &Instruction, state: &State) -> Option<(Register, Known)> {
                 _ => return None,
             };
             let m = mask(bits);
-            match (instr.op1_kind(), src_reg.map(|s| state.get(s))) {
+            let r = match (instr.op1_kind(), src_reg.map(|s| state.get_u32(s))) {
                 (OpKind::Register, Some(Known::Range { lo, hi }))
-                    if hi <= m
-                        && !matches!(
-                            src_reg,
-                            Some(Register::AH | Register::BH | Register::CH | Register::DH)
-                        ) =>
+                    if hi <= m && !src_reg.is_some_and(is_high_byte) =>
                 {
                     Known::Range { lo, hi }
                 }
                 _ => Known::Range { lo: 0, hi: m },
-            }
+            };
+            (r, r)
         }
         Mnemonic::Movsxd if d64 && src_reg.is_some_and(|s| s.is_gpr32()) => {
-            match state.get(src_reg?) {
-                Known::Range { lo, hi } if hi <= 0x7fff_ffff => Known::Range { lo, hi },
-                _ => Known::Unknown,
+            let s = state.get_u32(src_reg?);
+            match s {
+                Known::Range { lo, hi } if hi <= 0x7fff_ffff => {
+                    let r = Known::Range { lo, hi };
+                    (r, r)
+                }
+                Known::Range { lo, hi } => (Known::Unknown, Known::Range { lo, hi }),
+                _ => (Known::Unknown, Known::Unknown),
             }
         }
         Mnemonic::And if imm.is_some() => {
-            let m = imm? & mask(width);
-            let top = if width == 64 && (m as i64) < 0 {
-                None
+            let raw = imm?;
+            if d32 {
+                let m = raw & mask(32);
+                let r = match cur_u32 {
+                    Known::Range { hi, .. } => Known::Range {
+                        lo: 0,
+                        hi: hi.min(m),
+                    },
+                    _ => Known::Range { lo: 0, hi: m },
+                };
+                (r, r)
             } else {
-                Some(m)
-            };
-            match (top, cur) {
-                (Some(m), Known::Range { hi, .. }) => Known::Range {
-                    lo: 0,
-                    hi: hi.min(m),
-                },
-                (Some(m), _) => Known::Range { lo: 0, hi: m },
-                (None, _) => Known::Unknown,
+                let top = if (raw as i64) < 0 { None } else { Some(raw) };
+                let fv = match (top, cur) {
+                    (Some(m), Known::Range { hi, .. }) => Known::Range {
+                        lo: 0,
+                        hi: hi.min(m),
+                    },
+                    (Some(m), _) => Known::Range { lo: 0, hi: m },
+                    (None, _) => Known::Unknown,
+                };
+                let m32 = raw & mask(32);
+                let uv = match cur_u32 {
+                    Known::Range { hi, .. } => Known::Range {
+                        lo: 0,
+                        hi: hi.min(m32),
+                    },
+                    _ => Known::Range { lo: 0, hi: m32 },
+                };
+                (fv, uv)
             }
         }
         Mnemonic::Shr if imm.is_some() => {
-            let s = (imm? & 63) as u32;
-            let base = if d32 {
-                if cur.within_u32() {
-                    cur
-                } else {
-                    Known::Range {
+            if d32 {
+                let s = (imm? & 31) as u32;
+                let r = match cur_u32 {
+                    Known::Range { lo, hi } => Known::Range {
+                        lo: lo >> s,
+                        hi: hi >> s,
+                    },
+                    _ => Known::Range {
                         lo: 0,
-                        hi: mask(32),
-                    }
-                }
+                        hi: mask(32) >> s,
+                    },
+                };
+                (r, r)
             } else {
-                cur
-            };
-            match base {
-                Known::Range { lo, hi } => Known::Range {
-                    lo: lo >> s,
-                    hi: hi >> s,
-                },
-                _ => Known::Range {
-                    lo: 0,
-                    hi: mask(width) >> s,
-                },
+                let s = (imm? & 63) as u32;
+                let fv = match cur {
+                    Known::Range { lo, hi } => Known::Range {
+                        lo: lo >> s,
+                        hi: hi >> s,
+                    },
+                    _ => Known::Range {
+                        lo: 0,
+                        hi: mask(64) >> s,
+                    },
+                };
+                (fv, low32_of(fv))
             }
         }
         Mnemonic::Add | Mnemonic::Sub | Mnemonic::Inc | Mnemonic::Dec => {
@@ -837,46 +1108,82 @@ fn model(instr: &Instruction, state: &State) -> Option<(Register, Known)> {
                     }
                 }
             };
-            let base = if d32 && !cur.within_u32() {
-                Known::Unknown
+            if d32 {
+                let r = shift_range(cur_u32, delta, 32);
+                (r, r)
             } else {
-                cur
-            };
-            match base {
-                Known::Range { lo, hi } => {
-                    let nlo = i128::from(lo) + delta;
-                    let nhi = i128::from(hi) + delta;
-                    if nlo < 0 || nhi > i128::from(mask(width)) {
-                        if d32 {
-                            Known::Range {
-                                lo: 0,
-                                hi: mask(32),
-                            }
+                let fv = shift_range(cur, delta, 64);
+                let uv = match cur_u32 {
+                    Known::Range { .. }
+                        if (i128::from(i32::MIN)..=i128::from(i32::MAX)).contains(&delta) =>
+                    {
+                        let s = shift_range(cur_u32, delta, 32);
+                        if s == (Known::Range { lo: 0, hi: mask(32) }) {
+                            low32_of(fv)
                         } else {
-                            Known::Unknown
-                        }
-                    } else {
-                        Known::Range {
-                            lo: nlo as u64,
-                            hi: nhi as u64,
+                            s
                         }
                     }
-                }
-                _ if d32 => Known::Range {
-                    lo: 0,
-                    hi: mask(32),
-                },
-                _ => Known::Unknown,
+                    _ => low32_of(fv),
+                };
+                (fv, uv)
             }
         }
         // Any other unconditional write to a 32-bit register zero-extends: bounded by 2^32.
-        _ if d32 => Known::Range {
-            lo: 0,
-            hi: mask(32),
-        },
+        _ if d32 => {
+            let r = Known::Range {
+                lo: 0,
+                hi: mask(32),
+            };
+            (r, r)
+        }
         _ => return None,
     };
-    Some((full, known))
+    Some((full, full_v, u32_v))
+}
+
+/// Extract the `[nlo, nhi]` range implied for the low `bits` bits of `reg` by `instr` + `jcc`
+/// on the `taken` side, given its current range `[lo, hi]`.
+fn edge_fact(
+    instr: &Instruction,
+    jcc: Mnemonic,
+    taken: bool,
+    reg: Register,
+    bits: u32,
+    lo: u64,
+    hi: u64,
+) -> Option<(u64, u64)> {
+    let m = mask(bits);
+    match instr.mnemonic() {
+        Mnemonic::Cmp => {
+            let raw = instr.try_immediate(1).ok()?;
+            let imm = raw & m;
+            unsigned_fact_bits(jcc, taken, imm, lo, hi, bits)
+        }
+        Mnemonic::Test
+            if instr.op_count() == 2
+                && instr.op1_kind() == OpKind::Register
+                && instr.op1_register() == reg =>
+        {
+            match (jcc, taken) {
+                (Mnemonic::Je, true) | (Mnemonic::Jne, false) => Some((0, 0)),
+                (Mnemonic::Je, false) | (Mnemonic::Jne, true) if lo == 0 && hi > 0 => Some((1, hi)),
+                (Mnemonic::Js, false)
+                | (Mnemonic::Jns, true)
+                | (Mnemonic::Jl, false)
+                | (Mnemonic::Jge, true) => Some((0, mask(bits.saturating_sub(1)))),
+                _ => None,
+            }
+        }
+        Mnemonic::Test if instr.op_count() == 2 && instr.try_immediate(1).is_ok() => {
+            let imm_u = instr.try_immediate(1).ok()? & m;
+            match (jcc, taken) {
+                (Mnemonic::Je, true) | (Mnemonic::Jne, false) => Some((0, (!imm_u) & m)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Refine `state` for the edge `edge` out of `block` (which ends in a conditional branch).
@@ -907,6 +1214,12 @@ fn refine_edge(
     let n = block.instructions.len();
     for i in (0..n.saturating_sub(1)).rev() {
         let instr = &block.instructions[i];
+        if matches!(
+            instr.flow_control(),
+            FlowControl::Call | FlowControl::IndirectCall
+        ) {
+            return;
+        }
         if instr.rflags_modified() == 0 {
             continue;
         }
@@ -914,7 +1227,8 @@ fn refine_edge(
             return;
         }
         let reg = instr.op0_register();
-        if !(reg.is_gpr32() || reg.is_gpr64())
+        if !reg.is_gpr()
+            || is_high_byte(reg)
             || block.instructions[i + 1..n - 1]
                 .iter()
                 .any(|k| writes(info, k, reg))
@@ -922,42 +1236,100 @@ fn refine_edge(
             return;
         }
         let bits = reg.size() as u32 * 8;
-        let full = reg.full_register();
-        let cur = state.get(full);
-        // A 32-bit compare bounds the full register only when its upper half is known zero.
-        if bits == 32 && !cur.within_u32() {
+        if !matches!(bits, 8 | 16 | 32 | 64) {
             return;
         }
-        let (lo, hi) = match cur {
-            Known::Range { lo, hi } => (lo, hi),
-            _ => (0, mask(bits)),
+        let full = reg.full_register();
+        let Some(idx) = slot(full) else {
+            return;
         };
-        let fact = match instr.mnemonic() {
-            Mnemonic::Cmp => {
-                let Ok(raw) = instr.try_immediate(1) else {
-                    return;
+        let cur64 = state.ranges[idx];
+        let cur32 = state.u32_ranges[idx];
+        match bits {
+            64 => {
+                let (lo, hi) = match cur64 {
+                    Known::Range { lo, hi } => (lo, hi),
+                    _ => (0, u64::MAX),
                 };
-                let imm = raw & mask(bits);
-                unsigned_fact(jcc.mnemonic(), taken, imm, lo, hi)
-            }
-            Mnemonic::Test
-                if instr.op_count() == 2
-                    && instr.op1_kind() == OpKind::Register
-                    && instr.op1_register() == reg =>
-            {
-                match (jcc.mnemonic(), taken) {
-                    (Mnemonic::Je, true) | (Mnemonic::Jne, false) => Some((0, 0)),
-                    _ => None,
+                if let Some((nlo, nhi)) = edge_fact(instr, jcc.mnemonic(), taken, reg, 64, lo, hi) {
+                    let nlo = nlo.max(lo);
+                    let nhi = nhi.min(hi);
+                    if nlo <= nhi {
+                        let new64 = Known::Range { lo: nlo, hi: nhi };
+                        state.ranges[idx] = new64;
+                        if let Known::Range { lo: l32, hi: h32 } = low32_of(new64) {
+                            let (ulo, uhi) = match cur32 {
+                                Known::Range { lo, hi } => (lo, hi),
+                                _ => (0, mask(32)),
+                            };
+                            let nlo32 = l32.max(ulo);
+                            let nhi32 = h32.min(uhi);
+                            if nlo32 <= nhi32 {
+                                state.u32_ranges[idx] = Known::Range {
+                                    lo: nlo32,
+                                    hi: nhi32,
+                                };
+                            }
+                        }
+                    }
                 }
             }
-            _ => None,
-        };
-        if let Some((nlo, nhi)) = fact {
-            let nlo = nlo.max(lo);
-            let nhi = nhi.min(hi);
-            if nlo <= nhi {
-                state.set(full, Known::Range { lo: nlo, hi: nhi });
+            32 => {
+                let (ulo, uhi) = match cur32 {
+                    Known::Range { lo, hi } => (lo, hi),
+                    _ => (0, mask(32)),
+                };
+                if let Some((nlo, nhi)) = edge_fact(instr, jcc.mnemonic(), taken, reg, 32, ulo, uhi)
+                {
+                    let nlo = nlo.max(ulo);
+                    let nhi = nhi.min(uhi).min(mask(32));
+                    if nlo <= nhi {
+                        state.u32_ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                    }
+                }
+                if cur64.within_u32() {
+                    let Known::Range { lo, hi } = cur64 else {
+                        return;
+                    };
+                    if let Some((nlo, nhi)) =
+                        edge_fact(instr, jcc.mnemonic(), taken, reg, 32, lo, hi)
+                    {
+                        let nlo = nlo.max(lo);
+                        let nhi = nhi.min(hi).min(mask(32));
+                        if nlo <= nhi {
+                            state.ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                            state.u32_ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                        }
+                    }
+                }
             }
+            8 | 16 => {
+                let m = mask(bits);
+                if let Known::Range { lo: ulo, hi: uhi } = cur32
+                    && uhi <= m
+                    && let Some((nlo, nhi)) =
+                        edge_fact(instr, jcc.mnemonic(), taken, reg, bits, ulo, uhi)
+                {
+                    let nlo = nlo.max(ulo);
+                    let nhi = nhi.min(uhi).min(m);
+                    if nlo <= nhi {
+                        state.u32_ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                    }
+                }
+                if let Known::Range { lo, hi } = cur64
+                    && hi <= m
+                    && let Some((nlo, nhi)) =
+                        edge_fact(instr, jcc.mnemonic(), taken, reg, bits, lo, hi)
+                {
+                    let nlo = nlo.max(lo);
+                    let nhi = nhi.min(hi).min(m);
+                    if nlo <= nhi {
+                        state.ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                        state.u32_ranges[idx] = Known::Range { lo: nlo, hi: nhi };
+                    }
+                }
+            }
+            _ => {}
         }
         return;
     }
@@ -965,7 +1337,8 @@ fn refine_edge(
 
 /// `[lo, hi]` implied for the compared register by `cmp reg, imm` + `jcc` on the `taken` side,
 /// given its current range `[cur_lo, cur_hi]` (signed conditions only when that is non-negative
-/// below 2^31).
+/// below `2^(bits-1)`).
+#[cfg_attr(not(test), allow(dead_code))]
 fn unsigned_fact(
     jcc: Mnemonic,
     taken: bool,
@@ -973,7 +1346,19 @@ fn unsigned_fact(
     cur_lo: u64,
     cur_hi: u64,
 ) -> Option<(u64, u64)> {
-    let nonneg = cur_hi <= 0x7fff_ffff && imm <= 0x7fff_ffff;
+    unsigned_fact_bits(jcc, taken, imm, cur_lo, cur_hi, 32)
+}
+
+fn unsigned_fact_bits(
+    jcc: Mnemonic,
+    taken: bool,
+    imm: u64,
+    cur_lo: u64,
+    cur_hi: u64,
+    bits: u32,
+) -> Option<(u64, u64)> {
+    let sign_max = mask(bits.saturating_sub(1));
+    let nonneg = cur_hi <= sign_max && imm <= sign_max;
     let (op, holds) = match jcc {
         Mnemonic::Ja => ("gt", taken),
         Mnemonic::Jae => ("ge", taken),
@@ -1010,9 +1395,43 @@ fn unsigned_fact(
     }
 }
 
-/// Synthetic instructions that state `known` for `reg` in a form the jump-table slicer reads:
-/// `lea reg, [rip+v]` for a single in-image address, else `cmp reg, hi` with a not-taken `ja`,
-/// plus `cmp reg, lo` with a not-taken `jb` when `lo > 0`.
+/// Synthetic `cmp reg, hi; ja` (plus `cmp reg, lo; jb` when `lo > 0`) at `width` bits (32 or 64).
+fn synthesize_cmp_bounds(reg: Register, lo: u64, hi: u64, is_64: bool) -> Vec<(Instruction, bool)> {
+    let n = reg.full_register().number() as u8;
+    let cmp = |imm: u64| -> Option<Instruction> {
+        let mut bytes = Vec::with_capacity(7);
+        if is_64 {
+            bytes.push(0x48 | (n >> 3));
+        } else if n >= 8 {
+            bytes.push(0x41);
+        }
+        bytes.push(0x81);
+        bytes.push(0xF8 | (n & 7));
+        bytes.extend_from_slice(&(imm as u32).to_le_bytes());
+        decode(&bytes, 0)
+    };
+    let jcc = |opcode: u8| decode(&[0x0F, opcode, 0, 0, 0, 0], 0);
+    let mut out = Vec::new();
+    match (cmp(hi), jcc(0x87)) {
+        (Some(c), Some(j)) => {
+            out.push((c, false));
+            out.push((j, true));
+        }
+        _ => return Vec::new(),
+    }
+    if lo > 0
+        && let (Some(c), Some(j)) = (cmp(lo), jcc(0x82))
+    {
+        out.push((c, false));
+        out.push((j, true));
+    }
+    out
+}
+
+/// Synthetic instructions that state full 64-bit `known` for `reg` in a form the jump-table
+/// slicer reads: `lea reg, [rip+v]` for a single in-image address, else `cmp r64, hi; ja` when
+/// `hi <= i32::MAX` (bounding both 64-bit and 32-bit reads) or `cmp r32, hi; ja` when
+/// `hi <= u32::MAX`, plus the matching lower-bound `cmp reg, lo; jb` when `lo > 0`.
 ///
 /// Returns the instructions with whether each is a not-taken conditional branch; empty when
 /// nothing useful can be stated.
@@ -1043,33 +1462,24 @@ pub(crate) fn synthesize(
     if hi > u64::from(u32::MAX) {
         return Vec::new();
     }
-    // `cmp r32, imm32` compares the low half; valid because `hi < 2^32` bounds the whole register.
-    let cmp = |imm: u64| -> Option<Instruction> {
-        let mut bytes = Vec::with_capacity(7);
-        if n >= 8 {
-            bytes.push(0x41);
-        }
-        bytes.push(0x81);
-        bytes.push(0xF8 | (n & 7));
-        bytes.extend_from_slice(&(imm as u32).to_le_bytes());
-        decode(&bytes, 0)
+    // `cmp r64, imm32` sign-extends `imm32`, so it encodes positive unsigned bounds up to i32::MAX
+    // and bounds raw 64-bit index reads as well as 32-bit extensions. Larger values up to u32::MAX
+    // fall back to 32-bit `cmp r32, imm32`.
+    let is_64 = hi <= i32::MAX as u64;
+    synthesize_cmp_bounds(reg, lo, hi, is_64)
+}
+
+/// Synthetic 32-bit `cmp r32, hi; ja` (plus `cmp r32, lo; jb` when `lo > 0`) for a register whose
+/// low 32 bits are bounded even when its upper 32 bits are unknown. Safely bounds `movsxd`/`mov r32`
+/// reads without falsely bounding raw 64-bit index reads.
+pub(crate) fn synthesize_u32(reg: Register, known: Known) -> Vec<(Instruction, bool)> {
+    let Known::Range { lo, hi } = known else {
+        return Vec::new();
     };
-    let jcc = |opcode: u8| decode(&[0x0F, opcode, 0, 0, 0, 0], 0);
-    let mut out = Vec::new();
-    match (cmp(hi), jcc(0x87)) {
-        (Some(c), Some(j)) => {
-            out.push((c, false));
-            out.push((j, true));
-        }
-        _ => return Vec::new(),
+    if hi > u64::from(u32::MAX) || (lo == 0 && hi == u64::from(u32::MAX)) {
+        return Vec::new();
     }
-    if lo > 0
-        && let (Some(c), Some(j)) = (cmp(lo), jcc(0x82))
-    {
-        out.push((c, false));
-        out.push((j, true));
-    }
-    out
+    synthesize_cmp_bounds(reg, lo, hi, false)
 }
 
 /// Synthetic `mov dst32, src32` stating that `dst` is a zero-extended copy of `src`.
@@ -1081,6 +1491,21 @@ pub(crate) fn synthesize_copy(dst: Register, src: Register) -> Option<(Instructi
     decode(&bytes, 0)
         .filter(|i| {
             i.op0_register().is_gpr32()
+                && i.op0_register().full_register() == dst.full_register()
+                && i.op1_register().full_register() == src.full_register()
+        })
+        .map(|i| (i, false))
+}
+
+/// Synthetic `mov dst64, src64` stating that `dst` is a full 64-bit copy of `src`.
+pub(crate) fn synthesize_copy64(dst: Register, src: Register) -> Option<(Instruction, bool)> {
+    let d = dst.full_register().number() as u8;
+    let s = src.full_register().number() as u8;
+    let rex = 0x48 | ((s >> 3) << 2) | (d >> 3);
+    let bytes = [rex, 0x89, 0xC0 | ((s & 7) << 3) | (d & 7)];
+    decode(&bytes, 0)
+        .filter(|i| {
+            i.op0_register().is_gpr64()
                 && i.op0_register().full_register() == dst.full_register()
                 && i.op1_register().full_register() == src.full_register()
         })
@@ -1594,5 +2019,350 @@ mod tests {
             ),
             Some(vec![(Register::RCX, Known::Unknown)])
         );
+    }
+
+    #[test]
+    fn diamond_u32_param_guard_bounds_movsxd_without_falsely_bounding_raw_64bit() {
+        use crate::code_image::{CodeImage, CodeSection};
+        use crate::discover::discover;
+
+        // Build a diamond CFG where live-in `ecx` is guarded BEFORE the diamond:
+        //   0x00 (entry):   cmp ecx, 2; ja default(0x45); test edx, edx; je right(0x14)
+        //   0x0a (left):    nop; jmp merge(0x16)
+        //   0x14 (right):   nop (fallthrough to merge)
+        //   0x16 (merge):   movsxd rax, ecx; lea rdx, [rip -> table]; movsxd rcx, [rdx + rax*4];
+        //                   add rcx, rdx; jmp rcx
+        //   0x2e..0x45:     cases 0, 1, 2
+        //   0x45:           default: xor eax, eax; ret
+        const BASE: u64 = 0x1_4000_0000;
+        const TEXT: u64 = BASE + 0x1000;
+        const DATA: u64 = BASE + 0x2000;
+
+        // Helper to assemble a diamond with either `movsxd rax, ecx` + `[rdx + rax*4]`
+        // or raw 64-bit `[rdx + rcx*4]`.
+        let build = |use_movsxd: bool| -> crate::discover::Analysis {
+            let mut code = Vec::new();
+            // 0x00: cmp ecx, 2 (3B)
+            code.extend_from_slice(&[0x83, 0xf9, 0x02]);
+            // 0x03: ja default (rel8 placeholder at index 4)
+            code.extend_from_slice(&[0x77, 0x00]);
+            // 0x05: test edx, edx (2B)
+            code.extend_from_slice(&[0x85, 0xd2]);
+            // 0x07: je right (rel8 placeholder at index 8)
+            code.extend_from_slice(&[0x74, 0x00]);
+            // 0x09 (left): nop; jmp merge (rel8 placeholder at index 11)
+            code.extend_from_slice(&[0x90, 0xeb, 0x00]);
+            let right_off = code.len();
+            // right: nop (falls through to merge)
+            code.push(0x90);
+            let merge_off = code.len();
+            if use_movsxd {
+                // movsxd rax, ecx
+                code.extend_from_slice(&[0x48, 0x63, 0xc1]);
+            }
+            let lea_ip = TEXT + code.len() as u64;
+            code.extend_from_slice(&encode_lea_rip(Register::RDX, lea_ip, DATA));
+            if use_movsxd {
+                // movsxd rcx, dword ptr [rdx + rax*4]
+                code.extend_from_slice(&[0x48, 0x63, 0x0c, 0x82]);
+            } else {
+                // movsxd rcx, dword ptr [rdx + rcx*4] (raw 64-bit rcx!)
+                code.extend_from_slice(&[0x48, 0x63, 0x0c, 0x8a]);
+            }
+            // add rcx, rdx; jmp rcx
+            code.extend_from_slice(&[0x48, 0x01, 0xd1, 0xff, 0xe1]);
+
+            let c0 = code.len();
+            code.extend_from_slice(&[0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3]);
+            let c1 = code.len();
+            code.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+            let c2 = code.len();
+            code.extend_from_slice(&[0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+            let def = code.len();
+            code.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+
+            code[4] = (def - 5) as u8;
+            code[8] = (right_off - 9) as u8;
+            code[11] = (merge_off - 12) as u8;
+
+            let mut data = Vec::new();
+            for off in [c0, c1, c2] {
+                let delta = ((TEXT + off as u64) as i64 - DATA as i64) as i32;
+                data.extend_from_slice(&delta.to_le_bytes());
+            }
+
+            let image = CodeImage::new(
+                BASE,
+                vec![
+                    CodeSection::new(TEXT, &code, true),
+                    CodeSection::new(DATA, &data, false),
+                ],
+                vec![TEXT],
+            );
+            discover(&image)
+        };
+
+        // With `movsxd rax, ecx`, the 32-bit diamond guard resolves the switch with a proven bound!
+        let resolved = build(true);
+        assert_eq!(resolved.jump_tables.len(), 1);
+        let jt = resolved.jump_tables.values().next().unwrap();
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets.len(), 3);
+
+        // With raw 64-bit `[rdx + rcx*4]`, the 32-bit guard on live-in `ecx` must NOT falsely
+        // bound 64-bit `rcx` (upper 32 bits are unknown)!
+        let raw64 = build(false);
+        assert!(
+            raw64.jump_tables.is_empty(),
+            "32-bit guard on live-in ecx must not bound raw 64-bit rcx: {:?}",
+            raw64.jump_tables
+        );
+    }
+
+    #[test]
+    fn lea_offset_test_mask_narrow_cmp_and_64bit_synthetic_cmp() {
+        // 1) `test ecx, ~7; jne default` + `lea eax, [rcx - 2]` after `cmp ecx, 2; jb default`:
+        //    entry (0x1000): test ecx, 0xffff_fff8; jne 0x9000 -> fallthrough to 0x1010
+        //    0x1010:         cmp ecx, 2; jb 0x9000 -> fallthrough to 0x1020
+        //    0x1020:         lea eax, [rcx - 2] -> jump to 0x1030
+        //    0x1030:         nop
+        let mut blocks = BTreeMap::new();
+        blocks.insert(
+            0x1000,
+            make_block(
+                0x1000,
+                &[0xf7, 0xc1, 0xf8, 0xff, 0xff, 0xff, 0x75, 0x00], // test ecx, ~7; jne
+                Terminator::Branch,
+                vec![Edge::Taken(0x9000), Edge::Fallthrough(0x1010)],
+            ),
+        );
+        blocks.insert(
+            0x1010,
+            make_block(
+                0x1010,
+                &[0x83, 0xf9, 0x02, 0x72, 0x00], // cmp ecx, 2; jb
+                Terminator::Branch,
+                vec![Edge::Taken(0x9000), Edge::Fallthrough(0x1020)],
+            ),
+        );
+        blocks.insert(
+            0x1020,
+            make_block(
+                0x1020,
+                &[0x8d, 0x41, 0xfe], // lea eax, [rcx - 2]
+                Terminator::Jump,
+                vec![Edge::Jump(0x1030)],
+            ),
+        );
+        blocks.insert(
+            0x1030,
+            make_block(0x1030, &[0x90], Terminator::Return, vec![Edge::Return]),
+        );
+
+        let preds = |b: u64| match b {
+            0x1010 => vec![0x1000],
+            0x1020 => vec![0x1010],
+            0x1030 => vec![0x1020],
+            _ => Vec::new(),
+        };
+        let facts = reaching_facts(
+            &blocks,
+            &preds,
+            &|b| b == 0x1000,
+            0x1030,
+            &[Register::RCX, Register::RAX],
+        )
+        .expect("facts computed");
+
+        // Live-in RCX has unknown upper 32 bits, but low 32 bits are proven in [2, 7].
+        assert_eq!(facts.values[0], (Register::RCX, Known::Unknown));
+        assert_eq!(
+            facts.u32_values[0],
+            (Register::RCX, Known::Range { lo: 2, hi: 7 })
+        );
+        // `lea eax, [rcx - 2]` zero-extends into RAX and shifts [2, 7] -> [0, 5] in full 64-bit!
+        assert_eq!(
+            facts.values[1],
+            (Register::RAX, Known::Range { lo: 0, hi: 5 })
+        );
+        assert_eq!(
+            facts.u32_values[1],
+            (Register::RAX, Known::Range { lo: 0, hi: 5 })
+        );
+
+        // 2) Full 64-bit `synthesize` emits 64-bit `cmp r64, hi; ja` when hi <= i32::MAX,
+        //    whereas `synthesize_u32` emits 32-bit `cmp r32, hi; ja`.
+        let synth64 = synthesize(Register::R9, Known::Range { lo: 1, hi: 5 }, &|_| false);
+        assert_eq!(synth64.len(), 4);
+        assert!(synth64[0].0.op0_register().is_gpr64());
+        assert_eq!(synth64[0].0.op0_register(), Register::R9);
+        assert_eq!(synth64[0].0.try_immediate(1).ok(), Some(5));
+        assert!(synth64[2].0.op0_register().is_gpr64());
+        assert_eq!(synth64[2].0.try_immediate(1).ok(), Some(1));
+
+        let synth32 = synthesize_u32(Register::RCX, Known::Range { lo: 2, hi: 7 });
+        assert_eq!(synth32.len(), 4);
+        assert!(synth32[0].0.op0_register().is_gpr32());
+        assert_eq!(synth32[0].0.op0_register(), Register::ECX);
+        assert_eq!(synth32[0].0.try_immediate(1).ok(), Some(7));
+
+        // 3) 8-bit `cmp al, 4; ja default` refines RAX when already zero-extended to a byte.
+        let mut narrow_blocks = BTreeMap::new();
+        narrow_blocks.insert(
+            0x2000,
+            make_block(
+                0x2000,
+                &[0x0f, 0xb6, 0xc1, 0x3c, 0x04, 0x77, 0x00], // movzx eax, cl; cmp al, 4; ja
+                Terminator::Branch,
+                vec![Edge::Taken(0x9000), Edge::Fallthrough(0x2010)],
+            ),
+        );
+        narrow_blocks.insert(
+            0x2010,
+            make_block(0x2010, &[0x90], Terminator::Return, vec![Edge::Return]),
+        );
+        let narrow_res = reaching_values(
+            &narrow_blocks,
+            &|b| if b == 0x2010 { vec![0x2000] } else { vec![] },
+            &|b| b == 0x2000,
+            0x2010,
+            &[Register::RAX],
+        )
+        .expect("narrow cmp");
+        assert_eq!(
+            narrow_res,
+            vec![(Register::RAX, Known::Range { lo: 0, hi: 4 })]
+        );
+
+        // 4) 64-bit copy tracking (`mov r9, rcx` and `lea r10, [r9]`) + 64-bit synthetic cmp
+        //    bounding a direct 64-bit table load after a diamond merge.
+        let mut copy_blocks = BTreeMap::new();
+        copy_blocks.insert(
+            0x3000,
+            make_block(
+                0x3000,
+                &[0x49, 0x89, 0xc9, 0x4d, 0x8d, 0x11], // mov r9, rcx; lea r10, [r9]
+                Terminator::Jump,
+                vec![Edge::Jump(0x3010)],
+            ),
+        );
+        copy_blocks.insert(
+            0x3010,
+            make_block(0x3010, &[0x90], Terminator::Return, vec![Edge::Return]),
+        );
+        let copy_facts = reaching_facts(
+            &copy_blocks,
+            &|b| if b == 0x3010 { vec![0x3000] } else { vec![] },
+            &|b| b == 0x3000,
+            0x3010,
+            &[Register::R9, Register::R10],
+        )
+        .expect("copy facts");
+        assert_eq!(
+            copy_facts.copies,
+            vec![
+                (Register::R9, Register::RCX, true),
+                (Register::R10, Register::R9, true),
+            ]
+        );
+        let c64 = synthesize_copy64(Register::R9, Register::RCX).expect("mov r9, rcx");
+        assert!(c64.0.op0_register().is_gpr64());
+        assert_eq!(c64.0.op0_register(), Register::R9);
+        assert_eq!(c64.0.op1_register(), Register::RCX);
+
+        // `reaching_copies` reports only zero-extended 32-bit copies (`mov r32, r32` /
+        // `lea r32, [src + 0]`), not 64-bit copies (`mov r64, r64`).
+        let mut copy32_blocks = BTreeMap::new();
+        copy32_blocks.insert(
+            0x3100,
+            make_block(
+                0x3100,
+                &[0x41, 0x89, 0xc9, 0x44, 0x8d, 0x11, 0x49, 0x89, 0xcb], // mov r9d, ecx; lea r10d, [rcx]; mov r11, rcx
+                Terminator::Jump,
+                vec![Edge::Jump(0x3110)],
+            ),
+        );
+        copy32_blocks.insert(
+            0x3110,
+            make_block(0x3110, &[0x90], Terminator::Return, vec![Edge::Return]),
+        );
+        let zext_copies = reaching_copies(
+            &copy32_blocks,
+            &|b| if b == 0x3110 { vec![0x3100] } else { vec![] },
+            &|b| b == 0x3100,
+            0x3110,
+            &[Register::R9, Register::R10, Register::R11],
+        )
+        .expect("32-bit copies");
+        assert_eq!(
+            zext_copies,
+            vec![
+                (Register::R9, Register::RCX),
+                (Register::R10, Register::RCX),
+            ]
+        );
+    }
+
+    #[test]
+    fn full_64bit_reaching_bound_resolves_raw_64bit_switch_across_diamond() {
+        use crate::code_image::{CodeImage, CodeSection};
+        use crate::discover::discover;
+
+        // Entry guards full 64-bit `rcx` (`cmp rcx, 2; ja default`), branches on `edx` into a
+        // diamond, and the merge block indexes `[rdx + rcx*4]` directly using 64-bit `rcx`
+        // without `movsxd`. Our 64-bit synthetic `cmp rcx, 2; ja` must resolve it!
+        const BASE: u64 = 0x1_4000_0000;
+        const TEXT: u64 = BASE + 0x1000;
+        const DATA: u64 = BASE + 0x2000;
+
+        let mut code = Vec::new();
+        // 0x00: cmp rcx, 2 (4B: 48 83 f9 02)
+        code.extend_from_slice(&[0x48, 0x83, 0xf9, 0x02]);
+        // 0x04: ja default (rel8 placeholder at index 5)
+        code.extend_from_slice(&[0x77, 0x00]);
+        // 0x06: test edx, edx (2B)
+        code.extend_from_slice(&[0x85, 0xd2]);
+        // 0x08: je right (rel8 placeholder at index 9)
+        code.extend_from_slice(&[0x74, 0x00]);
+        // left: nop; jmp merge (rel8 placeholder at index 12)
+        code.extend_from_slice(&[0x90, 0xeb, 0x00]);
+        let right_off = code.len();
+        code.push(0x90);
+        let merge_off = code.len();
+        let lea_ip = TEXT + code.len() as u64;
+        code.extend_from_slice(&encode_lea_rip(Register::RDX, lea_ip, DATA));
+        // movsxd rax, dword ptr [rdx + rcx*4]; add rax, rdx; jmp rax
+        code.extend_from_slice(&[0x48, 0x63, 0x04, 0x8a, 0x48, 0x01, 0xd0, 0xff, 0xe0]);
+        let c0 = code.len();
+        code.extend_from_slice(&[0xb8, 0x00, 0x00, 0x00, 0x00, 0xc3]);
+        let c1 = code.len();
+        code.extend_from_slice(&[0xb8, 0x01, 0x00, 0x00, 0x00, 0xc3]);
+        let c2 = code.len();
+        code.extend_from_slice(&[0xb8, 0x02, 0x00, 0x00, 0x00, 0xc3]);
+        let def = code.len();
+        code.extend_from_slice(&[0x31, 0xc0, 0xc3]);
+
+        code[5] = (def - 6) as u8;
+        code[9] = (right_off - 10) as u8;
+        code[12] = (merge_off - 13) as u8;
+
+        let mut data = Vec::new();
+        for off in [c0, c1, c2] {
+            let delta = ((TEXT + off as u64) as i64 - DATA as i64) as i32;
+            data.extend_from_slice(&delta.to_le_bytes());
+        }
+        let image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code, true),
+                CodeSection::new(DATA, &data, false),
+            ],
+            vec![TEXT],
+        );
+        let analysis = discover(&image);
+        assert_eq!(analysis.jump_tables.len(), 1);
+        let jt = analysis.jump_tables.values().next().unwrap();
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets.len(), 3);
     }
 }
