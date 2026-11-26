@@ -1074,6 +1074,118 @@ void test_timers() {
     std::remove(path.c_str());
 }
 
+const char* kLightCompute = R"(
+@group(0) @binding(0) var<storage, read_write> out: array<u32>;
+@compute @workgroup_size(64) fn cs_main(@builtin(global_invocation_id) id: vec3u) {
+  out[id.x] = id.x;
+}
+)";
+
+// gpu_time_split: two compute pipelines in one pass are timed as separate segments, each under its own
+// shader hash (without the split the whole pass is keyed to the first pipeline).
+void test_timer_split() {
+    gpu::d3d12_guest::GpuTimeTable table;
+    ExecutorOptions opts;
+    opts.width = kW;
+    opts.height = kH;
+    opts.gpu_time = &table;
+    opts.gpu_time_split = true;
+    NativeExecutor::CreateStatus status;
+    std::string error;
+    auto ex = NativeExecutor::create(opts, &status, &error);
+    if (!ex) {
+        std::fprintf(stderr, "FAIL: split NativeExecutor::create: %s\n", error.c_str());
+        ++g_failures;
+        return;
+    }
+    if (!ex->stats().timer_supported) {
+        std::printf("test_native_executor: adapter lacks timestamp-query: split checks skipped\n");
+        return;
+    }
+    const uint64_t kHeavy = 0x00c0ffee0badf00dull, kLight = 0x00c0ffee0badf00eull;
+    const std::string heavy = kHeavyCompute, light = kLightCompute;
+    std::vector<uint8_t> pack = {'W', 'G', 'P', 'K', 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+    const uint32_t base = 16 + 2 * 20;
+    append(pack, kHeavy);
+    pack.push_back(3);
+    pack.insert(pack.end(), 3, 0);
+    append(pack, base);
+    append(pack, static_cast<uint32_t>(heavy.size()));
+    append(pack, kLight);
+    pack.push_back(3);
+    pack.insert(pack.end(), 3, 0);
+    append(pack, static_cast<uint32_t>(base + heavy.size()));
+    append(pack, static_cast<uint32_t>(light.size()));
+    pack.insert(pack.end(), heavy.begin(), heavy.end());
+    pack.insert(pack.end(), light.begin(), light.end());
+    const std::string path = "test_native_executor_timer_split.wgsl.pack";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        if (f) {
+            std::fwrite(pack.data(), 1, pack.size(), f);
+            std::fclose(f);
+        }
+    }
+    std::string err;
+    CHECK(ex->load_wgsl_pack(path, &err));
+
+    gpu::CommandEncoder setup;
+    setup.create_buffer(200, GpuBufferUsage::Storage, 64 * 64 * 4);
+    setup.create_shader_module(201, GpuShaderStage::Compute, "0x00c0ffee0badf00d");
+    setup.create_shader_module(206, GpuShaderStage::Compute, "0x00c0ffee0badf00e");
+    create_layouts(setup, 202, 203, {layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer, 1)});
+    GpuCreateComputePipeline2Payload cp;
+    std::memset(&cp, 0, sizeof cp);
+    cp.id = 204;
+    cp.cs_module_id = 201;
+    cp.pipeline_layout_id = 203;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    cp.id = 207;
+    cp.cs_module_id = 206;
+    emit(setup, GpuOpcode::CreateComputePipeline2, bytes_of(cp));
+    create_bind_group(setup, 205, 202, {bg_entry(0, GpuBindResourceType::Buffer, 200)});
+    run(*ex, setup);
+    for (int f = 0; f < 3; ++f) {
+        gpu::CommandEncoder frame;
+        frame.begin_frame();
+        frame.set_compute_pipeline(204);
+        set_bind_group2(frame, 0, 205);
+        frame.dispatch_compute(64);
+        frame.set_compute_pipeline(207);  // same compute pass, other shader
+        set_bind_group2(frame, 0, 205);
+        frame.dispatch_compute(64);
+        frame.present();
+        run(*ex, frame);
+        ex->wait_idle();
+    }
+    ex->poll();
+    CHECK(ex->stats().device_errors == 0);
+    if (ex->stats().timer_segments == 0) {
+        std::printf("test_native_executor: adapter lacks timestamp-query-inside-passes: split checks skipped\n");
+    } else {
+        CHECK(ex->stats().timer_segments == 3);  // the light pipeline's segment, once per frame
+        uint64_t heavy_ns = 0, light_ns = 0;
+        for (const auto& e : table.top(16)) {
+            if (e.hash == kHeavy && e.kind == gpu::d3d12_guest::GpuPassKind::Compute) {
+                heavy_ns = e.stats.total_ns;
+                CHECK(e.stats.passes == 3);
+            }
+            if (e.hash == kLight && e.kind == gpu::d3d12_guest::GpuPassKind::Compute) {
+                light_ns = e.stats.total_ns;
+                CHECK(e.stats.passes == 3);
+            }
+        }
+        CHECK(heavy_ns > 0);
+        CHECK(light_ns > 0);
+        CHECK(heavy_ns > light_ns);
+        std::printf("timer split: heavy %llu ns, light %llu ns over 3 frames\n", static_cast<unsigned long long>(heavy_ns),
+                    static_cast<unsigned long long>(light_ns));
+    }
+    ex.reset();
+    std::remove(path.c_str());
+}
+
 }  // namespace
 
 // The live boot (--window) attaches absolute host addresses: the native producer's ReadbackGate
@@ -1875,6 +1987,7 @@ int main() {
     test_reflection();
     CHECK(ex->stats().device_lost == 0);
     test_timers();
+    test_timer_split();
     test_blit();
     test_depth_texture_float_layout(*ex);
     test_depth_read_variants(*ex);

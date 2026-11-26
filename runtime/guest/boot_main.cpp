@@ -63,6 +63,7 @@
 //   --live-executor [--window-size WxH]  the same live path as --window (LivePump + native executor, the guest's GPU stream,
 //                        --live-digest / --screenshot-at / --gpu-validation / gpu_time / --gpu-capture / --host-input), but
 //                        presenting into the executor's offscreen swapchain texture (same format, size and blit): no window.
+//   --gpu-time-split / --gpu-time-log <file>  (with --window) time each pipeline inside a pass (timestamps at every pipeline change); one cumulative gpu_time line per second (tools/gpu_time_top.py --log ... --phase NAME=A-B)
 //   --window [--window-size WxH]  live play: hand the GPU packet stream to the native Dawn executor
 //                        (docs/NATIVE_EXECUTOR_DESIGN.md) on its own thread and present to a window.
 //                        Only in builds with -DPLAYGTA6_NATIVE_EXECUTOR=ON. Works together with
@@ -238,6 +239,8 @@ struct Options {
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (any dir outside a repo checkout)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
     std::string window_script;      // --window-script <script>
+    bool gpu_time_split = false;    // --gpu-time-split: per-pipeline GPU timing inside a pass (native executor)
+    std::string gpu_time_log;       // --gpu-time-log <file>: with --window, a gpu_time snapshot line per second
     std::string live_digest;        // --live-digest <file>: per-frame replay digests from the live executor
     std::string dawn_cache;         // --dawn-cache: Dawn blob cache root ("off" disables; default %LOCALAPPDATA%/playgta6/dawn-cache)
     uint64_t dawn_cache_max_mb = 2048;  // --dawn-cache-max-mb: LRU cap of the title's cache directory (0 = unbounded)
@@ -374,6 +377,8 @@ bool parse(int argc, char** argv, Options& o) {
             if (std::sscanf(argv[++i], "%ux%u", &w, &h) != 2 || w == 0 || h == 0) return false;
             o.window_width = w;
             o.window_height = h;
+        } else if (a == "--gpu-time-split") {
+            o.gpu_time_split = true;
         } else if (a == "--host-input") {
             o.host_input = true;
         } else if (a == "--native-pipelines") {
@@ -386,7 +391,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--program-dir" ||
                    a == "--cmdline" || a == "--report" || a == "--summary" || a == "--import-trace" ||
                    a == "--gpu-capture" || a == "--sandbox-id" || a == "--dump-pipelines" ||
-                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--keymap" || a == "--watch-gpu-va" ||
+                   a == "--shader-pack" || a == "--pipeline-warm-list" || a == "--dawn-cache" || a == "--live-digest" || a == "--gpu-time-log" || a == "--window-script" || a == "--input-script" || a == "--record-input" || a == "--keymap" || a == "--watch-gpu-va" ||
                    a == "--user-age-group" || a == "--profile" || a == "--save-dir" || a == "--audio-dump" ||
                    a == "--bcpack-tables" || a == "--record-indirect-targets") {
             if (!value(v)) {
@@ -400,6 +405,7 @@ bool parse(int argc, char** argv, Options& o) {
                                   : a == "--pipeline-warm-list" ? o.pipeline_warm_list
                                   : a == "--dawn-cache" ? o.dawn_cache
                                   : a == "--live-digest" ? o.live_digest
+                                  : a == "--gpu-time-log" ? o.gpu_time_log
                                   : a == "--window-script" ? o.window_script
                                   : a == "--input-script" ? o.input_script
                                   : a == "--record-input" ? o.record_input
@@ -910,6 +916,7 @@ bool start_live_window() {
     options.async_pipelines = !g_options.no_async_pipelines;
     options.gpu_validation = g_options.gpu_validation;
     options.frame_digest_path = g_options.live_digest;
+    options.gpu_time_split = g_options.gpu_time_split;
     options.window_script = g_options.window_script;
     // The guest renders at a fixed resolution: a window resize letterboxes the stream instead of stretching it.
     options.fixed_stream_size = true;
@@ -979,6 +986,25 @@ bool start_live_window() {
             prev_p = cp;
         }
     }).detach();
+    // --gpu-time-log: one JSON line per second (elapsed ms, presents, the cumulative gpu_time table), so a
+    // tool can cut a run into phases by differencing two lines. Counts and nanoseconds only.
+    if (!g_options.gpu_time_log.empty()) {
+        std::thread([] {
+            std::FILE* f = std::fopen(g_options.gpu_time_log.c_str(), "wb");
+            if (!f) return;
+            const auto t0 = std::chrono::steady_clock::now();
+            while (g_live_stats_active.load() && !g_live.window_closed()) {
+                for (int i = 0; i < 10 && g_live_stats_active.load(); ++i)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+                std::fprintf(f, "{\"t_ms\": %lld, \"presents\": %llu, \"gpu_time\": %s}\n", static_cast<long long>(ms),
+                             static_cast<unsigned long long>(g_live.stats().presents),
+                             playgta6::gpu::d3d12_guest::gpu_time_table().json(1024).c_str());
+                std::fflush(f);
+            }
+            std::fclose(f);
+        }).detach();
+    }
     // --max-ms must end a live run even while the guest is blocked behind the executor (the boot's own
     // limit is only checked on indirect dispatches, which a thread stuck in submit never reaches).
     if (g_options.max_ms != 0) {
