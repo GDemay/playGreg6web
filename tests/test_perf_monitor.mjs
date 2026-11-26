@@ -1507,3 +1507,111 @@ test('W287: recordFrame timestamp mode, recordDetailedFrame timestamp/invalid in
   assert.equal(postReset.fps30ComplianceRate, 1);
   assert.equal(postReset.dominantBottleneck, 'within_budget');
 });
+
+test('W366: PerfMonitor.getSnapshot() caches by _snapshotVersion, invalidates on mutations, and preserves immutability & fresh timestampMs', () => {
+  const clock = createDeterministicClock(1000);
+  const monitor = new PerfMonitor({ windowSize: 64, now: clock.now });
+
+  // Populate boot and gameplay phases.
+  monitor.setPhase(PERF_PHASES.BOOT);
+  monitor.recordFrameTimeMs(40);
+  monitor.recordFrameTimeMs(50);
+  monitor.setPhase(PERF_PHASES.GAMEPLAY);
+  for (let i = 0; i < 20; i += 1) {
+    monitor.recordFrameTimeMs(16 + (i % 4));
+  }
+
+  let phaseStatComputes = 0;
+  const origComputePhaseStats = monitor._computePhaseStats.bind(monitor);
+  monitor._computePhaseStats = (bucket) => {
+    phaseStatComputes += 1;
+    return origComputePhaseStats(bucket);
+  };
+
+  let scratchSorts = 0;
+  const origSubarray = monitor._scratchSorted.subarray.bind(monitor._scratchSorted);
+  monitor._scratchSorted.subarray = (...args) => {
+    const view = origSubarray(...args);
+    const origSort = view.sort.bind(view);
+    view.sort = (...sortArgs) => {
+      scratchSorts += 1;
+      return origSort(...sortArgs);
+    };
+    return view;
+  };
+
+  // First snapshot populates the version cache (global + 4 phase buckets).
+  const snap1 = monitor.getSnapshot();
+  assert.equal(snap1.timestampMs, 1000);
+  assert.equal(phaseStatComputes, 4);
+  const sortsAfterFirst = scratchSorts;
+  assert.ok(sortsAfterFirst >= 3, 'initial compute should sort global + populated phase buckets');
+
+  // Repeated getSnapshot() / getSummary() / toHudMetrics() between mutations hit cache with 0 re-sorts.
+  clock.advance(250);
+  const snap2 = monitor.getSnapshot();
+  clock.advance(250);
+  const summary = monitor.getSummary();
+  const hud = monitor.toHudMetrics();
+  assert.equal(snap2.timestampMs, 1250, 'cached snapshot must still emit fresh timestampMs');
+  assert.equal(summary.timestampMs, 1500);
+  assert.equal(phaseStatComputes, 4, 'cache hits must not recompute phase histograms');
+  assert.equal(scratchSorts, sortsAfterFirst, 'cache hits must perform zero Float64Array sorts');
+  assert.equal(snap2.frames.fps, snap1.frames.fps);
+  assert.equal(hud.totalFrames, 22);
+
+  // Caller mutations must not corrupt the cached snapshot.
+  snap2.frames.fps = 9999;
+  snap2.bottleneckCounts.cpu_bound = 9999;
+  snap2.phases.gameplay.avgFps = 9999;
+  snap2.gpu.totalGpuPackets = 9999;
+  const snap3 = monitor.getSnapshot();
+  assert.equal(snap3.frames.fps, snap1.frames.fps);
+  assert.equal(snap3.bottleneckCounts.cpu_bound, snap1.bottleneckCounts.cpu_bound);
+  assert.equal(snap3.phases.gameplay.avgFps, snap1.phases.gameplay.avgFps);
+  assert.equal(snap3.gpu.totalGpuPackets, 0);
+  assert.equal(scratchSorts, sortsAfterFirst);
+
+  // Per-phase bucket caching: recording one more gameplay frame only recomputes gameplay (1 bucket, not 4).
+  const versionBeforeFrame = monitor._snapshotVersion;
+  monitor.recordFrameTimeMs(18);
+  assert.ok(monitor._snapshotVersion > versionBeforeFrame);
+  const snap4 = monitor.getSnapshot();
+  assert.equal(snap4.frames.totalFrames, 23);
+  assert.equal(phaseStatComputes, 5, 'only dirty gameplay phase bucket should recompute');
+
+  // getTotalFrames() returns exact count in O(1) without triggering snapshot computation.
+  monitor.recordFrame(2000);
+  assert.equal(monitor.getTotalFrames(), 24);
+  assert.equal(phaseStatComputes, 5);
+
+  // Every other mutator invalidates _snapshotVersion and updates getSnapshot() immediately.
+  const versionBeforeGpu = monitor._snapshotVersion;
+  monitor.recordGpuBatch({ packets: 10, drawCalls: 4, durationMs: 16 });
+  assert.ok(monitor._snapshotVersion > versionBeforeGpu);
+  assert.equal(monitor.getSnapshot().gpu.totalGpuPackets, 10);
+
+  const versionBeforeIo = monitor._snapshotVersion;
+  monitor.recordIoRead({ bytes: BYTES_PER_MB, cacheHit: true, opfsHit: true, durationMs: 100 });
+  assert.ok(monitor._snapshotVersion > versionBeforeIo);
+  assert.equal(monitor.getSnapshot().io.opfsCacheHits, 1);
+
+  const versionBeforeAudio = monitor._snapshotVersion;
+  monitor.updateAudioTelemetry({ bufferedFrames: 512, activeVoices: 3 });
+  assert.ok(monitor._snapshotVersion > versionBeforeAudio);
+  assert.equal(monitor.getSnapshot().audio.bufferedFrames, 512);
+
+  const versionBeforePhase = monitor._snapshotVersion;
+  monitor.setPhase(PERF_PHASES.MENU);
+  assert.ok(monitor._snapshotVersion > versionBeforePhase);
+  assert.equal(monitor.getSnapshot().currentPhase, PERF_PHASES.MENU);
+
+  const versionBeforeReset = monitor._snapshotVersion;
+  monitor.reset();
+  assert.ok(monitor._snapshotVersion > versionBeforeReset);
+  const resetSnap = monitor.getSnapshot();
+  assert.equal(resetSnap.frames.totalFrames, 0);
+  assert.equal(resetSnap.gpu.totalGpuPackets, 0);
+  assert.equal(resetSnap.io.opfsCacheHits, 0);
+  assert.equal(resetSnap.audio.bufferedFrames, 0);
+});

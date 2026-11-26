@@ -1213,3 +1213,109 @@ test('W296 defensive feature checks tolerate legacy mocks and sanitize hostile/N
     await app.destroy();
   }
 });
+
+test('W366 app_bootstrap uses session.getPhaseTelemetry() (zero session.getStats() churn), fast-paths frame-presented labels, and throttles hidden-HUD churn', async () => {
+  const clock = createClock(60000);
+  let gpuStatsForwarded = 0;
+  let memoryStatsForwarded = 0;
+  let perfStatsForwarded = 0;
+  const hiddenHudController = {
+    visible: false,
+    isVisible() {
+      return this.visible;
+    },
+    updateGpuStats() {
+      gpuStatsForwarded += 1;
+    },
+    setMemoryStats() {
+      memoryStatsForwarded += 1;
+    },
+    updatePerfStats() {
+      perfStatsForwarded += 1;
+    },
+  };
+
+  const { app, mockWorker, broadcastInstances, hud } = createTestHost(
+    { ok: true, coopCoep: true, hasWasmBinary: true },
+    {
+      now: clock.now,
+      hudController: hiddenHudController,
+      performanceObj: {
+        memory: {
+          usedJSHeapSize: 128 * 1024 * 1024,
+          totalJSHeapSize: 256 * 1024 * 1024,
+        },
+      },
+    }
+  );
+
+  let sessionGetStatsCalls = 0;
+  let sessionGetPhaseTelemetryCalls = 0;
+  const origSessionGetStats = app.session.getStats.bind(app.session);
+  const origSessionGetPhaseTel = app.session.getPhaseTelemetry.bind(app.session);
+  app.session.getStats = (...args) => {
+    sessionGetStatsCalls += 1;
+    return origSessionGetStats(...args);
+  };
+  app.session.getPhaseTelemetry = (...args) => {
+    sessionGetPhaseTelemetryCalls += 1;
+    return origSessionGetPhaseTel(...args);
+  };
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+
+    // 1. Repeated telemetry reads call lightweight session.getPhaseTelemetry() and NEVER session.getStats().
+    for (let i = 0; i < 10; i += 1) {
+      const bt = app.getBootTelemetry();
+      const diag = app.getDiagnosticsSnapshot();
+      const pt = app.getPhaseTelemetry();
+      assert.equal(bt.sessionPhase, 'boot');
+      assert.equal(diag.sessionPhase, 'boot');
+      assert.equal(pt.currentPhase, 'boot');
+    }
+    assert.equal(sessionGetStatsCalls, 0, 'getBootTelemetry/getDiagnosticsSnapshot must not call session.getStats()');
+    assert.equal(sessionGetPhaseTelemetryCalls, 30);
+
+    // 2. BroadcastChannel per-frame progress labels bypass 32-source perf/memory scanning & HUD spam.
+    const hudMetricsBefore = hud.metrics.length;
+    for (let frame = 1; frame <= 120; frame += 1) {
+      clock.advance(16);
+      broadcastInstances[0].onmessage({
+        data: { label: `WebGPU frame #${frame} presented` },
+      });
+    }
+    assert.equal(app.perfMonitor.getTotalFrames(), 120);
+    assert.equal(app.getBootTelemetry().presentCount, 120);
+    assert.equal(sessionGetStatsCalls, 0);
+    assert.equal(memoryStatsForwarded, 0, 'pure frame-presented labels must not spam setMemoryStats');
+    assert.equal(perfStatsForwarded, 0, 'pure frame-presented labels must not spam updatePerfStats');
+    // 120 frames * 16 ms = 1920 ms -> at 500 ms hidden-HUD throttle, <= 6 hud.updateMetrics calls (vs 20+ unthrottled).
+    const hiddenHudMetricCalls = hud.metrics.length - hudMetricsBefore;
+    assert.ok(hiddenHudMetricCalls >= 1 && hiddenHudMetricCalls <= 6, `expected <= 6 hidden HUD metric updates, got ${hiddenHudMetricCalls}`);
+
+    // 3. Rapid worker frame-presented messages while HUD is hidden throttle forwardGpuStatsToObservers
+    //    while keeping getBootTelemetry().presentCount 100% up-to-date.
+    const gpuBefore = gpuStatsForwarded;
+    for (let frame = 121; frame <= 180; frame += 1) {
+      clock.advance(16);
+      mockWorker.dispatch('message', {
+        data: { type: 'frame-presented', presentCount: frame },
+      });
+    }
+    assert.equal(app.getBootTelemetry().presentCount, 180);
+    const hiddenGpuForwards = gpuStatsForwarded - gpuBefore;
+    assert.ok(hiddenGpuForwards >= 1 && hiddenGpuForwards <= 4, `expected <= 4 hidden GPU observer forwards, got ${hiddenGpuForwards}`);
+    assert.equal(sessionGetStatsCalls, 0);
+    // performance.memory fallback sampled once on first frame-presented and throttled thereafter.
+    assert.equal(memoryStatsForwarded, 1);
+
+    // 4. Explicit session.getStats() still works and stays 100% accurate whenever explicitly queried.
+    const explicitStats = app.session.getStats();
+    assert.equal(explicitStats.currentPhase, 'boot');
+    assert.equal(sessionGetStatsCalls, 1);
+  } finally {
+    await app.destroy();
+  }
+});

@@ -264,8 +264,18 @@ export class PerfMonitor {
         writeIdx: 0,
         sampleCount: 0,
         frameCount: 0,
+        version: 0,
+        cachedStats: null,
+        cachedStatsVersion: -1,
       };
     }
+
+    // Snapshot version cache (W366): avoids re-iterating rings and re-sorting
+    // `_scratchSorted` when `getSnapshot()`/`getSummary()`/`toHudMetrics()` are
+    // queried repeatedly between mutations.
+    this._snapshotVersion = 0;
+    this._cachedSnapshot = null;
+    this._cachedSnapshotVersion = -1;
 
     // GPU batch rate ring buffers (pre-allocated).
     this._gpuPacketsRing = new Float64Array(gpuWindowSize);
@@ -306,6 +316,10 @@ export class PerfMonitor {
     return this._currentPhase;
   }
 
+  getTotalFrames() {
+    return this._totalFrames;
+  }
+
   /**
    * Sets the active telemetry phase for phase-segmented frame-time histograms.
    * Invalid or unrecognized values are safely sanitized to `'boot'`.
@@ -315,7 +329,10 @@ export class PerfMonitor {
    */
   setPhase(phase) {
     const sanitized = sanitizePhase(phase, PERF_PHASES.BOOT);
-    this._currentPhase = sanitized;
+    if (sanitized !== this._currentPhase) {
+      this._currentPhase = sanitized;
+      this._snapshotVersion += 1;
+    }
     return sanitized;
   }
 
@@ -355,6 +372,9 @@ export class PerfMonitor {
       bucket.writeIdx = 0;
       bucket.sampleCount = 0;
       bucket.frameCount = 0;
+      bucket.version += 1;
+      bucket.cachedStats = null;
+      bucket.cachedStatsVersion = -1;
     }
 
     this._gpuPacketsRing.fill(0);
@@ -384,6 +404,10 @@ export class PerfMonitor {
     this._audioUnderruns = 0;
     this._audioUnderrunFrames = 0;
     this._audioActiveVoices = 0;
+
+    this._snapshotVersion += 1;
+    this._cachedSnapshot = null;
+    this._cachedSnapshotVersion = -1;
   }
 
   /**
@@ -453,8 +477,10 @@ export class PerfMonitor {
         bucket.sampleCount += 1;
       }
       bucket.frameCount += 1;
+      bucket.version += 1;
     }
 
+    this._snapshotVersion += 1;
     return bottleneck;
   }
 
@@ -505,6 +531,7 @@ export class PerfMonitor {
     }
 
     this._lastFrameTimestamp = ts;
+    this._snapshotVersion += 1;
     return deltaMs;
   }
 
@@ -631,6 +658,7 @@ export class PerfMonitor {
     if (this._gpuCount < this._gpuWindowSize) {
       this._gpuCount += 1;
     }
+    this._snapshotVersion += 1;
   }
 
   /**
@@ -687,6 +715,7 @@ export class PerfMonitor {
     if (this._ioCount < this._ioWindowSize) {
       this._ioCount += 1;
     }
+    this._snapshotVersion += 1;
   }
 
   /**
@@ -704,29 +733,49 @@ export class PerfMonitor {
     if (!telemetry || typeof telemetry !== 'object') {
       return;
     }
+    let changed = false;
     if (telemetry.bufferedFrames !== undefined) {
-      this._audioBufferedFrames = sanitizeNonNegativeNumber(
+      const next = sanitizeNonNegativeNumber(
         telemetry.bufferedFrames,
         this._audioBufferedFrames
       );
+      if (next !== this._audioBufferedFrames) {
+        this._audioBufferedFrames = next;
+        changed = true;
+      }
     }
     if (telemetry.underruns !== undefined) {
-      this._audioUnderruns = sanitizeNonNegativeNumber(
+      const next = sanitizeNonNegativeNumber(
         telemetry.underruns,
         this._audioUnderruns
       );
+      if (next !== this._audioUnderruns) {
+        this._audioUnderruns = next;
+        changed = true;
+      }
     }
     if (telemetry.underrunFrames !== undefined) {
-      this._audioUnderrunFrames = sanitizeNonNegativeNumber(
+      const next = sanitizeNonNegativeNumber(
         telemetry.underrunFrames,
         this._audioUnderrunFrames
       );
+      if (next !== this._audioUnderrunFrames) {
+        this._audioUnderrunFrames = next;
+        changed = true;
+      }
     }
     if (telemetry.activeVoices !== undefined) {
-      this._audioActiveVoices = sanitizeNonNegativeNumber(
+      const next = sanitizeNonNegativeNumber(
         telemetry.activeVoices,
         this._audioActiveVoices
       );
+      if (next !== this._audioActiveVoices) {
+        this._audioActiveVoices = next;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this._snapshotVersion += 1;
     }
   }
 
@@ -833,10 +882,15 @@ export class PerfMonitor {
   }
 
   /**
-   * Computes a structured telemetry snapshot across frames, 30 FPS budget/bottlenecks,
-   * phases, GPU, I/O, and audio.
+   * Computes or returns the version-cached internal telemetry snapshot so repeated
+   * `getSnapshot()`, `getSummary()`, and `toHudMetrics()` calls between mutations
+   * skip re-iterating `_frameDeltas`, GPU/IO rings, and re-sorting `_scratchSorted`.
    */
-  getSnapshot() {
+  _getOrComputeSnapshot() {
+    if (this._cachedSnapshot !== null && this._cachedSnapshotVersion === this._snapshotVersion) {
+      return this._cachedSnapshot;
+    }
+
     const count = this._frameCount;
     let avgFrameTimeMs = 0;
     let minFrameTimeMs = 0;
@@ -923,7 +977,12 @@ export class PerfMonitor {
     const phases = {};
     for (let i = 0; i < PERF_PHASE_VALUES.length; i += 1) {
       const phase = PERF_PHASE_VALUES[i];
-      phases[phase] = this._computePhaseStats(this._phaseBuckets[phase]);
+      const bucket = this._phaseBuckets[phase];
+      if (bucket.cachedStats === null || bucket.cachedStatsVersion !== bucket.version) {
+        bucket.cachedStats = this._computePhaseStats(bucket);
+        bucket.cachedStatsVersion = bucket.version;
+      }
+      phases[phase] = bucket.cachedStats;
     }
 
     const bottleneckCounts = this._copyBottleneckCounts();
@@ -938,8 +997,7 @@ export class PerfMonitor {
     );
     const dominantBottleneck = this._computeDominantBottleneck(bottleneckCounts);
 
-    return {
-      timestampMs: this._now(),
+    const computed = {
       windowSize: this._windowSize,
       jankThresholdMs: this._jankThresholdMs,
       targetFps: this._targetFps,
@@ -1015,6 +1073,50 @@ export class PerfMonitor {
         activeVoices: this._audioActiveVoices,
       },
     };
+
+    this._cachedSnapshot = computed;
+    this._cachedSnapshotVersion = this._snapshotVersion;
+    return computed;
+  }
+
+  /**
+   * Computes a structured telemetry snapshot across frames, 30 FPS budget/bottlenecks,
+   * phases, GPU, I/O, and audio. Cached by `_snapshotVersion` between mutations while
+   * returning caller-safe shallow copies with a fresh `timestampMs`.
+   */
+  getSnapshot() {
+    const c = this._getOrComputeSnapshot();
+    const p = c.phases;
+    return {
+      timestampMs: this._now(),
+      windowSize: c.windowSize,
+      jankThresholdMs: c.jankThresholdMs,
+      targetFps: c.targetFps,
+      budgetMs: c.budgetMs,
+      framesWithin30FpsBudget: c.framesWithin30FpsBudget,
+      framesOver30FpsBudget: c.framesOver30FpsBudget,
+      fps30ComplianceRate: c.fps30ComplianceRate,
+      dominantBottleneck: c.dominantBottleneck,
+      bottleneckCounts: { ...c.bottleneckCounts },
+      currentPhase: c.currentPhase,
+      phases: {
+        boot: { ...p.boot },
+        loading_assets: { ...p.loading_assets },
+        gameplay: { ...p.gameplay },
+        menu: { ...p.menu },
+      },
+      budget: {
+        ...c.budget,
+        bottleneckCounts: { ...c.budget.bottleneckCounts },
+      },
+      frames: {
+        ...c.frames,
+        bottleneckCounts: { ...c.frames.bottleneckCounts },
+      },
+      gpu: { ...c.gpu },
+      io: { ...c.io },
+      audio: { ...c.audio },
+    };
   }
 
   /**
@@ -1029,9 +1131,9 @@ export class PerfMonitor {
    * average and 1% low FPS, jank counters, and 30 FPS budget / bottleneck metrics.
    */
   getSummary() {
-    const snap = this.getSnapshot();
+    const snap = this._getOrComputeSnapshot();
     return {
-      timestampMs: snap.timestampMs,
+      timestampMs: this._now(),
       windowSize: snap.windowSize,
       jankThresholdMs: snap.jankThresholdMs,
       targetFps: snap.targetFps,
@@ -1070,7 +1172,7 @@ export class PerfMonitor {
    * (`pointerLock`, `gamepad`, `status`).
    */
   toHudMetrics() {
-    const snap = this.getSnapshot();
+    const snap = this._getOrComputeSnapshot();
     return {
       fps: snap.frames.fps,
       onePercentLowFps: snap.frames.onePercentLowFps,

@@ -894,13 +894,66 @@ export class RuntimeSessionController {
   }
 
   getPhaseDurations(nowMs) {
-    const durations = { ...this._phaseDurationsMs };
+    const src = this._phaseDurationsMs;
+    const durations = {
+      boot: src.boot,
+      start_screen: src.start_screen,
+      intro_video: src.intro_video,
+      main_menu: src.main_menu,
+      in_game: src.in_game,
+    };
     if (this._currentPhase !== null && this._phaseEnteredAtMs !== null) {
       const currentNow = this._resolveNowMs(nowMs);
-      const activeElapsedMs = Math.max(0, currentNow - this._phaseEnteredAtMs);
-      durations[this._currentPhase] = (durations[this._currentPhase] || 0) + activeElapsedMs;
+      const activeElapsedMs = currentNow - this._phaseEnteredAtMs;
+      if (activeElapsedMs > 0) {
+        durations[this._currentPhase] = (durations[this._currentPhase] || 0) + activeElapsedMs;
+      }
     }
     return durations;
+  }
+
+  /**
+   * Lightweight phase & soft-reclaim telemetry snapshot for hot-path callers
+   * (such as `app_bootstrap.getPhaseTelemetry()`), avoiding the full 33-field
+   * `getStats()` allocation and listener-set counting.
+   *
+   * @param {number} [nowMs]
+   */
+  getPhaseTelemetry(nowMs) {
+    const resolvedNow = this._resolveNowMs(nowMs);
+    return {
+      currentPhase: this._currentPhase,
+      phaseDurationsMs: this.getPhaseDurations(resolvedNow),
+      phaseTransitionCount: this._phaseTransitionCount,
+      reclaimRuns: this._reclaimRuns,
+      reclaimFailures: this._reclaimFailures,
+      lastReclaimReason: this._lastReclaimReason,
+      lastReclaimAtMs: this._lastReclaimAtMs,
+    };
+  }
+
+  /**
+   * Lightweight core status/phase/reclaim counters without full stats allocation
+   * or listener-set summation.
+   *
+   * @param {number} [nowMs]
+   */
+  getFastStats(nowMs) {
+    const resolvedNow = this._resolveNowMs(nowMs);
+    const uptimeMs = this._computeUptimeMs(resolvedNow);
+    return {
+      state: this._state,
+      mode: this._mode,
+      bootMode: this._bootMode,
+      currentPhase: this._currentPhase,
+      phaseTransitionCount: this._phaseTransitionCount,
+      destroyed: this._destroyed,
+      uptimeMs,
+      reclaimRuns: this._reclaimRuns,
+      reclaimFailures: this._reclaimFailures,
+      validationErrorCount: this._validationErrorCount,
+      splashFramesPresented: this._splashFramesPresented,
+    };
   }
 
   getStats(nowMs) {
@@ -955,10 +1008,21 @@ export class RuntimeSessionController {
   }
 
   getStateDurations(nowMs) {
-    const durations = { ...this._stateDurationsMs };
+    const src = this._stateDurationsMs;
+    const durations = {
+      idle: src.idle,
+      probing: src.probing,
+      starting: src.starting,
+      running_wasm: src.running_wasm,
+      running_smoke: src.running_smoke,
+      stopped: src.stopped,
+      error: src.error,
+    };
     const currentNow = this._resolveNowMs(nowMs);
-    const activeElapsedMs = Math.max(0, currentNow - this._stateEnteredAtMs);
-    durations[this._state] = (durations[this._state] || 0) + activeElapsedMs;
+    const activeElapsedMs = currentNow - this._stateEnteredAtMs;
+    if (activeElapsedMs > 0) {
+      durations[this._state] = (durations[this._state] || 0) + activeElapsedMs;
+    }
     return durations;
   }
 

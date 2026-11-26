@@ -949,6 +949,8 @@ function validateOptionalMaxPresses(value) {
  * Provides pure time evaluation via `sampleAt(elapsedMs)` plus a timer-driven
  * `start()` / `stop()` loop with injectable clock & timer hooks for deterministic testing.
  */
+const EMPTY_SCRIPT_SAMPLE = Object.freeze({ buttonsMask: 0, activeEventCount: 0 });
+
 export class ScriptedInputPlayer {
   constructor(presetOrSpec, options = {}) {
     const opts = options || {};
@@ -1238,19 +1240,19 @@ export class ScriptedInputPlayer {
    * Pure deterministic evaluation at `elapsedMs` (ms since playback start).
    * Returns `{ buttonsMask, activeEventCount }` (plus `sticks` / `triggers` when set by an active event).
    */
-  sampleAt(elapsedMs) {
+  sampleAt(elapsedMs, reuseIdle = false) {
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
-      return { buttonsMask: 0, activeEventCount: 0 };
+      return reuseIdle ? EMPTY_SCRIPT_SAMPLE : { buttonsMask: 0, activeEventCount: 0 };
     }
 
     if (this._mode === 'repeating') {
       const { startMs, holdMs, periodMs, endMs, maxPresses, buttonsMask, sticks, triggers } =
         this._rule;
       if (maxPresses === 0 || elapsedMs < startMs) {
-        return { buttonsMask: 0, activeEventCount: 0 };
+        return reuseIdle ? EMPTY_SCRIPT_SAMPLE : { buttonsMask: 0, activeEventCount: 0 };
       }
       if (endMs !== null && (endMs <= startMs || elapsedMs >= endMs)) {
-        return { buttonsMask: 0, activeEventCount: 0 };
+        return reuseIdle ? EMPTY_SCRIPT_SAMPLE : { buttonsMask: 0, activeEventCount: 0 };
       }
 
       let maxK = Math.floor((elapsedMs - startMs) / periodMs);
@@ -1261,12 +1263,12 @@ export class ScriptedInputPlayer {
         maxK = Math.min(maxK, Math.ceil((endMs - startMs) / periodMs) - 1);
       }
       if (maxK < 0) {
-        return { buttonsMask: 0, activeEventCount: 0 };
+        return reuseIdle ? EMPTY_SCRIPT_SAMPLE : { buttonsMask: 0, activeEventCount: 0 };
       }
 
       const latestEnd = startMs + maxK * periodMs + holdMs;
       if (elapsedMs >= latestEnd) {
-        return { buttonsMask: 0, activeEventCount: 0 };
+        return reuseIdle ? EMPTY_SCRIPT_SAMPLE : { buttonsMask: 0, activeEventCount: 0 };
       }
 
       let activeEventCount = 1;
@@ -1384,6 +1386,10 @@ export class ScriptedInputPlayer {
           if (ev.triggers.rt !== null) rt = ev.triggers.rt;
         }
       }
+    }
+
+    if (reuseIdle && buttonsMask === 0 && activeEventCount === 0 && !hasSticks && !hasTriggers) {
+      return EMPTY_SCRIPT_SAMPLE;
     }
 
     const result = { buttonsMask, activeEventCount };
@@ -1587,11 +1593,7 @@ export class ScriptedInputPlayer {
         : Math.max(0, this._nowFn() - this._startedAt);
 
     const prevMask = this._currentMask;
-    const prevPressCount = this._pressCount;
-    const sample = this.sampleAt(elapsedMs);
-    const newPressCount = Math.max(prevPressCount, this.pressCountAt(elapsedMs));
-    this._pressCount = newPressCount;
-
+    const sample = this.sampleAt(elapsedMs, true);
     const nextMask = sample.buttonsMask >>> 0;
     const nextSticks = sample.sticks || null;
     const nextTriggers = sample.triggers || null;
@@ -1601,6 +1603,9 @@ export class ScriptedInputPlayer {
       !scriptTriggersEqual(nextTriggers, this._currentTriggers);
 
     if (changed) {
+      const prevPressCount = this._pressCount;
+      const newPressCount = Math.max(prevPressCount, this.pressCountAt(elapsedMs));
+      this._pressCount = newPressCount;
       this._currentMask = nextMask;
       this._currentSticks = nextSticks;
       this._currentTriggers = nextTriggers;
@@ -1621,6 +1626,7 @@ export class ScriptedInputPlayer {
 
     const nextMs = this.nextTransitionMs(elapsedMs);
     if (nextMs === null && sample.activeEventCount === 0) {
+      this._pressCount = Math.max(this._pressCount, this.pressCountAt(elapsedMs));
       this._clearTimers();
       this._active = false;
       this._stoppedElapsedMs = elapsedMs;
@@ -1937,6 +1943,7 @@ export class InputBridge {
     }
 
     this.i32 = new Int32Array(this.sab, 0, INPUT_STATE_WORDS);
+    this._sabI32 = this.i32;
     this.u32 = new Uint32Array(this.sab, 0, INPUT_STATE_WORDS);
     this.f32 = new Float32Array(this.sab, 0, INPUT_STATE_WORDS);
     this.view = new DataView(this.sab, 0, INPUT_STATE_BYTES);
@@ -1988,11 +1995,13 @@ export class InputBridge {
     this._stuckResetCount = 0;
     this._pollsCount = 0;
     this._writesCount = 0;
+    this._notifyCount = 0;
     this._scriptedEventsDispatched = 0;
     this._gamepadConnects = 0;
     this._gamepadDisconnects = 0;
     this._activeGamepadIndex = null;
     this._hasConnectedGamepad = false;
+    this._hasNonZeroGpState = false;
     this._hasCustomNowFn = typeof opts.nowFn === 'function';
     this._nowFn = this._hasCustomNowFn ? opts.nowFn : defaultNowMs;
     this._idleGamepadPollIntervalMs =
@@ -2095,26 +2104,42 @@ export class InputBridge {
 
     this._boundTick = (rafTimestampMs) => {
       if (!this.running || this.disposed) return;
-      const nowMs =
-        !this._hasCustomNowFn &&
-        typeof rafTimestampMs === 'number' &&
-        Number.isFinite(rafTimestampMs)
-          ? rafTimestampMs
-          : this._nowFn();
-      if (
-        this._hasConnectedGamepad ||
-        this._lastIdleGamepadPollMs === null ||
-        this._idleGamepadPollIntervalMs === 0 ||
-        nowMs - this._lastIdleGamepadPollMs >= this._idleGamepadPollIntervalMs ||
-        nowMs < this._lastIdleGamepadPollMs
-      ) {
+      if (!this._hasConnectedGamepad) {
+        const lastIdle = this._lastIdleGamepadPollMs;
+        const intervalMs = this._idleGamepadPollIntervalMs;
+        const nowMs =
+          !this._hasCustomNowFn &&
+          typeof rafTimestampMs === 'number' &&
+          Number.isFinite(rafTimestampMs)
+            ? rafTimestampMs
+            : this._nowFn();
+        if (lastIdle !== null && intervalMs > 0) {
+          const elapsed = nowMs - lastIdle;
+          if (elapsed >= 0 && elapsed < intervalMs) {
+            this._idleGamepadPollsSkipped += 1;
+            const win = this._window;
+            if (win && typeof win.requestAnimationFrame === 'function') {
+              this._rafId = win.requestAnimationFrame(this._boundTick);
+            }
+            return;
+          }
+        }
         this.pollGamepads();
         this._lastIdleGamepadPollMs = this._hasConnectedGamepad ? null : nowMs;
       } else {
-        this._idleGamepadPollsSkipped += 1;
+        this.pollGamepads();
+        if (!this._hasConnectedGamepad) {
+          this._lastIdleGamepadPollMs =
+            !this._hasCustomNowFn &&
+            typeof rafTimestampMs === 'number' &&
+            Number.isFinite(rafTimestampMs)
+              ? rafTimestampMs
+              : this._nowFn();
+        }
       }
-      if (this.running && !this.disposed && this._window && typeof this._window.requestAnimationFrame === 'function') {
-        this._rafId = this._window.requestAnimationFrame(this._boundTick);
+      const win = this._window;
+      if (this.running && !this.disposed && win && typeof win.requestAnimationFrame === 'function') {
+        this._rafId = win.requestAnimationFrame(this._boundTick);
       }
     };
 
@@ -2179,7 +2204,8 @@ export class InputBridge {
   _notifySeq() {
     if (this._atomics && this.isSharedBuffer && typeof this._atomics.notify === 'function') {
       try {
-        this._atomics.notify(this.i32, INPUT_WORD_INDICES.SEQ, 1);
+        this._atomics.notify(this._sabI32, INPUT_WORD_INDICES.SEQ, 1);
+        this._notifyCount += 1;
       } catch {
         // Ignore host environments where Atomics.notify is unavailable/restricted.
       }
@@ -2461,6 +2487,7 @@ export class InputBridge {
     this._gpRy = 0;
     this._gpLt = 0;
     this._gpRt = 0;
+    this._hasNonZeroGpState = false;
   }
 
   _clearTransientInputs() {
@@ -2582,6 +2609,9 @@ export class InputBridge {
 
   _pollSelectedGamepadEntry(entry, forceCommit = false) {
     if (!entry || !entry.pad) {
+      if (!forceCommit && this._activeGamepadIndex === null && !this._hasNonZeroGpState) {
+        return false;
+      }
       this._activeGamepadIndex = null;
       this._clearGamepadState();
       return this._commitMergedState(forceCommit);
@@ -2599,12 +2629,12 @@ export class InputBridge {
         gpMask |= bit;
       }
     }
-    this._gpButtons = gpMask >>> 0;
+    const nextGpButtons = gpMask >>> 0;
 
     const rawLt = readGamepadTrigger(buttons[6]);
     const rawRt = readGamepadTrigger(buttons[7]);
-    this._gpLt = applyTriggerDeadzone(rawLt, this._triggerDeadzone, this._triggerOuterDeadzone);
-    this._gpRt = applyTriggerDeadzone(rawRt, this._triggerDeadzone, this._triggerOuterDeadzone);
+    const nextGpLt = applyTriggerDeadzone(rawLt, this._triggerDeadzone, this._triggerOuterDeadzone);
+    const nextGpRt = applyTriggerDeadzone(rawRt, this._triggerDeadzone, this._triggerOuterDeadzone);
 
     const axes = pad.axes || EMPTY_ARRAY;
     const ySign = this._invertGamepadY ? -1 : 1;
@@ -2628,10 +2658,34 @@ export class InputBridge {
       this._rightStickScratch
     );
 
+    if (
+      !forceCommit &&
+      nextGpButtons === this._gpButtons &&
+      nextGpLt === this._gpLt &&
+      nextGpRt === this._gpRt &&
+      left.x === this._gpLx &&
+      left.y === this._gpLy &&
+      right.x === this._gpRx &&
+      right.y === this._gpRy
+    ) {
+      return false;
+    }
+
+    this._gpButtons = nextGpButtons;
+    this._gpLt = nextGpLt;
+    this._gpRt = nextGpRt;
     this._gpLx = left.x;
     this._gpLy = left.y;
     this._gpRx = right.x;
     this._gpRy = right.y;
+    this._hasNonZeroGpState =
+      nextGpButtons !== 0 ||
+      nextGpLt !== 0 ||
+      nextGpRt !== 0 ||
+      left.x !== 0 ||
+      left.y !== 0 ||
+      right.x !== 0 ||
+      right.y !== 0;
 
     return this._commitMergedState(forceCommit);
   }
@@ -3132,6 +3186,7 @@ export class InputBridge {
       stuckResetCount: this._stuckResetCount,
       pollsCount: this._pollsCount,
       writesCount: this._writesCount,
+      notifyCount: this._notifyCount,
       scriptedEventsDispatched: this._scriptedEventsDispatched,
       gamepadConnects: this._gamepadConnects,
       gamepadDisconnects: this._gamepadDisconnects,

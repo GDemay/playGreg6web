@@ -3813,3 +3813,161 @@ test('W364 chrome-menu-flow-5 preset schedule, FIRST_VISIBLE_FRAME anchor, and 1
   assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP, '85 s Legal Terms loop start');
   bridge.destroy();
 });
+
+test('W366 InputBridge calls Atomics.notify on inputSab seq writes and guards non-shared buffers', () => {
+  const env = createMockEnv();
+  const notifyCalls = [];
+  const spyAtomics = {
+    load: (arr, idx) => Atomics.load(arr, idx),
+    store: (arr, idx, val) => Atomics.store(arr, idx, val),
+    add: (arr, idx, val) => Atomics.add(arr, idx, val),
+    notify: (arr, idx, count) => {
+      notifyCalls.push({
+        arr,
+        idx,
+        count,
+        seqAtNotify: Atomics.load(arr, idx),
+      });
+      return Atomics.notify(arr, idx, count);
+    },
+  };
+
+  const sab = new SharedArrayBuffer(40);
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+    sab,
+    atomicsObj: spyAtomics,
+  });
+
+  assert.equal(bridge.isSharedBuffer, true);
+  assert.equal(bridge._sabI32, bridge.i32);
+  assert.equal(notifyCalls.length, 0);
+  assert.equal(bridge.getStats().notifyCount, 0);
+
+  // 1. Keyboard press writes even seq and notifies index 0 with count 1.
+  env.win.dispatch('keydown', { code: 'Space' });
+  assert.equal(notifyCalls.length, 1);
+  assert.equal(notifyCalls[0].arr, bridge._sabI32);
+  assert.equal(notifyCalls[0].idx, INPUT_WORD_INDICES.SEQ);
+  assert.equal(notifyCalls[0].count, 1);
+  assert.equal(notifyCalls[0].seqAtNotify % 2, 0);
+  assert.equal(bridge.getStats().notifyCount, 1);
+
+  // 2. Pointer-locked mousemove accumulates delta, bumps even seq, and notifies.
+  env.lockPointer();
+  env.win.dispatch('mousemove', { movementX: 12, movementY: -4 });
+  assert.equal(notifyCalls.length, 2);
+  assert.equal(notifyCalls[1].idx, INPUT_WORD_INDICES.SEQ);
+  assert.equal(notifyCalls[1].count, 1);
+  assert.equal(notifyCalls[1].seqAtNotify % 2, 0);
+
+  // 3. Scripted input press notifies immediately when writing to inputSab.
+  const clock = createFakeClockAndTimers(0);
+  bridge.startScript([{ atMs: 100, holdMs: 200, button: INPUT_BUTTONS.B }], {
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  const beforeScriptNotify = notifyCalls.length;
+  clock.advanceTo(100);
+  assert.equal(notifyCalls.length, beforeScriptNotify + 1);
+  assert.equal(notifyCalls[notifyCalls.length - 1].seqAtNotify % 2, 0);
+
+  // 4. reset() notifies after clearing inputSab.
+  const beforeResetNotify = notifyCalls.length;
+  bridge.reset();
+  assert.equal(notifyCalls.length, beforeResetNotify + 1);
+  assert.equal(bridge.getStats().notifyCount, notifyCalls.length);
+  bridge.destroy();
+
+  // 5. Non-shared ArrayBuffer must never invoke Atomics.notify.
+  const nonSharedNotifyCalls = [];
+  const env2 = createMockEnv();
+  const nonSharedBridge = new InputBridge(env2.canvas, {
+    windowObj: env2.win,
+    documentObj: env2.doc,
+    navigatorObj: env2.nav,
+    sab: new ArrayBuffer(40),
+    atomicsObj: {
+      load: (arr, idx) => arr[idx],
+      store: (arr, idx, val) => {
+        arr[idx] = val;
+        return val;
+      },
+      add: (arr, idx, val) => {
+        const prev = arr[idx];
+        arr[idx] = prev + val;
+        return prev;
+      },
+      notify: (...args) => {
+        nonSharedNotifyCalls.push(args);
+        return 0;
+      },
+    },
+  });
+  assert.equal(nonSharedBridge.isSharedBuffer, false);
+  env2.win.dispatch('keydown', { code: 'Space' });
+  nonSharedBridge.reset();
+  assert.equal(nonSharedNotifyCalls.length, 0);
+  assert.equal(nonSharedBridge.getStats().notifyCount, 0);
+  nonSharedBridge.destroy();
+});
+
+test('W366 InputBridge idle _boundTick and pollGamepads fast-path skip redundant _commitMergedState and SAB writes', () => {
+  let nowMs = 0;
+  const env = createMockEnv({ withRaf: true });
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+    nowFn: () => nowMs,
+  });
+
+  let commitCalls = 0;
+  const origCommit = bridge._commitMergedState.bind(bridge);
+  bridge._commitMergedState = (...args) => {
+    commitCalls += 1;
+    return origCommit(...args);
+  };
+
+  // 1. Idle rAF loop across 2.5 seconds (150 ticks, 5 idle gamepad probes):
+  //    zero _commitMergedState calls and zero SAB writes.
+  bridge.start();
+  for (let i = 0; i < 150; i += 1) {
+    nowMs = i * 16;
+    env.flushRaf();
+  }
+  assert.equal(commitCalls, 0, 'idle polls with no gamepad must early-return before _commitMergedState');
+  assert.equal(bridge.getStats().writesCount, 0);
+  assert.equal(bridge.getStats().notifyCount, 0);
+  assert.ok(bridge.getStats().idleGamepadPollsSkipped > 100);
+
+  // 2. Connect gamepad with static input: commits once on change, then skips _commitMergedState on steady ticks.
+  const pad = makeStandardGamepad({ buttons: { 0: 1 } }); // A held
+  env.setGamepads([pad]);
+  env.win.dispatch('gamepadconnected', { gamepad: pad });
+  assert.equal(commitCalls, 1);
+  assert.equal(bridge.getStats().writesCount, 1);
+  assert.equal(bridge.getStats().notifyCount, 1);
+
+  for (let i = 0; i < 30; i += 1) {
+    nowMs += 16;
+    env.flushRaf();
+  }
+  assert.equal(commitCalls, 1, 'steady unchanged gamepad state must not re-enter _commitMergedState');
+  assert.equal(bridge.getStats().writesCount, 1);
+
+  // 3. Releasing the button commits immediately and notifies.
+  pad.buttons[0].pressed = false;
+  pad.buttons[0].value = 0;
+  nowMs += 16;
+  env.flushRaf();
+  assert.equal(commitCalls, 2);
+  assert.equal(bridge.getStats().writesCount, 2);
+  assert.equal(bridge.getStats().notifyCount, 2);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+
+  bridge.destroy();
+});
