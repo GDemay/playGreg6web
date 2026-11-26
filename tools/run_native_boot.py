@@ -414,11 +414,25 @@ def menu_to_ingame_script_text(duration_ms: int) -> str:
               f"repeat every 14s until draws_per_frame=={VIEWER_SCREEN} for 1500ms timeout 240s"]
     lines += ["  " + line for line in _lines(_menu_cycle())]
     lines += ["end", "capture"]
+    # Terms screen (VIEWER_SCREEN draws/frame): one round per 16 s until the screen changes (a pass leaves it; the
+    # round also toggles the checkboxes, so it stops as soon as the screen has left for 3 s).
+    lines += [f"repeat every 16s until draws_per_frame!={VIEWER_SCREEN} for 3s timeout 200s"]
+    lines += ["  " + line for line in _lines(_terms_round())]
+    lines += ["end"]
     lines += ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
               "  0 A 600", "  2500 Menu 150", "  4500 A 100", "end",
               "repeat every 12s until presents>=999999999 timeout 800s",
               "  0 A 100", "  1500 Up 1500", "  3500 RRight 1200", "  5500 LT 1000", "  7000 Up+RT 1000", "end"]
     return "\n".join(lines) + "\n"
+
+
+def _terms_round() -> list[tuple[int, str, int]]:
+    """ROCKSTAR GAMES LEGAL TERMS & POLICIES, same timing as the browser chrome-to-ingame round: Up x6 (cursor to
+    the top), right stick down (scroll), A (Privacy Policy checkbox), Down, right stick down, A (Terms of Service
+    checkbox), Down, A ("Confirm >", enabled once both are checked)."""
+    return ([(i * 450, "DUp", 150) for i in range(6)]
+            + [(2_700, "RDown", 900), (4_000, "A", 220), (5_200, "DDown", 150), (5_800, "RDown", 900),
+               (7_100, "A", 220), (8_300, "DDown", 150), (9_500, "A", 220)])
 
 
 def input_script_text(duration_ms: int, kind: str = "start-screen") -> str:
