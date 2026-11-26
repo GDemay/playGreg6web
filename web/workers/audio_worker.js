@@ -188,7 +188,13 @@
       return fallback;
     }
     const normalized = value.trim().toLowerCase();
-    if (normalized === OUTPUT_STATES.ACTIVE || normalized === 'running') {
+    if (
+      normalized === OUTPUT_STATES.ACTIVE ||
+      normalized === 'running' ||
+      normalized === 'worklet' ||
+      normalized === 'live' ||
+      normalized === 'playing'
+    ) {
       return OUTPUT_STATES.ACTIVE;
     }
     if (normalized === OUTPUT_STATES.SUSPENDED || normalized === 'interrupted') {
@@ -3553,6 +3559,9 @@
       this.volume = 1.0;
       this.muted = false;
       this.ring = null;
+      this._hasExternalRingSab = false;
+      this._stalledFullTicks = 0;
+      this._lastObservedReadCursor = null;
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
       this.framesDrained = 0;
@@ -3911,8 +3920,116 @@
       this._drainTimer = null;
     }
 
-    setOutputState(state) {
+    setSampleRate(sampleRate) {
+      if (
+        typeof sampleRate !== 'number' ||
+        !Number.isFinite(sampleRate) ||
+        sampleRate < MIN_SAMPLE_RATE ||
+        sampleRate > MAX_SAMPLE_RATE
+      ) {
+        return this.sampleRate;
+      }
+      const nextRate = Math.floor(sampleRate);
+      if (this._guestRing) {
+        const rateRatio = this._guestRing.sampleRate / nextRate;
+        if (rateRatio > MAX_RESAMPLE_RATIO || 1.0 / rateRatio > MAX_RESAMPLE_RATIO) {
+          throw new RangeError(
+            `Guest PCM ring sampleRate ratio (${this._guestRing.sampleRate} -> ${nextRate}) exceeds ${MAX_RESAMPLE_RATIO}x guard`
+          );
+        }
+      }
+      if (nextRate !== this.sampleRate) {
+        this.sampleRate = nextRate;
+        this._guestResamplerState = { phase: 0.0 };
+        this._resamplerState = { phase: 0.0 };
+        this._lastResampleSrcRate = null;
+      }
+      return this.sampleRate;
+    }
+
+    /**
+     * Attaches (or swaps) the shared AudioRingBuffer SAB shared with the main-thread
+     * AudioEngine / AudioWorkletProcessor WITHOUT losing an already-attached guest
+     * PCM ring (`playgta6_audio_ring`) or wiping guest drain telemetry.
+     *
+     * Cleanly transitions `outputState` from `'headless-drain'` to `'active'`
+     * unless an explicit `outputState` / `audioContextState` / `headless: true`
+     * option is supplied.
+     *
+     * @param {SharedArrayBuffer} ringSab
+     * @param {object} [options]
+     */
+    attachRingSab(ringSab, options = {}) {
+      if (typeof SharedArrayBuffer === 'undefined' || !isSharedArrayBuffer(ringSab)) {
+        throw new TypeError('Invalid ringSab: expected SharedArrayBuffer');
+      }
+      const opts = options && typeof options === 'object' ? options : {};
+      const nextChannels = sanitizePositiveInt(
+        opts.channels,
+        this.channels || DEFAULT_CHANNELS,
+        1,
+        MAX_CHANNELS
+      );
+      const nextRing = new AudioRingBuffer(ringSab, {
+        channels: nextChannels,
+        volume: this.volume,
+        muted: this.muted,
+        declickFrames: this._declickFrames,
+        fadeCurve: this._fadeCurve,
+        overflowPolicy: this._overflowPolicy,
+        maxFillRatio: this._maxFillRatio,
+        underrunRecoveryFrames: this._underrunRecoveryFrames,
+      });
+
+      if (opts.sampleRate !== undefined) {
+        this.setSampleRate(opts.sampleRate);
+      }
+
+      this.ring = nextRing;
+      this.channels = nextRing.channels;
+      this.initialized = true;
+      this._hasExternalRingSab = true;
+      this._stalledFullTicks = 0;
+      this._lastObservedReadCursor = null;
+
+      if (typeof opts.outputState === 'string') {
+        this.outputState = normalizeOutputState(opts.outputState, OUTPUT_STATES.ACTIVE);
+      } else if (typeof opts.state === 'string') {
+        this.outputState = normalizeOutputState(opts.state, OUTPUT_STATES.ACTIVE);
+      } else if (typeof opts.audioContextState === 'string') {
+        this.outputState = normalizeOutputState(opts.audioContextState, OUTPUT_STATES.ACTIVE);
+      } else if (opts.headless === true) {
+        this.outputState = OUTPUT_STATES.HEADLESS_DRAIN;
+      } else if (this.outputState === OUTPUT_STATES.HEADLESS_DRAIN) {
+        this.outputState = OUTPUT_STATES.ACTIVE;
+      }
+
+      if (this._shouldRunTimer()) {
+        this._startDrainTimer();
+      } else {
+        this._stopDrainTimer();
+      }
+
+      this._publishAudioStatsInternal(true, false, this._now());
+
+      return {
+        attached: true,
+        ringSabAttached: true,
+        outputState: this.outputState,
+        sampleRate: this.sampleRate,
+        channels: this.channels,
+        capacityFrames: this.ring.capacityFrames,
+        guestRingAttached: this._guestRing !== null,
+      };
+    }
+
+    setOutputState(state, options = null) {
+      if (options && typeof options === 'object' && options.sampleRate !== undefined) {
+        this.setSampleRate(options.sampleRate);
+      }
       this.outputState = normalizeOutputState(state, OUTPUT_STATES.HEADLESS_DRAIN);
+      this._stalledFullTicks = 0;
+      this._lastObservedReadCursor = null;
       if (this._shouldRunTimer()) {
         this._startDrainTimer();
       } else {
@@ -3958,14 +4075,31 @@
       this._inDrainTick = true;
       try {
         if (this._guestRing && this._guestRingAutoPump && maxFrames > 0) {
-          // Chunk by this.ring.capacityFrames so slow/throttled browser timer ticks
-          // (e.g. 100 ms = 4800 frames > 4096 ring capacity) never trigger spurious overruns.
-          const chunkCap = Math.max(1, this.ring.capacityFrames);
-          let remaining = maxFrames;
+          // Chunk by this.ring.capacityFrames (scaled by guestRate / targetRate if resampling)
+          // so slow/throttled browser timer ticks never trigger spurious overruns.
+          const guestRate = this._guestRing.sampleRate;
+          const targetRate = this.sampleRate;
+          const guestBudget =
+            guestRate !== targetRate
+              ? Math.min(
+                  Math.max(elapsedMs > 0 ? 1 : 0, Math.floor((guestRate * elapsedMs) / 1000)),
+                  this._effectiveMaxDrainFramesPerTick()
+                )
+              : maxFrames;
+          const chunkCap =
+            guestRate !== targetRate
+              ? Math.max(
+                  1,
+                  Math.floor(this.ring.capacityFrames * Math.min(1, guestRate / targetRate))
+                )
+              : Math.max(1, this.ring.capacityFrames);
+          let remaining = guestBudget;
           while (remaining > 0) {
             const step = remaining <= chunkCap ? remaining : chunkCap;
             const pumpRes = this._drainGuestPcmRingInto(step, null, this._drainGuestOutResult);
-            const stepDrained = this.ring.discardFrames(step);
+            const discardLimit =
+              pumpRes.pushedFrames > 0 ? pumpRes.pushedFrames : step;
+            const stepDrained = this.ring.discardFrames(discardLimit);
             drained += stepDrained;
             remaining -= step;
             if (pumpRes.framesDrained < step && this.ring.availableFrames() === 0) {
@@ -3989,6 +4123,11 @@
      * `playgta6_audio_ring` into `this.ring` up to available free space without
      * discarding unread samples so AudioWorkletProcessor plays them seamlessly.
      *
+     * Handles sample-rate conversion budgeting cleanly (e.g. 48 kHz guest -> 44.1/96 kHz
+     * host AudioContext) and prevents GuestPcmRingReader deadlocks if the AudioWorklet
+     * consumer is suspended (ring full with stationary read cursor for >= 2 ticks, or
+     * under `drop-oldest` policy).
+     *
      * @param {number} [nowMs] Optional monotonic timestamp in ms.
      * @returns {number} Number of guest stereo frames pumped.
      */
@@ -4011,19 +4150,66 @@
       }
       this._lastDrainMs = now;
 
-      const free = this.ring.freeFrames();
-      if (free <= 0) {
+      const guestRate = this._guestRing.sampleRate;
+      const targetRate = this.sampleRate;
+      const needsResample = guestRate !== targetRate;
+      let guestTimeBudget = Math.floor((guestRate * elapsedMs) / 1000);
+      if (elapsedMs > 0 && guestTimeBudget <= 0) {
+        guestTimeBudget = 1;
+      }
+      const tickCap = this._effectiveMaxDrainFramesPerTick();
+      guestTimeBudget = Math.min(guestTimeBudget, tickCap);
+      if (guestTimeBudget <= 0) {
         return 0;
       }
-      let timeBudgetFrames = Math.floor((this.sampleRate * elapsedMs) / 1000);
-      if (elapsedMs > 0 && timeBudgetFrames <= 0) {
-        timeBudgetFrames = 1;
+
+      let free = this.ring.freeFrames();
+      const curRead = Atomics.load(this.ring._ctrl, HDR_READ_CURSOR);
+      if (free <= 0) {
+        let shouldEvictOldest = false;
+        if (this._overflowPolicy === OVERFLOW_POLICIES.DROP_OLDEST) {
+          shouldEvictOldest = true;
+        } else {
+          if (this._lastObservedReadCursor === curRead) {
+            this._stalledFullTicks += 1;
+          } else {
+            this._stalledFullTicks = 1;
+            this._lastObservedReadCursor = curRead;
+          }
+          if (this._stalledFullTicks >= 2) {
+            shouldEvictOldest = true;
+          }
+        }
+        if (!shouldEvictOldest) {
+          return 0;
+        }
+        const availGuestFrames = this._guestRing.availableFrames();
+        if (availGuestFrames <= 0) {
+          return 0;
+        }
+        const outputStep = Math.min(
+          this.ring.capacityFrames,
+          Math.max(1, Math.floor((targetRate * elapsedMs) / 1000)),
+          tickCap
+        );
+        const evicted = this.ring.discardFrames(outputStep);
+        if (evicted > 0) {
+          this.framesDrained += evicted;
+          this._lastObservedReadCursor = Atomics.load(this.ring._ctrl, HDR_READ_CURSOR);
+        }
+        free = this.ring.freeFrames();
+        if (free <= 0) {
+          return 0;
+        }
+      } else {
+        this._stalledFullTicks = 0;
+        this._lastObservedReadCursor = curRead;
       }
-      const maxFrames = Math.min(
-        free,
-        timeBudgetFrames,
-        this._effectiveMaxDrainFramesPerTick()
-      );
+
+      const maxGuestForFree = needsResample
+        ? Math.max(1, Math.floor((free > 1 ? free - 1 : free) * (guestRate / targetRate)))
+        : free;
+      const maxFrames = Math.min(maxGuestForFree, guestTimeBudget, tickCap);
       if (maxFrames <= 0) {
         return 0;
       }
@@ -4929,6 +5115,8 @@
       this._resamplerState = { phase: 0.0 };
       this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
+      this._stalledFullTicks = 0;
+      this._lastObservedReadCursor = null;
       this._guestResamplerState = { phase: 0.0 };
       this._guestFramesDrained = 0;
       this._guestUnderruns = 0;
@@ -5109,6 +5297,15 @@
       if (this._hasExplicitOutputState) {
         return this.outputState;
       }
+      const providedRingSab =
+        msg.ringSab !== undefined && msg.ringSab !== null
+          ? msg.ringSab
+          : msg.audioSab !== undefined && msg.audioSab !== null
+            ? msg.audioSab
+            : msg.sab;
+      if (isSharedArrayBuffer(providedRingSab)) {
+        return OUTPUT_STATES.ACTIVE;
+      }
       return detectDefaultOutputState();
     }
 
@@ -5127,7 +5324,7 @@
       }
 
       try {
-        if (msg.init) {
+        if (msg.init || msg.type === 'init') {
           this._stopDrainTimer();
 
           if (msg.autoDrain !== undefined) {
@@ -5231,8 +5428,16 @@
             this._safePostMessage(errReply);
             return;
           }
-          if (msg.ringSab !== undefined && msg.ringSab !== null) {
-            if (!isSharedArrayBuffer(msg.ringSab)) {
+          const rawInitSab =
+            msg.ringSab !== undefined && msg.ringSab !== null
+              ? msg.ringSab
+              : msg.audioSab !== undefined && msg.audioSab !== null
+                ? msg.audioSab
+                : msg.sab !== undefined && msg.sab !== null
+                  ? msg.sab
+                  : null;
+          if (rawInitSab !== null) {
+            if (!isSharedArrayBuffer(rawInitSab)) {
               this._rejectedPackets += 1;
               const errReply = {
                 ready: false,
@@ -5243,9 +5448,9 @@
               return;
             }
             const reconfiguringSameSab = Boolean(
-              this.ring && this.ring.sab === msg.ringSab
+              this.ring && this.ring.sab === rawInitSab
             );
-            nextRing = new AudioRingBuffer(msg.ringSab, {
+            nextRing = new AudioRingBuffer(rawInitSab, {
               channels: nextChannels,
               volume: this.volume,
               muted: this.muted,
@@ -5258,6 +5463,7 @@
             if (reconfiguringSameSab) {
               nextRing.reset();
             }
+            this._hasExternalRingSab = true;
           } else {
             const cap = sanitizePositiveInt(
               msg.capacityFrames,
@@ -5274,6 +5480,7 @@
             });
             nextRing.setVolume(this.volume);
             nextRing.setMuted(this.muted);
+            this._hasExternalRingSab = false;
           }
 
           this.sampleRate = nextSampleRate;
@@ -5281,7 +5488,12 @@
           this.channels = nextRing.channels;
           this.outputState = this._resolveInitOutputState(msg);
           this.initialized = true;
-          this._resetTelemetryAndCounters();
+          if (msg.preserveGuestStats === true) {
+            this._stalledFullTicks = 0;
+            this._lastObservedReadCursor = null;
+          } else {
+            this._resetTelemetryAndCounters();
+          }
 
           if (this._shouldRunTimer()) {
             this._startDrainTimer();
@@ -5293,6 +5505,46 @@
             channels: this.channels,
             capacityFrames: this.ring.capacityFrames,
           });
+          return;
+        }
+
+        if (
+          msg.attachRingSab ||
+          msg.type === 'attach-ring-sab' ||
+          msg.type === 'attachRingSab' ||
+          msg.type === 'attach-sab'
+        ) {
+          const sab =
+            msg.ringSab !== undefined && msg.ringSab !== null
+              ? msg.ringSab
+              : msg.audioSab !== undefined && msg.audioSab !== null
+                ? msg.audioSab
+                : msg.sab;
+          try {
+            const info = this.attachRingSab(sab, msg);
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                attached: true,
+                ringSabAttached: true,
+                outputState: info.outputState,
+                sampleRate: info.sampleRate,
+                channels: info.channels,
+                capacityFrames: info.capacityFrames,
+                guestRingAttached: info.guestRingAttached,
+              });
+            }
+          } catch (attachErr) {
+            this._rejectedPackets += 1;
+            if (safeId !== undefined) {
+              this._safePostMessage({
+                id: safeId,
+                attached: false,
+                ringSabAttached: this._hasExternalRingSab,
+                error: sanitizeErrorMessage(attachErr),
+              });
+            }
+          }
           return;
         }
 
@@ -5787,18 +6039,45 @@
           return;
         }
 
+        if (
+          msg.setSampleRate ||
+          msg.type === 'set-sample-rate' ||
+          msg.type === 'setSampleRate'
+        ) {
+          const appliedRate = this.setSampleRate(msg.sampleRate);
+          if (safeId !== undefined) {
+            this._safePostMessage({
+              id: safeId,
+              type: 'sample-rate',
+              sampleRate: appliedRate,
+            });
+          }
+          return;
+        }
+
         if (msg.setOutputState || msg.type === 'output-state' || msg.type === 'audio-context-state') {
+          const attachedSab =
+            msg.ringSab !== undefined && msg.ringSab !== null
+              ? msg.ringSab
+              : msg.audioSab !== undefined && msg.audioSab !== null
+                ? msg.audioSab
+                : null;
+          if (isSharedArrayBuffer(attachedSab) && (!this.ring || this.ring.sab !== attachedSab)) {
+            this.attachRingSab(attachedSab, msg);
+          }
           const nextState = this.setOutputState(
             msg.outputState !== undefined
               ? msg.outputState
               : msg.state !== undefined
                 ? msg.state
-                : msg.audioContextState
+                : msg.audioContextState,
+            msg.sampleRate !== undefined ? { sampleRate: msg.sampleRate } : null
           );
           if (safeId !== undefined) {
             this._safePostMessage({
               id: safeId,
               outputState: nextState,
+              sampleRate: this.sampleRate,
             });
           }
           return;

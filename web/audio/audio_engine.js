@@ -1629,26 +1629,36 @@ export class AudioEngine {
       if (nextState === 'running') {
         this._wasPlaying = true;
         this._explicitlySuspended = false;
+        let recoveredForwarded = false;
         if (this._pendingAutoRecovery) {
           if (this._inManualResume && !this._inAutoRecovery) {
             this._pendingAutoRecovery = false;
             this._clearGestureListeners();
           } else {
-            this._markInterruptionRecovered();
+            recoveredForwarded = this._markInterruptionRecovered();
           }
-          if (
-            this._masterGainNode &&
-            this._masterGainHeldSilent &&
-            !this._inUnlockGesture &&
-            !this._inAutoRecovery
-          ) {
-            this._masterGainHeldSilent = false;
-            this._scheduleMasterGainRamp(
-              this._muted ? 0.0 : this._volume,
-              this._unlockFadeInMs,
-              0.0
-            );
-          }
+        }
+        if (
+          this._masterGainNode &&
+          this._masterGainHeldSilent &&
+          !this._inUnlockGesture &&
+          !this._inAutoRecovery
+        ) {
+          this._masterGainHeldSilent = false;
+          this._scheduleMasterGainRamp(
+            this._muted ? 0.0 : this._volume,
+            this._unlockFadeInMs,
+            0.0
+          );
+        }
+        if (
+          !recoveredForwarded &&
+          !this._inUnlockGesture &&
+          !this._inAutoRecovery &&
+          !this._inManualResume &&
+          prevState !== 'running'
+        ) {
+          this._forwardOutputStateToAudioWorker('active');
         }
       } else if (
         (nextState === 'interrupted' || nextState === 'suspended') &&
@@ -1661,16 +1671,9 @@ export class AudioEngine {
         if (this._masterGainNode) {
           this._masterGainHeldSilent = true;
         }
-        this._forwardToAudioWorker(
-          'setOutputState',
-          {
-            type: 'audio-context-state',
-            setOutputState: true,
-            outputState: 'suspended',
-            interrupted: nextState === 'interrupted',
-          },
-          ['suspended']
-        );
+        this._forwardOutputStateToAudioWorker('suspended', {
+          interrupted: nextState === 'interrupted',
+        });
         if (this._autoRecoverOnInterruption) {
           this._armInterruptionRecovery();
         }
@@ -1728,16 +1731,9 @@ export class AudioEngine {
     this._pendingAutoRecovery = false;
     this._autoRecoveryCount += 1;
     this._clearGestureListeners();
-    this._forwardToAudioWorker(
-      'setOutputState',
-      {
-        type: 'audio-context-state',
-        setOutputState: true,
-        outputState: 'active',
-        recoveredFromInterruption: true,
-      },
-      ['active']
-    );
+    this._forwardOutputStateToAudioWorker('active', {
+      recoveredFromInterruption: true,
+    });
     return true;
   }
 
@@ -1871,6 +1867,9 @@ export class AudioEngine {
               this._unlockFadeInMs,
               0.0
             );
+          }
+          if (!this._inUnlockGesture && !this._inAutoRecovery) {
+            this._forwardOutputStateToAudioWorker('active');
           }
           return true;
         }
@@ -2065,6 +2064,8 @@ export class AudioEngine {
       this._status = nextState;
       if (nextState !== 'suspended') {
         this._explicitlySuspended = false;
+      } else {
+        this._forwardOutputStateToAudioWorker('suspended');
       }
       this._emitStateChange();
       return nextState === 'suspended';
@@ -2232,17 +2233,10 @@ export class AudioEngine {
                 );
               }
               if (!markedRecovery) {
-                this._forwardToAudioWorker(
-                  'setOutputState',
-                  {
-                    type: 'audio-context-state',
-                    setOutputState: true,
-                    outputState: 'active',
-                    unlockedOnGesture: true,
-                    ...(recovering ? { recoveredFromInterruption: true } : {}),
-                  },
-                  ['active']
-                );
+                this._forwardOutputStateToAudioWorker('active', {
+                  unlockedOnGesture: true,
+                  ...(recovering ? { recoveredFromInterruption: true } : {}),
+                });
               }
             }
             if (
@@ -2339,6 +2333,36 @@ export class AudioEngine {
     } catch {
       return false;
     }
+  }
+
+  _forwardOutputStateToAudioWorker(outputState, extra = {}) {
+    const sampleRate = this.sampleRate;
+    const worker = this._audioWorker;
+    if (
+      worker &&
+      typeof worker === 'object' &&
+      typeof worker.setSampleRate === 'function' &&
+      typeof sampleRate === 'number' &&
+      Number.isFinite(sampleRate) &&
+      sampleRate > 0
+    ) {
+      try {
+        worker.setSampleRate(sampleRate);
+      } catch {
+        // Ignore direct worker sample-rate sync errors.
+      }
+    }
+    return this._forwardToAudioWorker(
+      'setOutputState',
+      {
+        type: 'audio-context-state',
+        setOutputState: true,
+        outputState,
+        sampleRate,
+        ...extra,
+      },
+      [outputState]
+    );
   }
 
   _forwardToAudioWorker(methodName, messagePayload, methodArgs = []) {
@@ -2601,6 +2625,7 @@ export class AudioEngine {
 
     const effectiveTarget = this._muted ? 0.0 : this._volume;
     if (currentState === 'running') {
+      const wasUnlocked = this._unlockedOnGesture;
       this._unlockedOnGesture = true;
       if (this._masterGainNode && this._masterGainHeldSilent) {
         this._masterGainHeldSilent = false;
@@ -2613,6 +2638,11 @@ export class AudioEngine {
           // Ignore cleanup errors.
         }
         this._gestureCleanup = null;
+      }
+      if (!wasUnlocked) {
+        this._forwardOutputStateToAudioWorker('active', {
+          unlockedOnGesture: true,
+        });
       }
       return {
         ok: true,
@@ -2699,16 +2729,9 @@ export class AudioEngine {
       this._gestureCleanup = null;
     }
 
-    this._forwardToAudioWorker(
-      'setOutputState',
-      {
-        type: 'audio-context-state',
-        setOutputState: true,
-        outputState: 'active',
-        unlockedOnGesture: true,
-      },
-      ['active']
-    );
+    this._forwardOutputStateToAudioWorker('active', {
+      unlockedOnGesture: true,
+    });
 
     return {
       ok: true,
