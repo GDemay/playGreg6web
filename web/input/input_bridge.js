@@ -200,6 +200,7 @@ export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
 
 export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
   'menu-to-ingame',
+  'chrome-to-ingame',
   'chrome-menu-flow-4',
   'chrome-menu-flow-2',
   'chrome-menu-flow',
@@ -254,6 +255,44 @@ const CHROME_MENU_FLOW_4_CYCLE_OFFSETS = Object.freeze([
   Object.freeze({ offsetMs: 6500, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A }),
 ]);
 
+// W362 (Refs #663): 16 s ROCKSTAR GAMES LEGAL TERMS & POLICIES checkbox-accept cycle.
+// Live Chrome t90 layout has 3 rows:
+//   Row 0: [ ] Privacy Policy (SCROLL [R] / SELECT [A])
+//   Row 1: [ ] Terms of Service (SCROLL [R] / SELECT [A])
+//   Row 2: Confirm > ("Confirm setup and start the game." — disabled until Row 0 & Row 1 checked)
+// Right-stick scroll uses ry: -0.95 (GameInput/XInput Y-up ABI where -1.0 is down).
+// All button holds are >= 200 ms (>= MIN_SCRIPT_HOLD_MS) and B is never pressed.
+export const CHROME_LEGAL_TERMS_ACCEPT_OFFSETS = Object.freeze([
+  Object.freeze({ offsetMs: 0, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 450, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 900, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1350, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 1800, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 2250, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP }),
+  Object.freeze({ offsetMs: 2700, holdMs: 900, sticks: Object.freeze({ ry: -0.95 }) }),
+  Object.freeze({ offsetMs: 4000, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 5200, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 5800, holdMs: 900, sticks: Object.freeze({ ry: -0.95 }) }),
+  Object.freeze({ offsetMs: 7100, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 8300, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_DOWN }),
+  Object.freeze({ offsetMs: 9500, holdMs: 220, button: INPUT_BUTTONS.A }),
+  Object.freeze({ offsetMs: 12000, holdMs: 220, button: INPUT_BUTTONS.A }),
+]);
+
+function expandOffsetCycle(events, baseMs, offsets) {
+  for (let i = 0; i < offsets.length; i++) {
+    const step = offsets[i];
+    const ev = {
+      atMs: baseMs + step.offsetMs,
+      holdMs: step.holdMs,
+    };
+    if (step.button !== undefined) ev.button = step.button;
+    if (step.sticks !== undefined) ev.sticks = step.sticks;
+    if (step.triggers !== undefined) ev.triggers = step.triggers;
+    events.push(Object.freeze(ev));
+  }
+}
+
 function buildChromeMenuFlow4Events() {
   const events = [];
   // Phase 1 (5s..75s): Early A confirmations every 2500 ms (holdMs: 200 >= 180 ms, 29 presses).
@@ -269,17 +308,7 @@ function buildChromeMenuFlow4Events() {
   // matching tools/run_native_boot.py::_to_list_screen (PR #1483) to advance any remaining
   // setup screens and deterministically select "Next >" on LEGAL NOTICES.
   for (let round = 0; round < 7; round++) {
-    const base = 80000 + round * 14000;
-    for (let i = 0; i < CHROME_MENU_FLOW_4_CYCLE_OFFSETS.length; i++) {
-      const step = CHROME_MENU_FLOW_4_CYCLE_OFFSETS[i];
-      events.push(
-        Object.freeze({
-          atMs: base + step.offsetMs,
-          holdMs: step.holdMs,
-          button: step.button,
-        })
-      );
-    }
+    expandOffsetCycle(events, 80000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
   }
   // Phase 3 (178s..180s): Post-Legal List Screen top-item select matching native menu-flow-4
   // (PR #1483: DUp to put cursor in 50-draw top state, then +2000 ms A to trigger the ~3 s
@@ -290,7 +319,7 @@ function buildChromeMenuFlow4Events() {
   events.push(
     Object.freeze({ atMs: 180000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
   );
-  // Phase 4 (184s..360s, W361): Extended long-Bink2 continuation so Wasm64 browser runs where
+  // Phase 4 (184s..360s, W361/W362): Extended long-Bink2 continuation so Wasm64 browser runs where
   // 4K Bink2 takes 30-160 s never run out of scripted inputs after UI TEXT SIZE.
   // Phase 4a (184s..212s): 10 spaced A confirmations every 3000 ms (holdMs: 200, never B) to
   // advance through UI TEXT SIZE -> BRIGHTNESS / HDR / SUBTITLES -> FINISH SETUP? -> LEGAL NOTICES.
@@ -307,31 +336,82 @@ function buildChromeMenuFlow4Events() {
   // 14000 ms to deterministically highlight & confirm "Next >" on LEGAL NOTICES (and advance any
   // remaining setup screen).
   for (let round = 0; round < 7; round++) {
-    const base = 218000 + round * 14000;
-    for (let i = 0; i < CHROME_MENU_FLOW_4_CYCLE_OFFSETS.length; i++) {
-      const step = CHROME_MENU_FLOW_4_CYCLE_OFFSETS[i];
-      events.push(
-        Object.freeze({
-          atMs: base + step.offsetMs,
-          holdMs: step.holdMs,
-          button: step.button,
-        })
-      );
-    }
+    expandOffsetCycle(events, 218000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
   }
-  // Phase 4c (320s..360s): Post-Legal List -> Main Menu -> Story/Play probes: DPAD_UP at 320s,
-  // A at 322s, then spaced A confirmations (328s, 334s, 340s, 346s, 352s, 358s; never B).
+  // Phase 4c (320s..360s, W362): 2 rounds of 16 s ROCKSTAR GAMES LEGAL TERMS & POLICIES
+  // checkbox-accept sequence (320s..352s: Up x6 -> right-stick scroll -> A [Privacy Policy] ->
+  // Down -> right-stick scroll -> A [Terms of Service] -> Down -> A [Confirm >] -> A) followed
+  // by an A confirmation at 358s for Main Menu / Story entry (never presses B).
+  for (let round = 0; round < 2; round++) {
+    expandOffsetCycle(events, 320000 + round * 16000, CHROME_LEGAL_TERMS_ACCEPT_OFFSETS);
+  }
   events.push(
-    Object.freeze({ atMs: 320000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.DPAD_UP })
+    Object.freeze({ atMs: 358000, holdMs: 220, button: INPUT_BUTTONS.A })
   );
-  events.push(
-    Object.freeze({ atMs: 322000, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
-  );
-  for (const atMs of [328000, 334000, 340000, 346000, 352000, 358000]) {
+  return Object.freeze(events);
+}
+
+function buildChromeToIngameEvents() {
+  const events = [];
+  // Phase 1 (5s..145s): Spaced A every 3000 ms (holdMs: 220, 47 presses: 5000..143000 ms)
+  // to advance Start Screen -> 4K Bink2 -> R* -> UI TEXT SIZE -> BRIGHTNESS -> FINISH SETUP?
+  // -> LEGAL NOTICES.
+  for (let atMs = 5000; atMs <= 145000; atMs += 3000) {
+    events.push(Object.freeze({ atMs, holdMs: 220, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 2 (150s..206s): 4 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A)
+  // to click "Next >" into ROCKSTAR GAMES LEGAL TERMS & POLICIES (harmless if already there).
+  for (let round = 0; round < 4; round++) {
+    expandOffsetCycle(events, 150000 + round * 14000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  }
+  // Phase 3 (210s..274s): 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS to check BOTH
+  // Privacy Policy & Terms of Service checkboxes and click "Confirm >" ("Confirm setup and
+  // start the game.").
+  for (let round = 0; round < 4; round++) {
+    expandOffsetCycle(events, 210000 + round * 16000, CHROME_LEGAL_TERMS_ACCEPT_OFFSETS);
+  }
+  // Phase 4a (280s..340s): Main Menu -> Story Mode / New Game selection (spaced A every 4000 ms,
+  // holdMs: 220, 16 presses: 280000..340000 ms, never pressing B).
+  for (let atMs = 280000; atMs <= 340000; atMs += 4000) {
+    events.push(Object.freeze({ atMs, holdMs: 220, button: INPUT_BUTTONS.A }));
+  }
+  // Phase 4b (346s..420s): Gentle in-game movement & camera look sweeps interspersed with brief
+  // A confirms (completes cleanly at 418220 ms <= 420000 ms with all inputs released; never B).
+  for (let block = 0; block < 4; block++) {
+    const base = 346000 + block * 18000;
+    const strafeSign = block % 2 === 0 ? 1 : -1;
+    events.push(Object.freeze({ atMs: base, holdMs: 220, button: INPUT_BUTTONS.A }));
     events.push(
-      Object.freeze({ atMs, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+      Object.freeze({
+        atMs: base + 2000,
+        holdMs: 2000,
+        sticks: Object.freeze({ lx: 0, ly: 0.85 }),
+      })
     );
+    events.push(
+      Object.freeze({
+        atMs: base + 5000,
+        holdMs: 1500,
+        sticks: Object.freeze({ rx: 0.7, ry: 0.15 }),
+      })
+    );
+    events.push(
+      Object.freeze({
+        atMs: base + 7500,
+        holdMs: 1500,
+        sticks: Object.freeze({ rx: -0.7, ry: -0.15 }),
+      })
+    );
+    events.push(
+      Object.freeze({
+        atMs: base + 10000,
+        holdMs: 2000,
+        sticks: Object.freeze({ lx: 0.5 * strafeSign, ly: 0.75, rx: 0.35 * strafeSign, ry: 0 }),
+      })
+    );
+    events.push(Object.freeze({ atMs: base + 14000, holdMs: 220, button: INPUT_BUTTONS.A }));
   }
+  events.push(Object.freeze({ atMs: 418000, holdMs: 220, button: INPUT_BUTTONS.A }));
   return Object.freeze(events);
 }
 
@@ -407,10 +487,19 @@ function buildChromeMenuFlow2Events() {
 //   through 6-star -> Bink2 -> Rockstar -> UI TEXT SIZE -> FINISH SETUP?), Phase 2 7 rounds of
 //   14 s cursor-resetting _menu_cycle (DPAD_UP x6, DPAD_DOWN, DPAD_DOWN, A) from 80000 ms for
 //   LEGAL NOTICES ("Next >"), Phase 3 Post-Legal List Screen DPAD_UP (178000 ms) + A (180000 ms),
-//   Phase 4 (W361, 184000..358000 ms) extended long-Bink2 continuation (4a: 10 spaced A every
+//   Phase 4 (W361/W362, 184000..358000 ms) extended long-Bink2 continuation (4a: 10 spaced A every
 //   3000 ms from 184000 ms through 211000 ms; 4b: 7 rounds of 14 s _menu_cycle from 218000 ms;
-//   4c: Post-Legal DPAD_UP 320000 ms, A 322000 ms, spaced A at 328s..358s), then Phase 5 looping
-//   _menu_cycle every 14000 ms from 368000 ms into Main Menu / In-Game (never presses B).
+//   4c: 2 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 320000 ms to check Privacy Policy
+//   + Terms of Service and click "Confirm >", followed by A at 358000 ms), then Phase 5 looping
+//   CHROME_LEGAL_TERMS_ACCEPT_OFFSETS every 16000 ms from 368000 ms (never presses B).
+// - 'chrome-to-ingame': Clean, fast FIRST_VISIBLE_FRAME-anchored Chrome Wasm64 preset driving
+//   Start Screen -> 4K Bink2 -> UI TEXT SIZE / BRIGHTNESS / FINISH SETUP? (Phase 1: spaced A every
+//   3000 ms from 5000 ms through 145000 ms) -> LEGAL NOTICES "Next >" (Phase 2: 4 rounds of 14 s
+//   _menu_cycle from 150000 ms through 206000 ms) -> ROCKSTAR GAMES LEGAL TERMS & POLICIES
+//   2-checkbox + "Confirm >" accept (Phase 3: 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS
+//   from 210000 ms through 274000 ms) -> Main Menu / Story Mode selection & gentle in-game
+//   movement/camera probes (Phase 4: spaced A every 4000 ms through 340000 ms, then A + left-stick
+//   forward / right-stick look sweeps through 420000 ms; bounded, never presses B).
 export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'start-screen': Object.freeze({
     name: 'start-screen',
@@ -595,13 +684,18 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
   'chrome-menu-flow-4': Object.freeze({
     name: 'chrome-menu-flow-4',
     events: buildChromeMenuFlow4Events(),
-    // Phase 5: Looping 14 s _menu_cycle (Up x6, Down, Down, A; 200 ms holds) from 368000 ms
-    // after the Phase 4 long-Bink2 continuation settles (~10 s after 358000 ms; never presses B).
+    // Phase 5 (W362): Looping 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS (Up x6, scroll, A, Down,
+    // scroll, A, Down, A, A; >= 200 ms holds) from 368000 ms after Phase 4 settles (~10 s after
+    // 358000 ms; never presses B).
     loop: Object.freeze({
       startMs: 368000,
-      periodMs: 14000,
-      events: CHROME_MENU_FLOW_4_CYCLE_OFFSETS,
+      periodMs: 16000,
+      events: CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
     }),
+  }),
+  'chrome-to-ingame': Object.freeze({
+    name: 'chrome-to-ingame',
+    events: buildChromeToIngameEvents(),
   }),
 });
 
@@ -2683,7 +2777,7 @@ export class InputBridge {
    * Notifies the bridge that the guest runtime has produced its first non-black visible
    * frame (`FIRST_VISIBLE_FRAME`, which also implies `FIRST_PRESENT`).
    * Starts any pending milestone-armed script immediately and cancels any fallback timer.
-   * When an anchorable menu preset (`menu-to-ingame`, `chrome-menu-flow-4`,
+   * When an anchorable menu preset (`menu-to-ingame`, `chrome-to-ingame`, `chrome-menu-flow-4`,
    * `chrome-menu-flow-2`, `chrome-menu-flow`) already started earlier (e.g. via
    * `FIRST_PRESENT`, `FIRST_PRESENT_FALLBACK`, or `immediate`) during a slow black
    * asset-loading screen, cleanly re-anchors the script clock to `FIRST_VISIBLE_FRAME`
