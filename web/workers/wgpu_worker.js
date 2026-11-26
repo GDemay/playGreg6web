@@ -2264,6 +2264,28 @@ class WgpuCommandProcessor {
     this._cachedCmdView = null;
     this._drainRingResultScratch = { frameCount: 0, presents: 0, bytesDrained: 0 };
     this._executeResultScratch = { frameCount: 0, presents: 0 };
+    // W363: Pre-allocated scratch descriptors for _handleWriteTexture (zero per-packet object alloc).
+    this._wtOriginScratch = { x: 0, y: 0, z: 0 };
+    this._wtDstScratch = { texture: null, mipLevel: 0, origin: this._wtOriginScratch };
+    this._wtSizeScratch = { width: 0, height: 0, depthOrArrayLayers: 1 };
+    this._wtLayoutOffsetOnlyScratch = { offset: 0 };
+    this._wtLayoutBprScratch = { offset: 0, bytesPerRow: 0 };
+    this._wtLayoutRpiScratch = { offset: 0, rowsPerImage: 0 };
+    this._wtLayoutFullScratch = { offset: 0, bytesPerRow: 0, rowsPerImage: 0 };
+    this._wtStageLayoutScratch = {
+      width: 0,
+      height: 0,
+      depthOrArrayLayers: 1,
+      mipLevel: 0,
+      origin: this._wtOriginScratch,
+      bytesPerRow: undefined,
+      rowsPerImage: undefined,
+    };
+    this._onWorkDoneFenceResolved = () => undefined;
+    this._onWorkDoneFenceRejected = (err) => {
+      this._noteWorkDoneFenceFailure(err);
+      return undefined;
+    };
     this._onZeroAllocDrainSpan = (bytesView, byteOffset, byteLength, span) => {
       this._zeroAllocDrainSpanBytes = byteLength;
       if (this.executeCommandBuffer !== WgpuCommandProcessor.prototype.executeCommandBuffer) {
@@ -3529,22 +3551,35 @@ class WgpuCommandProcessor {
   }
 
   _invalidateSpecializedPipelinesFor(pipelineId) {
+    if (
+      this._specializedFallbackPipelines.size === 0 &&
+      this._specializedFallbackBindGroups.size === 0
+    ) {
+      return;
+    }
     const prefix = `${pipelineId}|`;
-    for (const key of Array.from(this._specializedFallbackPipelines.keys())) {
-      if (key.startsWith(prefix)) {
-        this._specializedFallbackPipelines.delete(key);
+    if (this._specializedFallbackPipelines.size > 0) {
+      for (const key of this._specializedFallbackPipelines.keys()) {
+        if (key.startsWith(prefix)) {
+          this._specializedFallbackPipelines.delete(key);
+        }
       }
     }
-    for (const key of Array.from(this._specializedFallbackBindGroups.keys())) {
-      if (key.startsWith(prefix)) {
-        this._specializedFallbackBindGroups.delete(key);
+    if (this._specializedFallbackBindGroups.size > 0) {
+      for (const key of this._specializedFallbackBindGroups.keys()) {
+        if (key.startsWith(prefix)) {
+          this._specializedFallbackBindGroups.delete(key);
+        }
       }
     }
   }
 
   _invalidateSpecializedBindGroupsFor(bindGroupId) {
+    if (this._specializedFallbackBindGroups.size === 0) {
+      return;
+    }
     const suffix = `|${bindGroupId}`;
-    for (const key of Array.from(this._specializedFallbackBindGroups.keys())) {
+    for (const key of this._specializedFallbackBindGroups.keys()) {
       if (key.endsWith(suffix)) {
         this._specializedFallbackBindGroups.delete(key);
       }
@@ -5095,6 +5130,13 @@ class WgpuCommandProcessor {
     if (this._passCommands !== this._reusablePassCommands) {
       this._passCommands = this._reusablePassCommands;
     }
+    let ext = this.extension;
+    while (ext) {
+      if (typeof ext._releaseFramePools === 'function') {
+        ext._releaseFramePools();
+      }
+      ext = ext.next || null;
+    }
   }
 
   _getCachedDataView(buffer) {
@@ -6058,11 +6100,8 @@ class WgpuCommandProcessor {
     }
     try {
       return Promise.resolve(fence).then(
-        () => undefined,
-        (err) => {
-          this._noteWorkDoneFenceFailure(err);
-          return undefined;
-        }
+        this._onWorkDoneFenceResolved,
+        this._onWorkDoneFenceRejected
       );
     } catch (err) {
       this._noteWorkDoneFenceFailure(err);
@@ -9225,6 +9264,11 @@ class WgpuCommandProcessor {
 
     const data = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 48, dataLen);
 
+    const origin = this._wtOriginScratch;
+    origin.x = originX;
+    origin.y = originY;
+    origin.z = originZ;
+
     if (
       this.stagingPool &&
       !this.stagingPool._destroyed &&
@@ -9242,20 +9286,14 @@ class WgpuCommandProcessor {
       if (canStage) {
         const encoder = this._ensurePendingEncoder();
         if (encoder && typeof encoder.copyBufferToTexture === 'function') {
-          const layout = {
-            width,
-            height,
-            depthOrArrayLayers,
-            mipLevel,
-            origin: { x: originX, y: originY, z: originZ },
-          };
-          if (bytesPerRow > 0) {
-            layout.bytesPerRow = bytesPerRow;
-          }
-          if (rowsPerImage > 0) {
-            layout.rowsPerImage = rowsPerImage;
-          }
-          this.stagingPool.stageTextureUpload(encoder, texture, data, layout);
+          const stageLayout = this._wtStageLayoutScratch;
+          stageLayout.width = width;
+          stageLayout.height = height;
+          stageLayout.depthOrArrayLayers = depthOrArrayLayers;
+          stageLayout.mipLevel = mipLevel;
+          stageLayout.bytesPerRow = bytesPerRow > 0 ? bytesPerRow : undefined;
+          stageLayout.rowsPerImage = rowsPerImage > 0 ? rowsPerImage : undefined;
+          this.stagingPool.stageTextureUpload(encoder, texture, data, stageLayout);
           this._hasPendingUploadCommands = true;
           return;
         }
@@ -9265,27 +9303,37 @@ class WgpuCommandProcessor {
       }
     }
 
-    const dataLayout = { offset: 0 };
+    let dataLayout;
     if (bytesPerRow > 0) {
-      dataLayout.bytesPerRow = bytesPerRow;
-    }
-    if (rowsPerImage > 0) {
-      dataLayout.rowsPerImage = rowsPerImage;
-    }
-    this.device.queue.writeTexture(
-      {
-        texture,
-        mipLevel,
-        origin: { x: originX, y: originY, z: originZ },
-      },
-      data,
-      dataLayout,
-      {
-        width,
-        height,
-        depthOrArrayLayers,
+      if (rowsPerImage > 0) {
+        dataLayout = this._wtLayoutFullScratch;
+        dataLayout.bytesPerRow = bytesPerRow;
+        dataLayout.rowsPerImage = rowsPerImage;
+      } else {
+        dataLayout = this._wtLayoutBprScratch;
+        dataLayout.bytesPerRow = bytesPerRow;
       }
-    );
+    } else if (rowsPerImage > 0) {
+      dataLayout = this._wtLayoutRpiScratch;
+      dataLayout.rowsPerImage = rowsPerImage;
+    } else {
+      dataLayout = this._wtLayoutOffsetOnlyScratch;
+    }
+
+    const dst = this._wtDstScratch;
+    dst.texture = texture;
+    dst.mipLevel = mipLevel;
+
+    const size = this._wtSizeScratch;
+    size.width = width;
+    size.height = height;
+    size.depthOrArrayLayers = depthOrArrayLayers;
+
+    try {
+      this.device.queue.writeTexture(dst, data, dataLayout, size);
+    } finally {
+      dst.texture = null;
+    }
   }
 
   _handleCreateSampler(view, payloadOffset) {
@@ -9861,10 +9909,12 @@ class WgpuCommandProcessor {
     this.shaderModules.delete(id);
     this._shaderModuleGenerations.delete(id);
     this._inFlightRangedShaders.delete(id);
-    this._pendingRangedPipelines.delete(id);
-    for (const [pipeId, rec] of this._pendingRangedPipelines.entries()) {
-      if (rec && Array.isArray(rec.shaderIds) && rec.shaderIds.includes(id)) {
-        this._pendingRangedPipelines.delete(pipeId);
+    if (this._pendingRangedPipelines.size > 0) {
+      this._pendingRangedPipelines.delete(id);
+      for (const [pipeId, rec] of this._pendingRangedPipelines.entries()) {
+        if (rec && Array.isArray(rec.shaderIds) && rec.shaderIds.includes(id)) {
+          this._pendingRangedPipelines.delete(pipeId);
+        }
       }
     }
     this.pipelines.delete(id);
@@ -11073,7 +11123,12 @@ class WgpuCommandProcessor {
     ) {
       view = this._getCachedDataView(input);
       startOffset = 0;
-      endOffset = input.byteLength;
+      const optLen =
+        options && typeof options.byteLength === 'number' ? options.byteLength : -1;
+      endOffset =
+        optLen >= 0 && optLen <= input.byteLength && Number.isInteger(optLen)
+          ? optLen
+          : input.byteLength;
     } else if (ArrayBuffer.isView(input)) {
       view = this._getCachedDataView(input.buffer);
       startOffset = input.byteOffset;
@@ -14292,56 +14347,117 @@ function createWgpuWorkerHandler(options = {}) {
     return attachedRing;
   }
 
-  async function handleMessage(msg) {
+  // W363: Reusable options scratch + shared resolved promise for hot synchronous handleMessage paths
+  // (avoids per-message Uint8Array, options, and Promise/async-frame allocations).
+  const cmdBufferExecOpts = { reuseResult: true, byteLength: 0 };
+  const RESOLVED_VOID_PROMISE = Promise.resolve();
+
+  async function handleAsyncInitWithCanvas(payload) {
+    try {
+      preloadedInDefaultInit = false;
+      const created = await initGpu(
+        payload.canvas,
+        payload.width || 1280,
+        payload.height || 720,
+        payload
+      );
+      if (created && created !== processor) {
+        processor = created;
+        swapchain = created.swapchain || swapchain;
+        lastTelemetryEmitMs = -Infinity;
+        firstPresentNotified = false;
+        firstVisibleFrameNotified = false;
+        bindProcessorValidationErrors(processor);
+      }
+      if (
+        processor &&
+        pendingGuestMemory &&
+        processor._guestMemory !== pendingGuestMemory &&
+        typeof processor.attachGuestMemory === 'function'
+      ) {
+        processor.attachGuestMemory(pendingGuestMemory);
+      }
+      if (
+        processor &&
+        payload.enableResourceReplay !== undefined &&
+        typeof processor.setEnableResourceReplay === 'function'
+      ) {
+        processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
+      }
+      if (payload.ringSab || payload.ring) {
+        attachRingFromMessage(payload);
+      } else if (attachedRing && processor) {
+        processor.attachRing(attachedRing);
+      }
+      if (!preloadedInDefaultInit && processor) {
+        await preloadBootShaderAssets(processor, payload);
+      }
+    } catch (err) {
+      postMessage({ error: String(err) });
+    }
+  }
+
+  async function handleAsyncInitExisting(payload) {
+    try {
+      if (
+        payload.enableResourceReplay !== undefined &&
+        typeof processor.setEnableResourceReplay === 'function'
+      ) {
+        processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
+      }
+      await preloadBootShaderAssets(processor, payload);
+    } catch (err) {
+      postMessage({ error: String(err) });
+    }
+  }
+
+  async function handleAsyncLoadShaderPack(payload) {
+    try {
+      const packUrl =
+        typeof payload.loadShaderPack === 'string'
+          ? payload.loadShaderPack
+          : typeof payload.shaderPackUrl === 'string'
+            ? payload.shaderPackUrl
+            : typeof payload.url === 'string'
+              ? payload.url
+              : null;
+      const loadSummary = packUrl
+        ? await preloadBootShaderAssets(processor, {
+            ...payload,
+            shaderPackUrl: packUrl,
+          })
+        : { shaderPackLoaded: false, shaderPackShaders: 0 };
+      const packStats =
+        processor.wgslPackCache && typeof processor.wgslPackCache.getStats === 'function'
+          ? processor.wgslPackCache.getStats()
+          : null;
+      const packMode = packStats && typeof packStats.mode === 'string' ? packStats.mode : 'buffer';
+      postMessage({
+        id: payload.id,
+        shaderPackLoaded: loadSummary.shaderPackLoaded,
+        shaderCount: loadSummary.shaderPackShaders,
+        mode: packMode,
+        rangedPackActive: packMode === 'ranged' || packMode === 'mixed',
+        rangedPackThresholdBytes:
+          processor && processor._activeShaderPackStreamThresholdBytes !== undefined
+            ? toNonNegativeInt(
+                processor._activeShaderPackStreamThresholdBytes,
+                DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES
+              )
+            : DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
+      });
+    } catch (err) {
+      postMessage({ error: String(err) });
+    }
+  }
+
+  function handleMessage(msg) {
     const payload = msg || {};
     try {
       if (payload.init && payload.canvas) {
-        preloadedInDefaultInit = false;
-        const created = await initGpu(
-          payload.canvas,
-          payload.width || 1280,
-          payload.height || 720,
-          payload
-        );
-        if (created && created !== processor) {
-          processor = created;
-          swapchain = created.swapchain || swapchain;
-          lastTelemetryEmitMs = -Infinity;
-          firstPresentNotified = false;
-          firstVisibleFrameNotified = false;
-          bindProcessorValidationErrors(processor);
-        }
-        if (
-          processor &&
-          pendingGuestMemory &&
-          processor._guestMemory !== pendingGuestMemory &&
-          typeof processor.attachGuestMemory === 'function'
-        ) {
-          processor.attachGuestMemory(pendingGuestMemory);
-        }
-        if (
-          processor &&
-          payload.enableResourceReplay !== undefined &&
-          typeof processor.setEnableResourceReplay === 'function'
-        ) {
-          processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
-        }
-        if (payload.ringSab || payload.ring) {
-          attachRingFromMessage(payload);
-        } else if (attachedRing && processor) {
-          processor.attachRing(attachedRing);
-        }
-        if (!preloadedInDefaultInit && processor) {
-          await preloadBootShaderAssets(processor, payload);
-        }
+        return handleAsyncInitWithCanvas(payload);
       } else if (payload.init && processor) {
-        if (
-          payload.enableResourceReplay !== undefined &&
-          typeof processor.setEnableResourceReplay === 'function'
-        ) {
-          processor.setEnableResourceReplay(payload.enableResourceReplay !== false);
-        }
-        await preloadBootShaderAssets(processor, payload);
+        return handleAsyncInitExisting(payload);
       } else if (payload.resize && canvas) {
         const nextW = Math.max(1, payload.width | 0);
         const nextH = Math.max(1, payload.height | 0);
@@ -14398,39 +14514,7 @@ function createWgpuWorkerHandler(options = {}) {
           payload.type === 'loadShaderPack') &&
         processor
       ) {
-        const packUrl =
-          typeof payload.loadShaderPack === 'string'
-            ? payload.loadShaderPack
-            : typeof payload.shaderPackUrl === 'string'
-              ? payload.shaderPackUrl
-              : typeof payload.url === 'string'
-                ? payload.url
-                : null;
-        const loadSummary = packUrl
-          ? await preloadBootShaderAssets(processor, {
-              ...payload,
-              shaderPackUrl: packUrl,
-            })
-          : { shaderPackLoaded: false, shaderPackShaders: 0 };
-        const packStats =
-          processor.wgslPackCache && typeof processor.wgslPackCache.getStats === 'function'
-            ? processor.wgslPackCache.getStats()
-            : null;
-        const packMode = packStats && typeof packStats.mode === 'string' ? packStats.mode : 'buffer';
-        postMessage({
-          id: payload.id,
-          shaderPackLoaded: loadSummary.shaderPackLoaded,
-          shaderCount: loadSummary.shaderPackShaders,
-          mode: packMode,
-          rangedPackActive: packMode === 'ranged' || packMode === 'mixed',
-          rangedPackThresholdBytes:
-            processor && processor._activeShaderPackStreamThresholdBytes !== undefined
-              ? toNonNegativeInt(
-                  processor._activeShaderPackStreamThresholdBytes,
-                  DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES
-                )
-              : DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
-        });
+        return handleAsyncLoadShaderPack(payload);
       } else if (payload.type === 'request-gpu-telemetry') {
         emitTelemetry({
           id: payload.id,
@@ -14642,7 +14726,7 @@ function createWgpuWorkerHandler(options = {}) {
             errorReply.id = payload.id;
           }
           postMessage(errorReply);
-          return;
+          return RESOLVED_VOID_PROMISE;
         }
 
         if (processor.isDeviceRecovering === true) {
@@ -14659,7 +14743,7 @@ function createWgpuWorkerHandler(options = {}) {
             recoveringReply.id = payload.id;
           }
           postMessage(recoveringReply);
-          return;
+          return RESOLVED_VOID_PROMISE;
         }
 
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
@@ -14821,8 +14905,12 @@ function createWgpuWorkerHandler(options = {}) {
           rawBatchBuffer &&
           typeof rawBatchBuffer.byteLength === 'number' &&
           payload.byteLength <= rawBatchBuffer.byteLength;
+        const canPassDirectByteLength =
+          hasValidByteLength &&
+          (isRawArrayBuffer || isRawSharedBuffer) &&
+          processor.executeCommandBuffer === WgpuCommandProcessor.prototype.executeCommandBuffer;
         const batchInput =
-          hasValidByteLength && (isRawArrayBuffer || isRawSharedBuffer)
+          hasValidByteLength && (isRawArrayBuffer || isRawSharedBuffer) && !canPassDirectByteLength
             ? new Uint8Array(rawBatchBuffer, 0, payload.byteLength)
             : rawBatchBuffer;
         const shouldRecycle =
@@ -14849,7 +14937,12 @@ function createWgpuWorkerHandler(options = {}) {
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         let result;
         try {
-          result = processor.executeCommandBuffer(batchInput, DRAIN_RING_REUSE_OPTS);
+          if (canPassDirectByteLength) {
+            cmdBufferExecOpts.byteLength = payload.byteLength;
+            result = processor.executeCommandBuffer(batchInput, cmdBufferExecOpts);
+          } else {
+            result = processor.executeCommandBuffer(batchInput, DRAIN_RING_REUSE_OPTS);
+          }
         } finally {
           if (shouldRecycle) {
             if (processor._cachedCmdBuffer === rawBatchBuffer) {
@@ -14885,6 +14978,7 @@ function createWgpuWorkerHandler(options = {}) {
     } catch (err) {
       postMessage({ error: String(err) });
     }
+    return RESOLVED_VOID_PROMISE;
   }
 
   return {
@@ -14975,7 +15069,5 @@ if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
         ? self.postMessage(data, transfer)
         : self.postMessage(data),
   });
-  self.onmessage = async (ev) => {
-    await workerHandler.handleMessage(ev ? ev.data : null);
-  };
+  self.onmessage = (ev) => workerHandler.handleMessage(ev ? ev.data : null);
 }
