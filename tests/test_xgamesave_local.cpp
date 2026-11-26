@@ -106,8 +106,11 @@ void test_errors(const fs::path& base) {
     CHECK(store.submit_update("c", {{"", bytes("x")}}, {}) == E_INVALIDARG_HR);
     CHECK(store.submit_update("c", {{std::string(129, 'b'), bytes("x")}}, {}) == E_INVALIDARG_HR);
     CHECK(store.submit_update("c", {}, {""}) == E_INVALIDARG_HR);
-    CHECK(store.submit_update("c", {{"big", std::vector<uint8_t>(gs::kMaxBlobBytes + 1)}}, {}) == E_INVALIDARG_HR);
-    CHECK(store.enumerate_blobs("c", &blobs) == S_OK_HR && blobs.empty());
+    CHECK(store.submit_update("c", {{"big", std::vector<uint8_t>(gs::kMaxBlobBytes + 1)}}, {}) == gs::E_GS_UPDATE_TOO_BIG);
+    CHECK(store.submit_update("c", {{"a", std::vector<uint8_t>(gs::kMaxBlobBytes / 2 + 1)}, {"b", std::vector<uint8_t>(gs::kMaxBlobBytes / 2)}}, {}) == gs::E_GS_UPDATE_TOO_BIG);
+    CHECK(store.submit_update("c", {{"a", std::vector<uint8_t>(gs::kMaxBlobBytes / 2)}, {"b", std::vector<uint8_t>(gs::kMaxBlobBytes / 2)}}, {}) == S_OK_HR);
+    CHECK(gs::E_GS_UPDATE_TOO_BIG == static_cast<playgta6::os::gdk::HResult>(0x80830005u) && gs::E_GS_QUOTA_EXCEEDED == static_cast<playgta6::os::gdk::HResult>(0x80830006u) && gs::E_GS_PROVIDED_BUFFER_TOO_SMALL == static_cast<playgta6::os::gdk::HResult>(0x80830007u) && gs::E_GS_BLOB_NOT_FOUND == static_cast<playgta6::os::gdk::HResult>(0x80830008u));
+    CHECK(store.enumerate_blobs("c", &blobs) == S_OK_HR && blobs.size() == 2);
 }
 
 void test_quota_and_atomicity(const fs::path& base) {
@@ -215,6 +218,30 @@ void test_container_info(const fs::path& base) {
 
 }  // namespace
 
+void test_crash_between_swap_steps(const fs::path& base) {
+    const fs::path root = base / "crash";
+    for (int point = 1; point <= 2; ++point) {
+        gs::Store store((root / std::to_string(point)).string());
+        CHECK(store.create_container("S") == S_OK_HR);
+        CHECK(store.submit_update("S", {{"a", bytes("old-a")}, {"b", bytes("old-b")}}, {}) == S_OK_HR);
+        gs::Store::set_test_crash_point(point);
+        CHECK(store.submit_update("S", {{"a", bytes("new-a")}, {"c", bytes("new-c")}}, {"b"}) != S_OK_HR);
+        gs::Store::set_test_crash_point(0);
+        // A new Store on the same root recovers: the container is whole and is the old version.
+        gs::Store again((root / std::to_string(point)).string());
+        std::vector<gs::BlobInfo> blobs;
+        CHECK(again.enumerate_blobs("S", &blobs) == S_OK_HR && blobs.size() == 2);
+        std::vector<uint8_t> out;
+        CHECK(again.read_blob("S", "a", &out) == S_OK_HR && out == bytes("old-a"));
+        CHECK(again.read_blob("S", "b", &out) == S_OK_HR && out == bytes("old-b"));
+        CHECK(again.read_blob("S", "c", &out) == gs::E_GS_BLOB_NOT_FOUND);
+        // And a following update works.
+        CHECK(again.submit_update("S", {{"a", bytes("new-a")}}, {"b"}) == S_OK_HR);
+        CHECK(again.read_blob("S", "a", &out) == S_OK_HR && out == bytes("new-a"));
+        CHECK(again.read_blob("S", "b", &out) == gs::E_GS_BLOB_NOT_FOUND);
+    }
+}
+
 int main() {
     const fs::path base = fs::temp_directory_path() / "pg6_o34_store_test";
     fs::remove_all(base);
@@ -225,6 +252,7 @@ int main() {
     test_persistence_and_stale_temps(base);
     test_display_name(base);
     test_container_info(base);
+    test_crash_between_swap_steps(base);
     fs::remove_all(base);
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
