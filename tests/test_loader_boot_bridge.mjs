@@ -4045,3 +4045,198 @@ test('W358 loader.js gpuWorker.onmessage forwards swapchainProbe* telemetry end-
   assert.equal(mainMessages[1].swapchainProbeSupported, true);
   assert.equal(mainMessages[1].swapchainProbeErrorCount, 1);
 });
+
+test('W360 buildRuntimeModuleConfig posts attach-guest-memory without wgpuSubmit and re-posts after WebAssembly.Memory.grow()', () => {
+  // 1. options.memory already provided -> attaches immediately, no duplicate on unchanged check, re-attaches after grow().
+  const posted1 = [];
+  const mockGpuWorker1 = {
+    postMessage(msg) {
+      posted1.push(msg);
+    },
+  };
+  const sharedMem1 = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const initialBuf1 = sharedMem1.buffer;
+  const cfg1 = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker1,
+    memory: sharedMem1,
+    reportFn: () => {},
+  });
+
+  assert.equal(posted1.length, 1);
+  assert.equal(posted1[0].type, 'attach-guest-memory');
+  assert.equal(posted1[0].buffer, initialBuf1);
+
+  // Repeated check with unchanged buffer is an O(1) no-op.
+  assert.equal(cfg1.attachGuestMemory(), false);
+  assert.equal(posted1.length, 1);
+
+  // Growing shared memory produces a new SharedArrayBuffer; re-attaching posts the new buffer.
+  sharedMem1.grow(1);
+  const grownBuf1 = sharedMem1.buffer;
+  assert.notEqual(grownBuf1, initialBuf1);
+  assert.equal(cfg1.attachGuestMemory(), true);
+  assert.equal(posted1.length, 2);
+  assert.equal(posted1[1].type, 'attach-guest-memory');
+  assert.equal(posted1[1].buffer, grownBuf1);
+
+  // 2. Real-Chrome path (no options.memory): preRun / onRuntimeInitialized attach without wgpuSubmit ever being called.
+  const posted2 = [];
+  const mockGpuWorker2 = {
+    postMessage(msg) {
+      posted2.push(msg);
+    },
+  };
+  const sharedMem2 = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const cfg2 = buildRuntimeModuleConfig({
+    gpuWorker: mockGpuWorker2,
+    reportFn: () => {},
+  });
+  assert.equal(posted2.length, 0);
+
+  const mockRuntimeMod = { wasmMemory: sharedMem2 };
+  cfg2.preRun[0](mockRuntimeMod);
+  assert.equal(posted2.length, 1);
+  assert.equal(posted2[0].type, 'attach-guest-memory');
+  assert.equal(posted2[0].buffer, sharedMem2.buffer);
+
+  // onRuntimeInitialized with unchanged memory does not duplicate.
+  cfg2.onRuntimeInitialized.call(mockRuntimeMod);
+  assert.equal(posted2.length, 1);
+
+  // After Memory.grow(), host_log (or onRuntimeInitialized) automatically re-sends the grown SAB.
+  sharedMem2.grow(1);
+  const grownBuf2 = sharedMem2.buffer;
+  cfg2.hostImports.env.host_log(0, 0);
+  assert.equal(posted2.length, 2);
+  assert.equal(posted2[1].type, 'attach-guest-memory');
+  assert.equal(posted2[1].buffer, grownBuf2);
+});
+
+test('W360 loader.js SPSC gpu_ring boot attaches guest memory on runtime boot and re-attaches after grow() without wgpuSubmit', async () => {
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    postMessage() {}
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const sharedMem = new WebAssembly.Memory({ initial: 1, maximum: 4, shared: true });
+  const initialBuf = sharedMem.buffer;
+  let runtimeBootedResolve = null;
+  const runtimeBooted = new Promise((resolve) => {
+    runtimeBootedResolve = resolve;
+  });
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage() {},
+    createRuntimeModule: async (moduleConfig) => {
+      const mod = { wasmMemory: sharedMem };
+      if (Array.isArray(moduleConfig.preRun)) {
+        for (const fn of moduleConfig.preRun) fn(mod);
+      }
+      if (typeof moduleConfig.onRuntimeInitialized === 'function') {
+        moduleConfig.onRuntimeInitialized.call(mod);
+      }
+      runtimeBootedResolve(mod);
+      return mod;
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    WebAssembly,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async (url) => {
+      if (String(url).includes('dist/runtime.js')) {
+        return { ok: true, status: 200 };
+      }
+      return { ok: false, status: 404 };
+    },
+    importScripts(scriptPath) {
+      if (String(scriptPath).includes('dist/runtime.js')) {
+        return;
+      }
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      dataBase: '/data/',
+    },
+  });
+
+  const ioWorker = workersByScript.get('./workers/io_worker.js');
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  const audioWorker = workersByScript.get('./workers/audio_worker.js');
+  assert.ok(ioWorker && gpuWorker && audioWorker);
+
+  // Mark all 3 workers ready to trigger tryBootWasmRuntime() — wgpuSubmit is NEVER called!
+  ioWorker.onmessage({ data: { ready: true, summary: 'ok' } });
+  gpuWorker.onmessage({ data: { ready: true, adapter: 'mock' } });
+  audioWorker.onmessage({ data: { ready: true } });
+
+  await runtimeBooted;
+  await new Promise((r) => setTimeout(r, 10));
+
+  const attachPosts1 = gpuWorker.posted.filter((m) => m && m.type === 'attach-guest-memory');
+  assert.equal(attachPosts1.length, 1);
+  assert.equal(attachPosts1[0].buffer, initialBuf);
+
+  // Grow guest memory, then notify GPU ring drain via loader -> new SAB must be posted BEFORE drain-ring!
+  sharedMem.grow(1);
+  const grownBuf = sharedMem.buffer;
+  assert.notEqual(grownBuf, initialBuf);
+
+  workerSelf.onmessage({ data: { type: 'drain-ring' } });
+  const attachPosts2 = gpuWorker.posted.filter((m) => m && m.type === 'attach-guest-memory');
+  assert.equal(attachPosts2.length, 2);
+  assert.equal(attachPosts2[1].buffer, grownBuf);
+  const lastTwo = gpuWorker.posted.slice(-2);
+  assert.equal(lastTwo[0].type, 'attach-guest-memory');
+  assert.equal(lastTwo[0].buffer, grownBuf);
+  assert.equal(lastTwo[1].type, 'drain-ring');
+});

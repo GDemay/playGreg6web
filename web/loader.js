@@ -3847,11 +3847,17 @@ function createInstantiateWasmHandler(options = {}) {
   // upon handing to `WebAssembly.instantiate` so the closure retains 0 wire bytes.
   let pendingWireBytes = precompiledModule ? null : options.wasmBinary || null;
   const onError = typeof options.onError === 'function' ? options.onError : null;
+  const onMemory = typeof options.onMemory === 'function' ? options.onMemory : null;
 
   return function instantiateWasm(imports, receiveInstance) {
     const importedMemory = extractMemoryFromImports(imports);
-    if (importedMemory && hostImports && typeof hostImports.setMemory === 'function') {
-      hostImports.setMemory(importedMemory);
+    if (importedMemory) {
+      if (hostImports && typeof hostImports.setMemory === 'function') {
+        hostImports.setMemory(importedMemory);
+      }
+      if (onMemory) {
+        onMemory(importedMemory);
+      }
     }
 
     const mergedImports = mergeHostImportsIntoWasmImports(
@@ -3865,14 +3871,13 @@ function createInstantiateWasmHandler(options = {}) {
         result && result.module
           ? result.module
           : precompiledModule || undefined;
-      if (
-        instance &&
-        instance.exports &&
-        instance.exports.memory &&
-        hostImports &&
-        typeof hostImports.setMemory === 'function'
-      ) {
-        hostImports.setMemory(instance.exports.memory);
+      if (instance && instance.exports && instance.exports.memory) {
+        if (hostImports && typeof hostImports.setMemory === 'function') {
+          hostImports.setMemory(instance.exports.memory);
+        }
+        if (onMemory) {
+          onMemory(instance.exports.memory);
+        }
       }
       if (typeof receiveInstance === 'function') {
         receiveInstance(instance, mod);
@@ -6114,43 +6119,69 @@ function buildRuntimeModuleConfig(options = {}) {
     options.httpfsClient !== undefined ? options.httpfsClient : httpfsClient;
   const activeUserdataStore =
     options.userdataStore !== undefined ? options.userdataStore : userdataStore;
-  const activeGpuWorker = options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
+  const resolveTargetGpuWorker = () =>
+    options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
 
-  // G66 read-back: the GPU worker writes ReadbackBuffer / ReadbackTexture results straight into
-  // the runtime's shared memory, so it gets the current SharedArrayBuffer (again after a grow).
+  // G66 / W360 read-back: the GPU worker writes ReadbackBuffer / ReadbackTexture results straight
+  // into the runtime's shared memory, so it must receive the current SharedArrayBuffer on ALL live
+  // paths (including SPSC gpu_ring, instantiateWasm, preRun, onRuntimeInitialized, and after any
+  // WebAssembly.Memory.grow() — O(1) reference equality check when unchanged).
+  let instantiatedMemory = null;
   let attachedGuestMemory = null;
-  const attachGuestMemoryToGpuWorker = () => {
+  let attachedGuestMemoryWorker = null;
+  const resolveRuntimeMemory = (modOverride, memoryOverride) => {
+    const targetMod =
+      modOverride && typeof modOverride === 'object' ? modOverride : boundModule;
+    return (
+      memoryOverride ||
+      options.memory ||
+      (targetMod &&
+        (targetMod.wasmMemory ||
+          (targetMod.HEAPU8 && targetMod.HEAPU8.buffer) ||
+          (targetMod.HEAP32 && targetMod.HEAP32.buffer) ||
+          (targetMod.asm && targetMod.asm.memory) ||
+          (targetMod.wasmExports && targetMod.wasmExports.memory))) ||
+      instantiatedMemory ||
+      null
+    );
+  };
+  const attachGuestMemoryToGpuWorker = (modOverride, memoryOverride) => {
+    const targetWorker = resolveTargetGpuWorker();
+    if (!targetWorker || typeof targetWorker.postMessage !== 'function') {
+      return false;
+    }
     let buffer = null;
     try {
-      buffer = resolveBuffer(
-        options.memory ||
-          (boundModule &&
-            (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
-          null
-      );
+      buffer = resolveBuffer(resolveRuntimeMemory(modOverride, memoryOverride));
     } catch {
       buffer = null;
     }
     if (
       !buffer ||
-      buffer === attachedGuestMemory ||
+      (buffer === attachedGuestMemory && targetWorker === attachedGuestMemoryWorker) ||
       typeof SharedArrayBuffer === 'undefined' ||
       !(buffer instanceof SharedArrayBuffer)
     ) {
-      return;
+      return false;
     }
     attachedGuestMemory = buffer;
-    activeGpuWorker.postMessage({ type: 'attach-guest-memory', buffer });
+    attachedGuestMemoryWorker = targetWorker;
+    targetWorker.postMessage({ type: 'attach-guest-memory', buffer });
+    return true;
   };
+  // Attach immediately when options.memory is already a SharedArrayBuffer / shared Wasm memory.
+  attachGuestMemoryToGpuWorker();
+
   const wgpuSubmit =
     typeof options.wgpuSubmit === 'function'
       ? options.wgpuSubmit
       : (bytes) => {
-          if (!activeGpuWorker) return;
+          const targetWorker = resolveTargetGpuWorker();
+          if (!targetWorker || typeof targetWorker.postMessage !== 'function') return;
           const cmdBuffer = toTransferableArrayBuffer(bytes);
           if (!cmdBuffer) return;
           attachGuestMemoryToGpuWorker();
-          activeGpuWorker.postMessage({ cmdBuffer }, [cmdBuffer]);
+          targetWorker.postMessage({ cmdBuffer }, [cmdBuffer]);
         };
 
   const userLogFn =
@@ -6194,11 +6225,11 @@ function buildRuntimeModuleConfig(options = {}) {
       ? options.hostImports
       : createHostImports({
           memory: options.memory || null,
-          getMemory: () =>
-            options.memory ||
-            (boundModule &&
-              (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
-            null,
+          getMemory: () => {
+            const mem = resolveRuntimeMemory();
+            attachGuestMemoryToGpuWorker(null, mem);
+            return mem;
+          },
           log: logFn,
           report: activeReportFn,
           wgpuSubmit,
@@ -6327,17 +6358,16 @@ function buildRuntimeModuleConfig(options = {}) {
   };
 
   const preRun = Array.isArray(options.preRun)
-    ? pipelineDumpSyncer && pipelineDumpSyncer.enabled
-      ? [
-          (mod) => {
-            if (mod && !boundModule) {
-              boundModule = mod;
-            }
-            attachPipelineDumpSyncer(mod);
-          },
-          ...options.preRun,
-        ]
-      : options.preRun
+    ? [
+        (mod) => {
+          if (mod && !boundModule) {
+            boundModule = mod;
+          }
+          attachGuestMemoryToGpuWorker(mod);
+          attachPipelineDumpSyncer(mod);
+        },
+        ...options.preRun,
+      ]
     : [
         (mod) => {
           boundModule = mod || null;
@@ -6351,6 +6381,7 @@ function buildRuntimeModuleConfig(options = {}) {
           ) {
             activeHostImports.setMemory(mod.wasmMemory || mod.HEAPU8.buffer);
           }
+          attachGuestMemoryToGpuWorker(mod);
           attachPipelineDumpSyncer(mod);
           if (!activeUserdataStore || !mod || !mod.FS) return;
           const useRunDep =
@@ -6384,16 +6415,6 @@ function buildRuntimeModuleConfig(options = {}) {
   const activeInputSab = options.inputSab !== undefined ? options.inputSab : inputSab;
   let activeInputBridge = null;
 
-  const resolveRuntimeMemory = () =>
-    options.memory ||
-    (boundModule &&
-      (boundModule.wasmMemory ||
-        (boundModule.HEAPU8 && boundModule.HEAPU8.buffer) ||
-        (boundModule.HEAP32 && boundModule.HEAP32.buffer) ||
-        (boundModule.asm && boundModule.asm.memory) ||
-        (boundModule.wasmExports && boundModule.wasmExports.memory))) ||
-    null;
-
   const stopInputBridge = () => {
     if (activeInputBridge) {
       try {
@@ -6416,15 +6437,11 @@ function buildRuntimeModuleConfig(options = {}) {
     const bridge = startInputSabBridge({
       inputSab: activeInputSab,
       module: targetMod,
-      getMemory: () =>
-        resolveRuntimeMemory() ||
-        (targetMod &&
-          (targetMod.wasmMemory ||
-            (targetMod.HEAPU8 && targetMod.HEAPU8.buffer) ||
-            (targetMod.HEAP32 && targetMod.HEAP32.buffer) ||
-            (targetMod.asm && targetMod.asm.memory) ||
-            (targetMod.wasmExports && targetMod.wasmExports.memory))) ||
-        null,
+      getMemory: () => {
+        const mem = resolveRuntimeMemory(targetMod);
+        attachGuestMemoryToGpuWorker(targetMod, mem);
+        return mem;
+      },
       pollIntervalMs: options.inputPollIntervalMs,
     });
     if (bridge && bridge.active) {
@@ -6546,6 +6563,9 @@ function buildRuntimeModuleConfig(options = {}) {
     stopInputBridge();
     audioRingController.destroy();
     boundModule = null;
+    instantiatedMemory = null;
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -6555,6 +6575,8 @@ function buildRuntimeModuleConfig(options = {}) {
   const resetRuntimeConfig = () => {
     stopInputBridge();
     audioRingController.reset();
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
   };
 
   const userOnRuntimeInitialized =
@@ -6576,6 +6598,7 @@ function buildRuntimeModuleConfig(options = {}) {
         }
       }
     }
+    attachGuestMemoryToGpuWorker(mod);
     attachPipelineDumpSyncer(mod);
     attachInputBridge(mod);
     attachAudioRing(mod);
@@ -6589,6 +6612,9 @@ function buildRuntimeModuleConfig(options = {}) {
     stopInputBridge();
     resetAudioRingAttachment();
     boundModule = null;
+    instantiatedMemory = null;
+    attachedGuestMemory = null;
+    attachedGuestMemoryWorker = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -6614,6 +6640,7 @@ function buildRuntimeModuleConfig(options = {}) {
       ? options.httpfsMailboxSabs.slice()
       : httpfsMailboxSabs.slice(),
     inputSab: activeInputSab,
+    attachGuestMemory: attachGuestMemoryToGpuWorker,
     attachInputBridge,
     stopInputBridge,
     getInputBridge: () => activeInputBridge,
@@ -6686,6 +6713,10 @@ function buildRuntimeModuleConfig(options = {}) {
       fetchFn: options.fetchFn,
       wasmBinary: options.wasmBinary,
       onError: options.onWasmError,
+      onMemory: (mem) => {
+        instantiatedMemory = mem || null;
+        attachGuestMemoryToGpuWorker(null, mem);
+      },
     });
   }
 
@@ -7562,6 +7593,22 @@ let pendingPreloadedWasmBinary = null;
 let pendingPreloadedGuestBuffers = null;
 const coordinatorSharedWasmModules = createSharedWasmModuleCache({ trackGlobalCount: true });
 
+function attachActiveCoordinatorGuestMemory(modOverride) {
+  if (
+    activeCoordinatorModuleConfig &&
+    typeof activeCoordinatorModuleConfig.attachGuestMemory === 'function'
+  ) {
+    try {
+      return activeCoordinatorModuleConfig.attachGuestMemory(
+        modOverride !== undefined ? modOverride : activeCoordinatorRuntimeModule,
+      );
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 // W345: Keep pthread GPU submits flowing through the coordinator's multiplexed `txPort`
 // so `FIRST_PRESENT` detection (`GPU_OPCODE_PRESENT = 7`), audio-ring milestone delivery,
 // and `pthreadActiveTxPorts` telemetry stay intact, while transferring the received
@@ -7615,6 +7662,7 @@ function handlePthreadWgpuSubmit(data, options = {}) {
     }
   }
   if (gpuWorker && typeof gpuWorker.postMessage === 'function') {
+    attachActiveCoordinatorGuestMemory();
     gpuWorker.postMessage({ cmdBuffer: transferBuf }, [transferBuf]);
     return true;
   }
@@ -7868,6 +7916,9 @@ async function tryBootWasmRuntime() {
       }
       const runtimeMod = await self.createRuntimeModule(moduleConfig);
       activeCoordinatorRuntimeModule = runtimeMod;
+      if (typeof moduleConfig.attachGuestMemory === 'function') {
+        moduleConfig.attachGuestMemory(runtimeMod);
+      }
       if (typeof moduleConfig.attachInputBridge === 'function') {
         const attached = moduleConfig.attachInputBridge(runtimeMod);
         if (attached && attached.active) {
@@ -8021,6 +8072,18 @@ if (typeof self !== 'undefined') {
       gpuWorker.postMessage({ resize: true, width: msg.width, height: msg.height });
       return;
     }
+    if (
+      (msg.attachRing ||
+        msg.drainRing ||
+        msg.type === 'attach-ring' ||
+        msg.type === 'drain-ring') &&
+      gpuWorker &&
+      typeof gpuWorker.postMessage === 'function'
+    ) {
+      attachActiveCoordinatorGuestMemory();
+      gpuWorker.postMessage(msg);
+      return;
+    }
 
     if (!msg.canvas) return;
     coordinatorPthreadPool.closeTxPorts();
@@ -8126,14 +8189,20 @@ if (typeof self !== 'undefined') {
       const data = e && e.data;
       if (!data || typeof data !== 'object') return;
       if (data.ready) {
+        attachActiveCoordinatorGuestMemory();
         onWorkerReady('wgpu_worker', data.adapter);
         return;
       }
+      if (data.ringAttached) {
+        attachActiveCoordinatorGuestMemory();
+      }
       if (data.type === 'first-visible-frame' || data.type === 'visible-frame') {
+        attachActiveCoordinatorGuestMemory();
         forwardGpuWorkerMessage(data, postToMain);
         return;
       }
       if (data.frame) {
+        attachActiveCoordinatorGuestMemory();
         if (
           activeCoordinatorModuleConfig &&
           typeof activeCoordinatorModuleConfig.notifyGuestMilestone === 'function'
