@@ -2,6 +2,8 @@
 // Pure ES module with zero external dependencies — runs in Web Workers and Node.js.
 // Binary layout matches shaders/src/pack.rs and shaders/src/convert.rs byte-for-byte.
 
+import { applyRtBvhPrelude } from './rt_bvh_prelude.js';
+
 /** Binary pack file magic ("WGPK"). */
 export const WGPK_MAGIC = 'WGPK';
 
@@ -4930,7 +4932,7 @@ export class WgslPackCache {
 
     const shaderModule = device.createShaderModule({
       label,
-      code: entry.wgsl,
+      code: applyRtBvhPrelude(entry.wgsl),
     });
 
     deviceMap.set(key, shaderModule);
@@ -5005,7 +5007,7 @@ export class WgslPackCache {
 
     const shaderModule = device.createShaderModule({
       label,
-      code,
+      code: applyRtBvhPrelude(code),
     });
 
     deviceMap.set(key, shaderModule);
