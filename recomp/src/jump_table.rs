@@ -41,7 +41,8 @@
 //! jump unresolved; nothing is guessed.
 
 use iced_x86::{
-    FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess, OpKind, Register,
+    Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
+    OpKind, Register,
 };
 
 use crate::cfg::{JumpTable, JumpTableIndex, UnresolvedJump};
@@ -418,7 +419,8 @@ const MAX_LEAF_GAP: u64 = 0x1000;
 /// A matched table load (`[base + index*scale]` on a known table base, the dispatch shape of a
 /// compiled switch) whose index bound the slice cannot prove, e.g. a remainder computed by a loop
 /// or a merge with several incoming paths. The table is read from index 0 while entries land
-/// inside the `.pdata` function that contains the jump; the first entry that does not ends it.
+/// inside the `.pdata` function that contains the jump, each on an instruction start
+/// ([`Boundaries`]); the first entry that does not ends it.
 /// Over-reading only adds case blocks inside the function, under-reading leaves a value to the
 /// runtime dispatcher (see [`JumpTable::inferred`]). A jump outside every `.pdata` range is in a
 /// leaf function (no unwind data): its cases are taken from the jump to the next discovered
@@ -464,6 +466,7 @@ fn infer_extent(
     let cap = limit
         .min(MAX_INFERRED_ENTRIES)
         .min(usize::try_from(MAX_JUMP_TABLE_ENTRIES).unwrap_or(usize::MAX));
+    let mut boundaries = Boundaries::default();
     let mut targets = Vec::new();
     let mut va = table;
     while targets.len() < cap {
@@ -473,7 +476,13 @@ fn infer_extent(
         let Some(target) = encoding.decode(chunk) else {
             break;
         };
-        if image.code_bytes(target).is_err() || !inside(target) {
+        // An entry inside an instruction is not a case: it is past the table's end (e.g. the
+        // next table, whose entries are relative to another base).
+        let sweep_from = leaf_gap.map(|(start, _)| start);
+        if image.code_bytes(target).is_err()
+            || !inside(target)
+            || !boundaries.on_boundary(image, target, sweep_from)
+        {
             break;
         }
         targets.push(target);
@@ -490,6 +499,74 @@ fn infer_extent(
         index: None,
         inferred: true,
     })
+}
+
+/// Longest linear sweep (bytes) [`Boundaries`] decodes to place one target.
+const MAX_SWEEP_BYTES: u64 = 1 << 20;
+
+/// Instruction starts of a linear sweep over code, used to reject table entries that land inside
+/// an instruction. A `.pdata` chunk holds only code, so decoding it from its start yields its
+/// real instruction boundaries; a leaf function's span is swept from the given start (the
+/// instruction after the dispatch). A target the sweep cannot place (no chunk, too far, invalid
+/// bytes before it) counts as not on a boundary: the entry is not taken, never guessed.
+#[derive(Default)]
+struct Boundaries {
+    /// `(sweep start, instruction starts)` of the sweeps done so far.
+    sweeps: Vec<(u64, Vec<u64>)>,
+}
+
+impl Boundaries {
+    fn on_boundary(&mut self, image: &CodeImage<'_>, target: u64, start: Option<u64>) -> bool {
+        let Some(start) = start.or_else(|| image.function_table.range_at(target).map(|r| r.start))
+        else {
+            return false;
+        };
+        if target < start || target - start > MAX_SWEEP_BYTES {
+            return false;
+        }
+        let idx = match self.sweeps.iter().position(|(s, _)| *s == start) {
+            Some(i) => i,
+            None => {
+                self.sweeps.push((start, Vec::new()));
+                self.sweeps.len() - 1
+            }
+        };
+        let starts = &mut self.sweeps[idx].1;
+        if starts.last().is_none_or(|&last| last < target) {
+            // Extend the sweep up to `target`.
+            let from = starts.last().copied().map_or(Some(start), |last| {
+                // Resume after the last decoded instruction.
+                image.code_bytes(last).ok().and_then(|b| {
+                    let mut d = Decoder::with_ip(64, b, last, DecoderOptions::NONE);
+                    let i = d.decode();
+                    (!i.is_invalid()).then(|| i.next_ip())
+                })
+            });
+            let Some(from) = from else {
+                return false;
+            };
+            if from <= target {
+                let Ok(bytes) = image.code_bytes(from) else {
+                    return false;
+                };
+                let len = usize::try_from(target - from + 1).unwrap_or(usize::MAX);
+                let bytes = &bytes[..bytes.len().min(len.saturating_add(15))];
+                let mut decoder = Decoder::with_ip(64, bytes, from, DecoderOptions::NONE);
+                let mut instr = Instruction::default();
+                while decoder.can_decode() {
+                    decoder.decode_out(&mut instr);
+                    if instr.is_invalid() {
+                        break;
+                    }
+                    starts.push(instr.ip());
+                    if instr.ip() >= target {
+                        break;
+                    }
+                }
+            }
+        }
+        starts.binary_search(&target).is_ok()
+    }
 }
 
 /// `len` initialised bytes at `va` from a single section, rejecting zero-length reads and VA
@@ -2693,6 +2770,30 @@ mod tests {
         let table = &analysis.jump_tables[&jmp_va];
         assert!(!table.inferred);
         assert_eq!(table.targets.len(), 256);
+    }
+
+    #[test]
+    fn inferred_extent_stops_at_an_entry_inside_an_instruction() {
+        // A loop-state index with no provable bound, its table followed directly by the next
+        // switch's table: read with the first table's base, the next entries land inside the
+        // function but not on an instruction start. The extent ends there; that entry and every
+        // later one (here a real case again) stay on the run-time dispatcher.
+        let (code, cases, jmp_va) = loop_remainder_switch();
+        let mut entries: Vec<u32> = cases[..3].iter().map(|va| (va - BASE) as u32).collect();
+        entries.push((cases[0] + 1 - BASE) as u32);
+        entries.push((cases[3] - BASE) as u32);
+        let data = rva_table(entries);
+        let analysis = analyze(&code, &data, &[0], &[(0, code.len() as u32, 0)]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(table.inferred);
+        assert_eq!(table.targets, cases[..3]);
+        assert_eq!(
+            jump_successors(&analysis.functions[&TEXT], jmp_va),
+            cases[..3]
+                .iter()
+                .map(|&c| Edge::JumpTable(c))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
