@@ -3995,5 +3995,14 @@ class T95ChromeMenuFlow4BootOptionsAndSwapchainProbeTests(unittest.TestCase):
             self.assertEqual(cmd_meta["input_script"], "chrome-to-ingame")
 
 
+class PlayLocalPresetParityTests(unittest.TestCase):
+    def test_play_local_validate_set_matches_run_browser_boot_presets(self) -> None:
+        text = (Path(__file__).resolve().parents[1] / "tools" / "play_local.ps1").read_text(encoding="utf-8")
+        m = re.search(r'\[ValidateSet\(([^)]*)\)\]\s*\[string\]\$InputScript', text)
+        self.assertIsNotNone(m)
+        listed = set(re.findall(r'"([^"]+)"', m.group(1)))
+        self.assertEqual(listed - {"none"}, set(rbb.ALLOWED_INPUT_SCRIPT_PRESETS))
+
+
 if __name__ == "__main__":
     unittest.main()
