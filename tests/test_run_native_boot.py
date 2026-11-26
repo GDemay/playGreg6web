@@ -467,14 +467,18 @@ class RunTests(unittest.TestCase):
         lines = [x.strip() for x in script.splitlines() if x.strip() and not x.startswith("#")]
         i = lines.index("repeat every 14s until draws_per_frame==37 for 500ms timeout 240s")
         self.assertEqual(lines[i + 1:i + 3], ["0 A 100", "end"])
-        # No A between reaching LEGAL NOTICES and Down, Down, A: a plain wait, B only while not 37.
-        self.assertEqual(lines[i + 3:i + 11],
+        # No A between reaching LEGAL NOTICES and the menu cycle: a plain wait, B only while not 37.
+        self.assertEqual(lines[i + 3:i + 8],
                          ["wait draws_per_frame==37 for 2s timeout 30s",
                           "repeat every 3s until draws_per_frame==37 for 1s timeout 30s", "0 B 150", "end",
-                          "500 DDown 150", "1200 DDown 150", "1900 A 100",
-                          "wait draws_per_frame!=37 for 2s timeout 60s"])
-        self.assertEqual(lines[i + 11], "capture")
-        after = lines[i + 12:]
+                          "repeat every 14s until draws_per_frame==33|50|51 for 1500ms timeout 240s"])
+        # Up x6 (cursor on Copyright), Down, Down ("Next >"), A; repeated until the next screen holds
+        # (44 is LEGAL NOTICES with the cursor moved, so "!= 37" is not a pass).
+        cycle = [e.split() for e in lines[i + 8:i + 17]]
+        self.assertEqual([e[1] for e in cycle], ["DUp"] * 6 + ["DDown", "DDown", "A"])
+        self.assertEqual(lines[i + 17:i + 19], ["end", "capture"])
+        self.assertFalse(any("draws_per_frame!=37" in x for x in lines))
+        after = lines[i + 19:]
         self.assertEqual(after[:5], ["repeat every 15s until draws_per_frame!=34 for 3s timeout 120s",
                                      "0 A 600", "2500 Menu 150", "4500 A 100", "end"])
         self.assertTrue(after[5].startswith("repeat every 12s until presents>="))
