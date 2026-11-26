@@ -703,3 +703,227 @@ fn r61_xmm_ymmh_vex128_and_vzeroupper_stay_bit_exact_wasm64() {
     assert_eq!(&out[2].mem[0][16..32], &vec2(132, 176), "xmm1 *4 across vzeroupper");
     assert_eq!(out[2].mem[1], vec![0u8; 256], "vzeroupper cleared ymmh0..15");
 }
+
+#[test]
+fn r62_vex128_and_vzeroupper_callers_skip_dead_ymmh_spills() {
+    const CALLER_VEX_VZU: u64 = 0x1000;
+    const CALLER_MIXED: u64 = 0x1100;
+    const CALLEE_LEAF: u64 = 0x1200;
+
+    let prog = Program::new()
+        // Uses VEX-128 + vzeroupper + direct and indirect calls, never reads any ymmh.
+        .asm(CALLER_VEX_VZU, |a| {
+            a.vxorps(xmm0, xmm0, xmm0)?;
+            a.vaddps(xmm1, xmm1, xmm0)?;
+            a.call(CALLEE_LEAF)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        })
+        // Reads ONLY ymm0 (`vmovdqu [rcx], ymm0`), also runs VEX-128 on xmm3 and `vzeroupper`
+        // across direct + indirect calls -> only `%ymmh0` gets an alloca and call-site spills!
+        .asm(CALLER_MIXED, |a| {
+            a.vmovdqu(ymmword_ptr(rcx), ymm0)?;
+            a.vxorps(xmm3, xmm3, xmm3)?;
+            a.call(CALLEE_LEAF)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        })
+        .asm(CALLEE_LEAF, |a| {
+            a.add(rax, rcx)?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let summaries = FlagSummaries::compute(functions.values());
+    // Callers still see conservative ymmh touch summaries (VEX-128 / vzeroupper / indirect call).
+    assert_eq!(summaries.touched(CALLER_VEX_VZU), Some(ALL));
+    assert_eq!(summaries.touched(CALLER_MIXED), Some(ALL));
+
+    let ir = lift_module(functions.values()).expect("lifts").ir;
+
+    let vex_vzu_ir = function_ir(&ir, CALLER_VEX_VZU);
+    assert!(
+        !vex_vzu_ir.contains("%ymmh"),
+        "VEX-128 + vzeroupper caller without ymmh reads must allocate 0 %ymmh slots:\n{vex_vzu_ir}"
+    );
+    assert!(
+        !vex_vzu_ir.contains("load <2 x i64>, ptr %state.ymmh"),
+        "VEX-128 + vzeroupper caller without ymmh reads must never load %state.ymmh:\n{vex_vzu_ir}"
+    );
+    assert!(
+        vex_vzu_ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8"),
+        "{vex_vzu_ir}"
+    );
+    assert!(
+        vex_vzu_ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh1, align 8"),
+        "{vex_vzu_ir}"
+    );
+    assert!(
+        vex_vzu_ir.contains(
+            "call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"
+        ),
+        "{vex_vzu_ir}"
+    );
+
+    let mixed_ir = function_ir(&ir, CALLER_MIXED);
+    assert!(
+        mixed_ir.contains("  %ymmh0 = alloca <2 x i64>\n"),
+        "mixed caller must allocate %ymmh0:\n{mixed_ir}"
+    );
+    for idx in 1..16 {
+        assert!(
+            !mixed_ir.contains(&format!("%ymmh{idx} = alloca")),
+            "mixed caller must not allocate unread %ymmh{idx}:\n{mixed_ir}"
+        );
+        assert!(
+            !mixed_ir.contains(&format!("load <2 x i64>, ptr %state.ymmh{idx}")),
+            "mixed caller must not load unread %state.ymmh{idx}:\n{mixed_ir}"
+        );
+    }
+}
+
+#[test]
+fn r62_unread_ymmh_direct_stores_and_vzeroupper_memset_wasm64() {
+    if !exec_or_skip("r62_unread_ymmh_direct_stores_and_vzeroupper_memset_wasm64") {
+        return;
+    }
+    const XMM_STATE: u64 = STATE_ADDR + STATE_XMM_OFFSET;
+    const YMMH_STATE: u64 = STATE_ADDR + STATE_YMM_HI_OFFSET;
+    const DATA_IN: u64 = 0x20_0000;
+    const DATA_OUT: u64 = 0x20_0100;
+
+    const F_WRITE_ONLY: u64 = CODE_BASE + 0x3000;
+    const F_VEX_CALL: u64 = CODE_BASE + 0x3100;
+    const F_MIXED_VZU: u64 = CODE_BASE + 0x3200;
+    const F_VZEROALL: u64 = CODE_BASE + 0x3300;
+    const F_CALLEE_GPR: u64 = CODE_BASE + 0x3400;
+    const F_CALLEE_YMM1: u64 = CODE_BASE + 0x3500;
+
+    let prog = Program::new()
+        // Writes ymm0 (256-bit) without reading ymm0, calls a GPR-only callee, then returns.
+        // GuestState::ymm_hi[0] must contain the exact upper 128 bits from [rcx+16..rcx+32].
+        .asm(F_WRITE_ONLY, |a| {
+            a.vmovdqu(ymm0, ymmword_ptr(rcx))?;
+            a.call(F_CALLEE_GPR)?;
+            a.ret()
+        })
+        // VEX-128 clears ONLY ymmh2, then calls a callee that doubles ymm1, then returns
+        // (must leave callee's ymmh1 intact and other ymmh lanes untouched!).
+        .asm(F_VEX_CALL, |a| {
+            a.vxorps(xmm2, xmm2, xmm2)?;
+            a.call(F_CALLEE_YMM1)?;
+            a.ret()
+        })
+        // Reads ONLY ymm0 (`vmovdqu [rdx], ymm0`), zeroes xmm3/ymmh3 via VEX-128, calls
+        // F_CALLEE_GPR, then `vzeroupper` clears all 16 ymmh while preserving xmm0..15.
+        .asm(F_MIXED_VZU, |a| {
+            a.vmovdqu(ymmword_ptr(rdx), ymm0)?;
+            a.vxorps(xmm3, xmm3, xmm3)?;
+            a.call(F_CALLEE_GPR)?;
+            a.vzeroupper()?;
+            a.ret()
+        })
+        // `vzeroall` with no ymmh reads clears all 16 xmm + all 16 ymmh.
+        .asm(F_VZEROALL, |a| {
+            a.vzeroall()?;
+            a.ret()
+        })
+        .asm(F_CALLEE_GPR, |a| {
+            a.add(rax, 1)?;
+            a.ret()
+        })
+        .asm(F_CALLEE_YMM1, |a| {
+            a.vpaddq(ymm1, ymm1, ymm1)?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let built = build("r62_ymmh_elision", functions.values());
+
+    let vec2 = |a: u64, b: u64| -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&a.to_le_bytes());
+        out[8..].copy_from_slice(&b.to_le_bytes());
+        out
+    };
+
+    // Case 0: write-only `vmovdqu ymm0, [rcx]` preserves upper 128 bits in GuestState::ymm_hi[0].
+    let mut c0 = Case::new(F_WRITE_ONLY).reg(RCX, DATA_IN);
+    let mut in32 = Vec::with_capacity(32);
+    in32.extend_from_slice(&vec2(0x1111_2222_3333_4444, 0x5555_6666_7777_8888));
+    in32.extend_from_slice(&vec2(0x9999_AAAA_BBBB_CCCC, 0xDDDD_EEEE_FFFF_0123));
+    c0.mem.push((DATA_IN, in32.clone()));
+    c0.mem.push((YMMH_STATE, vec![0x5Au8; 64]));
+    c0.read.push((XMM_STATE, 16));
+    c0.read.push((YMMH_STATE, 64));
+
+    // Case 1: VEX-128 clears ONLY ymmh2; callee doubles ymm1; ymmh0 & ymmh3 untouched.
+    let mut c1 = Case::new(F_VEX_CALL);
+    let mut xmm_in1 = vec![0u8; 64];
+    let mut ymmh_in1 = vec![0u8; 64];
+    xmm_in1[0..16].copy_from_slice(&vec2(1, 2));
+    ymmh_in1[0..16].copy_from_slice(&vec2(3, 4));
+    xmm_in1[16..32].copy_from_slice(&vec2(10, 20));
+    ymmh_in1[16..32].copy_from_slice(&vec2(30, 40));
+    xmm_in1[32..48].copy_from_slice(&vec2(55, 66));
+    ymmh_in1[32..48].copy_from_slice(&vec2(77, 88));
+    xmm_in1[48..64].copy_from_slice(&vec2(7, 8));
+    ymmh_in1[48..64].copy_from_slice(&vec2(9, 10));
+    c1.mem.push((XMM_STATE, xmm_in1));
+    c1.mem.push((YMMH_STATE, ymmh_in1));
+    c1.read.push((XMM_STATE, 64));
+    c1.read.push((YMMH_STATE, 64));
+
+    // Case 2: Mixed read ymm0 + VEX-128 xmm3 + call + vzeroupper.
+    let mut c2 = Case::new(F_MIXED_VZU).reg(RDX, DATA_OUT);
+    let mut xmm_in2 = vec![0u8; 64];
+    xmm_in2[0..16].copy_from_slice(&vec2(101, 102));
+    xmm_in2[48..64].copy_from_slice(&vec2(999, 888));
+    let mut ymmh_in2 = vec![0xCCu8; 256];
+    ymmh_in2[0..16].copy_from_slice(&vec2(201, 202));
+    c2.mem.push((XMM_STATE, xmm_in2));
+    c2.mem.push((YMMH_STATE, ymmh_in2));
+    c2.read.push((DATA_OUT, 32));
+    c2.read.push((XMM_STATE, 64));
+    c2.read.push((YMMH_STATE, 256));
+
+    // Case 3: `vzeroall` clears all 16 xmm and all 16 ymmh.
+    let mut c3 = Case::new(F_VZEROALL);
+    c3.mem.push((XMM_STATE, vec![0x77u8; 256]));
+    c3.mem.push((YMMH_STATE, vec![0x88u8; 256]));
+    c3.read.push((XMM_STATE, 256));
+    c3.read.push((YMMH_STATE, 256));
+
+    let out = run(&built, &[c0, c1, c2, c3]);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+
+    // Verify Case 0
+    assert_eq!(&out[0].mem[0][..16], &in32[..16], "xmm0 loaded");
+    assert_eq!(&out[0].mem[1][..16], &in32[16..32], "ymmh0 written directly to state");
+    assert_eq!(&out[0].mem[1][16..64], &vec![0x5Au8; 48], "other ymmh lanes untouched");
+
+    // Verify Case 1
+    assert_eq!(&out[1].mem[0][0..16], &vec2(1, 2), "xmm0 untouched");
+    assert_eq!(&out[1].mem[1][0..16], &vec2(3, 4), "ymmh0 untouched");
+    assert_eq!(&out[1].mem[0][16..32], &vec2(20, 40), "xmm1 doubled by callee");
+    assert_eq!(&out[1].mem[1][16..32], &vec2(60, 80), "ymmh1 doubled by callee");
+    assert_eq!(&out[1].mem[0][32..48], &vec2(0, 0), "vxorps zeroed xmm2");
+    assert_eq!(&out[1].mem[1][32..48], &vec2(0, 0), "vxorps zeroed ymmh2");
+    assert_eq!(&out[1].mem[0][48..64], &vec2(7, 8), "xmm3 untouched");
+    assert_eq!(&out[1].mem[1][48..64], &vec2(9, 10), "ymmh3 untouched");
+
+    // Verify Case 2
+    assert_eq!(&out[2].mem[0][0..16], &vec2(101, 102), "stored ymm0 low");
+    assert_eq!(&out[2].mem[0][16..32], &vec2(201, 202), "stored ymm0 high before vzeroupper");
+    assert_eq!(&out[2].mem[1][0..16], &vec2(101, 102), "xmm0 preserved across vzeroupper");
+    assert_eq!(&out[2].mem[1][48..64], &vec2(0, 0), "vxorps zeroed xmm3");
+    assert_eq!(out[2].mem[2], vec![0u8; 256], "vzeroupper cleared all 16 ymmh");
+
+    // Verify Case 3
+    assert_eq!(out[3].mem[0], vec![0u8; 256], "vzeroall cleared all 16 xmm");
+    assert_eq!(out[3].mem[1], vec![0u8; 256], "vzeroall cleared all 16 ymmh");
+}

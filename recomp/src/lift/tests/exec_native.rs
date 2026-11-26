@@ -563,3 +563,137 @@ entry:
     let status = Command::new(&exe).status().expect("run native R61");
     assert_eq!(status.code(), Some(0), "native R61 run failed");
 }
+
+#[test]
+fn r62_unread_ymmh_write_and_vzeroupper_memset_run_natively() {
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipping native R62 test: host is not x86-64");
+        return;
+    }
+    let Some(tool) = find_llvm_tool() else {
+        eprintln!("skipping native R62 test: no LLVM tool (llc/clang) found");
+        return;
+    };
+    let target = LiftTarget::native_host();
+    let triple = target.triple().to_string();
+    let dir = TempDir::new();
+
+    const WRITE_ONLY: u64 = G;
+    const VEX_ONLY: u64 = F + 0x200;
+    const VZU_ONLY: u64 = F + 0x300;
+
+    // Entry F:
+    // 1. Calls WRITE_ONLY (`vmovdqu ymm0, [rcx]` — writes ymm0 without reading ymm0!)
+    //    and checks ymmh0 low qword == 0x33 (`r8`) and xmm0 low qword == 0x11 (`rax`).
+    // 2. Calls VEX_ONLY (`vxorps xmm1, xmm1, xmm1` — zeroes only ymmh1, leaves ymmh0 untouched!)
+    //    and checks ymmh1 low qword == 0 (`r9`) and ymmh0 low qword == 0x33 (`r10`).
+    // 3. Calls VZU_ONLY (`vzeroupper` — bulk-memset clears ymmh0..15, preserves xmm0!)
+    //    and checks ymmh0 low qword == 0 (`r11`) and xmm0 low qword == 0x11 (`rdx`).
+    // Packs: rax | (r8 << 8) | (r9 << 16) | (r10 << 24) | (r11 << 32) | (rdx << 40)
+    //      = 0x0000_1100_3300_3311
+    let prog = Program::new()
+        .asm(F, |a| {
+            a.call(WRITE_ONLY)?;
+            a.movq(rax, xmm0)?;
+            a.vextracti128(xmm4, ymm0, 1)?;
+            a.movq(r8, xmm4)?;
+            a.call(VEX_ONLY)?;
+            a.vextracti128(xmm5, ymm1, 1)?;
+            a.movq(r9, xmm5)?;
+            a.vextracti128(xmm6, ymm0, 1)?;
+            a.movq(r10, xmm6)?;
+            a.call(VZU_ONLY)?;
+            a.vextracti128(xmm7, ymm0, 1)?;
+            a.movq(r11, xmm7)?;
+            a.movq(rdx, xmm0)?;
+            a.shl(r8, 8)?;
+            a.shl(r9, 16)?;
+            a.shl(r10, 24)?;
+            a.shl(r11, 32)?;
+            a.shl(rdx, 40)?;
+            a.or(rax, r8)?;
+            a.or(rax, r9)?;
+            a.or(rax, r10)?;
+            a.or(rax, r11)?;
+            a.or(rax, rdx)?;
+            a.ret()
+        })
+        .asm(WRITE_ONLY, |a| {
+            a.vmovdqu(ymm0, ymmword_ptr(rcx))?;
+            a.ret()
+        })
+        .asm(VEX_ONLY, |a| {
+            a.vxorps(xmm1, xmm1, xmm1)?;
+            a.ret()
+        })
+        .asm(VZU_ONLY, |a| {
+            a.vzeroupper()?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let module = lift_module(functions.values()).expect("lift");
+    assert!(module.functions.iter().all(|f| f.unsupported.is_empty()));
+    let native_ir = target.retarget(module.ir);
+    let want: i64 = 0x0000_1100_3300_3311;
+    let o_rsp = STATE_GPR_OFFSET + 8 * 4;
+    let o_rax = STATE_GPR_OFFSET;
+    let o_rcx = STATE_GPR_OFFSET + 8;
+    let o_ymmh1 = STATE_YMM_HI_OFFSET + 16;
+    let driver = format!(
+        r#"target triple = "{triple}"
+@__playgta6_guest_base = global i64 0
+@state = global [{STATE_SIZE} x i8] zeroinitializer, align 16
+@stack = global [4096 x i64] zeroinitializer, align 16
+@vec_in = global [4 x i64] [i64 17, i64 34, i64 51, i64 68], align 32
+declare void @sub_{F:X}(ptr)
+declare void @llvm.trap() noreturn
+define void @__playgta6_indirect_call(ptr %s, i64 %t) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_trap(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_unimplemented(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_divide_error(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define i32 @main() {{
+entry:
+  %stack = ptrtoint ptr @stack to i64
+  %top = add i64 %stack, 32768
+  %entry_rsp = sub i64 %top, 8
+  store i64 %entry_rsp, ptr getelementptr (i8, ptr @state, i64 {o_rsp})
+  %in_va = ptrtoint ptr @vec_in to i64
+  store i64 %in_va, ptr getelementptr (i8, ptr @state, i64 {o_rcx})
+  store <2 x i64> <i64 99, i64 100>, ptr getelementptr (i8, ptr @state, i64 {o_ymmh1}), align 8
+  call void @sub_{F:X}(ptr @state)
+  %rax = load i64, ptr getelementptr (i8, ptr @state, i64 {o_rax})
+  %ok = icmp eq i64 %rax, {want}
+  %code = select i1 %ok, i32 0, i32 1
+  ret i32 %code
+}}
+"#
+    );
+    let lifted_ll = dir.0.join("r62_lifted.ll");
+    let driver_ll_path = dir.0.join("r62_driver.ll");
+    fs::write(&lifted_ll, &native_ir).expect("write lifted.ll");
+    fs::write(&driver_ll_path, &driver).expect("write driver.ll");
+    let obj_ext = if triple.contains("windows") {
+        "obj"
+    } else {
+        "o"
+    };
+    let mut objects = Vec::new();
+    for ll in [&lifted_ll, &driver_ll_path] {
+        let obj = ll.with_extension(obj_ext);
+        if let Err(err) = compile_to_object(&tool, &target, ll, &obj) {
+            eprintln!("skipping native R62 test: {err}");
+            return;
+        }
+        objects.push(obj);
+    }
+    let exe = match link(&dir.0, &objects, &triple) {
+        Ok(exe) => exe,
+        Err(reason) => {
+            eprintln!("skipping native R62 test: {reason}");
+            return;
+        }
+    };
+    let status = Command::new(&exe).status().expect("run native R62");
+    assert_eq!(status.code(), Some(0), "native R62 run failed");
+}

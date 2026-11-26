@@ -58,22 +58,19 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
 fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
     let func = asm_function(0x1000, |a| {
         a.addps(xmm0, xmm1)?; // legacy SSE: upper halves untouched
-        a.vaddps(ymm2, ymm3, ymm4)?; // 256-bit: both halves
-        a.vmulps(xmm5, xmm5, xmm5)?; // VEX-128: zeroes ymm5's upper half
+        a.vaddps(ymm2, ymm3, ymm4)?; // 256-bit: reads ymm3/ymm4, writes ymm2 only
+        a.vmulps(xmm5, xmm5, xmm5)?; // VEX-128: zeroes ymm5's upper half directly in state
         a.ret()
     });
     let lifted = lift_function(&func).expect("lifts");
     let ir = &lifted.ir;
     assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
-    for idx in [2, 3, 4, 5] {
+    // Read upper halves (`ymm3`, `ymm4`) keep local allocas with entry load + exit store.
+    for idx in [3, 4] {
         assert!(
-            ir.contains(&format!(
-                "  %ymmh{idx} = alloca <2 x i64>
-"
-            )),
+            ir.contains(&format!("  %ymmh{idx} = alloca <2 x i64>\n")),
             "{ir}"
         );
-        // entry load + exit store of state field 6 (`ymm_hi`)
         assert_eq!(
             ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
                 .count(),
@@ -81,12 +78,154 @@ fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
             "{ir}"
         );
     }
+    // Write-only (`ymm2`) and VEX-128-zeroed (`ymm5`) upper halves skip local allocas and write
+    // directly into `%state.ymmh*` (no entry load, no exit store).
+    for idx in [2, 5] {
+        assert!(!ir.contains(&format!("%ymmh{idx} = alloca")), "{ir}");
+        assert!(
+            !ir.contains(&format!("load <2 x i64>, ptr %state.ymmh{idx}")),
+            "{ir}"
+        );
+        assert_eq!(
+            ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
+                .count(),
+            1,
+            "{ir}"
+        );
+    }
     for idx in [0, 1] {
         assert!(!ir.contains(&format!("%ymmh{idx} =")), "{ir}");
+        assert!(!ir.contains(&format!("%state.ymmh{idx}")), "{ir}");
     }
     assert!(
-        ir.contains("store <2 x i64> zeroinitializer, ptr %ymmh5"),
+        ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh5, align 8"),
         "{ir}"
+    );
+}
+
+#[test]
+fn r62_unread_ymmh_elides_allocas_and_uses_memset_for_vzeroupper() {
+    // 1. VEX-128 + vzeroupper + direct & indirect calls, reading zero ymmh registers.
+    let prog = Program::new()
+        .asm(0x1000, |a| {
+            a.vxorps(xmm0, xmm0, xmm0)?;
+            a.call(0x2000)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        })
+        .asm(0x2000, |a| a.ret());
+    let f_vex_vzu = prog.function(0x1000);
+    let lifted = lift_function(&f_vex_vzu).expect("lifts");
+    let ir = &lifted.ir;
+    assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
+    assert!(
+        !ir.contains("%ymmh"),
+        "unread VEX-128/vzeroupper must emit zero %ymmh allocas:\n{ir}"
+    );
+    assert!(
+        !ir.contains("load <2 x i64>, ptr %state.ymmh"),
+        "unread VEX-128/vzeroupper must emit zero %state.ymmh loads:\n{ir}"
+    );
+    assert!(
+        ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8"),
+        "VEX-128 must still zero %state.ymmh0 directly:\n{ir}"
+    );
+    assert!(
+        ir.contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "vzeroupper with no local ymmh must emit a single 256-byte memset:\n{ir}"
+    );
+
+    // 2. Reads ONLY ymm0 (`vmovdqu [rcx], ymm0`) + vzeroupper + call -> only %ymmh0 allocated!
+    let prog_one = Program::new()
+        .asm(0x1000, |a| {
+            a.vmovdqu(ymmword_ptr(rcx), ymm0)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        });
+    let lifted_one = lift_function(&prog_one.function(0x1000)).expect("lifts");
+    let ir_one = &lifted_one.ir;
+    assert!(
+        lifted_one.unsupported.is_empty(),
+        "{:?}",
+        lifted_one.unsupported
+    );
+    assert!(
+        ir_one.contains("  %ymmh0 = alloca <2 x i64>\n"),
+        "read ymm0 must allocate %ymmh0:\n{ir_one}"
+    );
+    for idx in 1..16 {
+        assert!(
+            !ir_one.contains(&format!("%ymmh{idx} = alloca")),
+            "unread ymmh{idx} must not allocate:\n{ir_one}"
+        );
+        assert!(
+            !ir_one.contains(&format!("load <2 x i64>, ptr %state.ymmh{idx}")),
+            "unread ymmh{idx} must not reload from state:\n{ir_one}"
+        );
+    }
+    assert!(
+        ir_one.contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "vzeroupper with 1 local ymmh must bulk-zero state:\n{ir_one}"
+    );
+    assert!(
+        ir_one.contains("store <2 x i64> zeroinitializer, ptr %ymmh0"),
+        "vzeroupper must also zero local %ymmh0:\n{ir_one}"
+    );
+
+    // 3. Write-only 256-bit `vmovdqu ymm0, [rcx]` -> zero %ymmh allocas, direct store to %state.ymmh0.
+    let f_write_only = asm_function(0x1000, |a| {
+        a.vmovdqu(ymm0, ymmword_ptr(rcx))?;
+        a.ret()
+    });
+    let lifted_wo = lift_function(&f_write_only).expect("lifts");
+    let ir_wo = &lifted_wo.ir;
+    assert!(
+        lifted_wo.unsupported.is_empty(),
+        "{:?}",
+        lifted_wo.unsupported
+    );
+    assert!(
+        !ir_wo.contains("%ymmh"),
+        "write-only ymm0 must not allocate %ymmh:\n{ir_wo}"
+    );
+    assert!(
+        !ir_wo.contains("load <2 x i64>, ptr %state.ymmh"),
+        "write-only ymm0 must not load %state.ymmh:\n{ir_wo}"
+    );
+    assert_eq!(
+        ir_wo.matches("ptr %state.ymmh0, align 8").count(),
+        1,
+        "write-only ymm0 must store directly to %state.ymmh0 once:\n{ir_wo}"
+    );
+
+    // 4. `vzeroall` without ymmh reads -> zero %ymmh allocas, single 256-byte memset.
+    let f_vza = asm_function(0x1000, |a| {
+        a.vzeroall()?;
+        a.ret()
+    });
+    let lifted_vza = lift_function(&f_vza).expect("lifts");
+    assert!(lifted_vza.unsupported.is_empty());
+    assert!(!lifted_vza.ir.contains("%ymmh"), "{}", lifted_vza.ir);
+    assert!(
+        lifted_vza
+            .ir
+            .contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "{}",
+        lifted_vza.ir
+    );
+
+    // 5. 256-bit zeroing idiom `vxorps ymm0, ymm0, ymm0` must still lift cleanly without trapping.
+    let f_idiom = asm_function(0x1000, |a| {
+        a.vxorps(ymm0, ymm0, ymm0)?;
+        a.ret()
+    });
+    let lifted_idiom = lift_function(&f_idiom).expect("lifts");
+    assert!(
+        lifted_idiom.unsupported.is_empty(),
+        "{:?}",
+        lifted_idiom.unsupported
     );
 }
 
