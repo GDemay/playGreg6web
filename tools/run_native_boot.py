@@ -85,6 +85,7 @@ import compare_boot_reports  # noqa: E402
 import find_chrome  # noqa: E402
 import screen_timeline  # noqa: E402
 import clean_build_dirs  # noqa: E402
+import build_guard  # noqa: E402
 from lift_cache import (  # noqa: E402,F401 (re-exported for the tests)
     LIFT_CACHE_ENV, LIFT_CACHE_KEEP, LIFT_CACHE_KEEP_ENV, LIFT_CACHE_VERSION, LIFT_STAMP, PROGRAM_KEEP,
     clear_program, file_digest, lift_cache_dir, lift_cache_keep, lift_cache_restore, lift_cache_store,
@@ -209,7 +210,8 @@ def choose_build_dir(repo: Path, requested: Path | None, env: Mapping[str, str],
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
               force: bool, harness_override: Path | None,
               rebuild_program: bool = False, cache_dir: Path | None = None,
-              lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP) -> tuple[Plan, Path, Path]:
+              lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP,
+              recomp_cache: Path | None = None, toolchain: str | None = None) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
     `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
     `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
@@ -234,7 +236,22 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
     newest_rs = max([newest_mtime(d / "src") for d in workspace_dirs(repo)] + [0.0] + [mtime(p) or 0.0 for p in sources])
     reason = stale("recomp", recomp, [("the recompiler sources", newest_rs)])
     if reason:
-        plan.add("recomp", reason, ["cargo", "build", "--release", "-p", "playgta6-recomp"])
+        cargo = ["cargo", "build", "--release", "-p", "playgta6-recomp"]
+        rkey = None
+        if recomp_cache is not None and not force:
+            rkey = build_guard.recomp_inputs_key(repo, toolchain or build_guard.rustc_version())
+            if mtime(recomp) is not None and build_guard.read_recomp_stamp(recomp) == rkey:
+                reason = None  # this exact binary is there (only mtimes moved)
+            elif (recomp_cache / rkey / recomp.name).is_file():
+                plan.add("recomp", f"prebuilt recompiler cache hit {rkey[:12]} (no cargo build)",
+                         ["recomp-cache", "restore", str(recomp_cache / rkey), str(recomp)],
+                         run=lambda: build_guard.recomp_cache_restore(recomp_cache, rkey, recomp))
+                reason = None
+        if reason and rkey is not None:
+            plan.add("recomp", reason, cargo,
+                     after=lambda: build_guard.recomp_cache_store(recomp_cache, rkey, recomp))
+        elif reason:
+            plan.add("recomp", reason, cargo)
 
     manifest = program / "program-manifest.json"
     exe_time = mtime(exe) if exe else 0.0
@@ -674,6 +691,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--rebuild", action="store_true", help="rebuild every stage")
     p.add_argument("--rebuild-program", action="store_true",
                    help="regenerate the lifted program even when the stamps say it is current")
+    p.add_argument("--build-only", action="store_true", help="run the (timed) build stages, then stop before the run")
     p.add_argument("--no-build", action="store_true", help="fail instead of building a stale stage")
     p.add_argument("--trust-build", action="store_true",
                    help="skip the staleness checks and use the existing program and harness as they are")
@@ -786,9 +804,23 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
         raise RunnerError(f"run directory {run_dir} already exists (pick another --name)")
 
     lift_cache = None if (args.dry_run or args.trust_build) else lift_cache_dir(args.cache_dir, env)
+    recomp_cache = None if (args.dry_run or args.trust_build) else build_guard.recomp_cache_dir(args.cache_dir, env)
+    if args.dry_run:
+        return _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset, run_dir,
+                           lift_cache, recomp_cache)
+    try:
+        with build_guard.build_dir_lock(build_dir):
+            return _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset,
+                               run_dir, lift_cache, recomp_cache)
+    except build_guard.BuildDirBusy as exc:
+        raise RunnerError(str(exc)) from exc
+
+
+def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_dir, preset, run_dir,
+                lift_cache, recomp_cache) -> int:
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
                                       args.rebuild_program, args.cache_dir, lift_cache,
-                                      lift_cache_keep(env))
+                                      lift_cache_keep(env), recomp_cache)
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
@@ -853,6 +885,9 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if not harness.is_file():
         raise RunnerError(f"harness not found after the build: {harness}")
 
+    if args.build_only:
+        print(f"[build] done; harness {harness}", file=sys.stderr, flush=True)
+        return 0
     run_dir.mkdir(parents=True, exist_ok=True)
     clean_build_dirs.write_marker(build_dir, "run_native_boot.py", repo)
     if preset["input"] and not args.input_script:

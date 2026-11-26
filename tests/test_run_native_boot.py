@@ -83,7 +83,8 @@ class Fixture:
                 ["--exe", str(self.exe), "--game-dir", str(self.pkg), "--build-dir", str(self.build),
                  "--harness", str(self.harness), *argv],
                 runner=runner or default_runner,
-                env=env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache)}, repo_root=self.repo)
+                env=env or {rnb.LIFT_CACHE_ENV: str(self.lift_cache), "PLAYGTA6_RECOMP_CACHE": "off"},
+                repo_root=self.repo)
         return code, out.getvalue(), err.getvalue(), calls
 
 
@@ -159,6 +160,69 @@ class LiftCacheTests(unittest.TestCase):
             # --rebuild-program lifts again.
             code, _, err, calls = fx.run("--name", "r4", "--rebuild-program", runner=lifting_runner)
             self.assertIn("[plan] program: forced", err)
+
+
+class BuildGuardTests(unittest.TestCase):
+    def test_recomp_key_follows_sources_and_toolchain(self):
+        import build_guard as bg
+        base = bg.recomp_key({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "rustc 1")
+        self.assertEqual(base, bg.recomp_key({"Cargo.lock": "b", "recomp/src/main.rs": "a"}, "rustc 1"))
+        for variant in (({"recomp/src/main.rs": "A", "Cargo.lock": "b"}, "rustc 1"),
+                        ({"recomp/src/main.rs": "a", "Cargo.lock": "b", "x.rs": "c"}, "rustc 1"),
+                        ({"recomp/src/main.rs": "a", "Cargo.lock": "b"}, "rustc 2")):
+            self.assertNotEqual(base, bg.recomp_key(*variant))
+
+    def test_recomp_cache_hit_skips_cargo_and_miss_stores(self):
+        import build_guard as bg
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            env = {rnb.LIFT_CACHE_ENV: str(fx.lift_cache), "PLAYGTA6_RECOMP_CACHE": str(Path(d) / "rc")}
+            touch(fx.repo / "recomp" / "src" / "main.rs", fx.base + 100)
+            code, _, err, calls = fx.run("--name", "r1", env=env)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(calls[0][0], "cargo")  # miss: built, then stored
+            stored = list((Path(d) / "rc").iterdir())
+            self.assertEqual(len(stored), 1)
+            key = stored[0].name
+            self.assertEqual(bg.read_recomp_stamp(fx.recomp), key)
+            # same sources, binary gone: restored from the cache, no cargo
+            fx.recomp.unlink()
+            code, _, err, calls = fx.run("--name", "r2", env=env)
+            self.assertEqual(code, 0, err)
+            self.assertIn("prebuilt recompiler cache hit", err)
+            self.assertFalse(any(c and c[0] == "cargo" for c in calls))
+            self.assertTrue(fx.recomp.is_file())
+
+    def test_build_dir_lock_is_exclusive_and_released(self):
+        import build_guard as bg
+        with tempfile.TemporaryDirectory() as d:
+            build = Path(d) / "b"
+            with bg.build_dir_lock(build):
+                with self.assertRaises(bg.BuildDirBusy) as cm:
+                    with bg.build_dir_lock(build):
+                        pass
+                self.assertIn("--build-dir", str(cm.exception))
+            with bg.build_dir_lock(build):  # released
+                pass
+
+    def test_stale_lock_is_taken_over(self):
+        import build_guard as bg
+        with tempfile.TemporaryDirectory() as d:
+            build = Path(d)
+            lock = build / bg.BUILD_LOCK_NAME
+            touch(lock, 1.0)
+            with bg.build_dir_lock(build):
+                pass
+
+    def test_second_run_on_a_locked_build_dir_errors_clearly(self):
+        import build_guard as bg
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            with bg.build_dir_lock(fx.build):
+                code, _, err, calls = fx.run("--name", "r1")
+            self.assertEqual(code, 2)
+            self.assertIn("in use by another run", err)
+            self.assertEqual(calls, [])
 
 
 class StalenessTests(unittest.TestCase):
