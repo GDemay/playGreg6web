@@ -264,6 +264,24 @@ void StateBridgeDevice::unregister_resource(uint32_t resource_id) {
     }
     const std::vector<uint32_t> retired_views = retire_views(resource_id);
     const std::vector<uint32_t> retired_intermediates = retire_intermediates(resource_id);
+    {
+        // G66: ExecuteIndirect clamp bind groups over the buffer.
+        std::vector<uint32_t> stale;
+        {
+            std::lock_guard lock(objects_mutex_);
+            for (auto it = indirect_groups_.begin(); it != indirect_groups_.end();) {
+                if (it->first.first == resource_id || it->first.second == resource_id) {
+                    stale.push_back(it->second);
+                    it = indirect_groups_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+        for (const uint32_t id : stale) {
+            defer_destroy_resource(id);
+        }
+    }
     std::vector<uint32_t> invalidated_resources;
     invalidated_resources.reserve(1 + retired_intermediates.size());
     invalidated_resources.push_back(resource_id);
@@ -856,6 +874,154 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
         encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
     }
     return id;
+}
+
+// ---- G66: ExecuteIndirect clamp pass ----
+
+const char* indirect_clamp_wgsl() noexcept {
+    // One invocation per command. Params: the source record (word index and stride), the command
+    // count, the count buffer word (when has_count), the record kind and the index buffer's element
+    // count. Commands at or past the count buffer's value, or whose record does not fit in the
+    // source buffer, are written as all zeros (no work). Indexed draws are clamped to the index
+    // buffer, dispatches to the per-dimension workgroup limit.
+    return R"(struct Params {
+    src_word: u32,
+    stride_words: u32,
+    count: u32,
+    count_word: u32,
+    has_count: u32,
+    kind: u32,
+    index_limit: u32,
+    group_limit: u32,
+}
+@group(0) @binding(0) var<uniform> p: Params;
+@group(0) @binding(1) var<storage, read> src: array<u32>;
+@group(0) @binding(2) var<storage, read> cnt: array<u32>;
+@group(0) @binding(3) var<storage, read_write> dst: array<u32>;
+
+@compute @workgroup_size(64)
+fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
+    let i = id.x;
+    if (i >= p.count) {
+        return;
+    }
+    var words = 4u;
+    if (p.kind == 1u) {
+        words = 5u;
+    } else if (p.kind == 2u) {
+        words = 3u;
+    }
+    var n = p.count;
+    if (p.has_count != 0u) {
+        n = 0u;
+        if (p.count_word < arrayLength(&cnt)) {
+            n = min(cnt[p.count_word], p.count);
+        }
+    }
+    let base = p.src_word + i * p.stride_words;
+    let live = i < n && base < arrayLength(&src) && words <= arrayLength(&src) - base;
+    let out = i * words;
+    for (var k = 0u; k < words; k = k + 1u) {
+        var v = 0u;
+        if (live) {
+            v = src[base + k];
+        }
+        dst[out + k] = v;
+    }
+    if (!live) {
+        return;
+    }
+    if (p.kind == 1u) {
+        let first = dst[out + 2u];
+        var indices = 0u;
+        if (first < p.index_limit) {
+            indices = min(dst[out], p.index_limit - first);
+        }
+        dst[out] = indices;
+    } else if (p.kind == 2u) {
+        dst[out] = min(dst[out], p.group_limit);
+        dst[out + 1u] = min(dst[out + 1u], p.group_limit);
+        dst[out + 2u] = min(dst[out + 2u], p.group_limit);
+    }
+}
+)";
+}
+
+StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    IndirectClamp& c = indirect_clamp_;
+    if (c.pipeline == 0) {
+        const uint32_t module = allocate_id();
+        encoder.create_shader_module(module, GpuShaderStage::Compute, indirect_clamp_wgsl());
+        GpuBindGroupLayoutEntry entries[4] = {};
+        const uint8_t types[4] = {static_cast<uint8_t>(GpuBufferBindingType::Uniform),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage),
+                                  static_cast<uint8_t>(GpuBufferBindingType::Storage)};
+        for (uint32_t i = 0; i < 4; ++i) {
+            entries[i].binding = i;
+            entries[i].visibility = GpuShaderStageBits::Compute;
+            entries[i].type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+            entries[i].binding_type = types[i];
+        }
+        entries[0].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // params slot in the root constant ring
+        entries[0].min_binding_size = 32;
+        entries[3].flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;  // output window in the indirect ring
+        c.group_layout = allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.group_layout;
+        layout.entry_count = 4;
+        encoder.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = allocate_id();
+        pl.bind_group_layout_count = 1;
+        encoder.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+        GpuCreateComputePipeline2Payload cp{};
+        cp.id = allocate_id();
+        cp.cs_module_id = module;
+        cp.pipeline_layout_id = pl.id;
+        encoder.emit_packet(GpuOpcode::CreateComputePipeline2, &cp, sizeof(cp));
+        c.pipeline = cp.id;
+        c.ring = allocate_id();
+        encoder.create_buffer(c.ring, GpuBufferUsage::Storage | GpuBufferUsage::Indirect,
+                              kIndirectRingBytes + kIndirectWindowBytes);
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args,
+                                                 uint32_t count, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    uint32_t& id = indirect_groups_[{args, count}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e[4] = {};
+        const uint32_t ids[4] = {params_ring, args, count != 0 ? count : args, clamp.ring};
+        const uint64_t sizes[4] = {32, 0, 0, kIndirectWindowBytes};
+        for (uint32_t i = 0; i < 4; ++i) {
+            e[i].binding = i;
+            e[i].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+            e[i].resource_id = ids[i];
+            e[i].size = sizes[i];
+        }
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = clamp.group_layout;
+        g.entry_count = 4;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+    }
+    return id;
+}
+
+uint32_t StateBridgeDevice::allocate_indirect_window() {
+    std::lock_guard lock(objects_mutex_);
+    // GPU-ordered: the clamp pass that overwrites a reused window runs after the work that read it.
+    if (indirect_cursor_ + kIndirectWindowBytes > kIndirectRingBytes) {
+        indirect_cursor_ = 0;
+    }
+    const uint32_t offset = indirect_cursor_;
+    indirect_cursor_ += (kIndirectWindowBytes + 255u) & ~255u;
+    return offset;
 }
 
 uint32_t StateBridgeDevice::intern_view(const ViewRecord& record) const {
@@ -2674,12 +2840,7 @@ void CommandListBridge::DrawIndexedInstanced(uint32_t index_count_per_instance,
     ++stats_.draws;
 }
 
-void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
-                                 uint32_t thread_group_count_y,
-                                 uint32_t thread_group_count_z) {
-    if (!writable()) {
-        return;
-    }
+ComputePipelineState* CommandListBridge::prepare_compute_dispatch() {
     // G7: pending clears must land and the render pass must end before compute work.
     tracker_.flush_pending_clears();
     tracker_.end_render_pass();
@@ -2687,7 +2848,7 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     ComputePipelineState* state = compute_pso_;
     if (state == nullptr || state->pipeline_id_ == 0) {
         diagnostics_ |= BridgeDiag::NoComputePipeline;
-        return;
+        return nullptr;
     }
     if (device_.claim_compute_creation(state->pipeline_id_)) {
         GpuCreateComputePipeline2Payload payload{};
@@ -2710,6 +2871,19 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
     if (state->layout_ != nullptr && state->plans_.size() == state->layout_->groups.size() &&
         !apply_bind_groups(d3d::BindPoint::Compute, state->layout_, state->plans_, &compute_groups_, false)) {
+        return nullptr;
+    }
+    return state;
+}
+
+void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
+                                 uint32_t thread_group_count_y,
+                                 uint32_t thread_group_count_z) {
+    if (!writable()) {
+        return;
+    }
+    ComputePipelineState* state = prepare_compute_dispatch();
+    if (state == nullptr) {
         return;
     }
     // #482: storage bindings redirected to an intermediate texture. Dispatches in one compute pass
@@ -2748,6 +2922,107 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
         compute_pipeline_bound_ = 0;
         compute_groups_.clear();
     }
+}
+
+bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring,
+                                            uint32_t* out_offset) {
+    const StateBridgeDevice::IndirectClamp clamp = device_.indirect_clamp(encoder_);
+    const uint32_t params_ring = device_.ensure_root_constant_ring(encoder_);
+    uint32_t index_limit = 0xFFFFFFFFu;
+    if (e.kind == IndirectKind::DrawIndexed && index_buffer_.size_in_bytes != 0) {
+        index_limit = index_buffer_.size_in_bytes / (index_buffer_.format == GpuIndexFormat::Uint32 ? 4u : 2u);
+    }
+    const uint32_t params[8] = {static_cast<uint32_t>(e.args_offset / 4u),
+                                e.stride / 4u,
+                                count,
+                                static_cast<uint32_t>(e.count_offset / 4u),
+                                e.count_buffer != 0 ? 1u : 0u,
+                                static_cast<uint32_t>(e.kind),
+                                index_limit,
+                                kMaxIndirectWorkgroups};
+    bool wrapped = false;
+    const uint32_t params_offset = device_.allocate_root_constants(sizeof(params), &wrapped);
+    if (wrapped) {
+        diagnostics_ |= BridgeDiag::RootConstantRingWrapped;
+    }
+    encoder_.write_buffer(params_ring, params_offset, params, sizeof(params));
+    const uint32_t group = device_.indirect_clamp_group(clamp, params_ring, e.args_buffer, e.count_buffer, encoder_);
+    const uint32_t window = device_.allocate_indirect_window();
+    note_recorded_resource(e.args_buffer);
+    note_recorded_resource(e.count_buffer);
+    encoder_.set_compute_pipeline(clamp.pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 2u, 0u};
+    const uint32_t offsets[2] = {params_offset, window};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set), offsets, sizeof(offsets));
+    encoder_.dispatch_compute((count + 63u) / 64u, 1, 1);
+    // The stage's pipeline and bind groups are set again by the next dispatch.
+    compute_pipeline_bound_ = 0;
+    compute_groups_.clear();
+    *ring = clamp.ring;
+    *out_offset = window;
+    return true;
+}
+
+bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
+    if (!writable()) {
+        return false;
+    }
+    const uint32_t record = e.kind == IndirectKind::DrawIndexed ? 20u : e.kind == IndirectKind::Dispatch ? 12u : 16u;
+    const auto skip = [&] {
+        ++stats_.indirect_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    };
+    if (e.args_buffer == 0 || e.stride < record || e.stride % 4u != 0 || e.args_offset % 4u != 0 ||
+        e.count_offset % 4u != 0 || e.args_offset / 4u > 0xFFFFFFFFull || e.count_offset / 4u > 0xFFFFFFFFull) {
+        return skip();
+    }
+    if (e.max_count == 0) {
+        ++stats_.indirect_executions;
+        return true;  // no commands
+    }
+    const uint32_t count = std::min(e.max_count, kMaxIndirectCommands);
+    if (e.kind == IndirectKind::Dispatch) {
+        if (compute_pso_ == nullptr || compute_pso_->pipeline_id_ == 0) {
+            diagnostics_ |= BridgeDiag::NoComputePipeline;
+            return skip();
+        }
+    } else if (graphics_pso_ == nullptr || (e.kind == IndirectKind::DrawIndexed && index_buffer_.buffer_id == 0)) {
+        return skip();
+    }
+    stats_.indirect_truncated += e.max_count - count;
+    // The clamp pass is compute work: the render pass ends first.
+    tracker_.flush_pending_clears();
+    tracker_.end_render_pass();
+    drain_events();
+    uint32_t ring = 0;
+    uint32_t base = 0;
+    emit_indirect_clamp(e, count, &ring, &base);
+    GpuOpcode opcode = GpuOpcode::DispatchIndirect;
+    if (e.kind == IndirectKind::Dispatch) {
+        if (prepare_compute_dispatch() == nullptr) {
+            return skip();
+        }
+        // Storage bindings redirected to an intermediate texture (#482) need conversions around the
+        // stage, which only direct dispatches run: such an execution is skipped.
+        for (const BoundGroup& b : compute_groups_) {
+            if (redirects_.count(b.bind_group_id) != 0) {
+                return skip();
+            }
+        }
+    } else {
+        if (!prepare_render_draw()) {
+            return skip();
+        }
+        apply_input_assembler(e.kind == IndirectKind::DrawIndexed);
+        opcode = e.kind == IndirectKind::DrawIndexed ? GpuOpcode::DrawIndexedIndirect : GpuOpcode::DrawIndirect;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * record);
+    }
+    stats_.indirect_commands += count;
+    ++stats_.indirect_executions;
+    return true;
 }
 
 void CommandListBridge::ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers) {

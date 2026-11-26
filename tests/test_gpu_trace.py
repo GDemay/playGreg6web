@@ -1099,8 +1099,17 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(len(gpu_trace.WGPU_TEXTURE_FORMAT_NAMES), 64)
         self.assertEqual(len(gpu_trace.WGPU_VERTEX_FORMAT_NAMES), 42)
         self.assertEqual(
-            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 36))
+            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 39))
         )
+        self.assertEqual(gpu_trace.INDIRECT_STRUCT.size, 16)
+        # G66 ExecuteIndirect packets decode their GpuIndirectPayload.
+        stream = gpu_trace.encode_packet(
+            gpu_trace.GpuOpcode.DrawIndexedIndirect, gpu_trace.INDIRECT_STRUCT.pack(7, 0, 40)
+        )
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.packets[0].fields["buffer_id"], 7)
+        self.assertEqual(trace.packets[0].fields["offset"], 40)
 
     def test_decode_full_v2_frame(self) -> None:
         view_2d_array = gpu_trace.encode_texture_view_desc(40, 3, 0, 1, 2, 4, 1)

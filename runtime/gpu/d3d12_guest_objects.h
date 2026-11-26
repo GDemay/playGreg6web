@@ -1396,14 +1396,26 @@ private:
 class CommandSignature final : public ChildBase<ICommandSignatureHost> {
 public:
     static constexpr const char* kComClassName = "ID3D12CommandSignature";
-    CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count)
-        : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count) {}
+    // D3D12_INDIRECT_ARGUMENT_TYPE of the work argument (the last one); kIndirectArgXbox105 is an
+    // Xbox-only kind the title uses (meaning not established).
+    static constexpr uint32_t kIndirectArgDraw = 0;
+    static constexpr uint32_t kIndirectArgDrawIndexed = 1;
+    static constexpr uint32_t kIndirectArgDispatch = 2;
+    static constexpr uint32_t kIndirectArgDispatchMesh = 10;
+    static constexpr uint32_t kIndirectArgXbox105 = 105;
+    static constexpr uint32_t kIndirectArgUnknown = 0xFFFFFFFFu;
+    CommandSignature(com::Ref<Device> device, uint32_t byte_stride, uint32_t argument_count,
+                     uint32_t work_type = kIndirectArgUnknown)
+        : ChildBase(std::move(device)), byte_stride_(byte_stride), argument_count_(argument_count),
+          work_type_(work_type) {}
     uint32_t byte_stride() const { return byte_stride_; }
     uint32_t argument_count() const { return argument_count_; }
+    uint32_t work_type() const { return work_type_; }
 
 private:
     uint32_t byte_stride_;
     uint32_t argument_count_;
+    uint32_t work_type_;
 };
 
 class CommandQueue final : public ChildBase<ICommandQueueHost> {
@@ -1475,7 +1487,7 @@ ResourceAllocation resource_allocation(const GuestResourceDesc& desc);
 // A draw is "issued" when the title records it and ends in exactly one of: emitted (a packet),
 // no shader module, mesh/amplification pipeline (placeholder state), rectangle list, or dropped by
 // the state bridge (no pipeline state, missing bindings, ...). Dispatches likewise. Indirect
-// executions have no packet and are counted separately. Uploads count WriteTexture / WriteBuffer
+// executions (ExecuteIndirect) are counted separately: emitted or skipped. Uploads count WriteTexture / WriteBuffer
 // packets the layer builds from guest memory; copies it cannot express are "copies skipped".
 enum class Work : size_t {
     DrawsIssued,
@@ -1489,6 +1501,7 @@ enum class Work : size_t {
     DispatchesNoShaderModule,
     DispatchesDroppedByBridge,
     IndirectExecutionsSkipped,
+    IndirectExecutionsEmitted,  // G66: draws / indexed draws / dispatches through the clamp pass
     TextureUploads,
     BufferUploads,
     CopiesSkipped,

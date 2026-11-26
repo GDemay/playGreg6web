@@ -283,6 +283,11 @@ void CommandEncoder::dispatch_compute(
     write_packet(GpuOpcode::DispatchCompute, &payload, sizeof(payload));
 }
 
+void CommandEncoder::indirect(GpuOpcode opcode, uint32_t buffer_id, uint64_t offset) {
+    const GpuIndirectPayload payload{buffer_id, 0u, offset};
+    write_packet(opcode, &payload, sizeof(payload));
+}
+
 bool CommandEncoder::patch(size_t offset, const void* bytes, size_t size) {
     if (offset > buf_.size() || size > buf_.size() - offset) {
         return false;

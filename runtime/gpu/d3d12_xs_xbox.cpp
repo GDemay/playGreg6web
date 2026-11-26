@@ -1393,13 +1393,65 @@ void CommandList::SetPipelineStateX(com::CallContext& ctx) {
     bind_pipeline(static_cast<PipelineState*>(state.get()));
 }
 
-void CommandList::ExecuteIndirect(com::CallContext&) {
-    if (usable()) {
-        // No indirect draw/dispatch packet exists in the GPU ABI: diagnosed and skipped.
-        device_->count(xbox::Counter::IndirectSkipped);
+void CommandList::ExecuteIndirect(com::CallContext& ctx) {
+    // (signature, max command count, argument buffer, argument offset, count buffer, count offset)
+    if (!usable()) {
+        return;
+    }
+    const auto skip = [&](xbox::Counter counter) {
+        device_->count(counter);
         count_work(Work::IndirectExecutionsSkipped);
         device_->note_skipped_draw();
+    };
+    auto signature_arg = InterfaceArg<ICommandSignatureHost>::resolve(ctx.int_arg(1));
+    const auto* signature = signature_arg ? static_cast<const CommandSignature*>(signature_arg.get()) : nullptr;
+    if (signature == nullptr) {
+        skip(xbox::Counter::IndirectSkipped);
+        return;
     }
+    bridge::IndirectExecution e;
+    switch (signature->work_type()) {
+    case CommandSignature::kIndirectArgDraw: e.kind = bridge::IndirectKind::Draw; break;
+    case CommandSignature::kIndirectArgDrawIndexed: e.kind = bridge::IndirectKind::DrawIndexed; break;
+    case CommandSignature::kIndirectArgDispatch: e.kind = bridge::IndirectKind::Dispatch; break;
+    case CommandSignature::kIndirectArgDispatchMesh:
+        skip(xbox::Counter::IndirectMeshSkipped);  // no mesh pipelines yet
+        return;
+    case CommandSignature::kIndirectArgXbox105:
+        skip(xbox::Counter::IndirectType105Skipped);
+        return;
+    default:
+        skip(xbox::Counter::IndirectSkipped);
+        return;
+    }
+    Resource* args = resource(InterfaceArg<IResourceHost>::resolve(ctx.int_arg(3)));
+    const uint64_t count_pointer = ctx.int_arg(5);
+    Resource* count = count_pointer != 0 ? resource(InterfaceArg<IResourceHost>::resolve(count_pointer)) : nullptr;
+    const bool graphics = e.kind != bridge::IndirectKind::Dispatch;
+    PipelineState* pso = graphics ? graphics_pso_ : compute_pso_;
+    // Only single-argument signatures (no root argument / view changes per command) are expressed.
+    if (signature->argument_count() != 1 || args == nullptr || !args->is_buffer() ||
+        (count_pointer != 0 && (count == nullptr || !count->is_buffer())) || (pso != nullptr && !pso->resolved()) ||
+        (graphics && rect_list_)) {
+        skip(xbox::Counter::IndirectSkipped);
+        return;
+    }
+    e.max_count = static_cast<uint32_t>(ctx.int_arg(2));
+    e.stride = signature->byte_stride();
+    e.args_buffer = args->id();
+    e.args_offset = ctx.int_arg(4);
+    e.count_buffer = count != nullptr ? count->id() : 0u;
+    e.count_offset = count != nullptr ? ctx.int_arg(6) : 0u;
+    pinned_.push_back(com::Ref<com::ComObject>::share(args));
+    if (count != nullptr) {
+        pinned_.push_back(com::Ref<com::ComObject>::share(count));
+    }
+    if (!bridge_.ExecuteIndirect(e)) {
+        skip(xbox::Counter::IndirectSkipped);
+        return;
+    }
+    device_->count(xbox::Counter::IndirectExecuted);
+    count_work(Work::IndirectExecutionsEmitted);
 }
 
 void CommandList::OMSetDepthBounds(float, float) {

@@ -779,6 +779,285 @@ void test_compute_dispatch_packets() {
 
 }
 
+// G66 ExecuteIndirect: a clamp compute pass (count buffer, out-of-range arguments) writes compacted
+// records into the bridge's indirect ring, which one DrawIndirect / DrawIndexedIndirect /
+// DispatchIndirect per command reads.
+size_t find_op(const std::vector<Packet>& p, GpuOpcode op, size_t from = 0) {
+    for (size_t i = from; i < p.size(); ++i) {
+        if (p[i].opcode == op) {
+            return i;
+        }
+    }
+    return p.size();
+}
+
+size_t count_op(const std::vector<Packet>& p, GpuOpcode op) {
+    return static_cast<size_t>(std::count_if(p.begin(), p.end(), [&](const Packet& k) { return k.opcode == op; }));
+}
+
+// The clamp pass's params (the last 32-byte WriteBuffer before `before`).
+std::array<uint32_t, 8> indirect_params(const std::vector<Packet>& p, size_t before) {
+    std::array<uint32_t, 8> v{};
+    for (size_t i = std::min(before, p.size()); i-- > 0;) {
+        if (p[i].opcode == GpuOpcode::WriteBuffer && pod<GpuWriteBufferPayload>(p[i]).data_len == 32) {
+            std::memcpy(v.data(), p[i].payload.data() + sizeof(GpuWriteBufferPayload), sizeof(v));
+            break;
+        }
+    }
+    return v;
+}
+
+void test_execute_indirect_packets() {
+    Scene scene(7000);
+    constexpr uint32_t kArgs = 400;
+    constexpr uint32_t kCount = 401;
+    constexpr uint32_t kIndex = 402;
+    scene.device.register_buffer(kArgs, 0x300000, 4096);
+    scene.device.register_buffer(kCount, 0x310000, 256);
+    scene.device.register_buffer(kIndex, 0x320000, 1024);
+
+    const std::string wgsl = bridge::indirect_clamp_wgsl();
+    CHECK(wgsl.find("@compute @workgroup_size(64)") != std::string::npos);
+    CHECK(wgsl.find("fn cs_main") != std::string::npos);
+    CHECK(wgsl.find("arrayLength(&cnt)") != std::string::npos);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    const size_t mark = enc.size();
+
+    // Draws: 3 commands, 32-byte stride at offset 64, count buffer word 1.
+    bridge::IndirectExecution draw;
+    draw.kind = bridge::IndirectKind::Draw;
+    draw.max_count = 3;
+    draw.stride = 32;
+    draw.args_buffer = kArgs;
+    draw.args_offset = 64;
+    draw.count_buffer = kCount;
+    draw.count_offset = 4;
+    CHECK(list.ExecuteIndirect(draw));
+    {
+        const std::vector<Packet> p = decode(enc, mark);
+        using O = GpuOpcode;
+        const size_t end_pass = find_op(p, O::EndRenderPass);
+        const size_t module = find_op(p, O::CreateShaderModule);
+        const size_t layout = find_op(p, O::CreateBindGroupLayout);
+        const size_t pipeline = find_op(p, O::CreateComputePipeline2);
+        const size_t ring_create = find_op(p, O::CreateBuffer);
+        const size_t group = find_op(p, O::CreateBindGroup2);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        const size_t begin = find_op(p, O::BeginRenderPass, dispatch);
+        const size_t first_draw = find_op(p, O::DrawIndirect);
+        CHECK(end_pass < module && module < pipeline && pipeline < dispatch && dispatch < begin &&
+              begin < first_draw && first_draw < p.size());
+        CHECK(layout < p.size() && ring_create < p.size() && group < dispatch);
+        if (first_draw >= p.size() || group >= p.size() || ring_create >= p.size() || layout >= p.size()) {
+            return;
+        }
+        const auto layout_head = pod<GpuCreateBindGroupLayoutPayload>(p[layout]);
+        CHECK(layout_head.entry_count == 4);
+        const auto params_entry = pod<GpuBindGroupLayoutEntry>(p[layout], sizeof(layout_head));
+        const auto out_entry = pod<GpuBindGroupLayoutEntry>(p[layout], sizeof(layout_head) + 3 * sizeof(GpuBindGroupLayoutEntry));
+        CHECK(params_entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Uniform) &&
+              params_entry.flags == GpuBindGroupLayoutEntryFlags::HasDynamicOffset);
+        CHECK(out_entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage) &&
+              out_entry.flags == GpuBindGroupLayoutEntryFlags::HasDynamicOffset);
+        const auto ring = pod<GpuCreateBufferPayload>(p[ring_create]);
+        CHECK(ring.usage_flags == (GpuBufferUsage::Storage | GpuBufferUsage::Indirect));
+        CHECK(ring.byte_size == bridge::kIndirectRingBytes + bridge::kIndirectWindowBytes);
+        const auto bg = pod<GpuCreateBindGroup2Payload>(p[group]);
+        CHECK(bg.entry_count == 4 && bg.layout_id == layout_head.id);
+        const auto args_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + sizeof(GpuBindGroupEntry2));
+        const auto count_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
+        const auto ring_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 3 * sizeof(GpuBindGroupEntry2));
+        CHECK(args_entry.resource_id == kArgs && count_entry.resource_id == kCount && ring_entry.resource_id == ring.id);
+        CHECK(ring_entry.size == bridge::kIndirectWindowBytes);
+        const auto set = pod<GpuSetBindGroup2Payload>(p[dispatch - 1]);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2 && set.bind_group_id == bg.id && set.dynamic_offset_count == 2);
+        const uint32_t window = pod<uint32_t>(p[dispatch - 1], sizeof(set) + 4);
+        CHECK(pod<GpuDispatchComputePayload>(p[dispatch]).workgroup_x == 1);
+        const std::array<uint32_t, 8> params = indirect_params(p, dispatch);
+        CHECK((params == std::array<uint32_t, 8>{16, 8, 3, 1, 1, 0, 0xFFFFFFFFu, bridge::kMaxIndirectWorkgroups}));
+        CHECK(count_op(p, O::DrawIndirect) == 3);
+        for (uint32_t i = 0; i < 3; ++i) {
+            const auto d = pod<GpuIndirectPayload>(p[first_draw + i]);
+            CHECK(p[first_draw + i].opcode == O::DrawIndirect && d.buffer_id == ring.id &&
+                  d.offset == uint64_t{window} + 16u * i);
+        }
+    }
+    CHECK(list.stats().indirect_executions == 1 && list.stats().indirect_commands == 3);
+
+    // Indexed draws without a count buffer: the bind group (args, none) is new, the pipeline is not;
+    // the index count is clamped to the bound index buffer (600 bytes of uint16 = 300 indices).
+    const gpu::d3d12_xs::D3D12IndexBufferView ib{kIndex, 0, 600, GpuIndexFormat::Uint16};
+    list.IASetIndexBuffer(&ib);
+    const size_t mark2 = enc.size();
+    bridge::IndirectExecution indexed;
+    indexed.kind = bridge::IndirectKind::DrawIndexed;
+    indexed.max_count = 2;
+    indexed.stride = 20;
+    indexed.args_buffer = kArgs;
+    CHECK(list.ExecuteIndirect(indexed));
+    {
+        const std::vector<Packet> p = decode(enc, mark2);
+        CHECK(count_op(p, GpuOpcode::CreateShaderModule) == 0 && count_op(p, GpuOpcode::CreateComputePipeline2) == 0);
+        const size_t group = find_op(p, GpuOpcode::CreateBindGroup2);
+        CHECK(group < p.size());
+        if (group < p.size()) {
+            const auto bg = pod<GpuCreateBindGroup2Payload>(p[group]);
+            const auto count_entry = pod<GpuBindGroupEntry2>(p[group], sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
+            CHECK(count_entry.resource_id == kArgs);  // no count buffer: the args buffer stands in
+        }
+        const size_t dispatch = find_op(p, GpuOpcode::DispatchCompute);
+        const std::array<uint32_t, 8> params = indirect_params(p, dispatch);
+        CHECK(params[0] == 0 && params[1] == 5 && params[2] == 2 && params[4] == 0 && params[5] == 1 && params[6] == 300);
+        CHECK(find_op(p, GpuOpcode::SetIndexBuffer) < find_op(p, GpuOpcode::DrawIndexedIndirect));
+        const size_t first = find_op(p, GpuOpcode::DrawIndexedIndirect);
+        CHECK(count_op(p, GpuOpcode::DrawIndexedIndirect) == 2 && first + 1 < p.size());
+        if (first + 1 < p.size()) {
+            CHECK(pod<GpuIndirectPayload>(p[first + 1]).offset - pod<GpuIndirectPayload>(p[first]).offset == 20);
+        }
+    }
+
+    // The same buffers again: cached bind group, a new ring window.
+    const size_t mark3 = enc.size();
+    CHECK(list.ExecuteIndirect(draw));
+    {
+        const std::vector<Packet> p = decode(enc, mark3);
+        CHECK(count_op(p, GpuOpcode::CreateBindGroup2) <= 1);  // only the re-begun pass's own groups
+        CHECK(count_op(p, GpuOpcode::DrawIndirect) == 3);
+    }
+
+    // Over kMaxIndirectCommands: truncated and counted.
+    bridge::IndirectExecution many = draw;
+    many.max_count = bridge::kMaxIndirectCommands + 44;
+    const size_t mark4 = enc.size();
+    CHECK(list.ExecuteIndirect(many));
+    {
+        const std::vector<Packet> p = decode(enc, mark4);
+        CHECK(count_op(p, GpuOpcode::DrawIndirect) == bridge::kMaxIndirectCommands);
+        CHECK(pod<GpuDispatchComputePayload>(p[find_op(p, GpuOpcode::DispatchCompute)]).workgroup_x ==
+              bridge::kMaxIndirectCommands / 64);
+    }
+    CHECK(list.stats().indirect_truncated == 44);
+
+    // Invalid executions are skipped without packets.
+    const size_t mark5 = enc.size();
+    bridge::IndirectExecution bad = draw;
+    bad.stride = 8;  // shorter than a draw record
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.args_buffer = 0;
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.args_offset = 6;  // unaligned
+    CHECK(!list.ExecuteIndirect(bad));
+    bad = draw;
+    bad.kind = bridge::IndirectKind::Dispatch;  // no compute pipeline state
+    bad.stride = 12;
+    CHECK(!list.ExecuteIndirect(bad));
+    CHECK(enc.size() == mark5);
+    CHECK(list.stats().indirect_skipped == 4);
+    bridge::IndirectExecution none = draw;
+    none.max_count = 0;
+    CHECK(list.ExecuteIndirect(none) && enc.size() == mark5);  // nothing to draw
+    list.Close();
+
+    {
+        // Indexed draws without an index buffer are skipped.
+        gpu::CommandEncoder scratch;
+        bridge::CommandListBridge other(scene.device, scratch);
+        scene.bind_root(other);
+        other.OMSetRenderTargets(1, &rtv1, false, nullptr);
+        CHECK(!other.ExecuteIndirect(indexed));
+        CHECK(count_op(decode(scratch), GpuOpcode::DrawIndexedIndirect) == 0);
+    }
+
+    // Dispatches: clamped to the per-dimension limit, then the stage's pipeline and bind groups.
+    constexpr uint64_t kCs = 0xC6;
+    constexpr uint32_t kParams = 403;
+    scene.device.register_shader_module(kCs, 4);
+    scene.device.register_buffer(kParams, 0x330000, 1024);
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc cbv;
+    cbv.parameter_type = d3d::RootParameterType::Cbv;
+    rs.parameters.push_back(cbv);
+    d3d::RootSignature signature;
+    CHECK(d3d::RootSignature::build(rs, &signature).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                              join(0, d3d::DescriptorRangeType::Cbv, 0)});
+    layout.groups.push_back(group);
+    scene.device.register_pipeline_layout(kCs, 0, layout);
+    pso::D3D12ComputePsoDesc desc;
+    desc.cs = kCs;
+    desc.root_signature_id = 11;
+    auto cpso = scene.device.create_compute_pipeline_state(desc, &signature);
+
+    gpu::CommandEncoder cenc;
+    bridge::CommandListBridge compute(scene.device, cenc);
+    CHECK(compute.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+    CHECK(compute.SetComputeRootConstantBufferView(0, 0x330000) == d3d::Status::Ok);
+    compute.SetComputePipelineState(cpso.get());
+    bridge::IndirectExecution dispatch;
+    dispatch.kind = bridge::IndirectKind::Dispatch;
+    dispatch.max_count = 2;
+    dispatch.stride = 12;
+    dispatch.args_buffer = kArgs;
+    dispatch.args_offset = 128;
+    dispatch.count_buffer = kCount;
+    CHECK(compute.ExecuteIndirect(dispatch));
+    compute.Close();
+    {
+        const std::vector<Packet> p = decode(cenc);
+        const size_t clamp = find_op(p, GpuOpcode::DispatchCompute);
+        const size_t first = find_op(p, GpuOpcode::DispatchIndirect);
+        CHECK(clamp < first && first + 1 < p.size() && count_op(p, GpuOpcode::DispatchIndirect) == 2);
+        if (clamp < first && first < p.size()) {
+            CHECK(p[first - 1].opcode == GpuOpcode::SetBindGroup2);
+            bool stage_set = false;
+            for (size_t i = clamp; i < first; ++i) {
+                stage_set |= p[i].opcode == GpuOpcode::SetComputePipeline &&
+                             pod<GpuSetComputePipelinePayload>(p[i]).pipeline_id == cpso->pipeline_id();
+            }
+            CHECK(stage_set);
+            const std::array<uint32_t, 8> params = indirect_params(p, clamp);
+            CHECK(params[0] == 32 && params[1] == 3 && params[2] == 2 && params[3] == 0 && params[4] == 1 &&
+                  params[5] == 2 && params[7] == 65535);
+            CHECK(pod<GpuIndirectPayload>(p[first + 1]).offset - pod<GpuIndirectPayload>(p[first]).offset == 12);
+        }
+    }
+    CHECK(compute.stats().indirect_executions == 1 && compute.stats().indirect_commands == 2);
+
+    // A destroyed argument buffer retires its clamp bind groups: the next use builds a new one.
+    scene.device.unregister_resource(kCount);
+    scene.device.register_buffer(kCount, 0x310000, 256);
+    gpu::CommandEncoder renc;
+    bridge::CommandListBridge again(scene.device, renc);
+    CHECK(again.SetComputeRootSignature(&signature) == d3d::Status::Ok);
+    CHECK(again.SetComputeRootConstantBufferView(0, 0x330000) == d3d::Status::Ok);
+    again.SetComputePipelineState(cpso.get());
+    CHECK(again.ExecuteIndirect(dispatch));
+    again.Close();
+    {
+        const std::vector<Packet> p = decode(renc);
+        bool rebuilt = false;
+        for (const Packet& k : p) {
+            if (k.opcode == GpuOpcode::CreateBindGroup2 && pod<GpuCreateBindGroup2Payload>(k).entry_count == 4) {
+                const auto e = pod<GpuBindGroupEntry2>(k, sizeof(GpuCreateBindGroup2Payload) + 2 * sizeof(GpuBindGroupEntry2));
+                rebuilt |= e.resource_id == kCount;
+            }
+        }
+        CHECK(rebuilt);
+    }
+    CHECK(scene.device.deferred_destroy_count() >= 1);
+}
+
 // Binding arrays (G62, lane-indexed heap windows): with the device capability on, the layout entry
 // carries binding_array_size and the bind group a run of elements; off (default), such a layout is
 // refused and nothing array-shaped reaches the stream.
@@ -3691,6 +3970,7 @@ int main() {
     test_barrier_flushes_pending_clears();
     test_partial_clear_is_reported();
     test_compute_dispatch_packets();
+    test_execute_indirect_packets();
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();

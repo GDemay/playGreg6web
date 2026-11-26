@@ -76,6 +76,9 @@
     SET_BIND_GROUP2: 33,
     CREATE_SAMPLER2: 34,
     CREATE_TEXTURE2: 35,
+    DRAW_INDIRECT: 36,
+    DRAW_INDEXED_INDIRECT: 37,
+    DISPATCH_INDIRECT: 38,
   });
 
   // Canonical opcode names matching runtime/abi/playgta6_abi.h and tools/gpu_trace.py.
@@ -116,6 +119,9 @@
     33: 'SetBindGroup2',
     34: 'CreateSampler2',
     35: 'CreateTexture2',
+    36: 'DrawIndirect',
+    37: 'DrawIndexedIndirect',
+    38: 'DispatchIndirect',
   });
 
   function getOpcodeName(opcode) {
