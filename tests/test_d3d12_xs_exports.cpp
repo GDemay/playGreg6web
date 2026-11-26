@@ -2057,6 +2057,11 @@ void test_gpu_readback() {
         CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         CHECK(load64(word) == 0);
+        // The consumer finally answers: only now does the fence advance.
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(
+            static_cast<uintptr_t>(payload_as<GpuReadbackBufferPayload>(*rbb).done_addr));
+        done->fetch_add(1);
+        CHECK(wait_for([&] { return load64(word) == 2; }));
         scene.release_all({list, gpu_buf, readback, fence});
     }
 }
