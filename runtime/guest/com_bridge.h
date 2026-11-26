@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <tuple>
@@ -235,6 +236,21 @@ void* guest_to_host(uint64_t va, size_t len);
 // The reverse, for host pointers guest_to_host (or a marshaled pointer argument) produced: the
 // window VA for bytes of a translated-window page, else the arena's guest address. 0 for null.
 uint64_t host_to_guest(const void* host);
+
+// A guest range read in place: like guest_to_host(va, len), but for an arena range the arena's lock is
+// held for the view's lifetime, so another guest thread cannot decommit or release the pages while
+// they are being read (a bare guest_to_host pointer can fault if that happens right after it returns).
+// Keep a view short (hash / compare / copy) and never call into the arena while holding one.
+// data() is nullptr when the range is not mapped in one piece. Translated-window ranges are not locked.
+class GuestRangeView {
+public:
+    GuestRangeView(uint64_t va, size_t len);
+    const uint8_t* data() const { return data_; }
+
+private:
+    const uint8_t* data_ = nullptr;
+    std::unique_lock<std::mutex> hold_;
+};
 bool read_guest(uint64_t va, void* dst, size_t len);
 bool write_guest(uint64_t va, const void* src, size_t len);
 
