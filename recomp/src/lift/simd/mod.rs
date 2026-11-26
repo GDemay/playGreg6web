@@ -531,6 +531,157 @@ pub(super) fn reads_only_first_operand(m: Mnemonic) -> bool {
     )
 }
 
+/// Whether `ins` is a vector zeroing idiom that [`FunctionLifter::logic`] lowers directly to
+/// `zeroinitializer` without reading any vector register alloca (`pxor`/`vpxor`/`xorps`/`vxorps`/
+/// `xorpd`/`vxorpd`/`pandn`/`vpandn`/`andnps`/`vandnps`/`andnpd`/`vandnpd` with identical
+/// register sources).
+pub(super) fn is_zeroing_idiom(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    let vex = ins.encoding() == EncodingKind::VEX;
+    let f = Form::of(vex);
+    matches!(
+        ins.mnemonic(),
+        M::Pxor
+            | M::Vpxor
+            | M::Xorps
+            | M::Vxorps
+            | M::Xorpd
+            | M::Vxorpd
+            | M::Pandn
+            | M::Vpandn
+            | M::Andnps
+            | M::Vandnps
+            | M::Andnpd
+            | M::Vandnpd
+    ) && ins.op_count() > f.b
+        && ins.op_kind(f.a) == OpKind::Register
+        && ins.op_kind(f.b) == OpKind::Register
+        && ins.op_register(f.a) == ins.op_register(f.b)
+}
+
+/// Whether a legacy-SSE (non-VEX) instruction with an XMM `op0` destination overwrites all 128
+/// bits of `op0` without reading `op0`'s prior value (zeroing idioms are handled separately by
+/// [`is_zeroing_idiom`]). Every partial-lane write (`movss`/`movsd` reg-reg, `movlps`/`movhps`/
+/// `movlpd`/`movhpd`, `pinsr*`, `insertps`, `blend*`, `extrq`/`insertq`, etc.) returns `false`.
+fn legacy_full_xmm_overwrite(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    match ins.mnemonic() {
+        M::Movaps
+        | M::Movups
+        | M::Movapd
+        | M::Movupd
+        | M::Movdqa
+        | M::Movdqu
+        | M::Lddqu
+        | M::Movntdqa
+        | M::Movd
+        | M::Movq
+        | M::Movsldup
+        | M::Movshdup
+        | M::Movddup
+        | M::Sqrtps
+        | M::Sqrtpd
+        | M::Rcpps
+        | M::Rsqrtps
+        | M::Cvtdq2ps
+        | M::Cvtps2dq
+        | M::Cvttps2dq
+        | M::Cvtdq2pd
+        | M::Cvtpd2dq
+        | M::Cvttpd2dq
+        | M::Cvtps2pd
+        | M::Cvtpd2ps
+        | M::Roundps
+        | M::Roundpd
+        | M::Pshufd
+        | M::Pshuflw
+        | M::Pshufhw
+        | M::Pabsb
+        | M::Pabsw
+        | M::Pabsd
+        | M::Pmovsxbw
+        | M::Pmovsxbd
+        | M::Pmovsxbq
+        | M::Pmovsxwd
+        | M::Pmovsxwq
+        | M::Pmovsxdq
+        | M::Pmovzxbw
+        | M::Pmovzxbd
+        | M::Pmovzxbq
+        | M::Pmovzxwd
+        | M::Pmovzxwq
+        | M::Pmovzxdq
+        | M::Aesimc
+        | M::Aeskeygenassist
+        | M::Phminposuw => true,
+        // `movss/movsd xmm, m32/m64` zero-extends into all 128 bits (`zext_lanes`); reg-reg forms
+        // preserve the upper lanes and MUST NOT be treated as a full overwrite.
+        M::Movss | M::Movsd => ins.op_count() == 2 && ins.op_kind(1) == OpKind::Memory,
+        _ => false,
+    }
+}
+
+/// R64a: for a supported non-trapping SIMD instruction (`is_supported_non_trapping_simd(ins)`),
+/// returns `(reads, full_writes)` bitmasks over `xmm0..15`:
+/// - `reads`: superset of every `xmmN` whose `%xmmN` alloca `lift_simd` may load.
+/// - `full_writes`: subset of every `xmmN` whose `%xmmN` alloca `lift_simd` unconditionally
+///   overwrites (all 128 bits) without loading `%xmmN` first.
+pub(super) fn xmm_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (u16, u16) {
+    use Mnemonic as M;
+    match ins.mnemonic() {
+        M::Vzeroall => return (0, 0xFFFF),
+        M::Vzeroupper => return (0, 0),
+        _ => {}
+    }
+    if is_zeroing_idiom(ins)
+        && ins.op_count() > 0
+        && ins.op_kind(0) == OpKind::Register
+    {
+        let r0 = ins.op_register(0);
+        if (r0.is_xmm() || r0.is_ymm()) && r0.number() < 16 {
+            return (0, 1u16 << r0.number());
+        }
+    }
+    let mut reads = 0u16;
+    if matches!(ins.mnemonic(), M::Blendvps | M::Blendvpd | M::Pblendvb) {
+        reads |= 1u16 << 0;
+    }
+    for ur in info.used_registers() {
+        let r = ur.register();
+        if (r.is_xmm() || r.is_ymm()) && r.number() < 16 && is_read_access(ur.access()) {
+            reads |= 1u16 << r.number();
+        }
+    }
+    // Conservatively mark every explicit source vector operand (1..op_count) as read, even for
+    // dependency-breaking idioms that `iced_x86` omits from `used_registers` (such as `pcmpeqd`
+    // or `psubd` with equal operands) unless `logic()` short-circuits them above.
+    for i in 1..ins.op_count() {
+        if ins.op_kind(i) == OpKind::Register {
+            let r = ins.op_register(i);
+            if (r.is_xmm() || r.is_ymm()) && r.number() < 16 {
+                reads |= 1u16 << r.number();
+            }
+        }
+    }
+    let mut full_writes = 0u16;
+    if ins.op_count() > 0 && ins.op_kind(0) == OpKind::Register {
+        let r0 = ins.op_register(0);
+        if (r0.is_xmm() || r0.is_ymm()) && r0.number() < 16 {
+            let bit = 1u16 << r0.number();
+            let vex = ins.encoding() == EncodingKind::VEX;
+            let pure_full_write = info.op_access(0) == OpAccess::Write
+                && !reads_only_first_operand(ins.mnemonic())
+                && (vex || legacy_full_xmm_overwrite(ins));
+            if pure_full_write && reads & bit == 0 {
+                full_writes |= bit;
+            } else {
+                reads |= bit;
+            }
+        }
+    }
+    (reads, full_writes)
+}
+
 fn valid_mem_addr(ins: &Instruction) -> bool {
     let base = ins.memory_base();
     let index = ins.memory_index();

@@ -381,6 +381,155 @@ fn r63a_elides_redundant_unread_ymmh_zero_stores() {
 }
 
 #[test]
+fn r64a_elides_dead_entry_xmm_loads_soundly() {
+    let has_entry_load = |ir: &str, idx: usize| -> bool {
+        let entry_end = ir.find("\nbb_").expect("entry block ends before bb_");
+        let entry = &ir[..entry_end];
+        entry.contains(&format!("load <2 x i64>, ptr %state.xmm{idx}, align 8"))
+    };
+
+    // 1. Entry-block overwrites (after standard prologue): vmovdqu, movdqu, vmovd, vmovq,
+    //    zeroing idioms (vpxor/pxor/vxorps/vxorpd), and 3-op VEX non-merging arithmetic/unpack
+    //    elide their entry `%state.xmmN` loads while keeping allocas and exit stores.
+    let f_elide = asm_function(0x1000, |a| {
+        a.push(rbx)?;
+        a.sub(rsp, 0x20)?;
+        a.vmovdqu(xmm0, xmmword_ptr(rcx))?; // full load -> elided
+        a.movdqu(xmm1, xmmword_ptr(rdx))?; // legacy full load -> elided
+        a.vmovd(xmm2, eax)?; // zero-extending move -> elided
+        a.vmovq(xmm3, rax)?; // zero-extending move -> elided
+        a.vpxor(xmm4, xmm4, xmm4)?; // VEX zeroing idiom -> elided
+        a.pxor(xmm5, xmm5)?; // legacy zeroing idiom -> elided
+        a.vxorps(xmm6, xmm6, xmm6)?; // VEX float zeroing idiom -> elided
+        a.vxorpd(xmm7, xmm7, xmm7)?; // VEX double zeroing idiom -> elided
+        a.vpaddw(xmm8, xmm9, xmm10)?; // 3-op VEX dst!=src -> xmm8 elided, xmm9/xmm10 kept!
+        a.vpunpcklbw(xmm11, xmm0, xmm4)?; // 3-op VEX dst!=src -> xmm11 elided
+        a.add(rsp, 0x20)?;
+        a.pop(rbx)?;
+        a.ret()
+    });
+    let lifted = lift_function(&f_elide).expect("lifts");
+    let ir = &lifted.ir;
+    assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
+    for idx in [0, 1, 2, 3, 4, 5, 6, 7, 8, 11] {
+        assert!(
+            ir.contains(&format!("  %xmm{idx} = alloca <2 x i64>\n")),
+            "alloca must remain for xmm{idx}:\n{ir}"
+        );
+        assert!(
+            !has_entry_load(ir, idx),
+            "dead entry load for overwritten xmm{idx} must be elided:\n{ir}"
+        );
+        assert!(
+            ir.contains(&format!("ptr %state.xmm{idx}, align 8")),
+            "exit sync_out store must remain for xmm{idx}:\n{ir}"
+        );
+    }
+    for idx in [9, 10] {
+        assert!(
+            has_entry_load(ir, idx),
+            "read-before-write xmm{idx} must keep its entry load:\n{ir}"
+        );
+    }
+
+    // 2. Partial-register writes and read-modify-write instructions MUST preserve entry loads!
+    let f_partial = asm_function(0x2000, |a| {
+        a.movss(xmm0, xmm1)?; // reg-reg partial write (preserves upper 96 bits of xmm0)
+        a.movsd_2(xmm2, xmm3)?; // reg-reg partial write (preserves upper 64 bits of xmm2)
+        a.movlps(xmm4, qword_ptr(rcx))?; // partial half write
+        a.pinsrd(xmm5, eax, 1)?; // partial lane insert
+        a.insertps(xmm6, xmm7, 0)?; // partial lane insert
+        a.blendps(xmm8, xmm9, 0x5)?; // legacy blend reads dst
+        a.blendps(xmm10, xmm11, 0xF)?; // legacy blend even with 0xF mask reads dst in lifter
+        a.paddw(xmm12, xmm13)?; // legacy RMW
+        a.vpaddw(xmm14, xmm14, xmm15)?; // VEX RMW (dst == src1)
+        a.ret()
+    });
+    let lifted_p = lift_function(&f_partial).expect("lifts");
+    let ir_p = &lifted_p.ir;
+    assert!(lifted_p.unsupported.is_empty(), "{:?}", lifted_p.unsupported);
+    for idx in 0..16 {
+        assert!(
+            has_entry_load(ir_p, idx),
+            "partial/RMW xmm{idx} must preserve its entry load:\n{ir_p}"
+        );
+    }
+
+    // 3. FMA3, legacy blendvps (implicit xmm0), and pcmpeqd self-compare MUST preserve entry loads.
+    let f_special = asm_function(0x3000, |a| {
+        a.blendvps(xmm1, xmm2)?; // implicitly reads xmm0 + RMW xmm1
+        a.vfmadd213ps(xmm3, xmm4, xmm5)?; // FMA reads op0 (xmm3)
+        a.pcmpeqd(xmm6, xmm6)?; // lifter loads operands for pcmpeqd -> must NOT elide!
+        a.ret()
+    });
+    let ir_s = lift_function(&f_special).expect("lifts").ir;
+    for idx in [0, 1, 2, 3, 4, 5, 6] {
+        assert!(
+            has_entry_load(&ir_s, idx),
+            "xmm{idx} must preserve its entry load:\n{ir_s}"
+        );
+    }
+
+    // 4. Post-branch writes MUST preserve entry loads (only the entry block is scanned).
+    let f_branch = asm_function(0x4000, |a| {
+        let mut skip = a.create_label();
+        a.test(rcx, rcx)?;
+        a.jz(skip)?;
+        a.vmovdqu(xmm0, xmmword_ptr(rdx))?;
+        a.set_label(&mut skip)?;
+        a.ret()
+    });
+    let ir_b = lift_function(&f_branch).expect("lifts").ir;
+    assert!(
+        has_entry_load(&ir_b, 0),
+        "post-branch write to xmm0 must preserve entry load:\n{ir_b}"
+    );
+
+    // 5. Post-call writes MUST preserve entry loads (callee may observe `%state.xmm0`), while
+    //    writes BEFORE the call are safely elided.
+    let prog_call = Program::new()
+        .asm(0x5000, |a| {
+            a.vpxor(xmm1, xmm1, xmm1)?; // before call -> elided
+            a.call(0x6000)?;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx))?; // after call -> preserved!
+            a.ret()
+        })
+        .asm(0x6000, |a| a.ret());
+    let ir_c = lift_function(&prog_call.function(0x5000)).expect("lifts").ir;
+    assert!(
+        !has_entry_load(&ir_c, 1),
+        "xmm1 written before call should elide entry load:\n{ir_c}"
+    );
+    assert!(
+        has_entry_load(&ir_c, 0),
+        "xmm0 written only after call must preserve entry load:\n{ir_c}"
+    );
+
+    // 6. Writes AFTER a potentially-trapping instruction (`div`, `ldmxcsr`) MUST preserve entry
+    //    loads so `cold_trap`'s `sync_out()` sees live `%state.xmmN`.
+    let f_div = asm_function(0x7000, |a| {
+        a.div(rcx)?;
+        a.vmovdqu(xmm0, xmmword_ptr(rdx))?;
+        a.ret()
+    });
+    let ir_div = lift_function(&f_div).expect("lifts").ir;
+    assert!(
+        has_entry_load(&ir_div, 0),
+        "xmm0 written after potentially-trapping div must preserve entry load:\n{ir_div}"
+    );
+    let f_mxcsr = asm_function(0x8000, |a| {
+        a.ldmxcsr(dword_ptr(rcx))?;
+        a.vmovdqu(xmm0, xmmword_ptr(rdx))?;
+        a.ret()
+    });
+    let ir_mxcsr = lift_function(&f_mxcsr).expect("lifts").ir;
+    assert!(
+        has_entry_load(&ir_mxcsr, 0),
+        "xmm0 written after potentially-trapping ldmxcsr must preserve entry load:\n{ir_mxcsr}"
+    );
+}
+
+#[test]
 fn lifted_functions_require_wasm_simd() {
     let func = asm_function(0x1000, |a| {
         a.sqrtps(xmm0, xmm1)?;
