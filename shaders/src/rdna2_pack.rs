@@ -26,7 +26,9 @@ use std::thread;
 use crate::convert::{ShaderStage, fnv1a_64, format_shader_hash};
 use crate::dxil_reflect::sanitize_source_path;
 use crate::pack::{
-    PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry, PackError, write_json_string, write_pack,
+    PACK_ENTRY_BYTES, PACK_ENTRY_BYTES_V2, PACK_HEADER_BYTES, PACK_VERSION_V1, PACK_VERSION_V2,
+    PackEntry, PackError, PackVersion, resolve_pack_layout, write_json_string,
+    write_pack_with_layout_versioned,
 };
 use crate::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
@@ -170,8 +172,11 @@ impl fmt::Display for BudgetOrder {
 pub struct Rdna2PackOptions {
     /// Default RDNA2 -> WGSL translation options (per-blob overrides/hints take precedence over `Auto`).
     pub translate: Rdna2TranslateOptions,
-    /// `WGPK` v1 header flags word (default `0`).
+    /// `WGPK` header flags word (default `0`).
     pub pack_flags: u32,
+    /// Target `WGPK` binary container version policy (`Auto` selects v1 when the archive fits in
+    /// `u32::MAX` bytes and automatically upgrades to v2 when >4 GiB; `V1` forces v1; `V2` forces v2).
+    pub pack_version: PackVersion,
     /// When `true`, skip individual shaders that fail I/O, hash verification, size checks, or
     /// translation/Naga validation and record them in `summary.failures` instead of aborting.
     pub best_effort: bool,
@@ -179,17 +184,18 @@ pub struct Rdna2PackOptions {
     /// WGSL UTF-8 byte length exceeds `limit` is skipped cleanly instead of packed and counted in
     /// `summary.skipped_oversize`.
     pub max_wgsl_bytes: Option<usize>,
-    /// Optional total `.wgsl.pack` byte budget (capped at `u32::MAX`). When `Some(limit)`,
-    /// select translated stages according to `budget_order` so total output file size
-    /// (header + entry table + payloads) stays within `min(limit, u32::MAX as u64)`, counting
-    /// omitted stages in `summary.skipped_budget` / `summary.omitted_by_budget`.
+    /// Optional total `.wgsl.pack` byte budget (capped at `u32::MAX` when `pack_version == V1`;
+    /// unrestricted 64-bit budget for `Auto` / `V2`). When `Some(limit)`, select translated stages
+    /// according to `budget_order` so total output file size (header + entry table + payloads)
+    /// stays within the effective budget, counting omitted stages in `summary.skipped_budget` /
+    /// `summary.omitted_by_budget`.
     pub max_pack_bytes: Option<u64>,
     /// Candidate selection ordering applied when `max_pack_bytes` limits how many translated
-    /// stages fit in the `WGPK` v1 archive. Defaults to [`BudgetOrder::HashOrder`].
+    /// stages fit in the `WGPK` archive. Defaults to [`BudgetOrder::HashOrder`].
     pub budget_order: BudgetOrder,
     /// Optional ordered list of 64-bit shader hashes (`hash_fnv1a64`) that are always prioritized
     /// ahead of `budget_order` when `max_pack_bytes` limits how many translated stages fit in the
-    /// `WGPK` v1 archive. Duplicate hashes preserve their first-seen priority order.
+    /// `WGPK` archive. Duplicate hashes preserve their first-seen priority order.
     pub priority_hashes: Vec<u64>,
     /// Optional worker thread count for parallel RDNA2 -> WGSL stage translation.
     /// When `None`, defaults to `std::thread::available_parallelism()` (falling back to `1`).
@@ -242,6 +248,7 @@ pub struct Rdna2PackFailureSummary {
 /// zero usernames, zero filenames, and zero raw shader bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Rdna2PackSummary {
+    pub pack_version: u32,
     pub total_blobs: usize,
     pub translated_ok: usize,
     pub skipped_or_failed: usize,
@@ -267,11 +274,24 @@ pub struct Rdna2PackSummary {
 }
 
 impl Rdna2PackSummary {
+    fn resolved_pack_version(&self) -> u32 {
+        if self.pack_version == PACK_VERSION_V2 {
+            PACK_VERSION_V2
+        } else {
+            PACK_VERSION_V1
+        }
+    }
+
     /// Render a strictly sanitized deterministic JSON summary.
     pub fn to_json(&self) -> String {
+        let format_tag = if self.resolved_pack_version() == PACK_VERSION_V2 {
+            "wgpk_v2"
+        } else {
+            "wgpk_v1"
+        };
         let mut out = String::with_capacity(512);
         out.push_str("{\n");
-        out.push_str("  \"format\": \"wgpk_v1\",\n");
+        let _ = writeln!(out, "  \"format\": \"{format_tag}\",");
         out.push_str("  \"isa\": \"rdna2_gfx10_3\",\n");
         let _ = writeln!(out, "  \"total_blobs\": {},", self.total_blobs);
         let _ = writeln!(out, "  \"translated_ok\": {},", self.translated_ok);
@@ -393,8 +413,9 @@ impl Rdna2PackSummary {
 
     /// Render a strictly sanitized deterministic plain-text summary.
     pub fn to_text(&self) -> String {
+        let version = self.resolved_pack_version();
         let mut out = String::with_capacity(256);
-        out.push_str("WGPK v1 RDNA2 shader pack summary\n");
+        let _ = writeln!(out, "WGPK v{version} RDNA2 shader pack summary");
         let _ = writeln!(out, "  total_blobs:       {}", self.total_blobs);
         let _ = writeln!(out, "  translated_ok:     {}", self.translated_ok);
         let _ = writeln!(out, "  skipped_or_failed: {}", self.skipped_or_failed);
@@ -1301,12 +1322,26 @@ fn validate_wgpk_v1_size(
             .map(|n| format!("{n} bytes"))
             .unwrap_or_else(|| "> u64::MAX bytes".to_string());
         return Err(Rdna2PackError::Pack(PackError::Overflow(format!(
-            "WGPK v1 pack size ({total_desc} across {entry_count} stages; total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}) exceeds u32::MAX ({} bytes); re-run with --max-wgsl-bytes <N> and/or --max-pack-bytes <N>",
+            "WGPK v1 pack size ({total_desc} across {entry_count} stages; total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}) exceeds u32::MAX ({} bytes); re-run with --pack-version 2 (or auto), --max-wgsl-bytes <N>, and/or --max-pack-bytes <N>",
             u32::MAX
         ))));
     }
 
     Ok(projected_total.unwrap())
+}
+
+fn validate_wgpk_size(
+    pack_version: PackVersion,
+    entry_count: usize,
+    total_wgsl_bytes: u64,
+    largest_wgsl_bytes: usize,
+) -> Result<u64, Rdna2PackError> {
+    if pack_version == PackVersion::V1 {
+        return validate_wgpk_v1_size(entry_count, total_wgsl_bytes, largest_wgsl_bytes);
+    }
+    let layout = resolve_pack_layout(pack_version, entry_count, total_wgsl_bytes)
+        .map_err(Rdna2PackError::Pack)?;
+    Ok(layout.total_size)
 }
 
 fn build_pack_result(
@@ -1321,98 +1356,124 @@ fn build_pack_result(
     }
     let priority_hashes_requested = priority_rank.len();
 
-    let (selected_by_hash, expected_pack_bytes): (
-        BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)>,
-        u64,
-    ) = if let Some(max_pack) = options.max_pack_bytes {
-        let effective_budget = max_pack.min(u64::from(u32::MAX));
-        let mut priority_candidates: Vec<(usize, u64, usize, PackEntry, Rdna2PackEntrySummary)> =
-            Vec::new();
-        let mut regular_candidates: Vec<(u64, usize, PackEntry, Rdna2PackEntrySummary)> =
-            Vec::with_capacity(state.candidates_by_hash.len());
-
-        for (hash, (source_order, entry, summary)) in state.candidates_by_hash {
-            if let Some(&rank) = priority_rank.get(&hash) {
-                priority_candidates.push((rank, hash, source_order, entry, summary));
-            } else {
-                regular_candidates.push((hash, source_order, entry, summary));
-            }
-        }
-
-        // Priority shaders are always selected first in priority-file order.
-        priority_candidates.sort_by_key(|(rank, ..)| *rank);
-
-        // Remaining non-priority shaders follow the configured `budget_order`.
-        match options.budget_order {
-            BudgetOrder::HashOrder => {
-                // Already sorted by ascending 64-bit hash from `BTreeMap`.
-            }
-            BudgetOrder::SmallestFirst => {
-                regular_candidates.sort_by(|a, b| {
-                    a.2.wgsl
-                        .len()
-                        .cmp(&b.2.wgsl.len())
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-            }
-            BudgetOrder::ManifestOrder => {
-                regular_candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-            }
-        }
-
-        let mut current_pack_bytes = PACK_HEADER_BYTES as u64;
-        let mut selected: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-
-        // Phase 1: pack priority-listed shaders first in priority-file order.
-        // A priority shader that exceeds remaining budget is skipped without halting smaller
-        // subsequent priority or non-priority shaders.
-        for (_rank, hash, _source_order, entry, summary) in priority_candidates {
-            let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(entry.wgsl.len() as u64);
-            let projected = current_pack_bytes.saturating_add(entry_cost);
-            if projected <= effective_budget {
-                current_pack_bytes = projected;
-                selected.insert(hash, (entry, summary));
-            } else {
-                state.skipped_budget += 1;
-                state.skipped_or_failed += 1;
-            }
-        }
-
-        // Phase 2: fill remaining budget with non-priority shaders according to `budget_order`.
-        let mut budget_exhausted = false;
-        for (hash, _source_order, entry, summary) in regular_candidates {
-            let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(entry.wgsl.len() as u64);
-            let projected = current_pack_bytes.saturating_add(entry_cost);
-            if !budget_exhausted && projected <= effective_budget {
-                current_pack_bytes = projected;
-                selected.insert(hash, (entry, summary));
-            } else {
-                // `HashOrder` stops at the first candidate exceeding the budget to preserve
-                // legacy behavior 100%; `SmallestFirst` is ordered by ascending WGSL size so
-                // no later candidate can fit either. `ManifestOrder` continues scanning so a
-                // single large early stage does not block smaller early-manifest stages.
-                if matches!(
-                    options.budget_order,
-                    BudgetOrder::HashOrder | BudgetOrder::SmallestFirst
-                ) {
-                    budget_exhausted = true;
+    let selected_by_hash: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> =
+        if let Some(max_pack) = options.max_pack_bytes {
+            let (effective_budget, entry_record_bytes) = match options.pack_version {
+                PackVersion::V1 => (max_pack.min(u64::from(u32::MAX)), PACK_ENTRY_BYTES as u64),
+                PackVersion::V2 => (max_pack, PACK_ENTRY_BYTES_V2 as u64),
+                PackVersion::Auto => {
+                    if max_pack <= u64::from(u32::MAX) {
+                        (max_pack, PACK_ENTRY_BYTES as u64)
+                    } else {
+                        // Only pay 24-byte v2 TOC overhead when candidates cannot fit in v1.
+                        let all_wgsl: u64 = state
+                            .candidates_by_hash
+                            .values()
+                            .fold(0u64, |acc, (_, e, _)| acc.saturating_add(e.wgsl.len() as u64));
+                        let all_v1_size = (PACK_HEADER_BYTES as u64)
+                            .saturating_add(
+                                (state.candidates_by_hash.len() as u64)
+                                    .saturating_mul(PACK_ENTRY_BYTES as u64),
+                            )
+                            .saturating_add(all_wgsl);
+                        if all_v1_size <= u64::from(u32::MAX) {
+                            (max_pack, PACK_ENTRY_BYTES as u64)
+                        } else {
+                            (max_pack, PACK_ENTRY_BYTES_V2 as u64)
+                        }
+                    }
                 }
-                state.skipped_budget += 1;
-                state.skipped_or_failed += 1;
-            }
-        }
+            };
+            let mut priority_candidates: Vec<(
+                usize,
+                u64,
+                usize,
+                PackEntry,
+                Rdna2PackEntrySummary,
+            )> = Vec::new();
+            let mut regular_candidates: Vec<(u64, usize, PackEntry, Rdna2PackEntrySummary)> =
+                Vec::with_capacity(state.candidates_by_hash.len());
 
-        (selected, current_pack_bytes)
-    } else {
-        let mut current_pack_bytes = PACK_HEADER_BYTES as u64;
-        let mut selected: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
-        for (hash, (_source_order, entry, summary)) in state.candidates_by_hash {
-            let entry_cost = (PACK_ENTRY_BYTES as u64).saturating_add(entry.wgsl.len() as u64);
-            current_pack_bytes = current_pack_bytes.saturating_add(entry_cost);
-            selected.insert(hash, (entry, summary));
-        }
-        (selected, current_pack_bytes)
-    };
+            for (hash, (source_order, entry, summary)) in state.candidates_by_hash {
+                if let Some(&rank) = priority_rank.get(&hash) {
+                    priority_candidates.push((rank, hash, source_order, entry, summary));
+                } else {
+                    regular_candidates.push((hash, source_order, entry, summary));
+                }
+            }
+
+            // Priority shaders are always selected first in priority-file order.
+            priority_candidates.sort_by_key(|(rank, ..)| *rank);
+
+            // Remaining non-priority shaders follow the configured `budget_order`.
+            match options.budget_order {
+                BudgetOrder::HashOrder => {
+                    // Already sorted by ascending 64-bit hash from `BTreeMap`.
+                }
+                BudgetOrder::SmallestFirst => {
+                    regular_candidates.sort_by(|a, b| {
+                        a.2.wgsl
+                            .len()
+                            .cmp(&b.2.wgsl.len())
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                }
+                BudgetOrder::ManifestOrder => {
+                    regular_candidates
+                        .sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+                }
+            }
+
+            let mut current_pack_bytes = PACK_HEADER_BYTES as u64;
+            let mut selected: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
+
+            // Phase 1: pack priority-listed shaders first in priority-file order.
+            // A priority shader that exceeds remaining budget is skipped without halting smaller
+            // subsequent priority or non-priority shaders.
+            for (_rank, hash, _source_order, entry, summary) in priority_candidates {
+                let entry_cost = entry_record_bytes.saturating_add(entry.wgsl.len() as u64);
+                let projected = current_pack_bytes.saturating_add(entry_cost);
+                if projected <= effective_budget {
+                    current_pack_bytes = projected;
+                    selected.insert(hash, (entry, summary));
+                } else {
+                    state.skipped_budget += 1;
+                    state.skipped_or_failed += 1;
+                }
+            }
+
+            // Phase 2: fill remaining budget with non-priority shaders according to `budget_order`.
+            let mut budget_exhausted = false;
+            for (hash, _source_order, entry, summary) in regular_candidates {
+                let entry_cost = entry_record_bytes.saturating_add(entry.wgsl.len() as u64);
+                let projected = current_pack_bytes.saturating_add(entry_cost);
+                if !budget_exhausted && projected <= effective_budget {
+                    current_pack_bytes = projected;
+                    selected.insert(hash, (entry, summary));
+                } else {
+                    // `HashOrder` stops at the first candidate exceeding the budget to preserve
+                    // legacy behavior 100%; `SmallestFirst` is ordered by ascending WGSL size so
+                    // no later candidate can fit either. `ManifestOrder` continues scanning so a
+                    // single large early stage does not block smaller early-manifest stages.
+                    if matches!(
+                        options.budget_order,
+                        BudgetOrder::HashOrder | BudgetOrder::SmallestFirst
+                    ) {
+                        budget_exhausted = true;
+                    }
+                    state.skipped_budget += 1;
+                    state.skipped_or_failed += 1;
+                }
+            }
+
+            selected
+        } else {
+            let mut selected: BTreeMap<u64, (PackEntry, Rdna2PackEntrySummary)> = BTreeMap::new();
+            for (hash, (_source_order, entry, summary)) in state.candidates_by_hash {
+                selected.insert(hash, (entry, summary));
+            }
+            selected
+        };
 
     let mut entries: Vec<PackEntry> = Vec::with_capacity(selected_by_hash.len());
     let mut entry_summaries: Vec<Rdna2PackEntrySummary> =
@@ -1449,19 +1510,28 @@ fn build_pack_result(
         total_wgsl_bytes = total_wgsl_bytes.saturating_add(wgsl_len as u64);
     }
 
-    let _ = validate_wgpk_v1_size(entries.len(), total_wgsl_bytes, largest_wgsl_bytes)?;
+    let expected_pack_bytes = validate_wgpk_size(
+        options.pack_version,
+        entries.len(),
+        total_wgsl_bytes,
+        largest_wgsl_bytes,
+    )?;
 
-    let pack_bytes = write_pack(&entries, options.pack_flags).map_err(|err| match err {
-        PackError::Overflow(_) => Rdna2PackError::Pack(PackError::Overflow(format!(
-            "WGPK v1 pack size (total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}, entries={}) exceeds u32::MAX ({} bytes); re-run with --max-wgsl-bytes <N> and/or --max-pack-bytes <N>",
-            entries.len(),
-            u32::MAX
-        ))),
-        other => Rdna2PackError::Pack(other),
-    })?;
-    debug_assert_eq!(expected_pack_bytes, pack_bytes.len() as u64);
+    let written = write_pack_with_layout_versioned(&entries, options.pack_flags, options.pack_version)
+        .map_err(|err| match err {
+            PackError::Overflow(_) if options.pack_version == PackVersion::V1 => {
+                Rdna2PackError::Pack(PackError::Overflow(format!(
+                    "WGPK v1 pack size (total_wgsl_bytes={total_wgsl_bytes}, largest_wgsl_bytes={largest_wgsl_bytes}, entries={}) exceeds u32::MAX ({} bytes); re-run with --pack-version 2 (or auto), --max-wgsl-bytes <N>, and/or --max-pack-bytes <N>",
+                    entries.len(),
+                    u32::MAX
+                )))
+            }
+            other => Rdna2PackError::Pack(other),
+        })?;
+    debug_assert_eq!(expected_pack_bytes, written.bytes.len() as u64);
 
     let summary = Rdna2PackSummary {
+        pack_version: written.version,
         total_blobs: state.total_blobs,
         translated_ok: entries.len(),
         skipped_or_failed: state.skipped_or_failed,
@@ -1481,13 +1551,13 @@ fn build_pack_result(
         vertex_packed: vertex_count,
         fragment_packed: pixel_count,
         compute_packed: compute_count,
-        pack_bytes: pack_bytes.len(),
+        pack_bytes: written.bytes.len(),
         entries: entry_summaries,
         failures: state.failures,
     };
 
     Ok(Rdna2PackResult {
-        pack_bytes,
+        pack_bytes: written.bytes,
         entries,
         summary,
     })
@@ -3654,6 +3724,7 @@ mod tests {
         let err = validate_wgpk_v1_size(1, max_single_payload + 1, 2_097_152)
             .expect_err("total size exceeding u32::MAX must fail");
         let msg = err.to_string();
+        assert!(msg.contains("--pack-version 2"), "err: {msg}");
         assert!(msg.contains("--max-wgsl-bytes"), "err: {msg}");
         assert!(msg.contains("--max-pack-bytes"), "err: {msg}");
         assert!(
@@ -3661,6 +3732,79 @@ mod tests {
             "err: {msg}"
         );
         assert!(msg.contains("largest_wgsl_bytes=2097152"), "err: {msg}");
+
+        // Auto & V2 seamlessly accept >4 GiB projected totals using 24-byte v2 TOC entries,
+        // while forced V1 rejects them cleanly.
+        assert!(
+            validate_wgpk_size(PackVersion::V1, 1, max_single_payload + 1, 2_097_152).is_err()
+        );
+        let auto_v2_total =
+            validate_wgpk_size(PackVersion::Auto, 1, max_single_payload + 1, 2_097_152)
+                .expect("Auto upgrades >4 GiB pack to WGPK v2");
+        assert_eq!(
+            auto_v2_total,
+            PACK_HEADER_BYTES as u64 + PACK_ENTRY_BYTES_V2 as u64 + max_single_payload + 1
+        );
+        let explicit_v2_total =
+            validate_wgpk_size(PackVersion::V2, 1, max_single_payload + 1, 2_097_152)
+                .expect("V2 accepts >4 GiB pack");
+        assert_eq!(explicit_v2_total, auto_v2_total);
+    }
+
+    #[test]
+    fn pack_rdna2_blobs_explicit_wgpk_v2_round_trip_and_budget() {
+        let cs_bytes = build_minimal_compute_rdna2();
+        let ps_bytes = build_textured_splash_ps_rdna2();
+        let vs_bytes = build_fullscreen_triangle_vs_rdna2();
+
+        let blobs = vec![
+            Rdna2BlobInput::new("a_cs_0000000000009001.rdna2", cs_bytes),
+            Rdna2BlobInput::new("b_ps_0000000000009002.rdna2", ps_bytes),
+            Rdna2BlobInput::new("c_vs_0000000000009003.rdna2", vs_bytes),
+        ];
+
+        let v1_res = pack_rdna2_blobs(&blobs, &Rdna2PackOptions::default()).unwrap();
+        assert_eq!(v1_res.summary.pack_version, PACK_VERSION_V1);
+        assert!(v1_res.summary.to_json().contains("\"format\": \"wgpk_v1\""));
+        assert!(v1_res.summary.to_text().starts_with("WGPK v1 "));
+
+        let v2_opts = Rdna2PackOptions {
+            pack_version: PackVersion::V2,
+            ..Rdna2PackOptions::default()
+        };
+        let v2_res = pack_rdna2_blobs(&blobs, &v2_opts).expect("v2 rdna2 pack should succeed");
+        assert_eq!(v2_res.summary.pack_version, PACK_VERSION_V2);
+        assert_eq!(v2_res.pack_bytes.len() - v1_res.pack_bytes.len(), 4 * 3);
+        assert!(v2_res.summary.to_json().contains("\"format\": \"wgpk_v2\""));
+        assert!(v2_res.summary.to_text().starts_with("WGPK v2 "));
+
+        let decoded_v2 = read_pack(&v2_res.pack_bytes).expect("v2 pack must decode");
+        assert_eq!(decoded_v2.version, PACK_VERSION_V2);
+        assert_eq!(decoded_v2.entries.len(), 3);
+        let decoded_v1 = read_pack(&v1_res.pack_bytes).unwrap();
+        for (e1, e2) in decoded_v1.entries.iter().zip(decoded_v2.entries.iter()) {
+            assert_eq!(e1.hash, e2.hash);
+            assert_eq!(e1.stage, e2.stage);
+            assert_eq!(e1.wgsl, e2.wgsl);
+            assert_eq!(e2.offset, e1.offset + 12); // 3 entries * +4 bytes in TOC
+        }
+
+        // Exact v2 budget uses 24-byte TOC records per entry.
+        let len_a = v2_res.entries[0].wgsl.len() as u64;
+        let one_v2_budget = PACK_HEADER_BYTES as u64 + PACK_ENTRY_BYTES_V2 as u64 + len_a;
+        let budgeted_v2 = pack_rdna2_blobs(
+            &blobs,
+            &Rdna2PackOptions {
+                pack_version: PackVersion::V2,
+                max_pack_bytes: Some(one_v2_budget),
+                ..Rdna2PackOptions::default()
+            },
+        )
+        .expect("v2 budgeted pack should succeed");
+        assert_eq!(budgeted_v2.summary.pack_version, PACK_VERSION_V2);
+        assert_eq!(budgeted_v2.summary.translated_ok, 1);
+        assert_eq!(budgeted_v2.summary.skipped_budget, 2);
+        assert_eq!(budgeted_v2.pack_bytes.len() as u64, one_v2_budget);
     }
 
     #[test]
