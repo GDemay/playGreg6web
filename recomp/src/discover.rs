@@ -243,6 +243,10 @@ fn clip_inferred(
     mut table: JumpTable,
     bases: &BTreeSet<u64>,
 ) -> JumpTable {
+    table.alternates = std::mem::take(&mut table.alternates)
+        .into_iter()
+        .map(|t| clip_inferred(blocks, t, bases))
+        .collect();
     if !table.inferred || table.index.is_some() {
         return table;
     }
@@ -275,6 +279,9 @@ fn clip_inferred(
 }
 
 fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Vec<Relocation>) {
+    for alternate in &table.alternates {
+        jump_table_relocations(image, alternate, out);
+    }
     let mut push = |site, kind, target| {
         out.push(Relocation {
             site,
@@ -925,7 +932,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
 
     /// Base address of every resolved jump table.
     fn table_bases(&self) -> BTreeSet<u64> {
-        self.jump_tables.values().map(|t| t.table).collect()
+        self.jump_tables
+            .values()
+            .flat_map(JumpTable::tables)
+            .map(|t| t.table)
+            .collect()
     }
 
     /// [`Self::match_jump_table_raw`] with an inferred extent cut at the start of the next known
@@ -976,7 +987,76 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
             first.get_or_insert(table);
         }
-        first
+        self.match_constant_sets(&trace, first_block, preds, leaf, &all)
+            .or(first)
+    }
+
+    /// A dispatch whose table base (or another register the slice reads) holds one of a few
+    /// constants on the paths into the merge ([`reach::reaching_constant_sets`]): the slice runs
+    /// once per constant, with that constant stated last in front of the trace (after the facts
+    /// that hold on every path). The jump resolves only when every constant yields a table; equal
+    /// tables collapse, distinct ones become [`JumpTable::alternates`] of the one with the lowest
+    /// base. Since every path brings one of the constants, the union of the tables is every case
+    /// the jump can take under the proofs of the single tables.
+    fn match_constant_sets(
+        &self,
+        trace: &[Step<'_>],
+        first_block: u64,
+        preds: &BTreeMap<u64, Pred>,
+        leaf: Option<(u64, u64)>,
+        all: &[(Instruction, bool)],
+    ) -> Option<JumpTable> {
+        let live = live_in_registers(trace);
+        if live.is_empty() {
+            return None;
+        }
+        let preds_of = |b: u64| -> Vec<u64> {
+            preds.get(&b).map_or_else(Vec::new, |p| {
+                let mut v = Vec::with_capacity(1 + p.others.len());
+                v.push(p.from);
+                v.extend(p.others.iter().copied());
+                v
+            })
+        };
+        let is_entry = |b: u64| {
+            self.entries.contains(&b)
+                || self.return_sites.contains(&b)
+                || self.resume_targets.contains(&b)
+        };
+        let sets =
+            reach::reaching_constant_sets(&self.blocks, &preds_of, &is_entry, first_block, &live)?;
+        let contains = |va: u64| self.image.contains(va);
+        'regs: for (reg, values) in sets {
+            let mut tables: Vec<JumpTable> = Vec::with_capacity(values.len());
+            for value in values {
+                let mut prefix = all.to_vec();
+                let stated = reach::synthesize(
+                    reg,
+                    reach::Known::Range {
+                        lo: value,
+                        hi: value,
+                    },
+                    &contains,
+                );
+                if stated.is_empty() {
+                    continue 'regs;
+                }
+                prefix.extend(stated);
+                let Some(table) =
+                    jump_table::resolve_in(self.image, &prefixed(&prefix, trace), leaf)
+                else {
+                    continue 'regs;
+                };
+                tables.push(table);
+            }
+            tables.sort();
+            tables.dedup();
+            let mut tables = tables.into_iter();
+            let mut primary = tables.next()?;
+            primary.alternates = tables.collect();
+            return Some(primary);
+        }
+        None
     }
 
     /// Why each indirect jump without an import slot that is left to run-time dispatch did not
@@ -1064,7 +1144,7 @@ impl<'i, 'a> Discovery<'i, 'a> {
         .collect();
         // Tables found in the same round bound each other's inferred extents too.
         let mut bases = self.table_bases();
-        bases.extend(matched.iter().map(|t| t.table));
+        bases.extend(matched.iter().flat_map(JumpTable::tables).map(|t| t.table));
         let resolved: Vec<JumpTable> = matched
             .into_iter()
             .map(|t| clip_inferred(&self.blocks, t, &bases))
@@ -1083,10 +1163,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 .jump_block(table.site)
                 .and_then(|start| self.blocks.get_mut(&start))
             {
-                let targets: BTreeSet<u64> = table.targets.iter().copied().collect();
+                let targets: BTreeSet<u64> = table.all_targets().collect();
                 block.successors = targets.into_iter().map(Edge::JumpTable).collect();
             }
-            for &target in &table.targets {
+            for target in table.unique_targets() {
                 self.add_leader(target);
             }
             self.jump_tables.insert(table.site, table);
@@ -1158,10 +1238,10 @@ impl<'i, 'a> Discovery<'i, 'a> {
                 .jump_block(table.site)
                 .and_then(|start| self.blocks.get_mut(&start))
             {
-                let targets: BTreeSet<u64> = table.targets.iter().copied().collect();
+                let targets: BTreeSet<u64> = table.all_targets().collect();
                 block.successors = targets.into_iter().map(Edge::JumpTable).collect();
             }
-            for &target in &table.targets {
+            for target in table.unique_targets() {
                 self.add_leader(target);
             }
             self.jump_tables.insert(table.site, table);
@@ -1367,6 +1447,7 @@ mod tests {
             targets: (0..n as u64).map(|i| TEXT + 0x100 + i).collect(),
             index: None,
             inferred,
+            alternates: Vec::new(),
         };
         let bases = BTreeSet::from([DATA, DATA + 0x10, DATA + 0x20]);
         let clipped = clip_inferred(&blocks, table(20, true), &bases);
@@ -2458,6 +2539,7 @@ mod tests {
             targets: vec![high_start, high_start + 1, high_start + 2],
             index: None,
             inferred: false,
+            alternates: Vec::new(),
         };
         let mut relocs = Vec::new();
         jump_table_relocations(&image, &table, &mut relocs);
