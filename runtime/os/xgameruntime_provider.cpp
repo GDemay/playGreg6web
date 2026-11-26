@@ -115,9 +115,9 @@
 //     s11/s12 DeleteContainerAsync/Result h; s7, s10, s18, s26, s27 (no title wrappers) by the
 //     same order m. s15 (no wrapper; GetContainerInfo; the public header has no such function, so
 //     its signature is unknown) answers E_NOTIMPL without touching any argument.
-//   Stub-only (every slot logs and traps, so the first boot reports what it needs):
-//     XGameEventWrite {bbfbdcc7-...}, {1b339674-...} (XDisplay?), and unmapped
-//     {a4f1aee2-...}, {dfcd4649-...}.
+//   R40 non-trapping stub-only interfaces (every slot logs, then answers one documented HRESULT):
+//     events {bbfbdcc7-...} S_OK, shell {1b339674-...} and capture {a4f1aee2-...}
+//     HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED), XGameUi {dfcd4649-...} E_ABORT.
 //   {b884675d-...}: s3 is called through a wrapper that takes one pointer, passes a zeroed 0x90-byte
 //     local as the hidden return slot and copies 0x90 bytes from the returned pointer: a
 //     no-argument function returning a 144-byte struct by value, i.e. XSystemGetAnalyticsInfo()
@@ -2206,26 +2206,37 @@ constexpr auto kSpeechTable = slot_table<7>({
 });
 constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
                                                             kSpeechTable.slots, {.slot_count = 32});
-constexpr auto kIEvent = com::declare_interface<StubApi>("xgameruntime.XGameEvent", kEventGuid, {},
-                                                         {.slot_count = 16});
-constexpr auto kIDisplay = com::declare_interface<StubApi>("xgameruntime.{1b339674} (XDisplay?)", kDisplayGuid,
-                                                           {}, {.slot_count = 16});
+// R40: the four areas the title reaches from its legal and privacy screens no longer trap. Slot
+// numbers are not identified, so every slot of an interface answers one documented HRESULT:
+//   events {bbfbdcc7}: S_OK (writes accepted and dropped, truthful no-op);
+//   shell {1b339674}: HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) (URI launch not supported);
+//   capture {a4f1aee2}: ERROR_NOT_SUPPORTED (screenshots);
+//   XGameUi {dfcd4649}: E_ABORT (dialogs behave as cancelled by the user).
+constexpr int32_t kHrNotSupported = static_cast<int32_t>(0x80070032u);  // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+constexpr auto kIEvent = com::declare_interface<StubApi>(
+    "xgameruntime.XGameEvent", kEventGuid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = 0});
+constexpr auto kIDisplay = com::declare_interface<StubApi>(
+    "xgameruntime.{1b339674} (shell)", kDisplayGuid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = kHrNotSupported});
 using HD = M<HdrModeApi>;
 constexpr auto kUnmapped3Table = slot_table<2>({
     {4, HD::method<&HdrModeApi::TryEnableHdrMode>("XDisplayTryEnableHdrMode")},
 });
 constexpr auto kIUnmapped3 = com::declare_interface<HdrModeApi>("xgameruntime.{03f0fe74}", kUnmapped3Iid,
                                                                 kUnmapped3Table.slots, {.slot_count = 16});
-constexpr auto kIUnmapped9 = com::declare_interface<StubApi>("xgameruntime.{a4f1aee2}", kUnmapped9Iid, {},
-                                                             {.slot_count = 16});
+constexpr auto kIUnmapped9 = com::declare_interface<StubApi>(
+    "xgameruntime.{a4f1aee2} (capture)", kUnmapped9Iid, {},
+    {.slot_count = 16, .policy = com::SlotPolicy::ReturnFixed, .stub_result = kHrNotSupported});
 using AI = M<AnalyticsInfoApi>;
 constexpr auto kUnmapped10Table = slot_table<1>({
     {3, AI::method<&AnalyticsInfoApi::GetAnalyticsInfo>("XSystemGetAnalyticsInfo")},
 });
 constexpr auto kIUnmapped10 = com::declare_interface<AnalyticsInfoApi>(
     "xgameruntime.{b884675d}", kUnmapped10Guid, kUnmapped10Table.slots, {.slot_count = 16});
-constexpr auto kIUnmapped13 = com::declare_interface<StubApi>("xgameruntime.{dfcd4649}", kUnmapped13Iid, {},
-                                                              {.slot_count = 32});
+constexpr auto kIUnmapped13 = com::declare_interface<StubApi>(
+    "xgameruntime.{dfcd4649} (XGameUi)", kUnmapped13Iid, {},
+    {.slot_count = 32, .policy = com::SlotPolicy::ReturnFixed, .stub_result = E_ABORT_HR});
 
 // ---------------------------------------------------------------------------
 // API table and singletons

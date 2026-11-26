@@ -943,27 +943,36 @@ void test_unimplemented_slots() {
     CHECK(fault.info.detail == 8);
     CHECK(diag_contains("slot 8 called"));
 
-    // A stub-only interface reports its slots too.
-    int32_t hr = -1;
-    const uint64_t unmapped = fx.query(kUnmappedProvider, kUnmappedIid, &hr);
-    CHECK(hr == 0 && unmapped != 0);
-    trapped = false;
-    try {
-        fx.vcall(unmapped, 7, {1, 2, 3});
-    } catch (const GuestFault& f) {
-        fault = f;
-        trapped = true;
-    }
-    fx.restore_stack();
-    CHECK(trapped && fault.info.detail == 7);
-    bool reported = false;
-    for (const com::StubHit& hit : com::stub_hit_report()) {
-        if (hit.slot == 7 && hit.iid == kUnmappedIid && hit.hits == 1) {
-            reported = true;
+    // R40: stub-only interfaces no longer trap; each answers one documented HRESULT and counts hits.
+    const struct {
+        Guid provider;
+        Guid iid;
+        uint32_t expected;
+    } areas[] = {
+        {kUnmappedProvider, kUnmappedIid, 0x80004004u},                                        // XGameUi: E_ABORT
+        {com::make_guid("1b339674-328d-4283-a200-3171f18d3639"),
+         com::make_guid("1b339674-328d-4283-a200-3171f18d3639"), 0x80070032u},                 // shell
+        {com::make_guid("a4f1aee2-4bf1-4485-b008-a7c26d52ac27"),
+         com::make_guid("22e672d7-b4e3-406c-bd50-8f0d25236f9e"), 0x80070032u},                 // capture
+        {com::make_guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d"),
+         com::make_guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d"), 0u},                          // events
+    };
+    for (const auto& area : areas) {
+        int32_t hr = -1;
+        const uint64_t obj = fx.query(area.provider, area.iid, &hr);
+        CHECK(hr == 0 && obj != 0);
+        const uint64_t r = fx.vcall(obj, 7, {1, 2, 3});
+        fx.restore_stack();
+        CHECK(static_cast<uint32_t>(r) == area.expected);
+        bool reported = false;
+        for (const com::StubHit& hit : com::stub_hit_report()) {
+            if (hit.slot == 7 && hit.iid == area.iid && hit.hits == 1) {
+                reported = true;
+            }
         }
+        CHECK(reported);
+        CHECK(fx.vcall(obj, 2) >= 1);  // IUnknown still works
     }
-    CHECK(reported);
-    CHECK(fx.vcall(unmapped, 2) >= 1);  // IUnknown still works
 }
 
 uint64_t make_guest_block(Fixture& fx, uint64_t queue) {
