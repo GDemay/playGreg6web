@@ -721,8 +721,10 @@ test('W359: W342 mid-frame deferred destroys remain intact across hot-loop poole
   processor.executeCommandBuffer(frame2);
 
   // Resources must NOT be destroyed yet while the submitted fence is pending.
+  // Frame 1 had zero deferred destroys (so zero queue.onSubmittedWorkDone() stall);
+  // frame 2 queued 2 destroys and requested exactly 1 fence.
   assert.equal(mock.destroyedResources.length, 0);
-  assert.equal(mock.pendingFences.length, 2);
+  assert.equal(mock.pendingFences.length, 1);
 
   // Resolve fences and yield microtasks -> deferred destroys execute exactly once.
   for (const resolve of mock.pendingFences) resolve();

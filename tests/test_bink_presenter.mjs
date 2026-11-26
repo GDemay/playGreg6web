@@ -3133,3 +3133,155 @@ test('W316: triple-buffered 4K playback preserves 100% W280 bind-group LRU cache
   capPresenter.destroy();
   presenter.destroy();
 });
+
+test('allowUnalignedDirectUpload skips 256-byte CPU row repack for direct queue.writeTexture (4K & 1080p YUV420P, RGBA8, SAB)', () => {
+  const device = createMockWebGpuDevice();
+  const presenter = new BinkVideoPresenter({
+    device,
+    enableTripleBuffering: true,
+    allowUnalignedDirectUpload: true,
+    chromaOrder: BINK_CHROMA_ORDER.YVU,
+  });
+  assert.equal(presenter.allowUnalignedDirectUpload, true);
+  assert.equal(presenter.getStats().allowUnalignedDirectUpload, true);
+
+  // 4K YUV420P: Y is 3840x2160 (already 256B-aligned), U/V are 1920x1080 (NOT 256B-aligned).
+  // With allowUnalignedDirectUpload: true, all 3 planes upload directly with zero repack and
+  // zero scratch allocations!
+  const y4k = new Uint8Array(3840 * 2160);
+  const cr4k = new Uint8Array(1920 * 1080);
+  const cb4k = new Uint8Array(1920 * 1080);
+  y4k.fill(200);
+  cr4k.fill(111);
+  cb4k.fill(144);
+
+  const res4k = presenter.uploadYuv420Frame({
+    y: y4k,
+    u: cr4k,
+    v: cb4k,
+    width: 3840,
+    height: 2160,
+  });
+  assert.equal(res4k.yBytesPerRow, 3840);
+  assert.equal(res4k.uvBytesPerRow, 1920);
+  assert.equal(res4k.yZeroCopy, true);
+  assert.equal(res4k.chromaZeroCopy, true);
+
+  const planeWrites4k = device.writeTextureCalls.filter(
+    (c) => c.dest.texture.label !== 'playgta6-bink-presenter-dummy'
+  );
+  assert.equal(planeWrites4k.length, 3);
+  assert.equal(planeWrites4k[0].rawData, y4k);
+  assert.equal(planeWrites4k[0].dataLayout.bytesPerRow, 3840);
+  assert.equal(planeWrites4k[1].rawData, cr4k);
+  assert.equal(planeWrites4k[1].dataLayout.bytesPerRow, 1920);
+  assert.equal(planeWrites4k[2].rawData, cb4k);
+  assert.equal(planeWrites4k[2].dataLayout.bytesPerRow, 1920);
+
+  let stats = presenter.getStats();
+  assert.equal(stats.directZeroCopyUploads, 3);
+  assert.equal(stats.chromaRepackUploads, 0);
+  assert.equal(stats.scratchAllocations, 0);
+
+  // 1080p YUV420P (1920x1080 Y + 960x540 U/V): ALL 3 planes are non-256-aligned and still
+  // upload zero-copy with zero scratch allocations.
+  const y1080 = new Uint8Array(1920 * 1080);
+  const u1080 = new Uint8Array(960 * 540);
+  const v1080 = new Uint8Array(960 * 540);
+  device.writeTextureCalls.length = 0;
+  const res1080 = presenter.uploadYuv420Frame({
+    y: y1080,
+    u: u1080,
+    v: v1080,
+    width: 1920,
+    height: 1080,
+  });
+  assert.equal(res1080.yBytesPerRow, 1920);
+  assert.equal(res1080.uvBytesPerRow, 960);
+  assert.equal(res1080.yZeroCopy, true);
+  assert.equal(res1080.chromaZeroCopy, true);
+  assert.equal(device.writeTextureCalls.length, 3);
+  assert.equal(device.writeTextureCalls[0].rawData, y1080);
+  assert.equal(device.writeTextureCalls[1].rawData, u1080);
+  assert.equal(device.writeTextureCalls[2].rawData, v1080);
+  assert.equal(presenter.getStats().scratchAllocations, 0);
+  assert.equal(presenter.getStats().chromaRepackUploads, 0);
+
+  // RGBA8 with non-256-aligned width & custom stride also uploads directly without row repack.
+  const rgbaStride = 300; // 70px * 4 = 280B tight, 300B custom stride
+  const rgbaBytes = new Uint8Array(rgbaStride * 40);
+  device.writeTextureCalls.length = 0;
+  const rgbaRes = presenter.uploadRgbaFrame(rgbaBytes, 70, 40, { strideBytes: rgbaStride });
+  assert.equal(rgbaRes.bytesPerRow, rgbaStride);
+  assert.equal(rgbaRes.zeroCopy, true);
+  assert.equal(device.writeTextureCalls[0].rawData, rgbaBytes);
+  assert.equal(presenter.getStats().scratchAllocations, 0);
+
+  // SharedArrayBuffer-backed planes bulk-copy via TypedArray.set() into one persistent
+  // scratch buffer (zero GC churn across repeated frames, zero 256-byte row-repack).
+  if (typeof SharedArrayBuffer !== 'undefined') {
+    const sabPresenter = new BinkVideoPresenter({
+      device,
+      allowUnalignedDirectUpload: true,
+      doubleBuffer: true,
+    });
+    const sabY = new Uint8Array(new SharedArrayBuffer(1920 * 1080));
+    const sabU = new Uint8Array(new SharedArrayBuffer(960 * 540));
+    const sabV = new Uint8Array(new SharedArrayBuffer(960 * 540));
+    sabY[0] = 42;
+    sabU[0] = 99;
+    sabV[0] = 177;
+
+    device.writeTextureCalls.length = 0;
+    for (let f = 0; f < 4; f += 1) {
+      sabPresenter.uploadYuv420Frame({
+        y: sabY,
+        u: sabU,
+        v: sabV,
+        width: 1920,
+        height: 1080,
+      });
+    }
+    const sabStats = sabPresenter.getStats();
+    assert.equal(sabStats.scratchAllocations, 1, 'persistent scratch must be allocated only once');
+    assert.equal(sabStats.chromaRepackUploads, 0);
+    assert.equal(sabStats.directZeroCopyUploads, 12);
+    assert.equal(device.writeTextureCalls.length, 12);
+    // All writeTexture payloads must be backed by plain ArrayBuffer (not SharedArrayBuffer)
+    // and use native unaligned bytesPerRow.
+    assert.equal(device.writeTextureCalls[0].rawData.buffer instanceof SharedArrayBuffer, false);
+    assert.equal(device.writeTextureCalls[0].dataLayout.bytesPerRow, 1920);
+    assert.equal(device.writeTextureCalls[1].dataLayout.bytesPerRow, 960);
+    assert.equal(device.writeTextureCalls[2].dataLayout.bytesPerRow, 960);
+    assert.equal(device.writeTextureCalls[0].data[0], 42);
+    sabPresenter.destroy();
+  }
+
+  // stagingPool (copyBufferToTexture) STILL enforces 256-byte alignment even when
+  // allowUnalignedDirectUpload is true!
+  const stagedLayouts = [];
+  const stagedPresenter = new BinkVideoPresenter({
+    device,
+    allowUnalignedDirectUpload: true,
+    stagingPool: {
+      stageTextureUpload(_enc, _tex, _data, layout) {
+        stagedLayouts.push({ ...layout });
+      },
+    },
+  });
+  stagedPresenter.uploadYuv420Frame({
+    y: new Uint8Array(1920 * 1080),
+    u: new Uint8Array(960 * 540),
+    v: new Uint8Array(960 * 540),
+    width: 1920,
+    height: 1080,
+    commandEncoder: createMockCommandEncoder(),
+  });
+  assert.equal(stagedLayouts.length, 3);
+  assert.equal(stagedLayouts[0].bytesPerRow, 2048);
+  assert.equal(stagedLayouts[1].bytesPerRow, 1024);
+  assert.equal(stagedLayouts[2].bytesPerRow, 1024);
+
+  stagedPresenter.destroy();
+  presenter.destroy();
+});

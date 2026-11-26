@@ -3259,3 +3259,39 @@ test('W380 blitToCanvas blits arbitrary external HDR RT view onto SDR canvas and
 
   swapchain.destroy();
 });
+
+test('preserveCopySrcUntilVisible blocks ensureCopySrcUsage() after FIRST_VISIBLE_FRAME and drops COPY_SRC on resize', () => {
+  const { canvas, context, device } = createMockWebGpuEnv();
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device,
+    context,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    preserveCopySrcUntilVisible: true,
+  });
+
+  swapchain.configure({ width: 1280, height: 720 });
+  assert.equal(swapchain.hasCopySrcUsage, true);
+  assert.equal(swapchain.ensureCopySrcUsage(), true);
+
+  // Confirm first visible frame -> ensureCopySrcUsage must no longer re-enable COPY_SRC.
+  swapchain.confirmVisibleFrame({ timestampMs: 1234, realPackDraws: 1 });
+  assert.equal(swapchain.hasVisibleContent, true);
+  assert.equal(swapchain.getStats().hasVisibleContent, true);
+  assert.equal(swapchain.ensureCopySrcUsage(), false);
+
+  // Subsequent resize drops COPY_SRC back to RENDER_ATTACHMENT (direct scanout fast path).
+  const configuresBefore = context.configurations.length;
+  swapchain.resize(1920, 1080);
+  assert.equal(context.configurations.length, configuresBefore + 1);
+  assert.equal(swapchain.hasCopySrcUsage, false);
+  assert.equal(swapchain.ensureCopySrcUsage(), false);
+  assert.equal(
+    context.configurations.length,
+    configuresBefore + 1,
+    'ensureCopySrcUsage after FIRST_VISIBLE_FRAME must not trigger canvas reconfigure'
+  );
+
+  swapchain.destroy();
+});

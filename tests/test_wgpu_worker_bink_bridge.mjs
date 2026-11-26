@@ -832,3 +832,73 @@ test('W67 classic WorkerGlobalScope resolves bink_presenter.js & splash_frame_br
   const firstPresents = postedMessages.filter((m) => m.type === 'first-present');
   assert.equal(firstPresents.length, 1);
 });
+
+test('WgpuCommandProcessor defaults BinkVideoPresenter to zero-repack unaligned direct uploads and syncs swapchain first-visible-frame', () => {
+  const { WgpuSwapchain } = require('../web/workers/wgpu_swapchain.js');
+  const env = createMockWebGpuEnv({ swapWidth: 1920, swapHeight: 1080 });
+  const canvas = {
+    width: 1920,
+    height: 1080,
+    getContext: () => env.ctx,
+  };
+  env.ctx.configure = () => {};
+  const swapchain = new WgpuSwapchain({
+    canvas,
+    device: env.device,
+    context: env.ctx,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    preserveCopySrcUntilVisible: true,
+  });
+  swapchain.configure({ width: 1920, height: 1080 });
+
+  const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+    format: 'bgra8unorm',
+    width: 1920,
+    height: 1080,
+    swapchain,
+    enableSplashBridge: true,
+    enableResourceReplay: false,
+    enableRtPool: false,
+  });
+
+  assert.equal(processor.binkPresenter.allowUnalignedDirectUpload, true);
+  assert.equal(processor.binkPresenter.planeRingDepth, 3);
+
+  // Present a visible 4K YUV420P frame (3840x2160 Y + 1920x1080 U/V): U/V planes must
+  // upload directly with bytesPerRow === 1920 (0 CPU row repacks, 0 scratch allocations).
+  const y = new Uint8Array(3840 * 2160).fill(180);
+  const u = new Uint8Array(1920 * 1080).fill(128);
+  const v = new Uint8Array(1920 * 1080).fill(128);
+
+  const res = processor.presentSplashFrame({
+    width: 3840,
+    height: 2160,
+    format: 'yuv420p',
+    planes: { y, u, v },
+    zeroCopy: true,
+    frameIndex: 0,
+    source: 'bink2',
+  });
+
+  assert.equal(res.ok, true);
+  assert.equal(res.presented, true);
+  assert.equal(processor.firstVisibleFrame, true);
+  assert.equal(swapchain.hasVisibleContent, true, 'Bink first-visible-frame must sync swapchain');
+  assert.equal(swapchain.ensureCopySrcUsage(), false);
+
+  const binkStats = processor.binkPresenter.getStats();
+  assert.equal(binkStats.allowUnalignedDirectUpload, true);
+  assert.equal(binkStats.chromaRepackUploads, 0);
+  assert.equal(binkStats.scratchAllocations, 0);
+  assert.equal(binkStats.directZeroCopyUploads, 3);
+
+  const planeWrites = env.writeTextureCalls.filter((c) => c.size && c.size.width > 1);
+  assert.equal(planeWrites.length, 3);
+  assert.equal(planeWrites[0].dataLayout.bytesPerRow, 3840);
+  assert.equal(planeWrites[1].dataLayout.bytesPerRow, 1920);
+  assert.equal(planeWrites[2].dataLayout.bytesPerRow, 1920);
+
+  processor.destroy();
+  swapchain.destroy();
+});
