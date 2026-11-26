@@ -6,6 +6,7 @@ const require = createRequire(import.meta.url);
 const swapchainMod = require('../web/workers/wgpu_swapchain.js');
 const {
   BLIT_FULLSCREEN_WGSL,
+  BLIT_SRGB_ENCODE_WGSL,
   BLIT_TONEMAP_WGSL,
   BUFFER_USAGE_COPY_DST,
   BUFFER_USAGE_UNIFORM,
@@ -30,6 +31,7 @@ const {
   WgpuSwapchain,
   getCompatibleViewFormats,
   isHdrStreamFormat,
+  isSrgbFormat,
   isValidCanvasFormat,
   normalizeExposure,
   normalizeToneMapMode,
@@ -3226,12 +3228,20 @@ test('W380 blitToCanvas blits arbitrary external HDR RT view onto SDR canvas and
   assert.equal(u32[0], 2); // aces
   assert.equal(u32[2], 1); // auto apply_srgb for rgba16float -> bgra8unorm
 
-  // Switching to passthrough/none + exposure 1.0 switches back to zero-uniform passthrough blit.
+  // Switching to passthrough/none + exposure 1.0 uses zero-uniform passthrough blit for pre-encoded SDR (`rgba8unorm`),
+  // while `rgba8unorm-srgb` (hardware sRGB->linear on sample) MUST engage exact sRGB re-encoding (apply_srgb = 1).
   swapchain.setToneMapOptions({ mode: 'passthrough', exposure: 1.0, applySrgbEncode: null });
   assert.equal(swapchain.toneMapActive, false);
-  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba8unorm-srgb'), true);
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba8unorm'), true);
   assert.equal(swapchain.blitCount, 2);
   assert.equal(swapchain.toneMapBlitCount, 1);
+
+  assert.equal(swapchain.blitToCanvas(enc, externalHdrView, canvasView, 'rgba8unorm-srgb'), true);
+  assert.equal(swapchain.blitCount, 3);
+  assert.equal(swapchain.toneMapBlitCount, 2);
+  const u32Srgb = new Uint32Array(device.queueWrites[device.queueWrites.length - 1].bytes.buffer);
+  assert.equal(u32Srgb[0], 0); // passthrough (no tonemap compression)
+  assert.equal(u32Srgb[2], 1); // exact linear -> sRGB re-encode prevents ~x^4.84 double-gamma crush
 
   // Device loss destroys old uniform buffer; recover() rebuilds cleanly on new device.
   const oldBuf = device.createdBuffers[0];
@@ -3294,4 +3304,235 @@ test('preserveCopySrcUntilVisible blocks ensureCopySrcUsage() after FIRST_VISIBL
   );
 
   swapchain.destroy();
+});
+
+test('sRGB stream formats (bgra8unorm-srgb, rgba8unorm-srgb) apply exact single IEC 61966-2-1 linear->sRGB encode on SDR canvas without double-gamma crush', () => {
+  assert.equal(isSrgbFormat('bgra8unorm-srgb'), true);
+  assert.equal(isSrgbFormat('rgba8unorm-srgb'), true);
+  assert.equal(isSrgbFormat('BGRA8UNORM-SRGB'), true);
+  assert.equal(isSrgbFormat('bgra8unorm'), false);
+  assert.equal(isSrgbFormat('rgba8unorm'), false);
+  assert.equal(isSrgbFormat('rgba16float'), false);
+  assert.equal(isSrgbFormat(null), false);
+
+  assert.ok(typeof BLIT_SRGB_ENCODE_WGSL === 'string');
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('linear_to_srgb_channel'));
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('0.0031308'));
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('12.92'));
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('1.055'));
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('1.0 / 2.4'));
+  assert.ok(BLIT_SRGB_ENCODE_WGSL.includes('0.055'));
+
+  // 1) Real WebGPU / buffer-capable device: uses BLIT_TONEMAP_WGSL with mode=0, exposure=1.0, apply_srgb=1.
+  for (const srgbStreamFormat of ['bgra8unorm-srgb', 'rgba8unorm-srgb']) {
+    for (const sdrCanvasFormat of ['bgra8unorm', 'rgba8unorm']) {
+      const { canvas, context, device, events } = createMockWebGpuEnv();
+      attachMockBlitCapabilities(device, events);
+      attachMockToneMapBufferSupport(device, events);
+
+      const swapchain = new WgpuSwapchain({
+        canvas,
+        device,
+        context,
+        format: sdrCanvasFormat,
+        enableDepth: false,
+      });
+      swapchain.configure({ width: 1280, height: 720 });
+      assert.equal(swapchain.configureForStreamFormat(srgbStreamFormat), true);
+
+      assert.equal(swapchain.usesBlitFallback, true);
+      assert.equal(swapchain.streamFormat, srgbStreamFormat);
+      assert.equal(swapchain.canvasFormat, sdrCanvasFormat);
+      assert.equal(swapchain.applySrgbEncode, true);
+      assert.equal(swapchain.toneMapActive, true);
+      assert.equal(swapchain.getStats().applySrgbEncode, true);
+      assert.equal(swapchain.getStats().toneMapActive, true);
+
+      const encoder = createMockCommandEncoder();
+      const canvasView = { kind: 'GPUTextureView', id: `canvas-${sdrCanvasFormat}` };
+      assert.equal(swapchain.present(encoder, canvasView), true);
+
+      assert.equal(swapchain.blitCount, 1);
+      assert.equal(swapchain.toneMapBlitCount, 1);
+      assert.equal(device.createdShaderModules.length, 1);
+      assert.equal(device.createdShaderModules[0].desc.code, BLIT_TONEMAP_WGSL);
+      assert.equal(device.queueWrites.length, 1);
+
+      const u32 = new Uint32Array(device.queueWrites[0].bytes.buffer);
+      const f32 = new Float32Array(device.queueWrites[0].bytes.buffer);
+      assert.equal(u32[0], 0); // mode: none (no tonemap distortion on SDR sRGB)
+      assert.equal(f32[1], 1.0); // exposure: 1.0
+      assert.equal(u32[2], 1); // apply_srgb: 1 (exact IEC 61966-2-1 re-encode after hardware sRGB decode)
+
+      swapchain.destroy();
+    }
+  }
+
+  // 2) Buffer-less minimal device fallback: uses zero-uniform 2-binding BLIT_SRGB_ENCODE_WGSL (never raw BLIT_FULLSCREEN_WGSL).
+  {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720 });
+    swapchain.configureForStreamFormat('bgra8unorm-srgb');
+
+    assert.equal(swapchain.applySrgbEncode, true);
+    assert.equal(swapchain.toneMapActive, false); // no createBuffer on mock device
+
+    const encoder = createMockCommandEncoder();
+    assert.equal(swapchain.present(encoder), true);
+    assert.equal(device.createdShaderModules.length, 1);
+    assert.equal(device.createdShaderModules[0].desc.code, BLIT_SRGB_ENCODE_WGSL);
+    assert.equal(device.createdBindGroups.length, 1);
+    assert.equal(device.createdBindGroups[0].desc.entries.length, 2);
+    swapchain.destroy();
+  }
+
+  // 3) Numerical verification: IEC 61966-2-1 sRGB decode -> linear_to_srgb round-trips every 8-bit value
+  //    bit-for-bit (0..255), keeping midtone 0.5 linear at 188/255 (not crushed 128/255) and dark grays non-zero.
+  const srgbToLinear = (s) => (s <= 0.04045 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4));
+  const linearToSrgb = (v) => {
+    const c = Math.min(1.0, Math.max(0.0, v));
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1.0 / 2.4) - 0.055;
+  };
+  for (let byte = 0; byte <= 255; byte += 1) {
+    const linear = srgbToLinear(byte / 255);
+    const reencodedByte = Math.round(linearToSrgb(linear) * 255);
+    assert.equal(reencodedByte, byte, `sRGB byte ${byte} must round-trip without crush or drift`);
+  }
+  assert.equal(Math.round(linearToSrgb(0.5) * 255), 188);
+  assert.ok(Math.round(linearToSrgb(srgbToLinear(10 / 255)) * 255) === 10);
+});
+
+test('HDR linear stream formats (rgba16float, rgb10a2unorm, rg11b10ufloat) activate auto sRGB encode + tonemapping cleanly without dead code', () => {
+  // 1) rgb10a2unorm & rg11b10ufloat with default toneMapMode='none' and exposure=1.0 MUST activate
+  //    _shouldUseToneMapPipeline via _resolveEffectiveApplySrgbEncode(sourceFormat) -> apply_srgb = 1.
+  for (const hdrFormat of ['rgb10a2unorm', 'rg11b10ufloat']) {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+    attachMockToneMapBufferSupport(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1920, height: 1080 });
+    swapchain.configureForStreamFormat(hdrFormat);
+
+    assert.equal(swapchain.usesBlitFallback, true);
+    assert.equal(swapchain.applySrgbEncode, true);
+    assert.equal(swapchain.toneMapActive, true);
+
+    const encoder = createMockCommandEncoder();
+    assert.equal(swapchain.present(encoder), true);
+    assert.equal(swapchain.toneMapBlitCount, 1);
+    assert.equal(device.createdShaderModules[0].desc.code, BLIT_TONEMAP_WGSL);
+    const u32 = new Uint32Array(device.queueWrites[0].bytes.buffer);
+    assert.equal(u32[0], 0); // mode: none
+    assert.equal(u32[2], 1); // apply_srgb: 1
+    swapchain.destroy();
+  }
+
+  // 2) rgba16float via configure({ streamFormat: 'rgba16float' }) with ACES / Reinhard / custom exposure / explicit applySrgbEncode
+  //    keeps SDR canvas and runs tonemap + single sRGB encode; default toneMapMode='none' keeps direct rgba16float canvas.
+  {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+    attachMockToneMapBufferSupport(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      toneMapMode: 'aces',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720, streamFormat: 'rgba16float' });
+    assert.equal(swapchain.usesBlitFallback, true);
+    assert.equal(swapchain.canvasFormat, 'bgra8unorm');
+    assert.equal(swapchain.streamFormat, 'rgba16float');
+    assert.equal(swapchain.applySrgbEncode, true);
+    assert.equal(swapchain.toneMapActive, true);
+
+    const encoder = createMockCommandEncoder();
+    assert.equal(swapchain.present(encoder), true);
+    const u32 = new Uint32Array(device.queueWrites[0].bytes.buffer);
+    assert.equal(u32[0], 2); // aces
+    assert.equal(u32[2], 1); // apply_srgb: 1
+    swapchain.destroy();
+  }
+});
+
+test('pre-encoded SDR passthrough (bgra8unorm, rgba8unorm) and HDR rgba16float canvas targets are NEVER double-encoded', () => {
+  // 1) Pre-encoded SDR sources onto SDR canvas: applySrgbEncode=false, uses raw BLIT_FULLSCREEN_WGSL (0x extra encode).
+  for (const sdrSource of ['bgra8unorm', 'rgba8unorm']) {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+    attachMockToneMapBufferSupport(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'bgra8unorm',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720 });
+    assert.equal(swapchain.applySrgbEncode, false);
+    assert.equal(swapchain.toneMapActive, false);
+
+    const encoder = createMockCommandEncoder();
+    const externalSdrView = { kind: 'GPUTextureView', id: `sdr-${sdrSource}` };
+    const canvasView = { kind: 'GPUTextureView', id: 'canvas-bgra8' };
+    assert.equal(swapchain.blitToCanvas(encoder, externalSdrView, canvasView, sdrSource), true);
+
+    assert.equal(swapchain.blitCount, 1);
+    assert.equal(swapchain.toneMapBlitCount, 0);
+    assert.equal(device.createdBuffers.length, 0);
+    assert.equal(device.createdShaderModules.length, 1);
+    assert.equal(device.createdShaderModules[0].desc.code, BLIT_FULLSCREEN_WGSL);
+    swapchain.destroy();
+  }
+
+  // 2) HDR rgba16float canvas target: NEVER sRGB-encodes linear/sRGB sources (compositor expects linear float).
+  {
+    const { canvas, context, device, events } = createMockWebGpuEnv();
+    attachMockBlitCapabilities(device, events);
+    attachMockToneMapBufferSupport(device, events);
+
+    const swapchain = new WgpuSwapchain({
+      canvas,
+      device,
+      context,
+      format: 'rgba16float',
+      enableDepth: false,
+    });
+    swapchain.configure({ width: 1280, height: 720 });
+    assert.equal(swapchain.canvasFormat, 'rgba16float');
+    assert.equal(swapchain.applySrgbEncode, false);
+    assert.equal(swapchain.toneMapActive, false);
+
+    const encoder = createMockCommandEncoder();
+    const srcView = { kind: 'GPUTextureView', id: 'srgb-src' };
+    const dstView = { kind: 'GPUTextureView', id: 'hdr-canvas-view' };
+    for (const srcFmt of ['bgra8unorm-srgb', 'rgba8unorm-srgb', 'rgb10a2unorm', 'rgba16float']) {
+      assert.equal(swapchain.blitToCanvas(encoder, srcView, dstView, srcFmt), true);
+    }
+    assert.equal(swapchain.blitCount, 4);
+    assert.equal(swapchain.toneMapBlitCount, 0);
+    assert.equal(device.createdBuffers.length, 0);
+    assert.equal(device.createdShaderModules[0].desc.code, BLIT_FULLSCREEN_WGSL);
+    swapchain.destroy();
+  }
 });
