@@ -1126,3 +1126,255 @@ fn r66_wasm_simd128_native_lowering_ir() {
         "wasm-only intrinsic leaked into native IR:\n{native_ir}"
     );
 }
+
+#[test]
+fn r70_3d_fp_fma_f16c_and_shuffle_lowering_ir() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "fma3_ps",
+            asm_function(0x1000, |a| {
+                a.vfmadd213ps(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "fma3_addsub_ps",
+            asm_function(0x1100, |a| {
+                a.vfmaddsub213ps(xmm0, xmm1, xmm2)?;
+                a.vfmsubadd231pd(xmm3, xmm4, xmm5)?;
+                a.ret()
+            }),
+        ),
+        (
+            "fma3_scalar_ss",
+            asm_function(0x1200, |a| {
+                a.vfmadd213ss(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "addsub_fp",
+            asm_function(0x1300, |a| {
+                a.addsubps(xmm0, xmm1)?;
+                a.vaddsubpd(xmm2, xmm3, xmm4)?;
+                a.ret()
+            }),
+        ),
+        (
+            "dpps_fast_masks",
+            asm_function(0x1400, |a| {
+                a.dpps(xmm0, xmm1, 0x11)?; // 1-lane -> 1 fadd, 1 shuffle
+                a.dpps(xmm2, xmm3, 0x31)?; // 2-lane -> 2 fadd, 2 shuffles
+                a.dpps(xmm4, xmm5, 0x71)?; // 3-lane partial -> 2 fadd, 3 shuffles
+                a.dppd(xmm6, xmm7, 0x11)?; // 1-lane dppd -> 1 fadd, 1 shuffle
+                a.ret()
+            }),
+        ),
+        (
+            "rcp_range",
+            asm_function(0x1500, |a| {
+                a.rcpps(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "hadd_same_reg",
+            asm_function(0x1600, |a| {
+                a.haddps(xmm0, xmm0)?;
+                a.phaddd(xmm1, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvt256_pd",
+            asm_function(0x1700, |a| {
+                a.vcvtpd2dq(xmm0, ymm1)?;
+                a.vcvttpd2dq(xmm2, ymm3)?;
+                a.vcvtpd2ps(xmm4, ymm5)?;
+                a.vcvtps2pd(ymm6, xmm7)?;
+                a.vcvtdq2pd(ymm8, xmm9)?;
+                a.ret()
+            }),
+        ),
+        (
+            "shuffles_and_elisions",
+            asm_function(0x1800, |a| {
+                a.pshufd(xmm0, xmm1, 0xE4)?; // identity -> elided
+                a.pshuflw(xmm0, xmm1, 0xE4)?; // identity -> elided
+                a.vpermilps(xmm0, xmm1, 0xE4)?; // identity -> elided
+                a.shufps(xmm0, xmm0, 0xE4)?; // identity -> elided
+                a.blendps(xmm0, xmm1, 0x0)?; // only a -> elided
+                a.blendps(xmm0, xmm1, 0xF)?; // only b -> elided
+                a.vblendvps(xmm0, xmm1, xmm1, xmm2)?; // a == b -> elided
+                a.pslldq(xmm0, 0)?; // identity -> elided
+                a.psrldq(xmm0, 16)?; // zero -> elided
+                a.ret()
+            }),
+        ),
+        (
+            "unary_poison_shuffles",
+            asm_function(0x1900, |a| {
+                a.movsldup(xmm0, xmm1)?;
+                a.movshdup(xmm2, xmm3)?;
+                a.movddup(xmm4, xmm5)?;
+                a.pshufd(xmm6, xmm7, 0x1B)?;
+                a.vpermilps(xmm8, xmm9, 0xB1)?;
+                a.insertps(xmm10, xmm11, 0x50)?;
+                a.ret()
+            }),
+        ),
+        (
+            "movddup_mem64",
+            asm_function(0x1A00, |a| {
+                a.movddup(xmm0, qword_ptr(rcx))?;
+                a.ret()
+            }),
+        ),
+        (
+            "vinsert_and_vpermq",
+            asm_function(0x1B00, |a| {
+                a.vinsertf128(ymm0, ymm1, xmm2, 1)?;
+                a.vpermq(ymm3, ymm4, 0x00)?;
+                a.ret()
+            }),
+        ),
+        (
+            "f16c_256",
+            asm_function(0x1C00, |a| {
+                a.vcvtph2ps(ymm0, xmm1)?;
+                a.vcvtps2ph(xmm2, ymm3, 0)?;
+                a.vcvtps2ph(xmm4, ymm5, 2)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for ((name, _), f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{name}: {:?}", f.unsupported);
+        let ir = &f.ir;
+        match *name {
+            "fma3_ps" => {
+                assert!(
+                    !ir.contains("<4 x double>"),
+                    "fma32 <4 x float> must split into <2 x double> halves:\n{ir}"
+                );
+                assert!(ir.contains("fpext <2 x float>"), "{ir}");
+                assert!(ir.contains("fptrunc <2 x double>"), "{ir}");
+                assert!(!ir.contains("fcmp one"), "fma32 should avoid fcmp one:\n{ir}");
+                assert!(!ir.contains("select <2 x i1>"), "fma32 should avoid double selects:\n{ir}");
+            }
+            "fma3_addsub_ps" => {
+                assert!(ir.contains("<i32 -2147483648, i32 0, i32 -2147483648, i32 0>"), "{ir}");
+                assert!(ir.contains("<i64 0, i64 -9223372036854775808>"), "{ir}");
+                assert!(!ir.contains("fneg "), "vfmaddsub/vfmsubadd should use sign-bit xor:\n{ir}");
+            }
+            "fma3_scalar_ss" => {
+                // Only 1 load of %xmm0 inside the body (1 in body + 1 in sync_out = 2 total).
+                assert_eq!(
+                    ir.matches("load <2 x i64>, ptr %xmm0").count(),
+                    2,
+                    "scalar FMA should not reload %xmm0:\n{ir}"
+                );
+            }
+            "addsub_fp" => {
+                assert!(!ir.contains("fsub "), "addsubps/pd should use sign-bit xor + fadd:\n{ir}");
+                assert!(
+                    !ir.contains("shufflevector"),
+                    "addsubps/pd should need zero shuffles:\n{ir}"
+                );
+                assert!(ir.contains("<i32 -2147483648, i32 0, i32 -2147483648, i32 0>"), "{ir}");
+                assert!(ir.contains("<i64 -9223372036854775808, i64 0>"), "{ir}");
+            }
+            "dpps_fast_masks" => {
+                assert!(!ir.contains("extractelement") && !ir.contains("insertelement"), "{ir}");
+                // 1 + 2 + 3 + 1 = 7 shufflevectors total across all 4 dot instructions.
+                assert_eq!(
+                    ir.matches("shufflevector").count(),
+                    7,
+                    "expected tight 1/2/3/1 shuffle counts across dpps/dppd:\n{ir}"
+                );
+            }
+            "rcp_range" => {
+                assert!(ir.contains("16777216"), "rcpps should use single unsigned range check:\n{ir}");
+                assert!(!ir.contains("2147483647"), "rcpps should reuse sign via xor:\n{ir}");
+            }
+            "hadd_same_reg" => {
+                assert!(ir.contains("poison, <4 x i32> <i32 0, i32 2, i32 0, i32 2>"), "{ir}");
+                assert!(ir.contains("poison, <4 x i32> <i32 1, i32 3, i32 1, i32 3>"), "{ir}");
+            }
+            "cvt256_pd" => {
+                assert!(
+                    !ir.contains("<4 x double>"),
+                    "256-bit pd conversions must stay 128-bit (<2 x double>):\n{ir}"
+                );
+                assert_eq!(
+                    ir.matches("@llvm.fptosi.sat.v2i32.v2f64(").count(),
+                    4,
+                    "256-bit vcvt(t)pd2dq should emit 2 native v2i32.v2f64 sat calls each:\n{ir}"
+                );
+            }
+            "shuffles_and_elisions" => {
+                assert!(
+                    !ir.contains("shufflevector"),
+                    "identity shuffles and trivial blends must emit zero shufflevector:\n{ir}"
+                );
+                assert!(
+                    !ir.contains("select "),
+                    "same-reg blendv must emit zero select:\n{ir}"
+                );
+            }
+            "unary_poison_shuffles" => {
+                assert!(
+                    !ir.contains("extractelement") && !ir.contains("insertelement"),
+                    "reg-reg insertps should use shufflevector:\n{ir}"
+                );
+                assert_eq!(
+                    ir.matches(", <4 x i32> poison,").count() + ir.matches(", <2 x i64> poison,").count(),
+                    5,
+                    "unary shuffles must use poison second operand:\n{ir}"
+                );
+            }
+            "movddup_mem64" => {
+                assert!(ir.contains("insertelement <2 x i64> poison"), "{ir}");
+                assert!(ir.contains("<2 x i32> zeroinitializer"), "{ir}");
+            }
+            "vinsert_and_vpermq" => {
+                assert!(!ir.contains("<4 x i64>"), "vpermq must not build <4 x i64>:\n{ir}");
+                // vinsertf128 ymm0, ymm1, xmm2, 1 must NOT load %ymmh1 inside body.
+                assert_eq!(
+                    ir.matches("load <2 x i64>, ptr %ymmh1").count(),
+                    1,
+                    "only sync_out should load %ymmh1 (body only reads low half):\n{ir}"
+                );
+                // vpermq ymm3, ymm4, 0x00 only reads low half of ymm4, never %ymmh4 in body.
+                assert_eq!(
+                    ir.matches("load <2 x i64>, ptr %ymmh4").count(),
+                    1,
+                    "only sync_out should load %ymmh4 (0x00 only reads low half):\n{ir}"
+                );
+            }
+            "f16c_256" => {
+                assert!(
+                    !ir.contains("zext <8 x i16>")
+                        && !ir.contains("add <8 x i32>")
+                        && !ir.contains("lshr <8 x i32>")
+                        && !ir.contains("<8 x float>"),
+                    "256-bit F16C must lower in native <4 x i32> halves:\n{ir}"
+                );
+                assert!(ir.contains("zext <4 x i16>"), "{ir}");
+                assert!(ir.contains("@llvm.ceil.v4f32("), "{ir}");
+                assert!(ir.contains("@llvm.fptosi.sat.v4i32.v4f32("), "{ir}");
+            }
+            _ => {}
+        }
+    }
+
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR:\n{native_ir}"
+    );
+}

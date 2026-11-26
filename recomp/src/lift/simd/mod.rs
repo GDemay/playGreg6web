@@ -235,17 +235,6 @@ impl Ty {
         format!("<{}>", lanes.join(", "))
     }
 
-    /// `true`/`false` in every lane of the matching `i1` shape.
-    fn bool_splat(self, v: bool) -> String {
-        let s = if v { "true" } else { "false" };
-        if self.n == 1 {
-            return s.to_string();
-        }
-        let lane = format!("i1 {s}");
-        let lanes: Vec<&str> = (0..self.n).map(|_| lane.as_str()).collect();
-        format!("<{}>", lanes.join(", "))
-    }
-
     /// LLVM intrinsic type suffix (`f32`, `v4f32`, `v16i8`, ...).
     fn suffix(self) -> String {
         let e = match self.e {
@@ -273,6 +262,18 @@ fn fconst(v: f64) -> String {
 fn mask(indices: &[u32]) -> String {
     let lanes: Vec<String> = indices.iter().map(|i| format!("i32 {i}")).collect();
     format!("<{} x i32> <{}>", indices.len(), lanes.join(", "))
+}
+
+/// Whether operands `a` and `b` name the exact same register.
+fn same_reg(ins: &Instruction, a: u32, b: u32) -> bool {
+    ins.op_kind(a) == OpKind::Register
+        && ins.op_kind(b) == OpKind::Register
+        && ins.op_register(a) == ins.op_register(b)
+}
+
+/// Whether a shuffle index list is the identity permutation `[0, 1, ..., n - 1]`.
+fn is_identity_mask(idx: &[u32]) -> bool {
+    idx.iter().enumerate().all(|(i, &k)| k == i as u32)
 }
 
 /// LLVM intrinsics (and wasm builtins) the SIMD lifter calls.

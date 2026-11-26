@@ -7,7 +7,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use super::super::{Flag, FunctionLifter, R, imm, unsupported};
-use super::{Elem, Intr, Ty, fconst, is_256, mask};
+use super::{Elem, Intr, Ty, fconst, is_256, is_identity_mask, mask};
 
 /// 256-bit forms that operate on each 128-bit lane independently (with the same per-lane
 /// semantics as the 128-bit form; per-lane immediate bits are handled by the lane lifters).
@@ -371,13 +371,15 @@ impl FunctionLifter<'_> {
             }
             M::Vinsertf128 | M::Vinserti128 => {
                 let sel = Self::imm8(ins)? & 1;
-                let lo = self.xget_half(ins.op_register(1), 0, I64)?;
-                let hi = self.xget_half(ins.op_register(1), 1, I64)?;
                 let x = match ins.op_kind(2) {
                     OpKind::Register => self.xget_half(ins.op_register(2), 0, I64)?,
                     _ => self.mem_load_at(ins, Ty::v(I64), 0, 16)?,
                 };
-                let (lo, hi) = if sel == 0 { (x, hi) } else { (lo, x) };
+                let (lo, hi) = if sel == 0 {
+                    (x, self.xget_half(ins.op_register(1), 1, I64)?)
+                } else {
+                    (self.xget_half(ins.op_register(1), 0, I64)?, x)
+                };
                 self.set_halves(ins.op_register(0), &lo, Some(&hi), I64)?;
             }
             M::Vextractf128 | M::Vextracti128 => {
@@ -390,33 +392,67 @@ impl FunctionLifter<'_> {
             }
             M::Vperm2f128 | M::Vperm2i128 => {
                 let i = Self::imm8(ins)?;
-                let srcs = [
-                    self.v_half(ins, 1, 0, I64)?,
-                    self.v_half(ins, 1, 1, I64)?,
-                    self.v_half(ins, 2, 0, I64)?,
-                    self.v_half(ins, 2, 1, I64)?,
-                ];
-                let pick = |c: u32| -> String {
+                let cs = [i & 0xF, i >> 4];
+                let need_mem2 = ins.op_kind(2) == OpKind::Memory;
+                let mut loaded: [Option<String>; 4] = [None, None, None, None];
+                let mut out = Vec::with_capacity(2);
+                for c in cs {
                     if c & 8 != 0 {
-                        "zeroinitializer".to_string()
+                        out.push("zeroinitializer".to_string());
                     } else {
-                        srcs[(c & 3) as usize].clone()
+                        let slot = (c & 3) as usize;
+                        if loaded[slot].is_none() {
+                            let op = if slot < 2 { 1 } else { 2 };
+                            loaded[slot] = Some(self.v_half(ins, op, (slot & 1) as u32, I64)?);
+                        }
+                        out.push(loaded[slot].clone().unwrap());
                     }
-                };
-                let (lo, hi) = (pick(i & 0xF), pick(i >> 4));
-                self.set_halves(ins.op_register(0), &lo, Some(&hi), I64)?;
+                }
+                if need_mem2 && loaded[2].is_none() && loaded[3].is_none() {
+                    let _ = self.v_half(ins, 2, 0, I64)?;
+                }
+                self.set_halves(ins.op_register(0), &out[0], Some(&out[1]), I64)?;
             }
             M::Vpermq | M::Vpermpd => {
                 let i = Self::imm8(ins)?;
-                let (v, _) = self.whole(ins, 1, I64)?;
-                let idx: Vec<u32> = (0..4).map(|l| (i >> (2 * l)) & 3).collect();
-                let t = Ty::vn(I64, 4).ir();
-                let r = self.val(&format!(
-                    "shufflevector {t} {v}, {t} poison, {}",
-                    mask(&idx)
-                ));
-                let (lo, hi) = self.split(&r, I64);
-                self.set_halves(ins.op_register(0), &lo, Some(&hi), I64)?;
+                let idx: [u32; 4] = std::array::from_fn(|l| (i >> (2 * l)) & 3);
+                let need_lo = idx.iter().any(|&k| k < 2) || ins.op_kind(1) == OpKind::Memory;
+                let need_hi = idx.iter().any(|&k| k >= 2);
+                let lo = if need_lo {
+                    Some(self.v_half(ins, 1, 0, I64)?)
+                } else {
+                    None
+                };
+                let hi = if need_hi {
+                    Some(self.v_half(ins, 1, 1, I64)?)
+                } else {
+                    None
+                };
+                let mut build_half = |pair: [u32; 2]| -> String {
+                    if is_identity_mask(&pair) {
+                        lo.clone().unwrap()
+                    } else if pair == [2, 3] {
+                        hi.clone().unwrap()
+                    } else if pair[0] < 2 && pair[1] < 2 {
+                        self.shuffle(lo.as_deref().unwrap(), "poison", I64, &pair)
+                    } else if pair[0] >= 2 && pair[1] >= 2 {
+                        self.shuffle(
+                            hi.as_deref().unwrap(),
+                            "poison",
+                            I64,
+                            &[pair[0] - 2, pair[1] - 2],
+                        )
+                    } else {
+                        self.shuffle(lo.as_deref().unwrap(), hi.as_deref().unwrap(), I64, &pair)
+                    }
+                };
+                let out_lo = build_half([idx[0], idx[1]]);
+                let out_hi = if [idx[2], idx[3]] == [idx[0], idx[1]] {
+                    out_lo.clone()
+                } else {
+                    build_half([idx[2], idx[3]])
+                };
+                self.set_halves(ins.op_register(0), &out_lo, Some(&out_hi), I64)?;
             }
             M::Vpermd | M::Vpermps => {
                 // vpermd ymm1, ymm2 (indices), ymm3/m256 (data):
@@ -477,37 +513,92 @@ impl FunctionLifter<'_> {
             M::Pmovzxdq | M::Vpmovzxdq => self.extend(ins, I32, I64, "zext")?,
             M::Vcvtps2pd | M::Vcvtdq2pd if wide => {
                 let src = if m == M::Vcvtps2pd { F32 } else { I32 };
-                let v = self.v_half(ins, 1, 0, src)?;
                 let op = if m == M::Vcvtps2pd { "fpext" } else { "sitofp" };
-                let r = self.val(&format!("{op} {} {v} to <4 x double>", Ty::v(src).ir()));
-                let (lo, hi) = self.split(&r, F64);
+                let v = self.v_half(ins, 1, 0, src)?;
+                let st = Ty::v(src).ir();
+                let ht = Ty::vn(src, 2).ir();
+                // Split into two native `<2 x src> -> <2 x double>` halves so LLVM emits
+                // `f64x2.promote_low_f32x4` / `f64x2.convert_low_i32x4_s` without `<4 x double>`.
+                let v_lo = self.val(&format!(
+                    "shufflevector {st} {v}, {st} poison, <2 x i32> <i32 0, i32 1>"
+                ));
+                let v_hi = self.val(&format!(
+                    "shufflevector {st} {v}, {st} poison, <2 x i32> <i32 2, i32 3>"
+                ));
+                let lo = self.val(&format!("{op} {ht} {v_lo} to <2 x double>"));
+                let hi = self.val(&format!("{op} {ht} {v_hi} to <2 x double>"));
                 self.set_halves(ins.op_register(0), &lo, Some(&hi), F64)?;
             }
-            M::Vcvtpd2ps | M::Vcvtpd2dq | M::Vcvttpd2dq if wide => {
-                let (v, _) = self.whole(ins, 1, F64)?;
-                let r = if m == M::Vcvtpd2ps {
-                    let r = self.val(&format!("fptrunc <4 x double> {v} to <4 x float>"));
-                    self.cast(&r, Ty::v(F32), Ty::v(I32))
-                } else {
-                    self.float_to_int(&v, Ty::vn(F64, 4), 32, m == M::Vcvttpd2dq)
-                };
-                self.xset_half(ins.op_register(0), 0, &r, I32)?;
+            M::Vcvtpd2ps if wide => {
+                let lo = self.v_half(ins, 1, 0, F64)?;
+                let hi = self.v_half(ins, 1, 1, F64)?;
+                // Demote each `<2 x double>` half via `zext_lanes` and combine through `<2 x i64>`
+                // so LLVM keeps each half as `f32x4.demote_f64x2_zero` + one `i64x2.shuffle`.
+                let rlo = self.val(&format!("fptrunc <2 x double> {lo} to <2 x float>"));
+                let rhi = self.val(&format!("fptrunc <2 x double> {hi} to <2 x float>"));
+                let zlo = self.zext_lanes(&rlo, F32, 2);
+                let zhi = self.zext_lanes(&rhi, F32, 2);
+                let lo64 = self.cast(&zlo, Ty::v(F32), Ty::v(I64));
+                let hi64 = self.cast(&zhi, Ty::v(F32), Ty::v(I64));
+                let hi_swap = self.shuffle(&hi64, "poison", I64, &[1, 0]);
+                let r = self.val(&format!("or <2 x i64> {lo64}, {hi_swap}"));
+                self.xset_half(ins.op_register(0), 0, &r, I64)?;
+            }
+            M::Vcvtpd2dq | M::Vcvttpd2dq if wide => {
+                // Lower each `<2 x double>` half identically to 128-bit `cvt(t)pd2dq` so both
+                // halves keep their zero upper lanes through `select` and LLVM emits two native
+                // `i32x4.trunc_sat_f64x2_s_zero` instructions with zero scalarization.
+                let truncate = m == M::Vcvttpd2dq;
+                let limit = Ty::v(F64).splat(&fconst(2f64.powi(31)));
+                let mut halves = Vec::with_capacity(2);
+                for half in 0..2 {
+                    let v = self.v_half(ins, 1, half, F64)?;
+                    let x = if truncate {
+                        v
+                    } else {
+                        self.intr(Intr::Rint, Ty::v(F64), &[&v])
+                    };
+                    let sat2 = self.intr(Intr::FpToSiSat(I32), Ty::v(F64), &[&x]);
+                    let sat4 = self.zext_lanes(&sat2, I32, 2);
+                    let ok2 = self.val(&format!("fcmp olt <2 x double> {x}, {limit}"));
+                    let ok4 = self.val(&format!(
+                        "shufflevector <2 x i1> {ok2}, <2 x i1> poison, <4 x i32> <i32 0, i32 1, i32 0, i32 1>"
+                    ));
+                    let r4 = self.val(&format!(
+                        "select <4 x i1> {ok4}, <4 x i32> {sat4}, <4 x i32> <i32 -2147483648, i32 -2147483648, i32 0, i32 0>"
+                    ));
+                    halves.push(self.cast(&r4, Ty::v(I32), Ty::v(I64)));
+                }
+                let hi_swap = self.shuffle(&halves[1], "poison", I64, &[1, 0]);
+                let r = self.val(&format!("or <2 x i64> {}, {hi_swap}", halves[0]));
+                self.xset_half(ins.op_register(0), 0, &r, I64)?;
             }
             M::Vcvtph2ps => {
-                let n = if ins.op_register(0).is_ymm() { 8 } else { 4 };
-                let h = match ins.op_kind(1) {
-                    OpKind::Register => {
-                        let v = self.xget_half(ins.op_register(1), 0, I16)?;
-                        self.take_low(&v, I16, n)
-                    }
-                    _ => self.mem_load_at(ins, Ty::vn(I16, n), 0, 2 * n as usize)?,
-                };
-                let h = self.val(&format!("zext <{n} x i16> {h} to <{n} x i32>"));
-                let r = self.half_to_float(&h, n);
-                if n == 8 {
-                    let (lo, hi) = self.split(&r, I32);
-                    self.set_halves(ins.op_register(0), &lo, Some(&hi), I32)?;
+                if ins.op_register(0).is_ymm() {
+                    // Split `<8 x i16>` into lo/hi `<4 x i16>` -> `<4 x i32>` halves (matching
+                    // `i32x4.extend_low_i16x8_u` / `i32x4.extend_high_i16x8_u`) to stay 128-bit.
+                    let src = self.v_half(ins, 1, 0, I16)?;
+                    let lo16 = self.val(&format!(
+                        "shufflevector <8 x i16> {src}, <8 x i16> poison, <4 x i32> <i32 0, i32 1, i32 2, i32 3>"
+                    ));
+                    let hi16 = self.val(&format!(
+                        "shufflevector <8 x i16> {src}, <8 x i16> poison, <4 x i32> <i32 4, i32 5, i32 6, i32 7>"
+                    ));
+                    let h_lo = self.val(&format!("zext <4 x i16> {lo16} to <4 x i32>"));
+                    let h_hi = self.val(&format!("zext <4 x i16> {hi16} to <4 x i32>"));
+                    let r_lo = self.half_to_float_v4(&h_lo);
+                    let r_hi = self.half_to_float_v4(&h_hi);
+                    self.set_halves(ins.op_register(0), &r_lo, Some(&r_hi), I32)?;
                 } else {
+                    let h16 = match ins.op_kind(1) {
+                        OpKind::Register => {
+                            let v = self.xget_half(ins.op_register(1), 0, I16)?;
+                            self.take_low(&v, I16, 4)
+                        }
+                        _ => self.mem_load_at(ins, Ty::vn(I16, 4), 0, 8)?,
+                    };
+                    let h = self.val(&format!("zext <4 x i16> {h16} to <4 x i32>"));
+                    let r = self.half_to_float_v4(&h);
                     self.xset_half(ins.op_register(0), 0, &r, I32)?;
                 }
             }
@@ -518,16 +609,31 @@ impl FunctionLifter<'_> {
                 } else {
                     [Round::Nearest, Round::Down, Round::Up, Round::Zero][(i & 3) as usize]
                 };
-                let (v, wide_src) = self.whole(ins, 1, I32)?;
-                let n = if wide_src { 8 } else { 4 };
-                let h = self.float_to_half(&v, n, mode);
-                let h = self.val(&format!("trunc <{n} x i32> {h} to <{n} x i16>"));
-                match ins.op_kind(0) {
-                    OpKind::Register => {
-                        let r = self.zext_lanes(&h, I16, n);
-                        self.xset_half(ins.op_register(0), 0, &r, I16)?;
+                if ins.op_register(1).is_ymm() {
+                    // Convert each 128-bit `<4 x i32>` half natively and pack low 16 bits into
+                    // `<8 x i16>` with a single `shufflevector`.
+                    let v_lo = self.v_half(ins, 1, 0, I32)?;
+                    let v_hi = self.v_half(ins, 1, 1, I32)?;
+                    let h_lo = self.float_to_half_v4(&v_lo, mode);
+                    let h_hi = self.float_to_half_v4(&v_hi, mode);
+                    let lo16 = self.cast(&h_lo, Ty::v(I32), Ty::v(I16));
+                    let hi16 = self.cast(&h_hi, Ty::v(I32), Ty::v(I16));
+                    let h8 = self.shuffle(&lo16, &hi16, I16, &[0, 2, 4, 6, 8, 10, 12, 14]);
+                    match ins.op_kind(0) {
+                        OpKind::Register => self.xset_half(ins.op_register(0), 0, &h8, I16)?,
+                        _ => self.mem_store_at(ins, &h8, Ty::v(I16), 0, 16)?,
                     }
-                    _ => self.mem_store_at(ins, &h, Ty::vn(I16, n), 0, 2 * n as usize)?,
+                } else {
+                    let v = self.v_half(ins, 1, 0, I32)?;
+                    let h = self.float_to_half_v4(&v, mode);
+                    let h4 = self.val(&format!("trunc <4 x i32> {h} to <4 x i16>"));
+                    match ins.op_kind(0) {
+                        OpKind::Register => {
+                            let r = self.zext_lanes(&h4, I16, 4);
+                            self.xset_half(ins.op_register(0), 0, &r, I16)?;
+                        }
+                        _ => self.mem_store_at(ins, &h4, Ty::vn(I16, 4), 0, 8)?,
+                    }
                 }
             }
             _ => return Ok(false),
@@ -704,118 +810,131 @@ impl FunctionLifter<'_> {
         }
     }
 
-    /// binary16 (zero-extended in `<n x i32>`) -> binary32 bits, exact (signalling NaNs are
-    /// quieted like hardware does).
-    fn half_to_float(&mut self, h: &str, n: u32) -> String {
-        let ty = Ty::vn(Elem::I32, n);
-        let t = ty.ir();
-        let bt = ty.bool_ir();
+    /// binary16 (zero-extended in `<4 x i32>`) -> binary32 bits, bit-exact across all 65,536
+    /// inputs (signalling NaNs are quieted like hardware does).
+    fn half_to_float_v4(&mut self, h: &str) -> String {
+        let ty = Ty::v(Elem::I32);
+        let fty = Ty::v(Elem::F32);
+        let t = "<4 x i32>";
+        let bt = "<4 x i1>";
         let c = |v: i64| ty.splat(&v.to_string());
-        let sign = self.val(&format!("and {t} {h}, {}", c(0x8000)));
-        let sign = self.val(&format!("shl {t} {sign}, {}", c(16)));
-        let exp = self.val(&format!("lshr {t} {h}, {}", c(10)));
-        let exp = self.val(&format!("and {t} {exp}, {}", c(31)));
-        let man = self.val(&format!("and {t} {h}, {}", c(0x3FF)));
-        let man13 = self.val(&format!("shl {t} {man}, {}", c(13)));
-        let e32 = self.val(&format!("add {t} {exp}, {}", c(112)));
-        let e32 = self.val(&format!("shl {t} {e32}, {}", c(23)));
-        let normal = self.val(&format!("or {t} {e32}, {man13}"));
-        let has_man = self.val(&format!("icmp ne {t} {man}, zeroinitializer"));
-        let quiet = self.val(&format!(
-            "select {bt} {has_man}, {t} {}, {t} zeroinitializer",
-            c(0x0040_0000)
+        let s16 = self.val(&format!("and {t} {h}, {}", c(0x8000)));
+        let sign = self.val(&format!("shl {t} {s16}, {}", c(16)));
+        let abs = self.val(&format!("xor {t} {h}, {s16}"));
+        // Normals: `(abs << 13) + (112 << 23)`. Inf/NaN (`abs >= 0x7C00`) add a second `112 << 23`
+        // (143 + 112 = 255 = 0xFF); NaN (`abs > 0x7C00`) also sets the quiet bit `0x0040_0000`.
+        let sh = self.val(&format!("shl {t} {abs}, {}", c(13)));
+        let bias = c(0x3800_0000);
+        let base = self.val(&format!("add {t} {sh}, {bias}"));
+        let is_spec = self.val(&format!("icmp sgt {t} {abs}, {}", c(0x7BFF)));
+        let is_nan = self.val(&format!("icmp sgt {t} {abs}, {}", c(0x7C00)));
+        let spec_m = self.val(&format!("sext {bt} {is_spec} to {t}"));
+        let nan_m = self.val(&format!("sext {bt} {is_nan} to {t}"));
+        let exp_fix = self.val(&format!("and {t} {spec_m}, {bias}"));
+        let nan_fix = self.val(&format!("and {t} {nan_m}, {}", c(0x0040_0000)));
+        let ns = self.val(&format!("add {t} {base}, {exp_fix}"));
+        let ns = self.val(&format!("or {t} {ns}, {nan_fix}"));
+        // Zero and denormals (`abs < 0x0400`): `abs * 2^-24` is exact in binary32.
+        let f = self.val(&format!("sitofp {t} {abs} to <4 x float>"));
+        let tiny_f = self.val(&format!(
+            "fmul <4 x float> {f}, {}",
+            fty.splat(&fconst(2f64.powi(-24)))
         ));
-        let special = self.val(&format!("or {t} {man13}, {}", c(0x7F80_0000)));
-        let special = self.val(&format!("or {t} {special}, {quiet}"));
-        // Zero and denormals: man * 2^-24 is exact in binary32.
-        let f = self.val(&format!("uitofp {t} {man} to <{n} x float>"));
-        let scale = Ty::vn(Elem::F32, n).splat(&fconst(2f64.powi(-24)));
-        let f = self.val(&format!("fmul <{n} x float> {f}, {scale}"));
-        let tiny = self.val(&format!("bitcast <{n} x float> {f} to {t}"));
-        let is0 = self.val(&format!("icmp eq {t} {exp}, zeroinitializer"));
-        let is31 = self.val(&format!("icmp eq {t} {exp}, {}", c(31)));
-        let r = self.val(&format!("select {bt} {is31}, {t} {special}, {t} {normal}"));
-        let r = self.val(&format!("select {bt} {is0}, {t} {tiny}, {t} {r}"));
-        self.val(&format!("or {t} {r}, {sign}"))
+        let tiny = self.cast(&tiny_f, fty, ty);
+        let is_sub = self.val(&format!("icmp slt {t} {abs}, {}", c(0x0400)));
+        let mag = self.val(&format!("select {bt} {is_sub}, {t} {tiny}, {t} {ns}"));
+        self.val(&format!("or {t} {mag}, {sign}"))
     }
 
-    /// binary32 bits (`<n x i32>`) -> binary16 in the low 16 bits of each lane, rounded with
-    /// `mode`, exactly like `vcvtps2ph` (NaNs are quieted and keep the top payload bits).
-    fn float_to_half(&mut self, x: &str, n: u32, mode: Round) -> String {
-        let ty = Ty::vn(Elem::I32, n);
-        let t = ty.ir();
-        let bt = ty.bool_ir();
+    /// binary32 bits (`<4 x i32>`) -> binary16 in the low 16 bits of each lane, rounded with
+    /// `mode`, bit-exact with x86 F16C `vcvtps2ph` (NaNs are quieted and keep top payload bits).
+    fn float_to_half_v4(&mut self, x: &str, mode: Round) -> String {
+        let ty = Ty::v(Elem::I32);
+        let fty = Ty::v(Elem::F32);
+        let t = "<4 x i32>";
+        let bt = "<4 x i1>";
         let c = |v: i64| ty.splat(&v.to_string());
-        let s = self.val(&format!("lshr {t} {x}, {}", c(31)));
-        let neg = self.val(&format!("icmp ne {t} {s}, zeroinitializer"));
-        let sign16 = self.val(&format!("shl {t} {s}, {}", c(15)));
-        let e = self.val(&format!("lshr {t} {x}, {}", c(23)));
-        let e = self.val(&format!("and {t} {e}, {}", c(255)));
-        let m = self.val(&format!("and {t} {x}, {}", c(0x7F_FFFF)));
-        let e_zero = self.val(&format!("icmp eq {t} {e}, zeroinitializer"));
-        let mi = self.val(&format!("or {t} {m}, {}", c(0x80_0000)));
-        let full = self.val(&format!("select {bt} {e_zero}, {t} {m}, {t} {mi}"));
-        // Denormal inputs share the exponent of e == 1 (without the implicit bit).
-        let e_eff = self.val(&format!("select {bt} {e_zero}, {t} {}, {t} {e}", c(1)));
-        let big_e = self.val(&format!("sub {t} {e_eff}, {}", c(112))); // half exponent
-        let normal = self.val(&format!("icmp sgt {t} {big_e}, zeroinitializer"));
-        // shift = 13 for normal results, 14 - E for denormal ones (capped at 31).
-        let dshift = self.val(&format!("sub {t} {}, {big_e}", c(14)));
-        let small = self.val(&format!("icmp ult {t} {dshift}, {}", c(31)));
-        let dshift = self.val(&format!("select {bt} {small}, {t} {dshift}, {t} {}", c(31)));
-        let shift = self.val(&format!(
-            "select {bt} {normal}, {t} {}, {t} {dshift}",
-            c(13)
-        ));
-        let q = self.val(&format!("lshr {t} {full}, {shift}"));
-        let ones = self.val(&format!("shl {t} {}, {shift}", c(1)));
-        let lowmask = self.val(&format!("sub {t} {ones}, {}", c(1)));
-        let rem = self.val(&format!("and {t} {full}, {lowmask}"));
-        let em1 = self.val(&format!("sub {t} {big_e}, {}", c(1)));
-        let em1 = self.val(&format!("shl {t} {em1}, {}", c(10)));
-        let base = self.val(&format!(
-            "select {bt} {normal}, {t} {em1}, {t} zeroinitializer"
-        ));
-        let truncated = self.val(&format!("add {t} {base}, {q}"));
-        let inexact = self.val(&format!("icmp ne {t} {rem}, zeroinitializer"));
-        let inc = match mode {
-            Round::Nearest => {
-                let halfway = self.val(&format!("lshr {t} {ones}, {}", c(1)));
-                let above = self.val(&format!("icmp ugt {t} {rem}, {halfway}"));
-                let tie = self.val(&format!("icmp eq {t} {rem}, {halfway}"));
-                let odd = self.val(&format!("and {t} {q}, {}", c(1)));
-                let odd = self.val(&format!("icmp ne {t} {odd}, zeroinitializer"));
-                let tie_odd = self.val(&format!("and {bt} {tie}, {odd}"));
-                self.val(&format!("or {bt} {above}, {tie_odd}"))
-            }
-            Round::Down => self.val(&format!("and {bt} {inexact}, {neg}")),
-            Round::Up => {
-                let pos = self.val(&format!("xor {bt} {neg}, {}", ty.bool_splat(true)));
-                self.val(&format!("and {bt} {inexact}, {pos}"))
-            }
-            Round::Zero => ty.bool_splat(false),
+        let sign32 = self.val(&format!("and {t} {x}, {}", ty.splat(&imm(0x8000_0000, 32))));
+        let sign16 = self.val(&format!("lshr {t} {sign32}, {}", c(16)));
+        let abs = self.val(&format!("xor {t} {x}, {sign32}"));
+        let sh13 = self.val(&format!("lshr {t} {abs}, {}", c(13)));
+        let abs_f = self.cast(&abs, ty, fty);
+        let is_sub = self.val(&format!("icmp slt {t} {abs}, {}", c(0x3880_0000)));
+        let is_over = self.val(&format!("icmp sgt {t} {abs}, {}", c(0x477F_FFFF)));
+        let is_nan = self.val(&format!("icmp sgt {t} {abs}, {}", c(0x7F80_0000)));
+        let nan_p = self.val(&format!("and {t} {sh13}, {}", c(0x03FF)));
+        let nan_h = self.val(&format!("or {t} {nan_p}, {}", c(0x7E00)));
+
+        let r = if mode == Round::Nearest {
+            // Normal range [2^-14, 65536): round-to-nearest-even via single-constant bias.
+            // Values >= 65520.0 carry cleanly into 0x7C00 (+inf).
+            let odd = self.val(&format!("and {t} {sh13}, {}", c(1)));
+            let biased = self.val(&format!(
+                "add {t} {abs}, {}",
+                ty.splat(&imm(0xC800_0FFF, 32))
+            ));
+            let biased = self.val(&format!("add {t} {biased}, {odd}"));
+            let norm = self.val(&format!("lshr {t} {biased}, {}", c(13)));
+            // Subnormal/zero range [0, 2^-14): adding 0.5f32 (ulp = 2^-24) rounds with exact
+            // IEEE round-to-nearest-even directly onto the binary16 subnormal grid (and carries
+            // 1023.5*2^-24.. into 0x0400, the smallest normal half).
+            let sub_f = self.val(&format!(
+                "fadd <4 x float> {abs_f}, {}",
+                fty.splat(&fconst(0.5))
+            ));
+            let sub_bits = self.cast(&sub_f, fty, ty);
+            let sub_h = self.val(&format!("sub {t} {sub_bits}, {}", c(0x3F00_0000)));
+            let r = self.val(&format!("select {bt} {is_sub}, {t} {sub_h}, {t} {norm}"));
+            let r = self.val(&format!("select {bt} {is_over}, {t} {}, {t} {r}", c(0x7C00)));
+            self.val(&format!("select {bt} {is_nan}, {t} {nan_h}, {t} {r}"))
+        } else {
+            // Directed / truncate rounding modes:
+            // - Subnormal/zero: `|x| * 2^24` is exact in binary32 (even for f32 subnormals:
+            //   `2^-149 * 2^24 = 2^-125` is normal), so `ceil` + `fptosi.sat` gives exact
+            //   subnormal bits with zero variable shifts.
+            // - Normal: truncate `(abs - 0x3800_0000) >> 13`, plus 1 when rounding away & rem != 0.
+            let unbias = self.val(&format!("sub {t} {abs}, {}", c(0x3800_0000)));
+            let trunc_h = self.val(&format!("lshr {t} {unbias}, {}", c(13)));
+            let scaled = self.val(&format!(
+                "fmul <4 x float> {abs_f}, {}",
+                fty.splat(&fconst(2f64.powi(24)))
+            ));
+            let (norm, sub_h, overflow) = match mode {
+                Round::Zero => {
+                    let sub_h = self.intr(Intr::FpToSiSat(Elem::I32), fty, &[&scaled]);
+                    (trunc_h, sub_h, c(0x7BFF))
+                }
+                Round::Down | Round::Up => {
+                    let round_away = if mode == Round::Down {
+                        self.val(&format!("icmp slt {t} {x}, zeroinitializer"))
+                    } else {
+                        self.val(&format!("icmp sge {t} {x}, zeroinitializer"))
+                    };
+                    let rem = self.val(&format!("and {t} {abs}, {}", c(0x1FFF)));
+                    let inexact = self.val(&format!("icmp ne {t} {rem}, zeroinitializer"));
+                    let inc = self.val(&format!("and {bt} {inexact}, {round_away}"));
+                    let inc_m = self.val(&format!("sext {bt} {inc} to {t}"));
+                    let norm = self.val(&format!("sub {t} {trunc_h}, {inc_m}"));
+                    let ceiled = self.intr(Intr::Ceil, fty, &[&scaled]);
+                    let sub_f = self.val(&format!(
+                        "select {bt} {round_away}, <4 x float> {ceiled}, <4 x float> {scaled}"
+                    ));
+                    let sub_h = self.intr(Intr::FpToSiSat(Elem::I32), fty, &[&sub_f]);
+                    let overflow = self.val(&format!(
+                        "select {bt} {round_away}, {t} {}, {t} {}",
+                        c(0x7C00),
+                        c(0x7BFF)
+                    ));
+                    (norm, sub_h, overflow)
+                }
+                Round::Nearest => unreachable!(),
+            };
+            let is_inf = self.val(&format!("icmp eq {t} {abs}, {}", c(0x7F80_0000)));
+            let r = self.val(&format!("select {bt} {is_sub}, {t} {sub_h}, {t} {norm}"));
+            let r = self.val(&format!("select {bt} {is_over}, {t} {overflow}, {t} {r}"));
+            let r = self.val(&format!("select {bt} {is_inf}, {t} {}, {t} {r}", c(0x7C00)));
+            self.val(&format!("select {bt} {is_nan}, {t} {nan_h}, {t} {r}"))
         };
-        let inc = self.val(&format!("zext {bt} {inc} to {t}"));
-        let rounded = self.val(&format!("add {t} {truncated}, {inc}"));
-        // |x| >= 2^16 (half exponent >= 31): overflow per rounding mode.
-        let over = self.val(&format!("icmp sgt {t} {big_e}, {}", c(30)));
-        let (inf, max) = (c(0x7C00), c(0x7BFF));
-        let overflow = match mode {
-            Round::Nearest => inf.clone(),
-            Round::Zero => max.clone(),
-            Round::Down => self.val(&format!("select {bt} {neg}, {t} {inf}, {t} {max}")),
-            Round::Up => self.val(&format!("select {bt} {neg}, {t} {max}, {t} {inf}")),
-        };
-        let r = self.val(&format!(
-            "select {bt} {over}, {t} {overflow}, {t} {rounded}"
-        ));
-        // Infinity and NaN inputs.
-        let special = self.val(&format!("icmp eq {t} {e}, {}", c(255)));
-        let payload = self.val(&format!("lshr {t} {m}, {}", c(13)));
-        let has_m = self.val(&format!("icmp ne {t} {m}, zeroinitializer"));
-        let nan = self.val(&format!("or {t} {payload}, {}", c(0x7E00)));
-        let special_v = self.val(&format!("select {bt} {has_m}, {t} {nan}, {t} {inf}"));
-        let r = self.val(&format!("select {bt} {special}, {t} {special_v}, {t} {r}"));
         self.val(&format!("or {t} {r}, {sign16}"))
     }
 }
