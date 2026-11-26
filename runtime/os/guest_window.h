@@ -62,6 +62,15 @@ bool unmap_slot(uint64_t window_va);
 // keep naming the page's own slot (guest_address), and a write mark on any slot of the group is
 // a write mark on all of them (MarkPass). Remapping or unmapping the slot ends the alias.
 bool map_alias_slot(uint64_t window_va, void* host_page);
+// Atomically publishes a batch of slot mappings under one window-table lock with release ordering,
+// so concurrent readers never observe partially relocated runs. Non-alias entries should precede
+// alias entries targeting the same host page so alias groups include the page's primary slot.
+struct SlotMapping {
+    uint64_t window_va = 0;
+    void* host_page = nullptr;
+    bool alias = false;
+};
+void map_slots_batch(const SlotMapping* mappings, size_t count);
 // Slots currently mapped as aliases (diagnostics, tests).
 size_t alias_slot_count();
 // Host page backing the slot of `window_va`, or nullptr if unmapped / outside.
@@ -133,11 +142,35 @@ bool take_written(uint64_t va, size_t len, std::vector<uint64_t>* slot_offsets);
 // handed out. `host` must be kSlotBytes-aligned and stay valid until unmap_runtime_range. Returns
 // the window VA, or 0 (window off, misaligned, no room).
 inline constexpr uint64_t kRuntimeRangeBase = kWindowBase + (uint64_t{16} << 30);
-uint64_t map_runtime_range(void* host, uint64_t bytes);
+// When `map_slots` is true (default), all slots of the range are mapped 1:1 onto `host` right
+// away; when false (uncommitted MEM_PHYSICAL / placeholder reservations), slots stay unmapped
+// (kTrapDelta) until committed or populated by XMemMapPhysicalPages. A 1-slot unmapped guard gap
+// is kept before and between runtime ranges so separate allocations never form split pairs.
+uint64_t map_runtime_range(void* host, uint64_t bytes, bool map_slots = true);
 void unmap_runtime_range(uint64_t va, uint64_t bytes);
 // Host address behind window VA `va` of a runtime-owned range (the range's host memory, mapped or
 // not), or nullptr when `va` lies in no such range.
 void* runtime_range_host(uint64_t va);
+
+// Scoped pin for a host thread writing directly into a mapped window range (writable Buffers
+// in-place views, DirectStorage / ReadFile destinations). XMem run relocation waits for active
+// write pins from other threads overlapping a relocated run before copying and switching frames.
+class WritePin {
+public:
+    WritePin() = default;
+    WritePin(uint64_t window_va, size_t bytes);
+    WritePin(const WritePin&) = delete;
+    WritePin& operator=(const WritePin&) = delete;
+    WritePin(WritePin&& other) noexcept;
+    WritePin& operator=(WritePin&& other) noexcept;
+    ~WritePin();
+    void release();
+
+private:
+    uint64_t id_ = 0;
+};
+bool has_other_thread_write_pin(uint64_t first_va, uint64_t last_va_inclusive);
+void wait_other_thread_write_pins(uint64_t first_va, uint64_t last_va_inclusive);
 
 // Verification (tests, and real-program runs): a reader that uses the marks also compares the
 // unmarked slots and reports changes found there (note_verify_miss): a miss is a writer that did
@@ -262,6 +295,7 @@ private:
         uint64_t bytes = 0;
     };
     std::vector<Written> written_;  // window ranges written in place (marked by finish())
+    std::vector<WritePin> pins_;    // active writable in-place pins (released by finish())
 };
 
 // Contiguous runs (O29): code lifted with the windowed model's `contiguous_runs` has no straddle
