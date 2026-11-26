@@ -22,6 +22,11 @@ class PresentPacer {
 public:
     using Clock = std::chrono::steady_clock;
     static constexpr int64_t kVblankNs = 16'666'667;  // 60 Hz
+    // Hard upper bound on sync interval (6 vblanks = 100 ms, matching Xbox FramePacer's
+    // kMaxIntervalUs = 100,000 us and covering DXGI 0..4) so malformed intervals or stacked
+    // waits can never sleep unboundedly or poison pacing anchors.
+    static constexpr uint32_t kMaxInterval = 6;
+    static constexpr int64_t kMaxSleepNs = static_cast<int64_t>(kMaxInterval) * kVblankNs;
 
     PresentPacer();
 
@@ -58,7 +63,13 @@ public:
     bool honor_interval() const;
     // The gap in vblanks title-driven mode enforces for `interval` (> 0) in each mode.
     static uint32_t title_gap_vblanks(uint32_t interval, bool honor) {
-        return honor ? (interval < 1 ? 1u : interval) : 1u;
+        if (!honor) {
+            return 1u;
+        }
+        if (interval < 1u) {
+            return 1u;
+        }
+        return interval > kMaxInterval ? kMaxInterval : interval;
     }
 
     void set_enabled(bool on);
@@ -76,6 +87,9 @@ public:
     void reset_for_testing();
 
 private:
+    uint64_t vblank_at_locked(Clock::time_point t) const;
+    Clock::time_point vblank_start_locked(uint64_t v) const;
+
     mutable std::mutex mutex_;
     Clock::time_point origin_;
     std::function<Clock::time_point()> now_;
@@ -88,6 +102,7 @@ private:
     bool have_last_present_time_ = false;
     uint64_t last_flip_ = 0;
     Clock::time_point last_present_time_{};
+    uint64_t generation_ = 0;
     Stats stats_{};
 };
 

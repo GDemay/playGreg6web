@@ -3074,3 +3074,113 @@ test('Jitter/stutter fix (#1028/#663): AudioEngine configures 341ms ring, click-
     await engine.destroy();
   }
 });
+
+test('Orch-07 (#663/#1028): AudioEngine enables worklet softLimit, 4096-frame drift guard, smooth suspend/resume resync, and cursor normalization', async () => {
+  // 1. Default processorOptions include softLimit: true & softLimitKnee: 0.9, and 4096-frame ring gets proportional drift guard.
+  {
+    const env = createMockWebAudioEnv({ initialState: 'running', actualSampleRate: 48000 });
+    const engine = new AudioEngine({
+      capacityFrames: 4096,
+      AudioContextCtor: env.MockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      listenTelemetryBroadcast: false,
+    });
+    const res = await engine.start();
+    assert.equal(res.ok, true);
+    const opts = env.events.nodes[0].options.processorOptions;
+    assert.equal(opts.softLimit, true);
+    assert.equal(opts.softLimitKnee, 0.9);
+    assert.ok(opts.maxBufferedFrames > 0 && opts.maxBufferedFrames < 4096);
+    assert.ok(opts.targetWatermarkFrames > 0 && opts.targetWatermarkFrames < opts.maxBufferedFrames);
+    await engine.destroy();
+  }
+
+  // 2. suspend() ramps masterGainNode to 0.0 and holds silent; resume() fades back in and forwards resyncBacklog: true.
+  {
+    const workerMessages = [];
+    const ramps = [];
+    const env = createMockWebAudioEnv({ initialState: 'running', actualSampleRate: 48000 });
+    class GainMockAudioContext extends env.MockAudioContext {
+      constructor(ctxOpts) {
+        super(ctxOpts);
+        this.currentTime = 1.0;
+      }
+      createGain() {
+        const gainParam = {
+          value: 1.0,
+          cancelScheduledValues() {},
+          setValueAtTime(v) {
+            this.value = v;
+          },
+          linearRampToValueAtTime(v, t) {
+            ramps.push({ target: v, endTime: t });
+            this.value = v;
+          },
+        };
+        return {
+          gain: gainParam,
+          connect() {},
+          disconnect() {},
+        };
+      }
+      async suspend() {
+        this.state = 'suspended';
+        this._emit('statechange');
+      }
+    }
+    const engine = new AudioEngine({
+      AudioContextCtor: GainMockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      audioWorker: {
+        postMessage(msg) {
+          workerMessages.push(msg);
+        },
+      },
+      listenTelemetryBroadcast: false,
+    });
+    await engine.start();
+    assert.equal(await engine.suspend(), true);
+    assert.equal(engine._masterGainHeldSilent, true);
+    assert.ok(ramps.some((r) => r.target === 0.0), 'suspend must ramp masterGainNode to 0.0');
+    assert.equal(await engine.resume(), true);
+    assert.equal(engine._masterGainHeldSilent, false);
+    assert.ok(ramps.some((r) => r.target === 1.0), 'resume must ramp masterGainNode back to target volume');
+    const activeMsg = workerMessages.find(
+      (m) => m && m.setOutputState === true && m.outputState === 'active'
+    );
+    assert.ok(activeMsg, 'resume must forward active state to audio worker');
+    assert.equal(activeMsg.resyncBacklog, true);
+    await engine.destroy();
+  }
+
+  // 3. Corrupted out-of-range SAB cursors are normalized modulo 2*cap and unsigned telemetry counters > 2^31 stay non-negative.
+  {
+    const env = createMockWebAudioEnv({ initialState: 'running', actualSampleRate: 48000 });
+    const engine = new AudioEngine({
+      capacityFrames: 256,
+      AudioContextCtor: env.MockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      listenTelemetryBroadcast: false,
+    });
+    await engine.start();
+    const ctrl = new Int32Array(engine.sab, 0, 8);
+    // Out-of-range write cursor (512 + 40 = 552) and negative read cursor (-502 => 10 mod 512) => 30 buffered frames.
+    Atomics.store(ctrl, 0, 552);
+    Atomics.store(ctrl, 1, -502);
+    assert.equal(engine.availableFrames(), 30);
+
+    const pulled = new Float32Array(10 * 2);
+    const pullRes = engine.pullPcm(pulled);
+    assert.equal(pullRes.ok, true);
+    assert.equal(pullRes.framesRead, 10);
+    assert.equal(pullRes.bufferedFrames, 20);
+
+    // Unsigned Int32 counter wraparound (> 2^31) reads cleanly as positive integer.
+    Atomics.store(ctrl, HDR_UNDERRUN_FRAMES, 0x80000100 | 0);
+    Atomics.store(ctrl, HDR_DROPPED_FRAMES, 0x80000200 | 0);
+    const stats = engine.getTelemetry();
+    assert.equal(stats.underrunFrames, 0x80000100);
+    assert.equal(stats.droppedFrames, 0x80000200);
+    await engine.destroy();
+  }
+});

@@ -66,6 +66,14 @@
   const GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES = 480; // 10 ms @ 48 kHz
   const GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES = 4096; // ~85 ms zero-alloc burst chunk
   const GUEST_PCM_RING_MAX_QUANTUM_FRAMES = 65536;
+  const GUEST_TRIM_CROSSFADE_FRAMES = 64; // ~1.33 ms @ 48 kHz click-free backlog trim splice
+  const GUEST_HIGH_WATERMARK_MS = 250; // Trim active guest-ring backlog only above 250 ms (>180 ms burst)
+  const GUEST_TARGET_WATERMARK_MS = 96; // Post-trim steady cushion (~4608 frames @ 48 kHz)
+  const GUEST_RESUME_HIGH_WATERMARK_MS = 120; // Trim stale backlog on resume/unlock above 120 ms
+  const GUEST_RESUME_TARGET_WATERMARK_MS = 80; // Post-resume fresh cushion (~3840 frames @ 48 kHz)
+  const GUEST_THROTTLED_DRAIN_HIGH_WATERMARK_MS = 200; // Trim during 1 Hz throttled background drain
+  const ACTIVE_STALL_EVICT_MS = 60; // Dead-consumer wall-clock threshold (>21 ms OS hardware buffer / GPU jitter) before SPSC fallback
+  const ACTIVE_STALL_EVICT_MAX_TICKS = 16; // Fallback tick bound if monotonic clock is frozen in tests
 
   // O43 (#1028/#663): Live audio-stats BroadcastChannel telemetry defaults matching
   // web/loader.js & web/app_bootstrap.js ('game-progress').
@@ -2116,6 +2124,10 @@
       this._readCtrl = new Int32Array(sab, readIndexByteOffset, 1);
       this._writeCtrl = new Int32Array(sab, writeIndexByteOffset, 1);
       this._lastStereoFrame = new Float32Array(GUEST_PCM_RING_CHANNELS);
+      this._trimXfadeSamples = new Float32Array(
+        GUEST_TRIM_CROSSFADE_FRAMES * GUEST_PCM_RING_CHANNELS
+      );
+      this._pendingTrimXfadeFrames = 0;
       this._hasActiveAudio = false;
       this._inUnderrun = false;
       this._fadeInPos = 0;
@@ -2148,6 +2160,8 @@
     resetFadeState() {
       this._lastStereoFrame[0] = 0.0;
       this._lastStereoFrame[1] = 0.0;
+      this._trimXfadeSamples.fill(0);
+      this._pendingTrimXfadeFrames = 0;
       this._hasActiveAudio = false;
       this._inUnderrun = false;
       this._fadeInPos = 0;
@@ -2209,6 +2223,69 @@
       }
       const clamped = readable > this._capacitySamples ? this._capacitySamples : readable;
       return clamped >>> 1;
+    }
+
+    /**
+     * Lock-free, zero-allocation SPSC consumer-side backlog trim.
+     * Advances `_readCtrl` to leave at most `targetFrames` queued in the guest
+     * ring. When `crossfadeFrames > 0` and audio is active, captures the old
+     * head frames into `_trimXfadeSamples` so the next `readInto()` splices
+     * across the jump with a click-free half-cosine crossfade.
+     *
+     * @param {number} targetFrames
+     * @param {number} [crossfadeFrames=GUEST_TRIM_CROSSFADE_FRAMES]
+     * @returns {number} Number of stale frames trimmed.
+     */
+    trimToFrames(targetFrames, crossfadeFrames = GUEST_TRIM_CROSSFADE_FRAMES) {
+      const target = sanitizeNonNegInt(targetFrames, 0);
+      let read = Atomics.load(this._readCtrl, 0) >>> 0;
+      const write = Atomics.load(this._writeCtrl, 0) >>> 0;
+      let readableSamples = (write - read) >>> 0;
+      if (readableSamples >= 0x80000000) {
+        Atomics.store(this._readCtrl, 0, write | 0);
+        this._pendingTrimXfadeFrames = 0;
+        return 0;
+      }
+      if (readableSamples > this._capacitySamples) {
+        const excessSamples = readableSamples - this._capacitySamples;
+        const overrunFrames = Math.ceil(excessSamples / GUEST_PCM_RING_CHANNELS);
+        read = (read + overrunFrames * GUEST_PCM_RING_CHANNELS) >>> 0;
+        readableSamples = (write - read) >>> 0;
+      }
+      const availFrames = readableSamples >>> 1;
+      if (availFrames <= target) {
+        return 0;
+      }
+      const skipFrames = availFrames - target;
+      const requestedXfade = sanitizeNonNegInt(crossfadeFrames, 0);
+      if (
+        requestedXfade > 0 &&
+        this._hasActiveAudio &&
+        this._pendingTrimXfadeFrames === 0
+      ) {
+        const xf = Math.min(requestedXfade, GUEST_TRIM_CROSSFADE_FRAMES, availFrames);
+        const xfSamples = xf * GUEST_PCM_RING_CHANNELS;
+        const startSlot = read & this._mask;
+        const tailRoom = this._capacitySamples - startSlot;
+        const firstSamples = xfSamples <= tailRoom ? xfSamples : tailRoom;
+        const secondSamples = xfSamples - firstSamples;
+        const ringData = this._data;
+        const dst = this._trimXfadeSamples;
+        for (let i = 0; i < firstSamples; i++) {
+          const v = ringData[startSlot + i];
+          dst[i] = v - v === 0 ? v : 0.0;
+        }
+        for (let i = 0; i < secondSamples; i++) {
+          const v = ringData[i];
+          dst[firstSamples + i] = v - v === 0 ? v : 0.0;
+        }
+        this._pendingTrimXfadeFrames = xf;
+      } else if (requestedXfade === 0) {
+        this._pendingTrimXfadeFrames = 0;
+      }
+      const nextRead = (read + skipFrames * GUEST_PCM_RING_CHANNELS) >>> 0;
+      Atomics.store(this._readCtrl, 0, nextRead | 0);
+      return skipFrames;
     }
 
     /**
@@ -2372,6 +2449,31 @@
 
       if (samplesToRead > 0 || overrun) {
         Atomics.store(this._readCtrl, 0, read | 0);
+      }
+
+      // Click-free half-cosine crossfade across a consumer-side backlog trim boundary.
+      if (framesToRead > 0 && this._pendingTrimXfadeFrames > 0) {
+        const xfFrames =
+          this._pendingTrimXfadeFrames < framesToRead
+            ? this._pendingTrimXfadeFrames
+            : framesToRead;
+        const oldBuf = this._trimXfadeSamples;
+        const denom = xfFrames + 1;
+        for (let f = 0; f < xfFrames; f++) {
+          const t = (f + 1) / denom;
+          const wNew = 0.5 * (1.0 - Math.cos(Math.PI * t));
+          const wOld = 1.0 - wNew;
+          const base = f * GUEST_PCM_RING_CHANNELS;
+          const l = oldBuf[base] * wOld + output[base] * wNew;
+          const r = oldBuf[base + 1] * wOld + output[base + 1] * wNew;
+          output[base] = l;
+          output[base + 1] = r;
+          const absL = l < 0 ? -l : l;
+          const absR = r < 0 ? -r : r;
+          if (absL > peakLevel) peakLevel = absL;
+          if (absR > peakLevel) peakLevel = absR;
+        }
+        this._pendingTrimXfadeFrames = 0;
       }
 
       // W272/W299 click-free half-cosine (or linear) recovery fade-in when audio resumes after underrun.
@@ -2679,7 +2781,7 @@
     }
 
     get underruns() {
-      return Atomics.load(this._ctrl, HDR_UNDERRUNS);
+      return Atomics.load(this._ctrl, HDR_UNDERRUNS) >>> 0;
     }
 
     get underrunCount() {
@@ -2687,7 +2789,7 @@
     }
 
     get underrunFrames() {
-      return Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES);
+      return Atomics.load(this._ctrl, HDR_UNDERRUN_FRAMES) >>> 0;
     }
 
     get underrunRecoveries() {
@@ -2739,7 +2841,7 @@
     }
 
     get overflows() {
-      return Atomics.load(this._ctrl, HDR_OVERFLOWS);
+      return Atomics.load(this._ctrl, HDR_OVERFLOWS) >>> 0;
     }
 
     get overruns() {
@@ -2747,7 +2849,7 @@
     }
 
     get droppedFrames() {
-      return Atomics.load(this._ctrl, HDR_DROPPED_FRAMES);
+      return Atomics.load(this._ctrl, HDR_DROPPED_FRAMES) >>> 0;
     }
 
     get packetsReceived() {
@@ -3207,11 +3309,14 @@
               const fadeFrames =
                 declickFrames < missingFrames ? declickFrames : missingFrames;
               for (let i = 0; i < fadeFrames; i++) {
-                const rampGain = useCosine
-                  ? i === fadeFrames - 1
-                    ? 0.0
-                    : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
-                  : (fadeFrames - 1 - i) / fadeFrames;
+                const rampGain =
+                  fadeFrames === 1
+                    ? 0.5
+                    : useCosine
+                      ? i === fadeFrames - 1
+                        ? 0.0
+                        : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                      : (fadeFrames - 1 - i) / fadeFrames;
                 const base = (framesToRead + i) * channels;
                 for (let c = 0; c < channels; c++) {
                   output[base + c] = this._lastOutputFrame[c] * rampGain;
@@ -3566,6 +3671,7 @@
       this.ring = null;
       this._hasExternalRingSab = false;
       this._stalledFullTicks = 0;
+      this._stalledFullSinceMs = null;
       this._lastObservedReadCursor = null;
       this.totalPushedFrames = 0;
       this.totalPulledFrames = 0;
@@ -3605,6 +3711,13 @@
       this._guestPeakLevel = 0.0;
       this._guestUnderrunFadeCount = 0;
       this._guestRecoveryFadeCount = 0;
+      this._guestTrimmedFrames = 0;
+      this._guestTrimCount = 0;
+      this._directResampleLastFrame = new Float32Array(GUEST_PCM_RING_CHANNELS);
+      this._directResampleHasActive = false;
+      this._directResampleInUnderrun = false;
+      this._directResampleFadeInPos = 0;
+      this._directResampleFadeInTotal = 0;
       this._inDrainTick = false;
 
       // O43 (#1028/#663): Live BroadcastChannel audio-stats telemetry state.
@@ -4007,11 +4120,13 @@
         this.setSampleRate(opts.sampleRate);
       }
 
+      const prevState = this.outputState;
       this.ring = nextRing;
       this.channels = nextRing.channels;
       this.initialized = true;
       this._hasExternalRingSab = true;
       this._stalledFullTicks = 0;
+      this._stalledFullSinceMs = null;
       this._lastObservedReadCursor = null;
 
       if (typeof opts.outputState === 'string') {
@@ -4024,6 +4139,20 @@
         this.outputState = OUTPUT_STATES.HEADLESS_DRAIN;
       } else if (this.outputState === OUTPUT_STATES.HEADLESS_DRAIN) {
         this.outputState = OUTPUT_STATES.ACTIVE;
+      }
+
+      if (
+        this.outputState === OUTPUT_STATES.ACTIVE &&
+        (prevState !== OUTPUT_STATES.ACTIVE || opts.resyncBacklog === true) &&
+        this._guestRing
+      ) {
+        this._guestResamplerState.phase = 0.0;
+        const guestRate = this._guestRing.sampleRate;
+        this._trimGuestBacklog(
+          Math.round((guestRate * GUEST_RESUME_HIGH_WATERMARK_MS) / 1000),
+          Math.round((guestRate * GUEST_RESUME_TARGET_WATERMARK_MS) / 1000),
+          false
+        );
       }
 
       if (this._shouldRunTimer()) {
@@ -4048,15 +4177,50 @@
       };
     }
 
+    _trimGuestBacklog(highWatermarkFrames, targetFrames, withCrossfade = true) {
+      if (!this._guestRing) {
+        return 0;
+      }
+      const avail = this._guestRing.availableFrames();
+      if (avail <= highWatermarkFrames) {
+        return 0;
+      }
+      const safeTarget = targetFrames < highWatermarkFrames ? targetFrames : highWatermarkFrames;
+      const trimmed = this._guestRing.trimToFrames(
+        safeTarget,
+        withCrossfade ? GUEST_TRIM_CROSSFADE_FRAMES : 0
+      );
+      if (trimmed > 0) {
+        this._guestTrimmedFrames += trimmed;
+        this._guestTrimCount += 1;
+      }
+      return trimmed;
+    }
+
     setOutputState(state, options = null) {
       if (options && typeof options === 'object' && options.sampleRate !== undefined) {
         this.setSampleRate(options.sampleRate);
       }
       const prevState = this.outputState;
       this.outputState = normalizeOutputState(state, OUTPUT_STATES.HEADLESS_DRAIN);
+      const resyncRequested = Boolean(options && typeof options === 'object' && options.resyncBacklog);
       if (this.outputState !== prevState) {
         this._stalledFullTicks = 0;
+        this._stalledFullSinceMs = null;
         this._lastObservedReadCursor = null;
+      }
+      if (
+        this.outputState === OUTPUT_STATES.ACTIVE &&
+        (prevState !== OUTPUT_STATES.ACTIVE || resyncRequested) &&
+        this._guestRing
+      ) {
+        this._guestResamplerState.phase = 0.0;
+        const guestRate = this._guestRing.sampleRate;
+        this._trimGuestBacklog(
+          Math.round((guestRate * GUEST_RESUME_HIGH_WATERMARK_MS) / 1000),
+          Math.round((guestRate * GUEST_RESUME_TARGET_WATERMARK_MS) / 1000),
+          false
+        );
       }
       if (this._shouldRunTimer()) {
         const desiredInterval = this._effectiveTimerIntervalMs();
@@ -4083,12 +4247,16 @@
       }
       const now =
         typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : this._now();
+      let rawElapsedMs;
       let elapsedMs;
       if (this._lastDrainMs === null) {
+        rawElapsedMs = this._drainIntervalMs;
         elapsedMs = this._drainIntervalMs;
       } else {
-        elapsedMs = now - this._lastDrainMs;
+        rawElapsedMs = now - this._lastDrainMs;
+        elapsedMs = rawElapsedMs;
         if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
+          rawElapsedMs = this._drainIntervalMs;
           elapsedMs = this._drainIntervalMs;
         } else if (elapsedMs > MAX_DRAIN_ELAPSED_MS) {
           elapsedMs = MAX_DRAIN_ELAPSED_MS;
@@ -4106,9 +4274,20 @@
       this._inDrainTick = true;
       try {
         if (this._guestRing && this._guestRingAutoPump && maxFrames > 0) {
+          const guestRate = this._guestRing.sampleRate;
+          // Under background-tab timer throttling (e.g. Chrome 1 Hz -> rawElapsedMs > 100 ms),
+          // 100 ms real-time drain per 1000 ms cannot keep up with the 65536-frame guest ring.
+          // Trim stale guest-ring backlog directly so tab-return never plays >1 s behind video.
+          if (rawElapsedMs > MAX_DRAIN_ELAPSED_MS) {
+            const trimmed = this._trimGuestBacklog(
+              Math.round((guestRate * GUEST_THROTTLED_DRAIN_HIGH_WATERMARK_MS) / 1000),
+              Math.round((guestRate * GUEST_RESUME_TARGET_WATERMARK_MS) / 1000),
+              false
+            );
+            drained += trimmed;
+          }
           // Chunk by this.ring.capacityFrames (scaled by guestRate / targetRate if resampling)
           // so slow/throttled browser timer ticks never trigger spurious overruns.
-          const guestRate = this._guestRing.sampleRate;
           const targetRate = this.sampleRate;
           const guestBudget =
             guestRate !== targetRate
@@ -4155,10 +4334,10 @@
      * space without discarding unread samples or throttling to 1x elapsed wall-clock
      * time, so AudioWorkletProcessor maintains a healthy jitter cushion.
      *
-     * Handles sample-rate conversion budgeting cleanly (e.g. 48 kHz guest -> 44.1/96 kHz
-     * host AudioContext) and prevents GuestPcmRingReader deadlocks if the AudioWorklet
-     * consumer is suspended (ring full with stationary read cursor for >= 2 ticks, or
-     * under `drop-oldest` policy).
+     * Bounds stale backlog via click-free consumer-side guest-ring trimming above
+     * 250 ms and preserves strict SPSC safety on the output SAB ring by waiting for
+     * a real dead-consumer stall (>= 250 ms stationary read cursor) before ever
+     * falling back to producer-side eviction.
      *
      * @param {number} [nowMs] Optional monotonic timestamp in ms.
      * @returns {number} Number of guest stereo frames pumped.
@@ -4183,12 +4362,24 @@
       }
       this._lastDrainMs = now;
 
+      const guestRate = this._guestRing.sampleRate;
+      const guestHighWatermark = Math.max(
+        1,
+        Math.round((guestRate * GUEST_HIGH_WATERMARK_MS) / 1000)
+      );
+      const guestTargetWatermark = Math.max(
+        1,
+        Math.round((guestRate * GUEST_TARGET_WATERMARK_MS) / 1000)
+      );
+      // Trim extreme stale guest-ring backlog (>250 ms, e.g. after tab-switch or 1 s stall)
+      // down to ~96 ms with a click-free 64-frame half-cosine crossfade before pumping.
+      this._trimGuestBacklog(guestHighWatermark, guestTargetWatermark, true);
+
       const availGuestFrames = this._guestRing.availableFrames();
       if (availGuestFrames <= 0) {
         return 0;
       }
 
-      const guestRate = this._guestRing.sampleRate;
       const targetRate = this.sampleRate;
       const needsResample = guestRate !== targetRate;
       const tickCap = this._effectiveMaxDrainFramesPerTick();
@@ -4219,11 +4410,20 @@
         } else {
           if (this._lastObservedReadCursor === curRead) {
             this._stalledFullTicks += 1;
+            if (this._stalledFullSinceMs === null) {
+              this._stalledFullSinceMs = now;
+            }
           } else {
             this._stalledFullTicks = 1;
+            this._stalledFullSinceMs = now;
             this._lastObservedReadCursor = curRead;
           }
-          if (this._stalledFullTicks >= 2) {
+          const stalledMs =
+            this._stalledFullSinceMs !== null ? now - this._stalledFullSinceMs : 0;
+          if (
+            stalledMs >= ACTIVE_STALL_EVICT_MS ||
+            this._stalledFullTicks >= ACTIVE_STALL_EVICT_MAX_TICKS
+          ) {
             shouldEvictOldest = true;
           }
         }
@@ -4250,6 +4450,7 @@
         }
       } else {
         this._stalledFullTicks = 0;
+        this._stalledFullSinceMs = null;
         this._lastObservedReadCursor = curRead;
       }
 
@@ -4966,12 +5167,87 @@
           this._guestPeakLevel = peakLevel;
         }
 
+        const useCosine = drainFadeCurve !== 'linear';
+        if (outFramesWritten > 0 && drainDeclickFrames > 0 && fillSilence) {
+          if (this._directResampleInUnderrun) {
+            this._directResampleInUnderrun = false;
+            this._directResampleFadeInPos = 0;
+            this._directResampleFadeInTotal = drainDeclickFrames;
+            this._guestRecoveryFadeCount += 1;
+          }
+          if (
+            this._directResampleFadeInTotal > 0 &&
+            this._directResampleFadeInPos < this._directResampleFadeInTotal
+          ) {
+            const rem = this._directResampleFadeInTotal - this._directResampleFadeInPos;
+            const rampCount = outFramesWritten < rem ? outFramesWritten : rem;
+            const total = this._directResampleFadeInTotal;
+            for (let f = 0; f < rampCount; f++) {
+              const t = (this._directResampleFadeInPos + f) / total;
+              const rampGain = useCosine ? 0.5 * (1.0 - Math.cos(Math.PI * t)) : t;
+              const base = f * GUEST_PCM_RING_CHANNELS;
+              output[base] *= rampGain;
+              output[base + 1] *= rampGain;
+            }
+            this._directResampleFadeInPos += rampCount;
+            if (this._directResampleFadeInPos >= this._directResampleFadeInTotal) {
+              this._directResampleFadeInPos = 0;
+              this._directResampleFadeInTotal = 0;
+            }
+          }
+        }
+
         let underrun = false;
         let underrunFrames = 0;
         if (outFramesWritten < requestedFrames) {
           underrun = true;
           underrunFrames = requestedFrames - outFramesWritten;
-          if (fillSilence) {
+          if (drainDeclickFrames > 0 && fillSilence) {
+            this._directResampleFadeInPos = 0;
+            this._directResampleFadeInTotal = 0;
+            if (outFramesWritten > 0 || this._directResampleHasActive) {
+              if (outFramesWritten > 0) {
+                const lastBase = (outFramesWritten - 1) * GUEST_PCM_RING_CHANNELS;
+                this._directResampleLastFrame[0] = output[lastBase];
+                this._directResampleLastFrame[1] = output[lastBase + 1];
+              }
+              const fadeFrames =
+                drainDeclickFrames < underrunFrames ? drainDeclickFrames : underrunFrames;
+              const lastL = this._directResampleLastFrame[0];
+              const lastR = this._directResampleLastFrame[1];
+              for (let i = 0; i < fadeFrames; i++) {
+                const rampGain =
+                  fadeFrames === 1
+                    ? 0.5
+                    : useCosine
+                      ? i === fadeFrames - 1
+                        ? 0.0
+                        : 0.5 * (1.0 + Math.cos(Math.PI * ((i + 1) / fadeFrames)))
+                      : (fadeFrames - 1 - i) / fadeFrames;
+                const base = (outFramesWritten + i) * GUEST_PCM_RING_CHANNELS;
+                output[base] = lastL * rampGain;
+                output[base + 1] = lastR * rampGain;
+              }
+              if (outFramesWritten + fadeFrames < requestedFrames) {
+                output.fill(
+                  0,
+                  (outFramesWritten + fadeFrames) * GUEST_PCM_RING_CHANNELS,
+                  requestedFrames * GUEST_PCM_RING_CHANNELS
+                );
+              }
+              this._guestUnderrunFadeCount += 1;
+              this._directResampleHasActive = false;
+              this._directResampleLastFrame[0] = 0.0;
+              this._directResampleLastFrame[1] = 0.0;
+            } else {
+              output.fill(
+                0,
+                outFramesWritten * GUEST_PCM_RING_CHANNELS,
+                requestedFrames * GUEST_PCM_RING_CHANNELS
+              );
+            }
+            this._directResampleInUnderrun = true;
+          } else if (fillSilence) {
             output.fill(
               0,
               outFramesWritten * GUEST_PCM_RING_CHANNELS,
@@ -4980,6 +5256,11 @@
           }
           this._guestUnderruns += 1;
           this._guestUnderrunFrames += underrunFrames;
+        } else if (outFramesWritten > 0) {
+          const lastBase = (outFramesWritten - 1) * GUEST_PCM_RING_CHANNELS;
+          this._directResampleLastFrame[0] = output[lastBase];
+          this._directResampleLastFrame[1] = output[lastBase + 1];
+          this._directResampleHasActive = true;
         }
 
         const zeroAlloc = this._scratchPool.allocations === allocsBefore;
@@ -5185,6 +5466,7 @@
       this._lastResampleSrcRate = null;
       this._lastDrainMs = null;
       this._stalledFullTicks = 0;
+      this._stalledFullSinceMs = null;
       this._lastObservedReadCursor = null;
       this._guestResamplerState = { phase: 0.0 };
       this._guestFramesDrained = 0;
@@ -5195,6 +5477,14 @@
       this._guestPeakLevel = 0.0;
       this._guestUnderrunFadeCount = 0;
       this._guestRecoveryFadeCount = 0;
+      this._guestTrimmedFrames = 0;
+      this._guestTrimCount = 0;
+      this._directResampleLastFrame[0] = 0.0;
+      this._directResampleLastFrame[1] = 0.0;
+      this._directResampleHasActive = false;
+      this._directResampleInUnderrun = false;
+      this._directResampleFadeInPos = 0;
+      this._directResampleFadeInTotal = 0;
       this._lastTelemetryBroadcastMs = null;
       this._lastBroadcastFramesDrained = -1;
       this._lastBroadcastGuestFramesDrained = -1;
@@ -5346,6 +5636,8 @@
         guestUnderruns: this._guestUnderruns,
         guestOverruns: this._guestOverruns,
         guestPeakLevel: this._guestPeakLevel,
+        guestTrimmedFrames: this._guestTrimmedFrames,
+        guestTrimCount: this._guestTrimCount,
       };
     }
 
@@ -5560,6 +5852,7 @@
           this.initialized = true;
           if (msg.preserveGuestStats === true) {
             this._stalledFullTicks = 0;
+            this._stalledFullSinceMs = null;
             this._lastObservedReadCursor = null;
           } else {
             this._resetTelemetryAndCounters();
@@ -6135,13 +6428,23 @@
           if (isSharedArrayBuffer(attachedSab) && (!this.ring || this.ring.sab !== attachedSab)) {
             this.attachRingSab(attachedSab, msg);
           }
+          const stateOpts = {};
+          let hasStateOpts = false;
+          if (msg.sampleRate !== undefined) {
+            stateOpts.sampleRate = msg.sampleRate;
+            hasStateOpts = true;
+          }
+          if (msg.resyncBacklog !== undefined) {
+            stateOpts.resyncBacklog = Boolean(msg.resyncBacklog);
+            hasStateOpts = true;
+          }
           const nextState = this.setOutputState(
             msg.outputState !== undefined
               ? msg.outputState
               : msg.state !== undefined
                 ? msg.state
                 : msg.audioContextState,
-            msg.sampleRate !== undefined ? { sampleRate: msg.sampleRate } : null
+            hasStateOpts ? stateOpts : null
           );
           if (safeId !== undefined) {
             this._safePostMessage({
