@@ -200,6 +200,30 @@ function getResolveStorageCompatibleFormatFn(options) {
   return null;
 }
 const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
+const DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT = 256;
+const DEFAULT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT = 256;
+const DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE = 65536;
+const DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE = 134217728;
+const CORE_READ_WRITE_STORAGE_FORMATS = Object.freeze(new Set(['r32uint', 'r32sint', 'r32float']));
+const TIER2_READ_WRITE_STORAGE_FORMATS = Object.freeze(
+  new Set([
+    'r8unorm',
+    'r8uint',
+    'r8sint',
+    'rgba8unorm',
+    'rgba8uint',
+    'rgba8sint',
+    'r16uint',
+    'r16sint',
+    'r16float',
+    'rgba16uint',
+    'rgba16sint',
+    'rgba16float',
+    'rgba32uint',
+    'rgba32sint',
+    'rgba32float',
+  ])
+);
 const VALID_WGSL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const WGSL_GROUP0_RE = /@group\(\s*0\s*\)/;
 
@@ -590,6 +614,64 @@ function resolveTextureSampleType(format, device) {
     return deviceHasFeature(device, 'float32-filterable') ? 'float' : 'unfilterable-float';
   }
   return 'float';
+}
+
+function getDeviceLimit(device, limitName, fallback) {
+  const limits = device && typeof device === 'object' ? device.limits : null;
+  const raw = limits && typeof limits === 'object' ? limits[limitName] : undefined;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return Math.floor(raw);
+  }
+  return fallback;
+}
+
+function isCombinedDepthStencilFormat(format) {
+  return format === 'depth24plus-stencil8' || format === 'depth32float-stencil8';
+}
+
+function resolveEffectiveViewFormat(format, aspect) {
+  if (typeof format !== 'string' || format.length === 0) return format;
+  if (aspect === 'depth-only') {
+    if (format === 'depth32float-stencil8') return 'depth32float';
+    if (format === 'depth24plus-stencil8') return 'depth24plus';
+  } else if (aspect === 'stencil-only') {
+    if (format === 'depth32float-stencil8' || format === 'depth24plus-stencil8') return 'stencil8';
+  }
+  return format;
+}
+
+function isTextureSampleTypeCompatible(format, expectedSampleType, device) {
+  if (typeof format !== 'string' || format.length === 0 || format === 'undefined') return true;
+  const expected = expectedSampleType || 'float';
+  const actual = resolveTextureSampleType(format, device);
+  if (expected === 'unfilterable-float') {
+    return actual === 'float' || actual === 'unfilterable-float' || actual === 'depth';
+  }
+  return actual === expected;
+}
+
+function isStorageAccessCompatible(format, access, device) {
+  if (access !== 'read-write') return true;
+  if (typeof format !== 'string' || format.length === 0) return false;
+  const normalized = format.trim().toLowerCase();
+  if (CORE_READ_WRITE_STORAGE_FORMATS.has(normalized)) return true;
+  if (
+    deviceHasFeature(device, 'texture-formats-tier2') ||
+    deviceHasFeature(device, 'chromium-experimental-read-write-storage-texture')
+  ) {
+    return TIER2_READ_WRITE_STORAGE_FORMATS.has(normalized);
+  }
+  return false;
+}
+
+function isSamplerFilteringDesc(desc) {
+  if (!desc || typeof desc !== 'object') return false;
+  return (
+    desc.magFilter === 'linear' ||
+    desc.minFilter === 'linear' ||
+    desc.mipmapFilter === 'linear' ||
+    (typeof desc.maxAnisotropy === 'number' && desc.maxAnisotropy > 1)
+  );
 }
 
 function computeMaxMipLevels(width, height, depthOrArrayLayers = 1, dimension = '2d') {
@@ -2985,6 +3067,7 @@ class RenderStatePackets {
     this.computePipelineMeta = new Map(); // id -> { id, csId, layoutId, entryPoint, hasComputeAttr, autoLayoutRemap, wgslBindings }
     this.renderPipelineAutoLayoutMeta = new Map(); // id -> { id, layoutId, autoLayoutRemap, wgslBindings }
     this.bindGroupDescriptors = new Map(); // id -> { id, layoutId, resources }
+    this.samplerMeta = new Map(); // id -> { comparison, filtering }
     // 'c|r:<pipeId>:<bgId>' (+ '@<dynOffsets>' when root-constant dynamic offsets are non-zero)
     // -> GPUBindGroup | null. LRU-bounded by remappedBindGroupCacheLimit.
     this.remappedBindGroups = new Map();
@@ -3139,6 +3222,9 @@ class RenderStatePackets {
       bindingArrayLayouts: 0,
       bindingArrayBindGroups: 0,
       rtArenaGroup3Binds: 0,
+      missingResourceFallbacks: 0,
+      bindGroupValidationFallbacks: 0,
+      skippedUnboundPassOps: 0,
       warnings: [],
     };
     this._seenWarningKeys = new Set();
@@ -3336,6 +3422,9 @@ class RenderStatePackets {
       bindingArrayLayouts: this.telemetry.bindingArrayLayouts,
       bindingArrayBindGroups: this.telemetry.bindingArrayBindGroups,
       rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
+      missingResourceFallbacks: this.telemetry.missingResourceFallbacks,
+      bindGroupValidationFallbacks: this.telemetry.bindGroupValidationFallbacks,
+      skippedUnboundPassOps: this.telemetry.skippedUnboundPassOps,
     };
   }
 
@@ -3378,6 +3467,9 @@ class RenderStatePackets {
       bindingArrayLayouts: this.telemetry.bindingArrayLayouts,
       bindingArrayBindGroups: this.telemetry.bindingArrayBindGroups,
       rtArenaGroup3Binds: this.telemetry.rtArenaGroup3Binds,
+      missingResourceFallbacks: this.telemetry.missingResourceFallbacks,
+      bindGroupValidationFallbacks: this.telemetry.bindGroupValidationFallbacks,
+      skippedUnboundPassOps: this.telemetry.skippedUnboundPassOps,
       warnings: this.telemetry.warnings.slice(),
     };
   }
@@ -4091,6 +4183,7 @@ class RenderStatePackets {
     this.pendingAsyncRenderPipelines.clear();
     this.pendingAsyncComputePipelines.clear();
     this.bindGroupDescriptors.clear();
+    this.samplerMeta.clear();
     this.layoutsByContent.clear();
     this.textureMeta.clear();
     this._textureGenerations.clear();
@@ -4108,6 +4201,7 @@ class RenderStatePackets {
     this.pendingAsyncRenderPipelines.delete(id);
     this.pendingAsyncComputePipelines.delete(id);
     this.bindGroupDescriptors.delete(id);
+    this.samplerMeta.delete(id);
     this._invalidateRemappedBindGroupsForPipeline(id, true);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
     this._invalidateRemappedBindGroupsForBindGroup(id);
@@ -4261,6 +4355,8 @@ class RenderStatePackets {
       group0Entries: null,
       group3HasEntries: false,
       hasRtArenaGroup3: false,
+      requiredGroupsMask: 0,
+      groupBglIds: null,
     };
     if ((flags & MANIFEST_REFERENCE_FLAG) !== 0) {
       layout = this.resolveManifestLayout && this.resolveManifestLayout('pipelineLayout', contentId);
@@ -4271,6 +4367,8 @@ class RenderStatePackets {
     } else {
       if (24 + count * 4 > payloadBytes) return false;
       const bindGroupLayouts = [];
+      const groupBglIds = new Array(count);
+      let requiredGroupsMask = 0;
       let group0Record = null;
       let group3Record = null;
       for (let g = 0; g < count; g++) {
@@ -4279,6 +4377,14 @@ class RenderStatePackets {
         if (bglId !== 0 && !record) {
           this._packetError = `pipeline layout ${id}: unknown bind group layout ${bglId}`;
           return false;
+        }
+        groupBglIds[g] = bglId;
+        if (
+          g < 31 &&
+          record &&
+          (record.entries === null || (Array.isArray(record.entries) && record.entries.length > 0))
+        ) {
+          requiredGroupsMask |= 1 << g;
         }
         if (g === 0) group0Record = record;
         else if (g === RT_ARENA_GROUP_INDEX) group3Record = record;
@@ -4306,6 +4412,8 @@ class RenderStatePackets {
               (Array.isArray(group3Record.entries) && group3Record.entries.length > 0))
         ),
         hasRtArenaGroup3: Boolean(group3Record && group3Record.hasRtArenaBindings),
+        requiredGroupsMask,
+        groupBglIds,
       };
     }
     this.pipelineLayouts.set(id, layout);
@@ -5093,12 +5201,34 @@ class RenderStatePackets {
     // Folds r's dynamic offset into a static { buffer, offset, size } binding, clamped so that
     // offset + size never exceeds the GPUBuffer size; an out-of-bounds offset binds a dummy.
     const bufferResourceWithDynamicOffset = (r, b) => {
+      const base = r.resource;
+      if (!base || !base.buffer || base.buffer.destroyed === true) {
+        return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+      }
       const dIdx = r && r.hasDynamicOffset ? r.dynamicOffsetIndex : -1;
       const dyn =
         Number.isInteger(dIdx) && dIdx >= 0 && dIdx < dynOffsets.length ? dynOffsets[dIdx] : 0;
-      if (dyn <= 0) return r.resource;
-      const base = r.resource;
-      const effectiveOffset = (Number(base.offset) || 0) + dyn;
+      const isUniform = b.kind === 'uniform';
+      const maxBindingSize = isUniform
+        ? getDeviceLimit(this.device, 'maxUniformBufferBindingSize', DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE)
+        : getDeviceLimit(this.device, 'maxStorageBufferBindingSize', DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE);
+      const effectiveOffset = (Number(base.offset) || 0) + (dyn > 0 ? dyn : 0);
+      const explicitAlignKey = isUniform ? 'minUniformBufferOffsetAlignment' : 'minStorageBufferOffsetAlignment';
+      const explicitAlign =
+        this.device &&
+        this.device.limits &&
+        typeof this.device.limits[explicitAlignKey] === 'number' &&
+        this.device.limits[explicitAlignKey] > 1
+          ? Math.floor(this.device.limits[explicitAlignKey])
+          : 0;
+      if (effectiveOffset > 0 && explicitAlign > 1 && effectiveOffset % explicitAlign !== 0) {
+        this.telemetry.dynamicOffsetClamps += 1;
+        this._recordTelemetryWarningOnce(
+          `remap-dyn-offset-unaligned:${effectiveBgId}:${r.binding}:${explicitAlign}`,
+          `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} offset ${effectiveOffset} not aligned to ${explicitAlign}B; using dummy buffer`
+        );
+        return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+      }
       const bufferSize =
         typeof r.bufferSize === 'number' && Number.isFinite(r.bufferSize) && r.bufferSize > 0
           ? r.bufferSize
@@ -5106,6 +5236,12 @@ class RenderStatePackets {
             ? base.buffer.size
             : null;
       let size = typeof base.size === 'number' && base.size > 0 ? base.size : null;
+      if (dyn <= 0) {
+        const boundSize = size !== null ? size : bufferSize !== null ? bufferSize - effectiveOffset : null;
+        const needsClamp = boundSize !== null && boundSize > maxBindingSize;
+        const needsStorageAlign = !isUniform && boundSize !== null && (boundSize < 4 || boundSize % 4 !== 0);
+        if (!needsClamp && !needsStorageAlign) return base;
+      }
       if (bufferSize !== null) {
         if (effectiveOffset >= bufferSize) {
           this.telemetry.dynamicOffsetClamps += 1;
@@ -5124,8 +5260,23 @@ class RenderStatePackets {
             `auto-layout remap: bind group ${effectiveBgId} binding ${r.binding} size clamped to ${remaining} at dynamic offset ${dyn}`
           );
         }
+        const effBound = size !== null ? size : remaining;
+        if (effBound > maxBindingSize) {
+          size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
+        }
+        if (!isUniform) {
+          const storageBound = size !== null ? size : remaining;
+          if (storageBound < 4) {
+            return this._dummyResource(synthLayoutEntryForWgslBinding(b));
+          }
+          if (storageBound % 4 !== 0) {
+            size = Math.floor(storageBound / 4) * 4;
+          }
+        }
+      } else if (size !== null && size > maxBindingSize) {
+        size = isUniform ? maxBindingSize : Math.floor(maxBindingSize / 4) * 4;
       }
-      this.telemetry.dynamicOffsetRemaps += 1;
+      if (dyn > 0) this.telemetry.dynamicOffsetRemaps += 1;
       const folded = { buffer: base.buffer, offset: effectiveOffset };
       if (size !== null) folded.size = size;
       return folded;
@@ -5136,9 +5287,9 @@ class RenderStatePackets {
         for (let i = 0; i < available.length; i += 1) {
           if (usedIndices.has(i)) continue;
           const r = available[i];
-          if (!r || !r.resource || r.isDummy) continue;
+          if (!r || !r.resource || r.isDummy || r.resource.destroyed === true) continue;
           if (b.kind === 'uniform') {
-            if (!isBufferBindingResource(r.resource)) continue;
+            if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
             const isBuf =
               r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
             if (!isBuf) continue;
@@ -5152,7 +5303,7 @@ class RenderStatePackets {
             return bufferResourceWithDynamicOffset(r, b);
           }
           if (b.kind === 'read-only-storage' || b.kind === 'storage') {
-            if (!isBufferBindingResource(r.resource)) continue;
+            if (!isBufferBindingResource(r.resource) || r.resource.buffer.destroyed === true) continue;
             const isBuf =
               r.kind === 'uniform' || r.kind === 'storage' || r.kind === 'read-only-storage';
             if (!isBuf) continue;
@@ -5194,12 +5345,7 @@ class RenderStatePackets {
             }
             if (r.textureFormat) {
               const expectedSampleType = b.sampleType || 'float';
-              const actualSampleType = resolveTextureSampleType(r.textureFormat, this.device);
-              if (expectedSampleType === 'unfilterable-float') {
-                if (actualSampleType !== 'float' && actualSampleType !== 'unfilterable-float') {
-                  continue;
-                }
-              } else if (actualSampleType !== expectedSampleType) {
+              if (!isTextureSampleTypeCompatible(r.textureFormat, expectedSampleType, this.device)) {
                 continue;
               }
             }
@@ -5209,6 +5355,7 @@ class RenderStatePackets {
           if (b.kind === 'storage-texture') {
             if (r.kind !== 'storage-texture') continue;
             if (!isNonBufferBindingResource(r.resource) || isSamplerResource(r.resource)) continue;
+            if (r.multisampled === true) continue;
             if (
               r.textureUsage !== null &&
               r.textureUsage !== undefined &&
@@ -5307,6 +5454,10 @@ class RenderStatePackets {
     let activeComputePipelineId = null;
     let activeComputePipelineValid = false;
     let activeComputeAutoLayout = null;
+    let activeComputeHasKnownLayout = false;
+    let activeComputeRequiredGroupsMask = 0;
+    let boundComputeGroupsMask = 0;
+    let invalidComputeGroupsMask = 0;
     let hadExplicitSetComputePipeline = false;
     let group0BoundForCompute = false;
     let hasLastComputeGroup0 = false;
@@ -5314,6 +5465,10 @@ class RenderStatePackets {
 
     let activeRenderPipelineId = null;
     let activeRenderAutoLayout = null;
+    let activeRenderHasKnownLayout = false;
+    let activeRenderRequiredGroupsMask = 0;
+    let boundRenderGroupsMask = 0;
+    let invalidRenderGroupsMask = 0;
     let group0BoundForRender = false;
     let hasLastRenderGroup0 = false;
     const lastRenderGroup0 = this._scratchLastRenderGroup0;
@@ -5341,6 +5496,41 @@ class RenderStatePackets {
         continue;
       }
 
+      if (cmd._rsInvalidBindGroup) {
+        const gIdx = cmd._rsInvalidBindGroup.groupIndex;
+        const bit = gIdx >= 0 && gIdx < 31 ? 1 << gIdx : 0;
+        if (bit !== 0) {
+          if (activePassMode === 'compute') {
+            boundComputeGroupsMask &= ~bit;
+            invalidComputeGroupsMask |= bit;
+            if (gIdx === 0) {
+              group0BoundForCompute = false;
+              hasLastComputeGroup0 = false;
+            }
+          } else if (activePassMode === 'render') {
+            boundRenderGroupsMask &= ~bit;
+            invalidRenderGroupsMask |= bit;
+            if (gIdx === 0) {
+              group0BoundForRender = false;
+              hasLastRenderGroup0 = false;
+            }
+          } else {
+            boundComputeGroupsMask &= ~bit;
+            invalidComputeGroupsMask |= bit;
+            boundRenderGroupsMask &= ~bit;
+            invalidRenderGroupsMask |= bit;
+            if (gIdx === 0) {
+              group0BoundForCompute = false;
+              hasLastComputeGroup0 = false;
+              group0BoundForRender = false;
+              hasLastRenderGroup0 = false;
+            }
+          }
+        }
+        ensureFiltered(i);
+        continue;
+      }
+
       const passOpKind =
         (cmd._wgpuMeta && cmd._wgpuMeta.kind) || cmd._rsPassOp || null;
       if (passOpKind === 'beginRenderPass' || passOpKind === 'endRenderPass') {
@@ -5348,11 +5538,19 @@ class RenderStatePackets {
         activeComputePipelineId = null;
         activeComputePipelineValid = false;
         activeComputeAutoLayout = null;
+        activeComputeHasKnownLayout = false;
+        activeComputeRequiredGroupsMask = 0;
+        boundComputeGroupsMask = 0;
+        invalidComputeGroupsMask = 0;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
         hasLastComputeGroup0 = false;
         activeRenderPipelineId = null;
         activeRenderAutoLayout = null;
+        activeRenderHasKnownLayout = false;
+        activeRenderRequiredGroupsMask = 0;
+        boundRenderGroupsMask = 0;
+        invalidRenderGroupsMask = 0;
         group0BoundForRender = false;
         hasLastRenderGroup0 = false;
         activeRenderPending = false;
@@ -5362,10 +5560,16 @@ class RenderStatePackets {
       }
 
       if (cmd.type === 'setPipeline') {
+        if (activePassMode === 'compute') {
+          boundComputeGroupsMask = 0;
+          invalidComputeGroupsMask = 0;
+        }
         activePassMode = 'render';
         activeComputePipelineId = null;
         activeComputePipelineValid = false;
         activeComputeAutoLayout = null;
+        activeComputeHasKnownLayout = false;
+        activeComputeRequiredGroupsMask = 0;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
         hasLastComputeGroup0 = false;
@@ -5375,21 +5579,42 @@ class RenderStatePackets {
         if (activeRenderPending) {
           // Never bind an undefined pipeline; its draws are dropped until the compile resolves.
           activeRenderAutoLayout = null;
+          activeRenderHasKnownLayout = false;
+          activeRenderRequiredGroupsMask = 0;
           group0BoundForRender = false;
           ensureFiltered(i);
           continue;
         }
         const rMeta = this.renderPipelineAutoLayoutMeta.get(cmd.pipelineId) || null;
         activeRenderAutoLayout = rMeta && rMeta.autoLayoutRemap ? rMeta : null;
+        if (activeRenderAutoLayout) {
+          activeRenderHasKnownLayout = true;
+          activeRenderRequiredGroupsMask = 0;
+        } else {
+          const rPipeMeta =
+            this.processor && this.processor._pipelineMeta
+              ? this.processor._pipelineMeta.get(cmd.pipelineId) || null
+              : null;
+          const rLayoutMeta =
+            rPipeMeta && rPipeMeta.layoutId ? this.pipelineLayoutMeta.get(rPipeMeta.layoutId) || null : null;
+          activeRenderHasKnownLayout = Boolean(rLayoutMeta);
+          activeRenderRequiredGroupsMask = rLayoutMeta ? rLayoutMeta.requiredGroupsMask || 0 : 0;
+        }
         group0BoundForRender = false;
         if (filtered !== null) filtered.push(cmd);
         continue;
       }
 
       if (cmd.type === 'setComputePipeline') {
+        if (activePassMode === 'render') {
+          boundRenderGroupsMask = 0;
+          invalidRenderGroupsMask = 0;
+        }
         activePassMode = 'compute';
         activeRenderPipelineId = null;
         activeRenderAutoLayout = null;
+        activeRenderHasKnownLayout = false;
+        activeRenderRequiredGroupsMask = 0;
         group0BoundForRender = false;
         hasLastRenderGroup0 = false;
         activeRenderPending = false;
@@ -5399,6 +5624,8 @@ class RenderStatePackets {
         if (activeComputePending) {
           activeComputePipelineValid = false;
           activeComputeAutoLayout = null;
+          activeComputeHasKnownLayout = false;
+          activeComputeRequiredGroupsMask = 0;
           group0BoundForCompute = false;
           ensureFiltered(i);
           continue;
@@ -5408,6 +5635,8 @@ class RenderStatePackets {
         );
         if (!activeComputePipelineValid) {
           activeComputeAutoLayout = null;
+          activeComputeHasKnownLayout = false;
+          activeComputeRequiredGroupsMask = 0;
           group0BoundForCompute = false;
           this._recordTelemetryWarningOnce(
             `missing-compute-pipeline:${cmd.pipelineId}`,
@@ -5418,6 +5647,15 @@ class RenderStatePackets {
         }
         const cMeta = this.computePipelineMeta.get(cmd.pipelineId) || null;
         activeComputeAutoLayout = cMeta && cMeta.autoLayoutRemap ? cMeta : null;
+        if (activeComputeAutoLayout) {
+          activeComputeHasKnownLayout = true;
+          activeComputeRequiredGroupsMask = 0;
+        } else {
+          const cLayoutMeta =
+            cMeta && cMeta.layoutId ? this.pipelineLayoutMeta.get(cMeta.layoutId) || null : null;
+          activeComputeHasKnownLayout = Boolean(cLayoutMeta);
+          activeComputeRequiredGroupsMask = cLayoutMeta ? cLayoutMeta.requiredGroupsMask || 0 : 0;
+        }
         group0BoundForCompute = false;
         if (filtered !== null) filtered.push(cmd);
         continue;
@@ -5458,6 +5696,22 @@ class RenderStatePackets {
           dynamicOffsets = normalizeDynamicOffsets(
             cmd._wgpuMeta.dynamicOffsets || cmd._wgpuMeta.offsets
           );
+        }
+
+        const bgBit = groupIndex >= 0 && groupIndex < 31 ? 1 << groupIndex : 0;
+        if (bgBit !== 0) {
+          if (activePassMode === 'compute') {
+            boundComputeGroupsMask |= bgBit;
+            invalidComputeGroupsMask &= ~bgBit;
+          } else if (activePassMode === 'render') {
+            boundRenderGroupsMask |= bgBit;
+            invalidRenderGroupsMask &= ~bgBit;
+          } else {
+            boundComputeGroupsMask |= bgBit;
+            invalidComputeGroupsMask &= ~bgBit;
+            boundRenderGroupsMask |= bgBit;
+            invalidRenderGroupsMask &= ~bgBit;
+          }
         }
 
         if (groupIndex === 0) {
@@ -5536,10 +5790,15 @@ class RenderStatePackets {
         cmd.type === 'drawIndirect' ||
         cmd.type === 'drawIndexedIndirect'
       ) {
+        if (activePassMode === 'compute') {
+          boundComputeGroupsMask = 0;
+          invalidComputeGroupsMask = 0;
+        }
         activePassMode = 'render';
         activeComputePipelineId = null;
         activeComputePipelineValid = false;
         activeComputeAutoLayout = null;
+        activeComputeRequiredGroupsMask = 0;
         hadExplicitSetComputePipeline = false;
         group0BoundForCompute = false;
         hasLastComputeGroup0 = false;
@@ -5570,6 +5829,22 @@ class RenderStatePackets {
           } else if (res.status === 'empty') {
             ensureFiltered(i).push(this._acquireNoopRenderGroup0Command(srcBgId));
           }
+        } else if (
+          !activeRenderAutoLayout &&
+          (activeRenderHasKnownLayout
+            ? (activeRenderRequiredGroupsMask & invalidRenderGroupsMask) !== 0
+            : invalidRenderGroupsMask !== 0)
+        ) {
+          const badMask = activeRenderHasKnownLayout
+            ? activeRenderRequiredGroupsMask & invalidRenderGroupsMask
+            : invalidRenderGroupsMask;
+          this.telemetry.skippedUnboundPassOps += 1;
+          this._recordTelemetryWarningOnce(
+            `skip-draw-unbound:${activeRenderPipelineId || 0}:${badMask}`,
+            `skipped render draw on pipeline ${activeRenderPipelineId || 0}: required bind group failed to create or is unbound`
+          );
+          ensureFiltered(i);
+          continue;
         }
         if (filtered !== null) filtered.push(cmd);
         continue;
@@ -5634,6 +5909,23 @@ class RenderStatePackets {
           if (res.status === 'ok') {
             ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId));
           }
+        } else if (
+          !activeComputeAutoLayout &&
+          (activeComputeHasKnownLayout
+            ? (activeComputeRequiredGroupsMask & ~boundComputeGroupsMask) !== 0
+            : invalidComputeGroupsMask !== 0)
+        ) {
+          const missingMask = activeComputeHasKnownLayout
+            ? activeComputeRequiredGroupsMask & ~boundComputeGroupsMask
+            : invalidComputeGroupsMask;
+          this.telemetry.skippedUnboundPassOps += 1;
+          this.telemetry.skippedComputeDispatchCount += 1;
+          this._recordTelemetryWarningOnce(
+            `skip-dispatch-unbound:${activeComputePipelineId || 0}:${missingMask}`,
+            `skipped compute dispatch on pipeline ${activeComputePipelineId || 0}: required bind group mask 0x${missingMask.toString(16)} is unbound`
+          );
+          ensureFiltered(i);
+          continue;
         }
         this.telemetry.computeDispatchCount += 1;
         if (filtered !== null) filtered.push(cmd);
@@ -6270,7 +6562,17 @@ class RenderStatePackets {
 
   _dummyResource(layoutEntry) {
     if (layoutEntry.buffer) {
-      const size = Math.max(256, Math.ceil(layoutEntry.buffer.minBindingSize / 4) * 4);
+      const rawMin =
+        typeof layoutEntry.buffer.minBindingSize === 'number' &&
+        Number.isFinite(layoutEntry.buffer.minBindingSize) &&
+        layoutEntry.buffer.minBindingSize > 0
+          ? layoutEntry.buffer.minBindingSize
+          : 0;
+      const isUniform = (layoutEntry.buffer.type || 'uniform') === 'uniform';
+      const maxBindingSize = isUniform
+        ? getDeviceLimit(this.device, 'maxUniformBufferBindingSize', DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE)
+        : getDeviceLimit(this.device, 'maxStorageBufferBindingSize', DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE);
+      const size = Math.min(maxBindingSize, Math.max(256, Math.ceil(rawMin / 4) * 4));
       const key = `buffer:${size}`;
       if (!this.dummies.has(key)) {
         this.dummies.set(key, this.device.createBuffer({ size, usage: GPU_BUFFER_USAGE_UNIFORM_STORAGE_COPY_DST }));
@@ -6278,20 +6580,21 @@ class RenderStatePackets {
       return { buffer: this.dummies.get(key) };
     }
     if (layoutEntry.sampler) {
-      const key = `sampler:${layoutEntry.sampler.type}`;
+      const samplerType = layoutEntry.sampler.type || 'filtering';
+      const key = `sampler:${samplerType}`;
       if (!this.dummies.has(key)) {
-        const desc = layoutEntry.sampler.type === 'comparison' ? { compare: 'always' } : {};
+        const desc = samplerType === 'comparison' ? { compare: 'always' } : {};
         this.dummies.set(key, this.device.createSampler(desc));
       }
       return this.dummies.get(key);
     }
     const tex = layoutEntry.texture || layoutEntry.storageTexture;
-    const viewDimension = tex.viewDimension || '2d';
-    let format = tex.format;
+    let viewDimension = (tex && tex.viewDimension) || '2d';
+    let format = tex && tex.format;
     if (!format) {
       format =
         { float: 'rgba8unorm', 'unfilterable-float': 'r32float', depth: 'depth32float', sint: 'rgba8sint', uint: 'rgba8uint' }[
-          tex.sampleType
+          tex && tex.sampleType
         ] || 'rgba8unorm';
     }
     if (layoutEntry.storageTexture) {
@@ -6300,10 +6603,16 @@ class RenderStatePackets {
         resolvedStorage.supportsStorageBinding && resolvedStorage.storageFormat
           ? resolvedStorage.storageFormat
           : 'rgba8unorm';
+      if (viewDimension === 'cube' || viewDimension === 'cube-array') {
+        viewDimension = '2d-array';
+      }
     }
     const multisampled = Boolean(layoutEntry.texture && layoutEntry.texture.multisampled);
-    if (multisampled && !isMultisampleSupported(format, this.device)) {
-      format = 'rgba8unorm';
+    if (multisampled) {
+      viewDimension = '2d';
+      if (!isMultisampleSupported(format, this.device)) {
+        format = 'rgba8unorm';
+      }
     }
     const key = `texture:${format}:${viewDimension}:${multisampled}:${Boolean(layoutEntry.storageTexture)}`;
     if (!this.dummies.has(key)) {
@@ -6328,6 +6637,41 @@ class RenderStatePackets {
     return this.dummies.get(key);
   }
 
+  _fallbackResourceForLayoutEntry(layoutEntry, countSamplerFallback = true) {
+    if (!layoutEntry) return null;
+    if (layoutEntry.sampler) {
+      const samplerKind = layoutEntry.sampler.type || 'filtering';
+      const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+      if (fallbackSampler) {
+        if (countSamplerFallback) this.telemetry.fallbackSamplersBound += 1;
+        return fallbackSampler;
+      }
+    }
+    return this._dummyResource(layoutEntry);
+  }
+
+  _buildAllDummyEntriesForLayout(layoutEntries) {
+    const fallbackEntries = [];
+    for (let i = 0; i < layoutEntries.length; i += 1) {
+      const le = layoutEntries[i];
+      if (!le) continue;
+      if (le.bindingArraySize >= 1) {
+        for (let ai = 0; ai < le.bindingArraySize; ai += 1) {
+          fallbackEntries.push({
+            binding: le.binding + ai,
+            resource: this._fallbackResourceForLayoutEntry(le, false),
+          });
+        }
+      } else {
+        fallbackEntries.push({
+          binding: le.binding,
+          resource: this._fallbackResourceForLayoutEntry(le, false),
+        });
+      }
+    }
+    return fallbackEntries;
+  }
+
   _createBindGroup(view, offset, payloadBytes) {
     if (payloadBytes < 16) return false;
     const id = view.getUint32(offset, true);
@@ -6350,11 +6694,6 @@ class RenderStatePackets {
       const binding = view.getUint32(o, true);
       const arrayIndex = isBindingArrayBg ? view.getUint16(o + 12, true) : 0;
       const effectiveBinding = isBindingArrayBg ? binding + arrayIndex : binding;
-      if (seenBindings.has(effectiveBinding)) {
-        this._packetError = `bind group ${id}: duplicate binding ${effectiveBinding}`;
-        return false;
-      }
-      seenBindings.add(effectiveBinding);
       const type = view.getUint32(o + 4, true);
       const resourceId = view.getUint32(o + 8, true);
       const layoutEntry = entryByBinding
@@ -6362,6 +6701,30 @@ class RenderStatePackets {
         : record.entries
           ? record.entries.find((e) => e.binding === binding) || null
           : null;
+      if (!layoutEntry && Array.isArray(record.entries)) {
+        this.telemetry.bindGroupValidationFallbacks += 1;
+        this._recordTelemetryWarningOnce(
+          `bg-extra-binding:${layoutId}:${effectiveBinding}`,
+          `bind group ${id}: skipping binding ${effectiveBinding} not declared in layout ${layoutId}`
+        );
+        continue;
+      }
+      if (isBindingArrayBg && layoutEntry) {
+        const maxArraySize = layoutEntry.bindingArraySize >= 1 ? layoutEntry.bindingArraySize : 1;
+        if (arrayIndex >= maxArraySize) {
+          this.telemetry.bindGroupValidationFallbacks += 1;
+          this._recordTelemetryWarningOnce(
+            `bg-array-oob:${layoutId}:${binding}:${arrayIndex}`,
+            `bind group ${id}: skipping binding ${binding} arrayIndex ${arrayIndex} >= bindingArraySize ${maxArraySize}`
+          );
+          continue;
+        }
+      }
+      if (seenBindings.has(effectiveBinding)) {
+        this._packetError = `bind group ${id}: duplicate binding ${effectiveBinding}`;
+        return false;
+      }
+      seenBindings.add(effectiveBinding);
       const layoutExpectsBuffer = Boolean(layoutEntry && layoutEntry.buffer);
       const layoutExpectsTexture = Boolean(
         layoutEntry && (layoutEntry.texture || layoutEntry.storageTexture)
@@ -6405,7 +6768,8 @@ class RenderStatePackets {
         }
       } else if (type === BIND_RESOURCE_TYPE.BUFFER) {
         const buffer = this.processor.buffers.get(resourceId);
-        if (buffer) {
+        const bufferLive = Boolean(buffer && buffer.destroyed !== true);
+        if (bufferLive) {
           const bufMeta =
             this.processor &&
             this.processor._bufferMeta &&
@@ -6424,9 +6788,15 @@ class RenderStatePackets {
           const bufferSize =
             typeof buffer.size === 'number' && Number.isFinite(buffer.size) && buffer.size > 0
               ? buffer.size
-              : null;
+              : bufMeta && typeof bufMeta.byteSize === 'number' && Number.isFinite(bufMeta.byteSize) && bufMeta.byteSize > 0
+                ? bufMeta.byteSize
+                : buffer.desc && typeof buffer.desc.size === 'number' && Number.isFinite(buffer.desc.size) && buffer.desc.size > 0
+                  ? buffer.desc.size
+                  : null;
           bufferSizeKnown = bufferSize;
           const bufLayoutType = layoutExpectsBuffer ? layoutEntry.buffer.type || 'uniform' : null;
+          const isStorageBufLayout =
+            bufLayoutType === 'storage' || bufLayoutType === 'read-only-storage';
           const requiredBufferUsage =
             bufLayoutType === 'uniform'
               ? GPU_BUFFER_USAGE_UNIFORM
@@ -6445,9 +6815,53 @@ class RenderStatePackets {
             layoutEntry.buffer.minBindingSize > 0
               ? layoutEntry.buffer.minBindingSize
               : 0;
+          const offsetAlignment =
+            bufLayoutType === 'uniform'
+              ? getDeviceLimit(
+                  this.device,
+                  'minUniformBufferOffsetAlignment',
+                  DEFAULT_MIN_UNIFORM_BUFFER_OFFSET_ALIGNMENT
+                )
+              : isStorageBufLayout
+                ? getDeviceLimit(
+                    this.device,
+                    'minStorageBufferOffsetAlignment',
+                    DEFAULT_MIN_STORAGE_BUFFER_OFFSET_ALIGNMENT
+                  )
+                : 1;
+          const maxBindingSize =
+            bufLayoutType === 'uniform'
+              ? getDeviceLimit(
+                  this.device,
+                  'maxUniformBufferBindingSize',
+                  DEFAULT_MAX_UNIFORM_BUFFER_BINDING_SIZE
+                )
+              : isStorageBufLayout
+                ? getDeviceLimit(
+                    this.device,
+                    'maxStorageBufferBindingSize',
+                    DEFAULT_MAX_STORAGE_BUFFER_BINDING_SIZE
+                  )
+                : Infinity;
 
-          if (bufferSize !== null && bufOffset >= bufferSize) {
+          if (
+            !kindMismatch &&
+            !bufferUsageMismatch &&
+            layoutExpectsBuffer &&
+            bufOffset > 0 &&
+            offsetAlignment > 1 &&
+            bufOffset % offsetAlignment !== 0
+          ) {
+            this.telemetry.bindGroupValidationFallbacks += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-buffer-unaligned-offset:${layoutId}:${effectiveBinding}:${offsetAlignment}`,
+              `bind group ${id}: binding ${effectiveBinding} offset ${bufOffset} not aligned to ${offsetAlignment}B; using dummy buffer`
+            );
+            entryResource = this._dummyResource(layoutEntry);
+            entryUsedDummy = true;
+          } else if (bufferSize !== null && bufOffset >= bufferSize) {
             if (layoutEntry) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
               this._recordTelemetryWarningOnce(
                 `bg-buffer-oob:${layoutId}:${binding}`,
                 `bind group ${id}: binding ${binding} offset ${bufOffset} exceeds buffer size ${bufferSize}; using dummy buffer`
@@ -6462,25 +6876,67 @@ class RenderStatePackets {
             }
             const remaining = bufferSize !== null ? bufferSize - bufOffset : null;
             let undersizedForLayout = false;
-            if (minBindingSize > 0) {
-              const boundSize = effectiveSize > 0 ? effectiveSize : remaining;
-              if (boundSize !== null && boundSize < minBindingSize) {
-                if (remaining !== null && remaining >= minBindingSize) {
-                  effectiveSize = minBindingSize;
+            if (!kindMismatch && !bufferUsageMismatch && layoutExpectsBuffer) {
+              const rawBoundSize = effectiveSize > 0 ? effectiveSize : remaining;
+              if (rawBoundSize !== null && rawBoundSize > maxBindingSize) {
+                effectiveSize = isStorageBufLayout
+                  ? Math.floor(maxBindingSize / 4) * 4
+                  : maxBindingSize;
+                this._recordTelemetryWarningOnce(
+                  `bg-buffer-max-size:${layoutId}:${effectiveBinding}:${maxBindingSize}`,
+                  `bind group ${id}: binding ${effectiveBinding} size ${rawBoundSize} clamped to maxBindingSize ${effectiveSize}`
+                );
+              }
+              if (isStorageBufLayout) {
+                const curStorageSize = effectiveSize > 0 ? effectiveSize : remaining;
+                if (curStorageSize !== null && curStorageSize < 4) {
+                  undersizedForLayout = true;
                   this._recordTelemetryWarningOnce(
-                    `bg-buffer-widen:${layoutId}:${binding}:${minBindingSize}`,
-                    `bind group ${id}: binding ${binding} size widened to layout minBindingSize ${minBindingSize}`
+                    `bg-storage-size-too-small:${layoutId}:${effectiveBinding}`,
+                    `bind group ${id}: binding ${effectiveBinding} storage buffer size ${curStorageSize} < 4B; using dummy buffer`
+                  );
+                } else if (effectiveSize > 0 && effectiveSize % 4 !== 0) {
+                  const alignedUp = Math.ceil(effectiveSize / 4) * 4;
+                  if (
+                    (remaining === null || alignedUp <= remaining) &&
+                    alignedUp <= maxBindingSize
+                  ) {
+                    effectiveSize = alignedUp;
+                  } else {
+                    effectiveSize = Math.floor(effectiveSize / 4) * 4;
+                  }
+                } else if (effectiveSize === 0 && remaining !== null && remaining % 4 !== 0) {
+                  effectiveSize = Math.floor(remaining / 4) * 4;
+                }
+              }
+            }
+            if (!undersizedForLayout && minBindingSize > 0) {
+              const neededMin = isStorageBufLayout
+                ? Math.ceil(minBindingSize / 4) * 4
+                : minBindingSize;
+              const boundSize = effectiveSize > 0 ? effectiveSize : remaining;
+              if (boundSize !== null && boundSize < neededMin) {
+                if (
+                  remaining !== null &&
+                  remaining >= neededMin &&
+                  neededMin <= maxBindingSize
+                ) {
+                  effectiveSize = neededMin;
+                  this._recordTelemetryWarningOnce(
+                    `bg-buffer-widen:${layoutId}:${binding}:${neededMin}`,
+                    `bind group ${id}: binding ${binding} size widened to layout minBindingSize ${neededMin}`
                   );
                 } else if (layoutEntry) {
                   this._recordTelemetryWarningOnce(
-                    `bg-buffer-undersized:${layoutId}:${binding}:${minBindingSize}`,
-                    `bind group ${id}: binding ${binding} buffer smaller than minBindingSize ${minBindingSize}; using dummy buffer`
+                    `bg-buffer-undersized:${layoutId}:${binding}:${neededMin}`,
+                    `bind group ${id}: binding ${binding} buffer smaller than minBindingSize ${neededMin}; using dummy buffer`
                   );
                   undersizedForLayout = true;
                 }
               }
             }
             if (undersizedForLayout) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
               entryResource = this._dummyResource(layoutEntry);
               entryUsedDummy = true;
             } else {
@@ -6492,9 +6948,10 @@ class RenderStatePackets {
                   `bg-kind-mismatch:${layoutId}:${binding}:buffer`,
                   `bind group ${id}: binding ${binding} buffer resource mismatches layout entry; substituting dummy resource`
                 );
-                entryResource = this._dummyResource(layoutEntry);
+                entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, false);
                 entryUsedDummy = true;
               } else if (bufferUsageMismatch) {
+                this.telemetry.bindGroupValidationFallbacks += 1;
                 this._recordTelemetryWarningOnce(
                   `bg-buffer-usage-mismatch:${layoutId}:${binding}:${bufLayoutType}`,
                   `bind group ${id}: binding ${binding} buffer usage 0x${bufferUsage.toString(16)} lacks required ${bufLayoutType} usage; using dummy buffer`
@@ -6506,137 +6963,385 @@ class RenderStatePackets {
               }
             }
           }
+        } else if (layoutEntry) {
+          this.telemetry.missingResourceFallbacks += 1;
+          this._recordTelemetryWarningOnce(
+            `bg-missing-buffer:${layoutId}:${effectiveBinding}:${resourceId}`,
+            `bind group ${id}: binding ${effectiveBinding} buffer ${resourceId} unavailable; substituting dummy resource`
+          );
+          entryResource = this._fallbackResourceForLayoutEntry(layoutEntry);
+          entryUsedDummy = true;
         }
       } else if (type === BIND_RESOURCE_TYPE.TEXTURE_VIEW) {
         const viewDesc = decodeTextureViewDesc(view, o + 32);
         const texFormat = this._resolveTextureFormat(resourceId, viewDesc);
         const texMeta = this.textureMeta.get(resourceId) || null;
         const texObj = this.processor.textures.get(resourceId) || null;
-        if (texMeta && typeof texMeta.usage === 'number') {
-          textureUsage = texMeta.usage;
-        } else if (texObj && typeof texObj.usage === 'number') {
-          textureUsage = texObj.usage;
-        } else if (texObj && texObj.desc && typeof texObj.desc.usage === 'number') {
-          textureUsage = texObj.desc.usage;
-        }
-        textureFormat = texFormat || null;
-        const actualTexDim = this._resolveActualTextureDimension(texObj, texMeta);
-        const isPromoted1DTo2D = Boolean(texMeta && texMeta.promoted1DTo2D === true);
-        if (viewDesc && typeof viewDesc.dimension === 'string' && viewDesc.dimension !== 'undefined') {
-          if (viewDesc.dimension === '1d' && (actualTexDim === '2d' || isPromoted1DTo2D)) {
-            textureViewDimension = '2d';
-          } else if (actualTexDim === '1d' && viewDesc.dimension !== '1d') {
-            textureViewDimension = '1d';
-          } else {
-            textureViewDimension = viewDesc.dimension;
+        const texLive = Boolean(
+          texObj && texObj.destroyed !== true && typeof texObj.createView === 'function'
+        );
+        if (!texLive) {
+          if (layoutEntry) {
+            this.telemetry.missingResourceFallbacks += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-missing-texture:${layoutId}:${effectiveBinding}:${resourceId}`,
+              `bind group ${id}: binding ${effectiveBinding} texture ${resourceId} unavailable; substituting dummy resource`
+            );
+            entryResource = this._fallbackResourceForLayoutEntry(layoutEntry);
+            entryUsedDummy = true;
           }
         } else {
-          const baseDim = actualTexDim || '2d';
+          if (texMeta && typeof texMeta.usage === 'number') {
+            textureUsage = texMeta.usage;
+          } else if (texObj && typeof texObj.usage === 'number') {
+            textureUsage = texObj.usage;
+          } else if (texObj && texObj.desc && typeof texObj.desc.usage === 'number') {
+            textureUsage = texObj.desc.usage;
+          }
+          textureFormat = texFormat || null;
+          const actualTexDim = this._resolveActualTextureDimension(texObj, texMeta);
+          const isPromoted1DTo2D = Boolean(texMeta && texMeta.promoted1DTo2D === true);
           const baseLayers =
             (texMeta && typeof texMeta.depthOrArrayLayers === 'number' ? texMeta.depthOrArrayLayers : null) ||
             (texObj && typeof texObj.depthOrArrayLayers === 'number' ? texObj.depthOrArrayLayers : null) ||
             (texObj && texObj.desc && texObj.desc.size && typeof texObj.desc.size.depthOrArrayLayers === 'number'
               ? texObj.desc.size.depthOrArrayLayers
               : 1);
-          textureViewDimension = baseDim === '2d' && baseLayers > 1 ? '2d-array' : baseDim;
-        }
-        const sampleCount =
-          (texMeta && typeof texMeta.sampleCount === 'number' ? texMeta.sampleCount : null) ||
-          (texObj && typeof texObj.sampleCount === 'number' ? texObj.sampleCount : null) ||
-          (texObj && texObj.desc && typeof texObj.desc.sampleCount === 'number' ? texObj.desc.sampleCount : null);
-        if (sampleCount !== null) {
-          textureMultisampled = sampleCount > 1;
-        }
-        textureViewDescUsed = viewDesc;
-        if (
-          !kindMismatch &&
-          layoutEntry &&
-          layoutEntry.storageTexture &&
-          texFormat
-        ) {
-          const resolvedStorage = this._resolveStorageFormat(texFormat);
-          if (!resolvedStorage.supportsStorageBinding || !resolvedStorage.storageFormat) {
-            this._recordTelemetryWarningOnce(
-              `bg-storage-format-unsupported:${texFormat}:${binding}`,
-              `bind group ${id}: binding ${binding} storageTexture format ${texFormat} unsupported${
-                resolvedStorage.reason ? ` (${resolvedStorage.reason})` : ''
-              }; substituting dummy storage texture`
-            );
-            entryResource = this._dummyResource(layoutEntry);
-            entryUsedDummy = true;
-          } else if (resolvedStorage.needsLinearSiblingView) {
-            const linearViewDesc = { ...viewDesc, format: resolvedStorage.storageFormat };
-            if (linearViewDesc.mipLevelCount !== 1) {
-              linearViewDesc.mipLevelCount = 1;
-            }
-            const linearView = this._textureView(resourceId, linearViewDesc);
-            if (linearView) {
-              realResource = linearView;
-              entryResource = linearView;
-              textureFormat = resolvedStorage.storageFormat;
-              textureViewDescUsed = linearViewDesc;
+          if (viewDesc && typeof viewDesc.dimension === 'string' && viewDesc.dimension !== 'undefined') {
+            if (viewDesc.dimension === '1d' && (actualTexDim === '2d' || isPromoted1DTo2D)) {
+              textureViewDimension = '2d';
+            } else if (actualTexDim === '1d' && viewDesc.dimension !== '1d') {
+              textureViewDimension = '1d';
             } else {
-              this._packetError = null;
-              this._recordTelemetryWarningOnce(
-                `bg-storage-linear-view-fallback:${texFormat}:${binding}`,
-                `bind group ${id}: binding ${binding} linear sibling view ${resolvedStorage.storageFormat} unavailable for ${texFormat}; substituting dummy storage texture`
-              );
-              entryResource = this._dummyResource(layoutEntry);
-              entryUsedDummy = true;
+              textureViewDimension = viewDesc.dimension;
             }
           } else {
-            const storageViewDesc =
-              viewDesc && viewDesc.mipLevelCount === 1
-                ? viewDesc
-                : { ...(viewDesc || {}), mipLevelCount: 1 };
-            const resolvedView = this._textureView(resourceId, storageViewDesc);
+            const baseDim = actualTexDim || '2d';
+            textureViewDimension = baseDim === '2d' && baseLayers > 1 ? '2d-array' : baseDim;
+          }
+          const sampleCount =
+            (texMeta && typeof texMeta.sampleCount === 'number' ? texMeta.sampleCount : null) ||
+            (texObj && typeof texObj.sampleCount === 'number' ? texObj.sampleCount : null) ||
+            (texObj && texObj.desc && typeof texObj.desc.sampleCount === 'number' ? texObj.desc.sampleCount : null);
+          if (sampleCount !== null) {
+            textureMultisampled = sampleCount > 1;
+          }
+          textureViewDescUsed = viewDesc;
+          if (kindMismatch) {
+            const resolvedView = this._textureView(resourceId, viewDesc);
             if (resolvedView) {
               realResource = resolvedView;
-              entryResource = resolvedView;
-              textureViewDescUsed = storageViewDesc;
+            } else {
+              this._packetError = null;
             }
-          }
-        } else if (
-          !kindMismatch &&
-          layoutEntry &&
-          layoutEntry.texture &&
-          layoutEntry.texture.sampleType === 'float' &&
-          texFormat &&
-          isFloat32TextureFormat(texFormat) &&
-          !deviceHasFeature(this.device, 'float32-filterable')
-        ) {
-          this.telemetry.unfilterableFloatFallbacks += 1;
-          this._recordTelemetryWarningOnce(
-            `bg-unfilterable-float:${texFormat}:${binding}`,
-            `bind group ${id}: binding ${binding} format ${texFormat} requires unfilterable-float without float32-filterable; substituting filterable fallback`
-          );
-          entryResource = this._dummyResource(layoutEntry);
-          entryUsedDummy = true;
-        } else {
-          const resolvedView = this._textureView(resourceId, viewDesc);
-          if (resolvedView) {
-            realResource = resolvedView;
-            if (kindMismatch) {
-              this.telemetry.bindGroupKindMismatches += 1;
+            this.telemetry.bindGroupKindMismatches += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-kind-mismatch:${layoutId}:${binding}:texture`,
+              `bind group ${id}: binding ${binding} texture resource mismatches layout entry; substituting dummy resource`
+            );
+            entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, false);
+            entryUsedDummy = true;
+          } else if (layoutEntry && layoutEntry.storageTexture) {
+            const expectedStorageFormat = layoutEntry.storageTexture.format || null;
+            const expectedStorageDim = layoutEntry.storageTexture.viewDimension || '2d';
+            const expectedStorageAccess = layoutEntry.storageTexture.access || 'write-only';
+            const resolvedStorage = texFormat ? this._resolveStorageFormat(texFormat) : null;
+            if (resolvedStorage && (!resolvedStorage.supportsStorageBinding || !resolvedStorage.storageFormat)) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
               this._recordTelemetryWarningOnce(
-                `bg-kind-mismatch:${layoutId}:${binding}:texture`,
-                `bind group ${id}: binding ${binding} texture resource mismatches layout entry; substituting dummy resource`
+                `bg-storage-format-unsupported:${texFormat}:${binding}`,
+                `bind group ${id}: binding ${binding} storageTexture format ${texFormat} unsupported${
+                  resolvedStorage.reason ? ` (${resolvedStorage.reason})` : ''
+                }; substituting dummy storage texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else if (textureMultisampled === true) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-storage-multisampled:${layoutId}:${effectiveBinding}`,
+                `bind group ${id}: binding ${effectiveBinding} multisampled texture cannot bind as storageTexture; substituting dummy storage texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else if (
+              textureUsage !== null &&
+              (textureUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) === 0
+            ) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-storage-usage-mismatch:${layoutId}:${effectiveBinding}`,
+                `bind group ${id}: binding ${effectiveBinding} texture usage 0x${textureUsage.toString(16)} lacks STORAGE_BINDING; substituting dummy storage texture`
               );
               entryResource = this._dummyResource(layoutEntry);
               entryUsedDummy = true;
             } else {
+              const effectiveStorageFormat = resolvedStorage ? resolvedStorage.storageFormat : texFormat;
+              if (
+                expectedStorageFormat &&
+                effectiveStorageFormat &&
+                effectiveStorageFormat !== expectedStorageFormat
+              ) {
+                this.telemetry.bindGroupValidationFallbacks += 1;
+                this._recordTelemetryWarningOnce(
+                  `bg-storage-format-mismatch:${layoutId}:${effectiveBinding}:${effectiveStorageFormat}:${expectedStorageFormat}`,
+                  `bind group ${id}: binding ${effectiveBinding} storageTexture format ${effectiveStorageFormat} mismatches layout ${expectedStorageFormat}; substituting dummy storage texture`
+                );
+                entryResource = this._dummyResource(layoutEntry);
+                entryUsedDummy = true;
+              } else if (
+                effectiveStorageFormat &&
+                !isStorageAccessCompatible(effectiveStorageFormat, expectedStorageAccess, this.device)
+              ) {
+                this.telemetry.bindGroupValidationFallbacks += 1;
+                this._recordTelemetryWarningOnce(
+                  `bg-storage-access-unsupported:${layoutId}:${effectiveBinding}:${effectiveStorageFormat}:${expectedStorageAccess}`,
+                  `bind group ${id}: binding ${effectiveBinding} storageTexture format ${effectiveStorageFormat} unsupported for ${expectedStorageAccess}; substituting dummy storage texture`
+                );
+                entryResource = this._dummyResource(layoutEntry);
+                entryUsedDummy = true;
+              } else {
+                let storageViewDesc =
+                  resolvedStorage && resolvedStorage.needsLinearSiblingView
+                    ? { ...(viewDesc || {}), format: resolvedStorage.storageFormat, mipLevelCount: 1 }
+                    : viewDesc && viewDesc.mipLevelCount === 1
+                      ? viewDesc
+                      : { ...(viewDesc || {}), mipLevelCount: 1 };
+                const texDimForCheck = actualTexDim || '2d';
+                let dimCompatible =
+                  texDimForCheck === '1d'
+                    ? expectedStorageDim === '1d'
+                    : texDimForCheck === '3d'
+                      ? expectedStorageDim === '3d'
+                      : expectedStorageDim === '2d' || expectedStorageDim === '2d-array';
+                if (dimCompatible && textureViewDimension && textureViewDimension !== expectedStorageDim) {
+                  if (texDimForCheck === '2d' && expectedStorageDim === '2d') {
+                    storageViewDesc = { ...storageViewDesc, dimension: '2d', arrayLayerCount: 1 };
+                    textureViewDimension = '2d';
+                  } else if (texDimForCheck === '2d' && expectedStorageDim === '2d-array') {
+                    storageViewDesc = { ...storageViewDesc, dimension: '2d-array' };
+                    textureViewDimension = '2d-array';
+                  } else {
+                    dimCompatible = false;
+                  }
+                }
+                if (!dimCompatible) {
+                  this.telemetry.bindGroupValidationFallbacks += 1;
+                  this._recordTelemetryWarningOnce(
+                    `bg-storage-dim-mismatch:${layoutId}:${effectiveBinding}:${textureViewDimension}:${expectedStorageDim}`,
+                    `bind group ${id}: binding ${effectiveBinding} storageTexture dimension ${textureViewDimension} mismatches layout ${expectedStorageDim}; substituting dummy storage texture`
+                  );
+                  entryResource = this._dummyResource(layoutEntry);
+                  entryUsedDummy = true;
+                } else {
+                  const resolvedView = this._textureView(resourceId, storageViewDesc);
+                  if (resolvedView) {
+                    realResource = resolvedView;
+                    entryResource = resolvedView;
+                    if (resolvedStorage && resolvedStorage.needsLinearSiblingView) {
+                      textureFormat = resolvedStorage.storageFormat;
+                    }
+                    textureViewDescUsed = storageViewDesc;
+                  } else {
+                    this._packetError = null;
+                    this.telemetry.bindGroupValidationFallbacks += 1;
+                    this._recordTelemetryWarningOnce(
+                      resolvedStorage && resolvedStorage.needsLinearSiblingView
+                        ? `bg-storage-linear-view-fallback:${texFormat}:${binding}`
+                        : `bg-storage-view-fallback:${layoutId}:${effectiveBinding}:${resourceId}`,
+                      resolvedStorage && resolvedStorage.needsLinearSiblingView
+                        ? `bind group ${id}: binding ${binding} linear sibling view ${resolvedStorage.storageFormat} unavailable for ${texFormat}; substituting dummy storage texture`
+                        : `bind group ${id}: binding ${effectiveBinding} storageTexture view unavailable for texture ${resourceId}; substituting dummy storage texture`
+                    );
+                    entryResource = this._dummyResource(layoutEntry);
+                    entryUsedDummy = true;
+                  }
+                }
+              }
+            }
+          } else if (layoutEntry && layoutEntry.texture) {
+            const expectedSampleType = layoutEntry.texture.sampleType || 'float';
+            const expectedDim = layoutEntry.texture.viewDimension || '2d';
+            const expectedMultisampled = Boolean(layoutEntry.texture.multisampled);
+            let sampledViewDesc = viewDesc;
+            let effectiveAspect = (viewDesc && viewDesc.aspect) || 'all';
+            if (texFormat && isCombinedDepthStencilFormat(texFormat) && effectiveAspect === 'all') {
+              effectiveAspect = expectedSampleType === 'uint' ? 'stencil-only' : 'depth-only';
+              sampledViewDesc = { ...(sampledViewDesc || {}), aspect: effectiveAspect };
+            }
+            const effectiveTexFormat = resolveEffectiveViewFormat(texFormat, effectiveAspect);
+            if (effectiveTexFormat) textureFormat = effectiveTexFormat;
+
+            if (
+              textureUsage !== null &&
+              (textureUsage & GPU_TEXTURE_USAGE_TEXTURE_BINDING) === 0
+            ) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-texture-usage-mismatch:${layoutId}:${effectiveBinding}`,
+                `bind group ${id}: binding ${effectiveBinding} texture usage 0x${textureUsage.toString(16)} lacks TEXTURE_BINDING; substituting dummy texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else if (
+              textureMultisampled !== null &&
+              textureMultisampled !== expectedMultisampled
+            ) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-texture-multisample-mismatch:${layoutId}:${effectiveBinding}:${textureMultisampled}:${expectedMultisampled}`,
+                `bind group ${id}: binding ${effectiveBinding} texture multisampled=${textureMultisampled} mismatches layout multisampled=${expectedMultisampled}; substituting dummy texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else if (
+              expectedSampleType === 'float' &&
+              effectiveTexFormat &&
+              isFloat32TextureFormat(effectiveTexFormat) &&
+              !deviceHasFeature(this.device, 'float32-filterable')
+            ) {
+              this.telemetry.unfilterableFloatFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-unfilterable-float:${effectiveTexFormat}:${binding}`,
+                `bind group ${id}: binding ${binding} format ${effectiveTexFormat} requires unfilterable-float without float32-filterable; substituting filterable fallback`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else if (
+              effectiveTexFormat &&
+              !isTextureSampleTypeCompatible(effectiveTexFormat, expectedSampleType, this.device)
+            ) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-sample-type-mismatch:${layoutId}:${effectiveBinding}:${effectiveTexFormat}:${expectedSampleType}`,
+                `bind group ${id}: binding ${effectiveBinding} format ${effectiveTexFormat} incompatible with layout sampleType ${expectedSampleType}; substituting dummy texture`
+              );
+              entryResource = this._dummyResource(layoutEntry);
+              entryUsedDummy = true;
+            } else {
+              const texDimForCheck = actualTexDim || '2d';
+              let dimCompatible =
+                texDimForCheck === '1d'
+                  ? expectedDim === '1d'
+                  : texDimForCheck === '3d'
+                    ? expectedDim === '3d'
+                    : expectedDim === '2d' ||
+                      expectedDim === '2d-array' ||
+                      expectedDim === 'cube' ||
+                      expectedDim === 'cube-array';
+              if (dimCompatible && textureViewDimension && textureViewDimension !== expectedDim) {
+                if (texDimForCheck === '2d' && !expectedMultisampled) {
+                  if (expectedDim === '2d' && textureViewDimension === '2d-array') {
+                    sampledViewDesc = { ...(sampledViewDesc || {}), dimension: '2d', arrayLayerCount: 1 };
+                    textureViewDimension = '2d';
+                  } else if (expectedDim === '2d-array' && textureViewDimension === '2d') {
+                    sampledViewDesc = { ...(sampledViewDesc || {}), dimension: '2d-array' };
+                    textureViewDimension = '2d-array';
+                  } else if (expectedDim === 'cube' && baseLayers >= 6) {
+                    sampledViewDesc = {
+                      ...(sampledViewDesc || {}),
+                      dimension: 'cube',
+                      baseArrayLayer: 0,
+                      arrayLayerCount: 6,
+                    };
+                    textureViewDimension = 'cube';
+                  } else if (expectedDim === 'cube-array' && baseLayers >= 6) {
+                    const cubeLayers = Math.floor(baseLayers / 6) * 6;
+                    sampledViewDesc = {
+                      ...(sampledViewDesc || {}),
+                      dimension: 'cube-array',
+                      baseArrayLayer: 0,
+                      arrayLayerCount: cubeLayers,
+                    };
+                    textureViewDimension = 'cube-array';
+                  } else {
+                    dimCompatible = false;
+                  }
+                } else {
+                  dimCompatible = false;
+                }
+              }
+              if (
+                dimCompatible &&
+                (expectedDim === 'cube' || expectedDim === 'cube-array')
+              ) {
+                const texWidth =
+                  (texMeta && typeof texMeta.width === 'number' ? texMeta.width : null) ||
+                  (texObj && typeof texObj.width === 'number' ? texObj.width : null) ||
+                  (texObj && texObj.desc && texObj.desc.size && typeof texObj.desc.size.width === 'number'
+                    ? texObj.desc.size.width
+                    : null);
+                const texHeight =
+                  (texMeta && typeof texMeta.height === 'number' ? texMeta.height : null) ||
+                  (texObj && typeof texObj.height === 'number' ? texObj.height : null) ||
+                  (texObj && texObj.desc && texObj.desc.size && typeof texObj.desc.size.height === 'number'
+                    ? texObj.desc.size.height
+                    : null);
+                const viewBaseLayer =
+                  sampledViewDesc && typeof sampledViewDesc.baseArrayLayer === 'number'
+                    ? sampledViewDesc.baseArrayLayer
+                    : 0;
+                const availLayers = Math.max(0, baseLayers - viewBaseLayer);
+                const viewLayerCount =
+                  sampledViewDesc && typeof sampledViewDesc.arrayLayerCount === 'number' && sampledViewDesc.arrayLayerCount > 0
+                    ? sampledViewDesc.arrayLayerCount
+                    : availLayers;
+                if (
+                  baseLayers < 6 ||
+                  (texWidth !== null && texHeight !== null && texWidth !== texHeight) ||
+                  (expectedDim === 'cube' && viewLayerCount !== 6) ||
+                  (expectedDim === 'cube-array' && (viewLayerCount < 6 || viewLayerCount % 6 !== 0))
+                ) {
+                  dimCompatible = false;
+                }
+              }
+              if (!dimCompatible) {
+                this.telemetry.bindGroupValidationFallbacks += 1;
+                this._recordTelemetryWarningOnce(
+                  `bg-texture-dim-mismatch:${layoutId}:${effectiveBinding}:${textureViewDimension}:${expectedDim}`,
+                  `bind group ${id}: binding ${effectiveBinding} texture viewDimension ${textureViewDimension} (layers=${baseLayers}) incompatible with layout ${expectedDim}; substituting dummy texture`
+                );
+                entryResource = this._dummyResource(layoutEntry);
+                entryUsedDummy = true;
+              } else {
+                const resolvedView = this._textureView(resourceId, sampledViewDesc);
+                if (resolvedView) {
+                  realResource = resolvedView;
+                  entryResource = resolvedView;
+                  textureViewDescUsed = sampledViewDesc;
+                } else {
+                  this._packetError = null;
+                  this.telemetry.bindGroupValidationFallbacks += 1;
+                  this._recordTelemetryWarningOnce(
+                    `bg-texture-view-fallback:${layoutId}:${effectiveBinding}:${resourceId}`,
+                    `bind group ${id}: binding ${effectiveBinding} texture ${resourceId} createView failed; substituting dummy texture`
+                  );
+                  entryResource = this._dummyResource(layoutEntry);
+                  entryUsedDummy = true;
+                }
+              }
+            }
+          } else {
+            const resolvedView = this._textureView(resourceId, viewDesc);
+            if (resolvedView) {
+              realResource = resolvedView;
               entryResource = resolvedView;
             }
           }
         }
       } else if (type === BIND_RESOURCE_TYPE.SAMPLER) {
         const sampler = this.processor.samplers.get(resourceId) || null;
-        if (sampler) {
+        const samplerLive = Boolean(sampler && sampler.destroyed !== true);
+        if (samplerLive) {
           realResource = sampler;
-          if (sampler.desc && sampler.desc.compare !== undefined) {
-            samplerComparison = true;
+          const sMeta = this.samplerMeta.get(resourceId) || null;
+          let samplerFiltering = null;
+          if (sMeta) {
+            samplerComparison = sMeta.comparison;
+            samplerFiltering = sMeta.filtering;
           } else if (sampler.desc) {
-            samplerComparison = false;
+            samplerComparison = sampler.desc.compare !== undefined;
+            samplerFiltering = isSamplerFilteringDesc(sampler.desc);
           }
           if (kindMismatch) {
             this.telemetry.bindGroupKindMismatches += 1;
@@ -6644,26 +7349,78 @@ class RenderStatePackets {
               `bg-kind-mismatch:${layoutId}:${binding}:sampler`,
               `bind group ${id}: binding ${binding} sampler resource mismatches layout entry; substituting dummy resource`
             );
-            entryResource = this._dummyResource(layoutEntry);
+            entryResource = this._fallbackResourceForLayoutEntry(layoutEntry, false);
             entryUsedDummy = true;
+          } else if (layoutExpectsSampler) {
+            const expectedSamplerType = layoutEntry.sampler.type || 'filtering';
+            const comparisonMismatch =
+              (expectedSamplerType === 'comparison' && samplerComparison === false) ||
+              (expectedSamplerType !== 'comparison' && samplerComparison === true);
+            const filteringMismatch =
+              expectedSamplerType === 'non-filtering' && samplerFiltering === true;
+            if (comparisonMismatch || filteringMismatch) {
+              this.telemetry.bindGroupValidationFallbacks += 1;
+              this._recordTelemetryWarningOnce(
+                `bg-sampler-type-mismatch:${layoutId}:${effectiveBinding}:${expectedSamplerType}`,
+                `bind group ${id}: binding ${effectiveBinding} sampler ${resourceId} incompatible with layout type ${expectedSamplerType}; substituting default sampler`
+              );
+              entryResource = this._fallbackResourceForLayoutEntry(layoutEntry);
+              entryUsedDummy = true;
+            } else {
+              entryResource = sampler;
+            }
           } else {
             entryResource = sampler;
           }
+        } else if (layoutEntry) {
+          this.telemetry.missingResourceFallbacks += 1;
+          if (!kindMismatch) {
+            const samplerKind =
+              (layoutEntry.sampler && layoutEntry.sampler.type) || 'filtering';
+            const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+            if (fallbackSampler) {
+              entryResource = fallbackSampler;
+              samplerComparison = samplerKind === 'comparison';
+              this.telemetry.fallbackSamplersBound += 1;
+            } else {
+              entryResource = this._dummyResource(layoutEntry);
+              samplerComparison = samplerKind === 'comparison';
+            }
+            this._recordTelemetryWarningOnce(
+              `bg-missing-sampler:${layoutId}:${effectiveBinding}:${resourceId}`,
+              `bind group ${id}: binding ${effectiveBinding} sampler ${resourceId} unavailable; bound default ${samplerKind} sampler`
+            );
+          } else {
+            entryResource = this._dummyResource(layoutEntry);
+            this._recordTelemetryWarningOnce(
+              `bg-missing-sampler:${layoutId}:${effectiveBinding}:${resourceId}`,
+              `bind group ${id}: binding ${effectiveBinding} sampler ${resourceId} unavailable; substituting dummy resource`
+            );
+          }
+          entryUsedDummy = true;
         } else if (!kindMismatch) {
-          const samplerKind =
-            (layoutEntry && layoutEntry.sampler && layoutEntry.sampler.type) || 'filtering';
-          const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+          const fallbackSampler = this._resolveDefaultSamplerFromCache('filtering');
           if (fallbackSampler) {
             entryResource = fallbackSampler;
             entryUsedDummy = true;
-            samplerComparison = samplerKind === 'comparison';
+            samplerComparison = false;
             this.telemetry.fallbackSamplersBound += 1;
+            this.telemetry.missingResourceFallbacks += 1;
             this._recordTelemetryWarningOnce(
-              `bg-missing-sampler:${layoutId}:${binding}:${resourceId}`,
-              `bind group ${id}: binding ${binding} sampler ${resourceId} unavailable; bound default ${samplerKind} sampler`
+              `bg-missing-sampler:${layoutId}:${effectiveBinding}:${resourceId}`,
+              `bind group ${id}: binding ${effectiveBinding} sampler ${resourceId} unavailable; bound default filtering sampler`
             );
           }
         }
+      }
+      if (!entryResource && layoutEntry) {
+        this.telemetry.missingResourceFallbacks += 1;
+        this._recordTelemetryWarningOnce(
+          `bg-missing-resource:${layoutId}:${effectiveBinding}:${resourceId}`,
+          `bind group ${id}: binding ${effectiveBinding} resource ${resourceId} unavailable; substituting dummy resource`
+        );
+        entryResource = this._fallbackResourceForLayoutEntry(layoutEntry);
+        entryUsedDummy = true;
       }
       if (!entryResource) {
         this._packetError = `bind group ${id}: binding ${effectiveBinding} resource ${resourceId} unavailable`;
@@ -6760,30 +7517,81 @@ class RenderStatePackets {
       }
     }
 
-    // W167/W186: if the layout declares sampler slots omitted from CreateBindGroup2 (e.g. static
-    // samplers baked into a root signature) and pipelineCache.getOrCreateDefaultSampler is available,
-    // synthesize safe default samplers so the bind group creation succeeds instead of failing.
-    if (Array.isArray(record.entries) && this._getPipelineCache()) {
+    // W167/W186 + Orch-02: synthesize safe fallback entries for any layout bindings omitted from
+    // CreateBindGroup2 (samplers, buffers, textures, storageTextures, and binding-array slots)
+    // so device.createBindGroup never fails with entry count mismatches.
+    if (Array.isArray(record.entries)) {
       for (let i = 0; i < record.entries.length; i += 1) {
         const le = record.entries[i];
-        if (!le || !le.sampler || le.bindingArraySize >= 1 || seenBindings.has(le.binding)) continue;
-        const samplerKind = le.sampler.type || 'filtering';
-        const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
-        if (!fallbackSampler) continue;
+        if (!le) continue;
+        if (le.bindingArraySize >= 1) {
+          for (let ai = 0; ai < le.bindingArraySize; ai += 1) {
+            const slot = le.binding + ai;
+            if (seenBindings.has(slot)) continue;
+            seenBindings.add(slot);
+            const fallbackRes = this._fallbackResourceForLayoutEntry(le);
+            entries.push({ binding: slot, resource: fallbackRes });
+            const kind = le.buffer
+              ? le.buffer.type || 'uniform'
+              : le.storageTexture
+                ? 'storage-texture'
+                : le.texture
+                  ? 'texture'
+                  : 'sampler';
+            const descObj = { binding: slot, kind, resource: fallbackRes, isDummy: true };
+            if (le.sampler) descObj.comparison = le.sampler.type === 'comparison';
+            descriptorResources.push(descObj);
+            this.telemetry.bindGroupValidationFallbacks += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-omitted-array-slot:${layoutId}:${slot}`,
+              `bind group ${id}: omitted binding-array slot ${slot}; synthesized dummy resource`
+            );
+          }
+          continue;
+        }
+        if (seenBindings.has(le.binding)) continue;
         seenBindings.add(le.binding);
-        entries.push({ binding: le.binding, resource: fallbackSampler });
-        descriptorResources.push({
-          binding: le.binding,
-          kind: 'sampler',
-          resource: fallbackSampler,
-          isDummy: true,
-          comparison: samplerKind === 'comparison',
-        });
-        this.telemetry.fallbackSamplersBound += 1;
-        this._recordTelemetryWarningOnce(
-          `bg-omitted-sampler:${layoutId}:${le.binding}`,
-          `bind group ${id}: omitted sampler binding ${le.binding}; bound default ${samplerKind} sampler`
-        );
+        if (le.sampler) {
+          const samplerKind = le.sampler.type || 'filtering';
+          const fallbackSampler = this._resolveDefaultSamplerFromCache(samplerKind);
+          const samplerRes = fallbackSampler || this._dummyResource(le);
+          entries.push({ binding: le.binding, resource: samplerRes });
+          descriptorResources.push({
+            binding: le.binding,
+            kind: 'sampler',
+            resource: samplerRes,
+            isDummy: true,
+            comparison: samplerKind === 'comparison',
+          });
+          if (fallbackSampler) {
+            this.telemetry.fallbackSamplersBound += 1;
+          } else {
+            this.telemetry.bindGroupValidationFallbacks += 1;
+          }
+          this._recordTelemetryWarningOnce(
+            `bg-omitted-sampler:${layoutId}:${le.binding}`,
+            `bind group ${id}: omitted sampler binding ${le.binding}; bound default ${samplerKind} sampler`
+          );
+        } else {
+          const fallbackRes = this._dummyResource(le);
+          entries.push({ binding: le.binding, resource: fallbackRes });
+          const kind = le.buffer
+            ? le.buffer.type || 'uniform'
+            : le.storageTexture
+              ? 'storage-texture'
+              : 'texture';
+          descriptorResources.push({
+            binding: le.binding,
+            kind,
+            resource: fallbackRes,
+            isDummy: true,
+          });
+          this.telemetry.bindGroupValidationFallbacks += 1;
+          this._recordTelemetryWarningOnce(
+            `bg-omitted-binding:${layoutId}:${le.binding}`,
+            `bind group ${id}: omitted ${kind} binding ${le.binding}; synthesized dummy resource`
+          );
+        }
       }
     }
 
@@ -6880,8 +7688,24 @@ class RenderStatePackets {
       try {
         bindGroup = this.device.createBindGroup({ layout: record.layout, entries });
       } catch (err) {
-        this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
-        return false;
+        if (Array.isArray(record.entries)) {
+          presentxCacheKey = null;
+          try {
+            const fallbackEntries = this._buildAllDummyEntriesForLayout(record.entries);
+            bindGroup = this.device.createBindGroup({ layout: record.layout, entries: fallbackEntries });
+            this.telemetry.bindGroupValidationFallbacks += 1;
+            this._recordTelemetryWarningOnce(
+              `bg-create-retry-dummy:${layoutId}`,
+              `bind group ${id}: createBindGroup threw (${String(err && err.message ? err.message : err)}); retried with all-dummy entries`
+            );
+          } catch (err2) {
+            this._packetError = `bind group ${id}: ${String(err2 && err2.message ? err2.message : err2)}`;
+            return false;
+          }
+        } else {
+          this._packetError = `bind group ${id}: ${String(err && err.message ? err.message : err)}`;
+          return false;
+        }
       }
       if (presentxCacheKey && presentxCacheMeta) {
         this.telemetry.presentxBindGroupCacheMisses += 1;
@@ -6912,19 +7736,43 @@ class RenderStatePackets {
     // Resolved now: a later DestroyResource (bind group retired by the runtime) must not affect it.
     const bindGroup = this.processor.bindGroups.get(bindGroupId);
     if (!bindGroup) {
+      // Mark this group slot invalid in the pass command stream so _preparePassCommandsForFlush
+      // clears any stale prior binding and skips subsequent draws/dispatches on an unbound group.
+      this.processor._passCommands.push({
+        type: 'renderState',
+        _rsInvalidBindGroup: { groupIndex: index, bindGroupId },
+        run() {},
+      });
       this._packetError = `unknown bind group ${bindGroupId}`;
       return false;
     }
+    const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
+    const layoutRec =
+      bindGroupDesc && bindGroupDesc.layoutId
+        ? this.bindGroupLayouts.get(bindGroupDesc.layoutId) || null
+        : null;
+    const expectedDynCount =
+      layoutRec && layoutRec.dynamicOffsetIndices ? layoutRec.dynamicOffsetIndices.size : null;
+    const effectiveCount = expectedDynCount !== null ? expectedDynCount : count;
+    if (expectedDynCount !== null && count !== expectedDynCount) {
+      this._recordTelemetryWarningOnce(
+        `sbg-dynoffset-count:${bindGroupDesc.layoutId}:${count}:${expectedDynCount}`,
+        `SetBindGroup2: bind group ${bindGroupId} dynamicOffset count ${count} normalized to layout expected ${expectedDynCount}`
+      );
+    }
     let offsets;
-    if (count === 0) {
+    if (effectiveCount === 0) {
       offsets = EMPTY_DYNAMIC_OFFSETS;
     } else {
-      offsets = this._acquireDynamicOffsetsArray(count);
-      for (let i = 0; i < count; i += 1) {
+      offsets = this._acquireDynamicOffsetsArray(effectiveCount);
+      const copyLen = Math.min(count, effectiveCount);
+      for (let i = 0; i < copyLen; i += 1) {
         offsets[i] = view.getUint32(offset + 16 + i * 4, true);
       }
+      for (let i = copyLen; i < effectiveCount; i += 1) {
+        offsets[i] = 0;
+      }
     }
-    const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
     if (index === RT_ARENA_GROUP_INDEX && bindGroupDesc && bindGroupDesc.hasRtArenaBindings) {
       this.telemetry.rtArenaGroup3Binds += 1;
     }
@@ -6947,6 +7795,10 @@ class RenderStatePackets {
       return false;
     }
     this.processor.samplers.set(id, sampler);
+    this.samplerMeta.set(id, {
+      comparison: desc.compare !== undefined,
+      filtering: isSamplerFilteringDesc(desc),
+    });
     this._invalidatePresentXCacheForResource(id);
     return true;
   }
@@ -7031,6 +7883,9 @@ const exportedApi = {
   isRenderAttachmentSupported,
   isMultisampleSupported,
   resolveTextureSampleType,
+  resolveEffectiveViewFormat,
+  isTextureSampleTypeCompatible,
+  isStorageAccessCompatible,
   computeMaxMipLevels,
   resolveShaderEntryPoint,
   findWgslStageEntryPoints,
