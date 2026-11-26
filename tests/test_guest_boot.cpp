@@ -1927,6 +1927,10 @@ void test_fence_lag_and_present_max_interval() {
         // Title requests 30 Hz (33333 us -> 2 vblanks on a 60 Hz display).
         CHECK(dev->SetFrameIntervalX(0, 33333u, 1u, 0u) == dg::kSOk);
         CHECK(dev->present_interval_vblanks() == 2u);
+        // The title drives the frame interval, so presents add no 60 Hz wait on top of it.
+        CHECK(gpu::present_pacer().title_driven());
+        // Interval clamping below is covered with the display pacing on.
+        gpu::present_pacer().set_title_driven(false);
 
         const uint64_t guest_page = g_arena->reserve(0, os::kPageSize, os::PageProtect::ReadWrite);
         CHECK(guest_page != 0 && g_arena->commit(guest_page, os::kPageSize, os::PageProtect::ReadWrite));
