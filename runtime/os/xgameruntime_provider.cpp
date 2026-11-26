@@ -2323,12 +2323,21 @@ constexpr auto kSpeechTable = slot_table<19>({
 });
 constexpr auto kISpeech = com::declare_interface<SpeechApi>("xgameruntime.XSpeechSynthesizer", kSpeechIid,
                                                             kSpeechTable.slots, {.slot_count = 32});
-// R40: the four areas the title reaches from its legal and privacy screens no longer trap. Slot
-// numbers are not identified, so every slot of an interface answers one documented HRESULT:
-//   events {bbfbdcc7}: S_OK (writes accepted and dropped, truthful no-op);
-//   shell {1b339674}: HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED) (URI launch not supported);
-//   capture {a4f1aee2}: ERROR_NOT_SUPPORTED (screenshots);
-//   XGameUi {dfcd4649}: E_ABORT (dialogs behave as cancelled by the user).
+// R40: the four areas the title reaches from its legal and privacy screens no longer trap; every slot
+// of an interface answers one fixed HRESULT. Evidence: static survey of the executable's wrappers and
+// of every caller of them (R40 verification; no runtime trace of these slots exists yet):
+//   events {bbfbdcc7}: S_OK. One wrapper, s3 (6 arguments), reached only after XGameRuntimeIsFeatureAvailable
+//     (feature 20) answers true; with the feature table at false the wrapper returns E_NOTIMPL before it
+//     queries this interface, so the slot answer is unobservable today. A truthful no-op if enabled.
+//   shell {1b339674}: ERROR_NOT_SUPPORTED. s3(handle, ptr) fails into a logged error and the caller reports
+//     failure; s4(&handle) result is ignored and its handle stays null; s5(handle) is only called for a
+//     non-null handle. The function itself is not identified; every caller tolerates any failure.
+//   capture {a4f1aee2}: ERROR_NOT_SUPPORTED. One wrapper, s5(2 arguments); the caller stores a status
+//     (success 0, 0x82323002 3, any other failure 1) in a list and continues. Function not identified.
+//   XGameUi {dfcd4649}: E_ABORT. s7/s8 = ShowPlayerProfileCardAsync/Result and s17/s18/s19 =
+//     ShowTextEntryAsync/ResultSize/Result (named by the title's own error strings); s7 and s17 failing
+//     logs the error and returns, so the Result slots are never reached. A profile-card success
+//     answer would need a real dialog, so it stays a refusal.
 constexpr int32_t kHrNotSupported = static_cast<int32_t>(0x80070032u);  // HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
 constexpr auto kIEvent = com::declare_interface<StubApi>(
     "xgameruntime.XGameEvent", kEventGuid, {},
