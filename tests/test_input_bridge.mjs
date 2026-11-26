@@ -14,6 +14,11 @@ import {
   INPUT_BUTTONS,
   DEFAULT_KEY_BINDINGS,
   STANDARD_GAMEPAD_BUTTON_MAP,
+  IDLE_GAMEPAD_POLL_INTERVAL_MS,
+  MIN_SCRIPT_HOLD_MS,
+  FIRST_VISIBLE_FRAME_ANCHOR_PRESETS,
+  INPUT_SCRIPT_START_TRIGGERS,
+  CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
   applyDeadzone,
   applyRadialDeadzone as bridgeApplyRadialDeadzone,
   applyAxialDeadzone,
@@ -24,6 +29,8 @@ import {
   InputBridge,
 } from '../web/input/input_bridge.js';
 import { applyRadialDeadzone } from '../web/input/input_profiles.js';
+import { sanitizeString } from '../web/telemetry/crash_report.js';
+import { HudController, HIDDEN_HUD_MIN_RENDER_INTERVAL_MS } from '../web/ui/hud_controller.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -1512,6 +1519,7 @@ test('W174 INPUT_SCRIPT_PRESETS and INPUT_SCRIPT_PRESET_NAMES expose frozen buil
     'menu-to-ingame',
     'chrome-menu-flow-2',
     'chrome-menu-flow-4',
+    'chrome-menu-flow-5',
     'chrome-to-ingame',
   ]);
   assert.deepEqual(Object.keys(INPUT_SCRIPT_PRESETS), [...INPUT_SCRIPT_PRESET_NAMES]);
@@ -3451,6 +3459,7 @@ test('W339 startOffsetMs shifts preset and custom timelines cleanly while keepin
     ['menu-to-ingame', 5000],
     ['chrome-menu-flow-2', 110000],
     ['chrome-menu-flow-4', 5000],
+    ['chrome-menu-flow-5', 2000],
     ['chrome-to-ingame', 5000],
   ];
   for (const [name, expectedFirstMs] of expectedFirstTransitions) {
@@ -3458,4 +3467,349 @@ test('W339 startOffsetMs shifts preset and custom timelines cleanly while keepin
     assert.equal(p.startOffsetMs, 0, `${name} default startOffsetMs must be 0`);
     assert.equal(p.nextTransitionMs(0), expectedFirstMs, `${name} first transition mismatch`);
   }
+});
+
+test('W364 InputBridge throttles idle navigator.getGamepads() polling to 2 Hz and wakes immediately on gamepadconnected or first-tick detection', () => {
+  assert.equal(IDLE_GAMEPAD_POLL_INTERVAL_MS, 500);
+
+  let nowMs = 0;
+  let getGamepadsCalls = 0;
+  const env = createMockEnv({ withRaf: true });
+  const baseGetGamepads = env.nav.getGamepads;
+  env.nav.getGamepads = () => {
+    getGamepadsCalls += 1;
+    return baseGetGamepads();
+  };
+
+  const bridge = new InputBridge(env.canvas, {
+    windowObj: env.win,
+    documentObj: env.doc,
+    navigatorObj: env.nav,
+    nowFn: () => nowMs,
+  });
+
+  // 1. First tick always polls immediately even when idle (detects pre-connected/mock pads on tick 1).
+  bridge.start();
+  env.flushRaf();
+  assert.equal(getGamepadsCalls, 1, 'tick 1 must poll getGamepads() immediately');
+  assert.equal(bridge.hasConnectedGamepad, false);
+
+  // 2. Subsequent 60 Hz ticks within 500 ms skip navigator.getGamepads() completely.
+  for (let i = 1; i < 30; i += 1) {
+    nowMs = i * 16; // 16..464 ms (< 500 ms)
+    env.flushRaf();
+  }
+  assert.equal(getGamepadsCalls, 1, 'idle rAF ticks < 500 ms must not call getGamepads()');
+  assert.equal(bridge.getStats().idleGamepadPollsSkipped, 29);
+
+  // 3. At >= 500 ms, exactly one idle probe fires (2 Hz).
+  nowMs = 500;
+  env.flushRaf();
+  assert.equal(getGamepadsCalls, 2, 'idle probe must fire once at 500 ms');
+  nowMs = 750;
+  env.flushRaf();
+  assert.equal(getGamepadsCalls, 2, 'idle ticks between 500 ms and 1000 ms must remain throttled');
+
+  // 4. gamepadconnected wakes up 60 Hz polling immediately with zero latency.
+  const pad = makeStandardGamepad({ buttons: { 0: 1 } }); // A
+  env.setGamepads([pad]);
+  env.win.dispatch('gamepadconnected', { gamepad: pad });
+  assert.equal(bridge.hasConnectedGamepad, true);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A);
+  const callsAfterConnect = getGamepadsCalls;
+
+  for (let i = 1; i <= 5; i += 1) {
+    nowMs += 16;
+    env.flushRaf();
+  }
+  assert.equal(
+    getGamepadsCalls,
+    callsAfterConnect + 5,
+    'connected gamepad must poll on every 60 Hz rAF tick'
+  );
+
+  // 5. gamepaddisconnected returns to 500 ms idle throttling.
+  env.setGamepads([null]);
+  env.win.dispatch('gamepaddisconnected', { gamepad: pad });
+  assert.equal(bridge.hasConnectedGamepad, false);
+  const callsAfterDisconnect = getGamepadsCalls;
+
+  nowMs += 100;
+  env.flushRaf();
+  nowMs += 100;
+  env.flushRaf();
+  assert.equal(
+    getGamepadsCalls,
+    callsAfterDisconnect,
+    'after disconnect, ticks within 500 ms must stay throttled'
+  );
+
+  // 6. Plugging in a gamepad without a gamepadconnected event is picked up on the next 500 ms probe
+  //    and immediately flips hasConnectedGamepad = true for 60 Hz polling.
+  const silentPad = makeStandardGamepad({ buttons: { 3: 1 } }); // Y
+  env.setGamepads([silentPad]);
+  nowMs += 300; // total 500 ms since disconnect
+  env.flushRaf();
+  assert.equal(bridge.hasConnectedGamepad, true);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.Y);
+  const callsAfterSilentDetect = getGamepadsCalls;
+  nowMs += 16;
+  env.flushRaf();
+  assert.equal(getGamepadsCalls, callsAfterSilentDetect + 1);
+
+  bridge.destroy();
+
+  // 7. Pre-connected mock gamepad is detected immediately on tick 1 after start().
+  let preCalls = 0;
+  const preEnv = createMockEnv({
+    withRaf: true,
+    gamepads: [makeStandardGamepad({ buttons: { 2: 1 } })], // X
+  });
+  const basePre = preEnv.nav.getGamepads;
+  preEnv.nav.getGamepads = () => {
+    preCalls += 1;
+    return basePre();
+  };
+  const preBridge = new InputBridge(preEnv.canvas, {
+    windowObj: preEnv.win,
+    documentObj: preEnv.doc,
+    navigatorObj: preEnv.nav,
+  });
+  preBridge.start();
+  preEnv.flushRaf();
+  assert.equal(preCalls, 1);
+  assert.equal(preBridge.hasConnectedGamepad, true);
+  assert.equal(preBridge.getSnapshot().buttons, INPUT_BUTTONS.X);
+  preBridge.destroy();
+});
+
+test('W364 sanitizeString fast-path and clean cache preserve exact redaction on paths, secrets, tokens, and buffers', () => {
+  // Clean telemetry strings stay unchanged across repeated calls (hitting clean cache).
+  const cleanSamples = [
+    'Real Wasm64',
+    'Draws: 48 real (120 presents)',
+    'GPU: nvidia / ada lovelace',
+    'GET /api/status 200 OK',
+    'guestVa=0x140045678 offset=+0x2c hash=0x123456789abcdef0',
+    'WebGPU frame #120 ready? Yes.',
+    '0 WebGPU validation errors',
+  ];
+  for (const sample of cleanSamples) {
+    assert.equal(sanitizeString(sample), sample);
+    assert.equal(sanitizeString(sample), sample);
+  }
+
+  // Host paths, file:// URLs, query strings, auth/secrets, bare tokens, and binary/hex/base64 buffers
+  // must all still be redacted identically.
+  assert.equal(
+    sanitizeString('Failed C:\\Users\\alice\\GTA6\\game.exe at startup'),
+    'Failed [REDACTED_PATH] at startup'
+  );
+  assert.equal(
+    sanitizeString('Cannot open /home/bob/secret.bin or /Users/carol/data.rpf'),
+    'Cannot open [REDACTED_PATH] or [REDACTED_PATH]'
+  );
+  assert.equal(
+    sanitizeString('at boot (file:///C:/Users/alice/playgta6web/web/loader.js:42:10)'),
+    'at boot ([REDACTED_FILE_URL]:42:10)'
+  );
+  assert.equal(
+    sanitizeString('Mirror \\\\nas01\\share\\alice\\dump.bin and //nas02/share/bob/chunk.rpf'),
+    'Mirror [REDACTED_PATH] and [REDACTED_PATH]'
+  );
+  assert.equal(
+    sanitizeString('Config at ~/secrets/keys.json'),
+    'Config at [REDACTED_PATH]'
+  );
+  assert.equal(
+    sanitizeString('GET https://alice:pass@proxy.local/api?token=secret123'),
+    'GET https://[REDACTED]@proxy.local/api?[REDACTED]'
+  );
+  assert.equal(sanitizeString('Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.sig12345678'), 'Authorization: Bearer [REDACTED]');
+  assert.equal(sanitizeString('Basic dXNlcjpwYXNz'), 'Basic [REDACTED]');
+  assert.equal(sanitizeString('token=supersecret123'), 'token=[REDACTED]');
+  assert.equal(sanitizeString('ghp_1234567890abcdef1234567890abcdef'), '[REDACTED_TOKEN]');
+  assert.equal(sanitizeString('AKIAIOSFODNN7EXAMPLE'), '[REDACTED_TOKEN]');
+  assert.equal(
+    sanitizeString('data:application/octet-stream;base64,QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo='),
+    '[REDACTED_BUFFER]'
+  );
+  assert.equal(
+    sanitizeString('00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f 10 11'),
+    '[REDACTED_BUFFER]'
+  );
+  assert.equal(sanitizeString('a'.repeat(70)), '[REDACTED_BUFFER]');
+  assert.equal(sanitizeString('\x00asm\x01\x00\x00\x00'), '[REDACTED_BUFFER]');
+});
+
+test('W364 HudController skips visual-only DOM churn while hidden, keeps core telemetry intact, and flushes on setVisible(true)', () => {
+  assert.equal(HIDDEN_HUD_MIN_RENDER_INTERVAL_MS, 500);
+
+  let nowMs = 1000;
+  const makeEl = () => ({
+    textContent: '',
+    title: '',
+    hidden: false,
+    dataset: {},
+    style: {},
+    attrs: new Map(),
+    setAttribute(k, v) {
+      this.attrs.set(k, v);
+    },
+    getAttribute(k) {
+      return this.attrs.has(k) ? this.attrs.get(k) : null;
+    },
+  });
+
+  const hudRootEl = makeEl();
+  const framesEl = makeEl();
+  const fpsEl = makeEl();
+  const pillFpsEl = makeEl();
+  const bootStageEl = makeEl();
+  const bootModeBadge = makeEl();
+
+  const controller = new HudController({
+    bootMode: 'real-wasm64',
+    visible: false,
+    now: () => nowMs,
+    displayElements: {
+      hudRootEl,
+      framesEl,
+      fpsEl,
+      pillFpsEl,
+      bootStageEl,
+      bootModeBadge,
+    },
+  });
+
+  // First telemetry update while hidden updates core telemetry elements (frames, fps)
+  // while skipping visual-only elements (pillFpsEl).
+  controller.updateTelemetry({
+    gpu: { presentCount: 10, fps: 60, gpuAdapter: 'nvidia / ada lovelace' },
+  });
+  assert.equal(framesEl.textContent, '10');
+  assert.equal(fpsEl.textContent, '60');
+  assert.equal(pillFpsEl.textContent, '', 'visual-only pillFpsEl must be skipped while HUD hidden');
+
+  // Rapid updates within 500 ms while hidden are throttled with zero additional DOM writes.
+  const writesAfterFirst = controller.domWrites;
+  nowMs = 1050;
+  controller.updateTelemetry({ gpu: { presentCount: 11, fps: 59, gpuAdapter: 'nvidia / ada lovelace' } });
+  nowMs = 1100;
+  controller.updateTelemetry({ gpu: { presentCount: 12, fps: 58, gpuAdapter: 'nvidia / ada lovelace' } });
+  assert.equal(controller.domWrites, writesAfterFirst);
+  assert.equal(controller.getRenderStats().throttledRenders, 2);
+  assert.equal(controller.getTelemetry().gpu.presentCount, 12);
+
+  // After >= 500 ms while hidden, core telemetry updates cleanly.
+  nowMs = 1550;
+  controller.updateTelemetry({ gpu: { presentCount: 25, fps: 60, gpuAdapter: 'nvidia / ada lovelace' } });
+  assert.equal(framesEl.textContent, '25');
+  assert.equal(pillFpsEl.textContent, '', 'pillFpsEl still skipped while hidden');
+
+  // Making HUD visible immediately flushes all deferred visual elements.
+  controller.setVisible(true);
+  assert.equal(hudRootEl.hidden, false);
+  assert.equal(pillFpsEl.textContent, '60 fps');
+  assert.equal(framesEl.textContent, '25');
+  controller.destroy();
+});
+
+test('W364 chrome-menu-flow-5 preset schedule, FIRST_VISIBLE_FRAME anchor, and 16 s Legal Terms loop', () => {
+  assert.ok(INPUT_SCRIPT_PRESET_NAMES.includes('chrome-menu-flow-5'));
+  assert.ok(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS.includes('chrome-menu-flow-5'));
+
+  const spec = INPUT_SCRIPT_PRESETS['chrome-menu-flow-5'];
+  assert.ok(spec);
+  assert.equal(spec.name, 'chrome-menu-flow-5');
+  assert.equal(spec.events.length, 30, '3 Start Screen A + 3x9 LEGAL NOTICES cycle events = 30');
+  assert.ok(spec.loop);
+  assert.equal(spec.loop.startMs, 85000);
+  assert.equal(spec.loop.periodMs, 16000);
+  assert.equal(spec.loop.events, CHROME_LEGAL_TERMS_ACCEPT_OFFSETS);
+
+  // Every event hold must be >= MIN_SCRIPT_HOLD_MS (180 ms) and B must never be pressed.
+  for (const ev of spec.events) {
+    assert.ok(ev.holdMs >= MIN_SCRIPT_HOLD_MS, `holdMs ${ev.holdMs} < ${MIN_SCRIPT_HOLD_MS}`);
+    assert.equal((ev.button || 0) & INPUT_BUTTONS.B, 0, 'chrome-menu-flow-5 must never press B');
+  }
+  for (const ev of spec.loop.events) {
+    assert.ok(ev.holdMs >= MIN_SCRIPT_HOLD_MS);
+    assert.equal((ev.button || 0) & INPUT_BUTTONS.B, 0);
+  }
+
+  const player = new ScriptedInputPlayer('chrome-menu-flow-5');
+
+  // Phase 1 (0s..10s): Start Screen A at 2s, 4s, 6s.
+  assert.equal(player.sampleAt(0).buttonsMask, 0);
+  assert.equal(player.sampleAt(1999).buttonsMask, 0);
+  for (const atMs of [2000, 4000, 6000]) {
+    assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A, `Start Screen A at ${atMs}`);
+    assert.equal(player.sampleAt(atMs + 199).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(atMs + 200).buttonsMask, 0);
+  }
+
+  // Quiet window during 4K Bink2 playback (6200..34999 ms).
+  for (let t = 6200; t < 35000; t += 1000) {
+    assert.equal(player.sampleAt(t).buttonsMask, 0, `quiet during Bink2 at ${t}`);
+  }
+
+  // Phase 2 (35s..80s): 3x (Up x6, Down, Down, A) rounds at 35s, 50s, 65s.
+  for (const base of [35000, 50000, 65000]) {
+    for (let u = 0; u < 6; u += 1) {
+      assert.equal(player.sampleAt(base + u * 400).buttonsMask, INPUT_BUTTONS.DPAD_UP);
+    }
+    assert.equal(player.sampleAt(base + 3000).buttonsMask, INPUT_BUTTONS.DPAD_DOWN);
+    assert.equal(player.sampleAt(base + 4500).buttonsMask, INPUT_BUTTONS.DPAD_DOWN);
+    assert.equal(player.sampleAt(base + 6500).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(base + 6700).buttonsMask, 0);
+  }
+
+  // Quiet settle window before Legal Terms loop (71700..84999 ms).
+  assert.equal(player.sampleAt(75000).buttonsMask, 0);
+  assert.equal(player.sampleAt(84999).buttonsMask, 0);
+
+  // Phase 3 (85s+, looping every 16 s): CHROME_LEGAL_TERMS_ACCEPT_OFFSETS.
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const base = 85000 + cycle * 16000;
+    assert.equal(player.sampleAt(base).buttonsMask, INPUT_BUTTONS.DPAD_UP);
+    const scroll1 = player.sampleAt(base + 2700);
+    assert.equal(scroll1.buttonsMask, 0);
+    assert.ok(scroll1.sticks && scroll1.sticks.ry < -0.9, 'right-stick scroll down for Privacy Policy');
+    assert.equal(player.sampleAt(base + 4000).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(base + 5200).buttonsMask, INPUT_BUTTONS.DPAD_DOWN);
+    const scroll2 = player.sampleAt(base + 5800);
+    assert.ok(scroll2.sticks && scroll2.sticks.ry < -0.9, 'right-stick scroll down for Terms of Service');
+    assert.equal(player.sampleAt(base + 7100).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(base + 8300).buttonsMask, INPUT_BUTTONS.DPAD_DOWN);
+    assert.equal(player.sampleAt(base + 9500).buttonsMask, INPUT_BUTTONS.A);
+    assert.equal(player.sampleAt(base + 12000).buttonsMask, INPUT_BUTTONS.A);
+  }
+
+  // Re-anchoring on FIRST_VISIBLE_FRAME prepends 500 ms A without overlapping 2s/4s/6s presses.
+  const clock = createFakeClockAndTimers(0);
+  const bridge = new InputBridge({
+    windowObj: null,
+    documentObj: null,
+    navigatorObj: null,
+  });
+  bridge.startScript('chrome-menu-flow-5', {
+    startOn: INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME,
+    nowFn: clock.nowFn,
+    setTimeoutFn: clock.setTimeoutFn,
+    clearTimeoutFn: clock.clearTimeoutFn,
+  });
+  clock.advanceTo(30000);
+  assert.equal(bridge.notifyFirstVisibleFrame(), true);
+  assert.equal(bridge.getStats().scriptStartedOn, INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME);
+
+  clock.advanceTo(30500);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, 'initial 500 ms A after FIRST_VISIBLE_FRAME');
+  clock.advanceTo(30720);
+  assert.equal(bridge.getSnapshot().buttons, 0);
+  clock.advanceTo(32000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.A, '2 s Start Screen A');
+  clock.advanceTo(30000 + 85000);
+  assert.equal(bridge.getSnapshot().buttons, INPUT_BUTTONS.DPAD_UP, '85 s Legal Terms loop start');
+  bridge.destroy();
 });
