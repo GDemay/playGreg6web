@@ -1843,6 +1843,7 @@ BindGroupPlan BindGroupPlan::build(
                                                                                            : b.heap_index_parameter;
                 e.heap_dword = b.heap_index_source == HeapIndexSource::RootConstantIndex ? b.heap_index_dword : 0;
                 e.heap_shift = b.heap_shift;
+                e.heap_stride = b.heap_stride;
                 e.heap_index_source = b.heap_index_source;
                 e.heap_index_bias = b.array_index;
                 if (b.heap_index_source != HeapIndexSource::RootConstantIndex &&
@@ -1957,6 +1958,7 @@ BindGroupPlan BindGroupPlan::build(
         h.u32(e.cb_bit_offset);
         h.u32(e.cb_mask);
         h.u32(e.heap_index_bias);
+        h.u32(e.heap_stride);
         if (e.source == PlanSource::InlineSampler) {
             uint32_t words[sizeof(SamplerDesc) / 4] = {};
             std::memcpy(words, &e.sampler, sizeof(words));
@@ -2022,6 +2024,11 @@ bool cb_index_dword(const RootArgumentState& state, BindPoint bind_point, const 
 
 // The heap byte offset a heap-indexed plan entry selects under the current arguments: false when
 // the index is not available (*cb_miss set when it is a CB index that could not be read).
+// RDNA2 scalar-load soffset is 32-bit: the scaled index wraps in hardware.
+uint32_t scaled_heap_index(const PlanEntry& p, uint32_t index) {
+    return p.heap_stride != 0 ? index * p.heap_stride : index << p.heap_shift;
+}
+
 bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p,
                       const DescriptorSlotSource* source, uint64_t* byte_offset, bool* cb_miss = nullptr) {
     if (p.heap_index_source == HeapIndexSource::RootConstantIndex) {
@@ -2029,8 +2036,7 @@ bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, cons
         if (p.heap_dword >= values.size()) {
             return false;
         }
-        // RDNA2 scalar-load soffset is 32-bit: the shifted index wraps in hardware.
-        *byte_offset = static_cast<uint32_t>((values[p.heap_dword] + p.heap_index_bias) << p.heap_shift);
+        *byte_offset = scaled_heap_index(p, values[p.heap_dword] + p.heap_index_bias);
         return true;
     }
     uint32_t dword = 0;
@@ -2041,7 +2047,7 @@ bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, cons
         return false;
     }
     // 32-bit, as above; a binding array element adds its index to the window base.
-    *byte_offset = static_cast<uint32_t>((((dword >> p.cb_bit_offset) & p.cb_mask) + p.heap_index_bias) << p.heap_shift);
+    *byte_offset = scaled_heap_index(p, ((dword >> p.cb_bit_offset) & p.cb_mask) + p.heap_index_bias);
     return true;
 }
 

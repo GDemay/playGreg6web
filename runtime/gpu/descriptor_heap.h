@@ -836,6 +836,10 @@ struct ShaderBinding {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    // Non-power-of-two descriptor step (G62, #482; S63 lane-indexed windows the stage scales with
+    // s_mul_i32, e.g. * 24): when non-zero the byte offset is index * heap_stride instead of
+    // index << heap_shift (32-bit wrapping either way). 0 = shift.
+    uint32_t heap_stride = 0;
     // Binding array element (G62, #482; a lane-indexed heap window bound as a WGSL binding_array):
     // element `array_index` of an array of `array_size` heap descriptors. The element reads the heap
     // index above plus array_index (the window starts at that index). array_size 0 = not an array.
@@ -860,7 +864,8 @@ inline bool same_join(const ShaderBinding& a, const ShaderBinding& b) noexcept {
            a.heap_index_parameter == b.heap_index_parameter && a.heap_index_dword == b.heap_index_dword &&
            a.heap_shift == b.heap_shift && a.heap_index_source == b.heap_index_source &&
            a.cb_table_slot == b.cb_table_slot && a.cb_byte_offset == b.cb_byte_offset &&
-           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.array_size == b.array_size &&
+           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.heap_stride == b.heap_stride &&
+           a.array_size == b.array_size &&
            a.array_index == b.array_index && a.table_parameter == b.table_parameter &&
            a.table_slot == b.table_slot && a.inline_sampler == b.inline_sampler &&
            std::memcmp(&a.sampler, &b.sampler, sizeof(a.sampler)) == 0;
@@ -890,6 +895,7 @@ struct PlanEntry {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    uint32_t heap_stride = 0;      // HeapIndexed: non-zero = byte offset is index * heap_stride (ShaderBinding::heap_stride)
     uint32_t heap_index_bias = 0;  // HeapIndexed: added to the index (binding array element, ShaderBinding::array_index)
     SamplerDesc sampler{};                     // InlineSampler
 };
