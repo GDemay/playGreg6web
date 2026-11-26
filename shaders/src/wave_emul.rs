@@ -4454,6 +4454,472 @@ pub fn rdna_wave_helpers_wgsl(prefix: &str, helpers: &[RdnaWaveHelper]) -> Strin
 }
 
 // ---------------------------------------------------------------------------
+// S69: RDNA2 scalar bitmask, compute workgroup wave exchange, native subgroup,
+//      and GS_ALLOC_REQ WGSL helper emitters
+// ---------------------------------------------------------------------------
+
+/// Pure WGSL scalar bitmask helpers matching exact AMD RDNA2 (GFX10.3) `SOP1` bitmask semantics
+/// (`s_bcnt1_i32_b32/b64`, `s_ff0_i32_b32/b64`, `s_ff1_i32_b32/b64`, `s_flbit_i32_b32/b64`,
+/// `s_flbit_i32`, `s_flbit_i32_i64`).
+///
+/// Every helper is pure WGSL (no workgroup storage, no module-scope `let`, no shadowed builtins),
+/// returns `0xffffffffu` (`-1`) on the RDNA2 not-found sentinel cases, and validates in both
+/// compute and fragment shaders under baseline WebGPU (`Capabilities::empty()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RdnaBitmaskHelper {
+    /// `s_bcnt1_i32_b32`: popcount of a 32-bit mask.
+    Bcnt1B32,
+    /// `s_bcnt1_i32_b64`: popcount of a 64-bit ballot mask (`vec2<u32>`).
+    Bcnt1B64,
+    /// `s_ff0_i32_b32`: index of lowest 0-bit (`0..=31`), or `0xffffffffu` if all ones.
+    Ff0B32,
+    /// `s_ff0_i32_b64`: index of lowest 0-bit (`0..=63`), or `0xffffffffu` if all ones.
+    Ff0B64,
+    /// `s_ff1_i32_b32`: index of lowest 1-bit (`0..=31`), or `0xffffffffu` if zero.
+    Ff1B32,
+    /// `s_ff1_i32_b64`: index of lowest 1-bit (`0..=63`), or `0xffffffffu` if zero.
+    Ff1B64,
+    /// `s_flbit_i32_b32`: count leading zeros (`0..=31`), or `0xffffffffu` if zero.
+    FlbitB32,
+    /// `s_flbit_i32_b64`: count leading zeros (`0..=63`), or `0xffffffffu` if zero.
+    FlbitB64,
+    /// `s_flbit_i32`: count leading sign bits of signed 32-bit integer, or `0xffffffffu` if `0`/`-1`.
+    FlbitI32,
+    /// `s_flbit_i32_i64`: count leading sign bits of signed 64-bit integer, or `0xffffffffu` if `0`/`-1`.
+    FlbitI64,
+}
+
+impl RdnaBitmaskHelper {
+    pub const ALL: [Self; 10] = [
+        Self::Bcnt1B32,
+        Self::Bcnt1B64,
+        Self::Ff0B32,
+        Self::Ff0B64,
+        Self::Ff1B32,
+        Self::Ff1B64,
+        Self::FlbitB32,
+        Self::FlbitB64,
+        Self::FlbitI32,
+        Self::FlbitI64,
+    ];
+
+    pub const fn function_suffix(self) -> &'static str {
+        match self {
+            Self::Bcnt1B32 => "s_bcnt1_i32_b32",
+            Self::Bcnt1B64 => "s_bcnt1_i32_b64",
+            Self::Ff0B32 => "s_ff0_i32_b32",
+            Self::Ff0B64 => "s_ff0_i32_b64",
+            Self::Ff1B32 => "s_ff1_i32_b32",
+            Self::Ff1B64 => "s_ff1_i32_b64",
+            Self::FlbitB32 => "s_flbit_i32_b32",
+            Self::FlbitB64 => "s_flbit_i32_b64",
+            Self::FlbitI32 => "s_flbit_i32",
+            Self::FlbitI64 => "s_flbit_i32_i64",
+        }
+    }
+
+    pub fn function_name(self, prefix: &str) -> String {
+        format!("{prefix}{}", self.function_suffix())
+    }
+
+    fn source(self, prefix: &str) -> String {
+        let name = self.function_name(prefix);
+        let body = match self {
+            Self::Bcnt1B32 => "(mask: u32) -> u32 {\n    return countOneBits(mask);\n}",
+            Self::Bcnt1B64 => {
+                "(mask: vec2<u32>) -> u32 {\n    return countOneBits(mask.x) + countOneBits(mask.y);\n}"
+            }
+            Self::Ff0B32 => {
+                "(mask: u32) -> u32 {\n    let inv = ~mask;\n    return select(firstTrailingBit(inv), 0xffffffffu, inv == 0u);\n}"
+            }
+            Self::Ff0B64 => {
+                "(mask: vec2<u32>) -> u32 {\n    let inv = ~mask;\n    let hi = select(0xffffffffu, 32u + firstTrailingBit(inv.y), inv.y != 0u);\n    return select(hi, firstTrailingBit(inv.x), inv.x != 0u);\n}"
+            }
+            Self::Ff1B32 => {
+                "(mask: u32) -> u32 {\n    return select(firstTrailingBit(mask), 0xffffffffu, mask == 0u);\n}"
+            }
+            Self::Ff1B64 => {
+                "(mask: vec2<u32>) -> u32 {\n    let hi = select(0xffffffffu, 32u + firstTrailingBit(mask.y), mask.y != 0u);\n    return select(hi, firstTrailingBit(mask.x), mask.x != 0u);\n}"
+            }
+            Self::FlbitB32 => {
+                "(mask: u32) -> u32 {\n    return select(countLeadingZeros(mask), 0xffffffffu, mask == 0u);\n}"
+            }
+            Self::FlbitB64 => {
+                "(mask: vec2<u32>) -> u32 {\n    let lo = select(0xffffffffu, 32u + countLeadingZeros(mask.x), mask.x != 0u);\n    return select(lo, countLeadingZeros(mask.y), mask.y != 0u);\n}"
+            }
+            Self::FlbitI32 => {
+                "(val: u32) -> u32 {\n    let norm = select(val, ~val, (val & 0x80000000u) != 0u);\n    return select(countLeadingZeros(norm), 0xffffffffu, norm == 0u);\n}"
+            }
+            Self::FlbitI64 => {
+                "(val: vec2<u32>) -> u32 {\n    let neg = (val.y & 0x80000000u) != 0u;\n    let norm = select(val, ~val, neg);\n    let lo = select(0xffffffffu, 32u + countLeadingZeros(norm.x), norm.x != 0u);\n    return select(lo, countLeadingZeros(norm.y), norm.y != 0u);\n}"
+            }
+        };
+        format!("fn {name}{body}\n")
+    }
+}
+
+/// Emit standalone WGSL source for the requested [`RdnaBitmaskHelper`] functions (deduplicated,
+/// canonical order).
+pub fn rdna_bitmask_helpers_wgsl(prefix: &str, helpers: &[RdnaBitmaskHelper]) -> String {
+    let selected: BTreeSet<RdnaBitmaskHelper> = helpers.iter().copied().collect();
+    let mut out = String::new();
+    for (index, helper) in selected.into_iter().enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        out.push_str(&helper.source(prefix));
+    }
+    out
+}
+
+/// Configuration for generating a workgroup-shared WGSL compute wave emulation library via
+/// [`rdna_compute_wave_emul_wgsl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RdnaComputeWaveEmulConfig {
+    pub wave_size: WaveSize,
+    /// Total threads per compute workgroup (`1..=1024`).
+    pub workgroup_threads: u32,
+    pub prefix: String,
+}
+
+impl RdnaComputeWaveEmulConfig {
+    pub fn new(wave_size: WaveSize, workgroup_threads: u32) -> Self {
+        Self {
+            wave_size,
+            workgroup_threads: workgroup_threads.clamp(1, 1024),
+            prefix: DEFAULT_HELPER_PREFIX.to_string(),
+        }
+    }
+
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.prefix = prefix.to_string();
+        self
+    }
+}
+
+/// Emit a complete, self-contained, baseline-WebGPU (`Capabilities::empty()`) WGSL helper library
+/// emulating RDNA2 Wave32/Wave64 operations via `var<workgroup>` scratch arrays and
+/// `workgroupBarrier()`:
+///
+/// - `v_mbcnt_lo_u32_b32`, `v_mbcnt_hi_u32_b32`, `v_mbcnt_u64`
+/// - `s_bcnt1_i32_b32/b64`, `s_ff0_i32_b32/b64`, `s_ff1_i32_b32/b64`, `s_flbit_i32_b32/b64`,
+///   `s_flbit_i32`, `s_flbit_i32_i64`
+/// - `wave_ballot32`, `wave_ballot64` (`v_cmp_*` -> 32/64-bit lane mask)
+/// - `v_readfirstlane_b32`, `v_readlane_b32`, `wave_shuffle_b32`, `wave_shuffle_xor_b32`
+/// - `ds_swizzle_b32` (quad permute `QDMode`, butterfly/XOR/FFT/mask `Bitmode`)
+/// - `ds_bpermute_b32` (pull by `byte_addr >> 2`) and `ds_permute_b32` (scatter/push with exact
+///   RDNA2 highest-lane-wins semantics and zero data races)
+pub fn rdna_compute_wave_emul_wgsl(config: &RdnaComputeWaveEmulConfig) -> String {
+    let p = if config.prefix.is_empty()
+        || !is_wgsl_identifier(config.prefix.trim_end_matches('_'))
+    {
+        DEFAULT_HELPER_PREFIX
+    } else {
+        config.prefix.as_str()
+    };
+    let threads = config.workgroup_threads.clamp(1, 1024);
+    let lanes = config.wave_size.lane_count();
+    let lane_mask = config.wave_size.lane_mask();
+    let wave_shift = config.wave_size.wave_shift();
+    let wave_base_mask = config.wave_size.wave_base_mask();
+    let num_waves = threads.div_ceil(lanes).max(1);
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "// RDNA2 Wave{lanes} compute workgroup emulation library ({threads} threads, {num_waves} wave(s))"
+    );
+    let _ = writeln!(out, "const {p}WAVE_LANES: u32 = {lanes}u;");
+    let _ = writeln!(out, "const {p}WAVE_LANE_MASK: u32 = {lane_mask}u;");
+    let _ = writeln!(out, "const {p}WG_THREADS: u32 = {threads}u;");
+    let _ = writeln!(out, "var<workgroup> {p}wave_scratch: array<u32, {threads}>;");
+    let _ = writeln!(out, "var<workgroup> {p}wave_dst_lane: array<u32, {threads}>;");
+    let _ = writeln!(
+        out,
+        "var<workgroup> {p}wave_ballot_lo: array<atomic<u32>, {num_waves}>;"
+    );
+    let _ = writeln!(
+        out,
+        "var<workgroup> {p}wave_ballot_hi: array<atomic<u32>, {num_waves}>;\n"
+    );
+
+    // Pure scalar bitmask helpers (`s_bcnt1_*`, `s_ff0_*`, `s_ff1_*`, `s_flbit_*`).
+    out.push_str(&rdna_bitmask_helpers_wgsl(p, &RdnaBitmaskHelper::ALL));
+    out.push('\n');
+
+    let _ = writeln!(
+        out,
+        "fn {p}wave_lane(local_idx: u32) -> u32 {{
+    return local_idx & {lane_mask}u;
+}}
+
+fn {p}wave_base(local_idx: u32) -> u32 {{
+    return local_idx & {wave_base_mask:#x}u;
+}}
+
+fn {p}wave_index(local_idx: u32) -> u32 {{
+    return local_idx >> {wave_shift}u;
+}}
+
+fn {p}v_mbcnt_lo_u32_b32(mask: u32, acc: u32, local_idx: u32) -> u32 {{
+    let lane = local_idx & {lane_mask}u;
+    let partial = (1u << (lane & 31u)) - 1u;
+    let low_mask = select(partial, 0xffffffffu, lane >= 32u);
+    return countOneBits(mask & low_mask) + acc;
+}}
+
+fn {p}v_mbcnt_hi_u32_b32(mask: u32, acc: u32, local_idx: u32) -> u32 {{
+    let lane = local_idx & {lane_mask}u;
+    let partial = (1u << (lane & 31u)) - 1u;
+    let hi_mask = select(select(0u, partial, lane >= 32u), 0xffffffffu, lane >= 64u);
+    return countOneBits(mask & hi_mask) + acc;
+}}
+
+fn {p}v_mbcnt_u64(mask: vec2<u32>, local_idx: u32) -> u32 {{
+    let lo = {p}v_mbcnt_lo_u32_b32(mask.x, 0u, local_idx);
+    return {p}v_mbcnt_hi_u32_b32(mask.y, lo, local_idx);
+}}
+
+fn {p}wave_ballot64(local_idx: u32, predicate: bool) -> vec2<u32> {{
+    let lane = local_idx & {lane_mask}u;
+    let wid = local_idx >> {wave_shift}u;
+    if (lane == 0u) {{
+        atomicStore(&{p}wave_ballot_lo[wid], 0u);
+        atomicStore(&{p}wave_ballot_hi[wid], 0u);
+    }}
+    workgroupBarrier();
+    if (predicate) {{
+        let bit = 1u << (lane & 31u);
+        if (lane < 32u) {{
+            atomicOr(&{p}wave_ballot_lo[wid], bit);
+        }} else {{
+            atomicOr(&{p}wave_ballot_hi[wid], bit);
+        }}
+    }}
+    workgroupBarrier();
+    let lo = atomicLoad(&{p}wave_ballot_lo[wid]);
+    let hi = atomicLoad(&{p}wave_ballot_hi[wid]);
+    workgroupBarrier();
+    return vec2<u32>(lo, hi);
+}}
+
+fn {p}wave_ballot32(local_idx: u32, predicate: bool) -> u32 {{
+    return {p}wave_ballot64(local_idx, predicate).x;
+}}
+
+fn {p}v_readfirstlane_b32(local_idx: u32, value: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let out_val = {p}wave_scratch[base];
+    workgroupBarrier();
+    return out_val;
+}}
+
+fn {p}v_readlane_b32(local_idx: u32, value: u32, src_lane: u32) -> u32 {{
+    let base = local_idx & {wave_base_mask:#x}u;
+    {p}wave_scratch[local_idx] = value;
+    workgroupBarrier();
+    let slot = base + (src_lane & {lane_mask}u);
+    let safe_slot = min(slot, {threads}u - 1u);
+    let loaded = {p}wave_scratch[safe_slot];
+    workgroupBarrier();
+    return select(value, loaded, (src_lane < {lanes}u) && (slot < {threads}u));
+}}
+
+fn {p}wave_shuffle_b32(local_idx: u32, value: u32, src_lane: u32) -> u32 {{
+    return {p}v_readlane_b32(local_idx, value, src_lane);
+}}
+
+fn {p}wave_shuffle_xor_b32(local_idx: u32, value: u32, xor_mask: u32) -> u32 {{
+    let lane = local_idx & {lane_mask}u;
+    return {p}v_readlane_b32(local_idx, value, lane ^ (xor_mask & {lane_mask}u));
+}}
+
+fn {p}ds_swizzle_b32(local_idx: u32, value: u32, offset16: u32) -> u32 {{
+    let lane = local_idx & {lane_mask}u;
+    let qd_shift = (lane & 3u) * 2u;
+    let qd_lane = (lane & 0x3cu) | ((offset16 >> qd_shift) & 3u);
+    let and_mask = offset16 & 31u;
+    let or_mask = (offset16 >> 5u) & 31u;
+    let xor_mask = (offset16 >> 10u) & 31u;
+    let bit_lane = (lane & 32u) | ((((lane & 31u) & and_mask) | or_mask) ^ xor_mask);
+    let src_lane = select(bit_lane, qd_lane, (offset16 & 0x8000u) != 0u) & {lane_mask}u;
+    return {p}v_readlane_b32(local_idx, value, src_lane);
+}}
+
+fn {p}ds_bpermute_b32(local_idx: u32, byte_addr: u32, value: u32) -> u32 {{
+    let src_lane = (byte_addr >> 2u) & {lane_mask}u;
+    return {p}v_readlane_b32(local_idx, value, src_lane);
+}}
+
+// Forward permute (push): each lane publishes (dst_lane, value); each lane scans its wave in
+// ascending order so collisions resolve with exact RDNA2 highest-lane-wins semantics (0 if none).
+fn {p}ds_permute_b32(local_idx: u32, byte_addr: u32, value: u32) -> u32 {{
+    let lane = local_idx & {lane_mask}u;
+    let base = local_idx & {wave_base_mask:#x}u;
+    let dst_lane = (byte_addr >> 2u) & {lane_mask}u;
+    {p}wave_scratch[local_idx] = value;
+    {p}wave_dst_lane[local_idx] = dst_lane;
+    workgroupBarrier();
+    let wave_end = min(base + {lanes}u, {threads}u);
+    var result: u32 = 0u;
+    for (var s: u32 = base; s < wave_end; s = s + 1u) {{
+        if ({p}wave_dst_lane[s] == lane) {{
+            result = {p}wave_scratch[s];
+        }}
+    }}
+    workgroupBarrier();
+    return result;
+}}"
+    );
+    out
+}
+
+/// Emit a native WebGPU subgroups WGSL helper library for RDNA2 wave ops
+/// (`v_mbcnt_lo/hi_u32_b32`, `s_bcnt1_i32_b64`, `s_ff0`/`s_ff1`/`s_flbit`, `wave_ballot32/64`,
+/// `v_readfirstlane_b32`, `v_readlane_b32`, `wave_shuffle_b32`, `wave_shuffle_xor_b32`,
+/// `ds_swizzle_b32`, `ds_bpermute_b32`).
+///
+/// Prepend [`WGSL_SUBGROUPS_ENABLE`] (`enable subgroups;\n`) when submitting to a WebGPU adapter
+/// with `subgroups` enabled; it is omitted here so `naga::front::wgsl::parse_str` parses and
+/// validates the emitted helpers directly under `Capabilities::SUBGROUP` (matching
+/// [`WaveLoweringReport::wgsl_preamble`]).
+pub fn rdna_native_subgroup_wave_wgsl(prefix: &str) -> String {
+    let p = if prefix.is_empty() || !is_wgsl_identifier(prefix.trim_end_matches('_')) {
+        DEFAULT_HELPER_PREFIX
+    } else {
+        prefix
+    };
+    let mut out = String::new();
+    out.push_str("// Native WebGPU subgroups RDNA2 wave library (prepend WGSL_SUBGROUPS_ENABLE for Dawn/Tint)\n");
+    out.push_str(&rdna_bitmask_helpers_wgsl(p, &RdnaBitmaskHelper::ALL));
+    out.push('\n');
+    let _ = writeln!(
+        out,
+        "fn {p}v_mbcnt_lo_u32_b32(mask: u32, acc: u32, sg_lane: u32) -> u32 {{
+    let partial = (1u << (sg_lane & 31u)) - 1u;
+    let low_mask = select(partial, 0xffffffffu, sg_lane >= 32u);
+    return countOneBits(mask & low_mask) + acc;
+}}
+
+fn {p}v_mbcnt_hi_u32_b32(mask: u32, acc: u32, sg_lane: u32) -> u32 {{
+    let partial = (1u << (sg_lane & 31u)) - 1u;
+    let hi_mask = select(select(0u, partial, sg_lane >= 32u), 0xffffffffu, sg_lane >= 64u);
+    return countOneBits(mask & hi_mask) + acc;
+}}
+
+fn {p}wave_ballot64(predicate: bool) -> vec2<u32> {{
+    return subgroupBallot(predicate).xy;
+}}
+
+fn {p}wave_ballot32(predicate: bool) -> u32 {{
+    return subgroupBallot(predicate).x;
+}}
+
+fn {p}v_readfirstlane_b32(value: u32) -> u32 {{
+    return subgroupBroadcastFirst(value);
+}}
+
+fn {p}v_readlane_b32(value: u32, src_lane: u32) -> u32 {{
+    return subgroupShuffle(value, src_lane);
+}}
+
+fn {p}wave_shuffle_b32(value: u32, src_lane: u32) -> u32 {{
+    return subgroupShuffle(value, src_lane);
+}}
+
+fn {p}wave_shuffle_xor_b32(value: u32, xor_mask: u32) -> u32 {{
+    return subgroupShuffleXor(value, xor_mask);
+}}
+
+fn {p}ds_swizzle_b32(sg_lane: u32, value: u32, offset16: u32) -> u32 {{
+    let clamped = sg_lane & 63u;
+    let qd_shift = (clamped & 3u) * 2u;
+    let qd_lane = (clamped & 0x3cu) | ((offset16 >> qd_shift) & 3u);
+    let and_mask = offset16 & 31u;
+    let or_mask = (offset16 >> 5u) & 31u;
+    let xor_mask = (offset16 >> 10u) & 31u;
+    let bit_lane = (clamped & 32u) | ((((clamped & 31u) & and_mask) | or_mask) ^ xor_mask);
+    let src_lane = select(bit_lane, qd_lane, (offset16 & 0x8000u) != 0u);
+    return subgroupShuffle(value, src_lane);
+}}
+
+fn {p}ds_bpermute_b32(byte_addr: u32, value: u32, lane_mask: u32) -> u32 {{
+    let src_lane = (byte_addr >> 2u) & (lane_mask & 63u);
+    return subgroupShuffle(value, src_lane);
+}}"
+    );
+    out
+}
+
+/// Emit a standalone WGSL prelude for lowering RDNA2 `s_sendmsg(GS_ALLOC_REQ)` (`m0[10:0]` vertex
+/// count, `m0[22:12]` primitive count) into an indexed-indirect draw buffer allocation in a
+/// mesh-to-compute shader.
+///
+/// Validates under baseline WebGPU (`Capabilities::empty()`).
+pub fn rdna_gs_alloc_req_wgsl(
+    prefix: &str,
+    group: u32,
+    draw_args_binding: u32,
+    max_vertices: u32,
+    max_primitives: u32,
+    indices_per_primitive: u32,
+) -> String {
+    let p = if prefix.is_empty() || !is_wgsl_identifier(prefix.trim_end_matches('_')) {
+        DEFAULT_HELPER_PREFIX
+    } else {
+        prefix
+    };
+    let max_v = max_vertices.clamp(1, D3D_MAX_MESH_OUTPUT_VERTICES);
+    let max_p = max_primitives.clamp(1, D3D_MAX_MESH_OUTPUT_PRIMITIVES);
+    let ipp = indices_per_primitive.clamp(1, 3);
+
+    format!(
+        "// RDNA2 s_sendmsg(GS_ALLOC_REQ) meshlet allocation helper
+const {p}GS_MAX_VERTICES: u32 = {max_v}u;
+const {p}GS_MAX_PRIMITIVES: u32 = {max_p}u;
+const {p}GS_INDICES_PER_PRIM: u32 = {ipp}u;
+
+struct {p}GsAllocResult {{
+    vertex_count: u32,
+    primitive_count: u32,
+    primitive_base: u32,
+}}
+
+struct {p}GsDrawIndexedIndirectArgs {{
+    index_count: atomic<u32>,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+}}
+
+@group({group}) @binding({draw_args_binding}) var<storage, read_write> {p}gs_draw_args: {p}GsDrawIndexedIndirectArgs;
+var<workgroup> {p}gs_alloc_prim_base: u32;
+
+// Unpack GFX10.3 M0 register for MSG_GS_ALLOC_REQ: m0[10:0] = vertex count, m0[22:12] = primitive count.
+fn {p}decode_gs_alloc_m0(m0: u32) -> vec2<u32> {{
+    let verts = min(m0 & 0x7ffu, {p}GS_MAX_VERTICES);
+    let prims = min((m0 >> 12u) & 0x7ffu, {p}GS_MAX_PRIMITIVES);
+    return vec2<u32>(verts, prims);
+}}
+
+// Must be called in workgroup-uniform control flow by every lane of the mesh workgroup.
+fn {p}gs_alloc_req(local_idx: u32, m0: u32) -> {p}GsAllocResult {{
+    let counts = {p}decode_gs_alloc_m0(m0);
+    if (local_idx == 0u) {{
+        let added = counts.y * {p}GS_INDICES_PER_PRIM;
+        {p}gs_alloc_prim_base = atomicAdd(&{p}gs_draw_args.index_count, added) / {p}GS_INDICES_PER_PRIM;
+    }}
+    let base = workgroupUniformLoad(&{p}gs_alloc_prim_base);
+    return {p}GsAllocResult(counts.x, counts.y, base);
+}}
+"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Mesh-compute lowering helpers
 // ---------------------------------------------------------------------------
 
@@ -5935,6 +6401,7 @@ mod interp {
                 })
             }
             MathFunction::CountOneBits => map1(a, &|x| Val::U(x.u().count_ones())),
+            MathFunction::CountLeadingZeros => map1(a, &|x| Val::U(x.u().leading_zeros())),
             MathFunction::FirstTrailingBit => map1(a, &|x| {
                 let v = x.u();
                 Val::U(if v == 0 { u32::MAX } else { v.trailing_zeros() })
@@ -8295,5 +8762,156 @@ fn main(@builtin(local_invocation_index) li: u32) {
             );
             validate_wgsl_baseline(&combined);
         }
+    }
+
+    #[test]
+    fn s69_rdna_bitmask_helpers_execute_exact_rdna2_semantics() {
+        let src = rdna_bitmask_helpers_wgsl("b_", &RdnaBitmaskHelper::ALL);
+        let module = validate_wgsl_baseline(&src);
+        assert_no_module_scope_let_or_shadowed_builtins(&src, "rdna_bitmask_helpers_wgsl");
+
+        let call = |h: RdnaBitmaskHelper, args: Vec<Val>| {
+            call_function(&module, &h.function_name("b_"), args).u()
+        };
+
+        for &v in &[0u32, 1, 0x10, 0x0000_CCCC, 0x4000_0000, 0x7FFF_FFFF, 0x8000_0000, 0xFFFF_FFFE, u32::MAX] {
+            assert_eq!(call(RdnaBitmaskHelper::Bcnt1B32, vec![Val::U(v)]), v.count_ones());
+            let exp_ff0 = if v == u32::MAX { u32::MAX } else { (!v).trailing_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::Ff0B32, vec![Val::U(v)]), exp_ff0, "ff0({v:#x})");
+            let exp_ff1 = if v == 0 { u32::MAX } else { v.trailing_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::Ff1B32, vec![Val::U(v)]), exp_ff1, "ff1({v:#x})");
+            let exp_flb = if v == 0 { u32::MAX } else { v.leading_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::FlbitB32, vec![Val::U(v)]), exp_flb, "flbit_b32({v:#x})");
+            let norm = if (v & 0x8000_0000) != 0 { !v } else { v };
+            let exp_flbi = if norm == 0 { u32::MAX } else { norm.leading_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::FlbitI32, vec![Val::U(v)]), exp_flbi, "flbit_i32({v:#x})");
+        }
+
+        for &v in &[
+            0u64,
+            1,
+            0x8000_0000,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x4000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0xFFFF_FFFF_FFFF_FFFE,
+            u64::MAX,
+        ] {
+            let p = Val::u64_pair(v);
+            assert_eq!(call(RdnaBitmaskHelper::Bcnt1B64, vec![p.clone()]), v.count_ones());
+            let exp_ff0 = if v == u64::MAX { u32::MAX } else { (!v).trailing_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::Ff0B64, vec![p.clone()]), exp_ff0, "ff0_b64({v:#x})");
+            let exp_ff1 = if v == 0 { u32::MAX } else { v.trailing_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::Ff1B64, vec![p.clone()]), exp_ff1, "ff1_b64({v:#x})");
+            let exp_flb = if v == 0 { u32::MAX } else { v.leading_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::FlbitB64, vec![p.clone()]), exp_flb, "flbit_b64({v:#x})");
+            let norm = if (v & (1u64 << 63)) != 0 { !v } else { v };
+            let exp_flbi = if norm == 0 { u32::MAX } else { norm.leading_zeros() };
+            assert_eq!(call(RdnaBitmaskHelper::FlbitI64, vec![p]), exp_flbi, "flbit_i64({v:#x})");
+        }
+    }
+
+    #[test]
+    fn s69_compute_wave_emul_and_gs_alloc_execute_bit_exact() {
+        // Execute Wave32 (64 threads = 2 waves) and Wave64 (64 threads = 1 wave)
+        for wave_size in [WaveSize::Wave32, WaveSize::Wave64] {
+            let cfg = RdnaComputeWaveEmulConfig::new(wave_size, 64).with_prefix("e_");
+            let lib = rdna_compute_wave_emul_wgsl(&cfg);
+            let shader = format!(
+                "{lib}
+@group(0) @binding(0) var<storage, read_write> out: array<u32, 512>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(local_invocation_index) li: u32) {{
+    let pred = (li % 3u) == 0u;
+    let b64 = e_wave_ballot64(li, pred);
+    let mb = e_v_mbcnt_u64(b64, li);
+    let val = li * 10u + 7u;
+    let rf = e_v_readfirstlane_b32(li, val);
+    let rl = e_v_readlane_b32(li, val, 5u);
+    let swz_qd = e_ds_swizzle_b32(li, val, 0x801bu); // quad reverse
+    let bperm = e_ds_bpermute_b32(li, ((li ^ 2u) << 2u), val);
+    // Forward permute with intentional collision: lanes 0 and 1 both target lane 0 (lane 1 wins),
+    // lane 1 is unaddressed (gets 0), other lanes swap with lane ^ 1.
+    let lane = e_wave_lane(li);
+    let dst_lane = select(lane ^ 1u, 0u, lane < 2u);
+    let perm = e_ds_permute_b32(li, dst_lane << 2u, val);
+    let base = li * 8u;
+    out[base + 0u] = b64.x;
+    out[base + 1u] = b64.y;
+    out[base + 2u] = mb;
+    out[base + 3u] = rf;
+    out[base + 4u] = rl;
+    out[base + 5u] = swz_qd;
+    out[base + 6u] = bperm;
+    out[base + 7u] = perm;
+}}
+"
+            );
+            let module = validate_wgsl_baseline(&shader);
+            assert_no_module_scope_let_or_shadowed_builtins(&shader, "s69 compute wave emul");
+            let mem = Memory::new(&module);
+            run_compute(&module, &mem, "main", [1, 1, 1]);
+            let out = words_of(&mem, &module, "out");
+            let w = wave_size.lane_count();
+            for li in 0..64u32 {
+                let wbase = li & !(w - 1);
+                let lane = li - wbase;
+                let mut exp_ballot = 0u64;
+                for l in 0..w {
+                    if (wbase + l) % 3 == 0 {
+                        exp_ballot |= 1u64 << l;
+                    }
+                }
+                let exp_mb = (exp_ballot & ((1u64 << lane) - 1)).count_ones();
+                let base = (li * 8) as usize;
+                assert_eq!(out[base], exp_ballot as u32, "{wave_size:?} li={li} ballot.x");
+                assert_eq!(out[base + 1], (exp_ballot >> 32) as u32, "{wave_size:?} li={li} ballot.y");
+                assert_eq!(out[base + 2], exp_mb, "{wave_size:?} li={li} mbcnt");
+                assert_eq!(out[base + 3], wbase * 10 + 7, "{wave_size:?} li={li} readfirstlane");
+                assert_eq!(out[base + 4], (wbase + 5) * 10 + 7, "{wave_size:?} li={li} readlane(5)");
+                let qd_src = wbase + ((lane & !3) | (3 - (lane & 3)));
+                assert_eq!(out[base + 5], qd_src * 10 + 7, "{wave_size:?} li={li} swizzle quad");
+                let bp_src = wbase + ((lane ^ 2) & (w - 1));
+                assert_eq!(out[base + 6], bp_src * 10 + 7, "{wave_size:?} li={li} bpermute");
+                let exp_perm = if lane == 0 {
+                    (wbase + 1) * 10 + 7 // lane 1 > lane 0 wins collision
+                } else if lane == 1 {
+                    0 // unaddressed lane gets 0
+                } else {
+                    (wbase + (lane ^ 1)) * 10 + 7
+                };
+                assert_eq!(out[base + 7], exp_perm, "{wave_size:?} li={li} permute");
+            }
+        }
+
+        // Execute GS_ALLOC_REQ helper across 2 mesh workgroups (packing m0 with clamp + atomicAdd)
+        let gs = rdna_gs_alloc_req_wgsl("m_", 0, 0, 64, 100, 3);
+        let gs_shader = format!(
+            "{gs}
+@group(0) @binding(1) var<storage, read_write> results: array<u32, 6>;
+
+@compute @workgroup_size(8)
+fn main(
+    @builtin(local_invocation_index) li: u32,
+    @builtin(workgroup_id) wg: vec3<u32>,
+) {{
+    // wg 0 requests 40 verts, 30 prims; wg 1 requests 200 verts (clamped to 64), 150 prims (clamped to 100)
+    let m0 = select(200u | (150u << 12u), 40u | (30u << 12u), wg.x == 0u);
+    let r = m_gs_alloc_req(li, m0);
+    if (li == 0u) {{
+        results[wg.x * 3u + 0u] = r.vertex_count;
+        results[wg.x * 3u + 1u] = r.primitive_count;
+        results[wg.x * 3u + 2u] = r.primitive_base;
+    }}
+}}
+"
+        );
+        let gs_mod = validate_wgsl_baseline(&gs_shader);
+        let gs_mem = Memory::new(&gs_mod);
+        run_compute(&gs_mod, &gs_mem, "main", [2, 1, 1]);
+        let res = words_of(&gs_mem, &gs_mod, "results");
+        assert_eq!(res, vec![40, 30, 0, 64, 100, 30]);
     }
 }
