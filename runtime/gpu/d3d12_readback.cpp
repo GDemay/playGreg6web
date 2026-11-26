@@ -1,5 +1,6 @@
 #include "gpu/d3d12_readback.h"
 
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -44,7 +45,7 @@ uint64_t ReadbackGate::completed_locked() {
         count_work(Work::ReadbacksCompleted, reported - reported_seen_);
         reported_seen_ = reported;
     }
-    const uint64_t done = std::max(reported, forced_);
+    const uint64_t done = reported;
     // The consumer wrote these ranges: lifted code tracking window writes must see them (O37).
     while (seen_ < done && !ranges_.empty()) {
         os::guest_window::mark_written(ranges_.front().va, static_cast<size_t>(ranges_.front().bytes));
@@ -76,35 +77,24 @@ size_t ReadbackGate::poll() {
     std::vector<std::function<void()>> ready;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        uint64_t done = completed_locked();
+        const uint64_t done = completed_locked();
         const auto now = std::chrono::steady_clock::now();
         while (!parked_.empty()) {
             Parked& p = parked_.front();
-            if (done >= p.needed) {
-                timeouts_in_a_row_ = 0;
-            } else if (now - p.at >= timeout_) {
-                // No answer: release it anyway rather than hang the title (counted).
-                ++timeouts_;
-                count_work(Work::ReadbackTimeouts);
-                forced_ = std::max(forced_, p.needed);
-                done = completed_locked();
-                if (++timeouts_in_a_row_ >= kMaxTimeoutsInARow && hold_) {
-                    hold_ = false;
-                    os::log("d3d12_xs: GPU read-back consumer does not answer; queue signals are no longer held");
+            if (done < p.needed) {
+                // Never publish a completion before the bytes arrived: the signal stays held. The
+                // timeout is a diagnostic only (once per held signal, logged loudly).
+                if (!p.warned && now - p.at >= timeout_) {
+                    p.warned = true;
+                    ++timeouts_;
+                    count_work(Work::ReadbackTimeouts);
+                    os::log("d3d12_xs: WARNING GPU read-back not completed after " + std::to_string(timeout_.count()) +
+                            " ms; the guarding fence stays unsignalled (consumer stalled or present-bound?)");
                 }
-            } else {
                 break;
             }
             ready.push_back(std::move(p.release));
             parked_.pop_front();
-        }
-        if (!hold_) {
-            // Given up: everything still parked goes now, in order.
-            for (Parked& p : parked_) {
-                forced_ = std::max(forced_, p.needed);
-                ready.push_back(std::move(p.release));
-            }
-            parked_.clear();
         }
     }
     for (auto& r : ready) {
