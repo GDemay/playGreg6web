@@ -586,6 +586,10 @@ struct TrackedTexture {
     bool window_indexed = false;
     bool window_checked = false;
     bool window_dirty = true;
+    // G75 (#663): consecutive full-surface (>= 75% bands changed) dirty frames in a translated
+    // window. Once >= 3, sync_bound_texture_memory skips per-band content_hash() while dirty marks
+    // keep arriving, and resets to 0 on any clean/unmarked or partial-update frame.
+    uint8_t streaming_full_frames = 0;
     // Native shared-view write tracking (no translated window): the range the cursor below watches
     // and whether the last complete check (zero scan or hash) of it is still current. Cleared when
     // os::take_written_view_pages reports pages written, or does not cover the range.

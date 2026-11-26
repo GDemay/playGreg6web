@@ -863,9 +863,13 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             cur.window_indexed_va = cpu_va;
             cur.window_indexed_size = primary_size;
             cur.window_checked = false;
+            cur.streaming_full_frames = 0;
         }
         if (!dirty_now && cur.window_checked) {
             unmarked = true;
+            if (!verify_marks) {
+                cur.streaming_full_frames = 0;
+            }
         } else {
             // Clear before reading so a write racing with the scan re-marks the slot for the next sync.
             cur.window_dirty = false;
@@ -1002,9 +1006,19 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         using_default_detile && tt.layout == gfx10::kConsoleLinearLayout && whole_surface &&
         subs.size() == 1u && mips == 1u && layers == 1u && d == 1u && !convert_norm16 && !convert_a8 &&
         tiled_bytes == console_linear_bytes && src_size >= console_linear_bytes;
+    // G75 (#663): Streaming full-frame textures (e.g. 4K Bink2 Y/U/V planes) modify >= 75% of
+    // bands every dirty frame. After 3 consecutive full-surface dirty updates in a write-marked
+    // translated window, skip per-band content_hash() while dirty marks keep arriving.
+    const bool streaming_eligible =
+        in_window && !verify_marks && (single_console_linear_direct || single_linear_direct) &&
+        d == 1u && blocks_y > kUploadBandRows;
+    const bool skip_streaming_hash =
+        streaming_eligible && tt.ever_uploaded && tt.streaming_full_frames >= 3u;
     std::vector<uint64_t> direct_bands;
     uint64_t hash = 0;
-    if (single_linear_direct && d == 1u && blocks_y > kUploadBandRows) {
+    if (skip_streaming_hash) {
+        // Streaming fast path: skip content_hash() and emit full surface directly.
+    } else if (single_linear_direct && d == 1u && blocks_y > kUploadBandRows) {
         direct_bands.reserve((blocks_y + kUploadBandRows - 1u) / kUploadBandRows);
         for (uint32_t r = 0; r < blocks_y; r += kUploadBandRows) {
             const uint32_t n = std::min(kUploadBandRows, blocks_y - r);
@@ -1025,7 +1039,13 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     } else {
         hash = content_hash(src_data, src_size);
     }
-    if (tt.ever_uploaded && hash == tt.last_upload_hash) {
+    if (!skip_streaming_hash && tt.ever_uploaded && tt.last_upload_hash != 0 && hash == tt.last_upload_hash) {
+        if (streaming_eligible && tt.streaming_full_frames != 0) {
+            std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+            if (auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
+                it->second.streaming_full_frames = 0;
+            }
+        }
         note_window_checked();
         return false;
     }
@@ -1063,6 +1083,23 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         const uint64_t row_pitch = align_up(row_bytes, 256u);
         Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {},
                   nullptr, 0, 0, false, {}, {}};
+        if (skip_streaming_hash) {
+            if (single_console_linear_direct) {
+                st.borrowed = src_data;
+                st.borrowed_size = static_cast<size_t>(console_linear_bytes);
+                st.row_pitch = static_cast<uint32_t>(aligned_row_pitch);
+            } else {
+                st.borrowed = src_data;
+                st.borrowed_size = src_size;
+                if (row_pitch != row_bytes) {
+                    st.src_row_bytes = static_cast<uint32_t>(row_bytes);
+                    st.needs_row_pad = true;
+                }
+            }
+            st.runs.emplace_back(0u, by);
+            staged.push_back(std::move(st));
+            continue;
+        }
         if (single_console_linear_direct) {
             st.borrowed = src_data;
             st.borrowed_size = static_cast<size_t>(console_linear_bytes);
@@ -1195,7 +1232,12 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         TrackedTexture& cur = it->second;
         // Backlog 37: the size cap loosened since the last pass, so dropped top levels are due again.
         const bool cap_restore = cap_floor < cur.cap_floor_applied;
-        if (cur.ever_uploaded && cur.last_upload_hash == hash && !cap_restore) {
+        const bool was_ever_uploaded = cur.ever_uploaded;
+        if (!skip_streaming_hash && cur.ever_uploaded && cur.last_upload_hash != 0 && cur.last_upload_hash == hash &&
+            !cap_restore) {
+            if (streaming_eligible) {
+                cur.streaming_full_frames = 0;
+            }
             if (view_tracked) {
                 cur.view_checked = true;
                 cur.view_checked_cap = texture_budget().current_cap();
@@ -1206,7 +1248,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             }
             return false;
         }
-        cur.last_upload_hash = hash;
+        cur.last_upload_hash = skip_streaming_hash ? 0 : hash;
         cur.ever_uploaded = true;
         if (view_tracked) {
             cur.view_checked = true;
@@ -1230,24 +1272,50 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             if (st.sub.mip < cap_floor && seen == 0) {
                 continue;  // dropped top level under memory pressure: lower resolution, never uploaded
             }
+            std::vector<uint64_t>& prev = cur.subresource_bands[index];
+            if (skip_streaming_hash) {
+                prev.clear();
+                seen = 0;
+                if (st.runs.empty()) {
+                    st.runs.emplace_back(0u, st.rows);
+                }
+                if (&*out != &st) {
+                    *out = std::move(st);
+                }
+                ++out;
+                continue;
+            }
             if (seen == st.hash) {
+                if (streaming_eligible) {
+                    cur.streaming_full_frames = 0;
+                }
                 continue;  // unchanged
             }
-            if (seen == 0 && !single_known_nonzero && all_zero_bytes(st.data(), st.size())) {
+            if (seen == 0 && !(was_ever_uploaded && subs.size() == 1u) && !single_known_nonzero &&
+                all_zero_bytes(st.data(), st.size())) {
                 continue;  // still zero as the GPU texture was created
             }
-            std::vector<uint64_t>& prev = cur.subresource_bands[index];
             if (seen != 0 && !st.bands.empty() && prev.size() == st.bands.size()) {
+                uint32_t changed_bands = 0;
                 for (uint32_t b = 0; b < st.bands.size(); ++b) {
                     if (prev[b] == st.bands[b]) {
                         continue;
                     }
+                    ++changed_bands;
                     const uint32_t first = b * kUploadBandRows;
                     const uint32_t count = std::min(kUploadBandRows, st.rows - first);
                     if (!st.runs.empty() && st.runs.back().first + st.runs.back().second == first) {
                         st.runs.back().second += count;  // adjacent changed bands: one write
                     } else {
                         st.runs.emplace_back(first, count);
+                    }
+                }
+                if (streaming_eligible) {
+                    if (changed_bands * 4u >= st.bands.size() * 3u) {
+                        cur.streaming_full_frames =
+                            static_cast<uint8_t>(std::min<uint32_t>(uint32_t{cur.streaming_full_frames} + 1u, 8u));
+                    } else {
+                        cur.streaming_full_frames = 0;
                     }
                 }
             }
