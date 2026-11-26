@@ -60,6 +60,7 @@ add_library(playgta6_core STATIC
     gpu/drop_table.cpp
     gpu/rt_arena.cpp
     gpu/rt_bvh.cpp
+    gpu/rt_residency.cpp
     gpu/gpu_time.cpp
     gpu/d3d12_readback.cpp
     gpu/gfx10_descriptors.cpp
@@ -270,6 +271,13 @@ else()
     target_link_libraries(test_rt_bvh PRIVATE playgta6_core)
     target_include_directories(test_rt_bvh PRIVATE ../tests)
     add_test(NAME test_rt_bvh COMMAND test_rt_bvh)
+    add_executable(test_rt_residency ../tests/test_rt_residency.cpp)
+    target_link_libraries(test_rt_residency PRIVATE playgta6_core)
+    add_test(NAME test_rt_residency COMMAND test_rt_residency)
+    add_executable(test_rt_vectors_json ../tests/test_rt_vectors_json.cpp)
+    target_link_libraries(test_rt_vectors_json PRIVATE playgta6_core)
+    target_include_directories(test_rt_vectors_json PRIVATE ../tests)
+    add_test(NAME test_rt_vectors_json COMMAND test_rt_vectors_json ${CMAKE_CURRENT_SOURCE_DIR}/../tests/data/bvh_vectors.json)
     add_executable(test_gpu_time ../tests/test_gpu_time.cpp)
     target_link_libraries(test_gpu_time PRIVATE playgta6_core)
     add_test(NAME test_gpu_time COMMAND test_gpu_time)

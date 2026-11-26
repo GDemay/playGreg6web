@@ -54,7 +54,7 @@ constexpr uint32_t l2_index(uint64_t page) { return static_cast<uint32_t>(page &
 // Byte offset of a page slot inside its arena buffer.
 constexpr uint64_t slot_byte_offset(uint32_t slot) { return static_cast<uint64_t>(slot) * kPageBytes; }
 
-enum class SkipReason : uint8_t { RtOff, ArenaFull, NotResident, Atomic64, TranslatorPending, Count };
+enum class SkipReason : uint8_t { RtOff, ArenaFull, NotResident, Atomic64, TranslatorPending, StructuresUnavailable, Count };
 const char* skip_reason_name(SkipReason r);
 
 enum class Ensure : uint8_t { Resident, Uploaded, ArenaFull, TableFull, OutOfRange };
@@ -174,6 +174,8 @@ public:
     void mark_cpu_dirty(uint64_t page);
 
     bool is_resident(uint64_t page) const;
+    // True when a builder/trace program wrote the page (the CPU cannot trust guest memory for it).
+    bool is_gpu_owned(uint64_t page) const;
     // 0 when not resident. Mirrors exactly what the WGSL prelude computes.
     uint32_t lookup_entry(uint64_t addr) const;
 
