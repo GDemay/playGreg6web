@@ -3495,6 +3495,7 @@ class TestGpuTrace30FpsCadenceAndSanitization(unittest.TestCase):
                 "binding_audit",
                 "bink_video_audit",
                 "start_screen_skips",
+                "scene_pass_summary",
                 "fps30_analysis",
             ):
                 self.assertNotIn(opt_in_key, payload)
@@ -3505,6 +3506,500 @@ class TestGpuTrace30FpsCadenceAndSanitization(unittest.TestCase):
                 "over_budget_frames_30fps",
             ):
                 self.assertIn(cadence_key, payload)
+
+
+class TestGpuTraceScenePassSummary(unittest.TestCase):
+    """T104 tests for --scene-pass-summary and opcodes 36..38 indirect helpers."""
+
+    @staticmethod
+    def _make_key_with_vbuf(
+        *,
+        vs_shader: int = 0x1001,
+        ps_shader: int = 0x2001,
+        color_formats: tuple[int, ...] = (27,),
+        depth_format: int = 0,
+        vertex_buffer_slots: tuple[int, ...] = (),
+    ) -> bytes:
+        key = bytearray(
+            _make_pipeline_key(
+                vs_shader=vs_shader,
+                ps_shader=ps_shader,
+                color_formats=list(color_formats),
+                depth_format=depth_format,
+            )
+        )
+        if vertex_buffer_slots:
+            max_slot = max(vertex_buffer_slots) + 1
+            struct.pack_into("<II", key, 172, max_slot, len(vertex_buffer_slots))
+            for attr_idx, slot in enumerate(vertex_buffer_slots):
+                struct.pack_into("<IBB2x", key, 180 + 8 * slot, 32, 1, 1)  # stride=32, vertex, 1 attr
+                struct.pack_into("<IBBBx", key, 244 + 8 * attr_idx, 0, 30, attr_idx, slot)
+        return bytes(key)
+
+    @staticmethod
+    def _color_att(tex_id: int, load_op: int = 2, store_op: int = 1) -> dict:
+        return {"texture_id": tex_id, "load_op": load_op, "store_op": store_op}
+
+    @staticmethod
+    def _depth_att(tex_id: int, load_op: int = 2, store_op: int = 1) -> dict:
+        return {"texture_id": tex_id, "depth_load_op": load_op, "depth_store_op": store_op}
+
+    def test_indirect_encoders_and_decoded_trace_accounting(self) -> None:
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_buffer(10, 0x0180, 256),  # INDIRECT | STORAGE
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_begin_render_pass([self._color_att(gpu_trace.SWAPCHAIN_TEXTURE_ID)]),
+                gpu_trace.encode_draw_indirect(10, 0),
+                gpu_trace.encode_draw_indexed_indirect(10, 16),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_dispatch_indirect(10, 40),
+                gpu_trace.encode_present(),
+            ]
+        )
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.draw_indirect_calls, 1)
+        self.assertEqual(trace.draw_indexed_indirect_calls, 1)
+        self.assertEqual(trace.dispatch_indirect_calls, 1)
+        self.assertEqual(trace.draw_calls, 2)
+        self.assertEqual(trace.draw_indexed_calls, 1)
+        self.assertEqual(trace.compute_dispatches, 1)
+        self.assertEqual(trace.compute_passes, 1)
+        self.assertEqual(trace.frames[1].draw_indirect_calls, 1)
+        self.assertEqual(trace.frames[1].draw_indexed_indirect_calls, 1)
+        self.assertEqual(trace.frames[1].dispatch_indirect_calls, 1)
+        txt = gpu_trace.format_trace_text(trace)
+        self.assertIn("buffer=#10 offset=16", txt)
+        self.assertIn("buffer=#10 offset=40", txt)
+
+    def test_clean_3d_scene_passes_render_compute_indirect_mesh_and_rt_group3(self) -> None:
+        # Layouts:
+        # - bgl 100: storage buffer @binding(0) for compute write (meshlet/indirect output)
+        # - bgl 101: read-only-storage buffer @binding(0) for vertexless mesh draw
+        # - bgl 102: uniform buffer @binding(0) for normal draw
+        # - bgl 103: RT arena group 3 (push-constant @0 uniform + arena 16..19 storage + dir 20 ro-storage + stats 21 storage)
+        bgl_compute_out = gpu_trace.encode_create_bind_group_layout(
+            100, [(0, 0x4, 0, 1)]
+        )
+        bgl_mesh_read = gpu_trace.encode_create_bind_group_layout(
+            101, [(0, 0x1, 0, 2)]
+        )
+        bgl_uniform = gpu_trace.encode_create_bind_group_layout(
+            102, [(0, 0x3, 0, 0)]
+        )
+        bgl_rt_g3 = gpu_trace.encode_create_bind_group_layout(
+            103,
+            [
+                (0, 0x4, 0, 0),   # push constants (valid non-RT group-3 slot)
+                (16, 0x4, 0, 1),  # pg6_arena0
+                (17, 0x4, 0, 1),  # pg6_arena1
+                (18, 0x4, 0, 1),  # pg6_arena2
+                (19, 0x4, 0, 1),  # pg6_arena3
+                (20, 0x4, 0, 2),  # pg6_arena_dir
+                (21, 0x4, 0, 1),  # pg6_rt_stats
+            ],
+        )
+
+        # Pipeline layouts
+        pll_compute_out = gpu_trace.encode_create_pipeline_layout(200, [100])
+        pll_mesh_draw = gpu_trace.encode_create_pipeline_layout(201, [101])
+        pll_normal = gpu_trace.encode_create_pipeline_layout(202, [102])
+        pll_rt = gpu_trace.encode_create_pipeline_layout(203, [0, 0, 0, 103])
+
+        # Shaders
+        mod_vs = gpu_trace.encode_create_shader_module(300, 0, "@vertex fn vs_main() {}")
+        mod_fs = gpu_trace.encode_create_shader_module(301, 1, "@fragment fn fs_main() {}")
+        mod_cs = gpu_trace.encode_create_shader_module(302, 2, "@compute @workgroup_size(64) fn cs_main() {}")
+
+        # Buffers & textures
+        bufs = b"".join(
+            [
+                gpu_trace.encode_create_buffer(10, 0x0020, 4096),   # vertex buffer
+                gpu_trace.encode_create_buffer(11, 0x0010, 1024),   # index buffer
+                gpu_trace.encode_create_buffer(12, 0x0180, 1024),   # indirect args + storage (meshlet cull)
+                gpu_trace.encode_create_buffer(13, 0x0080, 4096),   # mesh output storage buffer
+                gpu_trace.encode_create_buffer(14, 0x0040, 256),    # uniform buffer
+                gpu_trace.encode_create_buffer(15, 0x0180, 256),    # dispatch indirect args
+                gpu_trace.encode_create_buffer(16, 0x0080, 65536),  # RT arena0
+                gpu_trace.encode_create_buffer(17, 0x0080, 65536),  # RT arena1
+                gpu_trace.encode_create_buffer(18, 0x0080, 65536),  # RT arena2
+                gpu_trace.encode_create_buffer(19, 0x0080, 65536),  # RT arena3
+                gpu_trace.encode_create_buffer(20, 0x0080, 16384),  # RT dir
+                gpu_trace.encode_create_buffer(21, 0x0080, 256),    # RT stats
+                gpu_trace.encode_create_buffer(22, 0x0080, 4096),   # normal compute scratch (not mesh!)
+            ]
+        )
+        texs = b"".join(
+            [
+                gpu_trace.encode_create_texture2(50, 1920, 1080, 48, usage_flags=0x10),  # depth32float
+                gpu_trace.encode_create_texture2(51, 1920, 1080, 40, usage_flags=0x10),  # rgba16float G0
+                gpu_trace.encode_create_texture2(52, 1920, 1080, 22, usage_flags=0x10),  # rgba8unorm G1
+                gpu_trace.encode_create_texture2(53, 1920, 1080, 40, usage_flags=0x10),  # rgba16float post
+            ]
+        )
+
+        # Bind groups
+        bgs = b"".join(
+            [
+                gpu_trace.encode_create_bind_group2(400, 100, [(0, 0, 12)]),  # compute -> indirect buf
+                gpu_trace.encode_create_bind_group2(401, 100, [(0, 0, 13)]),  # compute -> mesh output buf
+                gpu_trace.encode_create_bind_group2(402, 101, [(0, 0, 13)]),  # mesh draw reads buf 13
+                gpu_trace.encode_create_bind_group2(403, 102, [(0, 0, 14)]),  # normal uniform
+                gpu_trace.encode_create_bind_group2(404, 100, [(0, 0, 22)]),  # normal compute scratch
+                gpu_trace.encode_create_bind_group2(
+                    405,
+                    103,
+                    [
+                        (0, 0, 14),
+                        (16, 0, 16),
+                        (17, 0, 17),
+                        (18, 0, 18),
+                        (19, 0, 19),
+                        (20, 0, 20),
+                        (21, 0, 21),
+                    ],
+                ),
+            ]
+        )
+
+        # Pipelines
+        pipes = b"".join(
+            [
+                # 500: depth-only shadow pipeline (requires vertex buffer slot 0)
+                gpu_trace.encode_create_render_pipeline2(
+                    500, 300, 0, 202,
+                    self._make_key_with_vbuf(
+                        vs_shader=0x1111, ps_shader=0, color_formats=(), depth_format=48, vertex_buffer_slots=(0,)
+                    ),
+                ),
+                # 501: MRT G-buffer pipeline (vertexless mesh draw!)
+                gpu_trace.encode_create_render_pipeline2(
+                    501, 300, 301, 201,
+                    self._make_key_with_vbuf(
+                        vs_shader=0x1112, ps_shader=0x2222, color_formats=(40, 22), depth_format=48, vertex_buffer_slots=()
+                    ),
+                ),
+                # 502: Offscreen color-only post-process (vertexless, reads uniform)
+                gpu_trace.encode_create_render_pipeline2(
+                    502, 300, 301, 202,
+                    self._make_key_with_vbuf(
+                        vs_shader=0x1113, ps_shader=0x2223, color_formats=(40,), depth_format=0, vertex_buffer_slots=()
+                    ),
+                ),
+                # 503: Swapchain composite (vertexless)
+                gpu_trace.encode_create_render_pipeline2(
+                    503, 300, 301, 202,
+                    self._make_key_with_vbuf(
+                        vs_shader=0x1114, ps_shader=0x2224, color_formats=(27,), depth_format=0, vertex_buffer_slots=()
+                    ),
+                ),
+                # 510: Compute pipeline writing storage buffer
+                gpu_trace.encode_create_compute_pipeline2(510, 302, 200, cs_shader=0x3331),
+                # 511: RT compute pipeline using group 3 arena slots 16..21
+                gpu_trace.encode_create_compute_pipeline2(511, 302, 203, cs_shader=0x3332),
+            ]
+        )
+
+        frame = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                # Compute pass 1: meshlet culling writes indirect buffer #12
+                gpu_trace.encode_set_compute_pipeline(510),
+                gpu_trace.encode_set_bind_group2(0, 400),
+                gpu_trace.encode_dispatch_compute(8, 1, 1),
+                # Render pass 1 (depth-only): shadow/z-prepass using DrawIndexedIndirect(#12) -> mesh pass #1
+                gpu_trace.encode_begin_render_pass([], depth_stencil=self._depth_att(50)),
+                gpu_trace.encode_set_pipeline(500),
+                gpu_trace.encode_set_bind_group2(0, 403),
+                gpu_trace.encode_set_vertex_buffer(0, 10, 0),
+                gpu_trace.encode_set_index_buffer(11, 1, 0),
+                gpu_trace.encode_draw_indexed_indirect(12, 0),
+                gpu_trace.encode_end_render_pass(),
+                # Compute pass 2: mesh shader compute writes #13
+                gpu_trace.encode_set_compute_pipeline(510),
+                gpu_trace.encode_set_bind_group2(0, 401),
+                gpu_trace.encode_dispatch_compute(16, 1, 1),
+                # Render pass 2 (MRT color+depth): vertexless mesh draw reading #13 -> mesh pass #2
+                gpu_trace.encode_begin_render_pass(
+                    [self._color_att(51), self._color_att(52)],
+                    depth_stencil=self._depth_att(50, load_op=1),
+                ),
+                gpu_trace.encode_set_pipeline(501),
+                gpu_trace.encode_set_bind_group2(0, 402),
+                gpu_trace.encode_draw(192, 1, 0, 0),
+                gpu_trace.encode_end_render_pass(),
+                # Compute pass 3: RT trace pass with group 3 bindings 16..21 + DispatchIndirect
+                gpu_trace.encode_set_compute_pipeline(511),
+                gpu_trace.encode_set_bind_group2(3, 405),
+                gpu_trace.encode_dispatch_compute(32, 32, 1),
+                gpu_trace.encode_dispatch_indirect(15, 0),
+                # Render pass 3 (color-only offscreen)
+                gpu_trace.encode_begin_render_pass([self._color_att(53)]),
+                gpu_trace.encode_set_pipeline(502),
+                gpu_trace.encode_set_bind_group2(0, 403),
+                gpu_trace.encode_draw(3, 1, 0, 0),
+                gpu_trace.encode_end_render_pass(),
+                # Compute pass 4: plain non-mesh compute pass (writes #22, never consumed by mesh/indirect)
+                gpu_trace.encode_set_compute_pipeline(510),
+                gpu_trace.encode_set_bind_group2(0, 404),
+                gpu_trace.encode_dispatch_compute(4, 4, 1),
+                # Render pass 4 (swapchain color-only)
+                gpu_trace.encode_begin_render_pass([self._color_att(gpu_trace.SWAPCHAIN_TEXTURE_ID)]),
+                gpu_trace.encode_set_pipeline(503),
+                gpu_trace.encode_set_bind_group2(0, 403),
+                gpu_trace.encode_draw(3, 1, 0, 0),
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(
+            bgl_compute_out + bgl_mesh_read + bgl_uniform + bgl_rt_g3
+            + pll_compute_out + pll_mesh_draw + pll_normal + pll_rt
+            + mod_vs + mod_fs + mod_cs + bufs + texs + bgs + pipes + frame,
+            strict=True,
+        )
+        self.assertTrue(trace.ok)
+        summary = gpu_trace.build_scene_pass_summary(trace)
+        self.assertTrue(summary["ok"], msg=json.dumps(summary, indent=2))
+        self.assertEqual(summary["schema"], gpu_trace.SCENE_PASS_SUMMARY_SCHEMA)
+        self.assertEqual(summary["version"], 1)
+
+        rp = summary["render_passes"]
+        self.assertEqual(rp["begin_count"], 4)
+        self.assertEqual(rp["end_count"], 4)
+        self.assertEqual(rp["paired"], 4)
+        self.assertEqual(rp["unclosed"], 0)
+        self.assertEqual(rp["unmatched_end"], 0)
+        self.assertEqual(rp["depth_only"], 1)
+        self.assertEqual(rp["color_and_depth"], 1)
+        self.assertEqual(rp["color_only"], 2)
+        self.assertEqual(rp["swapchain"], 1)
+        self.assertEqual(rp["mrt"], 1)
+        self.assertEqual(rp["max_color_attachments"], 2)
+
+        self.assertEqual(summary["compute_passes"], 4)
+        self.assertEqual(summary["compute_dispatches"], 5)
+        self.assertEqual(summary["direct_compute_dispatches"], 4)
+        self.assertEqual(summary["indirect_compute_dispatches"], 1)
+
+        self.assertEqual(summary["indirect_passes"], 2)
+        self.assertEqual(
+            summary["indirect_calls"],
+            {
+                "total": 2,
+                "draw_indirect": 0,
+                "draw_indexed_indirect": 1,
+                "dispatch_indirect": 1,
+                "unique_buffer_count": 2,
+            },
+        )
+
+        # Exactly 2 mesh passes (compute->indirect + compute->mesh_draw); plain compute #4 NOT counted!
+        self.assertEqual(summary["mesh_passes"], 2)
+        self.assertEqual(summary["mesh_pass_details"]["compute_to_indirect_draws"], 1)
+        self.assertEqual(summary["mesh_pass_details"]["compute_to_mesh_draws"], 1)
+        self.assertEqual(summary["mesh_pass_details"]["flagged_mesh_dispatches"], 0)
+
+        # RT group-3 pass detected cleanly with 0 invalid slots.
+        self.assertEqual(summary["rt_passes"], 1)
+        rt = summary["rt_group3_bindings"]
+        self.assertEqual(rt["layouts_with_rt_slots"], 1)
+        self.assertEqual(rt["bind_groups_with_rt_slots"], 1)
+        self.assertEqual(rt["set_bind_group_calls"], 1)
+        self.assertEqual(rt["arena_slots_seen"], [16, 17, 18, 19, 20, 21])
+        self.assertEqual(rt["rt_dispatches"], 2)
+        self.assertEqual(rt["invalid_slot_count"], 0)
+
+        self.assertEqual(summary["skipped_draw_calls"], 0)
+        self.assertEqual(summary["binding_reflection_mismatches"]["total"], 0)
+        self.assertEqual(summary["binding_reflection_mismatches"]["top_offenders"], [])
+
+    def test_skipped_draws_by_cause_and_binding_reflection_mismatches(self) -> None:
+        # Layout 10: expects @0 buffer(uniform) and @1 texture(float)
+        bgl_ok = gpu_trace.encode_create_bind_group_layout(
+            10, [(0, 0x3, 0, 0), (1, 0x2, 2, 0)]
+        )
+        # Layout 11 (RT group 3 with invalid slots: @15 outside 16..21, @16 wrong type texture, @21 uniform instead of storage)
+        bgl_bad_rt = gpu_trace.encode_create_bind_group_layout(
+            11,
+            [
+                (15, 0x4, 0, 1),  # invalid: outside 16..21
+                (16, 0x4, 2, 0),  # invalid: texture in arena slot
+                (21, 0x4, 0, 0),  # invalid: uniform in stats slot
+            ],
+        )
+        pll_render = gpu_trace.encode_create_pipeline_layout(20, [10])
+        pll_rt = gpu_trace.encode_create_pipeline_layout(21, [0, 0, 0, 11])
+
+        buf1 = gpu_trace.encode_create_buffer(1, 0x0040, 256)
+        tex1 = gpu_trace.encode_create_texture2(2, 64, 64, 22, usage_flags=0x04)
+
+        # Bad bind group 30 against layout 10:
+        # - @0 bound as TextureView (resource_kind_mismatch)
+        # - @1 omitted (missing_layout_bindings)
+        # - @9 undeclared (extra_bind_group_entries)
+        # - @0 duplicate? Let's add a duplicate @9 (extra_bind_group_entries) and a null_binding resource_id=0!
+        bg_bad = gpu_trace.encode_create_bind_group2(
+            30,
+            10,
+            [
+                (0, 1, 2),  # TextureView into buffer slot -> resource_kind_mismatch
+                (9, 0, 0),  # undeclared binding + null_binding (resource_id=0)
+                (9, 0, 1),  # duplicate binding -> extra_bind_group_entries
+            ],
+        )
+        # Bad bind group 31 referencing unknown layout 999 -> unresolved_or_placeholder_bindings
+        bg_unknown_layout = gpu_trace.encode_create_bind_group2(31, 999, [(0, 0, 1)])
+
+        # Pipeline 40 requires vertex buffer slot 0 + layout 20 (group 0)
+        rp_40 = gpu_trace.encode_create_render_pipeline2(
+            40,
+            100,
+            101,
+            20,
+            self._make_key_with_vbuf(
+                vs_shader=0xABCD000000000001,
+                ps_shader=0xABCD000000000002,
+                color_formats=(27,),
+                vertex_buffer_slots=(0,),
+            ),
+        )
+        cp_41 = gpu_trace.encode_create_compute_pipeline2(
+            41, 102, 21, cs_shader=0xABCD000000000003
+        )
+
+        # Truncated Draw packet (only 4 bytes instead of 16) -> invalid_packet
+        bad_draw_pkt = gpu_trace.encode_packet(gpu_trace.GpuOpcode.Draw, b"\x01\x02\x03\x04")
+
+        stream = b"".join(
+            [
+                bgl_ok,
+                bgl_bad_rt,
+                pll_render,
+                pll_rt,
+                buf1,
+                tex1,
+                bg_bad,
+                bg_unknown_layout,
+                rp_40,
+                cp_41,
+                gpu_trace.encode_begin_frame(),
+                # 1. Draw with no pipeline bound & outside render pass
+                gpu_trace.encode_draw(3, 1, 0, 0),
+                # 2. Unmatched EndRenderPass
+                gpu_trace.encode_end_render_pass(),
+                # 3. Begin render pass (will be left UNCLOSED at Present!)
+                gpu_trace.encode_begin_render_pass([self._color_att(gpu_trace.SWAPCHAIN_TEXTURE_ID)]),
+                gpu_trace.encode_set_pipeline(40),
+                # 3a. DrawIndexed with: zero_geometry, missing_bind_group, missing_index_buffer, missing_vertex_buffer
+                gpu_trace.encode_draw_indexed(0, 1, 0, 0, 0),
+                # 3b. Bind bad bg 30 + invalid Draw packet
+                gpu_trace.encode_set_bind_group2(0, 30),
+                bad_draw_pkt,
+                # 3c. Bind unknown bg 888
+                gpu_trace.encode_set_bind_group2(0, 888),
+                gpu_trace.encode_draw(3, 1, 0, 0),
+                # 4. Compute dispatch with no compute pipeline bound (also closes render pass as unclosed!)
+                gpu_trace.encode_dispatch_compute(1, 1, 1),
+                # 5. Compute dispatch on RT pipeline 41 with zero_geometry and missing RT group 3
+                gpu_trace.encode_set_compute_pipeline(41),
+                gpu_trace.encode_dispatch_compute(0, 1, 1),
+                gpu_trace.encode_present(),
+            ]
+        )
+
+        trace = gpu_trace.decode_stream(stream, strict=False)
+        summary = gpu_trace.build_scene_pass_summary(trace, top_n=5)
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["render_passes"]["unclosed"], 1)
+        self.assertEqual(summary["render_passes"]["unmatched_end"], 1)
+
+        skips = summary["skipped_draws_by_cause"]
+        self.assertGreaterEqual(skips["no_pipeline_bound"], 2)
+        self.assertGreaterEqual(skips["zero_geometry"], 2)
+        self.assertGreaterEqual(skips["outside_render_pass"], 1)
+        self.assertGreaterEqual(skips["missing_bind_group"], 3)
+        self.assertGreaterEqual(skips["missing_index_buffer"], 1)
+        self.assertGreaterEqual(skips["missing_vertex_buffer"], 2)
+        self.assertEqual(skips["invalid_packet"], 1)
+
+        mm = summary["binding_reflection_mismatches"]
+        self.assertGreaterEqual(mm["unbound_required_groups"], 3)
+        self.assertGreaterEqual(mm["resource_kind_mismatches"], 1)
+        self.assertGreaterEqual(mm["missing_layout_bindings"], 1)
+        self.assertGreaterEqual(mm["extra_bind_group_entries"], 2)
+        self.assertEqual(mm["invalid_rt_group3_slots"], 3)
+        self.assertGreaterEqual(mm["unresolved_or_placeholder_bindings"], 3)
+        self.assertGreater(mm["total"], 0)
+
+        offenders = mm["top_offenders"]
+        self.assertGreater(len(offenders), 0)
+        offender_pids = [item["pipeline_id"] for item in offenders]
+        self.assertIn(40, offender_pids)
+        self.assertIn(41, offender_pids)
+        p40 = next(item for item in offenders if item["pipeline_id"] == 40)
+        self.assertEqual(p40["vs_shader"], "0xabcd000000000001")
+        self.assertEqual(p40["ps_shader"], "0xabcd000000000002")
+
+    def test_scene_pass_summary_cli_json_text_determinism_and_sanitization(self) -> None:
+        secret_wgsl = "SECRET_WGSL_SCENE_PASS_T104"
+        secret_buf = b"SECRET_BUFFER_PAYLOAD_T104"
+        stream = b"".join(
+            [
+                gpu_trace.encode_create_shader_module(1, 0, f"// {secret_wgsl}\n@vertex fn vs_main() {{}}"),
+                gpu_trace.encode_create_buffer(2, 0x0040, len(secret_buf)),
+                gpu_trace.encode_write_buffer(2, 0, secret_buf),
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_begin_render_pass([self._color_att(gpu_trace.SWAPCHAIN_TEXTURE_ID)]),
+                gpu_trace.encode_draw(3, 1, 0, 0),  # no pipeline bound -> offender
+                gpu_trace.encode_end_render_pass(),
+                gpu_trace.encode_present(),
+            ]
+        )
+        with tempfile.TemporaryDirectory(prefix="playgta6_t104_secret_") as tmp:
+            secret_dir = Path(tmp) / "Users" / "secret_t104_user" / "captures"
+            secret_dir.mkdir(parents=True)
+            trace_path = secret_dir / "scene_3d_t104.pg6trace"
+            trace_path.write_bytes(stream)
+
+            buf_j1 = io.StringIO()
+            with redirect_stdout(buf_j1):
+                rc1 = gpu_trace.main([str(trace_path), "--json", "--stats", "--scene-pass-summary"])
+            self.assertEqual(rc1, 0)
+            out_j1 = buf_j1.getvalue()
+
+            buf_j2 = io.StringIO()
+            with redirect_stdout(buf_j2):
+                rc2 = gpu_trace.main([str(trace_path), "--json", "--stats", "--scene-pass-summary"])
+            self.assertEqual(rc2, 0)
+            self.assertEqual(out_j1, buf_j2.getvalue())
+
+            parsed = json.loads(out_j1)
+            self.assertIn("scene_pass_summary", parsed)
+            sps = parsed["scene_pass_summary"]
+            self.assertEqual(sps["render_passes"]["swapchain"], 1)
+            self.assertEqual(sps["skipped_draws_by_cause"]["no_pipeline_bound"], 1)
+
+            buf_txt = io.StringIO()
+            with redirect_stdout(buf_txt):
+                rc_txt = gpu_trace.main([str(trace_path), "--stats", "--scene-pass-summary"])
+            self.assertEqual(rc_txt, 0)
+            out_txt = buf_txt.getvalue()
+            self.assertIn("3D Scene Pass Summary [ISSUES FOUND]:", out_txt)
+            self.assertIn("no_pipeline_bound=1", out_txt)
+
+            for leaked in (
+                str(tmp),
+                "secret_t104_user",
+                "playgta6_t104_secret_",
+                "scene_3d_t104.pg6trace",
+                secret_wgsl,
+                "SECRET_BUFFER_PAYLOAD_T104",
+            ):
+                self.assertNotIn(leaked, out_j1)
+                self.assertNotIn(leaked, out_txt)
 
 
 if __name__ == "__main__":
