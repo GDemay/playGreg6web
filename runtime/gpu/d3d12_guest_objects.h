@@ -1072,6 +1072,9 @@ public:
 
     DeviceStats stats() const;
     void note_bad_argument(const std::string& message);
+    // CheckFeatureSupport ids the device does not answer (E_NOTIMPL): id -> times asked; logged once each.
+    void note_unanswered_feature(uint32_t feature);
+    std::map<uint32_t, uint64_t> unanswered_features() const;
     std::vector<std::string> diagnostics() const;
 
     // Child counters.
@@ -1112,6 +1115,7 @@ private:
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;
     LogRateLimiter bad_arg_log_;  // guarded by diag_mutex_
+    std::map<uint32_t, uint64_t> unanswered_features_;  // guarded by diag_mutex_
     std::atomic<uint64_t> bad_arguments_{0};
 
     HResult create_resource(const GuestResourceDesc& desc, const GuestHeapProperties& heap, uint32_t heap_flags,

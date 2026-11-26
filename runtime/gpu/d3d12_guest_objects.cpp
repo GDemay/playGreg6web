@@ -1104,13 +1104,31 @@ HResult Device::CheckFeatureSupport(uint32_t feature, uint64_t data, uint32_t si
         return fill(o, sizeof(o));
     }
     case 32: {  // OPTIONS7 { MeshShaderTier, SamplerFeedbackTier }
-        const uint32_t o[2] = {0, 0};
+        // Mesh pipelines are implemented (compute pass plus draw, #1537/#1589): tier 1 (value 10).
+        // Sampler feedback is not implemented.
+        const uint32_t o[2] = {10, 0};
         return fill(o, sizeof(o));
     }
     default:
-        note_bad_argument("CheckFeatureSupport: feature " + std::to_string(feature) + " not answered");
-        return kEInvalidArg;
+        note_unanswered_feature(feature);
+        return kENotImpl;  // not implemented: never claim an unimplemented feature
     }
+}
+
+void Device::note_unanswered_feature(uint32_t feature) {
+    bool first = false;
+    {
+        std::lock_guard<std::mutex> lock(diag_mutex_);
+        first = ++unanswered_features_[feature] == 1;
+    }
+    if (first) {  // census: each unknown feature id is logged once
+        os::log("d3d12_xs: CheckFeatureSupport(" + std::to_string(feature) + ") not implemented (E_NOTIMPL)");
+    }
+}
+
+std::map<uint32_t, uint64_t> Device::unanswered_features() const {
+    std::lock_guard<std::mutex> lock(diag_mutex_);
+    return unanswered_features_;
 }
 
 HResult Device::CreateDescriptorHeap(const GuestDescriptorHeapDesc* desc, const Guid& riid, OutPtr out) {
