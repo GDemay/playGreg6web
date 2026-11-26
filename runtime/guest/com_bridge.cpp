@@ -8,6 +8,7 @@
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 
 #include "guest/guest_rtl.h"
@@ -53,13 +54,252 @@ GuestHeap& heap() {
 }
 
 // ---------------------------------------------------------------------------
-// Object registry, vtables, stubs, diagnostics
+// Starvation-free atomic reader-writer lock (zero std::mutex on read)
+// ---------------------------------------------------------------------------
+//
+// Bit layout of state_:
+//   bit  31     : writer active (exclusive ownership)
+//   bits 16..30 : waiting writer count (prevents reader starvation of writers)
+//   bits  0..15 : active reader count
+//
+// Uncontended reads pay a single fetch_add(acquire) and fetch_sub(release) with
+// no libc++ shared_mutex internal mutex lock/unlock overhead.
+
+class AtomicRwLock {
+public:
+    void lock_shared() noexcept {
+        const uint32_t prev = state_.fetch_add(1u, std::memory_order_acquire);
+        if ((prev & kWriterMask) == 0u) [[likely]] {
+            return;
+        }
+        // A writer is active or waiting: immediately undo the optimistic reader increment
+        // and wait read-only until writers drain so the writer sees readers == 0.
+        state_.fetch_sub(1u, std::memory_order_relaxed);
+        lock_shared_slow();
+    }
+
+    void unlock_shared() noexcept { state_.fetch_sub(1u, std::memory_order_release); }
+
+    void lock_exclusive() noexcept {
+        // Announce a waiting writer so new readers defer instead of starving us.
+        uint32_t s = state_.fetch_add(kWriterWaitUnit, std::memory_order_relaxed) + kWriterWaitUnit;
+        uint32_t spins = 0;
+        for (;;) {
+            if ((s & (kWriterActive | kReaderMask)) == 0u) {
+                const uint32_t desired = (s - kWriterWaitUnit) | kWriterActive;
+                if (state_.compare_exchange_weak(s, desired, std::memory_order_acquire,
+                                                 std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            backoff(spins);
+            s = state_.load(std::memory_order_relaxed);
+        }
+    }
+
+    void unlock_exclusive() noexcept { state_.fetch_sub(kWriterActive, std::memory_order_release); }
+
+private:
+    static constexpr uint32_t kWriterActive = 1u << 31;
+    static constexpr uint32_t kWriterWaitUnit = 1u << 16;
+    static constexpr uint32_t kWriterWaitMask = 0x7FFF'0000u;
+    static constexpr uint32_t kWriterMask = kWriterActive | kWriterWaitMask;
+    static constexpr uint32_t kReaderMask = 0x0000'FFFFu;
+
+    static void backoff(uint32_t& spins) noexcept {
+        if (spins < 64u) {
+            ++spins;
+        } else {
+            std::this_thread::yield();
+        }
+    }
+
+    void lock_shared_slow() noexcept {
+        uint32_t spins = 0;
+        uint32_t s = state_.load(std::memory_order_relaxed);
+        for (;;) {
+            if ((s & kWriterMask) == 0u) {
+                if (state_.compare_exchange_weak(s, s + 1u, std::memory_order_acquire,
+                                                 std::memory_order_relaxed)) {
+                    return;
+                }
+                continue;
+            }
+            backoff(spins);
+            s = state_.load(std::memory_order_relaxed);
+        }
+    }
+
+    alignas(64) std::atomic<uint32_t> state_{0};
+};
+
+struct SharedGuard {
+    AtomicRwLock& lock;
+    explicit SharedGuard(AtomicRwLock& l) noexcept : lock(l) { lock.lock_shared(); }
+    ~SharedGuard() { lock.unlock_shared(); }
+    SharedGuard(const SharedGuard&) = delete;
+    SharedGuard& operator=(const SharedGuard&) = delete;
+};
+
+struct UniqueGuard {
+    AtomicRwLock& lock;
+    explicit UniqueGuard(AtomicRwLock& l) noexcept : lock(l) { lock.lock_exclusive(); }
+    ~UniqueGuard() { lock.unlock_exclusive(); }
+    UniqueGuard(const UniqueGuard&) = delete;
+    UniqueGuard& operator=(const UniqueGuard&) = delete;
+};
+
+// ---------------------------------------------------------------------------
+// Flat open-addressed interface table (power-of-2, linear probe, backward-shift delete)
 // ---------------------------------------------------------------------------
 
-struct InterfaceEntry {
+struct InterfaceSlot {
+    uint64_t key = 0;  // 0 == empty (guest_alloc never returns 0)
+    const InterfaceInfo* iface = nullptr;
+    void* host = nullptr;
     std::shared_ptr<ComObject> object;
-    uint32_t index = 0;
 };
+
+class InterfaceTable {
+public:
+    static constexpr size_t kInitialCapacity = 64;
+
+    const InterfaceSlot* find(uint64_t key) const noexcept {
+        if (key == 0 || slots_.empty()) [[unlikely]] {
+            return nullptr;
+        }
+        const size_t mask = mask_;
+        size_t idx = hash_key(key, mask);
+        for (;;) {
+            const InterfaceSlot& slot = slots_[idx];
+            if (slot.key == key) [[likely]] {
+                return &slot;
+            }
+            if (slot.key == 0) {
+                return nullptr;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    void insert(uint64_t key, std::shared_ptr<ComObject> object, const InterfaceInfo* iface, void* host) {
+        if (key == 0) {
+            return;
+        }
+        if (slots_.empty()) {
+            rehash(kInitialCapacity);
+        } else if ((size_ + 1) * 2 > slots_.size()) {
+            rehash(slots_.size() * 2);
+        }
+        const size_t mask = mask_;
+        size_t idx = hash_key(key, mask);
+        for (;;) {
+            InterfaceSlot& slot = slots_[idx];
+            if (slot.key == 0) {
+                slot.key = key;
+                slot.iface = iface;
+                slot.host = host;
+                slot.object = std::move(object);
+                ++size_;
+                return;
+            }
+            if (slot.key == key) {
+                slot.iface = iface;
+                slot.host = host;
+                slot.object = std::move(object);
+                return;
+            }
+            idx = (idx + 1) & mask;
+        }
+    }
+
+    bool erase(uint64_t key) noexcept {
+        if (key == 0 || slots_.empty()) {
+            return false;
+        }
+        const size_t mask = mask_;
+        size_t idx = hash_key(key, mask);
+        for (;;) {
+            const uint64_t k = slots_[idx].key;
+            if (k == 0) {
+                return false;
+            }
+            if (k == key) {
+                break;
+            }
+            idx = (idx + 1) & mask;
+        }
+
+        // Backward-shift deletion preserves the linear-probing invariant without tombstones.
+        size_t hole = idx;
+        size_t cur = (hole + 1) & mask;
+        while (slots_[cur].key != 0) {
+            const size_t home = hash_key(slots_[cur].key, mask);
+            if (((hole - home) & mask) < ((cur - home) & mask)) {
+                slots_[hole] = std::move(slots_[cur]);
+                hole = cur;
+            }
+            cur = (cur + 1) & mask;
+        }
+        slots_[hole].key = 0;
+        slots_[hole].iface = nullptr;
+        slots_[hole].host = nullptr;
+        slots_[hole].object.reset();
+        --size_;
+        return true;
+    }
+
+    void clear() noexcept {
+        slots_.clear();
+        mask_ = 0;
+        size_ = 0;
+    }
+
+    void swap(InterfaceTable& other) noexcept {
+        slots_.swap(other.slots_);
+        std::swap(mask_, other.mask_);
+        std::swap(size_, other.size_);
+    }
+
+private:
+    static inline size_t hash_key(uint64_t key, size_t mask) noexcept {
+        // SplitMix64 finalizer: full 64-bit avalanche so sequential 8-byte-aligned guest
+        // interface pointers distribute uniformly across power-of-2 buckets.
+        uint64_t x = key;
+        x ^= x >> 30;
+        x *= 0xbf58476d1ce4e5b9ULL;
+        x ^= x >> 27;
+        x *= 0x94d049bb133111ebULL;
+        x ^= x >> 31;
+        return static_cast<size_t>(x) & mask;
+    }
+
+    void rehash(size_t new_cap) {
+        std::vector<InterfaceSlot> next(new_cap);
+        const size_t new_mask = new_cap - 1;
+        for (InterfaceSlot& old : slots_) {
+            if (old.key == 0) {
+                continue;
+            }
+            size_t idx = hash_key(old.key, new_mask);
+            while (next[idx].key != 0) {
+                idx = (idx + 1) & new_mask;
+            }
+            next[idx] = std::move(old);
+        }
+        slots_.swap(next);
+        mask_ = new_mask;
+    }
+
+    std::vector<InterfaceSlot> slots_;
+    size_t mask_ = 0;
+    size_t size_ = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Object registry, vtables, stubs, diagnostics
+// ---------------------------------------------------------------------------
 
 struct StubRecord {
     const InterfaceInfo* iface = nullptr;
@@ -76,8 +316,8 @@ struct VtableRecord {
 };
 
 struct Bridge {
-    std::shared_mutex registry_mutex;
-    std::unordered_map<uint64_t, InterfaceEntry> interfaces;              // interface pointer
+    alignas(64) AtomicRwLock registry_lock;
+    alignas(64) InterfaceTable interfaces;                                // interface pointer
     std::unordered_map<uint64_t, std::shared_ptr<ComObject>> objects;     // identity
 
     std::mutex vtable_mutex;
@@ -387,7 +627,7 @@ struct ObjectAccess {
         Bridge& b = bridge();
         std::shared_ptr<ComObject> owner;
         {
-            std::unique_lock<std::shared_mutex> lock(b.registry_mutex);
+            UniqueGuard lock(b.registry_lock);
             auto it = b.objects.find(o.guest_base_);
             if (it == b.objects.end() || it->second.get() != &o) {
                 return;  // not registered (bridge reset, or a failed creation)
@@ -497,9 +737,9 @@ bool detail::register_object(std::shared_ptr<ComObject> object,
 
     Bridge& b = bridge();
     {
-        std::unique_lock<std::shared_mutex> lock(b.registry_mutex);
+        UniqueGuard lock(b.registry_lock);
         for (size_t i = 0; i < bindings.size(); ++i) {
-            b.interfaces[base + 8 * i] = InterfaceEntry{object, static_cast<uint32_t>(i)};
+            b.interfaces.insert(base + 8 * i, object, bindings[i].iface, bindings[i].host);
         }
         b.objects[base] = std::move(object);
     }
@@ -508,16 +748,18 @@ bool detail::register_object(std::shared_ptr<ComObject> object,
 }
 
 bool detail::lookup_interface(uint64_t va, Resolved* out) {
-    Bridge& b = bridge();
-    std::shared_lock<std::shared_mutex> lock(b.registry_mutex);
-    auto it = b.interfaces.find(va);
-    if (it == b.interfaces.end()) {
+    if (va == 0) [[unlikely]] {
         return false;
     }
-    const auto& slot = ObjectAccess::slots(*it->second.object)[it->second.index];
-    out->object = it->second.object;
-    out->iface = slot.iface;
-    out->host = slot.host;
+    Bridge& b = bridge();
+    SharedGuard lock(b.registry_lock);
+    const InterfaceSlot* slot = b.interfaces.find(va);
+    if (slot == nullptr) [[unlikely]] {
+        return false;
+    }
+    out->object = slot->object;
+    out->iface = slot->iface;
+    out->host = slot->host;
     return true;
 }
 
@@ -766,7 +1008,7 @@ BridgeStats bridge_stats() {
     s.objects_created = b.objects_created.load(std::memory_order_relaxed);
     s.objects_destroyed = b.objects_destroyed.load(std::memory_order_relaxed);
     {
-        std::shared_lock<std::shared_mutex> lock(b.registry_mutex);
+        SharedGuard lock(b.registry_lock);
         s.live_objects = b.objects.size();
     }
     {
@@ -781,9 +1023,12 @@ BridgeStats bridge_stats() {
 std::vector<LiveObject> live_objects() {
     Bridge& b = bridge();
     std::vector<LiveObject> out;
-    std::shared_lock<std::shared_mutex> lock(b.registry_mutex);
-    for (const auto& [identity, object] : b.objects) {
-        out.push_back(LiveObject{object->class_name(), identity, object->ref_count()});
+    {
+        SharedGuard lock(b.registry_lock);
+        out.reserve(b.objects.size());
+        for (const auto& [identity, object] : b.objects) {
+            out.push_back(LiveObject{object->class_name(), identity, object->ref_count()});
+        }
     }
     std::sort(out.begin(), out.end(),
               [](const LiveObject& a, const LiveObject& c) { return a.identity < c.identity; });
@@ -878,12 +1123,14 @@ uint64_t guest_method_address(GuestState& state, uint64_t iface_ptr, uint32_t sl
 void reset_com_bridge() {
     Bridge& b = bridge();
     g_generation.fetch_add(1, std::memory_order_acq_rel);
+    InterfaceTable old_interfaces;
     std::unordered_map<uint64_t, std::shared_ptr<ComObject>> objects;
     {
-        std::unique_lock<std::shared_mutex> lock(b.registry_mutex);
-        b.interfaces.clear();
+        UniqueGuard lock(b.registry_lock);
+        old_interfaces.swap(b.interfaces);
         objects.swap(b.objects);
     }
+    old_interfaces.clear();
     objects.clear();  // host destructors run outside the lock
     {
         std::lock_guard<std::mutex> lock(b.vtable_mutex);

@@ -7,6 +7,8 @@
 #include <span>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -454,6 +456,26 @@ private:
 class Loose : public com::ComObject, public IOtherHost {
 public:
     int32_t Tag() override { return 77; }
+};
+
+std::atomic<int> g_parent_destroyed{0};
+
+class ParentCalc : public com::ComObject, public IOtherHost {
+public:
+    static constexpr const char* kComClassName = "ParentCalc";
+
+    explicit ParentCalc(com::Ref<Calc> child, int32_t tag) : child_(std::move(child)), tag_(tag) {}
+    ~ParentCalc() override {
+        // Must run outside registry_lock so releasing a child COM object never deadlocks.
+        child_.reset();
+        g_parent_destroyed.fetch_add(1);
+    }
+
+    int32_t Tag() override { return tag_; }
+
+private:
+    com::Ref<Calc> child_;
+    int32_t tag_;
 };
 
 // ---------------------------------------------------------------------------
@@ -1136,6 +1158,480 @@ void test_com_trace() {
     com::trace_reset();
 }
 
+void test_registry_high_load_and_rehash() {
+    Fixture fx;
+    g_calc_destroyed = 0;
+
+    // 1,200 dual-interface objects = 2,400 interface entries -> forces multiple power-of-2 rehashes
+    // (64 -> 128 -> 256 -> 512 -> 1024 -> 2048 -> 4096 -> 8192 at <= 0.5 load factor).
+    constexpr int kInitialCount = 1200;
+    struct Tracked {
+        com::Ref<Calc> ref;
+        uint64_t calc_va = 0;
+        uint64_t other_va = 0;
+        int32_t tag = 0;
+    };
+    std::vector<Tracked> items;
+    items.reserve(kInitialCount);
+    for (int i = 0; i < kInitialCount; ++i) {
+        com::Ref<Calc> obj = com::create_object<Calc>(com::implements(kICalc, kIOther), i + 1);
+        CHECK(obj);
+        const uint64_t cva = obj->interface_pointer(kICalc);
+        const uint64_t ova = obj->interface_pointer(kIOther);
+        items.push_back(Tracked{std::move(obj), cva, ova, i + 1});
+    }
+    CHECK(com::bridge_stats().live_objects == static_cast<uint64_t>(kInitialCount));
+
+    com::detail::Resolved r{};
+    CHECK(!com::detail::lookup_interface(0, &r));
+    CHECK(!com::detail::lookup_interface(0xDEADBEEFULL, &r));
+
+    auto verify_live = [](const Tracked& t) {
+        com::detail::Resolved res{};
+        CHECK(com::detail::lookup_interface(t.calc_va, &res));
+        CHECK(res.object.get() == t.ref.get());
+        CHECK(res.iface == &kICalc.info);
+        CHECK(res.host == static_cast<void*>(static_cast<ICalcHost*>(t.ref.get())));
+        CHECK(com::detail::lookup_interface(t.other_va, &res));
+        CHECK(res.object.get() == t.ref.get());
+        CHECK(res.iface == &kIOther.info);
+        CHECK(res.host == static_cast<void*>(static_cast<IOtherHost*>(t.ref.get())));
+        CHECK(static_cast<IOtherHost*>(res.host)->Tag() == t.tag);
+        // Unaligned / payload-offset addresses must not match.
+        CHECK(!com::detail::lookup_interface(t.calc_va + 4, &res));
+        CHECK(!com::detail::lookup_interface(t.other_va + 8, &res));
+    };
+
+    for (const Tracked& t : items) {
+        verify_live(t);
+    }
+
+    // Delete every other object (600 objects / 1,200 interface entries).
+    std::vector<uint64_t> deleted_vas;
+    deleted_vas.reserve(kInitialCount);
+    for (int i = 0; i < kInitialCount; i += 2) {
+        deleted_vas.push_back(items[i].calc_va);
+        deleted_vas.push_back(items[i].other_va);
+        items[i].ref.reset();
+    }
+    CHECK(com::bridge_stats().live_objects == static_cast<uint64_t>(kInitialCount / 2));
+    for (uint64_t dead : deleted_vas) {
+        CHECK(!com::detail::lookup_interface(dead, &r));
+    }
+    for (int i = 1; i < kInitialCount; i += 2) {
+        verify_live(items[i]);
+    }
+
+    // Multi-round insert/delete/rehash churn.
+    uint64_t rng = 0x9E3779B97F4A7C15ULL;
+    auto next_rng = [&]() -> uint64_t {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        return rng * 0x2545F4914F6CDD1DULL;
+    };
+    int next_tag = kInitialCount + 1;
+    for (int round = 0; round < 3; ++round) {
+        for (int i = 0; i < 800; ++i) {
+            const int32_t tag = next_tag++;
+            com::Ref<Calc> obj = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+            CHECK(obj);
+            const uint64_t cva = obj->interface_pointer(kICalc);
+            const uint64_t ova = obj->interface_pointer(kIOther);
+            items.push_back(Tracked{std::move(obj), cva, ova, tag});
+        }
+        std::unordered_set<uint64_t> live_vas;
+        std::vector<uint64_t> round_dead;
+        for (Tracked& t : items) {
+            if (!t.ref) {
+                continue;
+            }
+            if ((next_rng() & 1u) == 0u) {
+                round_dead.push_back(t.calc_va);
+                round_dead.push_back(t.other_va);
+                t.ref.reset();
+            } else {
+                live_vas.insert(t.calc_va);
+                live_vas.insert(t.other_va);
+            }
+        }
+        for (const Tracked& t : items) {
+            if (t.ref) {
+                verify_live(t);
+            }
+        }
+        for (uint64_t dead : round_dead) {
+            if (live_vas.find(dead) == live_vas.end()) {
+                CHECK(!com::detail::lookup_interface(dead, &r));
+            }
+        }
+    }
+
+    items.clear();
+    CHECK(com::bridge_stats().live_objects == 0);
+    CHECK(g_calc_destroyed.load() == next_tag - 1);
+}
+
+void test_registry_backward_shift_collisions() {
+    Fixture fx;
+    g_calc_destroyed = 0;
+
+    struct SlotExpect {
+        Calc* obj;
+        const com::InterfaceInfo* iface;
+        void* host;
+        int32_t tag;
+    };
+
+    auto check_oracle = [](const std::unordered_map<uint64_t, SlotExpect>& live,
+                           const std::unordered_set<uint64_t>& all_seen) {
+        com::detail::Resolved r{};
+        for (const auto& [va, exp] : live) {
+            CHECK(com::detail::lookup_interface(va, &r));
+            CHECK(r.object.get() == exp.obj);
+            CHECK(r.iface == exp.iface);
+            CHECK(r.host == exp.host);
+            if (exp.iface == &kIOther.info) {
+                CHECK(static_cast<IOtherHost*>(r.host)->Tag() == exp.tag);
+            }
+        }
+        for (uint64_t va : all_seen) {
+            if (live.find(va) == live.end()) {
+                CHECK(!com::detail::lookup_interface(va, &r));
+            }
+        }
+    };
+
+    // Phase 1 & 2: Forward and reverse full-drain deletion at dense load (~0.5 load factor),
+    // verifying every surviving and deleted entry across all collision clusters.
+    for (int reverse = 0; reverse < 2; ++reverse) {
+        constexpr int kCount = 512;
+        std::vector<com::Ref<Calc>> objs;
+        objs.reserve(kCount);
+        std::unordered_map<uint64_t, SlotExpect> live;
+        std::unordered_set<uint64_t> all_seen;
+        for (int i = 0; i < kCount; ++i) {
+            const int32_t tag = (reverse * 10000) + i + 1;
+            com::Ref<Calc> o = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+            CHECK(o);
+            const uint64_t cva = o->interface_pointer(kICalc);
+            const uint64_t ova = o->interface_pointer(kIOther);
+            live[cva] = SlotExpect{o.get(), &kICalc.info, static_cast<ICalcHost*>(o.get()), tag};
+            live[ova] = SlotExpect{o.get(), &kIOther.info, static_cast<IOtherHost*>(o.get()), tag};
+            all_seen.insert(cva);
+            all_seen.insert(ova);
+            objs.push_back(std::move(o));
+        }
+
+        for (int step = 0; step < kCount; ++step) {
+            const int idx = reverse ? (kCount - 1 - step) : step;
+            live.erase(objs[idx]->interface_pointer(kICalc));
+            live.erase(objs[idx]->interface_pointer(kIOther));
+            objs[idx].reset();
+            if (step == 127 || step == 255 || step == 383 || step == 460 || step == 506 || step == 511) {
+                check_oracle(live, all_seen);
+            }
+        }
+        CHECK(com::bridge_stats().live_objects == 0);
+    }
+
+    // Phase 3: Steady-state high-churn delete+insert loop (480 live objects = 960 entries) that
+    // repeatedly breaks and repairs probe chains without triggering table growth.
+    constexpr size_t kPoolSize = 480;
+    std::vector<com::Ref<Calc>> pool;
+    pool.reserve(kPoolSize);
+    std::unordered_map<uint64_t, SlotExpect> live;
+    std::unordered_set<uint64_t> all_seen;
+    int32_t next_tag = 50000;
+    for (size_t i = 0; i < kPoolSize; ++i) {
+        const int32_t tag = next_tag++;
+        com::Ref<Calc> o = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+        CHECK(o);
+        const uint64_t cva = o->interface_pointer(kICalc);
+        const uint64_t ova = o->interface_pointer(kIOther);
+        live[cva] = SlotExpect{o.get(), &kICalc.info, static_cast<ICalcHost*>(o.get()), tag};
+        live[ova] = SlotExpect{o.get(), &kIOther.info, static_cast<IOtherHost*>(o.get()), tag};
+        all_seen.insert(cva);
+        all_seen.insert(ova);
+        pool.push_back(std::move(o));
+    }
+
+    uint64_t rng = 0xD1B54A32D192ED03ULL;
+    for (int iter = 0; iter < 4000; ++iter) {
+        rng ^= rng >> 12;
+        rng ^= rng << 25;
+        rng ^= rng >> 27;
+        const size_t slot = static_cast<size_t>((rng * 0x2545F4914F6CDD1DULL) % kPoolSize);
+
+        // Delete selected object, then immediately verify a neighbor still resolves before re-insert.
+        live.erase(pool[slot]->interface_pointer(kICalc));
+        live.erase(pool[slot]->interface_pointer(kIOther));
+        pool[slot].reset();
+
+        const int32_t tag = next_tag++;
+        com::Ref<Calc> fresh = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+        CHECK(fresh);
+        const uint64_t cva = fresh->interface_pointer(kICalc);
+        const uint64_t ova = fresh->interface_pointer(kIOther);
+        live[cva] = SlotExpect{fresh.get(), &kICalc.info, static_cast<ICalcHost*>(fresh.get()), tag};
+        live[ova] = SlotExpect{fresh.get(), &kIOther.info, static_cast<IOtherHost*>(fresh.get()), tag};
+        all_seen.insert(cva);
+        all_seen.insert(ova);
+        pool[slot] = std::move(fresh);
+
+        if ((iter & 1023) == 1023) {
+            check_oracle(live, all_seen);
+        }
+    }
+    check_oracle(live, all_seen);
+
+    // Confirm real guest vcalls still dispatch accurately on surviving objects after heavy churn.
+    for (size_t i = 0; i < 16; ++i) {
+        const uint64_t ova = pool[i * 29]->interface_pointer(kIOther);
+        CHECK(as_hr(fx.vcall(ova, 3)) == pool[i * 29]->Tag());
+    }
+
+    pool.clear();
+    CHECK(com::bridge_stats().live_objects == 0);
+}
+
+void test_registry_concurrent_lookups_and_mutations() {
+    Fixture fx;
+    g_calc_destroyed = 0;
+
+    // Pinned objects stay registered for the entire test; readers must ALWAYS resolve them.
+    constexpr size_t kPinnedCount = 64;
+    struct PinnedInfo {
+        com::Ref<Calc> ref;
+        uint64_t calc_va = 0;
+        uint64_t other_va = 0;
+        int32_t tag = 0;
+    };
+    std::vector<PinnedInfo> pinned;
+    pinned.reserve(kPinnedCount);
+    for (size_t i = 0; i < kPinnedCount; ++i) {
+        const int32_t tag = static_cast<int32_t>(i + 1);
+        com::Ref<Calc> o = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+        CHECK(o);
+        const uint64_t cva = o->interface_pointer(kICalc);
+        const uint64_t ova = o->interface_pointer(kIOther);
+        pinned.push_back(PinnedInfo{std::move(o), cva, ova, tag});
+    }
+
+    // Shared atomic table of transient interface pointers concurrently mutated by writer threads.
+    constexpr size_t kTransientSlots = 128;
+    std::atomic<uint64_t> transient_other_vas[kTransientSlots];
+    for (auto& slot : transient_other_vas) {
+        slot.store(0, std::memory_order_relaxed);
+    }
+
+    const uint64_t tag_slot_va = com::slot_address(kIOther.info, 3);
+    constexpr int kReaderThreads = 6;
+    constexpr int kWriterThreads = 3;
+    constexpr int kWriterRounds = 400;
+    constexpr int kBatchSize = 8;
+    constexpr int32_t kTransientTagBase = 10000;
+    constexpr int32_t kTransientTagMax = kTransientTagBase + kWriterThreads * kWriterRounds * kBatchSize;
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+    std::atomic<uint64_t> total_reads{0};
+    std::atomic<uint64_t> per_reader_reads[kReaderThreads];
+    for (auto& c : per_reader_reads) {
+        c.store(0, std::memory_order_relaxed);
+    }
+
+    std::vector<std::thread> readers;
+    readers.reserve(kReaderThreads);
+    for (int t = 0; t < kReaderThreads; ++t) {
+        readers.emplace_back([&, t] {
+            GuestThread gt{};
+            if (!create_guest_thread(fx.arena, 64 * 1024, gt)) {
+                errors.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            uint64_t local_reads = 0;
+            size_t idx = static_cast<size_t>(t) * 7;
+            while (!stop.load(std::memory_order_acquire)) {
+                const PinnedInfo& p = pinned[idx % kPinnedCount];
+                com::detail::Resolved r{};
+                if (!com::detail::lookup_interface(p.calc_va, &r) || r.iface != &kICalc.info ||
+                    r.object.get() != p.ref.get() ||
+                    r.host != static_cast<void*>(static_cast<ICalcHost*>(p.ref.get()))) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (!com::detail::lookup_interface(p.other_va, &r) || r.iface != &kIOther.info ||
+                    r.object.get() != p.ref.get() ||
+                    static_cast<IOtherHost*>(r.host)->Tag() != p.tag) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                // Periodically run a full guest->host vtable call through resolve_this_or_fault.
+                if ((local_reads & 63u) == 0u) {
+                    const uint64_t args[1] = {p.other_va};
+                    if (as_hr(call_guest(fx.arena, gt.state, tag_slot_va, args)) != p.tag) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                // Race against concurrently registering/unregistering transient objects.
+                const uint64_t tva = transient_other_vas[idx % kTransientSlots].load(std::memory_order_acquire);
+                if (tva != 0 && com::detail::lookup_interface(tva, &r)) {
+                    if (r.iface != &kIOther.info || r.host == nullptr) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const int32_t tag = static_cast<IOtherHost*>(r.host)->Tag();
+                        if (tag < kTransientTagBase || tag >= kTransientTagMax) {
+                            errors.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                // Exercise misses under writer contention too.
+                if (com::detail::lookup_interface(0, &r) ||
+                    com::detail::lookup_interface(0x13370000ULL + (idx & 0xFFu), &r)) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                local_reads += 4;
+                ++idx;
+            }
+            per_reader_reads[t].store(local_reads, std::memory_order_relaxed);
+            total_reads.fetch_add(local_reads, std::memory_order_relaxed);
+            destroy_guest_thread(fx.arena, gt);
+        });
+    }
+
+    std::vector<std::thread> writers;
+    writers.reserve(kWriterThreads);
+    for (int w = 0; w < kWriterThreads; ++w) {
+        writers.emplace_back([&, w] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            std::vector<com::Ref<Calc>> prev_batch;
+            prev_batch.reserve(kBatchSize);
+            for (int round = 0; round < kWriterRounds; ++round) {
+                std::vector<com::Ref<Calc>> batch;
+                batch.reserve(kBatchSize);
+                for (int b = 0; b < kBatchSize; ++b) {
+                    const int32_t tag = kTransientTagBase + (w * kWriterRounds + round) * kBatchSize + b;
+                    com::Ref<Calc> o = com::create_object<Calc>(com::implements(kICalc, kIOther), tag);
+                    if (!o) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                    }
+                    const size_t slot = static_cast<size_t>((w * 37 + round * kBatchSize + b) % kTransientSlots);
+                    transient_other_vas[slot].store(o->interface_pointer(kIOther), std::memory_order_release);
+                    batch.push_back(std::move(o));
+                }
+                // Destroy the previous batch while readers are actively probing transient_other_vas.
+                prev_batch.clear();
+                if ((round & 31) == 0) {
+                    const com::BridgeStats st = com::bridge_stats();
+                    if (st.live_objects < kPinnedCount) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (com::live_objects().size() < kPinnedCount) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                prev_batch.swap(batch);
+            }
+            prev_batch.clear();
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto& th : writers) {
+        th.join();
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& th : readers) {
+        th.join();
+    }
+
+    CHECK(errors.load() == 0);
+    CHECK(total_reads.load() > 0);
+    for (int t = 0; t < kReaderThreads; ++t) {
+        CHECK(per_reader_reads[t].load() > 0);
+    }
+
+    pinned.clear();
+    const com::BridgeStats final_stats = com::bridge_stats();
+    const uint64_t expected_total =
+        kPinnedCount + static_cast<uint64_t>(kWriterThreads) * kWriterRounds * kBatchSize;
+    CHECK(final_stats.live_objects == 0);
+    CHECK(final_stats.objects_created == expected_total);
+    CHECK(final_stats.objects_destroyed == expected_total);
+    CHECK(static_cast<uint64_t>(g_calc_destroyed.load()) == expected_total);
+}
+
+void test_registry_reset_cleanup() {
+    Fixture fx;
+    g_calc_destroyed = 0;
+    g_parent_destroyed = 0;
+
+    // First verify normal destruction of a parent holding a child ComObject does not deadlock.
+    {
+        com::Ref<Calc> child = com::create_object<Calc>(com::implements(kICalc, kIOther), 11);
+        com::Ref<ParentCalc> parent =
+            com::create_object<ParentCalc>(com::implements(kIOther), std::move(child), 22);
+        CHECK(com::bridge_stats().live_objects == 2);
+        CHECK(as_hr(fx.vcall(parent->interface_pointer(kIOther), 3)) == 22);
+    }
+    CHECK(g_parent_destroyed.load() == 1);
+    CHECK(g_calc_destroyed.load() == 1);
+    CHECK(com::bridge_stats().live_objects == 0);
+
+    // Populate a large registry including nested parent->child ownership, then reset_com_bridge().
+    std::vector<uint64_t> leaked_vas;
+    constexpr int kCalcCount = 200;
+    constexpr int kParentCount = 32;
+    leaked_vas.reserve(kCalcCount * 2 + kParentCount * 3);
+    for (int i = 0; i < kCalcCount; ++i) {
+        com::Ref<Calc> o = com::create_object<Calc>(com::implements(kICalc, kIOther), i + 1);
+        leaked_vas.push_back(o->interface_pointer(kICalc));
+        leaked_vas.push_back(o->interface_pointer(kIOther));
+        o.detach(kICalc);  // intentionally left alive in the bridge until reset_com_bridge()
+    }
+    for (int i = 0; i < kParentCount; ++i) {
+        com::Ref<Calc> child = com::create_object<Calc>(com::implements(kICalc, kIOther), 1000 + i);
+        leaked_vas.push_back(child->interface_pointer(kICalc));
+        leaked_vas.push_back(child->interface_pointer(kIOther));
+        com::Ref<ParentCalc> parent =
+            com::create_object<ParentCalc>(com::implements(kIOther), std::move(child), 2000 + i);
+        leaked_vas.push_back(parent->interface_pointer(kIOther));
+        parent.detach(kIOther);
+    }
+    CHECK(com::bridge_stats().live_objects == static_cast<uint64_t>(kCalcCount + kParentCount * 2));
+
+    com::reset_com_bridge();
+    CHECK(g_parent_destroyed.load() == 1 + kParentCount);
+    CHECK(g_calc_destroyed.load() == 1 + kCalcCount + kParentCount);
+    const com::BridgeStats after_reset = com::bridge_stats();
+    CHECK(after_reset.live_objects == 0);
+    CHECK(after_reset.objects_created == 0);
+    CHECK(after_reset.objects_destroyed == 0);
+    CHECK(com::live_objects().empty());
+
+    com::detail::Resolved r{};
+    for (uint64_t va : leaked_vas) {
+        CHECK(!com::detail::lookup_interface(va, &r));
+    }
+
+    // Re-registering fresh objects after reset_com_bridge() must work seamlessly.
+    com::Ref<Calc> post = com::create_object<Calc>(com::implements(kICalc, kIOther), 777);
+    CHECK(post);
+    const uint64_t cva = post->interface_pointer(kICalc);
+    const uint64_t ova = post->interface_pointer(kIOther);
+    CHECK(com::detail::lookup_interface(cva, &r) && r.object.get() == post.get() && r.iface == &kICalc.info);
+    CHECK(com::detail::lookup_interface(ova, &r) && r.object.get() == post.get() && r.iface == &kIOther.info);
+    CHECK(as_hr(fx.vcall(ova, 3)) == 777);
+    post.reset();
+    CHECK(com::bridge_stats().live_objects == 0);
+}
+
 }  // namespace
 
 int main() {
@@ -1155,6 +1651,10 @@ int main() {
     test_async_shadow();
     test_get_proc_address_thunk();
     test_com_trace();
+    test_registry_high_load_and_rehash();
+    test_registry_backward_shift_collisions();
+    test_registry_concurrent_lookups_and_mutations();
+    test_registry_reset_cleanup();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_com_bridge: %d failure(s)\n", g_failures);
         return 1;
