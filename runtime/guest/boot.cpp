@@ -2835,6 +2835,14 @@ bool report_host_fault(const char* kind, uint64_t host_address, uint64_t host_pc
         return false;
     }
     const char* name = kind != nullptr ? kind : "host_fault";
+    if (b.fault.present && (std::strcmp(name, "host_terminate") == 0 || std::strcmp(name, "host_abort") == 0)) {
+        // The guest fault was already recorded (the unwind that should have stopped the boot hit a
+        // noexcept frame or the CRT aborted): keep that record and write the report.
+        b.message += std::string(" [process terminated while unwinding: ") + name + "]";
+        log_trap();
+        finish_report();
+        return true;
+    }
     capture_fault(name, nullptr, 0, 0);
     FaultRecord& f = b.fault;
     f.has_host = true;

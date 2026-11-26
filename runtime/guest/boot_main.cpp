@@ -70,6 +70,8 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <csignal>
+#include <exception>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -779,6 +781,17 @@ void write_outputs(bool print_summary) {
     terminate_now(code);
 }
 
+// A guest fault unwinds out of the guest with an exception; when that exception crosses a noexcept
+// frame (or the CRT aborts), the process would die with 0xC0000409 and no report. The terminate
+// and SIGABRT handlers write the already recorded fault record + report first.
+[[noreturn]] void terminate_handler_report() {
+    host_fault("host_terminate", 0, 0, kExitHostFault);
+}
+
+void abort_signal_report(int) {
+    host_fault("host_abort", 0, 0, kExitHostFault);
+}
+
 // BootConfig::off_thread_fault: the boot already recorded the fault of a non-boot guest thread.
 void off_thread_fault() {
     if (!g_finishing.exchange(true)) {
@@ -1052,6 +1065,8 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     install_host_fault_handlers();
 #endif
+    std::set_terminate(&terminate_handler_report);
+    std::signal(SIGABRT, &abort_signal_report);
     {
         gpu::d3d12_guest::DeviceOptions device_options;
         device_options.refuse_native_pipelines = !g_options.native_pipelines;
