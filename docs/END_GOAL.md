@@ -53,6 +53,7 @@ Run **Grand Theft Auto VI (Xbox Series)** directly inside a user's modern web br
 - [ ] Stream multi-GB `.rpf9` world/UI assets smoothly over 8-lane parallel HTTPFS + HTTP/1.1 keep-alive + 192 MiB slab cache + OPFS warm cache without stalling main/render threads or exceeding bounded `#1077` memory targets.
 - [ ] Stream click-free 48 kHz stereo game audio (Opus/ADPCM/XMA2) continuously through `playgta6_audio_ring` (`#1028`) / `audio_worker.js` / `AudioWorklet`.
 - [ ] **Big Milestone:** Fast boot from the Astryx splash past intro and calibration menus into the interactive Main Menu and trigger world load.
+- Since #1506: runtime and GPU work toward M5 landed (XMA2 frame walker, DirectStorage BCPack, mesh pipelines, ExecuteIndirect); details in `docs/WORKSTREAMS.md`.
 
 ### M6 — Playable In-Browser Build (30 FPS Target) — `UPCOMING` *(Active Target)*
 - [ ] Persistent saves in IndexedDB (`/userdata`) survive page reloads.
