@@ -901,9 +901,10 @@ void test_g83_formats_depth_srgb_and_swizzles() {
     }
 
     // 2. Packed GFX10 depth/stencil IMG_FMTs 142..146 reverse-lookup cleanly.
+    // Note: IMG_FMT_24_8_UNORM (143) is MSB-to-LSB, so 24-bit depth lives in Y [31:8].
     bool exact = false;
     CHECK(dxgi_format(142, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 47 && exact);
-    CHECK(dxgi_format(143, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 46 && exact);
+    CHECK(dxgi_format(143, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 46 && exact);
     CHECK(dxgi_format(144, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 47 && exact);
     CHECK(dxgi_format(145, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 22 && exact);
     CHECK(dxgi_format(146, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 21 && exact);
@@ -1153,6 +1154,216 @@ void test_g83_buffers_and_samplers() {
     }
 }
 
+// Console color, HDR/10-bit format, swizzle, and GFX10.3 V#/T#/S# fidelity tests.
+void test_console_color_and_gfx103_fidelity() {
+    // 1. GFX10.3 V# LLC_NOALLOC (dw3[27:26]) is accepted by plausible_buffer() / classify_slot()
+    // and round-trips cleanly, while reserved bit 25 is still rejected.
+    {
+        for (uint32_t llc = 0; llc <= 3; ++llc) {
+            BufferResource b;
+            b.base = 0x0000'0010'0002'0000ull;
+            b.stride = 32;
+            b.num_records = 64;
+            b.format = Fmt::F32;
+            b.llc_noalloc = llc;
+            uint32_t w[8] = {};
+            encode(b, w);
+            CHECK(((w[3] >> 26) & 3u) == llc);
+            CHECK(plausible_buffer(w));
+            CHECK(classify_slot(w) == SlotContent::Buffer);
+            const BufferResource dec = decode_buffer(w);
+            CHECK(dec.llc_noalloc == llc && dec.base == b.base && dec.stride == 32);
+        }
+    }
+
+    // 2. GFX10.3 T# LLC_NOALLOC (dw6[9:8]) and Xbox HDR 10-bit float formats:
+    //    116 = R10G10B10_7E3_A2_FLOAT (IMG_FMT 285), 117 = R10G10B10_6E4_A2_FLOAT (IMG_FMT 131),
+    //    plus Xbox 189 (2_10_10_10_SNORM = 51) and 190 (4_4_UNORM = 137), and reverse-only 128/129/140.
+    {
+        struct HdrCase {
+            uint32_t dxgi;
+            uint32_t hw;
+            Swizzle sel;
+        };
+        const HdrCase cases[] = {
+            {116, 285, kIdentitySwizzle},
+            {117, 131, kIdentitySwizzle},
+            {189, 51, kIdentitySwizzle},
+            {190, 137, Swizzle{Sel::X, Sel::Y, Sel::Zero, Sel::One}},
+        };
+        for (const HdrCase& c : cases) {
+            HardwareFormat hf;
+            CHECK(hardware_format(c.dxgi, &hf) && hf.format == c.hw && hf.swizzle == c.sel);
+            ImageResource img;
+            img.base = 0x0000'0020'0004'0000ull;
+            img.format = hf.format;
+            img.dst_sel = hf.swizzle;
+            img.width = 128;
+            img.height = 64;
+            img.llc_noalloc = 2;
+            uint32_t w[8] = {};
+            encode(img, w);
+            CHECK(plausible_image(w) && classify_slot(w) == SlotContent::Image);
+            const ImageResource dec = decode_image(w);
+            CHECK(dec.format == c.hw && dec.llc_noalloc == 2 && dec.dst_sel == c.sel);
+            bool exact = false;
+            CHECK(dxgi_format(dec.format, dec.dst_sel, &exact) == c.dxgi && exact);
+        }
+
+        // GFX10.3 formats 286..293 accepted by plausible_image(); 294 rejected.
+        ImageResource img;
+        img.base = 0x10000ull;
+        img.format = 293;
+        uint32_t w[8] = {};
+        encode(img, w);
+        CHECK(plausible_image(w));
+        img.format = 294;
+        encode(img, w);
+        CHECK(!plausible_image(w));
+
+        // Secondary image-only GFX10 formats 128 (8_SRGB), 129 (8_8_SRGB), 140 (32_FLOAT_CLAMP)
+        // decode to their closest DXGI equivalents without hijacking canonical forward encode.
+        bool exact = false;
+        CHECK(dxgi_format(128, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 61 && exact);
+        CHECK(dxgi_format(129, Swizzle{Sel::X, Sel::Y, Sel::Zero, Sel::One}, &exact) == 49 && exact);
+        CHECK(dxgi_format(140, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 41 && exact);
+        HardwareFormat canon;
+        CHECK(hardware_format(61, &canon) && canon.format == 1);
+        CHECK(hardware_format(49, &canon) && canon.format == 14);
+        CHECK(hardware_format(41, &canon) && canon.format == 22);
+    }
+
+    // 3. BGRA non-canonical alpha swizzle preserves BGR order (no red/blue swap) and 111R preserves A8.
+    {
+        bool exact = true;
+        CHECK(dxgi_format(56, Swizzle{Sel::Z, Sel::Y, Sel::X, Sel::Zero}, &exact) == 87 && !exact);
+        CHECK(dxgi_format(130, Swizzle{Sel::Z, Sel::Y, Sel::X, Sel::Zero}, &exact) == 91 && !exact);
+        CHECK(dxgi_format(1, Swizzle{Sel::One, Sel::One, Sel::One, Sel::X}, &exact) == 65 && !exact);
+        // Non-BGR custom swizzle still falls back to R8G8B8A8_UNORM.
+        CHECK(dxgi_format(56, Swizzle{Sel::W, Sel::Z, Sel::Y, Sel::X}, &exact) == 28 && !exact);
+    }
+
+    // 4. component_mapping_from() handles identity shortcuts and implicit missing hardware channels
+    //    (Y=0, Z=0, W=1) in their canonical slots on 1/2/3-channel formats.
+    {
+        uint32_t m = 0;
+        const Swizzle kX001 = {Sel::X, Sel::Zero, Sel::Zero, Sel::One};
+        const Swizzle kXY01 = {Sel::X, Sel::Y, Sel::Zero, Sel::One};
+        const Swizzle kXYZ1 = {Sel::X, Sel::Y, Sel::Z, Sel::One};
+        // Exact format swizzle returns D3D12 default mapping (0x1688).
+        CHECK(component_mapping_from(kX001, kX001, &m) && m == 0x1688u);
+        // R8/BC4 with {X, X, X, W} (implicit W=1): maps to (R, R, R, A).
+        const uint32_t kRRRA = 0u | (0u << 3) | (0u << 6) | (3u << 9) | (1u << 12);
+        CHECK(component_mapping_from(kX001, Swizzle{Sel::X, Sel::X, Sel::X, Sel::W}, &m) && m == kRRRA);
+        // BC5/R8G8 with {Y, X, Z, W} (implicit Z=0, W=1): maps to (G, R, B, A).
+        const uint32_t kGRBA = 1u | (0u << 3) | (2u << 6) | (3u << 9) | (1u << 12);
+        CHECK(component_mapping_from(kXY01, Swizzle{Sel::Y, Sel::X, Sel::Z, Sel::W}, &m) && m == kGRBA);
+        // R11G11B10/BC6H with {Z, Y, X, W} (implicit W=1): maps to (B, G, R, A).
+        const uint32_t kBGRA = 2u | (1u << 3) | (0u << 6) | (3u << 9) | (1u << 12);
+        CHECK(component_mapping_from(kXYZ1, Swizzle{Sel::Z, Sel::Y, Sel::X, Sel::W}, &m) && m == kBGRA);
+        // Invalid cross-slot missing channel {Y, 0, 0, 1} on R8 still fails.
+        CHECK(!component_mapping_from(kX001, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &m));
+    }
+
+    // 5. S# sampler fidelity: MIP_FILTER_NONE locks LOD to [0, 0], ANISO_POINT & asymmetric mag/min
+    //    filters round-trip, degamma overrides are detected, and comparison-aware decode preserves NEVER.
+    {
+        SamplerState none_mip;
+        none_mip.xy_mag_filter = 1;
+        none_mip.xy_min_filter = 1;
+        none_mip.mip_filter = 0;  // SQ_TEX_MIP_FILTER_NONE
+        none_mip.min_lod = lod_to_u4_8(2.0f);
+        none_mip.max_lod = lod_to_u4_8(12.0f);
+        bool exact = false;
+        const d3d::SamplerDesc d_none = d3d12_from_sampler(none_mip, &exact);
+        CHECK(exact && d_none.min_lod == 0.0f && d_none.max_lod == 0.0f && d_none.filter == 0x14u);
+
+        // ANISO_POINT (mag=2, min=2) and asymmetric point-mag / aniso-linear-min (mag=0, min=3).
+        SamplerState aniso_pt;
+        aniso_pt.xy_mag_filter = 2;  // ANISO_POINT
+        aniso_pt.xy_min_filter = 2;  // ANISO_POINT
+        aniso_pt.mip_filter = 1;
+        aniso_pt.max_aniso_ratio = 2;  // 4x
+        const d3d::SamplerDesc d_ap = d3d12_from_sampler(aniso_pt, &exact);
+        CHECK(exact && d_ap.filter == 0x40u && d_ap.max_anisotropy == 4u);
+        const SamplerState ap_back = sampler_from_d3d12(d_ap);
+        CHECK(ap_back.xy_mag_filter == 2 && ap_back.xy_min_filter == 2 && ap_back.max_aniso_ratio == 2);
+
+        SamplerState asym;
+        asym.xy_mag_filter = 0;  // POINT mag
+        asym.xy_min_filter = 3;  // ANISO_BILINEAR min
+        asym.mip_filter = 2;
+        asym.max_aniso_ratio = 3;  // 8x
+        const d3d::SamplerDesc d_asym = d3d12_from_sampler(asym);
+        CHECK(d_asym.filter == 0x51u && d_asym.max_anisotropy == 8u);
+
+        // Degamma & unnormalized & register border exactness reporting.
+        SamplerState dg;
+        dg.mip_filter = 1;
+        CHECK(sampler_degamma_override(dg) == DegammaOverride::None);
+        dg.force_degamma = true;
+        CHECK(sampler_degamma_override(dg) == DegammaOverride::ForceDegamma);
+        (void)d3d12_from_sampler(dg, &exact);
+        CHECK(!exact);
+        dg.skip_degamma = true;
+        CHECK(sampler_degamma_override(dg) == DegammaOverride::SkipDegamma);
+
+        SamplerState unnorm;
+        unnorm.mip_filter = 1;
+        unnorm.force_unnormalized = true;
+        (void)d3d12_from_sampler(unnorm, &exact);
+        CHECK(!exact);
+
+        SamplerState reg_border;
+        reg_border.mip_filter = 1;
+        reg_border.border_color_type = 3;  // REGISTER
+        (void)d3d12_from_sampler(reg_border, &exact);
+        CHECK(!exact);
+
+        // Comparison-aware decode: SQ_TEX_DEPTH_COMPARE_NEVER (0) -> D3D12_COMPARISON_FUNC_NEVER (1)
+        // when shader uses image_sample_c*, and stripped when shader uses regular image_sample*.
+        SamplerState cmp_never;
+        cmp_never.xy_mag_filter = 1;
+        cmp_never.xy_min_filter = 1;
+        cmp_never.mip_filter = 1;
+        cmp_never.depth_compare_func = 0;  // SQ_TEX_DEPTH_COMPARE_NEVER
+        const d3d::SamplerDesc d_cmp = d3d12_from_sampler_for_comparison(cmp_never, true, &exact);
+        CHECK(exact && (d_cmp.filter & 0x180u) == 0x80u && d_cmp.comparison_func == 1u);
+
+        SamplerState color_with_cmp;
+        color_with_cmp.xy_mag_filter = 1;
+        color_with_cmp.xy_min_filter = 1;
+        color_with_cmp.mip_filter = 1;
+        color_with_cmp.depth_compare_func = 3;  // stale LESS_EQUAL on non-comparison sampler
+        const d3d::SamplerDesc d_color = d3d12_from_sampler_for_comparison(color_with_cmp, false, &exact);
+        CHECK(exact && (d_color.filter & 0x180u) == 0u && d_color.comparison_func == 0u);
+    }
+
+    // 6. GFX10.3 linear 1D/2D T# pitch vs effective depth.
+    {
+        ImageResource lin2d;
+        lin2d.type = ImageType::Tex2D;
+        lin2d.sw_mode = 0;  // SW_LINEAR
+        lin2d.width = 1920;
+        lin2d.height = 1080;
+        lin2d.depth = 2048;  // word4 stores pitch - 1 = 2047 -> decoded depth = 2048
+        CHECK(image_effective_depth(lin2d) == 1u);
+        CHECK(image_linear_pitch_texels(lin2d) == 2048u);
+
+        ImageResource arr2d = lin2d;
+        arr2d.type = ImageType::Tex2DArray;
+        arr2d.depth = 6;
+        CHECK(image_effective_depth(arr2d) == 6u);
+        CHECK(image_linear_pitch_texels(arr2d) == 1920u);
+
+        ImageResource tiled2d = lin2d;
+        tiled2d.sw_mode = 27;  // 64KB_S_X
+        tiled2d.depth = 1;
+        CHECK(image_effective_depth(tiled2d) == 1u);
+        CHECK(image_linear_pitch_texels(tiled2d) == 1920u);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1168,6 +1379,7 @@ int main() {
     test_g83_3d_view_dimensions();
     test_g83_formats_depth_srgb_and_swizzles();
     test_g83_buffers_and_samplers();
+    test_console_color_and_gfx103_fidelity();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_gfx10_descriptors failed with %d failure(s)\n", g_failures);
         return 1;
