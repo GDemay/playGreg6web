@@ -17,8 +17,10 @@ void PresentPacer::reset_for_testing() {
     sleep_until_ = [](Clock::time_point t) { os::host_sleep::sleep_until(t); };  // precise (R40)
     enabled_ = true;
     have_last_ = false;
+    have_last_present_time_ = false;
     title_driven_ = false;
     last_flip_ = 0;
+    last_present_time_ = Clock::time_point{};
     stats_ = Stats{};
 }
 
@@ -30,13 +32,17 @@ void PresentPacer::set_clock_for_testing(std::function<Clock::time_point()> now,
     sleep_until_ = std::move(sleep_until);
     origin_ = origin;
     have_last_ = false;
+    have_last_present_time_ = false;
     last_flip_ = 0;
+    last_present_time_ = Clock::time_point{};
     stats_ = Stats{};
 }
 
 void PresentPacer::set_title_driven(bool on) {
     std::lock_guard<std::mutex> lock(mutex_);
     title_driven_ = on;
+    have_last_present_time_ = false;
+    last_present_time_ = Clock::time_point{};
 }
 
 bool PresentPacer::title_driven() const {
@@ -69,8 +75,30 @@ uint64_t PresentPacer::present(uint32_t interval) {
     ++stats_.presents;
     stats_.last_interval = interval;
     if (title_driven_) {
-        ++stats_.immediate;
-        return current;
+        if (interval == 0) {
+            ++stats_.immediate;
+            last_present_time_ = now;
+            have_last_present_time_ = true;
+            return current;
+        }
+        if (!have_last_present_time_ ||
+            now >= last_present_time_ + std::chrono::nanoseconds(kVblankNs)) {
+            ++stats_.immediate;
+            last_present_time_ = now;
+            have_last_present_time_ = true;
+            return current;
+        }
+        const Clock::time_point until = last_present_time_ + std::chrono::nanoseconds(kVblankNs);
+        last_present_time_ = until;
+        have_last_present_time_ = true;
+        auto sleep_until = sleep_until_;
+        lock.unlock();
+        sleep_until(until);
+        lock.lock();
+        ++stats_.waits;
+        stats_.wait_us += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(until - now).count());
+        return vblank_at(until);
     }
     if (interval == 0) {
         ++stats_.immediate;
@@ -105,6 +133,8 @@ void PresentPacer::set_enabled(bool on) {
     std::lock_guard<std::mutex> lock(mutex_);
     enabled_ = on;
     have_last_ = false;
+    have_last_present_time_ = false;
+    last_present_time_ = Clock::time_point{};
 }
 
 bool PresentPacer::enabled() const {

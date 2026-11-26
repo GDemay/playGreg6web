@@ -43,8 +43,10 @@ public:
     };
     Stats stats() const;
 
-    // The title drives the frame interval (SetFrameIntervalX): presents are counted but add no 60 Hz
-    // wait, the title's own frame events pace it.
+    // The title drives the frame interval (SetFrameIntervalX): presents are not quantized to the
+    // global 60 Hz vblank grid (zero phase beat when the title paces itself at <= 60 Hz), but
+    // interval > 0 presents still enforce a 1-vblank (60 Hz) minimum gap from the previous present
+    // so unpaced/catch-up bursts cannot flood asynchronous WebGPU queues (G74).
     void set_title_driven(bool on);
     bool title_driven() const;
 
@@ -71,7 +73,9 @@ private:
     bool enabled_ = true;
     bool title_driven_ = false;
     bool have_last_ = false;
+    bool have_last_present_time_ = false;
     uint64_t last_flip_ = 0;
+    Clock::time_point last_present_time_{};
     Stats stats_{};
 };
 
