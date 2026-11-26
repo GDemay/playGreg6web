@@ -1192,6 +1192,10 @@ private:
         uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
         bool ever_uploaded = false;
         bool dedicated = false;
+        // Native write tracking of the guest range: with a primed cursor and no page written since the last
+        // flush the range is not hashed again (flush_cpu_buffers). Unprimed = hash and arm.
+        os::WriteCursor write_cursor;
+        bool write_primed = false;
     };
     struct RelocatedStorageKey {
         uint64_t va = 0;
@@ -1216,6 +1220,8 @@ private:
         uint32_t buffer_id = 0;
         uint64_t last_hash = 0;
         uint64_t last_used_seq = 0;
+        os::WriteCursor write_cursor;  // as RelocatedStorage
+        bool write_primed = false;
     };
     mutable std::mutex ia_relocation_mutex_;
     std::map<std::pair<uint64_t, uint64_t>, RelocatedIa> ia_relocations_;  // (base GPU VA, size)
