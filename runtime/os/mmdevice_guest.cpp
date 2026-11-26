@@ -47,6 +47,7 @@
 #include <thread>
 #include <vector>
 
+#include "os/host_sleep.h"
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/xbox_middleware.h"
@@ -209,7 +210,30 @@ struct StreamClock {
     std::atomic<uint64_t> event{0};
     std::atomic<uint64_t> frames_played{0};
     std::atomic<uint64_t> periods{0};
+    // Bounded pending period credits so catch-up ticks never collapse on an auto-reset event.
+    std::atomic<uint32_t> pending_passes{0};
 };
+
+void add_pending_passes(StreamClock& c, uint32_t count) {
+    uint32_t cur = c.pending_passes.load(std::memory_order_relaxed);
+    for (;;) {
+        const uint32_t next = (cur + count > kAudioMaxCatchupPeriods) ? kAudioMaxCatchupPeriods : (cur + count);
+        if (c.pending_passes.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+}
+
+bool consume_pending_pass(StreamClock& c) {
+    uint32_t cur = c.pending_passes.load(std::memory_order_acquire);
+    while (cur > 0) {
+        if (c.pending_passes.compare_exchange_weak(cur, cur - 1, std::memory_order_acq_rel,
+                                                   std::memory_order_acquire)) {
+            return (cur - 1) > 0;
+        }
+    }
+    return false;
+}
 
 struct Sink {
     std::atomic<bool> has_sink{false};
@@ -225,6 +249,7 @@ Sink& sink() {
 class Engine {
 public:
     Engine() { tick_live_.reserve(8); }
+    ~Engine() { set_manual(true); }
 
     void add(const std::shared_ptr<StreamClock>& clock) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -236,10 +261,22 @@ public:
         cv_.notify_all();
     }
 
-    // One period for every started stream (the thread's step; tests call it directly).
-    void tick() {
+    // One period for every started stream (tests call it directly).
+    void tick() { tick_periods(1); }
+
+    // Advances every started stream by `periods` quanta (clamped to kAudioMaxCatchupPeriods),
+    // draining any staged catch-up audio into the output PCM ring and crediting pending passes so
+    // an auto-reset guest event cannot coalesce and drop catch-up periods.
+    void tick_periods(uint32_t periods) {
+        if (periods == 0) {
+            return;
+        }
+        if (periods > kAudioMaxCatchupPeriods) {
+            periods = kAudioMaxCatchupPeriods;
+        }
         std::lock_guard<std::mutex> tick_lock(tick_mutex_);
         tick_live_.clear();
+        uint32_t started_count = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             clocks_.erase(std::remove_if(clocks_.begin(), clocks_.end(),
@@ -247,22 +284,58 @@ public:
                           clocks_.end());
             for (const auto& w : clocks_) {
                 if (auto c = w.lock()) {
+                    if (c->started.load(std::memory_order_acquire)) {
+                        ++started_count;
+                    }
                     tick_live_.push_back(std::move(c));
                 }
             }
         }
-        audio_downmix::flush_period(kPeriodFrames);
+        active_started_streams_.store(started_count, std::memory_order_release);
+
+        // Drain up to kAudioMaxCatchupPeriods ready periods so jitter-delayed guest passes never
+        // stay permanently stranded in the staging buffer while the browser ring starves.
+        const uint32_t flushed_frames = audio_downmix::flush_pending(kPeriodFrames, kAudioMaxCatchupPeriods);
+        const uint32_t flushed_periods = flushed_frames / kPeriodFrames;
+
+        if (!manual_atomic_.load(std::memory_order_acquire) && started_count > 0) {
+            if (flushed_periods < periods) {
+                add_flush_deficit(periods - flushed_periods);
+            } else if (flushed_periods > periods) {
+                sub_flush_deficit(flushed_periods - periods);
+            }
+        }
+
+        const uint64_t advance_frames = static_cast<uint64_t>(periods) * kPeriodFrames;
         for (const auto& c : tick_live_) {
-            if (!c->started.load()) {
+            if (!c->started.load(std::memory_order_acquire)) {
                 continue;
             }
-            c->frames_played.fetch_add(kPeriodFrames);
-            c->periods.fetch_add(1);
-            if (const uint64_t ev = c->event.load(); ev != 0) {
+            c->frames_played.fetch_add(advance_frames, std::memory_order_relaxed);
+            c->periods.fetch_add(periods, std::memory_order_relaxed);
+            add_pending_passes(*c, periods);
+            if (const uint64_t ev = c->event.load(std::memory_order_acquire); ev != 0) {
                 win32::SetEvent(static_cast<win32::Handle>(ev));
             }
         }
         tick_live_.clear();
+    }
+
+    // Called by a guest audio stream right after pushing rendered PCM to audio_downmix. When the
+    // live real-time clock has already ticked past an empty staging buffer (flush_deficit_ > 0)
+    // and only a single stream is active, flush immediately into playgta6_audio_ring instead of
+    // delaying the audio up to 10 ms until the next timer tick.
+    void on_stream_data_pushed() {
+        if (manual_atomic_.load(std::memory_order_acquire) ||
+            active_started_streams_.load(std::memory_order_acquire) != 1) {
+            return;
+        }
+        if (flush_deficit_.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        if (audio_downmix::flush_period(kPeriodFrames) > 0) {
+            sub_flush_deficit(1);
+        }
     }
 
     void set_manual(bool manual) {
@@ -270,10 +343,14 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             manual_ = manual;
+            manual_atomic_.store(manual, std::memory_order_release);
             if (manual && thread_.joinable()) {
                 stop_ = true;
                 cv_.notify_all();
                 old = std::move(thread_);
+            } else if (!manual && !clocks_.empty() && !thread_.joinable()) {
+                stop_ = false;
+                thread_ = std::thread([this] { run(); });
             }
         }
         if (old.joinable()) {
@@ -286,25 +363,53 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         clocks_.clear();
         manual_ = false;
+        manual_atomic_.store(false, std::memory_order_release);
+        active_started_streams_.store(0, std::memory_order_release);
+        flush_deficit_.store(0, std::memory_order_release);
     }
 
 private:
+    void add_flush_deficit(uint32_t delta) {
+        uint32_t cur = flush_deficit_.load(std::memory_order_relaxed);
+        for (;;) {
+            const uint32_t next = (cur + delta > kAudioMaxCatchupPeriods) ? kAudioMaxCatchupPeriods : (cur + delta);
+            if (flush_deficit_.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+
+    void sub_flush_deficit(uint32_t delta) {
+        uint32_t cur = flush_deficit_.load(std::memory_order_acquire);
+        while (cur > 0) {
+            const uint32_t next = (cur > delta) ? (cur - delta) : 0u;
+            if (flush_deficit_.compare_exchange_weak(cur, next, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                break;
+            }
+        }
+    }
+
     void run() {
-        auto next = std::chrono::steady_clock::now();
+        host_sleep::raise_timer_resolution();
+        const auto origin = std::chrono::steady_clock::now();
+        AudioPacer pacer{};
+        pacer.step(0);  // arm first deadline at origin + kAudioPeriodUs
         std::unique_lock<std::mutex> lock(mutex_);
         while (!stop_) {
-            next += std::chrono::microseconds(kPeriodHns / 10);
-            cv_.wait_until(lock, next, [this] { return stop_; });
+            const auto deadline = origin + std::chrono::microseconds(pacer.next_deadline_us);
+            cv_.wait_until(lock, deadline, [this] { return stop_; });
             if (stop_) {
                 break;
             }
-            lock.unlock();
-            tick();
-            lock.lock();
-            const auto now = std::chrono::steady_clock::now();
-            if (now - next > std::chrono::milliseconds(100)) {
-                next = now;  // a long stall: do not burst the missed periods
+            const int64_t now_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - origin).count();
+            const uint32_t due = pacer.step(now_us);
+            if (due == 0) {
+                continue;
             }
+            lock.unlock();
+            tick_periods(due);
+            lock.lock();
         }
     }
 
@@ -314,6 +419,9 @@ private:
     std::vector<std::weak_ptr<StreamClock>> clocks_;
     std::vector<std::shared_ptr<StreamClock>> tick_live_;
     std::thread thread_;
+    std::atomic<bool> manual_atomic_{false};
+    std::atomic<uint32_t> active_started_streams_{0};
+    std::atomic<uint32_t> flush_deficit_{0};
     bool stop_ = false;
     bool manual_ = false;
 };
@@ -613,6 +721,7 @@ public:
             return kNotInitialized;
         }
         const bool was = clock_->started.exchange(false);
+        clock_->pending_passes.store(0, std::memory_order_release);
         return was ? kOk : kSFalse;
     }
     HResult Reset() {  // 12
@@ -625,6 +734,7 @@ public:
         }
         written_ = 0;
         clock_->frames_played = 0;
+        clock_->pending_passes.store(0, std::memory_order_release);
         return kOk;
     }
     HResult SetEventHandle(uint64_t event) {  // 13
@@ -668,20 +778,27 @@ public:
     }
     HResult release_buffer(uint32_t frames, uint32_t flags) {
         uint64_t buffer = 0;
+        const bool silent = (flags & 0x2u) != 0;  // AUDCLNT_BUFFERFLAGS_SILENT
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (frames > pending_ || (frames != 0 && pending_ == 0)) {
                 return com::E_INVALIDARG_HR;
             }
             pending_ = 0;
+            // After an underrun where the play cursor moved past `written_`, snap forward to the
+            // live play cursor so newly written audio is not swallowed by stale silence history.
+            const uint64_t played = clock_->frames_played.load(std::memory_order_acquire);
+            if (written_ < played) {
+                written_ = played;
+            }
             written_ += frames;
-            buffer = (flags & 0x2u) != 0 ? 0 : buffer_;  // AUDCLNT_BUFFERFLAGS_SILENT
+            buffer = silent ? 0 : buffer_;
         }
-        if ((flags & 0x2u) != 0) {
+        if (silent) {
             g_render_silent_releases.fetch_add(1);
         }
         g_render_frames.fetch_add(frames);
-        if (buffer != 0 && frames != 0) {
+        if (frames != 0) {
             const size_t samples = static_cast<size_t>(frames) * 2;
             float stack_stereo[kRenderBufferFrames * 2];
             float* stereo = stack_stereo;
@@ -693,7 +810,12 @@ public:
                 }
                 stereo = stereo_scratch_.data();
             }
-            if (com::read_guest(buffer, stereo, samples * sizeof(float))) {
+            if (silent) {
+                std::memset(stereo, 0, samples * sizeof(float));
+                audio_report::windows().record(frames, false);
+                audio_downmix::push_render_stereo(stereo, frames);
+                engine().on_stream_data_pushed();
+            } else if (buffer != 0 && com::read_guest(buffer, stereo, samples * sizeof(float))) {
                 forward_samples(0, stereo, frames, 2);
                 const bool nonzero = any_nonzero(stereo, samples, nullptr);
                 if (nonzero) {
@@ -701,6 +823,7 @@ public:
                 }
                 audio_report::windows().record(frames, nonzero);
                 audio_downmix::push_render_stereo(stereo, frames);
+                engine().on_stream_data_pushed();
             }
         }
         return kOk;
@@ -840,11 +963,13 @@ public:
     }
     HResult Stop() {  // 6
         clock_->started = false;
+        clock_->pending_passes.store(0, std::memory_order_release);
         return kOk;
     }
     HResult Reset() {  // 7
         std::lock_guard<std::mutex> lock(mutex_);
         clock_->frames_played = 0;
+        clock_->pending_passes.store(0, std::memory_order_release);
         return kOk;
     }
     HResult BeginUpdatingAudioObjects(GuestPtr<uint32_t> available_dynamic, GuestPtr<uint32_t> frames) {  // 8
@@ -943,6 +1068,15 @@ public:
             audio_report::windows().record(kPeriodFrames, pass_nonzero);
             if (valid_count != 0) {
                 audio_downmix::push_spatial_pass(types_data, ptrs_data, valid_count, kPeriodFrames);
+                engine().on_stream_data_pushed();
+            }
+        }
+        // Consume one pending period credit; if catch-up periods are still owed on this started
+        // stream, immediately re-signal the auto-reset event so the guest renders them back-to-back
+        // instead of losing catch-up periods to auto-reset event coalescing.
+        if (consume_pending_pass(*clock_) && clock_->started.load(std::memory_order_acquire)) {
+            if (const uint64_t ev = clock_->event.load(std::memory_order_acquire); ev != 0) {
+                win32::SetEvent(static_cast<win32::Handle>(ev));
             }
         }
         if (trace_on) {
@@ -1486,8 +1620,38 @@ AudioEndpointStats audio_endpoint_stats() {
     return s;
 }
 
+uint32_t AudioPacer::step(int64_t now_us) {
+    if (!initialized) {
+        initialized = true;
+        next_deadline_us = now_us + kAudioPeriodUs;
+        return 0;
+    }
+    if (now_us < next_deadline_us) {
+        return 0;
+    }
+    const int64_t behind_us = now_us - next_deadline_us;
+    const uint64_t due64 = 1u + static_cast<uint64_t>(behind_us / kAudioPeriodUs);
+    uint32_t due = 0;
+    if (due64 > kAudioMaxCatchupPeriods) {
+        // Long stall (e.g. tab background or Wasm stall > 40 ms): clamp to a bounded catch-up
+        // burst so the browser ring re-primes smoothly without bursting dozens of quanta at once.
+        due = kAudioMaxCatchupPeriods;
+        next_deadline_us = now_us + kAudioPeriodUs;
+        ++stalls_clamped;
+    } else {
+        due = static_cast<uint32_t>(due64);
+        next_deadline_us += static_cast<int64_t>(due) * kAudioPeriodUs;
+    }
+    if (due > 1) {
+        ++catchup_bursts;
+    }
+    periods_emitted += due;
+    return due;
+}
+
 void audio_engine_manual_clock(bool manual) { engine().set_manual(manual); }
 void audio_engine_tick() { engine().tick(); }
+void audio_engine_tick_periods(uint32_t periods) { engine().tick_periods(periods); }
 
 void set_audio_endpoint_enabled(bool on) { g_endpoint_enabled.store(on); }
 bool audio_endpoint_enabled() { return g_endpoint_enabled.load(); }
