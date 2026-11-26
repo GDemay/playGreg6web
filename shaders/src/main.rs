@@ -115,7 +115,7 @@ fn print_usage() {
     eprintln!("  playgta6-shaders reflect-dxil <file-or-dir> [--out <json>] [--json]");
     eprintln!("  playgta6-shaders disasm-rdna2 <file> [--json] [--max-instructions <N>]");
     eprintln!(
-        "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]"
+        "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--json]"
     );
     eprintln!(
         "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
@@ -444,7 +444,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             }
 
             let file_path = file_path.ok_or_else(|| {
-                "translate-rdna2 requires <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute] [--json]".to_string()
+                "translate-rdna2 requires <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--json]".to_string()
             })?;
 
             Ok(Command::TranslateRdna2 {
@@ -3503,6 +3503,55 @@ mod tests {
         assert!(err.contains("line 1"), "err: {err}");
         assert!(!err.contains(&root_str), "err must not leak host path: {err}");
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cli_parses_and_translates_mesh_stage_override() {
+        let cmd = parse_args(&[
+            "translate-rdna2".to_string(),
+            "mesh.ms.bin".to_string(),
+            "--stage".to_string(),
+            "mesh".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("translate-rdna2 --stage mesh must parse");
+        assert_eq!(
+            cmd,
+            Command::TranslateRdna2 {
+                file_path: PathBuf::from("mesh.ms.bin"),
+                out_path: None,
+                stage: Rdna2StageOverride::Mesh,
+                json: true,
+            }
+        );
+
+        let root = make_temp_dir("playgta6_cli_mesh");
+        let bin_path = root.join("sample.ms.bin");
+        // s_mov_b32 m0, (1 << 12) | 3 ; s_sendmsg MSG_GS_ALLOC_REQ ; exp pos0 ; exp prim ; s_endpgm
+        let words: Vec<u32> = vec![
+            (0b1011_1110_1u32 << 23) | (124u32 << 16) | (0x03u32 << 8) | 0xFFu32,
+            (1u32 << 12) | 3u32,
+            (0b1011_1111_1u32 << 23) | (0x10u32 << 16) | 9u32,
+            (0b111110u32 << 26) | (12u32 << 4) | 0xFu32,
+            0x0302_0100,
+            (0b111110u32 << 26) | (1u32 << 11) | (20u32 << 4) | 0x1u32,
+            0x0000_0004,
+            (0b1011_1111_1u32 << 23) | (0x01u32 << 16),
+        ];
+        fs::write(&bin_path, words_to_bytes(&words)).unwrap();
+
+        let (json_out, output, _) =
+            format_translate_rdna2(&bin_path, Rdna2StageOverride::Mesh, true)
+                .expect("CLI mesh translation must succeed");
+        assert_eq!(output.stage, ShaderStage::Compute);
+        assert!(output.mesh_output.is_some());
+        assert!(
+            json_out.contains(
+                "\"mesh_output\": {\"max_vertices\": 3, \"max_primitives\": 1, \"vertex_words\": 4}"
+            ),
+            "JSON:\n{json_out}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

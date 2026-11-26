@@ -30,9 +30,10 @@ use crate::pack::{
 };
 use crate::rdna2_to_wgsl::{
     Rdna2StageOverride, Rdna2TranslateOptions, Rdna2WgslOutput, WgslBindingInfo,
-    WgslVertexInputInfo, translate_rdna2_to_wgsl, write_wgsl_bindings_json,
+    WgslVertexInputInfo, translate_rdna2_to_wgsl, write_mesh_output_json, write_wgsl_bindings_json,
     write_wgsl_vertex_inputs_json,
 };
+pub use crate::rdna2_to_wgsl::{MESH_COMPUTE_KEY_SALT, MeshOutputLayout, mesh_compute_pack_key};
 
 /// File extensions recognized as raw RDNA2 shader blobs (ASCII case-insensitive).
 pub const SUPPORTED_RDNA2_EXTENSIONS: &[&str] = &["bin", "rdna2", "shader"];
@@ -55,6 +56,9 @@ pub struct PipelineDumpNativeStage {
     pub code_identity: u64,
     pub identity: Option<u64>,
     pub stage: ShaderStage,
+    /// `true` when the manifest declared `"stage": "mesh"` / `"ms"` (packed as `ShaderStage::Compute`
+    /// under `code_identity ^ MESH_COMPUTE_KEY_SALT`).
+    pub is_mesh: bool,
     pub code_file: String,
     pub code_bytes: Option<u64>,
 }
@@ -220,6 +224,7 @@ pub struct Rdna2PackEntrySummary {
     pub vertex_input_mode: String,
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
+    pub mesh_output: Option<MeshOutputLayout>,
 }
 
 /// Strictly sanitized record of an individual shader that failed packing (zero host paths,
@@ -342,6 +347,10 @@ impl Rdna2PackSummary {
                 if !entry.vertex_inputs.is_empty() {
                     out.push_str(",\n      \"vertex_inputs\": ");
                     write_wgsl_vertex_inputs_json(&mut out, &entry.vertex_inputs, "      ");
+                }
+                if let Some(mesh_output) = entry.mesh_output {
+                    out.push_str(",\n      \"mesh_output\": ");
+                    write_mesh_output_json(&mut out, mesh_output);
                 }
                 out.push('\n');
                 if i + 1 < self.entries.len() {
@@ -530,6 +539,8 @@ fn parse_stage_token(token: &str) -> Option<Rdna2StageOverride> {
         Some(Rdna2StageOverride::Pixel)
     } else if token.eq_ignore_ascii_case("cs") || token.eq_ignore_ascii_case("compute") {
         Some(Rdna2StageOverride::Compute)
+    } else if token.eq_ignore_ascii_case("ms") || token.eq_ignore_ascii_case("mesh") {
+        Some(Rdna2StageOverride::Mesh)
     } else {
         None
     }
@@ -625,7 +636,7 @@ pub fn parse_filename_hint(name: &str) -> Rdna2FilenameHint {
     };
 
     let parts: Vec<&str> = stem
-        .split(['_', '-'])
+        .split(['_', '-', '.'])
         .filter(|part| !part.is_empty())
         .collect();
     if parts.is_empty() {
@@ -653,7 +664,10 @@ pub fn parse_filename_hint(name: &str) -> Rdna2FilenameHint {
     Rdna2FilenameHint { stage, hash }
 }
 
-fn stage_to_override(stage: ShaderStage) -> Rdna2StageOverride {
+fn stage_to_override(stage: ShaderStage, is_mesh: bool) -> Rdna2StageOverride {
+    if is_mesh {
+        return Rdna2StageOverride::Mesh;
+    }
     match stage {
         ShaderStage::Vertex => Rdna2StageOverride::Vertex,
         ShaderStage::Fragment => Rdna2StageOverride::Pixel,
@@ -666,17 +680,19 @@ fn override_to_stage(stage: Rdna2StageOverride) -> Option<ShaderStage> {
         Rdna2StageOverride::Auto => None,
         Rdna2StageOverride::Vertex => Some(ShaderStage::Vertex),
         Rdna2StageOverride::Pixel => Some(ShaderStage::Fragment),
-        Rdna2StageOverride::Compute => Some(ShaderStage::Compute),
+        Rdna2StageOverride::Compute | Rdna2StageOverride::Mesh => Some(ShaderStage::Compute),
     }
 }
 
-fn parse_manifest_stage(value: &str) -> Option<ShaderStage> {
+fn parse_manifest_stage(value: &str) -> Option<(ShaderStage, bool)> {
     if value.eq_ignore_ascii_case("vertex") {
-        Some(ShaderStage::Vertex)
+        Some((ShaderStage::Vertex, false))
     } else if value.eq_ignore_ascii_case("pixel") || value.eq_ignore_ascii_case("fragment") {
-        Some(ShaderStage::Fragment)
+        Some((ShaderStage::Fragment, false))
     } else if value.eq_ignore_ascii_case("compute") {
-        Some(ShaderStage::Compute)
+        Some((ShaderStage::Compute, false))
+    } else if value.eq_ignore_ascii_case("mesh") || value.eq_ignore_ascii_case("ms") {
+        Some((ShaderStage::Compute, true))
     } else {
         None
     }
@@ -1173,9 +1189,9 @@ pub fn parse_pipeline_dump_manifest(
                     "native_stages[{idx}] missing string field \"stage\""
                 ))
             })?;
-        let stage = parse_manifest_stage(stage_raw).ok_or_else(|| {
+        let (stage, is_mesh) = parse_manifest_stage(stage_raw).ok_or_else(|| {
             Rdna2PackError::InvalidManifest(format!(
-                "native_stages[{idx}] has unsupported stage '{stage_raw}' (expected 'vertex', 'pixel', or 'compute')"
+                "native_stages[{idx}] has unsupported stage '{stage_raw}' (expected 'vertex', 'pixel', 'compute', or 'mesh')"
             ))
         })?;
 
@@ -1202,6 +1218,7 @@ pub fn parse_pipeline_dump_manifest(
             code_identity,
             identity,
             stage,
+            is_mesh,
             code_file: code_file.to_string(),
             code_bytes,
         });
@@ -1503,6 +1520,7 @@ const fn stage_override_key(stage: Rdna2StageOverride) -> u8 {
         Rdna2StageOverride::Vertex => 1,
         Rdna2StageOverride::Pixel => 2,
         Rdna2StageOverride::Compute => 3,
+        Rdna2StageOverride::Mesh => 4,
     }
 }
 
@@ -1517,6 +1535,7 @@ struct TranslatedStageData {
     vertex_input_mode: String,
     bindings: Vec<WgslBindingInfo>,
     vertex_inputs: Vec<WgslVertexInputInfo>,
+    mesh_output: Option<MeshOutputLayout>,
 }
 
 impl TranslatedStageData {
@@ -1531,6 +1550,7 @@ impl TranslatedStageData {
             vertex_input_mode: output.binding_summary.vertex_input_mode,
             bindings: output.bindings,
             vertex_inputs: output.vertex_inputs,
+            mesh_output: output.mesh_output,
         }
     }
 
@@ -1552,6 +1572,7 @@ impl TranslatedStageData {
             vertex_input_mode: self.vertex_input_mode,
             bindings: self.bindings,
             vertex_inputs: self.vertex_inputs,
+            mesh_output: self.mesh_output,
         };
         (entry, summary)
     }
@@ -1736,7 +1757,12 @@ fn pack_blobs_into_map(
         };
         let explicit_hash = blob.hash_override.or(hint.hash);
         let content_hash = fnv1a_64(&blob.bytes);
-        let final_hash = explicit_hash.unwrap_or(content_hash);
+        let base_hash = explicit_hash.unwrap_or(content_hash);
+        let final_hash = if stage == Rdna2StageOverride::Mesh {
+            mesh_compute_pack_key(base_hash)
+        } else {
+            base_hash
+        };
 
         let work_idx = if blob.bytes.len() < MIN_RDNA2_BLOB_BYTES {
             None
@@ -2099,7 +2125,7 @@ fn translate_manifest_stage(
     }
 
     let translate_opts = Rdna2TranslateOptions {
-        stage: stage_to_override(entry.stage),
+        stage: stage_to_override(entry.stage, entry.is_mesh),
         entry_point: options.translate.entry_point.clone(),
         min_cbv_vec4_count: options.translate.min_cbv_vec4_count,
         workgroup_size: options.translate.workgroup_size,
@@ -2162,11 +2188,16 @@ fn pack_manifest_into_map(
     // code blob in `playgta6-pipeline-dump`), preserving original manifest appearance index for
     // `BudgetOrder::ManifestOrder` while sorting by `code_identity` for deterministic translation
     // and strict-mode failure reporting.
-    let mut seen_code_ids: BTreeSet<u64> = BTreeSet::new();
+    let mut seen_pack_keys: BTreeSet<u64> = BTreeSet::new();
     let mut unique_stages: Vec<(usize, PipelineDumpNativeStage)> =
         Vec::with_capacity(manifest.native_stages.len());
     for entry in manifest.native_stages {
-        if !seen_code_ids.insert(entry.code_identity) {
+        let pack_key = if entry.is_mesh {
+            mesh_compute_pack_key(entry.code_identity)
+        } else {
+            entry.code_identity
+        };
+        if !seen_pack_keys.insert(pack_key) {
             state.manifest_duplicates_skipped += 1;
             continue;
         }
@@ -2174,7 +2205,13 @@ fn pack_manifest_into_map(
         state.next_source_order = state.next_source_order.saturating_add(1);
         unique_stages.push((source_order, entry));
     }
-    unique_stages.sort_by_key(|(_, entry)| entry.code_identity);
+    unique_stages.sort_by_key(|(_, entry)| {
+        if entry.is_mesh {
+            mesh_compute_pack_key(entry.code_identity)
+        } else {
+            entry.code_identity
+        }
+    });
 
     state.total_blobs += unique_stages.len();
 
@@ -2209,9 +2246,14 @@ fn pack_manifest_into_map(
                 state.skipped_or_failed += 1;
             }
             TranslatedStageOutcome::Translated(data) => {
-                let (pack_entry, entry_summary) = data.into_pack_parts(entry.code_identity);
+                let pack_key = if entry.is_mesh {
+                    mesh_compute_pack_key(entry.code_identity)
+                } else {
+                    entry.code_identity
+                };
+                let (pack_entry, entry_summary) = data.into_pack_parts(pack_key);
                 state.insert_translated(
-                    entry.code_identity,
+                    pack_key,
                     source_order,
                     pack_entry,
                     entry_summary,
@@ -4688,5 +4730,125 @@ fedcba9876543210\n";
         assert_eq!(unbounded.entries.len(), 5);
         assert_eq!(unbounded.summary.priority_hashes_requested, 3);
         assert_eq!(unbounded.summary.priority_hashes_packed, 2);
+    }
+
+    #[test]
+    fn parses_mesh_filename_hints_and_packs_mesh_blobs_and_manifest_with_salted_key() {
+        assert_eq!(
+            parse_filename_hint("ms_0123456789abcdef.rdna2"),
+            Rdna2FilenameHint {
+                stage: Rdna2StageOverride::Mesh,
+                hash: Some(0x0123_4567_89ab_cdef),
+            }
+        );
+        assert_eq!(
+            parse_filename_hint("0123456789abcdef.ms.bin"),
+            Rdna2FilenameHint {
+                stage: Rdna2StageOverride::Mesh,
+                hash: Some(0x0123_4567_89ab_cdef),
+            }
+        );
+        assert_eq!(
+            parse_filename_hint("meshlet.ms.bin"),
+            Rdna2FilenameHint {
+                stage: Rdna2StageOverride::Mesh,
+                hash: None,
+            }
+        );
+        assert_eq!(
+            parse_filename_hint("mesh_fedcba9876543210.bin"),
+            Rdna2FilenameHint {
+                stage: Rdna2StageOverride::Mesh,
+                hash: Some(0xfedc_ba98_7654_3210),
+            }
+        );
+
+        // Synthetic GFX10.3 mesh shader (3 verts, 1 prim, pos0 + param0 + prim).
+        let enc_sop1 = |op: u8, sdst: u8, ssrc0: u8| -> u32 {
+            (0b1011_1110_1u32 << 23)
+                | (u32::from(sdst & 0x7F) << 16)
+                | (u32::from(op) << 8)
+                | u32::from(ssrc0)
+        };
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 124, 0xFF)); // s_mov_b32 m0, (1 << 12) | 3
+        words.push((1u32 << 12) | 3u32);
+        words.push(enc_sopp(0x10, 9)); // s_sendmsg MSG_GS_ALLOC_REQ
+        words.push(enc_vop1(0x01, 1, 242)); // v1 = 1.0
+        words.push(enc_vop1(0x01, 2, 242));
+        words.push(enc_vop1(0x01, 3, 242));
+        words.push(enc_vop1(0x01, 4, 242));
+        words.push(enc_vop1(0x01, 8, 0xFF));
+        words.push((2u32 << 20) | (1u32 << 10));
+        words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [0, 1, 2, 3]));
+        words.extend_from_slice(&enc_exp(32, 0xF, false, false, false, [4, 4, 4, 4]));
+        words.extend_from_slice(&enc_exp(20, 0x1, false, true, false, [8, 0, 0, 0]));
+        words.push(enc_sopp(0x10, 3)); // s_sendmsg MSG_GS_DONE
+        words.push(enc_sopp(0x01, 0)); // s_endpgm
+        let ms_bytes = words_to_bytes(&words);
+        let raw_hash = fnv1a_64(&ms_bytes);
+        let expected_pack_key = raw_hash ^ MESH_COMPUTE_KEY_SALT;
+
+        // 1) Blob packing via `.ms.bin` filename hint
+        let blob_res = pack_rdna2_blobs(
+            &[Rdna2BlobInput::new(
+                format!("{raw_hash:016x}.ms.bin"),
+                ms_bytes.clone(),
+            )],
+            &Rdna2PackOptions::default(),
+        )
+        .expect("packing .ms.bin blob must succeed");
+
+        assert_eq!(blob_res.entries.len(), 1);
+        assert_eq!(blob_res.entries[0].hash, expected_pack_key);
+        assert_eq!(blob_res.entries[0].stage, ShaderStage::Compute);
+        assert_eq!(blob_res.entries[0].stage.to_u8(), 3);
+        let decoded = read_pack(&blob_res.pack_bytes).expect("valid WGPK v1");
+        assert_eq!(decoded.entries.len(), 1);
+        assert_eq!(decoded.entries[0].hash, expected_pack_key);
+        assert_eq!(decoded.entries[0].stage, ShaderStage::Compute);
+        assert!(decoded.entries[0].wgsl.contains("@group(3) @binding(0)"));
+
+        let json = blob_res.summary.to_json();
+        assert!(
+            json.contains(&format!("\"hash_fnv1a64\": \"0x{expected_pack_key:016x}\"")),
+            "JSON:\n{json}"
+        );
+        assert!(json.contains("\"stage\": \"compute\""), "JSON:\n{json}");
+        assert!(
+            json.contains(
+                "\"mesh_output\": {\"max_vertices\": 3, \"max_primitives\": 1, \"vertex_words\": 8}"
+            ),
+            "JSON:\n{json}"
+        );
+
+        // 2) Manifest packing with `"stage": "mesh"` and `"stage": "ms"`
+        let root = make_temp_dir("playgta6_mesh_manifest");
+        let ms_file = root.join("mesh_stage.bin");
+        fs::write(&ms_file, &ms_bytes).unwrap();
+
+        for stage_str in ["mesh", "ms"] {
+            let manifest_path = root.join(format!("manifest_{stage_str}.json"));
+            let manifest_json = format!(
+                "{{\"schema\": \"playgta6-pipeline-dump\", \"schema_version\": 1, \"native_stages\": [{{\"code_identity\": \"0x{raw_hash:016x}\", \"stage\": \"{stage_str}\", \"code_file\": \"mesh_stage.bin\"}}]}}"
+            );
+            fs::write(&manifest_path, manifest_json).unwrap();
+
+            let res = pack_rdna2_manifest(&manifest_path, &Rdna2PackOptions::default())
+                .expect("manifest mesh packing must succeed");
+            assert_eq!(res.entries.len(), 1);
+            assert_eq!(res.entries[0].hash, expected_pack_key);
+            assert_eq!(res.entries[0].stage, ShaderStage::Compute);
+            assert_eq!(
+                res.summary.entries[0].mesh_output,
+                Some(MeshOutputLayout {
+                    max_vertices: 3,
+                    max_primitives: 1,
+                    vertex_words: 8,
+                })
+            );
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
