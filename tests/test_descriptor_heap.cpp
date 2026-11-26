@@ -2305,6 +2305,277 @@ void test_concurrent_disjoint_writes() {
     CHECK(reg.heap_count() == 1);
 }
 
+// ---------------------------------------------------------------------------
+// 12. G77 hot-path stress tests: placed heaps, flat BindGroupCache, flat tracker index
+// ---------------------------------------------------------------------------
+
+void test_placed_heaps_sorted_lookup() {
+    DescriptorHeapRegistry reg;
+    // Create 12 placed heaps out-of-order (covers both linear scan <= 8 and binary search > 8),
+    // mixing CbvSrvUav (stride 32) and Sampler (stride 16) heaps.
+    constexpr uint32_t kPlacedCount = 12;
+    constexpr uint64_t kBaseAddr = 0x10000000ull;
+    constexpr uint64_t kSlotSpacing = 0x10000ull;
+    std::vector<DescriptorHeap*> heaps(kPlacedCount, nullptr);
+    const uint32_t order[kPlacedCount] = {7, 2, 11, 0, 5, 9, 3, 1, 10, 6, 4, 8};
+
+    for (uint32_t idx : order) {
+        DescriptorHeapDesc d;
+        d.type = (idx % 2 == 0) ? DescriptorHeapType::CbvSrvUav : DescriptorHeapType::Sampler;
+        d.num_descriptors = 64;
+        d.flags = DescriptorHeapFlags::ShaderVisible;
+        d.cpu_address = kBaseAddr + static_cast<uint64_t>(idx) * kSlotSpacing;
+        CHECK(reg.create_heap(d, &heaps[idx]) == Status::Ok);
+        CHECK(heaps[idx] != nullptr);
+    }
+
+    // Overlap checks: exact duplicate, partial tail overlap, partial head overlap, enclosing.
+    {
+        DescriptorHeap* bad = nullptr;
+        DescriptorHeapDesc ov;
+        ov.type = DescriptorHeapType::CbvSrvUav;
+        ov.num_descriptors = 16;
+        ov.cpu_address = kBaseAddr + 4 * kSlotSpacing;
+        CHECK(reg.create_heap(ov, &bad) == Status::InvalidArgument && bad == nullptr);
+        ov.cpu_address = kBaseAddr + 4 * kSlotSpacing + 32;
+        CHECK(reg.create_heap(ov, &bad) == Status::InvalidArgument && bad == nullptr);
+        ov.cpu_address = kBaseAddr + 4 * kSlotSpacing - 32;
+        CHECK(reg.create_heap(ov, &bad) == Status::InvalidArgument && bad == nullptr);
+        // Unaligned cpu_address (< 8 bytes).
+        ov.cpu_address = kBaseAddr + 20 * kSlotSpacing + 4;
+        CHECK(reg.create_heap(ov, &bad) == Status::InvalidArgument && bad == nullptr);
+    }
+
+    // Resolve valid slots, misaligned slots, and gap/out-of-range handles across all 12 heaps.
+    for (uint32_t i = 0; i < kPlacedCount; ++i) {
+        const uint32_t inc = heaps[i]->increment();
+        for (uint32_t s : {0u, 1u, 31u, 63u}) {
+            ResolvedDescriptor r;
+            const CpuDescriptorHandle h = heaps[i]->cpu_handle(s);
+            CHECK(h.ptr == kBaseAddr + static_cast<uint64_t>(i) * kSlotSpacing + static_cast<uint64_t>(s) * inc);
+            CHECK(reg.resolve_cpu(h, &r) == Status::Ok);
+            CHECK(r.heap == heaps[i] && r.index == s);
+        }
+        ResolvedDescriptor r;
+        // Misaligned inside heap.
+        CHECK(reg.resolve_cpu(CpuDescriptorHandle{heaps[i]->cpu_start().ptr + 8}, &r) == Status::MisalignedHandle);
+        // Past end (in gap between heaps).
+        CHECK(reg.resolve_cpu(heaps[i]->cpu_handle(64), &r) == Status::InvalidHandle);
+        CHECK(reg.resolve_cpu(CpuDescriptorHandle{heaps[i]->cpu_handle(64).ptr + 8}, &r) == Status::InvalidHandle);
+    }
+    // Below lowest placed heap.
+    {
+        ResolvedDescriptor r;
+        CHECK(reg.resolve_cpu(CpuDescriptorHandle{kBaseAddr - 32}, &r) == Status::InvalidHandle);
+    }
+
+    // Destroy first, middle, and last heaps; verify they no longer resolve while neighbors still do.
+    for (uint32_t kill : {0u, 5u, 11u}) {
+        const CpuDescriptorHandle old_h = heaps[kill]->cpu_handle(3);
+        reg.destroy_heap(heaps[kill]);
+        heaps[kill] = nullptr;
+        ResolvedDescriptor r;
+        CHECK(reg.resolve_cpu(old_h, &r) == Status::InvalidHandle);
+    }
+    // Now 9 heaps remain (>8); destroy 2 more to drop to 7 (<=8) and check linear path too.
+    for (uint32_t kill : {2u, 8u}) {
+        reg.destroy_heap(heaps[kill]);
+        heaps[kill] = nullptr;
+    }
+    for (uint32_t i = 0; i < kPlacedCount; ++i) {
+        if (heaps[i] == nullptr) {
+            continue;
+        }
+        ResolvedDescriptor r;
+        CHECK(reg.resolve_cpu(heaps[i]->cpu_handle(10), &r) == Status::Ok);
+        CHECK(r.heap == heaps[i] && r.index == 10);
+    }
+
+    // Re-insert into a previously destroyed range (index 5).
+    {
+        DescriptorHeapDesc d;
+        d.type = DescriptorHeapType::CbvSrvUav;
+        d.num_descriptors = 32;
+        d.cpu_address = kBaseAddr + 5 * kSlotSpacing;
+        CHECK(reg.create_heap(d, &heaps[5]) == Status::Ok && heaps[5] != nullptr);
+        ResolvedDescriptor r;
+        CHECK(reg.resolve_cpu(heaps[5]->cpu_handle(31), &r) == Status::Ok);
+        CHECK(r.heap == heaps[5] && r.index == 31);
+    }
+}
+
+void test_bind_group_cache_flat_mru_erase_and_scale() {
+    const DescriptorLiveCounts base_counts = descriptor_live_counts();
+
+    DescriptorHeapRegistry reg;
+    constexpr uint32_t kSlots = 1500;
+    DescriptorHeap* heap = make_heap(reg, DescriptorHeapType::CbvSrvUav, kSlots, true);
+    for (uint32_t i = 0; i < kSlots; ++i) {
+        ViewDesc srv = texture2d_srv();
+        CHECK(reg.create_shader_resource_view(1000u + i, &srv, cpu_at(heap, i)) == Status::Ok);
+    }
+
+    RootSignatureDesc rs_desc;
+    RootParameterDesc p0;
+    p0.parameter_type = RootParameterType::DescriptorTable;
+    DescriptorRangeDesc rng;
+    rng.range_type = DescriptorRangeType::Srv;
+    rng.num_descriptors = 1;
+    rng.base_shader_register = 0;
+    p0.ranges.push_back(rng);
+    rs_desc.parameters.push_back(p0);
+    RootSignature rs;
+    CHECK(RootSignature::build(rs_desc, &rs).ok());
+
+    const ShaderBinding bindings[1] = {{0, DescriptorRangeType::Srv, 0, 0, false}};
+    const BindGroupPlan plan = BindGroupPlan::build(rs, bindings, WebGpuStage::Fragment);
+    CHECK(!plan.has_heap_indexed());
+
+    RootArgumentState st;
+    DescriptorHeap* bound_heaps[1] = {heap};
+    CHECK(st.set_descriptor_heaps(1, bound_heaps) == Status::Ok);
+    CHECK(st.set_root_signature(BindPoint::Graphics, &rs) == Status::Ok);
+
+    BindGroupCache cache;
+    constexpr uint32_t kCount = 1200;
+    std::vector<CachedBindGroup*> ptrs(kCount, nullptr);
+
+    // Insert > 1,000 bind groups to force multiple flat-table growth/rehash passes,
+    // verifying pointer stability of the first entry across all rehashes.
+    for (uint32_t i = 0; i < kCount; ++i) {
+        CHECK(st.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(heap, i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && lk.rebuilt && lk.bind_group != nullptr);
+        lk.bind_group->gpu_id = 10000u + i;
+        lk.bind_group->view_ids.push_back(50000u + i);
+        ptrs[i] = lk.bind_group;
+
+        // Immediate repeat lookup must hit the 1-entry MRU cache with identical pointer.
+        const uint64_t hits_before = cache.hits();
+        BindGroupLookup mru = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+        CHECK(mru.status == Status::Ok && !mru.rebuilt && mru.bind_group == ptrs[i]);
+        CHECK(cache.hits() == hits_before + 1);
+    }
+    CHECK(cache.size() == kCount);
+    CHECK(descriptor_live_counts().cached_bind_groups == base_counts.cached_bind_groups + kCount);
+
+    // Every earlier entry must still be found at the exact same pointer after all rehashes.
+    for (uint32_t i = 0; i < kCount; i += 37) {
+        CHECK(st.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(heap, i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && !lk.rebuilt && lk.bind_group == ptrs[i]);
+        CHECK(lk.bind_group->gpu_id == 10000u + i);
+    }
+
+    // O(1) erase: null pointer, foreign/missing pointer, and valid pointer (including MRU entry).
+    CHECK(cache.erase(nullptr) == 0);
+    CachedBindGroup foreign;
+    foreign.key_hash = ptrs[0]->key_hash;  // same hash as a cached entry, different pointer
+    CHECK(cache.erase(&foreign) == 0);
+    foreign.key_hash = 0xdeadbeefcafebabeull;
+    CHECK(cache.erase(&foreign) == 0);
+
+    // Make ptrs[10] the MRU entry, then erase it; next lookup must miss and rebuild.
+    CHECK(st.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(heap, 10)) == Status::Ok);
+    CHECK(cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr).bind_group == ptrs[10]);
+    CHECK(cache.erase(ptrs[10]) == 10010u);
+    CHECK(cache.size() == kCount - 1);
+    BindGroupLookup rebuilt10 = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+    CHECK(rebuilt10.status == Status::Ok && rebuilt10.rebuilt && rebuilt10.bind_group != nullptr);
+    rebuilt10.bind_group->gpu_id = 20010u;
+    ptrs[10] = rebuilt10.bind_group;
+    CHECK(cache.size() == kCount);
+
+    // Evict a batch by resource_id and view_id.
+    std::vector<uint32_t> evict_res;
+    std::vector<uint32_t> evict_views;
+    for (uint32_t i = 0; i < 300; ++i) {
+        evict_res.push_back(1000u + i);
+    }
+    for (uint32_t i = 300; i < 600; ++i) {
+        evict_views.push_back(50000u + i);
+    }
+    std::vector<uint32_t> retired;
+    std::vector<uint64_t> evicted_hashes;
+    const size_t evicted = cache.evict_resources_and_views(evict_res, evict_views, &retired, &evicted_hashes);
+    CHECK(evicted == 600);
+    CHECK(retired.size() == 600 && evicted_hashes.size() == 600);
+    CHECK(cache.size() == kCount - 600);
+
+    // Start new epoch, touch 200 surviving entries, then end_epoch(250) to evict untouched entries
+    // and trigger tombstone compaction.
+    retired.clear();
+    CHECK(cache.end_epoch(kCount, &retired) == 0 && retired.empty());  // advances epoch without dropping
+    for (uint32_t i = 600; i < 800; ++i) {
+        CHECK(st.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(heap, i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && !lk.rebuilt && lk.bind_group == ptrs[i]);
+    }
+    const size_t epoch_dropped = cache.end_epoch(250, &retired);
+    CHECK(epoch_dropped == 400);
+    CHECK(retired.size() == 400);
+    CHECK(cache.size() == 200);
+
+    // Surviving 200 entries must still hit cleanly after compaction/rehash.
+    for (uint32_t i = 600; i < 800; ++i) {
+        CHECK(st.set_descriptor_table(BindPoint::Graphics, 0, gpu_at(heap, i)) == Status::Ok);
+        BindGroupLookup lk = cache.get_or_build(st, BindPoint::Graphics, plan, 77, test_resolver, nullptr);
+        CHECK(lk.status == Status::Ok && !lk.rebuilt && lk.bind_group == ptrs[i]);
+    }
+
+    // Clear and verify live gauge returns to baseline.
+    retired.clear();
+    cache.clear(&retired);
+    CHECK(retired.size() == 200 && cache.size() == 0);
+    CHECK(descriptor_live_counts().cached_bind_groups == base_counts.cached_bind_groups);
+}
+
+void test_state_tracker_flat_index_and_reset() {
+    ResourceStateRegistry reg;
+    constexpr uint32_t kResourceCount = 600;
+    for (uint32_t i = 1; i <= kResourceCount; ++i) {
+        ResourceStateDesc d;
+        d.subresource_count = (i % 10 == 0) ? 4u : 1u;
+        d.initial_state = ResourceStates::Common;
+        d.implicit_promotion = (i % 3 == 0);
+        CHECK(reg.register_resource(i, d) == Status::Ok);
+    }
+
+    CommandListStateTracker tracker(&reg);
+    for (int frame = 0; frame < 4; ++frame) {
+        const uint32_t from = (frame % 2 == 0) ? ResourceStates::Common : ResourceStates::RenderTarget;
+        const uint32_t to = (frame % 2 == 0) ? ResourceStates::RenderTarget : ResourceStates::Common;
+        for (uint32_t i = 1; i <= kResourceCount; ++i) {
+            const uint32_t expected_from = (i % 3 == 0) ? ResourceStates::Common : from;
+            if (expected_from != to) {
+                const ResourceBarrier b = ResourceBarrier::transition(i, expected_from, to);
+                tracker.resource_barrier(1, &b);
+            } else {
+                tracker.note_access(i, 0, ResourceStates::PixelShaderResource);
+            }
+        }
+        CHECK(tracker.diagnostics().empty());
+        for (uint32_t i = 1; i <= kResourceCount; ++i) {
+            const uint32_t expected_from = (i % 3 == 0) ? ResourceStates::Common : from;
+            if (expected_from != to) {
+                CHECK(tracker.state(i, 0) == to);
+                CHECK(tracker.expected_initial_state(i, 0) == expected_from);
+            } else {
+                CHECK(tracker.state(i, 0) == ResourceStates::PixelShaderResource);
+            }
+        }
+        std::vector<StateDiagnostic> exec_diags;
+        reg.execute(tracker, &exec_diags);
+        CHECK(exec_diags.empty());
+
+        tracker.reset();
+        CHECK(tracker.diagnostics().empty());
+        CHECK(tracker.state(1, 0) == kStateUnknown);
+        CHECK(tracker.state(kResourceCount, 0) == kStateUnknown);
+        CHECK(tracker.expected_initial_state(kResourceCount / 2, 0) == kStateUnknown);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2334,6 +2605,9 @@ int main() {
     test_state_tracker_diagnostic_cap();
     test_usage_scope_conflicts();
     test_concurrent_disjoint_writes();
+    test_placed_heaps_sorted_lookup();
+    test_bind_group_cache_flat_mru_erase_and_scale();
+    test_state_tracker_flat_index_and_reset();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_descriptor_heap failed with %d failure(s)\n", g_failures);

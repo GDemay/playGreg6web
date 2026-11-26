@@ -894,9 +894,7 @@ uint64_t stable_hash64(const void* data, size_t size) noexcept {
     size_t i = 0;
     for (; i + 8 <= size; i += 8) {
         uint64_t k = 0;
-        for (int b = 0; b < 8; ++b) {
-            k |= static_cast<uint64_t>(bytes[i + static_cast<size_t>(b)]) << (8 * b);
-        }
+        std::memcpy(&k, bytes + i, 8);
         k *= c1;
         k = std::rotl(k, 31);
         k *= c2;
@@ -1660,104 +1658,180 @@ ComputePipelineKey make_compute_pipeline_key(const D3D12ComputePsoDesc& desc) no
 
 namespace {
 
-constexpr size_t kShardCount = 16;
+constexpr size_t kShardBits = 4;
+constexpr size_t kShardCount = size_t{1} << kShardBits;
 
 template <typename Key>
 class ShardedPipelineMap {
 public:
-    struct Node {
-        Key key;
-        uint32_t id;
-        std::atomic<uint32_t> refs;
-        Node(const Key& k, uint32_t i) : key(k), id(i), refs(1) {}
-    };
+    static constexpr uint8_t kEmpty = 0;
+    static constexpr uint8_t kOccupied = 1;
+    static constexpr uint8_t kTombstone = 2;
+    static constexpr size_t kInitialCapacity = 16;
 
-    struct FindResult {
+    struct Slot {
+        Key key{};
+        uint64_t hash = 0;
         uint32_t id = 0;
-        bool found = false;
+        std::atomic<uint32_t> refs{0};
+        uint8_t state = kEmpty;
     };
 
     // Returns {id, created, collided}.
     template <typename Alloc>
     std::tuple<uint32_t, bool, bool> acquire(uint64_t hash, const Key& key, Alloc&& alloc) {
-        Shard& shard = shards_[hash % kShardCount];
+        Shard& shard = shards_[hash & (kShardCount - 1)];
         {
             std::shared_lock lock(shard.mutex);
-            if (Node* n = find_in(shard, hash, key)) {
-                n->refs.fetch_add(1, std::memory_order_relaxed);
-                return {n->id, false, false};
+            if (Slot* s = find_in(shard, hash, key)) {
+                s->refs.fetch_add(1, std::memory_order_relaxed);
+                return {s->id, false, false};
             }
         }
         std::unique_lock lock(shard.mutex);
-        if (Node* n = find_in(shard, hash, key)) {
-            n->refs.fetch_add(1, std::memory_order_relaxed);
-            return {n->id, false, false};
+        if (Slot* s = find_in(shard, hash, key)) {
+            s->refs.fetch_add(1, std::memory_order_relaxed);
+            return {s->id, false, false};
         }
-        auto& bucket = shard.buckets[hash];
-        const bool collided = !bucket.empty();
+        if (shard.capacity == 0) {
+            rehash(shard, kInitialCapacity);
+        } else if ((shard.occupied + shard.tombstones + 1) * 10 >= shard.capacity * 7) {
+            const size_t new_cap = shard.tombstones > shard.occupied ? shard.capacity : shard.capacity * 2;
+            rehash(shard, new_cap);
+        }
+        const size_t mask = shard.capacity - 1;
+        size_t idx = static_cast<size_t>(hash >> kShardBits) & mask;
+        size_t insert_idx = shard.capacity;
+        bool collided = false;
+        for (;;) {
+            Slot& slot = shard.table[idx];
+            if (slot.state == kEmpty) {
+                if (insert_idx == shard.capacity) {
+                    insert_idx = idx;
+                }
+                break;
+            }
+            if (slot.state == kTombstone) {
+                if (insert_idx == shard.capacity) {
+                    insert_idx = idx;
+                }
+            } else if (slot.hash == hash) {
+                collided = true;
+            }
+            idx = (idx + 1) & mask;
+        }
         const uint32_t id = alloc();
-        bucket.push_back(std::make_unique<Node>(key, id));
+        Slot& dst = shard.table[insert_idx];
+        if (dst.state == kTombstone) {
+            --shard.tombstones;
+        }
+        dst.key = key;
+        dst.hash = hash;
+        dst.id = id;
+        dst.refs.store(1, std::memory_order_relaxed);
+        dst.state = kOccupied;
+        ++shard.occupied;
         return {id, true, collided};
     }
 
     // Returns {id, evicted}; id 0 when the key is unknown.
     std::pair<uint32_t, bool> release(uint64_t hash, const Key& key, bool evict_unreferenced) {
-        Shard& shard = shards_[hash % kShardCount];
+        Shard& shard = shards_[hash & (kShardCount - 1)];
         std::unique_lock lock(shard.mutex);
-        auto it = shard.buckets.find(hash);
-        if (it == shard.buckets.end()) {
+        Slot* slot = find_in(shard, hash, key);
+        if (slot == nullptr) {
             return {0, false};
         }
-        auto& bucket = it->second;
-        for (size_t i = 0; i < bucket.size(); ++i) {
-            Node& n = *bucket[i];
-            if (!(n.key == key)) {
-                continue;
-            }
-            uint32_t refs = n.refs.load(std::memory_order_relaxed);
-            if (refs > 0) {
-                n.refs.store(--refs, std::memory_order_relaxed);
-            }
-            if (refs == 0 && evict_unreferenced) {
-                const uint32_t id = n.id;
-                bucket.erase(bucket.begin() + static_cast<std::ptrdiff_t>(i));
-                if (bucket.empty()) {
-                    shard.buckets.erase(it);
-                }
-                return {id, true};
-            }
-            return {n.id, false};
+        uint32_t refs = slot->refs.load(std::memory_order_relaxed);
+        if (refs > 0) {
+            slot->refs.store(--refs, std::memory_order_relaxed);
         }
-        return {0, false};
+        if (refs == 0 && evict_unreferenced) {
+            const uint32_t id = slot->id;
+            slot->state = kTombstone;
+            slot->id = 0;
+            --shard.occupied;
+            ++shard.tombstones;
+            return {id, true};
+        }
+        return {slot->id, false};
     }
 
     std::optional<std::pair<uint32_t, uint32_t>> find(uint64_t hash, const Key& key) const {
-        const Shard& shard = shards_[hash % kShardCount];
+        const Shard& shard = shards_[hash & (kShardCount - 1)];
         std::shared_lock lock(shard.mutex);
-        if (const Node* n = find_in(shard, hash, key)) {
-            return std::make_pair(n->id, n->refs.load(std::memory_order_relaxed));
+        if (const Slot* s = find_in(shard, hash, key)) {
+            return std::make_pair(s->id, s->refs.load(std::memory_order_relaxed));
         }
         return std::nullopt;
     }
 
 private:
-    struct Shard {
+    struct alignas(64) Shard {
         mutable std::shared_mutex mutex;
-        std::unordered_map<uint64_t, std::vector<std::unique_ptr<Node>>> buckets;
+        std::unique_ptr<Slot[]> table;
+        size_t capacity = 0;
+        size_t occupied = 0;
+        size_t tombstones = 0;
     };
 
-    template <typename S>
-    static auto find_in(S& shard, uint64_t hash, const Key& key) -> decltype(shard.buckets.begin()->second[0].get()) {
-        auto it = shard.buckets.find(hash);
-        if (it == shard.buckets.end()) {
+    static void rehash(Shard& shard, size_t new_cap) {
+        auto next = std::make_unique<Slot[]>(new_cap);
+        const size_t mask = new_cap - 1;
+        for (size_t i = 0; i < shard.capacity; ++i) {
+            Slot& src = shard.table[i];
+            if (src.state != kOccupied) {
+                continue;
+            }
+            size_t idx = static_cast<size_t>(src.hash >> kShardBits) & mask;
+            while (next[idx].state == kOccupied) {
+                idx = (idx + 1) & mask;
+            }
+            next[idx].key = src.key;
+            next[idx].hash = src.hash;
+            next[idx].id = src.id;
+            next[idx].refs.store(src.refs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            next[idx].state = kOccupied;
+        }
+        shard.table = std::move(next);
+        shard.capacity = new_cap;
+        shard.tombstones = 0;
+    }
+
+    static Slot* find_in(Shard& shard, uint64_t hash, const Key& key) noexcept {
+        if (shard.capacity == 0) {
             return nullptr;
         }
-        for (const auto& node : it->second) {
-            if (node->key == key) {  // full-key equality guards against 64-bit hash collisions
-                return node.get();
+        const size_t mask = shard.capacity - 1;
+        size_t idx = static_cast<size_t>(hash >> kShardBits) & mask;
+        for (;;) {
+            Slot& slot = shard.table[idx];
+            if (slot.state == kEmpty) {
+                return nullptr;
             }
+            if (slot.state == kOccupied && slot.hash == hash && slot.key == key) {
+                return &slot;
+            }
+            idx = (idx + 1) & mask;
         }
-        return nullptr;
+    }
+
+    static const Slot* find_in(const Shard& shard, uint64_t hash, const Key& key) noexcept {
+        if (shard.capacity == 0) {
+            return nullptr;
+        }
+        const size_t mask = shard.capacity - 1;
+        size_t idx = static_cast<size_t>(hash >> kShardBits) & mask;
+        for (;;) {
+            const Slot& slot = shard.table[idx];
+            if (slot.state == kEmpty) {
+                return nullptr;
+            }
+            if (slot.state == kOccupied && slot.hash == hash && slot.key == key) {
+                return &slot;
+            }
+            idx = (idx + 1) & mask;
+        }
     }
 
     std::array<Shard, kShardCount> shards_;
@@ -1900,8 +1974,11 @@ PipelineVariantState GraphicsPso::canonical_variant(const PipelineVariantState& 
     c.index_format = is_strip(topo) ? v.index_format : WgpuIndexFormat::Undefined;
     const uint32_t relevant = translation_.used_vertex_slots & ~translation_.instance_stride_zero_slots;
     c.bound_vertex_slots = v.bound_vertex_slots & relevant;
-    for (uint32_t s = 0; s < kMaxVertexBuffers; ++s) {
-        if ((c.bound_vertex_slots & (1u << s)) != 0) {
+    if (c.bound_vertex_slots != 0) {
+        uint32_t rem = c.bound_vertex_slots & ((1u << kMaxVertexBuffers) - 1u);
+        while (rem != 0) {
+            const uint32_t s = static_cast<uint32_t>(std::countr_zero(rem));
+            rem &= rem - 1u;
             c.vertex_strides[s] = v.vertex_strides[s];
         }
     }
@@ -1910,20 +1987,43 @@ PipelineVariantState GraphicsPso::canonical_variant(const PipelineVariantState& 
 
 PipelineResolution GraphicsPso::resolve(PipelineCache& cache, const PipelineVariantState& variant) {
     const PipelineVariantState state = canonical_variant(variant);
-    std::lock_guard lock(mutex_);
+    const uint64_t state_hash = stable_hash64(&state, sizeof(state));
 
-    auto matches = [&](const Variant& v) { return std::memcmp(&v.state, &state, sizeof(state)) == 0; };
-    auto hit = [&](size_t i) {
-        last_hit_ = i;
-        const Variant& v = *variants_[i];
-        return PipelineResolution{v.pipeline_id, false, &v.key, v.diagnostics};
+    auto matches = [&](const VariantIndex& vi) noexcept {
+        return vi.state_hash == state_hash && std::memcmp(&vi.ptr->state, &state, sizeof(state)) == 0;
     };
-    if (last_hit_ < variants_.size() && matches(*variants_[last_hit_])) {
-        return hit(last_hit_);
+
+    {
+        std::shared_lock lock(mutex_);
+        const size_t n = variant_index_.size();
+        const size_t hint = last_hit_.load(std::memory_order_relaxed);
+        if (hint < n && matches(variant_index_[hint])) {
+            const Variant& v = *variant_index_[hint].ptr;
+            return PipelineResolution{v.pipeline_id, false, &v.key, v.diagnostics};
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (matches(variant_index_[i])) {
+                last_hit_.store(i, std::memory_order_relaxed);
+                const Variant& v = *variant_index_[i].ptr;
+                return PipelineResolution{v.pipeline_id, false, &v.key, v.diagnostics};
+            }
+        }
     }
-    for (size_t i = 0; i < variants_.size(); ++i) {
-        if (matches(*variants_[i])) {
-            return hit(i);
+
+    std::unique_lock lock(mutex_);
+    {
+        const size_t n = variant_index_.size();
+        const size_t hint = last_hit_.load(std::memory_order_relaxed);
+        if (hint < n && matches(variant_index_[hint])) {
+            const Variant& v = *variant_index_[hint].ptr;
+            return PipelineResolution{v.pipeline_id, false, &v.key, v.diagnostics};
+        }
+        for (size_t i = 0; i < n; ++i) {
+            if (matches(variant_index_[i])) {
+                last_hit_.store(i, std::memory_order_relaxed);
+                const Variant& v = *variant_index_[i].ptr;
+                return PipelineResolution{v.pipeline_id, false, &v.key, v.diagnostics};
+            }
         }
     }
 
@@ -1947,14 +2047,15 @@ PipelineResolution GraphicsPso::resolve(PipelineCache& cache, const PipelineVari
             cache.note_variant();
         }
     }
+    const Variant* raw = v.get();
     variants_.push_back(std::move(v));
-    last_hit_ = variants_.size() - 1;
-    const Variant& stored = *variants_.back();
-    return PipelineResolution{stored.pipeline_id, created, &stored.key, stored.diagnostics};
+    variant_index_.push_back(VariantIndex{state_hash, raw});
+    last_hit_.store(variants_.size() - 1, std::memory_order_relaxed);
+    return PipelineResolution{raw->pipeline_id, created, &raw->key, raw->diagnostics};
 }
 
 std::vector<uint32_t> GraphicsPso::release(PipelineCache& cache) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     std::vector<uint32_t> evicted;
     for (const auto& v : variants_) {
         if (v->pipeline_id == 0) {
@@ -1965,12 +2066,13 @@ std::vector<uint32_t> GraphicsPso::release(PipelineCache& cache) {
         }
     }
     variants_.clear();
-    last_hit_ = 0;
+    variant_index_.clear();
+    last_hit_.store(0, std::memory_order_relaxed);
     return evicted;
 }
 
 size_t GraphicsPso::variant_count() const {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
     return variants_.size();
 }
 
@@ -2039,8 +2141,32 @@ bool CommandListStateTracker::Attachments::contains(uint32_t view_id) const noex
 CommandListStateTracker::CommandListStateTracker(TrackerOptions options) : options_(options) {}
 
 void CommandListStateTracker::reset() {
-    const TrackerOptions options = options_;
-    *this = CommandListStateTracker(options);
+    events_.clear();
+    passes_.clear();
+    clear_fallbacks_.clear();
+    pending_clears_.clear();
+    bound_ = Attachments{};
+    pass_attachments_ = Attachments{};
+    pass_open_ = false;
+    pass_state_known_ = false;
+    pass_width_ = 0;
+    pass_height_ = 0;
+    viewport_set_ = false;
+    scissor_set_ = false;
+    viewport_ = D3D12Viewport{};
+    scissor_ = D3D12Rect{};
+    blend_factor_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    stencil_ref_ = 0;
+    pso_ = nullptr;
+    variant_ = PipelineVariantState{};
+    pass_viewport_ = WgpuViewport{};
+    pass_scissor_ = WgpuScissorRect{};
+    pass_blend_constant_ = {0.0f, 0.0f, 0.0f, 0.0f};
+    pass_stencil_ref_ = 0;
+    pass_pipeline_id_ = 0;
+    diagnostics_ = 0;
+    pipeline_diagnostics_ = 0;
+    stats_ = TrackerStats{};
 }
 
 void CommandListStateTracker::clear_events() {
