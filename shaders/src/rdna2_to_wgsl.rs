@@ -64,10 +64,12 @@ const MAX_WEBGPU_MRTS: u8 = 8;
 /// `docs/gpu_commands.md` / `runtime/gpu/stage_reflection.h`).
 pub const WGPU_STORAGE_FORMAT_RGBA8_UNORM: u8 = 22;
 
-/// Binding number offset applied to reflected fragment-stage bindings in `@group(0)` so
-/// independently translated vertex (`0..`) and fragment (`32..`) stages never collide on the
+/// Binding number offset applied to v3-sidecar-eligible fragment-stage bindings in `@group(0)` so
+/// independently translated vertex (`0..63`) and fragment (`64..`) stages never collide on the
 /// same `@group(0) @binding(N)` with different descriptor-table sources during `join_pipeline_layout`.
-const FRAGMENT_REFLECTED_BINDING_OFFSET: u32 = 32;
+/// Runtime-owned `RT_ARENA` (`@group(3) @binding(16..21)`) and mesh output (`@group(3) @binding(0)`)
+/// live in `@group(3)`, so `@group(0) @binding(64..)` has zero conflicts.
+const FRAGMENT_REFLECTED_BINDING_OFFSET: u32 = 64;
 
 /// First extra binding index (`cb1`, `tex1`, `samp1`, `sbuf*`, `uav_tex*`) for unreflected
 /// fragment stages, kept disjoint from vertex extra bindings (`3..15`) so `layout:'auto'`
@@ -1920,18 +1922,17 @@ impl OriginState {
     fn initial(stage: ShaderStage, is_mesh: bool, unreferenced_user_sgprs: &[bool; 32]) -> Self {
         let mut origins = [SgprOrigin::Unwritten; TRACKED_SGPR_COUNT];
         // Seed console ABI initial SGPR origins:
-        //   Graphics (including mesh stages translated to compute):
+        //   Mesh (lowered to compute):
+        //             NGG/mesh system SGPRs in s0..s15, user data starts at s16..s31
+        //             (matching `runtime/gpu/stage_reflection.h` `kMeshUserDataBase = 16`).
+        //   Graphics (vertex / fragment):
         //             system SGPRs in s0..s7 (vertex hardware VB table ptr in s[0:1]),
         //             user data starts at s8..s31; scratch SGPRs s32..s105 & vcc start Unwritten.
         //   Compute:  system SGPRs in s0..s3, user data starts at s4..s31; s32..s105 & vcc Unwritten.
-        // Any register in user_base..32 that is never read as a user-data scalar/pointer anywhere
-        // in the program (e.g. a pure scratch SGPR used only to hold a conditionally loaded T#/V#/S#)
-        // stays Unwritten so CFG merges across guarded descriptor loads do not lose provenance.
-        let user_base: usize = if stage == ShaderStage::Compute && !is_mesh {
-            4
-        } else {
-            8
-        };
+        // Any register in user_base..32 that is not live-on-entry (never read, or unconditionally
+        // written before any read along every path from entry) stays Unwritten so CFG merges
+        // across guarded descriptor loads do not lose provenance.
+        let user_base = initial_user_sgpr_base(stage, is_mesh);
         for slot in origins.iter_mut().take(user_base) {
             *slot = SgprOrigin::Unknown;
         }
@@ -7882,90 +7883,161 @@ fn mark_untainted_def_and_parents(
     }
 }
 
-/// Identify SGPRs in `user_base..32` that are never read as scalar/pointer user-data inputs
-/// anywhere in `active` (e.g. pure scratch registers allocated by LLVM for conditionally loaded
-/// T#/V#/S# descriptors or inline samplers). Seeding those registers as `Unwritten` instead of
-/// `UserTable` prevents guarded CFG joins from clobbering proven descriptor origins to `Unknown`.
-fn compute_unreferenced_initial_user_sgprs(
-    active: &[Rdna2Instruction],
-    stage: ShaderStage,
-    is_mesh: bool,
-) -> [bool; 32] {
-    let user_base: usize = if stage == ShaderStage::Compute && !is_mesh {
+/// First SGPR holding console root-argument user data for the given stage.
+///
+/// Matches `runtime/gpu/stage_reflection.h`:
+/// - Mesh stages (lowered to compute): `s16` (`kMeshUserDataBase = 16`, `s8..s15` are NGG/mesh sys).
+/// - Regular compute stages: `s4`.
+/// - Graphics stages (vertex / fragment): `s8`.
+#[inline]
+const fn initial_user_sgpr_base(stage: ShaderStage, is_mesh: bool) -> usize {
+    if is_mesh {
+        16
+    } else if matches!(stage, ShaderStage::Compute) {
         4
     } else {
         8
+    }
+}
+
+/// Identify SGPRs in `user_base..32` that are NOT live-on-entry (either never read as scalar/pointer
+/// user-data inputs, or unconditionally written before any read along every CFG path from entry).
+/// Seeding those registers as `Unwritten` instead of `UserTable` prevents scratch SGPRs (e.g.
+/// `s12`/`s14`/`s16`/`s19`) and guarded CFG joins from clobbering proven descriptor origins.
+fn compute_unreferenced_initial_user_sgprs(
+    active: &[Rdna2Instruction],
+    cfg: &ControlFlowGraph,
+    stage: ShaderStage,
+    is_mesh: bool,
+    is_wave32: bool,
+) -> [bool; 32] {
+    let user_base = initial_user_sgpr_base(stage, is_mesh);
+    let Some(entry) = cfg.entry() else {
+        return [false; 32];
     };
-    let mut read_as_user = [false; 32];
-    let mut non_smem_written = [false; 32];
+
     #[inline]
-    fn mark_read(buf: &mut [bool; 32], reg: u16) {
-        if (reg as usize) < 32 {
-            buf[reg as usize] = true;
+    fn bit_u16(reg: u16) -> u32 {
+        if reg < 32 {
+            1u32 << reg
+        } else {
+            0
         }
     }
     #[inline]
-    fn mark_pair_read(buf: &mut [bool; 32], reg: u16) {
-        mark_read(buf, reg);
+    fn pair_bits_u16(reg: u16) -> u32 {
+        let mut mask = bit_u16(reg);
         if let Some(hi) = reg.checked_add(1) {
-            mark_read(buf, hi);
+            mask |= bit_u16(hi);
+        }
+        mask
+    }
+    #[inline]
+    fn bit_u8(reg: u8) -> u32 {
+        if reg < 32 {
+            1u32 << reg
+        } else {
+            0
         }
     }
     #[inline]
-    fn mark_non_smem_write(buf: &mut [bool; 32], reg: u8) {
-        if (reg as usize) < 32 {
-            buf[reg as usize] = true;
+    fn range_bits_u8(base: u8, count: u8) -> u32 {
+        let mut mask = 0u32;
+        for k in 0..count {
+            if let Some(r) = base.checked_add(k) {
+                mask |= bit_u8(r);
+            }
         }
+        mask
     }
 
+    // Track non-SMEM scalar writes across the program to recognize in-place synthesized root V#s
+    // at `s[r..r+3]` where words 2/3 are filled via SALU while words 0/1 come from initial user SGPRs.
+    let mut non_smem_written_mask = 0u32;
     for inst in active {
         if inst.truncated {
             continue;
         }
         match &inst.detail {
+            Rdna2Detail::Sop1 { op, sdst, .. } if !matches!(*op, 0x20 | 0x22) => {
+                non_smem_written_mask |= if sop1_writes_pair(*op) {
+                    range_bits_u8(*sdst, 2)
+                } else {
+                    bit_u8(*sdst)
+                };
+            }
+            Rdna2Detail::Sopk { op, sdst, .. }
+                if !matches!(*op, 0x03..=0x0E | 0x12 | 0x13 | 0x17..=0x1A) =>
+            {
+                non_smem_written_mask |= bit_u8(*sdst);
+            }
+            Rdna2Detail::Sop2 { op, sdst, .. } => {
+                let (p0, _) = sop2_src_pair_widths(*op);
+                non_smem_written_mask |= if p0 || *op == 0x25 {
+                    range_bits_u8(*sdst, 2)
+                } else {
+                    bit_u8(*sdst)
+                };
+            }
+            Rdna2Detail::Vop1 { op, vdst, .. } if *op == 0x02 => {
+                non_smem_written_mask |= bit_u8(*vdst & 0x7F);
+            }
+            Rdna2Detail::Vop3 { op, vdst, .. } if matches!(*op, 0x182 | 0x360) => {
+                non_smem_written_mask |= bit_u8(*vdst & 0x7F);
+            }
+            _ => {}
+        }
+    }
+
+    let inst_reads_writes = |inst: &Rdna2Instruction| -> (u32, u32) {
+        if inst.truncated {
+            return (0, 0);
+        }
+        let mut reads = 0u32;
+        let mut writes = 0u32;
+        match &inst.detail {
             Rdna2Detail::Sopc {
                 op, ssrc0, ssrc1, ..
             } => {
                 let (p0, p1) = sopc_src_pair_widths(*op);
-                if p0 {
-                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                reads |= if p0 {
+                    pair_bits_u16(u16::from(*ssrc0))
                 } else {
-                    mark_read(&mut read_as_user, u16::from(*ssrc0));
-                }
-                if p1 {
-                    mark_pair_read(&mut read_as_user, u16::from(*ssrc1));
+                    bit_u16(u16::from(*ssrc0))
+                };
+                reads |= if p1 {
+                    pair_bits_u16(u16::from(*ssrc1))
                 } else {
-                    mark_read(&mut read_as_user, u16::from(*ssrc1));
-                }
+                    bit_u16(u16::from(*ssrc1))
+                };
             }
             Rdna2Detail::Sop1 {
                 op, sdst, ssrc0, ..
             } => {
-                if sop1_reads_pair(*op) {
-                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                reads |= if sop1_reads_pair(*op) {
+                    pair_bits_u16(u16::from(*ssrc0))
                 } else {
-                    mark_read(&mut read_as_user, u16::from(*ssrc0));
-                }
+                    bit_u16(u16::from(*ssrc0))
+                };
                 if matches!(*op, 0x05 | 0x1B | 0x1D) {
-                    mark_read(&mut read_as_user, u16::from(*sdst));
+                    reads |= bit_u16(u16::from(*sdst));
                 } else if matches!(*op, 0x06 | 0x1C | 0x1E) {
-                    mark_pair_read(&mut read_as_user, u16::from(*sdst));
+                    reads |= pair_bits_u16(u16::from(*sdst));
                 }
-                if sop1_writes_pair(*op) {
-                    mark_non_smem_write(&mut non_smem_written, *sdst);
-                    if let Some(hi) = sdst.checked_add(1) {
-                        mark_non_smem_write(&mut non_smem_written, hi);
-                    }
-                } else {
-                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                if !matches!(*op, 0x20 | 0x22) {
+                    writes |= if sop1_writes_pair(*op) {
+                        range_bits_u8(*sdst, 2)
+                    } else {
+                        bit_u8(*sdst)
+                    };
                 }
             }
             Rdna2Detail::Sopk { op, sdst, .. } => {
-                if matches!(*op, 0x02..=0x10) {
-                    mark_read(&mut read_as_user, u16::from(*sdst));
+                if matches!(*op, 0x02..=0x10 | 0x12) {
+                    reads |= bit_u16(u16::from(*sdst));
                 }
-                if !matches!(*op, 0x03..=0x0E | 0x17..=0x1A) {
-                    mark_non_smem_write(&mut non_smem_written, *sdst);
+                if !matches!(*op, 0x03..=0x0E | 0x12 | 0x13 | 0x17..=0x1A) {
+                    writes |= bit_u8(*sdst);
                 }
             }
             Rdna2Detail::Sop2 {
@@ -7976,69 +8048,85 @@ fn compute_unreferenced_initial_user_sgprs(
                 ..
             } => {
                 let (p0, p1) = sop2_src_pair_widths(*op);
-                if p0 {
-                    mark_pair_read(&mut read_as_user, u16::from(*ssrc0));
+                reads |= if p0 {
+                    pair_bits_u16(u16::from(*ssrc0))
                 } else {
-                    mark_read(&mut read_as_user, u16::from(*ssrc0));
-                }
-                if p1 {
-                    mark_pair_read(&mut read_as_user, u16::from(*ssrc1));
+                    bit_u16(u16::from(*ssrc0))
+                };
+                reads |= if p1 {
+                    pair_bits_u16(u16::from(*ssrc1))
                 } else {
-                    mark_read(&mut read_as_user, u16::from(*ssrc1));
-                }
-                if p0 || *op == 0x25 {
-                    mark_non_smem_write(&mut non_smem_written, *sdst);
-                    if let Some(hi) = sdst.checked_add(1) {
-                        mark_non_smem_write(&mut non_smem_written, hi);
-                    }
+                    bit_u16(u16::from(*ssrc1))
+                };
+                writes |= if p0 || *op == 0x25 {
+                    range_bits_u8(*sdst, 2)
                 } else {
-                    mark_non_smem_write(&mut non_smem_written, *sdst);
-                }
+                    bit_u8(*sdst)
+                };
             }
             Rdna2Detail::Smem {
-                op, sbase, soffset, ..
+                op,
+                sdata,
+                sbase,
+                soffset,
+                ..
             } => {
-                let base_count: u8 = if matches!(*op, 0x08..=0x0C) { 4 } else { 2 };
+                let base_count: u8 = if matches!(*op, 0x08..=0x0C | 0x18..=0x1B) {
+                    4
+                } else {
+                    2
+                };
                 if let Some(sgpr) = checked_descriptor_sgpr(*sbase, 2) {
-                    for k in 0..base_count {
-                        if let Some(r) = sgpr.checked_add(k) {
-                            mark_read(&mut read_as_user, u16::from(r));
-                        }
-                    }
+                    reads |= range_bits_u8(sgpr, base_count);
                 }
                 if *soffset != 0x7D {
-                    mark_read(&mut read_as_user, u16::from(*soffset));
+                    reads |= bit_u16(u16::from(*soffset));
+                }
+                if let Some(count) = smem_load_dword_count(*op) {
+                    writes |= range_bits_u8(*sdata, count);
+                } else {
+                    let store_count: u8 = match *op {
+                        0x10 | 0x18 => 1,
+                        0x11 | 0x19 => 2,
+                        0x12 | 0x1A => 4,
+                        0x13 | 0x1B => 8,
+                        _ => 0,
+                    };
+                    if store_count > 0 {
+                        reads |= range_bits_u8(*sdata, store_count);
+                    }
                 }
             }
             Rdna2Detail::Vop1 { op, vdst, src0, .. } => {
-                mark_read(&mut read_as_user, *src0);
+                reads |= bit_u16(*src0);
                 if *op == 0x02 {
-                    mark_non_smem_write(&mut non_smem_written, *vdst & 0x7F);
+                    writes |= bit_u8(*vdst & 0x7F);
                 }
             }
             Rdna2Detail::Vopc { src0, .. } | Rdna2Detail::Vop2 { src0, .. } => {
-                mark_read(&mut read_as_user, *src0);
+                reads |= bit_u16(*src0);
             }
             Rdna2Detail::Vop3 {
                 op,
                 vdst,
+                sdst,
                 src0,
                 src1,
                 src2,
                 ..
             } => {
                 if !vop3_is_interp_f16(*op) {
-                    mark_read(&mut read_as_user, *src0);
+                    reads |= bit_u16(*src0);
                 }
                 if !(0x180..=0x1FF).contains(op) {
                     if matches!(*op, 0x2FF..=0x301) || *op == 0x364 {
-                        mark_pair_read(&mut read_as_user, *src1);
+                        reads |= pair_bits_u16(*src1);
                     } else {
-                        mark_read(&mut read_as_user, *src1);
+                        reads |= bit_u16(*src1);
                     }
                 }
                 if *op == 0x364 {
-                    mark_pair_read(&mut read_as_user, *src0);
+                    reads |= pair_bits_u16(*src0);
                 }
                 if *op != 0x342
                     && matches!(
@@ -8055,10 +8143,25 @@ fn compute_unreferenced_initial_user_sgprs(
                             | 0x378
                     )
                 {
-                    mark_read(&mut read_as_user, *src2);
+                    reads |= bit_u16(*src2);
                 }
-                if matches!(*op, 0x182 | 0x360) {
-                    mark_non_smem_write(&mut non_smem_written, *vdst & 0x7F);
+                if let Some(sd) = sdst {
+                    let sd7 = *sd & 0x7F;
+                    writes |= if !is_wave32 && sd7 % 2 == 0 {
+                        range_bits_u8(sd7, 2)
+                    } else {
+                        bit_u8(sd7)
+                    };
+                }
+                if *op <= 0xFF && (*op & 0x10) == 0 {
+                    let sd = *vdst & 0x7F;
+                    writes |= if !is_wave32 && sd % 2 == 0 {
+                        range_bits_u8(sd, 2)
+                    } else {
+                        bit_u8(sd)
+                    };
+                } else if matches!(*op, 0x182 | 0x360) {
+                    writes |= bit_u8(*vdst & 0x7F);
                 }
             }
             Rdna2Detail::Vop3P {
@@ -8068,17 +8171,26 @@ fn compute_unreferenced_initial_user_sgprs(
                 src2,
                 ..
             } => {
-                mark_read(&mut read_as_user, *src0);
-                mark_read(&mut read_as_user, *src1);
+                reads |= bit_u16(*src0) | bit_u16(*src1);
                 if vop3p_is_ternary(*op) {
-                    mark_read(&mut read_as_user, *src2);
+                    reads |= bit_u16(*src2);
                 }
             }
             Rdna2Detail::Flat { saddr, .. } => {
-                mark_pair_read(&mut read_as_user, u16::from(*saddr));
+                reads |= pair_bits_u16(u16::from(*saddr));
             }
-            Rdna2Detail::Mubuf { soffset, .. } | Rdna2Detail::Mtbuf { soffset, .. } => {
-                mark_read(&mut read_as_user, u16::from(*soffset));
+            Rdna2Detail::Mubuf { srsrc, soffset, .. }
+            | Rdna2Detail::Mtbuf { srsrc, soffset, .. } => {
+                reads |= bit_u16(u16::from(*soffset));
+                // If a MUBUF/MTBUF consumes an in-place synthesized root V# at s[r..r+3] whose
+                // words 2/3 were written by non-SMEM scalar ops, treat `s[r..r+1]` as read here
+                // so they stay live-on-entry unless overwritten beforehand.
+                if let Some(r) = checked_descriptor_sgpr(*srsrc, 4)
+                    && (r as usize) + 3 < 32
+                    && (non_smem_written_mask & range_bits_u8(r + 2, 2)) != 0
+                {
+                    reads |= range_bits_u8(r, 2);
+                }
             }
             Rdna2Detail::Mimg { .. }
             | Rdna2Detail::Vintrp { .. }
@@ -8087,39 +8199,67 @@ fn compute_unreferenced_initial_user_sgprs(
             | Rdna2Detail::Exp { .. }
             | Rdna2Detail::Unknown { .. } => {}
         }
-    }
+        (reads, writes)
+    };
 
-    // If a MUBUF/MTBUF consumes an in-place synthesized root V# at s[r..r+3] whose words 2/3 were
-    // written by non-SMEM scalar ops (e.g. `s_mov_b32 s10, -1; s_mov_b32 s11, 0x20000`), keep
-    // `s[r..r+1]` as live `UserTable` inputs.
-    for inst in active {
-        if inst.truncated {
+    let num_blocks = cfg.blocks.len();
+    let mut block_gen = vec![0u32; num_blocks];
+    let mut block_kill = vec![0u32; num_blocks];
+    for (bid, block) in cfg.blocks.iter().enumerate() {
+        if block.synthetic_exit {
             continue;
         }
-        let srsrc_opt = match &inst.detail {
-            Rdna2Detail::Mubuf { srsrc, .. } | Rdna2Detail::Mtbuf { srsrc, .. } => Some(*srsrc),
-            _ => None,
-        };
-        if let Some(srsrc) = srsrc_opt
-            && let Some(r) = checked_descriptor_sgpr(srsrc, 4)
-            && (r as usize) + 3 < 32
-            && (non_smem_written[(r as usize) + 2] || non_smem_written[(r as usize) + 3])
-        {
-            read_as_user[r as usize] = true;
-            read_as_user[(r as usize) + 1] = true;
+        let mut use_mask = 0u32;
+        let mut kill = 0u32;
+        for inst_idx in block.instr_range.clone() {
+            if let Some(inst) = active.get(inst_idx) {
+                let (reads, writes) = inst_reads_writes(inst);
+                use_mask |= reads & !kill;
+                kill |= writes;
+            }
+        }
+        block_gen[bid] = use_mask;
+        block_kill[bid] = kill;
+    }
+
+    // Standard backward dataflow fixpoint: `live_in[b] = gen[b] | (union(live_in[succ]) & !kill[b])`.
+    // Monotonic on a 32-bit lattice, so guaranteed to converge in at most 32 * num_blocks steps.
+    let mut live_in = block_gen.clone();
+    loop {
+        let mut changed = false;
+        for bid in (0..num_blocks).rev() {
+            let block = &cfg.blocks[bid];
+            if block.synthetic_exit {
+                continue;
+            }
+            let mut live_out = 0u32;
+            for succ in block.terminator.successors() {
+                if let Some(&succ_in) = live_in.get(succ) {
+                    live_out |= succ_in;
+                }
+            }
+            let next_in = block_gen[bid] | (live_out & !block_kill[bid]);
+            if next_in != live_in[bid] {
+                live_in[bid] = next_in;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
+    let live_at_entry = live_in[entry];
     let mut unreferenced = [false; 32];
-    for sgpr in user_base..32 {
-        unreferenced[sgpr] = !read_as_user[sgpr];
+    for (sgpr, slot) in unreferenced.iter_mut().enumerate().skip(user_base) {
+        *slot = (live_at_entry & (1u32 << sgpr)) == 0;
     }
     unreferenced
 }
 
 /// Detect descriptor-table V#/T#/S# indirections (`s_load_dword*`) and track console user-data
-/// SGPR provenance (`s8+` graphics, `s4+` compute) across CFG basic blocks, SALU address
-/// derivation, 2-level nested table pointers, VGPR lane/uniform spills, hardware VB-table
+/// SGPR provenance (`s8+` graphics, `s4+` compute, `s16+` mesh) across CFG basic blocks, SALU
+/// address derivation, 2-level nested table pointers, VGPR lane/uniform spills, hardware VB-table
 /// (`s[0:1]`), SM 6.6 dynamic descriptor heaps, and inline static-sampler S# origins
 /// for `<pack>.reflect.json` (S31 / #662, S34 / #733, S40 / #890, S41 / #917).
 fn analyze_vsharp_indirections(
@@ -8132,8 +8272,9 @@ fn analyze_vsharp_indirections(
     }
 
     let is_wave32 = detect_wave32_program(active);
-    let unreferenced_user_sgprs = compute_unreferenced_initial_user_sgprs(active, stage, is_mesh);
     let cfg = ControlFlowGraph::from_instructions(active);
+    let unreferenced_user_sgprs =
+        compute_unreferenced_initial_user_sgprs(active, &cfg, stage, is_mesh, is_wave32);
     let num_blocks = cfg.blocks.len();
 
     // Pass 1: Monotonic forward dataflow fixpoint over CFG basic blocks so clobbers on one
@@ -8410,8 +8551,9 @@ fn vertex_fetch_slot(is_mtbuf: bool, op: u8, format: u8, byte_offset: u16) -> (u
     }
 }
 
-/// Decode a GFX10.3 unified `MTBUF` `format` code into `(component_type, fetch_format)` for
-/// stage reflection (`runtime/gpu/stage_reflection.cpp::vertex_format_from_name`).
+/// Decode a GFX10.3 unified `MTBUF` `format` code (`V_008F0C_BUF_FMT_*`, matching
+/// `runtime/gpu/gfx10_descriptors.cpp`) into `(component_type, fetch_format)` for stage
+/// reflection (`runtime/gpu/stage_reflection.cpp::vertex_format_from_name`).
 fn mtbuf_vertex_format_info(format: u8, folded_4x8: bool) -> (&'static str, Option<&'static str>) {
     if folded_4x8 {
         return match format {
@@ -8444,24 +8586,47 @@ fn mtbuf_vertex_format_info(format: u8, folded_4x8: bool) -> (&'static str, Opti
         27 => ("u32", Some("uint16x2")),
         28 => ("i32", Some("sint16x2")),
         29 => ("f32", Some("float16x2")),
-        32 | 38 => ("f32", Some("unorm10-10-10-2")),
-        44 | 46 | 56 => ("f32", Some("unorm8x4")),
-        45 | 47 | 57 => ("f32", Some("snorm8x4")),
-        48 | 60 => ("u32", Some("uint8x4")),
-        49 | 61 => ("i32", Some("sint8x4")),
-        50 | 64 => ("u32", Some("uint32x2")),
-        51 | 65 => ("i32", Some("sint32x2")),
-        52 | 66 => ("f32", Some("float32x2")),
-        53 | 67 => ("f32", Some("unorm16x4")),
-        54 | 68 => ("f32", Some("snorm16x4")),
-        58 | 72 => ("f32", Some("float16x4")),
-        73 => ("u32", Some("uint32x3")),
-        74 => ("i32", Some("sint32x3")),
-        75 => ("f32", Some("float32x3")),
-        76 => ("u32", Some("uint32x4")),
-        77 => ("i32", Some("sint32x4")),
-        78 => ("f32", Some("float32x4")),
+        // GFX10.3 `10_10_10_2` (44..49) & `2_10_10_10` (50..55) UNORM/USCALED
+        44 | 46 | 50 | 52 => ("f32", Some("unorm10-10-10-2")),
+        // GFX10.3 `8_8_8_8` (56..61)
+        56 | 58 => ("f32", Some("unorm8x4")),
+        57 | 59 => ("f32", Some("snorm8x4")),
+        60 => ("u32", Some("uint8x4")),
+        61 => ("i32", Some("sint8x4")),
+        // GFX10.3 `32_32` (62..64)
+        62 => ("u32", Some("uint32x2")),
+        63 => ("i32", Some("sint32x2")),
+        64 => ("f32", Some("float32x2")),
+        // GFX10.3 `16_16_16_16` (65..71)
+        65 | 67 => ("f32", Some("unorm16x4")),
+        66 | 68 => ("f32", Some("snorm16x4")),
+        69 => ("u32", Some("uint16x4")),
+        70 => ("i32", Some("sint16x4")),
+        71 => ("f32", Some("float16x4")),
+        // GFX10.3 `32_32_32` (72..74)
+        72 => ("u32", Some("uint32x3")),
+        73 => ("i32", Some("sint32x3")),
+        74 => ("f32", Some("float32x3")),
+        // GFX10.3 `32_32_32_32` (75..77)
+        75 => ("u32", Some("uint32x4")),
+        76 => ("i32", Some("sint32x4")),
+        77 => ("f32", Some("float32x4")),
         _ => ("f32", None),
+    }
+}
+
+/// Map a raw untyped MUBUF dword load opcode (`buffer_load_dword` / `x2` / `x3` / `x4`) to its
+/// WebGPU `fetch_format` string so sub-element vertex loads carry an explicit width in reflection.
+/// Returns `None` for formatted loads (`buffer_load_format_*`, `0x00..=0x03`) whose element format
+/// is defined by the D3D12 input layout / V# descriptor.
+#[inline]
+const fn mubuf_raw_dword_fetch_format(op: u8) -> Option<&'static str> {
+    match op {
+        0x0C => Some("float32"),
+        0x0D => Some("float32x2"),
+        0x0F => Some("float32x3"),
+        0x0E => Some("float32x4"),
+        _ => None,
     }
 }
 
@@ -9477,13 +9642,29 @@ fn plan_program(
                     if let Some(comps) = mubuf_load_components(*op) {
                         has_buffer_fetch = true;
                         let vb_slot = vertex_fetch_vb_slots.get(&inst_idx).copied().unwrap_or(0);
+                        let raw_fetch_fmt = mubuf_raw_dword_fetch_format(*op);
                         vertex_buf_fetches
                             .entry((vb_slot, *offset))
-                            .and_modify(|p| p.components = p.components.max(comps))
+                            .and_modify(|p| {
+                                if comps > p.components {
+                                    p.components = comps;
+                                    if raw_fetch_fmt.is_some() {
+                                        p.fetch_format = raw_fetch_fmt;
+                                    }
+                                } else if p.fetch_format.is_none() && raw_fetch_fmt.is_some() {
+                                    p.fetch_format = match p.components {
+                                        1 => Some("float32"),
+                                        2 => Some("float32x2"),
+                                        3 => Some("float32x3"),
+                                        4 => Some("float32x4"),
+                                        _ => raw_fetch_fmt,
+                                    };
+                                }
+                            })
                             .or_insert(VertexFetchPlan {
                                 components: comps,
                                 component_type: "f32",
-                                fetch_format: None,
+                                fetch_format: raw_fetch_fmt,
                             });
                         for d in 0..comps {
                             if let Some(reg) = checked_vgpr_reg(*vdata, d) {
@@ -10341,34 +10522,46 @@ impl IrEmitter {
             BTreeMap::new();
         let mut used_group0_bindings: BTreeSet<(u32, u32)> = BTreeSet::new();
         let mut emitted_bindings: Vec<WgslBindingInfo> = Vec::new();
-        let has_any_binding = !plan.cbv_slots.is_empty()
-            || !plan.tex_slots.is_empty()
-            || !plan.samp_slots.is_empty()
-            || !plan.storage_buf_slots.is_empty()
-            || !plan.storage_tex_slots.is_empty();
-        let all_bindings_reflected = has_any_binding
-            && plan
-                .cbv_slots
-                .iter()
-                .all(|s| plan.cbv_sources.contains_key(&s.key))
-            && plan.tex_slots.iter().all(|s| s.to_source().is_some())
-            && plan.samp_slots.iter().all(|s| s.to_source().is_some())
-            && plan
+        let has_any_reflected_binding = plan
+            .cbv_slots
+            .iter()
+            .any(|s| plan.cbv_sources.contains_key(&s.key))
+            || plan.tex_slots.iter().any(|s| s.to_source().is_some())
+            || plan.samp_slots.iter().any(|s| s.to_source().is_some())
+            || plan
                 .storage_buf_slots
                 .iter()
-                .all(|s| s.key.to_source().is_some())
-            && plan
+                .any(|s| s.key.to_source().is_some())
+            || plan
                 .storage_tex_slots
                 .iter()
-                .all(|s| s.to_source().is_some());
-        let binding_base: u32 =
-            if plan.stage == ShaderStage::Fragment && all_bindings_reflected {
-                FRAGMENT_REFLECTED_BINDING_OFFSET
-            } else {
-                0
-            };
+                .any(|s| s.to_source().is_some());
+        // Sidecar v3 eligibility (`reflect.rs:3920-3937`, `stage_reflection_sidecar.py:348-354`):
+        // read-only bindings without a resolved source are emitted as `{"unresolved": true}`,
+        // whereas any sourceless writable (`storage` read_write / `storage-texture`) binding
+        // disqualifies the stage from the sidecar. Every v3-eligible fragment stage with at least
+        // one reflected binding uses `FRAGMENT_REFLECTED_BINDING_OFFSET` (`64+`) so it never
+        // collides with vertex `@group(0) @binding(0..63)` in `join_pipeline_layout`.
+        let all_writable_bindings_reflected = plan
+            .storage_buf_slots
+            .iter()
+            .filter(|s| s.writable && plan.stage != ShaderStage::Vertex)
+            .all(|s| s.key.to_source().is_some())
+            && (plan.stage == ShaderStage::Vertex
+                || plan
+                    .storage_tex_slots
+                    .iter()
+                    .all(|s| s.to_source().is_some()));
+        let fragment_uses_reflected_offset = plan.stage == ShaderStage::Fragment
+            && has_any_reflected_binding
+            && all_writable_bindings_reflected;
+        let binding_base: u32 = if fragment_uses_reflected_offset {
+            FRAGMENT_REFLECTED_BINDING_OFFSET
+        } else {
+            0
+        };
         let mut next_extra_binding: u32 =
-            if plan.stage == ShaderStage::Fragment && !all_bindings_reflected {
+            if plan.stage == ShaderStage::Fragment && !fragment_uses_reflected_offset {
                 FRAGMENT_EXTRA_BINDING_BASE
             } else {
                 3
@@ -25947,10 +26140,10 @@ mod tests {
     }
 
     #[test]
-    fn s32_reflected_fragment_bindings_use_disjoint_offset_32() {
+    fn s32_reflected_fragment_bindings_use_disjoint_offset_64() {
         // Fragment shader loading CBV V# and T# descriptors from graphics user SGPR table s8
-        // (zero-extended s9=0) plus an inline static sampler -> all bindings must land at 32+ so
-        // VS (0..31) and PS (32+) never collide in join_pipeline_layout.
+        // (zero-extended s9=0) plus an inline static sampler -> all bindings must land at 64+ so
+        // VS (0..63) and PS (64+) never collide in join_pipeline_layout.
         let mut words = Vec::new();
         words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0 (zero-extend graphics user table ptr s8)
         words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x00, false, false)); // CBV0 V# @ +0x00
@@ -25972,21 +26165,21 @@ mod tests {
         assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
         assert!(
             out.bindings.iter().all(|b| b.binding >= FRAGMENT_REFLECTED_BINDING_OFFSET),
-            "all reflected PS bindings must be >= 32: {:?}",
+            "all reflected PS bindings must be >= 64: {:?}",
             out.bindings
         );
         let cb0 = out.bindings.iter().find(|b| b.name == "cb0").unwrap();
         let tex0 = out.bindings.iter().find(|b| b.name == "tex0").unwrap();
         let samp0 = out.bindings.iter().find(|b| b.name == "samp0").unwrap();
         let cb1 = out.bindings.iter().find(|b| b.name == "cb1").unwrap();
-        assert_eq!(cb0.binding, 32);
-        assert_eq!(tex0.binding, 33);
-        assert_eq!(samp0.binding, 34);
-        assert_eq!(cb1.binding, 35);
-        assert!(out.wgsl.contains("@group(0) @binding(32)"), "WGSL:\n{}", out.wgsl);
-        assert!(out.wgsl.contains("@group(0) @binding(33)"), "WGSL:\n{}", out.wgsl);
-        assert!(out.wgsl.contains("@group(0) @binding(34)"), "WGSL:\n{}", out.wgsl);
-        assert!(out.wgsl.contains("@group(0) @binding(35)"), "WGSL:\n{}", out.wgsl);
+        assert_eq!(cb0.binding, 64);
+        assert_eq!(tex0.binding, 65);
+        assert_eq!(samp0.binding, 66);
+        assert_eq!(cb1.binding, 67);
+        assert!(out.wgsl.contains("@group(0) @binding(64)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(65)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(66)"), "WGSL:\n{}", out.wgsl);
+        assert!(out.wgsl.contains("@group(0) @binding(67)"), "WGSL:\n{}", out.wgsl);
         assert_naga_wgsl_valid(&out.wgsl);
     }
 
@@ -29528,27 +29721,28 @@ mod tests {
     #[test]
     fn translates_mesh_shader_to_compute_matching_runtime_contract() {
         // Synthetic GFX10.3 mesh shader:
-        // - Loads a CBV V# from graphics descriptor table at user SGPR s8 (+0 bytes) -> s[16:19]
-        // - Loads 4 dwords from CBV -> s[20:23]
+        // - Loads a CBV V# from mesh descriptor table at user SGPR s16 (`kMeshUserDataBase = 16`,
+        //   +0 bytes) -> s[20:23]
+        // - Loads 4 dwords from CBV -> s[24:27]
         // - Sets m0 = (1 << 12) | 3 (3 vertices, 1 triangle) and emits s_sendmsg(MSG_GS_ALLOC_REQ)
         // - Exports pos0 (v0..v3), param0 (v4..v7), and prim (v8, packed 3x10-bit indices)
         // - Emits s_sendmsg(MSG_GS_DONE) and s_endpgm
         let mut words = Vec::new();
-        // s_load_dwordx4 s[16:19], s[8:9], 0x0 (descriptor table at graphics user SGPR s8)
-        words.extend_from_slice(&enc_smem(0x02, 16, 4, 0x7D, 0, false, false));
-        // s_buffer_load_dwordx4 s[20:23], s[16:19], 0x0 (CBV read)
-        words.extend_from_slice(&enc_smem(0x0A, 20, 8, 0x7D, 0, false, false));
+        // s_load_dwordx4 s[20:23], s[16:17], 0x0 (descriptor table at mesh user SGPR s16)
+        words.extend_from_slice(&enc_smem(0x02, 20, 8, 0x7D, 0, false, false));
+        // s_buffer_load_dwordx4 s[24:27], s[20:23], 0x0 (CBV read)
+        words.extend_from_slice(&enc_smem(0x0A, 24, 10, 0x7D, 0, false, false));
         // s_mov_b32 m0, 0x00001003 (3 vertices, 1 primitive)
         words.push(enc_sop1(0x03, 124, 0xFF));
         words.push((1u32 << 12) | 3u32);
         // s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)
         words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ)));
         // v_mov_b32 v1..v8 from CBV SGPRs & inline constants
-        words.push(enc_vop1(0x01, 1, 20)); // v1 = s20
-        words.push(enc_vop1(0x01, 2, 21)); // v2 = s21
+        words.push(enc_vop1(0x01, 1, 24)); // v1 = s24
+        words.push(enc_vop1(0x01, 2, 25)); // v2 = s25
         words.push(enc_vop1(0x01, 3, 242)); // v3 = 1.0
-        words.push(enc_vop1(0x01, 4, 22)); // v4 = s22
-        words.push(enc_vop1(0x01, 5, 23)); // v5 = s23
+        words.push(enc_vop1(0x01, 4, 26)); // v4 = s26
+        words.push(enc_vop1(0x01, 5, 27)); // v5 = s27
         words.push(enc_vop1(0x01, 6, 242)); // v6 = 1.0
         words.push(enc_vop1(0x01, 7, 242)); // v7 = 1.0
         // v_mov_b32 v8, (2 << 20) | (1 << 10) | 0 (triangle indices 0, 1, 2)
@@ -29604,14 +29798,14 @@ mod tests {
             out.wgsl
         );
 
-        // Runtime contract: group 3 must NOT appear in reflected bindings, and graphics user
-        // data starts at s8 (not compute s4).
+        // Runtime contract: group 3 must NOT appear in reflected bindings, and mesh user
+        // data starts at s16 (`kMeshUserDataBase = 16`, s8..s15 are NGG/mesh system values).
         assert_eq!(out.bindings.len(), 1, "bindings: {:?}", out.bindings);
         assert_eq!(out.bindings[0].group, 0);
         assert_eq!(
             out.bindings[0].source,
             Some(WgslBindingSource::Table {
-                user_sgpr: 8,
+                user_sgpr: 16,
                 table_byte_offset: 0,
             })
         );
@@ -30179,5 +30373,211 @@ fn cs_main() { return; }
         };
         assert!(validate_emitted_bindings(std::slice::from_ref(&uav_buf), ShaderStage::Compute).is_ok());
         assert!(validate_emitted_bindings(&[uav_buf], ShaderStage::Vertex).is_err());
+    }
+
+    #[test]
+    fn v3_fragment_with_reflected_and_unresolved_readonly_uses_disjoint_offset_64() {
+        // Sidecar v3 fragment stage:
+        // - cb0 loaded via reflected user SGPR table `s8 + 0x00` (`source: Some(Table)`)
+        // - tex0 + samp0 read-only bindings with unresolved sources (`source: None`, raw s[32:39] / s[40:43])
+        // Because all writable bindings have sources (none exist) and at least one binding is
+        // reflected, this v3-eligible PS MUST emit all `@group(0)` bindings at `64+` (NEVER `0`
+        // or `16`), preventing `join_pipeline_layout` collisions with VS `@binding(0..63)`.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x00, false, false)); // CBV0 V# @ s8+0
+        words.extend_from_slice(&enc_smem(0x0A, 4, 6, 0x7D, 0x00, false, false)); // cb0 read
+        words.extend_from_slice(&enc_mimg(0x27, 0xF, 1, 0, 4, 8, 10)); // unresolved tex0/samp0
+        words.push(enc_vop2(0x03, 4, 4, 4)); // v4 = s4 + v4
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        let cb0 = out.bindings.iter().find(|b| b.name == "cb0").unwrap();
+        let tex0 = out.bindings.iter().find(|b| b.name == "tex0").unwrap();
+        let samp0 = out.bindings.iter().find(|b| b.name == "samp0").unwrap();
+        assert!(cb0.source.is_some(), "cb0 must be reflected: {cb0:?}");
+        assert!(tex0.source.is_none(), "tex0 must be unresolved: {tex0:?}");
+        assert!(samp0.source.is_none(), "samp0 must be unresolved: {samp0:?}");
+        assert!(
+            out.bindings.iter().all(|b| b.binding >= FRAGMENT_REFLECTED_BINDING_OFFSET),
+            "v3-eligible PS with unresolved read-only bindings must use offset >= 64: {:?}",
+            out.bindings
+        );
+        assert_eq!(cb0.binding, 64);
+        assert_eq!(tex0.binding, 65);
+        assert_eq!(samp0.binding, 66);
+        assert_naga_wgsl_valid(&out.wgsl);
+
+        // Contrast: a fragment shader with a sourceless writable UAV storage buffer is NOT
+        // v3-sidecar-eligible (rejected by `reflect.rs:3927-3931`), so it stays on legacy base 0.
+        let mut uav_words = Vec::new();
+        uav_words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0
+        uav_words.extend_from_slice(&enc_smem(0x02, 12, 4, 0x7D, 0x00, false, false)); // CBV0 V# @ s8+0
+        uav_words.extend_from_slice(&enc_smem(0x0A, 4, 6, 0x7D, 0x00, false, false)); // cb0 read
+        uav_words.push(enc_vop1(0x01, 0, 4)); // v0 = s4
+        // buffer_store_dword v0, v1, s[32:35], 0 (srsrc = 8 -> unresolved writable storage buffer)
+        uav_words.extend_from_slice(&enc_mubuf(0x1C, 0, 0, 1, 8, false));
+        uav_words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 0, 0, 0]));
+        uav_words.push(enc_sopp(0x01, 0));
+
+        let uav_out = translate_as(&uav_words, Rdna2StageOverride::Pixel);
+        let uav_cb0 = uav_out.bindings.iter().find(|b| b.name == "cb0").unwrap();
+        let uav_buf0 = uav_out.bindings.iter().find(|b| b.kind == "storage").unwrap();
+        assert!(uav_buf0.source.is_none());
+        assert_eq!(uav_cb0.binding, 0);
+        assert_eq!(uav_buf0.binding, FRAGMENT_EXTRA_BINDING_BASE);
+        assert_naga_wgsl_valid(&uav_out.wgsl);
+    }
+
+    #[test]
+    fn mubuf_raw_dword_and_gfx103_mtbuf_vertex_loads_emit_fetch_format() {
+        // Vertex shader fetching raw untyped MUBUF dwords (0x0C..=0x0F) plus a formatted MUBUF
+        // load (0x03 `buffer_load_format_xyzw`) and GFX10.3 MTBUF formats (64, 69, 70, 71, 74, 77).
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x04, 12, 0)); // s[12:13] = s[0:1] (VB table)
+        words.extend_from_slice(&enc_smem(0x02, 12, 6, 0x7D, 0, false, false)); // VB slot 0 V#
+        // Raw dword MUBUF loads -> explicit float32 / float32x2 / float32x3 / float32x4 fetch_format
+        words.extend_from_slice(&enc_mubuf(0x0C, 8, 4, 0, 3, true)); // buffer_load_dword   @ 8
+        words.extend_from_slice(&enc_mubuf(0x0D, 4, 5, 0, 3, true)); // buffer_load_dwordx2 @ 4
+        words.extend_from_slice(&enc_mubuf(0x0F, 20, 7, 0, 3, true)); // buffer_load_dwordx3 @ 20
+        words.extend_from_slice(&enc_mubuf(0x0E, 32, 10, 0, 3, true)); // buffer_load_dwordx4 @ 32
+        // Formatted MUBUF load -> fetch_format remains None (format comes from D3D12 input layout)
+        words.extend_from_slice(&enc_mubuf(0x03, 48, 14, 0, 3, true)); // buffer_load_format_xyzw @ 48
+        // GFX10.3 MTBUF formats matching runtime/gpu/gfx10_descriptors.cpp
+        words.extend_from_slice(&enc_mtbuf(0x01, 64, 64, 18, 0, 3, true)); // 32_32_FLOAT       @ 64
+        words.extend_from_slice(&enc_mtbuf(0x03, 69, 72, 20, 0, 3, true)); // 16_16_16_16_UINT  @ 72
+        words.extend_from_slice(&enc_mtbuf(0x03, 70, 80, 24, 0, 3, true)); // 16_16_16_16_SINT  @ 80
+        words.extend_from_slice(&enc_mtbuf(0x03, 71, 88, 28, 0, 3, true)); // 16_16_16_16_FLOAT @ 88
+        words.extend_from_slice(&enc_mtbuf(0x02, 74, 96, 32, 0, 3, true)); // 32_32_32_FLOAT    @ 96
+        words.extend_from_slice(&enc_mtbuf(0x03, 77, 108, 36, 0, 3, true)); // 32_32_32_32_FLOAT @ 108
+        words.push(enc_vop2(0x03, 4, 256 + 4, 5));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 7));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 10));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 14));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 18));
+        words.push(enc_vop1(0x06, 20, 256 + 20));
+        words.push(enc_vop1(0x05, 24, 256 + 24));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 20));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 24));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 28));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 32));
+        words.push(enc_vop2(0x03, 4, 256 + 4, 36));
+        words.extend_from_slice(&enc_exp(12, 0xF, true, false, false, [4, 5, 7, 10]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Vertex);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+
+        let by_off = |off: u32| {
+            out.vertex_inputs
+                .iter()
+                .find(|v| v.byte_offset == off)
+                .unwrap_or_else(|| panic!("missing vertex input at offset {off}: {:?}", out.vertex_inputs))
+        };
+        assert_eq!(by_off(8).fetch_format, Some("float32"));
+        assert_eq!(by_off(8).components, 1);
+        assert_eq!(by_off(4).fetch_format, Some("float32x2"));
+        assert_eq!(by_off(4).components, 2);
+        assert_eq!(by_off(20).fetch_format, Some("float32x3"));
+        assert_eq!(by_off(20).components, 3);
+        assert_eq!(by_off(32).fetch_format, Some("float32x4"));
+        assert_eq!(by_off(32).components, 4);
+        assert_eq!(by_off(48).fetch_format, None);
+        assert_eq!(by_off(64).fetch_format, Some("float32x2"));
+        assert_eq!(by_off(72).fetch_format, Some("uint16x4"));
+        assert_eq!(by_off(72).component_type, "u32");
+        assert_eq!(by_off(80).fetch_format, Some("sint16x4"));
+        assert_eq!(by_off(80).component_type, "i32");
+        assert_eq!(by_off(88).fetch_format, Some("float16x4"));
+        assert_eq!(by_off(96).fetch_format, Some("float32x3"));
+        assert_eq!(by_off(108).fetch_format, Some("float32x4"));
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn live_on_entry_sgpr_analysis_excludes_scratch_and_seeds_mesh_from_s16() {
+        // 1) Graphics PS where `s12` and `s14` are scratch SGPRs written before any read at entry
+        //    (even though `s12` and `s14` ARE read later in the program!). Only `s8` (live-on-entry)
+        //    should be seeded as `UserTable`.
+        let mut words = Vec::new();
+        words.push(enc_sop1(0x03, 9, 0x80)); // s9 = 0 (writes s9 before read -> NOT live-on-entry)
+        words.push(enc_sop1(0x03, 12, 0x80)); // s12 = 0 (scratch: written before read)
+        words.push(enc_sop1(0x03, 14, 8)); // s14 = s8 (reads s8 live-on-entry, writes s14)
+        words.push(enc_sop2(0x00, 16, 12, 14)); // s16 = s12 + s14 (reads s12, s14 AFTER write)
+        words.extend_from_slice(&enc_smem(0x02, 20, 4, 0x7D, 0x00, false, false)); // V# @ s8+0 -> s[20:23]
+        words.extend_from_slice(&enc_smem(0x0A, 4, 10, 0x7D, 0x00, false, false)); // cb0 read
+        words.push(enc_vop2(0x03, 0, 4, 16));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [0, 0, 0, 0]));
+        words.push(enc_sopp(0x01, 0));
+
+        let bytes = words_to_bytes(&words);
+        let decoded = decode_program(&bytes);
+        let cfg = ControlFlowGraph::from_instructions(&decoded);
+        let unref = compute_unreferenced_initial_user_sgprs(
+            &decoded,
+            &cfg,
+            ShaderStage::Fragment,
+            false,
+            true,
+        );
+        assert!(!unref[8], "s8 is read live-on-entry and must stay seeded as UserTable");
+        assert!(unref[9], "s9 is written before read at entry -> must NOT be seeded as UserTable");
+        assert!(unref[12], "s12 is scratch written before read -> must NOT be seeded as UserTable");
+        assert!(unref[14], "s14 is scratch written before read -> must NOT be seeded as UserTable");
+        assert!(unref[16], "s16 is scratch written before read -> must NOT be seeded as UserTable");
+        assert!(unref[20], "s20 is written by SMEM load before read -> must NOT be seeded as UserTable");
+
+        let entry_state = OriginState::initial(ShaderStage::Fragment, false, &unref);
+        assert_eq!(
+            entry_state.sgpr_origin(8),
+            SgprOrigin::UserTable {
+                user_sgpr: 8,
+                byte_offset: 0,
+            }
+        );
+        assert_eq!(entry_state.sgpr_origin(12), SgprOrigin::Unwritten);
+        assert_eq!(entry_state.sgpr_origin(14), SgprOrigin::Unwritten);
+        assert_eq!(entry_state.sgpr_origin(16), SgprOrigin::Unwritten);
+        assert_eq!(entry_state.sgpr_origin(20), SgprOrigin::Unwritten);
+
+        // 2) Mesh stage seeds user data strictly from s16 (`kMeshUserDataBase = 16`):
+        //    s8..s15 are NGG/mesh system values (`Unknown`), NOT `UserTable`, while live `s16` is `UserTable`.
+        let mut mesh_words = Vec::new();
+        mesh_words.extend_from_slice(&enc_smem(0x02, 20, 4, 0x7D, 0, false, false)); // reads s[8:9] (sys!)
+        mesh_words.extend_from_slice(&enc_smem(0x02, 24, 8, 0x7D, 0, false, false)); // reads s[16:17] (user!)
+        mesh_words.push(enc_sopp(0x01, 0));
+
+        let mesh_bytes = words_to_bytes(&mesh_words);
+        let mesh_decoded = decode_program(&mesh_bytes);
+        let mesh_cfg = ControlFlowGraph::from_instructions(&mesh_decoded);
+        let mesh_unref = compute_unreferenced_initial_user_sgprs(
+            &mesh_decoded,
+            &mesh_cfg,
+            ShaderStage::Compute,
+            true,
+            true,
+        );
+        let mesh_entry = OriginState::initial(ShaderStage::Compute, true, &mesh_unref);
+        for sys_reg in 0..16u8 {
+            assert_eq!(
+                mesh_entry.sgpr_origin(sys_reg),
+                SgprOrigin::Unknown,
+                "mesh s{sys_reg} must be system Unknown, not UserTable"
+            );
+        }
+        assert_eq!(
+            mesh_entry.sgpr_origin(16),
+            SgprOrigin::UserTable {
+                user_sgpr: 16,
+                byte_offset: 0,
+            }
+        );
+        assert_eq!(
+            mesh_entry.sgpr_origin(20),
+            SgprOrigin::Unwritten,
+            "mesh s20 written by SMEM before any read must be Unwritten"
+        );
     }
 }

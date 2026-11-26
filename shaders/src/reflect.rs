@@ -2396,7 +2396,7 @@ pub const STAGE_REFLECTION_VERSION_V3: u32 = 3;
 
 /// Default binding-index base used when deterministically remapping a secondary stage's
 /// colliding bindings (matches `FRAGMENT_REFLECTED_BINDING_OFFSET` in `rdna2_to_wgsl.rs`).
-pub const DEFAULT_SECONDARY_STAGE_BINDING_OFFSET: u32 = 32;
+pub const DEFAULT_SECONDARY_STAGE_BINDING_OFFSET: u32 = 64;
 
 /// AMD GFX10.3 (RDNA2) `S#` sampler descriptor byte size (4 dwords = 16 bytes).
 pub const GFX10_SAMPLER_STRIDE_BYTES: u32 = 16;
