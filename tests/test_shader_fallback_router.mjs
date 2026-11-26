@@ -2777,3 +2777,51 @@ test('W304 classic Worker importScripts isolation exposes W304 APIs with zero gl
   assert.equal(r.getStats().missingUniqueHashes, 0);
   assert.equal(r.getStats().fastPathHits, 0);
 });
+
+test('#1077 resolve cache enforces maxResolveCachePackWgslBytes LRU while preserving fallback miss cache and bounds _realShaders', () => {
+  const bigWgsl1 = `@vertex fn vs_main() -> @builtin(position) vec4<f32> { /* ${'a'.repeat(400)} */ return vec4<f32>(0.0); }`;
+  const bigWgsl2 = `@vertex fn vs_main() -> @builtin(position) vec4<f32> { /* ${'b'.repeat(400)} */ return vec4<f32>(0.0); }`;
+  const bigWgsl3 = `@vertex fn vs_main() -> @builtin(position) vec4<f32> { /* ${'c'.repeat(400)} */ return vec4<f32>(0.0); }`;
+  const h1 = 0x1001n;
+  const h2 = 0x1002n;
+  const h3 = 0x1003n;
+  const missHash = 0x9999n;
+
+  const packMap = new Map([
+    [h1, bigWgsl1],
+    [h2, bigWgsl2],
+    [h3, bigWgsl3],
+  ]);
+  const packLoader = {
+    getWgsl(h) {
+      return packMap.get(h);
+    },
+  };
+
+  // Budget fits at most 2 of the 3 ~500-char (~1000-byte UTF-16) shaders.
+  const router = new ShaderFallbackRouter({
+    packLoader,
+    maxResolveCachePackWgslBytes: 2200,
+    maxRealShaders: 2,
+  });
+
+  // Miss entry should stay cached even when pack entries evict for byte budget.
+  assert.equal(router.resolve(missHash, 'vertex').source, 'builtin');
+  assert.equal(router.resolve(h1, 'vertex').source, 'pack');
+  assert.equal(router.resolve(h2, 'vertex').source, 'pack');
+  // Touch h1 so h2 becomes LRU victim.
+  assert.equal(router.resolve(h1, 'vertex').source, 'pack');
+  assert.equal(router.resolve(h3, 'vertex').source, 'pack');
+
+  assert.ok(router._resolveCachePackWgslBytes <= 2200);
+  assert.equal(router._resolveCacheByStage[1].has(h1), true, 'LRU-refreshed h1 kept');
+  assert.equal(router._resolveCacheByStage[1].has(h3), true, 'newest h3 kept');
+  assert.equal(router._resolveCacheByStage[1].has(h2), false, 'oldest pack entry h2 evicted');
+  assert.equal(router._resolveCacheByStage[1].has(missHash), true, 'builtin miss stays cached');
+
+  // _realShaders is bounded by maxRealShaders (2).
+  router.registerRealShader(0x2001n, 'vertex', { wgsl: 'fn a() {}' });
+  router.registerRealShader(0x2002n, 'vertex', { wgsl: 'fn b() {}' });
+  router.registerRealShader(0x2003n, 'vertex', { wgsl: 'fn c() {}' });
+  assert.equal(router._realShaders.size, 2);
+});
