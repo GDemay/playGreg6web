@@ -1397,6 +1397,18 @@ GraphicsPsoTranslation translate_graphics_pso(const D3D12GraphicsPsoDesc& desc, 
     for (uint32_t i = 0; i < kMaxColorTargets; ++i) {
         const D3D12RenderTargetBlendDesc& rt = bs.IndependentBlendEnable ? bs.RenderTarget[i] : bs.RenderTarget[0];
         k.color_targets[i] = lower_render_target_blend(rt, features, &diag);
+        t.raw_write_masks[i] = k.color_targets[i].write_mask;
+        if (!rt.LogicOpEnable && rt.BlendEnable &&
+            rt.BlendOp != D3D12BlendOp::Min && rt.BlendOp != D3D12BlendOp::Max) {
+            if (rt.SrcBlend == D3D12Blend::AlphaFactor || rt.SrcBlend == D3D12Blend::InvAlphaFactor ||
+                rt.DestBlend == D3D12Blend::AlphaFactor || rt.DestBlend == D3D12Blend::InvAlphaFactor) {
+                t.color_alpha_factor_mask |= static_cast<uint8_t>(1u << i);
+            }
+            if (rt.SrcBlend == D3D12Blend::BlendFactor || rt.SrcBlend == D3D12Blend::InvBlendFactor ||
+                rt.DestBlend == D3D12Blend::BlendFactor || rt.DestBlend == D3D12Blend::InvBlendFactor) {
+                t.color_blend_factor_mask |= static_cast<uint8_t>(1u << i);
+            }
+        }
         if (i < desc.NumRenderTargets && desc.RTVFormats[i] == DxgiFormat::A8_UNORM) {
             // An A8 target (rgba8unorm here, see describe_dxgi) stores only the output's alpha.
             k.color_targets[i].write_mask &= D3D12ColorWriteEnable::Alpha;
@@ -1483,6 +1495,11 @@ uint64_t specialize_graphics_pipeline_key(const GraphicsPsoTranslation& t,
         }
         ct.format = m.format;
         formats[i] = m.format;
+        ct.write_mask = t.raw_write_masks[i];
+        if (rtv[i] == DxgiFormat::A8_UNORM) {
+            // An A8 target (rgba8unorm here, see describe_dxgi) stores only the output's alpha.
+            ct.write_mask &= D3D12ColorWriteEnable::Alpha;
+        }
         const bool pso_declares = i < t.num_render_targets && t.rtv_formats[i] != DxgiFormat::UNKNOWN;
         const bool ps_writes = pso_declares && (t.ps_output_mask & (1u << i)) != 0;
         if (!ps_writes) {
@@ -1492,6 +1509,25 @@ uint64_t specialize_graphics_pipeline_key(const GraphicsPsoTranslation& t,
         if (ct.blend_enabled != 0 && !is_blendable(ct.format, features)) {
             diag |= PipelineDiag::BlendOnNonBlendableFormat;
             ct.blend_enabled = 0;
+        }
+        if (ct.blend_enabled != 0 && (m.diagnostics & FormatDiag::AlphaIgnored) != 0) {
+            // X8 targets (e.g. B8G8R8X8_* promoted to bgra8unorm) have no alpha channel in D3D12:
+            // destination alpha always reads as 1.0 (DstAlpha -> One, OneMinusDstAlpha -> Zero).
+            auto fix_dst_alpha = [](WgpuBlendFactor& f) noexcept {
+                if (f == WgpuBlendFactor::DstAlpha) {
+                    f = WgpuBlendFactor::One;
+                } else if (f == WgpuBlendFactor::OneMinusDstAlpha) {
+                    f = WgpuBlendFactor::Zero;
+                }
+            };
+            fix_dst_alpha(ct.color.src_factor);
+            fix_dst_alpha(ct.color.dst_factor);
+            fix_dst_alpha(ct.alpha.src_factor);
+            fix_dst_alpha(ct.alpha.dst_factor);
+            if (same_component(ct.color, kDefaultBlendComponent) &&
+                same_component(ct.alpha, kDefaultBlendComponent)) {
+                ct.blend_enabled = 0;
+            }
         }
         if (ct.blend_enabled == 0) {
             ct.color = kDefaultBlendComponent;
@@ -2441,7 +2477,21 @@ void CommandListStateTracker::ClearRenderTargetView(const RenderTargetViewInfo& 
     PendingClear pc{};
     pc.view_id = rtv.view_id;
     pc.rtv = rtv;
-    pc.color = {color_rgba[0], color_rgba[1], color_rgba[2], color_rgba[3]};
+    auto clean_clear = [](float v) noexcept {
+        const float f = finite_or_zero(v);
+        return f == 0.0f ? 0.0f : f;
+    };
+    if (rtv.format == DxgiFormat::A8_UNORM) {
+        // A8_UNORM is emulated as rgba8unorm with (0, 0, 0, a): keep RGB cleared to 0 and preserve alpha.
+        pc.color = {0.0f, 0.0f, 0.0f, clean_clear(color_rgba[3])};
+    } else if (rtv.format == DxgiFormat::B8G8R8X8_UNORM || rtv.format == DxgiFormat::B8G8R8X8_UNORM_SRGB ||
+               rtv.format == DxgiFormat::B8G8R8X8_TYPELESS) {
+        // X8 targets have no alpha channel in D3D12 (alpha reads as 1.0).
+        pc.color = {clean_clear(color_rgba[0]), clean_clear(color_rgba[1]), clean_clear(color_rgba[2]), 1.0f};
+    } else {
+        pc.color = {clean_clear(color_rgba[0]), clean_clear(color_rgba[1]), clean_clear(color_rgba[2]),
+                    clean_clear(color_rgba[3])};
+    }
 
     ClearFallback fb{};
     fb.view_id = rtv.view_id;
@@ -2569,10 +2619,15 @@ void CommandListStateTracker::RSSetScissorRects(uint32_t num_rects, const D3D12R
 }
 
 void CommandListStateTracker::OMSetBlendFactor(const float blend_factor[4]) {
-    const std::array<float, 4> value = blend_factor != nullptr
-                                           ? std::array<float, 4>{blend_factor[0], blend_factor[1], blend_factor[2],
-                                                                  blend_factor[3]}
-                                           : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
+    auto clean = [](float v) noexcept {
+        const float f = finite_or_zero(v);
+        return f == 0.0f ? 0.0f : f;
+    };
+    const std::array<float, 4> value =
+        blend_factor != nullptr
+            ? std::array<float, 4>{clean(blend_factor[0]), clean(blend_factor[1]), clean(blend_factor[2]),
+                                   clean(blend_factor[3])}
+            : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f};
     if (value == blend_factor_) {
         ++stats_.redundant_calls_filtered;
         return;
@@ -2743,12 +2798,36 @@ bool CommandListStateTracker::prepare_draw(PipelineCache* cache) {
         pass_scissor_ = sc;
     }
 
-    if (!pass_state_known_ || blend_factor_ != pass_blend_constant_) {
+    std::array<float, 4> effective_blend_constant = blend_factor_;
+    if (pso_ != nullptr) {
+        const GraphicsPsoTranslation& t = pso_->translation();
+        if (t.color_alpha_factor_mask != 0) {
+            const bool bound_targets = (variant_.flags & VariantFlags::BoundTargets) != 0;
+            const uint32_t target_count =
+                bound_targets ? std::min(variant_.num_render_targets, kMaxColorTargets) : t.num_render_targets;
+            uint8_t active_mask = 0;
+            for (uint32_t i = 0; i < target_count; ++i) {
+                const DxgiFormat fmt = bound_targets ? variant_.rtv_formats[i] : t.rtv_formats[i];
+                const bool pso_declares = i < t.num_render_targets && t.rtv_formats[i] != DxgiFormat::UNKNOWN;
+                const bool ps_writes = pso_declares && (t.ps_output_mask & (1u << i)) != 0;
+                if (fmt != DxgiFormat::UNKNOWN && fmt != DxgiFormat::A8_UNORM && ps_writes) {
+                    active_mask |= static_cast<uint8_t>(1u << i);
+                }
+            }
+            if ((t.color_alpha_factor_mask & active_mask) != 0 && (t.color_blend_factor_mask & active_mask) == 0) {
+                // D3D12_BLEND_(INV_)ALPHA_FACTOR uses blend_factor_.a for RGB; WebGPU only has "constant".
+                // Broadcast alpha into RGB when no active target also relies on BlendFactor RGB.
+                const float a = blend_factor_[3];
+                effective_blend_constant = {a, a, a, a};
+            }
+        }
+    }
+    if (!pass_state_known_ || effective_blend_constant != pass_blend_constant_) {
         StateEvent e{};
         e.type = StateEventType::SetBlendConstant;
-        e.blend_constant = blend_factor_;
+        e.blend_constant = effective_blend_constant;
         events_.push_back(e);
-        pass_blend_constant_ = blend_factor_;
+        pass_blend_constant_ = effective_blend_constant;
     }
     if (!pass_state_known_ || stencil_ref_ != pass_stencil_ref_) {
         StateEvent e{};

@@ -2149,6 +2149,188 @@ void test_g77_pso_hotpath_stress() {
     }
 }
 
+void test_ui_a8_blend_fidelity() {
+    // 1. Bound A8_UNORM RTV overrides PSO format -> specialize_graphics_pipeline_key must narrow write_mask to Alpha.
+    {
+        D3D12GraphicsPsoDesc desc = basic_desc();
+        desc.RTVFormats[0] = D::R8G8B8A8_UNORM;
+        desc.BlendState.RenderTarget[0].BlendEnable = true;
+        desc.BlendState.RenderTarget[0].SrcBlend = D3D12Blend::SrcAlpha;
+        desc.BlendState.RenderTarget[0].DestBlend = D3D12Blend::InvSrcAlpha;
+        desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12Blend::One;
+        desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12Blend::InvSrcAlpha;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12ColorWriteEnable::All;
+
+        PipelineVariantState v{};
+        v.flags = VariantFlags::BoundTargets;
+        v.num_render_targets = 1;
+        v.rtv_formats[0] = D::A8_UNORM;
+        v.sample_count = 1;
+        const GraphicsKeyResult r = make_graphics_pipeline_key(desc, v);
+        CHECK(r.key.color_targets[0].format == TF::Rgba8Unorm);
+        CHECK(r.key.color_targets[0].write_mask == D3D12ColorWriteEnable::Alpha);
+        CHECK(r.key.color_targets[0].blend_enabled == 1);
+        CHECK(r.key.color_targets[0].alpha.src_factor == WgpuBlendFactor::One);
+        CHECK(r.key.color_targets[0].alpha.dst_factor == WgpuBlendFactor::OneMinusSrcAlpha);
+
+        // If PSO write mask excludes Alpha, A8_UNORM narrows it to 0.
+        D3D12GraphicsPsoDesc rgb_only = desc;
+        rgb_only.BlendState.RenderTarget[0].RenderTargetWriteMask =
+            D3D12ColorWriteEnable::Red | D3D12ColorWriteEnable::Green | D3D12ColorWriteEnable::Blue;
+        CHECK(make_graphics_pipeline_key(rgb_only, v).key.color_targets[0].write_mask == 0);
+
+        // Reverse: PSO declares A8_UNORM, bound view overrides to R8G8B8A8_UNORM -> full write_mask restored.
+        D3D12GraphicsPsoDesc a8_pso = desc;
+        a8_pso.RTVFormats[0] = D::A8_UNORM;
+        PipelineVariantState v_rgba = v;
+        v_rgba.rtv_formats[0] = D::R8G8B8A8_UNORM;
+        CHECK(make_graphics_pipeline_key(a8_pso, v_rgba).key.color_targets[0].write_mask ==
+              D3D12ColorWriteEnable::All);
+
+        // LogicOp::Noop keeps write_mask == 0 even when bound view overrides A8_UNORM -> R8G8B8A8_UNORM.
+        D3D12GraphicsPsoDesc noop_a8 = a8_pso;
+        noop_a8.BlendState.RenderTarget[0].BlendEnable = false;
+        noop_a8.BlendState.RenderTarget[0].LogicOpEnable = true;
+        noop_a8.BlendState.RenderTarget[0].LogicOp = D3D12LogicOp::Noop;
+        CHECK(make_graphics_pipeline_key(noop_a8, v_rgba).key.color_targets[0].write_mask == 0);
+    }
+
+    // 2. B8G8R8X8_* (AlphaIgnored) remaps DstAlpha -> One and OneMinusDstAlpha -> Zero.
+    {
+        D3D12GraphicsPsoDesc x8 = basic_desc();
+        x8.RTVFormats[0] = D::B8G8R8X8_UNORM;
+        x8.BlendState.RenderTarget[0].BlendEnable = true;
+        x8.BlendState.RenderTarget[0].SrcBlend = D3D12Blend::DestAlpha;
+        x8.BlendState.RenderTarget[0].DestBlend = D3D12Blend::InvDestAlpha;
+        x8.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12Blend::InvDestAlpha;
+        x8.BlendState.RenderTarget[0].DestBlendAlpha = D3D12Blend::DestAlpha;
+        const GraphicsKeyResult r = make_graphics_pipeline_key(x8);
+        CHECK(r.key.color_targets[0].format == TF::Bgra8Unorm);
+        CHECK(r.key.color_targets[0].blend_enabled == 1);
+        CHECK(r.key.color_targets[0].color.src_factor == WgpuBlendFactor::One);
+        CHECK(r.key.color_targets[0].color.dst_factor == WgpuBlendFactor::Zero);
+        CHECK(r.key.color_targets[0].alpha.src_factor == WgpuBlendFactor::Zero);
+        CHECK(r.key.color_targets[0].alpha.dst_factor == WgpuBlendFactor::One);
+
+        // When remapping reduces both color and alpha to passthrough (One, Zero, Add), blend disables cleanly.
+        x8.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12Blend::DestAlpha;
+        x8.BlendState.RenderTarget[0].DestBlendAlpha = D3D12Blend::InvDestAlpha;
+        const GraphicsKeyResult pt = make_graphics_pipeline_key(x8);
+        CHECK(pt.key.color_targets[0].blend_enabled == 0);
+    }
+
+    // 3. ClearRenderTargetView on A8_UNORM clears RGB to 0 and preserves alpha (both loadOp and ClearFallback);
+    //    B8G8R8X8_UNORM clears alpha to 1.0; non-finite clear values are sanitized.
+    {
+        CommandListStateTracker t;
+        const RenderTargetViewInfo a8 = rtv(40, 256, 256, D::A8_UNORM);
+        const RenderTargetViewInfo x8 = rtv(41, 256, 256, D::B8G8R8X8_UNORM);
+        const float col[4] = {0.9f, 0.8f, 0.7f, 0.35f};
+        t.ClearRenderTargetView(a8, col);
+        t.ClearRenderTargetView(x8, col);
+        t.set_render_targets(std::span<const RenderTargetViewInfo>(&a8, 1), nullptr);
+        set_full_viewport(t, 256.0f, 256.0f);
+        CHECK(t.prepare_draw(nullptr));
+        const RenderPassDesc& p0 = t.passes()[0];
+        CHECK(p0.color[0].load_op == WgpuLoadOp::Clear);
+        CHECK(p0.color[0].clear_value[0] == 0.0f && p0.color[0].clear_value[1] == 0.0f &&
+              p0.color[0].clear_value[2] == 0.0f && p0.color[0].clear_value[3] == 0.35f);
+
+        // Partial rect clear on A8_UNORM also zeroes RGB and preserves alpha.
+        const D3D12Rect partial{10, 10, 50, 50};
+        const float col2[4] = {1.0f, 1.0f, 1.0f, 0.6f};
+        t.ClearRenderTargetView(a8, col2, 1, &partial);
+        CHECK(!t.clear_fallbacks().empty());
+        const auto& fb_col = t.clear_fallbacks().back().color;
+        CHECK(fb_col[0] == 0.0f && fb_col[1] == 0.0f && fb_col[2] == 0.0f && fb_col[3] == 0.6f);
+
+        // Flush pending B8G8R8X8_UNORM clear: alpha forced to 1.0f.
+        t.close();
+        const RenderPassDesc& p_x8 = t.passes().back();
+        CHECK(p_x8.color[0].view_id == 41 && p_x8.color[0].load_op == WgpuLoadOp::Clear);
+        CHECK(p_x8.color[0].clear_value[0] == 0.9f && p_x8.color[0].clear_value[1] == 0.8f &&
+              p_x8.color[0].clear_value[2] == 0.7f && p_x8.color[0].clear_value[3] == 1.0f);
+    }
+
+    // 4. D3D12Blend::AlphaFactor broadcasts blend_factor_.a into RGB and restores RGB on BlendFactor PSOs.
+    {
+        PipelineCache cache;
+        D3D12GraphicsPsoDesc af_desc = basic_desc();
+        af_desc.BlendState.RenderTarget[0].BlendEnable = true;
+        af_desc.BlendState.RenderTarget[0].SrcBlend = D3D12Blend::AlphaFactor;
+        af_desc.BlendState.RenderTarget[0].DestBlend = D3D12Blend::InvAlphaFactor;
+        GraphicsPso af_pso(af_desc);
+
+        D3D12GraphicsPsoDesc bf_desc = basic_desc();
+        bf_desc.ps = 0x2223;
+        bf_desc.BlendState.RenderTarget[0].BlendEnable = true;
+        bf_desc.BlendState.RenderTarget[0].SrcBlend = D3D12Blend::BlendFactor;
+        bf_desc.BlendState.RenderTarget[0].DestBlend = D3D12Blend::InvBlendFactor;
+        GraphicsPso bf_pso(bf_desc);
+
+        // Mixed MRT PSO: RT0 uses AlphaFactor, RT1 uses BlendFactor -> keep original RGBA.
+        D3D12GraphicsPsoDesc mix_desc = basic_desc();
+        mix_desc.ps = 0x2224;
+        mix_desc.NumRenderTargets = 2;
+        mix_desc.RTVFormats[1] = D::R8G8B8A8_UNORM;
+        mix_desc.BlendState.IndependentBlendEnable = true;
+        mix_desc.BlendState.RenderTarget[0].BlendEnable = true;
+        mix_desc.BlendState.RenderTarget[0].SrcBlend = D3D12Blend::AlphaFactor;
+        mix_desc.BlendState.RenderTarget[1].BlendEnable = true;
+        mix_desc.BlendState.RenderTarget[1].SrcBlend = D3D12Blend::BlendFactor;
+        GraphicsPso mix_pso(mix_desc);
+
+        CommandListStateTracker t;
+        const RenderTargetViewInfo rt0 = rtv(50);
+        const RenderTargetViewInfo rt1 = rtv(51);
+        const RenderTargetViewInfo mrt[2] = {rt0, rt1};
+        const float bf[4] = {0.1f, 0.2f, 0.3f, 0.75f};
+        t.OMSetBlendFactor(bf);
+        t.set_render_targets(std::span<const RenderTargetViewInfo>(&rt0, 1), nullptr);
+        set_full_viewport(t);
+
+        // Draw 1: AlphaFactor PSO broadcasts alpha (0.75) to RGB.
+        t.SetPipelineState(&af_pso);
+        CHECK(t.prepare_draw(&cache));
+        CHECK(t.events().back().type == StateEventType::SetBlendConstant);
+        CHECK(t.events().back().blend_constant == (std::array<float, 4>{0.75f, 0.75f, 0.75f, 0.75f}));
+
+        // Draw 2: Same pass, switch to BlendFactor PSO -> restores {0.1, 0.2, 0.3, 0.75}.
+        t.SetPipelineState(&bf_pso);
+        CHECK(t.prepare_draw(&cache));
+        CHECK(t.events().back().type == StateEventType::SetBlendConstant);
+        CHECK(t.events().back().blend_constant == (std::array<float, 4>{0.1f, 0.2f, 0.3f, 0.75f}));
+
+        // Draw 3: New pass (rt1) with AlphaFactor PSO -> re-emits {0.75, 0.75, 0.75, 0.75}.
+        t.clear_events();
+        t.set_render_targets(std::span<const RenderTargetViewInfo>(&rt1, 1), nullptr);
+        t.SetPipelineState(&af_pso);
+        CHECK(t.prepare_draw(&cache));
+        bool got_bc = false;
+        for (const StateEvent& e : t.events()) {
+            if (e.type == StateEventType::SetBlendConstant) {
+                CHECK(e.blend_constant == (std::array<float, 4>{0.75f, 0.75f, 0.75f, 0.75f}));
+                got_bc = true;
+            }
+        }
+        CHECK(got_bc);
+
+        // Draw 4: Mixed MRT PSO -> preserves original {0.1, 0.2, 0.3, 0.75}.
+        t.clear_events();
+        t.set_render_targets(std::span<const RenderTargetViewInfo>(mrt, 2), nullptr);
+        t.SetPipelineState(&mix_pso);
+        CHECK(t.prepare_draw(&cache));
+        bool got_mix_bc = false;
+        for (const StateEvent& e : t.events()) {
+            if (e.type == StateEventType::SetBlendConstant) {
+                CHECK(e.blend_constant == (std::array<float, 4>{0.1f, 0.2f, 0.3f, 0.75f}));
+                got_mix_bc = true;
+            }
+        }
+        CHECK(got_mix_bc);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -2174,6 +2356,7 @@ int main() {
     test_om_set_render_targets_descriptors();
     test_tracker_pipeline_failures();
     test_g77_pso_hotpath_stress();
+    test_ui_a8_blend_fidelity();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pso_cache failed with %d failure(s)\n", g_failures);

@@ -468,6 +468,13 @@ ResolvedViewFormat resolve_sampled_view_format(pso::DxgiFormat texture_dxgi,
         return out;
     }
 
+    if (texture_dxgi == D::A8_UNORM && view_dxgi != D::A8_UNORM) {
+        // A8_UNORM is promoted to rgba8unorm (0, 0, 0, a) and cannot be sRGB-aliased or reinterpreted.
+        out.format = tex_map.format;
+        out.aspect = tex_map.aspect;
+        out.fallback_to_base = true;
+        return out;
+    }
     const pso::TextureFormatMapping view_map = pso::map_texture_format(view_dxgi, usage, features);
     if (!tex_map.supported()) {
         out.format = view_map.format;
@@ -2631,8 +2638,13 @@ bool StateBridgeDevice::resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewIn
     pso::WgpuTextureFormat view_wgpu =
         pso::map_texture_format(format, pso::FormatUsage::RenderTarget, options_.features).format;
     pso::DxgiFormat resolved_dxgi = format;
-    if (tex_wgpu != pso::WgpuTextureFormat::Undefined && view_wgpu != pso::WgpuTextureFormat::Undefined &&
-        !is_compatible_view_format(tex_wgpu, view_wgpu)) {
+    if (tex.format == pso::DxgiFormat::A8_UNORM) {
+        // A8_UNORM is held as rgba8unorm with (0, 0, 0, a): keep A8_UNORM identity so
+        // pipeline specialization and clears preserve the alpha-only write mask and zero RGB.
+        view_wgpu = tex_wgpu;
+        resolved_dxgi = pso::DxgiFormat::A8_UNORM;
+    } else if (tex_wgpu != pso::WgpuTextureFormat::Undefined && view_wgpu != pso::WgpuTextureFormat::Undefined &&
+               !is_compatible_view_format(tex_wgpu, view_wgpu)) {
         view_wgpu = tex_wgpu;
         resolved_dxgi = tex.format;
     }
@@ -3502,7 +3514,9 @@ void CommandListBridge::emit_begin_render_pass(const pso::RenderPassDesc& pass) 
         a.load_op = static_cast<uint8_t>(c.load_op);
         a.store_op = static_cast<uint8_t>(c.store_op);
         a.view = v->view;
-        std::memcpy(a.clear_value, c.clear_value.data(), sizeof(a.clear_value));
+        for (size_t ch = 0; ch < 4; ++ch) {
+            a.clear_value[ch] = canonical_finite_float(c.clear_value[ch]);
+        }
         usage_scope_.add(v->resource_id, v->range, v->usage);
         note_recorded_resource(v->texture_id);
         note_recorded_resource(v->resource_id);
