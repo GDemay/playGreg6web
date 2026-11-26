@@ -4587,3 +4587,232 @@ test('W379 integrates stage reflection v3 metadata (unresolved, lane_indexed, cb
   assert.equal(synth.synthesizedCount, 1);
   assert.equal(synth.synthesized[0].binding, 2);
 });
+
+// ---------------------------------------------------------------------------
+// PR #1868 high @binding(64+), WebGPU validation hardening & #1077 eviction
+// ---------------------------------------------------------------------------
+
+test('PR #1868 high @binding(64+) reflection slots, sampler synthesis, and fast hashing work cleanly', () => {
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device });
+
+  const highBindings = [
+    { binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform', minBindingSize: 256 } },
+    { binding: 64, visibility: SHADER_STAGE_BITS.FRAGMENT, buffer: { type: 'uniform', minBindingSize: 256 } },
+    { binding: 65, visibility: SHADER_STAGE_BITS.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d' } },
+    { binding: 66, visibility: SHADER_STAGE_BITS.FRAGMENT, sampler: { type: 'filtering' } },
+    { binding: 127, visibility: SHADER_STAGE_BITS.FRAGMENT, buffer: { type: 'read-only-storage' } },
+    { binding: 512, visibility: SHADER_STAGE_BITS.FRAGMENT, texture: { sampleType: 'unfilterable-float', viewDimension: '2d' } },
+  ];
+
+  // Out-of-order input should sort and deduplicate identically to sorted input.
+  const bgl1 = cache.createBindGroupLayoutFromReflection({ entries: [...highBindings].reverse() });
+  const bgl2 = cache.createBindGroupLayoutFromReflection({ entries: highBindings });
+  assert.equal(bgl1, bgl2);
+  assert.equal(device.calls.createBindGroupLayout.length, 1);
+
+  const createdEntries = device.calls.createBindGroupLayout[0].desc.entries;
+  assert.deepEqual(
+    createdEntries.map((e) => e.binding),
+    [0, 64, 65, 66, 127, 512]
+  );
+
+  // Fallback sampler synthesis works at @binding(66) without any <64 cap.
+  const synth = cache.synthesizeFallbackSamplerEntries({ entries: highBindings }, [
+    { binding: 64, resource: { buffer: {} } },
+    { binding: 65, resource: { kind: 'GPUTextureView' } },
+  ]);
+  assert.equal(synth.synthesizedCount, 1);
+  assert.equal(synth.synthesized[0].binding, 66);
+});
+
+test('WebGPU validation hardening: non-blendable formats, min/max & dual-source blend, stripIndexFormat, depthStencil, sparse VBs, and splash_rect_24b', () => {
+  const device = createMockGpuDevice();
+  const vs = device.createShaderModule({ code: 'vs' });
+  const fs = device.createShaderModule({ code: 'fs' });
+  const alphaBlend = {
+    color: { operation: 'add', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+    alpha: { operation: 'add', srcFactor: 'one', dstFactor: 'one-minus-src-alpha' },
+  };
+
+  // 1. Non-blendable integer & float32 color targets strip blend unless float32-blendable is enabled.
+  const nonBlendNorm = normalizeRenderPipelineDescriptor({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [
+        { format: 'r32float', blend: alphaBlend },
+        { format: 'rgba32float', blend: alphaBlend },
+        { format: 'rgba8uint', blend: alphaBlend },
+        { format: 'r32uint', blend: alphaBlend },
+        { format: 'rgba8unorm', blend: alphaBlend },
+      ],
+    },
+  });
+  assert.equal(nonBlendNorm.normalized, true);
+  assert.ok(nonBlendNorm.reasons.includes('stripped-non-blendable-blend'));
+  assert.equal(nonBlendNorm.descriptor.fragment.targets[0].blend, undefined);
+  assert.equal(nonBlendNorm.descriptor.fragment.targets[1].blend, undefined);
+  assert.equal(nonBlendNorm.descriptor.fragment.targets[2].blend, undefined);
+  assert.equal(nonBlendNorm.descriptor.fragment.targets[3].blend, undefined);
+  assert.deepEqual(nonBlendNorm.descriptor.fragment.targets[4].blend, alphaBlend);
+
+  // With float32-blendable enabled, r32float/rgba32float preserve blend while integer formats still strip it.
+  const f32BlendNorm = normalizeRenderPipelineDescriptor(
+    {
+      layout: 'auto',
+      vertex: { module: vs, entryPoint: 'vs_main' },
+      fragment: {
+        module: fs,
+        entryPoint: 'fs_main',
+        targets: [
+          { format: 'rgba32float', blend: alphaBlend },
+          { format: 'rgba8sint', blend: alphaBlend },
+        ],
+      },
+    },
+    { deviceFeatures: new Set(['float32-blendable']) }
+  );
+  assert.deepEqual(f32BlendNorm.descriptor.fragment.targets[0].blend, alphaBlend);
+  assert.equal(f32BlendNorm.descriptor.fragment.targets[1].blend, undefined);
+
+  // 2. min/max blend operations force srcFactor='one', dstFactor='one'; dual-source downgrades without feature.
+  const blendRuleNorm = normalizeRenderPipelineDescriptor({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    fragment: {
+      module: fs,
+      entryPoint: 'fs_main',
+      targets: [
+        {
+          format: 'bgra8unorm',
+          blend: {
+            color: { operation: 'min', srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha' },
+            alpha: { operation: 'add', srcFactor: 'src1', dstFactor: 'one-minus-src1-alpha' },
+          },
+        },
+      ],
+    },
+  });
+  assert.deepEqual(blendRuleNorm.descriptor.fragment.targets[0].blend, {
+    color: { operation: 'min', srcFactor: 'one', dstFactor: 'one' },
+    alpha: { operation: 'add', srcFactor: 'src', dstFactor: 'one-minus-src-alpha' },
+  });
+  assert.ok(blendRuleNorm.reasons.includes('normalized-dual-source-blend'));
+
+  // 3. stripIndexFormat stripped on non-strip topologies, preserved on strip topologies; unclippedDepth guarded.
+  const primNorm = normalizeRenderPipelineDescriptor(
+    {
+      layout: 'auto',
+      vertex: { module: vs, entryPoint: 'vs_main' },
+      primitive: { topology: 'triangle-list', stripIndexFormat: 'uint16', unclippedDepth: true },
+    },
+    { deviceFeatures: new Set() }
+  );
+  assert.equal(primNorm.descriptor.primitive.stripIndexFormat, undefined);
+  assert.equal(primNorm.descriptor.primitive.unclippedDepth, undefined);
+  assert.ok(primNorm.reasons.includes('stripped-strip-index-format'));
+  assert.ok(primNorm.reasons.includes('stripped-unclipped-depth'));
+
+  const stripOk = normalizeRenderPipelineDescriptor({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    primitive: { topology: 'triangle-strip', stripIndexFormat: 'uint32' },
+  });
+  assert.equal(stripOk.descriptor.primitive.stripIndexFormat, 'uint32');
+
+  // 4. Depth/stencil: stencil8 cannot write depth; depthWriteEnabled requires depthCompare; non-triangle zeros depthBias.
+  const stencilNorm = normalizeRenderPipelineDescriptor({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    depthStencil: { format: 'stencil8', depthWriteEnabled: true, depthCompare: 'less' },
+  });
+  assert.equal(stencilNorm.descriptor.depthStencil.depthWriteEnabled, false);
+  assert.equal(stencilNorm.descriptor.depthStencil.depthCompare, undefined);
+
+  const lineBiasNorm = normalizeRenderPipelineDescriptor({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: 'vs_main' },
+    primitive: { topology: 'line-list' },
+    depthStencil: {
+      format: 'depth24plus',
+      depthWriteEnabled: true,
+      depthBias: 2,
+      depthBiasSlopeScale: 1.5,
+      depthBiasClamp: 0.5,
+    },
+  });
+  assert.equal(lineBiasNorm.descriptor.depthStencil.depthCompare, 'always');
+  assert.equal(lineBiasNorm.descriptor.depthStencil.depthBias, 0);
+  assert.equal(lineBiasNorm.descriptor.depthStencil.depthBiasSlopeScale, 0);
+  assert.equal(lineBiasNorm.descriptor.depthStencil.depthBiasClamp, 0);
+  assert.ok(lineBiasNorm.reasons.includes('cleared-non-triangle-depth-bias'));
+
+  // 5. Sparse null vertex buffer slots preserve slot indices instead of shifting.
+  const sparseVbl = normalizeVertexBufferLayouts([
+    null,
+    {
+      arrayStride: 24,
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x4' },
+        { shaderLocation: 1, offset: 16, format: 'float32x2' },
+      ],
+    },
+  ]);
+  assert.equal(sparseVbl.length, 2);
+  assert.equal(sparseVbl[0], null);
+  assert.equal(sparseVbl[1].arrayStride, 24);
+
+  // 6. splash_rect_24b fallback profile is recognized with 3-attribute layout & 3-binding BGL.
+  assert.equal(normalizeFallbackProfile('splash_rect_24b'), 'splash_rect_24b');
+  assert.equal(normalizeFallbackProfile('rectlist-24b'), 'splash_rect_24b');
+  const splashVbl = normalizeVertexBufferLayouts([], { fallbackProfile: 'splash_rect_24b' });
+  assert.equal(splashVbl.length, 1);
+  assert.equal(splashVbl[0].arrayStride, 24);
+  assert.equal(splashVbl[0].attributes.length, 3);
+  assert.equal(splashVbl[0].attributes[1].format, 'unorm8x4');
+  const splashBgl = buildFallbackBindGroupLayoutDescriptor('splash_rect_24b');
+  assert.deepEqual(
+    splashBgl.entries.map((e) => e.binding),
+    [0, 1, 2]
+  );
+});
+
+test('#1077 pipeline cache eviction nulls GPURenderPipeline references and sweeps fast-lookup maps', () => {
+  let clock = 1000;
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({ device, now: () => clock });
+  const vs = device.createShaderModule({ code: 'vs' });
+  const fs = device.createShaderModule({ code: 'fs' });
+
+  const makeDesc = (ep) => ({
+    layout: 'auto',
+    vertex: { module: vs, entryPoint: ep },
+    fragment: { module: fs, entryPoint: 'fs_main', targets: [{ format: 'bgra8unorm' }] },
+  });
+
+  const p1 = cache.getOrCreateRenderPipeline(makeDesc('vs_a'), 'fast-a', { priority: 'low' });
+  const p2 = cache.getOrCreateRenderPipeline(makeDesc('vs_b'), 'fast-b', { priority: 'high' });
+  assert.ok(p1 && p2);
+
+  // Capture internal fast-lookup record before eviction to verify entry.value is nulled.
+  const recA = cache._fastRenderLookup.get('fast-a');
+  assert.ok(recA && recA.entry && recA.entry.value === p1);
+
+  const evicted = cache.evictLowPriority();
+  assert.equal(evicted, 1);
+  assert.equal(recA.entry.alive, false);
+  assert.equal(recA.entry.value, null);
+  assert.equal(cache._fastRenderLookup.has('fast-a'), false);
+  assert.equal(cache._fastRenderLookup.has('fast-b'), true);
+
+  // evictOlderThan also sweeps stale fast-lookup entries.
+  clock = 5000;
+  const recB = cache._fastRenderLookup.get('fast-b');
+  assert.equal(cache.evictOlderThan(1000), 1);
+  assert.equal(recB.entry.value, null);
+  assert.equal(cache._fastRenderLookup.size, 0);
+  assert.equal(cache._fastRenderIntHash.size, 0);
+});

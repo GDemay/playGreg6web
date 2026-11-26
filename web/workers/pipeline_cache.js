@@ -224,6 +224,97 @@
     'one-minus-src1-alpha',
   ]);
 
+  const DUAL_SOURCE_BLEND_FALLBACKS = Object.freeze({
+    src1: 'src',
+    'one-minus-src1': 'one-minus-src',
+    'src1-alpha': 'src-alpha',
+    'one-minus-src1-alpha': 'one-minus-src-alpha',
+  });
+
+  const VALID_COMPARE_FUNCTIONS = new Set([
+    'never',
+    'less',
+    'equal',
+    'less-equal',
+    'greater',
+    'not-equal',
+    'greater-equal',
+    'always',
+  ]);
+
+  const VALID_STENCIL_OPS = new Set([
+    'keep',
+    'zero',
+    'replace',
+    'invert',
+    'increment-clamp',
+    'decrement-clamp',
+    'increment-wrap',
+    'decrement-wrap',
+  ]);
+
+  const VALID_CULL_MODES = new Set(['none', 'front', 'back']);
+  const VALID_FRONT_FACES = new Set(['ccw', 'cw']);
+  const VALID_STRIP_INDEX_FORMATS = new Set(['uint16', 'uint32']);
+
+  const DEPTH_ASPECT_FORMATS = new Set([
+    'depth16unorm',
+    'depth24plus',
+    'depth24plus-stencil8',
+    'depth32float',
+    'depth32float-stencil8',
+  ]);
+
+  // Core WebGPU blendable color target formats (WebGPU "Texture Format Capabilities").
+  const BLENDABLE_CORE_FORMATS = new Set([
+    'r8unorm',
+    'rg8unorm',
+    'rgba8unorm',
+    'rgba8unorm-srgb',
+    'bgra8unorm',
+    'bgra8unorm-srgb',
+    'rgb10a2unorm',
+    'r16float',
+    'rg16float',
+    'rgba16float',
+  ]);
+
+  const FLOAT32_COLOR_FORMATS = new Set(['r32float', 'rg32float', 'rgba32float']);
+
+  const TIER1_BLENDABLE_FORMATS = new Set([
+    'r8snorm',
+    'rg8snorm',
+    'rgba8snorm',
+    'r16unorm',
+    'rg16unorm',
+    'rgba16unorm',
+    'r16snorm',
+    'rg16snorm',
+    'rgba16snorm',
+  ]);
+
+  const NON_BLENDABLE_INTEGER_FORMATS = new Set([
+    'r8uint',
+    'r8sint',
+    'rg8uint',
+    'rg8sint',
+    'rgba8uint',
+    'rgba8sint',
+    'r16uint',
+    'r16sint',
+    'rg16uint',
+    'rg16sint',
+    'rgba16uint',
+    'rgba16sint',
+    'r32uint',
+    'r32sint',
+    'rg32uint',
+    'rg32sint',
+    'rgba32uint',
+    'rgba32sint',
+    'rgb10a2uint',
+  ]);
+
   // Canonical W167 fallback sampler descriptors for stages declaring sampler bindings
   // without an explicit static sampler in the root signature.
   const DEFAULT_SAMPLER_DESCRIPTORS = Object.freeze({
@@ -294,10 +385,16 @@
     textured_24b: 'textured_quad_24b',
     'textured-quad-24b': 'textured_quad_24b',
     'textured-24b': 'textured_quad_24b',
+    splash_rect_24b: 'splash_rect_24b',
+    'splash-rect-24b': 'splash_rect_24b',
+    rectlist_24b: 'splash_rect_24b',
+    'rectlist-24b': 'splash_rect_24b',
+    frame1_splash_24b: 'splash_rect_24b',
+    'frame1-splash-24b': 'splash_rect_24b',
   });
 
   const FALLBACK_LABEL_RE =
-    /^fallback:(default|minimal|fullscreen[_-]triangle[_-]cbv|fullscreen[_-]cbv|textured[_-]quad[_-]24b|textured[_-]24b)(?:[:\s]|$)/i;
+    /^fallback:(default|minimal|fullscreen[_-]triangle[_-]cbv|fullscreen[_-]cbv|textured[_-]quad[_-]24b|textured[_-]24b|splash[_-]rect[_-]24b|rectlist[_-]24b|frame1[_-]splash[_-]24b)(?:[:\s]|$)/i;
 
   // Canonical Frame-1 24-byte-stride vertex layout (DrawInstanced(3, 1) / textured_quad_24b):
   // @location(0) float32x4 @ offset 0 (16 B) + @location(1) float32x2 @ offset 16 (8 B).
@@ -307,6 +404,18 @@
     attributes: Object.freeze([
       Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x4' }),
       Object.freeze({ shaderLocation: 1, offset: 16, format: 'float32x2' }),
+    ]),
+  });
+
+  // Canonical Frame-1 24-byte-stride splash/UI rectlist vertex layout (splash_rect_24b):
+  // @location(0) float32x3 @ offset 0 + @location(1) unorm8x4 @ offset 12 + @location(2) float32x2 @ offset 16.
+  const FRAME1_SPLASH_RECT_LAYOUT_24B = Object.freeze({
+    arrayStride: FRAME1_VERTEX_STRIDE_24B,
+    stepMode: 'vertex',
+    attributes: Object.freeze([
+      Object.freeze({ shaderLocation: 0, offset: 0, format: 'float32x3' }),
+      Object.freeze({ shaderLocation: 1, offset: 12, format: 'unorm8x4' }),
+      Object.freeze({ shaderLocation: 2, offset: 16, format: 'float32x2' }),
     ]),
   });
 
@@ -336,6 +445,33 @@
       }),
       Object.freeze({
         binding: 1,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        sampler: Object.freeze({
+          type: 'filtering',
+        }),
+      }),
+    ]),
+    splash_rect_24b: Object.freeze([
+      Object.freeze({
+        binding: 0,
+        visibility: SHADER_STAGE_BITS.VERTEX | SHADER_STAGE_BITS.FRAGMENT,
+        buffer: Object.freeze({
+          type: 'uniform',
+          hasDynamicOffset: false,
+          minBindingSize: FRAME1_CBV_MIN_BINDING_SIZE,
+        }),
+      }),
+      Object.freeze({
+        binding: 1,
+        visibility: SHADER_STAGE_BITS.FRAGMENT,
+        texture: Object.freeze({
+          sampleType: 'float',
+          viewDimension: '2d',
+          multisampled: false,
+        }),
+      }),
+      Object.freeze({
+        binding: 2,
         visibility: SHADER_STAGE_BITS.FRAGMENT,
         sampler: Object.freeze({
           type: 'filtering',
@@ -3044,7 +3180,60 @@
     return rate < 0 ? 0 : rate > 1 ? 1 : rate;
   }
 
-  function normalizeBlendComponentInternal(rawComp, addReason) {
+  function deviceFeaturesHas(deviceFeatures, featureName) {
+    if (!deviceFeatures || typeof deviceFeatures.has !== 'function') {
+      return false;
+    }
+    try {
+      return Boolean(deviceFeatures.has(featureName));
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Return false when a WebGPU color target format is known to be non-blendable
+   * on the target device (integer formats `*uint`/`*sint`, `r32float`/`rg32float`/`rgba32float`
+   * without `'float32-blendable'`, `rg11b10ufloat` without `'rg11b10ufloat-renderable'`,
+   * tier-1 snorm/unorm16 without `'texture-formats-tier1'`, depth/stencil, compressed, or `rgb9e5ufloat`).
+   */
+  function isBlendableColorFormat(format, deviceFeatures) {
+    if (typeof format !== 'string' || format.length === 0) {
+      return true;
+    }
+    const normalized = format.trim().toLowerCase();
+    if (BLENDABLE_CORE_FORMATS.has(normalized)) {
+      return true;
+    }
+    if (NON_BLENDABLE_INTEGER_FORMATS.has(normalized)) {
+      return false;
+    }
+    if (FLOAT32_COLOR_FORMATS.has(normalized)) {
+      return deviceFeaturesHas(deviceFeatures, 'float32-blendable');
+    }
+    if (normalized === 'rg11b10ufloat') {
+      return deviceFeaturesHas(deviceFeatures, 'rg11b10ufloat-renderable');
+    }
+    if (TIER1_BLENDABLE_FORMATS.has(normalized)) {
+      return deviceFeaturesHas(deviceFeatures, 'texture-formats-tier1');
+    }
+    if (
+      normalized === 'rgb9e5ufloat' ||
+      normalized === 'stencil8' ||
+      normalized.startsWith('depth') ||
+      normalized.startsWith('bc') ||
+      normalized.startsWith('etc2') ||
+      normalized.startsWith('eac') ||
+      normalized.startsWith('astc') ||
+      normalized.endsWith('uint') ||
+      normalized.endsWith('sint')
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  function normalizeBlendComponentInternal(rawComp, addReason, allowDualSource = false) {
     if (!rawComp || typeof rawComp !== 'object' || Array.isArray(rawComp)) {
       addReason('normalized-blend-component');
       return {
@@ -3075,6 +3264,30 @@
       addReason('normalized-blend-component');
     }
 
+    // WebGPU spec §10.2.4: 'min' and 'max' blend operations REQUIRE srcFactor === 'one' and dstFactor === 'one'.
+    if (operation === 'min' || operation === 'max') {
+      if (srcFactor !== 'one' || dstFactor !== 'one') {
+        srcFactor = 'one';
+        dstFactor = 'one';
+        changed = true;
+        addReason('normalized-blend-component');
+      }
+    }
+
+    // WebGPU spec: dual-source blend factors require 'dual-source-blending' feature and targets.length === 1.
+    if (!allowDualSource) {
+      if (Object.prototype.hasOwnProperty.call(DUAL_SOURCE_BLEND_FALLBACKS, srcFactor)) {
+        srcFactor = DUAL_SOURCE_BLEND_FALLBACKS[srcFactor];
+        changed = true;
+        addReason('normalized-dual-source-blend');
+      }
+      if (Object.prototype.hasOwnProperty.call(DUAL_SOURCE_BLEND_FALLBACKS, dstFactor)) {
+        dstFactor = DUAL_SOURCE_BLEND_FALLBACKS[dstFactor];
+        changed = true;
+        addReason('normalized-dual-source-blend');
+      }
+    }
+
     if (!changed) {
       return { component: rawComp, changed: false };
     }
@@ -3085,7 +3298,7 @@
     };
   }
 
-  function normalizeColorTargetsInternal(targets, defaultColorFormat) {
+  function normalizeColorTargetsInternal(targets, defaultColorFormat, deviceFeatures = null) {
     const reasons = [];
     const addReason = (r) => {
       if (!reasons.includes(r)) {
@@ -3102,6 +3315,8 @@
       };
     }
 
+    const allowDualSource =
+      targets.length === 1 && deviceFeaturesHas(deviceFeatures, 'dual-source-blending');
     let changed = false;
     const normalizedTargets = new Array(targets.length);
 
@@ -3150,9 +3365,22 @@
           stripBlend = true;
           targetChanged = true;
           addReason('invalid-blend-cleared');
+        } else if (!isBlendableColorFormat(nextFormat, deviceFeatures)) {
+          // WebGPU forbids blending on integer (*uint/*sint) and non-blendable float32 formats.
+          stripBlend = true;
+          targetChanged = true;
+          addReason('stripped-non-blendable-blend');
         } else {
-          const colorRes = normalizeBlendComponentInternal(rawTarget.blend.color, addReason);
-          const alphaRes = normalizeBlendComponentInternal(rawTarget.blend.alpha, addReason);
+          const colorRes = normalizeBlendComponentInternal(
+            rawTarget.blend.color,
+            addReason,
+            allowDualSource
+          );
+          const alphaRes = normalizeBlendComponentInternal(
+            rawTarget.blend.alpha,
+            addReason,
+            allowDualSource
+          );
           if (colorRes.changed || alphaRes.changed) {
             nextBlend = {
               color: colorRes.component,
@@ -3201,6 +3429,148 @@
       return { targets, changed: false, reasons };
     }
     return { targets: normalizedTargets, changed: true, reasons };
+  }
+
+  function normalizeStencilFaceInternal(face, addReason) {
+    if (!face || typeof face !== 'object' || Array.isArray(face)) {
+      return { face, changed: false };
+    }
+    let changed = false;
+    let compare = face.compare;
+    if (compare !== undefined && (typeof compare !== 'string' || !VALID_COMPARE_FUNCTIONS.has(compare))) {
+      compare = 'always';
+      changed = true;
+    }
+    let failOp = face.failOp;
+    if (failOp !== undefined && (typeof failOp !== 'string' || !VALID_STENCIL_OPS.has(failOp))) {
+      failOp = 'keep';
+      changed = true;
+    }
+    let depthFailOp = face.depthFailOp;
+    if (
+      depthFailOp !== undefined &&
+      (typeof depthFailOp !== 'string' || !VALID_STENCIL_OPS.has(depthFailOp))
+    ) {
+      depthFailOp = 'keep';
+      changed = true;
+    }
+    let passOp = face.passOp;
+    if (passOp !== undefined && (typeof passOp !== 'string' || !VALID_STENCIL_OPS.has(passOp))) {
+      passOp = 'keep';
+      changed = true;
+    }
+    if (!changed) {
+      return { face, changed: false };
+    }
+    addReason('normalized-depth-stencil');
+    const copy = { ...face };
+    if (compare !== undefined) copy.compare = compare;
+    if (failOp !== undefined) copy.failOp = failOp;
+    if (depthFailOp !== undefined) copy.depthFailOp = depthFailOp;
+    if (passOp !== undefined) copy.passOp = passOp;
+    return { face: copy, changed: true };
+  }
+
+  function normalizeDepthStencilInternal(ds, effectiveTopology, addReason) {
+    if (!ds || typeof ds !== 'object' || Array.isArray(ds)) {
+      return { depthStencil: ds, changed: false };
+    }
+    const format = typeof ds.format === 'string' ? ds.format.trim().toLowerCase() : ds.format;
+    const isStencilOnly = format === 'stencil8';
+    const hasDepthAspect = typeof format === 'string' && DEPTH_ASPECT_FORMATS.has(format);
+    const isTriangleTopology =
+      effectiveTopology === 'triangle-list' || effectiveTopology === 'triangle-strip';
+
+    let changed = false;
+    let copy = null;
+    const ensureCopy = () => {
+      if (copy === null) {
+        copy = { ...ds };
+      }
+      changed = true;
+      return copy;
+    };
+
+    if (typeof ds.format === 'string' && format !== ds.format) {
+      ensureCopy().format = format;
+      addReason('normalized-depth-stencil');
+    }
+
+    if (isStencilOnly) {
+      if (ds.depthWriteEnabled === true) {
+        ensureCopy().depthWriteEnabled = false;
+        addReason('normalized-depth-stencil');
+      }
+      if (ds.depthCompare !== undefined && ds.depthCompare !== 'always') {
+        delete ensureCopy().depthCompare;
+        addReason('normalized-depth-stencil');
+      }
+    } else if (hasDepthAspect) {
+      const effectiveDepthWrite =
+        ds.depthWriteEnabled !== undefined ? Boolean(ds.depthWriteEnabled) : undefined;
+      if (ds.depthWriteEnabled !== undefined && typeof ds.depthWriteEnabled !== 'boolean') {
+        ensureCopy().depthWriteEnabled = effectiveDepthWrite;
+        addReason('normalized-depth-stencil');
+      }
+      if (ds.depthCompare !== undefined) {
+        if (typeof ds.depthCompare !== 'string' || !VALID_COMPARE_FUNCTIONS.has(ds.depthCompare)) {
+          ensureCopy().depthCompare = 'always';
+          addReason('normalized-depth-stencil');
+        }
+        if (ds.depthWriteEnabled === undefined) {
+          ensureCopy().depthWriteEnabled = false;
+          addReason('normalized-depth-stencil');
+        }
+      } else if (effectiveDepthWrite === true) {
+        // WebGPU requires depthCompare when depthWriteEnabled is true on a depth-aspect format.
+        ensureCopy().depthCompare = 'always';
+        addReason('normalized-depth-stencil');
+      }
+    }
+
+    if (!isTriangleTopology) {
+      // WebGPU forbids non-zero depthBias / depthBiasSlopeScale / depthBiasClamp on non-triangle topologies.
+      if (ds.depthBias !== undefined && ds.depthBias !== 0) {
+        ensureCopy().depthBias = 0;
+        addReason('cleared-non-triangle-depth-bias');
+      }
+      if (ds.depthBiasSlopeScale !== undefined && ds.depthBiasSlopeScale !== 0) {
+        ensureCopy().depthBiasSlopeScale = 0;
+        addReason('cleared-non-triangle-depth-bias');
+      }
+      if (ds.depthBiasClamp !== undefined && ds.depthBiasClamp !== 0) {
+        ensureCopy().depthBiasClamp = 0;
+        addReason('cleared-non-triangle-depth-bias');
+      }
+    } else {
+      if (ds.depthBias !== undefined && (!Number.isFinite(ds.depthBias) || !Number.isInteger(ds.depthBias))) {
+        ensureCopy().depthBias = Number.isFinite(ds.depthBias) ? Math.trunc(ds.depthBias) : 0;
+        addReason('normalized-depth-stencil');
+      }
+      if (ds.depthBiasSlopeScale !== undefined && !Number.isFinite(ds.depthBiasSlopeScale)) {
+        ensureCopy().depthBiasSlopeScale = 0;
+        addReason('normalized-depth-stencil');
+      }
+      if (ds.depthBiasClamp !== undefined && !Number.isFinite(ds.depthBiasClamp)) {
+        ensureCopy().depthBiasClamp = 0;
+        addReason('normalized-depth-stencil');
+      }
+    }
+
+    if (ds.stencilFront !== undefined) {
+      const frontRes = normalizeStencilFaceInternal(ds.stencilFront, addReason);
+      if (frontRes.changed) {
+        ensureCopy().stencilFront = frontRes.face;
+      }
+    }
+    if (ds.stencilBack !== undefined) {
+      const backRes = normalizeStencilFaceInternal(ds.stencilBack, addReason);
+      if (backRes.changed) {
+        ensureCopy().stencilBack = backRes.face;
+      }
+    }
+
+    return changed ? { depthStencil: copy, changed: true } : { depthStencil: ds, changed: false };
   }
 
   /**
@@ -3314,6 +3684,18 @@
     };
   }
 
+  function cloneFrame1SplashRect24B(stepMode) {
+    return {
+      arrayStride: FRAME1_VERTEX_STRIDE_24B,
+      stepMode: stepMode === 'instance' ? 'instance' : 'vertex',
+      attributes: [
+        { shaderLocation: 0, offset: 0, format: 'float32x3' },
+        { shaderLocation: 1, offset: 12, format: 'unorm8x4' },
+        { shaderLocation: 2, offset: 16, format: 'float32x2' },
+      ],
+    };
+  }
+
   function isCanonical24BLayoutList(buffers) {
     if (!Array.isArray(buffers) || buffers.length !== 1) {
       return false;
@@ -3342,6 +3724,42 @@
       a1.shaderLocation === 1 &&
       a1.offset === 16 &&
       a1.format === 'float32x2'
+    );
+  }
+
+  function isCanonicalSplashRect24BLayoutList(buffers) {
+    if (!Array.isArray(buffers) || buffers.length !== 1) {
+      return false;
+    }
+    const buf = buffers[0];
+    if (!buf || typeof buf !== 'object') {
+      return false;
+    }
+    if (buf.arrayStride !== FRAME1_VERTEX_STRIDE_24B) {
+      return false;
+    }
+    if (buf.stepMode !== undefined && buf.stepMode !== 'vertex') {
+      return false;
+    }
+    if (!Array.isArray(buf.attributes) || buf.attributes.length !== 3) {
+      return false;
+    }
+    const a0 = buf.attributes[0];
+    const a1 = buf.attributes[1];
+    const a2 = buf.attributes[2];
+    return (
+      Boolean(a0) &&
+      Boolean(a1) &&
+      Boolean(a2) &&
+      a0.shaderLocation === 0 &&
+      a0.offset === 0 &&
+      a0.format === 'float32x3' &&
+      a1.shaderLocation === 1 &&
+      a1.offset === 12 &&
+      a1.format === 'unorm8x4' &&
+      a2.shaderLocation === 2 &&
+      a2.offset === 16 &&
+      a2.format === 'float32x2'
     );
   }
 
@@ -3406,6 +3824,9 @@
       }
       if (profile === 'textured_quad_24b') {
         return [cloneFrame1VertexLayout24B(stepMode)];
+      }
+      if (profile === 'splash_rect_24b') {
+        return [cloneFrame1SplashRect24B(stepMode)];
       }
     }
 
@@ -3485,6 +3906,17 @@
           reasons,
         };
       }
+      if (profile === 'splash_rect_24b') {
+        const alreadyCanonical = isCanonicalSplashRect24BLayoutList(buffers);
+        if (!alreadyCanonical) {
+          addReason('fallback-splash-rect-24b-vertex-layout');
+        }
+        return {
+          buffers: [cloneFrame1SplashRect24B('vertex')],
+          changed: !alreadyCanonical,
+          reasons,
+        };
+      }
     }
 
     if (typeof buffers === 'number') {
@@ -3540,6 +3972,11 @@
 
     for (let i = 0; i < slotCount; i += 1) {
       const buf = buffers[i];
+      if (buf === null) {
+        // WebGPU allows sparse `null` vertex buffer slots to preserve subsequent slot indices.
+        normalizedBuffers.push(null);
+        continue;
+      }
       if (!buf || typeof buf !== 'object' || Array.isArray(buf)) {
         changed = true;
         addReason('dropped-invalid-vertex-buffer');
@@ -3933,7 +4370,11 @@
       }
 
       let nextTargets = descriptor.fragment.targets;
-      const targetsResult = normalizeColorTargetsInternal(nextTargets, defaultColorFormat);
+      const targetsResult = normalizeColorTargetsInternal(
+        nextTargets,
+        defaultColorFormat,
+        opts.deviceFeatures || null
+      );
       if (targetsResult.changed) {
         nextTargets = targetsResult.targets;
         fragChanged = true;
@@ -3952,27 +4393,83 @@
       }
     }
 
-    // 4. Primitive topology & depthStencil null normalization
+    // 4. Primitive state & depthStencil normalization (WebGPU validation hardening)
     let nextPrimitive = descriptor.primitive;
-    if (
-      descriptor.primitive &&
-      typeof descriptor.primitive === 'object' &&
-      descriptor.primitive.topology !== undefined &&
-      !VALID_PRIMITIVE_TOPOLOGIES.has(descriptor.primitive.topology)
-    ) {
-      nextPrimitive = {
-        ...descriptor.primitive,
-        topology: 'triangle-list',
+    let effectiveTopology = 'triangle-list';
+    if (descriptor.primitive && typeof descriptor.primitive === 'object') {
+      const rawPrim = descriptor.primitive;
+      let primCopy = null;
+      const ensurePrimCopy = () => {
+        if (primCopy === null) {
+          primCopy = { ...rawPrim };
+        }
+        otherNormalized = true;
+        return primCopy;
       };
-      otherNormalized = true;
-      addReason('clamped-primitive-topology');
+
+      if (rawPrim.topology !== undefined) {
+        if (!VALID_PRIMITIVE_TOPOLOGIES.has(rawPrim.topology)) {
+          ensurePrimCopy().topology = 'triangle-list';
+          addReason('clamped-primitive-topology');
+          effectiveTopology = 'triangle-list';
+        } else {
+          effectiveTopology = rawPrim.topology;
+        }
+      }
+
+      const isStripTopology =
+        effectiveTopology === 'line-strip' || effectiveTopology === 'triangle-strip';
+      if (rawPrim.stripIndexFormat !== undefined) {
+        if (!isStripTopology) {
+          // WebGPU forbids stripIndexFormat when topology is not line-strip or triangle-strip.
+          delete ensurePrimCopy().stripIndexFormat;
+          addReason('stripped-strip-index-format');
+        } else if (!VALID_STRIP_INDEX_FORMATS.has(rawPrim.stripIndexFormat)) {
+          delete ensurePrimCopy().stripIndexFormat;
+          addReason('invalid-strip-index-format');
+        }
+      }
+
+      if (
+        rawPrim.unclippedDepth === true &&
+        opts.deviceFeatures &&
+        typeof opts.deviceFeatures.has === 'function' &&
+        !deviceFeaturesHas(opts.deviceFeatures, 'depth-clip-control')
+      ) {
+        delete ensurePrimCopy().unclippedDepth;
+        addReason('stripped-unclipped-depth');
+      }
+
+      if (rawPrim.cullMode !== undefined && !VALID_CULL_MODES.has(rawPrim.cullMode)) {
+        ensurePrimCopy().cullMode = 'none';
+        addReason('normalized-primitive-state');
+      }
+      if (rawPrim.frontFace !== undefined && !VALID_FRONT_FACES.has(rawPrim.frontFace)) {
+        ensurePrimCopy().frontFace = 'ccw';
+        addReason('normalized-primitive-state');
+      }
+
+      if (primCopy !== null) {
+        nextPrimitive = primCopy;
+      }
     }
 
     let stripDepthStencil = false;
+    let nextDepthStencil = descriptor.depthStencil;
     if (descriptor.depthStencil === null) {
       stripDepthStencil = true;
       otherNormalized = true;
       addReason('null-depth-stencil-cleared');
+    } else if (descriptor.depthStencil && typeof descriptor.depthStencil === 'object') {
+      const dsRes = normalizeDepthStencilInternal(
+        descriptor.depthStencil,
+        effectiveTopology,
+        addReason
+      );
+      if (dsRes.changed) {
+        nextDepthStencil = dsRes.depthStencil;
+        otherNormalized = true;
+      }
     }
 
     const normalized = layoutNormalized || vertexLayoutNormalized || otherNormalized;
@@ -3994,6 +4491,8 @@
     }
     if (stripDepthStencil) {
       delete nextDescriptor.depthStencil;
+    } else if (nextDepthStencil !== undefined) {
+      nextDescriptor.depthStencil = nextDepthStencil;
     }
     nextDescriptor.layout = nextLayout;
     if (nextVertex !== undefined) {
@@ -4787,6 +5286,7 @@
       const mergedOpts = {
         ...this._deviceVertexLimits(),
         defaultColorFormat: this._defaultColorFormat,
+        ...(this._device && this._device.features ? { deviceFeatures: this._device.features } : {}),
         ...opts,
       };
       if (fallbackLayout !== undefined) {
@@ -4909,6 +5409,7 @@
       }
       if (victimEntry !== undefined) {
         victimEntry.alive = false;
+        victimEntry.value = null;
       }
       map.delete(victimKey);
       this._stats.evictions += 1;
@@ -4979,6 +5480,7 @@
       }
       if (bestEntry !== null) {
         bestEntry.alive = false;
+        bestEntry.value = null;
       }
       bestMap.delete(bestKey);
       this._stats.evictions += 1;
@@ -5035,6 +5537,7 @@
       const prev = map.get(key);
       if (prev !== undefined) {
         prev.alive = false;
+        prev.value = null;
         map.delete(key);
       }
       const entry = {
@@ -7312,6 +7815,24 @@
       );
     }
 
+    _sweepDeadFastLookups() {
+      const fastMaps = [
+        this._fastRenderLookup,
+        this._fastComputeLookup,
+        this._fastRenderIntHash,
+        this._fastComputeIntHash,
+      ];
+      for (let i = 0; i < fastMaps.length; i += 1) {
+        const m = fastMaps[i];
+        if (!m || m.size === 0) continue;
+        for (const [k, rec] of m.entries()) {
+          if (!rec || !rec.entry || !rec.entry.alive || rec.generation !== this._generation) {
+            m.delete(k);
+          }
+        }
+      }
+    }
+
     /**
      * Evict cached render pipelines, compute pipelines, and bind group layouts
      * whose last access timestamp is strictly older than `now() - ageMs`.
@@ -7330,6 +7851,7 @@
         for (const [key, entry] of map.entries()) {
           if (entry.lastAccessedAt < cutoff) {
             entry.alive = false;
+            entry.value = null;
             map.delete(key);
             removed += 1;
           }
@@ -7340,6 +7862,9 @@
       prune(this._computePipelines);
       prune(this._bindGroupLayouts);
 
+      if (removed > 0) {
+        this._sweepDeadFastLookups();
+      }
       this._stats.evictions += removed;
       this._stats.reclaimedCount += removed;
       return removed;
@@ -7366,10 +7891,12 @@
           const map = maps[i];
           for (const entry of map.values()) {
             entry.alive = false;
+            entry.value = null;
             removed += 1;
           }
           map.clear();
         }
+        this._invalidateFastLookups();
         this._hasNonDefaultPriority = false;
         this._stats.evictions += removed;
         this._stats.reclaimedCount += removed;
@@ -7382,6 +7909,9 @@
           break;
         }
         removed += 1;
+      }
+      if (removed > 0) {
+        this._sweepDeadFastLookups();
       }
       return removed;
     }
@@ -7406,10 +7936,14 @@
           for (const [k, entry] of map.entries()) {
             if (entry.priorityRank === PIPELINE_PRIORITY_RANKS.low) {
               entry.alive = false;
+              entry.value = null;
               map.delete(k);
               removed += 1;
             }
           }
+        }
+        if (removed > 0) {
+          this._sweepDeadFastLookups();
         }
         this._stats.evictions += removed;
         this._stats.reclaimedCount += removed;
@@ -7426,6 +7960,9 @@
           break;
         }
         removed += 1;
+      }
+      if (removed > 0) {
+        this._sweepDeadFastLookups();
       }
       return removed;
     }

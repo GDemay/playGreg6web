@@ -4273,3 +4273,198 @@ test('W348 black frames on COPY_SRC device with WgpuSwapchain never leak firstVi
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// PR #1868 high @binding(64+) compaction + #1077 GPU/worker memory hardening
+// ---------------------------------------------------------------------------
+
+test('#1077 compacts large compiled WGSL to metadata stub preserving PR #1868 @binding(64+) and entry points', () => {
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx, { lazyShaderCompile: false });
+
+  const padding = '  let _pad = r0 + r1;\n'.repeat(180);
+  const largePsWgsl = [
+    'struct Cb0 { data: array<vec4<f32>, 16>, };',
+    '@group(0) @binding(64) var<uniform> cb0: Cb0;',
+    '@group(0) @binding(65) var tex0: texture_2d<f32>;',
+    '@group(0) @binding(66) var samp0: sampler;',
+    '@group(0) @binding(67) var unused_tex: texture_2d<f32>;',
+    '@fragment',
+    'fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {',
+    '  let r0 = cb0.data[0].x;',
+    '  let r1 = textureSample(tex0, samp0, uv).x;',
+    padding,
+    '  return vec4<f32>(r0, r1, 0.0, 1.0);',
+    '}',
+  ].join('\n');
+  assert.ok(largePsWgsl.length > 3500);
+
+  const stream = new BinaryCommandBuilder()
+    .createShaderModule(42, SHADER_STAGE.FRAGMENT, largePsWgsl)
+    .finish();
+  processor.executeCommandBuffer(stream);
+
+  const entry = processor.shaderModules.get(42);
+  assert.ok(entry && entry.module);
+  assert.ok(entry.code.length < 400, `expected compacted stub < 400 chars, got ${entry.code.length}`);
+  assert.ok(entry.code.includes('@binding(64)'));
+  assert.ok(entry.code.includes('@binding(65)'));
+  assert.ok(entry.code.includes('@binding(66)'));
+  assert.equal(entry.code.includes('unused_tex'), false, 'unreferenced binding dropped from stub');
+  assert.ok(entry.code.includes('@fragment fn fs_main'));
+
+  // Verify render_state_packets.js parses the exact same bindings from the compacted stub.
+  const rsp = require('../web/workers/render_state_packets.js');
+  const parsed = rsp.parseWgslGroup0Bindings(entry.code);
+  assert.deepEqual(
+    parsed.map((b) => [b.binding, b.kind]),
+    [
+      [64, 'uniform'],
+      [65, 'texture'],
+      [66, 'sampler'],
+    ]
+  );
+
+  processor.destroy();
+});
+
+test('#1077 readback staging GPUBuffer is destroyed on mapAsync rejection and on processor destroy/reset', async () => {
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+
+  let rejectedDestroyed = false;
+  let pendingDestroyed = false;
+
+  processor._recordedReadbacks = [
+    {
+      req: { kind: 'buffer', size: 16, slotIndex: 0 },
+      layout: { skip: 0, stagingSize: 16 },
+      staging: {
+        mapAsync: () => Promise.reject(new Error('device lost during mapAsync')),
+        destroy: () => {
+          rejectedDestroyed = true;
+        },
+      },
+    },
+  ];
+  processor._startRecordedReadbacks(true);
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(rejectedDestroyed, true, 'staging buffer must be destroyed when mapAsync rejects');
+
+  processor._recordedReadbacks = [
+    {
+      req: { kind: 'buffer', size: 16, slotIndex: 1 },
+      layout: { skip: 0, stagingSize: 16 },
+      staging: {
+        destroy: () => {
+          pendingDestroyed = true;
+        },
+      },
+    },
+  ];
+  processor.destroy();
+  assert.equal(pendingDestroyed, true, 'unsubmitted readback staging buffer must be destroyed on destroy()');
+  assert.equal(processor._recordedReadbacks.length, 0);
+});
+
+test('#1077 _handleWriteTexture recovers from stagingPool RangeError and trimTransientMemory trims pipelines & shadow buffers', () => {
+  const { device, ctx } = createMockWebGpu();
+  const origCreateEncoder = device.createCommandEncoder.bind(device);
+  device.createCommandEncoder = (...args) => {
+    const enc = origCreateEncoder(...args);
+    if (typeof enc.copyBufferToTexture !== 'function') {
+      enc.copyBufferToTexture = () => {};
+    }
+    return enc;
+  };
+  let directWriteTextureCalls = 0;
+  const origWriteTexture = device.queue.writeTexture.bind(device.queue);
+  device.queue.writeTexture = (...args) => {
+    directWriteTextureCalls += 1;
+    return origWriteTexture(...args);
+  };
+  let flushCalled = 0;
+  const mockStagingPool = {
+    _destroyed: false,
+    stageTextureUpload() {
+      throw new RangeError('staging pool exhausted');
+    },
+    trimForSceneTransition() {
+      return { reclaimedSlabs: 0, reclaimedBytes: 0 };
+    },
+    destroy() {},
+  };
+  let lowPriEvicted = 0;
+  const mockPipelineCache = {
+    evictLowPriority() {
+      lowPriEvicted += 1;
+      return 1;
+    },
+    clear() {},
+  };
+
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    stagingPool: mockStagingPool,
+    pipelineCache: mockPipelineCache,
+  });
+  const origFlush = processor._flushPendingUploads.bind(processor);
+  processor._flushPendingUploads = (force) => {
+    flushCalled += 1;
+    return origFlush(force);
+  };
+
+  // Create a 4x4 rgba8unorm texture and write 64 bytes — stagingPool throws RangeError -> falls back cleanly.
+  const texPixels = new Uint8Array(64).fill(0x7f);
+  const stream = new BinaryCommandBuilder()
+    .createTexture(7, 4, 4, 1, 1, TEXTURE_FORMAT.RGBA8_UNORM, TEXTURE_USAGE.COPY_DST | TEXTURE_USAGE.TEXTURE_BINDING)
+    .writeTexture(7, 0, 0, 0, 0, 4, 4, 1, 16, 4, texPixels)
+    .finish();
+  assert.doesNotThrow(() => processor.executeCommandBuffer(stream));
+  assert.equal(flushCalled, 1, 'should flush pending uploads on stagingPool RangeError');
+  assert.equal(directWriteTextureCalls, 1, 'should fall back to direct queue.writeTexture');
+
+  // Seed 20 MiB of shadow buffers + oversized cached command buffer and invoke trimTransientMemory().
+  processor._shadowBuffers.set(1, new Uint8Array(10 * 1024 * 1024));
+  processor._shadowBuffers.set(2, new Uint8Array(10 * 1024 * 1024));
+  processor._shadowBufferBytes = 20 * 1024 * 1024;
+  processor._cachedCmdBuffer = new ArrayBuffer(5 * 1024 * 1024);
+  processor._cachedCmdView = new DataView(processor._cachedCmdBuffer);
+
+  processor.trimTransientMemory();
+  assert.equal(lowPriEvicted, 1, 'trimTransientMemory should call pipelineCache.evictLowPriority()');
+  assert.ok(processor._shadowBufferBytes <= 16 * 1024 * 1024, 'shadow buffers trimmed to <= 16 MiB');
+  assert.equal(processor._cachedCmdBuffer, null, 'oversized >4 MiB _cachedCmdBuffer cleared');
+
+  processor.destroy();
+});
+
+test('#1077 InlineWgslPackCache lazily decodes entries on demand with bounded decoded LRU cache', () => {
+  const wgslA = '@vertex fn vs_a() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }';
+  const wgslB = '@fragment fn fs_b() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }';
+  const hashA = fnv1a64('lazy-pack-a');
+  const hashB = fnv1a64('lazy-pack-b');
+  const packBuf = buildWgslPackBuffer([
+    { hash: hashA, stage: WGPK_SHADER_STAGE.VERTEX, wgsl: wgslA },
+    { hash: hashB, stage: WGPK_SHADER_STAGE.FRAGMENT, wgsl: wgslB },
+  ]);
+
+  const { device, ctx } = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx);
+  const packCache = processor.wgslPackCache;
+  packCache.loadPackBuffer(packBuf, 'lazy-test');
+
+  // After loadPackBuffer, decoded string cache is empty (0 strings pinned eagerly).
+  assert.equal(packCache._decodedCache.size, 0);
+  assert.equal(packCache._decodedBytes, 0);
+
+  // Accessing via getWgsl or entry.wgsl decodes on demand and returns exact WGSL.
+  assert.equal(packCache.getWgsl(hashA), wgslA);
+  assert.equal(packCache._decodedCache.size, 1);
+  assert.equal(packCache.getByHash(hashB).wgsl, wgslB);
+  assert.equal(packCache._decodedCache.size, 2);
+
+  packCache.clear();
+  assert.equal(packCache._decodedCache.size, 0);
+  assert.equal(packCache._decodedBytes, 0);
+  processor.destroy();
+});
