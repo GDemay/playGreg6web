@@ -876,8 +876,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     // Native shared page views (no translated window): the same skip, from the per-page write
-    // stamps of os::take_written_view_pages (non-destructive for other readers; false where the
-    // range is not wholly view-backed, which keeps the full read). A texture whose last full check
+    // stamps of os::take_written_pages (the OS write bits are fanned out to every cursor; false where the
+    // range cannot be tracked, which keeps the full read). A texture whose last full check
     // (zero scan / hash) is still current and whose pages were not written since is unchanged.
     bool view_tracked = false;
     if (!in_window && primary_size > 0) {
@@ -896,7 +896,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 }
             }
             std::vector<uint64_t> pages;
-            const bool tracked = os::take_written_view_pages(host, primary_size, &cursor, &pages);
+            const bool tracked = os::take_written_pages(host, primary_size, &cursor, &pages);
             bool skip = false;
             {
                 std::lock_guard<std::mutex> lock(tracked_textures_mutex_);

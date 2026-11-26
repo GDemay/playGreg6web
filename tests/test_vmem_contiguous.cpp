@@ -538,6 +538,86 @@ void test_written_pages() {
     CHECK(arena.release(a));
 }
 
+// O36: the OS write bits are consumed once and fanned out: every WriteCursor is told each page
+// written since its own last take, whichever reader consumed the bits, and no write is lost.
+void test_written_pages_fanout() {
+    set_write_tracking(true);
+    VirtualMemoryArena arena;
+    set_write_tracking(false);
+    const uint64_t a = arena.reserve(0, 64 * 1024);
+    CHECK(a != 0);
+    CHECK(arena.commit(a, 64 * 1024, PageProtect::ReadWrite));
+    uint8_t* p = arena.host_ptr(a, 64 * 1024);
+    CHECK(p != nullptr);
+    if (p == nullptr) {
+        return;
+    }
+    WriteCursor x;
+    WriteCursor y;
+    std::vector<uint64_t> pages;
+    // Prime both (first takes may report everything or answer "unknown").
+    take_written_pages(p, 64 * 1024, &x, &pages);
+    take_written_pages(p, 64 * 1024, &y, &pages);
+    pages.clear();
+    const bool tracked = take_written_pages(p, 64 * 1024, &x, &pages);
+    if (!tracked) {
+        return;  // not a write-watched host
+    }
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages) && pages.empty());
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages) && pages.empty());
+    // A write consumed by x is still reported to y, and each only once.
+    p[3 * kWrittenPageSize] = 1;
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+    CHECK(pages == (std::vector<uint64_t>{3 * kWrittenPageSize}));
+    pages.clear();
+    p[7 * kWrittenPageSize + 5] = 1;
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+    CHECK(pages == (std::vector<uint64_t>{3 * kWrittenPageSize, 7 * kWrittenPageSize}));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages) && pages.empty());
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+    CHECK(pages == (std::vector<uint64_t>{7 * kWrittenPageSize}));
+    pages.clear();
+    // A narrow take consumes the OS bits of its pages only for the stamps: a reader of a wider
+    // range afterwards still sees them; a reader of a disjoint range does not.
+    p[1 * kWrittenPageSize] = 2;
+    p[10 * kWrittenPageSize] = 2;
+    WriteCursor narrow;
+    take_written_pages(p, 64 * 1024, &narrow, &pages);
+    pages.clear();
+    take_written_pages(p, 64 * 1024, &narrow, &pages);
+    pages.clear();
+    p[2 * kWrittenPageSize] = 3;
+    CHECK(take_written_pages(p, 4 * kWrittenPageSize, &narrow, &pages));
+    CHECK(pages == (std::vector<uint64_t>{2 * kWrittenPageSize}));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+    CHECK(pages == (std::vector<uint64_t>{1 * kWrittenPageSize, 2 * kWrittenPageSize, 10 * kWrittenPageSize}));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+    CHECK(pages == (std::vector<uint64_t>{1 * kWrittenPageSize, 2 * kWrittenPageSize, 10 * kWrittenPageSize}));
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages) && pages.empty());
+    // Many writers across 2 MiB-chunk-sized spans and a legacy (commit_seq) reader in between:
+    // nothing is lost for the cursor readers.
+    uint64_t seq = 0;
+    take_written_pages(p, 64 * 1024, &seq, &pages);
+    pages.clear();
+    for (uint64_t pg = 0; pg < 16; pg += 2) {
+        p[pg * kWrittenPageSize] = 9;
+    }
+    take_written_pages(p, 64 * 1024, &seq, &pages);  // consumes the OS bits
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+    CHECK(pages.size() == 8);
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+    CHECK(pages.size() == 8);
+    CHECK(arena.release(a));
+}
+
 }  // namespace
 
 int main() {
@@ -553,6 +633,7 @@ int main() {
     test_concurrent_reservations();
     test_process_arena();
     test_written_pages();
+    test_written_pages_fanout();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;
