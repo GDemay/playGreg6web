@@ -174,11 +174,14 @@ std::string default_keymap_text() {
     }
     s +=
         "\n[mouse]\n"
-        "# Real mouse movement drives the right stick. The cursor is not re-centred, so it stops at the screen edge.\n"
+        "# Real mouse movement drives the right stick. In the live window the cursor is captured (Raw Input,\n"
+        "# hidden and confined to the window) while it has focus; release_key toggles the capture, a click\n"
+        "# in the window re-captures. Focus loss and minimising release it too.\n"
         "look = off\n"
         "# Stick deflection per pixel moved per 8 ms poll (0.001 .. 10).\n"
         "sensitivity = 0.05\n"
-        "invert_y = off\n";
+        "invert_y = off\n"
+        "release_key = F8\n";
     return s;
 }
 
@@ -262,8 +265,15 @@ bool parse_keymap(const std::string& text, Keymap& out, std::vector<std::string>
                     continue;
                 }
                 out.mouse_sensitivity = f;
+            } else if (k == "release_key") {
+                int vk = 0;
+                if (!key_from_name(value, vk)) {
+                    err("unknown key '" + value + "' for release_key");
+                    continue;
+                }
+                out.mouse_release_vk = vk;
             } else {
-                err("unknown mouse setting '" + key + "' (expected look, sensitivity, invert_y)");
+                err("unknown mouse setting '" + key + "' (expected look, sensitivity, invert_y, release_key)");
             }
         }
     }
