@@ -2083,6 +2083,8 @@ public:
             }
             handle_ = 0;
             return S_OK_HR;
+        case XAsyncOp::Cancel:
+            return E_NOTIMPL_HR;
         case XAsyncOp::Cleanup:
             release_unclaimed();
             return S_OK_HR;
@@ -2111,13 +2113,20 @@ public:
     using Work = std::function<HResult(size_t* required)>;
     using Result = std::function<HResult(uint64_t buffer)>;
     using Cleanup = std::function<void()>;
-    SaveWorkOp(Work work, Result result, Cleanup cleanup = nullptr)
-        : work_(std::move(work)), result_(std::move(result)), cleanup_(std::move(cleanup)) {}
+    using OnBegin = std::function<void()>;
+    SaveWorkOp(Work work, Result result, Cleanup cleanup = nullptr, OnBegin on_begin = nullptr)
+        : work_(std::move(work)),
+          result_(std::move(result)),
+          cleanup_(std::move(cleanup)),
+          on_begin_(std::move(on_begin)) {}
     ~SaveWorkOp() override { run_cleanup(); }
 
     HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
         switch (op) {
         case XAsyncOp::Begin:
+            if (on_begin_) {
+                on_begin_();
+            }
             return XAsyncSchedule(block, 0);
         case XAsyncOp::DoWork: {
             size_t required = 0;
@@ -2127,6 +2136,8 @@ public:
         }
         case XAsyncOp::GetResult:
             return result_ ? result_(buffer) : S_OK_HR;
+        case XAsyncOp::Cancel:
+            return E_NOTIMPL_HR;
         case XAsyncOp::Cleanup:
             run_cleanup();
             return S_OK_HR;
@@ -2147,6 +2158,7 @@ private:
     Work work_;
     Result result_;
     Cleanup cleanup_;
+    OnBegin on_begin_;
 };
 
 // ReadBlobDataAsync results by guest XAsyncBlock until ReadBlobDataResult hands them over (the
@@ -2474,11 +2486,13 @@ public:
         if (!container || async == 0 || !guest_names(names, count, &wanted)) {
             return E_INVALIDARG_HR;
         }
-        auto pending = std::make_shared<PendingRead>();
-        {
-            std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
-            g_pending_reads[async] = pending;
+        if (Pg6XAsyncBlock* existing = cbk::async_shadow_find(async);
+            existing != nullptr && XAsyncGetStatus(existing, false) == E_PENDING_HR) {
+            return E_INVALIDARG_HR;
         }
+        auto pending = std::make_shared<PendingRead>();
+        // Register in g_pending_reads inside XAsyncOp::Begin (after XAsyncBeginWith confirms
+        // `async` is not already in-flight) so a duplicate call never clobbers a live read.
         const int32_t hr = begin_work(
             async, &kSaveReadIdentity, "XGameSaveReadBlobDataAsync",
             [container, wanted, pending](size_t* required) {
@@ -2491,10 +2505,11 @@ public:
                 std::lock_guard<std::mutex> lock(pending->mutex);
                 return write_blobs(buffer, pending->read) ? S_OK_HR : E_INVALIDARG_HR;
             },
-            [async, pending]() { erase_pending_read_if_match(async, pending); });
-        if (hr < 0) {
-            erase_pending_read_if_match(async, pending);
-        }
+            [async, pending]() { erase_pending_read_if_match(async, pending); },
+            [async, pending]() {
+                std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
+                g_pending_reads[async] = pending;
+            });
         return hr;
     }
 
@@ -2635,14 +2650,16 @@ public:
 
 private:
     int32_t begin_work(uint64_t async, const void* identity, const char* name, SaveWorkOp::Work work,
-                       SaveWorkOp::Result result, SaveWorkOp::Cleanup cleanup = nullptr) {
+                       SaveWorkOp::Result result, SaveWorkOp::Cleanup cleanup = nullptr,
+                       SaveWorkOp::OnBegin on_begin = nullptr) {
         Pg6XAsyncBlock* shadow = begin_async(async);
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        const int32_t hr =
-            XAsyncBeginWith(shadow, std::make_unique<SaveWorkOp>(std::move(work), std::move(result), std::move(cleanup)),
-                            async_identity_tag(identity), name);
+        const int32_t hr = XAsyncBeginWith(
+            shadow,
+            std::make_unique<SaveWorkOp>(std::move(work), std::move(result), std::move(cleanup), std::move(on_begin)),
+            async_identity_tag(identity), name);
         if (hr < 0) {
             end_async(async);
         }

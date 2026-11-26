@@ -86,9 +86,10 @@ GameFileStatCache& game_file_stat_cache() {
 // series of range reads, far more than the open.
 uint32_t probe_game_file(const std::string& key, uint64_t* size) {
     const uint64_t gen = httpfs_client_generation();
-    if (get_httpfs_client() == nullptr) {
+    const bool stable_client = (gen & 1u) == 0u && get_httpfs_client() != nullptr;
+    if (!stable_client) {
         auto& cache = game_file_stat_cache();
-        {
+        if ((gen & 1u) == 0u) {
             std::shared_lock<std::shared_mutex> rlock(cache.mutex);
             if (cache.generation != gen && !cache.entries.empty()) {
                 rlock.unlock();

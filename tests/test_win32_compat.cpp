@@ -1729,11 +1729,138 @@ static void test_concurrent_handles_and_spin_cs() {
     CHECK(after.opaque == baseline.opaque);
 }
 
+static void test_concurrent_overlapped_httpfs_reads_and_paths() {
+    using playgta6::os::HttpfsDirectBackend;
+    using playgta6::os::HttpfsMailboxClient;
+
+    // 1. normalize_path deep (>16 segments) stack->heap fallback and dot/dotdot collapsing.
+    {
+        bool is_ud = true;
+        const std::string deep = normalize_path(
+            "\\\\?\\G:\\a\\b\\c\\d\\e\\f\\g\\h\\i\\j\\k\\l\\m\\n\\o\\p\\q\\..\\r\\.\\s.rpf",
+            &is_ud);
+        CHECK(!is_ud);
+        CHECK(deep == "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/r/s.rpf");
+
+        const std::string ud = normalize_path("C:\\USERDATA\\saves\\..\\slot0\\hdr.bin", &is_ud);
+        CHECK(is_ud);
+        CHECK(ud == "/userdata/slot0/hdr.bin");
+    }
+
+    // 2. remove_opaque_object atomically checks tag before erasing.
+    {
+        auto payload = std::make_shared<int>(42);
+        const Handle h = insert_opaque_object(0x1111u, payload);
+        CHECK(h != kNullHandle);
+        CHECK(remove_opaque_object(h, 0x2222u) == nullptr);  // wrong tag leaves entry intact
+        CHECK(lookup_opaque_object(h, 0x1111u) == payload);
+        CHECK(remove_opaque_object(h, 0x1111u) == payload);  // matching tag removes entry
+        CHECK(lookup_opaque_object(h, 0x1111u) == nullptr);
+    }
+
+    // 3. Concurrent OVERLAPPED ReadFile calls on the SAME HTTPFS file handle overlap in parallel.
+    constexpr size_t kFileSize = 64 * 1024;
+    std::vector<uint8_t> data(kFileSize);
+    for (size_t i = 0; i < kFileSize; ++i) {
+        data[i] = static_cast<uint8_t>((i * 37u + 13u) & 0xFFu);
+    }
+
+    std::mutex barrier_mu;
+    std::condition_variable barrier_cv;
+    int in_flight = 0;
+    int max_in_flight = 0;
+    int arrived = 0;
+
+    HttpfsDirectBackend backend;
+    backend.concurrent = true;
+    backend.max_chunk_bytes = 64 * 1024;
+    backend.open = [&](std::string_view rel) -> int32_t {
+        return rel == "data/shared_archive.rpf" ? 9 : -2;
+    };
+    backend.read = [&](int32_t handle, uint64_t offset, void* dst, size_t len) -> int64_t {
+        if (handle != 9) {
+            return -1;
+        }
+        {
+            std::unique_lock<std::mutex> lock(barrier_mu);
+            ++in_flight;
+            ++arrived;
+            if (in_flight > max_in_flight) {
+                max_in_flight = in_flight;
+            }
+            barrier_cv.notify_all();
+            barrier_cv.wait_for(lock, std::chrono::milliseconds(500), [&] { return arrived >= 2; });
+        }
+        const size_t n = offset >= data.size() ? 0 : std::min<size_t>(len, data.size() - offset);
+        if (n > 0) {
+            std::memcpy(dst, data.data() + offset, n);
+        }
+        {
+            std::lock_guard<std::mutex> lock(barrier_mu);
+            --in_flight;
+        }
+        return static_cast<int64_t>(n);
+    };
+    backend.close = [&](int32_t handle) -> bool { return handle == 9; };
+
+    HttpfsMailboxClient client(std::move(backend));
+    set_httpfs_client(&client);
+
+    const Handle h = CreateFileW(u"G:\\data\\shared_archive.rpf", GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+
+    constexpr int kThreads = 4;
+    constexpr uint32_t kChunk = 4096;
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&, t] {
+            struct Overlapped {
+                uint64_t internal = 0;
+                uint64_t internal_high = 0;
+                uint32_t offset = 0;
+                uint32_t offset_high = 0;
+                uint64_t event = 0;
+            };
+            const uint32_t off = static_cast<uint32_t>(t) * kChunk;
+            const Handle ev = CreateEventW(nullptr, true, false, nullptr);
+            Overlapped ov{};
+            ov.offset = off;
+            ov.event = ev;
+            std::vector<uint8_t> out(kChunk, 0);
+            uint32_t got = 0;
+            if (!ReadFile(h, out.data(), kChunk, &got, &ov) || got != kChunk ||
+                ov.internal_high != kChunk || WaitForSingleObject(ev, 0) != WAIT_OBJECT_0 ||
+                std::memcmp(out.data(), data.data() + off, kChunk) != 0) {
+                failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            CloseHandle(ev);
+        });
+    }
+    for (auto& th : workers) {
+        th.join();
+    }
+    CHECK(failures.load() == 0);
+    CHECK(max_in_flight >= 2);
+
+    // Cached GetFileSizeEx fast path works cleanly on the shared handle.
+    int64_t sz = 0;
+    CHECK(GetFileSizeEx(h, &sz) && sz == static_cast<int64_t>(kFileSize));
+    int64_t sz2 = 0;
+    CHECK(GetFileSizeEx(h, &sz2) && sz2 == static_cast<int64_t>(kFileSize));
+
+    CHECK(CloseHandle(h));
+    set_httpfs_client(nullptr);
+}
+
 int main() {
     test_stall_compensation();
     test_httpfs_size_cache();
     test_httpfs_stat_cache_and_invalidation();
     test_concurrent_handles_and_spin_cs();
+    test_concurrent_overlapped_httpfs_reads_and_paths();
     test_httpfs_sparse_64bit_and_retry();
     test_directories_and_attributes();
     test_find_files();

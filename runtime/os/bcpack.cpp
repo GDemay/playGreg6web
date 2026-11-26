@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -818,9 +820,13 @@ void pair_indices(const uint8_t* rank, const uint8_t* symbols, size_t count, uin
 // codes name the endpoints 0 and 1 and the interpolated values 2.. in order from the first.
 inline uint64_t line_to_code(uint32_t p, uint32_t top) { return p == 0 ? 0 : p == top ? 1 : p + 1; }
 
-void write_le(uint8_t* out, uint64_t v, size_t bytes) {
-    for (size_t k = 0; k < bytes; ++k) {
-        out[k] = static_cast<uint8_t>(v >> (8 * k));
+inline void write_le(uint8_t* out, uint64_t v, size_t bytes) {
+    if constexpr (std::endian::native == std::endian::little) {
+        std::memcpy(out, &v, bytes);
+    } else {
+        for (size_t k = 0; k < bytes; ++k) {
+            out[k] = static_cast<uint8_t>(v >> (8 * k));
+        }
     }
 }
 
@@ -847,12 +853,15 @@ void pack_alpha(uint8_t e0, uint8_t e1, const uint8_t* ix, uint8_t* out) {
 struct PlainFormat {
     uint8_t endpoint_bits[8];
     uint8_t index_bits[32];
+    uint8_t endpoint_count;
+    uint8_t index_count;
     bool four_reference_symbols;
 };
 
 PlainFormat plain_format(uint32_t bc) {
     PlainFormat f{};
     auto indices = [&f](uint32_t three_bit, uint32_t two_bit) {
+        f.index_count = static_cast<uint8_t>(three_bit + two_bit);
         for (uint32_t k = 0; k < three_bit + two_bit; ++k) {
             f.index_bits[k] = k < three_bit ? 3 : 2;
         }
@@ -861,20 +870,24 @@ PlainFormat plain_format(uint32_t bc) {
     switch (bc) {
         case 1:
             std::memcpy(f.endpoint_bits, rgb565x2, 6);
+            f.endpoint_count = 6;
             indices(0, 16);
             break;
         case 3:
             std::memcpy(f.endpoint_bits, rgb565x2, 6);
             f.endpoint_bits[6] = f.endpoint_bits[7] = 8;
+            f.endpoint_count = 8;
             indices(16, 16);
             f.four_reference_symbols = true;
             break;
         case 4:
             f.endpoint_bits[0] = f.endpoint_bits[1] = 8;
+            f.endpoint_count = 2;
             indices(16, 0);
             break;
         default:  // 5
             std::fill(f.endpoint_bits, f.endpoint_bits + 4, uint8_t{8});
+            f.endpoint_count = 4;
             indices(32, 0);
             f.four_reference_symbols = true;
             break;
@@ -960,10 +973,10 @@ DecodeStatus decode_plain_stream(const Tables& t, uint32_t bc, size_t blocks, Cu
             const PlainBlock& ep_ref = referenced(i, refs.endpoints, history, dictionary, zero);
             const PlainBlock& ix_ref = referenced(i, refs.indices, history, dictionary, zero);
             PlainBlock v = plain_residual(t, bc, s);
-            for (uint32_t e = 0; e < 8; ++e) {
+            for (uint32_t e = 0; e < f.endpoint_count; ++e) {
                 v.ep[e] = static_cast<uint8_t>((v.ep[e] + ep_ref.ep[e]) & ((1u << f.endpoint_bits[e]) - 1u));
             }
-            for (uint32_t p = 0; p < 32; ++p) {
+            for (uint32_t p = 0; p < f.index_count; ++p) {
                 v.ix[p] = static_cast<uint8_t>((v.ix[p] + ix_ref.ix[p]) & ((1u << f.index_bits[p]) - 1u));
             }
             history[i & (kHistoryBlocks - 1)] = v;
@@ -1102,22 +1115,16 @@ void pack_bc7(const Bc7Block& b, const std::array<uint32_t, 4>& prec, uint8_t* o
             w.put(field(e / 2, e % 2, prec[0]) & 1u, 1);
         }
     }
-    auto is_anchor = [&c](uint32_t pixel) {
-        if (pixel == 0) {
-            return true;
-        }
-        if (c.subsets == 2) {
-            return pixel == kBc7Anchor2[c.partition];
-        }
-        if (c.subsets == 3) {
-            return pixel == kBc7Anchor3[c.partition][0] || pixel == kBc7Anchor3[c.partition][1];
-        }
-        return false;
-    };
+    uint32_t anchor_mask = 1u;  // pixel 0 is always subset 0's anchor
+    if (c.subsets == 2) {
+        anchor_mask |= 1u << kBc7Anchor2[c.partition];
+    } else if (c.subsets == 3) {
+        anchor_mask |= (1u << kBc7Anchor3[c.partition][0]) | (1u << kBc7Anchor3[c.partition][1]);
+    }
     auto put_indices = [&](uint32_t set) {
         const uint32_t bits = b.index_bits[set];
         for (uint32_t p = 0; p < 16; ++p) {
-            w.put(static_cast<uint16_t>(b.index[set][p]), bits - (is_anchor(p) ? 1 : 0));
+            w.put(static_cast<uint16_t>(b.index[set][p]), bits - ((anchor_mask >> p) & 1u));
         }
     };
     if (c.mode == 4) {  // the 2-bit set comes first
@@ -1442,7 +1449,7 @@ DecodeStatus decode_bc6_stream(const Tables& t, size_t blocks, CursorFetch& fetc
     return DecodeStatus::Ok;
 }
 
-std::mutex g_tables_mutex;
+std::shared_mutex g_tables_mutex;
 std::shared_ptr<const Tables> g_tables;
 
 }  // namespace
@@ -1525,12 +1532,12 @@ bool load_tables_file(const std::string& path, std::string* error) {
 }
 
 void set_active_tables(std::shared_ptr<const Tables> tables) {
-    std::lock_guard<std::mutex> lock(g_tables_mutex);
+    std::unique_lock<std::shared_mutex> lock(g_tables_mutex);
     g_tables = std::move(tables);
 }
 
 std::shared_ptr<const Tables> active_tables() {
-    std::lock_guard<std::mutex> lock(g_tables_mutex);
+    std::shared_lock<std::shared_mutex> lock(g_tables_mutex);
     return g_tables;
 }
 

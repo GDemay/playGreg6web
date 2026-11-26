@@ -65,7 +65,8 @@ int64_t guest_clock_ns() {
 std::atomic<VirtualMemoryArena*> g_vmem_arena{nullptr};
 std::atomic<TlsTable*> g_tls_table{nullptr};
 std::atomic<HttpfsMailboxClient*> g_httpfs_client{nullptr};
-std::atomic<uint64_t> g_httpfs_client_generation{1};
+// Even = stable, odd = set_httpfs_client() transition in progress.
+std::atomic<uint64_t> g_httpfs_client_generation{2};
 
 // ---------------------------------------------------------------------------
 // In-memory /userdata overlay
@@ -135,10 +136,10 @@ struct OpaqueEntry final : KernelObject {
 struct FileObject final : KernelObject {
     FileObject() : KernelObject(KernelObjectKind::File) {}
 
-    std::mutex mutex;
+    std::shared_mutex mutex;
     bool is_userdata = false;
     uint32_t desired_access = 0;
-    uint64_t cursor = 0;
+    std::atomic<uint64_t> cursor{0};
     std::string userdata_key;
     HttpfsMailboxClient* httpfs_client = nullptr;
     int32_t httpfs_handle = -1;
@@ -150,7 +151,7 @@ struct FileObject final : KernelObject {
 struct KernelHandleTable {
     static constexpr size_t kNumShards = 64;
 
-    struct Shard {
+    struct alignas(64) Shard {
         std::shared_mutex mutex;
         std::unordered_map<Handle, std::shared_ptr<KernelObject>> objects;
     };
@@ -204,6 +205,22 @@ struct KernelHandleTable {
         std::unique_lock<std::shared_mutex> lock(shard.mutex);
         auto it = shard.objects.find(h);
         if (it == shard.objects.end()) {
+            return nullptr;
+        }
+        auto obj = std::move(it->second);
+        shard.objects.erase(it);
+        return obj;
+    }
+
+    template <typename Pred>
+    std::shared_ptr<KernelObject> remove_if(Handle h, Pred&& pred) {
+        if (h == kNullHandle || h == INVALID_HANDLE_VALUE) {
+            return nullptr;
+        }
+        Shard& shard = shards[shard_index(h)];
+        std::unique_lock<std::shared_mutex> lock(shard.mutex);
+        auto it = shard.objects.find(h);
+        if (it == shard.objects.end() || !pred(*it->second)) {
             return nullptr;
         }
         auto obj = std::move(it->second);
@@ -343,7 +360,7 @@ bool equals_ascii_ci(std::string_view a, std::string_view b) {
 // asks again for every handle (GetFileAttributes* / GetFileSizeEx open, probe and close the
 // file each time), so a file's size is resolved once per client. Cleared when the client changes.
 struct HttpfsSizeCache {
-    std::mutex mutex;
+    std::shared_mutex mutex;
     std::unordered_map<std::string, uint64_t> sizes;
 };
 
@@ -354,7 +371,7 @@ HttpfsSizeCache& httpfs_size_cache() {
 
 bool lookup_httpfs_size(const std::string& key, uint64_t& out_size) {
     HttpfsSizeCache& cache = httpfs_size_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::shared_lock<std::shared_mutex> lock(cache.mutex);
     const auto it = cache.sizes.find(key);
     if (it == cache.sizes.end()) {
         return false;
@@ -368,7 +385,7 @@ void remember_httpfs_size(const FileObject& file, uint64_t size) {
         return;
     }
     HttpfsSizeCache& cache = httpfs_size_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::unique_lock<std::shared_mutex> lock(cache.mutex);
     cache.sizes[file.httpfs_key] = size;
 }
 
@@ -614,7 +631,9 @@ TlsTable* get_tls_table() {
 
 void set_httpfs_client(HttpfsMailboxClient* client) {
     HttpfsSizeCache& cache = httpfs_size_cache();
-    std::lock_guard<std::mutex> lock(cache.mutex);
+    std::unique_lock<std::shared_mutex> lock(cache.mutex);
+    // Seqlock-style generation: odd during transition, even once the new client is visible.
+    g_httpfs_client_generation.fetch_add(1, std::memory_order_acq_rel);
     cache.sizes.clear();
     g_httpfs_client.store(client, std::memory_order_release);
     g_httpfs_client_generation.fetch_add(1, std::memory_order_acq_rel);
@@ -649,11 +668,10 @@ std::shared_ptr<void> lookup_opaque_object(Handle handle, uint32_t tag) {
 }
 
 std::shared_ptr<void> remove_opaque_object(Handle handle, uint32_t tag) {
-    if (!lookup_opaque_object(handle, tag)) {
-        return nullptr;
-    }
-    auto obj = handle_table().remove(handle);
-    if (!obj || obj->kind != KernelObjectKind::Opaque) {
+    auto obj = handle_table().remove_if(handle, [tag](const KernelObject& o) {
+        return o.kind == KernelObjectKind::Opaque && static_cast<const OpaqueEntry&>(o).tag == tag;
+    });
+    if (!obj) {
         return nullptr;
     }
     return static_cast<OpaqueEntry*>(obj.get())->payload;
@@ -1103,10 +1121,10 @@ bool query_file_handle(Handle handle, FileHandleInfo* out) {
         return false;
     }
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+    std::shared_lock<std::shared_mutex> lock(file->mutex);
     out->is_userdata = file->is_userdata;
     out->desired_access = file->desired_access;
-    out->cursor = file->cursor;
+    out->cursor = file->cursor.load(std::memory_order_relaxed);
     out->userdata_key = file->userdata_key;
     return true;
 }
@@ -1118,14 +1136,15 @@ bool set_end_of_file_at_cursor(Handle handle) {
         return false;
     }
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+    std::unique_lock<std::shared_mutex> lock(file->mutex);
     if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
         SetLastError(ERROR_ACCESS_DENIED);
         return false;
     }
     // Zero-extension is bounded so a hostile seek position cannot exhaust host memory.
     constexpr uint64_t kMaxUserdataFileBytes = 1ull << 32;
-    if (file->cursor > kMaxUserdataFileBytes) {
+    const uint64_t cursor = file->cursor.load(std::memory_order_relaxed);
+    if (cursor > kMaxUserdataFileBytes) {
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
@@ -1136,7 +1155,7 @@ bool set_end_of_file_at_cursor(Handle handle) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return false;
     }
-    it->second.resize(static_cast<size_t>(file->cursor), 0);
+    it->second.resize(static_cast<size_t>(cursor), 0);
     stamp_locked(overlay, file->userdata_key, false);
     return true;
 }
@@ -1176,95 +1195,113 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
         return {};
     }
 
-    std::string s(raw_path);
-    for (char& c : s) {
-        if (c == '\\') {
-            c = '/';
-        }
-    }
-
+    auto is_sep = [](char c) { return c == '/' || c == '\\'; };
+    const size_t n = raw_path.size();
     size_t pos = 0;
+
     // Strip Win32 extended-length or device prefix (\\?\ or \\.\).
-    if (s.size() >= 4 && s[0] == '/' && s[1] == '/' && (s[2] == '?' || s[2] == '.') &&
-        s[3] == '/') {
+    if (n >= 4 && is_sep(raw_path[0]) && is_sep(raw_path[1]) &&
+        (raw_path[2] == '?' || raw_path[2] == '.') && is_sep(raw_path[3])) {
         pos = 4;
     }
 
     // Strip Windows / Xbox drive prefixes such as G:\, D:\, T:\, C:\.
-    if (pos + 2 <= s.size() &&
-        std::isalpha(static_cast<unsigned char>(s[pos])) &&
-        s[pos + 1] == ':') {
+    if (pos + 2 <= n &&
+        std::isalpha(static_cast<unsigned char>(raw_path[pos])) &&
+        raw_path[pos + 1] == ':') {
         pos += 2;
-        if (pos < s.size() && s[pos] == '/') {
+        if (pos < n && is_sep(raw_path[pos])) {
             ++pos;
         }
     }
 
-    // Parse into normalized path segments (collapsing duplicate slashes, '.', and '..').
-    std::vector<std::string_view> segments;
-    segments.reserve(8);
-    while (pos < s.size()) {
-        while (pos < s.size() && s[pos] == '/') {
+    // Parse into normalized path segments (collapsing duplicate slashes, '.', and '..') without
+    // temporary heap allocations in the common <= 16-segment case.
+    constexpr size_t kStackSegs = 16;
+    std::string_view stack_segs[kStackSegs];
+    size_t seg_count = 0;
+    std::vector<std::string_view> heap_segs;
+    auto push_seg = [&](std::string_view seg) {
+        if (!heap_segs.empty()) {
+            heap_segs.push_back(seg);
+        } else if (seg_count < kStackSegs) {
+            stack_segs[seg_count++] = seg;
+        } else {
+            heap_segs.reserve(kStackSegs * 2);
+            heap_segs.assign(stack_segs, stack_segs + seg_count);
+            heap_segs.push_back(seg);
+        }
+    };
+    auto pop_seg = [&]() {
+        if (!heap_segs.empty()) {
+            heap_segs.pop_back();
+        } else if (seg_count > 0) {
+            --seg_count;
+        }
+    };
+
+    while (pos < n) {
+        while (pos < n && is_sep(raw_path[pos])) {
             ++pos;
         }
-        if (pos >= s.size()) {
+        if (pos >= n) {
             break;
         }
-        size_t end = s.find('/', pos);
-        if (end == std::string::npos) {
-            end = s.size();
+        size_t end = pos;
+        while (end < n && !is_sep(raw_path[end])) {
+            ++end;
         }
-        std::string_view seg(s.data() + pos, end - pos);
+        const std::string_view seg = raw_path.substr(pos, end - pos);
         pos = end;
 
         if (seg.empty() || seg == ".") {
             continue;
         }
         if (seg == "..") {
-            if (!segments.empty()) {
-                segments.pop_back();
-            }
+            pop_seg();
             continue;
         }
-        segments.push_back(seg);
+        push_seg(seg);
     }
 
-    if (segments.empty()) {
+    const std::string_view* segs = heap_segs.empty() ? stack_segs : heap_segs.data();
+    const size_t count = heap_segs.empty() ? seg_count : heap_segs.size();
+    if (count == 0) {
         return {};
     }
 
-    if (equals_ascii_ci(segments[0], "userdata")) {
-        if (segments.size() < 2) {
+    if (equals_ascii_ci(segs[0], "userdata")) {
+        if (count < 2) {
             return {};
         }
         if (is_userdata != nullptr) {
             *is_userdata = true;
         }
         size_t total_len = 9;  // "/userdata"
-        for (size_t i = 1; i < segments.size(); ++i) {
-            total_len += 1 + segments[i].size();
+        for (size_t i = 1; i < count; ++i) {
+            total_len += 1 + segs[i].size();
         }
         std::string result;
         result.reserve(total_len);
         result.append("/userdata");
-        for (size_t i = 1; i < segments.size(); ++i) {
+        for (size_t i = 1; i < count; ++i) {
             result.push_back('/');
-            result.append(segments[i]);
+            result.append(segs[i]);
         }
         return result;
     }
 
-    size_t total_len = segments.size() - 1;
-    for (const std::string_view seg : segments) {
-        total_len += seg.size();
+    size_t total_len = count - 1;
+    for (size_t i = 0; i < count; ++i) {
+        total_len += segs[i].size();
     }
     std::string result;
     result.reserve(total_len);
-    for (size_t i = 0; i < segments.size(); ++i) {
+    for (size_t i = 0; i < count; ++i) {
         if (i > 0) {
             result.push_back('/');
         }
-        result.append(segments[i]);
+        result.append(segs[i]);
     }
     return result;
 }
@@ -1472,7 +1509,7 @@ namespace {
 // Host locks of SRWLOCKs, keyed by the guest lock's address (see Pg6SrwLock). A zeroed SRWLOCK is
 // unlocked, so a lock appears on first use; entries are never removed (SRWLOCK has no delete, and
 // memory reused for a new lock while unlocked keeps a valid unlocked entry).
-struct SrwShard {
+struct alignas(64) SrwShard {
     std::mutex mutex;
     std::unordered_map<uintptr_t, std::unique_ptr<playgta6::os::SrwLock>> locks;
 };
@@ -1561,7 +1598,7 @@ namespace {
 
 // Locks of critical sections, keyed by the section's address (see Pg6CriticalSection). Sharded so
 // unrelated sections do not contend on one table lock.
-struct CriticalSectionShard {
+struct alignas(64) CriticalSectionShard {
     std::mutex mutex;
     std::unordered_map<const void*, std::shared_ptr<std::recursive_mutex>> locks;
 };
@@ -1810,14 +1847,18 @@ constexpr uint32_t kStatusEndOfFile = 0xC0000011u;
 
 namespace {
 
-// PG6_AUDIO_TRACE=1: ReadFile on a path naming audio (at most 2000 lines).
-void trace_audio_read(const std::string& path, uint64_t offset, uint32_t size, int64_t got,
-                      std::chrono::steady_clock::time_point start) {
+bool audio_trace_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("PG6_AUDIO_TRACE");
         return e != nullptr && e[0] == '1';
     }();
-    if (!on) {
+    return on;
+}
+
+// PG6_AUDIO_TRACE=1: ReadFile on a path naming audio (at most 2000 lines).
+void trace_audio_read(const std::string& path, uint64_t offset, uint32_t size, int64_t got,
+                      std::chrono::steady_clock::time_point start) {
+    if (!audio_trace_enabled()) {
         return;
     }
     static std::atomic<uint32_t> lines{0};
@@ -1850,9 +1891,54 @@ bool read_file_at(Handle file_handle,
     }
 
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+
+    // Fast concurrent path: OVERLAPPED reads on immutable HTTPFS handles take a shared lock so
+    // multiple threads reading from the same archive execute concurrently across 8-lane HTTPFS,
+    // while CloseHandle (unique_lock) still waits for in-flight reads to drain.
+    if (start != nullptr && !file->is_userdata) {
+        std::shared_lock<std::shared_mutex> lock(file->mutex);
+        const uint64_t offset = *start;
+        file->cursor.store(offset, std::memory_order_relaxed);
+        if ((file->desired_access & GENERIC_READ) == 0) {
+            SetLastError(ERROR_ACCESS_DENIED);
+            return false;
+        }
+        if (bytes_to_read == 0) {
+            return true;
+        }
+        if (buffer == nullptr) {
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        if (file->httpfs_client == nullptr || file->httpfs_handle < 0) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        const bool trace = audio_trace_enabled();
+        const auto read_start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        int64_t got = 0;
+        {
+            HostStallScope stall;
+            got = file->httpfs_client->read(file->httpfs_handle, offset, buffer, bytes_to_read);
+        }
+        if (trace) {
+            trace_audio_read(file->httpfs_key, offset, bytes_to_read, got, read_start);
+        }
+        if (got < 0) {
+            SetLastError(ERROR_READ_FAULT);
+            return false;
+        }
+        file->cursor.store(offset + static_cast<uint64_t>(got), std::memory_order_relaxed);
+        if (bytes_read != nullptr) {
+            *bytes_read = static_cast<uint32_t>(got);
+        }
+        return true;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(file->mutex);
+    uint64_t cursor = start != nullptr ? *start : file->cursor.load(std::memory_order_relaxed);
     if (start != nullptr) {
-        file->cursor = *start;
+        file->cursor.store(cursor, std::memory_order_relaxed);
     }
 
     if ((file->desired_access & GENERIC_READ) == 0) {
@@ -1876,16 +1962,16 @@ bool read_file_at(Handle file_handle,
             return false;
         }
         const auto& data = it->second;
-        if (file->cursor >= data.size()) {
+        if (cursor >= data.size()) {
             if (bytes_read != nullptr) {
                 *bytes_read = 0;
             }
             return true;
         }
-        const size_t avail = data.size() - static_cast<size_t>(file->cursor);
+        const size_t avail = data.size() - static_cast<size_t>(cursor);
         const size_t to_copy = std::min<size_t>(avail, bytes_to_read);
-        std::memcpy(buffer, data.data() + static_cast<size_t>(file->cursor), to_copy);
-        file->cursor += to_copy;
+        std::memcpy(buffer, data.data() + static_cast<size_t>(cursor), to_copy);
+        file->cursor.store(cursor + to_copy, std::memory_order_relaxed);
         if (bytes_read != nullptr) {
             *bytes_read = static_cast<uint32_t>(to_copy);
         }
@@ -1897,18 +1983,21 @@ bool read_file_at(Handle file_handle,
         return false;
     }
 
-    const auto read_start = std::chrono::steady_clock::now();
+    const bool trace = audio_trace_enabled();
+    const auto read_start = trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     int64_t got = 0;
     {
         HostStallScope stall;  // a package read can block on the network/disk for seconds
-        got = file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+        got = file->httpfs_client->read(file->httpfs_handle, cursor, buffer, bytes_to_read);
     }
-    trace_audio_read(file->httpfs_key, file->cursor, bytes_to_read, got, read_start);
+    if (trace) {
+        trace_audio_read(file->httpfs_key, cursor, bytes_to_read, got, read_start);
+    }
     if (got < 0) {
         SetLastError(ERROR_READ_FAULT);
         return false;
     }
-    file->cursor += static_cast<uint64_t>(got);
+    file->cursor.store(cursor + static_cast<uint64_t>(got), std::memory_order_relaxed);
     if (bytes_read != nullptr) {
         *bytes_read = static_cast<uint32_t>(got);
     }
@@ -1927,9 +2016,10 @@ bool write_file_at(Handle file_handle,
     }
 
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+    std::unique_lock<std::shared_mutex> lock(file->mutex);
+    uint64_t cursor = start != nullptr ? *start : file->cursor.load(std::memory_order_relaxed);
     if (start != nullptr) {
-        file->cursor = *start;
+        file->cursor.store(cursor, std::memory_order_relaxed);
     }
 
     if (!file->is_userdata || (file->desired_access & GENERIC_WRITE) == 0) {
@@ -1947,12 +2037,12 @@ bool write_file_at(Handle file_handle,
     auto& overlay = userdata_overlay();
     std::lock_guard<std::mutex> ud_lock(overlay.mutex);
     auto& data = overlay.files[file->userdata_key];
-    const uint64_t end_pos = file->cursor + bytes_to_write;
+    const uint64_t end_pos = cursor + bytes_to_write;
     if (end_pos > data.size()) {
         data.resize(static_cast<size_t>(end_pos), 0);
     }
-    std::memcpy(data.data() + static_cast<size_t>(file->cursor), buffer, bytes_to_write);
-    file->cursor = end_pos;
+    std::memcpy(data.data() + static_cast<size_t>(cursor), buffer, bytes_to_write);
+    file->cursor.store(end_pos, std::memory_order_relaxed);
     stamp_locked(overlay, file->userdata_key, false);
     if (bytes_written != nullptr) {
         *bytes_written = bytes_to_write;
@@ -2027,7 +2117,7 @@ bool SetFilePointerEx(Handle file_handle,
     }
 
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+    std::unique_lock<std::shared_mutex> lock(file->mutex);
 
     int64_t base = 0;
     switch (move_method) {
@@ -2035,13 +2125,15 @@ bool SetFilePointerEx(Handle file_handle,
             base = 0;
             break;
 
-        case FILE_CURRENT:
-            if (file->cursor > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        case FILE_CURRENT: {
+            const uint64_t cur = file->cursor.load(std::memory_order_relaxed);
+            if (cur > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
                 SetLastError(ERROR_INVALID_PARAMETER);
                 return false;
             }
-            base = static_cast<int64_t>(file->cursor);
+            base = static_cast<int64_t>(cur);
             break;
+        }
 
         case FILE_END: {
             uint64_t size = 0;
@@ -2087,7 +2179,7 @@ bool SetFilePointerEx(Handle file_handle,
         return false;
     }
 
-    file->cursor = static_cast<uint64_t>(target);
+    file->cursor.store(static_cast<uint64_t>(target), std::memory_order_relaxed);
     if (new_file_pointer != nullptr) {
         *new_file_pointer = target;
     }
@@ -2107,7 +2199,14 @@ bool GetFileSizeEx(Handle file_handle, int64_t* file_size) {
     }
 
     auto* file = static_cast<FileObject*>(obj.get());
-    std::lock_guard<std::mutex> lock(file->mutex);
+    if (!file->is_userdata) {
+        std::shared_lock<std::shared_mutex> rlock(file->mutex);
+        if (file->has_cached_size) {
+            *file_size = static_cast<int64_t>(file->cached_size);
+            return true;
+        }
+    }
+    std::unique_lock<std::shared_mutex> lock(file->mutex);
 
     uint64_t size = 0;
     if (file->is_userdata) {
@@ -2139,7 +2238,7 @@ bool CloseHandle(Handle handle) {
 
     if (obj->kind == KernelObjectKind::File) {
         auto* file = static_cast<FileObject*>(obj.get());
-        std::lock_guard<std::mutex> lock(file->mutex);
+        std::unique_lock<std::shared_mutex> lock(file->mutex);
         if (!file->is_userdata && file->httpfs_client != nullptr && file->httpfs_handle >= 0) {
             file->httpfs_client->close(file->httpfs_handle);
             file->httpfs_handle = -1;

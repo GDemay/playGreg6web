@@ -568,6 +568,45 @@ void test_dstorage_virtual_and_httpfs() {
 
     http_file->Release();
     win32::set_httpfs_client(nullptr);
+
+    // Direct dstorage_file_read_at() fast path + HTTPFS client-swap safety:
+    // swapping the active HTTPFS client invalidates stale handles cleanly without calling close()
+    // on the wrong client.
+    {
+        char direct_out[16]{};
+        CHECK(dstorage_file_read_at(vfile, 14, direct_out, 13) == S_OK_HR);
+        CHECK(std::memcmp(direct_out, "XBOX-SCARLETT", 13) == 0);
+        CHECK(dstorage_file_read_at(nullptr, 0, direct_out, 4) == E_INVALIDARG_HR);
+
+        std::atomic<int> other_closes{0};
+        HttpfsMailbox other_mb{};
+        HttpfsMailboxClient::init_mailbox(other_mb);
+        HttpfsMailboxClient other_client(&other_mb, [&](HttpfsMailbox& mb) {
+            if (mb.op == static_cast<uint32_t>(HttpfsOp::Close)) {
+                other_closes.fetch_add(1, std::memory_order_relaxed);
+            }
+            HttpfsMailboxClient::complete_response(mb, 0);
+        });
+
+        win32::set_httpfs_client(&client);
+        Pg6IDStorageFile* stale_file = nullptr;
+        CHECK(factory->OpenFileA("stream/chunk0.bin",
+                                 kIidIDStorageFile,
+                                 reinterpret_cast<void**>(&stale_file)) == S_OK_HR);
+        CHECK(stale_file != nullptr);
+        char buf[16]{};
+        CHECK(dstorage_file_read_at(stale_file, 0, buf, 6) == S_OK_HR);
+        CHECK(std::memcmp(buf, "HTTPFS", 6) == 0);
+
+        // Swap to another client: stale handle read must fail cleanly and Release must NOT close
+        // on the swapped client.
+        win32::set_httpfs_client(&other_client);
+        CHECK(dstorage_file_read_at(stale_file, 0, buf, 6) == gdk::E_FAIL_HR);
+        stale_file->Release();
+        CHECK(other_closes.load() == 0);
+        win32::set_httpfs_client(nullptr);
+    }
+
     vfile->Release();
     status->Release();
     queue->Release();
