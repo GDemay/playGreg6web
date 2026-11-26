@@ -43,6 +43,11 @@ public:
     };
     Stats stats() const;
 
+    // The title drives the frame interval (SetFrameIntervalX): presents are counted but add no 60 Hz
+    // wait, the title's own frame events pace it.
+    void set_title_driven(bool on);
+    bool title_driven() const;
+
     void set_enabled(bool on);
     bool enabled() const;
 
@@ -64,6 +69,7 @@ private:
     std::function<void(Clock::time_point)> sleep_until_;
     std::atomic<Observer> observer_{nullptr};
     bool enabled_ = true;
+    bool title_driven_ = false;
     bool have_last_ = false;
     uint64_t last_flip_ = 0;
     Stats stats_{};
