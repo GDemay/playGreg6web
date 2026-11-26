@@ -5,7 +5,7 @@
 
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
-use super::super::{FunctionLifter, R, imm, unsupported};
+use super::super::{FunctionLifter, R, unsupported};
 use super::{Elem, Form, Intr, Ty};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,10 +348,7 @@ impl FunctionLifter<'_> {
             M::Pmaddwd | M::Vpmaddwd => {
                 let a = self.v128(ins, f.a, I16)?;
                 let b = self.v128(ins, f.b, I16)?;
-                let wa = self.val(&format!("sext <8 x i16> {a} to <8 x i32>"));
-                let wb = self.val(&format!("sext <8 x i16> {b} to <8 x i32>"));
-                let p = self.val(&format!("mul <8 x i32> {wa}, {wb}"));
-                let r = self.pair_sum(&p, 8, I32, "add");
+                let r = self.intr(Intr::WasmDot, Ty::v(I16), &[&a, &b]);
                 self.xset(ins.op_register(f.dst), &r, I32)?;
             }
             M::Pmaddubsw | M::Vpmaddubsw => {
@@ -408,15 +405,20 @@ impl FunctionLifter<'_> {
                 let hi = self.v128(ins, f.a, I8)?;
                 let lo = self.v128(ins, f.b, I8)?;
                 // (hi:lo) >> 8*imm: byte k is lo[k+i] (< 16), hi[k+i-16] (< 32), else 0.
-                let cat = self.val(&format!(
-                    "shufflevector <16 x i8> {lo}, <16 x i8> {hi}, {}",
-                    super::mask(&(0..32).collect::<Vec<_>>())
-                ));
-                let idx: Vec<u32> = (0..16).map(|k| (k + i).min(32)).collect();
-                let r = self.val(&format!(
-                    "shufflevector <32 x i8> {cat}, <32 x i8> zeroinitializer, {}",
-                    super::mask(&idx)
-                ));
+                let r = match i {
+                    0 => lo,
+                    1..=15 => {
+                        let idx: Vec<u32> = (0..16).map(|k| k + i).collect();
+                        self.shuffle(&lo, &hi, I8, &idx)
+                    }
+                    16 => hi,
+                    17..=31 => {
+                        let shift = i - 16;
+                        let idx: Vec<u32> = (0..16).map(|k| (k + shift).min(16)).collect();
+                        self.shuffle(&hi, "zeroinitializer", I8, &idx)
+                    }
+                    _ => "zeroinitializer".to_string(),
+                };
                 self.xset(ins.op_register(f.dst), &r, I8)?;
             }
             M::Pblendw | M::Vpblendw => {
@@ -537,16 +539,7 @@ impl FunctionLifter<'_> {
             IOp::MinU => self.intr(Intr::UMin, ty, &[&a, &b]),
             IOp::MaxS => self.intr(Intr::SMax, ty, &[&a, &b]),
             IOp::MaxU => self.intr(Intr::UMax, ty, &[&a, &b]),
-            IOp::Avg => {
-                let w = ty.with(e.wide()).ir();
-                let one = ty.with(e.wide()).splat("1");
-                let wa = self.val(&format!("zext {t} {a} to {w}"));
-                let wb = self.val(&format!("zext {t} {b} to {w}"));
-                let s = self.val(&format!("add {w} {wa}, {wb}"));
-                let s = self.val(&format!("add {w} {s}, {one}"));
-                let s = self.val(&format!("lshr {w} {s}, {one}"));
-                self.val(&format!("trunc {w} {s} to {t}"))
-            }
+            IOp::Avg => self.intr(Intr::AvgrUnsigned, ty, &[&a, &b]),
             IOp::Sign => {
                 let neg = self.val(&format!("sub {t} zeroinitializer, {a}"));
                 let lt = self.val(&format!("icmp slt {t} {b}, zeroinitializer"));
@@ -564,24 +557,42 @@ impl FunctionLifter<'_> {
         let ty = Ty::v(e);
         let t = ty.ir();
         let last = ins.op_count() - 1;
-        // Immediate forms: `psllw xmm, imm` / `vpsllw xmm1, xmm2, imm`.
-        let (src, count) = if super::super::is_immediate(ins.op_kind(last)) {
-            let src = if ins.op_count() == 3 { 1 } else { 0 };
-            (src, imm(u64::from(Self::imm8(ins)?), 64))
-        } else {
-            let count = match ins.op_kind(f.b) {
-                OpKind::Register => {
-                    // The count is always the low quadword of an XMM register, also for YMM data.
-                    let v = self.xget_half(ins.op_register(f.b), 0, Elem::I64)?;
-                    self.extract(&v, Elem::I64, 0)
-                }
-                OpKind::Memory => self.mem_load_at(ins, Ty::s(Elem::I64), 0, 16)?,
-                k => return unsupported(format!("shift count operand {k:?}")),
-            };
-            (f.a, count)
-        };
-        let v = self.v128(ins, src, e)?;
         let width = e.bits();
+        // Immediate forms: `psllw xmm, imm` / `vpsllw xmm1, xmm2, imm`.
+        if super::super::is_immediate(ins.op_kind(last)) {
+            let src = if ins.op_count() == 3 { 1 } else { 0 };
+            let c = Self::imm8(ins)?;
+            if c >= width && kind != ShiftKind::Arith {
+                return self.xset(ins.op_register(0), "zeroinitializer", e);
+            }
+            let v = self.v128(ins, src, e)?;
+            let r = if c == 0 {
+                v
+            } else if c >= width {
+                self.val(&format!(
+                    "ashr {t} {v}, {}",
+                    ty.splat(&(width - 1).to_string())
+                ))
+            } else {
+                let op = match kind {
+                    ShiftKind::Left => "shl",
+                    ShiftKind::Logical => "lshr",
+                    ShiftKind::Arith => "ashr",
+                };
+                self.val(&format!("{op} {t} {v}, {}", ty.splat(&c.to_string())))
+            };
+            return self.xset(ins.op_register(0), &r, e);
+        }
+        let count = match ins.op_kind(f.b) {
+            OpKind::Register => {
+                // The count is always the low quadword of an XMM register, also for YMM data.
+                let v = self.xget_half(ins.op_register(f.b), 0, Elem::I64)?;
+                self.extract(&v, Elem::I64, 0)
+            }
+            OpKind::Memory => self.mem_load_at(ins, Ty::s(Elem::I64), 0, 16)?,
+            k => return unsupported(format!("shift count operand {k:?}")),
+        };
+        let v = self.v128(ins, f.a, e)?;
         let big = self.val(&format!("icmp ugt i64 {count}, {}", width - 1));
         let r = match kind {
             ShiftKind::Arith => {
@@ -656,52 +667,19 @@ impl FunctionLifter<'_> {
         ))
     }
 
-    /// Sum (or difference) of adjacent lanes of a `<n x e>` vector -> `<n/2 x e>`.
-    fn pair_sum(&mut self, v: &str, n: u32, e: Elem, op: &str) -> String {
-        let t = Ty::vn(e, n).ir();
-        let even: Vec<u32> = (0..n / 2).map(|i| 2 * i).collect();
-        let odd: Vec<u32> = (0..n / 2).map(|i| 2 * i + 1).collect();
-        let lo = self.val(&format!(
-            "shufflevector {t} {v}, {t} poison, {}",
-            super::mask(&even)
-        ));
-        let hi = self.val(&format!(
-            "shufflevector {t} {v}, {t} poison, {}",
-            super::mask(&odd)
-        ));
-        self.val(&format!("{op} {} {lo}, {hi}", Ty::vn(e, n / 2).ir()))
-    }
-
-    /// `packss*`/`packus*`: saturate both sources to half-width lanes, a's lanes first.
-    /// Clamping each 128-bit source via `smax`/`smin` before truncating and concatenating avoids
-    /// redundant `v128.and` masks on signed packs and lowers directly to `max_s`/`min_s` + shuffle.
+    /// `packss*`/`packus*`: saturate both signed sources to half-width lanes, `a`'s lanes first.
+    /// Emits native Wasm SIMD128 narrowing intrinsics (`i8x16.narrow_i16x8_{s,u}`,
+    /// `i16x8.narrow_i32x4_{s,u}`), which treat both inputs as signed identically to x86.
     fn pack(&mut self, ins: &Instruction, f: Form, e: Elem, signed: bool) -> R<()> {
-        let n = e.lanes();
-        let ty = Ty::v(e);
-        let t = ty.ir();
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
-        let half = e.bits() / 2;
-        let (lo, hi) = if signed {
-            (-(1i64 << (half - 1)), (1i64 << (half - 1)) - 1)
+        let intr = if signed {
+            Intr::NarrowSigned
         } else {
-            (0, (1i64 << half) - 1)
+            Intr::NarrowUnsigned
         };
-        let lo_s = ty.splat(&lo.to_string());
-        let hi_s = ty.splat(&hi.to_string());
-        let ne = Elem::of_bits(half);
-        let half_t = Ty::vn(ne, n).ir();
-        let mut clamp_trunc = |src: &str| {
-            let v = self.intr(Intr::SMax, ty, &[src, &lo_s]);
-            let v = self.intr(Intr::SMin, ty, &[&v, &hi_s]);
-            self.val(&format!("trunc {t} {v} to {half_t}"))
-        };
-        let at = clamp_trunc(&a);
-        let bt = clamp_trunc(&b);
-        let r = self.val(&format!(
-            "shufflevector {half_t} {at}, {half_t} {bt}, {}",
-            super::mask(&(0..2 * n).collect::<Vec<_>>())
-        ));
+        let r = self.intr(intr, Ty::v(e), &[&a, &b]);
+        let ne = Elem::of_bits(e.bits() / 2);
         self.xset(ins.op_register(f.dst), &r, ne)
     }
 

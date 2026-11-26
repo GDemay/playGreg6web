@@ -538,14 +538,20 @@ impl FunctionLifter<'_> {
     /// `vbroadcastss/sd`, `vpbroadcastb/w/d/q`: the low element of an XMM register or memory in
     /// every lane.
     fn broadcast(&mut self, ins: &Instruction, e: Elem) -> R<()> {
-        let s = match ins.op_kind(1) {
+        let v = match ins.op_kind(1) {
             OpKind::Register => {
-                let v = self.xget_half(ins.op_register(1), 0, e)?;
-                self.extract(&v, e, 0)
+                let src = self.xget_half(ins.op_register(1), 0, e)?;
+                let t = Ty::v(e).ir();
+                self.val(&format!(
+                    "shufflevector {t} {src}, {t} poison, <{} x i32> zeroinitializer",
+                    e.lanes()
+                ))
             }
-            _ => self.mem_load_at(ins, Ty::s(e), 0, (e.bits() / 8) as usize)?,
+            _ => {
+                let s = self.mem_load_at(ins, Ty::s(e), 0, (e.bits() / 8) as usize)?;
+                self.splat_value(&s, e)
+            }
         };
-        let v = self.splat_value(&s, e);
         self.set_halves(ins.op_register(0), &v, Some(&v), e)
     }
 

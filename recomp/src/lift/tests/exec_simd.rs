@@ -796,3 +796,541 @@ fn rdssp_without_shadow_stack_is_a_nop() {
     assert_eq!(out[0].regs[10], 0x1122_3344_5566_7788);
     assert_eq!(out[0].regs[11], 0x99AA_BBCC_DDEE_FF00);
 }
+
+#[test]
+fn r66_wasm64_simd128_codegen_and_edge_cases() {
+    if !exec_or_skip("r66_wasm64_simd128_codegen_and_edge_cases") {
+        return;
+    }
+    use crate::lift::compile::{LlvmTool, find_llvm_tool};
+    use crate::lift::target::LiftTarget;
+
+    // 1) Verify LLVM emits exact 1-op Wasm64 SIMD128 instructions and compiles cleanly for native
+    //    x86_64-pc-windows-msvc (`x86-64-v3`).
+    if let Some(LlvmTool::Llc { llc, opt }) = find_llvm_tool() {
+        let dir = std::env::temp_dir().join(format!(
+            "playgta6_r66_asm_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let probes: Vec<(&str, crate::cfg::Function, &str, Option<&str>)> = vec![
+            (
+                "packsswb",
+                asm_function(CODE_BASE, |a| {
+                    a.packsswb(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i8x16.narrow_i16x8_s",
+                Some("packsswb"),
+            ),
+            (
+                "packuswb",
+                asm_function(CODE_BASE + 0x100, |a| {
+                    a.packuswb(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i8x16.narrow_i16x8_u",
+                Some("packuswb"),
+            ),
+            (
+                "packssdw",
+                asm_function(CODE_BASE + 0x200, |a| {
+                    a.packssdw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i16x8.narrow_i32x4_s",
+                Some("packssdw"),
+            ),
+            (
+                "packusdw",
+                asm_function(CODE_BASE + 0x300, |a| {
+                    a.packusdw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i16x8.narrow_i32x4_u",
+                Some("packusdw"),
+            ),
+            (
+                "pmaddwd",
+                asm_function(CODE_BASE + 0x400, |a| {
+                    a.pmaddwd(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i32x4.dot_i16x8_s",
+                Some("pmaddwd"),
+            ),
+            (
+                "pavgb",
+                asm_function(CODE_BASE + 0x500, |a| {
+                    a.pavgb(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i8x16.avgr_u",
+                Some("pavgb"),
+            ),
+            (
+                "pavgw",
+                asm_function(CODE_BASE + 0x600, |a| {
+                    a.pavgw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                "i16x8.avgr_u",
+                Some("pavgw"),
+            ),
+            (
+                "psrlw_imm",
+                asm_function(CODE_BASE + 0x700, |a| {
+                    a.psrlw(xmm0, 3)?;
+                    a.ret()
+                }),
+                "i16x8.shr_u",
+                None,
+            ),
+            (
+                "dpps_7f",
+                asm_function(CODE_BASE + 0x800, |a| {
+                    a.dpps(xmm0, xmm1, 0x7F)?;
+                    a.ret()
+                }),
+                "f32x4.add",
+                None,
+            ),
+        ];
+        let native_target = LiftTarget::parse("native:x86_64-pc-windows-msvc", Some("x86-64-v3"))
+            .expect("native target");
+        for (name, func, want_wasm, want_x86) in &probes {
+            let m = lift_module([func]).expect("lift");
+            let ll = dir.join(format!("{name}.ll"));
+            let bc = dir.join(format!("{name}.bc"));
+            let asm_path = dir.join(format!("{name}.s"));
+            std::fs::write(&ll, &m.ir).expect("write ll");
+            let input = if let Some(opt_bin) = &opt {
+                let st = std::process::Command::new(opt_bin)
+                    .args(["-O2"])
+                    .arg(&ll)
+                    .arg("-o")
+                    .arg(&bc)
+                    .status()
+                    .expect("run opt");
+                assert!(st.success(), "opt failed on {name}");
+                &bc
+            } else {
+                &ll
+            };
+            let st = std::process::Command::new(&llc)
+                .args(["-mtriple=wasm64-unknown-unknown", "-O2", "-filetype=asm"])
+                .arg(input)
+                .arg("-o")
+                .arg(&asm_path)
+                .status()
+                .expect("run llc wasm64");
+            assert!(st.success(), "llc wasm64 failed on {name}");
+            let asm = std::fs::read_to_string(&asm_path).expect("read wasm asm");
+            assert!(
+                asm.contains(want_wasm),
+                "{name} expected `{want_wasm}` in wasm64 asm:\n{asm}"
+            );
+            if *name == "dpps_7f" {
+                assert!(!asm.contains("extract_lane"), "dpps extracted lanes:\n{asm}");
+                assert!(!asm.contains("f32.mul"), "dpps scalarized fmul:\n{asm}");
+                assert!(!asm.contains("f32.add"), "dpps scalarized fadd:\n{asm}");
+            }
+
+            if let Some(x86_mnem) = want_x86 {
+                let native_ir = native_target.retarget(m.ir);
+                let nll = dir.join(format!("{name}_x86.ll"));
+                let nbc = dir.join(format!("{name}_x86.bc"));
+                let nasm = dir.join(format!("{name}_x86.s"));
+                std::fs::write(&nll, &native_ir).expect("write native ll");
+                let ninput = if let Some(opt_bin) = &opt {
+                    let st = std::process::Command::new(opt_bin)
+                        .args(["-O2"])
+                        .arg(&nll)
+                        .arg("-o")
+                        .arg(&nbc)
+                        .status()
+                        .expect("run opt native");
+                    assert!(st.success(), "opt native failed on {name}");
+                    &nbc
+                } else {
+                    &nll
+                };
+                let st = std::process::Command::new(&llc)
+                    .args([
+                        "-mtriple=x86_64-pc-windows-msvc",
+                        "-mcpu=x86-64-v3",
+                        "-O2",
+                        "-filetype=asm",
+                    ])
+                    .arg(ninput)
+                    .arg("-o")
+                    .arg(&nasm)
+                    .status()
+                    .expect("run llc native");
+                assert!(st.success(), "llc native failed on {name}");
+                let x86_asm = std::fs::read_to_string(&nasm).expect("read x86 asm");
+                assert!(
+                    x86_asm.contains(x86_mnem),
+                    "{name} expected `{x86_mnem}` in x86-64 asm:\n{x86_asm}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 2) Execute all R66 edge cases under Wasm64 (Node):
+    let f_packsswb = CODE_BASE;
+    let f_packuswb = CODE_BASE + 0x100;
+    let f_packssdw = CODE_BASE + 0x200;
+    let f_packusdw = CODE_BASE + 0x300;
+    let f_pmaddwd = CODE_BASE + 0x400;
+    let f_pavgb = CODE_BASE + 0x500;
+    let f_pavgw = CODE_BASE + 0x600;
+    let f_shifts = CODE_BASE + 0x700;
+    let f_palignr = CODE_BASE + 0x800;
+    let f_dpps_nan = CODE_BASE + 0x900;
+    let f_dpps_neg0 = CODE_BASE + 0xA00;
+    let f_dppd_edge = CODE_BASE + 0xB00;
+    let f_mov_bcast = CODE_BASE + 0xC00;
+
+    let program = Program::new()
+        .asm(f_packsswb, |a| {
+            a.packsswb(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_packuswb, |a| {
+            a.packuswb(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_packssdw, |a| {
+            a.packssdw(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_packusdw, |a| {
+            a.packusdw(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_pmaddwd, |a| {
+            a.pmaddwd(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_pavgb, |a| {
+            a.pavgb(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_pavgw, |a| {
+            a.pavgw(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_shifts, |a| {
+            a.psllw(xmm0, 0)?;
+            a.psrlw(xmm1, 4)?;
+            a.psllw(xmm2, 16)?;
+            a.psraw(xmm3, 25)?;
+            a.ret()
+        })
+        .asm(f_palignr, |a| {
+            a.palignr(xmm2, xmm1, 0)?; // xmm2 = xmm1
+            a.palignr(xmm3, xmm1, 5)?; // (xmm3:xmm1) >> 40
+            a.palignr(xmm4, xmm1, 16)?; // xmm4 = xmm4
+            a.palignr(xmm5, xmm1, 20)?; // (xmm5:xmm1) >> 160
+            a.palignr(xmm6, xmm1, 32)?; // 0
+            a.ret()
+        })
+        .asm(f_dpps_nan, |a| {
+            // Mask out lane 3 (which holds NaN/Inf): must NOT poison the dot product.
+            a.dpps(xmm0, xmm1, 0x7F)?;
+            a.ret()
+        })
+        .asm(f_dpps_neg0, |a| {
+            // Lane 0..3 all -0.0, in_mask=0xF, out_mask=0x5 -> [-0.0, +0.0, -0.0, +0.0]
+            a.dpps(xmm0, xmm1, 0xF5)?;
+            // Lane 0 is -0.0, lanes 1..3 masked out (become +0.0) -> -0.0 + +0.0 = +0.0!
+            a.dpps(xmm2, xmm3, 0x1F)?;
+            a.ret()
+        })
+        .asm(f_dppd_edge, |a| {
+            // Mask out lane 1 (NaN): result in lane 0 only, lane 1 = +0.0.
+            a.dppd(xmm0, xmm1, 0x11)?;
+            a.ret()
+        })
+        .asm(f_mov_bcast, |a| {
+            a.movss(xmm0, xmm1)?;
+            a.movsd_2(xmm2, xmm3)?;
+            a.movq(xmm4, xmm5)?;
+            a.vbroadcastss(xmm6, xmm7)?;
+            a.ret()
+        });
+
+    let functions = program.discover();
+    let built = build("r66_edge", functions.values());
+
+    let i16s = |vals: [i16; 8]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let u16s = |vals: [u16; 8]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let i32s = |vals: [i32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f32s = |vals: [f32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f64s = |vals: [f64; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    // 1. packsswb & packuswb
+    let p_a16 = [i16::MIN, -129, -128, -1, 0, 127, 128, 255];
+    let p_b16 = [256, i16::MAX, -1000, 1, -2, 127, 255, 256];
+    let mut c_sswb = Case::new(f_packsswb);
+    c_sswb.mem.push((XMM_STATE, [i16s(p_a16), i16s(p_b16)].concat()));
+    c_sswb.read.push((XMM_STATE, 16));
+
+    let mut c_uswb = Case::new(f_packuswb);
+    c_uswb.mem.push((XMM_STATE, [i16s(p_a16), i16s(p_b16)].concat()));
+    c_uswb.read.push((XMM_STATE, 16));
+
+    // 2. packssdw & packusdw
+    let p_a32 = [i32::MIN, -32769, -32768, -1];
+    let p_b32 = [0, 32767, 65535, i32::MAX];
+    let mut c_ssdw = Case::new(f_packssdw);
+    c_ssdw.mem.push((XMM_STATE, [i32s(p_a32), i32s(p_b32)].concat()));
+    c_ssdw.read.push((XMM_STATE, 16));
+
+    let mut c_usdw = Case::new(f_packusdw);
+    c_usdw.mem.push((XMM_STATE, [i32s(p_a32), i32s(p_b32)].concat()));
+    c_usdw.read.push((XMM_STATE, 16));
+
+    // 3. pmaddwd wrap (-32768*-32768 + -32768*-32768 = 0x80000000) + normal pairs
+    let mut c_dot = Case::new(f_pmaddwd);
+    c_dot.mem.push((
+        XMM_STATE,
+        [
+            i16s([-32768, -32768, 32767, 32767, -100, 200, 0, -1]),
+            i16s([-32768, -32768, 32767, -32768, 3, -4, 999, 1]),
+        ]
+        .concat(),
+    ));
+    c_dot.read.push((XMM_STATE, 16));
+
+    // 4. pavgb edge cases
+    let ab_a = [0u8, 0, 255, 255, 1, 2, 127, 128, 254, 255, 10, 11, 0, 128, 200, 201];
+    let ab_b = [0u8, 1, 255, 0, 1, 3, 128, 127, 255, 254, 20, 20, 254, 128, 200, 202];
+    let mut c_avgb = Case::new(f_pavgb);
+    c_avgb.mem.push((XMM_STATE, [ab_a.to_vec(), ab_b.to_vec()].concat()));
+    c_avgb.read.push((XMM_STATE, 16));
+
+    // 5. pavgw edge cases
+    let aw_a = [0u16, 0, 65535, 65535, 32767, 32768, 65534, 1];
+    let aw_b = [0u16, 1, 65535, 0, 32768, 32768, 65535, 2];
+    let mut c_avgw = Case::new(f_pavgw);
+    c_avgw.mem.push((XMM_STATE, [u16s(aw_a), u16s(aw_b)].concat()));
+    c_avgw.read.push((XMM_STATE, 16));
+
+    // 6. immediate shifts (0, normal, overshift logical, overshift arith)
+    let mut c_sh = Case::new(f_shifts);
+    c_sh.mem.push((
+        XMM_STATE,
+        [
+            u16s([0x1234, 0xABCD, 0, 0xFFFF, 1, 2, 3, 4]),
+            u16s([0xF000, 0x00F0, 0xFFFF, 0x000F, 0x8000, 0x7FFF, 0x1234, 0]),
+            u16s([0xFFFF; 8]),
+            i16s([-1, -32768, 0, 1, 32767, -2, 42, -42]),
+        ]
+        .concat(),
+    ));
+    c_sh.read.push((XMM_STATE, 64));
+
+    // 7. palignr (0, 5, 16, 20, 32)
+    let lo_b: Vec<u8> = (0x10u8..0x20).collect();
+    let hi_b: Vec<u8> = (0xA0u8..0xB0).collect();
+    let mut c_al = Case::new(f_palignr);
+    let mut al_xmms = vec![0u8; 7 * 16];
+    al_xmms[16..32].copy_from_slice(&lo_b);
+    for reg in 2..7 {
+        al_xmms[reg * 16..(reg + 1) * 16].copy_from_slice(&hi_b);
+    }
+    c_al.mem.push((XMM_STATE, al_xmms));
+    c_al.read.push((XMM_STATE + 32, 5 * 16));
+
+    // 8. dpps with NaN/Inf in masked-out lane 3
+    let mut c_dp_nan = Case::new(f_dpps_nan);
+    c_dp_nan.mem.push((
+        XMM_STATE,
+        [
+            f32s([1.0, 2.0, 3.0, f32::NAN]),
+            f32s([4.0, 5.0, 6.0, f32::INFINITY]),
+        ]
+        .concat(),
+    ));
+    c_dp_nan.read.push((XMM_STATE, 16));
+
+    // 9. dpps signed-zero edge cases
+    let mut c_dp_z = Case::new(f_dpps_neg0);
+    c_dp_z.mem.push((
+        XMM_STATE,
+        [
+            f32s([-0.0, -0.0, -0.0, -0.0]),
+            f32s([1.0, 1.0, 1.0, 1.0]),
+            f32s([-0.0, f32::NAN, f32::INFINITY, -0.0]),
+            f32s([1.0, 0.0, 0.0, 1.0]),
+        ]
+        .concat(),
+    ));
+    c_dp_z.read.push((XMM_STATE, 16));
+    c_dp_z.read.push((XMM_STATE + 32, 16));
+
+    // 10. dppd with NaN in masked-out lane 1
+    let mut c_dppd = Case::new(f_dppd_edge);
+    c_dppd.mem.push((
+        XMM_STATE,
+        [f64s([2.5, f64::NAN]), f64s([4.0, f64::INFINITY])].concat(),
+    ));
+    c_dppd.read.push((XMM_STATE, 16));
+
+    // 11. movss, movsd, movq, vbroadcastss reg-reg
+    let mut c_mb = Case::new(f_mov_bcast);
+    c_mb.mem.push((
+        XMM_STATE,
+        [
+            i32s([1, 2, 3, 4]),             // xmm0
+            i32s([99, 88, 77, 66]),         // xmm1
+            xmm_bytes(0x1111, 0x2222),      // xmm2
+            xmm_bytes(0xAAAA, 0xBBBB),      // xmm3
+            xmm_bytes(0xFFFF, 0xEEEE),      // xmm4
+            xmm_bytes(0x1234, 0x5678),      // xmm5
+            i32s([0; 4]),                   // xmm6
+            i32s([0x5555_6666, 1, 2, 3]),   // xmm7
+        ]
+        .concat(),
+    ));
+    c_mb.read.push((XMM_STATE, 8 * 16));
+
+    let out = run(
+        &built,
+        &[
+            c_sswb, c_uswb, c_ssdw, c_usdw, c_dot, c_avgb, c_avgw, c_sh, c_al, c_dp_nan, c_dp_z,
+            c_dppd, c_mb,
+        ],
+    );
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+
+    // Check packsswb
+    let want_sswb: Vec<u8> = p_a16
+        .iter()
+        .chain(&p_b16)
+        .map(|&v| v.clamp(-128, 127) as i8 as u8)
+        .collect();
+    assert_eq!(out[0].mem[0], want_sswb, "packsswb");
+
+    // Check packuswb
+    let want_uswb: Vec<u8> = p_a16
+        .iter()
+        .chain(&p_b16)
+        .map(|&v| v.clamp(0, 255) as u8)
+        .collect();
+    assert_eq!(out[1].mem[0], want_uswb, "packuswb");
+
+    // Check packssdw
+    let want_ssdw: Vec<u8> = p_a32
+        .iter()
+        .chain(&p_b32)
+        .flat_map(|&v| (v.clamp(i16::MIN as i32, i16::MAX as i32) as i16).to_le_bytes())
+        .collect();
+    assert_eq!(out[2].mem[0], want_ssdw, "packssdw");
+
+    // Check packusdw
+    let want_usdw: Vec<u8> = p_a32
+        .iter()
+        .chain(&p_b32)
+        .flat_map(|&v| (v.clamp(0, u16::MAX as i32) as u16).to_le_bytes())
+        .collect();
+    assert_eq!(out[3].mem[0], want_usdw, "packusdw");
+
+    // Check pmaddwd
+    assert_eq!(
+        out[4].mem[0],
+        i32s([
+            i32::MIN,
+            32767 * 32767 + 32767 * -32768,
+            -100 * 3 + 200 * -4,
+            -1
+        ]),
+        "pmaddwd"
+    );
+
+    // Check pavgb
+    let want_avgb: Vec<u8> = ab_a
+        .iter()
+        .zip(&ab_b)
+        .map(|(&a, &b)| ((u16::from(a) + u16::from(b) + 1) >> 1) as u8)
+        .collect();
+    assert_eq!(out[5].mem[0], want_avgb, "pavgb");
+
+    // Check pavgw
+    let want_avgw: Vec<u8> = aw_a
+        .iter()
+        .zip(&aw_b)
+        .flat_map(|(&a, &b)| (((u32::from(a) + u32::from(b) + 1) >> 1) as u16).to_le_bytes())
+        .collect();
+    assert_eq!(out[6].mem[0], want_avgw, "pavgw");
+
+    // Check immediate shifts
+    assert_eq!(
+        out[7].mem[0][0..16],
+        u16s([0x1234, 0xABCD, 0, 0xFFFF, 1, 2, 3, 4]),
+        "psllw 0"
+    );
+    assert_eq!(
+        out[7].mem[0][16..32],
+        u16s([0x0F00, 0x000F, 0x0FFF, 0x0000, 0x0800, 0x07FF, 0x0123, 0]),
+        "psrlw 4"
+    );
+    assert_eq!(out[7].mem[0][32..48], vec![0u8; 16], "psllw 16");
+    assert_eq!(
+        out[7].mem[0][48..64],
+        i16s([-1, -1, 0, 0, 0, -1, 0, -1]),
+        "psraw 25"
+    );
+
+    // Check palignr
+    let mut cat = lo_b.clone();
+    cat.extend_from_slice(&hi_b);
+    assert_eq!(out[8].mem[0][0..16], lo_b, "palignr 0");
+    assert_eq!(out[8].mem[0][16..32], cat[5..21], "palignr 5");
+    assert_eq!(out[8].mem[0][32..48], hi_b, "palignr 16");
+    let mut want_20 = hi_b[4..16].to_vec();
+    want_20.extend_from_slice(&[0u8; 4]);
+    assert_eq!(out[8].mem[0][48..64], want_20, "palignr 20");
+    assert_eq!(out[8].mem[0][64..80], vec![0u8; 16], "palignr 32");
+
+    // Check dpps NaN-masked
+    assert_eq!(out[9].mem[0], f32s([32.0; 4]), "dpps 0x7F masks NaN/Inf");
+
+    // Check dpps -0.0 sign preservation
+    assert_eq!(
+        out[10].mem[0],
+        f32s([-0.0, 0.0, -0.0, 0.0]),
+        "dpps 0xF5 preserves -0.0 in masked-in lanes and +0.0 in masked-out lanes"
+    );
+    assert_eq!(
+        out[10].mem[1],
+        f32s([0.0; 4]),
+        "dpps 0x1F sums -0.0 with +0.0 -> +0.0"
+    );
+
+    // Check dppd NaN-masked
+    assert_eq!(out[11].mem[0], f64s([10.0, 0.0]), "dppd 0x11 masks NaN/Inf");
+
+    // Check movss/movsd/movq/vbroadcastss
+    assert_eq!(out[12].mem[0][0..16], i32s([99, 2, 3, 4]), "movss reg-reg");
+    assert_eq!(
+        out[12].mem[0][32..48],
+        xmm_bytes(0xAAAA, 0x2222),
+        "movsd reg-reg"
+    );
+    assert_eq!(
+        out[12].mem[0][64..80],
+        xmm_bytes(0x1234, 0),
+        "movq xmm, xmm"
+    );
+    assert_eq!(
+        out[12].mem[0][96..112],
+        i32s([0x5555_6666; 4]),
+        "vbroadcastss reg-reg"
+    );
+}

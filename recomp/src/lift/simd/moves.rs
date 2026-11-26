@@ -286,12 +286,16 @@ impl FunctionLifter<'_> {
     /// `movss`/`movsd` (lane type `I32`/`I64`): register merges keep the upper lanes of the
     /// first source, loads zero them, stores write the low lane only.
     fn move_scalar(&mut self, ins: &Instruction, e: Elem) -> R<()> {
+        let merge_idx: &[u32] = if e == Elem::I32 {
+            &[4, 1, 2, 3]
+        } else {
+            &[2, 1]
+        };
         if ins.op_count() == 3 {
             // vmovss xmm1, xmm2, xmm3
             let a = self.xget(ins.op_register(1), e)?;
             let b = self.xget(ins.op_register(2), e)?;
-            let b0 = self.extract(&b, e, 0);
-            let r = self.insert(&a, e, &b0, 0);
+            let r = self.shuffle(&a, &b, e, merge_idx);
             return self.xset(ins.op_register(0), &r, e);
         }
         match (ins.op_kind(0), ins.op_kind(1)) {
@@ -308,8 +312,7 @@ impl FunctionLifter<'_> {
             (OpKind::Register, OpKind::Register) => {
                 let a = self.xget(ins.op_register(0), e)?;
                 let b = self.xget(ins.op_register(1), e)?;
-                let b0 = self.extract(&b, e, 0);
-                let r = self.insert(&a, e, &b0, 0);
+                let r = self.shuffle(&a, &b, e, merge_idx);
                 self.xset(ins.op_register(0), &r, e)
             }
             _ => unsupported("movss/movsd operand form"),
@@ -321,16 +324,16 @@ impl FunctionLifter<'_> {
     fn move_gpr(&mut self, ins: &Instruction, bits: u32) -> R<()> {
         let dst_is_xmm = ins.op_kind(0) == OpKind::Register && ins.op_register(0).is_xmm();
         if dst_is_xmm {
-            let v = if ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_xmm() {
+            if ins.op_kind(1) == OpKind::Register && ins.op_register(1).is_xmm() {
                 let x = self.xget(ins.op_register(1), Elem::I64)?;
-                self.extract(&x, Elem::I64, 0)
+                let r = self.shuffle(&x, "zeroinitializer", Elem::I64, &[0, 2]);
+                return self.xset(ins.op_register(0), &r, Elem::I64);
+            }
+            let v = self.read_op(ins, 1, bits)?;
+            let v = if bits == 32 {
+                self.val(&format!("zext i32 {v} to i64"))
             } else {
-                let v = self.read_op(ins, 1, bits)?;
-                if bits == 32 {
-                    self.val(&format!("zext i32 {v} to i64"))
-                } else {
-                    v
-                }
+                v
             };
             let r = self.zext_lanes(&v, Elem::I64, 1);
             return self.xset(ins.op_register(0), &r, Elem::I64);
