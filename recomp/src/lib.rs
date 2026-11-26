@@ -6,6 +6,7 @@ pub mod code_image;
 pub mod discover;
 pub mod eh;
 pub mod image;
+pub mod jump_survey;
 mod jump_table;
 mod reach;
 pub mod lift;
