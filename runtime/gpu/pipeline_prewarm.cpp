@@ -2,8 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <set>
-#include <tuple>
+#include <unordered_set>
 
 namespace playgta6::gpu {
 
@@ -27,7 +26,72 @@ uint64_t hash_detail(const std::vector<uint8_t>& d) {
     }
     return h == 0 ? 1 : h;
 }
+
+struct ShaderTriple {
+    uint32_t kind;
+    uint64_t k0;
+    uint64_t k1;
+    bool operator==(const ShaderTriple& o) const noexcept {
+        return kind == o.kind && k0 == o.k0 && k1 == o.k1;
+    }
+};
+struct ShaderTripleHash {
+    size_t operator()(const ShaderTriple& t) const noexcept {
+        uint64_t h = t.k0 * 0x9E3779B97F4A7C15ull;
+        h ^= (t.k1 + 0x7F4A7C15ull + (h << 6) + (h >> 2));
+        return static_cast<size_t>(h ^ t.kind);
+    }
+};
+
+size_t latency_bucket_for_ns(uint64_t ns) noexcept {
+    if (ns < 1'000'000ull) return 0;
+    if (ns < 10'000'000ull) return 1;
+    if (ns < 50'000'000ull) return 2;
+    if (ns < 200'000'000ull) return 3;
+    return 4;
+}
 }  // namespace
+
+void PipelinePrewarm::adjust_state_counters(const Slot& s, State state, int32_t delta) noexcept {
+    const bool full = s.id.k2 != 0;
+    switch (state) {
+        case State::Queued:
+            queued_count_ = static_cast<uint32_t>(static_cast<int32_t>(queued_count_) + delta);
+            break;
+        case State::InFlight:
+            in_flight_ = static_cast<uint32_t>(static_cast<int32_t>(in_flight_) + delta);
+            break;
+        case State::Done:
+            done_count_ = static_cast<uint32_t>(static_cast<int32_t>(done_count_) + delta);
+            if (full) {
+                full_done_ = static_cast<uint32_t>(static_cast<int32_t>(full_done_) + delta);
+            } else {
+                mod_done_ = static_cast<uint32_t>(static_cast<int32_t>(mod_done_) + delta);
+            }
+            break;
+        case State::Used:
+            done_count_ = static_cast<uint32_t>(static_cast<int32_t>(done_count_) + delta);
+            if (full) {
+                full_used_ = static_cast<uint32_t>(static_cast<int32_t>(full_used_) + delta);
+            } else {
+                mod_used_ = static_cast<uint32_t>(static_cast<int32_t>(mod_used_) + delta);
+            }
+            break;
+        case State::Failed:
+            failed_count_ = static_cast<uint32_t>(static_cast<int32_t>(failed_count_) + delta);
+            break;
+        case State::Skipped:
+            skipped_count_ = static_cast<uint32_t>(static_cast<int32_t>(skipped_count_) + delta);
+            break;
+    }
+}
+
+void PipelinePrewarm::set_slot_state(Slot& s, State next) noexcept {
+    if (s.state == next) return;
+    adjust_state_counters(s, s.state, -1);
+    s.state = next;
+    adjust_state_counters(s, next, +1);
+}
 
 void PipelinePrewarm::set_pack_index(std::shared_ptr<const ShaderPackIndex> index) {
     std::lock_guard<std::mutex> lock(mu_);
@@ -87,18 +151,24 @@ bool PipelinePrewarm::load_warm_list(const uint8_t* data, size_t size, std::stri
         parsed.push_back(std::move(p));
     }
     std::lock_guard<std::mutex> lock(mu_);
+    slots_.reserve(slots_.size() + parsed.size());
+    by_identity_.reserve(by_identity_.size() + parsed.size());
     uint32_t added = 0;
     for (Parsed& p : parsed) {
         const Identity id = p.id;
         if (by_identity_.count(id) != 0) continue;
         const bool seen = observed_set_.count(id) != 0;
-        slots_.push_back({id, State::Queued, std::move(p.detail)});
+        const bool can_resolve = seen || resolvable(id);
+        const State initial_state = (seen || !can_resolve) ? State::Skipped : State::Queued;
+        slots_.push_back({id, initial_state, std::move(p.detail), false});
+        adjust_state_counters(slots_.back(), initial_state, +1);
         const uint32_t task = static_cast<uint32_t>(slots_.size());
         by_identity_.emplace(id, task);
-        if (seen || !resolvable(id)) {
-            slots_.back().state = State::Skipped;
+        if (!can_resolve) {
+            ++pack_skipped_;
             continue;
         }
+        if (seen) continue;
         queue_.push_back(task);
         ++added;
     }
@@ -110,21 +180,28 @@ std::vector<uint8_t> PipelinePrewarm::save_warm_list() const {
     std::lock_guard<std::mutex> lock(mu_);
     // A module-only entry is redundant when the list carries a full pipeline for the same shaders
     // (building the pipeline builds the modules).
-    std::set<std::tuple<uint32_t, uint64_t, uint64_t>> full;
+    std::unordered_set<ShaderTriple, ShaderTripleHash> full;
+    full.reserve(observed_.size());
     for (const Identity& id : observed_) {
-        if (id.k2 != 0) full.emplace(id.kind, id.k0, id.k1);
+        if (id.k2 != 0) full.insert(ShaderTriple{id.kind, id.k0, id.k1});
     }
     std::vector<size_t> keep;
     keep.reserve(observed_.size());
     bool any_detail = false;
+    size_t detail_bytes_total = 0;
     for (size_t i = 0; i < observed_.size(); ++i) {
         const Identity& id = observed_[i];
-        if (id.k2 == 0 && full.count({id.kind, id.k0, id.k1}) != 0) continue;
-        if (id.k2 != 0) any_detail = true;
+        if (id.k2 == 0 && full.find(ShaderTriple{id.kind, id.k0, id.k1}) != full.end()) continue;
+        if (id.k2 != 0) {
+            any_detail = true;
+            if (observed_detail_[i]) detail_bytes_total += observed_detail_[i]->size();
+        }
         keep.push_back(i);
     }
+    const size_t total_bytes =
+        kPrewarmListHeaderBytes + keep.size() * kPrewarmListEntryBytes + (any_detail ? detail_bytes_total : 0);
     std::vector<uint8_t> out;
-    out.reserve(kPrewarmListHeaderBytes + keep.size() * kPrewarmListEntryBytes);
+    out.reserve(total_bytes);
     out.push_back('P');
     out.push_back('G');
     out.push_back('6');
@@ -159,9 +236,10 @@ bool PipelinePrewarm::note_locked(const Identity& id, PrewarmDetail detail) {
     if (it != by_identity_.end()) {
         Slot& s = slots_[it->second - 1];
         if (s.state == State::Queued) {
-            s.state = State::Skipped;  // the title got there first; dropped from the queue on take()
+            set_slot_state(s, State::Skipped);  // the title got there first; dropped from the queue on take()
+            ++retired_queued_;
         } else if (s.state == State::Done) {
-            s.state = State::Used;  // built ahead of the title's first use
+            set_slot_state(s, State::Used);  // built ahead of the title's first use
         }
     }
     return true;
@@ -178,8 +256,9 @@ bool PipelinePrewarm::note_title_pipeline_full(uint32_t kind, uint64_t key0, uin
     if (detail.empty()) return note_title_pipeline(kind, key0, key1);
     if (key0 == 0 || kind > kPrewarmKindCompute || detail.size() > kPrewarmMaxDetailBytes) return false;
     const Identity id{kind, key0, key1, hash_detail(detail)};
-    auto d = std::make_shared<const std::vector<uint8_t>>(std::move(detail));
     std::lock_guard<std::mutex> lock(mu_);
+    if (observed_set_.find(id) != observed_set_.end()) return false;
+    auto d = std::make_shared<const std::vector<uint8_t>>(std::move(detail));
     return note_locked(id, std::move(d));
 }
 
@@ -196,18 +275,51 @@ PrewarmDetail PipelinePrewarm::detail_of(uint32_t task_id) const {
     return slots_[task_id - 1].detail;
 }
 
+bool PipelinePrewarm::enqueue_priority(uint32_t kind, uint64_t key0, uint64_t key1, std::vector<uint8_t> detail) {
+    if (key0 == 0 || kind > kPrewarmKindCompute || detail.size() > kPrewarmMaxDetailBytes) return false;
+    const uint64_t k2 = detail.empty() ? 0 : hash_detail(detail);
+    const Identity id{kind, key0, key1, k2};
+    std::lock_guard<std::mutex> lock(mu_);
+    if (observed_set_.find(id) != observed_set_.end()) return false;
+    auto it = by_identity_.find(id);
+    if (it != by_identity_.end()) {
+        const uint32_t task_id = it->second;
+        Slot& s = slots_[task_id - 1];
+        if (s.state != State::Queued) return false;
+        if (!s.in_priority) {
+            s.in_priority = true;
+            priority_queue_.push_back(task_id);
+            ++priority_queued_;
+        }
+        return true;
+    }
+    if (!resolvable(id) || slots_.size() >= kPrewarmMaxEntries) return false;
+    PrewarmDetail d =
+        detail.empty() ? nullptr : std::make_shared<const std::vector<uint8_t>>(std::move(detail));
+    slots_.push_back({id, State::Queued, std::move(d), true});
+    adjust_state_counters(slots_.back(), State::Queued, +1);
+    const uint32_t task_id = static_cast<uint32_t>(slots_.size());
+    by_identity_.emplace(id, task_id);
+    priority_queue_.push_back(task_id);
+    ++priority_queued_;
+    return true;
+}
+
 size_t PipelinePrewarm::take(PrewarmTask* out, size_t max) {
     std::lock_guard<std::mutex> lock(mu_);
     size_t n = 0;
-    while (n < max && in_flight_ < max_in_flight_ && !queue_.empty()) {
-        const uint32_t task = queue_.front();
-        queue_.pop_front();
-        Slot& s = slots_[task - 1];
-        if (s.state != State::Queued) continue;
-        s.state = State::InFlight;
-        ++in_flight_;
-        out[n++] = PrewarmTask{task, s.id.kind, s.id.k0, s.id.k1};
-    }
+    auto drain_queue = [&](std::deque<uint32_t>& q) {
+        while (n < max && in_flight_ < max_in_flight_ && !q.empty()) {
+            const uint32_t task = q.front();
+            q.pop_front();
+            Slot& s = slots_[task - 1];
+            if (s.state != State::Queued) continue;
+            set_slot_state(s, State::InFlight);
+            out[n++] = PrewarmTask{task, s.id.kind, s.id.k0, s.id.k1};
+        }
+    };
+    drain_queue(priority_queue_);
+    drain_queue(queue_);
     return n;
 }
 
@@ -216,10 +328,12 @@ bool PipelinePrewarm::complete(uint32_t id, bool ok, uint64_t build_ns) {
     if (id == 0 || id > slots_.size()) return false;
     Slot& s = slots_[id - 1];
     if (s.state != State::InFlight) return false;
-    s.state = !ok ? State::Failed : observed_set_.count(s.id) != 0 ? State::Used : State::Done;  // used while building
-    --in_flight_;
+    const State next = !ok ? State::Failed : (observed_set_.count(s.id) != 0 ? State::Used : State::Done);
+    set_slot_state(s, next);
     longest_ns_ = std::max(longest_ns_, build_ns);
     total_ns_ += build_ns;
+    ++builds_completed_;
+    ++latency_buckets_[latency_bucket_for_ns(build_ns)];
     return true;
 }
 
@@ -228,8 +342,8 @@ bool PipelinePrewarm::complete_lost(uint32_t id) {
     if (id == 0 || id > slots_.size()) return false;
     Slot& s = slots_[id - 1];
     if (s.state != State::InFlight) return false;
-    s.state = State::Skipped;
-    --in_flight_;
+    set_slot_state(s, State::Skipped);
+    ++races_lost_;
     return true;
 }
 
@@ -237,16 +351,11 @@ PrewarmProgress PipelinePrewarm::progress() const {
     std::lock_guard<std::mutex> lock(mu_);
     PrewarmProgress p;
     p.total = static_cast<uint32_t>(slots_.size());
-    for (const Slot& s : slots_) {
-        switch (s.state) {
-            case State::Queued: ++p.queued; break;
-            case State::InFlight: ++p.in_flight; break;
-            case State::Done:
-            case State::Used: ++p.done; break;
-            case State::Failed: ++p.failed; break;
-            case State::Skipped: ++p.skipped; break;
-        }
-    }
+    p.queued = queued_count_;
+    p.in_flight = in_flight_;
+    p.done = done_count_;
+    p.failed = failed_count_;
+    p.skipped = skipped_count_;
     p.observed = static_cast<uint32_t>(observed_.size());
     p.longest_ns = longest_ns_;
     p.total_ns = total_ns_;
@@ -256,25 +365,53 @@ PrewarmProgress PipelinePrewarm::progress() const {
 PrewarmUse PipelinePrewarm::use_stats() const {
     std::lock_guard<std::mutex> lock(mu_);
     PrewarmUse u;
-    for (const Slot& s : slots_) {
-        const bool full = s.id.k2 != 0;
-        if (s.state == State::Done) ++(full ? u.pipelines_wasted : u.wasted);
-        if (s.state == State::Used) ++(full ? u.pipelines_hit : u.hit);
-    }
-    u.prewarmed = u.hit + u.wasted;
-    u.pipelines_prewarmed = u.pipelines_hit + u.pipelines_wasted;
+    u.wasted = mod_done_;
+    u.hit = mod_used_;
+    u.prewarmed = mod_used_ + mod_done_;
+    u.pipelines_wasted = full_done_;
+    u.pipelines_hit = full_used_;
+    u.pipelines_prewarmed = full_used_ + full_done_;
     return u;
+}
+
+PrewarmDiagnostics PipelinePrewarm::diagnostics() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    PrewarmDiagnostics d;
+    d.races_lost = races_lost_;
+    d.retired_queued = retired_queued_;
+    d.pack_skipped = pack_skipped_;
+    d.priority_queued = priority_queued_;
+    d.builds_completed = builds_completed_;
+    d.avg_build_ns = builds_completed_ != 0 ? (total_ns_ / builds_completed_) : 0;
+    d.longest_build_ns = longest_ns_;
+    for (size_t i = 0; i < 5; ++i) d.latency_buckets[i] = latency_buckets_[i];
+    return d;
 }
 
 void PipelinePrewarm::reset() {
     std::lock_guard<std::mutex> lock(mu_);
     slots_.clear();
     by_identity_.clear();
+    priority_queue_.clear();
     queue_.clear();
     observed_.clear();
     observed_detail_.clear();
     observed_set_.clear();
+    queued_count_ = 0;
     in_flight_ = 0;
+    done_count_ = 0;
+    failed_count_ = 0;
+    skipped_count_ = 0;
+    mod_done_ = 0;
+    mod_used_ = 0;
+    full_done_ = 0;
+    full_used_ = 0;
+    races_lost_ = 0;
+    retired_queued_ = 0;
+    pack_skipped_ = 0;
+    priority_queued_ = 0;
+    builds_completed_ = 0;
+    for (size_t i = 0; i < 5; ++i) latency_buckets_[i] = 0;
     longest_ns_ = 0;
     total_ns_ = 0;
 }

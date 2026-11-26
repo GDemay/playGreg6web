@@ -1,19 +1,22 @@
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
 #include <cstdio>
 #include <cstring>
-#include <utility>
-#include <thread>
-#include <atomic>
-#include "gpu/shader_pack_index.h"
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "gpu/pipeline_prewarm.h"
 #include "gpu/pipeline_prewarm_host.h"
 #include "gpu/prewarm_pipeline_desc.h"
+#include "gpu/shader_pack_index.h"
 
 namespace {
 int g_failures = 0;
@@ -440,6 +443,264 @@ void test_host_builds_pipelines() {
     pipeline_prewarm().reset();
 }
 
+void test_priority_lane_and_promotion() {
+    PipelinePrewarm src;
+    src.note_title_pipeline(kPrewarmKindGraphics, 10, 11);
+    src.note_title_pipeline(kPrewarmKindGraphics, 20, 21);
+    src.note_title_pipeline_full(kPrewarmKindGraphics, 30, 31, blob(3));
+    src.note_title_pipeline(kPrewarmKindCompute, 40, 0);
+    const std::vector<uint8_t> bytes = src.save_warm_list();
+
+    PipelinePrewarm q;
+    q.set_max_in_flight(8);
+    CHECK(q.load_warm_list(bytes.data(), bytes.size(), nullptr));
+    CHECK(q.progress().queued == 4);
+
+    // Promote an already-queued full pipeline (30/31) ahead of 10/11 and 20/21.
+    CHECK(q.enqueue_priority(kPrewarmKindGraphics, 30, 31, blob(3)));
+    // Re-promoting while still queued succeeds without double-counting.
+    CHECK(q.enqueue_priority(kPrewarmKindGraphics, 30, 31, blob(3)));
+    // Insert a brand-new priority pipeline not in the warm list.
+    CHECK(q.enqueue_priority(kPrewarmKindCompute, 99, 0, blob(9, 12)));
+    CHECK(q.progress().total == 5 && q.progress().queued == 5);
+    CHECK(q.diagnostics().priority_queued == 2);
+
+    // Invalid inputs and already-observed pipelines are rejected.
+    CHECK(!q.enqueue_priority(kPrewarmKindGraphics, 0, 1));
+    CHECK(!q.enqueue_priority(9, 50, 0));
+    CHECK(q.note_title_pipeline(kPrewarmKindCompute, 88, 0));
+    CHECK(!q.enqueue_priority(kPrewarmKindCompute, 88, 0));
+
+    // Take drains priority lane first (30, 99), then normal queue (10, 20, 40), without duplicating 30.
+    PrewarmTask t[8];
+    CHECK(q.take(t, 8) == 5);
+    CHECK(t[0].key0 == 30 && t[1].key0 == 99 && t[2].key0 == 10 && t[3].key0 == 20 && t[4].key0 == 40);
+    CHECK(q.detail_of(t[0].id) != nullptr && *q.detail_of(t[0].id) == blob(3));
+    CHECK(q.detail_of(t[1].id) != nullptr && *q.detail_of(t[1].id) == blob(9, 12));
+    CHECK(q.take(t, 8) == 0);
+    CHECK(q.progress().queued == 0 && q.progress().in_flight == 5);
+
+    // Cannot promote a task that is already InFlight or Done.
+    CHECK(!q.enqueue_priority(kPrewarmKindGraphics, 30, 31, blob(3)));
+    CHECK(q.complete(t[0].id, true, 1000));
+    CHECK(!q.enqueue_priority(kPrewarmKindGraphics, 30, 31, blob(3)));
+
+    // Pack filter is respected for brand-new priority entries.
+    auto pack = std::make_shared<ShaderPackIndex>();
+    (*pack)[500] = PackStage::Compute;
+    q.set_pack_index(pack);
+    CHECK(!q.enqueue_priority(kPrewarmKindCompute, 501, 0));
+    CHECK(q.enqueue_priority(kPrewarmKindCompute, 500, 0));
+}
+
+void test_diagnostics_histogram_and_counters() {
+    auto pack = std::make_shared<ShaderPackIndex>();
+    for (uint64_t k = 1; k <= 7; ++k) (*pack)[k] = PackStage::Compute;
+
+    // 7 resolvable + 2 unresolvable entries.
+    auto bytes = make_list({{1, 1, 0}, {1, 2, 0}, {1, 3, 0}, {1, 4, 0}, {1, 5, 0}, {1, 6, 0}, {1, 7, 0},
+                            {1, 900, 0}, {1, 901, 0}});
+    pipeline_prewarm().reset();
+    pipeline_prewarm().set_pack_index(pack);
+    pipeline_prewarm().set_max_in_flight(8);
+    uint32_t added = 0;
+    CHECK(pipeline_prewarm().load_warm_list(bytes.data(), bytes.size(), nullptr, &added));
+    CHECK(added == 7);
+    CHECK(pipeline_prewarm().diagnostics().pack_skipped == 2);
+
+    // Title retires one queued entry before take().
+    CHECK(pipeline_prewarm().note_title_pipeline(kPrewarmKindCompute, 7, 0));
+    CHECK(pipeline_prewarm().diagnostics().retired_queued == 1);
+
+    // Promote one entry into priority lane.
+    CHECK(pipeline_prewarm().enqueue_priority(kPrewarmKindCompute, 6, 0));
+
+    PrewarmTask t[8];
+    CHECK(pipeline_prewarm().take(t, 8) == 6);
+    CHECK(t[0].key0 == 6);
+    // Complete 5 tasks across all 5 latency buckets, and lose the race on the 6th.
+    const uint64_t durs[5] = {500'000ull, 1'000'000ull, 10'000'000ull, 50'000'000ull, 250'000'000ull};
+    for (int i = 0; i < 5; ++i) {
+        CHECK(pipeline_prewarm().complete(t[i].id, true, durs[i]));
+    }
+    CHECK(pipeline_prewarm().complete_lost(t[5].id));
+
+    const PrewarmDiagnostics d = pipeline_prewarm().diagnostics();
+    CHECK(d.races_lost == 1);
+    CHECK(d.retired_queued == 1);
+    CHECK(d.pack_skipped == 2);
+    CHECK(d.priority_queued == 1);
+    CHECK(d.builds_completed == 5);
+    CHECK(d.longest_build_ns == 250'000'000ull);
+    CHECK(d.avg_build_ns == (500'000ull + 1'000'000ull + 10'000'000ull + 50'000'000ull + 250'000'000ull) / 5ull);
+    for (int i = 0; i < 5; ++i) CHECK(d.latency_buckets[i] == 1);
+
+    const std::string json = prewarm_host_report_json();
+    CHECK(json.find("\"queued_total\": 9") != std::string::npos);
+    CHECK(json.find("\"longest_build_ms\": 250") != std::string::npos);
+    CHECK(json.find("\"races_lost\": 1") != std::string::npos);
+    CHECK(json.find("\"retired_queued\": 1") != std::string::npos);
+    CHECK(json.find("\"pack_skipped\": 2") != std::string::npos);
+    CHECK(json.find("\"priority_queued\": 1") != std::string::npos);
+
+    pipeline_prewarm().set_pack_index(nullptr);
+    pipeline_prewarm().reset();
+}
+
+void test_duplicate_note_title_pipeline_full() {
+    PipelinePrewarm q;
+    CHECK(q.note_title_pipeline_full(kPrewarmKindGraphics, 100, 101, blob(5, 64)));
+    for (int i = 0; i < 10; ++i) {
+        CHECK(!q.note_title_pipeline_full(kPrewarmKindGraphics, 100, 101, blob(5, 64)));
+    }
+    CHECK(q.progress().observed == 1);
+    // Different detail for the same shader pair is distinct.
+    CHECK(q.note_title_pipeline_full(kPrewarmKindGraphics, 100, 101, blob(6, 64)));
+    CHECK(q.progress().observed == 2);
+}
+
+void test_host_stop_mid_queue_leaves_queued() {
+    auto bytes = make_list({{1, 1, 0}, {1, 2, 0}, {1, 3, 0}, {1, 4, 0}, {1, 5, 0}, {1, 6, 0}, {1, 7, 0}, {1, 8, 0}});
+    pipeline_prewarm().reset();
+    pipeline_prewarm().set_max_in_flight(8);
+    CHECK(pipeline_prewarm().load_warm_list(bytes.data(), bytes.size(), nullptr));
+
+    std::mutex m;
+    std::condition_variable cv;
+    bool task1_started = false;
+    bool allow_finish = false;
+    std::atomic<int> built_count{0};
+
+    prewarm_host_start({[] { return true; },
+                        [&](uint32_t, uint64_t, uint64_t) {
+                            const int idx = built_count.fetch_add(1);
+                            if (idx == 0) {
+                                std::unique_lock<std::mutex> lk(m);
+                                task1_started = true;
+                                cv.notify_all();
+                                cv.wait(lk, [&] { return allow_finish; });
+                            }
+                            return true;
+                        }});
+
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return task1_started; });
+    }
+    // Only the active task is InFlight; the other 7 remain Queued.
+    PrewarmProgress mid = pipeline_prewarm().progress();
+    CHECK(mid.in_flight == 1 && mid.queued == 7);
+
+    // Title can retire task 2 directly while task 1 is building.
+    CHECK(pipeline_prewarm().note_title_pipeline(kPrewarmKindCompute, 2, 0));
+    mid = pipeline_prewarm().progress();
+    CHECK(mid.in_flight == 1 && mid.queued == 6 && mid.skipped == 1);
+    CHECK(pipeline_prewarm().diagnostics().retired_queued == 1);
+
+    // Stop while task 1 is active, then unblock task 1 so the worker exits cleanly.
+    std::thread stopper([] { prewarm_host_stop(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    {
+        std::lock_guard<std::mutex> lk(m);
+        allow_finish = true;
+    }
+    cv.notify_all();
+    stopper.join();
+
+    const PrewarmProgress after = pipeline_prewarm().progress();
+    CHECK(built_count.load() == 1);
+    CHECK(after.in_flight == 0);
+    CHECK(after.done == 1 && after.skipped == 1 && after.queued == 6);
+
+    // Remaining 6 tasks are still claimable (not stranded in InFlight).
+    PrewarmTask rest[8];
+    CHECK(pipeline_prewarm().take(rest, 8) == 6);
+    CHECK(rest[0].key0 == 3 && rest[5].key0 == 8);
+    pipeline_prewarm().reset();
+}
+
+void test_v2_save_load_stress_256() {
+    namespace fs = std::filesystem;
+    PipelinePrewarm src;
+    for (uint32_t i = 1; i <= 256; ++i) {
+        if ((i % 4) == 0) {
+            CHECK(src.note_title_pipeline(kPrewarmKindCompute, i * 10ull, 0));
+        } else {
+            // Also record redundant module-only entry for half the full entries.
+            if ((i % 2) == 1) {
+                CHECK(src.note_title_pipeline(kPrewarmKindGraphics, i * 10ull, i * 10ull + 1));
+            }
+            CHECK(src.note_title_pipeline_full(kPrewarmKindGraphics, i * 10ull, i * 10ull + 1,
+                                               blob(static_cast<uint8_t>(i & 0xff), 16 + (i % 96))));
+        }
+    }
+    const std::vector<uint8_t> bytes = src.save_warm_list();
+    CHECK(bytes[4] == kPrewarmListVersionPipelines);
+
+    // Roundtrip through fast one-shot file read/write too.
+    const fs::path dir = fs::temp_directory_path() / "pg6_prewarm_stress_256";
+    fs::remove_all(dir);
+    const std::string path = (dir / "stress.pg6w").string();
+    CHECK(write_warm_list_file(path, bytes));
+    std::vector<uint8_t> disk_bytes;
+    CHECK(read_warm_list_file(path, &disk_bytes));
+    CHECK(disk_bytes == bytes);
+    fs::remove_all(dir);
+
+    PipelinePrewarm dst;
+    dst.set_max_in_flight(16);
+    std::string err;
+    uint32_t added = 0;
+    CHECK(dst.load_warm_list(disk_bytes.data(), disk_bytes.size(), &err, &added));
+    CHECK(added == 256);
+    CHECK(dst.progress().total == 256 && dst.progress().queued == 256);
+
+    uint32_t taken_total = 0;
+    uint32_t expected_full_hits = 0;
+    uint32_t expected_full_wasted = 0;
+    uint32_t expected_mod_hits = 0;
+    uint32_t expected_mod_wasted = 0;
+    PrewarmTask batch[16];
+    while (size_t n = dst.take(batch, 16)) {
+        for (size_t j = 0; j < n; ++j) {
+            ++taken_total;
+            const uint32_t i = taken_total;
+            CHECK(batch[j].key0 == i * 10ull);
+            const PrewarmDetail d = dst.detail_of(batch[j].id);
+            const bool is_mod = (i % 4) == 0;
+            if (is_mod) {
+                CHECK(d == nullptr);
+            } else {
+                CHECK(d != nullptr && *d == blob(static_cast<uint8_t>(i & 0xff), 16 + (i % 96)));
+            }
+            CHECK(dst.complete(batch[j].id, true, uint64_t{i} * 100'000ull));
+            if ((i % 3) == 0) {
+                CHECK(dst.note_task_used(batch[j].id));
+                if (is_mod) {
+                    ++expected_mod_hits;
+                } else {
+                    ++expected_full_hits;
+                }
+            } else {
+                if (is_mod) {
+                    ++expected_mod_wasted;
+                } else {
+                    ++expected_full_wasted;
+                }
+            }
+        }
+    }
+    CHECK(taken_total == 256);
+    const PrewarmProgress p = dst.progress();
+    CHECK(p.queued == 0 && p.in_flight == 0 && p.done == 256 && p.failed == 0 && p.skipped == 0);
+    const PrewarmUse u = dst.use_stats();
+    CHECK(u.hit == expected_mod_hits && u.wasted == expected_mod_wasted &&
+          u.prewarmed == expected_mod_hits + expected_mod_wasted);
+    CHECK(u.pipelines_hit == expected_full_hits && u.pipelines_wasted == expected_full_wasted &&
+          u.pipelines_prewarmed == expected_full_hits + expected_full_wasted);
+    CHECK(dst.diagnostics().builds_completed == 256);
+}
+
 }  // namespace
 
 int main() {
@@ -455,6 +716,11 @@ int main() {
     test_full_pipeline_counters();
     test_desc_codec();
     test_host_builds_pipelines();
+    test_priority_lane_and_promotion();
+    test_diagnostics_histogram_and_counters();
+    test_duplicate_note_title_pipeline_full();
+    test_host_stop_mid_queue_leaves_queued();
+    test_v2_save_load_stress_256();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pipeline_prewarm: %d failure(s)\n", g_failures);
         return 1;
