@@ -13,12 +13,14 @@
 //   pool -> worker
 //     { id, type, payload }        run job `id` with handler `type`
 //     { id, cancel: true }         cooperative cancel request for job `id`
+//     { __watchdogPing: true, pingId }  health watchdog ping
 //
 //   worker -> pool
 //     { id, ok: true,  result }    job finished
 //     { id, ok: false, error }     job threw; error = { name, message, stack, code? }
 //     { id, progress }             optional progress value (any cloneable)
 //     { id, cancelled: true }      acknowledgement of a cancel request
+//     { __watchdogPong: true, pingId }  health watchdog pong
 //
 //   Messages with an unknown, finished or duplicate id are ignored.
 //
@@ -49,6 +51,8 @@ export const DEFAULT_RESPAWN_BACKOFF_MAX_MS = 5000;
 export const DEFAULT_MAX_BOOT_RETRIES = 3;
 export const DEFAULT_BOOT_RETRY_BASE_DELAY_MS = 50;
 export const DEFAULT_BOOT_RETRY_MAX_DELAY_MS = 500;
+export const DEFAULT_WATCHDOG_INTERVAL_MS = 0;
+export const DEFAULT_STALL_TIMEOUT_MS = 5000;
 
 /** Base class for all errors raised by the pool itself. */
 export class WorkerPoolError extends Error {
@@ -100,6 +104,21 @@ export class WorkerCrashError extends WorkerPoolError {
     super(`Worker crashed: ${reason}`, 'WORKER_CRASH', cause === undefined ? undefined : { cause });
     this.name = 'WorkerCrashError';
     this.reason = reason;
+  }
+}
+
+/** A worker failed to respond to health watchdog heartbeats or report progress within the stall timeout. */
+export class WorkerStallError extends WorkerPoolError {
+  constructor(stallTimeoutMs, slotIndex, missedPings = 1) {
+    const slotLabel = Number.isInteger(slotIndex) ? `slot ${slotIndex}` : 'worker';
+    super(
+      `Worker ${slotLabel} stalled (no heartbeat or activity for ${stallTimeoutMs} ms)`,
+      'WORKER_STALL'
+    );
+    this.name = 'WorkerStallError';
+    this.stallTimeoutMs = stallTimeoutMs;
+    this.slotIndex = slotIndex;
+    this.missedPings = missedPings;
   }
 }
 
@@ -197,18 +216,42 @@ function jobHigherPriority(a, b) {
   return a.seq < b.seq;
 }
 
-/** Attach a listener to either a DOM-style or a Node-style worker. */
+/** Attach a listener to either a DOM-style or a Node-style worker and return an idempotent detach function. */
 function listen(target, event, handler) {
+  let active = true;
   if (typeof target.addEventListener === 'function') {
     target.addEventListener(event, handler);
+    return () => {
+      if (!active) return;
+      active = false;
+      if (typeof target.removeEventListener === 'function') {
+        try {
+          target.removeEventListener(event, handler);
+        } catch (_) {
+          // Ignore teardown listener removal errors.
+        }
+      }
+    };
   } else if (typeof target.on === 'function') {
     // Node worker_threads: message/error/exit hand over the raw value.
-    target.on(event, (value) => {
+    const wrapped = (value) => {
       if (event === 'message') handler({ data: value });
       else if (event === 'error') handler({ error: value, message: value && value.message });
       else handler({ code: value });
-    });
+    };
+    target.on(event, wrapped);
+    return () => {
+      if (!active) return;
+      active = false;
+      try {
+        if (typeof target.off === 'function') target.off(event, wrapped);
+        else if (typeof target.removeListener === 'function') target.removeListener(event, wrapped);
+      } catch (_) {
+        // Ignore teardown listener removal errors.
+      }
+    };
   }
+  return () => {};
 }
 
 function describeErrorEvent(ev) {
@@ -283,9 +326,15 @@ export class WorkerPool {
    * @param {number} [options.maxBootRetries=3] Max exponential-backoff retries on transient worker boot/startup failures (`0` disables).
    * @param {number} [options.bootRetryBaseDelayMs=50] Initial exponential backoff delay in ms for transient worker boot retries.
    * @param {number} [options.bootRetryMaxDelayMs=500] Upper bound in ms for transient worker boot retry backoff.
+   * @param {number} [options.watchdogIntervalMs=0] Health watchdog ping interval in ms (`0` disables).
+   * @param {number} [options.stallTimeoutMs=5000] Max time in ms without heartbeat pong or job activity before a worker is classified as stalled.
+   * @param {(info: object) => void} [options.onWorkerStall] Optional callback invoked when a worker stalls and is recycled.
+   * @param {(info: object) => void} [options.onWorkerCrash] Optional callback invoked when a worker crashes.
    * @param {() => number} [options.now] Clock in ms.
    * @param {Function} [options.setTimeout]
    * @param {Function} [options.clearTimeout]
+   * @param {Function} [options.setInterval]
+   * @param {Function} [options.clearInterval]
    */
   constructor(options = {}) {
     const {
@@ -311,9 +360,15 @@ export class WorkerPool {
       maxBootRetries = DEFAULT_MAX_BOOT_RETRIES,
       bootRetryBaseDelayMs = DEFAULT_BOOT_RETRY_BASE_DELAY_MS,
       bootRetryMaxDelayMs = DEFAULT_BOOT_RETRY_MAX_DELAY_MS,
+      watchdogIntervalMs = DEFAULT_WATCHDOG_INTERVAL_MS,
+      stallTimeoutMs = DEFAULT_STALL_TIMEOUT_MS,
+      onWorkerStall = null,
+      onWorkerCrash = null,
       now,
       setTimeout: setTimeoutFn,
       clearTimeout: clearTimeoutFn,
+      setInterval: setIntervalFn,
+      clearInterval: clearIntervalFn,
     } = options;
 
     if (typeof workerFactory !== 'function' && url === undefined) {
@@ -409,6 +464,38 @@ export class WorkerPool {
         `bootRetryMaxDelayMs must be a finite non-negative number, got ${bootRetryMaxDelayMs}`
       );
     }
+    if (
+      typeof watchdogIntervalMs !== 'number' ||
+      Number.isNaN(watchdogIntervalMs) ||
+      !Number.isFinite(watchdogIntervalMs) ||
+      watchdogIntervalMs < 0
+    ) {
+      throw new RangeError(
+        `watchdogIntervalMs must be a finite non-negative number, got ${watchdogIntervalMs}`
+      );
+    }
+    if (
+      typeof stallTimeoutMs !== 'number' ||
+      Number.isNaN(stallTimeoutMs) ||
+      !Number.isFinite(stallTimeoutMs) ||
+      stallTimeoutMs <= 0
+    ) {
+      throw new RangeError(
+        `stallTimeoutMs must be a finite positive number, got ${stallTimeoutMs}`
+      );
+    }
+    if (onWorkerStall !== null && onWorkerStall !== undefined && typeof onWorkerStall !== 'function') {
+      throw new TypeError('onWorkerStall must be a function or null');
+    }
+    if (onWorkerCrash !== null && onWorkerCrash !== undefined && typeof onWorkerCrash !== 'function') {
+      throw new TypeError('onWorkerCrash must be a function or null');
+    }
+    if (setIntervalFn !== undefined && typeof setIntervalFn !== 'function') {
+      throw new TypeError('setInterval must be a function');
+    }
+    if (clearIntervalFn !== undefined && typeof clearIntervalFn !== 'function') {
+      throw new TypeError('clearInterval must be a function');
+    }
 
     const breakerObj = breaker && typeof breaker === 'object' ? breaker : null;
     const breakerDisabled = breaker === false && maxConsecutiveCrashes === undefined;
@@ -436,11 +523,20 @@ export class WorkerPool {
     this._maxBootRetries = maxBootRetries;
     this._bootRetryBaseDelayMs = bootRetryBaseDelayMs;
     this._bootRetryMaxDelayMs = bootRetryMaxDelayMs;
+    this._watchdogIntervalMs = watchdogIntervalMs;
+    this._stallTimeoutMs = stallTimeoutMs;
+    this._onWorkerStallCallback = onWorkerStall || null;
+    this._onWorkerCrashCallback = onWorkerCrash || null;
     this._now =
       now ||
       (() => (typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now()));
     this._setTimeout = setTimeoutFn || ((fn, ms) => globalThis.setTimeout(fn, ms));
     this._clearTimeout = clearTimeoutFn || ((t) => globalThis.clearTimeout(t));
+    this._useTimeoutForWatchdog = !setIntervalFn && Boolean(setTimeoutFn);
+    this._setInterval = setIntervalFn || ((fn, ms) => globalThis.setInterval(fn, ms));
+    this._clearInterval = clearIntervalFn || ((t) => globalThis.clearInterval(t));
+    this._watchdogTimer = null;
+    this._nextPingId = 0;
 
     this._slots = new Set();
     this._slotRespawns = new Array(maxWorkers).fill(0);
@@ -486,11 +582,19 @@ export class WorkerPool {
       bootRetryCount: 0,
       bootRetrySuccessCount: 0,
       bootRetryExhaustedCount: 0,
+      stalledWorkers: 0,
+      watchdogRecycled: 0,
+      watchdogPingsSent: 0,
+      watchdogPongsReceived: 0,
     };
     this._waitTotal = 0;
     this._waitCount = 0;
     this._runTotal = 0;
     this._runCount = 0;
+
+    if (this._watchdogIntervalMs > 0) {
+      this._startWatchdog();
+    }
   }
 
   /**
@@ -722,6 +826,10 @@ export class WorkerPool {
       bootRetryCount: 0,
       bootRetrySuccessCount: 0,
       bootRetryExhaustedCount: 0,
+      stalledWorkers: 0,
+      watchdogRecycled: 0,
+      watchdogPingsSent: 0,
+      watchdogPongsReceived: 0,
     };
     this._waitTotal = 0;
     this._waitCount = 0;
@@ -772,6 +880,11 @@ export class WorkerPool {
       bootRetryCount: this._counters.bootRetryCount,
       bootRetrySuccessCount: this._counters.bootRetrySuccessCount,
       bootRetryExhaustedCount: this._counters.bootRetryExhaustedCount,
+      stalledWorkers: this._counters.stalledWorkers,
+      watchdogRecycled: this._counters.watchdogRecycled,
+      watchdogPingsSent: this._counters.watchdogPingsSent,
+      watchdogPongsReceived: this._counters.watchdogPongsReceived,
+      watchdogEnabled: this._watchdogIntervalMs > 0,
       avgWaitMs: this._waitCount ? this._waitTotal / this._waitCount : 0,
       avgRunMs,
       avgTaskMs: avgRunMs,
@@ -783,6 +896,65 @@ export class WorkerPool {
   /** Alias for `stats()`. */
   getStats() {
     return this.stats();
+  }
+
+  /**
+   * Returns a sanitized health snapshot with per-slot heartbeat/activity state,
+   * stall and crash counters, circuit-breaker state, active timer counts, and
+   * watchdog status. Never exposes raw worker handles or job payloads.
+   */
+  getHealthSnapshot() {
+    const now = this._now();
+    const slots = [];
+    for (const slot of this._slots) {
+      if (slot.dead) continue;
+      slots.push({
+        index: slot.index,
+        state: slot.state,
+        booted: slot.booted,
+        busy: slot.state !== 'idle',
+        jobId: slot.job ? slot.job.id : null,
+        jobsHandled: slot.jobsHandled,
+        spawnedAt: slot.spawnedAt,
+        lastActivityAt: slot.lastActivityAt,
+        idleForMs: Math.max(0, now - slot.lastActivityAt),
+        lastPingSentAt: slot.lastPingSentAt,
+        pendingPingId: slot.pendingPingId,
+        consecutiveMissedPings: slot.consecutiveMissedPings,
+        respawns: this._slotRespawns[slot.index],
+        crashStreak: this._slotCrashStreak[slot.index],
+      });
+    }
+    slots.sort((a, b) => a.index - b.index);
+    const activeTimers = this._countActiveTimers();
+    return {
+      healthy: !this._closed && !this._circuitOpen,
+      terminated: this._closed,
+      circuitOpen: this._circuitOpen,
+      circuitBreakerTrips: this._counters.circuitBreakerTrips,
+      crashed: this._counters.crashed,
+      stalledWorkers: this._counters.stalledWorkers,
+      watchdogRecycled: this._counters.watchdogRecycled,
+      watchdogPingsSent: this._counters.watchdogPingsSent,
+      watchdogPongsReceived: this._counters.watchdogPongsReceived,
+      watchdog: {
+        enabled: this._watchdogIntervalMs > 0,
+        active: this._watchdogTimer !== null,
+        intervalMs: this._watchdogIntervalMs,
+        stallTimeoutMs: this._stallTimeoutMs,
+        pingsSent: this._counters.watchdogPingsSent,
+        pongsReceived: this._counters.watchdogPongsReceived,
+        stalledWorkers: this._counters.stalledWorkers,
+        recycled: this._counters.watchdogRecycled,
+      },
+      activeTimers,
+      workers: slots.length,
+      maxWorkers: this._maxWorkers,
+      queuedTasks: this._queuedCount() + this._blocked.length,
+      running: this._running,
+      slots,
+      timestampMs: now,
+    };
   }
 
   // ---- internals ---------------------------------------------------------
@@ -902,6 +1074,7 @@ export class WorkerPool {
       job.signal.removeEventListener('abort', job.abortListener);
       job.abortListener = null;
     }
+    job.signal = null;
   }
 
   /**
@@ -997,12 +1170,171 @@ export class WorkerPool {
     if (slot.graceTimer !== null) this._clearTimeout(slot.graceTimer);
     slot.idleTimer = null;
     slot.graceTimer = null;
-    this._slots.delete(slot);
-    try {
-      slot.worker.terminate();
-    } catch (_) {
-      // Already gone.
+    slot.pendingPingId = null;
+    slot.job = null;
+    if (Array.isArray(slot._detachListeners)) {
+      const detachers = slot._detachListeners;
+      slot._detachListeners = [];
+      for (const detach of detachers) {
+        try {
+          detach();
+        } catch (_) {
+          // Ignore listener removal errors during teardown.
+        }
+      }
     }
+    this._slots.delete(slot);
+    const worker = slot.worker;
+    slot.worker = null;
+    if (worker) {
+      try {
+        worker.terminate();
+      } catch (_) {
+        // Already gone.
+      }
+    }
+  }
+
+  _countActiveTimers() {
+    let total = this._watchdogTimer !== null ? 1 : 0;
+    for (const slot of this._slots) {
+      if (slot.dead) continue;
+      if (slot.idleTimer !== null) total++;
+      if (slot.graceTimer !== null) total++;
+      if (slot.job && slot.job.timeoutTimer !== null) total++;
+    }
+    for (let i = 0; i < this._maxWorkers; i++) {
+      if (this._slotBackoffTimers[i] !== null) total++;
+      if (this._slotBootRetryTimers[i] !== null) total++;
+    }
+    return total;
+  }
+
+  _startWatchdog() {
+    if (this._watchdogIntervalMs <= 0 || this._watchdogTimer !== null || this._closed) return;
+    if (this._useTimeoutForWatchdog) {
+      const scheduleNext = () => {
+        if (this._closed && !(this._terminateState && this._terminateState.graceful)) {
+          this._watchdogTimer = null;
+          return;
+        }
+        this._watchdogTimer = this._setTimeout(() => {
+          this._watchdogTimer = null;
+          this._onWatchdogTick();
+          if (
+            this._watchdogIntervalMs > 0 &&
+            (!this._closed || (this._terminateState && this._terminateState.graceful))
+          ) {
+            scheduleNext();
+          }
+        }, this._watchdogIntervalMs);
+      };
+      scheduleNext();
+    } else {
+      this._watchdogTimer = this._setInterval(() => {
+        this._onWatchdogTick();
+      }, this._watchdogIntervalMs);
+    }
+  }
+
+  _stopWatchdog() {
+    if (this._watchdogTimer === null) return;
+    const timer = this._watchdogTimer;
+    this._watchdogTimer = null;
+    if (this._useTimeoutForWatchdog) {
+      this._clearTimeout(timer);
+    } else {
+      this._clearInterval(timer);
+    }
+  }
+
+  _onWatchdogTick() {
+    const canRunWhileClosed = Boolean(this._terminateState && this._terminateState.graceful);
+    if (this._closed && !canRunWhileClosed) {
+      this._stopWatchdog();
+      return;
+    }
+    const now = this._now();
+    for (const slot of [...this._slots]) {
+      if (slot.dead || !slot.worker) continue;
+      if (slot.pendingPingId !== null) {
+        slot.consecutiveMissedPings++;
+        const silentMs = Math.max(0, now - slot.lastActivityAt);
+        const pingWaitMs = Math.max(0, now - slot.lastPingSentAt);
+        if (silentMs >= this._stallTimeoutMs || pingWaitMs >= this._stallTimeoutMs) {
+          this._onWorkerStall(slot);
+        }
+      } else {
+        const pingId = ++this._nextPingId;
+        slot.pendingPingId = pingId;
+        slot.lastPingSentAt = now;
+        this._counters.watchdogPingsSent++;
+        try {
+          slot.worker.postMessage({ __watchdogPing: true, pingId });
+        } catch (_) {
+          slot.consecutiveMissedPings++;
+          this._onWorkerStall(slot);
+        }
+      }
+    }
+  }
+
+  _onWorkerStall(slot) {
+    if (slot.dead) return;
+    const now = this._now();
+    const slotIndex = slot.index;
+    const job = slot.job;
+    const state = slot.state;
+    const silentMs = Math.max(0, now - slot.lastActivityAt);
+    const missedPings = Math.max(1, slot.consecutiveMissedPings);
+    const stallError = new WorkerStallError(this._stallTimeoutMs, slotIndex, missedPings);
+
+    this._counters.stalledWorkers++;
+    this._counters.watchdogRecycled++;
+    this._counters.hardKills++;
+
+    if (this._onWorkerStallCallback) {
+      try {
+        this._onWorkerStallCallback({
+          slotIndex,
+          state,
+          jobId: job ? job.id : null,
+          jobType: job ? job.type : null,
+          stallTimeoutMs: this._stallTimeoutMs,
+          silentMs,
+          missedPings,
+          timestampMs: now,
+          error: stallError,
+        });
+      } catch (_) {
+        // Callback errors must never disrupt stall recovery.
+      }
+    }
+
+    this._slotNeedsRespawn[slotIndex] = true;
+    this._destroySlot(slot);
+
+    if (job && !job.settled) {
+      job.slot = null;
+      if (job.crashRetries < this._retries && job.transfer.length === 0 && !this._closed) {
+        this._running--;
+        job.state = 'queued';
+        if (job.timeoutTimer !== null) {
+          this._clearTimeout(job.timeoutTimer);
+          job.timeoutTimer = null;
+        }
+        job.crashRetries++;
+        this._counters.retried++;
+        this._enqueue(job);
+      } else {
+        this._settle(job, 'fail', stallError);
+      }
+    }
+
+    this._pump();
+    this._recordPeakQueueDepth();
+    this._ensureMinWorkers();
+    this._checkIdle();
   }
 
   _computeRespawnBackoffMs(streak) {
@@ -1227,6 +1559,22 @@ export class WorkerPool {
         this._slotRespawns[index]++;
       }
       this._recordCrash(crashErr);
+      if (this._onWorkerCrashCallback) {
+        try {
+          this._onWorkerCrashCallback({
+            slotIndex: index,
+            jobId: null,
+            jobType: null,
+            reason: crashErr.reason,
+            crashed: this._counters.crashed,
+            circuitOpen: this._circuitOpen,
+            timestampMs: this._now(),
+            error: crashErr,
+          });
+        } catch (_) {
+          // Callback errors must never disrupt pool recovery.
+        }
+      }
       if (isRespawn && this._slotRespawns[index] < this._maxRespawnsPerSlot) {
         this._slotCrashStreak[index]++;
         const delay = this._computeRespawnBackoffMs(this._slotCrashStreak[index]);
@@ -1243,6 +1591,7 @@ export class WorkerPool {
       this._counters.respawnedWorkers++;
     }
     const bootRetryAttempt = this._slotBootRetries[index];
+    const spawnedAt = this._now();
     const slot = {
       index,
       worker,
@@ -1257,17 +1606,25 @@ export class WorkerPool {
       booted: false,
       bootRetryAttempt,
       forWarm,
+      spawnedAt,
+      lastActivityAt: spawnedAt,
+      lastPingSentAt: 0,
+      pendingPingId: null,
+      consecutiveMissedPings: 0,
+      _detachListeners: [],
     };
     this._slots.add(slot);
-    listen(worker, 'message', (ev) => this._onMessage(slot, ev && ev.data));
-    listen(worker, 'error', (ev) =>
-      this._onCrash(slot, new WorkerCrashError(describeErrorEvent(ev), ev && ev.error), ev)
-    );
-    listen(worker, 'messageerror', () =>
-      this._onCrash(slot, new WorkerCrashError('messageerror: message could not be deserialised'))
-    );
-    listen(worker, 'exit', (ev) =>
-      this._onCrash(slot, new WorkerCrashError(`worker exited unexpectedly (code ${ev && ev.code})`))
+    slot._detachListeners.push(
+      listen(worker, 'message', (ev) => this._onMessage(slot, ev && ev.data)),
+      listen(worker, 'error', (ev) =>
+        this._onCrash(slot, new WorkerCrashError(describeErrorEvent(ev), ev && ev.error), ev)
+      ),
+      listen(worker, 'messageerror', () =>
+        this._onCrash(slot, new WorkerCrashError('messageerror: message could not be deserialised'))
+      ),
+      listen(worker, 'exit', (ev) =>
+        this._onCrash(slot, new WorkerCrashError(`worker exited unexpectedly (code ${ev && ev.code})`))
+      )
     );
     return slot;
   }
@@ -1440,13 +1797,28 @@ export class WorkerPool {
 
   _onMessage(slot, data) {
     if (slot.dead || data === null || typeof data !== 'object') return;
+    if (data.__watchdogPong === true) {
+      this._counters.watchdogPongsReceived++;
+      slot.lastActivityAt = this._now();
+      this._markSlotBooted(slot);
+      if (slot.pendingPingId !== null && (data.pingId === slot.pendingPingId || data.pingId === undefined)) {
+        slot.pendingPingId = null;
+        slot.consecutiveMissedPings = 0;
+      }
+      return;
+    }
     if (data.ready === true) {
+      slot.lastActivityAt = this._now();
+      slot.consecutiveMissedPings = 0;
       this._markSlotBooted(slot);
       return;
     }
     const id = data.id;
     if (slot.state === 'cancelling') {
       if (id === slot.cancelId && (data.cancelled === true || typeof data.ok === 'boolean')) {
+        slot.lastActivityAt = this._now();
+        slot.pendingPingId = null;
+        slot.consecutiveMissedPings = 0;
         this._markSlotBooted(slot);
         if (slot.graceTimer !== null) {
           this._clearTimeout(slot.graceTimer);
@@ -1459,19 +1831,31 @@ export class WorkerPool {
     const job = slot.job;
     if (!job || job.settled || job.id !== id) return;
     if (data.ok === true) {
+      slot.lastActivityAt = this._now();
+      slot.pendingPingId = null;
+      slot.consecutiveMissedPings = 0;
       this._markSlotBooted(slot);
       this._slotCrashStreak[slot.index] = 0;
       this._settle(job, 'ok', data.result);
       this._releaseSlot(slot);
     } else if (data.ok === false) {
+      slot.lastActivityAt = this._now();
+      slot.pendingPingId = null;
+      slot.consecutiveMissedPings = 0;
       this._markSlotBooted(slot);
       this._settle(job, 'fail', deserializeError(data.error));
       this._releaseSlot(slot);
     } else if (data.cancelled === true) {
+      slot.lastActivityAt = this._now();
+      slot.pendingPingId = null;
+      slot.consecutiveMissedPings = 0;
       this._markSlotBooted(slot);
       this._settle(job, 'cancel', new JobAbortedError('cancelled by worker'));
       this._releaseSlot(slot);
     } else if ('progress' in data) {
+      slot.lastActivityAt = this._now();
+      slot.pendingPingId = null;
+      slot.consecutiveMissedPings = 0;
       this._markSlotBooted(slot);
       if (job.onProgress) {
         try {
@@ -1568,6 +1952,22 @@ export class WorkerPool {
       }
     }
     this._checkBreaker();
+    if (this._onWorkerCrashCallback) {
+      try {
+        this._onWorkerCrashCallback({
+          slotIndex,
+          jobId: job ? job.id : null,
+          jobType: job ? job.type : null,
+          reason: error.reason || error.message,
+          crashed: this._counters.crashed,
+          circuitOpen: this._circuitOpen,
+          timestampMs: this._now(),
+          error,
+        });
+      } catch (_) {
+        // Callback errors must never disrupt pool recovery.
+      }
+    }
     this._pump();
     this._recordPeakQueueDepth();
     this._ensureMinWorkers();
@@ -1609,6 +2009,7 @@ export class WorkerPool {
 
   _finishImmediate() {
     const st = this._terminateState;
+    this._stopWatchdog();
     this._clearAllBackoffTimers();
     this._clearAllBootRetryTimers(true);
     const pending = [...this._drainQueued(), ...this._blocked];
@@ -1682,10 +2083,12 @@ export function serveWorkerPool(handlers, options = {}) {
       scope.postMessage(message, transfer && transfer.length ? transfer : []);
     } catch (err) {
       // e.g. DataCloneError on the result: report it as a job error instead.
-      try {
-        scope.postMessage({ id: message.id, ok: false, error: serializeError(err) }, []);
-      } catch (_) {
-        // Nothing more can be done.
+      if (message && message.id !== undefined) {
+        try {
+          scope.postMessage({ id: message.id, ok: false, error: serializeError(err) }, []);
+        } catch (_) {
+          // Nothing more can be done.
+        }
       }
     }
   }
@@ -1726,7 +2129,12 @@ export function serveWorkerPool(handlers, options = {}) {
 
   function onMessage(ev) {
     const data = ev && ev.data;
-    if (data === null || typeof data !== 'object' || data.id === undefined) return;
+    if (data === null || typeof data !== 'object') return;
+    if (data.__watchdogPing === true) {
+      post({ __watchdogPong: true, pingId: data.pingId });
+      return;
+    }
+    if (data.id === undefined) return;
     if (data.cancel === true) {
       const controller = active.get(data.id);
       if (controller) controller.abort();

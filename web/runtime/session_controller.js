@@ -37,6 +37,7 @@ export const SESSION_PHASE = Object.freeze({
 export const DEFAULT_STATUS_URL = '/api/status';
 export const DEFAULT_MAX_VALIDATION_ERRORS = 32;
 export const DEFAULT_MAX_TRANSITION_HISTORY = 64;
+export const DEFAULT_MAX_DEVICE_RECOVERIES = 3;
 
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_TRANSITION_REASON_LENGTH = 256;
@@ -578,6 +579,11 @@ export class RuntimeSessionController {
    * @param {EventTarget} [options.audioGestureTarget]
    * @param {Function|null} [options.onDeviceLost=null]
    * @param {Function|null} [options.onDeviceRecovered=null]
+   * @param {Function|null} [options.onDeviceRecovery=null]
+   * @param {Function|null} [options.recoverDevice=null]
+   * @param {number} [options.maxDeviceRecoveries=3]
+   * @param {boolean} [options.autoRecoverOnDeviceLost]
+   * @param {EventTarget|null} [options.visibilityTarget=null]
    * @param {Function|null} [options.onMemoryReclaim=null]
    */
   constructor(options = {}) {
@@ -604,14 +610,19 @@ export class RuntimeSessionController {
       hudIntervalMs,
       audioGestureTarget,
       wgpuWorker = null,
+      visibilityTarget = null,
       maxValidationErrors = DEFAULT_MAX_VALIDATION_ERRORS,
       maxTransitionHistory = DEFAULT_MAX_TRANSITION_HISTORY,
+      maxDeviceRecoveries = DEFAULT_MAX_DEVICE_RECOVERIES,
+      autoRecoverOnDeviceLost,
       onStatusUpdate = null,
       onTelemetry = null,
       onValidationError = null,
       onSplashFrame = null,
       onDeviceLost = null,
       onDeviceRecovered = null,
+      onDeviceRecovery = null,
+      recoverDevice = null,
       onMemoryReclaim = null,
     } = options;
 
@@ -646,6 +657,9 @@ export class RuntimeSessionController {
     if (wgpuWorker !== null && !isEventTargetLike(wgpuWorker)) {
       throw new TypeError('wgpuWorker must implement addEventListener/removeEventListener or be null');
     }
+    if (visibilityTarget !== null && !isEventTargetLike(visibilityTarget)) {
+      throw new TypeError('visibilityTarget must implement addEventListener/removeEventListener or be null');
+    }
     if (!Number.isInteger(maxValidationErrors) || maxValidationErrors < 1) {
       throw new RangeError(
         `maxValidationErrors must be a positive integer, got ${maxValidationErrors}`
@@ -654,6 +668,11 @@ export class RuntimeSessionController {
     if (!Number.isInteger(maxTransitionHistory) || maxTransitionHistory < 1) {
       throw new RangeError(
         `maxTransitionHistory must be a positive integer, got ${maxTransitionHistory}`
+      );
+    }
+    if (!Number.isInteger(maxDeviceRecoveries) || maxDeviceRecoveries < 0) {
+      throw new RangeError(
+        `maxDeviceRecoveries must be a non-negative integer, got ${maxDeviceRecoveries}`
       );
     }
     if (onStatusUpdate !== null && typeof onStatusUpdate !== 'function') {
@@ -673,6 +692,12 @@ export class RuntimeSessionController {
     }
     if (onDeviceRecovered !== null && typeof onDeviceRecovered !== 'function') {
       throw new TypeError('onDeviceRecovered must be a function or null');
+    }
+    if (onDeviceRecovery !== null && typeof onDeviceRecovery !== 'function') {
+      throw new TypeError('onDeviceRecovery must be a function or null');
+    }
+    if (recoverDevice !== null && typeof recoverDevice !== 'function') {
+      throw new TypeError('recoverDevice must be a function or null');
     }
     if (onMemoryReclaim !== null && typeof onMemoryReclaim !== 'function') {
       throw new TypeError('onMemoryReclaim must be a function or null');
@@ -696,6 +721,12 @@ export class RuntimeSessionController {
     this._wgpuWorker = wgpuWorker || null;
     this._maxValidationErrors = maxValidationErrors;
     this._maxTransitionHistory = maxTransitionHistory;
+    this._maxDeviceRecoveries = maxDeviceRecoveries;
+    this._recoverDeviceHook = recoverDevice || onDeviceRecovery || null;
+    this._autoRecoverOnDeviceLost =
+      autoRecoverOnDeviceLost !== undefined
+        ? Boolean(autoRecoverOnDeviceLost)
+        : Boolean(this._recoverDeviceHook);
 
     this._state = SESSION_STATE.IDLE;
     this._mode = SESSION_MODE.NONE;
@@ -725,8 +756,30 @@ export class RuntimeSessionController {
     this._lastDeviceLossReason = null;
     this._lastDeviceLossAtMs = null;
     this._lastDeviceRecoveredAtMs = null;
+    this._gpuDevice = null;
+    this._gpuDeviceGeneration = 0;
+    this._gpuDeviceAttachment = null;
+    this._lastRecordedLossGeneration = null;
+    this._consecutiveDeviceLosses = 0;
+    this._deviceRecoveryAttempts = 0;
+    this._deviceRecoveryInFlight = false;
+    this._deviceRecoveryPromise = null;
+    this._deviceRecoveryExhausted = false;
+    this._intentionalDeviceDestroy = false;
+    this._paused = false;
+    this._pausedAtMs = null;
+    this._pauseReason = null;
+    this._pauseCount = 0;
+    this._totalPausedMs = 0;
+    this._pausedByVisibility = false;
+    this._visibilityTarget = null;
+    this._visibilityDetach = null;
     this._cleanShutdownCount = 0;
     this._preloadBufferReleaseCount = 0;
+    this._sabReleaseCount = 0;
+    this._workerPools = new Set();
+    this._cleanupResources = new Map();
+    this._nextCleanupId = 1;
     this._stateDurationsMs = createEmptyStateDurations();
     this._stateEnteredAtMs = this._readNowMs();
     this._currentPhase = null;
@@ -791,6 +844,9 @@ export class RuntimeSessionController {
     }
     if (onMemoryReclaim) {
       this._reclaimHooks.add(onMemoryReclaim);
+    }
+    if (visibilityTarget) {
+      this.attachVisibilityTarget(visibilityTarget);
     }
   }
 
@@ -867,9 +923,19 @@ export class RuntimeSessionController {
     this._lastDeviceLossReason = null;
     this._lastDeviceLossAtMs = null;
     this._lastDeviceRecoveredAtMs = null;
+    this._lastRecordedLossGeneration = null;
+    this._consecutiveDeviceLosses = 0;
+    this._deviceRecoveryAttempts = 0;
+    this._deviceRecoveryExhausted = false;
     this._cleanShutdownCount = 0;
     this._preloadBufferReleaseCount = 0;
+    this._sabReleaseCount = 0;
+    this._pauseCount = 0;
+    this._totalPausedMs = 0;
     const nowMs = this._readNowMs();
+    if (this._paused) {
+      this._pausedAtMs = nowMs;
+    }
     this._stateDurationsMs = createEmptyStateDurations();
     this._stateEnteredAtMs = nowMs;
     this._phaseDurationsMs = createEmptyPhaseDurations();
@@ -887,6 +953,78 @@ export class RuntimeSessionController {
 
   isDestroyed() {
     return this._destroyed;
+  }
+
+  isPaused() {
+    return this._paused;
+  }
+
+  /**
+   * Returns a sanitized snapshot of WebGPU device health and bounded recovery state.
+   */
+  getDeviceHealth() {
+    return {
+      lost: this._deviceLost,
+      generation: this._gpuDeviceGeneration,
+      lossCount: this._deviceLossCount,
+      recoveryCount: this._deviceRecoveryCount,
+      consecutiveLosses: this._consecutiveDeviceLosses,
+      recoveryInFlight: this._deviceRecoveryInFlight,
+      maxRecoveries: this._maxDeviceRecoveries,
+      exhausted: this._deviceRecoveryExhausted,
+      lastLossReason: this._lastDeviceLossReason,
+      lastLossAtMs: this._lastDeviceLossAtMs,
+      lastRecoveredAtMs: this._lastDeviceRecoveredAtMs,
+    };
+  }
+
+  _computeTotalPausedMs(nowMs) {
+    let total = this._totalPausedMs;
+    if (this._paused && this._pausedAtMs !== null) {
+      const currentNow = this._resolveNowMs(nowMs);
+      total += Math.max(0, currentNow - this._pausedAtMs);
+    }
+    return total;
+  }
+
+  _computeActiveWorkerCount() {
+    let count = this._attachedWorkers.size;
+    for (const pool of this._workerPools) {
+      try {
+        const stats =
+          typeof pool.stats === 'function'
+            ? pool.stats()
+            : typeof pool.getStats === 'function'
+              ? pool.getStats()
+              : null;
+        if (stats && typeof stats.workers === 'number' && Number.isFinite(stats.workers)) {
+          count += Math.max(0, stats.workers);
+        }
+      } catch {
+        // Ignore pool stats read errors during diagnostics.
+      }
+    }
+    const handle = this._activeHandle;
+    if (handle && typeof handle === 'object') {
+      if (typeof handle.getWorkerCount === 'function') {
+        try {
+          const n = handle.getWorkerCount();
+          if (typeof n === 'number' && Number.isFinite(n)) {
+            count += Math.max(0, n);
+          }
+        } catch {
+          // Ignore handle worker count errors.
+        }
+      } else if (
+        typeof handle.activeWorkerCount === 'number' &&
+        Number.isFinite(handle.activeWorkerCount)
+      ) {
+        count += Math.max(0, handle.activeWorkerCount);
+      } else if (Array.isArray(handle.workers)) {
+        count += handle.workers.length;
+      }
+    }
+    return count;
   }
 
   getCurrentPhase() {
@@ -979,8 +1117,15 @@ export class RuntimeSessionController {
       lastDeviceLossReason: this._lastDeviceLossReason,
       lastDeviceLossAtMs: this._lastDeviceLossAtMs,
       lastDeviceRecoveredAtMs: this._lastDeviceRecoveredAtMs,
+      deviceHealth: this.getDeviceHealth(),
+      paused: this._paused,
+      pauseReason: this._pauseReason,
+      pauseCount: this._pauseCount,
+      totalPausedMs: this._computeTotalPausedMs(resolvedNow),
+      visibilityAttached: Boolean(this._visibilityDetach),
       cleanShutdownCount: this._cleanShutdownCount,
       preloadBufferReleaseCount: this._preloadBufferReleaseCount,
+      sabReleaseCount: this._sabReleaseCount,
       reclaimRuns: this._reclaimRuns,
       reclaimFailures: this._reclaimFailures,
       reclaimInFlight: Boolean(this._reclaimPromise),
@@ -992,6 +1137,9 @@ export class RuntimeSessionController {
       splashFrameErrorCount: this._splashFrameErrorCount,
       transitionCount: this._transitionSeq,
       attachedWorkerCount: this._attachedWorkers.size,
+      activeWorkerCount: this._computeActiveWorkerCount(),
+      registeredWorkerPoolCount: this._workerPools.size,
+      registeredCleanupCount: this._cleanupResources.size,
       activeListenerCount:
         this._stateListeners.size +
         this._statusListeners.size +
@@ -1280,8 +1428,18 @@ export class RuntimeSessionController {
       deviceLossCount: this._deviceLossCount,
       deviceRecoveryCount: this._deviceRecoveryCount,
       lastDeviceLossReason: this._lastDeviceLossReason,
+      deviceHealth: this.getDeviceHealth(),
+      paused: this._paused,
+      pauseReason: this._pauseReason,
+      pauseCount: this._pauseCount,
+      totalPausedMs: this._computeTotalPausedMs(resolvedNow),
+      visibilityAttached: Boolean(this._visibilityDetach),
+      activeWorkerCount: this._computeActiveWorkerCount(),
+      registeredWorkerPoolCount: this._workerPools.size,
+      registeredCleanupCount: this._cleanupResources.size,
       cleanShutdownCount: this._cleanShutdownCount,
       preloadBufferReleaseCount: this._preloadBufferReleaseCount,
+      sabReleaseCount: this._sabReleaseCount,
       reclaimRuns: this._reclaimRuns,
       reclaimFailures: this._reclaimFailures,
       reclaimInFlight: Boolean(this._reclaimPromise),
@@ -1937,6 +2095,38 @@ export class RuntimeSessionController {
         payload && typeof payload.timestampMs === 'number' && Number.isFinite(payload.timestampMs)
           ? payload.timestampMs
           : this._readNowMs();
+      const generation =
+        payload && isNonNegativeInt(payload.generation) && payload.generation > 0
+          ? payload.generation
+          : this._gpuDeviceGeneration;
+      const sanitizedMessage =
+        payload && typeof payload.message === 'string' && payload.message.trim().length > 0
+          ? sanitizeDiagnosticText(payload.message, MAX_TRANSITION_REASON_LENGTH)
+          : sanitizedReason;
+
+      // Deduplicate duplicate loss reports for the same explicit GPU device generation.
+      if (
+        payload &&
+        isNonNegativeInt(payload.generation) &&
+        payload.generation > 0 &&
+        this._lastRecordedLossGeneration === payload.generation
+      ) {
+        return {
+          handled: false,
+          duplicate: true,
+          type: 'gpu-device-lost',
+          reason: this._lastDeviceLossReason,
+          message: sanitizedMessage,
+          generation,
+          deviceLost: this._deviceLost,
+          deviceLossCount: this._deviceLossCount,
+          deviceRecoveryCount: this._deviceRecoveryCount,
+          timestampMs,
+        };
+      }
+      if (payload && isNonNegativeInt(payload.generation) && payload.generation > 0) {
+        this._lastRecordedLossGeneration = payload.generation;
+      }
 
       this._deviceLossCount += 1;
       this._deviceLost = true;
@@ -1948,6 +2138,8 @@ export class RuntimeSessionController {
       const eventPayload = {
         type: 'gpu-device-lost',
         reason: sanitizedReason,
+        message: sanitizedMessage,
+        generation,
         source,
         deviceLost: true,
         deviceLossCount: this._deviceLossCount,
@@ -2010,6 +2202,8 @@ export class RuntimeSessionController {
         handled: true,
         type: 'gpu-device-lost',
         reason: sanitizedReason,
+        message: sanitizedMessage,
+        generation,
         deviceLost: true,
         deviceLossCount: this._deviceLossCount,
         deviceRecoveryCount: this._deviceRecoveryCount,
@@ -2061,6 +2255,10 @@ export class RuntimeSessionController {
 
       this._deviceRecoveryCount += 1;
       this._deviceLost = false;
+      this._consecutiveDeviceLosses = 0;
+      this._deviceRecoveryInFlight = false;
+      this._deviceRecoveryExhausted = false;
+      this._lastRecordedLossGeneration = null;
       this._lastDeviceRecoveredAtMs = timestampMs;
 
       this._hudLog(
@@ -2071,6 +2269,7 @@ export class RuntimeSessionController {
       const eventPayload = {
         type: 'gpu-device-recovered',
         source,
+        generation: this._gpuDeviceGeneration,
         deviceLost: false,
         deviceLossCount: this._deviceLossCount,
         deviceRecoveryCount: this._deviceRecoveryCount,
@@ -2124,6 +2323,7 @@ export class RuntimeSessionController {
       return {
         handled: true,
         type: 'gpu-device-recovered',
+        generation: this._gpuDeviceGeneration,
         deviceLost: false,
         deviceLossCount: this._deviceLossCount,
         deviceRecoveryCount: this._deviceRecoveryCount,
@@ -2134,6 +2334,7 @@ export class RuntimeSessionController {
       return {
         handled: false,
         type: 'gpu-device-recovered',
+        generation: this._gpuDeviceGeneration,
         deviceLost: this._deviceLost,
         deviceLossCount: this._deviceLossCount,
         deviceRecoveryCount: this._deviceRecoveryCount,
@@ -2141,6 +2342,683 @@ export class RuntimeSessionController {
         timestampMs: this._readNowMs(),
       };
     }
+  }
+
+  /**
+   * Marks the WebGPU device as recovered, optionally attaching a replacement GPUDevice,
+   * clears consecutive loss state, and notifies observers. Never throws.
+   *
+   * @param {string|object|null|undefined} [info]
+   */
+  notifyDeviceRecovered(info) {
+    try {
+      if (info && typeof info === 'object' && info.device && typeof info.device === 'object') {
+        const attachOpts =
+          info.deviceOptions && typeof info.deviceOptions === 'object' ? info.deviceOptions : undefined;
+        this.attachGpuDevice(info.device, attachOpts);
+      }
+      return this.recordDeviceRecovered(info);
+    } catch {
+      return this.recordDeviceRecovered(null);
+    }
+  }
+
+  /**
+   * Attaches a WebGPU `GPUDevice`-like object and wires its `device.lost` promise safely
+   * (zero unhandled rejections, per-generation deduplication, intentional-destroy suppression,
+   * and bounded automatic recovery). Returns an idempotent detach function.
+   *
+   * @param {object} device
+   * @param {object} [options]
+   * @returns {() => void}
+   */
+  attachGpuDevice(device, options = {}) {
+    if (!device || typeof device !== 'object') {
+      throw new TypeError('attachGpuDevice requires a WebGPU GPUDevice-like object');
+    }
+    if (options !== undefined && options !== null && typeof options !== 'object') {
+      throw new TypeError('attachGpuDevice options must be an object');
+    }
+    const opts = options && typeof options === 'object' ? options : {};
+    if (
+      opts.maxRecoveries !== undefined &&
+      (!Number.isInteger(opts.maxRecoveries) || opts.maxRecoveries < 0)
+    ) {
+      throw new RangeError(`maxRecoveries must be a non-negative integer, got ${opts.maxRecoveries}`);
+    }
+    if (
+      opts.onDeviceRecovery !== undefined &&
+      opts.onDeviceRecovery !== null &&
+      typeof opts.onDeviceRecovery !== 'function'
+    ) {
+      throw new TypeError('onDeviceRecovery must be a function or null');
+    }
+    if (
+      opts.recoverDevice !== undefined &&
+      opts.recoverDevice !== null &&
+      typeof opts.recoverDevice !== 'function'
+    ) {
+      throw new TypeError('recoverDevice must be a function or null');
+    }
+    if (this._destroyed) {
+      return () => {};
+    }
+    if (
+      this._gpuDeviceAttachment &&
+      this._gpuDeviceAttachment.active &&
+      this._gpuDeviceAttachment.device === device
+    ) {
+      return this._gpuDeviceAttachment.detach;
+    }
+
+    this.detachGpuDevice();
+
+    this._gpuDeviceGeneration += 1;
+    const generation = this._gpuDeviceGeneration;
+    const resolvedRecoverHook = opts.recoverDevice || opts.onDeviceRecovery || null;
+    const attachment = {
+      device,
+      generation,
+      active: true,
+      handledLoss: false,
+      options: {
+        autoRecover:
+          opts.autoRecover !== undefined
+            ? Boolean(opts.autoRecover)
+            : opts.autoRecoverOnDeviceLost !== undefined
+              ? Boolean(opts.autoRecoverOnDeviceLost)
+              : resolvedRecoverHook
+                ? true
+                : undefined,
+        maxRecoveries: opts.maxRecoveries,
+        recoverDevice: resolvedRecoverHook,
+        label: typeof opts.label === 'string' ? sanitizeDiagnosticText(opts.label, 64) : null,
+      },
+      detach: null,
+    };
+
+    const detach = () => {
+      if (!attachment.active) return;
+      attachment.active = false;
+      if (this._gpuDeviceAttachment === attachment) {
+        this._gpuDeviceAttachment = null;
+        this._gpuDevice = null;
+      }
+    };
+    attachment.detach = detach;
+
+    this._gpuDevice = device;
+    this._gpuDeviceAttachment = attachment;
+
+    if (device.lost && typeof device.lost.then === 'function') {
+      Promise.resolve(device.lost).then(
+        (info) => {
+          this._handleGpuDeviceLost(attachment, info, null);
+        },
+        (err) => {
+          this._handleGpuDeviceLost(attachment, null, err);
+        }
+      );
+    }
+
+    return detach;
+  }
+
+  /**
+   * Detaches the currently attached WebGPU device so late `device.lost` resolutions
+   * from older device generations are ignored cleanly.
+   *
+   * @returns {boolean} True if an active device attachment was detached.
+   */
+  detachGpuDevice() {
+    if (!this._gpuDeviceAttachment) {
+      return false;
+    }
+    const attachment = this._gpuDeviceAttachment;
+    attachment.detach();
+    return true;
+  }
+
+  _handleGpuDeviceLost(attachment, info, rejectionErr) {
+    if (
+      !attachment ||
+      !attachment.active ||
+      this._gpuDeviceAttachment !== attachment ||
+      attachment.handledLoss ||
+      this._destroyed
+    ) {
+      return;
+    }
+    attachment.handledLoss = true;
+
+    const rawReason =
+      info && typeof info === 'object' && typeof info.reason === 'string'
+        ? info.reason.trim().toLowerCase()
+        : 'unknown';
+    const rawMessage =
+      info && typeof info === 'object' && typeof info.message === 'string'
+        ? info.message
+        : rejectionErr
+          ? toError(rejectionErr, 'WebGPU device lost').message
+          : '';
+
+    // Intentional teardown (device.destroy() or stop/restart/destroy) must never
+    // trigger spurious recovery loops or error transitions.
+    if (rawReason === 'destroyed' || this._intentionalDeviceDestroy) {
+      attachment.detach();
+      this._hudLog('[WebGPU device] Device destroyed intentionally; skipping recovery.', 'info');
+      return;
+    }
+
+    const sanitizedReason = sanitizeDiagnosticText(rawReason, 64) || 'unknown';
+    const sanitizedMessage = sanitizeDiagnosticText(rawMessage, MAX_TRANSITION_REASON_LENGTH);
+    const timestampMs = this._readNowMs();
+    const generation = attachment.generation;
+
+    this._consecutiveDeviceLosses += 1;
+
+    this.recordDeviceLost({
+      reason: sanitizedReason,
+      message: sanitizedMessage,
+      generation,
+      source: attachment.options.label || 'gpu_device',
+      timestampMs,
+    });
+
+    const maxRecoveries =
+      attachment.options.maxRecoveries !== undefined
+        ? attachment.options.maxRecoveries
+        : this._maxDeviceRecoveries;
+    const recoverHook = attachment.options.recoverDevice || this._recoverDeviceHook;
+    const shouldAutoRecover =
+      attachment.options.autoRecover !== undefined
+        ? attachment.options.autoRecover
+        : this._autoRecoverOnDeviceLost;
+
+    if (!shouldAutoRecover) {
+      return;
+    }
+
+    if (this._deviceRecoveryAttempts >= maxRecoveries) {
+      this._markDeviceRecoveryExhausted(sanitizedReason, sanitizedMessage, generation, maxRecoveries);
+      return;
+    }
+
+    if (this._deviceRecoveryInFlight) {
+      return;
+    }
+
+    this._deviceRecoveryAttempts += 1;
+    this._runDeviceRecovery({
+      reason: sanitizedReason,
+      message: sanitizedMessage,
+      generation,
+      attempt: this._deviceRecoveryAttempts,
+      maxRecoveries,
+      timestampMs,
+      recoverHook,
+      attachmentOptions: attachment.options,
+    });
+  }
+
+  _markDeviceRecoveryExhausted(reason, message, generation, maxRecoveries) {
+    this._deviceRecoveryExhausted = true;
+    this._deviceRecoveryInFlight = false;
+    const detailText = message && message !== reason ? `${reason}: ${message}` : reason;
+    const err = new Error(
+      `WebGPU device recovery exhausted after ${maxRecoveries} attempt${maxRecoveries === 1 ? '' : 's'} (${detailText})`
+    );
+    err.code = 'GPU_DEVICE_LOST_EXHAUSTED';
+    this._lastError = err;
+    this._diagnosticReasons = [err.message];
+    this._hudStatus('GPU device lost', 'error');
+    this._hudLog(err.message, 'error');
+    this._reportError(err, {
+      phase: 'runtime',
+      source: 'gpu_device',
+      category: 'webgpu_device_lost_exhausted',
+      reason,
+      generation,
+      maxRecoveries,
+      deviceLossCount: this._deviceLossCount,
+      consecutiveLosses: this._consecutiveDeviceLosses,
+    });
+    if (
+      !this._destroyed &&
+      this._state !== SESSION_STATE.ERROR &&
+      this._state !== SESSION_STATE.STOPPED
+    ) {
+      this._finalizeCurrentPhase();
+      this._transition(SESSION_STATE.ERROR, {
+        error: err,
+        reason: err.message,
+        reasons: [err.message],
+      });
+    }
+    this._emitStatusUpdate('gpu-device-lost-exhausted');
+  }
+
+  _runDeviceRecovery({
+    reason,
+    message,
+    generation,
+    attempt,
+    maxRecoveries,
+    timestampMs,
+    recoverHook,
+    attachmentOptions,
+  }) {
+    this._deviceRecoveryInFlight = true;
+    const run = async () => {
+      try {
+        if (this._destroyed) return;
+        if (typeof recoverHook === 'function') {
+          const result = await recoverHook({
+            reason,
+            message,
+            generation,
+            attempt,
+            maxRecoveries,
+            timestampMs,
+            controller: this,
+          });
+          if (this._destroyed) return;
+          if (result === false) {
+            throw new Error('Device recovery hook returned false');
+          }
+          if (
+            result &&
+            typeof result === 'object' &&
+            ('lost' in result || typeof result.destroy === 'function')
+          ) {
+            this.attachGpuDevice(result, attachmentOptions);
+            this.notifyDeviceRecovered({
+              reason: 'device-recreated',
+              source: attachmentOptions.label || 'gpu_device',
+            });
+          } else if (this._deviceLost) {
+            this.notifyDeviceRecovered({
+              reason: 'device-recovered',
+              source: attachmentOptions.label || 'gpu_device',
+            });
+          }
+        } else {
+          const restartRes = await this.restart({
+            preferSmoke: this._mode === SESSION_MODE.SMOKE,
+            _fromDeviceRecovery: true,
+          });
+          if (this._destroyed) return;
+          if (restartRes && restartRes.ok) {
+            this.notifyDeviceRecovered({
+              reason: 'session-restarted',
+              source: 'session_restart',
+            });
+          } else if (!(restartRes && restartRes.aborted)) {
+            throw toError(restartRes && restartRes.error, 'Session restart recovery failed');
+          }
+        }
+      } catch (err) {
+        if (this._destroyed) return;
+        const normalized = toError(err, 'WebGPU device recovery failed');
+        const sanitizedErrMsg =
+          sanitizeDiagnosticText(normalized.message) || 'WebGPU device recovery failed';
+        this._hudLog(`[WebGPU device-recovery] Attempt ${attempt}/${maxRecoveries} failed: ${sanitizedErrMsg}`, 'warn');
+        this._reportError(new Error(sanitizedErrMsg), {
+          phase: 'runtime',
+          source: 'gpu_device_recovery',
+          attempt,
+          maxRecoveries,
+          generation,
+        });
+        if (this._deviceRecoveryAttempts >= maxRecoveries) {
+          this._markDeviceRecoveryExhausted(reason, sanitizedErrMsg, generation, maxRecoveries);
+        }
+      } finally {
+        this._deviceRecoveryInFlight = false;
+      }
+    };
+
+    const promise = run().finally(() => {
+      if (this._deviceRecoveryPromise === promise) {
+        this._deviceRecoveryPromise = null;
+      }
+    });
+    this._deviceRecoveryPromise = promise;
+    return promise;
+  }
+
+  // --- Tab-Switch Pause / Resume Coordination ---
+
+  _invokePauseResume(target, methodName, arg, sourceName) {
+    if (!target || typeof target[methodName] !== 'function') {
+      return false;
+    }
+    try {
+      const result = arg !== undefined ? target[methodName](arg) : target[methodName]();
+      if (result && typeof result.then === 'function') {
+        result.catch((err) => {
+          this._reportError(toError(err, `Failed to ${methodName} ${sourceName}`), {
+            phase: methodName,
+            source: sourceName,
+          });
+        });
+      }
+      return true;
+    } catch (err) {
+      this._reportError(toError(err, `Failed to ${methodName} ${sourceName}`), {
+        phase: methodName,
+        source: sourceName,
+      });
+      return false;
+    }
+  }
+
+  /**
+   * Cleanly pauses the active runtime handle, audioEngine, inputBridge, and perfMonitor
+   * without corrupting session state transitions. Idempotent.
+   *
+   * @param {string} [reason='manual']
+   */
+  pause(reason = 'manual') {
+    const nowMs = this._readNowMs();
+    if (this._destroyed) {
+      return {
+        ok: false,
+        destroyed: true,
+        paused: false,
+        alreadyPaused: false,
+        pauseCount: this._pauseCount,
+        totalPausedMs: this._computeTotalPausedMs(nowMs),
+        timestampMs: nowMs,
+      };
+    }
+
+    const isRunning =
+      this._state === SESSION_STATE.RUNNING_WASM || this._state === SESSION_STATE.RUNNING_SMOKE;
+    if (!isRunning) {
+      return {
+        ok: false,
+        paused: false,
+        alreadyPaused: false,
+        state: this._state,
+        reason: 'Session is not running',
+        pauseCount: this._pauseCount,
+        totalPausedMs: this._computeTotalPausedMs(nowMs),
+        timestampMs: nowMs,
+      };
+    }
+
+    if (this._paused) {
+      return {
+        ok: true,
+        paused: true,
+        alreadyPaused: true,
+        reason: this._pauseReason,
+        pauseCount: this._pauseCount,
+        totalPausedMs: this._computeTotalPausedMs(nowMs),
+        timestampMs: nowMs,
+      };
+    }
+
+    const sanitizedReason =
+      sanitizeTransitionReason(typeof reason === 'string' ? reason : 'manual') || 'manual';
+
+    this._paused = true;
+    this._pausedAtMs = nowMs;
+    this._pauseReason = sanitizedReason;
+    this._pauseCount += 1;
+
+    if (this._activeHandle && typeof this._activeHandle === 'object') {
+      this._invokePauseResume(this._activeHandle, 'pause', sanitizedReason, 'runtimeHandle');
+    }
+    if (this._audioEngine) {
+      if (!this._invokePauseResume(this._audioEngine, 'pause', sanitizedReason, 'audioEngine')) {
+        this._invokePauseResume(this._audioEngine, 'suspend', undefined, 'audioEngine');
+      }
+    }
+    if (this._inputBridge) {
+      if (!this._invokePauseResume(this._inputBridge, 'pause', sanitizedReason, 'inputBridge')) {
+        this._invokePauseResume(this._inputBridge, 'setPaused', true, 'inputBridge');
+      }
+    }
+    if (this._perfMonitor) {
+      this._invokePauseResume(this._perfMonitor, 'pause', sanitizedReason, 'perfMonitor');
+    }
+
+    this._hudLog(`Session paused (${sanitizedReason}).`, 'info');
+    this._emitStatusUpdate('paused');
+
+    return {
+      ok: true,
+      paused: true,
+      alreadyPaused: false,
+      reason: sanitizedReason,
+      pauseCount: this._pauseCount,
+      totalPausedMs: this._computeTotalPausedMs(nowMs),
+      timestampMs: nowMs,
+    };
+  }
+
+  /**
+   * Cleanly resumes a paused session (perfMonitor, inputBridge, audioEngine, active handle)
+   * and accumulates `totalPausedMs`. Idempotent.
+   *
+   * @param {string} [reason='manual']
+   */
+  resume(reason = 'manual') {
+    const nowMs = this._readNowMs();
+    if (this._destroyed) {
+      return {
+        ok: false,
+        destroyed: true,
+        paused: false,
+        alreadyResumed: false,
+        pauseDurationMs: 0,
+        pauseCount: this._pauseCount,
+        totalPausedMs: this._computeTotalPausedMs(nowMs),
+        timestampMs: nowMs,
+      };
+    }
+
+    if (!this._paused) {
+      return {
+        ok: true,
+        paused: false,
+        alreadyResumed: true,
+        pauseDurationMs: 0,
+        pauseCount: this._pauseCount,
+        totalPausedMs: this._computeTotalPausedMs(nowMs),
+        timestampMs: nowMs,
+      };
+    }
+
+    const sanitizedReason =
+      sanitizeTransitionReason(typeof reason === 'string' ? reason : 'manual') || 'manual';
+    const pauseDurationMs =
+      this._pausedAtMs !== null ? Math.max(0, nowMs - this._pausedAtMs) : 0;
+
+    this._totalPausedMs += pauseDurationMs;
+    this._paused = false;
+    this._pausedAtMs = null;
+    this._pauseReason = null;
+    this._pausedByVisibility = false;
+
+    if (this._perfMonitor) {
+      this._invokePauseResume(this._perfMonitor, 'resume', sanitizedReason, 'perfMonitor');
+    }
+    if (this._inputBridge) {
+      if (!this._invokePauseResume(this._inputBridge, 'resume', sanitizedReason, 'inputBridge')) {
+        this._invokePauseResume(this._inputBridge, 'setPaused', false, 'inputBridge');
+      }
+    }
+    if (this._audioEngine) {
+      this._invokePauseResume(this._audioEngine, 'resume', sanitizedReason, 'audioEngine');
+    }
+    if (this._activeHandle && typeof this._activeHandle === 'object') {
+      this._invokePauseResume(this._activeHandle, 'resume', sanitizedReason, 'runtimeHandle');
+    }
+
+    this._hudLog(`Session resumed (${sanitizedReason}, paused ${pauseDurationMs} ms).`, 'info');
+    this._emitStatusUpdate('resumed');
+
+    return {
+      ok: true,
+      paused: false,
+      alreadyResumed: false,
+      reason: sanitizedReason,
+      pauseDurationMs,
+      pauseCount: this._pauseCount,
+      totalPausedMs: this._totalPausedMs,
+      timestampMs: nowMs,
+    };
+  }
+
+  /**
+   * Wires a Document-like `visibilitychange` EventTarget so tab switches automatically
+   * pause and resume the running session without leaking listeners. Detached on `destroy()`.
+   *
+   * @param {EventTarget & { hidden?: boolean, visibilityState?: string }} doc
+   * @returns {() => void} Idempotent detach function.
+   */
+  attachVisibilityTarget(doc) {
+    if (!isEventTargetLike(doc)) {
+      throw new TypeError(
+        'attachVisibilityTarget requires an EventTarget-like document with addEventListener/removeEventListener'
+      );
+    }
+    if (this._destroyed) {
+      return () => {};
+    }
+    if (this._visibilityTarget === doc && this._visibilityDetach) {
+      return this._visibilityDetach;
+    }
+
+    this.detachVisibilityTarget();
+
+    const onVisibilityChange = () => {
+      if (this._destroyed) return;
+      const isHidden =
+        doc.hidden === true ||
+        (typeof doc.visibilityState === 'string' &&
+          doc.visibilityState.trim().toLowerCase() === 'hidden');
+      if (isHidden) {
+        if (
+          !this._paused &&
+          (this._state === SESSION_STATE.RUNNING_WASM ||
+            this._state === SESSION_STATE.RUNNING_SMOKE)
+        ) {
+          this._pausedByVisibility = true;
+          this.pause('visibilitychange:hidden');
+        }
+      } else if (this._paused && this._pausedByVisibility) {
+        this.resume('visibilitychange:visible');
+      }
+    };
+
+    doc.addEventListener('visibilitychange', onVisibilityChange);
+
+    let active = true;
+    const detach = () => {
+      if (!active) return;
+      active = false;
+      if (this._visibilityTarget === doc) {
+        this._visibilityTarget = null;
+        this._visibilityDetach = null;
+      }
+      try {
+        doc.removeEventListener('visibilitychange', onVisibilityChange);
+      } catch {
+        // Ignore listener removal errors during teardown.
+      }
+    };
+
+    this._visibilityTarget = doc;
+    this._visibilityDetach = detach;
+    return detach;
+  }
+
+  /**
+   * Detaches the currently attached `visibilitychange` target, if any.
+   *
+   * @returns {boolean} True if a visibility listener was detached.
+   */
+  detachVisibilityTarget() {
+    if (!this._visibilityDetach) {
+      return false;
+    }
+    const detach = this._visibilityDetach;
+    detach();
+    return true;
+  }
+
+  // --- Owned Worker Pool & SAB / Cleanup Resource Tracking (#1077) ---
+
+  /**
+   * Registers a cleanup callback (e.g. SharedArrayBuffer release, pthread pool handle,
+   * timer or listener cleanup) that is deterministically executed and cleared on
+   * `stop()`, `restart()`, and `destroy()`. Returns an idempotent unregister function.
+   *
+   * @param {string} name
+   * @param {() => (void | Promise<void>)} cleanupFn
+   * @param {{ sab?: boolean }} [options]
+   * @returns {() => void}
+   */
+  registerCleanupResource(name, cleanupFn, options = {}) {
+    if (typeof name !== 'string' || name.trim().length === 0) {
+      throw new TypeError('registerCleanupResource requires a non-empty resource name');
+    }
+    if (typeof cleanupFn !== 'function') {
+      throw new TypeError('registerCleanupResource requires a cleanup function');
+    }
+    if (this._destroyed) {
+      return () => {};
+    }
+    const id = this._nextCleanupId++;
+    const sanitizedName = sanitizeDiagnosticText(name, 96) || `resource-${id}`;
+    const isSab = Boolean(
+      (options && options.sab === true) || /sab|shared.?array|buffer/i.test(sanitizedName)
+    );
+    const entry = { id, name: sanitizedName, cleanupFn, isSab };
+    this._cleanupResources.set(id, entry);
+
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._cleanupResources.delete(id);
+    };
+  }
+
+  /**
+   * Registers an owned `WorkerPool` (or compatible object exposing `terminate`/`destroy`/`terminateAll`)
+   * so `stop()`, `restart()`, and `destroy()` deterministically terminate all its workers
+   * and report its live worker count in `getDiagnostics().activeWorkerCount`.
+   *
+   * @param {object} pool
+   * @returns {() => void}
+   */
+  registerWorkerPool(pool) {
+    if (
+      !pool ||
+      typeof pool !== 'object' ||
+      (typeof pool.terminate !== 'function' &&
+        typeof pool.destroy !== 'function' &&
+        typeof pool.terminateAll !== 'function')
+    ) {
+      throw new TypeError(
+        'registerWorkerPool requires a WorkerPool-like object with terminate(), destroy(), or terminateAll()'
+      );
+    }
+    if (this._destroyed) {
+      return () => {};
+    }
+    this._workerPools.add(pool);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this._workerPools.delete(pool);
+    };
   }
 
   _resetSessionPhases(enterBoot = false) {
@@ -2571,6 +3449,7 @@ export class RuntimeSessionController {
     if (!handle) {
       return true;
     }
+    let clean = true;
     try {
       if (typeof handle === 'function') {
         await handle();
@@ -2583,12 +3462,107 @@ export class RuntimeSessionController {
       } else if (typeof handle.terminate === 'function') {
         await handle.terminate();
       }
-      return true;
     } catch (err) {
+      clean = false;
       const normalized = toError(err, 'Failed to stop active runtime handle');
       this._reportError(normalized, { phase: 'stop', source: 'runtimeHandle' });
       this._hudLog(`Runtime stop warning: ${normalized.message}`, 'warn');
-      return false;
+    }
+
+    if (handle && typeof handle === 'object') {
+      if (typeof handle.terminateWorkers === 'function') {
+        try {
+          await handle.terminateWorkers();
+        } catch (err) {
+          clean = false;
+          const normalized = toError(err, 'Failed to terminate runtime handle workers');
+          this._reportError(normalized, { phase: 'stop', source: 'runtimeWorkers' });
+          this._hudLog(`Worker termination warning: ${normalized.message}`, 'warn');
+        }
+      }
+
+      const releaseBufFn =
+        typeof handle.releaseBuffers === 'function'
+          ? handle.releaseBuffers
+          : typeof handle.releaseSharedBuffers === 'function'
+            ? handle.releaseSharedBuffers
+            : null;
+      if (releaseBufFn) {
+        this._sabReleaseCount += 1;
+        try {
+          await releaseBufFn.call(handle);
+        } catch (err) {
+          clean = false;
+          const normalized = toError(err, 'Failed to release runtime shared buffers');
+          this._reportError(normalized, { phase: 'stop', source: 'runtimeBuffers' });
+          this._hudLog(`Shared buffer release warning: ${normalized.message}`, 'warn');
+        }
+      }
+    }
+
+    return clean;
+  }
+
+  async _teardownOwnedResources() {
+    let clean = true;
+
+    this.detachGpuDevice();
+
+    if (this._workerPools.size > 0) {
+      const pools = [...this._workerPools];
+      this._workerPools.clear();
+      for (const pool of pools) {
+        try {
+          if (typeof pool.terminate === 'function') {
+            await pool.terminate();
+          } else if (typeof pool.destroy === 'function') {
+            await pool.destroy();
+          } else if (typeof pool.terminateAll === 'function') {
+            await pool.terminateAll();
+          }
+        } catch (err) {
+          clean = false;
+          this._reportError(toError(err, 'Failed to terminate registered WorkerPool'), {
+            phase: 'stop',
+            source: 'workerPool',
+          });
+        }
+      }
+    }
+
+    if (this._cleanupResources.size > 0) {
+      const entries = [...this._cleanupResources.values()];
+      this._cleanupResources.clear();
+      for (const entry of entries) {
+        if (entry.isSab) {
+          this._sabReleaseCount += 1;
+        }
+        try {
+          await entry.cleanupFn();
+        } catch (err) {
+          clean = false;
+          this._reportError(toError(err, `Failed to clean up resource ${entry.name}`), {
+            phase: 'stop',
+            source: 'cleanupResource',
+            resource: entry.name,
+          });
+        }
+      }
+    }
+
+    return clean;
+  }
+
+  _finalizePauseOnStop() {
+    if (this._paused) {
+      if (this._pausedAtMs !== null) {
+        const elapsedMs = Math.max(0, this._readNowMs() - this._pausedAtMs);
+        this._totalPausedMs += elapsedMs;
+      }
+      this._paused = false;
+      this._pausedAtMs = null;
+      this._pauseReason = null;
+      this._pausedByVisibility = false;
     }
   }
 
@@ -2778,6 +3752,17 @@ export class RuntimeSessionController {
     ) {
       this.attachWorker(this._activeHandle.wgpuWorker);
     }
+
+    // 5. Auto-attach handle.gpuDevice (if exposed with a WebGPU `lost` promise).
+    if (
+      this._activeHandle &&
+      typeof this._activeHandle === 'object' &&
+      this._activeHandle.gpuDevice &&
+      typeof this._activeHandle.gpuDevice === 'object' &&
+      this._activeHandle.gpuDevice.lost
+    ) {
+      this.attachGpuDevice(this._activeHandle.gpuDevice);
+    }
   }
 
   // --- Environment Probing ---
@@ -2914,6 +3899,7 @@ export class RuntimeSessionController {
 
   async _startTracked(options = {}) {
     const preferSmoke = Boolean(options && options.preferSmoke);
+    const fromDeviceRecovery = Boolean(options && options._fromDeviceRecovery);
 
     if (this._destroyed) {
       return {
@@ -2954,7 +3940,7 @@ export class RuntimeSessionController {
     }
 
     const token = ++this._sessionToken;
-    const promise = this._startInternal({ preferSmoke, token }).finally(() => {
+    const promise = this._startInternal({ preferSmoke, fromDeviceRecovery, token }).finally(() => {
       if (this._startPromise === promise) {
         this._startPromise = null;
       }
@@ -2963,7 +3949,7 @@ export class RuntimeSessionController {
     return promise;
   }
 
-  async _startInternal({ preferSmoke, token }) {
+  async _startInternal({ preferSmoke, fromDeviceRecovery = false, token }) {
     this._lastError = null;
     this._diagnosticReasons = [];
     this._fallbackReason = null;
@@ -2971,6 +3957,16 @@ export class RuntimeSessionController {
     this._bootMode = BOOT_MODE.IDLE;
     this._startedAtMs = null;
     this._deviceLost = false;
+    this._paused = false;
+    this._pausedAtMs = null;
+    this._pauseReason = null;
+    this._pausedByVisibility = false;
+    if (!fromDeviceRecovery) {
+      this._deviceRecoveryAttempts = 0;
+      this._consecutiveDeviceLosses = 0;
+      this._deviceRecoveryExhausted = false;
+      this._lastRecordedLossGeneration = null;
+    }
 
     this._validationErrorCount = 0;
     this._validationErrorSeq = 0;
@@ -3255,6 +4251,24 @@ export class RuntimeSessionController {
         }
         return this.requestMemoryReclaim(reason);
       },
+      attachGpuDevice: (device, deviceOpts) => {
+        if (token !== this._sessionToken || this._destroyed) {
+          return () => {};
+        }
+        return this.attachGpuDevice(device, deviceOpts);
+      },
+      registerWorkerPool: (pool) => {
+        if (token !== this._sessionToken || this._destroyed) {
+          return () => {};
+        }
+        return this.registerWorkerPool(pool);
+      },
+      registerCleanupResource: (name, cleanupFn, resourceOpts) => {
+        if (token !== this._sessionToken || this._destroyed) {
+          return () => {};
+        }
+        return this.registerCleanupResource(name, cleanupFn, resourceOpts);
+      },
     };
 
     const launcher =
@@ -3354,11 +4368,17 @@ export class RuntimeSessionController {
       this._wireSubsystems();
     } catch (err) {
       const normalized = toError(err, 'Failed to wire runtime subsystems');
-      this._teardownSubsystems();
-      const handleToStop = this._activeHandle;
-      this._activeHandle = null;
-      await this._stopHandle(handleToStop);
-      this._releasePreloadBuffers(handleToStop);
+      this._intentionalDeviceDestroy = true;
+      try {
+        this._teardownSubsystems();
+        await this._teardownOwnedResources();
+        const handleToStop = this._activeHandle;
+        this._activeHandle = null;
+        await this._stopHandle(handleToStop);
+        this._releasePreloadBuffers(handleToStop);
+      } finally {
+        this._intentionalDeviceDestroy = false;
+      }
 
       this._lastError = normalized;
       this._diagnosticReasons = [normalized.message];
@@ -3469,9 +4489,20 @@ export class RuntimeSessionController {
       this._state === SESSION_STATE.STOPPED && !hadInFlightStart && !handleToStop;
 
     const runStop = async () => {
-      const subsystemsClean = this._teardownSubsystems();
-      const handleClean = await this._stopHandle(handleToStop);
-      const buffersClean = wasAlreadyStopped ? true : this._releasePreloadBuffers(handleToStop);
+      this._finalizePauseOnStop();
+      this._intentionalDeviceDestroy = true;
+      let subsystemsClean = true;
+      let ownedClean = true;
+      let handleClean = true;
+      let buffersClean = true;
+      try {
+        subsystemsClean = this._teardownSubsystems();
+        ownedClean = await this._teardownOwnedResources();
+        handleClean = await this._stopHandle(handleToStop);
+        buffersClean = wasAlreadyStopped ? true : this._releasePreloadBuffers(handleToStop);
+      } finally {
+        this._intentionalDeviceDestroy = false;
+      }
 
       this._mode = SESSION_MODE.NONE;
       this._bootMode = BOOT_MODE.IDLE;
@@ -3492,7 +4523,7 @@ export class RuntimeSessionController {
         };
       }
 
-      if (subsystemsClean && handleClean && buffersClean) {
+      if (subsystemsClean && ownedClean && handleClean && buffersClean) {
         this._cleanShutdownCount += 1;
       }
 
@@ -3627,6 +4658,7 @@ export class RuntimeSessionController {
     this._externalStopToken += 1;
 
     const runDestroy = async () => {
+      this.detachVisibilityTarget();
       const stopResult = await this._stopInternal();
       if (stopResult.alreadyStopped) {
         this._releasePreloadBuffers(null);
@@ -3641,11 +4673,17 @@ export class RuntimeSessionController {
       this._deviceRecoveredListeners.clear();
       this._reclaimHooks.clear();
       this._sessionReclaimUnregisters.clear();
+      this._workerPools.clear();
+      this._cleanupResources.clear();
 
       this._recentValidationErrors.length = 0;
       this._lastSplashFrame = null;
       this._bootOrchestrator = null;
       this._wgpuWorker = null;
+      this._gpuDevice = null;
+      this._gpuDeviceAttachment = null;
+      this._recoverDeviceHook = null;
+      this._visibilityTarget = null;
       this._audioGestureTarget = undefined;
 
       return {
