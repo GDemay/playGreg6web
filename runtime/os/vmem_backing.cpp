@@ -592,13 +592,13 @@ bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, ui
 
 // Peek mode: GetWriteWatch without RESET over the range (no page protection change, no TLB
 // flush) reports the bits nobody has collected yet; those count as written. When there are some and
-// the reservation was last collected more than kPeekCollectMs ago, the whole reservation is
+// the window around the range was last collected more than kPeekCollectMs ago, the window is
 // collected (one reset for all readers' pages, stamped like any take) and the range peeked again.
 // Result: the pages stamped after *epoch plus the pages still uncollected; never fewer than written.
 // The reader's new epoch is the one read before it looked at anything: a collect running
 // meanwhile stamps later values, which the next call reports again (twice, never missed).
 constexpr int64_t kPeekCollectMs = 8;
-std::atomic<int64_t> g_last_collect_ms{0};
+std::map<uintptr_t, int64_t> g_last_collect_ms;  // window start -> last collect, under g_stamp_mutex
 
 int64_t now_ms() {
     return static_cast<int64_t>(GetTickCount64());
@@ -632,13 +632,27 @@ bool written_pages_peek(uintptr_t start, uintptr_t end, uintptr_t origin, uintpt
     if (!peek_bits(&n)) {
         return false;
     }
-    if (n > 0 && now_ms() - g_last_collect_ms.load(std::memory_order_relaxed) >= kPeekCollectMs) {
-        // Collect the whole reservation (stamps only; the pages it names are not wanted here).
-        std::vector<uint64_t> none;
-        if (written_pages_by_watch(res_lo, res_hi, res_lo, nullptr, false, &none)) {
-            g_last_collect_ms.store(now_ms(), std::memory_order_relaxed);
-            if (!peek_bits(&n)) {
-                return false;
+    if (n > 0) {
+        // Collect a 64 MiB aligned window around the range (clipped to the reservation), at most
+        // every kPeekCollectMs per window: one reset for every reader's pages in it.
+        constexpr uintptr_t kWindow = uintptr_t{64} << 20;
+        const uintptr_t wlo = std::max<uintptr_t>(res_lo, start & ~(kWindow - 1));
+        const uintptr_t whi = std::min<uintptr_t>(res_hi, (end + kWindow - 1) & ~(kWindow - 1));
+        bool due = false;
+        {
+            std::lock_guard<std::mutex> lock(g_stamp_mutex);
+            int64_t& last = g_last_collect_ms[wlo];
+            if (now_ms() - last >= kPeekCollectMs) {
+                last = now_ms();
+                due = true;
+            }
+        }
+        if (due) {
+            std::vector<uint64_t> none;
+            if (written_pages_by_watch(wlo, whi, wlo, nullptr, false, &none)) {
+                if (!peek_bits(&n)) {
+                    return false;
+                }
             }
         }
     }
