@@ -46,6 +46,7 @@ add_library(playgta6_core STATIC
     gpu/d3d12_guest_resources.cpp
     gpu/d3d12_guest_command_list.cpp
     gpu/d3d12_xs_xbox.cpp
+    gpu/xbox_embedded_native.cpp
     gpu/present_pacing.cpp
     gpu/d3d12_xs_dump.cpp
     gpu/shader_pack_index.cpp
@@ -230,6 +231,10 @@ else()
     add_executable(test_console_layout_sizes ../tests/test_console_layout_sizes.cpp)
     target_link_libraries(test_console_layout_sizes PRIVATE playgta6_core)
     add_test(NAME test_console_layout_sizes COMMAND test_console_layout_sizes)
+
+    add_executable(test_xbox_embedded_native ../tests/test_xbox_embedded_native.cpp)
+    target_link_libraries(test_xbox_embedded_native PRIVATE playgta6_core)
+    add_test(NAME test_xbox_embedded_native COMMAND test_xbox_embedded_native)
 
     add_executable(test_stage_reflection ../tests/test_stage_reflection.cpp)
     target_link_libraries(test_stage_reflection PRIVATE playgta6_core)
