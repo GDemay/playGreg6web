@@ -8307,5 +8307,473 @@ async function boot() { await loadDylibs(); }
             )
 
 
+def _encode_code_section(
+    bodies: Sequence[tuple[Sequence[tuple[int, int]], int]],
+) -> bytes:
+    """Build a valid Wasm Code section (id=10) from `(locals_list, target_body_bytes)` tuples.
+
+    Each `locals_list` item is `(count, valtype_byte)`. If `valtype_byte` is `0x63` or `0x64`,
+    a 1-byte heaptype `0x70` (funcref) is emitted after it. `target_body_bytes` is the desired
+    encoded body length (padded with `0x01` nop bytes before trailing `0x0B` end).
+    """
+    payload = bytearray(_uleb128(len(bodies)))
+    for locals_list, target_body_bytes in bodies:
+        body = bytearray(_uleb128(len(locals_list)))
+        for count, valtype in locals_list:
+            body.extend(_uleb128(count))
+            body.append(valtype)
+            if valtype in (0x63, 0x64):
+                body.append(0x70)
+        pad_len = max(0, target_body_bytes - len(body) - 1)
+        if pad_len > 0:
+            body.extend(b"\x01" * pad_len)
+        body.append(0x0B)
+        payload.extend(_uleb128(len(body)))
+        payload.extend(body)
+    return _wasm_section(bgw.WASM_SECTION_CODE, bytes(payload))
+
+
+class TestT100Wasm64V8HeadroomAndStaleCleanup(unittest.TestCase):
+    """T100 (#1706, Refs #663): Code-section V8 headroom telemetry & stale side-module cleanup."""
+
+    def test_code_section_streaming_parser_metrics_and_errors(self) -> None:
+        # 1) Multi-function Code section with multiple local decls, typed ref locals,
+        #    multi-byte ULEB128 local counts & body sizes, and exact/over 1 MiB threshold.
+        over_1mib_a = bgw.LARGE_FUNC_BODY_THRESHOLD_BYTES + 1
+        over_1mib_b = 1_700_000
+        exact_1mib = bgw.LARGE_FUNC_BODY_THRESHOLD_BYTES
+        code_sec = _encode_code_section(
+            [
+                ([], 4),  # 0 locals, 4-byte body
+                ([(3, 0x7F), (1300, 0x7E), (3, 0x7B)], 512),  # 1,306 locals (multi-byte ULEB128)
+                ([(1, 0x63), (2048, 0x7F)], exact_1mib),  # 2,049 locals, exact 1 MiB (NOT > 1 MiB)
+                ([(250, 0x7E), (125, 0x7C)], over_1mib_a),  # 375 locals, > 1 MiB (#1)
+                ([(40, 0x7F)], over_1mib_b),  # 40 locals, > 1 MiB (#2, largest)
+            ]
+        )
+        wasm = (
+            b"\x00asm\x01\x00\x00\x00"
+            + _encode_dylink0_section(memory_size=4096, table_size=5103, needed=("runtime.wasm",))
+            + _encode_export_section([("__playgta6_dispatch_shard_main_00000", 0x00, 0)])
+            + code_sec
+        )
+
+        m_bytes = bgw.inspect_wasm_bytes(wasm, name="guest_part_0.wasm", role="side")
+        self.assertEqual(m_bytes.code_func_count, 5)
+        self.assertEqual(m_bytes.max_func_body_bytes, over_1mib_b)
+        self.assertEqual(m_bytes.max_func_locals, 2049)
+        self.assertEqual(m_bytes.large_func_bodies_over_1mib, 2)
+        self.assertEqual(m_bytes.table_size, 5103)
+        self.assertEqual(m_bytes.shard_dispatch_exports, 1)
+
+        # File-based streaming path produces identical metrics.
+        with tempfile.TemporaryDirectory() as tmp:
+            wasm_path = Path(tmp) / "guest_part_0.wasm"
+            wasm_path.write_bytes(wasm)
+            m_file = bgw.inspect_wasm_file(wasm_path, role="side")
+            self.assertEqual(m_file, m_bytes)
+
+        # 2) Absent, empty (0-byte), and zero-function Code sections cleanly yield zeros.
+        no_code = b"\x00asm\x01\x00\x00\x00"
+        empty_code = b"\x00asm\x01\x00\x00\x00" + _wasm_section(bgw.WASM_SECTION_CODE, b"")
+        zero_funcs = b"\x00asm\x01\x00\x00\x00" + _encode_code_section([])
+        for label, blob in (("absent", no_code), ("empty", empty_code), ("zero", zero_funcs)):
+            m = bgw.inspect_wasm_bytes(blob, name=f"{label}.wasm")
+            self.assertEqual(m.code_func_count, 0, label)
+            self.assertEqual(m.max_func_body_bytes, 0, label)
+            self.assertEqual(m.max_func_locals, 0, label)
+            self.assertEqual(m.large_func_bodies_over_1mib, 0, label)
+
+        # 3) Truncated / malformed Code sections raise WasmInspectError.
+        # 3a) func_count=2 but only 1 body present.
+        trunc_missing_body = b"\x00asm\x01\x00\x00\x00" + _wasm_section(
+            bgw.WASM_SECTION_CODE,
+            bytes([0x02, 0x02, 0x00, 0x0B]),
+        )
+        # 3b) body_size claims 100 bytes but section ends after 3 bytes.
+        trunc_body_past_sec = b"\x00asm\x01\x00\x00\x00" + _wasm_section(
+            bgw.WASM_SECTION_CODE,
+            bytes([0x01, 0x64, 0x00, 0x0B]),
+        )
+        # 3c) body_size=2 but local_decl_count=5 overflows body_end (even with a 2nd body after!).
+        trunc_locals_past_body = b"\x00asm\x01\x00\x00\x00" + _wasm_section(
+            bgw.WASM_SECTION_CODE,
+            bytes([0x02, 0x02, 0x05, 0x01, 0x02, 0x00, 0x0B]),
+        )
+        # 3d) body_size=0 cannot even hold local_decl_count.
+        trunc_zero_body = b"\x00asm\x01\x00\x00\x00" + _wasm_section(
+            bgw.WASM_SECTION_CODE,
+            bytes([0x01, 0x00]),
+        )
+        for bad_label, bad_wasm in (
+            ("missing_body", trunc_missing_body),
+            ("body_past_sec", trunc_body_past_sec),
+            ("locals_past_body", trunc_locals_past_body),
+            ("zero_body", trunc_zero_body),
+        ):
+            with self.assertRaises(bgw.WasmInspectError, msg=bad_label):
+                bgw.inspect_wasm_bytes(bad_wasm, name=f"{bad_label}.wasm")
+
+    def test_v8_headroom_calculations_warnings_and_manifest_emission(self) -> None:
+        self.assertEqual(bgw.WASM_SECTION_CODE, 10)
+        self.assertEqual(bgw.V8_MAX_WASM_FUNCTION_BYTES, 7_654_321)
+        self.assertEqual(bgw.V8_MAX_WASM_FUNCTION_LOCALS, 50_000)
+        self.assertEqual(bgw.LARGE_FUNC_BODY_THRESHOLD_BYTES, 1024 * 1024)
+
+        # 1) Realistic comfortable #663 shape: 890 MiB side module, 1.70 MB func, 1,306 locals, 4 >1 MiB.
+        m_main = bgw.WasmModuleMetrics(
+            name="runtime.wasm",
+            role="main",
+            wasm_bytes=12 * 1024 * 1024,
+            table_size=64,
+            code_func_count=1200,
+            max_func_body_bytes=64_000,
+            max_func_locals=120,
+            large_func_bodies_over_1mib=0,
+        )
+        m_side0 = bgw.WasmModuleMetrics(
+            name="guest_part_0.wasm",
+            role="side",
+            wasm_bytes=890 * 1024 * 1024,
+            table_size=5039,
+            got_func_imports=0,
+            code_func_count=412_000,
+            max_func_body_bytes=1_700_000,
+            max_func_locals=1306,
+            large_func_bodies_over_1mib=4,
+        )
+        m_reg = bgw.WasmModuleMetrics(
+            name="guest_part_1.wasm",
+            role="side",
+            wasm_bytes=18 * 1024 * 1024,
+            table_size=0,
+            got_func_imports=5039,
+            code_func_count=10,
+            max_func_body_bytes=1024,
+            max_func_locals=4,
+            large_func_bodies_over_1mib=0,
+        )
+        build_ok = bgw.WasmBuildMetrics(indirect_dispatch="shard", modules=(m_main, m_side0, m_reg))
+
+        self.assertEqual(m_side0.v8_module_headroom_bytes, 134 * 1024 * 1024)
+        self.assertEqual(m_side0.v8_module_headroom_mib, 134.0)
+        self.assertAlmostEqual(m_side0.v8_module_used_pct, 86.91, places=2)
+        self.assertEqual(m_side0.v8_func_body_headroom_bytes, 7_654_321 - 1_700_000)
+        self.assertEqual(m_side0.v8_func_locals_headroom, 50_000 - 1306)
+        self.assertFalse(m_side0.exceeds_v8_module_limit)
+        self.assertFalse(m_side0.exceeds_v8_func_size_limit)
+        self.assertFalse(m_side0.exceeds_v8_locals_limit)
+
+        self.assertEqual(build_ok.max_module_name, "guest_part_0.wasm")
+        self.assertEqual(build_ok.max_module_bytes, 890 * 1024 * 1024)
+        self.assertEqual(build_ok.min_module_headroom_mib, 134.0)
+        self.assertEqual(build_ok.max_func_body_bytes, 1_700_000)
+        self.assertEqual(build_ok.max_func_locals, 1306)
+        self.assertEqual(build_ok.large_func_bodies_over_1mib, 4)
+        self.assertEqual(build_ok.total_code_func_count, 413_210)
+        self.assertEqual(build_ok.total_table_size, 5103)
+        self.assertTrue(build_ok.within_all_limits)
+        self.assertEqual(bgw.check_v8_headroom_warnings(build_ok), [])
+
+        # Verify both snake_case and camelCase dicts carry full v8 headroom fields.
+        d = build_ok.to_dict()
+        self.assertEqual(d["v8_headroom"]["max_module_name"], "guest_part_0.wasm")
+        self.assertEqual(d["v8_headroom"]["min_module_headroom_mib"], 134.0)
+        self.assertEqual(d["v8_headroom"]["v8_module_limit_mib"], 1024.0)
+        self.assertEqual(d["v8_headroom"]["v8_func_body_limit_bytes"], 7_654_321)
+        self.assertEqual(d["v8_headroom"]["v8_func_locals_limit"], 50_000)
+        self.assertEqual(d["v8_headroom"]["large_func_bodies_over_1mib"], 4)
+        self.assertEqual(d["v8_headroom"]["total_code_func_count"], 413_210)
+        self.assertTrue(d["v8_headroom"]["within_all_limits"])
+
+        md = build_ok.to_manifest_dict()
+        self.assertEqual(md["v8Headroom"]["maxModuleName"], "guest_part_0.wasm")
+        self.assertEqual(md["v8Headroom"]["minModuleHeadroomMiB"], 134.0)
+        self.assertEqual(md["v8Headroom"]["v8ModuleLimitMiB"], 1024.0)
+        self.assertEqual(md["v8Headroom"]["maxFuncBodyBytes"], 1_700_000)
+        self.assertEqual(md["v8Headroom"]["maxFuncLocals"], 1306)
+        self.assertEqual(md["v8Headroom"]["largeFuncBodiesOver1MiB"], 4)
+        self.assertEqual(md["v8Headroom"]["totalCodeFuncCount"], 413_210)
+        self.assertEqual(md["v8Headroom"]["totalGotFuncImports"], 5039)
+        self.assertEqual(md["v8Headroom"]["totalTableSize"], 5103)
+        self.assertTrue(md["v8Headroom"]["withinAllLimits"])
+        self.assertEqual(md["modules"][1]["codeFuncCount"], 412_000)
+        self.assertEqual(md["modules"][1]["v8ModuleHeadroomMiB"], 134.0)
+        self.assertEqual(md["modules"][1]["v8FuncLocalsHeadroom"], 50_000 - 1306)
+
+        formatted = "\n".join(bgw.format_wasm_metrics_lines(build_ok))
+        self.assertIn("V8 headroom [OK]:", formatted)
+        self.assertIn("guest_part_0.wasm=890.00 / 1024.00 MiB", formatted)
+        self.assertIn("headroom 134.00 MiB", formatted)
+        self.assertIn("1,700,000 B", formatted)
+        self.assertIn("1,306 / 50,000", formatted)
+        self.assertIn("bodies >1 MiB=4", formatted)
+
+        # 2) Approaching limits (>=90% module, >=75% func body, >=80% locals) trigger proactive warnings.
+        m_approach = bgw.WasmModuleMetrics(
+            name="guest_part_0.wasm",
+            role="side",
+            wasm_bytes=950 * 1024 * 1024,  # 92.8% of 1024 MiB
+            code_func_count=10,
+            max_func_body_bytes=6_000_000,  # 78.4% of 7,654,321
+            max_func_locals=42_000,  # 84.0% of 50,000
+            large_func_bodies_over_1mib=1,
+        )
+        build_approach = bgw.WasmBuildMetrics(indirect_dispatch="shard", modules=(m_approach,))
+        self.assertTrue(build_approach.within_all_limits)
+        w_approach = bgw.check_v8_headroom_warnings(build_approach)
+        self.assertEqual(len(w_approach), 3, w_approach)
+        self.assertTrue(any("approaching Chrome/V8's 1024 MiB module cap" in w for w in w_approach))
+        self.assertTrue(any("kV8MaxWasmFunctionSize" in w and "6,000,000" in w for w in w_approach))
+        self.assertTrue(any("kV8MaxWasmFunctionLocals" in w and "42,000" in w for w in w_approach))
+
+        # 3) Exceeding limits marks within_all_limits=False and emits exceeding warnings.
+        m_exceed = bgw.WasmModuleMetrics(
+            name="guest_part_0.wasm",
+            role="side",
+            wasm_bytes=bgw.V8_MAX_WASM_MODULE_BYTES + 2 * 1024 * 1024,
+            code_func_count=1,
+            max_func_body_bytes=bgw.V8_MAX_WASM_FUNCTION_BYTES + 100,
+            max_func_locals=bgw.V8_MAX_WASM_FUNCTION_LOCALS + 5,
+            large_func_bodies_over_1mib=1,
+        )
+        build_exceed = bgw.WasmBuildMetrics(indirect_dispatch="shard", modules=(m_exceed,))
+        self.assertFalse(build_exceed.within_all_limits)
+        w_exceed_all = bgw.check_v8_headroom_warnings(build_exceed, include_module_exceeded=True)
+        self.assertEqual(len(w_exceed_all), 3, w_exceed_all)
+        w_exceed_dedup = bgw.check_v8_headroom_warnings(build_exceed, include_module_exceeded=False)
+        self.assertEqual(len(w_exceed_dedup), 2, w_exceed_dedup)
+        self.assertIn("V8 headroom [OVER LIMIT]:", "\n".join(bgw.format_wasm_metrics_lines(build_exceed)))
+
+        # 4) Empty modules edge case does not crash.
+        empty_metrics = bgw.WasmBuildMetrics(indirect_dispatch="table", modules=())
+        self.assertIsNone(empty_metrics.max_module_name)
+        self.assertEqual(empty_metrics.min_module_headroom_bytes, bgw.V8_MAX_WASM_MODULE_BYTES)
+        self.assertTrue(empty_metrics.within_all_limits)
+
+        # 5) End-to-end run_build() writes wasmMetrics.v8Headroom into guest_manifest.json
+        #    and appends proactive Code-section warnings without duplicating module warnings.
+        big_func_wasm = (
+            b"\x00asm\x01\x00\x00\x00"
+            + _encode_dylink0_section(memory_size=4096, table_size=2, needed=("runtime.wasm",))
+            + _encode_code_section(
+                [
+                    ([(41_000, 0x7F)], bgw.LARGE_FUNC_BODY_THRESHOLD_BYTES + 16),
+                    ([(12, 0x7E)], 64),
+                ]
+            )
+        )
+        main_wasm = (
+            b"\x00asm\x01\x00\x00\x00"
+            + _encode_table_section([(0x70, 32, None, False)])
+            + _encode_code_section([([(8, 0x7F)], 32)])
+        )
+
+        class CodeWasmRunner(RecordingRunner):
+            def __call__(self, argv: Sequence[str]) -> bgw.CommandResult:
+                res = super().__call__(argv)
+                out_path = _dash_o(tuple(str(a) for a in argv))
+                if res.returncode == 0 and out_path is not None:
+                    p = Path(out_path)
+                    if p.name == "guest_part_0.wasm":
+                        p.write_bytes(big_func_wasm)
+                    elif p.name == bgw.RUNTIME_JS:
+                        p.with_suffix(".wasm").write_bytes(main_wasm)
+                return res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            orig_lib = _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            src = root / "recomp-headroom"
+            _write(src / "lift" / "shard-00000.ll", "; s0\n")
+            _write(src / "lift" / "shard-00001.ll", "; s1\n")
+            _write(src / "lift" / "functions.ll", "; reg\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+            out_dir = root / "dist"
+
+            rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                collapse_single_side_module=True,
+                runtime_lib=orig_lib,
+                run_command=CodeWasmRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(rep.ok, rep.errors)
+            self.assertTrue(
+                any("41,000" in w and "kV8MaxWasmFunctionLocals" in w for w in rep.warnings),
+                rep.warnings,
+            )
+            gm = json.loads((out_dir / bgw.GUEST_MANIFEST_FILE).read_text(encoding="utf-8"))
+            v8h = gm["wasmMetrics"]["v8Headroom"]
+            self.assertEqual(v8h["maxFuncBodyBytes"], bgw.LARGE_FUNC_BODY_THRESHOLD_BYTES + 16)
+            self.assertEqual(v8h["maxFuncLocals"], 41_000)
+            self.assertEqual(v8h["largeFuncBodiesOver1MiB"], 1)
+            self.assertEqual(v8h["totalCodeFuncCount"], 3)
+            self.assertTrue(v8h["withinAllLimits"])
+            p0_manifest = next(m for m in gm["wasmMetrics"]["modules"] if m["name"] == "guest_part_0.wasm")
+            self.assertEqual(p0_manifest["codeFuncCount"], 2)
+            self.assertEqual(p0_manifest["maxFuncLocals"], 41_000)
+            self.assertEqual(p0_manifest["largeFuncBodiesOver1MiB"], 1)
+            self.assertEqual(p0_manifest["v8FuncLocalsHeadroom"], 9_000)
+            self.assertNotIn("\\\\", bgw.report_to_json(rep))
+
+    def test_stale_side_module_cleanup_collapse_dry_run_and_unrelated_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # 1) Direct unit test of cleanup_stale_side_modules().
+            d = root / "direct"
+            d.mkdir()
+            for fname in (
+                "guest_part_0.wasm",
+                "guest_part_1.wasm",
+                "guest_part_2.wasm",
+                "guest_part_10.wasm",
+                "guest_part_3.wasm",
+                "runtime.wasm",
+                "custom.wasm",
+                "guest_part_foo.wasm",
+            ):
+                (d / fname).write_bytes(b"\x00asm\x01\x00\x00\x00")
+            dir_named = d / "guest_part_99.wasm"
+            dir_named.mkdir()
+
+            planned = bgw.cleanup_stale_side_modules(
+                d, ["guest_part_0.wasm", "guest_part_1.wasm"], dry_run=True
+            )
+            self.assertEqual(planned, ["guest_part_2.wasm", "guest_part_3.wasm", "guest_part_10.wasm"])
+            # Dry-run leaves every file intact.
+            for fname in planned:
+                self.assertTrue((d / fname).is_file())
+
+            removed = bgw.cleanup_stale_side_modules(
+                d, ["guest_part_0.wasm", "guest_part_1.wasm"], dry_run=False
+            )
+            self.assertEqual(removed, ["guest_part_2.wasm", "guest_part_3.wasm", "guest_part_10.wasm"])
+            for fname in removed:
+                self.assertFalse((d / fname).exists())
+            for kept in ("guest_part_0.wasm", "guest_part_1.wasm", "runtime.wasm", "custom.wasm", "guest_part_foo.wasm"):
+                self.assertTrue((d / kept).is_file(), kept)
+            self.assertTrue(dir_named.is_dir())
+
+            # 2) End-to-end --collapse-single-side-module build over prior 4-part output_dir.
+            repo = root / "repo"
+            _fake_emsdk(repo)
+            orig_lib = _touch_lib(repo / "runtime" / "build-wasm64" / "libplaygta6_core.a")
+            src = root / "recomp-stale"
+            _write(src / "lift" / "shard-00000.ll", "; s0\n")
+            _write(src / "lift" / "shard-00001.ll", "; s1\n")
+            _write(src / "lift" / "functions.ll", "; reg\n")
+            _write(src / "stubs" / "pg6_import_thunks.cpp", "void thunk() {}\n")
+
+            out_dir = root / "dist"
+            out_dir.mkdir()
+            for idx in range(4):
+                (out_dir / f"guest_part_{idx}.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (out_dir / "custom.wasm").write_bytes(b"\x00asm\x01\x00\x00\x00")
+            (out_dir / "guest_part_9.wasm").mkdir()
+
+            # 2a) Dry-run reports stale files without deleting them.
+            dry_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                collapse_single_side_module=True,
+                dry_run=True,
+                runtime_lib=orig_lib,
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(dry_rep.ok, dry_rep.errors)
+            self.assertEqual(dry_rep.removed_stale_side_modules, ["guest_part_2.wasm", "guest_part_3.wasm"])
+            self.assertTrue((out_dir / "guest_part_2.wasm").is_file())
+            self.assertTrue((out_dir / "guest_part_3.wasm").is_file())
+            self.assertIn(
+                "Stale side modules (would remove): guest_part_2.wasm, guest_part_3.wasm",
+                bgw.format_report_text(dry_rep),
+            )
+            dry_payload = json.loads(bgw.report_to_json(dry_rep))
+            self.assertEqual(
+                dry_payload["removed_stale_side_modules"],
+                ["guest_part_2.wasm", "guest_part_3.wasm"],
+            )
+
+            # 2b) Failed side link preserves prior stale files on disk.
+            fail_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                collapse_single_side_module=True,
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(fail_outputs=frozenset({"guest_part_1.wasm"})),
+                which_fn=lambda _n: None,
+            )
+            self.assertFalse(fail_rep.ok)
+            self.assertEqual(fail_rep.removed_stale_side_modules, [])
+            self.assertTrue((out_dir / "guest_part_2.wasm").is_file())
+            self.assertTrue((out_dir / "guest_part_3.wasm").is_file())
+
+            # 2c) Successful collapsed build removes stale guest_part_2/3, keeps active & custom.wasm.
+            real_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=2,
+                split_strategy="asymmetric",
+                collapse_single_side_module=True,
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(real_rep.ok, real_rep.errors)
+            self.assertEqual(real_rep.removed_stale_side_modules, ["guest_part_2.wasm", "guest_part_3.wasm"])
+            self.assertTrue((out_dir / "guest_part_0.wasm").is_file())
+            self.assertTrue((out_dir / "guest_part_1.wasm").is_file())
+            self.assertFalse((out_dir / "guest_part_2.wasm").exists())
+            self.assertFalse((out_dir / "guest_part_3.wasm").exists())
+            self.assertTrue((out_dir / "custom.wasm").is_file())
+            self.assertTrue((out_dir / "guest_part_9.wasm").is_dir())
+            self.assertIn(
+                "Removed stale side modules: guest_part_2.wasm, guest_part_3.wasm",
+                bgw.format_report_text(real_rep),
+            )
+
+            # 2d) Subsequent monolithic build removes remaining guest_part_0/1, keeps custom.wasm.
+            mono_rep = bgw.run_build(
+                source_dir=src,
+                repo_root=repo,
+                cache_dir=root / "cache-mono",
+                out_dir=out_dir,
+                jobs=2,
+                split_modules=1,
+                runtime_lib=orig_lib,
+                run_command=RecordingRunner(),
+                which_fn=lambda _n: None,
+            )
+            self.assertTrue(mono_rep.ok, mono_rep.errors)
+            self.assertEqual(mono_rep.removed_stale_side_modules, ["guest_part_0.wasm", "guest_part_1.wasm"])
+            self.assertFalse((out_dir / "guest_part_0.wasm").exists())
+            self.assertFalse((out_dir / "guest_part_1.wasm").exists())
+            self.assertTrue((out_dir / "custom.wasm").is_file())
+            self.assertTrue((out_dir / "runtime.wasm").is_file())
+
+
 if __name__ == "__main__":
     unittest.main()
