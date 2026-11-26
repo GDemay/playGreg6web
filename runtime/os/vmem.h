@@ -408,6 +408,14 @@ void set_write_tracking(bool on);
 struct WriteCursor {
     uint64_t commit_seq = 0;
     uint64_t view_clock = 0;
+    // Position in the MEM_WRITE_WATCH fan-out (O36): the OS write bits are consumed by one owner and
+    // stamped; each cursor is told every page stamped after its epoch, so several readers of the
+    // same arena memory (buffer flush, texture sync) each see every write.
+    uint64_t watch_epoch = 0;
+    // Peek mode (O36): the take does not reset OS write bits itself, it counts a bit not yet collected as
+    // written and collects (the whole reservation, at most every few ms) only to learn it was
+    // written again. Cheap for readers that mostly find nothing (texture sync); never reports less.
+    bool peek_watch = false;
 };
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);

@@ -68,7 +68,8 @@ bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, st
     if (commit_seq == nullptr) {
         return false;
     }
-    WriteCursor cursor{*commit_seq, 0};
+    // The commit_seq form has no fan-out position: it is told only what this call consumed.
+    WriteCursor cursor{*commit_seq, 0, ~uint64_t{0}};
     const bool ok = take_written_pages(host, len, &cursor, offsets);
     *commit_seq = cursor.commit_seq;
     return ok;
@@ -100,7 +101,9 @@ static bool take_written_pages_impl(const void* host, uint64_t len, WriteCursor*
         *commit_seq = g_commit_seq;
     }
     return views_only ? backing::take_written_view_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets)
-                      : backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets);
+                      : backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock,
+                                                    cursor->watch_epoch == ~uint64_t{0} ? nullptr : &cursor->watch_epoch,
+                                                    cursor->peek_watch, offsets);
 }
 
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
