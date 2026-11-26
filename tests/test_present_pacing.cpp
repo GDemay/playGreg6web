@@ -95,6 +95,82 @@ void test_immediate_and_off() {
     CHECK(!p.enabled());
 }
 
+void test_title_driven_no_phase_beat_at_or_below_60hz() {
+    PresentPacer p;
+    FakeClock c;
+    c.install(p);
+    p.set_title_driven(true);
+    CHECK(p.title_driven());
+
+    // Start off-phase (+5 ms past vblank 0): title paces itself at 30 Hz (2 vblanks) then 60 Hz
+    // (1 vblank). Zero waits and zero global vblank-grid quantization / phase beat.
+    c.now = c.origin + std::chrono::milliseconds(5);
+    CHECK(p.present(2) == 0);
+    for (int i = 0; i < 5; ++i) {
+        c.now += 2 * kV;  // 30 Hz, staying +5 ms off-phase
+        (void)p.present(2);
+    }
+    for (int i = 0; i < 5; ++i) {
+        c.now += kV;  // 60 Hz, still +5 ms off-phase
+        (void)p.present(1);
+    }
+    const auto s = p.stats();
+    CHECK(c.sleeps.empty());
+    CHECK(s.presents == 11 && s.immediate == 11 && s.waits == 0 && s.wait_us == 0);
+}
+
+void test_title_driven_caps_unpaced_bursts_at_60hz() {
+    PresentPacer p;
+    FakeClock c;
+    c.install(p);
+    p.set_title_driven(true);
+
+    const auto t0 = c.origin + std::chrono::milliseconds(5);
+    c.now = t0;
+    // First present is immediate.
+    CHECK(p.present(1) == p.vblank_at(t0));
+    CHECK(c.sleeps.empty() && p.stats().immediate == 1 && p.stats().waits == 0);
+
+    // Back-to-back 0 ms burst: held to 1-vblank minimum gap from t0 (not quantized to vblank grid).
+    CHECK(p.present(1) == p.vblank_at(t0 + kV));
+    CHECK(c.now == t0 + kV);
+    CHECK(c.sleeps.size() == 1 && c.sleeps[0] == t0 + kV);
+
+    // Next present arrives 2 ms later with interval == 2: still capped at 1-vblank minimum gap (60 Hz).
+    c.now += std::chrono::milliseconds(2);
+    CHECK(p.present(2) == p.vblank_at(t0 + 2 * kV));
+    CHECK(c.now == t0 + 2 * kV);
+    CHECK(c.sleeps.size() == 2 && c.sleeps[1] == t0 + 2 * kV);
+
+    // Rapid burst of 10 presents at 0 ms spacing advances clock by 10 vblanks (<= 60 Hz).
+    const auto burst_start = c.now;
+    for (int i = 0; i < 10; ++i) {
+        (void)p.present(1);
+    }
+    CHECK(c.now == burst_start + 10 * kV);
+    const auto s = p.stats();
+    CHECK(s.presents == 13 && s.immediate == 1 && s.waits == 12 && s.wait_us > 0);
+}
+
+void test_title_driven_interval_zero_remains_immediate() {
+    PresentPacer p;
+    FakeClock c;
+    c.install(p);
+    p.set_title_driven(true);
+
+    const auto t0 = c.origin + std::chrono::milliseconds(3);
+    c.now = t0;
+    CHECK(p.present(1) == p.vblank_at(t0));
+    // Back-to-back interval 0 presents must never sleep, even within 1 vblank of a prior present.
+    for (int i = 0; i < 5; ++i) {
+        CHECK(p.present(0) == p.vblank_at(t0));
+    }
+    CHECK(c.now == t0);
+    CHECK(c.sleeps.empty());
+    const auto s = p.stats();
+    CHECK(s.presents == 6 && s.immediate == 6 && s.waits == 0 && s.wait_us == 0);
+}
+
 }  // namespace
 
 void test_present_samples_ring() {
@@ -146,6 +222,9 @@ int main() {
     test_interval_one_paces_to_60hz();
     test_interval_n_and_missed_vblanks();
     test_immediate_and_off();
+    test_title_driven_no_phase_beat_at_or_below_60hz();
+    test_title_driven_caps_unpaced_bursts_at_60hz();
+    test_title_driven_interval_zero_remains_immediate();
     test_present_samples_ring();
     test_host_sleep_is_precise();
     if (g_failures != 0) {
