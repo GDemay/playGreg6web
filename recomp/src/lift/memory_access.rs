@@ -39,6 +39,62 @@ pub(super) struct CachedWindowAddr {
     pub(super) ptr: String,
 }
 
+/// The last plain guest access (`guest_load`/`guest_store`): `value` is what guest memory holds at
+/// `addr` (`bytes` wide, as `ty`) right after the IR emitted up to byte `at` of the body. A later
+/// load of the same address takes `value` instead of reading memory again, provided nothing
+/// emitted since then is a label or [`keeps_memory`] rejects it: the load is then in the same LLVM
+/// block (so `value` dominates it) with no store, call, atomic or fence in between. On x86-TSO a
+/// thread reads its own store back (store-to-load forwarding) and two reads with nothing between
+/// them may see the same value, so this only picks one of the executions the guest allows; the
+/// memory-model barriers (`LOOP_BARRIER`, `fence seq_cst`, #719/#722) end the forwarding.
+pub(super) struct LastAccess {
+    addr: String,
+    ty: String,
+    value: String,
+    bytes: u64,
+    at: usize,
+}
+
+/// Whether an emitted IR line leaves guest memory as it was and stays in the current LLVM block:
+/// guest loads, arithmetic, intrinsics without memory effects and stores to the register/flag
+/// allocas (`%rax`, `%cf`, ...) or the guest state (`%state.*`, never guest memory) qualify;
+/// labels, terminators, calls, fences, atomics and every other store do not.
+fn keeps_memory(line: &str) -> bool {
+    const PURE_INTRINSICS: [&str; 12] = [
+        "@llvm.ctpop.",
+        "@llvm.ctlz.",
+        "@llvm.cttz.",
+        "@llvm.bswap.",
+        "@llvm.fshl.",
+        "@llvm.fshr.",
+        "@llvm.abs.",
+        "@llvm.smax.",
+        "@llvm.smin.",
+        "@llvm.umax.",
+        "@llvm.umin.",
+        ".with.overflow.",
+    ];
+    let Some(code) = line.strip_prefix("  ") else {
+        return false;
+    };
+    let rhs = code.split_once(" = ").map_or(code, |(_, rhs)| rhs);
+    let op = rhs.split(' ').next().unwrap_or_default();
+    match op {
+        "load" => !rhs.starts_with("load atomic") && !rhs.starts_with("load volatile"),
+        "store" => {
+            !rhs.starts_with("store atomic")
+                && !rhs.starts_with("store volatile")
+                && rhs.rsplit_once(", ptr %").is_some_and(|(_, ptr)| {
+                    !ptr.starts_with('t') && !ptr.contains(',') && !ptr.contains(' ')
+                })
+        }
+        "call" | "tail" => PURE_INTRINSICS.iter().any(|f| rhs.contains(f)),
+        "fence" | "atomicrmw" | "cmpxchg" | "br" | "switch" | "ret" | "unreachable"
+        | "indirectbr" | "invoke" | "resume" | "callbr" => false,
+        _ => true,
+    }
+}
+
 /// How `[burst.reg + disp]` accesses are lowered while inside a coalesced burst.
 #[derive(Clone)]
 pub(super) enum BurstMode {
@@ -101,6 +157,18 @@ pub(super) enum WriteMark {
     Always(String),
     /// Branching window check: mark slot `index` when `inside` holds.
     Inside { inside: String, index: String },
+}
+
+/// Values of the branch-free window translation ([`WindowCheck::Select`]) of one address.
+struct SelectDelta {
+    /// `rel < size`: the address is inside the window.
+    inside: String,
+    /// `addr - W`.
+    rel: String,
+    /// `rel >> SLOT_SHIFT`, the slot of an in-window address.
+    raw: String,
+    /// What to add to the address for its host address.
+    delta: String,
 }
 
 impl FunctionLifter<'_> {
@@ -200,17 +268,22 @@ impl FunctionLifter<'_> {
                     let slot = imm(rel >> SLOT_SHIFT, 64);
                     return (self.guest_ptr(addr), WriteMark::Always(slot));
                 }
+                let spare = w.size >> SLOT_SHIFT;
+                if w.check == WindowCheck::Select {
+                    // The translation's own window test and slot index feed the mark.
+                    let SelectDelta {
+                        inside, raw, delta, ..
+                    } = self.window_select_delta(addr, w);
+                    let host = self.val(&format!("add i64 {addr}, {delta}"));
+                    let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
+                    let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
+                    return (ptr, WriteMark::Always(index));
+                }
                 let (inside, rel) = self.window_test(addr, w);
                 let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
-                let spare = w.size >> SLOT_SHIFT;
                 let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
                 let ptr = self.guest_ptr(addr);
-                let mark = if w.check == WindowCheck::Select {
-                    WriteMark::Always(index)
-                } else {
-                    WriteMark::Inside { inside, index }
-                };
-                (ptr, mark)
+                (ptr, WriteMark::Inside { inside, index })
             }
             _ => (self.guest_ptr(addr), WriteMark::None),
         }
@@ -266,7 +339,7 @@ impl FunctionLifter<'_> {
                 }
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
-                let (_, delta) = self.window_select_delta(addr, w);
+                let SelectDelta { delta, .. } = self.window_select_delta(addr, w);
                 self.val(&format!("add i64 {addr}, {delta}"))
             }
             MemoryModel::Windowed(w) => {
@@ -294,15 +367,20 @@ impl FunctionLifter<'_> {
 
     /// Branch-free window delta ([`WindowCheck::Select`]): the table entry of the slot (entry 0
     /// for addresses outside the window, which keeps the load in bounds) or the flat base.
-    /// Returns `(inside, delta)`.
-    fn window_select_delta(&mut self, addr: &str, w: Window) -> (String, String) {
+    /// Its window test and slot index stay available for the write marks ([`Self::select_marks`]).
+    fn window_select_delta(&mut self, addr: &str, w: Window) -> SelectDelta {
         let (inside, rel) = self.window_test(addr, w);
         let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
         let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 0"));
         let entry = self.table_delta(WINDOW_TABLE_SYMBOL, &index);
         let flat = self.flat_base_val(w.flat);
         let delta = self.val(&format!("select i1 {inside}, i64 {entry}, i64 {flat}"));
-        (inside, delta)
+        SelectDelta {
+            inside,
+            rel,
+            raw,
+            delta,
+        }
     }
 
     /// Window path of [`WindowCheck::Outline`]: one call of the module's helper for this width.
@@ -360,13 +438,39 @@ impl FunctionLifter<'_> {
 
     /// Loads `ty` (`bytes` wide, `align 1`) from guest address `addr`.
     pub(super) fn guest_load(&mut self, addr: &str, ty: &str, bytes: u64) -> String {
-        self.guest_access(addr, bytes, Access::Load { ty })
-            .unwrap_or_default()
+        if let Some(last) = &self.last_access
+            && last.addr == addr
+            && last.ty == ty
+            && last.bytes == bytes
+            && self
+                .body
+                .get(last.at..)
+                .is_some_and(|since| since.lines().all(keeps_memory))
+        {
+            return last.value.clone();
+        }
+        let value = self
+            .guest_access(addr, bytes, Access::Load { ty })
+            .unwrap_or_default();
+        self.note_access(addr, ty, &value, bytes);
+        value
     }
 
     /// Stores `value` of `ty` (`bytes` wide, `align 1`) to guest address `addr`.
     pub(super) fn guest_store(&mut self, addr: &str, ty: &str, value: &str, bytes: u64) {
         self.guest_access(addr, bytes, Access::Store { ty, value });
+        self.note_access(addr, ty, value, bytes);
+    }
+
+    /// Remembers the access just emitted as the candidate for [`Self::guest_load`] forwarding.
+    fn note_access(&mut self, addr: &str, ty: &str, value: &str, bytes: u64) {
+        self.last_access = (!value.is_empty()).then(|| LastAccess {
+            addr: addr.to_string(),
+            ty: ty.to_string(),
+            value: value.to_string(),
+            bytes,
+            at: self.body.len(),
+        });
     }
 
     /// Emits the access through `ptr`; the loaded value for loads.
@@ -525,13 +629,14 @@ impl FunctionLifter<'_> {
                 self.const_window_access(addr, va, bytes, w, &access)
             }
             MemoryModel::Windowed(w) if w.check == WindowCheck::Select => {
-                let (inside, delta) = self.window_select_delta(addr, w);
+                let sel = self.window_select_delta(addr, w);
+                let (inside, delta) = (sel.inside.clone(), sel.delta.clone());
                 if bytes <= 1 || self.contiguous_runs() {
                     let host = self.val(&format!("add i64 {addr}, {delta}"));
                     let ptr = self.val(&format!("inttoptr i64 {host} to ptr"));
                     let v = self.access_at(&ptr, &access);
                     if let Access::Store { .. } = access {
-                        self.select_marks(&inside, addr, w, bytes);
+                        self.select_marks(&sel, w, bytes);
                     }
                     return v;
                 }
@@ -550,7 +655,7 @@ impl FunctionLifter<'_> {
                 let p_fast = self.val(&format!("inttoptr i64 {host} to ptr"));
                 if let Access::Store { .. } = access {
                     self.access_at(&p_fast, &access);
-                    self.select_marks(&inside, addr, w, 1);
+                    self.select_marks(&sel, w, 1);
                 }
                 self.emit(&format!("br label %{join}"));
                 self.start_internal_block(&slow);
@@ -823,10 +928,12 @@ impl FunctionLifter<'_> {
 
     /// O37: marks of a store under the branch-free window check: the slot (the spare entry
     /// outside the window) and, when runs are kept contiguous and the store is wider than a byte,
-    /// the slot of its last byte.
-    fn select_marks(&mut self, inside: &str, addr: &str, w: Window, bytes: u64) {
-        let rel = self.val(&format!("sub i64 {addr}, {}", imm(w.base, 64)));
-        let raw = self.val(&format!("lshr i64 {rel}, {SLOT_SHIFT}"));
+    /// the slot of its last byte. Reuses the window test and slot index of the access itself
+    /// (`sel` dominates the store), so a mark costs no second `sub`/`lshr` of the address.
+    fn select_marks(&mut self, sel: &SelectDelta, w: Window, bytes: u64) {
+        let SelectDelta {
+            inside, rel, raw, ..
+        } = sel;
         let spare = w.size >> SLOT_SHIFT;
         let index = self.val(&format!("select i1 {inside}, i64 {raw}, i64 {spare}"));
         self.window_mark(&index);

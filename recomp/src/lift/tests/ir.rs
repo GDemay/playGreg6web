@@ -1286,3 +1286,66 @@ fn shard_dispatch_emits_switch_internal_linkage_and_empty_shard_trap() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Guest loads (`align 1`) of `func` lifted alone.
+fn guest_loads(func: &cfg::Function) -> usize {
+    let ir = lift_function(func).expect("lifts").ir;
+    ir.lines()
+        .filter(|l| l.contains(" = load ") && l.ends_with("align 1"))
+        .count()
+}
+
+#[test]
+fn loads_take_the_value_of_an_earlier_access_to_the_same_address_in_the_block() {
+    // A pop reads back what the push stored; a second read of `[rdx]` reuses the first.
+    let forwarded = asm_function(0x1000, |a| {
+        a.push(rbx)?;
+        a.pop(rcx)?;
+        a.mov(rax, qword_ptr(rdx))?;
+        a.add(rax, qword_ptr(rdx))?;
+        a.ret()
+    });
+    // `[rdx]` once (`ret` does not read the return address).
+    assert_eq!(guest_loads(&forwarded), 1);
+    // A store to another (possibly aliasing) address, a fence, an atomic or a call in between
+    // reloads `[rdx]`.
+    type Emit = fn(&mut CodeAssembler) -> Result<(), IcedError>;
+    let barriers: [Emit; 4] = [
+        |a| a.mov(qword_ptr(rcx), rbx),
+        |a| a.mfence(),
+        |a| a.lock().xadd(qword_ptr(rcx), rbx),
+        |a| a.call(0x1000),
+    ];
+    for between in barriers {
+        let func = asm_function(0x1000, |a| {
+            a.mov(rax, qword_ptr(rdx))?;
+            between(a)?;
+            a.add(rax, qword_ptr(rdx))?;
+            a.ret()
+        });
+        let loads = guest_loads(&func);
+        assert!(loads >= 2, "forwarded across a barrier ({loads} loads)");
+    }
+}
+
+#[test]
+fn reloads_after_a_call_that_nothing_reads_are_dropped() {
+    // `add` overwrites every flag the call may have changed before anything reads them.
+    let program = Program::new()
+        .asm(0x1000, |a| {
+            a.cmp(rax, rbx)?;
+            a.call(0x5000)?;
+            a.add(rax, rbx)?;
+            a.ret()
+        })
+        .asm(0x5000, |a| {
+            a.xor(ecx, ecx)?;
+            a.ret()
+        });
+    let ir = lift_function(&program.function(0x1000)).expect("lifts").ir;
+    let call = ir.find("call void @sub_5000").expect("call");
+    assert!(
+        !ir[call..].contains("load i8, ptr %state.flag"),
+        "dead flag reloads after the call:\n{ir}"
+    );
+}
