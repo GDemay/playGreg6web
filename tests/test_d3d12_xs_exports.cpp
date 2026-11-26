@@ -4518,6 +4518,33 @@ void test_xbox_wait_frame_event_monotonic_tokens() {
     scene.release_all();
 }
 
+// ScheduleFrameEventX with an event handle signals it at every pacer tick; a timed-out
+// WaitFrameEventX returns S_FALSE (not a failure) with a token.
+void test_xbox_schedule_frame_event_signals_handle() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    namespace w = playgta6::os::win32;
+    const w::Handle ev = w::CreateEventW(nullptr, false, false, nullptr);
+    CHECK(ev != 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(2000), I(1), I(0)})) == 0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::ScheduleFrameEvent, {I(0), I(100), I(ev), I(0)})) == 0);
+    for (int i = 0; i < 3; ++i) {
+        CHECK(w::WaitForSingleObject(ev, 500) == w::WAIT_OBJECT_0);
+    }
+
+    // 100 ms interval, 1 ms timeout: the ORIGIN wait times out.
+    CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(100000), I(1), I(0)})) == 0);
+    const uint64_t tok_va = put<uint64_t>(0);
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(1), I(0), I(0), I(tok_va)})) == dg::kSFalse);
+    CHECK(load64(tok_va) != 0);
+
+    dev->shutdown_frame_events();
+    w::CloseHandle(ev);
+    CHECK(t_balanced);
+    scene.release_all();
+}
+
 // Helper for G49c end-to-end textured-draw tests: creates a root signature with 1 SRV descriptor
 // table (t0), registers its pipeline layout, creates a graphics PSO using that root signature, and
 // returns a lambda that records & executes one draw bound to a given shader-visible heap slot.
@@ -6539,6 +6566,7 @@ int main() {
     test_xbox_compute_pipeline_dump_and_pack_resolve();
     test_slot70_71_address_texture_view_registry();
     test_xbox_wait_frame_event_monotonic_tokens();
+    test_xbox_schedule_frame_event_signals_handle();
     test_g49c_default_detile_rgba8_and_bc7();
     test_g49c_slot70_address_texture_draw();
     test_g49c_raw_tsharp_descriptor_memory_draw();
