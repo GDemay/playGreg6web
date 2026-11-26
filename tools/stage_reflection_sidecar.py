@@ -806,6 +806,11 @@ def diff_sidecars(
     }
 
 
+def _unresolved_count(stage_obj: Any) -> int:
+    bindings = stage_obj.get("bindings", []) if isinstance(stage_obj, dict) else []
+    return sum(1 for b in bindings if isinstance(b, dict) and is_unresolved_source(b.get("source")))
+
+
 def build(
     docs: list[Any],
     existing_stages: dict[str, Any] | None = None,
@@ -820,6 +825,9 @@ def build(
             if stage is None:
                 skipped[why] = skipped.get(why, 0) + 1
                 continue
+            old = stages.get(key)
+            if old is not None and _unresolved_count(old) < _unresolved_count(stage):
+                continue  # never trade a fully traced entry for one with unresolved bindings
             stages[key] = stage
     if _stages_require_v3(stages):
         out_version = VERSION_UNRESOLVED
