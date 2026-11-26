@@ -1900,7 +1900,13 @@ BindGroupPlan BindGroupPlan::build(
             // Heap-indexed: the index is a root constant or a constant-buffer dword; the descriptor
             // comes from the bound heap.
             bool index_ok = b.heap_index_source == HeapIndexSource::Constant;
-            if (!index_ok && b.heap_index_parameter < signature.parameter_count()) {
+            if (!index_ok && b.heap_index_source == HeapIndexSource::CbTable &&
+                b.heap_index_parameter == kNoIndex &&
+                (signature.desc().flags & RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed) != 0) {
+                // SM 6.6 CBV stored directly inside the bound CBV/SRV/UAV descriptor heap
+                // (slot b.cb_table_slot of ResourceDescriptorHeap, no root-table parameter).
+                index_ok = b.cb_byte_offset % 4 == 0 && b.cb_bit_offset < 32 && b.cb_mask != 0;
+            } else if (!index_ok && b.heap_index_parameter < signature.parameter_count()) {
                 const auto& ip = signature.parameter(b.heap_index_parameter);
                 switch (b.heap_index_source) {
                 case HeapIndexSource::RootConstantIndex:
@@ -1929,7 +1935,10 @@ BindGroupPlan BindGroupPlan::build(
                 plan.has_heap_indexed_ = true;
                 e.root_parameter_index = b.heap_index_source == HeapIndexSource::Constant ? kNoIndex
                                                                                            : b.heap_index_parameter;
-                e.heap_dword = b.heap_index_source == HeapIndexSource::RootConstantIndex ? b.heap_index_dword : 0;
+                e.heap_dword = (b.heap_index_source == HeapIndexSource::RootConstantIndex ||
+                                b.heap_index_source == HeapIndexSource::Constant)
+                                   ? b.heap_index_dword
+                                   : 0;
                 e.heap_shift = b.heap_shift;
                 e.heap_stride = b.heap_stride;
                 e.heap_index_source = b.heap_index_source;
@@ -2070,7 +2079,7 @@ bool cb_index_dword(const RootArgumentState& state, BindPoint bind_point, const 
     case HeapIndexSource::RootConstantIndex:
         return false;
     case HeapIndexSource::Constant:
-        *dword = 0;
+        *dword = p.heap_dword;
         return true;
     case HeapIndexSource::CbRootConstants: {
         const std::span<const uint32_t> values = state.root_constants(bind_point, p.root_parameter_index);
@@ -2086,18 +2095,28 @@ bool cb_index_dword(const RootArgumentState& state, BindPoint bind_point, const 
                source->read_gpu_memory(arg.gpu_address + p.cb_byte_offset, dword, 4);
     }
     case HeapIndexSource::CbTable: {
-        const RootArgument& arg = state.argument(bind_point, p.root_parameter_index);
-        if (!arg.is_set || arg.heap == nullptr) {
-            return false;
+        const DescriptorHeap* heap = nullptr;
+        uint64_t slot = p.table_offset;
+        if (p.root_parameter_index == kNoIndex) {
+            heap = state.bound_heap(DescriptorHeapType::CbvSrvUav);
+            if (heap == nullptr) {
+                return false;
+            }
+        } else {
+            const RootArgument& arg = state.argument(bind_point, p.root_parameter_index);
+            if (!arg.is_set || arg.heap == nullptr) {
+                return false;
+            }
+            heap = arg.heap;
+            slot += static_cast<uint64_t>(arg.base_index);
         }
-        const uint64_t slot = static_cast<uint64_t>(arg.base_index) + p.table_offset;
-        if (slot >= arg.heap->capacity()) {
+        if (slot >= heap->capacity()) {
             return false;
         }
         ViewDescriptor v;
-        if (source != nullptr && source->reads(*arg.heap)) {
-            v = source->view(*arg.heap, static_cast<uint32_t>(slot), DescriptorRangeType::Cbv);
-        } else if (const ViewDescriptor* r = arg.heap->view(static_cast<uint32_t>(slot))) {
+        if (source != nullptr && source->reads(*heap)) {
+            v = source->view(*heap, static_cast<uint32_t>(slot), DescriptorRangeType::Cbv);
+        } else if (const ViewDescriptor* r = heap->view(static_cast<uint32_t>(slot))) {
             v = *r;
         }
         if (v.kind != DescriptorKind::Cbv || v.first_element_or_address == 0 ||
