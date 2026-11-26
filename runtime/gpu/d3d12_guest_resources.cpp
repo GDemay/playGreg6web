@@ -1718,6 +1718,21 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         // Verification mode compares unmarked pages too, so it visits everything.
         if (!scanned || os::guest_window::write_marks_verified()) {
             slot_index_.clear();
+            // Native: every tracked buffer takes its written pages below. Collect the OS write bits
+            // of all of them in one pass first, so each buffer does not pay a GetWriteWatch call.
+            std::vector<std::pair<uintptr_t, uintptr_t>> host_ranges;
+            host_ranges.reserve(tracked_.size());
+            for (Resource* r : tracked_) {
+                if (r->cpu_address() == 0 || r->shadow_bytes() == 0) {
+                    continue;
+                }
+                if (const auto* live = static_cast<const uint8_t*>(
+                        com::guest_to_host(r->cpu_address(), static_cast<size_t>(r->shadow_bytes())))) {
+                    host_ranges.emplace_back(reinterpret_cast<uintptr_t>(live),
+                                             reinterpret_cast<uintptr_t>(live) + static_cast<uintptr_t>(r->shadow_bytes()));
+                }
+            }
+            const os::WriteBatch write_batch(&host_ranges);
             for (Resource* r : tracked_) {
                 r->set_slot_indexed(false);
                 r->flush_shadow(encoder, &mark_pass_);

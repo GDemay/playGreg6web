@@ -30,6 +30,11 @@ bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, ui
 // Like take_written_pages but only for ranges wholly covered by tracked shared page views: it never
 // reads MEM_WRITE_WATCH (a destructive take), and returns false (consuming nothing) otherwise.
 bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets);
+// Batch take (flush): collects the MEM_WRITE_WATCH bits of the merged `ranges` ([lo, hi) host
+// addresses) once, stamping them for every reader, and lets this thread's takes inside a collected
+// range skip their own GetWriteWatch call until precollect_end. Takes of other ranges are unchanged.
+void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges);
+void precollect_end();
 // Whether later reserve() calls ask for write tracking (where the platform has it).
 void set_write_watch(bool on);
 // R40: writes caught on armed shared page views (Windows; 0 elsewhere).
