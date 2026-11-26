@@ -300,6 +300,11 @@ public:
     // commits and reservations: the backing is contiguous.
     uint8_t* host_ptr(uint64_t addr, size_t len = 1);
     const uint8_t* host_ptr_const(uint64_t addr, size_t len = 1) const;
+    // As host_ptr_const, but on success the arena's lock stays held in `hold` (the pointer stays
+    // valid, i.e. no other thread can decommit / release / remap its pages, until `hold` is
+    // released). On failure `hold` is empty. Use it when the bytes are read in place rather than
+    // copied (a bare host_ptr_const pointer can be unmapped by another thread right after it returns).
+    const uint8_t* host_ptr_const_held(uint64_t addr, size_t len, std::unique_lock<std::mutex>& hold) const;
 
     // Unchecked translation (what lifted code does): guest_base() + va, and back.
     uint8_t* translate(uint64_t va) const {

@@ -455,6 +455,17 @@ void* guest_to_host(uint64_t va, size_t len) {
     return const_cast<uint8_t*>(guest_memory().host_ptr_const(va, len == 0 ? 1 : len));
 }
 
+GuestRangeView::GuestRangeView(uint64_t va, size_t len) {
+    if (va == 0) {
+        return;
+    }
+    if (os::guest_window::translated(va)) [[unlikely]] {
+        data_ = static_cast<const uint8_t*>(os::guest_window::contiguous(va, len == 0 ? 1 : len));
+        return;
+    }
+    data_ = guest_memory().host_ptr_const_held(va, len == 0 ? 1 : len, hold_);
+}
+
 uint64_t host_to_guest(const void* host) {
     if (host == nullptr) {
         return 0;

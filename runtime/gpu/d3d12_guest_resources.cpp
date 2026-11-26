@@ -1976,15 +1976,29 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
             // R40: compare the live bytes in place where they are mapped in one piece (no copy
             // through the arena's checked read for an unchanged range, the usual case).
-            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
-            if (live != nullptr && r.shadow.size() == r.size && std::memcmp(live, r.shadow.data(), r.shadow.size()) == 0) {
+            // (The view holds the arena lock: another guest thread must not decommit the pages mid-read.)
+            bool unchanged = false;
+            bool copied = false;
+            {
+                const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));
+                if (view.data() != nullptr) {
+                    if (r.shadow.size() == r.size && std::memcmp(view.data(), r.shadow.data(), r.shadow.size()) == 0) {
+                        unchanged = true;
+                    } else {
+                        bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
+                        std::memcpy(bytes.data(), view.data(), bytes.size());
+                        copied = true;
+                    }
+                }
+            }
+            if (unchanged) {
                 continue;
             }
-            bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
-            if (live != nullptr) {
-                std::memcpy(bytes.data(), live, bytes.size());
-            } else if (!com::read_guest(cpu, bytes.data(), bytes.size())) {
-                continue;
+            if (!copied) {
+                bytes.resize(static_cast<size_t>(r.size));
+                if (!com::read_guest(cpu, bytes.data(), bytes.size())) {
+                    continue;
+                }
             }
             if (bytes == r.shadow) {
                 continue;
@@ -2006,15 +2020,25 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
             // R40: hash the live bytes in place where they are mapped in one piece and copy them
             // only when they changed (most ranges are unchanged at most submissions).
-            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
             uint64_t hash = 0;
-            if (live != nullptr) {
-                hash = content_hash(live, static_cast<size_t>(r.size));
-                if (r.ever_uploaded && hash == r.last_hash) {
-                    continue;
+            bool mapped = false;
+            bool unchanged = false;
+            {
+                const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));  // holds the arena lock
+                if (view.data() != nullptr) {
+                    mapped = true;
+                    hash = content_hash(view.data(), static_cast<size_t>(r.size));
+                    if (r.ever_uploaded && hash == r.last_hash) {
+                        unchanged = true;
+                    } else {
+                        bytes.assign(view.data(), view.data() + r.size);
+                    }
                 }
-                bytes.assign(live, live + r.size);
-            } else {
+            }
+            if (unchanged) {
+                continue;
+            }
+            if (!mapped) {
                 bytes.resize(static_cast<size_t>(r.size));
                 if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
                     continue;
@@ -2046,15 +2070,25 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 continue;  // (uploaded when it was created)
             }
             // R40: as above, hash in place and copy only a changed range.
-            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(key.second)));
             uint64_t hash = 0;
-            if (live != nullptr) {
-                hash = content_hash(live, static_cast<size_t>(key.second));
-                if (hash == r.last_hash) {
-                    continue;
+            bool mapped = false;
+            bool unchanged = false;
+            {
+                const com::GuestRangeView view(cpu, static_cast<size_t>(key.second));  // holds the arena lock
+                if (view.data() != nullptr) {
+                    mapped = true;
+                    hash = content_hash(view.data(), static_cast<size_t>(key.second));
+                    if (hash == r.last_hash) {
+                        unchanged = true;
+                    } else {
+                        bytes.assign(view.data(), view.data() + key.second);
+                    }
                 }
-                bytes.assign(live, live + key.second);
-            } else {
+            }
+            if (unchanged) {
+                continue;
+            }
+            if (!mapped) {
                 bytes.assign(static_cast<size_t>(key.second), 0);
                 if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
                     continue;

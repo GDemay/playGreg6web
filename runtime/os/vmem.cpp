@@ -1158,6 +1158,16 @@ const uint8_t* VirtualMemoryArena::host_ptr_const(uint64_t addr, size_t len) con
     return pages_allow_locked(addr, len, false) ? translate(addr) : nullptr;
 }
 
+const uint8_t* VirtualMemoryArena::host_ptr_const_held(uint64_t addr, size_t len,
+                                                       std::unique_lock<std::mutex>& hold) const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!pages_allow_locked(addr, len, false)) {
+        return nullptr;
+    }
+    hold = std::move(lock);
+    return translate(addr);
+}
+
 uint64_t VirtualMemoryArena::reserved_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return reserved_bytes_;
