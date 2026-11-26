@@ -4,15 +4,18 @@
 //! `ymm0..15` live in the guest state in two parts: bits 0..127 (`xmm0..15`) at
 //! [`STATE_XMM_OFFSET`](super::super::STATE_XMM_OFFSET) and bits 128..255 at
 //! [`STATE_YMM_HI_OFFSET`](super::super::STATE_YMM_HI_OFFSET), 16 bytes each, little endian.
-//! Inside a function every 128-bit part the function touches gets an `alloca <2 x i64>` (the
-//! canonical in-memory type of a 128-bit part), `%xmmN` / `%ymmhN`, loaded from the state at
-//! entry and after every call and stored back before every call, exit and trap, exactly like the
-//! GPRs. Instructions `bitcast` the value to the lane type they operate on (`<4 x float>`,
-//! `<16 x i8>`, ...); LLVM promotes the allocas to SSA values and the bitcasts are free on wasm
-//! (`v128`). The import thunks (`crate::stubs`) therefore always find float arguments in the low
-//! lanes of the `xmm0..3` slots and leave float results in `xmm0`. Upper-half slots exist only in
-//! functions with AVX code: legacy-SSE encodings leave bits 128..255 untouched (exact), VEX-128
-//! encodings zero them (exact), `vzeroupper`/`vzeroall` clear them.
+//! Inside a function every 128-bit `xmm0..15` register the function touches gets an
+//! `alloca <2 x i64>` (the canonical in-memory type of a 128-bit part), `%xmmN`, loaded from the
+//! state at entry and after every call and stored back before every call, exit and trap, exactly
+//! like the GPRs. Upper-half slots (`%ymmhN`) are allocated only for `ymm` registers whose upper
+//! 128 bits the function actually reads; write-only upper halves (including VEX-128 zeroing and
+//! `vzeroupper`/`vzeroall`) write directly to `%state.ymmhN`, eliminating dead allocas and
+//! call-boundary spill/reload traffic. Instructions `bitcast` the value to the lane type they
+//! operate on (`<4 x float>`, `<16 x i8>`, ...); LLVM promotes the allocas to SSA values and the
+//! bitcasts are free on wasm (`v128`). The import thunks (`crate::stubs`) therefore always find
+//! float arguments in the low lanes of the `xmm0..3` slots and leave float results in `xmm0`.
+//! Legacy-SSE encodings leave bits 128..255 untouched (exact), VEX-128 encodings zero them
+//! (exact), `vzeroupper`/`vzeroall` clear them.
 //!
 //! 256-bit instructions whose lanes are independent per 128-bit half (arithmetic, compares,
 //! in-lane shuffles, integer ops, FMA, ...) are lifted as two 128-bit halves (per-lane immediate
@@ -102,7 +105,9 @@ mod moves;
 
 use std::fmt::Write as _;
 
-use iced_x86::{Code, EncodingKind, Instruction, Mnemonic, OpKind, Register};
+use iced_x86::{
+    Code, EncodingKind, Instruction, InstructionInfo, Mnemonic, OpAccess, OpKind, Register,
+};
 
 use super::super::Support;
 use super::flag_liveness::{StateMask, xmm_state_bit, ymmh_state_bit};
@@ -438,7 +443,8 @@ pub(super) fn is_simd(ins: &Instruction) -> bool {
 pub(super) struct Regs {
     /// `xmm0..15` (bits 0..127 of `ymm0..15`) that get a slot.
     xmm: [bool; 16],
-    /// Upper halves (bits 128..255) of `ymm0..15` that get a slot.
+    /// Upper halves (bits 128..255) of `ymm0..15` that the function reads and therefore keep in a
+    /// local `%ymmhN` alloca. Unread upper halves write directly to `%state.ymmhN`.
     ymmh: [bool; 16],
     /// The 128-bit lane the register/memory accessors address while a 256-bit instruction is
     /// lifted one lane at a time (0 = low, 1 = high).
@@ -456,27 +462,39 @@ impl Regs {
     }
 }
 
-/// Records the vector registers an instruction uses (`reg` from its used-register info).
-/// (iced reports VEX destinations as the full ZMM register, as their upper bits are zeroed.)
-pub(super) fn note_register(reg: Register, regs: &mut Regs) {
+fn is_read_access(access: OpAccess) -> bool {
+    matches!(
+        access,
+        OpAccess::Read | OpAccess::CondRead | OpAccess::ReadWrite | OpAccess::ReadCondWrite
+    )
+}
+
+/// Records the vector registers an instruction uses (`reg` and `access` from its used-register
+/// info). Upper halves (`ymmh0..15`) only get a local alloca when read; write-only upper halves
+/// (including VEX-128 zeroing) store directly to `%state.ymmhN`.
+pub(super) fn note_register(reg: Register, access: OpAccess, regs: &mut Regs) {
     if (reg.is_xmm() || reg.is_ymm() || reg.is_zmm()) && reg.number() < 16 {
         regs.xmm[reg.number()] = true;
-        if !reg.is_xmm() {
+        if !reg.is_xmm() && is_read_access(access) {
             regs.ymmh[reg.number()] = true;
         }
     }
 }
 
-/// Records register halves an instruction writes without naming them as 256-bit operands: VEX
-/// instructions zero the upper half of their XMM destination, `vzeroupper`/`vzeroall` clear all,
-/// and legacy `blendvps`/`blendvpd`/`pblendvb` implicitly read `xmm0`.
-pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
+/// Records vector register halves an instruction uses beyond `used_registers`:
+/// - `vzeroall` tracks all `xmm0..15` (its `ymmh0..15` clearing writes `%state.ymmh*` directly
+///   when unread);
+/// - legacy `blendvps`/`blendvpd`/`pblendvb` implicitly read `xmm0`;
+/// - VEX-128 instructions with an XMM destination track `xmmN` (their upper-half zeroing writes
+///   directly to `%state.ymmhN` when `ymmhN` is unread);
+/// - explicit 256-bit `ymm` source operands (including zeroing idioms such as
+///   `vxorps ymm0, ymm0, ymm0` where iced omits `Read` from `used_registers`) mark `ymmhN` as read
+///   because the lifter reads source operands via `xget`/`xget_half`.
+pub(super) fn note_instruction(ins: &Instruction, info: &InstructionInfo, regs: &mut Regs) {
     match ins.mnemonic() {
         Mnemonic::Vzeroall => {
             regs.xmm = [true; 16];
-            regs.ymmh = [true; 16];
         }
-        Mnemonic::Vzeroupper => regs.ymmh = [true; 16],
         Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
             regs.xmm[0] = true;
         }
@@ -490,7 +508,17 @@ pub(super) fn note_instruction(ins: &Instruction, regs: &mut Regs) {
         && !reads_only_first_operand(ins.mnemonic())
     {
         regs.xmm[ins.op_register(0).number()] = true;
-        regs.ymmh[ins.op_register(0).number()] = true;
+    }
+    for i in 0..ins.op_count() {
+        if ins.op_kind(i) == OpKind::Register {
+            let r = ins.op_register(i);
+            if r.is_ymm() && r.number() < 16 {
+                regs.xmm[r.number()] = true;
+                if i >= 1 || is_read_access(info.op_access(i)) {
+                    regs.ymmh[r.number()] = true;
+                }
+            }
+        }
     }
 }
 
@@ -683,10 +711,53 @@ impl FunctionLifter<'_> {
     }
 
     /// Writes lane `half` of a vector register.
+    ///
+    /// Upper halves (`half == 1`) that the function never reads have no local alloca and are
+    /// written directly to `%state.ymmhN`, avoiding entry/call/exit spill and reload traffic.
     fn xset_half(&mut self, reg: Register, half: u32, v: &str, e: Elem) -> R<()> {
-        let slot = self.slot(reg, half)?;
+        if !(reg.is_xmm() || reg.is_ymm()) {
+            return unsupported(format!("operand {reg:?} is not an XMM/YMM register"));
+        }
+        let idx = reg.number();
+        if idx >= 16 {
+            return unsupported(format!(
+                "register {reg:?} (only 16 vector registers exist without EVEX)"
+            ));
+        }
         let raw = self.cast(v, Ty::v(e), Ty::v(Elem::I64));
+        if half == 1 && !self.simd.ymmh[idx] {
+            let ptr = self.state_vec_ptr(6, idx);
+            self.emit(&format!("store {XMM_TYPE} {raw}, ptr {ptr}, align 8"));
+            return Ok(());
+        }
+        let slot = self.slot(reg, half)?;
         self.emit(&format!("store {XMM_TYPE} {raw}, ptr {slot}"));
+        Ok(())
+    }
+
+    /// Zeroes all 16 upper YMM halves (`ymm0..15` bits 128..255) for `vzeroupper` / `vzeroall`.
+    ///
+    /// When most or all upper halves are not locally allocated, clears the 256-byte `ymm_hi[16]`
+    /// region in `%state` with a single `@llvm.memset.p0.i64` (lowering to one `memory.fill` on
+    /// wasm64 with `+bulk-memory`) and zeroes any locally-tracked `%ymmhN` allocas.
+    fn zero_all_ymmh(&mut self) -> R<()> {
+        let local_count = self.simd.ymmh.iter().filter(|&&used| used).count();
+        if local_count <= 13 {
+            self.support.insert(Support::Memset);
+            let ptr = self.state_vec_ptr(6, 0);
+            self.emit(&format!(
+                "call void @llvm.memset.p0.i64(ptr align 8 {ptr}, i8 0, i64 256, i1 false)"
+            ));
+            for idx in 0..16u32 {
+                if self.simd.ymmh[idx as usize] {
+                    self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
+                }
+            }
+            return Ok(());
+        }
+        for idx in 0..16u32 {
+            self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
+        }
         Ok(())
     }
 
@@ -1003,18 +1074,12 @@ impl FunctionLifter<'_> {
                 let v = self.val(&format!("load i32, ptr {ptr}"));
                 return self.mem_store(ins, &v, Ty::s(Elem::I32));
             }
-            M::Vzeroupper => {
-                for idx in 0..16u32 {
-                    self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
-                }
-                return Ok(());
-            }
+            M::Vzeroupper => return self.zero_all_ymmh(),
             M::Vzeroall => {
                 for idx in 0..16u32 {
                     self.xset_half(Register::YMM0 + idx, 0, "zeroinitializer", Elem::I64)?;
-                    self.xset_half(Register::YMM0 + idx, 1, "zeroinitializer", Elem::I64)?;
                 }
-                return Ok(());
+                return self.zero_all_ymmh();
             }
             M::Movnti => {
                 let bits = self.op_bits(ins, 1)?;

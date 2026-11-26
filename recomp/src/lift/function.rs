@@ -291,16 +291,17 @@ pub(super) fn lift(
                     }
                 }
             }
-            for used in info.info(ins).used_registers() {
+            let ins_info = info.info(ins);
+            for used in ins_info.used_registers() {
                 let reg = used.register();
                 if reg.is_gpr() && reg.full_register().is_gpr64() {
                     regs[reg.full_register().number()] = true;
                 }
-                if ins.mnemonic() != Mnemonic::Vzeroupper {
-                    simd::note_register(reg, &mut vector_regs);
+                if !matches!(ins.mnemonic(), Mnemonic::Vzeroupper | Mnemonic::Vzeroall) {
+                    simd::note_register(reg, used.access(), &mut vector_regs);
                 }
             }
-            simd::note_instruction(ins, &mut vector_regs);
+            simd::note_instruction(ins, ins_info, &mut vector_regs);
         }
         // Direct calls whose target discovery found to be unmapped or non-executable fault.
         for call in &block.calls {
