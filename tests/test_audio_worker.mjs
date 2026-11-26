@@ -2648,15 +2648,17 @@ test('W299 sanitized audio-stats telemetry surfaces all new fields, sanitizes di
 // O43 (#1028/#663): Live Guest Opus/Spatial PCM Drain Telemetry & Pump Hardening
 // ---------------------------------------------------------------------------
 
-test('O43 live headless drain broadcasts audio-stats and first-drain milestone on BroadcastChannel("game-progress") with throttling and zero leaked channels', () => {
+test('O43 live headless drain broadcasts audio-stats and first-drain milestone on BroadcastChannel("game-progress") with throttling and persistent channel reuse', () => {
   const broadcasts = [];
   let openChannels = 0;
+  let constructedChannels = 0;
 
   class MockBroadcastChannel {
     constructor(name) {
       this.name = name;
       this.closed = false;
       openChannels += 1;
+      constructedChannels += 1;
     }
     postMessage(msg) {
       if (this.closed) throw new Error('Channel already closed');
@@ -2688,12 +2690,14 @@ test('O43 live headless drain broadcasts audio-stats and first-drain milestone o
     capacityFrames: 4096,
     outputState: 'headless-drain',
   });
+  assert.equal(openChannels, 0, 'persistent BroadcastChannel is created lazily on first broadcast');
 
   const mock = createMockGuestPcmRing({ capacitySamples: 16384, baseOffset: 64 });
   worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true });
 
-  // Attach publishes initial audio-stats snapshot with guestRingAttached: true.
-  assert.equal(openChannels, 0, 'send-only BroadcastChannel must close immediately');
+  // Attach publishes initial audio-stats snapshot with guestRingAttached: true on one persistent channel.
+  assert.equal(openChannels, 1, 'persistent BroadcastChannel stays open while active');
+  assert.equal(constructedChannels, 1, 'BroadcastChannel constructed once');
   assert.equal(broadcasts.length, 1);
   assert.equal(broadcasts[0].channel, 'game-progress');
   assert.equal(broadcasts[0].msg.type, 'audio-stats');
@@ -2706,7 +2710,8 @@ test('O43 live headless drain broadcasts audio-stats and first-drain milestone o
   fakeNow = 10020; // 20 ms @ 48 kHz = 960 frames
   const firstDrained = worker.drainTick(fakeNow);
   assert.equal(firstDrained, 960);
-  assert.equal(openChannels, 0);
+  assert.equal(openChannels, 1);
+  assert.equal(constructedChannels, 1, 'must reuse single BroadcastChannel for stats + milestone');
 
   const statsAfterFirst = broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats');
   const milestoneLogs = broadcasts.filter((b) => b.msg && typeof b.msg.label === 'string');
@@ -2734,6 +2739,7 @@ test('O43 live headless drain broadcasts audio-stats and first-drain milestone o
   assert.equal(statsAfterInterval.length, 3);
   assert.equal(statsAfterInterval[2].msg.stats.framesDrained, 2880);
   assert.equal(statsAfterInterval[2].msg.stats.guestFramesDrained, 2880);
+  assert.equal(constructedChannels, 1, 'throttled broadcasts must reuse the same BroadcastChannel');
 
   // Idle tick past another 1000 ms with zero new frames must NOT emit redundant broadcasts.
   worker._lastDrainMs = 12500;
@@ -2741,9 +2747,10 @@ test('O43 live headless drain broadcasts audio-stats and first-drain milestone o
   assert.equal(worker.drainTick(fakeNow), 0);
   assert.equal(broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats').length, 3);
 
-  // destroy() flushes detach cleanly with zero leaked channels.
+  // destroy() flushes detach cleanly and closes the persistent BroadcastChannel.
   worker.destroy();
   assert.equal(openChannels, 0);
+  assert.equal(constructedChannels, 1);
   const lastStats = broadcasts.filter((b) => b.msg && b.msg.type === 'audio-stats').pop();
   assert.equal(lastStats.msg.stats.guestRingAttached, false);
 });
@@ -2848,12 +2855,14 @@ test('O43 classic Dedicated Worker context broadcasts live guest PCM drain on Br
   const broadcasts = [];
   let timerFn = null;
   let openChannels = 0;
+  let constructedChannels = 0;
 
   class MockBroadcastChannel {
     constructor(name) {
       this.name = name;
       this.closed = false;
       openChannels += 1;
+      constructedChannels += 1;
     }
     postMessage(msg) {
       broadcasts.push({ channel: this.name, msg });
@@ -2927,7 +2936,8 @@ test('O43 classic Dedicated Worker context broadcasts live guest PCM drain on Br
   fakeNow = 2020;
   timerFn();
 
-  assert.equal(openChannels, 0);
+  assert.equal(openChannels, 1, 'persistent BroadcastChannel stays open while worker is active');
+  assert.equal(constructedChannels, 1, 'single persistent BroadcastChannel reused across attach + drain + milestone');
   const drainedBroadcast = broadcasts.find(
     (b) => b.channel === 'game-progress' && b.msg && b.msg.type === 'audio-stats' && b.msg.stats.guestFramesDrained === 960
   );
@@ -2936,5 +2946,103 @@ test('O43 classic Dedicated Worker context broadcasts live guest PCM drain on Br
   assert.equal(drainedBroadcast.msg.stats.guestRingAttached, true);
 
   workerSelf.onmessage({ data: { stop: true } });
+  assert.equal(openChannels, 0, 'stop() must close the persistent BroadcastChannel');
+});
+
+test('W365 (#663) persistent BroadcastChannel lifecycle on reset/error and zero-alloc drainTick/active pump steady state', () => {
+  const broadcasts = [];
+  let openChannels = 0;
+  let constructedChannels = 0;
+  let throwNextPost = false;
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.closed = false;
+      openChannels += 1;
+      constructedChannels += 1;
+    }
+    postMessage(msg) {
+      if (this.closed) throw new Error('Channel closed');
+      if (throwNextPost) {
+        throwNextPost = false;
+        throw new Error('simulated IPC send failure');
+      }
+      broadcasts.push({ channel: this.name, msg });
+    }
+    close() {
+      if (!this.closed) {
+        this.closed = true;
+        openChannels -= 1;
+      }
+    }
+  }
+
+  let fakeNow = 50000;
+  const worker = new AudioMixerWorker(() => {}, {
+    now: () => fakeNow,
+    outputState: 'headless-drain',
+    autoDrain: false,
+    declickFrames: 0,
+    telemetryBroadcast: true,
+    BroadcastChannelCtor: MockBroadcastChannel,
+    telemetryBroadcastIntervalMs: 1000,
+  });
+
+  worker.handleMessage({
+    init: true,
+    sampleRate: 48000,
+    channels: 2,
+    capacityFrames: 4096,
+    outputState: 'headless-drain',
+  });
+
+  const mock = createMockGuestPcmRing({ capacitySamples: 16384, baseOffset: 64 });
+  worker.attachGuestPcmRing({ ...mock.descriptor, autoPump: true, quantumFrames: 960 });
+  assert.equal(openChannels, 1);
+  assert.equal(constructedChannels, 1);
+
+  // Steady-state headless drain ticks reuse scratch & result object with zero new BroadcastChannels.
+  const scratchAllocsAfterWarmup = worker.getStats().scratchAllocations;
+  worker._lastDrainMs = fakeNow;
+  for (let i = 0; i < 10; i++) {
+    assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.2)), 1920);
+    fakeNow += 20;
+    assert.equal(worker.drainTick(fakeNow), 960);
+  }
+  assert.equal(worker.getStats().scratchAllocations, scratchAllocsAfterWarmup);
+  assert.equal(worker.getStats().zeroAllocDrains, 10);
+  assert.equal(constructedChannels, 1);
+  assert.equal(openChannels, 1);
+
+  // reset() closes the persistent BroadcastChannel cleanly.
+  worker.reset();
+  assert.equal(openChannels, 0, 'reset() must close persistent BroadcastChannel');
+
+  // Subsequent drain lazily re-opens one channel and reuses it.
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.3)), 1920);
+  worker._lastDrainMs = fakeNow;
+  fakeNow += 20;
+  assert.equal(worker.drainTick(fakeNow), 960);
+  assert.equal(openChannels, 1);
+  assert.equal(constructedChannels, 2);
+
+  // A postMessage error closes the broken channel cleanly and recovers on the next broadcast.
+  throwNextPost = true;
+  fakeNow += 1500;
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.3)), 1920);
+  worker._lastDrainMs = fakeNow - 20;
+  assert.equal(worker.drainTick(fakeNow), 960);
+  assert.equal(openChannels, 0, 'failed postMessage must close broken channel');
+
+  fakeNow += 1500;
+  assert.equal(mock.producerPush(makeConstantStereoFrames(960, 0.3)), 1920);
+  worker._lastDrainMs = fakeNow - 20;
+  assert.equal(worker.drainTick(fakeNow), 960);
+  assert.equal(openChannels, 1, 'next broadcast recovers with a fresh persistent channel');
+  assert.equal(constructedChannels, 3);
+
+  // destroy() closes cleanly with zero leaks.
+  worker.destroy();
   assert.equal(openChannels, 0);
 });

@@ -266,44 +266,6 @@
   }
 
   /**
-   * Sends one payload on a short-lived BroadcastChannel and closes it immediately
-   * so send-only workers never retain open BroadcastChannel receive queues.
-   *
-   * @param {Function|null} BroadcastChannelCtor
-   * @param {string} channelName
-   * @param {object} payload
-   * @returns {boolean}
-   */
-  function postBroadcastOnce(BroadcastChannelCtor, channelName, payload) {
-    if (
-      typeof BroadcastChannelCtor !== 'function' ||
-      typeof channelName !== 'string' ||
-      channelName.length === 0
-    ) {
-      return false;
-    }
-    let ch = null;
-    try {
-      ch = new BroadcastChannelCtor(channelName);
-      if (ch && typeof ch.postMessage === 'function') {
-        ch.postMessage(payload);
-        return true;
-      }
-      return false;
-    } catch (_err) {
-      return false;
-    } finally {
-      if (ch && typeof ch.close === 'function') {
-        try {
-          ch.close();
-        } catch (_closeErr) {
-          // Ignore BroadcastChannel close errors.
-        }
-      }
-    }
-  }
-
-  /**
    * Filters a postMessage transfer list so SharedArrayBuffers, detached
    * ArrayBuffers, TypedArray views, and duplicates never trigger DataCloneError.
    *
@@ -3653,6 +3615,49 @@
       this._lastBroadcastGuestFramesDrained = -1;
       this._firstGuestDrainBroadcasted = false;
       this._telemetryBroadcastCount = 0;
+      // W365 (#663): Reuse one persistent BroadcastChannel('game-progress') instead of
+      // constructing/closing a new Mojo IPC channel on every audio-stats broadcast.
+      this._telemetryChannel = null;
+      this._telemetryChannelCtor = null;
+      this._telemetryChannelName = null;
+      this._snapshotOpts = { timestamp: 0 };
+      this._drainGuestOutResult = {
+        framesDrained: 0,
+        requestedFrames: 0,
+        pushedFrames: 0,
+        droppedFrames: 0,
+        underrun: false,
+        underrunFrames: 0,
+        overrun: false,
+        overrunDroppedFrames: 0,
+        peakLevel: 0.0,
+        zeroAlloc: true,
+        sanitizedNonFiniteSamples: 0,
+        softClippedSamples: 0,
+      };
+      this._resampleOpts = {
+        srcFrames: 0,
+        state: null,
+        maxOutputFrames: 0,
+        scratch: this._scratchPool,
+        stats: this._rsStats,
+        softClip: true,
+        limiterKnee: this._limiterKnee,
+      };
+      this._onDrainTimerTick = () => {
+        try {
+          if (
+            this.outputState === OUTPUT_STATES.HEADLESS_DRAIN ||
+            this.outputState === OUTPUT_STATES.SUSPENDED
+          ) {
+            this.drainTick();
+          } else if (this._guestRing !== null && this._guestRingAutoPump) {
+            this._pumpActiveGuestTick();
+          }
+        } catch (_err) {
+          // Never throw from background drain timer.
+        }
+      };
       this._guestReadOpts = {
         softClip: true,
         limiterKnee: this._limiterKnee,
@@ -3736,16 +3741,76 @@
       return null;
     }
 
-    _publishAudioStats(options = {}) {
+    _getTelemetryChannel() {
+      const ctor = this._resolveBroadcastChannelCtor();
+      if (
+        !ctor ||
+        typeof this._broadcastChannelName !== 'string' ||
+        this._broadcastChannelName.length === 0
+      ) {
+        return null;
+      }
+      if (
+        this._telemetryChannel !== null &&
+        this._telemetryChannelCtor === ctor &&
+        this._telemetryChannelName === this._broadcastChannelName
+      ) {
+        return this._telemetryChannel;
+      }
+      this._closeTelemetryChannel();
+      try {
+        const ch = new ctor(this._broadcastChannelName);
+        if (!ch || typeof ch.postMessage !== 'function') {
+          if (ch && typeof ch.close === 'function') {
+            try {
+              ch.close();
+            } catch (_closeErr) {
+              // Ignore BroadcastChannel close errors.
+            }
+          }
+          return null;
+        }
+        this._telemetryChannel = ch;
+        this._telemetryChannelCtor = ctor;
+        this._telemetryChannelName = this._broadcastChannelName;
+        return ch;
+      } catch (_err) {
+        return null;
+      }
+    }
+
+    _closeTelemetryChannel() {
+      const ch = this._telemetryChannel;
+      this._telemetryChannel = null;
+      this._telemetryChannelCtor = null;
+      this._telemetryChannelName = null;
+      if (ch && typeof ch.close === 'function') {
+        try {
+          ch.close();
+        } catch (_err) {
+          // Ignore BroadcastChannel close errors during teardown/reset.
+        }
+      }
+    }
+
+    _postTelemetryMessage(payload) {
+      const ch = this._getTelemetryChannel();
+      if (!ch) {
+        return false;
+      }
+      try {
+        ch.postMessage(payload);
+        return true;
+      } catch (_err) {
+        this._closeTelemetryChannel();
+        return false;
+      }
+    }
+
+    _publishAudioStatsInternal(force, milestone, nowMs) {
       if (!this._telemetryBroadcast) {
         return false;
       }
-      const force = Boolean(options && options.force);
-      const milestone = Boolean(options && options.milestone);
-      const nowMs =
-        options && typeof options.nowMs === 'number' && Number.isFinite(options.nowMs)
-          ? options.nowMs
-          : this._now();
       const framesChanged =
         this.framesDrained !== this._lastBroadcastFramesDrained ||
         this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained;
@@ -3760,19 +3825,19 @@
           return false;
         }
       }
-      const ctor = this._resolveBroadcastChannelCtor();
-      if (!ctor) {
+      if (!this._getTelemetryChannel()) {
         return false;
       }
-      const snapshot = buildAudioTelemetrySnapshot(this, { now: () => nowMs });
-      const sent = postBroadcastOnce(ctor, this._broadcastChannelName, snapshot);
+      this._snapshotOpts.timestamp = nowMs;
+      const snapshot = buildAudioTelemetrySnapshot(this, this._snapshotOpts);
+      const sent = this._postTelemetryMessage(snapshot);
       if (!sent) {
         return false;
       }
       if (milestone && this._guestFramesDrained > 0) {
         const rate = this._guestRing ? this._guestRing.sampleRate : this.sampleRate;
         const peak = Number.isFinite(this._guestPeakLevel) ? this._guestPeakLevel.toFixed(4) : '0.0000';
-        postBroadcastOnce(ctor, this._broadcastChannelName, {
+        this._postTelemetryMessage({
           label: `[audio] first_guest_pcm_drain guest_frames_drained=${this._guestFramesDrained} sampleRate=${rate} peak=${peak}`,
         });
       }
@@ -3783,15 +3848,40 @@
       return true;
     }
 
+    _publishAudioStats(options = {}) {
+      if (!this._telemetryBroadcast) {
+        return false;
+      }
+      const force = Boolean(options && options.force);
+      const milestone = Boolean(options && options.milestone);
+      const nowMs =
+        options && typeof options.nowMs === 'number' && Number.isFinite(options.nowMs)
+          ? options.nowMs
+          : this._now();
+      return this._publishAudioStatsInternal(force, milestone, nowMs);
+    }
+
     _maybeBroadcastAudioStats(nowMs) {
       if (!this._telemetryBroadcast) {
         return false;
       }
       if (this._guestFramesDrained > 0 && !this._firstGuestDrainBroadcasted) {
         this._firstGuestDrainBroadcasted = true;
-        return this._publishAudioStats({ force: true, milestone: true, nowMs });
+        return this._publishAudioStatsInternal(true, true, nowMs);
       }
-      return this._publishAudioStats({ nowMs });
+      if (
+        this.framesDrained === this._lastBroadcastFramesDrained &&
+        this._guestFramesDrained === this._lastBroadcastGuestFramesDrained
+      ) {
+        return false;
+      }
+      if (
+        this._lastTelemetryBroadcastMs !== null &&
+        nowMs - this._lastTelemetryBroadcastMs < this._telemetryBroadcastIntervalMs
+      ) {
+        return false;
+      }
+      return this._publishAudioStatsInternal(false, false, nowMs);
     }
 
     _startDrainTimer() {
@@ -3803,17 +3893,7 @@
         return;
       }
       this._lastDrainMs = this._now();
-      const handle = this._setInterval(() => {
-        try {
-          if (this._shouldDrain()) {
-            this.drainTick();
-          } else if (this._guestRing && this._guestRingAutoPump) {
-            this._pumpActiveGuestTick();
-          }
-        } catch (_err) {
-          // Never throw from background drain timer.
-        }
-      }, this._drainIntervalMs);
+      const handle = this._setInterval(this._onDrainTimerTick, this._drainIntervalMs);
       if (handle && typeof handle.unref === 'function') {
         handle.unref();
       }
@@ -3884,7 +3964,7 @@
           let remaining = maxFrames;
           while (remaining > 0) {
             const step = remaining <= chunkCap ? remaining : chunkCap;
-            const pumpRes = this.drainGuestPcmRing(step);
+            const pumpRes = this._drainGuestPcmRingInto(step, null, this._drainGuestOutResult);
             const stepDrained = this.ring.discardFrames(step);
             drained += stepDrained;
             remaining -= step;
@@ -3951,7 +4031,7 @@
       this._inDrainTick = true;
       let pumped = 0;
       try {
-        const pumpRes = this.drainGuestPcmRing(maxFrames);
+        const pumpRes = this._drainGuestPcmRingInto(maxFrames, null, this._drainGuestOutResult);
         pumped = pumpRes.framesDrained;
       } finally {
         this._inDrainTick = prevInDrainTick;
@@ -4309,7 +4389,7 @@
         this._startDrainTimer();
       }
 
-      this._publishAudioStats({ force: true });
+      this._publishAudioStatsInternal(true, false, this._now());
 
       return {
         attached: true,
@@ -4335,7 +4415,7 @@
         this._stopDrainTimer();
       }
       if (wasAttached) {
-        this._publishAudioStats({ force: true });
+        this._publishAudioStatsInternal(true, false, this._now());
       }
       return {
         detached: true,
@@ -4359,6 +4439,10 @@
      * @param {object} [maybeOptions]
      */
     drainGuestPcmRing(targetOrOptions, maybeOptions) {
+      return this._drainGuestPcmRingInto(targetOrOptions, maybeOptions, null);
+    }
+
+    _drainGuestPcmRingInto(targetOrOptions, maybeOptions, outResult) {
       let output = null;
       let opts = null;
       let maxFramesOpt;
@@ -4419,6 +4503,21 @@
           if (fillSil) {
             output.fill(0, 0, requestedFrames * GUEST_PCM_RING_CHANNELS);
           }
+        }
+        if (outResult) {
+          outResult.framesDrained = 0;
+          outResult.requestedFrames = requestedFrames;
+          outResult.pushedFrames = 0;
+          outResult.droppedFrames = 0;
+          outResult.underrun = false;
+          outResult.underrunFrames = 0;
+          outResult.overrun = false;
+          outResult.overrunDroppedFrames = 0;
+          outResult.peakLevel = 0.0;
+          outResult.zeroAlloc = true;
+          outResult.sanitizedNonFiniteSamples = 0;
+          outResult.softClippedSamples = 0;
+          return outResult;
         }
         return {
           framesDrained: 0,
@@ -4503,6 +4602,21 @@
           if (readRes.framesRead > 0) {
             this.recordActiveVoices(1);
           }
+          if (outResult) {
+            outResult.framesDrained = readRes.framesRead;
+            outResult.requestedFrames = requestedFrames;
+            outResult.pushedFrames = 0;
+            outResult.droppedFrames = 0;
+            outResult.underrun = readRes.underrun;
+            outResult.underrunFrames = readRes.underrunFrames;
+            outResult.overrun = readRes.overrun;
+            outResult.overrunDroppedFrames = readRes.overrunDroppedFrames;
+            outResult.peakLevel = readRes.peakLevel;
+            outResult.zeroAlloc = true;
+            outResult.sanitizedNonFiniteSamples = readRes.sanitizedSamples;
+            outResult.softClippedSamples = readRes.softClippedSamples;
+            return outResult;
+          }
           return {
             framesDrained: readRes.framesRead,
             requestedFrames,
@@ -4552,20 +4666,20 @@
           rsStats.resampledFrames = 0;
           rsStats.nanSanitizedSamples = 0;
           rsStats.clippedSamples = 0;
+          const rsOpts = this._resampleOpts;
+          rsOpts.srcFrames = readRes.framesRead;
+          rsOpts.state = this._guestResamplerState;
+          rsOpts.maxOutputFrames = maxScratchFrames;
+          rsOpts.scratch = this._scratchPool;
+          rsOpts.stats = rsStats;
+          rsOpts.softClip = softClip;
+          rsOpts.limiterKnee = limiterKnee;
           const resampled = resampleLinear(
             srcScratch,
             GUEST_PCM_RING_CHANNELS,
             guestRate,
             targetRate,
-            {
-              srcFrames: readRes.framesRead,
-              state: this._guestResamplerState,
-              maxOutputFrames: maxScratchFrames,
-              scratch: this._scratchPool,
-              stats: rsStats,
-              softClip,
-              limiterKnee,
-            }
+            rsOpts
           );
           this._resampledFrames += rsStats.resampledFrames;
           this._sanitizedSamples += rsStats.nanSanitizedSamples;
@@ -4683,15 +4797,21 @@
         rsStats.resampledFrames = 0;
         rsStats.nanSanitizedSamples = 0;
         rsStats.clippedSamples = 0;
-        pcmToPush = resampleLinear(scratchBuf, GUEST_PCM_RING_CHANNELS, guestRate, targetRate, {
-          srcFrames: sourceFramesToPump,
-          state: this._guestResamplerState,
-          maxOutputFrames: maxScratchFrames,
-          scratch: this._scratchPool,
-          stats: rsStats,
-          softClip,
-          limiterKnee,
-        });
+        const rsOpts = this._resampleOpts;
+        rsOpts.srcFrames = sourceFramesToPump;
+        rsOpts.state = this._guestResamplerState;
+        rsOpts.maxOutputFrames = maxScratchFrames;
+        rsOpts.scratch = this._scratchPool;
+        rsOpts.stats = rsStats;
+        rsOpts.softClip = softClip;
+        rsOpts.limiterKnee = limiterKnee;
+        pcmToPush = resampleLinear(
+          scratchBuf,
+          GUEST_PCM_RING_CHANNELS,
+          guestRate,
+          targetRate,
+          rsOpts
+        );
         framesToPush = Math.floor(pcmToPush.length / GUEST_PCM_RING_CHANNELS);
         this._resampledFrames += rsStats.resampledFrames;
         this._sanitizedSamples += rsStats.nanSanitizedSamples;
@@ -4756,6 +4876,22 @@
         this._maybeBroadcastAudioStats(this._now());
       }
 
+      if (outResult) {
+        outResult.framesDrained = readRes.framesRead;
+        outResult.requestedFrames = requestedFrames;
+        outResult.pushedFrames = pushedFrames;
+        outResult.droppedFrames = droppedFrames;
+        outResult.underrun = readRes.underrun;
+        outResult.underrunFrames = readRes.underrunFrames;
+        outResult.overrun = overrun;
+        outResult.overrunDroppedFrames = overrunDroppedFrames;
+        outResult.peakLevel = readRes.peakLevel;
+        outResult.zeroAlloc = zeroAlloc;
+        outResult.sanitizedNonFiniteSamples = totalSanitized;
+        outResult.softClippedSamples = totalSoftClipped;
+        return outResult;
+      }
+
       return {
         framesDrained: readRes.framesRead,
         requestedFrames,
@@ -4817,6 +4953,7 @@
       if (this.ring) {
         this.ring.reset();
       }
+      this._closeTelemetryChannel();
       this._resetTelemetryAndCounters();
     }
 
@@ -4826,7 +4963,7 @@
         this.framesDrained !== this._lastBroadcastFramesDrained ||
         this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained
       ) {
-        this._publishAudioStats({ force: true });
+        this._publishAudioStatsInternal(true, false, this._now());
       }
       this.reset();
     }
@@ -4837,9 +4974,10 @@
         this.framesDrained !== this._lastBroadcastFramesDrained ||
         this._guestFramesDrained !== this._lastBroadcastGuestFramesDrained
       ) {
-        this._publishAudioStats({ force: true });
+        this._publishAudioStatsInternal(true, false, this._now());
       }
       this.detachGuestPcmRing();
+      this._closeTelemetryChannel();
     }
 
     effectiveGain() {
