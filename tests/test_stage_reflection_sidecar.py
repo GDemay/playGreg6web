@@ -1735,6 +1735,16 @@ class SidecarTests(unittest.TestCase):
         report = sidecar.build_missing_sources_report([{"entries": [tex]}])
         self.assertEqual(report["total_skipped_missing_source"], 1)
 
+    def test_merge_keeps_traced_existing_over_unresolved_new(self):
+        traced = {"stage": "fragment", "bindings": [{"group": 0, "binding": 0, "kind": "texture",
+                                                      "source": {"user_sgpr": 2, "table_byte_offset": 0}}]}
+        entry = {"hash_fnv1a64": "0xaa", "stage": "pixel",
+                 "bindings": [{"group": 0, "binding": 0, "kind": "texture_2d"}]}
+        doc, _ = sidecar.build([{"entries": [entry]}], existing_stages={"0xaa": traced}, unresolved=True)
+        self.assertEqual(doc["stages"]["0xaa"], traced)
+        doc, _ = sidecar.build([{"entries": [entry]}], existing_stages={}, unresolved=True)
+        self.assertEqual(doc["stages"]["0xaa"]["bindings"][0]["source"], {"unresolved": True})
+
     def test_unresolved_source_from_translator_is_validated(self):
         ok = self._sourceless_fragment("0x00000000000000f4", [])
         ok["bindings"].append({"group": 0, "binding": 1, "kind": "texture_2d", "source": {"unresolved": True}})
