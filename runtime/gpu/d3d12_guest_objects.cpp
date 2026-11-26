@@ -260,6 +260,7 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
     detile_texture_ = options_.detile_texture;
+    using_default_detile_ = !detile_texture_;
     if (!detile_texture_) {
         detile_texture_ = [](const TextureDetileRequest& req,
                              const uint8_t* src,

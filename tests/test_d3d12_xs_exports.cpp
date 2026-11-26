@@ -6815,6 +6815,312 @@ void test_g72_non256_linear_texture_single_pass_and_lazy_pad() {
     scene.release_all();
 }
 
+// G73 (#663): single-subresource console-linear textures (layout == 0x100, mips=1, layers=1, d=1)
+// using the default GFX10 detiler take the zero-copy direct band-hashed upload path over guest
+// memory (both 256B-aligned and padded-row widths), while custom set_detile_fn hooks still take
+// precedence when installed.
+void test_g73_console_linear_direct_zero_copy_upload() {
+    constexpr uint32_t kDxgiR8Unorm = 61;
+
+    auto console_linear_desc = [](uint32_t w, uint32_t h) {
+        dg::GuestResourceDesc d = texture_desc(w, h, kDxgiR8Unorm, 0);
+        d.Layout = gpu::gfx10::kConsoleLinearLayout;  // 0x100
+        return d;
+    };
+
+    auto decode_write_textures = [](const gpu::CommandEncoder& enc, uint32_t tex_id) {
+        std::vector<Packet> out;
+        size_t off = 0;
+        while (off + sizeof(GpuPacketHeader) <= enc.size()) {
+            GpuPacketHeader h{};
+            std::memcpy(&h, enc.data() + off, sizeof(h));
+            off += sizeof(h);
+            Packet p;
+            p.opcode = static_cast<GpuOpcode>(h.opcode);
+            p.payload.assign(enc.data() + off, enc.data() + off + h.payload_bytes);
+            off += h.payload_bytes;
+            if (p.opcode == GpuOpcode::WriteTexture &&
+                payload_as<GpuWriteTexturePayload>(p).texture_id == tex_id) {
+                out.push_back(std::move(p));
+            }
+        }
+        CHECK(off == enc.size());
+        return out;
+    };
+
+    auto verify_direct_rows = [](const Packet& pkt, uint32_t expected_origin_y, uint32_t width,
+                                 uint32_t expected_height, uint32_t expected_pitch,
+                                 const std::vector<uint8_t>& full_surface) {
+        const auto wt = payload_as<GpuWriteTexturePayload>(pkt);
+        CHECK(wt.origin_x == 0 && wt.origin_y == expected_origin_y && wt.origin_z == 0);
+        CHECK(wt.width == width && wt.height == expected_height && wt.depth_or_layers == 1);
+        CHECK(wt.bytes_per_row == expected_pitch && wt.rows_per_image == expected_height);
+        const size_t expected_len = size_t{expected_height} * expected_pitch;
+        CHECK(wt.data_len == expected_len);
+        CHECK(pkt.payload.size() == sizeof(GpuWriteTexturePayload) + expected_len);
+        if (pkt.payload.size() != sizeof(GpuWriteTexturePayload) + expected_len) {
+            return;
+        }
+        const uint8_t* dst = pkt.payload.data() + sizeof(GpuWriteTexturePayload);
+        const uint8_t* src = full_surface.data() + size_t{expected_origin_y} * expected_pitch;
+        // Zero-copy borrow preserves the entire pitched slice directly from guest memory.
+        CHECK(std::memcmp(dst, src, expected_len) == 0);
+    };
+
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    int32_t result = -1;
+
+    // 1) 256B-aligned width: 512x128 R8_UNORM (layout == 0x100, pitch == 512, 2 bands of 64 rows).
+    {
+        constexpr uint32_t kW = 512, kH = 128, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kPitch} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(console_linear_desc(kW, kH))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> surface(size_t{kPitch} * kH);
+        for (uint32_t y = 0; y < kH; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                surface[size_t{y} * kPitch + x] = static_cast<uint8_t>(((y * 11u + x * 5u) & 0xFEu) | 1u);
+            }
+        }
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+
+        // Initial full upload.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+
+        // Unchanged -> skipped.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+
+        // Partial band update: modify ONLY band 1 (rows 64..127).
+        for (uint32_t y = 64; y < 128; ++y) {
+            std::memset(surface.data() + size_t{y} * kPitch, static_cast<uint8_t>(0x70u + (y - 64u)), kW);
+        }
+        CHECK(com::write_guest(mem + size_t{64} * kPitch, surface.data() + size_t{64} * kPitch,
+                               size_t{64} * kPitch));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 64, kW, 64, kPitch, surface);
+            }
+        }
+
+        // Full update: modify both bands -> coalesces into 1 WriteTexture covering all 128 rows.
+        for (size_t i = 0; i < surface.size(); ++i) {
+            surface[i] = static_cast<uint8_t>((i * 19u + 3u) | 1u);
+        }
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    // 2) Non-256B-aligned width: 300x192 R8_UNORM (layout == 0x100, src_pitch == 512, 3 bands of 64).
+    {
+        constexpr uint32_t kW = 300, kH = 192, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kPitch} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(console_linear_desc(kW, kH))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        // Populate active rows [0..300) + distinctive non-zero sentinel in padding [300..512).
+        std::vector<uint8_t> surface(size_t{kPitch} * kH, 0xA7u);
+        for (uint32_t y = 0; y < kH; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                surface[size_t{y} * kPitch + x] = static_cast<uint8_t>(((y * 7u + x * 3u) & 0xFEu) | 1u);
+            }
+        }
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+
+        // Initial upload: zero-copy direct borrow includes intact 512B-pitched guest rows.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+
+        // Unchanged -> skipped.
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+
+        // Partial band update: modify ONLY band 1 (rows 64..127).
+        for (uint32_t y = 64; y < 128; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                surface[size_t{y} * kPitch + x] = static_cast<uint8_t>(0x80u ^ ((y + x) & 0x3Fu));
+            }
+        }
+        CHECK(com::write_guest(mem + size_t{64} * kPitch, surface.data() + size_t{64} * kPitch,
+                               size_t{64} * kPitch));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 64, kW, 64, kPitch, surface);
+            }
+        }
+
+        // Non-adjacent band update: modify band 0 and band 2 -> 2 separate WriteTexture packets.
+        for (uint32_t y = 0; y < 64; ++y) {
+            std::memset(surface.data() + size_t{y} * kPitch, 0x3Cu, kW);
+        }
+        for (uint32_t y = 128; y < 192; ++y) {
+            std::memset(surface.data() + size_t{y} * kPitch, 0xD1u, kW);
+        }
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 2);
+            if (wts.size() == 2) {
+                verify_direct_rows(wts[0], 0, kW, 64, kPitch, surface);
+                verify_direct_rows(wts[1], 128, kW, 64, kPitch, surface);
+            }
+        }
+
+        // Full update: modify all 3 bands -> 1 coalesced WriteTexture covering all 192 rows.
+        for (uint32_t y = 0; y < kH; ++y) {
+            for (uint32_t x = 0; x < kW; ++x) {
+                surface[size_t{y} * kPitch + x] = static_cast<uint8_t>(((y * 13u + x) & 0xFEu) | 1u);
+            }
+        }
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    // 3) Single-band console-linear texture (300x48 R8_UNORM, blocks_y <= kUploadBandRows).
+    {
+        constexpr uint32_t kW = 300, kH = 48, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kPitch} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(console_linear_desc(kW, kH))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> surface(size_t{kPitch} * kH, 0x5Bu);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+        {
+            gpu::CommandEncoder enc;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, enc));
+            CHECK(decode_write_textures(enc, tex_id).empty());
+        }
+        surface[12 * kPitch + 42] = 0xE9u;
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+        {
+            gpu::CommandEncoder enc;
+            CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+            const auto wts = decode_write_textures(enc, tex_id);
+            CHECK(wts.size() == 1);
+            if (wts.size() == 1) {
+                verify_direct_rows(wts[0], 0, kW, kH, kPitch, surface);
+            }
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    // 4) Custom set_detile_fn hook must still take precedence over the zero-copy fast path.
+    {
+        uint32_t custom_calls = 0;
+        constexpr uint8_t kCustomFill = 0x4Du;
+        dev->set_detile_fn([&](const dg::TextureDetileRequest& req, const uint8_t* src, size_t src_bytes,
+                               uint8_t* dst, size_t dst_bytes) -> bool {
+            ++custom_calls;
+            CHECK(req.layout == gpu::gfx10::kConsoleLinearLayout);
+            CHECK(src != nullptr && src_bytes >= size_t{req.dst_row_pitch} * req.height);
+            std::memset(dst, kCustomFill, dst_bytes);
+            return true;
+        });
+
+        constexpr uint32_t kW = 300, kH = 128, kPitch = 512;
+        const uint64_t mem = com::guest_alloc(size_t{kPitch} * kH);
+        CHECK(mem != 0);
+        const uint64_t tex_obj = fx.create(scene.device, Slot2::CreatePlacedResourceX,
+                                           {I(mem), I(put(console_linear_desc(kW, kH))), I(0), I(0)},
+                                           dg::IID_ID3D12Resource, &result);
+        CHECK(result == 0);
+        const uint32_t tex_id = object_of<dg::Resource>(tex_obj)->id();
+
+        std::vector<uint8_t> surface(size_t{kPitch} * kH, 0x19u);
+        CHECK(com::write_guest(mem, surface.data(), surface.size()));
+
+        gpu::CommandEncoder enc;
+        CHECK(dev->sync_bound_texture_memory(tex_id, enc));
+        CHECK(custom_calls == 1u);
+        const auto wts = decode_write_textures(enc, tex_id);
+        CHECK(wts.size() == 1);
+        if (wts.size() == 1) {
+            const std::vector<uint8_t> expected(size_t{kPitch} * kH, kCustomFill);
+            verify_direct_rows(wts[0], 0, kW, kH, kPitch, expected);
+        }
+
+        fx.vcall(tex_obj, Slot::Release);
+    }
+
+    scene.release_all();
+}
+
 // R40: native CPU-window pages are shared page views (O36), which carry no MEM_WRITE_WATCH: their
 // writes are tracked by write protection (os::take_written_pages). After the first flush only
 // pages written since are compared and uploaded, including writes through another address of the
@@ -6932,6 +7238,7 @@ int main() {
     test_window_write_marks_flush();
     test_window_texture_sync_markpass_and_inplace_hash();
     test_g72_non256_linear_texture_single_pass_and_lazy_pad();
+    test_g73_console_linear_direct_zero_copy_upload();
     test_shared_view_write_tracking_flush();
     test_export_registration();
     test_create_device();
