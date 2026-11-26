@@ -302,6 +302,7 @@ struct InterfaceInfo;
 enum class SlotPolicy : uint8_t {
     Trap = 0,           // FaultKind::UnimplementedSlot through the O9 fault handler (default)
     ReturnNotImpl = 1,  // rax = E_NOTIMPL, return to the caller
+    ReturnFixed = 2,    // rax = InterfaceInfo::stub_result, return to the caller
 };
 
 // One vtable slot after IUnknown. thunk == nullptr declares a named stub.
@@ -317,6 +318,7 @@ struct InterfaceInfo {
     std::span<const Guid> extra_iids{};     // further IIDs answered with this interface (bases)
     uint32_t slot_count = 0;                // total vtable slots, >= first_method_slot() + methods
     SlotPolicy policy = SlotPolicy::Trap;
+    int32_t stub_result = 0;                // HRESULT for SlotPolicy::ReturnFixed
     bool iunknown = true;                   // slots 0..2 are QueryInterface, AddRef, Release
     const void* host_tag = nullptr;         // identifies the host interface class
 
@@ -337,6 +339,7 @@ struct InterfaceInfo {
 struct InterfaceOptions {
     uint32_t slot_count = 0;  // 0: exactly the declared slots
     SlotPolicy policy = SlotPolicy::Trap;
+    int32_t stub_result = 0;  // HRESULT for SlotPolicy::ReturnFixed
     bool iunknown = true;
     std::span<const Guid> extra_iids{};
 };
@@ -371,6 +374,7 @@ constexpr Interface<Host> declare_interface(const char* name,
     info.extra_iids = options.extra_iids;
     info.iunknown = options.iunknown;
     info.policy = options.policy;
+    info.stub_result = options.stub_result;
     const uint32_t declared = info.first_method_slot() + static_cast<uint32_t>(methods.size());
     info.slot_count = options.slot_count > declared ? options.slot_count : declared;
     info.host_tag = detail::type_tag<Host>();

@@ -648,6 +648,11 @@ void stub_thunk(void* raw) {
         detail::pop_return(state);
         return;
     }
+    if (stub->iface->policy == SlotPolicy::ReturnFixed) {
+        state.gpr[GuestReg::Rax] = static_cast<uint64_t>(static_cast<int64_t>(stub->iface->stub_result));
+        detail::pop_return(state);
+        return;
+    }
     raise_fault(FaultKind::UnimplementedSlot, &state, state.rip, stub->slot);
 }
 
