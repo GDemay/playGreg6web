@@ -1,5 +1,6 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/xbox_embedded_native.h"
 
 #include <algorithm>
 #include <atomic>
@@ -3011,13 +3012,46 @@ bool dxil_hash_digest(const uint8_t* p, size_t n, Device::DxilDigest* out) {
     return false;
 }
 
+// The console-native program of `want` the container carries in its DXIL part
+// (xbox_embedded_native.h), as a native stage record; written to the pipeline dump like a slot-57
+// stage (metadata: the unpacked FSSM blob). Stays empty without one.
+void embedded_native_stage(Device& dev, const std::vector<uint8_t>& bytes, xbox::EmbeddedStage want,
+                           Device::NativeStageRecord* out) {
+    *out = Device::NativeStageRecord{};
+    xbox::EmbeddedNative native;
+    std::string error;
+    if (!xbox::extract_embedded_native(bytes.data(), bytes.size(), &native, &error)) {
+        return;
+    }
+    const xbox::EmbeddedProgram* p = xbox::find_embedded(native, want);
+    if (p == nullptr) {
+        return;
+    }
+    out->code_identity = shader_identity(p->code.data(), p->code.size());
+    out->identity = native_stage_identity(p->code.data(), p->code.size(), native.fssm.data(), native.fssm.size());
+    out->code_bytes = static_cast<uint32_t>(p->code.size());
+    out->metadata_bytes = static_cast<uint32_t>(native.fssm.size());
+    if (PipelineDump* dump = dev.pipeline_dump()) {
+        const auto kind = want == xbox::EmbeddedStage::Ps   ? PipelineDump::NativeStageKind::Pixel
+                          : want == xbox::EmbeddedStage::Cs ? PipelineDump::NativeStageKind::Compute
+                                                            : PipelineDump::NativeStageKind::Vertex;
+        dump->native_stage(out->code_identity, out->identity, kind, /*layout_b=*/false, p->code.data(), p->code.size(),
+                           native.fssm.data(), native.fssm.size());
+    }
+}
+
 // Reads a shader's bytecode and returns its identity (0 = no shader). False on unreadable input.
 // `digest` (optional) receives the container's HASH digest; it stays all-zero without one.
+// `embedded` (optional) receives the container's own native stage of `want` (embedded_native_stage).
 bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage, uint64_t* identity,
-                 Device::DxilDigest* digest = nullptr) {
+                 Device::DxilDigest* digest = nullptr, Device::NativeStageRecord* embedded = nullptr,
+                 xbox::EmbeddedStage want = xbox::EmbeddedStage::Vs) {
     *identity = 0;
     if (digest != nullptr) {
         digest->fill(0);
+    }
+    if (embedded != nullptr) {
+        *embedded = Device::NativeStageRecord{};
     }
     if (code.pShaderBytecode == 0 || code.BytecodeLength == 0) {
         return true;
@@ -3041,6 +3075,9 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
     if (PipelineDump* dump = dev.pipeline_dump()) {
         dump->dxil(*identity, has_digest ? &d : nullptr, dxil_shader_kind(bytes.data(), bytes.size()), bytes.data(),
                    bytes.size());
+    }
+    if (embedded != nullptr) {
+        embedded_native_stage(dev, bytes, want, embedded);
     }
     return true;
 }
@@ -3159,7 +3196,9 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         return kEInvalidArg;
     }
     pso::D3D12GraphicsPsoDesc& d = src.desc;
-    if (!read_shader(*this, g.VS, "VS", &d.vs, &src.vs_digest) || !read_shader(*this, g.PS, "PS", &d.ps, &src.ps_digest) ||
+    NativeStageRecord embedded_vs, embedded_ps;
+    if (!read_shader(*this, g.VS, "VS", &d.vs, &src.vs_digest, &embedded_vs, xbox::EmbeddedStage::Vs) ||
+        !read_shader(*this, g.PS, "PS", &d.ps, &src.ps_digest, &embedded_ps, xbox::EmbeddedStage::Ps) ||
         !read_shader(*this, g.DS, "DS", &d.ds) || !read_shader(*this, g.HS, "HS", &d.hs) ||
         !read_shader(*this, g.GS, "GS", &d.gs)) {
         return kEInvalidArg;
@@ -3191,6 +3230,13 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
             }
             count(find_native_stage(*digest, record) ? xbox::Counter::DxilStagesJoined
                                                      : xbox::Counter::DxilStagesNotJoined);
+        }
+    }
+    // A stage no slot-57 stage joins runs the native code its own container carries (G66).
+    for (auto [embedded, record] : {std::pair{&embedded_vs, &src.native_vs}, std::pair{&embedded_ps, &src.native_ps}}) {
+        if (record->identity == 0 && embedded->identity != 0) {
+            *record = *embedded;
+            count(xbox::Counter::DxilStagesEmbeddedNative);
         }
     }
     d.stream_output_enabled = g.StreamOutput.NumEntries > 0;
@@ -3735,7 +3781,8 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     }
     pso::D3D12ComputePsoDesc d{};
     DxilDigest cs_digest{};
-    if (!read_shader(*this, g.CS, "CS", &d.cs, &cs_digest)) {
+    NativeStageRecord embedded_cs;
+    if (!read_shader(*this, g.CS, "CS", &d.cs, &cs_digest, &embedded_cs, xbox::EmbeddedStage::Cs)) {
         return kEInvalidArg;
     }
     if (d.cs == 0) {
@@ -3747,6 +3794,10 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     if (native_index_size() != 0 && cs_digest != kZero) {
         count(find_native_stage(cs_digest, &native_cs) ? xbox::Counter::DxilStagesJoined
                                                        : xbox::Counter::DxilStagesNotJoined);
+    }
+    if (native_cs.identity == 0 && embedded_cs.identity != 0) {
+        native_cs = embedded_cs;
+        count(xbox::Counter::DxilStagesEmbeddedNative);
     }
     if (const ShaderPackIndex* pack = options_.shader_pack.get(); pack != nullptr) {
         uint64_t pack_key = 0;
