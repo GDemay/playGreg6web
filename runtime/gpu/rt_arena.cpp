@@ -76,6 +76,7 @@ const char* skip_reason_name(SkipReason r) {
     case SkipReason::NotResident: return "not_resident";
     case SkipReason::Atomic64: return "atomic64";
     case SkipReason::TranslatorPending: return "translator_pending";
+    case SkipReason::StructuresUnavailable: return "structures_unavailable";
     case SkipReason::Count: break;
     }
     return "?";
@@ -560,6 +561,11 @@ void Arena::mark_cpu_dirty(uint64_t page) {
 }
 
 bool Arena::is_resident(uint64_t page) const { return pages_.count(page) != 0; }
+
+bool Arena::is_gpu_owned(uint64_t page) const {
+    const auto it = pages_.find(page);
+    return it != pages_.end() && it->second.gpu_owned;
+}
 
 std::vector<Upload> Arena::take_uploads() {
     std::vector<Upload> out;

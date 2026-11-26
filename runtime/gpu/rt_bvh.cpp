@@ -741,17 +741,27 @@ const char* prelude_wgsl() {
 @group(3) @binding(20) var<storage, read> pg6_arena_dir: array<u32>;
 @group(3) @binding(21) var<storage, read_write> pg6_rt_stats: array<atomic<u32>>;
 
+// A non-resident access: bumps rt_fault (word 0) and logs the page for the runtime to make resident
+// (word 1 = log attempts, words 2..31 = faulting page + 1, first 30 only). rt_residency.h FaultTracker.
+fn pg6_fault(page: u32) {
+    atomicAdd(&pg6_rt_stats[0], 1u);
+    let i = atomicAdd(&pg6_rt_stats[1], 1u);
+    if (i < 30u) {
+        atomicStore(&pg6_rt_stats[2u + i], page + 1u);
+    }
+}
+
 // Dword at a 40-bit address (x = low 32 bits, y = bits 39:32). Unmapped: counts a fault, reads 0.
 fn pg6_load32(addr: vec2<u32>) -> u32 {
     let page = (addr.x >> 16u) | ((addr.y & 0xffu) << 16u);
     let t = pg6_arena_dir[page >> 12u];
     if (t == 0u) {
-        atomicAdd(&pg6_rt_stats[0], 1u);
+        pg6_fault(page);
         return 0u;
     }
     let e = pg6_arena_dir[4096u + (t - 1u) * 4096u + (page & 0xfffu)];
     if ((e & 0x80000000u) == 0u) {
-        atomicAdd(&pg6_rt_stats[0], 1u);
+        pg6_fault(page);
         return 0u;
     }
     let w = (e & 0x1fffffffu) * 16384u + ((addr.x & 0xffffu) >> 2u);

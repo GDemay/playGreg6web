@@ -14,12 +14,14 @@
 
 #include "gpu/rt_arena.h"
 #include "gpu/rt_bvh.h"
+#include "gpu/rt_residency.h"
 #include "rt_bvh_vectors.h"
 
 namespace {
 using namespace playgta6::gpu;
+constexpr uint32_t kFaultClear = 31;  // stats words 1..31
 constexpr uint64_t kWait = UINT64_MAX;
-constexpr uint32_t kArenaPages = 8;  // pages per arena in this test (kArenaCount arenas)
+constexpr uint32_t kArenaPages = 16;  // pages per arena in this test (kArenaCount arenas)
 constexpr uint32_t kStride = 16;     // input dwords per vector
 
 std::string sv(wgpu::StringView s) {
@@ -149,9 +151,9 @@ int main() {
     const auto& dir = arena.directory();
     wgpu::Buffer dbuf = make_buf(dir.size() * 4, st);
     queue.WriteBuffer(dbuf, 0, dir.data(), dir.size() * 4);
-    wgpu::Buffer sbuf = make_buf(16, st);
-    const uint32_t zero4[4] = {0, 0, 0, 0};
-    queue.WriteBuffer(sbuf, 0, zero4, 16);
+    wgpu::Buffer sbuf = make_buf(256, st);
+    const uint32_t zero64[64] = {};
+    queue.WriteBuffer(sbuf, 0, zero64, sizeof zero64);
 
     const size_t n = vectors.size();
     std::vector<uint32_t> io(n * 20, 0);
@@ -221,26 +223,41 @@ int main() {
     bd3.entries = g3;
     wgpu::BindGroup bg3 = device.CreateBindGroup(&bd3);
 
-    wgpu::CommandEncoder enc = device.CreateCommandEncoder();
-    wgpu::ComputePassEncoder pass = enc.BeginComputePass();
-    pass.SetPipeline(pipe);
-    pass.SetBindGroup(0, bg0);
-    pass.SetBindGroup(rt_arena::kBindGroup, bg3);
-    pass.DispatchWorkgroups(static_cast<uint32_t>(n));
-    pass.End();
-    enc.CopyBufferToBuffer(iobuf, 0, rb, 0, io.size() * 4);
-    wgpu::CommandBuffer cb = enc.Finish();
-    queue.Submit(1, &cb);
-    wgpu::MapAsyncStatus ms = wgpu::MapAsyncStatus::Error;
-    instance.WaitAny(rb.MapAsync(
-                         wgpu::MapMode::Read, 0, io.size() * 4, wgpu::CallbackMode::WaitAnyOnly,
-                         [](wgpu::MapAsyncStatus s, wgpu::StringView, wgpu::MapAsyncStatus* out) { *out = s; }, &ms),
-                     kWait);
-    if (ms != wgpu::MapAsyncStatus::Success) {
+    wgpu::Buffer srb = make_buf(128, wgpu::BufferUsage::MapRead | wgpu::BufferUsage::CopyDst);
+    const auto map_read = [&](wgpu::Buffer& b, uint64_t bytes, std::vector<uint32_t>* out) {
+        wgpu::MapAsyncStatus ms = wgpu::MapAsyncStatus::Error;
+        instance.WaitAny(b.MapAsync(
+                             wgpu::MapMode::Read, 0, bytes, wgpu::CallbackMode::WaitAnyOnly,
+                             [](wgpu::MapAsyncStatus s, wgpu::StringView, wgpu::MapAsyncStatus* o) { *o = s; }, &ms),
+                         kWait);
+        if (ms != wgpu::MapAsyncStatus::Success) return false;
+        const uint32_t* p = static_cast<const uint32_t*>(b.GetConstMappedRange(0, bytes));
+        out->assign(p, p + bytes / 4);
+        b.Unmap();
+        return true;
+    };
+    // One dispatch of every vector; reads back the results and the first 32 stats words.
+    const auto dispatch = [&](std::vector<uint32_t>* results, std::vector<uint32_t>* stats) {
+        wgpu::CommandEncoder enc = device.CreateCommandEncoder();
+        wgpu::ComputePassEncoder pass = enc.BeginComputePass();
+        pass.SetPipeline(pipe);
+        pass.SetBindGroup(0, bg0);
+        pass.SetBindGroup(rt_arena::kBindGroup, bg3);
+        pass.DispatchWorkgroups(static_cast<uint32_t>(n));
+        pass.End();
+        enc.CopyBufferToBuffer(iobuf, 0, rb, 0, io.size() * 4);
+        enc.CopyBufferToBuffer(sbuf, 0, srb, 0, 128);
+        wgpu::CommandBuffer cb = enc.Finish();
+        queue.Submit(1, &cb);
+        return map_read(rb, io.size() * 4, results) && map_read(srb, 128, stats);
+    };
+    std::vector<uint32_t> resv, stats;
+    if (!dispatch(&resv, &stats)) {
         fail("map failed");
         return 1;
     }
-    const uint32_t* res = static_cast<const uint32_t*>(rb.GetConstMappedRange(0, io.size() * 4));
+    const uint32_t* res = resv.data();
+    if (stats[0] != 0) fail("resident run reported faults");
 
     for (size_t i = 0; i < n; ++i) {
         const auto& v = vectors[i];
@@ -260,7 +277,47 @@ int main() {
             fail(b);
         }
     }
-    rb.Unmap();
+
+    // Fault service: vector 0 now reads its nodes from a page that is not resident. The GPU counts and
+    // logs the fault, the tracker makes the page resident, the next frame reads the right bits.
+    {
+        const auto& v0 = vectors[0];
+        const uint64_t delta = static_cast<uint64_t>(n + 8) * rt_arena::kPageBytes;
+        const uint64_t shift_dw = (delta - (1 * rt_arena::kPageBytes)) >> 8;  // vector 0 was relocated by 1 page
+        std::map<uint64_t, uint32_t> fmem;
+        for (const auto& m : v0.memory)
+            for (size_t i = 0; i < m.dwords.size(); ++i) fmem[m.addr + delta + 4 * i] = m.dwords[i];
+        io[0] = v0.desc[0] + static_cast<uint32_t>(shift_dw);
+        queue.WriteBuffer(iobuf, 0, io.data(), io.size() * 4);
+        std::vector<uint32_t> r1, s1;
+        if (!dispatch(&r1, &s1)) return fail("map failed (fault run)"), 1;
+        if (s1[0] == 0) fail("non-resident access did not count a fault");
+        if (std::memcmp(&r1[n * 16], v0.expected, 16) == 0) fail("faulting vector unexpectedly produced the hit");
+        rt_residency::FaultTracker tracker;
+        if (!tracker.consume(s1.data(), s1.size(), arena)) fail("tracker saw no fault");
+        const uint64_t want_page = rt_arena::page_of(rt_bvh_vectors::kBase + delta);
+        const auto ups = arena.take_uploads();
+        bool found = false;
+        for (const auto& u : ups) {
+            found |= u.page == want_page;
+            for (const auto& [a, w] : fmem)
+                if (rt_arena::page_of(a) == u.page)
+                    queue.WriteBuffer(abuf[u.arena], (u.slot * page_words + ((a & (rt_arena::kPageBytes - 1)) >> 2)) * 4,
+                                      &w, 4);
+        }
+        if (!found) fail("tracker did not make the faulting page resident");
+        const auto& d2 = arena.directory();
+        queue.WriteBuffer(dbuf, 0, d2.data(), d2.size() * 4);
+        uint32_t clear[kFaultClear] = {};
+        queue.WriteBuffer(sbuf, 4, clear, sizeof clear);
+        std::vector<uint32_t> r2, s2;
+        if (!dispatch(&r2, &s2)) return fail("map failed (second run)"), 1;
+        if (std::memcmp(&r2[n * 16], v0.expected, 16) != 0) fail("vector 0 wrong after the fault was serviced");
+        if (s2[0] != s1[0] || s2[1] != 0) fail("faults continued after servicing");
+        if (arena.stats().faults != s1[0]) fail("arena rt_fault not updated");
+        std::printf("test_rt_bvh_gpu: fault service OK (%u faults, %llu page(s) serviced)\n", s1[0],
+                    (unsigned long long)tracker.stats().pages_serviced);
+    }
     for (const auto& e : errors) fail("device error: " + e);
     if (failures == 0) std::printf("test_rt_bvh_gpu: OK (%zu vectors bit-exact on GPU)\n", n);
     return failures == 0 ? 0 : 1;
