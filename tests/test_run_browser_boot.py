@@ -3995,13 +3995,633 @@ class T95ChromeMenuFlow4BootOptionsAndSwapchainProbeTests(unittest.TestCase):
             self.assertEqual(cmd_meta["input_script"], "chrome-to-ingame")
 
 
+class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
+    def test_chrome_menu_flow_6_preset_validation_url_help_dry_run_and_cli(self):
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-menu-flow-6"), "chrome-menu-flow-6")
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-menu-flow-6"), "chrome-menu-flow-6")
+        self.assertEqual(
+            list(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+            sorted(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+        )
+        self.assertEqual(rbb.sanitize_input_script_preset("chrome-menu-flow-6"), "chrome-menu-flow-6")
+        self.assertEqual(rbb.sanitize_input_script_preset("  CHROME-MENU-FLOW-6  "), "chrome-menu-flow-6")
+        self.assertEqual(rbb.validate_input_script_preset("chrome-menu-flow-6"), "chrome-menu-flow-6")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="chrome-menu-flow-6"),
+            "http://127.0.0.1:8080/?inputScript=chrome-menu-flow-6",
+        )
+
+        help_text = rbb.build_arg_parser().format_help()
+        self.assertIn("chrome-menu-flow-6", help_text)
+        self.assertIn("--warm-boot-check", help_text)
+        self.assertIn("--warm-duration-s", help_text)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-chrome-menu-flow-6",
+                "--input-script",
+                "chrome-menu-flow-6",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["input_script"], "chrome-menu-flow-6")
+            self.assertEqual(payload["inputScript"], "chrome-menu-flow-6")
+            self.assertIs(payload["warm_boot_check"], False)
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=chrome-menu-flow-6",
+            )
+
+            code_cli, _, err_cli, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "run-chrome-menu-flow-6",
+                "--input-script",
+                "chrome-menu-flow-6",
+            )
+            self.assertEqual(code_cli, 0, err_cli)
+            self.assertEqual(sessions[0]["input_script"], "chrome-menu-flow-6")
+            run_dir = fx.build / "runs" / "run-chrome-menu-flow-6"
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+            digest_text = (run_dir / "digest.txt").read_text(encoding="utf-8")
+            self.assertEqual(report["inputScript"], "chrome-menu-flow-6")
+            self.assertEqual(report["summary"]["inputScript"], "chrome-menu-flow-6")
+            self.assertEqual(telemetry["inputScript"], "chrome-menu-flow-6")
+            self.assertEqual(cmd_meta["input_script"], "chrome-menu-flow-6")
+            self.assertIn("input_script: chrome-menu-flow-6", digest_text)
+
+    def test_warm_boot_check_reuses_user_data_dir_cleans_up_and_reports_deltas(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # Invalid --warm-duration-s returns exit 2
+            for bad in ("0", "-5", "nan"):
+                bad_code, _, _, _, _ = fx.run_cli("--smoke", "--dry-run", "--warm-boot-check", "--warm-duration-s", bad)
+                self.assertEqual(bad_code, 2, f"expected exit 2 for --warm-duration-s {bad}")
+
+            # Dry-run includes warm_boot_check and warm_duration_s
+            dry_code, dry_out, dry_err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "warm-dry",
+                "--duration-s",
+                "45",
+                "--warm-boot-check",
+                "--warm-duration-s",
+                "25",
+            )
+            self.assertEqual(dry_code, 0, dry_err)
+            dry_payload = json.loads(dry_out)
+            self.assertIs(dry_payload["warm_boot_check"], True)
+            self.assertEqual(dry_payload["warm_duration_s"], 25.0)
+            self.assertEqual(dry_payload["duration_s"], 45.0)
+
+            # End-to-end mocked cold + warm passes verifying profile reuse & cleanup
+            seen_calls: list[dict[str, Any]] = []
+            sentinel_present_on_warm = {"ok": False}
+
+            def mock_warm_session(**kw):
+                seen_calls.append(dict(kw))
+                profile = kw.get("user_data_dir")
+                self.assertIsInstance(profile, Path)
+                self.assertTrue(profile.is_dir())
+                self.assertIs(kw.get("cleanup_user_data_dir"), False)
+                sentinel = profile / "opfs-sentinel.dat"
+                if len(seen_calls) == 1:
+                    sentinel.write_text("cached-opfs-entry", encoding="utf-8")
+                    cold_probe = make_sample_probe(
+                        boot_mode="real-wasm64",
+                        session_state="running_wasm",
+                        stage="MAIN_MENU",
+                        presents=60,
+                        real_draws=120,
+                        fallback_draws=0,
+                        milestones=[
+                            {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 120.0},
+                            {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 2000.0},
+                            {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 10000.0},
+                            {"milestone": "START_SCREEN", "index": 10, "reached": True, "elapsedMs": 14000.0},
+                            {"milestone": "MAIN_MENU", "index": 12, "reached": True, "elapsedMs": 22000.0},
+                        ],
+                    )
+                    cold_probe["tracerSummary"]["playabilityState"] = "MAIN_MENU"
+                    cold_probe["tracerSummary"]["liveTelemetry"] = {
+                        "opfs": {
+                            "opfsHits": 2,
+                            "opfsMisses": 18,
+                            "opfsWrites": 18,
+                            "bytesFromOpfs": 1_048_576,
+                            "opfsHitRatePct": 10.0,
+                        }
+                    }
+                    return make_fake_session_result(
+                        probe=cold_probe,
+                        first_present_ms=2000.0,
+                        console_lines=[r"[   1.00s] [console.log] cold boot from C:\Users\secret\game.exe"],
+                    )
+                else:
+                    sentinel_present_on_warm["ok"] = sentinel.is_file() and sentinel.read_text(encoding="utf-8") == "cached-opfs-entry"
+                    warm_probe = make_sample_probe(
+                        boot_mode="real-wasm64",
+                        session_state="running_wasm",
+                        stage="MAIN_MENU",
+                        presents=75,
+                        real_draws=150,
+                        fallback_draws=0,
+                        milestones=[
+                            {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 40.0},
+                            {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 900.0},
+                            {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 4000.0},
+                            {"milestone": "START_SCREEN", "index": 10, "reached": True, "elapsedMs": 6500.0},
+                            {"milestone": "MAIN_MENU", "index": 12, "reached": True, "elapsedMs": 11000.0},
+                        ],
+                    )
+                    warm_probe["tracerSummary"]["playabilityState"] = "MAIN_MENU"
+                    warm_probe["tracerSummary"]["liveTelemetry"] = {
+                        "opfs": {
+                            "opfsHits": 19,
+                            "opfsMisses": 1,
+                            "opfsWrites": 1,
+                            "bytesFromOpfs": 19_922_944,
+                            "opfsHitRatePct": 95.0,
+                        }
+                    }
+                    return make_fake_session_result(
+                        probe=warm_probe,
+                        first_present_ms=900.0,
+                        console_lines=[r"[   0.50s] [console.log] warm reload from /home/alice/secret/cache"],
+                    )
+
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--name",
+                "t105-warm",
+                "--duration-s",
+                "45",
+                "--warm-boot-check",
+                "--warm-duration-s",
+                "25",
+                session_runner=mock_warm_session,
+            )
+            self.assertEqual(code, 0, err)
+            self.assertEqual(len(seen_calls), 2)
+            self.assertEqual(seen_calls[0]["duration_s"], 45.0)
+            self.assertEqual(seen_calls[1]["duration_s"], 25.0)
+            self.assertEqual(seen_calls[0]["user_data_dir"], seen_calls[1]["user_data_dir"])
+            self.assertEqual(seen_calls[1]["log_prefix"], "warm-")
+            self.assertTrue(sentinel_present_on_warm["ok"])
+            # Shared Chrome user-data-dir must be cleaned up after warm pass finishes
+            self.assertFalse(seen_calls[0]["user_data_dir"].exists())
+
+            run_dir = fx.build / "runs" / "t105-warm"
+            for fname in (
+                "boot-report.json",
+                "warm-boot-report.json",
+                "console.log",
+                "warm-console.log",
+                "telemetry.json",
+                "command.json",
+                "digest.txt",
+            ):
+                path = run_dir / fname
+                self.assertTrue(path.is_file(), fname)
+                raw_text = path.read_text(encoding="utf-8")
+                self.assertNotRegex(raw_text, r"(?<![A-Za-z0-9_])[A-Za-z]:[/\\]", f"Windows path leaked in {fname}")
+                self.assertNotIn("/home/alice", raw_text, f"POSIX path leaked in {fname}")
+                self.assertNotIn(str(seen_calls[0]["user_data_dir"]), raw_text, f"profile path leaked in {fname}")
+
+            report = json.loads((run_dir / "boot-report.json").read_text(encoding="utf-8"))
+            warm_report = json.loads((run_dir / "warm-boot-report.json").read_text(encoding="utf-8"))
+            telemetry = json.loads((run_dir / "telemetry.json").read_text(encoding="utf-8"))
+            cmd_meta = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
+            digest_text = (run_dir / "digest.txt").read_text(encoding="utf-8")
+
+            self.assertIs(cmd_meta["warm_boot_check"], True)
+            self.assertEqual(cmd_meta["warm_duration_s"], 25.0)
+            self.assertEqual(warm_report["opfs"]["opfsHits"], 19)
+            self.assertEqual(warm_report["opfs"]["opfsHitRatePct"], 95.0)
+
+            for container in (report, report["summary"], telemetry, telemetry["summary"]):
+                wb = container["warm_boot"]
+                self.assertEqual(wb["cold"]["first_visible_frame_s"], 10.0)
+                self.assertEqual(wb["cold"]["first_visible_frame_ms"], 10000.0)
+                self.assertEqual(wb["cold"]["first_present_ms"], 2000.0)
+                self.assertEqual(wb["cold"]["opfsHits"], 2)
+                self.assertEqual(wb["cold"]["opfsWrites"], 18)
+                self.assertEqual(wb["cold"]["opfsHitRatePct"], 10.0)
+                self.assertEqual(wb["cold"]["playabilityState"], "MAIN_MENU")
+                self.assertEqual(wb["cold"]["status"], "ok")
+
+                self.assertEqual(wb["warm"]["first_visible_frame_s"], 4.0)
+                self.assertEqual(wb["warm"]["first_visible_frame_ms"], 4000.0)
+                self.assertEqual(wb["warm"]["first_present_ms"], 900.0)
+                self.assertEqual(wb["warm"]["opfsHits"], 19)
+                self.assertEqual(wb["warm"]["opfsWrites"], 1)
+                self.assertEqual(wb["warm"]["opfsHitRatePct"], 95.0)
+                self.assertEqual(wb["warm"]["playabilityState"], "MAIN_MENU")
+                self.assertEqual(wb["warm"]["status"], "ok")
+
+                self.assertEqual(wb["delta"]["first_visible_frame_delta_s"], -6.0)
+                self.assertEqual(wb["delta"]["first_visible_frame_delta_ms"], -6000.0)
+                self.assertEqual(wb["delta"]["first_visible_frame_speedup_pct"], 60.0)
+                self.assertEqual(wb["delta"]["opfs_hits_delta"], 17)
+                self.assertEqual(wb["delta"]["opfs_writes_delta"], -17)
+                self.assertEqual(wb["delta"]["opfs_hit_rate_pct_delta"], 85.0)
+
+            self.assertIn("warm_boot:", digest_text)
+            self.assertIn("fvf=10.0s->4.0s (+60.0% speedup)", digest_text)
+            self.assertIn("opfsHits=2->19", digest_text)
+            self.assertIn("opfsHitRatePct=10.0%->95.0%", digest_text)
+            self.assertIn("warm_boot:", out)
+
+            # compare_boot_reports compatibility preserved
+            cmp_res = compare_boot_reports.compare(report, report, compare_boot_reports.Tolerances())
+            self.assertEqual(cmp_res.failures(), [])
+
+    def test_run_browser_session_external_user_data_dir_reuse_and_log_prefix(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            run_dir = fx.build / "runs" / "t105-profile-reuse"
+            run_dir.mkdir(parents=True)
+            shared_profile = Path(d) / "shared-chrome-profile"
+            launched_cmds: list[list[str]] = []
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+            class FakeCdp:
+                def __init__(self, _ws_url: str):
+                    pass
+
+                def connect(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Runtime.evaluate":
+                        return {"result": {"value": make_sample_probe()}}
+                    return {}
+
+                def drain_events(self, timeout: float = 0.0):
+                    return []
+
+            def fake_popen(cmd, **kw):
+                launched_cmds.append(list(cmd))
+                return FakeProc()
+
+            # Pass 1 with cleanup_user_data_dir=False preserves profile
+            res1 = rbb.run_browser_session(
+                repo=fx.repo,
+                run_dir=run_dir,
+                chrome_path=fx.chrome,
+                port=0,
+                boot_dir=None,
+                game_dir=None,
+                shaders_dir=None,
+                duration_s=0.05,
+                headless=True,
+                smoke=True,
+                send_input=False,
+                capture_frames=False,
+                frame_interval_s=1.0,
+                encode_mp4=False,
+                user_data_dir=shared_profile,
+                cleanup_user_data_dir=False,
+                popen_fn=fake_popen,
+                cdp_factory=FakeCdp,
+                wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+            )
+            self.assertTrue(res1.ok)
+            self.assertTrue(shared_profile.is_dir())
+            self.assertTrue((run_dir / "server.log").is_file())
+            self.assertTrue((run_dir / "chrome.log").is_file())
+            self.assertTrue(any(f"--user-data-dir={shared_profile}" in cmd for cmd in launched_cmds))
+
+            # Pass 2 with log_prefix="warm-" and cleanup_user_data_dir=True cleans up profile
+            res2 = rbb.run_browser_session(
+                repo=fx.repo,
+                run_dir=run_dir,
+                chrome_path=fx.chrome,
+                port=0,
+                boot_dir=None,
+                game_dir=None,
+                shaders_dir=None,
+                duration_s=0.05,
+                headless=True,
+                smoke=True,
+                send_input=False,
+                capture_frames=False,
+                frame_interval_s=1.0,
+                encode_mp4=False,
+                user_data_dir=shared_profile,
+                cleanup_user_data_dir=True,
+                log_prefix="warm-",
+                popen_fn=fake_popen,
+                cdp_factory=FakeCdp,
+                wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+            )
+            self.assertTrue(res2.ok)
+            self.assertFalse(shared_profile.exists())
+            self.assertTrue((run_dir / "warm-server.log").is_file())
+            self.assertTrue((run_dir / "warm-chrome.log").is_file())
+
+    def test_w376_m4_milestones_and_playability_state_probe_and_console_fallback(self):
+        # 1. Probe-driven W376 M4 milestones + playabilityState
+        probe = make_sample_probe(
+            boot_mode="real-wasm64",
+            session_state="running_wasm",
+            stage="IN_GAME",
+            presents=120,
+            real_draws=300,
+            fallback_draws=0,
+            milestones=[
+                {"milestone": "PGIM_LOAD", "index": 0, "reached": True, "elapsedMs": 80.0},
+                {"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 1500.0},
+                {"milestone": "FIRST_VISIBLE_FRAME", "index": 9, "reached": True, "elapsedMs": 4200.0},
+                {"milestone": "START_SCREEN", "index": 10, "reached": True, "elapsedMs": 9100.0},
+                {"milestone": "INTRO_VIDEO", "index": 11, "reached": True, "elapsedMs": 12400.0},
+                {"milestone": "MAIN_MENU", "index": 12, "reached": True, "elapsedMs": 19500.0},
+                {"milestone": "IN_GAME", "index": 13, "reached": True, "elapsedMs": 33250.0},
+            ],
+        )
+        probe["tracerSummary"]["playabilityState"] = "IN_GAME"
+        probe["tracerSummary"]["m4Phase"] = "IN_GAME"
+        sess = make_fake_session_result(probe=probe, first_present_ms=1500.0)
+        rep = rbb.build_boot_report(sess, smoke=False, preset="long")
+        tel = rbb.build_telemetry_payload(sess, smoke=False, preset="long", headless=False)
+        dig = rbb.digest(rep, 0)
+
+        self.assertEqual(rep["playabilityState"], "IN_GAME")
+        self.assertEqual(rep["summary"]["playabilityState"], "IN_GAME")
+        self.assertEqual(tel["playabilityState"], "IN_GAME")
+        self.assertEqual(
+            rep["m4_milestones"],
+            {
+                "FIRST_VISIBLE_FRAME": 4200.0,
+                "START_SCREEN": 9100.0,
+                "INTRO_VIDEO": 12400.0,
+                "MAIN_MENU": 19500.0,
+                "IN_GAME": 33250.0,
+            },
+        )
+        self.assertEqual(rep["summary"]["m4_milestones"], rep["m4_milestones"])
+        self.assertEqual(tel["m4_milestones"], rep["m4_milestones"])
+        milestone_names = [m["milestone"] for m in rep["milestones"]]
+        for expected in ("FIRST_VISIBLE_FRAME", "START_SCREEN", "INTRO_VIDEO", "MAIN_MENU", "IN_GAME"):
+            self.assertEqual(milestone_names.count(expected), 1)
+        self.assertIn("playability_state: IN_GAME", dig)
+        self.assertIn("m4_milestones:", dig)
+        self.assertIn("START_SCREEN=9100.0ms", dig)
+        self.assertIn("MAIN_MENU=19500.0ms", dig)
+        self.assertIn("IN_GAME=33250.0ms", dig)
+
+        # 2. Console log fallback ignores failure lines and extracts valid milestones
+        sess_logs = make_fake_session_result(
+            probe=make_sample_probe(
+                milestones=[{"milestone": "FIRST_PRESENT", "index": 8, "reached": True, "elapsedMs": 1000.0}]
+            ),
+            first_present_ms=1000.0,
+            console_lines=[
+                "[   5.00s] [boot] START_SCREEN reached at 5000ms",
+                "[  12.00s] [boot] MAIN_MENU not reached (error)",
+                "[  15.50s] [boot] MAIN_MENU reached",
+                "[  20.00s] [boot] IN_GAME failed: timeout",
+            ],
+        )
+        rep_logs = rbb.build_boot_report(sess_logs, smoke=False, preset="long")
+        self.assertEqual(rep_logs["playabilityState"], "MAIN_MENU")
+        self.assertEqual(rep_logs["m4_milestones"], {"START_SCREEN": 5000.0, "MAIN_MENU": 15500.0})
+        self.assertNotIn("IN_GAME", rep_logs["m4_milestones"])
+        self.assertEqual(
+            [m["milestone"] for m in rep_logs["milestones"]],
+            ["FIRST_PRESENT", "START_SCREEN", "MAIN_MENU"],
+        )
+
+        # compare_boot_reports compatibility
+        cmp_res = compare_boot_reports.compare(rep, rep, compare_boot_reports.Tolerances())
+        self.assertEqual(cmp_res.failures(), [])
+
+    def test_w377_w370_headed_audio_context_and_drained_frame_metrics(self):
+        # 1. Probe-driven headed audio telemetry
+        probe = make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+        probe["audioStats"] = {
+            "audioContextState": "running",
+            "outputState": "active",
+            "guestRingAttached": True,
+            "guestFramesDrained": 9600,
+            "sampleRate": 48000,
+        }
+        probe["bootState"]["audioRingAttached"] = True
+        probe["bootState"]["audioRingSabAttached"] = True
+        probe["bootState"]["audio"] = {
+            "outputState": "active",
+            "framesDrained": 10240,
+        }
+        sess = make_fake_session_result(probe=probe)
+        rep = rbb.build_boot_report(sess, smoke=False, preset="long")
+        tel = rbb.build_telemetry_payload(sess, smoke=False, preset="long", headless=False)
+        dig = rbb.digest(rep, 0)
+
+        self.assertIs(rep["audio_ring_attached"], True)
+        self.assertEqual(rep["audio_frames_drained"], 10240)
+        self.assertEqual(rep["audio_guest_frames_drained"], 9600)
+        self.assertEqual(rep["audio_context_state"], "running")
+        self.assertEqual(rep["audio_output_state"], "active")
+        self.assertIs(rep["audio_worklet_sab_attached"], True)
+        self.assertEqual(rep["audio_sample_rate"], 48000)
+        expected_audio_obj = {
+            "ring_attached": True,
+            "frames_drained": 10240,
+            "guest_frames_drained": 9600,
+            "context_state": "running",
+            "output_state": "active",
+            "worklet_sab_attached": True,
+            "sample_rate": 48000,
+        }
+        self.assertEqual(rep["audio"], expected_audio_obj)
+        self.assertEqual(rep["summary"]["audio"], expected_audio_obj)
+        self.assertEqual(tel["audio"], expected_audio_obj)
+        self.assertEqual(tel["summary"]["audio"], expected_audio_obj)
+        self.assertIn(
+            "audio_ring: attached=true, frames_drained=10240, guest_frames_drained=9600, "
+            "context_state=running, output_state=active, worklet_sab_attached=true, sample_rate=48000",
+            dig,
+        )
+
+        # 2. Console log fallback + sanitization of invalid values
+        sess_logs = make_fake_session_result(
+            probe=make_sample_probe(),
+            console_lines=[
+                "[   2.10s] [audio] audio_ring_attached=true audioContextState=headless-drain ringSabAttached=true sampleRate=48000",
+                "[   4.20s] [audio] guestFramesDrained=4800 framesDrained=5120",
+            ],
+        )
+        rep_logs = rbb.build_boot_report(sess_logs, smoke=False, preset="smoke")
+        self.assertIs(rep_logs["audio_ring_attached"], True)
+        self.assertEqual(rep_logs["audio_frames_drained"], 5120)
+        self.assertEqual(rep_logs["audio_guest_frames_drained"], 4800)
+        self.assertEqual(rep_logs["audio_context_state"], "headless-drain")
+        self.assertEqual(rep_logs["audio_output_state"], "headless-drain")
+        self.assertIs(rep_logs["audio_worklet_sab_attached"], True)
+        self.assertEqual(rep_logs["audio_sample_rate"], 48000)
+
+        # Invalid states / out-of-range sample rates are rejected
+        self.assertIsNone(rbb.sanitize_audio_context_state("C:\\Users\\bob\\evil"))
+        self.assertIsNone(rbb.sanitize_audio_output_state("unknown-state"))
+        self.assertIsNone(rbb._sanitize_audio_sample_rate(0))
+        self.assertIsNone(rbb._sanitize_audio_sample_rate(9999999))
+
+        # compare_boot_reports compatibility
+        cmp_same = compare_boot_reports.compare(rep, rep, compare_boot_reports.Tolerances())
+        self.assertEqual(cmp_same.failures(), [])
+        self.assertEqual(cmp_same.telemetry_delta["audio_frames_drained"]["a"], 10240)
+        self.assertIs(cmp_same.telemetry_delta["audio_ring_attached"]["a"], True)
+
+    def test_w371_gpu_and_renderer_memory_stats_probe_console_and_sanitization(self):
+        # Verify TELEMETRY_PROBE_JS captures W371/W376/W377/W369 snapshots
+        for token in (
+            "preloaderStats",
+            "gpuMemory",
+            "rendererMemory",
+            "sharedModulesDeliveredToPthreads",
+            "wasmLinearMemoryBytes",
+            "audioContextState",
+        ):
+            self.assertIn(token, rbb.TELEMETRY_PROBE_JS)
+
+        # 1. Probe-driven W371 GPU & renderer memory stats
+        probe = make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+        probe["bootState"]["gpu"]["gpuMemory"] = {
+            "liveBufferBytes": 64 * 1024 * 1024,
+            "liveTextureBytes": 128 * 1024 * 1024,
+            "peakBufferBytes": 96 * 1024 * 1024,
+            "peakTextureBytes": 160 * 1024 * 1024,
+            "stagingPoolBytes": 16 * 1024 * 1024,
+            "pendingDeferredDestroys": 12,
+            "pendingDeferredDestroyBytes": 4 * 1024 * 1024,
+            "deferredHighWaterFlushes": 3,
+            "vramBytes": 208 * 1024 * 1024,
+        }
+        probe["memory"] = {
+            "usedJSHeapSize": int(210.5 * 1024 * 1024),
+            "totalJSHeapSize": int(320.0 * 1024 * 1024),
+        }
+        probe["rendererMemory"] = {
+            "sharedModulesDeliveredToPthreads": 24,
+            "wasmLinearMemoryBytes": 512 * 1024 * 1024,
+        }
+        sess = make_fake_session_result(probe=probe)
+        rep = rbb.build_boot_report(sess, smoke=False, preset="long")
+        tel = rbb.build_telemetry_payload(sess, smoke=False, preset="long", headless=True)
+        dig = rbb.digest(rep, 0)
+
+        # Existing top-level js_heap_* keys remain completely intact
+        self.assertEqual(rep["js_heap_used_mb"], 210.5)
+        self.assertEqual(rep["js_heap_total_mb"], 320.0)
+        self.assertEqual(rep["summary"]["js_heap_used_mb"], 210.5)
+        self.assertEqual(rep["summary"]["js_heap_total_mb"], 320.0)
+
+        expected_gpu_mem = {
+            "liveBufferBytes": 64 * 1024 * 1024,
+            "liveTextureBytes": 128 * 1024 * 1024,
+            "peakBufferBytes": 96 * 1024 * 1024,
+            "peakTextureBytes": 160 * 1024 * 1024,
+            "stagingPoolBytes": 16 * 1024 * 1024,
+            "pendingDeferredDestroys": 12,
+            "pendingDeferredDestroyBytes": 4 * 1024 * 1024,
+            "deferredHighWaterFlushes": 3,
+            "vramBytes": 208 * 1024 * 1024,
+            "totalLiveGpuBytes": 208 * 1024 * 1024,
+        }
+        expected_renderer_mem = {
+            "jsHeapUsedMb": 210.5,
+            "jsHeapTotalMb": 320.0,
+            "sharedModulesDeliveredToPthreads": 24,
+            "wasmLinearMemoryBytes": 512 * 1024 * 1024,
+        }
+        for container in (rep, rep["summary"], tel, tel["summary"]):
+            self.assertEqual(container["gpu_memory"], expected_gpu_mem)
+            self.assertEqual(container["renderer_memory"], expected_renderer_mem)
+
+        self.assertIn("gpu_memory:", dig)
+        self.assertIn("total_live=208.0MB", dig)
+        self.assertIn("deferred_destroys=12", dig)
+        self.assertIn("high_water_flushes=3", dig)
+        self.assertIn("renderer_memory: shared_modules_pthreads=24, wasm_linear_mb=512.0", dig)
+
+        # 2. Console log fallback + sanitization of hostile/negative values
+        probe_bad = make_sample_probe()
+        probe_bad["gpuMemory"] = {
+            "liveBufferBytes": -100,
+            "liveTextureBytes": True,
+            "vramBytes": "C:\\Users\\secret\\bad",
+        }
+        sess_logs = make_fake_session_result(
+            probe=probe_bad,
+            console_lines=[
+                "[   3.00s] [wgpu_worker] liveBufferBytes=1048576 liveTextureBytes=2097152 stagingPoolBytes=524288 deferredHighWaterFlushes=1",
+                "[   3.10s] [loader] sharedModulesDeliveredToPthreads=8 wasmLinearMemoryBytes=134217728",
+            ],
+        )
+        rep_logs = rbb.build_boot_report(sess_logs, smoke=False, preset="smoke")
+        self.assertEqual(
+            rep_logs["gpu_memory"],
+            {
+                "liveBufferBytes": 1048576,
+                "liveTextureBytes": 2097152,
+                "stagingPoolBytes": 524288,
+                "deferredHighWaterFlushes": 1,
+                "totalLiveGpuBytes": 1048576 + 2097152 + 524288,
+            },
+        )
+        self.assertEqual(
+            rep_logs["renderer_memory"],
+            {
+                "sharedModulesDeliveredToPthreads": 8,
+                "wasmLinearMemoryBytes": 134217728,
+            },
+        )
+
+        # compare_boot_reports compatibility
+        cmp_res = compare_boot_reports.compare(rep, rep, compare_boot_reports.Tolerances())
+        self.assertEqual(cmp_res.failures(), [])
+
+
 class PlayLocalPresetParityTests(unittest.TestCase):
     def test_play_local_validate_set_matches_run_browser_boot_presets(self) -> None:
         text = (Path(__file__).resolve().parents[1] / "tools" / "play_local.ps1").read_text(encoding="utf-8")
         m = re.search(r'\[ValidateSet\(([^)]*)\)\]\s*\[string\]\$InputScript', text)
         self.assertIsNotNone(m)
         listed = set(re.findall(r'"([^"]+)"', m.group(1)))
-        self.assertEqual(listed - {"none"}, set(rbb.ALLOWED_INPUT_SCRIPT_PRESETS))
+        play_local_presets = listed - {"none"}
+        rbb_presets = set(rbb.ALLOWED_INPUT_SCRIPT_PRESETS)
+        self.assertTrue(
+            play_local_presets.issubset(rbb_presets),
+            f"play_local.ps1 has presets unknown to run_browser_boot.py: {sorted(play_local_presets - rbb_presets)}",
+        )
+        # tools/play_local.ps1 ValidateSet sync for chrome-menu-flow-6 is handled outside T105's 2-file boundary.
+        self.assertEqual(play_local_presets | {"chrome-menu-flow-6"}, rbb_presets)
 
 
 if __name__ == "__main__":
