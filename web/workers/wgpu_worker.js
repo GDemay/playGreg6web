@@ -2112,6 +2112,9 @@ class WgpuCommandProcessor {
     // G66 read-back: runtime memory (attachGuestMemory), copies recorded this frame, and counters.
     this._guestMemory = options.guestMemory || null;
     this._recordedReadbacks = [];
+    this._readbackFlushWanted = false;
+    this._earlyFlushedThisFrame = false;
+    this._earlyReadbackFlushes = 0;
     this.readbackStats = { requested: 0, delivered: 0, failed: 0, bytes: 0 };
     this.samplers = new Map();
     this.bindGroups = new Map();
@@ -4911,12 +4914,30 @@ class WgpuCommandProcessor {
       }
     }
     if (last < 0) return false;
-    const tail = cmds.slice(last + 1);
-    this._passCommands = cmds.slice(0, last + 1);
-    try {
-      this._flushPresent({ readbackOnly: true });
-    } finally {
-      this._passCommands = tail;
+    const tailLen = cmds.length - (last + 1);
+    if (tailLen === 0) {
+      // Common path: read-back is the last recorded command, so no tail references remain in
+      // `_passCommandPool`. Reset the pool cleanly after submit so multi-readback loading phases
+      // without Present never accumulate pooled slots or retain old pipeline/bindGroup refs.
+      try {
+        this._flushPresent({ readbackOnly: true });
+      } finally {
+        this._clearPassCommands();
+      }
+    } else {
+      // Preserve tail commands (and keep `_passCommandPoolUsed` intact so any pooled slots in
+      // `tail` are never overwritten before the frame's Present calls `_clearPassCommands()`).
+      const tail = cmds.slice(last + 1);
+      cmds.length = last + 1;
+      try {
+        this._flushPresent({ readbackOnly: true });
+      } finally {
+        cmds.length = tail.length;
+        for (let i = 0; i < tail.length; i += 1) {
+          cmds[i] = tail[i];
+        }
+        this._passCommands = cmds;
+      }
     }
     this._earlyReadbackFlushes = (this._earlyReadbackFlushes || 0) + 1;
     return true;
@@ -5069,6 +5090,7 @@ class WgpuCommandProcessor {
 
   _resetFrameState() {
     this._earlyFlushedThisFrame = false;
+    this._readbackFlushWanted = false;
     this._clearColor = DEFAULT_CLEAR_COLOR;
     this._clearPassCommands();
     this._resetPerFrameDrawCounters();
@@ -10041,11 +10063,12 @@ class WgpuCommandProcessor {
     }
   }
 
-  _executePresentRenderDraw(drawOpName, cmd, isIndexed) {
+  _executePresentRenderDraw(drawOpName, cmd, isIndexed, indirectBuffer = null) {
     const ps = this._presentState;
     const pass = this._ensurePresentRenderPass();
-    const count = isIndexed ? cmd.indexCount : cmd.vertexCount;
-    const instanceCount = cmd.instanceCount;
+    const isIndirect = indirectBuffer !== null;
+    const count = isIndirect ? 1 : isIndexed ? cmd.indexCount : cmd.vertexCount;
+    const instanceCount = isIndirect ? 1 : cmd.instanceCount;
     this._maybeSpecializeFallbackPipeline(pass, count, instanceCount);
     const activePipelineId = ps.activePipelineId;
     const pipeMeta =
@@ -10077,7 +10100,13 @@ class WgpuCommandProcessor {
       return;
     }
     try {
-      if (isIndexed) {
+      if (isIndirect) {
+        if (isIndexed) {
+          pass.drawIndexedIndirect(indirectBuffer, cmd.offset);
+        } else {
+          pass.drawIndirect(indirectBuffer, cmd.offset);
+        }
+      } else if (isIndexed) {
         pass.drawIndexed(
           cmd.indexCount,
           cmd.instanceCount,
@@ -10348,22 +10377,16 @@ class WgpuCommandProcessor {
             this._recordOpValidationError(opName, `indirect buffer ${cmd.bufferId} not found`);
             break;
           }
-          executeRenderDraw(opName, 1, 1, (pass) => {
-            if (indexed) {
-              pass.drawIndexedIndirect(buffer, cmd.offset);
-            } else {
-              pass.drawIndirect(buffer, cmd.offset);
-            }
-          });
+          this._executePresentRenderDraw(opName, cmd, indexed, buffer);
           break;
         }
         case 'dispatchIndirect': {
-          const pass = ensureComputePass();
           const buffer = this.buffers.get(cmd.bufferId);
           if (!buffer) {
             this._recordOpValidationError('DispatchIndirect', `indirect buffer ${cmd.bufferId} not found`);
             break;
           }
+          const pass = this._ensurePresentComputePass();
           try {
             pass.dispatchWorkgroupsIndirect(buffer, cmd.offset);
             this._computeDispatchCount += 1;
@@ -10897,6 +10920,9 @@ class WgpuCommandProcessor {
           break;
         }
       }
+      if (this._readbackFlushWanted) {
+        this._flushReadbacksNow();
+      }
       if (reuseResult) {
         const out = this._drainRingResultScratch;
         out.frameCount = this.frameCount;
@@ -10919,6 +10945,9 @@ class WgpuCommandProcessor {
         bytes.byteOffset + bytes.byteLength
       );
     });
+    if (this._readbackFlushWanted) {
+      this._flushReadbacksNow();
+    }
     if (reuseResult) {
       const out = this._drainRingResultScratch;
       out.frameCount = this.frameCount;
@@ -11299,16 +11328,16 @@ class WgpuCommandProcessor {
       case OPCODES.DISPATCH_INDIRECT:
         // G66 ExecuteIndirect: GpuIndirectPayload { u32 buffer_id, u32 reserved, u64 offset }.
         if (payloadBytes >= 16) {
-          this._passCommands.push({
-            type:
-              opcode === OPCODES.DRAW_INDIRECT
-                ? 'drawIndirect'
-                : opcode === OPCODES.DRAW_INDEXED_INDIRECT
-                  ? 'drawIndexedIndirect'
-                  : 'dispatchIndirect',
-            bufferId: view.getUint32(payloadOffset, true),
-            offset: Number(view.getBigUint64(payloadOffset + 8, true)),
-          });
+          const cmd = this._acquirePassCommand(
+            opcode === OPCODES.DRAW_INDIRECT
+              ? 'drawIndirect'
+              : opcode === OPCODES.DRAW_INDEXED_INDIRECT
+                ? 'drawIndexedIndirect'
+                : 'dispatchIndirect'
+          );
+          cmd.bufferId = view.getUint32(payloadOffset, true);
+          cmd.offset = readUint64AsNumber(view, payloadOffset + 8);
+          this._passCommands.push(cmd);
         } else {
           this._recordOpValidationError(OPCODE_NAMES[opcode], `truncated payload (${payloadBytes}B < 16B)`);
         }
@@ -14202,6 +14231,9 @@ function createWgpuWorkerHandler(options = {}) {
     if (attachedRing) {
       processor.attachRing(attachedRing);
     }
+    if (pendingGuestMemory && typeof processor.attachGuestMemory === 'function') {
+      processor.attachGuestMemory(pendingGuestMemory);
+    }
 
     await preloadBootShaderAssets(processor, initPayload);
     preloadedInDefaultInit = true;
@@ -14259,6 +14291,14 @@ function createWgpuWorkerHandler(options = {}) {
           firstPresentNotified = false;
           firstVisibleFrameNotified = false;
           bindProcessorValidationErrors(processor);
+        }
+        if (
+          processor &&
+          pendingGuestMemory &&
+          processor._guestMemory !== pendingGuestMemory &&
+          typeof processor.attachGuestMemory === 'function'
+        ) {
+          processor.attachGuestMemory(pendingGuestMemory);
         }
         if (
           processor &&
@@ -14716,6 +14756,13 @@ function createWgpuWorkerHandler(options = {}) {
         swapchain = null;
         postMessage({ id: payload.id, destroyed: true });
       } else if ((payload.drainRing || payload.type === 'drain-ring') && processor) {
+        if (
+          pendingGuestMemory &&
+          processor._guestMemory !== pendingGuestMemory &&
+          typeof processor.attachGuestMemory === 'function'
+        ) {
+          processor.attachGuestMemory(pendingGuestMemory);
+        }
         const prevFrames = toNonNegativeInt(processor.frameCount, 0);
         const result = processor.drainRing(DRAIN_RING_REUSE_OPTS);
         if (result.presents > 0) {

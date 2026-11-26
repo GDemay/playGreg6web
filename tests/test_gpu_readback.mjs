@@ -8,12 +8,14 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const {
   WgpuCommandProcessor,
+  createWgpuWorkerHandler,
   OPCODES,
   decodeReadbackPayload,
   readbackStagingLayout,
   readbackPieces,
   deliverReadback,
 } = require('../web/workers/wgpu_worker.js');
+const { GpuRingBuffer } = require('../web/workers/gpu_ring.js');
 
 function bufferPayload({ seq, bufferId, srcOffset, size, dstAddr, doneAddr }) {
   const view = new DataView(new ArrayBuffer(40));
@@ -180,4 +182,372 @@ test('a title blocked on the guarded fence gets its read-back flushed without a 
   // Nothing recorded: no flush.
   processor._passCommands = [];
   assert.equal(processor._flushReadbacksNow(), false);
+});
+
+function encodePacket(opcode, payloadViewOrBytes = null) {
+  const payload =
+    payloadViewOrBytes === null
+      ? new Uint8Array(0)
+      : payloadViewOrBytes instanceof Uint8Array
+        ? payloadViewOrBytes
+        : new Uint8Array(
+            payloadViewOrBytes.buffer,
+            payloadViewOrBytes.byteOffset,
+            payloadViewOrBytes.byteLength
+          );
+  const out = new Uint8Array(8 + payload.byteLength);
+  const dv = new DataView(out.buffer);
+  dv.setUint16(0, opcode, true);
+  dv.setUint16(2, 0, true);
+  dv.setUint32(4, payload.byteLength, true);
+  out.set(payload, 8);
+  return out;
+}
+
+function concatBytes(chunks) {
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
+
+function setPipelinePayload(pipelineId) {
+  const v = new DataView(new ArrayBuffer(4));
+  v.setUint32(0, pipelineId, true);
+  return v;
+}
+
+function drawPayload(vertexCount, instanceCount = 1, firstVertex = 0, firstInstance = 0) {
+  const v = new DataView(new ArrayBuffer(16));
+  v.setUint32(0, vertexCount, true);
+  v.setUint32(4, instanceCount, true);
+  v.setUint32(8, firstVertex, true);
+  v.setUint32(12, firstInstance, true);
+  return v;
+}
+
+function indirectPayload(bufferId, offset) {
+  const v = new DataView(new ArrayBuffer(16));
+  v.setUint32(0, bufferId, true);
+  v.setUint32(4, 0, true);
+  v.setBigUint64(8, BigInt(offset), true);
+  return v;
+}
+
+function createFullMockWebGpu() {
+  const pendingMaps = [];
+  const recordedOps = [];
+  let submitCount = 0;
+  const device = {
+    createBuffer(desc) {
+      const b = {
+        size: desc.size,
+        usage: desc.usage,
+        contents: new Uint8Array(desc.size),
+        mapped: false,
+        destroyed: false,
+        mapAsync() {
+          return new Promise((resolve) =>
+            pendingMaps.push(() => {
+              b.mapped = true;
+              resolve();
+            })
+          );
+        },
+        getMappedRange() {
+          return b.contents.slice().buffer;
+        },
+        unmap() {
+          b.mapped = false;
+        },
+        destroy() {
+          b.destroyed = true;
+        },
+      };
+      return b;
+    },
+    createCommandEncoder() {
+      const encoder = {
+        beginRenderPass() {
+          return {
+            setPipeline(p) {
+              recordedOps.push({ op: 'setPipeline', id: p.id });
+            },
+            setVertexBuffer(slot, buf, off) {
+              recordedOps.push({ op: 'setVertexBuffer', slot, buf, off });
+            },
+            setIndexBuffer(buf, fmt, off) {
+              recordedOps.push({ op: 'setIndexBuffer', buf, fmt, off });
+            },
+            setBindGroup(idx, bg) {
+              recordedOps.push({ op: 'setBindGroup', idx, bg });
+            },
+            draw(vc, ic, fv, fi) {
+              recordedOps.push({ op: 'draw', vc, ic, fv, fi });
+            },
+            drawIndexed(ic, inst, fi, bv, finst) {
+              recordedOps.push({ op: 'drawIndexed', ic, inst, fi, bv, finst });
+            },
+            drawIndirect(buf, off) {
+              recordedOps.push({ op: 'drawIndirect', bufId: buf.id, off });
+            },
+            drawIndexedIndirect(buf, off) {
+              recordedOps.push({ op: 'drawIndexedIndirect', bufId: buf.id, off });
+            },
+            end() {},
+          };
+        },
+        beginComputePass() {
+          return {
+            setPipeline(p) {
+              recordedOps.push({ op: 'setComputePipeline', id: p.id });
+            },
+            setBindGroup(idx, bg) {
+              recordedOps.push({ op: 'setComputeBindGroup', idx, bg });
+            },
+            dispatchWorkgroups(x, y, z) {
+              recordedOps.push({ op: 'dispatch', x, y, z });
+            },
+            dispatchWorkgroupsIndirect(buf, off) {
+              recordedOps.push({ op: 'dispatchIndirect', bufId: buf.id, off });
+            },
+            end() {},
+          };
+        },
+        copyBufferToBuffer(src, srcOffset, dst, dstOffset, size) {
+          recordedOps.push({ op: 'copyBufferToBuffer', srcOffset, size });
+          dst.contents.set(src.contents.subarray(srcOffset, srcOffset + size), dstOffset);
+        },
+        copyTextureToBuffer(src, dst, size) {
+          recordedOps.push({ op: 'copyTextureToBuffer', size });
+        },
+        finish() {
+          return { finished: true };
+        },
+      };
+      return encoder;
+    },
+    queue: {
+      submit() {
+        submitCount += 1;
+        recordedOps.push({ op: 'submit', submitCount });
+      },
+    },
+  };
+  const ctx = {
+    getCurrentTexture() {
+      return {
+        width: 1280,
+        height: 720,
+        createView() {
+          return { view: true };
+        },
+      };
+    },
+  };
+  return {
+    device,
+    ctx,
+    recordedOps,
+    getSubmitCount: () => submitCount,
+    resolveMaps: () => pendingMaps.splice(0).forEach((fn) => fn()),
+  };
+}
+
+test('W360: read-back delivered via SPSC GpuRingBuffer drainRing() flushes immediately without Present', async () => {
+  const { device, ctx, recordedOps, getSubmitCount, resolveMaps } = createFullMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    enableStagingPool: false,
+    enableUniformRing: false,
+    enablePassTimer: false,
+    enableRtPool: false,
+    enableResourceReplay: false,
+  });
+  const guestMemory = new SharedArrayBuffer(8192);
+  processor.attachGuestMemory(guestMemory);
+
+  const srcBuf = device.createBuffer({ size: 64, usage: 0 });
+  srcBuf.contents.set([0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44], 8);
+  processor.buffers.set(7, srcBuf);
+
+  const ring = GpuRingBuffer.create(4096);
+  processor.attachRing(ring);
+
+  // Push ONLY a ReadbackBuffer packet into the SPSC ring (NO Present packet).
+  const pkt = encodePacket(
+    OPCODES.READBACK_BUFFER,
+    bufferPayload({ seq: 1, bufferId: 7, srcOffset: 8, size: 8, dstAddr: 256, doneAddr: 64 })
+  );
+  assert.equal(ring.writeBytes(pkt), true);
+
+  const res = processor.drainRing();
+  assert.equal(res.bytesDrained, pkt.byteLength);
+  assert.equal(res.presents, 0);
+  assert.equal(processor.frameCount, 0);
+  assert.equal(processor._earlyReadbackFlushes, 1);
+  assert.equal(processor._readbackFlushWanted, false);
+  assert.equal(processor._passCommands.length, 0);
+  assert.equal(processor._passCommandPoolUsed, 0);
+  assert.equal(getSubmitCount(), 1);
+  assert.equal(recordedOps.some((e) => e.op === 'copyBufferToBuffer'), true);
+
+  resolveMaps();
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.deepEqual(
+    [...new Uint8Array(guestMemory, 256, 8)],
+    [0xde, 0xad, 0xbe, 0xef, 0x11, 0x22, 0x33, 0x44]
+  );
+  assert.equal(Atomics.load(new Uint32Array(guestMemory, 64, 1), 0), 1);
+  assert.deepEqual(processor.readbackStats, { requested: 1, delivered: 1, failed: 0, bytes: 8 });
+});
+
+test('W360: createWgpuWorkerHandler attaches pendingGuestMemory before drainRing() when attach-guest-memory arrives pre-init', async () => {
+  const { device, ctx, resolveMaps } = createFullMockWebGpu();
+  const posted = [];
+  let createdProcessor = null;
+  const handler = createWgpuWorkerHandler({
+    postMessage: (m) => posted.push(m),
+    GpuRingBuffer,
+    initGpu: async () => {
+      createdProcessor = new WgpuCommandProcessor(device, ctx, {
+        enableStagingPool: false,
+        enableUniformRing: false,
+        enablePassTimer: false,
+        enableRtPool: false,
+        enableResourceReplay: false,
+      });
+      return createdProcessor;
+    },
+  });
+
+  const guestMemory = new SharedArrayBuffer(4096);
+  // attach-guest-memory arrives BEFORE init creates the processor.
+  await handler.handleMessage({ type: 'attach-guest-memory', buffer: guestMemory });
+  await handler.handleMessage({ init: true, canvas: { width: 1280, height: 720 }, width: 1280, height: 720 });
+  assert.equal(createdProcessor._guestMemory, guestMemory);
+
+  const srcBuf = device.createBuffer({ size: 32, usage: 0 });
+  srcBuf.contents.set([42, 43, 44, 45], 0);
+  createdProcessor.buffers.set(3, srcBuf);
+
+  const ring = GpuRingBuffer.create(4096);
+  await handler.handleMessage({ attachRing: true, ringSab: ring.sab });
+  const pkt = encodePacket(
+    OPCODES.READBACK_BUFFER,
+    bufferPayload({ seq: 1, bufferId: 3, srcOffset: 0, size: 4, dstAddr: 128, doneAddr: 32 })
+  );
+  ring.writeBytes(pkt);
+
+  await handler.handleMessage({ type: 'drain-ring' });
+  resolveMaps();
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.deepEqual([...new Uint8Array(guestMemory, 128, 4)], [42, 43, 44, 45]);
+  assert.equal(Atomics.load(new Uint32Array(guestMemory, 32, 1), 0), 1);
+});
+
+test('W360: _flushReadbacksNow() followed by pooled pass commands, indirect draws, and Present executes every command once with zero pool corruption', async () => {
+  const { device, ctx, recordedOps, getSubmitCount, resolveMaps } = createFullMockWebGpu();
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    enableStagingPool: false,
+    enableUniformRing: false,
+    enablePassTimer: false,
+    enableRtPool: false,
+    enableResourceReplay: false,
+  });
+  const guestMemory = new SharedArrayBuffer(8192);
+  processor.attachGuestMemory(guestMemory);
+
+  processor.pipelines.set(10, { id: 10 });
+  processor.pipelines.set(20, { id: 20 });
+  processor.pipelines.set(30, { id: 30 });
+  processor.computePipelines.set(40, { id: 40 });
+
+  const srcBuf = device.createBuffer({ size: 64, usage: 0 });
+  srcBuf.contents.set([1, 2, 3, 4], 0);
+  processor.buffers.set(5, srcBuf);
+
+  const indirectDrawBuf = device.createBuffer({ size: 256, usage: 0 });
+  indirectDrawBuf.id = 50;
+  processor.buffers.set(50, indirectDrawBuf);
+
+  const indirectDispatchBuf = device.createBuffer({ size: 256, usage: 0 });
+  indirectDispatchBuf.id = 51;
+  processor.buffers.set(51, indirectDispatchBuf);
+
+  // Batch 1: pooled commands BEFORE readback + readback + pooled tail commands AFTER readback.
+  const batch1 = concatBytes([
+    encodePacket(OPCODES.SET_PIPELINE, setPipelinePayload(10)),
+    encodePacket(OPCODES.DRAW, drawPayload(3, 1, 0, 0)),
+    encodePacket(
+      OPCODES.READBACK_BUFFER,
+      bufferPayload({ seq: 1, bufferId: 5, srcOffset: 0, size: 4, dstAddr: 200, doneAddr: 64 })
+    ),
+    encodePacket(OPCODES.SET_PIPELINE, setPipelinePayload(20)),
+    encodePacket(OPCODES.DRAW, drawPayload(6, 2, 1, 0)),
+  ]);
+  processor.executeCommandBuffer(batch1);
+
+  assert.equal(getSubmitCount(), 1);
+  assert.equal(processor.frameCount, 0);
+  assert.equal(processor._earlyReadbackFlushes, 1);
+  // Tail commands remain queued in `_passCommands` with intact pooled slot values.
+  assert.equal(processor._passCommands.length, 2);
+  assert.equal(processor._passCommands[0].type, 'setPipeline');
+  assert.equal(processor._passCommands[0].pipelineId, 20);
+  assert.equal(processor._passCommands[1].type, 'draw');
+  assert.equal(processor._passCommands[1].vertexCount, 6);
+  assert.equal(processor._passCommands[1].instanceCount, 2);
+  // Pool cursor was NOT reset because tail still holds pooled slots.
+  assert.equal(processor._passCommandPoolUsed, 4);
+
+  resolveMaps();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.deepEqual([...new Uint8Array(guestMemory, 200, 4)], [1, 2, 3, 4]);
+  assert.equal(Atomics.load(new Uint32Array(guestMemory, 64, 1), 0), 1);
+
+  // Batch 2: more pooled commands (including indirect draws/dispatch) + Present.
+  // Acquiring new pooled slots MUST NOT corrupt the preserved tail commands from Batch 1!
+  const batch2 = concatBytes([
+    encodePacket(OPCODES.SET_PIPELINE, setPipelinePayload(30)),
+    encodePacket(OPCODES.DRAW, drawPayload(9, 1, 0, 0)),
+    encodePacket(OPCODES.DRAW_INDIRECT, indirectPayload(50, 32)),
+    encodePacket(OPCODES.DRAW_INDEXED_INDIRECT, indirectPayload(50, 64)),
+    encodePacket(OPCODES.SET_COMPUTE_PIPELINE, setPipelinePayload(40)),
+    encodePacket(OPCODES.DISPATCH_INDIRECT, indirectPayload(51, 96)),
+    encodePacket(OPCODES.PRESENT),
+  ]);
+  const presentRes = processor.executeCommandBuffer(batch2);
+
+  assert.equal(presentRes.presents, 1);
+  assert.equal(processor.frameCount, 1);
+  assert.equal(getSubmitCount(), 2);
+  assert.equal(processor._passCommands.length, 0);
+  assert.equal(processor._passCommandPoolUsed, 0);
+  assert.equal(processor._validationErrorCount, 0);
+
+  // Verify exact execution sequence across both submits: every command ran ONCE in order.
+  assert.deepEqual(recordedOps, [
+    // Submit 1 (early readback flush)
+    { op: 'setPipeline', id: 10 },
+    { op: 'draw', vc: 3, ic: 1, fv: 0, fi: 0 },
+    { op: 'copyBufferToBuffer', srcOffset: 0, size: 4 },
+    { op: 'submit', submitCount: 1 },
+    // Submit 2 (frame Present: tail from batch 1 + batch 2)
+    { op: 'setPipeline', id: 20 },
+    { op: 'draw', vc: 6, ic: 2, fv: 1, fi: 0 },
+    { op: 'setPipeline', id: 30 },
+    { op: 'draw', vc: 9, ic: 1, fv: 0, fi: 0 },
+    { op: 'drawIndirect', bufId: 50, off: 32 },
+    { op: 'drawIndexedIndirect', bufId: 50, off: 64 },
+    { op: 'setComputePipeline', id: 40 },
+    { op: 'dispatchIndirect', bufId: 51, off: 96 },
+    { op: 'submit', submitCount: 2 },
+  ]);
 });
