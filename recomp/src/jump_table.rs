@@ -677,10 +677,15 @@ impl Slicer<'_, '_, '_, '_> {
     }
 
     /// Whether every bit of the full register `reg` from bit `bits` up is zero just before
-    /// `before`: its last write is a `movzx` from at most `bits` bits, or an `and` with a mask
-    /// below `1 << bits`, into a 32- or 64-bit register.
+    /// `before`: its last write is a `movzx` from at most `bits` bits, an `and` with a mask
+    /// below `1 << bits`, or a `shr` by an immediate of a value zero above `bits + shift`, into a
+    /// 32- or 64-bit register.
     fn is_zero_above(&mut self, reg: Register, before: usize, bits: u32) -> bool {
-        if bits == 0 || bits > 64 {
+        self.is_zero_above_at(reg, before, bits, 0)
+    }
+
+    fn is_zero_above_at(&mut self, reg: Register, before: usize, bits: u32, depth: u32) -> bool {
+        if bits == 0 || bits > 64 || depth > MAX_ALIAS_DEPTH || !self.consume_step() {
             return false;
         }
         let Some(at) = self.def(reg, before) else {
@@ -707,6 +712,17 @@ impl Slicer<'_, '_, '_, '_> {
             Mnemonic::And => instr
                 .try_immediate(1)
                 .is_ok_and(|imm| imm & mask(instr.op0_register().size() as u32 * 8) <= mask(bits)),
+            // `movzx ecx, cx; shr ecx, 4; cmp cx, 4; ja default`: a logical right shift by an
+            // immediate leaves the top `shift` bits of the (zero-extended) destination zero, and
+            // moves the source's zero bits down by `shift`.
+            Mnemonic::Shr if instr.op1_kind() == OpKind::Immediate8 => {
+                let dst_bits = instr.op0_register().size() as u32 * 8;
+                let shift = (instr.immediate8() as u32) & (dst_bits - 1);
+                if dst_bits.saturating_sub(shift) <= bits {
+                    return true;
+                }
+                shift > 0 && self.is_zero_above_at(reg, at, bits + shift, depth + 1)
+            }
             _ => false,
         }
     }
@@ -2557,6 +2573,52 @@ mod tests {
 
         // A signed byte guard does not bound the zero-extended value (0x80..0xff pass `jg`).
         let (code, cases, jmp_va) = byte_guard_switch(true);
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA; 4]));
+        assert_unresolved(&analyze(&code, &data, &[0], &[]), (jmp_va - TEXT) as u32);
+    }
+
+    /// `movzx eax, dx; shr eax, 4; cmp ax, 2; ja default` (a word guard on a shifted, zero-extended
+    /// index); with `zero_extended` false the index is `mov eax, edx` (bits 16..31 unknown).
+    fn shifted_word_guard_switch(zero_extended: bool) -> (Vec<u8>, [u64; 4], u64) {
+        let code = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            if zero_extended {
+                a.movzx(eax, dx)?;
+            } else {
+                a.mov(eax, edx)?;
+            }
+            a.shr(eax, 4)?;
+            a.cmp(ax, 2)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsxd(rcx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases = find_four_cases(&code);
+        let jmp_va = find_indirect_jmp(&code);
+        (code, cases, jmp_va)
+    }
+
+    #[test]
+    fn word_guard_bounds_a_shifted_zero_extended_index() {
+        let (code, cases, jmp_va) = shifted_word_guard_switch(true);
+        let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
+        data.extend_from_slice(&rva_table([DATA_RVA; 4])); // past the bound: never read
+        let analysis = analyze(&code, &data, &[0], &[]);
+        let table = &analysis.jump_tables[&jmp_va];
+        assert!(!table.inferred);
+        assert_eq!(table.targets, cases[..3]);
+
+        // Without the zero extension bits 16..31 of the shifted value are unknown: no bound.
+        let (code, cases, jmp_va) = shifted_word_guard_switch(false);
         let mut data = rva_table(cases[..3].iter().map(|va| (va - BASE) as u32));
         data.extend_from_slice(&rva_table([DATA_RVA; 4]));
         assert_unresolved(&analyze(&code, &data, &[0], &[]), (jmp_va - TEXT) as u32);
