@@ -1610,6 +1610,12 @@ export class PlayGta6AppHandle {
     this._reclaimSoftMemory = components.reclaimSoftMemory || (async () => ({ ok: false }));
     this._registerReclaimHook = components.registerReclaimHook || (() => () => {});
     this._attachAudioRing = components.attachAudioRing || (() => null);
+    this._unlockAudio = components.unlockAudio || (async () => ({ ok: false, state: 'idle', unlocked: false }));
+    this._getAudioStatus = components.getAudioStatus || (() => null);
+    this._requestPointerLock = components.requestPointerLock || (async () => ({ ok: false, locked: false }));
+    this._exitPointerLock = components.exitPointerLock || (() => ({ ok: false, locked: false }));
+    this._togglePointerLock = components.togglePointerLock || (async () => ({ ok: false, locked: false }));
+    this._isPointerLocked = components.isPointerLocked || (() => false);
     this._notifyFirstPresent = components.notifyFirstPresent || (() => ({ ok: true }));
     this._notifyFirstVisibleFrame = components.notifyFirstVisibleFrame || (() => ({ ok: true }));
     this._recordFastBootMilestone = components.recordFastBootMilestone || (() => null);
@@ -1658,6 +1664,30 @@ export class PlayGta6AppHandle {
 
   attachAudioRing(mod, opts) {
     return this._attachAudioRing(mod, opts);
+  }
+
+  unlockAudio(opts) {
+    return this._unlockAudio(opts);
+  }
+
+  getAudioStatus() {
+    return this._getAudioStatus();
+  }
+
+  requestPointerLock(opts) {
+    return this._requestPointerLock(opts);
+  }
+
+  exitPointerLock() {
+    return this._exitPointerLock();
+  }
+
+  togglePointerLock(opts) {
+    return this._togglePointerLock(opts);
+  }
+
+  isPointerLocked() {
+    return this._isPointerLocked();
   }
 
   notifyFirstPresent(meta) {
@@ -7379,7 +7409,8 @@ export function bootstrapPlayGta6App(options = {}) {
     resizeListenerAttached = true;
   }
 
-  // 8b. First-user-gesture Web Audio unlock (W261 / W370 / #1028 live stereo audio).
+  // 8b. First-user-gesture Web Audio unlock (Click + Key + Gamepad), visibilitychange recovery,
+  //     and Pointer Lock UX helpers (W261 / W370 / W382 / #1028 / #1759).
   notifyRuntimeAudioContextState = (outputState) => {
     if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
       return;
@@ -7426,7 +7457,137 @@ export function bootstrapPlayGta6App(options = {}) {
   let audioGestureUnlockInFlight = false;
   let audioGestureRetriesRemaining = 5;
   let audioGestureCleanup = null;
-  const audioGestureEvents = ['pointerdown', 'keydown', 'click', 'touchstart'];
+  let audioVisibilityRecoveries = 0;
+  let audioVisibilityInFlight = false;
+  let gamepadUnlockTimerId = null;
+  let visibilityLifecycleCleanup = null;
+  let pointerLockUiCleanup = null;
+  const audioGestureEvents = ['pointerdown', 'keydown', 'click', 'touchstart', 'gamepadconnected'];
+  const GAMEPAD_AUDIO_UNLOCK_POLL_MS = 120;
+  const GAMEPAD_AXIS_ACTIVITY_THRESHOLD = 0.25;
+
+  function isAudioCurrentlyRunning() {
+    return Boolean(audioEngine && typeof audioEngine === 'object' && audioEngine.state === 'running');
+  }
+
+  function isAudioNeedsUnlock() {
+    if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+      return false;
+    }
+    const st = audioEngine.state;
+    return st === 'idle' || st === 'suspended' || st === 'interrupted';
+  }
+
+  function readConnectedGamepads() {
+    if (!navigatorObj || typeof navigatorObj.getGamepads !== 'function') {
+      return [];
+    }
+    try {
+      const raw = navigatorObj.getGamepads();
+      if (!raw || typeof raw.length !== 'number') {
+        return [];
+      }
+      const pads = [];
+      for (let i = 0; i < raw.length; i += 1) {
+        const pad = raw[i];
+        if (pad && pad.connected !== false) {
+          pads.push(pad);
+        }
+      }
+      return pads;
+    } catch {
+      return [];
+    }
+  }
+
+  function hasActiveGamepadInput() {
+    const pads = readConnectedGamepads();
+    for (let p = 0; p < pads.length; p += 1) {
+      const pad = pads[p];
+      const buttons = pad.buttons;
+      if (buttons && typeof buttons.length === 'number') {
+        for (let b = 0; b < buttons.length; b += 1) {
+          const btn = buttons[b];
+          if (typeof btn === 'number') {
+            if (btn > 0.5) return true;
+          } else if (
+            btn &&
+            (btn.pressed === true || (typeof btn.value === 'number' && btn.value > 0.5))
+          ) {
+            return true;
+          }
+        }
+      }
+      const axes = pad.axes;
+      if (axes && typeof axes.length === 'number') {
+        for (let a = 0; a < axes.length; a += 1) {
+          const val = axes[a];
+          if (
+            typeof val === 'number' &&
+            Number.isFinite(val) &&
+            Math.abs(val) > GAMEPAD_AXIS_ACTIVITY_THRESHOLD
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function stopGamepadAudioUnlockPoll() {
+    if (gamepadUnlockTimerId === null) {
+      return;
+    }
+    const timerId = gamepadUnlockTimerId;
+    gamepadUnlockTimerId = null;
+    try {
+      const clearFn =
+        resolvedClearInterval ||
+        (typeof clearInterval === 'function' ? clearInterval : null);
+      if (clearFn) {
+        clearFn(timerId);
+      }
+    } catch {
+      // Ignore timer teardown errors.
+    }
+  }
+
+  function startGamepadAudioUnlockPoll() {
+    if (
+      destroyed ||
+      options.enableGamepadAudioUnlock === false ||
+      gamepadUnlockTimerId !== null ||
+      !isAudioNeedsUnlock() ||
+      readConnectedGamepads().length === 0
+    ) {
+      return;
+    }
+    const setFn =
+      resolvedSetInterval ||
+      (typeof setInterval === 'function' ? setInterval : null);
+    if (!setFn) {
+      return;
+    }
+    try {
+      gamepadUnlockTimerId = setFn(() => {
+        if (destroyed || !isAudioNeedsUnlock()) {
+          stopGamepadAudioUnlockPoll();
+          return;
+        }
+        if (readConnectedGamepads().length === 0) {
+          stopGamepadAudioUnlockPoll();
+          return;
+        }
+        if (hasActiveGamepadInput()) {
+          audioGestureUnlockAttempted = false;
+          void unlockAudio({ source: 'gamepad' });
+        }
+      }, GAMEPAD_AUDIO_UNLOCK_POLL_MS);
+    } catch {
+      gamepadUnlockTimerId = null;
+    }
+  }
 
   function detachAudioGestureUnlock() {
     if (!audioGestureCleanup) {
@@ -7446,7 +7607,7 @@ export function bootstrapPlayGta6App(options = {}) {
       return;
     }
     detachAudioGestureUnlock();
-    const registeredEvents = [];
+    const registered = [];
     for (let i = 0; i < audioGestureEvents.length; i += 1) {
       const evt = audioGestureEvents[i];
       try {
@@ -7454,16 +7615,28 @@ export function bootstrapPlayGta6App(options = {}) {
           passive: true,
           once: true,
         });
-        registeredEvents.push(evt);
+        registered.push([audioGestureTarget, evt]);
       } catch {
         // Ignore listener registration errors in restricted hosts.
       }
     }
-    if (registeredEvents.length > 0) {
+    if (audioGestureTarget !== windowObj && isEventTargetLike(windowObj)) {
+      try {
+        windowObj.addEventListener('gamepadconnected', invokeAudioGestureUnlock, {
+          passive: true,
+          once: true,
+        });
+        registered.push([windowObj, 'gamepadconnected']);
+      } catch {
+        // Ignore listener registration errors in restricted hosts.
+      }
+    }
+    if (registered.length > 0) {
       audioGestureCleanup = () => {
-        for (let i = 0; i < registeredEvents.length; i += 1) {
+        for (let i = 0; i < registered.length; i += 1) {
+          const [target, evt] = registered[i];
           try {
-            audioGestureTarget.removeEventListener(registeredEvents[i], invokeAudioGestureUnlock);
+            target.removeEventListener(evt, invokeAudioGestureUnlock);
           } catch {
             // Ignore listener removal errors.
           }
@@ -7472,7 +7645,153 @@ export function bootstrapPlayGta6App(options = {}) {
     }
   }
 
-  function invokeAudioGestureUnlock() {
+  function runAudioUnlockAttempt(opts = {}) {
+    if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+      return Promise.resolve({
+        ok: false,
+        state: 'closed',
+        unlocked: false,
+        unlockedOnGesture: false,
+        reason: destroyed ? 'destroyed' : 'no-audio-engine',
+      });
+    }
+    if (audioGestureUnlockInFlight) {
+      return Promise.resolve({
+        ok: isAudioCurrentlyRunning(),
+        state: normalizeAudioOutputState(audioEngine.state),
+        unlocked: isAudioCurrentlyRunning(),
+        unlockedOnGesture: Boolean(audioEngine.unlockedOnGesture),
+        reason: 'in-flight',
+      });
+    }
+
+    audioGestureUnlockInFlight = true;
+    detachAudioGestureUnlock();
+
+    const source = typeof opts.source === 'string' ? opts.source : 'gesture';
+    const isRecovery = source === 'visibilitychange' || source === 'focus' || source === 'pageshow';
+
+    const finalize = (failedExplicitly) => {
+      audioGestureUnlockInFlight = false;
+      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+        audioGestureUnlockAttempted = true;
+        stopGamepadAudioUnlockPoll();
+        return {
+          ok: false,
+          state: 'closed',
+          unlocked: false,
+          unlockedOnGesture: false,
+          reason: 'destroyed',
+        };
+      }
+      const rawState = audioEngine.state;
+      const stillSuspended = Boolean(
+        (audioEngine.context || rawState === 'suspended' || rawState === 'interrupted') &&
+          (rawState === 'suspended' || rawState === 'interrupted')
+      );
+      if (failedExplicitly || stillSuspended) {
+        if (audioGestureRetriesRemaining > 0) {
+          audioGestureRetriesRemaining -= 1;
+          audioGestureUnlockAttempted = false;
+          armAudioGestureUnlock();
+        } else {
+          audioGestureUnlockAttempted = true;
+        }
+        if (readConnectedGamepads().length > 0) {
+          startGamepadAudioUnlockPoll();
+        }
+        return {
+          ok: false,
+          state: normalizeAudioOutputState(rawState),
+          unlocked: false,
+          unlockedOnGesture: Boolean(audioEngine.unlockedOnGesture),
+          reason: failedExplicitly ? 'resume-rejected' : 'still-suspended',
+        };
+      }
+
+      audioGestureUnlockAttempted = true;
+      stopGamepadAudioUnlockPoll();
+      if (rawState === 'running') {
+        notifyRuntimeAudioContextState('active');
+      }
+      return {
+        ok: true,
+        state: normalizeAudioOutputState(rawState),
+        unlocked: true,
+        unlockedOnGesture: Boolean(audioEngine.unlockedOnGesture || rawState === 'running'),
+        sampleRate:
+          typeof audioEngine.sampleRate === 'number' && Number.isFinite(audioEngine.sampleRate)
+            ? audioEngine.sampleRate
+            : null,
+        reason: null,
+      };
+    };
+
+    const invokeMethod = () => {
+      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+        return Promise.resolve(finalize(false));
+      }
+      try {
+        let result;
+        if (isRecovery && typeof audioEngine.recoverFromInterruption === 'function') {
+          result = audioEngine.recoverFromInterruption({ armGestureFallback: false });
+        } else if (typeof audioEngine.unlockOnUserGesture === 'function') {
+          result = audioEngine.unlockOnUserGesture();
+        } else if (typeof audioEngine.unlockOnGesture === 'function') {
+          result = audioEngine.unlockOnGesture();
+        } else if (typeof audioEngine.resume === 'function') {
+          result = audioEngine.resume();
+        }
+        if (result && typeof result.then === 'function') {
+          return result.then(
+            (val) => {
+              const failed =
+                val === false ||
+                (val && typeof val === 'object' && (val.ok === false || val.unlocked === false));
+              return finalize(Boolean(failed));
+            },
+            () => finalize(true)
+          );
+        }
+        const failed =
+          result === false ||
+          (result &&
+            typeof result === 'object' &&
+            (result.ok === false || result.unlocked === false));
+        return Promise.resolve(finalize(Boolean(failed)));
+      } catch {
+        // Audio unlock errors must never interrupt input or rendering.
+        return Promise.resolve(finalize(true));
+      }
+    };
+
+    const needsLazyStart =
+      !isRecovery &&
+      !hasExplicitAudioEngine &&
+      hasWebAudioSupport &&
+      !audioEngine.context &&
+      audioEngine.state === 'idle' &&
+      typeof audioEngine.start === 'function';
+
+    if (needsLazyStart) {
+      try {
+        return Promise.resolve(audioEngine.start())
+          .then((startRes) => {
+            if (startRes && typeof startRes === 'object' && startRes.ok === false) {
+              return finalize(true);
+            }
+            return invokeMethod();
+          })
+          .catch(() => finalize(true));
+      } catch {
+        return Promise.resolve(finalize(true));
+      }
+    }
+
+    return invokeMethod();
+  }
+
+  function invokeAudioGestureUnlock(ev) {
     if (
       destroyed ||
       audioGestureUnlockAttempted ||
@@ -7482,102 +7801,397 @@ export function bootstrapPlayGta6App(options = {}) {
     ) {
       return;
     }
-    audioGestureUnlockInFlight = true;
-    detachAudioGestureUnlock();
+    const source = ev && typeof ev.type === 'string' ? ev.type : 'gesture';
+    void runAudioUnlockAttempt({ source });
+  }
 
-    const finishAttempt = (failedExplicitly) => {
-      audioGestureUnlockInFlight = false;
-      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
-        audioGestureUnlockAttempted = true;
-        return;
-      }
-      const stillSuspended = Boolean(
-        audioEngine.context &&
-          (audioEngine.state === 'suspended' || audioEngine.state === 'interrupted')
-      );
-      if ((failedExplicitly || stillSuspended) && audioGestureRetriesRemaining > 0) {
-        audioGestureRetriesRemaining -= 1;
-        armAudioGestureUnlock();
-        return;
-      }
+  function unlockAudio(opts = {}) {
+    if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+      return Promise.resolve({
+        ok: false,
+        state: 'closed',
+        unlocked: false,
+        unlockedOnGesture: false,
+        reason: destroyed ? 'destroyed' : 'no-audio-engine',
+      });
+    }
+    if (audioEngine.state === 'running') {
       audioGestureUnlockAttempted = true;
-      if (audioEngine.state === 'running') {
-        notifyRuntimeAudioContextState('active');
-      }
+      detachAudioGestureUnlock();
+      stopGamepadAudioUnlockPoll();
+      notifyRuntimeAudioContextState('active');
+      return Promise.resolve({
+        ok: true,
+        state: 'running',
+        unlocked: true,
+        alreadyRunning: true,
+        unlockedOnGesture: Boolean(audioEngine.unlockedOnGesture || true),
+        sampleRate:
+          typeof audioEngine.sampleRate === 'number' && Number.isFinite(audioEngine.sampleRate)
+            ? audioEngine.sampleRate
+            : null,
+        reason: null,
+      });
+    }
+    audioGestureUnlockAttempted = false;
+    audioGestureRetriesRemaining = Math.max(audioGestureRetriesRemaining, 5);
+    return runAudioUnlockAttempt({
+      source: opts && typeof opts.source === 'string' ? opts.source : 'manual',
+    });
+  }
+
+  function getAudioStatus() {
+    const rawState = audioEngine && typeof audioEngine === 'object' ? audioEngine.state ?? 'idle' : 'closed';
+    const visState =
+      documentObj && typeof documentObj.visibilityState === 'string'
+        ? documentObj.visibilityState
+        : documentObj && documentObj.hidden === true
+          ? 'hidden'
+          : 'visible';
+    return {
+      state: normalizeAudioOutputState(rawState),
+      rawState: typeof rawState === 'string' ? rawState : 'unknown',
+      unlocked: Boolean(
+        audioEngine && (audioEngine.unlockedOnGesture || audioEngine.state === 'running')
+      ),
+      unlockedOnGesture: Boolean(audioEngine && audioEngine.unlockedOnGesture),
+      gestureArmed: Boolean(audioGestureCleanup),
+      gamepadPollActive: gamepadUnlockTimerId !== null,
+      sampleRate:
+        audioEngine &&
+        typeof audioEngine.sampleRate === 'number' &&
+        Number.isFinite(audioEngine.sampleRate)
+          ? audioEngine.sampleRate
+          : null,
+      muted: Boolean(audioEngine && audioEngine.muted),
+      volume:
+        audioEngine && typeof audioEngine.volume === 'number' && Number.isFinite(audioEngine.volume)
+          ? audioEngine.volume
+          : 1.0,
+      visibilityRecoveries: audioVisibilityRecoveries,
+      visibilityState: visState,
     };
+  }
 
-    const triggerUnlock = () => {
-      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
-        finishAttempt(false);
-        return;
-      }
+  function isPointerLocked() {
+    if (canvas && documentObj && 'pointerLockElement' in documentObj) {
+      return documentObj.pointerLockElement === canvas;
+    }
+    if (inputBridge && typeof inputBridge.isPointerLocked === 'function') {
       try {
-        let result;
-        if (typeof audioEngine.unlockOnUserGesture === 'function') {
-          result = audioEngine.unlockOnUserGesture();
-        } else if (typeof audioEngine.unlockOnGesture === 'function') {
-          result = audioEngine.unlockOnGesture();
-        } else if (typeof audioEngine.resume === 'function') {
-          result = audioEngine.resume();
-        }
-        if (result && typeof result.then === 'function') {
-          result.then(
-            (val) => {
-              const failed =
-                val === false ||
-                (val && typeof val === 'object' && (val.ok === false || val.unlocked === false));
-              finishAttempt(Boolean(failed));
-            },
-            () => {
-              finishAttempt(true);
-            }
-          );
-        } else {
-          const failed =
-            result === false ||
-            (result &&
-              typeof result === 'object' &&
-              (result.ok === false || result.unlocked === false));
-          finishAttempt(Boolean(failed));
-        }
+        return Boolean(inputBridge.isPointerLocked());
       } catch {
-        // Audio unlock errors must never interrupt input or rendering.
-        finishAttempt(true);
+        return false;
       }
-    };
+    }
+    return false;
+  }
 
-    const needsLazyStart =
-      !hasExplicitAudioEngine &&
-      hasWebAudioSupport &&
-      !audioEngine.context &&
-      audioEngine.state === 'idle' &&
-      typeof audioEngine.start === 'function';
+  function exitPointerLock() {
+    if (destroyed) {
+      return { ok: false, locked: false, reason: 'destroyed' };
+    }
+    if (!isPointerLocked()) {
+      return { ok: true, locked: false, alreadyUnlocked: true, reason: null };
+    }
+    if (!documentObj || typeof documentObj.exitPointerLock !== 'function') {
+      return { ok: false, locked: isPointerLocked(), reason: 'unsupported' };
+    }
+    try {
+      documentObj.exitPointerLock();
+      const stillLocked = isPointerLocked();
+      if (hud && typeof hud.updateMetrics === 'function') {
+        try {
+          hud.updateMetrics({ pointerLock: stillLocked });
+        } catch {
+          // Ignore HUD update errors.
+        }
+      }
+      return { ok: true, locked: stillLocked, reason: null };
+    } catch (err) {
+      const msg = sanitizeString(err && err.message ? err.message : String(err));
+      return { ok: false, locked: isPointerLocked(), reason: 'exit-failed', error: msg };
+    }
+  }
 
-    if (needsLazyStart) {
+  function requestPointerLock(opts = {}) {
+    if (destroyed) {
+      return Promise.resolve({ ok: false, locked: false, requested: false, reason: 'destroyed' });
+    }
+    // Same user gesture seamlessly unlocks Web Audio if suspended/idle.
+    if (opts.unlockAudio !== false && isAudioNeedsUnlock() && !audioGestureUnlockInFlight) {
+      audioGestureUnlockAttempted = false;
+      void runAudioUnlockAttempt({ source: 'pointer-lock' });
+    }
+    if (isPointerLocked()) {
+      return Promise.resolve({
+        ok: true,
+        locked: true,
+        requested: false,
+        alreadyLocked: true,
+        reason: null,
+      });
+    }
+    if (!canvas || typeof canvas.requestPointerLock !== 'function') {
+      return Promise.resolve({ ok: false, locked: false, requested: false, reason: 'unsupported' });
+    }
+    let result;
+    try {
+      result =
+        opts && opts.unadjustedMovement !== undefined
+          ? canvas.requestPointerLock({ unadjustedMovement: Boolean(opts.unadjustedMovement) })
+          : canvas.requestPointerLock();
+    } catch (err) {
+      const msg = sanitizeString(err && err.message ? err.message : String(err));
+      if (hud && typeof hud.appendLog === 'function') {
+        try {
+          hud.appendLog(`Pointer lock request failed: ${msg}`, 'warn');
+        } catch {
+          // Ignore HUD errors.
+        }
+      }
+      return Promise.resolve({
+        ok: false,
+        locked: isPointerLocked(),
+        requested: false,
+        reason: 'request-failed',
+        error: msg,
+      });
+    }
+
+    if (result && typeof result.then === 'function') {
+      return result.then(
+        () => {
+          const lockedNow = isPointerLocked();
+          if (hud && typeof hud.updateMetrics === 'function') {
+            try {
+              hud.updateMetrics({ pointerLock: lockedNow });
+            } catch {
+              // Ignore HUD errors.
+            }
+          }
+          return { ok: true, locked: lockedNow, requested: true, reason: null };
+        },
+        (err) => {
+          const msg = sanitizeString(err && err.message ? err.message : String(err));
+          if (hud && typeof hud.appendLog === 'function') {
+            try {
+              hud.appendLog(`Pointer lock request rejected: ${msg}`, 'warn');
+            } catch {
+              // Ignore HUD errors.
+            }
+          }
+          return {
+            ok: false,
+            locked: isPointerLocked(),
+            requested: false,
+            reason: 'request-rejected',
+            error: msg,
+          };
+        }
+      );
+    }
+
+    const lockedNow = isPointerLocked();
+    if (hud && typeof hud.updateMetrics === 'function') {
       try {
-        Promise.resolve(audioEngine.start())
-          .then((startRes) => {
-            if (startRes && typeof startRes === 'object' && startRes.ok === false) {
-              finishAttempt(true);
-              return;
-            }
-            triggerUnlock();
-          })
-          .catch(() => {
-            // Ignore lazy WebAudio startup failures during gesture unlock.
-            finishAttempt(true);
-          });
+        hud.updateMetrics({ pointerLock: lockedNow });
       } catch {
-        // Ignore synchronous startup errors.
-        finishAttempt(true);
+        // Ignore HUD errors.
       }
+    }
+    return Promise.resolve({ ok: true, locked: lockedNow, requested: true, reason: null });
+  }
+
+  function togglePointerLock(opts = {}) {
+    if (isPointerLocked()) {
+      return Promise.resolve(exitPointerLock());
+    }
+    return requestPointerLock(opts);
+  }
+
+  function isPageHidden() {
+    if (!documentObj || typeof documentObj !== 'object') {
+      return false;
+    }
+    if (typeof documentObj.visibilityState === 'string') {
+      return documentObj.visibilityState === 'hidden';
+    }
+    return documentObj.hidden === true;
+  }
+
+  function recoverAudioOnVisibility(triggerSource) {
+    if (destroyed || !audioEngine || typeof audioEngine !== 'object' || audioVisibilityInFlight) {
+      return;
+    }
+    if (isPageHidden()) {
+      return;
+    }
+    const rawState = audioEngine.state;
+    if (rawState === 'running') {
+      notifyRuntimeAudioContextState('active');
+      return;
+    }
+    const hasRecoverableContext = Boolean(
+      audioEngine.context || rawState === 'suspended' || rawState === 'interrupted'
+    );
+    if (!hasRecoverableContext || (rawState !== 'suspended' && rawState !== 'interrupted')) {
       return;
     }
 
-    triggerUnlock();
+    audioVisibilityInFlight = true;
+    audioGestureUnlockAttempted = false;
+    audioGestureRetriesRemaining = Math.max(audioGestureRetriesRemaining, 5);
+    runAudioUnlockAttempt({ source: triggerSource })
+      .then((res) => {
+        audioVisibilityInFlight = false;
+        if (destroyed) {
+          return;
+        }
+        if (res && res.ok) {
+          audioVisibilityRecoveries += 1;
+          notifyRuntimeAudioContextState('active');
+        } else {
+          notifyRuntimeAudioContextState('suspended');
+          armAudioGestureUnlock();
+        }
+      })
+      .catch(() => {
+        audioVisibilityInFlight = false;
+        if (!destroyed) {
+          armAudioGestureUnlock();
+        }
+      });
+  }
+
+  function handleVisibilityChange() {
+    if (destroyed) {
+      return;
+    }
+    if (isPageHidden()) {
+      if (isPointerLocked()) {
+        exitPointerLock();
+      }
+      return;
+    }
+    recoverAudioOnVisibility('visibilitychange');
+  }
+
+  function handleWindowFocusOrShow(ev) {
+    if (destroyed || isPageHidden()) {
+      return;
+    }
+    const src = ev && typeof ev.type === 'string' ? ev.type : 'focus';
+    recoverAudioOnVisibility(src);
+  }
+
+  function attachVisibilityAndPointerLockLifecycle() {
+    const cleanups = [];
+    if (isEventTargetLike(documentObj)) {
+      try {
+        documentObj.addEventListener('visibilitychange', handleVisibilityChange);
+        cleanups.push(() => {
+          documentObj.removeEventListener('visibilitychange', handleVisibilityChange);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+      const onPointerLockError = () => {
+        if (destroyed) return;
+        if (hud && typeof hud.updateMetrics === 'function') {
+          try {
+            hud.updateMetrics({ pointerLock: isPointerLocked() });
+          } catch {
+            // Ignore HUD update errors.
+          }
+        }
+      };
+      try {
+        documentObj.addEventListener('pointerlockerror', onPointerLockError);
+        cleanups.push(() => {
+          documentObj.removeEventListener('pointerlockerror', onPointerLockError);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+    }
+    if (isEventTargetLike(windowObj)) {
+      try {
+        windowObj.addEventListener('focus', handleWindowFocusOrShow);
+        cleanups.push(() => {
+          windowObj.removeEventListener('focus', handleWindowFocusOrShow);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+      try {
+        windowObj.addEventListener('pageshow', handleWindowFocusOrShow);
+        cleanups.push(() => {
+          windowObj.removeEventListener('pageshow', handleWindowFocusOrShow);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+    }
+    if (isEventTargetLike(canvas)) {
+      const onCanvasClick = () => {
+        if (destroyed) return;
+        // Clicking the viewport unlocks audio on the same user gesture even if
+        // the event does not bubble to window/document in embedded hosts.
+        if (isAudioNeedsUnlock() && !audioGestureUnlockInFlight) {
+          invokeAudioGestureUnlock({ type: 'click' });
+        }
+        // InputBridge already handles canvas click -> requestPointerLock when active;
+        // only fall back here if InputBridge is disposed while session is running.
+        if (
+          options.autoPointerLockOnCanvasClick !== false &&
+          inputBridge &&
+          inputBridge.disposed &&
+          !isPointerLocked() &&
+          (session.getState() === SESSION_STATE.RUNNING_WASM ||
+            session.getState() === SESSION_STATE.RUNNING_SMOKE)
+        ) {
+          void requestPointerLock({ unlockAudio: false });
+        }
+      };
+      try {
+        canvas.addEventListener('click', onCanvasClick, { passive: true });
+        cleanups.push(() => {
+          canvas.removeEventListener('click', onCanvasClick);
+        });
+      } catch {
+        // Ignore listener registration errors.
+      }
+    }
+
+    if (cleanups.length > 0) {
+      visibilityLifecycleCleanup = () => {
+        for (let i = 0; i < cleanups.length; i += 1) {
+          try {
+            cleanups[i]();
+          } catch {
+            // Ignore cleanup errors.
+          }
+        }
+      };
+    }
+  }
+
+  function detachVisibilityAndPointerLockLifecycle() {
+    if (visibilityLifecycleCleanup) {
+      const fn = visibilityLifecycleCleanup;
+      visibilityLifecycleCleanup = null;
+      fn();
+    }
+    if (pointerLockUiCleanup) {
+      const fn = pointerLockUiCleanup;
+      pointerLockUiCleanup = null;
+      fn();
+    }
   }
 
   armAudioGestureUnlock();
+  attachVisibilityAndPointerLockLifecycle();
 
   function resolveCurrentBootMode() {
     if (session && typeof session.getBootMode === 'function') {
@@ -8583,12 +9197,16 @@ export function bootstrapPlayGta6App(options = {}) {
       ) {
         attachAudioRing(null);
       }
+      if (isAudioNeedsUnlock() && readConnectedGamepads().length > 0) {
+        startGamepadAudioUnlockPoll();
+      }
     }
     return result;
   }
 
   async function stop() {
     stopActiveInputScript();
+    stopGamepadAudioUnlockPoll();
     if (audioRingController && typeof audioRingController.stop === 'function') {
       try {
         audioRingController.stop();
@@ -8701,6 +9319,8 @@ export function bootstrapPlayGta6App(options = {}) {
       }
 
       detachAudioGestureUnlock();
+      stopGamepadAudioUnlockPoll();
+      detachVisibilityAndPointerLockLifecycle();
 
       stopActiveInputScript();
 
@@ -8830,6 +9450,12 @@ export function bootstrapPlayGta6App(options = {}) {
     reclaimSoftMemory,
     registerReclaimHook,
     attachAudioRing,
+    unlockAudio,
+    getAudioStatus,
+    requestPointerLock,
+    exitPointerLock,
+    togglePointerLock,
+    isPointerLocked,
     notifyFirstPresent,
     notifyFirstVisibleFrame,
     recordFastBootMilestone,
