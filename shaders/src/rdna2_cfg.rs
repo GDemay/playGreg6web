@@ -33,7 +33,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::ops::Range;
 
-use crate::rdna2::{Rdna2Detail, Rdna2Instruction};
+use crate::rdna2::{
+    Rdna2AtomicDomain, Rdna2Detail, Rdna2DsOpKind, Rdna2ExportTarget, Rdna2Instruction,
+};
 
 /// Decoded RDNA2 instruction as produced by [`crate::rdna2::decode_program`].
 pub type DecodedInstruction = Rdna2Instruction;
@@ -596,6 +598,115 @@ impl ControlFlowGraph {
             stack.extend(self.blocks[b].terminator.successors());
         }
         seen
+    }
+
+    /// Compute immediate dominators (`doms[b]`) over all reachable blocks via iterative
+    /// Cooper-Harvey-Kennedy dataflow over reverse postorder.
+    ///
+    /// `doms[entry] == Some(entry)`; unreachable blocks map to `None`.
+    pub fn dominators(&self) -> Vec<Option<BlockId>> {
+        let n = self.blocks.len();
+        let mut doms = vec![None; n];
+        let Some(entry) = self.entry() else {
+            return doms;
+        };
+
+        // Iterative DFS to compute postorder, then reverse for RPO.
+        let mut visited = vec![false; n];
+        let mut postorder = Vec::with_capacity(n);
+        let mut stack: Vec<(BlockId, usize)> = vec![(entry, 0)];
+        visited[entry] = true;
+        while let Some((b, next_idx)) = stack.pop() {
+            let succs = self.blocks[b].terminator.successors();
+            if next_idx < succs.len() {
+                stack.push((b, next_idx + 1));
+                let s = succs[next_idx];
+                if s < n && !visited[s] {
+                    visited[s] = true;
+                    stack.push((s, 0));
+                }
+            } else {
+                postorder.push(b);
+            }
+        }
+        postorder.reverse();
+        let rpo = postorder;
+
+        let mut rpo_num = vec![usize::MAX; n];
+        for (pos, &b) in rpo.iter().enumerate() {
+            rpo_num[b] = pos;
+        }
+
+        let preds = self.predecessors();
+        doms[entry] = Some(entry);
+
+        let intersect = |mut b1: BlockId, mut b2: BlockId, doms: &[Option<BlockId>]| -> BlockId {
+            let mut guard = 0usize;
+            let limit = n.saturating_mul(2).saturating_add(4);
+            while b1 != b2 && guard < limit {
+                guard += 1;
+                while rpo_num[b1] > rpo_num[b2] {
+                    match doms[b1] {
+                        Some(d) if d != b1 => b1 = d,
+                        _ => return entry,
+                    }
+                }
+                while rpo_num[b2] > rpo_num[b1] {
+                    match doms[b2] {
+                        Some(d) if d != b2 => b2 = d,
+                        _ => return entry,
+                    }
+                }
+            }
+            b1
+        };
+
+        let mut changed = true;
+        let max_passes = n.saturating_add(4);
+        let mut passes = 0usize;
+        while changed && passes < max_passes {
+            changed = false;
+            passes += 1;
+            for &b in &rpo {
+                if b == entry {
+                    continue;
+                }
+                let mut new_idom: Option<BlockId> = None;
+                for &p in &preds[b] {
+                    if p < n && doms[p].is_some() {
+                        new_idom = Some(match new_idom {
+                            None => p,
+                            Some(cur) => intersect(p, cur, &doms),
+                        });
+                    }
+                }
+                if doms[b] != new_idom && new_idom.is_some() {
+                    doms[b] = new_idom;
+                    changed = true;
+                }
+            }
+        }
+        doms
+    }
+
+    /// Returns `true` iff block `a` dominates block `b` under a precomputed [`Self::dominators`]
+    /// table. Unreachable blocks are not dominated by anything.
+    pub fn dominates(&self, doms: &[Option<BlockId>], a: BlockId, b: BlockId) -> bool {
+        if a >= self.blocks.len() || b >= self.blocks.len() || doms.get(b).copied().flatten().is_none()
+        {
+            return false;
+        }
+        let mut cur = b;
+        for _ in 0..=self.blocks.len() {
+            if cur == a {
+                return true;
+            }
+            match doms.get(cur).copied().flatten() {
+                Some(parent) if parent != cur => cur = parent,
+                _ => return false,
+            }
+        }
+        false
     }
 }
 
@@ -1378,6 +1489,505 @@ pub fn summarize(cfg: &ControlFlowGraph, node: &StructuredNode) -> String {
         node.is_fully_structured()
     );
     out
+}
+
+// ---------------------------------------------------------------------------
+// 3D Compute, Mesh-Shader, Atomic & Barrier CFG Analysis (S69)
+// ---------------------------------------------------------------------------
+
+/// Per-basic-block summary of synchronization, LDS, atomic, wave, and mesh export operations.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockSyncSummary {
+    pub block_id: BlockId,
+    /// Instruction indices of `s_barrier` inside this block.
+    pub barrier_instrs: Vec<usize>,
+    /// Instruction indices of `s_waitcnt*` inside this block.
+    pub waitcnt_instrs: Vec<usize>,
+    pub lds_read_count: usize,
+    pub lds_write_count: usize,
+    /// Count of cross-lane DS wave ops (`ds_swizzle_b32`, `ds_permute_b32`, `ds_bpermute_b32`).
+    pub lds_wave_count: usize,
+    pub buffer_atomic_count: usize,
+    pub image_atomic_count: usize,
+    pub global_atomic_count: usize,
+    pub lds_atomic_count: usize,
+    pub wave_op_count: usize,
+    /// Instruction indices of `s_sendmsg(GS_ALLOC_REQ)` in this block.
+    pub gs_alloc_req_instrs: Vec<usize>,
+    /// Instruction indices of `exp prim` in this block.
+    pub prim_export_instrs: Vec<usize>,
+    /// Instruction indices of `exp pos*` in this block.
+    pub pos_export_instrs: Vec<usize>,
+    /// Instruction indices of `exp param*` in this block.
+    pub param_export_instrs: Vec<usize>,
+    /// `true` if this block contains an `s_*_saveexec_*` or `s_andn*_wrexec_*` instruction.
+    pub has_exec_mask_write: bool,
+}
+
+impl BlockSyncSummary {
+    pub const fn total_atomics(&self) -> usize {
+        self.buffer_atomic_count
+            + self.image_atomic_count
+            + self.global_atomic_count
+            + self.lds_atomic_count
+    }
+
+    pub fn has_barrier(&self) -> bool {
+        !self.barrier_instrs.is_empty()
+    }
+
+    pub fn has_any_mesh_export(&self) -> bool {
+        !self.prim_export_instrs.is_empty()
+            || !self.pos_export_instrs.is_empty()
+            || !self.param_export_instrs.is_empty()
+    }
+}
+
+/// Control-flow guard pattern enclosing an `s_sendmsg(GS_ALLOC_REQ)` meshlet allocation point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MeshAllocGuardKind {
+    /// Executed unconditionally (entry block or straight-line path without branching).
+    Unconditional,
+    /// Guarded by a single-lane / EXEC / VCC mask pattern (`s_and_saveexec` + `s_cbranch_execz`,
+    /// `v_cmpx_*`, or `s_cbranch_vccz`).
+    SingleLaneExecGuard,
+    /// Guarded by a wave-uniform scalar branch (`s_cbranch_scc0` / `s_cbranch_scc1`).
+    WaveUniformScalarGuard,
+    /// Inside another conditional or multi-predecessor control-flow region.
+    OtherConditional,
+}
+
+/// Analysis record for one `s_sendmsg(GS_ALLOC_REQ)` allocation instruction in a mesh shader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeshAllocPoint {
+    pub block_id: BlockId,
+    pub instr_index: usize,
+    pub offset: usize,
+    pub guard_kind: MeshAllocGuardKind,
+    /// `true` iff this allocation (or its immediate single-lane/wave-uniform if-skip guard header)
+    /// dominates every mesh export (`exp prim` / `exp pos*` / `exp param*`) in the CFG.
+    pub dominates_all_exports: bool,
+    pub inside_loop: bool,
+}
+
+/// Analysis record for one `s_barrier` workgroup synchronization point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BarrierRegion {
+    pub barrier_block: BlockId,
+    pub barrier_instr_index: usize,
+    pub inside_loop: bool,
+    /// `true` when no enclosing divergent `EXEC`/`VCC` branch or un-restored exec-mask narrowing
+    /// can cause a subset of lanes to skip this `s_barrier`.
+    pub in_uniform_control_flow: bool,
+}
+
+/// Structured CFG analysis summary for 3D compute, culling, lighting, shadow, and mesh shaders.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ComputeMeshCfgAnalysis {
+    pub blocks: Vec<BlockSyncSummary>,
+    pub is_mesh_shader: bool,
+    pub mesh_alloc_points: Vec<MeshAllocPoint>,
+    /// `true` when there are no mesh exports or every mesh export is dominated by at least one
+    /// `GS_ALLOC_REQ` allocation point.
+    pub all_exports_dominated_by_alloc: bool,
+    pub unallocated_export_blocks: Vec<BlockId>,
+    pub barrier_regions: Vec<BarrierRegion>,
+    pub atomic_blocks: Vec<BlockId>,
+    pub total_buffer_atomics: usize,
+    pub total_image_atomics: usize,
+    pub total_global_atomics: usize,
+    pub total_lds_atomics: usize,
+    pub total_barriers: usize,
+    pub total_waitcnts: usize,
+    pub total_lds_ops: usize,
+    pub total_wave_ops: usize,
+    pub has_non_uniform_barrier: bool,
+}
+
+fn find_natural_loop_blocks(cfg: &ControlFlowGraph, doms: &[Option<BlockId>]) -> Vec<bool> {
+    let n = cfg.blocks.len();
+    let mut in_loop = vec![false; n];
+    let preds = cfg.predecessors();
+
+    for block in &cfg.blocks {
+        let u = block.id;
+        if doms.get(u).copied().flatten().is_none() {
+            continue;
+        }
+        for v in block.terminator.successors() {
+            if v < n && cfg.dominates(doms, v, u) {
+                // Natural loop for back-edge u -> v.
+                in_loop[v] = true;
+                if !in_loop[u] {
+                    in_loop[u] = true;
+                }
+                let mut worklist = vec![u];
+                let mut seen = vec![false; n];
+                seen[v] = true;
+                seen[u] = true;
+                while let Some(cur) = worklist.pop() {
+                    if cur == v {
+                        continue;
+                    }
+                    for &p in &preds[cur] {
+                        if p < n && !seen[p] && doms[p].is_some() {
+                            seen[p] = true;
+                            in_loop[p] = true;
+                            worklist.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    in_loop
+}
+
+/// Returns `true` if there is any path from `start` to a `Terminator::End` / exit block that does
+/// NOT pass through `avoid_block`.
+fn can_reach_end_avoiding(cfg: &ControlFlowGraph, start: BlockId, avoid_block: BlockId) -> bool {
+    let n = cfg.blocks.len();
+    if start >= n || start == avoid_block {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    let mut stack = vec![start];
+    seen[start] = true;
+    while let Some(b) = stack.pop() {
+        let succs = cfg.blocks[b].terminator.successors();
+        if succs.is_empty() || Some(b) == cfg.exit_block {
+            return true;
+        }
+        for s in succs {
+            if s < n && s != avoid_block && !seen[s] {
+                seen[s] = true;
+                stack.push(s);
+            }
+        }
+    }
+    false
+}
+
+/// Analyze a CFG and its decoded instruction stream for 3D compute / mesh-shader metadata:
+/// `s_sendmsg(GS_ALLOC_REQ)` guard classification and domination over mesh exports
+/// (`exp prim`/`exp pos*`/`exp param*`), LDS/buffer/image/global atomic regions, and
+/// `s_barrier`/`s_waitcnt` synchronization safety.
+pub fn analyze_compute_mesh_cfg(
+    cfg: &ControlFlowGraph,
+    instrs: &[DecodedInstruction],
+) -> ComputeMeshCfgAnalysis {
+    let mut analysis = ComputeMeshCfgAnalysis::default();
+    if cfg.blocks.is_empty() {
+        return analysis;
+    }
+
+    let doms = cfg.dominators();
+    let preds = cfg.predecessors();
+    let in_loop = find_natural_loop_blocks(cfg, &doms);
+
+    // 1. Gather per-block instruction metrics.
+    let mut blocks = Vec::with_capacity(cfg.blocks.len());
+    let mut all_export_sites: Vec<(BlockId, usize)> = Vec::new();
+    let mut raw_alloc_sites: Vec<(BlockId, usize, usize)> = Vec::new();
+
+    for block in &cfg.blocks {
+        let mut summary = BlockSyncSummary {
+            block_id: block.id,
+            ..BlockSyncSummary::default()
+        };
+        if !block.synthetic_exit {
+            let start = block.instr_range.start.min(instrs.len());
+            let end = block.instr_range.end.min(instrs.len());
+            for (idx, inst) in instrs[start..end].iter().enumerate() {
+                let abs_idx = start + idx;
+                if inst.is_barrier() {
+                    summary.barrier_instrs.push(abs_idx);
+                }
+                if inst.is_waitcnt() {
+                    summary.waitcnt_instrs.push(abs_idx);
+                }
+                if classify_exec_mask_op(inst).is_some() {
+                    summary.has_exec_mask_write = true;
+                }
+                if let Some(ds) = inst.ds_op_info() {
+                    match ds.kind {
+                        Rdna2DsOpKind::Read => summary.lds_read_count += 1,
+                        Rdna2DsOpKind::Write => summary.lds_write_count += 1,
+                        Rdna2DsOpKind::Swizzle
+                        | Rdna2DsOpKind::Permute
+                        | Rdna2DsOpKind::BPermute => summary.lds_wave_count += 1,
+                        Rdna2DsOpKind::Atomic | Rdna2DsOpKind::Other => {}
+                    }
+                }
+                if let Some(atomic) = inst.atomic_info() {
+                    match atomic.domain {
+                        Rdna2AtomicDomain::Buffer => summary.buffer_atomic_count += 1,
+                        Rdna2AtomicDomain::Image => summary.image_atomic_count += 1,
+                        Rdna2AtomicDomain::Flat
+                        | Rdna2AtomicDomain::Global
+                        | Rdna2AtomicDomain::Scratch => summary.global_atomic_count += 1,
+                        Rdna2AtomicDomain::Lds => summary.lds_atomic_count += 1,
+                    }
+                }
+                if inst.wave_op_info().is_some() {
+                    summary.wave_op_count += 1;
+                }
+                if let Some(msg) = inst.sendmsg_info()
+                    && msg.is_gs_alloc_req
+                {
+                    summary.gs_alloc_req_instrs.push(abs_idx);
+                    raw_alloc_sites.push((block.id, abs_idx, inst.offset));
+                }
+                if let Rdna2Detail::Exp { target, .. } = inst.detail {
+                    match target {
+                        Rdna2ExportTarget::Prim => {
+                            summary.prim_export_instrs.push(abs_idx);
+                            all_export_sites.push((block.id, abs_idx));
+                        }
+                        Rdna2ExportTarget::Pos(_) => {
+                            summary.pos_export_instrs.push(abs_idx);
+                            all_export_sites.push((block.id, abs_idx));
+                        }
+                        Rdna2ExportTarget::Param(_) => {
+                            summary.param_export_instrs.push(abs_idx);
+                            all_export_sites.push((block.id, abs_idx));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        analysis.total_buffer_atomics += summary.buffer_atomic_count;
+        analysis.total_image_atomics += summary.image_atomic_count;
+        analysis.total_global_atomics += summary.global_atomic_count;
+        analysis.total_lds_atomics += summary.lds_atomic_count;
+        analysis.total_barriers += summary.barrier_instrs.len();
+        analysis.total_waitcnts += summary.waitcnt_instrs.len();
+        analysis.total_lds_ops +=
+            summary.lds_read_count + summary.lds_write_count + summary.lds_wave_count + summary.lds_atomic_count;
+        analysis.total_wave_ops += summary.wave_op_count;
+        if summary.total_atomics() > 0 {
+            analysis.atomic_blocks.push(block.id);
+        }
+        blocks.push(summary);
+    }
+
+    let has_prim_exports = blocks.iter().any(|b| !b.prim_export_instrs.is_empty());
+    analysis.is_mesh_shader = !raw_alloc_sites.is_empty() || has_prim_exports;
+
+    // 2. Analyze GS_ALLOC_REQ guard patterns & domination over mesh exports.
+    let mut covered_export_sites: BTreeSet<(BlockId, usize)> = BTreeSet::new();
+    let entry = cfg.entry().unwrap_or(0);
+
+    for (alloc_block, alloc_idx, alloc_offset) in raw_alloc_sites {
+        // Check for inline exec-mask narrowing before GS_ALLOC_REQ in the same block.
+        let b_start = cfg.blocks[alloc_block].instr_range.start.min(instrs.len());
+        let inline_exec_guard = instrs[b_start..alloc_idx.min(instrs.len())]
+            .iter()
+            .any(|i| classify_exec_mask_op(i).is_some() || i.mnemonic.starts_with("v_cmpx_"));
+
+        let block_preds = &preds[alloc_block];
+        let mut guard_header: Option<BlockId> = None;
+        let guard_kind = if inline_exec_guard {
+            MeshAllocGuardKind::SingleLaneExecGuard
+        } else if alloc_block == entry {
+            MeshAllocGuardKind::Unconditional
+        } else if block_preds.len() == 1 {
+            let p = block_preds[0];
+            match cfg.blocks[p].terminator {
+                Terminator::CondBranch { kind, .. } => {
+                    guard_header = Some(p);
+                    match kind {
+                        BranchKind::Execz
+                        | BranchKind::Execnz
+                        | BranchKind::Vccz
+                        | BranchKind::Vccnz => MeshAllocGuardKind::SingleLaneExecGuard,
+                        BranchKind::Scc0 | BranchKind::Scc1 => {
+                            MeshAllocGuardKind::WaveUniformScalarGuard
+                        }
+                        BranchKind::Unconditional => MeshAllocGuardKind::Unconditional,
+                    }
+                }
+                Terminator::Fallthrough(_) | Terminator::Branch(_) => {
+                    // Walk dominator chain: unconditional if no conditional dominates us.
+                    let mut has_cond_dom = false;
+                    let mut cur = p;
+                    for _ in 0..cfg.blocks.len() {
+                        if matches!(cfg.blocks[cur].terminator, Terminator::CondBranch { .. }) {
+                            has_cond_dom = true;
+                            break;
+                        }
+                        match doms[cur] {
+                            Some(parent) if parent != cur => cur = parent,
+                            _ => break,
+                        }
+                    }
+                    if has_cond_dom {
+                        MeshAllocGuardKind::OtherConditional
+                    } else {
+                        MeshAllocGuardKind::Unconditional
+                    }
+                }
+                Terminator::End => MeshAllocGuardKind::OtherConditional,
+            }
+        } else {
+            MeshAllocGuardKind::OtherConditional
+        };
+
+        // Effective domination anchor: for the canonical AMD NGG/mesh single-lane/wave-0 if-skip
+        // guard (`guard_hdr` skips `alloc_block` straight into `merge`, while `alloc_block` flows
+        // directly to `merge`), `guard_hdr` represents the wave-wide allocation point for blocks
+        // strictly after `guard_hdr`.
+        let dom_anchor = match (guard_kind, guard_header) {
+            (
+                MeshAllocGuardKind::SingleLaneExecGuard
+                | MeshAllocGuardKind::WaveUniformScalarGuard,
+                Some(hdr),
+            ) => {
+                if let Terminator::CondBranch {
+                    target,
+                    fallthrough,
+                    ..
+                } = cfg.blocks[hdr].terminator
+                {
+                    let other_arm = if target == alloc_block {
+                        fallthrough
+                    } else {
+                        target
+                    };
+                    let alloc_succs = cfg.blocks[alloc_block].terminator.successors();
+                    if alloc_succs.len() == 1 && alloc_succs[0] == other_arm {
+                        hdr
+                    } else {
+                        alloc_block
+                    }
+                } else {
+                    alloc_block
+                }
+            }
+            _ => alloc_block,
+        };
+
+        let mut dominates_all = true;
+        for &(exp_block, exp_idx) in &all_export_sites {
+            let dominated = if exp_block == alloc_block {
+                alloc_idx < exp_idx
+            } else if dom_anchor != alloc_block && exp_block == dom_anchor {
+                // Export occurs inside the guard header BEFORE GS_ALLOC_REQ!
+                false
+            } else {
+                cfg.dominates(&doms, dom_anchor, exp_block)
+            };
+            if dominated {
+                covered_export_sites.insert((exp_block, exp_idx));
+            } else {
+                dominates_all = false;
+            }
+        }
+
+        analysis.mesh_alloc_points.push(MeshAllocPoint {
+            block_id: alloc_block,
+            instr_index: alloc_idx,
+            offset: alloc_offset,
+            guard_kind,
+            dominates_all_exports: dominates_all,
+            inside_loop: in_loop[alloc_block],
+        });
+    }
+
+    let mut unallocated: BTreeSet<BlockId> = BTreeSet::new();
+    for &(exp_block, exp_idx) in &all_export_sites {
+        if !covered_export_sites.contains(&(exp_block, exp_idx)) {
+            unallocated.insert(exp_block);
+        }
+    }
+    analysis.unallocated_export_blocks = unallocated.into_iter().collect();
+    analysis.all_exports_dominated_by_alloc =
+        all_export_sites.is_empty() || analysis.unallocated_export_blocks.is_empty();
+
+    // 3. Analyze s_barrier uniformity & loop nesting.
+    for b_summary in &blocks {
+        let bid = b_summary.block_id;
+        for &bar_idx in &b_summary.barrier_instrs {
+            let mut uniform = true;
+
+            // Check if any dominating divergent EXEC/VCC conditional branch can bypass this barrier.
+            for d in &cfg.blocks {
+                if d.id == bid {
+                    continue;
+                }
+                if let Terminator::CondBranch { kind, .. } = d.terminator
+                    && matches!(
+                        kind,
+                        BranchKind::Execz
+                            | BranchKind::Execnz
+                            | BranchKind::Vccz
+                            | BranchKind::Vccnz
+                    )
+                    && cfg.dominates(&doms, d.id, bid)
+                    && can_reach_end_avoiding(cfg, d.id, bid)
+                {
+                    uniform = false;
+                    break;
+                }
+            }
+
+            // Also check for an un-restored inline exec-mask narrowing earlier in the same block.
+            if uniform {
+                let start = cfg.blocks[bid].instr_range.start.min(instrs.len());
+                let mut narrowed = false;
+                for inst in &instrs[start..bar_idx.min(instrs.len())] {
+                    if classify_exec_mask_op(inst).is_some()
+                        || inst.mnemonic.starts_with("v_cmpx_")
+                    {
+                        narrowed = true;
+                    } else if matches!(
+                        inst.detail,
+                        Rdna2Detail::Sop1 { sdst: 126, .. } | Rdna2Detail::Sop2 { sdst: 126, .. }
+                    ) {
+                        // Direct restore to `exec` / `exec_lo`.
+                        narrowed = false;
+                    }
+                }
+                if narrowed {
+                    uniform = false;
+                }
+            }
+
+            if !uniform {
+                analysis.has_non_uniform_barrier = true;
+            }
+            analysis.barrier_regions.push(BarrierRegion {
+                barrier_block: bid,
+                barrier_instr_index: bar_idx,
+                inside_loop: in_loop[bid],
+                in_uniform_control_flow: uniform,
+            });
+        }
+    }
+
+    analysis.blocks = blocks;
+    analysis
+}
+
+/// Deterministic sanitized one-line summary of a [`ComputeMeshCfgAnalysis`].
+pub fn summarize_compute_mesh_cfg(analysis: &ComputeMeshCfgAnalysis) -> String {
+    format!(
+        "mesh={} allocs={} exports_dom={} barriers={} non_uniform_barriers={} waitcnts={} atomics(buf={},img={},glob={},lds={}) lds_ops={} wave_ops={}",
+        analysis.is_mesh_shader,
+        analysis.mesh_alloc_points.len(),
+        analysis.all_exports_dominated_by_alloc,
+        analysis.total_barriers,
+        analysis.has_non_uniform_barrier,
+        analysis.total_waitcnts,
+        analysis.total_buffer_atomics,
+        analysis.total_image_atomics,
+        analysis.total_global_atomics,
+        analysis.total_lds_atomics,
+        analysis.total_lds_ops,
+        analysis.total_wave_ops,
+    )
 }
 
 // ---------------------------------------------------------------------------

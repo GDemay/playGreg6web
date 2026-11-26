@@ -365,6 +365,796 @@ impl Rdna2Instruction {
         }
         out
     }
+
+    /// Classify atomic memory operations across `MUBUF`, `MIMG`, `FLAT`/`GLOBAL`/`SCRATCH`, and `DS`.
+    pub fn atomic_info(&self) -> Option<Rdna2AtomicInfo> {
+        classify_atomic_detail(&self.detail)
+    }
+
+    /// `true` iff this instruction is a memory/image/LDS atomic operation.
+    pub fn is_atomic(&self) -> bool {
+        self.atomic_info().is_some()
+    }
+
+    /// `true` iff this instruction is a workgroup barrier (`s_barrier`).
+    pub const fn is_barrier(&self) -> bool {
+        matches!(self.detail, Rdna2Detail::Sopp { op: 0x0A, .. })
+    }
+
+    /// Decode wait-counter metadata for `s_waitcnt`, `s_waitcnt_depctr`, and `s_waitcnt_*`.
+    pub const fn waitcnt_info(&self) -> Option<Rdna2WaitcntInfo> {
+        classify_waitcnt_detail(&self.detail)
+    }
+
+    /// `true` iff this instruction is any `s_waitcnt*` synchronization instruction.
+    pub const fn is_waitcnt(&self) -> bool {
+        self.waitcnt_info().is_some()
+    }
+
+    /// Decode `s_sendmsg` / `s_sendmsghalt` message metadata (`msg_id`, `op`, `stream`, `GS_ALLOC_REQ`).
+    pub const fn sendmsg_info(&self) -> Option<Rdna2SendMsgInfo> {
+        match self.detail {
+            Rdna2Detail::Sopp {
+                op: 0x10, simm16, ..
+            } => Some(decode_sendmsg(simm16, false)),
+            Rdna2Detail::Sopp {
+                op: 0x11, simm16, ..
+            } => Some(decode_sendmsg(simm16, true)),
+            _ => None,
+        }
+    }
+
+    /// Classify `DS` (LDS / cross-lane swizzle & permute) instruction operand metadata.
+    pub const fn ds_op_info(&self) -> Option<Rdna2DsOpInfo> {
+        classify_ds_detail(&self.detail)
+    }
+
+    /// Classify wave/subgroup/bitmask instructions (`v_mbcnt_*`, `s_bcnt1_*`, `s_ff0/ff1/flbit*`,
+    /// `v_readlane_b32`, `v_readfirstlane_b32`, `ds_swizzle/permute/bpermute`, `v_cmp*`).
+    pub const fn wave_op_info(&self) -> Option<Rdna2WaveOpInfo> {
+        classify_wave_detail(&self.detail)
+    }
+}
+
+/// Atomic operation kind across RDNA2 `MUBUF`, `MIMG`, `FLAT`/`GLOBAL`, and `DS` encodings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rdna2AtomicOp {
+    Swap,
+    CmpSwap,
+    Add,
+    Sub,
+    CSub,
+    SMin,
+    UMin,
+    SMax,
+    UMax,
+    And,
+    Or,
+    Xor,
+    Inc,
+    Dec,
+    FCmpSwap,
+    FMin,
+    FMax,
+}
+
+impl Rdna2AtomicOp {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Swap => "swap",
+            Self::CmpSwap => "cmpswap",
+            Self::Add => "add",
+            Self::Sub => "sub",
+            Self::CSub => "csub",
+            Self::SMin => "smin",
+            Self::UMin => "umin",
+            Self::SMax => "smax",
+            Self::UMax => "umax",
+            Self::And => "and",
+            Self::Or => "or",
+            Self::Xor => "xor",
+            Self::Inc => "inc",
+            Self::Dec => "dec",
+            Self::FCmpSwap => "fcmpswap",
+            Self::FMin => "fmin",
+            Self::FMax => "fmax",
+        }
+    }
+}
+
+/// Memory domain targeted by an RDNA2 atomic instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rdna2AtomicDomain {
+    Buffer,
+    Image,
+    Flat,
+    Global,
+    Scratch,
+    Lds,
+}
+
+impl Rdna2AtomicDomain {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Buffer => "buffer",
+            Self::Image => "image",
+            Self::Flat => "flat",
+            Self::Global => "global",
+            Self::Scratch => "scratch",
+            Self::Lds => "lds",
+        }
+    }
+}
+
+/// Structured metadata for a decoded RDNA2 atomic instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rdna2AtomicInfo {
+    pub domain: Rdna2AtomicDomain,
+    pub op: Rdna2AtomicOp,
+    pub is_64bit: bool,
+    pub is_float: bool,
+    pub returns_value: bool,
+    pub data_vgpr_count: u8,
+}
+
+/// Decoded wait-counter fields for `s_waitcnt*` instructions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rdna2WaitcntInfo {
+    pub vmcnt: Option<u8>,
+    pub expcnt: Option<u8>,
+    pub lgkmcnt: Option<u8>,
+    pub vscnt: Option<u16>,
+    pub is_depctr: bool,
+}
+
+/// Decoded GFX10.3 `s_sendmsg` / `s_sendmsghalt` operand fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rdna2SendMsgInfo {
+    pub msg_id: u8,
+    pub op: u8,
+    pub stream: u8,
+    pub is_halt: bool,
+    pub is_gs_alloc_req: bool,
+    pub is_gs_done: bool,
+}
+
+/// Decoded `ds_swizzle_b32` 16-bit offset mode (`QDMode` vs `Bitmode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Rdna2SwizzleMode {
+    /// Bit 15 == 1 (`QDMode`): 4-lane quad permute (`lanes[i]` = source lane in quad for lane `i`).
+    QuadPerm { lanes: [u8; 4] },
+    /// Bit 15 == 0 (`Bitmode` / butterfly / FFT / broadcast): `((lane & and_mask) | or_mask) ^ xor_mask`.
+    BitMode {
+        and_mask: u8,
+        or_mask: u8,
+        xor_mask: u8,
+    },
+}
+
+impl Rdna2SwizzleMode {
+    /// Compute the source lane index (`0..=63`) read by `lane` under this swizzle pattern.
+    pub const fn source_lane(self, lane: u32) -> u32 {
+        let clamped = lane & 63;
+        match self {
+            Self::QuadPerm { lanes } => {
+                let quad_lane = (clamped & 3) as usize;
+                (clamped & 0x3C) | (lanes[quad_lane] as u32 & 3)
+            }
+            Self::BitMode {
+                and_mask,
+                or_mask,
+                xor_mask,
+            } => {
+                let low = (((clamped & 31) & (and_mask as u32)) | (or_mask as u32)) ^ (xor_mask as u32);
+                (clamped & 32) | (low & 31)
+            }
+        }
+    }
+}
+
+/// Decode a `ds_swizzle_b32` 16-bit immediate offset (`(offset1 << 8) | offset0`).
+pub const fn decode_ds_swizzle_offset(offset16: u16) -> Rdna2SwizzleMode {
+    if (offset16 & 0x8000) != 0 {
+        Rdna2SwizzleMode::QuadPerm {
+            lanes: [
+                (offset16 & 0x3) as u8,
+                ((offset16 >> 2) & 0x3) as u8,
+                ((offset16 >> 4) & 0x3) as u8,
+                ((offset16 >> 6) & 0x3) as u8,
+            ],
+        }
+    } else {
+        Rdna2SwizzleMode::BitMode {
+            and_mask: (offset16 & 0x1F) as u8,
+            or_mask: ((offset16 >> 5) & 0x1F) as u8,
+            xor_mask: ((offset16 >> 10) & 0x1F) as u8,
+        }
+    }
+}
+
+/// High-level category of a `DS` instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rdna2DsOpKind {
+    Read,
+    Write,
+    Swizzle,
+    Permute,
+    BPermute,
+    Atomic,
+    Other,
+}
+
+/// Structured operand metadata for a decoded `DS` instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rdna2DsOpInfo {
+    pub kind: Rdna2DsOpKind,
+    /// Number of 32-bit VGPRs transferred (e.g. `3` for `b96`, `4` for `b128`, `1` for `b32`).
+    pub data_vgprs: u8,
+    /// Combined 16-bit immediate offset (`(offset1 << 8) | offset0`) for single-offset DS ops.
+    pub offset16: u16,
+    /// `true` for cross-lane routing instructions (`ds_swizzle_b32`, `ds_permute_b32`, `ds_bpermute_b32`).
+    pub is_wave_cross_lane: bool,
+    pub is_gds: bool,
+    pub swizzle_mode: Option<Rdna2SwizzleMode>,
+}
+
+/// Wave / subgroup / scalar-bitmask instruction classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rdna2WaveOpKind {
+    MbcntLo,
+    MbcntHi,
+    Bcnt0B32,
+    Bcnt0B64,
+    Bcnt1B32,
+    Bcnt1B64,
+    Ff0B32,
+    Ff0B64,
+    Ff1B32,
+    Ff1B64,
+    FlbitB32,
+    FlbitB64,
+    FlbitI32,
+    FlbitI64,
+    ReadFirstLane,
+    ReadLane,
+    WriteLane,
+    PermLane16,
+    PermLaneX16,
+    DsSwizzle,
+    DsPermute,
+    DsBPermute,
+    BallotCmp,
+    QuadMask,
+    Wqm,
+}
+
+/// Structured metadata for a wave/subgroup/bitmask instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Rdna2WaveOpInfo {
+    pub kind: Rdna2WaveOpKind,
+    /// `true` if the instruction operates on a 64-bit wave mask (`*_b64` / `*_i64` / `v_mbcnt_hi`).
+    pub is_wave64_mask: bool,
+    /// `true` if the instruction reads or exchanges data across lanes.
+    pub is_cross_lane: bool,
+}
+
+/// Extracted mesh-shader & 3D compute dispatch metadata from a decoded instruction stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rdna2MeshMetadata {
+    /// `true` when `s_sendmsg(GS_ALLOC_REQ)` or an `exp prim` export is present.
+    pub is_mesh_shader: bool,
+    pub gs_alloc_req_offsets: Vec<usize>,
+    pub gs_done_offsets: Vec<usize>,
+    pub prim_export_offsets: Vec<usize>,
+    pub pos_export_slots: Vec<u8>,
+    pub param_export_slots: Vec<u8>,
+    pub done_export_offsets: Vec<usize>,
+    pub atomic_count: usize,
+    pub barrier_count: usize,
+    pub waitcnt_count: usize,
+    pub lds_op_count: usize,
+    pub wave_op_count: usize,
+}
+
+/// Extract mesh-shader allocation/export, atomic, barrier, LDS, and wave metadata from decoded
+/// instructions without mutating [`Rdna2ProgramSummary`].
+pub fn extract_mesh_metadata(instructions: &[Rdna2Instruction]) -> Rdna2MeshMetadata {
+    let mut meta = Rdna2MeshMetadata::default();
+    let mut pos_slots = BTreeSet::new();
+    let mut param_slots = BTreeSet::new();
+
+    for inst in instructions {
+        if let Some(msg) = inst.sendmsg_info() {
+            if msg.is_gs_alloc_req {
+                meta.gs_alloc_req_offsets.push(inst.offset);
+            }
+            if msg.is_gs_done {
+                meta.gs_done_offsets.push(inst.offset);
+            }
+        }
+        if let Rdna2Detail::Exp { target, done, .. } = inst.detail {
+            match target {
+                Rdna2ExportTarget::Prim => meta.prim_export_offsets.push(inst.offset),
+                Rdna2ExportTarget::Pos(idx) => {
+                    pos_slots.insert(idx);
+                }
+                Rdna2ExportTarget::Param(idx) => {
+                    param_slots.insert(idx);
+                }
+                _ => {}
+            }
+            if done {
+                meta.done_export_offsets.push(inst.offset);
+            }
+        }
+        if inst.is_atomic() {
+            meta.atomic_count += 1;
+        }
+        if inst.is_barrier() {
+            meta.barrier_count += 1;
+        }
+        if inst.is_waitcnt() {
+            meta.waitcnt_count += 1;
+        }
+        if inst.ds_op_info().is_some() {
+            meta.lds_op_count += 1;
+        }
+        if inst.wave_op_info().is_some() {
+            meta.wave_op_count += 1;
+        }
+    }
+
+    meta.gs_alloc_req_offsets.sort_unstable();
+    meta.gs_done_offsets.sort_unstable();
+    meta.prim_export_offsets.sort_unstable();
+    meta.done_export_offsets.sort_unstable();
+    meta.pos_export_slots = pos_slots.into_iter().collect();
+    meta.param_export_slots = param_slots.into_iter().collect();
+    meta.is_mesh_shader =
+        !meta.gs_alloc_req_offsets.is_empty() || !meta.prim_export_offsets.is_empty();
+    meta
+}
+
+const fn classify_waitcnt_detail(detail: &Rdna2Detail) -> Option<Rdna2WaitcntInfo> {
+    match *detail {
+        Rdna2Detail::Sopp {
+            op: 0x0C, simm16, ..
+        } => {
+            let vmcnt = ((simm16 & 0xF) | (((simm16 >> 14) & 0x3) << 4)) as u8;
+            let expcnt = ((simm16 >> 4) & 0x7) as u8;
+            let lgkmcnt = ((simm16 >> 8) & 0x3F) as u8;
+            Some(Rdna2WaitcntInfo {
+                vmcnt: if vmcnt != 0x3F { Some(vmcnt) } else { None },
+                expcnt: if expcnt != 0x7 { Some(expcnt) } else { None },
+                lgkmcnt: if lgkmcnt != 0x3F { Some(lgkmcnt) } else { None },
+                vscnt: None,
+                is_depctr: false,
+            })
+        }
+        Rdna2Detail::Sopp { op: 0x23, .. } => Some(Rdna2WaitcntInfo {
+            vmcnt: None,
+            expcnt: None,
+            lgkmcnt: None,
+            vscnt: None,
+            is_depctr: true,
+        }),
+        Rdna2Detail::Sopk {
+            op: 0x17, simm16, ..
+        } => Some(Rdna2WaitcntInfo {
+            vmcnt: None,
+            expcnt: None,
+            lgkmcnt: None,
+            vscnt: Some(simm16),
+            is_depctr: false,
+        }),
+        Rdna2Detail::Sopk {
+            op: 0x18, simm16, ..
+        } => Some(Rdna2WaitcntInfo {
+            vmcnt: Some((simm16 & 0x3F) as u8),
+            expcnt: None,
+            lgkmcnt: None,
+            vscnt: None,
+            is_depctr: false,
+        }),
+        Rdna2Detail::Sopk {
+            op: 0x19, simm16, ..
+        } => Some(Rdna2WaitcntInfo {
+            vmcnt: None,
+            expcnt: Some((simm16 & 0x7) as u8),
+            lgkmcnt: None,
+            vscnt: None,
+            is_depctr: false,
+        }),
+        Rdna2Detail::Sopk {
+            op: 0x1A, simm16, ..
+        } => Some(Rdna2WaitcntInfo {
+            vmcnt: None,
+            expcnt: None,
+            lgkmcnt: Some((simm16 & 0x3F) as u8),
+            vscnt: None,
+            is_depctr: false,
+        }),
+        _ => None,
+    }
+}
+
+const fn classify_buf_or_flat_atomic_op(op: u8) -> Option<(Rdna2AtomicOp, bool, bool, u8)> {
+    // Returns (atomic_op, is_64bit, is_float, data_vgpr_count)
+    match op {
+        0x30 => Some((Rdna2AtomicOp::Swap, false, false, 1)),
+        0x31 => Some((Rdna2AtomicOp::CmpSwap, false, false, 2)),
+        0x32 => Some((Rdna2AtomicOp::Add, false, false, 1)),
+        0x33 => Some((Rdna2AtomicOp::Sub, false, false, 1)),
+        0x34 => Some((Rdna2AtomicOp::CSub, false, false, 1)),
+        0x35 => Some((Rdna2AtomicOp::SMin, false, false, 1)),
+        0x36 => Some((Rdna2AtomicOp::UMin, false, false, 1)),
+        0x37 => Some((Rdna2AtomicOp::SMax, false, false, 1)),
+        0x38 => Some((Rdna2AtomicOp::UMax, false, false, 1)),
+        0x39 => Some((Rdna2AtomicOp::And, false, false, 1)),
+        0x3A => Some((Rdna2AtomicOp::Or, false, false, 1)),
+        0x3B => Some((Rdna2AtomicOp::Xor, false, false, 1)),
+        0x3C => Some((Rdna2AtomicOp::Inc, false, false, 1)),
+        0x3D => Some((Rdna2AtomicOp::Dec, false, false, 1)),
+        0x3E => Some((Rdna2AtomicOp::FCmpSwap, false, true, 2)),
+        0x3F => Some((Rdna2AtomicOp::FMin, false, true, 1)),
+        0x40 => Some((Rdna2AtomicOp::FMax, false, true, 1)),
+        0x50 => Some((Rdna2AtomicOp::Swap, true, false, 2)),
+        0x51 => Some((Rdna2AtomicOp::CmpSwap, true, false, 4)),
+        0x52 => Some((Rdna2AtomicOp::Add, true, false, 2)),
+        0x53 => Some((Rdna2AtomicOp::Sub, true, false, 2)),
+        0x55 => Some((Rdna2AtomicOp::SMin, true, false, 2)),
+        0x56 => Some((Rdna2AtomicOp::UMin, true, false, 2)),
+        0x57 => Some((Rdna2AtomicOp::SMax, true, false, 2)),
+        0x58 => Some((Rdna2AtomicOp::UMax, true, false, 2)),
+        0x59 => Some((Rdna2AtomicOp::And, true, false, 2)),
+        0x5A => Some((Rdna2AtomicOp::Or, true, false, 2)),
+        0x5B => Some((Rdna2AtomicOp::Xor, true, false, 2)),
+        0x5C => Some((Rdna2AtomicOp::Inc, true, false, 2)),
+        0x5D => Some((Rdna2AtomicOp::Dec, true, false, 2)),
+        0x5E => Some((Rdna2AtomicOp::FCmpSwap, true, true, 4)),
+        0x5F => Some((Rdna2AtomicOp::FMin, true, true, 2)),
+        0x60 => Some((Rdna2AtomicOp::FMax, true, true, 2)),
+        _ => None,
+    }
+}
+
+const fn classify_mimg_atomic_op(op: u8, dmask: u8) -> Option<(Rdna2AtomicOp, bool, bool, u8)> {
+    let is_cmpswap = matches!(op, 0x10 | 0x1D);
+    let regs = dmask.count_ones() as u8;
+    let is_64bit = if is_cmpswap { regs >= 4 } else { regs >= 2 };
+    let data_vgprs = if regs > 0 {
+        regs
+    } else if is_cmpswap {
+        2
+    } else {
+        1
+    };
+    let (kind, is_float) = match op {
+        0x0F => (Rdna2AtomicOp::Swap, false),
+        0x10 => (Rdna2AtomicOp::CmpSwap, false),
+        0x11 => (Rdna2AtomicOp::Add, false),
+        0x12 => (Rdna2AtomicOp::Sub, false),
+        0x14 => (Rdna2AtomicOp::SMin, false),
+        0x15 => (Rdna2AtomicOp::UMin, false),
+        0x16 => (Rdna2AtomicOp::SMax, false),
+        0x17 => (Rdna2AtomicOp::UMax, false),
+        0x18 => (Rdna2AtomicOp::And, false),
+        0x19 => (Rdna2AtomicOp::Or, false),
+        0x1A => (Rdna2AtomicOp::Xor, false),
+        0x1B => (Rdna2AtomicOp::Inc, false),
+        0x1C => (Rdna2AtomicOp::Dec, false),
+        0x1D => (Rdna2AtomicOp::FCmpSwap, true),
+        0x1E => (Rdna2AtomicOp::FMin, true),
+        0x1F => (Rdna2AtomicOp::FMax, true),
+        _ => return None,
+    };
+    Some((kind, is_64bit, is_float, data_vgprs))
+}
+
+const fn classify_ds_atomic_op(op: u8) -> Option<(Rdna2AtomicOp, bool, bool, u8)> {
+    // Returns (atomic_op, is_64bit, returns_value, data_vgpr_count)
+    match op {
+        0x00 => Some((Rdna2AtomicOp::Add, false, false, 1)),
+        0x01 => Some((Rdna2AtomicOp::Sub, false, false, 1)),
+        0x03 => Some((Rdna2AtomicOp::Inc, false, false, 1)),
+        0x04 => Some((Rdna2AtomicOp::Dec, false, false, 1)),
+        0x05 => Some((Rdna2AtomicOp::SMin, false, false, 1)),
+        0x06 => Some((Rdna2AtomicOp::SMax, false, false, 1)),
+        0x07 => Some((Rdna2AtomicOp::UMin, false, false, 1)),
+        0x08 => Some((Rdna2AtomicOp::UMax, false, false, 1)),
+        0x09 => Some((Rdna2AtomicOp::And, false, false, 1)),
+        0x0A => Some((Rdna2AtomicOp::Or, false, false, 1)),
+        0x0B => Some((Rdna2AtomicOp::Xor, false, false, 1)),
+        0x20 => Some((Rdna2AtomicOp::Add, false, true, 1)),
+        0x21 => Some((Rdna2AtomicOp::Sub, false, true, 1)),
+        0x23 => Some((Rdna2AtomicOp::Inc, false, true, 1)),
+        0x24 => Some((Rdna2AtomicOp::Dec, false, true, 1)),
+        0x25 => Some((Rdna2AtomicOp::SMin, false, true, 1)),
+        0x26 => Some((Rdna2AtomicOp::SMax, false, true, 1)),
+        0x27 => Some((Rdna2AtomicOp::UMin, false, true, 1)),
+        0x28 => Some((Rdna2AtomicOp::UMax, false, true, 1)),
+        0x29 => Some((Rdna2AtomicOp::And, false, true, 1)),
+        0x2A => Some((Rdna2AtomicOp::Or, false, true, 1)),
+        0x2B => Some((Rdna2AtomicOp::Xor, false, true, 1)),
+        0x2D => Some((Rdna2AtomicOp::Swap, false, true, 1)),
+        0x30 => Some((Rdna2AtomicOp::CmpSwap, false, true, 2)),
+        _ => None,
+    }
+}
+
+const fn classify_atomic_detail(detail: &Rdna2Detail) -> Option<Rdna2AtomicInfo> {
+    match *detail {
+        Rdna2Detail::Mubuf { op, glc, .. } => {
+            let Some((atomic_op, is_64bit, is_float, data_vgpr_count)) =
+                classify_buf_or_flat_atomic_op(op)
+            else {
+                return None;
+            };
+            Some(Rdna2AtomicInfo {
+                domain: Rdna2AtomicDomain::Buffer,
+                op: atomic_op,
+                is_64bit,
+                is_float,
+                returns_value: glc,
+                data_vgpr_count,
+            })
+        }
+        Rdna2Detail::Mimg { op, dmask, glc, .. } => {
+            let Some((atomic_op, is_64bit, is_float, data_vgpr_count)) =
+                classify_mimg_atomic_op(op, dmask)
+            else {
+                return None;
+            };
+            Some(Rdna2AtomicInfo {
+                domain: Rdna2AtomicDomain::Image,
+                op: atomic_op,
+                is_64bit,
+                is_float,
+                returns_value: glc,
+                data_vgpr_count,
+            })
+        }
+        Rdna2Detail::Flat { seg, op, glc, .. } => {
+            let Some((atomic_op, is_64bit, is_float, data_vgpr_count)) =
+                classify_buf_or_flat_atomic_op(op)
+            else {
+                return None;
+            };
+            let domain = match seg {
+                0 => Rdna2AtomicDomain::Flat,
+                1 => Rdna2AtomicDomain::Scratch,
+                _ => Rdna2AtomicDomain::Global,
+            };
+            Some(Rdna2AtomicInfo {
+                domain,
+                op: atomic_op,
+                is_64bit,
+                is_float,
+                returns_value: glc,
+                data_vgpr_count,
+            })
+        }
+        Rdna2Detail::Ds { op, .. } => {
+            let Some((atomic_op, is_64bit, returns_value, data_vgpr_count)) =
+                classify_ds_atomic_op(op)
+            else {
+                return None;
+            };
+            Some(Rdna2AtomicInfo {
+                domain: Rdna2AtomicDomain::Lds,
+                op: atomic_op,
+                is_64bit,
+                is_float: false,
+                returns_value,
+                data_vgpr_count,
+            })
+        }
+        _ => None,
+    }
+}
+
+const fn classify_ds_detail(detail: &Rdna2Detail) -> Option<Rdna2DsOpInfo> {
+    let Rdna2Detail::Ds {
+        op,
+        gds,
+        offset0,
+        offset1,
+        ..
+    } = *detail
+    else {
+        return None;
+    };
+    let offset16 = (offset0 as u16) | ((offset1 as u16) << 8);
+    let (kind, data_vgprs, is_wave_cross_lane, swizzle_mode) = match op {
+        0x0D | 0x1E | 0x1F => (Rdna2DsOpKind::Write, 1, false, None),
+        0x0E | 0x0F | 0x4D => (Rdna2DsOpKind::Write, 2, false, None),
+        0xDE => (Rdna2DsOpKind::Write, 3, false, None),
+        0xDF => (Rdna2DsOpKind::Write, 4, false, None),
+        0x36 | 0x39..=0x3C => (Rdna2DsOpKind::Read, 1, false, None),
+        0x37 | 0x38 | 0x76 => (Rdna2DsOpKind::Read, 2, false, None),
+        0xFE => (Rdna2DsOpKind::Read, 3, false, None),
+        0xFF => (Rdna2DsOpKind::Read, 4, false, None),
+        0x35 | 0x3D => (
+            Rdna2DsOpKind::Swizzle,
+            1,
+            true,
+            Some(decode_ds_swizzle_offset(offset16)),
+        ),
+        0xB2 | 0xB6 => (Rdna2DsOpKind::Permute, 1, true, None),
+        0xB3 | 0xB5 => (Rdna2DsOpKind::BPermute, 1, true, None),
+        _ => match classify_ds_atomic_op(op) {
+            Some((_, _, _, regs)) => (Rdna2DsOpKind::Atomic, regs, false, None),
+            None => (Rdna2DsOpKind::Other, 1, false, None),
+        },
+    };
+    Some(Rdna2DsOpInfo {
+        kind,
+        data_vgprs,
+        offset16,
+        is_wave_cross_lane,
+        is_gds: gds,
+        swizzle_mode,
+    })
+}
+
+const fn classify_wave_detail(detail: &Rdna2Detail) -> Option<Rdna2WaveOpInfo> {
+    match *detail {
+        Rdna2Detail::Sop1 { op, .. } => match op {
+            0x09 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Wqm,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x0A => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Wqm,
+                is_wave64_mask: true,
+                is_cross_lane: true,
+            }),
+            0x0D => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Bcnt0B32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x0E => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Bcnt0B64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x0F => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Bcnt1B32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x10 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Bcnt1B64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x11 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Ff0B32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x12 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Ff0B64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x13 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Ff1B32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x14 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::Ff1B64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x15 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::FlbitB32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x16 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::FlbitB64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x17 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::FlbitI32,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x18 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::FlbitI64,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x2C => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::QuadMask,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x2D => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::QuadMask,
+                is_wave64_mask: true,
+                is_cross_lane: true,
+            }),
+            _ => None,
+        },
+        Rdna2Detail::Vop1 { op: 0x02, .. } => Some(Rdna2WaveOpInfo {
+            kind: Rdna2WaveOpKind::ReadFirstLane,
+            is_wave64_mask: false,
+            is_cross_lane: true,
+        }),
+        Rdna2Detail::Vopc { .. } => Some(Rdna2WaveOpInfo {
+            kind: Rdna2WaveOpKind::BallotCmp,
+            is_wave64_mask: false,
+            is_cross_lane: true,
+        }),
+        Rdna2Detail::Vop3 { op, .. } => match op {
+            0x000..=0x0FF => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::BallotCmp,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x182 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::ReadFirstLane,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x360 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::ReadLane,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x361 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::WriteLane,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x365 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::MbcntLo,
+                is_wave64_mask: false,
+                is_cross_lane: false,
+            }),
+            0x366 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::MbcntHi,
+                is_wave64_mask: true,
+                is_cross_lane: false,
+            }),
+            0x377 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::PermLane16,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0x378 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::PermLaneX16,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            _ => None,
+        },
+        Rdna2Detail::Ds { op, .. } => match op {
+            0x35 | 0x3D => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::DsSwizzle,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0xB2 | 0xB6 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::DsPermute,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            0xB3 | 0xB5 => Some(Rdna2WaveOpInfo {
+                kind: Rdna2WaveOpKind::DsBPermute,
+                is_wave64_mask: false,
+                is_cross_lane: true,
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Extracted `EXP` instruction summary entry.
@@ -648,6 +1438,12 @@ pub(crate) const fn sop2_src_pair_widths(op: u8) -> (bool, bool) {
         0x1F | 0x21 | 0x23 | 0x29 | 0x2A => (true, false),
         _ => (false, false),
     }
+}
+
+/// Whether an SOP1 opcode reads a 64-bit SGPR pair (`s[n:n+1]`, `vcc`, `exec`) in `ssrc0`
+/// while writing a 32-bit scalar result (`s_bcnt*_i32_b64`, `s_ff*_i32_b64`, `s_flbit_i32_*64`).
+pub(crate) const fn sop1_src_is_pair_narrow_dst(op: u8) -> bool {
+    matches!(op, 0x0E | 0x10 | 0x12 | 0x14 | 0x16 | 0x18)
 }
 
 /// Which SOPC sources are 64-bit SGPR pairs: `(src0_is_64, src1_is_64)`.
@@ -1250,8 +2046,8 @@ fn vop3_info(op: u16) -> (String, u8, bool) {
         0x360 => ("v_readlane_b32".to_string(), 2, false),
         0x361 => ("v_writelane_b32".to_string(), 2, false),
         0x364 => ("v_add_f64".to_string(), 2, false),
-        0x365 => ("v_mul_f64".to_string(), 2, false),
-        0x366 => ("v_min_f64".to_string(), 2, false),
+        0x365 => ("v_mbcnt_lo_u32_b32".to_string(), 2, false),
+        0x366 => ("v_mbcnt_hi_u32_b32".to_string(), 2, false),
         0x367 => ("v_max_f64".to_string(), 2, false),
         0x368 => ("v_ldexp_f64".to_string(), 2, false),
         0x36D => ("v_add3_u32".to_string(), 3, false),
@@ -1333,13 +2129,39 @@ fn mubuf_mnemonic(op: u8) -> String {
         0x1D => "buffer_store_dwordx2",
         0x1E => "buffer_store_dwordx4",
         0x1F => "buffer_store_dwordx3",
-        0x32 => "buffer_atomic_swap",
-        0x33 => "buffer_atomic_cmpswap",
-        0x34 => "buffer_atomic_add",
-        0x35 => "buffer_atomic_sub",
-        0x38 => "buffer_atomic_and",
-        0x39 => "buffer_atomic_or",
-        0x3A => "buffer_atomic_xor",
+        0x30 => "buffer_atomic_swap",
+        0x31 => "buffer_atomic_cmpswap",
+        0x32 => "buffer_atomic_add",
+        0x33 => "buffer_atomic_sub",
+        0x34 => "buffer_atomic_csub",
+        0x35 => "buffer_atomic_smin",
+        0x36 => "buffer_atomic_umin",
+        0x37 => "buffer_atomic_smax",
+        0x38 => "buffer_atomic_umax",
+        0x39 => "buffer_atomic_and",
+        0x3A => "buffer_atomic_or",
+        0x3B => "buffer_atomic_xor",
+        0x3C => "buffer_atomic_inc",
+        0x3D => "buffer_atomic_dec",
+        0x3E => "buffer_atomic_fcmpswap",
+        0x3F => "buffer_atomic_fmin",
+        0x40 => "buffer_atomic_fmax",
+        0x50 => "buffer_atomic_swap_x2",
+        0x51 => "buffer_atomic_cmpswap_x2",
+        0x52 => "buffer_atomic_add_x2",
+        0x53 => "buffer_atomic_sub_x2",
+        0x55 => "buffer_atomic_smin_x2",
+        0x56 => "buffer_atomic_umin_x2",
+        0x57 => "buffer_atomic_smax_x2",
+        0x58 => "buffer_atomic_umax_x2",
+        0x59 => "buffer_atomic_and_x2",
+        0x5A => "buffer_atomic_or_x2",
+        0x5B => "buffer_atomic_xor_x2",
+        0x5C => "buffer_atomic_inc_x2",
+        0x5D => "buffer_atomic_dec_x2",
+        0x5E => "buffer_atomic_fcmpswap_x2",
+        0x5F => "buffer_atomic_fmin_x2",
+        0x60 => "buffer_atomic_fmax_x2",
         0x70 => "buffer_gl0_inv",
         0x71 => "buffer_gl1_inv",
         other => return format!("mubuf_op_{other:#04x}"),
@@ -1385,10 +2207,22 @@ fn mimg_info(op: u8) -> (String, bool) {
         0x0A => "image_store_pck",
         0x0B => "image_store_mip_pck",
         0x0E => "image_get_resinfo",
-        0x10 => "image_atomic_swap",
-        0x11 => "image_atomic_cmpswap",
-        0x12 => "image_atomic_add",
-        0x13 => "image_atomic_sub",
+        0x0F => "image_atomic_swap",
+        0x10 => "image_atomic_cmpswap",
+        0x11 => "image_atomic_add",
+        0x12 => "image_atomic_sub",
+        0x14 => "image_atomic_smin",
+        0x15 => "image_atomic_umin",
+        0x16 => "image_atomic_smax",
+        0x17 => "image_atomic_umax",
+        0x18 => "image_atomic_and",
+        0x19 => "image_atomic_or",
+        0x1A => "image_atomic_xor",
+        0x1B => "image_atomic_inc",
+        0x1C => "image_atomic_dec",
+        0x1D => "image_atomic_fcmpswap",
+        0x1E => "image_atomic_fmin",
+        0x1F => "image_atomic_fmax",
         0x20 => "image_sample",
         0x21 => "image_sample_cl",
         0x22 => "image_sample_d",
@@ -1478,22 +2312,35 @@ fn flat_mnemonic(seg: u8, op: u8) -> String {
         0x31 => "atomic_cmpswap",
         0x32 => "atomic_add",
         0x33 => "atomic_sub",
+        0x34 => "atomic_csub",
+        0x35 => "atomic_smin",
+        0x36 => "atomic_umin",
+        0x37 => "atomic_smax",
+        0x38 => "atomic_umax",
+        0x39 => "atomic_and",
+        0x3A => "atomic_or",
+        0x3B => "atomic_xor",
+        0x3C => "atomic_inc",
+        0x3D => "atomic_dec",
+        0x3E => "atomic_fcmpswap",
+        0x3F => "atomic_fmin",
+        0x40 => "atomic_fmax",
         0x50 => "atomic_swap_x2",
         0x51 => "atomic_cmpswap_x2",
         0x52 => "atomic_add_x2",
         0x53 => "atomic_sub_x2",
-        0x54 => "atomic_smin_x2",
-        0x55 => "atomic_umin_x2",
-        0x56 => "atomic_smax_x2",
-        0x57 => "atomic_umax_x2",
-        0x58 => "atomic_and_x2",
-        0x59 => "atomic_or_x2",
-        0x5A => "atomic_xor_x2",
-        0x5B => "atomic_inc_x2",
-        0x5C => "atomic_dec_x2",
-        0x5D => "atomic_fcmpswap_x2",
-        0x5E => "atomic_fmin_x2",
-        0x5F => "atomic_fmax_x2",
+        0x55 => "atomic_smin_x2",
+        0x56 => "atomic_umin_x2",
+        0x57 => "atomic_smax_x2",
+        0x58 => "atomic_umax_x2",
+        0x59 => "atomic_and_x2",
+        0x5A => "atomic_or_x2",
+        0x5B => "atomic_xor_x2",
+        0x5C => "atomic_inc_x2",
+        0x5D => "atomic_dec_x2",
+        0x5E => "atomic_fcmpswap_x2",
+        0x5F => "atomic_fmin_x2",
+        0x60 => "atomic_fmax_x2",
         other => return format!("{prefix}_op_{other:#04x}"),
     };
     format!("{prefix}_{suffix}")
@@ -1501,11 +2348,38 @@ fn flat_mnemonic(seg: u8, op: u8) -> String {
 
 fn ds_mnemonic(op: u8) -> String {
     match op {
+        0x00 => "ds_add_u32",
+        0x01 => "ds_sub_u32",
+        0x03 => "ds_inc_u32",
+        0x04 => "ds_dec_u32",
+        0x05 => "ds_min_i32",
+        0x06 => "ds_max_i32",
+        0x07 => "ds_min_u32",
+        0x08 => "ds_max_u32",
+        0x09 => "ds_and_b32",
+        0x0A => "ds_or_b32",
+        0x0B => "ds_xor_b32",
         0x0D => "ds_write_b32",
         0x0E => "ds_write2_b32",
         0x0F => "ds_write2st64_b32",
         0x1E => "ds_write_b8",
         0x1F => "ds_write_b16",
+        0x20 => "ds_add_rtn_u32",
+        0x21 => "ds_sub_rtn_u32",
+        0x23 => "ds_inc_rtn_u32",
+        0x24 => "ds_dec_rtn_u32",
+        0x25 => "ds_min_rtn_i32",
+        0x26 => "ds_max_rtn_i32",
+        0x27 => "ds_min_rtn_u32",
+        0x28 => "ds_max_rtn_u32",
+        0x29 => "ds_and_rtn_b32",
+        0x2A => "ds_or_rtn_b32",
+        0x2B => "ds_xor_rtn_b32",
+        0x2D => "ds_wrxchg_rtn_b32",
+        0x30 => "ds_cmpst_rtn_b32",
+        // 0x35 is the canonical GFX10.3 opcode for `ds_swizzle_b32`; 0x3D is preserved as a
+        // legacy VI alias for existing unit tests.
+        0x35 | 0x3D => "ds_swizzle_b32",
         0x36 => "ds_read_b32",
         0x37 => "ds_read2_b32",
         0x38 => "ds_read2st64_b32",
@@ -1513,11 +2387,12 @@ fn ds_mnemonic(op: u8) -> String {
         0x3A => "ds_read_u8",
         0x3B => "ds_read_i16",
         0x3C => "ds_read_u16",
-        0x3D => "ds_swizzle_b32",
         0x4D => "ds_write_b64",
         0x76 => "ds_read_b64",
-        0xB5 => "ds_bpermute_b32",
-        0xB6 => "ds_permute_b32",
+        // 0xB2 / 0xB3 are the canonical GFX10.3 opcodes for `ds_permute_b32` / `ds_bpermute_b32`;
+        // 0xB6 / 0xB5 are kept as backwards-compatible aliases.
+        0xB2 | 0xB6 => "ds_permute_b32",
+        0xB3 | 0xB5 => "ds_bpermute_b32",
         0xDE => "ds_write_b96",
         0xDF => "ds_write_b128",
         0xFE => "ds_read_b96",
@@ -1605,6 +2480,22 @@ pub const SENDMSG_ID_SYSMSG: u8 = 15;
 #[inline]
 pub const fn sendmsg_id(simm16: u16) -> u8 {
     (simm16 & 0x000F) as u8
+}
+
+/// Decode all GFX10.3 `s_sendmsg` / `s_sendmsghalt` immediate fields (`msg_id`, `op`, `stream`).
+#[inline]
+pub const fn decode_sendmsg(simm16: u16, is_halt: bool) -> Rdna2SendMsgInfo {
+    let msg_id = sendmsg_id(simm16);
+    let op = ((simm16 >> 4) & 0x7) as u8;
+    let stream = ((simm16 >> 8) & 0x3) as u8;
+    Rdna2SendMsgInfo {
+        msg_id,
+        op,
+        stream,
+        is_halt,
+        is_gs_alloc_req: msg_id == SENDMSG_ID_GS_ALLOC_REQ,
+        is_gs_done: msg_id == SENDMSG_ID_GS_DONE,
+    }
 }
 
 /// Format an `s_sendmsg` / `s_sendmsghalt` `simm16` operand into sanitized GFX10.3 assembly text.
@@ -1740,6 +2631,7 @@ fn decode_sop1(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     } else {
         format_sdst(sdst)
     };
+    let src_is_pair = sop1_src_is_pair_narrow_dst(op);
     let operands = if op == 0x1F {
         // s_getpc_b64 sdst
         dst_str
@@ -1747,7 +2639,10 @@ fn decode_sop1(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
         // s_setpc_b64 ssrc0 / s_rfe_b64 ssrc0
         format_src_operand(u16::from(ssrc0), literal)
     } else {
-        format!("{dst_str}, {}", format_src_operand(u16::from(ssrc0), literal))
+        format!(
+            "{dst_str}, {}",
+            format_ssrc_maybe_pair(ssrc0, literal, src_is_pair)
+        )
     };
 
     Rdna2Instruction {
@@ -2123,8 +3018,8 @@ fn decode_vop3(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let mut operands = if op <= 0xFF {
         // VOPC promoted to VOP3 writes SGPR mask in vdst[6:0]
         format_sdst(vdst & 0x7F)
-    } else if op == 0x360 {
-        // v_readlane_b32 sdst, vsrc0, ssrc1
+    } else if op == 0x360 || op == 0x182 {
+        // v_readlane_b32 sdst, vsrc0, ssrc1 / v_readfirstlane_b32 (VOP3) sdst, vsrc0
         format_sdst(vdst & 0x7F)
     } else if let Some(sd) = sdst {
         format!("v{vdst}, {}", format_sdst(sd))
@@ -2801,8 +3696,15 @@ fn decode_flat(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     let mut operands = String::new();
     if !truncated {
         let is_store = matches!(op, 0x18..=0x1F);
+        let is_atomic = classify_buf_or_flat_atomic_op(op).is_some();
         if is_store {
             let _ = write!(operands, "v{addr}, v{data}");
+        } else if is_atomic {
+            if glc {
+                let _ = write!(operands, "v{vdst}, v{addr}, v{data}");
+            } else {
+                let _ = write!(operands, "v{addr}, v{data}");
+            }
         } else {
             let _ = write!(operands, "v{vdst}, v{addr}");
         }
@@ -2872,16 +3774,45 @@ fn decode_ds(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
 
     let mut operands = String::new();
     if !truncated {
+        let offset16 = u16::from(offset0) | (u16::from(offset1) << 8);
         if matches!(op, 0x0E | 0x0F) {
             let _ = write!(operands, "v{vdst}, v{addr}, v{data0}, v{data1}");
+            if offset0 != 0 {
+                let _ = write!(operands, " offset0:{offset0}");
+            }
+            if offset1 != 0 {
+                let _ = write!(operands, " offset1:{offset1}");
+            }
+        } else if matches!(op, 0x35 | 0x3D) {
+            let _ = write!(operands, "v{vdst}, v{addr}");
+            if offset16 != 0 {
+                let _ = write!(operands, " offset:0x{offset16:04x}");
+            }
+        } else if matches!(op, 0xB2 | 0xB3 | 0xB5 | 0xB6) {
+            let _ = write!(operands, "v{vdst}, v{addr}, v{data0}");
+            if offset16 != 0 {
+                let _ = write!(operands, " offset:{offset16}");
+            }
+        } else if matches!(op, 0xDE | 0xDF) {
+            let hi = data0.saturating_add(if op == 0xDE { 2 } else { 3 });
+            let _ = write!(operands, "v{addr}, v[{data0}:{hi}]");
+            if offset16 != 0 {
+                let _ = write!(operands, " offset:{offset16}");
+            }
+        } else if matches!(op, 0xFE | 0xFF) {
+            let hi = vdst.saturating_add(if op == 0xFE { 2 } else { 3 });
+            let _ = write!(operands, "v[{vdst}:{hi}], v{addr}");
+            if offset16 != 0 {
+                let _ = write!(operands, " offset:{offset16}");
+            }
         } else {
             let _ = write!(operands, "v{vdst}, v{addr}, v{data0}");
-        }
-        if offset0 != 0 {
-            let _ = write!(operands, " offset0:{offset0}");
-        }
-        if offset1 != 0 {
-            let _ = write!(operands, " offset1:{offset1}");
+            if offset0 != 0 {
+                let _ = write!(operands, " offset0:{offset0}");
+            }
+            if offset1 != 0 {
+                let _ = write!(operands, " offset1:{offset1}");
+            }
         }
         if gds {
             operands.push_str(" gds");
@@ -3158,11 +4089,12 @@ pub fn analyze_instructions(
                 op, sdst, ssrc0, ..
             } => {
                 let (_, is_64) = sop1_mnemonic(*op);
+                let src_64 = is_64 || sop1_src_is_pair_narrow_dst(*op);
                 if *op != 0x20 && *op != 0x22 {
                     record_sgpr_range(&mut max_sgpr, *sdst, if is_64 { 2 } else { 1 });
                 }
                 if *op != 0x1F {
-                    record_sgpr_range(&mut max_sgpr, *ssrc0, if is_64 { 2 } else { 1 });
+                    record_sgpr_range(&mut max_sgpr, *ssrc0, if src_64 { 2 } else { 1 });
                 }
             }
             Rdna2Detail::Sopk {
@@ -3261,11 +4193,11 @@ pub fn analyze_instructions(
                 if is_interp_f16 {
                     has_vintrp = true;
                 }
-                if *op <= 0xFF || *op == 0x360 {
+                if *op <= 0xFF || *op == 0x360 || *op == 0x182 {
                     record_sgpr(&mut max_sgpr, *vdst & 0x7F);
                 } else {
                     record_vgpr(&mut max_vgpr, *vdst);
-                    if matches!(*op, 0x2FF..=0x301 | 0x364..=0x368) && *vdst < 255 {
+                    if matches!(*op, 0x2FF..=0x301 | 0x364 | 0x367..=0x368) && *vdst < 255 {
                         record_vgpr(&mut max_vgpr, *vdst + 1);
                     }
                 }
@@ -3368,11 +4300,17 @@ pub fn analyze_instructions(
                     let srsrc_sgpr = srsrc.saturating_mul(4);
                     record_sgpr_range(&mut max_sgpr, srsrc_sgpr, 4);
                     record_sgpr(&mut max_sgpr, *soffset);
-                    let data_count = match *op {
-                        0x01 | 0x05 | 0x0D | 0x1D => 2,
-                        0x02 | 0x06 | 0x0F | 0x1F => 3,
-                        0x03 | 0x07 | 0x0E | 0x1E => 4,
-                        _ => 1,
+                    let data_count = if let Some((_, _, _, atomic_regs)) =
+                        classify_buf_or_flat_atomic_op(*op)
+                    {
+                        atomic_regs
+                    } else {
+                        match *op {
+                            0x01 | 0x05 | 0x0D | 0x1D => 2,
+                            0x02 | 0x06 | 0x0F | 0x1F => 3,
+                            0x03 | 0x07 | 0x0E | 0x1E => 4,
+                            _ => 1,
+                        }
                     };
                     record_vgpr_range(&mut max_vgpr, *vdata, data_count);
                     if *offen && *idxen {
@@ -3436,7 +4374,7 @@ pub fn analyze_instructions(
                 ..
             } => {
                 let is_bvh = matches!(*op, 0xE6 | 0xE7);
-                if is_bvh || matches!(*op, 0x08..=0x0B | 0x10..=0x13) {
+                if is_bvh || matches!(*op, 0x08..=0x0B | 0x0F..=0x1F) {
                     has_compute_mem = true;
                 }
                 if !inst.truncated {
@@ -3478,6 +4416,7 @@ pub fn analyze_instructions(
             Rdna2Detail::Flat {
                 seg,
                 op,
+                glc,
                 lds,
                 addr,
                 data,
@@ -3491,7 +4430,13 @@ pub fn analyze_instructions(
                 }
                 if !inst.truncated {
                     record_vgpr(&mut max_vgpr, *addr);
-                    if matches!(op, 0x18..=0x1F) {
+                    if let Some((_, is_64bit, _, data_regs)) = classify_buf_or_flat_atomic_op(*op)
+                    {
+                        record_vgpr_range(&mut max_vgpr, *data, data_regs);
+                        if *glc {
+                            record_vgpr_range(&mut max_vgpr, *vdst, if is_64bit { 2 } else { 1 });
+                        }
+                    } else if matches!(op, 0x18..=0x1F) {
                         record_vgpr(&mut max_vgpr, *data);
                     } else {
                         record_vgpr(&mut max_vgpr, *vdst);
@@ -3513,11 +4458,40 @@ pub fn analyze_instructions(
                 has_compute_mem = true;
                 if !inst.truncated {
                     record_vgpr(&mut max_vgpr, *addr);
-                    record_vgpr(&mut max_vgpr, *data0);
-                    if matches!(*op, 0x0E | 0x0F) {
-                        record_vgpr(&mut max_vgpr, *data1);
+                    match *op {
+                        0x35 | 0x3D => {
+                            record_vgpr(&mut max_vgpr, *vdst);
+                        }
+                        0xB2 | 0xB3 | 0xB5 | 0xB6 => {
+                            record_vgpr(&mut max_vgpr, *data0);
+                            record_vgpr(&mut max_vgpr, *vdst);
+                        }
+                        0xDE => {
+                            record_vgpr_range(&mut max_vgpr, *data0, 3);
+                        }
+                        0xDF => {
+                            record_vgpr_range(&mut max_vgpr, *data0, 4);
+                        }
+                        0x4D => {
+                            record_vgpr_range(&mut max_vgpr, *data0, 2);
+                        }
+                        0xFE => {
+                            record_vgpr_range(&mut max_vgpr, *vdst, 3);
+                        }
+                        0xFF => {
+                            record_vgpr_range(&mut max_vgpr, *vdst, 4);
+                        }
+                        0x76 => {
+                            record_vgpr_range(&mut max_vgpr, *vdst, 2);
+                        }
+                        _ => {
+                            record_vgpr(&mut max_vgpr, *data0);
+                            if matches!(*op, 0x0E | 0x0F | 0x30) {
+                                record_vgpr(&mut max_vgpr, *data1);
+                            }
+                            record_vgpr(&mut max_vgpr, *vdst);
+                        }
                     }
-                    record_vgpr(&mut max_vgpr, *vdst);
                 }
             }
             Rdna2Detail::Unknown { .. } => {}
