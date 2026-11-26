@@ -790,10 +790,10 @@ test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
     ['CREATE_TEXTURE2', 35, 'CreateTexture2'],
   ];
 
-  // Exact parity with WgpuCommandProcessor's OPCODES table (0..35).
+  // Exact parity with WgpuCommandProcessor's OPCODES table (0..38).
   assert.deepEqual(OPCODES, WGPU_OPCODES);
-  assert.equal(Object.keys(OPCODES).length, 36);
-  assert.equal(Object.keys(OPCODE_NAMES).length, 36);
+  assert.equal(Object.keys(OPCODES).length, 39);
+  assert.equal(Object.keys(OPCODE_NAMES).length, 39);
 
   for (const [constName, value, canonicalName] of expectedV2) {
     assert.equal(OPCODES[constName], value);
@@ -802,6 +802,8 @@ test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
   }
   assert.equal(OPCODES.CREATE_TEXTURE2, 35);
   assert.equal(getOpcodeName(35), 'CreateTexture2');
+  assert.equal(OPCODES.DISPATCH_INDIRECT, 38);
+  assert.equal(getOpcodeName(36), 'DrawIndirect');
 });
 
 test('splitTraceIntoFrames splits multi-frame, omitted-payload, empty, and truncated traces', () => {

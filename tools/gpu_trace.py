@@ -3,7 +3,7 @@
 
 Matches the packet layout in `runtime/abi/playgta6_abi.h` and
 `docs/gpu_commands.md` (v1 opcodes 0..21, v2 opcodes 22..34, plus forward-compatible
-handling of unknown/future opcodes >= 35).
+handling of unknown/future opcodes >= 39).
 
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
@@ -52,6 +52,7 @@ DRAW_INDEXED_STRUCT = struct.Struct("<IIIiI")  # 20 bytes
 CREATE_COMPUTE_PIPELINE_STRUCT = struct.Struct("<IIII")  # 16 bytes
 SET_COMPUTE_PIPELINE_STRUCT = struct.Struct("<I")  # 4 bytes
 DISPATCH_COMPUTE_STRUCT = struct.Struct("<III")  # 12 bytes
+INDIRECT_STRUCT = struct.Struct("<IIQ")  # 16 bytes (GpuIndirectPayload)
 
 # Packet ABI v2 (opcodes 22..34).
 TEXTURE_VIEW_DESC_STRUCT = struct.Struct("<BBBBHHII")  # 16 bytes
@@ -145,6 +146,9 @@ class GpuOpcode(IntEnum):
     SetBindGroup2 = 33
     CreateSampler2 = 34
     CreateTexture2 = 35
+    DrawIndirect = 36
+    DrawIndexedIndirect = 37
+    DispatchIndirect = 38
 
 
 class GpuTextureFormat(IntEnum):
@@ -3034,6 +3038,15 @@ def _decode_v2_payload(
             ],
             **extra,
         }, True
+
+    if opcode in (GpuOpcode.DrawIndirect, GpuOpcode.DrawIndexedIndirect, GpuOpcode.DispatchIndirect):
+        can_decode, extra = fixed_fields(INDIRECT_STRUCT.size)
+        if not can_decode:
+            return extra, False
+        buffer_id, _reserved, indirect_offset = INDIRECT_STRUCT.unpack_from(payload, 0)
+        if indirect_offset % 4:
+            ctx.warn("unaligned_indirect_offset", f"indirect offset {indirect_offset} is not a multiple of 4")
+        return {"buffer_id": buffer_id, "offset": indirect_offset, **extra}, True
 
     raise AssertionError(f"Unhandled v2 opcode: {opcode}")
 
@@ -7319,7 +7332,7 @@ def _is_timing_log_input(raw_bytes: bytes | bytearray | memoryview, source_hint:
         return True
     if len(raw) >= HEADER_SIZE:
         opcode, _flags, payload_bytes = HEADER_STRUCT.unpack_from(raw, 0)
-        if opcode <= GpuOpcode.CreateTexture2 and (HEADER_SIZE + payload_bytes) <= len(raw):
+        if opcode <= GpuOpcode.DispatchIndirect and (HEADER_SIZE + payload_bytes) <= len(raw):
             return False
         if (HEADER_SIZE + payload_bytes) <= len(raw):
             try:
@@ -7927,7 +7940,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help=(
-            "Fail with non-zero exit code on unknown opcodes (>= 35), "
+            "Fail with non-zero exit code on unknown opcodes (>= 39), "
             "size mismatches, or malformed/truncated packets or timing records."
         ),
     )

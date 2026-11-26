@@ -127,6 +127,9 @@ v2 adds explicit bind group / pipeline layouts, full render pipeline keys, expli
 | `33` | `SetBindGroup2` | `16 + 4 * dynamic_offset_count` | `{ u32 group_index, u32 bind_group_id, u32 dynamic_offset_count, u32 reserved }` (`GpuSetBindGroup2Payload`) followed by `dynamic_offset_count` `u32` dynamic offsets |
 | `34` | `CreateSampler2` | `24` | `{ u32 id, u8 address_u, u8 address_v, u8 address_w, u8 mag_filter, u8 min_filter, u8 mipmap_filter, u8 compare, u8 reserved0, u16 max_anisotropy, u16 reserved1, f32 lod_min_clamp, f32 lod_max_clamp }` (`GpuCreateSampler2Payload`) |
 | `35` | `CreateTexture2` | `40` | `{ u32 id, u32 width, u32 height, u32 depth_or_layers, u32 mip_levels, u32 sample_count, u32 usage_flags, u8 dimension, u8 format, u8 view_format_count, u8 reserved, u8 view_formats[8] }` (`GpuCreateTexture2Payload`) |
+| `36` | `DrawIndirect` | `16` | `{ u32 buffer_id, u32 reserved, u64 offset }` (`GpuIndirectPayload`): `drawIndirect(buffer, offset)`, a 16-byte `{ vertex_count, instance_count, first_vertex, first_instance }` record |
+| `37` | `DrawIndexedIndirect` | `16` | `GpuIndirectPayload`: `drawIndexedIndirect(buffer, offset)`, a 20-byte `{ index_count, instance_count, first_index, base_vertex, first_instance }` record |
+| `38` | `DispatchIndirect` | `16` | `GpuIndirectPayload`: `dispatchWorkgroupsIndirect(buffer, offset)`, a 12-byte `{ x, y, z }` record |
 
 ### Ids
 - All ids share the v1 `u32` resource id namespace (`0` = none). `DestroyResource` also destroys bind group layouts, pipeline layouts and v2 bind groups, samplers and pipelines.

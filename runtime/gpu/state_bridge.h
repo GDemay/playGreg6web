@@ -204,6 +204,34 @@ inline constexpr size_t kMaxCachedBindGroups = 4096;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
+
+// G66: ExecuteIndirect with a single-argument command signature. The guest's argument records are
+// first passed through a clamp compute pass (indirect_clamp_wgsl) that applies the count buffer,
+// clamps out-of-range values and writes them compacted into a bridge-owned ring, from which one
+// DrawIndirect / DrawIndexedIndirect / DispatchIndirect per command reads.
+enum class IndirectKind : uint8_t {
+    Draw = 0,         // 16-byte record: vertex count, instance count, first vertex, first instance
+    DrawIndexed = 1,  // 20-byte record: index count, instance count, first index, base vertex, first instance
+    Dispatch = 2,     // 12-byte record: thread group counts x, y, z
+};
+struct IndirectExecution {
+    IndirectKind kind = IndirectKind::Draw;
+    uint32_t max_count = 0;
+    uint32_t stride = 0;       // command signature ByteStride
+    uint32_t args_buffer = 0;  // buffer resource id
+    uint64_t args_offset = 0;
+    uint32_t count_buffer = 0;  // 0 = no count buffer (max_count commands)
+    uint64_t count_offset = 0;
+};
+// Commands one ExecuteIndirect emits at most (more are dropped and counted).
+inline constexpr uint32_t kMaxIndirectCommands = 256;
+// WebGPU's default maxComputeWorkgroupsPerDimension: dispatch arguments are clamped to it.
+inline constexpr uint32_t kMaxIndirectWorkgroups = 65535;
+// The clamp pass's output ring (one window of kMaxIndirectCommands records per execution).
+inline constexpr uint32_t kIndirectRingBytes = 1u << 18;
+inline constexpr uint32_t kIndirectWindowBytes = kMaxIndirectCommands * 20u;
+// The clamp compute shader (entry point cs_main, workgroup size 64).
+const char* indirect_clamp_wgsl() noexcept;
 class CommandListBridge;
 
 struct ViewRecord {
@@ -358,6 +386,18 @@ private:
     // True exactly once per compute pipeline id: the caller emits CreateComputePipeline2.
     bool claim_compute_creation(uint32_t pipeline_id);
 
+    // G66 ExecuteIndirect clamp pass: pipeline, group layout and output ring (created through
+    // `encoder` on first use), its bind group over (args, count) buffers, and a ring window.
+    struct IndirectClamp {
+        uint32_t group_layout = 0;
+        uint32_t pipeline = 0;
+        uint32_t ring = 0;
+    };
+    IndirectClamp indirect_clamp(CommandEncoder& encoder);
+    uint32_t indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args, uint32_t count,
+                                  CommandEncoder& encoder);
+    uint32_t allocate_indirect_window();
+
     // #482 storage-format fallback: the intermediate texture of `resource_id` in `format` (same size,
     // dimension and mips), created through `encoder` on first use.
     uint32_t intermediate_storage_texture(uint32_t resource_id, const TextureInfo& info, uint8_t format,
@@ -414,6 +454,9 @@ private:
     std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
     std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
     std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
+    IndirectClamp indirect_clamp_{};
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> indirect_groups_;  // (args, count) -> bind group
+    uint32_t indirect_cursor_ = 0;
 
     mutable std::mutex bridges_mutex_;
     std::vector<CommandListBridge*> bridges_;
@@ -516,6 +559,13 @@ struct BridgeStats {
     uint64_t heap_index_misses = 0;
     // ... of those, CB-indexed bindings (G62) whose index could not be read from the constant buffer.
     uint64_t cb_index_misses = 0;
+    // G66 ExecuteIndirect: executions emitted, the indirect draws/dispatches they emitted, executions
+    // skipped (invalid arguments, no pipeline, storage redirects), and commands dropped over
+    // kMaxIndirectCommands.
+    uint64_t indirect_executions = 0;
+    uint64_t indirect_commands = 0;
+    uint64_t indirect_skipped = 0;
+    uint64_t indirect_truncated = 0;
 };
 
 class CommandListBridge {
@@ -589,6 +639,8 @@ public:
                               uint32_t start_index_location, int32_t base_vertex_location,
                               uint32_t start_instance_location);
     void Dispatch(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
+    // G66: ExecuteIndirect (see IndirectExecution). False when skipped (counted in stats().indirect_skipped).
+    bool ExecuteIndirect(const IndirectExecution& execution);
 
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
@@ -667,6 +719,10 @@ private:
     GpuTextureViewDesc texture_view_desc(const d3d::ViewDescriptor& view);
     uint32_t upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index);
     bool prepare_render_draw();
+    // Ends the render pass and binds the compute PSO and its bind groups (null: nothing to dispatch).
+    ComputePipelineState* prepare_compute_dispatch();
+    // G66: emits the clamp pass for `e` (count commands) and returns the ring offset of its output.
+    bool emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring, uint32_t* out_offset);
     void apply_input_assembler(bool indexed);
 
     // #482: a compute storage-texture binding redirected to an intermediate texture in the stage's

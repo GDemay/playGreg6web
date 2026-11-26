@@ -40,6 +40,9 @@ export const GPU_OPCODES = Object.freeze({
   SET_BIND_GROUP2: 33,
   CREATE_SAMPLER2: 34,
   CREATE_TEXTURE2: 35,
+  DRAW_INDIRECT: 36,
+  DRAW_INDEXED_INDIRECT: 37,
+  DISPATCH_INDIRECT: 38,
 });
 
 export const GPU_BUFFER_USAGE = Object.freeze({

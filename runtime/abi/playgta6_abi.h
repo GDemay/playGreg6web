@@ -63,6 +63,12 @@ enum class GpuOpcode : uint16_t {
     CreateSampler2 = 34,
     // v2 texture creation: full texture format codes, sample count and view formats.
     CreateTexture2 = 35,
+    // Indirect work (G66, ExecuteIndirect): the arguments are read by the GPU from a buffer
+    // (GpuIndirectPayload), in WebGPU's drawIndirect / drawIndexedIndirect / dispatchWorkgroupsIndirect
+    // layouts (16 / 20 / 12 bytes).
+    DrawIndirect = 36,
+    DrawIndexedIndirect = 37,
+    DispatchIndirect = 38,
 };
 
 // WebGPU-compatible GPUBufferUsage bitmask values for GpuCreateBufferPayload::usage_flags.
@@ -315,6 +321,15 @@ struct GpuDispatchComputePayload {
     uint32_t workgroup_z;
 };
 static_assert(sizeof(GpuDispatchComputePayload) == 12, "GpuDispatchComputePayload layout must stay 12 bytes");
+
+// DrawIndirect / DrawIndexedIndirect / DispatchIndirect: the argument record at `offset` (a multiple
+// of 4) in buffer `buffer_id` (created with GpuBufferUsage::Indirect).
+struct GpuIndirectPayload {
+    uint32_t buffer_id;
+    uint32_t reserved;
+    uint64_t offset;
+};
+static_assert(sizeof(GpuIndirectPayload) == 16, "GpuIndirectPayload layout must stay 16 bytes");
 
 // Guest x86-64 CPU state of recompiled code (recomp/src/lift, `%playgta6.GuestState`).
 // 704 bytes, little endian, one per guest thread. Every lifted function is
