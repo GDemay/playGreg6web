@@ -820,17 +820,36 @@ void test_lane_indexed_heap_sources() {
         CHECK(error.find("lane_indexed_resource_heap needs") != std::string::npos);
     }
 
-    // Well formed: the join fails with the lane-indexed reason and counts both bindings.
+    // Well formed without binding_arrays: degrades to scalar heap bindings at the window base
+    // (window_base + 0, or constant slot 0 without window_base), counted in lane_indexed_bindings.
     const d3d::RootSignatureDesc rs = ui_root_signature();
     bridge::PipelineLayoutDesc layout;
     std::string report;
     JoinStats stats;
-    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
-    CHECK(stats.lane_indexed_bindings == 2 && stats.table_slots_outside_rs == 0);
-    CHECK(report.find("lane-indexed heap window of 64 descriptors needs a binding array") != std::string::npos);
-    CHECK(report.find("lane-indexed heap window of 16 descriptors") != std::string::npos);
-    CHECK(report.find("resource heap[(0 + lane) << 5] x 64") != std::string::npos);
-    CHECK(report.find("sampler heap[(cb(root CBV at s11)[8] + lane) << 4] x 16") != std::string::npos);
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.lane_indexed_bindings == 2 && stats.lane_indexed_arrays == 0 && stats.table_slots_outside_rs == 0);
+    CHECK(layout.groups.size() == 1 && layout.groups[0].bindings.size() == 2);
+    if (layout.groups.size() == 1 && layout.groups[0].bindings.size() == 2) {
+        const bridge::LayoutBinding& tex = layout.groups[0].bindings[0];
+        CHECK(tex.entry.binding_array_size == 0 && tex.join.array_size == 0 && tex.join.array_index == 0);
+        CHECK(tex.join.heap == d3d::HeapAccess::Resource && tex.join.heap_shift == 5 &&
+              tex.join.heap_index_source == d3d::HeapIndexSource::Constant &&
+              tex.join.register_class == d3d::DescriptorRangeType::Srv);
+        const bridge::LayoutBinding& smp = layout.groups[0].bindings[1];
+        CHECK(smp.entry.binding_array_size == 0 && smp.join.array_size == 0 && smp.join.array_index == 0);
+        CHECK(smp.join.heap == d3d::HeapAccess::Sampler && smp.join.heap_shift == 4 &&
+              smp.join.heap_index_source == d3d::HeapIndexSource::CbRootDescriptor &&
+              smp.join.heap_index_parameter == 2 && smp.join.cb_byte_offset == 8 && smp.join.cb_bit_offset == 8 &&
+              smp.join.cb_mask == 255 && smp.join.register_class == d3d::DescriptorRangeType::Sampler);
+        d3d::RootSignature built;
+        CHECK(d3d::RootSignature::build(rs, &built).ok());
+        d3d::ShaderBinding joins[2] = {tex.join, smp.join};
+        joins[0].binding = 0;
+        joins[1].binding = 1;
+        const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(built, joins, d3d::WebGpuStage::Fragment);
+        CHECK(plan.unresolved_count() == 0 && plan.entries().size() == 2);
+    }
 
     // A consumer that binds binding arrays: both windows join as arrays of max_count heap descriptors.
     bridge::PipelineLayoutDesc arrays;
@@ -867,14 +886,14 @@ void test_lane_indexed_heap_sources() {
     CHECK(report.find("cannot come from the sampler heap") != std::string::npos);
     CHECK(report.find("window base: root parameter 1 is not a root CBV") != std::string::npos);
 
-    // A stage without lane-indexed bindings joined next to one with them still fails the whole join.
+    // A stage without lane-indexed bindings joined next to one with them succeeds via scalar fallback.
     StageReflection vs;
     vs.stage = ReflectedStage::Vertex;
     report.clear();
     JoinStats mixed;
-    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &vs}, {GpuShaderStageBits::Fragment, &ps}},
-                                &layout, &report, &mixed));
-    CHECK(mixed.lane_indexed_bindings == 2);
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &vs}, {GpuShaderStageBits::Fragment, &ps}},
+                               &layout, &report, &mixed));
+    CHECK(report.empty() && mixed.lane_indexed_bindings == 2 && mixed.lane_indexed_arrays == 0);
 }
 
 // S63 (#482, #1394): the translator's exact lane-indexed sidecar sources (rdna2_to_wgsl.rs tests)
@@ -933,12 +952,21 @@ void test_s63_lane_indexed_sidecar() {
             CHECK(b[2].entry.binding_array_size == 64 && b[2].join.heap_shift == 0 && b[2].join.heap_stride == 24 &&
                   b[2].join.array_size == 64);
         }
-        // Without binding arrays the same stage is refused with the counted lane-indexed reason.
+        // Without binding arrays the same stage degrades to scalar heap bindings at slot 0,
+        // preserving non-power-of-two stride and counting all three in lane_indexed_bindings.
         report.clear();
         JoinStats off;
-        CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &off));
-        CHECK(off.lane_indexed_bindings == 3);
-        CHECK(report.find("resource heap[(0 + lane) * 24] x 64") != std::string::npos);
+        CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &off));
+        CHECK(report.empty() && off.lane_indexed_bindings == 3 && off.lane_indexed_arrays == 0);
+        if (layout.groups.size() == 1 && layout.groups[0].bindings.size() == 3) {
+            const auto& b = layout.groups[0].bindings;
+            CHECK(b[0].entry.binding_array_size == 0 && b[0].join.array_size == 0 &&
+                  b[0].join.heap_index_source == d3d::HeapIndexSource::Constant && b[0].join.heap_shift == 5);
+            CHECK(b[1].entry.binding_array_size == 0 && b[1].join.array_size == 0 &&
+                  b[1].join.heap == d3d::HeapAccess::Sampler && b[1].join.heap_shift == 4);
+            CHECK(b[2].entry.binding_array_size == 0 && b[2].join.array_size == 0 &&
+                  b[2].join.heap_shift == 0 && b[2].join.heap_stride == 24);
+        }
     }
 }
 
@@ -1613,6 +1641,308 @@ void test_g83_mesh_and_rt_group3_joins() {
     CHECK(report.find("rt_arena_mask") != std::string::npos);
 }
 
+// #663 / #482: sub-element vertex fetch inference (32-bit dword sub-reads like NORMAL0 + 24 and
+// TANGENT0 + 40, adjacent element spanning, and 2-byte aligned 16-bit element sub-reads).
+void test_vertex_sub_element_inference() {
+    // 32-bit dword sub-reads: POSITION0 float3 @0 (12B), NORMAL0 float4 @16 (16B: 16..32),
+    // TANGENT0 float4 @32 (16B: 32..48).
+    std::vector<pso::D3D12InputElementDesc> layout(3);
+    layout[0].SemanticName = "POSITION";
+    layout[0].Format = pso::DxgiFormat::R32G32B32_FLOAT;
+    layout[0].AlignedByteOffset = 0;
+    layout[1].SemanticName = "NORMAL";
+    layout[1].Format = pso::DxgiFormat::R32G32B32A32_FLOAT;
+    layout[1].AlignedByteOffset = 16;
+    layout[2].SemanticName = "TANGENT";
+    layout[2].Format = pso::DxgiFormat::R32G32B32A32_FLOAT;
+    layout[2].AlignedByteOffset = 32;
+
+    StageReflection vs;
+    vs.stage = ReflectedStage::Vertex;
+    vs.vertex_inputs = {
+        {0, 0, 0, 3, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+        // Reads inside NORMAL0 at +24 (2 floats inside NORMAL0).
+        {1, 0, 24, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+        // Reads inside TANGENT0 at +40 (2 floats left at tail, even if stage asks for 4 components).
+        {2, 0, 40, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+    };
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    CHECK(join_vertex_inputs(vs, layout.data(), static_cast<uint32_t>(layout.size()), &fetches, &report));
+    CHECK(report.empty() && fetches.size() == 3);
+    if (fetches.size() == 3) {
+        CHECK(fetches[0].offset == 0 && fetches[0].format == pso::WgpuVertexFormat::Float32x3);
+        CHECK(fetches[1].offset == 24 && fetches[1].format == pso::WgpuVertexFormat::Float32x2);
+        CHECK(fetches[2].offset == 40 && fetches[2].format == pso::WgpuVertexFormat::Float32x2);
+    }
+
+    // Verify translate_graphics_pso accepts the inferred sub-element fetches with zero validation diags.
+    pso::D3D12GraphicsPsoDesc pso_desc{};
+    pso_desc.vs = 1;
+    pso_desc.ps = 2;
+    pso_desc.pInputElementDescs = layout.data();
+    pso_desc.NumInputElements = static_cast<uint32_t>(layout.size());
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    pso_desc.vs_input_fetches = fetches.data();
+    pso_desc.vs_input_fetch_count = static_cast<uint32_t>(fetches.size());
+    const pso::GraphicsPsoTranslation t = pso::translate_graphics_pso(pso_desc, pso::PipelineKeyOptions{});
+    CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::MissingVertexInput)) == 0);
+
+    // Sub-element dword read spanning NORMAL0 + 24 (2 floats) into TANGENT0 + 32 (2 floats) -> Float32x4.
+    StageReflection span_vs;
+    span_vs.vertex_inputs = {{1, 0, 24, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
+    fetches.clear();
+    report.clear();
+    CHECK(join_vertex_inputs(span_vs, layout.data(), static_cast<uint32_t>(layout.size()), &fetches, &report));
+    CHECK(report.empty() && fetches.size() == 1 && fetches[0].format == pso::WgpuVertexFormat::Float32x4);
+
+    // 32-bit bitcast sub-read: Uint32x4 read as F32 at +8 -> Float32x2.
+    std::vector<pso::D3D12InputElementDesc> u32_el(1);
+    u32_el[0].SemanticName = "TEXCOORD";
+    u32_el[0].Format = pso::DxgiFormat::R32G32B32A32_UINT;
+    u32_el[0].AlignedByteOffset = 0;
+    StageReflection bitcast_vs;
+    bitcast_vs.vertex_inputs = {{0, 0, 8, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
+    fetches.clear();
+    report.clear();
+    CHECK(join_vertex_inputs(bitcast_vs, u32_el.data(), 1, &fetches, &report));
+    CHECK(report.empty() && fetches.size() == 1 && fetches[0].format == pso::WgpuVertexFormat::Float32x2);
+
+    // 16-bit sub-element reads: Float16x4, Unorm16x4, Snorm16x4, Uint16x4, Sint16x2.
+    std::vector<pso::D3D12InputElementDesc> half_layout(5);
+    half_layout[0].SemanticName = "NORMAL";
+    half_layout[0].Format = pso::DxgiFormat::R16G16B16A16_FLOAT;
+    half_layout[0].AlignedByteOffset = 0;   // 0..8
+    half_layout[1].SemanticName = "TANGENT";
+    half_layout[1].Format = pso::DxgiFormat::R16G16B16A16_UNORM;
+    half_layout[1].AlignedByteOffset = 8;   // 8..16
+    half_layout[2].SemanticName = "BINORMAL";
+    half_layout[2].Format = pso::DxgiFormat::R16G16B16A16_SNORM;
+    half_layout[2].AlignedByteOffset = 16;  // 16..24
+    half_layout[3].SemanticName = "BLENDINDICES";
+    half_layout[3].Format = pso::DxgiFormat::R16G16B16A16_UINT;
+    half_layout[3].AlignedByteOffset = 24;  // 24..32
+    half_layout[4].SemanticName = "TEXCOORD";
+    half_layout[4].Format = pso::DxgiFormat::R16G16_SINT;
+    half_layout[4].AlignedByteOffset = 32;  // 32..36
+
+    StageReflection half_vs;
+    half_vs.vertex_inputs = {
+        {0, 0, 4, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},   // Float16x2
+        {1, 0, 12, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},  // Unorm16x2
+        {2, 0, 22, 1, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},  // Snorm16 (2-byte aligned)
+        {3, 0, 28, 2, ReflectedComponentType::U32, pso::WgpuVertexFormat::Undefined},  // Uint16x2
+        {4, 0, 34, 1, ReflectedComponentType::I32, pso::WgpuVertexFormat::Undefined},  // Sint16 (2-byte aligned)
+    };
+    fetches.clear();
+    report.clear();
+    CHECK(join_vertex_inputs(half_vs, half_layout.data(), static_cast<uint32_t>(half_layout.size()), &fetches, &report));
+    CHECK(report.empty() && fetches.size() == 5);
+    if (fetches.size() == 5) {
+        CHECK(fetches[0].format == pso::WgpuVertexFormat::Float16x2);
+        CHECK(fetches[1].format == pso::WgpuVertexFormat::Unorm16x2);
+        CHECK(fetches[2].format == pso::WgpuVertexFormat::Snorm16);
+        CHECK(fetches[3].format == pso::WgpuVertexFormat::Uint16x2);
+        CHECK(fetches[4].format == pso::WgpuVertexFormat::Sint16);
+    }
+
+    // Rejections: unaligned dword read (+2 in Float32x4), 2-comp half read at 2-byte-only offset (+2 in Float16x4),
+    // odd offset in 16-bit element (+1 in Float16x4), and class mismatch on 16-bit sub-read (Uint16x4 as f32).
+    StageReflection bad_dw;
+    bad_dw.vertex_inputs = {{0, 0, 18, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
+    report.clear();
+    CHECK(!join_vertex_inputs(bad_dw, layout.data(), static_cast<uint32_t>(layout.size()), &fetches, &report));
+    CHECK(report.find("reads inside element NORMAL0 and has no fetch_format") != std::string::npos);
+
+    StageReflection bad_half_align;
+    bad_half_align.vertex_inputs = {
+        {0, 0, 2, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+        {1, 0, 1, 1, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+        {2, 0, 28, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+    };
+    report.clear();
+    CHECK(!join_vertex_inputs(bad_half_align, half_layout.data(), static_cast<uint32_t>(half_layout.size()), &fetches,
+                              &report));
+    CHECK(report.find("@location(0) <- slot 0 + 2: reads inside element NORMAL0") != std::string::npos);
+    CHECK(report.find("@location(1) <- slot 0 + 1: reads inside element NORMAL0") != std::string::npos);
+    CHECK(report.find("@location(2) <- slot 0 + 28: the stage expects f32, the attribute gives u32") !=
+          std::string::npos);
+}
+
+// #663 / #482: per-stage user_data_base override on ReflectedStageRef and automatic GFX10.3
+// shifted-base fallback (s16 NGG/merged VS, s12 4-SGPR-shifted VS, s14) paired with PS at s8.
+void test_per_stage_user_data_base_and_shifted_fallback() {
+    // Root signature (4 dwords total):
+    //   [0] table {SRV t2 space1, CBV b0 space1} (offset +0)
+    //   [1] 2 root constants b500                (offset +1..+2)
+    //   [2] table {SRV t5 space0}                (offset +3)
+    // At base 8 (PS):     param 0 = s8,  param 1 = s9..s10,  param 2 = s11
+    // At base 16 (NGG):   param 0 = s16, param 1 = s17..s18, param 2 = s19
+    // At base 12 (shift): param 0 = s12, param 1 = s13..s14, param 2 = s15
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc t0;
+    t0.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc srv0;
+    srv0.range_type = d3d::DescriptorRangeType::Srv;
+    srv0.base_shader_register = 2;
+    srv0.register_space = 1;
+    d3d::DescriptorRangeDesc cbv0;
+    cbv0.range_type = d3d::DescriptorRangeType::Cbv;
+    cbv0.base_shader_register = 0;
+    cbv0.register_space = 1;
+    t0.ranges = {srv0, cbv0};
+    d3d::RootParameterDesc rc;
+    rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+    rc.shader_register = 500;
+    rc.num_32bit_values = 2;
+    d3d::RootParameterDesc t2;
+    t2.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc srv2;
+    srv2.range_type = d3d::DescriptorRangeType::Srv;
+    srv2.base_shader_register = 5;
+    srv2.register_space = 0;
+    t2.ranges = {srv2};
+    rs.parameters = {t0, rc, t2};
+
+    // VS at NGG base s16: table at s16 + 0 (shared with PS), table at s19 + 1312 (live log pattern!).
+    StageReflection vs_ngg;
+    vs_ngg.stage = ReflectedStage::Vertex;
+    ReflectedBinding v0;
+    v0.group = 0;
+    v0.binding = 0;
+    v0.kind = ReflectedBindingKind::ReadOnlyStorage;
+    v0.source = ReflectedSource::Table;
+    v0.user_sgpr = 16;
+    v0.table_byte_offset = 0;
+    ReflectedBinding v2;
+    v2.group = 0;
+    v2.binding = 2;
+    v2.kind = ReflectedBindingKind::Texture;
+    v2.source = ReflectedSource::Table;
+    v2.user_sgpr = 19;
+    v2.table_byte_offset = 1312;  // slot 41, past declared ranges -> outside_rs on param 2
+    vs_ngg.bindings = {v0, v2};
+
+    // PS at default base s8: shares @group(0) @binding(0) via s8 + 0, plus root constants at s9.
+    StageReflection ps;
+    ps.stage = ReflectedStage::Fragment;
+    ReflectedBinding p0 = v0;
+    p0.user_sgpr = 8;
+    ReflectedBinding p1;
+    p1.group = 0;
+    p1.binding = 1;
+    p1.kind = ReflectedBindingKind::Uniform;
+    p1.source = ReflectedSource::RootConstants;
+    p1.user_sgpr = 9;
+    ps.bindings = {p0, p1};
+
+    // 1. Auto GFX10.3 shifted-base fallback: VS resolves at s16 while PS stays at s8.
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &vs_ngg}, {GpuShaderStageBits::Fragment, &ps}},
+                               &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.shifted_user_data_base_stages == 1 && stats.table_slots_outside_rs == 1);
+    const bridge::LayoutBinding* b0 = find(layout, 0, 0);
+    CHECK(b0 != nullptr && b0->entry.visibility == (GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment) &&
+          b0->join.register_class == d3d::DescriptorRangeType::Srv && b0->join.shader_register == 2 &&
+          b0->join.register_space == 1);
+    const bridge::LayoutBinding* b1 = find(layout, 0, 1);
+    CHECK(b1 != nullptr && b1->join.root_constants && b1->join.shader_register == 500);
+    const bridge::LayoutBinding* b2 = find(layout, 0, 2);
+    CHECK(b2 != nullptr && b2->join.table_parameter == 2 && b2->join.table_slot == 41 &&
+          b2->join.register_class == d3d::DescriptorRangeType::Srv);
+
+    // 2. Explicit per-stage ReflectedStageRef::user_data_base: does not count as auto-shifted.
+    report.clear();
+    JoinStats explicit_stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &vs_ngg, kMeshUserDataBase},
+                                {GpuShaderStageBits::Fragment, &ps, 0}},
+                               &layout, &report, &explicit_stats));
+    CHECK(report.empty() && explicit_stats.shifted_user_data_base_stages == 0);
+
+    // 3. Auto 4-SGPR-shifted VS (base s12: s12 table, s13 constants, s15 table) paired with PS at s8.
+    StageReflection vs_s12;
+    vs_s12.stage = ReflectedStage::Vertex;
+    ReflectedBinding s12_t = v0;
+    s12_t.user_sgpr = 12;
+    ReflectedBinding s12_c = p1;
+    s12_c.user_sgpr = 13;
+    ReflectedBinding s12_t2 = v2;
+    s12_t2.user_sgpr = 15;
+    s12_t2.table_byte_offset = 0;  // SRV t5 space 0
+    vs_s12.bindings = {s12_t, s12_c, s12_t2};
+    report.clear();
+    JoinStats s12_stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &vs_s12}, {GpuShaderStageBits::Fragment, &ps}},
+                               &layout, &report, &s12_stats));
+    CHECK(report.empty() && s12_stats.shifted_user_data_base_stages == 1);
+    const bridge::LayoutBinding* s12_b2 = find(layout, 0, 2);
+    CHECK(s12_b2 != nullptr && s12_b2->join.shader_register == 5 && s12_b2->join.register_space == 0);
+
+    // 4. Derived shifted base (s14: table at s14, constants at s15, table at s17).
+    StageReflection vs_s14 = vs_s12;
+    vs_s14.bindings[0].user_sgpr = 14;
+    vs_s14.bindings[1].user_sgpr = 15;
+    vs_s14.bindings[2].user_sgpr = 17;
+    report.clear();
+    JoinStats s14_stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &vs_s14}, {GpuShaderStageBits::Fragment, &ps}},
+                               &layout, &report, &s14_stats));
+    CHECK(report.empty() && s14_stats.shifted_user_data_base_stages == 1);
+
+    // 5. Negative: inconsistent stage mixing s8 and s19 fails (no single base covers both).
+    StageReflection bad_mix;
+    bad_mix.stage = ReflectedStage::Vertex;
+    bad_mix.bindings = {p0, v2};  // s8 + s19 in one stage
+    report.clear();
+    JoinStats bad_stats;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad_mix}}, &layout, &report, &bad_stats));
+    CHECK(bad_stats.shifted_user_data_base_stages == 0);
+    CHECK(report.find("no root parameter covers s19") != std::string::npos);
+
+    // 6. Negative: wrong parameter kind under every shifted base (two adjacent tables at s16 & s17,
+    // while rs only has tables at offsets +0 and +3, never adjacent).
+    StageReflection bad_kind;
+    bad_kind.stage = ReflectedStage::Vertex;
+    ReflectedBinding bk0 = v0;
+    bk0.binding = 0;
+    bk0.user_sgpr = 16;
+    ReflectedBinding bk1 = v0;
+    bk1.binding = 1;
+    bk1.user_sgpr = 17;
+    bad_kind.bindings = {bk0, bk1};
+    report.clear();
+    bad_stats = JoinStats{};
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad_kind}}, &layout, &report, &bad_stats));
+    CHECK(bad_stats.shifted_user_data_base_stages == 0);
+
+    // 7. Negative: out-of-bounds base (> 24, s30 on 4-dword RS) fails cleanly.
+    StageReflection bad_hi;
+    bad_hi.stage = ReflectedStage::Vertex;
+    ReflectedBinding hi = v0;
+    hi.user_sgpr = 30;
+    bad_hi.bindings = {hi};
+    report.clear();
+    bad_stats = JoinStats{};
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad_hi}}, &layout, &report, &bad_stats));
+    CHECK(report.find("no root parameter covers s30") != std::string::npos);
+
+    // 8. Negative: compute pipeline does NOT auto-shift.
+    StageReflection cs_shifted = vs_ngg;
+    cs_shifted.stage = ReflectedStage::Compute;
+    report.clear();
+    bad_stats = JoinStats{};
+    CHECK(!join_pipeline_layout(rs, true, {{GpuShaderStageBits::Compute, &cs_shifted}}, &layout, &report, &bad_stats));
+    CHECK(bad_stats.shifted_user_data_base_stages == 0);
+}
+
 int main() {
     test_rt_arena_bindings();
     test_mesh_output();
@@ -1622,6 +1952,7 @@ int main() {
     test_vertex_join();
     test_vertex_join_wide_fetch();
     test_vertex_default_inputs();
+    test_vertex_sub_element_inference();
     test_layout_join();
     test_plan_direct_slot();
     test_heap_sources();
@@ -1634,6 +1965,7 @@ int main() {
     test_g83_unresolved_and_multistage();
     test_g83_heap_strides_and_arrays();
     test_g83_mesh_and_rt_group3_joins();
+    test_per_stage_user_data_base_and_shifted_fallback();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;
