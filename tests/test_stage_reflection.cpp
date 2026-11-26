@@ -2,7 +2,9 @@
 // build vertex attributes and pipeline layouts for pack-resolved stages (G62, #651).
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -2470,6 +2472,568 @@ void test_vertex_join_and_pso_completeness() {
           pso::WgpuTextureFormat::Rgba16Float);
 }
 
+// SM 6.6 directly-indexed descriptor heap implicit SGPRs:
+// When CbvSrvUavHeapDirectlyIndexed (0x400) and/or SamplerHeapDirectlyIndexed (0x800) are set,
+// trailing 1-SGPR heap pointers sit immediately after the explicit root parameters:
+//   s_res = base + total_root_dwords(rs)
+//   s_smp = base + total_root_dwords(rs) + (has_res ? 1 : 0)
+void test_sm66_implicit_heap_sgprs() {
+    class FakeCbMemory final : public d3d::DescriptorSlotSource {
+    public:
+        std::map<uint64_t, uint32_t> dwords;
+        bool reads(const d3d::DescriptorHeap&) const override { return false; }
+        bool snapshot(const d3d::DescriptorHeap&, uint32_t, uint32_t, std::vector<uint8_t>* out) const override {
+            out->clear();
+            return false;
+        }
+        d3d::ViewDescriptor view(const d3d::DescriptorHeap&, uint32_t, d3d::DescriptorRangeType) const override {
+            return {};
+        }
+        bool sampler(const d3d::DescriptorHeap&, uint32_t, d3d::SamplerDesc*) const override { return false; }
+        bool read_gpu_memory(uint64_t va, void* out, size_t bytes) const override {
+            auto it = dwords.find(va);
+            if (bytes != 4 || it == dwords.end()) {
+                return false;
+            }
+            std::memcpy(out, &it->second, 4);
+            return true;
+        }
+    };
+    auto fake_va_resolver = [](void*, uint64_t va, d3d::GpuVaResolution* out) -> bool {
+        if (va == 0x9000) {
+            *out = {500, 0, 256};
+            return true;
+        }
+        return false;
+    };
+
+    // 1. RS #9-like compute RS: flags=0x400, 2 root dwords at s4..s5 -> implicit s_res = s6.
+    {
+        d3d::RootSignatureDesc rs9;
+        rs9.flags = d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed;
+        d3d::RootParameterDesc rc;
+        rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+        rc.shader_register = 0;
+        rc.num_32bit_values = 2;  // s4..s5
+        rs9.parameters = {rc};
+
+        const char* doc = R"({
+          "schema": "playgta6-stage-reflection", "version": 3,
+          "stages": {
+            "0x0000000000009009": {
+              "stage": "compute",
+              "bindings": [
+                {"group": 0, "binding": 0, "kind": "uniform",
+                 "source": {"user_sgpr": 4, "root_constants": true}},
+                {"group": 0, "binding": 1, "kind": "read_only_storage",
+                 "source": {"user_sgpr": 6, "root_descriptor": true}},
+                {"group": 0, "binding": 2, "kind": "uniform",
+                 "source": {"user_sgpr": 6, "root_descriptor": true, "table_byte_offset": 96}},
+                {"group": 0, "binding": 3, "kind": "texture",
+                 "source": {"user_sgpr": 6, "table_byte_offset": 32}},
+                {"group": 0, "binding": 4, "kind": "storage",
+                 "source": {"user_sgpr": 6, "table_byte_offset": 128}},
+                {"group": 0, "binding": 5, "kind": "storage_texture", "storage_format": 18,
+                 "source": {"user_sgpr": 6, "table_byte_offset": 160}}
+              ]
+            }
+          }
+        })";
+        StageReflectionIndex idx;
+        std::string err;
+        CHECK(parse_stage_reflection_json(doc, &idx, &err));
+        CHECK(err.empty() && idx.size() == 1);
+
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs9, true, {{GpuShaderStageBits::Compute, &idx.at(0x9009)}}, &layout, &report,
+                                   &stats));
+        CHECK(report.empty() && stats.implicit_heap_bindings == 5 && stats.root_descriptor_tables == 0);
+
+        const bridge::LayoutBinding* b0 = find(layout, 0, 0);
+        CHECK(b0 != nullptr && b0->join.root_constants && b0->join.heap == d3d::HeapAccess::None);
+        const bridge::LayoutBinding* b1 = find(layout, 0, 1);
+        CHECK(b1 != nullptr && b1->join.heap == d3d::HeapAccess::Resource &&
+              b1->join.heap_index_source == d3d::HeapIndexSource::Constant &&
+              b1->join.heap_index_parameter == d3d::kNoIndex && b1->join.heap_index_dword == 0 &&
+              b1->join.heap_shift == 5 && b1->join.register_class == d3d::DescriptorRangeType::Srv);
+        const bridge::LayoutBinding* b2 = find(layout, 0, 2);
+        CHECK(b2 != nullptr && b2->join.heap == d3d::HeapAccess::Resource &&
+              b2->join.heap_index_source == d3d::HeapIndexSource::Constant && b2->join.heap_index_dword == 3 &&
+              b2->join.heap_shift == 5 && b2->join.register_class == d3d::DescriptorRangeType::Cbv);
+        const bridge::LayoutBinding* b3 = find(layout, 0, 3);
+        CHECK(b3 != nullptr && b3->join.heap == d3d::HeapAccess::Resource &&
+              b3->join.heap_index_source == d3d::HeapIndexSource::Constant && b3->join.heap_index_dword == 1 &&
+              b3->join.heap_shift == 5 && b3->join.register_class == d3d::DescriptorRangeType::Srv);
+        const bridge::LayoutBinding* b4 = find(layout, 0, 4);
+        CHECK(b4 != nullptr && b4->join.heap == d3d::HeapAccess::Resource &&
+              b4->join.heap_index_source == d3d::HeapIndexSource::Constant && b4->join.heap_index_dword == 4 &&
+              b4->join.heap_shift == 5 && b4->join.register_class == d3d::DescriptorRangeType::Uav);
+        const bridge::LayoutBinding* b5 = find(layout, 0, 5);
+        CHECK(b5 != nullptr && b5->join.heap == d3d::HeapAccess::Resource &&
+              b5->join.heap_index_source == d3d::HeapIndexSource::Constant && b5->join.heap_index_dword == 5 &&
+              b5->join.heap_shift == 5 && b5->join.register_class == d3d::DescriptorRangeType::Uav);
+
+        // s7 is uncovered on RS #9 (SamplerHeapDirectlyIndexed is NOT set).
+        StageReflection s7_stage;
+        s7_stage.stage = ReflectedStage::Compute;
+        ReflectedBinding s7_b;
+        s7_b.group = 0;
+        s7_b.binding = 0;
+        s7_b.kind = ReflectedBindingKind::Sampler;
+        s7_b.source = ReflectedSource::Table;
+        s7_b.user_sgpr = 7;
+        s7_b.table_byte_offset = 0;
+        s7_stage.bindings = {s7_b};
+        bridge::PipelineLayoutDesc untouched;
+        report.clear();
+        CHECK(!join_pipeline_layout(rs9, true, {{GpuShaderStageBits::Compute, &s7_stage}}, &untouched, &report));
+        CHECK(untouched.groups.empty() && report.find("no root parameter covers s7") != std::string::npos);
+    }
+
+    // 2. RS #10-like compute RS: flags=0xc00, 6 root dwords at s4..s9 -> s_res=s10, s_smp=s11.
+    // Includes end-to-end BindGroupPlan + BindGroupCache + StateBridgeDevice verification that
+    // non-zero constant slots (e.g. sampler slots 64, 65, 67, 84 and resource slot 2) bind their
+    // exact slots rather than slot 0.
+    {
+        d3d::RootSignatureDesc rs10;
+        rs10.flags = d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed |
+                     d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed;
+        d3d::RootParameterDesc cbv0;
+        cbv0.parameter_type = d3d::RootParameterType::Cbv;
+        cbv0.shader_register = 0;  // s4..s5 (2 dw)
+        d3d::RootParameterDesc cbv1;
+        cbv1.parameter_type = d3d::RootParameterType::Cbv;
+        cbv1.shader_register = 1;  // s6..s7 (2 dw)
+        d3d::RootParameterDesc rc2;
+        rc2.parameter_type = d3d::RootParameterType::Constants32Bit;
+        rc2.shader_register = 2;
+        rc2.num_32bit_values = 2;  // s8..s9 (2 dw)
+        rs10.parameters = {cbv0, cbv1, rc2};
+
+        StageReflection cs;
+        cs.stage = ReflectedStage::Compute;
+        auto mk_res = [](uint32_t binding, ReflectedBindingKind kind, ReflectedSource src, uint32_t sgpr,
+                         uint32_t off) {
+            ReflectedBinding b;
+            b.group = 0;
+            b.binding = binding;
+            b.kind = kind;
+            b.source = src;
+            b.user_sgpr = sgpr;
+            b.table_byte_offset = off;
+            return b;
+        };
+        // Explicit root CBV at s4, implicit resource heap at s10 (RootDescriptor -> slot 0, Table +64 -> slot 2),
+        // implicit sampler heap at s11 (+1024 -> slot 64, +1040 -> 65, +1072 -> 67, +1344 -> 84 comparison),
+        // plus CBV-indexed resource heap reading its CBV from s10 + 96 (slot 3 of ResourceDescriptorHeap)
+        // and ResourceHeap / SamplerHeap with base_user_sgpr = s10 / s11.
+        ReflectedBinding cb_idx;
+        cb_idx.group = 0;
+        cb_idx.binding = 7;
+        cb_idx.kind = ReflectedBindingKind::Texture;
+        cb_idx.source = ReflectedSource::CbvIndexedResourceHeap;
+        cb_idx.cbv = ReflectedCbv::Table;
+        cb_idx.user_sgpr = 10;
+        cb_idx.table_byte_offset = 96;  // CBV in ResourceDescriptorHeap[3]
+        cb_idx.cb_byte_offset = 8;
+        cb_idx.heap_shift = 5;
+
+        ReflectedBinding lane_idx;
+        lane_idx.group = 0;
+        lane_idx.binding = 8;
+        lane_idx.kind = ReflectedBindingKind::Sampler;
+        lane_idx.source = ReflectedSource::LaneIndexedSamplerHeap;
+        lane_idx.lane_max_count = 4;
+        lane_idx.lane_has_window_base = true;
+        lane_idx.cbv = ReflectedCbv::RootDescriptor;
+        lane_idx.user_sgpr = 10;  // CBV in ResourceDescriptorHeap[0]
+        lane_idx.cb_byte_offset = 4;
+        lane_idx.heap_shift = 4;
+
+        ReflectedBinding direct_res_heap;
+        direct_res_heap.group = 0;
+        direct_res_heap.binding = 9;
+        direct_res_heap.kind = ReflectedBindingKind::Texture;
+        direct_res_heap.source = ReflectedSource::ResourceHeap;
+        direct_res_heap.heap_base_sgpr = 10;
+        direct_res_heap.heap_stride = 32;
+        direct_res_heap.heap_index_sgpr = 8;
+        direct_res_heap.heap_shift = 5;
+
+        cs.bindings = {
+            mk_res(0, ReflectedBindingKind::Uniform, ReflectedSource::RootDescriptor, 4, 0),
+            mk_res(1, ReflectedBindingKind::ReadOnlyStorage, ReflectedSource::RootDescriptor, 10, 0),
+            mk_res(2, ReflectedBindingKind::Texture, ReflectedSource::Table, 10, 64),
+            mk_res(3, ReflectedBindingKind::Sampler, ReflectedSource::Table, 11, 1024),
+            mk_res(4, ReflectedBindingKind::Sampler, ReflectedSource::Table, 11, 1040),
+            mk_res(5, ReflectedBindingKind::Sampler, ReflectedSource::Table, 11, 1072),
+            mk_res(6, ReflectedBindingKind::ComparisonSampler, ReflectedSource::Table, 11, 1344),
+            cb_idx,
+            lane_idx,
+            direct_res_heap,
+        };
+
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs10, true, {{GpuShaderStageBits::Compute, &cs}}, &layout, &report, &stats));
+        CHECK(report.empty() && stats.implicit_heap_bindings == 9 && stats.lane_indexed_bindings == 1);
+
+        const bridge::LayoutBinding* s64 = find(layout, 0, 3);
+        const bridge::LayoutBinding* s65 = find(layout, 0, 4);
+        const bridge::LayoutBinding* s67 = find(layout, 0, 5);
+        const bridge::LayoutBinding* s84 = find(layout, 0, 6);
+        const bridge::LayoutBinding* b7 = find(layout, 0, 7);
+        const bridge::LayoutBinding* b8 = find(layout, 0, 8);
+        CHECK(s64 != nullptr && s64->join.heap == d3d::HeapAccess::Sampler &&
+              s64->join.heap_index_source == d3d::HeapIndexSource::Constant && s64->join.heap_index_dword == 64 &&
+              s64->join.heap_shift == 4);
+        CHECK(s65 != nullptr && s65->join.heap_index_dword == 65 && s65->join.heap_shift == 4);
+        CHECK(s67 != nullptr && s67->join.heap_index_dword == 67 && s67->join.heap_shift == 4);
+        CHECK(s84 != nullptr && s84->join.heap_index_dword == 84 && s84->join.heap_shift == 4 &&
+              s84->entry.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Comparison));
+        CHECK(b7 != nullptr && b7->join.heap == d3d::HeapAccess::Resource &&
+              b7->join.heap_index_source == d3d::HeapIndexSource::CbTable &&
+              b7->join.heap_index_parameter == d3d::kNoIndex && b7->join.cb_table_slot == 3 &&
+              b7->join.cb_byte_offset == 8);
+        CHECK(b8 != nullptr && b8->join.heap == d3d::HeapAccess::Sampler &&
+              b8->join.heap_index_source == d3d::HeapIndexSource::CbTable &&
+              b8->join.heap_index_parameter == d3d::kNoIndex && b8->join.cb_table_slot == 0 &&
+              b8->join.cb_byte_offset == 4);
+
+        // End-to-end BindGroupPlan + BindGroupCache verification against real heaps.
+        d3d::RootSignature built_rs;
+        CHECK(d3d::RootSignature::build(rs10, &built_rs).ok());
+        std::vector<d3d::ShaderBinding> joins;
+        for (const bridge::LayoutBinding& lb : layout.groups[0].bindings) {
+            joins.push_back(lb.join);
+        }
+        const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(built_rs, joins, d3d::WebGpuStage::Compute);
+        CHECK(plan.unresolved_count() == 0 && plan.has_heap_indexed());
+        // Only explicit param 0 (root CBV) and param 2 (root constants for binding 9) are in parameter_mask!
+        CHECK(plan.parameter_mask() == ((1ull << 0) | (1ull << 2)));
+
+        d3d::DescriptorHeapRegistry reg;
+        d3d::DescriptorHeap* res_heap = nullptr;
+        d3d::DescriptorHeap* smp_heap = nullptr;
+        CHECK(reg.create_heap({d3d::DescriptorHeapType::CbvSrvUav, 32, d3d::DescriptorHeapFlags::ShaderVisible, 0, 0},
+                              &res_heap) == d3d::Status::Ok);
+        CHECK(reg.create_heap({d3d::DescriptorHeapType::Sampler, 128, d3d::DescriptorHeapFlags::ShaderVisible, 0, 0},
+                              &smp_heap) == d3d::Status::Ok);
+        d3d::ViewDesc srv_desc;
+        srv_desc.format = static_cast<uint32_t>(pso::DxgiFormat::R8G8B8A8_UNORM);
+        srv_desc.dimension = d3d::ViewDimension::Texture2D;
+        srv_desc.mip_levels = 1;
+        // Resource slot 0: CBV at 0xA000 (also read as SRV if bound; keep distinct slots for clear checks).
+        // Put SRVs at slots 0, 2, 5, 7 and CBV at slot 3 (0xB000).
+        CHECK(reg.create_shader_resource_view(1000, &srv_desc, res_heap->cpu_handle(0)) == d3d::Status::Ok);
+        CHECK(reg.create_shader_resource_view(1002, &srv_desc, res_heap->cpu_handle(2)) == d3d::Status::Ok);
+        CHECK(reg.create_shader_resource_view(1005, &srv_desc, res_heap->cpu_handle(5)) == d3d::Status::Ok);
+        CHECK(reg.create_shader_resource_view(1007, &srv_desc, res_heap->cpu_handle(7)) == d3d::Status::Ok);
+        d3d::ConstantBufferViewDesc cb3{0xB000, 256};
+        CHECK(reg.create_constant_buffer_view(&cb3, res_heap->cpu_handle(3)) == d3d::Status::Ok);
+        // Distinct sampler anisotropy per slot so slot 0 can never pass for slots 64/65/67/84!
+        auto write_smp = [&](uint32_t slot, uint32_t aniso) {
+            d3d::SamplerDesc sd;
+            sd.max_anisotropy = aniso;
+            CHECK(reg.create_sampler(sd, smp_heap->cpu_handle(slot)) == d3d::Status::Ok);
+        };
+        write_smp(0, 1);
+        write_smp(64, 4);
+        write_smp(65, 6);
+        write_smp(67, 8);
+        write_smp(84, 12);
+
+        FakeCbMemory mem;
+        mem.dwords[0xB008] = 5;  // binding 7: CBV at ResourceDescriptorHeap[3] + 8 -> resource slot 5 (id 1005)
+
+        d3d::RootArgumentState args;
+        d3d::DescriptorHeap* heaps[2] = {res_heap, smp_heap};
+        CHECK(args.set_descriptor_heaps(2, heaps) == d3d::Status::Ok);
+        CHECK(args.set_root_signature(d3d::BindPoint::Compute, &built_rs) == d3d::Status::Ok);
+        CHECK(args.set_root_view(d3d::BindPoint::Compute, 0, d3d::RootParameterType::Cbv, 0x9000) == d3d::Status::Ok);
+        CHECK(args.set_root_constant(d3d::BindPoint::Compute, 2, 7, 0) == d3d::Status::Ok);  // binding 9 -> slot 7
+
+        d3d::BindGroupCache cache;
+        cache.set_slot_source(&mem);
+        const d3d::BindGroupLookup bg =
+            cache.get_or_build(args, d3d::BindPoint::Compute, plan, 1, fake_va_resolver, nullptr);
+        CHECK(bg.status == d3d::Status::Ok && bg.bind_group != nullptr && bg.bind_group->entries.size() == 10);
+        if (bg.bind_group != nullptr && bg.bind_group->entries.size() == 10) {
+            const auto& e = bg.bind_group->entries;
+            CHECK(e[0].kind == d3d::BindResourceKind::Buffer && e[0].resource_id == 500);
+            CHECK(e[1].kind == d3d::BindResourceKind::TextureView && e[1].resource_id == 1000);
+            CHECK(e[2].kind == d3d::BindResourceKind::TextureView && e[2].resource_id == 1002);
+            CHECK(e[3].kind == d3d::BindResourceKind::Sampler && e[3].sampler.max_anisotropy == 4);
+            CHECK(e[4].kind == d3d::BindResourceKind::Sampler && e[4].sampler.max_anisotropy == 6);
+            CHECK(e[5].kind == d3d::BindResourceKind::Sampler && e[5].sampler.max_anisotropy == 8);
+            CHECK(e[6].kind == d3d::BindResourceKind::Sampler && e[6].sampler.max_anisotropy == 12);
+            CHECK(e[7].kind == d3d::BindResourceKind::TextureView && e[7].resource_id == 1005);
+            CHECK(e[9].kind == d3d::BindResourceKind::TextureView && e[9].resource_id == 1007);
+        }
+
+        // Verify StateBridgeDevice compute pipeline creation preserves constant heap slots cleanly.
+        bridge::StateBridgeDevice dev(reg);
+        dev.register_shader_module(0x1010, 1);
+        dev.register_pipeline_layout(0x1010, 0, layout);
+        pso::D3D12ComputePsoDesc cpso_desc{};
+        cpso_desc.cs = 0x1010;
+        auto cpso = dev.create_compute_pipeline_state(cpso_desc, &built_rs);
+        CHECK(cpso != nullptr && cpso->diagnostics() == 0);
+    }
+
+    // 3. Sampler-only directly indexed (flags=0x800 without 0x400): s_smp = base + total_root_dwords.
+    {
+        d3d::RootSignatureDesc rs_smp;
+        rs_smp.flags = d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed;
+        d3d::RootParameterDesc rc;
+        rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+        rc.num_32bit_values = 2;  // s4..s5
+        rs_smp.parameters = {rc};
+
+        StageReflection cs;
+        cs.stage = ReflectedStage::Compute;
+        ReflectedBinding b;
+        b.group = 0;
+        b.binding = 0;
+        b.kind = ReflectedBindingKind::Sampler;
+        b.source = ReflectedSource::Table;
+        b.user_sgpr = 6;  // s4 + 2 + 0 (no s_res gap!)
+        b.table_byte_offset = 32;
+        cs.bindings = {b};
+
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs_smp, true, {{GpuShaderStageBits::Compute, &cs}}, &layout, &report, &stats));
+        CHECK(report.empty() && stats.implicit_heap_bindings == 1);
+        const bridge::LayoutBinding* lb = find(layout, 0, 0);
+        CHECK(lb != nullptr && lb->join.heap == d3d::HeapAccess::Sampler && lb->join.heap_index_dword == 2 &&
+              lb->join.heap_shift == 4);
+    }
+
+    // 4. Negative tests:
+    //    (a) flags=0x0 rejects uncovered s6/s10/s11;
+    //    (b) kind mismatch: sampler on s_res, resource on s_smp;
+    //    (c) misaligned byte offset: s_res+16, s_smp+8;
+    //    (d) RootConstants on s_res/s_smp;
+    //    (e) CBV-indexed CBV on s_smp; ResourceHeap base_user_sgpr == s_smp.
+    {
+        d3d::RootSignatureDesc rs_no_flags;
+        rs_no_flags.flags = d3d::RootSignatureFlags::None;
+        d3d::RootParameterDesc rc;
+        rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+        rc.num_32bit_values = 2;  // s4..s5
+        rs_no_flags.parameters = {rc};
+
+        StageReflection unflagged;
+        unflagged.stage = ReflectedStage::Compute;
+        ReflectedBinding s6;
+        s6.group = 0;
+        s6.binding = 0;
+        s6.kind = ReflectedBindingKind::ReadOnlyStorage;
+        s6.source = ReflectedSource::RootDescriptor;
+        s6.user_sgpr = 6;
+        ReflectedBinding s7;
+        s7.group = 0;
+        s7.binding = 1;
+        s7.kind = ReflectedBindingKind::Sampler;
+        s7.source = ReflectedSource::Table;
+        s7.user_sgpr = 7;
+        s7.table_byte_offset = 1024;
+        unflagged.bindings = {s6, s7};
+
+        bridge::PipelineLayoutDesc untouched;
+        std::string report;
+        JoinStats stats;
+        CHECK(!join_pipeline_layout(rs_no_flags, true, {{GpuShaderStageBits::Compute, &unflagged}}, &untouched,
+                                    &report, &stats));
+        CHECK(untouched.groups.empty() && stats.implicit_heap_bindings == 0);
+        CHECK(report.find("no root parameter covers s6") != std::string::npos);
+        CHECK(report.find("no root parameter covers s7") != std::string::npos);
+
+        d3d::RootSignatureDesc rs_both = rs_no_flags;
+        rs_both.flags = d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed |
+                        d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed;  // s_res=s6, s_smp=s7
+
+        StageReflection bad_kinds;
+        bad_kinds.stage = ReflectedStage::Compute;
+        ReflectedBinding smp_on_res = s6;
+        smp_on_res.binding = 0;
+        smp_on_res.kind = ReflectedBindingKind::Sampler;
+        smp_on_res.source = ReflectedSource::Table;
+        smp_on_res.user_sgpr = 6;
+        ReflectedBinding res_on_smp = s7;
+        res_on_smp.binding = 1;
+        res_on_smp.kind = ReflectedBindingKind::Texture;
+        res_on_smp.source = ReflectedSource::Table;
+        res_on_smp.user_sgpr = 7;
+        res_on_smp.table_byte_offset = 0;
+        ReflectedBinding misalign_res = s6;
+        misalign_res.binding = 2;
+        misalign_res.source = ReflectedSource::Table;
+        misalign_res.user_sgpr = 6;
+        misalign_res.table_byte_offset = 16;
+        ReflectedBinding misalign_smp = s7;
+        misalign_smp.binding = 3;
+        misalign_smp.source = ReflectedSource::Table;
+        misalign_smp.user_sgpr = 7;
+        misalign_smp.table_byte_offset = 8;
+        ReflectedBinding rc_on_res = s6;
+        rc_on_res.binding = 4;
+        rc_on_res.kind = ReflectedBindingKind::Uniform;
+        rc_on_res.source = ReflectedSource::RootConstants;
+        rc_on_res.user_sgpr = 6;
+        ReflectedBinding cb_on_smp;
+        cb_on_smp.group = 0;
+        cb_on_smp.binding = 5;
+        cb_on_smp.kind = ReflectedBindingKind::Texture;
+        cb_on_smp.source = ReflectedSource::CbvIndexedResourceHeap;
+        cb_on_smp.cbv = ReflectedCbv::Table;
+        cb_on_smp.user_sgpr = 7;
+        cb_on_smp.table_byte_offset = 0;
+        cb_on_smp.cb_byte_offset = 0;
+        cb_on_smp.heap_shift = 5;
+        ReflectedBinding wrong_heap_base;
+        wrong_heap_base.group = 0;
+        wrong_heap_base.binding = 6;
+        wrong_heap_base.kind = ReflectedBindingKind::Texture;
+        wrong_heap_base.source = ReflectedSource::ResourceHeap;
+        wrong_heap_base.heap_base_sgpr = 7;  // s_smp, not s_res!
+        wrong_heap_base.heap_stride = 32;
+        wrong_heap_base.heap_index_sgpr = 4;
+        wrong_heap_base.heap_shift = 5;
+        bad_kinds.bindings = {smp_on_res, res_on_smp, misalign_res, misalign_smp, rc_on_res, cb_on_smp,
+                              wrong_heap_base};
+
+        report.clear();
+        CHECK(!join_pipeline_layout(rs_both, true, {{GpuShaderStageBits::Compute, &bad_kinds}}, &untouched, &report,
+                                    &stats));
+        CHECK(untouched.groups.empty() && stats.implicit_heap_bindings == 0);
+        CHECK(report.find("cannot come from the implicit resource heap at s6") != std::string::npos);
+        CHECK(report.find("cannot come from the implicit sampler heap at s7") != std::string::npos);
+        CHECK(report.find("byte offset 16 is not a descriptor boundary") != std::string::npos);
+        CHECK(report.find("byte offset 8 is not a descriptor boundary") != std::string::npos);
+        CHECK(report.find("not root constants") != std::string::npos);
+        CHECK(report.find("implicit sampler heap, not a CBV_SRV_UAV descriptor heap") != std::string::npos);
+        CHECK(report.find("s7 is the implicit sampler heap, not the resource heap") != std::string::npos);
+    }
+
+    // 5. Graphics VS/PS (default base s8 + shifted NGG VS at s16) and Mesh stage (explicit base 16)
+    //    with flags=0xc00, plus a 0-parameter pure bindless RS.
+    {
+        d3d::RootSignatureDesc rs_gfx;
+        rs_gfx.flags = d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed |
+                       d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed;
+        d3d::RootParameterDesc cbv0;
+        cbv0.parameter_type = d3d::RootParameterType::Cbv;
+        cbv0.shader_register = 0;  // +0..1
+        d3d::RootParameterDesc rc1;
+        rc1.parameter_type = d3d::RootParameterType::Constants32Bit;
+        rc1.shader_register = 1;
+        rc1.num_32bit_values = 2;  // +2..3 -> total 4 dw
+        rs_gfx.parameters = {cbv0, rc1};
+
+        // Default base s8: explicit s8..s11, s_res=s12, s_smp=s13.
+        // Shifted NGG VS at s16: explicit s16..s19, s_res=s20, s_smp=s21.
+        StageReflection vs;
+        vs.stage = ReflectedStage::Vertex;
+        ReflectedBinding vs_cbv;
+        vs_cbv.group = 0;
+        vs_cbv.binding = 0;
+        vs_cbv.kind = ReflectedBindingKind::Uniform;
+        vs_cbv.source = ReflectedSource::RootDescriptor;
+        vs_cbv.user_sgpr = 16;  // forces shifted base s16
+        ReflectedBinding vs_shared;
+        vs_shared.group = 0;
+        vs_shared.binding = 1;
+        vs_shared.kind = ReflectedBindingKind::ReadOnlyStorage;
+        vs_shared.source = ReflectedSource::Table;
+        vs_shared.user_sgpr = 20;  // s_res at base 16
+        vs_shared.table_byte_offset = 64;  // slot 2
+        vs.bindings = {vs_cbv, vs_shared};
+
+        StageReflection ps;
+        ps.stage = ReflectedStage::Fragment;
+        ReflectedBinding ps_shared = vs_shared;
+        ps_shared.user_sgpr = 12;  // s_res at base 8 -> same slot 2, must merge cleanly!
+        ReflectedBinding ps_smp;
+        ps_smp.group = 0;
+        ps_smp.binding = 2;
+        ps_smp.kind = ReflectedBindingKind::Sampler;
+        ps_smp.source = ReflectedSource::Table;
+        ps_smp.user_sgpr = 13;  // s_smp at base 8
+        ps_smp.table_byte_offset = 48;  // slot 3
+        ps.bindings = {ps_shared, ps_smp};
+
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs_gfx, false,
+                                   {{GpuShaderStageBits::Vertex, &vs}, {GpuShaderStageBits::Fragment, &ps}}, &layout,
+                                   &report, &stats));
+        CHECK(report.empty() && stats.shifted_user_data_base_stages == 1 && stats.implicit_heap_bindings == 2);
+        const bridge::LayoutBinding* shared = find(layout, 0, 1);
+        CHECK(shared != nullptr &&
+              shared->entry.visibility == (GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment) &&
+              shared->join.heap == d3d::HeapAccess::Resource && shared->join.heap_index_dword == 2 &&
+              shared->join.heap_shift == 5);
+        const bridge::LayoutBinding* ps_s = find(layout, 0, 2);
+        CHECK(ps_s != nullptr && ps_s->join.heap == d3d::HeapAccess::Sampler && ps_s->join.heap_index_dword == 3 &&
+              ps_s->join.heap_shift == 4);
+
+        // Mesh stage with explicit user_data_base = kMeshUserDataBase (16): s_res=s20, s_smp=s21.
+        StageReflection mesh;
+        mesh.stage = ReflectedStage::Compute;
+        ReflectedBinding m_res = vs_shared;
+        ReflectedBinding m_smp = ps_smp;
+        m_smp.user_sgpr = 21;
+        mesh.bindings = {m_res, m_smp};
+        report.clear();
+        JoinStats mesh_stats;
+        CHECK(join_pipeline_layout(rs_gfx, false, {{GpuShaderStageBits::Compute, &mesh}}, &layout, &report,
+                                   &mesh_stats, JoinOptions{false, kMeshUserDataBase}));
+        CHECK(report.empty() && mesh_stats.shifted_user_data_base_stages == 0 &&
+              mesh_stats.implicit_heap_bindings == 2);
+
+        // Pure 0-parameter SM 6.6 bindless RS (parameters empty, flags=0xc00):
+        // compute uses s_res=s4, s_smp=s5; shifted VS uses s_res=s16, s_smp=s17.
+        d3d::RootSignatureDesc rs_empty;
+        rs_empty.flags = d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed |
+                         d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed;
+        StageReflection empty_cs;
+        empty_cs.stage = ReflectedStage::Compute;
+        ReflectedBinding ecs_r = vs_shared;
+        ecs_r.user_sgpr = 4;
+        ecs_r.table_byte_offset = 0;
+        ReflectedBinding ecs_s = ps_smp;
+        ecs_s.user_sgpr = 5;
+        ecs_s.table_byte_offset = 16;
+        empty_cs.bindings = {ecs_r, ecs_s};
+        report.clear();
+        JoinStats empty_stats;
+        CHECK(join_pipeline_layout(rs_empty, true, {{GpuShaderStageBits::Compute, &empty_cs}}, &layout, &report,
+                                   &empty_stats));
+        CHECK(report.empty() && empty_stats.implicit_heap_bindings == 2);
+
+        StageReflection empty_vs;
+        empty_vs.stage = ReflectedStage::Vertex;
+        ReflectedBinding evs_r = ecs_r;
+        evs_r.user_sgpr = 16;
+        ReflectedBinding evs_s = ecs_s;
+        evs_s.user_sgpr = 17;
+        empty_vs.bindings = {evs_r, evs_s};
+        report.clear();
+        JoinStats empty_vs_stats;
+        CHECK(join_pipeline_layout(rs_empty, false, {{GpuShaderStageBits::Vertex, &empty_vs}}, &layout, &report,
+                                   &empty_vs_stats));
+        CHECK(report.empty() && empty_vs_stats.shifted_user_data_base_stages == 1 &&
+              empty_vs_stats.implicit_heap_bindings == 2);
+    }
+}
+
 int main() {
     test_rt_arena_bindings();
     test_mesh_output();
@@ -2498,6 +3062,7 @@ int main() {
     test_wide_rs_covered_shifted_user_data_base();
     test_cbv_indexed_root_constants_and_table_coercion();
     test_vertex_join_and_pso_completeness();
+    test_sm66_implicit_heap_sgprs();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;
