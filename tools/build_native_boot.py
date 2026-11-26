@@ -1127,6 +1127,9 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner = run_command)
             return 0
         if args.module_dir is None:
             parser.error("module_dir is required (unless --cache-trim)")
+        if runner is run_command:  # not in the unit tests, which pass a fake runner
+            import trim_caches  # noqa: PLC0415
+            trim_caches.auto_trim_if_low(os.environ, cache_dir, say, extra_objs=[cache_dir])
         inputs = load_inputs(args.module_dir)
         triple = args.triple
         if triple is None:

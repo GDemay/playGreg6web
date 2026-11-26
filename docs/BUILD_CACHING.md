@@ -71,6 +71,14 @@ a program directory or a whole-program entry take no extra space.
 
 `build-program` prints `lift cache: R/N shards reused, L of F functions lifted` per module.
 
+## Trimming every cache (`tools/trim_caches.py`)
+
+`python tools/trim_caches.py` lists the object, lift, shard, recompiler, indirect-target, wasm object and Dawn blob caches
+with sizes and what each would free to its budget (LRU by atime/mtime); it is a dry run until `--apply`. It only looks at
+the known cache roots, and keeps the newest entry of each cache, anything used in the last 6 h, and anything holding a
+fresh lock or temporary. The builders call it on their own (log line `disk low: ...`) when free disk is below
+`PLAYGTA6_MIN_FREE_GB` (default 20, 0 disables).
+
 ## Measurements
 
 Game executable `main` module: 435,719 functions, 23.5M instructions. 24 hardware threads,

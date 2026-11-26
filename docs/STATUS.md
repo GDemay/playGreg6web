@@ -19,6 +19,8 @@ $env:PLAYGTA6_EXE = "D:\game\game.exe"; $env:GTA6_GAME_DIR = "D:\game\package"
   `...\prebuilt-web`). Flags: `-Prebuilt` (#1854, #1866), `-ConsoleTiming`, `-MaxMs`, `-SaveDir`, `-InputScript`, `-NoBuild`, `-DryRun`.
 - `-ConsoleTiming` (#1861) honors the title's present sync interval: menus run at the console's 30 fps instead of
   about 60 (default `--present-interval min1`); gameplay at interval 1 is the same.
+- `python tools	rim_caches.py [--apply]` reports and LRU-trims all build caches to budgets (dry run by default); builders
+  auto-trim when free disk < `PLAYGTA6_MIN_FREE_GB` (default 20). See [BUILD_CACHING.md](BUILD_CACHING.md).
 - F3 toggles a stats overlay (fps, frame-time graph, present mode, draws, GPU ms, underruns, fault text; #1852).
   All window hotkeys sit in one table, rebindable in `keymap.ini [hotkeys]`; `--show-target` keys are Ctrl+F7..F10 (#1844).
 - A GPU device loss is recovered by the native executor instead of ending the run (#1836). Headless run of the same
