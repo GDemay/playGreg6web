@@ -1068,6 +1068,7 @@ void write_outputs(bool print_summary) {
 }
 
 [[noreturn]] void terminate_now(int code) {
+    playgta6::guest::host_input::silence_host_rumble();
     std::fflush(nullptr);
 #ifdef _WIN32
     TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
@@ -1794,6 +1795,9 @@ int main(int argc, char** argv) {
             host_source.set_recorder(&recorder);
             std::fprintf(stderr, "[harness] recording host input to %s\n", g_options.record_input.c_str());
         }
+#ifdef PLAYGTA6_NATIVE_EXECUTOR
+        g_host_source.store(&host_source);
+#endif
         host_source.start();
         std::fprintf(stderr, "[harness] host input: XInput pad + keyboard\n");
     }
