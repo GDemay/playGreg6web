@@ -245,6 +245,14 @@ impl Default for Rdna2TranslateOptions {
     }
 }
 
+/// Maximum descriptor-window size for per-lane bindless heap reflection (`stage_reflection.h`
+/// `kMaxLaneIndexedWindow`, `stage_reflection_sidecar.py` `MAX_LANE_INDEXED_WINDOW`).
+pub const MAX_LANE_INDEXED_WINDOW: u32 = 256;
+
+/// Conservative default descriptor-window size when a per-lane VGPR heap index has no statically
+/// inferable bitmask/clamp upper bound (strictly within `1..=MAX_LANE_INDEXED_WINDOW`).
+pub const DEFAULT_LANE_INDEXED_WINDOW: u32 = 64;
+
 /// Constant-buffer origin holding a 32-bit bindless descriptor-heap index dword
 /// (`cbv_indexed_resource_heap` / `cbv_indexed_sampler_heap`, G62 / #482 / #1383).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -260,6 +268,16 @@ pub enum CbvRefSource {
     RootConstants { user_sgpr: u32 },
 }
 
+/// Constant-buffer 32-bit dword origin (`(dword_at(cbv, byte_offset) >> bit_offset) & mask`),
+/// used as the optional `window_base` of [`LaneIndexedHeapSource`] (G62 / S63 / #482 / #1394).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CbvDwordSource {
+    pub cbv: CbvRefSource,
+    pub byte_offset: u32,
+    pub bit_offset: u32,
+    pub mask: u32,
+}
+
 /// SM 6.6 CB-indexed descriptor-heap binding origin (`#482` / `#1383`).
 ///
 /// The runtime computes the 32-bit wrapping heap byte offset as
@@ -272,6 +290,19 @@ pub struct CbvIndexedHeapSource {
     pub bit_offset: u32,
     pub mask: u32,
     pub stride: u32,
+}
+
+/// SM 6.6 per-lane (VGPR / `v_readfirstlane_b32` waterfall) descriptor-heap binding origin
+/// (`lane_indexed_resource_heap` / `lane_indexed_sampler_heap`, G62 / S63 / #482 / #1394).
+///
+/// Element `k` of the window (`0 <= k < max_count`) is the descriptor at byte offset
+/// `(window_base + k) << shift` of the bound heap (`window_base = 0` when `None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LaneIndexedHeapSource {
+    pub max_count: u32,
+    pub shift: u32,
+    pub stride: u32,
+    pub window_base: Option<CbvDwordSource>,
 }
 
 /// Origin of a reflected binding in console user-data SGPRs or static samplers
@@ -318,6 +349,10 @@ pub enum WgslBindingSource {
     CbvIndexedResourceHeap(CbvIndexedHeapSource),
     /// SM 6.6 `SamplerDescriptorHeap[cb[byte_offset]]` (G62 / #482 / #1383).
     CbvIndexedSamplerHeap(CbvIndexedHeapSource),
+    /// SM 6.6 `ResourceDescriptorHeap[NonUniformResourceIndex(i)]` (G62 / S63 / #482 / #1394).
+    LaneIndexedResourceHeap(LaneIndexedHeapSource),
+    /// SM 6.6 `SamplerDescriptorHeap[NonUniformResourceIndex(i)]` (G62 / S63 / #482 / #1394).
+    LaneIndexedSamplerHeap(LaneIndexedHeapSource),
 }
 
 /// Reflected vertex input attribute fetched by a vertex stage (`stage_reflection.h`).
@@ -351,6 +386,32 @@ pub struct WgslBindingInfo {
     pub highest_vec4_offset: Option<u32>,
     /// Descriptor origin in console user-data SGPRs or static samplers when statically known.
     pub source: Option<WgslBindingSource>,
+}
+
+fn write_cbv_ref_json(out: &mut String, cbv: CbvRefSource) {
+    match cbv {
+        CbvRefSource::RootDescriptor { user_sgpr } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true}}"
+            );
+        }
+        CbvRefSource::Table {
+            user_sgpr,
+            table_byte_offset,
+        } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"table_byte_offset\": {table_byte_offset}}}"
+            );
+        }
+        CbvRefSource::RootConstants { user_sgpr } => {
+            let _ = write!(
+                out,
+                "{{\"user_sgpr\": {user_sgpr}, \"root_constants\": true}}"
+            );
+        }
+    }
 }
 
 /// Write a JSON array of [`WgslBindingInfo`] entries with the given leading indentation.
@@ -460,29 +521,7 @@ pub(crate) fn write_wgsl_bindings_json(
                         "cbv_indexed_resource_heap"
                     };
                     let _ = write!(out, "{{\"{key_name}\": {{\"cbv\": ");
-                    match h.cbv {
-                        CbvRefSource::RootDescriptor { user_sgpr } => {
-                            let _ = write!(
-                                out,
-                                "{{\"user_sgpr\": {user_sgpr}, \"root_descriptor\": true}}"
-                            );
-                        }
-                        CbvRefSource::Table {
-                            user_sgpr,
-                            table_byte_offset,
-                        } => {
-                            let _ = write!(
-                                out,
-                                "{{\"user_sgpr\": {user_sgpr}, \"table_byte_offset\": {table_byte_offset}}}"
-                            );
-                        }
-                        CbvRefSource::RootConstants { user_sgpr } => {
-                            let _ = write!(
-                                out,
-                                "{{\"user_sgpr\": {user_sgpr}, \"root_constants\": true}}"
-                            );
-                        }
-                    }
+                    write_cbv_ref_json(out, h.cbv);
                     let _ = write!(
                         out,
                         ", \"byte_offset\": {}, \"shift\": {}",
@@ -496,6 +535,35 @@ pub(crate) fn write_wgsl_bindings_json(
                     }
                     if h.stride != 0 {
                         let _ = write!(out, ", \"stride\": {}", h.stride);
+                    }
+                    out.push_str("}}");
+                }
+                WgslBindingSource::LaneIndexedResourceHeap(h)
+                | WgslBindingSource::LaneIndexedSamplerHeap(h) => {
+                    let key_name = if matches!(src, WgslBindingSource::LaneIndexedSamplerHeap(_)) {
+                        "lane_indexed_sampler_heap"
+                    } else {
+                        "lane_indexed_resource_heap"
+                    };
+                    let _ = write!(
+                        out,
+                        "{{\"{key_name}\": {{\"max_count\": {}, \"shift\": {}",
+                        h.max_count, h.shift
+                    );
+                    if h.stride != 0 {
+                        let _ = write!(out, ", \"stride\": {}", h.stride);
+                    }
+                    if let Some(base) = h.window_base {
+                        out.push_str(", \"window_base\": {\"cbv\": ");
+                        write_cbv_ref_json(out, base.cbv);
+                        let _ = write!(out, ", \"byte_offset\": {}", base.byte_offset);
+                        if base.bit_offset != 0 {
+                            let _ = write!(out, ", \"bit_offset\": {}", base.bit_offset);
+                        }
+                        if base.mask != u32::MAX {
+                            let _ = write!(out, ", \"mask\": {}", base.mask);
+                        }
+                        out.push('}');
                     }
                     out.push_str("}}");
                 }
@@ -750,7 +818,8 @@ struct DynamicHeapOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CbvKey {
     /// Base SGPR pair index (raw `sbase` for unreflected direct/indirect SMEM loads;
-    /// normalized to `0` when `user_sgpr`, `dynamic_heap`, or `cbv_indexed_heap` uniquely identifies the CBV).
+    /// normalized to `0` when `user_sgpr`, `dynamic_heap`, `cbv_indexed_heap`, or
+    /// `lane_indexed_heap` uniquely identifies the CBV).
     base_sbase: u8,
     /// Known console user-data SGPR when sourced from a descriptor table or root descriptor.
     user_sgpr: Option<u32>,
@@ -761,6 +830,8 @@ struct CbvKey {
     dynamic_heap: Option<DynamicHeapOrigin>,
     /// `Some(origin)` for a coalesced SM 6.6 CB-indexed `ResourceDescriptorHeap` V# CBV entry (#1383).
     cbv_indexed_heap: Option<CbvIndexedHeapSource>,
+    /// `Some(origin)` for a coalesced SM 6.6 lane-indexed `ResourceDescriptorHeap` V# CBV entry (#1394).
+    lane_indexed_heap: Option<LaneIndexedHeapSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -802,6 +873,8 @@ enum ResourceKey {
     },
     CbvIndexedSamplerHeap(CbvIndexedHeapSource),
     CbvIndexedResourceHeap(CbvIndexedHeapSource),
+    LaneIndexedSamplerHeap(LaneIndexedHeapSource),
+    LaneIndexedResourceHeap(LaneIndexedHeapSource),
     RawSlot(u8),
 }
 
@@ -848,6 +921,8 @@ impl ResourceKey {
             }),
             Self::CbvIndexedSamplerHeap(h) => Some(WgslBindingSource::CbvIndexedSamplerHeap(h)),
             Self::CbvIndexedResourceHeap(h) => Some(WgslBindingSource::CbvIndexedResourceHeap(h)),
+            Self::LaneIndexedSamplerHeap(h) => Some(WgslBindingSource::LaneIndexedSamplerHeap(h)),
+            Self::LaneIndexedResourceHeap(h) => Some(WgslBindingSource::LaneIndexedResourceHeap(h)),
             Self::RawSlot(_) => None,
         }
     }
@@ -1480,6 +1555,7 @@ enum PatchedDescBase {
     },
     DynamicHeap(DynamicHeapOrigin),
     CbvIndexedHeap(CbvIndexedHeapSource),
+    LaneIndexedHeap(LaneIndexedHeapSource),
     Vb {
         vb_slot: u32,
     },
@@ -1523,6 +1599,18 @@ enum SgprOrigin {
     ScaledCbvDword(CbvIndexedHeapSource),
     /// 32-bit GPUVA pointer formed by adding a descriptor-heap base and a `ScaledCbvDword`.
     CbvIndexedHeapPtr(CbvIndexedHeapSource),
+    /// Per-lane VGPR-sourced index (`v_readfirstlane_b32` waterfall loop or bounded/offset VGPR),
+    /// optionally bounded by a static bitmask/clamp (`max_count` in `1..=MAX_LANE_INDEXED_WINDOW`)
+    /// and/or offset by a CBV-loaded `window_base` (S63 / #482 / #1394).
+    LaneIndex {
+        max_count: Option<u32>,
+        window_base: Option<CbvDwordSource>,
+    },
+    /// Shifted/scaled per-lane heap index (`(window_base + lane_idx) << shift` or `* stride`),
+    /// ready to serve as a dynamic descriptor-heap byte offset (S63 / #482 / #1394).
+    ScaledLaneIndex(LaneIndexedHeapSource),
+    /// 32-bit GPUVA pointer formed by adding a descriptor-heap base and a `ScaledLaneIndex`.
+    LaneIndexedHeapPtr(LaneIndexedHeapSource),
     /// Descriptor dword (or nested table / CBV pointer) loaded from a user-data descriptor table
     /// via `s_load_dword*`.
     TableDesc {
@@ -1544,6 +1632,11 @@ enum SgprOrigin {
     CbvIndexedHeapDesc {
         def_inst_idx: usize,
         origin: CbvIndexedHeapSource,
+    },
+    /// Descriptor dword loaded from an SM 6.6 per-lane bindless sampler/resource heap via `s_load_dword*`.
+    LaneIndexedHeapDesc {
+        def_inst_idx: usize,
+        origin: LaneIndexedHeapSource,
     },
     /// Descriptor dword loaded from an unknown/legacy table `sbase` (e.g. `s[0:1]` in pixel/compute),
     /// kept so unreflected indirect V# coalescing and spurious-CBV suppression survive copies/branches.
@@ -2012,9 +2105,13 @@ fn is_known_descriptor_or_table(o: SgprOrigin) -> bool {
             | SgprOrigin::CbvDword { .. }
             | SgprOrigin::ScaledCbvDword(_)
             | SgprOrigin::CbvIndexedHeapPtr(_)
+            | SgprOrigin::LaneIndex { .. }
+            | SgprOrigin::ScaledLaneIndex(_)
+            | SgprOrigin::LaneIndexedHeapPtr(_)
             | SgprOrigin::TableDesc { .. }
             | SgprOrigin::DynamicHeapDesc { .. }
             | SgprOrigin::CbvIndexedHeapDesc { .. }
+            | SgprOrigin::LaneIndexedHeapDesc { .. }
             | SgprOrigin::VbDesc { .. }
             | SgprOrigin::RawTableDesc { .. }
             | SgprOrigin::PatchedDescWord { .. }
@@ -2044,11 +2141,230 @@ fn patched_desc_word_of(origin: SgprOrigin) -> Option<(usize, PatchedDescBase)> 
             def_inst_idx,
             origin,
         } => Some((def_inst_idx, PatchedDescBase::CbvIndexedHeap(origin))),
+        SgprOrigin::LaneIndexedHeapDesc {
+            def_inst_idx,
+            origin,
+        } => Some((def_inst_idx, PatchedDescBase::LaneIndexedHeap(origin))),
         SgprOrigin::VbDesc {
             def_inst_idx,
             vb_slot,
         } => Some((def_inst_idx, PatchedDescBase::Vb { vb_slot })),
         SgprOrigin::PatchedDescWord { def_inst_idx, base } => Some((def_inst_idx, base)),
+        _ => None,
+    }
+}
+
+#[inline]
+fn lane_bound_from_upper_inclusive(upper_inclusive: u32) -> u32 {
+    if upper_inclusive < MAX_LANE_INDEXED_WINDOW {
+        upper_inclusive + 1
+    } else {
+        MAX_LANE_INDEXED_WINDOW
+    }
+}
+
+#[inline]
+fn tighten_lane_max_count(prev: Option<u32>, bound: u32) -> u32 {
+    let clamped = bound.clamp(1, MAX_LANE_INDEXED_WINDOW);
+    prev.map_or(clamped, |p| p.min(clamped).clamp(1, MAX_LANE_INDEXED_WINDOW))
+}
+
+#[inline]
+fn finalize_lane_max_count(max_count: Option<u32>) -> u32 {
+    max_count
+        .unwrap_or(DEFAULT_LANE_INDEXED_WINDOW)
+        .clamp(1, MAX_LANE_INDEXED_WINDOW)
+}
+
+#[inline]
+fn is_lane_origin(o: SgprOrigin) -> bool {
+    matches!(
+        o,
+        SgprOrigin::LaneIndex { .. }
+            | SgprOrigin::ScaledLaneIndex(_)
+            | SgprOrigin::LaneIndexedHeapPtr(_)
+    )
+}
+
+fn cbv_dword_from_origin(origin: SgprOrigin) -> Option<CbvDwordSource> {
+    match origin {
+        SgprOrigin::CbvDword {
+            cbv,
+            byte_offset,
+            bit_offset,
+            mask,
+        } if byte_offset.is_multiple_of(4) && bit_offset < 32 && mask != 0 => {
+            Some(CbvDwordSource {
+                cbv,
+                byte_offset,
+                bit_offset,
+                mask,
+            })
+        }
+        SgprOrigin::TableDesc {
+            cbv_dword: Some((cbv, byte_offset)),
+            addr_offset: 0,
+            ..
+        } if byte_offset.is_multiple_of(4) => Some(CbvDwordSource {
+            cbv,
+            byte_offset,
+            bit_offset: 0,
+            mask: u32::MAX,
+        }),
+        SgprOrigin::MaskedUserSgpr { user_sgpr, mask } if mask != 0 => Some(CbvDwordSource {
+            cbv: CbvRefSource::RootConstants { user_sgpr },
+            byte_offset: 0,
+            bit_offset: 0,
+            mask,
+        }),
+        _ => None,
+    }
+}
+
+fn apply_min_const(origin: SgprOrigin, limit: u32, signed: bool) -> SgprOrigin {
+    if signed && (limit as i32) < 0 {
+        return SgprOrigin::Unknown;
+    }
+    match origin {
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base: None,
+        } => SgprOrigin::LaneIndex {
+            max_count: Some(tighten_lane_max_count(
+                max_count,
+                lane_bound_from_upper_inclusive(limit),
+            )),
+            window_base: None,
+        },
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base: Some(wb),
+        } => {
+            if limit < MAX_LANE_INDEXED_WINDOW {
+                SgprOrigin::LaneIndex {
+                    max_count: Some(limit + 1),
+                    window_base: None,
+                }
+            } else {
+                SgprOrigin::LaneIndex {
+                    max_count,
+                    window_base: Some(wb),
+                }
+            }
+        }
+        _ => SgprOrigin::Unknown,
+    }
+}
+
+fn combine_add_lane_origins(a: SgprOrigin, b: SgprOrigin) -> Option<SgprOrigin> {
+    match (a, b) {
+        (
+            SgprOrigin::LaneIndex {
+                max_count,
+                window_base: None,
+            },
+            other,
+        )
+        | (
+            other,
+            SgprOrigin::LaneIndex {
+                max_count,
+                window_base: None,
+            },
+        ) => {
+            if let Some(wb) = cbv_dword_from_origin(other) {
+                Some(SgprOrigin::LaneIndex {
+                    max_count,
+                    window_base: Some(wb),
+                })
+            } else if let SgprOrigin::UserTable {
+                user_sgpr,
+                byte_offset: 0,
+            } = other
+            {
+                Some(SgprOrigin::LaneIndex {
+                    max_count,
+                    window_base: Some(CbvDwordSource {
+                        cbv: CbvRefSource::RootConstants { user_sgpr },
+                        byte_offset: 0,
+                        bit_offset: 0,
+                        mask: u32::MAX,
+                    }),
+                })
+            } else {
+                None
+            }
+        }
+        (
+            SgprOrigin::LaneIndex {
+                max_count,
+                window_base: Some(wb),
+            },
+            SgprOrigin::UserTable { byte_offset: 0, .. },
+        )
+        | (
+            SgprOrigin::UserTable { byte_offset: 0, .. },
+            SgprOrigin::LaneIndex {
+                max_count,
+                window_base: Some(wb),
+            },
+        ) => Some(SgprOrigin::LaneIndexedHeapPtr(LaneIndexedHeapSource {
+            max_count: finalize_lane_max_count(max_count),
+            shift: 0,
+            stride: 0,
+            window_base: Some(wb),
+        })),
+        (SgprOrigin::ScaledLaneIndex(h), SgprOrigin::UserTable { byte_offset: 0, .. })
+        | (SgprOrigin::UserTable { byte_offset: 0, .. }, SgprOrigin::ScaledLaneIndex(h)) => {
+            Some(SgprOrigin::LaneIndexedHeapPtr(h))
+        }
+        (SgprOrigin::ScaledLaneIndex(h), SgprOrigin::Unknown)
+        | (SgprOrigin::Unknown, SgprOrigin::ScaledLaneIndex(h))
+            if h.shift > 0 || h.stride > 1 =>
+        {
+            Some(SgprOrigin::LaneIndexedHeapPtr(h))
+        }
+        (SgprOrigin::ScaledLaneIndex(mut h), SgprOrigin::ScaledCbvDword(c))
+        | (SgprOrigin::ScaledCbvDword(c), SgprOrigin::ScaledLaneIndex(mut h))
+            if h.window_base.is_none()
+                && h.shift == c.shift
+                && h.stride == c.stride
+                && c.byte_offset.is_multiple_of(4)
+                && c.bit_offset < 32
+                && c.mask != 0 =>
+        {
+            h.window_base = Some(CbvDwordSource {
+                cbv: c.cbv,
+                byte_offset: c.byte_offset,
+                bit_offset: c.bit_offset,
+                mask: c.mask,
+            });
+            Some(SgprOrigin::ScaledLaneIndex(h))
+        }
+        (
+            SgprOrigin::ScaledLaneIndex(mut h),
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+        )
+        | (
+            SgprOrigin::ScaledUserSgpr {
+                user_sgpr,
+                stride,
+                shift,
+            },
+            SgprOrigin::ScaledLaneIndex(mut h),
+        ) if h.window_base.is_none() && h.shift == shift && h.stride == stride => {
+            h.window_base = Some(CbvDwordSource {
+                cbv: CbvRefSource::RootConstants { user_sgpr },
+                byte_offset: 0,
+                bit_offset: 0,
+                mask: u32::MAX,
+            });
+            Some(SgprOrigin::ScaledLaneIndex(h))
+        }
         _ => None,
     }
 }
@@ -2123,6 +2439,51 @@ fn join_cfg_origin(
         ) if h1 == h2 => {
             record_def_alias(def_aliases, d1, d2);
             SgprOrigin::CbvIndexedHeapDesc {
+                def_inst_idx: d1.min(d2),
+                origin: h1,
+            }
+        }
+        (
+            SgprOrigin::LaneIndex {
+                max_count: m1,
+                window_base: w1,
+            },
+            SgprOrigin::LaneIndex {
+                max_count: m2,
+                window_base: w2,
+            },
+        ) if w1 == w2 => SgprOrigin::LaneIndex {
+            max_count: m1.zip(m2).map(|(a, b)| a.max(b)),
+            window_base: w1,
+        },
+        (SgprOrigin::ScaledLaneIndex(h1), SgprOrigin::ScaledLaneIndex(h2))
+            if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base =>
+        {
+            SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                max_count: h1.max_count.max(h2.max_count),
+                ..h1
+            })
+        }
+        (SgprOrigin::LaneIndexedHeapPtr(h1), SgprOrigin::LaneIndexedHeapPtr(h2))
+            if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base =>
+        {
+            SgprOrigin::LaneIndexedHeapPtr(LaneIndexedHeapSource {
+                max_count: h1.max_count.max(h2.max_count),
+                ..h1
+            })
+        }
+        (
+            SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: d1,
+                origin: h1,
+            },
+            SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: d2,
+                origin: h2,
+            },
+        ) if h1 == h2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::LaneIndexedHeapDesc {
                 def_inst_idx: d1.min(d2),
                 origin: h1,
             }
@@ -2280,6 +2641,51 @@ fn merge_select_origin(
             }
         }
         (
+            SgprOrigin::LaneIndex {
+                max_count: m1,
+                window_base: w1,
+            },
+            SgprOrigin::LaneIndex {
+                max_count: m2,
+                window_base: w2,
+            },
+        ) if w1 == w2 => SgprOrigin::LaneIndex {
+            max_count: m1.zip(m2).map(|(a, b)| a.max(b)),
+            window_base: w1,
+        },
+        (SgprOrigin::ScaledLaneIndex(h1), SgprOrigin::ScaledLaneIndex(h2))
+            if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base =>
+        {
+            SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                max_count: h1.max_count.max(h2.max_count),
+                ..h1
+            })
+        }
+        (SgprOrigin::LaneIndexedHeapPtr(h1), SgprOrigin::LaneIndexedHeapPtr(h2))
+            if h1.shift == h2.shift && h1.stride == h2.stride && h1.window_base == h2.window_base =>
+        {
+            SgprOrigin::LaneIndexedHeapPtr(LaneIndexedHeapSource {
+                max_count: h1.max_count.max(h2.max_count),
+                ..h1
+            })
+        }
+        (
+            SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: d1,
+                origin: h1,
+            },
+            SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: d2,
+                origin: h2,
+            },
+        ) if h1 == h2 => {
+            record_def_alias(def_aliases, d1, d2);
+            SgprOrigin::LaneIndexedHeapDesc {
+                def_inst_idx: d1.min(d2),
+                origin: h1,
+            }
+        }
+        (
             SgprOrigin::VbDesc {
                 def_inst_idx: d1,
                 vb_slot: v1,
@@ -2399,9 +2805,30 @@ fn apply_const_offset(origin: SgprOrigin, delta: i32) -> SgprOrigin {
         SgprOrigin::CbvDword { .. } if delta == 0 => origin,
         SgprOrigin::ScaledCbvDword(_) if delta == 0 => origin,
         SgprOrigin::CbvIndexedHeapPtr(_) if delta == 0 => origin,
-        // Adding a constant byte offset to a loaded DynamicHeapDesc / CbvIndexedHeapDesc V# base
-        // address (or 2-level CBV VA) still references the exact same heap binding.
-        SgprOrigin::DynamicHeapDesc { .. } | SgprOrigin::CbvIndexedHeapDesc { .. } => origin,
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base,
+        } => {
+            if delta == 0 {
+                origin
+            } else if delta > 0 && (delta as u32) < MAX_LANE_INDEXED_WINDOW {
+                SgprOrigin::LaneIndex {
+                    max_count: max_count
+                        .map(|m| m.saturating_add(delta as u32).min(MAX_LANE_INDEXED_WINDOW)),
+                    window_base,
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        SgprOrigin::ScaledLaneIndex(_) if delta == 0 => origin,
+        SgprOrigin::LaneIndexedHeapPtr(_) if delta == 0 => origin,
+        // Adding a constant byte offset to a loaded DynamicHeapDesc / CbvIndexedHeapDesc /
+        // LaneIndexedHeapDesc V# base address (or 2-level CBV VA) still references the exact same
+        // heap binding.
+        SgprOrigin::DynamicHeapDesc { .. }
+        | SgprOrigin::CbvIndexedHeapDesc { .. }
+        | SgprOrigin::LaneIndexedHeapDesc { .. } => origin,
         SgprOrigin::VbDesc { .. } if delta == 0 => origin,
         SgprOrigin::RawTableDesc { .. } if delta == 0 => origin,
         SgprOrigin::PatchedDescWord { .. } if delta == 0 => origin,
@@ -2457,7 +2884,9 @@ fn apply_or_const(origin: SgprOrigin, imm: u32, inst_idx: usize) -> SgprOrigin {
                 cbv_dword: None,
             }
         }
-        SgprOrigin::DynamicHeapDesc { .. } | SgprOrigin::CbvIndexedHeapDesc { .. }
+        SgprOrigin::DynamicHeapDesc { .. }
+        | SgprOrigin::CbvIndexedHeapDesc { .. }
+        | SgprOrigin::LaneIndexedHeapDesc { .. }
             if imm < 0x0010_0000 =>
         {
             origin
@@ -2593,7 +3022,59 @@ fn apply_and_const(origin: SgprOrigin, mask: u32, inst_idx: usize) -> SgprOrigin
         SgprOrigin::CbvIndexedHeapPtr(origin) if is_pointer_align_mask(mask) => {
             SgprOrigin::CbvIndexedHeapPtr(origin)
         }
-        SgprOrigin::DynamicHeapDesc { .. } | SgprOrigin::CbvIndexedHeapDesc { .. }
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base,
+        } => {
+            let bound = lane_bound_from_upper_inclusive(mask);
+            match window_base {
+                None => SgprOrigin::LaneIndex {
+                    max_count: Some(tighten_lane_max_count(max_count, bound)),
+                    window_base: None,
+                },
+                Some(wb) if mask >= 0x00FF_FFFF => SgprOrigin::LaneIndex {
+                    max_count,
+                    window_base: Some(wb),
+                },
+                Some(_) => SgprOrigin::LaneIndex {
+                    max_count: Some(bound),
+                    window_base: None,
+                },
+            }
+        }
+        SgprOrigin::ScaledLaneIndex(mut h) => {
+            if is_pointer_align_mask(mask) && (h.stride & !mask) == 0 {
+                SgprOrigin::ScaledLaneIndex(h)
+            } else if h.shift < 32 && (mask & ((1u32 << h.shift).wrapping_sub(1))) == 0 {
+                let unshifted = mask >> h.shift;
+                if unshifted == 0 {
+                    SgprOrigin::ConstImmediate {
+                        def_inst_idx: inst_idx,
+                        value: Some(0),
+                    }
+                } else {
+                    let bound = lane_bound_from_upper_inclusive(unshifted);
+                    if h.window_base.is_none() {
+                        h.max_count = h.max_count.min(bound).clamp(1, MAX_LANE_INDEXED_WINDOW);
+                        SgprOrigin::ScaledLaneIndex(h)
+                    } else if unshifted >= 0x00FF_FFFF {
+                        SgprOrigin::ScaledLaneIndex(h)
+                    } else {
+                        h.window_base = None;
+                        h.max_count = bound;
+                        SgprOrigin::ScaledLaneIndex(h)
+                    }
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        SgprOrigin::LaneIndexedHeapPtr(origin) if is_pointer_align_mask(mask) => {
+            SgprOrigin::LaneIndexedHeapPtr(origin)
+        }
+        SgprOrigin::DynamicHeapDesc { .. }
+        | SgprOrigin::CbvIndexedHeapDesc { .. }
+        | SgprOrigin::LaneIndexedHeapDesc { .. }
             if is_pointer_align_mask(mask) =>
         {
             origin
@@ -2752,6 +3233,46 @@ fn apply_lshr_const(origin: SgprOrigin, shr: u32, inst_idx: usize) -> SgprOrigin
                 }
             }
         }
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base: None,
+        } => {
+            let shifted_prev = max_count.map(|m| (((m - 1) >> shr) + 1).clamp(1, MAX_LANE_INDEXED_WINDOW));
+            let shifted_type = if shr >= 24 {
+                Some((1u32 << (32 - shr)).min(MAX_LANE_INDEXED_WINDOW))
+            } else {
+                None
+            };
+            let next_max = match (shifted_prev, shifted_type) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            SgprOrigin::LaneIndex {
+                max_count: next_max,
+                window_base: None,
+            }
+        }
+        SgprOrigin::ScaledLaneIndex(h) if h.shift < 32 && shr <= h.shift => {
+            let new_shift = h.shift - shr;
+            if new_shift == 0 && (h.stride == 0 || h.stride == (1u32 << h.shift)) {
+                SgprOrigin::LaneIndex {
+                    max_count: Some(h.max_count),
+                    window_base: h.window_base,
+                }
+            } else {
+                let new_stride = if h.stride != 0 {
+                    h.stride >> shr
+                } else {
+                    1u32 << new_shift
+                };
+                SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                    shift: new_shift,
+                    stride: new_stride,
+                    ..h
+                })
+            }
+        }
         _ => SgprOrigin::Unknown,
     }
 }
@@ -2763,6 +3284,26 @@ fn apply_bfe_u32_const(origin: SgprOrigin, param: u32, inst_idx: usize) -> SgprO
         return SgprOrigin::ConstImmediate {
             def_inst_idx: inst_idx,
             value: Some(0),
+        };
+    }
+    if let SgprOrigin::LaneIndex {
+        max_count,
+        window_base,
+    } = origin
+    {
+        let bfe_bound = if width < 8 {
+            1u32 << width
+        } else {
+            MAX_LANE_INDEXED_WINDOW
+        };
+        let next_max = if off == 0 && window_base.is_none() {
+            tighten_lane_max_count(max_count, bfe_bound)
+        } else {
+            bfe_bound
+        };
+        return SgprOrigin::LaneIndex {
+            max_count: Some(next_max),
+            window_base: None,
         };
     }
     let bfe_mask = if width >= 32 {
@@ -2913,6 +3454,48 @@ fn scale_user_sgpr_by_shift(origin: SgprOrigin, shift: u32) -> SgprOrigin {
             }),
             _ => SgprOrigin::Unknown,
         },
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base,
+        } => {
+            if shift == 0 {
+                origin
+            } else {
+                SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                    max_count: finalize_lane_max_count(max_count),
+                    shift,
+                    stride: mult,
+                    window_base,
+                })
+            }
+        }
+        SgprOrigin::ScaledLaneIndex(h) => {
+            if shift == 0 {
+                SgprOrigin::ScaledLaneIndex(h)
+            } else if h.stride == 0 || h.stride == (1u32 << h.shift) {
+                match h.shift.checked_add(shift) {
+                    Some(new_shift) if new_shift < 32 => {
+                        SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                            shift: new_shift,
+                            stride: 1u32 << new_shift,
+                            ..h
+                        })
+                    }
+                    _ => SgprOrigin::Unknown,
+                }
+            } else {
+                match h.stride.checked_mul(mult) {
+                    Some(new_stride) if new_stride > 0 => {
+                        SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                            shift: 0,
+                            stride: new_stride,
+                            ..h
+                        })
+                    }
+                    _ => SgprOrigin::Unknown,
+                }
+            }
+        }
         _ => SgprOrigin::Unknown,
     }
 }
@@ -2944,6 +3527,51 @@ fn scale_user_sgpr_by_mul(origin: SgprOrigin, factor: i32) -> SgprOrigin {
             if f.is_power_of_two() =>
         {
             scale_user_sgpr_by_shift(origin, f.trailing_zeros())
+        }
+        SgprOrigin::LaneIndex {
+            max_count,
+            window_base,
+        } => {
+            if f == 1 {
+                origin
+            } else if f.is_power_of_two() {
+                scale_user_sgpr_by_shift(origin, f.trailing_zeros())
+            } else {
+                SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                    max_count: finalize_lane_max_count(max_count),
+                    shift: 0,
+                    stride: f,
+                    window_base,
+                })
+            }
+        }
+        SgprOrigin::ScaledLaneIndex(h) => {
+            if f == 1 {
+                SgprOrigin::ScaledLaneIndex(h)
+            } else if f.is_power_of_two() && (h.stride == 0 || h.stride == (1u32 << h.shift)) {
+                scale_user_sgpr_by_shift(origin, f.trailing_zeros())
+            } else {
+                let base_stride = if h.stride != 0 {
+                    h.stride
+                } else {
+                    1u32 << h.shift
+                };
+                match base_stride.checked_mul(f) {
+                    Some(new_stride) if new_stride > 0 => {
+                        let new_shift = if new_stride.is_power_of_two() {
+                            new_stride.trailing_zeros()
+                        } else {
+                            0
+                        };
+                        SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                            shift: new_shift,
+                            stride: new_stride,
+                            ..h
+                        })
+                    }
+                    _ => SgprOrigin::Unknown,
+                }
+            }
         }
         _ => SgprOrigin::Unknown,
     }
@@ -3003,6 +3631,7 @@ fn taint_sgpr_if_loaded(
             SgprOrigin::TableDesc { def_inst_idx, .. }
             | SgprOrigin::DynamicHeapDesc { def_inst_idx, .. }
             | SgprOrigin::CbvIndexedHeapDesc { def_inst_idx, .. }
+            | SgprOrigin::LaneIndexedHeapDesc { def_inst_idx, .. }
             | SgprOrigin::RawTableDesc { def_inst_idx, .. }
             | SgprOrigin::VbDesc { def_inst_idx, .. }
             | SgprOrigin::PatchedDescWord { def_inst_idx, .. } => {
@@ -3101,6 +3730,8 @@ fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
             | SgprOrigin::PatchedDescWord { .. }
             | SgprOrigin::CbvDword { .. }
             | SgprOrigin::ScaledCbvDword(_)
+            | SgprOrigin::LaneIndex { .. }
+            | SgprOrigin::ScaledLaneIndex(_)
             | SgprOrigin::MaskedUserSgpr { .. }
             | SgprOrigin::ScaledUserSgpr { .. }
     ) {
@@ -3153,6 +3784,14 @@ fn resolve_vsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
                             origin: hi,
                         };
                     }
+                    (PatchedDescBase::LaneIndexedHeap(hi), PatchedDescBase::LaneIndexedHeap(hj))
+                        if hi == hj =>
+                    {
+                        return SgprOrigin::LaneIndexedHeapDesc {
+                            def_inst_idx: di,
+                            origin: hi,
+                        };
+                    }
                     (
                         PatchedDescBase::Vb { vb_slot: vi },
                         PatchedDescBase::Vb { vb_slot: vj },
@@ -3185,6 +3824,8 @@ fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
             | SgprOrigin::Unwritten
             | SgprOrigin::CbvDword { .. }
             | SgprOrigin::ScaledCbvDword(_)
+            | SgprOrigin::LaneIndex { .. }
+            | SgprOrigin::ScaledLaneIndex(_)
             | SgprOrigin::MaskedUserSgpr { .. }
             | SgprOrigin::ScaledUserSgpr { .. }
     ) {
@@ -3254,6 +3895,21 @@ fn resolve_tsharp_origin(origins: &[SgprOrigin; TRACKED_SGPR_COUNT], rsrc_sgpr: 
                 },
             ) if d_lo == d_hi && h_lo == h_hi => {
                 return SgprOrigin::CbvIndexedHeapDesc {
+                    def_inst_idx: d_lo,
+                    origin: h_lo,
+                };
+            }
+            (
+                SgprOrigin::LaneIndexedHeapDesc {
+                    def_inst_idx: d_lo,
+                    origin: h_lo,
+                },
+                SgprOrigin::LaneIndexedHeapDesc {
+                    def_inst_idx: d_hi,
+                    origin: h_hi,
+                },
+            ) if d_lo == d_hi && h_lo == h_hi => {
+                return SgprOrigin::LaneIndexedHeapDesc {
                     def_inst_idx: d_lo,
                     origin: h_lo,
                 };
@@ -3363,6 +4019,7 @@ fn is_valid_carry_hi(sdst: u8, origin: SgprOrigin, last_carry_lo_reg: Option<u8>
         origin,
         SgprOrigin::DynamicHeapDesc { .. }
             | SgprOrigin::CbvIndexedHeapDesc { .. }
+            | SgprOrigin::LaneIndexedHeapDesc { .. }
             | SgprOrigin::VbDesc { .. }
             | SgprOrigin::PatchedDescWord { .. }
     )
@@ -3370,6 +4027,239 @@ fn is_valid_carry_hi(sdst: u8, origin: SgprOrigin, last_carry_lo_reg: Option<u8>
 
 fn is_swappable_origin(o: SgprOrigin) -> bool {
     is_known_descriptor_or_table(o) || matches!(o, SgprOrigin::ConstImmediate { .. })
+}
+
+fn resolve_readfirstlane_origin(state: &OriginState, src0: u16) -> SgprOrigin {
+    if (256..=511).contains(&src0) {
+        let vsrc = (src0 - 256) as u8;
+        if let Some(&lane0) = state.lane_origins.get(&(vsrc, 0)) {
+            return normalize_read_origin(lane0);
+        }
+        let restored = normalize_read_origin(state.vgpr_origin(vsrc));
+        if restored == SgprOrigin::Unknown {
+            // Genuine per-lane VGPR value (not a uniform SGPR spill or constant):
+            // candidate for SM 6.6 per-lane waterfall descriptor-heap indexing (#482 / #1394).
+            SgprOrigin::LaneIndex {
+                max_count: None,
+                window_base: None,
+            }
+        } else {
+            restored
+        }
+    } else if src0 <= u16::from(MAX_TRACKED_SGPR) {
+        normalize_read_origin(state.sgpr_origin(src0 as u8))
+    } else {
+        SgprOrigin::Unknown
+    }
+}
+
+fn resolve_valu_const_u32(src: u16, literal: Option<u32>, state: &OriginState) -> Option<u32> {
+    if src <= u16::from(MAX_TRACKED_SGPR) {
+        if let SgprOrigin::ConstImmediate { value: Some(v), .. } = state.sgpr_origin(src as u8) {
+            Some(v)
+        } else {
+            None
+        }
+    } else if (256..=511).contains(&src) {
+        if let SgprOrigin::ConstImmediate { value: Some(v), .. } =
+            state.vgpr_origin((src - 256) as u8)
+        {
+            Some(v)
+        } else {
+            None
+        }
+    } else if let Some(v) = decode_inline_u32_src(src, literal) {
+        Some(v as u32)
+    } else {
+        decode_inline_float_u32(src)
+    }
+}
+
+fn resolve_valu_lane_operand(
+    src: u16,
+    literal: Option<u32>,
+    inst_idx: usize,
+    state: &OriginState,
+) -> SgprOrigin {
+    if src <= u16::from(MAX_TRACKED_SGPR) {
+        normalize_read_origin(state.sgpr_origin(src as u8))
+    } else if (256..=511).contains(&src) {
+        let v = (src - 256) as u8;
+        let o = normalize_read_origin(state.vgpr_origin(v));
+        if o == SgprOrigin::Unknown {
+            SgprOrigin::LaneIndex {
+                max_count: None,
+                window_base: None,
+            }
+        } else {
+            o
+        }
+    } else if let Some(v) = decode_inline_u32_src(src, literal) {
+        SgprOrigin::ConstImmediate {
+            def_inst_idx: inst_idx,
+            value: Some(v as u32),
+        }
+    } else if let Some(bits) = decode_inline_float_u32(src) {
+        SgprOrigin::ConstImmediate {
+            def_inst_idx: inst_idx,
+            value: Some(bits),
+        }
+    } else {
+        SgprOrigin::Unknown
+    }
+}
+
+fn eval_valu_lane_origin_vop2_like(
+    state: &OriginState,
+    vop2_op: u8,
+    src0: u16,
+    src1: u16,
+    literal: Option<u32>,
+    inst_idx: usize,
+) -> Option<SgprOrigin> {
+    let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+    let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+    let c0 = resolve_valu_const_u32(src0, literal, state);
+    let c1 = resolve_valu_const_u32(src1, literal, state);
+    let res = match vop2_op {
+        // v_min_i32 / v_min_u32
+        0x11 | 0x13 => {
+            let signed = vop2_op == 0x11;
+            if let Some(lim) = c0 {
+                apply_min_const(o1, lim, signed)
+            } else if let Some(lim) = c1 {
+                apply_min_const(o0, lim, signed)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_lshrrev_b32: src1 >> (src0 & 31)
+        0x16 => {
+            if let Some(sh) = c0 {
+                apply_lshr_const(o1, sh & 31, inst_idx)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_lshlrev_b32: src1 << (src0 & 31)
+        0x1A => {
+            if let Some(sh) = c0 {
+                scale_user_sgpr_by_shift(o1, sh & 31)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_and_b32
+        0x1B => {
+            if let Some(m) = c0 {
+                apply_and_const(o1, m, inst_idx)
+            } else if let Some(m) = c1 {
+                apply_and_const(o0, m, inst_idx)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add_nc_u32
+        0x25 => {
+            if let Some(imm) = c0 {
+                apply_const_offset(o1, imm as i32)
+            } else if let Some(imm) = c1 {
+                apply_const_offset(o0, imm as i32)
+            } else {
+                combine_add_lane_origins(o0, o1).unwrap_or(SgprOrigin::Unknown)
+            }
+        }
+        _ => SgprOrigin::Unknown,
+    };
+    is_lane_origin(res).then_some(res)
+}
+
+fn eval_valu_lane_origin_vop3(
+    state: &OriginState,
+    op: u16,
+    src0: u16,
+    src1: u16,
+    src2: u16,
+    literal: Option<u32>,
+    inst_idx: usize,
+) -> Option<SgprOrigin> {
+    if (0x100..=0x13F).contains(&op) {
+        return eval_valu_lane_origin_vop2_like(
+            state,
+            (op - 0x100) as u8,
+            src0,
+            src1,
+            literal,
+            inst_idx,
+        );
+    }
+    let res = match op {
+        // v_bfe_u32 vdst, src0, off(src1), width(src2)
+        0x148 => {
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            if is_lane_origin(o0)
+                && let (Some(off), Some(width)) = (
+                    resolve_valu_const_u32(src1, literal, state),
+                    resolve_valu_const_u32(src2, literal, state),
+                )
+            {
+                let param = (off & 31) | ((width & 0x7F) << 16);
+                apply_bfe_u32_const(o0, param, inst_idx)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_mul_lo_u32 vdst, src0, src1
+        0x169 => {
+            let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+            let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+            if let Some(f) = resolve_valu_const_u32(src1, literal, state) {
+                scale_user_sgpr_by_mul(o0, f as i32)
+            } else if let Some(f) = resolve_valu_const_u32(src0, literal, state) {
+                scale_user_sgpr_by_mul(o1, f as i32)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add_co_u32 vdst, sdst, src0, src1
+        0x30F => {
+            return eval_valu_lane_origin_vop2_like(state, 0x25, src0, src1, literal, inst_idx);
+        }
+        // v_lshl_add_u32 vdst, src0, shift(src1), src2: (src0 << shift) + src2
+        0x346 => {
+            if let Some(sh) = resolve_valu_const_u32(src1, literal, state) {
+                let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+                let o2 = resolve_valu_lane_operand(src2, literal, inst_idx, state);
+                let scaled = scale_user_sgpr_by_shift(o0, sh & 31);
+                if resolve_valu_const_u32(src2, literal, state) == Some(0) {
+                    scaled
+                } else {
+                    combine_add_lane_origins(scaled, o2).unwrap_or(SgprOrigin::Unknown)
+                }
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        // v_add_lshl_u32 vdst, src0, src1, shift(src2): (src0 + src1) << shift
+        0x347 => {
+            if let Some(sh) = resolve_valu_const_u32(src2, literal, state) {
+                let o0 = resolve_valu_lane_operand(src0, literal, inst_idx, state);
+                let o1 = resolve_valu_lane_operand(src1, literal, inst_idx, state);
+                let sum = if let Some(imm) = resolve_valu_const_u32(src0, literal, state) {
+                    apply_const_offset(o1, imm as i32)
+                } else if let Some(imm) = resolve_valu_const_u32(src1, literal, state) {
+                    apply_const_offset(o0, imm as i32)
+                } else {
+                    combine_add_lane_origins(o0, o1).unwrap_or(SgprOrigin::Unknown)
+                };
+                scale_user_sgpr_by_shift(sum, sh & 31)
+            } else {
+                SgprOrigin::Unknown
+            }
+        }
+        _ => SgprOrigin::Unknown,
+    };
+    is_lane_origin(res).then_some(res)
 }
 
 fn step_origin_state(
@@ -4225,6 +5115,10 @@ fn step_origin_state(
                                 mask,
                                 stride: 0,
                             });
+                        } else if let Some(lane_combined) =
+                            combine_add_lane_origins(src0_origin, src1_origin)
+                        {
+                            next_origin = lane_combined;
                         } else if let (Some((u0, s0)), Some((u1, s1))) = (
                             scaled_user_sgpr_stride(src0_origin),
                             scaled_user_sgpr_stride(src1_origin),
@@ -4305,6 +5199,21 @@ fn step_origin_state(
                             };
                         } else if *ssrc0 == *ssrc1 && *ssrc0 <= MAX_TRACKED_SGPR {
                             next_origin = normalize_read_origin(src0_origin);
+                        } else if matches!(*op, 0x06 | 0x07) {
+                            let signed = *op == 0x06;
+                            if let Some(lim) = c1 {
+                                next_origin = apply_min_const(src0_origin, lim, signed);
+                            } else if let Some(lim) = c0 {
+                                next_origin = apply_min_const(src1_origin, lim, signed);
+                            }
+                        } else if matches!(*op, 0x08 | 0x09) {
+                            if c1 == Some(0) && matches!(src0_origin, SgprOrigin::LaneIndex { .. }) {
+                                next_origin = src0_origin;
+                            } else if c0 == Some(0)
+                                && matches!(src1_origin, SgprOrigin::LaneIndex { .. })
+                            {
+                                next_origin = src1_origin;
+                            }
                         }
                     }
                     // s_cselect_b32
@@ -4557,6 +5466,27 @@ fn step_origin_state(
                                         next_origin = SgprOrigin::ScaledCbvDword(h);
                                     }
                                 }
+                                SgprOrigin::ScaledLaneIndex(h) => {
+                                    if *ssrc0 == *ssrc1
+                                        && *ssrc0 <= MAX_TRACKED_SGPR
+                                        && matches!(src0_origin, SgprOrigin::LaneIndex { .. })
+                                    {
+                                        let stride = (1u32 << shift).saturating_add(1);
+                                        next_origin =
+                                            SgprOrigin::ScaledLaneIndex(LaneIndexedHeapSource {
+                                                shift: 0,
+                                                stride,
+                                                ..h
+                                            });
+                                    } else if let Some(combined) = combine_add_lane_origins(
+                                        SgprOrigin::ScaledLaneIndex(h),
+                                        src1_origin,
+                                    ) {
+                                        next_origin = combined;
+                                    } else if c1 == Some(0) {
+                                        next_origin = SgprOrigin::ScaledLaneIndex(h);
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -4703,6 +5633,7 @@ fn step_origin_state(
                                 table_offset: Some(table_byte_offset as i32),
                                 dynamic_heap: None,
                                 cbv_indexed_heap: None,
+                                lane_indexed_heap: None,
                             };
                             col.buffer_load_uses.push(BufferLoadUse {
                                 inst_idx,
@@ -4724,6 +5655,7 @@ fn step_origin_state(
                                 table_offset: None,
                                 dynamic_heap: Some(heap),
                                 cbv_indexed_heap: None,
+                                lane_indexed_heap: None,
                             };
                             col.buffer_load_uses.push(BufferLoadUse {
                                 inst_idx,
@@ -4747,12 +5679,32 @@ fn step_origin_state(
                                 table_offset: None,
                                 dynamic_heap: None,
                                 cbv_indexed_heap: Some(heap),
+                                lane_indexed_heap: None,
                             };
                             col.buffer_load_uses.push(BufferLoadUse {
                                 inst_idx,
                                 def_inst_idx,
                                 cbv_key: Some(key),
                                 source: Some(WgslBindingSource::CbvIndexedResourceHeap(heap)),
+                            });
+                        }
+                        SgprOrigin::LaneIndexedHeapDesc {
+                            def_inst_idx,
+                            origin: heap,
+                        } => {
+                            let key = CbvKey {
+                                base_sbase: 0,
+                                user_sgpr: None,
+                                table_offset: None,
+                                dynamic_heap: None,
+                                cbv_indexed_heap: None,
+                                lane_indexed_heap: Some(heap),
+                            };
+                            col.buffer_load_uses.push(BufferLoadUse {
+                                inst_idx,
+                                def_inst_idx,
+                                cbv_key: Some(key),
+                                source: Some(WgslBindingSource::LaneIndexedResourceHeap(heap)),
                             });
                         }
                         SgprOrigin::RawTableDesc {
@@ -4770,6 +5722,7 @@ fn step_origin_state(
                                     table_offset: Some(table_offset),
                                     dynamic_heap: None,
                                     cbv_indexed_heap: None,
+                                    lane_indexed_heap: None,
                                 })
                             };
                             col.buffer_load_uses.push(BufferLoadUse {
@@ -4927,9 +5880,34 @@ fn step_origin_state(
                 } else {
                     None
                 };
+                let lane_heap_from_soffset = if is_dynamic
+                    && dynamic_heap_from_soffset.is_none()
+                    && cbv_heap_from_soffset.is_none()
+                    && *offset == 0
+                    && !matches!(base_origin, SgprOrigin::VbTablePtr { .. })
+                {
+                    match soffset_origin {
+                        SgprOrigin::ScaledLaneIndex(h) => Some(h),
+                        SgprOrigin::LaneIndex {
+                            max_count,
+                            window_base,
+                        } if matches!(base_origin, SgprOrigin::UserTable { byte_offset: 0, .. }) => {
+                            Some(LaneIndexedHeapSource {
+                                max_count: finalize_lane_max_count(max_count),
+                                shift: 0,
+                                stride: 0,
+                                window_base,
+                            })
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
                 if is_dynamic
                     && dynamic_heap_from_soffset.is_none()
                     && cbv_heap_from_soffset.is_none()
+                    && lane_heap_from_soffset.is_none()
                 {
                     taint_sgpr_if_loaded(&mut collector, &state.origins, u16::from(*soffset));
                 }
@@ -4963,6 +5941,7 @@ fn step_origin_state(
                                 table_offset: Some(table_byte_offset as i32),
                                 dynamic_heap: None,
                                 cbv_indexed_heap: None,
+                                lane_indexed_heap: None,
                             };
                             col.cbv_ptr_loads.push(CbvPtrLoad {
                                 inst_idx,
@@ -4985,6 +5964,7 @@ fn step_origin_state(
                                 table_offset: None,
                                 dynamic_heap: Some(heap),
                                 cbv_indexed_heap: None,
+                                lane_indexed_heap: None,
                             };
                             col.cbv_ptr_loads.push(CbvPtrLoad {
                                 inst_idx,
@@ -5009,12 +5989,33 @@ fn step_origin_state(
                                 table_offset: None,
                                 dynamic_heap: None,
                                 cbv_indexed_heap: Some(heap),
+                                lane_indexed_heap: None,
                             };
                             col.cbv_ptr_loads.push(CbvPtrLoad {
                                 inst_idx,
                                 ptr_def,
                                 cbv_key: key,
                                 source: WgslBindingSource::CbvIndexedResourceHeap(heap),
+                            });
+                        }
+                        SgprOrigin::LaneIndexedHeapDesc {
+                            def_inst_idx: ptr_def,
+                            origin: heap,
+                        } => {
+                            col.def_parents.insert(inst_idx, ptr_def);
+                            let key = CbvKey {
+                                base_sbase: 0,
+                                user_sgpr: None,
+                                table_offset: None,
+                                dynamic_heap: None,
+                                cbv_indexed_heap: None,
+                                lane_indexed_heap: Some(heap),
+                            };
+                            col.cbv_ptr_loads.push(CbvPtrLoad {
+                                inst_idx,
+                                ptr_def,
+                                cbv_key: key,
+                                source: WgslBindingSource::LaneIndexedResourceHeap(heap),
                             });
                         }
                         SgprOrigin::RawTableDesc {
@@ -5075,6 +6076,60 @@ fn step_origin_state(
                                         state.set_sgpr_origin(
                                             reg,
                                             SgprOrigin::CbvIndexedHeapDesc {
+                                                def_inst_idx: inst_idx,
+                                                origin: heap,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            SgprOrigin::LaneIndexedHeapPtr(heap) if raw_off == 0 => {
+                                for k in 0..count {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::LaneIndexedHeapDesc {
+                                                def_inst_idx: inst_idx,
+                                                origin: heap,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            SgprOrigin::LaneIndex {
+                                max_count,
+                                window_base:
+                                    Some(CbvDwordSource {
+                                        cbv: CbvRefSource::RootConstants { .. },
+                                        byte_offset: 0,
+                                        bit_offset: 0,
+                                        mask: u32::MAX,
+                                    }),
+                            } if raw_off == 0 => {
+                                let heap = LaneIndexedHeapSource {
+                                    max_count: finalize_lane_max_count(max_count),
+                                    shift: 0,
+                                    stride: 0,
+                                    window_base: None,
+                                };
+                                for k in 0..count {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::LaneIndexedHeapDesc {
+                                                def_inst_idx: inst_idx,
+                                                origin: heap,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            SgprOrigin::LaneIndexedHeapDesc { origin: heap, .. } => {
+                                for k in 0..count {
+                                    if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                        state.set_sgpr_origin(
+                                            reg,
+                                            SgprOrigin::LaneIndexedHeapDesc {
                                                 def_inst_idx: inst_idx,
                                                 origin: heap,
                                             },
@@ -5218,6 +6273,18 @@ fn step_origin_state(
                                 );
                             }
                         }
+                    } else if let Some(heap) = lane_heap_from_soffset {
+                        for k in 0..count {
+                            if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
+                                state.set_sgpr_origin(
+                                    reg,
+                                    SgprOrigin::LaneIndexedHeapDesc {
+                                        def_inst_idx: inst_idx,
+                                        origin: heap,
+                                    },
+                                );
+                            }
+                        }
                     } else if matches!(*op, 0x02 | 0x03 | 0x04) && (*sdata % 2 == 0) {
                         for k in 0..count {
                             if let Some(reg) = checked_tracked_sgpr_reg(*sdata, k) {
@@ -5275,23 +6342,11 @@ fn step_origin_state(
                         }
                     }
                     0x02 => {
-                        // v_readfirstlane_b32 sdst, src0: restore lane 0 or uniform VGPR origin.
+                        // v_readfirstlane_b32 sdst, src0: restore lane 0 / uniform VGPR spill, or
+                        // tag a genuine per-lane VGPR as a `LaneIndex` candidate (#482 / #1394).
                         let sd = *vdst & 0x7F;
                         if sd <= MAX_TRACKED_SGPR {
-                            let restored = if (256..=511).contains(src0) {
-                                let vsrc = (*src0 - 256) as u8;
-                                normalize_read_origin(
-                                    state
-                                        .lane_origins
-                                        .get(&(vsrc, 0))
-                                        .copied()
-                                        .unwrap_or_else(|| state.vgpr_origin(vsrc)),
-                                )
-                            } else if *src0 <= u16::from(MAX_TRACKED_SGPR) {
-                                normalize_read_origin(state.sgpr_origin(*src0 as u8))
-                            } else {
-                                SgprOrigin::Unknown
-                            };
+                            let restored = resolve_readfirstlane_origin(state, *src0);
                             state.set_sgpr_origin(sd, restored);
                             clear_pending_xor_if(state, sd);
                         }
@@ -5323,9 +6378,26 @@ fn step_origin_state(
                 }
             }
         }
-        Rdna2Detail::Vop2 { op, vdst, src0, .. } => {
+        Rdna2Detail::Vop2 {
+            op,
+            vdst,
+            vsrc1,
+            src0,
+            literal,
+        } => {
             taint_sgpr_if_loaded(&mut collector, &state.origins, *src0);
+            let next_lane_origin = eval_valu_lane_origin_vop2_like(
+                state,
+                *op,
+                *src0,
+                256 + u16::from(*vsrc1),
+                *literal,
+                inst_idx,
+            );
             clear_vgpr_origins(state, *vdst);
+            if let Some(orig) = next_lane_origin {
+                state.set_vgpr_origin(*vdst, orig);
+            }
             if vop2_is_co_ci(*op) {
                 state.set_sgpr_origin(106, SgprOrigin::Unknown);
                 clear_pending_xor_if(state, 106);
@@ -5444,20 +6516,7 @@ fn step_origin_state(
                 // v_readfirstlane_b32_e64
                 let sd = *vdst & 0x7F;
                 if sd <= MAX_TRACKED_SGPR {
-                    let restored = if (256..=511).contains(src0) {
-                        let vsrc = (*src0 - 256) as u8;
-                        normalize_read_origin(
-                            state
-                                .lane_origins
-                                .get(&(vsrc, 0))
-                                .copied()
-                                .unwrap_or_else(|| state.vgpr_origin(vsrc)),
-                        )
-                    } else if *src0 <= u16::from(MAX_TRACKED_SGPR) {
-                        normalize_read_origin(state.sgpr_origin(*src0 as u8))
-                    } else {
-                        SgprOrigin::Unknown
-                    };
+                    let restored = resolve_readfirstlane_origin(state, *src0);
                     state.set_sgpr_origin(sd, restored);
                     clear_pending_xor_if(state, sd);
                 }
@@ -5522,7 +6581,13 @@ fn step_origin_state(
                     clear_pending_xor_if(state, sd);
                 }
             } else {
+                let next_lane_origin = eval_valu_lane_origin_vop3(
+                    state, *op, *src0, *src1, *src2, *literal, inst_idx,
+                );
                 clear_vgpr_origins(state, *vdst);
+                if let Some(orig) = next_lane_origin {
+                    state.set_vgpr_origin(*vdst, orig);
+                }
                 if (matches!(*op, 0x2FF..=0x301) || *op == 0x364)
                     && let Some(hi_v) = checked_vgpr_reg(*vdst, 1)
                 {
@@ -5617,6 +6682,18 @@ fn step_origin_state(
                                 col.out.inst_tex_keys.insert(inst_idx, key);
                             }
                         }
+                        SgprOrigin::LaneIndexedHeapDesc {
+                            def_inst_idx,
+                            origin,
+                        } => {
+                            col.direct_descriptor_defs.insert(def_inst_idx);
+                            let key = ResourceKey::LaneIndexedResourceHeap(origin);
+                            if layout.is_store {
+                                col.out.inst_storage_tex_keys.insert(inst_idx, key);
+                            } else if !layout.is_get_lod {
+                                col.out.inst_tex_keys.insert(inst_idx, key);
+                            }
+                        }
                         SgprOrigin::RawTableDesc {
                             def_inst_idx,
                             is_dynamic: true,
@@ -5675,6 +6752,18 @@ fn step_origin_state(
                                     col.out.inst_samp_keys.insert(
                                         inst_idx,
                                         ResourceKey::CbvIndexedSamplerHeap(origin),
+                                    );
+                                }
+                            }
+                            SgprOrigin::LaneIndexedHeapDesc {
+                                def_inst_idx,
+                                origin,
+                            } => {
+                                col.direct_descriptor_defs.insert(def_inst_idx);
+                                if !layout.is_get_lod {
+                                    col.out.inst_samp_keys.insert(
+                                        inst_idx,
+                                        ResourceKey::LaneIndexedSamplerHeap(origin),
                                     );
                                 }
                             }
@@ -5791,6 +6880,19 @@ fn step_origin_state(
                             col.out.vertex_storage_buf_insts.insert(inst_idx);
                         }
                     }
+                    SgprOrigin::LaneIndexedHeapDesc {
+                        def_inst_idx,
+                        origin,
+                    } => {
+                        col.direct_descriptor_defs.insert(def_inst_idx);
+                        col.out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::LaneIndexedResourceHeap(origin),
+                        );
+                        if stage == ShaderStage::Vertex && mubuf_storage_op(*op).is_some() {
+                            col.out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                    }
                     SgprOrigin::UserTable { user_sgpr, .. }
                         if (stage != ShaderStage::Vertex || !*idxen)
                             && rsrc_sgpr_opt.is_some_and(|rsrc_sgpr| {
@@ -5890,6 +6992,19 @@ fn step_origin_state(
                         col.out.inst_storage_buf_keys.insert(
                             inst_idx,
                             ResourceKey::CbvIndexedResourceHeap(origin),
+                        );
+                        if stage == ShaderStage::Vertex && mtbuf_storage_op(*op).is_some() {
+                            col.out.vertex_storage_buf_insts.insert(inst_idx);
+                        }
+                    }
+                    SgprOrigin::LaneIndexedHeapDesc {
+                        def_inst_idx,
+                        origin,
+                    } => {
+                        col.direct_descriptor_defs.insert(def_inst_idx);
+                        col.out.inst_storage_buf_keys.insert(
+                            inst_idx,
+                            ResourceKey::LaneIndexedResourceHeap(origin),
                         );
                         if stage == ShaderStage::Vertex && mtbuf_storage_op(*op).is_some() {
                             col.out.vertex_storage_buf_insts.insert(inst_idx);
@@ -6218,6 +7333,7 @@ fn analyze_vsharp_indirections(
                     table_offset: tbo.map(|v| v as i32),
                     dynamic_heap: None,
                     cbv_indexed_heap: None,
+                    lane_indexed_heap: None,
                 };
                 out.indirect_smem_cbv_keys.insert(load.inst_idx, key);
                 out.cbv_sources
@@ -6234,6 +7350,7 @@ fn analyze_vsharp_indirections(
                 table_offset: None,
                 dynamic_heap: None,
                 cbv_indexed_heap: None,
+                lane_indexed_heap: None,
             };
             for load in loads {
                 out.indirect_smem_cbv_keys.insert(load.inst_idx, key);
@@ -6812,6 +7929,7 @@ fn plan_program(
                             table_offset: None,
                             dynamic_heap: None,
                             cbv_indexed_heap: None,
+                            lane_indexed_heap: None,
                         });
                     cbv_usage
                         .entry(cbv_key)
@@ -12228,6 +13346,7 @@ impl IrEmitter {
                 table_offset: None,
                 dynamic_heap: None,
                 cbv_indexed_heap: None,
+                lane_indexed_heap: None,
             });
         let Some(&(cb_global, cb_vec4_count)) = self
             .cb_globals
@@ -24154,5 +25273,340 @@ mod tests {
             })
         );
         assert_naga_wgsl_valid(&dyn_out.wgsl);
+    }
+
+    // -- S63 (#482 / #1394 / #1413): per-lane (VGPR / v_readfirstlane_b32 waterfall) bindless heaps --
+
+    #[test]
+    fn s63_lane_indexed_resource_and_sampler_heap_waterfall_and_window_base() {
+        // Fragment shader exercising all S63 lane-indexed heap shapes (#482 / #1394):
+        //   1. Unclamped `v_readfirstlane_b32` + `s_lshl_b32 << 5` + `s_load_dwordx8` T#
+        //      -> `lane_indexed_resource_heap` { max_count: 64, shift: 5, stride: 32 }
+        //   2. VALU-masked `v_and_b32 & 0xF` + `v_readfirstlane_b32` + `s_lshl_b32 << 4` + `s_load_dwordx4` S#
+        //      -> `lane_indexed_sampler_heap` { max_count: 16, shift: 4, stride: 16 }
+        //   3. Root CBV `window_base` (`s[10:11] + 0x8`) added in SALU to SALU-masked `v_readfirstlane_b32`
+        //      (`s_and_b32 & 0x1F` -> max_count: 32) + `s_lshl_b32 << 5` + `s_add_u32` heap ptr -> V# storage buf
+        //   4. Table CBV `window_base` (`s8 + 0x40` V#, `s_buffer_load_dword +0x4`, `s_bfe_u32` off=8 w=8)
+        //      added in VALU (`v_add_nc_u32`) to `v_min_u32(v3, 7)` (max_count: 8) -> `v_readfirstlane_b32`
+        //      -> `s_lshl_b32 << 5` -> `s_load_dwordx4` V# -> `s_buffer_load_dword` CBV
+        let mut words = Vec::new();
+        // Interpolate per-lane VGPRs v2, v3
+        words.push(enc_vintrp(0, 2, 0, 0, 0));
+        words.push(enc_vintrp(1, 2, 0, 0, 1));
+        words.push(enc_vintrp(0, 3, 0, 1, 0));
+        words.push(enc_vintrp(1, 3, 0, 1, 1));
+
+        // Keep descriptor table ptr s8 in s[48:49], resource heap base s18 in s[50:51],
+        // sampler heap base s16 in s[52:53].
+        words.push(enc_sop1(0x03, 48, 8));
+        words.push(enc_sop1(0x03, 49, 0x80));
+        words.push(enc_sop1(0x03, 50, 18));
+        words.push(enc_sop1(0x03, 51, 0x80));
+        words.push(enc_sop1(0x03, 52, 16));
+        words.push(enc_sop1(0x03, 53, 0x80));
+
+        // 1) Unclamped T# from ResourceDescriptorHeap: v_readfirstlane_b32 s12, v2; s_lshl_b32 << 5; s_load_dwordx8
+        words.push(enc_vop1(0x02, 12, 256 + 2)); // v_readfirstlane_b32 s12, v2
+        words.push(enc_sop2(0x1E, 12, 12, 128 + 5)); // s_lshl_b32 s12, s12, 5
+        words.extend_from_slice(&enc_smem(0x03, 24, 25, 12, 0, false, false)); // s_load_dwordx8 s[24:31], s[50:51], s12
+
+        // 2) Masked S# from SamplerDescriptorHeap: v_and_b32 v10, 15, v3; v_readfirstlane_b32 s13, v10; << 4; s_load_dwordx4
+        words.push(enc_vop2(0x1B, 10, 128 + 15, 3)); // v_and_b32 v10, 15, v3 -> max_count = 16
+        words.push(enc_vop1(0x02, 13, 256 + 10)); // v_readfirstlane_b32 s13, v10
+        words.push(enc_sop2(0x1E, 13, 13, 128 + 4)); // s_lshl_b32 s13, s13, 4
+        words.extend_from_slice(&enc_smem(0x02, 36, 26, 13, 0, false, false)); // s_load_dwordx4 s[36:39], s[52:53], s13
+
+        // 3) Root CBV window_base (s[10:11] + 0x8) + SALU-masked lane idx (& 31 -> max_count = 32)
+        //    -> << 5 -> s_add_u32 with heap base s18 -> s_load_dwordx4 V# -> buffer_load_dword
+        words.extend_from_slice(&enc_smem(0x00, 14, 5, 0x7D, 0x08, false, false)); // s_load_dword s14, s[10:11], 0x8
+        words.push(enc_vop1(0x02, 15, 256 + 2)); // v_readfirstlane_b32 s15, v2
+        words.push(enc_sop2(0x0E, 15, 15, 128 + 31)); // s_and_b32 s15, s15, 31 -> max_count = 32
+        words.push(enc_sop2(0x00, 15, 15, 14)); // s_add_u32 s15, s15, s14 (+ window_base)
+        words.push(enc_sop2(0x1E, 15, 15, 128 + 5)); // s_lshl_b32 s15, s15, 5
+        words.push(enc_sop2(0x00, 20, 18, 15)); // s_add_u32 s20, s18, s15
+        words.push(enc_sop1(0x03, 21, 0x80)); // s21 = 0
+        words.extend_from_slice(&enc_smem(0x02, 40, 10, 0x7D, 0, false, false)); // s_load_dwordx4 s[40:43], s[20:21], 0
+
+        // 4) Table CBV window_base (s8 + 0x40 V#, +0x4, bfe off=8 width=8) added in VALU to
+        //    v_min_u32(7, v3) (max_count = 8) -> v_readfirstlane_b32 -> << 5 -> V# -> s_buffer_load_dword
+        words.extend_from_slice(&enc_smem(0x02, 32, 24, 0x7D, 0x40, false, false)); // V# @ s8+0x40 -> s[32:35]
+        words.extend_from_slice(&enc_smem(0x08, 54, 16, 0x7D, 0x04, false, false)); // s_buffer_load_dword s54, s[32:35], 4
+        words.push(enc_sop2(0x27, 54, 54, 0xFF)); // s_bfe_u32 s54, s54, (8<<16)|8
+        words.push((8u32 << 16) | 8u32);
+        words.push(enc_vop2(0x13, 11, 128 + 7, 3)); // v_min_u32 v11, 7, v3 -> max_count = 8
+        words.push(enc_vop2(0x25, 11, 54, 11)); // v_add_nc_u32 v11, s54, v11 (+ window_base)
+        words.push(enc_vop1(0x02, 55, 256 + 11)); // v_readfirstlane_b32 s55, v11
+        words.push(enc_sop2(0x1E, 55, 55, 128 + 5)); // s_lshl_b32 s55, s55, 5
+        words.extend_from_slice(&enc_smem(0x02, 56, 25, 55, 0, false, false)); // V# -> s[56:59]
+        words.extend_from_slice(&enc_smem(0x08, 60, 28, 0x7D, 0x0, false, false)); // s_buffer_load_dword s60, s[56:59], 0
+
+        // Consume T#, S#, storage buffer V#, and CBV V#, then export
+        words.extend_from_slice(&enc_mimg(0x20, 0xF, 1, 2, 4, 6, 9)); // srsrc=6 (s[24:31]), ssamp=9 (s[36:39])
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 2, 8, 10, 0x7D)); // buffer_load_dword v8, v2, s[40:43]
+        words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        words.push(enc_vop2(0x03, 5, 60, 5));
+        words.extend_from_slice(&enc_exp(0, 0xF, false, true, true, [4, 5, 6, 7]));
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Pixel);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+        assert!(
+            out.bindings.iter().all(|b| b.source.is_some()),
+            "all bindings must have reflected sources: {:?}",
+            out.bindings
+        );
+
+        let tex = out.bindings.iter().find(|b| b.kind == "texture_2d").unwrap();
+        assert_eq!(
+            tex.source,
+            Some(WgslBindingSource::LaneIndexedResourceHeap(
+                LaneIndexedHeapSource {
+                    max_count: DEFAULT_LANE_INDEXED_WINDOW,
+                    shift: 5,
+                    stride: 32,
+                    window_base: None,
+                }
+            ))
+        );
+
+        let samp = out.bindings.iter().find(|b| b.kind == "sampler").unwrap();
+        assert_eq!(
+            samp.source,
+            Some(WgslBindingSource::LaneIndexedSamplerHeap(
+                LaneIndexedHeapSource {
+                    max_count: 16,
+                    shift: 4,
+                    stride: 16,
+                    window_base: None,
+                }
+            ))
+        );
+
+        let sbuf = out
+            .bindings
+            .iter()
+            .find(|b| b.kind == "read-only-storage")
+            .unwrap();
+        assert_eq!(
+            sbuf.source,
+            Some(WgslBindingSource::LaneIndexedResourceHeap(
+                LaneIndexedHeapSource {
+                    max_count: 32,
+                    shift: 5,
+                    stride: 32,
+                    window_base: Some(CbvDwordSource {
+                        cbv: CbvRefSource::RootDescriptor { user_sgpr: 10 },
+                        byte_offset: 8,
+                        bit_offset: 0,
+                        mask: u32::MAX,
+                    }),
+                }
+            ))
+        );
+
+        let lane_cbv = out.bindings.iter().find(|b| {
+            b.kind == "uniform"
+                && b.source
+                    == Some(WgslBindingSource::LaneIndexedResourceHeap(
+                        LaneIndexedHeapSource {
+                            max_count: 8,
+                            shift: 5,
+                            stride: 32,
+                            window_base: Some(CbvDwordSource {
+                                cbv: CbvRefSource::Table {
+                                    user_sgpr: 8,
+                                    table_byte_offset: 64,
+                                },
+                                byte_offset: 4,
+                                bit_offset: 8,
+                                mask: 0xFF,
+                            }),
+                        },
+                    ))
+        });
+        assert!(
+            lane_cbv.is_some(),
+            "expected lane-indexed CBV with table window_base: {:?}",
+            out.bindings
+        );
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"source\": {\"lane_indexed_resource_heap\": {\"max_count\": 64, \"shift\": 5, \"stride\": 32}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"lane_indexed_sampler_heap\": {\"max_count\": 16, \"shift\": 4, \"stride\": 16}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"lane_indexed_resource_heap\": {\"max_count\": 32, \"shift\": 5, \"stride\": 32, \"window_base\": {\"cbv\": {\"user_sgpr\": 10, \"root_descriptor\": true}, \"byte_offset\": 8}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert!(
+            json.contains(
+                "\"source\": {\"lane_indexed_resource_heap\": {\"max_count\": 8, \"shift\": 5, \"stride\": 32, \"window_base\": {\"cbv\": {\"user_sgpr\": 8, \"table_byte_offset\": 64}, \"byte_offset\": 4, \"bit_offset\": 8, \"mask\": 255}}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    #[test]
+    fn s63_lane_indexed_heap_compute_waterfall_loop_mul_stride_and_cbv_guard() {
+        // Compute shader (user data starts at s4) testing:
+        //   1. True GFX10.3 waterfall loop with backedge (`v_readfirstlane_b32` + `v_cmp_eq_u32` +
+        //      `s_and_saveexec_b32` + `s_mul_i32 * 24` non-pow2 stride + `s_load_dwordx4` V# +
+        //      `buffer_load_dword` + `s_xor_b32 exec_lo` + `s_cbranch_execnz` loop)
+        //      -> `lane_indexed_resource_heap` { max_count: 64, shift: 0, stride: 24 }
+        //   2. `s_lshl4_add_u32` sampler heap addressing from `v_readfirstlane_b32` -> S#
+        //      + `v_lshl_add_u32` T# in VALU -> `image_sample_lz`
+        //   3. Dynamic VGPR-indexed `s_load_dwordx4` from Root CBV `s[6:7]` consumed by VALU
+        //      -> must remain `RootDescriptor { user_sgpr: 6 }` (ZERO false-positive lane heap!)
+        //   4. Uniform VGPR spill (`v_mov_b32 v20, s8; v_readfirstlane_b32 s20, v20`)
+        //      -> must still restore `Table` (not `LaneIndex`)!
+        let mut words = Vec::new();
+        // Heap bases: resource heap in s4 (s[32:33]), sampler heap in s5 (s[34:35]), table ptr in s8
+        words.push(enc_sop1(0x03, 32, 4));
+        words.push(enc_sop1(0x03, 33, 0x80));
+        words.push(enc_sop1(0x03, 34, 5));
+        words.push(enc_sop1(0x03, 35, 0x80));
+
+        // 1) Waterfall loop over v0 (thread id) with non-pow2 stride 24 (`s_mul_i32`)
+        words.push(enc_sop1(0x03, 30, 126)); // s30 = exec_lo
+        let loop_start = words.len();
+        words.push(enc_vop1(0x02, 12, 256 + 0)); // v_readfirstlane_b32 s12, v0
+        words.push(enc_vopc(0x02, 12, 0)); // v_cmp_eq_u32 vcc_lo, s12, v0
+        words.push(enc_sop1(0x3C, 31, 106)); // s_and_saveexec_b32 s31, vcc_lo
+        words.push(enc_sop2(0x26, 13, 12, 128 + 24)); // s_mul_i32 s13, s12, 24
+        words.extend_from_slice(&enc_smem(0x02, 40, 16, 13, 0, false, false)); // s_load_dwordx4 s[40:43], s[32:33], s13
+        words.extend_from_slice(&enc_mubuf_full(0x0C, 0, true, false, 0, 4, 10, 0x7D)); // buffer_load_dword v4, v0, s[40:43]
+        words.push(enc_sop2(0x12, 126, 126, 31)); // s_xor_b32 exec_lo, exec_lo, s31
+        let branch_idx = words.len();
+        let rel = (loop_start as i32) - ((branch_idx + 1) as i32);
+        words.push(enc_sopp(0x09, (rel as i16) as u16)); // s_cbranch_execnz loop_start
+        words.push(enc_sop1(0x03, 126, 30)); // s_mov_b32 exec_lo, s30
+
+        // 2) Sampler via `s_lshl4_add_u32` (shift 4, stride 16) + T# via `v_bfe_u32` (width 5 -> max_count 32)
+        //    + `v_lshl_add_u32` (`(v1 << 5) + s4`) + `v_readfirstlane_b32`
+        words.push(enc_vop1(0x02, 14, 256 + 0)); // v_readfirstlane_b32 s14, v0
+        words.push(enc_sop2(0x31, 44, 14, 5)); // s_lshl4_add_u32 s44, s14, s5 (sampler heap ptr)
+        words.push(enc_sop1(0x03, 45, 0x80)); // s45 = 0
+        words.extend_from_slice(&enc_smem(0x02, 48, 22, 0x7D, 0, false, false)); // S# -> s[48:51]
+        words.extend_from_slice(&enc_vop3(
+            0x148,
+            1,
+            256 + 0,
+            128 + 0,
+            128 + 5,
+            false,
+            0,
+            0,
+            0,
+        )); // v_bfe_u32 v1, v0, 0, 5 -> max_count = 32
+        words.extend_from_slice(&enc_vop3(
+            0x346,
+            2,
+            256 + 1,
+            128 + 5,
+            4,
+            false,
+            0,
+            0,
+            0,
+        )); // v_lshl_add_u32 v2, v1, 5, s4
+        words.push(enc_vop1(0x02, 52, 256 + 2)); // v_readfirstlane_b32 s52, v2
+        words.push(enc_sop1(0x03, 53, 0x80)); // s53 = 0
+        words.extend_from_slice(&enc_smem(0x03, 56, 26, 0x7D, 0, false, false)); // T# -> s[56:63]
+        words.extend_from_slice(&enc_mimg(0x25, 0xF, 1, 0, 8, 14, 12)); // image_sample_lz v[8:11], v[0:1], s[56:63], s[48:51]
+
+        // 3) Normal dynamically indexed Root CBV s[6:7] consumed by VALU -> MUST stay RootDescriptor(6)
+        words.push(enc_vop1(0x02, 16, 256 + 0)); // v_readfirstlane_b32 s16, v0
+        words.push(enc_sop2(0x1E, 16, 16, 128 + 4)); // s_lshl_b32 s16, s16, 4
+        words.extend_from_slice(&enc_smem(0x02, 64, 3, 16, 0, false, false)); // s_load_dwordx4 s[64:67], s[6:7], s16
+        words.push(enc_vop2(0x03, 4, 64, 4)); // v_add_f32 v4, s64, v4 (VALU consumer!)
+
+        // 4) Uniform VGPR spill of table ptr s8 -> v_readfirstlane_b32 must restore Table(s8, 0x20)
+        words.push(enc_vop1(0x01, 20, 8)); // v_mov_b32 v20, s8
+        words.push(enc_vop1(0x02, 20, 256 + 20)); // v_readfirstlane_b32 s20, v20
+        words.push(enc_sop1(0x03, 21, 0x80)); // s21 = 0
+        words.extend_from_slice(&enc_smem(0x02, 68, 10, 0x7D, 0x20, false, false)); // V# @ s8+0x20 -> s[68:71]
+        words.push(enc_vop2(0x03, 4, 256 + 4, 8));
+        words.extend_from_slice(&enc_mubuf_full(0x1C, 0, true, false, 0, 4, 17, 0x7D)); // buffer_store_dword v4, v0, s[68:71]
+        words.push(enc_sopp(0x01, 0));
+
+        let out = translate_as(&words, Rdna2StageOverride::Compute);
+        assert!(out.naga_validated);
+        assert_eq!(out.unsupported_op_count, 0, "WGSL:\n{}", out.wgsl);
+
+        let sources: Vec<_> = out.bindings.iter().filter_map(|b| b.source).collect();
+        assert!(
+            sources.contains(&WgslBindingSource::LaneIndexedResourceHeap(
+                LaneIndexedHeapSource {
+                    max_count: DEFAULT_LANE_INDEXED_WINDOW,
+                    shift: 0,
+                    stride: 24,
+                    window_base: None,
+                }
+            )),
+            "expected non-pow2 stride 24 lane-indexed storage buffer: {:?}",
+            out.bindings
+        );
+        assert!(
+            sources.contains(&WgslBindingSource::LaneIndexedSamplerHeap(
+                LaneIndexedHeapSource {
+                    max_count: DEFAULT_LANE_INDEXED_WINDOW,
+                    shift: 4,
+                    stride: 16,
+                    window_base: None,
+                }
+            )),
+            "expected s_lshl4_add_u32 lane-indexed sampler: {:?}",
+            out.bindings
+        );
+        assert!(
+            sources.contains(&WgslBindingSource::LaneIndexedResourceHeap(
+                LaneIndexedHeapSource {
+                    max_count: 32,
+                    shift: 5,
+                    stride: 32,
+                    window_base: None,
+                }
+            )),
+            "expected v_bfe_u32 + v_lshl_add_u32 lane-indexed texture: {:?}",
+            out.bindings
+        );
+        assert!(
+            sources.contains(&WgslBindingSource::RootDescriptor {
+                user_sgpr: 6,
+                table_byte_offset: None,
+            }),
+            "normal dynamic Root CBV consumed by VALU must stay RootDescriptor(6): {:?}",
+            out.bindings
+        );
+        assert!(
+            sources.contains(&WgslBindingSource::Table {
+                user_sgpr: 8,
+                table_byte_offset: 32,
+            }),
+            "uniform VGPR spill via v_readfirstlane_b32 must stay Table(8, 32): {:?}",
+            out.bindings
+        );
+
+        let json = out.to_json();
+        assert!(
+            json.contains(
+                "\"source\": {\"lane_indexed_resource_heap\": {\"max_count\": 64, \"shift\": 0, \"stride\": 24}}"
+            ),
+            "JSON:\n{json}"
+        );
+        assert_naga_wgsl_valid(&out.wgsl);
     }
 }
