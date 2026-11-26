@@ -17,6 +17,11 @@ void release(uint8_t* base, uint64_t size);
 bool commit(uint8_t* p, uint64_t len, PageProtect protect);
 // Gives committed pages back (where the platform can); the range may include uncommitted pages.
 bool decommit(uint8_t* p, uint64_t len);
+// Hints the OS that committed pages' contents are no longer needed (MEM_RESET / MADV_DONTNEED)
+// while preserving committed state and protection.
+bool reset_pages(uint8_t* p, uint64_t len);
+// Reclaims pages previously marked with reset_pages if still resident (MEM_RESET_UNDO).
+bool reset_undo_pages(uint8_t* p, uint64_t len);
 // Applies a protection to committed pages (no-op where protections cannot be enforced).
 bool protect(uint8_t* p, uint64_t len, PageProtect protect);
 bool enforces_protection();

@@ -50,6 +50,10 @@ struct MemoryBudgetInput {
     uint64_t shadow_resident = 0;
     uint64_t gpu_texture_bytes = 0;
     uint64_t gpu_parked_bytes = 0;
+    // O54: peak & reclamation telemetry (default 0 for backward compatibility).
+    uint64_t arena_peak_committed = 0;
+    uint64_t arena_reclaimed_bytes = 0;
+    uint64_t guest_heap_reclaimed_bytes = 0;
 };
 
 struct MemoryBudgetTotals {
@@ -59,6 +63,11 @@ struct MemoryBudgetTotals {
     int64_t wasm_headroom = 0;  // limit - wasm_heap (negative: over the limit)
     // Nominal page bytes the title asked for that no host memory backs yet.
     uint64_t xmem_pages_saved = 0;
+    // O54: heap slack and reclamation telemetry.
+    uint64_t guest_heap_slack = 0;
+    uint64_t arena_peak_committed = 0;
+    uint64_t arena_reclaimed_bytes = 0;
+    uint64_t guest_heap_reclaimed_bytes = 0;
 };
 
 inline MemoryBudgetTotals memory_budget_totals(const MemoryBudgetInput& in) {
@@ -69,6 +78,12 @@ inline MemoryBudgetTotals memory_budget_totals(const MemoryBudgetInput& in) {
     t.wasm_headroom = static_cast<int64_t>(kWasmLinearMemoryLimit) - static_cast<int64_t>(t.wasm_heap);
     t.xmem_pages_saved =
         in.xmem_pages_nominal > in.xmem_pages_resident ? in.xmem_pages_nominal - in.xmem_pages_resident : 0;
+    t.guest_heap_slack =
+        in.guest_heap_committed > in.guest_heap_live ? in.guest_heap_committed - in.guest_heap_live : 0;
+    t.arena_peak_committed =
+        in.arena_peak_committed >= in.arena_committed ? in.arena_peak_committed : in.arena_committed;
+    t.arena_reclaimed_bytes = in.arena_reclaimed_bytes;
+    t.guest_heap_reclaimed_bytes = in.guest_heap_reclaimed_bytes;
     return t;
 }
 
@@ -80,6 +95,10 @@ inline std::string memory_budget_json(const MemoryBudgetInput& in) {
                     ", \"guest_arena\": {\"reserved\": " + n(in.arena_reserved) +
                     ", \"committed\": " + n(in.arena_committed) + ", \"guest_heap_committed\": " +
                     n(in.guest_heap_committed) + ", \"guest_heap_live\": " + n(in.guest_heap_live) +
+                    ", \"guest_heap_slack\": " + n(t.guest_heap_slack) +
+                    ", \"arena_peak_committed\": " + n(t.arena_peak_committed) +
+                    ", \"arena_reclaimed_bytes\": " + n(t.arena_reclaimed_bytes) +
+                    ", \"guest_heap_reclaimed_bytes\": " + n(t.guest_heap_reclaimed_bytes) +
                     "}, \"xmem\": {\"heap_bytes\": " + n(in.xmem_heap_bytes) +
                     ", \"virtual_committed\": " + n(in.xmem_virtual_committed) +
                     ", \"pages_nominal\": " + n(in.xmem_pages_nominal) +

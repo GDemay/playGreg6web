@@ -861,12 +861,120 @@ void test_xmem_on_offset_arena() {
     win32::set_vmem_arena(nullptr);
 }
 
+void test_city_block_churn_and_reclaim() {
+    // O54: Simulate 3D open-world city-block load/unload churn across multiple waves.
+    VirtualMemoryArena arena(kDefaultArenaBase, 512 * kMiB, ArenaPlacement::Anywhere);
+    CHECK(arena.valid());
+    if (!arena.valid()) {
+        return;
+    }
+    GuestHeap heap(arena);
+
+    // 1. Bi-directional coalescing & exact-fit reuse across size classes.
+    const uint64_t c1 = heap.alloc(4096);
+    const uint64_t c2 = heap.alloc(8192);
+    const uint64_t c3 = heap.alloc(4096);
+    CHECK(c1 != 0 && c2 != 0 && c3 != 0);
+    CHECK(heap.free(c1));
+    CHECK(heap.free(c3));
+    CHECK(heap.free(c2));  // coalesces with both left (c1) and right (c3)
+    const uint64_t merged = heap.alloc(16384);
+    CHECK(merged != 0);
+    CHECK(heap.free(merged));
+
+    // 2. Multi-wave city-block load/unload churn: thousands of mixed small/medium/large blocks.
+    constexpr int kWaves = 4;
+    constexpr int kBlocksPerWave = 1200;
+    const uint64_t aligns[] = {16, 32, 64, 256, 4096, 65536};
+    uint64_t peak_committed_during_waves = 0;
+
+    for (int wave = 0; wave < kWaves; ++wave) {
+        struct Rec {
+            uint64_t va;
+            uint64_t size;
+            uint64_t seed;
+        };
+        std::vector<Rec> wave_blocks;
+        wave_blocks.reserve(kBlocksPerWave);
+
+        for (int i = 0; i < kBlocksPerWave; ++i) {
+            const uint64_t kind = static_cast<uint64_t>((i * 37 + wave * 13) % 100);
+            uint64_t size = 0;
+            uint64_t align = 16;
+            if (kind < 50) {
+                size = 16 + static_cast<uint64_t>((i * 19) % 512);  // small
+                align = aligns[i % 3];
+            } else if (kind < 92) {
+                size = 1024 + static_cast<uint64_t>((i * 997) % (64 * kKiB));  // medium
+                align = aligns[i % 6];
+            } else {
+                size = 192 * kKiB + static_cast<uint64_t>((i * 4093) % (256 * kKiB));  // large
+                align = aligns[(i % 2) == 0 ? 0 : 4];
+            }
+            const uint64_t va = heap.alloc(size, align, (i & 1) ? HeapFamily::XMem : HeapFamily::Crt);
+            CHECK(va != 0);
+            if (va == 0) {
+                break;
+            }
+            CHECK((va & (align - 1)) == 0);
+            const uint64_t seed = (static_cast<uint64_t>(wave) << 20) | static_cast<uint64_t>(i);
+            fill_pattern(heap, va, size, seed);
+            wave_blocks.push_back({va, size, seed});
+        }
+
+        const GuestHeapStats mid = heap.stats();
+        CHECK(mid.active_segments >= 4);  // multiple 2 MiB segments committed during wave
+        peak_committed_during_waves = std::max(peak_committed_during_waves, mid.committed_bytes);
+
+        // Verify contents and unload the entire city block in shuffled order.
+        for (size_t i = 0; i < wave_blocks.size(); ++i) {
+            const size_t idx = (i * 521) % wave_blocks.size();
+            const Rec& r = wave_blocks[idx];
+            CHECK(check_pattern(heap, r.va, r.size, r.seed));
+            CHECK(heap.free(r.va));
+        }
+
+        const GuestHeapStats after_wave = heap.stats();
+        CHECK(after_wave.live_blocks == 0);
+        CHECK(after_wave.live_bytes == 0);
+        // Automatic reclamation keeps at most 1 hot cached empty 2 MiB segment.
+        CHECK(after_wave.active_segments <= 1);
+        CHECK(after_wave.committed_bytes <= GuestHeap::kSegmentSize);
+        CHECK(arena.committed_bytes() <= GuestHeap::kSegmentSize);
+        CHECK(after_wave.segments_reclaimed >= 3);
+        CHECK(after_wave.reclaimed_bytes >= 3 * GuestHeap::kSegmentSize);
+    }
+
+    CHECK(peak_committed_during_waves >= 8 * kMiB);
+    CHECK(arena.peak_committed_bytes() >= peak_committed_during_waves);
+    CHECK(arena.decommitted_bytes_total() >= 3 * GuestHeap::kSegmentSize);
+    CHECK(arena.reclaimed_pages_reused() > 0);
+
+    // Explicit reclaim releases even the 1 hot cached empty segment.
+    const uint64_t extra_reclaimed = heap.reclaim_empty_segments();
+    CHECK(extra_reclaimed == GuestHeap::kSegmentSize);
+    CHECK(heap.reclaim_empty_segments() == 0);
+    const GuestHeapStats final_st = heap.stats();
+    CHECK(final_st.active_segments == 0);
+    CHECK(final_st.committed_bytes == 0);
+    CHECK(arena.committed_bytes() == 0);
+
+    // Allocator works cleanly after full reclamation.
+    const uint64_t post = heap.alloc(256, 64, HeapFamily::Crt, kHeapZeroMemory);
+    CHECK(post != 0 && (post & 63) == 0);
+    CHECK(heap.stats().active_segments == 1);
+    CHECK(heap.free(post));
+    CHECK(heap.reclaim_empty_segments() == GuestHeap::kSegmentSize);
+    CHECK(arena.committed_bytes() == 0);
+}
+
 }  // namespace
 
 int main() {
     std::printf("test_guest_heap\n");
     test_core_on_process_arena();
     test_core_on_offset_arena();
+    test_city_block_churn_and_reclaim();
     test_crt_family();
     test_crt_on_offset_arena();
     test_xmem_attributes_and_family();

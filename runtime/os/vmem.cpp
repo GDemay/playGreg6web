@@ -234,20 +234,77 @@ bool VirtualMemoryArena::is_valid_protect(PageProtect protect) {
     }
 }
 
+void VirtualMemoryArena::invalidate_lookup_cache_locked() const {
+    last_res_ = nullptr;
+    lookup_cache_.fill(nullptr);
+}
+
+void VirtualMemoryArena::mark_decommitted_page_locked(uint64_t va,
+                                                      uint64_t& cached_key,
+                                                      DecommitChunk*& cached_chunk) {
+    if (va < space_base_) {
+        return;
+    }
+    const uint64_t rel = va - space_base_;
+    const uint64_t key = rel >> kDecommitChunkShift;
+    if (cached_chunk == nullptr || key != cached_key) {
+        cached_key = key;
+        cached_chunk = &decommitted_chunks_[key];
+    }
+    const size_t idx = static_cast<size_t>((rel >> 12) & 0xFFFu);
+    const uint64_t mask = uint64_t{1} << (idx & 63u);
+    if ((cached_chunk->bits[idx >> 6] & mask) == 0) {
+        cached_chunk->bits[idx >> 6] |= mask;
+        ++cached_chunk->count;
+    }
+}
+
+bool VirtualMemoryArena::consume_reclaimed_page_locked(uint64_t va,
+                                                       uint64_t& cached_key,
+                                                       DecommitChunk*& cached_chunk) {
+    if (decommitted_chunks_.empty() || va < space_base_) {
+        return false;
+    }
+    const uint64_t rel = va - space_base_;
+    const uint64_t key = rel >> kDecommitChunkShift;
+    if (cached_chunk == nullptr || key != cached_key) {
+        auto it = decommitted_chunks_.find(key);
+        if (it == decommitted_chunks_.end()) {
+            cached_key = key;
+            cached_chunk = nullptr;
+            return false;
+        }
+        cached_key = key;
+        cached_chunk = &it->second;
+    }
+    const size_t idx = static_cast<size_t>((rel >> 12) & 0xFFFu);
+    const uint64_t mask = uint64_t{1} << (idx & 63u);
+    if ((cached_chunk->bits[idx >> 6] & mask) == 0) {
+        return false;
+    }
+    cached_chunk->bits[idx >> 6] &= ~mask;
+    if (--cached_chunk->count == 0) {
+        decommitted_chunks_.erase(key);
+        cached_chunk = nullptr;
+    }
+    return true;
+}
+
 VirtualMemoryArena::Reservation* VirtualMemoryArena::find_reservation_locked(uint64_t addr) {
-    auto it = reservations_.upper_bound(addr);
-    if (it == reservations_.begin()) {
-        return nullptr;
-    }
-    --it;
-    Reservation& res = it->second;
-    if (addr >= res.base && addr < res.base + res.size) {
-        return &res;
-    }
-    return nullptr;
+    return const_cast<Reservation*>(
+        static_cast<const VirtualMemoryArena*>(this)->find_reservation_locked(addr));
 }
 
 const VirtualMemoryArena::Reservation* VirtualMemoryArena::find_reservation_locked(uint64_t addr) const {
+    if (last_res_ != nullptr && addr >= last_res_->base && addr < last_res_->base + last_res_->size) {
+        return last_res_;
+    }
+    const size_t slot = static_cast<size_t>((addr >> 20) & (kLookupCacheSize - 1));
+    const Reservation* cached = lookup_cache_[slot];
+    if (cached != nullptr && addr >= cached->base && addr < cached->base + cached->size) {
+        last_res_ = cached;
+        return cached;
+    }
     auto it = reservations_.upper_bound(addr);
     if (it == reservations_.begin()) {
         return nullptr;
@@ -255,6 +312,8 @@ const VirtualMemoryArena::Reservation* VirtualMemoryArena::find_reservation_lock
     --it;
     const Reservation& res = it->second;
     if (addr >= res.base && addr < res.base + res.size) {
+        lookup_cache_[slot] = &res;
+        last_res_ = &res;
         return &res;
     }
     return nullptr;
@@ -279,8 +338,8 @@ bool VirtualMemoryArena::pages_allow_locked(uint64_t addr, size_t len, bool need
         const size_t last_page = static_cast<size_t>((stop - 1u - res->base) / kPageSize);
         for (size_t p = first_page; p <= last_page; ++p) {
             const PageMeta& page = res->pages[p];
-            if (page.state != MemState::Commit ||
-                !(need_write ? is_writable(page.protect) : is_readable(page.protect))) {
+            if (page.state() != MemState::Commit ||
+                !(need_write ? is_writable(page.protect()) : is_readable(page.protect()))) {
                 return false;
             }
         }
@@ -429,18 +488,18 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
     // the bookkeeping never disagrees with the backing.
     uint64_t newly_committed_bytes = 0;
     for (size_t i = first_page; i < last_page;) {
-        if (res->pages[i].state == MemState::Commit) {
+        if (res->pages[i].state() == MemState::Commit) {
             ++i;
             continue;
         }
         const size_t run_start = i;
-        while (i < last_page && res->pages[i].state != MemState::Commit) {
+        while (i < last_page && res->pages[i].state() != MemState::Commit) {
             ++i;
         }
         const uint64_t run_bytes = static_cast<uint64_t>(i - run_start) * kPageSize;
         if (!backing::commit(run_ptr(run_start), run_bytes, protect)) {
             for (size_t p = first_page; p < run_start; ++p) {
-                if (res->pages[p].state != MemState::Commit) {
+                if (res->pages[p].state() != MemState::Commit) {
                     backing::decommit(run_ptr(p), kPageSize);
                 }
             }
@@ -452,24 +511,35 @@ bool VirtualMemoryArena::commit_locked(uint64_t addr, uint64_t size, PageProtect
 
     // Already committed pages keep their data and take the new protection.
     for (size_t i = first_page; i < last_page;) {
-        if (res->pages[i].state != MemState::Commit || res->pages[i].protect == protect) {
+        if (res->pages[i].state() != MemState::Commit || res->pages[i].protect() == protect) {
             ++i;
             continue;
         }
         const size_t run_start = i;
-        while (i < last_page && res->pages[i].state == MemState::Commit &&
-               res->pages[i].protect != protect) {
+        while (i < last_page && res->pages[i].state() == MemState::Commit &&
+               res->pages[i].protect() != protect) {
             ++i;
         }
         backing::protect(run_ptr(run_start), static_cast<uint64_t>(i - run_start) * kPageSize,
                          protect);
     }
 
+    const bool track_reuse = newly_committed_bytes != 0 && !decommitted_chunks_.empty();
+    uint64_t cached_key = ~uint64_t{0};
+    DecommitChunk* cached_chunk = nullptr;
     for (size_t p = first_page; p < last_page; ++p) {
-        res->pages[p].state = MemState::Commit;
-        res->pages[p].protect = protect;
+        if (track_reuse && res->pages[p].state() != MemState::Commit) {
+            if (consume_reclaimed_page_locked(res->base + p * kPageSize, cached_key, cached_chunk)) {
+                ++reclaimed_pages_reused_;
+            }
+        }
+        res->pages[p].set_state(MemState::Commit);
+        res->pages[p].set_protect(protect);
     }
     committed_bytes_ += newly_committed_bytes;
+    if (committed_bytes_ > peak_committed_bytes_) {
+        peak_committed_bytes_ = committed_bytes_;
+    }
     if (newly_committed != nullptr) {
         *newly_committed = newly_committed_bytes;
     }
@@ -507,15 +577,19 @@ bool VirtualMemoryArena::decommit_locked(uint64_t addr, uint64_t size) {
     const size_t last_page = static_cast<size_t>((end - res->base) / kPageSize);
 
     uint64_t freed_bytes = 0;
+    uint64_t cached_key = ~uint64_t{0};
+    DecommitChunk* cached_chunk = nullptr;
     for (size_t p = first_page; p < last_page; ++p) {
-        if (res->pages[p].state == MemState::Commit) {
+        if (res->pages[p].state() == MemState::Commit) {
             freed_bytes += kPageSize;
+            mark_decommitted_page_locked(res->base + p * kPageSize, cached_key, cached_chunk);
         }
-        res->pages[p].state = MemState::Reserve;
-        res->pages[p].protect = PageProtect::NoAccess;
+        res->pages[p].set_state(MemState::Reserve);
+        res->pages[p].set_protect(PageProtect::NoAccess);
     }
     if (freed_bytes != 0) {
         backing::decommit(translate(start), end - start);
+        decommitted_bytes_total_ += freed_bytes;
     }
     committed_bytes_ -= freed_bytes;
     return true;
@@ -528,24 +602,33 @@ bool VirtualMemoryArena::release_locked(uint64_t base_addr) {
     }
     const Reservation& res = it->second;
     uint64_t res_committed = 0;
-    for (const auto& page : res.pages) {
-        if (page.state == MemState::Commit) {
+    uint64_t cached_key = ~uint64_t{0};
+    DecommitChunk* cached_chunk = nullptr;
+    for (size_t p = 0; p < res.pages.size(); ++p) {
+        if (res.pages[p].state() == MemState::Commit) {
             res_committed += kPageSize;
+            if (!res.shared) {
+                mark_decommitted_page_locked(res.base + p * kPageSize, cached_key, cached_chunk);
+            }
         }
     }
     if (res.shared) {
         // O36: views still mapped go away (64 KiB at a time, as they were mapped).
         constexpr size_t kPagesPerView = static_cast<size_t>(kAllocationGranularity / kPageSize);
         for (size_t p = 0; p < res.pages.size(); p += kPagesPerView) {
-            if (res.pages[p].state == MemState::Commit) {
+            if (res.pages[p].state() == MemState::Commit) {
                 backing::unmap_shared_page(translate(res.base + p * kPageSize), kAllocationGranularity);
             }
         }
     } else if (res_committed != 0) {
         backing::decommit(translate(res.base), res.size);
     }
+    if (res_committed != 0) {
+        decommitted_bytes_total_ += res_committed;
+    }
     reserved_bytes_ -= res.size;
     committed_bytes_ -= res_committed;
+    invalidate_lookup_cache_locked();
     reservations_.erase(it);
     return true;
 }
@@ -611,7 +694,7 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
             (size % kAllocationGranularity) != 0 || va - res->base > res->size - size) {
             return false;
         }
-        was_shown = res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state == MemState::Commit;
+        was_shown = res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state() == MemState::Commit;
     }
     if (was_shown) {
         backing::unmap_shared_page(translate(va), size);  // another page was shown here
@@ -626,6 +709,7 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
     const size_t count = static_cast<size_t>(size / kPageSize);
     if (was_shown) {
         committed_bytes_ -= size;
+        decommitted_bytes_total_ += size;
     }
     const PageMeta meta = ok ? PageMeta{MemState::Commit, PageProtect::ReadWrite}
                              : PageMeta{MemState::Reserve, PageProtect::NoAccess};
@@ -636,6 +720,9 @@ bool VirtualMemoryArena::map_shared(uint64_t va, void* page, uint64_t size) {
         return false;
     }
     committed_bytes_ += size;
+    if (committed_bytes_ > peak_committed_bytes_) {
+        peak_committed_bytes_ = committed_bytes_;
+    }
     notify(*this, ArenaEvent::Commit, va, size, PageProtect::ReadWrite, true);
     return true;
 }
@@ -647,7 +734,7 @@ bool VirtualMemoryArena::unmap_shared(uint64_t va, uint64_t size) {
         if (res == nullptr || !res->shared || size == 0 || va - res->base > res->size - size) {
             return false;
         }
-        if (res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state != MemState::Commit) {
+        if (res->pages[static_cast<size_t>((va - res->base) / kPageSize)].state() != MemState::Commit) {
             return true;
         }
     }
@@ -663,6 +750,7 @@ bool VirtualMemoryArena::unmap_shared(uint64_t va, uint64_t size) {
         res->pages[p] = PageMeta{MemState::Reserve, PageProtect::NoAccess};
     }
     committed_bytes_ -= size;
+    decommitted_bytes_total_ += size;
     notify(*this, ArenaEvent::Decommit, va, size, PageProtect::NoAccess, true);
     return true;
 }
@@ -726,7 +814,7 @@ bool VirtualMemoryArena::protect(uint64_t addr,
     const size_t last_page = static_cast<size_t>((end - res->base) / kPageSize);
 
     for (size_t p = first_page; p < last_page; ++p) {
-        if (res->pages[p].state != MemState::Commit) {
+        if (res->pages[p].state() != MemState::Commit) {
             return false;
         }
     }
@@ -735,10 +823,10 @@ bool VirtualMemoryArena::protect(uint64_t addr,
         return false;
     }
     if (old_protect != nullptr) {
-        *old_protect = res->pages[first_page].protect;
+        *old_protect = res->pages[first_page].protect();
     }
     for (size_t p = first_page; p < last_page; ++p) {
-        res->pages[p].protect = new_protect;
+        res->pages[p].set_protect(new_protect);
     }
     return true;
 }
@@ -754,7 +842,8 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
                                            uint64_t size,
                                            uint32_t alloc_type,
                                            PageProtect protect) {
-    constexpr uint32_t kAllowed = kMemReserve | kMemCommit | kMemReservePlaceholder | kMemReplacePlaceholder;
+    constexpr uint32_t kAllowed = kMemReserve | kMemCommit | kMemReservePlaceholder |
+                                  kMemReplacePlaceholder | kMemReset | kMemResetUndo;
     if (size == 0 || alloc_type == 0 || (alloc_type & ~kAllowed) != 0) {
         return 0;
     }
@@ -763,6 +852,38 @@ uint64_t VirtualMemoryArena::virtual_alloc(uint64_t addr,
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+
+    if ((alloc_type & (kMemReset | kMemResetUndo)) != 0) {
+        // MEM_RESET and MEM_RESET_UNDO cannot be combined with any other flag and require an
+        // existing committed range; committed state and protection are preserved.
+        if (alloc_type != kMemReset && alloc_type != kMemResetUndo) {
+            return 0;
+        }
+        if (addr == 0 || addr > UINT64_MAX - size) {
+            return 0;
+        }
+        Reservation* res = find_reservation_locked(addr);
+        if (res == nullptr || res->placeholder || res->shared) {
+            return 0;
+        }
+        const uint64_t start = align_down(addr, kPageSize);
+        uint64_t end = 0;
+        if (!align_up_checked(addr + size, kPageSize, end) || start < res->base ||
+            end > res->base + res->size) {
+            return 0;
+        }
+        const size_t first_page = static_cast<size_t>((start - res->base) / kPageSize);
+        const size_t last_page = static_cast<size_t>((end - res->base) / kPageSize);
+        for (size_t p = first_page; p < last_page; ++p) {
+            if (res->pages[p].state() != MemState::Commit) {
+                return 0;
+            }
+        }
+        const bool ok = alloc_type == kMemReset
+                            ? backing::reset_pages(translate(start), end - start)
+                            : backing::reset_undo_pages(translate(start), end - start);
+        return ok ? start : 0;
+    }
 
     if ((alloc_type & kMemReservePlaceholder) != 0) {
         // A new placeholder: reserve only, no access, allocation-granularity aligned.
@@ -857,12 +978,14 @@ bool VirtualMemoryArena::split_placeholder_locked(uint64_t addr, uint64_t size) 
         found->placeholder = true;
         found->replaced_placeholder = false;
         found->allocation_protect = PageProtect::NoAccess;
+        invalidate_lookup_cache_locked();
         return true;
     }
     if (addr == base && size == found->size) {
         return true;  // already exactly this placeholder
     }
     // [base, addr) / [addr, addr + size) / [addr + size, end): each non-empty piece is a placeholder.
+    invalidate_lookup_cache_locked();
     Reservation whole = std::move(*found);
     reservations_.erase(base);
     auto piece = [&](uint64_t from, uint64_t to) {
@@ -905,6 +1028,7 @@ bool VirtualMemoryArena::coalesce_placeholders_locked(uint64_t addr, uint64_t si
     if (bases.size() < 2) {
         return bases.size() == 1;  // a single placeholder is already coalesced
     }
+    invalidate_lookup_cache_locked();
     Reservation merged;
     merged.base = addr;
     merged.size = size;
@@ -960,16 +1084,16 @@ MemoryBasicInfo VirtualMemoryArena::query(uint64_t addr) const {
         const PageMeta& first = res->pages[idx];
         size_t end_idx = idx + 1;
         while (end_idx < res->pages.size() &&
-               res->pages[end_idx].state == first.state &&
-               res->pages[end_idx].protect == first.protect) {
+               res->pages[end_idx].state() == first.state() &&
+               res->pages[end_idx].protect() == first.protect()) {
             ++end_idx;
         }
         MemoryBasicInfo info;
         info.base_address = page_addr;
         info.allocation_base = res->base;
         info.region_size = static_cast<uint64_t>(end_idx - idx) * kPageSize;
-        info.state = first.state;
-        info.protect = first.protect;
+        info.state = first.state();
+        info.protect = first.protect();
         info.allocation_protect = res->allocation_protect;
         return info;
     }
@@ -1042,6 +1166,21 @@ uint64_t VirtualMemoryArena::reserved_bytes() const {
 uint64_t VirtualMemoryArena::committed_bytes() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return committed_bytes_;
+}
+
+uint64_t VirtualMemoryArena::peak_committed_bytes() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return peak_committed_bytes_;
+}
+
+uint64_t VirtualMemoryArena::decommitted_bytes_total() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return decommitted_bytes_total_;
+}
+
+uint64_t VirtualMemoryArena::reclaimed_pages_reused() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return reclaimed_pages_reused_;
 }
 
 size_t VirtualMemoryArena::reservation_count() const {
