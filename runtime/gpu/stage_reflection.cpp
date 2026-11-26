@@ -570,7 +570,11 @@ std::string binding_key(const ReflectedBinding& b) {
                          : b.cbv == ReflectedCbv::RootConstants ? std::string("root constants")
                                                                  : "table + " + std::to_string(b.table_byte_offset)) +
                         " at s" + std::to_string(b.user_sgpr) + ")[" + std::to_string(b.cb_byte_offset) + "]") +
-                 " + lane) << " + std::to_string(b.heap_shift) + "] x " + std::to_string(b.lane_max_count);
+                 " + lane)" +
+                 (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)
+                      ? " * " + std::to_string(b.heap_stride)
+                      : " << " + std::to_string(b.heap_shift)) +
+                 "] x " + std::to_string(b.lane_max_count);
             break;
     }
     return k;
@@ -920,6 +924,11 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
                 lb.join.heap_index_source = from;
                 lb.join.heap_shift = b.heap_shift;
+                // S63 emits a non-power-of-two scale (s_mul_i32 * 24) as shift 0 plus that stride;
+                // a power-of-two stride is the shift itself.
+                if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
+                    lb.join.heap_stride = b.heap_stride;
+                }
                 lb.join.array_size = b.lane_max_count;
                 if (b.lane_has_window_base) {
                     lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
