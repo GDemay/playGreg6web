@@ -184,7 +184,7 @@ def scan(root: CacheRoot) -> list:
                 continue
             size, used, lock = _tree(Path(c.path))
             try:
-                used = max(used, _used(c.stat(follow_symlinks=False)))
+                used = max(used, c.stat(follow_symlinks=False).st_mtime)  # not atime: listing a dir touches it
             except OSError:
                 pass
             entries.append(Entry([Path(c.path)], size, used, lock or ".tmp" in c.name))
