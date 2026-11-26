@@ -164,7 +164,9 @@ enum class DxgiFormat : uint32_t {
     BC7_UNORM_SRGB = 99,
     // 100..114 are video/palettized formats (AYUV .. P8/A8P8); none has a WebGPU equivalent.
     B4G4R4A4_UNORM = 115,
-    // Xbox-only (d3d12_x / d3d12_xs) 16-bit depth + 8-bit stencil family.
+    // Xbox-only (d3d12_x / d3d12_xs) 10-bit float HDR and 16-bit depth + 8-bit stencil families.
+    R10G10B10_7E3_A2_FLOAT = 116,
+    R10G10B10_6E4_A2_FLOAT = 117,
     D16_UNORM_S8_UINT = 118,
     R16_UNORM_X8_TYPELESS = 119,
     X16_TYPELESS_G8_UINT = 120,
@@ -783,6 +785,9 @@ struct VertexFormatMapping {
 // DXGI -> GPUVertexFormat for input-assembler elements. 3-component 8/16-bit, R11G11B10_FLOAT,
 // R10G10B10A2_UINT, sRGB and packed 16-bit formats have no WebGPU vertex format and report unsupported.
 VertexFormatMapping map_vertex_format(DxgiFormat format) noexcept;
+// Byte stride of a DXGI format when placed in an IA vertex buffer (0 when unknown/compressed).
+// Used so APPEND_ALIGNED_ELEMENT offsets stay accurate even after an unsupported/typeless element.
+uint32_t dxgi_vertex_element_byte_size(DxgiFormat format) noexcept;
 
 // Enum lowering helpers (exposed for tests and for the layer above). Invalid inputs return nullopt.
 std::optional<WgpuBlendFactor> map_blend_factor(D3D12Blend blend) noexcept;
@@ -999,7 +1004,8 @@ struct PipelineVariantState {
     DxgiFormat dsv_format = DxgiFormat::UNKNOWN;
     uint32_t sample_count = 1;
     WgpuIndexFormat index_format = WgpuIndexFormat::Undefined;  // bound index buffer format
-    uint8_t reserved[3] = {};
+    uint8_t dsv_flags = 0;                                      // D3D12DsvFlags when BoundTargets is set
+    uint8_t reserved[2] = {};
     uint32_t bound_vertex_slots = 0;  // bit i set = vertex_strides[i] comes from IASetVertexBuffers
     uint32_t vertex_strides[kMaxVertexBuffers] = {};
 };

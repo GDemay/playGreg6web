@@ -15,9 +15,11 @@
 // User data -> root parameter (console ABI, established from the stage metadata of every pipeline
 // the title creates): root parameters occupy consecutive user-data SGPRs from s8 in graphics
 // stages and from s4 in compute stages; a descriptor table takes one SGPR (32-bit pointer), root
-// constants one per 32-bit value and a root descriptor two. A table's descriptors are 32-byte slots:
-// slot = table byte offset / 32, slots numbered as D3D12 numbers them (ranges appended in order
-// unless they give an explicit offset).
+// constants one per 32-bit value and a root descriptor two. CBV_SRV_UAV table descriptors are
+// 32-byte slots (`slot = table_byte_offset / 32`); sampler table descriptors are 16-byte slots
+// (`slot = table_byte_offset / 16`), matching `descriptor_handle_increment_size` and GFX10 S# size.
+// Slots are numbered as D3D12 numbers them (ranges appended in order unless they give an explicit
+// offset).
 //
 // Source: a sidecar `<pack>.reflect.json` next to the shader pack, keyed by the pack key (stage
 // identity): {"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x<key>": {

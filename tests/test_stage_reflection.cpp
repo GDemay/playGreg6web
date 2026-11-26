@@ -2,6 +2,7 @@
 // build vertex attributes and pipeline layouts for pack-resolved stages (G62, #651).
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -1943,6 +1944,532 @@ void test_per_stage_user_data_base_and_shifted_fallback() {
     CHECK(bad_stats.shifted_user_data_base_stages == 0);
 }
 
+// PR #1868 regression (#663, #651): disjoint fragment @group(0) @binding(64..127) joining,
+// ShaderBinding::binding invariant, BindGroupPlan + BindGroupCache null/resource emission, and
+// StateBridgeDevice layout interning with high binding numbers.
+void test_fragment_high_bindings_64_to_95() {
+    // Root signature with CBV_SRV_UAV table at s8 (param 0), Sampler table at s9 (param 1),
+    // 2 root constants at s10..s11 (param 2), root CBV at s12..s13 (param 3).
+    d3d::RootSignatureDesc rs_desc;
+    d3d::RootParameterDesc res_tbl;
+    res_tbl.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc srv_r;
+    srv_r.range_type = d3d::DescriptorRangeType::Srv;
+    srv_r.num_descriptors = 4;
+    srv_r.base_shader_register = 0;
+    d3d::DescriptorRangeDesc cbv_r;
+    cbv_r.range_type = d3d::DescriptorRangeType::Cbv;
+    cbv_r.num_descriptors = 2;
+    cbv_r.base_shader_register = 0;
+    res_tbl.ranges = {srv_r, cbv_r};
+
+    d3d::RootParameterDesc smp_tbl;
+    smp_tbl.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc smp_r;
+    smp_r.range_type = d3d::DescriptorRangeType::Sampler;
+    smp_r.num_descriptors = 4;
+    smp_r.base_shader_register = 0;
+    smp_tbl.ranges = {smp_r};
+
+    d3d::RootParameterDesc rc;
+    rc.parameter_type = d3d::RootParameterType::Constants32Bit;
+    rc.shader_register = 10;
+    rc.num_32bit_values = 2;
+
+    d3d::RootParameterDesc rcbv;
+    rcbv.parameter_type = d3d::RootParameterType::Cbv;
+    rcbv.shader_register = 11;
+
+    rs_desc.parameters = {res_tbl, smp_tbl, rc, rcbv};
+
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x0000000000006401": {
+      "stage": "vertex",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "min_binding_size_bytes": 64,
+         "source": {"user_sgpr": 8, "table_byte_offset": 128}},
+        {"group": 0, "binding": 1, "kind": "uniform", "min_binding_size_bytes": 8,
+         "source": {"user_sgpr": 10, "root_constants": true}}
+      ]
+    },
+    "0x0000000000006402": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 64, "kind": "texture", "view_dimension": "2d",
+         "source": {"user_sgpr": 8, "table_byte_offset": 0}},
+        {"group": 0, "binding": 65, "kind": "sampler",
+         "source": {"user_sgpr": 9, "table_byte_offset": 16}},
+        {"group": 0, "binding": 72, "kind": "uniform", "min_binding_size_bytes": 32,
+         "source": {"user_sgpr": 12, "root_descriptor": true}},
+        {"group": 0, "binding": 80, "kind": "texture", "view_dimension": "2d",
+         "source": {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 12, "root_descriptor": true},
+                                                  "byte_offset": 0, "shift": 5}}},
+        {"group": 0, "binding": 88, "kind": "texture", "view_dimension": "2d",
+         "source": {"lane_indexed_resource_heap": {"max_count": 16, "shift": 5}}},
+        {"group": 0, "binding": 95, "kind": "sampler",
+         "source": {"inline_sampler": {"sdwords": [146, 15728640, 139460608, 0]}}},
+        {"group": 0, "binding": 127, "kind": "texture", "view_dimension": "2d",
+         "source": {"unresolved": "cb_dynamic_offset"}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &idx, &error));
+    CHECK(error.empty() && idx.size() == 2);
+
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs_desc, false,
+                               {{GpuShaderStageBits::Vertex, &idx.at(0x6401)},
+                                {GpuShaderStageBits::Fragment, &idx.at(0x6402)}},
+                               &layout, &report, &stats));
+    CHECK(report.empty() && layout.groups.size() == 1 && layout.groups[0].bindings.size() == 9);
+    CHECK(stats.unresolved_bindings == 1 && stats.lane_indexed_bindings == 1 && stats.lane_indexed_arrays == 0);
+
+    // Every LayoutBinding preserves exact binding number in BOTH entry.binding and join.binding.
+    for (const uint32_t bn : {0u, 1u, 64u, 65u, 72u, 80u, 88u, 95u, 127u}) {
+        const bridge::LayoutBinding* lb = find(layout, 0, bn);
+        CHECK(lb != nullptr);
+        if (lb != nullptr) {
+            CHECK(lb->entry.binding == bn && lb->join.binding == bn);
+        }
+    }
+    const bridge::LayoutBinding* ps_smp = find(layout, 0, 65);
+    CHECK(ps_smp != nullptr && ps_smp->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          ps_smp->join.shader_register == 1 && ps_smp->join.table_parameter == d3d::kNoIndex);
+    const bridge::LayoutBinding* ps_unres = find(layout, 0, 127);
+    CHECK(ps_unres != nullptr && ps_unres->join.shader_register == d3d::kNoIndex &&
+          ps_unres->join.register_space == d3d::kNoIndex && ps_unres->join.table_parameter == d3d::kNoIndex);
+
+    // Build a real BindGroupPlan directly from lb.join (without manually overwriting sb.binding!)
+    // and verify BindGroupCache produces resource_id == 0 (Null) for @binding(127) and preserves
+    // all binding numbers 64..127.
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+    std::vector<d3d::ShaderBinding> sbs;
+    for (const bridge::LayoutBinding& lb : layout.groups[0].bindings) {
+        sbs.push_back(lb.join);
+    }
+    const d3d::BindGroupPlan plan =
+        d3d::BindGroupPlan::build(rs, sbs, d3d::WebGpuStage::Vertex | d3d::WebGpuStage::Fragment);
+    CHECK(plan.entries().size() == 9 && plan.unresolved_count() == 1);
+    bool saw_64 = false, saw_65 = false, saw_95 = false, saw_127_unres = false;
+    for (const d3d::PlanEntry& e : plan.entries()) {
+        if (e.binding == 64) {
+            saw_64 = e.source == d3d::PlanSource::DescriptorTable && e.root_parameter_index == 0 && e.table_offset == 0;
+        } else if (e.binding == 65) {
+            saw_65 = e.source == d3d::PlanSource::DescriptorTable && e.root_parameter_index == 1 && e.table_offset == 1;
+        } else if (e.binding == 95) {
+            saw_95 = e.source == d3d::PlanSource::InlineSampler;
+        } else if (e.binding == 127) {
+            saw_127_unres = e.source == d3d::PlanSource::Unresolved;
+        }
+    }
+    CHECK(saw_64 && saw_65 && saw_95 && saw_127_unres);
+
+    // Also verify StateBridgeDevice accepts the joined @binding(64..127) layout & creates a usable graphics PSO.
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice dev(heaps);
+    dev.register_shader_module(0x6401, 101);
+    dev.register_shader_module(0x6402, 102);
+    dev.register_pipeline_layout(0x6401, 0x6402, layout);
+    pso::D3D12GraphicsPsoDesc pdesc{};
+    pdesc.vs = 0x6401;
+    pdesc.ps = 0x6402;
+    pdesc.NumRenderTargets = 1;
+    pdesc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    auto gpso = dev.create_graphics_pipeline_state(pdesc, &rs);
+    CHECK(gpso != nullptr && !pso::is_fatal(gpso->pso().diagnostics()));
+}
+
+// Sampler descriptor tables use 16-byte S# slots (matching descriptor_handle_increment_size(Sampler) == 16),
+// while CBV_SRV_UAV tables remain 32-byte slots.
+void test_sampler_table_16_byte_slots() {
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc smp_tbl;
+    smp_tbl.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc smp_r;
+    smp_r.range_type = d3d::DescriptorRangeType::Sampler;
+    smp_r.num_descriptors = 6;
+    smp_r.base_shader_register = 0;
+    smp_r.register_space = 2;
+    smp_tbl.ranges = {smp_r};
+
+    d3d::RootParameterDesc res_tbl;
+    res_tbl.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc srv_r;
+    srv_r.range_type = d3d::DescriptorRangeType::Srv;
+    srv_r.num_descriptors = 4;
+    srv_r.base_shader_register = 0;
+    res_tbl.ranges = {srv_r};
+    rs.parameters = {smp_tbl, res_tbl};
+
+    StageReflection ps;
+    ps.stage = ReflectedStage::Fragment;
+    auto make_smp = [](uint32_t binding, uint32_t byte_off) {
+        ReflectedBinding b;
+        b.group = 0;
+        b.binding = binding;
+        b.kind = ReflectedBindingKind::Sampler;
+        b.source = ReflectedSource::Table;
+        b.user_sgpr = 8;
+        b.table_byte_offset = byte_off;
+        return b;
+    };
+    ps.bindings = {
+        make_smp(64, 0),    // slot 0 -> s0
+        make_smp(65, 16),   // slot 1 -> s1 (odd 16-byte slot!)
+        make_smp(66, 32),   // slot 2 -> s2 (NOT slot 1!)
+        make_smp(67, 48),   // slot 3 -> s3
+        make_smp(68, 80),   // slot 5 -> s5
+        make_smp(69, 144),  // slot 9 -> past declared 6 slots -> outside_rs slot 9
+    };
+
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(report.empty() && stats.table_slots_outside_rs == 1);
+    const std::pair<uint32_t, uint32_t> expected_regs[] = {{64, 0}, {65, 1}, {66, 2}, {67, 3}, {68, 5}};
+    for (const auto& [bn, reg] : expected_regs) {
+        const bridge::LayoutBinding* lb = find(layout, 0, bn);
+        CHECK(lb != nullptr && lb->join.register_class == d3d::DescriptorRangeType::Sampler &&
+              lb->join.shader_register == reg && lb->join.register_space == 2 &&
+              lb->join.table_parameter == d3d::kNoIndex);
+    }
+    const bridge::LayoutBinding* oob = find(layout, 0, 69);
+    CHECK(oob != nullptr && oob->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          oob->join.table_parameter == 0 && oob->join.table_slot == 9);
+
+    // Non-16-byte sampler offset (8) and non-32-byte resource offset (16) still fail cleanly.
+    StageReflection bad;
+    bad.stage = ReflectedStage::Fragment;
+    ReflectedBinding bad_smp = make_smp(64, 8);
+    ReflectedBinding bad_res;
+    bad_res.group = 0;
+    bad_res.binding = 65;
+    bad_res.kind = ReflectedBindingKind::Texture;
+    bad_res.source = ReflectedSource::Table;
+    bad_res.user_sgpr = 9;
+    bad_res.table_byte_offset = 16;
+    bad.bindings = {bad_smp, bad_res};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad}}, &layout, &report));
+    CHECK(report.find("byte offset 8 is not a descriptor boundary") != std::string::npos);
+    CHECK(report.find("byte offset 16 is not a descriptor boundary") != std::string::npos);
+}
+
+// Wide graphics root signature where an NGG/merged VS at s16 has all its user SGPRs still covered
+// by the default s8 range (so had_uncovered_user_sgpr == false), failing on parameter type at s8.
+void test_wide_rs_covered_shifted_user_data_base() {
+    // 14 dwords total:
+    //   [0] table {SRV t0}        (+0)   -> s8 at base 8,  s16 at base 16
+    //   [1] 4 root constants b0   (+1..4)-> s9..s12,       s17..s20
+    //   [2] root CBV b1           (+5..6)-> s13..s14,      s21..s22
+    //   [3] 7 root constants b2   (+7..13)-> s15..s21,     s23..s29
+    // At base 8, s16 and s17 both fall INSIDE param 3 (root constants)!
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc t0;
+    t0.parameter_type = d3d::RootParameterType::DescriptorTable;
+    d3d::DescriptorRangeDesc srv0;
+    srv0.range_type = d3d::DescriptorRangeType::Srv;
+    srv0.base_shader_register = 0;
+    t0.ranges = {srv0};
+
+    d3d::RootParameterDesc rc1;
+    rc1.parameter_type = d3d::RootParameterType::Constants32Bit;
+    rc1.shader_register = 0;
+    rc1.num_32bit_values = 4;
+
+    d3d::RootParameterDesc cbv2;
+    cbv2.parameter_type = d3d::RootParameterType::Cbv;
+    cbv2.shader_register = 1;
+
+    d3d::RootParameterDesc rc3;
+    rc3.parameter_type = d3d::RootParameterType::Constants32Bit;
+    rc3.shader_register = 2;
+    rc3.num_32bit_values = 7;
+    rs.parameters = {t0, rc1, cbv2, rc3};
+
+    // NGG VS reads table at s16 + 0 and root constants at s17 (both covered by s8..s21!).
+    StageReflection vs;
+    vs.stage = ReflectedStage::Vertex;
+    ReflectedBinding vt;
+    vt.group = 0;
+    vt.binding = 0;
+    vt.kind = ReflectedBindingKind::ReadOnlyStorage;
+    vt.source = ReflectedSource::Table;
+    vt.user_sgpr = 16;
+    vt.table_byte_offset = 0;
+    ReflectedBinding vc;
+    vc.group = 0;
+    vc.binding = 1;
+    vc.kind = ReflectedBindingKind::Uniform;
+    vc.source = ReflectedSource::RootConstants;
+    vc.user_sgpr = 17;
+    vs.bindings = {vt, vc};
+
+    // PS at s8 uses disjoint @binding(64).
+    StageReflection ps;
+    ps.stage = ReflectedStage::Fragment;
+    ReflectedBinding pt = vt;
+    pt.binding = 64;
+    pt.user_sgpr = 8;
+    ps.bindings = {pt};
+
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &vs}, {GpuShaderStageBits::Fragment, &ps}},
+                               &layout, &report, &stats));
+    CHECK(report.empty() && stats.shifted_user_data_base_stages == 1);
+    const bridge::LayoutBinding* b0 = find(layout, 0, 0);
+    const bridge::LayoutBinding* b1 = find(layout, 0, 1);
+    const bridge::LayoutBinding* b64 = find(layout, 0, 64);
+    CHECK(b0 != nullptr && b0->join.register_class == d3d::DescriptorRangeType::Srv && b0->join.shader_register == 0);
+    CHECK(b1 != nullptr && b1->join.root_constants && b1->join.shader_register == 0);
+    CHECK(b64 != nullptr && b64->join.register_class == d3d::DescriptorRangeType::Srv && b64->join.shader_register == 0);
+
+    // Fragment stage with covered s16 table mismatch must NOT auto-shift.
+    StageReflection bad_ps = vs;
+    bad_ps.stage = ReflectedStage::Fragment;
+    report.clear();
+    JoinStats ps_stats;
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad_ps}}, &layout, &report, &ps_stats));
+    CHECK(ps_stats.shifted_user_data_base_stages == 0);
+}
+
+// CB-indexed and lane-indexed window_base CBV completeness: contained root-constants user_sgpr
+// folds dword offset into cb_byte_offset, and root_descriptor CBV over a descriptor table coerces
+// to CbTable (slot 0 or v2/v3 table_byte_offset / 32).
+void test_cbv_indexed_root_constants_and_table_coercion() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x000000000000cb01": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 64, "kind": "texture",
+         "source": {"cbv_indexed_resource_heap": {
+             "cbv": {"user_sgpr": 10, "root_constants": true},
+             "byte_offset": 0, "shift": 5}}},
+        {"group": 0, "binding": 65, "kind": "texture",
+         "source": {"cbv_indexed_resource_heap": {
+             "cbv": {"user_sgpr": 8, "root_descriptor": true},
+             "byte_offset": 12, "shift": 5}}},
+        {"group": 0, "binding": 66, "kind": "sampler",
+         "source": {"lane_indexed_sampler_heap": {
+             "max_count": 8, "shift": 4,
+             "window_base": {"cbv": {"user_sgpr": 8, "root_descriptor": true, "table_byte_offset": 32},
+                             "byte_offset": 4}}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &idx, &error));
+    CHECK(error.empty() && idx.size() == 1);
+
+    // ui_root_signature: [0] table at s8 (slot 0 SRV, slot 1 CBV), [1] 2 constants at s9..s10, [2] root CBV at s11.
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &idx.at(0xcb01)}}, &layout, &report, &stats,
+                               JoinOptions{true}));
+    CHECK(report.empty() && stats.root_descriptor_tables == 2 && stats.lane_indexed_arrays == 1);
+
+    const bridge::LayoutBinding* b64 = find(layout, 0, 64);
+    CHECK(b64 != nullptr && b64->join.heap_index_source == d3d::HeapIndexSource::CbRootConstants &&
+          b64->join.heap_index_parameter == 1 && b64->join.cb_byte_offset == 4);
+    const bridge::LayoutBinding* b65 = find(layout, 0, 65);
+    CHECK(b65 != nullptr && b65->join.heap_index_source == d3d::HeapIndexSource::CbTable &&
+          b65->join.heap_index_parameter == 0 && b65->join.cb_table_slot == 0 && b65->join.cb_byte_offset == 12);
+    const bridge::LayoutBinding* b66 = find(layout, 0, 66);
+    CHECK(b66 != nullptr && b66->join.heap_index_source == d3d::HeapIndexSource::CbTable &&
+          b66->join.heap_index_parameter == 0 && b66->join.cb_table_slot == 1 && b66->join.cb_byte_offset == 4 &&
+          b66->entry.binding_array_size == 8);
+
+    // Out-of-bounds contained root constant (s10 + byte_offset 4 -> effective byte 8 >= 2 * 4) fails cleanly.
+    StageReflection oob = idx.at(0xcb01);
+    oob.bindings = {oob.bindings[0]};
+    oob.bindings[0].cb_byte_offset = 4;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &oob}}, &layout, &report));
+    CHECK(report.find("covering byte 8") != std::string::npos);
+}
+
+// Vertex join + PSO completeness regressions: unorm8x4-bgra parse, exact-offset priority,
+// 16-bit widening & single-tail sub-read, integer signedness reinterpret, APPEND_ALIGNED past
+// unsupported formats, constant_default spare-slot collision avoidance, tight_strides from fetches,
+// ReadOnlyDepth/Stencil variant propagation, AlphaToCoverage with null PS, 2x->4x SampleMask,
+// Xbox formats 116/117, +/-Inf depth bias, and parser storage_format/group validation.
+void test_vertex_join_and_pso_completeness() {
+    // 1. unorm8x4-bgra parses in fetch_format; storage_format > 255 and group >= 16 rejected.
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "vertex",
+            "vertex_inputs": [{"location": 0, "vb_slot": 0, "byte_offset": 0, "components": 4,
+                               "component_type": "f32", "fetch_format": "unorm8x4-bgra"}]}}})",
+        &idx, &error));
+    CHECK(idx.at(1).vertex_inputs[0].fetch_format == pso::WgpuVertexFormat::Unorm8x4Bgra);
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 0, "binding": 0, "kind": "storage_texture", "storage_format": 256,
+                          "source": {"user_sgpr": 4, "table_byte_offset": 0}}]}}})",
+        &bad, &error));
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 16, "binding": 0, "kind": "uniform",
+                          "source": {"user_sgpr": 4, "table_byte_offset": 0}}]}}})",
+        &bad, &error));
+
+    // 2. APPEND_ALIGNED_ELEMENT stays accurate after unsupported R11G11B10_FLOAT (4B),
+    //    exact-offset match wins over earlier overlapping element, 16-bit widening (Float16x2+Float16x2 -> Float16x4),
+    //    16-bit single-tail sub-read (Float16x2 @+2 with default components=4 -> Float16),
+    //    and uint16x2 <-> sint16x2 signedness reinterpretation.
+    std::vector<pso::D3D12InputElementDesc> el(6);
+    el[0].SemanticName = "TEXCOORD";
+    el[0].Format = pso::DxgiFormat::R11G11B10_FLOAT;  // 4B unsupported vertex format @0..4
+    el[0].AlignedByteOffset = 0;
+    el[1].SemanticName = "POSITION";
+    el[1].Format = pso::DxgiFormat::R32G32_FLOAT;     // appended -> MUST be @4..12, not @0!
+    el[2].SemanticName = "NORMAL";
+    el[2].Format = pso::DxgiFormat::R16G16_FLOAT;     // appended -> @12..16
+    el[3].SemanticName = "TANGENT";
+    el[3].Format = pso::DxgiFormat::R16G16_FLOAT;     // appended -> @16..20
+    el[4].SemanticName = "BLENDINDICES";
+    el[4].Format = pso::DxgiFormat::R16G16_UINT;      // appended -> @20..24
+    el[5].SemanticName = "COLOR";
+    el[5].Format = pso::DxgiFormat::R16G16_FLOAT;     // appended -> @24..28
+
+    StageReflection vs;
+    vs.stage = ReflectedStage::Vertex;
+    vs.vertex_inputs = {
+        {0, 0, 4, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},   // POSITION @4
+        {1, 0, 12, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},  // widens NORMAL+TANGENT -> Float16x4
+        {2, 0, 20, 2, ReflectedComponentType::I32, pso::WgpuVertexFormat::Undefined},  // Uint16x2 -> Sint16x2
+        {3, 0, 26, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},  // tail half of COLOR @26 -> Float16
+    };
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    CHECK(join_vertex_inputs(vs, el.data(), static_cast<uint32_t>(el.size()), &fetches, &report));
+    CHECK(report.empty() && fetches.size() == 4);
+    if (fetches.size() == 4) {
+        CHECK(fetches[0].offset == 4 && fetches[0].format == pso::WgpuVertexFormat::Float32x2);
+        CHECK(fetches[1].offset == 12 && fetches[1].format == pso::WgpuVertexFormat::Float16x4);
+        CHECK(fetches[2].offset == 20 && fetches[2].format == pso::WgpuVertexFormat::Sint16x2);
+        CHECK(fetches[3].offset == 26 && fetches[3].format == pso::WgpuVertexFormat::Float16);
+    }
+
+    // 3. constant_default avoids declared slot 0 when reflected VS only reads slot 1 + default,
+    //    and tight_strides incorporates vs_input_fetches extent without spurious MissingVertexInput.
+    pso::D3D12InputElementDesc two_slots[2]{};
+    two_slots[0].SemanticName = "POSITION";
+    two_slots[0].Format = pso::DxgiFormat::R32G32B32_FLOAT;
+    two_slots[0].InputSlot = 0;
+    two_slots[0].AlignedByteOffset = 0;
+    two_slots[1].SemanticName = "TEXCOORD";
+    two_slots[1].Format = pso::DxgiFormat::R32G32_FLOAT;
+    two_slots[1].InputSlot = 1;
+    two_slots[1].AlignedByteOffset = 0;
+
+    pso::VertexInputFetch f_slot1[2]{};
+    f_slot1[0] = {1, 0, 0, pso::WgpuVertexFormat::Float32x4, false};  // wider (16B) than slot 1 element (8B)
+    f_slot1[1] = {0, 0, 1, pso::WgpuVertexFormat::Float32x4, true};   // constant default
+    const pso::VertexInputSignatureElement dummy_sig = {"POSITION", 0, 0};
+
+    pso::D3D12GraphicsPsoDesc pso_desc{};
+    pso_desc.vs = 1;
+    pso_desc.ps = 2;
+    pso_desc.pInputElementDescs = two_slots;
+    pso_desc.NumInputElements = 2;
+    pso_desc.vs_input_signature = &dummy_sig;
+    pso_desc.vs_input_signature_count = 1;
+    pso_desc.vs_input_fetches = f_slot1;
+    pso_desc.vs_input_fetch_count = 2;
+    pso_desc.NumRenderTargets = 1;
+    pso_desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    const pso::GraphicsPsoTranslation tr = pso::translate_graphics_pso(pso_desc, pso::PipelineKeyOptions{});
+    CHECK(tr.default_vertex_slot_mask == (1u << 2));  // avoids BOTH declared slot 0 and fetched slot 1!
+    CHECK(tr.tight_strides[1] == 16u);                // reflects Float32x4 extent, not just 8B element!
+    CHECK((tr.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::MissingVertexInput)) == 0);
+
+    // 4. ReadOnlyDepth & ReadOnlyStencil propagate into GraphicsPipelineKey and preserve pending clears.
+    pso::D3D12GraphicsPsoDesc ds_pso{};
+    ds_pso.vs = 1;
+    ds_pso.ps = 2;
+    ds_pso.NumRenderTargets = 1;
+    ds_pso.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    ds_pso.DSVFormat = pso::DxgiFormat::D24_UNORM_S8_UINT;
+    ds_pso.DepthStencilState.DepthEnable = true;
+    ds_pso.DepthStencilState.DepthWriteMask = pso::D3D12DepthWriteMask::All;
+    ds_pso.DepthStencilState.StencilEnable = true;
+    ds_pso.DepthStencilState.FrontFace.StencilPassOp = pso::D3D12StencilOp::Replace;
+    pso::GraphicsPso gpu_pso(ds_pso);
+    pso::PipelineCache cache;
+    pso::CommandListStateTracker tracker;
+    const pso::RenderTargetViewInfo rt_info{1, pso::DxgiFormat::R8G8B8A8_UNORM, 128, 128, 1};
+    const pso::DepthStencilViewInfo dsv_rw{2, pso::DxgiFormat::D24_UNORM_S8_UINT, 128, 128, 1, 0};
+    const pso::DepthStencilViewInfo dsv_ro{
+        2, pso::DxgiFormat::D24_UNORM_S8_UINT, 128, 128, 1,
+        pso::D3D12DsvFlags::ReadOnlyDepth | pso::D3D12DsvFlags::ReadOnlyStencil};
+    tracker.ClearDepthStencilView(dsv_rw, pso::D3D12ClearFlags::Depth | pso::D3D12ClearFlags::Stencil, 0.5f, 3);
+    tracker.set_render_targets(std::span<const pso::RenderTargetViewInfo>(&rt_info, 1), &dsv_ro);
+    tracker.SetPipelineState(&gpu_pso);
+    const pso::D3D12Viewport vp{0.0f, 0.0f, 128.0f, 128.0f, 0.0f, 1.0f};
+    const pso::D3D12Rect sc{0, 0, 128, 128};
+    tracker.RSSetViewports(1, &vp);
+    tracker.RSSetScissorRects(1, &sc);
+    CHECK(tracker.prepare_draw(&cache));
+    const pso::GraphicsPipelineKey* ro_key = nullptr;
+    for (const pso::StateEvent& ev : tracker.events()) {
+        if (ev.type == pso::StateEventType::SetPipeline) {
+            ro_key = ev.pipeline_key;
+        }
+    }
+    CHECK(ro_key != nullptr && ro_key->depth_stencil.depth_write_enabled == 0 &&
+          ro_key->depth_stencil.stencil_write_mask == 0 &&
+          ro_key->depth_stencil.stencil_front.pass_op == pso::WgpuStencilOperation::Keep);
+    // Pending clear was NOT silently discarded by the read-only pass: switching to writable DSV folds it!
+    tracker.set_render_targets(std::span<const pso::RenderTargetViewInfo>(&rt_info, 1), &dsv_rw);
+    CHECK(tracker.prepare_draw(&cache));
+    CHECK(tracker.passes().size() == 2 &&
+          tracker.passes()[1].depth_stencil.depth_load_op == pso::WgpuLoadOp::Clear &&
+          tracker.passes()[1].depth_stencil.stencil_load_op == pso::WgpuLoadOp::Clear);
+
+    // 5. AlphaToCoverage dropped with null PS, 2x->4x MSAA full mask expansion, Xbox 116/117 HDR formats, +/-Inf bias.
+    pso::D3D12GraphicsPsoDesc edge{};
+    edge.vs = 1;
+    edge.ps = 0;
+    edge.NumRenderTargets = 1;
+    edge.RTVFormats[0] = pso::DxgiFormat::R10G10B10_7E3_A2_FLOAT;
+    edge.SampleDesc.Count = 2;
+    edge.SampleMask = 0x3u;
+    edge.BlendState.AlphaToCoverageEnable = true;
+    edge.RasterizerState.SlopeScaledDepthBias = std::numeric_limits<float>::infinity();
+    edge.RasterizerState.DepthBiasClamp = -std::numeric_limits<float>::infinity();
+    const pso::GraphicsKeyResult er = pso::make_graphics_pipeline_key(edge);
+    CHECK(!pso::is_fatal(er.diagnostics));
+    CHECK(er.key.color_targets[0].format == pso::WgpuTextureFormat::Rgba16Float);
+    CHECK(er.key.multisample.count == 4u && er.key.multisample.mask == 0xFu);
+    CHECK(er.key.multisample.alpha_to_coverage_enabled == 0 &&
+          (er.diagnostics & pso::PipelineDiag::AlphaToCoverageDropped) != 0);
+    CHECK(er.key.depth_stencil.depth_bias_slope_scale_bits == 0u &&
+          er.key.depth_stencil.depth_bias_clamp_bits == 0u);
+    CHECK(pso::map_texture_format(pso::DxgiFormat::R10G10B10_6E4_A2_FLOAT, pso::FormatUsage::RenderTarget, 0).format ==
+          pso::WgpuTextureFormat::Rgba16Float);
+}
+
 int main() {
     test_rt_arena_bindings();
     test_mesh_output();
@@ -1966,6 +2493,11 @@ int main() {
     test_g83_heap_strides_and_arrays();
     test_g83_mesh_and_rt_group3_joins();
     test_per_stage_user_data_base_and_shifted_fallback();
+    test_fragment_high_bindings_64_to_95();
+    test_sampler_table_16_byte_slots();
+    test_wide_rs_covered_shifted_user_data_base();
+    test_cbv_indexed_root_constants_and_table_coercion();
+    test_vertex_join_and_pso_completeness();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;
