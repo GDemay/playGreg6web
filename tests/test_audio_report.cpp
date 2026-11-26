@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "os/audio_report.h"
+#include "os/xapu_connect.h"
 
 namespace {
 int g_failures = 0;
@@ -65,6 +66,17 @@ int main() {
     CHECK(json2.find("\"xapu_commands\": 12, \"xapu_unhandled_commands\": 1") != std::string::npos);
     CHECK(json2.find("\"xapu_commands_by_type\": {\"1\": 2, \"2\": 2, \"3\": 7, \"5\": 0}") != std::string::npos);
     CHECK(ar::to_json(ar::Totals{}, {}, 0).find("\"non_silent_fraction\": 0.000000") != std::string::npos);
+
+    {  // XApuConnect params as the title sends them (raw dump, menu run)
+        namespace xc = playgta6::os::xapu_connect;
+        const uint32_t w[6] = {1, 256, 2, 0x104000, 0, 1};
+        const xc::Params p = xc::parse(w);
+        CHECK(p.outstanding_limit == 512 && p.memory_bytes == 0x104000 && !p.result_event);
+        const uint32_t ev[6] = {1, 4, 2, 0x104000, 0, 9};
+        CHECK(xc::parse(ev).result_event);
+        const uint32_t bad[6] = {1, 0, 0, 2, 0, 0};
+        CHECK(xc::parse(bad).outstanding_limit == 0 && xc::parse(bad).memory_bytes == xc::kFixedLayoutBytes);
+    }
 
     if (g_failures == 0) std::printf("test_audio_report: ok\n");
     return g_failures == 0 ? 0 : 1;
