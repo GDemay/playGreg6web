@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include "gpu/pipeline_prewarm.h"
 #include "gpu/prewarm_pipeline_desc.h"
 #include "gpu/pso_cache.h"
+#include "gpu/xbox_embedded_native.h"
 #include "wasm_boot.h"
 #include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
@@ -6468,6 +6470,775 @@ void test_ui_a8_blend_fidelity() {
     }
 }
 
+// Helper: decode a raw GPU packet byte stream into Packet records.
+std::vector<Packet> decode_raw_stream(const std::vector<uint8_t>& buf) {
+    std::vector<Packet> out;
+    size_t off = 0;
+    while (off + sizeof(GpuPacketHeader) <= buf.size()) {
+        GpuPacketHeader h{};
+        std::memcpy(&h, buf.data() + off, sizeof(h));
+        off += sizeof(h);
+        Packet p;
+        p.opcode = static_cast<GpuOpcode>(h.opcode);
+        p.payload.assign(buf.data() + off, buf.data() + off + h.payload_bytes);
+        off += h.payload_bytes;
+        out.push_back(std::move(p));
+    }
+    CHECK(off == buf.size());
+    return out;
+}
+
+// #663 / Orch-15: 512+ skipped mesh-shader PSO wave must hit the zero-mesh-compute fast gate
+// (near-instant, no MS/PS guest read/hash/inflate), while real packed mesh-compute PSOs keep
+// working and MS-first rejection skips reading PS on MS misses.
+void test_mesh_pso_stall_fast_gate_and_packed_preservation() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        const uint64_t mem =
+            arena.virtual_alloc(0, 64u << 10, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+        CHECK(mem != 0);
+        const uint64_t out_slot = mem;
+
+        // Part A: shader pack + reflection index with zero mesh-compute stages.
+        {
+            auto pack = std::make_shared<gpu::ShaderPackIndex>();
+            pack->emplace(0x1111222233334444ull, gpu::PackStage::Vertex);
+            pack->emplace(0x5555666677778888ull, gpu::PackStage::Fragment);
+            auto refl = std::make_shared<gpu::StageReflectionIndex>();
+            gpu::StageReflection dummy_r{};
+            dummy_r.has_mesh_output = false;
+            refl->emplace(0x1111222233334444ull, dummy_r);
+
+            dg::DeviceOptions opts;
+            opts.shader_pack = pack;
+            opts.stage_reflection = refl;
+            opts.sink = [](const uint8_t*, size_t) {};
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+            CHECK(!device->mesh_pipelines_possible());
+
+            auto rs_obj = std::make_unique<d3d::RootSignature>();
+            CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, rs_obj.get()).ok());
+            auto rs = com::create_object<dg::RootSignature>(com::implements(dg::kID3D12RootSignature),
+                                                            dg::device_ref(device.get()), std::move(rs_obj));
+            CHECK(rs);
+
+            dg::GuestGraphicsPipelineStateDesc g{};
+            g.pRootSignature = rs->identity();
+            g.NumRenderTargets = 1;
+            g.RTVFormats[0] = 28;
+            // Deliberately unmapped addresses: the fast gate must return BEFORE reading MS or PS!
+            g.PS = {0x0000'DEAD'0000'0000ull, 4096};
+            dg::GuestShaderBytecode ms{0x0000'BEEF'0000'0000ull, 65536};
+
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 512; ++i) {
+                uint64_t pso_ptr = 0;
+                CHECK(com::write_guest(out_slot, pso_ptr));
+                CHECK(device->create_mesh_pso(g, ms, false, dg::IID_ID3D12PipelineState, com::OutPtr{out_slot}) ==
+                      dg::kSOk);
+                CHECK(com::read_guest(out_slot, pso_ptr) && pso_ptr != 0);
+                com::detail::Resolved resolved{};
+                CHECK(com::detail::lookup_interface(pso_ptr, &resolved));
+                auto* ps_obj = static_cast<dg::PipelineState*>(resolved.object.get());
+                CHECK(ps_obj->unsupported_reason() == "mesh shaders (no mesh compute translation in the pack)");
+                resolved.object->release();  // release guest ref from hand_out
+            }
+            const auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+            CHECK(elapsed_ms < 500);
+            CHECK(device->counter(dg::xbox::Counter::PlaceholderPipelineStates) == 512);
+            CHECK(device->counter(dg::xbox::Counter::MeshPipelineStates) == 0);
+        }
+
+        // Part B: shader pack + reflection index WITH a real mesh-compute stage preserves real mesh PSOs,
+        // rejects unpacked MS before touching PS, and populates the embedded-native cache.
+        {
+            const std::array<uint8_t, 16> ms_bytes = {'M', 'S', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+            const std::array<uint8_t, 16> miss_ms = {'N', 'O', 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 12, 13, 14};
+            const std::array<uint8_t, 16> ps_bytes = {'P', 'S', 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+            const uint64_t ms_va = mem + 0x1000;
+            const uint64_t miss_ms_va = mem + 0x1100;
+            const uint64_t ps_va = mem + 0x1200;
+            CHECK(com::write_guest(ms_va, ms_bytes.data(), ms_bytes.size()));
+            CHECK(com::write_guest(miss_ms_va, miss_ms.data(), miss_ms.size()));
+            CHECK(com::write_guest(ps_va, ps_bytes.data(), ps_bytes.size()));
+
+            const uint64_t ms_id = dg::shader_identity(ms_bytes.data(), ms_bytes.size());
+            const uint64_t ps_id = dg::shader_identity(ps_bytes.data(), ps_bytes.size());
+            const uint64_t ms_key = bridge::mesh_compute_pack_key(ms_id);
+
+            auto pack = std::make_shared<gpu::ShaderPackIndex>();
+            pack->emplace(ms_key, gpu::PackStage::Compute);
+            pack->emplace(ps_id, gpu::PackStage::Fragment);
+            auto refl = std::make_shared<gpu::StageReflectionIndex>();
+            gpu::StageReflection mr{};
+            mr.has_mesh_output = true;
+            mr.mesh_output = bridge::MeshOutputLayout{64, 64, 8};
+            refl->emplace(ms_key, mr);
+            gpu::StageReflection pr{};
+            refl->emplace(ps_id, pr);
+
+            dg::DeviceOptions opts;
+            opts.shader_pack = pack;
+            opts.stage_reflection = refl;
+            opts.sink = [](const uint8_t*, size_t) {};
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+            CHECK(device->mesh_pipelines_possible());
+
+            auto rs_obj = std::make_unique<d3d::RootSignature>();
+            CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, rs_obj.get()).ok());
+            auto rs = com::create_object<dg::RootSignature>(com::implements(dg::kID3D12RootSignature),
+                                                            dg::device_ref(device.get()), std::move(rs_obj));
+            CHECK(rs);
+
+            // 1) Packed MS + PS builds a real MeshPipelineState.
+            dg::GuestGraphicsPipelineStateDesc g{};
+            g.pRootSignature = rs->identity();
+            g.NumRenderTargets = 1;
+            g.RTVFormats[0] = 28;
+            g.SampleMask = 0xFFFFFFFFu;
+            g.SampleCount = 1;
+            g.PS = {ps_va, ps_bytes.size()};
+            dg::GuestShaderBytecode ms{ms_va, ms_bytes.size()};
+            uint64_t pso_ptr = 0;
+            CHECK(device->create_mesh_pso(g, ms, false, dg::IID_ID3D12PipelineState, com::OutPtr{out_slot}) ==
+                  dg::kSOk);
+            CHECK(com::read_guest(out_slot, pso_ptr) && pso_ptr != 0);
+            {
+                com::detail::Resolved resolved{};
+                CHECK(com::detail::lookup_interface(pso_ptr, &resolved));
+                auto* ps_obj = static_cast<dg::PipelineState*>(resolved.object.get());
+                CHECK(ps_obj->mesh() != nullptr && ps_obj->resolved());
+                resolved.object->release();
+            }
+            CHECK(device->counter(dg::xbox::Counter::MeshPipelineStates) == 1);
+            CHECK(device->counter(dg::xbox::Counter::PlaceholderPipelineStates) == 0);
+
+            // Embedded-native cache must have cached the MS stage identity.
+            dg::Device::NativeStageRecord cached_rec{};
+            CHECK(device->find_cached_embedded_native(
+                ms_id, static_cast<uint8_t>(dg::xbox::EmbeddedStage::Ms), &cached_rec));
+
+            // 2) Unpacked MS with unmapped PS: MS-first rejection skips reading PS.
+            g.PS = {0x0000'DEAD'0000'0000ull, 4096};
+            dg::GuestShaderBytecode miss_code{miss_ms_va, miss_ms.size()};
+            CHECK(device->create_mesh_pso(g, miss_code, false, dg::IID_ID3D12PipelineState, com::OutPtr{out_slot}) ==
+                  dg::kSOk);
+            CHECK(com::read_guest(out_slot, pso_ptr) && pso_ptr != 0);
+            {
+                com::detail::Resolved resolved{};
+                CHECK(com::detail::lookup_interface(pso_ptr, &resolved));
+                auto* ps_obj = static_cast<dg::PipelineState*>(resolved.object.get());
+                CHECK(ps_obj->unsupported_reason() == "mesh shaders (no mesh compute translation in the pack)");
+                resolved.object->release();
+            }
+            CHECK(device->counter(dg::xbox::Counter::PlaceholderPipelineStates) == 1);
+        }
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// #691 / Orch-15 (B1): releasing a guest resource whose GPU create is still deferred while an
+// unexecuted CommandListBridge already references it must preserve the deferred create so
+// CreateTexture2/CreateBuffer lands strictly before CreateBindGroup2, and defer DestroyResource
+// until after Present. Unused resources still drop their deferred create with zero packets.
+void test_deferred_create_preserved_when_resource_released_before_execute() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        std::vector<uint8_t> stream;
+        dg::DeviceOptions opts;
+        opts.defer_gpu_objects = true;
+        opts.sink = [&stream](const uint8_t* data, size_t size) { stream.insert(stream.end(), data, data + size); };
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        dg::GuestResourceDesc td{};
+        td.Dimension = dg::ResourceDimension::Texture2D;
+        td.Width = 16;
+        td.Height = 16;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = 28;  // R8G8B8A8_UNORM
+        td.SampleCount = 1;
+        dg::Resource::Placement pl{};
+
+        // Unused resource: create deferred, released before any use -> zero packets emitted.
+        uint32_t unused_id = 0;
+        {
+            auto unused = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                           dg::device_ref(device.get()), td, pl, 0u);
+            CHECK(unused && unused->initialize());
+            unused_id = unused->id();
+            CHECK(device->gpu_object_pending(unused_id));
+        }
+        CHECK(!device->gpu_object_pending(unused_id));
+        CHECK(stream.empty());
+
+        // Used resource: recorded into an unexecuted command list, then released BEFORE Execute.
+        uint32_t used_id = 0;
+        gpu::CommandEncoder list_enc;
+        bridge::CommandListBridge list(device->state_bridge(), list_enc);
+        {
+            auto used = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                         dg::device_ref(device.get()), td, pl, 0u);
+            CHECK(used && used->initialize());
+            used_id = used->id();
+            CHECK(device->gpu_object_pending(used_id));
+
+            // Record a packet referencing used_id into the unexecuted command list.
+            const uint8_t pixels[4] = {255, 0, 0, 255};
+            list.WriteTexture(used_id, 0, 0, 0, 0, 1, 1, 1, 256, 1, pixels, sizeof(pixels));
+            CHECK(device->state_bridge().is_resource_recorded(used_id));
+        }
+        // Released while still recorded in `list`: deferred create MUST stay alive, and destroy deferred!
+        CHECK(device->gpu_object_pending(used_id));
+        CHECK(device->state_bridge().deferred_destroy_count() >= 1);
+
+        // Execute the list: CreateTexture2(used_id) must be spliced strictly BEFORE WriteTexture(used_id).
+        list.Close();
+        gpu::CommandEncoder prelude;
+        list.refresh_memory_bind_groups(prelude);
+        device->submit(list_enc);
+        device->present();
+        {
+            gpu::CommandEncoder flush_enc;
+            device->state_bridge().advance_present_frame(device->stats().presents, flush_enc);
+            if (flush_enc.size() != 0) {
+                device->submit(flush_enc);
+            }
+        }
+        const std::vector<Packet> pkts = decode_raw_stream(stream);
+        size_t create_idx = pkts.size(), write_idx = pkts.size(), present_idx = pkts.size(), destroy_idx = pkts.size();
+        for (size_t i = 0; i < pkts.size(); ++i) {
+            if (pkts[i].opcode == GpuOpcode::CreateTexture2 &&
+                pod<GpuCreateTexture2Payload>(pkts[i]).id == used_id) {
+                create_idx = i;
+            } else if (pkts[i].opcode == GpuOpcode::WriteTexture &&
+                       pod<GpuWriteTexturePayload>(pkts[i]).texture_id == used_id) {
+                write_idx = i;
+            } else if (pkts[i].opcode == GpuOpcode::Present) {
+                present_idx = i;
+            } else if (pkts[i].opcode == GpuOpcode::DestroyResource &&
+                       pod<GpuDestroyResourcePayload>(pkts[i]).id == used_id) {
+                destroy_idx = i;
+            }
+        }
+        CHECK(create_idx < write_idx && write_idx < present_idx && present_idx < destroy_idx &&
+              destroy_idx < pkts.size());
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// #691 / Orch-15 (B2): device-global bridge objects (layouts, samplers, root-constant ring, pipelines)
+// are deferred at the device level so resetting an unexecuted first command list or executing a second
+// list first still splices every prerequisite strictly before use in the executed stream.
+void test_device_object_deferral_out_of_order_and_reset_lists() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        std::vector<uint8_t> stream;
+        dg::DeviceOptions opts;
+        opts.sink = [&stream](const uint8_t* data, size_t size) { stream.insert(stream.end(), data, data + size); };
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        bridge::StateBridgeDevice& sb = device->state_bridge();
+        constexpr uint32_t kRt = 50001u, kTex = 50002u, kVb = 50003u;
+        constexpr uint64_t kVs = 0xAA01, kPs = 0xAA02;
+        sb.register_texture(kRt, {pso::DxgiFormat::R8G8B8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, true});
+        sb.register_texture(kTex, {pso::DxgiFormat::R8G8B8A8_UNORM, 16, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        sb.register_buffer(kVb, 0x10000, 64, 64);
+        sb.register_shader_module(kVs, 11);
+        sb.register_shader_module(kPs, 12);
+
+        d3d::DescriptorHeap* rtv_heap = make_heap(device->heaps(), d3d::DescriptorHeapType::Rtv, 2, false);
+        d3d::DescriptorHeap* srv_heap = make_heap(device->heaps(), d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::DescriptorHeap* smp_heap = make_heap(device->heaps(), d3d::DescriptorHeapType::Sampler, 4, true);
+        CHECK(device->heaps().create_render_target_view(kRt, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::ViewDesc srv{};
+        srv.format = 28;
+        srv.dimension = d3d::ViewDimension::Texture2D;
+        srv.mip_levels = 1;
+        CHECK(device->heaps().create_shader_resource_view(kTex, &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::SamplerDesc smp{};
+        CHECK(device->heaps().create_sampler(smp, smp_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc p0{};
+        p0.parameter_type = d3d::RootParameterType::Constants32Bit;
+        p0.shader_register = 0;
+        p0.num_32bit_values = 4;
+        d3d::RootParameterDesc p1{};
+        p1.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc r_srv{};
+        r_srv.range_type = d3d::DescriptorRangeType::Srv;
+        r_srv.num_descriptors = 1;
+        p1.ranges.push_back(r_srv);
+        d3d::RootParameterDesc p2{};
+        p2.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc r_smp{};
+        r_smp.range_type = d3d::DescriptorRangeType::Sampler;
+        r_smp.num_descriptors = 1;
+        p2.ranges.push_back(r_smp);
+        rs_desc.parameters = {p0, p1, p2};
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+
+        bridge::PipelineLayoutDesc pl;
+        bridge::GroupLayoutDesc grp;
+        GpuBindGroupLayoutEntry e0 =
+            layout_entry(0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                         static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+        e0.flags = GpuBindGroupLayoutEntryFlags::HasDynamicOffset;
+        grp.bindings.push_back({e0, join(0, d3d::DescriptorRangeType::Cbv, 0)});
+        grp.bindings.push_back({layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                             static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                join(1, d3d::DescriptorRangeType::Srv, 0)});
+        grp.bindings.push_back({layout_entry(2, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Sampler,
+                                             static_cast<uint8_t>(GpuSamplerBindingType::Filtering)),
+                                join(2, d3d::DescriptorRangeType::Sampler, 0)});
+        pl.groups.push_back(grp);
+        sb.register_pipeline_layout(kVs, kPs, pl);
+
+        pso::D3D12GraphicsPsoDesc pd = Scene::pso_desc();
+        pd.vs = kVs;
+        pd.ps = kPs;
+        pd.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+        pd.DSVFormat = pso::DxgiFormat::UNKNOWN;
+        auto pso_state = sb.create_graphics_pipeline_state(pd, &rs);
+        CHECK(pso_state);
+
+        auto record_draw = [&](bridge::CommandListBridge& list) {
+            d3d::DescriptorHeap* visible[] = {srv_heap, smp_heap};
+            CHECK(list.SetDescriptorHeaps(2, visible) == d3d::Status::Ok);
+            CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+            list.SetPipelineState(pso_state.get());
+            const uint32_t rc[4] = {1, 2, 3, 4};
+            CHECK(list.SetGraphicsRoot32BitConstants(0, 4, rc, 0) == d3d::Status::Ok);
+            CHECK(list.SetGraphicsRootDescriptorTable(1, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+            CHECK(list.SetGraphicsRootDescriptorTable(2, smp_heap->gpu_handle(0)) == d3d::Status::Ok);
+            list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+            const gpu::d3d12_xs::D3D12VertexBufferView vb{kVb, 0, 36, 12};
+            list.IASetVertexBuffers(0, 1, &vb);
+            const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+            list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+            list.DrawInstanced(3, 1, 0, 0);
+            list.Close();
+        };
+
+        // List A records FIRST, triggering device-global object creation, then is DISCARDED without executing!
+        {
+            gpu::CommandEncoder enc_a;
+            bridge::CommandListBridge list_a(sb, enc_a);
+            record_draw(list_a);
+            CHECK(stream.empty());  // recording submits nothing before ExecuteCommandLists
+            enc_a.clear();          // List A reset/discarded without executing!
+        }
+
+        // List B records SECOND using the same cached layout/sampler/ring/pipeline, and executes!
+        gpu::CommandEncoder enc_b;
+        bridge::CommandListBridge list_b(sb, enc_b);
+        record_draw(list_b);
+        device->submit(enc_b);
+
+        const std::vector<Packet> pkts = decode_raw_stream(stream);
+        size_t bgl_idx = pkts.size(), pl_idx = pkts.size(), rp_idx = pkts.size(), set_pipe_idx = pkts.size();
+        size_t smp_idx = pkts.size(), ring_idx = pkts.size(), bg_idx = pkts.size();
+        for (size_t i = 0; i < pkts.size(); ++i) {
+            if (pkts[i].opcode == GpuOpcode::CreateBindGroupLayout && bgl_idx == pkts.size()) bgl_idx = i;
+            if (pkts[i].opcode == GpuOpcode::CreatePipelineLayout && pl_idx == pkts.size()) pl_idx = i;
+            if (pkts[i].opcode == GpuOpcode::CreateRenderPipeline2 && rp_idx == pkts.size()) rp_idx = i;
+            if (pkts[i].opcode == GpuOpcode::SetPipeline && set_pipe_idx == pkts.size()) set_pipe_idx = i;
+            if (pkts[i].opcode == GpuOpcode::CreateSampler2 && smp_idx == pkts.size()) smp_idx = i;
+            if (pkts[i].opcode == GpuOpcode::CreateBuffer && ring_idx == pkts.size()) ring_idx = i;
+            if (pkts[i].opcode == GpuOpcode::CreateBindGroup2 && bg_idx == pkts.size()) bg_idx = i;
+        }
+        CHECK(bgl_idx < pl_idx && pl_idx < rp_idx && rp_idx < set_pipe_idx);
+        CHECK(bgl_idx < bg_idx && smp_idx < bg_idx && ring_idx < bg_idx && bg_idx < pkts.size());
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// #691 / Orch-15 (B3): Device::emit_msaa_resolve pins src, dst, and transient bind group on the
+// owning CommandListBridge so advance_present_frame while unexecuted cannot destroy them early.
+void test_msaa_resolve_pins_resources_across_unexecuted_frame_advance() {
+    namespace com = playgta6::guest::com;
+    namespace dg = playgta6::gpu::d3d12_guest;
+
+    os::VirtualMemoryArena arena;
+    com::reset_com_bridge();
+    com::set_guest_memory(&arena);
+    {
+        dg::DeviceOptions opts;
+        opts.sink = [](const uint8_t*, size_t) {};
+        auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+        CHECK(device);
+        device->initialize_guest_payload();
+
+        bridge::StateBridgeDevice& sb = device->state_bridge();
+        constexpr uint32_t kSrc = 60001u, kDst = 60002u;
+        sb.register_texture(kSrc, {pso::DxgiFormat::R8G8B8A8_UNORM, 32, 32, 1, 1, 4, GpuTextureDimension::Dim2D, false});
+        sb.register_texture(kDst, {pso::DxgiFormat::R8G8B8A8_UNORM, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(sb, enc);
+        CHECK(device->emit_msaa_resolve(kDst, 0, 0, kSrc, 0, 28, enc));
+
+        uint32_t group_id = 0;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                group_id = pod<GpuCreateBindGroup2Payload>(pk).id;
+            }
+        }
+        CHECK(group_id != 0);
+        CHECK(sb.is_resource_recorded(kSrc));
+        CHECK(sb.is_resource_recorded(kDst));
+        CHECK(sb.is_resource_recorded(group_id));
+
+        // Present frame advances while `list` is still unexecuted: group_id must NOT be destroyed!
+        gpu::CommandEncoder flush_enc;
+        CHECK(sb.advance_present_frame(1, flush_enc));
+        for (const Packet& pk : decode(flush_enc)) {
+            if (pk.opcode == GpuOpcode::DestroyResource) {
+                const uint32_t id = pod<GpuDestroyResourcePayload>(pk).id;
+                CHECK(id != group_id && id != kSrc && id != kDst);
+            }
+        }
+        list.Close();
+    }
+    com::reset_com_bridge();
+    com::set_guest_memory(nullptr);
+}
+
+// #691 / Orch-15 (V1, V2, V3, C2, C3, C4): view array-size normalization, typeless depth SRVs
+// before DSV resolution, promoted render target SRV/upload consistency, UAV view format guarding,
+// BC block-aligned WriteToSubresource extents, and mixed sRGB/UNORM present plane views.
+void test_view_format_color_fidelity_and_bc_subresource_extents() {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+
+    // 1) V1 + V2 + V3 + C3 via StateBridgeDevice + CommandListBridge.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions bo = counting_options(7000);
+        bo.features = 0;  // no rg11b10ufloat-renderable: R11G11B10_FLOAT RT promotes to rgba16float
+        bridge::StateBridgeDevice device(heaps, bo, &states);
+
+        constexpr uint32_t kRt = 701, kArrTex = 702, kCubeTex = 703, kDepthTex = 704, kHdrRt = 705, kUavTex = 706;
+        constexpr uint64_t kVs = 0xCC01, kPs = 0xCC02;
+        device.register_texture(kRt, {D::R8G8B8A8_UNORM, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, true});
+        device.register_texture(kArrTex, {D::R8G8B8A8_UNORM, 16, 16, 4, 1, 1, GpuTextureDimension::Dim2D, false});
+        device.register_texture(kCubeTex, {D::R8G8B8A8_UNORM, 16, 16, 12, 1, 1, GpuTextureDimension::Dim2D, false});
+
+        bridge::TextureInfo depth_info{D::R32_TYPELESS, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        depth_info.depth_stencil = true;
+        depth_info.created_format = F::Depth32Float;
+        device.register_texture(kDepthTex, depth_info);
+
+        bridge::TextureInfo hdr_info{D::R11G11B10_FLOAT, 32, 32, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        hdr_info.render_target = true;
+        hdr_info.created_format = F::Rgba16Float;
+        device.register_texture(kHdrRt, hdr_info);
+
+        bridge::TextureInfo uav_info{D::R8G8B8A8_UNORM, 16, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        uav_info.storage = true;
+        uav_info.created_format = F::Rgba8Unorm;
+        device.register_texture(kUavTex, uav_info);
+
+        device.register_shader_module(kVs, 21);
+        device.register_shader_module(kPs, 22);
+        device.register_buffer(Scene::kVertexBuffer, 0x20000, 64, 64);
+
+        d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+        d3d::DescriptorHeap* heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 8, true);
+        CHECK(heaps.create_render_target_view(kRt, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        // V1: 2D array with array_size = 0xFFFFFFFF (-1) and cube array with array_size = 0xFFFFFFFF (-1).
+        d3d::ViewDesc arr_srv{};
+        arr_srv.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM);
+        arr_srv.dimension = d3d::ViewDimension::Texture2DArray;
+        arr_srv.mip_levels = 1;
+        arr_srv.array_size = 0xFFFFFFFFu;
+        CHECK(heaps.create_shader_resource_view(kArrTex, &arr_srv, heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::ViewDesc cube_srv{};
+        cube_srv.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM);
+        cube_srv.dimension = d3d::ViewDimension::TextureCubeArray;
+        cube_srv.mip_levels = 1;
+        cube_srv.array_size = 0xFFFFFFFFu;
+        CHECK(heaps.create_shader_resource_view(kCubeTex, &cube_srv, heap->cpu_handle(1)) == d3d::Status::Ok);
+
+        // V2: R32_FLOAT SRV of R32_TYPELESS depth texture BEFORE any DSV is ever resolved.
+        d3d::ViewDesc depth_srv{};
+        depth_srv.format = static_cast<uint32_t>(D::R32_FLOAT);
+        depth_srv.dimension = d3d::ViewDimension::Texture2D;
+        depth_srv.mip_levels = 1;
+        CHECK(heaps.create_shader_resource_view(kDepthTex, &depth_srv, heap->cpu_handle(2)) == d3d::Status::Ok);
+
+        // C3: R11G11B10_FLOAT SRV of an R11G11B10_FLOAT RT promoted to Rgba16Float.
+        d3d::ViewDesc hdr_srv{};
+        hdr_srv.format = static_cast<uint32_t>(D::R11G11B10_FLOAT);
+        hdr_srv.dimension = d3d::ViewDimension::Texture2D;
+        hdr_srv.mip_levels = 1;
+        CHECK(heaps.create_shader_resource_view(kHdrRt, &hdr_srv, heap->cpu_handle(3)) == d3d::Status::Ok);
+
+        // V3: UAV with incompatible sRGB view format when layout.storage_format == 0.
+        d3d::ViewDesc bad_uav{};
+        bad_uav.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM_SRGB);
+        bad_uav.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_unordered_access_view(kUavTex, 0, &bad_uav, heap->cpu_handle(4)) == d3d::Status::Ok);
+
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc tab{};
+        tab.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc r0{};
+        r0.range_type = d3d::DescriptorRangeType::Srv;
+        r0.num_descriptors = 4;
+        d3d::DescriptorRangeDesc r1{};
+        r1.range_type = d3d::DescriptorRangeType::Uav;
+        r1.num_descriptors = 1;
+        tab.ranges = {r0, r1};
+        rs_desc.parameters.push_back(tab);
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+
+        bridge::PipelineLayoutDesc pl;
+        bridge::GroupLayoutDesc grp;
+        grp.bindings.push_back({layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                             static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2DArray)),
+                                join(0, d3d::DescriptorRangeType::Srv, 0)});
+        grp.bindings.push_back({layout_entry(1, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                             static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                             static_cast<uint8_t>(GpuTextureViewDimension::CubeArray)),
+                                join(1, d3d::DescriptorRangeType::Srv, 1)});
+        grp.bindings.push_back({layout_entry(2, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                             static_cast<uint8_t>(GpuTextureSampleType::Depth),
+                                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                join(2, d3d::DescriptorRangeType::Srv, 2)});
+        grp.bindings.push_back({layout_entry(3, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                             static_cast<uint8_t>(GpuTextureSampleType::Float),
+                                             static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                join(3, d3d::DescriptorRangeType::Srv, 3)});
+        GpuBindGroupLayoutEntry uav_le =
+            layout_entry(4, GpuShaderStageBits::Fragment, GpuBindingLayoutType::StorageTexture,
+                         static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),
+                         static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        uav_le.storage_format = 0;  // conventional layout without explicit storage format
+        grp.bindings.push_back({uav_le, join(4, d3d::DescriptorRangeType::Uav, 0)});
+        pl.groups.push_back(grp);
+        device.register_pipeline_layout(kVs, kPs, pl);
+
+        pso::D3D12GraphicsPsoDesc pd = Scene::pso_desc();
+        pd.vs = kVs;
+        pd.ps = kPs;
+        pd.RTVFormats[0] = D::R8G8B8A8_UNORM;
+        pd.DSVFormat = D::UNKNOWN;
+        auto state = device.create_graphics_pipeline_state(pd, &rs);
+
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* vis[] = {heap};
+        CHECK(list.SetDescriptorHeaps(1, vis) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+        list.SetPipelineState(state.get());
+        CHECK(list.SetGraphicsRootDescriptorTable(0, heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+
+        bool found_bg = false;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode != GpuOpcode::CreateBindGroup2) {
+                continue;
+            }
+            const auto bg = pod<GpuCreateBindGroup2Payload>(pk);
+            CHECK(bg.entry_count == 5);
+            const auto e0 = pod<GpuBindGroupEntry2>(pk, sizeof(bg) + 0 * sizeof(GpuBindGroupEntry2));
+            const auto e1 = pod<GpuBindGroupEntry2>(pk, sizeof(bg) + 1 * sizeof(GpuBindGroupEntry2));
+            const auto e2 = pod<GpuBindGroupEntry2>(pk, sizeof(bg) + 2 * sizeof(GpuBindGroupEntry2));
+            const auto e3 = pod<GpuBindGroupEntry2>(pk, sizeof(bg) + 3 * sizeof(GpuBindGroupEntry2));
+            const auto e4 = pod<GpuBindGroupEntry2>(pk, sizeof(bg) + 4 * sizeof(GpuBindGroupEntry2));
+            CHECK(e0.view.array_layer_count == 0u);  // V1: 0xFFFFFFFF normalized to 0
+            CHECK(e1.view.array_layer_count == 0u);  // V1: cube array 0xFFFFFFFF normalized to 0
+            CHECK(e2.view.format == static_cast<uint8_t>(F::Depth32Float));  // V2: depth sibling before DSV
+            CHECK(e2.view.aspect == static_cast<uint8_t>(GpuTextureAspect::DepthOnly));
+            CHECK(e3.view.format == static_cast<uint8_t>(F::Rgba16Float));   // C3: matches promoted RT host format
+            CHECK(e4.view.format == static_cast<uint8_t>(F::Rgba8Unorm));    // V3: coerced to texture's own format
+            found_bg = true;
+        }
+        CHECK(found_bg);
+    }
+
+    // 2) C2 (BC3 small-mip WriteToSubresource extent rounding) + C3 (R11G11B10_FLOAT RT upload gate)
+    //    + C4 (present planes mixing sRGB and UNORM).
+    {
+        namespace com = playgta6::guest::com;
+        namespace dg = playgta6::gpu::d3d12_guest;
+
+        os::VirtualMemoryArena arena;
+        com::reset_com_bridge();
+        com::set_guest_memory(&arena);
+        {
+            std::vector<uint8_t> stream;
+            dg::DeviceOptions opts;
+            opts.bridge.features = pso::WgpuFeature::TextureCompressionBc;  // BC enabled, rg11b10-renderable OFF
+            opts.sink = [&stream](const uint8_t* data, size_t size) {
+                stream.insert(stream.end(), data, data + size);
+            };
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+
+            // C2: BC3 8x8 with 4 mips; WriteToSubresource on mip 2 (2x2) must round copySize to 4x4.
+            const uint64_t src_mem =
+                arena.virtual_alloc(0, 64u << 10, os::kMemReserve | os::kMemCommit, os::PageProtect::ReadWrite);
+            CHECK(src_mem != 0);
+            const std::array<uint8_t, 16> bc3_block = {0xAA, 0xBB, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
+            CHECK(com::write_guest(src_mem, bc3_block.data(), bc3_block.size()));
+
+            dg::GuestResourceDesc bc_desc{};
+            bc_desc.Dimension = dg::ResourceDimension::Texture2D;
+            bc_desc.Width = 8;
+            bc_desc.Height = 8;
+            bc_desc.DepthOrArraySize = 1;
+            bc_desc.MipLevels = 4;
+            bc_desc.Format = static_cast<uint32_t>(D::BC3_UNORM);
+            bc_desc.SampleCount = 1;
+            auto bc_res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                           dg::device_ref(device.get()), bc_desc,
+                                                           dg::Resource::Placement{}, 0u);
+            CHECK(bc_res && bc_res->initialize());
+            GuestState gst{};
+            gst.gpr[GuestReg::Rcx] = bc_res->identity();
+            gst.gpr[GuestReg::Rdx] = 2u;       // mip 2 (2x2 texels -> 4x4 physical block)
+            gst.gpr[GuestReg::R8] = 0u;        // null box -> full mip
+            gst.gpr[GuestReg::R9] = src_mem;   // pSrcData
+            const uint64_t stack_va = src_mem + 0x1000;
+            gst.gpr[GuestReg::Rsp] = stack_va;
+            CHECK(com::write_guest(stack_va + 0x28, uint64_t{16}));  // SrcRowPitch
+            CHECK(com::write_guest(stack_va + 0x30, uint64_t{16}));  // SrcDepthPitch
+            com::CallContext ctx{gst, bc_res->identity(), bc_res.get(), nullptr, stack_va};
+            CHECK(bc_res->WriteToSubresource(ctx) == dg::kSOk);
+
+            bool saw_bc_write = false;
+            for (const Packet& pk : decode_raw_stream(stream)) {
+                if (pk.opcode == GpuOpcode::WriteTexture) {
+                    const auto wt = pod<GpuWriteTexturePayload>(pk);
+                    if (wt.texture_id == bc_res->id() && wt.mip_level == 2) {
+                        CHECK(wt.width == 4u && wt.height == 4u);
+                        saw_bc_write = true;
+                    }
+                }
+            }
+            CHECK(saw_bc_write);
+
+            // C3: R11G11B10_FLOAT render target (promoted to rgba16float) skips raw 4-byte sync upload.
+            dg::GuestResourceDesc hdr_desc{};
+            hdr_desc.Dimension = dg::ResourceDimension::Texture2D;
+            hdr_desc.Width = 4;
+            hdr_desc.Height = 4;
+            hdr_desc.DepthOrArraySize = 1;
+            hdr_desc.MipLevels = 1;
+            hdr_desc.Format = static_cast<uint32_t>(D::R11G11B10_FLOAT);
+            hdr_desc.SampleCount = 1;
+            hdr_desc.Flags = dg::ResourceFlags::AllowRenderTarget;
+            dg::Resource::Placement hdr_pl{};
+            hdr_pl.address = src_mem + 0x2000;
+            const std::array<uint8_t, 64> raw_hdr = {1, 2, 3, 4};
+            CHECK(com::write_guest(hdr_pl.address, raw_hdr.data(), raw_hdr.size()));
+            auto hdr_res = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                            dg::device_ref(device.get()), hdr_desc, hdr_pl, 0u);
+            CHECK(hdr_res && hdr_res->initialize());
+            gpu::CommandEncoder hdr_enc;
+            CHECK(!device->sync_bound_texture_memory(hdr_res->id(), hdr_enc));
+            CHECK(hdr_enc.empty());
+
+            // C4: Present planes mixing sRGB bottom plane + UNORM top plane must sample top plane via sRGB view,
+            // and UNORM bottom plane + sRGB top plane must sample top plane via UNORM view.
+            dg::GuestResourceDesc srgb_desc{};
+            srgb_desc.Dimension = dg::ResourceDimension::Texture2D;
+            srgb_desc.Width = 16;
+            srgb_desc.Height = 16;
+            srgb_desc.DepthOrArraySize = 1;
+            srgb_desc.MipLevels = 1;
+            srgb_desc.Format = static_cast<uint32_t>(D::R8G8B8A8_UNORM_SRGB);
+            srgb_desc.SampleCount = 1;
+            srgb_desc.Flags = dg::ResourceFlags::AllowRenderTarget;
+            auto plane_srgb = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                               dg::device_ref(device.get()), srgb_desc,
+                                                               dg::Resource::Placement{}, 0u);
+            dg::GuestResourceDesc unorm_desc = srgb_desc;
+            unorm_desc.Format = static_cast<uint32_t>(D::R8G8B8A8_UNORM);
+            auto plane_unorm = com::create_object<dg::Resource>(com::implements(dg::kID3D12Resource),
+                                                                dg::device_ref(device.get()), unorm_desc,
+                                                                dg::Resource::Placement{}, 0u);
+            CHECK(plane_srgb && plane_srgb->initialize() && plane_unorm && plane_unorm->initialize());
+
+            // Case 1: top = UNORM, bottom = sRGB -> canvas is sRGB, top UNORM plane viewed as Rgba8UnormSrgb.
+            stream.clear();
+            const uint32_t planes1[2] = {plane_unorm->id(), plane_srgb->id()};
+            CHECK(device->present(planes1) == 2u);
+            uint8_t top_unorm_view = 0xFFu, bottom_srgb_view = 0xFFu;
+            for (const Packet& pk : decode_raw_stream(stream)) {
+                if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                    const auto e0 = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload));
+                    if (e0.resource_id == plane_unorm->id()) top_unorm_view = e0.view.format;
+                    if (e0.resource_id == plane_srgb->id()) bottom_srgb_view = e0.view.format;
+                }
+            }
+            CHECK(bottom_srgb_view == 0u);
+            CHECK(top_unorm_view == static_cast<uint8_t>(F::Rgba8UnormSrgb));
+
+            // Case 2: top = sRGB, bottom = UNORM -> canvas is UNORM, top sRGB plane viewed as Rgba8Unorm.
+            stream.clear();
+            const uint32_t planes2[2] = {plane_srgb->id(), plane_unorm->id()};
+            CHECK(device->present(planes2) == 2u);
+            uint8_t top_srgb_view = 0xFFu, bottom_unorm_view = 0xFFu;
+            for (const Packet& pk : decode_raw_stream(stream)) {
+                if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                    const auto e0 = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload));
+                    if (e0.resource_id == plane_srgb->id()) top_srgb_view = e0.view.format;
+                    if (e0.resource_id == plane_unorm->id()) bottom_unorm_view = e0.view.format;
+                }
+            }
+            CHECK(bottom_unorm_view == 0u);
+            CHECK(top_srgb_view == static_cast<uint8_t>(F::Rgba8Unorm));
+        }
+        com::reset_com_bridge();
+        com::set_guest_memory(nullptr);
+    }
+}
+
 int main() {
     test_ui_a8_blend_fidelity();
     test_g81_depth_bias_and_shadow_map_parity();
@@ -6525,6 +7296,11 @@ int main() {
     test_fence_completion_and_ref_lifetime();
     test_prewarm_pipeline_matches_on_demand();
     test_prewarm_title_first_and_concurrent_single_build();
+    test_mesh_pso_stall_fast_gate_and_packed_preservation();
+    test_deferred_create_preserved_when_resource_released_before_execute();
+    test_device_object_deferral_out_of_order_and_reset_lists();
+    test_msaa_resolve_pins_resources_across_unexecuted_frame_advance();
+    test_view_format_color_fidelity_and_bc_subresource_extents();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", g_failures);
         return 1;
