@@ -342,7 +342,7 @@ pub(super) fn lift(
         unwind_sites: 0,
         state_ptrs: BTreeMap::new(),
         flag_summaries,
-        dead_after: flag_liveness::dead_after(func, flag_summaries),
+        block_live_out: flag_liveness::block_live_out(func, flag_summaries),
         dead_flags: 0,
         known: Known::default(),
         edge_known: Vec::new(),
@@ -611,9 +611,10 @@ struct FunctionLifter<'a> {
     /// (`flag_liveness`); without it every call and tail jump stores every tracked flag and
     /// register and every call reloads them.
     flag_summaries: Option<&'a FlagSummaries>,
-    /// Per modelled instruction, the flags dead right after it (`flag_liveness::dead_after`).
-    dead_after: BTreeMap<u64, FlagMask>,
-    /// [`Self::dead_after`] of the instruction being lifted (0 outside modelled instructions):
+    /// Flags live at the exit of each basic block (`flag_liveness::block_live_out`), before the
+    /// block's own instructions or `Branch` terminator are accounted for.
+    block_live_out: BTreeMap<u64, FlagMask>,
+    /// Per-instruction dead flags mask (0 outside modelled instructions):
     /// these flags are neither computed nor stored.
     dead_flags: FlagMask,
     /// Load forwarding: the value each GPR / flag alloca holds, as far as it is known in the
@@ -626,11 +627,57 @@ struct FunctionLifter<'a> {
     edge_known: Vec<(u64, Known)>,
 }
 
+/// High-level origin of the current block's live arithmetic flags, used to fuse
+/// `cmp`/`test`/ALU/shift/bit-scan -> `jcc`/`setcc`/`cmovcc` into a single direct `icmp`
+/// instead of materializing and combining individual flag slots.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum FlagSource {
+    /// `a - b` (`cmp`, `sub`, `neg`): all 10 relational CCs lower directly to `icmp <pred> a, b`;
+    /// `e`/`ne`/`s`/`ns` use `diff` (when available) or `a` vs 0 (when `b == "0"`).
+    Compare {
+        a: String,
+        b: String,
+        diff: Option<String>,
+        bits: u32,
+    },
+    /// Logical result (`test`, `and`, `or`, `xor`, `andn`): `CF = 0, OF = 0`, `ZF`/`SF` from
+    /// `result`; all non-parity CCs lower directly to a constant or one `icmp <pred> result, 0`.
+    LogicZero { result: String, bits: u32 },
+    /// Result (`add`, `blsi`, `blsr`, `bzhi`, non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`):
+    /// `e`/`ne`/`s`/`ns` lower directly to `icmp eq/ne/slt/sge result, 0`.
+    ResultZeroSign { result: String, bits: u32 },
+    /// `dec a` (`result = a - 1`, preserving `CF`): `e`/`ne`/`s`/`ns` test `result` vs 0;
+    /// `l`/`ge`/`le`/`g` test `a` vs 1.
+    Dec {
+        a: String,
+        result: String,
+        bits: u32,
+    },
+    /// `inc a` (`result = a + 1`, preserving `CF`): `e`/`ne`/`s`/`ns` test `result` vs 0;
+    /// `l`/`ge`/`le`/`g` test `a` vs -1.
+    Inc {
+        a: String,
+        result: String,
+        bits: u32,
+    },
+    /// `ZF = (val == 0)` (`popcnt`, `bextr`): `e`/`ne` test `val` vs 0.
+    ZeroOnly { val: String, bits: u32 },
+    /// Precomputed `ZF = is_zero` (`bsf`, `bsr`): `e` uses `is_zero`, `ne` negates it.
+    ZeroBit { is_zero: String },
+    /// `tzcnt`/`lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)`.
+    BitCount {
+        src: String,
+        result: String,
+        bits: u32,
+    },
+}
+
 /// See [`FunctionLifter::known`].
 #[derive(Clone, Default)]
 struct Known {
     gprs: [Option<String>; 16],
     flags: [Option<String>; 6],
+    flag_source: Option<FlagSource>,
 }
 
 struct Checkpoint {
@@ -690,6 +737,13 @@ impl FunctionLifter<'_> {
             };
             let mut trapped = false;
             let bursts = self.find_window_bursts(body);
+            let live_out = self
+                .block_live_out
+                .get(&start)
+                .copied()
+                .unwrap_or(ALL_FLAGS);
+            let block_dead =
+                flag_liveness::dead_flags_for_block(block, live_out, self.flag_summaries, &bursts);
             let mut burst_cursor = 0usize;
             let mut idx = 0usize;
             while idx < body.len() {
@@ -713,7 +767,11 @@ impl FunctionLifter<'_> {
                             address: bad.ip(),
                         });
                     }
-                    match self.lift_window_burst(burst, slice) {
+                    match self.lift_window_burst(
+                        burst,
+                        slice,
+                        &block_dead[burst.start..=burst.end],
+                    ) {
                         Ok(true) => {
                             idx = burst.end + 1;
                             burst_cursor += 1;
@@ -730,7 +788,7 @@ impl FunctionLifter<'_> {
                 }
                 let checkpoint = self.checkpoint();
                 self.ea = None;
-                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                self.dead_flags = block_dead[idx];
                 let lifted = self.lift_instruction(ins);
                 self.dead_flags = 0;
                 match lifted {
@@ -1133,6 +1191,12 @@ impl FunctionLifter<'_> {
                 self.known.flags[i] = entry.flags[i].clone();
             }
         }
+        if entry.flag_source.is_some()
+            && a.flag_source == entry.flag_source
+            && b.flag_source == entry.flag_source
+        {
+            self.known.flag_source = entry.flag_source.clone();
+        }
     }
 
     // ----- guest state ---------------------------------------------------------------------------
@@ -1182,6 +1246,7 @@ impl FunctionLifter<'_> {
                 self.known.gprs[idx] = Some(v);
             }
         }
+        self.known.flag_source = None;
         for flag in FLAGS {
             if self.flags[flag as usize] {
                 let ptr = self.state_flag_ptr(flag);
@@ -1324,6 +1389,14 @@ impl FunctionLifter<'_> {
         let old = self.load_gpr(idx)?;
         let keep = !(mask(bits) << shift);
         let kept = self.val(&format!("and i64 {old}, {}", imm(keep, 64)));
+        if let Ok(c) = value.parse::<i64>() {
+            let placed = ((c as u64) & mask(bits)) << shift;
+            if placed == 0 {
+                return self.store_gpr(idx, &kept);
+            }
+            let merged = self.val(&format!("or i64 {kept}, {}", imm(placed, 64)));
+            return self.store_gpr(idx, &merged);
+        }
         let wide = self.val(&format!("zext i{bits} {value} to i64"));
         let placed = if shift == 0 {
             wide
@@ -1435,12 +1508,17 @@ impl FunctionLifter<'_> {
     }
 
     fn read_addr_reg(&mut self, reg: Register) -> R<String> {
-        let (v, bits) = self.read_reg(reg)?;
-        Ok(if bits == 64 {
-            v
-        } else {
-            self.val(&format!("zext i{bits} {v} to i64"))
-        })
+        match reg_ref(reg)? {
+            RegRef::Low(idx, 64) => self.load_gpr(idx),
+            RegRef::Low(idx, 32) => {
+                let full = self.load_gpr(idx)?;
+                Ok(self.val(&format!("and i64 {full}, 4294967295")))
+            }
+            _ => {
+                let (v, bits) = self.read_reg(reg)?;
+                Ok(self.val(&format!("zext i{bits} {v} to i64")))
+            }
+        }
     }
 
     /// Effective (segmented) address of the current instruction's memory operand, computed once
@@ -1690,6 +1768,7 @@ impl FunctionLifter<'_> {
 
     fn set_flag(&mut self, flag: Flag, value: &str) {
         debug_assert!(self.flags[flag as usize], "flag {flag:?} was not tracked");
+        self.known.flag_source = None;
         if !self.flag_live(flag) {
             return;
         }
@@ -1738,14 +1817,6 @@ impl FunctionLifter<'_> {
         self.val(&format!("icmp ne {t} {x}, 0"))
     }
 
-    /// Computes ZF, SF and PF of `r` (not stored).
-    fn zsp(&mut self, r: &str, bits: u32) -> [String; 3] {
-        let zf = self.val(&format!("icmp eq i{bits} {r}, 0"));
-        let sf = self.msb(r, bits);
-        let pf = self.parity(r, bits);
-        [zf, sf, pf]
-    }
-
     /// Computes and stores the live ones of ZF, SF and PF of `r`.
     fn set_zsp(&mut self, r: &str, bits: u32) {
         if self.flag_live(Flag::Zf) {
@@ -1789,8 +1860,159 @@ impl FunctionLifter<'_> {
         }
     }
 
+    fn negate_i1(&mut self, v: &str) -> String {
+        match v {
+            "true" => "false".to_string(),
+            "false" => "true".to_string(),
+            _ => self.val(&format!("xor i1 {v}, true")),
+        }
+    }
+
+    fn or_i1(&mut self, a: &str, b: &str) -> String {
+        match (a, b) {
+            ("true", _) | (_, "true") => "true".to_string(),
+            ("false", x) | (x, "false") => x.to_string(),
+            _ => self.val(&format!("or i1 {a}, {b}")),
+        }
+    }
+
+    fn xor_i1(&mut self, a: &str, b: &str) -> String {
+        match (a, b) {
+            ("false", x) | (x, "false") => x.to_string(),
+            ("true", x) | (x, "true") => self.negate_i1(x),
+            _ => self.val(&format!("xor i1 {a}, {b}")),
+        }
+    }
+
+    /// Evaluates `cc` directly from the current block's [`FlagSource`] as a single `icmp` (or
+    /// constant), avoiding flag-slot loads and boolean flag chains.
+    fn try_fused_condition(&mut self, cc: ConditionCode) -> Option<String> {
+        use ConditionCode as C;
+        let src = self.known.flag_source.clone()?;
+        match src {
+            FlagSource::Compare { a, b, diff, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(match diff {
+                        Some(r) => self.val(&format!("icmp eq {t} {r}, 0")),
+                        None => self.val(&format!("icmp eq {t} {a}, {b}")),
+                    }),
+                    C::ne => Some(match diff {
+                        Some(r) => self.val(&format!("icmp ne {t} {r}, 0")),
+                        None => self.val(&format!("icmp ne {t} {a}, {b}")),
+                    }),
+                    C::b => Some(if b == "0" {
+                        "false".to_string()
+                    } else {
+                        self.val(&format!("icmp ult {t} {a}, {b}"))
+                    }),
+                    C::ae => Some(if b == "0" {
+                        "true".to_string()
+                    } else {
+                        self.val(&format!("icmp uge {t} {a}, {b}"))
+                    }),
+                    C::be => Some(self.val(&format!("icmp ule {t} {a}, {b}"))),
+                    C::a => Some(self.val(&format!("icmp ugt {t} {a}, {b}"))),
+                    C::l => Some(self.val(&format!("icmp slt {t} {a}, {b}"))),
+                    C::ge => Some(self.val(&format!("icmp sge {t} {a}, {b}"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {a}, {b}"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {a}, {b}"))),
+                    C::s => match diff {
+                        Some(r) => Some(self.val(&format!("icmp slt {t} {r}, 0"))),
+                        None if b == "0" => Some(self.val(&format!("icmp slt {t} {a}, 0"))),
+                        None => None,
+                    },
+                    C::ns => match diff {
+                        Some(r) => Some(self.val(&format!("icmp sge {t} {r}, 0"))),
+                        None if b == "0" => Some(self.val(&format!("icmp sge {t} {a}, 0"))),
+                        None => None,
+                    },
+                    _ => None,
+                }
+            }
+            FlagSource::LogicZero { result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::o | C::b => Some("false".to_string()),
+                    C::no | C::ae => Some("true".to_string()),
+                    C::e | C::be => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne | C::a => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s | C::l => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns | C::ge => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {result}, 0"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {result}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::ResultZeroSign { result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::Dec { a, result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::l => Some(self.val(&format!("icmp slt {t} {a}, 1"))),
+                    C::ge => Some(self.val(&format!("icmp sge {t} {a}, 1"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {a}, 1"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {a}, 1"))),
+                    _ => None,
+                }
+            }
+            FlagSource::Inc { a, result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::s => Some(self.val(&format!("icmp slt {t} {result}, 0"))),
+                    C::ns => Some(self.val(&format!("icmp sge {t} {result}, 0"))),
+                    C::l => Some(self.val(&format!("icmp slt {t} {a}, -1"))),
+                    C::ge => Some(self.val(&format!("icmp sge {t} {a}, -1"))),
+                    C::le => Some(self.val(&format!("icmp sle {t} {a}, -1"))),
+                    C::g => Some(self.val(&format!("icmp sgt {t} {a}, -1"))),
+                    _ => None,
+                }
+            }
+            FlagSource::ZeroOnly { val, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {val}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {val}, 0"))),
+                    _ => None,
+                }
+            }
+            FlagSource::ZeroBit { is_zero } => match cc {
+                C::e => Some(is_zero),
+                C::ne => Some(self.negate_i1(&is_zero)),
+                _ => None,
+            },
+            FlagSource::BitCount { src, result, bits } => {
+                let t = ty(bits);
+                match cc {
+                    C::e => Some(self.val(&format!("icmp eq {t} {result}, 0"))),
+                    C::ne => Some(self.val(&format!("icmp ne {t} {result}, 0"))),
+                    C::b => Some(self.val(&format!("icmp eq {t} {src}, 0"))),
+                    C::ae => Some(self.val(&format!("icmp ne {t} {src}, 0"))),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     fn condition(&mut self, cc: ConditionCode) -> R<String> {
         use ConditionCode as C;
+        if let Some(fused) = self.try_fused_condition(cc) {
+            return Ok(fused);
+        }
         let (flag, negate) = match cc {
             C::o => (Flag::Of, false),
             C::no => (Flag::Of, true),
@@ -1805,43 +2027,35 @@ impl FunctionLifter<'_> {
             C::be | C::a => {
                 let cf = self.get_flag(Flag::Cf);
                 let zf = self.get_flag(Flag::Zf);
-                let be = self.val(&format!("or i1 {cf}, {zf}"));
+                let be = self.or_i1(&cf, &zf);
                 return Ok(if cc == C::be {
                     be
                 } else {
-                    self.val(&format!("xor i1 {be}, true"))
+                    self.negate_i1(&be)
                 });
             }
             C::l | C::ge => {
                 let sf = self.get_flag(Flag::Sf);
                 let of = self.get_flag(Flag::Of);
-                let l = self.val(&format!("xor i1 {sf}, {of}"));
-                return Ok(if cc == C::l {
-                    l
-                } else {
-                    self.val(&format!("xor i1 {l}, true"))
-                });
+                let l = self.xor_i1(&sf, &of);
+                return Ok(if cc == C::l { l } else { self.negate_i1(&l) });
             }
             C::le | C::g => {
                 let sf = self.get_flag(Flag::Sf);
                 let of = self.get_flag(Flag::Of);
                 let zf = self.get_flag(Flag::Zf);
-                let l = self.val(&format!("xor i1 {sf}, {of}"));
-                let le = self.val(&format!("or i1 {zf}, {l}"));
+                let l = self.xor_i1(&sf, &of);
+                let le = self.or_i1(&zf, &l);
                 return Ok(if cc == C::le {
                     le
                 } else {
-                    self.val(&format!("xor i1 {le}, true"))
+                    self.negate_i1(&le)
                 });
             }
             C::None => return unsupported("missing condition code"),
         };
         let v = self.get_flag(flag);
-        Ok(if negate {
-            self.val(&format!("xor i1 {v}, true"))
-        } else {
-            v
-        })
+        Ok(if negate { self.negate_i1(&v) } else { v })
     }
 
     // ----- instructions --------------------------------------------------------------------------
@@ -1851,6 +2065,11 @@ impl FunctionLifter<'_> {
         use Mnemonic as M;
         if ins.code() == Code::INVALID {
             return unsupported("invalid instruction encoding");
+        }
+        // Any instruction that can modify flags (or a call) invalidates the pending `FlagSource`
+        // before it runs; fusable producers reinstall their own `FlagSource` after updating flags.
+        if ins.rflags_modified() != 0 || ins.mnemonic() == M::Call {
+            self.known.flag_source = None;
         }
         if simd::is_simd(ins) {
             return self.lift_simd(ins);
@@ -1869,11 +2088,35 @@ impl FunctionLifter<'_> {
             M::Movzx | M::Movsx | M::Movsxd => {
                 let dst_bits = self.op_bits(ins, 0)?;
                 let src_bits = self.op_bits(ins, 1)?;
+                if src_bits > dst_bits {
+                    return unsupported("narrowing extension");
+                }
+                if ins.mnemonic() == M::Movzx
+                    && ins.op_kind(0) == OpKind::Register
+                    && matches!(dst_bits, 32 | 64)
+                    && src_bits < 32
+                {
+                    let RegRef::Low(dst_idx, _) = reg_ref(ins.op_register(0))? else {
+                        return unsupported("movzx destination");
+                    };
+                    // `movzx r32/r64, r8_low/r16`: mask the 64-bit source directly instead of
+                    // `trunc -> zext -> zext`. Memory / high-byte sources extend straight to i64.
+                    let wide = if ins.op_kind(1) == OpKind::Register
+                        && let Ok(RegRef::Low(src_idx, sb)) = reg_ref(ins.op_register(1))
+                        && sb == src_bits
+                    {
+                        let full = self.load_gpr(src_idx)?;
+                        self.val(&format!("and i64 {full}, {}", mask(src_bits)))
+                    } else {
+                        let v = self.read_op(ins, 1, src_bits)?;
+                        self.val(&format!("zext i{src_bits} {v} to i64"))
+                    };
+                    self.store_gpr(dst_idx, &wide)?;
+                    return Ok(());
+                }
                 let v = self.read_op(ins, 1, src_bits)?;
                 let v = if src_bits == dst_bits {
                     v
-                } else if src_bits > dst_bits {
-                    return unsupported("narrowing extension");
                 } else {
                     let ext = if ins.mnemonic() == M::Movzx {
                         "zext"
@@ -1890,6 +2133,18 @@ impl FunctionLifter<'_> {
                     return unsupported("lea without memory operand");
                 }
                 let addr = self.address(ins, false)?;
+                if bits == 32 && ins.op_kind(0) == OpKind::Register {
+                    let RegRef::Low(dst_idx, 32) = reg_ref(ins.op_register(0))? else {
+                        return unsupported("lea destination");
+                    };
+                    let masked = if let Ok(c) = addr.parse::<i64>() {
+                        imm((c as u64) & 0xFFFF_FFFF, 64)
+                    } else {
+                        self.val(&format!("and i64 {addr}, 4294967295"))
+                    };
+                    self.store_gpr(dst_idx, &masked)?;
+                    return Ok(());
+                }
                 let v = if bits == 64 {
                     addr
                 } else {
@@ -1980,11 +2235,29 @@ impl FunctionLifter<'_> {
             | M::Cmovg => {
                 let bits = self.op_bits(ins, 0)?;
                 let c = self.condition(ins.condition_code())?;
-                let src = self.read_op(ins, 1, bits)?;
-                let old = self.read_op(ins, 0, bits)?;
-                let v = self.val(&format!("select i1 {c}, i{bits} {src}, i{bits} {old}"));
-                // A 32-bit cmov zero-extends the destination even when the condition is false.
-                self.write_op(ins, 0, &v, bits)?;
+                if bits == 32
+                    && ins.op_kind(0) == OpKind::Register
+                    && ins.op_kind(1) == OpKind::Register
+                {
+                    let RegRef::Low(dst_idx, 32) = reg_ref(ins.op_register(0))? else {
+                        return unsupported("cmov destination");
+                    };
+                    let RegRef::Low(src_idx, 32) = reg_ref(ins.op_register(1))? else {
+                        return unsupported("cmov source");
+                    };
+                    let src64 = self.load_gpr(src_idx)?;
+                    let old64 = self.load_gpr(dst_idx)?;
+                    let sel = self.val(&format!("select i1 {c}, i64 {src64}, i64 {old64}"));
+                    // A 32-bit cmov zero-extends the destination even when the condition is false.
+                    let wide = self.val(&format!("and i64 {sel}, 4294967295"));
+                    self.store_gpr(dst_idx, &wide)?;
+                } else {
+                    let src = self.read_op(ins, 1, bits)?;
+                    let old = self.read_op(ins, 0, bits)?;
+                    let v = self.val(&format!("select i1 {c}, i{bits} {src}, i{bits} {old}"));
+                    // A 32-bit cmov zero-extends the destination even when the condition is false.
+                    self.write_op(ins, 0, &v, bits)?;
+                }
             }
             M::Push => {
                 let bits = match ins.stack_pointer_increment() {
@@ -2063,6 +2336,7 @@ impl FunctionLifter<'_> {
                     if !matches!(op, Alu::Test) {
                         self.write_op(ins, 0, &a, bits)?;
                     }
+                    self.known.flag_source = Some(FlagSource::LogicZero { result: a, bits });
                     return Ok(());
                 }
                 Alu::Add | Alu::Adc | Alu::Sbb => {}
@@ -2081,63 +2355,129 @@ impl FunctionLifter<'_> {
     /// and returns the result. Also used with the old value of an atomic read-modify-write.
     fn alu_value(&mut self, op: Alu, a: &str, b: &str, bits: u32) -> String {
         let t = ty(bits);
-        let r = match op {
-            Alu::Add | Alu::Adc => {
-                let (r, cf) = if matches!(op, Alu::Add) {
-                    let r = self.val(&format!("add {t} {a}, {b}"));
-                    let cf = if self.flag_live(Flag::Cf) {
-                        self.val(&format!("icmp ult {t} {r}, {a}"))
-                    } else {
-                        String::new()
-                    };
-                    (r, cf)
+        match op {
+            Alu::Add => {
+                let r = if b == "0" {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, "false");
+                    a.to_string()
                 } else {
-                    // carry out of a + b + c: r < a, or r == a with a carry in.
-                    let c = self.get_flag(Flag::Cf);
-                    let cz = self.val(&format!("zext i1 {c} to {t}"));
-                    let s = self.val(&format!("add {t} {a}, {b}"));
-                    let r = self.val(&format!("add {t} {s}, {cz}"));
-                    let cf = if self.flag_live(Flag::Cf) {
-                        let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
-                        let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
-                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                        self.val(&format!("or i1 {lt}, {ceq}"))
-                    } else {
-                        String::new()
-                    };
-                    (r, cf)
+                    let r = self.val(&format!("add {t} {a}, {b}"));
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ult {t} {r}, {a}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    self.set_of_af(a, b, &r, bits, false);
+                    r
                 };
-                self.set_flag(Flag::Cf, &cf);
-                self.set_of_af(a, b, &r, bits, false);
+                self.set_zsp(&r, bits);
+                self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                    result: r.clone(),
+                    bits,
+                });
                 r
             }
-            Alu::Sub | Alu::Cmp | Alu::Sbb => {
-                let (r, cf) = if matches!(op, Alu::Sbb) {
-                    // borrow out of a - b - c: a < b, or a == b with a borrow in.
-                    let c = self.get_flag(Flag::Cf);
-                    let cz = self.val(&format!("zext i1 {c} to {t}"));
-                    let d = self.val(&format!("sub {t} {a}, {b}"));
-                    let r = self.val(&format!("sub {t} {d}, {cz}"));
-                    let cf = if self.flag_live(Flag::Cf) {
-                        let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
-                        let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
-                        let ceq = self.val(&format!("and i1 {c}, {eq}"));
-                        self.val(&format!("or i1 {lt}, {ceq}"))
+            Alu::Adc => {
+                // carry out of a + b + c: r < a, or r == a with a carry in.
+                let c = self.get_flag(Flag::Cf);
+                let cz = self.val(&format!("zext i1 {c} to {t}"));
+                let s = self.val(&format!("add {t} {a}, {b}"));
+                let r = self.val(&format!("add {t} {s}, {cz}"));
+                if self.flag_live(Flag::Cf) {
+                    let lt = self.val(&format!("icmp ult {t} {r}, {a}"));
+                    let eq = self.val(&format!("icmp eq {t} {r}, {a}"));
+                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                    self.set_flag(Flag::Cf, &cf);
+                }
+                self.set_of_af(a, b, &r, bits, false);
+                self.set_zsp(&r, bits);
+                r
+            }
+            Alu::Cmp => {
+                let diff = if b == "0" {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, "false");
+                    self.set_zsp(a, bits);
+                    None
+                } else {
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ult {t} {a}, {b}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    if self.flag_live(Flag::Zf) {
+                        let zf = self.val(&format!("icmp eq {t} {a}, {b}"));
+                        self.set_flag(Flag::Zf, &zf);
+                    }
+                    let need_diff = self.flag_live(Flag::Of)
+                        || self.flag_live(Flag::Af)
+                        || self.flag_live(Flag::Sf)
+                        || self.flag_live(Flag::Pf);
+                    if need_diff {
+                        let r = self.val(&format!("sub {t} {a}, {b}"));
+                        self.set_of_af(a, b, &r, bits, true);
+                        if self.flag_live(Flag::Sf) {
+                            let sf = self.msb(&r, bits);
+                            self.set_flag(Flag::Sf, &sf);
+                        }
+                        if self.flag_live(Flag::Pf) {
+                            let pf = self.parity(&r, bits);
+                            self.set_flag(Flag::Pf, &pf);
+                        }
+                        Some(r)
                     } else {
-                        String::new()
-                    };
-                    (r, cf)
+                        None
+                    }
+                };
+                self.known.flag_source = Some(FlagSource::Compare {
+                    a: a.to_string(),
+                    b: b.to_string(),
+                    diff,
+                    bits,
+                });
+                String::new()
+            }
+            Alu::Sub => {
+                let r = if b == "0" {
+                    self.set_flag(Flag::Cf, "false");
+                    self.set_flag(Flag::Of, "false");
+                    self.set_flag(Flag::Af, "false");
+                    a.to_string()
                 } else {
                     let r = self.val(&format!("sub {t} {a}, {b}"));
-                    let cf = if self.flag_live(Flag::Cf) {
-                        self.val(&format!("icmp ult {t} {a}, {b}"))
-                    } else {
-                        String::new()
-                    };
-                    (r, cf)
+                    if self.flag_live(Flag::Cf) {
+                        let cf = self.val(&format!("icmp ult {t} {a}, {b}"));
+                        self.set_flag(Flag::Cf, &cf);
+                    }
+                    self.set_of_af(a, b, &r, bits, true);
+                    r
                 };
-                self.set_flag(Flag::Cf, &cf);
+                self.set_zsp(&r, bits);
+                self.known.flag_source = Some(FlagSource::Compare {
+                    a: a.to_string(),
+                    b: b.to_string(),
+                    diff: Some(r.clone()),
+                    bits,
+                });
+                r
+            }
+            Alu::Sbb => {
+                // borrow out of a - b - c: a < b, or a == b with a borrow in.
+                let c = self.get_flag(Flag::Cf);
+                let cz = self.val(&format!("zext i1 {c} to {t}"));
+                let d = self.val(&format!("sub {t} {a}, {b}"));
+                let r = self.val(&format!("sub {t} {d}, {cz}"));
+                if self.flag_live(Flag::Cf) {
+                    let lt = self.val(&format!("icmp ult {t} {a}, {b}"));
+                    let eq = self.val(&format!("icmp eq {t} {a}, {b}"));
+                    let ceq = self.val(&format!("and i1 {c}, {eq}"));
+                    let cf = self.val(&format!("or i1 {lt}, {ceq}"));
+                    self.set_flag(Flag::Cf, &cf);
+                }
                 self.set_of_af(a, b, &r, bits, true);
+                self.set_zsp(&r, bits);
                 r
             }
             Alu::And | Alu::Or | Alu::Xor | Alu::Test => {
@@ -2150,11 +2490,14 @@ impl FunctionLifter<'_> {
                 // CF and OF are cleared; AF is undefined and left unchanged.
                 self.set_flag(Flag::Cf, "false");
                 self.set_flag(Flag::Of, "false");
+                self.set_zsp(&r, bits);
+                self.known.flag_source = Some(FlagSource::LogicZero {
+                    result: r.clone(),
+                    bits,
+                });
                 r
             }
-        };
-        self.set_zsp(&r, bits);
-        r
+        }
     }
 
     fn unary(&mut self, ins: &Instruction) -> R<()> {
@@ -2169,7 +2512,7 @@ impl FunctionLifter<'_> {
     fn unary_value(&mut self, mnemonic: Mnemonic, a: &str, bits: u32) -> String {
         let t = ty(bits);
         let min = imm(1u64 << (bits - 1), bits);
-        let r = match mnemonic {
+        let (r, source) = match mnemonic {
             Mnemonic::Not => {
                 // `not` does not modify any flag.
                 return self.val(&format!("xor {t} {a}, -1"));
@@ -2185,7 +2528,12 @@ impl FunctionLifter<'_> {
                     let af = self.aux_flag(a, "1", &r, bits);
                     self.set_flag(Flag::Af, &af);
                 }
-                r
+                let src = FlagSource::Inc {
+                    a: a.to_string(),
+                    result: r.clone(),
+                    bits,
+                };
+                (r, src)
             }
             Mnemonic::Dec => {
                 let r = self.val(&format!("sub {t} {a}, 1"));
@@ -2197,7 +2545,12 @@ impl FunctionLifter<'_> {
                     let af = self.aux_flag(a, "1", &r, bits);
                     self.set_flag(Flag::Af, &af);
                 }
-                r
+                let src = FlagSource::Dec {
+                    a: a.to_string(),
+                    result: r.clone(),
+                    bits,
+                };
+                (r, src)
             }
             _ => {
                 // neg
@@ -2214,10 +2567,17 @@ impl FunctionLifter<'_> {
                     let af = self.aux_flag("0", a, &r, bits);
                     self.set_flag(Flag::Af, &af);
                 }
-                r
+                let src = FlagSource::Compare {
+                    a: "0".to_string(),
+                    b: a.to_string(),
+                    diff: Some(r.clone()),
+                    bits,
+                };
+                (r, src)
             }
         };
         self.set_zsp(&r, bits);
+        self.known.flag_source = Some(source);
         r
     }
 
@@ -2230,12 +2590,23 @@ impl FunctionLifter<'_> {
         let count_mask: u64 = if bits == 64 { 63 } else { 31 };
         let a = self.read_op(ins, 0, bits)?;
 
-        // Masked count as i64 (and constant value when immediate).
+        // Native count width: `i32` for 32-bit shifts/rotates, `i{bits}` for 8/16-bit rotates,
+        // `i64` for 64-bit and for 8/16-bit shifts (which widen to i64 so counts 8..31 never poison).
+        let cnt_bits = match (kind, bits) {
+            (Shift::Rol | Shift::Ror, b) => b,
+            (_, 32) => 32,
+            _ => 64,
+        };
         let (count, imm_count) = match ins.op_kind(1) {
             OpKind::Register if ins.op_register(1) == Register::CL => {
                 let (cl, _) = self.read_reg(Register::CL)?;
                 let masked = self.val(&format!("and i8 {cl}, {count_mask}"));
-                (self.val(&format!("zext i8 {masked} to i64")), None)
+                let widened = if cnt_bits == 8 {
+                    masked
+                } else {
+                    self.val(&format!("zext i8 {masked} to i{cnt_bits}"))
+                };
+                (widened, None)
             }
             kind if is_immediate(kind) => match ins.try_immediate(1) {
                 Ok(v) => {
@@ -2257,11 +2628,6 @@ impl FunctionLifter<'_> {
         let (r, cf, of): (String, Option<String>, Option<String>) = match kind {
             Shift::Rol | Shift::Ror => {
                 // fshl/fshr take the amount modulo the width, like x86 rotates (after masking).
-                let amount = if bits == 64 || imm_count.is_some() {
-                    count.clone()
-                } else {
-                    self.val(&format!("trunc i64 {count} to {t}"))
-                };
                 let (name, support) = if kind == Shift::Rol {
                     ("fshl", Support::Fshl(bits))
                 } else {
@@ -2269,7 +2635,7 @@ impl FunctionLifter<'_> {
                 };
                 self.support.insert(support);
                 let r = self.val(&format!(
-                    "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {amount})"
+                    "call {t} @llvm.{name}.{t}({t} {a}, {t} {a}, {t} {count})"
                 ));
                 if kind == Shift::Rol {
                     let cf =
@@ -2295,40 +2661,33 @@ impl FunctionLifter<'_> {
                 }
             }
             _ => {
-                // count - 1 (masked so a zero count never produces a poison shift amount).
-                let prev = if !want_cf || kind == Shift::Shl {
-                    String::new()
-                } else {
-                    match imm_count {
-                        Some(c) => (c - 1).to_string(),
-                        None => {
-                            let prev = self.val(&format!("add i64 {count}, 63"));
-                            self.val(&format!("and i64 {prev}, 63"))
-                        }
-                    }
-                };
                 let op = match kind {
                     Shift::Shl => "shl",
                     Shift::Shr => "lshr",
                     _ => "ashr",
                 };
-                if bits == 64 {
-                    let r = self.val(&format!("{op} i64 {a}, {count}"));
+                if bits == 64 || bits == 32 {
+                    // Masked counts are in 0..bits, so native `i32`/`i64` shifts never poison.
+                    let w = u64::from(bits);
+                    let m = w - 1;
+                    let r = self.val(&format!("{op} {t} {a}, {count}"));
                     match kind {
                         Shift::Shl => {
-                            let cf = (want_cf || want_of).then(|| {
-                                let back = match imm_count {
-                                    Some(c) => ((64 - c) & 63).to_string(),
-                                    None => {
-                                        let back = self.val(&format!("sub i64 64, {count}"));
-                                        self.val(&format!("and i64 {back}, 63"))
-                                    }
-                                };
-                                let out = self.val(&format!("lshr i64 {a}, {back}"));
-                                self.val(&format!("trunc i64 {out} to i1"))
+                            let cf = (want_cf || want_of).then(|| match imm_count {
+                                Some(1) => self.msb(&a, bits),
+                                Some(c) => {
+                                    let out = self.val(&format!("lshr {t} {a}, {}", (w - c) & m));
+                                    self.val(&format!("trunc {t} {out} to i1"))
+                                }
+                                None => {
+                                    let back = self.val(&format!("sub {t} {w}, {count}"));
+                                    let back = self.val(&format!("and {t} {back}, {m}"));
+                                    let out = self.val(&format!("lshr {t} {a}, {back}"));
+                                    self.val(&format!("trunc {t} {out} to i1"))
+                                }
                             });
                             let of = if want_of {
-                                let msb = self.msb(&r, 64);
+                                let msb = self.msb(&r, bits);
                                 Some(self.val(&format!("xor i1 {msb}, {}", cf.as_ref().unwrap())))
                             } else {
                                 None
@@ -2336,12 +2695,21 @@ impl FunctionLifter<'_> {
                             (r, cf.filter(|_| want_cf), of)
                         }
                         _ => {
-                            let cf = want_cf.then(|| {
-                                let out = self.val(&format!("{op} i64 {a}, {prev}"));
-                                self.val(&format!("trunc i64 {out} to i1"))
+                            let cf = want_cf.then(|| match imm_count {
+                                Some(1) => self.val(&format!("trunc {t} {a} to i1")),
+                                Some(c) => {
+                                    let out = self.val(&format!("{op} {t} {a}, {}", c - 1));
+                                    self.val(&format!("trunc {t} {out} to i1"))
+                                }
+                                None => {
+                                    let prev = self.val(&format!("add {t} {count}, {m}"));
+                                    let prev = self.val(&format!("and {t} {prev}, {m}"));
+                                    let out = self.val(&format!("{op} {t} {a}, {prev}"));
+                                    self.val(&format!("trunc {t} {out} to i1"))
+                                }
                             });
                             let of = if kind == Shift::Shr {
-                                want_of.then(|| self.msb(&a, 64))
+                                want_of.then(|| self.msb(&a, bits))
                             } else {
                                 want_of.then(|| "false".to_string())
                             };
@@ -2349,7 +2717,18 @@ impl FunctionLifter<'_> {
                         }
                     }
                 } else {
-                    // Narrow operands are shifted in 64 bits; counts are at most 31 here.
+                    // 8/16-bit operands are shifted in 64 bits so masked counts up to 31 never poison.
+                    let prev = if !want_cf || kind == Shift::Shl {
+                        String::new()
+                    } else {
+                        match imm_count {
+                            Some(c) => (c - 1).to_string(),
+                            None => {
+                                let prev = self.val(&format!("add i64 {count}, 63"));
+                                self.val(&format!("and i64 {prev}, 63"))
+                            }
+                        }
+                    };
                     let ext = if kind == Shift::Sar { "sext" } else { "zext" };
                     let wide = self.val(&format!("{ext} {t} {a} to i64"));
                     let res = self.val(&format!("{op} i64 {wide}, {count}"));
@@ -2409,13 +2788,19 @@ impl FunctionLifter<'_> {
                     self.set_flag(flag, &new);
                 }
             } else {
-                let nonzero = self.val(&format!("icmp ne i64 {count}, 0"));
+                let nonzero = self.val(&format!("icmp ne i{cnt_bits} {count}, 0"));
                 for (flag, new) in updates {
                     let old = self.get_flag(flag);
                     let v = self.val(&format!("select i1 {nonzero}, i1 {new}, i1 {old}"));
                     self.set_flag(flag, &v);
                 }
             }
+        }
+        if !matches!(kind, Shift::Rol | Shift::Ror) && imm_count.is_some() {
+            self.known.flag_source = Some(FlagSource::ResultZeroSign {
+                result: r.clone(),
+                bits,
+            });
         }
         self.write_op(ins, 0, &r, bits)
     }
@@ -2496,14 +2881,17 @@ impl FunctionLifter<'_> {
             _ => (Register::RAX, Register::RDX),
         };
         let (a, _) = self.read_reg(acc)?;
+        let want_ov = self.flag_live(Flag::Cf) || self.flag_live(Flag::Of);
         let overflow = if bits == 64 {
             let (lo, hi) = self.mul128(&a, &src, signed);
-            let ov = if signed {
-                let sign = self.val(&format!("ashr i64 {lo}, 63"));
-                self.val(&format!("icmp ne i64 {hi}, {sign}"))
-            } else {
-                self.val(&format!("icmp ne i64 {hi}, 0"))
-            };
+            let ov = want_ov.then(|| {
+                if signed {
+                    let sign = self.val(&format!("ashr i64 {lo}, 63"));
+                    self.val(&format!("icmp ne i64 {hi}, {sign}"))
+                } else {
+                    self.val(&format!("icmp ne i64 {hi}, 0"))
+                }
+            });
             self.write_reg(Register::RAX, &lo, 64)?;
             self.write_reg(Register::RDX, &hi, 64)?;
             ov
@@ -2513,27 +2901,31 @@ impl FunctionLifter<'_> {
             let wb = self.val(&format!("{ext} {t} {src} to i64"));
             let p = self.val(&format!("mul i64 {wa}, {wb}"));
             let lo = self.val(&format!("trunc i64 {p} to {t}"));
-            let ov = if signed {
-                let back = self.val(&format!("sext {t} {lo} to i64"));
-                self.val(&format!("icmp ne i64 {back}, {p}"))
-            } else {
-                let high = self.val(&format!("lshr i64 {p}, {bits}"));
-                self.val(&format!("icmp ne i64 {high}, 0"))
-            };
+            let high = (bits != 8 || (want_ov && !signed))
+                .then(|| self.val(&format!("lshr i64 {p}, {bits}")));
+            let ov = want_ov.then(|| {
+                if signed {
+                    let back = self.val(&format!("sext {t} {lo} to i64"));
+                    self.val(&format!("icmp ne i64 {back}, {p}"))
+                } else {
+                    self.val(&format!("icmp ne i64 {}, 0", high.as_ref().unwrap()))
+                }
+            });
             if bits == 8 {
                 let ax = self.val(&format!("trunc i64 {p} to i16"));
                 self.write_reg(Register::AX, &ax, 16)?;
             } else {
-                let high = self.val(&format!("lshr i64 {p}, {bits}"));
-                let hi = self.val(&format!("trunc i64 {high} to {t}"));
+                let hi = self.val(&format!("trunc i64 {} to {t}", high.unwrap()));
                 self.write_reg(acc, &lo, bits)?;
                 self.write_reg(dst_hi, &hi, bits)?;
             }
             ov
         };
         // SF, ZF, AF and PF are undefined and left unchanged.
-        self.set_flag(Flag::Cf, &overflow);
-        self.set_flag(Flag::Of, &overflow);
+        if let Some(overflow) = overflow {
+            self.set_flag(Flag::Cf, &overflow);
+            self.set_flag(Flag::Of, &overflow);
+        }
         Ok(())
     }
 
@@ -2546,15 +2938,14 @@ impl FunctionLifter<'_> {
         let divisor = self.read_op(ins, 0, bits)?;
         let ext = if signed { "sext" } else { "zext" };
 
-        let (hi, lo, d) = if bits == 64 {
-            let (hi, _) = self.read_reg(Register::RDX)?;
-            let (lo, _) = self.read_reg(Register::RAX)?;
-            (hi, lo, divisor)
-        } else {
-            // Assemble the 2N-bit dividend in an i64, then extend it to 128 bits.
-            let dividend = if bits == 8 {
+        // 8/16/32-bit `div`/`idiv`: the 2N-bit dividend fits natively in `i64`, so lower straight
+        // to Wasm64/native `udiv`/`sdiv`/`urem`/`srem i64` without calling the 128-bit helpers.
+        if bits < 64 {
+            let (dividend, hi_part) = if bits == 8 {
                 let (ax, _) = self.read_reg(Register::AX)?;
-                self.val(&format!("{ext} i16 {ax} to i64"))
+                let div = self.val(&format!("{ext} i16 {ax} to i64"));
+                let hi = (!signed).then(|| self.val(&format!("lshr i64 {div}, 8")));
+                (div, hi)
             } else {
                 let (hreg, lreg) = if bits == 16 {
                     (Register::DX, Register::AX)
@@ -2563,26 +2954,63 @@ impl FunctionLifter<'_> {
                 };
                 let (h, _) = self.read_reg(hreg)?;
                 let (l, _) = self.read_reg(lreg)?;
-                let h = self.val(&format!("zext {t} {h} to i64"));
-                let l = self.val(&format!("zext {t} {l} to i64"));
-                let h = self.val(&format!("shl i64 {h}, {bits}"));
-                let joined = self.val(&format!("or i64 {h}, {l}"));
-                if signed && bits == 16 {
+                let h64 = self.val(&format!("zext {t} {h} to i64"));
+                let l64 = self.val(&format!("zext {t} {l} to i64"));
+                let hsh = self.val(&format!("shl i64 {h64}, {bits}"));
+                let joined = self.val(&format!("or i64 {hsh}, {l64}"));
+                let div = if signed && bits == 16 {
                     let narrow = self.val(&format!("trunc i64 {joined} to i32"));
                     self.val(&format!("sext i32 {narrow} to i64"))
                 } else {
                     joined
-                }
-            };
-            let hi = if signed {
-                self.val(&format!("ashr i64 {dividend}, 63"))
-            } else {
-                "0".to_string()
+                };
+                (div, (!signed).then_some(h64))
             };
             let d = self.val(&format!("{ext} {t} {divisor} to i64"));
-            (hi, dividend, d)
-        };
+            let (q, r) = if !signed {
+                // `d == 0` OR `floor(dividend / d) >= 2^bits` iff `hi_part >=u d`.
+                let hi_part = hi_part.expect("unsigned hi_part");
+                let fault = self.val(&format!("icmp uge i64 {hi_part}, {d}"));
+                self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
+                let q64 = self.val(&format!("udiv i64 {dividend}, {d}"));
+                let r64 = self.val(&format!("urem i64 {dividend}, {d}"));
+                (
+                    self.val(&format!("trunc i64 {q64} to {t}")),
+                    self.val(&format!("trunc i64 {r64} to {t}")),
+                )
+            } else {
+                let d_zero = self.val(&format!("icmp eq i64 {d}, 0"));
+                let pre_fault = if bits == 32 {
+                    // Guard LLVM/wasm `sdiv`/`srem` against `INT64_MIN / -1` (also #DE on x86).
+                    let is_min =
+                        self.val(&format!("icmp eq i64 {dividend}, -9223372036854775808"));
+                    let is_neg1 = self.val(&format!("icmp eq i64 {d}, -1"));
+                    let sdiv_ov = self.val(&format!("and i1 {is_min}, {is_neg1}"));
+                    self.val(&format!("or i1 {d_zero}, {sdiv_ov}"))
+                } else {
+                    d_zero
+                };
+                self.cold_trap_branch(&pre_fault, ColdTrapKind::DivideError, ins.ip());
+                let q64 = self.val(&format!("sdiv i64 {dividend}, {d}"));
+                let r64 = self.val(&format!("srem i64 {dividend}, {d}"));
+                let qn = self.val(&format!("trunc i64 {q64} to {t}"));
+                let rn = self.val(&format!("trunc i64 {r64} to {t}"));
+                let back = self.val(&format!("sext {t} {qn} to i64"));
+                let range = self.val(&format!("icmp ne i64 {back}, {q64}"));
+                self.cold_trap_branch(&range, ColdTrapKind::DivideError, ins.ip());
+                (qn, rn)
+            };
+            let (qreg, rreg) = match bits {
+                8 => (Register::AL, Register::AH),
+                16 => (Register::AX, Register::DX),
+                _ => (Register::EAX, Register::EDX),
+            };
+            self.write_reg(qreg, &q, bits)?;
+            return self.write_reg(rreg, &r, bits);
+        }
 
+        let (hi, _) = self.read_reg(Register::RDX)?;
+        let (lo, _) = self.read_reg(Register::RAX)?;
         let helper = if signed {
             self.support.insert(Support::Sdiv128);
             "__playgta6_sdiv128"
@@ -2591,32 +3019,14 @@ impl FunctionLifter<'_> {
             "__playgta6_udiv128"
         };
         let res = self.val(&format!(
-            "call {{ i64, i64, i1 }} @{helper}(i64 {hi}, i64 {lo}, i64 {d})"
+            "call {{ i64, i64, i1 }} @{helper}(i64 {hi}, i64 {lo}, i64 {divisor})"
         ));
         let q = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 0"));
         let r = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 1"));
-        let mut fault = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 2"));
-        let (q, r) = if bits == 64 {
-            (q, r)
-        } else {
-            let qn = self.val(&format!("trunc i64 {q} to {t}"));
-            let rn = self.val(&format!("trunc i64 {r} to {t}"));
-            let back = self.val(&format!("{ext} {t} {qn} to i64"));
-            let range = self.val(&format!("icmp ne i64 {back}, {q}"));
-            fault = self.val(&format!("or i1 {fault}, {range}"));
-            (qn, rn)
-        };
-
+        let fault = self.val(&format!("extractvalue {{ i64, i64, i1 }} {res}, 2"));
         self.cold_trap_branch(&fault, ColdTrapKind::DivideError, ins.ip());
-
-        let (qreg, rreg) = match bits {
-            8 => (Register::AL, Register::AH),
-            16 => (Register::AX, Register::DX),
-            32 => (Register::EAX, Register::EDX),
-            _ => (Register::RAX, Register::RDX),
-        };
-        self.write_reg(qreg, &q, bits)?;
-        self.write_reg(rreg, &r, bits)
+        self.write_reg(Register::RAX, &q, 64)?;
+        self.write_reg(Register::RDX, &r, 64)
     }
 
     // ----- control flow --------------------------------------------------------------------------
@@ -2956,6 +3366,23 @@ exit:
 pub(super) const SDIV128_IR: &str = "\
 define internal { i64, i64, i1 } @__playgta6_sdiv128(i64 %hi, i64 %lo, i64 %d) unnamed_addr #0 {
 entry:
+  %sign = ashr i64 %lo, 63
+  %narrow = icmp eq i64 %hi, %sign
+  %nz = icmp ne i64 %d, 0
+  %is_min = icmp eq i64 %lo, -9223372036854775808
+  %is_neg1 = icmp eq i64 %d, -1
+  %ov = and i1 %is_min, %is_neg1
+  %not_ov = xor i1 %ov, true
+  %ok0 = and i1 %narrow, %nz
+  %fast_ok = and i1 %ok0, %not_ov
+  br i1 %fast_ok, label %fast, label %slow
+fast:
+  %fq = sdiv i64 %lo, %d
+  %fr = srem i64 %lo, %d
+  %f0 = insertvalue { i64, i64, i1 } { i64 0, i64 0, i1 false }, i64 %fq, 0
+  %f1 = insertvalue { i64, i64, i1 } %f0, i64 %fr, 1
+  ret { i64, i64, i1 } %f1
+slow:
   %nneg = icmp slt i64 %hi, 0
   %dneg = icmp slt i64 %d, 0
   %lo.neg = sub i64 0, %lo

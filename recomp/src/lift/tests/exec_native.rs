@@ -297,3 +297,126 @@ fn lifted_code_runs_natively() {
         expected(a, b)
     );
 }
+
+#[test]
+fn r60_scalar_bitmanip_and_fused_branches_run_natively() {
+    if !cfg!(target_arch = "x86_64") {
+        eprintln!("skipping native R60 test: host is not x86-64");
+        return;
+    }
+    let Some(tool) = find_llvm_tool() else {
+        eprintln!("skipping native R60 test: no LLVM tool (llc/clang) found");
+        return;
+    };
+    let target = LiftTarget::native_host();
+    let triple = target.triple().to_string();
+    let dir = TempDir::new();
+
+    // Exercises R60 paths natively: bsf(0)/bsr(0) preservation, tzcnt/lzcnt/popcnt, rol/ror,
+    // shld/shrd, bswap, 32-bit div/idiv, 32-bit shifts, movzx, and fused signed INT_MIN/INT_MAX cmp+jle/cmovg.
+    let prog = Program::new().asm(F, |a| {
+        let mut lt_ok = a.create_label();
+        let mut bad = a.create_label();
+        // 1. cmp INT_MIN, INT_MAX -> jle must be taken!
+        a.mov(r8, i64::MIN as u64)?;
+        a.mov(r9, i64::MAX as u64)?;
+        a.cmp(r8, r9)?;
+        a.jle(lt_ok)?;
+        a.jmp(bad)?;
+        a.set_label(&mut lt_ok)?;
+        // 2. bsf(0) preserves 64-bit r10 = 0x1234_5678_9ABC_DEF0
+        a.mov(r10, 0x1234_5678_9ABC_DEF0u64)?;
+        a.xor(ecx, ecx)?;
+        a.bsf(r10d, ecx)?;
+        // 3. tzcnt(0) = 64, lzcnt(0) = 64, popcnt(0xF0F0) = 8
+        a.tzcnt(rax, rcx)?;
+        a.lzcnt(r11, rcx)?;
+        a.add(rax, r11)?; // 128
+        a.mov(ecx, 0xF0F0)?;
+        a.popcnt(ecx, ecx)?;
+        a.add(rax, rcx)?; // 136
+        // 4. rol32(0x8000_0001, 1) = 3, bswap32(0x01020304) = 0x04030201
+        a.mov(edx, 0x8000_0001u32)?;
+        a.rol(edx, 1)?;
+        a.add(rax, rdx)?; // 139
+        a.mov(edx, 0x0102_0304u32)?;
+        a.bswap(edx)?;
+        a.shr(edx, 24)?; // 4
+        a.add(rax, rdx)?; // 143
+        // 5. shld32(0x1234_5678, 0x9ABC_DEF0, 4) = 0x2345_6789 -> low byte 0x89
+        a.mov(ecx, 0x1234_5678u32)?;
+        a.mov(edx, 0x9ABC_DEF0u32)?;
+        a.shld(ecx, edx, 4)?;
+        a.movzx(ecx, cl)?;
+        a.add(rax, rcx)?; // 143 + 0x89 = 280
+        a.mov(rbx, rax)?; // save 280
+        // 6. 32-bit idiv: -100 / 7 = -14 rem -2
+        a.mov(eax, (-100i32) as u32)?;
+        a.cdq()?;
+        a.mov(ecx, 7)?;
+        a.idiv(ecx)?; // eax = -14, edx = -2
+        a.add(eax, edx)?; // -16
+        a.movsxd(rax, eax)?;
+        a.add(rax, rbx)?; // 264
+        a.add(rax, r10)?; // 0x1234_5678_9ABC_DEF0 + 264
+        a.ret()?;
+        a.set_label(&mut bad)?;
+        a.xor(eax, eax)?;
+        a.ret()
+    });
+    let functions = prog.discover();
+    let module = lift_module(functions.values()).expect("lift");
+    assert!(module.functions.iter().all(|f| f.unsupported.is_empty()));
+    let native_ir = target.retarget(module.ir);
+    let want = 0x1234_5678_9ABC_DEF0u64.wrapping_add(264) as i64;
+    let o_rsp = STATE_GPR_OFFSET + 8 * 4;
+    let o_rax = STATE_GPR_OFFSET;
+    let driver = format!(
+        r#"target triple = "{triple}"
+@__playgta6_guest_base = global i64 0
+@state = global [{STATE_SIZE} x i8] zeroinitializer, align 16
+@stack = global [4096 x i64] zeroinitializer, align 16
+declare void @sub_{F:X}(ptr)
+declare void @llvm.trap() noreturn
+define void @__playgta6_indirect_call(ptr %s, i64 %t) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_trap(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_unimplemented(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define void @__playgta6_divide_error(ptr %s, i64 %va) {{ call void @llvm.trap() unreachable }}
+define i32 @main() {{
+entry:
+  %stack = ptrtoint ptr @stack to i64
+  %top = add i64 %stack, 32768
+  %entry_rsp = sub i64 %top, 8
+  store i64 %entry_rsp, ptr getelementptr (i8, ptr @state, i64 {o_rsp})
+  call void @sub_{F:X}(ptr @state)
+  %rax = load i64, ptr getelementptr (i8, ptr @state, i64 {o_rax})
+  %ok = icmp eq i64 %rax, {want}
+  %code = select i1 %ok, i32 0, i32 1
+  ret i32 %code
+}}
+"#
+    );
+    let lifted_ll = dir.0.join("r60_lifted.ll");
+    let driver_ll_path = dir.0.join("r60_driver.ll");
+    fs::write(&lifted_ll, &native_ir).expect("write lifted.ll");
+    fs::write(&driver_ll_path, &driver).expect("write driver.ll");
+    let obj_ext = if triple.contains("windows") { "obj" } else { "o" };
+    let mut objects = Vec::new();
+    for ll in [&lifted_ll, &driver_ll_path] {
+        let obj = ll.with_extension(obj_ext);
+        if let Err(err) = compile_to_object(&tool, &target, ll, &obj) {
+            eprintln!("skipping native R60 test: {err}");
+            return;
+        }
+        objects.push(obj);
+    }
+    let exe = match link(&dir.0, &objects, &triple) {
+        Ok(exe) => exe,
+        Err(reason) => {
+            eprintln!("skipping native R60 test: {reason}");
+            return;
+        }
+    };
+    let status = Command::new(&exe).status().expect("run native R60");
+    assert_eq!(status.code(), Some(0), "native R60 run failed");
+}

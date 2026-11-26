@@ -47,9 +47,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use iced_x86::{Code, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register};
+use iced_x86::{
+    Code, ConditionCode, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register,
+};
 
-use super::{FLAGS, ends_in_transfer};
+use super::memory_access::WindowBurst;
+use super::{FLAGS, ends_in_transfer, is_immediate, mask};
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
 /// Bit `Flag as usize` per arithmetic flag.
@@ -239,20 +242,16 @@ impl Model {
     }
 }
 
-/// Per modelled instruction of `func` (by address), the flags whose value is dead right after
-/// it: every path from there overwrites them before anything can observe them (an instruction
-/// that reads them, an unmodelled instruction, a call to a callee that may observe them, a
-/// return, trap, dispatcher or tail jump to a target that may observe them). The lifter skips
-/// computing and storing those flags. `summaries` must be the ones the lifter uses for its direct
-/// calls and tail jumps (`None`: every call and tail jump stores every flag).
-pub(super) fn dead_after(
+/// Flags live at the exit of each basic block (keyed by block start address), BEFORE accounting
+/// for the block's own instructions or a `Terminator::Branch` condition.
+pub(super) fn block_live_out(
     func: &cfg::Function,
     summaries: Option<&FlagSummaries>,
 ) -> BTreeMap<u64, FlagMask> {
     let needed = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.needed_by(target));
     let model = Model::new(func);
     let live_in = model.block_live_in(needed);
-    let mut dead = BTreeMap::new();
+    let mut out = BTreeMap::new();
     for (block, model_block) in func.blocks.values().zip(&model.blocks) {
         let mut live = 0;
         for exit in &model_block.exits {
@@ -262,24 +261,279 @@ pub(super) fn dead_after(
                 Exit::Everything => ALL_FLAGS,
             };
         }
-        let (body, transfer) = match block.instructions.split_last() {
-            Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
-            _ => (&block.instructions[..], None),
+        out.insert(block.start, live);
+    }
+    out
+}
+
+/// Same-block flag-producer shapes whose flags can be fused directly into `jcc`/`setcc`/`cmovcc`
+/// without materializing or reading individual flag allocas.
+///
+/// Every `(ProducerKind, ConditionCode)` accepted by [`ProducerKind::supports`] MUST:
+/// 1. Be matched by `FunctionLifter::try_fused_condition` with identical semantics, and
+/// 2. Only read flags that the producer unconditionally kills in [`flag_effect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProducerKind {
+    /// `cmp` / `sub` / `neg`: `a - b`. `has_diff_or_zero` is true when `diff` (or `b == 0`) is
+    /// available for `s`/`ns` without extra arithmetic.
+    Compare { has_diff_or_zero: bool },
+    /// `test` / `and` / `or` / `xor` / `andn`: `CF = 0, OF = 0`, `ZF`/`SF` from result.
+    LogicZero,
+    /// `add` / `blsi` / `blsr` / `bzhi` / non-zero imm `shl`/`shr`/`sar`/`shld`/`shrd`:
+    /// `ZF`/`SF` from result.
+    ResultZeroSign,
+    /// `dec a`: `ZF`/`SF`/`OF` from `a - 1` (`CF` preserved).
+    Dec,
+    /// `inc a`: `ZF`/`SF`/`OF` from `a + 1` (`CF` preserved).
+    Inc,
+    /// `bsf` / `bsr` / `popcnt` / `bextr`: `ZF` from input/result.
+    ZeroOnly,
+    /// `tzcnt` / `lzcnt`: `CF = (src == 0)`, `ZF = (result == 0)`.
+    BitCount,
+}
+
+impl ProducerKind {
+    fn supports(self, cc: ConditionCode) -> bool {
+        use ConditionCode as C;
+        match self {
+            Self::Compare { has_diff_or_zero } => match cc {
+                C::e | C::ne | C::b | C::ae | C::be | C::a | C::l | C::ge | C::le | C::g => true,
+                C::s | C::ns => has_diff_or_zero,
+                _ => false,
+            },
+            Self::LogicZero => matches!(
+                cc,
+                C::o | C::no
+                    | C::b
+                    | C::ae
+                    | C::e
+                    | C::ne
+                    | C::be
+                    | C::a
+                    | C::s
+                    | C::ns
+                    | C::l
+                    | C::ge
+                    | C::le
+                    | C::g
+            ),
+            Self::ResultZeroSign => matches!(cc, C::e | C::ne | C::s | C::ns),
+            Self::Dec | Self::Inc => {
+                matches!(cc, C::e | C::ne | C::s | C::ns | C::l | C::ge | C::le | C::g)
+            }
+            Self::ZeroOnly => matches!(cc, C::e | C::ne),
+            Self::BitCount => matches!(cc, C::e | C::ne | C::b | C::ae),
+        }
+    }
+}
+
+fn is_setcc(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Seto
+            | M::Setno
+            | M::Setb
+            | M::Setae
+            | M::Sete
+            | M::Setne
+            | M::Setbe
+            | M::Seta
+            | M::Sets
+            | M::Setns
+            | M::Setp
+            | M::Setnp
+            | M::Setl
+            | M::Setge
+            | M::Setle
+            | M::Setg
+    )
+}
+
+fn is_cmovcc(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    matches!(
+        m,
+        M::Cmovo
+            | M::Cmovno
+            | M::Cmovb
+            | M::Cmovae
+            | M::Cmove
+            | M::Cmovne
+            | M::Cmovbe
+            | M::Cmova
+            | M::Cmovs
+            | M::Cmovns
+            | M::Cmovp
+            | M::Cmovnp
+            | M::Cmovl
+            | M::Cmovge
+            | M::Cmovle
+            | M::Cmovg
+    )
+}
+
+fn same_reg_operands(ins: &Instruction) -> bool {
+    ins.op_count() >= 2
+        && ins.op_kind(0) == OpKind::Register
+        && ins.op_kind(1) == OpKind::Register
+        && ins.op_register(0) == ins.op_register(1)
+}
+
+fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
+    use Mnemonic as M;
+    flag_effect(ins)?;
+    match ins.mnemonic() {
+        M::Cmp => {
+            if same_reg_operands(ins) {
+                return None;
+            }
+            let bits = operand_bits(ins)?;
+            let is_zero = is_immediate(ins.op_kind(1))
+                && ins
+                    .try_immediate(1)
+                    .ok()
+                    .is_some_and(|v| (v & mask(bits)) == 0);
+            Some(ProducerKind::Compare {
+                has_diff_or_zero: is_zero,
+            })
+        }
+        M::Sub => {
+            if same_reg_operands(ins) {
+                return None;
+            }
+            Some(ProducerKind::Compare {
+                has_diff_or_zero: true,
+            })
+        }
+        M::Neg => Some(ProducerKind::Compare {
+            has_diff_or_zero: true,
+        }),
+        M::Xor => {
+            if same_reg_operands(ins) {
+                return None;
+            }
+            Some(ProducerKind::LogicZero)
+        }
+        M::Test | M::And | M::Or | M::Andn => Some(ProducerKind::LogicZero),
+        M::Add | M::Blsi | M::Blsr | M::Bzhi => Some(ProducerKind::ResultZeroSign),
+        M::Shl | M::Sal | M::Shr | M::Sar => {
+            let bits = operand_bits(ins)?;
+            let count_mask = if bits == 64 { 63 } else { 31 };
+            if is_immediate(ins.op_kind(1))
+                && ins
+                    .try_immediate(1)
+                    .ok()
+                    .is_some_and(|v| (v & count_mask) != 0)
+            {
+                Some(ProducerKind::ResultZeroSign)
+            } else {
+                None
+            }
+        }
+        M::Shld | M::Shrd => {
+            let bits = operand_bits(ins)?;
+            let count_mask = if bits == 64 { 63 } else { 31 };
+            if is_immediate(ins.op_kind(2))
+                && ins
+                    .try_immediate(2)
+                    .ok()
+                    .is_some_and(|v| (v & count_mask) != 0)
+            {
+                Some(ProducerKind::ResultZeroSign)
+            } else {
+                None
+            }
+        }
+        M::Dec => Some(ProducerKind::Dec),
+        M::Inc => Some(ProducerKind::Inc),
+        M::Bsf | M::Bsr | M::Popcnt | M::Bextr => Some(ProducerKind::ZeroOnly),
+        M::Tzcnt | M::Lzcnt => Some(ProducerKind::BitCount),
+        _ => None,
+    }
+}
+
+/// Per body instruction of `block`, the flags whose value is dead right after it, accounting for
+/// same-block producer -> `jcc`/`setcc`/`cmovcc` predicate fusion.
+///
+/// `bursts` are the coalesced window bursts in `block`: a producer inside a burst only elides
+/// flags for consumers inside the *same* burst (because `lift_window_burst` clears modified
+/// `known` entries at its `join` block).
+pub(super) fn dead_flags_for_block(
+    block: &cfg::BasicBlock,
+    live_out: FlagMask,
+    summaries: Option<&FlagSummaries>,
+    bursts: &[WindowBurst],
+) -> Vec<FlagMask> {
+    let needed = |target: u64| summaries.map_or(ALL_FLAGS, |s| s.needed_by(target));
+    let (body, transfer) = match block.instructions.split_last() {
+        Some((last, rest)) if ends_in_transfer(block.terminator) => (rest, Some(last)),
+        _ => (&block.instructions[..], None),
+    };
+    let burst_of = |idx: usize| -> Option<usize> {
+        bursts
+            .iter()
+            .position(|b| idx >= b.start && idx <= b.end)
+    };
+
+    // Identify same-block `setcc`/`cmovcc`/`jcc` consumers that will be answered directly from
+    // an earlier producer's `FlagSource` without reading any flag alloca.
+    let mut fused_body = vec![false; body.len()];
+    let mut fused_term = false;
+    for (p, prod) in body.iter().enumerate() {
+        let Some(kind) = producer_kind(prod) else {
+            continue;
         };
-        if let (Terminator::Branch, Some(ins)) = (block.terminator, transfer) {
-            live |= read_mask(ins);
-        }
-        for ins in body.iter().rev() {
-            live = match instruction_step(block, ins) {
-                Step::Effect { gen_, kill } => {
-                    if ins.mnemonic() != Mnemonic::Call && flag_effect(ins).is_some() {
-                        dead.insert(ins.ip(), ALL_FLAGS & !live);
-                    }
-                    gen_ | (live & !kill)
+        let p_burst = burst_of(p);
+        let mut reaches_end = true;
+        for j in (p + 1)..body.len() {
+            let cur = &body[j];
+            if flag_effect(cur).is_some() && (is_setcc(cur.mnemonic()) || is_cmovcc(cur.mnemonic()))
+            {
+                if kind.supports(cur.condition_code())
+                    && (p_burst.is_none() || p_burst == burst_of(j))
+                {
+                    fused_body[j] = true;
                 }
-                Step::Call(target) => needed(target),
-            };
+                continue;
+            }
+            if cur.mnemonic() != Mnemonic::Call
+                && cur.rflags_modified() == 0
+                && flag_effect(cur) == Some((0, 0))
+            {
+                continue;
+            }
+            reaches_end = false;
+            break;
         }
+        if reaches_end
+            && p_burst.is_none()
+            && let (Terminator::Branch, Some(term)) = (block.terminator, transfer)
+            && term.is_jcc_short_or_near()
+            && kind.supports(term.condition_code())
+        {
+            fused_term = true;
+        }
+    }
+
+    let mut live = live_out;
+    if !fused_term
+        && let (Terminator::Branch, Some(term)) = (block.terminator, transfer)
+    {
+        live |= read_mask(term);
+    }
+    let mut dead = vec![0 as FlagMask; body.len()];
+    for (idx, ins) in body.iter().enumerate().rev() {
+        live = match instruction_step(block, ins) {
+            Step::Effect { gen_, kill } => {
+                if ins.mnemonic() != Mnemonic::Call && flag_effect(ins).is_some() {
+                    dead[idx] = ALL_FLAGS & !live;
+                }
+                let effective_gen = if fused_body[idx] { 0 } else { gen_ };
+                effective_gen | (live & !kill)
+            }
+            Step::Call(target) => needed(target),
+        };
     }
     dead
 }
@@ -383,10 +637,70 @@ fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     }
     // CF OF ZF SF PF: what a shift by a non-zero count writes (AF is left unchanged).
     let shift_flags = mask_of(&[0, 5, 3, 4, 1]);
-    // CF OF: what a rotate by a non-zero count writes.
+    // CF OF: what a rotate by a non-zero count (or mul/imul) writes.
     let rotate_flags = mask_of(&[0, 5]);
+    let cf = mask_of(&[0]);
+    let zf = mask_of(&[3]);
+    let of = mask_of(&[5]);
+    let zf_sf_cf_of = mask_of(&[0, 3, 4, 5]);
+    let zf_cf_of = mask_of(&[0, 3, 5]);
     match ins.mnemonic() {
-        M::Mov | M::Movzx | M::Movsx | M::Movsxd | M::Lea | M::Push | M::Pop => Some((0, 0)),
+        M::Mov
+        | M::Movzx
+        | M::Movsx
+        | M::Movsxd
+        | M::Lea
+        | M::Push
+        | M::Pop
+        | M::Not
+        | M::Cbw
+        | M::Cwde
+        | M::Cdqe
+        | M::Cwd
+        | M::Cdq
+        | M::Cqo
+        | M::Bswap => Some((0, 0)),
+        M::Xchg
+            if ins.op_kind(0) == OpKind::Register && ins.op_kind(1) == OpKind::Register =>
+        {
+            Some((0, 0))
+        }
+        M::Movbe if operand_bits(ins).is_some_and(|b| b >= 16) => Some((0, 0)),
+        M::Shlx | M::Shrx | M::Sarx | M::Mulx
+            if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) =>
+        {
+            Some((0, 0))
+        }
+        M::Rorx
+            if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64))
+                && is_immediate(ins.op_kind(2)) =>
+        {
+            Some((0, 0))
+        }
+        m if is_setcc(m) || is_cmovcc(m) => Some((read_mask(ins), 0)),
+        M::Clc | M::Stc => Some((0, cf)),
+        M::Cmc => Some((cf, cf)),
+        M::Adcx if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) => Some((cf, cf)),
+        M::Adox if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) => Some((of, of)),
+        M::Bsf | M::Bsr
+            if ins.op_kind(0) == OpKind::Register
+                && operand_bits(ins).is_some_and(|b| b >= 16) =>
+        {
+            Some((0, zf))
+        }
+        M::Tzcnt | M::Lzcnt if operand_bits(ins).is_some_and(|b| b >= 16) => Some((0, cf | zf)),
+        M::Popcnt if operand_bits(ins).is_some_and(|b| b >= 16) => Some((0, ALL_FLAGS)),
+        M::Bt | M::Bts | M::Btr | M::Btc if operand_bits(ins).is_some_and(|b| b >= 16) => {
+            Some((0, cf))
+        }
+        M::Andn | M::Blsi | M::Blsr | M::Blsmsk | M::Bzhi
+            if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) =>
+        {
+            Some((0, zf_sf_cf_of))
+        }
+        M::Bextr if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) => {
+            Some((0, zf_cf_of))
+        }
         M::Add
         | M::Adc
         | M::Sub
@@ -399,7 +713,7 @@ fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
         | M::Inc
         | M::Dec
         | M::Neg => Some((read_mask(ins), written_mask(ins))),
-        M::Imul if ins.op_count() >= 2 => Some((0, rotate_flags)),
+        M::Mul | M::Imul => Some((0, rotate_flags)),
         M::Shl | M::Sal | M::Shr | M::Sar | M::Rol | M::Ror => {
             let flags = if matches!(ins.mnemonic(), M::Rol | M::Ror) {
                 rotate_flags
@@ -418,6 +732,24 @@ fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
                     };
                     let count = ins.try_immediate(1).ok()? & count_mask;
                     Some((0, if count == 0 { 0 } else { flags }))
+                }
+            }
+        }
+        M::Shld | M::Shrd
+            if ins.op_kind(1) == OpKind::Register
+                && operand_bits(ins).is_some_and(|b| b >= 16) =>
+        {
+            match ins.op_kind(2) {
+                OpKind::Register if ins.op_register(2) == Register::CL => Some((shift_flags, 0)),
+                OpKind::Register => None,
+                _ => {
+                    let count_mask = if operand_bits(ins) == Some(64) {
+                        63
+                    } else {
+                        31
+                    };
+                    let count = ins.try_immediate(2).ok()? & count_mask;
+                    Some((0, if count == 0 { 0 } else { shift_flags }))
                 }
             }
         }

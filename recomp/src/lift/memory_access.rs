@@ -1002,6 +1002,7 @@ impl FunctionLifter<'_> {
         &mut self,
         burst: WindowBurst,
         insns: &[Instruction],
+        burst_dead: &[super::FlagMask],
     ) -> R<bool> {
         let MemoryModel::Windowed(w) = self.memory else {
             return Ok(false);
@@ -1106,9 +1107,9 @@ impl FunctionLifter<'_> {
                 max_end: burst.max_end,
                 addrs: BTreeMap::new(),
             });
-            for ins in insns {
+            for (k, ins) in insns.iter().enumerate() {
                 self.ea = None;
-                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                self.dead_flags = burst_dead[k];
                 let r = self.lift_instruction(ins);
                 self.dead_flags = 0;
                 r?;
@@ -1144,9 +1145,9 @@ impl FunctionLifter<'_> {
                 max_end: burst.max_end,
                 addrs: BTreeMap::new(),
             });
-            for ins in insns {
+            for (k, ins) in insns.iter().enumerate() {
                 self.ea = None;
-                self.dead_flags = self.dead_after.get(&ins.ip()).copied().unwrap_or(0);
+                self.dead_flags = burst_dead[k];
                 let r = self.lift_instruction(ins);
                 self.dead_flags = 0;
                 r?;
