@@ -81,6 +81,10 @@ PACK_ENTRY_BYTES = PACK_ENTRY_STRUCT.size  # 20 bytes
 U32_MAX = 0xFFFFFFFF
 U64_MAX = 0xFFFFFFFFFFFFFFFF
 
+# Maximum addressable WGPK v1 archive size and entry count (matching shaders/src/pack.rs).
+MAX_PACK_BYTES = U32_MAX
+MAX_PACK_ENTRIES = (MAX_PACK_BYTES - PACK_HEADER_BYTES) // PACK_ENTRY_BYTES
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_REPO_OUTPUT_DIR_NAMES: tuple[str, ...] = ("local-data", "work")
 
@@ -321,11 +325,13 @@ BUILTIN_PROFILES: dict[str, dict[ShaderStage, str]] = {
 # Strict cross-platform path & username sanitization
 # ---------------------------------------------------------------------------
 
+_FILE_URI_RE = re.compile(r"file://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
 _UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
 _UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
 _WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
+_TILDE_PATH_RE = re.compile(r"(?<![A-Za-z0-9._-])~[A-Za-z0-9._-]*/[^\s\"'<>|,;()\[\]]*")
 _POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+    r"/(?:[A-Za-z]/(?:Users|Program|Windows)|Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|cygdrive|srv|media|run)/[^\s\"'<>|,;()\[\]]*"
 )
 
 
@@ -345,34 +351,48 @@ class UnsafeOutputPathError(PackerError):
         super().__init__(message, code="unsafe_output_path")
 
 
+def _add_username_candidate(names: list[str], raw: str) -> None:
+    cleaned = raw.strip()
+    if not cleaned:
+        return
+    parts = [cleaned]
+    if "\\" in cleaned or "/" in cleaned:
+        leaf = re.split(r"[/\\]+", cleaned.rstrip("/\\"))[-1].strip()
+        if leaf and leaf not in parts:
+            parts.append(leaf)
+    for item in parts:
+        if len(item) >= 3 and item not in names:
+            names.append(item)
+
+
 def _current_usernames() -> list[str]:
     names: list[str] = []
-    for candidate in (
-        os.environ.get("USERNAME", ""),
-        os.environ.get("USER", ""),
-        os.environ.get("LOGNAME", ""),
-    ):
-        cleaned = candidate.strip()
-        if len(cleaned) >= 3 and cleaned not in names:
-            names.append(cleaned)
+    for env_key in ("USERNAME", "USER", "LOGNAME"):
+        _add_username_candidate(names, os.environ.get(env_key, ""))
+    for home_key in ("HOME", "USERPROFILE"):
+        home_raw = os.environ.get(home_key, "").strip().rstrip("/\\")
+        if home_raw:
+            leaf = re.split(r"[/\\]+", home_raw)[-1]
+            _add_username_candidate(names, leaf)
     try:
-        home_name = Path.home().name.strip()
-        if len(home_name) >= 3 and home_name not in names:
-            names.append(home_name)
+        _add_username_candidate(names, Path.home().name)
     except (OSError, RuntimeError):
         pass
+    names.sort(key=len, reverse=True)
     return names
 
 
 def sanitize_text(raw: str | None) -> str:
-    """Strip Windows/UNC/POSIX host paths and active OS usernames from text."""
+    """Strip file URIs, Windows/UNC/POSIX/tilde host paths, and active OS usernames from text."""
     if raw is None:
         return ""
     text = str(raw)
+    text = _FILE_URI_RE.sub("<path>", text)
     text = _UNC_BS_PATH_RE.sub("<path>", text)
     text = text.replace("\\", "/")
     text = _WINDOWS_PATH_RE.sub("<path>", text)
     text = _UNC_FS_PATH_RE.sub("<path>", text)
+    text = _TILDE_PATH_RE.sub("<path>", text)
     text = _POSIX_PATH_RE.sub("<path>", text)
     for username in _current_usernames():
         pattern = re.compile(
@@ -397,7 +417,7 @@ def sanitize_label(source: str | Path | None) -> str:
         return "<unknown>"
     parts = re.split(r"[/\\]+", stripped)
     base = parts[-1]
-    if not base or (len(base) == 2 and base[1] == ":"):
+    if not base or base in (".", "..") or (len(base) == 2 and base[1] == ":"):
         return "<unknown>"
     return sanitize_text(base)
 
@@ -415,6 +435,11 @@ def sanitize_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [sanitize_value(v) for v in value]
     return value
+
+
+def render_json_summary(report: Mapping[str, Any]) -> str:
+    """Serialize a strictly sanitized JSON summary (zero host paths, usernames, or raw bytes)."""
+    return json.dumps(sanitize_value(report), indent=2) + "\n"
 
 
 def sanitize_os_error(source: str | Path, exc: OSError) -> str:
@@ -1017,8 +1042,352 @@ def read_override_wgsl(override: WgslOverrideFile) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WGPK v1 binary writer & packed entry models
+# WGPK v1 binary writer, verifier & packed entry models
 # ---------------------------------------------------------------------------
+
+
+def checked_table_data_start(entry_count: int) -> int:
+    """Compute checked `u32` byte offset where WGSL payloads begin (`header + entry_count * 20`)."""
+    if isinstance(entry_count, bool) or not isinstance(entry_count, int) or entry_count < 0:
+        raise PackerError(
+            f"entry count must be a non-negative integer, got {entry_count!r}",
+            code="pack_overflow",
+        )
+    if entry_count > MAX_PACK_ENTRIES:
+        raise PackerError(
+            f"entry count {entry_count} exceeds WGPK v1 u32 table limit ({MAX_PACK_ENTRIES})",
+            code="pack_overflow",
+        )
+    return PACK_HEADER_BYTES + entry_count * PACK_ENTRY_BYTES
+
+
+def checked_entry_bounds(
+    entry_index: int,
+    offset: int,
+    length: int,
+    data_start: int,
+    total_len: int,
+) -> tuple[int, int]:
+    """Validate one WGPK v1 entry's `[offset..offset+length)` payload bounds."""
+    if offset < 0 or length < 0:
+        raise PackerError(
+            f"entry {entry_index} payload range [{offset}..+{length}] has negative bounds",
+            code="wgpk_out_of_bounds",
+        )
+    end = offset + length
+    if end > U32_MAX:
+        raise PackerError(
+            f"entry {entry_index} payload range [{offset}..+{length}] overflows u32",
+            code="wgpk_payload_overflow",
+        )
+    if offset < data_start or end > total_len:
+        raise PackerError(
+            f"entry {entry_index} payload [{offset}..+{length}] exceeds WGPK pack bounds "
+            f"(valid payload range: [{data_start}..{total_len}])",
+            code="wgpk_out_of_bounds",
+        )
+    return offset, end
+
+
+def verify_canonical_hash_order(
+    hashes: Sequence[int],
+    *,
+    allow_equal_adjacent: bool = False,
+) -> None:
+    """Verify 64-bit shader hashes are in canonical ascending order.
+
+    By default (`allow_equal_adjacent=False`), enforces strictly ascending unsigned
+    64-bit hashes, rejecting duplicate hashes (`code="wgpk_duplicate_hash"`) and
+    out-of-order entries (`code="wgpk_non_canonical_order"`).
+    """
+    prev: int | None = None
+    for idx, raw_hash in enumerate(hashes):
+        h = normalize_shader_hash(raw_hash)
+        if prev is not None:
+            if h == prev and not allow_equal_adjacent:
+                raise PackerError(
+                    f"duplicate shader hash {format_shader_hash(h)} at entries {idx - 1} and {idx}",
+                    code="wgpk_duplicate_hash",
+                )
+            if h < prev:
+                raise PackerError(
+                    f"non-canonical hash order at entry {idx}: {format_shader_hash(h)} "
+                    f"must be greater than previous {format_shader_hash(prev)}",
+                    code="wgpk_non_canonical_order",
+                )
+        prev = h
+
+
+def sort_entries_canonical(
+    entries: Sequence[tuple[int, ShaderStage | int | str, str]],
+    *,
+    reject_duplicate_hashes: bool = True,
+) -> list[tuple[int, ShaderStage, str]]:
+    """Normalize and deterministically sort `(hash, stage, wgsl)` entries in canonical order.
+
+    Orders entries by ascending unsigned 64-bit shader hash (with stage code as a
+    deterministic tie-breaker only when `reject_duplicate_hashes=False`). Always rejects
+    exact duplicate `(hash, stage)` pairs, and rejects any duplicate 64-bit hash when
+    `reject_duplicate_hashes=True`.
+    """
+    normalized: list[tuple[int, ShaderStage, str]] = []
+    seen_pairs: dict[tuple[int, ShaderStage], int] = {}
+    seen_hashes: dict[int, int] = {}
+
+    for idx, (shader_hash, stage, wgsl) in enumerate(entries):
+        h = normalize_shader_hash(shader_hash)
+        st = normalize_stage(stage, allow_unknown=False)
+        assert st is not None
+        pair = (h, st)
+        if pair in seen_pairs:
+            raise PackerError(
+                f"duplicate shader entry ({format_shader_hash(h)}, {st.as_str()}) "
+                f"at indices {seen_pairs[pair]} and {idx}",
+                code="duplicate_hash",
+            )
+        if reject_duplicate_hashes and h in seen_hashes:
+            raise PackerError(
+                f"duplicate shader hash {format_shader_hash(h)} at indices {seen_hashes[h]} and {idx}",
+                code="duplicate_hash",
+            )
+        seen_pairs[pair] = idx
+        seen_hashes.setdefault(h, idx)
+        normalized.append((h, st, wgsl))
+
+    normalized.sort(key=lambda item: (item[0], int(item[1])))
+    return normalized
+
+
+@dataclass(frozen=True)
+class VerifiedWgpkEntry:
+    """Single verified entry decoded from a binary `WGPK` v1 container."""
+
+    shader_hash: int
+    stage: ShaderStage
+    offset: int
+    length: int
+    wgsl: str
+
+    @property
+    def hash_hex(self) -> str:
+        return format_shader_hash(self.shader_hash)
+
+
+@dataclass(frozen=True)
+class WgpkVerificationSummary:
+    """Result of verifying a binary `WGPK` v1 header, bounds, uniqueness, and payloads."""
+
+    version: int
+    flags: int
+    byte_length: int
+    entry_count: int
+    unique_hash_count: int
+    total_wgsl_bytes: int
+    canonical_hash_order: bool
+    canonical_pair_order: bool
+    stage_counts: dict[str, int]
+    pack_sha256: str
+    entries: tuple[VerifiedWgpkEntry, ...]
+
+    def to_summary_dict(self) -> dict[str, Any]:
+        """Return a strictly sanitized verification summary (zero host paths or raw WGSL)."""
+        return sanitize_value(
+            {
+                "verified": True,
+                "pack_format": PACK_MAGIC.decode("ascii"),
+                "pack_version": self.version,
+                "pack_flags": self.flags,
+                "pack_bytes": self.byte_length,
+                "pack_sha256": self.pack_sha256,
+                "entry_count": self.entry_count,
+                "unique_hash_count": self.unique_hash_count,
+                "total_wgsl_bytes": self.total_wgsl_bytes,
+                "canonical_hash_order": self.canonical_hash_order,
+                "canonical_pair_order": self.canonical_pair_order,
+                "stage_counts": dict(self.stage_counts),
+            }
+        )
+
+
+def verify_wgpk_pack(
+    data: bytes | bytearray | memoryview,
+    *,
+    reject_duplicate_hashes: bool = True,
+    require_canonical_order: bool = False,
+    verify_utf8: bool = True,
+) -> WgpkVerificationSummary:
+    """Verify a binary `WGPK` v1 archive header, entry bounds, uniqueness, and UTF-8 payloads."""
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        raise PackerError(
+            f"WGPK buffer must be bytes-like, got {type(data).__name__}",
+            code="wgpk_invalid_buffer",
+        )
+
+    raw = bytes(data)
+    total_len = len(raw)
+
+    if total_len < PACK_HEADER_BYTES:
+        raise PackerError(
+            f"WGPK pack truncated: {total_len} bytes (minimum header size: {PACK_HEADER_BYTES})",
+            code="wgpk_truncated_header",
+        )
+
+    magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(raw, 0)
+    if magic != PACK_MAGIC:
+        raise PackerError(
+            f"invalid WGPK magic {magic!r} (expected {PACK_MAGIC!r})",
+            code="wgpk_invalid_magic",
+        )
+    if version != PACK_VERSION:
+        raise PackerError(
+            f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+            code="wgpk_unsupported_version",
+        )
+
+    data_start = checked_table_data_start(entry_count)
+    if total_len < data_start:
+        raise PackerError(
+            f"WGPK pack truncated: {total_len} bytes "
+            f"(header + {entry_count} entries require {data_start} bytes)",
+            code="wgpk_truncated_table",
+        )
+
+    entries: list[VerifiedWgpkEntry] = []
+    seen_pairs: dict[tuple[int, ShaderStage], int] = {}
+    seen_hashes: dict[int, int] = {}
+    non_empty_ranges: list[tuple[int, int, int]] = []
+    stage_counts = {"vertex": 0, "fragment": 0, "compute": 0}
+
+    for idx in range(entry_count):
+        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
+        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(raw, base)
+
+        try:
+            stage = ShaderStage(stage_raw)
+        except ValueError as exc:
+            raise PackerError(
+                f"invalid shader stage code {stage_raw} at entry {idx}",
+                code="wgpk_invalid_stage",
+            ) from exc
+
+        start, end = checked_entry_bounds(idx, offset, length, data_start, total_len)
+
+        pair = (shader_hash, stage)
+        if pair in seen_pairs:
+            raise PackerError(
+                f"duplicate shader entry ({format_shader_hash(shader_hash)}, {stage.as_str()}) "
+                f"at entries {seen_pairs[pair]} and {idx}",
+                code="wgpk_duplicate_hash",
+            )
+        if reject_duplicate_hashes and shader_hash in seen_hashes:
+            raise PackerError(
+                f"duplicate shader hash {format_shader_hash(shader_hash)} "
+                f"at entries {seen_hashes[shader_hash]} and {idx}",
+                code="wgpk_duplicate_hash",
+            )
+        seen_pairs[pair] = idx
+        seen_hashes.setdefault(shader_hash, idx)
+
+        if length > 0:
+            non_empty_ranges.append((start, end, idx))
+
+        wgsl_text = ""
+        if verify_utf8:
+            try:
+                wgsl_text = raw[start:end].decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise PackerError(
+                    f"entry {idx} payload is not valid UTF-8",
+                    code="wgpk_invalid_utf8",
+                ) from exc
+
+        stage_counts[stage.as_str()] += 1
+        entries.append(
+            VerifiedWgpkEntry(
+                shader_hash=shader_hash,
+                stage=stage,
+                offset=offset,
+                length=length,
+                wgsl=wgsl_text,
+            )
+        )
+
+    if len(non_empty_ranges) > 1:
+        non_empty_ranges.sort(key=lambda item: (item[0], item[1], item[2]))
+        for prev, curr in zip(non_empty_ranges, non_empty_ranges[1:]):
+            if curr[0] < prev[1]:
+                raise PackerError(
+                    f"overlapping payload ranges between entry {prev[2]} [{prev[0]}..{prev[1]}) "
+                    f"and entry {curr[2]} [{curr[0]}..{curr[1]})",
+                    code="wgpk_overlapping_payloads",
+                )
+
+    canonical_hash_order = all(
+        entries[i].shader_hash > entries[i - 1].shader_hash for i in range(1, len(entries))
+    )
+    canonical_pair_order = all(
+        (entries[i].shader_hash, int(entries[i].stage))
+        > (entries[i - 1].shader_hash, int(entries[i - 1].stage))
+        for i in range(1, len(entries))
+    )
+
+    if require_canonical_order:
+        if reject_duplicate_hashes:
+            verify_canonical_hash_order(
+                [entry.shader_hash for entry in entries],
+                allow_equal_adjacent=False,
+            )
+        else:
+            verify_canonical_hash_order(
+                [entry.shader_hash for entry in entries],
+                allow_equal_adjacent=True,
+            )
+            if not canonical_pair_order:
+                for idx in range(1, len(entries)):
+                    prev_key = (entries[idx - 1].shader_hash, int(entries[idx - 1].stage))
+                    curr_key = (entries[idx].shader_hash, int(entries[idx].stage))
+                    if curr_key <= prev_key:
+                        raise PackerError(
+                            f"non-canonical entry order at entry {idx}: "
+                            f"({entries[idx].hash_hex}, {entries[idx].stage.as_str()}) "
+                            f"must follow ({entries[idx - 1].hash_hex}, {entries[idx - 1].stage.as_str()})",
+                            code="wgpk_non_canonical_order",
+                        )
+
+    return WgpkVerificationSummary(
+        version=version,
+        flags=flags,
+        byte_length=total_len,
+        entry_count=len(entries),
+        unique_hash_count=len(seen_hashes),
+        total_wgsl_bytes=sum(entry.length for entry in entries),
+        canonical_hash_order=canonical_hash_order,
+        canonical_pair_order=canonical_pair_order,
+        stage_counts=stage_counts,
+        pack_sha256=hashlib.sha256(raw).hexdigest(),
+        entries=tuple(entries),
+    )
+
+
+def verify_wgpk_file(
+    pack_path: Path | str,
+    *,
+    reject_duplicate_hashes: bool = True,
+    require_canonical_order: bool = False,
+    verify_utf8: bool = True,
+) -> WgpkVerificationSummary:
+    """Read and verify a binary `WGPK` v1 `.wgsl.pack` file from disk."""
+    path = Path(pack_path).expanduser()
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise PackerError(sanitize_os_error(path, exc), code="wgpk_read_error") from exc
+    return verify_wgpk_pack(
+        raw,
+        reject_duplicate_hashes=reject_duplicate_hashes,
+        require_canonical_order=require_canonical_order,
+        verify_utf8=verify_utf8,
+    )
 
 
 @dataclass(frozen=True)
@@ -1067,6 +1436,7 @@ class PackBuildResult:
     skipped_unknown_stage_count: int
     stage_conflict_hash_count: int
     warnings: tuple[str, ...]
+    verification: WgpkVerificationSummary | None = None
 
     def to_report_dict(
         self,
@@ -1086,6 +1456,12 @@ class PackBuildResult:
         override_count = sum(1 for e in self.entries if e.source == "override")
         profile_count = sum(1 for e in self.entries if e.source == "profile")
         total_wgsl_bytes = sum(e.pack_length for e in self.entries)
+        verification = self.verification or verify_wgpk_pack(
+            self.pack_bytes,
+            reject_duplicate_hashes=False,
+            require_canonical_order=False,
+            verify_utf8=True,
+        )
 
         inputs_payload: dict[str, Any] = {
             "scan_json_files": [sanitize_label(lbl) for lbl in scan_json_labels],
@@ -1099,7 +1475,7 @@ class PackBuildResult:
             "schema_version": SCHEMA_VERSION,
             "pack_format": PACK_MAGIC.decode("ascii"),
             "pack_version": PACK_VERSION,
-            "pack_flags": 0,
+            "pack_flags": verification.flags,
             "profile": self.profile,
             "output_file": sanitize_label(output_label),
             "pack_bytes": len(self.pack_bytes),
@@ -1114,9 +1490,11 @@ class PackBuildResult:
                 "override_entry_count": override_count,
                 "profile_entry_count": profile_count,
                 "stage_conflict_hash_count": self.stage_conflict_hash_count,
+                "canonical_hash_order": verification.canonical_hash_order,
                 "stage_counts": stage_counts,
                 "total_wgsl_bytes": total_wgsl_bytes,
             },
+            "verification": verification.to_summary_dict(),
             "entries": [entry.to_report_dict() for entry in self.entries],
             "warnings": [sanitize_text(w) for w in self.warnings],
         }
@@ -1127,41 +1505,71 @@ def serialize_wgpk(
     entries: Sequence[tuple[int, ShaderStage, str]],
     *,
     flags: int = 0,
+    canonical_sort: bool = True,
+    reject_duplicate_hashes: bool = False,
+    reject_duplicate_pairs: bool = True,
 ) -> tuple[bytes, list[tuple[int, int]]]:
     """Serialize `(hash, stage, wgsl)` tuples into exact `WGPK` v1 binary bytes.
 
-    Returns `(pack_bytes, [(offset, length), ...])` matching `shaders/src/pack.rs`
-    and `web/workers/wgsl_pack_loader.js` byte-for-byte.
+    Returns `(pack_bytes, ranges)` where `ranges[i]` is the `(offset, length)` of input
+    `entries[i]` inside `pack_bytes`, matching `shaders/src/pack.rs` and
+    `web/workers/wgsl_pack_loader.js` byte-for-byte.
+
+    When `canonical_sort=True` (default), the binary entry table and payload region are
+    written in deterministic ascending `(hash, stage)` order regardless of input order.
     """
     if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0 or flags > U32_MAX:
         raise PackerError(f"flags must be an unsigned 32-bit integer, got {flags!r}", code="invalid_flags")
-    if len(entries) > U32_MAX:
-        raise PackerError("entry count exceeds u32::MAX", code="pack_overflow")
+
+    data_start = checked_table_data_start(len(entries))
 
     encoded: list[tuple[int, ShaderStage, bytes]] = []
+    seen_pairs: dict[tuple[int, ShaderStage], int] = {}
+    seen_hashes: dict[int, int] = {}
     total_payload = 0
-    for shader_hash, stage, wgsl in entries:
+    for idx, (shader_hash, stage, wgsl) in enumerate(entries):
         h = normalize_shader_hash(shader_hash)
         st = normalize_stage(stage, allow_unknown=False)
         assert st is not None
+        pair = (h, st)
+        if reject_duplicate_pairs and pair in seen_pairs:
+            raise PackerError(
+                f"duplicate shader entry ({format_shader_hash(h)}, {st.as_str()}) "
+                f"at indices {seen_pairs[pair]} and {idx}",
+                code="duplicate_hash",
+            )
+        if reject_duplicate_hashes and h in seen_hashes:
+            raise PackerError(
+                f"duplicate shader hash {format_shader_hash(h)} at indices {seen_hashes[h]} and {idx}",
+                code="duplicate_hash",
+            )
+        seen_pairs.setdefault(pair, idx)
+        seen_hashes.setdefault(h, idx)
+
         payload = wgsl.encode("utf-8")
         if len(payload) > U32_MAX:
             raise PackerError("shader WGSL payload exceeds u32::MAX bytes", code="pack_overflow")
         total_payload += len(payload)
         encoded.append((h, st, payload))
 
-    data_start = PACK_HEADER_BYTES + len(encoded) * PACK_ENTRY_BYTES
     total_size = data_start + total_payload
     if total_size > U32_MAX:
         raise PackerError("total WGPK pack size exceeds u32::MAX byte offsets", code="pack_overflow")
 
+    order = (
+        sorted(range(len(encoded)), key=lambda i: (encoded[i][0], int(encoded[i][1])))
+        if canonical_sort
+        else list(range(len(encoded)))
+    )
+
     out = bytearray(total_size)
     PACK_HEADER_STRUCT.pack_into(out, 0, PACK_MAGIC, PACK_VERSION, len(encoded), flags)
 
-    ranges: list[tuple[int, int]] = []
+    ranges: list[tuple[int, int]] = [(0, 0)] * len(encoded)
     cursor = data_start
-    for idx, (shader_hash, stage, payload) in enumerate(encoded):
-        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
+    for table_idx, orig_idx in enumerate(order):
+        shader_hash, stage, payload = encoded[orig_idx]
+        base = PACK_HEADER_BYTES + table_idx * PACK_ENTRY_BYTES
         length = len(payload)
         PACK_ENTRY_STRUCT.pack_into(
             out,
@@ -1173,7 +1581,7 @@ def serialize_wgpk(
             length,
         )
         out[cursor : cursor + length] = payload
-        ranges.append((cursor, length))
+        ranges[orig_idx] = (cursor, length)
         cursor += length
 
     return bytes(out), ranges
@@ -1185,10 +1593,18 @@ def build_fallback_pack(
     profile: str = "default",
     wgsl_dir: Path | str | None = None,
     flags: int = 0,
+    reject_duplicate_hashes: bool = False,
+    allow_empty: bool = False,
 ) -> PackBuildResult:
-    """Deduplicate, deterministically sort by `(hash, stage)`, resolve WGSL, and pack."""
+    """Deduplicate (or reject duplicates), canonically sort by `(hash, stage)`, pack, and verify."""
     canonical_profile = normalize_profile(profile)
     profile_templates = BUILTIN_PROFILES[canonical_profile]
+
+    if not records and not allow_empty:
+        raise PackerError(
+            "no shader records provided (pass --allow-empty to emit an empty WGPK pack)",
+            code="empty_input",
+        )
 
     warnings: list[str] = []
     override_index: WgslOverrideIndex | None = None
@@ -1199,21 +1615,33 @@ def build_fallback_pack(
                 f"skipped {override_index.skipped_escaping_symlinks} symlink(s) escaping --wgsl-dir"
             )
 
+    if reject_duplicate_hashes:
+        seen_input_hashes: set[int] = set()
+        for rec in records:
+            normalized_hash = normalize_shader_hash(rec.shader_hash)
+            if normalized_hash in seen_input_hashes:
+                raise PackerError(
+                    f"duplicate shader hash {format_shader_hash(normalized_hash)} detected in inputs",
+                    code="duplicate_hash",
+                )
+            seen_input_hashes.add(normalized_hash)
+
     known_pairs: set[tuple[int, ShaderStage]] = set()
     known_hashes: set[int] = set()
     unknown_hashes_seen: list[int] = []
     duplicate_collapsed = 0
 
     for rec in records:
+        normalized_hash = normalize_shader_hash(rec.shader_hash)
         if rec.stage is not None:
-            pair = (rec.shader_hash, rec.stage)
+            pair = (normalized_hash, rec.stage)
             if pair in known_pairs:
                 duplicate_collapsed += 1
             else:
                 known_pairs.add(pair)
-                known_hashes.add(rec.shader_hash)
+                known_hashes.add(normalized_hash)
         else:
-            unknown_hashes_seen.append(rec.shader_hash)
+            unknown_hashes_seen.append(normalized_hash)
 
     skipped_unknown_stage = 0
     seen_unresolved_unknown: set[int] = set()
@@ -1245,8 +1673,15 @@ def build_fallback_pack(
             "(provide explicit --hashes or a stage-identifiable WGSL override in --wgsl-dir)"
         )
 
-    # Deterministic ordering strictly by (hash, stage_code).
+    # Deterministic canonical ascending ordering by (u64 hash, stage_code).
     sorted_pairs = sorted(known_pairs, key=lambda pair: (pair[0], int(pair[1])))
+
+    if not sorted_pairs and not allow_empty:
+        raise PackerError(
+            "no packable shader entries remained after resolving stages "
+            "(pass --allow-empty to emit an empty WGPK pack)",
+            code="empty_pack",
+        )
 
     stages_per_hash: dict[int, set[ShaderStage]] = {}
     for shader_hash, stage in sorted_pairs:
@@ -1290,8 +1725,17 @@ def build_fallback_pack(
     pack_bytes, ranges = serialize_wgpk(
         [(h, st, wgsl) for h, st, wgsl, _src, _prof, _ov in resolved_specs],
         flags=flags,
+        canonical_sort=True,
+        reject_duplicate_hashes=reject_duplicate_hashes,
+        reject_duplicate_pairs=True,
     )
-    pack_sha256 = hashlib.sha256(pack_bytes).hexdigest()
+    verification = verify_wgpk_pack(
+        pack_bytes,
+        reject_duplicate_hashes=reject_duplicate_hashes,
+        require_canonical_order=True,
+        verify_utf8=True,
+    )
+    pack_sha256 = verification.pack_sha256
 
     packed_entries: list[PackedShaderEntry] = []
     for (shader_hash, stage, wgsl, source, prof, override_file), (offset, length) in zip(
@@ -1321,6 +1765,7 @@ def build_fallback_pack(
         skipped_unknown_stage_count=skipped_unknown_stage,
         stage_conflict_hash_count=stage_conflict_hashes,
         warnings=tuple(warnings),
+        verification=verification,
     )
 
 
@@ -1376,12 +1821,26 @@ def render_text_summary(report: Mapping[str, Any]) -> str:
     return sanitize_text("\n".join(lines) + "\n")
 
 
+def render_verification_text_summary(report: Mapping[str, Any]) -> str:
+    """Render a concise, strictly sanitized stdout summary for `--verify-pack`."""
+    stages = report["stage_counts"]
+    lines = [
+        f"Verified {report['entry_count']} shader(s) in {report['input_file']} "
+        f"({report['pack_format']} v{report['pack_version']}, {report['pack_bytes']} bytes, "
+        f"canonical_hash_order={str(report['canonical_hash_order']).lower()})",
+        f"  stages: vertex={stages['vertex']} fragment={stages['fragment']} compute={stages['compute']}",
+        f"  unique_hashes: {report['unique_hash_count']} total_wgsl_bytes={report['total_wgsl_bytes']}",
+        f"  sha256: {report['pack_sha256']}",
+    ]
+    return sanitize_text("\n".join(lines) + "\n")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Pack RDNA2 shader hashes (from inspect_rdna2_shaders.py --json and/or --hashes) "
             "into a deterministic WGPK v1 .wgsl.pack bundle using optional --wgsl-dir overrides "
-            "and G34 WebGPU-validated fallback profiles."
+            "and G34 WebGPU-validated fallback profiles, or verify an existing WGPK v1 pack."
         )
     )
     parser.add_argument(
@@ -1419,15 +1878,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--out",
-        required=True,
+        default=None,
         metavar="PATH.wgsl.pack",
         help="Output .wgsl.pack path (must be in gitignored work/, local-data/, or outside repo).",
+    )
+    parser.add_argument(
+        "--verify-pack",
+        default=None,
+        metavar="PATH.wgsl.pack",
+        help="Verify an existing WGPK v1 .wgsl.pack file (header, bounds, duplicate hashes, UTF-8) instead of packing.",
+    )
+    parser.add_argument(
+        "--reject-duplicate-hashes",
+        action="store_true",
+        help="Fail instead of collapsing duplicate 64-bit shader hashes across inputs (also rejects stage conflicts).",
+    )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Allow emitting a valid 0-entry WGPK v1 pack when inputs produce zero packable shaders.",
+    )
+    parser.add_argument(
+        "--require-canonical-order",
+        action="store_true",
+        help="With --verify-pack, require entries to be in strictly ascending canonical 64-bit hash order.",
+    )
+    parser.add_argument(
+        "--allow-stage-conflicts",
+        action="store_true",
+        help="With --verify-pack, permit the same 64-bit hash under distinct stages (still rejects duplicate hash+stage pairs).",
     )
     parser.add_argument(
         "--report-json",
         default=None,
         metavar="PATH",
-        help="Optional path to write a strictly sanitized JSON packing report.",
+        help="Optional path to write a strictly sanitized JSON packing or verification report.",
     )
     parser.add_argument(
         "--json",
@@ -1444,6 +1929,52 @@ def main(
 ) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    if args.verify_pack is not None:
+        if args.out is not None or args.scan_json or args.hashes or args.native_dir:
+            print(
+                "Error: --verify-pack cannot be combined with --out, --scan-json, --native-dir, or --hashes",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            report_path = (
+                validate_output_path(args.report_json, flag_name="--report-json", repo_root=repo_root)
+                if args.report_json is not None
+                else None
+            )
+            summary = verify_wgpk_file(
+                args.verify_pack,
+                reject_duplicate_hashes=not args.allow_stage_conflicts,
+                require_canonical_order=args.require_canonical_order,
+                verify_utf8=True,
+            )
+            verify_report = sanitize_value(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "mode": "verify",
+                    "input_file": sanitize_label(args.verify_pack),
+                    **summary.to_summary_dict(),
+                }
+            )
+            if report_path is not None:
+                atomic_write_text(report_path, render_json_summary(verify_report))
+        except PackerError as exc:
+            print(f"Error: {sanitize_text(exc.message)}", file=sys.stderr)
+            return 1
+        except OSError as exc:
+            print(f"Error: {sanitize_os_error(args.verify_pack, exc)}", file=sys.stderr)
+            return 1
+
+        if args.json:
+            sys.stdout.write(render_json_summary(verify_report))
+        else:
+            sys.stdout.write(render_verification_text_summary(verify_report))
+        return 0
+
+    if args.out is None:
+        print("Error: --out is required unless --verify-pack is specified", file=sys.stderr)
+        return 2
 
     if not args.scan_json and not args.hashes and not args.native_dir:
         print(
@@ -1480,6 +2011,8 @@ def main(
             records,
             profile=args.profile,
             wgsl_dir=args.wgsl_dir,
+            reject_duplicate_hashes=args.reject_duplicate_hashes,
+            allow_empty=args.allow_empty,
         )
 
         report = result.to_report_dict(
@@ -1492,7 +2025,7 @@ def main(
 
         atomic_write_bytes(out_path, result.pack_bytes)
         if report_path is not None:
-            atomic_write_text(report_path, json.dumps(report, indent=2) + "\n")
+            atomic_write_text(report_path, render_json_summary(report))
 
     except PackerError as exc:
         print(f"Error: {sanitize_text(exc.message)}", file=sys.stderr)
@@ -1502,7 +2035,7 @@ def main(
         return 1
 
     if args.json:
-        sys.stdout.write(json.dumps(report, indent=2) + "\n")
+        sys.stdout.write(render_json_summary(report))
     else:
         sys.stdout.write(render_text_summary(report))
     return 0
