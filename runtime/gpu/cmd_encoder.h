@@ -13,6 +13,8 @@ class CommandEncoder {
 public:
     void clear();
     void nop();
+    // A Nop packet carrying `payload_bytes` of zero padding (a patchable placeholder).
+    void nop_padded(uint32_t payload_bytes);
     void begin_frame();
     void clear_color(float r, float g, float b, float a);
     void create_buffer(uint32_t id, uint32_t usage_flags, uint64_t byte_size);

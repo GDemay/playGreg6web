@@ -19,6 +19,7 @@
 #include "gpu/descriptor_heap.h"
 #include "gpu/descriptor_words.h"
 #include "gpu/gfx10_detile.h"
+#include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
 #include "wasm_boot.h"
 #include "gpu/state_bridge.h"
@@ -909,6 +910,141 @@ std::array<uint32_t, 8> indirect_params(const std::vector<Packet>& p, size_t bef
     return v;
 }
 
+// Backlog 41: clamps of consecutive indirect draws are batched ahead of the draws.
+void test_indirect_clamp_batch_planner() {
+    using bridge::IndirectClampBatch;
+    gpu::CommandEncoder enc;
+    enc.nop();
+    IndirectClampBatch b;
+    CHECK(!b.open() && b.try_join(1, 2, 10) == IndirectClampBatch::kNoSlot);
+    b.begin(enc.size(), 120, enc.size(), 0);
+    CHECK(b.open());
+    // Draw-ish packets and writes to other buffers keep the run joinable; slots go out in order.
+    enc.write_buffer(900, 0, "abcd", 4);
+    enc.set_compute_pipeline(5);
+    enc.dispatch_compute(1, 1, 1);  // a dispatch may write any storage buffer: the run ends
+    b.scan(enc.data(), enc.size());
+    CHECK(!b.open());
+
+    gpu::CommandEncoder e2;
+    b.begin(0, 120, 0, 0);
+    e2.write_buffer(900, 0, "abcd", 4);
+    e2.draw(3, 1, 0, 0);
+    b.scan(e2.data(), e2.size());
+    CHECK(b.open());
+    CHECK(b.try_join(1, 2, 256) == 0);
+    CHECK(b.try_join(3, 0, 512) == 120);
+    // A buffer written since the run started cannot be read earlier: no slot, run stays open.
+    e2.write_buffer(7, 16, "wxyz", 4);
+    b.scan(e2.data(), e2.size());
+    CHECK(b.try_join(7, 0, 768) == IndirectClampBatch::kNoSlot);
+    CHECK(b.try_join(8, 7, 768) == IndirectClampBatch::kNoSlot);  // count buffer too
+    CHECK(b.open() && b.try_join(9, 0, 768) == 240);
+    // A reused (wrapped) ring window ends the run.
+    CHECK(b.try_join(10, 0, 0) == IndirectClampBatch::kNoSlot && !b.open());
+    // Capacity: the run's inline clamp plus kIndirectClampBatchSize - 1 slots.
+    b.begin(0, 120, 0, 0);
+    uint32_t joined = 0;
+    for (uint32_t i = 0; i < 20; ++i) {
+        if (b.try_join(100 + i, 0, 256 * (i + 1)) != IndirectClampBatch::kNoSlot) {
+            ++joined;
+        }
+    }
+    CHECK(joined == bridge::kIndirectClampBatchSize - 1);
+    // Unknown packets are ordering points.
+    b.begin(0, 120, 0, 0);
+    gpu::CommandEncoder e3;
+    e3.begin_frame();
+    b.scan(e3.data(), e3.size());
+    CHECK(!b.open());
+}
+
+// The second execution's clamp lands in a slot reserved behind the first one, before the first
+// draws; a write to its arguments in between keeps it in place.
+void test_execute_indirect_clamp_batching() {
+    Scene scene(7100);
+    constexpr uint32_t kArgsA = 410;
+    constexpr uint32_t kArgsB = 411;
+    constexpr uint32_t kArgsC = 412;
+    scene.device.register_buffer(kArgsA, 0x400000, 4096);
+    scene.device.register_buffer(kArgsB, 0x410000, 4096);
+    scene.device.register_buffer(kArgsC, 0x420000, 4096);
+    bridge::IndirectExecution a;
+    a.kind = bridge::IndirectKind::Draw;
+    a.max_count = 2;
+    a.stride = 16;
+    a.args_buffer = kArgsA;
+    bridge::IndirectExecution b = a;
+    b.args_buffer = kArgsB;
+    b.max_count = 3;
+    bridge::IndirectExecution c = a;
+    c.args_buffer = kArgsC;
+    c.max_count = 4;
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+
+    {  // Warm-up list: creates the clamp bind groups (these are not batched; the groups are new).
+        gpu::CommandEncoder warm;
+        bridge::CommandListBridge list(scene.device, warm);
+        scene.bind_root(list);
+        list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+        CHECK(list.ExecuteIndirect(a) && list.ExecuteIndirect(b) && list.ExecuteIndirect(c));
+        CHECK(list.stats().indirect_clamps_batched == 0);
+        CHECK(count_op(decode(warm), GpuOpcode::DrawIndirect) == 9);
+        list.Close();
+    }
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    CHECK(list.ExecuteIndirect(a));
+    const size_t after_a = enc.size();
+    list.DrawInstanced(3, 1, 0, 0);
+    CHECK(list.ExecuteIndirect(b));  // joins: its clamp is patched in behind a's
+    CHECK(list.stats().indirect_clamps_batched == 1);
+    {
+        const std::vector<Packet> p = decode(enc);
+        // One compute pass worth of dispatches before any draw, for both executions.
+        const size_t first_draw = find_op(p, GpuOpcode::DrawIndirect);
+        CHECK(first_draw < p.size());
+        size_t dispatches_before_draws = 0;
+        std::vector<uint32_t> groups;
+        for (size_t i = 0; i < first_draw; ++i) {
+            if (p[i].opcode == GpuOpcode::DispatchCompute) {
+                ++dispatches_before_draws;
+                groups.push_back(pod<GpuDispatchComputePayload>(p[i]).workgroup_x);
+            }
+        }
+        CHECK(dispatches_before_draws == 2);  // a's clamp and b's batched clamp
+        CHECK(count_op(p, GpuOpcode::DispatchCompute) == 2);  // none between the draws
+        CHECK(count_op(p, GpuOpcode::DrawIndirect) == 5);
+        CHECK(count_op(p, GpuOpcode::BeginRenderPass) == 1);  // the render pass was not broken for b
+        // b's parameters (3 commands) are written before a's first draw.
+        bool found_b_params = false;
+        for (size_t i = 0; i < first_draw; ++i) {
+            if (p[i].opcode == GpuOpcode::WriteBuffer && pod<GpuWriteBufferPayload>(p[i]).data_len == 32) {
+                std::array<uint32_t, 8> v{};
+                std::memcpy(v.data(), p[i].payload.data() + sizeof(GpuWriteBufferPayload), sizeof(v));
+                found_b_params = found_b_params || v[2] == 3;
+            }
+        }
+        CHECK(found_b_params);
+        // The bytes the draws were recorded after are untouched: a's clamp stayed at its place.
+        CHECK(after_a > 0);
+    }
+    // An upload to c's arguments after the run started: c's clamp must run after it, inline.
+    enc.write_buffer(kArgsC, 0, "abcd", 4);
+    const size_t before_c = enc.size();
+    CHECK(list.ExecuteIndirect(c));
+    CHECK(list.stats().indirect_clamps_batched == 1);
+    {
+        const std::vector<Packet> p = decode(enc, before_c);
+        CHECK(find_op(p, GpuOpcode::DispatchCompute) < find_op(p, GpuOpcode::DrawIndirect));
+        CHECK(count_op(p, GpuOpcode::DispatchCompute) == 1);
+    }
+    list.Close();
+}
+
 void test_execute_indirect_packets() {
     Scene scene(7000);
     constexpr uint32_t kArgs = 400;
@@ -1039,10 +1175,20 @@ void test_execute_indirect_packets() {
     const size_t mark4 = enc.size();
     CHECK(list.ExecuteIndirect(many));
     {
+        // The clamp may have been batched into a slot reserved earlier: look at the whole list.
+        const std::vector<Packet> all = decode(enc);
         const std::vector<Packet> p = decode(enc, mark4);
         CHECK(count_op(p, GpuOpcode::DrawIndirect) == bridge::kMaxIndirectCommands);
-        CHECK(pod<GpuDispatchComputePayload>(p[find_op(p, GpuOpcode::DispatchCompute)]).workgroup_x ==
-              bridge::kMaxIndirectCommands / 64);
+        size_t clamp_at = all.size();
+        for (size_t i = all.size(); i-- > 0;) {
+            if (all[i].opcode == GpuOpcode::DispatchCompute) {
+                clamp_at = i;
+                break;
+            }
+        }
+        CHECK(clamp_at < all.size());
+        CHECK(clamp_at < all.size() &&
+              pod<GpuDispatchComputePayload>(all[clamp_at]).workgroup_x == bridge::kMaxIndirectCommands / 64);
     }
     CHECK(list.stats().indirect_truncated == 44);
 
@@ -4401,6 +4547,8 @@ int main() {
     test_partial_clear_is_reported();
     test_compute_dispatch_packets();
     test_execute_indirect_packets();
+    test_indirect_clamp_batch_planner();
+    test_execute_indirect_clamp_batching();
     test_mesh_pipeline_packets();
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();

@@ -46,6 +46,11 @@ void CommandEncoder::nop() {
     write_packet(GpuOpcode::Nop, nullptr, 0);
 }
 
+void CommandEncoder::nop_padded(uint32_t payload_bytes) {
+    const std::vector<uint8_t> zeros(payload_bytes, 0);
+    write_packet(GpuOpcode::Nop, zeros.data(), payload_bytes);
+}
+
 void CommandEncoder::begin_frame() {
     write_packet(GpuOpcode::BeginFrame, nullptr, 0);
 }

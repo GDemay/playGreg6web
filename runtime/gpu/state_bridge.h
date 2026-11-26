@@ -52,6 +52,7 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_xs.h"
 #include "gpu/descriptor_heap.h"
+#include "gpu/indirect_clamp_batch.h"
 #include "gpu/pso_cache.h"
 
 namespace playgta6::gpu::bridge {
@@ -264,6 +265,8 @@ inline constexpr uint32_t kMaxIndirectWorkgroups = 65535;
 // The clamp pass's output ring (one window of kMaxIndirectCommands records per execution).
 inline constexpr uint32_t kIndirectRingBytes = 1u << 18;
 inline constexpr uint32_t kIndirectWindowBytes = kMaxIndirectCommands * 28u;
+// Encoded size of one clamp pass (params write, pipeline, bind group, dispatch): a batch slot.
+inline constexpr uint32_t kIndirectClampSlotBytes = 120;
 // Bytes the clamp pass writes per command of `kind` (the stride of the indirect packets' records).
 uint32_t indirect_output_bytes(IndirectKind kind) noexcept;
 // The clamp compute shader (entry point cs_main, workgroup size 64).
@@ -486,6 +489,8 @@ private:
     IndirectClamp indirect_clamp(CommandEncoder& encoder);
     uint32_t indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args, uint32_t count,
                                   CommandEncoder& encoder);
+    // True when the (args, count) clamp bind group already exists (a batched clamp may use it).
+    bool indirect_clamp_group_known(uint32_t args, uint32_t count);
     uint32_t allocate_indirect_window();
 
     // G66 mesh pipelines: `base` (at most kMeshOutputGroup groups) padded with empty groups and
@@ -688,6 +693,7 @@ struct BridgeStats {
     uint64_t indirect_commands = 0;
     uint64_t indirect_skipped = 0;
     uint64_t indirect_truncated = 0;
+    uint64_t indirect_clamps_batched = 0;  // clamps recorded ahead of their draws (backlog 41)
     // G66 mesh pipelines: mesh dispatches emitted (direct, and indirect commands), and mesh work
     // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
     uint64_t mesh_dispatches = 0;
@@ -960,6 +966,7 @@ private:
     std::unordered_set<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
     bool compute_pass_valid_ = false;
     uint32_t compute_pipeline_bound_ = 0;
+    IndirectClampBatch clamp_batch_;  // backlog 41: the open run of batched ExecuteIndirect clamps
     // Root constants last uploaded per (bind point, parameter): values + ring offset.
     struct RootConstantUpload {
         std::vector<uint32_t> values;
