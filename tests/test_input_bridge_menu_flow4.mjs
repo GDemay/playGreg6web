@@ -1319,8 +1319,8 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
   assert.equal(Object.isFrozen(spec), true);
   assert.equal(spec.name, 'chrome-to-ingame');
   assert.equal(spec.loop, undefined);
-  // 47 Phase 1 + 36 Phase 2 (4x9) + 56 Phase 3 (4x14) + 16 Phase 4a + 25 Phase 4b (4x6 + 1) = 180 events
-  assert.equal(spec.events.length, 180);
+  // 24 Phase 1 (5s..74s) + 81 Phase 2 (9x9: 80s..206s warm+cold) + 56 Phase 3 (4x14) + 16 Phase 4a + 25 Phase 4b (4x6 + 1) = 202 events
+  assert.equal(spec.events.length, 202);
   assert.equal(spec.events[0].atMs, 5000);
   assert.equal(spec.events[spec.events.length - 1].atMs, 418000);
 
@@ -1346,9 +1346,10 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
   assert.equal(player.preset, 'chrome-to-ingame');
   assert.equal(player.nextTransitionMs(0), 5000);
 
-  // Phase 1 (5s..145s): Spaced A every 3000 ms (holdMs: 220, 47 presses: 5000..143000 ms).
+  // Phase 1 (5s..74s): Spaced A every 3000 ms (holdMs: 220, 24 presses: 5000..74000 ms) — stops
+  // before warm LEGAL NOTICES (~80s) so plain A never opens Row 0 ("Copyright").
   let expectedCount = 0;
-  for (let atMs = 5000; atMs <= 145000; atMs += 3000) {
+  for (let atMs = 5000; atMs <= 74000; atMs += 3000) {
     expectedCount += 1;
     assert.equal(player.sampleAt(atMs - 1).buttonsMask, 0);
     assert.equal(player.sampleAt(atMs).buttonsMask, INPUT_BUTTONS.A);
@@ -1356,9 +1357,10 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
     assert.equal(player.sampleAt(atMs + 220).buttonsMask, 0);
     assert.equal(player.pressCountAt(atMs), expectedCount);
   }
-  assert.equal(expectedCount, 47);
+  assert.equal(expectedCount, 24);
 
-  // Phase 2 (150s..206s): 4 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A).
+  // Phase 2 (80s..206s): 9 rounds of 14 s LEGAL NOTICES _menu_cycle (Up x6, Down, Down, A)
+  // covering both warm (~80..110s) and cold (~150..198s) boots cleanly.
   const expectedMenuCycle = [
     [0, INPUT_BUTTONS.DPAD_UP],
     [400, INPUT_BUTTONS.DPAD_UP],
@@ -1370,8 +1372,8 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
     [4500, INPUT_BUTTONS.DPAD_DOWN],
     [6500, INPUT_BUTTONS.A],
   ];
-  for (let round = 0; round < 4; round++) {
-    const base = 150000 + round * 14000;
+  for (let round = 0; round < 9; round++) {
+    const base = 80000 + round * 14000;
     for (const [offsetMs, btn] of expectedMenuCycle) {
       expectedCount += 1;
       const t = base + offsetMs;
@@ -1382,7 +1384,7 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
       assert.equal(player.pressCountAt(t), expectedCount);
     }
   }
-  assert.equal(expectedCount, 83);
+  assert.equal(expectedCount, 105);
 
   // Phase 3 (210s..274s): 4 rounds of 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS (Up x6 -> A -> Down -> A -> Down -> A).
   for (let round = 0; round < 4; round++) {
@@ -1404,7 +1406,7 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
       assert.equal(player.pressCountAt(t), expectedCount);
     }
   }
-  assert.equal(expectedCount, 139);
+  assert.equal(expectedCount, 161);
 
   // Phase 4a (280s..340s): Main Menu -> Story Mode spaced A every 4000 ms (16 presses).
   for (let atMs = 280000; atMs <= 340000; atMs += 4000) {
@@ -1414,7 +1416,7 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
     assert.equal(player.sampleAt(atMs + 220).buttonsMask, 0);
     assert.equal(player.pressCountAt(atMs), expectedCount);
   }
-  assert.equal(expectedCount, 155);
+  assert.equal(expectedCount, 177);
 
   // Phase 4b (346s..420s): Gentle in-game left-stick forward + right-stick look sweeps + A confirms.
   assert.equal(player.sampleAt(346000).buttonsMask, INPUT_BUTTONS.A);
@@ -1426,7 +1428,7 @@ test('W362 chrome-to-ingame preset drives Start Screen -> LEGAL NOTICES -> Legal
   assert.equal(player.sampleAt(418000).buttonsMask, INPUT_BUTTONS.A);
   assert.equal(player.sampleAt(418220).buttonsMask, 0);
   assert.equal(player.nextTransitionMs(418220), null);
-  assert.equal(player.pressCountAt(450000), 180);
+  assert.equal(player.pressCountAt(450000), 202);
 
   // Zero B presses across entire 425 s window; only A, DPAD_UP, DPAD_DOWN buttons ever used.
   const allowed = new Set([0, INPUT_BUTTONS.A, INPUT_BUTTONS.DPAD_UP, INPUT_BUTTONS.DPAD_DOWN]);

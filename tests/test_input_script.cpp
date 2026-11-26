@@ -380,6 +380,164 @@ void test_record_replay_round_trip() {
     fs::remove(path, ec);
 }
 
+void test_hardening_and_builtin_presets() {
+    std::vector<InputScriptEvent> ev;
+    std::string error;
+
+    // 1. Parser hardening: reject negative numbers, integer overflow, duration overflow, and NaN/Inf state floats.
+    CHECK(!parse_input_script("-1 A\n", ev, error));
+    CHECK(!parse_input_script("1000 A -50\n", ev, error));
+    CHECK(!parse_input_script("99999999999999999999999999 A\n", ev, error));
+    CHECK(!parse_input_script("wait draws==3 for 1e30s\n", ev, error));
+    CHECK(!parse_input_script("state 5 0x1 nan 0 0 0 0 0\n", ev, error));
+    CHECK(!parse_input_script("state 5 0x1 0 inf 0 0 0 0\n", ev, error));
+    CHECK(!parse_input_script("state -1 0x1 0 0 0 0 0 0\n", ev, error));
+
+    // 2. Explicit analog left-stick tokens (LUp, LDown, LLeft, LRight).
+    CHECK(parse_input_script("0 LUp+LRight 200\n100 LDown+LLeft 200\n", ev, error) && ev.size() == 2);
+    if (ev.size() == 2) {
+        CHECK(ev[0].left_stick_y == 1.0f && ev[0].left_stick_x == 1.0f && ev[0].buttons == 0);
+        CHECK(ev[1].left_stick_y == -1.0f && ev[1].left_stick_x == -1.0f && ev[1].buttons == 0);
+    }
+
+    // 3. ConditionTracker non-monotonic clock regression must not underflow into false met().
+    {
+        InputCondition c;
+        c.op = InputCondition::Op::Eq;
+        c.values = {33};
+        ConditionTracker tracker(c, 500);
+        CHECK(!tracker.update(1000, InputStatus{1, 33}));
+        CHECK(!tracker.update(900, InputStatus{2, 33}));  // regressed timestamp: must not underflow!
+        CHECK(!tracker.met());
+        CHECK(!tracker.update(1300, InputStatus{3, 33}));
+        CHECK(tracker.update(1400, InputStatus{4, 33}) && tracker.met());
+    }
+
+    // 4. Overlapping/delayed Press preserves full hold duration and min_hold_ms floor upgrades short holds.
+    {
+        CHECK(parse_input_script("0 A 60\n10 B 20\n", ev, error) && ev.size() == 2);
+        playgta6::InputState state{};
+        playgta6::guest::InputScriptPlayer player(ev, &state);
+        player.set_min_hold_ms(50);
+        const auto t0 = std::chrono::steady_clock::now();
+        player.start();
+        bool done = false;
+        for (int i = 0; i < 400 && !done; ++i) {
+            done = player.finished();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(done);
+        CHECK(player.writes() == 4);
+        // Event 1 held >= 60 ms, Event 2 upgraded by min_hold_ms(50) -> total >= 100 ms (never 0 ms collapsed!).
+        CHECK(elapsed_ms >= 95);
+
+        // Restarting player resets finished()/writes() cleanly.
+        player.stop();
+        player.start();
+        done = false;
+        for (int i = 0; i < 400 && !done; ++i) {
+            done = player.finished();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(done && player.writes() == 4);
+    }
+
+    // 5. Repeat timeout_ms bounds waiting inside the repeat body promptly (does not sleep for late body event).
+    {
+        CHECK(parse_input_script("repeat every 10s until draws==999 for 1s timeout 60ms\n"
+                                 "  5000 A 200\n"
+                                 "end\n",
+                                 ev, error));
+        playgta6::InputState state{};
+        playgta6::guest::InputScriptPlayer player(ev, &state);
+        const auto t0 = std::chrono::steady_clock::now();
+        player.start();
+        bool done = false;
+        for (int i = 0; i < 400 && !done; ++i) {
+            done = player.finished();
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto elapsed_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        CHECK(done);
+        CHECK(elapsed_ms < 1000);  // bounded by 60 ms timeout, not 5000 ms body press!
+        CHECK(player.writes() == 0 && player.waits_timed_out() == 1);
+    }
+
+    // 6. Cooperative live-input yield immediately releases held scripted input and sets yielded().
+    {
+        CHECK(parse_input_script("0 A 2000\n", ev, error));
+        playgta6::InputState state{};
+        std::atomic<bool> live_active{false};
+        playgta6::guest::InputScriptPlayer player(ev, &state);
+        player.set_live_yield_probe([&] { return live_active.load(); });
+        player.start();
+        bool pressed = false;
+        for (int i = 0; i < 100 && !pressed; ++i) {
+            pressed = state.buttons == button::kGamepadA;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(pressed);
+        live_active.store(true);
+        bool released = false;
+        for (int i = 0; i < 100 && !released; ++i) {
+            released = player.yielded() && state.buttons == 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(released);
+        player.stop();
+        CHECK(state.buttons == 0);
+    }
+
+    // 7. State playback releases latched buttons when interrupted by stop().
+    {
+        CHECK(parse_input_script("state 0 0x100 0 0 0 0 0 0\nstate 999999 0x0 0 0 0 0 0 0\n", ev, error));
+        playgta6::InputState state{};
+        playgta6::guest::InputScriptPlayer player(ev, &state);
+        player.set_status_probe([] { return InputStatus{1, 0}; });
+        player.start();
+        bool latched = false;
+        for (int i = 0; i < 100 && !latched; ++i) {
+            latched = state.buttons == button::kGamepadA;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        CHECK(latched);
+        player.stop();
+        CHECK(state.buttons == 0);
+    }
+
+    // 8. Built-in hardened presets parse cleanly, enforce >= 200 ms holds, include Legal Notices/Terms, and never press B.
+    const auto names = playgta6::guest::builtin_input_script_preset_names();
+    CHECK(names.size() == 5);
+    std::string unknown;
+    CHECK(!playgta6::guest::builtin_input_script_preset("does-not-exist", unknown));
+    for (const std::string& name : names) {
+        std::string script_text;
+        CHECK(playgta6::guest::builtin_input_script_preset(name, script_text));
+        CHECK(playgta6::guest::parse_input_script_or_preset(name, ev, error));
+        CHECK(!ev.empty());
+        bool has_a = false;
+        bool has_dup = false;
+        bool has_rdown = false;
+        for (const InputScriptEvent& e : ev) {
+            if (e.kind == InputStepKind::Press) {
+                CHECK(e.hold_ms >= playgta6::guest::kDefaultScriptMinHoldMs);
+                CHECK((e.buttons & button::kGamepadB) == 0);
+                if ((e.buttons & button::kGamepadA) != 0) has_a = true;
+                if ((e.buttons & button::kDPadUp) != 0) has_dup = true;
+                if (e.right_stick_y < -0.5f) has_rdown = true;
+            }
+        }
+        CHECK(has_a);
+        if (name != "calibration-skip") {
+            CHECK(has_dup);
+            CHECK(has_rdown);
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -391,6 +549,7 @@ int main() {
     test_player_repeat_stops_on_the_target_screen();
     test_title_reads_the_script_through_game_input();
     test_record_replay_round_trip();
+    test_hardening_and_builtin_presets();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_input_script: %d failure(s)\n", g_failures);
         return 1;
