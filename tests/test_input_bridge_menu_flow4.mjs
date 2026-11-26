@@ -808,6 +808,7 @@ test('W357 chrome-menu-flow-4 re-anchors to FIRST_VISIBLE_FRAME 90 s after FIRST
   assert.deepEqual(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS, [
     'menu-to-ingame',
     'chrome-to-ingame',
+    'chrome-menu-flow-6',
     'chrome-menu-flow-5',
     'chrome-menu-flow-4',
     'chrome-menu-flow-2',

@@ -66,6 +66,8 @@ export const RESPONSE_CURVES = Object.freeze({
 
 export const PROFILE_SCHEMA_VERSION = 1;
 export const DEFAULT_STORAGE_KEY = 'playgta6.inputProfiles.v1';
+export const DEFAULT_MOUSE_DEADZONE = 0;
+export const DEFAULT_MAX_MOUSE_DELTA = 500;
 
 export const PROFILE_LIMITS = Object.freeze({
   MIN_SENSITIVITY: 0.1,
@@ -1109,6 +1111,89 @@ export function transformStickAxes(lx, ly, rx, ry, profile = BUILTIN_PROFILES.de
   };
 }
 
+const INT32_MIN = -2147483648;
+const INT32_MAX = 2147483647;
+
+/**
+ * Scales raw Pointer Lock mouse movement deltas with optional spike clamping
+ * (`maxMouseDelta`), micro-jitter radial deadzone (`mouseDeadzone`), per-axis
+ * sensitivity (`sensitivityX`, `sensitivityY`), Y-axis inversion (`invertLookY`),
+ * and fractional sub-pixel remainder accumulation so low sensitivity values never
+ * truncate small deltas to zero.
+ *
+ * Pass a pre-allocated `out` object `{ dx, dy, remX, remY }` for zero-allocation
+ * hot-path mousemove handling (initial `remX`/`remY` are read from `out`).
+ */
+export function applyMouseDelta(
+  rawDx,
+  rawDy,
+  sensitivityX = 1.0,
+  sensitivityY = 1.0,
+  invertLookY = false,
+  mouseDeadzone = DEFAULT_MOUSE_DEADZONE,
+  maxMouseDelta = DEFAULT_MAX_MOUSE_DELTA,
+  out = null
+) {
+  const target = out || { dx: 0, dy: 0, remX: 0, remY: 0 };
+  const prevRemX = typeof target.remX === 'number' && Number.isFinite(target.remX) ? target.remX : 0;
+  const prevRemY = typeof target.remY === 'number' && Number.isFinite(target.remY) ? target.remY : 0;
+
+  let dx = typeof rawDx === 'number' && Number.isFinite(rawDx) ? rawDx : 0;
+  let dy = typeof rawDy === 'number' && Number.isFinite(rawDy) ? rawDy : 0;
+
+  if (dx === 0 && dy === 0) {
+    target.dx = 0;
+    target.dy = 0;
+    target.remX = normalizeZero(prevRemX);
+    target.remY = normalizeZero(prevRemY);
+    return target;
+  }
+
+  if (typeof maxMouseDelta === 'number' && Number.isFinite(maxMouseDelta) && maxMouseDelta > 0) {
+    if (dx > maxMouseDelta) dx = maxMouseDelta;
+    else if (dx < -maxMouseDelta) dx = -maxMouseDelta;
+    if (dy > maxMouseDelta) dy = maxMouseDelta;
+    else if (dy < -maxMouseDelta) dy = -maxMouseDelta;
+  }
+
+  if (typeof mouseDeadzone === 'number' && Number.isFinite(mouseDeadzone) && mouseDeadzone > 0) {
+    if (dx * dx + dy * dy <= mouseDeadzone * mouseDeadzone) {
+      target.dx = 0;
+      target.dy = 0;
+      target.remX = normalizeZero(prevRemX);
+      target.remY = normalizeZero(prevRemY);
+      return target;
+    }
+  }
+
+  const sensX =
+    typeof sensitivityX === 'number' && Number.isFinite(sensitivityX) && sensitivityX > 0
+      ? sensitivityX
+      : 1.0;
+  const sensY =
+    typeof sensitivityY === 'number' && Number.isFinite(sensitivityY) && sensitivityY > 0
+      ? sensitivityY
+      : 1.0;
+
+  const totalX = prevRemX + dx * sensX;
+  const totalY = prevRemY + dy * sensY * (invertLookY ? -1 : 1);
+
+  const clampedX = totalX > INT32_MAX ? INT32_MAX : totalX < INT32_MIN ? INT32_MIN : totalX;
+  const clampedY = totalY > INT32_MAX ? INT32_MAX : totalY < INT32_MIN ? INT32_MIN : totalY;
+  const roundedX = Math.round(clampedX);
+  const roundedY = Math.round(clampedY);
+  const snappedX = Math.abs(clampedX - roundedX) <= 1e-9 ? roundedX : clampedX;
+  const snappedY = Math.abs(clampedY - roundedY) <= 1e-9 ? roundedY : clampedY;
+  const intDx = normalizeZero(Math.trunc(snappedX));
+  const intDy = normalizeZero(Math.trunc(snappedY));
+
+  target.dx = intDx;
+  target.dy = intDy;
+  target.remX = normalizeZero(snappedX - intDx);
+  target.remY = normalizeZero(snappedY - intDy);
+  return target;
+}
+
 export class InputProfileManager {
   constructor(options = {}) {
     const opts = isPlainObject(options) ? options : {};
@@ -1418,6 +1503,8 @@ export class InputProfileManager {
     Object.assign(keyBindings, profile.keyBindings);
 
     return {
+      mouseDeadzone: DEFAULT_MOUSE_DEADZONE,
+      maxMouseDelta: DEFAULT_MAX_MOUSE_DELTA,
       ...overrides,
       keyBindings,
       stickDeadzone: profile.leftStickDeadzone,

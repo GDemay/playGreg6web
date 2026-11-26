@@ -5,10 +5,22 @@
 import {
   INPUT_BUTTONS,
   DEFAULT_KEY_BINDINGS,
+  BUILTIN_PROFILES,
+  RESPONSE_CURVES,
+  DEFAULT_MOUSE_DEADZONE,
+  DEFAULT_MAX_MOUSE_DELTA,
   applyRadialDeadzone,
+  applyMouseDelta,
 } from './input_profiles.js';
 
-export { INPUT_BUTTONS, DEFAULT_KEY_BINDINGS, applyRadialDeadzone };
+export {
+  INPUT_BUTTONS,
+  DEFAULT_KEY_BINDINGS,
+  DEFAULT_MOUSE_DEADZONE,
+  DEFAULT_MAX_MOUSE_DELTA,
+  applyRadialDeadzone,
+  applyMouseDelta,
+};
 
 export const INPUT_ABI_VERSION = 1;
 export const INPUT_STATE_BYTES = 40;
@@ -202,6 +214,7 @@ export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
 export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
   'menu-to-ingame',
   'chrome-to-ingame',
+  'chrome-menu-flow-6',
   'chrome-menu-flow-5',
   'chrome-menu-flow-4',
   'chrome-menu-flow-2',
@@ -209,6 +222,9 @@ export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
 ]);
 const FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET = new Set(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS);
 const FIRST_VISIBLE_FRAME_MIN_GAP_MS = 500;
+
+export const INTERACTIVE_YIELD_PRESETS = Object.freeze(['chrome-menu-flow-6']);
+const INTERACTIVE_YIELD_PRESET_SET = new Set(INTERACTIVE_YIELD_PRESETS);
 
 export const FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS = Object.freeze([
   Object.freeze({
@@ -721,6 +737,21 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
     // Phase 3 (W364): Looping 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 85000 ms
     // (Up x6, right-stick scroll, A [Privacy Policy], Down, right-stick scroll,
     // A [Terms of Service], Down, A [Confirm >], A; >= 200 ms holds, never presses B).
+    loop: Object.freeze({
+      startMs: 85000,
+      periodMs: 16000,
+      events: CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
+    }),
+  }),
+  'chrome-menu-flow-6': Object.freeze({
+    name: 'chrome-menu-flow-6',
+    // W374 (Refs #663): Interactive-friendly fast-boot Chrome preset.
+    // Drives Start Screen -> 4K Bink2 -> LEGAL NOTICES -> Rockstar Legal Terms checkboxes +
+    // Confirm > -> Main Menu using fast chrome-menu-flow-5 timings (>= 200 ms holds, never B),
+    // and enables interactive user-input yield by default so live keyboard, Pointer Lock mouse,
+    // or gamepad input immediately pauses scripted playback and never fights the player.
+    yieldOnUserInput: true,
+    events: buildChromeMenuFlow5Events(),
     loop: Object.freeze({
       startMs: 85000,
       periodMs: 16000,
@@ -1853,6 +1884,42 @@ export class ScriptedInputPlayer {
     return this;
   }
 
+  /**
+   * Resumes timer-driven playback from the paused elapsed timestamp (`_stoppedElapsedMs`)
+   * without resetting press telemetry or skipping elapsed phases.
+   */
+  resume() {
+    if (this._active) return this;
+    this._clearTimers();
+    this._runToken += 1;
+    const token = this._runToken;
+
+    const resumeElapsedMs =
+      Number.isFinite(this._stoppedElapsedMs) && this._stoppedElapsedMs >= 0
+        ? this._stoppedElapsedMs
+        : 0;
+    this._startedAt = this._nowFn() - resumeElapsedMs;
+    this._currentMask = 0;
+    this._currentSticks = null;
+    this._currentTriggers = null;
+    this._active = true;
+
+    this._tick(token, resumeElapsedMs);
+
+    if (
+      this._active &&
+      token === this._runToken &&
+      this._useInterval &&
+      typeof this._setIntervalFn === 'function'
+    ) {
+      this._intervalId = this._setIntervalFn(() => {
+        this._tick(token);
+      }, this._tickMs);
+    }
+
+    return this;
+  }
+
   getState() {
     const elapsedMs = this._active
       ? Math.max(0, this._nowFn() - this._startedAt)
@@ -1984,11 +2051,53 @@ export class InputBridge {
     this._triggerDeadzone = opts.triggerDeadzone ?? 0.05;
     this._triggerOuterDeadzone = opts.triggerOuterDeadzone ?? 0.98;
     this._invertGamepadY = opts.invertGamepadY ?? true;
+    this._invertLookY = Boolean(opts.invertLookY);
+    this._mouseSensitivityX =
+      typeof opts.mouseSensitivityX === 'number' &&
+      Number.isFinite(opts.mouseSensitivityX) &&
+      opts.mouseSensitivityX > 0
+        ? opts.mouseSensitivityX
+        : 1.0;
+    this._mouseSensitivityY =
+      typeof opts.mouseSensitivityY === 'number' &&
+      Number.isFinite(opts.mouseSensitivityY) &&
+      opts.mouseSensitivityY > 0
+        ? opts.mouseSensitivityY
+        : 1.0;
+    this._mouseDeadzone =
+      typeof opts.mouseDeadzone === 'number' &&
+      Number.isFinite(opts.mouseDeadzone) &&
+      opts.mouseDeadzone >= 0
+        ? opts.mouseDeadzone
+        : DEFAULT_MOUSE_DEADZONE;
+    this._maxMouseDelta =
+      opts.maxMouseDelta === null || opts.maxMouseDelta === 0
+        ? 0
+        : typeof opts.maxMouseDelta === 'number' &&
+            Number.isFinite(opts.maxMouseDelta) &&
+            opts.maxMouseDelta > 0
+          ? opts.maxMouseDelta
+          : DEFAULT_MAX_MOUSE_DELTA;
+    this._stickCurve =
+      opts.stickCurve === RESPONSE_CURVES.CUBIC || opts.stickCurve === RESPONSE_CURVES.EXPO
+        ? opts.stickCurve
+        : RESPONSE_CURVES.LINEAR;
+    this._stickExpoExponent =
+      typeof opts.stickExpoExponent === 'number' && Number.isFinite(opts.stickExpoExponent)
+        ? opts.stickExpoExponent
+        : undefined;
+    this._swapSticks = Boolean(opts.swapSticks);
+    this._swapTriggersAndBumpers = Boolean(opts.swapTriggersAndBumpers);
+    this._profileId = typeof opts.profileId === 'string' && opts.profileId.length > 0 ? opts.profileId : null;
     this._gamepadIndex = opts.gamepadIndex ?? null;
     this._allowUnlockedMouseButtons = Boolean(opts.allowUnlockedMouseButtons);
     this._autoStartOnGamepad = opts.autoStart !== false;
     this._onPointerLockChangeCallback =
       typeof opts.onPointerLockChange === 'function' ? opts.onPointerLockChange : null;
+    this._defaultYieldScriptOnUserInput =
+      typeof opts.yieldScriptOnUserInput === 'boolean' ? opts.yieldScriptOnUserInput : null;
+    this._onScriptYieldCallback =
+      typeof opts.onScriptYield === 'function' ? opts.onScriptYield : null;
 
     // Input hardening, hot-plug & zero-alloc snapshot telemetry
     this._blurResets = 0;
@@ -1997,6 +2106,7 @@ export class InputBridge {
     this._writesCount = 0;
     this._notifyCount = 0;
     this._scriptedEventsDispatched = 0;
+    this._userInputCount = 0;
     this._gamepadConnects = 0;
     this._gamepadDisconnects = 0;
     this._activeGamepadIndex = null;
@@ -2023,6 +2133,8 @@ export class InputBridge {
     this._mouseButtonBits = 0;  // mapped INPUT_BUTTONS bits from mouse
     this._mouseLt = 0;
     this._mouseRt = 0;
+    this._mouseRemX = 0; // sub-pixel fractional remainder X
+    this._mouseRemY = 0; // sub-pixel fractional remainder Y
     this._wheelDelta = 0;
 
     this._gpButtons = 0;
@@ -2039,6 +2151,10 @@ export class InputBridge {
     this._scriptManuallyStopped = false;
     this._scriptReanchorOnFirstVisibleFrame = false;
     this._scriptReanchoredCount = 0;
+    this._scriptYieldOnUserInput = false;
+    this._scriptYieldedByUser = false;
+    this._scriptYieldReason = null;
+    this._yieldedPending = null;
     this._firstPresentNotified = false;
     this._firstVisibleFrameNotified = false;
     this._scriptButtons = 0;
@@ -2052,6 +2168,17 @@ export class InputBridge {
     // Pre-allocated scratch objects for zero-allocation 60/120Hz polling, snapshots & telemetry.
     this._leftStickScratch = { x: 0, y: 0 };
     this._rightStickScratch = { x: 0, y: 0 };
+    this._leftStickCurveOpts = {
+      curve: this._stickCurve,
+      exponent: this._stickExpoExponent,
+      out: this._leftStickScratch,
+    };
+    this._rightStickCurveOpts = {
+      curve: this._stickCurve,
+      exponent: this._stickExpoExponent,
+      out: this._rightStickScratch,
+    };
+    this._mouseDeltaScratch = { dx: 0, dy: 0, remX: 0, remY: 0 };
     this._selectedGamepadScratch = { pad: null, index: -1 };
     this._snapshotScratch = {
       seq: 0,
@@ -2077,6 +2204,9 @@ export class InputBridge {
       buttons: 0,
       pointerLocked: false,
       activeGamepadIndex: null,
+      scriptYieldedByUser: false,
+      yieldReason: null,
+      userInputCount: 0,
     };
 
     // Last committed merged state (stored as IEEE-754 int32 bits for fast change detection).
@@ -2265,9 +2395,15 @@ export class InputBridge {
       );
       const changed = nowLocked !== this.pointerLocked;
       this.pointerLocked = nowLocked;
-      if (!nowLocked && this._mouseButtonsMask !== 0) {
-        this._clearMouseButtons();
-        this._commitMergedState(true);
+      if (!nowLocked) {
+        this._mouseRemX = 0;
+        this._mouseRemY = 0;
+        if (this._mouseButtonsMask !== 0 || this._pressedKeys.size > 0) {
+          this._clearMouseButtons();
+          this._pressedKeys.clear();
+          this._recomputeKeyboardState();
+          this._commitMergedState(true);
+        }
       }
       if (changed && this._onPointerLockChangeCallback) {
         this._onPointerLockChangeCallback(nowLocked);
@@ -2276,9 +2412,32 @@ export class InputBridge {
 
     this._addListener(this._window, 'mousemove', (e) => {
       if (this.disposed || !this.isPointerLocked()) return;
-      const dx = (e?.movementX ?? 0) | 0;
-      const dy = (e?.movementY ?? 0) | 0;
+      const rawDx =
+        typeof e?.movementX === 'number' && Number.isFinite(e.movementX) ? e.movementX : 0;
+      const rawDy =
+        typeof e?.movementY === 'number' && Number.isFinite(e.movementY) ? e.movementY : 0;
+      if (rawDx === 0 && rawDy === 0) return;
+
+      const scratch = this._mouseDeltaScratch;
+      scratch.remX = this._mouseRemX;
+      scratch.remY = this._mouseRemY;
+      applyMouseDelta(
+        rawDx,
+        rawDy,
+        this._mouseSensitivityX,
+        this._mouseSensitivityY,
+        this._invertLookY,
+        this._mouseDeadzone,
+        this._maxMouseDelta,
+        scratch
+      );
+      this._mouseRemX = scratch.remX;
+      this._mouseRemY = scratch.remY;
+      const dx = scratch.dx;
+      const dy = scratch.dy;
       if (dx === 0 && dy === 0) return;
+
+      this._recordLiveUserInput('mouse', true);
 
       // Even/odd seqlock framing around atomic mouse delta accumulation.
       // Matches Atomics.exchange(0) in runtime/os/game_input.cpp::consume_mouse_delta().
@@ -2299,6 +2458,7 @@ export class InputBridge {
       if ((this._mouseButtonsMask & bit) !== 0) return;
       this._mouseButtonsMask |= bit;
       this._recomputeMouseButtons();
+      this._recordLiveUserInput('mouse', false);
       this._commitMergedState(false);
     });
 
@@ -2315,18 +2475,21 @@ export class InputBridge {
 
     this._addListener(this._window, 'wheel', (e) => {
       if (this.disposed || !this.isPointerLocked()) return;
+      if (typeof e?.preventDefault === 'function') {
+        e.preventDefault();
+      }
       const deltaY = Number.isFinite(e?.deltaY) ? e.deltaY : 0;
       if (deltaY !== 0) {
         this._wheelDelta += deltaY;
+        this._recordLiveUserInput('mouse', true);
       }
     });
 
     this._addListener(this._window, 'keydown', (e) => {
       if (this.disposed || !e || !e.code) return;
       const code = e.code;
-      const isWasd = code === 'KeyW' || code === 'KeyS' || code === 'KeyA' || code === 'KeyD';
       const binding = this._keyBindings[code] || 0;
-      if (!binding && !isWasd) return;
+      if (!binding) return;
       if (this._shouldIgnoreKeydown(e, code)) return;
 
       if (
@@ -2342,6 +2505,7 @@ export class InputBridge {
 
       this._pressedKeys.add(code);
       this._recomputeKeyboardState();
+      this._recordLiveUserInput('keyboard', false);
       this._commitMergedState(false);
     });
 
@@ -2440,6 +2604,117 @@ export class InputBridge {
     return this.pointerLocked;
   }
 
+  /**
+   * Dynamically applies an input profile (built-in profile ID string, profile object,
+   * or `InputProfileManager.toInputBridgeOptions()` object) onto this running bridge
+   * without recreating the SharedArrayBuffer or DOM listeners.
+   */
+  applyProfile(profileOrName) {
+    if (this.disposed) return false;
+    let cfg = profileOrName;
+    if (typeof cfg === 'string') {
+      if (!Object.prototype.hasOwnProperty.call(BUILTIN_PROFILES, cfg)) {
+        throw new RangeError(`Unknown input profile: ${cfg}`);
+      }
+      cfg = BUILTIN_PROFILES[cfg];
+    }
+    if (!cfg || typeof cfg !== 'object') {
+      throw new TypeError('applyProfile expects a built-in profile ID or profile/options object');
+    }
+
+    if (cfg.keyBindings && typeof cfg.keyBindings === 'object') {
+      const nextBindings = {};
+      for (const defaultKey of Object.keys(DEFAULT_KEY_BINDINGS)) {
+        nextBindings[defaultKey] = 0;
+      }
+      Object.assign(nextBindings, cfg.keyBindings);
+      this._keyBindings = nextBindings;
+    }
+
+    if (typeof cfg.stickDeadzone === 'number' && Number.isFinite(cfg.stickDeadzone)) {
+      this._stickDeadzone = cfg.stickDeadzone;
+    }
+    if (typeof cfg.leftStickDeadzone === 'number' && Number.isFinite(cfg.leftStickDeadzone)) {
+      this._leftStickDeadzone = cfg.leftStickDeadzone;
+    }
+    if (typeof cfg.rightStickDeadzone === 'number' && Number.isFinite(cfg.rightStickDeadzone)) {
+      this._rightStickDeadzone = cfg.rightStickDeadzone;
+    }
+    if (typeof cfg.stickOuterDeadzone === 'number' && Number.isFinite(cfg.stickOuterDeadzone)) {
+      this._stickOuterDeadzone = cfg.stickOuterDeadzone;
+    }
+    if (typeof cfg.triggerDeadzone === 'number' && Number.isFinite(cfg.triggerDeadzone)) {
+      this._triggerDeadzone = cfg.triggerDeadzone;
+    }
+    if (typeof cfg.triggerOuterDeadzone === 'number' && Number.isFinite(cfg.triggerOuterDeadzone)) {
+      this._triggerOuterDeadzone = cfg.triggerOuterDeadzone;
+    }
+    if (
+      typeof cfg.mouseSensitivityX === 'number' &&
+      Number.isFinite(cfg.mouseSensitivityX) &&
+      cfg.mouseSensitivityX > 0
+    ) {
+      this._mouseSensitivityX = cfg.mouseSensitivityX;
+    }
+    if (
+      typeof cfg.mouseSensitivityY === 'number' &&
+      Number.isFinite(cfg.mouseSensitivityY) &&
+      cfg.mouseSensitivityY > 0
+    ) {
+      this._mouseSensitivityY = cfg.mouseSensitivityY;
+    }
+    if (typeof cfg.invertLookY === 'boolean') {
+      this._invertLookY = cfg.invertLookY;
+    }
+    if (
+      typeof cfg.mouseDeadzone === 'number' &&
+      Number.isFinite(cfg.mouseDeadzone) &&
+      cfg.mouseDeadzone >= 0
+    ) {
+      this._mouseDeadzone = cfg.mouseDeadzone;
+    }
+    if (cfg.maxMouseDelta === null || cfg.maxMouseDelta === 0) {
+      this._maxMouseDelta = 0;
+    } else if (
+      typeof cfg.maxMouseDelta === 'number' &&
+      Number.isFinite(cfg.maxMouseDelta) &&
+      cfg.maxMouseDelta > 0
+    ) {
+      this._maxMouseDelta = cfg.maxMouseDelta;
+    }
+    if (
+      cfg.stickCurve === RESPONSE_CURVES.LINEAR ||
+      cfg.stickCurve === RESPONSE_CURVES.CUBIC ||
+      cfg.stickCurve === RESPONSE_CURVES.EXPO
+    ) {
+      this._stickCurve = cfg.stickCurve;
+      this._leftStickCurveOpts.curve = this._stickCurve;
+      this._rightStickCurveOpts.curve = this._stickCurve;
+    }
+    if (typeof cfg.stickExpoExponent === 'number' && Number.isFinite(cfg.stickExpoExponent)) {
+      this._stickExpoExponent = cfg.stickExpoExponent;
+      this._leftStickCurveOpts.exponent = this._stickExpoExponent;
+      this._rightStickCurveOpts.exponent = this._stickExpoExponent;
+    }
+    if (typeof cfg.swapSticks === 'boolean') {
+      this._swapSticks = cfg.swapSticks;
+    }
+    if (typeof cfg.swapTriggersAndBumpers === 'boolean') {
+      this._swapTriggersAndBumpers = cfg.swapTriggersAndBumpers;
+    }
+    if (typeof cfg.profileId === 'string' && cfg.profileId.length > 0) {
+      this._profileId = cfg.profileId;
+    } else if (typeof cfg.id === 'string' && cfg.id.length > 0) {
+      this._profileId = cfg.id;
+    }
+
+    this._mouseRemX = 0;
+    this._mouseRemY = 0;
+    this._recomputeKeyboardState();
+    this._commitMergedState(false);
+    return true;
+  }
+
   _recomputeKeyboardState() {
     let mask = 0;
     for (const code of this._pressedKeys) {
@@ -2448,9 +2723,11 @@ export class InputBridge {
     this._keyButtons = mask >>> 0;
 
     let kx =
-      (this._pressedKeys.has('KeyD') ? 1 : 0) - (this._pressedKeys.has('KeyA') ? 1 : 0);
+      ((mask & INPUT_BUTTONS.MOVE_RIGHT) !== 0 ? 1 : 0) -
+      ((mask & INPUT_BUTTONS.MOVE_LEFT) !== 0 ? 1 : 0);
     let ky =
-      (this._pressedKeys.has('KeyW') ? 1 : 0) - (this._pressedKeys.has('KeyS') ? 1 : 0);
+      ((mask & INPUT_BUTTONS.MOVE_FORWARD) !== 0 ? 1 : 0) -
+      ((mask & INPUT_BUTTONS.MOVE_BACKWARD) !== 0 ? 1 : 0);
 
     if (kx !== 0 && ky !== 0) {
       kx *= Math.SQRT1_2;
@@ -2477,6 +2754,8 @@ export class InputBridge {
     this._mouseButtonBits = 0;
     this._mouseLt = 0;
     this._mouseRt = 0;
+    this._mouseRemX = 0;
+    this._mouseRemY = 0;
   }
 
   _clearGamepadState() {
@@ -2621,42 +2900,65 @@ export class InputBridge {
     this._activeGamepadIndex = index;
 
     const buttons = pad.buttons || EMPTY_ARRAY;
+    const swapTB = this._swapTriggersAndBumpers;
     let gpMask = 0;
     const maxButtons = Math.min(buttons.length, STANDARD_GAMEPAD_BUTTON_MAP.length);
     for (let i = 0; i < maxButtons; i++) {
+      if (swapTB && (i === 4 || i === 5)) continue;
       const bit = STANDARD_GAMEPAD_BUTTON_MAP[i];
       if (bit !== 0 && isGamepadButtonPressed(buttons[i])) {
         gpMask |= bit;
       }
     }
+    if (swapTB) {
+      if (isGamepadButtonPressed(buttons[6])) gpMask |= INPUT_BUTTONS.LB;
+      if (isGamepadButtonPressed(buttons[7])) gpMask |= INPUT_BUTTONS.RB;
+    }
     const nextGpButtons = gpMask >>> 0;
 
-    const rawLt = readGamepadTrigger(buttons[6]);
-    const rawRt = readGamepadTrigger(buttons[7]);
+    const rawLt = readGamepadTrigger(swapTB ? buttons[4] : buttons[6]);
+    const rawRt = readGamepadTrigger(swapTB ? buttons[5] : buttons[7]);
     const nextGpLt = applyTriggerDeadzone(rawLt, this._triggerDeadzone, this._triggerOuterDeadzone);
     const nextGpRt = applyTriggerDeadzone(rawRt, this._triggerDeadzone, this._triggerOuterDeadzone);
 
     const axes = pad.axes || EMPTY_ARRAY;
     const ySign = this._invertGamepadY ? -1 : 1;
-    const rawLx = Number.isFinite(axes[0]) ? axes[0] : 0;
-    const rawLy = Number.isFinite(axes[1]) ? axes[1] * ySign : 0;
-    const rawRx = Number.isFinite(axes[2]) ? axes[2] : 0;
-    const rawRy = Number.isFinite(axes[3]) ? axes[3] * ySign : 0;
+    const physLx = Number.isFinite(axes[0]) ? axes[0] : 0;
+    const physLy = Number.isFinite(axes[1]) ? axes[1] * ySign : 0;
+    const physRx = Number.isFinite(axes[2]) ? axes[2] : 0;
+    const physRy = Number.isFinite(axes[3]) ? axes[3] * ySign : 0;
 
+    const inLx = this._swapSticks ? physRx : physLx;
+    const inLy = this._swapSticks ? physRy : physLy;
+    const inRx = this._swapSticks ? physLx : physRx;
+    const inRy = this._swapSticks ? physLy : physRy;
+
+    const isLinear = this._stickCurve === RESPONSE_CURVES.LINEAR;
     const left = applyRadialDeadzone(
-      rawLx,
-      rawLy,
+      inLx,
+      inLy,
       this._leftStickDeadzone,
       this._stickOuterDeadzone,
-      this._leftStickScratch
+      isLinear ? this._leftStickScratch : this._leftStickCurveOpts
     );
     const right = applyRadialDeadzone(
-      rawRx,
-      rawRy,
+      inRx,
+      inRy,
       this._rightStickDeadzone,
       this._stickOuterDeadzone,
-      this._rightStickScratch
+      isLinear ? this._rightStickScratch : this._rightStickCurveOpts
     );
+    const nextGpRx = right.x;
+    const nextGpRy = this._invertLookY ? (right.y === 0 ? 0 : -right.y) : right.y;
+
+    const hasNonZero =
+      nextGpButtons !== 0 ||
+      nextGpLt !== 0 ||
+      nextGpRt !== 0 ||
+      left.x !== 0 ||
+      left.y !== 0 ||
+      nextGpRx !== 0 ||
+      nextGpRy !== 0;
 
     if (
       !forceCommit &&
@@ -2665,9 +2967,12 @@ export class InputBridge {
       nextGpRt === this._gpRt &&
       left.x === this._gpLx &&
       left.y === this._gpLy &&
-      right.x === this._gpRx &&
-      right.y === this._gpRy
+      nextGpRx === this._gpRx &&
+      nextGpRy === this._gpRy
     ) {
+      if (hasNonZero && this._scriptYieldOnUserInput && !this._scriptYieldedByUser) {
+        this._recordLiveUserInput('gamepad', true);
+      }
       return false;
     }
 
@@ -2676,16 +2981,13 @@ export class InputBridge {
     this._gpRt = nextGpRt;
     this._gpLx = left.x;
     this._gpLy = left.y;
-    this._gpRx = right.x;
-    this._gpRy = right.y;
-    this._hasNonZeroGpState =
-      nextGpButtons !== 0 ||
-      nextGpLt !== 0 ||
-      nextGpRt !== 0 ||
-      left.x !== 0 ||
-      left.y !== 0 ||
-      right.x !== 0 ||
-      right.y !== 0;
+    this._gpRx = nextGpRx;
+    this._gpRy = nextGpRy;
+    this._hasNonZeroGpState = hasNonZero;
+
+    if (hasNonZero) {
+      this._recordLiveUserInput('gamepad', false);
+    }
 
     return this._commitMergedState(forceCommit);
   }
@@ -2850,6 +3152,63 @@ export class InputBridge {
     return this._commitMergedState(false);
   }
 
+  _recordLiveUserInput(reason, commitIfYielded) {
+    this._userInputCount += 1;
+    if (!this._scriptYieldOnUserInput || this._scriptYieldedByUser) {
+      return false;
+    }
+    const hasPending = this._pendingScript !== null;
+    const hasActive = Boolean(this._scriptPlayer && this._scriptPlayer._active);
+    if (!hasPending && !hasActive) {
+      return false;
+    }
+
+    this._scriptYieldedByUser = true;
+    this._scriptYieldReason = reason;
+
+    if (hasPending) {
+      const pending = this._pendingScript;
+      this._yieldedPending = {
+        trigger: pending.trigger,
+        visibleFrameFallbackMs: pending.visibleFrameFallbackMs,
+        firstPresentTimeoutMs: pending.firstPresentTimeoutMs,
+        reanchorOnFirstVisibleFrame: pending.reanchorOnFirstVisibleFrame,
+        setTimeoutFn: pending.setTimeoutFn,
+        clearTimeoutFn: pending.clearTimeoutFn,
+      };
+      this._clearPendingScript();
+    }
+
+    if (hasActive) {
+      this._scriptPlayer._stopWithoutSink();
+    }
+
+    const hadScriptState =
+      this._scriptButtons !== 0 ||
+      this._scriptLx !== 0 ||
+      this._scriptLy !== 0 ||
+      this._scriptRx !== 0 ||
+      this._scriptRy !== 0 ||
+      this._scriptLt !== 0 ||
+      this._scriptRt !== 0;
+    this._scriptButtons = 0;
+    this._scriptLx = 0;
+    this._scriptLy = 0;
+    this._scriptRx = 0;
+    this._scriptRy = 0;
+    this._scriptLt = 0;
+    this._scriptRt = 0;
+
+    if (commitIfYielded && hadScriptState && !this.disposed) {
+      this._commitMergedState(false);
+    }
+
+    if (this._onScriptYieldCallback) {
+      this._onScriptYieldCallback(reason, this.getScriptState());
+    }
+    return true;
+  }
+
   _clearPendingScript() {
     const pending = this._pendingScript;
     if (!pending) return;
@@ -2950,6 +3309,7 @@ export class InputBridge {
     if (
       this._scriptPlayer &&
       !this._scriptManuallyStopped &&
+      !this._scriptYieldedByUser &&
       this._scriptReanchorOnFirstVisibleFrame &&
       this._scriptStartedOn !== INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME
     ) {
@@ -3032,10 +3392,30 @@ export class InputBridge {
         ? opts.reanchorOnFirstVisibleFrame
         : isDefaultAnchorPreset;
 
+    const presetDefaultYield = Boolean(
+      (typeof presetOrSpec === 'string' && INPUT_SCRIPT_PRESETS[presetOrSpec]?.yieldOnUserInput) ||
+        (presetOrSpec &&
+          typeof presetOrSpec === 'object' &&
+          presetOrSpec.yieldOnUserInput === true) ||
+        (typeof player.preset === 'string' &&
+          (INTERACTIVE_YIELD_PRESET_SET.has(player.preset) ||
+            INPUT_SCRIPT_PRESETS[player.preset]?.yieldOnUserInput === true))
+    );
+    const yieldScriptOnUserInput =
+      typeof opts.yieldScriptOnUserInput === 'boolean'
+        ? opts.yieldScriptOnUserInput
+        : typeof this._defaultYieldScriptOnUserInput === 'boolean'
+          ? this._defaultYieldScriptOnUserInput
+          : presetDefaultYield;
+
     this._scriptPlayer = player;
     this._scriptStartedOn = null;
     this._scriptManuallyStopped = false;
     this._scriptReanchorOnFirstVisibleFrame = reanchorOnFirstVisibleFrame;
+    this._scriptYieldOnUserInput = yieldScriptOnUserInput;
+    this._scriptYieldedByUser = false;
+    this._scriptYieldReason = null;
+    this._yieldedPending = null;
 
     if (startTrigger === INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE) {
       this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.IMMEDIATE;
@@ -3111,6 +3491,9 @@ export class InputBridge {
    */
   stopScript() {
     this._scriptManuallyStopped = true;
+    this._scriptYieldedByUser = false;
+    this._scriptYieldReason = null;
+    this._yieldedPending = null;
     this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer.stop();
@@ -3133,6 +3516,91 @@ export class InputBridge {
     if (hadScriptState && !this.disposed) {
       this._commitMergedState(false);
     }
+  }
+
+  /**
+   * Returns `true` if scripted input playback is currently paused/yielded due to live
+   * keyboard, Pointer Lock mouse, or gamepad user input.
+   */
+  isScriptYielded() {
+    return this._scriptYieldedByUser;
+  }
+
+  get scriptYieldedByUser() {
+    return this._scriptYieldedByUser;
+  }
+
+  get yieldReason() {
+    return this._scriptYieldReason;
+  }
+
+  get userInputCount() {
+    return this._userInputCount;
+  }
+
+  /**
+   * Resumes scripted input playback after it was yielded by live user input.
+   * Returns `true` if a yielded script was resumed or re-armed cleanly, else `false`.
+   */
+  resumeScript() {
+    if (this.disposed || !this._scriptYieldedByUser || !this._scriptPlayer) {
+      return false;
+    }
+    const pendingSpec = this._yieldedPending;
+    this._scriptYieldedByUser = false;
+    this._scriptYieldReason = null;
+    this._yieldedPending = null;
+    this._scriptManuallyStopped = false;
+
+    if (pendingSpec) {
+      const trigger = pendingSpec.trigger;
+      if (
+        trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+        this._firstVisibleFrameNotified
+      ) {
+        this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME;
+        if (pendingSpec.reanchorOnFirstVisibleFrame) {
+          this._scriptPlayer.reanchor({
+            initialEvents: FIRST_VISIBLE_FRAME_INITIAL_A_EVENTS,
+            preservePressCount: false,
+          });
+        } else {
+          this._scriptPlayer.start();
+        }
+        return true;
+      }
+      if (
+        trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT &&
+        (this._firstPresentNotified || this._firstVisibleFrameNotified)
+      ) {
+        this._scriptStartedOn = INPUT_SCRIPT_START_TRIGGERS.FIRST_PRESENT;
+        this._scriptPlayer.start();
+        return true;
+      }
+      const pending = {
+        player: this._scriptPlayer,
+        trigger: pendingSpec.trigger,
+        visibleFrameFallbackMs: pendingSpec.visibleFrameFallbackMs,
+        firstPresentTimeoutMs: pendingSpec.firstPresentTimeoutMs,
+        reanchorOnFirstVisibleFrame: pendingSpec.reanchorOnFirstVisibleFrame,
+        setTimeoutFn: pendingSpec.setTimeoutFn,
+        clearTimeoutFn: pendingSpec.clearTimeoutFn,
+        timerId: null,
+      };
+      this._pendingScript = pending;
+      if (
+        trigger === INPUT_SCRIPT_START_TRIGGERS.FIRST_VISIBLE_FRAME &&
+        this._firstPresentNotified
+      ) {
+        this._armPendingTimer(pending, pending.visibleFrameFallbackMs, 'FIRST_PRESENT_FALLBACK');
+      } else if (pending.firstPresentTimeoutMs !== null) {
+        this._armPendingTimer(pending, pending.firstPresentTimeoutMs, 'FIRST_PRESENT_TIMEOUT');
+      }
+      return true;
+    }
+
+    this._scriptPlayer.resume();
+    return true;
   }
 
   /**
@@ -3173,6 +3641,10 @@ export class InputBridge {
       scriptPending: Boolean(this._pendingScript),
       scriptStartedOn: this._scriptStartedOn,
       scriptReanchoredCount: this._scriptReanchoredCount,
+      scriptYieldedByUser: this._scriptYieldedByUser,
+      yieldReason: this._scriptYieldReason,
+      yieldScriptOnUserInput: this._scriptYieldOnUserInput,
+      userInputCount: this._userInputCount,
       firstPresentNotified: this._firstPresentNotified,
       firstVisibleFrameNotified: this._firstVisibleFrameNotified,
       activePreset: script.activePreset,
@@ -3193,6 +3665,15 @@ export class InputBridge {
       activeGamepadIndex: this._activeGamepadIndex,
       hasConnectedGamepad: this._hasConnectedGamepad,
       idleGamepadPollsSkipped: this._idleGamepadPollsSkipped,
+      profileId: this._profileId,
+      mouseSensitivityX: this._mouseSensitivityX,
+      mouseSensitivityY: this._mouseSensitivityY,
+      invertLookY: this._invertLookY,
+      mouseDeadzone: this._mouseDeadzone,
+      maxMouseDelta: this._maxMouseDelta,
+      stickCurve: this._stickCurve,
+      swapSticks: this._swapSticks,
+      swapTriggersAndBumpers: this._swapTriggersAndBumpers,
     };
   }
 
@@ -3206,7 +3687,7 @@ export class InputBridge {
   /**
    * Returns hot-path input-state telemetry (`pollsCount`, `writesCount`, `stuckResetCount`,
    * `activePreset`, `scriptedEventsDispatched`, `seq`, `buttons`, `pointerLocked`,
-   * `activeGamepadIndex`).
+   * `activeGamepadIndex`, `scriptYieldedByUser`, `yieldReason`, `userInputCount`).
    * Pass `{ reuse: true }` or a pre-allocated target object (`out`) for zero-allocation reads.
    */
   getInputTelemetry(optionsOrOut = null) {
@@ -3232,6 +3713,9 @@ export class InputBridge {
       buttons: 0,
       pointerLocked: false,
       activeGamepadIndex: null,
+      scriptYieldedByUser: false,
+      yieldReason: null,
+      userInputCount: 0,
     };
     out.pollsCount = this._pollsCount;
     out.writesCount = this._writesCount;
@@ -3243,6 +3727,9 @@ export class InputBridge {
     out.buttons = this.buttons;
     out.pointerLocked = this.isPointerLocked();
     out.activeGamepadIndex = this._activeGamepadIndex;
+    out.scriptYieldedByUser = this._scriptYieldedByUser;
+    out.yieldReason = this._scriptYieldReason;
+    out.userInputCount = this._userInputCount;
     return out;
   }
 
@@ -3254,6 +3741,9 @@ export class InputBridge {
 
   reset() {
     this._scriptManuallyStopped = true;
+    this._scriptYieldedByUser = false;
+    this._scriptYieldReason = null;
+    this._yieldedPending = null;
     this._clearPendingScript();
     if (this._scriptPlayer) {
       this._scriptPlayer._stopWithoutSink();
