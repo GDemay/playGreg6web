@@ -23,6 +23,7 @@
 
   const PIXEL_FORMAT = Object.freeze({
     RGBA8: 'rgba8',
+    BGRA8: 'bgra8',
     YUV420P: 'yuv420p',
     YUVA420P: 'yuva420p',
     NV12: 'nv12',
@@ -74,6 +75,11 @@
       typeof GPUTextureUsage.TEXTURE_BINDING === 'number'
         ? GPUTextureUsage.TEXTURE_BINDING
         : 0x04,
+    RENDER_ATTACHMENT:
+      typeof GPUTextureUsage !== 'undefined' &&
+      typeof GPUTextureUsage.RENDER_ATTACHMENT === 'number'
+        ? GPUTextureUsage.RENDER_ATTACHMENT
+        : 0x10,
   });
 
   // Original procedural color-bar palette (not derived from any copyrighted media).
@@ -127,8 +133,12 @@
     }
     if (typeof format === 'string') {
       const normalized = format.trim().toLowerCase();
+      if (normalized === 'bgra8unorm') {
+        return PIXEL_FORMAT.BGRA8;
+      }
       if (
         normalized === PIXEL_FORMAT.RGBA8 ||
+        normalized === PIXEL_FORMAT.BGRA8 ||
         normalized === PIXEL_FORMAT.YUV420P ||
         normalized === PIXEL_FORMAT.YUVA420P ||
         normalized === PIXEL_FORMAT.NV12
@@ -300,7 +310,14 @@
       return null;
     }
     const token = format.trim().toLowerCase();
-    if (token === 'rgba8' || token === 'rgba' || token === 'rgba8unorm') {
+    if (
+      token === 'rgba8' ||
+      token === 'rgba' ||
+      token === 'rgba8unorm' ||
+      token === 'bgra8' ||
+      token === 'bgra' ||
+      token === 'bgra8unorm'
+    ) {
       return ALLOWED_FRAME_FORMATS.RGBA8;
     }
     if (token === 'yuv420p' || token === 'yuv420' || token === 'yuva420p' || token === 'yuva420') {
@@ -990,6 +1007,25 @@
       return this._loadOp;
     }
 
+    /**
+     * Switch presentation swapchain format (e.g. `bgra8unorm`, `bgra8unorm-srgb`, `rgba16float`)
+     * and propagate it to the underlying presenter so sRGB/linear output stays exact.
+     *
+     * @param {string} presentationFormat
+     */
+    setPresentationFormat(presentationFormat) {
+      this._assertNotDestroyed();
+      if (typeof presentationFormat !== 'string' || presentationFormat.trim().length === 0) {
+        throw new TypeError('presentationFormat must be a non-empty string');
+      }
+      const normalized = presentationFormat.trim();
+      this._presentationFormat = normalized;
+      if (this._presenter && typeof this._presenter.setPresentationFormat === 'function') {
+        this._presenter.setPresentationFormat(normalized);
+      }
+      return this._presentationFormat;
+    }
+
     _assertNotDestroyed() {
       if (this._destroyed) {
         throw new Error('SplashFrameBridge has been destroyed');
@@ -1167,12 +1203,20 @@
       const planes = frame.planes || null;
       const fmt = frame.format;
 
-      if (fmt === PIXEL_FORMAT.RGBA8 || fmt === 0 || (!fmt && (frame.rgba || (planes && planes.rgba)))) {
-        const rgba = (planes && planes.rgba) || frame.rgba || frame.data || null;
+      if (
+        fmt === PIXEL_FORMAT.RGBA8 ||
+        fmt === PIXEL_FORMAT.BGRA8 ||
+        fmt === 0 ||
+        (!fmt && (frame.rgba || frame.bgra || (planes && (planes.rgba || planes.bgra))))
+      ) {
+        const isBgra = fmt === PIXEL_FORMAT.BGRA8 || Boolean(frame.bgra || (planes && planes.bgra));
+        const rgba =
+          (planes && (planes.bgra || planes.rgba)) || frame.bgra || frame.rgba || frame.data || null;
         if (rgba) {
           const probeOpts = this._configureLumaProbeOpts(overrideOpts, {
             bytesPerPixel: 4,
             strideBytes: frame.strideBytes !== undefined ? frame.strideBytes : null,
+            format: isBgra ? 'bgra8' : 'rgba8',
           });
           hasVisibleNonBlackPixels(rgba, w, h, probeOpts);
           return scratch;
@@ -1770,17 +1814,26 @@
       let aStride = null;
       let strideBytes = null;
 
-      if (format === PIXEL_FORMAT.RGBA8) {
-        const rgbaInput =
-          planes && planes.rgba !== undefined
-            ? planes.rgba
-            : frame.rgba !== undefined
-              ? frame.rgba
-              : frame.data;
-        if (rgbaInput === undefined || rgbaInput === null) {
-          throw new TypeError('RGBA8 frames require planes.rgba');
+      if (format === PIXEL_FORMAT.RGBA8 || format === PIXEL_FORMAT.BGRA8) {
+        const isBgra = format === PIXEL_FORMAT.BGRA8;
+        const pixelInput =
+          planes && planes.bgra !== undefined
+            ? planes.bgra
+            : planes && planes.rgba !== undefined
+              ? planes.rgba
+              : frame.bgra !== undefined
+                ? frame.bgra
+                : frame.rgba !== undefined
+                  ? frame.rgba
+                  : frame.data;
+        if (pixelInput === undefined || pixelInput === null) {
+          throw new TypeError(
+            isBgra ? 'BGRA8 frames require planes.bgra or planes.rgba' : 'RGBA8 frames require planes.rgba'
+          );
         }
-        ownedPlanes = { rgba: acquirePlaneBytes(rgbaInput, 'planes.rgba', zeroCopy) };
+        ownedPlanes = isBgra
+          ? { bgra: acquirePlaneBytes(pixelInput, 'planes.bgra', zeroCopy) }
+          : { rgba: acquirePlaneBytes(pixelInput, 'planes.rgba', zeroCopy) };
         strideBytes = resolveOptionalStride(
           frame.strideBytes,
           planes && planes.strideBytes,
@@ -2142,7 +2195,10 @@
         label: `playgta6-splash-external-${frame.frameIndex}`,
         size: { width: frame.width, height: frame.height, depthOrArrayLayers: 1 },
         format: 'rgba8unorm',
-        usage: TEXTURE_USAGE.COPY_DST | TEXTURE_USAGE.TEXTURE_BINDING,
+        usage:
+          TEXTURE_USAGE.COPY_DST |
+          TEXTURE_USAGE.TEXTURE_BINDING |
+          TEXTURE_USAGE.RENDER_ATTACHMENT,
       });
       device.queue.copyExternalImageToTexture(
         { source: frame.externalSource },
@@ -2151,21 +2207,51 @@
       );
       this._resourcesReleased = false;
       this._externalScratchTextures.push(texture);
-      return true;
+      return texture;
     }
 
     _uploadFrame(presenter, device, frame) {
-      if (frame.source === SPLASH_FRAME_SOURCE.EXTERNAL) {
-        this._uploadExternalViaCopy(device, frame);
+      if (frame.format === PIXEL_FORMAT.BGRA8) {
+        const bgra = frame.planes && (frame.planes.bgra || frame.planes.rgba);
+        if (typeof presenter.uploadBgraFrame === 'function') {
+          if (frame.strideBytes !== null && frame.strideBytes !== undefined) {
+            return presenter.uploadBgraFrame(bgra, frame.width, frame.height, {
+              strideBytes: frame.strideBytes,
+            });
+          }
+          return presenter.uploadBgraFrame(bgra, frame.width, frame.height);
+        }
+        if (typeof presenter.uploadFrame === 'function') {
+          const bgraDesc = {
+            format: PIXEL_FORMAT.BGRA8,
+            bgra,
+            width: frame.width,
+            height: frame.height,
+          };
+          if (frame.strideBytes !== null && frame.strideBytes !== undefined) {
+            bgraDesc.strideBytes = frame.strideBytes;
+          }
+          return presenter.uploadFrame(bgraDesc);
+        }
+        throw new TypeError('presenter does not support BGRA8 uploads');
       }
 
       if (frame.format === PIXEL_FORMAT.RGBA8) {
+        let externalTexture = null;
+        if (frame.source === SPLASH_FRAME_SOURCE.EXTERNAL) {
+          externalTexture = this._uploadExternalViaCopy(device, frame) || null;
+        }
         let rgba = frame.planes && frame.planes.rgba;
         if (!rgba && frame.externalSource) {
           rgba = extractRgbaFromExternal(frame.externalSource, frame.width, frame.height);
         }
+        if (!rgba && externalTexture && typeof presenter.bindExternalTexture === 'function') {
+          // Bind the GPU-copied external texture directly so GPU-only ImageBitmaps render
+          // their actual pixels instead of a synthetic solid-white fallback.
+          return presenter.bindExternalTexture(externalTexture, frame.width, frame.height);
+        }
         if (!rgba) {
-          // Last-resort solid frame so presentation never stalls when only GPU copy succeeded.
+          // Last-resort solid frame when neither CPU extraction nor presenter.uploadExternalImage is available.
           rgba = new Uint8Array(frame.width * frame.height * 4);
           rgba.fill(255);
         }
@@ -2200,18 +2286,14 @@
           width: frame.width,
           height: frame.height,
           chromaOrder: frame.chromaOrder || this._chromaOrder,
+          colorSpace: frame.colorSpace || this._colorSpace,
+          colorRange: frame.colorRange || this._colorRange,
         };
         if (frame.yStride !== null && frame.yStride !== undefined) {
           nv12.yStride = frame.yStride;
         }
         if (frame.uvStride !== null && frame.uvStride !== undefined) {
           nv12.uvStride = frame.uvStride;
-        }
-        if (frame.colorSpace) {
-          nv12.colorSpace = frame.colorSpace;
-        }
-        if (frame.colorRange) {
-          nv12.colorRange = frame.colorRange;
         }
         if (typeof presenter.uploadNv12Frame === 'function') {
           return presenter.uploadNv12Frame(nv12);
@@ -2232,6 +2314,8 @@
         width: frame.width,
         height: frame.height,
         chromaOrder: frame.chromaOrder || this._chromaOrder,
+        colorSpace: frame.colorSpace || this._colorSpace,
+        colorRange: frame.colorRange || this._colorRange,
       };
       if (frame.format === PIXEL_FORMAT.YUVA420P) {
         yuv.a = frame.planes.a;
@@ -2250,12 +2334,6 @@
       }
       if (frame.aStride !== null && frame.aStride !== undefined) {
         yuv.aStride = frame.aStride;
-      }
-      if (frame.colorSpace) {
-        yuv.colorSpace = frame.colorSpace;
-      }
-      if (frame.colorRange) {
-        yuv.colorRange = frame.colorRange;
       }
       if (typeof presenter.uploadYuv420Frame === 'function') {
         return presenter.uploadYuv420Frame(yuv);

@@ -87,6 +87,10 @@
 
   const TEXTURE_DIMENSION_NAMES = Object.freeze(['1d', '2d', '3d']);
   const BC_SLICED_3D_FEATURE = 'texture-compression-bc-sliced-3d';
+  const BGRA8_STORAGE_FEATURE = 'bgra8unorm-storage';
+  const RG11B10_RENDERABLE_FEATURE = 'rg11b10ufloat-renderable';
+  const GPU_TEXTURE_USAGE_STORAGE_BINDING = 0x08;
+  const GPU_TEXTURE_USAGE_RENDER_ATTACHMENT = 0x10;
 
   // Block geometry for all WebGPU texture formats in TEXTURE_FORMAT_NAMES.
   const WEBGPU_FORMAT_BLOCK_INFO = Object.freeze({
@@ -361,29 +365,139 @@
     };
   }
 
-  function deviceSupportsBcSliced3d(device) {
+  function deviceHasFeature(device, featureName) {
     const features = device && device.features;
     if (!features) {
       return false;
     }
     if (typeof features.has === 'function') {
-      return Boolean(features.has(BC_SLICED_3D_FEATURE));
+      return Boolean(features.has(featureName));
     }
     if (Array.isArray(features)) {
-      return features.includes(BC_SLICED_3D_FEATURE);
+      return features.includes(featureName);
     }
     if (typeof features[Symbol.iterator] === 'function') {
       for (const item of features) {
-        if (item === BC_SLICED_3D_FEATURE) {
+        if (item === featureName) {
           return true;
         }
       }
       return false;
     }
     if (typeof features === 'object') {
-      return Boolean(features[BC_SLICED_3D_FEATURE]);
+      return Boolean(features[featureName]);
     }
     return false;
+  }
+
+  function deviceSupportsBcSliced3d(device) {
+    return deviceHasFeature(device, BC_SLICED_3D_FEATURE);
+  }
+
+  function isDepthOrStencilFormat(format) {
+    return (
+      typeof format === 'string' &&
+      (format.startsWith('depth') || format === 'stencil8')
+    );
+  }
+
+  function formatSupportsStorageBinding(format, device) {
+    if (typeof format !== 'string' || !format) {
+      return false;
+    }
+    if (
+      format.endsWith('-srgb') ||
+      isBcCompressedFormat(format) ||
+      isDepthOrStencilFormat(format) ||
+      format === 'rgb9e5ufloat' ||
+      format === 'rg11b10ufloat' ||
+      format === 'rgb10a2unorm' ||
+      format === 'rgb10a2uint' ||
+      format === 'r8unorm' ||
+      format === 'r8snorm' ||
+      format === 'r8uint' ||
+      format === 'r8sint' ||
+      format === 'rg8unorm' ||
+      format === 'rg8snorm' ||
+      format === 'rg8uint' ||
+      format === 'rg8sint' ||
+      format === 'r16unorm' ||
+      format === 'r16snorm' ||
+      format === 'r16uint' ||
+      format === 'r16sint' ||
+      format === 'r16float' ||
+      format === 'rg16unorm' ||
+      format === 'rg16snorm' ||
+      format === 'rg16uint' ||
+      format === 'rg16sint' ||
+      format === 'rg16float' ||
+      format === 'rgba16unorm' ||
+      format === 'rgba16snorm'
+    ) {
+      return false;
+    }
+    if (format === 'bgra8unorm') {
+      return device && device.features ? deviceHasFeature(device, BGRA8_STORAGE_FEATURE) : true;
+    }
+    return true;
+  }
+
+  function formatSupportsRenderAttachment(format, device) {
+    if (typeof format !== 'string' || !format) {
+      return false;
+    }
+    if (
+      isBcCompressedFormat(format) ||
+      format === 'rgb9e5ufloat' ||
+      format === 'r8snorm' ||
+      format === 'rg8snorm' ||
+      format === 'rgba8snorm' ||
+      format === 'r16snorm' ||
+      format === 'rg16snorm' ||
+      format === 'rgba16snorm'
+    ) {
+      return false;
+    }
+    if (format === 'rg11b10ufloat') {
+      return device && device.features ? deviceHasFeature(device, RG11B10_RENDERABLE_FEATURE) : true;
+    }
+    return true;
+  }
+
+  function formatSupportsMultisample(format, device) {
+    if (!formatSupportsRenderAttachment(format, device)) {
+      return false;
+    }
+    if (
+      format === 'r32uint' ||
+      format === 'r32sint' ||
+      format === 'rg32uint' ||
+      format === 'rg32sint' ||
+      format === 'rg32float' ||
+      format === 'rgba32uint' ||
+      format === 'rgba32sint' ||
+      format === 'rgba32float'
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Compute WebGPU §22.5.1 minimum required byte length for a texel copy where the
+   * final row of the final slice may be tightly packed (`lastRowBytes <= bytesPerRow`).
+   */
+  function calcMinTexelCopyBytes(bytesPerRow, rowsPerImage, rowsInSlice, depthOrLayers, lastRowBytes) {
+    if (rowsInSlice <= 0 || depthOrLayers <= 0 || bytesPerRow <= 0) {
+      return 0;
+    }
+    const finalRow =
+      Number.isInteger(lastRowBytes) && lastRowBytes > 0 && lastRowBytes < bytesPerRow
+        ? lastRowBytes
+        : bytesPerRow;
+    const rpi =
+      Number.isInteger(rowsPerImage) && rowsPerImage >= rowsInSlice ? rowsPerImage : rowsInSlice;
+    return (depthOrLayers - 1) * rpi * bytesPerRow + (rowsInSlice - 1) * bytesPerRow + finalRow;
   }
 
   function toNonNegativeInt(value) {
@@ -851,30 +965,35 @@
    * @param {Uint8Array | TextureScratchPool | object | null} [scratchOrOptions=null]
    */
   function copyAndPadRepackedRows(src, dst, bytesPerRow, alignedBytesPerRow, totalRows, zeroPad) {
+    const srcLen = src.byteLength;
     if (totalRows === 1) {
-      if (src.byteLength === bytesPerRow) {
+      const copyLen = Math.min(bytesPerRow, srcLen);
+      if (copyLen === srcLen && copyLen > 0) {
         dst.set(src, 0);
-      } else if (bytesPerRow <= 32) {
-        for (let i = 0; i < bytesPerRow; i += 1) {
+      } else if (copyLen <= 32) {
+        for (let i = 0; i < copyLen; i += 1) {
           dst[i] = src[i];
         }
       } else {
-        dst.set(src.subarray(0, bytesPerRow), 0);
+        dst.set(src.subarray(0, copyLen), 0);
       }
-      if (zeroPad) {
-        dst.fill(0, bytesPerRow, alignedBytesPerRow);
+      if ((zeroPad || copyLen < bytesPerRow) && copyLen < alignedBytesPerRow) {
+        dst.fill(0, copyLen, alignedBytesPerRow);
       }
       return;
     }
+    const lastRowIndex = totalRows - 1;
     if (bytesPerRow <= 32) {
       for (let row = 0; row < totalRows; row += 1) {
         const srcOffset = row * bytesPerRow;
         const dstOffset = row * alignedBytesPerRow;
-        for (let i = 0; i < bytesPerRow; i += 1) {
+        const copyLen =
+          row === lastRowIndex ? Math.min(bytesPerRow, Math.max(0, srcLen - srcOffset)) : bytesPerRow;
+        for (let i = 0; i < copyLen; i += 1) {
           dst[dstOffset + i] = src[srcOffset + i];
         }
-        if (zeroPad) {
-          dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
+        if ((zeroPad || copyLen < bytesPerRow) && copyLen < alignedBytesPerRow) {
+          dst.fill(0, dstOffset + copyLen, dstOffset + alignedBytesPerRow);
         }
       }
       return;
@@ -882,9 +1001,13 @@
     for (let row = 0; row < totalRows; row += 1) {
       const srcOffset = row * bytesPerRow;
       const dstOffset = row * alignedBytesPerRow;
-      dst.set(src.subarray(srcOffset, srcOffset + bytesPerRow), dstOffset);
-      if (zeroPad) {
-        dst.fill(0, dstOffset + bytesPerRow, dstOffset + alignedBytesPerRow);
+      const copyLen =
+        row === lastRowIndex ? Math.min(bytesPerRow, Math.max(0, srcLen - srcOffset)) : bytesPerRow;
+      if (copyLen > 0) {
+        dst.set(src.subarray(srcOffset, srcOffset + copyLen), dstOffset);
+      }
+      if ((zeroPad || copyLen < bytesPerRow) && copyLen < alignedBytesPerRow) {
+        dst.fill(0, dstOffset + copyLen, dstOffset + alignedBytesPerRow);
       }
     }
   }
@@ -912,12 +1035,19 @@
     const totalRows = rowCount * depthOrLayers;
     const alignedBytesPerRow = alignBytesPerRow256(bytesPerRow);
     const fromSab = isSharedBuffer(src.buffer);
-    const forceCopy = Boolean(
+    const isOptsObj =
       scratchOrOptions &&
       typeof scratchOrOptions === 'object' &&
-      !(scratchOrOptions instanceof Uint8Array) &&
-      (scratchOrOptions.copyResult === true || scratchOrOptions.copy === true)
+      !(scratchOrOptions instanceof Uint8Array);
+    const forceCopy = Boolean(
+      isOptsObj && (scratchOrOptions.copyResult === true || scratchOrOptions.copy === true)
     );
+    const optLastRowBytes =
+      isOptsObj &&
+      Number.isInteger(scratchOrOptions.lastRowBytes) &&
+      scratchOrOptions.lastRowBytes > 0
+        ? Math.min(bytesPerRow, scratchOrOptions.lastRowBytes)
+        : bytesPerRow;
 
     if (totalRows === 0) {
       return {
@@ -931,17 +1061,19 @@
       };
     }
 
-    const requiredSrcBytes = bytesPerRow * totalRows;
-    if (src.byteLength < requiredSrcBytes) {
+    const fullSrcBytes = bytesPerRow * totalRows;
+    const minRequiredSrcBytes = (totalRows - 1) * bytesPerRow + optLastRowBytes;
+    if (src.byteLength < minRequiredSrcBytes) {
       throw new RangeError(
-        `repackRowsTo256: srcBytes too small (${src.byteLength} bytes; need at least ${requiredSrcBytes} bytes for ${totalRows} rows of ${bytesPerRow} bytes)`
+        `repackRowsTo256: srcBytes too small (${src.byteLength} bytes; need at least ${minRequiredSrcBytes} bytes for ${totalRows} rows of ${bytesPerRow} bytes)`
       );
     }
 
-    if (alignedBytesPerRow === bytesPerRow) {
-      const slice = src.byteLength === requiredSrcBytes ? src : src.subarray(0, requiredSrcBytes);
+    const needsLastRowPad = src.byteLength < fullSrcBytes;
+    if (alignedBytesPerRow === bytesPerRow && !needsLastRowPad) {
+      const slice = src.byteLength === fullSrcBytes ? src : src.subarray(0, fullSrcBytes);
       if (fromSab || forceCopy) {
-        const dest = resolveScratchDestination(requiredSrcBytes, scratchOrOptions);
+        const dest = resolveScratchDestination(fullSrcBytes, scratchOrOptions);
         dest.view.set(slice, 0);
         return {
           data: dest.view,
@@ -2008,6 +2140,7 @@
       };
       this._reusableDecodeCreate1 = createTextureDecodeScratch(false);
       this._reusableDecodeCreate2 = createTextureDecodeScratch(true);
+      this._pendingStagedTextures = new Set();
 
       this.stats = this._createEmptyStats();
       this.lastError = null;
@@ -2283,6 +2416,7 @@
       this._textureObjFormats = new WeakMap();
       this._textureMeta.clear();
       this._textureObjMeta = new WeakMap();
+      this._pendingStagedTextures.clear();
       this._scratchPool.reset();
       this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
@@ -2303,6 +2437,7 @@
       this._textureObjFormats = new WeakMap();
       this._textureMeta.clear();
       this._textureObjMeta = new WeakMap();
+      this._pendingStagedTextures.clear();
       this._scratchPool.destroy();
       this._clearReusableDescriptorRefs();
       this.stats = this._createEmptyStats();
@@ -2385,7 +2520,14 @@
       };
     }
 
-    _repackRowsWithScratchInto(out, srcBytes, bytesPerRow, rowCount, depthOrLayers = 1) {
+    _repackRowsWithScratchInto(
+      out,
+      srcBytes,
+      bytesPerRow,
+      rowCount,
+      depthOrLayers = 1,
+      lastRowBytes = bytesPerRow
+    ) {
       const src = toUint8Array(srcBytes, 'repackRowsTo256');
       if (!Number.isInteger(bytesPerRow) || bytesPerRow < 1) {
         throw new RangeError(
@@ -2419,25 +2561,31 @@
         return out;
       }
 
-      const requiredSrcBytes = bytesPerRow * totalRows;
-      if (src.byteLength < requiredSrcBytes) {
+      const effLastRowBytes =
+        Number.isInteger(lastRowBytes) && lastRowBytes > 0
+          ? Math.min(bytesPerRow, lastRowBytes)
+          : bytesPerRow;
+      const fullSrcBytes = bytesPerRow * totalRows;
+      const minRequiredSrcBytes = (totalRows - 1) * bytesPerRow + effLastRowBytes;
+      if (src.byteLength < minRequiredSrcBytes) {
         throw new RangeError(
-          `repackRowsTo256: srcBytes too small (${src.byteLength} bytes; need at least ${requiredSrcBytes} bytes for ${totalRows} rows of ${bytesPerRow} bytes)`
+          `repackRowsTo256: srcBytes too small (${src.byteLength} bytes; need at least ${minRequiredSrcBytes} bytes for ${totalRows} rows of ${bytesPerRow} bytes)`
         );
       }
 
-      if (alignedBytesPerRow === bytesPerRow) {
-        const slice = src.byteLength === requiredSrcBytes ? src : src.subarray(0, requiredSrcBytes);
+      const needsLastRowPad = src.byteLength < fullSrcBytes;
+      if (alignedBytesPerRow === bytesPerRow && !needsLastRowPad) {
+        const slice = src.byteLength === fullSrcBytes ? src : src.subarray(0, fullSrcBytes);
         if (fromSab) {
-          const scratch = this._acquireScratchSlot0(requiredSrcBytes);
+          const scratch = this._acquireScratchSlot0(fullSrcBytes);
           let dst;
           if (scratch.buffer) {
             dst =
-              scratch.buffer.byteLength === requiredSrcBytes
+              scratch.buffer.byteLength === fullSrcBytes
                 ? scratch.buffer
-                : scratch.buffer.subarray(0, requiredSrcBytes);
+                : scratch.buffer.subarray(0, fullSrcBytes);
           } else {
-            dst = new Uint8Array(requiredSrcBytes);
+            dst = new Uint8Array(fullSrcBytes);
           }
           dst.set(slice, 0);
           out.data = dst;
@@ -2690,6 +2838,23 @@
       rawSizeFallback
     ) {
       const src = toUint8Array(rawData, 'writeTexture');
+      // Prevent queue.writeTexture from overtaking an earlier staged copyBufferToTexture to
+      // the same texture recorded on processor._pendingEncoder (WebGPU queue timeline order).
+      const proc = this.processor;
+      if (proc) {
+        if (!proc._hasPendingUploadCommands) {
+          if (this._pendingStagedTextures.size > 0) {
+            this._pendingStagedTextures.clear();
+          }
+        } else if (
+          proc._pendingEncoder &&
+          this._pendingStagedTextures.has(texture) &&
+          typeof proc._flushPendingUploads === 'function'
+        ) {
+          this._pendingStagedTextures.clear();
+          proc._flushPendingUploads(false);
+        }
+      }
       const chunkMax = this._maxWriteChunkBytes;
       const srcAvailBytes = Math.max(0, src.byteLength - layoutOffset);
 
@@ -3405,10 +3570,17 @@
             Number.isInteger(srcBytesPerRow) && srcBytesPerRow > 0
               ? srcBytesPerRow
               : origMinRowBytes;
+          const minTightBlocksBytes = calcMinTexelCopyBytes(
+            candidateBpr,
+            origBlocksY,
+            origBlocksY,
+            rawD,
+            origMinRowBytes
+          );
           if (
             candidateBpr > 0 &&
             rawBytesForCheck.byteLength < candidateBpr * srcRowsPerImage * rawD &&
-            rawBytesForCheck.byteLength >= candidateBpr * origBlocksY * rawD
+            rawBytesForCheck.byteLength >= minTightBlocksBytes
           ) {
             origRowsPerImage = origBlocksY;
           } else {
@@ -3526,12 +3698,15 @@
           };
         }
 
+        const tightLastRowBytes =
+          blockInfo && blocksX > 0 ? Math.min(rawBytesPerRow, blocksX * blockInfo.bytesPerBlock) : rawBytesPerRow;
         const packed = this._repackRowsWithScratchInto(
           this._reusableRepackResult,
           rawBytes,
           rawBytesPerRow,
           rowsPerImage,
-          effD
+          effD,
+          tightLastRowBytes
         );
         if (packed.repacked) {
           this.stats.rowPitchRepackCount += 1;
@@ -3571,6 +3746,9 @@
           const packedBpr = packed.bytesPerRow;
           packed.data = null;
           p.stagingPool.stageTextureUpload(encoder, dstTexture, packedData, stageLayout);
+          if (p._pendingEncoder && encoder === p._pendingEncoder) {
+            this._pendingStagedTextures.add(dstTexture);
+          }
           this.stats.reusedDescriptorCount += 1;
           this._recordUploadCount();
           this._recordUploadBytes(packedLen);
@@ -3775,14 +3953,26 @@
           });
         }
 
+        const srcBufSize =
+          typeof srcBuffer.size === 'number' && Number.isFinite(srcBuffer.size) && srcBuffer.size > 0
+            ? srcBuffer.size
+            : Infinity;
         for (let row = 0; row < totalRows; row += 1) {
-          encoder.copyBufferToBuffer(
-            srcBuffer,
-            srcOffset + row * rawBytesPerRow,
-            dstBuffer,
-            dstOffset + row * alignedBytesPerRow,
-            rawBytesPerRow
-          );
+          const rowSrcOff = srcOffset + row * rawBytesPerRow;
+          let copySize = rawBytesPerRow;
+          if (row === totalRows - 1 && rowSrcOff + copySize > srcBufSize) {
+            const avail = Math.max(0, srcBufSize - rowSrcOff);
+            copySize = Math.floor(avail / 4) * 4;
+          }
+          if (copySize > 0) {
+            encoder.copyBufferToBuffer(
+              srcBuffer,
+              rowSrcOff,
+              dstBuffer,
+              dstOffset + row * alignedBytesPerRow,
+              copySize
+            );
+          }
         }
         const reusedSrc = this._fillBufferSource(
           dstBuffer,
@@ -3896,10 +4086,17 @@
       if (rowsPerImage > 0) {
         if (isCompressed && rowsPerImage === height && rowsPerImage > origBlocksY) {
           const candidateBpr = bytesPerRow > 0 ? bytesPerRow : origMinRowBytes;
+          const minTightBlocksBytes = calcMinTexelCopyBytes(
+            candidateBpr,
+            origBlocksY,
+            origBlocksY,
+            depthOrArrayLayers,
+            origMinRowBytes
+          );
           if (
             candidateBpr > 0 &&
             dataLen < candidateBpr * rowsPerImage * depthOrArrayLayers &&
-            dataLen >= candidateBpr * origBlocksY * depthOrArrayLayers
+            dataLen >= minTightBlocksBytes
           ) {
             effectiveRowsPerImage = origBlocksY;
           } else {
@@ -4017,8 +4214,19 @@
         copyHeight > 0 &&
         dataLen > 0
       ) {
+        const tightLastRowBytes =
+          blockInfo && clampedBlocksX > 0
+            ? Math.min(effectiveBytesPerRow, clampedBlocksX * blockInfo.bytesPerBlock)
+            : effectiveBytesPerRow;
+        const minTightSrcBytes = calcMinTexelCopyBytes(
+          effectiveBytesPerRow,
+          effectiveRowsPerImage,
+          clampedBlocksY,
+          effDepth,
+          tightLastRowBytes
+        );
         const canStage =
-          effectiveBytesPerRow > 0 && dataLen >= effectiveBytesPerRow * totalRows;
+          effectiveBytesPerRow > 0 && minTightSrcBytes > 0 && dataLen >= minTightSrcBytes;
 
         if (canStage) {
           const encoder =
@@ -4029,7 +4237,8 @@
               rawData,
               effectiveBytesPerRow,
               effectiveRowsPerImage,
-              effDepth
+              effDepth,
+              tightLastRowBytes
             );
             if (packed.repacked) {
               this.stats.rowPitchRepackCount += 1;
@@ -4059,6 +4268,7 @@
             packed.data = null;
             p.stagingPool.stageTextureUpload(encoder, texture, packedData, stageLayout);
             p._hasPendingUploadCommands = true;
+            this._pendingStagedTextures.add(texture);
             this.stats.reusedDescriptorCount += 1;
             this._recordUploadCount();
             this._recordUploadBytes(packedLen);
@@ -4138,11 +4348,13 @@
         !deviceSupportsBcSliced3d(p && p.device)
       ) {
         // W108 (#734): WebGPU rejects 3D BC-compressed textures without texture-compression-bc-sliced-3d.
+        // Preserve sRGB color transfer when falling back from 3D BC*-srgb formats.
         bc3dFallback = true;
+        const fallbackFormat = descriptor.format.endsWith('-srgb') ? 'rgba8unorm-srgb' : 'rgba8unorm';
         effectiveDescriptor = {
           ...descriptor,
           size: descriptor.size ? { ...descriptor.size } : descriptor.size,
-          format: 'rgba8unorm',
+          format: fallbackFormat,
         };
         if (Array.isArray(descriptor.viewFormats)) {
           const filteredViewFormats = descriptor.viewFormats.filter(
@@ -4201,6 +4413,35 @@
           effectiveDescriptor.sampleCount = 1;
         }
         promoted1DTo2D = true;
+      }
+
+      if (
+        effectiveDescriptor &&
+        typeof effectiveDescriptor.format === 'string' &&
+        typeof effectiveDescriptor.usage === 'number'
+      ) {
+        let sanitizedUsage = effectiveDescriptor.usage;
+        const fmt = effectiveDescriptor.format;
+        const dev = p && p.device ? p.device : null;
+        if (
+          (sanitizedUsage & GPU_TEXTURE_USAGE_STORAGE_BINDING) !== 0 &&
+          !formatSupportsStorageBinding(fmt, dev)
+        ) {
+          sanitizedUsage &= ~GPU_TEXTURE_USAGE_STORAGE_BINDING;
+        }
+        if (
+          (sanitizedUsage & GPU_TEXTURE_USAGE_RENDER_ATTACHMENT) !== 0 &&
+          !formatSupportsRenderAttachment(fmt, dev)
+        ) {
+          sanitizedUsage &= ~GPU_TEXTURE_USAGE_RENDER_ATTACHMENT;
+        }
+        if (sanitizedUsage !== effectiveDescriptor.usage) {
+          effectiveDescriptor = {
+            ...effectiveDescriptor,
+            size: effectiveDescriptor.size ? { ...effectiveDescriptor.size } : effectiveDescriptor.size,
+            usage: sanitizedUsage,
+          };
+        }
       }
 
       if (
