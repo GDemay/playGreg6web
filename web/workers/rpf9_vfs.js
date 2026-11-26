@@ -85,6 +85,8 @@ const DEFAULT_TOC_CACHE_CAPACITY = 64;
 
 const utf8Decoder = new TextDecoder('utf-8');
 const utf8Encoder = new TextEncoder();
+const ASCII_NORM_SCRATCH_CAPACITY = 1024;
+const ASCII_NORM_SCRATCH = new Uint16Array(ASCII_NORM_SCRATCH_CAPACITY);
 
 function normalizeCacheCapacity(value, defaultCapacity) {
   if (value === undefined || value === null) {
@@ -140,13 +142,96 @@ function joaatHash(input) {
 
 /**
  * Computes the normalized lowercase 32-bit JOAAT hash for a virtual RPF path.
+ * Uses a zero-allocation single-pass ASCII fast path that canonicalizes slashes,
+ * backslashes, uppercase ASCII, and `.` segments inline while rejecting `..` and NUL.
  *
  * @param {string} virtualPath
  * @returns {number} Unsigned 32-bit integer hash.
  */
 function hashVirtualPath(virtualPath) {
-  const norm = normalizeVirtualPath(virtualPath);
-  return joaatHash(norm.key);
+  if (virtualPath === undefined || virtualPath === null || virtualPath === '') {
+    return 0;
+  }
+  if (typeof virtualPath !== 'string') {
+    throw new RpfFormatError('INVALID_PATH', 'Virtual path must be a string');
+  }
+
+  const len = virtualPath.length;
+  let hash = 0;
+  let hasOutput = false;
+  let i = 0;
+
+  while (i < len) {
+    // Skip leading/duplicate slashes or backslashes.
+    while (i < len) {
+      const c = virtualPath.charCodeAt(i);
+      if (c === 0) {
+        throw new RpfFormatError('INVALID_PATH', `Virtual path contains NUL byte: ${virtualPath}`);
+      }
+      if (c !== 0x2f && c !== 0x5c) {
+        break;
+      }
+      i += 1;
+    }
+    if (i >= len) {
+      break;
+    }
+
+    const segStart = i;
+    let asciiOnly = true;
+    while (i < len) {
+      const c = virtualPath.charCodeAt(i);
+      if (c === 0) {
+        throw new RpfFormatError('INVALID_PATH', `Virtual path contains NUL byte: ${virtualPath}`);
+      }
+      if (c === 0x2f || c === 0x5c) {
+        break;
+      }
+      if (c >= 0x80) {
+        asciiOnly = false;
+        break;
+      }
+      i += 1;
+    }
+
+    if (!asciiOnly) {
+      const norm = normalizeVirtualPath(virtualPath);
+      return joaatHash(norm.key);
+    }
+
+    const segLen = i - segStart;
+    if (segLen === 1 && virtualPath.charCodeAt(segStart) === 0x2e) {
+      continue;
+    }
+    if (
+      segLen === 2 &&
+      virtualPath.charCodeAt(segStart) === 0x2e &&
+      virtualPath.charCodeAt(segStart + 1) === 0x2e
+    ) {
+      throw new RpfFormatError('INVALID_PATH', `Path traversal is not allowed: ${virtualPath}`);
+    }
+
+    if (hasOutput) {
+      hash = (hash + 0x2f) | 0;
+      hash = (hash + (hash << 10)) | 0;
+      hash ^= hash >>> 6;
+    }
+    for (let j = segStart; j < i; j += 1) {
+      let c = virtualPath.charCodeAt(j);
+      if (c >= 0x41 && c <= 0x5a) {
+        c += 0x20;
+      }
+      hash = (hash + c) | 0;
+      hash = (hash + (hash << 10)) | 0;
+      hash ^= hash >>> 6;
+    }
+    hasOutput = true;
+  }
+
+  hash = (hash + (hash << 3)) | 0;
+  hash ^= hash >>> 11;
+  hash = (hash + (hash << 15)) | 0;
+  return hash >>> 0;
 }
 
 function isAsciiWhitespace(c) {
@@ -821,6 +906,9 @@ function parseRpfHeader(bytes, totalSize = null) {
 }
 
 function readCString(namesBytes, nameOffset) {
+  if (!Number.isInteger(nameOffset) || nameOffset < 0) {
+    throw new RpfFormatError('INVALID_TOC', `Invalid TOC nameOffset: ${nameOffset}`);
+  }
   if (namesBytes.byteLength === 0) {
     if (nameOffset === 0) return '';
     throw new RpfFormatError(
@@ -838,12 +926,22 @@ function readCString(namesBytes, nameOffset) {
   while (end < namesBytes.byteLength && namesBytes[end] !== 0) {
     end += 1;
   }
+  if (end >= namesBytes.byteLength) {
+    throw new RpfFormatError(
+      'INVALID_TOC',
+      `Unterminated TOC name string at nameOffset ${nameOffset} (namesSize ${namesBytes.byteLength})`
+    );
+  }
   return utf8Decoder.decode(namesBytes.subarray(nameOffset, end));
 }
 
 function parseTocEntry(tocBytes, byteOffset, namesBytes, entryIndex = 0) {
   const u8 = toUint8Array(tocBytes, 'tocBytes');
-  if (byteOffset < 0 || byteOffset + RPF9_ENTRY_STRIDE > u8.byteLength) {
+  if (
+    !Number.isInteger(byteOffset) ||
+    byteOffset < 0 ||
+    byteOffset + RPF9_ENTRY_STRIDE > u8.byteLength
+  ) {
     throw new RpfFormatError(
       'INVALID_TOC',
       `TOC entry ${entryIndex} at byte offset ${byteOffset} exceeds TOC buffer length ${u8.byteLength}`
@@ -878,10 +976,30 @@ function parseTocEntry(tocBytes, byteOffset, namesBytes, entryIndex = 0) {
   const isEncrypted = (flags & RPF_ENTRY_FLAG_ENCRYPTED) !== 0;
   const isSectorOffset = (flags & RPF_ENTRY_FLAG_OFFSET_SHIFT9) !== 0;
 
-  const dataOffset = isSectorOffset ? w1 * RPF_SECTOR_SIZE : w1;
+  const dataOffsetBig = isSectorOffset ? BigInt(w1) * BigInt(RPF_SECTOR_SIZE) : BigInt(w1);
   const uncompressedSize = w2;
   const compressedSize = w3;
   const storedSize = isCompressed ? compressedSize : uncompressedSize;
+
+  if (isCompressed && compressedSize === 0 && uncompressedSize > 0) {
+    throw new RpfFormatError(
+      'INVALID_TOC',
+      `Compressed TOC entry ${entryIndex} has compressedSize=0 with uncompressedSize=${uncompressedSize}`
+    );
+  }
+
+  if (
+    dataOffsetBig > MAX_SAFE_BIGINT ||
+    dataOffsetBig + BigInt(storedSize) > MAX_SAFE_BIGINT ||
+    dataOffsetBig + BigInt(uncompressedSize) > MAX_SAFE_BIGINT
+  ) {
+    throw new RpfFormatError(
+      'SIZE_OVERFLOW',
+      `TOC entry ${entryIndex} byte range overflows safe integer bounds`
+    );
+  }
+
+  const dataOffset = Number(dataOffsetBig);
 
   return {
     kind: 'file',
@@ -896,6 +1014,7 @@ function parseTocEntry(tocBytes, byteOffset, namesBytes, entryIndex = 0) {
     isCompressed,
     isResource,
     isEncrypted,
+    isSectorOffset,
   };
 }
 
@@ -997,6 +1116,77 @@ function normalizePathKeyFast(virtualPath) {
   if (isCanonical) {
     return virtualPath;
   }
+
+  // Single-pass zero-intermediate-allocation ASCII canonicalization for non-canonical
+  // mixed-case, backslash, or redundant-slash paths within scratch capacity.
+  if (len <= ASCII_NORM_SCRATCH_CAPACITY) {
+    let outLen = 0;
+    let i = 0;
+    let asciiOnly = true;
+    while (i < len) {
+      while (i < len) {
+        const c = virtualPath.charCodeAt(i);
+        if (c === 0) {
+          throw new RpfFormatError('INVALID_PATH', `Virtual path contains NUL byte: ${virtualPath}`);
+        }
+        if (c !== 0x2f && c !== 0x5c) {
+          break;
+        }
+        i += 1;
+      }
+      if (i >= len) {
+        break;
+      }
+      const sStart = i;
+      while (i < len) {
+        const c = virtualPath.charCodeAt(i);
+        if (c === 0) {
+          throw new RpfFormatError('INVALID_PATH', `Virtual path contains NUL byte: ${virtualPath}`);
+        }
+        if (c === 0x2f || c === 0x5c) {
+          break;
+        }
+        if (c >= 0x80) {
+          asciiOnly = false;
+          break;
+        }
+        i += 1;
+      }
+      if (!asciiOnly) {
+        break;
+      }
+      const sLen = i - sStart;
+      if (sLen === 1 && virtualPath.charCodeAt(sStart) === 0x2e) {
+        continue;
+      }
+      if (
+        sLen === 2 &&
+        virtualPath.charCodeAt(sStart) === 0x2e &&
+        virtualPath.charCodeAt(sStart + 1) === 0x2e
+      ) {
+        throw new RpfFormatError('INVALID_PATH', `Path traversal is not allowed: ${virtualPath}`);
+      }
+      if (outLen > 0) {
+        ASCII_NORM_SCRATCH[outLen] = 0x2f;
+        outLen += 1;
+      }
+      for (let j = sStart; j < i; j += 1) {
+        let c = virtualPath.charCodeAt(j);
+        if (c >= 0x41 && c <= 0x5a) {
+          c += 0x20;
+        }
+        ASCII_NORM_SCRATCH[outLen] = c;
+        outLen += 1;
+      }
+    }
+    if (asciiOnly) {
+      if (outLen === 0) {
+        return '';
+      }
+      return String.fromCharCode.apply(null, ASCII_NORM_SCRATCH.subarray(0, outLen));
+    }
+  }
+
   return normalizeVirtualPath(virtualPath).key;
 }
 
@@ -1323,6 +1513,8 @@ class RpfArchiveVfs {
     visited[0] = 1;
 
     const stack = [rootNode];
+    const headerTocNamesEndBig = BigInt(this.header.namesOffset) + BigInt(this.header.namesSize);
+    const totalSizeBig = this.header.totalSize !== null ? BigInt(this.header.totalSize) : null;
     while (stack.length > 0) {
       const dirNode = stack.pop();
       const dirEntry = dirNode.entry;
@@ -1334,13 +1526,26 @@ class RpfArchiveVfs {
       }
 
       const start = dirEntry.firstChildIndex;
-      const end = start + dirEntry.childCount;
-      if (start < 0 || end > entries.length) {
+      const childCount = dirEntry.childCount;
+      if (
+        !Number.isInteger(start) ||
+        !Number.isInteger(childCount) ||
+        start < 0 ||
+        childCount < 0
+      ) {
         throw new RpfFormatError(
           'INVALID_TOC',
-          `Directory entry ${dirEntry.index} child range [${start}..${end}) exceeds entryCount ${entries.length}`
+          `Directory entry ${dirEntry.index} has invalid child bounds (${start}, ${childCount})`
         );
       }
+      const endBig = BigInt(start) + BigInt(childCount);
+      if (endBig > BigInt(entries.length)) {
+        throw new RpfFormatError(
+          'INVALID_TOC',
+          `Directory entry ${dirEntry.index} child range [${start}..${endBig}) exceeds entryCount ${entries.length}`
+        );
+      }
+      const end = Number(endBig);
 
       for (let idx = start; idx < end; idx += 1) {
         if (visited[idx]) {
@@ -1360,18 +1565,51 @@ class RpfArchiveVfs {
           );
         }
 
-        if (child.kind === 'file' && this.header.totalSize !== null) {
-          const endByte = child.dataOffset + child.storedSize;
-          if (endByte > this.header.totalSize) {
+        if (child.kind === 'file') {
+          if (
+            !Number.isSafeInteger(child.dataOffset) ||
+            child.dataOffset < 0 ||
+            !Number.isSafeInteger(child.storedSize) ||
+            child.storedSize < 0 ||
+            !Number.isSafeInteger(child.uncompressedSize) ||
+            child.uncompressedSize < 0
+          ) {
+            throw new RpfFormatError(
+              'SIZE_OVERFLOW',
+              `File entry "${cleanName}" has invalid offset or size`
+            );
+          }
+          const dataOffsetBig = BigInt(child.dataOffset);
+          const storedSizeBig = BigInt(child.storedSize);
+          const endByteBig = dataOffsetBig + storedSizeBig;
+          if (endByteBig > MAX_SAFE_BIGINT) {
+            throw new RpfFormatError(
+              'SIZE_OVERFLOW',
+              `File entry "${cleanName}" range overflows safe integer bounds`
+            );
+          }
+          if (child.storedSize > 0 && dataOffsetBig < headerTocNamesEndBig) {
+            throw new RpfFormatError(
+              'INVALID_TOC',
+              `File entry "${cleanName}" dataOffset ${child.dataOffset} overlaps archive header/TOC/names (${headerTocNamesEndBig})`
+            );
+          }
+          if (totalSizeBig !== null && endByteBig > totalSizeBig) {
             throw new RpfFormatError(
               'TRUNCATED_ARCHIVE',
-              `File entry "${cleanName}" range [${child.dataOffset}..${endByte}) exceeds archive size ${this.header.totalSize}`
+              `File entry "${cleanName}" range [${child.dataOffset}..${endByteBig}) exceeds archive size ${this.header.totalSize}`
             );
           }
         }
 
         const childPath = dirNode.path ? `${dirNode.path}/${cleanName}` : cleanName;
         const childKey = childPath.toLowerCase();
+        if (this._nodesByKey.has(childKey)) {
+          throw new RpfFormatError(
+            'INVALID_TOC',
+            `Duplicate entry path "${childKey}" detected at TOC entry ${idx}`
+          );
+        }
         const childHash = joaatHash(childKey);
         const childNode = {
           path: childPath,
@@ -1649,6 +1887,39 @@ class RpfArchiveVfs {
 
   resolveByHash(pathHash) {
     return this.lookupByHash(pathHash);
+  }
+
+  /**
+   * Zero-allocation O(1) hash lookup supporting uint32, BigInt u32, or hex string
+   * hashes and an optional pre-allocated `out` scratch result object (reusing
+  /**
+   * Zero-allocation O(1) path lookup supporting an optional pre-allocated `out`
+   * scratch object (reusing `out.stat` when present).
+   *
+   * @param {string} virtualPath
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  resolveByPathFast(virtualPath, out = undefined) {
+    const node = this._resolveNode(virtualPath);
+    if (!node) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    const statTarget =
+      target.stat !== undefined && target.stat !== null && typeof target.stat === 'object'
+        ? target.stat
+        : {};
+    writeNodeStat(node, statTarget);
+    target.path = node.path;
+    target.key = node.key;
+    target.name = node.name;
+    target.archivePath = node.path;
+    target.pathHash = node.pathHash;
+    target.stat = statTarget;
+    return target;
   }
 
   /**
@@ -1955,7 +2226,21 @@ class RpfArchiveVfs {
       throw new EncryptedArchiveError(this.header.encryptionTag, this.header.encryptionLabel);
     }
 
-    const archiveOffset = entry.dataOffset + offset;
+    const archiveOffsetBig = BigInt(entry.dataOffset) + BigInt(offset);
+    const archiveEndBig = archiveOffsetBig + BigInt(clampedLength);
+    if (archiveEndBig > MAX_SAFE_BIGINT) {
+      throw new RpfFormatError(
+        'SIZE_OVERFLOW',
+        `File range read [${archiveOffsetBig}..${archiveEndBig}) overflows safe integer bounds`
+      );
+    }
+    if (this.header.totalSize !== null && archiveEndBig > BigInt(this.header.totalSize)) {
+      throw new RpfFormatError(
+        'TRUNCATED_ARCHIVE',
+        `File range read [${archiveOffsetBig}..${archiveEndBig}) exceeds archive size ${this.header.totalSize}`
+      );
+    }
+    const archiveOffset = Number(archiveOffsetBig);
     let bytes = await this._readRange(archiveOffset, clampedLength);
     if (bytes.byteLength > clampedLength) {
       bytes = bytes.subarray(0, clampedLength);
@@ -2753,6 +3038,36 @@ class RpfVfsMountTable {
   }
 
   /**
+   * Zero-allocation O(1) path lookup across mounted archives supporting an optional
+   * pre-allocated `out` scratch result object (reusing `out.stat` when present).
+   *
+   * @param {string} virtualPath
+   * @param {object} [out]
+   * @returns {object|null}
+   */
+  resolveByPathFast(virtualPath, out = undefined) {
+    const resolved = this._resolveRaw(virtualPath);
+    if (!resolved || resolved.vfs === undefined) {
+      this._stats.lookupMisses += 1;
+      return null;
+    }
+    this._stats.lookupHits += 1;
+    const target = out !== undefined && out !== null && typeof out === 'object' ? out : {};
+    const statTarget =
+      target.stat !== undefined && target.stat !== null && typeof target.stat === 'object'
+        ? target.stat
+        : {};
+    this._writeMountedStat(resolved, statTarget);
+    target.mountId = resolved.mountId;
+    target.mountPrefix = resolved.mountPrefix;
+    target.vfs = resolved.vfs;
+    target.archivePath = resolved.archivePath;
+    target.pathHash = resolved.pathHash;
+    target.stat = statTarget;
+    return target;
+  }
+
+  /**
    * Zero-allocation O(1) hash lookup across mounted archives supporting uint32,
    * BigInt u32, or hex string hashes and an optional pre-allocated `out` scratch
    * result object (reusing `out.stat` when present). Preserves exact
@@ -3486,6 +3801,7 @@ const exportedApi = {
   parseRpfHeader,
   parseTocEntry,
   normalizeVirtualPath,
+  normalizePathKeyFast,
   joaatHash,
   hashVirtualPath,
   RpfTocCache,
