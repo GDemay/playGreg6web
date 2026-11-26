@@ -593,6 +593,7 @@ struct TrackedTexture {
     uint64_t view_size = 0;
     os::WriteCursor view_cursor{};
     bool view_checked = false;
+    uint32_t view_checked_cap = 0;  // texture budget cap in force when view_checked was set
 };
 // Block rows per dirty-tracked band of a 2D texture upload (TrackedTexture::subresource_bands).
 constexpr uint32_t kUploadBandRows = 64;

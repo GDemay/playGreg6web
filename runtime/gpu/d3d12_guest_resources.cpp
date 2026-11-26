@@ -876,8 +876,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     // Native shared page views (no translated window): the same skip, from the per-page write
-    // stamps of os::take_written_view_pages (non-destructive for other readers; false where the
-    // range is not wholly view-backed, which keeps the full read). A texture whose last full check
+    // stamps of os::take_written_pages (the OS write bits are fanned out to every cursor; false where the
+    // range cannot be tracked, which keeps the full read). A texture whose last full check
     // (zero scan / hash) is still current and whose pages were not written since is unchanged.
     bool view_tracked = false;
     if (!in_window && primary_size > 0) {
@@ -896,7 +896,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 }
             }
             std::vector<uint64_t> pages;
-            const bool tracked = os::take_written_view_pages(host, primary_size, &cursor, &pages);
+            cursor.peek_watch = true;  // uncollected OS write bits count as written; no reset per texture
+            const bool tracked = os::take_written_pages(host, primary_size, &cursor, &pages);
             bool skip = false;
             {
                 std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
@@ -905,7 +906,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                     return false;
                 }
                 TrackedTexture& cur = it->second;
-                skip = tracked && same_range && cur.view_checked && pages.empty();
+                // a changed texture-budget cap (#1596) is never skipped: dropped levels may be due
+                skip = tracked && same_range && cur.view_checked && pages.empty() &&
+                       cur.view_checked_cap == texture_budget().current_cap();
                 if (!skip) {
                     cur.view_checked = false;  // set again once a full check of this call completes
                 }
@@ -928,6 +931,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
         if (auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
             it->second.view_checked = true;
+            it->second.view_checked_cap = texture_budget().current_cap();
         }
     };
 
@@ -1193,6 +1197,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         if (cur.ever_uploaded && cur.last_upload_hash == hash && !cap_restore) {
             if (view_tracked) {
                 cur.view_checked = true;
+                cur.view_checked_cap = texture_budget().current_cap();
             }
             if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
                 cur.window_indexed_size == primary_size) {
@@ -1204,6 +1209,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         cur.ever_uploaded = true;
         if (view_tracked) {
             cur.view_checked = true;
+            cur.view_checked_cap = texture_budget().current_cap();
         }
         if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
             cur.window_indexed_size == primary_size) {
