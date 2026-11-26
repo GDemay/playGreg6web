@@ -4184,12 +4184,12 @@ extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
     if (!b.audio_probes.active()) {
         return;
     }
-    const uint64_t args[AudioProbes::kArgs] = {state->gpr[GuestReg::Rcx], state->gpr[GuestReg::Rdx],
-                                               state->gpr[GuestReg::R8], state->gpr[GuestReg::R9]};
+    const uint64_t args[AudioProbes::kArgs] = {state->gpr[playgta6::GuestReg::Rcx], state->gpr[playgta6::GuestReg::Rdx],
+                                               state->gpr[playgta6::GuestReg::R8], state->gpr[playgta6::GuestReg::R9]};
     bool first = false;
     const long idx = b.audio_probes.entry_hit(va, args, &first);
     if (first && idx >= 0 && b.log_progress) {
-        os::log(("[audio-probe] first entry of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
+        playgta6::os::log(("[audio-probe] first entry of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
     }
 }
 
