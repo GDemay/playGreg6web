@@ -6,6 +6,7 @@ use iced_x86::{Instruction, Mnemonic};
 
 use super::super::{FunctionLifter, R};
 use super::{Elem, Form, Intr, Ty, mask};
+use crate::lift::{BitIntrinsic, Support};
 
 /// AES state byte `4 * column + row` of an XMM register.
 fn byte(column: u32, row: u32) -> u32 {
@@ -80,16 +81,21 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(f.dst), &r, I64)?;
             }
             M::Phminposuw | M::Vphminposuw => {
+                // Vector butterfly reduction via `i16x8.min_u`, then `i16x8.eq` + `i16x8.bitmask`
+                // + `cttz` to recover the lowest lane index matching the minimum.
                 let v = self.v128(ins, 1, I16)?;
-                let mut min = self.extract(&v, I16, 0);
-                let mut index = "0".to_string();
-                for l in 1..8 {
-                    let x = self.extract(&v, I16, l);
-                    // Strictly smaller: the lowest index wins ties.
-                    let lt = self.val(&format!("icmp ult i16 {x}, {min}"));
-                    min = self.val(&format!("select i1 {lt}, i16 {x}, i16 {min}"));
-                    index = self.val(&format!("select i1 {lt}, i16 {l}, i16 {index}"));
-                }
+                let s1 = self.shuffle(&v, &v, I16, &[4, 5, 6, 7, 0, 1, 2, 3]);
+                let m1 = self.intr(Intr::UMin, Ty::v(I16), &[&v, &s1]);
+                let s2 = self.shuffle(&m1, &m1, I16, &[2, 3, 0, 1, 6, 7, 4, 5]);
+                let m2 = self.intr(Intr::UMin, Ty::v(I16), &[&m1, &s2]);
+                let s3 = self.shuffle(&m2, &m2, I16, &[1, 0, 3, 2, 5, 4, 7, 6]);
+                let m3 = self.intr(Intr::UMin, Ty::v(I16), &[&m2, &s3]);
+                let eq = self.val(&format!("icmp eq <8 x i16> {v}, {m3}"));
+                let bits = self.val(&format!("bitcast <8 x i1> {eq} to i8"));
+                let bits16 = self.val(&format!("zext i8 {bits} to i16"));
+                self.support.insert(Support::BitIntrinsic(BitIntrinsic::Cttz, 16));
+                let index = self.val(&format!("call i16 @llvm.cttz.i16(i16 {bits16}, i1 true)"));
+                let min = self.extract(&m3, I16, 0);
                 let r = self.insert("zeroinitializer", I16, &min, 0);
                 let r = self.insert(&r, I16, &index, 1);
                 self.xset(ins.op_register(0), &r, I16)?;

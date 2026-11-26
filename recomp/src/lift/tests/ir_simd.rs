@@ -265,3 +265,176 @@ fn random_sse_byte_sequences_never_panic() {
         "traps {traps}, xmm loads {lifted}"
     );
 }
+
+#[test]
+fn r59_simd_vector_lowering_avoids_scalar_loops() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "psadbw",
+            asm_function(0x1000, |a| {
+                a.psadbw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermd",
+            asm_function(0x1100, |a| {
+                a.vpermd(ymm0, ymm1, ymm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermilps_var",
+            asm_function(0x1200, |a| {
+                a.vpermilps(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermilpd_var",
+            asm_function(0x1300, |a| {
+                a.vpermilpd(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "ptest",
+            asm_function(0x1400, |a| {
+                a.ptest(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vptest256",
+            asm_function(0x1500, |a| {
+                a.vptest(ymm0, ymm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "phminposuw",
+            asm_function(0x1600, |a| {
+                a.phminposuw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "packsswb",
+            asm_function(0x1700, |a| {
+                a.packsswb(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmulhrsw",
+            asm_function(0x1800, |a| {
+                a.pmulhrsw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmulhw",
+            asm_function(0x1900, |a| {
+                a.pmulhw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmuldq",
+            asm_function(0x1A00, |a| {
+                a.pmuldq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtps2dq",
+            asm_function(0x1B00, |a| {
+                a.cvtps2dq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtpd2dq",
+            asm_function(0x1C00, |a| {
+                a.cvtpd2dq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtpd2ps",
+            asm_function(0x1D00, |a| {
+                a.cvtpd2ps(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for (name, f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{}: {:?}", name.0, f.unsupported);
+        let ir = &f.ir;
+        match name.0 {
+            "psadbw" => {
+                assert!(!ir.contains("extractelement"), "psadbw scalarized:\n{ir}");
+                assert!(ir.contains("@llvm.umax.v16i8"), "{ir}");
+                assert!(ir.contains("@llvm.umin.v16i8"), "{ir}");
+            }
+            "vpermd" | "vpermilps_var" => {
+                assert!(!ir.contains("extractelement"), "{} scalarized:\n{ir}", name.0);
+                assert!(ir.contains("@llvm.wasm.swizzle("), "{ir}");
+            }
+            "vpermilpd_var" => {
+                assert!(!ir.contains("extractelement"), "vpermilpd scalarized:\n{ir}");
+                assert!(ir.contains("select <2 x i1>"), "{ir}");
+            }
+            "ptest" | "vptest256" => {
+                assert!(!ir.contains("extractelement"), "{} scalarized:\n{ir}", name.0);
+                assert!(ir.contains("bitcast <2 x i1>"), "{ir}");
+            }
+            "phminposuw" => {
+                assert!(ir.contains("@llvm.umin.v8i16"), "{ir}");
+                assert!(ir.contains("@llvm.cttz.i16"), "{ir}");
+            }
+            "packsswb" => {
+                assert!(ir.contains("@llvm.smax.v8i16"), "{ir}");
+                assert!(ir.contains("@llvm.smin.v8i16"), "{ir}");
+            }
+            "pmulhrsw" => {
+                assert!(ir.contains("16384"), "{ir}");
+                assert!(ir.contains("lshr <4 x i32>"), "{ir}");
+            }
+            "pmulhw" => {
+                assert!(!ir.contains("lshr"), "pmulhw should shuffle odd lanes directly:\n{ir}");
+            }
+            "pmuldq" => {
+                assert!(ir.contains("sext <2 x i32>"), "{ir}");
+            }
+            "cvtps2dq" => {
+                assert!(ir.contains("@llvm.fptosi.sat.v4i32.v4f32"), "{ir}");
+            }
+            "cvtpd2dq" => {
+                assert!(ir.contains("@llvm.fptosi.sat.v2i32.v2f64"), "{ir}");
+                assert!(
+                    ir.contains("<4 x i32> <i32 0, i32 1, i32 2, i32 3>"),
+                    "{ir}"
+                );
+            }
+            "cvtpd2ps" => {
+                assert!(
+                    ir.contains("<4 x i32> <i32 0, i32 1, i32 2, i32 3>"),
+                    "{ir}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Native retargeting must remain free of wasm-only intrinsics.
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR"
+    );
+}
