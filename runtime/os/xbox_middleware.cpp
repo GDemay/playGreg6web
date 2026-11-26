@@ -1843,8 +1843,7 @@ Pg6HResult pg6_mw_xapu_connect(const void* params, Pg6XApuHandle* handle) {
             hex += tmp;
             if ((i & 3) == 3) hex += ' ';
         }
-        std::fprintf(stderr, "xapu: XApuConnect params %p raw[64]: %s
-", params, hex.c_str());
+        std::fprintf(stderr, "xapu: XApuConnect params %p raw[64]: %s\n", params, hex.c_str());
     }
     auto& g = mw::xapu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
