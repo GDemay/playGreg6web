@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import vm from 'node:vm';
 
 const require = createRequire(import.meta.url);
 const mod = require('../web/workers/indirect_draw.js');
@@ -8,8 +10,13 @@ const mod = require('../web/workers/indirect_draw.js');
 const {
   U32_MAX,
   DEFAULT_MAX_INDIRECT_BATCH_COUNT,
+  DEFAULT_CLAMP_WORKGROUP_SIZE,
+  CLAMP_PARAMS_UNIFORM_BYTES,
+  CLAMP_PARAMS_SLOT_STRIDE,
+  DISPATCH_MESH_CLAMP_OUTPUT_BYTES,
   BUFFER_USAGE,
   INDIRECT_KIND,
+  INDIRECT_CLAMP_KIND,
   DRAW_INDIRECT_LAYOUT,
   DRAW_INDEXED_INDIRECT_LAYOUT,
   DISPATCH_INDIRECT_LAYOUT,
@@ -17,6 +24,14 @@ const {
   recordByteSize,
   wgslStructSource,
   wgslArrayStride,
+  deviceSupportsIndirectFirstInstance,
+  resolveMaxComputeWorkgroups,
+  generateIndirectClampWgsl,
+  getOrCreateIndirectClampPipeline,
+  encodeClampedIndirectPass,
+  encodeMeshComputeThenDraw,
+  GpuIndirectClampPass,
+  IndirectClampExecutor,
   encodeDrawIndirect,
   encodeDrawIndexedIndirect,
   encodeDispatchIndirect,
@@ -874,6 +889,15 @@ test('telemetry tracks drawIndirect, drawIndexedIndirect, dispatchWorkgroupsIndi
     commandsValidated: 0,
     zeroCountElided: 0,
     outOfBoundsElided: 0,
+    gpuClampPassesEncoded: 0,
+    gpuClampCommandsClamped: 0,
+    gpuClampPipelinesCreated: 0,
+    gpuClampPipelineCacheHits: 0,
+    gpuClampFirstInstanceZeroed: 0,
+    gpuClampCountBuffersBound: 0,
+    meshOrchestrationsEncoded: 0,
+    meshIndirectDispatches: 0,
+    meshZeroCountElided: 0,
   });
 
   // IndirectArgsBuffer instance telemetry + maxIndirectBatchCount + resetStats
@@ -1987,4 +2011,565 @@ test('W306: dispatchIndirectBatch validates consecutive structs in a single pass
   assert.equal(clearedBuf.zeroCountElided, 0);
   assert.equal(clearedBuf.outOfBoundsElided, 0);
   assert.equal(clearedBuf.liveSlots, 2);
+});
+
+// ---------------------------------------------------------------------------
+// W378: GPU-Clamped ExecuteIndirect & Mesh Compute-Then-Draw Orchestration
+// ---------------------------------------------------------------------------
+
+function createMockClampDevice(options = {}) {
+  let nextId = 1;
+  const buffers = [];
+  const shaderModules = [];
+  const computePipelines = [];
+  const bindGroupLayouts = [];
+  const pipelineLayouts = [];
+  const bindGroups = [];
+  const writes = [];
+  const passes = [];
+
+  const features = new Set(options.features || []);
+  const limits = {
+    maxComputeWorkgroupsPerDimension:
+      options.maxComputeWorkgroupsPerDimension !== undefined
+        ? options.maxComputeWorkgroupsPerDimension
+        : 65535,
+  };
+
+  const device = {
+    features,
+    limits,
+    queue: {
+      writeBuffer(buffer, offset, data) {
+        const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength).slice();
+        buffer._data.set(bytes, offset);
+        writes.push({ buffer, offset, bytes, u32: new Uint32Array(bytes.buffer) });
+      },
+    },
+    createBuffer(desc) {
+      const buf = {
+        id: nextId++,
+        ...desc,
+        _data: new Uint8Array(desc.size),
+        destroyed: false,
+        destroy() {
+          this.destroyed = true;
+        },
+      };
+      buffers.push(buf);
+      return buf;
+    },
+    createShaderModule(desc) {
+      const m = { id: nextId++, ...desc };
+      shaderModules.push(m);
+      return m;
+    },
+    createComputePipeline(desc) {
+      const p = {
+        id: nextId++,
+        ...desc,
+        destroyed: false,
+        getBindGroupLayout(index) {
+          return { id: nextId++, pipelineId: p.id, index };
+        },
+      };
+      computePipelines.push(p);
+      return p;
+    },
+    createBindGroup(desc) {
+      const bg = {
+        id: nextId++,
+        label: desc.label,
+        layout: desc.layout,
+        entries: desc.entries.map((e) => ({
+          binding: e.binding,
+          resource: e.resource && e.resource.buffer ? { ...e.resource } : e.resource,
+        })),
+        destroyed: false,
+      };
+      bindGroups.push(bg);
+      return bg;
+    },
+    createCommandEncoder() {
+      const encoderOps = [];
+      return {
+        ops: encoderOps,
+        beginComputePass(desc) {
+          const ops = [];
+          const pass = {
+            kind: 'compute',
+            desc,
+            ops,
+            ended: false,
+            setPipeline(pipeline) {
+              ops.push(['setPipeline', pipeline]);
+            },
+            setBindGroup(index, bg, dynOffsets) {
+              ops.push(['setBindGroup', index, bg, dynOffsets ? Array.from(dynOffsets) : null]);
+            },
+            dispatchWorkgroups(x, y, z) {
+              ops.push(['dispatchWorkgroups', x, y, z]);
+            },
+            dispatchWorkgroupsIndirect(buf, off) {
+              ops.push(['dispatchWorkgroupsIndirect', buf, off]);
+            },
+            end() {
+              this.ended = true;
+              ops.push(['end']);
+            },
+          };
+          passes.push(pass);
+          encoderOps.push(pass);
+          return pass;
+        },
+        beginRenderPass(desc) {
+          const ops = [];
+          const pass = {
+            kind: 'render',
+            desc,
+            ops,
+            ended: false,
+            setPipeline(pipeline) {
+              ops.push(['setPipeline', pipeline]);
+            },
+            setBindGroup(index, bg, dynOffsets) {
+              ops.push(['setBindGroup', index, bg, dynOffsets ? Array.from(dynOffsets) : null]);
+            },
+            setVertexBuffer(slot, buf, off, size) {
+              ops.push(['setVertexBuffer', slot, buf, off, size]);
+            },
+            setIndexBuffer(buf, fmt, off, size) {
+              ops.push(['setIndexBuffer', buf, fmt, off, size]);
+            },
+            drawIndirect(buf, off) {
+              ops.push(['drawIndirect', buf, off]);
+            },
+            drawIndexedIndirect(buf, off) {
+              ops.push(['drawIndexedIndirect', buf, off]);
+            },
+            multiDrawIndirect(buf, off, count) {
+              ops.push(['multiDrawIndirect', buf, off, count]);
+            },
+            multiDrawIndexedIndirect(buf, off, count) {
+              ops.push(['multiDrawIndexedIndirect', buf, off, count]);
+            },
+            end() {
+              this.ended = true;
+              ops.push(['end']);
+            },
+          };
+          passes.push(pass);
+          encoderOps.push(pass);
+          return pass;
+        },
+      };
+    },
+  };
+
+  if (options.withExplicitLayouts !== false) {
+    device.createBindGroupLayout = (desc) => {
+      const bgl = { id: nextId++, ...desc };
+      bindGroupLayouts.push(bgl);
+      return bgl;
+    };
+    device.createPipelineLayout = (desc) => {
+      const pl = { id: nextId++, ...desc };
+      pipelineLayouts.push(pl);
+      return pl;
+    };
+  }
+
+  return {
+    device,
+    buffers,
+    shaderModules,
+    computePipelines,
+    bindGroupLayouts,
+    pipelineLayouts,
+    bindGroups,
+    writes,
+    passes,
+  };
+}
+
+test('W378: generateIndirectClampWgsl emits valid WGSL compute clamp shaders for draw, drawIndexed, dispatch, and dispatchMesh', () => {
+  assert.equal(DEFAULT_CLAMP_WORKGROUP_SIZE, 64);
+  assert.equal(CLAMP_PARAMS_UNIFORM_BYTES, 48);
+  assert.equal(CLAMP_PARAMS_SLOT_STRIDE, 256);
+  assert.equal(DISPATCH_MESH_CLAMP_OUTPUT_BYTES, 28);
+  assert.equal(GpuIndirectClampPass, IndirectClampExecutor);
+
+  const drawWgsl = generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DRAW);
+  assert.match(drawWgsl, /struct ClampParams/);
+  assert.match(drawWgsl, /@compute @workgroup_size\(64\)/);
+  assert.match(drawWgsl, /let in_words = 4u;/);
+  assert.match(drawWgsl, /let out_words = 4u;/);
+  assert.match(drawWgsl, /params\.has_count_buffer != 0u/);
+  assert.match(drawWgsl, /first_vertex < params\.max_element_count/);
+  assert.match(drawWgsl, /\(params\.flags & 1u\) != 0u/);
+  assert.match(drawWgsl, /first_instance = 0u;/);
+
+  const indexedWgsl = generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DRAW_INDEXED, {
+    workgroupSize: 32,
+  });
+  assert.match(indexedWgsl, /@compute @workgroup_size\(32\)/);
+  assert.match(indexedWgsl, /let in_words = 5u;/);
+  assert.match(indexedWgsl, /let out_words = 5u;/);
+  assert.match(indexedWgsl, /first_index < params\.max_element_count/);
+  assert.match(indexedWgsl, /base_vertex_bits = src_args\[src_base \+ 3u\]/);
+  assert.match(indexedWgsl, /dst_args\[out_base \+ 3u\] = base_vertex_bits;/);
+
+  const dispatchWgsl = generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DISPATCH);
+  assert.match(dispatchWgsl, /let in_words = 3u;/);
+  assert.match(dispatchWgsl, /let out_words = 3u;/);
+  assert.match(dispatchWgsl, /min\(src_args\[src_base \+ 0u\], params\.max_group_x\)/);
+  assert.match(dispatchWgsl, /min\(src_args\[src_base \+ 1u\], params\.max_group_y\)/);
+  assert.match(dispatchWgsl, /min\(src_args\[src_base \+ 2u\], params\.max_group_z\)/);
+
+  const meshWgsl = generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DISPATCH_MESH);
+  assert.match(meshWgsl, /let in_words = 3u;/);
+  assert.match(meshWgsl, /let out_words = 7u;/);
+  assert.match(meshWgsl, /total_groups \* params\.max_element_count/);
+
+  assert.throws(() => generateIndirectClampWgsl('bogus'), TypeError);
+  assert.throws(() => generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DRAW, { workgroupSize: 0 }), RangeError);
+  assert.throws(() => generateIndirectClampWgsl(INDIRECT_CLAMP_KIND.DRAW, { workgroupSize: 512 }), RangeError);
+});
+
+test('W378: getOrCreateIndirectClampPipeline caches per (device, kind, workgroupSize) in WeakMap and supports auto layout fallback', () => {
+  resetStats();
+  const env1 = createMockClampDevice();
+  const env2 = createMockClampDevice({ withExplicitLayouts: false });
+
+  const p1a = getOrCreateIndirectClampPipeline(env1.device, INDIRECT_CLAMP_KIND.DRAW);
+  const p1b = getOrCreateIndirectClampPipeline(env1.device, INDIRECT_CLAMP_KIND.DRAW);
+  const p1idx = getOrCreateIndirectClampPipeline(env1.device, INDIRECT_CLAMP_KIND.DRAW_INDEXED);
+  const p1disp = getOrCreateIndirectClampPipeline(env1.device, INDIRECT_CLAMP_KIND.DISPATCH);
+  const p2auto = getOrCreateIndirectClampPipeline(env2.device, INDIRECT_CLAMP_KIND.DRAW);
+
+  assert.equal(p1a.cacheHit, false);
+  assert.equal(p1b.cacheHit, true);
+  assert.equal(p1a.pipeline, p1b.pipeline);
+  assert.equal(p1a.hasDynamicParamsOffset, true);
+  assert.notEqual(p1idx.pipeline, p1a.pipeline);
+  assert.notEqual(p1disp.pipeline, p1a.pipeline);
+  assert.equal(env1.computePipelines.length, 3);
+  assert.equal(env1.shaderModules.length, 3);
+
+  assert.equal(p2auto.hasDynamicParamsOffset, false);
+  assert.equal(p2auto.pipeline.layout, 'auto');
+  assert.equal(env2.computePipelines.length, 1);
+
+  const stats = getStats();
+  assert.equal(stats.gpuClampPipelinesCreated, 4);
+  assert.equal(stats.gpuClampPipelineCacheHits, 1);
+});
+
+test('W378: GpuIndirectClampPass encodes draw/drawIndexed/dispatch clamps, count buffers, firstInstance gating, and zero-alloc scratch reuse', () => {
+  resetStats();
+  const envNoFeat = createMockClampDevice({ maxComputeWorkgroupsPerDimension: 32768 });
+  const envWithFeat = createMockClampDevice({
+    features: ['indirect-first-instance'],
+    maxComputeWorkgroupsPerDimension: 65535,
+  });
+
+  assert.equal(deviceSupportsIndirectFirstInstance(envNoFeat.device), false);
+  assert.equal(deviceSupportsIndirectFirstInstance(envWithFeat.device), true);
+  assert.equal(resolveMaxComputeWorkgroups(envNoFeat.device), 32768);
+  assert.equal(resolveMaxComputeWorkgroups(envWithFeat.device), 65535);
+
+  const clampExec = new GpuIndirectClampPass({ device: envNoFeat.device });
+  const srcBuf = envNoFeat.device.createBuffer({
+    size: 512,
+    usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.INDIRECT,
+  });
+  const countBuf = envNoFeat.device.createBuffer({
+    size: 64,
+    usage: BUFFER_USAGE.STORAGE,
+  });
+  const dstBuf = envNoFeat.device.createBuffer({
+    size: 512,
+    usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.INDIRECT,
+  });
+
+  const encoder = envNoFeat.device.createCommandEncoder();
+  const scratch = {};
+
+  // 1. drawIndirect clamp (16B) with countBuffer + vertex/instance caps; firstInstance zeroed because device lacks feature!
+  const rDraw = clampExec.clampDrawIndirect(
+    encoder,
+    {
+      srcBuffer: srcBuf,
+      srcOffset: 16,
+      dstBuffer: dstBuf,
+      dstOffset: 0,
+      countBuffer: countBuf,
+      countOffset: 8,
+      commandCount: 4,
+      stride: 32,
+      maxVertexCount: 10000,
+      maxInstanceCount: 64,
+    },
+    scratch
+  );
+  assert.equal(rDraw, scratch, 'reuses caller scratch object');
+  assert.equal(rDraw.ok, true);
+  assert.equal(rDraw.encoded, true);
+  assert.equal(rDraw.kind, INDIRECT_CLAMP_KIND.DRAW);
+  assert.equal(rDraw.commandCount, 4);
+  assert.equal(rDraw.workgroupsX, 1);
+  assert.equal(rDraw.dstBuffer, dstBuf);
+  assert.equal(rDraw.dstOffset, 0);
+  assert.equal(rDraw.dstByteLength, 64);
+  assert.equal(rDraw.recordBytes, 16);
+  assert.equal(rDraw.zeroedFirstInstance, true);
+  assert.equal(rDraw.hasCountBuffer, true);
+
+  // Verify exact 48B ClampParams written at slot 0 (offset 0)
+  assert.equal(envNoFeat.writes.length, 1);
+  assert.equal(envNoFeat.writes[0].offset, 0);
+  assert.deepEqual(Array.from(envNoFeat.writes[0].u32), [
+    4, // src_word (16/4)
+    8, // stride_words (32/4)
+    0, // dst_word (0/4)
+    4, // command_count
+    2, // count_word (8/4)
+    1, // has_count_buffer
+    10000, // max_element_count (maxVertexCount)
+    64, // max_instance_count
+    32768, // max_group_x
+    32768, // max_group_y
+    32768, // max_group_z
+    1, // flags bit 0: zero_first_instance
+  ]);
+
+  // 2. Second clamp on the SAME encoder writes params at slot 1 (offset 256) and uses managed output ring!
+  const rIdx = clampExec.clampDrawIndexedIndirect(
+    encoder,
+    {
+      srcBuffer: srcBuf,
+      srcOffset: 0,
+      commandCount: 70,
+      maxIndexCount: 50000,
+      maxInstanceCount: 16,
+    },
+    scratch
+  );
+  assert.equal(rIdx, scratch);
+  assert.equal(rIdx.ok, true);
+  assert.equal(rIdx.encoded, true);
+  assert.equal(rIdx.workgroupsX, 2, '70 commands / 64 workgroupSize = 2 workgroups');
+  assert.equal(rIdx.recordBytes, 20);
+  assert.equal(rIdx.dstByteLength, 70 * 20);
+  assert.equal(rIdx.dstOffset, 0);
+  assert.notEqual(rIdx.dstBuffer, dstBuf, 'allocates from managed output ring');
+  assert.equal(envNoFeat.writes[1].offset, 256, 'slot 1 params at 256B offset');
+  assert.equal(envNoFeat.writes[1].u32[5], 0, 'no count buffer');
+  assert.equal(envNoFeat.writes[1].u32[6], 50000);
+  assert.equal(envNoFeat.writes[1].u32[11], 1);
+
+  // 3. Batching two dispatch clamps directly onto an already-open GPUComputePassEncoder!
+  const openPass = encoder.beginComputePass({ label: 'batched-clamps' });
+  const rDisp1 = clampExec.clampDispatchIndirect(
+    openPass,
+    {
+      srcBuffer: srcBuf,
+      srcOffset: 0,
+      dstBuffer: dstBuf,
+      dstOffset: 128,
+      commandCount: 2,
+      maxWorkgroupsX: 1024,
+      maxWorkgroupsY: 256,
+      maxWorkgroupsZ: 8,
+    },
+    scratch
+  );
+  const rDisp2 = clampExec.clampDispatchIndirect(
+    openPass,
+    {
+      srcBuffer: srcBuf,
+      srcOffset: 24,
+      dstBuffer: dstBuf,
+      dstOffset: 152,
+      commandCount: 1,
+    },
+    scratch
+  );
+  assert.equal(openPass.ended, false, 'must NOT end caller-owned compute pass');
+  openPass.end();
+  assert.equal(rDisp1.zeroedFirstInstance, false);
+  assert.equal(rDisp2.cacheHit, true, 'second dispatch clamp hits pipeline cache');
+  assert.equal(envNoFeat.writes[2].offset, 512);
+  assert.equal(envNoFeat.writes[2].u32[8], 1024);
+  assert.equal(envNoFeat.writes[2].u32[9], 256);
+  assert.equal(envNoFeat.writes[2].u32[10], 8);
+  assert.equal(envNoFeat.writes[3].offset, 768);
+  assert.equal(envNoFeat.writes[3].u32[8], 32768);
+
+  // Bind group was reused on rDisp2 (same pipeline, paramsBuffer, srcBuffer, dstBuffer)!
+  const clampStats = clampExec.getStats();
+  assert.equal(clampStats.gpuClampPassesEncoded, 4);
+  assert.equal(clampStats.gpuClampCommandsClamped, 4 + 70 + 2 + 1);
+  assert.equal(clampStats.gpuClampCountBuffersBound, 1);
+  assert.equal(clampStats.gpuClampFirstInstanceZeroed, 74);
+  assert.equal(clampStats.bindGroupCacheHits, 1);
+
+  // 4. Device WITH indirect-first-instance leaves flags bit 0 clear (zeroedFirstInstance === false).
+  const encFeat = envWithFeat.device.createCommandEncoder();
+  const srcFeat = envWithFeat.device.createBuffer({ size: 128, usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.INDIRECT });
+  const rFeat = encodeClampedIndirectPass(
+    encFeat,
+    INDIRECT_CLAMP_KIND.DRAW_INDEXED,
+    {
+      device: envWithFeat.device,
+      srcBuffer: srcFeat,
+      commandCount: 2,
+      maxIndexCount: 999,
+    },
+    scratch
+  );
+  assert.equal(rFeat.ok, true);
+  assert.equal(rFeat.zeroedFirstInstance, false);
+  assert.equal(envWithFeat.writes[0].u32[11], 0);
+
+  // 5. Zero-count elision, misaligned offset, destroyed buffer, and resetFrame / destroy guards.
+  const rZero = clampExec.clampDrawIndirect(encoder, { srcBuffer: srcBuf, commandCount: 0 }, scratch);
+  assert.equal(rZero.ok, true);
+  assert.equal(rZero.encoded, false);
+  assert.equal(rZero.reason, 'ZERO_COUNT');
+
+  const rMisaligned = clampExec.clampDrawIndirect(encoder, { srcBuffer: srcBuf, srcOffset: 2 }, scratch);
+  assert.equal(rMisaligned.ok, false);
+  assert.equal(rMisaligned.reason, 'MISALIGNED_OFFSET');
+
+  clampExec.resetFrame();
+  clampExec.destroy();
+  const rAfterDestroy = clampExec.clampDrawIndirect(encoder, { srcBuffer: srcBuf }, scratch);
+  assert.equal(rAfterDestroy.ok, false);
+  assert.equal(rAfterDestroy.reason, 'DESTROYED');
+});
+
+test('W378: encodeMeshComputeThenDraw orchestrates direct & indirect mesh compute -> clamped drawIndirect and elides zero-count', () => {
+  resetStats();
+  const env = createMockClampDevice();
+  const encoder = env.device.createCommandEncoder();
+  const meshPipe = { id: 901, label: 'mesh-compute' };
+  const renderPipe = { id: 902, label: 'mesh-render' };
+  const meshBg = { id: 903 };
+  const renderBg = { id: 904 };
+  const meshVb = env.device.createBuffer({ size: 4096, usage: BUFFER_USAGE.STORAGE });
+  const meshIb = env.device.createBuffer({ size: 1024, usage: BUFFER_USAGE.STORAGE });
+  const dispatchBuf = env.device.createBuffer({
+    size: 64,
+    usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.INDIRECT,
+  });
+  const drawIndBuf = env.device.createBuffer({
+    size: 128,
+    usage: BUFFER_USAGE.STORAGE | BUFFER_USAGE.INDIRECT,
+  });
+  const scratch = {};
+
+  // 1. Direct mesh compute dispatch -> GPU-clamped drawIndirect render pass.
+  const r1 = encodeMeshComputeThenDraw(
+    encoder,
+    {
+      device: env.device,
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      meshBindGroups: [meshBg],
+      renderBindGroups: [renderBg],
+      vertexBuffers: [{ slot: 0, buffer: meshVb, offset: 0 }],
+      workgroupCountX: 12,
+      workgroupCountY: 1,
+      workgroupCountZ: 1,
+      drawIndirectBuffer: drawIndBuf,
+      maxVertexCount: 4096,
+      maxInstanceCount: 1,
+    },
+    scratch
+  );
+  assert.equal(r1, scratch);
+  assert.equal(r1.ok, true);
+  assert.equal(r1.executed, true);
+  assert.equal(r1.indirectDispatch, false);
+  assert.equal(r1.dispatchClamped, false);
+  assert.equal(r1.drawClamped, true);
+  assert.equal(r1.drawsIssued, 1);
+  // Exact pass order on encoder: [mesh compute pass, draw clamp compute pass, render pass]
+  assert.deepEqual(
+    encoder.ops.map((p) => p.kind),
+    ['compute', 'compute', 'render']
+  );
+  assert.deepEqual(encoder.ops[0].ops[2], ['dispatchWorkgroups', 12, 1, 1]);
+  assert.equal(encoder.ops[2].ops[3][0], 'drawIndirect');
+  assert.equal(encoder.ops[2].ops[3][1], r1.drawIndirectBuffer);
+
+  // 2. Indirect mesh compute dispatch (GPU-clamped) -> GPU-clamped drawIndexedIndirect (3 draws).
+  const enc2 = env.device.createCommandEncoder();
+  const r2 = encodeMeshComputeThenDraw(
+    enc2,
+    {
+      device: env.device,
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      indirectDispatch: true,
+      dispatchIndirectBuffer: dispatchBuf,
+      indexed: true,
+      indexBuffer: { buffer: meshIb, format: 'uint32', offset: 0 },
+      drawIndirectBuffer: drawIndBuf,
+      drawCount: 3,
+      maxIndexCount: 256,
+    },
+    scratch
+  );
+  assert.equal(r2.ok, true);
+  assert.equal(r2.indirectDispatch, true);
+  assert.equal(r2.dispatchClamped, true);
+  assert.equal(r2.drawClamped, true);
+  assert.equal(r2.indexed, true);
+  assert.equal(r2.drawsIssued, 3);
+  // Exact pass order: [dispatch clamp compute, mesh compute, draw clamp compute, render pass]
+  assert.deepEqual(
+    enc2.ops.map((p) => p.kind),
+    ['compute', 'compute', 'compute', 'render']
+  );
+  assert.equal(enc2.ops[1].ops[1][0], 'dispatchWorkgroupsIndirect');
+  assert.equal(
+    enc2.ops[3].ops.filter((op) => op[0] === 'drawIndexedIndirect').length,
+    3
+  );
+
+  // 3. Zero-count elision skips all GPU passes cleanly.
+  const enc3 = env.device.createCommandEncoder();
+  const rZeroWg = encodeMeshComputeThenDraw(
+    enc3,
+    {
+      device: env.device,
+      meshPipeline: meshPipe,
+      renderPipeline: renderPipe,
+      workgroupCountX: 0,
+      drawIndirectBuffer: drawIndBuf,
+    },
+    scratch
+  );
+  assert.equal(rZeroWg.ok, true);
+  assert.equal(rZeroWg.elided, true);
+  assert.equal(rZeroWg.reason, 'ZERO_COUNT');
+  assert.equal(enc3.ops.length, 0);
+
+  const stats = getStats();
+  assert.equal(stats.meshOrchestrationsEncoded, 2);
+  assert.equal(stats.meshIndirectDispatches, 1);
+  assert.equal(stats.meshZeroCountElided, 1);
+
+  // 4. Classic Worker importScripts IIFE isolation check (zero ES module syntax / global leaks).
+  const source = readFileSync(new URL('../web/workers/indirect_draw.js', import.meta.url), 'utf8');
+  const ctx = vm.createContext({ console });
+  ctx.self = ctx;
+  vm.runInContext(source, ctx, { filename: 'indirect_draw.js' });
+  vm.runInContext('const generateIndirectClampWgsl = null; const GpuIndirectClampPass = null;', ctx);
+  assert.equal(typeof ctx.PlayGta6IndirectDraw.generateIndirectClampWgsl, 'function');
+  assert.equal(typeof ctx.PlayGta6IndirectDraw.GpuIndirectClampPass, 'function');
+  assert.equal(typeof ctx.PlayGta6IndirectDraw.encodeClampedIndirectPass, 'function');
+  assert.equal(typeof ctx.PlayGta6IndirectDraw.encodeMeshComputeThenDraw, 'function');
 });

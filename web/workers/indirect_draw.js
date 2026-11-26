@@ -16,6 +16,12 @@
   const INDIRECT_OFFSET_ALIGNMENT = 4;
   const DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION = 65535;
   const DEFAULT_MAX_INDIRECT_BATCH_COUNT = 4096;
+  const DEFAULT_CLAMP_WORKGROUP_SIZE = 64;
+  const CLAMP_PARAMS_UNIFORM_BYTES = 48; // 12 x u32
+  const CLAMP_PARAMS_SLOT_STRIDE = 256; // WebGPU minUniformBufferOffsetAlignment
+  const DISPATCH_MESH_CLAMP_OUTPUT_BYTES = 28; // 12B dispatch + 16B drawIndirect pair (G66 #1537)
+  const DEFAULT_CLAMP_PARAMS_SLOTS = 64;
+  const DEFAULT_CLAMP_OUTPUT_BYTES = 65536; // 64 KiB managed clamped indirect ring
 
   function createEmptyStats() {
     return {
@@ -39,6 +45,15 @@
       commandsValidated: 0,
       zeroCountElided: 0,
       outOfBoundsElided: 0,
+      gpuClampPassesEncoded: 0,
+      gpuClampCommandsClamped: 0,
+      gpuClampPipelinesCreated: 0,
+      gpuClampPipelineCacheHits: 0,
+      gpuClampFirstInstanceZeroed: 0,
+      gpuClampCountBuffersBound: 0,
+      meshOrchestrationsEncoded: 0,
+      meshIndirectDispatches: 0,
+      meshZeroCountElided: 0,
     };
   }
 
@@ -194,6 +209,15 @@
       commandsValidated: moduleStats.commandsValidated,
       zeroCountElided: moduleStats.zeroCountElided,
       outOfBoundsElided: moduleStats.outOfBoundsElided,
+      gpuClampPassesEncoded: moduleStats.gpuClampPassesEncoded,
+      gpuClampCommandsClamped: moduleStats.gpuClampCommandsClamped,
+      gpuClampPipelinesCreated: moduleStats.gpuClampPipelinesCreated,
+      gpuClampPipelineCacheHits: moduleStats.gpuClampPipelineCacheHits,
+      gpuClampFirstInstanceZeroed: moduleStats.gpuClampFirstInstanceZeroed,
+      gpuClampCountBuffersBound: moduleStats.gpuClampCountBuffersBound,
+      meshOrchestrationsEncoded: moduleStats.meshOrchestrationsEncoded,
+      meshIndirectDispatches: moduleStats.meshIndirectDispatches,
+      meshZeroCountElided: moduleStats.meshZeroCountElided,
     };
   }
 
@@ -214,6 +238,10 @@
       typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.COPY_DST === 'number'
         ? GPUBufferUsage.COPY_DST
         : 0x0008,
+    UNIFORM:
+      typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.UNIFORM === 'number'
+        ? GPUBufferUsage.UNIFORM
+        : 0x0040,
     STORAGE:
       typeof GPUBufferUsage !== 'undefined' && typeof GPUBufferUsage.STORAGE === 'number'
         ? GPUBufferUsage.STORAGE
@@ -224,10 +252,22 @@
         : 0x0100,
   });
 
+  const SHADER_STAGE_COMPUTE =
+    typeof GPUShaderStage !== 'undefined' && typeof GPUShaderStage.COMPUTE === 'number'
+      ? GPUShaderStage.COMPUTE
+      : 0x0004;
+
   const INDIRECT_KIND = Object.freeze({
     DRAW: 'draw',
     DRAW_INDEXED: 'drawIndexed',
     DISPATCH: 'dispatch',
+  });
+
+  const INDIRECT_CLAMP_KIND = Object.freeze({
+    DRAW: 'draw',
+    DRAW_INDEXED: 'drawIndexed',
+    DISPATCH: 'dispatch',
+    DISPATCH_MESH: 'dispatchMesh',
   });
 
   // Field layouts: byte offsets in the record. `signed` marks i32 fields.
@@ -4091,6 +4131,15 @@
         commandsValidated: this._stats.commandsValidated,
         zeroCountElided: this._stats.zeroCountElided,
         outOfBoundsElided: this._stats.outOfBoundsElided,
+        gpuClampPassesEncoded: this._stats.gpuClampPassesEncoded,
+        gpuClampCommandsClamped: this._stats.gpuClampCommandsClamped,
+        gpuClampPipelinesCreated: this._stats.gpuClampPipelinesCreated,
+        gpuClampPipelineCacheHits: this._stats.gpuClampPipelineCacheHits,
+        gpuClampFirstInstanceZeroed: this._stats.gpuClampFirstInstanceZeroed,
+        gpuClampCountBuffersBound: this._stats.gpuClampCountBuffersBound,
+        meshOrchestrationsEncoded: this._stats.meshOrchestrationsEncoded,
+        meshIndirectDispatches: this._stats.meshIndirectDispatches,
+        meshZeroCountElided: this._stats.meshZeroCountElided,
         liveSlots: this.live.size,
         capacity: this.capacity,
         stride: this.stride,
@@ -4119,16 +4168,1855 @@
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // W378: GPU-Clamped ExecuteIndirect Compute Pass & Mesh Compute-Then-Draw
+  // ---------------------------------------------------------------------------
+
+  const _deviceClampPipelineCache = new WeakMap();
+  const _deviceDefaultClampExecutors = new WeakMap();
+
+  /**
+   * Check whether a WebGPU device exposes the `indirect-first-instance` feature.
+   *
+   * @param {object | null | undefined} device
+   * @returns {boolean}
+   */
+  function deviceSupportsIndirectFirstInstance(device) {
+    if (!device || typeof device !== 'object') {
+      return false;
+    }
+    if (device.features && typeof device.features.has === 'function') {
+      return Boolean(device.features.has('indirect-first-instance'));
+    }
+    return false;
+  }
+
+  /**
+   * Resolve `maxComputeWorkgroupsPerDimension` from a WebGPU device (default 65535).
+   *
+   * @param {object | null | undefined} device
+   * @param {number} [overrideLimit]
+   * @returns {number}
+   */
+  function resolveMaxComputeWorkgroups(device, overrideLimit) {
+    if (isPosSafeIntFast(overrideLimit)) {
+      return overrideLimit;
+    }
+    const raw =
+      device &&
+      device.limits &&
+      typeof device.limits.maxComputeWorkgroupsPerDimension === 'number'
+        ? Math.floor(device.limits.maxComputeWorkgroupsPerDimension)
+        : 0;
+    return isPosSafeIntFast(raw) ? raw : DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION;
+  }
+
+  function clampInputWordCount(kind) {
+    if (kind === INDIRECT_CLAMP_KIND.DRAW) return 4;
+    if (kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED) return 5;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH) return 3;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH_MESH) return 3;
+    throw new TypeError(`unknown indirect clamp kind '${kind}'`);
+  }
+
+  function clampOutputWordCount(kind) {
+    if (kind === INDIRECT_CLAMP_KIND.DRAW) return 4;
+    if (kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED) return 5;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH) return 3;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH_MESH) return 7;
+    throw new TypeError(`unknown indirect clamp kind '${kind}'`);
+  }
+
+  function clampKindNumericId(kind) {
+    if (kind === INDIRECT_CLAMP_KIND.DRAW) return 0;
+    if (kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED) return 1;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH) return 2;
+    if (kind === INDIRECT_CLAMP_KIND.DISPATCH_MESH) return 3;
+    throw new TypeError(`unknown indirect clamp kind '${kind}'`);
+  }
+
+  /**
+   * Generate a WGSL compute shader that clamps GPU-written indirect argument records
+   * (`drawIndirect` 16B, `drawIndexedIndirect` 20B, `dispatchIndirect` 12B, or
+   * `dispatchMesh` 12B -> 28B dispatch+draw pair) into a validated output indirect buffer
+   * without CPU readbacks, mirroring the G66 (#1533 / #1537) compute clamp design.
+   *
+   * @param {string} kind One of INDIRECT_CLAMP_KIND ('draw' | 'drawIndexed' | 'dispatch' | 'dispatchMesh').
+   * @param {{ workgroupSize?: number }} [options]
+   * @returns {string}
+   */
+  function generateIndirectClampWgsl(kind, options) {
+    const inWords = clampInputWordCount(kind);
+    const outWords = clampOutputWordCount(kind);
+    const wgSize =
+      options && options.workgroupSize !== undefined
+        ? options.workgroupSize
+        : DEFAULT_CLAMP_WORKGROUP_SIZE;
+    if (!Number.isInteger(wgSize) || wgSize < 1 || wgSize > 256) {
+      throw new RangeError(`workgroupSize must be an integer in [1, 256], got ${wgSize}`);
+    }
+
+    const header = [
+      'struct ClampParams {',
+      '  src_word: u32,',
+      '  stride_words: u32,',
+      '  dst_word: u32,',
+      '  command_count: u32,',
+      '  count_word: u32,',
+      '  has_count_buffer: u32,',
+      '  max_element_count: u32,',
+      '  max_instance_count: u32,',
+      '  max_group_x: u32,',
+      '  max_group_y: u32,',
+      '  max_group_z: u32,',
+      '  flags: u32,',
+      '}',
+      '@group(0) @binding(0) var<uniform> params: ClampParams;',
+      '@group(0) @binding(1) var<storage, read> src_args: array<u32>;',
+      '@group(0) @binding(2) var<storage, read> count_buf: array<u32>;',
+      '@group(0) @binding(3) var<storage, read_write> dst_args: array<u32>;',
+      '',
+      `@compute @workgroup_size(${wgSize})`,
+      'fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {',
+      '  let i = gid.x;',
+      '  if (i >= params.command_count) {',
+      '    return;',
+      '  }',
+      `  let in_words = ${inWords}u;`,
+      `  let out_words = ${outWords}u;`,
+      '  let out_base = params.dst_word + i * out_words;',
+      '  let dst_len = arrayLength(&dst_args);',
+      '  if (out_base >= dst_len || out_words > dst_len - out_base) {',
+      '    return;',
+      '  }',
+      '  var effective_count = params.command_count;',
+      '  if (params.has_count_buffer != 0u) {',
+      '    effective_count = 0u;',
+      '    if (params.count_word < arrayLength(&count_buf)) {',
+      '      effective_count = min(count_buf[params.count_word], params.command_count);',
+      '    }',
+      '  }',
+      '  let src_base = params.src_word + i * params.stride_words;',
+      '  let src_len = arrayLength(&src_args);',
+      '  let live = i < effective_count && src_base < src_len && in_words <= src_len - src_base;',
+      '  if (!live) {',
+      '    for (var k = 0u; k < out_words; k = k + 1u) {',
+      '      dst_args[out_base + k] = 0u;',
+      '    }',
+      '    return;',
+      '  }',
+    ];
+
+    let body;
+    if (kind === INDIRECT_CLAMP_KIND.DRAW) {
+      body = [
+        '  let first_vertex = src_args[src_base + 2u];',
+        '  var vertex_count = 0u;',
+        '  if (first_vertex < params.max_element_count) {',
+        '    vertex_count = min(src_args[src_base + 0u], params.max_element_count - first_vertex);',
+        '  }',
+        '  let instance_count = min(src_args[src_base + 1u], params.max_instance_count);',
+        '  var first_instance = src_args[src_base + 3u];',
+        '  if ((params.flags & 1u) != 0u) {',
+        '    first_instance = 0u;',
+        '  }',
+        '  dst_args[out_base + 0u] = vertex_count;',
+        '  dst_args[out_base + 1u] = instance_count;',
+        '  dst_args[out_base + 2u] = first_vertex;',
+        '  dst_args[out_base + 3u] = first_instance;',
+      ];
+    } else if (kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED) {
+      body = [
+        '  let first_index = src_args[src_base + 2u];',
+        '  var index_count = 0u;',
+        '  if (first_index < params.max_element_count) {',
+        '    index_count = min(src_args[src_base + 0u], params.max_element_count - first_index);',
+        '  }',
+        '  let instance_count = min(src_args[src_base + 1u], params.max_instance_count);',
+        '  let base_vertex_bits = src_args[src_base + 3u];',
+        '  var first_instance = src_args[src_base + 4u];',
+        '  if ((params.flags & 1u) != 0u) {',
+        '    first_instance = 0u;',
+        '  }',
+        '  dst_args[out_base + 0u] = index_count;',
+        '  dst_args[out_base + 1u] = instance_count;',
+        '  dst_args[out_base + 2u] = first_index;',
+        '  dst_args[out_base + 3u] = base_vertex_bits;',
+        '  dst_args[out_base + 4u] = first_instance;',
+      ];
+    } else if (kind === INDIRECT_CLAMP_KIND.DISPATCH) {
+      body = [
+        '  dst_args[out_base + 0u] = min(src_args[src_base + 0u], params.max_group_x);',
+        '  dst_args[out_base + 1u] = min(src_args[src_base + 1u], params.max_group_y);',
+        '  dst_args[out_base + 2u] = min(src_args[src_base + 2u], params.max_group_z);',
+      ];
+    } else {
+      // INDIRECT_CLAMP_KIND.DISPATCH_MESH: 12B mesh dispatch -> 28B (dispatch 12B + drawIndirect 16B).
+      body = [
+        '  let gx = min(src_args[src_base + 0u], params.max_group_x);',
+        '  let gy = min(src_args[src_base + 1u], params.max_group_y);',
+        '  let gz = min(src_args[src_base + 2u], params.max_group_z);',
+        '  let total_groups = gx * gy * gz;',
+        '  var vertex_count = 0u;',
+        '  if (total_groups > 0u && params.max_element_count > 0u) {',
+        '    let max_groups_before_cap = params.max_instance_count / params.max_element_count;',
+        '    if (total_groups >= max_groups_before_cap) {',
+        '      vertex_count = params.max_instance_count;',
+        '    } else {',
+        '      vertex_count = total_groups * params.max_element_count;',
+        '    }',
+        '  }',
+        '  let inst_count = select(0u, 1u, vertex_count > 0u);',
+        '  dst_args[out_base + 0u] = gx;',
+        '  dst_args[out_base + 1u] = gy;',
+        '  dst_args[out_base + 2u] = gz;',
+        '  dst_args[out_base + 3u] = vertex_count;',
+        '  dst_args[out_base + 4u] = inst_count;',
+        '  dst_args[out_base + 5u] = 0u;',
+        '  dst_args[out_base + 6u] = 0u;',
+      ];
+    }
+
+    return header.concat(body, ['}', '']).join('\n');
+  }
+
+  /**
+   * Look up or create a cached `GPUComputePipeline` for GPU-side indirect argument clamping,
+   * keyed by `(device, kind, workgroupSize)` inside a device-scoped `WeakMap` so destroyed
+   * devices are garbage-collected automatically.
+   *
+   * @param {object} device GPUDevice
+   * @param {string} kind One of INDIRECT_CLAMP_KIND
+   * @param {{ workgroupSize?: number, _statsTarget?: object | null }} [options]
+   * @returns {{
+   *   kind: string,
+   *   workgroupSize: number,
+   *   wgsl: string,
+   *   module: object,
+   *   bindGroupLayout: object | null,
+   *   pipelineLayout: object | null,
+   *   pipeline: object,
+   *   hasDynamicParamsOffset: boolean,
+   *   cacheHit: boolean
+   * }}
+   */
+  function getOrCreateIndirectClampPipeline(device, kind, options) {
+    if (
+      !device ||
+      typeof device !== 'object' ||
+      typeof device.createShaderModule !== 'function' ||
+      typeof device.createComputePipeline !== 'function'
+    ) {
+      throw new TypeError(
+        'getOrCreateIndirectClampPipeline requires a GPUDevice with createShaderModule() and createComputePipeline()'
+      );
+    }
+    clampInputWordCount(kind);
+    const wgSize =
+      options && options.workgroupSize !== undefined
+        ? options.workgroupSize
+        : DEFAULT_CLAMP_WORKGROUP_SIZE;
+    if (!Number.isInteger(wgSize) || wgSize < 1 || wgSize > 256) {
+      throw new RangeError(`workgroupSize must be an integer in [1, 256], got ${wgSize}`);
+    }
+    const statsTarget = options && options._statsTarget ? options._statsTarget : null;
+
+    let perDevice = _deviceClampPipelineCache.get(device);
+    if (!perDevice) {
+      perDevice = new Map();
+      _deviceClampPipelineCache.set(device, perDevice);
+    }
+    const key = `${kind}:${wgSize}`;
+    const cached = perDevice.get(key);
+    if (cached && cached.pipeline && cached.pipeline.destroyed !== true) {
+      recordStat('gpuClampPipelineCacheHits', 1, statsTarget);
+      return {
+        kind: cached.kind,
+        workgroupSize: cached.workgroupSize,
+        wgsl: cached.wgsl,
+        module: cached.module,
+        bindGroupLayout: cached.bindGroupLayout,
+        pipelineLayout: cached.pipelineLayout,
+        pipeline: cached.pipeline,
+        hasDynamicParamsOffset: cached.hasDynamicParamsOffset,
+        cacheHit: true,
+      };
+    }
+
+    const wgsl = generateIndirectClampWgsl(kind, { workgroupSize: wgSize });
+    const module = device.createShaderModule({
+      label: `playgta6:indirect_clamp:${kind}`,
+      code: wgsl,
+    });
+
+    let bindGroupLayout = null;
+    let pipelineLayout = null;
+    let hasDynamicParamsOffset = false;
+    if (
+      typeof device.createBindGroupLayout === 'function' &&
+      typeof device.createPipelineLayout === 'function'
+    ) {
+      bindGroupLayout = device.createBindGroupLayout({
+        label: `playgta6:indirect_clamp_bgl:${kind}`,
+        entries: [
+          {
+            binding: 0,
+            visibility: SHADER_STAGE_COMPUTE,
+            buffer: {
+              type: 'uniform',
+              hasDynamicOffset: true,
+              minBindingSize: CLAMP_PARAMS_UNIFORM_BYTES,
+            },
+          },
+          {
+            binding: 1,
+            visibility: SHADER_STAGE_COMPUTE,
+            buffer: { type: 'read-only-storage' },
+          },
+          {
+            binding: 2,
+            visibility: SHADER_STAGE_COMPUTE,
+            buffer: { type: 'read-only-storage' },
+          },
+          {
+            binding: 3,
+            visibility: SHADER_STAGE_COMPUTE,
+            buffer: { type: 'storage' },
+          },
+        ],
+      });
+      pipelineLayout = device.createPipelineLayout({
+        label: `playgta6:indirect_clamp_pl:${kind}`,
+        bindGroupLayouts: [bindGroupLayout],
+      });
+      hasDynamicParamsOffset = true;
+    }
+
+    const pipeline = device.createComputePipeline({
+      label: `playgta6:indirect_clamp_pipe:${kind}`,
+      layout: pipelineLayout || 'auto',
+      compute: {
+        module,
+        entryPoint: 'cs_main',
+      },
+    });
+    if (!bindGroupLayout && pipeline && typeof pipeline.getBindGroupLayout === 'function') {
+      bindGroupLayout = pipeline.getBindGroupLayout(0);
+    }
+
+    const entry = {
+      kind,
+      workgroupSize: wgSize,
+      wgsl,
+      module,
+      bindGroupLayout,
+      pipelineLayout,
+      pipeline,
+      hasDynamicParamsOffset,
+    };
+    perDevice.set(key, entry);
+    recordStat('gpuClampPipelinesCreated', 1, statsTarget);
+    return {
+      kind: entry.kind,
+      workgroupSize: entry.workgroupSize,
+      wgsl: entry.wgsl,
+      module: entry.module,
+      bindGroupLayout: entry.bindGroupLayout,
+      pipelineLayout: entry.pipelineLayout,
+      pipeline: entry.pipeline,
+      hasDynamicParamsOffset: entry.hasDynamicParamsOffset,
+      cacheHit: false,
+    };
+  }
+
+  function writeClampPassResult(
+    target,
+    ok,
+    encoded,
+    kind,
+    commandCount,
+    workgroupsX,
+    dstBuffer,
+    dstOffset,
+    dstByteLength,
+    recordBytes,
+    stride,
+    zeroedFirstInstance,
+    hasCountBuffer,
+    cacheHit,
+    reason
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.encoded = encoded;
+      target.kind = kind;
+      target.commandCount = commandCount;
+      target.workgroupsX = workgroupsX;
+      target.dstBuffer = dstBuffer;
+      target.dstOffset = dstOffset;
+      target.dstByteLength = dstByteLength;
+      target.recordBytes = recordBytes;
+      target.stride = stride;
+      target.zeroedFirstInstance = zeroedFirstInstance;
+      target.hasCountBuffer = hasCountBuffer;
+      target.cacheHit = cacheHit;
+      target.reason = reason;
+      return target;
+    }
+    return {
+      ok,
+      encoded,
+      kind,
+      commandCount,
+      workgroupsX,
+      dstBuffer,
+      dstOffset,
+      dstByteLength,
+      recordBytes,
+      stride,
+      zeroedFirstInstance,
+      hasCountBuffer,
+      cacheHit,
+      reason,
+    };
+  }
+
+  /**
+   * Reusable GPU-side `ExecuteIndirect` compute clamp pass manager (`GpuIndirectClampPass`,
+   * aliased as `IndirectClampExecutor`). Caches per-kind `GPUComputePipeline` objects via
+   * device WeakMap, caches bind groups per `(pipeline, srcBuffer, countBuffer, dstBuffer)`,
+   * manages a 256B-aligned uniform parameter ring + optional clamped indirect output ring,
+   * and encodes clamp dispatches with zero per-draw GC allocations on the hot path.
+   */
+  class GpuIndirectClampPass {
+    /**
+     * @param {object} options
+     * @param {object} options.device GPUDevice
+     * @param {number} [options.workgroupSize=64]
+     * @param {number} [options.maxParamsSlots=64]
+     * @param {number} [options.outputRingBytes=65536]
+     * @param {boolean} [options.indirectFirstInstance] Override device feature check.
+     * @param {number} [options.maxComputeWorkgroupsPerDimension] Override device limit.
+     * @param {string} [options.label='playgta6-indirect-clamp']
+     */
+    constructor(options) {
+      if (!options || typeof options !== 'object' || !options.device) {
+        throw new TypeError('GpuIndirectClampPass requires an options object with a device');
+      }
+      this.device = options.device;
+      this.workgroupSize =
+        options.workgroupSize === undefined
+          ? DEFAULT_CLAMP_WORKGROUP_SIZE
+          : options.workgroupSize;
+      if (!Number.isInteger(this.workgroupSize) || this.workgroupSize < 1 || this.workgroupSize > 256) {
+        throw new RangeError(`workgroupSize must be an integer in [1, 256], got ${this.workgroupSize}`);
+      }
+      this.maxParamsSlots =
+        options.maxParamsSlots === undefined ? DEFAULT_CLAMP_PARAMS_SLOTS : options.maxParamsSlots;
+      assertPositiveInteger(this.maxParamsSlots, 'maxParamsSlots');
+      this.outputRingBytes =
+        options.outputRingBytes === undefined
+          ? DEFAULT_CLAMP_OUTPUT_BYTES
+          : options.outputRingBytes;
+      assertPositiveInteger(this.outputRingBytes, 'outputRingBytes');
+      if (!isAligned4Fast(this.outputRingBytes)) {
+        this.outputRingBytes = Math.ceil(this.outputRingBytes / 4) * 4;
+      }
+      this.indirectFirstInstance =
+        options.indirectFirstInstance !== undefined
+          ? Boolean(options.indirectFirstInstance)
+          : deviceSupportsIndirectFirstInstance(this.device);
+      this.maxComputeWorkgroupsPerDimension = resolveMaxComputeWorkgroups(
+        this.device,
+        options.maxComputeWorkgroupsPerDimension
+      );
+      this.label = options.label || 'playgta6-indirect-clamp';
+      this.destroyed = false;
+
+      // Reusable hot-path scratch objects (zero per-draw heap allocations).
+      this._paramsU32 = new Uint32Array(CLAMP_PARAMS_UNIFORM_BYTES >>> 2);
+      this._dynOffsets = new Uint32Array(1);
+      this._computePassDesc = { label: `${this.label}:pass` };
+      this._bgEntries = [
+        { binding: 0, resource: { buffer: null, offset: 0, size: CLAMP_PARAMS_UNIFORM_BYTES } },
+        { binding: 1, resource: { buffer: null } },
+        { binding: 2, resource: { buffer: null } },
+        { binding: 3, resource: { buffer: null } },
+      ];
+      this._bgDescriptor = {
+        label: `${this.label}:bg`,
+        layout: null,
+        entries: this._bgEntries,
+      };
+      this._scratchResult = writeClampPassResult(
+        null,
+        false,
+        false,
+        INDIRECT_CLAMP_KIND.DRAW,
+        0,
+        0,
+        null,
+        0,
+        0,
+        0,
+        0,
+        false,
+        false,
+        false,
+        null
+      );
+
+      this._paramsBuffer = null;
+      this._paramsSlotCursor = 0;
+      this._outputRingBuffer = null;
+      this._outputRingCursor = 0;
+
+      // Bind-group cache keyed by integer resource IDs to avoid per-draw createBindGroup().
+      this._resourceIds = new WeakMap();
+      this._nextResourceId = 0;
+      this._bgCache = new Map();
+      this._maxBgCacheEntries = 256;
+      this._stats = createEmptyStats();
+      this._bgCacheHits = 0;
+      this._bgCacheMisses = 0;
+    }
+
+    _getResId(obj) {
+      if (!obj || typeof obj !== 'object') {
+        return 0;
+      }
+      let id = this._resourceIds.get(obj);
+      if (id === undefined) {
+        this._nextResourceId += 1;
+        id = this._nextResourceId;
+        this._resourceIds.set(obj, id);
+      }
+      return id;
+    }
+
+    _ensureParamsBuffer(hasDynamicOffset) {
+      const neededSlots = hasDynamicOffset ? this.maxParamsSlots : 1;
+      const neededBytes = neededSlots * CLAMP_PARAMS_SLOT_STRIDE;
+      if (
+        this._paramsBuffer &&
+        this._paramsBuffer.destroyed !== true &&
+        (typeof this._paramsBuffer.size !== 'number' || this._paramsBuffer.size >= neededBytes)
+      ) {
+        return this._paramsBuffer;
+      }
+      if (this._paramsBuffer && typeof this._paramsBuffer.destroy === 'function') {
+        try {
+          this._paramsBuffer.destroy();
+        } catch (_err) {
+          // Ignore already-destroyed device buffer.
+        }
+      }
+      this._paramsBuffer = this.device.createBuffer({
+        label: `${this.label}:params`,
+        size: neededBytes,
+        usage: BUFFER_USAGE.UNIFORM | BUFFER_USAGE.COPY_DST,
+      });
+      this._paramsSlotCursor = 0;
+      this._bgCache.clear();
+      return this._paramsBuffer;
+    }
+
+    _ensureOutputRingBuffer(minBytes) {
+      if (
+        this._outputRingBuffer &&
+        this._outputRingBuffer.destroyed !== true &&
+        (typeof this._outputRingBuffer.size !== 'number' || this._outputRingBuffer.size >= minBytes)
+      ) {
+        return this._outputRingBuffer;
+      }
+      const nextSize = Math.max(this.outputRingBytes, Math.ceil(minBytes / 4) * 4);
+      if (this._outputRingBuffer && typeof this._outputRingBuffer.destroy === 'function') {
+        try {
+          this._outputRingBuffer.destroy();
+        } catch (_err) {
+          // Ignore already-destroyed device buffer.
+        }
+      }
+      this._outputRingBuffer = this.device.createBuffer({
+        label: `${this.label}:output-ring`,
+        size: nextSize,
+        usage:
+          BUFFER_USAGE.INDIRECT |
+          BUFFER_USAGE.STORAGE |
+          BUFFER_USAGE.COPY_DST |
+          BUFFER_USAGE.COPY_SRC,
+      });
+      this.outputRingBytes = nextSize;
+      this._outputRingCursor = 0;
+      this._bgCache.clear();
+      return this._outputRingBuffer;
+    }
+
+    _allocateOutputWindow(byteLength) {
+      const alignedLen = Math.ceil(byteLength / 4) * 4;
+      const buf = this._ensureOutputRingBuffer(alignedLen);
+      const bufSize = typeof buf.size === 'number' ? buf.size : this.outputRingBytes;
+      if (this._outputRingCursor + alignedLen > bufSize) {
+        this._outputRingCursor = 0;
+      }
+      const offset = this._outputRingCursor;
+      this._outputRingCursor += alignedLen;
+      return offset;
+    }
+
+    _getOrCreateClampBindGroup(pipeInfo, paramsBuffer, srcBuffer, countBuffer, dstBuffer, paramsOffset) {
+      const dynamic = pipeInfo.hasDynamicParamsOffset;
+      const keyOffset = dynamic ? 0 : paramsOffset;
+      const key =
+        `${this._getResId(pipeInfo.pipeline)}:` +
+        `${this._getResId(paramsBuffer)}:${keyOffset}:` +
+        `${this._getResId(srcBuffer)}:` +
+        `${this._getResId(countBuffer)}:` +
+        `${this._getResId(dstBuffer)}`;
+
+      const cached = this._bgCache.get(key);
+      if (
+        cached &&
+        cached.bg &&
+        cached.bg.destroyed !== true &&
+        cached.paramsBuffer === paramsBuffer &&
+        cached.srcBuffer === srcBuffer &&
+        cached.countBuffer === countBuffer &&
+        cached.dstBuffer === dstBuffer &&
+        paramsBuffer.destroyed !== true &&
+        srcBuffer.destroyed !== true &&
+        countBuffer.destroyed !== true &&
+        dstBuffer.destroyed !== true
+      ) {
+        this._bgCacheHits += 1;
+        return cached.bg;
+      }
+
+      this._bgCacheMisses += 1;
+      this._bgEntries[0].resource.buffer = paramsBuffer;
+      this._bgEntries[0].resource.offset = keyOffset;
+      this._bgEntries[0].resource.size = CLAMP_PARAMS_UNIFORM_BYTES;
+      this._bgEntries[1].resource.buffer = srcBuffer;
+      this._bgEntries[2].resource.buffer = countBuffer;
+      this._bgEntries[3].resource.buffer = dstBuffer;
+      this._bgDescriptor.layout = pipeInfo.bindGroupLayout;
+
+      const bg = this.device.createBindGroup(this._bgDescriptor);
+      if (this._bgCache.size >= this._maxBgCacheEntries) {
+        const oldestKey = this._bgCache.keys().next().value;
+        this._bgCache.delete(oldestKey);
+      }
+      this._bgCache.set(key, {
+        bg,
+        paramsBuffer,
+        srcBuffer,
+        countBuffer,
+        dstBuffer,
+      });
+      return bg;
+    }
+
+    /**
+     * Reset per-frame parameter-slot and output-ring cursors (call at frame start).
+     */
+    resetFrame() {
+      this._paramsSlotCursor = 0;
+      this._outputRingCursor = 0;
+    }
+
+    /**
+     * Encode a GPU compute clamp pass for `kind` ('draw' | 'drawIndexed' | 'dispatch' | 'dispatchMesh').
+     * Accepts either a `GPUCommandEncoder` (opens and ends a compute pass) or an active
+     * `GPUComputePassEncoder` (encodes directly onto the open pass for batching).
+     * Pass a preallocated `out` object (or `options.out`) for zero per-draw GC allocations.
+     *
+     * @param {object} passOrEncoder GPUCommandEncoder or GPUComputePassEncoder
+     * @param {string} kind INDIRECT_CLAMP_KIND
+     * @param {object} options
+     * @param {object} options.srcBuffer Source GPU-written indirect buffer (STORAGE)
+     * @param {number} [options.srcOffset=0] 4-byte-aligned byte offset in `srcBuffer`
+     * @param {number} [options.stride] Source byte stride (>= input record bytes, multiple of 4)
+     * @param {number} [options.commandCount=1] Number of commands (`count` / `maxCommandCount` aliases)
+     * @param {object} [options.dstBuffer] Output indirect buffer (STORAGE | INDIRECT); uses managed ring if omitted
+     * @param {number} [options.dstOffset=0] 4-byte-aligned byte offset in `dstBuffer`
+     * @param {object} [options.countBuffer] Optional GPU count buffer (u32 at `countOffset`)
+     * @param {number} [options.countOffset=0] 4-byte-aligned byte offset in `countBuffer`
+     * @param {number} [options.maxVertexCount] Upper bound for draw `vertexCount` (default U32_MAX)
+     * @param {number} [options.maxIndexCount] Upper bound for drawIndexed `indexCount` (default U32_MAX)
+     * @param {number} [options.maxMeshVerticesPerGroup] Vertices per mesh group for `dispatchMesh`
+     * @param {number} [options.maxMeshTotalVertices] Total vertex cap for `dispatchMesh`
+     * @param {number} [options.maxInstanceCount] Upper bound for `instanceCount` (default U32_MAX)
+     * @param {number} [options.maxWorkgroupsX] Upper bound for workgroups X (default device limit)
+     * @param {number} [options.maxWorkgroupsY] Upper bound for workgroups Y (default device limit)
+     * @param {number} [options.maxWorkgroupsZ] Upper bound for workgroups Z (default device limit)
+     * @param {boolean} [options.indirectFirstInstance] Override `indirect-first-instance` gating
+     * @param {number} [options.maxIndirectBatchCount=4096]
+     * @param {boolean} [options.clampBatch=true]
+     * @param {object} [options.out]
+     * @param {object} [out]
+     */
+    encodeClamp(passOrEncoder, kind, options, out) {
+      const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+      const outTarget = resolveOutTarget(options, out);
+      if (this.destroyed) {
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          0,
+          0,
+          false,
+          false,
+          false,
+          'DESTROYED'
+        );
+      }
+
+      let inWords;
+      let outWords;
+      try {
+        inWords = clampInputWordCount(kind);
+        outWords = clampOutputWordCount(kind);
+      } catch (_err) {
+        recordBoundsRejection(this._stats);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          0,
+          0,
+          false,
+          false,
+          false,
+          'UNKNOWN_KIND'
+        );
+      }
+
+      const inBytes = inWords * 4;
+      const outBytes = outWords * 4;
+      const isEncoder = Boolean(
+        passOrEncoder && typeof passOrEncoder.beginComputePass === 'function'
+      );
+      const isComputePass = Boolean(
+        passOrEncoder &&
+          typeof passOrEncoder.setPipeline === 'function' &&
+          typeof passOrEncoder.setBindGroup === 'function' &&
+          typeof passOrEncoder.dispatchWorkgroups === 'function'
+      );
+      if (!isEncoder && !isComputePass) {
+        recordBoundsRejection(this._stats);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'INVALID_PASS_OR_ENCODER'
+        );
+      }
+
+      if (!hasOpts) {
+        recordBoundsRejection(this._stats);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'INVALID_OPTIONS'
+        );
+      }
+
+      const srcBuffer = options.srcBuffer !== undefined ? options.srcBuffer : options.buffer;
+      const srcOffset = options.srcOffset !== undefined ? options.srcOffset : options.offset || 0;
+      const stride = options.stride !== undefined ? options.stride : inBytes;
+      const rawCount =
+        options.commandCount !== undefined
+          ? options.commandCount
+          : options.count !== undefined
+            ? options.count
+            : options.maxCommandCount !== undefined
+              ? options.maxCommandCount
+              : 1;
+      const maxBatch =
+        options.maxIndirectBatchCount !== undefined
+          ? options.maxIndirectBatchCount
+          : DEFAULT_MAX_INDIRECT_BATCH_COUNT;
+      const clampBatch = options.clampBatch !== false;
+
+      if (!isNonNegSafeIntFast(rawCount)) {
+        recordBoundsRejection(this._stats);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'INVALID_COUNT'
+        );
+      }
+      if (rawCount === 0) {
+        recordStat('zeroBatchSkips', 1, this._stats);
+        recordStat('zeroCountElided', 1, this._stats);
+        return writeClampPassResult(
+          outTarget,
+          true,
+          false,
+          kind,
+          0,
+          0,
+          options.dstBuffer || null,
+          options.dstOffset || 0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'ZERO_COUNT'
+        );
+      }
+
+      let commandCount = rawCount;
+      if (isPosSafeIntFast(maxBatch) && commandCount > maxBatch) {
+        if (!clampBatch) {
+          recordBatchLimitRejected(this._stats);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            false,
+            false,
+            'BATCH_LIMIT_EXCEEDED'
+          );
+        }
+        commandCount = maxBatch;
+        recordBatchClamped(this._stats);
+      }
+
+      if (!srcBuffer || typeof srcBuffer !== 'object' || srcBuffer.destroyed === true) {
+        recordRangeRejection(
+          srcBuffer && srcBuffer.destroyed ? RANGE_DESTROYED_BUFFER : RANGE_NOT_INDIRECT,
+          this._stats,
+          commandCount,
+          true
+        );
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          srcBuffer && srcBuffer.destroyed ? 'DESTROYED_BUFFER' : 'INVALID_SRC_BUFFER'
+        );
+      }
+      if (!isNonNegSafeIntFast(srcOffset) || !isAligned4Fast(srcOffset)) {
+        recordRangeRejection(RANGE_MISALIGNED_OFFSET, this._stats, commandCount, true);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'MISALIGNED_OFFSET'
+        );
+      }
+      if (!isPosSafeIntFast(stride) || stride < inBytes || !isAligned4Fast(stride)) {
+        recordBoundsRejection(this._stats);
+        return writeClampPassResult(
+          outTarget,
+          false,
+          false,
+          kind,
+          0,
+          0,
+          null,
+          0,
+          0,
+          outBytes,
+          outBytes,
+          false,
+          false,
+          false,
+          'INVALID_STRIDE'
+        );
+      }
+
+      const countBuffer = options.countBuffer || null;
+      const countOffset = options.countOffset || 0;
+      const hasCountBuffer = countBuffer !== null;
+      if (hasCountBuffer) {
+        if (typeof countBuffer !== 'object' || countBuffer.destroyed === true) {
+          recordBoundsRejection(this._stats);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            true,
+            false,
+            'INVALID_COUNT_BUFFER'
+          );
+        }
+        if (!isNonNegSafeIntFast(countOffset) || !isAligned4Fast(countOffset)) {
+          recordRangeRejection(RANGE_MISALIGNED_OFFSET, this._stats, 1, true);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            true,
+            false,
+            'MISALIGNED_COUNT_OFFSET'
+          );
+        }
+      }
+
+      const dstByteLength = commandCount * outBytes;
+      let dstBuffer = options.dstBuffer || null;
+      let dstOffset = options.dstOffset !== undefined ? options.dstOffset : 0;
+      if (dstBuffer !== null) {
+        if (typeof dstBuffer !== 'object' || dstBuffer.destroyed === true) {
+          recordRangeRejection(RANGE_DESTROYED_BUFFER, this._stats, commandCount, true);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            hasCountBuffer,
+            false,
+            'INVALID_DST_BUFFER'
+          );
+        }
+        if (!isNonNegSafeIntFast(dstOffset) || !isAligned4Fast(dstOffset)) {
+          recordRangeRejection(RANGE_MISALIGNED_OFFSET, this._stats, commandCount, true);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            hasCountBuffer,
+            false,
+            'MISALIGNED_DST_OFFSET'
+          );
+        }
+        if (typeof dstBuffer.size === 'number' && dstOffset + dstByteLength > dstBuffer.size) {
+          recordRangeRejection(RANGE_OUT_OF_BOUNDS, this._stats, commandCount, true);
+          return writeClampPassResult(
+            outTarget,
+            false,
+            false,
+            kind,
+            0,
+            0,
+            null,
+            0,
+            0,
+            outBytes,
+            outBytes,
+            false,
+            hasCountBuffer,
+            false,
+            'OUT_OF_BOUNDS'
+          );
+        }
+      } else {
+        dstOffset = this._allocateOutputWindow(dstByteLength);
+        dstBuffer = this._outputRingBuffer;
+      }
+
+      const pipeInfo = getOrCreateIndirectClampPipeline(this.device, kind, {
+        workgroupSize: this.workgroupSize,
+        _statsTarget: this._stats,
+      });
+
+      const paramsBuffer = this._ensureParamsBuffer(pipeInfo.hasDynamicParamsOffset);
+      let paramsOffset = 0;
+      if (pipeInfo.hasDynamicParamsOffset) {
+        if (this._paramsSlotCursor >= this.maxParamsSlots) {
+          this._paramsSlotCursor = 0;
+        }
+        paramsOffset = this._paramsSlotCursor * CLAMP_PARAMS_SLOT_STRIDE;
+        this._paramsSlotCursor += 1;
+      }
+
+      const allowFirstInstance =
+        options.indirectFirstInstance !== undefined
+          ? Boolean(options.indirectFirstInstance)
+          : this.indirectFirstInstance;
+      const isDrawKind =
+        kind === INDIRECT_CLAMP_KIND.DRAW || kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED;
+      const zeroFirstInstance = isDrawKind && !allowFirstInstance;
+
+      let maxElementCount = U32_MAX;
+      if (kind === INDIRECT_CLAMP_KIND.DRAW) {
+        if (isNonNegSafeIntFast(options.maxVertexCount)) {
+          maxElementCount = Math.min(options.maxVertexCount, U32_MAX);
+        }
+      } else if (kind === INDIRECT_CLAMP_KIND.DRAW_INDEXED) {
+        if (isNonNegSafeIntFast(options.maxIndexCount)) {
+          maxElementCount = Math.min(options.maxIndexCount, U32_MAX);
+        }
+      } else if (kind === INDIRECT_CLAMP_KIND.DISPATCH_MESH) {
+        maxElementCount = isNonNegSafeIntFast(options.maxMeshVerticesPerGroup)
+          ? Math.min(options.maxMeshVerticesPerGroup, U32_MAX)
+          : 256 * 3;
+      }
+
+      let maxInstanceCount = U32_MAX;
+      if (kind === INDIRECT_CLAMP_KIND.DISPATCH_MESH) {
+        if (isNonNegSafeIntFast(options.maxMeshTotalVertices)) {
+          maxInstanceCount = Math.min(options.maxMeshTotalVertices, U32_MAX);
+        }
+      } else if (isNonNegSafeIntFast(options.maxInstanceCount)) {
+        maxInstanceCount = Math.min(options.maxInstanceCount, U32_MAX);
+      }
+
+      const maxGroupDefault = this.maxComputeWorkgroupsPerDimension;
+      const maxGroupX = isNonNegSafeIntFast(options.maxWorkgroupsX)
+        ? Math.min(options.maxWorkgroupsX, maxGroupDefault)
+        : maxGroupDefault;
+      const maxGroupY = isNonNegSafeIntFast(options.maxWorkgroupsY)
+        ? Math.min(options.maxWorkgroupsY, maxGroupDefault)
+        : maxGroupDefault;
+      const maxGroupZ = isNonNegSafeIntFast(options.maxWorkgroupsZ)
+        ? Math.min(options.maxWorkgroupsZ, maxGroupDefault)
+        : maxGroupDefault;
+
+      const u32 = this._paramsU32;
+      u32[0] = (srcOffset / 4) >>> 0;
+      u32[1] = (stride / 4) >>> 0;
+      u32[2] = (dstOffset / 4) >>> 0;
+      u32[3] = commandCount >>> 0;
+      u32[4] = (countOffset / 4) >>> 0;
+      u32[5] = hasCountBuffer ? 1 : 0;
+      u32[6] = maxElementCount >>> 0;
+      u32[7] = maxInstanceCount >>> 0;
+      u32[8] = maxGroupX >>> 0;
+      u32[9] = maxGroupY >>> 0;
+      u32[10] = maxGroupZ >>> 0;
+      u32[11] = zeroFirstInstance ? 1 : 0;
+
+      if (this.device.queue && typeof this.device.queue.writeBuffer === 'function') {
+        this.device.queue.writeBuffer(paramsBuffer, paramsOffset, u32);
+      }
+
+      const effectiveCountBuf = hasCountBuffer ? countBuffer : srcBuffer;
+      const bindGroup = this._getOrCreateClampBindGroup(
+        pipeInfo,
+        paramsBuffer,
+        srcBuffer,
+        effectiveCountBuf,
+        dstBuffer,
+        paramsOffset
+      );
+
+      const workgroupsX = Math.ceil(commandCount / this.workgroupSize);
+      const computePass = isComputePass
+        ? passOrEncoder
+        : passOrEncoder.beginComputePass(this._computePassDesc);
+
+      computePass.setPipeline(pipeInfo.pipeline);
+      if (pipeInfo.hasDynamicParamsOffset) {
+        this._dynOffsets[0] = paramsOffset;
+        computePass.setBindGroup(0, bindGroup, this._dynOffsets);
+      } else {
+        computePass.setBindGroup(0, bindGroup);
+      }
+      computePass.dispatchWorkgroups(workgroupsX, 1, 1);
+
+      if (!isComputePass && typeof computePass.end === 'function') {
+        computePass.end();
+      }
+
+      recordStat('gpuClampPassesEncoded', 1, this._stats);
+      recordStat('gpuClampCommandsClamped', commandCount, this._stats);
+      if (zeroFirstInstance) {
+        recordStat('gpuClampFirstInstanceZeroed', commandCount, this._stats);
+      }
+      if (hasCountBuffer) {
+        recordStat('gpuClampCountBuffersBound', 1, this._stats);
+      }
+
+      return writeClampPassResult(
+        outTarget,
+        true,
+        true,
+        kind,
+        commandCount,
+        workgroupsX,
+        dstBuffer,
+        dstOffset,
+        dstByteLength,
+        outBytes,
+        outBytes,
+        zeroFirstInstance,
+        hasCountBuffer,
+        pipeInfo.cacheHit,
+        null
+      );
+    }
+
+    clampDrawIndirect(passOrEncoder, options, out) {
+      return this.encodeClamp(passOrEncoder, INDIRECT_CLAMP_KIND.DRAW, options, out);
+    }
+
+    clampDrawIndexedIndirect(passOrEncoder, options, out) {
+      return this.encodeClamp(passOrEncoder, INDIRECT_CLAMP_KIND.DRAW_INDEXED, options, out);
+    }
+
+    clampDispatchIndirect(passOrEncoder, options, out) {
+      return this.encodeClamp(passOrEncoder, INDIRECT_CLAMP_KIND.DISPATCH, options, out);
+    }
+
+    clampDispatchMeshIndirect(passOrEncoder, options, out) {
+      return this.encodeClamp(passOrEncoder, INDIRECT_CLAMP_KIND.DISPATCH_MESH, options, out);
+    }
+
+    getStats() {
+      return {
+        gpuClampPassesEncoded: this._stats.gpuClampPassesEncoded,
+        gpuClampCommandsClamped: this._stats.gpuClampCommandsClamped,
+        gpuClampPipelinesCreated: this._stats.gpuClampPipelinesCreated,
+        gpuClampPipelineCacheHits: this._stats.gpuClampPipelineCacheHits,
+        gpuClampFirstInstanceZeroed: this._stats.gpuClampFirstInstanceZeroed,
+        gpuClampCountBuffersBound: this._stats.gpuClampCountBuffersBound,
+        boundsRejectedCount: this._stats.boundsRejectedCount,
+        batchClampedCount: this._stats.batchClampedCount,
+        batchLimitRejectedCount: this._stats.batchLimitRejectedCount,
+        zeroBatchSkips: this._stats.zeroBatchSkips,
+        zeroCountElided: this._stats.zeroCountElided,
+        bindGroupCacheHits: this._bgCacheHits,
+        bindGroupCacheMisses: this._bgCacheMisses,
+        bindGroupCacheSize: this._bgCache.size,
+        indirectFirstInstance: this.indirectFirstInstance,
+        maxComputeWorkgroupsPerDimension: this.maxComputeWorkgroupsPerDimension,
+        destroyed: this.destroyed,
+      };
+    }
+
+    resetStats() {
+      this._stats = createEmptyStats();
+      this._bgCacheHits = 0;
+      this._bgCacheMisses = 0;
+    }
+
+    destroy() {
+      if (this.destroyed) {
+        return;
+      }
+      this.destroyed = true;
+      if (this._paramsBuffer && typeof this._paramsBuffer.destroy === 'function') {
+        try {
+          this._paramsBuffer.destroy();
+        } catch (_err) {
+          // Ignore device-lost cleanup errors.
+        }
+      }
+      if (this._outputRingBuffer && typeof this._outputRingBuffer.destroy === 'function') {
+        try {
+          this._outputRingBuffer.destroy();
+        } catch (_err) {
+          // Ignore device-lost cleanup errors.
+        }
+      }
+      this._paramsBuffer = null;
+      this._outputRingBuffer = null;
+      this._bgCache.clear();
+    }
+  }
+
+  /**
+   * Standalone helper to encode a GPU compute clamp pass for `draw`, `drawIndexed`,
+   * `dispatch`, or `dispatchMesh` indirect arguments, caching pipelines & parameter rings
+   * per `GPUDevice` via `WeakMap` (or using a caller-supplied `options.clampExecutor`).
+   *
+   * @param {object} passOrEncoder GPUCommandEncoder or GPUComputePassEncoder
+   * @param {string} kind INDIRECT_CLAMP_KIND
+   * @param {object} options Must include `srcBuffer` and either `clampExecutor` or `device`
+   * @param {object} [out] Optional preallocated scratch result object
+   */
+  function encodeClampedIndirectPass(passOrEncoder, kind, options, out) {
+    const hasOpts = options !== undefined && options !== null && typeof options === 'object';
+    let executor = hasOpts ? options.clampExecutor || null : null;
+    if (!executor) {
+      const device = hasOpts ? options.device : null;
+      if (!device || typeof device !== 'object') {
+        throw new TypeError(
+          'encodeClampedIndirectPass requires options.clampExecutor or options.device'
+        );
+      }
+      executor = _deviceDefaultClampExecutors.get(device);
+      if (!executor || executor.destroyed) {
+        executor = new GpuIndirectClampPass({
+          device,
+          workgroupSize: options.workgroupSize,
+          indirectFirstInstance: options.indirectFirstInstance,
+          maxComputeWorkgroupsPerDimension: options.maxComputeWorkgroupsPerDimension,
+        });
+        _deviceDefaultClampExecutors.set(device, executor);
+      }
+    }
+    return executor.encodeClamp(passOrEncoder, kind, options, out);
+  }
+
+  function writeMeshOrchestrationResult(
+    target,
+    ok,
+    executed,
+    elided,
+    indirectDispatch,
+    dispatchClamped,
+    drawClamped,
+    indexed,
+    drawsIssued,
+    drawIndirectBuffer,
+    drawIndirectOffset,
+    reason
+  ) {
+    if (target !== null) {
+      target.ok = ok;
+      target.executed = executed;
+      target.elided = elided;
+      target.indirectDispatch = indirectDispatch;
+      target.dispatchClamped = dispatchClamped;
+      target.drawClamped = drawClamped;
+      target.indexed = indexed;
+      target.drawsIssued = drawsIssued;
+      target.drawIndirectBuffer = drawIndirectBuffer;
+      target.drawIndirectOffset = drawIndirectOffset;
+      target.reason = reason;
+      return target;
+    }
+    return {
+      ok,
+      executed,
+      elided,
+      indirectDispatch,
+      dispatchClamped,
+      drawClamped,
+      indexed,
+      drawsIssued,
+      drawIndirectBuffer,
+      drawIndirectOffset,
+      reason,
+    };
+  }
+
+  const _meshClampScratch = writeClampPassResult(
+    null,
+    false,
+    false,
+    INDIRECT_CLAMP_KIND.DISPATCH,
+    0,
+    0,
+    null,
+    0,
+    0,
+    0,
+    0,
+    false,
+    false,
+    false,
+    null
+  );
+  const _meshClampOptsScratch = {
+    device: null,
+    clampExecutor: null,
+    srcBuffer: null,
+    srcOffset: 0,
+    dstBuffer: null,
+    dstOffset: 0,
+    countBuffer: null,
+    countOffset: 0,
+    commandCount: 1,
+    stride: undefined,
+    maxVertexCount: undefined,
+    maxIndexCount: undefined,
+    maxInstanceCount: undefined,
+    maxWorkgroupsX: undefined,
+    maxWorkgroupsY: undefined,
+    maxWorkgroupsZ: undefined,
+    indirectFirstInstance: undefined,
+  };
+  const _meshDrawBatchScratch = {};
+
+  /**
+   * Orchestrate a lowered mesh-shader compute-then-draw pipeline (#1537 / #1552):
+   * 1. Optional GPU clamp of indirect mesh dispatch arguments.
+   * 2. Compute pass executing the lowered mesh shader (direct `dispatchWorkgroups` or
+   *    indirect `dispatchWorkgroupsIndirect`), generating mesh output buffers + draw-indirect args.
+   * 3. Optional GPU clamp of generated `drawIndirect` / `drawIndexedIndirect` arguments.
+   * 4. Render pass executing `drawIndirect` / `drawIndexedIndirect` over the generated mesh output.
+   *
+   * Zero per-draw heap allocations when `out` (or `spec.out`) is supplied.
+   *
+   * @param {object} encoder GPUCommandEncoder (optional if both `spec.computePass` and `spec.renderPass` are supplied)
+   * @param {object} spec
+   * @param {object} [out] Optional preallocated scratch result object
+   */
+  function encodeMeshComputeThenDraw(encoder, spec, out) {
+    const outTarget = resolveOutTarget(spec, out);
+    if (!spec || typeof spec !== 'object') {
+      recordBoundsRejection(null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        0,
+        null,
+        0,
+        'INVALID_SPEC'
+      );
+    }
+
+    const indexed = Boolean(spec.indexed);
+    const indirectDispatch = Boolean(
+      spec.indirectDispatch === true || spec.dispatchIndirectBuffer
+    );
+    const drawCount = spec.drawCount !== undefined ? spec.drawCount : 1;
+    if (!isNonNegSafeIntFast(drawCount)) {
+      recordBoundsRejection(null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        false,
+        false,
+        false,
+        indirectDispatch,
+        false,
+        false,
+        indexed,
+        0,
+        null,
+        0,
+        'INVALID_DRAW_COUNT'
+      );
+    }
+    if (drawCount === 0) {
+      recordStat('meshZeroCountElided', 1, null);
+      recordStat('zeroCountElided', 1, null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        true,
+        false,
+        true,
+        indirectDispatch,
+        false,
+        false,
+        indexed,
+        0,
+        spec.drawIndirectBuffer || null,
+        spec.drawIndirectOffset || 0,
+        'ZERO_COUNT'
+      );
+    }
+
+    let gx = 0;
+    let gy = 1;
+    let gz = 1;
+    if (!indirectDispatch) {
+      gx = spec.workgroupCountX !== undefined ? spec.workgroupCountX : spec.x !== undefined ? spec.x : 0;
+      gy = spec.workgroupCountY !== undefined ? spec.workgroupCountY : spec.y !== undefined ? spec.y : 1;
+      gz = spec.workgroupCountZ !== undefined ? spec.workgroupCountZ : spec.z !== undefined ? spec.z : 1;
+      if (
+        !isNonNegSafeIntFast(gx) ||
+        !isNonNegSafeIntFast(gy) ||
+        !isNonNegSafeIntFast(gz)
+      ) {
+        recordBoundsRejection(null);
+        return writeMeshOrchestrationResult(
+          outTarget,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          indexed,
+          0,
+          null,
+          0,
+          'INVALID_WORKGROUP_COUNT'
+        );
+      }
+      if (gx === 0 || gy === 0 || gz === 0) {
+        recordStat('meshZeroCountElided', 1, null);
+        recordStat('zeroCountElided', 1, null);
+        return writeMeshOrchestrationResult(
+          outTarget,
+          true,
+          false,
+          true,
+          false,
+          false,
+          false,
+          indexed,
+          0,
+          spec.drawIndirectBuffer || null,
+          spec.drawIndirectOffset || 0,
+          'ZERO_COUNT'
+        );
+      }
+      const maxWg = resolveMaxComputeWorkgroups(
+        spec.device,
+        spec.maxComputeWorkgroupsPerDimension
+      );
+      if (gx > maxWg) gx = maxWg;
+      if (gy > maxWg) gy = maxWg;
+      if (gz > maxWg) gz = maxWg;
+    }
+
+    if (!spec.meshPipeline || !spec.renderPipeline) {
+      recordBoundsRejection(null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        false,
+        false,
+        false,
+        indirectDispatch,
+        false,
+        false,
+        indexed,
+        0,
+        null,
+        0,
+        !spec.meshPipeline ? 'MISSING_MESH_PIPELINE' : 'MISSING_RENDER_PIPELINE'
+      );
+    }
+
+    const rawDrawBuf = spec.drawIndirectBuffer || null;
+    const rawDrawOff = spec.drawIndirectOffset || 0;
+    const recordBytes = indexed ? DRAW_INDEXED_INDIRECT_BYTES : DRAW_INDIRECT_BYTES;
+    const drawStride = spec.drawStride !== undefined ? spec.drawStride : recordBytes;
+
+    // 1. Optional GPU clamp of indirect mesh dispatch buffer.
+    let dispatchBuf = spec.dispatchIndirectBuffer || null;
+    let dispatchOff = spec.dispatchIndirectOffset || 0;
+    let dispatchClamped = false;
+    const hasClampCap = Boolean(spec.clampExecutor || spec.device);
+
+    if (indirectDispatch) {
+      if (
+        spec.clampDispatch !== false &&
+        hasClampCap &&
+        (spec.clampComputePass || (encoder && typeof encoder.beginComputePass === 'function'))
+      ) {
+        const co = _meshClampOptsScratch;
+        co.device = spec.device || null;
+        co.clampExecutor = spec.clampExecutor || null;
+        co.srcBuffer = dispatchBuf;
+        co.srcOffset = dispatchOff;
+        co.dstBuffer = spec.clampedDispatchBuffer || null;
+        co.dstOffset = spec.clampedDispatchOffset || 0;
+        co.countBuffer = spec.dispatchCountBuffer || null;
+        co.countOffset = spec.dispatchCountOffset || 0;
+        co.commandCount = 1;
+        co.stride = DISPATCH_INDIRECT_BYTES;
+        co.maxVertexCount = undefined;
+        co.maxIndexCount = undefined;
+        co.maxInstanceCount = undefined;
+        co.maxWorkgroupsX = spec.maxWorkgroupsX;
+        co.maxWorkgroupsY = spec.maxWorkgroupsY;
+        co.maxWorkgroupsZ = spec.maxWorkgroupsZ;
+        co.indirectFirstInstance = undefined;
+        const clampRes = encodeClampedIndirectPass(
+          spec.clampComputePass || encoder,
+          INDIRECT_CLAMP_KIND.DISPATCH,
+          co,
+          _meshClampScratch
+        );
+        if (!clampRes.ok) {
+          return writeMeshOrchestrationResult(
+            outTarget,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            indexed,
+            0,
+            null,
+            0,
+            clampRes.reason || 'DISPATCH_CLAMP_FAILED'
+          );
+        }
+        dispatchBuf = clampRes.dstBuffer;
+        dispatchOff = clampRes.dstOffset;
+        dispatchClamped = clampRes.encoded;
+      } else if (
+        fastCheckIndirectRange(dispatchBuf, dispatchOff, DISPATCH_INDIRECT_BYTES, undefined) !==
+        RANGE_OK
+      ) {
+        recordRangeRejection(
+          fastCheckIndirectRange(dispatchBuf, dispatchOff, DISPATCH_INDIRECT_BYTES, undefined),
+          null,
+          1,
+          true
+        );
+        return writeMeshOrchestrationResult(
+          outTarget,
+          false,
+          false,
+          false,
+          true,
+          false,
+          false,
+          indexed,
+          0,
+          null,
+          0,
+          'INVALID_DISPATCH_BUFFER'
+        );
+      }
+    }
+
+    // 2. Mesh compute pass: run lowered mesh shader writing output geometry + draw-indirect args.
+    const ownedComputePass = !spec.computePass;
+    const computePass =
+      spec.computePass ||
+      (encoder && typeof encoder.beginComputePass === 'function'
+        ? encoder.beginComputePass(spec.computePassDescriptor)
+        : null);
+    if (!computePass || typeof computePass.setPipeline !== 'function') {
+      recordBoundsRejection(null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        false,
+        false,
+        false,
+        indirectDispatch,
+        dispatchClamped,
+        false,
+        indexed,
+        0,
+        null,
+        0,
+        'INVALID_COMPUTE_PASS'
+      );
+    }
+
+    computePass.setPipeline(spec.meshPipeline);
+    if (Array.isArray(spec.meshBindGroups)) {
+      for (let i = 0; i < spec.meshBindGroups.length; i += 1) {
+        const bg = spec.meshBindGroups[i];
+        if (!bg) continue;
+        const groupIdx = Number.isInteger(bg.groupIndex) ? bg.groupIndex : i;
+        const handle = bg.bindGroup !== undefined ? bg.bindGroup : bg;
+        if (bg.dynamicOffsets) {
+          computePass.setBindGroup(groupIdx, handle, bg.dynamicOffsets);
+        } else {
+          computePass.setBindGroup(groupIdx, handle);
+        }
+      }
+    }
+    if (indirectDispatch) {
+      computePass.dispatchWorkgroupsIndirect(dispatchBuf, dispatchOff);
+      recordStat('meshIndirectDispatches', 1, null);
+      recordEncodedKind(INDIRECT_KIND.DISPATCH, 1, null);
+    } else {
+      computePass.dispatchWorkgroups(gx, gy, gz);
+    }
+    if (ownedComputePass && typeof computePass.end === 'function') {
+      computePass.end();
+    }
+
+    // 3. Optional GPU clamp of generated draw-indirect arguments.
+    let finalDrawBuf = rawDrawBuf;
+    let finalDrawOff = rawDrawOff;
+    let finalDrawStride = drawStride;
+    let drawClamped = false;
+    if (
+      spec.clampDrawIndirect !== false &&
+      hasClampCap &&
+      (spec.drawClampComputePass || (encoder && typeof encoder.beginComputePass === 'function'))
+    ) {
+      const co = _meshClampOptsScratch;
+      co.device = spec.device || null;
+      co.clampExecutor = spec.clampExecutor || null;
+      co.srcBuffer = rawDrawBuf;
+      co.srcOffset = rawDrawOff;
+      co.dstBuffer = spec.clampedDrawBuffer || null;
+      co.dstOffset = spec.clampedDrawOffset || 0;
+      co.countBuffer = spec.drawCountBuffer || null;
+      co.countOffset = spec.drawCountOffset || 0;
+      co.commandCount = drawCount;
+      co.stride = drawStride;
+      co.maxVertexCount = spec.maxVertexCount;
+      co.maxIndexCount = spec.maxIndexCount;
+      co.maxInstanceCount = spec.maxInstanceCount;
+      co.maxWorkgroupsX = undefined;
+      co.maxWorkgroupsY = undefined;
+      co.maxWorkgroupsZ = undefined;
+      co.indirectFirstInstance = spec.indirectFirstInstance;
+      const drawClampRes = encodeClampedIndirectPass(
+        spec.drawClampComputePass || encoder,
+        indexed ? INDIRECT_CLAMP_KIND.DRAW_INDEXED : INDIRECT_CLAMP_KIND.DRAW,
+        co,
+        _meshClampScratch
+      );
+      if (!drawClampRes.ok) {
+        return writeMeshOrchestrationResult(
+          outTarget,
+          false,
+          false,
+          false,
+          indirectDispatch,
+          dispatchClamped,
+          false,
+          indexed,
+          0,
+          null,
+          0,
+          drawClampRes.reason || 'DRAW_CLAMP_FAILED'
+        );
+      }
+      finalDrawBuf = drawClampRes.dstBuffer;
+      finalDrawOff = drawClampRes.dstOffset;
+      finalDrawStride = drawClampRes.stride;
+      drawClamped = drawClampRes.encoded;
+    }
+
+    // 4. Render pass: bind generated mesh output buffers + pipeline and issue drawIndirect/drawIndexedIndirect.
+    const ownedRenderPass = !spec.renderPass;
+    const renderPass =
+      spec.renderPass ||
+      (encoder && typeof encoder.beginRenderPass === 'function'
+        ? encoder.beginRenderPass(spec.renderPassDescriptor)
+        : null);
+    if (!renderPass || typeof renderPass.setPipeline !== 'function') {
+      recordBoundsRejection(null);
+      return writeMeshOrchestrationResult(
+        outTarget,
+        false,
+        false,
+        false,
+        indirectDispatch,
+        dispatchClamped,
+        drawClamped,
+        indexed,
+        0,
+        finalDrawBuf,
+        finalDrawOff,
+        'INVALID_RENDER_PASS'
+      );
+    }
+
+    renderPass.setPipeline(spec.renderPipeline);
+    if (Array.isArray(spec.renderBindGroups)) {
+      for (let i = 0; i < spec.renderBindGroups.length; i += 1) {
+        const bg = spec.renderBindGroups[i];
+        if (!bg) continue;
+        const groupIdx = Number.isInteger(bg.groupIndex) ? bg.groupIndex : i;
+        const handle = bg.bindGroup !== undefined ? bg.bindGroup : bg;
+        if (bg.dynamicOffsets) {
+          renderPass.setBindGroup(groupIdx, handle, bg.dynamicOffsets);
+        } else {
+          renderPass.setBindGroup(groupIdx, handle);
+        }
+      }
+    }
+    if (Array.isArray(spec.vertexBuffers)) {
+      for (let i = 0; i < spec.vertexBuffers.length; i += 1) {
+        const vb = spec.vertexBuffers[i];
+        if (!vb) continue;
+        const slot = Number.isInteger(vb.slot) ? vb.slot : i;
+        const buf = vb.buffer !== undefined ? vb.buffer : vb;
+        const off = vb.offset || 0;
+        if (vb.size !== undefined && vb.size !== null) {
+          renderPass.setVertexBuffer(slot, buf, off, vb.size);
+        } else {
+          renderPass.setVertexBuffer(slot, buf, off);
+        }
+      }
+    }
+    if (indexed && spec.indexBuffer) {
+      const ib = spec.indexBuffer;
+      const ibBuf = ib.buffer !== undefined ? ib.buffer : ib;
+      const ibFmt = ib.format || ib.indexFormat || 'uint32';
+      const ibOff = ib.offset || 0;
+      if (ib.size !== undefined && ib.size !== null) {
+        renderPass.setIndexBuffer(ibBuf, ibFmt, ibOff, ib.size);
+      } else {
+        renderPass.setIndexBuffer(ibBuf, ibFmt, ibOff);
+      }
+    }
+
+    let drawsIssued = 0;
+    let drawOk = true;
+    let drawReason = null;
+    if (drawCount === 1) {
+      const dr = dispatchIndirectSingle(
+        renderPass,
+        indexed ? INDIRECT_KIND.DRAW_INDEXED : INDIRECT_KIND.DRAW,
+        finalDrawBuf,
+        finalDrawOff,
+        null,
+        _meshDrawBatchScratch
+      );
+      drawOk = dr.ok;
+      drawsIssued = dr.executed;
+      drawReason = dr.reason;
+    } else {
+      const br = dispatchIndirectBatch(
+        renderPass,
+        finalDrawBuf,
+        {
+          indexed,
+          count: drawCount,
+          baseOffset: finalDrawOff,
+          stride: finalDrawStride,
+          useNative: Boolean(spec.useNativeMultiDraw),
+        },
+        _meshDrawBatchScratch
+      );
+      drawOk = br.ok;
+      drawsIssued = br.dispatched;
+      drawReason = br.reason;
+    }
+
+    if (ownedRenderPass && typeof renderPass.end === 'function') {
+      renderPass.end();
+    }
+
+    if (drawOk && drawsIssued > 0) {
+      recordStat('meshOrchestrationsEncoded', 1, null);
+    }
+
+    return writeMeshOrchestrationResult(
+      outTarget,
+      drawOk,
+      drawOk && drawsIssued > 0,
+      false,
+      indirectDispatch,
+      dispatchClamped,
+      drawClamped,
+      indexed,
+      drawsIssued,
+      finalDrawBuf,
+      finalDrawOff,
+      drawReason
+    );
+  }
+
   const exportedApi = Object.freeze({
     U32_MAX,
     INDIRECT_OFFSET_ALIGNMENT,
     DEFAULT_MAX_COMPUTE_WORKGROUPS_PER_DIMENSION,
     DEFAULT_MAX_INDIRECT_BATCH_COUNT,
+    DEFAULT_CLAMP_WORKGROUP_SIZE,
+    CLAMP_PARAMS_UNIFORM_BYTES,
+    CLAMP_PARAMS_SLOT_STRIDE,
+    DISPATCH_MESH_CLAMP_OUTPUT_BYTES,
     DRAW_INDIRECT_BYTES,
     DRAW_INDEXED_INDIRECT_BYTES,
     DISPATCH_INDIRECT_BYTES,
     BUFFER_USAGE,
     INDIRECT_KIND,
+    INDIRECT_CLAMP_KIND,
     DRAW_INDIRECT_LAYOUT,
     DRAW_INDEXED_INDIRECT_LAYOUT,
     DISPATCH_INDIRECT_LAYOUT,
@@ -4136,6 +6024,14 @@
     recordByteSize,
     wgslStructSource,
     wgslArrayStride,
+    deviceSupportsIndirectFirstInstance,
+    resolveMaxComputeWorkgroups,
+    generateIndirectClampWgsl,
+    getOrCreateIndirectClampPipeline,
+    encodeClampedIndirectPass,
+    encodeMeshComputeThenDraw,
+    GpuIndirectClampPass,
+    IndirectClampExecutor: GpuIndirectClampPass,
     normalizeRecord,
     encodeRecord,
     decodeRecord,

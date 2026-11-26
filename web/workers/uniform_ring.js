@@ -459,6 +459,8 @@
         maxRingBytes,
         multiSlice,
         preserveBuffersOnGrow,
+        autoRollover,
+        rolloverOnOverflow,
         allowWrap = false,
         wrapOnOverflow = false,
         immediateFlush = false,
@@ -527,7 +529,11 @@
           ? Boolean(multiSlice)
           : preserveBuffersOnGrow !== undefined
             ? Boolean(preserveBuffersOnGrow)
-            : false;
+            : autoRollover !== undefined
+              ? Boolean(autoRollover)
+              : rolloverOnOverflow !== undefined
+                ? Boolean(rolloverOnOverflow)
+                : false;
 
       if (hasExplicitMaxRingBytes) {
         assertPositiveInteger(maxRingBytes, 'maxRingBytes');
@@ -691,6 +697,12 @@
         { start: 0, end: 0, writeCount: 0 },
         { start: 0, end: 0, writeCount: 0 },
       ];
+      this._retiredSlicePool = [];
+      this._tmpOverflowAlloc = {
+        chunk: null,
+        dynamicOffset: 0,
+        createdNewPage: false,
+      };
       this._slots = [];
       this._destroyed = false;
 
@@ -738,6 +750,11 @@
       this._sabCopyCount = 0;
       this._unalignedCopyCount = 0;
       this._wrapCount = 0;
+      this._rolloverCount = 0;
+      this._sliceRolloverCount = 0;
+      this._spillRolloverCount = 0;
+      this._maxSlicesPerFrame = 0;
+      this._alignmentViolationsRejected = 0;
 
       for (let i = 0; i < resolvedFramesInFlight; i += 1) {
         const buffer = this._createSlotBuffer(i, resolvedByteSize);
@@ -1048,8 +1065,20 @@
         for (let i = 0; i < slot.retiredSlices.length; i += 1) {
           const slice = slot.retiredSlices[i];
           this._destroyRawBuffer(slice.buffer, slice.byteSize);
+          if (slice.dirtyRanges && slice.dirtyRanges.length > 0) {
+            releaseDirtyRanges(slice.dirtyRanges, this._dirtyRangePool);
+          }
           slice.buffer = null;
           slice.shadow = null;
+          slice.byteSize = 0;
+          slice.cursor = 0;
+          slice.flushedCursor = 0;
+          slice.drawCount = 0;
+          slice.flushedDrawCount = 0;
+          slice.dirty = false;
+          if (this._retiredSlicePool.length < MAX_DIRTY_RANGE_POOL_SIZE) {
+            this._retiredSlicePool.push(slice);
+          }
         }
         slot.retiredSlices.length = 0;
       }
@@ -1057,8 +1086,14 @@
         for (let i = 0; i < slot.overflowChunks.length; i += 1) {
           const chunk = slot.overflowChunks[i];
           this._destroyRawBuffer(chunk.buffer, chunk.byteSize);
+          if (chunk.dirtyRanges && chunk.dirtyRanges.length > 0) {
+            releaseDirtyRanges(chunk.dirtyRanges, this._dirtyRangePool);
+          }
           chunk.buffer = null;
           chunk.shadow = null;
+          chunk.shadowU32 = null;
+          chunk.shadowI32 = null;
+          chunk.shadowF32 = null;
         }
         slot.overflowChunks.length = 0;
       }
@@ -1252,17 +1287,36 @@
       }
 
       const sliceDirty = this._dirtyRanges.length > 0;
-      slot.retiredSlices.push({
-        buffer: slot.buffer,
-        byteSize: slot.byteSize,
-        shadow: sliceDirty ? this._shadow : null,
-        dirtyRanges: sliceDirty ? this._dirtyRanges : [],
-        cursor: this._cursor,
-        flushedCursor: this._flushedCursor,
-        drawCount: this._primaryFrameDrawCount,
-        flushedDrawCount: this._flushedDrawCount,
-        dirty: sliceDirty,
-      });
+      let retiredEntry;
+      let nextDirtyRanges;
+      if (this._retiredSlicePool.length > 0) {
+        retiredEntry = this._retiredSlicePool.pop();
+        nextDirtyRanges = retiredEntry.dirtyRanges || [];
+        nextDirtyRanges.length = 0;
+      } else {
+        retiredEntry = {
+          buffer: null,
+          byteSize: 0,
+          shadow: null,
+          dirtyRanges: null,
+          cursor: 0,
+          flushedCursor: 0,
+          drawCount: 0,
+          flushedDrawCount: 0,
+          dirty: false,
+        };
+        nextDirtyRanges = [];
+      }
+      retiredEntry.buffer = slot.buffer;
+      retiredEntry.byteSize = slot.byteSize;
+      retiredEntry.shadow = sliceDirty ? this._shadow : null;
+      retiredEntry.dirtyRanges = sliceDirty ? this._dirtyRanges : nextDirtyRanges;
+      retiredEntry.cursor = this._cursor;
+      retiredEntry.flushedCursor = this._flushedCursor;
+      retiredEntry.drawCount = this._primaryFrameDrawCount;
+      retiredEntry.flushedDrawCount = this._flushedDrawCount;
+      retiredEntry.dirty = sliceDirty;
+      slot.retiredSlices.push(retiredEntry);
 
       this._frameSliceBytes += this._framePrimaryBytes;
       this._activeSliceIndex += 1;
@@ -1276,7 +1330,8 @@
       slot.generation += 1;
 
       this._setShadowBuffer(new Uint8Array(nextSliceSize));
-      this._dirtyRanges = [];
+      this._dirtyRanges = sliceDirty ? nextDirtyRanges : this._dirtyRanges;
+      this._dirtyRanges.length = 0;
       this._cursor = 0;
       this._writtenHighWater = 0;
       this._framePrimaryBytes = 0;
@@ -1300,7 +1355,20 @@
 
       this._growCount += 1;
       this._overflowAllocCount += 1;
+      this._rolloverCount += 1;
+      this._sliceRolloverCount += 1;
+      this._updateMaxSlicesPerFrame(slot);
       return true;
+    }
+
+    _updateMaxSlicesPerFrame(slot) {
+      if (!slot) {
+        return;
+      }
+      const totalSlices = 1 + slot.retiredSlices.length + slot.overflowChunks.length;
+      if (totalSlices > this._maxSlicesPerFrame) {
+        this._maxSlicesPerFrame = totalSlices;
+      }
     }
 
     _allocateOverflowSlice(slot, alignedSize) {
@@ -1337,10 +1405,21 @@
           `playgta6-uniform-ring-slot-${slot.index}-overflow-${chunkIndex}`,
           chunkByteSize
         );
+        const chunkShadow = new Uint8Array(chunkByteSize);
+        const aligned4Shadow = (chunkByteSize & 3) === 0;
         chunk = {
           buffer,
           byteSize: chunkByteSize,
-          shadow: new Uint8Array(chunkByteSize),
+          shadow: chunkShadow,
+          shadowU32: aligned4Shadow
+            ? new Uint32Array(chunkShadow.buffer, chunkShadow.byteOffset, chunkByteSize >>> 2)
+            : null,
+          shadowI32: aligned4Shadow
+            ? new Int32Array(chunkShadow.buffer, chunkShadow.byteOffset, chunkByteSize >>> 2)
+            : null,
+          shadowF32: aligned4Shadow
+            ? new Float32Array(chunkShadow.buffer, chunkShadow.byteOffset, chunkByteSize >>> 2)
+            : null,
           dirtyRanges: [],
           cursor: 0,
           flushedCursor: 0,
@@ -1351,11 +1430,18 @@
         slot.overflowChunks.push(chunk);
         this._overflowAllocCount += 1;
         this._spillPagesCreated += 1;
+        this._rolloverCount += 1;
+        this._spillRolloverCount += 1;
+        this._updateMaxSlicesPerFrame(slot);
         createdNewPage = true;
       }
 
       const dynamicOffset = alignUp(chunk.cursor, this.alignment);
-      return { chunk, dynamicOffset, createdNewPage };
+      const out = this._tmpOverflowAlloc;
+      out.chunk = chunk;
+      out.dynamicOffset = dynamicOffset;
+      out.createdNewPage = createdNewPage;
+      return out;
     }
 
     _safeWriteBuffer(buffer, bufferOffset, data) {
@@ -1363,6 +1449,16 @@
         throw new TypeError(
           'DynamicUniformRing.flush() requires device.queue.writeBuffer()'
         );
+      }
+      // Zero-allocation fast path for internal regular ArrayBuffer 4-byte-aligned shadow slices.
+      if (
+        data instanceof Uint8Array &&
+        !isSharedArrayBuffer(data.buffer) &&
+        (data.byteOffset & 3) === 0 &&
+        (data.byteLength & 3) === 0
+      ) {
+        this.device.queue.writeBuffer(buffer, bufferOffset, data);
+        return data.byteLength;
       }
       const prepared = copyForWriteBuffer(data);
       if (prepared.copiedFromSab) {
@@ -1868,7 +1964,15 @@
         wastedBytes = (dynamicOffset - prevChunkCursor) + (alignedSize - size);
 
         if (hasData) {
-          copySourceToShadow(chunk.shadow, null, null, null, data, size, dynamicOffset);
+          copySourceToShadow(
+            chunk.shadow,
+            chunk.shadowU32,
+            chunk.shadowI32,
+            chunk.shadowF32,
+            data,
+            size,
+            dynamicOffset
+          );
           if (alignedSize > size) {
             chunk.shadow.fill(0, dynamicOffset + size, chunkEndOffset);
           }
@@ -1880,7 +1984,8 @@
           dynamicOffset,
           chunkEndOffset,
           1,
-          this.maxCoalesceGapBytes
+          this.maxCoalesceGapBytes,
+          this._dirtyRangePool
         );
         chunk.cursor = chunkEndOffset;
         chunk.drawCount += 1;
@@ -1912,6 +2017,9 @@
       this._dirty = true;
       this._frameDrawCount += 1;
       this._totalDrawCount += 1;
+      if (this._maxSlicesPerFrame < 1) {
+        this._maxSlicesPerFrame = 1;
+      }
       if (createdNewBuffer) {
         this._freshAllocations += 1;
       } else {
@@ -2212,6 +2320,7 @@
         ? WEBGPU_BUFFER_COPY_ALIGNMENT
         : this.alignment;
       if (offset % requiredOffsetAlign !== 0) {
+        this._alignmentViolationsRejected += 1;
         throw new RangeError(
           `writeStaged offset (${offset}) must be aligned to ${requiredOffsetAlign} bytes`
         );
@@ -2375,7 +2484,7 @@
       return this._pushConstantsWithFlags(data, true, allowWrap, false, out);
     }
 
-    _flushDirtyInternal() {
+    _flushDirtyInternal(out = null) {
       this._assertNotDestroyed();
 
       const slot = this._slots[this._slotIndex];
@@ -2398,6 +2507,16 @@
       }
 
       if (!this._dirty || (!hasRetiredSlicesDirty && !hasPrimaryDirty && !hasOverflowDirty)) {
+        if (out) {
+          out.uploadedBytes = 0;
+          out.bytesUploaded = 0;
+          out.drawCount = 0;
+          out.stagedWrites = 0;
+          out.writeBufferCalls = 0;
+          out.coalescedWrites = 0;
+          out.dirtyRangesFlushed = 0;
+          return out;
+        }
         return {
           uploadedBytes: 0,
           bytesUploaded: 0,
@@ -2428,7 +2547,10 @@
         for (let rIdx = 0; rIdx < slice.dirtyRanges.length; rIdx += 1) {
           const range = slice.dirtyRanges[rIdx];
           const rangeBytes = range.end - range.start;
-          const sliceView = slice.shadow.subarray(range.start, range.end);
+          const sliceView =
+            range.start === 0 && range.end === slice.shadow.byteLength
+              ? slice.shadow
+              : slice.shadow.subarray(range.start, range.end);
 
           this._safeWriteBuffer(slice.buffer, range.start, sliceView);
 
@@ -2437,7 +2559,7 @@
           coalescedWrites += Math.max(0, range.writeCount - 1);
           uploadedBytes += rangeBytes;
         }
-        slice.dirtyRanges.length = 0;
+        releaseDirtyRanges(slice.dirtyRanges, this._dirtyRangePool);
         slice.flushedCursor = slice.cursor;
         slice.flushedDrawCount = slice.drawCount;
         slice.dirty = false;
@@ -2448,7 +2570,10 @@
         for (let rIdx = 0; rIdx < this._dirtyRanges.length; rIdx += 1) {
           const range = this._dirtyRanges[rIdx];
           const rangeBytes = range.end - range.start;
-          const shadowSlice = this._shadow.subarray(range.start, range.end);
+          const shadowSlice =
+            range.start === 0 && range.end === this._shadow.byteLength
+              ? this._shadow
+              : this._shadow.subarray(range.start, range.end);
 
           this._safeWriteBuffer(slot.buffer, range.start, shadowSlice);
 
@@ -2471,7 +2596,10 @@
         for (let rIdx = 0; rIdx < chunk.dirtyRanges.length; rIdx += 1) {
           const range = chunk.dirtyRanges[rIdx];
           const rangeBytes = range.end - range.start;
-          const chunkSlice = chunk.shadow.subarray(range.start, range.end);
+          const chunkSlice =
+            range.start === 0 && range.end === chunk.shadow.byteLength
+              ? chunk.shadow
+              : chunk.shadow.subarray(range.start, range.end);
 
           this._safeWriteBuffer(chunk.buffer, range.start, chunkSlice);
 
@@ -2480,7 +2608,7 @@
           coalescedWrites += Math.max(0, range.writeCount - 1);
           uploadedBytes += rangeBytes;
         }
-        chunk.dirtyRanges.length = 0;
+        releaseDirtyRanges(chunk.dirtyRanges, this._dirtyRangePool);
         chunk.flushedCursor = chunk.cursor;
         chunk.flushedDrawCount = chunk.drawCount;
         chunk.dirty = false;
@@ -2492,6 +2620,17 @@
       this._writeBufferCalls += writeBufferCalls;
       this._coalescedWrites += coalescedWrites;
       this._stagedWritesFlushed += stagedWrites;
+
+      if (out) {
+        out.uploadedBytes = uploadedBytes;
+        out.bytesUploaded = uploadedBytes;
+        out.drawCount = stagedWrites;
+        out.stagedWrites = stagedWrites;
+        out.writeBufferCalls = writeBufferCalls;
+        out.coalescedWrites = coalescedWrites;
+        out.dirtyRangesFlushed = writeBufferCalls;
+        return out;
+      }
 
       return {
         uploadedBytes,
@@ -2510,10 +2649,14 @@
      * of regular `ArrayBuffer`-backed, 4-byte-aligned `device.queue.writeBuffer(...)` calls,
      * returning full coalescing telemetry for this flush.
      *
+     * Pass an optional preallocated `out` object to avoid per-flush heap allocation.
+     *
+     * @param {object} [out]
      * @returns {{ uploadedBytes: number, bytesUploaded: number, drawCount: number, stagedWrites: number, writeBufferCalls: number, coalescedWrites: number, dirtyRangesFlushed: number }}
      */
-    flushDirty() {
-      return this._flushDirtyInternal();
+    flushDirty(out) {
+      const target = validateOutTarget(out, 'flushDirty');
+      return this._flushDirtyInternal(target);
     }
 
     /**
@@ -2522,12 +2665,18 @@
      * `ArrayBuffer`-backed, 4-byte-aligned `device.queue.writeBuffer(...)` calls.
      *
      * Preserves the legacy `{ uploadedBytes, drawCount }` return contract for existing
-     * callers; call `flushDirty()` or `getStats()` for full coalescing stats.
+     * callers; pass an optional preallocated `out` object for zero-allocation hot-loop flushes.
      *
+     * @param {object} [out]
      * @returns {{ uploadedBytes: number, drawCount: number }}
      */
-    flush() {
-      const res = this._flushDirtyInternal();
+    flush(out) {
+      const target = validateOutTarget(out, 'flush');
+      if (target) {
+        const res = this._flushDirtyInternal(target);
+        return res;
+      }
+      const res = this._flushDirtyInternal(null);
       return {
         uploadedBytes: res.uploadedBytes,
         drawCount: res.drawCount,
@@ -2864,12 +3013,15 @@
 
     /**
      * Build a WebGPU `GPUBindGroupEntry` directly for a `pushConstants()` / `pushCbv()`
-     * allocation (works transparently for both primary ring slots and overflow buffers).
+     * allocation (works transparently for primary ring slots, rolled-over slices, and
+     * spill pages). Pass an optional preallocated `out` object (`{ binding, resource: {} }`)
+     * to avoid per-draw heap allocation.
      *
      * @param {number} binding
      * @param {{ buffer: GPUBuffer, size?: number, paddedSize?: number }} allocation
+     * @param {object} [out]
      */
-    createBindGroupEntryForAllocation(binding, allocation) {
+    createBindGroupEntryForAllocation(binding, allocation, out) {
       this._assertNotDestroyed();
       assertNonNegativeInteger(binding, 'binding');
       if (!allocation || typeof allocation !== 'object' || !allocation.buffer) {
@@ -2885,9 +3037,26 @@
             : 0;
       const resolvedSize = this.normalizeSliceSize(rawSize);
       if (resolvedSize > this.maxBindingSize) {
+        this._alignmentViolationsRejected += 1;
         throw new RangeError(
           `Allocation binding size (${resolvedSize}) exceeds maxBindingSize (${this.maxBindingSize})`
         );
+      }
+      const target = validateOutTarget(out, 'createBindGroupEntryForAllocation');
+      if (target) {
+        target.binding = binding;
+        if (!target.resource || typeof target.resource !== 'object') {
+          target.resource = {
+            buffer: allocation.buffer,
+            offset: 0,
+            size: resolvedSize,
+          };
+        } else {
+          target.resource.buffer = allocation.buffer;
+          target.resource.offset = 0;
+          target.resource.size = resolvedSize;
+        }
+        return target;
       }
       return {
         binding,
@@ -2900,7 +3069,54 @@
     }
 
     /**
-     * Return ring configuration, usage, alignment, VRAM shrink, SAB copy, and overflow diagnostics.
+     * Return a diagnostic snapshot of all live uniform buffer slices active in the current
+     * frame (retired multi-slices + current primary slice + spill pages) in allocation order.
+     */
+    getActiveFrameSlices() {
+      this._assertNotDestroyed();
+      const slot = this._slots[this._slotIndex];
+      if (!slot) {
+        return [];
+      }
+      const slices = [];
+      for (let i = 0; i < slot.retiredSlices.length; i += 1) {
+        const s = slot.retiredSlices[i];
+        slices.push({
+          sliceIndex: i,
+          kind: 'retired',
+          buffer: s.buffer,
+          byteSize: s.byteSize,
+          usedBytes: s.cursor,
+          drawCount: s.drawCount,
+          dirty: s.dirty,
+        });
+      }
+      slices.push({
+        sliceIndex: this._activeSliceIndex,
+        kind: 'primary',
+        buffer: slot.buffer,
+        byteSize: slot.byteSize,
+        usedBytes: this._cursor,
+        drawCount: this._primaryFrameDrawCount,
+        dirty: this._dirtyRanges.length > 0,
+      });
+      for (let i = 0; i < slot.overflowChunks.length; i += 1) {
+        const c = slot.overflowChunks[i];
+        slices.push({
+          sliceIndex: this._activeSliceIndex + 1 + i,
+          kind: 'spill',
+          buffer: c.buffer,
+          byteSize: c.byteSize,
+          usedBytes: c.cursor,
+          drawCount: c.drawCount,
+          dirty: c.dirty,
+        });
+      }
+      return slices;
+    }
+
+    /**
+     * Return ring configuration, usage, alignment, VRAM shrink, SAB copy, rollover, and overflow diagnostics.
      */
     getStats() {
       const activeSlot =
@@ -2908,6 +3124,9 @@
           ? this._slots[this._slotIndex]
           : null;
       const peakVramBytes = Math.max(this._allocatedGpuBytes, this._peakAllocatedGpuBytes);
+      const activeFrameSliceCount = activeSlot
+        ? 1 + activeSlot.retiredSlices.length + activeSlot.overflowChunks.length
+        : 0;
       return {
         frameIndex: this._frameIndex,
         slotIndex: this._slotIndex,
@@ -2969,6 +3188,13 @@
         spillPagesCreated: this._spillPagesCreated,
         liveSpillPages: this._destroyed ? 0 : this._countLiveSpillPages(),
         liveSpillBytes: this._destroyed ? 0 : this._countLiveSpillBytes(),
+        rolloverCount: this._rolloverCount,
+        sliceRolloverCount: this._sliceRolloverCount,
+        spillRolloverCount: this._spillRolloverCount,
+        activeSliceIndex: this._destroyed ? 0 : this._activeSliceIndex,
+        activeFrameSliceCount,
+        maxSlicesPerFrame: this._maxSlicesPerFrame,
+        alignmentViolationsRejected: this._alignmentViolationsRejected,
         sabCopyCount: this._sabCopyCount,
         unalignedCopyCount: this._unalignedCopyCount,
         wrapCount: this._wrapCount,
@@ -2986,6 +3212,10 @@
     resetStats() {
       const currentUsed =
         this._frameSliceBytes + this._framePrimaryBytes + this._frameOverflowBytes;
+      const activeSlot =
+        !this._destroyed && this._slots.length > 0
+          ? this._slots[this._slotIndex]
+          : null;
       this._peakAllocatedGpuBytes = this._allocatedGpuBytes;
       this._peakUsedBytes = currentUsed;
       this._peakFrameBytes = currentUsed;
@@ -3006,6 +3236,14 @@
       this._overflowAllocCount = 0;
       this._spillAllocations = 0;
       this._spillPagesCreated = 0;
+      this._rolloverCount = 0;
+      this._sliceRolloverCount = 0;
+      this._spillRolloverCount = 0;
+      this._maxSlicesPerFrame =
+        activeSlot && currentUsed > 0
+          ? 1 + activeSlot.retiredSlices.length + activeSlot.overflowChunks.length
+          : 0;
+      this._alignmentViolationsRejected = 0;
       this._sabCopyCount = 0;
       this._unalignedCopyCount = 0;
       this._wrapCount = 0;
@@ -3038,6 +3276,8 @@
       this._setShadowBuffer(null);
       this._dirtyRanges = [];
       this._dirtyRangePool = [];
+      this._retiredSlicePool = [];
+      this._tmpOverflowAlloc.chunk = null;
       this._allocatedGpuBytes = 0;
       this._frameEnded = false;
       this._cursor = 0;
