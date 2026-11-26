@@ -2670,7 +2670,8 @@ test('W90: live app_bootstrap -> HudController -> index.html HUD DOM updates Fra
   assert.equal(dom.metricFramesEl.textContent, '31');
   assert.equal(dom.metricFpsEl.textContent, '60');
   assert.equal(dom.pillFpsEl.textContent, '60 fps');
-  assert.equal(dom.bootStageEl.textContent, 'FIRST_PRESENT');
+  // W376: HudController now recognizes FIRST_VISIBLE_FRAME from app.bootTracer (must not revert to BOOTING).
+  assert.equal(dom.bootStageEl.textContent, 'FIRST_VISIBLE_FRAME');
 
   // 5. Real-pack-only draws + frame-presented up to 1,217 frames (Live Chrome Test #31 scenario).
   // 250ms elapsed before PerfMonitor tick + 750ms here = 1000ms since frame 31 (+60 frames -> 60 FPS).
@@ -2697,7 +2698,7 @@ test('W90: live app_bootstrap -> HudController -> index.html HUD DOM updates Fra
   assert.equal(dom.metricFramesEl.textContent, '1217');
   assert.equal(dom.metricFpsEl.textContent, '60');
   assert.equal(dom.pillFpsEl.textContent, '60 fps');
-  assert.equal(dom.bootStageEl.textContent, 'FIRST_PRESENT');
+  assert.equal(dom.bootStageEl.textContent, 'FIRST_VISIBLE_FRAME');
   assert.equal(mockWindow.__playgta6.getDiagnosticsSnapshot().framesPresented, 1217);
   assert.equal(mockWindow.__playgta6BootState.presentCount, 1217);
 

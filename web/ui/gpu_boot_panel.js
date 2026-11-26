@@ -71,7 +71,33 @@
     'FIRST_PRESENT',
   ]);
 
+  /** Post-present M4 boot milestones (mirrors BootTracer OPTIONAL + FAST_BOOT_MILESTONES). */
+  const POST_PRESENT_BOOT_STAGES = Object.freeze([
+    'FIRST_VISIBLE_FRAME',
+    'START_SCREEN',
+    'INTRO_VIDEO',
+    'MAIN_MENU',
+    'IN_GAME',
+  ]);
+
+  /** Complete ordered list of core and post-present M4 boot milestones. */
+  const ALL_BOOT_STAGE_ORDER = Object.freeze([...BOOT_STAGE_ORDER, ...POST_PRESENT_BOOT_STAGES]);
+
   const BOOT_STAGE_SET = new Set(BOOT_STAGE_ORDER);
+  const POST_PRESENT_STAGE_SET = new Set(POST_PRESENT_BOOT_STAGES);
+  const ALL_BOOT_STAGE_SET = new Set(ALL_BOOT_STAGE_ORDER);
+
+  const PLAYABILITY_STATE = Object.freeze({
+    BOOTING: 'BOOTING',
+    FIRST_PRESENT: 'FIRST_PRESENT',
+    START_SCREEN: 'START_SCREEN',
+    INTRO_VIDEO: 'INTRO_VIDEO',
+    MAIN_MENU: 'MAIN_MENU',
+    IN_GAME: 'IN_GAME',
+  });
+
+  const ALLOWED_AUDIO_OUTPUT_STATES = Object.freeze(['active', 'suspended', 'headless-drain']);
+  const ALLOWED_AUDIO_OUTPUT_STATE_SET = new Set(ALLOWED_AUDIO_OUTPUT_STATES);
 
   /** Canonical WGPK / ShaderFallbackRouter stage codes. */
   const STAGE_NAMES = Object.freeze({
@@ -280,7 +306,7 @@
       return STAGE_NOT_STARTED;
     }
     const upper = rawStage.trim().toUpperCase();
-    if (upper === STAGE_NOT_STARTED || BOOT_STAGE_SET.has(upper)) {
+    if (upper === STAGE_NOT_STARTED || ALL_BOOT_STAGE_SET.has(upper)) {
       return upper;
     }
     // Reject anything containing path separators, colons, dots, spaces, or query chars.
@@ -290,10 +316,22 @@
     return 'UNKNOWN';
   }
 
+  function resolvePlayabilityState(stage) {
+    if (stage === 'IN_GAME') return PLAYABILITY_STATE.IN_GAME;
+    if (stage === 'MAIN_MENU') return PLAYABILITY_STATE.MAIN_MENU;
+    if (stage === 'INTRO_VIDEO') return PLAYABILITY_STATE.INTRO_VIDEO;
+    if (stage === 'START_SCREEN') return PLAYABILITY_STATE.START_SCREEN;
+    if (stage === 'FIRST_VISIBLE_FRAME' || stage === 'FIRST_PRESENT') {
+      return PLAYABILITY_STATE.FIRST_PRESENT;
+    }
+    return PLAYABILITY_STATE.BOOTING;
+  }
+
   function normalizeBootSummary(raw) {
     if (!raw || typeof raw !== 'object') {
       return {
         stage: STAGE_NOT_STARTED,
+        playabilityState: PLAYABILITY_STATE.BOOTING,
         milestonesReached: 0,
         totalMilestones: BOOT_STAGE_ORDER.length,
         progressPct: 0,
@@ -303,6 +341,7 @@
 
     const stage = sanitizeBootStage(safeRead(raw, 'stage'));
     const stageIdx = BOOT_STAGE_ORDER.indexOf(stage);
+    const isPostPresent = POST_PRESENT_STAGE_SET.has(stage);
 
     const rawMilestones = safeRead(raw, 'milestones');
     const rawTotal = safeRead(raw, 'totalMilestones');
@@ -325,6 +364,8 @@
       milestonesReached = count;
     } else if (stageIdx >= 0) {
       milestonesReached = stageIdx + 1;
+    } else if (isPostPresent) {
+      milestonesReached = BOOT_STAGE_ORDER.length;
     } else {
       milestonesReached = 0;
     }
@@ -333,6 +374,8 @@
     let progressPct;
     if (rawProgress !== undefined && rawProgress !== null) {
       progressPct = Math.round(clampPct(rawProgress));
+    } else if (isPostPresent) {
+      progressPct = 100;
     } else if (stageIdx >= 0) {
       progressPct = Math.round(((stageIdx + 1) / BOOT_STAGE_ORDER.length) * 100);
     } else if (milestonesReached > 0 && totalMilestones > 0) {
@@ -344,10 +387,11 @@
     const readyForSplash =
       Boolean(safeRead(raw, 'readyForSplash')) ||
       stage === 'FIRST_PRESENT' ||
-      stage === 'FIRST_VISIBLE_FRAME';
+      isPostPresent;
 
     return {
       stage,
+      playabilityState: resolvePlayabilityState(stage),
       milestonesReached,
       totalMilestones,
       progressPct,
@@ -1388,15 +1432,141 @@
   }
 
   /**
-   * Format a positive integer I/O mailbox lane count (`>= 1`),
-   * returning `—` when absent or invalid.
+   * Sanitize a percentage value into `[0, 100]` (rounded to 1 decimal place),
+   * returning `null` for invalid, negative, non-finite, boolean, or hostile values.
    *
    * @param {unknown} value
+   * @param {boolean} [isUnitRatio=false]
+   * @returns {number|null}
+   */
+  function sanitizePercentage(value, isUnitRatio = false) {
+    const n = sanitizeNonNegativeNumber(value);
+    if (n === null) return null;
+    const scaled = isUnitRatio && n <= 1 ? n * 100 : n;
+    const clamped = Math.min(100, Math.max(0, scaled));
+    const rounded = Math.round(clamped * 10) / 10;
+    return rounded === 0 ? 0 : rounded;
+  }
+
+  /**
+   * Strictly allowlist an audio output state to `'active' | 'suspended' | 'headless-drain'`,
+   * returning `null` for missing, unknown, or hostile values.
+   *
+   * @param {unknown} value
+   * @returns {'active'|'suspended'|'headless-drain'|null}
+   */
+  function sanitizeAudioOutputState(value) {
+    if (typeof value !== 'string') return null;
+    const norm = value.trim().toLowerCase().replace(/_/g, '-');
+    if (!norm || norm.length > 32) return null;
+    if (norm === 'running' || norm === 'playing') return 'active';
+    if (norm === 'headless' || norm === 'drain' || norm === 'draining') return 'headless-drain';
+    if (norm === 'paused' || norm === 'closed' || norm === 'idle' || norm === 'muted') return 'suspended';
+    return ALLOWED_AUDIO_OUTPUT_STATE_SET.has(norm) ? norm : null;
+  }
+
+  function sanitizeBigIntOrNonNegativeInt(value, fallback = 0) {
+    if (typeof value === 'bigint') {
+      if (value < 0n) return fallback;
+      return value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value);
+    }
+    return sanitizeNonNegativeInt(value, fallback);
+  }
+
+  function formatAudioFrameCount(value) {
+    const n = sanitizeBigIntOrNonNegativeInt(value, null);
+    if (n === null) return PLACEHOLDER_DASH;
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 10_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  }
+
+  function formatOpfsBytes(bytes) {
+    const n = sanitizeBigIntOrNonNegativeInt(bytes, null);
+    if (n === null || n === 0) return PLACEHOLDER_DASH;
+    if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GiB`;
+    if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MiB`;
+    if (n >= 1024) return `${(n / 1024).toFixed(1)} KiB`;
+    return `${n} B`;
+  }
+
+  function formatOpfsHitRate(value) {
+    const pct = sanitizePercentage(value, false);
+    return pct === null ? PLACEHOLDER_DASH : `${pct.toFixed(1)}%`;
+  }
+
+  /**
+   * Format a positive integer I/O mailbox lane count (`>= 1`) and optional live
+   * active/peak concurrency metrics, returning `—` when absent or invalid.
+   * Backward-compatible: `formatMailboxLanes(8)` -> `'8'`;
+   * `formatMailboxLanes(8, { peakMailboxLanes: 8 })` -> `'8 lanes (peak 8)'`;
+   * `formatMailboxLanes({ mailboxLanes: 8, activeMailboxLanes: 6, peakMailboxLanes: 8 })` -> `'6/8 lanes (peak 8)'`.
+   *
+   * @param {unknown} value
+   * @param {object|null|undefined} [opts]
    * @returns {string}
    */
-  function formatMailboxLanes(value) {
-    const lanes = sanitizePositiveInt(value);
-    return lanes === null ? PLACEHOLDER_DASH : String(lanes);
+  function formatMailboxLanes(value, opts) {
+    let lanes = null;
+    let active = null;
+    let peak = null;
+
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      lanes = sanitizePositiveInt(
+        safeRead(value, 'mailboxLanes') !== undefined
+          ? safeRead(value, 'mailboxLanes')
+          : safeRead(value, 'lanes')
+      );
+      const rawActive =
+        safeRead(value, 'activeMailboxLanes') !== undefined
+          ? safeRead(value, 'activeMailboxLanes')
+          : safeRead(value, 'httpfsActiveConcurrency');
+      if (rawActive !== undefined && rawActive !== null) {
+        active = sanitizeNonNegativeInt(rawActive, null);
+      }
+      const rawPeak =
+        safeRead(value, 'peakMailboxLanes') !== undefined
+          ? safeRead(value, 'peakMailboxLanes')
+          : safeRead(value, 'httpfsPeakConcurrency');
+      if (rawPeak !== undefined && rawPeak !== null) {
+        peak = sanitizeNonNegativeInt(rawPeak, null);
+      }
+    } else {
+      lanes = sanitizePositiveInt(value);
+      if (opts && typeof opts === 'object') {
+        const rawActive =
+          safeRead(opts, 'activeMailboxLanes') !== undefined
+            ? safeRead(opts, 'activeMailboxLanes')
+            : safeRead(opts, 'httpfsActiveConcurrency');
+        if (rawActive !== undefined && rawActive !== null) {
+          active = sanitizeNonNegativeInt(rawActive, null);
+        }
+        const rawPeak =
+          safeRead(opts, 'peakMailboxLanes') !== undefined
+            ? safeRead(opts, 'peakMailboxLanes')
+            : safeRead(opts, 'httpfsPeakConcurrency');
+        if (rawPeak !== undefined && rawPeak !== null) {
+          peak = sanitizeNonNegativeInt(rawPeak, null);
+        }
+      }
+    }
+
+    if (lanes === null && active === null && peak === null) {
+      return PLACEHOLDER_DASH;
+    }
+    if (lanes !== null && active === null && peak === null) {
+      return String(lanes);
+    }
+    if (active !== null && lanes !== null) {
+      return peak !== null ? `${active}/${lanes} lanes (peak ${peak})` : `${active}/${lanes} lanes`;
+    }
+    if (lanes !== null && peak !== null) {
+      return `${lanes} lanes (peak ${peak})`;
+    }
+    if (peak !== null) {
+      return `peak ${peak}`;
+    }
+    return String(active);
   }
 
   function createDefaultPacingStats() {
@@ -1417,6 +1587,33 @@
   function createDefaultMailboxStats() {
     return {
       mailboxLanes: null,
+      activeMailboxLanes: null,
+      peakMailboxLanes: null,
+      rangeCacheHitRatePct: null,
+    };
+  }
+
+  function createDefaultAudioStats() {
+    return {
+      audioOutputState: null,
+      guestRingAttached: false,
+      guestFramesDrained: 0,
+      framesDrained: 0,
+      underruns: 0,
+      guestUnderruns: 0,
+      overruns: 0,
+    };
+  }
+
+  function createDefaultOpfsStats() {
+    return {
+      opfsHits: 0,
+      opfsMisses: 0,
+      opfsWrites: 0,
+      opfsInvalidations: 0,
+      bytesFromOpfs: 0,
+      bytesFromNetwork: 0,
+      opfsHitRatePct: null,
     };
   }
 
@@ -1615,16 +1812,14 @@
         : safeRead(source, 'boot');
     const bootObj = rawBoot && typeof rawBoot === 'object' ? rawBoot : null;
 
-    const picked = pickFirstDefinedWithSource(
-      [
-        { obj: source, explicitNull: true },
-        { obj: mailboxObj, explicitNull: true },
-        { obj: ioObj, explicitNull: true },
-        { obj: bootObj, explicitNull: false },
-      ],
-      ['mailboxLanes']
-    );
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: mailboxObj, explicitNull: true },
+      { obj: ioObj, explicitNull: true },
+      { obj: bootObj, explicitNull: false },
+    ];
 
+    const picked = pickFirstDefinedWithSource(sources, ['mailboxLanes', 'mailbox_lanes']);
     if (picked.found) {
       if (picked.value === null) {
         if (picked.explicitNull) {
@@ -1632,6 +1827,272 @@
         }
       } else {
         next.mailboxLanes = sanitizePositiveInt(picked.value);
+      }
+    }
+
+    const pickedActive = pickFirstDefinedWithSource(sources, [
+      'activeMailboxLanes',
+      'active_mailbox_lanes',
+      'httpfsActiveConcurrency',
+    ]);
+    if (pickedActive.found) {
+      if (pickedActive.value === null) {
+        if (pickedActive.explicitNull) {
+          next.activeMailboxLanes = null;
+        }
+      } else {
+        const parsed = sanitizeNonNegativeNumber(pickedActive.value);
+        next.activeMailboxLanes = parsed === null ? null : Math.floor(parsed);
+      }
+    }
+
+    const pickedPeak = pickFirstDefinedWithSource(sources, [
+      'peakMailboxLanes',
+      'peak_mailbox_lanes',
+      'httpfsPeakConcurrency',
+      'httpfs_peak_concurrency',
+    ]);
+    if (pickedPeak.found) {
+      if (pickedPeak.value === null) {
+        if (pickedPeak.explicitNull) {
+          next.peakMailboxLanes = null;
+        }
+      } else {
+        const parsed = sanitizeNonNegativeNumber(pickedPeak.value);
+        next.peakMailboxLanes = parsed === null ? null : Math.floor(parsed);
+      }
+    } else if (pickedActive.found && next.activeMailboxLanes !== null) {
+      next.peakMailboxLanes = Math.max(next.peakMailboxLanes ?? 0, next.activeMailboxLanes);
+    }
+
+    const pickedHitPct = pickFirstDefinedWithSource(sources, [
+      'rangeCacheHitRatePct',
+      'range_cache_hit_rate_pct',
+      'slabHitRatePct',
+      'slab_hit_rate_pct',
+    ]);
+    if (pickedHitPct.found) {
+      if (pickedHitPct.value === null) {
+        if (pickedHitPct.explicitNull) {
+          next.rangeCacheHitRatePct = null;
+        }
+      } else {
+        next.rangeCacheHitRatePct = sanitizePercentage(pickedHitPct.value, false);
+      }
+    } else {
+      const pickedHitRatio = pickFirstDefinedWithSource(sources, ['rangeCacheHitRate', 'slabHitRate']);
+      if (pickedHitRatio.found) {
+        if (pickedHitRatio.value === null) {
+          if (pickedHitRatio.explicitNull) {
+            next.rangeCacheHitRatePct = null;
+          }
+        } else {
+          next.rangeCacheHitRatePct = sanitizePercentage(pickedHitRatio.value, true);
+        }
+      }
+    }
+
+    return next;
+  }
+
+  function extractAudioStats(source, base) {
+    let next = base ? { ...base } : createDefaultAudioStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawAudio =
+      safeRead(source, 'audioStats') !== undefined
+        ? safeRead(source, 'audioStats')
+        : safeRead(source, 'audio');
+    if (rawAudio === null) {
+      next = createDefaultAudioStats();
+    }
+    const audioObj = rawAudio && typeof rawAudio === 'object' ? rawAudio : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: audioObj, explicitNull: true },
+    ];
+
+    const statePicked = pickFirstDefinedWithSource(sources, [
+      'audioOutputState',
+      'audio_output_state',
+    ]);
+    const nestedStatePicked = audioObj
+      ? pickFirstDefinedWithSource([{ obj: audioObj, explicitNull: true }], [
+          'outputState',
+          'output_state',
+        ])
+      : { found: false, value: undefined, explicitNull: false };
+    const effectiveState = statePicked.found ? statePicked : nestedStatePicked;
+    if (effectiveState.found) {
+      if (effectiveState.value === null) {
+        if (effectiveState.explicitNull) {
+          next.audioOutputState = null;
+        }
+      } else {
+        next.audioOutputState = sanitizeAudioOutputState(effectiveState.value);
+      }
+    }
+
+    const ringPicked = pickFirstDefinedWithSource(sources, [
+      'guestRingAttached',
+      'guest_ring_attached',
+      'ringAttached',
+    ]);
+    if (ringPicked.found) {
+      next.guestRingAttached = ringPicked.value === true;
+    }
+
+    const guestDrained = pickFirstDefinedWithSource(sources, [
+      'guestFramesDrained',
+      'guest_frames_drained',
+    ]);
+    if (guestDrained.found) {
+      next.guestFramesDrained = sanitizeBigIntOrNonNegativeInt(guestDrained.value, 0);
+    }
+
+    const drained = pickFirstDefinedWithSource(sources, [
+      'framesDrained',
+      'frames_drained',
+      'drainedFrames',
+    ]);
+    if (drained.found) {
+      next.framesDrained = sanitizeBigIntOrNonNegativeInt(drained.value, 0);
+    }
+
+    const underruns = pickFirstDefinedWithSource(sources, ['underruns', 'underrunCount']);
+    if (underruns.found) {
+      next.underruns = sanitizeBigIntOrNonNegativeInt(underruns.value, 0);
+    }
+
+    const guestUnderruns = pickFirstDefinedWithSource(sources, [
+      'guestUnderruns',
+      'guest_underruns',
+    ]);
+    if (guestUnderruns.found) {
+      next.guestUnderruns = sanitizeBigIntOrNonNegativeInt(guestUnderruns.value, 0);
+    }
+
+    const overruns = pickFirstDefinedWithSource(sources, ['overruns', 'overrunCount', 'overflows']);
+    if (overruns.found) {
+      next.overruns = sanitizeBigIntOrNonNegativeInt(overruns.value, 0);
+    }
+
+    return next;
+  }
+
+  function extractOpfsStats(source, base) {
+    let next = base ? { ...base } : createDefaultOpfsStats();
+    if (!source || typeof source !== 'object') {
+      return next;
+    }
+
+    const rawOpfs =
+      safeRead(source, 'opfsStats') !== undefined
+        ? safeRead(source, 'opfsStats')
+        : safeRead(source, 'opfsTelemetry') !== undefined
+          ? safeRead(source, 'opfsTelemetry')
+          : safeRead(source, 'preloadTelemetry') !== undefined
+            ? safeRead(source, 'preloadTelemetry')
+            : safeRead(source, 'opfs');
+    if (rawOpfs === null) {
+      next = createDefaultOpfsStats();
+    }
+    const opfsObj = rawOpfs && typeof rawOpfs === 'object' ? rawOpfs : null;
+
+    const rawIo =
+      safeRead(source, 'ioStats') !== undefined
+        ? safeRead(source, 'ioStats')
+        : safeRead(source, 'httpfsStats') !== undefined
+          ? safeRead(source, 'httpfsStats')
+          : safeRead(source, 'io');
+    const ioObj = rawIo && typeof rawIo === 'object' ? rawIo : null;
+
+    const sources = [
+      { obj: source, explicitNull: true },
+      { obj: opfsObj, explicitNull: true },
+      { obj: ioObj, explicitNull: false },
+    ];
+
+    let countsTouched = false;
+
+    const hits = pickFirstDefinedWithSource(sources, ['opfsHits', 'opfs_hits', 'opfsCacheHits']);
+    if (hits.found) {
+      next.opfsHits = sanitizeBigIntOrNonNegativeInt(hits.value, 0);
+      countsTouched = true;
+    }
+
+    const misses = pickFirstDefinedWithSource(sources, [
+      'opfsMisses',
+      'opfs_misses',
+      'opfsCacheMisses',
+    ]);
+    if (misses.found) {
+      next.opfsMisses = sanitizeBigIntOrNonNegativeInt(misses.value, 0);
+      countsTouched = true;
+    }
+
+    const writes = pickFirstDefinedWithSource(sources, ['opfsWrites', 'opfs_writes']);
+    if (writes.found) {
+      next.opfsWrites = sanitizeBigIntOrNonNegativeInt(writes.value, 0);
+    }
+
+    const invalidations = pickFirstDefinedWithSource(sources, [
+      'opfsInvalidations',
+      'opfs_invalidations',
+    ]);
+    if (invalidations.found) {
+      next.opfsInvalidations = sanitizeBigIntOrNonNegativeInt(invalidations.value, 0);
+    }
+
+    const bytesFromOpfs = pickFirstDefinedWithSource(sources, ['bytesFromOpfs', 'bytes_from_opfs']);
+    if (bytesFromOpfs.found) {
+      next.bytesFromOpfs = sanitizeBigIntOrNonNegativeInt(bytesFromOpfs.value, 0);
+      countsTouched = true;
+    }
+
+    const bytesFromNetwork = pickFirstDefinedWithSource(sources, [
+      'bytesFromNetwork',
+      'bytes_from_network',
+    ]);
+    if (bytesFromNetwork.found) {
+      next.bytesFromNetwork = sanitizeBigIntOrNonNegativeInt(bytesFromNetwork.value, 0);
+      countsTouched = true;
+    }
+
+    const explicitPct = pickFirstDefinedWithSource(sources, [
+      'opfsHitRatePct',
+      'opfs_hit_rate_pct',
+      'warmBootHitRatePct',
+    ]);
+    const explicitRatio = pickFirstDefinedWithSource(sources, ['opfsHitRate', 'opfs_hit_rate']);
+    if (explicitPct.found) {
+      if (explicitPct.value === null) {
+        if (explicitPct.explicitNull) {
+          next.opfsHitRatePct = null;
+        }
+      } else {
+        next.opfsHitRatePct = sanitizePercentage(explicitPct.value, false);
+      }
+    } else if (explicitRatio.found) {
+      if (explicitRatio.value === null) {
+        if (explicitRatio.explicitNull) {
+          next.opfsHitRatePct = null;
+        }
+      } else {
+        next.opfsHitRatePct = sanitizePercentage(explicitRatio.value, true);
+      }
+    } else if (countsTouched) {
+      const lookups = next.opfsHits + next.opfsMisses;
+      const totalBytes = next.bytesFromOpfs + next.bytesFromNetwork;
+      if (lookups > 0) {
+        next.opfsHitRatePct = Math.round((next.opfsHits / lookups) * 1000) / 10;
+      } else if (totalBytes > 0) {
+        next.opfsHitRatePct = Math.round((next.bytesFromOpfs / totalBytes) * 1000) / 10;
+      } else {
+        next.opfsHitRatePct = null;
       }
     }
 
@@ -1659,6 +2120,8 @@
     const pacingStats = extractPacingStats(source, null);
     const memoryStats = extractMemoryStats(source, null);
     const mailboxStats = extractMailboxStats(source, null);
+    const audioStats = extractAudioStats(source, null);
+    const opfsStats = extractOpfsStats(source, null);
 
     const parts = [
       `${boot.stage} (${boot.progressPct}%)`,
@@ -1685,7 +2148,34 @@
       parts.push(`bgHit=${formatRatioPct(memoryStats.bindGroupHitRate)}`);
     }
     if (mailboxStats.mailboxLanes !== null) {
-      parts.push(`mailboxLanes=${mailboxStats.mailboxLanes}`);
+      if (mailboxStats.activeMailboxLanes !== null && mailboxStats.peakMailboxLanes !== null) {
+        parts.push(
+          `mailboxLanes=${mailboxStats.activeMailboxLanes}/${mailboxStats.mailboxLanes}(peak=${mailboxStats.peakMailboxLanes})`
+        );
+      } else if (mailboxStats.peakMailboxLanes !== null) {
+        parts.push(`mailboxLanes=${mailboxStats.mailboxLanes}(peak=${mailboxStats.peakMailboxLanes})`);
+      } else {
+        parts.push(`mailboxLanes=${mailboxStats.mailboxLanes}`);
+      }
+    }
+    if (mailboxStats.rangeCacheHitRatePct !== null) {
+      parts.push(`ioCacheHit=${mailboxStats.rangeCacheHitRatePct.toFixed(1)}%`);
+    }
+    if (
+      audioStats.guestRingAttached ||
+      audioStats.guestFramesDrained > 0 ||
+      audioStats.framesDrained > 0 ||
+      audioStats.audioOutputState !== null
+    ) {
+      const drainedCount =
+        audioStats.guestFramesDrained > 0 ? audioStats.guestFramesDrained : audioStats.framesDrained;
+      const ringTag = audioStats.guestRingAttached ? 'attached' : audioStats.audioOutputState || 'detached';
+      parts.push(
+        drainedCount > 0 ? `audio=${ringTag}(${formatAudioFrameCount(drainedCount)})` : `audio=${ringTag}`
+      );
+    }
+    if (opfsStats.opfsHitRatePct !== null) {
+      parts.push(`opfsHit=${opfsStats.opfsHitRatePct.toFixed(1)}%`);
     }
 
     return parts.join(' | ');
@@ -1850,6 +2340,8 @@
     const pacingStats = extractPacingStats(source, null);
     const memoryStats = extractMemoryStats(source, null);
     const mailboxStats = extractMailboxStats(source, null);
+    const audioStats = extractAudioStats(source, null);
+    const opfsStats = extractOpfsStats(source, null);
 
     let exportedAtValue = safeRead(source, 'exportedAt');
     if (exportedAtValue === undefined) {
@@ -1884,6 +2376,7 @@
       exportedAt: formatIsoTimestamp(exportedAtValue),
       boot: {
         stage: boot.stage,
+        playabilityState: boot.playabilityState,
         milestonesReached: boot.milestonesReached,
         totalMilestones: boot.totalMilestones,
         progressPct: boot.progressPct,
@@ -1945,6 +2438,30 @@
         bindGroupHitRate: memoryStats.bindGroupHitRate,
       },
       mailboxLanes: mailboxStats.mailboxLanes,
+      httpfsConcurrency: {
+        mailboxLanes: mailboxStats.mailboxLanes,
+        activeMailboxLanes: mailboxStats.activeMailboxLanes,
+        peakMailboxLanes: mailboxStats.peakMailboxLanes,
+        rangeCacheHitRatePct: mailboxStats.rangeCacheHitRatePct,
+      },
+      audio: {
+        outputState: audioStats.audioOutputState,
+        guestRingAttached: audioStats.guestRingAttached,
+        guestFramesDrained: audioStats.guestFramesDrained,
+        framesDrained: audioStats.framesDrained,
+        underruns: audioStats.underruns,
+        guestUnderruns: audioStats.guestUnderruns,
+        overruns: audioStats.overruns,
+      },
+      opfs: {
+        opfsHits: opfsStats.opfsHits,
+        opfsMisses: opfsStats.opfsMisses,
+        opfsWrites: opfsStats.opfsWrites,
+        opfsInvalidations: opfsStats.opfsInvalidations,
+        bytesFromOpfs: opfsStats.bytesFromOpfs,
+        bytesFromNetwork: opfsStats.bytesFromNetwork,
+        opfsHitRatePct: opfsStats.opfsHitRatePct,
+      },
       missingShaderCount: missingShaders.length,
       missingShaders,
     };
@@ -2109,8 +2626,12 @@
       this._pacingStats = createDefaultPacingStats();
       this._memoryStats = createDefaultMemoryStats();
       this._mailboxStats = createDefaultMailboxStats();
+      this._audioStats = createDefaultAudioStats();
+      this._opfsStats = createDefaultOpfsStats();
       this._missingShaders = [];
       this._renderedCache = Object.create(null);
+      this._headerDirty = false;
+      this._bodyDirty = false;
 
       this._styleEl = ensureSharedStyle(doc);
       this._root = opts.root && typeof opts.root === 'object' ? opts.root : this._buildDom();
@@ -2583,6 +3104,66 @@
       pacingMemoryGrid.appendChild(mailboxLanesMetric.card);
       pacingMemorySection.appendChild(pacingMemoryGrid);
 
+      // --- Live M4 Audio Ring & OPFS Warm-Boot telemetry section (W376) ---
+      const m4LiveSection = createEl(
+        doc,
+        'div',
+        `${ROOT_CLASS}__section ${ROOT_CLASS}__m4-live`,
+        {
+          role: 'group',
+          'aria-label': 'Live M4 Audio Ring & OPFS Warm-Boot',
+        }
+      );
+      m4LiveSection.appendChild(
+        createEl(doc, 'div', `${ROOT_CLASS}__section-title`, {
+          text: 'Audio Ring & OPFS Warm-Boot',
+        })
+      );
+      const m4LiveGrid = createEl(doc, 'div', `${ROOT_CLASS}__grid`);
+      const audioRingMetric = this._buildMetricCard(
+        doc,
+        'Audio Ring',
+        `${ROOT_CLASS}__audio-ring`,
+        'Detached'
+      );
+      const audioOutputStateMetric = this._buildMetricCard(
+        doc,
+        'Audio Output',
+        `${ROOT_CLASS}__audio-output-state`,
+        PLACEHOLDER_DASH
+      );
+      const audioFramesDrainedMetric = this._buildMetricCard(
+        doc,
+        'Audio Drained',
+        `${ROOT_CLASS}__audio-frames-drained`,
+        '0'
+      );
+      const opfsHitRateMetric = this._buildMetricCard(
+        doc,
+        'OPFS Hit Rate',
+        `${ROOT_CLASS}__opfs-hit-rate`,
+        PLACEHOLDER_DASH
+      );
+      const opfsHitsMissesMetric = this._buildMetricCard(
+        doc,
+        'OPFS Hits/Miss',
+        `${ROOT_CLASS}__opfs-hits-misses`,
+        '0 / 0'
+      );
+      const opfsBytesMetric = this._buildMetricCard(
+        doc,
+        'OPFS Cached',
+        `${ROOT_CLASS}__opfs-bytes`,
+        PLACEHOLDER_DASH
+      );
+      m4LiveGrid.appendChild(audioRingMetric.card);
+      m4LiveGrid.appendChild(audioOutputStateMetric.card);
+      m4LiveGrid.appendChild(audioFramesDrainedMetric.card);
+      m4LiveGrid.appendChild(opfsHitRateMetric.card);
+      m4LiveGrid.appendChild(opfsHitsMissesMetric.card);
+      m4LiveGrid.appendChild(opfsBytesMetric.card);
+      m4LiveSection.appendChild(m4LiveGrid);
+
       // --- Missing-shader table section ---
       const missingSection = createEl(doc, 'div', `${ROOT_CLASS}__section ${ROOT_CLASS}__missing`);
       const missingHeader = createEl(
@@ -2620,6 +3201,7 @@
       body.appendChild(perfSection);
       body.appendChild(adapterReflectionSection);
       body.appendChild(pacingMemorySection);
+      body.appendChild(m4LiveSection);
       body.appendChild(missingSection);
 
       rootEl.appendChild(header);
@@ -2674,6 +3256,12 @@
         vramBudgetUtilization: vramBudgetMetric.val,
         bindGroupHitRate: bindGroupHitRateMetric.val,
         mailboxLanes: mailboxLanesMetric.val,
+        audioRing: audioRingMetric.val,
+        audioOutputState: audioOutputStateMetric.val,
+        audioFramesDrained: audioFramesDrainedMetric.val,
+        opfsHitRate: opfsHitRateMetric.val,
+        opfsHitsMisses: opfsHitsMissesMetric.val,
+        opfsBytes: opfsBytesMetric.val,
         missingHeader,
         table,
         tbody,
@@ -2740,6 +3328,12 @@
           vramBudgetUtilization: q(`.${ROOT_CLASS}__vram-budget-utilization`),
           bindGroupHitRate: q(`.${ROOT_CLASS}__bind-group-hit-rate`),
           mailboxLanes: q(`.${ROOT_CLASS}__mailbox-lanes`),
+          audioRing: q(`.${ROOT_CLASS}__audio-ring`),
+          audioOutputState: q(`.${ROOT_CLASS}__audio-output-state`),
+          audioFramesDrained: q(`.${ROOT_CLASS}__audio-frames-drained`),
+          opfsHitRate: q(`.${ROOT_CLASS}__opfs-hit-rate`),
+          opfsHitsMisses: q(`.${ROOT_CLASS}__opfs-hits-misses`),
+          opfsBytes: q(`.${ROOT_CLASS}__opfs-bytes`),
           missingHeader: q(`.${ROOT_CLASS}__missing-header`),
           table: q(`.${ROOT_CLASS}__table`),
           tbody: q(`.${ROOT_CLASS}__table-body`),
@@ -2859,6 +3453,12 @@
       const els = this._els;
       if (!els) return;
 
+      if (!this._visible) {
+        this._headerDirty = true;
+        this._bodyDirty = true;
+        return;
+      }
+
       const boot = this._boot;
       const frames = this._frameStats;
       const fb = this._fallbackStats;
@@ -2871,9 +3471,18 @@
       const pacing = this._pacingStats;
       const memory = this._memoryStats;
       const mailbox = this._mailboxStats;
+      const audio = this._audioStats;
+      const opfs = this._opfsStats;
 
       try {
         this._setTextIfChanged('summaryBadge', els.summaryBadge, `${boot.stage} · ${boot.progressPct}%`);
+        this._headerDirty = false;
+
+        if (this._collapsed) {
+          this._bodyDirty = true;
+          return;
+        }
+        this._bodyDirty = false;
         this._setTextIfChanged('bootStage', els.bootStage, boot.stage);
         this._setTextIfChanged(
           'bootMilestones',
@@ -3046,7 +3655,41 @@
         this._setTextIfChanged(
           'mailboxLanes',
           els.mailboxLanes,
-          formatMailboxLanes(mailbox.mailboxLanes)
+          formatMailboxLanes(mailbox.mailboxLanes, mailbox)
+        );
+
+        // W376: Live M4 audio ring & OPFS warm-boot diagnostics cards.
+        this._setTextIfChanged(
+          'audioRing',
+          els.audioRing,
+          audio.guestRingAttached ? 'Attached' : 'Detached'
+        );
+        this._setTextIfChanged(
+          'audioOutputState',
+          els.audioOutputState,
+          audio.audioOutputState || PLACEHOLDER_DASH
+        );
+        const effectiveDrained =
+          audio.guestFramesDrained > 0 ? audio.guestFramesDrained : audio.framesDrained;
+        this._setTextIfChanged(
+          'audioFramesDrained',
+          els.audioFramesDrained,
+          formatAudioFrameCount(effectiveDrained)
+        );
+        this._setTextIfChanged(
+          'opfsHitRate',
+          els.opfsHitRate,
+          formatOpfsHitRate(opfs.opfsHitRatePct)
+        );
+        this._setTextIfChanged(
+          'opfsHitsMisses',
+          els.opfsHitsMisses,
+          `${opfs.opfsHits} / ${opfs.opfsMisses}`
+        );
+        this._setTextIfChanged(
+          'opfsBytes',
+          els.opfsBytes,
+          formatOpfsBytes(opfs.bytesFromOpfs)
         );
 
         const totalMissing = this._missingShaders.length;
@@ -3172,6 +3815,8 @@
       this._pacingStats = extractPacingStats(snapshot, this._pacingStats);
       this._memoryStats = extractMemoryStats(snapshot, this._memoryStats);
       this._mailboxStats = extractMailboxStats(snapshot, this._mailboxStats);
+      this._audioStats = extractAudioStats(snapshot, this._audioStats);
+      this._opfsStats = extractOpfsStats(snapshot, this._opfsStats);
 
       this._render();
       return this.getState();
@@ -3199,6 +3844,8 @@
       this._pacingStats = createDefaultPacingStats();
       this._memoryStats = createDefaultMemoryStats();
       this._mailboxStats = createDefaultMailboxStats();
+      this._audioStats = createDefaultAudioStats();
+      this._opfsStats = createDefaultOpfsStats();
       this._missingShaders = [];
       this._exportCount = 0;
 
@@ -3207,8 +3854,8 @@
     }
 
     /**
-     * Build and return a sanitized JSON string of the current missing-shader shopping list,
-     * invoking `onExportMissingShaders(jsonText, payload)` if configured.
+     * Build and return a sanitized JSON string of the current missing-shader shopping list
+     * and live M4 diagnostics, invoking `onExportMissingShaders(jsonText, payload)` if configured.
      *
      * @returns {string}
      */
@@ -3226,7 +3873,9 @@
         reflectionStats: this._reflectionStats,
         pacingStats: this._pacingStats,
         memoryStats: this._memoryStats,
-        mailboxLanes: this._mailboxStats.mailboxLanes,
+        mailboxStats: this._mailboxStats,
+        audioStats: this._audioStats,
+        opfsStats: this._opfsStats,
         maxTopMissingShaders: this._maxTopMissingShaders,
         now: this._now,
       });
@@ -3247,7 +3896,17 @@
     }
 
     /**
+     * Alias of `exportMissingShadersJson()` returning the full sanitized M4 diagnostics JSON.
+     *
+     * @returns {string}
+     */
+    exportDiagnosticsJson() {
+      return this.exportMissingShadersJson();
+    }
+
+    /**
      * Toggle the collapsible diagnostics body (or set collapsed explicitly when given a boolean).
+     * Syncs deferred body DOM immediately when expanded.
      *
      * @param {boolean} [forceCollapsed]
      * @returns {object}
@@ -3258,15 +3917,21 @@
       }
       const next = typeof forceCollapsed === 'boolean' ? forceCollapsed : !this._collapsed;
       this._applyCollapsed(next);
+      if (!this._collapsed && this._visible && this._bodyDirty) {
+        this._render();
+      }
       return this.getState();
     }
 
-    /** Show the panel root element. */
+    /** Show the panel root element and flush any deferred DOM updates. */
     show() {
       if (this._destroyed) {
         return this.getState();
       }
       this._applyVisibility(true);
+      if (this._headerDirty || (!this._collapsed && this._bodyDirty)) {
+        this._render();
+      }
       return this.getState();
     }
 
@@ -3319,8 +3984,25 @@
         vramBudgetUtilization: this._memoryStats.vramBudgetUtilization,
         bindGroupHitRate: this._memoryStats.bindGroupHitRate,
         mailboxLanes: this._mailboxStats.mailboxLanes,
+        activeMailboxLanes: this._mailboxStats.activeMailboxLanes,
+        peakMailboxLanes: this._mailboxStats.peakMailboxLanes,
+        rangeCacheHitRatePct: this._mailboxStats.rangeCacheHitRatePct,
+        audioOutputState: this._audioStats.audioOutputState,
+        guestRingAttached: this._audioStats.guestRingAttached,
+        guestFramesDrained: this._audioStats.guestFramesDrained,
+        framesDrained: this._audioStats.framesDrained,
+        opfsHits: this._opfsStats.opfsHits,
+        opfsMisses: this._opfsStats.opfsMisses,
+        opfsWrites: this._opfsStats.opfsWrites,
+        opfsInvalidations: this._opfsStats.opfsInvalidations,
+        bytesFromOpfs: this._opfsStats.bytesFromOpfs,
+        bytesFromNetwork: this._opfsStats.bytesFromNetwork,
+        opfsHitRatePct: this._opfsStats.opfsHitRatePct,
         pacingStats: { ...this._pacingStats },
         memoryStats: { ...this._memoryStats },
+        mailboxStats: { ...this._mailboxStats },
+        audioStats: { ...this._audioStats },
+        opfsStats: { ...this._opfsStats },
         hitRateText: formatHitRatePct(this._fallbackStats.hitRatePct),
         missingShaders: this._missingShaders.map((row) => ({ ...row })),
         visibleMissingShaders,
@@ -3350,7 +4032,9 @@
         adapterStats: this._adapterStats,
         pacingStats: this._pacingStats,
         memoryStats: this._memoryStats,
-        mailboxLanes: this._mailboxStats.mailboxLanes,
+        mailboxStats: this._mailboxStats,
+        audioStats: this._audioStats,
+        opfsStats: this._opfsStats,
       });
     }
 
@@ -3414,12 +4098,18 @@
     EXPORT_FORMAT,
     EXPORT_SCHEMA_VERSION,
     BOOT_STAGE_ORDER,
+    POST_PRESENT_BOOT_STAGES,
+    ALL_BOOT_STAGE_ORDER,
+    PLAYABILITY_STATE,
     STAGE_NAMES,
     ALLOWED_SWAPCHAIN_FORMATS,
+    ALLOWED_AUDIO_OUTPUT_STATES,
     sanitizeSwapchainFormat,
     sanitizeGpuAdapter,
     sanitizeUnitRatio,
     sanitizePositiveInt,
+    sanitizePercentage,
+    sanitizeAudioOutputState,
     formatDurationMs,
     formatOnePercentLowFps,
     formatP99FrameMs,
@@ -3427,6 +4117,9 @@
     formatFrameJitterMs,
     formatMemoryMb,
     formatMailboxLanes,
+    formatAudioFrameCount,
+    formatOpfsHitRate,
+    formatOpfsBytes,
     formatSummary,
     normalizeTopMissingShaders,
     formatTopMissingShaders,
