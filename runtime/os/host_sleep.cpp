@@ -42,6 +42,37 @@ HANDLE thread_timer() {
 
 }  // namespace
 
+void raise_timer_resolution() {
+#ifdef _WIN32
+    static const bool done = [] {
+        using SetRes = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+        if (HMODULE nt = GetModuleHandleW(L"ntdll.dll")) {
+            if (auto set_res = reinterpret_cast<SetRes>(reinterpret_cast<void*>(GetProcAddress(nt, "NtSetTimerResolution")))) {
+                ULONG actual = 0;
+                if (set_res(5000, TRUE, &actual) >= 0) {  // 0.5 ms, in 100 ns units
+                    return true;
+                }
+            }
+        }
+        if (HMODULE mm = LoadLibraryW(L"winmm.dll")) {
+            using Begin = UINT(WINAPI*)(UINT);
+            if (auto begin = reinterpret_cast<Begin>(reinterpret_cast<void*>(GetProcAddress(mm, "timeBeginPeriod")))) {
+                begin(1);
+            }
+        }
+        // Windows 11 stops honouring a raised resolution for processes it considers idle unless asked.
+        return true;
+    }();
+    (void)done;
+    // Windows 11: do not let a (windowless/occluded) process have its timers throttled.
+    PROCESS_POWER_THROTTLING_STATE st{};
+    st.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+    st.StateMask = 0;
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st));
+#endif
+}
+
 void sleep_until(std::chrono::steady_clock::time_point deadline) {
 #ifdef _WIN32
     if (HANDLE timer = thread_timer()) {

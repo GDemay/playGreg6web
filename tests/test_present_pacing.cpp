@@ -1,6 +1,8 @@
 // Present pacing against a 60 Hz vblank clock (O36, gpu/present_pacing.h), on a fake clock.
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <vector>
 
