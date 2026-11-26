@@ -1987,10 +1987,26 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         marked.clear();
         return mark_pass_.take(cpu, static_cast<size_t>(size), &marked) && marked.empty();
     };
+    // Native arena ranges (outside the translated window): the OS write tracking says whether any page was
+    // written since this range's previous take. The take re-arms the tracking before the caller hashes,
+    // so a write racing with the hash is seen next time. The first take (or one the platform cannot
+    // answer) reports "possibly written" and only primes the cursor.
+    std::vector<uint64_t> native_written;
+    auto native_unwritten = [&](os::WriteCursor& cursor, bool& primed, const void* host, uint64_t size) {
+        native_written.clear();
+        const bool ok = os::take_written_pages(host, size, &cursor, &native_written);
+        const bool skip = ok && primed && native_written.empty();
+        primed = ok;
+        return skip;
+    };
     // O36: take every dirty window slot once, then visit only the buffers and tracked textures
     // overlapping one (sharing this submission's MarkPass so a shared 64 KiB slot notifies both).
     std::vector<uint64_t> dirty;
     const bool scanned = mark_pass_.take_dirty(&dirty);
+    // The OS write bits of the buffers and of the relocated storage / index ranges, collected in one pass
+    // that outlives the loops below (each take inside the ranges then skips its own GetWriteWatch).
+    std::vector<std::pair<uintptr_t, uintptr_t>> host_ranges;
+    std::optional<os::WriteBatch> write_batch;
     {
         std::lock_guard<std::mutex> lock(tracked_mutex_);
         // Verification mode compares unmarked pages too, so it visits everything.
@@ -1998,7 +2014,6 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             slot_index_.clear();
             // Native: every tracked buffer takes its written pages below. Collect the OS write bits
             // of all of them in one pass first, so each buffer does not pay a GetWriteWatch call.
-            std::vector<std::pair<uintptr_t, uintptr_t>> host_ranges;
             host_ranges.reserve(tracked_.size());
             for (Resource* r : tracked_) {
                 if (r->cpu_address() == 0 || r->shadow_bytes() == 0) {
@@ -2010,7 +2025,24 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                                              reinterpret_cast<uintptr_t>(live) + static_cast<uintptr_t>(r->shadow_bytes()));
                 }
             }
-            const os::WriteBatch write_batch(&host_ranges);
+            const auto add_range = [&](uint64_t cpu, uint64_t size) {
+                if (const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(size)))) {
+                    host_ranges.emplace_back(reinterpret_cast<uintptr_t>(live), reinterpret_cast<uintptr_t>(live) + static_cast<uintptr_t>(size));
+                }
+            };
+            {
+                std::lock_guard<std::mutex> rlock(storage_relocation_mutex_);
+                for (const auto& [key, r] : storage_relocations_) {
+                    add_range(cpu_address_for_gpu(r.va), r.size);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> rlock(ia_relocation_mutex_);
+                for (const auto& [key, r] : ia_relocations_) {
+                    add_range(cpu_address_for_gpu(key.first), key.second);
+                }
+            }
+            write_batch.emplace(&host_ranges);
             for (Resource* r : tracked_) {
                 r->set_slot_indexed(false);
                 r->flush_shadow(encoder, &mark_pass_);
@@ -2125,6 +2157,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));  // holds the arena lock
                 if (view.data() != nullptr) {
                     mapped = true;
+                    if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && r.ever_uploaded) {
+                        continue;  // no page written since the last hash: same bytes
+                    }
                     hash = content_hash(view.data(), static_cast<size_t>(r.size));
                     if (r.ever_uploaded && hash == r.last_hash) {
                         unchanged = true;
@@ -2175,6 +2210,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 const com::GuestRangeView view(cpu, static_cast<size_t>(key.second));  // holds the arena lock
                 if (view.data() != nullptr) {
                     mapped = true;
+                    if (native_unwritten(r.write_cursor, r.write_primed, view.data(), key.second)) {
+                        continue;  // no page written since the last hash: same bytes
+                    }
                     hash = content_hash(view.data(), static_cast<size_t>(key.second));
                     if (hash == r.last_hash) {
                         unchanged = true;
