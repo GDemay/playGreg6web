@@ -187,6 +187,7 @@ export const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 256;
 export const MAX_GPU_ADAPTER_LABEL_LENGTH = 96;
 export const DEFAULT_TOGGLE_KEY = 'F3';
 export const DEFAULT_MIN_RENDER_INTERVAL_MS = 0;
+export const HIDDEN_HUD_MIN_RENDER_INTERVAL_MS = 500;
 const SCRIPTED_INPUT_PRESET_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/i;
 const MAX_SIDE_MODULE_NAMES = 64;
 const SIDE_MODULE_LAYOUT_RE =
@@ -1938,6 +1939,7 @@ export class HudController {
     this._validationErrorSeq = 0;
 
     this._gpuTelemetry = createInitialGpuTelemetry();
+    this._lastRawGpuAdapter = undefined;
     this._audioTelemetry = createInitialAudioTelemetry();
     this._pthreadTelemetry = createInitialPthreadTelemetry();
     this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
@@ -1953,6 +1955,7 @@ export class HudController {
     this._mountedDiagnosticsSection = null;
 
     const initialGpuAdapter = sanitizeGpuAdapterLabel(gpuAdapter);
+    this._lastRawGpuAdapter = typeof gpuAdapter === 'string' ? gpuAdapter : undefined;
     if (initialGpuAdapter !== null) {
       this._gpuTelemetry.gpuAdapter = initialGpuAdapter;
       this._hasGpuTelemetry = true;
@@ -1980,6 +1983,7 @@ export class HudController {
     this._minRenderIntervalMs = resolvedMinRenderIntervalMs;
     this._lastRenderTimestampMs = null;
     this._renderDirty = false;
+    this._hiddenRenderDeferred = false;
     this._renderCount = 0;
     this._throttledRenders = 0;
     this._domWriteStats = {
@@ -3865,7 +3869,10 @@ export class HudController {
       'adapter_info',
     ]);
     if (rawGpuAdapter !== undefined) {
-      this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+      if (typeof rawGpuAdapter !== 'string' || rawGpuAdapter !== this._lastRawGpuAdapter) {
+        this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+        this._lastRawGpuAdapter = typeof rawGpuAdapter === 'string' ? rawGpuAdapter : undefined;
+      }
       touched = true;
     }
 
@@ -4520,8 +4527,14 @@ export class HudController {
       return this._gpuTelemetry.gpuAdapter;
     }
     const opts = isPlainObject(options) ? options : {};
-    const sanitized = sanitizeGpuAdapterLabel(label);
-    this._gpuTelemetry.gpuAdapter = sanitized;
+    let sanitized;
+    if (typeof label === 'string' && label === this._lastRawGpuAdapter) {
+      sanitized = this._gpuTelemetry.gpuAdapter;
+    } else {
+      sanitized = sanitizeGpuAdapterLabel(label);
+      this._gpuTelemetry.gpuAdapter = sanitized;
+      this._lastRawGpuAdapter = typeof label === 'string' ? label : undefined;
+    }
     if (sanitized !== null) {
       this._hasGpuTelemetry = true;
     }
@@ -4594,6 +4607,7 @@ export class HudController {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
         force: opts.force === true,
+        skipStatusReturn: true,
       });
       this._syncLiveHudReadouts({
         includeFrames: true,
@@ -4793,7 +4807,10 @@ export class HudController {
       'adapter_info',
     ]);
     if (rawGpuAdapter !== undefined) {
-      this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+      if (typeof rawGpuAdapter !== 'string' || rawGpuAdapter !== this._lastRawGpuAdapter) {
+        this._gpuTelemetry.gpuAdapter = sanitizeGpuAdapterLabel(rawGpuAdapter);
+        this._lastRawGpuAdapter = typeof rawGpuAdapter === 'string' ? rawGpuAdapter : undefined;
+      }
     }
 
     const rawBlackLoadingMs = pickFirstDefined(event, [
@@ -4856,6 +4873,7 @@ export class HudController {
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus === true,
       force: opts.force === true,
+      skipStatusReturn: true,
     });
     this._syncLiveHudReadouts({
       includeFrames: true,
@@ -5008,6 +5026,7 @@ export class HudController {
       this._renderBootDiagnostics({
         updateHudStatus: opts.updateHudStatus === true,
         force: opts.force === true,
+        skipStatusReturn: true,
       });
       this._syncLiveHudReadouts({
         includeFrames: this._liveFramesPresented > 0,
@@ -5033,6 +5052,7 @@ export class HudController {
     }
     const opts = isPlainObject(options) ? options : {};
     this._gpuTelemetry = createInitialGpuTelemetry();
+    this._lastRawGpuAdapter = undefined;
     this._audioTelemetry = createInitialAudioTelemetry();
     this._pthreadTelemetry = createInitialPthreadTelemetry();
     this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();
@@ -5123,7 +5143,7 @@ export class HudController {
     const p99FrameMsText = formatP99FrameMs(g.p99FrameMs);
     const zeroCopyUploadsText = formatZeroCopyUploads(g.zeroCopyUploads);
     const perfSummaryText = formatPerfMetricsSummary(g);
-    const gpuAdapterText = formatGpuAdapter(g.gpuAdapter);
+    const gpuAdapterText = g.gpuAdapter ? `GPU: ${g.gpuAdapter}` : '';
     const blackLoadingText = formatBlackLoadingMs(g.blackLoadingMs);
     const firstVisibleFrameText = formatFirstVisibleFrameMs(g.firstVisibleFrameMs);
     const loadingStatusText = formatLoadingStatus(g);
@@ -6252,18 +6272,26 @@ export class HudController {
     const opts = isPlainObject(options) ? options : {};
     const force = opts.force === true;
     const recordRenderTimestamp = opts.recordRenderTimestamp !== false;
+    const skipStatusReturn = opts.skipStatusReturn === true;
     const nowMs = this._safeNowMs();
+    const hidden = !this._visible;
+    const effectiveMinIntervalMs = hidden
+      ? Math.max(this._minRenderIntervalMs, HIDDEN_HUD_MIN_RENDER_INTERVAL_MS)
+      : this._minRenderIntervalMs;
 
     if (
       !force &&
-      this._minRenderIntervalMs > 0 &&
+      effectiveMinIntervalMs > 0 &&
       this._lastRenderTimestampMs !== null
     ) {
       const elapsedMs = nowMs - this._lastRenderTimestampMs;
-      if (elapsedMs >= 0 && elapsedMs < this._minRenderIntervalMs) {
+      if (elapsedMs >= 0 && elapsedMs < effectiveMinIntervalMs) {
         this._renderDirty = true;
+        if (hidden) {
+          this._hiddenRenderDeferred = true;
+        }
         this._throttledRenders += 1;
-        return this.getBootStatus();
+        return skipStatusReturn ? null : this.getBootStatus();
       }
     }
 
@@ -6276,6 +6304,73 @@ export class HudController {
 
     const els = this._displayElements;
     const domStats = this._domWriteStats;
+
+    if (hidden) {
+      // HUD is hidden (e.g. ?hideHud=1 or F3): skip visual-only DOM sections/tooltips and
+      // update only the core telemetry text/data attributes inspected by run_browser_boot.py.
+      this._hiddenRenderDeferred = true;
+
+      if (els.bootModeBadge) {
+        safeSetText(els.bootModeBadge, status.badgeText, domStats);
+        safeSetDataset(els.bootModeBadge, 'bootMode', status.bootMode, domStats);
+        safeSetDataset(els.bootModeBadge, 'state', status.badgeState, domStats);
+      }
+      if (els.bootStatusEl) {
+        safeSetText(els.bootStatusEl, status.statusText, domStats);
+        safeSetDataset(els.bootStatusEl, 'bootMode', status.bootMode, domStats);
+        safeSetDataset(
+          els.bootStatusEl,
+          'state',
+          status.statusLevel === 'error' ? 'err' : status.statusLevel,
+          domStats
+        );
+      }
+      if (els.sideModuleStatusEl) {
+        const sm = status.sideModules;
+        const pthreadText = status.telemetry && status.telemetry.pthread.statusText;
+        const smText = sm.active
+          ? pthreadText
+            ? `${sm.statusText} · ${pthreadText}`
+            : sm.statusText
+          : 'No split modules';
+        safeSetText(els.sideModuleStatusEl, smText, domStats);
+        safeSetDataset(els.sideModuleStatusEl, 'loaded', String(sm.loadedCount), domStats);
+        safeSetDataset(els.sideModuleStatusEl, 'total', String(sm.sideModuleCount), domStats);
+      }
+      if (els.validationCountEl) {
+        const validation = status.validation;
+        safeSetText(els.validationCountEl, String(validation.count), domStats);
+        safeSetDataset(els.validationCountEl, 'count', String(validation.count), domStats);
+        safeSetDataset(els.validationCountEl, 'state', validation.hasErrors ? 'err' : 'ok', domStats);
+      }
+      if (els.framesEl) {
+        safeSetText(els.framesEl, String(status.framesPresented), domStats);
+        safeSetDataset(els.framesEl, 'frames', String(status.framesPresented), domStats);
+      }
+      if (els.fpsEl) {
+        safeSetText(els.fpsEl, formatFpsDisplay(status.fps), domStats);
+        safeSetDataset(els.fpsEl, 'fps', String(status.fps), domStats);
+      }
+      if (els.bootStageEl) {
+        safeSetText(els.bootStageEl, status.bootStage, domStats);
+        safeSetDataset(els.bootStageEl, 'stage', status.bootStage, domStats);
+      }
+
+      this._renderVisibility();
+      this._renderScriptedInputBadge();
+
+      if (
+        opts.updateHudStatus === true &&
+        this._hud &&
+        typeof this._hud.setStatus === 'function'
+      ) {
+        this._setHudStatus(status.statusText, status.statusLevel);
+      }
+
+      return status;
+    }
+
+    this._hiddenRenderDeferred = false;
 
     if (els.bootModeBadge) {
       safeSetText(els.bootModeBadge, status.badgeText, domStats);
@@ -6912,8 +7007,13 @@ export class HudController {
     if (this._destroyed) {
       return this._visible;
     }
-    this._visible = Boolean(visible);
+    const nextVisible = Boolean(visible);
+    const becameVisible = nextVisible && !this._visible;
+    this._visible = nextVisible;
     this._renderVisibility();
+    if (becameVisible && (this._hiddenRenderDeferred || this._renderDirty)) {
+      this._renderBootDiagnostics({ updateHudStatus: false, force: true, skipStatusReturn: true });
+    }
     if (this._hud && typeof this._hud.setVisible === 'function') {
       try {
         this._hud.setVisible(this._visible);
@@ -7084,6 +7184,7 @@ export class HudController {
     }
     const opts = isPlainObject(options) ? options : {};
     this._scriptedInputPreset = sanitizeScriptedInputPreset(presetOrNull);
+    this._renderScriptedInputBadge();
     this._renderBootDiagnostics({
       updateHudStatus: opts.updateHudStatus !== false,
       force: opts.force === true,
@@ -7278,6 +7379,7 @@ export class HudController {
       this._currentSideModule = null;
       this._runtimeInitialized = false;
       this._gpuTelemetry = createInitialGpuTelemetry();
+    this._lastRawGpuAdapter = undefined;
       this._audioTelemetry = createInitialAudioTelemetry();
       this._pthreadTelemetry = createInitialPthreadTelemetry();
       this._frameBudgetTelemetry = createInitialFrameBudgetTelemetry();

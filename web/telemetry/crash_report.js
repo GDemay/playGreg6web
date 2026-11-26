@@ -136,6 +136,10 @@ const TILDE_HOME_PATH_RE =
 const SENSITIVE_KEY_RE =
   /^(?:authorization|cookie|set[_-]?cookie|password|passwd|secret|client[_-]?secret|api[_-]?key|apikey|api[_-]?secret|access[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|id[_-]?token|oauth[_-]?token|bearer[_-]?token|github[_-]?token|npm[_-]?token|session[_-]?token|session[_-]?id|csrf[_-]?token|x[_-]?csrf[_-]?token|sas[_-]?token|private[_-]?key|secret[_-]?key|signing[_-]?key|secret[_-]?token|aws[_-]?(?:secret[_-]?access[_-]?key|access[_-]?key[_-]?id|session[_-]?token)|x[_-]?api[_-]?key|x[_-]?auth[_-]?token|x[_-]?access[_-]?token|x[_-]?session[_-]?token|x[_-]?amz[_-]?(?:signature|security[_-]?token|credential)|jwt|token|username|user[_-]?name|os[_-]?user|host[_-]?user|user[_-]?profile|home[_-]?dir|homedir)$/i;
 
+const MAX_SANITIZE_CLEAN_CACHE = 512;
+const MAX_SANITIZE_CACHE_STRING_LENGTH = 256;
+const _cleanSanitizeCache = new Set();
+
 /**
  * Strips Windows paths (`C:\Users\...`), UNC paths (`\\server\share\...`, `//server/share/...`),
  * POSIX host paths (`/home/...`, `/Users/...`), `file://` URLs, query strings (`?token=...`),
@@ -152,12 +156,74 @@ export function sanitizeString(text) {
   }
 
   let out = typeof text === 'string' ? text : String(text);
-  if (out.length === 0) {
+  const origLen = out.length;
+  if (origLen === 0) {
     return out;
   }
 
+  // Fast O(1) cache hit for repeated clean strings (never stores sensitive/redacted inputs).
+  if (origLen <= MAX_SANITIZE_CACHE_STRING_LENGTH && _cleanSanitizeCache.has(out)) {
+    return out;
+  }
+
+  // Single-pass character class scan so clean telemetry/UI strings skip all irrelevant regexes
+  // while preserving 100% identical redaction behavior on every path, URL, secret, and buffer.
+  let hasControl = false;
+  let hasColon = false;
+  let hasEquals = false;
+  let hasSlash = false;
+  let hasBackslash = false;
+  let hasQuestion = false;
+  let hasTilde = false;
+  let hasAt = false;
+  let hasDash = false;
+  let hasUnderscore = false;
+  let hasDot = false;
+  let hasWhitespace = false;
+  let hasBChar = false;
+  let hasUpperA = false;
+
+  for (let i = 0; i < origLen; i += 1) {
+    const c = out.charCodeAt(i);
+    if (c < 0x20) {
+      if (c === 0x09 || c === 0x0a || c === 0x0d) {
+        hasWhitespace = true;
+      } else {
+        hasControl = true;
+      }
+    } else if (c === 0x20 || c >= 0xa0) {
+      hasWhitespace = true;
+    } else if (c === 0x3a) {
+      hasColon = true;
+    } else if (c === 0x3d) {
+      hasEquals = true;
+    } else if (c === 0x2f) {
+      hasSlash = true;
+    } else if (c === 0x5c) {
+      hasBackslash = true;
+    } else if (c === 0x3f) {
+      hasQuestion = true;
+    } else if (c === 0x7e) {
+      hasTilde = true;
+    } else if (c === 0x40) {
+      hasAt = true;
+    } else if (c === 0x2d) {
+      hasDash = true;
+    } else if (c === 0x5f) {
+      hasUnderscore = true;
+    } else if (c === 0x2e) {
+      hasDot = true;
+    } else if (c === 0x42 || c === 0x62) {
+      hasBChar = true;
+    } else if (c === 0x41) {
+      hasUpperA = true;
+    }
+  }
+
+  const original = out;
+
   // 0. Redact raw binary payloads (NUL/control-byte blobs, base64 data URIs, hex dumps).
-  if (BINARY_CONTROL_CHAR_RE.test(out)) {
+  if (hasControl) {
     let nulCount = 0;
     let ctrlCount = 0;
     for (let i = 0; i < out.length; i += 1) {
@@ -174,54 +240,103 @@ export function sanitizeString(text) {
     }
     out = out.replace(BINARY_CONTROL_RUN_RE, '[REDACTED_BUFFER]');
   }
-  out = out.replace(DATA_URI_BASE64_RE, '[REDACTED_BUFFER]');
-  out = out.replace(HEX_DUMP_BYTES_RE, '[REDACTED_BUFFER]');
-  out = out.replace(LONG_HEX_PAYLOAD_RE, '[REDACTED_BUFFER]');
+  if (hasColon && hasSlash && origLen >= 30) {
+    out = out.replace(DATA_URI_BASE64_RE, '[REDACTED_BUFFER]');
+  }
+  if (origLen >= 50 && hasWhitespace) {
+    out = out.replace(HEX_DUMP_BYTES_RE, '[REDACTED_BUFFER]');
+  }
+  if (origLen >= 65) {
+    out = out.replace(LONG_HEX_PAYLOAD_RE, '[REDACTED_BUFFER]');
+  }
 
   // 1. Redact file:// URLs completely (quoted first to catch spaces, preserving optional :line:col).
-  out = out.replace(QUOTED_FILE_URL_RE, (_, quote, _url, lineCol) => {
-    return `${quote}[REDACTED_FILE_URL]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(FILE_URL_RE, '[REDACTED_FILE_URL]');
+  if (hasColon && hasSlash) {
+    out = out.replace(QUOTED_FILE_URL_RE, (_, quote, _url, lineCol) => {
+      return `${quote}[REDACTED_FILE_URL]${lineCol || ''}${quote}`;
+    });
+    out = out.replace(FILE_URL_RE, '[REDACTED_FILE_URL]');
+  }
 
   // 2. Redact embedded URL credentials (scheme://user:pass@host and scheme://user@host).
-  out = out.replace(URL_USERINFO_RE, '$1[REDACTED]@');
+  if (hasAt && hasColon && hasSlash) {
+    out = out.replace(URL_USERINFO_RE, '$1[REDACTED]@');
+  }
 
   // 3. Redact query strings on HTTP/WS/FTP URLs and standalone ?key=value tokens.
-  out = out.replace(URL_QUERY_RE, '$1?[REDACTED]');
-  out = out.replace(STANDALONE_QUERY_RE, '?[REDACTED]');
+  if (hasQuestion) {
+    if (hasColon && hasSlash) {
+      out = out.replace(URL_QUERY_RE, '$1?[REDACTED]');
+    }
+    if (hasEquals) {
+      out = out.replace(STANDALONE_QUERY_RE, '?[REDACTED]');
+    }
+  }
 
   // 4. Redact PEM private keys, Bearer/Basic tokens, inline credential/username pairs, and bare JWTs/PATs.
-  out = out.replace(PEM_PRIVATE_KEY_RE, '[REDACTED_TOKEN]');
-  out = out.replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
-  out = out.replace(SECRET_KV_RE, '$1$2[REDACTED]');
-  out = out.replace(BARE_TOKEN_RE, '[REDACTED_TOKEN]');
+  if (hasDash && origLen >= 46 && out.includes('-----BEGIN ')) {
+    out = out.replace(PEM_PRIVATE_KEY_RE, '[REDACTED_TOKEN]');
+  }
+  if (hasBChar && hasWhitespace && origLen >= 7) {
+    out = out.replace(AUTH_SCHEME_RE, '$1 [REDACTED]');
+  }
+  if (hasColon || hasEquals) {
+    out = out.replace(SECRET_KV_RE, '$1$2[REDACTED]');
+  }
+  if (origLen >= 15 && (hasDot || hasUnderscore || hasDash || hasUpperA)) {
+    out = out.replace(BARE_TOKEN_RE, '[REDACTED_TOKEN]');
+  }
 
   // 5. Redact Windows absolute drive, extended-length/device, and UNC paths (quoted first to catch spaces).
-  out = out.replace(QUOTED_WIN_PATH_RE, (_, quote, _path, lineCol) => {
-    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(QUOTED_UNC_PATH_RE, (_, quote, _path, lineCol) => {
-    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(QUOTED_FWD_UNC_PATH_RE, (_, quote, _path, lineCol) => {
-    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(WIN_DEVICE_PATH_RE, '$1[REDACTED_PATH]');
-  out = out.replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]');
-  out = out.replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]');
-  out = out.replace(FWD_UNC_PATH_RE, '$1[REDACTED_PATH]');
+  if (hasColon && (hasBackslash || hasSlash)) {
+    out = out.replace(QUOTED_WIN_PATH_RE, (_, quote, _path, lineCol) => {
+      return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+    });
+  }
+  if (hasBackslash) {
+    out = out.replace(QUOTED_UNC_PATH_RE, (_, quote, _path, lineCol) => {
+      return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+    });
+  }
+  if (hasSlash && out.includes('//')) {
+    out = out.replace(QUOTED_FWD_UNC_PATH_RE, (_, quote, _path, lineCol) => {
+      return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+    });
+  }
+  if (hasBackslash) {
+    out = out.replace(WIN_DEVICE_PATH_RE, '$1[REDACTED_PATH]');
+  }
+  if (hasColon && (hasBackslash || hasSlash)) {
+    out = out.replace(WIN_DRIVE_PATH_RE, '[REDACTED_PATH]');
+  }
+  if (hasBackslash) {
+    out = out.replace(WIN_UNC_PATH_RE, '$1[REDACTED_PATH]');
+  }
+  if (hasSlash && out.includes('//')) {
+    out = out.replace(FWD_UNC_PATH_RE, '$1[REDACTED_PATH]');
+  }
 
   // 6. Redact POSIX host absolute paths, MSYS drive user paths, and ~ home paths (preserving app routes like /api/status).
-  out = out.replace(QUOTED_POSIX_PATH_RE, (_, quote, _path, lineCol) => {
-    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(POSIX_ABS_PATH_RE, '$1[REDACTED_PATH]');
-  out = out.replace(MSYS_DRIVE_USER_PATH_RE, '$1[REDACTED_PATH]');
-  out = out.replace(QUOTED_TILDE_HOME_PATH_RE, (_, quote, _path, lineCol) => {
-    return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
-  });
-  out = out.replace(TILDE_HOME_PATH_RE, '$1[REDACTED_PATH]');
+  if (hasSlash) {
+    out = out.replace(QUOTED_POSIX_PATH_RE, (_, quote, _path, lineCol) => {
+      return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+    });
+    out = out.replace(POSIX_ABS_PATH_RE, '$1[REDACTED_PATH]');
+    out = out.replace(MSYS_DRIVE_USER_PATH_RE, '$1[REDACTED_PATH]');
+    if (hasTilde) {
+      out = out.replace(QUOTED_TILDE_HOME_PATH_RE, (_, quote, _path, lineCol) => {
+        return `${quote}[REDACTED_PATH]${lineCol || ''}${quote}`;
+      });
+      out = out.replace(TILDE_HOME_PATH_RE, '$1[REDACTED_PATH]');
+    }
+  }
+
+  if (out === original && origLen <= MAX_SANITIZE_CACHE_STRING_LENGTH) {
+    if (_cleanSanitizeCache.size >= MAX_SANITIZE_CLEAN_CACHE) {
+      _cleanSanitizeCache.clear();
+    }
+    _cleanSanitizeCache.add(out);
+  }
 
   return out;
 }

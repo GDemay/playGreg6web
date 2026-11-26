@@ -136,6 +136,7 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "chrome-menu-flow": "chrome-menu-flow",
     "chrome-menu-flow-2": "chrome-menu-flow-2",
     "chrome-menu-flow-4": "chrome-menu-flow-4",
+    "chrome-menu-flow-5": "chrome-menu-flow-5",
     "chrome-to-ingame": "chrome-to-ingame",
     "intro-watch": "intro-watch",
     "legal-notices": "legal-notices",
