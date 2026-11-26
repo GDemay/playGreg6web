@@ -204,6 +204,7 @@ inline constexpr size_t kMaxCachedBindGroups = 4096;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
+class CommandListBridge;
 
 struct ViewRecord {
     uint32_t texture_id = 0;  // packet texture id (kGpuSwapchainTextureId for swapchain buffers)
@@ -280,6 +281,31 @@ public:
     bool retired(uint32_t resource_id) const;
     uint64_t retire_epoch() const noexcept { return retire_epoch_.load(std::memory_order_acquire); }
 
+    // ---- Frame-safe resource lifetime & deferred DestroyResource (G70, #691) ----
+    // Records that GPU resource `resource_id` (texture, buffer, intermediate, or bind group) is
+    // referenced by commands in the current frame (since the last Present) and updates its LRU tick.
+    void note_resource_used(uint32_t resource_id);
+    bool is_resource_used_in_frame(uint32_t resource_id) const;
+    uint64_t resource_last_use_tick(uint32_t resource_id) const;
+    // Emits DestroyResource(resource_id) into `encoder`, or defers it until after Present if
+    // `resource_id` was referenced in the current frame. Returns true if deferred.
+    bool destroy_or_defer_resource(uint32_t resource_id, CommandEncoder& encoder);
+    // Unconditionally queues `resource_id` for DestroyResource after Present (deduplicated).
+    void defer_destroy_resource(uint32_t resource_id);
+    // Removes `resource_id` from the deferred queue (if pending) and emits DestroyResource into `encoder`.
+    // Safe only for bind group ids (GPUBindGroup has no WebGPU destroy() that invalidates a submit).
+    bool take_deferred_destroy(uint32_t resource_id, CommandEncoder& encoder);
+    // Emits DestroyResource for every deferred resource and starts a new frame usage window.
+    // Call strictly AFTER Present (or at the start of the next frame after Present).
+    size_t flush_deferred_destroys(CommandEncoder& encoder);
+    // Emits Present into `encoder`, then immediately flushes all deferred DestroyResource packets
+    // after Present so no resource used by the frame is destroyed before queue.submit().
+    void present(CommandEncoder& encoder);
+    // Syncs with a host Present counter (e.g. Device::stats().presents). When `present_count`
+    // has advanced past the last seen count, flushes deferred destroys into `encoder` and returns true.
+    bool advance_present_frame(uint64_t present_count, CommandEncoder& encoder);
+    size_t deferred_destroy_count() const;
+
 private:
     friend class CommandListBridge;
     friend class GraphicsPipelineState;
@@ -304,7 +330,11 @@ private:
     };
 
     uint32_t intern_view(const ViewRecord& record) const;
-    void retire_views(uint32_t texture_id);
+    std::vector<uint32_t> retire_views(uint32_t texture_id);
+    void attach_bridge(CommandListBridge* bridge);
+    void detach_bridge(CommandListBridge* bridge);
+    void notify_bridges_invalidated(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
+    size_t flush_deferred_destroys_impl(CommandEncoder& encoder, bool respect_unexecuted);
 
 public:
     // O36 (tests): live interned views and sampler count.
@@ -343,8 +373,9 @@ private:
     uint32_t storage_conversion_group(const StorageConversionPipeline& pipeline, uint8_t dimension, uint32_t src,
                                       uint8_t src_format, uint32_t dst, uint8_t dst_format, uint32_t mip,
                                       uint32_t base_layer, uint32_t layer_count, CommandEncoder& encoder);
-    // Drops the intermediates and conversion bind groups of `resource_id` (destroyed at next use).
-    void retire_intermediates(uint32_t resource_id);
+    // Drops the intermediates and conversion bind groups of `resource_id` (queued for frame-safe destroy)
+    // and returns the retired intermediate texture ids so cached bind groups can be invalidated too.
+    std::vector<uint32_t> retire_intermediates(uint32_t resource_id);
     void flush_retired_locked(CommandEncoder& encoder);
 
     d3d::DescriptorHeapRegistry& heaps_;
@@ -382,7 +413,18 @@ private:
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
     std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
     std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
-    std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next use
+    std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
+
+    mutable std::mutex bridges_mutex_;
+    std::vector<CommandListBridge*> bridges_;
+
+    mutable std::mutex retire_mutex_;
+    std::unordered_set<uint32_t> frame_used_resources_;
+    std::unordered_map<uint32_t, uint64_t> resource_last_use_;
+    uint64_t resource_use_tick_ = 0;
+    std::vector<uint32_t> deferred_destroys_;
+    std::unordered_set<uint32_t> deferred_destroy_set_;
+    uint64_t synced_present_count_ = 0;
 };
 
 // Graphics PSO as seen by the bridge: the G7 GraphicsPso plus everything needed to emit its packets.
@@ -439,6 +481,7 @@ struct BridgeStats {
     uint64_t pipelines_created = 0;
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
+    uint64_t bind_groups_invalidated = 0;       // G70: cached bind groups evicted on resource/view unregister
     uint64_t bind_groups_relocation_moved = 0;  // G66: cache hits re-created, a relocated home moved
     uint64_t bind_groups_resource_retired = 0;  // G66: cache hits re-built, a bound resource was destroyed
     uint64_t retired_resources_nulled = 0;      // G66: bindings of destroyed textures/buffers bound null
@@ -478,11 +521,19 @@ struct BridgeStats {
 class CommandListBridge {
 public:
     CommandListBridge(StateBridgeDevice& device, CommandEncoder& encoder);
+    ~CommandListBridge();
+    CommandListBridge(const CommandListBridge&) = delete;
+    CommandListBridge& operator=(const CommandListBridge&) = delete;
 
     // ID3D12GraphicsCommandList::Reset (state back to defaults; the encoder is not cleared).
     void Reset(GraphicsPipelineState* initial_state = nullptr);
     // Flushes pending clears, ends the open render pass and finishes the list.
     void Close();
+    // Emits Present into the encoder and flushes end-of-frame deferred DestroyResource packets after it.
+    void Present();
+    // Drains any pending resource/view invalidations queued by StateBridgeDevice::unregister_resource.
+    void flush_invalidations();
+    size_t cached_bind_group_count() const;
     bool is_open() const noexcept { return open_; }
 
     // Pipeline state.
@@ -563,6 +614,7 @@ public:
     const pso::TrackerStats& tracker_stats() const noexcept { return tracker_.stats(); }
 
 private:
+    friend class StateBridgeDevice;
     struct BoundGroup {
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> dynamic_offsets;
@@ -593,8 +645,22 @@ private:
     bool relocations_moved(d3d::CachedBindGroup* cached);
     // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
     bool binds_retired(d3d::CachedBindGroup* cached) const;
-    // Relocations the last gpu_entries call made.
+    // Relocations and interned views the last gpu_entries call made.
     std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
+    std::vector<uint32_t> pending_view_ids_;
+    void invalidate_resources_locked(std::span<const uint32_t> resource_ids,
+                                     std::span<const uint32_t> view_ids,
+                                     std::vector<uint32_t>* retired_bgs);
+    bool try_invalidate_immediately(std::span<const uint32_t> resource_ids,
+                                    std::span<const uint32_t> view_ids,
+                                    std::vector<uint32_t>* retired_bgs);
+    void queue_invalidation(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
+    void drain_invalidations_locked();
+    void note_recorded_resource(uint32_t resource_id);
+    void clear_recorded_resources(bool executed);
+    void collect_unexecuted_resources(std::unordered_set<uint32_t>* out) const;
+    void mark_executed_and_pin_in_frame();
+    void note_bind_group_used_locked(const d3d::CachedBindGroup& cached, uint32_t bind_group_id);
     void sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                              CommandEncoder& target);
     void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);
@@ -651,8 +717,20 @@ private:
         const StateBridgeDevice::GroupLayoutRecord* group = nullptr;
         d3d::BindGroupPlan plan;
         d3d::CachedBindGroup built;
+        bool invalidated = false;
     };
     std::vector<MemoryBindGroup> memory_groups_;
+    mutable std::mutex cache_mutex_;
+    mutable std::mutex pending_mutex_;
+    mutable std::mutex recorded_mutex_;
+    std::unordered_set<uint32_t> recorded_resources_;
+    bool executed_ = false;
+    std::vector<uint32_t> pending_invalidated_resources_;
+    std::vector<uint32_t> pending_invalidated_views_;
+    std::unordered_set<uint64_t> invalidated_key_hashes_;
+    std::vector<uint32_t> invalidated_bgs_to_retire_;
+    std::atomic<uint64_t> pending_invalidation_epoch_{0};
+    uint64_t seen_invalidation_epoch_ = 0;
     // Storage redirects the last gpu_entries call made, and those of each bind group (by gpu id).
     std::vector<StorageRedirect> pending_redirects_;
     std::array<uint32_t, pso::kMaxColorTargets + 1> om_attachments_{};  // texture ids of the bound RTVs + DSV

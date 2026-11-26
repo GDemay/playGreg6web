@@ -3227,8 +3227,452 @@ void test_view_table_bounded() {
     CHECK(device.test_intern_view(rec) == a && a <= 2u && device.view(a)->texture_id == 9000u);
 }
 
+// G70 (#691): unregistering/evicting a texture immediately invalidates every cached bind group
+// referencing it (both directly and via interned view ids), retires the evicted bind groups with
+// zero GPU leak, and prevents stale bind groups or destroyed texture ids from being bound.
+void test_unregister_texture_invalidates_cached_bind_groups() {
+    // Part A: direct texture unregister invalidates cached bind groups in CommandListBridge.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Draw 1: creates and caches bind group bg1 referencing kAlbedo.
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg1 = 0;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg1 = pod<GpuCreateBindGroup2Payload>(pk).id;
+            }
+        }
+        CHECK(bg1 != 0);
+        CHECK(list.cached_bind_group_count() == 1);
+        const size_t views_before = scene.device.live_view_count();
+        CHECK(views_before >= 2u);  // swapchain RTV + kAlbedo SRV
+
+        // Draw 2: cache hit (only Draw emitted).
+        const size_t mark_hit = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(opcodes(decode(enc, mark_hit)) == std::vector<GpuOpcode>{GpuOpcode::Draw});
+        CHECK(list.stats().bind_group_cache_hits == 1);
+
+        // Unregister kAlbedo: must immediately evict bg1 from BindGroupCache, retire its interned
+        // view, and queue bg1 for DestroyResource (zero GPU leak).
+        scene.device.unregister_resource(Scene::kAlbedo);
+        CHECK(list.cached_bind_group_count() == 0);
+        CHECK(list.stats().bind_groups_invalidated == 1);
+        CHECK(scene.device.live_view_count() < views_before);
+        CHECK(scene.device.deferred_destroy_count() == 1);
+
+        // Draw 3: heap slot still names unregistered kAlbedo; cache must miss and emit a fresh bind
+        // group with null resource_id (0), NEVER reusing bg1 or binding destroyed kAlbedo.
+        const size_t mark_null = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg2 = 0;
+        GpuBindGroupEntry2 tex_entry{};
+        bool found_bg2 = false;
+        for (const Packet& pk : decode(enc, mark_null)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg2 = pod<GpuCreateBindGroup2Payload>(pk).id;
+                tex_entry = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                found_bg2 = true;
+            }
+        }
+        CHECK(found_bg2 && bg2 != 0 && bg2 != bg1);
+        CHECK(tex_entry.resource_id == 0);
+        CHECK((list.diagnostics() & bridge::BridgeDiag::UnknownTexture) != 0);
+
+        // Point the heap slot at live kAlbedo2: rebuilds cleanly to kAlbedo2.
+        scene.write_albedo_srv(Scene::kAlbedo2, 0);
+        const size_t mark_live = enc.size();
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg3 = 0;
+        GpuBindGroupEntry2 tex_entry3{};
+        for (const Packet& pk : decode(enc, mark_live)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg3 = pod<GpuCreateBindGroup2Payload>(pk).id;
+                tex_entry3 = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+            }
+        }
+        CHECK(bg3 != 0 && bg3 != bg1 && bg3 != bg2);
+        CHECK(tex_entry3.resource_id == Scene::kAlbedo2);
+
+        // Present flushes deferred DestroyResource(bg1) strictly after Present.
+        list.Present();
+        const std::vector<Packet> all = decode(enc);
+        size_t present_idx = all.size();
+        size_t destroy_bg1_idx = all.size();
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (all[i].opcode == GpuOpcode::Present) {
+                present_idx = i;
+            } else if (all[i].opcode == GpuOpcode::DestroyResource &&
+                       pod<GpuDestroyResourcePayload>(all[i]).id == bg1) {
+                destroy_bg1_idx = i;
+            }
+        }
+        CHECK(present_idx < all.size());
+        CHECK(destroy_bg1_idx < all.size() && destroy_bg1_idx > present_idx);
+        CHECK(scene.device.deferred_destroy_count() == 0);
+    }
+
+    // Part B: BindGroupCache invalidates entries matching an interned view id even when resource_ids is empty.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        d3d::ViewDesc srv{};
+        srv.format = 28;
+        srv.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_shader_resource_view(555u, &srv, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Srv;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs_desc.parameters.push_back(table);
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+        const d3d::ShaderBinding join_srv = join(0, d3d::DescriptorRangeType::Srv, 0);
+        const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(rs, std::span<const d3d::ShaderBinding>(&join_srv, 1),
+                                                                  d3d::WebGpuStage::Fragment);
+        d3d::RootArgumentState root_args;
+        d3d::DescriptorHeap* visible[] = {srv_heap};
+        CHECK(root_args.set_descriptor_heaps(1, visible) == d3d::Status::Ok);
+        CHECK(root_args.set_root_signature(d3d::BindPoint::Graphics, &rs) == d3d::Status::Ok);
+        CHECK(root_args.set_descriptor_table(d3d::BindPoint::Graphics, 0, srv_heap->gpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::BindGroupCache cache;
+        d3d::BindGroupLookup lk = cache.get_or_build(root_args, d3d::BindPoint::Graphics, plan, 1u, nullptr, nullptr);
+        CHECK(lk.status == d3d::Status::Ok && lk.bind_group != nullptr);
+        lk.bind_group->gpu_id = 7777u;
+        lk.bind_group->view_ids.push_back(42u);
+        CHECK(cache.size() == 1);
+
+        const uint32_t retired_view = 42u;
+        std::vector<uint32_t> retired_bgs;
+        const size_t evicted = cache.evict_resources_and_views({}, std::span<const uint32_t>(&retired_view, 1),
+                                                               &retired_bgs);
+        CHECK(evicted == 1 && cache.size() == 0);
+        CHECK(retired_bgs.size() == 1 && retired_bgs[0] == 7777u);
+    }
+
+    // Part C: memory-backed descriptor tables force-refresh when their texture id is unregistered
+    // and replaced at the same GPU VA even though the raw descriptor memory bytes did not change.
+    {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions options = counting_options(8000);
+        struct Holder {
+            std::unique_ptr<TestSlotSource> source;
+        } holder;
+        struct Forward final : d3d::DescriptorSlotSource {
+            Holder* h = nullptr;
+            bool reads(const d3d::DescriptorHeap& heap) const override { return h->source && h->source->reads(heap); }
+            bool snapshot(const d3d::DescriptorHeap& heap, uint32_t f, uint32_t c, std::vector<uint8_t>* o) const override {
+                return h->source->snapshot(heap, f, c, o);
+            }
+            d3d::ViewDescriptor view(const d3d::DescriptorHeap& heap, uint32_t i, d3d::DescriptorRangeType r) const override {
+                return h->source->view(heap, i, r);
+            }
+            bool sampler(const d3d::DescriptorHeap& heap, uint32_t i, d3d::SamplerDesc* o) const override {
+                return h->source->sampler(heap, i, o);
+            }
+        } forward;
+        forward.h = &holder;
+        options.slot_source = &forward;
+
+        bridge::StateBridgeDevice device(heaps, options, &states);
+        constexpr uint32_t kTarget = 100, kTex1 = 301, kTex2 = 302;
+        constexpr uint64_t kVs = 0xF1, kPs = 0xF2, kTexVa = 0x7E00'0005'0000ull;
+        device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        bridge::TextureInfo tex{pso::DxgiFormat::R32G32B32A32_FLOAT, 256, 1, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.gpu_va = kTexVa;
+        device.register_texture(kTex1, tex);
+        device.register_shader_module(kVs, 1);
+        device.register_shader_module(kPs, 2);
+
+        d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+        d3d::DescriptorHeap* heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        holder.source = std::make_unique<TestSlotSource>(device, heap);
+        CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+        d3d::ViewDescriptor img{};
+        img.kind = d3d::DescriptorKind::Srv;
+        img.resource_id = kTex1;
+        img.dimension = d3d::ViewDimension::Texture2D;
+        img.format = 2;  // R32G32B32A32_FLOAT
+        img.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        img.mip_levels = 1;
+        uint32_t words[8] = {};
+        CHECK(bridge::view_words(device, img, words) == bridge::WordsStatus::Ok);
+        holder.source->write(0, words, sizeof(words));
+
+        d3d::RootSignatureDesc rs_desc;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Srv;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs_desc.parameters.push_back(table);
+        d3d::RootSignature rs;
+        CHECK(d3d::RootSignature::build(rs_desc, &rs).ok());
+
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Fragment, GpuBindingLayoutType::Texture,
+                                               static_cast<uint8_t>(GpuTextureSampleType::UnfilterableFloat),
+                                               static_cast<uint8_t>(GpuTextureViewDimension::Dim2D)),
+                                  join(0, d3d::DescriptorRangeType::Srv, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kVs, kPs, layout);
+        pso::D3D12GraphicsPsoDesc pd = Scene::pso_desc();
+        pd.vs = kVs;
+        pd.ps = kPs;
+        pd.DSVFormat = pso::DxgiFormat::UNKNOWN;
+        auto state = device.create_graphics_pipeline_state(pd, &rs);
+
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+        list.SetPipelineState(state.get());
+        CHECK(list.SetGraphicsRootDescriptorTable(0, heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const gpu::d3d12_xs::D3D12VertexBufferView vb{Scene::kVertexBuffer, 0, 36, 12};
+        list.IASetVertexBuffers(0, 1, &vb);
+        const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+        list.DrawInstanced(3, 1, 0, 0);
+        list.Close();
+        uint32_t bg1 = 0;
+        CHECK(last_bind_group_entry(enc, &bg1).resource_id == kTex1);
+        CHECK(list.cached_bind_group_count() == 1);
+
+        // Evict kTex1 and re-create a replacement kTex2 at the same GPU VA (descriptor words unchanged).
+        device.unregister_resource(kTex1);
+        CHECK(list.cached_bind_group_count() == 0);
+        device.register_texture(kTex2, tex);
+
+        // refresh_memory_bind_groups must detect the invalidation and patch the recorded bind group to kTex2.
+        gpu::CommandEncoder prelude;
+        CHECK(list.refresh_memory_bind_groups(prelude) == 1);
+        CHECK(last_bind_group_entry(enc).resource_id == kTex2);
+    }
+}
+
+// G70 (#691): a texture bound in a draw and evicted before Present must have its DestroyResource
+// packet emitted strictly AFTER Present (never before), both at the StateBridge layer and through
+// d3d12_guest::Device::ensure_address_texture LRU eviction.
+void test_evicted_texture_destroy_deferred_until_after_present() {
+    // Part A: StateBridgeDevice + CommandListBridge deferral before Present, immediate destroy for unused.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Unused texture can be destroyed immediately without bloating the deferred queue.
+        constexpr uint32_t kUnused = 999u;
+        CHECK(!scene.device.is_resource_used_in_frame(kUnused));
+        CHECK(!scene.device.destroy_or_defer_resource(kUnused, enc));
+
+        // Draw 1 binds kAlbedo via bg1.
+        list.DrawInstanced(3, 1, 0, 0);
+        uint32_t bg1 = 0;
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                bg1 = pod<GpuCreateBindGroup2Payload>(pk).id;
+            }
+        }
+        CHECK(bg1 != 0);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+        CHECK(scene.device.is_resource_used_in_frame(bg1));
+
+        // Evict kAlbedo BEFORE Present: must defer DestroyResource for both kAlbedo and bg1!
+        scene.device.unregister_resource(Scene::kAlbedo);
+        CHECK(scene.device.destroy_or_defer_resource(Scene::kAlbedo, enc));
+        for (const Packet& pk : decode(enc)) {
+            if (pk.opcode == GpuOpcode::DestroyResource) {
+                const uint32_t id = pod<GpuDestroyResourcePayload>(pk).id;
+                CHECK(id != Scene::kAlbedo && id != bg1);
+            }
+        }
+        CHECK(scene.device.deferred_destroy_count() == 2);
+
+        // Emit Present: DestroyResource(kAlbedo) and DestroyResource(bg1) must appear strictly AFTER Present.
+        list.Present();
+        const std::vector<Packet> packets = decode(enc);
+        size_t present_idx = packets.size();
+        size_t destroy_tex_idx = packets.size();
+        size_t destroy_bg_idx = packets.size();
+        for (size_t i = 0; i < packets.size(); ++i) {
+            if (packets[i].opcode == GpuOpcode::Present) {
+                present_idx = i;
+            } else if (packets[i].opcode == GpuOpcode::DestroyResource) {
+                const uint32_t id = pod<GpuDestroyResourcePayload>(packets[i]).id;
+                if (id == Scene::kAlbedo) {
+                    destroy_tex_idx = i;
+                } else if (id == bg1) {
+                    destroy_bg_idx = i;
+                }
+            }
+        }
+        CHECK(present_idx < packets.size());
+        CHECK(destroy_tex_idx < packets.size() && destroy_tex_idx > present_idx);
+        CHECK(destroy_bg_idx < packets.size() && destroy_bg_idx > present_idx);
+        CHECK(scene.device.deferred_destroy_count() == 0);
+    }
+
+    // Part B: multi-frame advance_present_frame preserves resources already recorded into an unexecuted
+    // command list of Frame N+1 while flushing deferred destroys from Frame N.
+    {
+        Scene scene;
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(scene.device, enc);
+        scene.bind_root(list);
+        const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+        list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+        // Frame 0 deferred resource (from a previous frame).
+        constexpr uint32_t kOldTex = 888u;
+        scene.device.defer_destroy_resource(kOldTex);
+
+        // Frame 1 starts recording into `list` (not yet executed) and binds kAlbedo BEFORE
+        // advance_present_frame(1) runs.
+        list.DrawInstanced(3, 1, 0, 0);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+
+        gpu::CommandEncoder flush_enc;
+        CHECK(scene.device.advance_present_frame(1, flush_enc));
+        // kOldTex is flushed, while kAlbedo stays pinned in-frame for the unexecuted command list!
+        bool saw_old = false;
+        for (const Packet& pk : decode(flush_enc)) {
+            if (pk.opcode == GpuOpcode::DestroyResource && pod<GpuDestroyResourcePayload>(pk).id == kOldTex) {
+                saw_old = true;
+            }
+        }
+        CHECK(saw_old);
+        CHECK(scene.device.is_resource_used_in_frame(Scene::kAlbedo));
+        CHECK(scene.device.destroy_or_defer_resource(Scene::kAlbedo, flush_enc));
+        list.Close();
+    }
+
+    // Part C: full d3d12_guest::Device::ensure_address_texture LRU eviction of a 256x1 RGBA32Float
+    // texture used in Frame 0: LRU prefers non-in-frame victims, and any forced in-frame eviction
+    // emits DestroyResource strictly AFTER Present, never before.
+    {
+        namespace com = playgta6::guest::com;
+        namespace dg = playgta6::gpu::d3d12_guest;
+
+        os::VirtualMemoryArena arena;
+        com::reset_com_bridge();
+        com::set_guest_memory(&arena);
+        {
+            std::vector<uint8_t> stream;
+            dg::DeviceOptions dev_opts;
+            dev_opts.sink = [&stream](const uint8_t* data, size_t size) {
+                stream.insert(stream.end(), data, data + size);
+            };
+            auto device = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), dev_opts);
+            CHECK(device);
+            device->initialize_guest_payload();
+
+            auto decode_stream = [](const std::vector<uint8_t>& buf) {
+                std::vector<Packet> out;
+                size_t off = 0;
+                while (off + sizeof(GpuPacketHeader) <= buf.size()) {
+                    GpuPacketHeader h{};
+                    std::memcpy(&h, buf.data() + off, sizeof(h));
+                    off += sizeof(h);
+                    Packet p;
+                    p.opcode = static_cast<GpuOpcode>(h.opcode);
+                    p.payload.assign(buf.data() + off, buf.data() + off + h.payload_bytes);
+                    off += h.payload_bytes;
+                    out.push_back(std::move(p));
+                }
+                CHECK(off == buf.size());
+                return out;
+            };
+
+            // Create a 256x1 RGBA32Float (DXGI format 2) address texture and mark it used in Frame 0.
+            constexpr uint64_t kBaseVa = 0x7E00'1000'0000ull;
+            const uint32_t lut_id = device->ensure_address_texture(kBaseVa, 2u, 256u, 1u, 1u, 1u, 0x100u,
+                                                                   GpuTextureDimension::Dim2D, false);
+            CHECK(lut_id != 0);
+            device->state_bridge().note_resource_used(lut_id);
+
+            // Fill the LRU with kMaxAddressTextures cold (not used in Frame 0) textures:
+            // lut_id must NOT be evicted while cold non-in-frame candidates exist.
+            std::vector<uint32_t> others;
+            others.reserve(dg::Device::kMaxAddressTextures);
+            for (size_t i = 1; i <= dg::Device::kMaxAddressTextures; ++i) {
+                const uint32_t id = device->ensure_address_texture(kBaseVa + i * 0x10000ull, 2u, 256u, 1u, 1u, 1u,
+                                                                   0x100u, GpuTextureDimension::Dim2D, false);
+                CHECK(id != 0);
+                others.push_back(id);
+            }
+            bridge::TextureInfo info{};
+            CHECK(device->state_bridge().texture_info(lut_id, &info));
+
+            // Now mark every live texture in Frame 0 with a newer tick than lut_id so the next
+            // allocation MUST evict in-frame lut_id BEFORE Present!
+            for (const uint32_t id : others) {
+                if (device->state_bridge().texture_info(id, &info)) {
+                    device->state_bridge().note_resource_used(id);
+                }
+            }
+            const uint32_t overflow_id = device->ensure_address_texture(
+                kBaseVa + (dg::Device::kMaxAddressTextures + 10u) * 0x10000ull, 2u, 256u, 1u, 1u, 1u, 0x100u,
+                GpuTextureDimension::Dim2D, false);
+            CHECK(overflow_id != 0);
+            CHECK(!device->state_bridge().texture_info(lut_id, &info));  // lut_id was evicted
+
+            // Before Present: ZERO DestroyResource(lut_id) packets may have been emitted!
+            for (const Packet& pk : decode_stream(stream)) {
+                if (pk.opcode == GpuOpcode::DestroyResource) {
+                    CHECK(pod<GpuDestroyResourcePayload>(pk).id != lut_id);
+                }
+            }
+            CHECK(device->state_bridge().deferred_destroy_count() >= 1);
+
+            // Present Frame 0, then flush Frame 1 submission prelude: DestroyResource(lut_id) must
+            // appear strictly AFTER Present!
+            device->present();
+            gpu::CommandEncoder frame1_enc;
+            device->flush_cpu_buffers(frame1_enc);
+            device->submit(frame1_enc);
+
+            const std::vector<Packet> all = decode_stream(stream);
+            size_t present_idx = all.size();
+            size_t destroy_lut_idx = all.size();
+            for (size_t i = 0; i < all.size(); ++i) {
+                if (all[i].opcode == GpuOpcode::Present) {
+                    present_idx = i;
+                } else if (all[i].opcode == GpuOpcode::DestroyResource &&
+                           pod<GpuDestroyResourcePayload>(all[i]).id == lut_id) {
+                    destroy_lut_idx = i;
+                }
+            }
+            CHECK(present_idx < all.size());
+            CHECK(destroy_lut_idx < all.size() && destroy_lut_idx > present_idx);
+        }
+        com::reset_com_bridge();
+        com::set_guest_memory(nullptr);
+    }
+}
+
 int main() {
     test_view_table_bounded();
+    test_unregister_texture_invalidates_cached_bind_groups();
+    test_evicted_texture_destroy_deferred_until_after_present();
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
     test_fragment_storage_texture_format_conversion();
