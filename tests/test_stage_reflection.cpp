@@ -136,6 +136,11 @@ void test_user_data_rule() {
     CHECK(root_parameter_containing_user_sgpr(rs, false, 10, &dw) == 1 && dw == 1);
     CHECK(root_parameter_containing_user_sgpr(rs, false, 12, &dw) == 2 && dw == 1);
     CHECK(root_parameter_containing_user_sgpr(rs, false, 13, &dw) == -1);
+    // Mesh stage: the first root parameter's table is at s16.
+    CHECK(root_parameter_for_user_sgpr(rs, false, 16, kMeshUserDataBase) == 0);
+    CHECK(root_parameter_for_user_sgpr(rs, false, 17, kMeshUserDataBase) == 1);
+    CHECK(root_parameter_for_user_sgpr(rs, false, 8, kMeshUserDataBase) == -1);
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 18, &dw, kMeshUserDataBase) == 1 && dw == 1);
 }
 
 void test_contained_sgpr_and_bitcast_vertex() {
