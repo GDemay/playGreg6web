@@ -4719,6 +4719,8 @@ void test_xbox_schedule_frame_event_signals_handle() {
     CHECK(hr(fx.vcall(scene.device, XSlot::SetFrameInterval, {I(0), I(100000), I(1), I(0)})) == 0);
     const uint64_t tok_va = put<uint64_t>(0);
     CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(1), I(0), I(0), I(tok_va)})) == dg::kSFalse);
+    CHECK(load64(tok_va) == 0);  // flag 2 not set: no fresh token
+    CHECK(hr(fx.vcall(scene.device, XSlot::WaitFrameEvent, {I(0), I(1), I(0), I(2), I(tok_va)})) == dg::kSFalse);
     CHECK(load64(tok_va) != 0);
 
     dev->shutdown_frame_events();
