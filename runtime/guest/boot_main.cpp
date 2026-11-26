@@ -88,6 +88,7 @@
 
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/drop_table.h"
+#include "gpu/gpu_time.h"
 #include "gpu/d3d12_xs_exports.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/frame_capture.h"
