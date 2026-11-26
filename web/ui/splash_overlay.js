@@ -80,6 +80,7 @@
   const DEFAULT_FADE_OUT_MS = 220;
   const DEFAULT_VISIBLE_FRAME_FADE_MS = 450;
   const DEFAULT_HOLD_FALLBACK_TIMEOUT_MS = 240000;
+  const DEFAULT_ELAPSED_INTERVAL_MS = 250;
   const DEFAULT_LOADING_ASSETS_MESSAGE = 'Loading game assets...';
   const DEFAULT_GREG_IMAGE_URL = './assets/greg.png';
   const DEFAULT_GREG_CLICK_THRESHOLD = 3;
@@ -142,7 +143,7 @@
     '.' +
     ROOT_CLASS +
     '__media--greg{display:flex;align-items:center;justify-content:center;box-sizing:border-box;' +
-    'padding:24px 24px 128px;' +
+    'padding:28px 28px 124px;' +
     'background:radial-gradient(circle at 50% 44%,rgba(38,41,50,0.42) 0%,rgba(15,16,22,0.88) 54%,#0b0c10 100%),#0b0c10;}' +
     '.' +
     ROOT_CLASS +
@@ -151,9 +152,11 @@
     ROOT_CLASS +
     '__img.' +
     ROOT_CLASS +
-    '__img--greg{position:relative;inset:auto;width:min(340px,46vmin);height:min(340px,46vmin);' +
-    'max-width:70vw;max-height:55vh;object-fit:contain;object-position:center;' +
-    'user-select:none;pointer-events:none;filter:drop-shadow(0 18px 42px rgba(0,0,0,0.58));}' +
+    '__img--greg{position:relative;inset:auto;width:min(1040px,92vw);height:auto;' +
+    'max-width:100%;max-height:calc(100vh - 152px);aspect-ratio:2/1;object-fit:contain;object-position:center;' +
+    'border-radius:var(--radius-container,16px);user-select:none;pointer-events:none;' +
+    'box-shadow:0 22px 58px rgba(0,0,0,0.68),0 0 0 1px rgba(255,255,255,0.08);' +
+    'animation:pg6-greg-pulse 4800ms ease-in-out infinite;}' +
     '.' +
     ROOT_CLASS +
     '__fallback{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0b1220,#1a2a3a);}' +
@@ -188,7 +191,7 @@
     'align-items:center;justify-content:center;cursor:pointer;user-select:none;}' +
     '.' +
     ROOT_CLASS +
-    '__spinner--greg{width:22px;height:22px;}' +
+    '__spinner--greg{width:14px;height:14px;}' +
     '.' +
     ROOT_CLASS +
     '__spinner-ring{box-sizing:border-box;width:14px;height:14px;border-radius:var(--radius-full,9999px);' +
@@ -197,7 +200,7 @@
     '.' +
     ROOT_CLASS +
     '__greg{width:22px;height:22px;object-fit:contain;border:none;' +
-    'box-shadow:none;display:block;animation:pg6-spin 1200ms linear infinite;}' +
+    'box-shadow:none;display:none;animation:none;}' +
     '.' +
     ROOT_CLASS +
     '__spinner[hidden],.' +
@@ -244,10 +247,21 @@
     'font-variant-numeric:tabular-nums;text-shadow:none;}' +
     '.' +
     ROOT_CLASS +
+    '__elapsed-label{font-family:var(--font-family-body,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif);' +
+    'font-size:11px;font-weight:var(--font-weight-medium,500);color:var(--color-text-secondary,#9e9e9e);}' +
+    '.' +
+    ROOT_CLASS +
+    '__elapsed{font-family:var(--font-family-code,ui-monospace,"SF Mono",SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace);' +
+    'font-size:11px;font-weight:var(--font-weight-medium,500);color:var(--color-text-primary,#dfe2e5);' +
+    'font-variant-numeric:tabular-nums;}' +
+    '.' +
+    ROOT_CLASS +
     '__badge{margin-top:2px;padding:8px 10px;border:none;border-radius:var(--radius-element,12px);' +
     'background:var(--color-error-muted,rgba(255,152,144,0.18));' +
     'color:var(--color-on-error-muted,#ffaea7);font-size:11px;font-weight:var(--font-weight-medium,500);line-height:1.4;}' +
     '@keyframes pg6-spin{from{transform:rotate(0deg);}to{transform:rotate(360deg);}}' +
+    '@keyframes pg6-greg-pulse{0%,100%{transform:scale(1);filter:drop-shadow(0 18px 44px rgba(0,0,0,0.58));}' +
+    '50%{transform:scale(1.012);filter:drop-shadow(0 24px 56px rgba(0,0,0,0.72));}}' +
     '.' +
     ROOT_CLASS +
     '[data-reduced-motion="true"] .' +
@@ -256,7 +270,11 @@
     ROOT_CLASS +
     '[data-reduced-motion="true"] .' +
     ROOT_CLASS +
-    '__greg{animation:none!important;}' +
+    '__greg,.' +
+    ROOT_CLASS +
+    '[data-reduced-motion="true"] .' +
+    ROOT_CLASS +
+    '__img--greg{animation:none!important;transform:none!important;}' +
     '@media (prefers-reduced-motion: reduce){.' +
     ROOT_CLASS +
     ',.' +
@@ -267,7 +285,9 @@
     ROOT_CLASS +
     '__spinner-ring,.' +
     ROOT_CLASS +
-    '__greg{animation:none!important;}}';
+    '__greg,.' +
+    ROOT_CLASS +
+    '__img--greg{animation:none!important;transform:none!important;}}';
 
   /**
    * Strictly validate a scripted-input preset identifier.
@@ -619,6 +639,27 @@
     return `${(n / 1000).toFixed(1)} s`;
   }
 
+  /**
+   * Format an elapsed duration in milliseconds as a live wall-clock string
+   * (`MM:SS` under 1 hour, `H:MM:SS` at 1 hour and above).
+   *
+   * @param {number} ms
+   * @returns {string}
+   */
+  function formatElapsedClock(ms) {
+    const n = typeof ms === 'number' && Number.isFinite(ms) ? Math.max(0, ms) : 0;
+    const totalSeconds = Math.floor(n / 1000);
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    const mm = String(minutes).padStart(2, '0');
+    const ss = String(seconds).padStart(2, '0');
+    if (hours > 0) {
+      return `${hours}:${mm}:${ss}`;
+    }
+    return `${mm}:${ss}`;
+  }
+
   function streamingPct(streamingProgress) {
     if (streamingProgress === undefined || streamingProgress === null) return null;
     if (typeof streamingProgress === 'number') return clampPct(streamingProgress);
@@ -780,6 +821,21 @@
       if (opts.clearTimeout !== undefined && typeof opts.clearTimeout !== 'function') {
         throw new TypeError('clearTimeout must be a function');
       }
+      if (opts.setInterval !== undefined && typeof opts.setInterval !== 'function') {
+        throw new TypeError('setInterval must be a function');
+      }
+      if (opts.clearInterval !== undefined && typeof opts.clearInterval !== 'function') {
+        throw new TypeError('clearInterval must be a function');
+      }
+      if (
+        opts.elapsedIntervalMs !== undefined &&
+        opts.elapsedIntervalMs !== null &&
+        (typeof opts.elapsedIntervalMs !== 'number' ||
+          !Number.isFinite(opts.elapsedIntervalMs) ||
+          opts.elapsedIntervalMs < 0)
+      ) {
+        throw new TypeError('elapsedIntervalMs must be a non-negative finite number');
+      }
       if (opts.nowFn !== undefined && opts.nowFn !== null && typeof opts.nowFn !== 'function') {
         throw new TypeError('nowFn must be a function');
       }
@@ -922,6 +978,24 @@
           : typeof clearTimeout === 'function'
             ? clearTimeout
             : () => {};
+      this._setInterval =
+        typeof opts.setInterval === 'function'
+          ? opts.setInterval
+          : typeof setInterval === 'function'
+            ? setInterval
+            : null;
+      this._clearInterval =
+        typeof opts.clearInterval === 'function'
+          ? opts.clearInterval
+          : typeof clearInterval === 'function'
+            ? clearInterval
+            : () => {};
+      this._elapsedIntervalMs =
+        typeof opts.elapsedIntervalMs === 'number'
+          ? opts.elapsedIntervalMs
+          : DEFAULT_ELAPSED_INTERVAL_MS;
+      this._elapsedTimer = null;
+      this._lastElapsedText = '';
       this._nowFn = typeof opts.nowFn === 'function' ? opts.nowFn : () => Date.now();
       this._reducedMotionOverride =
         typeof opts.reducedMotion === 'boolean' ? opts.reducedMotion : null;
@@ -1006,6 +1080,9 @@
 
       this._applyVisibility(this._visible);
       this._syncChrome();
+      if (this._visible && !this._dismissed) {
+        this._startElapsedTimer();
+      }
     }
 
     _safeNow() {
@@ -1086,31 +1163,26 @@
       const spinnerRing = createEl(doc, 'span', `${ROOT_CLASS}__spinner-ring`, {
         'aria-hidden': 'true',
       });
-      spinnerRing.hidden = Boolean(this._gregMode);
-      if (spinnerRing.style) spinnerRing.style.display = this._gregMode ? 'none' : '';
+      spinnerRing.hidden = false;
+      if (spinnerRing.style) spinnerRing.style.display = '';
       const gregImg = createEl(doc, 'img', `${ROOT_CLASS}__greg`, {
         src: this._gregImageUrl,
-        alt: 'Greg',
+        alt: 'Greg Theft Auto',
         'aria-hidden': 'true',
         draggable: 'false',
         decoding: 'async',
       });
-      gregImg.hidden = !this._gregMode;
-      if (gregImg.style) gregImg.style.display = this._gregMode ? '' : 'none';
+      gregImg.hidden = true;
+      if (gregImg.style) {
+        gregImg.style.display = 'none';
+        gregImg.style.animation = 'none';
+      }
       spinner.appendChild(spinnerRing);
       spinner.appendChild(gregImg);
 
       const stage = createEl(doc, 'div', `${ROOT_CLASS}__stage`);
       stageRow.appendChild(spinner);
       stageRow.appendChild(stage);
-      const bar = createEl(doc, 'div', `${ROOT_CLASS}__bar`, {
-        role: 'progressbar',
-        'aria-valuemin': '0',
-        'aria-valuemax': '100',
-        'aria-valuenow': '0',
-      });
-      const barFill = createEl(doc, 'div', `${ROOT_CLASS}__bar-fill`);
-      bar.appendChild(barFill);
 
       const stream = createEl(doc, 'div', `${ROOT_CLASS}__stream`);
       stream.hidden = true;
@@ -1118,9 +1190,17 @@
       stream.appendChild(streamFill);
 
       const meta = createEl(doc, 'div', `${ROOT_CLASS}__meta`);
-      const pct = createEl(doc, 'span', `${ROOT_CLASS}__pct`);
-      const elapsed = createEl(doc, 'span', `${ROOT_CLASS}__elapsed`);
-      meta.appendChild(pct);
+      const elapsedLabel = createEl(doc, 'span', `${ROOT_CLASS}__elapsed-label`, {
+        text: 'Elapsed',
+      });
+      const elapsed = createEl(doc, 'span', `${ROOT_CLASS}__elapsed`, {
+        role: 'timer',
+        'aria-live': 'off',
+        'data-elapsed-ms': '0',
+        'aria-label': 'Elapsed: 00:00',
+        text: '00:00',
+      });
+      meta.appendChild(elapsedLabel);
       meta.appendChild(elapsed);
 
       const badge = createEl(doc, 'div', `${ROOT_CLASS}__badge`);
@@ -1128,7 +1208,6 @@
 
       panel.appendChild(scripted);
       panel.appendChild(stageRow);
-      panel.appendChild(bar);
       panel.appendChild(stream);
       panel.appendChild(meta);
       panel.appendChild(badge);
@@ -1147,11 +1226,12 @@
         spinnerRing,
         gregImg,
         stage,
-        bar,
-        barFill,
+        bar: null,
+        barFill: null,
         stream,
         streamFill,
-        pct,
+        pct: null,
+        elapsedLabel,
         elapsed,
         badge,
       };
@@ -1213,6 +1293,9 @@
             ? this._root.querySelector(`.${ROOT_CLASS}__stream-fill`)
             : null,
           pct: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__pct`) : null,
+          elapsedLabel: this._root.querySelector
+            ? this._root.querySelector(`.${ROOT_CLASS}__elapsed-label`)
+            : null,
           elapsed: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__elapsed`) : null,
           badge: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__badge`) : null,
         };
@@ -1227,6 +1310,7 @@
             this._imageFailed = true;
           }
           this._syncImage();
+          this._syncSpinner();
         };
         try {
           if (typeof img.addEventListener === 'function') {
@@ -1335,7 +1419,7 @@
               if (!img.getAttribute || img.getAttribute('src') !== activeUrl) {
                 img.setAttribute('src', activeUrl);
               }
-              const altText = gregBackdropActive ? 'Greg' : 'Local splash';
+              const altText = gregBackdropActive ? 'Greg Theft Auto' : 'Local splash';
               if (!img.getAttribute || img.getAttribute('alt') !== altText) {
                 img.setAttribute('alt', altText);
               }
@@ -1348,6 +1432,7 @@
             if (img.style) {
               img.style.display = '';
               img.style.objectFit = gregBackdropActive ? 'contain' : 'cover';
+              img.style.animation = gregBackdropActive && this._isReducedMotion() ? 'none' : '';
             }
           } else {
             if (typeof img.removeAttribute === 'function') {
@@ -1362,6 +1447,7 @@
             if (img.style) {
               img.style.display = 'none';
               img.style.objectFit = '';
+              img.style.animation = '';
             }
           }
           setElementClass(img, `${ROOT_CLASS}__img--greg`, gregBackdropActive);
@@ -1520,7 +1606,7 @@
       const spinnerRing = els.spinnerRing;
       const gregImg = els.gregImg;
       const reducedMotion = this._isReducedMotion();
-      const activeGreg = Boolean(this._gregMode) && !this._gregImageFailed;
+      const activeGreg = Boolean(this._gregMode) && !this._gregBackdropFailed && !this._gregImageFailed;
       const hideSpinner = Boolean(this._dismissed);
 
       if (this._root) {
@@ -1529,6 +1615,14 @@
             this._root.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
             this._root.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
           }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (els.img && els.img.style && this._usingGregBackdrop) {
+        try {
+          els.img.style.animation = reducedMotion ? 'none' : '';
         } catch {
           // ignore
         }
@@ -1544,16 +1638,13 @@
             spinner.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
           }
           const gregClass = `${ROOT_CLASS}__spinner--greg`;
-          if (spinner.classList && typeof spinner.classList.add === 'function' && typeof spinner.classList.remove === 'function') {
-            if (activeGreg) {
-              spinner.classList.add(gregClass);
-            } else {
-              spinner.classList.remove(gregClass);
-            }
+          if (spinner.classList && typeof spinner.classList.remove === 'function') {
+            spinner.classList.remove(gregClass);
           } else if (typeof spinner.className === 'string') {
-            const tokens = spinner.className.split(/\s+/).filter((c) => c && c !== gregClass);
-            if (activeGreg) tokens.push(gregClass);
-            spinner.className = tokens.join(' ');
+            spinner.className = spinner.className
+              .split(/\s+/)
+              .filter((c) => c && c !== gregClass)
+              .join(' ');
           }
         } catch {
           // Spinner updates must never throw.
@@ -1562,9 +1653,9 @@
 
       if (spinnerRing) {
         try {
-          spinnerRing.hidden = activeGreg;
+          spinnerRing.hidden = false;
           if (spinnerRing.style) {
-            spinnerRing.style.display = activeGreg ? 'none' : '';
+            spinnerRing.style.display = '';
             spinnerRing.style.animation = reducedMotion ? 'none' : '';
           }
         } catch {
@@ -1578,8 +1669,8 @@
             if (!gregImg.getAttribute || gregImg.getAttribute('src') !== this._gregImageUrl) {
               gregImg.setAttribute('src', this._gregImageUrl);
             }
-            if (!gregImg.getAttribute || gregImg.getAttribute('alt') !== 'Greg') {
-              gregImg.setAttribute('alt', 'Greg');
+            if (!gregImg.getAttribute || gregImg.getAttribute('alt') !== 'Greg Theft Auto') {
+              gregImg.setAttribute('alt', 'Greg Theft Auto');
             }
             if (!gregImg.getAttribute || gregImg.getAttribute('aria-hidden') !== 'true') {
               gregImg.setAttribute('aria-hidden', 'true');
@@ -1590,14 +1681,84 @@
           } else if (gregImg.src !== this._gregImageUrl) {
             gregImg.src = this._gregImageUrl;
           }
-          gregImg.hidden = !activeGreg;
+          gregImg.hidden = true;
           if (gregImg.style) {
-            gregImg.style.display = activeGreg ? '' : 'none';
-            gregImg.style.animation = reducedMotion ? 'none' : '';
+            gregImg.style.display = 'none';
+            gregImg.style.animation = 'none';
           }
         } catch {
           // ignore
         }
+      }
+    }
+
+    _computeLiveElapsedMs() {
+      const clockElapsed =
+        typeof this._totalSplashMs === 'number' &&
+        Number.isFinite(this._totalSplashMs) &&
+        this._totalSplashMs >= 0
+          ? sanitizeNonNegativeMs(this._totalSplashMs)
+          : sanitizeNonNegativeMs(this._safeNow() - this._splashStartedAtMs);
+      const reportedElapsed = sanitizeNonNegativeMs(this._elapsedMs);
+      return Math.max(clockElapsed, reportedElapsed);
+    }
+
+    _syncElapsedDisplay(force = false) {
+      const els = this._els || {};
+      const liveMs = this._computeLiveElapsedMs();
+      const formatted = formatElapsedClock(liveMs);
+      if (els.elapsed && (force || formatted !== this._lastElapsedText)) {
+        try {
+          els.elapsed.textContent = formatted;
+          if (typeof els.elapsed.setAttribute === 'function') {
+            els.elapsed.setAttribute('data-elapsed-ms', String(liveMs));
+            els.elapsed.setAttribute('aria-label', `Elapsed: ${formatted}`);
+          }
+        } catch {
+          // ignore
+        }
+      }
+      this._lastElapsedText = formatted;
+      return formatted;
+    }
+
+    _startElapsedTimer() {
+      if (
+        this._destroyed ||
+        this._dismissed ||
+        !this._visible ||
+        this._elapsedTimer !== null ||
+        !this._setInterval ||
+        this._elapsedIntervalMs <= 0
+      ) {
+        return;
+      }
+      this._syncElapsedDisplay(true);
+      try {
+        const id = this._setInterval(() => {
+          if (this._destroyed || this._dismissed || !this._visible) {
+            this._stopElapsedTimer();
+            return;
+          }
+          this._syncElapsedDisplay(false);
+        }, this._elapsedIntervalMs);
+        if (id && typeof id === 'object' && typeof id.unref === 'function') {
+          id.unref();
+        }
+        this._elapsedTimer = id;
+      } catch {
+        this._elapsedTimer = null;
+      }
+    }
+
+    _stopElapsedTimer() {
+      if (this._elapsedTimer !== null && this._elapsedTimer !== undefined) {
+        try {
+          this._clearInterval(this._elapsedTimer);
+        } catch {
+          // ignore
+        }
+        this._elapsedTimer = null;
       }
     }
 
@@ -1608,7 +1769,7 @@
 
       if (els.stage) els.stage.textContent = stageText;
       if (els.pct) els.pct.textContent = `${pct}%`;
-      if (els.elapsed) els.elapsed.textContent = formatElapsed(this._elapsedMs);
+      this._syncElapsedDisplay(true);
 
       if (els.barFill) {
         if (els.barFill.style) {
@@ -1850,6 +2011,70 @@
     }
 
     /**
+     * Backwards-compatible convenience helper for callers updating progress directly.
+     *
+     * @param {number|object|null|undefined} progress
+     * @returns {object} Current controller state.
+     */
+    updateProgress(progress) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      if (typeof progress === 'number') {
+        return this.updateBootState({
+          stage: this._stage,
+          progressPct: progress,
+          elapsedMs: this._elapsedMs,
+        });
+      }
+      if (progress && typeof progress === 'object') {
+        const patch = {
+          stage: progress.stage || this._stage,
+          elapsedMs:
+            typeof progress.elapsedMs === 'number' ? progress.elapsedMs : this._elapsedMs,
+        };
+        if (progress.progressPct !== undefined) {
+          patch.progressPct = progress.progressPct;
+        } else if (progress.pct !== undefined) {
+          patch.progressPct = progress.pct;
+        }
+        if (
+          progress.loadedBytes !== undefined ||
+          progress.totalBytes !== undefined ||
+          progress.streamingProgress !== undefined
+        ) {
+          patch.streamingProgress = progress.streamingProgress || progress;
+        }
+        if (typeof progress.statusText === 'string') {
+          patch.statusText = progress.statusText;
+        }
+        return this.updateBootState(patch);
+      }
+      return this.getState();
+    }
+
+    /**
+     * Backwards-compatible convenience helper for callers updating stage / status text directly.
+     *
+     * @param {string} stage
+     * @param {string} [statusText]
+     * @returns {object} Current controller state.
+     */
+    setStage(stage, statusText) {
+      if (this._destroyed) {
+        return this.getState();
+      }
+      const patch = {
+        stage,
+        elapsedMs: this._elapsedMs,
+      };
+      if (typeof statusText === 'string' && statusText.trim().length > 0) {
+        patch.statusText = statusText;
+      }
+      return this.updateBootState(patch);
+    }
+
+    /**
      * Dynamically set or clear the local splash image URL (e.g. after `/api/status`
      * discovers `/game/xbs_splash.png`). Resets prior image-error state when URL changes.
      *
@@ -1923,6 +2148,7 @@
     }
 
     _completeDismiss(effectiveFadeMs, startedAtMs, reason) {
+      this._stopElapsedTimer();
       const completedAtMs = this._safeNow();
       let fadeDurationMs = 0;
       if (effectiveFadeMs > 0) {
@@ -1931,6 +2157,7 @@
       }
       this._finalizeActivePhase(completedAtMs);
       this._totalSplashMs = sanitizeNonNegativeMs(completedAtMs - this._splashStartedAtMs);
+      this._syncElapsedDisplay(true);
       this._fadeOutCompleted = true;
       this._dismissedAtMs = completedAtMs;
       this._dismissCount += 1;
@@ -2253,8 +2480,10 @@
       this._holdingForVisibleFrame = false;
       this._fadeOutCompleted = false;
       this._pendingDismissReason = resolvedReason;
+      this._stopElapsedTimer();
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
+      this._syncElapsedDisplay(true);
       this._enterPhase('FIRST_VISIBLE_FRAME');
       if (this._progressPct < 100) {
         this._progressPct = 100;
@@ -2357,6 +2586,7 @@
       }
       this._applyVisibility(true);
       this._syncChrome();
+      this._startElapsedTimer();
       return this.getState();
     }
 
@@ -2388,6 +2618,7 @@
         return this.getState();
       }
       const wasFading = this._fading;
+      this._stopElapsedTimer();
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
       this._fading = false;
@@ -2470,6 +2701,8 @@
         progressPct: Math.round(clampPct(this._progressPct)),
         stageDurationsMs: this._getSanitizedStageDurationsMs(),
         totalSplashMs: this._getSanitizedTotalSplashMs(),
+        liveElapsedMs: this._computeLiveElapsedMs(),
+        elapsedText: formatElapsedClock(this._computeLiveElapsedMs()),
         readyForSplash: Boolean(this._readyForSplash),
         scriptedInputPreset: this._scriptedInputPreset,
         gregMode: Boolean(this._gregMode),
@@ -2518,6 +2751,8 @@
         stageLabel: this._stageLabel,
         statusText: this._statusText,
         elapsedMs: this._elapsedMs,
+        liveElapsedMs: this._computeLiveElapsedMs(),
+        elapsedText: formatElapsedClock(this._computeLiveElapsedMs()),
         stageDurationsMs: this._getSanitizedStageDurationsMs(),
         totalSplashMs: this._getSanitizedTotalSplashMs(),
         badgeText: this._badgeText,
@@ -2563,6 +2798,7 @@
         this._totalSplashMs = sanitizeNonNegativeMs(destroyedAtMs - this._splashStartedAtMs);
       }
       this._destroyed = true;
+      this._stopElapsedTimer();
       this._clearFadeTimer();
       this._clearHoldFallbackTimer();
       this._holdingForVisibleFrame = false;
@@ -2643,6 +2879,7 @@
     BOOT_PHASE_RANGES,
     DISMISS_REASONS,
     computeBootProgress,
+    formatElapsedClock,
     resolveBootPhase,
     clampMonotonicPhaseProgress,
     sanitizeScriptedInputPreset,
@@ -2656,6 +2893,7 @@
     DEFAULT_FADE_OUT_MS,
     DEFAULT_VISIBLE_FRAME_FADE_MS,
     DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
+    DEFAULT_ELAPSED_INTERVAL_MS,
     DEFAULT_LOADING_ASSETS_MESSAGE,
     DEFAULT_GREG_IMAGE_URL,
     DEFAULT_GREG_CLICK_THRESHOLD,
