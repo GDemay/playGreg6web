@@ -6,11 +6,13 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -26,13 +28,26 @@
 #define PG6_GUEST_HELPER
 #endif
 
+#if defined(_MSC_VER)
+#define PG6_NOINLINE __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+#define PG6_NOINLINE __attribute__((noinline))
+#else
+#define PG6_NOINLINE
+#endif
+
 namespace playgta6::guest {
 
 namespace {
 
-constexpr size_t kChunkBits = 12;
-constexpr size_t kChunkSize = size_t{1} << kChunkBits;
-constexpr size_t kMaxChunks = static_cast<size_t>(kMaxSyntheticTargets / kChunkSize);
+constexpr uint64_t kSyntheticStrideMask = kSyntheticStride - 1;
+constexpr unsigned kSyntheticStrideShift = 4;
+constexpr uint64_t kSyntheticSpan = kMaxSyntheticTargets * kSyntheticStride;
+constexpr uint64_t kInitialSyntheticCapacity = 4096;
+static_assert((uint64_t{1} << kSyntheticStrideShift) == kSyntheticStride,
+              "kSyntheticStride must be 16");
+static_assert(kSyntheticBase + kSyntheticSpan > kSyntheticBase,
+              "synthetic address range must not wrap uint64_t");
 
 struct LiftedTable {
     const LiftedFunctionEntry* entries = nullptr;
@@ -41,13 +56,28 @@ struct LiftedTable {
     uint64_t hi = 0;
 };
 
-struct SyntheticEntry {
-    HostThunkFn thunk = nullptr;
-    uint64_t image_base = 0;
-    uint32_t slot_rva = 0;
-    bool is_import = false;
-    const char* name = nullptr;
+// Immutable snapshot published for lock-free O(1) direct-indexed synthetic lookups.
+// `entries` is a contiguous flat array of `SyntheticTarget` indexed directly by
+// `(va - kSyntheticBase) >> kSyntheticStrideShift`. Index 0 is reserved for kGuestReturnSentinel;
+// valid published indices are [1, count).
+struct SyntheticSnapshot {
+    const SyntheticTarget* entries;
+    uint64_t count;
 };
+
+constexpr SyntheticSnapshot kEmptySyntheticSnapshot{nullptr, 1};
+
+// Read-mostly atomics grouped on one cache line away from mutated registry fields and mutexes,
+// zero/constexpr-initialized at namespace scope so hot dispatch/describe paths never touch
+// function-local static init guards.
+struct alignas(64) HotDispatchGlobals {
+    std::atomic<DispatchObserver> observer{nullptr};
+    std::atomic<uint64_t> generation{1};  // 0 marks an empty/invalidated L1 cache
+    std::atomic<const SyntheticSnapshot*> synthetic_snapshot{&kEmptySyntheticSnapshot};
+    std::atomic<bool> cache_enabled{true};
+};
+
+HotDispatchGlobals g_hot{};
 
 // Readers (dispatch) only touch the atomics and the data they publish; everything else is
 // guarded by `mutex`.
@@ -64,9 +94,13 @@ struct Registry {
     std::atomic<size_t> shard_function_count{0};
     std::atomic<size_t> shard_count{0};
 
-    std::atomic<SyntheticEntry*> chunks[kMaxChunks];
-    std::vector<std::unique_ptr<SyntheticEntry[]>> owned_chunks;
-    std::atomic<uint64_t> synthetic_count{1};  // index 0 is kGuestReturnSentinel
+    // Flat contiguous synthetic table storage + snapshot history (guarded by `mutex`; readers
+    // access only via `g_hot.synthetic_snapshot`).
+    SyntheticTarget* synthetic_entries = nullptr;
+    uint64_t synthetic_capacity = 0;
+    uint64_t synthetic_count = 1;  // index 0 is kGuestReturnSentinel
+    std::vector<std::unique_ptr<SyntheticTarget[]>> owned_synthetic_arrays;
+    std::deque<SyntheticSnapshot> synthetic_snapshots;
 
     std::deque<std::string> names;
     std::unordered_map<uint64_t, uint64_t> proc_to_synthetic;
@@ -79,20 +113,57 @@ Registry& registry() {
     return instance;
 }
 
-std::atomic<DispatchObserver> g_dispatch_observer{nullptr};
+// ---- Dispatch caches (L1 inline TLS + L2 4096-entry) ---------------------------------------
+// In front of registry resolution sit two per-thread direct-mapped caches:
+//   - L1: 256-slot (8 KiB) table inline in TLS (no pointer chase, no TLS init guard). A single
+//     generation check (`t_l1_dispatch_cache.generation == generation`) validates the whole L1
+//     table in one branch, so repeated indirect calls resolve in ~3 instructions without binary
+//     search, shard lookup, or synthetic snapshot loads.
+//   - L2: 4096-slot (128 KiB) heap table allocated lazily on first fill, catching L1 conflict
+//     misses for wider working sets and promoting hits back into L1.
+// Only resolved targets (lifted functions, shard dispatch targets, and bound synthetic thunks)
+// are cached; unknown targets and kGuestReturnSentinel always reach the slow path. Every registry
+// mutation, reset, or enable/disable bumps `g_hot.generation` with release semantics after
+// publishing, so stale entries are never served.
 
-// ---- Dispatch cache ------------------------------------------------------------------------
-// A per-thread direct-mapped cache guest VA -> resolved lifted function or shard dispatcher in
-// front of the registry lookup. Only resolved lifted targets are cached (no misses, no synthetic
-// addresses: those resolve in O(1) already), so unknown targets still reach the slow path and
-// raise the same fault. Every registry change bumps g_dispatch_generation after publishing; an
-// entry is valid only for the generation it was filled under (read before the lookup), so no
-// thread ever uses an entry that a later registration could shadow. The hit path is one acquire
-// load of the generation plus thread-local memory: no locks, no shared writes.
+enum DispatchCacheKind : uint32_t {
+    kCachedEmpty = 0,
+    kCachedLifted = 1,
+    kCachedShard = 2,
+    kCachedSynthetic = 3,
+};
 
-std::atomic<uint64_t> g_dispatch_generation{1};  // 0 marks an empty cache entry
+constexpr unsigned kDispatchL1Bits = 8;  // 256 entries, 8 KiB inline in TLS
+constexpr size_t kDispatchL1Size = size_t{1} << kDispatchL1Bits;
+constexpr size_t kDispatchL1Mask = kDispatchL1Size - 1;
 
-enum DispatchCacheKind : uint32_t { kCachedLifted = 1, kCachedShard = 2 };
+struct alignas(32) DispatchL1Entry {
+    uint64_t va;
+    union {
+        LiftedFn lifted;
+        Pg6ShardDispatchFn shard;
+        HostThunkFn thunk;
+    } fn;
+    uint32_t local_idx;
+    uint32_t kind;
+};
+static_assert(sizeof(DispatchL1Entry) == 32, "two L1 entries per cache line");
+static_assert(std::is_trivially_copyable_v<DispatchL1Entry>, "no TLS init guard");
+
+struct alignas(64) DispatchL1Cache {
+    uint64_t generation;  // 0 = empty / invalidated (g_hot.generation starts at 1)
+    DispatchL1Entry entries[kDispatchL1Size];
+};
+static_assert(std::is_trivially_default_constructible_v<DispatchL1Cache>, "zero-init .tbss");
+static_assert(std::is_trivially_destructible_v<DispatchL1Cache>, "safe during thread exit");
+
+thread_local DispatchL1Cache t_l1_dispatch_cache;
+
+inline size_t dispatch_l1_index(uint64_t va) noexcept {
+    // Lifted functions (16-byte aligned) and synthetic addresses (stride 16) vary from bit 4 up;
+    // folding bits 4..27 avoids collisions across sequential slots and 4 KiB pages without a mul.
+    return static_cast<size_t>(((va >> 4) ^ (va >> 12) ^ (va >> 20)) & kDispatchL1Mask);
+}
 
 struct alignas(32) DispatchCacheEntry {
     uint64_t va = 0;
@@ -100,9 +171,10 @@ struct alignas(32) DispatchCacheEntry {
     union {
         LiftedFn lifted;
         Pg6ShardDispatchFn shard;
+        HostThunkFn thunk;
     } fn{nullptr};
     uint32_t local_idx = 0;
-    uint32_t kind = 0;
+    uint32_t kind = kCachedEmpty;
 };
 static_assert(sizeof(DispatchCacheEntry) == 32, "two entries per cache line");
 
@@ -127,11 +199,11 @@ struct DispatchCacheOwner {
     }
 };
 
-inline size_t dispatch_cache_index(uint64_t va) {
+inline size_t dispatch_cache_index(uint64_t va) noexcept {
     return static_cast<size_t>((va * 0x9E3779B97F4A7C15ULL) >> (64 - kDispatchCacheBits));
 }
 
-// The calling thread's cache (allocated on first use), or nullptr if it cannot have one.
+// The calling thread's L2 cache (allocated on first use), or nullptr if it cannot have one.
 DispatchCache* dispatch_cache_for_fill() {
     if (DispatchCache* cache = t_dispatch_cache) {
         return cache;
@@ -147,13 +219,34 @@ DispatchCache* dispatch_cache_for_fill() {
     return owner.cache;
 }
 
-std::atomic<bool> g_dispatch_cache_enabled{true};
+inline void fill_l1_cache(uint64_t va, uint64_t generation, uint32_t kind, LiftedFn lifted,
+                          Pg6ShardDispatchFn shard, HostThunkFn thunk, uint32_t local_idx) {
+    if (t_l1_dispatch_cache.generation != generation) {
+        if (t_l1_dispatch_cache.generation > generation) {
+            return;
+        }
+        std::memset(t_l1_dispatch_cache.entries, 0, sizeof(t_l1_dispatch_cache.entries));
+        t_l1_dispatch_cache.generation = generation;
+    }
+    DispatchL1Entry& e = t_l1_dispatch_cache.entries[dispatch_l1_index(va)];
+    e.va = va;
+    if (kind == kCachedLifted) {
+        e.fn.lifted = lifted;
+    } else if (kind == kCachedShard) {
+        e.fn.shard = shard;
+    } else {
+        e.fn.thunk = thunk;
+    }
+    e.local_idx = local_idx;
+    e.kind = kind;
+}
 
-void fill_dispatch_cache(uint64_t va, uint64_t generation, LiftedFn lifted, Pg6ShardDispatchFn shard,
-                         uint32_t local_idx) {
-    if (!g_dispatch_cache_enabled.load(std::memory_order_relaxed)) {
+void fill_dispatch_cache(uint64_t va, uint64_t generation, uint32_t kind, LiftedFn lifted,
+                         Pg6ShardDispatchFn shard, HostThunkFn thunk, uint32_t local_idx) {
+    if (!g_hot.cache_enabled.load(std::memory_order_relaxed)) {
         return;
     }
+    fill_l1_cache(va, generation, kind, lifted, shard, thunk, local_idx);
     DispatchCache* cache = dispatch_cache_for_fill();
     if (cache == nullptr) {
         return;
@@ -161,19 +254,20 @@ void fill_dispatch_cache(uint64_t va, uint64_t generation, LiftedFn lifted, Pg6S
     DispatchCacheEntry& e = cache->entries[dispatch_cache_index(va)];
     e.va = va;
     e.generation = generation;
-    if (lifted != nullptr) {
+    if (kind == kCachedLifted) {
         e.fn.lifted = lifted;
-        e.kind = kCachedLifted;
-    } else {
+    } else if (kind == kCachedShard) {
         e.fn.shard = shard;
-        e.kind = kCachedShard;
+    } else {
+        e.fn.thunk = thunk;
     }
     e.local_idx = local_idx;
+    e.kind = kind;
 }
 
-// Called after a registry change is published (under the registry mutex).
+// Called after a registry change is published (under the registry mutex) or on cache toggle.
 void invalidate_dispatch_caches() {
-    g_dispatch_generation.fetch_add(1, std::memory_order_release);
+    g_hot.generation.fetch_add(1, std::memory_order_release);
 }
 
 const LiftedFunctionEntry* find_entry(const LiftedTable& table, uint64_t va) {
@@ -209,47 +303,96 @@ uint64_t nearest_entry_at_or_below(uint64_t va) {
     return best;
 }
 
-const SyntheticEntry* find_synthetic(uint64_t va) {
-    if (!is_synthetic_address(va)) {
-        return nullptr;
-    }
+inline const SyntheticTarget* find_synthetic(uint64_t va) noexcept {
     const uint64_t offset = va - kSyntheticBase;
-    if (offset % kSyntheticStride != 0) {
+    // Reject misaligned addresses, kGuestReturnSentinel (offset == 0 -> offset - 1 wraps to
+    // UINT64_MAX), addresses below kSyntheticBase, and addresses at/above the synthetic span
+    // before issuing any atomic load.
+    if (((offset & kSyntheticStrideMask) != 0) | ((offset - 1) >= (kSyntheticSpan - 1))) [[unlikely]] {
         return nullptr;
     }
-    const uint64_t index = offset / kSyntheticStride;
-    Registry& reg = registry();
-    if (index == 0 || index >= reg.synthetic_count.load(std::memory_order_acquire)) {
+    const uint64_t index = offset >> kSyntheticStrideShift;
+    const SyntheticSnapshot* snap = g_hot.synthetic_snapshot.load(std::memory_order_acquire);
+    if (index >= snap->count) [[unlikely]] {
         return nullptr;
     }
-    const SyntheticEntry* chunk =
-        reg.chunks[static_cast<size_t>(index >> kChunkBits)].load(std::memory_order_acquire);
-    if (chunk == nullptr) {
-        return nullptr;
-    }
-    return &chunk[static_cast<size_t>(index & (kChunkSize - 1))];
+    return &snap->entries[static_cast<size_t>(index)];
 }
 
 // Reserves the next synthetic slot (not yet visible to readers). Returns 0 when full.
-uint64_t reserve_synthetic_locked(Registry& reg, SyntheticEntry** slot) {
-    const uint64_t index = reg.synthetic_count.load(std::memory_order_relaxed);
+uint64_t reserve_synthetic_locked(Registry& reg, SyntheticTarget** slot) {
+    const uint64_t index = reg.synthetic_count;
     if (index >= kMaxSyntheticTargets) {
         return 0;
     }
-    const size_t chunk_index = static_cast<size_t>(index >> kChunkBits);
-    SyntheticEntry* chunk = reg.chunks[chunk_index].load(std::memory_order_relaxed);
-    if (chunk == nullptr) {
-        reg.owned_chunks.push_back(std::make_unique<SyntheticEntry[]>(kChunkSize));
-        chunk = reg.owned_chunks.back().get();
-        reg.chunks[chunk_index].store(chunk, std::memory_order_release);
+    if (index >= reg.synthetic_capacity) {
+        const uint64_t new_capacity =
+            reg.synthetic_capacity == 0
+                ? kInitialSyntheticCapacity
+                : std::min<uint64_t>(reg.synthetic_capacity * 2, kMaxSyntheticTargets);
+        auto new_storage = std::make_unique<SyntheticTarget[]>(static_cast<size_t>(new_capacity));
+        if (reg.synthetic_entries != nullptr) {
+            std::copy_n(reg.synthetic_entries, static_cast<size_t>(index), new_storage.get());
+        }
+        reg.synthetic_entries = new_storage.get();
+        reg.synthetic_capacity = new_capacity;
+        reg.owned_synthetic_arrays.push_back(std::move(new_storage));
     }
-    *slot = &chunk[static_cast<size_t>(index & (kChunkSize - 1))];
+    *slot = &reg.synthetic_entries[static_cast<size_t>(index)];
     return kSyntheticBase + index * kSyntheticStride;
 }
 
 void publish_synthetic_locked(Registry& reg) {
-    reg.synthetic_count.store(reg.synthetic_count.load(std::memory_order_relaxed) + 1,
-                              std::memory_order_release);
+    const uint64_t new_count = ++reg.synthetic_count;
+    reg.synthetic_snapshots.push_back(SyntheticSnapshot{reg.synthetic_entries, new_count});
+    g_hot.synthetic_snapshot.store(&reg.synthetic_snapshots.back(), std::memory_order_release);
+}
+
+PG6_NOINLINE void indirect_call_slow(GuestState* state, uint64_t target, uint64_t generation) {
+    if (const DispatchCache* l2 = t_dispatch_cache) {
+        const DispatchCacheEntry& e = l2->entries[dispatch_cache_index(target)];
+        if (e.va == target && e.generation == generation) {
+            fill_l1_cache(target, generation, e.kind, e.fn.lifted, e.fn.shard, e.fn.thunk,
+                          e.local_idx);
+            if (e.kind == kCachedShard) {
+                e.fn.shard(e.local_idx, state);
+                return;
+            }
+            if (e.kind == kCachedSynthetic) {
+                e.fn.thunk(state);
+                return;
+            }
+            if (e.kind == kCachedLifted) {
+                e.fn.lifted(state);
+                return;
+            }
+        }
+    }
+    if (is_synthetic_address(target)) {
+        if (target == kGuestReturnSentinel) {
+            return;  // a jump to call_guest's return address: back to the host caller
+        }
+        if (const SyntheticTarget* entry = find_synthetic(target)) {
+            fill_dispatch_cache(target, generation, kCachedSynthetic, nullptr, nullptr, entry->thunk,
+                                0);
+            entry->thunk(state);
+            return;
+        }
+    } else {
+        if (LiftedFn fn = find_lifted_function(target)) {
+            fill_dispatch_cache(target, generation, kCachedLifted, fn, nullptr, nullptr, 0);
+            fn(state);
+            return;
+        }
+        ResolvedShardTarget shard_target{};
+        if (find_shard_dispatch_target(target, shard_target) && shard_target.dispatcher != nullptr) {
+            fill_dispatch_cache(target, generation, kCachedShard, nullptr, shard_target.dispatcher,
+                                nullptr, shard_target.local_idx);
+            shard_target.dispatcher(shard_target.local_idx, state);
+            return;
+        }
+    }
+    raise_fault(FaultKind::UnknownTarget, state, target, nearest_entry_at_or_below(target));
 }
 
 // Writes one 8-byte IAT slot, temporarily making a read-only page writable.
@@ -455,7 +598,7 @@ size_t bind_import_slots(os::VirtualMemoryArena& arena,
             os::log(message);
             continue;
         }
-        SyntheticEntry* entry = nullptr;
+        SyntheticTarget* entry = nullptr;
         const uint64_t address = reserve_synthetic_locked(reg, &entry);
         if (address == 0) {
             os::log("guest runtime: synthetic address table full, import slots left unbound");
@@ -468,7 +611,7 @@ size_t bind_import_slots(os::VirtualMemoryArena& arena,
             os::log(message);
             continue;
         }
-        *entry = SyntheticEntry{slot.thunk, image_base, slot.slot_rva, true, nullptr};
+        *entry = SyntheticTarget{slot.thunk, image_base, slot.slot_rva, true, nullptr};
         publish_synthetic_locked(reg);
         ++bound;
     }
@@ -484,7 +627,7 @@ uint64_t register_host_callable(HostThunkFn thunk, const char* name, uint64_t pr
     }
     Registry& reg = registry();
     std::lock_guard<std::mutex> lock(reg.mutex);
-    SyntheticEntry* entry = nullptr;
+    SyntheticTarget* entry = nullptr;
     const uint64_t address = reserve_synthetic_locked(reg, &entry);
     if (address == 0) {
         return 0;
@@ -494,7 +637,7 @@ uint64_t register_host_callable(HostThunkFn thunk, const char* name, uint64_t pr
         reg.names.emplace_back(name);
         stored_name = reg.names.back().c_str();
     }
-    *entry = SyntheticEntry{thunk, 0, 0, false, stored_name};
+    *entry = SyntheticTarget{thunk, 0, 0, false, stored_name};
     publish_synthetic_locked(reg);
     if (proc_address != 0) {
         reg.proc_to_synthetic[proc_address] = address;
@@ -511,13 +654,12 @@ uint64_t guest_callable_for_proc(uint64_t proc_address) {
 }
 
 bool describe_synthetic(uint64_t va, SyntheticTarget* out) {
-    const SyntheticEntry* entry = find_synthetic(va);
-    if (entry == nullptr) {
+    const SyntheticTarget* entry = find_synthetic(va);
+    if (entry == nullptr) [[unlikely]] {
         return false;
     }
-    if (out != nullptr) {
-        *out = SyntheticTarget{entry->thunk, entry->image_base, entry->slot_rva, entry->is_import,
-                               entry->name};
+    if (out != nullptr) [[likely]] {
+        *out = *entry;
     }
     return true;
 }
@@ -591,17 +733,17 @@ size_t format_fault(const FaultInfo& info, char* buffer, size_t size) {
 }
 
 DispatchObserver set_dispatch_observer(DispatchObserver observer) {
-    return g_dispatch_observer.exchange(observer, std::memory_order_acq_rel);
+    return g_hot.observer.exchange(observer, std::memory_order_acq_rel);
 }
 
 bool set_dispatch_cache_enabled(bool enabled) {
-    const bool previous = g_dispatch_cache_enabled.exchange(enabled, std::memory_order_relaxed);
+    const bool previous = g_hot.cache_enabled.exchange(enabled, std::memory_order_acq_rel);
     invalidate_dispatch_caches();  // a disabled cache must not keep serving old fills
     return previous;
 }
 
 uint64_t dispatch_cache_generation() {
-    return g_dispatch_generation.load(std::memory_order_acquire);
+    return g_hot.generation.load(std::memory_order_acquire);
 }
 
 void raise_fault(FaultKind kind, GuestState* state, uint64_t va, uint64_t detail) {
@@ -747,15 +889,16 @@ void reset_guest_runtime() {
     reg.owned_shard_registries.clear();
     reg.shard_function_count.store(0, std::memory_order_relaxed);
     reg.shard_count.store(0, std::memory_order_relaxed);
-    reg.synthetic_count.store(1, std::memory_order_release);
-    for (auto& chunk : reg.chunks) {
-        chunk.store(nullptr, std::memory_order_release);
-    }
-    reg.owned_chunks.clear();
+    g_hot.synthetic_snapshot.store(&kEmptySyntheticSnapshot, std::memory_order_release);
+    reg.synthetic_count = 1;
+    reg.synthetic_entries = nullptr;
+    reg.synthetic_capacity = 0;
+    reg.owned_synthetic_arrays.clear();
+    reg.synthetic_snapshots.clear();
     reg.names.clear();
     reg.proc_to_synthetic.clear();
     reg.fault_handler.store(nullptr, std::memory_order_release);
-    g_dispatch_observer.store(nullptr, std::memory_order_release);
+    g_hot.observer.store(nullptr, std::memory_order_release);
     invalidate_dispatch_caches();
 }
 
@@ -772,47 +915,31 @@ extern "C" {
 
 PG6_GUEST_HELPER void __playgta6_indirect_call(GuestState* state, uint64_t target) {
     state->rip = target;
-    if (guest::DispatchObserver observer = guest::g_dispatch_observer.load(std::memory_order_acquire)) {
+    if (guest::DispatchObserver observer =
+            guest::g_hot.observer.load(std::memory_order_acquire)) [[unlikely]] {
         observer(state, target);
     }
-    // Fast path: this thread resolved `target` before and the registry has not changed since.
-    const uint64_t generation = guest::g_dispatch_generation.load(std::memory_order_acquire);
-    if (const guest::DispatchCache* cache = guest::t_dispatch_cache) {
-        const guest::DispatchCacheEntry& e = cache->entries[guest::dispatch_cache_index(target)];
-        if (e.va == target && e.generation == generation) {
+    // Fast path: inline 256-slot L1 TLS cache validated by a single generation comparison.
+    const uint64_t generation = guest::g_hot.generation.load(std::memory_order_acquire);
+    if (guest::t_l1_dispatch_cache.generation == generation) [[likely]] {
+        const guest::DispatchL1Entry& e =
+            guest::t_l1_dispatch_cache.entries[guest::dispatch_l1_index(target)];
+        if (e.va == target) [[likely]] {
+            if (e.kind == guest::kCachedShard) [[likely]] {
+                e.fn.shard(e.local_idx, state);
+                return;
+            }
+            if (e.kind == guest::kCachedSynthetic) {
+                e.fn.thunk(state);
+                return;
+            }
             if (e.kind == guest::kCachedLifted) {
                 e.fn.lifted(state);
-            } else {
-                e.fn.shard(e.local_idx, state);
+                return;
             }
-            return;
         }
     }
-    if (guest::is_synthetic_address(target)) {
-        if (target == guest::kGuestReturnSentinel) {
-            return;  // a jump to call_guest's return address: back to the host caller
-        }
-        if (const guest::SyntheticEntry* entry = guest::find_synthetic(target)) {
-            entry->thunk(state);
-            return;
-        }
-    } else {
-        if (playgta6::LiftedFn fn = guest::find_lifted_function(target)) {
-            guest::fill_dispatch_cache(target, generation, fn, nullptr, 0);
-            fn(state);
-            return;
-        }
-        guest::ResolvedShardTarget shard_target{};
-        if (guest::find_shard_dispatch_target(target, shard_target) &&
-            shard_target.dispatcher != nullptr) {
-            guest::fill_dispatch_cache(target, generation, nullptr, shard_target.dispatcher,
-                                       shard_target.local_idx);
-            shard_target.dispatcher(shard_target.local_idx, state);
-            return;
-        }
-    }
-    guest::raise_fault(guest::FaultKind::UnknownTarget, state, target,
-                       guest::nearest_entry_at_or_below(target));
+    guest::indirect_call_slow(state, target, generation);
 }
 
 PG6_GUEST_HELPER void __playgta6_trap(GuestState* state, uint64_t va) {
