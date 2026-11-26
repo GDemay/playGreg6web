@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -5146,7 +5148,993 @@ void test_rt_off_skips_and_counts() {
     CHECK(rig.reads.empty());
 }
 
+// =================================================================================================
+// G81: Full 3D pipeline StateBridge tests
+// =================================================================================================
+
+void test_g81_depth_bias_and_shadow_map_parity() {
+    // 1. Direct float / bits sanitization (NaN, +/-Inf, -0.0f -> +0.0f; finite preserved).
+    CHECK(bridge::sanitize_depth_bias_float(std::numeric_limits<float>::quiet_NaN()) == 0.0f);
+    CHECK(bridge::sanitize_depth_bias_float(std::numeric_limits<float>::infinity()) == 0.0f);
+    CHECK(bridge::sanitize_depth_bias_float(-std::numeric_limits<float>::infinity()) == 0.0f);
+    CHECK(bridge::sanitize_depth_bias_bits(-0.0f) == 0u);
+    CHECK(bridge::sanitize_depth_bias_bits(std::numeric_limits<float>::infinity()) == 0u);
+    CHECK(bridge::sanitize_depth_bias_bits(-std::numeric_limits<float>::infinity()) == 0u);
+    CHECK(bridge::sanitize_depth_bias_bits(std::numeric_limits<float>::quiet_NaN()) == 0u);
+    {
+        uint32_t expected_bits = 0;
+        const float slope = -1.75f;
+        std::memcpy(&expected_bits, &slope, sizeof(expected_bits));
+        CHECK(bridge::sanitize_depth_bias_bits(slope) == expected_bits);
+    }
+
+    // 2. Shadow-map depth-only render pass (NumRenderTargets = 0, ps = 0, D32_FLOAT) with
+    //    DepthBias / SlopeScaledDepthBias / DepthBiasClamp forwarded into CreateRenderPipeline2.
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps, counting_options(30000));
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 2, false);
+    d3d::DescriptorHeap* dsv_heap = make_heap(heaps, d3d::DescriptorHeapType::Dsv, 2, false);
+
+    constexpr uint32_t kShadowTex = 301;
+    constexpr uint32_t kColorTex = 302;
+    constexpr uint32_t kVb = 303;
+    constexpr uint64_t kVs = 0x5A01;
+    constexpr uint64_t kPs = 0x5A02;
+    device.register_texture(kShadowTex, {pso::DxgiFormat::D32_FLOAT, 1024, 1024, 1, 1, 1,
+                                         GpuTextureDimension::Dim2D, false});
+    device.register_texture(kColorTex, {pso::DxgiFormat::R8G8B8A8_UNORM, 1024, 1024, 1, 1, 1,
+                                        GpuTextureDimension::Dim2D, false});
+    device.register_shader_module(kVs, 11);
+    device.register_shader_module(kPs, 12);
+
+    d3d::ViewDesc dsv_desc;
+    dsv_desc.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT);
+    dsv_desc.dimension = d3d::DsvDimension::Texture2D;
+    CHECK(heaps.create_depth_stencil_view(kShadowTex, &dsv_desc, dsv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    CHECK(heaps.create_render_target_view(kColorTex, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, &rs).ok());
+
+    auto make_shadow_desc = [&](int32_t bias, float slope, float clamp, bool with_ps) {
+        pso::D3D12GraphicsPsoDesc d{};
+        d.root_signature_id = 1;
+        d.vs = kVs;
+        d.ps = with_ps ? kPs : 0;
+        d.NumRenderTargets = with_ps ? 1 : 0;
+        if (with_ps) {
+            d.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+        }
+        d.DSVFormat = pso::DxgiFormat::D32_FLOAT;
+        d.DepthStencilState.DepthEnable = true;
+        d.DepthStencilState.DepthWriteMask = pso::D3D12DepthWriteMask::All;
+        d.DepthStencilState.DepthFunc = pso::D3D12ComparisonFunc::GreaterEqual;  // reverse-Z shadow map
+        d.RasterizerState.DepthBias = bias;
+        d.RasterizerState.SlopeScaledDepthBias = slope;
+        d.RasterizerState.DepthBiasClamp = clamp;
+        return d;
+    };
+
+    auto shadow_pso = device.create_graphics_pipeline_state(make_shadow_desc(-4, -2.5f, 0.02f, false), &rs);
+    auto inf_pso = device.create_graphics_pipeline_state(
+        make_shadow_desc(3, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity(), true),
+        &rs);
+    auto nan_pso = device.create_graphics_pipeline_state(
+        make_shadow_desc(3, std::numeric_limits<float>::quiet_NaN(), -0.0f, true), &rs);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+    const gpu::d3d12_xs::D3D12VertexBufferView vb{kVb, 0, 48, 16};
+    list.IASetVertexBuffers(0, 1, &vb);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+
+    const d3d::CpuDescriptorHandle dsv = dsv_heap->cpu_handle(0);
+    const d3d::CpuDescriptorHandle rtv = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(0, nullptr, false, &dsv);
+    list.SetPipelineState(shadow_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // Non-triangle topology (LineList) with depth bias -> WebGPU requires zeroed depth bias.
+    const size_t line_mark = enc.size();
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::LineList);
+    list.DrawInstanced(2, 1, 0, 0);
+
+    // Inf and NaN slope/clamp sanitize to +0.0f and deduplicate to the SAME pipeline ID!
+    const size_t inf_mark = enc.size();
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list.OMSetRenderTargets(1, &rtv, false, &dsv);
+    list.SetPipelineState(inf_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+    const size_t nan_mark = enc.size();
+    list.SetPipelineState(nan_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // No depth attachment bound -> depth_stencil (including depth_bias) completely zeroed.
+    const size_t nodepth_mark = enc.size();
+    list.OMSetRenderTargets(1, &rtv, false, nullptr);
+    list.SetPipelineState(inf_pso.get());
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    auto find_rp2 = [](const std::vector<Packet>& pkts, GpuCreateRenderPipeline2Payload* out) {
+        for (const Packet& pk : pkts) {
+            if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+                *out = pod<GpuCreateRenderPipeline2Payload>(pk);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    GpuCreateRenderPipeline2Payload rp{};
+    CHECK(find_rp2(decode(enc, 0), &rp));
+    CHECK(rp.fs_module_id == 0 && rp.key.color_target_count == 0);
+    CHECK(rp.key.depth_stencil.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth32Float));
+    CHECK(rp.key.depth_stencil.depth_bias == -4);
+    CHECK(rp.key.depth_stencil.depth_bias_slope_scale_bits == bridge::sanitize_depth_bias_bits(-2.5f));
+    CHECK(rp.key.depth_stencil.depth_bias_clamp_bits == bridge::sanitize_depth_bias_bits(0.02f));
+
+    // LineList: depth bias zeroed for non-triangle topology.
+    CHECK(find_rp2(decode(enc, line_mark), &rp));
+    CHECK(rp.key.depth_stencil.depth_bias == 0);
+    CHECK(rp.key.depth_stencil.depth_bias_slope_scale_bits == 0u);
+    CHECK(rp.key.depth_stencil.depth_bias_clamp_bits == 0u);
+
+    // Inf PSO: depth_bias=3 preserved, non-finite slope & clamp sanitized to 0.
+    const std::vector<Packet> inf_pkts = decode(enc, inf_mark);
+    // Slice to nan_mark by decoding full and filtering.
+    GpuCreateRenderPipeline2Payload inf_rp{};
+    CHECK(find_rp2(inf_pkts, &inf_rp));
+    CHECK(inf_rp.key.depth_stencil.depth_bias == 3);
+    CHECK(inf_rp.key.depth_stencil.depth_bias_slope_scale_bits == 0u);
+    CHECK(inf_rp.key.depth_stencil.depth_bias_clamp_bits == 0u);
+
+    // NaN PSO: deduplicated with Inf PSO (no CreateRenderPipeline2 between nan_mark and nodepth_mark).
+    const std::vector<Packet> nan_pkts = decode(enc, nan_mark);
+    // The only CreateRenderPipeline2 after nan_mark must be the depth-less variant (at nodepth_mark).
+    GpuCreateRenderPipeline2Payload nodepth_rp{};
+    CHECK(find_rp2(decode(enc, nodepth_mark), &nodepth_rp));
+    CHECK(nodepth_rp.key.depth_stencil.format == 0);
+    CHECK(nodepth_rp.key.depth_stencil.depth_bias == 0);
+    CHECK(nodepth_rp.key.depth_stencil.depth_bias_slope_scale_bits == 0u);
+    CHECK(nodepth_rp.key.depth_stencil.depth_bias_clamp_bits == 0u);
+    // Count total CreateRenderPipeline2 in [nan_mark, nodepth_mark): must be 0.
+    {
+        gpu::CommandEncoder sub;
+        // Verify by checking total pipelines created == 4 (shadow tri, shadow line, inf/nan shared, depth-less).
+        CHECK(list.stats().pipelines_created == 4);
+    }
+
+    // 3. Direct sanitize_render_pipeline_key catches raw infinity & missing-depth bias on prewarmed keys.
+    GpuRenderPipelineKey dirty{};
+    dirty.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+    dirty.depth_stencil.format = static_cast<uint8_t>(pso::WgpuTextureFormat::Depth32Float);
+    dirty.depth_stencil.depth_write_enabled = 1;
+    dirty.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Less);
+    dirty.depth_stencil.depth_bias = 5;
+    const float pinf = std::numeric_limits<float>::infinity();
+    std::memcpy(&dirty.depth_stencil.depth_bias_slope_scale_bits, &pinf, 4);
+    dirty.depth_stencil.depth_bias_clamp_bits = 0x80000000u;  // -0.0f
+    CHECK(bridge::sanitize_render_pipeline_key(&dirty, 0));
+    CHECK(dirty.depth_stencil.depth_bias == 5);
+    CHECK(dirty.depth_stencil.depth_bias_slope_scale_bits == 0u);
+    CHECK(dirty.depth_stencil.depth_bias_clamp_bits == 0u);
+    CHECK(!bridge::sanitize_render_pipeline_key(&dirty, 0));  // idempotent
+}
+
+void test_g81_eight_mrt_blend_and_integer_guards() {
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::BridgeOptions opts = counting_options(31000);
+    opts.features = pso::WgpuFeature::Rg11b10UfloatRenderable;  // Float32Blendable & DualSourceBlending OFF
+    bridge::StateBridgeDevice device(heaps, opts);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 8, false);
+    d3d::DescriptorHeap* dsv_heap = make_heap(heaps, d3d::DescriptorHeapType::Dsv, 1, false);
+
+    // 8 distinct MRTs covering HDR float, sRGB, UNORM, R32_FLOAT (non-blendable w/o feature), and integer formats.
+    const std::array<pso::DxgiFormat, 8> mrt_formats = {
+        pso::DxgiFormat::R16G16B16A16_FLOAT,  // RT0: HDR float16 (blendable)
+        pso::DxgiFormat::R11G11B10_FLOAT,     // RT1: HDR rg11b10 (blendable w/ feature)
+        pso::DxgiFormat::R10G10B10A2_UNORM,   // RT2: 10-bit HDR/UI (blendable)
+        pso::DxgiFormat::R8G8B8A8_UNORM_SRGB, // RT3: sRGB (blendable)
+        pso::DxgiFormat::R32_UINT,            // RT4: integer uint (NOT blendable!)
+        pso::DxgiFormat::R16G16B16A16_SINT,   // RT5: integer sint (NOT blendable!)
+        pso::DxgiFormat::R32_FLOAT,           // RT6: float32 (NOT blendable without Float32Blendable!)
+        pso::DxgiFormat::R8G8_UNORM,          // RT7: RG8 (blendable)
+    };
+    for (uint32_t i = 0; i < 8; ++i) {
+        device.register_texture(400 + i, {mrt_formats[i], 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        d3d::ViewDesc vd;
+        vd.format = static_cast<uint32_t>(mrt_formats[i]);
+        vd.dimension = d3d::ViewDimension::Texture2D;
+        CHECK(heaps.create_render_target_view(400 + i, &vd, rtv_heap->cpu_handle(i)) == d3d::Status::Ok);
+    }
+    device.register_texture(410, {pso::DxgiFormat::D32_FLOAT, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    d3d::ViewDesc dsv_desc;
+    dsv_desc.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT);
+    dsv_desc.dimension = d3d::DsvDimension::Texture2D;
+    CHECK(heaps.create_depth_stencil_view(410, &dsv_desc, dsv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    constexpr uint64_t kVs = 0x8B01;
+    constexpr uint64_t kPs = 0x8B02;
+    device.register_shader_module(kVs, 21);
+    device.register_shader_module(kPs, 22);
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, &rs).ok());
+
+    auto base_mrt_desc = [&] {
+        pso::D3D12GraphicsPsoDesc d{};
+        d.root_signature_id = 1;
+        d.vs = kVs;
+        d.ps = kPs;
+        d.NumRenderTargets = 8;
+        for (uint32_t i = 0; i < 8; ++i) {
+            d.RTVFormats[i] = mrt_formats[i];
+        }
+        d.DSVFormat = pso::DxgiFormat::D32_FLOAT;
+        return d;
+    };
+
+    // Case A: IndependentBlendEnable = false -> RT0 replicated to all blendable targets,
+    // integer & non-blendable targets (RT4, RT5, RT6) have blend stripped cleanly!
+    pso::D3D12GraphicsPsoDesc desc_shared = base_mrt_desc();
+    desc_shared.BlendState.IndependentBlendEnable = false;
+    desc_shared.BlendState.RenderTarget[0].BlendEnable = true;
+    desc_shared.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::SrcAlpha;
+    desc_shared.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvSrcAlpha;
+    desc_shared.BlendState.RenderTarget[0].BlendOp = pso::D3D12BlendOp::Add;
+    desc_shared.BlendState.RenderTarget[0].SrcBlendAlpha = pso::D3D12Blend::One;
+    desc_shared.BlendState.RenderTarget[0].DestBlendAlpha = pso::D3D12Blend::Zero;
+    desc_shared.BlendState.RenderTarget[0].BlendOpAlpha = pso::D3D12BlendOp::Add;
+    desc_shared.BlendState.RenderTarget[0].RenderTargetWriteMask = 0x7;  // RGB only
+    // Poison RT1..RT7 with distinct values that must be ignored when IndependentBlendEnable == false.
+    desc_shared.BlendState.RenderTarget[1].BlendEnable = false;
+    desc_shared.BlendState.RenderTarget[1].RenderTargetWriteMask = 0xF;
+    auto pso_shared = device.create_graphics_pipeline_state(desc_shared, &rs);
+
+    // Case B: IndependentBlendEnable = true -> per-target blend factors, ops, constant factor, write masks.
+    pso::D3D12GraphicsPsoDesc desc_indep = base_mrt_desc();
+    desc_indep.BlendState.IndependentBlendEnable = true;
+    for (uint32_t i = 0; i < 8; ++i) {
+        desc_indep.BlendState.RenderTarget[i].RenderTargetWriteMask = static_cast<uint8_t>((i + 1) & 0xF);
+    }
+    // RT0: constant blend factor
+    desc_indep.BlendState.RenderTarget[0].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::BlendFactor;
+    desc_indep.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvBlendFactor;
+    desc_indep.BlendState.RenderTarget[0].BlendOp = pso::D3D12BlendOp::Add;
+    // RT1: Min blend op (WebGPU requires src/dst factors = One)
+    desc_indep.BlendState.RenderTarget[1].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[1].SrcBlend = pso::D3D12Blend::SrcAlpha;
+    desc_indep.BlendState.RenderTarget[1].DestBlend = pso::D3D12Blend::DestAlpha;
+    desc_indep.BlendState.RenderTarget[1].BlendOp = pso::D3D12BlendOp::Min;
+    // RT2: blend disabled, custom write mask
+    desc_indep.BlendState.RenderTarget[2].BlendEnable = false;
+    // RT3: ReverseSubtract
+    desc_indep.BlendState.RenderTarget[3].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[3].SrcBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[3].DestBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[3].BlendOp = pso::D3D12BlendOp::RevSubtract;
+    // RT4/RT5/RT6: blend requested on integer / non-blendable float32 -> must be stripped!
+    desc_indep.BlendState.RenderTarget[4].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[4].SrcBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[4].DestBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[5].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[5].SrcBlend = pso::D3D12Blend::SrcAlpha;
+    desc_indep.BlendState.RenderTarget[5].DestBlend = pso::D3D12Blend::InvSrcAlpha;
+    desc_indep.BlendState.RenderTarget[6].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[6].SrcBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[6].DestBlend = pso::D3D12Blend::One;
+    // RT7: additive blend on R8G8_UNORM
+    desc_indep.BlendState.RenderTarget[7].BlendEnable = true;
+    desc_indep.BlendState.RenderTarget[7].SrcBlend = pso::D3D12Blend::One;
+    desc_indep.BlendState.RenderTarget[7].DestBlend = pso::D3D12Blend::One;
+    auto pso_indep = device.create_graphics_pipeline_state(desc_indep, &rs);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    CHECK(list.SetGraphicsRootSignature(&rs) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+
+    // Bind all 8 MRTs using rts_single_handle_to_descriptor_range = true (tests the G81 contiguous-range fix too!).
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    const d3d::CpuDescriptorHandle dsv0 = dsv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(8, &rtv0, true, &dsv0);
+    list.SetPipelineState(pso_shared.get());
+    list.DrawInstanced(3, 1, 0, 0);
+
+    const size_t indep_mark = enc.size();
+    list.SetPipelineState(pso_indep.get());
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    CHECK(list.stats().draws == 2 && list.stats().draws_skipped == 0);
+    CHECK((list.pipeline_diagnostics() & pso::PipelineDiag::BlendOnNonBlendableFormat) != 0);
+
+    const std::vector<Packet> p0 = decode(enc, 0);
+    GpuCreateRenderPipeline2Payload rp_shared{};
+    bool found_shared = false;
+    for (const Packet& pk : p0) {
+        if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            rp_shared = pod<GpuCreateRenderPipeline2Payload>(pk);
+            found_shared = true;
+            break;
+        }
+    }
+    CHECK(found_shared && rp_shared.key.color_target_count == 8);
+    // Blendable targets (0, 1, 2, 3, 7) inherit RT0's blend & write_mask 0x7; non-blendable (4, 5, 6) drop blend.
+    for (uint32_t i = 0; i < 8; ++i) {
+        const auto& ct = rp_shared.key.color_targets[i];
+        CHECK(ct.write_mask == 0x7);
+        const bool expected_blend = (i != 4 && i != 5 && i != 6);
+        CHECK(ct.blend_enabled == (expected_blend ? 1u : 0u));
+        if (expected_blend) {
+            CHECK(ct.color.src_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::SrcAlpha));
+            CHECK(ct.color.dst_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusSrcAlpha));
+        }
+    }
+
+    const std::vector<Packet> p1 = decode(enc, indep_mark);
+    GpuCreateRenderPipeline2Payload rp_indep{};
+    bool found_indep = false;
+    for (const Packet& pk : p1) {
+        if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            rp_indep = pod<GpuCreateRenderPipeline2Payload>(pk);
+            found_indep = true;
+            break;
+        }
+    }
+    CHECK(found_indep && rp_indep.key.color_target_count == 8);
+    CHECK(rp_indep.key.color_targets[0].blend_enabled == 1 &&
+          rp_indep.key.color_targets[0].color.src_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::Constant) &&
+          rp_indep.key.color_targets[0].color.dst_factor ==
+              static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusConstant) &&
+          rp_indep.key.color_targets[0].write_mask == 1);
+    CHECK(rp_indep.key.color_targets[1].blend_enabled == 1 &&
+          rp_indep.key.color_targets[1].color.operation == static_cast<uint8_t>(pso::WgpuBlendOperation::Min) &&
+          rp_indep.key.color_targets[1].color.src_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::One) &&
+          rp_indep.key.color_targets[1].color.dst_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::One) &&
+          rp_indep.key.color_targets[1].write_mask == 2);
+    CHECK(rp_indep.key.color_targets[2].blend_enabled == 0 && rp_indep.key.color_targets[2].write_mask == 3);
+    CHECK(rp_indep.key.color_targets[3].blend_enabled == 1 &&
+          rp_indep.key.color_targets[3].color.operation ==
+              static_cast<uint8_t>(pso::WgpuBlendOperation::ReverseSubtract) &&
+          rp_indep.key.color_targets[3].write_mask == 4);
+    CHECK(rp_indep.key.color_targets[4].blend_enabled == 0 && rp_indep.key.color_targets[4].write_mask == 5);
+    CHECK(rp_indep.key.color_targets[5].blend_enabled == 0 && rp_indep.key.color_targets[5].write_mask == 6);
+    CHECK(rp_indep.key.color_targets[6].blend_enabled == 0 && rp_indep.key.color_targets[6].write_mask == 7);
+    CHECK(rp_indep.key.color_targets[7].blend_enabled == 1 && rp_indep.key.color_targets[7].write_mask == 8);
+
+    // Case C: With DualSourceBlending + Float32Blendable enabled:
+    //  - R32_FLOAT becomes blendable;
+    //  - Dual-source works on 1 RT and is rejected (DualSourceMultipleTargets) on 2 RTs.
+    {
+        d3d::DescriptorHeapRegistry h2;
+        bridge::BridgeOptions opts2 = counting_options(32000);
+        opts2.features = pso::WgpuFeature::Float32Blendable | pso::WgpuFeature::DualSourceBlending;
+        bridge::StateBridgeDevice dev2(h2, opts2);
+        d3d::DescriptorHeap* rtv2 = make_heap(h2, d3d::DescriptorHeapType::Rtv, 2, false);
+        dev2.register_texture(420, {pso::DxgiFormat::R32_FLOAT, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        dev2.register_texture(421, {pso::DxgiFormat::R8G8B8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+        CHECK(h2.create_render_target_view(420, nullptr, rtv2->cpu_handle(0)) == d3d::Status::Ok);
+        CHECK(h2.create_render_target_view(421, nullptr, rtv2->cpu_handle(1)) == d3d::Status::Ok);
+        dev2.register_shader_module(kVs, 31);
+        dev2.register_shader_module(kPs, 32);
+
+        pso::D3D12GraphicsPsoDesc ds_desc{};
+        ds_desc.vs = kVs;
+        ds_desc.ps = kPs;
+        ds_desc.NumRenderTargets = 1;
+        ds_desc.RTVFormats[0] = pso::DxgiFormat::R32_FLOAT;
+        ds_desc.BlendState.RenderTarget[0].BlendEnable = true;
+        ds_desc.BlendState.RenderTarget[0].SrcBlend = pso::D3D12Blend::Src1Color;
+        ds_desc.BlendState.RenderTarget[0].DestBlend = pso::D3D12Blend::InvSrc1Alpha;
+        auto ds_pso = dev2.create_graphics_pipeline_state(ds_desc, &rs);
+
+        gpu::CommandEncoder enc2;
+        bridge::CommandListBridge list2(dev2, enc2);
+        list2.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+        const d3d::CpuDescriptorHandle rt_one = rtv2->cpu_handle(0);
+        list2.OMSetRenderTargets(1, &rt_one, false, nullptr);
+        list2.SetPipelineState(ds_pso.get());
+        list2.DrawInstanced(3, 1, 0, 0);
+        CHECK(list2.stats().draws == 1 && list2.stats().draws_skipped == 0);
+        GpuCreateRenderPipeline2Payload ds_rp{};
+        for (const Packet& pk : decode(enc2)) {
+            if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+                ds_rp = pod<GpuCreateRenderPipeline2Payload>(pk);
+                break;
+            }
+        }
+        CHECK(ds_rp.key.color_targets[0].format == static_cast<uint8_t>(pso::WgpuTextureFormat::R32Float));
+        CHECK(ds_rp.key.color_targets[0].blend_enabled == 1);
+        CHECK(ds_rp.key.color_targets[0].color.src_factor == static_cast<uint8_t>(pso::WgpuBlendFactor::Src1));
+        CHECK(ds_rp.key.color_targets[0].color.dst_factor ==
+              static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusSrc1Alpha));
+
+        // Binding 2 targets with dual-source blending must skip the draw (WebGPU fatal rule).
+        const d3d::CpuDescriptorHandle rt_two[2] = {rtv2->cpu_handle(0), rtv2->cpu_handle(1)};
+        list2.OMSetRenderTargets(2, rt_two, false, nullptr);
+        list2.DrawInstanced(3, 1, 0, 0);
+        CHECK(list2.stats().draws == 1 && list2.stats().draws_skipped == 1);
+        CHECK((list2.pipeline_diagnostics() & pso::PipelineDiag::DualSourceMultipleTargets) != 0);
+        list2.Close();
+    }
+}
+
+void test_g81_stencil_faces_masks_and_dynamic_reemission() {
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::BridgeOptions opts = counting_options(33000);
+    opts.features = pso::WgpuFeature::Depth32FloatStencil8;
+    bridge::StateBridgeDevice device(heaps, opts);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 2, false);
+    d3d::DescriptorHeap* dsv_heap = make_heap(heaps, d3d::DescriptorHeapType::Dsv, 3, false);
+
+    device.register_texture(500, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(501, {pso::DxgiFormat::R8G8B8A8_UNORM, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(502, {pso::DxgiFormat::D24_UNORM_S8_UINT, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(503, {pso::DxgiFormat::D32_FLOAT_S8X24_UINT, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(504, {pso::DxgiFormat::D32_FLOAT, 256, 256, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    CHECK(heaps.create_render_target_view(500, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    CHECK(heaps.create_render_target_view(501, nullptr, rtv_heap->cpu_handle(1)) == d3d::Status::Ok);
+
+    d3d::ViewDesc dsv24;
+    dsv24.format = static_cast<uint32_t>(pso::DxgiFormat::D24_UNORM_S8_UINT);
+    dsv24.dimension = d3d::DsvDimension::Texture2D;
+    dsv24.flags = d3d::DsvFlags::ReadOnlyDepth;  // depth read-only, stencil WRITABLE!
+    CHECK(heaps.create_depth_stencil_view(502, &dsv24, dsv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    d3d::ViewDesc dsv32s8;
+    dsv32s8.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT_S8X24_UINT);
+    dsv32s8.dimension = d3d::DsvDimension::Texture2D;
+    CHECK(heaps.create_depth_stencil_view(503, &dsv32s8, dsv_heap->cpu_handle(1)) == d3d::Status::Ok);
+
+    d3d::ViewDesc dsv32;
+    dsv32.format = static_cast<uint32_t>(pso::DxgiFormat::D32_FLOAT);
+    dsv32.dimension = d3d::DsvDimension::Texture2D;
+    dsv32.flags = d3d::DsvFlags::ReadOnlyDepth | d3d::DsvFlags::ReadOnlyStencil;  // depth-only must ignore stencil_ro!
+    CHECK(heaps.create_depth_stencil_view(504, &dsv32, dsv_heap->cpu_handle(2)) == d3d::Status::Ok);
+
+    constexpr uint64_t kVs = 0x5701;
+    constexpr uint64_t kPs = 0x5702;
+    device.register_shader_module(kVs, 41);
+    device.register_shader_module(kPs, 42);
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(d3d::RootSignatureDesc{}, &rs).ok());
+
+    pso::D3D12GraphicsPsoDesc desc{};
+    desc.vs = kVs;
+    desc.ps = kPs;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    desc.DSVFormat = pso::DxgiFormat::D24_UNORM_S8_UINT;
+    desc.DepthStencilState.DepthEnable = true;
+    desc.DepthStencilState.DepthWriteMask = pso::D3D12DepthWriteMask::Zero;
+    desc.DepthStencilState.DepthFunc = pso::D3D12ComparisonFunc::LessEqual;
+    desc.DepthStencilState.StencilEnable = true;
+    desc.DepthStencilState.StencilReadMask = 0x3F;
+    desc.DepthStencilState.StencilWriteMask = 0xC0;
+    desc.DepthStencilState.FrontFace = {pso::D3D12StencilOp::Replace, pso::D3D12StencilOp::IncrSat,
+                                        pso::D3D12StencilOp::Incr, pso::D3D12ComparisonFunc::Equal};
+    desc.DepthStencilState.BackFace = {pso::D3D12StencilOp::Zero, pso::D3D12StencilOp::DecrSat,
+                                       pso::D3D12StencilOp::Invert, pso::D3D12ComparisonFunc::NotEqual};
+    auto stencil_pso = device.create_graphics_pipeline_state(desc, &rs);
+
+    // Check resolve_dsv usage: ReadOnlyDepth on D24S8 with writable stencil must remain DepthStencilWrite!
+    pso::DepthStencilViewInfo dsv_info{};
+    CHECK(device.resolve_dsv(dsv_heap->cpu_handle(0).ptr, &dsv_info));
+    const bridge::ViewRecord* vr = device.view(dsv_info.view_id);
+    CHECK(vr != nullptr && vr->usage == d3d::ResourceUsage::DepthStencilWrite);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list.SetPipelineState(stencil_pso.get());
+
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    const d3d::CpuDescriptorHandle rtv1 = rtv_heap->cpu_handle(1);
+    const d3d::CpuDescriptorHandle dsv0 = dsv_heap->cpu_handle(0);
+    const d3d::CpuDescriptorHandle dsv1 = dsv_heap->cpu_handle(1);
+    const d3d::CpuDescriptorHandle dsv2 = dsv_heap->cpu_handle(2);
+
+    // Pass 1: D24S8 (depth_read_only=1, stencil_read_only=0), dynamic stencil ref & blend constant (with NaN sanitized).
+    list.OMSetRenderTargets(1, &rtv0, false, &dsv0);
+    list.OMSetStencilRef(0xAB);
+    const float bf_dirty[4] = {0.25f, std::numeric_limits<float>::quiet_NaN(), 0.75f,
+                               std::numeric_limits<float>::infinity()};
+    list.OMSetBlendFactor(bf_dirty);
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // Second draw in Pass 1 with identical dynamic state: no redundant SetStencilReference / SetBlendConstant.
+    const size_t same_pass_mark = enc.size();
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // Pass 2: switch to rtv1 + D32S8 -> dynamic stencil ref & blend constant MUST re-emit across pass boundary!
+    const size_t pass2_mark = enc.size();
+    list.OMSetRenderTargets(1, &rtv1, false, &dsv1);
+    list.DrawInstanced(3, 1, 0, 0);
+
+    // Pass 3: ResourceBarrier breaks pass + OMSetBlendFactor(nullptr) sets {1,1,1,1}, D32_FLOAT clears stencil state.
+    const size_t pass3_mark = enc.size();
+    list.ResourceBarrier(0, nullptr);
+    list.OMSetBlendFactor(nullptr);
+    list.OMSetStencilRef(0x55);
+    list.OMSetRenderTargets(1, &rtv0, false, &dsv2);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    // Verify Pass 1 packets.
+    const std::vector<Packet> p1 = decode(enc, 0);
+    CHECK(p1[0].opcode == GpuOpcode::BeginRenderPass);
+    const auto bp1 = pod<GpuBeginRenderPassPayload>(p1[0]);
+    CHECK(bp1.depth_stencil.depth_read_only == 1 && bp1.depth_stencil.stencil_read_only == 0);
+    CHECK(bp1.depth_stencil.depth_load_op == 0 && bp1.depth_stencil.stencil_load_op == static_cast<uint8_t>(GpuLoadOp::Load));
+    GpuCreateRenderPipeline2Payload rp1{};
+    GpuSetBlendConstantPayload bc1{};
+    GpuSetStencilReferencePayload sr1{};
+    bool got_rp1 = false, got_bc1 = false, got_sr1 = false;
+    for (const Packet& pk : p1) {
+        if (!got_rp1 && pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            rp1 = pod<GpuCreateRenderPipeline2Payload>(pk);
+            got_rp1 = true;
+        } else if (!got_bc1 && pk.opcode == GpuOpcode::SetBlendConstant) {
+            bc1 = pod<GpuSetBlendConstantPayload>(pk);
+            got_bc1 = true;
+        } else if (!got_sr1 && pk.opcode == GpuOpcode::SetStencilReference) {
+            sr1 = pod<GpuSetStencilReferencePayload>(pk);
+            got_sr1 = true;
+        }
+    }
+    CHECK(got_rp1 && got_bc1 && got_sr1);
+    CHECK(rp1.key.depth_stencil.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth24PlusStencil8));
+    CHECK(rp1.key.depth_stencil.stencil_read_mask == 0x3Fu && rp1.key.depth_stencil.stencil_write_mask == 0xC0u);
+    CHECK(rp1.key.depth_stencil.stencil_front.compare == static_cast<uint8_t>(pso::WgpuCompareFunction::Equal) &&
+          rp1.key.depth_stencil.stencil_front.fail_op == static_cast<uint8_t>(pso::WgpuStencilOperation::Replace) &&
+          rp1.key.depth_stencil.stencil_front.depth_fail_op ==
+              static_cast<uint8_t>(pso::WgpuStencilOperation::IncrementClamp) &&
+          rp1.key.depth_stencil.stencil_front.pass_op ==
+              static_cast<uint8_t>(pso::WgpuStencilOperation::IncrementWrap));
+    CHECK(rp1.key.depth_stencil.stencil_back.compare == static_cast<uint8_t>(pso::WgpuCompareFunction::NotEqual) &&
+          rp1.key.depth_stencil.stencil_back.fail_op == static_cast<uint8_t>(pso::WgpuStencilOperation::Zero) &&
+          rp1.key.depth_stencil.stencil_back.depth_fail_op ==
+              static_cast<uint8_t>(pso::WgpuStencilOperation::DecrementClamp) &&
+          rp1.key.depth_stencil.stencil_back.pass_op == static_cast<uint8_t>(pso::WgpuStencilOperation::Invert));
+    CHECK(bc1.r == 0.25f && bc1.g == 0.0f && bc1.b == 0.75f && bc1.a == 0.0f);
+    CHECK(sr1.reference == 0xABu);
+
+    // Same-pass draw emitted ONLY Draw (check first packet at same_pass_mark).
+    const std::vector<Packet> same_pkts = decode(enc, same_pass_mark);
+    CHECK(!same_pkts.empty() && same_pkts[0].opcode == GpuOpcode::Draw);
+
+    // Pass 2 re-emits SetBlendConstant and SetStencilReference with the exact same values!
+    const std::vector<Packet> p2 = decode(enc, pass2_mark);
+    bool got_bc2 = false, got_sr2 = false, got_rp2 = false;
+    GpuCreateRenderPipeline2Payload rp2{};
+    for (const Packet& pk : p2) {
+        if (pk.opcode == GpuOpcode::EndRenderPass && got_rp2) {
+            break;
+        }
+        if (pk.opcode == GpuOpcode::CreateRenderPipeline2 && !got_rp2) {
+            rp2 = pod<GpuCreateRenderPipeline2Payload>(pk);
+            got_rp2 = true;
+        } else if (pk.opcode == GpuOpcode::SetBlendConstant && !got_bc2) {
+            const auto bc = pod<GpuSetBlendConstantPayload>(pk);
+            CHECK(bc.r == 0.25f && bc.g == 0.0f && bc.b == 0.75f && bc.a == 0.0f);
+            got_bc2 = true;
+        } else if (pk.opcode == GpuOpcode::SetStencilReference && !got_sr2) {
+            CHECK(pod<GpuSetStencilReferencePayload>(pk).reference == 0xABu);
+            got_sr2 = true;
+        }
+    }
+    CHECK(got_rp2 && got_bc2 && got_sr2);
+    CHECK(rp2.key.depth_stencil.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth32FloatStencil8));
+    CHECK(rp2.key.depth_stencil.stencil_read_mask == 0x3Fu && rp2.key.depth_stencil.stencil_write_mask == 0xC0u);
+
+    // Pass 3: D32_FLOAT (no stencil aspect) -> stencil_read_only forced 0, stencil ops/masks cleared,
+    // OMSetBlendFactor(nullptr) emitted {1, 1, 1, 1}, stencil ref 0x55 re-emitted.
+    const std::vector<Packet> p3 = decode(enc, pass3_mark);
+    bool got_bp3 = false, got_rp3 = false, got_bc3 = false, got_sr3 = false;
+    for (const Packet& pk : p3) {
+        if (pk.opcode == GpuOpcode::BeginRenderPass) {
+            const auto bp3 = pod<GpuBeginRenderPassPayload>(pk);
+            CHECK(bp3.depth_stencil.depth_read_only == 1 && bp3.depth_stencil.stencil_read_only == 0);
+            got_bp3 = true;
+        } else if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+            const auto rp3 = pod<GpuCreateRenderPipeline2Payload>(pk);
+            CHECK(rp3.key.depth_stencil.format == static_cast<uint8_t>(pso::WgpuTextureFormat::Depth32Float));
+            CHECK(rp3.key.depth_stencil.stencil_read_mask == 0u && rp3.key.depth_stencil.stencil_write_mask == 0u);
+            CHECK(rp3.key.depth_stencil.stencil_front.compare ==
+                  static_cast<uint8_t>(pso::WgpuCompareFunction::Always));
+            got_rp3 = true;
+        } else if (pk.opcode == GpuOpcode::SetBlendConstant) {
+            const auto bc = pod<GpuSetBlendConstantPayload>(pk);
+            CHECK(bc.r == 1.0f && bc.g == 1.0f && bc.b == 1.0f && bc.a == 1.0f);
+            got_bc3 = true;
+        } else if (pk.opcode == GpuOpcode::SetStencilReference) {
+            CHECK(pod<GpuSetStencilReferencePayload>(pk).reference == 0x55u);
+            got_sr3 = true;
+        }
+    }
+    CHECK(got_bp3 && got_rp3 && got_bc3 && got_sr3);
+}
+
+void test_g81_primitive_topology_and_strip_index_format() {
+    // 1. Direct seam conversion & stripIndexFormat helpers.
+    bool exact = false;
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::PointList, &exact) ==
+              GpuPrimitiveTopology::PointList &&
+          exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::LineList, &exact) ==
+              GpuPrimitiveTopology::LineList &&
+          exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::LineStrip, &exact) ==
+              GpuPrimitiveTopology::LineStrip &&
+          exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::TriangleList, &exact) ==
+              GpuPrimitiveTopology::TriangleList &&
+          exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::TriangleStrip, &exact) ==
+              GpuPrimitiveTopology::TriangleStrip &&
+          exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::TriangleFan, &exact) ==
+              GpuPrimitiveTopology::TriangleList &&
+          !exact);
+    CHECK(bridge::to_gpu_primitive_topology(pso::D3DPrimitiveTopology::TriangleStripAdj, &exact) ==
+              GpuPrimitiveTopology::TriangleStrip &&
+          !exact);
+
+    CHECK(!bridge::is_strip_topology(GpuPrimitiveTopology::PointList));
+    CHECK(!bridge::is_strip_topology(GpuPrimitiveTopology::LineList));
+    CHECK(bridge::is_strip_topology(GpuPrimitiveTopology::LineStrip));
+    CHECK(!bridge::is_strip_topology(GpuPrimitiveTopology::TriangleList));
+    CHECK(bridge::is_strip_topology(GpuPrimitiveTopology::TriangleStrip));
+
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::TriangleList, pso::WgpuIndexFormat::Uint32,
+                                             pso::D3D12IndexBufferStripCutValue::Value0xFFFFFFFF) ==
+          pso::WgpuIndexFormat::Undefined);
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::PointList, pso::WgpuIndexFormat::Uint16) ==
+          pso::WgpuIndexFormat::Undefined);
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::TriangleStrip, pso::WgpuIndexFormat::Uint16) ==
+          pso::WgpuIndexFormat::Uint16);
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::LineStrip, pso::WgpuIndexFormat::Uint32) ==
+          pso::WgpuIndexFormat::Uint32);
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::TriangleStrip, pso::WgpuIndexFormat::Undefined,
+                                             pso::D3D12IndexBufferStripCutValue::Value0xFFFF) ==
+          pso::WgpuIndexFormat::Uint16);
+    CHECK(bridge::resolve_strip_index_format(pso::WgpuPrimitiveTopology::TriangleStrip, pso::WgpuIndexFormat::Undefined,
+                                             pso::D3D12IndexBufferStripCutValue::Disabled) ==
+          pso::WgpuIndexFormat::Undefined);
+
+    // 2. End-to-end draws: re-keying on strip index format changes, Undefined on list topologies,
+    //    and clearing stale index format on IASetIndexBuffer(nullptr).
+    Scene scene(34000);
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+    const gpu::d3d12_xs::D3D12IndexBufferView ib16{601, 0, 128, GpuIndexFormat::Uint16};
+    const gpu::d3d12_xs::D3D12IndexBufferView ib32{602, 0, 256, GpuIndexFormat::Uint32};
+
+    // Draw 1: TriangleStrip + Uint16 -> strip_index_format == Uint16.
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleStrip);
+    list.IASetIndexBuffer(&ib16);
+    list.DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // Draw 2: TriangleStrip + Uint32 -> new pipeline with strip_index_format == Uint32.
+    const size_t m_u32 = enc.size();
+    list.IASetIndexBuffer(&ib32);
+    list.DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // Draw 3: IASetIndexBuffer(nullptr) clears stale Uint32 -> non-indexed TriangleStrip uses Undefined (0)!
+    const size_t m_null_ib = enc.size();
+    list.IASetIndexBuffer(nullptr);
+    list.DrawInstanced(4, 1, 0, 0);
+
+    // Draw 4: TriangleList + Uint32 -> strip_index_format == Undefined (0).
+    const size_t m_list = enc.size();
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    list.IASetIndexBuffer(&ib32);
+    list.DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // Draw 5: TriangleList + Uint16 -> reuses the SAME list pipeline (no new CreateRenderPipeline2)!
+    const size_t m_list_u16 = enc.size();
+    list.IASetIndexBuffer(&ib16);
+    list.DrawIndexedInstanced(6, 1, 0, 0, 0);
+
+    // Draw 6: LineStrip + Uint16 -> strip_index_format == Uint16.
+    const size_t m_line_strip = enc.size();
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::LineStrip);
+    list.DrawIndexedInstanced(4, 1, 0, 0, 0);
+    list.Close();
+
+    auto first_rp = [](const std::vector<Packet>& pkts, GpuCreateRenderPipeline2Payload* out) {
+        for (const Packet& pk : pkts) {
+            if (pk.opcode == GpuOpcode::CreateRenderPipeline2) {
+                *out = pod<GpuCreateRenderPipeline2Payload>(pk);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    GpuCreateRenderPipeline2Payload rp{};
+    CHECK(first_rp(decode(enc, 0), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::TriangleStrip));
+    CHECK(rp.key.primitive.strip_index_format == static_cast<uint8_t>(pso::WgpuIndexFormat::Uint16));
+
+    CHECK(first_rp(decode(enc, m_u32), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::TriangleStrip));
+    CHECK(rp.key.primitive.strip_index_format == static_cast<uint8_t>(pso::WgpuIndexFormat::Uint32));
+
+    CHECK(first_rp(decode(enc, m_null_ib), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::TriangleStrip));
+    CHECK(rp.key.primitive.strip_index_format == static_cast<uint8_t>(pso::WgpuIndexFormat::Undefined));
+
+    CHECK(first_rp(decode(enc, m_list), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList));
+    CHECK(rp.key.primitive.strip_index_format == static_cast<uint8_t>(pso::WgpuIndexFormat::Undefined));
+
+    // Draw 5 reused Draw 4's pipeline -> first CreateRenderPipeline2 after m_list_u16 is Draw 6 (LineStrip).
+    CHECK(first_rp(decode(enc, m_list_u16), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::LineStrip));
+    CHECK(first_rp(decode(enc, m_line_strip), &rp));
+    CHECK(rp.key.primitive.topology == static_cast<uint8_t>(GpuPrimitiveTopology::LineStrip));
+    CHECK(rp.key.primitive.strip_index_format == static_cast<uint8_t>(pso::WgpuIndexFormat::Uint16));
+    CHECK(list.stats().pipelines_created == 5);
+}
+
+void test_g81_hdr_depth_srgb_view_formats() {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+    using A = pso::WgpuTextureAspect;
+
+    // 1. All 6 sRGB <-> linear sibling viewFormats pairs (both directions).
+    const std::pair<F, F> srgb_pairs[] = {
+        {F::Rgba8Unorm, F::Rgba8UnormSrgb},       {F::Bgra8Unorm, F::Bgra8UnormSrgb},
+        {F::Bc1RgbaUnorm, F::Bc1RgbaUnormSrgb},   {F::Bc2RgbaUnorm, F::Bc2RgbaUnormSrgb},
+        {F::Bc3RgbaUnorm, F::Bc3RgbaUnormSrgb},   {F::Bc7RgbaUnorm, F::Bc7RgbaUnormSrgb},
+    };
+    for (const auto& [lin, srgb] : srgb_pairs) {
+        const auto c_lin = bridge::compatible_view_formats(lin);
+        const auto c_srgb = bridge::compatible_view_formats(srgb);
+        CHECK(c_lin.count == 1 && c_lin.formats[0] == srgb);
+        CHECK(c_srgb.count == 1 && c_srgb.formats[0] == lin);
+        CHECK(bridge::is_compatible_view_format(lin, srgb));
+        CHECK(bridge::is_compatible_view_format(srgb, lin));
+        CHECK(bridge::is_compatible_view_format(lin, lin));
+        CHECK(bridge::is_compatible_view_format(lin, F::Undefined));
+        CHECK(!bridge::is_srgb_format(lin) && bridge::is_srgb_format(srgb));
+    }
+    // Cross-family or integer reinterpretation is NOT a valid WebGPU viewFormat pair.
+    CHECK(!bridge::is_compatible_view_format(F::Rgba8Unorm, F::Bgra8Unorm));
+    CHECK(!bridge::is_compatible_view_format(F::Rgba8Unorm, F::Rgba8Uint));
+    CHECK(!bridge::is_compatible_view_format(F::Rgba16Float, F::Rgba16Uint));
+    CHECK(bridge::compatible_view_formats(F::Rgba16Float).count == 0);
+
+    // DXGI viewFormats helper (with and without BC compression feature).
+    const auto bc7_with = bridge::compatible_view_formats_for_dxgi(
+        D::BC7_UNORM, pso::FormatUsage::Sampled, pso::WgpuFeature::TextureCompressionBc);
+    CHECK(bc7_with.count == 1 && bc7_with.formats[0] == F::Bc7RgbaUnormSrgb);
+    const auto bc7_without = bridge::compatible_view_formats_for_dxgi(D::BC7_UNORM, pso::FormatUsage::Sampled, 0);
+    CHECK(bc7_without.count == 1 && bc7_without.formats[0] == F::Rgba8UnormSrgb);
+
+    // 2. HDR format classification and mapping.
+    CHECK(bridge::is_hdr_color_format(D::R16G16B16A16_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R11G11B10_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R10G10B10A2_UNORM));
+    CHECK(bridge::is_hdr_color_format(D::R32G32B32A32_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R32_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R16_FLOAT));
+    CHECK(bridge::is_hdr_color_format(D::R16G16_FLOAT));
+    CHECK(!bridge::is_hdr_color_format(D::R8G8_UNORM));
+    CHECK(!bridge::is_hdr_color_format(D::R8G8B8A8_UNORM));
+
+    // 3. Depth & typeless-depth sibling SRV format resolution.
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::D32_FLOAT));
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::D24_UNORM_S8_UINT));
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::D32_FLOAT_S8X24_UINT));
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::D16_UNORM));
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::R24G8_TYPELESS));
+    CHECK(bridge::is_depth_stencil_dxgi_format(D::R32G8X24_TYPELESS));
+
+    const auto d32_srv = bridge::resolve_sampled_view_format(D::D32_FLOAT, D::R32_FLOAT, false, 0);
+    CHECK(d32_srv.format == F::Depth32Float && d32_srv.aspect == A::DepthOnly && d32_srv.depth_sibling);
+
+    const auto r32_typeless_depth =
+        bridge::resolve_sampled_view_format(D::R32_TYPELESS, D::R32_FLOAT, false, 0, /*is_depth_resource=*/true);
+    CHECK(r32_typeless_depth.format == F::Depth32Float && r32_typeless_depth.aspect == A::DepthOnly &&
+          r32_typeless_depth.depth_sibling);
+    const auto r32_typeless_color =
+        bridge::resolve_sampled_view_format(D::R32_TYPELESS, D::R32_FLOAT, false, 0, /*is_depth_resource=*/false);
+    CHECK(r32_typeless_color.format == F::R32Float && r32_typeless_color.aspect == A::All &&
+          !r32_typeless_color.depth_sibling);
+
+    const auto d16_srv =
+        bridge::resolve_sampled_view_format(D::R16_TYPELESS, D::R16_UNORM, false, 0, /*is_depth_resource=*/true);
+    CHECK(d16_srv.format == F::Depth16Unorm && d16_srv.aspect == A::DepthOnly && d16_srv.depth_sibling);
+
+    const auto d24_depth_srv =
+        bridge::resolve_sampled_view_format(D::R24G8_TYPELESS, D::R24_UNORM_X8_TYPELESS, false, 0);
+    CHECK(d24_depth_srv.format == F::Depth24PlusStencil8 && d24_depth_srv.aspect == A::DepthOnly);
+    const auto d24_stencil_srv =
+        bridge::resolve_sampled_view_format(D::R24G8_TYPELESS, D::X24_TYPELESS_G8_UINT, false, 0);
+    CHECK(d24_stencil_srv.format == F::Depth24PlusStencil8 && d24_stencil_srv.aspect == A::StencilOnly);
+
+    const auto d32s8_depth = bridge::resolve_sampled_view_format(
+        D::R32G8X24_TYPELESS, D::R32_FLOAT_X8X24_TYPELESS, false, pso::WgpuFeature::Depth32FloatStencil8);
+    CHECK(d32s8_depth.format == F::Depth32FloatStencil8 && d32s8_depth.aspect == A::DepthOnly);
+    const auto d32s8_stencil_fb =
+        bridge::resolve_sampled_view_format(D::R32G8X24_TYPELESS, D::X32_TYPELESS_G8X24_UINT, false, 0);
+    CHECK(d32s8_stencil_fb.format == F::Depth24PlusStencil8 && d32s8_stencil_fb.aspect == A::StencilOnly);
+
+    // Valid sRGB view alias vs invalid integer alias fallback.
+    const auto srgb_alias = bridge::resolve_sampled_view_format(D::R8G8B8A8_UNORM, D::R8G8B8A8_UNORM_SRGB, false, 0);
+    CHECK(srgb_alias.format == F::Rgba8UnormSrgb && srgb_alias.srgb_aliased && !srgb_alias.fallback_to_base);
+    const auto bad_alias = bridge::resolve_sampled_view_format(D::R8G8B8A8_UNORM, D::R8G8B8A8_UINT, false, 0);
+    CHECK(bad_alias.format == F::Rgba8Unorm && !bad_alias.srgb_aliased && bad_alias.fallback_to_base);
+
+    // 4. End-to-end CommandListBridge test: R32_TYPELESS depth texture written as D32_FLOAT DSV,
+    //    then sampled via R32_FLOAT SRV -> CreateBindGroup2 carries Depth32Float + DepthOnly!
+    //    And R8G8B8A8_UNORM sampled via R8G8B8A8_UNORM_SRGB -> Rgba8UnormSrgb; invalid UINT SRV -> Rgba8Unorm!
+    Scene scene(35000);
+    constexpr uint32_t kTypelessShadow = 701;
+    scene.device.register_texture(kTypelessShadow, {D::R32_TYPELESS, 512, 512, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    d3d::ViewDesc shadow_dsv;
+    shadow_dsv.format = static_cast<uint32_t>(D::D32_FLOAT);
+    shadow_dsv.dimension = d3d::DsvDimension::Texture2D;
+    CHECK(scene.heaps.create_depth_stencil_view(kTypelessShadow, &shadow_dsv, scene.dsv_heap->cpu_handle(1)) ==
+          d3d::Status::Ok);
+
+    // Resolve the DSV (marks kTypelessShadow as a depth resource), then bind an R32_FLOAT SRV of it.
+    pso::DepthStencilViewInfo shadow_info{};
+    CHECK(scene.device.resolve_dsv(scene.dsv_heap->cpu_handle(1).ptr, &shadow_info));
+
+    d3d::ViewDesc shadow_srv;
+    shadow_srv.format = static_cast<uint32_t>(D::R32_FLOAT);
+    shadow_srv.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(scene.heaps.create_shader_resource_view(kTypelessShadow, &shadow_srv, scene.srv_heap->cpu_handle(4)) ==
+          d3d::Status::Ok);
+
+    d3d::ViewDesc srgb_srv;
+    srgb_srv.format = static_cast<uint32_t>(D::R8G8B8A8_UNORM_SRGB);
+    srgb_srv.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(scene.heaps.create_shader_resource_view(Scene::kAlbedo, &srgb_srv, scene.srv_heap->cpu_handle(5)) ==
+          d3d::Status::Ok);
+
+    d3d::ViewDesc bad_uint_srv;
+    bad_uint_srv.format = static_cast<uint32_t>(D::R8G8B8A8_UINT);
+    bad_uint_srv.dimension = d3d::ViewDimension::Texture2D;
+    CHECK(scene.heaps.create_shader_resource_view(Scene::kAlbedo, &bad_uint_srv, scene.srv_heap->cpu_handle(6)) ==
+          d3d::Status::Ok);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv0 = scene.rtv(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+
+    auto draw_with_srv_slot = [&](uint32_t slot) {
+        const size_t mark = enc.size();
+        CHECK(list.SetGraphicsRootDescriptorTable(0, scene.srv_heap->gpu_handle(slot)) == d3d::Status::Ok);
+        list.DrawInstanced(3, 1, 0, 0);
+        GpuBindGroupEntry2 tex_entry{};
+        bool found = false;
+        for (const Packet& pk : decode(enc, mark)) {
+            if (pk.opcode == GpuOpcode::CreateBindGroup2) {
+                tex_entry = pod<GpuBindGroupEntry2>(pk, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+                found = true;
+            }
+        }
+        CHECK(found);
+        return tex_entry;
+    };
+
+    const GpuBindGroupEntry2 e_shadow = draw_with_srv_slot(4);
+    CHECK(e_shadow.resource_id == kTypelessShadow);
+    CHECK(e_shadow.view.format == static_cast<uint8_t>(F::Depth32Float));
+    CHECK(e_shadow.view.aspect == static_cast<uint8_t>(GpuTextureAspect::DepthOnly));
+
+    const GpuBindGroupEntry2 e_srgb = draw_with_srv_slot(5);
+    CHECK(e_srgb.resource_id == Scene::kAlbedo);
+    CHECK(e_srgb.view.format == static_cast<uint8_t>(F::Rgba8UnormSrgb));
+
+    const GpuBindGroupEntry2 e_bad = draw_with_srv_slot(6);
+    CHECK(e_bad.resource_id == Scene::kAlbedo);
+    CHECK(e_bad.view.format == static_cast<uint8_t>(F::Rgba8Unorm));
+    list.Close();
+}
+
+void test_g81_zero_alloc_deterministic_hashing() {
+    // 1. Deterministic FNV-1a / SplitMix64 hashes: identical inputs produce identical hashes,
+    //    single-bit changes produce distinct hashes.
+    const uint32_t data_a[4] = {1u, 2u, 3u, 4u};
+    const uint32_t data_b[4] = {1u, 2u, 3u, 5u};
+    CHECK(bridge::fnv1a_hash64(data_a, sizeof(data_a)) == bridge::fnv1a_hash64(data_a, sizeof(data_a)));
+    CHECK(bridge::fnv1a_hash64(data_a, sizeof(data_a)) != bridge::fnv1a_hash64(data_b, sizeof(data_b)));
+    CHECK(bridge::splitmix64(0) != bridge::splitmix64(1));
+    CHECK(bridge::hash_combine64(12345ull, 67890ull) == bridge::hash_combine64(12345ull, 67890ull));
+    CHECK(bridge::hash_combine64(12345ull, 67890ull) != bridge::hash_combine64(67890ull, 12345ull));
+
+    // 2. Sampler payload hashing ignores id/reserved and canonicalizes -0.0f / NaN / Inf LOD clamps.
+    GpuCreateSampler2Payload s1{};
+    s1.id = 10;
+    s1.address_u = static_cast<uint8_t>(GpuAddressMode::Repeat);
+    s1.lod_min_clamp = 0.0f;
+    s1.lod_max_clamp = 16.0f;
+    GpuCreateSampler2Payload s2 = s1;
+    s2.id = 999;
+    s2.reserved0 = 0xAA;
+    s2.reserved1 = 0xBEEF;
+    s2.lod_min_clamp = -0.0f;
+    CHECK(bridge::hash_sampler_payload(s1) == bridge::hash_sampler_payload(s2));
+    s2.compare = static_cast<uint8_t>(pso::WgpuCompareFunction::LessEqual);
+    CHECK(bridge::hash_sampler_payload(s1) != bridge::hash_sampler_payload(s2));
+
+    // 3. ViewRecord hashing ignores GpuTextureViewDesc::reserved and distinguishes aspect/mip/usage.
+    bridge::ViewRecord v1{};
+    v1.texture_id = 42;
+    v1.resource_id = 42;
+    v1.view.format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+    v1.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+    v1.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+    v1.usage = d3d::ResourceUsage::Sampled;
+    bridge::ViewRecord v2 = v1;
+    v2.view.reserved = 0x77;
+    CHECK(bridge::hash_view_record(v1) == bridge::hash_view_record(v2));
+    v2.view.base_mip_level = 1;
+    CHECK(bridge::hash_view_record(v1) != bridge::hash_view_record(v2));
+
+    // 4. RenderPipelineKey hashing distinguishes depth_bias & MRT state deterministically.
+    GpuRenderPipelineKey k1{};
+    k1.vs_shader = 0x1111;
+    k1.depth_stencil.depth_bias = 2;
+    GpuRenderPipelineKey k2 = k1;
+    CHECK(bridge::hash_render_pipeline_key(k1) == bridge::hash_render_pipeline_key(k2));
+    k2.depth_stencil.depth_bias = -2;
+    CHECK(bridge::hash_render_pipeline_key(k1) != bridge::hash_render_pipeline_key(k2));
+
+    // 5. Sampler interning deduplicates -0.0f vs +0.0f LOD clamps and reuses the same sampler ID.
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps, counting_options(36000));
+    d3d::DescriptorHeap* srv_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 2, true);
+    d3d::DescriptorHeap* smp_heap = make_heap(heaps, d3d::DescriptorHeapType::Sampler, 4, true);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    device.register_texture(800, {pso::DxgiFormat::R8G8B8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    device.register_texture(801, {pso::DxgiFormat::R8G8B8A8_UNORM, 64, 64, 1, 1, 1, GpuTextureDimension::Dim2D, false});
+    CHECK(heaps.create_render_target_view(800, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+    CHECK(heaps.create_shader_resource_view(801, nullptr, srv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    d3d::SamplerDesc sd_pos{};
+    sd_pos.min_lod = 0.0f;
+    sd_pos.max_lod = 8.0f;
+    d3d::SamplerDesc sd_neg = sd_pos;
+    sd_neg.min_lod = -0.0f;
+    CHECK(heaps.create_sampler(sd_pos, smp_heap->cpu_handle(0)) == d3d::Status::Ok);
+    CHECK(heaps.create_sampler(sd_neg, smp_heap->cpu_handle(1)) == d3d::Status::Ok);
+
+    // View interning deduplicates & recycles cleanly through ViewKey.
+    const uint32_t vid1 = device.test_intern_view(v1);
+    const uint32_t vid2 = device.test_intern_view(v2);
+    CHECK(vid1 != 0 && vid2 != 0 && vid1 != vid2);
+    CHECK(device.test_intern_view(v1) == vid1);
+    CHECK(device.live_view_count() == 2);
+    device.unregister_resource(42);
+    CHECK(device.live_view_count() == 0);
+    CHECK(device.view(vid1) == nullptr && device.view(vid2) == nullptr);
+    const uint32_t vid3 = device.test_intern_view(v1);
+    CHECK(vid3 == vid1 || vid3 == vid2);  // recycled from free list
+    CHECK(device.live_view_count() == 1);
+}
+
 int main() {
+    test_g81_depth_bias_and_shadow_map_parity();
+    test_g81_eight_mrt_blend_and_integer_guards();
+    test_g81_stencil_faces_masks_and_dynamic_reemission();
+    test_g81_primitive_topology_and_strip_index_format();
+    test_g81_hdr_depth_srgb_view_formats();
+    test_g81_zero_alloc_deterministic_hashing();
     test_rt_arena_dispatch();
     test_rt_off_skips_and_counts();
     test_partly_held_mip_chain_clamps_views();
