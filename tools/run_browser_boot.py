@@ -603,6 +603,24 @@ def find_free_port(host: str = "127.0.0.1") -> int:
         return int(sock.getsockname()[1])
 
 
+def wait_for_port_released(host: str, port: int, timeout_s: float = 3.0) -> bool:
+    """Wait briefly until TCP `host:port` can be bound again (avoids EADDRINUSE on warm reuse)."""
+    if port <= 0:
+        return True
+    deadline = time.monotonic() + max(0.0, timeout_s)
+    while True:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if sys.platform != "win32" and hasattr(socket, "SO_REUSEADDR"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((host, port))
+                return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 def terminate_process(proc: Any, wait_s: float = 5.0) -> int | None:
     """Gracefully terminate a subprocess, escalating to kill() if needed."""
     if proc is None:
@@ -4392,6 +4410,8 @@ def run_browser_session(
                 pass
         terminate_process(chrome_proc)
         terminate_process(server_proc)
+        if server_proc is not None:
+            wait_for_port_released(host, server_port)
         for fh in (chrome_log_fh, server_log_fh):
             if fh is not None:
                 try:
@@ -5770,15 +5790,20 @@ def _run(
     warm_session: BrowserSessionResult | None = None
     warm_report: dict[str, Any] | None = None
     warm_boot_summary: dict[str, Any] | None = None
+    session_port = args.port
     if warm_boot_check:
         shared_profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-warm-profile-"))
+        if session_port == 0:
+            # Pick one free localhost port upfront so cold and warm passes share the exact
+            # same http://127.0.0.1:<port> origin (required for Chrome OPFS cache reuse).
+            session_port = find_free_port("127.0.0.1")
 
     try:
         cold_kwargs: dict[str, Any] = {
             "repo": repo,
             "run_dir": run_dir,
             "chrome_path": chrome_path,
-            "port": args.port,
+            "port": session_port,
             "boot_dir": None if args.smoke else boot_dir,
             "game_dir": game_dir,
             "shaders_dir": effective_shaders_dir,
@@ -5825,7 +5850,8 @@ def _run(
 
         if warm_boot_check and cold_report is not None and shared_profile_dir is not None:
             print(
-                f"[warm] running warm reload pass ({warm_duration_s:g}s) in shared Chrome profile",
+                f"[warm] running warm reload pass ({warm_duration_s:g}s) in shared Chrome profile "
+                f"on 127.0.0.1:{session_port}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -5833,7 +5859,7 @@ def _run(
                 "repo": repo,
                 "run_dir": run_dir,
                 "chrome_path": chrome_path,
-                "port": args.port,
+                "port": session_port,
                 "boot_dir": None if args.smoke else boot_dir,
                 "game_dir": game_dir,
                 "shaders_dir": effective_shaders_dir,
