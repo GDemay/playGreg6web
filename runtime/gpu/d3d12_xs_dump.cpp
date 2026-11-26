@@ -185,9 +185,10 @@ void PipelineDump::native_stage(uint64_t code_identity, uint64_t identity, Nativ
         meta_file = "native/" + id_text(code_identity) + "-" + id_text(identity) + ".meta";
         write_file(dir_ + "/" + meta_file, metadata, metadata_size);
     }
-    const char* stage_name = stage == NativeStageKind::Compute
-                                 ? "compute"
-                                 : (stage == NativeStageKind::Pixel ? "pixel" : "vertex");
+    const char* stage_name = stage == NativeStageKind::Compute ? "compute"
+                             : stage == NativeStageKind::Mesh  ? "mesh"
+                             : stage == NativeStageKind::Pixel ? "pixel"
+                                                               : "vertex";
     native_entries_.push_back("{\"code_identity\": " + json_string(id_text(code_identity)) + ", \"identity\": " +
                               json_string(id_text(identity)) + ", \"stage\": \"" + stage_name +
                               "\", \"layout\": \"" + (layout_b ? "B" : "A") + "\", \"code_bytes\": " +

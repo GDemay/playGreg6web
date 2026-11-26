@@ -208,11 +208,15 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
 // The root parameter whose user data starts at `user_sgpr` (-1 when none does).
 inline constexpr uint32_t kGraphicsUserDataBase = 8;
 inline constexpr uint32_t kComputeUserDataBase = 4;
+// The mesh stage (lowered to compute) reads the graphics root arguments from s16 on: its reflections
+// put the first root parameter's table at s16 (s8..s15 hold the mesh/NGG system values).
+inline constexpr uint32_t kMeshUserDataBase = 16;
 inline constexpr uint32_t kTableSlotBytes = 32;
-int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr);
+// `base` (0 = the graphics or compute default) overrides the first root parameter's user SGPR.
+int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr, uint32_t base = 0);
 // The root parameter whose user data *covers* `user_sgpr` (-1 when none), with the dword index into it.
 int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
-                                        uint32_t* dword);
+                                        uint32_t* dword, uint32_t base = 0);
 
 // Pipeline layout for pack-resolved stages from their reflection joined to the root signature.
 // `stages`: each stage's reflection with its GpuShaderStageBits. Bindings that two stages share
@@ -247,6 +251,8 @@ struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
     // join as arrays instead of failing the join.
     bool binding_arrays = false;
+    // First root parameter's user SGPR (0: the graphics / compute default); kMeshUserDataBase for a mesh stage.
+    uint32_t user_data_base = 0;
 };
 bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const std::vector<ReflectedStageRef>& stages,
                           bridge::PipelineLayoutDesc* out, std::string* report, JoinStats* stats = nullptr,

@@ -3128,6 +3128,7 @@ void embedded_native_stage(Device& dev, const std::vector<uint8_t>& bytes, xbox:
     if (PipelineDump* dump = dev.pipeline_dump()) {
         const auto kind = want == xbox::EmbeddedStage::Ps   ? PipelineDump::NativeStageKind::Pixel
                           : want == xbox::EmbeddedStage::Cs ? PipelineDump::NativeStageKind::Compute
+                          : want == xbox::EmbeddedStage::Ms ? PipelineDump::NativeStageKind::Mesh
                                                             : PipelineDump::NativeStageKind::Vertex;
         dump->native_stage(out->code_identity, out->identity, kind, /*layout_b=*/false, p->code.data(), p->code.size(),
                            native.fssm.data(), native.fssm.size());
@@ -3643,19 +3644,26 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
     uint64_t ps_id = 0;
     DxilDigest ms_digest{};
     DxilDigest ps_digest{};
-    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest) || !read_shader(*this, g.PS, "PS", &ps_id, &ps_digest) ||
-        ms_id == 0) {
+    // A stage no slot-57 stage joins runs the native code its own container carries, as for the
+    // other stage kinds; the mesh stage's is also written to the pipeline dump (stage "mesh").
+    NativeStageRecord embedded_ms{};
+    NativeStageRecord embedded_ps{};
+    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest, &embedded_ms, xbox::EmbeddedStage::Ms) ||
+        !read_shader(*this, g.PS, "PS", &ps_id, &ps_digest, &embedded_ps, xbox::EmbeddedStage::Ps) || ms_id == 0) {
         return placeholder("mesh shaders (unreadable stage)");
     }
     // Pack keys, as for the other stages: the joined console-native stage's code identity first,
     // then the DXIL identity.
     static const DxilDigest kZero{};
-    const auto find_key = [&](const DxilDigest& digest, uint64_t dxil, uint64_t salt, PackStage stage) -> uint64_t {
+    const auto find_key = [&](const DxilDigest& digest, uint64_t dxil, uint64_t salt, PackStage stage,
+                              const NativeStageRecord& embedded) -> uint64_t {
         NativeStageRecord native{};
         if (native_index_size() != 0 && digest != kZero) {
             find_native_stage(digest, &native);
         }
-        for (uint64_t k : {native.identity != 0 ? native.code_identity : uint64_t{0}, dxil}) {
+        // The joined slot-57 stage first, then the container's own native stage, then the DXIL identity.
+        for (uint64_t k : {native.identity != 0 ? native.code_identity : uint64_t{0},
+                           embedded.identity != 0 ? embedded.code_identity : uint64_t{0}, dxil}) {
             auto it = k != 0 ? pack->find(k ^ salt) : pack->end();
             if (it != pack->end() && it->second == stage) {
                 return k ^ salt;
@@ -3663,11 +3671,15 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
         }
         return 0;
     };
-    const uint64_t ms_key = find_key(ms_digest, ms_id, bridge::kMeshComputeKeySalt, PackStage::Compute);
-    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment) : 0;
+    const uint64_t ms_key = find_key(ms_digest, ms_id, bridge::kMeshComputeKeySalt, PackStage::Compute, embedded_ms);
+    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment, embedded_ps) : 0;
     const auto ms_refl = ms_key != 0 ? refl->find(ms_key) : refl->end();
     if (ms_key == 0 || ms_refl == refl->end() || !ms_refl->second.has_mesh_output || (ps_id != 0 && ps_key == 0)) {
-        return placeholder("mesh shaders (no mesh compute translation in the pack)");
+        // The reason names the missing piece (the text is the deduplication key of the notice).
+        return placeholder(ms_key == 0                         ? "mesh shaders (no mesh compute translation in the pack)"
+                           : ms_refl == refl->end()            ? "mesh shaders (no reflection for the mesh compute stage)"
+                           : !ms_refl->second.has_mesh_output  ? "mesh shaders (reflection without mesh_output)"
+                                                               : "mesh shaders (no pixel stage translation in the pack)");
     }
     const bridge::MeshOutputLayout output = ms_refl->second.mesh_output;
     // Layouts: the mesh stage's from its reflection (graphics user data, compute visibility); the
@@ -3676,7 +3688,7 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
     bridge::PipelineLayoutDesc stage_layout;
     bool ok = join_pipeline_layout(rs->signature().desc(), /*compute=*/false,
                                    {{GpuShaderStageBits::Compute, &ms_refl->second}}, &stage_layout, &report, nullptr,
-                                   JoinOptions{options_.bridge.binding_arrays});
+                                   JoinOptions{options_.bridge.binding_arrays, kMeshUserDataBase});
     bridge::PipelineLayoutDesc draw_layout;
     const auto ps_refl = ps_key != 0 ? refl->find(ps_key) : refl->end();
     if (ok && ps_refl != refl->end()) {

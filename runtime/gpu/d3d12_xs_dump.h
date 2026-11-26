@@ -17,7 +17,7 @@
 // the identity the guest layer uses; the code+metadata identity is in the manifest.
 //
 // manifest.json (schema "playgta6-pipeline-dump", schema_version 1):
-//   native_stages: [{code_identity, identity, stage ("vertex" | "pixel" | "compute"), layout ("A" | "B"),
+//   native_stages: [{code_identity, identity, stage ("vertex" | "pixel" | "compute" | "mesh"), layout ("A" | "B"),
 //                    code_bytes, metadata_bytes, code_file, metadata_file}]
 //   dxil: [{identity, hash_digest (32 hex digits, the HASH part; "" if none), kind (DXIL program
 //           kind: 0 pixel, 1 vertex, 5 compute, ...; -1 unknown), bytes, file}]
@@ -72,7 +72,7 @@ public:
     bool ok() const { return ok_; }
     const std::string& dir() const { return dir_; }
 
-    enum class NativeStageKind : uint8_t { Vertex = 0, Pixel = 1, Compute = 2 };
+    enum class NativeStageKind : uint8_t { Vertex = 0, Pixel = 1, Compute = 2, Mesh = 3 };
 
     void native_stage(uint64_t code_identity, uint64_t identity, bool pixel, bool layout_b, const uint8_t* code,
                       size_t code_size, const uint8_t* metadata, size_t metadata_size);
