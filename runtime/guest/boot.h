@@ -454,6 +454,11 @@ struct BootConfig {
     // nullptr: such faults go to the default fault handler (log and abort).
     OffThreadFaultFn off_thread_fault = nullptr;
     GuestThreadStartedFn guest_thread_started = nullptr;
+    // Compact fault record (report "fault_record" + a "[fault]" log line; tools/fault_report.py):
+    // guest rip, containing function and nearest export, indirect call source, registers, call
+    // stack, the last 64 dispatched function entries of the faulting thread, elapsed time and the
+    // newest present's draws. Off: the entry ring keeps one slot and no record is written.
+    bool fault_record = true;
     bool log_progress = true;       // phase lines through os::log
     // The generated export table (`pg6_export_thunks`, guest/export_thunks.h): guest-callable
     // entries for every shim export, registered after the IAT slots are bound so that
