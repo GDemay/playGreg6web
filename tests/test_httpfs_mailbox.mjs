@@ -1375,3 +1375,586 @@ test('W294: cross-lane in-flight Range coalescing triggers strictly 1 network fe
   assert.equal(directCache.getStats().cacheMisses, 0);
   assert.equal(directCache.getStats().cacheBytes, 4096);
 });
+
+// ---------------------------------------------------------------------------
+// 10. W367: Adaptive read-ahead slab caching, zero-copy reads, deduplication,
+//     LRU budget enforcement, EOF/short-read clamping, and error/retry safety
+// ---------------------------------------------------------------------------
+
+test('W367: adaptive sequential read-ahead ramps prefetch window, bounds concurrent prefetches, and supports clustered RPF gaps', async () => {
+  const chunkSize = 4096;
+  const totalChunks = 16; // 64 KiB across 16 chunks
+  const rpfBytes = makePatternBytes(totalChunks * chunkSize, 173);
+
+  let activeFetches = 0;
+  let peakActiveFetches = 0;
+  const mock = createMockRangeFetch(new Map([['/game/world_stream.rpf', rpfBytes]]), {
+    onRequest: async () => {
+      activeFetches += 1;
+      if (activeFetches > peakActiveFetches) {
+        peakActiveFetches = activeFetches;
+      }
+      await new Promise((r) => setTimeout(r, 2));
+      activeFetches -= 1;
+    },
+  });
+
+  const cache = new HttpfsLruChunkCache({
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 128 * 1024, // 32 chunks budget
+    chunkSize,
+    readAheadChunks: 2,
+    maxReadAheadChunks: 6,
+    maxConcurrentPrefetches: 3,
+    adaptiveReadAhead: true,
+  });
+
+  // Stream all 16 chunks sequentially; after chunk 1, background prefetches should satisfy
+  // every subsequent chunk without issuing duplicate HTTP requests.
+  for (let idx = 0; idx < totalChunks; idx += 1) {
+    const got = await cache.read('/game/world_stream.rpf', idx * chunkSize, chunkSize);
+    assert.deepEqual(got, rpfBytes.subarray(idx * chunkSize, (idx + 1) * chunkSize));
+    // Active background prefetches must strictly obey maxConcurrentPrefetches.
+    assert.ok(
+      cache.getStats().activePrefetches <= 3,
+      `activePrefetches exceeded maxConcurrentPrefetches=3: ${cache.getStats().activePrefetches}`,
+    );
+  }
+  await cache.flushPrefetches();
+
+  const stats = cache.getStats();
+  assert.equal(mock.requests.length, totalChunks, 'Strictly 1 HTTP fetch per chunk (zero duplicates)');
+  assert.equal(stats.cacheMisses, 2, 'Only chunks 0 and 1 should be demand misses');
+  assert.equal(stats.prefetchIssued, totalChunks - 2);
+  assert.equal(stats.prefetchHits, totalChunks - 2);
+  assert.equal(stats.activePrefetches, 0);
+  assert.equal(stats.adaptiveReadAhead, true);
+  assert.equal(stats.maxReadAheadChunks, 6);
+  assert.equal(stats.maxConcurrentPrefetches, 3);
+  assert.ok(peakActiveFetches <= 4, `Peak concurrent fetches should stay bounded, got ${peakActiveFetches}`);
+
+  // Clustered forward reads with small sector/entry alignment gaps (e.g. 256B RPF9 padding)
+  // must trigger sequential read-ahead, whereas random seeks must NOT.
+  const clusterBytes = makePatternBytes(6 * chunkSize, 181);
+  const clusterMock = createMockRangeFetch(new Map([['/game/clustered.rpf', clusterBytes]]));
+  const clusterCache = new HttpfsLruChunkCache({
+    fetchImpl: clusterMock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 2,
+  });
+
+  // Read [0..1024), then [1280..2304) (256B alignment gap <= chunkSize/2) -> triggers read-ahead!
+  assert.deepEqual(
+    await clusterCache.read('/game/clustered.rpf', 0, 1024),
+    clusterBytes.subarray(0, 1024),
+  );
+  assert.equal(clusterCache.getStats().prefetchIssued, 0);
+  assert.deepEqual(
+    await clusterCache.read('/game/clustered.rpf', 1280, 1024),
+    clusterBytes.subarray(1280, 2304),
+  );
+  await clusterCache.flushPrefetches();
+  assert.equal(
+    clusterCache.getStats().prefetchIssued,
+    2,
+    'Clustered forward read with small alignment gap must trigger read-ahead prefetches',
+  );
+  // Chunk 1 is now warm in cache (served synchronously via prefetchHit, while proactively prefetching chunk 3).
+  assert.deepEqual(
+    clusterCache.tryReadSync('/game/clustered.rpf', chunkSize, 1024),
+    clusterBytes.subarray(chunkSize, chunkSize + 1024),
+  );
+  await clusterCache.flushPrefetches();
+  assert.equal(clusterCache.getStats().cacheMisses, 1, 'Only chunk 0 was a demand miss');
+  assert.equal(clusterCache.getStats().prefetchHits, 1, 'Chunk 1 served directly from prefetch');
+  assert.equal(
+    clusterMock.requests.filter((r) => r.rangeHeader === 'bytes=4096-8191').length,
+    1,
+    'Chunk 1 must never be re-fetched',
+  );
+});
+
+test('W367: zero-copy tryReadIntoSync / readInto avoid extra copies, preserve caller canary bytes, and guard clear() generation', async () => {
+  const chunkSize = 4096;
+  const rpfBytes = makePatternBytes(3 * chunkSize + 500, 191);
+  const saveBytes = makePatternBytes(2048, 197);
+  const gate = createDeferred();
+  let gateChunk2 = false;
+
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/game/zerocopy.rpf', rpfBytes],
+      ['/userdata/dynamic.sav', saveBytes],
+    ]),
+    {
+      onRequest: async (req) => {
+        if (gateChunk2 && req.rangeHeader === 'bytes=8192-12287') {
+          await gate.promise;
+        }
+      },
+    },
+  );
+
+  const cache = new HttpfsLruChunkCache({
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 0,
+  });
+
+  // Cold miss returns -1 without touching dst canary bytes.
+  const dst = new Uint8Array(6000);
+  dst.fill(0xa5);
+  assert.equal(cache.tryReadIntoSync('/game/zerocopy.rpf', 100, 512, dst, 64), -1);
+  assert.ok(dst.every((b) => b === 0xa5), 'Miss must not modify destination buffer');
+
+  // readInto fetches chunk 0 and writes directly at dstOffset=64 without disturbing surrounding canaries.
+  const n0 = await cache.readInto('/game/zerocopy.rpf', 100, 512, dst, 64);
+  assert.equal(n0, 512);
+  assert.deepEqual(dst.subarray(64, 64 + 512), rpfBytes.subarray(100, 612));
+  assert.equal(dst[63], 0xa5);
+  assert.equal(dst[64 + 512], 0xa5);
+  assert.equal(mock.requests.length, 1);
+
+  // Repeat read hits tryReadIntoSync synchronously (0 HTTP fetches, MRU fast path).
+  const n0Sync = cache.tryReadIntoSync('/game/zerocopy.rpf', 200, 1024, dst, 128);
+  assert.equal(n0Sync, 1024);
+  assert.deepEqual(dst.subarray(128, 128 + 1024), rpfBytes.subarray(200, 1224));
+  assert.equal(mock.requests.length, 1);
+
+  // Cross-chunk readInto spanning chunks 0 and 1.
+  const spanOff = chunkSize - 300;
+  const nSpan = await cache.readInto('/game/zerocopy.rpf', spanOff, 900, dst, 32);
+  assert.equal(nSpan, 900);
+  assert.deepEqual(dst.subarray(32, 32 + 900), rpfBytes.subarray(spanOff, spanOff + 900));
+  assert.equal(mock.requests.length, 2);
+
+  // Cross-chunk tryReadIntoSync hits both cached chunks synchronously.
+  const nSpanSync = cache.tryReadIntoSync('/game/zerocopy.rpf', spanOff + 50, 700, dst, 16);
+  assert.equal(nSpanSync, 700);
+  assert.deepEqual(dst.subarray(16, 16 + 700), rpfBytes.subarray(spanOff + 50, spanOff + 750));
+  assert.equal(mock.requests.length, 2);
+
+  // Non-cacheable URL bypasses LRU cleanly via readInto.
+  assert.equal(cache.tryReadIntoSync('/userdata/dynamic.sav', 0, 256, dst, 0), -1);
+  const nSave = await cache.readInto('/userdata/dynamic.sav', 128, 256, dst, 10);
+  assert.equal(nSave, 256);
+  assert.deepEqual(dst.subarray(10, 10 + 256), saveBytes.subarray(128, 384));
+
+  // Generation guard: clear() while chunk 2 is in-flight prevents stale chunk 2 from repopulating cache.
+  gateChunk2 = true;
+  const inflightBuf = new Uint8Array(512);
+  const inflightRead = cache.readInto('/game/zerocopy.rpf', 2 * chunkSize, 512, inflightBuf, 0);
+  assert.equal(cache.getStats().inFlightRequests, 1);
+  cache.clear();
+  assert.equal(cache.getStats().cacheBytes, 0);
+
+  gate.resolve();
+  assert.equal(await inflightRead, 512);
+  assert.deepEqual(inflightBuf, rpfBytes.subarray(2 * chunkSize, 2 * chunkSize + 512));
+  assert.equal(
+    cache.getStats().cacheBytes,
+    0,
+    'In-flight fetch started before clear() must not repopulate cleared cache',
+  );
+  assert.equal(cache.getStats().inFlightRequests, 0);
+});
+
+test('W367: LRU budget stays strictly bounded under sustained adaptive sequential streaming', async () => {
+  const chunkSize = 4096;
+  const totalChunks = 12;
+  const budgetChunks = 4; // Strict 16 KiB cap for a 48 KiB stream
+  const rpfBytes = makePatternBytes(totalChunks * chunkSize, 223);
+  const mock = createMockRangeFetch(new Map([['/game/bounded_stream.rpf', rpfBytes]]));
+
+  const cache = new HttpfsLruChunkCache({
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: budgetChunks * chunkSize,
+    chunkSize,
+    readAheadChunks: 2,
+    maxReadAheadChunks: 8,
+    adaptiveReadAhead: true,
+  });
+
+  for (let idx = 0; idx < totalChunks; idx += 1) {
+    const got = await cache.read('/game/bounded_stream.rpf', idx * chunkSize, chunkSize);
+    assert.deepEqual(got, rpfBytes.subarray(idx * chunkSize, (idx + 1) * chunkSize));
+    await cache.flushPrefetches();
+    const st = cache.getStats();
+    assert.ok(
+      st.cacheBytes <= budgetChunks * chunkSize,
+      `cacheBytes (${st.cacheBytes}) exceeded budget (${budgetChunks * chunkSize}) at chunk ${idx}`,
+    );
+    assert.ok(st.cacheEntries <= budgetChunks);
+  }
+
+  const finalStats = cache.getStats();
+  assert.ok(finalStats.cacheEvictions >= totalChunks - budgetChunks);
+  assert.equal(finalStats.cacheBytes, budgetChunks * chunkSize);
+  assert.equal(finalStats.prefetchHits, totalChunks - 2, 'Adaptive cap must never self-evict prefetched slabs');
+  assert.equal(mock.requests.length, totalChunks, 'Zero thrash re-fetches despite tight LRU cap');
+});
+
+test('W367: error/retry safety cleans up in-flight state on network throws, supports opt-in transient retries, and clamps unknown-size EOF', async () => {
+  const chunkSize = 4096;
+  const tailSize = 2 * chunkSize + 777;
+  const rpfBytes = makePatternBytes(tailSize, 233);
+
+  // Part A: Default (maxRetries=0) network throw on demand + prefetch leaves zero stuck in-flight state.
+  let throwChunk0Once = true;
+  let throwChunk2Once = true;
+  const flakyFetchA = async (url, init = {}) => {
+    const range = init.headers && (init.headers.Range || init.headers.range);
+    if (throwChunk0Once && range === 'bytes=0-4095') {
+      throwChunk0Once = false;
+      throw new TypeError('simulated network reset');
+    }
+    if (throwChunk2Once && range === 'bytes=8192-12287') {
+      throwChunk2Once = false;
+      throw new TypeError('simulated prefetch drop');
+    }
+    const base = createMockRangeFetch(new Map([[url, rpfBytes]]));
+    return base.fetchImpl(url, init);
+  };
+
+  const cacheA = new HttpfsLruChunkCache({
+    fetchImpl: flakyFetchA,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 2,
+  });
+
+  await assert.rejects(() => cacheA.read('/game/flaky.rpf', 0, 512), /simulated network reset/);
+  assert.equal(cacheA.getStats().inFlightRequests, 0);
+  assert.equal(cacheA.getStats().activePrefetches, 0);
+  assert.equal(cacheA.getStats().cacheBytes, 0);
+
+  // Immediate retry succeeds cleanly.
+  assert.deepEqual(await cacheA.read('/game/flaky.rpf', 0, 512), rpfBytes.subarray(0, 512));
+  // Trigger sequential prefetch (chunk 1 succeeds, chunk 2 throws and is safely absorbed).
+  assert.deepEqual(await cacheA.read('/game/flaky.rpf', 512, 512), rpfBytes.subarray(512, 1024));
+  await cacheA.flushPrefetches();
+  assert.equal(cacheA.getStats().inFlightRequests, 0);
+  assert.equal(cacheA.getStats().activePrefetches, 0);
+
+  // Demand read of chunk 2 (whose prefetch threw) retries cleanly and clamps at EOF (777B).
+  const tailGot = await cacheA.read('/game/flaky.rpf', 2 * chunkSize, 2048);
+  assert.equal(tailGot.byteLength, 777);
+  assert.deepEqual(tailGot, rpfBytes.subarray(2 * chunkSize, tailSize));
+
+  // Part B: Opt-in maxRetries retries transient 503 & network throws, does NOT retry 404.
+  let chunk0Fails = 2;
+  let notFoundCalls = 0;
+  const retryMock = createMockRangeFetch(new Map([['/game/retry_ok.rpf', rpfBytes]]), {
+    onRequest: async (req) => {
+      if (req.url === '/game/missing_404.rpf') {
+        notFoundCalls += 1;
+      }
+      if (req.url === '/game/retry_ok.rpf' && req.rangeHeader === 'bytes=0-4095' && chunk0Fails === 2) {
+        chunk0Fails -= 1;
+        throw new TypeError('transient socket hangup');
+      }
+    },
+    statusOverrides: new Map([
+      [
+        '/game/retry_ok.rpf',
+        (req) => {
+          if (req.rangeHeader === 'bytes=0-4095' && chunk0Fails === 1) {
+            chunk0Fails -= 1;
+            return 503;
+          }
+          return null;
+        },
+      ],
+    ]),
+  });
+
+  const retryCache = new HttpfsLruChunkCache({
+    fetchImpl: retryMock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 0,
+    maxRetries: 2,
+    retryBackoffMs: 1,
+  });
+
+  const recovered = await retryCache.read('/game/retry_ok.rpf', 0, 1024);
+  assert.deepEqual(recovered, rpfBytes.subarray(0, 1024));
+  assert.equal(retryCache.getStats().retryAttempts, 2);
+
+  // 404 must fail immediately without retrying.
+  const retriesBefore404 = retryCache.getStats().retryAttempts;
+  await assert.rejects(() => retryCache.read('/game/missing_404.rpf', 0, 64), /HTTP 404/);
+  assert.equal(notFoundCalls, 1);
+  assert.equal(retryCache.getStats().retryAttempts, retriesBefore404);
+  assert.equal(retryCache.getStats().inFlightRequests, 0);
+
+  // Part C: Unknown total size (`Content-Range: bytes start-end/*`) clamps cleanly on partial tail
+  // and learns exact EOF size so subsequent past-EOF reads perform zero network fetches.
+  const omitMock = createMockRangeFetch(new Map([['/game/unknown_total.rpf', rpfBytes]]), {
+    omitTotal: true,
+  });
+  const omitCache = new HttpfsLruChunkCache({
+    fetchImpl: omitMock.fetchImpl,
+    cacheMaxBytes: 64 * 1024,
+    chunkSize,
+    readAheadChunks: 2,
+  });
+  const spanAll = await omitCache.read('/game/unknown_total.rpf', 0, tailSize + 8192);
+  await omitCache.flushPrefetches();
+  assert.equal(spanAll.byteLength, tailSize);
+  assert.deepEqual(spanAll, rpfBytes);
+  assert.equal(omitCache.getKnownSize('/game/unknown_total.rpf'), tailSize);
+  const reqsAfterLearn = omitMock.requests.length;
+  assert.deepEqual(await omitCache.read('/game/unknown_total.rpf', tailSize, 4096), new Uint8Array(0));
+  assert.equal(omitMock.requests.length, reqsAfterLearn, 'Past-EOF read after learning size must issue 0 fetches');
+});
+
+test('W367: HttpfsMailboxHost backgroundPrefetch double-buffers sequential windows & cross-thread multi-chunk sync reads stay exact', async () => {
+  // Part A: Opt-in host backgroundPrefetch asynchronously fetches the next adaptive window
+  // while draining the current window, promoting nextRaBuffer -> raBuffer with zero stall.
+  const fileSize = 2 * 1024 * 1024; // 2 MiB = 32 x 64 KiB reads
+  const fileBytes = makePatternBytes(fileSize, 251);
+  const backendCalls = [];
+
+  const sab = createHttpfsMailboxBuffer(64 * 1024);
+  const host = new HttpfsMailboxHost(sab, {
+    readAhead: {
+      enabled: true,
+      backgroundPrefetch: true,
+      maxReadAheadBytes: 1024 * 1024,
+    },
+    open: () => 5,
+    read: async (handle, offset, reqLen) => {
+      if (handle !== 5) return null;
+      backendCalls.push({ offset, reqLen });
+      await new Promise((r) => setTimeout(r, 1));
+      return fileBytes.subarray(offset, Math.min(fileSize, offset + reqLen));
+    },
+    close: (handle) => handle === 5,
+  });
+  const client = new HttpfsMailboxClient(sab);
+  host.start();
+
+  try {
+    const h = await client.openAsync('update/bg_stream.rpf');
+    assert.equal(h, 5);
+
+    const assembled = new Uint8Array(fileSize);
+    const stepBuf = new Uint8Array(64 * 1024);
+    for (let i = 0; i < 32; i += 1) {
+      const got = await client.readAsync(h, BigInt(i * 65536), stepBuf, 65536);
+      assert.equal(got, 65536);
+      assembled.set(stepBuf, i * 65536);
+      // Allow background prefetch promise to settle between reads.
+      if (i % 4 === 2) {
+        await new Promise((r) => setTimeout(r, 4));
+      }
+    }
+    assert.deepEqual(assembled, fileBytes);
+
+    const tel = host.getHandleTelemetry(h);
+    // Background prefetch promotes next window before miss, so >= 29 of 32 reads hit read-ahead!
+    assert.ok(
+      tel.readAheadHits >= 29,
+      `Expected >= 29 readAheadHits with backgroundPrefetch, got ${tel.readAheadHits}`,
+    );
+    // 5 data windows + at most 1 EOF probe (buf.eof guard prevents repeated past-EOF prefetches)
+    assert.ok(backendCalls.length <= 6, `Expected <= 6 backend calls, got ${backendCalls.length}`);
+
+    // Random seek clears both raBuffer and nextRaBuffer cleanly.
+    const seekBuf = new Uint8Array(1024);
+    assert.equal(await client.readAsync(h, 4096n, seekBuf, 1024), 1024);
+    assert.deepEqual(seekBuf, fileBytes.subarray(4096, 5120));
+    assert.equal(await client.closeAsync(h), true);
+  } finally {
+    await host.stop();
+  }
+
+  // Part B: Cross-thread synchronous multi-chunk SAB streaming (exercises _executeRoundtripSync
+  // bounded spin, direct ResponseReady -> RequestReady chunk chaining, and zero-copy host reads).
+  const chunkSize = 32 * 1024;
+  const streamSize = 512 * 1024 + 1337; // 16+ slabs, 8+ multi-chunk 64 KiB SAB frames per read
+  const streamBytes = makePatternBytes(streamSize, 139);
+  const mock = createMockRangeFetch(new Map([['/game/sync_stream.rpf', streamBytes]]));
+
+  const syncSab = createHttpfsMailboxBuffer(64 * 1024);
+  const syncHost = new HttpfsMailboxHost(syncSab, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 1024 * 1024,
+    chunkSize,
+    readAheadChunks: 2,
+    maxReadAheadChunks: 6,
+    probeOnOpen: true,
+  });
+  syncHost.start();
+
+  const workerCode = `
+    const { workerData, parentPort } = require('node:worker_threads');
+    const { HttpfsMailboxClient } = require(workerData.mailboxPath);
+    const client = new HttpfsMailboxClient(workerData.sab, { timeoutMs: 8000 });
+
+    const h = client.open('game/sync_stream.rpf');
+    // Multi-chunk 256 KiB reads (4 x 64 KiB SAB roundtrips per call) across full file + EOF.
+    const out1 = new Uint8Array(workerData.size);
+    let off = 0;
+    while (off < workerData.size) {
+      const want = Math.min(256 * 1024, workerData.size - off);
+      const slice = new Uint8Array(want);
+      const got = client.read(h, BigInt(off), slice, want);
+      if (got <= 0) break;
+      out1.set(slice.subarray(0, got), off);
+      off += got;
+    }
+    // Second pass hits 100% cached slabs via zero-copy tryReadIntoSync + spin fast path.
+    const out2 = new Uint8Array(workerData.size);
+    const got2 = client.read(h, 0n, out2, workerData.size);
+    const eof = client.read(h, BigInt(workerData.size), new Uint8Array(64), 64);
+    const closed = client.close(h);
+    const checksum = (buf) => buf.reduce((a, b, i) => (a + b * ((i & 7) + 1)) >>> 0, 0);
+    parentPort.postMessage({
+      h,
+      off,
+      got2,
+      eof,
+      closed,
+      sum1: checksum(out1),
+      sum2: checksum(out2),
+    });
+  `;
+
+  try {
+    const res = await new Promise((resolve, reject) => {
+      const w = new NodeWorker(workerCode, {
+        eval: true,
+        workerData: {
+          sab: syncSab,
+          size: streamSize,
+          mailboxPath: path.join(repoRoot, 'web', 'workers', 'httpfs_mailbox.js'),
+        },
+      });
+      w.once('message', resolve);
+      w.once('error', reject);
+      w.once('exit', (code) => {
+        if (code !== 0) reject(new Error(`Worker exited with code ${code}`));
+      });
+    });
+
+    await syncHost.flushPrefetches();
+    const expectedSum = streamBytes.reduce((a, b, i) => (a + b * ((i & 7) + 1)) >>> 0, 0);
+    assert.ok(res.h >= 1);
+    assert.equal(res.off, streamSize);
+    assert.equal(res.got2, streamSize);
+    assert.equal(res.eof, 0);
+    assert.equal(res.closed, true);
+    assert.equal(res.sum1, expectedSum);
+    assert.equal(res.sum2, expectedSum);
+
+    const expectedChunks = Math.ceil(streamSize / chunkSize);
+    assert.equal(
+      mock.requests.length,
+      1 + expectedChunks,
+      `Expected 1 probe + ${expectedChunks} chunks across TWO full reads, got ${mock.requests.length}`,
+    );
+    const stats = syncHost.getStats();
+    assert.ok(stats.syncFastPathHits >= 10, `Expected >= 10 syncFastPathHits, got ${stats.syncFastPathHits}`);
+    assert.equal(stats.cacheBytes, streamSize);
+    assert.equal(stats.activePrefetches, undefined); // host stats stay strictly sanitized
+    assert.equal(syncHost.chunkCache.getStats().activePrefetches, 0);
+  } finally {
+    await syncHost.stop();
+  }
+});
+
+test('W367: multi-lane out-of-order sequential slab reads deduplicate in-flight fetches and sustain prefetching across lanes', async () => {
+  const chunkSize = 8192;
+  const totalChunks = 8; // 64 KiB
+  const rpfBytes = makePatternBytes(totalChunks * chunkSize, 163);
+  const chunkGates = new Map();
+  for (let i = 0; i < totalChunks; i += 1) {
+    chunkGates.set(i, createDeferred());
+  }
+
+  const mock = createMockRangeFetch(new Map([['/game/multilane_seq.rpf', rpfBytes]]), {
+    onRequest: async (req) => {
+      const m = /^bytes=(\d+)-(\d+)$/.exec(req.rangeHeader || '');
+      if (m) {
+        const idx = Math.floor(Number(m[1]) / chunkSize);
+        const gate = chunkGates.get(idx);
+        if (gate) {
+          await gate.promise;
+        }
+      }
+    },
+  });
+
+  const slots = createHttpfsMailboxPool(4, 4096);
+  const poolHost = new HttpfsMailboxPoolHost(slots, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 128 * 1024,
+    chunkSize,
+    readAheadChunks: 2,
+    maxReadAheadChunks: 4,
+    probeOnOpen: false,
+  });
+  const clients = slots.map((sab) => new HttpfsMailboxClient(sab));
+  poolHost.start();
+
+  try {
+    const handles = await Promise.all(clients.map((c) => c.openAsync('game/multilane_seq.rpf')));
+    assert.ok(handles.every((h) => h >= 1));
+
+    // Wave 1: 4 lanes issue overlapping + out-of-order reads across chunks 0 & 1 concurrently:
+    //   lane 0: chunk 0 [0..4096)
+    //   lane 1: chunk 0 [4096..8192)  (deduplicates with lane 0!)
+    //   lane 2: chunk 1 [12288..16384) (arrives slightly ahead of [8192..12288)!)
+    //   lane 3: chunk 1 [8192..12288)  (deduplicates with lane 2!)
+    const b0 = new Uint8Array(4096);
+    const b1 = new Uint8Array(4096);
+    const b2 = new Uint8Array(4096);
+    const b3 = new Uint8Array(4096);
+    const p0 = clients[0].readAsync(handles[0], 0n, b0, 4096);
+    const p1 = clients[1].readAsync(handles[1], 4096n, b1, 4096);
+    const p2 = clients[2].readAsync(handles[2], 12288n, b2, 4096);
+    const p3 = clients[3].readAsync(handles[3], 8192n, b3, 4096);
+
+    await waitForCondition(
+      () => poolHost.getStats().activeLanes === 4 && mock.requests.length >= 2,
+      3000,
+      '4 lanes dispatched across chunks 0 & 1',
+    );
+
+    // Strictly 1 HTTP fetch for chunk 0 and 1 for chunk 1 (no duplicates!).
+    assert.equal(
+      mock.requests.filter((r) => r.rangeHeader === 'bytes=0-8191').length,
+      1,
+      'Chunk 0 must have strictly 1 in-flight HTTP fetch across lanes 0 and 1',
+    );
+    assert.equal(
+      mock.requests.filter((r) => r.rangeHeader === 'bytes=8192-16383').length,
+      1,
+      'Chunk 1 must have strictly 1 in-flight HTTP fetch across lanes 2 and 3',
+    );
+
+    // Release all chunk gates so wave 1 and subsequent background prefetches complete.
+    for (const gate of chunkGates.values()) {
+      gate.resolve();
+    }
+
+    const lens = await Promise.all([p0, p1, p2, p3]);
+    assert.deepEqual(lens, [4096, 4096, 4096, 4096]);
+    assert.deepEqual(b0, rpfBytes.subarray(0, 4096));
+    assert.deepEqual(b1, rpfBytes.subarray(4096, 8192));
+    assert.deepEqual(b2, rpfBytes.subarray(12288, 16384));
+    assert.deepEqual(b3, rpfBytes.subarray(8192, 12288));
+
+    await poolHost.flushPrefetches();
+    const st = poolHost.getStats();
+    assert.ok(st.crossLaneCoalesced >= 2, `Expected >= 2 crossLaneCoalesced, got ${st.crossLaneCoalesced}`);
+    assert.ok(st.prefetchIssued >= 1, `Expected out-of-order multi-lane sequential stream to issue prefetches, got ${st.prefetchIssued}`);
+    assert.ok(st.cacheBytes <= 128 * 1024);
+  } finally {
+    await poolHost.stop();
+  }
+});
