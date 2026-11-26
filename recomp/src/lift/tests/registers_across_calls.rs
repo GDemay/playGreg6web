@@ -135,7 +135,7 @@ fn summaries_treat_unknown_code_as_touching_everything() {
         a.ret()
     });
     let unmodelled = asm_function(0x4000, |a| {
-        a.bswap(rax)?;
+        a.cpuid()?;
         a.ret()
     });
     let trap = asm_function(0x5000, |a| a.int3());

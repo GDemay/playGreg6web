@@ -134,7 +134,7 @@ fn summaries_treat_unknown_code_as_reading_every_flag() {
         a.ret()
     });
     let unmodelled = asm_function(0x4000, |a| {
-        a.bswap(rax)?;
+        a.cpuid()?;
         a.xor(eax, eax)?;
         a.ret()
     });
