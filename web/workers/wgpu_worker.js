@@ -222,6 +222,11 @@ const DEFAULT_MAX_VALIDATION_ERROR_POSTS = 64;
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_GPU_ADAPTER_FIELD_LENGTH = 96;
 const MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_DEFERRED_GPU_DESTROYS = 2048;
+const DEFAULT_MAX_DEFERRED_GPU_DESTROY_BYTES = 256 * 1024 * 1024;
+const MAX_SPECIALIZED_FALLBACK_PIPELINES = 512;
+const MAX_SPECIALIZED_FALLBACK_BIND_GROUPS = 2048;
+const MAX_VALIDATION_ERROR_DEDUP_ENTRIES = 1024;
 const RECYCLE_CMD_BUFFER_MIN_BYTES = 256 * 1024;
 const RECYCLE_CMD_BUFFER_MAX_BYTES = 32 * 1024 * 1024;
 const DEFAULT_OVERSIZED_RT_RECLAIM_IDLE_FRAMES = 2;
@@ -2497,8 +2502,27 @@ class WgpuCommandProcessor {
     // W342: Mid-frame deferred GPU destroy queue (drained after queue.submit / onSubmittedWorkDone)
     // and 1D -> 2D LUT texture promotion (enabled by default; opt-out via options.promote1DTo2D === false).
     this._deferredGpuDestroys = [];
+    this._deferredGpuDestroysSet = new Set();
     this._inFlightDeferredDestroys = new Set();
+    this._deferredResourceBytes = typeof WeakMap === 'function' ? new WeakMap() : null;
     this._deferredDestroyCount = 0;
+    this._pendingDeferredDestroyBytes = 0;
+    this._deferredHighWaterFlushes = 0;
+    this._maxDeferredGpuDestroys = resolvePositiveIntOption(
+      options.maxDeferredGpuDestroys,
+      DEFAULT_MAX_DEFERRED_GPU_DESTROYS
+    );
+    this._maxDeferredGpuDestroyBytes = resolvePositiveIntOption(
+      options.maxDeferredGpuDestroyBytes,
+      DEFAULT_MAX_DEFERRED_GPU_DESTROY_BYTES
+    );
+    // W371 (#1077): Accurate live & peak GPU buffer/texture byte accounting even without resourceRegistry.
+    this._liveBufferBytes = 0;
+    this._peakBufferBytes = 0;
+    this._liveTextureBytes = 0;
+    this._peakTextureBytes = 0;
+    this._textureMeta = new Map();
+    this._directWriteScratch = null;
     this._promote1DTo2D = options.promote1DTo2D !== false;
     this._promoted1DTo2DCount = 0;
 
@@ -3379,13 +3403,21 @@ class WgpuCommandProcessor {
     }
 
     if (this._validationErrorPostedCount >= this._maxValidationErrorPosts) {
-      this._validationErrorDedup.set(dedupKey, { count: 1, seq: 0, capped: true });
+      if (this._validationErrorDedup.size < MAX_VALIDATION_ERROR_DEDUP_ENTRIES) {
+        this._validationErrorDedup.set(dedupKey, { count: 1, seq: 0, capped: true });
+      }
       this._validationErrorSuppressedCount += 1;
       return null;
     }
 
     this._validationErrorSeq += 1;
     this._validationErrorPostedCount += 1;
+    if (this._validationErrorDedup.size >= MAX_VALIDATION_ERROR_DEDUP_ENTRIES) {
+      const oldestKey = this._validationErrorDedup.keys().next().value;
+      if (oldestKey !== undefined) {
+        this._validationErrorDedup.delete(oldestKey);
+      }
+    }
     this._validationErrorDedup.set(dedupKey, { count: 1, seq: this._validationErrorSeq });
 
     const record = {
@@ -3825,6 +3857,12 @@ class WgpuCommandProcessor {
     if (!changed) {
       const existing = this.pipelines.get(pipeMeta.id) || null;
       const entry = { pipeline: existing, profile: canonicalProfile, changed: false };
+      if (this._specializedFallbackPipelines.size >= MAX_SPECIALIZED_FALLBACK_PIPELINES) {
+        const oldestKey = this._specializedFallbackPipelines.keys().next().value;
+        if (oldestKey !== undefined) {
+          this._specializedFallbackPipelines.delete(oldestKey);
+        }
+      }
       this._specializedFallbackPipelines.set(cacheKey, entry);
       return entry;
     }
@@ -3877,6 +3915,12 @@ class WgpuCommandProcessor {
       return null;
     }
     const entry = { pipeline, profile: canonicalProfile, changed: true, vsCode, fsCode };
+    if (this._specializedFallbackPipelines.size >= MAX_SPECIALIZED_FALLBACK_PIPELINES) {
+      const oldestKey = this._specializedFallbackPipelines.keys().next().value;
+      if (oldestKey !== undefined) {
+        this._specializedFallbackPipelines.delete(oldestKey);
+      }
+    }
     this._specializedFallbackPipelines.set(cacheKey, entry);
     return entry;
   }
@@ -3920,6 +3964,12 @@ class WgpuCommandProcessor {
         layout,
         entries,
       });
+      if (this._specializedFallbackBindGroups.size >= MAX_SPECIALIZED_FALLBACK_BIND_GROUPS) {
+        const oldestKey = this._specializedFallbackBindGroups.keys().next().value;
+        if (oldestKey !== undefined) {
+          this._specializedFallbackBindGroups.delete(oldestKey);
+        }
+      }
       this._specializedFallbackBindGroups.set(key, bg);
       return bg;
     } catch (_) {
@@ -6909,7 +6959,11 @@ class WgpuCommandProcessor {
     this.buffers.clear();
     this._bufferMeta.clear();
     this.textures.clear();
+    this._textureMeta.clear();
     this.textureViews.clear();
+    this._liveBufferBytes = 0;
+    this._liveTextureBytes = 0;
+    this._directWriteScratch = null;
     this.samplers.clear();
     this.bindGroups.clear();
     this._bindGroupKinds.clear();
@@ -7945,6 +7999,39 @@ class WgpuCommandProcessor {
       }
     }
 
+    let scratchBytesReleased = 0;
+    if (this._directWriteScratch) {
+      scratchBytesReleased += this._directWriteScratch.byteLength;
+      this._directWriteScratch = null;
+    }
+    if (
+      this.resourceTable &&
+      !this.resourceTable._destroyed &&
+      typeof this.resourceTable.trimWriteScratch === 'function'
+    ) {
+      try {
+        scratchBytesReleased += toNonNegativeInt(this.resourceTable.trimWriteScratch(), 0);
+      } catch (_) {
+        // Ignore scratch trim errors.
+      }
+    }
+
+    let deferredDestroysFlushed = 0;
+    if (!this._isFrameOrBatchActive()) {
+      deferredDestroysFlushed += this._drainDeferredGpuDestroys(null, DRAIN_DEFERRED_OPTS_IMMEDIATE);
+      if (
+        this.resourceTable &&
+        !this.resourceTable._destroyed &&
+        typeof this.resourceTable.flushDeferredDestroys === 'function'
+      ) {
+        try {
+          deferredDestroysFlushed += toNonNegativeInt(this.resourceTable.flushDeferredDestroys(), 0);
+        } catch (_) {
+          // Ignore resource table deferred destroy flush errors.
+        }
+      }
+    }
+
     return {
       reclaimedCount: rtReclaimedCount + stagingReclaimedSlabs,
       reclaimedBytes: rtReclaimedBytes + stagingReclaimedBytes,
@@ -8069,16 +8156,46 @@ class WgpuCommandProcessor {
     );
   }
 
-  _retireOrDestroyGpuResource(resource) {
+  _retireOrDestroyGpuResource(resource, byteSize = 0) {
     if (!resource || typeof resource.destroy !== 'function') {
       return;
+    }
+    const recordedBytes =
+      byteSize > 0
+        ? byteSize
+        : this._deferredResourceBytes !== null
+          ? this._deferredResourceBytes.get(resource) || 0
+          : 0;
+    if (recordedBytes > 0 && this._deferredResourceBytes !== null) {
+      this._deferredResourceBytes.set(resource, recordedBytes);
     }
     if (this._isFrameOrBatchActive()) {
       if (
         !this._inFlightDeferredDestroys.has(resource) &&
-        !this._deferredGpuDestroys.includes(resource)
+        !this._deferredGpuDestroysSet.has(resource)
       ) {
+        this._deferredGpuDestroysSet.add(resource);
         this._deferredGpuDestroys.push(resource);
+        if (recordedBytes > 0) {
+          this._pendingDeferredDestroyBytes += recordedBytes;
+        }
+        // W371 (#1077): Prevent unbounded pre-present deferred-destroy accumulation during
+        // long loading bursts where many buffers/textures are overwritten before Present.
+        if (
+          this._deferredGpuDestroys.length >= this._maxDeferredGpuDestroys ||
+          this._pendingDeferredDestroyBytes >= this._maxDeferredGpuDestroyBytes
+        ) {
+          if (this._pendingEncoder !== null && this._hasPendingUploadCommands) {
+            this._deferredHighWaterFlushes += 1;
+            this._flushPendingUploads(false);
+          } else if (
+            this._pendingEncoder === null &&
+            (!Array.isArray(this._passCommands) || this._passCommands.length === 0)
+          ) {
+            this._deferredHighWaterFlushes += 1;
+            this._drainDeferredGpuDestroys();
+          }
+        }
       }
       return;
     }
@@ -8089,17 +8206,29 @@ class WgpuCommandProcessor {
     }
   }
 
+  _decrementDeferredDestroyBytes(res) {
+    if (!res || this._deferredResourceBytes === null) {
+      return;
+    }
+    const bytes = this._deferredResourceBytes.get(res) || 0;
+    if (bytes > 0) {
+      this._pendingDeferredDestroyBytes = Math.max(0, this._pendingDeferredDestroyBytes - bytes);
+    }
+  }
+
   _drainDeferredGpuDestroys(workDoneFence = null, { immediate = false } = {}) {
     if (!Array.isArray(this._deferredGpuDestroys) || this._deferredGpuDestroys.length === 0) {
       return 0;
     }
     const batch = this._deferredGpuDestroys;
     this._deferredGpuDestroys = [];
+    this._deferredGpuDestroysSet.clear();
 
     if (immediate) {
       for (let i = 0; i < batch.length; i += 1) {
         const res = batch[i];
         this._inFlightDeferredDestroys.delete(res);
+        this._decrementDeferredDestroyBytes(res);
         if (res && typeof res.destroy === 'function') {
           try {
             res.destroy();
@@ -8108,6 +8237,9 @@ class WgpuCommandProcessor {
           }
         }
         this._deferredDestroyCount += 1;
+      }
+      if (this._inFlightDeferredDestroys.size === 0 && this._deferredGpuDestroys.length === 0) {
+        this._pendingDeferredDestroyBytes = 0;
       }
       return batch.length;
     }
@@ -8129,6 +8261,7 @@ class WgpuCommandProcessor {
           if (!this._inFlightDeferredDestroys.delete(res)) {
             continue;
           }
+          this._decrementDeferredDestroyBytes(res);
           if (res && typeof res.destroy === 'function') {
             try {
               res.destroy();
@@ -8137,6 +8270,9 @@ class WgpuCommandProcessor {
             }
           }
           this._deferredDestroyCount += 1;
+        }
+        if (this._inFlightDeferredDestroys.size === 0 && this._deferredGpuDestroys.length === 0) {
+          this._pendingDeferredDestroyBytes = 0;
         }
       };
       Promise.resolve(fence)
@@ -8148,6 +8284,7 @@ class WgpuCommandProcessor {
     for (let i = 0; i < batch.length; i += 1) {
       const res = batch[i];
       this._inFlightDeferredDestroys.delete(res);
+      this._decrementDeferredDestroyBytes(res);
       if (res && typeof res.destroy === 'function') {
         try {
           res.destroy();
@@ -8157,17 +8294,53 @@ class WgpuCommandProcessor {
       }
       this._deferredDestroyCount += 1;
     }
+    if (this._inFlightDeferredDestroys.size === 0 && this._deferredGpuDestroys.length === 0) {
+      this._pendingDeferredDestroyBytes = 0;
+    }
     return batch.length;
+  }
+
+  /**
+   * Publicly flush deferred GPU destroys (fence-gated by default, or immediate when requested).
+   */
+  flushDeferredDestroys(options = {}) {
+    const immediate = Boolean(options && options.immediate === true);
+    let count = 0;
+    if (immediate) {
+      const before = this._deferredDestroyCount;
+      this._flushAllDeferredGpuDestroysImmediate();
+      count += Math.max(0, this._deferredDestroyCount - before);
+      if (
+        this.resourceTable &&
+        !this.resourceTable._destroyed &&
+        typeof this.resourceTable.flushDeferredDestroys === 'function'
+      ) {
+        count += toNonNegativeInt(this.resourceTable.flushDeferredDestroys(), 0);
+      }
+      return count;
+    }
+    count += this._drainDeferredGpuDestroys(null, DRAIN_DEFERRED_OPTS_DEFERRED);
+    if (
+      this.resourceTable &&
+      !this.resourceTable._destroyed &&
+      typeof this.resourceTable.endFrame === 'function' &&
+      !this._isFrameOrBatchActive()
+    ) {
+      this.resourceTable.endFrame(this.device ? this.device.queue : undefined);
+    }
+    return count;
   }
 
   _flushAllDeferredGpuDestroysImmediate(alreadyDestroyed = null) {
     const seen = alreadyDestroyed instanceof Set ? alreadyDestroyed : new Set();
     const pending = Array.isArray(this._deferredGpuDestroys) ? this._deferredGpuDestroys : [];
     this._deferredGpuDestroys = [];
+    this._deferredGpuDestroysSet.clear();
     for (let i = 0; i < pending.length; i += 1) {
       const res = pending[i];
       if (!res) continue;
       this._inFlightDeferredDestroys.delete(res);
+      this._decrementDeferredDestroyBytes(res);
       if (seen.has(res)) continue;
       seen.add(res);
       if (typeof res.destroy === 'function') {
@@ -8186,6 +8359,7 @@ class WgpuCommandProcessor {
         const res = inFlight[i];
         if (!res || seen.has(res)) continue;
         seen.add(res);
+        this._decrementDeferredDestroyBytes(res);
         if (typeof res.destroy === 'function') {
           try {
             res.destroy();
@@ -8196,52 +8370,96 @@ class WgpuCommandProcessor {
         this._deferredDestroyCount += 1;
       }
     }
+    this._pendingDeferredDestroyBytes = 0;
   }
 
   _destroyBufferIfPresent(id) {
     const existing = this.buffers.get(id);
     if (existing) {
+      const meta = this._bufferMeta.get(id);
+      const byteSize =
+        meta && typeof meta.byteSize === 'number' && meta.byteSize > 0
+          ? meta.byteSize
+          : typeof existing.size === 'number' && existing.size > 0
+            ? existing.size
+            : 0;
+      if (byteSize > 0) {
+        this._liveBufferBytes = Math.max(0, this._liveBufferBytes - byteSize);
+      }
       let retired = false;
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
         retired = Boolean(this.resourceRegistry.retire('buffer', id));
       }
       if (!retired) {
-        this._retireOrDestroyGpuResource(existing);
+        this._retireOrDestroyGpuResource(existing, byteSize);
       }
       this.buffers.delete(id);
+      this._bufferMeta.delete(id);
     }
   }
 
   _destroyTextureIfPresent(id) {
     const existing = this.textures.get(id);
     if (existing) {
+      const meta = this._textureMeta.get(id);
+      const byteSize =
+        meta && typeof meta.byteSize === 'number' && meta.byteSize > 0 ? meta.byteSize : 0;
+      if (byteSize > 0) {
+        this._liveTextureBytes = Math.max(0, this._liveTextureBytes - byteSize);
+      }
       let retiredTex = false;
       if (this.resourceRegistry && typeof this.resourceRegistry.retire === 'function') {
         retiredTex = Boolean(this.resourceRegistry.retire('texture', id));
         this.resourceRegistry.retire('textureView', id);
       }
       if (!retiredTex) {
-        this._retireOrDestroyGpuResource(existing);
+        this._retireOrDestroyGpuResource(existing, byteSize);
       }
       this.textures.delete(id);
+      this._textureMeta.delete(id);
     }
     this.textureViews.delete(id);
+  }
+
+  _acquireDirectWriteScratch(requiredBytes) {
+    if (requiredBytes <= 0 || requiredBytes > MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES) {
+      return null;
+    }
+    if (this._directWriteScratch && this._directWriteScratch.byteLength >= requiredBytes) {
+      return this._directWriteScratch;
+    }
+    const allocBytes = this._directWriteScratch
+      ? Math.min(
+          MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES,
+          Math.max(requiredBytes, this._directWriteScratch.byteLength * 2)
+        )
+      : requiredBytes;
+    this._directWriteScratch = new Uint8Array(allocBytes);
+    return this._directWriteScratch;
   }
 
   _handleCreateBuffer(view, payloadOffset) {
     const id = view.getUint32(payloadOffset, true);
     const usage = view.getUint32(payloadOffset + 4, true);
     const byteSize = Number(view.getBigUint64(payloadOffset + 8, true));
+    const safeBytes = Number.isFinite(byteSize) && byteSize > 0 ? Math.trunc(byteSize) : 0;
     this._destroyBufferIfPresent(id);
     const buffer = this.device.createBuffer({
       size: byteSize,
       usage,
     });
     this.buffers.set(id, buffer);
-    this._bufferMeta.set(id, { usage, byteSize });
+    this._bufferMeta.set(id, { usage, byteSize: safeBytes });
+    this._liveBufferBytes += safeBytes;
+    if (this._liveBufferBytes > this._peakBufferBytes) {
+      this._peakBufferBytes = this._liveBufferBytes;
+    }
+    if (this._deferredResourceBytes !== null && buffer && typeof buffer === 'object') {
+      this._deferredResourceBytes.set(buffer, safeBytes);
+    }
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
       this.resourceRegistry.register('buffer', id, buffer, {
-        byteSize: Math.max(0, Math.trunc(byteSize)),
+        byteSize: safeBytes,
         label: `buffer:${id}`,
       });
     }
@@ -8257,12 +8475,12 @@ class WgpuCommandProcessor {
     if (!buffer) return;
 
     const data = new Uint8Array(view.buffer, view.byteOffset + payloadOffset + 16, dataLen);
+    if (dataLen === 0) return;
 
     if (
       this.stagingPool &&
       !this.stagingPool._destroyed &&
       typeof this.stagingPool.stageBufferUpload === 'function' &&
-      dataLen > 0 &&
       dstOffset % 4 === 0
     ) {
       const rem = dataLen % 4;
@@ -8271,31 +8489,71 @@ class WgpuCommandProcessor {
       if (fitsDst) {
         const encoder = this._ensurePendingEncoder();
         if (encoder && typeof encoder.copyBufferToBuffer === 'function') {
-          this.stagingPool.stageBufferUpload(encoder, buffer, dstOffset, data);
-          this._hasPendingUploadCommands = true;
-          return;
-        }
-        if (!this._hasPendingUploadCommands) {
+          try {
+            this.stagingPool.stageBufferUpload(encoder, buffer, dstOffset, data);
+            this._hasPendingUploadCommands = true;
+            return;
+          } catch (err) {
+            // If stagingPool budget is exhausted mid-frame (e.g. massive loading burst),
+            // flush pending uploads and fall back cleanly to <=4 MiB chunked queue.writeBuffer.
+            if (err instanceof RangeError) {
+              this._flushPendingUploads(true);
+            } else {
+              throw err;
+            }
+          }
+        } else if (!this._hasPendingUploadCommands) {
           this._pendingEncoder = null;
         }
       }
     }
 
-    if (data.byteLength > MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES) {
-      const chunkMax = MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES;
+    const isShared =
+      typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer;
+    const chunkMax = MAX_DIRECT_WRITE_BUFFER_CHUNK_BYTES;
+    if (data.byteLength > chunkMax) {
       for (let off = 0; off < data.byteLength; off += chunkMax) {
-        const chunkLen = Math.min(chunkMax, data.byteLength - off);
-        this.device.queue.writeBuffer(
-          buffer,
-          dstOffset + off,
-          data.subarray(off, off + chunkLen)
-        );
+        const rawLen = Math.min(chunkMax, data.byteLength - off);
+        const rem = rawLen % 4;
+        const alignedLen = rem === 0 ? rawLen : rawLen + (4 - rem);
+        const srcSlice = data.subarray(off, off + rawLen);
+        if (!isShared && rem === 0) {
+          this.device.queue.writeBuffer(buffer, dstOffset + off, srcSlice);
+        } else {
+          const scratch = this._acquireDirectWriteScratch(alignedLen);
+          const dst = scratch
+            ? scratch.byteLength === alignedLen
+              ? scratch
+              : scratch.subarray(0, alignedLen)
+            : new Uint8Array(alignedLen);
+          dst.set(srcSlice, 0);
+          if (rem !== 0) {
+            dst.fill(0, rawLen, alignedLen);
+          }
+          this.device.queue.writeBuffer(buffer, dstOffset + off, dst);
+        }
       }
       this._chunkedWriteBufferUploads += 1;
       return;
     }
 
-    this.device.queue.writeBuffer(buffer, dstOffset, data);
+    const rem = data.byteLength % 4;
+    if (!isShared && rem === 0) {
+      this.device.queue.writeBuffer(buffer, dstOffset, data);
+      return;
+    }
+    const alignedLen = rem === 0 ? data.byteLength : data.byteLength + (4 - rem);
+    const scratch = this._acquireDirectWriteScratch(alignedLen);
+    const dst = scratch
+      ? scratch.byteLength === alignedLen
+        ? scratch
+        : scratch.subarray(0, alignedLen)
+      : new Uint8Array(alignedLen);
+    dst.set(data, 0);
+    if (rem !== 0) {
+      dst.fill(0, data.byteLength, alignedLen);
+    }
+    this.device.queue.writeBuffer(buffer, dstOffset, dst);
   }
 
   _resolveShaderPayload(id, stage, rawCode, trimmed, hashOnlyHex) {
@@ -9150,16 +9408,32 @@ class WgpuCommandProcessor {
         : this._createSafeTextureView(texture);
       this.textureViews.set(id, textureView);
     }
+    const size = effectiveDescriptor.size || {};
+    const byteSize = estimateTextureBytes(
+      size.width || 1,
+      size.height || 1,
+      size.depthOrArrayLayers || 1,
+      effectiveDescriptor.mipLevelCount || 1,
+      effectiveDescriptor.format,
+      effectiveDescriptor.dimension
+    );
+    this._textureMeta.set(id, {
+      byteSize,
+      width: size.width || 1,
+      height: size.height || 1,
+      depthOrArrayLayers: size.depthOrArrayLayers || 1,
+      mipLevelCount: effectiveDescriptor.mipLevelCount || 1,
+      format: effectiveDescriptor.format || 'rgba8unorm',
+      dimension: effectiveDescriptor.dimension || '2d',
+    });
+    this._liveTextureBytes += byteSize;
+    if (this._liveTextureBytes > this._peakTextureBytes) {
+      this._peakTextureBytes = this._liveTextureBytes;
+    }
+    if (this._deferredResourceBytes !== null && texture && typeof texture === 'object') {
+      this._deferredResourceBytes.set(texture, byteSize);
+    }
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
-      const size = effectiveDescriptor.size || {};
-      const byteSize = estimateTextureBytes(
-        size.width || 1,
-        size.height || 1,
-        size.depthOrArrayLayers || 1,
-        effectiveDescriptor.mipLevelCount || 1,
-        effectiveDescriptor.format,
-        effectiveDescriptor.dimension
-      );
       this.resourceRegistry.register('texture', id, texture, {
         byteSize,
         label: `texture:${id}`,
@@ -9329,8 +9603,22 @@ class WgpuCommandProcessor {
     size.height = height;
     size.depthOrArrayLayers = depthOrArrayLayers;
 
+    const isShared =
+      typeof SharedArrayBuffer !== 'undefined' && data.buffer instanceof SharedArrayBuffer;
+    let uploadData = data;
+    if (isShared && data.byteLength > 0) {
+      const scratch = this._acquireDirectWriteScratch(data.byteLength);
+      const copy = scratch
+        ? scratch.byteLength === data.byteLength
+          ? scratch
+          : scratch.subarray(0, data.byteLength)
+        : new Uint8Array(data.byteLength);
+      copy.set(data, 0);
+      uploadData = copy;
+    }
+
     try {
-      this.device.queue.writeTexture(dst, data, dataLayout, size);
+      this.device.queue.writeTexture(dst, uploadData, dataLayout, size);
     } finally {
       dst.texture = null;
     }
@@ -11430,6 +11718,88 @@ class WgpuCommandProcessor {
   }
 
   /**
+   * W371 (#1077): Accurate live GPU buffer, texture, staging-pool, scratch, and
+   * deferred-destroy byte accounting across the processor and wired subsystems.
+   */
+  getGpuMemoryStats(precomputed = null) {
+    const stagingStats =
+      precomputed && precomputed.stagingPool !== undefined
+        ? precomputed.stagingPool
+        : this.stagingPool && typeof this.stagingPool.getStats === 'function'
+          ? this.stagingPool.getStats()
+          : null;
+    const rtStats =
+      precomputed && precomputed.resourceTable !== undefined
+        ? precomputed.resourceTable
+        : this.resourceTable && typeof this.resourceTable.getStats === 'function'
+          ? this.resourceTable.getStats()
+          : null;
+
+    const resourceTableBufferBytes = toNonNegativeInt(rtStats && rtStats.liveBufferBytes, 0);
+    const resourceTableTextureBytes = toNonNegativeInt(rtStats && rtStats.liveTextureBytes, 0);
+    const resourceTablePeakBufferBytes = toNonNegativeInt(rtStats && rtStats.peakBufferBytes, 0);
+    const resourceTablePeakTextureBytes = toNonNegativeInt(rtStats && rtStats.peakTextureBytes, 0);
+    const resourceTableScratchBytes = toNonNegativeInt(rtStats && rtStats.writeScratchBytes, 0);
+    const resourceTablePendingDestroys = toNonNegativeInt(
+      rtStats && (rtStats.pendingDeferredDestroys ?? rtStats.pendingDeferredDestroyCount),
+      0
+    );
+    const resourceTablePendingBytes = toNonNegativeInt(
+      rtStats && rtStats.pendingDeferredDestroyBytes,
+      0
+    );
+
+    const liveBufferBytes = this._liveBufferBytes + resourceTableBufferBytes;
+    const peakBufferBytes = Math.max(
+      this._peakBufferBytes + resourceTablePeakBufferBytes,
+      liveBufferBytes
+    );
+    const liveTextureBytes = this._liveTextureBytes + resourceTableTextureBytes;
+    const peakTextureBytes = Math.max(
+      this._peakTextureBytes + resourceTablePeakTextureBytes,
+      liveTextureBytes
+    );
+    const stagingPoolBytes = toNonNegativeInt(
+      stagingStats && (stagingStats.stagingPoolBytes ?? stagingStats.allocatedBytes),
+      0
+    );
+    const stagingPoolPeakBytes = toNonNegativeInt(
+      stagingStats && (stagingStats.peakAllocatedBytes ?? stagingStats.peakBytes),
+      0
+    );
+    const stagingScratchBytes = toNonNegativeInt(stagingStats && stagingStats.scratchBytes, 0);
+    const directWriteScratchBytes =
+      this._directWriteScratch && typeof this._directWriteScratch.byteLength === 'number'
+        ? this._directWriteScratch.byteLength
+        : 0;
+    const pendingDeferredDestroys =
+      this._deferredGpuDestroys.length +
+      this._inFlightDeferredDestroys.size +
+      resourceTablePendingDestroys;
+    const pendingDeferredDestroyBytes =
+      this._pendingDeferredDestroyBytes + resourceTablePendingBytes;
+    const totalLiveGpuBytes = liveBufferBytes + liveTextureBytes + stagingPoolBytes;
+
+    return {
+      liveBufferBytes,
+      peakBufferBytes,
+      liveTextureBytes,
+      peakTextureBytes,
+      stagingPoolBytes,
+      stagingPoolPeakBytes,
+      stagingScratchBytes,
+      directWriteScratchBytes,
+      resourceTableBufferBytes,
+      resourceTableTextureBytes,
+      resourceTableScratchBytes,
+      pendingDeferredDestroys,
+      pendingDeferredDestroyBytes,
+      deferredHighWaterFlushes: this._deferredHighWaterFlushes,
+      totalLiveGpuBytes,
+    };
+  }
+
+  /**
    * Return aggregated processor and subsystem telemetry (packet counts, frame count,
    * staging pool, dynamic uniform ring, GPU pass timings, VRAM resource registry,
    * render-target pool hit rate, and reflection shader count).
@@ -11592,6 +11962,7 @@ class WgpuCommandProcessor {
         drawExecutorStats = null;
       }
     }
+    const gpuMemory = this.getGpuMemoryStats({ stagingPool, resourceTable });
     const perf30Fps = resolve30FpsTelemetry(this, {
       swapchain,
       rtPool,
@@ -11648,7 +12019,16 @@ class WgpuCommandProcessor {
       gpuRecorder,
       lastPassTimings,
       resourceRegistry,
-      vramBytes: resourceRegistry ? resourceRegistry.totalBytes : 0,
+      vramBytes: resourceRegistry ? resourceRegistry.totalBytes : gpuMemory.totalLiveGpuBytes,
+      gpuMemory,
+      liveBufferBytes: gpuMemory.liveBufferBytes,
+      liveTextureBytes: gpuMemory.liveTextureBytes,
+      stagingPoolBytes: gpuMemory.stagingPoolBytes,
+      pendingDeferredDestroys: gpuMemory.pendingDeferredDestroys,
+      peakBufferBytes: gpuMemory.peakBufferBytes,
+      peakTextureBytes: gpuMemory.peakTextureBytes,
+      pendingDeferredDestroyBytes: gpuMemory.pendingDeferredDestroyBytes,
+      deferredHighWaterFlushes: gpuMemory.deferredHighWaterFlushes,
       rtPool,
       rtPoolHitRate: rtPool ? rtPool.hitRate : 0,
       reflectionRegistry,
@@ -11777,7 +12157,11 @@ class WgpuCommandProcessor {
     this.buffers.clear();
     this._bufferMeta.clear();
     this.textures.clear();
+    this._textureMeta.clear();
     this.textureViews.clear();
+    this._liveBufferBytes = 0;
+    this._liveTextureBytes = 0;
+    this._directWriteScratch = null;
     this.samplers.clear();
     this.bindGroups.clear();
     this._bindGroupKinds.clear();
@@ -12749,6 +13133,15 @@ function buildGpuTelemetrySnapshot(processor, options = {}) {
     const gpuRecorder = resolveGpuRecorderTelemetry(processor, stats);
     if (gpuRecorder !== null) {
       snapshot.gpuRecorder = gpuRecorder;
+    }
+    if (stats && stats.gpuMemory && typeof stats.gpuMemory === 'object') {
+      snapshot.gpuMemory = { ...stats.gpuMemory };
+    } else if (typeof processor.getGpuMemoryStats === 'function') {
+      try {
+        snapshot.gpuMemory = processor.getGpuMemoryStats();
+      } catch (_) {
+        // Ignore memory telemetry errors.
+      }
     }
   }
   return snapshot;

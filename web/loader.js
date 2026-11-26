@@ -21,6 +21,21 @@ const DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS = 2;
 const DEFAULT_HTTPFS_MAILBOX_LANES = 8;
 const DEFAULT_GUEST_MANIFEST_RELATIVE = './dist/guest_manifest.json';
 const INDIRECT_DISPATCH_MODES = new Set(['shard', 'table']);
+const V8_SIDE_MODULE_CAP_BYTES = 1024 * 1024 * 1024; // 1024 MiB V8 per-module Wasm cap (#663)
+const V8_SIDE_MODULE_WARN_RATIO = 0.85; // Emit headroom warning above 85% of 1 GiB
+const FAST_BOOT_EXPORT_NAMES = Object.freeze([
+  'playgta6_get_input_state_ptr',
+  'playgta6_audio_ring',
+  'playgta6_prewarm_load_list',
+  'playgta6_prewarm_take',
+  'playgta6_prewarm_complete',
+  'playgta6_prewarm_progress',
+  'playgta6_prewarm_save_list',
+  'playgta6_relaunch_requested',
+  'playgta6_relaunch_args_ptr',
+  'playgta6_storage_generation',
+  'playgta6_storage_take_changed',
+]);
 const HOST_ABI_IMPORT_NAMES = Object.freeze([
   'host_log',
   'host_httpfs_open',
@@ -2140,7 +2155,7 @@ function patchPthreadWasmImports(wasmModuleOrBytes, rawImports, wasmNs, hostImpo
  * `WebAssembly.Instance.prototype` / `instanceof`.
  * Returns an idempotent restore function.
  */
-function installPthreadHostImportShim(globalScope, hostImports) {
+function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}) {
   if (
     !globalScope ||
     !globalScope.WebAssembly ||
@@ -2153,12 +2168,33 @@ function installPthreadHostImportShim(globalScope, hostImports) {
   const OriginalInstance = wasmNs.Instance;
   const OriginalInstantiate =
     typeof wasmNs.instantiate === 'function' ? wasmNs.instantiate : null;
+  const OriginalCompileStreaming =
+    typeof wasmNs.compileStreaming === 'function' ? wasmNs.compileStreaming : null;
+  const OriginalInstantiateStreaming =
+    typeof wasmNs.instantiateStreaming === 'function' ? wasmNs.instantiateStreaming : null;
+  const resolveSharedModule =
+    shimOptions && typeof shimOptions.resolveSharedModule === 'function'
+      ? shimOptions.resolveSharedModule
+      : null;
   const hostEnv =
     hostImports && typeof hostImports === 'object'
       ? hostImports.env && typeof hostImports.env === 'object'
         ? hostImports.env
         : hostImports
       : null;
+
+  const cancelResponseBodyQuietly = (resp) => {
+    try {
+      if (resp && resp.body && typeof resp.body.cancel === 'function' && !resp.bodyUsed) {
+        const p = resp.body.cancel();
+        if (p && typeof p.catch === 'function') {
+          p.catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore body cancel errors on mock or already-consumed Response objects.
+    }
+  };
 
   const bindExportedMemoryIfNeeded = (rawImports, instance) => {
     if (
@@ -2221,6 +2257,65 @@ function installPthreadHostImportShim(globalScope, hostImports) {
     wasmNs.instantiate = WrappedInstantiate;
   }
 
+  let WrappedCompileStreaming = null;
+  if (OriginalCompileStreaming && resolveSharedModule) {
+    WrappedCompileStreaming = function wrappedWasmCompileStreaming(source) {
+      return Promise.resolve(source).then((resp) => {
+        const respUrl = resp && typeof resp.url === 'string' ? resp.url : '';
+        if (respUrl) {
+          const cachedMod = resolveSharedModule(respUrl);
+          if (isCompiledWasmModule(cachedMod, wasmNs)) {
+            cancelResponseBodyQuietly(resp);
+            return cachedMod;
+          }
+        }
+        return OriginalCompileStreaming.call(wasmNs, Promise.resolve(resp));
+      });
+    };
+    wasmNs.compileStreaming = WrappedCompileStreaming;
+  }
+
+  let WrappedInstantiateStreaming = null;
+  if (OriginalInstantiateStreaming && resolveSharedModule) {
+    WrappedInstantiateStreaming = function wrappedWasmInstantiateStreaming(source, imports) {
+      return Promise.resolve(source).then((resp) => {
+        const respUrl = resp && typeof resp.url === 'string' ? resp.url : '';
+        if (respUrl) {
+          const cachedMod = resolveSharedModule(respUrl);
+          if (isCompiledWasmModule(cachedMod, wasmNs)) {
+            cancelResponseBodyQuietly(resp);
+            const patchedImports =
+              imports && typeof imports === 'object'
+                ? patchPthreadWasmImports(cachedMod, imports, wasmNs, hostImports, hostEnv)
+                : imports;
+            if (OriginalInstantiate) {
+              return OriginalInstantiate.call(wasmNs, cachedMod, patchedImports).then((instance) => {
+                bindExportedMemoryIfNeeded(imports, instance);
+                return { instance, module: cachedMod };
+              });
+            }
+            const instance = new OriginalInstance(cachedMod, patchedImports);
+            bindExportedMemoryIfNeeded(imports, instance);
+            return { instance, module: cachedMod };
+          }
+        }
+        const patchedImports =
+          imports && typeof imports === 'object'
+            ? patchPthreadWasmImports(null, imports, wasmNs, hostImports, hostEnv)
+            : imports;
+        return OriginalInstantiateStreaming.call(wasmNs, Promise.resolve(resp), patchedImports).then(
+          (instantiated) => {
+            const instance =
+              instantiated && instantiated.instance ? instantiated.instance : instantiated;
+            bindExportedMemoryIfNeeded(imports, instance);
+            return instantiated;
+          },
+        );
+      });
+    };
+    wasmNs.instantiateStreaming = WrappedInstantiateStreaming;
+  }
+
   let restored = false;
   return function restorePthreadHostImportShim() {
     if (restored) {
@@ -2232,6 +2327,12 @@ function installPthreadHostImportShim(globalScope, hostImports) {
     }
     if (OriginalInstantiate && wasmNs.instantiate === WrappedInstantiate) {
       wasmNs.instantiate = OriginalInstantiate;
+    }
+    if (OriginalCompileStreaming && wasmNs.compileStreaming === WrappedCompileStreaming) {
+      wasmNs.compileStreaming = OriginalCompileStreaming;
+    }
+    if (OriginalInstantiateStreaming && wasmNs.instantiateStreaming === WrappedInstantiateStreaming) {
+      wasmNs.instantiateStreaming = OriginalInstantiateStreaming;
     }
   };
 }
@@ -2415,6 +2516,90 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
   let attachedHttpfsSab = null;
   let httpfsChannel = null;
 
+  // W371 (#1077): Track precompiled WebAssembly.Module side modules delivered via CMD_LOAD
+  // or options so pthreads reuse compiled modules without ever re-fetching or re-compiling.
+  const pthreadSharedModulesByName = new Map();
+  const pthreadSharedModulesList = [];
+  let pthreadSharedModuleHits = 0;
+
+  const normalizeSharedModuleName = (rawName) => {
+    if (typeof rawName !== 'string' || rawName.length === 0) {
+      return '';
+    }
+    const base = extractWasmBasename(rawName) || rawName.trim();
+    return base.toLowerCase();
+  };
+
+  const registerPthreadSharedModules = (modules, names) => {
+    const targetWasmNs =
+      scope && scope.WebAssembly
+        ? scope.WebAssembly
+        : typeof globalThis !== 'undefined' && globalThis.WebAssembly
+          ? globalThis.WebAssembly
+          : null;
+    if (modules && typeof modules === 'object' && !Array.isArray(modules)) {
+      if (modules instanceof Map) {
+        modules.forEach((mod, key) => {
+          if (isCompiledWasmModule(mod, targetWasmNs)) {
+            const norm = normalizeSharedModuleName(String(key));
+            if (norm) {
+              pthreadSharedModulesByName.set(norm, mod);
+            }
+            if (!pthreadSharedModulesList.includes(mod)) {
+              pthreadSharedModulesList.push(mod);
+            }
+          }
+        });
+      } else {
+        const keys = Object.keys(modules);
+        for (let i = 0; i < keys.length; i += 1) {
+          const mod = modules[keys[i]];
+          if (isCompiledWasmModule(mod, targetWasmNs)) {
+            const norm = normalizeSharedModuleName(keys[i]);
+            if (norm) {
+              pthreadSharedModulesByName.set(norm, mod);
+            }
+            if (!pthreadSharedModulesList.includes(mod)) {
+              pthreadSharedModulesList.push(mod);
+            }
+          }
+        }
+      }
+    } else if (Array.isArray(modules)) {
+      stripWireBytesFromSharedModules(modules, { wasmApi: targetWasmNs, recordTelemetry: false });
+      for (let i = 0; i < modules.length; i += 1) {
+        const mod = modules[i];
+        if (!isCompiledWasmModule(mod, targetWasmNs)) {
+          continue;
+        }
+        if (!pthreadSharedModulesList.includes(mod)) {
+          pthreadSharedModulesList.push(mod);
+        }
+        const rawName = Array.isArray(names) && typeof names[i] === 'string' ? names[i] : '';
+        const norm = normalizeSharedModuleName(rawName);
+        if (norm) {
+          pthreadSharedModulesByName.set(norm, mod);
+        }
+      }
+    }
+    if (
+      scope &&
+      scope.Module &&
+      typeof scope.Module === 'object' &&
+      pthreadSharedModulesList.length > 0 &&
+      (!Array.isArray(scope.Module.sharedModules) || scope.Module.sharedModules.length === 0)
+    ) {
+      scope.Module.sharedModules = pthreadSharedModulesList.slice();
+    }
+  };
+
+  if (options.sharedModulesByName) {
+    registerPthreadSharedModules(options.sharedModulesByName);
+  }
+  if (Array.isArray(options.sharedModules)) {
+    registerPthreadSharedModules(options.sharedModules, options.sharedModuleNames);
+  }
+
   const closeHttpfsChannel = () => {
     const ch = httpfsChannel;
     httpfsChannel = null;
@@ -2519,6 +2704,18 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       attachTxPort(msg.__playgta6_tx_port);
       handled = true;
     }
+    if (msg.__playgta6_shared_modules) {
+      registerPthreadSharedModules(
+        msg.__playgta6_shared_modules,
+        msg.__playgta6_shared_module_names,
+      );
+      handled = true;
+    }
+    // Passively observe CMD_LOAD sharedModules WITHOUT stopping propagation so Emscripten's
+    // own pthread message handler still receives CMD_LOAD intact.
+    if (isPthreadLoadMessage(msg) && msg.sharedModules) {
+      registerPthreadSharedModules(msg.sharedModules, msg.__playgta6_shared_module_names);
+    }
     if (handled && typeof ev.stopImmediatePropagation === 'function') {
       ev.stopImmediatePropagation();
     }
@@ -2565,7 +2762,20 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       : typeof globalThis !== 'undefined' && globalThis.WebAssembly
         ? globalThis
         : scope;
-  const restoreWasmInstance = installPthreadHostImportShim(wasmTargetScope, hostImports);
+  const resolvePthreadSharedModule = (urlOrName) => {
+    const key = normalizeSharedModuleName(urlOrName);
+    if (!key) {
+      return null;
+    }
+    const hit = pthreadSharedModulesByName.get(key) || null;
+    if (hit) {
+      pthreadSharedModuleHits += 1;
+    }
+    return hit;
+  };
+  const restoreWasmInstance = installPthreadHostImportShim(wasmTargetScope, hostImports, {
+    resolveSharedModule: resolvePthreadSharedModule,
+  });
 
   if (importScriptsFn) {
     importScriptsFn(runtimeScriptUrl);
@@ -2581,6 +2791,10 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     getHttpfsSab: () => attachedHttpfsSab,
     attachTxPort,
     hasTxPort: () => Boolean(txPort && !txPortClosed),
+    getSharedModules: () => pthreadSharedModulesList.slice(),
+    getSharedModuleByName: (name) =>
+      pthreadSharedModulesByName.get(normalizeSharedModuleName(name)) || null,
+    getSharedModuleHits: () => pthreadSharedModuleHits,
     cmdBufferPool,
     channels: {
       progress: null,
@@ -2596,6 +2810,8 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
       restoreWasmInstance();
       closeTxPort();
       cmdBufferPool.clear();
+      pthreadSharedModulesByName.clear();
+      pthreadSharedModulesList.length = 0;
       attachedHttpfsSab = null;
       pthreadHttpfsClient = null;
       if (hostImports && typeof hostImports.setHttpfsClient === 'function') {
@@ -3098,6 +3314,474 @@ function parseGuestManifest(rawManifest) {
   };
 }
 
+function extractSideModuleEntries(rawManifest) {
+  let manifest = rawManifest;
+  if (typeof manifest === 'string') {
+    try {
+      manifest = JSON.parse(manifest);
+    } catch {
+      return [];
+    }
+  }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    return [];
+  }
+  const rawSideList =
+    manifest.sideModules !== undefined
+      ? manifest.sideModules
+      : manifest.side_modules !== undefined
+        ? manifest.side_modules
+        : manifest.sideModuleUrls !== undefined
+          ? manifest.sideModuleUrls
+          : manifest.side_module_urls !== undefined
+            ? manifest.side_module_urls
+            : manifest.dynamicLibraries !== undefined
+              ? manifest.dynamicLibraries
+              : manifest.dynamic_libraries;
+  if (!Array.isArray(rawSideList)) {
+    return [];
+  }
+  const entries = [];
+  const seen = new Set();
+  for (let i = 0; i < rawSideList.length; i += 1) {
+    const raw = rawSideList[i];
+    const url = extractSideModuleEntryUrl(raw);
+    if (!url || seen.has(url)) {
+      continue;
+    }
+    seen.add(url);
+    const name = extractWasmBasename(url) || url;
+    const obj = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+    const byteLength = obj
+      ? toOptionalNonNegativeInt(
+          pickFirstDefined(obj, [
+            'wasmBytes',
+            'wasm_bytes',
+            'byteLength',
+            'byte_length',
+            'sizeBytes',
+            'size_bytes',
+            'size',
+            'bytes',
+          ]),
+        )
+      : null;
+    const shardCount = obj
+      ? toOptionalNonNegativeInt(pickFirstDefined(obj, ['shardCount', 'shard_count', 'shards']))
+      : null;
+    entries.push({
+      name,
+      url,
+      byteLength,
+      shardCount,
+    });
+  }
+  return entries;
+}
+
+/**
+ * Evaluate V8 1024 MiB per-side-module size cap headroom and asymmetric/collapsed split shape
+ * (#663). Accepts a raw manifest object/JSON, an array of `{ name, byteLength }` descriptors,
+ * a `Map<name, byteLength>`, or a single numeric byte size. Never leaks host paths.
+ */
+function evaluateV8SideModuleBudget(input, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const capBytes =
+    typeof safeOpts.capBytes === 'number' && Number.isFinite(safeOpts.capBytes) && safeOpts.capBytes > 0
+      ? Math.floor(safeOpts.capBytes)
+      : V8_SIDE_MODULE_CAP_BYTES;
+  const warnRatio =
+    typeof safeOpts.warnRatio === 'number' &&
+    Number.isFinite(safeOpts.warnRatio) &&
+    safeOpts.warnRatio > 0 &&
+    safeOpts.warnRatio <= 1
+      ? safeOpts.warnRatio
+      : V8_SIDE_MODULE_WARN_RATIO;
+  const warnThresholdBytes = Math.floor(capBytes * warnRatio);
+
+  const normalized = [];
+  if (typeof input === 'number' && Number.isFinite(input) && input >= 0) {
+    normalized.push({ name: 'side_module.wasm', byteLength: Math.floor(input) });
+  } else if (input instanceof Map) {
+    input.forEach((val, key) => {
+      const len = toOptionalNonNegativeInt(val);
+      const base = extractWasmBasename(String(key || '')) || 'side_module.wasm';
+      normalized.push({ name: base, byteLength: len });
+    });
+  } else if (Array.isArray(input)) {
+    for (let i = 0; i < input.length; i += 1) {
+      const item = input[i];
+      if (typeof item === 'number' && Number.isFinite(item) && item >= 0) {
+        normalized.push({ name: `guest_part_${i}.wasm`, byteLength: Math.floor(item) });
+      } else if (item && typeof item === 'object') {
+        const rawName = item.name || item.url || item.path || item.file || `guest_part_${i}.wasm`;
+        const base = extractWasmBasename(String(rawName)) || `guest_part_${i}.wasm`;
+        const len = toOptionalNonNegativeInt(
+          pickFirstDefined(item, [
+            'byteLength',
+            'byte_length',
+            'wasmBytes',
+            'wasm_bytes',
+            'sizeBytes',
+            'size_bytes',
+            'size',
+            'bytes',
+          ]),
+        );
+        normalized.push({ name: base, byteLength: len });
+      }
+    }
+  } else if (input && typeof input === 'object') {
+    const extracted = extractSideModuleEntries(input);
+    for (let i = 0; i < extracted.length; i += 1) {
+      normalized.push({ name: extracted[i].name, byteLength: extracted[i].byteLength });
+    }
+    const rawMetrics = input.wasmMetrics || input.wasm_metrics || null;
+    const explicitLargest = toOptionalNonNegativeInt(
+      pickFirstDefined(rawMetrics, ['largestSideModuleBytes', 'largest_side_module_bytes']) ??
+        pickFirstDefined(input, ['largestSideModuleBytes', 'largest_side_module_bytes']),
+    );
+    if (explicitLargest !== null && normalized.every((e) => e.byteLength === null)) {
+      if (normalized.length > 0) {
+        normalized[0].byteLength = explicitLargest;
+      } else {
+        normalized.push({ name: 'guest_part_0.wasm', byteLength: explicitLargest });
+      }
+    }
+  }
+
+  let totalSideModuleBytes = 0;
+  let largestSideModuleBytes = 0;
+  let largestSideModuleName = null;
+  let smallestSideModuleBytes = null;
+  let sizedCount = 0;
+  const warnings = [];
+
+  for (let i = 0; i < normalized.length; i += 1) {
+    const entry = normalized[i];
+    const len = entry.byteLength;
+    if (len === null || len === undefined) {
+      continue;
+    }
+    sizedCount += 1;
+    totalSideModuleBytes += len;
+    if (len >= largestSideModuleBytes) {
+      largestSideModuleBytes = len;
+      largestSideModuleName = entry.name;
+    }
+    if (smallestSideModuleBytes === null || len < smallestSideModuleBytes) {
+      smallestSideModuleBytes = len;
+    }
+    const mib = (len / (1024 * 1024)).toFixed(1);
+    const capMib = (capBytes / (1024 * 1024)).toFixed(0);
+    if (len > capBytes) {
+      warnings.push(
+        `Wasm side module ${entry.name} (${mib} MiB) exceeds V8 ${capMib} MiB per-module cap`,
+      );
+    } else if (len >= warnThresholdBytes) {
+      const headroomMib = ((capBytes - len) / (1024 * 1024)).toFixed(1);
+      warnings.push(
+        `Wasm side module ${entry.name} (${mib} MiB) is within ${headroomMib} MiB of V8 ${capMib} MiB cap`,
+      );
+    }
+  }
+
+  const sideModuleCount = normalized.length;
+  const sideModuleHeadroomBytes = Math.max(0, capBytes - largestSideModuleBytes);
+  const utilizationRatio =
+    capBytes > 0 ? Math.round((largestSideModuleBytes / capBytes) * 10000) / 10000 : 0;
+  const exceedsCap = largestSideModuleBytes > capBytes;
+  const nearCapWarning = largestSideModuleBytes >= warnThresholdBytes;
+
+  let splitShape = 'none';
+  if (sideModuleCount === 1) {
+    splitShape = 'single-collapsed';
+  } else if (sideModuleCount >= 2) {
+    if (
+      sizedCount >= 2 &&
+      smallestSideModuleBytes !== null &&
+      (smallestSideModuleBytes === 0 || largestSideModuleBytes >= smallestSideModuleBytes * 10)
+    ) {
+      splitShape = 'asymmetric';
+    } else {
+      splitShape = 'balanced';
+    }
+  }
+
+  return {
+    v8SideModuleCapBytes: capBytes,
+    warnThresholdBytes,
+    warnRatio,
+    sideModuleCount,
+    totalSideModuleBytes,
+    largestSideModuleBytes,
+    largestSideModuleName,
+    smallestSideModuleBytes: smallestSideModuleBytes !== null ? smallestSideModuleBytes : 0,
+    sideModuleHeadroomBytes,
+    utilizationRatio,
+    nearCapWarning,
+    exceedsCap,
+    splitShape,
+    warnings,
+  };
+}
+
+/**
+ * Inspect a Wasm runtime module's exports cleanly without expecting or invoking `_main` (#663).
+ * Reports whether `_main` is exported and which fast-boot exports are present.
+ */
+function inspectRuntimeExports(mod) {
+  if (!mod || typeof mod !== 'object') {
+    return {
+      hasMain: false,
+      hasCallMain: false,
+      fastBootExports: [],
+      mode: 'fast-boot',
+    };
+  }
+  const hasFn = (name) => {
+    const prefixed = `_${name}`;
+    return Boolean(
+      typeof mod[prefixed] === 'function' ||
+        typeof mod[name] === 'function' ||
+        (mod.wasmExports &&
+          (typeof mod.wasmExports[name] === 'function' ||
+            typeof mod.wasmExports[prefixed] === 'function')) ||
+        (mod.asm &&
+          (typeof mod.asm[name] === 'function' || typeof mod.asm[prefixed] === 'function')),
+    );
+  };
+  const hasMain = hasFn('main');
+  const hasCallMain = typeof mod.callMain === 'function';
+  const fastBootExports = [];
+  for (let i = 0; i < FAST_BOOT_EXPORT_NAMES.length; i += 1) {
+    const exportName = FAST_BOOT_EXPORT_NAMES[i];
+    if (hasFn(exportName)) {
+      fastBootExports.push(exportName);
+    }
+  }
+  return {
+    hasMain,
+    hasCallMain,
+    fastBootExports,
+    mode: hasMain ? 'main' : 'fast-boot',
+  };
+}
+
+function readWasmGlobalOrInt(raw) {
+  if (raw === null || raw === undefined) {
+    return null;
+  }
+  let inner = raw;
+  let isGlobal = false;
+  if (typeof inner === 'object' && 'value' in inner) {
+    isGlobal = true;
+    try {
+      inner = inner.value;
+    } catch {
+      return null;
+    }
+  }
+  if (typeof inner === 'bigint') {
+    if (inner < 0n || inner > BigInt(Number.MAX_SAFE_INTEGER)) {
+      return null;
+    }
+    return { value: Number(inner), isBigInt: true, isGlobal };
+  }
+  if (typeof inner === 'number' && Number.isFinite(inner) && inner >= 0) {
+    return { value: Math.floor(inner), isBigInt: false, isGlobal };
+  }
+  return null;
+}
+
+/**
+ * Audit `__indirect_function_table`, `__table_base`, and `GOT.func` imports cleanly across
+ * asymmetric (384+ `GOT.func` dispatchers, table size >= 5103) and single-side-module collapsed
+ * (0 `GOT.func`) builds, without mutating Emscripten lazy-stub `GOT.func` Proxies (#663).
+ */
+function auditIndirectTableAndGotFunc(imports, manifestMetrics = null) {
+  const env = imports && typeof imports === 'object' && imports.env && typeof imports.env === 'object'
+    ? imports.env
+    : null;
+  const table = env
+    ? env.__indirect_function_table || env.table || null
+    : imports && typeof imports === 'object' && typeof imports.grow === 'function'
+      ? imports
+      : null;
+  const rawTableLen = table && table.length !== undefined ? table.length : null;
+  const tableLenInfo = readWasmGlobalOrInt(rawTableLen);
+  const tableBaseInfo = env ? readWasmGlobalOrInt(env.__table_base) : null;
+
+  let gotFuncOwnCount = 0;
+  const gotNs =
+    imports && typeof imports === 'object' && imports['GOT.func'] && typeof imports['GOT.func'] === 'object'
+      ? imports['GOT.func']
+      : imports &&
+          typeof imports === 'object' &&
+          imports.GOT &&
+          typeof imports.GOT === 'object' &&
+          imports.GOT.func &&
+          typeof imports.GOT.func === 'object'
+        ? imports.GOT.func
+        : null;
+  if (gotNs) {
+    try {
+      gotFuncOwnCount = Object.keys(gotNs).length;
+    } catch {
+      gotFuncOwnCount = 0;
+    }
+  }
+
+  const metrics =
+    manifestMetrics && typeof manifestMetrics === 'object' ? manifestMetrics : null;
+  const manifestTableSize = metrics
+    ? toOptionalNonNegativeInt(
+        pickFirstDefined(metrics, ['totalTableSize', 'total_table_size', 'tableSize', 'table_size']),
+      )
+    : null;
+  const manifestGotFuncCount = metrics
+    ? toOptionalNonNegativeInt(
+        pickFirstDefined(metrics, [
+          'totalGotFuncImports',
+          'total_got_func_imports',
+          'gotFuncImports',
+          'got_func_imports',
+        ]),
+      )
+    : null;
+
+  const gotFuncCount =
+    manifestGotFuncCount !== null ? Math.max(manifestGotFuncCount, gotFuncOwnCount) : gotFuncOwnCount;
+  const currentTableLength = tableLenInfo ? tableLenInfo.value : 0;
+  const tableBase = tableBaseInfo ? tableBaseInfo.value : 0;
+  const isTable64 = Boolean(
+    (tableLenInfo && tableLenInfo.isBigInt) || (tableBaseInfo && tableBaseInfo.isBigInt),
+  );
+  const requiredTableSize = Math.max(
+    manifestTableSize !== null ? manifestTableSize : 0,
+    tableBase + gotFuncCount,
+  );
+
+  return {
+    hasTable: Boolean(table && typeof table.grow === 'function'),
+    currentTableLength,
+    tableBase,
+    gotFuncCount,
+    manifestTableSize,
+    manifestGotFuncCount,
+    requiredTableSize,
+    needsGrow: Boolean(table && typeof table.grow === 'function' && currentTableLength < requiredTableSize),
+    isTable64,
+  };
+}
+
+/**
+ * Ensure `env.__indirect_function_table` has at least `requiredSlots` (with NO hardcoded cap)
+ * so large tables (>= 5103+) and high `GOT.func` dispatcher counts (384+) or collapsed single
+ * modules (0 `GOT.func`) never fail dynamic linking due to table exhaustion (#663).
+ * Safely handles both Wasm32 (`number`) and Wasm64 (`BigInt` / `WebAssembly.Global`) indices.
+ */
+function ensureIndirectFunctionTableCapacity(importsOrTable, requiredSlots = 0, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const isDirectTable = Boolean(
+    importsOrTable &&
+      typeof importsOrTable === 'object' &&
+      typeof importsOrTable.grow === 'function' &&
+      !importsOrTable.env,
+  );
+  const env =
+    !isDirectTable &&
+    importsOrTable &&
+    typeof importsOrTable === 'object' &&
+    importsOrTable.env &&
+    typeof importsOrTable.env === 'object'
+      ? importsOrTable.env
+      : null;
+  const table = isDirectTable
+    ? importsOrTable
+    : env
+      ? env.__indirect_function_table || env.table || null
+      : null;
+
+  const audit = auditIndirectTableAndGotFunc(
+    isDirectTable ? { env: { __indirect_function_table: table } } : importsOrTable,
+    safeOpts.manifestMetrics || safeOpts.wasmMetrics || null,
+  );
+
+  const explicitSlots = toNonNegativeInt(requiredSlots, 0);
+  const tableBaseOverride =
+    safeOpts.tableBase !== undefined ? readWasmGlobalOrInt(safeOpts.tableBase) : null;
+  const effectiveTableBase = tableBaseOverride ? tableBaseOverride.value : audit.tableBase;
+  const gotFuncExtra = toNonNegativeInt(
+    safeOpts.gotFuncCount !== undefined ? safeOpts.gotFuncCount : audit.gotFuncCount,
+    0,
+  );
+  const headroom = toNonNegativeInt(safeOpts.headroom, 0);
+
+  const targetLength = Math.max(
+    audit.currentTableLength,
+    audit.requiredTableSize,
+    explicitSlots,
+    effectiveTableBase + gotFuncExtra + headroom,
+  );
+
+  if (!table || typeof table.grow !== 'function') {
+    return {
+      grew: false,
+      previousLength: audit.currentTableLength,
+      currentLength: audit.currentTableLength,
+      targetLength,
+      tableBase: effectiveTableBase,
+      gotFuncCount: gotFuncExtra,
+      isTable64: audit.isTable64,
+      error: null,
+    };
+  }
+
+  const previousLength = audit.currentTableLength;
+  if (previousLength >= targetLength) {
+    return {
+      grew: false,
+      previousLength,
+      currentLength: previousLength,
+      targetLength,
+      tableBase: effectiveTableBase,
+      gotFuncCount: gotFuncExtra,
+      isTable64: audit.isTable64,
+      error: null,
+    };
+  }
+
+  const delta = targetLength - previousLength;
+  const growArg = typeof table.length === 'bigint' ? BigInt(delta) : delta;
+  try {
+    table.grow(growArg);
+  } catch (err) {
+    return {
+      grew: false,
+      previousLength,
+      currentLength: readWasmGlobalOrInt(table.length)?.value ?? previousLength,
+      targetLength,
+      tableBase: effectiveTableBase,
+      gotFuncCount: gotFuncExtra,
+      isTable64: audit.isTable64,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  const afterLen = readWasmGlobalOrInt(table.length)?.value ?? targetLength;
+  return {
+    grew: afterLen > previousLength,
+    previousLength,
+    currentLength: afterLen,
+    targetLength,
+    tableBase: effectiveTableBase,
+    gotFuncCount: gotFuncExtra,
+    isTable64: audit.isTable64,
+    error: null,
+  };
+}
+
 async function loadGuestManifest(options = {}) {
   const url =
     typeof options.url === 'string' && options.url.trim().length > 0
@@ -3129,6 +3813,16 @@ async function loadGuestManifest(options = {}) {
           ? await resp.text()
           : null;
     parsed = parseGuestManifest(raw);
+    if (parsed && raw) {
+      const budget = evaluateV8SideModuleBudget(raw);
+      if (budget.largestSideModuleBytes > 0) {
+        recordSideModuleByteSize(
+          budget.largestSideModuleName || 'guest_part_0.wasm',
+          budget.largestSideModuleBytes,
+          reportFn,
+        );
+      }
+    }
   } catch {
     return null;
   }
@@ -3329,7 +4023,54 @@ const wasmMemoryTelemetry = {
   transferredArrayBuffers: 0,
   streamingCompiles: 0,
   fallbackCompiles: 0,
+  largestSideModuleBytes: 0,
+  largestSideModuleName: null,
+  sideModuleCapWarnings: 0,
+  peakWireBytesInFlight: 0,
+  currentWireBytesInFlight: 0,
+  sharedModulesDeliveredToPthreads: 0,
 };
+
+function recordSideModuleByteSize(moduleName, byteLength, reportFn) {
+  const bytes = toNonNegativeInt(byteLength, 0);
+  if (bytes <= 0) {
+    return null;
+  }
+  const cleanName = extractWasmBasename(String(moduleName || '')) || 'side_module.wasm';
+  if (bytes > wasmMemoryTelemetry.largestSideModuleBytes) {
+    wasmMemoryTelemetry.largestSideModuleBytes = bytes;
+    wasmMemoryTelemetry.largestSideModuleName = cleanName;
+  }
+  const warnThreshold = Math.floor(V8_SIDE_MODULE_CAP_BYTES * V8_SIDE_MODULE_WARN_RATIO);
+  if (bytes >= warnThreshold) {
+    wasmMemoryTelemetry.sideModuleCapWarnings += 1;
+    const mib = (bytes / (1024 * 1024)).toFixed(1);
+    const headroomMib = (Math.max(0, V8_SIDE_MODULE_CAP_BYTES - bytes) / (1024 * 1024)).toFixed(1);
+    const msg =
+      bytes > V8_SIDE_MODULE_CAP_BYTES
+        ? `[wasm] WARNING: side module ${cleanName} (${mib} MiB) exceeds V8 1024 MiB cap`
+        : `[wasm] WARNING: side module ${cleanName} (${mib} MiB) has only ${headroomMib} MiB headroom below V8 1024 MiB cap`;
+    if (typeof reportFn === 'function') {
+      try {
+        reportFn(msg);
+      } catch {
+        // Non-fatal warning hook failure.
+      }
+    }
+    return msg;
+  }
+  return null;
+}
+
+function trackWireBytesInFlightDelta(delta) {
+  wasmMemoryTelemetry.currentWireBytesInFlight = Math.max(
+    0,
+    wasmMemoryTelemetry.currentWireBytesInFlight + delta,
+  );
+  if (wasmMemoryTelemetry.currentWireBytesInFlight > wasmMemoryTelemetry.peakWireBytesInFlight) {
+    wasmMemoryTelemetry.peakWireBytesInFlight = wasmMemoryTelemetry.currentWireBytesInFlight;
+  }
+}
 
 let activeSharedWasmModuleCount = 0;
 
@@ -3395,6 +4136,7 @@ function recordTransferredArrayBuffers(count = 1) {
 }
 
 function getWasmMemoryTelemetry() {
+  const largest = wasmMemoryTelemetry.largestSideModuleBytes;
   return {
     wireBytesReleased: wasmMemoryTelemetry.wireBytesReleased,
     droppedWasmBuffers: wasmMemoryTelemetry.droppedWasmBuffers,
@@ -3403,6 +4145,13 @@ function getWasmMemoryTelemetry() {
     streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
     fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
     sharedModuleCount: activeSharedWasmModuleCount,
+    v8SideModuleCapBytes: V8_SIDE_MODULE_CAP_BYTES,
+    largestSideModuleBytes: largest,
+    largestSideModuleName: wasmMemoryTelemetry.largestSideModuleName,
+    sideModuleHeadroomBytes: Math.max(0, V8_SIDE_MODULE_CAP_BYTES - largest),
+    sideModuleCapWarnings: wasmMemoryTelemetry.sideModuleCapWarnings,
+    peakWireBytesInFlight: wasmMemoryTelemetry.peakWireBytesInFlight,
+    sharedModulesDeliveredToPthreads: wasmMemoryTelemetry.sharedModulesDeliveredToPthreads,
   };
 }
 
@@ -3413,6 +4162,12 @@ function resetWasmMemoryTelemetry() {
   wasmMemoryTelemetry.transferredArrayBuffers = 0;
   wasmMemoryTelemetry.streamingCompiles = 0;
   wasmMemoryTelemetry.fallbackCompiles = 0;
+  wasmMemoryTelemetry.largestSideModuleBytes = 0;
+  wasmMemoryTelemetry.largestSideModuleName = null;
+  wasmMemoryTelemetry.sideModuleCapWarnings = 0;
+  wasmMemoryTelemetry.peakWireBytesInFlight = 0;
+  wasmMemoryTelemetry.currentWireBytesInFlight = 0;
+  wasmMemoryTelemetry.sharedModulesDeliveredToPthreads = 0;
   return getWasmMemoryTelemetry();
 }
 
@@ -3762,7 +4517,19 @@ async function compileWasmModuleStreaming(source, options = {}) {
   if (directBinary) {
     let localBytes = source;
     const byteLength = directBinary.byteLength;
+    const moduleNameHint =
+      typeof safeOpts.moduleName === 'string' && safeOpts.moduleName
+        ? safeOpts.moduleName
+        : typeof safeOpts.ownerKey === 'string'
+          ? safeOpts.ownerKey
+          : '';
     releaseOwnerSlot();
+    if (byteLength > 0) {
+      trackWireBytesInFlightDelta(byteLength);
+      if (moduleNameHint) {
+        recordSideModuleByteSize(moduleNameHint, byteLength, safeOpts.reportFn);
+      }
+    }
     let mod;
     try {
       const compilePromise = wasmNs.compile(localBytes);
@@ -3772,14 +4539,21 @@ async function compileWasmModuleStreaming(source, options = {}) {
       localBytes = null;
       releaseOwnerSlot();
       if (byteLength > 0) {
+        trackWireBytesInFlightDelta(-byteLength);
         recordDroppedWasmWireBytes(byteLength, 1);
       }
     }
     wasmMemoryTelemetry.fallbackCompiles += 1;
-    return { module: mod, streaming: false, wireBytesReleased: byteLength };
+    return { module: mod, streaming: false, wireBytesReleased: byteLength, moduleByteLength: byteLength };
   }
 
   let resp = source;
+  const sourceUrlHint =
+    typeof source === 'string'
+      ? source
+      : typeof safeOpts.moduleName === 'string'
+        ? safeOpts.moduleName
+        : '';
   if (typeof source === 'string') {
     if (!fetchFn) {
       throw new Error(`fetch unavailable while compiling ${source}`);
@@ -3802,6 +4576,15 @@ async function compileWasmModuleStreaming(source, options = {}) {
     resp.headers && typeof resp.headers.get === 'function'
       ? String(resp.headers.get('content-type') || '')
       : '';
+  const contentLengthHeader =
+    resp.headers && typeof resp.headers.get === 'function'
+      ? resp.headers.get('content-length')
+      : null;
+  const declaredByteLength = toOptionalNonNegativeInt(contentLengthHeader);
+  const effectiveModuleName =
+    (typeof safeOpts.moduleName === 'string' && safeOpts.moduleName) ||
+    (resp && typeof resp.url === 'string' && resp.url) ||
+    sourceUrlHint;
   const isRealResponse = typeof Response === 'undefined' || resp instanceof Response;
   const canStream =
     typeof wasmNs.compileStreaming === 'function' &&
@@ -3810,10 +4593,18 @@ async function compileWasmModuleStreaming(source, options = {}) {
       safeOpts.allowStreamingWithoutContentType === true);
 
   if (canStream) {
+    if (declaredByteLength !== null && declaredByteLength > 0 && effectiveModuleName) {
+      recordSideModuleByteSize(effectiveModuleName, declaredByteLength, safeOpts.reportFn);
+    }
     try {
       const mod = await wasmNs.compileStreaming(Promise.resolve(resp));
       wasmMemoryTelemetry.streamingCompiles += 1;
-      return { module: mod, streaming: true, wireBytesReleased: 0 };
+      return {
+        module: mod,
+        streaming: true,
+        wireBytesReleased: 0,
+        moduleByteLength: declaredByteLength !== null ? declaredByteLength : 0,
+      };
     } catch (streamErr) {
       if (resp.bodyUsed) {
         throw streamErr;
@@ -3824,6 +4615,12 @@ async function compileWasmModuleStreaming(source, options = {}) {
 
   let wireBytes = await resp.arrayBuffer();
   const byteLength = wireBytes && typeof wireBytes.byteLength === 'number' ? wireBytes.byteLength : 0;
+  if (byteLength > 0) {
+    trackWireBytesInFlightDelta(byteLength);
+    if (effectiveModuleName) {
+      recordSideModuleByteSize(effectiveModuleName, byteLength, safeOpts.reportFn);
+    }
+  }
   let mod;
   try {
     const compilePromise = wasmNs.compile(wireBytes);
@@ -3832,11 +4629,12 @@ async function compileWasmModuleStreaming(source, options = {}) {
   } finally {
     wireBytes = null;
     if (byteLength > 0) {
+      trackWireBytesInFlightDelta(-byteLength);
       recordDroppedWasmWireBytes(byteLength, 1);
     }
   }
   wasmMemoryTelemetry.fallbackCompiles += 1;
-  return { module: mod, streaming: false, wireBytesReleased: byteLength };
+  return { module: mod, streaming: false, wireBytesReleased: byteLength, moduleByteLength: byteLength };
 }
 
 /**
@@ -3848,7 +4646,11 @@ function createSharedWasmModuleCache(options = {}) {
   const safeOpts = options && typeof options === 'object' ? options : {};
   const modulesByKey = new Map();
   const inFlightByKey = new Map();
+  const moduleSizesByKey = new Map();
+  const compileCountsByKey = new Map();
   const trackGlobalCount = safeOpts.trackGlobalCount === true;
+  let totalCompileCount = 0;
+  let cacheHits = 0;
 
   const normalizeKey = (rawKey) => {
     if (typeof rawKey !== 'string') {
@@ -3864,12 +4666,31 @@ function createSharedWasmModuleCache(options = {}) {
     }
   };
 
-  function setModule(nameOrUrl, mod) {
+  const releaseDuplicateCallerWireBytes = (source, callOpts) => {
+    if (!callOpts || !callOpts.owner || callOpts.ownerKey === undefined) {
+      return;
+    }
+    const info = getBinaryWireInfo(source, callOpts.wasmApi || safeOpts.wasmApi);
+    if (callOpts.owner instanceof Map) {
+      callOpts.owner.delete(callOpts.ownerKey);
+    } else if (isWritableOwnProp(callOpts.owner, callOpts.ownerKey)) {
+      callOpts.owner[callOpts.ownerKey] = null;
+    }
+    if (info && info.byteLength > 0) {
+      recordDroppedWasmWireBytes(info.byteLength, 1);
+    }
+  };
+
+  function setModule(nameOrUrl, mod, byteLength = 0) {
     const key = normalizeKey(nameOrUrl);
     if (!key || !isCompiledWasmModule(mod, safeOpts.wasmApi)) {
       return false;
     }
     modulesByKey.set(key, mod);
+    const bytes = toNonNegativeInt(byteLength, 0);
+    if (bytes > 0) {
+      moduleSizesByKey.set(key, bytes);
+    }
     syncGlobalCount();
     return true;
   }
@@ -3891,35 +4712,35 @@ function createSharedWasmModuleCache(options = {}) {
     }
     const existing = modulesByKey.get(key);
     if (existing) {
+      cacheHits += 1;
       // Even on cache hit, immediately release any raw wire bytes passed by caller.
-      if (callOpts && callOpts.owner && callOpts.ownerKey !== undefined) {
-        const info = getBinaryWireInfo(source, callOpts.wasmApi || safeOpts.wasmApi);
-        if (callOpts.owner instanceof Map) {
-          callOpts.owner.delete(callOpts.ownerKey);
-        } else if (isWritableOwnProp(callOpts.owner, callOpts.ownerKey)) {
-          callOpts.owner[callOpts.ownerKey] = null;
-        }
-        if (info && info.byteLength > 0) {
-          recordDroppedWasmWireBytes(info.byteLength, 1);
-        }
-      }
+      releaseDuplicateCallerWireBytes(source, callOpts);
       return existing;
     }
     const pending = inFlightByKey.get(key);
     if (pending) {
+      cacheHits += 1;
+      releaseDuplicateCallerWireBytes(source, callOpts);
       return pending;
     }
+    totalCompileCount += 1;
+    compileCountsByKey.set(key, (compileCountsByKey.get(key) || 0) + 1);
     const promise = compileWasmModuleStreaming(source, {
       wasmApi: callOpts.wasmApi || safeOpts.wasmApi,
       fetchFn: callOpts.fetchFn || safeOpts.fetchFn,
       signal: callOpts.signal,
       allowStreamingWithoutContentType: callOpts.allowStreamingWithoutContentType,
+      reportFn: callOpts.reportFn || safeOpts.reportFn,
+      moduleName: key,
       owner: callOpts.owner,
       ownerKey: callOpts.ownerKey,
     })
       .then((res) => {
         if (res && res.module) {
           modulesByKey.set(key, res.module);
+          if (typeof res.moduleByteLength === 'number' && res.moduleByteLength > 0) {
+            moduleSizesByKey.set(key, res.moduleByteLength);
+          }
           syncGlobalCount();
           return res.module;
         }
@@ -3930,6 +4751,26 @@ function createSharedWasmModuleCache(options = {}) {
       });
     inFlightByKey.set(key, promise);
     return promise;
+  }
+
+  async function precompileSideModules(sideModuleUrls, callOpts = {}) {
+    if (!Array.isArray(sideModuleUrls) || sideModuleUrls.length === 0) {
+      return [];
+    }
+    const results = new Array(sideModuleUrls.length);
+    await Promise.all(
+      sideModuleUrls.map(async (entry, idx) => {
+        const url = extractSideModuleEntryUrl(entry);
+        if (!url) {
+          results[idx] = null;
+          return;
+        }
+        const resolvedUrl =
+          typeof callOpts.resolveUrl === 'function' ? callOpts.resolveUrl(url) : url;
+        results[idx] = await compileAndShare(url, resolvedUrl, callOpts);
+      }),
+    );
+    return results.filter((m) => isCompiledWasmModule(m, callOpts.wasmApi || safeOpts.wasmApi));
   }
 
   async function ingestPreloadedBuffers(container, callOpts = {}) {
@@ -3984,13 +4825,35 @@ function createSharedWasmModuleCache(options = {}) {
     return Array.from(modulesByKey.values());
   }
 
+  function getSharedModuleNames() {
+    return Array.from(modulesByKey.keys());
+  }
+
+  function getSharedModulesEntries() {
+    const out = [];
+    modulesByKey.forEach((mod, name) => {
+      out.push({
+        name,
+        module: mod,
+        byteLength: moduleSizesByKey.get(name) || 0,
+      });
+    });
+    return out;
+  }
+
   function getSharedModulesMap() {
     return new Map(modulesByKey);
+  }
+
+  function getBudgetSummary(budgetOpts) {
+    return evaluateV8SideModuleBudget(moduleSizesByKey, budgetOpts);
   }
 
   function clear() {
     modulesByKey.clear();
     inFlightByKey.clear();
+    moduleSizesByKey.clear();
+    compileCountsByKey.clear();
     syncGlobalCount();
   }
 
@@ -3999,17 +4862,28 @@ function createSharedWasmModuleCache(options = {}) {
     getModule,
     hasModule,
     compileAndShare,
+    precompileSideModules,
     ingestPreloadedBuffers,
     getSharedModulesArray,
+    getSharedModuleNames,
+    getSharedModulesEntries,
     getSharedModulesMap,
+    getBudgetSummary,
     clear,
     get size() {
       return modulesByKey.size;
     },
     getStats() {
+      const budget = evaluateV8SideModuleBudget(moduleSizesByKey);
       return {
         sharedModuleCount: modulesByKey.size,
         inFlightCompiles: inFlightByKey.size,
+        compileCount: totalCompileCount,
+        cacheHits,
+        compileCountsByKey: Object.fromEntries(compileCountsByKey),
+        v8SideModuleCapBytes: budget.v8SideModuleCapBytes,
+        largestSideModuleBytes: budget.largestSideModuleBytes,
+        sideModuleHeadroomBytes: budget.sideModuleHeadroomBytes,
       };
     },
   };
@@ -4040,8 +4914,23 @@ function createInstantiateWasmHandler(options = {}) {
   let pendingWireBytes = precompiledModule ? null : options.wasmBinary || null;
   const onError = typeof options.onError === 'function' ? options.onError : null;
   const onMemory = typeof options.onMemory === 'function' ? options.onMemory : null;
+  const manifestWasmMetrics =
+    options.wasmMetrics && typeof options.wasmMetrics === 'object' ? options.wasmMetrics : null;
 
-  return function instantiateWasm(imports, receiveInstance) {
+  function releasePendingWireBytes() {
+    if (!pendingWireBytes) {
+      return 0;
+    }
+    const info = getBinaryWireInfo(pendingWireBytes, wasmNs);
+    const len = info ? info.byteLength : 0;
+    pendingWireBytes = null;
+    if (len > 0) {
+      recordDroppedWasmWireBytes(len, 1);
+    }
+    return len;
+  }
+
+  function instantiateWasm(imports, receiveInstance) {
     const importedMemory = extractMemoryFromImports(imports);
     if (importedMemory) {
       if (hostImports && typeof hostImports.setMemory === 'function') {
@@ -4050,6 +4939,21 @@ function createInstantiateWasmHandler(options = {}) {
       if (onMemory) {
         onMemory(importedMemory);
       }
+    }
+
+    // W371 (#663): When manifest metrics declare a large __indirect_function_table (e.g. >= 5103
+    // with 384+ GOT.func dispatchers), grow an undersized imported table safely before linking.
+    if (
+      manifestWasmMetrics &&
+      typeof manifestWasmMetrics.totalTableSize === 'number' &&
+      manifestWasmMetrics.totalTableSize > 0 &&
+      imports &&
+      imports.env &&
+      imports.env.__indirect_function_table
+    ) {
+      ensureIndirectFunctionTableCapacity(imports, manifestWasmMetrics.totalTableSize, {
+        wasmMetrics: manifestWasmMetrics,
+      });
     }
 
     const mergedImports = mergeHostImportsIntoWasmImports(
@@ -4156,7 +5060,10 @@ function createInstantiateWasmHandler(options = {}) {
 
     instantiatePromise.then(finish, handleFailure);
     return {};
-  };
+  }
+
+  instantiateWasm.releasePendingWireBytes = releasePendingWireBytes;
+  return instantiateWasm;
 }
 
 function isSharedArrayBufferValue(buf) {
@@ -6775,13 +7682,23 @@ function buildRuntimeModuleConfig(options = {}) {
 
   const getAudioRingTelemetry = () => audioRingController.getTelemetry();
 
+  let runtimeExportsSummary = null;
+  let instantiatedWasmHandler = null;
+
   const destroyRuntimeConfig = () => {
     stopInputBridge();
     audioRingController.destroy();
+    if (
+      instantiatedWasmHandler &&
+      typeof instantiatedWasmHandler.releasePendingWireBytes === 'function'
+    ) {
+      instantiatedWasmHandler.releasePendingWireBytes();
+    }
     boundModule = null;
     instantiatedMemory = null;
     attachedGuestMemory = null;
     attachedGuestMemoryWorker = null;
+    runtimeExportsSummary = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -6803,6 +7720,10 @@ function buildRuntimeModuleConfig(options = {}) {
     const mod = this && typeof this === 'object' ? this : boundModule;
     if (mod && !boundModule) {
       boundModule = mod;
+    }
+    // W371 (#663): Inspect fast-boot exports cleanly without expecting or calling `_main`.
+    if (mod && typeof mod === 'object') {
+      runtimeExportsSummary = inspectRuntimeExports(mod);
     }
     // W351 (#1077): Drop raw Emscripten `Module.wasmBinary` wire bytes once compiled/initialized.
     if (mod && typeof mod === 'object' && Object.prototype.hasOwnProperty.call(mod, 'wasmBinary')) {
@@ -6827,10 +7748,17 @@ function buildRuntimeModuleConfig(options = {}) {
   const onExit = function onPlayGta6RuntimeExit() {
     stopInputBridge();
     resetAudioRingAttachment();
+    if (
+      instantiatedWasmHandler &&
+      typeof instantiatedWasmHandler.releasePendingWireBytes === 'function'
+    ) {
+      instantiatedWasmHandler.releasePendingWireBytes();
+    }
     boundModule = null;
     instantiatedMemory = null;
     attachedGuestMemory = null;
     attachedGuestMemoryWorker = null;
+    runtimeExportsSummary = null;
     const drainPromise = stopPipelineDumpSyncer();
     if (drainPromise && typeof drainPromise.catch === 'function') {
       drainPromise.catch(() => {});
@@ -6870,6 +7798,15 @@ function buildRuntimeModuleConfig(options = {}) {
     resetAudioRingAttachment,
     getAudioRingDescriptor: () => audioRingController.getDescriptor(),
     getAudioRingTelemetry,
+    getRuntimeExportsSummary: () =>
+      runtimeExportsSummary
+        ? {
+            hasMain: runtimeExportsSummary.hasMain,
+            hasCallMain: runtimeExportsSummary.hasCallMain,
+            fastBootExports: runtimeExportsSummary.fastBootExports.slice(),
+            mode: runtimeExportsSummary.mode,
+          }
+        : null,
     reset: resetRuntimeConfig,
     destroy: destroyRuntimeConfig,
     dispose: destroyRuntimeConfig,
@@ -6922,18 +7859,20 @@ function buildRuntimeModuleConfig(options = {}) {
   if (typeof options.instantiateWasm === 'function') {
     config.instantiateWasm = options.instantiateWasm;
   } else if (options.instantiateWasm !== null && options.instantiateWasm !== false) {
-    config.instantiateWasm = createInstantiateWasmHandler({
+    instantiatedWasmHandler = createInstantiateWasmHandler({
       locateFile,
       hostImports: activeHostImports,
       reportFn: activeReportFn,
       fetchFn: options.fetchFn,
       wasmBinary: options.wasmBinary,
+      wasmMetrics: manifestSummary ? manifestSummary.wasmMetrics : null,
       onError: options.onWasmError,
       onMemory: (mem) => {
         instantiatedMemory = mem || null;
         attachGuestMemoryToGpuWorker(null, mem);
       },
     });
+    config.instantiateWasm = instantiatedWasmHandler;
   }
 
   return config;
@@ -7125,6 +8064,12 @@ function createPthreadPoolCoordinator(options = {}) {
       : Array.isArray(options.sharedModules)
         ? () => options.sharedModules
         : null;
+  const getSharedModuleNames =
+    typeof options.getSharedModuleNames === 'function'
+      ? options.getSharedModuleNames
+      : Array.isArray(options.sharedModuleNames)
+        ? () => options.sharedModuleNames
+        : null;
   const explicitMessageChannelCtor = options.MessageChannelCtor;
   const onTelemetryChange =
     typeof options.onTelemetryChange === 'function' ? options.onTelemetryChange : null;
@@ -7144,6 +8089,7 @@ function createPthreadPoolCoordinator(options = {}) {
   let pthreadLoadedCount = 0;
   let peakConcurrentLoads = 0;
   let pthreadActiveTxPorts = 0;
+  let pthreadSharedModulesDelivered = 0;
   const activeTxPorts = new Set();
 
   function resolveHttpfsMailboxPool() {
@@ -7199,6 +8145,7 @@ function createPthreadPoolCoordinator(options = {}) {
       pthreadPeakConcurrentLoads: peakConcurrentLoads,
       maxConcurrentPthreadLoads: maxConcurrentLoads,
       pthreadActiveTxPorts,
+      pthreadSharedModulesDelivered,
       httpfsMailboxLanes: resolveHttpfsMailboxPool().length,
     };
   }
@@ -7605,19 +8552,56 @@ function createPthreadPoolCoordinator(options = {}) {
         }
         if (isPthreadLoadMessage(msg)) {
           if (entry.state === 'spawned') {
-            // W351 (#1077): Share compiled WebAssembly.Module objects across pthreads and never
-            // carry or clone raw wire-byte ArrayBuffers alongside compiled modules in CMD_LOAD.
+            // W351 / W371 (#1077): Share compiled WebAssembly.Module objects across ALL 48+
+            // pthreads (even if Emscripten passes an empty `sharedModules: []`) and never carry
+            // or clone raw wire-byte ArrayBuffers alongside compiled modules in CMD_LOAD.
             if (msg && typeof msg === 'object') {
+              const mergedModules = [];
+              const mergedNames = [];
+              const seenModules = new Set();
               if (msg.sharedModules) {
                 stripWireBytesFromSharedModules(msg.sharedModules);
-              } else if (getSharedModules) {
-                const shared = getSharedModules();
-                if (Array.isArray(shared) && shared.length > 0) {
-                  const compiledOnly = shared.filter((m) => isCompiledWasmModule(m));
-                  if (compiledOnly.length > 0) {
-                    msg.sharedModules = compiledOnly;
+                if (Array.isArray(msg.sharedModules)) {
+                  for (let i = 0; i < msg.sharedModules.length; i += 1) {
+                    const m = msg.sharedModules[i];
+                    if (isCompiledWasmModule(m) && !seenModules.has(m)) {
+                      seenModules.add(m);
+                      mergedModules.push(m);
+                      const existingName =
+                        Array.isArray(msg.__playgta6_shared_module_names) &&
+                        typeof msg.__playgta6_shared_module_names[i] === 'string'
+                          ? msg.__playgta6_shared_module_names[i]
+                          : '';
+                      mergedNames.push(existingName);
+                    }
                   }
                 }
+              }
+              if (getSharedModules) {
+                const shared = getSharedModules();
+                const sharedNames = getSharedModuleNames ? getSharedModuleNames() : null;
+                if (Array.isArray(shared) && shared.length > 0) {
+                  for (let i = 0; i < shared.length; i += 1) {
+                    const m = shared[i];
+                    if (isCompiledWasmModule(m) && !seenModules.has(m)) {
+                      seenModules.add(m);
+                      mergedModules.push(m);
+                      const name =
+                        Array.isArray(sharedNames) && typeof sharedNames[i] === 'string'
+                          ? sharedNames[i]
+                          : '';
+                      mergedNames.push(name);
+                    }
+                  }
+                }
+              }
+              if (mergedModules.length > 0) {
+                msg.sharedModules = mergedModules;
+                if (mergedNames.some((n) => n.length > 0)) {
+                  msg.__playgta6_shared_module_names = mergedNames;
+                }
+                pthreadSharedModulesDelivered += mergedModules.length;
+                wasmMemoryTelemetry.sharedModulesDeliveredToPthreads += mergedModules.length;
               }
               if (isCompiledWasmModule(msg.wasmModule)) {
                 if (
@@ -7992,6 +8976,7 @@ const coordinatorPthreadPool = createPthreadPoolCoordinator({
   getHttpfsMailboxSab: () => httpfsMailboxSab,
   getHttpfsMailboxSabs: () => httpfsMailboxSabs,
   getSharedModules: () => coordinatorSharedWasmModules.getSharedModulesArray(),
+  getSharedModuleNames: () => coordinatorSharedWasmModules.getSharedModuleNames(),
   onPthreadTxMessage: handlePthreadTxMessage,
 });
 
@@ -8066,6 +9051,23 @@ function getLoaderStatus() {
     streamingCompiles: wasmMemoryTelemetry.streamingCompiles,
     fallbackCompiles: wasmMemoryTelemetry.fallbackCompiles,
     sharedModuleCount: coordinatorSharedWasmModules.size,
+    v8SideModuleCapBytes: V8_SIDE_MODULE_CAP_BYTES,
+    largestSideModuleBytes: wasmMemoryTelemetry.largestSideModuleBytes,
+    largestSideModuleName: wasmMemoryTelemetry.largestSideModuleName,
+    sideModuleHeadroomBytes: Math.max(
+      0,
+      V8_SIDE_MODULE_CAP_BYTES - wasmMemoryTelemetry.largestSideModuleBytes,
+    ),
+    sideModuleCapWarnings: wasmMemoryTelemetry.sideModuleCapWarnings,
+    peakWireBytesInFlight: wasmMemoryTelemetry.peakWireBytesInFlight,
+    sharedModulesDeliveredToPthreads: wasmMemoryTelemetry.sharedModulesDeliveredToPthreads,
+    runtimeExports:
+      activeCoordinatorModuleConfig &&
+      typeof activeCoordinatorModuleConfig.getRuntimeExportsSummary === 'function'
+        ? activeCoordinatorModuleConfig.getRuntimeExportsSummary()
+        : activeCoordinatorRuntimeModule
+          ? inspectRuntimeExports(activeCoordinatorRuntimeModule)
+          : null,
   };
 }
 
@@ -8082,6 +9084,14 @@ async function tryBootWasmRuntime() {
     let manifestSummary = null;
     if (configuredGuestManifest !== null) {
       manifestSummary = parseGuestManifest(configuredGuestManifest);
+      const cfgBudget = evaluateV8SideModuleBudget(configuredGuestManifest);
+      if (cfgBudget.largestSideModuleBytes > 0) {
+        recordSideModuleByteSize(
+          cfgBudget.largestSideModuleName || 'guest_part_0.wasm',
+          cfgBudget.largestSideModuleBytes,
+          report,
+        );
+      }
     } else if (typeof fetch === 'function') {
       manifestSummary = await loadGuestManifest({
         url: configuredGuestManifestUrl || DEFAULT_GUEST_MANIFEST_RELATIVE,
@@ -8235,6 +9245,19 @@ async function tryBootWasmRuntime() {
       }
     }
   } catch (err) {
+    // W371 (#1077): Release any unconsumed preloaded wire bytes on boot failure so nothing leaks.
+    if (pendingPreloadedWasmBinary) {
+      const binInfo = getBinaryWireInfo(pendingPreloadedWasmBinary);
+      pendingPreloadedWasmBinary = null;
+      if (binInfo && binInfo.byteLength > 0) {
+        recordDroppedWasmWireBytes(binInfo.byteLength, 1);
+      }
+    }
+    if (pendingPreloadedGuestBuffers) {
+      const leftover = pendingPreloadedGuestBuffers;
+      pendingPreloadedGuestBuffers = null;
+      releaseWireBytesFromObject(leftover, { assumeWasm: true });
+    }
     postProgress({ error: `runtime boot: ${err}` });
   }
 }
@@ -8629,6 +9652,9 @@ const exportedApi = {
   PTHREAD_CMD_OBJECT_TRANSFER,
   DEFAULT_MAX_CONCURRENT_PTHREAD_LOADS,
   DEFAULT_HTTPFS_MAILBOX_LANES,
+  V8_SIDE_MODULE_CAP_BYTES,
+  V8_SIDE_MODULE_WARN_RATIO,
+  FAST_BOOT_EXPORT_NAMES,
   HOST_ABI_IMPORT_NAMES,
   GPU_OPCODE_PRESENT,
   GPU_PACKET_HEADER_BYTES,
@@ -8671,6 +9697,11 @@ const exportedApi = {
   compileWasmModuleStreaming,
   createSharedWasmModuleCache,
   parseGuestManifest,
+  extractSideModuleEntries,
+  evaluateV8SideModuleBudget,
+  inspectRuntimeExports,
+  auditIndirectTableAndGotFunc,
+  ensureIndirectFunctionTableCapacity,
   loadGuestManifest,
   inspectGpuPacketBatchForPresent,
   normalizeBootHttpfsPath,
