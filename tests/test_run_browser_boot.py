@@ -4639,12 +4639,27 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
         expected_renderer_mem = {
             "jsHeapUsedMb": 210.5,
             "jsHeapTotalMb": 320.0,
+            "jsHeapUsedBytes": int(210.5 * 1024 * 1024),
+            "jsHeapTotalBytes": int(320.0 * 1024 * 1024),
             "sharedModulesDeliveredToPthreads": 24,
             "wasmLinearMemoryBytes": 512 * 1024 * 1024,
+        }
+        expected_memory_stats = {
+            "liveBufferBytes": 64 * 1024 * 1024,
+            "liveTextureBytes": 128 * 1024 * 1024,
+            "peakBufferBytes": 96 * 1024 * 1024,
+            "peakTextureBytes": 160 * 1024 * 1024,
+            "stagingPoolBytes": 16 * 1024 * 1024,
+            "totalLiveGpuBytes": 208 * 1024 * 1024,
+            "vramBytes": 208 * 1024 * 1024,
+            "wasmLinearMemoryBytes": 512 * 1024 * 1024,
+            "jsHeapUsedBytes": int(210.5 * 1024 * 1024),
+            "jsHeapTotalBytes": int(320.0 * 1024 * 1024),
         }
         for container in (rep, rep["summary"], tel, tel["summary"]):
             self.assertEqual(container["gpu_memory"], expected_gpu_mem)
             self.assertEqual(container["renderer_memory"], expected_renderer_mem)
+            self.assertEqual(container["memory_stats"], expected_memory_stats)
 
         self.assertIn("gpu_memory:", dig)
         self.assertIn("total_live=208.0MB", dig)
@@ -4787,6 +4802,386 @@ class PlayLocalPresetParityTests(unittest.TestCase):
         )
         # tools/play_local.ps1 ValidateSet sync for chrome-menu-flow-6 is handled outside T105's 2-file boundary.
         self.assertEqual(play_local_presets | {"chrome-menu-flow-6"}, rbb_presets)
+
+
+class Orch14DumpPipelinesStagingAndTelemetryTests(unittest.TestCase):
+    def test_dump_pipelines_url_server_cmd_dry_run_and_flush_capture(self):
+        # URL & server cmd defaults remain clean when dump_pipelines is off
+        self.assertEqual(rbb.build_target_url("127.0.0.1", 8080), "http://127.0.0.1:8080/")
+        dump_url = rbb.build_target_url("127.0.0.1", 8080, dump_pipelines=True, input_script="chrome-to-ingame")
+        self.assertIn("dumpPipelines=1", dump_url)
+        self.assertIn("allowDumpWrites=1", dump_url)
+        self.assertIn("inputScript=chrome-to-ingame", dump_url)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            # Dry run includes --allow-dump-dir, dumpPipelines=1, allowDumpWrites=1, and sanitized dump_dir
+            code, out, err, _, _ = fx.run_cli(
+                "--trust-build",
+                "--dry-run",
+                "--name",
+                "orch14-dump-dry",
+                "--dump-pipelines",
+            )
+            self.assertEqual(code, 0, err)
+            dry = json.loads(out)
+            self.assertIn("dumpPipelines=1", dry["url"])
+            self.assertIn("allowDumpWrites=1", dry["url"])
+            self.assertIn("--allow-dump-dir", dry["server_command"])
+            self.assertEqual(dry["dump_dir"], "work/browser-boot/runs/orch14-dump-dry/pg6_dump")
+
+            # Live run_browser_session wires --allow-dump-dir, URL params, pre-close flush wait, and dump summary
+            run_dir = fx.build / "runs" / "orch14-dump-session"
+            run_dir.mkdir(parents=True)
+            dump_dir = run_dir / "pg6_dump"
+            spawned_cmds: list[list[str]] = []
+            navigated_urls: list[str] = []
+            flush_evals: list[str] = []
+            fake_clock = {"t": 100.0}
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            def fake_popen(cmd, **kw):
+                spawned_cmds.append(list(cmd))
+                return FakeProc()
+
+            class DumpFakeCdp:
+                def __init__(self, ws_url: str):
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Page.navigate":
+                        navigated_urls.append(params["url"])
+                        return {}
+                    if method == "Runtime.evaluate":
+                        expr = (params or {}).get("expression", "")
+                        if "flushPipelineDumps" in expr:
+                            flush_evals.append(expr)
+                            # Simulate loader.js posting dumped files to serve_local.py during flush cycle
+                            (dump_dir / "native").mkdir(parents=True, exist_ok=True)
+                            (dump_dir / "dxil").mkdir(parents=True, exist_ok=True)
+                            (dump_dir / "native" / "0xe60f2f99bbb95e26.bin").write_bytes(b"\x01\x02\x03\x04")
+                            (dump_dir / "native" / "0xe60f2f99bbb95e26.meta").write_bytes(b"\xaa\xbb")
+                            (dump_dir / "dxil" / "0x1122334455667788.dxbc").write_bytes(b"DXBC1234")
+                            (dump_dir / "manifest.json").write_text(
+                                json.dumps(
+                                    {
+                                        "schema": "playgta6-pipeline-dump",
+                                        "schema_version": 1,
+                                        "native_stages": [{"code_identity": "0xe60f2f99bbb95e26"}],
+                                        "dxil": [{"identity": "0x1122334455667788"}],
+                                        "pipelines": [{"index": 0}, {"index": 1}],
+                                        "compute_pipelines": [{"index": 0}],
+                                    }
+                                ),
+                                encoding="utf-8",
+                            )
+                            return {"result": {"value": "periodic-only"}}
+                        return {"result": {"value": make_sample_probe()}}
+                    return {}
+
+                def drain_events(self, timeout=0.0):
+                    fake_clock["t"] += max(0.2, float(timeout))
+                    return []
+
+            with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=fx.boot_dir,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=0.3,
+                    headless=True,
+                    smoke=False,
+                    send_input=False,
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    boot_options={"dump_pipelines_dir": "/pg6_dump"},
+                    dump_pipelines=True,
+                    allow_dump_dir=dump_dir,
+                    dump_flush_wait_s=0.5,
+                    popen_fn=fake_popen,
+                    cdp_factory=DumpFakeCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            server_cmd = spawned_cmds[0]
+            self.assertIn("--allow-dump-dir", server_cmd)
+            self.assertEqual(server_cmd[server_cmd.index("--allow-dump-dir") + 1], str(dump_dir))
+            self.assertEqual(len(navigated_urls), 1)
+            self.assertIn("dumpPipelines=1", navigated_urls[0])
+            self.assertIn("allowDumpWrites=1", navigated_urls[0])
+            self.assertEqual(len(flush_evals), 1)
+            self.assertIsNotNone(sess.pipeline_dump)
+            self.assertEqual(sess.pipeline_dump["files"], 4)
+            self.assertEqual(sess.pipeline_dump["native_bin_files"], 1)
+            self.assertEqual(sess.pipeline_dump["native_meta_files"], 1)
+            self.assertEqual(sess.pipeline_dump["dxil_files"], 1)
+            self.assertTrue(sess.pipeline_dump["has_manifest"])
+            self.assertEqual(sess.pipeline_dump["manifest_pipelines"], 2)
+            self.assertEqual(sess.pipeline_dump["manifest_compute_pipelines"], 1)
+            self.assertEqual(sess.pipeline_dump["manifest_native_stages"], 1)
+            self.assertEqual(sess.pipeline_dump["dir"], "work/browser-boot/runs/orch14-dump-session/pg6_dump")
+
+            rep = rbb.build_boot_report(sess, smoke=False, preset="smoke")
+            tel = rbb.build_telemetry_payload(sess, smoke=False, preset="smoke", headless=True)
+            dig = rbb.digest(rep, 0)
+            self.assertEqual(rep["pipeline_dump"]["native_bin_files"], 1)
+            self.assertEqual(tel["pipeline_dump"]["manifest_pipelines"], 2)
+            self.assertIn("pipeline_dump: files=4, native_bin=1, dxil=1, manifest=true", dig)
+
+    def test_zero_copy_shader_pack_staging_in_place_and_hardlink(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            pack_dir = Path(d) / "large_pack_dir"
+            pack = pack_dir / "full_v2.wgsl.pack"
+            sidecar = pack_dir / "full_v2.wgsl.pack.reflect.json"
+            touch(pack, fx.base, "WGPKv2-payload")
+            touch(sidecar, fx.base, '{"schema":"playgta6-stage-reflection","stages":{}}')
+
+            # 1. With --stream-shaders, unambiguous pack dir is served directly in place (zero copy!)
+            copy_calls: list[tuple[Path, Path]] = []
+
+            def fail_if_copied(src: Path, dst: Path) -> None:
+                copy_calls.append((src, dst))
+                raise AssertionError("multi-GB shader pack must not be copied")
+
+            stage_dir = fx.build / "staged-shaders"
+            served_dir, staged = rbb.prepare_shader_serving_dir(
+                pack, stage_dir, stream_shaders=True, copy_fn=fail_if_copied
+            )
+            self.assertEqual(served_dir, pack_dir)
+            self.assertEqual(copy_calls, [])
+            self.assertTrue(all(item["method"] == "in_place" and not item["copied"] for item in staged))
+
+            # 2. Without --stream-shaders, same-volume staging uses hardlinks (zero copy!) and prunes stale packs
+            stale = stage_dir / "stale_old.wgsl.pack"
+            touch(stale, fx.base, "OLD")
+            served_dir2, staged2 = rbb.prepare_shader_serving_dir(
+                pack, stage_dir, stream_shaders=False, copy_fn=fail_if_copied
+            )
+            self.assertEqual(served_dir2, stage_dir)
+            self.assertEqual(copy_calls, [])
+            self.assertFalse(stale.exists())
+            self.assertTrue((stage_dir / pack.name).is_file())
+            self.assertTrue(os.path.samefile(pack, stage_dir / pack.name))
+            self.assertEqual(staged2[0]["method"], "hardlink")
+            self.assertFalse(staged2[0]["copied"])
+            self.assertTrue(staged2[0]["linked"])
+
+            # 3. Cross-volume hardlink OSError falls back to in-place when unambiguous (still zero copy!)
+            stage_dir3 = fx.build / "staged-shaders-xdev"
+
+            def fake_xdev_link(_src: Path, _dst: Path) -> None:
+                raise OSError("EXDEV cross-device link")
+
+            served_dir3, staged3 = rbb.prepare_shader_serving_dir(
+                pack, stage_dir3, stream_shaders=False, link_fn=fake_xdev_link, copy_fn=fail_if_copied
+            )
+            self.assertEqual(served_dir3, pack_dir)
+            self.assertEqual(copy_calls, [])
+            self.assertEqual(staged3[0]["method"], "in_place")
+
+            # 4. Multiple packs where splash.wgsl.pack would shadow target pack -> cannot serve in place;
+            #    uses hardlink into isolated stage_dir (still zero copy on same volume!)
+            touch(pack_dir / "splash.wgsl.pack", fx.base, "SPLASH")
+            self.assertFalse(rbb.can_serve_shader_pack_in_place(pack))
+            stage_dir4 = fx.build / "staged-shaders-isolated"
+            served_dir4, staged4 = rbb.prepare_shader_serving_dir(
+                pack, stage_dir4, stream_shaders=True, copy_fn=fail_if_copied
+            )
+            self.assertEqual(served_dir4, stage_dir4)
+            self.assertEqual(staged4[0]["method"], "hardlink")
+            self.assertFalse((stage_dir4 / "splash.wgsl.pack").exists())
+
+    def test_input_script_diagnostics_and_cdp_performance_memory_fallback(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # 1. --input-script chrome-to-ingame on smoke AND start-screen sets send_input=True,
+            #    disables conflicting CDP Enter spam (cdp_send_input=False), and records input_mode="input-script"
+            for preset in ("smoke", "start-screen"):
+                code, out, err, _, _ = fx.run_cli(
+                    "--smoke",
+                    "--dry-run",
+                    "--preset",
+                    preset,
+                    "--name",
+                    f"dry-input-{preset}",
+                    "--input-script",
+                    "chrome-menu-flow-6",
+                )
+                self.assertEqual(code, 0, err)
+                dry = json.loads(out)
+                self.assertTrue(dry["send_input"])
+                self.assertFalse(dry["cdp_send_input"])
+                self.assertEqual(dry["input_mode"], "input-script")
+
+            # 2. Live run_browser_session captures InputBridge scriptedPressesSent + peak GPU memory
+            #    across polls and falls back to CDP Performance.getMetrics for jsHeapUsedBytes
+            run_dir = fx.build / "runs" / "orch14-telemetry-session"
+            run_dir.mkdir(parents=True)
+            fake_clock = {"t": 10.0}
+            cdp_enter_events: list[dict] = []
+            poll_idx = {"n": 0}
+
+            class FakeProc:
+                returncode = None
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    self.returncode = 0
+                    return 0
+
+                def kill(self):
+                    self.returncode = -9
+
+            class TelemetryCdp:
+                def __init__(self, ws_url: str):
+                    self.ws_url = ws_url
+
+                def connect(self):
+                    pass
+
+                def close(self):
+                    pass
+
+                def send(self, method: str, params=None, timeout=None):
+                    if method == "Input.dispatchKeyEvent":
+                        cdp_enter_events.append(params)
+                        return {}
+                    if method == "Performance.getMetrics":
+                        return {
+                            "metrics": [
+                                {"name": "JSHeapUsedSize", "value": 94371840},
+                                {"name": "JSHeapTotalSize", "value": 134217728},
+                            ]
+                        }
+                    if method == "Runtime.evaluate":
+                        poll_idx["n"] += 1
+                        probe = make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+                        probe["memory"] = None
+                        if poll_idx["n"] == 1:
+                            probe["bootState"]["gpu"]["gpuMemory"] = {
+                                "liveBufferBytes": 100 * 1024 * 1024,
+                                "liveTextureBytes": 200 * 1024 * 1024,
+                                "peakBufferBytes": 150 * 1024 * 1024,
+                                "peakTextureBytes": 250 * 1024 * 1024,
+                            }
+                            probe["rendererMemory"] = {"wasmLinearMemoryBytes": 1024 * 1024 * 1024}
+                            probe["inputScriptState"] = {
+                                "active": True,
+                                "preset": "chrome-to-ingame",
+                                "scriptedPressesSent": 7,
+                                "pressCount": 7,
+                                "lastScriptedButton": "A",
+                                "elapsedScriptMs": 4200.5,
+                            }
+                        else:
+                            # Final poll simulates lower live usage and script finished; peaks & presses must survive
+                            probe["bootState"]["gpu"]["gpuMemory"] = {
+                                "liveBufferBytes": 80 * 1024 * 1024,
+                                "liveTextureBytes": 180 * 1024 * 1024,
+                            }
+                            probe["inputScriptState"] = {
+                                "active": False,
+                                "preset": "chrome-to-ingame",
+                                "scriptedPressesSent": 11,
+                                "pressCount": 11,
+                                "lastScriptedButton": "START",
+                                "elapsedScriptMs": 9100.0,
+                            }
+                        return {"result": {"value": probe}}
+                    return {}
+
+                def drain_events(self, timeout=0.0):
+                    fake_clock["t"] += 0.6
+                    return []
+
+            with mock.patch.object(rbb.time, "monotonic", side_effect=lambda: fake_clock["t"]):
+                sess = rbb.run_browser_session(
+                    repo=fx.repo,
+                    run_dir=run_dir,
+                    chrome_path=fx.chrome,
+                    port=0,
+                    boot_dir=fx.boot_dir,
+                    game_dir=None,
+                    shaders_dir=None,
+                    duration_s=1.0,
+                    headless=True,
+                    smoke=False,
+                    send_input=True,  # must be suppressed because input_script is active!
+                    input_script="chrome-to-ingame",
+                    capture_frames=False,
+                    frame_interval_s=1.0,
+                    encode_mp4=False,
+                    popen_fn=lambda cmd, **kw: FakeProc(),
+                    cdp_factory=TelemetryCdp,
+                    wait_server_fn=lambda *a, **k: {"status_code": 200, "coop": "same-origin", "coep": "require-corp"},
+                    wait_cdp_fn=lambda *a, **k: "ws://127.0.0.1:9222/devtools/page/1",
+                )
+
+            self.assertEqual(cdp_enter_events, [])
+            self.assertTrue(sess.send_input)
+            self.assertEqual(sess.input_mode, "input-script")
+            self.assertEqual(sess.cdp_inputs_sent, 0)
+            self.assertEqual(sess.input_script_presses_sent, 11)
+            self.assertEqual(sess.scripted_inputs_sent, 11)
+
+            rep = rbb.build_boot_report(sess, smoke=False, preset="start-screen", input_script="chrome-to-ingame")
+            tel = rbb.build_telemetry_payload(
+                sess, smoke=False, preset="start-screen", headless=True, input_script="chrome-to-ingame"
+            )
+            dig = rbb.digest(rep, 0)
+
+            self.assertTrue(rep["send_input"])
+            self.assertEqual(rep["input_mode"], "input-script")
+            self.assertEqual(rep["scripted_inputs_sent"], 11)
+            self.assertEqual(rep["counters"]["scripted_inputs_sent"], 11)
+            self.assertEqual(rep["summary"]["scripted_inputs_sent"], 11)
+            self.assertEqual(rep["summary"]["input_script_presses_sent"], 11)
+            self.assertEqual(rep["input_script_state"]["lastScriptedButton"], "START")
+            self.assertEqual(tel["scripted_inputs_sent"], 11)
+            self.assertIn("input_script: chrome-to-ingame (scripted_inputs_sent=11)", dig)
+
+            mem = rep["memory_stats"]
+            self.assertEqual(mem["liveBufferBytes"], 80 * 1024 * 1024)
+            self.assertEqual(mem["liveTextureBytes"], 180 * 1024 * 1024)
+            self.assertEqual(mem["peakBufferBytes"], 150 * 1024 * 1024)
+            self.assertEqual(mem["peakTextureBytes"], 250 * 1024 * 1024)
+            self.assertEqual(mem["wasmLinearMemoryBytes"], 1024 * 1024 * 1024)
+            self.assertEqual(mem["jsHeapUsedBytes"], 94371840)
+            self.assertEqual(rep["js_heap_used_mb"], 90.0)
 
 
 if __name__ == "__main__":

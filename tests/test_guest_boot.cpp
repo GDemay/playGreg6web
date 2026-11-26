@@ -2712,6 +2712,83 @@ void test_minidump_paths() {
     CHECK(md::annotate_report(r, "") == r);
 }
 
+void test_dump_pipelines_dir_and_present_interval_boot_options() {
+    // 1. Defaults and valid JSON string parsing for dump_pipelines_dir and present_interval.
+    {
+        BootConfig cfg;
+        CHECK(cfg.dump_pipelines_dir.empty());
+        CHECK(!cfg.present_honor_interval);
+
+        CHECK(apply_boot_options_json(
+            "{\"dump_pipelines_dir\": \"/pg6_dump\", \"present_interval\": \"honor\"}", cfg));
+        CHECK(cfg.dump_pipelines_dir == "/pg6_dump");
+        CHECK(cfg.present_honor_interval);
+
+        CHECK(apply_boot_options_json("{\"present_interval\": \"min1\"}", cfg));
+        CHECK(!cfg.present_honor_interval);
+        CHECK(cfg.dump_pipelines_dir == "/pg6_dump");
+
+        // Escaped path characters (including escaped slashes and \u002f) decode cleanly.
+        CHECK(apply_boot_options_json(
+            "{\"dump_pipelines_dir\": \"\\u002fpg6_dump\\/sub\"}", cfg));
+        CHECK(cfg.dump_pipelines_dir == "/pg6_dump/sub");
+
+        // Empty string, non-string types, and malformed/unterminated strings leave the field untouched.
+        const char* bad_inputs[] = {
+            "{\"dump_pipelines_dir\": \"\"}",
+            "{\"dump_pipelines_dir\": 123}",
+            "{\"dump_pipelines_dir\": true}",
+            "{\"dump_pipelines_dir\": null}",
+            "{\"dump_pipelines_dir\": \"/unterminated}",
+            "{\"present_interval\": \"invalid\"}",
+            "{\"present_interval\": 2}",
+        };
+        for (const char* json : bad_inputs) {
+            CHECK(apply_boot_options_json(json, cfg));
+            CHECK(cfg.dump_pipelines_dir == "/pg6_dump/sub");
+            CHECK(!cfg.present_honor_interval);
+        }
+    }
+
+    // 2. load_boot_options reads dump_pipelines_dir from boot/boot-options.json.
+    {
+        BootConfig cfg;
+        CHECK(load_boot_options(cfg, [](const std::string& path, std::vector<uint8_t>& out) {
+            if (path != "boot/boot-options.json") {
+                return false;
+            }
+            const std::string body = "{\"dump_pipelines_dir\": \"/pg6_dump\", \"report_to_log\": true}";
+            out.assign(body.begin(), body.end());
+            return true;
+        }));
+        CHECK(cfg.dump_pipelines_dir == "/pg6_dump");
+        CHECK(static_cast<bool>(cfg.report_sink));
+    }
+
+    // 3. run_boot wires dump_pipelines_dir into DeviceOptions::dump_dir and preserves pre-existing
+    //    DeviceOptions::dump_dir when BootConfig::dump_pipelines_dir is empty.
+    {
+        gpu::d3d12_xs_exports::reset_for_tests();
+        const Run r1 = boot_scenario(Scenario::ReturnCode, [](BootConfig& c) {
+            CHECK(apply_boot_options_json("{\"dump_pipelines_dir\": \"/pg6_dump\"}", c));
+        });
+        CHECK(r1.result.status == BootStatus::Exited);
+        CHECK(gpu::d3d12_xs_exports::device_options().dump_dir == "/pg6_dump");
+
+        // Empty BootConfig::dump_pipelines_dir must not clear a harness-configured dump_dir.
+        gpu::d3d12_xs_exports::reset_for_tests();
+        {
+            gpu::d3d12_guest::DeviceOptions pre;
+            pre.dump_dir = "/preconfigured_dump";
+            gpu::d3d12_xs_exports::set_device_options(pre);
+        }
+        const Run r2 = boot_scenario(Scenario::ReturnCode);
+        CHECK(r2.result.status == BootStatus::Exited);
+        CHECK(gpu::d3d12_xs_exports::device_options().dump_dir == "/preconfigured_dump");
+        gpu::d3d12_xs_exports::reset_for_tests();
+    }
+}
+
 int main() {
     test_minidump_paths();
 #ifdef __EMSCRIPTEN__
@@ -2742,6 +2819,7 @@ int main() {
     test_shard_dispatch_boot();
     test_boot_options_and_report_sink();
     test_fence_lag_and_present_max_interval();
+    test_dump_pipelines_dir_and_present_interval_boot_options();
     test_lockfree_dispatch_observer();
     test_fault_log_gprs_and_callers();
     test_wasm_off_thread_fault_records();
