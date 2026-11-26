@@ -1054,6 +1054,66 @@ function resolveSubsystemCtor(injectedCtor, globalNamespace, exportName, scriptR
   return null;
 }
 
+let cachedRtBvhPreludeApi = null;
+let pendingRtBvhPreludePromise = null;
+
+function resolveRtBvhPreludeApiSync() {
+  if (cachedRtBvhPreludeApi) {
+    return cachedRtBvhPreludeApi;
+  }
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.PlayGta6RtBvhPrelude &&
+    typeof globalThis.PlayGta6RtBvhPrelude.applyRtBvhPrelude === 'function'
+  ) {
+    cachedRtBvhPreludeApi = globalThis.PlayGta6RtBvhPrelude;
+    return cachedRtBvhPreludeApi;
+  }
+  if (typeof require === 'function') {
+    try {
+      const mod = require('./rt_bvh_prelude.js');
+      if (mod && typeof mod.applyRtBvhPrelude === 'function') {
+        cachedRtBvhPreludeApi = mod;
+        return cachedRtBvhPreludeApi;
+      }
+    } catch (_) {
+      // Optional ESM helper unavailable synchronously in this environment.
+    }
+  }
+  return null;
+}
+
+function ensureRtBvhPreludeLoaded() {
+  const syncApi = resolveRtBvhPreludeApiSync();
+  if (syncApi) {
+    return Promise.resolve(syncApi);
+  }
+  if (!pendingRtBvhPreludePromise) {
+    pendingRtBvhPreludePromise = Promise.resolve()
+      .then(() => import('./rt_bvh_prelude.js'))
+      .then((mod) => {
+        if (mod && typeof mod.applyRtBvhPrelude === 'function') {
+          cachedRtBvhPreludeApi = mod;
+          return mod;
+        }
+        return null;
+      })
+      .catch(() => null);
+  }
+  return pendingRtBvhPreludePromise;
+}
+
+function applyRtBvhPreludeIfNeeded(code) {
+  if (typeof code !== 'string' || code.length === 0) {
+    return code;
+  }
+  const api = resolveRtBvhPreludeApiSync();
+  if (api && typeof api.applyRtBvhPrelude === 'function') {
+    return api.applyRtBvhPrelude(code);
+  }
+  return code;
+}
+
 const WGPK_MAGIC_BYTES = Object.freeze([0x57, 0x47, 0x50, 0x4b]);
 const WGPK_VERSION = 1;
 const WGPK_HEADER_BYTES = 16;
@@ -3859,8 +3919,8 @@ class WgpuCommandProcessor {
       );
       if (resolvedVs && typeof resolvedVs.wgsl === 'string' && resolvedVs.wgsl.length > 0) {
         if (resolvedVs.wgsl !== vsOrig.code) {
-          vsModule = this.device.createShaderModule({ code: resolvedVs.wgsl });
-          vsCode = resolvedVs.wgsl;
+          vsCode = applyRtBvhPreludeIfNeeded(resolvedVs.wgsl);
+          vsModule = this.device.createShaderModule({ code: vsCode });
           vsEntryPoint = resolvedVs.entryPoint || extractWgslEntryPoint(vsCode, SHADER_STAGE.VERTEX) || 'vs_main';
           changed = true;
         }
@@ -3882,8 +3942,8 @@ class WgpuCommandProcessor {
       );
       if (resolvedFs && typeof resolvedFs.wgsl === 'string' && resolvedFs.wgsl.length > 0) {
         if (resolvedFs.wgsl !== fsOrig.code) {
-          fsModule = this.device.createShaderModule({ code: resolvedFs.wgsl });
-          fsCode = resolvedFs.wgsl;
+          fsCode = applyRtBvhPreludeIfNeeded(resolvedFs.wgsl);
+          fsModule = this.device.createShaderModule({ code: fsCode });
           fsEntryPoint = resolvedFs.entryPoint || extractWgslEntryPoint(fsCode, SHADER_STAGE.FRAGMENT) || 'fs_main';
           changed = true;
         }
@@ -8729,7 +8789,7 @@ class WgpuCommandProcessor {
     if (!this.device) {
       return null;
     }
-    const code = entry.code;
+    const code = applyRtBvhPreludeIfNeeded(entry.code);
     const recordCompileFailure = () => {
       if (
         !this.shaderFallbackRouter ||
@@ -8797,9 +8857,10 @@ class WgpuCommandProcessor {
     entry.module = module;
     this._materializedShaderCount += 1;
     if (this.resourceRegistry && typeof this.resourceRegistry.register === 'function') {
-      const byteSize = entry.isInlineCode
-        ? Math.max(0, Math.trunc(entry.codeLen || 0))
-        : new TextEncoder().encode(code).byteLength;
+      const byteSize =
+        entry.isInlineCode && code === entry.code
+          ? Math.max(0, Math.trunc(entry.codeLen || 0))
+          : new TextEncoder().encode(code).byteLength;
       this.resourceRegistry.register('shaderModule', id, module, {
         byteSize,
         label: `shaderModule:${id}`,
@@ -14480,6 +14541,7 @@ function createWgpuWorkerHandler(options = {}) {
   }
 
   async function defaultInitGpu(offscreen, width, height, initPayload = {}) {
+    const rtPreludePromise = ensureRtBvhPreludeLoaded();
     canvas = offscreen;
     canvas.width = width;
     canvas.height = height;
@@ -14619,6 +14681,8 @@ function createWgpuWorkerHandler(options = {}) {
       configureCanvasContextWithCopySrc(ctx, { device, format, alphaMode: 'opaque' });
     }
     swapchain = activeSwapchain;
+
+    await rtPreludePromise;
 
     processor = new WgpuCommandProcessor(device, ctx, {
       format,
@@ -14875,6 +14939,7 @@ function createWgpuWorkerHandler(options = {}) {
   async function handleAsyncInitWithCanvas(payload) {
     try {
       preloadedInDefaultInit = false;
+      await ensureRtBvhPreludeLoaded();
       const created = await initGpu(
         payload.canvas,
         payload.width || 1280,
