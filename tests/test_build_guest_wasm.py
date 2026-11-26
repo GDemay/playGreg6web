@@ -5068,6 +5068,37 @@ class TestAsymmetricSideModuleSplit(unittest.TestCase):
         self.assertIn(bgw.SIDE_MODULE_FLAG, legacy)
         self.assertNotIn(bgw.SIDE_MODULE_PRUNED_FLAG, legacy)
 
+    def test_capped_partition_auto_n_balanced_and_deterministic(self) -> None:
+        sizes = [300, 250, 200, 250, 300, 200, 100]  # 1600 total, cap 900 -> 2 parts
+        items = [self._fake_item(f"lift/shard-{i:05d}.ll", sz) for i, sz in enumerate(sizes)]
+        a = bgw.partition_shards_capped(items, 8, max_bucket_bytes=900)
+        b = bgw.partition_shards_capped(list(reversed(items)), 8, max_bucket_bytes=900)
+        self.assertEqual(len(a), 2)
+        self.assertEqual([[x.unit.unit_id for x in p] for p in a], [[x.unit.unit_id for x in p] for p in b])
+        weights = [sum(bgw._partition_weight(x) for x in p) for p in a]
+        self.assertTrue(all(w <= 900 for w in weights))
+        self.assertLessEqual(max(weights) - min(weights), 300)
+        flat = [x.unit.unit_id for p in a for x in p]
+        self.assertEqual(flat, sorted(flat))
+
+    def test_capped_partition_grows_parts_with_size_and_single_part_when_small(self) -> None:
+        small = [self._fake_item(f"lift/shard-{i:05d}.ll", 100) for i in range(5)]
+        self.assertEqual(len(bgw.partition_shards_capped(small, 4, max_bucket_bytes=900)), 1)
+        big = [self._fake_item(f"lift/shard-{i:05d}.ll", 100) for i in range(30)]
+        parts = bgw.partition_shards_capped(big, 8, max_bucket_bytes=900)
+        self.assertEqual(len(parts), 4)
+        for p in parts:
+            self.assertLessEqual(sum(bgw._partition_weight(x) for x in p), 900)
+
+    def test_capped_partition_errors_instead_of_over_cap(self) -> None:
+        items = [self._fake_item(f"lift/shard-{i:05d}.ll", 100) for i in range(30)]
+        with self.assertRaisesRegex(bgw.BuildGuestWasmError, "raise --split-modules"):
+            bgw.partition_shards_capped(items, 2, max_bucket_bytes=900)
+        huge = [self._fake_item("lift/shard-00000.ll", 1000)]
+        with self.assertRaisesRegex(bgw.BuildGuestWasmError, "alone is"):
+            bgw.partition_shards_capped(huge, 4, max_bucket_bytes=900)
+        self.assertEqual(bgw.side_module_mode_for_strategy("capped"), 2)
+
     def test_asymmetric_partition_targets_994_171_two_part_shape(self) -> None:
         # Scale the proven ~994/171 MiB shape down to small byte weights for unit tests.
         # part_0 packs up to 994, part_1 gets the remaining 171.
