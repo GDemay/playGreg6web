@@ -131,6 +131,11 @@ private:
 };
 
 struct Staged {
+    // Lock ordering: always acquire `flush_mutex` before `mutex`.
+    // `flush_mutex` serializes single-producer writes to `runtime_ring()` and `sink` callbacks
+    // when both the engine clock thread and a late-pass catch-up flush run concurrently.
+    // `push_spatial_pass` / `push_render_stereo` only take `mutex` and never block on ring/sink I/O.
+    std::mutex flush_mutex;
     std::mutex mutex;
     StagedRing spatial;  // interleaved stereo, already downmixed
     StagedRing render;   // interleaved stereo
@@ -183,34 +188,62 @@ StereoGain downmix_gain(uint32_t t) {
     }
 }
 
-void mix_object_into_stereo(uint32_t object_type, const float* mono, uint32_t frames, float* out) {
+void mix_object_into_stereo_impl(uint32_t object_type, const float* mono, uint32_t frames, float* out,
+                                 uint64_t* non_finite) {
     const StereoGain g = downmix_gain(object_type);
     if (mono == nullptr || out == nullptr || frames == 0 || (g.left == 0.0f && g.right == 0.0f)) {
         return;
     }
+    uint64_t bad = 0;
     if (g.right == 0.0f) {
         if (g.left == 1.0f) {
             for (uint32_t i = 0; i < frames; ++i) {
-                out[static_cast<size_t>(i) * 2] += mono[i];
+                const float s = mono[i];
+                if (std::isfinite(s)) {
+                    out[static_cast<size_t>(i) * 2] += s;
+                } else {
+                    ++bad;
+                }
             }
         } else {
             const float gl = g.left;
             for (uint32_t i = 0; i < frames; ++i) {
-                out[static_cast<size_t>(i) * 2] += mono[i] * gl;
+                const float s = mono[i];
+                if (std::isfinite(s)) {
+                    out[static_cast<size_t>(i) * 2] += s * gl;
+                } else {
+                    ++bad;
+                }
             }
+        }
+        if (non_finite != nullptr) {
+            *non_finite += bad;
         }
         return;
     }
     if (g.left == 0.0f) {
         if (g.right == 1.0f) {
             for (uint32_t i = 0; i < frames; ++i) {
-                out[static_cast<size_t>(i) * 2 + 1] += mono[i];
+                const float s = mono[i];
+                if (std::isfinite(s)) {
+                    out[static_cast<size_t>(i) * 2 + 1] += s;
+                } else {
+                    ++bad;
+                }
             }
         } else {
             const float gr = g.right;
             for (uint32_t i = 0; i < frames; ++i) {
-                out[static_cast<size_t>(i) * 2 + 1] += mono[i] * gr;
+                const float s = mono[i];
+                if (std::isfinite(s)) {
+                    out[static_cast<size_t>(i) * 2 + 1] += s * gr;
+                } else {
+                    ++bad;
+                }
             }
+        }
+        if (non_finite != nullptr) {
+            *non_finite += bad;
         }
         return;
     }
@@ -218,9 +251,20 @@ void mix_object_into_stereo(uint32_t object_type, const float* mono, uint32_t fr
     const float gr = g.right;
     for (uint32_t i = 0; i < frames; ++i) {
         const float s = mono[i];
-        out[static_cast<size_t>(i) * 2] += s * gl;
-        out[static_cast<size_t>(i) * 2 + 1] += s * gr;
+        if (std::isfinite(s)) {
+            out[static_cast<size_t>(i) * 2] += s * gl;
+            out[static_cast<size_t>(i) * 2 + 1] += s * gr;
+        } else {
+            ++bad;
+        }
     }
+    if (non_finite != nullptr) {
+        *non_finite += bad;
+    }
+}
+
+void mix_object_into_stereo(uint32_t object_type, const float* mono, uint32_t frames, float* out) {
+    mix_object_into_stereo_impl(object_type, mono, frames, out, nullptr);
 }
 
 void mix_stereo_into_stereo(const float* in, uint32_t frames, float* out) {
@@ -228,7 +272,10 @@ void mix_stereo_into_stereo(const float* in, uint32_t frames, float* out) {
         return;
     }
     for (size_t i = 0; i < static_cast<size_t>(frames) * 2; ++i) {
-        out[i] += in[i];
+        const float s = in[i];
+        if (std::isfinite(s)) {
+            out[i] += s;
+        }
     }
 }
 
@@ -343,8 +390,9 @@ void push_spatial_pass(const uint32_t* types, const float* const* buffers, uint3
         fallback_mix.assign(total_samples, 0.0f);
         mix_ptr = fallback_mix.data();
     }
+    uint64_t non_finite = 0;
     for (uint32_t i = 0; i < objects; ++i) {
-        mix_object_into_stereo(types[i], buffers[i], frames, mix_ptr);
+        mix_object_into_stereo_impl(types[i], buffers[i], frames, mix_ptr, &non_finite);
     }
     uint64_t dropped = 0;
     {
@@ -354,6 +402,9 @@ void push_spatial_pass(const uint32_t* types, const float* const* buffers, uint3
     }
     if (dropped != 0) {
         counters().staged_spatial_dropped.fetch_add(dropped, std::memory_order_relaxed);
+    }
+    if (non_finite != 0) {
+        counters().non_finite_clamped.fetch_add(non_finite, std::memory_order_relaxed);
     }
 }
 
@@ -372,11 +423,13 @@ void push_render_stereo(const float* interleaved, uint32_t frames) {
     }
 }
 
-uint32_t flush_period(uint32_t period_frames) {
+namespace {
+
+// Caller must hold `s.flush_mutex`.
+uint32_t flush_period_locked(Staged& s, uint32_t period_frames) {
     if (period_frames == 0) {
         return 0;
     }
-    Staged& s = staged();
     float stack_mix[kStackMixFrames * kChannels];
     float* mix_ptr = stack_mix;
     size_t n = 0;
@@ -441,6 +494,71 @@ uint32_t flush_period(uint32_t period_frames) {
     return frames;
 }
 
+}  // namespace
+
+uint32_t flush_period(uint32_t period_frames) {
+    if (period_frames == 0) {
+        return 0;
+    }
+    Staged& s = staged();
+    std::lock_guard<std::mutex> flush_lock(s.flush_mutex);
+    return flush_period_locked(s, period_frames);
+}
+
+uint32_t flush_pending(uint32_t period_frames, uint32_t max_periods) {
+    if (period_frames == 0 || max_periods == 0) {
+        return 0;
+    }
+    Staged& s = staged();
+    std::lock_guard<std::mutex> flush_lock(s.flush_mutex);
+    bool both_active = false;
+    {
+        std::lock_guard<std::mutex> lock(s.mutex);
+        both_active = (s.spatial.size() > 0 && s.render.size() > 0);
+    }
+    uint32_t total_frames = flush_period_locked(s, period_frames);
+    if (total_frames == 0 || max_periods == 1) {
+        return total_frames;
+    }
+    const size_t period_samples = static_cast<size_t>(period_frames) * kChannels;
+    const PcmRing& ring = runtime_ring();
+    for (uint32_t p = 1; p < max_periods; ++p) {
+        const size_t readable = ring_readable(ring);
+        const size_t free_frames = (ring.capacity > readable) ? (ring.capacity - readable) / kChannels : 0;
+        if (free_frames < period_frames) {
+            break;
+        }
+        bool ready = false;
+        {
+            std::lock_guard<std::mutex> lock(s.mutex);
+            const size_t sp = s.spatial.size();
+            const size_t rd = s.render.size();
+            // Flush an extra catch-up period only if a full period is ready and we will not
+            // desynchronize simultaneous spatial + render sources.
+            if (sp >= period_samples && rd >= period_samples) {
+                ready = true;
+            } else if (!both_active && ((sp >= period_samples && rd == 0) || (rd >= period_samples && sp == 0))) {
+                ready = true;
+            }
+        }
+        if (!ready) {
+            break;
+        }
+        const uint32_t f = flush_period_locked(s, period_frames);
+        if (f == 0) {
+            break;
+        }
+        total_frames += f;
+    }
+    return total_frames;
+}
+
+size_t staged_frames() {
+    Staged& s = staged();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    return std::max(s.spatial.size(), s.render.size()) / kChannels;
+}
+
 AudioDownmixStats stats() {
     const Counters& c = counters();
     AudioDownmixStats out;
@@ -455,6 +573,7 @@ AudioDownmixStats stats() {
 
 void reset() {
     Staged& s = staged();
+    std::lock_guard<std::mutex> flush_lock(s.flush_mutex);
     {
         std::lock_guard<std::mutex> lock(s.mutex);
         s.spatial.clear();

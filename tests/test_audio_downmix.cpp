@@ -473,6 +473,166 @@ void test_mixer_and_accessor() {
     ad::reset();
 }
 
+void test_nan_isolation_and_clamping() {
+    ad::reset();
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+
+    // Object 0 (FrontLeft) carries NaN/+Inf/-Inf, while Object 1 (FrontCenter) carries valid 0.5f.
+    // Non-finite samples in one object must never poison valid samples from other objects.
+    const float bad_fl[4] = {qnan, inf, -inf, 0.25f};
+    const float good_fc[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    const uint32_t types[2] = {ad::kFrontLeft, ad::kFrontCenter};
+    const float* bufs[2] = {bad_fl, good_fc};
+    ad::push_spatial_pass(types, bufs, 2, 4);
+    CHECK(ad::flush_period(4) == 4);
+
+    float out[8] = {};
+    CHECK(ad::ring_pop(ad::runtime_ring(), out, 8) == 8);
+    const float fc_gain = 0.5f * 0.70710678f;
+    CHECK(near(out[0], fc_gain) && near(out[1], fc_gain));
+    CHECK(near(out[2], fc_gain) && near(out[3], fc_gain));
+    CHECK(near(out[4], fc_gain) && near(out[5], fc_gain));
+    CHECK(near(out[6], 0.25f + fc_gain) && near(out[7], fc_gain));
+    CHECK(ad::stats().non_finite_clamped == 3);
+
+    // Direct mix_stereo_into_stereo also ignores non-finite samples without poisoning accumulator.
+    float acc[4] = {0.25f, -0.25f, 0.5f, -0.5f};
+    const float dirty_stereo[4] = {qnan, 0.5f, inf, -inf};
+    ad::mix_stereo_into_stereo(dirty_stereo, 2, acc);
+    CHECK(near(acc[0], 0.25f) && near(acc[1], 0.25f) && near(acc[2], 0.5f) && near(acc[3], -0.5f));
+    ad::reset();
+}
+
+void test_flush_pending_catchup_and_wraparound() {
+    ad::reset();
+    Capture cap;
+    ad::set_stereo_sink(&capture_sink, &cap);
+
+    // 1. Single-source backlog catch-up: stage 6 periods of 480 frames, flush_pending(480, 4)
+    //    must drain 4 periods (1920 frames) immediately and leave 2 periods (960 frames) staged.
+    std::vector<float> fl(480), fr(480);
+    const uint32_t types[2] = {ad::kFrontLeft, ad::kFrontRight};
+    const float* bufs[2] = {fl.data(), fr.data()};
+    for (uint32_t p = 0; p < 6; ++p) {
+        for (uint32_t i = 0; i < 480; ++i) {
+            const float v = static_cast<float>(p * 480 + i) / 10000.0f;
+            fl[i] = v;
+            fr[i] = -v;
+        }
+        ad::push_spatial_pass(types, bufs, 2, 480);
+    }
+    CHECK(ad::staged_frames() == 6 * 480);
+    CHECK(ad::flush_pending(480, 4) == 4 * 480);
+    CHECK(ad::staged_frames() == 2 * 480);
+    CHECK(ad::flush_pending(480, 4) == 2 * 480);
+    CHECK(ad::staged_frames() == 0);
+    CHECK(cap.pcm.size() == 6 * 480 * 2);
+
+    std::vector<float> got(6 * 480 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), got.data(), got.size()) == got.size());
+    bool ramp_ok = true;
+    for (uint32_t i = 0; i < 6 * 480; ++i) {
+        const float exp = static_cast<float>(i) / 10000.0f;
+        if (!near(got[2 * i], exp) || !near(got[2 * i + 1], -exp)) {
+            ramp_ok = false;
+        }
+    }
+    CHECK(ramp_ok);
+
+    // 2. Dual-source lockstep: 2 spatial periods + 1 render period -> flush_pending flushes only
+    //    the 1 paired period so spatial[480..959] stays aligned for render's 2nd period.
+    ad::reset();
+    std::vector<float> sp1(480, 0.25f), sp2(480, 0.5f), rd1(480 * 2, 0.1f), rd2(480 * 2, 0.2f);
+    const uint32_t t1[1] = {ad::kFrontLeft};
+    const float* b1[1] = {sp1.data()};
+    const float* b2[1] = {sp2.data()};
+    ad::push_spatial_pass(t1, b1, 1, 480);
+    ad::push_spatial_pass(t1, b2, 1, 480);
+    ad::push_render_stereo(rd1.data(), 480);
+    CHECK(ad::flush_pending(480, 4) == 480);
+    CHECK(ad::staged_frames() == 480);
+    ad::push_render_stereo(rd2.data(), 480);
+    CHECK(ad::flush_pending(480, 4) == 480);
+    CHECK(ad::staged_frames() == 0);
+    std::vector<float> paired(960 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), paired.data(), paired.size()) == paired.size());
+    CHECK(near(paired[0], 0.35f) && near(paired[1], 0.1f));
+    CHECK(near(paired[960], 0.7f) && near(paired[961], 0.2f));
+
+    // 3. Ring backpressure: when the ring only has room for 1 period + 100 frames, flush_pending
+    //    pushes the 1st period and leaves extra catch-up periods staged rather than dropping them.
+    ad::reset();
+    ad::PcmRing& ring = ad::runtime_ring();
+    const size_t cap_frames = ring.capacity / 2;
+    std::vector<float> filler((cap_frames - 580) * 2, 0.0f);
+    CHECK(ad::ring_push(ring, filler.data(), filler.size()) == filler.size());
+    for (int p = 0; p < 3; ++p) {
+        ad::push_render_stereo(rd1.data(), 480);
+    }
+    CHECK(ad::flush_pending(480, 4) == 480);
+    CHECK(ad::staged_frames() == 2 * 480);
+    CHECK(ad::stats().frames_dropped == 0);
+
+    // 4. Multi-lap continuous wraparound + concurrent flush serialization (> 2 full ring laps).
+    ad::reset();
+    constexpr uint32_t kTotalPeriods = 300;  // 300 * 480 = 144,000 frames (> 2.19x 65536-frame ring)
+    std::thread producer([&] {
+        std::vector<float> chunk(480 * 2);
+        for (uint32_t p = 0; p < kTotalPeriods; ++p) {
+            for (uint32_t i = 0; i < 480; ++i) {
+                const float v = static_cast<float>((p * 480 + i) & 0x3FFu) / 1024.0f;
+                chunk[2 * i] = v;
+                chunk[2 * i + 1] = -v;
+            }
+            ad::push_render_stereo(chunk.data(), 480);
+            // Alternate between single-period flush and multi-period catch-up flush.
+            if ((p & 3u) == 3u) {
+                while (ad::staged_frames() >= 480) {
+                    const size_t free_f = (ring.capacity - ad::ring_readable(ring)) / 2;
+                    if (free_f < 480) {
+                        std::this_thread::yield();
+                        continue;
+                    }
+                    ad::flush_pending(480, 4);
+                }
+            }
+        }
+        while (ad::staged_frames() > 0) {
+            const size_t free_f = (ring.capacity - ad::ring_readable(ring)) / 2;
+            if (free_f < 480) {
+                std::this_thread::yield();
+                continue;
+            }
+            ad::flush_pending(480, 4);
+        }
+    });
+
+    uint32_t frames_read = 0;
+    bool continuous = true;
+    std::vector<float> out(512 * 2);
+    while (frames_read < kTotalPeriods * 480) {
+        const size_t got_samples = ad::ring_pop(ring, out.data(), out.size());
+        if (got_samples == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        CHECK((got_samples & 1u) == 0u);
+        const uint32_t got_frames = static_cast<uint32_t>(got_samples / 2);
+        for (uint32_t i = 0; i < got_frames; ++i) {
+            const float exp = static_cast<float>((frames_read + i) & 0x3FFu) / 1024.0f;
+            if (!near(out[2 * i], exp) || !near(out[2 * i + 1], -exp)) {
+                continuous = false;
+            }
+        }
+        frames_read += got_frames;
+    }
+    producer.join();
+    CHECK(continuous);
+    CHECK(ad::stats().frames_dropped == 0);
+    ad::reset();
+}
+
 }  // namespace
 
 int main() {
@@ -485,6 +645,8 @@ int main() {
     test_spsc_threads();
     test_spsc_multithread_variable_chunks_wrap32();
     test_mixer_and_accessor();
+    test_nan_isolation_and_clamping();
+    test_flush_pending_catchup_and_wraparound();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_audio_downmix failed with %d failure(s)\n", g_failures);
         return 1;

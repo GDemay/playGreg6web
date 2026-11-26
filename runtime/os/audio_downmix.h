@@ -89,6 +89,13 @@ void push_render_stereo(const float* interleaved, uint32_t frames);
 // Mixes up to `period_frames` staged frames per source; nothing is pushed when no source has
 // data. Returns the frames delivered.
 uint32_t flush_period(uint32_t period_frames);
+// Drains up to `max_periods` periods of `period_frames` from staged audio into the ring and
+// stereo sink. Always flushes the first period if any data is staged; flushes additional full
+// catch-up periods only while the output ring has free space and without breaking lockstep
+// between simultaneous spatial and render sources. Returns total frames delivered.
+uint32_t flush_pending(uint32_t period_frames, uint32_t max_periods);
+// Maximum frames currently queued in either staging ring (diagnostics / tests).
+size_t staged_frames();
 // Tests and shutdown: drops staged audio and the sink, zeroes the ring indices.
 void reset();
 

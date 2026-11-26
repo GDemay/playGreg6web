@@ -30,6 +30,7 @@
 #include "guest/com_bridge.h"
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
+#include "os/audio_downmix.h"
 #include "os/bcpack.h"
 #include "os/httpfs_mailbox.h"
 #include "os/vmem.h"
@@ -2548,7 +2549,179 @@ void spatial_audio_object_volume(AudioFixture& fx) {
     win32::CloseHandle(event);
 }
 
+// Drift-compensated AudioPacer: zero cumulative drift across jittered wakeups, smooth multi-quantum
+// catch-up within kAudioMaxCatchupPeriods, and strict long-stall clamping without bursts.
+void audio_pacer_drift_and_stall_bounds() {
+    ga::AudioPacer pacer{};
+    CHECK(pacer.step(0) == 0);
+    CHECK(pacer.initialized && pacer.next_deadline_us == ga::kAudioPeriodUs);
+
+    // Early / spurious wakeups before deadline emit 0 and leave the deadline untouched.
+    CHECK(pacer.step(4000) == 0);
+    CHECK(pacer.step(ga::kAudioPeriodUs - 1) == 0);
+    CHECK(pacer.next_deadline_us == ga::kAudioPeriodUs);
+
+    // 1,000 jittered wakeups (+0 .. +4000 us late): exact 100 Hz rate with zero cumulative drift.
+    for (int64_t i = 1; i <= 1000; ++i) {
+        const int64_t jitter_us = (i * 1733) % 4000;
+        const int64_t now_us = i * ga::kAudioPeriodUs + jitter_us;
+        CHECK(pacer.step(now_us) == 1);
+    }
+    CHECK(pacer.periods_emitted == 1000);
+    CHECK(pacer.catchup_bursts == 0 && pacer.stalls_clamped == 0);
+    CHECK(pacer.next_deadline_us == 1001 * ga::kAudioPeriodUs);
+
+    // Moderate Emscripten pthread scheduling jitter (35 ms late = 4 periods due <= max):
+    // catches up all 4 periods while staying phase-locked to the exact 10 ms wall-clock grid.
+    const int64_t late_now = 1001 * ga::kAudioPeriodUs + 35000;
+    CHECK(pacer.step(late_now) == ga::kAudioMaxCatchupPeriods);
+    CHECK(pacer.next_deadline_us == 1005 * ga::kAudioPeriodUs);
+    CHECK(pacer.catchup_bursts == 1 && pacer.stalls_clamped == 0);
+
+    // Long stall (500 ms late, e.g. shader compile or tab switch): strictly clamped to
+    // kAudioMaxCatchupPeriods (4 quanta = 40 ms) instead of bursting 50 quanta, and resets
+    // next_deadline_us to now + 10 ms so normal cadence resumes immediately.
+    const int64_t stall_now = pacer.next_deadline_us + 500000;
+    CHECK(pacer.step(stall_now) == ga::kAudioMaxCatchupPeriods);
+    CHECK(pacer.stalls_clamped == 1);
+    CHECK(pacer.next_deadline_us == stall_now + ga::kAudioPeriodUs);
+    CHECK(pacer.step(stall_now + ga::kAudioPeriodUs) == 1);
+    CHECK(pacer.next_deadline_us == stall_now + 2 * ga::kAudioPeriodUs);
+}
+
+// Spatial stream catch-up: multi-period engine bursts credit pending_passes so auto-reset events do
+// not coalesce and drop periods, and flush_pending drains all staged passes cleanly into the ring.
+void spatial_audio_catchup_and_flush_backlog(AudioFixture& fx) {
+    namespace ad = playgta6::os::audio_downmix;
+    const uint64_t dev = fx.default_endpoint(fx.enumerator());
+    const uint64_t sac = fx.activate(dev, kIidSpatialAudioClient);
+    const uint64_t out = fx.out_slot();
+    CHECK(as_hr(fx.vcall(sac, 6, {I(out)})) == 0);
+    const uint64_t formats = load64(out);
+    CHECK(as_hr(fx.vcall(formats, 4, {I(0), I(out)})) == 0);
+    const uint64_t fmt = load64(out);
+
+    const win32::Handle event = win32::CreateEventW(nullptr, false, false, nullptr);
+    const uint64_t params = com::guest_alloc(0x28);
+    CHECK(com::write_guest(params, fmt) && com::write_guest(params + 8, uint32_t{0x6}) &&
+          com::write_guest(params + 20, uint32_t{6}) && com::write_guest(params + 24, uint64_t{event}));
+    const uint64_t pv = com::guest_alloc(24);
+    CHECK(com::write_guest(pv, uint16_t{65}) && com::write_guest(pv + 8, uint32_t{0x28}) &&
+          com::write_guest(pv + 16, params));
+    CHECK(as_hr(fx.vcall(sac, 10, {I(pv), I(fx.guid(kIidSpatialStream)), I(out)})) == 0);
+    const uint64_t stream = load64(out);
+    CHECK(as_hr(fx.vcall(stream, 5)) == 0);  // Start
+
+    const uint64_t frames = com::guest_alloc(8);
+    const uint64_t buf = com::guest_alloc(16);
+    uint64_t object = 0;
+
+    // Simulate a 30 ms jitter catch-up burst (3 periods at once): the auto-reset event must
+    // re-signal after passes 0 and 1 so the guest renders all 3 passes with zero lost periods.
+    ga::audio_engine_tick_periods(3);
+    for (int pass = 0; pass < 3; ++pass) {
+        CHECK(win32::WaitForSingleObject(event, 0) == 0);
+        CHECK(as_hr(fx.vcall(stream, 8, {I(frames), I(frames + 4)})) == 0);  // Begin
+        if (object == 0) {
+            CHECK(as_hr(fx.vcall(stream, 10, {I(0x2), I(out)})) == 0);  // FrontLeft
+            object = load64(out);
+        }
+        CHECK(as_hr(fx.vcall(object, 3, {I(buf), I(buf + 8)})) == 0);
+        std::vector<float> samples(480, 0.1f * static_cast<float>(pass + 1));
+        CHECK(com::write_guest(load64(buf), samples.data(), samples.size() * sizeof(float)));
+        CHECK(as_hr(fx.vcall(stream, 9)) == 0);  // End (re-signals event while credits remain)
+    }
+    // After consuming all 3 catch-up passes, the auto-reset event is no longer signaled.
+    CHECK(win32::WaitForSingleObject(event, 0) != 0);
+    CHECK(ad::staged_frames() == 3 * 480);
+
+    // One engine tick drains all 3 staged catch-up periods into playgta6_audio_ring without
+    // leaving frames permanently stranded in staging.
+    ga::audio_engine_tick();
+    CHECK(ad::staged_frames() == 0);
+    CHECK(ad::ring_readable(ad::runtime_ring()) == 3 * 480 * 2);
+    std::vector<float> pcm(3 * 480 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), pcm.data(), pcm.size()) == pcm.size());
+    CHECK(std::fabs(pcm[0] - 0.1f) < 1e-5f && pcm[1] == 0.0f);
+    CHECK(std::fabs(pcm[480 * 2] - 0.2f) < 1e-5f && pcm[480 * 2 + 1] == 0.0f);
+    CHECK(std::fabs(pcm[960 * 2] - 0.3f) < 1e-5f && pcm[960 * 2 + 1] == 0.0f);
+
+    // Oversized tick_periods(10) clamps credits to kAudioMaxCatchupPeriods (4), and Stop clears
+    // any remaining credits so EndUpdatingAudioObjects never re-signals after Stop.
+    CHECK(win32::WaitForSingleObject(event, 0) == 0);  // clear the signal from the flush tick above
+    ga::audio_engine_tick_periods(10);
+    CHECK(win32::WaitForSingleObject(event, 0) == 0);
+    CHECK(as_hr(fx.vcall(stream, 8, {I(frames), I(frames + 4)})) == 0);
+    CHECK(as_hr(fx.vcall(stream, 6)) == 0);  // Stop clears pending_passes
+    CHECK(as_hr(fx.vcall(stream, 9)) == 0);  // End must not re-signal a stopped stream
+    CHECK(win32::WaitForSingleObject(event, 0) != 0);
+
+    for (const uint64_t o : {object, stream, formats, sac, dev}) {
+        fx.vcall(o, 2);
+    }
+    win32::CloseHandle(event);
+}
+
+// IAudioClient underrun recovery and silent buffer continuity: after a long stall moves the play
+// cursor past written_, ReleaseBuffer snaps forward so padding recovers immediately, and
+// AUDCLNT_BUFFERFLAGS_SILENT pushes zero frames to keep the 48 kHz PCM ring unbroken.
+void audio_client_underrun_recovery_and_silent_release(AudioFixture& fx) {
+    namespace ad = playgta6::os::audio_downmix;
+    const uint64_t dev = fx.default_endpoint(fx.enumerator());
+    const uint64_t client = fx.activate(dev, kIidAudioClient);
+    const uint64_t out = fx.out_slot();
+    const uint64_t u32 = com::guest_alloc(8);
+
+    CHECK(as_hr(fx.vcall(client, 8, {I(out)})) == 0);  // GetMixFormat
+    const uint64_t fmt = load64(out);
+    CHECK(as_hr(fx.vcall(client, 3, {I(0), I(0), I(0), I(0), I(fmt), I(0)})) == 0);
+    pg6_win32_co_task_mem_free(fmt);
+    CHECK(as_hr(fx.vcall(client, 14, {I(fx.guid(kIidAudioRenderClient)), I(out)})) == 0);
+    const uint64_t render = load64(out);
+
+    // Pre-fill 480 frames and start.
+    CHECK(as_hr(fx.vcall(render, 3, {I(480), I(out)})) == 0);
+    std::vector<float> tone(480 * 2, 0.25f);
+    CHECK(com::write_guest(load64(out), tone.data(), tone.size() * sizeof(float)));
+    CHECK(as_hr(fx.vcall(render, 4, {I(480), I(0)})) == 0);
+    CHECK(as_hr(fx.vcall(client, 10)) == 0);  // Start
+
+    // Advance 6 periods (2880 frames) without writing -> deep underrun (played >> written).
+    ga::audio_engine_tick_periods(4);
+    ga::audio_engine_tick_periods(2);
+    CHECK(as_hr(fx.vcall(client, 6, {I(u32)})) == 0 && load32(u32) == 0);
+
+    // Drain initial 480 frames from ring.
+    std::vector<float> drain(480 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), drain.data(), drain.size()) == drain.size());
+
+    // Release 480 new frames: padding must immediately be 480 (not stuck at 0 behind played).
+    CHECK(as_hr(fx.vcall(render, 3, {I(480), I(out)})) == 0);
+    CHECK(com::write_guest(load64(out), tone.data(), tone.size() * sizeof(float)));
+    CHECK(as_hr(fx.vcall(render, 4, {I(480), I(0)})) == 0);
+    CHECK(as_hr(fx.vcall(client, 6, {I(u32)})) == 0 && load32(u32) == 480);
+
+    // Release 480 silent frames (AUDCLNT_BUFFERFLAGS_SILENT = 0x2): keeps continuous PCM in ring.
+    const uint64_t nz_before = ga::audio_endpoint_stats().render_nonzero_frames;
+    CHECK(as_hr(fx.vcall(render, 3, {I(480), I(out)})) == 0);
+    CHECK(as_hr(fx.vcall(render, 4, {I(480), I(0x2)})) == 0);
+    CHECK(ga::audio_endpoint_stats().render_silent_releases == 1);
+    CHECK(ga::audio_endpoint_stats().render_nonzero_frames == nz_before);
+
+    // One tick flushes both the 480 tone frames and the 480 silent frames smoothly.
+    ga::audio_engine_tick();
+    std::vector<float> both(960 * 2);
+    CHECK(ad::ring_pop(ad::runtime_ring(), both.data(), both.size()) == both.size());
+    CHECK(std::fabs(both[0] - 0.25f) < 1e-5f && std::fabs(both[959] - 0.25f) < 1e-5f);
+    CHECK(both[960] == 0.0f && both[1919] == 0.0f);
+
+    for (const uint64_t o : {render, client, dev}) {
+        fx.vcall(o, 2);
+    }
+}
+
 void test_mmdevice() {
+    audio_pacer_drift_and_stall_bounds();
     AudioFixture fx;
     mmdevice_enumerator_and_endpoint(fx);
     fx.next_case();
@@ -2557,6 +2730,10 @@ void test_mmdevice() {
     spatial_audio_stream_cycle(fx);
     fx.next_case();
     spatial_audio_object_volume(fx);
+    fx.next_case();
+    spatial_audio_catchup_and_flush_backlog(fx);
+    fx.next_case();
+    audio_client_underrun_recovery_and_silent_release(fx);
 }
 
 // chad.dll XDsp in the executable's call shapes: connect hands out an opaque handle, activation

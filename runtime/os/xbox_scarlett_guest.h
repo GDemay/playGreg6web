@@ -546,10 +546,29 @@ struct AudioEndpointStats {
 };
 AudioEndpointStats audio_endpoint_stats();
 
+// Drift-compensated wall-clock pacer for the 10 ms (480-frame @ 48 kHz) audio engine clock.
+// Exposed so unit tests can verify multi-quantum pacing, jitter catch-up bounds, and long-stall
+// clamping deterministically without wall-clock sleeps.
+constexpr int64_t kAudioPeriodUs = 10000;
+constexpr uint32_t kAudioMaxCatchupPeriods = 4;
+
+struct AudioPacer {
+    int64_t next_deadline_us = 0;
+    bool initialized = false;
+    uint64_t periods_emitted = 0;
+    uint64_t catchup_bursts = 0;
+    uint64_t stalls_clamped = 0;
+
+    // Given monotonic timestamp `now_us`, returns how many 10 ms periods are due in
+    // [0, kAudioMaxCatchupPeriods] and advances `next_deadline_us` without cumulative drift.
+    uint32_t step(int64_t now_us);
+};
+
 // Tests only: with a manual clock the 10 ms period thread is stopped and audio_engine_tick()
 // advances every started stream by one period (padding drains, the stream's event is set).
 void audio_engine_manual_clock(bool manual);
 void audio_engine_tick();
+void audio_engine_tick_periods(uint32_t periods);
 // Tests only: stops the period thread, forgets the streams, the sink and the statistics.
 void reset_audio_endpoint();
 // Boot option audio_endpoint (on by default): off, CoCreateInstance(CLSID_MMDeviceEnumerator)
