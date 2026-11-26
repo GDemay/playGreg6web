@@ -708,6 +708,16 @@ def run_with_relaunch(cmd: list[str], repo: Path, run_dir: Path, runner: Runner,
               f"{MAX_RELAUNCHES} with the same arguments", file=sys.stderr, flush=True)
 
 
+def resolve_watchdog_ms(preset, max_ms_override, watchdog_ms_override):
+    """Hard watchdog: explicit value wins; otherwise keep the preset's margin above the effective max-ms so a
+    longer --max-ms is not cut short by the preset's (smaller) watchdog."""
+    if watchdog_ms_override is not None:
+        return watchdog_ms_override
+    if max_ms_override is None:
+        return preset["watchdog_ms"]
+    return max(preset["watchdog_ms"], max_ms_override + (preset["watchdog_ms"] - preset["max_ms"]))
+
+
 def main(argv: Sequence[str] | None = None, runner: Runner = run_command,
          env: Mapping[str, str] | None = None, repo_root: Path = REPO_ROOT) -> int:
     env = os.environ if env is None else env
@@ -754,7 +764,7 @@ def _run(args, extra: list[str], runner: Runner, env: Mapping[str, str], repo: P
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
-    watchdog_ms = args.watchdog_ms if args.watchdog_ms is not None else preset["watchdog_ms"]
+    watchdog_ms = resolve_watchdog_ms(preset, args.max_ms, args.watchdog_ms)
 
     cmd = harness_command(harness)
     cmd += ["--program-dir", str(program), "--name", exe.name, "--game-dir", str(game_dir),

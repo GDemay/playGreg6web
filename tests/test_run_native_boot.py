@@ -517,6 +517,13 @@ class RunTests(unittest.TestCase):
             self.assertEqual(args[args.index("--watchdog-ms") + 1], "99")
             self.assertNotIn("--input-script", args)
 
+    def test_watchdog_follows_max_ms_override(self):
+        pre = rnb.PRESETS["menu-flow"]
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, None, None), 270_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 300_000, None), 330_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 100_000, None), 270_000)
+        self.assertEqual(rnb.resolve_watchdog_ms(pre, 300_000, 99), 99)
+
     def test_missing_report_and_existing_run_dir(self):
         with tempfile.TemporaryDirectory() as d:
             fx = Fixture(Path(d))
