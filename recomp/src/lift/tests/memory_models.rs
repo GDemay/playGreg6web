@@ -870,6 +870,145 @@ fn r64b_triple_base_and_32_insn_bursts() {
     );
 }
 
+#[test]
+fn r67_extended_64_insn_and_indexed_window_bursts() {
+    use iced_x86::code_asm::*;
+
+    // 1. Long 48-instruction (>32, <=64) unrolled single-base burst coalesces into ONE burst.
+    let long48_f = super::asm_function(0x1000, |a| {
+        a.xor(eax, eax)?;
+        for k in 0..24i32 {
+            a.mov(rdx, qword_ptr(rcx + k * 8))?;
+            a.add(rax, rdx)?;
+        }
+        a.ret()
+    });
+    let long48_ir = lift_module_with([&long48_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        long48_ir.matches("\ngbf").count(),
+        1,
+        "48-instruction single-base burst must coalesce into ONE burst (MAX_BURST_INSNS=64):\n{long48_ir}"
+    );
+    assert_eq!(
+        long48_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        1,
+        "48-instruction burst must emit 1 window_table lookup:\n{long48_ir}"
+    );
+
+    // 2. Indexed `[rcx + rsi*8 + disp]` read/write burst coalesces into ONE burst with ONE table
+    //    lookup and ONE dirty mark.
+    let idx_f = super::asm_function(0x2000, |a| {
+        a.mov(rax, qword_ptr(rcx + rsi * 8))?;
+        a.add(rax, qword_ptr(rcx + rsi * 8 + 8))?;
+        a.add(rax, qword_ptr(rcx + rsi * 8 + 16))?;
+        a.mov(qword_ptr(rcx + rsi * 8 + 24), rax)?;
+        a.ret()
+    });
+    let idx_ir = lift_module_with([&idx_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        idx_ir.matches("\ngbf").count(),
+        1,
+        "indexed [rcx + rsi*8 + disp] burst must coalesce into ONE fast path:\n{idx_ir}"
+    );
+    assert_eq!(
+        idx_ir.matches("\ngbs").count(),
+        1,
+        "indexed burst must emit ONE shared slow fallback:\n{idx_ir}"
+    );
+    assert_eq!(
+        idx_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        1,
+        "indexed burst must emit ONE window_table lookup:\n{idx_ir}"
+    );
+    assert_eq!(
+        idx_ir.matches("store atomic i8 1, ptr ").count(),
+        1,
+        "indexed burst must emit ONE coalesced dirty mark:\n{idx_ir}"
+    );
+
+    // 3. Multi-base burst mixing plain `[rdx + d]` + indexed `[rcx + r8*4 + d]` -> `[rbx + r8*4 + d]`.
+    let mixed_f = super::asm_function(0x3000, |a| {
+        for k in 0..4i32 {
+            let off = k * 16;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx + r8 * 4 + off))?;
+            a.vmovdqu(xmm1, xmmword_ptr(rdx + off))?;
+            a.vpaddd(xmm2, xmm0, xmm1)?;
+            a.vmovdqu(xmmword_ptr(rbx + r8 * 4 + off), xmm2)?;
+        }
+        a.ret()
+    });
+    let mixed_ir = lift_module_with([&mixed_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(mixed_ir.matches("\ngbf").count(), 1, "{mixed_ir}");
+    assert_eq!(mixed_ir.matches("\ngbc").count(), 2, "{mixed_ir}");
+    assert_eq!(
+        mixed_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        3,
+        "3-base plain+indexed burst must emit 3 window_table lookups:\n{mixed_ir}"
+    );
+    assert_eq!(
+        mixed_ir.matches("store atomic i8 1, ptr ").count(),
+        1,
+        "only written indexed base rbx+r8*4 needs a dirty mark:\n{mixed_ir}"
+    );
+
+    // 4. Soundness: modifying the index register `rsi` breaks an indexed burst (never reuses stale
+    //    `eff_base`).
+    let mod_idx_f = super::asm_function(0x4000, |a| {
+        a.vmovdqu(xmm0, xmmword_ptr(rcx + rsi * 8))?;
+        a.add(rsi, 2)?;
+        a.vmovdqu(xmm1, xmmword_ptr(rcx + rsi * 8))?;
+        a.ret()
+    });
+    let mod_idx_ir = lift_module_with([&mod_idx_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        mod_idx_ir.matches("\ngbf").count(),
+        0,
+        "modifying index reg rsi must prevent coalescing across `add rsi, 2`:\n{mod_idx_ir}"
+    );
+
+    // 5. Soundness: indexed `[rsp + rax*8 + disp]` must NOT be skipped as stack-flat even under
+    //    `stack_flat = true` (it must still perform a window check!).
+    let rsp_idx_f = super::asm_function(0x5000, |a| {
+        a.mov(rcx, qword_ptr(rsp + rax * 8))?;
+        a.mov(qword_ptr(rsp + rax * 8 + 8), rcx)?;
+        a.ret()
+    });
+    let rsp_idx_ir = lift_module_with([&rsp_idx_f], window(WindowCheck::Branch, true, true))
+        .expect("lifts")
+        .ir;
+    assert_eq!(
+        rsp_idx_ir.matches("\ngbf").count(),
+        1,
+        "indexed [rsp + rax*8 + disp] must form a checked window burst (not stack-flat):\n{rsp_idx_ir}"
+    );
+    assert_eq!(
+        rsp_idx_ir
+            .matches("getelementptr i64, ptr @__playgta6_window_table")
+            .count(),
+        1,
+        "indexed [rsp + rax*8 + disp] must emit a window_table lookup:\n{rsp_idx_ir}"
+    );
+    assert_eq!(
+        rsp_idx_ir.matches("store atomic i8 1, ptr ").count(),
+        1,
+        "indexed [rsp + rax*8 + disp] store must emit a dirty mark:\n{rsp_idx_ir}"
+    );
+}
+
 /// FNV-1a 64 of a byte string (stable fingerprint of emitted IR).
 fn fnv(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {

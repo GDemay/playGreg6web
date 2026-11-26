@@ -284,3 +284,153 @@ fn constant_flags_are_stored_without_a_zext() {
     assert!(!ir.contains("zext i1 false"), "{ir}");
     assert!(ir.contains("store i8 0,"), "{ir}");
 }
+
+/// Flags reloaded from `%state.flag{i}` in `text` (matching `load i8, ptr %state.flag{i}`).
+fn loaded_flags(text: &str) -> Vec<usize> {
+    (0..6)
+        .filter(|i| text.contains(&format!("load i8, ptr %state.flag{i},")))
+        .collect()
+}
+
+/// The `after_call` block text following the first call inside `caller`, up to the next block
+/// label or return.
+fn after_first_call(ir: &str, caller: u64) -> String {
+    let func = ir
+        .split("define ")
+        .find(|f| f.contains(&format!("@{}(ptr noalias", function_symbol(caller))))
+        .expect("caller defined");
+    let after_lbl = func.find("\nafter_call").expect("after_call label");
+    let body = &func[after_lbl + 1..];
+    let body = &body[body.find(":\n").expect("label end") + 2..];
+    let end = body
+        .lines()
+        .take_while(|l| l.starts_with("  ") || l.is_empty())
+        .map(|l| l.len() + 1)
+        .sum::<usize>()
+        .min(body.len());
+    body[..end].to_string()
+}
+
+#[test]
+fn r67_dead_flags_after_direct_and_indirect_calls_are_not_reloaded() {
+    const DIRECT_DEAD: u64 = CODE_BASE + 0x1000;
+    const DIRECT_PARTIAL: u64 = CODE_BASE + 0x1100;
+    const DIRECT_LIVE: u64 = CODE_BASE + 0x1200;
+    const INDIRECT_DEAD: u64 = CODE_BASE + 0x1300;
+    const INDIRECT_LIVE: u64 = CODE_BASE + 0x1400;
+    const SET_FLAGS_CALLEE: u64 = CODE_BASE + 0x1500;
+
+    let prog = Program::new()
+        // All 6 flags are immediately overwritten by `add rax, rcx` after the direct call.
+        .asm(DIRECT_DEAD, |a| {
+            a.call(SET_FLAGS_CALLEE)?;
+            a.add(rax, rcx)?;
+            a.ret()
+        })
+        // Only CF is read by `adc rax, 0`, which then overwrites all 6 flags.
+        .asm(DIRECT_PARTIAL, |a| {
+            a.call(SET_FLAGS_CALLEE)?;
+            a.adc(rax, 0)?;
+            a.ret()
+        })
+        // Returning immediately after the call leaves all 6 flags live (caller tracks flags via
+        // the earlier `cmp`, so all 6 must be reloaded after the call before `ret` stores them).
+        .asm(DIRECT_LIVE, |a| {
+            a.cmp(rcx, rdx)?;
+            a.call(SET_FLAGS_CALLEE)?;
+            a.ret()
+        })
+        // Indirect call whose returned flags are completely overwritten by `sub rax, rcx`.
+        .asm(INDIRECT_DEAD, |a| {
+            a.call(r11)?;
+            a.sub(rax, rcx)?;
+            a.ret()
+        })
+        // Indirect call whose returned ZF is read by `setz`, then all flags are killed by `add`.
+        .asm(INDIRECT_LIVE, |a| {
+            a.call(r11)?;
+            a.setz(dl)?;
+            a.add(rax, rdx)?;
+            a.ret()
+        })
+        // Callee sets flags via `cmp rcx, rdx` and returns `rcx` in `rax`.
+        .asm(SET_FLAGS_CALLEE, |a| {
+            a.mov(rax, rcx)?;
+            a.cmp(rcx, rdx)?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let ir = lift_module(functions.values()).expect("lifts").ir;
+
+    assert_eq!(
+        loaded_flags(&after_first_call(&ir, DIRECT_DEAD)),
+        Vec::<usize>::new(),
+        "dead flags after direct call must not be reloaded:\n{}",
+        after_first_call(&ir, DIRECT_DEAD)
+    );
+    assert_eq!(
+        loaded_flags(&after_first_call(&ir, DIRECT_PARTIAL)),
+        vec![0],
+        "only live CF should be reloaded after direct call before adc:\n{}",
+        after_first_call(&ir, DIRECT_PARTIAL)
+    );
+    assert_eq!(
+        loaded_flags(&after_first_call(&ir, DIRECT_LIVE)),
+        vec![0, 1, 2, 3, 4, 5],
+        "all flags live at ret must still be reloaded:\n{}",
+        after_first_call(&ir, DIRECT_LIVE)
+    );
+    assert_eq!(
+        loaded_flags(&after_first_call(&ir, INDIRECT_DEAD)),
+        Vec::<usize>::new(),
+        "dead flags after indirect call must not be reloaded:\n{}",
+        after_first_call(&ir, INDIRECT_DEAD)
+    );
+    assert_eq!(
+        loaded_flags(&after_first_call(&ir, INDIRECT_LIVE)),
+        vec![3],
+        "only live ZF should be reloaded after indirect call before setz+add:\n{}",
+        after_first_call(&ir, INDIRECT_LIVE)
+    );
+
+    if !exec_or_skip("r67_dead_flags_after_direct_and_indirect_calls_are_not_reloaded") {
+        return;
+    }
+    let built = build("r67_post_call_dead_flags", functions.values());
+    let cases = [
+        // DIRECT_DEAD: rcx=10, rdx=20 -> callee returns rax=10, caller adds rcx -> 20
+        Case::new(DIRECT_DEAD).reg(RCX, 10).reg(RDX, 20),
+        // DIRECT_PARTIAL: rcx=10 < rdx=20 -> callee sets CF=1, caller adc rax,0 -> 11
+        Case::new(DIRECT_PARTIAL).reg(RCX, 10).reg(RDX, 20),
+        // DIRECT_PARTIAL: rcx=20 > rdx=10 -> callee sets CF=0, caller adc rax,0 -> 20
+        Case::new(DIRECT_PARTIAL).reg(RCX, 20).reg(RDX, 10),
+        // INDIRECT_DEAD: calls SET_FLAGS_CALLEE via r11, then sub rax, rcx -> 0 (ZF=1)
+        Case::new(INDIRECT_DEAD)
+            .reg(super::exec::R11, SET_FLAGS_CALLEE)
+            .reg(RCX, 15)
+            .reg(RDX, 25),
+        // INDIRECT_LIVE: rcx==rdx=7 -> ZF=1 -> dl=1 -> rax = 7 + (rdx with dl=1)
+        Case::new(INDIRECT_LIVE)
+            .reg(super::exec::R11, SET_FLAGS_CALLEE)
+            .reg(RCX, 7)
+            .reg(RDX, 7),
+        // INDIRECT_LIVE: rcx=7 != rdx=9 -> ZF=0 -> dl=0 -> rax = 7 + (rdx with dl=0)
+        Case::new(INDIRECT_LIVE)
+            .reg(super::exec::R11, SET_FLAGS_CALLEE)
+            .reg(RCX, 7)
+            .reg(RDX, 9),
+    ];
+    let out = run(&built, &cases);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+    assert_eq!(out[0].regs[RAX], 20);
+    assert_eq!(out[0].flags[3], false, "DIRECT_DEAD ZF");
+    assert_eq!(out[1].regs[RAX], 11, "DIRECT_PARTIAL CF=1");
+    assert_eq!(out[2].regs[RAX], 20, "DIRECT_PARTIAL CF=0");
+    assert_eq!(out[3].regs[RAX], 0, "INDIRECT_DEAD rax");
+    assert_eq!(out[3].flags[3], true, "INDIRECT_DEAD ZF=1");
+    assert_eq!(out[4].regs[RAX], 8, "INDIRECT_LIVE ZF=1 -> dl=1, 7+1=8");
+    assert_eq!(out[5].regs[RAX], 7, "INDIRECT_LIVE ZF=0 -> dl=0, 7+0=7");
+}
