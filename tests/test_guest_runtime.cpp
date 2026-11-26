@@ -902,6 +902,315 @@ void test_dispatch_cache_concurrent_invalidation() {
     reset_guest_runtime();
 }
 
+// ---------------------------------------------------------------------------
+// O45: L1 dispatch cache, observer on hits, exact invalidation, O(1) synthetic snapshot
+// ---------------------------------------------------------------------------
+
+thread_local uint64_t t_observer_calls = 0;
+thread_local uint64_t t_observer_last_target = 0;
+thread_local uint64_t t_observer_last_rip = 0;
+
+void counting_observer(GuestState* state, uint64_t target) {
+    ++t_observer_calls;
+    t_observer_last_target = target;
+    t_observer_last_rip = state->rip;
+}
+
+void cache_thunk_alt(void* state) {
+    t_last_kind = 101;
+    t_last_rip = static_cast<GuestState*>(state)->rip;
+}
+
+void test_l1_dispatch_cache_and_observer() {
+    reset_guest_runtime();
+    set_fault_handler(throwing_handler);
+    set_dispatch_cache_enabled(true);
+
+    VirtualMemoryArena arena;
+    CHECK(arena.reserve(kImageBase, 0x10000, PageProtect::ReadWrite) == kImageBase);
+    CHECK(arena.commit(kImageBase, 0x4000, PageProtect::ReadWrite));
+    const ImportSlotBinding import_slots[] = {{kIatRva, cache_thunk_alt}};
+    CHECK(bind_import_slots(arena, kImageBase, import_slots) == 1);
+    uint64_t import_va = 0;
+    CHECK(arena.read(kImageBase + kIatRva, &import_va, sizeof(import_va)));
+
+    // Two VAs engineered to collide in the 256-slot L1 index ((va>>4)^(va>>12)^(va>>20)) & 255
+    // (bit 28 differs, bits 4..27 match), testing L1 eviction -> L2 hit -> L1 promotion.
+    constexpr uint64_t kL1CollideA = kCacheBase + 0x3000;
+    constexpr uint64_t kL1CollideB = kCacheBase + 0x10003000ULL;
+    static const LiftedFunctionEntry lifted_table[] = {
+        {kL1CollideA, cache_fn_a},
+        {kL1CollideB, cache_fn_b},
+    };
+    static const Pg6ShardDispatchFn shards[] = {cache_shard};
+    constexpr uint64_t kShardA = kCacheBase + 0x20004000ULL;
+    constexpr uint64_t kShardB = kCacheBase + 0x20004010ULL;
+    static const Pg6ShardFunctionEntry shard_entries[] = {
+        {kShardA, 0, 3},
+        {kShardB, 0, 4},
+    };
+    CHECK(register_lifted_functions(lifted_table));
+    CHECK(register_shard_table(shard_entries, 2, shards, 1));
+    const uint64_t host_va = register_host_callable(cache_thunk, "o45_host");
+    CHECK(host_va != 0);
+
+    CHECK(set_dispatch_observer(counting_observer) == nullptr);
+    t_observer_calls = 0;
+    t_observer_last_target = 0;
+    t_observer_last_rip = 0;
+
+    // Repeated calls to lifted, shard, host callable, and bound import hit L1 and fire observer.
+    uint64_t expected_observer_calls = 0;
+    for (int i = 0; i < 8; ++i) {
+        CHECK(dispatch(kL1CollideA) == 1);
+        ++expected_observer_calls;
+        CHECK(t_observer_calls == expected_observer_calls);
+        CHECK(t_observer_last_target == kL1CollideA && t_observer_last_rip == kL1CollideA);
+
+        CHECK(dispatch(kShardA) == 13);
+        ++expected_observer_calls;
+        CHECK(t_observer_calls == expected_observer_calls);
+        CHECK(t_observer_last_target == kShardA && t_observer_last_rip == kShardA);
+
+        CHECK(dispatch(host_va) == 100);
+        ++expected_observer_calls;
+        CHECK(t_observer_calls == expected_observer_calls);
+        CHECK(t_observer_last_target == host_va && t_observer_last_rip == host_va);
+
+        CHECK(dispatch(import_va) == 101);
+        ++expected_observer_calls;
+        CHECK(t_observer_calls == expected_observer_calls);
+        CHECK(t_observer_last_target == import_va && t_observer_last_rip == import_va);
+    }
+
+    // Alternating L1-colliding targets: both resolve cleanly via L2 promotion and fire observer.
+    for (int i = 0; i < 6; ++i) {
+        CHECK(dispatch(kL1CollideA) == 1);
+        ++expected_observer_calls;
+        CHECK(dispatch(kL1CollideB) == 2);
+        ++expected_observer_calls;
+    }
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    // Empty L1 slots (va == 0, kind == 0) must never falsely match target == 0 once L1 is warm.
+    GuestFault fault{};
+    CHECK(dispatch(0, &fault) == 0);
+    ++expected_observer_calls;
+    CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+    CHECK(fault.info.va == 0 && fault.info.detail == 0);
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    // Exact invalidation on register_host_callable().
+    const uint64_t gen_before_host = dispatch_cache_generation();
+    const uint64_t host_va2 = register_host_callable(cache_thunk_alt, "o45_host_2");
+    CHECK(host_va2 != 0 && dispatch_cache_generation() == gen_before_host + 1);
+    CHECK(dispatch(host_va2) == 101);
+    CHECK(dispatch(host_va) == 100);
+    expected_observer_calls += 2;
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    // Exact invalidation when a new lifted table shadows a warm L1 shard target.
+    CHECK(dispatch(kShardB) == 14);
+    CHECK(dispatch(kShardB) == 14);  // warm in L1
+    expected_observer_calls += 2;
+    const uint64_t gen_before_shadow = dispatch_cache_generation();
+    static const LiftedFunctionEntry shadow_table[] = {{kShardB, cache_fn_c}};
+    CHECK(register_lifted_functions(shadow_table));
+    CHECK(dispatch_cache_generation() == gen_before_shadow + 1);
+    CHECK(dispatch(kShardB) == 3);  // must NOT serve stale shard entry from L1
+    ++expected_observer_calls;
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    // Exact invalidation on set_dispatch_cache_enabled(false) and re-enable.
+    const uint64_t gen_before_disable = dispatch_cache_generation();
+    CHECK(set_dispatch_cache_enabled(false) == true);
+    CHECK(dispatch_cache_generation() == gen_before_disable + 1);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(dispatch(kL1CollideA) == 1);
+        CHECK(dispatch(host_va) == 100);
+        CHECK(dispatch(kShardA) == 13);
+        expected_observer_calls += 3;
+    }
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    const uint64_t gen_before_enable = dispatch_cache_generation();
+    CHECK(set_dispatch_cache_enabled(true) == false);
+    CHECK(dispatch_cache_generation() == gen_before_enable + 1);
+    for (int i = 0; i < 4; ++i) {
+        CHECK(dispatch(kL1CollideA) == 1);
+        CHECK(dispatch(host_va) == 100);
+        expected_observer_calls += 2;
+    }
+    CHECK(t_observer_calls == expected_observer_calls);
+
+    // Reset invalidates cached lifted, shard, and synthetic targets.
+    CHECK(set_dispatch_observer(nullptr) == counting_observer);
+    reset_guest_runtime();
+    set_fault_handler(throwing_handler);
+    CHECK(dispatch(kL1CollideA, &fault) == 0);
+    CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+    CHECK(dispatch(kShardA, &fault) == 0);
+    CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+    CHECK(dispatch(host_va, &fault) == 0);
+    CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+    CHECK(dispatch(import_va, &fault) == 0);
+    CHECK(static_cast<FaultKind>(fault.info.kind) == FaultKind::UnknownTarget);
+    reset_guest_runtime();
+}
+
+void test_describe_synthetic_bounds_and_concurrency() {
+    reset_guest_runtime();
+    set_fault_handler(throwing_handler);
+    set_dispatch_cache_enabled(true);
+
+    // Out-of-range, sentinel, misaligned, and unbound synthetic addresses all return false.
+    SyntheticTarget info{};
+    const uint64_t invalid_vas[] = {
+        0ULL,
+        1ULL,
+        kImageBase,
+        kAdd6,
+        kSyntheticBase - kSyntheticStride,
+        kSyntheticBase - 1,
+        kGuestReturnSentinel,
+        kSyntheticBase + 1,
+        kSyntheticBase + 4,
+        kSyntheticBase + 8,
+        kSyntheticBase + 15,
+        kSyntheticBase + kSyntheticStride,  // nothing registered yet
+        kSyntheticBase + kMaxSyntheticTargets * kSyntheticStride,
+        kSyntheticBase + (kMaxSyntheticTargets + 1) * kSyntheticStride,
+        UINT64_MAX,
+        UINT64_MAX & ~uint64_t{0xF},
+    };
+    for (uint64_t va : invalid_vas) {
+        CHECK(!describe_synthetic(va, &info));
+        CHECK(!describe_synthetic(va, nullptr));
+    }
+
+    // Bind import slots and host callables; verify exact metadata and boundary behavior.
+    VirtualMemoryArena arena;
+    CHECK(arena.reserve(kImageBase, 0x10000, PageProtect::ReadWrite) == kImageBase);
+    CHECK(arena.commit(kImageBase, 0x4000, PageProtect::ReadWrite));
+    const ImportSlotBinding slots[] = {
+        {kIatRva, cache_thunk},
+        {kIatRva + 8, cache_thunk_alt},
+    };
+    CHECK(bind_import_slots(arena, kImageBase, slots) == 2);
+    uint64_t imp0 = 0;
+    uint64_t imp1 = 0;
+    CHECK(arena.read(kImageBase + kIatRva, &imp0, sizeof(imp0)));
+    CHECK(arena.read(kImageBase + kIatRva + 8, &imp1, sizeof(imp1)));
+
+    const uint64_t host_named = register_host_callable(cache_thunk, "named_callable");
+    const uint64_t host_unnamed = register_host_callable(cache_thunk_alt, nullptr);
+    CHECK(host_named != 0 && host_unnamed != 0);
+
+    CHECK(describe_synthetic(imp0, &info));
+    CHECK(info.is_import && info.thunk == cache_thunk && info.image_base == kImageBase &&
+          info.slot_rva == kIatRva && info.name == nullptr);
+    CHECK(describe_synthetic(imp1, &info));
+    CHECK(info.is_import && info.thunk == cache_thunk_alt && info.image_base == kImageBase &&
+          info.slot_rva == kIatRva + 8 && info.name == nullptr);
+    CHECK(describe_synthetic(host_named, &info));
+    CHECK(!info.is_import && info.thunk == cache_thunk && info.image_base == 0 &&
+          info.slot_rva == 0 && info.name != nullptr && std::strcmp(info.name, "named_callable") == 0);
+    CHECK(describe_synthetic(host_unnamed, &info));
+    CHECK(!info.is_import && info.thunk == cache_thunk_alt && info.name == nullptr);
+    CHECK(describe_synthetic(host_unnamed, nullptr));
+
+    // Misaligned offsets within bound slots and the next unbound slot return false.
+    CHECK(!describe_synthetic(host_named + 1, &info));
+    CHECK(!describe_synthetic(host_named + 8, &info));
+    CHECK(!describe_synthetic(host_unnamed + kSyntheticStride, &info));
+
+    // Multi-threaded concurrent indirect calls + describe_synthetic while synthetic storage
+    // grows across the initial 4096-entry snapshot capacity boundary.
+    static const LiftedFunctionEntry lifted[] = {{kCacheBase + 0x5000, cache_fn_a}};
+    static const Pg6ShardDispatchFn shards[] = {cache_shard};
+    static const Pg6ShardFunctionEntry shard_entries[] = {{kCacheBase + 0x5100, 0, 9}};
+    CHECK(register_lifted_functions(lifted));
+    CHECK(register_shard_table(shard_entries, 1, shards, 1));
+
+    constexpr int kWorkers = 6;
+    constexpr uint64_t kGrowRegistrations = 5200;  // crosses 4096 -> 8192 flat array growth
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0};
+    std::atomic<uint64_t> published_max{host_unnamed};
+    std::vector<std::thread> workers;
+    for (int w = 0; w < kWorkers; ++w) {
+        workers.emplace_back([&, w] {
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            uint64_t rng = 0x517CC1B727220A95ULL * static_cast<uint64_t>(w + 1);
+            while (!stop.load(std::memory_order_acquire)) {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+
+                // Hot indirect calls (lifted + shard + synthetic).
+                if (dispatch(kCacheBase + 0x5000) != 1 || dispatch(kCacheBase + 0x5100) != 19 ||
+                    dispatch(host_named) != 100 || dispatch(imp1) != 101) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                // Concurrent describe_synthetic on published, growing, and invalid addresses.
+                const uint64_t max_va = published_max.load(std::memory_order_acquire);
+                const uint64_t max_idx = (max_va - kSyntheticBase) / kSyntheticStride;
+                const uint64_t probe_idx = 1 + (rng % (max_idx + 128));
+                const uint64_t probe_va = kSyntheticBase + probe_idx * kSyntheticStride;
+                SyntheticTarget t{};
+                const bool found = describe_synthetic(probe_va, &t);
+                if (probe_idx <= max_idx && !found) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (found) {
+                    if (t.thunk == nullptr) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (!t.is_import && probe_va > host_unnamed &&
+                        (t.name == nullptr || std::strcmp(t.name, "grow_callable") != 0)) {
+                        errors.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                if (describe_synthetic(probe_va + 4, &t) ||
+                    describe_synthetic(kGuestReturnSentinel, &t) ||
+                    describe_synthetic(kSyntheticBase + kMaxSyntheticTargets * kSyntheticStride, &t)) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (uint64_t i = 0; i < kGrowRegistrations; ++i) {
+        const uint64_t va =
+            register_host_callable((i & 1) == 0 ? cache_thunk : cache_thunk_alt, "grow_callable");
+        CHECK(va != 0);
+        published_max.store(va, std::memory_order_release);
+        if (i == 2000) {
+            set_dispatch_cache_enabled(false);
+        } else if (i == 2100) {
+            set_dispatch_cache_enabled(true);
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    CHECK(errors.load() == 0);
+    // Final entry past the 4096 growth boundary is immediately dispatchable and describable.
+    const uint64_t final_va = published_max.load();
+    CHECK(describe_synthetic(final_va, &info));
+    CHECK(info.thunk == cache_thunk_alt && info.name != nullptr &&
+          std::strcmp(info.name, "grow_callable") == 0);
+    CHECK(dispatch(final_va) == 101);
+    CHECK(!describe_synthetic(final_va + kSyntheticStride, &info));
+    reset_guest_runtime();
+}
+
 }  // namespace
 
 int main() {
@@ -920,6 +1229,8 @@ int main() {
     test_dispatch_cache_semantics();
     test_dispatch_cache_collisions();
     test_dispatch_cache_concurrent_invalidation();
+    test_l1_dispatch_cache_and_observer();
+    test_describe_synthetic_bounds_and_concurrency();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_runtime failed with %d failure(s)\n", g_failures);
