@@ -209,9 +209,16 @@ void xma_worker() {
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(x.mutex);
-            // A 256-byte block of mono 16-bit PCM lasts 2.7 ms at 48 kHz.
-            x.wake.wait_for(lock, std::chrono::milliseconds(2), [&x] { return x.woken; });
+            if (x.stats.enabled_now == 0) {
+                x.wake.wait(lock, [&x] { return x.woken || x.stats.enabled_now != 0; });
+            } else {
+                // A 256-byte block of mono 16-bit PCM lasts 2.7 ms at 48 kHz.
+                x.wake.wait_for(lock, std::chrono::milliseconds(2), [&x] { return x.woken; });
+            }
             x.woken = false;
+            if (x.stats.enabled_now == 0) {
+                continue;
+            }
         }
         pump_enabled_voices();
     }
@@ -612,6 +619,9 @@ void push_bounded(std::deque<XApuResult>& queue, const XApuResult& result) {
     }
 }
 
+constexpr size_t kXApuMaxOutputFloats = kXApuMaxOutputBytes / sizeof(float);
+static_assert(kXApuMaxOutputBytes % sizeof(float) == 0);
+
 struct XApuState {
     std::mutex mutex;
     std::map<uint64_t, std::deque<XApuResult>> queues;  // handle -> pending results
@@ -620,6 +630,7 @@ struct XApuState {
     std::map<uint64_t, uint64_t> events;                // handle -> auto-reset result event (when asked for)
     std::map<uint64_t, size_t> limits;                  // handle -> max outstanding results (0 = unlimited)
     std::map<std::pair<uint64_t, uint32_t>, std::unique_ptr<xapu_opus::VoiceDecoder>> decoders;  // (handle, voice)
+    std::array<float, kXApuMaxOutputFloats> decode_pcm{};  // reusable decode scratch (guarded by mutex)
     uint64_t decoded_packets = 0;
     uint64_t failed_packets = 0;
     uint64_t decoded_bytes = 0;
@@ -664,13 +675,6 @@ xapu_connect::Params parse_connect_params(uint64_t params) {
         return {};
     }
     return xapu_connect::parse(w);
-}
-
-void signal_result_event(uint64_t handle) {  // the caller holds the lock
-    const auto e = xapu().events.find(handle);
-    if (e != xapu().events.end()) {
-        win32::SetEvent(static_cast<win32::Handle>(e->second));
-    }
 }
 
 HResult xapu_connect(uint64_t params, GuestPtr<uint64_t> shared, OutPtr out) {
@@ -797,13 +801,13 @@ XApuResult decode_command(uint64_t handle, const uint8_t* cmd) {
             decoder = std::make_unique<xapu_opus::VoiceDecoder>();
         }
         const size_t max_frames = capacity / (channels * sizeof(float));
-        std::vector<float> pcm(max_frames * channels);
+        float* pcm = s.decode_pcm.data();
         const uint32_t sample_rate = rate >= 1.0f && rate < 1.0e6f ? static_cast<uint32_t>(rate) : 48000u;
-        const int frames = decoder->decode(packet, packet_bytes, sample_rate, channels, pcm.data(), max_frames);
+        const int frames = decoder->decode(packet, packet_bytes, sample_rate, channels, pcm, max_frames);
         if (frames >= 0) {
             const uint32_t dropped = std::min<uint32_t>(skip, static_cast<uint32_t>(frames));
             const uint32_t bytes = (static_cast<uint32_t>(frames) - dropped) * channels * sizeof(float);
-            if (bytes == 0 || com::write_guest(output_va, pcm.data() + size_t{dropped} * channels, bytes)) {
+            if (bytes == 0 || com::write_guest(output_va, pcm + size_t{dropped} * channels, bytes)) {
                 ++s.decoded_packets;
                 s.decoded_bytes += bytes;
                 if (!s.decode_logged) {
@@ -868,43 +872,52 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (type == 3 && !com::read_guest(command, decode, sizeof(decode))) {
         return com::E_INVALIDARG_HR;
     }
-    std::lock_guard<std::mutex> lock(xapu().mutex);
-    auto it = xapu().queues.find(handle);
-    if (it == xapu().queues.end()) {
-        return com::E_INVALIDARG_HR;
-    }
-    if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
-        return kXApuQueueFull;
-    }
-    // Every command type is acknowledged with a result, in command order. The title sends only types
-    // 1, 2, 3 and 5 and its drain loop ignores other result types (see the model notes above).
-    const bool acknowledged = true;
-    if (++xapu().commands[type] == 1) {
-        diag("XApu: first command of type " + std::to_string(type) +
-             (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
-    }
-    if (audio_trace_enabled()) {
-        trace_command(handle, type, head[1]);
-    }
-    if (type == 1 || type == 2) {
-        // The voice starts or is freed: its next packet begins a new stream.
-        auto d = xapu().decoders.find({handle, head[1]});
-        if (d != xapu().decoders.end()) {
-            d->second->reset();
+    uint64_t result_event = 0;
+    {
+        std::lock_guard<std::mutex> lock(xapu().mutex);
+        auto it = xapu().queues.find(handle);
+        if (it == xapu().queues.end()) {
+            return com::E_INVALIDARG_HR;
+        }
+        if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
+            return kXApuQueueFull;
+        }
+        // Every command type is acknowledged with a result, in command order. The title sends only types
+        // 1, 2, 3 and 5 and its drain loop ignores other result types (see the model notes above).
+        const bool acknowledged = true;
+        if (++xapu().commands[type] == 1) {
+            diag("XApu: first command of type " + std::to_string(type) +
+                 (acknowledged ? ": acknowledged with a result" : ": accepted without a result"));
+        }
+        if (audio_trace_enabled()) {
+            trace_command(handle, type, head[1]);
+        }
+        if (type == 1 || type == 2) {
+            // The voice starts or is freed: its next packet begins a new stream.
+            auto d = xapu().decoders.find({handle, head[1]});
+            if (d != xapu().decoders.end()) {
+                d->second->reset();
+            }
+        }
+        if (type == 3) {
+            push_bounded(it->second, decode_command(handle, decode));
+            ++xapu().type3_results;
+        } else {
+            push_bounded(it->second, make_result(type, head[1]));
+        }
+        if (type != 1 && type != 2 && type != 3 && type != 5) {
+            ++xapu().unhandled;  // no behaviour modelled for this type (still acknowledged)
+        }
+        ++xapu().results_posted;
+        if (const auto e = xapu().events.find(handle); e != xapu().events.end()) {
+            result_event = e->second;
         }
     }
-    if (type == 3) {
-        push_bounded(it->second, decode_command(handle, decode));
-        ++xapu().type3_results;
-    } else {
-        push_bounded(it->second, make_result(type, head[1]));
+    // The result is ready now: wake the title's audio thread after releasing xapu().mutex so the
+    // woken consumer does not immediately stall trying to acquire the lock.
+    if (result_event != 0) {
+        win32::SetEvent(static_cast<win32::Handle>(result_event));
     }
-    if (type != 1 && type != 2 && type != 3 && type != 5) {
-        ++xapu().unhandled;  // no behaviour modelled for this type (still acknowledged)
-    }
-    ++xapu().results_posted;
-    // The result is ready now: wake the title's audio thread (auto-reset event, if connected with one).
-    signal_result_event(handle);
     return kOk;
 }
 
