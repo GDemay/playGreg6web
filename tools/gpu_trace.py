@@ -3,7 +3,7 @@
 
 Matches the packet layout in `runtime/abi/playgta6_abi.h` and
 `docs/gpu_commands.md` (v1 opcodes 0..21, v2 opcodes 22..34, plus forward-compatible
-handling of unknown/future opcodes >= 35).
+handling of unknown/future opcodes >= 39).
 
 Pure Python 3.12 stdlib only (zero external dependencies). Usable both as an
 importable library and as a CLI:
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import re
 import struct
 import sys
@@ -51,6 +52,7 @@ DRAW_INDEXED_STRUCT = struct.Struct("<IIIiI")  # 20 bytes
 CREATE_COMPUTE_PIPELINE_STRUCT = struct.Struct("<IIII")  # 16 bytes
 SET_COMPUTE_PIPELINE_STRUCT = struct.Struct("<I")  # 4 bytes
 DISPATCH_COMPUTE_STRUCT = struct.Struct("<III")  # 12 bytes
+INDIRECT_STRUCT = struct.Struct("<IIQ")  # 16 bytes (GpuIndirectPayload)
 
 # Packet ABI v2 (opcodes 22..34).
 TEXTURE_VIEW_DESC_STRUCT = struct.Struct("<BBBBHHII")  # 16 bytes
@@ -144,6 +146,11 @@ class GpuOpcode(IntEnum):
     SetBindGroup2 = 33
     CreateSampler2 = 34
     CreateTexture2 = 35
+    DrawIndirect = 36
+    DrawIndexedIndirect = 37
+    DispatchIndirect = 38
+    ReadbackBuffer = 39
+    ReadbackTexture = 40
 
 
 class GpuTextureFormat(IntEnum):
@@ -621,6 +628,20 @@ class DecodedTrace:
         )
 
     @property
+    def present_count(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.Present and p.valid)
+
+    def cadence_30fps(self) -> dict[str, Any]:
+        """Compute deterministic 30 FPS draw/present cadence summary for this trace."""
+        samples = _build_trace_frame_samples(self)
+        return compute_30fps_cadence(
+            present_count=self.present_count,
+            draw_calls=self.draw_calls,
+            frame_durations_ms=[s.frame_ms for s in samples],
+            frame_budget_ms=DEFAULT_30FPS_BUDGET_MS,
+        )
+
+    @property
     def draw_indexed_calls(self) -> int:
         return sum(1 for p in self.packets if p.opcode == GpuOpcode.DrawIndexed and p.valid)
 
@@ -753,6 +774,21 @@ class DecodedTrace:
         budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
         top_n: int = DEFAULT_TOP_N,
     ) -> dict[str, Any]:
+        fps30_report = (
+            analyze_30fps_trace(self, budget_ms=budget_ms, top_n=top_n)
+            if analyze_30fps
+            else None
+        )
+        if fps30_report is not None:
+            cadence = {
+                "frame_budget_ms": fps30_report["frame_budget_ms"],
+                "present_fps_avg": fps30_report["present_fps_avg"],
+                "draws_per_present_avg": fps30_report["draws_per_present_avg"],
+                "over_budget_frames_30fps": fps30_report["over_budget_frames_30fps"],
+            }
+        else:
+            cadence = self.cadence_30fps()
+
         result: dict[str, Any] = {
             "abi_version": self.abi_version,
             "strict": self.strict,
@@ -784,6 +820,10 @@ class DecodedTrace:
             "malformed_v2_packets": self.malformed_v2_packets,
             "truncated_v2_diagnostics": self.truncated_v2_diagnostics,
             "unknown_opcode_count": self.unknown_opcode_count,
+            "frame_budget_ms": cadence["frame_budget_ms"],
+            "present_fps_avg": cadence["present_fps_avg"],
+            "draws_per_present_avg": cadence["draws_per_present_avg"],
+            "over_budget_frames_30fps": cadence["over_budget_frames_30fps"],
             "opcode_histogram": dict(self.opcode_histogram),
             "frames": [frame.to_dict() for frame in self.frames],
             "diagnostics": [diag.to_dict() for diag in self.diagnostics],
@@ -798,12 +838,8 @@ class DecodedTrace:
             result["bink_video_audit"] = audit_bink_video(self)
         if start_screen_skips:
             result["start_screen_skips"] = audit_start_screen_skips(self)
-        if analyze_30fps:
-            result["fps30_analysis"] = analyze_30fps_trace(
-                self,
-                budget_ms=budget_ms,
-                top_n=top_n,
-            )
+        if fps30_report is not None:
+            result["fps30_analysis"] = fps30_report
         return result
 
 
@@ -3004,6 +3040,15 @@ def _decode_v2_payload(
             ],
             **extra,
         }, True
+
+    if opcode in (GpuOpcode.DrawIndirect, GpuOpcode.DrawIndexedIndirect, GpuOpcode.DispatchIndirect):
+        can_decode, extra = fixed_fields(INDIRECT_STRUCT.size)
+        if not can_decode:
+            return extra, False
+        buffer_id, _reserved, indirect_offset = INDIRECT_STRUCT.unpack_from(payload, 0)
+        if indirect_offset % 4:
+            ctx.warn("unaligned_indirect_offset", f"indirect offset {indirect_offset} is not a multiple of 4")
+        return {"buffer_id": buffer_id, "offset": indirect_offset, **extra}, True
 
     raise AssertionError(f"Unhandled v2 opcode: {opcode}")
 
@@ -5659,10 +5704,258 @@ _HOST_PATH_RE = re.compile(
     r"\.(?:wgsl|rpf|xvd|xvc|ttpf|awc|pg6trace|bin|exe|dll|pdb)\b)",
     re.IGNORECASE,
 )
+_FILE_URI_RE = re.compile(r"(?i)file://[^\s\"'<>|,;()\[\]]*")
+_UNC_PATH_RE = re.compile(
+    r"\\\\[^\\\s\"'<>|,;()\[\]]+\\[^\\\s\"'<>|,;()\[\]]+(?:\\[^\s\"'<>|,;()\[\]]+)*"
+    r"(?:\s+[^\s\"'<>|,;()\[\]]*\\[^\s\"'<>|,;()\[\]]+)*"
+)
+_WIN_ABS_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])[A-Za-z]:[\\/](?:[^\s\"'<>|,;()\[\]]+"
+    r"(?:\s+[^\s\"'<>|,;()\[\]]*[\\/][^\s\"'<>|,;()\[\]]+)*)?"
+)
+_UNIX_HOST_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|tmp|var|private|mnt|root|opt|srv|Volumes|etc|proc)"
+    r"(?:/[^\s\"'<>|,;()\[\]]*(?:\s+[^\s\"'<>|,;()\[\]]*/[^\s\"'<>|,;()\[\]]+)*)?"
+)
+_REL_USER_PATH_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_.-])(?:\.\.[\\/]+)*(?:Users|home)[\\/][^\s\"'<>|,;()\[\]]*"
+)
+_SAFE_NON_USERNAME_TOKENS: frozenset[str] = frozenset(
+    {
+        "admin",
+        "blend",
+        "buffer",
+        "clear",
+        "complete",
+        "compute",
+        "debug",
+        "default",
+        "draw",
+        "error",
+        "false",
+        "fragment",
+        "frame",
+        "gpu",
+        "guest",
+        "incomplete",
+        "info",
+        "json",
+        "layout",
+        "load",
+        "local",
+        "none",
+        "null",
+        "pass",
+        "pipeline",
+        "present",
+        "render",
+        "root",
+        "sampler",
+        "scissor",
+        "shader",
+        "stencil",
+        "store",
+        "swapchain",
+        "system",
+        "test",
+        "texture",
+        "trace",
+        "true",
+        "unknown",
+        "user",
+        "vertex",
+        "viewport",
+        "warning",
+    }
+)
 _CHROME_FRAME_NAME_RE = re.compile(
     r"^(?:frame|gpu_?frame|render_?frame|main_?frame|present_?frame|begin_?frame)$",
     re.IGNORECASE,
 )
+
+
+def _current_host_usernames() -> tuple[str, ...]:
+    names: list[str] = []
+    for candidate in (
+        os.environ.get("USERNAME", ""),
+        os.environ.get("USER", ""),
+        os.environ.get("LOGNAME", ""),
+    ):
+        cleaned = candidate.strip()
+        if len(cleaned) >= 3 and cleaned.lower() not in _SAFE_NON_USERNAME_TOKENS:
+            if not (len(cleaned) <= 4 and all(ch in "0123456789abcdefABCDEF" for ch in cleaned)):
+                if cleaned not in names:
+                    names.append(cleaned)
+    try:
+        home_name = Path.home().name.strip()
+        if len(home_name) >= 3 and home_name.lower() not in _SAFE_NON_USERNAME_TOKENS:
+            if not (len(home_name) <= 4 and all(ch in "0123456789abcdefABCDEF" for ch in home_name)):
+                if home_name not in names:
+                    names.append(home_name)
+    except (OSError, RuntimeError):
+        pass
+    return tuple(names)
+
+
+def _current_host_home_prefixes() -> tuple[str, ...]:
+    prefixes: list[str] = []
+    seen: set[str] = set()
+    try:
+        home = Path.home()
+        candidates = (home, home.resolve())
+    except (OSError, RuntimeError):
+        return ()
+    for item in candidates:
+        for variant in (str(item), str(item).replace("\\", "/")):
+            cleaned = variant.rstrip("\\/")
+            if len(cleaned) < 4:
+                continue
+            key = cleaned.lower() if os.name == "nt" else cleaned
+            if key not in seen:
+                seen.add(key)
+                prefixes.append(cleaned)
+    prefixes.sort(key=len, reverse=True)
+    return tuple(prefixes)
+
+
+def _basename_from_path_text(raw: str) -> str:
+    parts = [p for p in re.split(r"[\\/]+", raw) if p]
+    if not parts:
+        return "<redacted>"
+    if len(parts[0]) == 2 and parts[0][1] == ":":
+        parts = parts[1:]
+    if not parts:
+        return "<redacted>"
+    if len(parts) <= 2 and parts[0].lower() in {"users", "home"}:
+        return "<redacted>"
+    return parts[-1]
+
+
+def sanitize_path_label(value: str | Path) -> str:
+    """Reduce any host/absolute/traversal path to a safe basename or redacted label."""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if (
+        re.match(r"(?i)^file://", text)
+        or re.match(r"(?i)^[A-Za-z]:[\\/]", text)
+        or text.startswith(("/", "\\"))
+        or ".." in re.split(r"[\\/]+", text)
+    ):
+        return _basename_from_path_text(text)
+    normalized = text.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p and p != "."]
+    if parts and parts[0].lower() in {"users", "home"}:
+        return _basename_from_path_text(normalized)
+    return "/".join(parts)
+
+
+def sanitize_text(text: str) -> str:
+    """Scrub host filesystem paths, file:// URIs, and host usernames from arbitrary text."""
+    if not text:
+        return text
+    out = _FILE_URI_RE.sub("<redacted-path>", text)
+    for prefix in _current_host_home_prefixes():
+        flags = re.IGNORECASE if (os.name == "nt" or re.match(r"^[A-Za-z]:", prefix)) else 0
+        out = re.sub(
+            rf"{re.escape(prefix)}(?:[\\/][^\s\"'<>|,;()\[\]]*)?",
+            "<redacted-path>",
+            out,
+            flags=flags,
+        )
+    out = _UNC_PATH_RE.sub("<redacted-path>", out)
+    out = _WIN_ABS_PATH_RE.sub("<redacted-path>", out)
+    out = _UNIX_HOST_PATH_RE.sub("<redacted-path>", out)
+    out = _REL_USER_PATH_RE.sub("<redacted-path>", out)
+    for username in _current_host_usernames():
+        out = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+            "<redacted-user>",
+            out,
+            flags=re.IGNORECASE,
+        )
+    return out
+
+
+def sanitize_json_payload(value: Any) -> Any:
+    """Recursively sanitize a JSON-serializable payload so host paths and usernames never leak."""
+    if isinstance(value, Path):
+        return sanitize_text(str(value))
+    if isinstance(value, str):
+        return sanitize_text(value)
+    if isinstance(value, dict):
+        return {
+            (sanitize_text(k) if isinstance(k, str) else k): sanitize_json_payload(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [sanitize_json_payload(item) for item in value]
+    return value
+
+
+def compute_30fps_cadence(
+    *,
+    present_count: int,
+    draw_calls: int,
+    frame_durations_ms: Sequence[float] = (),
+    total_span_ms: float | None = None,
+    frame_budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+) -> dict[str, Any]:
+    """Compute deterministic 30 FPS draw/present cadence summary with zero-division guards."""
+    if isinstance(frame_budget_ms, bool) or not isinstance(frame_budget_ms, (int, float)):
+        raise ValueError(
+            f"frame_budget_ms must be a positive finite number, got {frame_budget_ms!r}"
+        )
+    budget_val = float(frame_budget_ms)
+    if not math.isfinite(budget_val) or budget_val <= 0.0:
+        raise ValueError(
+            f"frame_budget_ms must be a positive finite number, got {frame_budget_ms!r}"
+        )
+    budget = round(budget_val, 3)
+
+    presents = (
+        present_count
+        if (not isinstance(present_count, bool) and isinstance(present_count, int) and present_count > 0)
+        else 0
+    )
+    draws = (
+        draw_calls
+        if (not isinstance(draw_calls, bool) and isinstance(draw_calls, int) and draw_calls > 0)
+        else 0
+    )
+    finite_durations = [
+        float(d)
+        for d in frame_durations_ms
+        if not isinstance(d, bool)
+        and isinstance(d, (int, float))
+        and math.isfinite(float(d))
+        and float(d) >= 0.0
+    ]
+
+    if total_span_ms is None:
+        span_ms = sum(finite_durations)
+    elif (
+        not isinstance(total_span_ms, bool)
+        and isinstance(total_span_ms, (int, float))
+        and math.isfinite(float(total_span_ms))
+        and float(total_span_ms) > 0.0
+    ):
+        span_ms = float(total_span_ms)
+    else:
+        span_ms = 0.0
+
+    present_fps_avg = (
+        round((presents * 1000.0) / span_ms, 3) if (presents > 0 and span_ms > 0.0) else 0.0
+    )
+    draws_per_present_avg = round(draws / presents, 3) if presents > 0 else 0.0
+    over_budget_frames_30fps = sum(1 for d in finite_durations if d > budget)
+
+    return {
+        "frame_budget_ms": budget,
+        "present_fps_avg": present_fps_avg,
+        "draws_per_present_avg": draws_per_present_avg,
+        "over_budget_frames_30fps": over_budget_frames_30fps,
+    }
 
 
 def _validate_budget_and_top_n(budget_ms: float, top_n: int) -> tuple[float, int]:
@@ -5876,6 +6169,18 @@ class _FrameSample:
     rt_allocs: int
     sync_stall_ms: float
     passes: tuple[_PassSample, ...]
+    presents: int = 1
+
+
+def _extract_present_count(obj: dict[str, Any], *, default: int = 1) -> int:
+    for key in ("presents", "present_count", "presentCount"):
+        if key in obj and obj[key] is not None:
+            val = _as_non_negative_int(obj[key])
+            if val is not None:
+                return val
+    if isinstance(obj.get("presented"), bool):
+        return 1 if obj["presented"] else 0
+    return default
 
 
 def _extract_duration_ms(obj: dict[str, Any], *, allow_chrome_dur_us: bool = False) -> float | None:
@@ -6163,6 +6468,7 @@ def _build_frame_sample_from_dict(
             rt_allocs=int(counters.get("rt_allocs", 0)),
             sync_stall_ms=float(counters.get("sync_stall_ms", 0.0)),
             passes=tuple(passes),
+            presents=_extract_present_count(obj, default=1),
         ),
         malformed,
     )
@@ -6319,6 +6625,7 @@ def _parse_chrome_trace_events(
                     rt_allocs=int(counters.get("rt_allocs", 0)),
                     sync_stall_ms=float(counters.get("sync_stall_ms", 0.0)),
                     passes=tuple(passes),
+                    presents=_extract_present_count(args, default=1),
                 )
             )
         return frames, malformed
@@ -6337,12 +6644,15 @@ def _parse_chrome_trace_events(
         for f_idx in sorted(grouped):
             items = grouped[f_idx]
             passes = []
+            group_draws = 0
             for dur_ms, name_str, cat_str, args in items:
                 explicit = args.get("cause") or args.get("category") or cat_str
+                item_counters = _extract_frame_counters(args)
+                group_draws += int(item_counters.get("draw_calls", 0))
                 cause = classify_spike_cause(
                     name_str,
                     explicit_cause=explicit if isinstance(explicit, str) else None,
-                    counters=_extract_frame_counters(args),
+                    counters=item_counters,
                 )
                 passes.append(_PassSample(name=_sanitize_marker_name(name_str), duration_ms=dur_ms, cause=cause))
             total_ms = sum(p.duration_ms for p in passes)
@@ -6360,23 +6670,25 @@ def _parse_chrome_trace_events(
                     top_pass=best_p.name,
                     top_pass_ms=best_p.duration_ms,
                     phase=None,
-                    draw_calls=0,
+                    draw_calls=group_draws,
                     compute_dispatches=0,
                     pso_compiles=0,
                     upload_bytes=0,
                     rt_allocs=0,
                     sync_stall_ms=0.0,
                     passes=tuple(passes),
+                    presents=1,
                 )
             )
         return frames, malformed
 
     for idx, (dur_ms, name_str, cat_str, args) in enumerate(ungrouped):
         explicit = args.get("cause") or args.get("category") or cat_str
+        item_counters = _extract_frame_counters(args)
         cause = classify_spike_cause(
             name_str,
             explicit_cause=explicit if isinstance(explicit, str) else None,
-            counters=_extract_frame_counters(args),
+            counters=item_counters,
         )
         sanitized = _sanitize_marker_name(name_str)
         ps = _PassSample(name=sanitized, duration_ms=dur_ms, cause=cause)
@@ -6388,13 +6700,14 @@ def _parse_chrome_trace_events(
                 top_pass=sanitized,
                 top_pass_ms=dur_ms,
                 phase=_sanitize_phase_name(args.get("phase")),
-                draw_calls=0,
+                draw_calls=int(item_counters.get("draw_calls", 0)),
                 compute_dispatches=0,
                 pso_compiles=0,
                 upload_bytes=0,
                 rt_allocs=0,
                 sync_stall_ms=0.0,
                 passes=(ps,),
+                presents=_extract_present_count(args, default=1),
             )
         )
     return frames, malformed
@@ -6729,17 +7042,28 @@ def _summarize_frame_samples(
     else:
         ok = not has_error
 
+    cadence = compute_30fps_cadence(
+        present_count=sum(s.presents for s in samples),
+        draw_calls=sum(s.draw_calls for s in samples),
+        frame_durations_ms=[s.frame_ms for s in samples],
+        frame_budget_ms=DEFAULT_30FPS_BUDGET_MS,
+    )
+
     return {
         "schema_version": SPIKE_ANALYSIS_SCHEMA_VERSION,
         "source_kind": source_kind,
         "timing_source": timing_source,
         "ok": ok,
         "budget_ms": round(budget_ms, 3),
+        "frame_budget_ms": cadence["frame_budget_ms"],
         "target_fps": round(1000.0 / budget_ms, 3),
         "total_frames": total_frames,
         "frames_within_budget": within,
         "frames_over_budget": over,
+        "over_budget_frames_30fps": cadence["over_budget_frames_30fps"],
         "fps30_compliance_rate": compliance_rate,
+        "present_fps_avg": cadence["present_fps_avg"],
+        "draws_per_present_avg": cadence["draws_per_present_avg"],
         "avg_frame_ms": avg_ms,
         "min_frame_ms": min_ms,
         "p50_ms": p50_ms,
@@ -6812,19 +7136,8 @@ def analyze_30fps_frames(
     )
 
 
-def analyze_30fps_trace(
-    trace: DecodedTrace,
-    *,
-    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
-    top_n: int = DEFAULT_TOP_N,
-) -> dict[str, Any]:
-    """Analyze a binary DecodedTrace for 30 FPS frame-budget spikes and GPU command hotspots.
-
-    Binary `.pg6trace` command streams do not carry wall-clock GPU timestamps, so per-frame
-    and per-pass durations are derived from a deterministic packet workload model
-    (`timing_source="estimated"`). Output is strictly sanitized.
-    """
-    budget, limit = _validate_budget_and_top_n(budget_ms, top_n)
+def _build_trace_frame_samples(trace: DecodedTrace) -> list[_FrameSample]:
+    """Derive deterministic per-frame workload estimates from a decoded binary GPU trace."""
     samples: list[_FrameSample] = []
 
     for frame in trace.frames:
@@ -6839,6 +7152,7 @@ def analyze_30fps_trace(
         sync_stall_ms = 0.0
         draw_calls = 0
         compute_dispatches = 0
+        presents = 0
         pass_list: list[_PassSample] = []
 
         render_pass_idx = 0
@@ -6865,7 +7179,9 @@ def analyze_30fps_trace(
                 continue
             op = pkt.opcode
             f = pkt.fields
-            if op == GpuOpcode.CreateShaderModule:
+            if op == GpuOpcode.Present:
+                presents += 1
+            elif op == GpuOpcode.CreateShaderModule:
                 pso_compiles += 1
                 pso_compile_ms += 3.5
             elif op in (GpuOpcode.CreateRenderPipeline, GpuOpcode.CreateRenderPipeline2):
@@ -6957,8 +7273,27 @@ def analyze_30fps_trace(
                 rt_allocs=rt_allocs,
                 sync_stall_ms=sync_stall_ms,
                 passes=tuple(pass_list),
+                presents=presents,
             )
         )
+
+    return samples
+
+
+def analyze_30fps_trace(
+    trace: DecodedTrace,
+    *,
+    budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
+    top_n: int = DEFAULT_TOP_N,
+) -> dict[str, Any]:
+    """Analyze a binary DecodedTrace for 30 FPS frame-budget spikes and GPU command hotspots.
+
+    Binary `.pg6trace` command streams do not carry wall-clock GPU timestamps, so per-frame
+    and per-pass durations are derived from a deterministic packet workload model
+    (`timing_source="estimated"`). Output is strictly sanitized.
+    """
+    budget, limit = _validate_budget_and_top_n(budget_ms, top_n)
+    samples = _build_trace_frame_samples(trace)
 
     trace_diags = [
         {
@@ -6999,7 +7334,7 @@ def _is_timing_log_input(raw_bytes: bytes | bytearray | memoryview, source_hint:
         return True
     if len(raw) >= HEADER_SIZE:
         opcode, _flags, payload_bytes = HEADER_STRUCT.unpack_from(raw, 0)
-        if opcode <= GpuOpcode.CreateTexture2 and (HEADER_SIZE + payload_bytes) <= len(raw):
+        if opcode <= GpuOpcode.DispatchIndirect and (HEADER_SIZE + payload_bytes) <= len(raw):
             return False
         if (HEADER_SIZE + payload_bytes) <= len(raw):
             try:
@@ -7079,6 +7414,12 @@ def format_30fps_analysis_text(report: dict[str, Any]) -> str:
             f"max={float(report['max_frame_ms']):.3f}"
         ),
         (
+            f"  Cadence (30 FPS): present_fps_avg={float(report.get('present_fps_avg', 0.0)):.3f} | "
+            f"draws_per_present_avg={float(report.get('draws_per_present_avg', 0.0)):.3f} | "
+            f"over_budget_frames_30fps={int(report.get('over_budget_frames_30fps', over))} "
+            f"(frame_budget_ms={float(report.get('frame_budget_ms', DEFAULT_30FPS_BUDGET_MS)):.3f})"
+        ),
+        (
             f"  Budget Excess: total={float(report['total_over_budget_ms']):.3f} ms | "
             f"max={float(report['max_over_budget_ms']):.3f} ms | "
             f"malformed_records={int(report['malformed_records'])}"
@@ -7144,8 +7485,8 @@ def format_30fps_analysis_text(report: dict[str, Any]) -> str:
 
 
 def fps30_analysis_to_json(report: dict[str, Any], *, indent: int = 2) -> str:
-    """Serialize a 30 FPS spike analysis dictionary to deterministic formatted JSON."""
-    return json.dumps(report, indent=indent, allow_nan=False)
+    """Serialize a 30 FPS spike analysis dictionary to deterministic sanitized JSON."""
+    return json.dumps(sanitize_json_payload(report), indent=indent, allow_nan=False)
 
 
 # ---------------------------------------------------------------------------
@@ -7557,8 +7898,8 @@ def trace_to_json(
     top_n: int = DEFAULT_TOP_N,
     indent: int = 2,
 ) -> str:
-    """Serialize a DecodedTrace to formatted JSON."""
-    return json.dumps(
+    """Serialize a DecodedTrace to deterministic sanitized JSON."""
+    payload = sanitize_json_payload(
         trace.to_dict(
             stats_only=stats_only,
             shader_summary=shader_summary,
@@ -7568,9 +7909,9 @@ def trace_to_json(
             analyze_30fps=analyze_30fps,
             budget_ms=budget_ms,
             top_n=top_n,
-        ),
-        indent=indent,
+        )
     )
+    return json.dumps(payload, indent=indent, allow_nan=False)
 
 
 # ---------------------------------------------------------------------------
@@ -7601,7 +7942,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--strict",
         action="store_true",
         help=(
-            "Fail with non-zero exit code on unknown opcodes (>= 35), "
+            "Fail with non-zero exit code on unknown opcodes (>= 39), "
             "size mismatches, or malformed/truncated packets or timing records."
         ),
     )
@@ -7688,7 +8029,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             budget_ms, top_n = _validate_budget_and_top_n(budget_ms, args.top_n)
         except ValueError as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(f"Error: {sanitize_text(str(exc))}", file=sys.stderr)
             return 2
     else:
         top_n = args.top_n
@@ -7699,7 +8040,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         path = Path(args.trace_file)
         if not path.is_file():
-            print(f"Error: trace file not found: {path}", file=sys.stderr)
+            print(f"Error: trace file not found: {sanitize_path_label(path)}", file=sys.stderr)
             return 2
         raw_bytes = path.read_bytes()
         source_hint = args.trace_file

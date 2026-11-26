@@ -1885,5 +1885,274 @@ class TestWasm64FastBootCliAndSanitization(unittest.TestCase):
         self.assertNotRegex(blob, r"[A-Za-z]:[\\/]")
 
 
+# ---------------------------------------------------------------------------
+# T83: Fast-boot shard balance summary metrics & strict JSON path sanitization
+# ---------------------------------------------------------------------------
+
+
+class TestFastBootShardBalanceSummaryT83(unittest.TestCase):
+    def test_balanced_shards_metrics_and_determinism(self) -> None:
+        mib = 1024 * 1024
+        summary = arb.compute_shard_balance_summary([2 * mib, 2 * mib, 2 * mib])
+        self.assertEqual(
+            summary,
+            {
+                "shard_count": 3,
+                "max_shard_mib": 2.0,
+                "total_mib": 6.0,
+                "balance_ratio": 1.0,
+            },
+        )
+        # Permutation invariance / determinism.
+        s1 = arb.compute_shard_balance_summary([1 * mib, 3 * mib, 2 * mib])
+        s2 = arb.compute_shard_balance_summary([3 * mib, 2 * mib, 1 * mib])
+        self.assertEqual(s1, s2)
+        self.assertEqual(s1["shard_count"], 3)
+        self.assertEqual(s1["max_shard_mib"], 3.0)
+        self.assertEqual(s1["total_mib"], 6.0)
+        self.assertEqual(s1["balance_ratio"], 1.5)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = _stage_fast_boot_dist(
+                Path(tmp) / "balanced_dist",
+                part_sizes=[1024 * 1024, 1024 * 1024],
+            )
+            j_code, j_out, j_err = _run_cli(["--dist-dir", str(dist), "--json"])
+            t_code, t_out, t_err = _run_cli(["--dist-dir", str(dist)])
+            m_code, m_out, m_err = _run_cli(["--dist-dir", str(dist), "--markdown"])
+
+        self.assertEqual((j_code, j_err), (0, ""))
+        self.assertEqual((t_code, t_err), (0, ""))
+        self.assertEqual((m_code, m_err), (0, ""))
+        payload = json.loads(j_out)
+        fb = payload["wasm64_fast_boot"]
+        expected = {
+            "shard_count": 2,
+            "max_shard_mib": 1.0,
+            "total_mib": 2.0,
+            "balance_ratio": 1.0,
+        }
+        self.assertEqual(fb["shard_balance"], expected)
+        for key, val in expected.items():
+            self.assertEqual(fb["split_balance"][key], val)
+        self.assertIn(
+            "shard balance: shards 2, max_shard_mib 1.0000 MiB, total_mib 2.0000 MiB, balance_ratio 1.0000x",
+            t_out,
+        )
+        self.assertIn(
+            "Shard balance: **2** shards, max **1.0000 MiB**, total **2.0000 MiB**, balance ratio **1.0000x**",
+            m_out,
+        )
+
+    def test_skewed_shards_metrics_in_fast_boot_and_wasm_footprint(self) -> None:
+        mib = 1024 * 1024
+        skewed = arb.compute_shard_balance_summary([8 * mib, 1 * mib, 1 * mib])
+        self.assertEqual(
+            skewed,
+            {
+                "shard_count": 3,
+                "max_shard_mib": 8.0,
+                "total_mib": 10.0,
+                "balance_ratio": 2.4,
+            },
+        )
+        with_empty = arb.compute_shard_balance_summary([4 * mib, 0])
+        self.assertEqual(
+            with_empty,
+            {
+                "shard_count": 2,
+                "max_shard_mib": 4.0,
+                "total_mib": 4.0,
+                "balance_ratio": 2.0,
+            },
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = _stage_fast_boot_dist(
+                Path(tmp) / "skewed_dist",
+                part_sizes=[8000, 1000, 1000],
+            )
+            code, out, err = _run_cli(["--dist-dir", str(dist), "--json"])
+            _, txt_out, _ = _run_cli(["--dist-dir", str(dist)])
+
+            # Multi-module guest_manifest.json footprint also exposes shard_balance (2 MiB + 1 MiB).
+            gm_dir = Path(tmp) / "gm_only"
+            gm_dir.mkdir()
+            (gm_dir / "guest_manifest.json").write_text(
+                json.dumps(_guest_manifest()), encoding="utf-8"
+            )
+            gm_code, gm_json, gm_err = _run_cli([str(gm_dir), "--json"])
+            _, gm_txt, _ = _run_cli([str(gm_dir)])
+            _, gm_md, _ = _run_cli([str(gm_dir), "--markdown"])
+
+        self.assertEqual((code, err), (0, ""))
+        fb = json.loads(out)["wasm64_fast_boot"]
+        self.assertEqual(fb["shard_balance"]["shard_count"], 3)
+        self.assertAlmostEqual(fb["shard_balance"]["max_shard_mib"], round(8000 / mib, 4), places=4)
+        self.assertAlmostEqual(fb["shard_balance"]["total_mib"], round(10000 / mib, 4), places=4)
+        self.assertAlmostEqual(fb["shard_balance"]["balance_ratio"], 2.4, places=4)
+        self.assertTrue(fb["split_balance"]["dominant_shard_warning"])
+        self.assertIn("balance_ratio 2.4000x", txt_out)
+
+        self.assertEqual((gm_code, gm_err), (0, ""))
+        gm_payload = json.loads(gm_json)
+        self.assertEqual(
+            gm_payload["wasm_footprint"]["shard_balance"],
+            {
+                "shard_count": 2,
+                "max_shard_mib": 2.0,
+                "total_mib": 3.0,
+                "balance_ratio": 1.3333,
+            },
+        )
+        self.assertIn(
+            "shard balance: shards 2, max_shard_mib 2.0000 MiB, total_mib 3.0000 MiB, balance_ratio 1.3333x",
+            gm_txt,
+        )
+        self.assertIn(
+            "Shard balance: **2** shards, max **2.0000 MiB**, total **3.0000 MiB**, balance ratio **1.3333x**",
+            gm_md,
+        )
+
+    def test_zero_shard_and_zero_byte_zero_division_guard(self) -> None:
+        empty = arb.compute_shard_balance_summary([])
+        self.assertEqual(
+            empty,
+            {
+                "shard_count": 0,
+                "max_shard_mib": 0.0,
+                "total_mib": 0.0,
+                "balance_ratio": 0.0,
+            },
+        )
+        all_zero = arb.compute_shard_balance_summary([0, 0, 0])
+        self.assertEqual(
+            all_zero,
+            {
+                "shard_count": 3,
+                "max_shard_mib": 0.0,
+                "total_mib": 0.0,
+                "balance_ratio": 0.0,
+            },
+        )
+        neg_clamped = arb.compute_shard_balance_summary([-1024, 0])
+        self.assertEqual(
+            neg_clamped,
+            {
+                "shard_count": 2,
+                "max_shard_mib": 0.0,
+                "total_mib": 0.0,
+                "balance_ratio": 0.0,
+            },
+        )
+
+        # Zero-shard dist directory must never divide by zero in JSON, text, or Markdown.
+        with tempfile.TemporaryDirectory() as tmp:
+            dist = _stage_fast_boot_dist(Path(tmp) / "empty_parts", part_sizes=[])
+            j_code, j_out, j_err = _run_cli(["--dist-dir", str(dist), "--json"])
+            t_code, t_out, t_err = _run_cli(["--dist-dir", str(dist)])
+            m_code, m_out, m_err = _run_cli(["--dist-dir", str(dist), "--markdown"])
+
+        self.assertEqual((j_code, j_err), (0, ""))
+        self.assertEqual((t_code, t_err), (0, ""))
+        self.assertEqual((m_code, m_err), (0, ""))
+        fb = json.loads(j_out)["wasm64_fast_boot"]
+        self.assertEqual(fb["shard_balance"], empty)
+        self.assertEqual(fb["split_balance"]["shard_count"], 0)
+        self.assertEqual(fb["split_balance"]["max_shard_mib"], 0.0)
+        self.assertEqual(fb["split_balance"]["total_mib"], 0.0)
+        self.assertEqual(fb["split_balance"]["balance_ratio"], 0.0)
+        self.assertIn("shard balance: shards 0, max_shard_mib 0.0000 MiB, total_mib 0.0000 MiB, balance_ratio 0.0000x", t_out)
+        self.assertIn("Shard balance: **0** shards, max **0.0000 MiB**, total **0.0000 MiB**, balance ratio **0.0000x**", m_out)
+
+    def test_strict_host_path_and_username_sanitization_in_json_output(self) -> None:
+        # Verify helper sanitization across Windows, POSIX, MSYS, file://, tilde, UNC, PathLike, and user-home leaves.
+        self.assertEqual(arb.basename_label(r"C:\Users\alice"), "<user>")
+        self.assertEqual(arb.basename_label("/home/bob/"), "<user>")
+        self.assertEqual(arb.basename_label("/Users/carol"), "<user>")
+        self.assertEqual(arb.basename_label(r"C:\Users\alice\work\dist"), "dist")
+        self.assertEqual(arb.basename_label("/home/bob/work/build-manifest.json"), "build-manifest.json")
+
+        sanitized_paths = arb.sanitize_value(
+            {
+                "win": r"C:\Users\alice\work\guest_part_00.wasm",
+                "posix": "/home/bob/work/guest_part_01.wasm",
+                "msys": "/c/Users/carol/work/runtime.wasm",
+                "uri": "file:///C:/Users/dave/work/manifest.json",
+                "tilde": "~eve/work/build.json",
+                "unc": r"\\fileserver\share\frank\dist",
+                "path_obj": Path("/home/grace/projects/playgta6web/dist"),
+            }
+        )
+        serialized = json.dumps(sanitized_paths)
+        for leak in ("alice", "bob", "carol", "dave", "eve", "frank", "grace", "C:\\", "C:/", "/home/", "/Users/", "fileserver"):
+            self.assertNotIn(leak, serialized)
+        self.assertEqual(sanitized_paths["path_obj"], "dist")
+
+        # End-to-end --json CLI sanitization with host paths injected into module, imports, and dist path.
+        username = "t83hostuser"
+        manifest = _manifest(module=rf"C:\Users\{username}\work\main_game")
+        manifest["refinements"]["import_slots"]["referenced_unresolved"] = [
+            {
+                "dll": f"/home/{username}/sdk/d3d12_xs.dll",
+                "import": "PresentX",
+                "reason": rf"missing at C:\Users\{username}\shims",
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Users" / username
+            build_dir = _write_build_dir(root / "recomp", manifest=manifest, discover=_discover())
+            dist_dir = _stage_fast_boot_dist(root / "dist", part_sizes=[512, 512])
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "USERNAME": username,
+                    "USER": username,
+                    "HOME": f"/home/{username}",
+                    "USERPROFILE": rf"C:\Users\{username}",
+                },
+            ):
+                code, out, err = _run_cli(
+                    [str(build_dir), "--dist-dir", str(dist_dir), "--json"]
+                )
+
+        self.assertEqual((code, err), (0, ""))
+        payload = json.loads(out)
+        self.assertEqual(payload["module"], "main_game")
+        self.assertEqual(payload["unresolved_imports"], ["d3d12_xs.dll!PresentX"])
+        self.assertNotIn(username, out)
+        self.assertNotIn("C:\\", out)
+        self.assertNotIn("C:/", out)
+        self.assertNotIn("/home/", out)
+        self.assertNotIn("/Users/", out)
+        self.assertNotRegex(out, r"[A-Za-z]:[\\/]")
+
+    def test_backward_compatibility_existing_cli_flags_and_legacy_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build_dir = _write_build_dir(Path(tmp), manifest=_manifest(), discover=_discover())
+            code_legacy, out_legacy, err_legacy = _run_cli(
+                [str(build_dir), "--top", "2", "--boot-depth", "1", "--fail-on-unresolved", "1", "--json"]
+            )
+            code_fail, out_fail, err_fail = _run_cli(
+                [str(build_dir), "--fail-on-unresolved", "0", "--json"]
+            )
+
+        self.assertEqual((code_legacy, err_legacy), (0, ""))
+        legacy = json.loads(out_legacy)
+        self.assertEqual(legacy["schema"], "playgta6-recomp-audit")
+        self.assertEqual(legacy["schema_version"], 1)
+        self.assertEqual(len(legacy["unlifted_mnemonics"]), 2)
+        self.assertEqual(legacy["boot"]["boot_depth"], 1)
+        self.assertIn("balance_ratio", legacy["shards"])
+        # Legacy single-module report without --dist-dir must not add fast-boot or program sections.
+        self.assertNotIn("wasm64_fast_boot", legacy)
+        self.assertNotIn("program", legacy)
+        self.assertNotIn("wasm_footprint", legacy)
+
+        self.assertEqual(code_fail, arb.EXIT_THRESHOLD_FAILED)
+        self.assertIn("Threshold failed", err_fail)
+        self.assertEqual(json.loads(out_fail)["module"], "main")
+
+
 if __name__ == "__main__":
     unittest.main()

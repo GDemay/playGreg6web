@@ -137,6 +137,108 @@ fn unpack_mask(e: Elem, high: bool) -> Vec<u32> {
     (0..n / 2).flat_map(|i| [base + i, n + base + i]).collect()
 }
 
+/// Whether [`FunctionLifter::lift_int`] handles `m` (mirroring its dispatch).
+pub(super) fn is_int_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    if binary(m).is_some() || shift(m).is_some() || variable_shift(m).is_some() {
+        return true;
+    }
+    matches!(
+        m,
+        M::Pand
+            | M::Vpand
+            | M::Pandn
+            | M::Vpandn
+            | M::Por
+            | M::Vpor
+            | M::Pxor
+            | M::Vpxor
+            | M::Pslldq
+            | M::Vpslldq
+            | M::Psrldq
+            | M::Vpsrldq
+            | M::Pshufd
+            | M::Vpshufd
+            | M::Pshuflw
+            | M::Vpshuflw
+            | M::Pshufhw
+            | M::Vpshufhw
+            | M::Pshufb
+            | M::Vpshufb
+            | M::Punpcklbw
+            | M::Vpunpcklbw
+            | M::Punpckhbw
+            | M::Vpunpckhbw
+            | M::Punpcklwd
+            | M::Vpunpcklwd
+            | M::Punpckhwd
+            | M::Vpunpckhwd
+            | M::Punpckldq
+            | M::Vpunpckldq
+            | M::Punpckhdq
+            | M::Vpunpckhdq
+            | M::Punpcklqdq
+            | M::Vpunpcklqdq
+            | M::Punpckhqdq
+            | M::Vpunpckhqdq
+            | M::Packsswb
+            | M::Vpacksswb
+            | M::Packssdw
+            | M::Vpackssdw
+            | M::Packuswb
+            | M::Vpackuswb
+            | M::Packusdw
+            | M::Vpackusdw
+            | M::Pabsb
+            | M::Vpabsb
+            | M::Pabsw
+            | M::Vpabsw
+            | M::Pabsd
+            | M::Vpabsd
+            | M::Pmaddwd
+            | M::Vpmaddwd
+            | M::Pmaddubsw
+            | M::Vpmaddubsw
+            | M::Psadbw
+            | M::Vpsadbw
+            | M::Palignr
+            | M::Vpalignr
+            | M::Pblendw
+            | M::Vpblendw
+            | M::Vpblendd
+            | M::Pblendvb
+            | M::Vpblendvb
+            | M::Phaddw
+            | M::Vphaddw
+            | M::Phaddd
+            | M::Vphaddd
+            | M::Phaddsw
+            | M::Vphaddsw
+            | M::Phsubw
+            | M::Vphsubw
+            | M::Phsubd
+            | M::Vphsubd
+            | M::Phsubsw
+            | M::Vphsubsw
+            | M::Pextrb
+            | M::Vpextrb
+            | M::Pextrw
+            | M::Vpextrw
+            | M::Pextrd
+            | M::Vpextrd
+            | M::Pextrq
+            | M::Vpextrq
+            | M::Pinsrb
+            | M::Vpinsrb
+            | M::Pinsrw
+            | M::Vpinsrw
+            | M::Pinsrd
+            | M::Vpinsrd
+            | M::Pinsrq
+            | M::Vpinsrq
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_int(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{I8, I16, I32, I64};
@@ -249,43 +351,52 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(f.dst), &r, I32)?;
             }
             M::Pmaddubsw | M::Vpmaddubsw => {
-                let a = self.v128(ins, f.a, I8)?;
-                let b = self.v128(ins, f.b, I8)?;
-                let wa = self.val(&format!("zext <16 x i8> {a} to <16 x i16>"));
-                let wb = self.val(&format!("sext <16 x i8> {b} to <16 x i16>"));
-                // Each product fits in i16; the pair sum saturates.
-                let p = self.val(&format!("mul <16 x i16> {wa}, {wb}"));
-                let even = self.val(&format!(
-                    "shufflevector <16 x i16> {p}, <16 x i16> poison, {}",
-                    super::mask(&(0..8).map(|i| 2 * i).collect::<Vec<_>>())
-                ));
-                let odd = self.val(&format!(
-                    "shufflevector <16 x i16> {p}, <16 x i16> poison, {}",
-                    super::mask(&(0..8).map(|i| 2 * i + 1).collect::<Vec<_>>())
-                ));
-                let r = self.intr(Intr::SAddSat, Ty::v(I16), &[&even, &odd]);
+                // View byte pairs as `<8 x i16>` (little-endian: low byte = even, high byte = odd)
+                // to avoid cross-vector shuffles and wide `<16 x i16>` multiplies.
+                let a = self.v128(ins, f.a, I16)?;
+                let b = self.v128(ins, f.b, I16)?;
+                let ty = Ty::v(I16);
+                let c8 = ty.splat("8");
+                let ae = self.val(&format!("and <8 x i16> {a}, {}", ty.splat("255")));
+                let ao = self.val(&format!("lshr <8 x i16> {a}, {c8}"));
+                let be_s = self.val(&format!("shl <8 x i16> {b}, {c8}"));
+                let be = self.val(&format!("ashr <8 x i16> {be_s}, {c8}"));
+                let bo = self.val(&format!("ashr <8 x i16> {b}, {c8}"));
+                // Each u8 * i8 product fits in signed i16; the pair sum saturates.
+                let pe = self.val(&format!("mul <8 x i16> {ae}, {be}"));
+                let po = self.val(&format!("mul <8 x i16> {ao}, {bo}"));
+                let r = self.intr(Intr::SAddSat, ty, &[&pe, &po]);
                 self.xset(ins.op_register(f.dst), &r, I16)?;
             }
             M::Psadbw | M::Vpsadbw => {
+                // Pure SIMD128 sum of absolute differences without scalar lane extractions:
+                // |a - b| = umax(a, b) - umin(a, b) in `<16 x i8>`, then 3-stage little-endian
+                // pairwise reduction (2 -> 4 -> 8 bytes per qword, max sum 2040 fits easily).
                 let a = self.v128(ins, f.a, I8)?;
                 let b = self.v128(ins, f.b, I8)?;
-                let wa = self.val(&format!("zext <16 x i8> {a} to <16 x i16>"));
-                let wb = self.val(&format!("zext <16 x i8> {b} to <16 x i16>"));
-                let d = self.val(&format!("sub <16 x i16> {wa}, {wb}"));
-                let ad = self.intr(Intr::Abs, Ty::vn(I16, 16), &[&d]);
-                let mut r = "zeroinitializer".to_string();
-                for q in 0..2 {
-                    let mut sum = String::from("0");
-                    for k in 0..8 {
-                        let x = self.val(&format!(
-                            "extractelement <16 x i16> {ad}, i32 {}",
-                            8 * q + k
-                        ));
-                        sum = self.val(&format!("add i16 {sum}, {x}"));
-                    }
-                    let wide = self.val(&format!("zext i16 {sum} to i64"));
-                    r = self.insert(&r, I64, &wide, q);
-                }
+                let hi = self.intr(Intr::UMax, Ty::v(I8), &[&a, &b]);
+                let lo = self.intr(Intr::UMin, Ty::v(I8), &[&a, &b]);
+                let d = self.val(&format!("sub <16 x i8> {hi}, {lo}"));
+                let d16 = self.cast(&d, Ty::v(I8), Ty::v(I16));
+                let d16_lo = self.val(&format!("and <8 x i16> {d16}, {}", Ty::v(I16).splat("255")));
+                let d16_hi = self.val(&format!("lshr <8 x i16> {d16}, {}", Ty::v(I16).splat("8")));
+                let s16 = self.val(&format!("add nuw <8 x i16> {d16_lo}, {d16_hi}"));
+                let s32_v = self.cast(&s16, Ty::v(I16), Ty::v(I32));
+                let s32_lo = self.val(&format!(
+                    "and <4 x i32> {s32_v}, {}",
+                    Ty::v(I32).splat("65535")
+                ));
+                let s32_hi =
+                    self.val(&format!("lshr <4 x i32> {s32_v}, {}", Ty::v(I32).splat("16")));
+                let s32 = self.val(&format!("add nuw <4 x i32> {s32_lo}, {s32_hi}"));
+                let s64_v = self.cast(&s32, Ty::v(I32), Ty::v(I64));
+                let s64_lo = self.val(&format!(
+                    "and <2 x i64> {s64_v}, {}",
+                    Ty::v(I64).splat("4294967295")
+                ));
+                let s64_hi =
+                    self.val(&format!("lshr <2 x i64> {s64_v}, {}", Ty::v(I64).splat("32")));
+                let r = self.val(&format!("add nuw <2 x i64> {s64_lo}, {s64_hi}"));
                 self.xset(ins.op_register(f.dst), &r, I64)?;
             }
             M::Palignr | M::Vpalignr => {
@@ -354,55 +465,74 @@ impl FunctionLifter<'_> {
             IOp::SubSatS => self.intr(Intr::SSubSat, ty, &[&a, &b]),
             IOp::SubSatU => self.intr(Intr::USubSat, ty, &[&a, &b]),
             IOp::MulHiS | IOp::MulHiU | IOp::MulHrs => {
-                let ext = if op == IOp::MulHiU { "zext" } else { "sext" };
-                let w = ty.with(Elem::I32).ir();
-                let wa = self.val(&format!("{ext} {t} {a} to {w}"));
-                let wb = self.val(&format!("{ext} {t} {b} to {w}"));
-                let p = self.val(&format!("mul {w} {wa}, {wb}"));
-                let hi = if op == IOp::MulHrs {
-                    // ((a * b >> 14) + 1) >> 1
-                    let s = self.val(&format!("ashr {w} {p}, {}", ty.with(Elem::I32).splat("14")));
-                    let s = self.val(&format!("add {w} {s}, {}", ty.with(Elem::I32).splat("1")));
-                    self.val(&format!("ashr {w} {s}, {}", ty.with(Elem::I32).splat("1")))
+                // Split into low/high `<4 x i16>` -> `<4 x i32>` extmul halves, then pick the
+                // result `i16` lanes directly with one `shufflevector`:
+                // - pmulhw/pmulhuw: odd `i16` lanes [1,3,5,7,9,11,13,15] (3 ops: 2 extmul + shuffle)
+                // - pmulhrsw: ((a * b) + 16384) >>u 15, even `i16` lanes [0,2,4,6,8,10,12,14]
+                //   (exact for all i16 pairs including -32768 * -32768 -> -32768, 7 ops, no mask).
+                let (ext, mflag) = if op == IOp::MulHiU {
+                    ("zext", "nuw")
                 } else {
-                    self.val(&format!("lshr {w} {p}, {}", ty.with(Elem::I32).splat("16")))
+                    ("sext", "nsw")
                 };
-                self.val(&format!("trunc {w} {hi} to {t}"))
+                let lo_mask = super::mask(&[0, 1, 2, 3]);
+                let hi_mask = super::mask(&[4, 5, 6, 7]);
+                let mut halves = Vec::with_capacity(2);
+                for half_mask in [&lo_mask, &hi_mask] {
+                    let ah = self.val(&format!(
+                        "shufflevector <8 x i16> {a}, <8 x i16> poison, {half_mask}"
+                    ));
+                    let bh = self.val(&format!(
+                        "shufflevector <8 x i16> {b}, <8 x i16> poison, {half_mask}"
+                    ));
+                    let wa = self.val(&format!("{ext} <4 x i16> {ah} to <4 x i32>"));
+                    let wb = self.val(&format!("{ext} <4 x i16> {bh} to <4 x i32>"));
+                    let mut p = self.val(&format!("mul {mflag} <4 x i32> {wa}, {wb}"));
+                    if op == IOp::MulHrs {
+                        let c16384 = Ty::v(Elem::I32).splat("16384");
+                        let c15 = Ty::v(Elem::I32).splat("15");
+                        let s = self.val(&format!("add nsw <4 x i32> {p}, {c16384}"));
+                        p = self.val(&format!("lshr <4 x i32> {s}, {c15}"));
+                    }
+                    halves.push(self.cast(&p, Ty::v(Elem::I32), Ty::v(Elem::I16)));
+                }
+                let pick = if op == IOp::MulHrs {
+                    [0, 2, 4, 6, 8, 10, 12, 14]
+                } else {
+                    [1, 3, 5, 7, 9, 11, 13, 15]
+                };
+                self.shuffle(&halves[0], &halves[1], Elem::I16, &pick)
             }
             IOp::MulEvenU | IOp::MulEvenS => {
-                // Low 32 bits of each quadword, zero/sign-extended, multiplied to 64 bits.
-                let (wa, wb) = if op == IOp::MulEvenU {
-                    let m = ty.splat("4294967295");
-                    (
-                        self.val(&format!("and {t} {a}, {m}")),
-                        self.val(&format!("and {t} {b}, {m}")),
-                    )
+                // Low 32 bits of each quadword (lanes 0, 2 of `<4 x i32>`), widened and multiplied
+                // so LLVM emits native `i64x2.extmul_low_i32x4_{u,s}` instead of `i64x2.mul`.
+                let a32 = self.cast(&a, Ty::v(Elem::I64), Ty::v(Elem::I32));
+                let b32 = self.cast(&b, Ty::v(Elem::I64), Ty::v(Elem::I32));
+                let even = super::mask(&[0, 2]);
+                let ae = self.val(&format!(
+                    "shufflevector <4 x i32> {a32}, <4 x i32> poison, {even}"
+                ));
+                let be = self.val(&format!(
+                    "shufflevector <4 x i32> {b32}, <4 x i32> poison, {even}"
+                ));
+                let (ext, mflag) = if op == IOp::MulEvenU {
+                    ("zext", "nuw")
                 } else {
-                    let s = ty.splat("32");
-                    let a1 = self.val(&format!("shl {t} {a}, {s}"));
-                    let b1 = self.val(&format!("shl {t} {b}, {s}"));
-                    (
-                        self.val(&format!("ashr {t} {a1}, {s}")),
-                        self.val(&format!("ashr {t} {b1}, {s}")),
-                    )
+                    ("sext", "nsw")
                 };
-                self.val(&format!("mul {t} {wa}, {wb}"))
+                let wa = self.val(&format!("{ext} <2 x i32> {ae} to <2 x i64>"));
+                let wb = self.val(&format!("{ext} <2 x i32> {be} to <2 x i64>"));
+                self.val(&format!("mul {mflag} <2 x i64> {wa}, {wb}"))
             }
             IOp::CmpEq | IOp::CmpGt => {
                 let pred = if op == IOp::CmpEq { "eq" } else { "sgt" };
                 let c = self.val(&format!("icmp {pred} {t} {a}, {b}"));
                 self.val(&format!("sext {bt} {c} to {t}"))
             }
-            IOp::MinS | IOp::MinU | IOp::MaxS | IOp::MaxU => {
-                let pred = match op {
-                    IOp::MinS => "slt",
-                    IOp::MinU => "ult",
-                    IOp::MaxS => "sgt",
-                    _ => "ugt",
-                };
-                let c = self.val(&format!("icmp {pred} {t} {a}, {b}"));
-                self.val(&format!("select {bt} {c}, {t} {a}, {t} {b}"))
-            }
+            IOp::MinS => self.intr(Intr::SMin, ty, &[&a, &b]),
+            IOp::MinU => self.intr(Intr::UMin, ty, &[&a, &b]),
+            IOp::MaxS => self.intr(Intr::SMax, ty, &[&a, &b]),
+            IOp::MaxU => self.intr(Intr::UMax, ty, &[&a, &b]),
             IOp::Avg => {
                 let w = ty.with(e.wide()).ir();
                 let one = ty.with(e.wide()).splat("1");
@@ -539,19 +669,14 @@ impl FunctionLifter<'_> {
     }
 
     /// `packss*`/`packus*`: saturate both sources to half-width lanes, a's lanes first.
+    /// Clamping each 128-bit source via `smax`/`smin` before truncating and concatenating avoids
+    /// redundant `v128.and` masks on signed packs and lowers directly to `max_s`/`min_s` + shuffle.
     fn pack(&mut self, ins: &Instruction, f: Form, e: Elem, signed: bool) -> R<()> {
         let n = e.lanes();
-        let ty = Ty::vn(e, 2 * n);
+        let ty = Ty::v(e);
         let t = ty.ir();
-        let bt = ty.bool_ir();
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
-        let cat = self.val(&format!(
-            "shufflevector {} {a}, {} {b}, {}",
-            Ty::v(e).ir(),
-            Ty::v(e).ir(),
-            super::mask(&(0..2 * n).collect::<Vec<_>>())
-        ));
         let half = e.bits() / 2;
         let (lo, hi) = if signed {
             (-(1i64 << (half - 1)), (1i64 << (half - 1)) - 1)
@@ -560,12 +685,19 @@ impl FunctionLifter<'_> {
         };
         let lo_s = ty.splat(&lo.to_string());
         let hi_s = ty.splat(&hi.to_string());
-        let c1 = self.val(&format!("icmp slt {t} {cat}, {lo_s}"));
-        let v = self.val(&format!("select {bt} {c1}, {t} {lo_s}, {t} {cat}"));
-        let c2 = self.val(&format!("icmp sgt {t} {v}, {hi_s}"));
-        let v = self.val(&format!("select {bt} {c2}, {t} {hi_s}, {t} {v}"));
         let ne = Elem::of_bits(half);
-        let r = self.val(&format!("trunc {t} {v} to {}", Ty::vn(ne, 2 * n).ir()));
+        let half_t = Ty::vn(ne, n).ir();
+        let mut clamp_trunc = |src: &str| {
+            let v = self.intr(Intr::SMax, ty, &[src, &lo_s]);
+            let v = self.intr(Intr::SMin, ty, &[&v, &hi_s]);
+            self.val(&format!("trunc {t} {v} to {half_t}"))
+        };
+        let at = clamp_trunc(&a);
+        let bt = clamp_trunc(&b);
+        let r = self.val(&format!(
+            "shufflevector {half_t} {at}, {half_t} {bt}, {}",
+            super::mask(&(0..2 * n).collect::<Vec<_>>())
+        ));
         self.xset(ins.op_register(f.dst), &r, ne)
     }
 

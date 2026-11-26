@@ -131,6 +131,46 @@ void test_user_data_rule() {
     CHECK(root_parameter_for_user_sgpr(rs, true, 4) == 0);
     CHECK(root_parameter_for_user_sgpr(rs, true, 5) == 1);
     CHECK(root_parameter_for_user_sgpr(rs, true, 7) == 2);
+    // Containing lookup: s10 is dword 1 of the constants (parameter 1); s12 is the high half of the root CBV.
+    uint32_t dw = 99;
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 10, &dw) == 1 && dw == 1);
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 12, &dw) == 2 && dw == 1);
+    CHECK(root_parameter_containing_user_sgpr(rs, false, 13, &dw) == -1);
+}
+
+void test_contained_sgpr_and_bitcast_vertex() {
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    StageReflection fs;
+    ReflectedBinding b;
+    b.group = 0;
+    b.binding = 0;
+    b.kind = ReflectedBindingKind::Uniform;
+    b.source = ReflectedSource::RootConstants;
+    b.user_sgpr = 10;  // second dword of the 2-constant parameter
+    fs.bindings = {b};
+    ReflectedStageRef ref;
+    ref.reflection = &fs;
+    bridge::PipelineLayoutDesc out;
+    std::string report;
+    CHECK(join_pipeline_layout(rs, false, {ref}, &out, &report, nullptr, JoinOptions{}));
+    // A table read through the middle of a root CBV is refused with a precise reason.
+    fs.bindings[0].source = ReflectedSource::Table;
+    fs.bindings[0].user_sgpr = 12;
+    fs.bindings[0].table_byte_offset = 1056;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {ref}, &out, &report, nullptr, JoinOptions{}));
+    CHECK(report.find("dword 1 of root parameter 2") != std::string::npos);
+
+    // f32 attribute over a u32 stage input: reinterpreted, not refused.
+    std::vector<pso::D3D12InputElementDesc> e(1);
+    e[0].SemanticName = "POSITION";
+    e[0].Format = pso::DxgiFormat::R32G32_FLOAT;
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 0, 2, ReflectedComponentType::U32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    report.clear();
+    CHECK(join_vertex_inputs(vs, e.data(), 1, &fetches, &report));
+    CHECK(fetches.size() == 1 && fetches[0].format == pso::WgpuVertexFormat::Uint32x2);
 }
 
 std::vector<pso::D3D12InputElementDesc> ui_input_layout() {
@@ -164,8 +204,8 @@ void test_vertex_join() {
         CHECK(fetches[2].location == 2 && fetches[2].offset == 6 && fetches[2].format == pso::WgpuVertexFormat::Unorm8x2);
     }
 
-    // Failures: an offset no element covers, a read inside an element without fetch format, and a
-    // component class mismatch. Each is reported with its key.
+    // Failures: a read inside an element without fetch format and a component class mismatch. Each is
+    // reported with its key. (Offsets no element covers are defaulted, see test_vertex_default_inputs.)
     StageReflection bad;
     bad.vertex_inputs = {{0, 0, 40, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
                          {1, 0, 5, 1, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
@@ -173,11 +213,10 @@ void test_vertex_join() {
                          {3, 1, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
     report.clear();
     CHECK(!join_vertex_inputs(bad, layout.data(), 3, &fetches, &report));
-    CHECK(report.find("@location(0) <- slot 0 + 40: no input-layout element") != std::string::npos);
     CHECK(report.find("@location(1) <- slot 0 + 5: reads inside element COLOR1") != std::string::npos);
     CHECK(report.find("@location(2) <- slot 0 + 0: the stage expects u32, the attribute gives f32") !=
           std::string::npos);
-    CHECK(report.find("@location(3) <- slot 1 + 0: no input-layout element") != std::string::npos);
+    CHECK(report.find("@location(3)") == std::string::npos);
 
     // The pipeline key takes the fetches: locations, offsets and formats from the stage; COLOR1 dropped.
     pso::D3D12GraphicsPsoDesc desc{};
@@ -205,6 +244,70 @@ void test_vertex_join() {
     }
     CHECK(saw_position && saw_inside);
     CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::MissingVertexInput)) == 0);
+}
+
+// An input no layout element covers reads D3D12's (0, 0, 0, 1): a constant-default fetch placed at a
+// spare instance slot with stride 0, counted in JoinStats.
+void test_vertex_default_inputs() {
+    const std::vector<pso::D3D12InputElementDesc> layout = ui_input_layout();
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 8, 2, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {1, 3, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {2, 3, 4, 4, ReflectedComponentType::U32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_vertex_inputs(vs, layout.data(), 3, &fetches, &report, &stats));
+    CHECK(report.empty() && fetches.size() == 3 && stats.vertex_inputs_defaulted == 2);
+    CHECK(fetches[1].constant_default && fetches[1].format == pso::WgpuVertexFormat::Float32x4 && fetches[1].offset == 0);
+    CHECK(fetches[2].constant_default && fetches[2].format == pso::WgpuVertexFormat::Uint32x4 &&
+          fetches[2].offset == pso::kDefaultVertexIntOffset);
+
+    pso::D3D12GraphicsPsoDesc desc{};
+    desc.vs = 1;
+    desc.ps = 2;
+    desc.pInputElementDescs = layout.data();
+    desc.NumInputElements = 3;
+    desc.NumRenderTargets = 1;
+    desc.RTVFormats[0] = pso::DxgiFormat::R8G8B8A8_UNORM;
+    desc.vs_input_fetches = fetches.data();
+    desc.vs_input_fetch_count = static_cast<uint32_t>(fetches.size());
+    const pso::GraphicsPsoTranslation t = pso::translate_graphics_pso(desc, pso::PipelineKeyOptions{});
+    CHECK(t.default_vertex_slot_mask == 2u);  // slot 0 carries POSITION, slot 1 is the first spare
+    CHECK(t.base.vertex_buffer_count == 2 && t.base.vertex_buffers[1].array_stride == 0 &&
+          t.base.vertex_buffers[1].step_mode == pso::WgpuVertexStepMode::Instance &&
+          t.base.vertex_buffers[1].attribute_count == 2);
+    CHECK((t.diagnostics & (pso::PipelineDiag::VertexLayoutInvalid | pso::PipelineDiag::VertexSlotOutOfRange)) == 0);
+}
+
+// #691: menu glyph quads (COLOR unorm8x4 @0, TEXCOORD float2 @4, POSITION float2 @12, stride 20)
+// whose stage reads UV and position as one 4-dword fetch at +4. The attribute must be float32x4,
+// not TEXCOORD's float32x2 (position would read the (0, 1) defaults and every quad collapse).
+void test_vertex_join_wide_fetch() {
+    std::vector<pso::D3D12InputElementDesc> e(3);
+    e[0].SemanticName = "COLOR";
+    e[0].Format = pso::DxgiFormat::R8G8B8A8_UNORM;
+    e[1].SemanticName = "TEXCOORD";
+    e[1].Format = pso::DxgiFormat::R32G32_FLOAT;
+    e[1].AlignedByteOffset = 4;
+    e[2].SemanticName = "POSITION";
+    e[2].Format = pso::DxgiFormat::R32G32_FLOAT;
+    e[2].AlignedByteOffset = 12;
+    StageReflection vs;
+    vs.vertex_inputs = {{0, 0, 0, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined},
+                        {1, 0, 4, 4, ReflectedComponentType::F32, pso::WgpuVertexFormat::Undefined}};
+    std::vector<pso::VertexInputFetch> fetches;
+    std::string report;
+    CHECK(join_vertex_inputs(vs, e.data(), 3, &fetches, &report));
+    CHECK(fetches.size() == 2);
+    if (fetches.size() == 2) {
+        CHECK(fetches[0].format == pso::WgpuVertexFormat::Unorm8x4);
+        CHECK(fetches[1].offset == 4 && fetches[1].format == pso::WgpuVertexFormat::Float32x4);
+    }
+    // Without a following element the fetch keeps the element's own format.
+    report.clear();
+    CHECK(join_vertex_inputs(vs, e.data(), 2, &fetches, &report));
+    CHECK(fetches.size() == 2 && fetches[1].format == pso::WgpuVertexFormat::Float32x2);
 }
 
 const bridge::LayoutBinding* find(const bridge::PipelineLayoutDesc& l, uint32_t group, uint32_t binding) {
@@ -302,7 +405,7 @@ void test_layout_join() {
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &bad}}, &untouched, &report, &failed_stats));
     CHECK(untouched.groups.empty());
     CHECK(failed_stats.table_slots_outside_rs == 0);  // counted only when the join succeeds
-    CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: no root parameter starts at s12") != std::string::npos);
+    CHECK(report.find("@group(0) @binding(0) <- table at s12 + 0: s12 is dword 1 of root parameter 2") != std::string::npos);
     // A slot declared as another class joins the slot itself (no failure).
     CHECK(report.find("@binding(2)") == std::string::npos);
     CHECK(report.find("byte offset 16") != std::string::npos);
@@ -336,15 +439,35 @@ void test_layout_join() {
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &wrong}}, &slots, &report));
     CHECK(report.find("is a resource table") != std::string::npos);
 
-    // A writable binding over a declared read-only slot is still a failure.
+    // A writable binding over a declared CBV joins the slot as a UAV (#482: shared root signatures
+    // list a CBV where the stage's own space-1 layout has a UAV; the stage stores through it).
     StageReflection writable;
-    ReflectedBinding st = tex;
+    ReflectedBinding st = tex;  // slot 1 = CBV b0 space 1
     st.kind = ReflectedBindingKind::StorageTexture;
     st.storage_format = 18;
-    writable.bindings = {st};
+    ReflectedBinding sb = tex;
+    sb.binding = 5;
+    sb.kind = ReflectedBindingKind::Storage;
+    sb.min_binding_size = 16;
+    writable.bindings = {st, sb};
     report.clear();
-    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &untouched, &report));
-    CHECK(report.find("cannot take a CBV") != std::string::npos);
+    JoinStats cbv_stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &writable}}, &slots, &report, &cbv_stats));
+    CHECK(report.empty() && cbv_stats.table_slots_outside_rs == 2);
+    if (slots.groups.size() == 1 && slots.groups[0].bindings.size() == 2) {
+        const bridge::LayoutBinding& w = slots.groups[0].bindings[0];
+        CHECK(w.entry.binding == 2 && w.join.table_parameter == 0 && w.join.table_slot == 1 &&
+              w.join.register_class == d3d::DescriptorRangeType::Uav &&
+              w.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) &&
+              w.entry.storage_format == 18);
+        const bridge::LayoutBinding& s = slots.groups[0].bindings[1];
+        CHECK(s.entry.binding == 5 && s.join.table_parameter == 0 && s.join.table_slot == 1 &&
+              s.join.register_class == d3d::DescriptorRangeType::Uav &&
+              s.entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+              s.entry.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage));
+    } else {
+        CHECK(false);
+    }
     // Over a declared SRV it joins the slot as a UAV (the stage writes through the descriptor, #482:
     // compute stages image_store through s5 + 32 where the root signature declares an SRV).
     StageReflection over_srv;
@@ -749,16 +872,271 @@ void test_lane_indexed_heap_sources() {
     CHECK(mixed.lane_indexed_bindings == 2);
 }
 
+// S63 (#482, #1394): the translator's exact lane-indexed sidecar sources (rdna2_to_wgsl.rs tests)
+// parse at every sidecar version, and join as binding arrays; a non-power-of-two scale (shift 0,
+// stride 24 from s_mul_i32) joins with that stride, a power-of-two stride as the shift.
+void test_s63_lane_indexed_sidecar() {
+    for (int version : {1, 2, 3}) {
+        const std::string doc =
+            std::string(R"({"schema": "playgta6-stage-reflection", "version": )") + std::to_string(version) + R"(,
+  "stages": {"0x00000000000000d1": {"stage": "fragment", "bindings": [
+    {"group": 0, "binding": 0, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 64, "shift": 5, "stride": 32}}},
+    {"group": 0, "binding": 1, "kind": "sampler",
+     "source": {"lane_indexed_sampler_heap": {"max_count": 16, "shift": 4, "stride": 16}}},
+    {"group": 0, "binding": 2, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 64, "shift": 0, "stride": 24}}}]},
+  "0x00000000000000d2": {"stage": "fragment", "bindings": [
+    {"group": 0, "binding": 0, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 32, "shift": 5, "stride": 32, "window_base": {"cbv": {"user_sgpr": 10, "root_descriptor": true}, "byte_offset": 8}}}},
+    {"group": 0, "binding": 1, "kind": "texture",
+     "source": {"lane_indexed_resource_heap": {"max_count": 8, "shift": 5, "stride": 32, "window_base": {"cbv": {"user_sgpr": 8, "table_byte_offset": 64}, "byte_offset": 4, "bit_offset": 8, "mask": 255}}}}]}}})";
+        StageReflectionIndex index;
+        std::string error;
+        CHECK(parse_stage_reflection_json(doc, &index, &error));
+        if (index.size() != 2) {
+            continue;
+        }
+        const StageReflection& ps = index.at(0xd1);
+        CHECK(ps.bindings.size() == 3);
+        CHECK(ps.bindings[2].source == ReflectedSource::LaneIndexedResourceHeap && ps.bindings[2].heap_shift == 0 &&
+              ps.bindings[2].heap_stride == 24 && ps.bindings[2].lane_max_count == 64);
+        const StageReflection& based = index.at(0xd2);
+        CHECK(based.bindings.size() == 2);
+        const ReflectedBinding& root = based.bindings[0];
+        CHECK(root.lane_has_window_base && root.cbv == ReflectedCbv::RootDescriptor && root.user_sgpr == 10 &&
+              root.cb_byte_offset == 8 && root.cb_bit_offset == 0 && root.cb_mask == 0xffffffffu &&
+              root.lane_max_count == 32);
+        const ReflectedBinding& table = based.bindings[1];
+        CHECK(table.lane_has_window_base && table.cbv == ReflectedCbv::Table && table.user_sgpr == 8 &&
+              table.table_byte_offset == 64 && table.cb_byte_offset == 4 && table.cb_bit_offset == 8 &&
+              table.cb_mask == 255 && table.lane_max_count == 8);
+
+        const d3d::RootSignatureDesc rs = ui_root_signature();
+        bridge::PipelineLayoutDesc layout;
+        std::string report;
+        JoinStats stats;
+        CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats,
+                                   JoinOptions{true}));
+        CHECK(report.empty() && stats.lane_indexed_arrays == 3 && stats.lane_indexed_bindings == 0);
+        CHECK(layout.groups.size() == 1 && layout.groups[0].bindings.size() == 3);
+        if (layout.groups.size() == 1 && layout.groups[0].bindings.size() == 3) {
+            const auto& b = layout.groups[0].bindings;
+            CHECK(b[0].entry.binding_array_size == 64 && b[0].join.heap_shift == 5 && b[0].join.heap_stride == 0);
+            CHECK(b[1].entry.binding_array_size == 16 && b[1].join.heap == d3d::HeapAccess::Sampler &&
+                  b[1].join.heap_shift == 4 && b[1].join.heap_stride == 0);
+            CHECK(b[2].entry.binding_array_size == 64 && b[2].join.heap_shift == 0 && b[2].join.heap_stride == 24 &&
+                  b[2].join.array_size == 64);
+        }
+        // Without binding arrays the same stage is refused with the counted lane-indexed reason.
+        report.clear();
+        JoinStats off;
+        CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &off));
+        CHECK(off.lane_indexed_bindings == 3);
+        CHECK(report.find("resource heap[(0 + lane) * 24] x 64") != std::string::npos);
+    }
+}
+
+// Root-descriptor sources over a descriptor table (G62, #482): the user SGPR starts a table, so
+// the binding joins as a table slot: slot 0 by default, the sidecar's table_byte_offset from
+// version 2 (ignored in version 1).
+std::string root_table_sidecar(int version) {
+    return std::string(R"({"schema": "playgta6-stage-reflection", "version": )") + std::to_string(version) +
+           R"(, "stages": {"0xc3": {"stage": "fragment", "bindings": [
+             {"group": 0, "binding": 0, "kind": "read_only_storage", "source": {"user_sgpr": 8, "root_descriptor": true}},
+             {"group": 0, "binding": 1, "kind": "uniform",
+              "source": {"user_sgpr": 8, "root_descriptor": true, "table_byte_offset": 32}},
+             {"group": 0, "binding": 2, "kind": "uniform", "source": {"user_sgpr": 11, "root_descriptor": true}}]}}})";
+}
+
+void test_root_descriptor_over_table() {
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    std::string error;
+
+    // Version 1: the offset is not part of the format; both table bindings join at slot 0 (SRV t2).
+    StageReflectionIndex v1;
+    CHECK(parse_stage_reflection_json(root_table_sidecar(1), &v1, &error));
+    const StageReflection& ps1 = v1.at(0xc3);
+    CHECK(ps1.bindings.size() == 3 && ps1.bindings[1].source == ReflectedSource::RootDescriptor &&
+          !ps1.bindings[1].root_table_offset_given && ps1.bindings[1].table_byte_offset == 0);
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    StageReflection only_srv = ps1;
+    only_srv.bindings.erase(only_srv.bindings.begin() + 1);
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &only_srv}}, &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.root_descriptor_tables == 1 && stats.table_slots_outside_rs == 0);
+    const bridge::LayoutBinding* b0 = find(layout, 0, 0);
+    CHECK(b0 != nullptr && b0->join.register_class == d3d::DescriptorRangeType::Srv && b0->join.shader_register == 2 &&
+          b0->join.register_space == 1 && b0->join.table_parameter == d3d::kNoIndex);
+    // A real root CBV keeps its root-descriptor join and is not counted.
+    const bridge::LayoutBinding* b2 = find(layout, 0, 2);
+    CHECK(b2 != nullptr && b2->join.register_class == d3d::DescriptorRangeType::Cbv && b2->join.shader_register == 7);
+    // v1 ignores the offset: the uniform binding also joins slot 0 (SRV t2, a buffer view).
+    stats = JoinStats{};
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps1}}, &layout, &report, &stats));
+    CHECK(stats.root_descriptor_tables == 2 && stats.table_slots_outside_rs == 0);
+    const bridge::LayoutBinding* u1 = find(layout, 0, 1);
+    CHECK(u1 != nullptr && u1->join.register_class == d3d::DescriptorRangeType::Srv && u1->join.shader_register == 2 &&
+          u1->join.register_space == 1);
+    // A slot past the declared ranges joins by slot.
+    StageReflection past = ps1;
+    past.bindings = {ps1.bindings[0]};
+    past.bindings[0].root_table_offset_given = true;
+    past.bindings[0].table_byte_offset = 64;
+    stats = JoinStats{};
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &past}}, &layout, &report, &stats));
+    CHECK(stats.root_descriptor_tables == 1 && stats.table_slots_outside_rs == 1);
+    const bridge::LayoutBinding* p0 = find(layout, 0, 0);
+    CHECK(p0 != nullptr && p0->join.table_parameter == 0 && p0->join.table_slot == 2);
+
+    // Version 2: the given table_byte_offset picks slot 1 (CBV b0 space 1).
+    StageReflectionIndex v2;
+    CHECK(parse_stage_reflection_json(root_table_sidecar(2), &v2, &error));
+    const StageReflection& ps2 = v2.at(0xc3);
+    CHECK(ps2.bindings[1].root_table_offset_given && ps2.bindings[1].table_byte_offset == 32);
+    CHECK(!ps2.bindings[0].root_table_offset_given);
+    stats = JoinStats{};
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps2}}, &layout, &report, &stats));
+    CHECK(report.empty());
+    CHECK(stats.root_descriptor_tables == 2 && stats.table_slots_outside_rs == 0);
+    u1 = find(layout, 0, 1);
+    CHECK(u1 != nullptr && u1->join.register_class == d3d::DescriptorRangeType::Cbv && u1->join.shader_register == 0 &&
+          u1->join.register_space == 1 && u1->join.table_parameter == d3d::kNoIndex);
+
+    // A misaligned offset fails the join like a table source; an unknown version is rejected.
+    StageReflection bad = ps2;
+    bad.bindings[1].table_byte_offset = 36;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad}}, &layout, &report));
+    CHECK(report.find("not a descriptor boundary") != std::string::npos);
+    StageReflectionIndex v4;
+    CHECK(!parse_stage_reflection_json(root_table_sidecar(4), &v4, &error));
+    CHECK(error.find("version") != std::string::npos);
+    // Root constants are still not a root descriptor.
+    StageReflection consts = ps1;
+    consts.bindings = {ps1.bindings[0]};
+    consts.bindings[0].user_sgpr = 9;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &consts}}, &layout, &report));
+    CHECK(report.find("is not a root descriptor") != std::string::npos);
+}
+
+// G66: a mesh stage's compute translation carries its output record layout.
+void test_mesh_output() {
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x4d535343000000d7": {"stage": "compute",
+            "mesh_output": {"max_vertices": 64, "max_primitives": 126, "vertex_words": 12}}}})",
+        &index, &error));
+    const auto it = index.find(0x4d535343000000d7ull);
+    CHECK(it != index.end() && it->second.has_mesh_output && it->second.mesh_output.max_vertices == 64 &&
+          it->second.mesh_output.max_primitives == 126 && it->second.mesh_output.vertex_words == 12);
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x1": {"stage": "compute",
+            "mesh_output": {"max_vertices": 64, "max_primitives": 126, "vertex_words": 10}}}})",
+        &bad, &error));
+}
+
+// G62 / #482 (sidecar version 3): a binding whose descriptor origin the translator could not trace
+// comes with an "unresolved" source. The stage still joins: the binding is bound as the worker's
+// default for its kind (no register), counted in JoinStats::unresolved_bindings.
+void test_unresolved_source() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x00000000000000e1": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 8, "root_constants": true}},
+        {"group": 0, "binding": 1, "kind": "texture", "view_dimension": "2d", "source": {"unresolved": true}},
+        {"group": 0, "binding": 2, "kind": "sampler", "source": {"unresolved": "cb_dynamic_offset"}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    const StageReflection& ps = index.at(0xe1);
+    CHECK(ps.bindings.size() == 3 && ps.bindings[1].source == ReflectedSource::Unresolved &&
+          ps.bindings[2].source == ReflectedSource::Unresolved);
+
+    d3d::RootSignatureDesc desc;
+    d3d::RootParameterDesc constants;
+    constants.parameter_type = d3d::RootParameterType::Constants32Bit;
+    constants.num_32bit_values = 4;
+    desc.parameters = {constants};
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(desc, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(report.empty() && stats.unresolved_bindings == 2);
+    const bridge::LayoutBinding* tex = find(layout, 0, 1);
+    CHECK(tex != nullptr && tex->join.register_class == d3d::DescriptorRangeType::Srv &&
+          tex->join.shader_register == d3d::kNoIndex && tex->join.register_space == d3d::kNoIndex &&
+          tex->join.heap == d3d::HeapAccess::None && tex->join.table_parameter == d3d::kNoIndex &&
+          tex->entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Texture));
+    const bridge::LayoutBinding* samp = find(layout, 0, 2);
+    CHECK(samp != nullptr && samp->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          samp->join.shader_register == d3d::kNoIndex);
+    // The planner finds no slot for them (bound as the worker's default); the root constants resolve.
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(desc, &rs).ok());
+    std::vector<d3d::ShaderBinding> bindings;
+    for (const auto& g : layout.groups) {
+        for (const auto& lb : g.bindings) {
+            d3d::ShaderBinding sb = lb.join;
+            sb.binding = lb.entry.binding;
+            bindings.push_back(sb);
+        }
+    }
+    const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(rs, bindings, d3d::WebGpuStage::Fragment);
+    CHECK(plan.entries().size() == 3 && plan.unresolved_count() == 2);
+
+    // Before version 3, not literally true, or on a writable kind: malformed.
+    const char* bad_docs[] = {
+        R"({"schema": "playgta6-stage-reflection", "version": 2, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": false}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": ""}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 0, "binding": 0, "kind": "storage", "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 0, "binding": 0, "kind": "storage_texture", "storage_format": 18,
+                          "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 4, "stages": {}})",
+    };
+    for (const char* bad_doc : bad_docs) {
+        StageReflectionIndex bad;
+        CHECK(!parse_stage_reflection_json(bad_doc, &bad, &error));
+    }
+}
+
 int main() {
+    test_mesh_output();
     test_parse();
     test_user_data_rule();
+    test_contained_sgpr_and_bitcast_vertex();
     test_vertex_join();
+    test_vertex_join_wide_fetch();
+    test_vertex_default_inputs();
     test_layout_join();
     test_plan_direct_slot();
     test_heap_sources();
     test_cbv_indexed_heap_sources();
     test_lane_indexed_heap_sources();
+    test_s63_lane_indexed_sidecar();
     test_inline_sampler();
+    test_root_descriptor_over_table();
+    test_unresolved_source();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

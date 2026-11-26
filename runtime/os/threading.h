@@ -92,7 +92,9 @@ public:
 
     explicit XTaskQueue(DispatchMode work_mode = DispatchMode::Manual,
                         DispatchMode completion_mode = DispatchMode::Manual,
-                        uint32_t work_threads = 1);
+                        uint32_t work_threads = 1,
+                        bool work_serialized = false,
+                        bool completion_serialized = false);
     ~XTaskQueue();
 
     XTaskQueue(const XTaskQueue&) = delete;
@@ -138,7 +140,15 @@ private:
         bool terminated = false;
         std::mutex join_mutex;
         std::vector<std::thread> workers;
+        // Thread-pool growth: a non-serialized port starts a worker whenever more tasks are
+        // queued than workers are idle (up to kMaxPoolWorkers); workers are kept for reuse.
+        size_t idle = 0;
+        size_t worker_count = 0;
+        size_t max_workers = 1;
     };
+
+    static constexpr size_t kMaxPoolWorkers = 64;
+    void grow_port(Port& port);
 
     bool submit_to_port(Port& port, TaskEntry entry);
     bool dispatch_from_port(Port& port, uint32_t timeout_ms);

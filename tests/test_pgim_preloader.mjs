@@ -1564,6 +1564,8 @@ test('W147 constructor validates retryDelayMs, maxRetryDelayMs, sleepFn, nowFn a
     opfsInvalidations: 0,
     bytesFromOpfs: 0,
     bytesFromNetwork: 0,
+    wireBytesReleased: 0,
+    droppedWasmBuffers: 0,
   });
   assert.deepEqual(p.getSnapshot(), initial);
 });
@@ -1930,6 +1932,8 @@ test('W147 honors AbortSignal immediately during retry backoff and tracks aborte
       opfsInvalidations: 0,
       bytesFromOpfs: 0,
       bytesFromNetwork: 0,
+      wireBytesReleased: 0,
+      droppedWasmBuffers: 0,
     });
     assert.deepEqual(preloader.getStats(), cleared);
   }

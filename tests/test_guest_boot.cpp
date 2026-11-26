@@ -13,6 +13,9 @@
 #include "abi/playgta6_abi.h"
 #include <thread>
 
+#include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_xs_exports.h"
+#include "gpu/d3d12_xs_xbox.h"
 #include "gpu/present_pacing.h"
 #include "guest/boot.h"
 #include "guest/com_bridge.h"
@@ -947,6 +950,9 @@ void test_fault_reports() {
         CHECK(run.report["startup"]["modules"][0]["pdata"].boolean == pdata);
         check_fault(run, "trap", kLeaf + 4, kLeaf);
         CHECK(run.report["fault"]["trap_kind"].text == "GUEST_TRAP");
+        CHECK(run.report["code_misses"]["trap"]["count"].number == 1);
+        CHECK(run.report["code_misses"]["trap"]["targets"][0].hex() == kLeaf + 4);
+        CHECK(run.report["code_misses"]["unknown_target"]["count"].number == 0);
         const Json& bt = run.report["backtrace"];
         CHECK(bt["method"].text == (pdata ? "rtl-virtual-unwind" : "stack-scan-call-verified"));
         CHECK(bt["frames"].items.size() == 2);
@@ -969,6 +975,15 @@ void test_fault_reports() {
     check_fault(run, "unknown_target", kUnknownInsideEntry, kEntry);
     CHECK(run.report["fault"]["trap_kind"].text == "INDIRECT_CALL_MISS");
     CHECK(run.report["fault"]["detail"].hex() == kEntry);  // nearest entry below the target
+    {
+        // The dispatch miss is counted and its target listed for recomp seeding (`--entry`).
+        const Json& misses = run.report["code_misses"];
+        CHECK(misses["unknown_target"]["count"].number == 1);
+        CHECK(misses["unknown_target"]["targets"].items.size() == 1);
+        CHECK(misses["unknown_target"]["targets"][0].hex() == kUnknownInsideEntry);
+        CHECK(misses["unknown_resume_target"]["count"].number == 0);
+        CHECK(misses["trap"]["targets"].items.empty());
+    }
     // (the synthetic unwind info describes the Trap scenario's frames; only the caller is exact here)
     CHECK(!run.report["backtrace"]["frames"].items.empty());
     CHECK(run.report["backtrace"]["frames"][0]["return_address"].hex() == kEntryCallsIat);
@@ -1764,6 +1779,210 @@ void test_boot_options_and_report_sink() {
     }));
 }
 
+// G71 (#663, #1508): fence_publish_lag_frames, fence_publish_cap_ms, and present_max_interval
+// boot options: defaults, JSON parsing, validation, run_boot wiring, and PresentX interval clamping.
+void test_fence_lag_and_present_max_interval() {
+    // 1. Defaults match G69 (#1508) and console-faithful pacing (0 = no clamp).
+    {
+        BootConfig cfg;
+        CHECK(cfg.fence_publish_lag);
+        CHECK(cfg.fence_publish_lag_frames == 1u);
+        CHECK(cfg.fence_publish_cap_ms == 33u);
+        CHECK(cfg.present_max_interval == 0u);
+    }
+
+    // 2. JSON parsing: valid overrides, zeros, independent fields, no key-prefix collision.
+    {
+        BootConfig cfg;
+        CHECK(apply_boot_options_json(
+            "{\"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 50, \"present_max_interval\": 1}",
+            cfg));
+        CHECK(cfg.fence_publish_lag);
+        CHECK(cfg.fence_publish_lag_frames == 2u);
+        CHECK(cfg.fence_publish_cap_ms == 50u);
+        CHECK(cfg.present_max_interval == 1u);
+
+        // fence_publish_lag: false disables lag cleanly without corrupting numeric lag fields.
+        CHECK(apply_boot_options_json("{\"fence_publish_lag\": false}", cfg));
+        CHECK(!cfg.fence_publish_lag);
+        CHECK(cfg.fence_publish_lag_frames == 2u);
+        CHECK(cfg.fence_publish_cap_ms == 50u);
+
+        // Zero values are accepted for all three uint32 fields.
+        CHECK(apply_boot_options_json(
+            "{\"fence_publish_lag\": true, \"fence_publish_lag_frames\": 0, "
+            "\"fence_publish_cap_ms\": 0, \"present_max_interval\": 0}",
+            cfg));
+        CHECK(cfg.fence_publish_lag);
+        CHECK(cfg.fence_publish_lag_frames == 0u);
+        CHECK(cfg.fence_publish_cap_ms == 0u);
+        CHECK(cfg.present_max_interval == 0u);
+
+        // Max uint32 boundary is accepted.
+        CHECK(apply_boot_options_json(
+            "{\"fence_publish_lag_frames\": 4294967295, \"fence_publish_cap_ms\": 4294967295, "
+            "\"present_max_interval\": 4294967295}",
+            cfg));
+        CHECK(cfg.fence_publish_lag_frames == 4294967295u);
+        CHECK(cfg.fence_publish_cap_ms == 4294967295u);
+        CHECK(cfg.present_max_interval == 4294967295u);
+    }
+
+    // 3. Validation: negative, string, bool, float, uint32 overflow, and uint64 overflow leave fields untouched.
+    {
+        BootConfig cfg;
+        cfg.fence_publish_lag_frames = 2u;
+        cfg.fence_publish_cap_ms = 40u;
+        cfg.present_max_interval = 1u;
+
+        const char* bad_inputs[] = {
+            "{\"fence_publish_lag_frames\": -1, \"fence_publish_cap_ms\": -5, \"present_max_interval\": -2}",
+            "{\"fence_publish_lag_frames\": \"2\", \"fence_publish_cap_ms\": \"16\", \"present_max_interval\": \"1\"}",
+            "{\"fence_publish_lag_frames\": true, \"fence_publish_cap_ms\": false, \"present_max_interval\": null}",
+            "{\"fence_publish_lag_frames\": 1.5, \"fence_publish_cap_ms\": 33.3, \"present_max_interval\": 1.0}",
+            "{\"fence_publish_lag_frames\": 4294967296, \"fence_publish_cap_ms\": 4294967296, \"present_max_interval\": 4294967296}",
+            "{\"fence_publish_lag_frames\": 99999999999999999999999, \"fence_publish_cap_ms\": 99999999999999999999999, \"present_max_interval\": 99999999999999999999999}",
+        };
+        for (const char* json : bad_inputs) {
+            CHECK(apply_boot_options_json(json, cfg));
+            CHECK(cfg.fence_publish_lag_frames == 2u);
+            CHECK(cfg.fence_publish_cap_ms == 40u);
+            CHECK(cfg.present_max_interval == 1u);
+        }
+    }
+
+    // 4. run_boot wiring to DeviceOptions and xbox::present_max_interval().
+    {
+        gpu::d3d12_xs_exports::reset_for_tests();
+        const Run r1 = boot_scenario(Scenario::ReturnCode, [](BootConfig& c) {
+            CHECK(apply_boot_options_json(
+                "{\"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 66, \"present_max_interval\": 1}",
+                c));
+        });
+        CHECK(r1.result.status == BootStatus::Exited);
+        const gpu::d3d12_guest::DeviceOptions opts1 = gpu::d3d12_xs_exports::device_options();
+        CHECK(opts1.fence_publish_lag);
+        CHECK(opts1.fence_publish_lag_frames == 2u);
+        CHECK(opts1.fence_publish_cap_ms == 66u);
+        CHECK(gpu::d3d12_guest::xbox::present_max_interval() == 1u);
+
+        // fence_publish_lag: false disables lag cleanly on DeviceOptions and Device even with lag_frames > 0.
+        const Run r2 = boot_scenario(Scenario::ReturnCode, [](BootConfig& c) {
+            CHECK(apply_boot_options_json(
+                "{\"fence_publish_lag\": false, \"fence_publish_lag_frames\": 2, \"fence_publish_cap_ms\": 50}",
+                c));
+        });
+        CHECK(r2.result.status == BootStatus::Exited);
+        const gpu::d3d12_guest::DeviceOptions opts2 = gpu::d3d12_xs_exports::device_options();
+        CHECK(!opts2.fence_publish_lag);
+        CHECK(opts2.fence_publish_lag_frames == 2u);
+        CHECK(opts2.fence_publish_cap_ms == 50u);
+        CHECK(gpu::d3d12_guest::xbox::present_max_interval() == 0u);
+        {
+            gpu::d3d12_guest::DeviceOptions dev_opts = opts2;
+            dev_opts.sink = [](const uint8_t*, size_t) {};
+            gpu::d3d12_guest::Device dev(dev_opts);
+            CHECK(!dev.fence_publish_lag());
+            CHECK(dev.fence_publish_lag_frames() == 0u);
+            CHECK(dev.fence_publish_cap_ms() == 50u);
+            dev.shutdown_frame_events();
+        }
+
+        // Subsequent default boot restores lag_frames=1, cap_ms=33, present_max_interval=0.
+        gpu::d3d12_xs_exports::reset_for_tests();
+        const Run r3 = boot_scenario(Scenario::ReturnCode);
+        CHECK(r3.result.status == BootStatus::Exited);
+        const gpu::d3d12_guest::DeviceOptions opts3 = gpu::d3d12_xs_exports::device_options();
+        CHECK(opts3.fence_publish_lag);
+        CHECK(opts3.fence_publish_lag_frames == 1u);
+        CHECK(opts3.fence_publish_cap_ms == 33u);
+        CHECK(gpu::d3d12_guest::xbox::present_max_interval() == 0u);
+    }
+
+    // 5. CommandQueue::PresentX interval clamping right before present_pacer().present(...).
+    {
+        namespace dg = gpu::d3d12_guest;
+        com::set_guest_memory(g_arena);
+        gpu::present_pacer().reset_for_testing();
+        gpu::present_pacer().set_enabled(true);
+
+        auto now = gpu::PresentPacer::Clock::time_point{};
+        gpu::present_pacer().set_clock_for_testing(
+            [&] { return now; },
+            [&](gpu::PresentPacer::Clock::time_point target) { now = target; },
+            now);
+
+        dg::DeviceOptions opts;
+        opts.sink = [](const uint8_t*, size_t) {};
+        opts.fence_publish_lag = false;
+        com::Ref<dg::Device> dev = com::create_object<dg::Device>(com::implements(dg::kID3D12Device), opts);
+        CHECK(static_cast<bool>(dev));
+        dev->initialize_guest_payload();
+
+        dg::GuestCommandQueueDesc qdesc{};
+        com::Ref<dg::CommandQueue> queue =
+            com::create_object<dg::CommandQueue>(com::implements(dg::kID3D12CommandQueue), dev, qdesc);
+        CHECK(static_cast<bool>(queue));
+
+        // Title requests 30 Hz (33333 us -> 2 vblanks on a 60 Hz display).
+        CHECK(dev->SetFrameIntervalX(0, 33333u, 1u, 0u) == dg::kSOk);
+        CHECK(dev->present_interval_vblanks() == 2u);
+
+        const uint64_t guest_page = g_arena->reserve(0, os::kPageSize, os::PageProtect::ReadWrite);
+        CHECK(guest_page != 0 && g_arena->commit(guest_page, os::kPageSize, os::PageProtect::ReadWrite));
+        dg::xbox::GuestPresentPlaneX plane{};
+        CHECK(g_arena->write(guest_page, &plane, sizeof(plane)));
+        const uint64_t params_va = guest_page + 0x100;
+        const uint32_t non_immediate = 0u;
+        const uint32_t immediate = 1u;
+        CHECK(g_arena->write(params_va, &non_immediate, sizeof(non_immediate)));
+
+        // Default present_max_interval = 0 -> no clamp, honors title's 2-vblank (30 Hz) interval.
+        dg::xbox::set_present_max_interval(0u);
+        CHECK(queue->PresentX(1u, guest_page, params_va) == dg::kSOk);
+        CHECK(gpu::present_pacer().stats().last_interval == 2u);
+        const auto t_after_first = now;
+        CHECK(queue->PresentX(1u, guest_page, params_va) == dg::kSOk);
+        CHECK(gpu::present_pacer().stats().last_interval == 2u);
+        CHECK(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_after_first).count() ==
+              2 * gpu::PresentPacer::kVblankNs);
+
+        // present_max_interval = 1 -> clamps 2-vblank title interval to 1 vblank (60 Hz cap).
+        dg::xbox::set_present_max_interval(1u);
+        const auto t_before_clamp = now;
+        CHECK(queue->PresentX(1u, guest_page, params_va) == dg::kSOk);
+        CHECK(gpu::present_pacer().stats().last_interval == 1u);
+        CHECK(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_before_clamp).count() ==
+              1 * gpu::PresentPacer::kVblankNs);
+
+        // present_max_interval = 3 (> title's 2) -> keeps title's 2-vblank interval.
+        dg::xbox::set_present_max_interval(3u);
+        const auto t_before_higher = now;
+        CHECK(queue->PresentX(1u, guest_page, params_va) == dg::kSOk);
+        CHECK(gpu::present_pacer().stats().last_interval == 2u);
+        CHECK(std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_before_higher).count() ==
+              2 * gpu::PresentPacer::kVblankNs);
+
+        // Immediate present (parameters[0] != 0) stays interval 0 even when present_max_interval = 1.
+        CHECK(g_arena->write(params_va, &immediate, sizeof(immediate)));
+        dg::xbox::set_present_max_interval(1u);
+        const auto t_before_imm = now;
+        CHECK(queue->PresentX(1u, guest_page, params_va) == dg::kSOk);
+        CHECK(gpu::present_pacer().stats().last_interval == 0u);
+        CHECK(now == t_before_imm);
+
+        // Clean up global test state.
+        dg::xbox::set_present_max_interval(0u);
+        dev->shutdown_frame_events();
+        queue.reset();
+        dev.reset();
+        g_arena->release(guest_page);
+        com::reset_com_bridge();
+        gpu::d3d12_xs_exports::reset_for_tests();
+        gpu::present_pacer().reset_for_testing();
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1794,6 +2013,7 @@ int main() {
     test_host_fault_mapping();
     test_shard_dispatch_boot();
     test_boot_options_and_report_sink();
+    test_fence_lag_and_present_max_interval();
 
     reset_boot();
     os::win32::set_vmem_arena(nullptr);

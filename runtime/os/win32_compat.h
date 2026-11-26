@@ -361,6 +361,48 @@ uint64_t get_unhandled_exception_filter();
 // registrations (the runtime never calls them back on its own).
 size_t app_notification_registration_count();
 
+// Process lifetime management (PLM). Both callbacks are `void CALLBACK(BOOLEAN flag, PVOID context)`:
+// flag is `quiesced` for app-state routines and `constrained` for constrained-change routines.
+enum class AppNotificationKind : uint8_t { State, Constrained };
+struct AppNotification {
+    AppNotificationKind kind;
+    uint64_t routine;  // guest address
+    uint8_t flag;      // BOOLEAN quiesced / constrained
+    uint64_t context;
+};
+// Calls one guest routine; the runtime supplies it (only it can enter guest code).
+using AppNotificationInvoker = void (*)(const AppNotification& call, void* user);
+size_t app_notification_registration_count(AppNotificationKind kind);
+// Suspend in the documented GDK order: every constrained-change routine with TRUE, then every
+// app-state routine with quiesced = TRUE (a title's suspend handler can wait on work its constrained
+// handler started). Resume: app-state routines with FALSE, then constrained-change routines with
+// FALSE. Each group runs in registration order. Returns the number of routines called.
+size_t dispatch_app_suspend(AppNotificationInvoker invoker, void* user);
+size_t dispatch_app_resume(AppNotificationInvoker invoker, void* user);
+
+// XLaunchNewGame of the running title: the guest stops with this exit code, and the native harness
+// (tools/run_native_boot.py) and the browser boot turn it into a relaunch with the same arguments.
+// ASCII "RELN" so it cannot collide with a title's own exit codes in practice.
+inline constexpr uint32_t kRelaunchSelfExitCode = 0x52454C4Eu;
+
+// Guest restart (XLaunchNewGame of the running title): the new arguments are recorded, the hook
+// (the boot installs one that runs the guest's suspend routines) runs, then the process stops with
+// kRelaunchSelfExitCode. The host (native main, browser loader) restarts with the same options plus
+// these arguments. Cleared by reset_relaunch_request.
+using RelaunchPrepareHook = void (*)(void* user);
+void set_relaunch_prepare_hook(RelaunchPrepareHook hook, void* user);
+// Records `args` and runs the prepare hook (no-op without one).
+void begin_guest_relaunch(std::string_view args);
+bool relaunch_requested(std::string* args_out);
+void reset_relaunch_request();
+// The relaunch suspend sequence: constrained-change routines, then app-state routines (suspend order,
+// dispatch_app_suspend), then `grace` (sleep for the grace period, ~1 s). Returns routines called.
+using RelaunchGraceFn = void (*)(uint32_t grace_ms, void* user);
+inline constexpr uint32_t kRelaunchGraceMs = 1000;
+size_t run_relaunch_suspend_sequence(AppNotificationInvoker invoker, void* invoker_user,
+                                     RelaunchGraceFn grace, void* grace_user,
+                                     uint32_t grace_ms = kRelaunchGraceMs);
+
 // In-memory registry (empty by default). Keys are "HKLM\\Software\\Vendor" style paths (root names
 // HKCR, HKCU, HKLM, HKU or their long forms; case-insensitive); values are stored per key.
 void registry_set_value(std::string_view key_path,

@@ -356,3 +356,305 @@ fn sse4a_bit_fields_execute() {
         assert_eq!(hi, d1, "case {i}: upper quadword preserved");
     }
 }
+
+#[test]
+fn r59_wasm64_simd128_codegen_and_edge_cases() {
+    if !exec_or_skip("r59_wasm64_simd128_codegen_and_edge_cases") {
+        return;
+    }
+    use crate::lift::STATE_YMM_HI_OFFSET;
+    use crate::lift::compile::{LlvmTool, find_llvm_tool};
+
+    const YMMH_STATE: u64 = STATE_ADDR + STATE_YMM_HI_OFFSET;
+
+    // 1) Verify LLVM emits native Wasm64 SIMD128 instructions (no stack spills or scalar loops).
+    if let Some(LlvmTool::Llc { llc, opt }) = find_llvm_tool() {
+        let dir = std::env::temp_dir().join(format!(
+            "playgta6_r59_asm_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let probes: Vec<(&str, crate::cfg::Function)> = vec![
+            (
+                "psadbw",
+                asm_function(CODE_BASE, |a| {
+                    a.psadbw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "vpermd",
+                asm_function(CODE_BASE + 0x100, |a| {
+                    a.vpermd(ymm0, ymm1, ymm2)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "vpermilps",
+                asm_function(CODE_BASE + 0x200, |a| {
+                    a.vpermilps(xmm0, xmm1, xmm2)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "vpermilpd",
+                asm_function(CODE_BASE + 0x300, |a| {
+                    a.vpermilpd(xmm0, xmm1, xmm2)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "vptest",
+                asm_function(CODE_BASE + 0x400, |a| {
+                    a.vptest(ymm0, ymm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "pmuludq",
+                asm_function(CODE_BASE + 0x500, |a| {
+                    a.paddd(xmm0, xmm2)?;
+                    a.paddd(xmm1, xmm2)?;
+                    a.pmuludq(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "pmuldq",
+                asm_function(CODE_BASE + 0x600, |a| {
+                    a.paddd(xmm0, xmm2)?;
+                    a.paddd(xmm1, xmm2)?;
+                    a.pmuldq(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "cvtpd2ps",
+                asm_function(CODE_BASE + 0x700, |a| {
+                    a.cvtpd2ps(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "cvtpd2dq",
+                asm_function(CODE_BASE + 0x800, |a| {
+                    a.cvtpd2dq(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+            (
+                "phminposuw",
+                asm_function(CODE_BASE + 0x900, |a| {
+                    a.phminposuw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+            ),
+        ];
+        for (name, func) in &probes {
+            let m = lift_module([func]).expect("lift");
+            let ll = dir.join(format!("{name}.ll"));
+            let bc = dir.join(format!("{name}.bc"));
+            let asm_path = dir.join(format!("{name}.s"));
+            std::fs::write(&ll, &m.ir).expect("write ll");
+            let input = if let Some(opt_bin) = &opt {
+                let st = std::process::Command::new(opt_bin)
+                    .args(["-O2"])
+                    .arg(&ll)
+                    .arg("-o")
+                    .arg(&bc)
+                    .status()
+                    .expect("run opt");
+                assert!(st.success(), "opt failed on {name}");
+                &bc
+            } else {
+                &ll
+            };
+            let st = std::process::Command::new(&llc)
+                .args(["-mtriple=wasm64-unknown-unknown", "-O2", "-filetype=asm"])
+                .arg(input)
+                .arg("-o")
+                .arg(&asm_path)
+                .status()
+                .expect("run llc");
+            assert!(st.success(), "llc failed on {name}");
+            let asm = std::fs::read_to_string(&asm_path).expect("read asm");
+            match *name {
+                "psadbw" => {
+                    assert!(asm.contains("i8x16.max_u"), "{asm}");
+                    assert!(asm.contains("i8x16.min_u"), "{asm}");
+                    assert!(!asm.contains("extract_lane"), "psadbw scalarized:\n{asm}");
+                }
+                "vpermd" | "vpermilps" => {
+                    assert!(asm.contains("i8x16.swizzle"), "{name}:\n{asm}");
+                    assert!(!asm.contains("__stack_pointer"), "{name} spilled stack:\n{asm}");
+                }
+                "vpermilpd" => {
+                    assert!(asm.contains("v128.bitselect"), "{asm}");
+                    assert!(!asm.contains("__stack_pointer"), "vpermilpd spilled stack:\n{asm}");
+                }
+                "vptest" => {
+                    assert!(asm.contains("v128.any_true"), "{asm}");
+                    assert!(!asm.contains("i64x2.extract_lane"), "vptest extracted lanes:\n{asm}");
+                }
+                "pmuludq" => {
+                    // Newer LLVM (23+) `opt -O2` canonicalizes zext(shuffle) into an `and` with
+                    // 0xFFFFFFFF that the wasm backend no longer folds back into `extmul`; the
+                    // masked `i64x2.mul` is still a pure SIMD128 sequence (no scalarization).
+                    assert!(
+                        asm.contains("i64x2.extmul_low_i32x4_u")
+                            || (asm.contains("v128.and") && asm.contains("4294967295")),
+                        "{asm}"
+                    );
+                    assert!(!asm.contains("extract_lane"), "pmuludq scalarized:
+{asm}");
+                }
+                "pmuldq" => {
+                    // See pmuludq: newer LLVM may keep a shl/shr_s sign-extension + `i64x2.mul`.
+                    assert!(
+                        asm.contains("i64x2.extmul_low_i32x4_s")
+                            || (asm.contains("i64x2.shr_s") && asm.contains("i64x2.mul")),
+                        "{asm}"
+                    );
+                    assert!(!asm.contains("extract_lane"), "pmuldq scalarized:
+{asm}");
+                }
+                "cvtpd2ps" => {
+                    assert!(asm.contains("f32x4.demote_f64x2_zero"), "{asm}");
+                }
+                "cvtpd2dq" => {
+                    assert!(asm.contains("i32x4.trunc_sat_f64x2_s_zero"), "{asm}");
+                }
+                "phminposuw" => {
+                    assert!(asm.contains("i16x8.min_u"), "{asm}");
+                    assert!(asm.contains("i16x8.bitmask"), "{asm}");
+                }
+                _ => {}
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 2) Execute critical edge cases under Wasm64 (Node):
+    //    - pmulhrsw(-32768, -32768) == -32768 (wraps, does NOT saturate to 32767)
+    //    - vpmulhrsw (VEX-128) zeroes ymm0[128..255]
+    //    - pmaddwd(-32768, -32768) == -2147483648
+    //    - psadbw max byte diff (0 vs 255 -> [2040, 2040])
+    //    - cvttpd2dq on -2147483648.9 and +inf -> [-2147483648, -2147483648, 0, 0]
+    let f_pmulhrsw = CODE_BASE;
+    let f_vpmulhrsw = CODE_BASE + 0x100;
+    let f_pmaddwd = CODE_BASE + 0x200;
+    let f_psadbw = CODE_BASE + 0x300;
+    let f_cvttpd2dq = CODE_BASE + 0x400;
+    let f_phminposuw = CODE_BASE + 0x500;
+    let program = Program::new()
+        .asm(f_pmulhrsw, |a| {
+            a.pmulhrsw(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_vpmulhrsw, |a| {
+            a.vpmulhrsw(xmm0, xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(f_pmaddwd, |a| {
+            a.pmaddwd(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_psadbw, |a| {
+            a.psadbw(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_cvttpd2dq, |a| {
+            a.cvttpd2dq(xmm0, xmm1)?;
+            a.ret()
+        })
+        .asm(f_phminposuw, |a| {
+            a.phminposuw(xmm0, xmm1)?;
+            a.ret()
+        });
+    let functions = program.discover();
+    let built = build("r59_edge", functions.values());
+
+    let words = |ws: [i16; 8]| -> Vec<u8> { ws.iter().flat_map(|w| w.to_le_bytes()).collect() };
+
+    // pmulhrsw edge pairs
+    let mut c_hrsw = Case::new(f_pmulhrsw);
+    let mut xmms = vec![0u8; 48];
+    xmms[0..16].copy_from_slice(&words([-32768, -32768, -1, 32767, 16384, -16384, 0, 1]));
+    xmms[16..32].copy_from_slice(&words([-32768, 32767, 1, 32767, 16384, 16384, -32768, 16384]));
+    c_hrsw.mem.push((XMM_STATE, xmms.clone()));
+    c_hrsw.read.push((XMM_STATE, 16));
+
+    // vpmulhrsw VEX-128 zeroing of upper 128 bits
+    let mut c_vhrsw = Case::new(f_vpmulhrsw);
+    let mut vxmms = vec![0u8; 48];
+    vxmms[16..32].copy_from_slice(&words([-32768; 8]));
+    vxmms[32..48].copy_from_slice(&words([-32768; 8]));
+    c_vhrsw.mem.push((XMM_STATE, vxmms));
+    c_vhrsw.mem.push((YMMH_STATE, vec![0xA5u8; 16]));
+    c_vhrsw.read.push((XMM_STATE, 16));
+    c_vhrsw.read.push((YMMH_STATE, 16));
+
+    // pmaddwd(-32768, -32768)
+    let mut c_madd = Case::new(f_pmaddwd);
+    let mut mxmms = vec![0u8; 32];
+    mxmms[0..16].copy_from_slice(&words([-32768; 8]));
+    mxmms[16..32].copy_from_slice(&words([-32768; 8]));
+    c_madd.mem.push((XMM_STATE, mxmms));
+    c_madd.read.push((XMM_STATE, 16));
+
+    // psadbw(0x00.., 0xFF..) -> [2040, 2040]
+    let mut c_sad = Case::new(f_psadbw);
+    let mut sxmms = vec![0u8; 32];
+    sxmms[16..32].fill(0xFF);
+    c_sad.mem.push((XMM_STATE, sxmms));
+    c_sad.read.push((XMM_STATE, 16));
+
+    // cvttpd2dq([-2147483648.9, +inf]) -> [0x80000000, 0x80000000, 0, 0]
+    let mut c_cvt = Case::new(f_cvttpd2dq);
+    let mut cxmms = vec![0u8; 32];
+    cxmms[16..24].copy_from_slice(&(-2147483648.9f64).to_le_bytes());
+    cxmms[24..32].copy_from_slice(&f64::INFINITY.to_le_bytes());
+    c_cvt.mem.push((XMM_STATE, cxmms));
+    c_cvt.read.push((XMM_STATE, 16));
+
+    // phminposuw tie-breaking: lanes 2 and 5 both hold 7 -> min=7, index=2
+    let mut c_minpos = Case::new(f_phminposuw);
+    let mut pxmms = vec![0u8; 32];
+    pxmms[16..32].copy_from_slice(&words([100, 50, 7, 99, 8, 7, 1000, 12]));
+    c_minpos.mem.push((XMM_STATE, pxmms));
+    c_minpos.read.push((XMM_STATE, 16));
+
+    let out = run(&built, &[c_hrsw, c_vhrsw, c_madd, c_sad, c_cvt, c_minpos]);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+    assert_eq!(
+        out[0].mem[0],
+        words([-32768, -32767, 0, 32766, 8192, -8192, 0, 1]),
+        "pmulhrsw edge cases"
+    );
+    assert_eq!(out[1].mem[0], words([-32768; 8]), "vpmulhrsw lo");
+    assert_eq!(out[1].mem[1], vec![0u8; 16], "vpmulhrsw VEX-128 zeroes ymm0_hi");
+    assert_eq!(
+        out[2].mem[0],
+        [-2147483648i32; 4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+        "pmaddwd -32768*-32768 wrap"
+    );
+    assert_eq!(out[3].mem[0], xmm_bytes(2040, 2040), "psadbw max diff");
+    assert_eq!(
+        out[4].mem[0],
+        [-2147483648i32, -2147483648, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect::<Vec<_>>(),
+        "cvttpd2dq edge cases"
+    );
+    assert_eq!(
+        out[5].mem[0],
+        words([7, 2, 0, 0, 0, 0, 0, 0]),
+        "phminposuw tie-breaking"
+    );
+}

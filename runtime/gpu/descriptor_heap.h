@@ -836,6 +836,10 @@ struct ShaderBinding {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    // Non-power-of-two descriptor step (G62, #482; S63 lane-indexed windows the stage scales with
+    // s_mul_i32, e.g. * 24): when non-zero the byte offset is index * heap_stride instead of
+    // index << heap_shift (32-bit wrapping either way). 0 = shift.
+    uint32_t heap_stride = 0;
     // Binding array element (G62, #482; a lane-indexed heap window bound as a WGSL binding_array):
     // element `array_index` of an array of `array_size` heap descriptors. The element reads the heap
     // index above plus array_index (the window starts at that index). array_size 0 = not an array.
@@ -860,7 +864,8 @@ inline bool same_join(const ShaderBinding& a, const ShaderBinding& b) noexcept {
            a.heap_index_parameter == b.heap_index_parameter && a.heap_index_dword == b.heap_index_dword &&
            a.heap_shift == b.heap_shift && a.heap_index_source == b.heap_index_source &&
            a.cb_table_slot == b.cb_table_slot && a.cb_byte_offset == b.cb_byte_offset &&
-           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.array_size == b.array_size &&
+           a.cb_bit_offset == b.cb_bit_offset && a.cb_mask == b.cb_mask && a.heap_stride == b.heap_stride &&
+           a.array_size == b.array_size &&
            a.array_index == b.array_index && a.table_parameter == b.table_parameter &&
            a.table_slot == b.table_slot && a.inline_sampler == b.inline_sampler &&
            std::memcmp(&a.sampler, &b.sampler, sizeof(a.sampler)) == 0;
@@ -890,6 +895,7 @@ struct PlanEntry {
     uint32_t cb_byte_offset = 0;
     uint32_t cb_bit_offset = 0;
     uint32_t cb_mask = 0xffffffffu;
+    uint32_t heap_stride = 0;      // HeapIndexed: non-zero = byte offset is index * heap_stride (ShaderBinding::heap_stride)
     uint32_t heap_index_bias = 0;  // HeapIndexed: added to the index (binding array element, ShaderBinding::array_index)
     SamplerDesc sampler{};                     // InlineSampler
 };
@@ -991,6 +997,31 @@ struct CachedBindGroup {
     std::vector<BindGroupEntry> entries;  // sorted by binding
     uint32_t gpu_id = 0;  // WebGPU bind group id, assigned by the caller after a rebuild
     uint32_t null_entries = 0;
+    uint64_t last_used_epoch = 0;  // BindGroupCache epoch of the last lookup that returned it
+    // G66 (#691): entries the bridge bound as a relocated copy (relocate_uniform / relocate_storage)
+    // and the home it got, with the relocation epoch at that time. A cache hit does not relocate
+    // again, so a home the device has since handed to another range must be noticed here.
+    struct Relocation {
+        uint32_t entry = 0;
+        bool storage = false;
+        uint64_t va = 0;
+        uint64_t size = 0;
+        uint64_t binding_size = 0;
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+    };
+    std::vector<Relocation> relocations;
+    uint64_t relocation_epoch = 0;
+    // G66 (#691): the bridge's resource retire epoch when the entries were last checked live.
+    uint64_t retire_epoch = 0;
+    // G66 partly-held mip chains: the bridge's residency epoch when the entries' mip clamps were
+    // last checked, and a hash of (texture, clamped base mip) over its texture entries.
+    uint64_t residency_epoch = 0;
+    uint64_t residency_key = 0;
+    // G70 (#691): bridge-interned view ids backing TextureView entries in this bind group, so
+    // retiring a texture's interned views immediately invalidates cached bind groups referencing them.
+    std::vector<uint32_t> view_ids;
+    uint64_t key_hash = 0;
 
     // Internal validity data.
     std::vector<uint64_t> key;
@@ -1011,14 +1042,16 @@ struct CachedBindGroup {
 };
 
 // Re-reads the memory-backed table entries of `group` (built for `plan`) through `source`: true
-// when the windows' words changed since the build, in which case the table entries and
-// built_words are rebuilt (other entries are kept). Heaps are looked up again by their handles.
+// when the windows' words changed since the build (or `force_rebuild` is true), in which case the
+// table entries and built_words are rebuilt (other entries are kept). Heaps are looked up again by
+// their handles.
 bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
                            const DescriptorSlotSource& source,
                            const BindGroupPlan& plan,
                            GpuVaResolver resolver,
                            void* resolver_user,
-                           CachedBindGroup* group);
+                           CachedBindGroup* group,
+                           bool force_rebuild = false);
 
 struct BindGroupLookup {
     Status status = Status::Ok;
@@ -1046,6 +1079,26 @@ public:
 
     // Drops every entry, appending their gpu ids (if non-zero) to `retired`.
     void clear(std::vector<uint32_t>* retired);
+    // Drops one entry (a pointer a lookup returned); returns its gpu id (0 when none / not cached).
+    uint32_t erase(const CachedBindGroup* group);
+    // G70 (#691): immediately evicts every cached entry referencing `resource_id` (directly in
+    // entries/views or in relocations) and appends their non-zero gpu ids to `retired`.
+    size_t evict_resource(uint32_t resource_id, std::vector<uint32_t>* retired = nullptr);
+    // G70 (#691): immediately evicts every cached entry referencing any id in `resource_ids`
+    // (entries/views/relocations) or any interned view id in `view_ids`, appending retired gpu ids
+    // and optionally the evicted entries' cache key hashes.
+    size_t evict_resources_and_views(std::span<const uint32_t> resource_ids,
+                                     std::span<const uint32_t> view_ids,
+                                     std::vector<uint32_t>* retired = nullptr,
+                                     std::vector<uint64_t>* evicted_key_hashes = nullptr);
+    // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
+    // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
+    // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
+    // the entries the current epoch did not use, then everything if still above the bound; the gpu
+    // ids of dropped entries go to `retired`. Then starts a new epoch. Only call it when no open
+    // recording references the entries (command-list Reset). Returns the number dropped.
+    size_t end_epoch(size_t max_entries, std::vector<uint32_t>* retired);
+    uint64_t epoch() const noexcept { return epoch_; }
     // Tables in heaps the source reads come from descriptor memory (nullptr: registry only).
     void set_slot_source(const DescriptorSlotSource* source) noexcept { slot_source_ = source; }
     const DescriptorSlotSource* slot_source() const noexcept { return slot_source_; }
@@ -1077,6 +1130,7 @@ private:
     std::vector<uint64_t> scratch_key_;
     std::vector<uint8_t> scratch_words_;
     const DescriptorSlotSource* slot_source_ = nullptr;
+    uint64_t epoch_ = 1;
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
     uint64_t heap_index_misses_ = 0;

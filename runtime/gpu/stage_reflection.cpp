@@ -294,7 +294,7 @@ bool parse_cb_dword(const Json& body, ReflectedBinding* r) {
     return ok && r->cb_bit_offset < 32 && r->cb_mask != 0 && r->cb_byte_offset % 4 == 0;
 }
 
-bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
+bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::string* error) {
     const std::string stage = get_string(s, "stage");
     if (stage == "vertex") {
         out->stage = ReflectedStage::Vertex;
@@ -305,6 +305,17 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
     } else {
         *error = "unknown stage \"" + stage + "\"";
         return false;
+    }
+    if (const Json* mesh = s.get("mesh_output"); mesh != nullptr) {
+        bridge::MeshOutputLayout& m = out->mesh_output;
+        if (mesh->type != Json::Type::Object || !get_u32(*mesh, "max_vertices", &m.max_vertices) ||
+            !get_u32(*mesh, "max_primitives", &m.max_primitives) || !get_u32(*mesh, "vertex_words", &m.vertex_words) ||
+            !bridge::valid_mesh_output_layout(m)) {
+            *error = "mesh_output needs max_vertices and max_primitives in 1..256 and vertex_words 4 + 4 * n (n <= " +
+                     std::to_string(bridge::kMaxMeshAttributes) + ")";
+            return false;
+        }
+        out->has_mesh_output = true;
     }
     if (const Json* inputs = s.get("vertex_inputs"); inputs != nullptr && inputs->type == Json::Type::Array) {
         for (const Json& in : inputs->array) {
@@ -450,6 +461,19 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                     *error = "inline_sampler needs sdwords: four 32-bit unsigned integers";
                     return false;
                 }
+            } else if (const Json* unresolved = src->get("unresolved"); unresolved != nullptr) {
+                const bool marked = (unresolved->type == Json::Type::Bool && unresolved->boolean) ||
+                                    (unresolved->type == Json::Type::String && !unresolved->string.empty());
+                if (version < kStageReflectionVersionUnresolved || !marked) {
+                    *error = "unresolved source needs \"unresolved\": true or a reason string, and version >= 3";
+                    return false;
+                }
+                if (r.kind == ReflectedBindingKind::Storage || r.kind == ReflectedBindingKind::StorageTexture) {
+                    *error = std::string("a ") + (r.kind == ReflectedBindingKind::Storage ? "storage" : "storage_texture") +
+                             " binding cannot have an unresolved source";
+                    return false;
+                }
+                r.source = ReflectedSource::Unresolved;
             } else if (src->get("static_sampler") != nullptr) {
                 r.source = ReflectedSource::StaticSampler;
                 if (!get_u32(*src, "static_sampler", &r.static_sampler)) {
@@ -465,6 +489,14 @@ bool parse_stage(const Json& s, StageReflection* out, std::string* error) {
                     r.source = ReflectedSource::RootConstants;
                 } else if (get_bool(*src, "root_descriptor")) {
                     r.source = ReflectedSource::RootDescriptor;
+                    if (version >= kStageReflectionVersionRootTableOffset &&
+                        src->get("table_byte_offset") != nullptr) {
+                        if (!get_u32(*src, "table_byte_offset", &r.table_byte_offset)) {
+                            *error = "bad root_descriptor table_byte_offset";
+                            return false;
+                        }
+                        r.root_table_offset_given = true;
+                    }
                 } else if (!get_u32(*src, "table_byte_offset", &r.table_byte_offset)) {
                     *error = "source needs table_byte_offset, root_constants or root_descriptor";
                     return false;
@@ -538,7 +570,11 @@ std::string binding_key(const ReflectedBinding& b) {
                          : b.cbv == ReflectedCbv::RootConstants ? std::string("root constants")
                                                                  : "table + " + std::to_string(b.table_byte_offset)) +
                         " at s" + std::to_string(b.user_sgpr) + ")[" + std::to_string(b.cb_byte_offset) + "]") +
-                 " + lane) << " + std::to_string(b.heap_shift) + "] x " + std::to_string(b.lane_max_count);
+                 " + lane)" +
+                 (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)
+                      ? " * " + std::to_string(b.heap_stride)
+                      : " << " + std::to_string(b.heap_shift)) +
+                 "] x " + std::to_string(b.lane_max_count);
             break;
     }
     return k;
@@ -631,6 +667,27 @@ const char* class_name(ReflectedComponentType c) {
     return c == ReflectedComponentType::U32 ? "u32" : c == ReflectedComponentType::I32 ? "i32" : "f32";
 }
 
+// 32-bit component count of a Float32/Uint32/Sint32 format (0 for any other format).
+uint32_t dword_components(pso::WgpuVertexFormat f) {
+    using F = pso::WgpuVertexFormat;
+    switch (f) {
+        case F::Float32: case F::Uint32: case F::Sint32: return 1;
+        case F::Float32x2: case F::Uint32x2: case F::Sint32x2: return 2;
+        case F::Float32x3: case F::Uint32x3: case F::Sint32x3: return 3;
+        case F::Float32x4: case F::Uint32x4: case F::Sint32x4: return 4;
+        default: return 0;
+    }
+}
+
+pso::WgpuVertexFormat dword_format(ReflectedComponentType cls, uint32_t n) {
+    using F = pso::WgpuVertexFormat;
+    static constexpr F kF32[] = {F::Float32, F::Float32x2, F::Float32x3, F::Float32x4};
+    static constexpr F kU32[] = {F::Uint32, F::Uint32x2, F::Uint32x3, F::Uint32x4};
+    static constexpr F kI32[] = {F::Sint32, F::Sint32x2, F::Sint32x3, F::Sint32x4};
+    const F* t = cls == ReflectedComponentType::U32 ? kU32 : cls == ReflectedComponentType::I32 ? kI32 : kF32;
+    return t[n - 1];
+}
+
 }  // namespace
 
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error) {
@@ -643,7 +700,8 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
         return false;
     }
     uint32_t version = 0;
-    if (!get_u32(root, "version", &version) || version != 1) {
+    if (!get_u32(root, "version", &version) || version < kStageReflectionVersion ||
+        version > kStageReflectionMaxVersion) {
         *error = "unsupported reflection version";
         return false;
     }
@@ -661,13 +719,29 @@ bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* ou
         }
         StageReflection r;
         std::string why;
-        if (!parse_stage(s, &r, &why)) {
+        if (!parse_stage(s, version, &r, &why)) {
             *error = "stage " + key + ": " + why;
             return false;
         }
         (*out)[k] = std::move(r);
     }
     return true;
+}
+
+int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
+                                        uint32_t* dword) {
+    uint32_t sgpr = compute ? kComputeUserDataBase : kGraphicsUserDataBase;
+    for (size_t i = 0; i < rs.parameters.size(); ++i) {
+        const uint32_t n = parameter_dwords(rs.parameters[i]);
+        if (user_sgpr >= sgpr && user_sgpr < sgpr + n) {
+            if (dword != nullptr) {
+                *dword = user_sgpr - sgpr;
+            }
+            return static_cast<int>(i);
+        }
+        sgpr += n;
+    }
+    return -1;
 }
 
 int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr) {
@@ -740,6 +814,8 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     uint64_t outside_rs = 0;
     uint64_t lane_indexed = 0;
     uint64_t lane_arrays = 0;
+    uint64_t root_tables = 0;
+    uint64_t unresolved = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -848,6 +924,11 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
                 lb.join.heap_index_source = from;
                 lb.join.heap_shift = b.heap_shift;
+                // S63 emits a non-power-of-two scale (s_mul_i32 * 24) as shift 0 plus that stride;
+                // a power-of-two stride is the shift itself.
+                if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
+                    lb.join.heap_stride = b.heap_stride;
+                }
                 lb.join.array_size = b.lane_max_count;
                 if (b.lane_has_window_base) {
                     lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
@@ -874,6 +955,16 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 reg = space = d3d::kNoIndex;
                 lb.join.inline_sampler = true;
                 lb.join.sampler = desc;
+            } else if (b.source == ReflectedSource::Unresolved) {
+                // The translator could not trace the descriptor (#482): bind the worker's default
+                // for the kind (an unresolved register), so the rest of the stage still joins.
+                const bool sampler_kind =
+                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                                                              : d3d::DescriptorRangeType::Srv;
+                reg = space = d3d::kNoIndex;
+                ++unresolved;
             } else if (b.source == ReflectedSource::StaticSampler) {
                 cls = d3d::DescriptorRangeType::Sampler;
                 if (b.static_sampler < rs.static_samplers.size()) {
@@ -886,38 +977,57 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     reg = space = d3d::kNoIndex;
                 }
             } else {
-                const int pi = root_parameter_for_user_sgpr(rs, compute, b.user_sgpr);
+                uint32_t into = 0;
+                const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into);
                 if (pi < 0) {
-                    fail(b, "no root parameter starts at s" + std::to_string(b.user_sgpr));
+                    fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
+                    continue;
+                }
+                if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
+                    rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {
+                    fail(b, "s" + std::to_string(b.user_sgpr) + " is dword " + std::to_string(into) + " of root parameter " +
+                                std::to_string(pi) + ", not a table pointer or root descriptor");
                     continue;
                 }
                 const d3d::RootParameterDesc& p = rs.parameters[static_cast<size_t>(pi)];
                 const std::string pname = "root parameter " + std::to_string(pi);
-                switch (b.source) {
+                ReflectedSource source = b.source;
+                uint32_t table_byte_offset = b.table_byte_offset;
+                if (source == ReflectedSource::RootDescriptor &&
+                    p.parameter_type == d3d::RootParameterType::DescriptorTable) {
+                    // The stage builds its buffer from the SGPR that holds the table pointer (#482):
+                    // join the table's descriptor the sidecar names, else its first one.
+                    source = ReflectedSource::Table;
+                    table_byte_offset = b.root_table_offset_given ? b.table_byte_offset : 0;
+                    ++root_tables;
+                }
+                switch (source) {
                     case ReflectedSource::Table: {
                         if (p.parameter_type != d3d::RootParameterType::DescriptorTable) {
                             fail(b, pname + " is not a descriptor table");
                             continue;
                         }
-                        if (b.table_byte_offset % kTableSlotBytes != 0) {
-                            fail(b, pname + ": byte offset " + std::to_string(b.table_byte_offset) +
+                        if (table_byte_offset % kTableSlotBytes != 0) {
+                            fail(b, pname + ": byte offset " + std::to_string(table_byte_offset) +
                                         " is not a descriptor boundary");
                             continue;
                         }
                         const bool read_only_kind = b.kind != ReflectedBindingKind::Storage &&
                                                     b.kind != ReflectedBindingKind::StorageTexture;
                         const bool declared =
-                            table_slot_register(p, b.table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
+                            table_slot_register(p, table_byte_offset / kTableSlotBytes, &cls, &reg, &space);
                         if (!declared || (read_only_kind && !kind_accepts(b.kind, cls)) ||
-                            (!read_only_kind && cls == d3d::DescriptorRangeType::Srv)) {
+                            (!read_only_kind && cls != d3d::DescriptorRangeType::Uav)) {
                             // A slot the root signature does not declare, or declares as another class:
                             // console stages read their tables as memory, past and regardless of the
                             // declared ranges. Join the slot itself, with the class the stage reads.
-                            // That includes a writable binding over a declared SRV: the stage stores
-                            // through the descriptor (image_store / buffer_store), so the slot holds a
-                            // UAV-capable view on the console; it is bound as a storage view (a texture
-                            // created without storage usage binds null, see the state bridge). A
-                            // writable binding over a declared CBV stays a failure.
+                            // That includes a writable binding over a declared SRV or CBV: the stage
+                            // stores through the descriptor (image_store / buffer_store), so the slot
+                            // holds a UAV-capable view on the console (#482: shared root signatures
+                            // whose space-1 table lists a CBV where the stage's compact layout has a
+                            // UAV). It is bound as a storage view; a slot that holds no UAV at draw
+                            // time binds null (translate_view), as does a texture created without
+                            // storage usage (see the state bridge).
                             const bool sampler_kind = b.kind == ReflectedBindingKind::Sampler ||
                                                       b.kind == ReflectedBindingKind::ComparisonSampler;
                             bool sampler_table = false;
@@ -926,7 +1036,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                             }
                             if (sampler_kind != sampler_table) {
                                 fail(b, pname + " has no descriptor at byte offset " +
-                                            std::to_string(b.table_byte_offset) + " and is a " +
+                                            std::to_string(table_byte_offset) + " and is a " +
                                             (sampler_table ? "sampler" : "resource") + " table");
                                 continue;
                             }
@@ -938,7 +1048,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                                       : d3d::DescriptorRangeType::Srv;
                             reg = space = 0;
                             lb.join.table_parameter = static_cast<uint32_t>(pi);
-                            lb.join.table_slot = b.table_byte_offset / kTableSlotBytes;
+                            lb.join.table_slot = table_byte_offset / kTableSlotBytes;
                             ++outside_rs;
                         }
                         break;
@@ -975,6 +1085,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     case ReflectedSource::CbvIndexedResourceHeap:
                     case ReflectedSource::LaneIndexedSamplerHeap:
                     case ReflectedSource::LaneIndexedResourceHeap:
+                    case ReflectedSource::Unresolved:
                         break;
                 }
             }
@@ -1073,12 +1184,14 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     if (stats != nullptr) {
         stats->table_slots_outside_rs += outside_rs;
         stats->lane_indexed_arrays += lane_arrays;
+        stats->root_descriptor_tables += root_tables;
+        stats->unresolved_bindings += unresolved;
     }
     return true;
 }
 
 bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementDesc* elements, uint32_t count,
-                        std::vector<pso::VertexInputFetch>* out, std::string* report) {
+                        std::vector<pso::VertexInputFetch>* out, std::string* report, JoinStats* stats) {
     struct Element {
         uint32_t slot, offset, size;
         pso::WgpuVertexFormat format;
@@ -1102,6 +1215,7 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         placed.push_back(Element{e.InputSlot, offset, vf.byte_size, vf.format, e.SemanticName, e.SemanticIndex});
     }
     bool ok = true;
+    uint64_t defaulted = 0;
     std::vector<pso::VertexInputFetch> fetches;
     for (const ReflectedVertexInput& in : vs.vertex_inputs) {
         const std::string key = "@location(" + std::to_string(in.location) + ") <- slot " + std::to_string(in.vb_slot) +
@@ -1114,8 +1228,14 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
             }
         }
         if (hit == nullptr) {
-            *report += key + ": no input-layout element covers it\n";
-            ok = false;
+            // D3D12 reads (0, 0, 0, 1) for an attribute the layout does not provide.
+            pso::VertexInputFetch d;
+            d.location = in.location;
+            d.constant_default = true;
+            d.offset = in.component_type == ReflectedComponentType::F32 ? 0u : pso::kDefaultVertexIntOffset;
+            d.format = dword_format(in.component_type, std::min(std::max(in.components, 1u), 4u));
+            fetches.push_back(d);
+            ++defaulted;
             continue;
         }
         pso::VertexInputFetch f;
@@ -1124,6 +1244,33 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         f.location = in.location;
         if (in.byte_offset == hit->offset && in.fetch_format == pso::WgpuVertexFormat::Undefined) {
             f.format = hit->format;
+            // A dword fetch wider than its element (#691: one 4-dword load of TEXCOORD float2 @4 plus
+            // POSITION float2 @12) spans the following 32-bit elements of the same class; widen the
+            // attribute over them, or the extra components read WebGPU's (0, 1) defaults.
+            const uint32_t have = dword_components(hit->format);
+            if (have != 0 && in.components > have && in.components <= 4) {
+                ReflectedComponentType hit_cls;
+                element_class(hit->format, &hit_cls);
+                uint32_t covered = have;
+                bool extended = true;
+                while (covered < in.components && extended) {
+                    extended = false;
+                    for (const Element& el : placed) {
+                        ReflectedComponentType el_cls;
+                        element_class(el.format, &el_cls);
+                        const uint32_t n = dword_components(el.format);
+                        if (el.slot == hit->slot && el.offset == hit->offset + covered * 4u && n != 0 &&
+                            el_cls == hit_cls) {
+                            covered += n;
+                            extended = true;
+                            break;
+                        }
+                    }
+                }
+                if (covered >= in.components) {
+                    f.format = dword_format(hit_cls, in.components);
+                }
+            }
         } else if (in.fetch_format != pso::WgpuVertexFormat::Undefined) {
             f.format = in.fetch_format;  // the stage's own fetch (inside an element, or a reinterpretation)
         } else {
@@ -1134,6 +1281,11 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         }
         ReflectedComponentType cls;
         element_class(f.format, &cls);
+        if (cls != in.component_type && dword_components(f.format) != 0) {
+            // Same 32-bit bits, other class (f32 vs u32/i32): the vertex format is ours, so reinterpret it.
+            f.format = dword_format(in.component_type, dword_components(f.format));
+            cls = in.component_type;
+        }
         if (cls != in.component_type) {
             *report += key + ": the stage expects " + class_name(in.component_type) + ", the attribute gives " +
                        class_name(cls) + "\n";
@@ -1146,6 +1298,9 @@ bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementD
         return false;
     }
     *out = std::move(fetches);
+    if (stats != nullptr) {
+        stats->vertex_inputs_defaulted += defaulted;
+    }
     return true;
 }
 

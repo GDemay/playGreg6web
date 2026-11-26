@@ -241,7 +241,7 @@ fn calls_push_return_addresses_and_sync_state() {
         .find("call void @sub_5000(ptr %state)")
         .expect("call");
     let after = &lifted.ir[call_at..];
-    assert!(before.rfind("store i64").is_some() && after.contains("load i64, ptr %t"));
+    assert!(before.rfind("store i64").is_some() && after.contains("load i64, ptr %state.gpr"));
     assert_eq!(lifted.callees.iter().copied().collect::<Vec<_>>(), [0x5000]);
 }
 
@@ -605,6 +605,129 @@ fn truncating_imul64_result_is_a_plain_mul() {
     assert!(ir.contains("@__playgta6_umul128("), "{ir}");
 }
 
+#[test]
+fn flags_overwritten_before_any_reader_are_not_materialised() {
+    let func = asm_function(0x1000, |a| {
+        // Every flag of the add (and the imul's CF/OF) is overwritten by the sub.
+        a.add(rax, rcx)?;
+        a.imul_2(rax, rcx)?;
+        a.sub(rax, rdx)?;
+        // dec keeps CF: the sub's CF stays live up to the return, its other flags do not.
+        a.dec(rax)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    // One parity (dec's PF), one AF chain (dec's), one CF (the sub's), no 128-bit high half.
+    assert_eq!(ir.matches("@llvm.ctpop.i8(").count(), 1, "{ir}");
+    assert_eq!(ir.matches(" = and i64 ").count(), 1, "{ir}");
+    assert_eq!(ir.matches("icmp ult i64").count(), 1, "{ir}");
+    assert!(!ir.contains("@__playgta6_umul128("), "{ir}");
+    // Every flag still reaches the state at the return.
+    for flag in 0..6 {
+        assert!(ir.contains(&format!("ptr %state.flag{flag}\n")), "{ir}");
+    }
+}
+
+#[test]
+fn register_and_flag_allocas_are_forwarded_within_a_block() {
+    let func = asm_function(0x1000, |a| {
+        a.add(rax, rcx)?;
+        a.add(rax, rdx)?;
+        a.push(rbx)?;
+        a.pop(rbx)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    let body = block_text(ir, "bb_1000");
+    let loads = |slot: &str| body.matches(&format!(" = load i64, ptr %{slot}\n")).count();
+    let stores = |slot: &str| {
+        let suffix = format!(", ptr %{slot}");
+        body.lines()
+            .filter(|l| l.trim_start().starts_with("store ") && l.ends_with(&suffix))
+            .count()
+    };
+    // Each alloca is loaded at most once per block; later reads reuse the value.
+    for reg in ["rax", "rcx", "rdx", "rbx", "rsp"] {
+        assert!(loads(reg) <= 1, "{reg}:\n{ir}");
+    }
+    assert_eq!(body.matches(" = load i1, ptr %").count(), 0, "{ir}");
+    // Overwritten stores are gone: only the second add's rax and the ret's rsp remain.
+    assert_eq!(stores("rax"), 1, "{ir}");
+    assert_eq!(stores("rsp"), 1, "{ir}");
+    assert_eq!(flag_stores(&body, "cf"), 1, "{ir}");
+    // The final values still reach the state.
+    assert!(ir.contains("ptr %state.gpr0\n"), "{ir}");
+}
+
+#[test]
+fn state_pointers_are_computed_once_in_the_entry_block() {
+    // Two exits (ret and a tail jump) and a call: every one stores rax and the flags.
+    let program = Program::new()
+        .asm(0x1000, |a| {
+            let mut out = a.create_label();
+            a.add(rax, rcx)?;
+            a.call(0x5000)?;
+            a.test(rax, rax)?;
+            a.jne(out)?;
+            a.ret()?;
+            a.set_label(&mut out)?;
+            a.jmp(0x6000)
+        })
+        .asm(0x5000, |a| a.ret())
+        .asm(0x6000, |a| a.ret());
+    let lifted = lift_function(&program.function(0x1000)).expect("lifts");
+    let ir = &lifted.ir;
+    let entry_end = ir.find("\nbb_1000:").expect("first block");
+    for slot in ["gpr0", "gpr4", "flag0"] {
+        let def = format!("  %state.{slot} = getelementptr inbounds ");
+        // Defined exactly once, in `entry:`, and used by the later blocks.
+        assert_eq!(ir.matches(&def).count(), 1, "{slot}:\n{ir}");
+        assert!(ir.find(&def).unwrap() < entry_end, "{slot}:\n{ir}");
+        assert!(
+            ir[entry_end..]
+                .matches(&format!("ptr %state.{slot}\n"))
+                .count()
+                >= 2,
+            "{slot}:\n{ir}"
+        );
+    }
+    // No other state `getelementptr` remains in the lifted blocks.
+    assert!(
+        !ir[entry_end..].contains("getelementptr inbounds %playgta6.GuestState"),
+        "{ir}"
+    );
+}
+
+#[test]
+fn register_values_are_forwarded_into_single_predecessor_blocks() {
+    let func = asm_function(0x1000, |a| {
+        let mut skip = a.create_label();
+        a.add(rax, rcx)?;
+        a.test(rax, rax)?;
+        a.jz(skip)?;
+        a.add(rax, rdx)?;
+        a.set_label(&mut skip)?;
+        a.add(rax, 1)?;
+        a.ret()
+    });
+    let lifted = lift_function(&func).expect("lifts");
+    let ir = &lifted.ir;
+    let rax_loads = |body: &str| body.matches(" = load i64, ptr %rax\n").count();
+    // The fall-through block has the `jz` block as its only predecessor and reuses its rax.
+    let labels: Vec<&str> = ir
+        .lines()
+        .filter_map(|l| l.strip_suffix(':'))
+        .filter(|l| l.starts_with("bb_"))
+        .collect();
+    assert_eq!(labels.len(), 3, "{ir}");
+    assert_eq!(rax_loads(&block_text(ir, labels[0])), 1, "{ir}");
+    assert_eq!(rax_loads(&block_text(ir, labels[1])), 0, "{ir}");
+    // The join has two predecessors and reloads the alloca.
+    assert_eq!(rax_loads(&block_text(ir, labels[2])), 1, "{ir}");
+}
+
 /// A block built by hand (for CFG shapes discovery never produces).
 fn block(
     start: u64,
@@ -957,18 +1080,23 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
     assert_eq!(ir.matches("br label %ret_epilog").count(), 2, "{ir}");
 
     // Compact windowed accesses: 2 non-stack loads -> 2 `align 1` loads total (not 6!),
-    // 2 non-stack stores -> one `align 1` store on the flat and one on the window path each (O37:
-    // the window path marks its slot after the store, without a second branch) + outlined cold
-    // slow_store helpers.
+    // 2 coalesced same-base stores (`[rdx]`, `[rdx+8]`) -> 2 fast `align 1` stores sharing one
+    // O37/R57 guarded dirty mark (1 monotonic load + 1 cold release store) + outlined cold
+    // slow_store helpers for the boundary-crossing fallback.
     assert_eq!(
         fn_ir.matches(", align 1\n").count(),
-        8,
-        "2 loads + 2 x 2 stores + 2 slot marks = 8 align-1 accesses total:\n{fn_ir}"
+        6,
+        "2 loads + 2 coalesced stores + 1 mark load + 1 mark store = 6 align-1 accesses total:\n{fn_ir}"
+    );
+    assert_eq!(
+        fn_ir.matches("load atomic i8, ptr ").count(),
+        1,
+        "coalesced same-base window stores share one dirty-slot check:\n{fn_ir}"
     );
     assert_eq!(
         fn_ir.matches("store atomic i8 1, ptr ").count(),
-        2,
-        "each window store marks its slot:\n{fn_ir}"
+        1,
+        "coalesced same-base window stores share one dirty-slot mark:\n{fn_ir}"
     );
     assert!(
         ir.contains("define internal void @__playgta6_slow_store8(i64 noundef %va, i64 noundef %v) unnamed_addr noinline cold #0 {"),
@@ -1012,6 +1140,13 @@ fn r36_lossless_ir_size_optimizations_for_windowed_multi_block_functions() {
             "define internal void @__playgta6_wstore16_400000000(i64 noundef %va, <2 x i64> noundef %v) unnamed_addr noinline cold #0 {"
         ),
         "{}",
+        outlined.ir
+    );
+    assert!(
+        outlined
+            .ir
+            .contains("%cur = load atomic i8, ptr %m monotonic, align 1\n  %clean = icmp eq i8 %cur, 0\n  br i1 %clean, label %wm_set, label %wm_done, !prof !{!\"branch_weights\", i32 1, i32 2000}\nwm_set:\n  store atomic i8 1, ptr %m release, align 1\n  br label %wm_done\nwm_done:\n  ret void\n"),
+        "outlined wstore must guard the atomic release mark with a monotonic check:\n{}",
         outlined.ir
     );
     assert!(
@@ -1150,4 +1285,67 @@ fn shard_dispatch_emits_switch_internal_linkage_and_empty_shard_trap() {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Guest loads (`align 1`) of `func` lifted alone.
+fn guest_loads(func: &cfg::Function) -> usize {
+    let ir = lift_function(func).expect("lifts").ir;
+    ir.lines()
+        .filter(|l| l.contains(" = load ") && l.ends_with("align 1"))
+        .count()
+}
+
+#[test]
+fn loads_take_the_value_of_an_earlier_access_to_the_same_address_in_the_block() {
+    // A pop reads back what the push stored; a second read of `[rdx]` reuses the first.
+    let forwarded = asm_function(0x1000, |a| {
+        a.push(rbx)?;
+        a.pop(rcx)?;
+        a.mov(rax, qword_ptr(rdx))?;
+        a.add(rax, qword_ptr(rdx))?;
+        a.ret()
+    });
+    // `[rdx]` once (`ret` does not read the return address).
+    assert_eq!(guest_loads(&forwarded), 1);
+    // A store to another (possibly aliasing) address, a fence, an atomic or a call in between
+    // reloads `[rdx]`.
+    type Emit = fn(&mut CodeAssembler) -> Result<(), IcedError>;
+    let barriers: [Emit; 4] = [
+        |a| a.mov(qword_ptr(rcx), rbx),
+        |a| a.mfence(),
+        |a| a.lock().xadd(qword_ptr(rcx), rbx),
+        |a| a.call(0x1000),
+    ];
+    for between in barriers {
+        let func = asm_function(0x1000, |a| {
+            a.mov(rax, qword_ptr(rdx))?;
+            between(a)?;
+            a.add(rax, qword_ptr(rdx))?;
+            a.ret()
+        });
+        let loads = guest_loads(&func);
+        assert!(loads >= 2, "forwarded across a barrier ({loads} loads)");
+    }
+}
+
+#[test]
+fn reloads_after_a_call_that_nothing_reads_are_dropped() {
+    // `add` overwrites every flag the call may have changed before anything reads them.
+    let program = Program::new()
+        .asm(0x1000, |a| {
+            a.cmp(rax, rbx)?;
+            a.call(0x5000)?;
+            a.add(rax, rbx)?;
+            a.ret()
+        })
+        .asm(0x5000, |a| {
+            a.xor(ecx, ecx)?;
+            a.ret()
+        });
+    let ir = lift_function(&program.function(0x1000)).expect("lifts").ir;
+    let call = ir.find("call void @sub_5000").expect("call");
+    assert!(
+        !ir[call..].contains("load i8, ptr %state.flag"),
+        "dead flag reloads after the call:\n{ir}"
+    );
 }

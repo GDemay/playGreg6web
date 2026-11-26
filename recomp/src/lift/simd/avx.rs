@@ -7,7 +7,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use super::super::{Flag, FunctionLifter, R, imm, unsupported};
-use super::{Elem, Ty, fconst, is_256, mask};
+use super::{Elem, Intr, Ty, fconst, is_256, mask};
 
 /// 256-bit forms that operate on each 128-bit lane independently (with the same per-lane
 /// semantics as the 128-bit form; per-lane immediate bits are handled by the lane lifters).
@@ -222,6 +222,75 @@ pub(super) fn in_lane(m: Mnemonic) -> bool {
     )
 }
 
+/// Whether [`FunctionLifter::lift_avx`] handles `ins` (mirroring its match arms).
+pub(super) fn is_avx_supported(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    let wide = is_256(ins);
+    match ins.mnemonic() {
+        M::Vbroadcastss
+        | M::Vbroadcastsd
+        | M::Vpbroadcastb
+        | M::Vpbroadcastw
+        | M::Vpbroadcastd
+        | M::Vpbroadcastq
+        | M::Vbroadcastf128
+        | M::Vbroadcasti128
+        | M::Vinsertf128
+        | M::Vinserti128
+        | M::Vextractf128
+        | M::Vextracti128
+        | M::Vperm2f128
+        | M::Vperm2i128
+        | M::Vpermq
+        | M::Vpermpd
+        | M::Vpermd
+        | M::Vpermps
+        | M::Ptest
+        | M::Vptest
+        | M::Vtestps
+        | M::Vtestpd
+        | M::Vmaskmovps
+        | M::Vpmaskmovd
+        | M::Vmaskmovpd
+        | M::Vpmaskmovq
+        | M::Pmovsxbw
+        | M::Vpmovsxbw
+        | M::Pmovsxbd
+        | M::Vpmovsxbd
+        | M::Pmovsxbq
+        | M::Vpmovsxbq
+        | M::Pmovsxwd
+        | M::Vpmovsxwd
+        | M::Pmovsxwq
+        | M::Vpmovsxwq
+        | M::Pmovsxdq
+        | M::Vpmovsxdq
+        | M::Pmovzxbw
+        | M::Vpmovzxbw
+        | M::Pmovzxbd
+        | M::Vpmovzxbd
+        | M::Pmovzxbq
+        | M::Vpmovzxbq
+        | M::Pmovzxwd
+        | M::Vpmovzxwd
+        | M::Pmovzxwq
+        | M::Vpmovzxwq
+        | M::Pmovzxdq
+        | M::Vpmovzxdq
+        | M::Vcvtph2ps
+        | M::Vcvtps2ph => true,
+        M::Vmovmskps
+        | M::Vmovmskpd
+        | M::Vpmovmskb
+        | M::Vcvtps2pd
+        | M::Vcvtdq2pd
+        | M::Vcvtpd2ps
+        | M::Vcvtpd2dq
+        | M::Vcvttpd2dq => wide,
+        _ => false,
+    }
+}
+
 /// F16C rounding control from `vcvtps2ph`'s immediate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Round {
@@ -346,19 +415,23 @@ impl FunctionLifter<'_> {
                 self.set_halves(ins.op_register(0), &lo, Some(&hi), I64)?;
             }
             M::Vpermd | M::Vpermps => {
-                // vpermd ymm1, ymm2 (indices), ymm3/m256 (data)
-                let (idx, _) = self.whole(ins, 1, I32)?;
-                let (data, _) = self.whole(ins, 2, I32)?;
-                let t = Ty::vn(I32, 8).ir();
-                let mut r = "poison".to_string();
-                for l in 0..8 {
-                    let k = self.val(&format!("extractelement {t} {idx}, i32 {l}"));
-                    let k = self.val(&format!("and i32 {k}, 7"));
-                    let x = self.val(&format!("extractelement {t} {data}, i32 {k}"));
-                    r = self.val(&format!("insertelement {t} {r}, i32 {x}, i32 {l}"));
+                // vpermd ymm1, ymm2 (indices), ymm3/m256 (data):
+                // Lower via two `i8x16.swizzle` ops per 128-bit half (zero stack spills!).
+                // Byte indices in 0..15 hit `dlo` (and `idx ^ 16` in 16..31 zeroes `dhi`);
+                // byte indices in 16..31 zero `dlo` (and `idx ^ 16` in 0..15 hits `dhi`).
+                let dlo = self.v_half(ins, 2, 0, I8)?;
+                let dhi = self.v_half(ins, 2, 1, I8)?;
+                let xor16 = Ty::v(I8).splat("16");
+                let mut out = Vec::with_capacity(2);
+                for half in 0..2 {
+                    let idx_h = self.v_half(ins, 1, half, I32)?;
+                    let lo_idx = self.dword_swizzle_indices(&idx_h, 7);
+                    let hi_idx = self.val(&format!("xor <16 x i8> {lo_idx}, {xor16}"));
+                    let rlo = self.intr(Intr::Swizzle, Ty::v(I8), &[&dlo, &lo_idx]);
+                    let rhi = self.intr(Intr::Swizzle, Ty::v(I8), &[&dhi, &hi_idx]);
+                    out.push(self.val(&format!("or <16 x i8> {rlo}, {rhi}")));
                 }
-                let (lo, hi) = self.split(&r, I32);
-                self.set_halves(ins.op_register(0), &lo, Some(&hi), I32)?;
+                self.set_halves(ins.op_register(0), &out[0], Some(&out[1]), I8)?;
             }
             M::Vmovmskps | M::Vmovmskpd | M::Vpmovmskb if wide => {
                 let e = match m {
@@ -474,6 +547,8 @@ impl FunctionLifter<'_> {
 
     /// `ptest/vptest` (`sign == None`) and `vtestps/vtestpd` (sign bits of `sign` lanes only):
     /// ZF = (a & b) == 0, CF = (!a & b) == 0, the other flags cleared.
+    /// Accumulates halves with vector `or` and tests via `icmp ne` + `bitcast <2 x i1> to i2`,
+    /// which LLVM lowers directly to a single `v128.any_true` per flag.
     fn test(&mut self, ins: &Instruction, sign: Option<Elem>) -> R<()> {
         let wide = is_256(ins);
         let t = Ty::v(Elem::I64).ir();
@@ -482,26 +557,32 @@ impl FunctionLifter<'_> {
             Some(_) => Some(Ty::v(Elem::I64).splat(&imm(0x8000_0000_0000_0000, 64))),
             None => None,
         };
-        let mut any_and = "false".to_string();
-        let mut any_andn = "false".to_string();
+        let mut acc_and = String::new();
+        let mut acc_andn = String::new();
         for half in 0..if wide { 2 } else { 1 } {
             let a = self.v_half(ins, 0, half, Elem::I64)?;
             let b = self.v_half(ins, 1, half, Elem::I64)?;
             let na = self.val(&format!("xor {t} {a}, <i64 -1, i64 -1>"));
-            for (x, acc) in [(a, &mut any_and), (na, &mut any_andn)] {
-                let mut v = self.val(&format!("and {t} {x}, {b}"));
-                if let Some(m) = &sign_mask {
-                    v = self.val(&format!("and {t} {v}, {m}"));
-                }
-                let l0 = self.val(&format!("extractelement {t} {v}, i32 0"));
-                let l1 = self.val(&format!("extractelement {t} {v}, i32 1"));
-                let o = self.val(&format!("or i64 {l0}, {l1}"));
-                let nz = self.val(&format!("icmp ne i64 {o}, 0"));
-                *acc = self.val(&format!("or i1 {acc}, {nz}"));
+            let v_and = self.val(&format!("and {t} {a}, {b}"));
+            let v_andn = self.val(&format!("and {t} {na}, {b}"));
+            if half == 0 {
+                acc_and = v_and;
+                acc_andn = v_andn;
+            } else {
+                acc_and = self.val(&format!("or {t} {acc_and}, {v_and}"));
+                acc_andn = self.val(&format!("or {t} {acc_andn}, {v_andn}"));
             }
         }
-        let zf = self.val(&format!("xor i1 {any_and}, true"));
-        let cf = self.val(&format!("xor i1 {any_andn}, true"));
+        let mut is_all_zero = |mut v: String| {
+            if let Some(m) = &sign_mask {
+                v = self.val(&format!("and {t} {v}, {m}"));
+            }
+            let nz = self.val(&format!("icmp ne {t} {v}, zeroinitializer"));
+            let bits = self.val(&format!("bitcast <2 x i1> {nz} to i2"));
+            self.val(&format!("icmp eq i2 {bits}, 0"))
+        };
+        let zf = is_all_zero(acc_and);
+        let cf = is_all_zero(acc_andn);
         self.set_flag(Flag::Zf, &zf);
         self.set_flag(Flag::Cf, &cf);
         for flag in [Flag::Af, Flag::Of, Flag::Pf, Flag::Sf] {

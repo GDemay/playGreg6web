@@ -116,8 +116,12 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
                     "unique_segments",
                     "black_frames",
                     "non_black_frames",
+                    "black_frame_count",
+                    "non_black_frame_count",
+                    "all_black",
                     "first_non_black_frame",
                     "first_non_black_s",
+                    "black_loading_s",
                     "segments",
                 },
             )
@@ -125,8 +129,13 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
             self.assertEqual(data["unique_segments"], 5)
             self.assertEqual(data["black_frames"], 3)
             self.assertEqual(data["non_black_frames"], 7)
+            self.assertEqual(data["black_frame_count"], 3)
+            self.assertEqual(data["non_black_frame_count"], 7)
+            self.assertFalse(data["all_black"])
             self.assertEqual(data["first_non_black_frame"], 3)
             self.assertEqual(data["first_non_black_s"], 3.0)
+            # Leading black is frames 1..2 (3.0s); mid-capture black frame 5 does not inflate black_loading_s.
+            self.assertEqual(data["black_loading_s"], 3.0)
 
             segs = data["segments"]
             self.assertEqual(len(segs), 5)
@@ -138,6 +147,7 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
                 "start_s",
                 "end_s",
                 "dwell_s",
+                "delta_s",
                 "mean_luma",
                 "is_black",
             }
@@ -152,12 +162,12 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
                 (6, 8, 3),
                 (9, 10, 2),
             ])
-            self.assertEqual([(s["start_s"], s["end_s"], s["dwell_s"]) for s in segs], [
-                (0.0, 3.0, 3.0),
-                (3.0, 6.0, 3.0),
-                (6.0, 7.5, 1.5),
-                (7.5, 12.0, 4.5),
-                (12.0, 15.0, 3.0),
+            self.assertEqual([(s["start_s"], s["end_s"], s["dwell_s"], s["delta_s"]) for s in segs], [
+                (0.0, 3.0, 3.0, 0.0),
+                (3.0, 6.0, 3.0, 3.0),
+                (6.0, 7.5, 1.5, 3.0),
+                (7.5, 12.0, 4.5, 1.5),
+                (12.0, 15.0, 3.0, 4.5),
             ])
             self.assertEqual([s["is_black"] for s in segs], [True, False, True, False, False])
             self.assertEqual(segs[0]["mean_luma"], 0.0)
@@ -180,12 +190,17 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
             self.assertEqual(data["unique_segments"], 2)
             self.assertEqual(data["black_frames"], 1)
             self.assertEqual(data["non_black_frames"], 2)
+            self.assertEqual(data["black_frame_count"], 1)
+            self.assertEqual(data["non_black_frame_count"], 2)
+            self.assertFalse(data["all_black"])
             self.assertEqual(data["first_non_black_frame"], 2)
             self.assertIsNone(data["first_non_black_s"])
+            self.assertIsNone(data["black_loading_s"])
             for seg in data["segments"]:
                 self.assertIsNone(seg["start_s"])
                 self.assertIsNone(seg["end_s"])
                 self.assertIsNone(seg["dwell_s"])
+                self.assertIsNone(seg["delta_s"])
 
     def test_plain_text_output_with_and_without_interval(self):
         with tempfile.TemporaryDirectory(prefix="playgta6_plain_dir_") as tmp:
@@ -201,13 +216,17 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
             self.assertIn("black", out1)
             self.assertIn("visible", out1)
             self.assertNotIn("dwell_s", out1)
+            self.assertNotIn("delta_s", out1)
+            self.assertNotIn("black_loading_s", out1)
             self.assertNotIn(str(frames_dir), out1)
             self.assertNotIn(frames_dir.name, out1)
 
             rc2, out2, err2 = self._run_cli([str(frames_dir), "--interval-sec", "2.0"])
             self.assertEqual(rc2, 0, err2)
             self.assertIn("first_non_black: frame 2 @ 2.00s", out2)
+            self.assertIn("black_loading_s: 2.00s", out2)
             self.assertIn("dwell_s", out2)
+            self.assertIn("delta_s", out2)
             self.assertIn("4.00", out2)
             self.assertNotIn(str(frames_dir), out2)
 
@@ -225,10 +244,21 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
                 "unique_segments": 0,
                 "black_frames": 0,
                 "non_black_frames": 0,
+                "black_frame_count": 0,
+                "non_black_frame_count": 0,
+                "all_black": False,
                 "first_non_black_frame": None,
                 "first_non_black_s": None,
+                "black_loading_s": 0.0,
                 "segments": [],
             })
+
+            rc_no_int, out_no_int, err_no_int = self._run_cli([str(frames_dir), "--json"])
+            self.assertEqual(rc_no_int, 0, err_no_int)
+            data_no_int = json.loads(out_no_int)
+            self.assertIsNone(data_no_int["black_loading_s"])
+            self.assertIsNone(data_no_int["first_non_black_s"])
+            self.assertFalse(data_no_int["all_black"])
 
             rc_txt, out_txt, err_txt = self._run_cli([str(frames_dir)])
             self.assertEqual(rc_txt, 0, err_txt)
@@ -246,10 +276,104 @@ class ScreenTimelineCaptureCLI(unittest.TestCase):
             self.assertEqual(data["unique_segments"], 1)
             self.assertEqual(data["black_frames"], 3)
             self.assertEqual(data["non_black_frames"], 0)
+            self.assertEqual(data["black_frame_count"], 3)
+            self.assertEqual(data["non_black_frame_count"], 0)
+            self.assertTrue(data["all_black"])
             self.assertIsNone(data["first_non_black_frame"])
             self.assertIsNone(data["first_non_black_s"])
+            self.assertEqual(data["black_loading_s"], 1.5)
             self.assertEqual(data["segments"][0]["dwell_s"], 1.5)
+            self.assertEqual(data["segments"][0]["delta_s"], 0.0)
             self.assertTrue(data["segments"][0]["is_black"])
+
+            rc_txt, out_txt, err_txt = self._run_cli([str(frames_dir), "--interval-sec", "0.5"])
+            self.assertEqual(rc_txt, 0, err_txt)
+            self.assertIn("black_loading_s: 1.50s", out_txt)
+            self.assertIn("all_black: true", out_txt)
+
+    def test_immediate_non_black_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            frames_dir = Path(tmp)
+            colors = [
+                (220, 220, 220),
+                (220, 220, 220),
+                (40, 180, 90),
+                (0, 0, 0),
+            ]
+            for idx, rgb in enumerate(colors, start=1):
+                _write_solid_png(frames_dir / f"frame_{idx:04d}.png", rgb)
+
+            rc, stdout, stderr = self._run_cli([str(frames_dir), "--interval-sec", "0.5", "--json"])
+            self.assertEqual(rc, 0, stderr)
+            data = json.loads(stdout)
+            self.assertEqual(data["total_frames"], 4)
+            self.assertEqual(data["unique_segments"], 3)
+            self.assertEqual(data["black_frame_count"], 1)
+            self.assertEqual(data["non_black_frame_count"], 3)
+            self.assertFalse(data["all_black"])
+            self.assertEqual(data["first_non_black_frame"], 1)
+            self.assertEqual(data["first_non_black_s"], 0.0)
+            self.assertEqual(data["black_loading_s"], 0.0)
+            self.assertEqual([s["delta_s"] for s in data["segments"]], [0.0, 1.0, 0.5])
+
+    def test_json_host_path_sanitization(self):
+        with tempfile.TemporaryDirectory(prefix="playgta6_host_leak_") as tmp:
+            nested = Path(tmp) / "Users" / "secret_alice" / "captures"
+            nested.mkdir(parents=True)
+            _write_solid_png(nested / "frame_0001.png", (0, 0, 0))
+            _write_solid_png(nested / "frame_0002.png", (200, 100, 50))
+
+            rc, stdout, stderr = self._run_cli([str(nested), "--interval-sec", "1.0", "--json"])
+            self.assertEqual(rc, 0, stderr)
+            self.assertEqual(stderr, "")
+            for forbidden in (str(nested), str(tmp), "secret_alice", "playgta6_host_leak_", "C:\\", "/home/", "/Users/"):
+                self.assertNotIn(forbidden, stdout)
+            data = json.loads(stdout)
+            self.assertEqual(data["black_loading_s"], 1.0)
+            self.assertEqual(data["first_non_black_s"], 1.0)
+
+        # Direct unit checks for host-path & username scrubbing helpers.
+        self.assertEqual(
+            st.sanitize_path_label(r"C:\Users\alice\Documents\captures\frame_0001.png"),
+            "frame_0001.png",
+        )
+        self.assertEqual(
+            st.sanitize_path_label(r"C:\Users\Alice Smith\My Captures\frame_0001.png"),
+            "frame_0001.png",
+        )
+        self.assertEqual(
+            st.sanitize_path_label("/home/bob/work/captures/frame_0002.png"),
+            "frame_0002.png",
+        )
+        self.assertEqual(
+            st.sanitize_path_label("/Users/carol/Desktop/frame_0003.png"),
+            "frame_0003.png",
+        )
+        self.assertEqual(
+            st.sanitize_path_label(r"\\fileserver\share\dave\frame_0004.png"),
+            "frame_0004.png",
+        )
+        self.assertEqual(st.sanitize_path_label(r"C:\Users\alice"), "<redacted>")
+        self.assertEqual(st.sanitize_path_label("/home/bob/"), "<redacted>")
+        self.assertEqual(st.sanitize_path_label("../../Users/eve/frame_0005.png"), "frame_0005.png")
+        self.assertEqual(st.sanitize_path_label("captures/frame_0006.png"), "captures/frame_0006.png")
+
+        scrubbed = st.sanitize_json_payload({
+            "win": r"C:\Users\alice\captures\frame_0001.png",
+            "unix": "/home/bob/captures/frame_0002.png",
+            "nested": [Path(r"C:\Users\alice\run\frame_0003.png"), {"msg": "loaded /Users/carol/out.png"}],
+            "count": 3,
+            "flag": False,
+        })
+        serialized = json.dumps(scrubbed)
+        for leaked in ("C:\\", "/home/", "/Users/", "alice", "bob", "carol"):
+            self.assertNotIn(leaked, serialized)
+        self.assertEqual(scrubbed["win"], "frame_0001.png")
+        self.assertEqual(scrubbed["unix"], "frame_0002.png")
+        self.assertEqual(scrubbed["nested"][0], "frame_0003.png")
+        self.assertEqual(scrubbed["nested"][1]["msg"], "loaded out.png")
+        self.assertEqual(scrubbed["count"], 3)
+        self.assertFalse(scrubbed["flag"])
 
     def test_stdlib_png_fallback_matches_pil_results(self):
         with tempfile.TemporaryDirectory() as tmp:

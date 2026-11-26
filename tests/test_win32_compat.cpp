@@ -1,3 +1,4 @@
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -915,6 +916,70 @@ void test_debug_and_lifecycle() {
     pg6_win32_unregister_app_constrained_change_notification(0x1);
     CHECK(app_notification_registration_count() == base + 1);
 
+    // PLM order: suspend runs constrained (TRUE) before app-state (quiesced TRUE); resume runs
+    // app-state (FALSE) before constrained (FALSE). Unregister with the wrong kind is a no-op.
+    {
+        uint64_t s1 = 0, c1 = 0, s2 = 0;
+        CHECK(pg6_win32_register_app_state_change_notification(0x5100, 11, &s1) == ERROR_SUCCESS);
+        CHECK(pg6_win32_register_app_constrained_change_notification(0x5200, 12, &c1) == ERROR_SUCCESS);
+        CHECK(pg6_win32_register_app_state_change_notification(0x5300, 13, &s2) == ERROR_SUCCESS);
+        pg6_win32_unregister_app_constrained_change_notification(s1);  // wrong kind: kept
+        CHECK(app_notification_registration_count(AppNotificationKind::State) >= 2);
+        std::vector<AppNotification> calls;
+        const auto record = [](const AppNotification& n, void* user) {
+            if (n.routine >= 0x5100 && n.routine <= 0x5300) {
+                static_cast<std::vector<AppNotification>*>(user)->push_back(n);
+            }
+        };
+        dispatch_app_suspend(record, &calls);
+        CHECK(calls.size() == 3);
+        CHECK(calls[0].routine == 0x5200 && calls[0].kind == AppNotificationKind::Constrained && calls[0].flag == 1 &&
+              calls[0].context == 12);
+        CHECK(calls[1].routine == 0x5100 && calls[1].flag == 1 && calls[1].context == 11);
+        CHECK(calls[2].routine == 0x5300 && calls[2].flag == 1);
+        calls.clear();
+        dispatch_app_resume(record, &calls);
+        CHECK(calls.size() == 3);
+        CHECK(calls[0].routine == 0x5100 && calls[0].kind == AppNotificationKind::State && calls[0].flag == 0);
+        CHECK(calls[1].routine == 0x5300 && calls[1].flag == 0);
+        CHECK(calls[2].routine == 0x5200 && calls[2].flag == 0);
+        CHECK(dispatch_app_suspend(nullptr, nullptr) == 0);
+
+        // XLaunchNewGame sequence: constrained routines, then app-state routines, then the grace wait.
+        {
+            struct Trace {
+                std::vector<std::string> events;
+            } trace;
+            const auto note = [](const AppNotification& n, void* user) {
+                if (n.routine >= 0x5100 && n.routine <= 0x5300) {
+                    static_cast<Trace*>(user)->events.push_back(
+                        (n.kind == AppNotificationKind::Constrained ? "constrained:" : "state:") +
+                        std::to_string(n.routine) + ":" + std::to_string(n.flag));
+                }
+            };
+            const auto grace = [](uint32_t ms, void* user) {
+                static_cast<Trace*>(user)->events.push_back("grace:" + std::to_string(ms));
+            };
+            CHECK(run_relaunch_suspend_sequence(note, &trace, grace, &trace) >= 3);
+            CHECK(trace.events.size() == 4);
+            CHECK(trace.events[0] == "constrained:" + std::to_string(0x5200) + ":1");
+            CHECK(trace.events[1] == "state:" + std::to_string(0x5100) + ":1");
+            CHECK(trace.events[2] == "state:" + std::to_string(0x5300) + ":1");
+            CHECK(trace.events[3] == "grace:1000");
+            reset_relaunch_request();
+            std::string args;
+            CHECK(!relaunch_requested(&args));
+            begin_guest_relaunch("-lang de");
+            CHECK(relaunch_requested(&args) && args == "-lang de");
+            reset_relaunch_request();
+            CHECK(!relaunch_requested(nullptr));
+        }
+        pg6_win32_unregister_app_state_change_notification(s1);
+        pg6_win32_unregister_app_state_change_notification(s2);
+        pg6_win32_unregister_app_constrained_change_notification(c1);
+        CHECK(app_notification_registration_count() == base + 1);
+    }
+
     // WER, named pipes.
     CHECK(pg6_win32_wer_register_file(u"C:\\x.log", 2, 0) == 0);
     CHECK(pg6_win32_wer_register_file(nullptr, 2, 0) == E_INVALIDARG);
@@ -1298,6 +1363,7 @@ void test_httpfs_size_cache() {
     const uint64_t kSize = 123457;
     int opens = 0;
     int reads = 0;
+    int slow_read_ms = 0;
     HttpfsMailboxClient client(&mailbox, [&](HttpfsMailbox& mb) {
         if (mb.op == static_cast<uint32_t>(HttpfsOp::Open)) {
             const std::string path(reinterpret_cast<const char*>(mb.payload),
@@ -1310,6 +1376,9 @@ void test_httpfs_size_cache() {
             }
         } else if (mb.op == static_cast<uint32_t>(HttpfsOp::Read)) {
             ++reads;
+            if (slow_read_ms != 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(slow_read_ms));
+            }
             const uint64_t n = mb.offset >= kSize ? 0 : std::min<uint64_t>(mb.length, kSize - mb.offset);
             std::memset(mb.payload, 0x5A, static_cast<size_t>(n));
             HttpfsMailboxClient::complete_response(mb, static_cast<int64_t>(n));
@@ -1348,11 +1417,50 @@ void test_httpfs_size_cache() {
                                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
     CHECK(GetFileSizeEx(c, &size) && static_cast<uint64_t>(size) == kSize);
     CHECK(reads == 2 * probe_reads);
+
+    // A slow package read counts as a host stall (kept off the guest clocks); a fast one does not.
+    ResetHostStallForTesting();
+    uint8_t buf[16];
+    uint32_t got = 0;
+    CHECK(ReadFile(c, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+    CHECK(TotalHostStallNs() == 0);
+    slow_read_ms = 80;
+    CHECK(ReadFile(c, buf, sizeof(buf), &got, nullptr) && got == sizeof(buf));
+    CHECK(TotalHostStallNs() >= kHostStallThresholdNs);
+    ResetHostStallForTesting();
     CloseHandle(c);
     set_httpfs_client(nullptr);
 }
 
+static void test_stall_compensation() {
+    using namespace playgta6::os::win32;
+    ResetHostStallForTesting();
+    int64_t a = 0;
+    QueryPerformanceCounter(&a);
+    ReportHostStall(kHostStallThresholdNs - 1);  // below threshold: ignored
+    CHECK(TotalHostStallNs() == 0);
+    ReportHostStall(5'000'000'000LL);  // 5 s host stall
+    CHECK(TotalHostStallNs() == 5'000'000'000LL);
+    int64_t b = 0;
+    QueryPerformanceCounter(&b);
+    CHECK(b >= a);                              // monotonic
+    CHECK(b - a < 1'000'000'000LL);             // stall not visible to guest
+    CHECK(GetTickCount64() < 1000u + static_cast<uint64_t>(b / 1'000'000LL));
+    ResetHostStallForTesting();
+    {
+        HostStallScope fast;
+    }
+    CHECK(TotalHostStallNs() == 0);
+    {
+        HostStallScope slow;
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    }
+    CHECK(TotalHostStallNs() >= kHostStallThresholdNs);
+    ResetHostStallForTesting();
+}
+
 int main() {
+    test_stall_compensation();
     test_httpfs_size_cache();
     test_directories_and_attributes();
     test_find_files();

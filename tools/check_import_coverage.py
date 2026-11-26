@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -213,18 +214,234 @@ def _current_usernames() -> list[str]:
     return names
 
 
-def sanitize_message(text: str) -> str:
-    """Strip any accidental host paths or usernames from diagnostic messages."""
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", text)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
-    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
-    for username in _current_usernames():
-        pattern = re.compile(
+# Fixed report schema keys that should never be altered by username substitution.
+_REPORT_SCHEMA_KEYS: frozenset[str] = frozenset(
+    {
+        "api_set_rule_count",
+        "canonical_dll",
+        "complete_dlls",
+        "coverage_pct",
+        "dll",
+        "dll_count",
+        "dlls",
+        "effective_boot_pct",
+        "errors",
+        "gthunk",
+        "guest",
+        "guest_dlls",
+        "guest_recompiled",
+        "guest_recompiled_dlls",
+        "guest_recompiled_pct",
+        "guest_recompiled_symbols",
+        "header_export_count",
+        "host",
+        "import",
+        "importers",
+        "kind",
+        "missing",
+        "missing_dlls",
+        "missing_only",
+        "missing_pct",
+        "missing_symbols",
+        "ok",
+        "partial_dlls",
+        "reason",
+        "recorded",
+        "registered_export_count",
+        "registered_module_count",
+        "registered_ordinal_count",
+        "resolution_breakdown",
+        "runtime",
+        "runtime_scan",
+        "scanned_file_count",
+        "shimmed",
+        "shimmed_pct",
+        "shimmed_symbols",
+        "source",
+        "status",
+        "total",
+        "totals",
+        "unrecorded",
+        "unresolved",
+    }
+)
+
+
+def _sensitive_host_paths(extra_paths: Sequence[Path | str] = ()) -> list[str]:
+    """Collect host-specific filesystem path prefixes that must never leak."""
+    raw_candidates: list[Path] = []
+    try:
+        home = Path.home()
+        raw_candidates.append(home)
+        raw_candidates.append(home.resolve())
+    except (OSError, RuntimeError):
+        pass
+
+    for item in extra_paths:
+        if not item:
+            continue
+        p = Path(item)
+        raw_candidates.append(p)
+        try:
+            raw_candidates.append(p.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for path in raw_candidates:
+        for text in (str(path), str(path).replace("\\", "/")):
+            cleaned = text.rstrip("\\/")
+            if len(cleaned) < 4:
+                continue
+            key = cleaned.lower() if os.name == "nt" else cleaned
+            if key not in seen:
+                seen.add(key)
+                variants.append(cleaned)
+    variants.sort(key=len, reverse=True)
+    return variants
+
+
+def _compile_host_prefix_patterns(extra_paths: Sequence[Path | str] = ()) -> list[re.Pattern[str]]:
+    patterns: list[re.Pattern[str]] = []
+    for host_prefix in _sensitive_host_paths(extra_paths):
+        flags = re.IGNORECASE if (os.name == "nt" or re.match(r"^[A-Za-z]:", host_prefix)) else 0
+        patterns.append(
+            re.compile(
+                rf"{re.escape(host_prefix)}(?:[\\/][^\s\"'<>|,;()\[\]]*)?",
+                flags,
+            )
+        )
+    return patterns
+
+
+def _compile_username_patterns() -> list[re.Pattern[str]]:
+    return [
+        re.compile(
             rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
             re.IGNORECASE,
         )
-        sanitized = pattern.sub("<user>", sanitized)
+        for username in _current_usernames()
+    ]
+
+
+def _sanitize_text_with_patterns(
+    text: str,
+    prefix_patterns: Sequence[re.Pattern[str]],
+    username_patterns: Sequence[re.Pattern[str]],
+    *,
+    sanitize_usernames: bool = True,
+) -> str:
+    sanitized = text
+    for prefix_re in prefix_patterns:
+        sanitized = prefix_re.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    if sanitize_usernames:
+        for user_re in username_patterns:
+            sanitized = user_re.sub("<user>", sanitized)
     return sanitized
+
+
+def sanitize_message(text: str, *, extra_paths: Sequence[Path | str] = ()) -> str:
+    """Strip any accidental host paths or usernames from diagnostic messages."""
+    return _sanitize_text_with_patterns(
+        text,
+        _compile_host_prefix_patterns(extra_paths),
+        _compile_username_patterns(),
+    )
+
+
+def sanitize_report(
+    value: Any,
+    *,
+    repo_root: Path | str | None = None,
+    extra_paths: Sequence[Path | str] = (),
+) -> Any:
+    """Recursively sanitize every string key and value in a report before JSON serialization."""
+    paths: list[Path | str] = list(extra_paths)
+    if repo_root is not None:
+        paths.append(repo_root)
+    prefix_patterns = _compile_host_prefix_patterns(paths)
+    username_patterns = _compile_username_patterns()
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, str):
+            return _sanitize_text_with_patterns(node, prefix_patterns, username_patterns)
+        if isinstance(node, list):
+            return [_walk(item) for item in node]
+        if isinstance(node, tuple):
+            return [_walk(item) for item in node]
+        if isinstance(node, Mapping):
+            out: dict[Any, Any] = {}
+            for key, val in node.items():
+                if isinstance(key, str):
+                    clean_key = (
+                        key
+                        if key in _REPORT_SCHEMA_KEYS
+                        else _sanitize_text_with_patterns(
+                            key, prefix_patterns, username_patterns
+                        )
+                    )
+                else:
+                    clean_key = key
+                clean_val = _walk(val)
+                if (
+                    clean_key in out
+                    and isinstance(out[clean_key], dict)
+                    and isinstance(clean_val, dict)
+                    and out[clean_key].keys() == clean_val.keys()
+                    and all(
+                        isinstance(v, int) and not isinstance(v, bool)
+                        for v in out[clean_key].values()
+                    )
+                    and all(
+                        isinstance(v, int) and not isinstance(v, bool)
+                        for v in clean_val.values()
+                    )
+                ):
+                    out[clean_key] = {
+                        k: out[clean_key][k] + clean_val[k] for k in out[clean_key]
+                    }
+                else:
+                    out[clean_key] = clean_val
+            return out
+        return node
+
+    return _walk(value)
+
+
+def _canonical_dll_sort_key(dll_name: str) -> tuple[str, str, str]:
+    """Deterministic case-insensitive canonical DLL sort key with exact-case tie-break."""
+    return (canonical_dll_name(dll_name), dll_name.lower(), dll_name)
+
+
+def _canonical_symbol_sort_key(symbol: str) -> tuple[int, int, str, str]:
+    """Deterministic symbol sort key: named symbols case-insensitively, then ordinals numerically."""
+    if symbol.startswith("#") and symbol[1:].isdigit():
+        return (1, int(symbol[1:]), symbol.lower(), symbol)
+    return (0, 0, symbol.lower(), symbol)
+
+
+def coverage_pct(
+    covered: int | float,
+    total: int | float,
+    *,
+    digits: int = 2,
+) -> float:
+    """Zero-division-safe coverage percentage rounded to `digits` decimal places in [0.0, 100.0]."""
+    try:
+        cov = float(covered)
+        tot = float(total)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (math.isfinite(cov) and math.isfinite(tot)) or tot <= 0.0 or cov <= 0.0:
+        return 0.0
+    pct = (cov / tot) * 100.0
+    if pct > 100.0:
+        pct = 100.0
+    return round(pct, digits)
 
 
 def canonical_dll_name(name: str) -> str:
@@ -854,7 +1071,8 @@ def scan_runtime_shims(repo_root: Path | str) -> dict[str, Any]:
         if not scan_dir.is_dir():
             continue
         files = sorted(
-            p for p in scan_dir.iterdir() if p.is_file() and p.suffix.lower() in (".h", ".cpp")
+            (p for p in scan_dir.iterdir() if p.is_file() and p.suffix.lower() in (".h", ".cpp")),
+            key=lambda p: (p.name.lower(), p.name),
         )
         for path in files:
             source_rel = f"{rel_dir}/{path.name}"
@@ -883,7 +1101,9 @@ def scan_runtime_shims(repo_root: Path | str) -> dict[str, Any]:
             dll: dict(sorted(ords.items())) for dll, ords in sorted(ordinals_by_dll.items())
         },
         "api_set_rules": dict(sorted(api_set_rules.items())),
-        "module_aliases": dict(sorted(module_aliases.items())),
+        "module_aliases": {
+            alias: sorted(targets) for alias, targets in sorted(module_aliases.items())
+        },
         "header_exports": dict(sorted(header_exports.items())),
     }
 
@@ -953,12 +1173,12 @@ def _build_header_key_index(
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Index header declarations as `{prefix: {normalized_key: entry}}`."""
     index: dict[str, dict[str, dict[str, Any]]] = {}
-    for entry in header_exports.values():
+    for _, entry in sorted(header_exports.items()):
         prefix = str(entry["prefix"])
         prefix_map = index.setdefault(prefix, {})
         for key in entry["normalized_keys"]:
             prefix_map.setdefault(str(key), dict(entry))
-    return index
+    return {prefix: dict(sorted(key_map.items())) for prefix, key_map in sorted(index.items())}
 
 
 def _match_import_against_shims(
@@ -1014,14 +1234,14 @@ def _match_import_against_shims(
 
 
 def _pct(numerator: int, denominator: int) -> float:
-    if denominator <= 0:
-        return 0.0
-    return round((numerator / denominator) * 100.0, 2)
+    return coverage_pct(numerator, denominator)
 
 
 def audit_import_coverage(
     repo_root: Path | str | None = None,
     guest_recompiled_dlls: Iterable[str] | None = None,
+    *,
+    sort_dlls: bool = False,
 ) -> dict[str, Any]:
     """Audit real-binary import coverage across `docs/imports_required.md` and `runtime/`."""
     root = Path(repo_root) if repo_root is not None else DEFAULT_REPO_ROOT
@@ -1041,7 +1261,12 @@ def audit_import_coverage(
             markdown_text = imports_path.read_text(encoding="utf-8")
             imports_by_dll = parse_imports_required(markdown_text)
         except OSError as exc:
-            errors.append(sanitize_message(f"failed to read {IMPORTS_REQUIRED_REL}: {exc}"))
+            errors.append(
+                sanitize_message(
+                    f"failed to read {IMPORTS_REQUIRED_REL}: {exc}",
+                    extra_paths=(root,),
+                )
+            )
             imports_by_dll = {}
 
     shims = scan_runtime_shims(root)
@@ -1053,7 +1278,13 @@ def audit_import_coverage(
     total_guest_recompiled = 0
     total_missing = 0
 
-    for dll_name, entries in imports_by_dll.items():
+    dll_items = (
+        sorted(imports_by_dll.items(), key=lambda kv: _canonical_dll_sort_key(kv[0]))
+        if sort_dlls
+        else list(imports_by_dll.items())
+    )
+
+    for dll_name, entries in dll_items:
         canon_dll = canonical_dll_name(dll_name)
         is_guest_recompiled = canon_dll in guest_dll_set
 
@@ -1074,6 +1305,10 @@ def audit_import_coverage(
             else:
                 missing_syms.append(symbol)
 
+        shimmed_syms.sort(key=_canonical_symbol_sort_key)
+        guest_syms.sort(key=_canonical_symbol_sort_key)
+        missing_syms.sort(key=_canonical_symbol_sort_key)
+
         dll_total = len(entries)
         dll_shimmed = len(shimmed_syms)
         dll_guest = len(guest_syms)
@@ -1091,6 +1326,7 @@ def audit_import_coverage(
         else:
             status = "missing"
 
+        effective_pct = coverage_pct(dll_shimmed + dll_guest, dll_total)
         dll_reports.append(
             {
                 "dll": dll_name,
@@ -1100,8 +1336,9 @@ def audit_import_coverage(
                 "shimmed": dll_shimmed,
                 "guest_recompiled": dll_guest,
                 "missing": dll_missing,
-                "shimmed_pct": _pct(dll_shimmed, dll_total),
-                "effective_boot_pct": _pct(dll_shimmed + dll_guest, dll_total),
+                "shimmed_pct": coverage_pct(dll_shimmed, dll_total),
+                "effective_boot_pct": effective_pct,
+                "coverage_pct": effective_pct,
                 "shimmed_symbols": shimmed_syms,
                 "guest_recompiled_symbols": guest_syms,
                 "missing_symbols": missing_syms,
@@ -1114,14 +1351,15 @@ def audit_import_coverage(
 
     registered_export_count = sum(len(v) for v in shims["registered_exports"].values())
     registered_ordinal_count = sum(len(v) for v in shims["registered_ordinals"].values())
+    total_effective_pct = coverage_pct(total_shimmed + total_guest_recompiled, total_symbols)
 
-    return {
+    report = {
         "ok": not errors,
         "source": IMPORTS_REQUIRED_REL,
         "guest_recompiled_dlls": sorted(guest_dll_set),
         "totals": {
             "dll_count": len(dll_reports),
-            "complete_dlls": sum(1 for d in dll_reports if d["missing"] == 0),
+            "complete_dlls": sum(1 for d in dll_reports if d["missing"] == 0 and d["total"] > 0),
             "partial_dlls": sum(
                 1 for d in dll_reports if d["missing"] > 0 and (d["shimmed"] > 0 or d["guest_recompiled"] > 0)
             ),
@@ -1132,10 +1370,11 @@ def audit_import_coverage(
             "shimmed": total_shimmed,
             "guest_recompiled": total_guest_recompiled,
             "missing": total_missing,
-            "shimmed_pct": _pct(total_shimmed, total_symbols),
-            "guest_recompiled_pct": _pct(total_guest_recompiled, total_symbols),
-            "effective_boot_pct": _pct(total_shimmed + total_guest_recompiled, total_symbols),
-            "missing_pct": _pct(total_missing, total_symbols),
+            "shimmed_pct": coverage_pct(total_shimmed, total_symbols),
+            "guest_recompiled_pct": coverage_pct(total_guest_recompiled, total_symbols),
+            "effective_boot_pct": total_effective_pct,
+            "coverage_pct": total_effective_pct,
+            "missing_pct": coverage_pct(total_missing, total_symbols),
         },
         "runtime_scan": {
             "scanned_file_count": len(shims["scanned_files"]),
@@ -1146,11 +1385,44 @@ def audit_import_coverage(
             "api_set_rule_count": len(shims["api_set_rules"]),
         },
         "dlls": dll_reports,
-        "errors": errors,
+        "errors": sorted(errors),
     }
+    return sanitize_report(report, repo_root=root)
 
 
-def filter_report_missing_only(report: Mapping[str, Any]) -> dict[str, Any]:
+def canonicalize_report(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a canonically sorted copy of an audit report (DLLs and all symbol lists sorted)."""
+    out = dict(report)
+    if isinstance(report.get("guest_recompiled_dlls"), list):
+        out["guest_recompiled_dlls"] = sorted(
+            (str(d) for d in report["guest_recompiled_dlls"]),
+            key=_canonical_dll_sort_key,
+        )
+    if isinstance(report.get("errors"), list):
+        out["errors"] = sorted(str(e) for e in report["errors"])
+    if isinstance(report.get("dlls"), list):
+        normalized_dlls: list[dict[str, Any]] = []
+        for entry in report["dlls"]:
+            item = dict(entry)
+            for sym_key in ("shimmed_symbols", "guest_recompiled_symbols", "missing_symbols"):
+                if isinstance(item.get(sym_key), list):
+                    item[sym_key] = sorted(
+                        (str(s) for s in item[sym_key]),
+                        key=_canonical_symbol_sort_key,
+                    )
+            if isinstance(item.get("resolution_breakdown"), Mapping):
+                item["resolution_breakdown"] = dict(sorted(item["resolution_breakdown"].items()))
+            normalized_dlls.append(item)
+        normalized_dlls.sort(key=lambda d: _canonical_dll_sort_key(str(d.get("dll", ""))))
+        out["dlls"] = normalized_dlls
+    return out
+
+
+def filter_report_missing_only(
+    report: Mapping[str, Any],
+    *,
+    sort_dlls: bool = False,
+) -> dict[str, Any]:
     """Return a copy of an audit report filtered to DLLs with missing symbols."""
     filtered_dlls = [
         {
@@ -1163,11 +1435,14 @@ def filter_report_missing_only(report: Mapping[str, Any]) -> dict[str, Any]:
             "missing": d["missing"],
             "shimmed_pct": d["shimmed_pct"],
             "effective_boot_pct": d["effective_boot_pct"],
-            "missing_symbols": list(d["missing_symbols"]),
+            "coverage_pct": d.get("coverage_pct", d["effective_boot_pct"]),
+            "missing_symbols": sorted(d["missing_symbols"], key=_canonical_symbol_sort_key),
         }
         for d in report["dlls"]
         if d["missing"] > 0
     ]
+    if sort_dlls:
+        filtered_dlls.sort(key=lambda d: _canonical_dll_sort_key(str(d["dll"])))
     out = dict(report)
     out["missing_only"] = True
     out["dlls"] = filtered_dlls
@@ -1305,6 +1580,9 @@ def audit_bridge_manifest(
         else frozenset(canonical_dll_name(d) for d in guest_dlls if d.strip())
     )
     errors: list[str] = []
+    if not isinstance(manifest, Mapping):
+        errors.append("manifest root must be a JSON object")
+        manifest = {}
     kind = (
         "program"
         if manifest.get("schema") == PROGRAM_SCHEMA
@@ -1319,7 +1597,7 @@ def audit_bridge_manifest(
         errors.append("manifest has no imports list")
         imports = []
     rows = [classify_bridge_import(e, guest_set) for e in imports if isinstance(e, Mapping)]
-    totals = {cls: 0 for cls in BINDING_CLASSES}
+    totals: dict[str, Any] = {cls: 0 for cls in BINDING_CLASSES}
     per_importer: dict[str, dict[str, int]] = {}
     per_dll: dict[str, dict[str, int]] = {}
     unresolved: list[dict[str, Any]] = []
@@ -1338,18 +1616,31 @@ def audit_bridge_manifest(
             )
             if not row["recorded"]:
                 unrecorded.append(label)
-    totals["total"] = len(rows)
-    return {
+    total_count = len(rows)
+    resolved_count = total_count - totals["unresolved"]
+    totals["total"] = total_count
+    totals["coverage_pct"] = coverage_pct(resolved_count, total_count)
+    unresolved.sort(
+        key=lambda u: (
+            str(u["import"]).lower(),
+            str(u["import"]),
+            str(u.get("reason") or ""),
+            str(u.get("recorded") or ""),
+        )
+    )
+    unrecorded.sort(key=lambda label: (label.lower(), label))
+    report = {
         "ok": not errors and not unrecorded,
         "kind": kind,
         "guest_dlls": sorted(guest_set) if kind == "bridge" else [],
         "totals": totals,
-        "importers": dict(sorted(per_importer.items())),
-        "dlls": dict(sorted(per_dll.items(), key=lambda kv: kv[0].lower())),
+        "importers": dict(sorted(per_importer.items(), key=lambda kv: (kv[0].lower(), kv[0]))),
+        "dlls": dict(sorted(per_dll.items(), key=lambda kv: _canonical_dll_sort_key(kv[0]))),
         "unresolved": unresolved,
         "unrecorded": unrecorded,
-        "errors": errors,
+        "errors": sorted(errors),
     }
+    return sanitize_report(report)
 
 
 def format_bridge_report(report: Mapping[str, Any]) -> str:
@@ -1458,6 +1749,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Show only DLLs with remaining missing symbols.",
     )
     parser.add_argument(
+        "--sort-dlls",
+        action="store_true",
+        help="Sort DLL report entries in canonical case-insensitive alphabetical order.",
+    )
+    parser.add_argument(
         "--min-pct",
         type=float,
         default=0.0,
@@ -1491,23 +1787,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.bridge_manifest is not None:
+        manifest_extra_paths = (args.bridge_manifest, args.bridge_manifest.parent)
         try:
             manifest = json.loads(args.bridge_manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            print(sanitize_message(f"failed to read bridge manifest: {exc}"), file=sys.stderr)
+            print(
+                sanitize_message(
+                    f"failed to read bridge manifest: {exc}",
+                    extra_paths=manifest_extra_paths,
+                ),
+                file=sys.stderr,
+            )
             return 1
-        bridge_report = audit_bridge_manifest(manifest, args.guest_dll)
+        bridge_report = sanitize_report(
+            audit_bridge_manifest(manifest, args.guest_dll),
+            repo_root=args.repo_root,
+            extra_paths=manifest_extra_paths,
+        )
         if args.json:
             print(json.dumps(bridge_report, indent=2))
         else:
             print(format_bridge_report(bridge_report))
         return 0 if bridge_report["ok"] else 1
 
-    report = audit_import_coverage(args.repo_root)
-    output_report = filter_report_missing_only(report) if args.missing_only else report
+    report = audit_import_coverage(args.repo_root, sort_dlls=args.sort_dlls)
+    output_report = (
+        filter_report_missing_only(report, sort_dlls=args.sort_dlls)
+        if args.missing_only
+        else report
+    )
+    sanitized_output = sanitize_report(output_report, repo_root=args.repo_root)
 
     if args.json:
-        print(json.dumps(output_report, indent=2))
+        print(json.dumps(sanitized_output, indent=2))
     else:
         print(format_human_report(report, missing_only=args.missing_only))
 

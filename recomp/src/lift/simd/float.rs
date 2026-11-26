@@ -143,6 +143,105 @@ fn predicate(p: u32) -> &'static str {
     }
 }
 
+/// Whether [`FunctionLifter::lift_float`] handles `m` (mirroring its dispatch).
+pub(super) fn is_float_supported(m: Mnemonic) -> bool {
+    use Mnemonic as M;
+    if arith(m).is_some() || fma(m).is_some() {
+        return true;
+    }
+    matches!(
+        m,
+        M::Andps
+            | M::Vandps
+            | M::Andpd
+            | M::Vandpd
+            | M::Andnps
+            | M::Vandnps
+            | M::Andnpd
+            | M::Vandnpd
+            | M::Orps
+            | M::Vorps
+            | M::Orpd
+            | M::Vorpd
+            | M::Xorps
+            | M::Vxorps
+            | M::Xorpd
+            | M::Vxorpd
+            | M::Cmpps
+            | M::Vcmpps
+            | M::Cmppd
+            | M::Vcmppd
+            | M::Cmpss
+            | M::Vcmpss
+            | M::Cmpsd
+            | M::Vcmpsd
+            | M::Comiss
+            | M::Vcomiss
+            | M::Ucomiss
+            | M::Vucomiss
+            | M::Comisd
+            | M::Vcomisd
+            | M::Ucomisd
+            | M::Vucomisd
+            | M::Cvtsi2ss
+            | M::Vcvtsi2ss
+            | M::Cvtsi2sd
+            | M::Vcvtsi2sd
+            | M::Cvtss2sd
+            | M::Vcvtss2sd
+            | M::Cvtsd2ss
+            | M::Vcvtsd2ss
+            | M::Cvtss2si
+            | M::Vcvtss2si
+            | M::Cvttss2si
+            | M::Vcvttss2si
+            | M::Cvtsd2si
+            | M::Vcvtsd2si
+            | M::Cvttsd2si
+            | M::Vcvttsd2si
+            | M::Cvtdq2ps
+            | M::Vcvtdq2ps
+            | M::Cvtps2dq
+            | M::Vcvtps2dq
+            | M::Cvttps2dq
+            | M::Vcvttps2dq
+            | M::Cvtdq2pd
+            | M::Vcvtdq2pd
+            | M::Cvtpd2dq
+            | M::Vcvtpd2dq
+            | M::Cvttpd2dq
+            | M::Vcvttpd2dq
+            | M::Cvtps2pd
+            | M::Vcvtps2pd
+            | M::Cvtpd2ps
+            | M::Vcvtpd2ps
+            | M::Haddps
+            | M::Vhaddps
+            | M::Haddpd
+            | M::Vhaddpd
+            | M::Hsubps
+            | M::Vhsubps
+            | M::Hsubpd
+            | M::Vhsubpd
+            | M::Addsubps
+            | M::Vaddsubps
+            | M::Addsubpd
+            | M::Vaddsubpd
+            | M::Roundps
+            | M::Vroundps
+            | M::Roundpd
+            | M::Vroundpd
+            | M::Roundss
+            | M::Vroundss
+            | M::Roundsd
+            | M::Vroundsd
+            | M::Dpps
+            | M::Vdpps
+            | M::Dppd
+            | M::Vdppd
+    )
+}
+
 impl FunctionLifter<'_> {
     pub(super) fn lift_float(&mut self, ins: &Instruction, vex: bool) -> R<bool> {
         use Elem::{F32, F64, I32};
@@ -205,10 +304,25 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(0), &r, F64)?;
             }
             M::Cvtpd2dq | M::Vcvtpd2dq | M::Cvttpd2dq | M::Vcvttpd2dq => {
+                // Zero-extend the `<2 x i32>` `fptosi.sat` result to `<4 x i32>` before selecting
+                // the indefinite lane value so LLVM emits native `i32x4.trunc_sat_f64x2_s_zero`.
                 let truncate = matches!(m, M::Cvttpd2dq | M::Vcvttpd2dq);
                 let v = self.v128(ins, 1, F64)?;
-                let r = self.float_to_int(&v, Ty::v(F64), 32, truncate);
-                let r = self.zext_lanes(&r, I32, 2);
+                let x = if truncate {
+                    v
+                } else {
+                    self.intr(Intr::Rint, Ty::v(F64), &[&v])
+                };
+                let sat2 = self.intr(Intr::FpToSiSat(I32), Ty::v(F64), &[&x]);
+                let sat4 = self.zext_lanes(&sat2, I32, 2);
+                let limit = Ty::v(F64).splat(&fconst(2f64.powi(31)));
+                let ok2 = self.val(&format!("fcmp olt <2 x double> {x}, {limit}"));
+                let ok4 = self.val(&format!(
+                    "shufflevector <2 x i1> {ok2}, <2 x i1> poison, <4 x i32> <i32 0, i32 1, i32 0, i32 1>"
+                ));
+                let r = self.val(&format!(
+                    "select <4 x i1> {ok4}, <4 x i32> {sat4}, <4 x i32> <i32 -2147483648, i32 -2147483648, i32 0, i32 0>"
+                ));
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Cvtps2pd | M::Vcvtps2pd => {
@@ -429,8 +543,10 @@ impl FunctionLifter<'_> {
     }
 
     /// x86 float -> signed int conversion: round half to even (or truncate), and the "integer
-    /// indefinite" value `1 << (bits - 1)` for NaN and out-of-range inputs (LLVM's `fptosi` is
-    /// poison there, so it is only selected for in-range values).
+    /// indefinite" value `1 << (bits - 1)` for NaN and out-of-range inputs.
+    /// `llvm.fptosi.sat` already saturates `x <= -2^(bits-1)` (including `-inf`) to the exact
+    /// indefinite value `MIN_INT`, so a single ordered comparison `x < 2^(bits-1)` catches both
+    /// positive overflow and NaN.
     pub(super) fn float_to_int(&mut self, v: &str, ty: Ty, bits: u32, truncate: bool) -> String {
         let t = ty.ir();
         let x = if truncate {
@@ -438,23 +554,14 @@ impl FunctionLifter<'_> {
         } else {
             self.intr(Intr::Rint, ty, &[v])
         };
+        let dst_elem = Elem::of_bits(bits);
+        let sat = self.intr(Intr::FpToSiSat(dst_elem), ty, &[&x]);
         let limit = 2f64.powi(bits as i32 - 1);
-        // Smallest value whose truncation still fits: -limit - 1 is exclusive when it is
-        // representable (only double -> i32); otherwise -limit itself is inclusive.
-        let low = if truncate && ty.e == Elem::F64 && bits == 32 {
-            let c = ty.splat(&fconst(-limit - 1.0));
-            self.val(&format!("fcmp ogt {t} {x}, {c}"))
-        } else {
-            let c = ty.splat(&fconst(-limit));
-            self.val(&format!("fcmp oge {t} {x}, {c}"))
-        };
-        let high = self.val(&format!("fcmp olt {t} {x}, {}", ty.splat(&fconst(limit))));
-        let ok = self.val(&format!("and {} {low}, {high}", ty.bool_ir()));
-        let it = ty.with(Elem::of_bits(bits));
-        let i = self.val(&format!("fptosi {t} {x} to {}", it.ir()));
+        let ok = self.val(&format!("fcmp olt {t} {x}, {}", ty.splat(&fconst(limit))));
+        let it = ty.with(dst_elem);
         let indefinite = it.splat(&imm(1u64 << (bits - 1), bits));
         self.val(&format!(
-            "select {} {ok}, {} {i}, {} {indefinite}",
+            "select {} {ok}, {} {sat}, {} {indefinite}",
             ty.bool_ir(),
             it.ir(),
             it.ir()

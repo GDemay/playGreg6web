@@ -1843,6 +1843,7 @@ BindGroupPlan BindGroupPlan::build(
                                                                                            : b.heap_index_parameter;
                 e.heap_dword = b.heap_index_source == HeapIndexSource::RootConstantIndex ? b.heap_index_dword : 0;
                 e.heap_shift = b.heap_shift;
+                e.heap_stride = b.heap_stride;
                 e.heap_index_source = b.heap_index_source;
                 e.heap_index_bias = b.array_index;
                 if (b.heap_index_source != HeapIndexSource::RootConstantIndex &&
@@ -1957,6 +1958,7 @@ BindGroupPlan BindGroupPlan::build(
         h.u32(e.cb_bit_offset);
         h.u32(e.cb_mask);
         h.u32(e.heap_index_bias);
+        h.u32(e.heap_stride);
         if (e.source == PlanSource::InlineSampler) {
             uint32_t words[sizeof(SamplerDesc) / 4] = {};
             std::memcpy(words, &e.sampler, sizeof(words));
@@ -2022,6 +2024,11 @@ bool cb_index_dword(const RootArgumentState& state, BindPoint bind_point, const 
 
 // The heap byte offset a heap-indexed plan entry selects under the current arguments: false when
 // the index is not available (*cb_miss set when it is a CB index that could not be read).
+// RDNA2 scalar-load soffset is 32-bit: the scaled index wraps in hardware.
+uint32_t scaled_heap_index(const PlanEntry& p, uint32_t index) {
+    return p.heap_stride != 0 ? index * p.heap_stride : index << p.heap_shift;
+}
+
 bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, const PlanEntry& p,
                       const DescriptorSlotSource* source, uint64_t* byte_offset, bool* cb_miss = nullptr) {
     if (p.heap_index_source == HeapIndexSource::RootConstantIndex) {
@@ -2029,8 +2036,7 @@ bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, cons
         if (p.heap_dword >= values.size()) {
             return false;
         }
-        // RDNA2 scalar-load soffset is 32-bit: the shifted index wraps in hardware.
-        *byte_offset = static_cast<uint32_t>((values[p.heap_dword] + p.heap_index_bias) << p.heap_shift);
+        *byte_offset = scaled_heap_index(p, values[p.heap_dword] + p.heap_index_bias);
         return true;
     }
     uint32_t dword = 0;
@@ -2041,7 +2047,7 @@ bool heap_byte_offset(const RootArgumentState& state, BindPoint bind_point, cons
         return false;
     }
     // 32-bit, as above; a binding array element adds its index to the window base.
-    *byte_offset = static_cast<uint32_t>((((dword >> p.cb_bit_offset) & p.cb_mask) + p.heap_index_bias) << p.heap_shift);
+    *byte_offset = scaled_heap_index(p, ((dword >> p.cb_bit_offset) & p.cb_mask) + p.heap_index_bias);
     return true;
 }
 
@@ -2223,6 +2229,7 @@ BindGroupLookup BindGroupCache::get_or_build(
     auto it = entries_.find(h);
     if (it != entries_.end() && it->second->key == scratch_key_) {
         CachedBindGroup& cached = *it->second;
+        cached.last_used_epoch = epoch_;
         bool changed = false;
         const std::vector<BindGroupPlan::TableWindow>& windows = plan.table_windows();
         for (size_t t = 0; t < windows.size() && !changed; ++t) {
@@ -2265,6 +2272,8 @@ BindGroupLookup BindGroupCache::get_or_build(
     }
     auto entry = std::make_unique<CachedBindGroup>();
     entry->layout_key = layout_key;
+    entry->key_hash = h;
+    entry->last_used_epoch = epoch_;
     build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
     result.bind_group = entry.get();
     result.rebuilt = true;
@@ -2314,7 +2323,8 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
                            const BindGroupPlan& plan,
                            GpuVaResolver resolver,
                            void* resolver_user,
-                           CachedBindGroup* group) {
+                           CachedBindGroup* group,
+                           bool force_rebuild) {
     if (!group->from_memory) {
         return false;
     }
@@ -2354,7 +2364,7 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
             words.insert(words.end(), window.begin(), window.end());
         }
     }
-    if (words == group->built_words) {
+    if (!force_rebuild && words == group->built_words) {
         return false;
     }
     group->built_words = std::move(words);
@@ -2395,6 +2405,107 @@ void BindGroupCache::clear(std::vector<uint32_t>* retired) {
         }
     }
     entries_.clear();
+}
+
+uint32_t BindGroupCache::erase(const CachedBindGroup* group) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
+        if (it->second.get() == group) {
+            const uint32_t id = it->second->gpu_id;
+            entries_.erase(it);
+            return id;
+        }
+    }
+    return 0;
+}
+
+size_t BindGroupCache::evict_resource(uint32_t resource_id, std::vector<uint32_t>* retired) {
+    if (resource_id == 0) {
+        return 0;
+    }
+    return evict_resources_and_views(std::span<const uint32_t>(&resource_id, 1), {}, retired);
+}
+
+size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resource_ids,
+                                                 std::span<const uint32_t> view_ids,
+                                                 std::vector<uint32_t>* retired,
+                                                 std::vector<uint64_t>* evicted_key_hashes) {
+    if (entries_.empty() || (resource_ids.empty() && view_ids.empty())) {
+        return 0;
+    }
+    auto contains = [](std::span<const uint32_t> ids, uint32_t id) noexcept -> bool {
+        if (id == 0) {
+            return false;
+        }
+        for (const uint32_t candidate : ids) {
+            if (candidate == id) {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto references_any = [&](const CachedBindGroup& g) noexcept -> bool {
+        if (!resource_ids.empty()) {
+            for (const BindGroupEntry& e : g.entries) {
+                if (contains(resource_ids, e.resource_id) ||
+                    contains(resource_ids, e.view.resource_id) ||
+                    contains(resource_ids, e.view.counter_resource_id)) {
+                    return true;
+                }
+            }
+            for (const CachedBindGroup::Relocation& r : g.relocations) {
+                if (contains(resource_ids, r.buffer_id)) {
+                    return true;
+                }
+            }
+        }
+        if (!view_ids.empty()) {
+            for (const uint32_t vid : g.view_ids) {
+                if (contains(view_ids, vid)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    size_t dropped = 0;
+    for (auto it = entries_.begin(); it != entries_.end();) {
+        if (references_any(*it->second)) {
+            if (retired != nullptr && it->second->gpu_id != 0) {
+                retired->push_back(it->second->gpu_id);
+            }
+            if (evicted_key_hashes != nullptr) {
+                evicted_key_hashes->push_back(it->first);
+            }
+            it = entries_.erase(it);
+            ++dropped;
+        } else {
+            ++it;
+        }
+    }
+    return dropped;
+}
+
+size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired) {
+    size_t dropped = 0;
+    if (entries_.size() > max_entries) {
+        for (auto it = entries_.begin(); it != entries_.end();) {
+            if (it->second->last_used_epoch < epoch_) {
+                if (retired != nullptr && it->second->gpu_id != 0) {
+                    retired->push_back(it->second->gpu_id);
+                }
+                it = entries_.erase(it);
+                ++dropped;
+            } else {
+                ++it;
+            }
+        }
+        if (entries_.size() > max_entries) {
+            dropped += entries_.size();
+            clear(retired);
+        }
+    }
+    ++epoch_;
+    return dropped;
 }
 
 // ===========================================================================

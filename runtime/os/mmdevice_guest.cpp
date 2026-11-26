@@ -48,6 +48,7 @@
 
 #include "os/win32_compat.h"
 #include "os/win32_kernel.h"
+#include "os/xbox_middleware.h"
 #include "os/xbox_scarlett_guest.h"
 
 namespace playgta6::os::scarlett::guest_api {
@@ -317,6 +318,7 @@ std::atomic<uint64_t> g_spatial_passes{0};
 std::atomic<uint64_t> g_render_frames{0};
 std::atomic<uint64_t> g_spatial_object_buffers{0};   // object buffers read at EndUpdatingAudioObjects
 std::atomic<uint64_t> g_spatial_nonzero_buffers{0};  // ... of them holding a non-zero sample
+std::atomic<uint64_t> g_spatial_nonzero_passes{0};   // passes with any non-zero object buffer
 std::atomic<uint64_t> g_render_nonzero_frames{0};
 std::atomic<uint64_t> g_render_silent_releases{0};   // ReleaseBuffer with AUDCLNT_BUFFERFLAGS_SILENT
 
@@ -364,6 +366,12 @@ void trace_window(uint32_t objects_this_pass, float pass_peak) {
                   static_cast<unsigned long long>(rf - rf_last), static_cast<unsigned long long>(rnz - rnz_last),
                   static_cast<unsigned long long>(g_render_silent_releases.load()),
                   static_cast<unsigned long long>(xa - xapu_last), static_cast<unsigned long long>(xd - xdsp_last));
+    com::detail::diagnostic(line);
+    const Pg6XmaContextCensus xma = pg6_mw_xma_context_census();
+    std::snprintf(line, sizeof(line),
+                  "audio-trace: XMA contexts %u: %u set up, %u with input valid, %u with output pending (no XMA "
+                  "decoder: input stays queued)",
+                  xma.contexts, xma.touched, xma.input_valid, xma.output_pending);
     com::detail::diagnostic(line);
     objects = 0;
     peak = 0.0f;
@@ -832,6 +840,7 @@ public:
         std::vector<uint32_t> types;
         std::vector<std::vector<float>> pcm;
         float pass_peak = 0.0f;
+        bool pass_nonzero = false;
         for (const auto& [type, buffer, volume] : written) {
             std::vector<float> mono(kPeriodFrames);
             if (buffer != 0 && com::read_guest(buffer, mono.data(), mono.size() * sizeof(float))) {
@@ -844,11 +853,18 @@ public:
                 g_spatial_object_buffers.fetch_add(1);
                 if (any_nonzero(mono.data(), mono.size(), &pass_peak)) {
                     g_spatial_nonzero_buffers.fetch_add(1);
+                    pass_nonzero = true;
                 }
                 types.push_back(type);
                 pcm.push_back(std::move(mono));
             }
         }
+        // The report's non-silent fraction and windows count spatial passes like render frames:
+        // a title that only renders through static objects otherwise reports 0 frames.
+        if (pass_nonzero) {
+            g_spatial_nonzero_passes.fetch_add(1);
+        }
+        audio_report::windows().record(kPeriodFrames, pass_nonzero);
         std::vector<const float*> ptrs;
         for (const auto& v : pcm) {
             ptrs.push_back(v.data());
@@ -1385,6 +1401,7 @@ AudioEndpointStats audio_endpoint_stats() {
     s.render_frames = g_render_frames.load();
     s.spatial_object_buffers = g_spatial_object_buffers.load();
     s.spatial_nonzero_buffers = g_spatial_nonzero_buffers.load();
+    s.spatial_nonzero_passes = g_spatial_nonzero_passes.load();
     s.render_nonzero_frames = g_render_nonzero_frames.load();
     s.render_silent_releases = g_render_silent_releases.load();
     return s;
@@ -1405,6 +1422,7 @@ void reset_audio_endpoint() {
     g_render_frames = 0;
     g_spatial_object_buffers = 0;
     g_spatial_nonzero_buffers = 0;
+    g_spatial_nonzero_passes = 0;
     g_render_nonzero_frames = 0;
     audio_report::windows().reset();
     g_render_silent_releases = 0;

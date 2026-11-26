@@ -1,9 +1,13 @@
 #include "os/win32_sync.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -47,16 +51,65 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 
-// Process-wide dispatcher lock guarding the state of every dispatcher object and its waiter
-// list. Leaked on purpose so thread-exit paths that run during static destruction can use it.
-std::mutex& dispatcher_mutex() {
-    static auto* mutex = new std::mutex();
-    return *mutex;
-}
+// Locking model: every dispatcher object has its own lock guarding its state and waiter list.
+// A wait-all locks all of its objects in address order; nothing else ever holds two object locks.
+// A WaitBlock's mutex is innermost: it is taken under an object lock (to wake the waiter) and is
+// never held while acquiring an object lock.
 
-// One per blocked WaitFor* call; registered on every object it waits for.
+// One per WaitFor* call; registered on every object it waits for.
+//
+// Wait-any blocks are satisfied by direct handoff: a signaler that finds the object signaled for
+// a registered waiter claims the block (CAS Waiting -> Claimed), applies the acquire side effect
+// on the waiter's behalf (consumes the auto-reset event / semaphore unit, takes the mutex) and
+// publishes the result. Waiters are queued FIFO per object, so auto-reset events and semaphores
+// are handed out in arrival order. A timed-out waiter must win CAS Waiting -> TimedOut, so a
+// wait never both times out and consumes a signal.
+//
+// Wait-all blocks are only notified (wake_seq bump); the waiter re-checks with all its objects
+// locked and acquires them atomically or not at all.
 struct WaitBlock {
+    enum : uint32_t { kWaiting, kClaimed, kSatisfied, kTimedOut };
+
+    WaitBlock(uint32_t waiter_thread, bool all) : thread_id(waiter_thread), wait_all(all) {}
+
+    // Called with the object lock held; the block outlives that lock because the waiter must take
+    // it to deregister before returning.
+    void publish_satisfied(uint32_t object_index, bool was_abandoned, bool took_mutex) {
+        index = object_index;
+        abandoned = was_abandoned;
+        newly_owned = took_mutex;
+        std::lock_guard<std::mutex> guard(mutex);
+        state.store(kSatisfied, std::memory_order_release);
+        cv.notify_one();
+    }
+
+    void notify_wait_all() {
+        std::lock_guard<std::mutex> guard(mutex);
+        wake_seq.fetch_add(1, std::memory_order_release);
+        cv.notify_one();
+    }
+
+    const uint32_t thread_id;
+    const bool wait_all;
+    std::mutex mutex;
     std::condition_variable cv;
+    std::atomic<uint32_t> state{kWaiting};
+    std::atomic<uint32_t> wake_seq{0};
+    // Written by the claimer before state becomes kSatisfied.
+    uint32_t index = 0;
+    bool abandoned = false;
+    bool newly_owned = false;
+};
+
+struct WaiterLink {
+    WaitBlock* block;
+    uint32_t index;  // position of the object in the waiter's handle array
+};
+
+// Result of a satisfied wait on one object.
+struct AcquireOutcome {
+    bool abandoned = false;    // an abandoned mutex was acquired
+    bool newly_owned = false;  // a mutex changed owner to the waiter (track it for abandonment)
 };
 
 struct ThreadInfo {
@@ -76,7 +129,7 @@ uint32_t allocate_thread_id() {
 
 class MutexObject;
 
-// Per-OS-thread state. owned_mutexes is only touched by its own thread, under the dispatcher lock.
+// Per-OS-thread state. owned_mutexes is only touched by its own thread.
 struct ThreadState {
     std::shared_ptr<ThreadInfo> info;
     std::vector<std::shared_ptr<MutexObject>> owned_mutexes;
@@ -97,7 +150,106 @@ ThreadInfo& current_thread_info() {
     return *t_thread.info;
 }
 
+// PG6_EVENT_TRACE=1: SetEvent / ResetEvent / ReleaseSemaphore / waits on chosen handles, with thread, guest caller
+// and time, to find who signals an event a thread is blocked on and how late.
+// PG6_EVENT_TRACE_HANDLES=0x15f,0x160 picks the handles (default 0x15f). Timed-out polls are
+// counted, not logged: the satisfied wait reports how many polls and how long it took.
+struct EventTrace {
+    bool enabled = false;
+    std::vector<Handle> handles;
+    Clock::time_point start = Clock::now();
+};
+
+std::atomic<uint64_t (*)()> g_event_trace_caller{nullptr};
+
+const EventTrace& event_trace_config() {
+    static const EventTrace config = [] {
+        EventTrace t;
+        const char* on = std::getenv("PG6_EVENT_TRACE");
+        t.enabled = on != nullptr && on[0] != '\0' && on[0] != '0';
+        if (!t.enabled) {
+            return t;
+        }
+        const char* list = std::getenv("PG6_EVENT_TRACE_HANDLES");
+        std::string text = list != nullptr ? list : "0x15f";
+        size_t pos = 0;
+        while (pos < text.size()) {
+            size_t end = text.find(',', pos);
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            const std::string item = text.substr(pos, end - pos);
+            if (!item.empty()) {
+                t.handles.push_back(static_cast<Handle>(std::strtoull(item.c_str(), nullptr, 0)));
+            }
+            pos = end + 1;
+        }
+        return t;
+    }();
+    return config;
+}
+
+bool event_traced(Handle handle) {
+    const EventTrace& t = event_trace_config();
+    return t.enabled && std::find(t.handles.begin(), t.handles.end(), handle) != t.handles.end();
+}
+
+// Timed-out polls of a traced handle by this thread since its last satisfied wait.
+struct PollRun {
+    Handle handle = 0;
+    uint32_t polls = 0;
+    Clock::time_point first{};
+};
+thread_local PollRun t_poll_run;
+
+void event_trace_line(const char* op, Handle handle, const char* detail) {
+    const auto caller_fn = g_event_trace_caller.load(std::memory_order_relaxed);
+    const uint64_t caller = caller_fn != nullptr ? caller_fn() : 0;
+    const double ms =
+        std::chrono::duration<double, std::milli>(Clock::now() - event_trace_config().start).count();
+    std::fprintf(stderr, "[event-trace] %10.3f ms tid=%u %-6s h=0x%" PRIx64 " caller=0x%" PRIx64 "%s%s\n",
+                 ms, current_thread_info().id, op, static_cast<uint64_t>(handle), caller,
+                 detail[0] != '\0' ? " " : "", detail);
+}
+
+void event_trace_wait(Handle handle, uint32_t timeout_ms, uint32_t result) {
+    if (!event_traced(handle)) {
+        return;
+    }
+    PollRun& run = t_poll_run;
+    if (run.handle != handle) {
+        run = PollRun{handle, 0, Clock::now()};
+    }
+    if (result == WAIT_TIMEOUT && timeout_ms == 0) {
+        if (run.polls++ == 0) {
+            run.first = Clock::now();
+        }
+        return;
+    }
+    char detail[128];
+    const double waited =
+        run.polls != 0 ? std::chrono::duration<double, std::milli>(Clock::now() - run.first).count() : 0.0;
+    std::snprintf(detail, sizeof(detail), "timeout=%d result=0x%x after %u polls / %.3f ms",
+                  static_cast<int32_t>(timeout_ms), result, run.polls, waited);
+    event_trace_line("wait", handle, detail);
+    run.polls = 0;
+}
+
 }  // namespace
+
+void set_event_trace_caller(uint64_t (*caller)()) {
+    g_event_trace_caller.store(caller, std::memory_order_relaxed);
+}
+
+bool event_trace_enabled(Handle handle) {
+    return event_traced(handle);
+}
+
+void event_trace_note(const char* op, Handle handle, const char* detail) {
+    if (event_traced(handle)) {
+        event_trace_line(op, handle, detail != nullptr ? detail : "");
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Dispatcher objects
@@ -118,19 +270,43 @@ public:
     DispatcherObject(const DispatcherObject&) = delete;
     DispatcherObject& operator=(const DispatcherObject&) = delete;
 
-    // Both are called with the dispatcher lock held, on the waiting thread.
+    // Both are called with this object's lock held (by the waiter or by a signaler handing off).
     virtual bool is_signaled_for(uint32_t thread_id) const = 0;
-    // Applies the side effect of a satisfied wait. Returns true if an abandoned mutex was acquired.
-    virtual bool acquire(uint32_t thread_id) = 0;
+    // Applies the side effect of a satisfied wait for `thread_id`.
+    virtual AcquireOutcome acquire(uint32_t thread_id) = 0;
 
+    // Called with `lock` held after the state may have become signaled: hands the object to
+    // queued wait-any waiters in FIFO order while it stays signaled and wakes wait-all waiters.
     void wake_waiters_locked() {
-        for (WaitBlock* block : waiters) {
-            block->cv.notify_one();
+        // Lets a spinning waiter (see wait_for_objects) notice a state change without the lock.
+        signal_seq.fetch_add(1, std::memory_order_release);
+        for (size_t i = 0; i < waiters.size();) {
+            WaitBlock* block = waiters[i].block;
+            if (!is_signaled_for(block->thread_id)) {
+                break;  // nothing left to hand out (a mutex is signaled for every non-owner alike)
+            }
+            if (block->wait_all) {
+                block->notify_wait_all();
+                ++i;
+                continue;
+            }
+            uint32_t expected = WaitBlock::kWaiting;
+            if (!block->state.compare_exchange_strong(expected, WaitBlock::kClaimed,
+                                                      std::memory_order_acq_rel)) {
+                ++i;  // satisfied through another object, or timing out
+                continue;
+            }
+            const uint32_t index = waiters[i].index;
+            waiters.erase(waiters.begin() + static_cast<std::ptrdiff_t>(i));
+            const AcquireOutcome outcome = acquire(block->thread_id);
+            block->publish_satisfied(index, outcome.abandoned, outcome.newly_owned);
         }
     }
 
     const Type type;
-    std::vector<WaitBlock*> waiters;
+    std::mutex lock;
+    std::vector<WaiterLink> waiters;  // FIFO
+    std::atomic<uint32_t> signal_seq{0};
 };
 
 namespace {
@@ -143,11 +319,11 @@ public:
         : DispatcherObject(ObjectType::Event), manual_reset(manual), signaled(initial) {}
 
     bool is_signaled_for(uint32_t) const override { return signaled; }
-    bool acquire(uint32_t) override {
+    AcquireOutcome acquire(uint32_t) override {
         if (!manual_reset) {
             signaled = false;
         }
-        return false;
+        return {};
     }
 
     const bool manual_reset;
@@ -160,9 +336,9 @@ public:
         : DispatcherObject(ObjectType::Semaphore), count(initial), maximum(maximum_count) {}
 
     bool is_signaled_for(uint32_t) const override { return count > 0; }
-    bool acquire(uint32_t) override {
+    AcquireOutcome acquire(uint32_t) override {
         --count;
-        return false;
+        return {};
     }
 
     int32_t count;
@@ -178,17 +354,18 @@ public:
         return owner == 0 || owner == thread_id;
     }
 
-    bool acquire(uint32_t thread_id) override {
+    // May run on a signaler thread (handoff); the waiter records ownership in its own
+    // t_thread.owned_mutexes when it sees newly_owned. It cannot exit before doing so.
+    AcquireOutcome acquire(uint32_t thread_id) override {
         if (owner == thread_id) {
             ++recursion;
-            return false;
+            return {};
         }
         owner = thread_id;
         recursion = 1;
-        t_thread.owned_mutexes.push_back(shared_from_this());
         const bool was_abandoned = abandoned;
         abandoned = false;
-        return was_abandoned;
+        return {was_abandoned, true};
     }
 
     uint32_t owner = 0;  // owning thread id, 0 when free
@@ -209,7 +386,7 @@ public:
           suspend_count(suspended ? 1u : 0u) {}
 
     bool is_signaled_for(uint32_t) const override { return exited; }
-    bool acquire(uint32_t) override { return false; }
+    AcquireOutcome acquire(uint32_t) override { return {}; }
 
     const std::shared_ptr<ThreadInfo> info;
     const Pg6ThreadStartRoutine start;
@@ -217,11 +394,12 @@ public:
     bool exited = false;
     uint32_t exit_code = STILL_ACTIVE;
     uint32_t suspend_count;
-    std::condition_variable resume_cv;  // waited on with the dispatcher lock
+    std::condition_variable resume_cv;  // waited on with this object's lock
 };
 
-void abandon_owned_mutexes_locked(ThreadState& state) {
+void abandon_owned_mutexes(ThreadState& state) {
     for (auto& mutex : state.owned_mutexes) {
+        std::lock_guard<std::mutex> guard(mutex->lock);
         mutex->owner = 0;
         mutex->recursion = 0;
         mutex->abandoned = true;
@@ -232,11 +410,14 @@ void abandon_owned_mutexes_locked(ThreadState& state) {
 
 // Threads not created through CreateThread (host threads, pool workers) abandon their mutexes here.
 ThreadState::~ThreadState() {
-    if (owned_mutexes.empty()) {
-        return;
+    abandon_owned_mutexes(*this);
+}
+
+// Records a mutex the current thread just took ownership of, so its exit abandons it.
+void note_acquired(DispatcherObject& object, const AcquireOutcome& outcome) {
+    if (outcome.newly_owned) {
+        t_thread.owned_mutexes.push_back(static_cast<MutexObject&>(object).shared_from_this());
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
-    abandon_owned_mutexes_locked(*this);
 }
 
 template <typename T>
@@ -262,7 +443,7 @@ NamedObjects& named_objects() {
     return *names;
 }
 
-// Lock order: named-object mutex -> handle table mutex / dispatcher lock. Never the reverse.
+// Lock order: named-object mutex -> handle table mutex / object lock. Never the reverse.
 template <typename Factory>
 Handle create_dispatcher_handle(std::string_view name, ObjectType type, Factory make_object) {
     if (name.empty()) {
@@ -325,8 +506,8 @@ Handle create_mutex(bool initial_owner, std::string_view name) {
         auto mutex = std::make_shared<MutexObject>();
         if (initial_owner) {
             const uint32_t thread_id = current_thread_info().id;
-            std::lock_guard<std::mutex> lock(dispatcher_mutex());
-            mutex->acquire(thread_id);
+            std::lock_guard<std::mutex> lock(mutex->lock);
+            note_acquired(*mutex, mutex->acquire(thread_id));
         }
         return mutex;
     });
@@ -338,49 +519,203 @@ Handle create_mutex(bool initial_owner, std::string_view name) {
 
 using ObjectArray = std::array<std::shared_ptr<DispatcherObject>, MAXIMUM_WAIT_OBJECTS>;
 
-bool try_satisfy_locked(ObjectArray& objects,
-                        uint32_t count,
-                        bool wait_all,
-                        uint32_t thread_id,
-                        uint32_t& result) {
-    if (!wait_all) {
-        // Wait-any reports the lowest satisfied index.
+// Upper bound of the spin phase before a blocking wait parks the thread.
+constexpr auto kWaitSpinWindow = std::chrono::microseconds(20);
+
+// Short bounded spin before parking: producer/consumer pairs (render thread, Bink workers)
+// usually signal within microseconds, and a futex sleep + wake costs far more. Only a
+// wake_waiters_locked() on one of the objects ends the spin early; the caller then re-checks the
+// state under the object locks, so no wait is ever skipped.
+void spin_for_signal(const ObjectArray& objects, uint32_t count) {
+    std::array<uint32_t, MAXIMUM_WAIT_OBJECTS> seen{};
+    for (uint32_t i = 0; i < count; ++i) {
+        seen[i] = objects[i]->signal_seq.load(std::memory_order_acquire);
+    }
+    const Clock::time_point spin_end = Clock::now() + kWaitSpinWindow;
+    for (uint32_t iter = 1;; ++iter) {
         for (uint32_t i = 0; i < count; ++i) {
-            if (objects[i]->is_signaled_for(thread_id)) {
-                const bool abandoned = objects[i]->acquire(thread_id);
-                result = (abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + i;
-                return true;
+            if (objects[i]->signal_seq.load(std::memory_order_acquire) != seen[i]) {
+                return;
             }
         }
-        return false;
+        if ((iter & 31u) == 0 && Clock::now() >= spin_end) {
+            return;
+        }
+        if ((iter & 7u) == 0) {
+            std::this_thread::yield();
+        }
+    }
+}
+
+// Wait-any, one object lock at a time in index order (so the lowest signaled index wins among
+// those seen). With `enqueue`, the block is queued on every object found unsignaled, atomically
+// with that check, so a later signal hands the object off instead of being lost. Returns true
+// once the block is claimed (by this call or, while enqueuing, by a concurrent handoff).
+bool try_wait_any(const ObjectArray& objects, uint32_t count, WaitBlock& block, bool enqueue,
+                  uint32_t& registered) {
+    for (uint32_t i = 0; i < count; ++i) {
+        DispatcherObject& object = *objects[i];
+        std::lock_guard<std::mutex> guard(object.lock);
+        if (object.is_signaled_for(block.thread_id)) {
+            uint32_t expected = WaitBlock::kWaiting;
+            if (block.state.compare_exchange_strong(expected, WaitBlock::kClaimed,
+                                                    std::memory_order_acq_rel)) {
+                const AcquireOutcome outcome = object.acquire(block.thread_id);
+                block.index = i;
+                block.abandoned = outcome.abandoned;
+                block.newly_owned = outcome.newly_owned;
+                block.state.store(WaitBlock::kSatisfied, std::memory_order_release);
+            }
+            return true;
+        }
+        if (enqueue) {
+            if (block.state.load(std::memory_order_acquire) != WaitBlock::kWaiting) {
+                return true;  // handed off through an object queued earlier in this pass
+            }
+            object.waiters.push_back({&block, i});
+            registered = i + 1;
+        }
+    }
+    return false;
+}
+
+void unregister_wait_block(const ObjectArray& objects, uint32_t registered, WaitBlock& block) {
+    for (uint32_t i = 0; i < registered; ++i) {
+        DispatcherObject& object = *objects[i];
+        std::lock_guard<std::mutex> guard(object.lock);
+        std::erase_if(object.waiters, [&](const WaiterLink& link) { return link.block == &block; });
+    }
+}
+
+// Wait-all: all object locks taken in address order, then everything or nothing is acquired.
+// With `enqueue`, the block is queued on every object while they are all still locked.
+bool try_wait_all(const ObjectArray& objects,
+                  const std::array<uint32_t, MAXIMUM_WAIT_OBJECTS>& lock_order,
+                  uint32_t count,
+                  WaitBlock& block,
+                  bool enqueue,
+                  uint32_t& result) {
+    for (uint32_t k = 0; k < count; ++k) {
+        objects[lock_order[k]]->lock.lock();
+    }
+    bool satisfied = true;
+    for (uint32_t i = 0; i < count && satisfied; ++i) {
+        satisfied = objects[i]->is_signaled_for(block.thread_id);
+    }
+    if (satisfied) {
+        uint32_t first_abandoned = count;
+        for (uint32_t i = 0; i < count; ++i) {
+            const AcquireOutcome outcome = objects[i]->acquire(block.thread_id);
+            note_acquired(*objects[i], outcome);
+            if (outcome.abandoned && first_abandoned == count) {
+                first_abandoned = i;
+            }
+        }
+        result = first_abandoned < count ? WAIT_ABANDONED_0 + first_abandoned : WAIT_OBJECT_0;
+    } else if (enqueue) {
+        for (uint32_t i = 0; i < count; ++i) {
+            objects[i]->waiters.push_back({&block, i});
+        }
+    }
+    for (uint32_t k = count; k-- > 0;) {
+        objects[lock_order[k]]->lock.unlock();
+    }
+    return satisfied;
+}
+
+uint32_t wait_any(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
+                  uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
+    WaitBlock block(thread_id, false);
+    uint32_t registered = 0;
+    bool claimed = try_wait_any(objects, count, block, false, registered);
+    if (!claimed && timeout_ms != 0) {  // a poll never spins
+        spin_for_signal(objects, count);
+        claimed = try_wait_any(objects, count, block, false, registered);
+        if (!claimed && (infinite || Clock::now() < deadline)) {
+            claimed = try_wait_any(objects, count, block, true, registered);
+        }
     }
 
-    // Wait-all: acquire nothing unless every object can be acquired right now.
-    for (uint32_t i = 0; i < count; ++i) {
-        if (!objects[i]->is_signaled_for(thread_id)) {
-            return false;
+    {
+        std::unique_lock<std::mutex> guard(block.mutex);
+        const auto done = [&]() {
+            return block.state.load(std::memory_order_acquire) == WaitBlock::kSatisfied;
+        };
+        if (claimed || registered != 0) {
+            if (infinite) {
+                block.cv.wait(guard, done);
+            } else if (!block.cv.wait_until(guard, deadline, done)) {
+                uint32_t expected = WaitBlock::kWaiting;
+                if (!block.state.compare_exchange_strong(expected, WaitBlock::kTimedOut,
+                                                         std::memory_order_acq_rel)) {
+                    block.cv.wait(guard, done);  // a handoff won the race; it completes shortly
+                }
+            }
         }
     }
-    uint32_t first_abandoned = count;
+    unregister_wait_block(objects, registered, block);
+
+    if (block.state.load(std::memory_order_acquire) != WaitBlock::kSatisfied) {
+        return WAIT_TIMEOUT;
+    }
+    note_acquired(*objects[block.index], {block.abandoned, block.newly_owned});
+    return (block.abandoned ? WAIT_ABANDONED_0 : WAIT_OBJECT_0) + block.index;
+}
+
+uint32_t wait_all(const ObjectArray& objects, uint32_t count, uint32_t thread_id,
+                  uint32_t timeout_ms, bool infinite, Clock::time_point deadline) {
+    std::array<uint32_t, MAXIMUM_WAIT_OBJECTS> lock_order{};
     for (uint32_t i = 0; i < count; ++i) {
-        if (objects[i]->acquire(thread_id) && first_abandoned == count) {
-            first_abandoned = i;
+        lock_order[i] = i;
+    }
+    std::sort(lock_order.begin(), lock_order.begin() + count, [&](uint32_t a, uint32_t b) {
+        return std::less<const DispatcherObject*>()(objects[a].get(), objects[b].get());
+    });
+
+    WaitBlock block(thread_id, true);
+    bool registered = false;
+    bool spun = timeout_ms == 0;  // a poll never spins
+    uint32_t result = WAIT_TIMEOUT;
+    for (;;) {
+        const uint32_t seen = block.wake_seq.load(std::memory_order_acquire);
+        const bool enqueue = spun && !registered && timeout_ms != 0;
+        if (try_wait_all(objects, lock_order, count, block, enqueue, result)) {
+            break;
+        }
+        registered = registered || enqueue;
+        if (!infinite && Clock::now() >= deadline) {
+            result = WAIT_TIMEOUT;
+            break;
+        }
+        if (!spun) {
+            spun = true;
+            spin_for_signal(objects, count);
+            continue;
+        }
+        std::unique_lock<std::mutex> guard(block.mutex);
+        const auto woken = [&]() { return block.wake_seq.load(std::memory_order_acquire) != seen; };
+        if (infinite) {
+            block.cv.wait(guard, woken);
+        } else {
+            block.cv.wait_until(guard, deadline, woken);
         }
     }
-    result = first_abandoned < count ? WAIT_ABANDONED_0 + first_abandoned : WAIT_OBJECT_0;
-    return true;
+    if (registered) {
+        unregister_wait_block(objects, count, block);
+    }
+    return result;
 }
 
 uint32_t wait_for_objects(uint32_t count,
                           const Handle* handles,
-                          bool wait_all,
+                          bool wait_all_objects,
                           uint32_t timeout_ms) {
     if (count == 0 || count > MAXIMUM_WAIT_OBJECTS || handles == nullptr) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return WAIT_FAILED;
     }
 
-    // Handle lookups take the handle-table lock, so resolve them before the dispatcher lock.
+    // Handle lookups take the handle-table lock, so resolve them before any object lock.
     ObjectArray objects;
     for (uint32_t i = 0; i < count; ++i) {
         objects[i] = lookup_dispatcher_object(handles[i]);
@@ -389,7 +724,7 @@ uint32_t wait_for_objects(uint32_t count,
             return WAIT_FAILED;
         }
     }
-    if (wait_all) {
+    if (wait_all_objects) {
         // Win32 rejects the same object appearing twice in a wait-all set.
         for (uint32_t i = 0; i < count; ++i) {
             for (uint32_t j = i + 1; j < count; ++j) {
@@ -405,36 +740,8 @@ uint32_t wait_for_objects(uint32_t count,
     const bool infinite = timeout_ms == INFINITE_TIMEOUT;
     const Clock::time_point deadline =
         infinite ? Clock::time_point::max() : Clock::now() + std::chrono::milliseconds(timeout_ms);
-
-    WaitBlock block;
-    bool registered = false;
-    uint32_t result = WAIT_TIMEOUT;
-    {
-        std::unique_lock<std::mutex> lock(dispatcher_mutex());
-        while (!try_satisfy_locked(objects, count, wait_all, thread_id, result)) {
-            if (!infinite && Clock::now() >= deadline) {
-                result = WAIT_TIMEOUT;
-                break;
-            }
-            if (!registered) {
-                for (uint32_t i = 0; i < count; ++i) {
-                    objects[i]->waiters.push_back(&block);
-                }
-                registered = true;
-            }
-            if (infinite) {
-                block.cv.wait(lock);
-            } else {
-                block.cv.wait_until(lock, deadline);
-            }
-        }
-        if (registered) {
-            for (uint32_t i = 0; i < count; ++i) {
-                std::erase(objects[i]->waiters, &block);
-            }
-        }
-    }
-    return result;
+    return wait_all_objects ? wait_all(objects, count, thread_id, timeout_ms, infinite, deadline)
+                            : wait_any(objects, count, thread_id, timeout_ms, infinite, deadline);
 }
 
 // ---------------------------------------------------------------------------
@@ -559,7 +866,7 @@ void wake_condition_variable(const void* key, bool wake_all) {
 void thread_trampoline(std::shared_ptr<ThreadObject> self) {
     t_thread.info = self->info;
     {
-        std::unique_lock<std::mutex> lock(dispatcher_mutex());
+        std::unique_lock<std::mutex> lock(self->lock);
         self->resume_cv.wait(lock, [&]() { return self->suspend_count == 0; });
     }
 
@@ -567,8 +874,8 @@ void thread_trampoline(std::shared_ptr<ThreadObject> self) {
 
     // Abandon owned mutexes before the thread handle becomes signaled, so a thread that waited
     // on the handle observes WAIT_ABANDONED on those mutexes.
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
-    abandon_owned_mutexes_locked(t_thread);
+    abandon_owned_mutexes(t_thread);
+    std::lock_guard<std::mutex> lock(self->lock);
     self->exit_code = exit_code;
     self->exited = true;
     self->wake_waiters_locked();
@@ -602,7 +909,8 @@ bool submit_to_pool(std::function<void()> callback) {
     if (!pool.queue) {
         pool.queue = std::make_unique<XTaskQueue>(XTaskQueue::DispatchMode::ThreadPool,
                                                   XTaskQueue::DispatchMode::Manual,
-                                                  pool.max_threads);
+                                                  pool.max_threads,
+                                                  /*work_serialized=*/true);  // fixed, bounded pool
     }
     return pool.queue->submit_work(std::move(callback));
 }
@@ -700,7 +1008,10 @@ bool SetEvent(Handle event_handle) {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    if (event_traced(event_handle)) {
+        event_trace_line("set", event_handle, "");
+    }
+    std::lock_guard<std::mutex> lock(event->lock);
     event->signaled = true;
     event->wake_waiters_locked();
     return true;
@@ -712,7 +1023,10 @@ bool ResetEvent(Handle event_handle) {
         SetLastError(ERROR_INVALID_HANDLE);
         return false;
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    if (event_traced(event_handle)) {
+        event_trace_line("reset", event_handle, "");
+    }
+    std::lock_guard<std::mutex> lock(event->lock);
     event->signaled = false;
     return true;
 }
@@ -747,7 +1061,7 @@ bool ReleaseSemaphore(Handle semaphore, int32_t release_count, int32_t* previous
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    std::lock_guard<std::mutex> lock(sem->lock);
     if (release_count > sem->maximum - sem->count) {
         SetLastError(ERROR_TOO_MANY_POSTS);
         return false;
@@ -757,6 +1071,11 @@ bool ReleaseSemaphore(Handle semaphore, int32_t release_count, int32_t* previous
     }
     sem->count += release_count;
     sem->wake_waiters_locked();
+    if (event_traced(semaphore)) {
+        char detail[48];
+        std::snprintf(detail, sizeof(detail), "+%d -> %d", release_count, sem->count);
+        event_trace_line("release", semaphore, detail);
+    }
     return true;
 }
 
@@ -777,7 +1096,7 @@ bool ReleaseMutex(Handle mutex) {
         return false;
     }
     const uint32_t thread_id = current_thread_info().id;
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    std::lock_guard<std::mutex> lock(object->lock);
     if (object->owner != thread_id) {
         SetLastError(ERROR_NOT_OWNER);
         return false;
@@ -795,12 +1114,16 @@ bool ReleaseMutex(Handle mutex) {
 // ---------------------------------------------------------------------------
 
 uint32_t WaitForSingleObject(Handle handle, uint32_t timeout_ms) {
-    return wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    event_trace_wait(handle, timeout_ms, result);
+    return result;
 }
 
 uint32_t WaitForSingleObjectEx(Handle handle, uint32_t timeout_ms, bool alertable) {
     (void)alertable;
-    return wait_for_objects(1, &handle, false, timeout_ms);
+    const uint32_t result = wait_for_objects(1, &handle, false, timeout_ms);
+    event_trace_wait(handle, timeout_ms, result);
+    return result;
 }
 
 uint32_t WaitForMultipleObjects(uint32_t count,
@@ -921,7 +1244,7 @@ uint32_t ResumeThread(Handle thread) {
         SetLastError(ERROR_INVALID_HANDLE);
         return RESUME_THREAD_FAILED;
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    std::lock_guard<std::mutex> lock(object->lock);
     const uint32_t previous = object->suspend_count;
     if (previous > 0 && --object->suspend_count == 0) {
         object->resume_cv.notify_all();
@@ -939,7 +1262,7 @@ bool GetExitCodeThread(Handle thread, uint32_t* exit_code) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    std::lock_guard<std::mutex> lock(dispatcher_mutex());
+    std::lock_guard<std::mutex> lock(object->lock);
     *exit_code = object->exited ? object->exit_code : STILL_ACTIVE;
     return true;
 }

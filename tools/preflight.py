@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import getpass
 import http.client
 import importlib.util
 import json
@@ -76,30 +77,238 @@ TOOLCHAIN_SPECS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("gh", ("gh",)),
 )
 
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]+")
-_UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_FILE_URI_RE = re.compile(r"file://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_WINDOWS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/](?:[^\s\"'<>|,;()\[\]]+(?:[ ]+[^\s\"'<>|,;()\[\]]*[\\/][^\s\"'<>|,;()\[\]]+)*)?"
+)
+_UNC_PATH_RE = re.compile(
+    r"\\\\[^\s\"'<>|,;()\[\]]+(?:[ ]+[^\s\"'<>|,;()\[\]]*\\[^\s\"'<>|,;()\[\]]+)*"
+)
+_FORWARD_UNC_RE = re.compile(
+    r"(?<![A-Za-z0-9:/])//[A-Za-z0-9._-]+/[^\s\"'<>|,;()\[\]]+(?:[ ]+[^\s\"'<>|,;()\[\]]*/[^\s\"'<>|,;()\[\]]+)*"
+)
 _POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+    r"(?<![A-Za-z0-9_:/])/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|srv|run|media|proc|sys|cygdrive|wsl\.localhost)"
+    r"(?:/[^\s\"'<>|,;()\[\]]*(?:[ ]+[^\s\"'<>|,;()\[\]]*/[^\s\"'<>|,;()\[\]]+)*)?"
+)
+_TILDE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9._-]*/[^\s\"'<>|,;()\[\]]+")
+_RESERVED_NON_USERNAME_TOKENS = frozenset(
+    {
+        "python",
+        "node",
+        "rustc",
+        "cargo",
+        "cmake",
+        "emcc",
+        "emcmake",
+        "chrome",
+        "edge",
+        "chromium",
+        "root",
+        "work",
+        "web",
+        "server",
+        "local",
+        "data",
+        "dist",
+        "pass",
+        "warn",
+        "fail",
+        "true",
+        "false",
+        "null",
+        "none",
+        "json",
+        "wasm",
+        "wgpk",
+        "bin",
+        "usr",
+        "tmp",
+        "var",
+        "opt",
+        "etc",
+        "home",
+        "users",
+        "user",
+        "path",
+    }
 )
 
 
 def _current_usernames() -> list[str]:
     names: list[str] = []
-    for candidate in (
+    candidates: list[str] = [
         os.environ.get("USERNAME", ""),
         os.environ.get("USER", ""),
         os.environ.get("LOGNAME", ""),
-    ):
-        cleaned = candidate.strip()
-        if len(cleaned) >= 3 and cleaned not in names:
-            names.append(cleaned)
+    ]
     try:
-        home_name = Path.home().name.strip()
-        if len(home_name) >= 3 and home_name not in names:
-            names.append(home_name)
+        candidates.append(getpass.getuser())
+    except (OSError, KeyError, RuntimeError):
+        pass
+    try:
+        candidates.append(Path.home().name)
     except (OSError, RuntimeError):
         pass
+
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        if (
+            len(cleaned) >= 3
+            and cleaned.lower() not in _RESERVED_NON_USERNAME_TOKENS
+            and cleaned not in names
+        ):
+            names.append(cleaned)
     return names
+
+
+def _collect_host_paths(extra_paths: Sequence[Path | str] = ()) -> list[str]:
+    raw_candidates: list[Path | str] = list(extra_paths)
+    raw_candidates.append(DEFAULT_REPO_ROOT)
+    try:
+        raw_candidates.append(Path.home())
+    except (OSError, RuntimeError):
+        pass
+    for env_key in ("HOME", "USERPROFILE", "LOCALAPPDATA", "APPDATA", "TEMP", "TMP"):
+        val = os.environ.get(env_key, "").strip()
+        if val:
+            raw_candidates.append(val)
+
+    normalized: set[str] = set()
+    for item in raw_candidates:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if len(text) < 4:
+            continue
+        variants = {text, text.replace("\\", "/"), text.replace("/", "\\")}
+        try:
+            p = Path(text)
+            if p.is_absolute():
+                variants.add(str(p))
+                variants.add(p.as_posix())
+        except (OSError, ValueError):
+            pass
+        for variant in variants:
+            cleaned = variant.rstrip("\\/")
+            if len(cleaned) >= 4 and ("/" in cleaned or "\\" in cleaned):
+                normalized.add(cleaned)
+    return sorted(normalized, key=len, reverse=True)
+
+
+def sanitize_text(
+    raw: str,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+    extra_usernames: Sequence[str] = (),
+    redact_usernames: bool = True,
+) -> str:
+    """Strip host filesystem paths (Windows, UNC, POSIX, file://, ~/) and usernames from a string."""
+    if not raw:
+        return raw
+
+    sanitized = raw
+    for host_path in _collect_host_paths(extra_paths):
+        # Match the host path and any immediately following path suffix segments.
+        escaped = re.escape(host_path)
+        sanitized = re.sub(
+            rf"{escaped}(?:[\\/][^\s\"'<>|,;()\[\]]*)*",
+            "<path>",
+            sanitized,
+            flags=re.IGNORECASE if sys.platform == "win32" else 0,
+        )
+
+    sanitized = _FILE_URI_RE.sub("<path>", sanitized)
+    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
+    sanitized = _FORWARD_UNC_RE.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    sanitized = _TILDE_PATH_RE.sub("<path>", sanitized)
+
+    if redact_usernames:
+        usernames = _current_usernames()
+        for extra in extra_usernames:
+            cleaned = extra.strip()
+            if len(cleaned) >= 3 and cleaned not in usernames:
+                usernames.append(cleaned)
+        for username in sorted(usernames, key=len, reverse=True):
+            pattern = re.compile(
+                rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+                re.IGNORECASE,
+            )
+            sanitized = pattern.sub("<user>", sanitized)
+
+    return sanitized
+
+
+def sanitize_json_value(
+    value: Any,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+    extra_usernames: Sequence[str] = (),
+) -> Any:
+    """Recursively sanitize any JSON-serializable structure so it never leaks paths or usernames."""
+    if isinstance(value, str):
+        return sanitize_text(
+            value,
+            extra_paths=extra_paths,
+            extra_usernames=extra_usernames,
+            redact_usernames=True,
+        )
+    if isinstance(value, dict):
+        sanitized_dict: dict[Any, Any] = {}
+        for k, v in value.items():
+            clean_key = (
+                sanitize_text(
+                    k,
+                    extra_paths=extra_paths,
+                    extra_usernames=extra_usernames,
+                    redact_usernames=False,
+                )
+                if isinstance(k, str)
+                else k
+            )
+            sanitized_dict[clean_key] = sanitize_json_value(
+                v,
+                extra_paths=extra_paths,
+                extra_usernames=extra_usernames,
+            )
+        return sanitized_dict
+    if isinstance(value, list):
+        return [
+            sanitize_json_value(
+                item,
+                extra_paths=extra_paths,
+                extra_usernames=extra_usernames,
+            )
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            sanitize_json_value(
+                item,
+                extra_paths=extra_paths,
+                extra_usernames=extra_usernames,
+            )
+            for item in value
+        )
+    return value
+
+
+def sanitize_report(
+    report: Mapping[str, Any],
+    *,
+    extra_paths: Sequence[Path | str] = (),
+    extra_usernames: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Return a deeply sanitized copy of a preflight report safe for `--json` emission."""
+    result = sanitize_json_value(
+        dict(report),
+        extra_paths=extra_paths,
+        extra_usernames=extra_usernames,
+    )
+    assert isinstance(result, dict)
+    return result
 
 
 def sanitize_version(raw: str | None) -> str | None:
@@ -115,14 +324,7 @@ def sanitize_version(raw: str | None) -> str | None:
     if not first_line:
         return None
 
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", first_line)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
-    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
-
-    for username in _current_usernames():
-        pattern = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])", re.IGNORECASE)
-        sanitized = pattern.sub("<user>", sanitized)
-
+    sanitized = sanitize_text(first_line, redact_usernames=True)
     sanitized = " ".join(sanitized.split())
     if len(sanitized) > 160:
         sanitized = sanitized[:157].rstrip() + "..."
@@ -324,9 +526,13 @@ def _probe_disk_target(
     fallback: Path,
     *,
     min_free_gb: float,
+    min_free_gib: float | None = None,
     disk_usage_fn: Callable[[Path], Any],
 ) -> dict[str, Any]:
     target = _nearest_existing_dir(path, fallback)
+    warn_threshold = float(min_free_gb)
+    min_gib_rounded = round(float(min_free_gib), 2) if min_free_gib is not None else None
+    enforced = min_free_gib is not None
     try:
         usage = disk_usage_fn(target)
         total_bytes = int(usage.total)
@@ -338,24 +544,39 @@ def _probe_disk_target(
             "totalBytes": None,
             "usedBytes": None,
             "freeBytes": None,
+            "totalGb": None,
+            "totalGib": None,
             "freeGb": None,
-            "minFreeGb": round(float(min_free_gb), 2),
+            "freeGib": None,
+            "minFreeGb": round(warn_threshold, 2),
+            "minFreeGib": min_gib_rounded,
             "lowSpace": False,
+            "failed": enforced,
             "ok": False,
+            "status": "fail" if enforced else "warn",
             "error": "disk usage unavailable",
         }
 
-    free_gb = free_bytes / BYTES_PER_GIB
-    low_space = free_gb < min_free_gb
+    total_gib = total_bytes / BYTES_PER_GIB
+    free_gib = free_bytes / BYTES_PER_GIB
+    failed = bool(min_free_gib is not None and free_gib < min_free_gib)
+    low_space = bool(failed or free_gib < warn_threshold)
+    status = "fail" if failed else ("warn" if low_space else "pass")
     return {
         "checked": True,
         "totalBytes": total_bytes,
         "usedBytes": used_bytes,
         "freeBytes": free_bytes,
-        "freeGb": round(free_gb, 2),
-        "minFreeGb": round(float(min_free_gb), 2),
+        "totalGb": round(total_gib, 2),
+        "totalGib": round(total_gib, 2),
+        "freeGb": round(free_gib, 2),
+        "freeGib": round(free_gib, 2),
+        "minFreeGb": round(warn_threshold, 2),
+        "minFreeGib": min_gib_rounded,
         "lowSpace": low_space,
+        "failed": failed,
         "ok": not low_space,
+        "status": status,
         "error": None,
     }
 
@@ -364,12 +585,22 @@ def check_disk_space(
     repo_root: Path,
     work_dir: Path | None = None,
     *,
-    min_free_gb: float = DEFAULT_MIN_FREE_GB,
+    min_free_gb: float | None = None,
+    min_free_gib: float | None = None,
     disk_usage_fn: Callable[[Path], Any] | None = None,
 ) -> dict[str, Any]:
-    """Check free disk space on the workspace and work drives (sanitized; never leaks paths)."""
-    if not math.isfinite(min_free_gb) or min_free_gb < 0:
+    """Check free/total disk space in GiB on workspace and work drives (sanitized; never leaks paths)."""
+    if min_free_gb is not None and (not math.isfinite(min_free_gb) or min_free_gb < 0):
         raise ValueError("min_free_gb must be a finite non-negative number")
+    if min_free_gib is not None and (not math.isfinite(min_free_gib) or min_free_gib < 0):
+        raise ValueError("min_free_gib must be a finite non-negative number")
+
+    if min_free_gb is None:
+        warn_threshold = float(min_free_gib) if min_free_gib is not None else DEFAULT_MIN_FREE_GB
+    else:
+        warn_threshold = float(min_free_gb)
+        if min_free_gib is not None and min_free_gib > warn_threshold:
+            warn_threshold = float(min_free_gib)
 
     usage_fn = shutil.disk_usage if disk_usage_fn is None else disk_usage_fn
     resolved_work = work_dir if work_dir is not None else (repo_root / "work")
@@ -377,32 +608,54 @@ def check_disk_space(
     workspace_info = _probe_disk_target(
         repo_root,
         repo_root,
-        min_free_gb=min_free_gb,
+        min_free_gb=warn_threshold,
+        min_free_gib=min_free_gib,
         disk_usage_fn=usage_fn,
     )
     work_info = _probe_disk_target(
         resolved_work,
         repo_root,
-        min_free_gb=min_free_gb,
+        min_free_gb=warn_threshold,
+        min_free_gib=min_free_gib,
         disk_usage_fn=usage_fn,
     )
 
-    checked_free = [
-        info["freeBytes"]
+    checked_targets = [
+        info
         for info in (workspace_info, work_info)
         if info["checked"] and isinstance(info["freeBytes"], int)
     ]
-    min_free_bytes = min(checked_free) if checked_free else None
-    min_free_gb_val = round(min_free_bytes / BYTES_PER_GIB, 2) if min_free_bytes is not None else None
+    limiting_target = min(checked_targets, key=lambda info: info["freeBytes"]) if checked_targets else None
+    min_free_bytes = limiting_target["freeBytes"] if limiting_target is not None else None
+    total_bytes = limiting_target["totalBytes"] if limiting_target is not None else None
+    min_free_gib_val = round(min_free_bytes / BYTES_PER_GIB, 2) if min_free_bytes is not None else None
+    total_gib_val = round(total_bytes / BYTES_PER_GIB, 2) if total_bytes is not None else None
+
+    failed = bool(workspace_info["failed"] or work_info["failed"])
     low_space = bool(workspace_info["lowSpace"] or work_info["lowSpace"])
+    all_ok = bool(workspace_info["ok"] and work_info["ok"])
+    if failed:
+        status = "fail"
+    elif low_space or not all_ok:
+        status = "warn"
+    else:
+        status = "pass"
 
     return {
-        "minFreeGb": round(float(min_free_gb), 2),
-        "ok": bool(workspace_info["ok"] and work_info["ok"]),
-        "warning": low_space,
+        "minFreeGb": round(warn_threshold, 2),
+        "minFreeGib": round(float(min_free_gib), 2) if min_free_gib is not None else None,
+        "enforced": min_free_gib is not None,
+        "ok": all_ok,
+        "warning": bool(low_space or failed),
         "lowSpace": low_space,
+        "failed": failed,
+        "status": status,
+        "totalBytes": total_bytes,
+        "totalGb": total_gib_val,
+        "totalGib": total_gib_val,
         "freeBytes": min_free_bytes,
-        "freeGb": min_free_gb_val,
+        "freeGb": min_free_gib_val,
+        "freeGib": min_free_gib_val,
         "workspace": workspace_info,
         "work": work_info,
     }
@@ -1700,7 +1953,8 @@ def run_preflight(
     which_fn: Callable[[str], str | None] = shutil.which,
     version_fn: Callable[[str], str | None] | None = None,
     skip_server_check: bool = False,
-    min_free_gb: float = DEFAULT_MIN_FREE_GB,
+    min_free_gb: float | None = None,
+    min_free_gib: float | None = None,
     disk_usage_fn: Callable[[Path], Any] | None = None,
     shaders_dir: Path | str | None = None,
     min_free_ram_gb: float = DEFAULT_MIN_FREE_RAM_GB,
@@ -1721,6 +1975,7 @@ def run_preflight(
         root,
         work_dir=work_dir,
         min_free_gb=min_free_gb,
+        min_free_gib=min_free_gib,
         disk_usage_fn=disk_usage_fn,
     )
     memory = check_memory_headroom(
@@ -1749,7 +2004,15 @@ def run_preflight(
     for msg in browser["warnings"]:
         if msg not in fast_boot_warnings:
             fast_boot_warnings.append(msg)
-    if disk_space["lowSpace"]:
+    if disk_space["failed"]:
+        if disk_space["freeGib"] is not None and disk_space["totalGib"] is not None:
+            fast_boot_warnings.append(
+                f"free disk space ({disk_space['freeGib']:.2f} / {disk_space['totalGib']:.2f} GiB) is below "
+                f"{disk_space['minFreeGib']:.2f} GiB required minimum"
+            )
+        else:
+            fast_boot_warnings.append("disk usage unavailable for required minimum free GiB check")
+    elif disk_space["lowSpace"] and disk_space["freeGb"] is not None:
         fast_boot_warnings.append(
             f"free disk space ({disk_space['freeGb']:.2f} GB) is below "
             f"{disk_space['minFreeGb']:.2f} GB browser-boot threshold"
@@ -1795,9 +2058,49 @@ def run_preflight(
 
     milestones, next_commands = compute_milestones(toolchains, local_env, artifacts, server)
 
-    return {
+    failed_checks: list[str] = []
+    if not milestones["M1"]["ready"]:
+        failed_checks.append("milestone:M1")
+    if disk_space["failed"]:
+        failed_checks.append("diskSpace:minFreeGib")
+
+    warning_checks: list[str] = []
+    if disk_space["warning"] and not disk_space["failed"]:
+        warning_checks.append("diskSpace:lowSpace")
+    if memory["lowMemory"]:
+        warning_checks.append("memory:lowMemory")
+    if browser["warning"]:
+        warning_checks.append("browser:missing")
+    if splash_pack["warning"]:
+        warning_checks.append("splashPack:notInSync")
+
+    if failed_checks:
+        summary_status = "fail"
+    elif warning_checks:
+        summary_status = "warn"
+    else:
+        summary_status = "pass"
+
+    overall_ok = bool(milestones["M1"]["ready"] and not disk_space["failed"])
+    readiness_summary: dict[str, Any] = {
+        "status": summary_status,
+        "ok": overall_ok,
+        "m0Ready": bool(milestones["M0"]["ready"]),
+        "m1Ready": bool(milestones["M1"]["ready"]),
+        "m2Ready": bool(milestones["M2"]["ready"]),
+        "m3Ready": bool(milestones["M3"]["ready"]),
+        "fastBootReady": bool(fast_boot["ready"]),
+        "diskStatus": disk_space["status"],
+        "freeGib": disk_space["freeGib"],
+        "totalGib": disk_space["totalGib"],
+        "minFreeGib": disk_space["minFreeGib"],
+        "failedChecks": failed_checks,
+        "warningChecks": warning_checks,
+    }
+
+    report: dict[str, Any] = {
         "schemaVersion": 1,
-        "ok": bool(milestones["M1"]["ready"]),
+        "ok": overall_ok,
         "toolchains": toolchains,
         "localEnv": local_env,
         "diskSpace": disk_space,
@@ -1809,7 +2112,16 @@ def run_preflight(
         "server": server,
         "milestones": milestones,
         "nextCommands": next_commands,
+        "readinessSummary": readiness_summary,
     }
+
+    extra_host_paths: list[Path | str] = [root, data_dir, work_dir]
+    if resolved_env["game_path"] is not None:
+        extra_host_paths.append(resolved_env["game_path"])
+    if shaders_dir is not None:
+        extra_host_paths.append(shaders_dir)
+
+    return sanitize_report(report, extra_paths=extra_host_paths)
 
 
 def _tag(ok: bool) -> str:
@@ -1858,24 +2170,44 @@ def format_report_text(report: Mapping[str, Any]) -> str:
     disk = report.get("diskSpace")
     if isinstance(disk, Mapping):
         threshold = disk.get("minFreeGb", DEFAULT_MIN_FREE_GB)
+        min_gib = disk.get("minFreeGib")
         lines.append("")
-        lines.append(f"Disk Space (warning threshold: {threshold:.2f} GB):")
+        if min_gib is not None:
+            lines.append(
+                f"Disk Space (minimum: {min_gib:.2f} GiB, warning threshold: {threshold:.2f} GiB):"
+            )
+        else:
+            lines.append(f"Disk Space (warning threshold: {threshold:.2f} GiB):")
         for label, key in (("workspace drive", "workspace"), ("work drive", "work")):
             target = disk.get(key, {})
             if not target.get("checked"):
+                tag = "[FAIL]" if target.get("failed") else "[WARN]"
                 lines.append(
-                    f"  [WARN] {label:<16} {target.get('error') or 'disk usage unavailable'}"
-                )
-            elif target.get("lowSpace"):
-                lines.append(
-                    f"  [WARN] {label:<16} {target.get('freeGb', 0.0):.2f} GB free "
-                    f"(below {threshold:.2f} GB warning threshold)"
+                    f"  {tag} {label:<16} {target.get('error') or 'disk usage unavailable'}"
                 )
             else:
-                lines.append(
-                    f"  {_warn_tag(True)} {label:<16} {target.get('freeGb', 0.0):.2f} GB free "
-                    f"(>= {threshold:.2f} GB)"
+                free_gib_val = target.get("freeGib", target.get("freeGb", 0.0))
+                total_gib_val = target.get("totalGib")
+                space_desc = (
+                    f"{free_gib_val:.2f} / {total_gib_val:.2f} GiB free"
+                    if isinstance(total_gib_val, (int, float))
+                    else f"{free_gib_val:.2f} GiB free"
                 )
+                if target.get("failed") and min_gib is not None:
+                    lines.append(
+                        f"  [FAIL] {label:<16} {space_desc} "
+                        f"(below {min_gib:.2f} GiB required minimum)"
+                    )
+                elif target.get("lowSpace"):
+                    lines.append(
+                        f"  [WARN] {label:<16} {space_desc} "
+                        f"(below {threshold:.2f} GiB warning threshold)"
+                    )
+                else:
+                    lines.append(
+                        f"  {_warn_tag(True)} {label:<16} {space_desc} "
+                        f"(>= {threshold:.2f} GiB)"
+                    )
 
     memory = report.get("memory")
     if isinstance(memory, Mapping):
@@ -2052,10 +2384,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-free-gb",
         type=float,
-        default=DEFAULT_MIN_FREE_GB,
+        default=None,
         help=(
-            f"Minimum free disk space in GB on the workspace/work drive before emitting "
+            f"Minimum free disk space in GiB on the workspace/work drive before emitting "
             f"a low-space warning (default: {DEFAULT_MIN_FREE_GB:g})."
+        ),
+    )
+    parser.add_argument(
+        "--min-free-gib",
+        type=float,
+        default=None,
+        help=(
+            "Optional required minimum free disk space in GiB on the workspace/work drive; "
+            "off/informational by default, warns/fails (and fails --strict) when below this threshold."
         ),
     )
     parser.add_argument(
@@ -2082,8 +2423,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
-    if not math.isfinite(args.min_free_gb) or args.min_free_gb < 0:
+    if args.min_free_gb is not None and (not math.isfinite(args.min_free_gb) or args.min_free_gb < 0):
         parser.error("--min-free-gb must be a finite non-negative number")
+    if args.min_free_gib is not None and (not math.isfinite(args.min_free_gib) or args.min_free_gib < 0):
+        parser.error("--min-free-gib must be a finite non-negative number")
     if not math.isfinite(args.min_free_ram_gb) or args.min_free_ram_gb < 0:
         parser.error("--min-free-ram-gb must be a finite non-negative number")
 
@@ -2091,16 +2434,24 @@ def main(argv: list[str] | None = None) -> int:
         repo_root=args.repo_root,
         skip_server_check=args.skip_server,
         min_free_gb=args.min_free_gb,
+        min_free_gib=args.min_free_gib,
         shaders_dir=args.shaders_dir,
         min_free_ram_gb=args.min_free_ram_gb,
     )
 
     if args.json:
-        print(json.dumps(report, indent=2))
+        extra_paths: list[Path | str] = [args.repo_root]
+        if args.shaders_dir is not None:
+            extra_paths.append(args.shaders_dir)
+        sanitized_report = sanitize_report(report, extra_paths=extra_paths)
+        print(json.dumps(sanitized_report, indent=2))
     else:
         print(format_report_text(report))
 
-    if args.strict and not report["milestones"]["M1"]["ready"]:
+    if args.strict and (
+        not report["milestones"]["M1"]["ready"]
+        or bool(report["diskSpace"].get("failed"))
+    ):
         return 1
     return 0
 

@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "guest/com_bridge.h"
@@ -47,6 +48,10 @@ struct ApiRequest {
     uint64_t count = 0;
     bool known = false;
 };
+
+// XLaunchNewGame target check: true when the file name of `exe_path` (directories dropped,
+// case-insensitive) is the running title's, i.e. the first token of its command line.
+bool is_self_launch_target(std::string_view exe_path, std::string_view command_line);
 
 // XGameGetXboxTitleId result (default 0: the title id is not known to the runtime yet).
 void set_xbox_title_id(uint32_t title_id);

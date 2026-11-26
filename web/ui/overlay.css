@@ -1113,6 +1113,48 @@ body {
   pointer-events: none;
 }
 
+.pg6-splash[data-greg-backdrop="true"],
+#splash-overlay-root .pg6-splash[data-greg-backdrop="true"] {
+  background: #0b0c10;
+}
+
+.pg6-splash__media--greg,
+#splash-overlay-root .pg6-splash__media--greg {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-sizing: border-box;
+  padding: 24px 24px 128px;
+  background:
+    radial-gradient(
+      circle at 50% 44%,
+      rgba(38, 41, 50, 0.42) 0%,
+      rgba(15, 16, 22, 0.88) 54%,
+      #0b0c10 100%
+    ),
+    #0b0c10;
+}
+
+.pg6-splash__img,
+#splash-overlay-root .pg6-splash__img {
+  object-fit: cover;
+}
+
+.pg6-splash__img.pg6-splash__img--greg,
+#splash-overlay-root .pg6-splash__img.pg6-splash__img--greg {
+  position: relative;
+  inset: auto;
+  width: min(340px, 46vmin);
+  height: min(340px, 46vmin);
+  max-width: 70vw;
+  max-height: 55vh;
+  object-fit: contain;
+  object-position: center;
+  user-select: none;
+  pointer-events: none;
+  filter: drop-shadow(0 18px 42px rgba(0, 0, 0, 0.58));
+}
+
 #splash-overlay-root .pg6-splash__panel {
   width: min(340px, calc(100vw - 24px));
   max-width: 340px;
@@ -1154,6 +1196,15 @@ body {
   -webkit-backdrop-filter: none;
 }
 
+@keyframes pg6-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 #splash-overlay-root .pg6-splash__spinner {
   width: 14px;
   height: 14px;
@@ -1178,9 +1229,11 @@ body {
 #splash-overlay-root .pg6-splash__greg {
   width: 22px;
   height: 22px;
+  display: block;
+  object-fit: contain;
   border: none;
-  border-radius: var(--radius-full);
   box-shadow: none;
+  animation: pg6-spin 1200ms linear infinite;
 }
 
 #splash-overlay-root .pg6-splash__stage {
@@ -1328,6 +1381,11 @@ body {
     padding: 0 16px 36px;
   }
 
+  .pg6-splash__media--greg,
+  #splash-overlay-root .pg6-splash__media--greg {
+    padding: 32px 32px 156px;
+  }
+
   .pg6-splash__panel,
   #splash-overlay-root .pg6-splash__panel {
     width: min(368px, calc(100vw - 32px));
@@ -1373,6 +1431,11 @@ body {
     padding: 0 8px 16px;
   }
 
+  .pg6-splash__media--greg,
+  #splash-overlay-root .pg6-splash__media--greg {
+    padding: 16px 16px 112px;
+  }
+
   .pg6-splash__panel,
   #splash-overlay-root .pg6-splash__panel {
     width: min(340px, calc(100vw - 16px));
@@ -1412,6 +1475,11 @@ body {
   .pg6-splash,
   #splash-overlay-root .pg6-splash {
     padding-bottom: 14px;
+  }
+
+  .pg6-splash__media--greg,
+  #splash-overlay-root .pg6-splash__media--greg {
+    padding: 14px 16px 104px;
   }
 }
 
