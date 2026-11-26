@@ -90,23 +90,31 @@ struct HttpfsDirectBackend {
     std::function<int32_t(std::string_view rel_path)> open;
     std::function<int64_t(int32_t handle, uint64_t offset, void* dst, size_t len)> read;
     std::function<bool(int32_t handle)> close;
+    // When true, the backend callbacks are thread-safe / multi-lane and HttpfsMailboxClient does
+    // not hold its global HttpfsFairMutex across direct open/read/close calls.
+    bool concurrent = false;
+    // Maximum bytes requested per direct read() call (0 falls back to kHttpfsPayloadBytes).
+    size_t max_chunk_bytes = kHttpfsPayloadBytes;
 };
 
 // Thread-safe C++ client helper that encodes Open/Read/Close requests into an HttpfsMailbox.
 // Supports both synchronous injectable responder callbacks (for native unit tests) and
 // asynchronous worker-to-worker Atomics.wait / Atomics.notify responders.
 //
-// One request is in flight at a time (the downstream mailbox / host channel is single-lane).
-// Reads larger than the payload capacity are split into chunks, and the lock is taken per chunk
-// in FIFO order: a short read from another thread waits for at most one chunk of a bulk read,
-// not for the whole bulk read.
+// By default, one request is in flight at a time (the downstream mailbox / host channel is
+// single-lane). Reads larger than the payload capacity are split into chunks, and the lock is
+// taken per chunk in FIFO order: a short read from another thread waits for at most one chunk of
+// a bulk read, not for the whole bulk read. Multi-lane direct backends may set
+// HttpfsDirectBackend::concurrent = true to allow parallel open/read/close calls without holding
+// the global lock.
 class HttpfsMailboxClient {
 public:
     using ResponderCallback = std::function<void(HttpfsMailbox& mailbox)>;
 
     explicit HttpfsMailboxClient(HttpfsMailbox* mailbox,
                                  ResponderCallback responder = nullptr);
-    // Direct mode: requests go to `backend` (chunked to kHttpfsPayloadBytes, no payload copy).
+    // Direct mode: requests go to `backend` (chunked to backend.max_chunk_bytes, defaulting to
+    // kHttpfsPayloadBytes, with no payload copy).
     explicit HttpfsMailboxClient(HttpfsDirectBackend backend);
 
     void set_responder(ResponderCallback responder);

@@ -43,9 +43,17 @@ void HttpfsMailboxClient::set_retry_policy(RetryPolicy policy) {
     retry_ = std::move(policy);
 }
 
+namespace {
+
+size_t direct_chunk_capacity(const HttpfsDirectBackend& direct) {
+    return direct.max_chunk_bytes > 0 ? direct.max_chunk_bytes : kHttpfsPayloadBytes;
+}
+
+}  // namespace
+
 size_t HttpfsMailboxClient::effective_capacity_locked() const {
     if (direct_mode_) {
-        return kHttpfsPayloadBytes;
+        return direct_chunk_capacity(direct_);
     }
     if (mailbox_ == nullptr) {
         return 0;
@@ -57,6 +65,9 @@ size_t HttpfsMailboxClient::effective_capacity_locked() const {
 }
 
 size_t HttpfsMailboxClient::payload_capacity() const {
+    if (direct_mode_) {
+        return direct_chunk_capacity(direct_);
+    }
     std::lock_guard<HttpfsFairMutex> lock(mutex_);
     return effective_capacity_locked();
 }
@@ -125,14 +136,20 @@ HttpfsStatus HttpfsMailboxClient::execute_roundtrip_locked(int64_t& out_result) 
 }
 
 int32_t HttpfsMailboxClient::open(std::string_view rel_path) {
-    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     if (direct_mode_) {
         if (rel_path.empty() || !direct_.open) {
             return -1;
         }
+        if (direct_.concurrent) {
+            const int32_t handle = direct_.open(rel_path);
+            return handle < 0 ? -1 : handle;
+        }
+        std::lock_guard<HttpfsFairMutex> lock(mutex_);
         const int32_t handle = direct_.open(rel_path);
         return handle < 0 ? -1 : handle;
     }
+
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     if (mailbox_ == nullptr || rel_path.empty()) {
         return -1;
     }
@@ -234,26 +251,35 @@ int64_t HttpfsMailboxClient::read_chunk(int32_t handle,
                                         size_t remaining,
                                         size_t* asked,
                                         bool* retryable) {
-    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     *retryable = false;
-    const size_t cap = effective_capacity_locked();
-    if (cap == 0) {
-        return -1;
-    }
-    const size_t chunk = std::min(remaining, cap);
-    *asked = chunk;
-
     if (direct_mode_) {
+        const size_t cap = direct_chunk_capacity(direct_);
+        const size_t chunk = std::min(remaining, cap);
+        *asked = chunk;
         if (!direct_.read) {
             return -1;
         }
-        const int64_t n = direct_.read(handle, offset, dst, chunk);
+        int64_t n = 0;
+        if (direct_.concurrent) {
+            n = direct_.read(handle, offset, dst, chunk);
+        } else {
+            std::lock_guard<HttpfsFairMutex> lock(mutex_);
+            n = direct_.read(handle, offset, dst, chunk);
+        }
         if (n < 0) {
             *retryable = true;
             return n;
         }
         return static_cast<uint64_t>(n) > chunk ? -1 : n;
     }
+
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
+    const size_t cap = effective_capacity_locked();
+    if (cap == 0) {
+        return -1;
+    }
+    const size_t chunk = std::min(remaining, cap);
+    *asked = chunk;
 
     mailbox_->op = static_cast<uint32_t>(HttpfsOp::Read);
     mailbox_->handle = handle;
@@ -291,10 +317,18 @@ bool HttpfsMailboxClient::close(int32_t handle) {
         return false;
     }
 
-    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     if (direct_mode_) {
-        return direct_.close ? direct_.close(handle) : false;
+        if (!direct_.close) {
+            return false;
+        }
+        if (direct_.concurrent) {
+            return direct_.close(handle);
+        }
+        std::lock_guard<HttpfsFairMutex> lock(mutex_);
+        return direct_.close(handle);
     }
+
+    std::lock_guard<HttpfsFairMutex> lock(mutex_);
     if (mailbox_ == nullptr) {
         return false;
     }
