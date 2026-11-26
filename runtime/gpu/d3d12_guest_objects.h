@@ -1065,6 +1065,12 @@ public:
     // Returns the number of planes drawn.
     uint32_t present(std::span<const uint32_t> plane_textures = {});
     void set_sink(PacketSink sink);
+    // G79: Emits a WebGPU-valid MSAA resolve pass (4x MSAA 2D/2D-array subresource -> 1x 2D/2D-array
+    // subresource) into `enc` using ABI v2 render-pass packets. Returns false when the format or
+    // geometry cannot be resolved on WebGPU so the caller can fall back cleanly.
+    bool emit_msaa_resolve(uint32_t dst_texture_id, uint32_t dst_mip, uint32_t dst_layer,
+                           uint32_t src_texture_id, uint32_t src_layer, uint32_t resolve_dxgi_format,
+                           CommandEncoder& enc);
 
     // ---- Lazy GPU objects (G66, #1077; DeviceOptions::defer_gpu_objects) ----
     // `create` holds the create packet(s) of resource `id`: it is written right before the first
@@ -1121,6 +1127,15 @@ private:
         std::unordered_map<uint32_t, uint32_t> pipelines;  // canvas format code << 1 | blended -> pipeline
         std::unordered_map<uint32_t, uint32_t> groups;     // presented texture id -> bind group
     } present_blit_;
+    // G79: MSAA resolve pipelines (color float/unorm/srgb & depth), created lazily once per device.
+    mutable std::mutex resolve_mutex_;
+    struct MsaaResolve {
+        uint32_t vs = 0;
+        uint32_t color_fs = 0, color_group_layout = 0, color_pipeline_layout = 0;
+        uint32_t depth_fs = 0, depth_group_layout = 0, depth_pipeline_layout = 0;
+        std::unordered_map<uint8_t, uint32_t> color_pipelines;  // WgpuTextureFormat code -> pipeline
+        std::unordered_map<uint8_t, uint32_t> depth_pipelines;  // WgpuTextureFormat code -> pipeline
+    } msaa_resolve_;
 
     mutable std::mutex diag_mutex_;
     std::vector<std::string> diags_;
@@ -1647,6 +1662,25 @@ uint64_t committed_memory_size(const GuestResourceDesc& desc);
 //   object type (bits 0..13), alignment, memory type and the rest = 0 (not documented values).
 inline constexpr uint64_t kD3D12ResourceXMemAttributes = (uint64_t{0x80} << 16) | (uint64_t{2} << 14);
 com::Ref<Device> device_ref(Device* device);
+
+class CommandList;
+
+// G79: Read-only snapshot of a command list's validated 3D dynamic state and depth-twin sync counts.
+struct CommandListDynamicStateSnapshot {
+    std::vector<pso::D3D12Viewport> viewports;
+    std::vector<pso::D3D12Rect> scissors;
+    float blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+    uint32_t stencil_ref = 0;
+    uint32_t bound_dsv_texture = 0;
+    uint32_t bound_rt_width = 0;
+    uint32_t bound_rt_height = 0;
+    uint64_t depth_srv_sync_flushes = 0;
+    uint64_t depth_srv_sync_refreshes = 0;
+    uint64_t resolves_emitted = 0;
+    uint64_t resolves_fallback = 0;
+};
+CommandListDynamicStateSnapshot inspect_command_list_state(const CommandList* list);
+const bridge::DepthTwinTracker* inspect_command_list_depth_twin(const CommandList* list);
 
 // Root signature description from a D3D12_VERSIONED_ROOT_SIGNATURE_DESC in guest memory (all nested
 // arrays read through the seam). False + message on malformed input.

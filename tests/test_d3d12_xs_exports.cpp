@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -8135,6 +8136,537 @@ void test_g84_xbox_3d_methods_hardening() {
     }
 }
 
+// G79 (1): CopyTextureRegion / CopyTextureRegionX 3D textures, 2D arrays, cubemaps, box clamping,
+// and BC compressed format 4x4 block & mip-tail alignment.
+void test_g79_copy_texture_region_3d_array_cube_and_bc_miptail() {
+    Fixture fx;
+    dg::DeviceOptions options;
+    options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+    options.bridge.features = playgta6::gpu::pso::WgpuFeature::TextureCompressionBc;
+    dx::set_device_options(options);
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+
+    // 1) 3D texture (8x8x4 RGBA8, 2 mips): upload sub-box into mip 0 at dst_z = 1 (2 slices).
+    dg::GuestResourceDesc desc3d = texture_desc(8, 8, 28, 0);
+    desc3d.Dimension = dg::ResourceDimension::Texture3D;
+    desc3d.DepthOrArraySize = 4;
+    desc3d.MipLevels = 2;
+    const uint64_t tex3d = committed(fx, scene.device, 1, desc3d, 0x400);
+    const uint64_t up3d = committed(fx, scene.device, 2, buffer_desc(256 * 8 * 4), 0xAC3);
+    std::vector<uint8_t> data3d(256 * 8 * 4, 0x3Au);
+    CHECK(com::write_guest(object_of<dg::Resource>(up3d)->cpu_address(), data3d.data(), data3d.size()));
+
+    // 2) Cubemap (16x16x6 RGBA8, 2 mips -> 12 subresources): upload mip 1 of face 4 (subresource = 1 + 4*2 = 9).
+    dg::GuestResourceDesc cube_desc = texture_desc(16, 16, 28, 0);
+    cube_desc.DepthOrArraySize = 6;
+    cube_desc.MipLevels = 2;
+    const uint64_t cube = committed(fx, scene.device, 1, cube_desc, 0x400);
+
+    // 3) BC7 texture (16x16, 5 mips -> mip 3 is logical 2x2, mip 4 is logical 1x1; physical 4x4!).
+    dg::GuestResourceDesc bc_desc = texture_desc(16, 16, 98 /* BC7_UNORM */, 0);
+    bc_desc.MipLevels = 5;
+    const uint64_t bc_tex = committed(fx, scene.device, 1, bc_desc, 0x400);
+    const uint64_t up_bc = committed(fx, scene.device, 2, buffer_desc(1024), 0xAC3);
+    std::vector<uint8_t> bc_bytes(1024, 0xBCu);
+    CHECK(com::write_guest(object_of<dg::Resource>(up_bc)->cpu_address(), bc_bytes.data(), bc_bytes.size()));
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+
+    // 3D upload: oversized box clamped to 3D mip bounds (dst_x=4, dst_y=4, dst_z=1; box 0..8, 0..8, 0..4 -> clamped 4x4x3).
+    dg::GuestTextureCopyLocation dst3d{};
+    dst3d.pResource = tex3d;
+    dst3d.Type = 0;
+    dst3d.PlacedFootprint.Offset = 0;  // mip 0
+    dg::GuestTextureCopyLocation src3d{};
+    src3d.pResource = up3d;
+    src3d.Type = 1;
+    src3d.PlacedFootprint = {0, {28, 8, 8, 4, 256}};
+    dg::GuestBox box3d{0, 0, 0, 8, 8, 4};
+    fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst3d)), I(4), I(4), I(1), I(put(src3d)), I(put(box3d))});
+
+    // Cubemap upload via CopyTextureRegionX (slot 85) to face 4, mip 1 (subresource 9, 8x8).
+    dg::GuestTextureCopyLocation dst_cube{};
+    dst_cube.pResource = cube;
+    dst_cube.Type = 0;
+    dst_cube.PlacedFootprint.Offset = 9;
+    dg::GuestTextureCopyLocation src_cube{};
+    src_cube.pResource = up3d;
+    src_cube.Type = 1;
+    src_cube.PlacedFootprint = {0, {28, 8, 8, 1, 256}};
+    fx.vcall(list, 85, {I(put(dst_cube)), I(0), I(0), I(0), I(put(src_cube)), I(0), I(0)});
+
+    // BC7 mip 3 (logical 2x2) with logical 2x2 box -> rounded up to 4x4 physical block copy for WebGPU!
+    dg::GuestTextureCopyLocation dst_bc{};
+    dst_bc.pResource = bc_tex;
+    dst_bc.Type = 0;
+    dst_bc.PlacedFootprint.Offset = 3;  // mip 3 (2x2 logical, 4x4 physical)
+    dg::GuestTextureCopyLocation src_bc{};
+    src_bc.pResource = up_bc;
+    src_bc.Type = 1;
+    src_bc.PlacedFootprint = {0, {98, 4, 4, 1, 256}};
+    dg::GuestBox logical_tail{0, 0, 0, 2, 2, 1};
+    fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst_bc)), I(0), I(0), I(0), I(put(src_bc)), I(put(logical_tail))});
+
+    // BC7 misaligned destination origin (dst_x = 2) -> diagnosed and skipped cleanly!
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    dst_bc.PlacedFootprint.Offset = 0;  // mip 0 (16x16)
+    fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst_bc)), I(2), I(0), I(0), I(put(src_bc)), I(0)});
+    CHECK(dev->stats().bad_arguments == bad_before + 1);
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+
+    std::vector<GpuWriteTexturePayload> writes;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::WriteTexture) {
+            writes.push_back(payload_as<GpuWriteTexturePayload>(p));
+        }
+    }
+    CHECK(writes.size() == 3);
+    if (writes.size() == 3) {
+        // 3D upload
+        CHECK(writes[0].texture_id == object_of<dg::Resource>(tex3d)->id() && writes[0].mip_level == 0 &&
+              writes[0].origin_x == 4 && writes[0].origin_y == 4 && writes[0].origin_z == 1 && writes[0].width == 4 &&
+              writes[0].height == 4 && writes[0].depth_or_layers == 3 && writes[0].rows_per_image == 8);
+        // Cubemap face 4, mip 1
+        CHECK(writes[1].texture_id == object_of<dg::Resource>(cube)->id() && writes[1].mip_level == 1 &&
+              writes[1].origin_z == 4 && writes[1].width == 8 && writes[1].height == 8 &&
+              writes[1].depth_or_layers == 1);
+        // BC7 mip 3 (logical 2x2 rounded to 4x4 physical block)
+        CHECK(writes[2].texture_id == object_of<dg::Resource>(bc_tex)->id() && writes[2].mip_level == 3 &&
+              writes[2].width == 4 && writes[2].height == 4 && writes[2].depth_or_layers == 1 &&
+              writes[2].bytes_per_row == 256 && writes[2].rows_per_image == 1 && writes[2].data_len == 16);
+    }
+
+    CHECK(t_balanced);
+    scene.release_all({list, tex3d, up3d, cube, bc_tex, up_bc});
+}
+
+// G79 (2): CopyBufferRegion 64-bit overflow bounds, zero-byte no-op, 4-byte WebGPU alignment
+// (tail padding + CPU-visible RMW), GPU-only unaligned rejection, and overlapping src==dst safety.
+void test_g79_copy_buffer_region_64bit_alignment_and_overlap() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+
+    const uint64_t cpu_buf = committed(fx, scene.device, 2, buffer_desc(128), 0xAC3);
+    const uint64_t gpu_buf = committed(fx, scene.device, 1, buffer_desc(128), 0x400);
+    const uint64_t cpu_va = object_of<dg::Resource>(cpu_buf)->cpu_address();
+    std::vector<uint8_t> init(128);
+    for (size_t i = 0; i < init.size(); ++i) {
+        init[i] = static_cast<uint8_t>(0x10u + i);
+    }
+    CHECK(com::write_guest(cpu_va, init.data(), init.size()));
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+
+    // 1) Zero-byte copy: clean no-op, zero diagnostics, zero unsupported copies.
+    const uint64_t bad0 = dev->stats().bad_arguments;
+    const uint64_t unsup0 = dev->stats().unsupported_copies;
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(gpu_buf), I(0), I(cpu_buf), I(0), I(0)});
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(gpu_buf), I(0), I(gpu_buf), I(0), I(0)});
+    CHECK(dev->stats().bad_arguments == bad0 && dev->stats().unsupported_copies == unsup0);
+
+    // 2) 64-bit overflow bounds check: UINT64_MAX - 4 + 8 must NOT wrap and pass!
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(gpu_buf), I(UINT64_MAX - 4), I(cpu_buf), I(0), I(8)});
+    CHECK(dev->stats().bad_arguments == bad0 + 1);
+
+    // 3) Unaligned dst_offset on GPU-only buffer: diagnosed & skipped (no invalid WriteBuffer).
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(gpu_buf), I(2), I(cpu_buf), I(0), I(6)});
+    CHECK(dev->stats().bad_arguments == bad0 + 2);
+
+    // 4) Aligned dst_offset with unaligned length (bytes=6) to GPU-only buffer -> padded to 8 bytes.
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(gpu_buf), I(8), I(cpu_buf), I(0), I(6)});
+
+    // 5) Unaligned dst_offset=2, bytes=6 on CPU-visible buffer -> RMW aligned to offset=0, len=8 preserving [0..1].
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(cpu_buf), I(2), I(cpu_buf), I(32), I(6)});
+
+    // 6) Overlapping src==dst copy on CPU-visible buffer: [16..32) -> [20..36) (overlap of 12 bytes).
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(cpu_buf), I(20), I(cpu_buf), I(16), I(16)});
+
+    // 7) Identical self-copy on CPU-visible buffer: safe no-op.
+    fx.vcall(list, Slot2::CopyBufferRegion, {I(cpu_buf), I(40), I(cpu_buf), I(40), I(16)});
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+
+    const uint32_t gpu_id = object_of<dg::Resource>(gpu_buf)->id();
+    const uint32_t cpu_id = object_of<dg::Resource>(cpu_buf)->id();
+    bool saw_gpu_padded = false;
+    bool saw_cpu_rmw = false;
+    bool saw_cpu_overlap = false;
+    for (const Packet& p : ps) {
+        if (p.opcode != GpuOpcode::WriteBuffer) {
+            continue;
+        }
+        const auto w = payload_as<GpuWriteBufferPayload>(p);
+        CHECK((w.dst_offset & 3u) == 0u && (w.data_len & 3u) == 0u);  // WebGPU 4-byte alignment invariant!
+        const uint8_t* d = p.payload.data() + sizeof(GpuWriteBufferPayload);
+        if (w.id == gpu_id && w.dst_offset == 8 && w.data_len == 8) {
+            saw_gpu_padded = (d[0] == init[0] && d[5] == init[5] && d[6] == 0 && d[7] == 0);
+        }
+        if (w.id == cpu_id && w.dst_offset == 0 && w.data_len == 8) {
+            saw_cpu_rmw = (d[0] == init[0] && d[1] == init[1] && d[2] == init[32] && d[7] == init[37]);
+        }
+        if (w.id == cpu_id && w.dst_offset == 20 && w.data_len == 16) {
+            saw_cpu_overlap = (std::memcmp(d, init.data() + 16, 16) == 0);
+        }
+    }
+    CHECK(saw_gpu_padded && saw_cpu_rmw && saw_cpu_overlap);
+    CHECK(t_balanced);
+    scene.release_all({list, cpu_buf, gpu_buf});
+}
+
+// G79 (3): ClearDepthStencilView depth clamping/validation + DepthTwinTracker synchronization when
+// depth targets are cleared, written by render passes, and subsequently sampled as SRVs.
+void test_g79_depth_clear_and_depth_srv_twin_sync() {
+    Fixture fx;
+    Scene scene(fx);
+    const uint64_t list = scene.new_list();
+    auto* host_list = object_of<dg::CommandList>(list);
+
+    // Create a D32_FLOAT depth target (32x32, AllowDepthStencil, shader-readable).
+    dg::GuestResourceDesc d_desc = texture_desc(32, 32, 40 /* D32_FLOAT */, 2 /* ALLOW_DEPTH_STENCIL */);
+    const uint64_t depth_tex = committed(fx, scene.device, 1, d_desc, 0x10 /* DEPTH_WRITE */);
+    const uint32_t depth_id = object_of<dg::Resource>(depth_tex)->id();
+
+    // Create DSV heap & DSV, plus shader-visible SRV heap & SRV over the depth texture (R32_FLOAT).
+    const uint64_t dsv_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                        {I(put(dg::GuestDescriptorHeapDesc{3, 4, 0, 0}))},
+                                        dg::IID_ID3D12DescriptorHeap);
+    const uint64_t dsv_buf = put<uint64_t>(0);
+    fx.sret_call(dsv_heap, Slot::GetCPUStart, dsv_buf);
+    const uint64_t dsv_handle = load64(dsv_buf);
+    fx.vcall(scene.device, 21 /* CreateDepthStencilView */, {I(depth_tex), I(0), I(dsv_handle)});
+
+    const uint64_t srv_heap = fx.create(scene.device, Slot::CreateDescriptorHeap,
+                                        {I(put(dg::GuestDescriptorHeapDesc{0, 4, 1, 0}))},
+                                        dg::IID_ID3D12DescriptorHeap);
+    const uint64_t srv_cpu_buf = put<uint64_t>(0);
+    const uint64_t srv_gpu_buf = put<uint64_t>(0);
+    fx.sret_call(srv_heap, Slot::GetCPUStart, srv_cpu_buf);
+    fx.sret_call(srv_heap, Slot::GetGPUStart, srv_gpu_buf);
+    dg::GuestShaderResourceViewDesc srv_desc{};
+    srv_desc.Format = 41;  // R32_FLOAT reading D32_FLOAT
+    srv_desc.ViewDimension = 4;  // TEXTURE2D
+    srv_desc.Shader4ComponentMapping = 0x1688u;
+    srv_desc.u[1] = 1;  // MipLevels = 1
+    fx.vcall(scene.device, Slot2::CreateShaderResourceView, {I(depth_tex), I(put(srv_desc)), I(load64(srv_cpu_buf))});
+
+    // Root signature with 1 SRV descriptor table at param 0.
+    dg::GuestDescriptorRange1 range{0 /* SRV */, 1, 0, 0, 0, 0};
+    dg::GuestRootParameter rp{};
+    rp.ParameterType = 0;  // DescriptorTable
+    rp.w0 = 1;
+    rp.q = put(range);
+    rp.ShaderVisibility = 0;  // All
+    dg::GuestVersionedRootSignatureDesc rsd{};
+    rsd.Version = 2;
+    rsd.NumParameters = 1;
+    rsd.pParameters = put(rp);
+    const uint64_t blob_out = put<uint64_t>(0);
+    CHECK(hr(fx.dcall(dx::export_address("D3D12SerializeVersionedRootSignature"), {I(put(rsd)), I(blob_out), I(0)})) == 0);
+    const uint64_t rs_blob = load64(blob_out);
+    const uint64_t rs = fx.create(scene.device, Slot::CreateRootSignature,
+                                  {I(0), I(fx.vcall(rs_blob, Slot::GetBufferPointer)),
+                                   I(fx.vcall(rs_blob, Slot::GetBufferSize))},
+                                  dg::IID_ID3D12RootSignature);
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(1), I(put(dsv_handle))});
+    // Out-of-range depth clear (2.5f -> clamped to 1.0f) must produce WebGPU-valid depthClearValue.
+    fx.vcall(list, Slot2::ClearDepthStencilView, {I(dsv_handle), I(1), F32(2.5f), I(0), I(0), I(0)});
+    // Bind depth texture as SRV and draw (simulating SSAO/SSR reading the depth target).
+    const uint64_t heaps_arr = put<uint64_t>(srv_heap);
+    fx.vcall(list, 32 /* SetDescriptorHeaps */, {I(1), I(heaps_arr)});
+    fx.vcall(list, Slot2::SetGraphicsRootSignature, {I(rs)});
+    fx.vcall(list, 36 /* SetGraphicsRootDescriptorTable */, {I(0), I(load64(srv_gpu_buf))});
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(1), I(0)});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+
+    const auto snap1 = dg::inspect_command_list_state(host_list);
+    const auto* dt = dg::inspect_command_list_depth_twin(host_list);
+    CHECK(dt != nullptr && !dt->needs_srv_refresh(depth_id, 0, 0));
+    CHECK(snap1.depth_srv_sync_refreshes == 1);
+
+    // Second draw with no intervening depth write: zero additional SRV refreshes!
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(dg::inspect_command_list_state(host_list).depth_srv_sync_refreshes == 1);
+
+    // Stencil-only clear does NOT stale depth SRV state.
+    fx.vcall(list, Slot2::ClearDepthStencilView, {I(dsv_handle), I(2), F32(0.0f), I(5), I(0), I(0)});
+    CHECK(dt != nullptr && !dt->needs_srv_refresh(depth_id, 0, 0));
+
+    // Depth clear with NaN -> clamped safely to 1.0f AND stales depth SRV state so next draw refreshes!
+    fx.vcall(list, Slot2::ClearDepthStencilView,
+             {I(dsv_handle), I(1), F32(std::numeric_limits<float>::quiet_NaN()), I(0), I(0), I(0)});
+    CHECK(dt != nullptr && dt->needs_srv_refresh(depth_id, 0, 0));
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+    CHECK(dg::inspect_command_list_state(host_list).depth_srv_sync_refreshes == 2);
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+    bool saw_clamped_clear = false;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::BeginRenderPass) {
+            const auto rp_pay = payload_as<GpuBeginRenderPassPayload>(p);
+            if (rp_pay.depth_stencil.texture_id == depth_id &&
+                rp_pay.depth_stencil.depth_load_op == static_cast<uint8_t>(GpuLoadOp::Clear)) {
+                CHECK(rp_pay.depth_stencil.depth_clear_value >= 0.0f &&
+                      rp_pay.depth_stencil.depth_clear_value <= 1.0f);
+                saw_clamped_clear = true;
+            }
+        }
+    }
+    CHECK(saw_clamped_clear);
+    CHECK(t_balanced);
+    scene.release_all({list, depth_tex, dsv_heap, srv_heap, rs, rs_blob});
+}
+
+// G79 (4): Multi-viewport / multi-scissor clamping against render-target extents, NaN/negative
+// guards, OMSetStencilRef 8-bit masking, OMSetBlendFactor (RGBA + NaN + null->default), ClearState.
+void test_g79_multi_viewport_scissor_stencil_blend_and_clear_state() {
+    Fixture fx;
+    Scene scene(fx);  // scene RT is 64x64
+    const uint64_t list = scene.new_list();
+    auto* host_list = object_of<dg::CommandList>(list);
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+
+    // Set 2 viewports BEFORE OMSetRenderTargets: vp[0] has negative origin + oversized extent +
+    // inverted depth; vp[1] has NaN/negative width.
+    dg::GuestViewport vps[2] = {
+        {-10.0f, -4.0f, 100.0f, 80.0f, 1.5f, 0.25f},
+        {std::numeric_limits<float>::quiet_NaN(), 2.0f, -5.0f, 20.0f, -1.0f, 2.0f},
+    };
+    dg::GuestRect rects[2] = {
+        {-8, -4, 100, 80},
+        {20, 20, 10, 5},  // inverted -> empty
+    };
+    fx.vcall(list, Slot2::RSSetViewports, {I(2), I(put_bytes(vps, sizeof(vps)))});
+    fx.vcall(list, Slot2::RSSetScissorRects, {I(2), I(put_bytes(rects, sizeof(rects)))});
+
+    // Now bind 64x64 RT: viewports & scissors must re-clamp against 64x64!
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(1), I(0)});
+    const auto snap = dg::inspect_command_list_state(host_list);
+    CHECK(snap.bound_rt_width == 64 && snap.bound_rt_height == 64);
+    CHECK(snap.viewports.size() == 2);
+    if (snap.viewports.size() == 2) {
+        CHECK(snap.viewports[0].TopLeftX == 0.0f && snap.viewports[0].TopLeftY == 0.0f &&
+              snap.viewports[0].Width == 64.0f && snap.viewports[0].Height == 64.0f &&
+              snap.viewports[0].MinDepth == 0.25f && snap.viewports[0].MaxDepth == 1.0f);
+        CHECK(snap.viewports[1].TopLeftX == 0.0f && snap.viewports[1].TopLeftY == 2.0f &&
+              snap.viewports[1].Width == 0.0f && snap.viewports[1].Height == 20.0f &&
+              snap.viewports[1].MinDepth == 0.0f && snap.viewports[1].MaxDepth == 1.0f);
+    }
+    CHECK(snap.scissors.size() == 2);
+    if (snap.scissors.size() == 2) {
+        CHECK(snap.scissors[0].left == 0 && snap.scissors[0].top == 0 && snap.scissors[0].right == 64 &&
+              snap.scissors[0].bottom == 64);
+        CHECK(snap.scissors[1].left == 20 && snap.scissors[1].top == 20 && snap.scissors[1].right == 20 &&
+              snap.scissors[1].bottom == 20);
+    }
+
+    // OMSetStencilRef masks upper bits cleanly to 0..255.
+    fx.vcall(list, 24 /* OMSetStencilRef */, {I(0xABCD005Au)});
+    CHECK(dg::inspect_command_list_state(host_list).stencil_ref == 0x5Au);
+
+    // OMSetBlendFactor: finite RGBA + NaN sanitized to 0, then draw, then null -> default {1,1,1,1}.
+    const float bf[4] = {0.25f, 0.5f, std::numeric_limits<float>::quiet_NaN(), 0.75f};
+    fx.vcall(list, 23 /* OMSetBlendFactor */, {I(put_bytes(bf, sizeof(bf)))});
+    {
+        const auto s = dg::inspect_command_list_state(host_list);
+        CHECK(s.blend_factor[0] == 0.25f && s.blend_factor[1] == 0.5f && s.blend_factor[2] == 0.0f &&
+              s.blend_factor[3] == 0.75f);
+    }
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+
+    // Null blend factor resets to {1, 1, 1, 1}.
+    fx.vcall(list, 23 /* OMSetBlendFactor */, {I(0)});
+    {
+        const auto s = dg::inspect_command_list_state(host_list);
+        CHECK(s.blend_factor[0] == 1.0f && s.blend_factor[1] == 1.0f && s.blend_factor[2] == 1.0f &&
+              s.blend_factor[3] == 1.0f);
+    }
+    fx.vcall(list, Slot2::DrawInstanced, {I(3), I(1), I(0), I(0)});
+
+    // ClearState resets dynamic state back to defaults.
+    fx.vcall(list, 11 /* ClearState */, {I(0)});
+    {
+        const auto s = dg::inspect_command_list_state(host_list);
+        CHECK(s.viewports.empty() && s.scissors.empty() && s.stencil_ref == 0 && s.bound_rt_width == 0);
+    }
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+
+    const Packet* vp_pkt = find_op(ps, GpuOpcode::SetViewport);
+    CHECK(vp_pkt != nullptr);
+    if (vp_pkt != nullptr) {
+        const auto v = payload_as<GpuSetViewportPayload>(*vp_pkt);
+        CHECK(v.x == 0.0f && v.y == 0.0f && v.width == 64.0f && v.height == 64.0f && v.min_depth == 0.25f &&
+              v.max_depth == 1.0f);
+    }
+    const Packet* st_pkt = find_op(ps, GpuOpcode::SetStencilReference);
+    CHECK(st_pkt != nullptr && payload_as<GpuSetStencilReferencePayload>(*st_pkt).reference == 0x5Au);
+    std::vector<GpuSetBlendConstantPayload> blends;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::SetBlendConstant) {
+            blends.push_back(payload_as<GpuSetBlendConstantPayload>(p));
+        }
+    }
+    CHECK(blends.size() == 2);
+    if (blends.size() == 2) {
+        CHECK(blends[0].r == 0.25f && blends[0].g == 0.5f && blends[0].b == 0.0f && blends[0].a == 0.75f);
+        CHECK(blends[1].r == 1.0f && blends[1].g == 1.0f && blends[1].b == 1.0f && blends[1].a == 1.0f);
+    }
+    CHECK(t_balanced);
+    scene.release_all({list});
+}
+
+// G79 (5): DrawInstanced / DrawIndexedInstanced full parity for start_vertex, signed int32_t
+// base_vertex (positive & negative), start_index, and start_instance.
+void test_g79_draw_instanced_and_indexed_parity() {
+    Fixture fx;
+    Scene scene(fx);
+    const uint64_t list = scene.new_list();
+    const uint64_t ib = committed(fx, scene.device, 2, buffer_desc(64), 0xAC3);
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(scene.pso)})) == 0);
+    fx.vcall(list, Slot2::OMSetRenderTargets, {I(1), I(put(scene.rtv)), I(1), I(0)});
+    fx.vcall(list, Slot2::IASetPrimitiveTopology, {I(4)});
+    fx.vcall(list, Slot2::IASetVertexBuffers, {I(0), I(1), I(put(dg::GuestVertexBufferView{scene.vb_va, 36, 12}))});
+    fx.vcall(list, Slot2::IASetIndexBuffer,
+             {I(put(dg::GuestIndexBufferView{fx.vcall(ib, Slot2::GetGPUVirtualAddress), 64, 42 /* R32_UINT */}))});
+
+    fx.vcall(list, Slot2::DrawInstanced, {I(9), I(4), I(17), I(5)});
+    fx.vcall(list, Slot2::DrawIndexedInstanced,
+             {I(6), I(3), I(12), I(static_cast<uint32_t>(-7)), I(2)});
+    fx.vcall(list, Slot2::DrawIndexedInstanced, {I(12), I(2), I(4), I(42), I(11)});
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+
+    const Packet* dp = find_op(ps, GpuOpcode::Draw);
+    CHECK(dp != nullptr);
+    if (dp != nullptr) {
+        const auto d = payload_as<GpuDrawPayload>(*dp);
+        CHECK(d.vertex_count == 9 && d.instance_count == 4 && d.first_vertex == 17 && d.first_instance == 5);
+    }
+    std::vector<GpuDrawIndexedPayload> indexed;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::DrawIndexed) {
+            indexed.push_back(payload_as<GpuDrawIndexedPayload>(p));
+        }
+    }
+    CHECK(indexed.size() == 2);
+    if (indexed.size() == 2) {
+        CHECK(indexed[0].index_count == 6 && indexed[0].instance_count == 3 && indexed[0].first_index == 12 &&
+              indexed[0].base_vertex == -7 && indexed[0].first_instance == 2);
+        CHECK(indexed[1].index_count == 12 && indexed[1].instance_count == 2 && indexed[1].first_index == 4 &&
+              indexed[1].base_vertex == 42 && indexed[1].first_instance == 11);
+    }
+    CHECK(t_balanced);
+    scene.release_all({list, ib});
+}
+
+// G79 (6): ResolveSubresource MSAA color & depth resolve passes, subresource validation, depth-twin
+// invalidation, and safe fallback on unsupported resolve configurations.
+void test_g79_resolve_subresource_msaa() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    const uint64_t list = scene.new_list();
+    auto* host_list = object_of<dg::CommandList>(list);
+
+    // 4x MSAA color source (32x32x2 RGBA8_UNORM, AllowRenderTarget) -> 1x color destination (64x64x2, 2 mips -> mip 1 is 32x32!).
+    dg::GuestResourceDesc msaa_color_desc = texture_desc(32, 32, 28, 1 /* ALLOW_RENDER_TARGET */);
+    msaa_color_desc.SampleCount = 4;
+    msaa_color_desc.DepthOrArraySize = 2;
+    const uint64_t msaa_color = committed(fx, scene.device, 1, msaa_color_desc, 0x4);
+    dg::GuestResourceDesc dst_color_desc = texture_desc(64, 64, 28, 1 /* ALLOW_RENDER_TARGET */);
+    dst_color_desc.MipLevels = 2;
+    dst_color_desc.DepthOrArraySize = 2;
+    const uint64_t dst_color = committed(fx, scene.device, 1, dst_color_desc, 0x400);
+
+    // 4x MSAA depth source (32x32 D32_FLOAT, AllowDepthStencil) -> 1x depth destination (32x32 D32_FLOAT, AllowDepthStencil).
+    dg::GuestResourceDesc msaa_depth_desc = texture_desc(32, 32, 40, 2 /* ALLOW_DEPTH_STENCIL */);
+    msaa_depth_desc.SampleCount = 4;
+    const uint64_t msaa_depth = committed(fx, scene.device, 1, msaa_depth_desc, 0x10);
+    dg::GuestResourceDesc dst_depth_desc = texture_desc(32, 32, 40, 2 /* ALLOW_DEPTH_STENCIL */);
+    const uint64_t dst_depth = committed(fx, scene.device, 1, dst_depth_desc, 0x400);
+
+    // Non-render-target destination for safe fallback test.
+    dg::GuestResourceDesc non_rt_desc = texture_desc(32, 32, 28, 0);
+    const uint64_t non_rt_dst = committed(fx, scene.device, 1, non_rt_desc, 0x400);
+
+    CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+
+    // 1) Color MSAA resolve: src slice 1 (sub=1) -> dst mip 1, slice 1 (sub = 1 + 1*2 = 3).
+    fx.vcall(list, 19 /* ResolveSubresource */, {I(dst_color), I(3), I(msaa_color), I(1), I(28)});
+
+    // 2) Depth MSAA resolve: src sub 0 -> dst sub 0.
+    fx.vcall(list, 19 /* ResolveSubresource */, {I(dst_depth), I(0), I(msaa_depth), I(0), I(40)});
+
+    // 3) Safe fallback (dst lacks AllowRenderTarget) -> counted as fallback + unsupported_copy, zero invalid pass.
+    const uint64_t unsup_before = dev->stats().unsupported_copies;
+    fx.vcall(list, 19 /* ResolveSubresource */, {I(non_rt_dst), I(0), I(msaa_color), I(0), I(28)});
+    CHECK(dev->stats().unsupported_copies == unsup_before + 1);
+
+    // 4) Dimension mismatch -> diagnosed as bad argument, skipped cleanly.
+    const uint64_t bad_before = dev->stats().bad_arguments;
+    fx.vcall(list, 19 /* ResolveSubresource */, {I(dst_color), I(0) /* 64x64 */, I(msaa_color), I(0) /* 32x32 */, I(28)});
+    CHECK(dev->stats().bad_arguments == bad_before + 1);
+
+    const auto snap = dg::inspect_command_list_state(host_list);
+    CHECK(snap.resolves_emitted == 2 && snap.resolves_fallback == 1);
+
+    CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+    const size_t mark = fx.captured.size();
+    scene.execute({list});
+    const auto ps = packets_since(fx, mark);
+
+    const uint32_t dst_color_id = object_of<dg::Resource>(dst_color)->id();
+    const uint32_t dst_depth_id = object_of<dg::Resource>(dst_depth)->id();
+    bool saw_color_resolve = false;
+    bool saw_depth_resolve = false;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::BeginRenderPass) {
+            const auto rp = payload_as<GpuBeginRenderPassPayload>(p);
+            if (rp.color_count == 1 && rp.color[0].texture_id == dst_color_id && rp.color[0].view.base_mip_level == 1 &&
+                rp.color[0].view.base_array_layer == 1) {
+                saw_color_resolve = true;
+            }
+            if (rp.color_count == 0 && rp.depth_stencil.texture_id == dst_depth_id &&
+                rp.depth_stencil.depth_store_op == static_cast<uint8_t>(GpuStoreOp::Store)) {
+                saw_depth_resolve = true;
+            }
+        }
+    }
+    CHECK(saw_color_resolve && saw_depth_resolve);
+    CHECK(count_op(ps, GpuOpcode::Draw) == 2);
+    CHECK(count_op(ps, GpuOpcode::EndRenderPass) == 2);
+    CHECK(t_balanced);
+    scene.release_all({list, msaa_color, dst_color, msaa_depth, dst_depth, non_rt_dst});
+}
+
 int main() {
     // The flush of CPU-visible buffers uses the arena's write tracking where it exists (the boot
     // harness turns it on); exercise that path here too.
@@ -8204,6 +8736,12 @@ int main() {
     test_storage_relocation_reuse_waits_for_presents();
     test_g84_readback_ring_hardening();
     test_g84_xbox_3d_methods_hardening();
+    test_g79_copy_texture_region_3d_array_cube_and_bc_miptail();
+    test_g79_copy_buffer_region_64bit_alignment_and_overlap();
+    test_g79_depth_clear_and_depth_srv_twin_sync();
+    test_g79_multi_viewport_scissor_stencil_blend_and_clear_state();
+    test_g79_draw_instanced_and_indexed_parity();
+    test_g79_resolve_subresource_msaa();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_d3d12_xs_exports: %d failure(s)\n", g_failures);
         return 1;

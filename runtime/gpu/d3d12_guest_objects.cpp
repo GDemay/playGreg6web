@@ -861,6 +861,268 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
     return static_cast<uint32_t>(order.size());
 }
 
+namespace {
+
+constexpr std::string_view kMsaaResolveVs = R"(@vertex fn vs_main(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+  let x = f32((i << 1u) & 2u);
+  let y = f32(i & 2u);
+  return vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+}
+)";
+
+constexpr std::string_view kMsaaResolveColorFs = R"(@group(0) @binding(0) var src: texture_multisampled_2d<f32>;
+@fragment fn fs_main(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+  let c = vec2<i32>(pos.xy);
+  return (textureLoad(src, c, 0) + textureLoad(src, c, 1) + textureLoad(src, c, 2) + textureLoad(src, c, 3)) * 0.25;
+}
+)";
+
+constexpr std::string_view kMsaaResolveDepthFs = R"(@group(0) @binding(0) var src: texture_depth_multisampled_2d;
+@fragment fn fs_main(@builtin(position) pos: vec4<f32>) -> @builtin(frag_depth) f32 {
+  return textureLoad(src, vec2<i32>(pos.xy), 0);
+}
+)";
+
+bool is_float_color_resolve_format(pso::WgpuTextureFormat f) {
+    using F = pso::WgpuTextureFormat;
+    switch (f) {
+    case F::R8Unorm:
+    case F::R8Snorm:
+    case F::R16Unorm:
+    case F::R16Snorm:
+    case F::R16Float:
+    case F::Rg8Unorm:
+    case F::Rg8Snorm:
+    case F::R32Float:
+    case F::Rg16Unorm:
+    case F::Rg16Snorm:
+    case F::Rg16Float:
+    case F::Rgba8Unorm:
+    case F::Rgba8UnormSrgb:
+    case F::Rgba8Snorm:
+    case F::Bgra8Unorm:
+    case F::Bgra8UnormSrgb:
+    case F::Rgb10a2Unorm:
+    case F::Rg11b10Ufloat:
+    case F::Rg32Float:
+    case F::Rgba16Unorm:
+    case F::Rgba16Snorm:
+    case F::Rgba16Float:
+    case F::Rgba32Float:
+        return true;
+    default:
+        return false;
+    }
+}
+
+}  // namespace
+
+bool Device::emit_msaa_resolve(uint32_t dst_texture_id, uint32_t dst_mip, uint32_t dst_layer,
+                               uint32_t src_texture_id, uint32_t src_layer, uint32_t resolve_dxgi_format,
+                               CommandEncoder& enc) {
+    bridge::TextureInfo dst_info{}, src_info{};
+    if (dst_texture_id == 0 || src_texture_id == 0 || !bridge_->texture_info(dst_texture_id, &dst_info) ||
+        !bridge_->texture_info(src_texture_id, &src_info)) {
+        return false;
+    }
+    if (dst_info.dimension != GpuTextureDimension::Dim2D || src_info.dimension != GpuTextureDimension::Dim2D ||
+        src_info.sample_count <= 1u || dst_info.sample_count != 1u || dst_mip >= dst_info.mip_levels ||
+        dst_layer >= std::max<uint32_t>(1u, dst_info.depth_or_array_size) ||
+        src_layer >= std::max<uint32_t>(1u, src_info.depth_or_array_size)) {
+        return false;
+    }
+    const uint32_t dst_mip_w = std::max<uint32_t>(1u, dst_info.width >> dst_mip);
+    const uint32_t dst_mip_h = std::max<uint32_t>(1u, dst_info.height >> dst_mip);
+    if (src_info.width != dst_mip_w || src_info.height != dst_mip_h) {
+        return false;
+    }
+
+    const uint32_t features = bridge_->options().features;
+    const auto resolve_dxgi = static_cast<pso::DxgiFormat>(resolve_dxgi_format);
+    const pso::TextureFormatMapping depth_map =
+        pso::map_texture_format(resolve_dxgi, pso::FormatUsage::DepthStencil, features);
+    const bool is_depth = depth_map.supported() && pso::has_depth_aspect(depth_map.format);
+
+    pso::WgpuTextureFormat dst_wgpu = pso::WgpuTextureFormat::Undefined;
+    pso::WgpuTextureFormat src_wgpu = pso::WgpuTextureFormat::Undefined;
+    if (is_depth) {
+        dst_wgpu = depth_map.format;
+        src_wgpu = depth_map.format;
+    } else {
+        const pso::TextureFormatMapping rt_map =
+            pso::map_texture_format(resolve_dxgi, pso::FormatUsage::RenderTarget, features);
+        if (!rt_map.supported() || !pso::is_color_renderable(rt_map.format, features) ||
+            !is_float_color_resolve_format(rt_map.format)) {
+            return false;
+        }
+        dst_wgpu = rt_map.format;
+        src_wgpu = rt_map.format;
+    }
+
+    const uint8_t dst_fmt_code = static_cast<uint8_t>(dst_wgpu);
+    uint32_t group_layout_id = 0;
+    uint32_t pipeline_id = 0;
+    CommandEncoder setup;
+    {
+        std::lock_guard<std::mutex> lock(resolve_mutex_);
+        MsaaResolve& r = msaa_resolve_;
+        if (r.vs == 0) {
+            r.vs = allocate_id();
+            setup.create_shader_module(r.vs, GpuShaderStage::Vertex, kMsaaResolveVs);
+        }
+        if (is_depth) {
+            if (r.depth_fs == 0) {
+                r.depth_fs = allocate_id();
+                setup.create_shader_module(r.depth_fs, GpuShaderStage::Fragment, kMsaaResolveDepthFs);
+                GpuBindGroupLayoutEntry entry{};
+                entry.binding = 0;
+                entry.visibility = GpuShaderStageBits::Fragment;
+                entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+                entry.binding_type = static_cast<uint8_t>(GpuTextureSampleType::Depth);
+                entry.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+                entry.flags = GpuBindGroupLayoutEntryFlags::Multisampled;
+                r.depth_group_layout = allocate_id();
+                GpuCreateBindGroupLayoutPayload bgl{};
+                bgl.id = r.depth_group_layout;
+                bgl.entry_count = 1;
+                setup.emit_packet(GpuOpcode::CreateBindGroupLayout, &bgl, sizeof(bgl), &entry, sizeof(entry));
+                r.depth_pipeline_layout = allocate_id();
+                GpuCreatePipelineLayoutPayload pl{};
+                pl.id = r.depth_pipeline_layout;
+                pl.bind_group_layout_count = 1;
+                setup.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &r.depth_group_layout,
+                                  sizeof(uint32_t));
+            }
+            group_layout_id = r.depth_group_layout;
+            uint32_t& p = r.depth_pipelines[dst_fmt_code];
+            if (p == 0) {
+                p = allocate_id();
+                GpuCreateRenderPipeline2Payload rp{};
+                rp.id = p;
+                rp.vs_module_id = r.vs;
+                rp.fs_module_id = r.depth_fs;
+                rp.pipeline_layout_id = r.depth_pipeline_layout;
+                rp.key.color_target_count = 0;
+                rp.key.depth_stencil.format = dst_fmt_code;
+                rp.key.depth_stencil.depth_write_enabled = 1;
+                rp.key.depth_stencil.depth_compare = static_cast<uint8_t>(pso::WgpuCompareFunction::Always);
+                rp.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+                rp.key.multisample.count = 1;
+                rp.key.multisample.mask = 0xFFFFFFFFu;
+                setup.emit_packet(GpuOpcode::CreateRenderPipeline2, &rp, sizeof(rp));
+            }
+            pipeline_id = p;
+        } else {
+            if (r.color_fs == 0) {
+                r.color_fs = allocate_id();
+                setup.create_shader_module(r.color_fs, GpuShaderStage::Fragment, kMsaaResolveColorFs);
+                GpuBindGroupLayoutEntry entry{};
+                entry.binding = 0;
+                entry.visibility = GpuShaderStageBits::Fragment;
+                entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+                entry.binding_type = static_cast<uint8_t>(GpuTextureSampleType::UnfilterableFloat);
+                entry.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+                entry.flags = GpuBindGroupLayoutEntryFlags::Multisampled;
+                r.color_group_layout = allocate_id();
+                GpuCreateBindGroupLayoutPayload bgl{};
+                bgl.id = r.color_group_layout;
+                bgl.entry_count = 1;
+                setup.emit_packet(GpuOpcode::CreateBindGroupLayout, &bgl, sizeof(bgl), &entry, sizeof(entry));
+                r.color_pipeline_layout = allocate_id();
+                GpuCreatePipelineLayoutPayload pl{};
+                pl.id = r.color_pipeline_layout;
+                pl.bind_group_layout_count = 1;
+                setup.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &r.color_group_layout,
+                                  sizeof(uint32_t));
+            }
+            group_layout_id = r.color_group_layout;
+            uint32_t& p = r.color_pipelines[dst_fmt_code];
+            if (p == 0) {
+                p = allocate_id();
+                GpuCreateRenderPipeline2Payload rp{};
+                rp.id = p;
+                rp.vs_module_id = r.vs;
+                rp.fs_module_id = r.color_fs;
+                rp.pipeline_layout_id = r.color_pipeline_layout;
+                rp.key.color_target_count = 1;
+                rp.key.color_targets[0].format = dst_fmt_code;
+                rp.key.color_targets[0].write_mask = 0xFu;
+                rp.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+                rp.key.multisample.count = 1;
+                rp.key.multisample.mask = 0xFFFFFFFFu;
+                setup.emit_packet(GpuOpcode::CreateRenderPipeline2, &rp, sizeof(rp));
+            }
+            pipeline_id = p;
+        }
+    }
+    if (!setup.empty()) {
+        submit(setup);
+    }
+
+    // Create a transient bind group over the resolved source subresource.
+    const uint32_t group_id = allocate_id();
+    GpuBindGroupEntry2 entry{};
+    entry.binding = 0;
+    entry.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+    entry.resource_id = src_texture_id;
+    entry.view.format = is_depth ? 0u : static_cast<uint8_t>(src_wgpu);
+    entry.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+    entry.view.aspect = static_cast<uint8_t>(is_depth ? GpuTextureAspect::DepthOnly : GpuTextureAspect::All);
+    entry.view.base_mip_level = 0;
+    entry.view.mip_level_count = 1;
+    entry.view.base_array_layer = src_layer;
+    entry.view.array_layer_count = 1;
+    GpuCreateBindGroup2Payload bg{};
+    bg.id = group_id;
+    bg.layout_id = group_layout_id;
+    bg.entry_count = 1;
+    enc.emit_packet(GpuOpcode::CreateBindGroup2, &bg, sizeof(bg), &entry, sizeof(entry));
+
+    GpuBeginRenderPassPayload pass{};
+    if (is_depth) {
+        pass.color_count = 0;
+        GpuRenderPassDepthStencilAttachment& d = pass.depth_stencil;
+        d.texture_id = dst_texture_id;
+        d.depth_load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+        d.depth_store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+        d.depth_clear_value = 0.0f;
+        if (pso::has_stencil_aspect(dst_wgpu)) {
+            d.stencil_read_only = 1;
+        }
+        d.view.format = dst_fmt_code;
+        d.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        d.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+        d.view.base_mip_level = static_cast<uint16_t>(dst_mip);
+        d.view.mip_level_count = 1;
+        d.view.base_array_layer = dst_layer;
+        d.view.array_layer_count = 1;
+    } else {
+        pass.color_count = 1;
+        GpuRenderPassColorAttachment& c = pass.color[0];
+        c.texture_id = dst_info.swapchain ? kGpuSwapchainTextureId : dst_texture_id;
+        c.load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+        c.store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+        c.view.format = dst_fmt_code;
+        c.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        c.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+        c.view.base_mip_level = static_cast<uint16_t>(dst_mip);
+        c.view.mip_level_count = 1;
+        c.view.base_array_layer = dst_layer;
+        c.view.array_layer_count = 1;
+    }
+    enc.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+    enc.set_pipeline(pipeline_id);
+    const GpuSetBindGroup2Payload set{0u, group_id, 0u, 0u};
+    enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    enc.draw(3, 1, 0, 0);
+    enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+
+    bridge_->note_resource_used(src_texture_id);
+    bridge_->note_resource_used(dst_texture_id);
+    bridge_->defer_destroy_resource(group_id);
+    return true;
+}
+
 uint32_t Device::present(std::span<const uint32_t> plane_textures) {
     if (dump_ && dump_presents_.fetch_add(1) % 60 == 59) {
         dump_->write_manifest();
