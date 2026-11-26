@@ -17,6 +17,7 @@
 #include "os/httpfs_mailbox.h"
 #include "os/image_loader.h"
 #include "os/os_shim.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/xbox_scarlett.h"
 #include "os/xbox_scarlett_guest.h"
@@ -489,14 +490,15 @@ bool try_load_shader_pack(const WasmBootConfig& cfg,
     }
 
     uint32_t entry_count = 0;
+    uint32_t pack_version = 1;
     std::string parse_error;
-    if (!gpu::parse_shader_pack_header(header, header_got, &entry_count, &parse_error)) {
+    if (!gpu::parse_shader_pack_header(header, header_got, &entry_count, &parse_error, &pack_version)) {
         emit_boot_milestone(cfg, "SHADER_PACK", path + " invalid: " + parse_error);
         return false;
     }
 
     const uint64_t entries_bytes =
-        uint64_t{entry_count} * uint64_t{gpu::kShaderPackEntryBytes};
+        uint64_t{entry_count} * uint64_t{gpu::shader_pack_entry_bytes(pack_version)};
     const uint64_t toc_bytes = uint64_t{gpu::kShaderPackHeaderBytes} + entries_bytes;
     const uint64_t toc_cap =
         (cfg.max_file_bytes != 0 && cfg.max_file_bytes < kMaxShaderPackTocBytes)
@@ -720,6 +722,28 @@ bool load_file_via_httpfs(const WasmBootConfig& cfg,
     }
 }
 
+namespace {
+bool g_relaunch_pending = false;
+std::string g_relaunch_args;  // last relaunch request, read by the browser loader through exports
+
+std::string with_title_args(std::string base, const std::string& title_args) {
+    if (!title_args.empty()) {
+        base += ' ';
+        base += title_args;
+    }
+    return base;
+}
+
+void finish_relaunch(WasmBootResult& result) {
+    std::string args;
+    result.relaunch_requested = os::win32::relaunch_requested(&args) &&
+        static_cast<uint32_t>(result.exit_code) == os::win32::kRelaunchSelfExitCode;
+    result.relaunch_args = result.relaunch_requested ? args : std::string();
+    g_relaunch_args = result.relaunch_args;
+    g_relaunch_pending = result.relaunch_requested;
+}
+}  // namespace
+
 WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program& program) {
     WasmBootResult result;
     result.linked_guest_available = true;
@@ -801,7 +825,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     program_boot.config.console_mode = guest::kConsoleModeSeriesX;
     program_boot.config.sandbox_id = "RETAIL";
     program_boot.config.working_directory = "G:\\";
-    program_boot.config.command_line = "game_scarlett_master.exe";
+    program_boot.config.command_line = with_title_args("game_scarlett_master.exe", cfg.title_args);
     program_boot.config.off_thread_fault = &wasm_off_thread_fault;
 
     ScopedActiveBootConfig active_boot_cfg(&cfg);
@@ -862,6 +886,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
         std::string error;
         return load_file_via_httpfs(cfg, path, out, error);
     });
+    os::win32::reset_relaunch_request();
     const guest::BootResult boot = guest::run_boot(program_boot.config);
     if (auto dev = gpu::d3d12_xs_exports::current_device()) {
         if (!dump_dir.empty()) {
@@ -878,6 +903,7 @@ WasmBootResult run_wasm_program_boot(const WasmBootConfig& cfg, const Pg6Program
     }
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;
+    finish_relaunch(result);
     result.stage = result.ok ? "ENTRY_CALL" : guest::boot_status_name(boot.status);
     if (!result.ok) {
         result.error = boot.summary;
@@ -970,9 +996,12 @@ WasmBootResult run_wasm_guest_boot(const WasmBootConfig& cfg) {
         current_input == nullptr || current_input == &g_wasm_input_state.state) {
         attach_default_input_state();
     }
+    boot_cfg.command_line = with_title_args("game.exe", cfg.title_args);
+    os::win32::reset_relaunch_request();
     const guest::BootResult boot = guest::run_boot(boot_cfg);
     result.ok = boot.status == guest::BootStatus::Exited;
     result.exit_code = boot.stats.exit_code;
+    finish_relaunch(result);
     result.stage = result.ok ? "ENTRY_CALL" : guest::boot_status_name(boot.status);
     if (!result.ok) {
         result.error = boot.summary;
@@ -995,10 +1024,26 @@ playgta6::InputState* input_state_ptr() noexcept {
 
 void attach_default_input_state() {
     os::scarlett::set_game_input_state(&g_wasm_input_state.state, os::SeqlockMode::MonotonicSeq);
+#ifdef __EMSCRIPTEN__
+    // O36: a key tap shorter than the title's frame must still reach it (press latch).
+    os::scarlett::set_game_input_press_sampler(true);
+#endif
 }
 
 }  // namespace playgta6::boot
 
 extern "C" PG6_WASM_BOOT_EXPORT uintptr_t playgta6_get_input_state_ptr(void) {
     return reinterpret_cast<uintptr_t>(playgta6::boot::input_state_ptr());
+}
+
+// Browser relaunch contract (XLaunchNewGame): after run_wasm_guest_boot returns, the loader reads
+// playgta6_relaunch_requested(); when 1 it tears the worker down and boots again with the same
+// options plus the arguments at playgta6_relaunch_args_ptr() (NUL-terminated UTF-8, valid until the
+// next boot), passed as WasmBootConfig::title_args.
+extern "C" PG6_WASM_BOOT_EXPORT int32_t playgta6_relaunch_requested(void) {
+    return playgta6::boot::g_relaunch_pending ? 1 : 0;
+}
+
+extern "C" PG6_WASM_BOOT_EXPORT const char* playgta6_relaunch_args_ptr(void) {
+    return playgta6::boot::g_relaunch_args.c_str();
 }

@@ -14,6 +14,7 @@
 #include "gpu/gfx10_detile.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
+#include "os/win32_sync.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -241,6 +242,8 @@ std::u16string PrivateData::name() const {
 // ---------------------------------------------------------------------------------------------
 
 Device::Device(DeviceOptions options) : options_(std::move(options)) {
+    readback_gate_ = std::make_unique<ReadbackGate>(options_.gpu_readback_hold,
+                                                    std::chrono::milliseconds(options_.gpu_readback_timeout_ms));
     // The title creates constant-buffer views at 16-byte aligned addresses and sizes (Xbox; PC
     // D3D12 requires 256).
     heaps_.set_cbv_alignment(16);
@@ -252,6 +255,7 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.relocate_storage = [this](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
         return relocate_storage_buffer(va, size, id, offset, /*require_zero_offset=*/false);
     };
+    bo.relocation_epoch = [this] { return relocation_evictions_.load(std::memory_order_relaxed); };
     bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
@@ -330,7 +334,7 @@ void Device::register_lag_fence(Fence* fence) {
         lag_publisher_ = std::thread([this] {
             std::unique_lock<std::mutex> l(lag_mutex_);
             while (!lag_stop_) {
-                lag_cv_.wait_for(l, std::chrono::milliseconds(8));
+                lag_cv_.wait_for(l, std::chrono::milliseconds(4));
                 if (lag_stop_) {
                     break;
                 }
@@ -356,11 +360,12 @@ void Device::publish_fences() {
     uint64_t by_present = 0, by_cap = 0, lag = 0;
     const auto now = std::chrono::steady_clock::now();
     const uint64_t epoch = present_epoch();
+    const uint32_t min_lag_frames = fence_publish_lag_frames();
     const std::chrono::milliseconds cap(options_.fence_publish_cap_ms);
     {
         std::lock_guard<std::mutex> lock(lag_mutex_);
         for (Fence* f : lag_fences_) {
-            f->publish_due(epoch, now, cap, &by_present, &by_cap, &lag);
+            f->publish_due(epoch, min_lag_frames, now, cap, &by_present, &by_cap, &lag);
         }
     }
     if (by_present != 0) {
@@ -373,6 +378,7 @@ void Device::publish_fences() {
 }
 
 Device::~Device() {
+    readback_gate_.reset();  // stops the poller; held signals are dropped
     {
         std::lock_guard<std::mutex> lock(lag_mutex_);
         lag_stop_ = true;
@@ -407,7 +413,7 @@ Device::~Device() {
             std::lock_guard<std::mutex> lock(address_textures_mutex_);
             ids.reserve(address_textures_.size());
             for (const auto& entry : address_textures_) {
-                ids.push_back(entry.second);
+                ids.push_back(entry.second.id);
             }
             address_textures_.clear();
         }
@@ -426,6 +432,7 @@ Device::~Device() {
     flush_pipeline_dump();
     os::xmem_windows::remove_alias_listener(alias_listener_);
     pacer_.shutdown();
+    stop_frame_event_thread();
 }
 
 void Device::initialize_guest_payload() {
@@ -484,8 +491,17 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
     case GpuOpcode::WriteBuffer:
     case GpuOpcode::WriteTexture:
     case GpuOpcode::SetIndexBuffer:
+    case GpuOpcode::DrawIndirect:
+    case GpuOpcode::DrawIndexedIndirect:
+    case GpuOpcode::DispatchIndirect:
         if (len >= 4) {
             fn(read_u32(p));
+        }
+        break;
+    case GpuOpcode::ReadbackBuffer:
+    case GpuOpcode::ReadbackTexture:
+        if (len >= 8) {
+            fn(read_u32(p + 4));  // buffer_id / texture_id
         }
         break;
     case GpuOpcode::SetVertexBuffer:
@@ -1849,8 +1865,14 @@ HResult Device::CreateCommandSignature(const GuestCommandSignatureDesc* desc, ui
         note_bad_argument("CreateCommandSignature: invalid descriptor");
         return kEInvalidArg;
     }
+    // D3D12_INDIRECT_ARGUMENT_DESC is 16 bytes, Type first; the work argument is the last one.
+    uint32_t work_type = CommandSignature::kIndirectArgUnknown;
+    if (!com::read_guest(desc->pArgumentDescs + uint64_t{desc->NumArgumentDescs - 1} * 16u, &work_type,
+                         sizeof(work_type))) {
+        work_type = CommandSignature::kIndirectArgUnknown;
+    }
     auto signature = com::create_object<CommandSignature>(com::implements(kID3D12CommandSignature), device_ref(this),
-                                                          desc->ByteStride, desc->NumArgumentDescs);
+                                                          desc->ByteStride, desc->NumArgumentDescs, work_type);
     return hand_out(std::move(signature), riid, out);
 }
 
@@ -1963,8 +1985,18 @@ HResult Fence::SetEventOnCompletion(uint64_t value, uint64_t event_handle) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (value_.load(std::memory_order_acquire) < value) {
             waits_.emplace(value, event_handle);
+            if (os::win32::event_trace_enabled(event_handle)) {
+                char detail[96];
+                std::snprintf(detail, sizeof(detail), "fence=%p wants %llu, executed %llu", static_cast<void*>(this),
+                              static_cast<unsigned long long>(value),
+                              static_cast<unsigned long long>(value_.load(std::memory_order_acquire)));
+                os::win32::event_trace_note("fence", event_handle, detail);
+            }
             return kSOk;
         }
+    }
+    if (os::win32::event_trace_enabled(event_handle)) {
+        os::win32::event_trace_note("fence", event_handle, "already reached");
     }
     if (publish_for_wait(value)) {
         device_->count(xbox::Counter::FencePublishesByWait);
@@ -2043,15 +2075,16 @@ bool Fence::publish_for_wait(uint64_t value) {
     return was_pending;
 }
 
-void Fence::publish_due(uint64_t present_epoch, std::chrono::steady_clock::time_point now,
+void Fence::publish_due(uint64_t present_epoch, uint32_t min_lag_frames, std::chrono::steady_clock::time_point now,
                         std::chrono::milliseconds cap, uint64_t* by_present, uint64_t* by_cap, uint64_t* lag_frames) {
     std::lock_guard<std::mutex> lock(mutex_);
     uint64_t target = 0;
     while (!pending_.empty()) {
         const PendingSignal& p = pending_.front();
-        if (present_epoch >= p.epoch + 2) {
+        const uint64_t elapsed_presents = present_epoch >= p.epoch ? (present_epoch - p.epoch) : 0;
+        if (elapsed_presents >= min_lag_frames) {
             ++*by_present;
-            *lag_frames += present_epoch - p.epoch - 1;
+            *lag_frames += elapsed_presents;
         } else if (now - p.at >= cap) {
             ++*by_cap;
         } else {
@@ -2112,8 +2145,16 @@ HResult CommandQueue::Signal(InterfaceArg<IFenceHost> fence, uint64_t value) {
     }
     // Work is handed to the GPU process at ExecuteCommandLists time and executes in submission
     // order; the runtime has no GPU completion feedback, so a queue signal completes when it is
-    // issued (everything submitted before it has been handed off).
-    static_cast<Fence*>(fence.get())->signal_from_queue(value, device_->present_epoch());
+    // issued (everything submitted before it has been handed off). The exception is read-back
+    // (G66): a signal behind an outstanding read-back is held until its bytes are in guest memory.
+    auto* f = static_cast<Fence*>(fence.get());
+    Device* device = device_.get();
+    if (device->readbacks().park([keep = com::Ref<Fence>::share(f), device, value] {
+            keep->signal_from_queue(value, device->present_epoch());
+        })) {
+        return kSOk;
+    }
+    f->signal_from_queue(value, device->present_epoch());
     return kSOk;
 }
 

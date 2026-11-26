@@ -227,6 +227,26 @@ HResult Store::enumerate_containers(const std::string& prefix, std::vector<Conta
     return S_OK_HR;
 }
 
+HResult Store::get_container_info(const std::string& name, ContainerInfo* out) const {
+    *out = ContainerInfo{};
+    if (!valid_name(name, kMaxContainerNameChars)) {
+        return E_GS_INVALID_CONTAINER_NAME;
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    const fs::path path = container_path(root_, name);
+    std::error_code ec;
+    if (!fs::is_directory(path, ec)) {
+        return E_GS_NO_SUCH_CONTAINER;
+    }
+    out->name = name;
+    out->display_name = read_display_name(path);
+    for (const auto& entry : list_blobs(path, &out->last_modified)) {
+        ++out->blob_count;
+        out->total_size += entry.second;
+    }
+    return S_OK_HR;
+}
+
 HResult Store::enumerate_blobs(const std::string& container, std::vector<BlobInfo>* out) const {
     out->clear();
     if (!valid_name(container, kMaxContainerNameChars)) {

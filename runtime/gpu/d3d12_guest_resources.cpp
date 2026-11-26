@@ -1,5 +1,6 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/gpu_va_watch.h"
+#include "gpu/xbox_embedded_native.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -16,6 +18,7 @@
 #include "gpu/gfx10_detile.h"
 #include "os/guest_window.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 #include "os/vmem.h"
 #include "os/surface_blocks.h"
 #include "os/xbox_scarlett.h"
@@ -566,16 +569,45 @@ void Device::untrack_cpu_buffer(Resource* resource) {
     slot_index_.remove(resource);
 }
 
+namespace {
+
+const void* texture_slot_key(uint32_t resource_id) {
+    return reinterpret_cast<const void*>(static_cast<uintptr_t>(resource_id));
+}
+
+bool any_window_slot_marked(uint64_t va, uint64_t len) {
+    if (!os::guest_window::translated(va) || len == 0) {
+        return false;
+    }
+    constexpr uint64_t kSlotBytes = os::guest_window::kSlotBytes;
+    const uint64_t max_va = os::guest_window::kWindowBase + os::guest_window::kWindowMaxSize - 1;
+    const uint64_t last_va = len - 1 > max_va - va ? max_va : va + (len - 1);
+    const uint64_t last_slot_base = last_va & ~(kSlotBytes - 1);
+    for (uint64_t addr = va & ~(kSlotBytes - 1);; addr += kSlotBytes) {
+        if (os::guest_window::write_marked(addr)) {
+            return true;
+        }
+        if (addr >= last_slot_base) {
+            break;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 void Device::track_guest_texture(const TrackedTexture& tex) {
     if (tex.resource_id == 0 || tex.gpu_va == 0) {
         return;
     }
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    texture_slot_index_.remove(texture_slot_key(tex.resource_id));
     tracked_textures_[tex.resource_id] = tex;
 }
 
 void Device::untrack_guest_texture(uint32_t resource_id) {
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    texture_slot_index_.remove(texture_slot_key(resource_id));
     tracked_textures_.erase(resource_id);
     copy_destinations_.erase(resource_id);
 }
@@ -585,6 +617,7 @@ void Device::note_texture_copy_destination(uint32_t resource_id) {
         return;
     }
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+    texture_slot_index_.remove(texture_slot_key(resource_id));
     copy_destinations_.insert(resource_id);
 }
 
@@ -763,10 +796,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
     }
 
-    // Safely read the source bytes via CPU-window translation (never crashes on unmapped/guard pages).
+    // Safely access the source bytes via CPU-window translation (never crashes on unmapped/guard pages).
     const uint64_t cpu_va = cpu_address_for_gpu(tt.gpu_va);
-    std::vector<uint8_t> raw;
-    bool read_ok = false;
+    const uint64_t fallback_size = tight_mip0_bytes * linear_layers;
+    uint64_t primary_size = fallback_size;
     if (is_tiled && detile_fn) {
         if (tiled_bytes == 0) {
             GuestResourceDesc tmp{};
@@ -780,37 +813,142 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             tmp.Layout = tt.layout;
             tiled_bytes = committed_memory_size(tmp);
         }
-        const uint64_t read_size = std::max<uint64_t>(tiled_bytes, tight_mip0_bytes);
-        if (read_size > 0 && read_size <= kMaxSyncTextureBytes) {
-            raw.resize(static_cast<size_t>(read_size));
-            read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
+        const uint64_t tiled_read = std::max<uint64_t>(tiled_bytes, tight_mip0_bytes);
+        if (tiled_read > 0 && tiled_read <= kMaxSyncTextureBytes) {
+            primary_size = tiled_read;
         }
     }
-    if (!read_ok) {
-        raw.resize(static_cast<size_t>(tight_mip0_bytes * linear_layers));
-        read_ok = com::read_guest(cpu_va, raw.data(), raw.size());
+
+    // G68 (#663): when the texture lives in the translated CPU window, skip reading, zero-scanning
+    // and hashing altogether if none of its 64 KiB slots were marked written since the last check
+    // (either via flush_cpu_buffers's shared MarkPass or directly since then).
+    const bool in_window = os::guest_window::translated(cpu_va);
+    const bool verify_marks = in_window && os::guest_window::write_marks_verified();
+    bool unmarked = false;
+    bool needs_window_checked = false;
+    if (in_window && primary_size > 0) {
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        const auto it = tracked_textures_.find(resource_id);
+        if (it == tracked_textures_.end()) {
+            return false;
+        }
+        TrackedTexture& cur = it->second;
+        const bool same_range = cur.window_indexed && cur.window_indexed_va == cpu_va &&
+                                cur.window_indexed_size == primary_size;
+        const bool dirty_now = !same_range || cur.window_dirty || any_window_slot_marked(cpu_va, primary_size);
+        if (!same_range) {
+            texture_slot_index_.add(texture_slot_key(resource_id), cpu_va, primary_size);
+            cur.window_indexed = true;
+            cur.window_indexed_va = cpu_va;
+            cur.window_indexed_size = primary_size;
+            cur.window_checked = false;
+        }
+        if (!dirty_now && cur.window_checked) {
+            unmarked = true;
+        } else {
+            // Clear before reading so a write racing with the scan re-marks the slot for the next sync.
+            cur.window_dirty = false;
+        }
+        needs_window_checked = !cur.window_checked;
+    }
+    if (unmarked && !verify_marks) {
+        return false;
+    }
+
+    auto note_window_checked = [&]() {
+        if (!needs_window_checked) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        if (auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
+            if (it->second.window_indexed && it->second.window_indexed_va == cpu_va &&
+                it->second.window_indexed_size == primary_size) {
+                it->second.window_checked = true;
+            }
+        }
+    };
+
+    // G68 (#663): inspect contiguous guest memory in place (zero allocation / copy when unchanged),
+    // falling back to a segmented com::read_guest copy only when window slots are non-adjacent.
+    std::vector<uint8_t> raw;
+    const uint8_t* src_data = nullptr;
+    size_t src_size = 0;
+    auto try_map_or_read = [&](uint64_t size) -> bool {
+        if (size == 0) {
+            return false;
+        }
+        if (const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu_va, static_cast<size_t>(size)))) {
+            src_data = live;
+            src_size = static_cast<size_t>(size);
+            return true;
+        }
+        raw.resize(static_cast<size_t>(size));
+        if (com::read_guest(cpu_va, raw.data(), raw.size())) {
+            src_data = raw.data();
+            src_size = raw.size();
+            return true;
+        }
+        raw.clear();
+        return false;
+    };
+    bool read_ok = try_map_or_read(primary_size);
+    if (!read_ok && fallback_size != primary_size) {
+        read_ok = try_map_or_read(fallback_size);
     }
     if (!read_ok) {
         return false;
     }
 
-    const bool all_zero = all_zero_bytes(raw.data(), raw.size());
-    if (all_zero && !tt.ever_uploaded) {
+    if (!tt.ever_uploaded && all_zero_bytes(src_data, src_size)) {
+        note_window_checked();
         return false;
     }
 
-    const uint64_t hash = content_hash(raw.data(), raw.size());
+    // G72 (#663): For a single tightly-packed linear surface (whether or not tight_row_bytes is
+    // 256B-aligned, e.g., 4K Bink2 Y/U/V planes), hash its 64-row bands once in place over tight
+    // rows and derive the surface hash from them so the surface is never hashed twice or eagerly
+    // copied/zero-filled into an intermediate staging buffer.
+    const bool single_linear_direct =
+        subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_a8 && src_size == tight_mip0_bytes;
+    std::vector<uint64_t> direct_bands;
+    uint64_t hash = 0;
+    if (single_linear_direct && d == 1u && blocks_y > kUploadBandRows) {
+        direct_bands.reserve((blocks_y + kUploadBandRows - 1u) / kUploadBandRows);
+        for (uint32_t r = 0; r < blocks_y; r += kUploadBandRows) {
+            const uint32_t n = std::min(kUploadBandRows, blocks_y - r);
+            direct_bands.push_back(
+                content_hash(src_data + size_t{r} * tight_row_bytes, size_t{n} * tight_row_bytes));
+        }
+        hash = content_hash(direct_bands.data(), direct_bands.size() * sizeof(uint64_t));
+    } else {
+        hash = content_hash(src_data, src_size);
+    }
     if (tt.ever_uploaded && hash == tt.last_upload_hash) {
+        note_window_checked();
         return false;
+    }
+    if (unmarked && verify_marks && !any_window_slot_marked(cpu_va, primary_size)) {
+        os::guest_window::note_verify_miss(cpu_va);
     }
 
     // Stage every placed subresource; only those whose texels changed since their last upload
-    // are written (per-subresource dirty tracking), so one changed mip costs one upload.
+    // are written (per-subresource dirty tracking), so one changed mip costs one upload. Inside a
+    // 2D subresource only the changed bands of kUploadBandRows block rows are written (#691: a
+    // glyph atlas the title fills a few glyphs at a time re-uploaded 16 MiB per new glyph).
     struct Staged {
         Sub sub;
         uint32_t copy_w, copy_h, copy_d, row_pitch, rows;
         uint64_t hash;
-        std::vector<uint8_t> bytes;
+        std::vector<uint8_t> bytes;       // owned staging bytes (empty when borrowing src_data)
+        const uint8_t* borrowed = nullptr;  // non-null when referencing src_data directly
+        size_t borrowed_size = 0;
+        uint32_t src_row_bytes = 0;         // tight row stride when needs_row_pad is true
+        bool needs_row_pad = false;         // true: borrowed has tight rows, pad to row_pitch on emit
+        std::vector<uint64_t> bands;  // hash per band of kUploadBandRows rows (2D only; empty: none)
+        std::vector<std::pair<uint32_t, uint32_t>> runs;  // block rows [first, first + count) to write
+
+        const uint8_t* data() const { return bytes.empty() ? borrowed : bytes.data(); }
+        size_t size() const { return bytes.empty() ? borrowed_size : bytes.size(); }
     };
     std::vector<Staged> staged;
     for (const Sub& sub : subs) {
@@ -821,10 +959,11 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         const uint32_t by = (mh + l.block_height - 1u) / l.block_height;
         const uint64_t row_bytes = uint64_t{bx} * l.block_bytes;
         const uint64_t row_pitch = align_up(row_bytes, 256u);
-        Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {}};
-        st.bytes.assign(static_cast<size_t>(row_pitch * by * md), 0);
+        Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {},
+                  nullptr, 0, 0, false, {}, {}};
         bool detiled = false;
         if (is_tiled && detile_fn) {
+            st.bytes.assign(static_cast<size_t>(row_pitch * by * md), 0);
             TextureDetileRequest req{};
             req.dxgi_format = tt.dxgi_format;
             req.width = w;
@@ -839,21 +978,45 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             req.array_size = whole_surface ? layers : 1u;
             req.mip = sub.mip;
             req.array_slice = sub.slice;
-            detiled = detile_fn(req, raw.data(), raw.size(), st.bytes.data(), st.bytes.size());
+            detiled = detile_fn(req, src_data, src_size, st.bytes.data(), st.bytes.size());
             if (!detiled && (sub.mip != 0u || sub.slice != 0u)) {
                 continue;  // the hook does not place this subresource
             }
             if (!detiled && !is_tiny) {
                 return false;
             }
+            if (!detiled) {
+                st.bytes.clear();
+            }
         }
+        const uint8_t* linear_src = nullptr;
+        uint64_t linear_src_pitch = row_pitch;
         if (!detiled) {
             const uint64_t slice_off = uint64_t{sub.slice} * tight_mip0_bytes;
-            const uint32_t total_rows = by * md;
-            for (uint32_t r = 0; r < total_rows; ++r) {
-                std::memcpy(st.bytes.data() + static_cast<size_t>(r) * row_pitch,
-                            raw.data() + static_cast<size_t>(slice_off + r * row_bytes), static_cast<size_t>(row_bytes));
+            if (convert_norm16 || convert_a8) {
+                linear_src = src_data + static_cast<size_t>(slice_off);
+                linear_src_pitch = row_bytes;
+            } else if (row_pitch == row_bytes) {
+                st.borrowed = src_data + static_cast<size_t>(slice_off);
+                st.borrowed_size = static_cast<size_t>(row_pitch * by * md);
+            } else if (single_linear_direct) {
+                // Lazy row-pad: borrow tight src_data and repack only changed runs during emit.
+                st.borrowed = src_data;
+                st.borrowed_size = src_size;
+                st.src_row_bytes = static_cast<uint32_t>(row_bytes);
+                st.needs_row_pad = true;
+            } else {
+                const uint32_t total_rows = by * md;
+                st.bytes.assign(static_cast<size_t>(row_pitch * total_rows), 0);
+                for (uint32_t r = 0; r < total_rows; ++r) {
+                    std::memcpy(st.bytes.data() + static_cast<size_t>(r) * row_pitch,
+                                src_data + static_cast<size_t>(slice_off + r * row_bytes),
+                                static_cast<size_t>(row_bytes));
+                }
             }
+        } else {
+            linear_src = st.bytes.data();
+            linear_src_pitch = row_pitch;
         }
         if (convert_norm16) {
             // Widen each row of 16-bit normalized components into the texture's float format.
@@ -867,7 +1030,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             std::vector<uint8_t> converted(static_cast<size_t>(out_pitch * by * md), 0);
             for (uint32_t r = 0; r < by * md; ++r) {
                 pso::convert_norm16_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
-                                           st.bytes.data() + static_cast<size_t>(r) * row_pitch, comps,
+                                           linear_src + static_cast<size_t>(r) * linear_src_pitch, comps,
                                            converted.data() + static_cast<size_t>(r) * out_pitch);
             }
             st.bytes = std::move(converted);
@@ -878,16 +1041,32 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             std::vector<uint8_t> converted(static_cast<size_t>(out_pitch * by * md), 0);
             for (uint32_t r = 0; r < by * md; ++r) {
                 pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
-                                     st.bytes.data() + static_cast<size_t>(r) * row_pitch, static_cast<size_t>(row_bytes),
+                                     linear_src + static_cast<size_t>(r) * linear_src_pitch, static_cast<size_t>(row_bytes),
                                      converted.data() + static_cast<size_t>(r) * out_pitch);
             }
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
         }
-        st.hash = content_hash(st.bytes.data(), st.bytes.size());
+        if (single_linear_direct && !direct_bands.empty()) {
+            st.bands = std::move(direct_bands);
+            st.hash = hash;
+        } else if (single_linear_direct && !(st.copy_d == 1u && st.rows > kUploadBandRows)) {
+            st.hash = hash;
+        } else if (st.copy_d == 1u && st.rows > kUploadBandRows) {
+            const uint8_t* ptr = st.data();
+            for (uint32_t r = 0; r < st.rows; r += kUploadBandRows) {
+                const uint32_t n = std::min(kUploadBandRows, st.rows - r);
+                st.bands.push_back(content_hash(ptr + size_t{r} * st.row_pitch, size_t{n} * st.row_pitch));
+            }
+            st.hash = content_hash(st.bands.data(), st.bands.size() * sizeof(uint64_t));
+        } else {
+            st.hash = content_hash(st.data(), st.size());
+        }
         staged.push_back(std::move(st));
     }
 
+    uint32_t held_floor = 0;
+    const bool single_known_nonzero = !tt.ever_uploaded && single_linear_direct;
     {
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
         const auto it = tracked_textures_.find(resource_id);
@@ -896,18 +1075,49 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
         TrackedTexture& cur = it->second;
         if (cur.ever_uploaded && cur.last_upload_hash == hash) {
+            if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
+                cur.window_indexed_size == primary_size) {
+                cur.window_checked = true;
+            }
             return false;
         }
         cur.last_upload_hash = hash;
         cur.ever_uploaded = true;
+        if (needs_window_checked && cur.window_indexed && cur.window_indexed_va == cpu_va &&
+            cur.window_indexed_size == primary_size) {
+            cur.window_checked = true;
+        }
         cur.subresource_hashes.resize(size_t{mips} * layers, 0);
+        cur.subresource_bands.resize(size_t{mips} * layers);
         auto out = staged.begin();
         for (Staged& st : staged) {
-            uint64_t& seen = cur.subresource_hashes[st.sub.mip + size_t{st.sub.slice} * mips];
-            const bool zero = all_zero_bytes(st.bytes.data(), st.bytes.size());
-            if (seen == st.hash || (seen == 0 && zero)) {
-                continue;  // unchanged, or still zero as the GPU texture was created
+            const size_t index = st.sub.mip + size_t{st.sub.slice} * mips;
+            uint64_t& seen = cur.subresource_hashes[index];
+            if (seen == st.hash) {
+                continue;  // unchanged
             }
+            if (seen == 0 && !single_known_nonzero && all_zero_bytes(st.data(), st.size())) {
+                continue;  // still zero as the GPU texture was created
+            }
+            std::vector<uint64_t>& prev = cur.subresource_bands[index];
+            if (seen != 0 && !st.bands.empty() && prev.size() == st.bands.size()) {
+                for (uint32_t b = 0; b < st.bands.size(); ++b) {
+                    if (prev[b] == st.bands[b]) {
+                        continue;
+                    }
+                    const uint32_t first = b * kUploadBandRows;
+                    const uint32_t count = std::min(kUploadBandRows, st.rows - first);
+                    if (!st.runs.empty() && st.runs.back().first + st.runs.back().second == first) {
+                        st.runs.back().second += count;  // adjacent changed bands: one write
+                    } else {
+                        st.runs.emplace_back(first, count);
+                    }
+                }
+            }
+            if (st.runs.empty()) {
+                st.runs.emplace_back(0u, st.rows);
+            }
+            prev = st.bands;
             seen = st.hash;
             if (&*out != &st) {
                 *out = std::move(st);
@@ -915,14 +1125,68 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             ++out;
         }
         staged.erase(out, staged.end());
+        held_floor = bridge::held_mip_floor(cur.subresource_hashes, mips, layers, cur.streamable);
     }
+    // G66 partly-held mip chains: views of the texture start at its first held level.
+    bridge_->set_resident_mip_floor(resource_id, held_floor);
+
+    struct PadScratch {
+        std::unique_ptr<uint8_t[]> data;
+        size_t capacity = 0;
+
+        uint8_t* ensure(size_t bytes) {
+            if (bytes > capacity) {
+                data.reset(new uint8_t[bytes]);
+                capacity = bytes;
+            }
+            return data.get();
+        }
+
+        void release() {
+            data.reset();
+            capacity = 0;
+        }
+    };
+    constexpr size_t kMaxRetainedPadScratch = 16u << 20;
+    thread_local PadScratch pad_scratch;
+    bool used_pad_scratch = false;
 
     for (const Staged& st : staged) {
-        encoder.write_texture(resource_id, st.sub.mip, 0u, 0u, st.sub.slice, st.copy_w, st.copy_h, st.copy_d,
-                              st.row_pitch, st.rows, st.bytes.data(), static_cast<uint32_t>(st.bytes.size()));
-        count_work(Work::TextureUploads);
-        note_upload(st.bytes.size());
-        note_texture_upload();
+        for (const auto& [first, count] : st.runs) {
+            const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
+            const uint8_t* data = nullptr;
+            uint32_t len = 0;
+            if (st.needs_row_pad) {
+                const size_t total_rows = size_t{count} * st.copy_d;
+                const size_t padded_bytes = total_rows * st.row_pitch;
+                const size_t src_row_bytes = st.src_row_bytes;
+                const size_t pad_tail = st.row_pitch - src_row_bytes;
+                uint8_t* scratch = pad_scratch.ensure(padded_bytes);
+                const uint8_t* src_base = st.borrowed + size_t{first} * src_row_bytes;
+                uint8_t* dst = scratch;
+                for (size_t r = 0; r < total_rows; ++r) {
+                    std::memcpy(dst, src_base, src_row_bytes);
+                    std::memset(dst + src_row_bytes, 0, pad_tail);
+                    src_base += src_row_bytes;
+                    dst += st.row_pitch;
+                }
+                data = scratch;
+                len = static_cast<uint32_t>(padded_bytes);
+                used_pad_scratch = true;
+            } else {
+                data = st.data() + size_t{first} * st.row_pitch;
+                len = static_cast<uint32_t>(
+                    count == st.rows ? st.size() : size_t{count} * st.row_pitch);
+            }
+            encoder.write_texture(resource_id, st.sub.mip, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
+                                  st.copy_d, st.row_pitch, count, data, len);
+            count_work(Work::TextureUploads);
+            note_upload(len);
+            note_texture_upload();
+        }
+    }
+    if (used_pad_scratch && pad_scratch.capacity > kMaxRetainedPadScratch) {
+        pad_scratch.release();
     }
     return !staged.empty();
 }
@@ -969,7 +1233,38 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     std::lock_guard<std::mutex> lock(address_textures_mutex_);
     const auto it = address_textures_.find(key);
     if (it != address_textures_.end()) {
-        return it->second;
+        it->second.last_use = ++address_texture_tick_;
+        return it->second.id;
+    }
+    // O36 / G70 (#691): bounded LRU. Prefer evicting textures not used in the current frame, and
+    // incorporate StateBridgeDevice::resource_last_use_tick so textures kept hot by BindGroupCache
+    // hits are not starved. Any victim referenced in the current frame has its DestroyResource
+    // deferred until after Present so queue.submit() never sees a destroyed texture.
+    CommandEncoder drop;
+    bridge_->advance_present_frame(stats().presents, drop);
+    while (address_textures_.size() >= kMaxAddressTextures) {
+        auto oldest = address_textures_.end();
+        bool oldest_in_frame = true;
+        uint64_t oldest_use = UINT64_MAX;
+        for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
+            const bool in_frame = bridge_->is_resource_used_in_frame(i->second.id);
+            const uint64_t use = std::max(i->second.last_use, bridge_->resource_last_use_tick(i->second.id));
+            if (oldest == address_textures_.end() ||
+                (oldest_in_frame && !in_frame) ||
+                (in_frame == oldest_in_frame && use < oldest_use)) {
+                oldest = i;
+                oldest_in_frame = in_frame;
+                oldest_use = use;
+            }
+        }
+        const uint32_t victim = oldest->second.id;
+        address_textures_.erase(oldest);
+        untrack_guest_texture(victim);
+        bridge_->unregister_resource(victim);
+        bridge_->destroy_or_defer_resource(victim, drop);
+    }
+    if (drop.size() != 0) {
+        submit(drop);
     }
 
     const uint32_t id = allocate_id();
@@ -1042,12 +1337,15 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         }
     }
 
-    address_textures_.emplace(key, id);
+    address_textures_.emplace(key, AddressTextureEntry{id, ++address_texture_tick_});
     return id;
 }
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     std::lock_guard<std::mutex> flush_lock(flush_mutex_);
+    // G70 (#691): emit deferred DestroyResource packets from the previous frame once Present has
+    // advanced (strictly after that frame's Present and before any draw in the new frame).
+    bridge_->advance_present_frame(stats().presents, encoder);
     // O36: one pass over the translated window's write marks for the buffers and the relocated
     // ranges below. A relocated range in the window whose slots are unmarked has not been written
     // since its bytes were last read (the same protocol as the buffers: marks taken before the
@@ -1058,13 +1356,13 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         marked.clear();
         return mark_pass_.take(cpu, static_cast<size_t>(size), &marked) && marked.empty();
     };
+    // O36: take every dirty window slot once, then visit only the buffers and tracked textures
+    // overlapping one (sharing this submission's MarkPass so a shared 64 KiB slot notifies both).
+    std::vector<uint64_t> dirty;
+    const bool scanned = mark_pass_.take_dirty(&dirty);
     {
         std::lock_guard<std::mutex> lock(tracked_mutex_);
-        // O36: take every dirty window slot once, then visit only the buffers overlapping one (plus
-        // the buffers not indexed yet: non-window, or whose first full comparison is still due).
         // Verification mode compares unmarked pages too, so it visits everything.
-        std::vector<uint64_t> dirty;
-        const bool scanned = mark_pass_.take_dirty(&dirty);
         if (!scanned || os::guest_window::write_marks_verified()) {
             slot_index_.clear();
             for (Resource* r : tracked_) {
@@ -1094,6 +1392,31 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
         }
     }
+    // G68 (#663): propagate the same submission MarkPass's dirty slots to tracked window textures
+    // so textures sharing a 64 KiB slot with buffers (or written during a submission that did not
+    // bind them) never lose write marks.
+    {
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        if (!scanned) {
+            if (texture_slot_index_.size() != 0) {
+                texture_slot_index_.clear();
+                for (auto& [id, tex] : tracked_textures_) {
+                    tex.window_indexed = false;
+                    tex.window_checked = false;
+                    tex.window_dirty = true;
+                }
+            }
+        } else if (!dirty.empty() && texture_slot_index_.size() != 0) {
+            std::vector<const void*> dirty_textures;
+            texture_slot_index_.collect(dirty, &dirty_textures);
+            for (const void* key : dirty_textures) {
+                const uint32_t tex_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(key));
+                if (auto it = tracked_textures_.find(tex_id); it != tracked_textures_.end()) {
+                    it->second.window_dirty = true;
+                }
+            }
+        }
+    }
     // Relocated uniform ranges: refresh the aligned copies whose guest bytes changed.
     {
         std::lock_guard<std::mutex> lock(relocation_mutex_);
@@ -1103,8 +1426,19 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, r.size) && !r.shadow.empty()) {
                 continue;
             }
+            // R40: compare the live bytes in place where they are mapped in one piece (no copy
+            // through the arena's checked read for an unchanged range, the usual case).
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
+            if (live != nullptr && r.shadow.size() == r.size && std::memcmp(live, r.shadow.data(), r.shadow.size()) == 0) {
+                continue;
+            }
             bytes.resize(static_cast<size_t>(r.size));  // only the view's bytes: the home past them stays zero
-            if (!com::read_guest(cpu, bytes.data(), bytes.size()) || bytes == r.shadow) {
+            if (live != nullptr) {
+                std::memcpy(bytes.data(), live, bytes.size());
+            } else if (!com::read_guest(cpu, bytes.data(), bytes.size())) {
+                continue;
+            }
+            if (bytes == r.shadow) {
                 continue;
             }
             encoder.write_buffer(r.buffer_id, static_cast<uint32_t>(r.offset), bytes.data(), static_cast<uint32_t>(r.size));
@@ -1122,13 +1456,25 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, r.size) && r.ever_uploaded) {
                 continue;
             }
-            bytes.resize(static_cast<size_t>(r.size));
-            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
-                continue;
-            }
-            const uint64_t hash = content_hash(bytes.data(), bytes.size());
-            if (r.ever_uploaded && hash == r.last_hash) {
-                continue;
+            // R40: hash the live bytes in place where they are mapped in one piece and copy them
+            // only when they changed (most ranges are unchanged at most submissions).
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(r.size)));
+            uint64_t hash = 0;
+            if (live != nullptr) {
+                hash = content_hash(live, static_cast<size_t>(r.size));
+                if (r.ever_uploaded && hash == r.last_hash) {
+                    continue;
+                }
+                bytes.assign(live, live + r.size);
+            } else {
+                bytes.resize(static_cast<size_t>(r.size));
+                if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
+                    continue;
+                }
+                hash = content_hash(bytes.data(), bytes.size());
+                if (r.ever_uploaded && hash == r.last_hash) {
+                    continue;
+                }
             }
             bytes.resize(static_cast<size_t>(write_len), 0);
             for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
@@ -1151,13 +1497,24 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (unwritten(cpu, key.second)) {
                 continue;  // (uploaded when it was created)
             }
-            bytes.assign(static_cast<size_t>(key.second), 0);
-            if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
-                continue;
-            }
-            const uint64_t hash = content_hash(bytes.data(), bytes.size());
-            if (hash == r.last_hash) {
-                continue;
+            // R40: as above, hash in place and copy only a changed range.
+            const auto* live = static_cast<const uint8_t*>(com::guest_to_host(cpu, static_cast<size_t>(key.second)));
+            uint64_t hash = 0;
+            if (live != nullptr) {
+                hash = content_hash(live, static_cast<size_t>(key.second));
+                if (hash == r.last_hash) {
+                    continue;
+                }
+                bytes.assign(live, live + key.second);
+            } else {
+                bytes.assign(static_cast<size_t>(key.second), 0);
+                if (!read_guest_best_effort(cpu, bytes.data(), bytes.size())) {
+                    continue;
+                }
+                hash = content_hash(bytes.data(), bytes.size());
+                if (hash == r.last_hash) {
+                    continue;
+                }
             }
             bytes.resize(static_cast<size_t>(r.buffer_bytes), 0);
             for (uint64_t off = 0; off < r.buffer_bytes; off += kMaxWriteChunk) {
@@ -1186,26 +1543,50 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
     std::lock_guard<std::mutex> lock(relocation_mutex_);
     auto it = relocations_.find({va, size, need});
     if (it == relocations_.end()) {
-        // A fresh home: the chunk is zero-initialised and homes are never reused, so the bytes
-        // past `size` stay zero (zero-extension for WebGPU's minimum binding size, not data).
-        if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
-            relocation_buffer_ = allocate_id();
-            CommandEncoder enc;
-            enc.create_buffer(relocation_buffer_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, kChunk);
-            submit(enc);
-            relocation_used_ = 0;
+        constexpr size_t kMaxEntries = 8192;  // O36: per-draw VAs (ring-allocated constants) must not grow this forever
+        if (relocations_.size() >= kMaxEntries) {
+            auto lru = relocations_.begin();
+            for (auto i = relocations_.begin(); i != relocations_.end(); ++i) {
+                if (i->second.last_used_seq < lru->second.last_used_seq) lru = i;
+            }
+            relocation_free_[{lru->second.size, std::get<2>(lru->first)}].emplace_back(lru->second.buffer_id,
+                                                                                         lru->second.offset);
+            relocations_.erase(lru);
+            relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
         }
         RelocatedUniform r;
         r.va = va;
         r.size = size;
-        r.buffer_id = relocation_buffer_;
-        r.offset = relocation_used_;
-        relocation_used_ += need;
+        auto& free_homes = relocation_free_[{size, need}];
+        if (!free_homes.empty()) {
+            r.buffer_id = free_homes.back().first;
+            r.offset = free_homes.back().second;
+            free_homes.pop_back();
+        } else {
+            // A fresh home: the chunk is zero-initialised, so the bytes past `size` stay zero
+            // (zero-extension for WebGPU's minimum binding size, not data).
+            if (relocation_buffer_ == 0 || relocation_used_ + need > kChunk) {
+                relocation_buffer_ = allocate_id();
+                CommandEncoder enc;
+                enc.create_buffer(relocation_buffer_, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst, kChunk);
+                submit(enc);
+                relocation_used_ = 0;
+            }
+            r.buffer_id = relocation_buffer_;
+            r.offset = relocation_used_;
+            relocation_used_ += need;
+        }
         it = relocations_.emplace(std::make_tuple(va, size, need), std::move(r)).first;
     }
+    it->second.last_used_seq = ++relocation_seq_;
     *buffer_id = it->second.buffer_id;
     *offset = it->second.offset;
     return true;
+}
+
+size_t Device::address_texture_count() const {
+    std::lock_guard<std::mutex> lock(address_textures_mutex_);
+    return address_textures_.size();
 }
 
 size_t Device::relocated_uniform_count() const {
@@ -1278,13 +1659,15 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             if (lru_it->second.dedicated) {
                 const uint32_t old_id = lru_it->second.buffer_id;
                 bridge_->unregister_resource(old_id);
-                enc.destroy_resource(old_id);
+                bridge_->advance_present_frame(stats().presents, enc);
+                bridge_->destroy_or_defer_resource(old_id, enc);
                 storage_relocation_buffers_.erase(
                     std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
                     storage_relocation_buffers_.end());
             }
             storage_relocations_.erase(lru_it);
         }
+        relocation_evictions_.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (target_buf == 0) {
@@ -1383,17 +1766,28 @@ bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id,
     const uint64_t buffer_bytes = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(buffer_bytes), 0);
 
-    // Bounded like the storage relocations: the least recently bound mirror is destroyed.
+    // Bounded like the storage relocations: the least recently bound mirror is destroyed
+    // (preferring entries not used in the current frame, and deferring DestroyResource past Present
+    // if a current-frame buffer had to be evicted).
     CommandEncoder enc;
+    bridge_->advance_present_frame(stats().presents, enc);
     while (!ia_relocations_.empty() &&
            (ia_relocations_.size() >= kMaxEntries || ia_relocation_bytes_ + buffer_bytes > kMaxTotalBytes)) {
-        auto lru = ia_relocations_.begin();
+        auto lru = ia_relocations_.end();
+        bool lru_in_frame = true;
+        uint64_t lru_use = UINT64_MAX;
         for (auto it = ia_relocations_.begin(); it != ia_relocations_.end(); ++it) {
-            if (it->second.last_used_seq < lru->second.last_used_seq) {
+            const bool in_frame = bridge_->is_resource_used_in_frame(it->second.buffer_id);
+            const uint64_t use = std::max(it->second.last_used_seq, bridge_->resource_last_use_tick(it->second.buffer_id));
+            if (lru == ia_relocations_.end() ||
+                (lru_in_frame && !in_frame) ||
+                (in_frame == lru_in_frame && use < lru_use)) {
                 lru = it;
+                lru_in_frame = in_frame;
+                lru_use = use;
             }
         }
-        enc.destroy_resource(lru->second.buffer_id);
+        bridge_->destroy_or_defer_resource(lru->second.buffer_id, enc);
         ia_relocation_bytes_ -= lru->second.buffer_bytes;
         ia_relocations_.erase(lru);
     }
@@ -1526,8 +1920,11 @@ Resource::~Resource() {
         // A GPU object whose create packet was never written (never used) needs no DestroyResource.
         if ((is_buffer() || gpu_texture_) && !device_->release_deferred(id_)) {
             CommandEncoder enc;
-            enc.destroy_resource(id_);
-            device_->submit(enc);
+            device_->state_bridge().advance_present_frame(device_->stats().presents, enc);
+            device_->state_bridge().destroy_or_defer_resource(id_, enc);
+            if (enc.size() != 0) {
+                device_->submit(enc);
+            }
         }
     }
     if (owned_guest_memory_ != 0) {
@@ -1741,6 +2138,7 @@ bool Resource::initialize() {
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
                 TrackedTexture tt{};
                 tt.resource_id = id_;
+                tt.streamable = placement_.reserved;
                 tt.gpu_va = gpu_va_;
                 tt.dxgi_format = desc_.Format;
                 tt.width = p.width;
@@ -1821,6 +2219,23 @@ void register_view_texture_probe(uint64_t cpu_address, uint64_t size) {
     }
     TextureProbe& p = texture_probe();
     std::lock_guard<std::mutex> lock(p.mutex);
+    // O36: one probe per address (an evicted-and-recreated texture reuses it), and the table is capped.
+    for (ViewProbe& existing : p.views) {
+        if (existing.cpu == cpu_address) {
+            return;
+        }
+    }
+    constexpr size_t kMaxViewProbes = 4096;
+    if (p.views.size() >= kMaxViewProbes) {
+        const size_t drop = kMaxViewProbes / 4;
+        for (size_t i = 0; i < drop; ++i) {
+            if (p.views[i].seen_data && p.views_with_data > 0) {
+                --p.views_with_data;
+            }
+        }
+        p.views.erase(p.views.begin(), p.views.begin() + static_cast<std::ptrdiff_t>(drop));
+        p.view_cursor = 0;
+    }
     p.views.push_back(ViewProbe{cpu_address, std::min<uint64_t>(64u << 10, std::max<uint64_t>(1, size)), false});
 }
 
@@ -2575,9 +2990,14 @@ PipelineState::PipelineState(com::Ref<Device> device, com::Ref<RootSignature> ro
 }
 
 PipelineState::~PipelineState() {
-    if (graphics_) {
+    if (graphics_ || mesh_) {
         CommandEncoder enc;
-        device_->state_bridge().release_pipeline_state(std::move(graphics_), enc);
+        if (graphics_) {
+            device_->state_bridge().release_pipeline_state(std::move(graphics_), enc);
+        }
+        if (mesh_) {
+            device_->state_bridge().release_mesh_pipeline_state(std::move(mesh_), enc);
+        }
         if (enc.size() != 0) {
             device_->submit(enc);
         }
@@ -2652,13 +3072,46 @@ bool dxil_hash_digest(const uint8_t* p, size_t n, Device::DxilDigest* out) {
     return false;
 }
 
+// The console-native program of `want` the container carries in its DXIL part
+// (xbox_embedded_native.h), as a native stage record; written to the pipeline dump like a slot-57
+// stage (metadata: the unpacked FSSM blob). Stays empty without one.
+void embedded_native_stage(Device& dev, const std::vector<uint8_t>& bytes, xbox::EmbeddedStage want,
+                           Device::NativeStageRecord* out) {
+    *out = Device::NativeStageRecord{};
+    xbox::EmbeddedNative native;
+    std::string error;
+    if (!xbox::extract_embedded_native(bytes.data(), bytes.size(), &native, &error)) {
+        return;
+    }
+    const xbox::EmbeddedProgram* p = xbox::find_embedded(native, want);
+    if (p == nullptr) {
+        return;
+    }
+    out->code_identity = shader_identity(p->code.data(), p->code.size());
+    out->identity = native_stage_identity(p->code.data(), p->code.size(), native.fssm.data(), native.fssm.size());
+    out->code_bytes = static_cast<uint32_t>(p->code.size());
+    out->metadata_bytes = static_cast<uint32_t>(native.fssm.size());
+    if (PipelineDump* dump = dev.pipeline_dump()) {
+        const auto kind = want == xbox::EmbeddedStage::Ps   ? PipelineDump::NativeStageKind::Pixel
+                          : want == xbox::EmbeddedStage::Cs ? PipelineDump::NativeStageKind::Compute
+                                                            : PipelineDump::NativeStageKind::Vertex;
+        dump->native_stage(out->code_identity, out->identity, kind, /*layout_b=*/false, p->code.data(), p->code.size(),
+                           native.fssm.data(), native.fssm.size());
+    }
+}
+
 // Reads a shader's bytecode and returns its identity (0 = no shader). False on unreadable input.
 // `digest` (optional) receives the container's HASH digest; it stays all-zero without one.
+// `embedded` (optional) receives the container's own native stage of `want` (embedded_native_stage).
 bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage, uint64_t* identity,
-                 Device::DxilDigest* digest = nullptr) {
+                 Device::DxilDigest* digest = nullptr, Device::NativeStageRecord* embedded = nullptr,
+                 xbox::EmbeddedStage want = xbox::EmbeddedStage::Vs) {
     *identity = 0;
     if (digest != nullptr) {
         digest->fill(0);
+    }
+    if (embedded != nullptr) {
+        *embedded = Device::NativeStageRecord{};
     }
     if (code.pShaderBytecode == 0 || code.BytecodeLength == 0) {
         return true;
@@ -2682,6 +3135,9 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
     if (PipelineDump* dump = dev.pipeline_dump()) {
         dump->dxil(*identity, has_digest ? &d : nullptr, dxil_shader_kind(bytes.data(), bytes.size()), bytes.data(),
                    bytes.size());
+    }
+    if (embedded != nullptr) {
+        embedded_native_stage(dev, bytes, want, embedded);
     }
     return true;
 }
@@ -2784,6 +3240,7 @@ void PipelineState::initialize_guest_payload() {
 }
 
 HResult Device::CreateGraphicsPipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
+    os::win32::HostStallScope stall;  // pipeline/shader builds can block the guest thread
     GuestGraphicsPipelineStateDesc g{};
     if (desc_va == 0 || !com::read_guest(desc_va, g)) {
         note_bad_argument("CreateGraphicsPipelineState: unreadable descriptor");
@@ -2800,7 +3257,9 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
         return kEInvalidArg;
     }
     pso::D3D12GraphicsPsoDesc& d = src.desc;
-    if (!read_shader(*this, g.VS, "VS", &d.vs, &src.vs_digest) || !read_shader(*this, g.PS, "PS", &d.ps, &src.ps_digest) ||
+    NativeStageRecord embedded_vs, embedded_ps;
+    if (!read_shader(*this, g.VS, "VS", &d.vs, &src.vs_digest, &embedded_vs, xbox::EmbeddedStage::Vs) ||
+        !read_shader(*this, g.PS, "PS", &d.ps, &src.ps_digest, &embedded_ps, xbox::EmbeddedStage::Ps) ||
         !read_shader(*this, g.DS, "DS", &d.ds) || !read_shader(*this, g.HS, "HS", &d.hs) ||
         !read_shader(*this, g.GS, "GS", &d.gs)) {
         return kEInvalidArg;
@@ -2832,6 +3291,13 @@ HResult Device::create_graphics_pso(const GuestGraphicsPipelineStateDesc& g, con
             }
             count(find_native_stage(*digest, record) ? xbox::Counter::DxilStagesJoined
                                                      : xbox::Counter::DxilStagesNotJoined);
+        }
+    }
+    // A stage no slot-57 stage joins runs the native code its own container carries (G66).
+    for (auto [embedded, record] : {std::pair{&embedded_vs, &src.native_vs}, std::pair{&embedded_ps, &src.native_ps}}) {
+        if (record->identity == 0 && embedded->identity != 0) {
+            *record = *embedded;
+            count(xbox::Counter::DxilStagesEmbeddedNative);
         }
     }
     d.stream_output_enabled = g.StreamOutput.NumEntries > 0;
@@ -3035,19 +3501,22 @@ bool Device::resolve_with_pack(GraphicsPsoSource& src, uint64_t* vs_key, uint64_
         }
         std::vector<pso::VertexInputFetch> fetches;
         if (ok) {
+            JoinStats join_stats;
             ok = join_vertex_inputs(*vs_refl, src.input.data(), static_cast<uint32_t>(src.input.size()), &fetches,
-                                    &report);
+                                    &report, &join_stats);
             std::vector<ReflectedStageRef> stages{{GpuShaderStageBits::Vertex, vs_refl}};
             if (ps_refl != nullptr) {
                 stages.push_back({GpuShaderStageBits::Fragment, ps_refl});
             }
-            JoinStats join_stats;
             ok = join_pipeline_layout(src.root_signature->signature().desc(), /*compute=*/false, stages,
                                       &reflected_layout, &report, &join_stats,
                                       JoinOptions{options_.bridge.binding_arrays}) && ok;
             count_work(Work::ReflectionLaneIndexedUnbound, join_stats.lane_indexed_bindings);
             if (ok) {
                 count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
+                count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
+                count_work(Work::ReflectionVertexInputsDefaulted, join_stats.vertex_inputs_defaulted);
+                count_work(Work::ReflectionUnresolvedBindings, join_stats.unresolved_bindings);
             }
         }
         if (!ok) {
@@ -3118,6 +3587,134 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
                                              rs ? &rs->signature().desc() : nullptr);
     }
     state->source_ = std::move(src);
+    return hand_out(std::move(state), riid, out);
+}
+
+HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
+                                bool amplification, const Guid& riid, OutPtr out) {
+    const auto placeholder = [&](const char* reason) {
+        count(xbox::Counter::PlaceholderPipelineStates);
+        return create_placeholder_pso(reason, riid, out);
+    };
+    if (amplification) {
+        return placeholder("amplification shaders");
+    }
+    const ShaderPackIndex* pack = options_.shader_pack.get();
+    const StageReflectionIndex* refl = options_.stage_reflection.get();
+    com::Ref<RootSignature> rs = root_signature_ref(g.pRootSignature);
+    if (pack == nullptr || refl == nullptr || !rs || g.NumRenderTargets > 8) {
+        return placeholder("mesh shaders (no shader pack, reflection or root signature)");
+    }
+    uint64_t ms_id = 0;
+    uint64_t ps_id = 0;
+    DxilDigest ms_digest{};
+    DxilDigest ps_digest{};
+    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest) || !read_shader(*this, g.PS, "PS", &ps_id, &ps_digest) ||
+        ms_id == 0) {
+        return placeholder("mesh shaders (unreadable stage)");
+    }
+    // Pack keys, as for the other stages: the joined console-native stage's code identity first,
+    // then the DXIL identity.
+    static const DxilDigest kZero{};
+    const auto find_key = [&](const DxilDigest& digest, uint64_t dxil, uint64_t salt, PackStage stage) -> uint64_t {
+        NativeStageRecord native{};
+        if (native_index_size() != 0 && digest != kZero) {
+            find_native_stage(digest, &native);
+        }
+        for (uint64_t k : {native.identity != 0 ? native.code_identity : uint64_t{0}, dxil}) {
+            auto it = k != 0 ? pack->find(k ^ salt) : pack->end();
+            if (it != pack->end() && it->second == stage) {
+                return k ^ salt;
+            }
+        }
+        return 0;
+    };
+    const uint64_t ms_key = find_key(ms_digest, ms_id, bridge::kMeshComputeKeySalt, PackStage::Compute);
+    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment) : 0;
+    const auto ms_refl = ms_key != 0 ? refl->find(ms_key) : refl->end();
+    if (ms_key == 0 || ms_refl == refl->end() || !ms_refl->second.has_mesh_output || (ps_id != 0 && ps_key == 0)) {
+        return placeholder("mesh shaders (no mesh compute translation in the pack)");
+    }
+    const bridge::MeshOutputLayout output = ms_refl->second.mesh_output;
+    // Layouts: the mesh stage's from its reflection (graphics user data, compute visibility); the
+    // draw's from the pixel stage's reflection, or the root-signature convention without one.
+    std::string report;
+    bridge::PipelineLayoutDesc stage_layout;
+    bool ok = join_pipeline_layout(rs->signature().desc(), /*compute=*/false,
+                                   {{GpuShaderStageBits::Compute, &ms_refl->second}}, &stage_layout, &report, nullptr,
+                                   JoinOptions{options_.bridge.binding_arrays});
+    bridge::PipelineLayoutDesc draw_layout;
+    const auto ps_refl = ps_key != 0 ? refl->find(ps_key) : refl->end();
+    if (ok && ps_refl != refl->end()) {
+        ok = join_pipeline_layout(rs->signature().desc(), /*compute=*/false,
+                                  {{GpuShaderStageBits::Fragment, &ps_refl->second}}, &draw_layout, &report, nullptr,
+                                  JoinOptions{options_.bridge.binding_arrays});
+    } else if (ok) {
+        draw_layout = layout_from_root_signature(rs->signature().desc());
+    }
+    if (!ok || stage_layout.groups.size() > bridge::kMeshOutputGroup ||
+        draw_layout.groups.size() > bridge::kMeshOutputGroup) {
+        char head[96];
+        std::snprintf(head, sizeof(head), "d3d12_xs: mesh pipeline layout join failed (mesh 0x%016" PRIx64 "):\n", ms_key);
+        os::log(std::string(head) + report);
+        return placeholder("mesh shaders (pipeline layout)");
+    }
+    const uint64_t stage_identity = bridge::mesh_compute_pack_key(ms_id);
+    const uint64_t draw_vs = bridge::mesh_draw_vertex_identity(output);
+    {
+        std::lock_guard<std::mutex> lock(pack_mutex_);
+        CommandEncoder enc;
+        const auto module_for = [&](uint64_t key, GpuShaderStage stage, const std::string& code) {
+            auto it = pack_modules_.find(key);
+            if (it != pack_modules_.end()) {
+                return it->second;
+            }
+            const uint32_t id = allocate_id();
+            enc.create_shader_module(id, stage, code);
+            pack_modules_.emplace(key, id);
+            return id;
+        };
+        register_shader_module(stage_identity, module_for(ms_key, GpuShaderStage::Compute, pack_key_code(ms_key)));
+        register_shader_module(draw_vs, module_for(draw_vs, GpuShaderStage::Vertex, bridge::mesh_draw_vertex_wgsl(output)));
+        if (ps_id != 0) {
+            register_shader_module(ps_id, module_for(ps_key, GpuShaderStage::Fragment, pack_key_code(ps_key)));
+        }
+        if (enc.size() != 0) {
+            submit(enc);
+        }
+        if (pack_layouts_.insert({stage_identity, 0}).second) {
+            bridge_->register_pipeline_layout(stage_identity, 0, std::move(stage_layout));
+        }
+        if (pack_layouts_.insert({draw_vs, ps_id}).second) {
+            bridge_->register_pipeline_layout(draw_vs, ps_id, std::move(draw_layout));
+        }
+    }
+    pso::D3D12GraphicsPsoDesc d{};
+    d.vs = draw_vs;
+    d.ps = ps_id;
+    d.root_signature_id = static_cast<uint32_t>(rs->signature().hash());
+    convert_blend_desc(g.BlendState, &d.BlendState);
+    d.SampleMask = g.SampleMask;
+    convert_rasterizer_desc(g.RasterizerState, &d.RasterizerState);
+    convert_depth_stencil_desc(g.DepthStencilState, &d.DepthStencilState);
+    d.PrimitiveTopologyType = pso::D3D12PrimitiveTopologyType::Triangle;
+    d.NumRenderTargets = g.NumRenderTargets;
+    for (int i = 0; i < 8; ++i) {
+        d.RTVFormats[i] = static_cast<pso::DxgiFormat>(g.RTVFormats[i]);
+    }
+    d.DSVFormat = static_cast<pso::DxgiFormat>(g.DSVFormat);
+    d.SampleDesc.Count = g.SampleCount;
+    d.SampleDesc.Quality = g.SampleQuality;
+    auto state = com::create_object<PipelineState>(com::implements(kID3D12PipelineState), device_ref(this), rs);
+    if (!state) {
+        return kEOutOfMemory;
+    }
+    state->initialize_guest_payload();
+    state->mesh_ = bridge_->create_mesh_pipeline_state(d, stage_identity, output, &rs->signature());
+    state->identities_ = {ms_id, ps_id};
+    state->resolved_ = (state->mesh_->diagnostics() &
+                        (bridge::BridgeDiag::UnknownShaderModule | bridge::BridgeDiag::MissingPipelineLayout)) == 0;
+    count(xbox::Counter::MeshPipelineStates);
     return hand_out(std::move(state), riid, out);
 }
 
@@ -3230,6 +3827,7 @@ HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Gu
 }
 
 HResult Device::CreateComputePipelineState(uint64_t desc_va, const Guid& riid, OutPtr out) {
+    os::win32::HostStallScope stall;  // pipeline/shader builds can block the guest thread
     GuestComputePipelineStateDesc g{};
     if (desc_va == 0 || !com::read_guest(desc_va, g)) {
         note_bad_argument("CreateComputePipelineState: unreadable descriptor");
@@ -3246,7 +3844,8 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     }
     pso::D3D12ComputePsoDesc d{};
     DxilDigest cs_digest{};
-    if (!read_shader(*this, g.CS, "CS", &d.cs, &cs_digest)) {
+    NativeStageRecord embedded_cs;
+    if (!read_shader(*this, g.CS, "CS", &d.cs, &cs_digest, &embedded_cs, xbox::EmbeddedStage::Cs)) {
         return kEInvalidArg;
     }
     if (d.cs == 0) {
@@ -3258,6 +3857,10 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
     if (native_index_size() != 0 && cs_digest != kZero) {
         count(find_native_stage(cs_digest, &native_cs) ? xbox::Counter::DxilStagesJoined
                                                        : xbox::Counter::DxilStagesNotJoined);
+    }
+    if (native_cs.identity == 0 && embedded_cs.identity != 0) {
+        native_cs = embedded_cs;
+        count(xbox::Counter::DxilStagesEmbeddedNative);
     }
     if (const ShaderPackIndex* pack = options_.shader_pack.get(); pack != nullptr) {
         uint64_t pack_key = 0;
@@ -3284,6 +3887,8 @@ HResult Device::create_compute_pso(const GuestComputePipelineStateDesc& g, const
                 if (ok) {
                     reflected = true;
                     count_work(Work::ReflectionTableSlotsOutsideRs, join_stats.table_slots_outside_rs);
+                    count_work(Work::ReflectionRootDescriptorTables, join_stats.root_descriptor_tables);
+                    count_work(Work::ReflectionUnresolvedBindings, join_stats.unresolved_bindings);
                 } else {
                     const uint64_t rs_hash = rs ? rs->signature().hash() : 0;
                     std::lock_guard<std::mutex> lock(pack_mutex_);

@@ -10,6 +10,10 @@ const pipelineCacheMod = require('../web/workers/pipeline_cache.js');
 const shaderFallbackMod = require('../web/workers/shader_fallback_router.js');
 const {
   DEFAULT_MAX_FAST_LOOKUP_ENTRIES,
+  DEFAULT_COMPILE_BUDGET_MS,
+  DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
+  PIPELINE_PRIORITY_TIERS,
+  PIPELINE_PRIORITY_RANKS,
   DEFAULT_MAX_ERROR_HISTORY,
   DEFAULT_MAX_QUARANTINED_KEYS,
   DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
@@ -25,6 +29,7 @@ const {
   hashDescriptorKey,
   registerShaderModuleId,
   normalizeFallbackProfile,
+  normalizePipelinePriority,
   normalizeDefaultSamplerKind,
   buildDefaultSamplerDescriptor,
   isSrgbColorFormat,
@@ -375,6 +380,7 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     samplerMisses: 0,
     inFlightDedupes: 0,
     evictions: 0,
+    reclaimedCount: 0,
     renderCount: 2,
     computeCount: 1,
     layoutCount: 1,
@@ -382,6 +388,19 @@ test('sync render, compute, and bindGroupLayout cache hits, misses, and telemetr
     compileCount: 4,
     totalCompileMs: 1.5 + 4.0 + 2.5 + 4.0,
     maxCompileMs: 4.0,
+    p50Ms: 2.5,
+    p95Ms: 4.0,
+    maxMs: 4.0,
+    slowCompilesOverBudget: 0,
+    compileLatency: {
+      p50Ms: 2.5,
+      p95Ms: 4.0,
+      maxMs: 4.0,
+      slowCompilesOverBudget: 0,
+      budgetMs: DEFAULT_COMPILE_BUDGET_MS,
+      sampleCount: 4,
+      windowSize: DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
+    },
     quarantineHits: 0,
     quarantinedKeys: 0,
     fallbackNormalizedCount: 0,
@@ -849,6 +868,7 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     samplerMisses: 0,
     inFlightDedupes: 0,
     evictions: 0,
+    reclaimedCount: 0,
     renderCount: 0,
     computeCount: 0,
     layoutCount: 0,
@@ -856,6 +876,19 @@ test('evictOlderThan and clear manage lifecycle and isolate stale in-flight comp
     compileCount: 0,
     totalCompileMs: 0,
     maxCompileMs: 0,
+    p50Ms: 0,
+    p95Ms: 0,
+    maxMs: 0,
+    slowCompilesOverBudget: 0,
+    compileLatency: {
+      p50Ms: 0,
+      p95Ms: 0,
+      maxMs: 0,
+      slowCompilesOverBudget: 0,
+      budgetMs: DEFAULT_COMPILE_BUDGET_MS,
+      sampleCount: 0,
+      windowSize: DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
+    },
     quarantineHits: 0,
     quarantinedKeys: 0,
     fallbackNormalizedCount: 0,
@@ -3864,6 +3897,464 @@ test('W281 guards against in-place descriptor mutation, shader re-registration, 
   );
   assert.equal(
     typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.destroy,
+    'function'
+  );
+});
+
+// --- W334: Compile-Latency Rolling Window, Priority Hints & Bounded LRU Reclaim Tests ---
+
+test('W334 tracks rolling compile-latency percentiles via reusable Float64Array scratch buffer and slowCompilesOverBudget', async () => {
+  assert.equal(DEFAULT_COMPILE_BUDGET_MS, 33.333);
+  assert.equal(DEFAULT_COMPILE_LATENCY_WINDOW_SIZE, 128);
+
+  let clock = 0;
+  const durations = [45.0, 10.0, 20.0, 33.333, 33.334, 5.0, 15.0];
+  let idx = 0;
+
+  const device = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      const dt = durations[idx++] ?? 1.0;
+      clock += dt;
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    computeAsyncImpl: async (desc, id) => {
+      const dt = durations[idx++] ?? 1.0;
+      clock += dt;
+      return { kind: 'GPUComputePipeline', id, async: true, desc };
+    },
+  });
+
+  // Small rolling window (size = 5) with default 33.333ms 30 FPS budget
+  const cache = new WebGpuPipelineCache({
+    device,
+    now: () => clock,
+    compileLatencyWindowSize: 5,
+  });
+
+  const scratchRef = cache._compileLatencyScratch;
+  const windowRef = cache._compileLatencyWindow;
+  assert.ok(scratchRef instanceof Float64Array);
+  assert.ok(windowRef instanceof Float64Array);
+  assert.equal(scratchRef.length, 5);
+  assert.equal(windowRef.length, 5);
+
+  // Empty state returns zeros
+  const emptyLatency = cache.getCompileLatencyStats();
+  assert.deepEqual(emptyLatency, {
+    p50Ms: 0,
+    p95Ms: 0,
+    maxMs: 0,
+    slowCompilesOverBudget: 0,
+    budgetMs: 33.333,
+    sampleCount: 0,
+    windowSize: 5,
+  });
+
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000090001', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000090002', code: 'cs' });
+
+  // First 5 compiles: [45.0, 10.0, 20.0, 33.333, 33.334]
+  // Sorted: [10.0, 20.0, 33.333, 33.334, 45.0]
+  // p50 (ceil(0.5*5)-1 = 2) = 33.333, p95 (ceil(0.95*5)-1 = 4) = 45.0, max = 45.0
+  // Over 33.333 budget: 45.0 and 33.334 (exact 33.333 is within budget) -> 2
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_0' } });
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_1' } });
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_2' } });
+  await cache.getOrCreateComputePipelineAsync({
+    layout: 'auto',
+    compute: { module: cs, entryPoint: 'cs_3' },
+  });
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_4' } });
+
+  let stats = cache.getStats();
+  assert.equal(stats.p50Ms, 33.333);
+  assert.equal(stats.p95Ms, 45.0);
+  assert.equal(stats.maxMs, 45.0);
+  assert.equal(stats.maxCompileMs, 45.0);
+  assert.equal(stats.slowCompilesOverBudget, 2);
+  assert.deepEqual(stats.compileLatency, {
+    p50Ms: 33.333,
+    p95Ms: 45.0,
+    maxMs: 45.0,
+    slowCompilesOverBudget: 2,
+    budgetMs: 33.333,
+    sampleCount: 5,
+    windowSize: 5,
+  });
+
+  // 2 more fast compiles roll out 45.0 and 10.0 -> rolling window holds [5.0, 15.0, 20.0, 33.333, 33.334]
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_5' } });
+  cache.getOrCreateRenderPipeline({ layout: 'auto', vertex: { module: vs, entryPoint: 'vs_6' } });
+
+  stats = cache.getStats();
+  assert.equal(stats.p50Ms, 20.0);
+  assert.equal(stats.p95Ms, 33.334);
+  assert.equal(stats.maxMs, 33.334);
+  assert.equal(stats.maxCompileMs, 45.0); // lifetime max preserved
+  assert.equal(stats.slowCompilesOverBudget, 2);
+  assert.equal(stats.compileLatency.sampleCount, 5);
+
+  // Verify pre-allocated Float64Array buffers are reused without reallocation
+  assert.equal(cache._compileLatencyScratch, scratchRef);
+  assert.equal(cache._compileLatencyWindow, windowRef);
+
+  // resetStats() resets rolling window & slow count while reusing the exact same typed arrays
+  cache.resetStats();
+  assert.equal(cache._compileLatencyScratch, scratchRef);
+  assert.equal(cache._compileLatencyWindow, windowRef);
+  stats = cache.getStats();
+  assert.equal(stats.p50Ms, 0);
+  assert.equal(stats.p95Ms, 0);
+  assert.equal(stats.maxMs, 0);
+  assert.equal(stats.slowCompilesOverBudget, 0);
+  assert.equal(stats.compileLatency.sampleCount, 0);
+
+  // Configurable compileBudgetMs (e.g. 16.667ms 60 FPS target)
+  let clock60 = 0;
+  const budgetSamples = [8.0, 16.667, 17.0, 25.0];
+  let bIdx = 0;
+  const device60 = createMockGpuDevice({
+    renderSyncImpl: (desc, id) => {
+      clock60 += budgetSamples[bIdx++] ?? 1.0;
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+  });
+  const cache60 = new WebGpuPipelineCache({
+    device: device60,
+    now: () => clock60,
+    compileBudgetMs: 16.667,
+  });
+  const vs60 = device60.createShaderModule({ code: 'vs60' });
+  for (let i = 0; i < budgetSamples.length; i += 1) {
+    cache60.getOrCreateRenderPipeline({
+      layout: 'auto',
+      vertex: { module: vs60, entryPoint: `vs_${i}` },
+    });
+  }
+  const stats60 = cache60.getStats();
+  assert.equal(stats60.compileLatency.budgetMs, 16.667);
+  assert.equal(stats60.slowCompilesOverBudget, 2); // 17.0 and 25.0
+  assert.equal(stats60.p50Ms, 16.667);
+  assert.equal(stats60.p95Ms, 25.0);
+  assert.equal(stats60.maxMs, 25.0);
+});
+
+test('W334 enforces priority-aware bounded LRU eviction via per-map cap and global maxEntries', async () => {
+  assert.equal(PIPELINE_PRIORITY_TIERS.CRITICAL, 'critical');
+  assert.equal(PIPELINE_PRIORITY_TIERS.HIGH, 'high');
+  assert.equal(PIPELINE_PRIORITY_TIERS.NORMAL, 'normal');
+  assert.equal(PIPELINE_PRIORITY_TIERS.LOW, 'low');
+  assert.ok(PIPELINE_PRIORITY_RANKS.critical > PIPELINE_PRIORITY_RANKS.high);
+  assert.ok(PIPELINE_PRIORITY_RANKS.high > PIPELINE_PRIORITY_RANKS.normal);
+  assert.ok(PIPELINE_PRIORITY_RANKS.normal > PIPELINE_PRIORITY_RANKS.low);
+
+  assert.equal(normalizePipelinePriority('CRITICAL'), 'critical');
+  assert.equal(normalizePipelinePriority('urgent'), 'critical');
+  assert.equal(normalizePipelinePriority('High'), 'high');
+  assert.equal(normalizePipelinePriority('low'), 'low');
+  assert.equal(normalizePipelinePriority('background'), 'low');
+  assert.equal(normalizePipelinePriority(undefined), 'normal');
+  assert.equal(normalizePipelinePriority('unknown-tier'), 'normal');
+
+  // 1. Per-map priority-aware LRU eviction protects critical/high entries even if less recently touched
+  const device = createMockGpuDevice();
+  const cache = new WebGpuPipelineCache({
+    device,
+    maxRenderPipelines: 2,
+  });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000091001', code: 'vs' });
+  const makeRender = (ep) => ({ layout: 'auto', vertex: { module: vs, entryPoint: ep } });
+
+  const pCrit = cache.getOrCreateRenderPipeline(makeRender('vs_crit'), 'k_crit', {
+    priority: 'critical',
+  });
+  const pLow = cache.getOrCreateRenderPipeline(makeRender('vs_low'), 'k_low', {
+    priority: 'low',
+  });
+
+  // Touch pLow so it is MORE recently used than pCrit
+  assert.equal(cache.getFastRenderPipeline('k_low'), pLow);
+
+  // Inserting a normal entry must evict pLow (lowest priority), keeping pCrit alive
+  const pNorm = cache.getOrCreateRenderPipeline(makeRender('vs_norm'), 'k_norm', {
+    priority: 'normal',
+  });
+  assert.equal(cache.getStats().renderCount, 2);
+  assert.equal(cache.getStats().evictions, 1);
+  assert.equal(cache.getStats().reclaimedCount, 1);
+  assert.equal(cache.getFastRenderPipeline('k_crit'), pCrit);
+  assert.equal(cache.getFastRenderPipeline('k_norm'), pNorm);
+  assert.equal(cache.getFastRenderPipeline('k_low'), null);
+
+  // Priority promotion on hit: promote k_norm to critical, insert high -> older critical evicted only after lower tiers
+  const pHigh = cache.getOrCreateRenderPipeline(makeRender('vs_high'), 'k_high', {
+    priority: 'high',
+  });
+  // k_norm was rank 1 (normal) < k_crit rank 3 (critical), so k_norm is evicted
+  assert.equal(cache.getFastRenderPipeline('k_crit'), pCrit);
+  assert.equal(cache.getFastRenderPipeline('k_high'), pHigh);
+  assert.equal(cache.getFastRenderPipeline('k_norm'), null);
+  assert.equal(cache.getStats().evictions, 2);
+  assert.equal(cache.getStats().reclaimedCount, 2);
+
+  // 2. Global maxEntries bounds total entries across render + compute + bindGroupLayouts
+  const device2 = createMockGpuDevice();
+  const bounded = new WebGpuPipelineCache({
+    device: device2,
+    maxEntries: 3,
+  });
+  const vs2 = device2.createShaderModule({ code: 'vs2' });
+  const cs2 = device2.createShaderModule({ code: 'cs2' });
+
+  const rCrit = bounded.getOrCreateRenderPipeline(
+    { layout: 'auto', vertex: { module: vs2, entryPoint: 'r_crit' } },
+    'r_crit',
+    { priority: 'critical' }
+  );
+  const cLow = bounded.getOrCreateComputePipeline(
+    { layout: 'auto', compute: { module: cs2, entryPoint: 'c_low' } },
+    'c_low',
+    { priority: 'low' }
+  );
+  const bglHigh = bounded.getOrCreateBindGroupLayout(
+    { entries: [{ binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform' } }] },
+    'bgl_high',
+    { priority: 'high' }
+  );
+  assert.equal(bounded.getStats().renderCount + bounded.getStats().computeCount + bounded.getStats().layoutCount, 3);
+  assert.equal(bounded.getStats().evictions, 0);
+
+  // Touch cLow to make it newest, then insert a 4th entry -> cLow is evicted across maps because it is 'low'
+  assert.equal(bounded.getFastComputePipeline('c_low'), cLow);
+  const rNorm = bounded.getOrCreateRenderPipeline(
+    { layout: 'auto', vertex: { module: vs2, entryPoint: 'r_norm' } },
+    'r_norm',
+    { priority: 'normal' }
+  );
+
+  const bStats = bounded.getStats();
+  assert.equal(bStats.renderCount, 2);
+  assert.equal(bStats.computeCount, 0);
+  assert.equal(bStats.layoutCount, 1);
+  assert.equal(bStats.evictions, 1);
+  assert.equal(bStats.reclaimedCount, 1);
+  assert.equal(bounded.getFastRenderPipeline('r_crit'), rCrit);
+  assert.equal(bounded.getFastRenderPipeline('r_norm'), rNorm);
+  assert.equal(bounded.getFastComputePipeline('c_low'), null);
+  assert.equal(
+    bounded.getOrCreateBindGroupLayout(
+      { entries: [{ binding: 0, visibility: SHADER_STAGE_BITS.VERTEX, buffer: { type: 'uniform' } }] },
+      'bgl_high'
+    ),
+    bglHigh
+  );
+
+  // 3. In-flight async priority promotion: low caller + concurrent critical caller -> stored as critical
+  const deferred = createDeferred();
+  const asyncDev = createMockGpuDevice({
+    renderAsyncImpl: async (desc, id) => {
+      await deferred.promise;
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+  });
+  const asyncCache = new WebGpuPipelineCache({ device: asyncDev, maxRenderPipelines: 2 });
+  const avs = asyncDev.createShaderModule({ code: 'avs' });
+  const sharedDesc = { layout: 'auto', vertex: { module: avs, entryPoint: 'vs_shared' } };
+
+  const p1 = asyncCache.getOrCreateRenderPipelineAsync(sharedDesc, 'k_shared', { priority: 'low' });
+  const p2 = asyncCache.getOrCreateRenderPipelineAsync(sharedDesc, 'k_shared', {
+    priority: 'critical',
+  });
+  deferred.resolve();
+  const [res1, res2] = await Promise.all([p1, p2]);
+  assert.equal(res1, res2);
+
+  // Add a normal entry, then a high entry -> promoted k_shared (critical) must survive, normal gets evicted
+  asyncCache.getOrCreateRenderPipeline(
+    { layout: 'auto', vertex: { module: avs, entryPoint: 'vs_n' } },
+    'k_n',
+    { priority: 'normal' }
+  );
+  asyncCache.getOrCreateRenderPipeline(
+    { layout: 'auto', vertex: { module: avs, entryPoint: 'vs_h' } },
+    'k_h',
+    { priority: 'high' }
+  );
+  assert.equal(asyncCache.getFastRenderPipeline('k_shared'), res1);
+  assert.equal(asyncCache.getFastRenderPipeline('k_n'), null);
+});
+
+test('W334 trimTo, evictLowPriority, and priority-ordered prewarm reclaim cleanly and preserve fast-path consistency', async () => {
+  const compileOrder = [];
+  const device = createMockGpuDevice({
+    renderAsyncImpl: async (desc, id) => {
+      compileOrder.push(desc.vertex.entryPoint);
+      return { kind: 'GPURenderPipeline', id, desc };
+    },
+    computeAsyncImpl: async (desc, id) => {
+      compileOrder.push(desc.compute.entryPoint);
+      return { kind: 'GPUComputePipeline', id, desc };
+    },
+  });
+  const cache = new WebGpuPipelineCache({ device });
+  const vs = device.createShaderModule({ label: 'wgpk:vertex:0x0000000000092001', code: 'vs' });
+  const cs = device.createShaderModule({ label: 'wgpk:compute:0x0000000000092002', code: 'cs' });
+
+  // Priority-ordered prewarm with concurrency: 1 compiles critical -> high -> normal -> low
+  // while preserving original input order in summary.pipelines
+  const prewarmRes = await cache.prewarmRenderPipelines(
+    [
+      { descriptor: { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_low_1' } }, keyHint: 'r_low_1', priority: 'low' },
+      { descriptor: { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_norm' } }, keyHint: 'r_norm', priority: 'normal' },
+      { descriptor: { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_crit' } }, keyHint: 'r_crit', priority: 'critical' },
+      { descriptor: { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_low_2' } }, keyHint: 'r_low_2', priority: 'low' },
+      { descriptor: { layout: 'auto', vertex: { module: vs, entryPoint: 'vs_high' } }, keyHint: 'r_high', priority: 'high' },
+    ],
+    { concurrency: 1 }
+  );
+
+  assert.deepEqual(compileOrder, ['vs_crit', 'vs_high', 'vs_norm', 'vs_low_1', 'vs_low_2']);
+  assert.equal(prewarmRes.compiled, 5);
+  assert.equal(prewarmRes.pipelines[0].desc.vertex.entryPoint, 'vs_low_1');
+  assert.equal(prewarmRes.pipelines[2].desc.vertex.entryPoint, 'vs_crit');
+  assert.equal(prewarmRes.pipelines[4].desc.vertex.entryPoint, 'vs_high');
+
+  // Add a low-priority compute pipeline (most recent low-priority entry)
+  const cLow = cache.getOrCreateComputePipeline(
+    { layout: 'auto', compute: { module: cs, entryPoint: 'cs_low' } },
+    'c_low',
+    { priority: 'low' }
+  );
+  assert.equal(cache.getFastComputePipeline('c_low'), cLow);
+
+  // Touch r_low_1 so r_low_2 becomes the oldest low-priority entry
+  assert.ok(cache.getFastRenderPipeline('r_low_1'));
+
+  // evictLowPriority(1) evicts only the oldest 'low' entry (r_low_2)
+  assert.equal(cache.evictLowPriority(1), 1);
+  assert.equal(cache.getFastRenderPipeline('r_low_2'), null);
+  assert.ok(cache.getFastRenderPipeline('r_low_1'));
+  assert.equal(cache.getFastComputePipeline('c_low'), cLow);
+  assert.equal(cache.getStats().reclaimedCount, 1);
+  assert.equal(cache.getStats().evictions, 1);
+
+  // evictLowPriority(10) evicts remaining 2 low entries (r_low_1, c_low) and never touches normal/high/critical
+  assert.equal(cache.evictLowPriority(10), 2);
+  assert.equal(cache.getFastRenderPipeline('r_low_1'), null);
+  assert.equal(cache.getFastComputePipeline('c_low'), null);
+  assert.ok(cache.getFastRenderPipeline('r_norm'));
+  assert.ok(cache.getFastRenderPipeline('r_high'));
+  assert.ok(cache.getFastRenderPipeline('r_crit'));
+  assert.equal(cache.getStats().reclaimedCount, 3);
+  assert.equal(cache.getStats().evictions, 3);
+
+  // evictLowPriority() with no args on no remaining low entries is a no-op
+  assert.equal(cache.evictLowPriority(), 0);
+
+  // trimTo(2) evicts r_norm (lowest remaining tier), keeping r_high and r_crit
+  assert.equal(cache.trimTo(2), 1);
+  assert.equal(cache.getFastRenderPipeline('r_norm'), null);
+  assert.ok(cache.getFastRenderPipeline('r_high'));
+  assert.ok(cache.getFastRenderPipeline('r_crit'));
+  assert.equal(cache.getStats().reclaimedCount, 4);
+  assert.equal(cache.getStats().evictions, 4);
+
+  // trimTo(5) when already <= 5 is a no-op
+  assert.equal(cache.trimTo(5), 0);
+
+  // trimTo(0) reclaims remaining 2 entries and invalidates all fast lookups
+  assert.equal(cache.trimTo(0), 2);
+  assert.equal(cache.getStats().renderCount, 0);
+  assert.equal(cache.getStats().computeCount, 0);
+  assert.equal(cache.getStats().layoutCount, 0);
+  assert.equal(cache.getStats().reclaimedCount, 6);
+  assert.equal(cache.getStats().evictions, 6);
+  assert.equal(cache.getFastRenderPipeline('r_high'), null);
+  assert.equal(cache.getFastRenderPipeline('r_crit'), null);
+
+  // Priority-ordered prewarmComputePipelines also respects priority order
+  compileOrder.length = 0;
+  const computePrewarm = await cache.prewarmComputePipelines(
+    [
+      { descriptor: { layout: 'auto', compute: { module: cs, entryPoint: 'cs_bg' } }, priority: 'low' },
+      { descriptor: { layout: 'auto', compute: { module: cs, entryPoint: 'cs_crit' } }, priority: 'critical' },
+    ],
+    { concurrency: 1 }
+  );
+  assert.deepEqual(compileOrder, ['cs_crit', 'cs_bg']);
+  assert.equal(computePrewarm.pipelines[0].desc.compute.entryPoint, 'cs_bg');
+  assert.equal(computePrewarm.pipelines[1].desc.compute.entryPoint, 'cs_crit');
+
+  // evictLowPriority() with no args evicts cs_bg while preserving cs_crit
+  assert.equal(cache.evictLowPriority(), 1);
+  assert.equal(cache.getStats().computeCount, 1);
+});
+
+test('W334 validates options, preserves JSON serializability, backward compatibility, and classic-Worker IIFE isolation', () => {
+  const device = createMockGpuDevice();
+
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, maxEntries: 0 }),
+    /maxEntries must be a positive integer/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, maxEntries: -5 }),
+    /maxEntries must be a positive integer/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, compileBudgetMs: 0 }),
+    /compileBudgetMs must be a finite positive number/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, compileBudgetMs: NaN }),
+    /compileBudgetMs must be a finite positive number/
+  );
+  assert.throws(
+    () => new WebGpuPipelineCache({ device, compileLatencyWindowSize: 0 }),
+    /compileLatencyWindowSize must be a positive integer/
+  );
+
+  const cache = new WebGpuPipelineCache({ device });
+  assert.throws(() => cache.trimTo(-1), /limit must be a non-negative integer/);
+  assert.throws(() => cache.trimTo(1.5), /limit must be a non-negative integer/);
+  assert.throws(() => cache.evictLowPriority(-1), /count must be a non-negative integer/);
+  assert.throws(() => cache.evictLowPriority(2.5), /count must be a non-negative integer/);
+
+  // Stats and compile latency snapshots round-trip cleanly through JSON
+  const stats = cache.getStats();
+  assert.deepEqual(JSON.parse(JSON.stringify(stats)), stats);
+  const latency = cache.getCompileLatencyStats();
+  assert.deepEqual(JSON.parse(JSON.stringify(latency)), latency);
+
+  // Classic-Worker sandbox isolation: no internal W334 helpers leaked to global scope
+  const scriptPath = path.resolve(
+    path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    '../web/workers/pipeline_cache.js'
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const sandbox = { performance, Date };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+
+  assert.equal(sandbox.percentileFromSorted, undefined);
+  assert.equal(sandbox.extractPriorityOption, undefined);
+  assert.equal(sandbox.hasRenderNormalizationOptions, undefined);
+  assert.equal(sandbox.validatePositiveNumber, undefined);
+  assert.equal(sandbox.validateNonNegativeInt, undefined);
+  assert.equal(sandbox.PlayGta6PipelineCache.DEFAULT_COMPILE_BUDGET_MS, 33.333);
+  assert.equal(typeof sandbox.PlayGta6PipelineCache.normalizePipelinePriority, 'function');
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.trimTo,
+    'function'
+  );
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.evictLowPriority,
+    'function'
+  );
+  assert.equal(
+    typeof sandbox.PlayGta6PipelineCache.WebGpuPipelineCache.prototype.getCompileLatencyStats,
     'function'
   );
 });

@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
-"""MicrosoftGame.Config & Xbox package readiness inspector CLI (Track 5 / W39).
+"""MicrosoftGame.Config & Xbox package readiness inspector CLI (Track 5 / W39, T88).
 
 Safely parses Xbox GDK `MicrosoftGame.Config` XML (rejecting DTD/XXE declarations
 and capping input size), cross-checks declared executables and `ShellVisuals`
 assets for presence, size, and non-zero header completeness (detecting partial
-downloads), and catalogs bundled `.dll`s and `.rpf` counts.
+downloads), and catalogs bundled `.dll`s and deterministically sorted `.rpf`
+archive inventory & zero-division-safe size/ratio summaries.
 
 Security & privacy invariants:
 - Rejects `<!DOCTYPE` / `<!ENTITY` declarations before XML parsing to block XXE.
 - Caps `MicrosoftGame.Config` input size before loading into memory.
 - Enforces package-root containment (blocks `..` traversal and external symlinks).
-- Machine-readable `--json` output NEVER includes host absolute paths, usernames,
-  or raw file bytes (relative package paths and basenames only).
+- Machine-readable `--json` output NEVER includes host absolute paths, UNC paths,
+  usernames, copyrighted `.rpf` archive names, or raw file bytes.
 - Strictly uses Python 3.12 standard library modules only.
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
+import hashlib
 import json
 import os
 import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parent.parent
 SCHEMA_VERSION = 1
@@ -49,11 +52,14 @@ SHELL_VISUAL_IMAGE_FIELDS: tuple[tuple[str, str], ...] = (
 
 _FORBIDDEN_XML_DECL_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 _WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
-_WINDOWS_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
-_UNC_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_FILE_URL_RE = re.compile(r"\bfile://[^\s\"'<>|,;()\[\]]+", re.IGNORECASE)
+_UNC_BS_PATH_RE = re.compile(r"\\\\[^\s\"'<>|,;()\[\]]+")
+_UNC_FS_PATH_RE = re.compile(r"(?<!:)//[^\s\"'<>|,;()\[\]]+")
+_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/][^\s\"'<>|,;()\[\]]*")
 _POSIX_PATH_RE = re.compile(
-    r"/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes)/[^\s\"'<>|,;()\[\]]*"
+    r"(?<![A-Za-z0-9_.-])/(?:Users|home|tmp|var|opt|root|mnt|private|etc|usr|Library|Volumes|proc|run|srv|media|cygdrive)/[^\s\"'<>|,;()\[\]]*"
 )
+_TILDE_HOME_RE = re.compile(r"(?<![A-Za-z0-9_])~[A-Za-z0-9._-]*/[^\s\"'<>|,;()\[\]]*")
 
 
 class GameConfigError(ValueError):
@@ -68,41 +74,164 @@ class ConfigTooLargeError(GameConfigError):
     """Raised when XML input exceeds the maximum allowed byte size."""
 
 
+def safe_ratio(numerator: int | float, denominator: int | float, *, digits: int = 6) -> float:
+    """Compute `numerator / denominator` safely, returning `0.0` when `denominator <= 0`."""
+    if denominator <= 0:
+        return 0.0
+    return round(float(numerator) / float(denominator), digits)
+
+
 def _current_usernames() -> list[str]:
     names: list[str] = []
-    for candidate in (
+    candidates: list[str] = [
         os.environ.get("USERNAME", ""),
         os.environ.get("USER", ""),
         os.environ.get("LOGNAME", ""),
-    ):
+    ]
+    for env_home_var in ("USERPROFILE", "HOME"):
+        env_home = os.environ.get(env_home_var, "").strip().rstrip("\\/")
+        if env_home:
+            tail = re.split(r"[/\\]+", env_home)[-1]
+            candidates.append(tail)
+    try:
+        candidates.append(getpass.getuser())
+    except (OSError, KeyError, RuntimeError):
+        pass
+    try:
+        candidates.append(Path.home().name)
+    except (OSError, RuntimeError):
+        pass
+
+    for candidate in candidates:
         cleaned = candidate.strip()
         if len(cleaned) >= 3 and cleaned not in names:
             names.append(cleaned)
-    try:
-        home_name = Path.home().name.strip()
-        if len(home_name) >= 3 and home_name not in names:
-            names.append(home_name)
-    except (OSError, RuntimeError):
-        pass
     return names
 
 
-def sanitize_text(raw: str | None) -> str | None:
-    """Strip host filesystem paths and active usernames from a string."""
-    if raw is None:
-        return None
-    sanitized = _WINDOWS_PATH_RE.sub("<path>", raw)
-    sanitized = _UNC_PATH_RE.sub("<path>", sanitized)
-    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+def _sensitive_host_paths(extra_paths: Sequence[Path | str] = ()) -> list[str]:
+    """Collect concrete host filesystem path prefixes that must never leak."""
+    raw_candidates: list[str] = []
+    for env_var in ("USERPROFILE", "HOME"):
+        val = os.environ.get(env_var, "").strip()
+        if val:
+            raw_candidates.append(val)
+    try:
+        home = Path.home()
+        raw_candidates.append(str(home))
+        raw_candidates.append(str(home.resolve()))
+    except (OSError, RuntimeError):
+        pass
 
-    for username in _current_usernames():
-        pattern = re.compile(
+    for item in extra_paths:
+        if not item:
+            continue
+        raw_str = str(item)
+        raw_candidates.append(raw_str)
+        try:
+            raw_candidates.append(str(Path(item).resolve()))
+        except (OSError, RuntimeError):
+            pass
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_candidates:
+        for text in (raw, raw.replace("\\", "/"), raw.replace("/", "\\")):
+            cleaned = text.rstrip("\\/")
+            if len(cleaned) < 4:
+                continue
+            key = cleaned.lower() if (os.name == "nt" or _WINDOWS_DRIVE_PREFIX_RE.match(cleaned)) else cleaned
+            if key not in seen:
+                seen.add(key)
+                variants.append(cleaned)
+    variants.sort(key=len, reverse=True)
+    return variants
+
+
+def _compile_host_prefix_patterns(extra_paths: Sequence[Path | str] = ()) -> list[re.Pattern[str]]:
+    patterns: list[re.Pattern[str]] = []
+    for host_prefix in _sensitive_host_paths(extra_paths):
+        flags = re.IGNORECASE if (os.name == "nt" or _WINDOWS_DRIVE_PREFIX_RE.match(host_prefix)) else 0
+        patterns.append(
+            re.compile(
+                rf"{re.escape(host_prefix)}(?:[\\/][^\s\"'<>|,;()\[\]]*)?",
+                flags,
+            )
+        )
+    return patterns
+
+
+def _compile_username_patterns() -> list[re.Pattern[str]]:
+    return [
+        re.compile(
             rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
             re.IGNORECASE,
         )
-        sanitized = pattern.sub("<user>", sanitized)
+        for username in _current_usernames()
+    ]
+
+
+def _sanitize_text_with_patterns(
+    text: str,
+    prefix_patterns: Sequence[re.Pattern[str]],
+    username_patterns: Sequence[re.Pattern[str]],
+) -> str:
+    sanitized = _FILE_URL_RE.sub("<path>", text)
+    for prefix_re in prefix_patterns:
+        sanitized = prefix_re.sub("<path>", sanitized)
+    sanitized = _UNC_BS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _WINDOWS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _UNC_FS_PATH_RE.sub("<path>", sanitized)
+    sanitized = _POSIX_PATH_RE.sub("<path>", sanitized)
+    sanitized = _TILDE_HOME_RE.sub("<path>", sanitized)
+
+    for user_re in username_patterns:
+        sanitized = user_re.sub("<user>", sanitized)
 
     return sanitized
+
+
+def sanitize_text(
+    raw: str | None,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+) -> str | None:
+    """Strip host filesystem paths, UNC paths, file URLs, and active usernames."""
+    if raw is None:
+        return None
+    return _sanitize_text_with_patterns(
+        str(raw),
+        _compile_host_prefix_patterns(extra_paths),
+        _compile_username_patterns(),
+    )
+
+
+def sanitize_report(
+    value: Any,
+    *,
+    extra_paths: Sequence[Path | str] = (),
+) -> Any:
+    """Recursively sanitize every string, path, key, and raw byte blob in a report."""
+    prefix_patterns = _compile_host_prefix_patterns(extra_paths)
+    username_patterns = _compile_username_patterns()
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, (bytes, bytearray, memoryview)):
+            return f"<bytes:{len(node)}>"
+        if isinstance(node, Path):
+            return _sanitize_text_with_patterns(node.name, prefix_patterns, username_patterns)
+        if isinstance(node, str):
+            return _sanitize_text_with_patterns(node, prefix_patterns, username_patterns)
+        if isinstance(node, Mapping):
+            return {
+                _sanitize_text_with_patterns(str(key), prefix_patterns, username_patterns): _walk(val)
+                for key, val in node.items()
+            }
+        if isinstance(node, (list, tuple)):
+            return [_walk(item) for item in node]
+        return node
+
+    return _walk(value)
 
 
 def load_dotenv(env_path: Path) -> dict[str, str]:
@@ -212,14 +341,18 @@ def _normalize_declared_path(raw: str | None) -> str | None:
     cleaned = raw.strip()
     if not cleaned:
         return None
-    if _is_unsafe_absolute_path(cleaned):
-        sanitized = sanitize_text(cleaned)
-        return sanitized if sanitized else "<path>"
+    if (
+        _is_unsafe_absolute_path(cleaned)
+        or bool(_FILE_URL_RE.match(cleaned))
+        or bool(_TILDE_HOME_RE.match(cleaned))
+    ):
+        return "<path>"
 
     parts = [part for part in cleaned.replace("\\", "/").split("/") if part and part != "."]
     if not parts:
         return None
-    return "/".join(parts)
+    sanitized = sanitize_text("/".join(parts))
+    return sanitized if sanitized else "<path>"
 
 
 def _validate_package_relative_path(raw: str | None) -> tuple[list[str] | None, str | None]:
@@ -227,7 +360,12 @@ def _validate_package_relative_path(raw: str | None) -> tuple[list[str] | None, 
     if not raw or not raw.strip():
         return None, "empty_path"
     cleaned = raw.strip()
-    if _is_unsafe_absolute_path(cleaned) or cleaned == "<path>":
+    if (
+        _is_unsafe_absolute_path(cleaned)
+        or cleaned == "<path>"
+        or bool(_FILE_URL_RE.match(cleaned))
+        or bool(_TILDE_HOME_RE.match(cleaned))
+    ):
         return None, "unsafe_path"
     parts = [part for part in cleaned.replace("\\", "/").split("/") if part and part != "."]
     if not parts:
@@ -394,7 +532,8 @@ def parse_microsoft_game_config(
             "childTags": sorted({_local_name(child.tag) for child in dr_el}),
         }
 
-    mod_folder_el = _find_child(root, "ModFolder") or dr_mod_folder_el
+    root_mod_folder_el = _find_child(root, "ModFolder")
+    mod_folder_el = root_mod_folder_el if root_mod_folder_el is not None else dr_mod_folder_el
     mod_folder: dict[str, Any] | None = None
     if mod_folder_el is not None:
         mod_folder = {
@@ -404,25 +543,27 @@ def parse_microsoft_game_config(
             "readOnly": _parse_optional_bool(_get_attr(mod_folder_el, "ReadOnly")),
         }
 
-    return {
-        "configVersion": sanitize_text(_get_attr(root, "configVersion")),
-        "identity": identity,
-        "titleId": sanitize_text(_get_text(_find_child(root, "TitleId"))),
-        "storeId": sanitize_text(_get_text(_find_child(root, "StoreId"))),
-        "msaAppId": sanitize_text(_get_text(_find_child(root, "MSAAppId"))),
-        "executables": executables,
-        "shellVisuals": shell_visuals,
-        "resources": {"languages": languages},
-        "virtualMachine": virtual_machine,
-        "modFolder": mod_folder,
-        "desktopRegistration": desktop_registration,
-    }
+    return sanitize_report(
+        {
+            "configVersion": sanitize_text(_get_attr(root, "configVersion")),
+            "identity": identity,
+            "titleId": sanitize_text(_get_text(_find_child(root, "TitleId"))),
+            "storeId": sanitize_text(_get_text(_find_child(root, "StoreId"))),
+            "msaAppId": sanitize_text(_get_text(_find_child(root, "MSAAppId"))),
+            "executables": executables,
+            "shellVisuals": shell_visuals,
+            "resources": {"languages": languages},
+            "virtualMachine": virtual_machine,
+            "modFolder": mod_folder,
+            "desktopRegistration": desktop_registration,
+        }
+    )
 
 
 def _locate_microsoft_game_config(game_dir: Path) -> Path | None:
     """Locate `MicrosoftGame.Config` case-insensitively at root or 1 level deep."""
     try:
-        root_entries = sorted(game_dir.iterdir(), key=lambda p: p.name.lower())
+        root_entries = sorted(game_dir.iterdir(), key=lambda p: (p.name.lower(), p.name))
     except OSError:
         return None
 
@@ -437,7 +578,7 @@ def _locate_microsoft_game_config(game_dir: Path) -> Path | None:
         try:
             if not entry.is_dir() or entry.is_symlink():
                 continue
-            sub_entries = sorted(entry.iterdir(), key=lambda p: p.name.lower())
+            sub_entries = sorted(entry.iterdir(), key=lambda p: (p.name.lower(), p.name))
         except OSError:
             continue
         for sub in sub_entries:
@@ -465,7 +606,7 @@ def _resolve_case_insensitive_in_root(root: Path, root_resolved: Path, parts: li
         if matched is None:
             try:
                 target_lower = part.lower()
-                for entry in sorted(current.iterdir(), key=lambda p: p.name.lower()):
+                for entry in sorted(current.iterdir(), key=lambda p: (p.name.lower(), p.name)):
                     if entry.name.lower() == target_lower:
                         matched = entry
                         break
@@ -600,8 +741,21 @@ def _check_declared_asset(
 ) -> dict[str, Any]:
     parts, err = _validate_package_relative_path(declared_path)
     if err is not None or parts is None:
+        safe_declared: str | None
+        if declared_path is None:
+            safe_declared = None
+        else:
+            stripped_declared = declared_path.strip()
+            if (
+                _is_unsafe_absolute_path(stripped_declared)
+                or bool(_FILE_URL_RE.match(stripped_declared))
+                or bool(_TILDE_HOME_RE.match(stripped_declared))
+            ):
+                safe_declared = "<path>"
+            else:
+                safe_declared = sanitize_text(declared_path)
         return {
-            "declaredPath": sanitize_text(declared_path),
+            "declaredPath": safe_declared,
             "relativePath": None,
             "present": False,
             "sizeBytes": 0,
@@ -649,9 +803,140 @@ def _check_declared_asset(
     }
 
 
+def _archive_path_hash(rel_posix: str) -> str:
+    """Return a deterministic 16-hex-char SHA-256 digest of a normalized relative path."""
+    normalized = rel_posix.replace("\\", "/").strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def sort_archive_inventory(archives: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return a deterministically sorted copy of sanitized archive inventory entries.
+
+    Orders largest archives first (`sizeBytes` descending) with deterministic tie-breaking
+    on `(pathHash, extension, depth, status)` so ordering is independent of filesystem
+    traversal order.
+    """
+    ordered = [dict(item) for item in archives]
+    ordered.sort(
+        key=lambda item: (
+            -int(item.get("sizeBytes", 0)),
+            str(item.get("pathHash", "")),
+            str(item.get("extension", "")),
+            int(item.get("depth", 0)),
+            str(item.get("status", "")),
+        )
+    )
+    return ordered
+
+
+def summarize_archive_inventory(archives: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Compute zero-division-safe size and ratio summary metrics for an archive inventory."""
+    archive_count = len(archives)
+    complete_count = 0
+    incomplete_count = 0
+    empty_count = 0
+    zero_header_count = 0
+    unreadable_count = 0
+    total_bytes = 0
+    complete_bytes = 0
+    incomplete_bytes = 0
+    sizes: list[int] = []
+    status_counts: dict[str, int] = {}
+    format_counts: dict[str, int] = {}
+
+    for item in archives:
+        size_bytes = max(0, int(item.get("sizeBytes", 0)))
+        sizes.append(size_bytes)
+        total_bytes += size_bytes
+
+        complete = bool(item.get("complete", False))
+        if complete:
+            complete_count += 1
+            complete_bytes += size_bytes
+        else:
+            incomplete_count += 1
+            incomplete_bytes += size_bytes
+
+        status = str(item.get("status") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status == "empty":
+            empty_count += 1
+        elif status == "incomplete_zero_header":
+            zero_header_count += 1
+        elif status == "unreadable":
+            unreadable_count += 1
+
+        header_fmt = str(item.get("headerFormat") or "unknown")
+        format_counts[header_fmt] = format_counts.get(header_fmt, 0) + 1
+
+    min_bytes = min(sizes) if sizes else 0
+    max_bytes = max(sizes) if sizes else 0
+
+    return {
+        "archiveCount": archive_count,
+        "completeCount": complete_count,
+        "incompleteCount": incomplete_count,
+        "emptyCount": empty_count,
+        "zeroHeaderCount": zero_header_count,
+        "unreadableCount": unreadable_count,
+        "totalBytes": total_bytes,
+        "completeBytes": complete_bytes,
+        "incompleteBytes": incomplete_bytes,
+        "minBytes": min_bytes,
+        "maxBytes": max_bytes,
+        "avgBytes": safe_ratio(total_bytes, archive_count, digits=2),
+        "completeCountRatio": safe_ratio(complete_count, archive_count),
+        "incompleteCountRatio": safe_ratio(incomplete_count, archive_count),
+        "completeByteRatio": safe_ratio(complete_bytes, total_bytes),
+        "incompleteByteRatio": safe_ratio(incomplete_bytes, total_bytes),
+        "largestArchiveByteRatio": safe_ratio(max_bytes, total_bytes),
+        "statusCounts": {key: status_counts[key] for key in sorted(status_counts)},
+        "headerFormatCounts": {key: format_counts[key] for key in sorted(format_counts)},
+    }
+
+
+def _empty_inventory() -> dict[str, Any]:
+    return {
+        "dlls": [],
+        "dllCount": 0,
+        "dllCompleteCount": 0,
+        "dllIncompleteCount": 0,
+        "dllTotalBytes": 0,
+        "rpfCount": 0,
+        "rpfCompleteCount": 0,
+        "rpfIncompleteCount": 0,
+        "rpfTotalBytes": 0,
+        "archives": [],
+        "archiveSummary": summarize_archive_inventory(()),
+    }
+
+
+def _empty_readiness() -> dict[str, Any]:
+    return {
+        "allDeclaredAssetsComplete": False,
+        "hasPartialDownloads": False,
+        "declaredExecutableCount": 0,
+        "presentExecutableCount": 0,
+        "completeExecutableCount": 0,
+        "missingExecutableCount": 0,
+        "incompleteExecutableCount": 0,
+        "executableCompleteRatio": 0.0,
+        "declaredVisualCount": 0,
+        "presentVisualCount": 0,
+        "completeVisualCount": 0,
+        "missingVisualCount": 0,
+        "incompleteVisualCount": 0,
+        "visualCompleteRatio": 0.0,
+        "dllCompleteRatio": 0.0,
+        "archiveCompleteRatio": 0.0,
+        "archiveCompleteByteRatio": 0.0,
+    }
+
+
 def _catalog_package_files(game_dir: Path, game_dir_resolved: Path) -> dict[str, Any]:
-    """Catalog bundled `.dll` files and `.rpf` counts using relative paths/basenames only."""
+    """Catalog bundled `.dll` files and sanitized `.rpf` archive inventory/summary."""
     dlls: list[dict[str, Any]] = []
+    raw_archives: list[dict[str, Any]] = []
     rpf_count = 0
     rpf_complete_count = 0
     rpf_incomplete_count = 0
@@ -663,7 +948,7 @@ def _catalog_package_files(game_dir: Path, game_dir_resolved: Path) -> dict[str,
     while stack:
         current_dir, depth = stack.pop()
         try:
-            entries = sorted(current_dir.iterdir(), key=lambda p: p.name.lower())
+            entries = sorted(current_dir.iterdir(), key=lambda p: (p.name.lower(), p.name))
         except OSError:
             continue
 
@@ -706,100 +991,118 @@ def _catalog_package_files(game_dir: Path, game_dir_resolved: Path) -> dict[str,
             elif lower_name.endswith(".rpf"):
                 rpf_count += 1
                 probe = _probe_file_completeness(entry)
-                rpf_total_bytes += int(probe["sizeBytes"])
+                size_bytes = int(probe["sizeBytes"])
+                rpf_total_bytes += size_bytes
                 if probe["complete"]:
                     rpf_complete_count += 1
                 else:
                     rpf_incomplete_count += 1
+                try:
+                    rel_path = _relative_posix(entry.resolve(), game_dir_resolved)
+                except (OSError, ValueError):
+                    rel_path = entry.name
+                raw_archives.append(
+                    {
+                        "pathHash": _archive_path_hash(rel_path),
+                        "extension": ".rpf",
+                        "depth": depth,
+                        "sizeBytes": size_bytes,
+                        "nonZeroHeader": probe["nonZeroHeader"],
+                        "headerFormat": probe["headerFormat"],
+                        "partialDownloadSuspected": probe["partialDownloadSuspected"],
+                        "complete": probe["complete"],
+                        "status": probe["status"],
+                    }
+                )
 
         # Reverse so stack pop processes directories in lexicographical order.
         for sub in reversed(subdirs):
             stack.append(sub)
 
-    dlls.sort(key=lambda item: item["relativePath"].lower())
+    dlls.sort(key=lambda item: (item["relativePath"].lower(), item["relativePath"], item["basename"]))
+    archives = sort_archive_inventory(raw_archives)
+    for arch in archives:
+        arch["sizeRatio"] = safe_ratio(int(arch["sizeBytes"]), rpf_total_bytes)
+
+    archive_summary = summarize_archive_inventory(archives)
     return {
         "dlls": dlls,
         "dllCount": len(dlls),
         "dllCompleteCount": sum(1 for item in dlls if item["complete"]),
         "dllIncompleteCount": sum(1 for item in dlls if not item["complete"]),
+        "dllTotalBytes": sum(int(item["sizeBytes"]) for item in dlls),
         "rpfCount": rpf_count,
         "rpfCompleteCount": rpf_complete_count,
         "rpfIncompleteCount": rpf_incomplete_count,
         "rpfTotalBytes": rpf_total_bytes,
+        "archives": archives,
+        "archiveSummary": archive_summary,
     }
 
 
 def inspect_game_directory(game_dir: str | os.PathLike[str]) -> dict[str, Any]:
     """Inspect a local Xbox Series game directory and return a sanitized readiness report.
 
-    Never emits host absolute paths, usernames, or raw file bytes.
+    Never emits host absolute paths, UNC paths, usernames, copyrighted archive names,
+    or raw file bytes.
     """
     base_path = Path(game_dir).expanduser()
-    empty_inventory = {
-        "dlls": [],
-        "dllCount": 0,
-        "dllCompleteCount": 0,
-        "dllIncompleteCount": 0,
-        "rpfCount": 0,
-        "rpfCompleteCount": 0,
-        "rpfIncompleteCount": 0,
-        "rpfTotalBytes": 0,
-    }
-    empty_readiness = {
-        "allDeclaredAssetsComplete": False,
-        "hasPartialDownloads": False,
-        "declaredExecutableCount": 0,
-        "presentExecutableCount": 0,
-        "completeExecutableCount": 0,
-        "missingExecutableCount": 0,
-        "incompleteExecutableCount": 0,
-        "declaredVisualCount": 0,
-        "presentVisualCount": 0,
-        "completeVisualCount": 0,
-        "missingVisualCount": 0,
-        "incompleteVisualCount": 0,
-    }
+    empty_inventory = _empty_inventory()
+    empty_readiness = _empty_readiness()
 
     if not base_path.is_dir():
-        return {
-            "schemaVersion": SCHEMA_VERSION,
-            "ok": False,
-            "status": "missing_game_dir",
-            "configFound": False,
-            "configValid": False,
-            "configRelativePath": None,
-            "error": "Game directory does not exist or is not a directory",
-            "config": None,
-            "executables": [],
-            "shellVisuals": [],
-            "inventory": empty_inventory,
-            "readiness": empty_readiness,
-        }
+        return sanitize_report(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "ok": False,
+                "status": "missing_game_dir",
+                "configFound": False,
+                "configValid": False,
+                "configRelativePath": None,
+                "error": "Game directory does not exist or is not a directory",
+                "config": None,
+                "executables": [],
+                "shellVisuals": [],
+                "inventory": empty_inventory,
+                "readiness": empty_readiness,
+            },
+            extra_paths=(base_path,),
+        )
 
     game_dir_resolved = base_path.resolve()
+    extra_paths = (base_path, game_dir_resolved)
     inventory = _catalog_package_files(base_path, game_dir_resolved)
+    dll_complete_ratio = safe_ratio(inventory["dllCompleteCount"], inventory["dllCount"])
+    archive_complete_ratio = safe_ratio(inventory["rpfCompleteCount"], inventory["rpfCount"])
+    archive_complete_byte_ratio = inventory["archiveSummary"]["completeByteRatio"]
 
     config_path = _locate_microsoft_game_config(base_path)
     if config_path is None:
-        return {
-            "schemaVersion": SCHEMA_VERSION,
-            "ok": False,
-            "status": "missing_config",
-            "configFound": False,
-            "configValid": False,
-            "configRelativePath": None,
-            "error": "MicrosoftGame.Config not found in game directory",
-            "config": None,
-            "executables": [],
-            "shellVisuals": [],
-            "inventory": inventory,
-            "readiness": {
-                **empty_readiness,
-                "hasPartialDownloads": bool(
-                    inventory["dllIncompleteCount"] > 0 or inventory["rpfIncompleteCount"] > 0
-                ),
+        return sanitize_report(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "ok": False,
+                "status": "missing_config",
+                "configFound": False,
+                "configValid": False,
+                "configRelativePath": None,
+                "error": "MicrosoftGame.Config not found in game directory",
+                "config": None,
+                "executables": [],
+                "shellVisuals": [],
+                "inventory": inventory,
+                "readiness": {
+                    **empty_readiness,
+                    "hasPartialDownloads": bool(
+                        inventory["dllIncompleteCount"] > 0 or inventory["rpfIncompleteCount"] > 0
+                    ),
+                    "dllCompleteRatio": dll_complete_ratio,
+                    "archiveCompleteRatio": archive_complete_ratio,
+                    "archiveCompleteByteRatio": archive_complete_byte_ratio,
+                },
             },
-        }
+            extra_paths=extra_paths,
+        )
 
     try:
         config_rel_path = _relative_posix(config_path.resolve(), game_dir_resolved)
@@ -809,25 +1112,31 @@ def inspect_game_directory(game_dir: str | os.PathLike[str]) -> dict[str, Any]:
     try:
         parsed_config = parse_microsoft_game_config(config_path)
     except (GameConfigError, OSError) as exc:
-        return {
-            "schemaVersion": SCHEMA_VERSION,
-            "ok": False,
-            "status": "invalid_config",
-            "configFound": True,
-            "configValid": False,
-            "configRelativePath": config_rel_path,
-            "error": sanitize_text(str(exc)) or "Invalid MicrosoftGame.Config",
-            "config": None,
-            "executables": [],
-            "shellVisuals": [],
-            "inventory": inventory,
-            "readiness": {
-                **empty_readiness,
-                "hasPartialDownloads": bool(
-                    inventory["dllIncompleteCount"] > 0 or inventory["rpfIncompleteCount"] > 0
-                ),
+        return sanitize_report(
+            {
+                "schemaVersion": SCHEMA_VERSION,
+                "ok": False,
+                "status": "invalid_config",
+                "configFound": True,
+                "configValid": False,
+                "configRelativePath": config_rel_path,
+                "error": sanitize_text(str(exc), extra_paths=extra_paths) or "Invalid MicrosoftGame.Config",
+                "config": None,
+                "executables": [],
+                "shellVisuals": [],
+                "inventory": inventory,
+                "readiness": {
+                    **empty_readiness,
+                    "hasPartialDownloads": bool(
+                        inventory["dllIncompleteCount"] > 0 or inventory["rpfIncompleteCount"] > 0
+                    ),
+                    "dllCompleteRatio": dll_complete_ratio,
+                    "archiveCompleteRatio": archive_complete_ratio,
+                    "archiveCompleteByteRatio": archive_complete_byte_ratio,
+                },
             },
-        }
+            extra_paths=extra_paths,
+        )
 
     package_root = config_path.parent
     package_root_resolved = package_root.resolve()
@@ -894,33 +1203,41 @@ def inspect_game_directory(game_dir: str | os.PathLike[str]) -> dict[str, Any]:
         and complete_visuals == len(visual_checks)
     )
 
-    return {
-        "schemaVersion": SCHEMA_VERSION,
-        "ok": True,
-        "status": "ok",
-        "configFound": True,
-        "configValid": True,
-        "configRelativePath": config_rel_path,
-        "error": None,
-        "config": parsed_config,
-        "executables": executable_checks,
-        "shellVisuals": visual_checks,
-        "inventory": inventory,
-        "readiness": {
-            "allDeclaredAssetsComplete": all_declared_complete,
-            "hasPartialDownloads": has_partial_downloads,
-            "declaredExecutableCount": len(executable_checks),
-            "presentExecutableCount": present_exes,
-            "completeExecutableCount": complete_exes,
-            "missingExecutableCount": missing_exes,
-            "incompleteExecutableCount": incomplete_exes,
-            "declaredVisualCount": len(visual_checks),
-            "presentVisualCount": present_visuals,
-            "completeVisualCount": complete_visuals,
-            "missingVisualCount": missing_visuals,
-            "incompleteVisualCount": incomplete_visuals,
+    return sanitize_report(
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "ok": True,
+            "status": "ok",
+            "configFound": True,
+            "configValid": True,
+            "configRelativePath": config_rel_path,
+            "error": None,
+            "config": parsed_config,
+            "executables": executable_checks,
+            "shellVisuals": visual_checks,
+            "inventory": inventory,
+            "readiness": {
+                "allDeclaredAssetsComplete": all_declared_complete,
+                "hasPartialDownloads": has_partial_downloads,
+                "declaredExecutableCount": len(executable_checks),
+                "presentExecutableCount": present_exes,
+                "completeExecutableCount": complete_exes,
+                "missingExecutableCount": missing_exes,
+                "incompleteExecutableCount": incomplete_exes,
+                "executableCompleteRatio": safe_ratio(complete_exes, len(executable_checks)),
+                "declaredVisualCount": len(visual_checks),
+                "presentVisualCount": present_visuals,
+                "completeVisualCount": complete_visuals,
+                "missingVisualCount": missing_visuals,
+                "incompleteVisualCount": incomplete_visuals,
+                "visualCompleteRatio": safe_ratio(complete_visuals, len(visual_checks)),
+                "dllCompleteRatio": dll_complete_ratio,
+                "archiveCompleteRatio": archive_complete_ratio,
+                "archiveCompleteByteRatio": archive_complete_byte_ratio,
+            },
         },
-    }
+        extra_paths=extra_paths,
+    )
 
 
 def _status_badge(status: str) -> str:
@@ -947,7 +1264,7 @@ def format_report_text(report: Mapping[str, Any]) -> str:
             lines.append(
                 f"Scanned: dlls={inv.get('dllCount', 0)}, rpf={inv.get('rpfCount', 0)}"
             )
-        return "\n".join(lines)
+        return sanitize_text("\n".join(lines)) or ""
 
     cfg = report["config"]
     ident = cfg["identity"]
@@ -1020,6 +1337,13 @@ def format_report_text(report: Mapping[str, Any]) -> str:
         f"({inv['rpfCompleteCount']} complete, {inv['rpfIncompleteCount']} incomplete, "
         f"{inv['rpfTotalBytes']} bytes)"
     )
+    arch_summary = inv.get("archiveSummary")
+    if isinstance(arch_summary, Mapping):
+        lines.append(
+            f"         complete_ratio={arch_summary.get('completeCountRatio', 0.0):.2%}, "
+            f"complete_bytes_ratio={arch_summary.get('completeByteRatio', 0.0):.2%}, "
+            f"avg={arch_summary.get('avgBytes', 0.0):.2f} bytes"
+        )
 
     rd = report["readiness"]
     lines.append("")
@@ -1035,7 +1359,7 @@ def format_report_text(report: Mapping[str, Any]) -> str:
     if rd["hasPartialDownloads"]:
         lines.append("  WARNING: Zero-filled or empty files detected (partial download suspected).")
 
-    return "\n".join(lines)
+    return sanitize_text("\n".join(lines)) or ""
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -1077,53 +1401,37 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.from_env:
-        target_dir = resolve_game_dir_from_env(repo_root=args.repo_root.resolve())
+        repo_root_resolved = args.repo_root.resolve()
+        target_dir = resolve_game_dir_from_env(repo_root=repo_root_resolved)
         if target_dir is None:
-            report: dict[str, Any] = {
-                "schemaVersion": SCHEMA_VERSION,
-                "ok": False,
-                "status": "env_not_configured",
-                "configFound": False,
-                "configValid": False,
-                "configRelativePath": None,
-                "error": 'GTA6_GAME_DIR is not configured (run: python tools/local_env.py --set-game "<path>")',
-                "config": None,
-                "executables": [],
-                "shellVisuals": [],
-                "inventory": {
-                    "dlls": [],
-                    "dllCount": 0,
-                    "dllCompleteCount": 0,
-                    "dllIncompleteCount": 0,
-                    "rpfCount": 0,
-                    "rpfCompleteCount": 0,
-                    "rpfIncompleteCount": 0,
-                    "rpfTotalBytes": 0,
+            report: dict[str, Any] = sanitize_report(
+                {
+                    "schemaVersion": SCHEMA_VERSION,
+                    "ok": False,
+                    "status": "env_not_configured",
+                    "configFound": False,
+                    "configValid": False,
+                    "configRelativePath": None,
+                    "error": 'GTA6_GAME_DIR is not configured (run: python tools/local_env.py --set-game "<path>")',
+                    "config": None,
+                    "executables": [],
+                    "shellVisuals": [],
+                    "inventory": _empty_inventory(),
+                    "readiness": _empty_readiness(),
                 },
-                "readiness": {
-                    "allDeclaredAssetsComplete": False,
-                    "hasPartialDownloads": False,
-                    "declaredExecutableCount": 0,
-                    "presentExecutableCount": 0,
-                    "completeExecutableCount": 0,
-                    "missingExecutableCount": 0,
-                    "incompleteExecutableCount": 0,
-                    "declaredVisualCount": 0,
-                    "presentVisualCount": 0,
-                    "completeVisualCount": 0,
-                    "missingVisualCount": 0,
-                    "incompleteVisualCount": 0,
-                },
-            }
+                extra_paths=(args.repo_root, repo_root_resolved),
+            )
             if args.json:
                 print(json.dumps(report, indent=2))
             else:
                 print(format_report_text(report))
             return 1
+        extra_paths: tuple[Path, ...] = (args.repo_root, repo_root_resolved, target_dir)
     else:
         target_dir = args.game_dir
+        extra_paths = (target_dir,)
 
-    report = inspect_game_directory(target_dir)
+    report = sanitize_report(inspect_game_directory(target_dir), extra_paths=extra_paths)
     if args.json:
         print(json.dumps(report, indent=2))
     else:

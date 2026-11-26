@@ -15,6 +15,7 @@
 #include "guest/guest_callbacks.h"
 #include "guest/guest_runtime.h"
 #include "os/vmem.h"
+#include "os/win32_compat.h"
 #include "os/win32_kernel.h"
 #include "os/shim_exports.h"
 #include "os/win32_loader.h"
@@ -226,6 +227,19 @@ void sub_blob_cb(GuestState* s) {
     ret(s);
 }
 
+// void callback(void* context, const XNetworkingConnectivityHint* hint): records the hint.
+constexpr uint64_t kHintCb = 0x140020700ULL;
+std::atomic<int> g_hint_calls{0};
+std::atomic<uint64_t> g_hint_ctx{0};
+uint32_t g_hint_words[4] = {};
+
+void sub_hint_cb(GuestState* s) {
+    g_hint_ctx = s->gpr[GuestReg::Rcx];
+    CHECK(g_arena->read(s->gpr[GuestReg::Rdx], g_hint_words, sizeof(g_hint_words)));
+    g_hint_calls.fetch_add(1);
+    ret(s);
+}
+
 const LiftedFunctionEntry kFunctions[] = {
     {kRecord, sub_record},
     {kAsyncDone, sub_async_done},
@@ -233,6 +247,7 @@ const LiftedFunctionEntry kFunctions[] = {
     {kWorkFn, sub_work},
     {kEnumCb, sub_enum_cb},
     {kBlobCb, sub_blob_cb},
+    {kHintCb, sub_hint_cb},
 };
 
 struct GuestFault {
@@ -283,6 +298,10 @@ constexpr Guid kHdrProvider = com::make_guid("03f0fe74-fdd9-4e5c-b630-f9339c47ac
 constexpr Guid kHdrIid = com::make_guid("35f07670-706e-4bfb-9476-090798c5ebf3");
 constexpr Guid kUnmappedProvider = com::make_guid("dfcd4649-4ff8-4043-ba07-35d607df98b0");
 constexpr Guid kUnmappedIid = com::make_guid("eaf669df-5542-4590-99a3-8dc061f837cc");
+constexpr Guid kGameProvider = com::make_guid("973a344e-24bf-4d0f-8457-56c534892b29");
+constexpr Guid kGameIid = com::make_guid("2549f142-6419-4a06-97b5-931aab7c2f34");
+constexpr Guid kNetworkingProvider = com::make_guid("37e56907-2f10-41e8-b72f-36edb185331a");
+constexpr Guid kNetworkingIid = com::make_guid("bf2346b2-39af-4658-b5ea-44713c7e83b3");
 constexpr Guid kBogus = com::make_guid("12345678-1234-1234-1234-123456789abc");
 
 struct Fixture {
@@ -504,15 +523,62 @@ void test_query_api() {
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
     {
-        // XSpeechSynthesizer slot 9 (XSpeechSynthesizerCreate): no synthesizer, so it fails and
-        // leaves the handle null; a null out pointer is invalid.
+        // XSpeechSynthesizer: silent synthesizer. Fixed handle, empty 16 kHz mono WAVE streams.
+        // Pins the slot map read from the executable's wrappers: s8 EnumerateInstalledVoices,
+        // s9 Create, s10 CloseHandle, s11 SetDefaultVoice, s12 SetCustomVoice, s13 FromText,
+        // s14 CloseStream, s15 GetStreamDataSize, s16 GetStreamData, s21 FromSsml. (A guessed map
+        // without s8 trapped the boot once Create started succeeding.)
+        namespace gdk = playgta6::os::gdk;
         const uint64_t speech = fx.query(com::make_guid("3e241977-6237-41e9-8559-102c2d9983f1"),
                                          com::make_guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"));
+        // s8: no installed voices, so the callback never runs.
+        g_record_calls = 0;
+        CHECK(hr32(fx.vcall(speech, 8, {0x1234, kRecord})) == gdk::S_OK_HR);
+        CHECK(g_record_calls == 0);
+        CHECK(hr32(fx.vcall(speech, 8, {0, kRecord})) == gdk::S_OK_HR);
+        CHECK(g_record_calls == 0);
+        CHECK(hr32(fx.vcall(speech, 8, {0x1234, 0})) == com::E_INVALIDARG_HR);
+        CHECK(g_record_calls == 0);
         const uint64_t handle = fx.alloc(8);
         CHECK(com::write_guest(handle, uint64_t{0x1234}));
-        CHECK(hr32(fx.vcall(speech, 9, {handle})) == com::E_NOTIMPL_HR);
-        CHECK(load64(handle) == 0);
+        CHECK(hr32(fx.vcall(speech, 9, {handle})) == gdk::S_OK_HR);
+        const uint64_t h = load64(handle);
+        CHECK(h != 0 && h != 0x1234);
         CHECK(hr32(fx.vcall(speech, 9, {0})) == com::E_INVALIDARG_HR);
+        CHECK(hr32(fx.vcall(speech, 11, {h})) == gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 12, {h, fx.cstring("voice")})) == com::E_INVALIDARG_HR);
+        const uint64_t stream_out = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 21, {h, 0, stream_out})) == gdk::S_OK_HR);
+        CHECK(load64(stream_out) != 0);
+        CHECK(com::write_guest(stream_out, uint64_t{0}));
+        CHECK(hr32(fx.vcall(speech, 13, {h, 0, stream_out})) == gdk::S_OK_HR);
+        const uint64_t stream = load64(stream_out);
+        CHECK(stream != 0);
+        CHECK(hr32(fx.vcall(speech, 13, {h, 0, 0})) == com::E_INVALIDARG_HR);
+        const uint64_t size = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 15, {stream, size})) == gdk::S_OK_HR);
+        CHECK(load64(size) == 44);
+        const uint64_t buf = fx.alloc(64);
+        const uint64_t used = fx.alloc(8);
+        CHECK(hr32(fx.vcall(speech, 16, {stream, 10, buf, used})) == gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(speech, 16, {stream, 64, buf, used})) == gdk::S_OK_HR);
+        CHECK(load64(used) == 44);
+        uint8_t wav[44] = {};
+        CHECK(com::read_guest(buf, wav, sizeof(wav)));
+        CHECK(std::memcmp(wav, "RIFF", 4) == 0 && std::memcmp(wav + 8, "WAVE", 4) == 0);
+        CHECK(wav[22] == 1 && wav[24] == 0x80 && wav[25] == 0x3e && wav[34] == 16);
+        CHECK(wav[40] == 0 && wav[41] == 0 && wav[42] == 0 && wav[43] == 0);
+        CHECK(hr32(fx.vcall(speech, 14, {stream})) == gdk::S_OK_HR);
+        CHECK(hr32(fx.vcall(speech, 10, {h})) == gdk::S_OK_HR);
+        // s17 is not part of the map: it still traps.
+        bool trapped = false;
+        try {
+            fx.vcall(speech, 17, {0});
+        } catch (const GuestFault& f) {
+            trapped = f.info.kind == static_cast<uint32_t>(FaultKind::UnimplementedSlot) && f.info.detail == 17;
+        }
+        fx.restore_stack();
+        CHECK(trapped);
     }
     {
         // XGameSave (O34): a local provider. s3 hands out a handle, s4 completes through the
@@ -829,6 +895,53 @@ void test_task_queue_slots() {
     CHECK(fx.state().gpr[GuestReg::Rsp] == fx.thread.stack_top);
 }
 
+// XNetworking: the hint reports an initialized network with no connectivity, and each
+// registration gets exactly one initial notification with that hint on its completion port.
+void test_networking_slots() {
+    Fixture fx;
+    const uint64_t async = fx.query(kAsyncQueue, kAsyncQueue);
+    const uint64_t net = fx.query(kNetworkingProvider, kNetworkingIid);
+    const uint64_t hint = fx.alloc(16);
+    CHECK(hr32(fx.vcall(net, 15, {hint})) == 0);  // XNetworkingGetConnectivityHint
+    uint32_t words[4] = {};
+    CHECK(com::read_guest(hint, words, sizeof(words)));
+    CHECK(words[0] == 1u);            // connectivityLevel = None
+    CHECK(words[1] == 0u);            // connectivityCost = Unknown
+    CHECK((words[3] & 0xFFu) == 1u);  // networkInitialized
+    CHECK((words[3] >> 8) == 0u);     // no data limit / roaming flags
+
+    const uint64_t out = fx.alloc(8);
+    CHECK(hr32(fx.vcall(async, 12, {0, 0, out})) == 0);  // Manual / Manual queue
+    const uint64_t queue = load64(out);
+    g_hint_calls = 0;
+    std::memset(g_hint_words, 0xFF, sizeof(g_hint_words));
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0x4E7, kHintCb, out})) == 0);
+    const uint64_t token = load64(out);
+    CHECK(token != 0);
+    CHECK(g_hint_calls == 0);                                // queued, not inline
+    CHECK((fx.vcall(async, 16, {queue, 0, 0}) & 0xFF) == 0);  // nothing on the work port
+    CHECK((fx.vcall(async, 16, {queue, 1, 0}) & 0xFF) == 1);  // initial notification
+    CHECK(g_hint_calls == 1);
+    CHECK(g_hint_ctx == 0x4E7);
+    CHECK(g_hint_words[0] == 1u && g_hint_words[1] == 0u && (g_hint_words[3] & 0xFFu) == 1u);
+    CHECK((fx.vcall(async, 16, {queue, 1, 0}) & 0xFF) == 0);  // only once
+    CHECK((fx.vcall(net, 17, {token, 1}) & 0xFF) == 1);
+
+    // Unregistered before dispatch: no callback.
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0, kHintCb, out})) == 0);
+    CHECK((fx.vcall(net, 17, {load64(out), 0}) & 0xFF) == 1);
+    fx.vcall(async, 16, {queue, 1, 0});
+    CHECK(g_hint_calls == 1);
+
+    // Null queue: delivered on the process task queue.
+    CHECK(hr32(fx.vcall(net, 16, {0, 0x9, kHintCb, out})) == 0);
+    CHECK(wait_for([] { return g_hint_calls.load() == 2; }));
+    CHECK(g_hint_ctx == 0x9);
+    CHECK((fx.vcall(net, 17, {load64(out), 1}) & 0xFF) == 1);
+    CHECK(hr32(fx.vcall(net, 16, {queue, 0, 0, out})) == com::E_INVALIDARG_HR);
+    fx.vcall(async, 17, {queue});
+}
+
 void test_user_slots() {
     Fixture fx;
     const uint64_t async = fx.query(kAsyncQueue, kAsyncQueue);
@@ -940,27 +1053,36 @@ void test_unimplemented_slots() {
     CHECK(fault.info.detail == 8);
     CHECK(diag_contains("slot 8 called"));
 
-    // A stub-only interface reports its slots too.
-    int32_t hr = -1;
-    const uint64_t unmapped = fx.query(kUnmappedProvider, kUnmappedIid, &hr);
-    CHECK(hr == 0 && unmapped != 0);
-    trapped = false;
-    try {
-        fx.vcall(unmapped, 7, {1, 2, 3});
-    } catch (const GuestFault& f) {
-        fault = f;
-        trapped = true;
-    }
-    fx.restore_stack();
-    CHECK(trapped && fault.info.detail == 7);
-    bool reported = false;
-    for (const com::StubHit& hit : com::stub_hit_report()) {
-        if (hit.slot == 7 && hit.iid == kUnmappedIid && hit.hits == 1) {
-            reported = true;
+    // R40: stub-only interfaces no longer trap; each answers one documented HRESULT and counts hits.
+    const struct {
+        Guid provider;
+        Guid iid;
+        uint32_t expected;
+    } areas[] = {
+        {kUnmappedProvider, kUnmappedIid, 0x80004004u},                                        // XGameUi: E_ABORT
+        {com::make_guid("1b339674-328d-4283-a200-3171f18d3639"),
+         com::make_guid("1b339674-328d-4283-a200-3171f18d3639"), 0x80070032u},                 // shell
+        {com::make_guid("a4f1aee2-4bf1-4485-b008-a7c26d52ac27"),
+         com::make_guid("22e672d7-b4e3-406c-bd50-8f0d25236f9e"), 0x80070032u},                 // capture
+        {com::make_guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d"),
+         com::make_guid("bbfbdcc7-bfe7-409b-a5ca-edf054960b4d"), 0u},                          // events
+    };
+    for (const auto& area : areas) {
+        int32_t hr = -1;
+        const uint64_t obj = fx.query(area.provider, area.iid, &hr);
+        CHECK(hr == 0 && obj != 0);
+        const uint64_t r = fx.vcall(obj, 7, {1, 2, 3});
+        fx.restore_stack();
+        CHECK(static_cast<uint32_t>(r) == area.expected);
+        bool reported = false;
+        for (const com::StubHit& hit : com::stub_hit_report()) {
+            if (hit.slot == 7 && hit.iid == area.iid && hit.hits == 1) {
+                reported = true;
+            }
         }
+        CHECK(reported);
+        CHECK(fx.vcall(obj, 2) >= 1);  // IUnknown still works
     }
-    CHECK(reported);
-    CHECK(fx.vcall(unmapped, 2) >= 1);  // IUnknown still works
 }
 
 uint64_t make_guest_block(Fixture& fx, uint64_t queue) {
@@ -1206,15 +1328,59 @@ void test_store_ext_slots() {
 
 }  // namespace
 
+uint32_t g_exit_code = 0;
+int g_exit_calls = 0;
+void record_exit(uint32_t code, void*) {
+    g_exit_code = code;
+    ++g_exit_calls;
+}
+
+// XGame s4 XLaunchNewGame: the running title relaunching itself stops the guest with the relaunch
+// exit code (the harness restarts it); another title stays E_NOTIMPL.
+void test_launch_new_game() {
+    CHECK(prov::is_self_launch_target("game.exe", "game.exe"));
+    CHECK(prov::is_self_launch_target("D:\\Title\\GAME.EXE", "\"C:\\x y\\game.exe\" -arg 1"));
+    CHECK(prov::is_self_launch_target("./game.exe", "game.exe -foo"));
+    CHECK(!prov::is_self_launch_target("other.exe", "game.exe"));
+    CHECK(!prov::is_self_launch_target("game.exe", ""));
+    CHECK(!prov::is_self_launch_target("", "game.exe"));
+
+    Fixture fx;
+    int32_t hr = -1;
+    const uint64_t game = fx.query(kGameProvider, kGameIid, &hr);
+    CHECK(hr == 0 && game != 0);
+    playgta6::os::win32::set_command_line("Title.exe -mode 2");
+    playgta6::os::win32::reset_process_exit_state();
+    playgta6::os::win32::set_process_exit_handler(&record_exit, nullptr);
+    g_exit_calls = 0;
+
+    CHECK(hr32(fx.vcall(game, 4, {fx.cstring("Other.exe"), fx.cstring(""), 0})) == com::E_NOTIMPL_HR);
+    CHECK(g_exit_calls == 0);
+    CHECK(hr32(fx.vcall(game, 4, {0, 0, 0})) == static_cast<int32_t>(0x80070057u));
+    CHECK(hr32(fx.vcall(game, 4, {fx.cstring("title.exe"), fx.cstring("-mode 2"), 0})) == 0);
+    CHECK(g_exit_calls == 1 && g_exit_code == playgta6::os::win32::kRelaunchSelfExitCode);
+    uint32_t code = 0;
+    CHECK(playgta6::os::win32::process_exit_requested(&code) && code == playgta6::os::win32::kRelaunchSelfExitCode);
+    std::string relaunch_args;
+    CHECK(playgta6::os::win32::relaunch_requested(&relaunch_args) && relaunch_args == "-mode 2");
+    playgta6::os::win32::reset_relaunch_request();
+
+    playgta6::os::win32::set_process_exit_handler(nullptr, nullptr);
+    playgta6::os::win32::reset_process_exit_state();
+    playgta6::os::win32::set_command_line("game.exe");
+}
+
 int main() {
     test_module_and_exports();
     test_query_api();
     test_task_queue_slots();
     test_user_slots();
+    test_networking_slots();
     test_unimplemented_slots();
     test_async_provider_slots();
     test_http_client_thunks();
     test_store_ext_slots();
+    test_launch_new_game();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xgameruntime_provider: %d failure(s)\n", g_failures);
         return 1;

@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstdio>
@@ -16,6 +18,7 @@
 #include <vector>
 
 #include "guest/guest_runtime.h"
+#include "os/bcpack.h"
 #include "os/os_shim.h"
 #include "os/win32_kernel.h"
 #include "os/win32_loader.h"
@@ -47,13 +50,48 @@ void diag(const std::string& message) {
     com::detail::diagnostic(message.c_str());
 }
 
+int64_t trace_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool path_is_audio(const std::u16string& path) {
+    std::string lower;
+    for (char16_t c : path) {
+        lower.push_back(static_cast<char>(c < 0x80 ? std::tolower(static_cast<int>(c)) : '?'));
+    }
+    return lower.find("audio") != std::string::npos;
+}
+
+// PG6_AUDIO_TRACE=1: every request on a file whose path names audio (at most 2000 lines).
+void trace_audio_request(const std::u16string& path, const DStorageRequest& r, HResult hr, int64_t enqueued_ms) {
+    static std::atomic<uint32_t> lines{0};
+    if (!path_is_audio(path) || lines.fetch_add(1) >= 2000) {
+        return;
+    }
+    std::string name;
+    for (char16_t c : path) {
+        name.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+    }
+    char line[400];
+    std::snprintf(line, sizeof(line),
+                  "audio-trace: XCRDAPI '%s' +0x%" PRIx64 " %u -> %u bytes, options 0x%" PRIx64 ", %s, %" PRId64
+                  " ms after enqueue (t=%" PRId64 ")",
+                  name.c_str(), r.source_offset, r.source_size, r.destination_size, r.options, hr_text(hr).c_str(),
+                  trace_now_ms() - enqueued_ms, trace_now_ms());
+    diag(line);
+}
+
 // One diagnostic per distinct problem (requests can fail by the thousand).
 struct OnceFlags {
     std::atomic<bool> bad_options{false};
-    std::atomic<bool> bad_format{false};
+    std::atomic<bool> bcpack{false};
+    std::atomic<bool> bad_pages{false};
     std::atomic<bool> bad_request{false};
     std::atomic<bool> read_failed{false};
     std::atomic<bool> inflate_failed{false};
+    std::atomic<bool> bcpack_failed{false};
     std::atomic<bool> bad_signal{false};
     std::atomic<bool> closed_queue{false};
 };
@@ -116,6 +154,9 @@ struct Counters {
     std::atomic<uint64_t> decompressed_requests{0};
     std::atomic<uint64_t> submits{0};
     std::atomic<uint64_t> live_queues{0};
+    std::atomic<uint64_t> physical_page_requests{0};
+    std::atomic<uint64_t> bcpack_requests{0};  // all BCPack requests (option bits 1-4)
+    std::atomic<uint64_t> bcpack_decoded{0};   // ... of which unpacked into their destination
 
     std::atomic<uint32_t> worker_threads{1};
     std::atomic<uint64_t> max_gap{64 * 1024};
@@ -685,7 +726,6 @@ public:
 
     DStorageQueue(const DStorageQueueDesc& desc, std::string name) : desc_(desc), name_(std::move(name)) {
         capacity_ = desc.capacity;
-        auto_submit_ = std::max<size_t>(1, capacity_ / 2);
         counters().live_queues.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -707,7 +747,7 @@ public:
         if (!request.read(item.req)) {
             diag("XCRDAPI: EnqueueRequest with unreadable request " + hex64(request.va()));
             item.error = com::E_INVALIDARG_HR;
-        } else if ((item.req.options & kDStorageOptionSourceMemory) == 0) {
+        } else if (!parse_dstorage_options(item.req.options).source_memory) {
             auto file = com::InterfaceArg<DStorageFile>::resolve(item.req.source);
             if (!file) {
                 diag_once(once().bad_request, "XCRDAPI: EnqueueRequest source " + hex64(item.req.source) +
@@ -818,8 +858,8 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             const size_t used = occupancy_locked();
             info.empty_slot_count = static_cast<uint16_t>(used >= capacity_ ? 0 : capacity_ - used);
-            info.request_count_until_auto_submit =
-                static_cast<uint16_t>(pending_.size() >= auto_submit_ ? 0 : auto_submit_ - pending_.size());
+            // Auto-submit happens only when an enqueue finds the queue full.
+            info.request_count_until_auto_submit = info.empty_slot_count;
         }
         if (!out.is_null()) {
             out.write(info);
@@ -841,6 +881,7 @@ private:
         uint64_t value = 0;
         HResult error = kOk;  // found at enqueue time
         bool cancelled = false;
+        int64_t enqueued_ms = 0;  // PG6_AUDIO_TRACE: request latency
     };
 
     size_t occupancy_locked() const { return pending_.size() + submitted_.size() + in_flight_; }
@@ -853,7 +894,11 @@ private:
         }
     }
 
+    // Work starts only at Submit: the title fills a request's page list after EnqueueRequest and
+    // before its own Submit, so running earlier writes into stale pages. The one exception is an
+    // enqueue that finds the queue full, which must submit to make progress.
     void enqueue(Item&& item) {
+        item.enqueued_ms = trace_now_ms();
         std::unique_lock<std::mutex> lock(mutex_);
         while (!closed_ && occupancy_locked() >= capacity_) {
             if (!pending_.empty()) {
@@ -868,9 +913,6 @@ private:
             return;
         }
         pending_.push_back(std::move(item));
-        if (pending_.size() >= auto_submit_) {
-            submit_locked();
-        }
     }
 
     void submit_locked() {
@@ -913,11 +955,11 @@ private:
     // Executes the requests of one batch (worker thread); returns per-request results.
     void execute(HostReader& reader, std::vector<Item>& items, std::vector<HResult>& results);
     HResult deliver(const Item& item, const uint8_t* data, size_t len, std::vector<uint8_t>& scratch);
+    HResult write_destination(const DStorageRequest& r, const uint8_t* data, size_t len);
 
     DStorageQueueDesc desc_;
     std::string name_;
     size_t capacity_ = 0;
-    size_t auto_submit_ = 1;
 
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -1045,34 +1087,87 @@ bool DStorageQueue::run_batch(HostReader& reader) {
     return more;
 }
 
+// Writes `len` bytes to the request's destination: a guest buffer, or with
+// DestinationIsPhysicalPages the physical pages listed by the guest array at `destination`.
+HResult DStorageQueue::write_destination(const DStorageRequest& r, const uint8_t* data, size_t len) {
+    if (!parse_dstorage_options(r.options).physical_pages) {
+        return com::write_guest(r.destination, data, len) ? kOk : com::E_INVALIDARG_HR;
+    }
+    const uint64_t array = r.destination;
+    auto entry_at = [array](size_t i, uint64_t* entry) { return com::read_guest(array + i * 8, entry, 8); };
+    // destination_reserved: the start offset into the first page (small textures share a page).
+    if (!scarlett::xmem_write_physical_pages(entry_at, data, len, r.destination_reserved)) {
+        diag_once(once().bad_pages, "XCRDAPI: DestinationIsPhysicalPages request: page array " + hex64(array) +
+                                        " names no live physical pages for " + std::to_string(len) + " bytes");
+        return com::E_INVALIDARG_HR;
+    }
+    return kOk;
+}
+
 HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len, std::vector<uint8_t>& scratch) {
     const DStorageRequest& r = item.req;
-    const uint32_t format = static_cast<uint32_t>(r.options & kDStorageOptionFormatMask);
-    if (format == kDStorageFormatNone) {
-        if (!com::write_guest(r.destination, data, len)) {
-            return com::E_INVALIDARG_HR;
+    const DStorageOptions opts = parse_dstorage_options(r.options);
+    if (!opts.compressed()) {
+        const HResult hr = write_destination(r, data, len);
+        if (gdk::succeeded(hr)) {
+            counters().bytes_delivered.fetch_add(len, std::memory_order_relaxed);
         }
-        counters().bytes_delivered.fetch_add(len, std::memory_order_relaxed);
-        return kOk;
+        return hr;
     }
-    const size_t expected = r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size;
-    uint8_t* out = static_cast<uint8_t*>(com::guest_to_host(r.destination, expected));
+    const bool unpack_bc = opts.bcpack_mode != 0;
+    // zlib and BCPack together: the console inflates first (to uncompressed_size bytes, the
+    // intermediate size), then unpacks the BC blocks into the destination.
+    std::vector<uint8_t> intermediate;
+    if (unpack_bc && opts.zlib) {
+        size_t produced = 0;
+        intermediate.resize(r.uncompressed_size);
+        const InflateStatus st = r.uncompressed_size == 0
+                                     ? InflateStatus::OutputTooSmall
+                                     : inflate_stream(data, len, intermediate.data(), intermediate.size(), &produced);
+        if (st != InflateStatus::Ok) {
+            diag_once(once().inflate_failed, "XCRDAPI: zlib stage of a zlib+BCPack request failed (status " +
+                                                 std::to_string(static_cast<int>(st)) + ", intermediate size " +
+                                                 std::to_string(r.uncompressed_size) + ")");
+            return kHrInvalidData;
+        }
+        intermediate.resize(produced);
+        data = intermediate.data();
+        len = intermediate.size();
+    }
+    const size_t expected =
+        unpack_bc ? r.destination_size : (r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size);
+    uint8_t* out = opts.physical_pages ? nullptr : static_cast<uint8_t*>(com::guest_to_host(r.destination, expected));
     if (out == nullptr) {
         scratch.resize(expected);
         out = scratch.data();
     }
-    size_t produced = 0;
-    const InflateStatus st = inflate_stream(data, len, out, expected, &produced);
-    if (st != InflateStatus::Ok || produced != expected) {
-        diag_once(once().inflate_failed, "XCRDAPI: zlib request failed (status " +
-                                             std::to_string(static_cast<int>(st)) + ", produced " +
-                                             std::to_string(produced) + " of " + std::to_string(expected) + ")");
-        return kHrInvalidData;
+    if (unpack_bc) {
+        const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
+        const bcpack::DecodeStatus st = tables ? bcpack::decode(*tables, opts.bcpack_mode, data, len, out, expected)
+                                               : bcpack::DecodeStatus::Unsupported;
+        if (st != bcpack::DecodeStatus::Ok) {
+            diag_once(once().bcpack_failed, "XCRDAPI: BCPack request (mode " + std::to_string(opts.bcpack_mode) +
+                                                ", " + std::to_string(len) + " -> " + std::to_string(expected) +
+                                                " bytes) failed: " + bcpack::decode_status_name(st));
+            return kHrInvalidData;
+        }
+        counters().bcpack_decoded.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        size_t produced = 0;
+        const InflateStatus st = inflate_stream(data, len, out, expected, &produced);
+        if (st != InflateStatus::Ok || produced != expected) {
+            diag_once(once().inflate_failed, "XCRDAPI: zlib request failed (status " +
+                                                 std::to_string(static_cast<int>(st)) + ", produced " +
+                                                 std::to_string(produced) + " of " + std::to_string(expected) + ")");
+            return kHrInvalidData;
+        }
     }
-    if (out == scratch.data() && !com::write_guest(r.destination, out, expected)) {
-        return com::E_INVALIDARG_HR;
-    }
-    if (out != scratch.data()) {
+    if (out == scratch.data()) {
+        const HResult hr = write_destination(r, out, expected);
+        if (gdk::failed(hr)) {
+            return hr;
+        }
+    } else {
         guest_window::mark_written(r.destination, expected);  // O37: inflated in place
     }
     counters().decompressed_requests.fetch_add(1, std::memory_order_relaxed);
@@ -1095,20 +1190,40 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             continue;
         }
         const DStorageRequest& r = item.req;
-        const uint64_t unknown_bits = r.options & ~(kDStorageOptionFormatMask | kDStorageOptionSourceMemory);
-        const uint32_t format = static_cast<uint32_t>(r.options & kDStorageOptionFormatMask);
-        if (unknown_bits != 0) {
-            diag_once(once().bad_options, "XCRDAPI: request options " + hex64(r.options) +
-                                              " use unsupported bits (destination type / flags)");
+        const DStorageOptions opts = parse_dstorage_options(r.options);
+        if (opts.unknown_bits != 0) {
+            diag_once(once().bad_options, "XCRDAPI: request options " + hex64(r.options) + " use unsupported bits " +
+                                              hex64(opts.unknown_bits));
             results[i] = com::E_NOTIMPL_HR;
             continue;
         }
-        if (format != kDStorageFormatNone && format != kDStorageFormatZlib) {
-            diag_once(once().bad_format, "XCRDAPI: unsupported compression format " + std::to_string(format));
-            results[i] = com::E_NOTIMPL_HR;
-            continue;
+        if (opts.bcpack_mode != 0) {
+            const uint64_t n = counters().bcpack_requests.fetch_add(1, std::memory_order_relaxed) + 1;
+            const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
+            if (!tables || !bcpack::supports(*tables, opts.bcpack_mode)) {
+                if ((n & (n - 1)) == 0) {  // the 1st, 2nd, 4th, ... (they fail by the hundred: say which)
+                    std::string name;
+                    read_guest_string(r.name, 96, &name);
+                    const std::string why =
+                        !tables ? "no BCPack tables are loaded: pass --bcpack-tables <file> or set "
+                                  "PLAYGTA6_BCPACK_TABLES (the repository does not ship them; docs/BCPACK.md)"
+                                : "the loaded BCPack tables cannot decode mode " + std::to_string(opts.bcpack_mode) +
+                                      " (they support: " + bcpack::supported_formats(*tables) +
+                                      "; BC2 has no BCPack decoder)";
+                    diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
+                         std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
+                         std::to_string(r.destination_size) + " bytes, request '" + name + "'); " + why +
+                         ", failing with E_NOTIMPL (BCPack request " + std::to_string(n) + ")");
+                }
+                results[i] = com::E_NOTIMPL_HR;
+                continue;
+            }
         }
-        const size_t out_size = format == kDStorageFormatNone
+        if (opts.physical_pages) {
+            counters().physical_page_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+        const size_t out_size = opts.bcpack_mode != 0 ? r.destination_size
+                                : !opts.zlib
                                     ? r.source_size
                                     : (r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size);
         if ((out_size != 0 && r.destination == 0) || out_size > r.destination_size) {
@@ -1121,7 +1236,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         if (r.source_size == 0) {
             continue;  // nothing to transfer
         }
-        if ((r.options & kDStorageOptionSourceMemory) != 0) {
+        if (opts.source_memory) {
             staging.resize(r.source_size);
             if (!com::read_guest(r.source, staging.data(), staging.size())) {
                 results[i] = com::E_INVALIDARG_HR;
@@ -1149,7 +1264,8 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
     auto read_single = [&](size_t i) {
         const Item& item = items[i];
         const DStorageRequest& r = item.req;
-        const bool plain = (r.options & kDStorageOptionFormatMask) == kDStorageFormatNone;
+        const DStorageOptions opts = parse_dstorage_options(r.options);
+        const bool plain = !opts.compressed() && !opts.physical_pages;
         void* direct = plain ? com::guest_to_host(r.destination, r.source_size) : nullptr;
         if (direct != nullptr) {
             const HResult hr = reader.read(item.file->host(), r.source_offset, direct, r.source_size);
@@ -1207,6 +1323,9 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
     for (size_t i = 0; i < results.size(); ++i) {
         if (gdk::failed(results[i]) && items[i].kind == Item::Request && !items[i].cancelled) {
             diag_once(once().read_failed, "XCRDAPI: request failed with " + hr_text(results[i]));
+        }
+        if (items[i].kind == Item::Request && items[i].file && audio_trace_enabled()) {
+            trace_audio_request(items[i].file->path(), items[i].req, results[i], items[i].enqueued_ms);
         }
     }
 }
@@ -1310,6 +1429,13 @@ HResult DStorageFactory::OpenFile(GuestPtr<char16_t> path, const Guid& riid, Out
     }
     void* raw = nullptr;
     const HResult hr = host_->OpenFile(name.c_str(), scarlett::kIidIDStorageFile, &raw);
+    if (audio_trace_enabled()) {
+        std::string utf8;
+        for (char16_t c : name) {
+            utf8.push_back(c < 0x80 ? static_cast<char>(c) : '?');
+        }
+        diag("audio-trace: XCRDAPI OpenFile '" + utf8 + "' -> " + hr_text(hr));
+    }
     if (gdk::failed(hr)) {
         return hr;
     }
@@ -1458,6 +1584,9 @@ DStorageStats dstorage_stats() {
     s.decompressed_requests = c.decompressed_requests.load();
     s.submits = c.submits.load();
     s.live_queues = c.live_queues.load();
+    s.physical_page_requests = c.physical_page_requests.load();
+    s.bcpack_requests = c.bcpack_requests.load();
+    s.bcpack_decoded = c.bcpack_decoded.load();
     return s;
 }
 
@@ -1518,16 +1647,21 @@ void reset_xbox_scarlett_guest() {
     c.coalesced_requests = 0;
     c.decompressed_requests = 0;
     c.submits = 0;
+    c.physical_page_requests = 0;
+    c.bcpack_requests = 0;
+    c.bcpack_decoded = 0;
     c.worker_threads = 1;
     c.max_gap = 64 * 1024;
     c.max_span = 4 * 1024 * 1024;
     c.staging_size = 32 * 1024 * 1024;
     OnceFlags& f = once();
     f.bad_options = false;
-    f.bad_format = false;
+    f.bcpack = false;
+    f.bad_pages = false;
     f.bad_request = false;
     f.read_failed = false;
     f.inflate_failed = false;
+    f.bcpack_failed = false;
     f.bad_signal = false;
     f.closed_queue = false;
 }

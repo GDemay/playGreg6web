@@ -772,7 +772,7 @@ test('exported .pg6trace binary stream disassembles cleanly with tools/gpu_trace
   assert.equal(parsed.frames[1].has_begin_frame, true);
 });
 
-test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
+test('ABI v2 opcodes (22..40) match playgta6_abi.h and wgpu_worker.js', () => {
   const expectedV2 = [
     ['CREATE_BIND_GROUP_LAYOUT', 22, 'CreateBindGroupLayout'],
     ['CREATE_PIPELINE_LAYOUT', 23, 'CreatePipelineLayout'],
@@ -788,12 +788,14 @@ test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
     ['SET_BIND_GROUP2', 33, 'SetBindGroup2'],
     ['CREATE_SAMPLER2', 34, 'CreateSampler2'],
     ['CREATE_TEXTURE2', 35, 'CreateTexture2'],
+    ['READBACK_BUFFER', 39, 'ReadbackBuffer'],
+    ['READBACK_TEXTURE', 40, 'ReadbackTexture'],
   ];
 
-  // Exact parity with WgpuCommandProcessor's OPCODES table (0..35).
+  // Exact parity with WgpuCommandProcessor's OPCODES table (0..40).
   assert.deepEqual(OPCODES, WGPU_OPCODES);
-  assert.equal(Object.keys(OPCODES).length, 36);
-  assert.equal(Object.keys(OPCODE_NAMES).length, 36);
+  assert.equal(Object.keys(OPCODES).length, 41);
+  assert.equal(Object.keys(OPCODE_NAMES).length, 41);
 
   for (const [constName, value, canonicalName] of expectedV2) {
     assert.equal(OPCODES[constName], value);
@@ -802,6 +804,8 @@ test('ABI v2 opcodes (22..35) match playgta6_abi.h and wgpu_worker.js', () => {
   }
   assert.equal(OPCODES.CREATE_TEXTURE2, 35);
   assert.equal(getOpcodeName(35), 'CreateTexture2');
+  assert.equal(OPCODES.DISPATCH_INDIRECT, 38);
+  assert.equal(getOpcodeName(36), 'DrawIndirect');
 });
 
 test('splitTraceIntoFrames splits multi-frame, omitted-payload, empty, and truncated traces', () => {

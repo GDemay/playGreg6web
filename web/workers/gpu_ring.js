@@ -203,9 +203,15 @@
       );
       this._headerScratch = new Uint8Array(GPU_PACKET_HEADER_BYTES);
       this._headerScratchView = new DataView(this._headerScratch.buffer);
-      // Pre-allocated reusable wrap scratch buffer so wrap-around spans avoid per-batch allocations.
+      // Pre-allocated reusable wrap scratch buffer + cached DataView so wrap-around spans
+      // avoid per-batch backing and DataView allocations.
       const initialWrapScratchBytes = Math.min(this._capacityBytes, DEFAULT_WRAP_SCRATCH_BYTES);
       this._wrapScratch = new Uint8Array(initialWrapScratchBytes);
+      this._wrapScratchView = new DataView(
+        this._wrapScratch.buffer,
+        this._wrapScratch.byteOffset,
+        this._wrapScratch.byteLength
+      );
       this._scratch = this._wrapScratch;
       // Reusable descriptor and result objects for zero-alloc consumer batch span draining.
       this._spanDescriptor = {
@@ -217,6 +223,8 @@
         packets: 0,
         wrapped: false,
         zeroCopy: false,
+        dataView: null,
+        viewOffset: 0,
       };
       this._reusableDrainResult = {
         packets: 0,
@@ -260,8 +268,36 @@
         nextSize = requiredBytes;
       }
       this._wrapScratch = new Uint8Array(nextSize);
+      this._wrapScratchView = new DataView(
+        this._wrapScratch.buffer,
+        this._wrapScratch.byteOffset,
+        this._wrapScratch.byteLength
+      );
       this._scratch = this._wrapScratch;
       return this._wrapScratch;
+    }
+
+    _copyWrappedToScratch(startOffset, byteLength) {
+      const scratch = this._ensureWrapScratch(byteLength);
+      const data = this._data;
+      const cap = this._capacityBytes;
+      const firstLen = cap - startOffset;
+      const secondLen = byteLength - firstLen;
+      if (firstLen <= 128) {
+        for (let i = 0; i < firstLen; i++) {
+          scratch[i] = data[startOffset + i];
+        }
+      } else {
+        scratch.set(data.subarray(startOffset, cap), 0);
+      }
+      if (secondLen <= 128) {
+        for (let i = 0; i < secondLen; i++) {
+          scratch[firstLen + i] = data[i];
+        }
+      } else {
+        scratch.set(data.subarray(0, secondLen), firstLen);
+      }
+      return scratch;
     }
 
     _recordOccupancy(bytes) {
@@ -358,6 +394,14 @@
       return this._capacityBytes;
     }
 
+    get dataView() {
+      return this._dataView;
+    }
+
+    get wrapScratchView() {
+      return this._wrapScratchView;
+    }
+
     get magic() {
       return Atomics.load(this._headerU32, HEADER_INDEX.MAGIC);
     }
@@ -442,9 +486,11 @@
       }
 
       const offset = (writePos & this._mask) >>> 0;
-      const firstLen = Math.min(len, this._capacityBytes - offset);
-      this._data.set(src.subarray(0, firstLen), offset);
-      if (len > firstLen) {
+      if (offset + len <= this._capacityBytes) {
+        this._data.set(src, offset);
+      } else {
+        const firstLen = this._capacityBytes - offset;
+        this._data.set(src.subarray(0, firstLen), offset);
         this._data.set(src.subarray(firstLen, len), 0);
       }
 
@@ -475,9 +521,11 @@
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const avail = (writePos - readPos) >>> 0;
-      this._drainCalls = sanitizeNonNegInt(this._drainCalls) + 1;
+      const curDrainCalls = this._drainCalls;
+      this._drainCalls = curDrainCalls >= 0 && curDrainCalls < Infinity ? curDrainCalls + 1 : 1;
       if (avail === 0) {
-        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        const curEmpty = this._emptyDrains;
+        this._emptyDrains = curEmpty >= 0 && curEmpty < Infinity ? curEmpty + 1 : 1;
         return 0;
       }
       this._recordOccupancy(avail);
@@ -487,11 +535,7 @@
       if (offset + avail <= this._capacityBytes) {
         slice = this._data.subarray(offset, offset + avail);
       } else {
-        const scratch = this._ensureWrapScratch(avail);
-        const firstLen = this._capacityBytes - offset;
-        const secondLen = avail - firstLen;
-        scratch.set(this._data.subarray(offset, this._capacityBytes), 0);
-        scratch.set(this._data.subarray(0, secondLen), firstLen);
+        const scratch = this._copyWrappedToScratch(offset, avail);
         slice = scratch.subarray(0, avail);
       }
 
@@ -501,12 +545,20 @@
       } finally {
         Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
         Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
-        this._totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained) + avail;
-        const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+        const curTotal = this._totalBytesDrained;
+        this._totalBytesDrained =
+          (curTotal >= 0 && curTotal < Infinity ? curTotal : 0) + avail;
+        const curMaxBytes =
+          this._maxDrainBatchBytes >= 0 && this._maxDrainBatchBytes < Infinity
+            ? this._maxDrainBatchBytes
+            : 0;
         if (avail > curMaxBytes) {
           this._maxDrainBatchBytes = avail;
         }
-        const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+        const curPeakBatch =
+          this._peakBatchBytes >= 0 && this._peakBatchBytes < Infinity
+            ? this._peakBatchBytes
+            : 0;
         if (avail > curPeakBatch) {
           this._peakBatchBytes = avail;
         }
@@ -602,14 +654,12 @@
             payloadBytes = this._dataView.getUint32(pktOffset + 4, true);
           } else {
             const firstHdr = this._capacityBytes - pktOffset;
-            this._headerScratch.set(
-              this._data.subarray(pktOffset, this._capacityBytes),
-              0
-            );
-            this._headerScratch.set(
-              this._data.subarray(0, GPU_PACKET_HEADER_BYTES - firstHdr),
-              firstHdr
-            );
+            for (let i = 0; i < firstHdr; i++) {
+              this._headerScratch[i] = this._data[pktOffset + i];
+            }
+            for (let i = firstHdr; i < GPU_PACKET_HEADER_BYTES; i++) {
+              this._headerScratch[i] = this._data[i - firstHdr];
+            }
             opcode = this._headerScratchView.getUint16(0, true);
             flags = this._headerScratchView.getUint16(2, true);
             payloadBytes = this._headerScratchView.getUint32(4, true);
@@ -632,11 +682,7 @@
             );
           } else {
             packetWrapped = true;
-            const scratch = this._ensureWrapScratch(packetLen);
-            const firstLen = this._capacityBytes - pktOffset;
-            const secondLen = packetLen - firstLen;
-            scratch.set(this._data.subarray(pktOffset, this._capacityBytes), 0);
-            scratch.set(this._data.subarray(0, secondLen), firstLen);
+            const scratch = this._copyWrappedToScratch(pktOffset, packetLen);
             bytes = scratch.subarray(0, packetLen);
             payload = scratch.subarray(GPU_PACKET_HEADER_BYTES, packetLen);
           }
@@ -729,6 +775,7 @@
       let maxBytes = this._capacityBytes;
       let framed = true;
       let reuseResult = false;
+      let directView = false;
 
       if (options !== undefined && options !== null) {
         if (typeof options === 'number') {
@@ -769,6 +816,9 @@
           if (options.reuseResult !== undefined) {
             reuseResult = Boolean(options.reuseResult);
           }
+          if (options.directView !== undefined) {
+            directView = Boolean(options.directView);
+          }
         } else {
           throw new TypeError(
             'GpuRingBuffer.drainBatchZeroAlloc options must be an options object or positive integer maxPackets'
@@ -779,10 +829,12 @@
       const readPos = Atomics.load(this._headerU32, HEADER_INDEX.READ_POS);
       const writePos = Atomics.load(this._headerU32, HEADER_INDEX.WRITE_POS);
       const avail = (writePos - readPos) >>> 0;
-      this._drainCalls = sanitizeNonNegInt(this._drainCalls) + 1;
+      const curDrainCalls = this._drainCalls;
+      this._drainCalls = curDrainCalls >= 0 && curDrainCalls < Infinity ? curDrainCalls + 1 : 1;
 
       if (avail === 0) {
-        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        const curEmpty = this._emptyDrains;
+        this._emptyDrains = curEmpty >= 0 && curEmpty < Infinity ? curEmpty + 1 : 1;
         if (reuseResult) {
           this._reusableDrainResult.packets = 0;
           this._reusableDrainResult.bytes = 0;
@@ -840,7 +892,8 @@
       }
 
       if (spanBytes === 0) {
-        this._emptyDrains = sanitizeNonNegInt(this._emptyDrains) + 1;
+        const curEmpty = this._emptyDrains;
+        this._emptyDrains = curEmpty >= 0 && curEmpty < Infinity ? curEmpty + 1 : 1;
         if (reuseResult) {
           this._reusableDrainResult.packets = 0;
           this._reusableDrainResult.bytes = 0;
@@ -859,51 +912,78 @@
       }
 
       let bytesView;
+      let viewOffset = 0;
+      let spanDataView;
       let wrapped = false;
       if (startOffset + spanBytes <= this._capacityBytes) {
-        bytesView = this._data.subarray(startOffset, startOffset + spanBytes);
+        spanDataView = this._dataView;
+        if (directView) {
+          bytesView = this._data;
+          viewOffset = startOffset;
+        } else {
+          bytesView = this._data.subarray(startOffset, startOffset + spanBytes);
+          viewOffset = 0;
+        }
       } else {
         wrapped = true;
-        const scratch = this._ensureWrapScratch(spanBytes);
-        const firstLen = this._capacityBytes - startOffset;
-        const secondLen = spanBytes - firstLen;
-        scratch.set(this._data.subarray(startOffset, this._capacityBytes), 0);
-        scratch.set(this._data.subarray(0, secondLen), firstLen);
-        bytesView = scratch.subarray(0, spanBytes);
+        const scratch = this._copyWrappedToScratch(startOffset, spanBytes);
+        spanDataView = this._wrapScratchView;
+        if (directView) {
+          bytesView = scratch;
+          viewOffset = 0;
+        } else {
+          bytesView = scratch.subarray(0, spanBytes);
+          viewOffset = 0;
+        }
       }
 
       const zeroCopy = !wrapped;
       const span = this._spanDescriptor;
       span.bytes = bytesView;
-      span.byteOffset = 0;
+      span.byteOffset = viewOffset;
       span.byteLength = spanBytes;
-      span.bufferByteOffset = bytesView.byteOffset;
+      span.bufferByteOffset = bytesView.byteOffset + viewOffset;
       span.ringOffset = startOffset;
       span.packets = packetCount;
       span.wrapped = wrapped;
       span.zeroCopy = zeroCopy;
+      span.dataView = spanDataView;
+      span.viewOffset = wrapped ? 0 : startOffset;
 
       // Only advance READ_POS and telemetry if handler succeeds without throwing.
-      handler(bytesView, 0, spanBytes, span);
+      handler(bytesView, viewOffset, spanBytes, span);
 
       const nextRead = (readPos + spanBytes) >>> 0;
       Atomics.store(this._headerU32, HEADER_INDEX.READ_POS, nextRead);
       Atomics.notify(this._headerI32, HEADER_INDEX.READ_POS, 1);
 
-      this._totalBytesDrained = sanitizeNonNegInt(this._totalBytesDrained) + spanBytes;
-      const curMaxBytes = sanitizeNonNegInt(this._maxDrainBatchBytes);
+      const curTotal = this._totalBytesDrained;
+      this._totalBytesDrained =
+        (curTotal >= 0 && curTotal < Infinity ? curTotal : 0) + spanBytes;
+      const curMaxBytes =
+        this._maxDrainBatchBytes >= 0 && this._maxDrainBatchBytes < Infinity
+          ? this._maxDrainBatchBytes
+          : 0;
       if (spanBytes > curMaxBytes) {
         this._maxDrainBatchBytes = spanBytes;
       }
-      const curPeakBatch = sanitizeNonNegInt(this._peakBatchBytes);
+      const curPeakBatch =
+        this._peakBatchBytes >= 0 && this._peakBatchBytes < Infinity
+          ? this._peakBatchBytes
+          : 0;
       if (spanBytes > curPeakBatch) {
         this._peakBatchBytes = spanBytes;
       }
-      this._zeroAllocDrains = sanitizeNonNegInt(this._zeroAllocDrains) + 1;
-      this._batchesDrained = sanitizeNonNegInt(this._batchesDrained) + 1;
+      const curZeroAlloc = this._zeroAllocDrains;
+      this._zeroAllocDrains = curZeroAlloc >= 0 && curZeroAlloc < Infinity ? curZeroAlloc + 1 : 1;
+      const curBatches = this._batchesDrained;
+      this._batchesDrained = curBatches >= 0 && curBatches < Infinity ? curBatches + 1 : 1;
       if (packetCount > 0) {
-        this._packetsDrained = sanitizeNonNegInt(this._packetsDrained) + packetCount;
-        const curMaxBatch = sanitizeNonNegInt(this._maxBatchSize);
+        const curPackets = this._packetsDrained;
+        this._packetsDrained =
+          (curPackets >= 0 && curPackets < Infinity ? curPackets : 0) + packetCount;
+        const curMaxBatch =
+          this._maxBatchSize >= 0 && this._maxBatchSize < Infinity ? this._maxBatchSize : 0;
         if (packetCount > curMaxBatch) {
           this._maxBatchSize = packetCount;
         }

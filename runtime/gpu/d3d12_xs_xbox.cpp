@@ -19,7 +19,9 @@
 #include "gpu/d3d12_guest_resources.h"
 #include "gpu/descriptor_words.h"
 #include "gpu/present_pacing.h"
+#include "guest/boot.h"
 #include "os/os_shim.h"
+#include "os/win32_kernel.h"
 #include "os/xmem_windows.h"
 
 namespace playgta6::gpu::d3d12_guest {
@@ -350,7 +352,14 @@ bool parse_pipeline_stream(const uint8_t* bytes, size_t size, StreamPipeline* ou
             std::memcpy(&p.compute.CS, d, 16);
             has_cs = true;
             break;
-        case 23: case 24: has_mesh = true; break;
+        case 23:
+            p.amplification = true;
+            has_mesh = true;
+            break;
+        case 24:
+            std::memcpy(&p.mesh, d, 16);
+            has_mesh = true;
+            break;
         case 7: std::memcpy(&g.StreamOutput, d, 32); break;
         case 8: std::memcpy(&g.BlendState, d, sizeof(GuestBlendDesc)); break;
         case 9: g.SampleMask = load<uint32_t>(d); break;
@@ -524,6 +533,7 @@ bool FramePacer::is_shut_down() const {
 
 namespace {
 std::atomic<bool> g_present_token_waits{true};
+std::atomic<uint32_t> g_present_max_interval{0};
 std::atomic<uint64_t> g_frame_waits{0};
 std::atomic<uint64_t> g_frame_wait_us{0};
 std::atomic<uint64_t> g_frame_polls{0};
@@ -531,6 +541,14 @@ std::atomic<uint64_t> g_frame_timeouts{0};
 }  // namespace
 
 void xbox::set_present_token_waits(bool on) { g_present_token_waits.store(on, std::memory_order_relaxed); }
+
+void xbox::set_present_max_interval(uint32_t max_interval) {
+    g_present_max_interval.store(max_interval, std::memory_order_relaxed);
+}
+
+uint32_t xbox::present_max_interval() {
+    return g_present_max_interval.load(std::memory_order_relaxed);
+}
 
 xbox::FrameWaitTotals xbox::frame_wait_totals() {
     FrameWaitTotals t;
@@ -549,10 +567,66 @@ HResult Device::SetFrameIntervalX(uint64_t, uint32_t interval_us, uint32_t perio
     return kSOk;
 }
 
-HResult Device::ScheduleFrameEventX(uint32_t, uint32_t, uint64_t, uint32_t) {
-    // Events are ticks of the pacer; the type and offset only shift the event inside the frame.
+HResult Device::ScheduleFrameEventX(uint32_t type, uint32_t offset_us, uint64_t event_handle, uint32_t) {
+    // Events are ticks of the pacer; the offset shifts the event inside the frame. WaitFrameEventX
+    // waits on the pacer directly; a title that passes an event handle gets it signalled at every
+    // tick (`offset_us` in) by the frame-event thread, every scheduled type on each tick.
     count(xbox::Counter::FrameEventsScheduled);
+    if (event_handle == 0) {
+        return kSOk;
+    }
+    std::lock_guard<std::mutex> lock(frame_event_mutex_);
+    if (frame_event_stop_) {
+        return kSOk;
+    }
+    frame_events_[type] = ScheduledFrameEvent{std::min<uint32_t>(offset_us, xbox::FramePacer::kMaxIntervalUs),
+                                              event_handle};
+    if (!frame_event_thread_.joinable()) {
+        frame_event_thread_ = std::thread([this] { run_frame_events(); });
+    }
     return kSOk;
+}
+
+void Device::run_frame_events() {
+    for (;;) {
+        uint64_t frame = 0;
+        if (pacer_.wait_after(pacer_.current_frame(), kInfinite, &frame) == xbox::FramePacer::WaitResult::Shutdown) {
+            return;
+        }
+        const auto tick = std::chrono::steady_clock::now();
+        std::vector<ScheduledFrameEvent> due;
+        {
+            std::lock_guard<std::mutex> lock(frame_event_mutex_);
+            if (frame_event_stop_) {
+                return;
+            }
+            for (const auto& [type, event] : frame_events_) {
+                due.push_back(event);
+            }
+        }
+        std::sort(due.begin(), due.end(),
+                  [](const ScheduledFrameEvent& a, const ScheduledFrameEvent& b) { return a.offset_us < b.offset_us; });
+        for (const ScheduledFrameEvent& event : due) {
+            std::unique_lock<std::mutex> lock(frame_event_mutex_);
+            if (frame_event_cv_.wait_until(lock, tick + std::chrono::microseconds(event.offset_us),
+                                           [this] { return frame_event_stop_; })) {
+                return;
+            }
+            lock.unlock();
+            pg6_win32_set_event(event.handle);
+        }
+    }
+}
+
+void Device::stop_frame_event_thread() {
+    {
+        std::lock_guard<std::mutex> lock(frame_event_mutex_);
+        frame_event_stop_ = true;
+    }
+    frame_event_cv_.notify_all();
+    if (frame_event_thread_.joinable() && frame_event_thread_.get_id() != std::this_thread::get_id()) {
+        frame_event_thread_.join();
+    }
 }
 
 HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, uint32_t, GuestPtr<uint64_t> token) {
@@ -610,7 +684,9 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
             const uint64_t out_tok = std::max<uint64_t>(std::max<uint64_t>(frame, 1),
                                                         last_frame_token_.load(std::memory_order_acquire));
             token.write(out_tok);
-            return static_cast<HResult>(0x887A0027u);  // DXGI_ERROR_WAIT_TIMEOUT
+            // A timed-out wait is not a failure: S_FALSE, as a WaitForSingleObject-style timeout
+            // (titles trap on a failed HRESULT from this call).
+            return kSFalse;
         }
     }
     // Always hand out a strictly monotonic, non-zero D3D12XBOX_FRAME_PIPELINE_TOKEN.
@@ -699,6 +775,7 @@ HResult Device::RegisterPagePool_unverified(uint64_t, uint32_t, GuestPtr<uint64_
 }
 
 HResult Device::CreateComputePipelineStateX(com::CallContext& ctx) {
+    os::win32::HostStallScope stall;  // pipeline builds can block the guest thread
     // Slot 62: (desc, a, b, riid, out); desc is D3D12_COMPUTE_PIPELINE_STATE_DESC (DXIL compute
     // shader). a and b were always 0; other values are recorded and otherwise ignored.
     const uint64_t desc_va = ctx.int_arg(1);
@@ -833,8 +910,7 @@ HResult Device::CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& 
     case xbox::StreamPipelineKind::Compute:
         return create_compute_pso(p.compute, riid, out);
     case xbox::StreamPipelineKind::Mesh:
-        count(xbox::Counter::PlaceholderPipelineStates);
-        return create_placeholder_pso("mesh/amplification shaders", riid, out);
+        return create_mesh_pso(p.graphics, p.mesh, p.amplification, riid, out);
     case xbox::StreamPipelineKind::Graphics:
         break;
     }
@@ -1198,7 +1274,8 @@ HResult CommandQueue::ResumeX() {
 HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext& ctx) {
     // (range count, ranges, page-pool address, pool pages, 0); range = {u64 GPU-window address,
     // u32 entry count, u64 entries}, entry = {u32 kind, u32 pool page, u32 page count}
-    // (d3d12_xs_xbox.h). Applied to the XMem GPU page table (os/xmem_windows.h).
+    // (d3d12_xs_xbox.h). Kinds: 0 consecutive pool pages, 1 one pool page repeated, 2 unmap,
+    // 3 leave as is. Applied to the XMem GPU page table (os/xmem_windows.h).
     const uint64_t count = static_cast<uint32_t>(ctx.int_arg(1));
     const uint64_t ranges_va = ctx.int_arg(2);
     const uint64_t pool_va = ctx.int_arg(3);
@@ -1297,7 +1374,12 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
     if (parameters != 0 && !com::read_guest(parameters, &immediate, sizeof(immediate))) {
         immediate = 0;
     }
-    present_pacer().present(immediate != 0 ? 0u : device_->present_interval_vblanks());
+    uint32_t interval = immediate != 0 ? 0u : device_->present_interval_vblanks();
+    const uint32_t max_interval = g_present_max_interval.load(std::memory_order_relaxed);
+    if (max_interval > 0) {
+        interval = std::min(interval, max_interval);
+    }
+    present_pacer().present(interval);
     return kSOk;
 }
 
@@ -1333,13 +1415,82 @@ void CommandList::SetPipelineStateX(com::CallContext& ctx) {
     bind_pipeline(static_cast<PipelineState*>(state.get()));
 }
 
-void CommandList::ExecuteIndirect(com::CallContext&) {
-    if (usable()) {
-        // No indirect draw/dispatch packet exists in the GPU ABI: diagnosed and skipped.
-        device_->count(xbox::Counter::IndirectSkipped);
+void CommandList::ExecuteIndirect(com::CallContext& ctx) {
+    // (signature, max command count, argument buffer, argument offset, count buffer, count offset)
+    if (!usable()) {
+        return;
+    }
+    const auto skip = [&](xbox::Counter counter) {
+        device_->count(counter);
         count_work(Work::IndirectExecutionsSkipped);
         device_->note_skipped_draw();
+    };
+    auto signature_arg = InterfaceArg<ICommandSignatureHost>::resolve(ctx.int_arg(1));
+    const auto* signature = signature_arg ? static_cast<const CommandSignature*>(signature_arg.get()) : nullptr;
+    if (signature == nullptr) {
+        skip(xbox::Counter::IndirectSkipped);
+        return;
     }
+    bridge::IndirectExecution e;
+    switch (signature->work_type()) {
+    case CommandSignature::kIndirectArgDraw: e.kind = bridge::IndirectKind::Draw; break;
+    case CommandSignature::kIndirectArgDrawIndexed: e.kind = bridge::IndirectKind::DrawIndexed; break;
+    case CommandSignature::kIndirectArgDispatch: e.kind = bridge::IndirectKind::Dispatch; break;
+    case CommandSignature::kIndirectArgDispatchMesh:
+        // G66: the bound graphics pipeline must be an emulated mesh pipeline.
+        if (graphics_pso_ == nullptr || graphics_pso_->mesh() == nullptr || !graphics_pso_->resolved()) {
+            skip(xbox::Counter::IndirectMeshSkipped);
+            return;
+        }
+        e.kind = bridge::IndirectKind::DispatchMesh;
+        break;
+    case CommandSignature::kIndirectArgXbox105:
+        // Xbox-only kind (meaning not established; read as a single-pass dispatch with a 12-byte
+        // group-count record): a mesh dispatch when an emulated mesh pipeline is bound, otherwise a
+        // compute dispatch.
+        if (graphics_pso_ != nullptr && graphics_pso_->mesh() != nullptr && graphics_pso_->resolved()) {
+            e.kind = bridge::IndirectKind::DispatchMesh;
+        } else if (compute_pso_ != nullptr) {
+            e.kind = bridge::IndirectKind::Dispatch;
+        } else {
+            skip(xbox::Counter::IndirectType105Skipped);
+            return;
+        }
+        break;
+    default:
+        skip(xbox::Counter::IndirectSkipped);
+        return;
+    }
+    Resource* args = resource(InterfaceArg<IResourceHost>::resolve(ctx.int_arg(3)));
+    const uint64_t count_pointer = ctx.int_arg(5);
+    Resource* count = count_pointer != 0 ? resource(InterfaceArg<IResourceHost>::resolve(count_pointer)) : nullptr;
+    const bool graphics = e.kind != bridge::IndirectKind::Dispatch;
+    PipelineState* pso = graphics ? graphics_pso_ : compute_pso_;
+    // Only single-argument signatures (no root argument / view changes per command) are expressed.
+    if (signature->argument_count() != 1 || args == nullptr || !args->is_buffer() ||
+        (count_pointer != 0 && (count == nullptr || !count->is_buffer())) || (pso != nullptr && !pso->resolved()) ||
+        (graphics && rect_list_)) {
+        skip(xbox::Counter::IndirectSkipped);
+        return;
+    }
+    e.max_count = static_cast<uint32_t>(ctx.int_arg(2));
+    e.stride = signature->byte_stride();
+    e.args_buffer = args->id();
+    e.args_offset = ctx.int_arg(4);
+    e.count_buffer = count != nullptr ? count->id() : 0u;
+    e.count_offset = count != nullptr ? ctx.int_arg(6) : 0u;
+    pinned_.push_back(com::Ref<com::ComObject>::share(args));
+    if (count != nullptr) {
+        pinned_.push_back(com::Ref<com::ComObject>::share(count));
+    }
+    if (!bridge_.ExecuteIndirect(e)) {
+        skip(e.kind == bridge::IndirectKind::DispatchMesh ? xbox::Counter::IndirectMeshSkipped
+             : signature->work_type() == CommandSignature::kIndirectArgXbox105 ? xbox::Counter::IndirectType105Skipped
+                                                                              : xbox::Counter::IndirectSkipped);
+        return;
+    }
+    device_->count(xbox::Counter::IndirectExecuted);
+    count_work(Work::IndirectExecutionsEmitted);
 }
 
 void CommandList::OMSetDepthBounds(float, float) {

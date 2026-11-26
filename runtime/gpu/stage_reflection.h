@@ -40,7 +40,15 @@
 //                           {"lane_indexed_resource_heap" | "lane_indexed_sampler_heap": {
 //                               "max_count", "shift", "stride" (opt.),
 //                               "window_base" (opt.): {"cbv": <as above>, "byte_offset", "bit_offset" (0),
-//                                                      "mask" (0xffffffff)}}}}]}}}
+//                                                      "mask" (0xffffffff)}}} |
+//                           {"unresolved": true | "<reason>"} (version >= 3)}]}}}
+// An unresolved source (G62, #482; version >= 3): the translator reflected the binding but could
+// not trace where the stage loads its descriptor from (mostly SM 6.6 bindless textures whose heap
+// index is a constant-buffer dword at an offset computed from a root constant, which the CB-indexed
+// source cannot express yet). The stage still joins: such a binding is bound as the worker's
+// default for its kind (an unresolved register, like a sampler without a static sampler), counted
+// in JoinStats::unresolved_bindings, instead of the whole stage falling back to conventions.
+// Writable kinds (storage, storage_texture) cannot be unresolved: their writes would be lost.
 // A lane-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[NonUniformResourceIndex(i)]:
 // a VGPR index, v_readfirstlane_b32 waterfall loops): each lane picks its own descriptor, so the
 // stage reads a window of "max_count" consecutive heap descriptors as a WGSL
@@ -64,6 +72,12 @@
 // signature flags SAMPLER_HEAP_DIRECTLY_INDEXED / CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED): the index is
 // a root constant (the user SGPR inside a constants parameter); the descriptor is the one at byte
 // offset (index << shift) of the bound heap, chosen at draw time.
+// A root-descriptor source over a descriptor table (G62, #482): the translator reports
+// "root_descriptor" when the stage builds a buffer from the user-data SGPR pair itself, but the
+// root parameter that starts at that SGPR may be a descriptor table (one SGPR, a 32-bit pointer).
+// Such a binding joins as the table's descriptor at "table_byte_offset" when the sidecar gives it
+// next to "root_descriptor": true (version >= 2, kStageReflectionVersionRootTableOffset), else as
+// the table's first descriptor (slot 0). Counted in JoinStats::root_descriptor_tables.
 // Stages without an entry keep the layer's conventions (layout_from_root_signature, input element i
 // -> @location(i)).
 
@@ -115,6 +129,7 @@ enum class ReflectedSource : uint8_t {
     CbvIndexedResourceHeap,
     LaneIndexedSamplerHeap,  // per-lane index into a window of the heap (lane_*), G62
     LaneIndexedResourceHeap,
+    Unresolved,  // origin not traced by the translator: bound as the default (version >= 3), G62
 };
 
 // Largest lane-indexed window a sidecar may ask for (WebGPU's per-stage sampled-texture limit we
@@ -158,6 +173,9 @@ struct ReflectedBinding {
     // a CB-indexed index (cbv, user_sgpr, table_byte_offset, cb_*); otherwise it is 0.
     uint32_t lane_max_count = 0;
     bool lane_has_window_base = false;
+    // RootDescriptor: the sidecar gave table_byte_offset with it (version >= 2), used when the root
+    // parameter at user_sgpr is a descriptor table; otherwise such a table joins at slot 0.
+    bool root_table_offset_given = false;
 };
 
 enum class ReflectedStage : uint8_t { Vertex = 1, Fragment = 2, Compute = 3 };
@@ -166,10 +184,23 @@ struct StageReflection {
     ReflectedStage stage = ReflectedStage::Vertex;
     std::vector<ReflectedVertexInput> vertex_inputs;
     std::vector<ReflectedBinding> bindings;
+    // G66: a mesh stage translated to compute (pack key bridge::mesh_compute_pack_key): its output
+    // record layout, from the optional "mesh_output": {"max_vertices", "max_primitives",
+    // "vertex_words"} (see bridge::MeshOutputLayout; validated by bridge::valid_mesh_output_layout).
+    bool has_mesh_output = false;
+    bridge::MeshOutputLayout mesh_output{};
 };
 
 // Pack key (stage identity) -> reflection.
 using StageReflectionIndex = std::unordered_map<uint64_t, StageReflection>;
+
+// Sidecar versions this parser reads. Version 2 adds the optional "table_byte_offset" of a
+// "root_descriptor" source (ignored in version 1 documents); version 3 adds the "unresolved" source
+// (malformed in older documents).
+inline constexpr uint32_t kStageReflectionVersion = 1;
+inline constexpr uint32_t kStageReflectionVersionRootTableOffset = 2;
+inline constexpr uint32_t kStageReflectionVersionUnresolved = 3;
+inline constexpr uint32_t kStageReflectionMaxVersion = 3;
 
 // Parses a sidecar (see above). False + message when malformed; unknown members are ignored.
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error);
@@ -179,6 +210,9 @@ inline constexpr uint32_t kGraphicsUserDataBase = 8;
 inline constexpr uint32_t kComputeUserDataBase = 4;
 inline constexpr uint32_t kTableSlotBytes = 32;
 int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr);
+// The root parameter whose user data *covers* `user_sgpr` (-1 when none), with the dword index into it.
+int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
+                                        uint32_t* dword);
 
 // Pipeline layout for pack-resolved stages from their reflection joined to the root signature.
 // `stages`: each stage's reflection with its GpuShaderStageBits. Bindings that two stages share
@@ -200,6 +234,14 @@ struct JoinStats {
     uint64_t lane_indexed_bindings = 0;
     // Lane-indexed heap bindings joined as binding arrays (JoinOptions::binding_arrays; on success).
     uint64_t lane_indexed_arrays = 0;
+    // Root-descriptor bindings whose user SGPR starts a descriptor table, joined as a table slot
+    // (the given table_byte_offset, else the first descriptor; on success).
+    uint64_t root_descriptor_tables = 0;
+    // Vertex inputs no input-layout element covers, read as D3D12's (0, 0, 0, 1) defaults from a
+    // shared constant buffer (join_vertex_inputs; on success).
+    uint64_t vertex_inputs_defaulted = 0;
+    // Bindings with an unresolved source, bound as the worker's default (on success).
+    uint64_t unresolved_bindings = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
@@ -214,9 +256,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
 // element of its slot that covers its byte offset. An element starting at that offset gives its own
 // format (its component class must match the input's: float for unorm/snorm/float formats, uint,
 // sint); an input inside an element needs its fetch format. Elements no input reads are dropped.
-// False (one line per failed location in *report) when an input has no element or the classes
-// differ.
+// An input no element covers is not a failure: D3D12 reads (0, 0, 0, 1), so it becomes a
+// `constant_default` fetch. False (one line per failed location in *report) when the classes differ.
 bool join_vertex_inputs(const StageReflection& vs, const pso::D3D12InputElementDesc* elements, uint32_t count,
-                        std::vector<pso::VertexInputFetch>* out, std::string* report);
+                        std::vector<pso::VertexInputFetch>* out, std::string* report, JoinStats* stats = nullptr);
 
 }  // namespace playgta6::gpu

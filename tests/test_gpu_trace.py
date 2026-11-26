@@ -1099,8 +1099,17 @@ class TestGpuTraceV2Packets(unittest.TestCase):
         self.assertEqual(len(gpu_trace.WGPU_TEXTURE_FORMAT_NAMES), 64)
         self.assertEqual(len(gpu_trace.WGPU_VERTEX_FORMAT_NAMES), 42)
         self.assertEqual(
-            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 36))
+            [op.value for op in gpu_trace.GpuOpcode if op.value >= 22], list(range(22, 41))
         )
+        self.assertEqual(gpu_trace.INDIRECT_STRUCT.size, 16)
+        # G66 ExecuteIndirect packets decode their GpuIndirectPayload.
+        stream = gpu_trace.encode_packet(
+            gpu_trace.GpuOpcode.DrawIndexedIndirect, gpu_trace.INDIRECT_STRUCT.pack(7, 0, 40)
+        )
+        trace = gpu_trace.decode_stream(stream, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.packets[0].fields["buffer_id"], 7)
+        self.assertEqual(trace.packets[0].fields["offset"], 40)
 
     def test_decode_full_v2_frame(self) -> None:
         view_2d_array = gpu_trace.encode_texture_view_desc(40, 3, 0, 1, 2, 4, 1)
@@ -2596,11 +2605,15 @@ class TestGpuTrace30FpsSpikeAnalyzer(unittest.TestCase):
         "timing_source",
         "ok",
         "budget_ms",
+        "frame_budget_ms",
         "target_fps",
         "total_frames",
         "frames_within_budget",
         "frames_over_budget",
+        "over_budget_frames_30fps",
         "fps30_compliance_rate",
+        "present_fps_avg",
+        "draws_per_present_avg",
         "avg_frame_ms",
         "min_frame_ms",
         "p50_ms",
@@ -3150,6 +3163,348 @@ class TestGpuTrace30FpsSpikeAnalyzer(unittest.TestCase):
             self.assertEqual(parsed["top_slow_frames"][0]["top_pass"], "shader_event_redacted")
             self.assertIsNone(parsed["top_slow_frames"][0]["phase"])
             self.assertEqual(parsed["top_slow_frames"][1]["phase"], "main_menu")
+
+
+class TestGpuTrace30FpsCadenceAndSanitization(unittest.TestCase):
+    def test_cadence_calculations_timing_log_and_custom_budget(self) -> None:
+        # 4 frames: 16.667 ms (50 draws), 33.333 ms (boundary - within 30 FPS, 100 draws),
+        # 33.334 ms (over 30 FPS, 150 draws), 50.0 ms (over 30 FPS, 200 draws).
+        payload = {
+            "frames": [
+                {"frame_index": 0, "frame_ms": 16.667, "draw_calls": 50},
+                {"frame_index": 1, "frame_ms": 33.333, "draw_calls": 100},
+                {"frame_index": 2, "frame_ms": 33.334, "draw_calls": 150},
+                {"frame_index": 3, "frame_ms": 50.0, "draw_calls": 200},
+            ]
+        }
+        report = gpu_trace.analyze_30fps_frames(payload)
+        self.assertEqual(report["frame_budget_ms"], 33.333)
+        self.assertEqual(report["over_budget_frames_30fps"], 2)
+        self.assertEqual(report["frames_over_budget"], 2)
+        self.assertEqual(report["draws_per_present_avg"], 125.0)
+        # 4 presents / 133.334 ms * 1000 = 29.99985 -> 30.0
+        self.assertEqual(report["present_fps_avg"], round(4000.0 / 133.334, 3))
+
+        # Custom 60 FPS budget (16.667 ms) changes frames_over_budget (3),
+        # while frame_budget_ms stays 33.333 and over_budget_frames_30fps stays 2.
+        report_60 = gpu_trace.analyze_30fps_frames(payload, budget_ms=16.667)
+        self.assertEqual(report_60["budget_ms"], 16.667)
+        self.assertEqual(report_60["frames_over_budget"], 3)
+        self.assertEqual(report_60["frame_budget_ms"], 33.333)
+        self.assertEqual(report_60["over_budget_frames_30fps"], 2)
+        self.assertEqual(report_60["draws_per_present_avg"], 125.0)
+        self.assertEqual(report_60["present_fps_avg"], report["present_fps_avg"])
+
+        text = gpu_trace.format_30fps_analysis_text(report)
+        self.assertIn("Cadence (30 FPS):", text)
+        self.assertIn("present_fps_avg=30.000", text)
+        self.assertIn("draws_per_present_avg=125.000", text)
+        self.assertIn("over_budget_frames_30fps=2", text)
+        self.assertIn("frame_budget_ms=33.333", text)
+
+        # Determinism: repeated serialization is byte-for-byte identical.
+        j1 = gpu_trace.fps30_analysis_to_json(report)
+        j2 = gpu_trace.fps30_analysis_to_json(report)
+        self.assertEqual(j1, j2)
+
+    def test_cadence_calculations_binary_trace_and_parity(self) -> None:
+        # Setup preamble (no Present) + 2 complete frames (frame 1 has 2 draws, frame 2 has 3 draws + PSO spike).
+        preamble = gpu_trace.encode_create_buffer(1, 0x0020, 256)
+        frame1 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_draw_indexed(6),
+                gpu_trace.encode_present(),
+            ]
+        )
+        frame2 = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                *[
+                    gpu_trace.encode_create_render_pipeline2(
+                        100 + i,
+                        1,
+                        2,
+                        0,
+                        _make_pipeline_key(vs_shader=0x10 + i, ps_shader=0x20 + i, color_formats=[27]),
+                    )
+                    for i in range(5)
+                ],
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_draw(6),
+                gpu_trace.encode_draw_indexed(9),
+                gpu_trace.encode_present(),
+            ]
+        )
+        trace = gpu_trace.decode_stream(preamble + frame1 + frame2, strict=True)
+        self.assertTrue(trace.ok)
+        self.assertEqual(trace.present_count, 2)
+        self.assertEqual(trace.draw_calls, 5)
+
+        trace_dict = trace.to_dict(stats_only=True)
+        analysis = gpu_trace.analyze_30fps_trace(trace)
+
+        self.assertEqual(trace_dict["frame_budget_ms"], 33.333)
+        self.assertEqual(trace_dict["draws_per_present_avg"], 2.5)
+        self.assertEqual(trace_dict["over_budget_frames_30fps"], 1)
+        self.assertGreater(trace_dict["present_fps_avg"], 0.0)
+
+        # Exact parity between DecodedTrace.to_dict() and analyze_30fps_trace().
+        for key in (
+            "frame_budget_ms",
+            "present_fps_avg",
+            "draws_per_present_avg",
+            "over_budget_frames_30fps",
+        ):
+            self.assertEqual(trace_dict[key], analysis[key])
+
+        # Byte-for-byte determinism across repeated trace_to_json() calls.
+        self.assertEqual(
+            gpu_trace.trace_to_json(trace, stats_only=True),
+            gpu_trace.trace_to_json(trace, stats_only=True),
+        )
+
+    def test_zero_present_and_zero_span_zero_division_guards(self) -> None:
+        # 1. Direct helper: zero presents, zero span, negative/NaN/Inf inputs.
+        zero_both = gpu_trace.compute_30fps_cadence(present_count=0, draw_calls=0, frame_durations_ms=[])
+        self.assertEqual(
+            zero_both,
+            {
+                "frame_budget_ms": 33.333,
+                "present_fps_avg": 0.0,
+                "draws_per_present_avg": 0.0,
+                "over_budget_frames_30fps": 0,
+            },
+        )
+
+        zero_presents = gpu_trace.compute_30fps_cadence(
+            present_count=0, draw_calls=42, frame_durations_ms=[20.0, 50.0]
+        )
+        self.assertEqual(zero_presents["present_fps_avg"], 0.0)
+        self.assertEqual(zero_presents["draws_per_present_avg"], 0.0)
+        self.assertEqual(zero_presents["over_budget_frames_30fps"], 1)
+
+        zero_span = gpu_trace.compute_30fps_cadence(
+            present_count=4, draw_calls=10, frame_durations_ms=[0.0, 0.0, 0.0, 0.0]
+        )
+        self.assertEqual(zero_span["present_fps_avg"], 0.0)
+        self.assertEqual(zero_span["draws_per_present_avg"], 2.5)
+        self.assertEqual(zero_span["over_budget_frames_30fps"], 0)
+
+        bad_span = gpu_trace.compute_30fps_cadence(
+            present_count=3,
+            draw_calls=9,
+            frame_durations_ms=[float("nan"), float("inf"), -5.0, 40.0],
+            total_span_ms=float("nan"),
+        )
+        self.assertEqual(bad_span["present_fps_avg"], 0.0)
+        self.assertEqual(bad_span["draws_per_present_avg"], 3.0)
+        self.assertEqual(bad_span["over_budget_frames_30fps"], 1)
+
+        with self.assertRaises(ValueError):
+            gpu_trace.compute_30fps_cadence(present_count=1, draw_calls=1, frame_budget_ms=0.0)
+        with self.assertRaises(ValueError):
+            gpu_trace.compute_30fps_cadence(present_count=1, draw_calls=1, frame_budget_ms=float("nan"))
+
+        # 2. Empty binary stream.
+        empty_trace = gpu_trace.decode_stream(b"", strict=True)
+        empty_dict = empty_trace.to_dict(stats_only=True)
+        self.assertEqual(empty_dict["frame_budget_ms"], 33.333)
+        self.assertEqual(empty_dict["present_fps_avg"], 0.0)
+        self.assertEqual(empty_dict["draws_per_present_avg"], 0.0)
+        self.assertEqual(empty_dict["over_budget_frames_30fps"], 0)
+
+        # 3. Binary stream with draws but zero Present packets.
+        no_present_stream = gpu_trace.encode_begin_frame() + gpu_trace.encode_draw(3) + gpu_trace.encode_draw(6)
+        no_present_trace = gpu_trace.decode_stream(no_present_stream, strict=True)
+        self.assertEqual(no_present_trace.present_count, 0)
+        self.assertEqual(no_present_trace.draw_calls, 2)
+        np_dict = no_present_trace.to_dict(stats_only=True)
+        self.assertEqual(np_dict["present_fps_avg"], 0.0)
+        self.assertEqual(np_dict["draws_per_present_avg"], 0.0)
+        self.assertEqual(np_dict["over_budget_frames_30fps"], 0)
+
+        # 4. Timing log with zero-duration frames (zero span) and timing log with presents=0.
+        zero_span_log = gpu_trace.analyze_30fps_frames(
+            {"frames": [{"frame_ms": 0.0, "draw_calls": 6}, {"frame_ms": 0.0, "draw_calls": 4}]}
+        )
+        self.assertEqual(zero_span_log["present_fps_avg"], 0.0)
+        self.assertEqual(zero_span_log["draws_per_present_avg"], 5.0)
+        self.assertEqual(zero_span_log["over_budget_frames_30fps"], 0)
+
+        zero_present_log = gpu_trace.analyze_30fps_frames(
+            {
+                "frames": [
+                    {"frame_ms": 45.0, "draw_calls": 12, "presents": 0},
+                    {"frame_ms": 15.0, "draw_calls": 8, "presented": False},
+                ]
+            }
+        )
+        self.assertEqual(zero_present_log["present_fps_avg"], 0.0)
+        self.assertEqual(zero_present_log["draws_per_present_avg"], 0.0)
+        self.assertEqual(zero_present_log["over_budget_frames_30fps"], 1)
+
+    def test_host_path_and_username_json_sanitization(self) -> None:
+        import os
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"USERNAME": "secret_user_t86", "USER": "secret_user_t86"}):
+            raw_payload = {
+                "win_path": r"C:\Users\secret_alice\Documents\gta6\capture.pg6trace",
+                "win_spaces": r"loaded C:\Users\Alice Smith\My Captures\trace.pg6trace ok",
+                "unix_home": "/home/secret_bob/work/timings.json",
+                "macos_user": "/Users/carol_private/Desktop/frame.bin",
+                "unc_share": r"\\fileserver\private_share\dave\dump.pg6trace",
+                "file_uri": "file:///C:/Users/eve_secret/local-data/game.rpf",
+                "rel_user": "../../Users/grace_secret/trace.bin",
+                "nested": [
+                    Path(r"C:\Users\secret_alice\nested\secret_file.pg6trace"),
+                    {"note": "captured by secret_user_t86 on /tmp/run_99/out.json"},
+                ],
+                "safe_hash": "0x00000000deadbeef",
+                "frame_budget_ms": 33.333,
+                "ok": True,
+            }
+            scrubbed = gpu_trace.sanitize_json_payload(raw_payload)
+            serialized = json.dumps(scrubbed)
+
+            for leaked in (
+                "C:\\",
+                "C:/",
+                "/home/",
+                "/Users/",
+                "/tmp/",
+                "\\\\fileserver",
+                "file://",
+                "secret_alice",
+                "Alice Smith",
+                "My Captures",
+                "secret_bob",
+                "carol_private",
+                "private_share",
+                "eve_secret",
+                "grace_secret",
+                "secret_user_t86",
+                "secret_file.pg6trace",
+            ):
+                self.assertNotIn(leaked, serialized, f"Leaked {leaked!r} in sanitized JSON")
+
+            self.assertEqual(scrubbed["win_spaces"], "loaded <redacted-path> ok")
+            self.assertEqual(scrubbed["safe_hash"], "0x00000000deadbeef")
+            self.assertEqual(scrubbed["frame_budget_ms"], 33.333)
+            self.assertTrue(scrubbed["ok"])
+
+            # Verify fps30_analysis_to_json and trace_to_json both enforce sanitization.
+            mutated_report = gpu_trace.analyze_30fps_frames({"frames": [{"frame_ms": 20.0, "draw_calls": 4}]})
+            mutated_report["diagnostics"].append(
+                {
+                    "severity": "warning",
+                    "code": "synthetic_note",
+                    "record_index": 0,
+                    "message": r"seen at C:\Users\secret_alice\run.json by secret_user_t86",
+                }
+            )
+            fps_json = gpu_trace.fps30_analysis_to_json(mutated_report)
+            self.assertNotIn("secret_alice", fps_json)
+            self.assertNotIn("secret_user_t86", fps_json)
+            self.assertIn("<redacted-path>", fps_json)
+            self.assertIn("<redacted-user>", fps_json)
+
+            # Verify sanitize_path_label handles host paths and home roots safely.
+            self.assertEqual(
+                gpu_trace.sanitize_path_label(r"C:\Users\secret_alice\captures\run.pg6trace"),
+                "run.pg6trace",
+            )
+            self.assertEqual(gpu_trace.sanitize_path_label(r"C:\Users\secret_alice"), "<redacted>")
+            self.assertEqual(gpu_trace.sanitize_path_label("/home/secret_bob/"), "<redacted>")
+
+        # CLI missing-file error and --json output must not leak host path directories.
+        with tempfile.TemporaryDirectory(prefix="playgta6_t86_host_") as tmp:
+            secret_dir = Path(tmp) / "Users" / "secret_cli_user" / "captures"
+            secret_dir.mkdir(parents=True)
+            trace_path = secret_dir / "capture_t86.pg6trace"
+            trace_path.write_bytes(
+                gpu_trace.encode_begin_frame() + gpu_trace.encode_draw(3) + gpu_trace.encode_present()
+            )
+
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = gpu_trace.main([str(trace_path), "--json", "--stats"])
+            self.assertEqual(rc, 0)
+            out_json = buf.getvalue()
+            for leaked in (str(tmp), "secret_cli_user", "playgta6_t86_host_", "capture_t86.pg6trace"):
+                self.assertNotIn(leaked, out_json)
+            parsed = json.loads(out_json)
+            self.assertEqual(parsed["frame_budget_ms"], 33.333)
+            self.assertEqual(parsed["draws_per_present_avg"], 1.0)
+            self.assertGreater(parsed["present_fps_avg"], 0.0)
+            self.assertEqual(parsed["over_budget_frames_30fps"], 0)
+
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc_missing = gpu_trace.main([str(secret_dir / "missing_t86.pg6trace")])
+            self.assertEqual(rc_missing, 2)
+            self.assertIn("trace file not found", err_buf.getvalue())
+            self.assertNotIn("secret_cli_user", err_buf.getvalue())
+            self.assertNotIn("playgta6_t86_host_", err_buf.getvalue())
+
+    def test_backwards_compatibility_cli_flags_and_outputs(self) -> None:
+        stream = b"".join(
+            [
+                gpu_trace.encode_begin_frame(),
+                gpu_trace.encode_clear_color(0.0, 0.0, 0.0, 1.0),
+                gpu_trace.encode_draw(3),
+                gpu_trace.encode_present(),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            trace_path = Path(tmp) / "compat.pg6trace"
+            trace_path.write_bytes(stream)
+
+            # Default text mode keeps original header/frame layout untouched.
+            buf_txt = io.StringIO()
+            with redirect_stdout(buf_txt):
+                rc = gpu_trace.main([str(trace_path)])
+            self.assertEqual(rc, 0)
+            txt = buf_txt.getvalue()
+            self.assertIn("playgta6 GPU Trace (ABI v1)", txt)
+            self.assertIn("Frame 000 [complete]", txt)
+            self.assertNotIn("30 FPS Frame-Budget Spike Analysis", txt)
+
+            # --json --stats omits opt-in audit sections and packets, preserves legacy keys + adds cadence.
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc = gpu_trace.main([str(trace_path), "--json", "--stats"])
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf_json.getvalue())
+            for legacy_key in (
+                "abi_version",
+                "ok",
+                "packet_count",
+                "frame_count",
+                "draw_calls",
+                "opcode_histogram",
+                "frames",
+                "diagnostics",
+            ):
+                self.assertIn(legacy_key, payload)
+            for opt_in_key in (
+                "packets",
+                "shader_summary",
+                "binding_audit",
+                "bink_video_audit",
+                "start_screen_skips",
+                "fps30_analysis",
+            ):
+                self.assertNotIn(opt_in_key, payload)
+            for cadence_key in (
+                "frame_budget_ms",
+                "present_fps_avg",
+                "draws_per_present_avg",
+                "over_budget_frames_30fps",
+            ):
+                self.assertIn(cadence_key, payload)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,12 @@
 // Present pacing against a 60 Hz vblank clock (O36, gpu/present_pacing.h), on a fake clock.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <vector>
 
 #include "gpu/present_pacing.h"
 #include "gpu/present_samples.h"
+#include "os/host_sleep.h"
 
 namespace {
 
@@ -97,7 +99,9 @@ void test_immediate_and_off() {
 
 void test_present_samples_ring() {
     playgta6::gpu::PresentSampleRing r(3);
+    CHECK(r.last().index == 0 && r.last().draws == 0);
     r.record(10, 5, 2);
+    CHECK(r.last().draws == 5 && r.last().wall_ms == 10);
     r.record(20, 12, 2);
     auto v = r.snapshot();
     CHECK(v.size() == 2 && v[0].draws == 5 && v[0].resources == 2);
@@ -109,8 +113,31 @@ void test_present_samples_ring() {
     CHECK(r.total() == 5 && r.size() == 3 && v.size() == 3);
     CHECK(v[0].index == 2 && v[1].index == 3 && v[2].index == 4);
     CHECK(v[1].draws == 8 && v[2].draws == 0);
+    CHECK(r.last().index == 4 && r.last().wall_ms == 50);  // the newest, also after wrapping
+    r.record(60, 23, 4);
+    CHECK(r.last().index == 5 && r.last().draws == 3);
     r.clear();
     CHECK(r.total() == 0 && r.snapshot().empty());
+}
+
+// R40: host sleeps wake near their deadline, not on the next system timer tick (15.6 ms by
+// default on Windows), so a guest Sleep(1) poll and a paced present's vblank wait are not
+// stretched by up to a tick. Median overshoot of 2 ms sleeps, generous for loaded runners.
+void test_host_sleep_is_precise() {
+    std::vector<int64_t> overshoot_us;
+    for (int i = 0; i < 15; ++i) {
+        const auto deadline = Clock::now() + std::chrono::milliseconds(2);
+        playgta6::os::host_sleep::sleep_until(deadline);
+        const auto late = Clock::now() - deadline;
+        CHECK(late >= Clock::duration::zero());
+        overshoot_us.push_back(std::chrono::duration_cast<std::chrono::microseconds>(late).count());
+    }
+    std::sort(overshoot_us.begin(), overshoot_us.end());
+    const int64_t median = overshoot_us[overshoot_us.size() / 2];
+    if (median >= 6000) {
+        std::fprintf(stderr, "host sleep median overshoot %lld us\n", static_cast<long long>(median));
+    }
+    CHECK(median < 6000);
 }
 
 int main() {
@@ -120,6 +147,7 @@ int main() {
     test_interval_n_and_missed_vblanks();
     test_immediate_and_off();
     test_present_samples_ring();
+    test_host_sleep_is_precise();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_present_pacing: %d failure(s)\n", g_failures);
         return 1;

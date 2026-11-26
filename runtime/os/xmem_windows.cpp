@@ -36,6 +36,9 @@ struct State {
     uint64_t next_listener = 1;
     std::unordered_map<uint64_t, uint64_t> gpu_pages;  // GPU page VA -> pool page index
     uint64_t gpu_mapping_updates = 0;
+    uint64_t gpu_mapping_kind_entries[4] = {};
+    uint64_t gpu_mapping_repeated_single_runs = 0;
+    uint64_t gpu_mapping_skipped_entries = 0;
     int64_t cpu_window_mapped = 0;
 };
 
@@ -237,8 +240,17 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
     for (const PageMappingRange& range : ranges) {
         uint64_t page_va = range.gpu_va & ~(kWindowPageSize - 1);
         for (const PageMappingEntry& e : range.entries) {
-            if (e.kind != 1 && e.kind != 2) {
+            if (e.kind > kKeep) {
                 ++r.skipped_entries;
+                continue;
+            }
+            ++r.kind_entries[e.kind];
+            if (e.kind == kMapSinglePage && e.count > 1) {
+                ++r.repeated_single_runs;
+            }
+            if (e.kind == kKeep) {
+                page_va += uint64_t{e.count} * kWindowPageSize;
+                r.kept_pages += e.count;
                 continue;
             }
             for (uint32_t i = 0; i < e.count; ++i, page_va += kWindowPageSize) {
@@ -247,21 +259,26 @@ PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> rang
                     ++r.outside_window;
                     continue;
                 }
-                if (e.kind == 1) {
-                    const uint64_t pool_page = uint64_t{e.pool_page} + i;
-                    if (pool_pages != 0 && pool_page >= pool_pages) {
-                        ++r.outside_window;
-                        continue;
-                    }
-                    s.gpu_pages[page_va] = pool_page;
-                    ++r.mapped_pages;
-                } else {
+                if (e.kind == kUnmap) {
                     s.gpu_pages.erase(page_va);
                     ++r.unmapped_pages;
+                    continue;
                 }
+                const uint64_t pool_page = uint64_t{e.pool_page} + (e.kind == kMapConsecutive ? i : 0u);
+                if (pool_pages != 0 && pool_page >= pool_pages) {
+                    ++r.outside_window;
+                    continue;
+                }
+                s.gpu_pages[page_va] = pool_page;
+                ++r.mapped_pages;
             }
         }
     }
+    for (int k = 0; k < 4; ++k) {
+        s.gpu_mapping_kind_entries[k] += r.kind_entries[k];
+    }
+    s.gpu_mapping_repeated_single_runs += r.repeated_single_runs;
+    s.gpu_mapping_skipped_entries += r.skipped_entries;
     return r;
 }
 
@@ -298,6 +315,11 @@ Accounting accounting() {
     a.cpu_window_mapped = s.cpu_window_mapped > 0 ? static_cast<uint64_t>(s.cpu_window_mapped) : 0;
     a.gpu_window_mapped = s.gpu_pages.size() * kWindowPageSize;
     a.gpu_mapping_updates = s.gpu_mapping_updates;
+    for (int k = 0; k < 4; ++k) {
+        a.gpu_mapping_kind_entries[k] = s.gpu_mapping_kind_entries[k];
+    }
+    a.gpu_mapping_repeated_single_runs = s.gpu_mapping_repeated_single_runs;
+    a.gpu_mapping_skipped_entries = s.gpu_mapping_skipped_entries;
     return a;
 }
 
@@ -356,6 +378,11 @@ void reset_for_testing() {
     s.listeners.clear();
     s.gpu_pages.clear();
     s.gpu_mapping_updates = 0;
+    for (uint64_t& n : s.gpu_mapping_kind_entries) {
+        n = 0;
+    }
+    s.gpu_mapping_repeated_single_runs = 0;
+    s.gpu_mapping_skipped_entries = 0;
     s.cpu_window_mapped = 0;
 }
 

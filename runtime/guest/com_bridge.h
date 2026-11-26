@@ -302,6 +302,7 @@ struct InterfaceInfo;
 enum class SlotPolicy : uint8_t {
     Trap = 0,           // FaultKind::UnimplementedSlot through the O9 fault handler (default)
     ReturnNotImpl = 1,  // rax = E_NOTIMPL, return to the caller
+    ReturnFixed = 2,    // rax = InterfaceInfo::stub_result, return to the caller
 };
 
 // One vtable slot after IUnknown. thunk == nullptr declares a named stub.
@@ -317,6 +318,7 @@ struct InterfaceInfo {
     std::span<const Guid> extra_iids{};     // further IIDs answered with this interface (bases)
     uint32_t slot_count = 0;                // total vtable slots, >= first_method_slot() + methods
     SlotPolicy policy = SlotPolicy::Trap;
+    int32_t stub_result = 0;                // HRESULT for SlotPolicy::ReturnFixed
     bool iunknown = true;                   // slots 0..2 are QueryInterface, AddRef, Release
     const void* host_tag = nullptr;         // identifies the host interface class
 
@@ -337,6 +339,7 @@ struct InterfaceInfo {
 struct InterfaceOptions {
     uint32_t slot_count = 0;  // 0: exactly the declared slots
     SlotPolicy policy = SlotPolicy::Trap;
+    int32_t stub_result = 0;  // HRESULT for SlotPolicy::ReturnFixed
     bool iunknown = true;
     std::span<const Guid> extra_iids{};
 };
@@ -371,6 +374,7 @@ constexpr Interface<Host> declare_interface(const char* name,
     info.extra_iids = options.extra_iids;
     info.iunknown = options.iunknown;
     info.policy = options.policy;
+    info.stub_result = options.stub_result;
     const uint32_t declared = info.first_method_slot() + static_cast<uint32_t>(methods.size());
     info.slot_count = options.slot_count > declared ? options.slot_count : declared;
     info.host_tag = detail::type_tag<Host>();
@@ -637,6 +641,36 @@ public:
 private:
     GuestState* previous_ = nullptr;
 };
+
+
+// ---------------------------------------------------------------------------
+// COM call trace (env PG6_COM_TRACE=1, off by default)
+// ---------------------------------------------------------------------------
+// Every call through a bridge method thunk or function_thunk is counted per (interface, slot); the
+// first call of each pair is logged with the caller address, the first four argument registers and
+// the HRESULT (rax) returned. Boot report: "com_calls". Off: one relaxed atomic load per call.
+extern std::atomic<bool> g_com_trace;
+inline bool trace_enabled() { return g_com_trace.load(std::memory_order_relaxed); }
+void set_trace_enabled(bool on);
+void trace_reset();
+
+struct TraceSnap {
+    uint64_t rip = 0;
+    uint64_t rsp = 0;
+    uint64_t args[4] = {0, 0, 0, 0};
+};
+TraceSnap trace_snap(const GuestState& state);
+// iface == nullptr: a flat function_thunk, `fn_id` stands in for the slot.
+void trace_record(const InterfaceInfo* iface, uint32_t fn_id, const TraceSnap& snap, int32_t hresult);
+uint32_t trace_next_function_id();
+
+struct TraceRow {
+    std::string interface_name;
+    uint32_t slot = 0;
+    uint64_t count = 0;
+    int32_t hresult = 0;
+};
+std::vector<TraceRow> trace_report();
 
 namespace detail {
 
@@ -917,8 +951,16 @@ void method_thunk(void* raw_state) {
     GuestStateScope scope(state);
     CallContext ctx{state, state.gpr[GuestReg::Rcx], r.object.get(), r.iface,
                     state.gpr[GuestReg::Rsp]};
+    const bool traced = trace_enabled();
+    TraceSnap snap;
+    if (traced) {
+        snap = trace_snap(state);
+    }
     invoke_method<Host, M, typename Traits::Ret>(ctx, static_cast<Host*>(r.host),
                                                  static_cast<typename Traits::Params*>(nullptr));
+    if (traced) {
+        trace_record(r.iface, 0, snap, static_cast<int32_t>(state.gpr[GuestReg::Rax]));
+    }
     pop_return(state);
 }
 
@@ -929,7 +971,15 @@ void raw_method_thunk(void* raw_state) {
     GuestStateScope scope(state);
     CallContext ctx{state, state.gpr[GuestReg::Rcx], r.object.get(), r.iface,
                     state.gpr[GuestReg::Rsp]};
+    const bool traced = trace_enabled();
+    TraceSnap snap;
+    if (traced) {
+        snap = trace_snap(state);
+    }
     F(ctx);
+    if (traced) {
+        trace_record(r.iface, 0, snap, static_cast<int32_t>(state.gpr[GuestReg::Rax]));
+    }
     pop_return(state);
 }
 
@@ -970,7 +1020,16 @@ void function_thunk(void* raw_state) {
     GuestState& state = *static_cast<GuestState*>(raw_state);
     GuestStateScope scope(state);
     CallContext ctx{state, 0, nullptr, nullptr, state.gpr[GuestReg::Rsp]};
+    const bool traced = trace_enabled();
+    TraceSnap snap;
+    if (traced) {
+        snap = trace_snap(state);
+    }
     invoke_free<F, typename Traits::Ret>(ctx, static_cast<typename Traits::Params*>(nullptr));
+    if (traced) {
+        static const uint32_t fn_id = trace_next_function_id();
+        trace_record(nullptr, fn_id, snap, static_cast<int32_t>(state.gpr[GuestReg::Rax]));
+    }
     pop_return(state);
 }
 

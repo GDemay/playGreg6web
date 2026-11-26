@@ -85,7 +85,7 @@ bool map_dispatch_mode(XTaskQueueDispatchMode mode,
     switch (mode) {
         case XTaskQueueDispatchMode::ThreadPool:
             out_mode = playgta6::os::XTaskQueue::DispatchMode::ThreadPool;
-            out_threads = 2;
+            out_threads = 1;
             return true;
         case XTaskQueueDispatchMode::SerializedThreadPool:
             out_mode = playgta6::os::XTaskQueue::DispatchMode::ThreadPool;
@@ -189,7 +189,9 @@ HResult XTaskQueueCreate(XTaskQueueDispatchMode work_mode,
 
     auto* handle = new Pg6XTaskQueue();
     handle->queue = std::make_unique<playgta6::os::XTaskQueue>(
-        mapped_work, mapped_completion, work_threads);
+        mapped_work, mapped_completion, work_threads,
+        work_mode == XTaskQueueDispatchMode::SerializedThreadPool,
+        completion_mode == XTaskQueueDispatchMode::SerializedThreadPool);
     *queue = handle;
     return S_OK_HR;
 }
@@ -285,7 +287,7 @@ bool XTaskQueueGetCurrentProcessTaskQueue(XTaskQueueHandle* queue) {
         created->queue = std::make_unique<playgta6::os::XTaskQueue>(
             playgta6::os::XTaskQueue::DispatchMode::ThreadPool,
             playgta6::os::XTaskQueue::DispatchMode::ThreadPool,
-            2u);
+            1u);
         state.process_queue = created;
     }
 

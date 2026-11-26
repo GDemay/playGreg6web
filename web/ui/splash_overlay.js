@@ -92,6 +92,7 @@
   const DISMISS_REASON_RE = /^[a-z0-9][a-z0-9_.:-]{0,63}$/i;
   const HUD_HIDDEN_VALUES = new Set(['0', 'false', 'off', 'no', 'none', 'hidden']);
   const GREG_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
+  const GREG_DISABLED_VALUES = new Set(['0', 'false', 'off', 'no']);
   const SPLASH_HOLD_ENABLED_VALUES = new Set(['1', 'true', 'on', 'yes']);
   const DISMISS_REASONS = Object.freeze({
     FIRST_PRESENT: 'first_present',
@@ -134,10 +135,25 @@
     '.pg6-splash--fading{opacity:0;pointer-events:none;}' +
     '.' +
     ROOT_CLASS +
+    '[data-greg-backdrop="true"]{background:#0b0c10;}' +
+    '.' +
+    ROOT_CLASS +
     '__media{position:absolute;inset:0;overflow:hidden;}' +
     '.' +
     ROOT_CLASS +
+    '__media--greg{display:flex;align-items:center;justify-content:center;box-sizing:border-box;' +
+    'padding:24px 24px 128px;' +
+    'background:radial-gradient(circle at 50% 44%,rgba(38,41,50,0.42) 0%,rgba(15,16,22,0.88) 54%,#0b0c10 100%),#0b0c10;}' +
+    '.' +
+    ROOT_CLASS +
     '__img,.pg6-splash__fallback{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;}' +
+    '.' +
+    ROOT_CLASS +
+    '__img.' +
+    ROOT_CLASS +
+    '__img--greg{position:relative;inset:auto;width:min(340px,46vmin);height:min(340px,46vmin);' +
+    'max-width:70vw;max-height:55vh;object-fit:contain;object-position:center;' +
+    'user-select:none;pointer-events:none;filter:drop-shadow(0 18px 42px rgba(0,0,0,0.58));}' +
     '.' +
     ROOT_CLASS +
     '__fallback{display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0b1220,#1a2a3a);}' +
@@ -180,7 +196,7 @@
     'border-top-color:var(--color-accent,#dfe2e5);animation:pg6-spin 850ms linear infinite;}' +
     '.' +
     ROOT_CLASS +
-    '__greg{width:22px;height:22px;object-fit:contain;border:none;border-radius:var(--radius-full,9999px);' +
+    '__greg{width:22px;height:22px;object-fit:contain;border:none;' +
     'box-shadow:none;display:block;animation:pg6-spin 1200ms linear infinite;}' +
     '.' +
     ROOT_CLASS +
@@ -378,6 +394,22 @@
   function isGregQuery(search) {
     const value = readLastQueryParam(search, 'greg');
     return value !== null && GREG_ENABLED_VALUES.has(value);
+  }
+
+  /**
+   * Resolve default Spinning Greg state from URL query params.
+   * Spinning Greg is enabled by default unless explicitly disabled via `?greg=0` /
+   * `?greg=false` / `?greg=off` / `?greg=no`. Never throws.
+   *
+   * @param {unknown} search
+   * @returns {boolean}
+   */
+  function resolveDefaultGregMode(search) {
+    const value = readLastQueryParam(search, 'greg');
+    if (value !== null && GREG_DISABLED_VALUES.has(value)) {
+      return false;
+    }
+    return true;
   }
 
   /**
@@ -674,6 +706,25 @@
     return el;
   }
 
+  function setElementClass(el, className, active) {
+    if (!el) return;
+    if (
+      el.classList &&
+      typeof el.classList.add === 'function' &&
+      typeof el.classList.remove === 'function'
+    ) {
+      if (active) {
+        el.classList.add(className);
+      } else {
+        el.classList.remove(className);
+      }
+    } else if (typeof el.className === 'string') {
+      const tokens = el.className.split(/\s+/).filter((c) => c && c !== className);
+      if (active) tokens.push(className);
+      el.className = tokens.join(' ');
+    }
+  }
+
   /**
    * Controllable splash / boot-stage overlay.
    */
@@ -881,7 +932,12 @@
       this._instantHide =
         typeof opts.instantHide === 'boolean' ? opts.instantHide : this._hudHidden;
       this._gregMode =
-        typeof opts.gregMode === 'boolean' ? opts.gregMode : isGregQuery(searchSource);
+        typeof opts.gregMode === 'boolean' ? opts.gregMode : resolveDefaultGregMode(searchSource);
+      this._gregImageFailed = false;
+      this._gregBackdropFailed = false;
+      this._usingGregBackdrop = false;
+      this._activeImageUrl = null;
+      this._onGregImageError = null;
       this._holdUntilVisible =
         typeof opts.holdUntilVisible === 'boolean'
           ? opts.holdUntilVisible
@@ -1025,18 +1081,22 @@
       );
       const spinner = createEl(doc, 'span', `${ROOT_CLASS}__spinner`, {
         'aria-hidden': 'true',
-        'data-greg-mode': 'false',
+        'data-greg-mode': this._gregMode ? 'true' : 'false',
       });
       const spinnerRing = createEl(doc, 'span', `${ROOT_CLASS}__spinner-ring`, {
         'aria-hidden': 'true',
       });
+      spinnerRing.hidden = Boolean(this._gregMode);
+      if (spinnerRing.style) spinnerRing.style.display = this._gregMode ? 'none' : '';
       const gregImg = createEl(doc, 'img', `${ROOT_CLASS}__greg`, {
         src: this._gregImageUrl,
         alt: 'Greg',
+        'aria-hidden': 'true',
+        draggable: 'false',
         decoding: 'async',
       });
-      gregImg.hidden = true;
-      if (gregImg.style) gregImg.style.display = 'none';
+      gregImg.hidden = !this._gregMode;
+      if (gregImg.style) gregImg.style.display = this._gregMode ? '' : 'none';
       spinner.appendChild(spinnerRing);
       spinner.appendChild(gregImg);
 
@@ -1132,6 +1192,7 @@
       if (!els.root) {
         this._els = {
           root: this._root,
+          media: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__media`) : null,
           img: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__img`) : null,
           fallback: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__fallback`) : null,
           scripted: this._root.querySelector ? this._root.querySelector(`.${ROOT_CLASS}__scripted`) : null,
@@ -1160,14 +1221,38 @@
       const img = this._els.img;
       if (img) {
         this._onImageError = () => {
-          this._imageFailed = true;
-          this._usingFallback = true;
+          if (this._usingGregBackdrop) {
+            this._gregBackdropFailed = true;
+          } else {
+            this._imageFailed = true;
+          }
           this._syncImage();
         };
-        if (typeof img.addEventListener === 'function') {
-          img.addEventListener('error', this._onImageError);
-        } else {
-          img.onerror = this._onImageError;
+        try {
+          if (typeof img.addEventListener === 'function') {
+            img.addEventListener('error', this._onImageError);
+          } else {
+            img.onerror = this._onImageError;
+          }
+        } catch {
+          this._onImageError = null;
+        }
+      }
+
+      const gregImg = this._els.gregImg;
+      if (gregImg) {
+        this._onGregImageError = () => {
+          this._gregImageFailed = true;
+          this._syncSpinner();
+        };
+        try {
+          if (typeof gregImg.addEventListener === 'function') {
+            gregImg.addEventListener('error', this._onGregImageError);
+          } else {
+            gregImg.onerror = this._onGregImageError;
+          }
+        } catch {
+          this._onGregImageError = null;
         }
       }
 
@@ -1229,28 +1314,87 @@
 
     _syncImage() {
       const img = this._els && this._els.img;
+      const media = this._els && this._els.media;
       const fallback = this._els && this._els.fallback;
-      const useImage = Boolean(this._splashImageUrl) && !this._imageFailed;
+      const useGregBackdrop =
+        Boolean(this._gregMode) && Boolean(this._gregImageUrl) && !this._gregBackdropFailed;
+      const useSplashImage =
+        !useGregBackdrop && Boolean(this._splashImageUrl) && !this._imageFailed;
+      const activeUrl = useGregBackdrop
+        ? this._gregImageUrl
+        : useSplashImage
+          ? this._splashImageUrl
+          : null;
+      let useImage = Boolean(activeUrl);
+      let gregBackdropActive = useGregBackdrop && useImage;
 
       if (img) {
         try {
           if (useImage) {
-            if (img.getAttribute && img.getAttribute('src') !== this._splashImageUrl) {
-              img.setAttribute('src', this._splashImageUrl);
-            } else if (img.src !== this._splashImageUrl) {
-              img.src = this._splashImageUrl;
+            if (typeof img.setAttribute === 'function') {
+              if (!img.getAttribute || img.getAttribute('src') !== activeUrl) {
+                img.setAttribute('src', activeUrl);
+              }
+              const altText = gregBackdropActive ? 'Greg' : 'Local splash';
+              if (!img.getAttribute || img.getAttribute('alt') !== altText) {
+                img.setAttribute('alt', altText);
+              }
+              img.setAttribute('data-greg-backdrop', gregBackdropActive ? 'true' : 'false');
+              img.setAttribute('draggable', 'false');
+            } else if (img.src !== activeUrl) {
+              img.src = activeUrl;
             }
             img.hidden = false;
-            if (img.style) img.style.display = '';
+            if (img.style) {
+              img.style.display = '';
+              img.style.objectFit = gregBackdropActive ? 'contain' : 'cover';
+            }
           } else {
-            img.removeAttribute && img.removeAttribute('src');
+            if (typeof img.removeAttribute === 'function') {
+              img.removeAttribute('src');
+            } else {
+              img.src = '';
+            }
+            if (typeof img.setAttribute === 'function') {
+              img.setAttribute('data-greg-backdrop', 'false');
+            }
             img.hidden = true;
-            if (img.style) img.style.display = 'none';
+            if (img.style) {
+              img.style.display = 'none';
+              img.style.objectFit = '';
+            }
           }
+          setElementClass(img, `${ROOT_CLASS}__img--greg`, gregBackdropActive);
         } catch {
           // Image attribute updates must never throw out of the overlay.
-          this._imageFailed = true;
-          this._usingFallback = true;
+          if (useGregBackdrop) {
+            this._gregBackdropFailed = true;
+          } else {
+            this._imageFailed = true;
+          }
+          useImage = false;
+          gregBackdropActive = false;
+        }
+      }
+
+      if (media) {
+        try {
+          setElementClass(media, `${ROOT_CLASS}__media--greg`, gregBackdropActive);
+          if (typeof media.setAttribute === 'function') {
+            media.setAttribute('data-greg-backdrop', gregBackdropActive ? 'true' : 'false');
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (this._root) {
+        try {
+          if (typeof this._root.setAttribute === 'function') {
+            this._root.setAttribute('data-greg-backdrop', gregBackdropActive ? 'true' : 'false');
+          }
+        } catch {
+          // ignore
         }
       }
 
@@ -1261,6 +1405,8 @@
         }
       }
 
+      this._usingGregBackdrop = gregBackdropActive;
+      this._activeImageUrl = useImage ? activeUrl : null;
       this._usingFallback = !useImage;
     }
 
@@ -1374,13 +1520,15 @@
       const spinnerRing = els.spinnerRing;
       const gregImg = els.gregImg;
       const reducedMotion = this._isReducedMotion();
-      const activeGreg = Boolean(this._gregMode);
+      const activeGreg = Boolean(this._gregMode) && !this._gregImageFailed;
       const hideSpinner = Boolean(this._dismissed);
 
       if (this._root) {
         try {
-          this._root.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
-          this._root.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+          if (typeof this._root.setAttribute === 'function') {
+            this._root.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
+            this._root.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+          }
         } catch {
           // ignore
         }
@@ -1390,8 +1538,11 @@
         try {
           spinner.hidden = hideSpinner;
           if (spinner.style) spinner.style.display = hideSpinner ? 'none' : '';
-          spinner.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
-          spinner.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+          if (typeof spinner.setAttribute === 'function') {
+            spinner.setAttribute('aria-hidden', 'true');
+            spinner.setAttribute('data-greg-mode', activeGreg ? 'true' : 'false');
+            spinner.setAttribute('data-reduced-motion', reducedMotion ? 'true' : 'false');
+          }
           const gregClass = `${ROOT_CLASS}__spinner--greg`;
           if (spinner.classList && typeof spinner.classList.add === 'function' && typeof spinner.classList.remove === 'function') {
             if (activeGreg) {
@@ -1423,13 +1574,21 @@
 
       if (gregImg) {
         try {
-          if (gregImg.getAttribute && gregImg.getAttribute('src') !== this._gregImageUrl) {
-            gregImg.setAttribute('src', this._gregImageUrl);
+          if (typeof gregImg.setAttribute === 'function') {
+            if (!gregImg.getAttribute || gregImg.getAttribute('src') !== this._gregImageUrl) {
+              gregImg.setAttribute('src', this._gregImageUrl);
+            }
+            if (!gregImg.getAttribute || gregImg.getAttribute('alt') !== 'Greg') {
+              gregImg.setAttribute('alt', 'Greg');
+            }
+            if (!gregImg.getAttribute || gregImg.getAttribute('aria-hidden') !== 'true') {
+              gregImg.setAttribute('aria-hidden', 'true');
+            }
+            if (!gregImg.getAttribute || gregImg.getAttribute('draggable') !== 'false') {
+              gregImg.setAttribute('draggable', 'false');
+            }
           } else if (gregImg.src !== this._gregImageUrl) {
             gregImg.src = this._gregImageUrl;
-          }
-          if (gregImg.getAttribute && gregImg.getAttribute('alt') !== 'Greg') {
-            gregImg.setAttribute('alt', 'Greg');
           }
           gregImg.hidden = !activeGreg;
           if (gregImg.style) {
@@ -1733,7 +1892,8 @@
     }
 
     /**
-     * Enable or disable the Spinning Greg loading spinner easter egg.
+     * Enable or disable Greg mode (centered Greg splash backdrop + Spinning Greg
+     * loading spinner).
      *
      * @param {boolean} enabled
      * @returns {object} Current controller state.
@@ -1746,6 +1906,7 @@
       this._gregClickCount = 0;
       this._gregKeyBuffer = '';
       this._syncSpinner();
+      this._syncImage();
       return this.getState();
     }
 
@@ -2312,6 +2473,7 @@
         readyForSplash: Boolean(this._readyForSplash),
         scriptedInputPreset: this._scriptedInputPreset,
         gregMode: Boolean(this._gregMode),
+        gregBackdropActive: Boolean(this._usingGregBackdrop),
         holdUntilVisible: Boolean(this._holdUntilVisible),
         holdingForVisibleFrame: Boolean(this._holdingForVisibleFrame),
         heldForVisibleFrame: Boolean(this._heldForVisibleFrame),
@@ -2361,6 +2523,9 @@
         badgeText: this._badgeText,
         readyForSplash: this._readyForSplash,
         splashImageUrl: this._splashImageUrl,
+        activeSplashImageUrl: this._activeImageUrl,
+        gregBackdropActive: Boolean(this._usingGregBackdrop),
+        gregBackdropFailed: Boolean(this._gregBackdropFailed),
         usingFallback: this._usingFallback,
         imageFailed: this._imageFailed,
         fadeMs: this._fadeMs,
@@ -2418,6 +2583,20 @@
         }
       }
 
+      const gregImg = this._els && this._els.gregImg;
+      if (gregImg && this._onGregImageError) {
+        try {
+          if (typeof gregImg.removeEventListener === 'function') {
+            gregImg.removeEventListener('error', this._onGregImageError);
+          } else {
+            gregImg.onerror = null;
+          }
+        } catch {
+          // ignore
+        }
+      }
+      this._onGregImageError = null;
+
       const spinner = this._els && this._els.spinner;
       if (spinner && this._onSpinnerClick) {
         try {
@@ -2470,6 +2649,7 @@
     sanitizeDismissReason,
     isHudHiddenQuery,
     isGregQuery,
+    resolveDefaultGregMode,
     isSplashHoldQuery,
     SplashOverlayController,
     DEFAULT_FADE_MS,

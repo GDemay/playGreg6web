@@ -30,7 +30,7 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
         !ir.contains("%xmm1 = alloca"),
         "only used registers get a slot"
     );
-    let state_slot = |idx: u32| format!("ptr %state, i64 0, i32 5, i64 {idx}\n");
+    let state_slot = |idx: u32| format!("ptr %state.xmm{idx}, align 8");
     // entry + after the call + before the call + before the return
     assert_eq!(ir.matches(&state_slot(0)).count(), 4, "{ir}");
     assert_eq!(ir.matches(&state_slot(5)).count(), 4, "{ir}");
@@ -42,7 +42,7 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
             > before.rfind("load <2 x i64>, ptr %xmm0").unwrap()
     );
     assert!(
-        after.contains("load <2 x i64>, ptr %t"),
+        after.contains("load <2 x i64>, ptr %state.xmm"),
         "reloaded after the call: {after}"
     );
 
@@ -58,38 +58,174 @@ fn used_xmm_registers_get_slots_synced_like_gprs() {
 fn ymm_upper_halves_get_slots_only_where_avx_touches_them() {
     let func = asm_function(0x1000, |a| {
         a.addps(xmm0, xmm1)?; // legacy SSE: upper halves untouched
-        a.vaddps(ymm2, ymm3, ymm4)?; // 256-bit: both halves
-        a.vmulps(xmm5, xmm5, xmm5)?; // VEX-128: zeroes ymm5's upper half
+        a.vaddps(ymm2, ymm3, ymm4)?; // 256-bit: reads ymm3/ymm4, writes ymm2 only
+        a.vmulps(xmm5, xmm5, xmm5)?; // VEX-128: zeroes ymm5's upper half directly in state
         a.ret()
     });
     let lifted = lift_function(&func).expect("lifts");
     let ir = &lifted.ir;
     assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
-    for idx in [2, 3, 4, 5] {
+    // Read upper halves (`ymm3`, `ymm4`) keep local allocas with entry load + exit store.
+    for idx in [3, 4] {
         assert!(
-            ir.contains(&format!(
-                "  %ymmh{idx} = alloca <2 x i64>
-"
-            )),
+            ir.contains(&format!("  %ymmh{idx} = alloca <2 x i64>\n")),
             "{ir}"
         );
-        // entry load + exit store of state field 6 (`ymm_hi`)
         assert_eq!(
-            ir.matches(&format!(
-                "ptr %state, i64 0, i32 6, i64 {idx}
-"
-            ))
-            .count(),
+            ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
+                .count(),
             2,
+            "{ir}"
+        );
+    }
+    // Write-only (`ymm2`) and VEX-128-zeroed (`ymm5`) upper halves skip local allocas and write
+    // directly into `%state.ymmh*` (no entry load, no exit store).
+    for idx in [2, 5] {
+        assert!(!ir.contains(&format!("%ymmh{idx} = alloca")), "{ir}");
+        assert!(
+            !ir.contains(&format!("load <2 x i64>, ptr %state.ymmh{idx}")),
+            "{ir}"
+        );
+        assert_eq!(
+            ir.matches(&format!("ptr %state.ymmh{idx}, align 8"))
+                .count(),
+            1,
             "{ir}"
         );
     }
     for idx in [0, 1] {
         assert!(!ir.contains(&format!("%ymmh{idx} =")), "{ir}");
+        assert!(!ir.contains(&format!("%state.ymmh{idx}")), "{ir}");
     }
     assert!(
-        ir.contains("store <2 x i64> zeroinitializer, ptr %ymmh5"),
+        ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh5, align 8"),
         "{ir}"
+    );
+}
+
+#[test]
+fn r62_unread_ymmh_elides_allocas_and_uses_memset_for_vzeroupper() {
+    // 1. VEX-128 + vzeroupper + direct & indirect calls, reading zero ymmh registers.
+    let prog = Program::new()
+        .asm(0x1000, |a| {
+            a.vxorps(xmm0, xmm0, xmm0)?;
+            a.call(0x2000)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        })
+        .asm(0x2000, |a| a.ret());
+    let f_vex_vzu = prog.function(0x1000);
+    let lifted = lift_function(&f_vex_vzu).expect("lifts");
+    let ir = &lifted.ir;
+    assert!(lifted.unsupported.is_empty(), "{:?}", lifted.unsupported);
+    assert!(
+        !ir.contains("%ymmh"),
+        "unread VEX-128/vzeroupper must emit zero %ymmh allocas:\n{ir}"
+    );
+    assert!(
+        !ir.contains("load <2 x i64>, ptr %state.ymmh"),
+        "unread VEX-128/vzeroupper must emit zero %state.ymmh loads:\n{ir}"
+    );
+    assert!(
+        ir.contains("store <2 x i64> zeroinitializer, ptr %state.ymmh0, align 8"),
+        "VEX-128 must still zero %state.ymmh0 directly:\n{ir}"
+    );
+    assert!(
+        ir.contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "vzeroupper with no local ymmh must emit a single 256-byte memset:\n{ir}"
+    );
+
+    // 2. Reads ONLY ymm0 (`vmovdqu [rcx], ymm0`) + vzeroupper + call -> only %ymmh0 allocated!
+    let prog_one = Program::new()
+        .asm(0x1000, |a| {
+            a.vmovdqu(ymmword_ptr(rcx), ymm0)?;
+            a.call(rax)?;
+            a.vzeroupper()?;
+            a.ret()
+        });
+    let lifted_one = lift_function(&prog_one.function(0x1000)).expect("lifts");
+    let ir_one = &lifted_one.ir;
+    assert!(
+        lifted_one.unsupported.is_empty(),
+        "{:?}",
+        lifted_one.unsupported
+    );
+    assert!(
+        ir_one.contains("  %ymmh0 = alloca <2 x i64>\n"),
+        "read ymm0 must allocate %ymmh0:\n{ir_one}"
+    );
+    for idx in 1..16 {
+        assert!(
+            !ir_one.contains(&format!("%ymmh{idx} = alloca")),
+            "unread ymmh{idx} must not allocate:\n{ir_one}"
+        );
+        assert!(
+            !ir_one.contains(&format!("load <2 x i64>, ptr %state.ymmh{idx}")),
+            "unread ymmh{idx} must not reload from state:\n{ir_one}"
+        );
+    }
+    assert!(
+        ir_one.contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "vzeroupper with 1 local ymmh must bulk-zero state:\n{ir_one}"
+    );
+    assert!(
+        ir_one.contains("store <2 x i64> zeroinitializer, ptr %ymmh0"),
+        "vzeroupper must also zero local %ymmh0:\n{ir_one}"
+    );
+
+    // 3. Write-only 256-bit `vmovdqu ymm0, [rcx]` -> zero %ymmh allocas, direct store to %state.ymmh0.
+    let f_write_only = asm_function(0x1000, |a| {
+        a.vmovdqu(ymm0, ymmword_ptr(rcx))?;
+        a.ret()
+    });
+    let lifted_wo = lift_function(&f_write_only).expect("lifts");
+    let ir_wo = &lifted_wo.ir;
+    assert!(
+        lifted_wo.unsupported.is_empty(),
+        "{:?}",
+        lifted_wo.unsupported
+    );
+    assert!(
+        !ir_wo.contains("%ymmh"),
+        "write-only ymm0 must not allocate %ymmh:\n{ir_wo}"
+    );
+    assert!(
+        !ir_wo.contains("load <2 x i64>, ptr %state.ymmh"),
+        "write-only ymm0 must not load %state.ymmh:\n{ir_wo}"
+    );
+    assert_eq!(
+        ir_wo.matches("ptr %state.ymmh0, align 8").count(),
+        1,
+        "write-only ymm0 must store directly to %state.ymmh0 once:\n{ir_wo}"
+    );
+
+    // 4. `vzeroall` without ymmh reads -> zero %ymmh allocas, single 256-byte memset.
+    let f_vza = asm_function(0x1000, |a| {
+        a.vzeroall()?;
+        a.ret()
+    });
+    let lifted_vza = lift_function(&f_vza).expect("lifts");
+    assert!(lifted_vza.unsupported.is_empty());
+    assert!(!lifted_vza.ir.contains("%ymmh"), "{}", lifted_vza.ir);
+    assert!(
+        lifted_vza
+            .ir
+            .contains("call void @llvm.memset.p0.i64(ptr align 8 %state.ymmh0, i8 0, i64 256, i1 false)"),
+        "{}",
+        lifted_vza.ir
+    );
+
+    // 5. 256-bit zeroing idiom `vxorps ymm0, ymm0, ymm0` must still lift cleanly without trapping.
+    let f_idiom = asm_function(0x1000, |a| {
+        a.vxorps(ymm0, ymm0, ymm0)?;
+        a.ret()
+    });
+    let lifted_idiom = lift_function(&f_idiom).expect("lifts");
+    assert!(
+        lifted_idiom.unsupported.is_empty(),
+        "{:?}",
+        lifted_idiom.unsupported
     );
 }
 
@@ -266,5 +402,207 @@ fn random_sse_byte_sequences_never_panic() {
     assert!(
         traps > 0 && lifted > 200,
         "traps {traps}, xmm loads {lifted}"
+    );
+}
+
+#[test]
+fn r61_supported_non_trapping_simd_never_traps_on_random_sse() {
+    use crate::lift::function::simd::is_supported_non_trapping_simd;
+    let functions = random_sse_program(800);
+    let mut checked = 0usize;
+    for func in functions.values() {
+        let lifted = lift_function(func).expect("lifts");
+        let trapped_addrs: std::collections::BTreeSet<u64> =
+            lifted.unsupported.iter().map(|u| u.address).collect();
+        for block in func.blocks.values() {
+            for ins in &block.instructions {
+                if is_supported_non_trapping_simd(ins) {
+                    checked += 1;
+                    assert!(
+                        !trapped_addrs.contains(&ins.ip()),
+                        "is_supported_non_trapping_simd accepted an instruction that trapped: {ins} ({:?}) at {:#x}",
+                        ins.code(),
+                        ins.ip()
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 100,
+        "expected >100 checked SIMD instructions, got {checked}"
+    );
+}
+
+#[test]
+fn r59_simd_vector_lowering_avoids_scalar_loops() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "psadbw",
+            asm_function(0x1000, |a| {
+                a.psadbw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermd",
+            asm_function(0x1100, |a| {
+                a.vpermd(ymm0, ymm1, ymm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermilps_var",
+            asm_function(0x1200, |a| {
+                a.vpermilps(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpermilpd_var",
+            asm_function(0x1300, |a| {
+                a.vpermilpd(xmm0, xmm1, xmm2)?;
+                a.ret()
+            }),
+        ),
+        (
+            "ptest",
+            asm_function(0x1400, |a| {
+                a.ptest(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vptest256",
+            asm_function(0x1500, |a| {
+                a.vptest(ymm0, ymm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "phminposuw",
+            asm_function(0x1600, |a| {
+                a.phminposuw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "packsswb",
+            asm_function(0x1700, |a| {
+                a.packsswb(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmulhrsw",
+            asm_function(0x1800, |a| {
+                a.pmulhrsw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmulhw",
+            asm_function(0x1900, |a| {
+                a.pmulhw(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "pmuldq",
+            asm_function(0x1A00, |a| {
+                a.pmuldq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtps2dq",
+            asm_function(0x1B00, |a| {
+                a.cvtps2dq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtpd2dq",
+            asm_function(0x1C00, |a| {
+                a.cvtpd2dq(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "cvtpd2ps",
+            asm_function(0x1D00, |a| {
+                a.cvtpd2ps(xmm0, xmm1)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for (name, f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{}: {:?}", name.0, f.unsupported);
+        let ir = &f.ir;
+        match name.0 {
+            "psadbw" => {
+                assert!(!ir.contains("extractelement"), "psadbw scalarized:\n{ir}");
+                assert!(ir.contains("@llvm.umax.v16i8"), "{ir}");
+                assert!(ir.contains("@llvm.umin.v16i8"), "{ir}");
+            }
+            "vpermd" | "vpermilps_var" => {
+                assert!(!ir.contains("extractelement"), "{} scalarized:\n{ir}", name.0);
+                assert!(ir.contains("@llvm.wasm.swizzle("), "{ir}");
+            }
+            "vpermilpd_var" => {
+                assert!(!ir.contains("extractelement"), "vpermilpd scalarized:\n{ir}");
+                assert!(ir.contains("select <2 x i1>"), "{ir}");
+            }
+            "ptest" | "vptest256" => {
+                assert!(!ir.contains("extractelement"), "{} scalarized:\n{ir}", name.0);
+                assert!(ir.contains("bitcast <2 x i1>"), "{ir}");
+            }
+            "phminposuw" => {
+                assert!(ir.contains("@llvm.umin.v8i16"), "{ir}");
+                assert!(ir.contains("@llvm.cttz.i16"), "{ir}");
+            }
+            "packsswb" => {
+                assert!(ir.contains("@llvm.smax.v8i16"), "{ir}");
+                assert!(ir.contains("@llvm.smin.v8i16"), "{ir}");
+            }
+            "pmulhrsw" => {
+                assert!(ir.contains("16384"), "{ir}");
+                assert!(ir.contains("lshr <4 x i32>"), "{ir}");
+            }
+            "pmulhw" => {
+                assert!(!ir.contains("lshr"), "pmulhw should shuffle odd lanes directly:\n{ir}");
+            }
+            "pmuldq" => {
+                assert!(ir.contains("sext <2 x i32>"), "{ir}");
+            }
+            "cvtps2dq" => {
+                assert!(ir.contains("@llvm.fptosi.sat.v4i32.v4f32"), "{ir}");
+            }
+            "cvtpd2dq" => {
+                assert!(ir.contains("@llvm.fptosi.sat.v2i32.v2f64"), "{ir}");
+                assert!(
+                    ir.contains("<4 x i32> <i32 0, i32 1, i32 2, i32 3>"),
+                    "{ir}"
+                );
+            }
+            "cvtpd2ps" => {
+                assert!(
+                    ir.contains("<4 x i32> <i32 0, i32 1, i32 2, i32 3>"),
+                    "{ir}"
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Native retargeting must remain free of wasm-only intrinsics.
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR"
     );
 }

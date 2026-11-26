@@ -105,7 +105,27 @@ struct TextureInfo {
     bool sampled_only = false;
     // Created with STORAGE_BINDING usage (storage views of it are valid).
     bool storage = false;
+    // G66 partly-held mip chains: first mip level from which the chain holds content (the title
+    // streams only the small levels; the larger ones are unmapped or belong to another texture).
+    // Sampled views start no lower than it. 0 = the whole chain is held. Set with
+    // StateBridgeDevice::set_resident_mip_floor, kept when the same description is registered again.
+    uint32_t resident_mip_floor = 0;
 };
+
+// The sampled-view mip range clamped to the held levels: `base` / `count` (count 0 = all remaining
+// levels) of a view of a texture with `mip_levels` levels, raised so the view starts no lower than
+// max(resident_floor, floor(min_lod_clamp)) (D3D12 ResourceMinLODClamp counts from the resource's
+// level 0). At least the view's (or the chain's) last level stays. Returns true when it raised base.
+bool clamp_view_to_resident_mips(uint32_t mip_levels, uint32_t resident_floor, float min_lod_clamp, uint16_t* base,
+                                 uint16_t* count) noexcept;
+// The first held level of a mip chain from per-subresource upload marks (index mip + slice * mips;
+// non-zero = that subresource's guest memory was mapped and uploaded): the lowest level from which
+// every smaller level is held in some slice. 0 when the smallest level is not held (nothing
+// streamed, or levels filled on the GPU): such a chain is not clamped.
+// Only a streamable (reserved/tiled) resource is clamped: for any other, an all-zero level is a
+// black level the title uploaded, not a level that is not loaded, so the floor is 0.
+uint32_t held_mip_floor(std::span<const uint64_t> subresource_marks, uint32_t mips, uint32_t layers,
+                        bool streamable = true) noexcept;
 
 // One binding of a bind group layout: the WebGPU layout entry plus the D3D register join key (S6
 // layout-manifest.json `bindings` record). `entry.binding` and `join.binding` must match.
@@ -178,6 +198,10 @@ struct BridgeOptions {
     // first byte, so the view's bytes must start the binding: an aligned-down binding would need an
     // offset the stage does not take.
     std::function<bool(uint64_t gpu_va, uint64_t size, uint32_t* buffer_id, uint64_t* offset)> relocate_storage;
+    // G66 (#691): bumped whenever the two hooks above hand an existing home to another range (LRU
+    // eviction). A cached bind group bound to a relocated home re-resolves its relocations when it
+    // changed and is re-created if one moved; otherwise it would read another draw's bytes.
+    std::function<uint64_t()> relocation_epoch;
     // Root tables in heaps this source reads are built from descriptor memory (G48): at recording,
     // and again at ExecuteCommandLists (CommandListBridge::refresh_memory_bind_groups). Not owned.
     const d3d::DescriptorSlotSource* slot_source = nullptr;
@@ -195,9 +219,83 @@ struct BridgeOptions {
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
 // WebGPU's default maxUniformBufferBindingSize (also D3D12's 4096 x 16-byte constant buffer limit).
 inline constexpr uint64_t kMaxUniformBindingSize = 65536;
+// Bind groups one command list keeps cached across Resets (O36); see CommandListBridge::Reset.
+inline constexpr size_t kMaxCachedBindGroups = 4096;
 
 class GraphicsPipelineState;
 class ComputePipelineState;
+
+// G66: ExecuteIndirect with a single-argument command signature. The guest's argument records are
+// first passed through a clamp compute pass (indirect_clamp_wgsl) that applies the count buffer,
+// clamps out-of-range values and writes them compacted into a bridge-owned ring, from which one
+// DrawIndirect / DrawIndexedIndirect / DispatchIndirect per command reads.
+enum class IndirectKind : uint8_t {
+    Draw = 0,         // 16-byte record: vertex count, instance count, first vertex, first instance
+    DrawIndexed = 1,  // 20-byte record: index count, instance count, first index, base vertex, first instance
+    Dispatch = 2,     // 12-byte record: thread group counts x, y, z
+    // G66 mesh pipelines: 12-byte DispatchMesh record (group counts x, y, z) for the bound mesh
+    // pipeline state. The clamp pass writes a 28-byte pair: a dispatch record (x, 1, 1) for the
+    // mesh stage run as compute, then a draw record (x * max_primitives * 3, 1, 0, 0).
+    DispatchMesh = 3,
+};
+struct IndirectExecution {
+    IndirectKind kind = IndirectKind::Draw;
+    uint32_t max_count = 0;
+    uint32_t stride = 0;       // command signature ByteStride
+    uint32_t args_buffer = 0;  // buffer resource id
+    uint64_t args_offset = 0;
+    uint32_t count_buffer = 0;  // 0 = no count buffer (max_count commands)
+    uint64_t count_offset = 0;
+};
+// Commands one ExecuteIndirect emits at most (more are dropped and counted).
+inline constexpr uint32_t kMaxIndirectCommands = 256;
+// WebGPU's default maxComputeWorkgroupsPerDimension: dispatch arguments are clamped to it.
+inline constexpr uint32_t kMaxIndirectWorkgroups = 65535;
+// The clamp pass's output ring (one window of kMaxIndirectCommands records per execution).
+inline constexpr uint32_t kIndirectRingBytes = 1u << 18;
+inline constexpr uint32_t kIndirectWindowBytes = kMaxIndirectCommands * 28u;
+// Bytes the clamp pass writes per command of `kind` (the stride of the indirect packets' records).
+uint32_t indirect_output_bytes(IndirectKind kind) noexcept;
+// The clamp compute shader (entry point cs_main, workgroup size 64).
+const char* indirect_clamp_wgsl() noexcept;
+class CommandListBridge;
+
+// ---- G66: mesh pipelines (triangle output, x-dimension groups) emulated with compute + draw ----
+// A mesh pipeline state is two pipelines:
+//   * the mesh stage translated to a WGSL compute module (pack stage "compute", key
+//     mesh_compute_pack_key(mesh stage key), entry point cs_main, one workgroup per mesh group,
+//     workgroup_id.x = the group index). Its pipeline layout is the stage's own (groups 0..2, bound
+//     from the graphics root arguments) plus group kMeshOutputGroup, binding 0: the runtime's
+//     output buffer (storage, read_write), one record per group (mesh_group_record_words):
+//       word 0: vertex count, word 1: primitive count (SetMeshOutputCounts), words 2..3: 0,
+//       then max_vertices vertices of vertex_words words (SV_Position xyzw as f32 bits, then the
+//       attributes as vec4<f32> per location 0..), then max_primitives x 3 u32 local indices;
+//   * a draw with a runtime vertex shader (mesh_draw_vertex_wgsl) that pulls those triangles from
+//     the same buffer (group kMeshOutputGroup, read-only storage) and the title's pixel shader:
+//     groups * max_primitives * 3 vertices, unused primitives degenerate.
+struct MeshOutputLayout {
+    uint32_t max_vertices = 0;    // 1..256
+    uint32_t max_primitives = 0;  // 1..256
+    uint32_t vertex_words = 0;    // 4 (position) + 4 per attribute location (at most kMaxMeshAttributes)
+};
+inline constexpr uint32_t kMaxMeshAttributes = 15;
+inline constexpr uint32_t kMeshOutputGroup = 3;
+// The runtime's mesh output buffer: every mesh dispatch writes it from offset 0 (GPU-ordered).
+inline constexpr uint64_t kMeshOutputBytes = 32ull << 20;
+bool valid_mesh_output_layout(const MeshOutputLayout& layout) noexcept;
+uint32_t mesh_group_record_words(const MeshOutputLayout& layout) noexcept;
+// Groups one mesh dispatch runs at most: what fits in the output buffer, at most kMaxIndirectWorkgroups.
+uint32_t mesh_max_groups(const MeshOutputLayout& layout) noexcept;
+// The pack key of a mesh stage's compute translation.
+inline constexpr uint64_t kMeshComputeKeySalt = 0x4d53435300000000ull;  // "MSCS"
+constexpr uint64_t mesh_compute_pack_key(uint64_t mesh_stage_key) noexcept {
+    return mesh_stage_key ^ kMeshComputeKeySalt;
+}
+// The runtime vertex shader of a mesh draw (entry point vs_main) and the shader identity it is
+// registered under (one per output layout).
+std::string mesh_draw_vertex_wgsl(const MeshOutputLayout& layout);
+uint64_t mesh_draw_vertex_identity(const MeshOutputLayout& layout) noexcept;
+class MeshPipelineState;
 
 struct ViewRecord {
     uint32_t texture_id = 0;  // packet texture id (kGpuSwapchainTextureId for swapchain buffers)
@@ -238,14 +336,27 @@ public:
     std::unique_ptr<ComputePipelineState> create_compute_pipeline_state(
         const pso::D3D12ComputePsoDesc& desc,
         const d3d::RootSignature* root_signature);
+    // G66 mesh pipeline: `draw_desc` is the pipeline's graphics state with vs =
+    // mesh_draw_vertex_identity(output) (its module and its (vs, ps) layout registered), no input
+    // layout and triangle topology; `mesh_shader` is the identity the mesh stage's compute module
+    // and (mesh_shader, 0) layout are registered under. Diagnostics as for the other states.
+    std::unique_ptr<MeshPipelineState> create_mesh_pipeline_state(const pso::D3D12GraphicsPsoDesc& draw_desc,
+                                                                  uint64_t mesh_shader, const MeshOutputLayout& output,
+                                                                  const d3d::RootSignature* root_signature);
     // Final Release of a PSO: drops its pipeline-cache references and emits DestroyResource for the
     // pipelines the cache evicted (only with EvictUnreferenced caches).
     void release_pipeline_state(std::unique_ptr<GraphicsPipelineState> pso, CommandEncoder& encoder);
+    void release_mesh_pipeline_state(std::unique_ptr<MeshPipelineState> pso, CommandEncoder& encoder);
 
     // ---- pso::DescriptorViewResolver over the G6 heaps ----
     uint64_t rtv_descriptor_increment() const override;
     bool resolve_rtv(uint64_t cpu_handle, pso::RenderTargetViewInfo* out) const override;
     bool resolve_dsv(uint64_t cpu_handle, pso::DepthStencilViewInfo* out) const override;
+    // Texture id behind an RTV/DSV descriptor (0 if null or unknown).
+    uint32_t attachment_texture(uint64_t cpu_handle, d3d::DescriptorKind kind) const {
+        d3d::ViewDescriptor v{};
+        return cpu_handle != 0 && resolve_view_descriptor(cpu_handle, kind, &v) ? v.resource_id : 0u;
+    }
 
     // Resolves a CBV / root descriptor GPU virtual address (G6 GpuVaResolver contract).
     bool resolve_gpu_va(uint64_t gpu_address, d3d::GpuVaResolution* out) const;
@@ -262,6 +373,44 @@ public:
     bool texture_info(uint32_t resource_id, TextureInfo* out) const;
     // The texture whose descriptor address (TextureInfo::gpu_va) is exactly `gpu_va` (0 if none).
     uint32_t texture_at(uint64_t gpu_va) const;
+    // G66 partly-held mip chains: records the first held mip level of texture `resource_id` (from the
+    // title's uploads / mappings: the levels whose memory holds content). Sampled views bound after
+    // this start there; cached bind groups over the texture are re-created when it changes.
+    // Returns false for an unknown texture.
+    bool set_resident_mip_floor(uint32_t resource_id, uint32_t first_resident_mip);
+    // Bumped whenever a texture's resident mip floor changes.
+    uint64_t residency_epoch() const noexcept { return residency_epoch_.load(std::memory_order_acquire); }
+    // G66 (#691): ids of textures / buffers unregistered since they were registered (destroyed by the
+    // device: guest Release, address-texture LRU, relocation teardown). A bind group built while
+    // such a resource lived still names it: a cached hit must not bind it again, as WebGPU then
+    // rejects the whole submit ("Destroyed texture used in a submit"). The epoch bumps on every one.
+    bool retired(uint32_t resource_id) const;
+    uint64_t retire_epoch() const noexcept { return retire_epoch_.load(std::memory_order_acquire); }
+
+    // ---- Frame-safe resource lifetime & deferred DestroyResource (G70, #691) ----
+    // Records that GPU resource `resource_id` (texture, buffer, intermediate, or bind group) is
+    // referenced by commands in the current frame (since the last Present) and updates its LRU tick.
+    void note_resource_used(uint32_t resource_id);
+    bool is_resource_used_in_frame(uint32_t resource_id) const;
+    uint64_t resource_last_use_tick(uint32_t resource_id) const;
+    // Emits DestroyResource(resource_id) into `encoder`, or defers it until after Present if
+    // `resource_id` was referenced in the current frame. Returns true if deferred.
+    bool destroy_or_defer_resource(uint32_t resource_id, CommandEncoder& encoder);
+    // Unconditionally queues `resource_id` for DestroyResource after Present (deduplicated).
+    void defer_destroy_resource(uint32_t resource_id);
+    // Removes `resource_id` from the deferred queue (if pending) and emits DestroyResource into `encoder`.
+    // Safe only for bind group ids (GPUBindGroup has no WebGPU destroy() that invalidates a submit).
+    bool take_deferred_destroy(uint32_t resource_id, CommandEncoder& encoder);
+    // Emits DestroyResource for every deferred resource and starts a new frame usage window.
+    // Call strictly AFTER Present (or at the start of the next frame after Present).
+    size_t flush_deferred_destroys(CommandEncoder& encoder);
+    // Emits Present into `encoder`, then immediately flushes all deferred DestroyResource packets
+    // after Present so no resource used by the frame is destroyed before queue.submit().
+    void present(CommandEncoder& encoder);
+    // Syncs with a host Present counter (e.g. Device::stats().presents). When `present_count`
+    // has advanced past the last seen count, flushes deferred destroys into `encoder` and returns true.
+    bool advance_present_frame(uint64_t present_count, CommandEncoder& encoder);
+    size_t deferred_destroy_count() const;
 
 private:
     friend class CommandListBridge;
@@ -278,6 +427,8 @@ private:
         // The emitted GpuBindGroupLayoutEntry list: one per binding (arrays not expanded).
         std::vector<GpuBindGroupLayoutEntry> layout_entries;
         bool emitted = false;
+        // G66 mesh pipelines: a group the caller binds itself (the mesh output buffer).
+        bool runtime_owned = false;
     };
     struct PipelineLayoutRecord {
         uint32_t id = 0;
@@ -287,6 +438,18 @@ private:
     };
 
     uint32_t intern_view(const ViewRecord& record) const;
+    std::vector<uint32_t> retire_views(uint32_t texture_id);
+    void attach_bridge(CommandListBridge* bridge);
+    void detach_bridge(CommandListBridge* bridge);
+    void notify_bridges_invalidated(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
+    size_t flush_deferred_destroys_impl(CommandEncoder& encoder, bool respect_unexecuted);
+
+public:
+    // O36 (tests): live interned views and sampler count.
+    size_t live_view_count() const;
+    uint32_t test_intern_view(const ViewRecord& record) const { return intern_view(record); }
+
+private:
     bool resolve_view_descriptor(uint64_t cpu_handle, d3d::DescriptorKind kind, d3d::ViewDescriptor* out) const;
     PipelineLayoutRecord* find_layout(uint64_t first_shader, uint64_t second_shader);
     uint32_t module_id(uint64_t shader_identity, bool* known) const;
@@ -296,10 +459,32 @@ private:
     uint32_t intern_sampler(const d3d::SamplerDesc& desc, CommandEncoder& encoder, uint64_t* diagnostics);
     // Root constant ring buffer id; emits its CreateBuffer on first use.
     uint32_t ensure_root_constant_ring(CommandEncoder& encoder);
+    // Shared (0,0,0,1) vertex buffer for attributes no input element feeds (G62); created on first use.
+    uint32_t ensure_default_vertex_buffer(CommandEncoder& encoder);
     // Reserves `bytes` (256-byte aligned start) in the ring and returns the offset.
     uint32_t allocate_root_constants(uint32_t bytes, bool* wrapped);
     // True exactly once per compute pipeline id: the caller emits CreateComputePipeline2.
     bool claim_compute_creation(uint32_t pipeline_id);
+
+    // G66 ExecuteIndirect clamp pass: pipeline, group layout and output ring (created through
+    // `encoder` on first use), its bind group over (args, count) buffers, and a ring window.
+    struct IndirectClamp {
+        uint32_t group_layout = 0;
+        uint32_t pipeline = 0;
+        uint32_t ring = 0;
+    };
+    IndirectClamp indirect_clamp(CommandEncoder& encoder);
+    uint32_t indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args, uint32_t count,
+                                  CommandEncoder& encoder);
+    uint32_t allocate_indirect_window();
+
+    // G66 mesh pipelines: `base` (at most kMeshOutputGroup groups) padded with empty groups and
+    // followed by the runtime-owned output group (binding 0, `visibility`, `binding_type`); null
+    // when `base` has more groups.
+    PipelineLayoutRecord* mesh_layout(PipelineLayoutRecord* base, uint32_t visibility, uint8_t binding_type);
+    // The output buffer's bind group for runtime group layout `group` (created through `encoder`
+    // on first use).
+    uint32_t mesh_output_group(const GroupLayoutRecord& group, CommandEncoder& encoder);
 
     // #482 storage-format fallback: the intermediate texture of `resource_id` in `format` (same size,
     // dimension and mips), created through `encoder` on first use.
@@ -316,8 +501,9 @@ private:
     uint32_t storage_conversion_group(const StorageConversionPipeline& pipeline, uint8_t dimension, uint32_t src,
                                       uint8_t src_format, uint32_t dst, uint8_t dst_format, uint32_t mip,
                                       uint32_t base_layer, uint32_t layer_count, CommandEncoder& encoder);
-    // Drops the intermediates and conversion bind groups of `resource_id` (destroyed at next use).
-    void retire_intermediates(uint32_t resource_id);
+    // Drops the intermediates and conversion bind groups of `resource_id` (queued for frame-safe destroy)
+    // and returns the retired intermediate texture ids so cached bind groups can be invalidated too.
+    std::vector<uint32_t> retire_intermediates(uint32_t resource_id);
     void flush_retired_locked(CommandEncoder& encoder);
 
     d3d::DescriptorHeapRegistry& heaps_;
@@ -331,11 +517,18 @@ private:
     std::unordered_map<uint32_t, uint64_t> buffer_va_;                  // id -> va
     std::unordered_map<uint32_t, uint64_t> buffer_allocated_;           // id -> WebGPU buffer size
     std::unordered_map<uint64_t, uint32_t> textures_by_va_;             // descriptor address -> id
+    std::unordered_set<uint32_t> retired_resources_;  // see retired(); an id registered again leaves it
+    std::atomic<uint64_t> retire_epoch_{0};
+    std::atomic<uint64_t> residency_epoch_{0};
     std::unordered_map<uint64_t, uint32_t> shader_modules_;
 
     mutable std::mutex views_mutex_;
     mutable std::deque<ViewRecord> views_;  // index = view_id - 1 (stable addresses)
     mutable std::unordered_map<std::string, uint32_t> view_ids_;
+    // O36: views die with their texture: the id is recycled (free list) and the interned key dropped.
+    mutable std::deque<std::string> view_keys_;                               // index = view_id - 1; empty = free
+    mutable std::unordered_map<uint32_t, std::vector<uint32_t>> views_by_texture_;
+    mutable std::vector<uint32_t> free_views_;
 
     std::mutex objects_mutex_;  // layouts, samplers, root constant ring
     std::vector<std::unique_ptr<GroupLayoutRecord>> group_layouts_;
@@ -344,11 +537,30 @@ private:
     std::unordered_map<std::string, uint32_t> samplers_;
     std::unordered_set<uint32_t> emitted_compute_;
     uint32_t ring_buffer_id_ = 0;
+    uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
     std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
     std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
     std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
-    std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next use
+    std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
+    IndirectClamp indirect_clamp_{};
+    std::map<std::pair<uint32_t, uint32_t>, uint32_t> indirect_groups_;  // (args, count) -> bind group
+    uint32_t indirect_cursor_ = 0;
+    std::map<std::pair<PipelineLayoutRecord*, uint32_t>, PipelineLayoutRecord*> mesh_layouts_;
+    GroupLayoutRecord* empty_group_layout_ = nullptr;
+    uint32_t mesh_output_buffer_ = 0;
+    std::map<uint32_t, uint32_t> mesh_output_groups_;  // runtime group layout id -> bind group
+
+    mutable std::mutex bridges_mutex_;
+    std::vector<CommandListBridge*> bridges_;
+
+    mutable std::mutex retire_mutex_;
+    std::unordered_set<uint32_t> frame_used_resources_;
+    std::unordered_map<uint32_t, uint64_t> resource_last_use_;
+    uint64_t resource_use_tick_ = 0;
+    std::vector<uint32_t> deferred_destroys_;
+    std::unordered_set<uint32_t> deferred_destroy_set_;
+    uint64_t synced_present_count_ = 0;
 };
 
 // Graphics PSO as seen by the bridge: the G7 GraphicsPso plus everything needed to emit its packets.
@@ -393,6 +605,23 @@ private:
     uint64_t diagnostics_ = 0;
 };
 
+// G66: a mesh pipeline state (see MeshOutputLayout).
+class MeshPipelineState {
+public:
+    GraphicsPipelineState* draw() const noexcept { return draw_.get(); }
+    ComputePipelineState* stage() const noexcept { return stage_.get(); }
+    const MeshOutputLayout& output() const noexcept { return output_; }
+    uint64_t diagnostics() const noexcept { return diagnostics_; }
+
+private:
+    friend class StateBridgeDevice;
+    friend class CommandListBridge;
+    std::unique_ptr<GraphicsPipelineState> draw_;
+    std::unique_ptr<ComputePipelineState> stage_;
+    MeshOutputLayout output_{};
+    uint64_t diagnostics_ = 0;
+};
+
 // =====================================================================================================
 // Per-command-list recording API (ID3D12GraphicsCommandList subset)
 // =====================================================================================================
@@ -405,6 +634,12 @@ struct BridgeStats {
     uint64_t pipelines_created = 0;
     uint64_t bind_groups_created = 0;
     uint64_t bind_groups_retired = 0;
+    uint64_t bind_groups_invalidated = 0;       // G70: cached bind groups evicted on resource/view unregister
+    uint64_t bind_groups_relocation_moved = 0;  // G66: cache hits re-created, a relocated home moved
+    uint64_t bind_groups_resource_retired = 0;  // G66: cache hits re-built, a bound resource was destroyed
+    uint64_t retired_resources_nulled = 0;      // G66: bindings of destroyed textures/buffers bound null
+    uint64_t bind_group_cache_hits = 0;    // G66: bind group lookups answered without a CreateBindGroup
+    uint64_t bind_group_cache_misses = 0;  // ... rebuilt (first use or changed descriptors)
     uint64_t memory_bind_groups = 0;            // bind groups over descriptor memory (recorded)
     uint64_t memory_bind_groups_refreshed = 0;  // ... rebuilt at ExecuteCommandLists (words changed)
     uint64_t root_constant_uploads = 0;
@@ -421,6 +656,8 @@ struct BridgeStats {
     uint64_t storage_views_without_usage = 0;
     // ... of a texture whose format is not the stage's storage format, bound as null too.
     uint64_t storage_views_format_mismatch = 0;
+    // Redirected storage views whose texture is also a render attachment of the draw's pass: counted, not converted.
+    uint64_t storage_views_attachment_alias = 0;
     // Compute storage-texture bindings of another format than the stage's bound instead to an
     // intermediate texture in the stage's format (#482: both formats storage-capable and float),
     // converted into the real texture after the dispatch (and from it before, for read access).
@@ -432,21 +669,47 @@ struct BridgeStats {
     uint64_t heap_index_misses = 0;
     // ... of those, CB-indexed bindings (G62) whose index could not be read from the constant buffer.
     uint64_t cb_index_misses = 0;
+    // G66 ExecuteIndirect: executions emitted, the indirect draws/dispatches they emitted, executions
+    // skipped (invalid arguments, no pipeline, storage redirects), and commands dropped over
+    // kMaxIndirectCommands.
+    uint64_t indirect_executions = 0;
+    uint64_t indirect_commands = 0;
+    uint64_t indirect_skipped = 0;
+    uint64_t indirect_truncated = 0;
+    // G66 mesh pipelines: mesh dispatches emitted (direct, and indirect commands), and mesh work
+    // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
+    uint64_t mesh_dispatches = 0;
+    uint64_t mesh_skipped = 0;
+    // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
+    // to the texture's first held level or the view's min-LOD clamp, and cached bind groups
+    // re-created because a bound texture's held levels changed.
+    uint64_t mip_clamped_binds = 0;
+    uint64_t bind_groups_residency_changed = 0;
 };
 
 class CommandListBridge {
 public:
     CommandListBridge(StateBridgeDevice& device, CommandEncoder& encoder);
+    ~CommandListBridge();
+    CommandListBridge(const CommandListBridge&) = delete;
+    CommandListBridge& operator=(const CommandListBridge&) = delete;
 
     // ID3D12GraphicsCommandList::Reset (state back to defaults; the encoder is not cleared).
     void Reset(GraphicsPipelineState* initial_state = nullptr);
     // Flushes pending clears, ends the open render pass and finishes the list.
     void Close();
+    // Emits Present into the encoder and flushes end-of-frame deferred DestroyResource packets after it.
+    void Present();
+    // Drains any pending resource/view invalidations queued by StateBridgeDevice::unregister_resource.
+    void flush_invalidations();
+    size_t cached_bind_group_count() const;
     bool is_open() const noexcept { return open_; }
 
     // Pipeline state.
     void SetPipelineState(GraphicsPipelineState* pso);
     void SetComputePipelineState(ComputePipelineState* pso);
+    // G66: binds a mesh pipeline state (graphics slot); SetPipelineState unbinds it.
+    void SetMeshPipelineState(MeshPipelineState* pso);
 
     // Output merger / clears.
     void OMSetRenderTargets(uint32_t num_render_target_descriptors,
@@ -497,9 +760,20 @@ public:
                               uint32_t start_index_location, int32_t base_vertex_location,
                               uint32_t start_instance_location);
     void Dispatch(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
+    // G66: ExecuteIndirect (see IndirectExecution). False when skipped (counted in stats().indirect_skipped).
+    bool ExecuteIndirect(const IndirectExecution& execution);
+    // G66: DispatchMesh with the bound mesh pipeline state (x-dimension groups only: y and z must
+    // be 1). False when skipped (counted in stats().mesh_skipped).
+    bool DispatchMesh(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
 
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
+
+    // G66 read-back: ends the open render pass (pending clears first, as for a copy) and emits a
+    // ReadbackBuffer / ReadbackTexture packet naming `resource_id`. Returns the encoder offset of
+    // the payload (the caller patches its sequence number at execution), or SIZE_MAX when the list
+    // is not writable.
+    size_t Readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id);
 
     // Emits a WriteTexture packet into this command list's encoder stream (G49b).
     void WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
@@ -522,6 +796,7 @@ public:
     const pso::TrackerStats& tracker_stats() const noexcept { return tracker_.stats(); }
 
 private:
+    friend class StateBridgeDevice;
     struct BoundGroup {
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> dynamic_offsets;
@@ -548,12 +823,45 @@ private:
     // The CreateBindGroup2 entries for `cached` (samplers are interned through `side`).
     void gpu_entries(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                      CommandEncoder& side, std::vector<GpuBindGroupEntry2>* out);
+    // G66 (#691): true when a relocation `cached` was emitted with now resolves to another home.
+    bool relocations_moved(d3d::CachedBindGroup* cached);
+    // G66 (#691): true when `cached` binds a texture or buffer the device destroyed since it was built.
+    bool binds_retired(d3d::CachedBindGroup* cached) const;
+    // G66 partly-held mip chains: hash of (texture, clamped base mip) over a group's texture entries,
+    // and whether a cached group's clamps changed since it was emitted (the residency epoch moved).
+    uint64_t residency_key(const d3d::CachedBindGroup& cached) const;
+    bool residency_changed(d3d::CachedBindGroup* cached) const;
+    // Relocations and interned views the last gpu_entries call made.
+    std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
+    std::vector<uint32_t> pending_view_ids_;
+    void invalidate_resources_locked(std::span<const uint32_t> resource_ids,
+                                     std::span<const uint32_t> view_ids,
+                                     std::vector<uint32_t>* retired_bgs);
+    bool try_invalidate_immediately(std::span<const uint32_t> resource_ids,
+                                    std::span<const uint32_t> view_ids,
+                                    std::vector<uint32_t>* retired_bgs);
+    void queue_invalidation(std::span<const uint32_t> resource_ids, std::span<const uint32_t> view_ids);
+    void drain_invalidations_locked();
+    void note_recorded_resource(uint32_t resource_id);
+    void clear_recorded_resources(bool executed);
+    void collect_unexecuted_resources(std::unordered_set<uint32_t>* out) const;
+    void mark_executed_and_pin_in_frame();
+    void note_bind_group_used_locked(const d3d::CachedBindGroup& cached, uint32_t bind_group_id);
     void sync_bound_textures(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::CachedBindGroup& cached,
                              CommandEncoder& target);
     void add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join);
     GpuTextureViewDesc texture_view_desc(const d3d::ViewDescriptor& view);
     uint32_t upload_root_constants(d3d::BindPoint bind_point, uint32_t parameter_index);
     bool prepare_render_draw();
+    // Ends the render pass and binds the compute PSO and its bind groups (null: nothing to dispatch).
+    ComputePipelineState* prepare_compute_dispatch();
+    ComputePipelineState* prepare_compute_dispatch(ComputePipelineState* state, d3d::BindPoint bind_point);
+    // G66 mesh pipelines: the mesh stage's compute pipeline and bindings (output group included),
+    // and the draw's render pass and bindings. False when they cannot be prepared.
+    bool prepare_mesh_stage();
+    bool prepare_mesh_draw();
+    // G66: emits the clamp pass for `e` (count commands) and returns the ring offset of its output.
+    bool emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring, uint32_t* out_offset);
     void apply_input_assembler(bool indexed);
 
     // #482: a compute storage-texture binding redirected to an intermediate texture in the stage's
@@ -581,6 +889,8 @@ private:
                           StorageRedirect* out);
     // Emits one conversion dispatch: real -> intermediate (`into_intermediate`) or back.
     void emit_storage_conversion(const StorageRedirect& r, bool into_intermediate);
+    // Fragment-stage redirects of the open render pass: converted out when the pass ends.
+    std::vector<StorageRedirect> pass_redirects_;
 
     StateBridgeDevice& device_;
     CommandEncoder& encoder_;
@@ -594,6 +904,7 @@ private:
     bool open_ = false;
     GraphicsPipelineState* graphics_pso_ = nullptr;
     ComputePipelineState* compute_pso_ = nullptr;
+    MeshPipelineState* mesh_pso_ = nullptr;
     std::unordered_map<uint32_t, uint32_t> empty_bind_groups_;  // group layout id -> bind group id
     // Bind groups recorded over descriptor memory: where their entries sit in the encoder, what
     // they were built from.
@@ -602,10 +913,23 @@ private:
         const StateBridgeDevice::GroupLayoutRecord* group = nullptr;
         d3d::BindGroupPlan plan;
         d3d::CachedBindGroup built;
+        bool invalidated = false;
     };
     std::vector<MemoryBindGroup> memory_groups_;
+    mutable std::mutex cache_mutex_;
+    mutable std::mutex pending_mutex_;
+    mutable std::mutex recorded_mutex_;
+    std::unordered_set<uint32_t> recorded_resources_;
+    bool executed_ = false;
+    std::vector<uint32_t> pending_invalidated_resources_;
+    std::vector<uint32_t> pending_invalidated_views_;
+    std::unordered_set<uint64_t> invalidated_key_hashes_;
+    std::vector<uint32_t> invalidated_bgs_to_retire_;
+    std::atomic<uint64_t> pending_invalidation_epoch_{0};
+    uint64_t seen_invalidation_epoch_ = 0;
     // Storage redirects the last gpu_entries call made, and those of each bind group (by gpu id).
     std::vector<StorageRedirect> pending_redirects_;
+    std::array<uint32_t, pso::kMaxColorTargets + 1> om_attachments_{};  // texture ids of the bound RTVs + DSV
     std::unordered_map<uint32_t, std::vector<StorageRedirect>> redirects_;
     static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
     void note_memory_group(const StateBridgeDevice::GroupLayoutRecord& group, const d3d::BindGroupPlan& plan,
@@ -621,7 +945,7 @@ private:
     bool render_pass_open_ = false;
     std::vector<BoundGroup> render_groups_;
     std::vector<BoundGroup> compute_groups_;
-    std::vector<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
+    std::unordered_set<uint32_t> scoped_bind_groups_;  // bind groups already added to the usage scope
     bool compute_pass_valid_ = false;
     uint32_t compute_pipeline_bound_ = 0;
     // Root constants last uploaded per (bind point, parameter): values + ring offset.

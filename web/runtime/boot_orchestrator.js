@@ -107,7 +107,36 @@
     return value;
   }
 
+  const WASM_FIELD_PATH_RE = /(?:wasm|guest_?part|guestmodule|sidemodule|wirebytes)/i;
+
+  function isCompiledWasmModule(value) {
+    return Boolean(
+      value &&
+        typeof value === 'object' &&
+        typeof WebAssembly !== 'undefined' &&
+        typeof WebAssembly.Module === 'function' &&
+        value instanceof WebAssembly.Module
+    );
+  }
+
+  function isTransferableArrayBuffer(value) {
+    if (!value || typeof value !== 'object') return false;
+    if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+      return false;
+    }
+    if (Object.prototype.toString.call(value) === '[object SharedArrayBuffer]') {
+      return false;
+    }
+    return (
+      value instanceof ArrayBuffer ||
+      Object.prototype.toString.call(value) === '[object ArrayBuffer]'
+    );
+  }
+
   function getBinaryBufferInfo(value) {
+    if (!value || typeof value !== 'object' || isCompiledWasmModule(value)) {
+      return null;
+    }
     if (value instanceof ArrayBuffer) {
       return { backingBuffer: value, byteLength: value.byteLength };
     }
@@ -118,6 +147,84 @@
       return { backingBuffer: value.buffer, byteLength: value.byteLength };
     }
     return null;
+  }
+
+  /**
+   * Collect unique standalone transferable non-SAB `ArrayBuffer`s reachable inside `payload`
+   * so Window -> Worker `postMessage(msg, transferList)` moves large `.wasm` / `.pgim` /
+   * `.wgsl.pack` wire buffers zero-copy instead of cloning them on the Window heap.
+   *
+   * Skips `SharedArrayBuffer`, `WebAssembly.Module`, already-detached (0-byte) buffers,
+   * and subviews that do not span their entire backing `ArrayBuffer`.
+   *
+   * @param {unknown} payload
+   * @returns {ArrayBuffer[]}
+   */
+  function collectTransferableBuffers(payload) {
+    const unique = new Set();
+    const visited = new Set();
+
+    const visit = (value) => {
+      if (!value || typeof value !== 'object' || isCompiledWasmModule(value)) {
+        return;
+      }
+      if (isTransferableArrayBuffer(value)) {
+        if (!value.detached && value.byteLength > 0) {
+          unique.add(value);
+        }
+        return;
+      }
+      if (typeof SharedArrayBuffer !== 'undefined' && value instanceof SharedArrayBuffer) {
+        return;
+      }
+      if (ArrayBuffer.isView(value)) {
+        const buf = value.buffer;
+        if (
+          isTransferableArrayBuffer(buf) &&
+          !buf.detached &&
+          value.byteOffset === 0 &&
+          value.byteLength === buf.byteLength &&
+          buf.byteLength > 0
+        ) {
+          unique.add(buf);
+        }
+        return;
+      }
+      if (visited.has(value)) return;
+      visited.add(value);
+
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i += 1) {
+          visit(value[i]);
+        }
+        return;
+      }
+      if (value instanceof Map) {
+        for (const entryVal of value.values()) {
+          visit(entryVal);
+        }
+        return;
+      }
+      if (value instanceof Set) {
+        for (const entryVal of value.values()) {
+          visit(entryVal);
+        }
+        return;
+      }
+      const keys = Object.keys(value);
+      for (let i = 0; i < keys.length; i += 1) {
+        let child;
+        try {
+          child = value[keys[i]];
+        } catch {
+          continue;
+        }
+        visit(child);
+      }
+    };
+
+    visit(payload);
+    return Array.from(unique);
   }
 
   function isWritableOwnProperty(obj, key) {
@@ -131,12 +238,24 @@
     return desc.writable === true;
   }
 
+  const BINARY_PAYLOAD_PROP_KEYS = Object.freeze([
+    'bytes',
+    'buffer',
+    'wasmBinary',
+    'wireBytes',
+    'rawBytes',
+    'arrayBuffer',
+    'data',
+    'wasmBytes',
+    'wasmBuffer',
+  ]);
+
   /**
    * Release large binary payload references (`ArrayBuffer`, `SharedArrayBuffer`, or TypedArray views)
    * held on a preloaded boot bundle (or single-asset preload result) while preserving lightweight
    * metadata (`bytesLoaded`, `totalBytes`, `entryCount`, `manifest`, `header`, `timingMs`,
-   * `durationMs`, `transport`). Defensive and idempotent: never throws on null, primitive, or
-   * frozen inputs.
+   * `durationMs`, `transport`) and compiled `WebAssembly.Module` instances.
+   * Defensive and idempotent: never throws on null, primitive, or frozen inputs.
    *
    * @param {unknown} bundle
    * @returns {{ releasedFields: string[], releasedBytes: number }}
@@ -185,10 +304,27 @@
     };
 
     const releasePayloadContainer = (obj, prefix) => {
-      if (!obj || typeof obj !== 'object' || visitedObjects.has(obj)) return;
+      if (!obj || typeof obj !== 'object' || isCompiledWasmModule(obj) || visitedObjects.has(obj)) return;
       visitedObjects.add(obj);
-      nullBinaryProp(obj, 'bytes', `${prefix}.bytes`);
-      nullBinaryProp(obj, 'buffer', `${prefix}.buffer`);
+      for (let i = 0; i < BINARY_PAYLOAD_PROP_KEYS.length; i += 1) {
+        const propKey = BINARY_PAYLOAD_PROP_KEYS[i];
+        nullBinaryProp(obj, propKey, `${prefix}.${propKey}`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'sideModules')) {
+        releaseCollection(obj.sideModules, `${prefix}.sideModules`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'modules')) {
+        releaseCollection(obj.modules, `${prefix}.modules`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'modulesByName')) {
+        releaseCollection(obj.modulesByName, `${prefix}.modulesByName`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'guestModuleBytes')) {
+        releaseCollection(obj.guestModuleBytes, `${prefix}.guestModuleBytes`);
+      }
+      if (Object.prototype.hasOwnProperty.call(obj, 'preloadedBuffers')) {
+        releaseCollection(obj.preloadedBuffers, `${prefix}.preloadedBuffers`);
+      }
     };
 
     const releaseAssetSlot = (parent, key, prefix) => {
@@ -201,9 +337,13 @@
       } catch {
         return;
       }
-      if (!val || typeof val !== 'object') return;
+      if (!val || typeof val !== 'object' || isCompiledWasmModule(val)) return;
       if (getBinaryBufferInfo(val)) {
         nullBinaryProp(parent, key, prefix);
+        return;
+      }
+      if (val instanceof Map || Array.isArray(val)) {
+        releaseCollection(val, prefix);
         return;
       }
       releasePayloadContainer(val, prefix);
@@ -212,22 +352,66 @@
     const releaseModuleList = (list, prefix) => {
       if (!Array.isArray(list) || visitedObjects.has(list)) return;
       visitedObjects.add(list);
+      let allDirectBinary = list.length > 0;
       for (let i = 0; i < list.length; i += 1) {
         const item = list[i];
-        if (!item || typeof item !== 'object') continue;
+        if (!item || typeof item !== 'object' || isCompiledWasmModule(item)) {
+          allDirectBinary = false;
+          continue;
+        }
         if (getBinaryBufferInfo(item)) {
           nullBinaryProp(list, String(i), `${prefix}[${i}]`);
         } else {
+          allDirectBinary = false;
           releasePayloadContainer(item, `${prefix}[${i}]`);
+        }
+      }
+      if (allDirectBinary && !Object.isFrozen(list)) {
+        try {
+          list.length = 0;
+        } catch {
+          // Ignore non-resizable arrays.
+        }
+      }
+    };
+
+    const releaseBinaryMap = (map, prefix) => {
+      if (!(map instanceof Map) || visitedObjects.has(map)) return;
+      visitedObjects.add(map);
+      for (const [k, val] of Array.from(map.entries())) {
+        if (!val || typeof val !== 'object' || isCompiledWasmModule(val)) continue;
+        const info = getBinaryBufferInfo(val);
+        const keyLabel = typeof k === 'string' || typeof k === 'number' ? String(k) : 'entry';
+        if (info) {
+          map.delete(k);
+          releasedFields.push(`${prefix}.${keyLabel}`);
+          recordBufferBytes(info);
+        } else {
+          releasePayloadContainer(val, `${prefix}.${keyLabel}`);
         }
       }
     };
 
     const releaseModuleMap = (map, prefix) => {
       if (!map || typeof map !== 'object' || Array.isArray(map) || visitedObjects.has(map)) return;
+      if (map instanceof Map) {
+        releaseBinaryMap(map, prefix);
+        return;
+      }
       visitedObjects.add(map);
       for (const key of Object.keys(map)) {
         releaseAssetSlot(map, key, `${prefix}.${key}`);
+      }
+    };
+
+    const releaseCollection = (col, prefix) => {
+      if (!col || typeof col !== 'object') return;
+      if (Array.isArray(col)) {
+        releaseModuleList(col, prefix);
+      } else if (col instanceof Map) {
+        releaseBinaryMap(col, prefix);
+      } else {
+        releaseModuleMap(col, prefix);
       }
     };
 
@@ -236,6 +420,14 @@
     nullBinaryProp(bundle, 'buffer', 'buffer');
     nullBinaryProp(bundle, 'bytes', 'bytes');
     nullBinaryProp(bundle, 'pgimBytes', 'pgimBytes');
+    nullBinaryProp(bundle, 'pgimBuffer', 'pgimBuffer');
+    nullBinaryProp(bundle, 'shaderPackBuffer', 'shaderPackBuffer');
+    nullBinaryProp(bundle, 'wasmBinary', 'wasmBinary');
+    nullBinaryProp(bundle, 'wasmBytes', 'wasmBytes');
+    nullBinaryProp(bundle, 'wasmBuffer', 'wasmBuffer');
+    nullBinaryProp(bundle, 'wireBytes', 'wireBytes');
+    nullBinaryProp(bundle, 'rawBytes', 'rawBytes');
+    nullBinaryProp(bundle, 'arrayBuffer', 'arrayBuffer');
 
     releaseAssetSlot(bundle, 'shaderPackBytes', 'shaderPackBytes');
     releaseAssetSlot(bundle, 'pgim', 'pgim');
@@ -246,10 +438,28 @@
     releaseAssetSlot(bundle, 'opfsWarmBoot', 'opfsWarmBoot');
 
     if (Object.prototype.hasOwnProperty.call(bundle, 'modules')) {
-      releaseModuleList(bundle.modules, 'modules');
+      releaseCollection(bundle.modules, 'modules');
     }
     if (Object.prototype.hasOwnProperty.call(bundle, 'modulesByName')) {
-      releaseModuleMap(bundle.modulesByName, 'modulesByName');
+      releaseCollection(bundle.modulesByName, 'modulesByName');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'sideModules')) {
+      releaseCollection(bundle.sideModules, 'sideModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'sideModuleBytes')) {
+      releaseCollection(bundle.sideModuleBytes, 'sideModuleBytes');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'guestModules')) {
+      releaseCollection(bundle.guestModules, 'guestModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'guestModuleBytes')) {
+      releaseCollection(bundle.guestModuleBytes, 'guestModuleBytes');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'wasmModules')) {
+      releaseCollection(bundle.wasmModules, 'wasmModules');
+    }
+    if (Object.prototype.hasOwnProperty.call(bundle, 'preloadedBuffers')) {
+      releaseCollection(bundle.preloadedBuffers, 'preloadedBuffers');
     }
     if (Object.prototype.hasOwnProperty.call(bundle, 'mainModule')) {
       releaseAssetSlot(bundle, 'mainModule', 'mainModule');
@@ -262,16 +472,18 @@
     ) {
       const program = bundle.program;
       visitedObjects.add(program);
-      nullBinaryProp(program, 'bytes', 'program.bytes');
-      nullBinaryProp(program, 'buffer', 'program.buffer');
+      for (let i = 0; i < BINARY_PAYLOAD_PROP_KEYS.length; i += 1) {
+        const propKey = BINARY_PAYLOAD_PROP_KEYS[i];
+        nullBinaryProp(program, propKey, `program.${propKey}`);
+      }
       if (Object.prototype.hasOwnProperty.call(program, 'mainModule')) {
         releaseAssetSlot(program, 'mainModule', 'program.mainModule');
       }
       if (Object.prototype.hasOwnProperty.call(program, 'modules')) {
-        releaseModuleList(program.modules, 'program.modules');
+        releaseCollection(program.modules, 'program.modules');
       }
       if (Object.prototype.hasOwnProperty.call(program, 'modulesByName')) {
-        releaseModuleMap(program.modulesByName, 'program.modulesByName');
+        releaseCollection(program.modulesByName, 'program.modulesByName');
       }
     }
 
@@ -290,6 +502,54 @@
     }
 
     return { releasedFields, releasedBytes };
+  }
+
+  /**
+   * Post `message` to `worker` with zero-copy `ArrayBuffer` transfer for every unique
+   * standalone non-SAB `ArrayBuffer` found on `message` (and optional extra transferables
+   * such as `OffscreenCanvas` or `MessagePort`), then immediately release raw binary
+   * references on `releaseTarget` (if provided) so Window heap drops to ~0 bytes.
+   *
+   * @param {{ postMessage: Function }} worker
+   * @param {object} message
+   * @param {{ extraTransferables?: unknown[], releaseTarget?: unknown }} [options]
+   * @returns {{ transferredBuffers: number, transferredBytes: number, releasedFields: string[], releasedBytes: number }}
+   */
+  function transferPreloadPayloadToWorker(worker, message, options = {}) {
+    if (!worker || typeof worker.postMessage !== 'function') {
+      throw new TypeError('worker must expose postMessage');
+    }
+    const safeOpts = options && typeof options === 'object' ? options : {};
+    const arrayBuffers = collectTransferableBuffers(message);
+    let transferredBytes = 0;
+    for (let i = 0; i < arrayBuffers.length; i += 1) {
+      transferredBytes += arrayBuffers[i].byteLength;
+    }
+    const transferList = arrayBuffers.slice();
+    if (Array.isArray(safeOpts.extraTransferables)) {
+      const seen = new Set(transferList);
+      for (let i = 0; i < safeOpts.extraTransferables.length; i += 1) {
+        const item = safeOpts.extraTransferables[i];
+        if (item && !seen.has(item)) {
+          seen.add(item);
+          transferList.push(item);
+        }
+      }
+    }
+    if (transferList.length > 0) {
+      worker.postMessage(message, transferList);
+    } else {
+      worker.postMessage(message);
+    }
+    const releaseTarget =
+      safeOpts.releaseTarget !== undefined ? safeOpts.releaseTarget : message;
+    const released = releaseTarget ? releaseBootBundleBytes(releaseTarget) : { releasedFields: [], releasedBytes: 0 };
+    return {
+      transferredBuffers: arrayBuffers.length,
+      transferredBytes,
+      releasedFields: released.releasedFields,
+      releasedBytes: released.releasedBytes,
+    };
   }
 
   function normalizePreloadTasks(value) {
@@ -1271,6 +1531,10 @@
       this._stalledMs = 0;
       this._stallCount = 0;
       this._preloadStats = emptyPreloadStats(this._parallelPreload, this._preloadConcurrency);
+      this._wireBytesReleased = 0;
+      this._droppedWasmBuffers = 0;
+      this._droppedPreloadBuffers = 0;
+      this._transferredArrayBuffers = 0;
     }
 
     _readNow() {
@@ -1302,6 +1566,10 @@
       this._stalledMs = 0;
       this._stallCount = 0;
       this._preloadStats = emptyPreloadStats(this._parallelPreload, this._preloadConcurrency);
+      this._wireBytesReleased = 0;
+      this._droppedWasmBuffers = 0;
+      this._droppedPreloadBuffers = 0;
+      this._transferredArrayBuffers = 0;
     }
 
     _buildTimingSnapshot(now = this._readNow()) {
@@ -1385,6 +1653,23 @@
         stalledStage: watchdog.stalledStage,
         stalledMs: watchdog.stalledMs,
         stallCount: this._stallCount,
+        wireBytesReleased: this._wireBytesReleased,
+        droppedWasmBuffers: this._droppedWasmBuffers,
+        droppedPreloadBuffers: this._droppedPreloadBuffers,
+        transferredArrayBuffers: this._transferredArrayBuffers,
+      };
+    }
+
+    /**
+     * Return sanitized numeric memory-drop and zero-copy handoff telemetry for Chrome heap verification.
+     */
+    getMemoryDropTelemetry() {
+      return {
+        wireBytesReleased: this._wireBytesReleased,
+        droppedWasmBuffers: this._droppedWasmBuffers,
+        droppedPreloadBuffers: this._droppedPreloadBuffers,
+        transferredArrayBuffers: this._transferredArrayBuffers,
+        bundleRetained: this._bundle !== null,
       };
     }
 
@@ -1434,7 +1719,57 @@
       if (!bundle) {
         return { releasedFields: [], releasedBytes: 0 };
       }
-      return releaseBootBundleBytes(bundle);
+      const released = releaseBootBundleBytes(bundle);
+      if (released.releasedBytes > 0) {
+        this._wireBytesReleased += released.releasedBytes;
+      }
+      if (released.releasedFields.length > 0) {
+        this._droppedPreloadBuffers += released.releasedFields.length;
+        for (let i = 0; i < released.releasedFields.length; i += 1) {
+          if (WASM_FIELD_PATH_RE.test(released.releasedFields[i])) {
+            this._droppedWasmBuffers += 1;
+          }
+        }
+      }
+      return released;
+    }
+
+    /**
+     * Transfer the currently held preload bundle's standalone non-SAB `ArrayBuffer`s to `worker`
+     * via zero-copy `postMessage(msg, transferList)` and immediately drop all Window-side references.
+     *
+     * @param {{ postMessage: Function }} worker
+     * @param {object} [message]
+     * @param {{ extraTransferables?: unknown[] }} [options]
+     */
+    transferBundleToWorker(worker, message = null, options = {}) {
+      const bundle = this._bundle;
+      const payload =
+        message && typeof message === 'object'
+          ? { ...message, ...(bundle && message.bundle === undefined ? { bundle } : {}) }
+          : { bundle };
+      const result = transferPreloadPayloadToWorker(worker, payload, {
+        ...(options && typeof options === 'object' ? options : {}),
+        releaseTarget: bundle || payload,
+      });
+      this._bundle = null;
+      if (result.transferredBuffers > 0) {
+        this._transferredArrayBuffers += result.transferredBuffers;
+      }
+      if (result.releasedBytes > 0) {
+        this._wireBytesReleased += result.releasedBytes;
+      } else if (result.transferredBytes > 0) {
+        this._wireBytesReleased += result.transferredBytes;
+      }
+      if (result.releasedFields.length > 0) {
+        this._droppedPreloadBuffers += result.releasedFields.length;
+        for (let i = 0; i < result.releasedFields.length; i += 1) {
+          if (WASM_FIELD_PATH_RE.test(result.releasedFields[i])) {
+            this._droppedWasmBuffers += 1;
+          }
+        }
+      }
+      return result;
     }
 
     _evaluateWatchdog(now = this._readNow()) {
@@ -1547,6 +1882,10 @@
         stalledStage: watchdog.stalledStage,
         stalledMs: watchdog.stalledMs,
         stallCount: this._stallCount,
+        wireBytesReleased: this._wireBytesReleased,
+        droppedWasmBuffers: this._droppedWasmBuffers,
+        droppedPreloadBuffers: this._droppedPreloadBuffers,
+        transferredArrayBuffers: this._transferredArrayBuffers,
       };
     }
 
@@ -1585,6 +1924,10 @@
         stalledStage: watchdog.stalledStage,
         stalledMs: watchdog.stalledMs,
         stallCount: this._stallCount,
+        wireBytesReleased: this._wireBytesReleased,
+        droppedWasmBuffers: this._droppedWasmBuffers,
+        droppedPreloadBuffers: this._droppedPreloadBuffers,
+        transferredArrayBuffers: this._transferredArrayBuffers,
         tracer: tracerSnapshot(this._bootTracer),
       };
     }
@@ -1641,7 +1984,8 @@
         ...(detail && typeof detail === 'object' ? detail : {}),
       };
       invokeQuiet(this._onPhaseChange, event);
-      this._pushOverlay({ phase: nextPhase, ...event });
+      // Never pass raw binary preload bundles into the splash overlay DOM controller.
+      this._pushOverlay({ phase: nextPhase, ...event, bundle: null });
     }
 
     _pushOverlay(payload) {
@@ -2020,9 +2364,19 @@
         }
       }
 
+      const cleanupExecutionContainers = () => {
+        if (results && typeof results.clear === 'function') {
+          results.clear();
+        }
+        if (Array.isArray(execution.settled)) {
+          execution.settled.length = 0;
+        }
+      };
+
       if (useBootBundle) {
         const baseBundle = results.get('bootBundle') || null;
         if (tasks.length === 1) {
+          cleanupExecutionContainers();
           return baseBundle;
         }
         const merged = baseBundle && typeof baseBundle === 'object' ? { ...baseBundle } : { pgim: null };
@@ -2051,6 +2405,7 @@
         }
         const baseBytes = inferBytesLoaded(baseBundle);
         merged.bytesLoaded = baseBytes + extraBytes;
+        cleanupExecutionContainers();
         return merged;
       }
 
@@ -2097,6 +2452,7 @@
       if (customSidecars) {
         bundle.sidecars = customSidecars;
       }
+      cleanupExecutionContainers();
       return bundle;
     }
 
@@ -2573,6 +2929,8 @@
     BootOrchestrator,
     discoverBootAssets,
     isRealGuestBoot,
+    collectTransferableBuffers,
+    transferPreloadPayloadToWorker,
     releaseBootBundleBytes,
     runConcurrentPreloads,
     default: BootOrchestrator,

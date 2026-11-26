@@ -34,8 +34,18 @@
 //! Both phases are iterative (no recursion proportional to code size). Block splitting is
 //! `O(log n + block length)` and the per-instruction hot path does no heap formatting. Each
 //! jump-table round costs one `O(blocks)` predecessor pass.
+//!
+//! Parallelism: block decoding stays one serial worklist (leaders and splits make it stateful),
+//! but the expensive read-only work runs in waves over a frozen snapshot on scoped threads:
+//! matching each jump-table round's pending jumps, revising and verifying resolved tables,
+//! classifying unresolved jumps, gathering relocations and the per-function membership walks.
+//! Every wave maps an ordered input to an ordered output ([`par_map`]) and the results are merged
+//! serially in that order, so the analysis is identical for every thread count.
+//! [`discover`] uses [`default_threads`]; [`discover_with_threads`] takes an explicit count.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use iced_x86::{Decoder, DecoderError, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind};
 
@@ -102,10 +112,30 @@ impl Analysis {
     }
 }
 
+/// Environment variable overriding the discovery thread count (a positive integer).
+pub const THREADS_ENV: &str = "PLAYGTA6_RECOMP_THREADS";
+
+/// Threads [`discover`] uses: [`THREADS_ENV`] when set to a positive integer, else the available
+/// parallelism, else 1.
+pub fn default_threads() -> usize {
+    std::env::var(THREADS_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .or_else(|| std::thread::available_parallelism().ok().map(usize::from))
+        .unwrap_or(1)
+}
+
 /// Discover functions, per-function CFGs, jump tables and the relocation map starting from
 /// `image.entry_points`. Never panics on malformed code: problems become [`Diagnostic`]s.
 pub fn discover(image: &CodeImage<'_>) -> Analysis {
-    let mut state = Discovery::new(image);
+    discover_with_threads(image, default_threads())
+}
+
+/// [`discover`] with an explicit thread count (`0` and `1` run serially). The result does not
+/// depend on `threads`.
+pub fn discover_with_threads(image: &CodeImage<'_>, threads: usize) -> Analysis {
+    let mut state = Discovery::new(image, threads);
     for &entry in &image.entry_points {
         state.add_function(entry);
     }
@@ -125,10 +155,17 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
     state.verify_jump_tables();
     let unresolved_jumps = state.classify_unresolved_jumps();
 
-    let mut relocations = Vec::new();
-    for instr in state.blocks.values().flat_map(|b| b.instructions.iter()) {
-        instruction_relocations(image, instr, &mut relocations);
-    }
+    let blocks: Vec<&BasicBlock> = state.blocks.values().collect();
+    let mut relocations: Vec<Relocation> = par_map(threads, &blocks, |block| {
+        let mut out = Vec::new();
+        for instr in &block.instructions {
+            instruction_relocations(image, instr, &mut out);
+        }
+        out
+    })
+    .into_iter()
+    .flatten()
+    .collect();
     let jump_tables = std::mem::take(&mut state.jump_tables);
     for table in jump_tables.values() {
         jump_table_relocations(image, table, &mut relocations);
@@ -141,6 +178,43 @@ pub fn discover(image: &CodeImage<'_>) -> Analysis {
         jump_tables,
         unresolved_jumps,
     }
+}
+
+/// `f` over `items` on up to `threads` scoped threads, results in input order. Workers claim small
+/// index chunks from a shared counter (load balancing for uneven items); the output order, and so
+/// everything merged from it, is independent of scheduling and thread count.
+fn par_map<T: Sync, R: Send>(threads: usize, items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = threads.min(items.len());
+    if threads <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let chunk = (items.len() / (threads * 8)).max(1);
+    let next = AtomicUsize::new(0);
+    let parts: Mutex<Vec<(usize, Vec<R>)>> = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                let mut local = Vec::new();
+                loop {
+                    let start = next.fetch_add(chunk, Ordering::Relaxed);
+                    if start >= items.len() {
+                        break;
+                    }
+                    let end = (start + chunk).min(items.len());
+                    local.push((start, items[start..end].iter().map(&f).collect::<Vec<R>>()));
+                }
+                parts
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(local);
+            });
+        }
+    });
+    let mut parts = parts
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    parts.sort_unstable_by_key(|(start, _)| *start);
+    parts.into_iter().flat_map(|(_, part)| part).collect()
 }
 
 /// Relocations of a resolved table: the table and index-table reads plus one per entry.
@@ -170,6 +244,8 @@ fn jump_table_relocations(image: &CodeImage<'_>, table: &JumpTable, out: &mut Ve
 
 struct Discovery<'i, 'a> {
     image: &'i CodeImage<'a>,
+    /// Threads for the read-only waves ([`par_map`]).
+    threads: usize,
     no_return: BTreeSet<u64>,
     /// Every block decoded so far, keyed by start VA.
     blocks: BTreeMap<u64, BasicBlock>,
@@ -196,9 +272,10 @@ struct Discovery<'i, 'a> {
 }
 
 impl<'i, 'a> Discovery<'i, 'a> {
-    fn new(image: &'i CodeImage<'a>) -> Self {
+    fn new(image: &'i CodeImage<'a>, threads: usize) -> Self {
         Self {
             image,
+            threads,
             no_return: image.no_return.iter().copied().collect(),
             blocks: BTreeMap::new(),
             leaders: BTreeSet::new(),
@@ -800,30 +877,30 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// resolve ([`jump_table::classify`] on the same slice and reaching facts the match used).
     fn classify_unresolved_jumps(&self) -> BTreeMap<u64, UnresolvedJump> {
         let preds = self.predecessors();
-        let mut out = BTreeMap::new();
-        for block in self.blocks.values() {
-            if block.terminator != Terminator::IndirectJump
-                || !block
-                    .successors
-                    .contains(&Edge::IndirectJump { slot: None })
-            {
-                continue;
-            }
-            let Some(jmp) = block.instructions.last() else {
-                continue;
-            };
-            let Some((trace, first_block)) = self.jump_trace(jmp.ip(), &preds) else {
-                continue;
-            };
+        let jumps: Vec<u64> = self
+            .blocks
+            .values()
+            .filter(|block| {
+                block.terminator == Terminator::IndirectJump
+                    && block
+                        .successors
+                        .contains(&Edge::IndirectJump { slot: None })
+            })
+            .filter_map(|block| block.instructions.last().map(Instruction::ip))
+            .collect();
+        par_map(self.threads, &jumps, |&site| {
+            let (trace, first_block) = self.jump_trace(site, &preds)?;
             let kind = match self.reaching_prefix(&trace, first_block, &preds) {
                 Some((_, all)) if !all.is_empty() => {
                     jump_table::classify(self.image, &prefixed(&all, &trace))
                 }
                 _ => jump_table::classify(self.image, &trace),
             };
-            out.insert(jmp.ip(), kind);
-        }
-        out
+            Some((site, kind))
+        })
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// Try every jump decoded since the last round. Returns whether any table was resolved.
@@ -834,10 +911,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
         }
         // One predecessor snapshot per round keeps the outcome independent of visiting order.
         let preds = self.predecessors();
-        let resolved: Vec<JumpTable> = pending
-            .into_iter()
-            .filter_map(|site| self.match_jump_table(site, &preds))
-            .collect();
+        let pending: Vec<u64> = pending.into_iter().collect();
+        let resolved: Vec<JumpTable> = par_map(self.threads, &pending, |&site| {
+            self.match_jump_table(site, &preds)
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let progress = !resolved.is_empty();
         for table in resolved {
             if let Some(block) = self
@@ -863,17 +943,20 @@ impl<'i, 'a> Discovery<'i, 'a> {
     /// [`MAX_TABLE_REVISIONS`] times, so the rounds terminate.
     fn revise_jump_tables(&mut self) -> bool {
         let preds = self.predecessors();
-        let changed: Vec<JumpTable> = self
+        let candidates: Vec<(&u64, &JumpTable)> = self
             .jump_tables
             .iter()
             .filter(|(site, _)| {
                 self.table_revisions.get(site).copied().unwrap_or(0) < MAX_TABLE_REVISIONS
             })
-            .filter_map(|(site, table)| {
-                let now = self.match_jump_table(*site, &preds)?;
-                (now != *table).then_some(now)
-            })
             .collect();
+        let changed: Vec<JumpTable> = par_map(self.threads, &candidates, |&(site, table)| {
+            let now = self.match_jump_table(*site, &preds)?;
+            (now != *table).then_some(now)
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let progress = !changed.is_empty();
         for table in changed {
             let revisions = self.table_revisions.entry(table.site).or_insert(0);
@@ -898,14 +981,13 @@ impl<'i, 'a> Discovery<'i, 'a> {
     fn verify_jump_tables(&mut self) {
         loop {
             let preds = self.predecessors();
-            let stale: Vec<u64> = self
-                .jump_tables
-                .iter()
-                .filter(|(site, table)| {
-                    self.match_jump_table(**site, &preds).as_ref() != Some(*table)
-                })
-                .map(|(site, _)| *site)
-                .collect();
+            let tables: Vec<(&u64, &JumpTable)> = self.jump_tables.iter().collect();
+            let stale: Vec<u64> = par_map(self.threads, &tables, |&(site, table)| {
+                (self.match_jump_table(*site, &preds).as_ref() != Some(table)).then_some(*site)
+            })
+            .into_iter()
+            .flatten()
+            .collect();
             if stale.is_empty() {
                 return;
             }
@@ -933,14 +1015,11 @@ impl<'i, 'a> Discovery<'i, 'a> {
             }
         }
 
-        // Membership: blocks reachable from each entry through intra-function edges.
-        let mut members: Vec<Vec<u64>> = Vec::with_capacity(entries.len());
-        let mut refcount: BTreeMap<u64, usize> = BTreeMap::new();
-        let mut seen: BTreeSet<u64> = BTreeSet::new();
-        let mut stack: Vec<u64> = Vec::new();
-        for &entry in &entries {
-            seen.clear();
-            stack.push(entry);
+        // Membership: blocks reachable from each entry through intra-function edges (one
+        // independent walk per entry, run as a parallel wave).
+        let members: Vec<Vec<u64>> = par_map(self.threads, &entries, |&entry| {
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            let mut stack: Vec<u64> = vec![entry];
             stack.extend(roots.get(&entry).into_iter().flatten().rev());
             let mut list = Vec::new();
             while let Some(va) = stack.pop() {
@@ -959,11 +1038,12 @@ impl<'i, 'a> Discovery<'i, 'a> {
                     }
                 }
             }
-            for &va in &list {
-                let count = refcount.entry(va).or_default();
-                *count = count.saturating_add(1);
-            }
-            members.push(list);
+            list
+        });
+        let mut refcount: BTreeMap<u64, usize> = BTreeMap::new();
+        for &va in members.iter().flatten() {
+            let count = refcount.entry(va).or_default();
+            *count = count.saturating_add(1);
         }
 
         // Materialise: move a block into its last owner, clone it for earlier ones.
@@ -2131,7 +2211,7 @@ mod tests {
         );
 
         // `leaf_extent` at u64::MAX must not overflow `site + 1`.
-        let mut state = Discovery::new(&image);
+        let mut state = Discovery::new(&image, 1);
         state.add_function(high_start);
         state.add_function(u64::MAX);
         assert_eq!(state.leaf_extent(u64::MAX), None);
@@ -2183,7 +2263,7 @@ mod tests {
             vec![TEXT],
         );
         image.eh = eh;
-        let mut state = Discovery::new(&image);
+        let mut state = Discovery::new(&image, 1);
         state.add_function(TEXT);
         state.seed_resume_target(TEXT, TEXT + 2);
         state.run();

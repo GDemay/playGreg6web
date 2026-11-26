@@ -20,6 +20,18 @@
 // whole run): wall time since the capture started and the counters of frame_capture_set_counters
 // at that Present.
 //
+// Late start (R40, `deferred`): until frame_capture_begin() is called (or `start_ms` has passed
+// since frame_capture_start), packets are not written as frames. Resource creation, shader modules
+// and destruction are still written in order (the replay needs every object), WriteBuffer /
+// WriteTexture are held in memory (a buffer as one image of everything written to it, a texture as
+// the newest write of each region; a write that covers an earlier one of the same mip replaces it)
+// and render/compute commands and Presents are dropped. At the first Present after the start the
+// held writes are flushed and frame 0 begins: it holds the creation prefix, the held writes and
+// the commands up to the next Present. The sidecar's `first_present` is the index (in `presents`)
+// of the Present that ends frame 0, so frame i of the trace is present first_present + i of the
+// run. Lost by design: contents the GPU itself produced before the start (render targets,
+// storage buffers), which the captured frames redraw for most screens.
+//
 // Capture files are derived from the running title: keep them out of the repository.
 
 #pragma once
@@ -45,12 +57,18 @@ struct FrameCaptureConfig {
     uint32_t thin_uploads = 0;
     uint32_t thin_min_bytes = 4u << 20;
     bool attach = true;        // install the os::wgpu_submit observer (tests feed frame_capture_observe)
+    // Late start: hold writes and drop commands until frame_capture_begin() or `start_ms` (> 0)
+    // since frame_capture_start (whichever first).
+    bool deferred = false;
+    uint64_t start_ms = 0;
 };
 
 // Starts a capture (replacing none: false if one is running or the file cannot be opened).
 bool frame_capture_start(const FrameCaptureConfig& config);
 // Feeds a batch of complete packets (the observer does this for wgpu_submit).
 void frame_capture_observe(const uint8_t* data, size_t len);
+// A deferred capture starts writing frames at the next Present (no-op otherwise; any thread).
+void frame_capture_begin();
 // Flushes the trace and writes the sidecar; idempotent; detaches the observer.
 void frame_capture_finish();
 

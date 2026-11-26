@@ -28,6 +28,7 @@ const {
   DEFAULT_MAX_BIND_GROUPS,
   DEFAULT_FAST_BIND_GROUP_BUCKETS,
   isBcFormat,
+  isViewDimensionCompatible,
   deviceSupportsBc,
   computeMaxMipLevels,
   clampMipLevelCount,
@@ -39,6 +40,7 @@ const {
   sanitizeTextureDescriptor,
   computeBindGroupHashFast,
   ResourceTable,
+  GpuResourceTable,
 } = rt;
 
 const WORKERS_DIR = fileURLToPath(new URL('../web/workers/', import.meta.url));
@@ -2204,6 +2206,467 @@ test('ResourceTable zero-alloc fast-cache preserves bounded LRU recency, clear()
   assert.equal(noFastTable.getStats().zeroAllocKeyHits, 0);
   assert.equal(noFastTable.getStats().bindGroupHits, 1);
 
+  for (const [k, v] of Object.entries(stats)) {
+    assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
+    assert.ok(Number.isFinite(v), `stat ${k} must be finite`);
+  }
+});
+
+function createControllableQueue() {
+  const pendingResolvers = [];
+  return {
+    pendingCount() {
+      return pendingResolvers.length;
+    },
+    resolveNext() {
+      const next = pendingResolvers.shift();
+      if (next) next.resolve();
+    },
+    rejectNext(err) {
+      const next = pendingResolvers.shift();
+      if (next) next.reject(err);
+    },
+    resolveAll() {
+      while (pendingResolvers.length > 0) {
+        pendingResolvers.shift().resolve();
+      }
+    },
+    onSubmittedWorkDone() {
+      return new Promise((resolve, reject) => {
+        pendingResolvers.push({ resolve, reject });
+      });
+    },
+  };
+}
+
+function createStrictDimensionMockDevice() {
+  const { device, calls } = createMockDevice();
+  const viewCalls = [];
+  const origCreateTexture = device.createTexture.bind(device);
+  device.createTexture = (desc) => {
+    const tex = origCreateTexture(desc);
+    tex.dimension = desc.dimension || '2d';
+    tex.width = desc.size.width;
+    tex.height = desc.size.height;
+    tex.depthOrArrayLayers = desc.size.depthOrArrayLayers;
+    tex.format = desc.format;
+    tex.destroyCount = 0;
+    const origDestroy = tex.destroy.bind(tex);
+    tex.destroy = () => {
+      tex.destroyCount += 1;
+      origDestroy();
+    };
+    const origCreateView = tex.createView.bind(tex);
+    tex.createView = (viewDesc) => {
+      viewCalls.push({ texture: tex, viewDesc });
+      if (viewDesc && viewDesc.dimension !== undefined && !isViewDimensionCompatible(tex.dimension, viewDesc.dimension)) {
+        throw new Error(
+          `WebGPU validation: Dimension (${viewDesc.dimension}) incompatible with texture dimension (${tex.dimension})`
+        );
+      }
+      if (tex.dimension === '1d' && viewDesc) {
+        if ((viewDesc.baseArrayLayer || 0) > 0 || (viewDesc.arrayLayerCount !== undefined && viewDesc.arrayLayerCount > 1)) {
+          throw new Error('WebGPU validation: 1D texture view cannot span multiple array layers');
+        }
+      }
+      return origCreateView(viewDesc);
+    };
+    return tex;
+  };
+  const origCreateBuffer = device.createBuffer.bind(device);
+  device.createBuffer = (desc) => {
+    const buf = origCreateBuffer(desc);
+    buf.destroyCount = 0;
+    const origDestroy = buf.destroy.bind(buf);
+    buf.destroy = () => {
+      buf.destroyCount += 1;
+      origDestroy();
+    };
+    return buf;
+  };
+  return { device, calls, viewCalls };
+}
+
+test('W340 mid-frame destroyTexture, destroyBuffer, and handle overwrites (setTexture/createTexture/createBuffer) defer .destroy() until endFrame(queue) onSubmittedWorkDone() settles', async () => {
+  const { device } = createStrictDimensionMockDevice();
+  const table = new ResourceTable(device);
+  const queue = createControllableQueue();
+
+  // Reproduce t82 256x1 RGBA32Float LUT texture + uniform buffer active mid-frame.
+  const lutOld = table.createTexture(10, {
+    size: { width: 256, height: 1, depthOrArrayLayers: 1 },
+    format: 'rgba32float',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  });
+  const texToDelete = table.createTexture(11, {
+    size: { width: 64, height: 64 },
+    format: 'rgba8unorm',
+  });
+  const bufOld = table.createBuffer(20, {
+    size: 256,
+    usage: GPU_BUFFER_USAGE.UNIFORM | GPU_BUFFER_USAGE.COPY_DST,
+  });
+  const bufToDelete = table.createBuffer(21, {
+    size: 64,
+    usage: GPU_BUFFER_USAGE.VERTEX,
+  });
+
+  // Start Frame 1: mid-frame overwrites & destroys MUST NOT call .destroy() synchronously!
+  assert.equal(table.beginFrame(), true);
+
+  const lutReplacement = device.createTexture({
+    size: { width: 256, height: 1, depthOrArrayLayers: 1 },
+    dimension: '2d',
+    format: 'rgba32float',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  });
+  table.setTexture(10, lutReplacement);
+  assert.strictEqual(table.getTexture(10), lutReplacement);
+  assert.equal(lutOld.destroyed, false, 'setTexture overwrite mid-frame must NOT destroy oldTex immediately');
+  assert.equal(lutOld.destroyCount, 0);
+
+  assert.equal(table.destroyTexture(11), true);
+  assert.equal(texToDelete.destroyed, false, 'destroyTexture mid-frame must NOT destroy texture immediately');
+  assert.equal(table.hasTexture(11), false);
+
+  const bufReplacement = table.createBuffer(20, { size: 512, usage: GPU_BUFFER_USAGE.UNIFORM });
+  assert.strictEqual(table.getBuffer(20), bufReplacement);
+  assert.equal(bufOld.destroyed, false, 'createBuffer overwrite mid-frame must NOT destroy oldBuf immediately');
+
+  assert.equal(table.destroyBuffer(21), true);
+  assert.equal(bufToDelete.destroyed, false, 'destroyBuffer mid-frame must NOT destroy buffer immediately');
+
+  let stats = table.getStats();
+  assert.equal(stats.deferredDestroyCount, 4);
+  assert.equal(stats.pendingDeferredDestroyCount, 4);
+
+  // Close Frame 1 with async GPU queue: resources stay alive until onSubmittedWorkDone() resolves.
+  const frame1Promise = table.endFrame(queue);
+  assert.equal(queue.pendingCount(), 1);
+  assert.equal(lutOld.destroyed, false);
+  assert.equal(texToDelete.destroyed, false);
+  assert.equal(bufOld.destroyed, false);
+  assert.equal(bufToDelete.destroyed, false);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 4);
+
+  // Start Frame 2 while Frame 1 is still in flight; Frame 2's deferred resource is isolated from Frame 1.
+  table.beginFrame();
+  const frame2Tex = table.createTexture(30, { size: { width: 32, height: 32 }, format: 'rgba8unorm' });
+  table.destroyTexture(30);
+  assert.equal(frame2Tex.destroyed, false);
+  assert.equal(table.getStats().deferredDestroyCount, 5);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 5);
+
+  // Resolve Frame 1's GPU work -> Frame 1's 4 resources are destroyed exactly once; Frame 2's stays alive!
+  queue.resolveNext();
+  const destroyedFrame1 = await frame1Promise;
+  assert.equal(destroyedFrame1, 4);
+  assert.equal(lutOld.destroyed, true);
+  assert.equal(lutOld.destroyCount, 1);
+  assert.equal(texToDelete.destroyed, true);
+  assert.equal(texToDelete.destroyCount, 1);
+  assert.equal(bufOld.destroyed, true);
+  assert.equal(bufOld.destroyCount, 1);
+  assert.equal(bufToDelete.destroyed, true);
+  assert.equal(bufToDelete.destroyCount, 1);
+  assert.equal(lutReplacement.destroyed, false);
+  assert.equal(bufReplacement.destroyed, false);
+  assert.equal(frame2Tex.destroyed, false);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 1);
+
+  // Frame 2 endFrame() with a rejecting onSubmittedWorkDone() still destroys cleanly without unhandled rejection.
+  const frame2Promise = table.endFrame(queue);
+  queue.rejectNext(new Error('device lost'));
+  const destroyedFrame2 = await frame2Promise;
+  assert.equal(destroyedFrame2, 1);
+  assert.equal(frame2Tex.destroyed, true);
+  assert.equal(frame2Tex.destroyCount, 1);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 0);
+  assert.equal(table.getStats().deferredDestroyCount, 5);
+});
+
+test('W340 outside a frame (default deferDestroys: false) destroys synchronously while deferDestroys: true defers until endFrame()', () => {
+  const { device } = createStrictDimensionMockDevice();
+
+  // Default constructor: deferDestroys is false -> synchronous destroy outside beginFrame().
+  const syncTable = new ResourceTable(device);
+  const t1 = syncTable.createTexture(1, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  const t2 = device.createTexture({
+    size: { width: 16, height: 16, depthOrArrayLayers: 1 },
+    dimension: '2d',
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  const b1 = syncTable.createBuffer(2, { size: 32, usage: GPU_BUFFER_USAGE.VERTEX });
+
+  syncTable.setTexture(1, t2);
+  assert.equal(t1.destroyed, true, 'outside a frame, setTexture overwrite destroys oldTex synchronously');
+  assert.equal(syncTable.destroyTexture(1), true);
+  assert.equal(t2.destroyed, true, 'outside a frame, destroyTexture destroys synchronously');
+  assert.equal(syncTable.destroyBuffer(2), true);
+  assert.equal(b1.destroyed, true, 'outside a frame, destroyBuffer destroys synchronously');
+  assert.equal(syncTable.getStats().deferredDestroyCount, 0);
+  assert.equal(syncTable.getStats().pendingDeferredDestroyCount, 0);
+
+  // deferDestroys: true -> defers even when beginFrame() was NOT called!
+  const deferredTable = new ResourceTable(device, { deferDestroys: true });
+  const dt1 = deferredTable.createTexture(10, { size: { width: 32, height: 32 }, format: 'rgba8unorm' });
+  const db1 = deferredTable.createBuffer(11, { size: 64, usage: GPU_BUFFER_USAGE.UNIFORM });
+
+  deferredTable.destroyTexture(10);
+  deferredTable.destroyBuffer(11);
+  assert.equal(dt1.destroyed, false);
+  assert.equal(db1.destroyed, false);
+  assert.equal(deferredTable.getStats().deferredDestroyCount, 2);
+  assert.equal(deferredTable.getStats().pendingDeferredDestroyCount, 2);
+
+  // Calling endFrame() without a queue drains synchronously.
+  const drained = deferredTable.endFrame();
+  assert.equal(drained, 2);
+  assert.equal(dt1.destroyed, true);
+  assert.equal(db1.destroyed, true);
+  assert.equal(deferredTable.getStats().pendingDeferredDestroyCount, 0);
+});
+
+test('W340 flushDeferredDestroys() and destroyAll() drain queued and in-flight deferred resources cleanly without double-destroy', async () => {
+  const { device } = createStrictDimensionMockDevice();
+  const queue = createControllableQueue();
+  const table = new ResourceTable(device);
+
+  // Queue one batch into an in-flight onSubmittedWorkDone promise, plus a second batch still in _deferredDestroys.
+  table.beginFrame();
+  const inFlightTex = table.createTexture(1, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  table.destroyTexture(1);
+  const inflightPromise = table.endFrame(queue);
+
+  table.beginFrame();
+  const queuedBuf = table.createBuffer(2, { size: 32, usage: GPU_BUFFER_USAGE.UNIFORM });
+  table.destroyBuffer(2);
+  assert.equal(inFlightTex.destroyed, false);
+  assert.equal(queuedBuf.destroyed, false);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 2);
+
+  // flushDeferredDestroys() synchronously drains BOTH current-frame and in-flight batches!
+  const flushedCount = table.flushDeferredDestroys();
+  assert.equal(flushedCount, 2);
+  assert.equal(inFlightTex.destroyed, true);
+  assert.equal(inFlightTex.destroyCount, 1);
+  assert.equal(queuedBuf.destroyed, true);
+  assert.equal(queuedBuf.destroyCount, 1);
+  assert.equal(table.getStats().pendingDeferredDestroyCount, 0);
+
+  // Later settling the in-flight promise must be a clean no-op (zero double-destroy!).
+  queue.resolveAll();
+  const lateCount = await inflightPromise;
+  assert.equal(lateCount, 0);
+  assert.equal(inFlightTex.destroyCount, 1);
+
+  // destroyAll() while deferDestroys: true and mid-frame drains both live AND deferred resources immediately.
+  const deferTable = new ResourceTable(device, { deferDestroys: true });
+  deferTable.beginFrame();
+  const liveTex = deferTable.createTexture(10, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  const liveBuf = deferTable.createBuffer(11, { size: 64, usage: GPU_BUFFER_USAGE.VERTEX });
+  const deferredTex = deferTable.createTexture(12, { size: { width: 16, height: 16 }, format: 'rgba8unorm' });
+  deferTable.destroyTexture(12);
+  assert.equal(deferredTex.destroyed, false);
+  assert.equal(deferTable.getStats().deferredDestroyCount, 1);
+  assert.equal(deferTable.getStats().pendingDeferredDestroyCount, 1);
+
+  deferTable.destroyAll();
+  assert.equal(liveTex.destroyed, true);
+  assert.equal(liveTex.destroyCount, 1);
+  assert.equal(liveBuf.destroyed, true);
+  assert.equal(liveBuf.destroyCount, 1);
+  assert.equal(deferredTex.destroyed, true);
+  assert.equal(deferredTex.destroyCount, 1);
+  assert.equal(deferTable.getStats().pendingDeferredDestroyCount, 0);
+  assert.equal(deferTable.getStats().liveHandles, 0);
+
+  // resetStats() zeroes deferredDestroyCount cleanly.
+  deferTable.resetStats();
+  assert.equal(deferTable.getStats().deferredDestroyCount, 0);
+  assert.equal(deferTable.getStats().pendingDeferredDestroyCount, 0);
+});
+
+test('W340 isViewDimensionCompatible() validates WebGPU texture/view dimension compatibility and exports across CJS/ESM/global', async () => {
+  const esmMod = await import('../web/workers/resource_table.js');
+  assert.equal(typeof isViewDimensionCompatible, 'function');
+  assert.equal(esmMod.isViewDimensionCompatible, isViewDimensionCompatible);
+  assert.equal(globalThis.PlayGta6ResourceTable.isViewDimensionCompatible, isViewDimensionCompatible);
+  assert.equal(ResourceTable.isViewDimensionCompatible, isViewDimensionCompatible);
+  assert.equal(GpuResourceTable, ResourceTable);
+  assert.equal(esmMod.GpuResourceTable, ResourceTable);
+  assert.equal(globalThis.PlayGta6ResourceTable.GpuResourceTable, ResourceTable);
+
+  // 1D texture: ONLY '1d' (or undefined/null default) is valid.
+  assert.equal(isViewDimensionCompatible('1d', '1d'), true);
+  assert.equal(isViewDimensionCompatible('1D', '1D'), true);
+  assert.equal(isViewDimensionCompatible(0, '1d'), true);
+  assert.equal(isViewDimensionCompatible('1d', undefined), true);
+  assert.equal(isViewDimensionCompatible('1d', null), true);
+  assert.equal(isViewDimensionCompatible('1d', '2d'), false);
+  assert.equal(isViewDimensionCompatible('1d', '2d-array'), false);
+  assert.equal(isViewDimensionCompatible('1d', 'cube'), false);
+  assert.equal(isViewDimensionCompatible('1d', 'cube-array'), false);
+  assert.equal(isViewDimensionCompatible('1d', '3d'), false);
+  assert.equal(isViewDimensionCompatible(0, '2d'), false);
+
+  // 2D texture: '2d', '2d-array', 'cube', 'cube-array' are valid; '1d' and '3d' are invalid.
+  assert.equal(isViewDimensionCompatible('2d', '2d'), true);
+  assert.equal(isViewDimensionCompatible('2d', '2d-array'), true);
+  assert.equal(isViewDimensionCompatible('2d', 'cube'), true);
+  assert.equal(isViewDimensionCompatible('2d', 'cube-array'), true);
+  assert.equal(isViewDimensionCompatible('2D', '2D-Array'), true);
+  assert.equal(isViewDimensionCompatible(1, '2d'), true);
+  assert.equal(isViewDimensionCompatible('2d', '1d'), false);
+  assert.equal(isViewDimensionCompatible('2d', '3d'), false);
+
+  // 3D texture: ONLY '3d' is valid.
+  assert.equal(isViewDimensionCompatible('3d', '3d'), true);
+  assert.equal(isViewDimensionCompatible(2, '3d'), true);
+  assert.equal(isViewDimensionCompatible('3d', '2d'), false);
+  assert.equal(isViewDimensionCompatible('3d', '1d'), false);
+
+  // Invalid inputs return false safely.
+  assert.equal(isViewDimensionCompatible('4d', '2d'), false);
+  assert.equal(isViewDimensionCompatible('2d', '4d'), false);
+  assert.equal(isViewDimensionCompatible(null, '2d'), false);
+  assert.equal(isViewDimensionCompatible('2d', 123), false);
+});
+
+test('W340 guards 1D textures from incompatible createView({ dimension: "2d" }) across createTextureView(), resolveSlot(), and setTexture()', () => {
+  const { device, viewCalls } = createStrictDimensionMockDevice();
+  const warnings = [];
+  const table = new ResourceTable(device, {
+    onWarning: (ev) => warnings.push(ev),
+  });
+
+  // Reproduce t82 4096 px R32Float 1D LUT texture.
+  const tex1d = table.createTexture(100, {
+    dimension: '1d',
+    size: { width: 4096, height: 1, depthOrArrayLayers: 1 },
+    format: 'r32float',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  });
+  assert.equal(tex1d.dimension, '1d');
+  assert.equal(table.getTextureMeta(100).dimension, '1d');
+  assert.equal(table.isViewDimensionCompatible('1d', '2d'), false);
+  assert.equal(table.isViewDimensionCompatible('1d', '1d'), true);
+
+  // 1. createTextureView requesting '2d' on a '1d' texture must NEVER call createView({ dimension: '2d' }).
+  const guardedView = table.createTextureView(101, 100, {
+    dimension: '2d',
+    baseArrayLayer: 2,
+    arrayLayerCount: 4,
+  });
+  assert.ok(guardedView);
+  assert.equal(guardedView.viewDesc.dimension, '1d');
+  assert.equal(guardedView.viewDesc.baseArrayLayer, 0);
+  assert.equal(guardedView.viewDesc.arrayLayerCount, 1);
+  assert.equal(table.getStats().viewDimensionGuardCount, 1);
+
+  // 2. Slot resolution requesting '2d' view on a '1d' texture must also guard safely.
+  table.setSlot(0, { kind: 'texture', handle: 100, dimension: '2d' });
+  const slotView = table.resolveSlot(0);
+  assert.ok(slotView);
+  assert.equal(slotView.viewDesc.dimension, '1d');
+  assert.equal(table.getStats().viewDimensionGuardCount, 2);
+
+  // 3. setTexture() with an incompatible viewDescriptor also guards cleanly.
+  const ext1d = device.createTexture({
+    size: { width: 4096, height: 1, depthOrArrayLayers: 1 },
+    dimension: '1d',
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING,
+  });
+  table.setTexture(102, ext1d, { viewDescriptor: { dimension: '2d' } });
+  const extView = table.getTextureView(102);
+  assert.ok(extView);
+  assert.equal(extView.viewDesc.dimension, '1d');
+  assert.equal(table.getStats().viewDimensionGuardCount, 3);
+
+  // 4. Compatible view dimensions ('2d-array' on '2d' texture) pass through untouched with no extra guard warnings.
+  table.createTexture(200, {
+    dimension: '2d',
+    size: { width: 64, height: 64, depthOrArrayLayers: 6 },
+    format: 'rgba8unorm',
+  });
+  const arrView = table.createTextureView(201, 200, { dimension: '2d-array' });
+  assert.equal(arrView.viewDesc.dimension, '2d-array');
+  assert.equal(table.getStats().viewDimensionGuardCount, 3);
+
+  // Confirm zero incompatible createView calls ever reached the mock WebGPU texture.
+  for (const call of viewCalls) {
+    if (call.viewDesc && call.viewDesc.dimension !== undefined) {
+      assert.equal(
+        isViewDimensionCompatible(call.texture.dimension, call.viewDesc.dimension),
+        true,
+        `createView must never receive incompatible dimension ${call.viewDesc.dimension} for ${call.texture.dimension}`
+      );
+    }
+  }
+  assert.equal(warnings.filter((w) => w.kind === 'texture_view_dimension_guard').length, 3);
+});
+
+test('W340 promote1DTo2D promotes 1D textures to width x 1 2D textures across sanitizeTextureDescriptor, createTexture, createTexture2, and constructor option', () => {
+  const { device, calls } = createStrictDimensionMockDevice();
+
+  // Pure sanitizeTextureDescriptor: default false preserves '1d'; promote1DTo2D: true produces '2d' width x 1.
+  const raw1d = {
+    dimension: '1d',
+    size: { width: 4096, height: 8, depthOrArrayLayers: 4 },
+    format: 'rgba8unorm',
+    usage: GPU_TEXTURE_USAGE.TEXTURE_BINDING | GPU_TEXTURE_USAGE.COPY_DST,
+  };
+  const kept1d = sanitizeTextureDescriptor(raw1d, device);
+  assert.equal(kept1d.promoted1DTo2D, false);
+  assert.equal(kept1d.descriptor.dimension, '1d');
+  assert.deepEqual(kept1d.descriptor.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+
+  const promoted = sanitizeTextureDescriptor(raw1d, device, { promote1DTo2D: true });
+  assert.equal(promoted.promoted1DTo2D, true);
+  assert.equal(promoted.descriptor.dimension, '2d');
+  assert.deepEqual(promoted.descriptor.size, { width: 4096, height: 1, depthOrArrayLayers: 1 });
+
+  // Per-call promote1DTo2D on createTexture & createTexture2 (including binary payload).
+  const table = new ResourceTable(device);
+  const t1 = table.createTexture(1, raw1d, { promote1DTo2D: true });
+  assert.equal(t1.dimension, '2d');
+  assert.equal(t1.width, 4096);
+  assert.equal(t1.height, 1);
+  assert.equal(table.getTextureMeta(1).dimension, '2d');
+  assert.equal(table.getTextureMeta(1).promoted1DTo2D, true);
+
+  // Requesting a '2d' view on the promoted texture succeeds natively with zero viewDimensionGuardCount increments!
+  const v1 = table.createTextureView(10, 1, { dimension: '2d' });
+  assert.equal(v1.viewDesc.dimension, '2d');
+  assert.equal(table.getStats().viewDimensionGuardCount, 0);
+  assert.equal(table.getStats().promoted1DTo2DCount, 1);
+
+  // Binary CreateTexture2 with dimension=0 (1d) and constructor-level promote1DTo2D: true.
+  const autoPromoteTable = new ResourceTable(device, { promote1DTo2D: true });
+  const payload1d = buildCreateTexture2Payload({
+    id: 50,
+    width: 4096,
+    height: 1,
+    layers: 1,
+    mips: 1,
+    dimension: 0, // 1d
+    format: 16, // r32float
+  });
+  const res = autoPromoteTable.createTexture2(payload1d, 0);
+  assert.equal(res.error, undefined);
+  assert.equal(res.texture.dimension, '2d');
+  assert.equal(res.meta.dimension, '2d');
+  assert.equal(res.meta.width, 4096);
+  assert.equal(res.meta.height, 1);
+  assert.equal(res.meta.format, 'r32float');
+  assert.equal(res.meta.promoted1DTo2D, true);
+  assert.equal(autoPromoteTable.getStats().promoted1DTo2DCount, 1);
+  assert.equal(calls.createTexture[calls.createTexture.length - 1].desc.dimension, '2d');
+
+  // Verify all stats remain finite numbers.
+  const stats = autoPromoteTable.getStats();
   for (const [k, v] of Object.entries(stats)) {
     assert.equal(typeof v, 'number', `stat ${k} must be numeric`);
     assert.ok(Number.isFinite(v), `stat ${k} must be finite`);

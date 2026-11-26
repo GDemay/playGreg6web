@@ -85,6 +85,8 @@ public:
     void create_compute_pipeline(uint32_t id, uint32_t cs_shader_id, uint32_t flags = 0);
     void set_compute_pipeline(uint32_t pipeline_id);
     void dispatch_compute(uint32_t workgroup_x, uint32_t workgroup_y = 1, uint32_t workgroup_z = 1);
+    // DrawIndirect / DrawIndexedIndirect / DispatchIndirect (GpuIndirectPayload).
+    void indirect(GpuOpcode opcode, uint32_t buffer_id, uint64_t offset);
     // Generic packet for opcodes without a dedicated method: payload = `head` followed by `tail`.
     void emit_packet(
         GpuOpcode opcode,

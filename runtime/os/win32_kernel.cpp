@@ -8,6 +8,8 @@
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -29,6 +31,24 @@ thread_local uint32_t* g_last_error_slot = nullptr;
 const std::chrono::steady_clock::time_point& process_start_time() {
     static const auto kStart = std::chrono::steady_clock::now();
     return kStart;
+}
+
+std::atomic<int64_t> g_host_stall_ns{0};
+std::atomic<int64_t> g_last_guest_ns{0};
+
+// Guest-visible nanoseconds since process start, minus compensated host stalls; never regresses.
+int64_t guest_clock_ns() {
+    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
+    int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count() -
+                 g_host_stall_ns.load(std::memory_order_acquire);
+    if (ns < 0) {
+        ns = 0;
+    }
+    int64_t prev = g_last_guest_ns.load(std::memory_order_relaxed);
+    while (prev < ns &&
+           !g_last_guest_ns.compare_exchange_weak(prev, ns, std::memory_order_relaxed)) {
+    }
+    return prev > ns ? prev : ns;
 }
 
 // ---------------------------------------------------------------------------
@@ -1370,9 +1390,8 @@ struct SrwShard {
     std::unordered_map<uintptr_t, std::unique_ptr<playgta6::os::SrwLock>> locks;
 };
 
-playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
+playgta6::os::SrwLock& srw_lock_for_slow(uintptr_t key) {
     static SrwShard shards[64];
-    const uintptr_t key = reinterpret_cast<uintptr_t>(srw_lock);
     SrwShard& shard = shards[(key >> 3) % 64];
     std::lock_guard<std::mutex> guard(shard.mutex);
     std::unique_ptr<playgta6::os::SrwLock>& entry = shard.locks[key];
@@ -1380,6 +1399,25 @@ playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
         entry = std::make_unique<playgta6::os::SrwLock>();
     }
     return *entry;
+}
+
+// Uncontended fast path: entries are never removed, so a per-thread direct-mapped cache of
+// address -> host lock stays valid forever and skips the shard mutex + hash lookup per call.
+struct SrwCacheSlot {
+    uintptr_t key = 0;
+    playgta6::os::SrwLock* lock = nullptr;
+};
+constexpr size_t kSrwCacheSlots = 64;
+
+playgta6::os::SrwLock& srw_lock_for(const SrwLock* srw_lock) {
+    thread_local SrwCacheSlot cache[kSrwCacheSlots];
+    const uintptr_t key = reinterpret_cast<uintptr_t>(srw_lock);
+    SrwCacheSlot& slot = cache[(key >> 3) % kSrwCacheSlots];
+    if (slot.key != key) {
+        slot.lock = &srw_lock_for_slow(key);
+        slot.key = key;
+    }
+    return *slot.lock;
 }
 
 }  // namespace
@@ -1449,20 +1487,53 @@ CriticalSectionShard& critical_section_shard(const void* address) {
     return shards[(key >> 4) % kCriticalSectionShards];
 }
 
+// Bumped whenever a section's host lock is replaced (re-Initialize) or erased (Delete), which
+// invalidates every thread's cached lookup below.
+std::atomic<uint64_t> g_critical_section_generation{1};
+
 // The section's lock; created when missing and `create` (a zero-initialized section entered
 // without an Initialize call behaves like an initialized one).
-std::shared_ptr<std::recursive_mutex> critical_section_lock(const CriticalSection* cs, bool create) {
+std::recursive_mutex* critical_section_lock_slow(const CriticalSection* cs, bool create) {
     CriticalSectionShard& shard = critical_section_shard(cs);
     std::lock_guard<std::mutex> guard(shard.mutex);
     auto it = shard.locks.find(cs);
     if (it != shard.locks.end()) {
-        return it->second;
+        return it->second.get();
     }
     if (!create) {
         return nullptr;
     }
     auto lock = std::make_shared<std::recursive_mutex>();
-    shard.locks.emplace(cs, lock);
+    std::recursive_mutex* raw = lock.get();
+    shard.locks.emplace(cs, std::move(lock));
+    return raw;
+}
+
+// Uncontended fast path: a per-thread direct-mapped cache of section -> host lock, valid while
+// the global generation is unchanged. Skips the shard mutex, the hash lookup and two atomic
+// shared_ptr refcount updates on every Enter/Leave. (Deleting a section another thread is still
+// using is undefined in Win32 too, so a raw pointer is as safe as the old temporary reference.)
+struct CriticalSectionCacheSlot {
+    const void* key = nullptr;
+    uint64_t generation = 0;
+    std::recursive_mutex* lock = nullptr;
+};
+constexpr size_t kCriticalSectionCacheSlots = 64;
+
+std::recursive_mutex* critical_section_lock(const CriticalSection* cs, bool create) {
+    thread_local CriticalSectionCacheSlot cache[kCriticalSectionCacheSlots];
+    const uint64_t generation = g_critical_section_generation.load(std::memory_order_acquire);
+    CriticalSectionCacheSlot& slot =
+        cache[(reinterpret_cast<uintptr_t>(cs) >> 4) % kCriticalSectionCacheSlots];
+    if (slot.key == cs && slot.generation == generation) {
+        return slot.lock;
+    }
+    std::recursive_mutex* lock = critical_section_lock_slow(cs, create);
+    if (lock != nullptr) {
+        slot.key = cs;
+        slot.generation = generation;
+        slot.lock = lock;
+    }
     return lock;
 }
 
@@ -1484,7 +1555,11 @@ void InitializeCriticalSectionWithSpinCount(CriticalSection* critical_section, u
     *critical_section = CriticalSection{~uint64_t{0}, -1, 0, 0, 0, spin_count};
     CriticalSectionShard& shard = critical_section_shard(critical_section);
     std::lock_guard<std::mutex> guard(shard.mutex);
-    shard.locks[critical_section] = std::make_shared<std::recursive_mutex>();
+    auto& entry = shard.locks[critical_section];
+    if (entry) {
+        g_critical_section_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
+    entry = std::make_shared<std::recursive_mutex>();
 }
 
 void InitializeCriticalSection(CriticalSection* critical_section) {
@@ -1497,7 +1572,9 @@ void DeleteCriticalSection(CriticalSection* critical_section) {
     }
     CriticalSectionShard& shard = critical_section_shard(critical_section);
     std::lock_guard<std::mutex> guard(shard.mutex);
-    shard.locks.erase(critical_section);
+    if (shard.locks.erase(critical_section) != 0) {
+        g_critical_section_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
 }
 
 void EnterCriticalSection(CriticalSection* critical_section) {
@@ -1524,7 +1601,8 @@ bool TryEnterCriticalSection(CriticalSection* critical_section) {
 }
 
 void LeaveCriticalSection(CriticalSection* critical_section) {
-    const auto lock = critical_section != nullptr ? critical_section_lock(critical_section, false) : nullptr;
+    std::recursive_mutex* const lock =
+        critical_section != nullptr ? critical_section_lock(critical_section, false) : nullptr;
     if (lock == nullptr) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
@@ -1616,6 +1694,29 @@ constexpr uint32_t kStatusEndOfFile = 0xC0000011u;
 
 namespace {
 
+// PG6_AUDIO_TRACE=1: ReadFile on a path naming audio (at most 2000 lines).
+void trace_audio_read(const std::string& path, uint64_t offset, uint32_t size, int64_t got,
+                      std::chrono::steady_clock::time_point start) {
+    static const bool on = [] {
+        const char* e = std::getenv("PG6_AUDIO_TRACE");
+        return e != nullptr && e[0] == '1';
+    }();
+    static std::atomic<uint32_t> lines{0};
+    std::string lower = path;
+    for (char& c : lower) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (!on || lower.find("audio") == std::string::npos || lines.fetch_add(1) >= 2000) {
+        return;
+    }
+    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+    char line[400];
+    std::snprintf(line, sizeof(line), "audio-trace: ReadFile '%s' +0x%llx %u -> %lld (%lld us)", path.c_str(),
+                  static_cast<unsigned long long>(offset), size, static_cast<long long>(got),
+                  static_cast<long long>(us.count()));
+    std::fprintf(stderr, "%s\n", line);
+}
+
 // Reads at `*start` (an OVERLAPPED offset) or at the file pointer; either way the file pointer
 // ends after the bytes read, as for a synchronous handle.
 bool read_file_at(Handle file_handle,
@@ -1677,8 +1778,13 @@ bool read_file_at(Handle file_handle,
         return false;
     }
 
-    const int64_t got =
-        file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+    const auto read_start = std::chrono::steady_clock::now();
+    int64_t got = 0;
+    {
+        HostStallScope stall;  // a package read can block on the network/disk for seconds
+        got = file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+    }
+    trace_audio_read(file->httpfs_key, file->cursor, bytes_to_read, got, read_start);
     if (got < 0) {
         SetLastError(ERROR_READ_FAULT);
         return false;
@@ -1941,16 +2047,27 @@ bool QueryPerformanceCounter(int64_t* performance_count) {
         SetLastError(ERROR_INVALID_PARAMETER);
         return false;
     }
-    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
-    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
-    *performance_count = (ns >= 0 ? ns : 0) + 1;
+    *performance_count = guest_clock_ns() + 1;
     return true;
 }
 
 uint64_t GetTickCount64() {
-    const auto elapsed = std::chrono::steady_clock::now() - process_start_time();
-    const int64_t ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
-    return ms >= 0 ? static_cast<uint64_t>(ms) : 0ULL;
+    return static_cast<uint64_t>(guest_clock_ns() / 1'000'000LL);
+}
+
+void ReportHostStall(int64_t stall_ns) {
+    if (stall_ns >= kHostStallThresholdNs) {
+        g_host_stall_ns.fetch_add(stall_ns, std::memory_order_acq_rel);
+    }
+}
+
+int64_t TotalHostStallNs() {
+    return g_host_stall_ns.load(std::memory_order_acquire);
+}
+
+void ResetHostStallForTesting() {
+    g_host_stall_ns.store(0, std::memory_order_release);
+    g_last_guest_ns.store(0, std::memory_order_relaxed);
 }
 
 void GetSystemTimeAsFileTime(FileTime* system_time_as_file_time) {

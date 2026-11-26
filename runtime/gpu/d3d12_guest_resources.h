@@ -293,6 +293,8 @@ public:
     bool resolved() const { return resolved_; }
     bridge::GraphicsPipelineState* graphics() const { return graphics_.get(); }
     bridge::ComputePipelineState* compute() const { return compute_.get(); }
+    // G66: emulated mesh pipeline (null for every other pipeline state).
+    bridge::MeshPipelineState* mesh() const { return mesh_.get(); }
     const std::vector<uint64_t>& shader_identities() const { return identities_; }
     // Graphics description (null for compute and placeholder pipeline states).
     const GraphicsPsoSource* graphics_source() const { return source_.get(); }
@@ -318,6 +320,7 @@ private:
     com::Ref<RootSignature> root_signature_;
     std::unique_ptr<bridge::GraphicsPipelineState> graphics_;
     std::unique_ptr<bridge::ComputePipelineState> compute_;
+    std::unique_ptr<bridge::MeshPipelineState> mesh_;
     std::unique_ptr<GraphicsPsoSource> source_;
     std::unique_ptr<Native> native_;
     uint32_t dump_index_ = kNoDumpIndex;
@@ -402,6 +405,10 @@ public:
     // the list is executed (work completes at submission in this runtime, as fences do).
     void apply_immediate_writes();
     size_t immediate_write_count() const { return immediate_writes_.size(); }
+    // G66: numbers this list's read-back packets for one execution (ReadbackGate::issue) and patches
+    // the numbers into the recorded payloads. Runs before the list's packets are submitted.
+    void issue_readbacks();
+    size_t readback_count() const { return readbacks_.size(); }
 
     // ---- Runtime side ----
     bool is_open() const { return open_; }
@@ -488,6 +495,20 @@ private:
         uint32_t size = 0;  // 4 or 8
     };
     std::vector<ImmediateWrite> immediate_writes_;
+    // Read-backs recorded into `encoder_` (G66): where their seq field is and the guest range they write.
+    struct ReadbackRecord {
+        size_t seq_offset = 0;
+        uint64_t guest_va = 0;
+        uint64_t bytes = 0;
+    };
+    std::vector<ReadbackRecord> readbacks_;
+    // Emits a read-back packet (dst_addr / done_addr already set) whose bytes land at guest
+    // [va, va + bytes).
+    bool readback_target(uint64_t va, uint64_t bytes, uint64_t* dst_addr, uint64_t* done_addr);
+    void record_readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id,
+                         uint64_t va, uint64_t bytes);
+    void copy_texture_to_footprint(com::CallContext& ctx, const GuestTextureCopyLocation& dst,
+                                   const GuestTextureCopyLocation& src, Resource* buf, Resource* tex);
     uint64_t diag_count_ = 0;
     std::map<uint32_t, uint64_t> xbox_calls_;
 };
