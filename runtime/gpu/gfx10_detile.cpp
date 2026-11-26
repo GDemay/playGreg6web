@@ -199,12 +199,15 @@ constexpr bool verify_mask_tables() noexcept {
 }
 static_assert(verify_mask_tables(), "GFX10 swizzle mask table invariant failed");
 
-// GFX10 64KB/Var _X pipe-bank XOR: leaves bits [0..7] (256B pipe interleave) untouched and XORs
-// pipe/bank bits [8..11] with reverse-ordered upper intra-tile bits [15..12]. Bijective involution.
-constexpr uint32_t apply_gfx10_xor_64k(uint32_t intra) noexcept {
+// GFX10 64KB/Var _X pipe-bank XOR: leaves bits [0..7] (256B pipe interleave) untouched, XORs
+// pipe/bank bits [8..11] with reverse-ordered upper intra-tile bits [15..12], and applies the
+// optional 8-bit hardware pipe_bank_xor seed into bits [8..15]. Bijective on [0..65535] for every
+// 8-bit pipe_bank_xor value (and identical to the zero-seed involution when pipe_bank_xor == 0).
+constexpr uint32_t apply_gfx10_xor_64k(uint32_t intra, uint32_t pipe_bank_xor = 0u) noexcept {
     const uint32_t hi = (intra >> 12) & 0xFu;
     const uint32_t rev = ((hi & 1u) << 3) | ((hi & 2u) << 1) | ((hi & 4u) >> 1) | ((hi & 8u) >> 3);
-    return intra ^ (rev << 8);
+    const uint32_t seed = (pipe_bank_xor & 0xFFu) << 8;
+    return intra ^ (rev << 8) ^ seed;
 }
 
 struct TileShape {
@@ -269,7 +272,8 @@ constexpr uint32_t apply_equation(const BitEq* eq, uint32_t blk_size_log2, uint3
 }
 
 constexpr size_t tiled_byte_offset_shape(const TileShape& shape, uint32_t bpp_log2, uint32_t bx, uint32_t by,
-                                         uint32_t bz, uint32_t tiles_per_row, uint32_t tiles_per_col) noexcept {
+                                         uint32_t bz, uint32_t tiles_per_row, uint32_t tiles_per_col,
+                                         uint32_t pipe_bank_xor = 0u) noexcept {
     const uint32_t tile_w_mask = (1u << shape.w_log2) - 1u;
     const uint32_t tile_h_mask = (1u << shape.h_log2) - 1u;
     const uint32_t tile_d_mask = (1u << shape.d_log2) - 1u;
@@ -289,7 +293,7 @@ constexpr size_t tiled_byte_offset_shape(const TileShape& shape, uint32_t bpp_lo
         intra = deposit_bits(local_x_bytes, shape.x_mask) | deposit_bits(local_y, shape.y_mask);
     }
     if (shape.xor_mode) {
-        intra = apply_gfx10_xor_64k(intra);
+        intra = apply_gfx10_xor_64k(intra, pipe_bank_xor);
     }
 
     const size_t tiles_per_slice = static_cast<size_t>(tiles_per_row) * static_cast<size_t>(tiles_per_col);
@@ -307,6 +311,25 @@ bool checked_mul_u64(uint64_t a, uint64_t b, uint64_t* out) noexcept {
     return true;
 }
 
+bool checked_add_u64(uint64_t a, uint64_t b, uint64_t* out) noexcept {
+    if (b > std::numeric_limits<uint64_t>::max() - a) {
+        return false;
+    }
+    *out = a + b;
+    return true;
+}
+
+bool checked_align_pow2_u64(uint64_t v, uint64_t a, uint64_t* out) noexcept {
+    if (a == 0u || (a & (a - 1u)) != 0u) {
+        return false;
+    }
+    if (v > std::numeric_limits<uint64_t>::max() - (a - 1u)) {
+        return false;
+    }
+    *out = (v + a - 1u) & ~(a - 1u);
+    return true;
+}
+
 struct SubresourcePlan {
     bool ok = false;
     const char* error = nullptr;
@@ -314,6 +337,7 @@ struct SubresourcePlan {
     SwizzleTraits traits{};
     FormatGeometry fmt{};
     uint32_t bpp_log2 = 0;
+    uint32_t pipe_bank_xor = 0;
     uint32_t blocks_x = 0;
     uint32_t blocks_y = 0;
     uint32_t slices = 0;
@@ -347,6 +371,7 @@ SubresourcePlan plan_subresource(const TextureLayoutDesc& desc, uint32_t mip) no
         p.error = "unsupported D3D12 texture layout / swizzle mode";
         return p;
     }
+    p.pipe_bank_xor = p.traits.xor_mode ? (desc.pipe_bank_xor & 0xFFu) : 0u;
 
     if (desc.width == 0 || desc.height == 0 || desc.depth == 0) {
         p.error = "invalid texture dimensions (width, height, and depth must be non-zero)";
@@ -542,6 +567,8 @@ FormatGeometry format_geometry(uint32_t dxgi_format) noexcept {
         case 91:  // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
         case 92:  // DXGI_FORMAT_B8G8R8X8_TYPELESS
         case 93:  // DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
+        case 116: // DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT (Xbox HDR)
+        case 117: // DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT (Xbox HDR)
             return {1, 1, 4, false, true};
 
         // 2 bytes per pixel (16-bit)
@@ -557,6 +584,9 @@ FormatGeometry format_geometry(uint32_t dxgi_format) noexcept {
         case 57:  // DXGI_FORMAT_R16_UINT
         case 58:  // DXGI_FORMAT_R16_SNORM
         case 59:  // DXGI_FORMAT_R16_SINT
+        case 85:  // DXGI_FORMAT_B5G6R5_UNORM
+        case 86:  // DXGI_FORMAT_B5G5R5A1_UNORM
+        case 115: // DXGI_FORMAT_B4G4R4A4_UNORM
             return {1, 1, 2, false, true};
 
         // 1 byte per pixel (8-bit)
@@ -606,6 +636,11 @@ bool is_swizzle_supported(SwizzleMode mode) noexcept {
 
 size_t tiled_byte_offset_2d(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t bytes_per_block,
                             uint32_t pitch_in_blocks) noexcept {
+    return tiled_byte_offset_2d_xor(mode, bx, by, bytes_per_block, pitch_in_blocks, 0u);
+}
+
+size_t tiled_byte_offset_2d_xor(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t bytes_per_block,
+                                uint32_t pitch_in_blocks, uint32_t pipe_bank_xor) noexcept {
     const SwizzleTraits traits = classify_mode(mode);
     const uint32_t bpp_log2 = bpp_to_log2(bytes_per_block);
     if (!traits.valid || bpp_log2 == 0xFFu) {
@@ -622,7 +657,8 @@ size_t tiled_byte_offset_2d(SwizzleMode mode, uint32_t bx, uint32_t by, uint32_t
     const uint32_t eff_pitch = pitch_in_blocks > 0u ? pitch_in_blocks : tile_w;
     const uint32_t tiles_per_row = static_cast<uint32_t>(
         (static_cast<uint64_t>(eff_pitch) + tile_w - 1u) >> shape.w_log2);
-    return tiled_byte_offset_shape(shape, bpp_log2, bx, by, /*bz=*/0u, tiles_per_row, /*tiles_per_col=*/1u);
+    return tiled_byte_offset_shape(shape, bpp_log2, bx, by, /*bz=*/0u, tiles_per_row, /*tiles_per_col=*/1u,
+                                   traits.xor_mode ? (pipe_bank_xor & 0xFFu) : 0u);
 }
 
 size_t tiled_footprint_bytes(const TextureLayoutDesc& desc, uint32_t mip) noexcept {
@@ -678,7 +714,7 @@ DetileResult detile_subresource(const TextureLayoutDesc& desc, uint32_t mip, con
                 uint8_t* dst_row = dst_slice + static_cast<size_t>(by) * plan.linear_row_pitch;
                 for (uint32_t bx = 0; bx < plan.blocks_x; ++bx) {
                     const size_t src_off = tiled_byte_offset_shape(plan.tile_shape, plan.bpp_log2, bx, by, bz,
-                                                                   plan.tiles_x, plan.tiles_y);
+                                                                   plan.tiles_x, plan.tiles_y, plan.pipe_bank_xor);
                     if (src_off > src_bytes || bpp > src_bytes - src_off) {
                         linear_out.clear();
                         res.error = "tiled source offset out of bounds";
@@ -737,7 +773,7 @@ bool tile_subresource_for_test(const TextureLayoutDesc& desc, uint32_t mip, cons
                 const uint8_t* src_row = src_slice + static_cast<size_t>(by) * plan.linear_row_pitch;
                 for (uint32_t bx = 0; bx < plan.blocks_x; ++bx) {
                     const size_t dst_off = tiled_byte_offset_shape(plan.tile_shape, plan.bpp_log2, bx, by, bz,
-                                                                   plan.tiles_x, plan.tiles_y);
+                                                                   plan.tiles_x, plan.tiles_y, plan.pipe_bank_xor);
                     if (dst_off > tiled_out.size() || bpp > tiled_out.size() - dst_off) {
                         tiled_out.clear();
                         return false;
@@ -783,6 +819,7 @@ struct ChainLayout {
     bool in_tail[kMaxMips] = {};
     uint32_t tail_x[kMaxMips] = {};
     uint32_t tail_y[kMaxMips] = {};
+    uint32_t pipe_bank_xor = 0;
     bool linear = false;  // console linear (ADDR_SW_LINEAR): pitched rows, no blocks
 };
 
@@ -815,10 +852,19 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
         c.error = "3D textures have no array slices";
         return c;
     }
+    c.pipe_bank_xor = traits.xor_mode ? (desc.pipe_bank_xor & 0xFFu) : 0u;
     c.mips = std::min(std::max(desc.mip_levels, 1u), kMaxMips);
-    const uint32_t ew = (desc.width + c.fmt.block_width - 1u) / c.fmt.block_width;
-    const uint32_t eh = (desc.height + c.fmt.block_height - 1u) / c.fmt.block_height;
+    const uint64_t ew64 = (uint64_t{desc.width} + c.fmt.block_width - 1u) / c.fmt.block_width;
+    const uint64_t eh64 = (uint64_t{desc.height} + c.fmt.block_height - 1u) / c.fmt.block_height;
+    if (ew64 == 0u || eh64 == 0u || ew64 > std::numeric_limits<uint32_t>::max() ||
+        eh64 > std::numeric_limits<uint32_t>::max()) {
+        c.error = "surface element dimensions overflow";
+        return c;
+    }
+    const uint32_t ew = static_cast<uint32_t>(ew64);
+    const uint32_t eh = static_cast<uint32_t>(eh64);
     const uint32_t depth = desc.depth;
+    const uint32_t layers = std::max(desc.array_size, 1u);
     if (c.linear) {
         // AMD addrlib Gfx10Lib::HwlComputeSurfaceInfoLinear, ADDR_SW_LINEAR: the pitch of every
         // mip is aligned to 256 bytes (256 / bytes-per-element elements), mip sizes are rounded up
@@ -827,18 +873,47 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
         // slice) holds the whole chain: slice stride = chain size, surface = chain x slices.
         const uint64_t bpe = c.fmt.bytes_per_block;
         const uint32_t pitch_align = 256u / c.fmt.bytes_per_block;
+        c.bw = pitch_align;
+        c.bh = 1u;
+        c.bd = 1u;
         uint64_t chain = 0;
         for (int32_t i = static_cast<int32_t>(c.mips) - 1; i >= 0; --i) {
             const uint32_t m = static_cast<uint32_t>(i);
-            c.pitch[m] = static_cast<uint32_t>(align_pow2(shift_ceil(ew, m), pitch_align));
+            uint64_t pitch64 = 0;
+            if (!checked_align_pow2_u64(shift_ceil(ew, m), pitch_align, &pitch64) ||
+                pitch64 > std::numeric_limits<uint32_t>::max()) {
+                c.error = "linear mip pitch overflow";
+                return c;
+            }
+            c.pitch[m] = static_cast<uint32_t>(pitch64);
             c.height[m] = shift_ceil(eh, m);
-            c.slice_bytes[m] = uint64_t{c.pitch[m]} * c.height[m] * bpe;
-            c.size_bytes[m] = c.slice_bytes[m] * (depth > 1u ? shift_ceil(depth, m) : 1u);
+            uint64_t row_bytes = 0;
+            uint64_t slice_b = 0;
+            uint64_t size_b = 0;
+            if (!checked_mul_u64(pitch64, bpe, &row_bytes) ||
+                !checked_mul_u64(row_bytes, c.height[m], &slice_b) ||
+                !checked_mul_u64(slice_b, depth > 1u ? shift_ceil(depth, m) : 1u, &size_b)) {
+                c.error = "linear mip footprint overflow";
+                return c;
+            }
+            c.slice_bytes[m] = slice_b;
+            c.size_bytes[m] = size_b;
             c.offset[m] = c.macro_offset[m] = chain;
-            chain += c.slice_bytes[m];
+            if (!checked_add_u64(chain, slice_b, &chain)) {
+                c.error = "linear mip chain overflow";
+                return c;
+            }
         }
         c.slice_stride = chain;
-        c.total_bytes = chain * depth * std::max(desc.array_size, 1u);
+        uint64_t depth_layers = 0;
+        uint64_t total = 0;
+        if (!checked_mul_u64(depth, layers, &depth_layers) ||
+            !checked_mul_u64(chain, depth_layers, &total) ||
+            total > std::numeric_limits<size_t>::max()) {
+            c.error = "linear surface size overflow";
+            return c;
+        }
+        c.total_bytes = total;
         c.ok = true;
         return c;
     }
@@ -850,7 +925,16 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
     const uint32_t blk = c.shape.blk_size_log2;
     const uint64_t block_bytes = uint64_t{1} << blk;
     const uint64_t bpe = c.fmt.bytes_per_block;
-    const uint64_t num_slices = thick ? align_pow2(depth, c.bd) : uint64_t{depth} * std::max(desc.array_size, 1u);
+    uint64_t num_slices = 0;
+    if (thick) {
+        if (!checked_align_pow2_u64(depth, c.bd, &num_slices)) {
+            c.error = "3D depth alignment overflow";
+            return c;
+        }
+    } else if (!checked_mul_u64(depth, layers, &num_slices)) {
+        c.error = "surface slice count overflow";
+        return c;
+    }
 
     uint64_t chain = 0;
     if (blk == 8u) {
@@ -858,18 +942,36 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
         for (int32_t i = static_cast<int32_t>(c.mips) - 1; i >= 0; --i) {
             const uint32_t w = shift_ceil(ew, static_cast<uint32_t>(i));
             const uint32_t h = shift_ceil(eh, static_cast<uint32_t>(i));
-            c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
-            c.height[i] = static_cast<uint32_t>(align_pow2(h, c.bh));
+            uint64_t p64 = 0, h64 = 0, row_b = 0, slice_b = 0;
+            if (!checked_align_pow2_u64(w, c.bw, &p64) || !checked_align_pow2_u64(h, c.bh, &h64) ||
+                p64 > std::numeric_limits<uint32_t>::max() || h64 > std::numeric_limits<uint32_t>::max() ||
+                !checked_mul_u64(p64, bpe, &row_b) || !checked_mul_u64(row_b, h64, &slice_b)) {
+                c.error = "micro-tiled mip footprint overflow";
+                return c;
+            }
+            c.pitch[i] = static_cast<uint32_t>(p64);
+            c.height[i] = static_cast<uint32_t>(h64);
             c.macro_offset[i] = c.offset[i] = chain;
-            c.slice_bytes[i] = c.size_bytes[i] = uint64_t{c.pitch[i]} * c.height[i] * bpe;
-            chain += c.slice_bytes[i];
+            c.slice_bytes[i] = c.size_bytes[i] = slice_b;
+            if (!checked_add_u64(chain, slice_b, &chain)) {
+                c.error = "micro-tiled mip chain overflow";
+                return c;
+            }
         }
     } else if (c.mips == 1u) {
-        c.pitch[0] = static_cast<uint32_t>(align_pow2(ew, c.bw));
-        c.height[0] = static_cast<uint32_t>(align_pow2(eh, c.bh));
-        c.slice_bytes[0] = uint64_t{c.pitch[0]} * c.height[0] * bpe;
-        chain = c.slice_bytes[0];
-        c.size_bytes[0] = chain * num_slices;
+        uint64_t p64 = 0, h64 = 0, row_b = 0, slice_b = 0, size_b = 0;
+        if (!checked_align_pow2_u64(ew, c.bw, &p64) || !checked_align_pow2_u64(eh, c.bh, &h64) ||
+            p64 > std::numeric_limits<uint32_t>::max() || h64 > std::numeric_limits<uint32_t>::max() ||
+            !checked_mul_u64(p64, bpe, &row_b) || !checked_mul_u64(row_b, h64, &slice_b) ||
+            !checked_mul_u64(slice_b, num_slices, &size_b)) {
+            c.error = "tiled single-mip footprint overflow";
+            return c;
+        }
+        c.pitch[0] = static_cast<uint32_t>(p64);
+        c.height[0] = static_cast<uint32_t>(h64);
+        c.slice_bytes[0] = slice_b;
+        chain = slice_b;
+        c.size_bytes[0] = size_b;
     } else {
         // Mip tail: the largest region that a mip may occupy in the tail block (addrlib
         // Lib::GetMipTailDim), and how many mips fit (Gfx10Lib::GetMaxNumMipsInTail).
@@ -893,17 +995,27 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
             const uint32_t h = shift_ceil(eh, i);
             if (w <= tw && h <= th && c.mips - i <= max_mips_in_tail) {
                 first_tail = i;
-                chain += block_bytes / c.bd;
+                if (!checked_add_u64(chain, block_bytes / c.bd, &chain)) {
+                    c.error = "tiled mip chain overflow";
+                    return c;
+                }
                 break;
             }
-            c.pitch[i] = static_cast<uint32_t>(align_pow2(w, c.bw));
-            c.height[i] = static_cast<uint32_t>(align_pow2(h, c.bh));
-            const uint64_t slice = uint64_t{c.pitch[i]} * c.height[i] * bpe;
+            uint64_t p64 = 0, h64 = 0, row_b = 0, slice = 0, pad_d = 0, size_b = 0, mss = 0;
             const uint32_t d = thick ? shift_ceil(depth, i) : 1u;
+            if (!checked_align_pow2_u64(w, c.bw, &p64) || !checked_align_pow2_u64(h, c.bh, &h64) ||
+                p64 > std::numeric_limits<uint32_t>::max() || h64 > std::numeric_limits<uint32_t>::max() ||
+                !checked_mul_u64(p64, bpe, &row_b) || !checked_mul_u64(row_b, h64, &slice) ||
+                !checked_align_pow2_u64(d, c.bd, &pad_d) || !checked_mul_u64(slice, pad_d, &size_b) ||
+                !checked_mul_u64(slice, c.bd, &mss) || !checked_add_u64(chain, slice, &chain)) {
+                c.error = "tiled mip footprint overflow";
+                return c;
+            }
+            c.pitch[i] = static_cast<uint32_t>(p64);
+            c.height[i] = static_cast<uint32_t>(h64);
             c.slice_bytes[i] = slice;
-            c.size_bytes[i] = slice * align_pow2(d, c.bd);
-            mip_slice_size[i] = slice * c.bd;
-            chain += slice;
+            c.size_bytes[i] = size_b;
+            mip_slice_size[i] = mss;
         }
         uint32_t b256d = 0;
         for (uint32_t i = 0; i < 8u && c.shape.eq != nullptr; ++i) {
@@ -914,17 +1026,31 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
         uint64_t offset = 0;
         if (first_tail != c.mips) {
             const uint32_t tail_depth = thick ? shift_ceil(depth, first_tail) : 1u;
-            offset = block_bytes * align_pow2(tail_depth, c.bd) / c.bd;
+            uint64_t pad_tail_d = 0;
+            if (!checked_align_pow2_u64(tail_depth, c.bd, &pad_tail_d) ||
+                !checked_mul_u64(block_bytes / c.bd, pad_tail_d, &offset)) {
+                c.error = "mip tail offset overflow";
+                return c;
+            }
             macro = block_bytes;
             if (thick) {
-                tail_depth_blocks = static_cast<uint32_t>(align_pow2(tail_depth, 1u << b256d) >> b256d);
+                uint64_t pad_256d = 0;
+                if (!checked_align_pow2_u64(tail_depth, uint64_t{1} << b256d, &pad_256d) ||
+                    (pad_256d >> b256d) > std::numeric_limits<uint32_t>::max()) {
+                    c.error = "3D mip tail depth overflow";
+                    return c;
+                }
+                tail_depth_blocks = static_cast<uint32_t>(pad_256d >> b256d);
             }
         }
         for (int32_t i = static_cast<int32_t>(first_tail) - 1; i >= 0; --i) {
             c.macro_offset[i] = macro;
             c.offset[i] = offset;
-            macro += mip_slice_size[i];
-            offset += c.size_bytes[i];
+            if (!checked_add_u64(macro, mip_slice_size[i], &macro) ||
+                !checked_add_u64(offset, c.size_bytes[i], &offset)) {
+                c.error = "tiled mip offset overflow";
+                return c;
+            }
         }
         // Tail mips: placed by coordinate inside the block (Gfx10Lib::ComputeSurfaceInfoMacroTiled).
         uint32_t b256w = 0, b256h = 0;
@@ -967,8 +1093,16 @@ ChainLayout build_chain(const TextureLayoutDesc& desc) noexcept {
             c.size_bytes[i] = c.slice_bytes[i] * (thick ? (uint64_t{tail_depth_blocks} << b256d) : 1u);
         }
     }
-    c.slice_stride = thick ? chain * c.bd : chain;
-    c.total_bytes = chain * num_slices;
+    uint64_t stride = 0;
+    uint64_t total = 0;
+    if (!checked_mul_u64(chain, thick ? c.bd : 1u, &stride) ||
+        !checked_mul_u64(chain, num_slices, &total) ||
+        total > std::numeric_limits<size_t>::max()) {
+        c.error = "tiled surface size overflow";
+        return c;
+    }
+    c.slice_stride = stride;
+    c.total_bytes = total;
     c.ok = true;
     return c;
 }
@@ -988,7 +1122,7 @@ uint64_t chain_address(const ChainLayout& c, uint32_t mip, uint32_t x, uint32_t 
         intra = deposit_bits((tx & (c.bw - 1u)) << c.bpp_log2, s.x_mask) | deposit_bits(ty & (c.bh - 1u), s.y_mask);
     }
     if (s.xor_mode) {
-        intra = apply_gfx10_xor_64k(intra);
+        intra = apply_gfx10_xor_64k(intra, c.pipe_bank_xor);
     }
     const uint64_t slice = s.thick_3d ? z / c.bd : z;
     const uint64_t blk_index = c.in_tail[mip] ? 0u : uint64_t{y / c.bh} * (c.pitch[mip] / c.bw) + x / c.bw;
@@ -1010,9 +1144,19 @@ MipPlacement mip_placement(const TextureLayoutDesc& desc, uint32_t mip) noexcept
             p.error = "linear mip chains are not modelled (mip 0 only)";
             return p;
         }
-        p.surface_bytes = uint64_t{tiled_footprint_bytes(desc, 0u)} * std::max(desc.array_size, 1u);
-        p.ok = p.surface_bytes != 0u;
-        p.error = p.ok ? nullptr : "unsupported linear subresource";
+        if (desc.depth > 1u && desc.array_size > 1u) {
+            p.error = "3D textures have no array slices";
+            return p;
+        }
+        const uint64_t fp = tiled_footprint_bytes(desc, 0u);
+        uint64_t total = 0;
+        if (fp == 0u || !checked_mul_u64(fp, std::max(desc.array_size, 1u), &total) ||
+            total > std::numeric_limits<size_t>::max()) {
+            p.error = "unsupported linear subresource";
+            return p;
+        }
+        p.surface_bytes = total;
+        p.ok = true;
         return p;
     }
     const ChainLayout c = build_chain(desc);
@@ -1075,13 +1219,17 @@ uint64_t surface_element_offset(const TextureLayoutDesc& desc, uint32_t mip, uin
     const uint32_t mip_w = std::max(1u, desc.width >> std::min(mip, 31u));
     const uint32_t mip_h = std::max(1u, desc.height >> std::min(mip, 31u));
     const uint32_t mip_d = std::max(1u, desc.depth >> std::min(mip, 31u));
-    const uint32_t bx = (mip_w + c.fmt.block_width - 1u) / c.fmt.block_width;
-    const uint32_t by = (mip_h + c.fmt.block_height - 1u) / c.fmt.block_height;
+    const uint64_t bx = (uint64_t{mip_w} + c.fmt.block_width - 1u) / c.fmt.block_width;
+    const uint64_t by = (uint64_t{mip_h} + c.fmt.block_height - 1u) / c.fmt.block_height;
     const uint32_t nz = desc.depth > 1u ? mip_d : std::max(desc.array_size, 1u);
     if (x >= bx || y >= by || z >= nz) {
         return UINT64_MAX;
     }
-    return chain_address(c, mip, x, y, z);
+    const uint64_t addr = chain_address(c, mip, x, y, z);
+    if (addr > c.total_bytes || c.fmt.bytes_per_block > c.total_bytes - addr) {
+        return UINT64_MAX;
+    }
+    return addr;
 }
 
 size_t surface_bytes(const TextureLayoutDesc& desc) noexcept {
@@ -1136,16 +1284,29 @@ const char* prepare_surface_mip(const TextureLayoutDesc& desc, uint32_t mip, uin
         z0 = array_slice;
         nz = 1;
     }
-    const uint32_t bx = (mip_w + out->c.fmt.block_width - 1u) / out->c.fmt.block_width;
-    const uint32_t by = (mip_h + out->c.fmt.block_height - 1u) / out->c.fmt.block_height;
+    const uint64_t bx64 = (uint64_t{mip_w} + out->c.fmt.block_width - 1u) / out->c.fmt.block_width;
+    const uint64_t by64 = (uint64_t{mip_h} + out->c.fmt.block_height - 1u) / out->c.fmt.block_height;
     const uint32_t bpe = out->c.fmt.bytes_per_block;
+    uint64_t row_pitch64 = 0;
+    uint64_t slice_linear64 = 0;
+    uint64_t linear_size64 = 0;
+    if (bx64 == 0u || by64 == 0u || bx64 > std::numeric_limits<uint32_t>::max() ||
+        by64 > std::numeric_limits<uint32_t>::max() ||
+        !checked_mul_u64(bx64, bpe, &row_pitch64) || row_pitch64 > std::numeric_limits<uint32_t>::max() ||
+        !checked_mul_u64(row_pitch64, by64, &slice_linear64) ||
+        !checked_mul_u64(slice_linear64, nz, &linear_size64) ||
+        linear_size64 > std::numeric_limits<size_t>::max()) {
+        return "linear output size overflow";
+    }
+    const uint32_t bx = static_cast<uint32_t>(bx64);
+    const uint32_t by = static_cast<uint32_t>(by64);
     out->z0 = z0;
     out->nz = nz;
     out->bx = bx;
     out->by = by;
     out->bpe = bpe;
-    out->row_pitch = bx * bpe;
-    out->linear_size = size_t{out->row_pitch} * by * nz;
+    out->row_pitch = static_cast<uint32_t>(row_pitch64);
+    out->linear_size = static_cast<size_t>(linear_size64);
 
     if (out->c.linear && by > 0u && out->row_pitch > 0u) {
         const uint64_t src_row_pitch = uint64_t{out->c.pitch[mip]} * bpe;
@@ -1224,7 +1385,7 @@ const char* walk_surface_mip(const PreparedSurfaceMip& p, uint32_t mip, size_t s
             for (uint32_t x = 0; x < p.bx; ++x) {
                 uint32_t intra = col_intra[x] | row_intra;
                 if (s.xor_mode) {
-                    intra = apply_gfx10_xor_64k(intra);
+                    intra = apply_gfx10_xor_64k(intra, c.pipe_bank_xor);
                 }
                 const uint64_t addr = row + col_block[x] + intra;
                 if (addr > surface_size || p.bpe > surface_size - addr) {
@@ -1284,13 +1445,14 @@ DetileResult detile_linear(const TextureLayoutDesc& desc, uint32_t mip, uint32_t
     const uint32_t count = all ? layers : 1u;
     std::vector<uint8_t> one;
     for (uint32_t s = first; s < first + count; ++s) {
-        const size_t off = stride * s;
-        if (surface == nullptr || off > surface_size) {
+        uint64_t off64 = 0;
+        if (!checked_mul_u64(stride, s, &off64) || surface == nullptr || off64 > surface_size) {
             linear_out.clear();
             res = DetileResult{};
             res.error = "source buffer truncated for surface footprint";
             return res;
         }
+        const size_t off = static_cast<size_t>(off64);
         res = detile_subresource(desc, 0u, surface + off, surface_size - off, one);
         if (!res.ok) {
             linear_out.clear();
@@ -1298,8 +1460,16 @@ DetileResult detile_linear(const TextureLayoutDesc& desc, uint32_t mip, uint32_t
         }
         linear_out.insert(linear_out.end(), one.begin(), one.end());
     }
+    uint64_t consumed64 = 0;
+    if (!checked_mul_u64(stride, uint64_t{first} + count, &consumed64) ||
+        consumed64 > std::numeric_limits<size_t>::max()) {
+        linear_out.clear();
+        res = DetileResult{};
+        res.error = "linear source footprint overflow";
+        return res;
+    }
     res.slices = count;
-    res.tiled_bytes_consumed = stride * (first + count);
+    res.tiled_bytes_consumed = static_cast<size_t>(consumed64);
     return res;
 }
 

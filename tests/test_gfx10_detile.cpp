@@ -1020,6 +1020,192 @@ void test_planes_and_suggest() {
     }
 }
 
+// G82 (#1747): Comprehensive cubemap, 2D-array, 3D volume, HDR, BC1-BC7, 64KB_R_X / _X pipe-bank
+// XOR, mip-tail, and Wasm64 overflow/truncation tests.
+void test_cubemaps_and_arrays_all_modes() {
+    // Cubemap (6 slices) and cubemap array (12 slices) across 4KB_S, 64KB_S, 64KB_D, 64KB_R_X, 64KB_S_X.
+    const uint32_t layouts[] = {0x105u, 0x109u, 0x10Au, 0x11Bu, 0x119u, 0x11Au};
+    uint32_t seed = 21000u;
+    for (uint32_t layout : layouts) {
+        // 6-face cubemap with full mip chain (including mip tail): BC7 (16B) and R11G11B10_FLOAT (4B).
+        verify_subresource_round_trip({98u, 128u, 128u, 1u, 8u, layout, 0u}, 6u, seed);
+        verify_element_offsets({98u, 64u, 64u, 1u, 7u, layout, 0u}, 6u, seed + 10u);
+        verify_subresource_round_trip({26u, 64u, 64u, 1u, 7u, layout, 0u}, 6u, seed + 20u);
+        // 2-cubemap array (12 slices), RGBA16F (8B), full chain into mip tail.
+        verify_subresource_round_trip({10u, 32u, 32u, 1u, 6u, layout, 0u}, 12u, seed + 30u);
+        // Verify slice stride == single-slice chain size and tile_map slice_tiles * 6 == total_tiles.
+        TextureLayoutDesc cube{98u, 128u, 128u, 1u, 8u, layout, 0u, 6u};
+        TextureLayoutDesc face{98u, 128u, 128u, 1u, 8u, layout, 0u, 1u};
+        CHECK(surface_bytes(cube) == surface_bytes(face) * 6u);
+        const TileMap tm = tile_map(cube);
+        CHECK(tm.ok && tm.slice_tiles * 6u == tm.total_tiles);
+        seed += 100u;
+    }
+}
+
+void test_3d_volumes_and_mip_tails() {
+    // Thick 3D volumes (4KB_S, 64KB_S, 64KB_S_X) + 2D-sliced 3D (64KB_D, 64KB_R_X) across HDR & BC.
+    const uint32_t thick_layouts[] = {0x105u, 0x109u, 0x119u};
+    uint32_t seed = 23000u;
+    for (uint32_t layout : thick_layouts) {
+        // Depth-shrinking mip chains spanning standard mips + mip tail across 1B/2B/4B/8B/16B:
+        verify_surface_round_trip({61u, 32u, 32u, 32u, 6u, layout, 0u}, seed + 1u);       // R8_UNORM (1B)
+        verify_surface_round_trip({54u, 16u, 16u, 16u, 5u, layout, 0u}, seed + 2u);       // R16_FLOAT (2B)
+        verify_surface_round_trip({26u, 32u, 32u, 32u, 6u, layout, 0u}, seed + 3u);       // R11G11B10_FLOAT (4B)
+        verify_surface_round_trip({10u, 16u, 16u, 16u, 5u, layout, 0u}, seed + 4u);       // R16G16B16A16_FLOAT (8B)
+        verify_surface_round_trip({2u, 16u, 16u, 16u, 5u, layout, 0u}, seed + 5u);        // R32G32B32A32_FLOAT (16B)
+        // Deep/skinny 3D volume (depth > width, height) and NPOT volume:
+        verify_surface_round_trip({28u, 8u, 8u, 32u, 6u, layout, 0u}, seed + 6u);
+        verify_surface_round_trip({24u, 13u, 11u, 9u, 4u, layout, 0u}, seed + 7u);        // R10G10B10A2_UNORM NPOT
+        // BC7 3D compressed volume (4x4 blocks, 16B) with mip chain:
+        verify_surface_round_trip({98u, 16u, 16u, 16u, 5u, layout, 0u}, seed + 8u);
+        // Element offset agreement across every mip & depth slice:
+        verify_element_offsets({26u, 16u, 16u, 16u, 5u, layout, 0u}, 1u, seed + 9u);
+        verify_element_offsets({10u, 16u, 16u, 8u, 4u, layout, 0u}, 1u, seed + 10u);
+        seed += 100u;
+    }
+
+    // 2D-sliced 3D volumes (64KB_D, 64KB_R_X, 64KB_D_X):
+    for (uint32_t layout : {0x10Au, 0x11Au, 0x11Bu}) {
+        verify_surface_round_trip({26u, 32u, 32u, 8u, 5u, layout, 0u}, seed + 1u);
+        verify_surface_round_trip({10u, 16u, 16u, 6u, 4u, layout, 0u}, seed + 2u);
+        verify_element_offsets({26u, 16u, 16u, 4u, 4u, layout, 0u}, 1u, seed + 3u);
+        seed += 50u;
+    }
+}
+
+void test_bc1_to_bc7_and_hdr_formats_full_chains() {
+    // Complete BC1-BC7 + HDR format matrix with full mip chains across 4KB_S, 64KB_S, 64KB_D, 64KB_R_X.
+    const uint32_t formats[] = {
+        // BC1-BC7 (typeless, unorm/snorm/uf16/sf16, sRGB)
+        70u, 71u, 72u,  // BC1
+        73u, 74u, 75u,  // BC2
+        76u, 77u, 78u,  // BC3
+        79u, 80u, 81u,  // BC4
+        82u, 83u, 84u,  // BC5
+        94u, 95u, 96u,  // BC6H
+        97u, 98u, 99u,  // BC7
+        // HDR uncompressed + 16-bit/32-bit siblings
+        26u,            // R11G11B10_FLOAT
+        23u, 24u, 25u,  // R10G10B10A2_TYPELESS / UNORM / UINT
+        67u,            // R9G9B9E5_SHAREDEXP
+        53u, 54u,       // R16_TYPELESS / R16_FLOAT
+        33u, 34u,       // R16G16_TYPELESS / R16G16_FLOAT
+        9u,  10u,       // R16G16B16A16_TYPELESS / R16G16B16A16_FLOAT
+        39u, 41u,       // R32_TYPELESS / R32_FLOAT
+        15u, 16u,       // R32G32_TYPELESS / R32G32_FLOAT
+        1u,  2u,        // R32G32B32A32_TYPELESS / R32G32B32A32_FLOAT
+        85u, 86u, 115u, // B5G6R5 / B5G5R5A1 / B4G4R4A4 (2B)
+        116u, 117u,     // Xbox R10G10B10_7E3_A2_FLOAT / R10G10B10_6E4_A2_FLOAT (4B)
+    };
+    const uint32_t layouts[] = {0x105u, 0x109u, 0x10Au, 0x11Bu};
+    uint32_t seed = 25000u;
+    for (uint32_t fmt : formats) {
+        CHECK(format_geometry(fmt).supported);
+        const uint32_t layout = layouts[(seed++) % 4u];
+        verify_surface_round_trip({fmt, 64u, 64u, 1u, 7u, layout, 0u}, seed);
+    }
+}
+
+void test_pipe_bank_xor_modes() {
+    // Bijectivity of tiled_byte_offset_2d_xor for _X modes across non-zero pipe_bank_xor seeds.
+    const SwizzleMode xor_modes[] = {
+        SwizzleMode::Sw64KBSX, SwizzleMode::Sw64KBDX, SwizzleMode::Sw64KBRX,
+        SwizzleMode::SwVarSX,  SwizzleMode::SwVarDX,  SwizzleMode::SwVarRX,
+    };
+    const uint32_t bpps[5] = {1u, 2u, 4u, 8u, 16u};
+    const uint32_t w64k[5] = {256u, 256u, 128u, 128u, 64u};
+    const uint32_t h64k[5] = {256u, 128u, 128u, 64u, 64u};
+    for (SwizzleMode m : xor_modes) {
+        for (uint32_t pbx : {0u, 0x05u, 0x3Cu, 0xA7u, 0xFFu}) {
+            for (uint32_t bi = 0; bi < 5u; ++bi) {
+                const uint32_t bpp = bpps[bi];
+                const uint32_t tw = w64k[bi];
+                const uint32_t th = h64k[bi];
+                std::vector<uint8_t> seen(size_t{tw} * th, 0u);
+                for (uint32_t y = 0; y < th; ++y) {
+                    for (uint32_t x = 0; x < tw; ++x) {
+                        const size_t off = tiled_byte_offset_2d_xor(m, x, y, bpp, tw, pbx);
+                        CHECK(off < 65536u);
+                        CHECK((off % bpp) == 0u);
+                        const size_t slot = off / bpp;
+                        CHECK(seen[slot] == 0u);
+                        seen[slot] = 1u;
+                    }
+                }
+                // Non-zero pbx must differ from pbx == 0 at origin (0, 0).
+                const size_t off0 = tiled_byte_offset_2d_xor(m, 0u, 0u, bpp, tw, 0u);
+                const size_t offx = tiled_byte_offset_2d_xor(m, 0u, 0u, bpp, tw, pbx);
+                if (pbx != 0u) {
+                    CHECK(offx != off0);
+                    CHECK((offx & 0xFFu) == (off0 & 0xFFu));  // 256B pipe interleave untouched
+                }
+            }
+        }
+    }
+
+    // Non-XOR verified modes ignore pipe_bank_xor completely.
+    CHECK(tiled_byte_offset_2d_xor(SwizzleMode::Sw64KBS, 5u, 7u, 4u, 128u, 0x5Au) ==
+          tiled_byte_offset_2d(SwizzleMode::Sw64KBS, 5u, 7u, 4u, 128u));
+    CHECK(tiled_byte_offset_2d_xor(SwizzleMode::Sw64KBD, 5u, 7u, 16u, 64u, 0xA5u) ==
+          tiled_byte_offset_2d(SwizzleMode::Sw64KBD, 5u, 7u, 16u, 64u));
+
+    // Full surface & subresource round-trips + element offset checks with non-zero pipe_bank_xor.
+    for (uint32_t layout : {0x119u, 0x11Au, 0x11Bu}) {
+        TextureLayoutDesc desc{98u, 128u, 128u, 1u, 8u, layout, 0u, 6u, 0x6Du};
+        verify_subresource_round_trip(desc, 6u, 27000u + layout);
+        verify_element_offsets(desc, 6u, 27100u + layout);
+        // Changing pipe_bank_xor changes the tiled surface bytes for the same linear input.
+        TextureLayoutDesc desc0 = desc;
+        desc0.pipe_bank_xor = 0u;
+        const std::vector<uint8_t> lin = make_synthetic_linear(32u * 32u * 16u, 27200u);
+        std::vector<uint8_t> surf0(surface_bytes(desc0), 0u);
+        std::vector<uint8_t> surfx(surface_bytes(desc), 0u);
+        CHECK(tile_surface_subresource(desc0, 0u, 0u, lin.data(), lin.size(), surf0.data(), surf0.size()));
+        CHECK(tile_surface_subresource(desc, 0u, 0u, lin.data(), lin.size(), surfx.data(), surfx.size()));
+        CHECK(surf0 != surfx);
+    }
+    // 3D thick 64KB_S_X with non-zero pipe_bank_xor.
+    TextureLayoutDesc vol_x{10u, 16u, 16u, 16u, 5u, 0x119u, 0u, 1u, 0x3Bu};
+    verify_surface_round_trip(vol_x, 27300u);
+    verify_element_offsets(vol_x, 1u, 27350u);
+}
+
+void test_overflow_and_truncation_guards() {
+    // Huge dimensions near UINT32_MAX must fail cleanly without uint32/uint64 overflow.
+    const TextureLayoutDesc huge_bc{98u, 0xFFFFFFFDu, 0xFFFFFFFDu, 1u, 1u, 0x10Au, 0u, 1u};
+    CHECK(surface_bytes(huge_bc) == 0u);
+    CHECK(!mip_placement(huge_bc, 0u).ok);
+    CHECK(!tile_map(huge_bc).ok);
+    CHECK(surface_element_offset(huge_bc, 0u, 0u, 0u, 0u) == UINT64_MAX);
+
+    const TextureLayoutDesc huge_lin{2u, 0xFFFFFFF0u, 0xFFFFFFF0u, 1u, 1u, 0x100u, 0u, 1u};
+    CHECK(surface_bytes(huge_lin) == 0u);
+    CHECK(!mip_placement(huge_lin, 0u).ok);
+
+    const TextureLayoutDesc huge_arr{2u, 65536u, 65536u, 1u, 1u, 0x109u, 0u, 0xFFFFFFFFu};
+    CHECK(surface_bytes(huge_arr) == 0u);
+    CHECK(!mip_placement(huge_arr, 0u).ok);
+
+    const TextureLayoutDesc huge_3d{2u, 65536u, 65536u, 0xFFFFFFFFu, 1u, 0x109u, 0u, 1u};
+    CHECK(surface_bytes(huge_3d) == 0u);
+    CHECK(!mip_placement(huge_3d, 0u).ok);
+
+    // 3D + array_size > 1 rejected on both tiled and linear layouts.
+    CHECK(!mip_placement({28u, 16u, 16u, 4u, 1u, 0u, 0u, 2u}, 0u).ok);
+    CHECK(!mip_placement({28u, 16u, 16u, 4u, 1u, 0x109u, 0u, 2u}, 0u).ok);
+
+    // Truncated mip-tail surface rejected without leaving stale output.
+    const TextureLayoutDesc tail{98u, 64u, 64u, 1u, 7u, 0x11Bu, 0u, 6u, 0x1Fu};
+    const size_t need = surface_bytes(tail);
+    CHECK(need > 0u);
+    std::vector<uint8_t> short_buf(need - 1u, 0xAAu);
+    std::vector<uint8_t> out = {1u, 2u, 3u};
+    const DetileResult r = detile_surface_subresource(tail, 6u, 5u, short_buf.data(), short_buf.size(), out);
+    CHECK(!r.ok && r.error != nullptr && out.empty());
+    CHECK(!tile_surface_subresource(tail, 6u, 5u, short_buf.data(), short_buf.size(), short_buf.data(), short_buf.size()));
+}
+
 int main() {
     test_planes_and_suggest();
     test_decode_d3d12_layout();
@@ -1041,6 +1227,11 @@ int main() {
     test_linear_subresources();
     test_linear_custom_pitch();
     test_bounds_and_error_rejection();
+    test_cubemaps_and_arrays_all_modes();
+    test_3d_volumes_and_mip_tails();
+    test_bc1_to_bc7_and_hdr_formats_full_chains();
+    test_pipe_bank_xor_modes();
+    test_overflow_and_truncation_guards();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_gfx10_detile: %d failure(s)\n", g_failures);

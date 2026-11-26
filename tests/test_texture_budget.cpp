@@ -1,5 +1,7 @@
 #include <cstdint>
 #include <cstdio>
+#include <thread>
+#include <vector>
 
 #include "gpu/texture_budget.h"
 
@@ -101,6 +103,177 @@ void test_host_realloc() {
     t.reset();
     CHECK(t.stats().host_reallocs == 0 && t.stats().host_bytes_saved == 0);
 }
+
+void test_3d_and_array_chain_bytes() {
+    // 2D cubemap (6 constant array layers) vs 3D volume (depth halves per mip):
+    const uint64_t face = texture_chain_bytes(256, 256, 1, 9, 4, 4, 16, 0, 1);
+    const uint64_t cube = texture_chain_bytes(256, 256, 1, 9, 4, 4, 16, 0, 6);
+    CHECK(cube == face * 6u);
+    const uint64_t vol = texture_chain_bytes(32, 32, 32, 6, 1, 1, 4, 0, 1);
+    const uint64_t expected_vol = (32u * 32u * 32u + 16u * 16u * 16u + 8u * 8u * 8u +
+                                   4u * 4u * 4u + 2u * 2u * 2u + 1u) * 4u;
+    CHECK(vol == expected_vol);
+    CHECK(texture_chain_bytes(32, 32, 1, 4, 1, 1, 4, 0, 0) == 0u);
+    CHECK(cap_floor_for_3d(128, 128, 512, 10, 256) == 1u);  // depth decides
+    CHECK(cap_floor_for_3d(128, 128, 128, 8, 256) == 0u);
+}
+
+void test_pressure_tiers_and_reclaim_targets() {
+    constexpr uint64_t b = 1000;
+    CHECK(pressure_tier_for(0, 0) == BudgetPressureTier::Normal);
+    CHECK(pressure_tier_for(699, b) == BudgetPressureTier::Normal);
+    CHECK(pressure_tier_for(700, b) == BudgetPressureTier::Medium);
+    CHECK(pressure_tier_for(799, b) == BudgetPressureTier::Medium);
+    CHECK(pressure_tier_for(800, b) == BudgetPressureTier::Reclaim);
+    CHECK(pressure_tier_for(849, b) == BudgetPressureTier::Reclaim);
+    CHECK(pressure_tier_for(850, b) == BudgetPressureTier::High);
+    CHECK(pressure_tier_for(919, b) == BudgetPressureTier::High);
+    CHECK(pressure_tier_for(920, b) == BudgetPressureTier::Critical);
+
+    // Reclaim target with hysteresis:
+    CHECK(reclaim_target_bytes(790, b, /*reclaim_active=*/false) == 0u);
+    CHECK(reclaim_target_bytes(800, b, /*reclaim_active=*/false) == 120u);  // 800 - 680
+    // While reclaim_active is latched, usage between 68% and 80% still reclaims down to 68%.
+    CHECK(reclaim_target_bytes(750, b, /*reclaim_active=*/true) == 70u);    // 750 - 680
+    CHECK(reclaim_target_bytes(680, b, /*reclaim_active=*/true) == 0u);
+    CHECK(reclaim_target_bytes(600, b, /*reclaim_active=*/true) == 0u);
+    // Incoming allocation lookahead triggers reclamation before exceeding 80%.
+    CHECK(reclaim_target_bytes(750, b, /*reclaim_active=*/false, /*incoming=*/60) == 130u);  // 810 - 680
+    CHECK(reclaim_target_bytes(UINT64_MAX - 10, UINT64_MAX, false, 100) > 0u);
+}
+
+void test_lru_ordering_pinning_and_age_protection() {
+    TextureBudget t;
+    t.set_budget_bytes(1000);
+
+    // Register 4 textures at frame 1 (ids 1..4, 200B each = 800B -> 80% Reclaim tier).
+    // Pin id 1 (back buffer), mark id 2 non-evictable, leave ids 3 and 4 evictable.
+    t.register_texture(1, 200, /*frame=*/1, /*pinned=*/true, /*evictable=*/true);
+    t.register_texture(2, 200, /*frame=*/1, /*pinned=*/false, /*evictable=*/false);
+    t.register_texture(3, 200, /*frame=*/1, /*pinned=*/false, /*evictable=*/true);
+    t.register_texture(4, 200, /*frame=*/1, /*pinned=*/false, /*evictable=*/true);
+    t.note_created(800);
+
+    TextureBudgetStats s = t.stats();
+    CHECK(s.lru_tracked_textures == 4u && s.lru_tracked_bytes == 800u && s.lru_pinned_textures == 1u);
+    CHECK(s.pressure_tier == static_cast<uint8_t>(BudgetPressureTier::Reclaim));
+
+    // Touch id 3 at frame 2 so LRU order of evictable entries is [4 (older), 3 (newer)].
+    t.touch_texture(3, /*frame=*/2);
+
+    // At frame 2 with default min_age_frames = 2: id 4 has age 1 (< 2) and id 3 has age 0 -> both protected!
+    auto cands_f2 = t.select_eviction_candidates(/*current_frame=*/2);
+    CHECK(cands_f2.empty());
+    CHECK(t.is_reclaim_active());
+
+    // At frame 3 with min_age_frames = 2: id 4 has age 2 (eligible!), id 3 has age 1 (protected),
+    // id 1 pinned, id 2 non-evictable -> only id 4 selected!
+    auto cands_f3 = t.select_eviction_candidates(/*current_frame=*/3);
+    CHECK(cands_f3.size() == 1u && cands_f3[0].resource_id == 4u && cands_f3[0].bytes == 200u);
+
+    // Push into Critical tier (>= 92%): id 3 (age 1, NOT current frame 3) becomes eligible in Critical,
+    // while a current-frame texture (id 5 at frame 3) and pinned id 1 remain protected!
+    t.register_texture(5, 150, /*frame=*/3, /*pinned=*/false, /*evictable=*/true);
+    t.note_created(150);  // 950 / 1000 = 95% Critical
+    CHECK(t.current_pressure_tier() == BudgetPressureTier::Critical);
+    auto cands_crit = t.select_eviction_candidates(/*current_frame=*/3, /*target_bytes=*/0, 64, 2);
+    // Target is 950 - 680 = 270 -> selects id 4 (200B) + id 3 (200B) = 400B >= 270B, never id 1, 2, or 5!
+    CHECK(cands_crit.size() == 2u);
+    CHECK(cands_crit[0].resource_id == 4u);
+    CHECK(cands_crit[1].resource_id == 3u);
+
+    // Complete evictions and verify hysteresis clears once usage drops below 680B.
+    t.note_destroyed(200);
+    t.note_lru_evicted(4, 200);
+    CHECK(t.is_reclaim_active());  // 750 > 680 -> hysteresis stays latched!
+    CHECK(t.bytes_to_reclaim() == 70u);
+
+    t.note_destroyed(200);
+    t.note_lru_evicted(3, 200);
+    CHECK(!t.is_reclaim_active());  // 550 <= 680 -> hysteresis cleared!
+    CHECK(t.bytes_to_reclaim() == 0u);
+
+    s = t.stats();
+    CHECK(s.lru_tracked_textures == 3u && s.lru_tracked_bytes == 550u);
+    CHECK(s.lru_evictions == 2u && s.lru_bytes_reclaimed == 400u);
+
+    // Dynamic pin / unpin and byte size update.
+    t.set_texture_pinned(5, true);
+    CHECK(t.stats().lru_pinned_textures == 2u);
+    t.update_texture_bytes(5, 100);
+    CHECK(t.stats().lru_tracked_bytes == 500u);
+    t.set_texture_pinned(5, false);
+    CHECK(t.stats().lru_pinned_textures == 1u);
+    t.unregister_texture(5);
+    CHECK(t.stats().lru_tracked_textures == 2u && t.stats().lru_tracked_bytes == 400u);
+
+    t.reset();
+    s = t.stats();
+    CHECK(s.lru_tracked_textures == 0u && s.lru_tracked_bytes == 0u && s.lru_evictions == 0u &&
+          s.lru_bytes_reclaimed == 0u && s.lru_pinned_textures == 0u && !s.reclaim_active);
+}
+
+void test_streaming_gigabytes_hysteresis_and_concurrency() {
+    // Simulate streaming 4 GiB of 3D open-world textures within a 512 MiB Chrome VRAM budget
+    // across 120 frames, verifying usage stays bounded without thrashing active-frame textures.
+    TextureBudget t;
+    constexpr uint64_t kBudget = 512ull << 20;
+    constexpr uint64_t kTexSize = 16ull << 20;  // 16 MiB per streamed 3D/BC7 texture
+    t.set_budget_bytes(kBudget);
+    // Keep 2 pinned render targets (32 MiB).
+    t.register_texture(1, 16ull << 20, 0, /*pinned=*/true, /*evictable=*/false);
+    t.register_texture(2, 16ull << 20, 0, /*pinned=*/true, /*evictable=*/false);
+    t.note_created(32ull << 20);
+
+    uint32_t next_id = 100;
+    for (uint64_t frame = 1; frame <= 120; ++frame) {
+        // Stream 2 new 16 MiB textures per frame (3.84 GiB total streamed).
+        for (int k = 0; k < 2; ++k) {
+            const uint64_t goal = t.bytes_to_reclaim(kTexSize);
+            if (goal > 0) {
+                for (const auto& c : t.select_eviction_candidates(frame, goal)) {
+                    t.note_destroyed(c.bytes);
+                    t.note_lru_evicted(c.resource_id, c.bytes);
+                }
+            }
+            const uint32_t id = next_id++;
+            t.register_texture(id, kTexSize, frame, /*pinned=*/false, /*evictable=*/true);
+            t.note_created(kTexSize);
+        }
+        // Usage must stay well below the 512 MiB hard ceiling.
+        CHECK(t.stats().used_bytes <= kBudget);
+    }
+    const TextureBudgetStats st = t.stats();
+    CHECK(st.lru_evictions >= 200u);
+    CHECK(st.lru_bytes_reclaimed >= (3ull << 30));
+    CHECK(st.lru_pinned_textures == 2u);
+
+    // Multi-threaded stress test: concurrent register, touch, select, unregister, stats.
+    t.reset();
+    t.set_budget_bytes(64ull << 20);
+    std::vector<std::thread> workers;
+    for (uint32_t w = 0; w < 4; ++w) {
+        workers.emplace_back([&, w] {
+            const uint32_t base = 10000u + w * 200u;
+            for (uint32_t i = 0; i < 100u; ++i) {
+                t.register_texture(base + i, 64u << 10, i, (i % 16u) == 0u, true);
+                t.touch_texture(base + (i / 2u), i + 1u);
+                if ((i % 10u) == 0u) {
+                    (void)t.select_eviction_candidates(i + 5u, 128u << 10, 8u, 2u);
+                    (void)t.stats();
+                }
+            }
+            for (uint32_t i = 0; i < 100u; ++i) {
+                t.unregister_texture(base + i);
+            }
+        });
+    }
+    for (auto& th : workers) {
+        th.join();
+    }
+    CHECK(t.stats().lru_tracked_textures == 0u && t.stats().lru_tracked_bytes == 0u &&
+          t.stats().lru_pinned_textures == 0u);
+}
 }  // namespace
 
 int main() {
@@ -109,6 +282,10 @@ int main() {
     test_pressure_tiers();
     test_tracker();
     test_host_realloc();
+    test_3d_and_array_chain_bytes();
+    test_pressure_tiers_and_reclaim_targets();
+    test_lru_ordering_pinning_and_age_protection();
+    test_streaming_gigabytes_hysteresis_and_concurrency();
     if (g_failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", g_failures);
         return 1;

@@ -3,8 +3,11 @@
 // layouts keep the linear estimate.
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 #include "gpu/d3d12_guest_objects.h"
+#include "gpu/d3d12_guest_resources.h"
 #include "gpu/gfx10_detile.h"
 
 namespace {
@@ -135,11 +138,64 @@ void test_small_placement() {
     CHECK(a.alignment == 0x1000u && a.size == ((dg::resource_size_estimate(linear) + 0xFFFu) & ~0xFFFull));
 }
 
+// G82 (#1747): 3D volume, cubemap, and HDR mip-chain console layout sizes + incremental
+// dirty-band / dirty-slice hashing & run coalescing.
+void test_3d_cubemap_hdr_sizes_and_dirty_bands() {
+    // 6-face cubemap HDR (R11G11B10_FLOAT = 26, RGBA16F = 10) in 64KB_D and 4KB_S:
+    const gfx10::TextureLayoutDesc hdr_cube{26u, 256u, 256u, 1u, 9u, 0x10Au, 0u, 6u};
+    CHECK(dg::resource_size_estimate(texture(3, 256, 256, 6, 9, 26, 0x10A)) == gfx10::surface_bytes(hdr_cube));
+    const gfx10::TextureLayoutDesc f16_cube{10u, 128u, 128u, 1u, 8u, 0x105u, 0u, 6u};
+    CHECK(dg::resource_size_estimate(texture(3, 128, 128, 6, 8, 10, 0x105)) == gfx10::surface_bytes(f16_cube));
+    // Thick 3D volume mip chain in 64KB_S:
+    const gfx10::TextureLayoutDesc vol64{26u, 64u, 64u, 32u, 7u, 0x109u, 0u, 1u};
+    CHECK(dg::resource_size_estimate(texture(4, 64, 64, 32, 7, 26, 0x109)) == gfx10::surface_bytes(vol64));
+
+    // Incremental 2D dirty-band hashing & coalescing (4 bands of 64 rows, 256B per row).
+    constexpr uint32_t kRows = 256u;
+    constexpr size_t kRowStride = 256u;
+    std::vector<uint8_t> img(kRows * kRowStride, 0u);
+    std::vector<uint64_t> bands0, bands1;
+    // Initial sparse image: only band 1 (rows 64..127) non-zero.
+    std::memset(img.data() + 64u * kRowStride, 0x42, 16u * kRowStride);
+    const uint64_t h0 = dg::hash_dirty_bands(img.data(), kRows, dg::kUploadBandRows, kRowStride, kRowStride, &bands0);
+    CHECK(h0 != 0u && bands0.size() == 4u);
+    std::vector<uint8_t> zmask = {1u, 0u, 1u, 1u};
+    std::vector<dg::DirtyBandRun> runs;
+    const uint32_t init_changed =
+        dg::compute_dirty_band_runs({}, bands0, kRows, dg::kUploadBandRows, &zmask, &runs);
+    CHECK(init_changed == 1u && runs.size() == 1u && runs[0].first == 64u && runs[0].count == 64u);
+
+    // Mutate bands 2 and 3 (adjacent -> coalesced into a single 128-row run); band 0 & 1 unchanged.
+    std::memset(img.data() + 130u * kRowStride, 0x77, kRowStride);
+    std::memset(img.data() + 200u * kRowStride, 0x88, kRowStride);
+    const uint64_t h1 = dg::hash_dirty_bands(img.data(), kRows, dg::kUploadBandRows, kRowStride, kRowStride, &bands1);
+    CHECK(h1 != h0);
+    const uint32_t diff_changed =
+        dg::compute_dirty_band_runs(bands0, bands1, kRows, dg::kUploadBandRows, nullptr, &runs);
+    CHECK(diff_changed == 2u && runs.size() == 1u && runs[0].first == 128u && runs[0].count == 128u);
+
+    // Incremental 3D dirty-slice hashing (8 depth slices, 512B per slice): mutate slices 1, 2 and 6.
+    constexpr uint32_t kSlices = 8u;
+    constexpr size_t kSliceBytes = 512u;
+    std::vector<uint8_t> vol(kSlices * kSliceBytes, 0x11u);
+    std::vector<uint64_t> z0, z1;
+    dg::hash_dirty_bands(vol.data(), kSlices, 1u, kSliceBytes, kSliceBytes, &z0);
+    vol[1u * kSliceBytes] = 0xAAu;
+    vol[2u * kSliceBytes] = 0xBBu;
+    vol[6u * kSliceBytes] = 0xCCu;
+    dg::hash_dirty_bands(vol.data(), kSlices, 1u, kSliceBytes, kSliceBytes, &z1);
+    const uint32_t z_changed = dg::compute_dirty_band_runs(z0, z1, kSlices, 1u, nullptr, &runs);
+    CHECK(z_changed == 3u && runs.size() == 2u);
+    CHECK(runs[0].first == 1u && runs[0].count == 2u);
+    CHECK(runs[1].first == 6u && runs[1].count == 1u);
+}
+
 }  // namespace
 
 int main() {
     test_sizes();
     test_small_placement();
+    test_3d_cubemap_hdr_sizes_and_dirty_bands();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_console_layout_sizes: %d failure(s)\n", g_failures);
         return 1;

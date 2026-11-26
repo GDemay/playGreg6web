@@ -454,6 +454,72 @@ bool all_zero_bytes(const void* data, size_t size) {
     return true;
 }
 
+uint64_t hash_dirty_bands(const uint8_t* data, uint32_t total_units, uint32_t band_units,
+                          size_t unit_stride, size_t unit_bytes, std::vector<uint64_t>* out_bands) {
+    if (out_bands != nullptr) {
+        out_bands->clear();
+    }
+    if (data == nullptr || total_units == 0u || band_units == 0u || unit_bytes == 0u || unit_bytes > unit_stride) {
+        return 0u;
+    }
+    const size_t num_bands = (size_t{total_units} + band_units - 1u) / band_units;
+    std::vector<uint64_t> local_bands;
+    std::vector<uint64_t>& bands = out_bands != nullptr ? *out_bands : local_bands;
+    bands.reserve(num_bands);
+    for (uint32_t u = 0; u < total_units; u += band_units) {
+        const uint32_t n = std::min(band_units, total_units - u);
+        if (unit_bytes == unit_stride) {
+            bands.push_back(content_hash(data + size_t{u} * unit_stride, size_t{n} * unit_stride));
+        } else {
+            uint64_t bh = kContentPrime1 + n;
+            for (uint32_t k = 0; k < n; ++k) {
+                const uint64_t rh = content_hash(data + size_t{u + k} * unit_stride, unit_bytes);
+                bh = content_round(bh, rh);
+            }
+            bands.push_back(bh);
+        }
+    }
+    return content_hash(bands.data(), bands.size() * sizeof(uint64_t));
+}
+
+uint32_t compute_dirty_band_runs(const std::vector<uint64_t>& prev_bands,
+                                 const std::vector<uint64_t>& cur_bands,
+                                 uint32_t total_units,
+                                 uint32_t band_units,
+                                 const std::vector<uint8_t>* zero_mask,
+                                 std::vector<DirtyBandRun>* out_runs) {
+    if (out_runs != nullptr) {
+        out_runs->clear();
+    }
+    if (cur_bands.empty() || total_units == 0u || band_units == 0u) {
+        return 0u;
+    }
+    const bool has_prev = prev_bands.size() == cur_bands.size();
+    const bool has_zero = !has_prev && zero_mask != nullptr && zero_mask->size() == cur_bands.size();
+    uint32_t changed = 0u;
+    for (uint32_t b = 0; b < cur_bands.size(); ++b) {
+        if (has_prev) {
+            if (prev_bands[b] == cur_bands[b]) {
+                continue;
+            }
+        } else if (has_zero && (*zero_mask)[b] != 0u) {
+            continue;
+        }
+        ++changed;
+        if (out_runs == nullptr) {
+            continue;
+        }
+        const uint32_t first = b * band_units;
+        const uint32_t count = std::min(band_units, total_units - first);
+        if (!out_runs->empty() && out_runs->back().first + out_runs->back().count == first) {
+            out_runs->back().count += count;
+        } else {
+            out_runs->push_back(DirtyBandRun{first, count});
+        }
+    }
+    return changed;
+}
+
 uint64_t native_stage_identity(const void* code, size_t code_size, const void* metadata, size_t metadata_size) {
     uint64_t h = 0xcbf29ce484222325ull;
     for (const auto& [data, size] : {std::pair<const void*, size_t>{code, code_size}, {metadata, metadata_size}}) {
@@ -635,6 +701,7 @@ void Device::track_guest_texture(const TrackedTexture& tex) {
 }
 
 void Device::untrack_guest_texture(uint32_t resource_id) {
+    texture_budget().unregister_texture(resource_id);
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
     texture_slot_index_.remove(texture_slot_key(resource_id));
     if (const auto it = tracked_textures_.find(resource_id); it != tracked_textures_.end()) {
@@ -689,6 +756,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     if (resource_id == 0) {
         return false;
     }
+    // Keep actively bound textures at the MRU front of the VRAM budget LRU table even when
+    // their contents are unchanged or skipped by write-mark tracking.
+    texture_budget().touch_texture(resource_id, present_epoch());
     TrackedTexture tt{};
     {
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
@@ -1081,24 +1151,63 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // Stage every placed subresource; only those whose texels changed since their last upload
     // are written (per-subresource dirty tracking), so one changed mip costs one upload. Inside a
     // 2D subresource only the changed bands of kUploadBandRows block rows are written (#691: a
-    // glyph atlas the title fills a few glyphs at a time re-uploaded 16 MiB per new glyph).
+    // glyph atlas the title fills a few glyphs at a time re-uploaded 16 MiB per new glyph); inside
+    // a 3D subresource only the changed depth slices are written (#1747).
+    uint32_t cap_floor = 0;
+    const bool cap_eligible =
+        whole_surface && tt.dimension == ResourceDimension::Texture2D && l.block_width > 1u && mips > 1u;
+    if (cap_eligible) {
+        cap_floor = cap_floor_for(w, h, mips, texture_budget().current_cap());
+    }
+    gfx10::TextureLayoutDesc surface_desc{};
+    surface_desc.dxgi_format = tt.dxgi_format;
+    surface_desc.width = w;
+    surface_desc.height = h;
+    surface_desc.depth = d;
+    surface_desc.mip_levels = mips;
+    surface_desc.d3d12_layout = tt.layout;
+    surface_desc.array_size = d > 1u ? 1u : layers;
+
     struct Staged {
         Sub sub;
         uint32_t copy_w, copy_h, copy_d, row_pitch, rows;
         uint64_t hash;
-        std::vector<uint8_t> bytes;       // owned staging bytes (empty when borrowing src_data)
+        std::vector<uint8_t> bytes;         // owned staging bytes (empty when borrowing src_data)
         const uint8_t* borrowed = nullptr;  // non-null when referencing src_data directly
         size_t borrowed_size = 0;
         uint32_t src_row_bytes = 0;         // tight row stride when needs_row_pad is true
         bool needs_row_pad = false;         // true: borrowed has tight rows, pad to row_pitch on emit
-        std::vector<uint64_t> bands;  // hash per band of kUploadBandRows rows (2D only; empty: none)
-        std::vector<std::pair<uint32_t, uint32_t>> runs;  // block rows [first, first + count) to write
+        bool band_is_z = false;             // true: bands/runs index 3D depth slices; false: 2D row bands
+        std::vector<uint64_t> bands;        // hash per band (2D rows) or per depth slice (3D)
+        std::vector<DirtyBandRun> runs;     // units [first, first + count) to write
 
         const uint8_t* data() const { return bytes.empty() ? borrowed : bytes.data(); }
         size_t size() const { return bytes.empty() ? borrowed_size : bytes.size(); }
     };
     std::vector<Staged> staged;
+    staged.reserve(subs.size());
     for (const Sub& sub : subs) {
+        const size_t sub_idx = sub.mip + size_t{sub.slice} * mips;
+        const uint64_t prev_sub_hash = sub_idx < tt.subresource_hashes.size() ? tt.subresource_hashes[sub_idx] : 0u;
+        // Skip detiling, allocating, converting, and hashing top mips that will be dropped by the
+        // current texture size cap (cap_floor can only stay equal or increase under hysteresis).
+        if (sub.mip < cap_floor && prev_sub_hash == 0u) {
+            continue;
+        }
+        // Fast path for unstreamed standard (non-tail) console-layout 2D/array/cubemap mips:
+        // inspect the contiguous tiled/console-linear macro-block span in place before detiling.
+        if (using_default_detile && is_tiled && whole_surface && d == 1u && prev_sub_hash == 0u &&
+            !skip_streaming_hash && !single_console_linear_direct) {
+            const gfx10::MipPlacement mp = gfx10::mip_placement(surface_desc, sub.mip);
+            if (mp.ok && !mp.in_tail && mp.slice_bytes > 0u && layers > 0u) {
+                const uint64_t slice_stride = mp.surface_bytes / layers;
+                const uint64_t mip_off = slice_stride * sub.slice + mp.macro_block_offset;
+                if (mip_off <= src_size && mp.slice_bytes <= src_size - mip_off &&
+                    all_zero_bytes(src_data + mip_off, static_cast<size_t>(mp.slice_bytes))) {
+                    continue;
+                }
+            }
+        }
         const uint32_t mw = std::max(1u, w >> sub.mip);
         const uint32_t mh = std::max(1u, h >> sub.mip);
         const uint32_t md = std::max(1u, d >> sub.mip);
@@ -1107,7 +1216,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         const uint64_t row_bytes = uint64_t{bx} * l.block_bytes;
         const uint64_t row_pitch = align_up(row_bytes, 256u);
         Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {},
-                  nullptr, 0, 0, false, {}, {}};
+                  nullptr, 0, 0, false, false, {}, {}};
         if (skip_streaming_hash) {
             if (single_console_linear_direct) {
                 st.borrowed = src_data;
@@ -1121,7 +1230,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                     st.needs_row_pad = true;
                 }
             }
-            st.runs.emplace_back(0u, by);
+            st.runs.push_back(DirtyBandRun{0u, by});
             staged.push_back(std::move(st));
             continue;
         }
@@ -1223,15 +1332,19 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         if (single_linear_direct && !direct_bands.empty()) {
             st.bands = std::move(direct_bands);
             st.hash = hash;
-        } else if (single_linear_direct && !(st.copy_d == 1u && st.rows > kUploadBandRows)) {
+        } else if (single_linear_direct && st.copy_d == 1u && !(st.rows > kUploadBandRows)) {
             st.hash = hash;
+        } else if (st.copy_d > 1u) {
+            // 3D subresource: per-depth-slice dirty tracking so sparse 3D volume updates only upload
+            // the modified Z slices (#1747).
+            st.band_is_z = true;
+            const size_t active_row_stride = st.needs_row_pad ? size_t{st.src_row_bytes} : size_t{st.row_pitch};
+            const size_t slice_stride = size_t{st.rows} * active_row_stride;
+            st.hash = hash_dirty_bands(st.data(), st.copy_d, /*band_units=*/1u, slice_stride, slice_stride, &st.bands);
         } else if (st.copy_d == 1u && st.rows > kUploadBandRows) {
-            const uint8_t* ptr = st.data();
-            for (uint32_t r = 0; r < st.rows; r += kUploadBandRows) {
-                const uint32_t n = std::min(kUploadBandRows, st.rows - r);
-                st.bands.push_back(content_hash(ptr + size_t{r} * st.row_pitch, size_t{n} * st.row_pitch));
-            }
-            st.hash = content_hash(st.bands.data(), st.bands.size() * sizeof(uint64_t));
+            const size_t active_row_stride = st.needs_row_pad ? size_t{st.src_row_bytes} : size_t{st.row_pitch};
+            st.hash = hash_dirty_bands(st.data(), st.rows, kUploadBandRows, active_row_stride, active_row_stride,
+                                       &st.bands);
         } else {
             st.hash = content_hash(st.data(), st.size());
         }
@@ -1239,19 +1352,12 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     uint32_t held_floor = 0;
-    // Backlog 37: under memory pressure a block-compressed 2D texture with its whole mip chain placed
-    // drops the levels above the size cap (see gpu/texture_budget.h).
-    uint32_t cap_floor = 0;
-    const bool cap_eligible =
-        whole_surface && tt.dimension == ResourceDimension::Texture2D && l.block_width > 1u && mips > 1u;
-    if (cap_eligible) {
-        cap_floor = cap_floor_for(w, h, mips, texture_budget().current_cap());
-    }
     // Host reallocation (see gpu/texture_budget.h): set below when the host texture is re-created.
     bool host_recreate = false;
     GpuCreateTexture2Payload recreate{};
     uint32_t host_floor_now = 0;
     int64_t saved_delta = 0;
+    uint64_t host_new_bytes = 0;
     const bool single_known_nonzero =
         !tt.ever_uploaded &&
         (single_linear_direct || (single_console_linear_direct && src_size == console_linear_bytes));
@@ -1268,7 +1374,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         if (cur.has_create && cap_eligible && cap_floor != cur.host_floor) {
             bool change = true;
             const auto chain = [&](uint32_t floor) {
-                return texture_chain_bytes(w, h, 1u, mips, l.block_width, l.block_height, l.block_bytes, floor);
+                return texture_chain_bytes(w, h, 1u, mips, l.block_width, l.block_height, l.block_bytes, floor, layers);
             };
             if (cap_floor < cur.host_floor) {
                 // Hysteresis: grow back only while the larger texture still fits the tier its cap came from.
@@ -1276,8 +1382,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 change = texture_budget().restore_fits(w, h, mips, cap_floor, extra);
             }
             if (change) {
-                const uint64_t saved = chain(0) - chain(cap_floor);
+                const uint64_t new_chain = chain(cap_floor);
+                const uint64_t saved = chain(0) - new_chain;
                 saved_delta = static_cast<int64_t>(saved) - static_cast<int64_t>(cur.host_saved_bytes);
+                host_new_bytes = new_chain;
                 cur.host_saved_bytes = saved;
                 cur.host_floor = cap_floor;
                 recreate = cur.create;
@@ -1343,7 +1451,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 prev.clear();
                 seen = 0;
                 if (st.runs.empty()) {
-                    st.runs.emplace_back(0u, st.rows);
+                    st.runs.push_back(DirtyBandRun{0u, st.band_is_z ? st.copy_d : st.rows});
                 }
                 if (&*out != &st) {
                     *out = std::move(st);
@@ -1361,32 +1469,39 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 all_zero_bytes(st.data(), st.size())) {
                 continue;  // still zero as the GPU texture was created
             }
-            if (seen != 0 && !st.bands.empty() && prev.size() == st.bands.size()) {
-                uint32_t changed_bands = 0;
-                for (uint32_t b = 0; b < st.bands.size(); ++b) {
-                    if (prev[b] == st.bands[b]) {
-                        continue;
+            const uint32_t total_units = st.band_is_z ? st.copy_d : st.rows;
+            const uint32_t band_units = st.band_is_z ? 1u : kUploadBandRows;
+            if (!st.bands.empty()) {
+                if (seen != 0 && prev.size() == st.bands.size()) {
+                    const uint32_t changed_bands = compute_dirty_band_runs(prev, st.bands, total_units, band_units,
+                                                                           /*zero_mask=*/nullptr, &st.runs);
+                    if (streaming_eligible && !st.band_is_z) {
+                        if (changed_bands * 4u >= st.bands.size() * 3u) {
+                            cur.streaming_full_frames =
+                                static_cast<uint8_t>(std::min<uint32_t>(uint32_t{cur.streaming_full_frames} + 1u, 8u));
+                        } else {
+                            cur.streaming_full_frames = 0;
+                        }
                     }
-                    ++changed_bands;
-                    const uint32_t first = b * kUploadBandRows;
-                    const uint32_t count = std::min(kUploadBandRows, st.rows - first);
-                    if (!st.runs.empty() && st.runs.back().first + st.runs.back().second == first) {
-                        st.runs.back().second += count;  // adjacent changed bands: one write
-                    } else {
-                        st.runs.emplace_back(first, count);
+                } else if (st.band_is_z && seen == 0 && (!was_ever_uploaded || host_recreate)) {
+                    // Initial upload of a freshly zero-initialized 3D GPU texture: skip all-zero Z slices
+                    // while still recording every slice hash in `prev` so future writes trigger uploads.
+                    std::vector<uint8_t> zero_mask(st.bands.size(), 0u);
+                    const size_t active_row_stride =
+                        st.needs_row_pad ? size_t{st.src_row_bytes} : size_t{st.row_pitch};
+                    const size_t unit_stride = size_t{st.rows} * active_row_stride;
+                    const uint8_t* ptr = st.data();
+                    for (uint32_t b = 0; b < st.bands.size(); ++b) {
+                        if (all_zero_bytes(ptr + size_t{b} * unit_stride, unit_stride)) {
+                            zero_mask[b] = 1u;
+                        }
                     }
-                }
-                if (streaming_eligible) {
-                    if (changed_bands * 4u >= st.bands.size() * 3u) {
-                        cur.streaming_full_frames =
-                            static_cast<uint8_t>(std::min<uint32_t>(uint32_t{cur.streaming_full_frames} + 1u, 8u));
-                    } else {
-                        cur.streaming_full_frames = 0;
-                    }
+                    static const std::vector<uint64_t> kEmptyPrev;
+                    compute_dirty_band_runs(kEmptyPrev, st.bands, total_units, band_units, &zero_mask, &st.runs);
                 }
             }
             if (st.runs.empty()) {
-                st.runs.emplace_back(0u, st.rows);
+                st.runs.push_back(DirtyBandRun{0u, total_units});
             }
             prev = st.bands;
             seen = st.hash;
@@ -1403,7 +1518,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 texture_budget().note_capped(
                     cap_floor - prev_cap_floor,
                     texture_chain_bytes(w, h, 1u, cap_floor, l.block_width, l.block_height, l.block_bytes,
-                                        prev_cap_floor));
+                                        prev_cap_floor, layers));
             }
         }
     }
@@ -1411,6 +1526,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         replace_host_texture(recreate, encoder);
         bridge_->set_host_mip_offset(resource_id, host_floor_now);
         texture_budget().note_host_realloc(saved_delta);
+        texture_budget().update_texture_bytes(resource_id, host_new_bytes);
     }
     // G66 partly-held mip chains: views of the texture start at its first held level.
     bridge_->set_resident_mip_floor(resource_id, held_floor);
@@ -1440,34 +1556,63 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         if (st.sub.mip < host_floor_now) {
             continue;  // a level the capped host texture lacks
         }
-        for (const auto& [first, count] : st.runs) {
-            const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
+        for (const DirtyBandRun& run : st.runs) {
+            const uint32_t first = run.first;
+            const uint32_t count = run.count;
             const uint8_t* data = nullptr;
             uint32_t len = 0;
-            if (st.needs_row_pad) {
-                const size_t total_rows = size_t{count} * st.copy_d;
-                const size_t padded_bytes = total_rows * st.row_pitch;
-                const size_t src_row_bytes = st.src_row_bytes;
-                const size_t pad_tail = st.row_pitch - src_row_bytes;
-                uint8_t* scratch = pad_scratch.ensure(padded_bytes);
-                const uint8_t* src_base = st.borrowed + size_t{first} * src_row_bytes;
-                uint8_t* dst = scratch;
-                for (size_t r = 0; r < total_rows; ++r) {
-                    std::memcpy(dst, src_base, src_row_bytes);
-                    std::memset(dst + src_row_bytes, 0, pad_tail);
-                    src_base += src_row_bytes;
-                    dst += st.row_pitch;
+            if (st.band_is_z) {
+                if (st.needs_row_pad) {
+                    const size_t total_rows = size_t{st.rows} * count;
+                    const size_t padded_bytes = total_rows * st.row_pitch;
+                    const size_t src_row_bytes = st.src_row_bytes;
+                    const size_t pad_tail = st.row_pitch - src_row_bytes;
+                    uint8_t* scratch = pad_scratch.ensure(padded_bytes);
+                    const uint8_t* src_base = st.borrowed + size_t{first} * st.rows * src_row_bytes;
+                    uint8_t* dst = scratch;
+                    for (size_t r = 0; r < total_rows; ++r) {
+                        std::memcpy(dst, src_base, src_row_bytes);
+                        std::memset(dst + src_row_bytes, 0, pad_tail);
+                        src_base += src_row_bytes;
+                        dst += st.row_pitch;
+                    }
+                    data = scratch;
+                    len = static_cast<uint32_t>(padded_bytes);
+                    used_pad_scratch = true;
+                } else {
+                    const size_t slice_bytes = size_t{st.rows} * st.row_pitch;
+                    data = st.data() + size_t{first} * slice_bytes;
+                    len = static_cast<uint32_t>(size_t{count} * slice_bytes);
                 }
-                data = scratch;
-                len = static_cast<uint32_t>(padded_bytes);
-                used_pad_scratch = true;
+                encoder.write_texture(resource_id, st.sub.mip - host_floor_now, 0u, 0u, first, st.copy_w, st.copy_h,
+                                      count, st.row_pitch, st.rows, data, len);
             } else {
-                data = st.data() + size_t{first} * st.row_pitch;
-                len = static_cast<uint32_t>(
-                    count == st.rows ? st.size() : size_t{count} * st.row_pitch);
+                const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
+                if (st.needs_row_pad) {
+                    const size_t total_rows = size_t{count} * st.copy_d;
+                    const size_t padded_bytes = total_rows * st.row_pitch;
+                    const size_t src_row_bytes = st.src_row_bytes;
+                    const size_t pad_tail = st.row_pitch - src_row_bytes;
+                    uint8_t* scratch = pad_scratch.ensure(padded_bytes);
+                    const uint8_t* src_base = st.borrowed + size_t{first} * src_row_bytes;
+                    uint8_t* dst = scratch;
+                    for (size_t r = 0; r < total_rows; ++r) {
+                        std::memcpy(dst, src_base, src_row_bytes);
+                        std::memset(dst + src_row_bytes, 0, pad_tail);
+                        src_base += src_row_bytes;
+                        dst += st.row_pitch;
+                    }
+                    data = scratch;
+                    len = static_cast<uint32_t>(padded_bytes);
+                    used_pad_scratch = true;
+                } else {
+                    data = st.data() + size_t{first} * st.row_pitch;
+                    len = static_cast<uint32_t>(
+                        count == st.rows ? st.size() : size_t{count} * st.row_pitch);
+                }
+                encoder.write_texture(resource_id, st.sub.mip - host_floor_now, 0u, first * bh, st.sub.slice,
+                                      st.copy_w, count * bh, st.copy_d, st.row_pitch, count, data, len);
             }
-            encoder.write_texture(resource_id, st.sub.mip - host_floor_now, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
-                                  st.copy_d, st.row_pitch, count, data, len);
             count_work(Work::TextureUploads);
             note_upload(len);
             note_texture_upload();
@@ -1518,18 +1663,58 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     key.d3d12_layout = d3d12_layout;
     key.dim = static_cast<uint8_t>(dim);
 
+    const DxgiFormatLayout shape_layout = dxgi_format_layout(dxgi_format);
+    const bool is3d_tex = dim == GpuTextureDimension::Dim3D;
+    const uint64_t chain_bytes =
+        shape_layout.known && shape_layout.block_bytes != 0
+            ? texture_chain_bytes(width, safe_height, is3d_tex ? safe_depth : 1u, safe_mips, shape_layout.block_width,
+                                  shape_layout.block_height, shape_layout.block_bytes, 0u,
+                                  is3d_tex ? 1u : safe_depth)
+            : 0u;
+    const uint64_t cur_frame = present_epoch();
+
     std::lock_guard<std::mutex> lock(address_textures_mutex_);
     const auto it = address_textures_.find(key);
     if (it != address_textures_.end()) {
         it->second.last_use = ++address_texture_tick_;
+        texture_budget().touch_texture(it->second.id, cur_frame);
         return it->second.id;
     }
-    // O36 / G70 (#691): bounded LRU. Prefer evicting textures not used in the current frame, and
-    // incorporate StateBridgeDevice::resource_last_use_tick so textures kept hot by BindGroupCache
-    // hits are not starved. Any victim referenced in the current frame has its DestroyResource
-    // deferred until after Present so queue.submit() never sees a destroyed texture.
+    // O36 / G70 (#691) / G82 (#1747): VRAM-budget LRU reclamation + bounded count LRU.
+    // Reclaim cold address textures when VRAM pressure crosses the hysteresis trigger threshold,
+    // then enforce the entry count ceiling. Prefer evicting textures not used in the current frame,
+    // and defer DestroyResource until after Present for any in-frame victim.
     CommandEncoder drop;
     bridge_->advance_present_frame(stats().presents, drop);
+    if (const uint64_t reclaim_goal = texture_budget().bytes_to_reclaim(chain_bytes); reclaim_goal != 0u) {
+        const std::vector<LruEvictCandidate> candidates =
+            texture_budget().select_eviction_candidates(cur_frame, reclaim_goal);
+        for (const LruEvictCandidate& cand : candidates) {
+            if (bridge_->is_resource_used_in_frame(cand.resource_id)) {
+                continue;
+            }
+            auto victim_it = address_textures_.end();
+            for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
+                if (i->second.id == cand.resource_id) {
+                    victim_it = i;
+                    break;
+                }
+            }
+            if (victim_it == address_textures_.end()) {
+                continue;
+            }
+            const uint32_t victim = victim_it->second.id;
+            const uint64_t victim_bytes = victim_it->second.budget_bytes;
+            address_textures_.erase(victim_it);
+            untrack_guest_texture(victim);
+            bridge_->unregister_resource(victim);
+            if (victim_bytes != 0) {
+                texture_budget().note_destroyed(victim_bytes);
+            }
+            texture_budget().note_lru_evicted(victim, victim_bytes != 0 ? victim_bytes : cand.bytes);
+            bridge_->destroy_or_defer_resource(victim, drop);
+        }
+    }
     while (address_textures_.size() >= kMaxAddressTextures) {
         auto oldest = address_textures_.end();
         bool oldest_in_frame = true;
@@ -1568,6 +1753,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         }
         if (victim_entry.budget_bytes != 0) {
             texture_budget().note_destroyed(victim_entry.budget_bytes);
+            texture_budget().note_lru_evicted(victim, victim_entry.budget_bytes);
         }
         bridge_->destroy_or_defer_resource(victim, drop);
     }
@@ -1577,13 +1763,6 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 
     // Backlog 38: the host texture of a released small texture of the same shape is reused; every
     // texel of every mip is zeroed below, so nothing of its previous content stays visible.
-    const DxgiFormatLayout shape_layout = dxgi_format_layout(dxgi_format);
-    const bool is3d_tex = dim == GpuTextureDimension::Dim3D;
-    const uint64_t chain_bytes =
-        shape_layout.known && shape_layout.block_bytes != 0
-            ? texture_chain_bytes(width, safe_height, safe_depth, safe_mips, shape_layout.block_width,
-                                  shape_layout.block_height, shape_layout.block_bytes)
-            : 0u;
     SmallTextureShape shape{};
     shape.owner = reinterpret_cast<uintptr_t>(this);
     shape.dxgi_format = dxgi_format;
@@ -1691,6 +1870,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     }
 
     address_textures_.emplace(key, AddressTextureEntry{id, ++address_texture_tick_, chain_bytes, shape});
+    texture_budget().register_texture(id, chain_bytes, cur_frame, /*pinned=*/false, /*evictable=*/true);
     return id;
 }
 
@@ -2305,6 +2485,9 @@ Resource::~Resource() {
     if (texture_tracked_) {
         device_->untrack_guest_texture(id_);
     }
+    if (id_ != 0 && !is_buffer()) {
+        texture_budget().unregister_texture(id_);
+    }
     if (budget_bytes_ != 0) {
         texture_budget().note_destroyed(budget_bytes_);
         budget_bytes_ = 0;
@@ -2531,9 +2714,13 @@ bool Resource::initialize() {
             dev.state_bridge().register_texture(id_, info);
             va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
             if (const DxgiFormatLayout bl = dxgi_format_layout(desc_.Format); bl.known && bl.block_bytes != 0) {
-                budget_bytes_ = texture_chain_bytes(p.width, p.height, p.depth_or_layers, mips_, bl.block_width,
-                                                    bl.block_height, bl.block_bytes);
+                const bool is3d = desc_.Dimension == ResourceDimension::Texture3D;
+                budget_bytes_ = texture_chain_bytes(p.width, p.height, is3d ? p.depth_or_layers : 1u, mips_,
+                                                    bl.block_width, bl.block_height, bl.block_bytes, 0u,
+                                                    is3d ? 1u : p.depth_or_layers);
                 texture_budget().note_created(budget_bytes_);
+                texture_budget().register_texture(id_, budget_bytes_, dev.present_epoch(),
+                                                  /*pinned=*/rt || depth || back_buffer_.load(), /*evictable=*/false);
             }
             if (gpu_va_ != 0 && gpu_va_ < Device::kFakeGpuVaBase) {
                 TrackedTexture tt{};
@@ -2660,6 +2847,7 @@ void Resource::mark_back_buffer() {
     info.gpu_va = descriptor_va_;
     device_->state_bridge().register_texture(id_, info);
     back_buffer_.store(true);
+    texture_budget().set_texture_pinned(id_, true);
 }
 
 bool Resource::shadow_same(uint64_t off, const uint8_t* live, uint64_t n) const {
