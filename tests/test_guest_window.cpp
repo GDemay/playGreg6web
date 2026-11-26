@@ -1024,12 +1024,13 @@ void test_xmem_mirrored_alias_contiguity_zero_split_pairs() {
     uint8_t b = 0;
     CHECK(gw::copy_from_guest(&b, W + 200 * k64K + 123, 1) && b == 0x20 + 30);
 
-    // Impossible adjacent self-alias in S must report a contiguity violation instead of silently
-    // leaving a split pair.
+    // Impossible adjacent self-alias in a mirrored reservation (>= kRuntimeRangeBase) must record
+    // a run_break without triggering a fatal contiguity_violation (real games mix primary and
+    // alias/2 MiB pages in mirrored reservations).
     const uint64_t bad_va[] = {S + 14 * k64K};
     const uint64_t bad_pg[] = {pfn[30]};
     CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(bad_va, 1, bad_pg) == 1);
-    CHECK(g_violation == S + 14 * k64K);
+    CHECK(g_violation == 0);
     CHECK(xmem_window_contiguity().run_breaks == 1);
 
     gw::set_contiguous_runs_required(false);
@@ -1278,6 +1279,62 @@ void test_xmem_concurrent_write_pin_and_relocation() {
     gw::reset_for_testing();
 }
 
+// Regression: mirrored reservations (>= kRuntimeRangeBase) can legitimately mix primary mappings
+// with adjacent alias mappings (e.g. a page whose home lives in another reservation) under
+// --contiguous-runs. That must record run_breaks without triggering a fatal contiguity_violation.
+void test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);
+    void* mirror_a = pg6_xbox_XMemVirtualAlloc(nullptr, 64 * k64K, kWindowType, 0x23u, kCpuProtect);
+    void* mirror_b = pg6_xbox_XMemVirtualAlloc(nullptr, 64 * k64K, kWindowType, 0x23u, kCpuProtect);
+    CHECK(cpu != nullptr && pool != nullptr && mirror_a != nullptr && mirror_b != nullptr);
+    const uint64_t wa = va_of(mirror_a);
+    const uint64_t wb = va_of(mirror_b);
+    CHECK(wa >= gw::kRuntimeRangeBase && wb >= gw::kRuntimeRangeBase);
+
+    size_t count = 2;
+    uint64_t pfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == 2);
+
+    // Map pfn[0] as a primary page in mirror_a, then alias it at mirror_b[0], and map pfn[1] as a
+    // primary page right beside it at mirror_b[1] (non-adjacent host frames in a mirrored region).
+    const uint64_t a0 = wa;
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&a0, 1, &pfn[0]) == 1);
+    const uint64_t b0 = wb;
+    const uint64_t b1 = wb + k64K;
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&b0, 1, &pfn[0]) == 1);
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&b1, 1, &pfn[1]) == 1);
+
+    // Must not trigger a fatal contiguity_violation on mirrored slots (>= kRuntimeRangeBase).
+    CHECK(g_violation == 0);
+    CHECK(xmem_window_contiguity().run_breaks >= 1);
+
+    const uint32_t tag0 = 0x11223344u;
+    const uint32_t tag1 = 0x55667788u;
+    CHECK(gw::copy_to_guest(b0, &tag0, sizeof(tag0)));
+    CHECK(gw::copy_to_guest(b1, &tag1, sizeof(tag1)));
+    uint32_t read_a0 = 0;
+    uint32_t read_b1 = 0;
+    CHECK(gw::copy_from_guest(&read_a0, a0, sizeof(read_a0)) && read_a0 == tag0);
+    CHECK(gw::copy_from_guest(&read_b1, b1, sizeof(read_b1)) && read_b1 == tag1);
+
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(mirror_b));
+    CHECK(xmem_virtual_free(mirror_a));
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, pfn) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -1296,6 +1353,7 @@ int main() {
     test_xmem_mirrored_alias_contiguity_zero_split_pairs();
     test_xmem_concurrent_relocation_no_torn_reads();
     test_xmem_concurrent_write_pin_and_relocation();
+    test_xmem_mirrored_mixed_primary_and_alias_no_fatal_trap();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
