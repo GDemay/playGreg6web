@@ -277,6 +277,15 @@ export function buildFileFingerprint(sizeOrMeta, etag = null) {
   return null;
 }
 
+function extractFingerprintFromKey(key) {
+  if (typeof key !== 'string' || key.length === 0) {
+    return null;
+  }
+  const leaf = key.includes('/') ? key.slice(key.lastIndexOf('/') + 1) : key;
+  const match = /_fp_([0-9a-zA-Z_-]{1,64})\.bin$/.exec(leaf);
+  return match ? match[1] : null;
+}
+
 /**
  * Normalizes a string key or chunk descriptor (`{ key }`, `{ path, chunkIndex, chunkSize }`,
  * or `{ path, offset, length }`) into a deterministic validated OPFS cache key.
@@ -1442,6 +1451,7 @@ export class OpfsChunkCache {
               createdAtMs: ts,
               etag: null,
               versionKey: null,
+              fileFingerprint: extractFingerprintFromKey(validKey),
               pinned: false,
               kind: inferChunkKind(validKey),
               accessOrder: this._nextAccessOrder(),
@@ -1950,8 +1960,17 @@ export class OpfsChunkCache {
       };
     }
 
+    const keyFp = extractFingerprintFromKey(key);
+    const keyMatchesExpectedFp =
+      expectedEtag === null &&
+      expectedVersionKey === null &&
+      expectedFileFingerprint !== null &&
+      keyFp !== null &&
+      keyFp === expectedFileFingerprint;
+
     if (
       !existing &&
+      !keyMatchesExpectedFp &&
       (expectedEtag !== null || expectedVersionKey !== null || expectedFileFingerprint !== null)
     ) {
       await this._removeFile(cacheDir, key);
@@ -2009,7 +2028,7 @@ export class OpfsChunkCache {
         createdAtMs: nowMs,
         etag: null,
         versionKey: null,
-        fileFingerprint: null,
+        fileFingerprint: keyFp,
         pinned: false,
         kind: inferChunkKind(key),
         accessOrder: this._nextAccessOrder(),
