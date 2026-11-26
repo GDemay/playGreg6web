@@ -4493,7 +4493,21 @@ class RenderStatePackets {
   }
 
   isAsyncPipelinePending(id, isCompute) {
-    return (isCompute ? this.pendingAsyncComputePipelines : this.pendingAsyncRenderPipelines).has(id);
+    if ((isCompute ? this.pendingAsyncComputePipelines : this.pendingAsyncRenderPipelines).has(id)) {
+      return true;
+    }
+    const proc = this.processor;
+    if (proc && proc._pendingRangedPipelines && proc._pendingRangedPipelines.has(id)) {
+      const live = isCompute ? proc.computePipelines : proc.pipelines;
+      if (!live || !live.has(id)) {
+        const rec = proc._pendingRangedPipelines.get(id);
+        const recIsCompute = Boolean(rec && (rec.kind === 'compute' || rec.kind === 'compute2'));
+        if (!rec || recIsCompute === Boolean(isCompute)) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   /**
@@ -4543,6 +4557,15 @@ class RenderStatePackets {
       } catch (err) {
         this._recordAsyncPipelineFailure(kind, id, err);
       }
+      return;
+    }
+    if (
+      this.processor &&
+      this.processor._pendingRangedPipelines &&
+      this.processor._pendingRangedPipelines.has(id)
+    ) {
+      // Temporary fallback compile failed while real ranged shaders are still streaming in;
+      // wait cleanly for the ranged shader settlement to materialize the real pipeline.
       return;
     }
     this._recordAsyncPipelineFailure(kind, id, result && result.error);
@@ -6944,7 +6967,7 @@ function installRenderStatePackets(processor, options = {}) {
         if (activeHandler && typeof activeHandler._preparePassCommandsForFlush === 'function') {
           activeHandler._preparePassCommandsForFlush();
         }
-        return origFlushPresent.call(this);
+        return origFlushPresent.apply(this, arguments);
       };
     }
 
