@@ -33,8 +33,8 @@ use crate::pack::write_json_string;
 use crate::rdna2::{
     Rdna2Detail, Rdna2ExportTarget, Rdna2InferredStage, Rdna2Instruction, Rdna2ProgramSummary,
     SENDMSG_ID_GS, SENDMSG_ID_GS_ALLOC_REQ, SENDMSG_ID_GS_DONE, analyze_instructions,
-    decode_program, decode_vop3_interp_attr, sendmsg_id, sop2_src_pair_widths,
-    sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
+    decode_program, decode_vop3_interp_attr, mimg_addr_vgpr, mimg_bvh_addr_vgpr_count, sendmsg_id,
+    sop2_src_pair_widths, sopc_src_pair_widths, vop2_is_co_ci, vop2_is_madk, vop3_is_interp_f16,
 };
 use crate::rdna2_cfg::{
     BlockId, BranchKind, ControlFlowGraph, DISPATCH_EXIT_PC, ExecMaskOp, ExecMaskWrite,
@@ -628,6 +628,9 @@ pub struct Rdna2BindingSummary {
     pub exports_depth: bool,
 }
 
+/// Runtime-owned RT WGSL prelude contract version (`runtime/gpu/rt_bvh.h::kPreludeVersion`).
+pub const RT_PRELUDE_VERSION: u32 = 1;
+
 /// Result of translating an RDNA2 binary shader into validated WebGPU WGSL.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rdna2WgslOutput {
@@ -641,6 +644,11 @@ pub struct Rdna2WgslOutput {
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
     pub mesh_output: Option<MeshOutputLayout>,
+    pub rt_arena: bool,
+    pub rt_prelude_version: Option<u32>,
+    pub bvh_ops: u32,
+    pub raw_address: bool,
+    pub atomic64: bool,
     pub binding_summary: Rdna2BindingSummary,
 }
 
@@ -697,6 +705,21 @@ impl Rdna2WgslOutput {
             out.push_str("  \"mesh_output\": ");
             write_mesh_output_json(&mut out, mesh_output);
             out.push_str(",\n");
+        }
+        if self.rt_arena {
+            out.push_str("  \"rt_arena\": true,\n");
+        }
+        if let Some(ver) = self.rt_prelude_version {
+            let _ = writeln!(out, "  \"rt_prelude_version\": {ver},");
+        }
+        if self.bvh_ops > 0 {
+            let _ = writeln!(out, "  \"bvh_ops\": {},", self.bvh_ops);
+        }
+        if self.raw_address {
+            out.push_str("  \"raw_address\": true,\n");
+        }
+        if self.atomic64 {
+            out.push_str("  \"atomic64\": true,\n");
         }
 
         // binding_summary
@@ -1019,6 +1042,15 @@ struct ProgramPlan {
     needs_m0: bool,
     /// Mesh-to-compute output layout (`Some(...)` when `Rdna2StageOverride::Mesh`).
     mesh_output: Option<MeshOutputLayout>,
+    /// `true` when the emitted WGSL calls runtime-owned RT prelude helpers (`pg6_load32` /
+    /// `pg6_bvh_intersect`) and requires the runtime to prepend `prelude_wgsl()` and bind group 3.
+    rt_arena: bool,
+    /// Number of GFX10.3 BVH MIMG instructions (`0xE6` / `0xE7`) in the active program.
+    bvh_ops: u32,
+    /// `true` when the active program contains FLAT/GLOBAL raw-address memory instructions.
+    raw_address: bool,
+    /// `true` when the active program contains 64-bit FLAT/GLOBAL atomic instructions (`0x50..=0x5F`).
+    atomic64: bool,
 }
 
 fn resolve_stage(inferred: Rdna2InferredStage, override_stage: Rdna2StageOverride) -> ShaderStage {
@@ -8255,14 +8287,43 @@ fn plan_program(
                 op,
                 dmask,
                 dim,
+                a16,
                 d16,
+                nsize,
                 vaddr,
+                nsa_vaddrs,
                 vdata,
                 srsrc,
                 ssamp,
                 ..
             } => {
-                if let Some(layout) = mimg_addr_layout(*op) {
+                if let Some(addr_count) = mimg_bvh_addr_vgpr_count(*op, *a16) {
+                    if stage != ShaderStage::Vertex && !is_mesh {
+                        let srsrc_base = srsrc.saturating_mul(4);
+                        for k in 0..4u8 {
+                            if let Some(reg) = checked_sgpr_reg(srsrc_base, k) {
+                                sgprs.insert(reg);
+                                if !written_sgprs.contains(&reg) {
+                                    read_before_write_sgprs.insert(reg);
+                                }
+                            }
+                        }
+                        for a in 0..addr_count {
+                            if let Some(reg) = mimg_addr_vgpr(*vaddr, *nsize, nsa_vaddrs, a) {
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
+                            }
+                        }
+                        for d in 0..4u8 {
+                            if let Some(reg) = checked_vgpr_reg(*vdata, d) {
+                                vgprs.insert(reg);
+                                written_vgprs.insert(reg);
+                            }
+                        }
+                    }
+                } else if let Some(layout) = mimg_addr_layout(*op) {
                     let eff_mask = if *dmask == 0 { 0xF } else { *dmask };
                     let comp_cnt = eff_mask.count_ones();
                     let data_vgprs = if *d16 { comp_cnt.div_ceil(2) } else { comp_cnt } as u8;
@@ -8628,7 +8689,59 @@ fn plan_program(
                 Some(BranchKind::Execz | BranchKind::Execnz) => needs_exec = true,
                 Some(BranchKind::Unconditional) | None => {}
             },
-            Rdna2Detail::Flat { .. } | Rdna2Detail::Unknown { .. } => {}
+            Rdna2Detail::Flat {
+                seg,
+                op,
+                lds,
+                addr,
+                saddr,
+                vdst,
+                ..
+            } => {
+                if stage != ShaderStage::Vertex
+                    && !is_mesh
+                    && !*lds
+                    && matches!(*seg, 0 | 2)
+                    && matches!(*op, 0x08..=0x0F)
+                {
+                    if *seg == 2 && *saddr != 0x7F {
+                        for k in 0..2u8 {
+                            if let Some(reg) = checked_sgpr_reg(*saddr, k) {
+                                sgprs.insert(reg);
+                                if !written_sgprs.contains(&reg) {
+                                    read_before_write_sgprs.insert(reg);
+                                }
+                            }
+                        }
+                        vgprs.insert(*addr);
+                        if !written_vgprs.contains(addr) {
+                            read_before_write_vgprs.insert(*addr);
+                        }
+                    } else {
+                        for k in 0..2u8 {
+                            if let Some(reg) = checked_vgpr_reg(*addr, k) {
+                                vgprs.insert(reg);
+                                if !written_vgprs.contains(&reg) {
+                                    read_before_write_vgprs.insert(reg);
+                                }
+                            }
+                        }
+                    }
+                    let dst_count: u8 = match *op {
+                        0x0D => 2,
+                        0x0F => 3,
+                        0x0E => 4,
+                        _ => 1,
+                    };
+                    for k in 0..dst_count {
+                        if let Some(reg) = checked_vgpr_reg(*vdst, k) {
+                            vgprs.insert(reg);
+                            written_vgprs.insert(reg);
+                        }
+                    }
+                }
+            }
+            Rdna2Detail::Unknown { .. } => {}
         }
     }
 
@@ -8821,6 +8934,33 @@ fn plan_program(
         .max()
         .unwrap_or(0);
 
+    let mut bvh_ops: u32 = 0;
+    let mut raw_address = false;
+    let mut atomic64 = false;
+    let mut has_lowered_flat_load = false;
+    for inst in active {
+        if inst.truncated {
+            continue;
+        }
+        match &inst.detail {
+            Rdna2Detail::Mimg { op, .. } if matches!(*op, 0xE6 | 0xE7) => {
+                bvh_ops = bvh_ops.saturating_add(1);
+            }
+            Rdna2Detail::Flat { seg, op, lds, .. } if !*lds && matches!(*seg, 0 | 2) => {
+                raw_address = true;
+                if matches!(*op, 0x08..=0x0F) {
+                    has_lowered_flat_load = true;
+                } else if matches!(*op, 0x50..=0x5F) {
+                    atomic64 = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    let rt_arena = stage != ShaderStage::Vertex
+        && mesh_output.is_none()
+        && (bvh_ops > 0 || has_lowered_flat_load);
+
     ProgramPlan {
         stage,
         entry_point,
@@ -8861,6 +9001,10 @@ fn plan_program(
         needs_exec,
         needs_m0,
         mesh_output,
+        rt_arena,
+        bvh_ops,
+        raw_address,
+        atomic64,
     }
 }
 
@@ -8918,6 +9062,8 @@ struct IrEmitter {
     helper_rt_u32: Option<Handle<Function>>,
     helper_rt_i32: Option<Handle<Function>>,
     helper_rt_vec2_f32: Option<Handle<Function>>,
+    helper_pg6_load32: Option<Handle<Function>>,
+    helper_pg6_bvh_intersect: Option<Handle<Function>>,
     vgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     sgpr_locals: BTreeMap<u8, Handle<LocalVariable>>,
     /// Dedicated per-`(vgpr, lane)` `u32` locals for lossless `v_writelane_b32`/`v_readlane_b32` SGPR spills.
@@ -9946,6 +10092,8 @@ impl IrEmitter {
             helper_rt_u32: None,
             helper_rt_i32: None,
             helper_rt_vec2_f32: None,
+            helper_pg6_load32: None,
+            helper_pg6_bvh_intersect: None,
             vgpr_locals,
             sgpr_locals,
             lane_spill_locals,
@@ -12222,15 +12370,26 @@ impl IrEmitter {
                 op,
                 dmask,
                 dim,
+                a16,
                 d16,
+                nsize,
                 vaddr,
+                nsa_vaddrs,
                 vdata,
                 srsrc,
                 ssamp,
                 ..
-            } => self.translate_mimg(
-                inst_idx, *op, *dmask, *dim, *d16, *vaddr, *vdata, *srsrc, *ssamp,
-            ),
+            } => {
+                if matches!(*op, 0xE6 | 0xE7) {
+                    self.translate_bvh_intersect(
+                        *op, *a16, *nsize, *vaddr, nsa_vaddrs, *vdata, *srsrc,
+                    )
+                } else {
+                    self.translate_mimg(
+                        inst_idx, *op, *dmask, *dim, *d16, *vaddr, *vdata, *srsrc, *ssamp,
+                    )
+                }
+            }
             Rdna2Detail::Mubuf {
                 op,
                 offset,
@@ -12275,7 +12434,17 @@ impl IrEmitter {
                 vsrc,
                 ..
             } => self.translate_exp(*target, *en, *compr, *vsrc),
-            Rdna2Detail::Flat { .. } | Rdna2Detail::Unknown { .. } => false,
+            Rdna2Detail::Flat {
+                seg,
+                op,
+                offset,
+                lds,
+                addr,
+                saddr,
+                vdst,
+                ..
+            } => self.translate_flat(*seg, *op, *offset, *lds, *addr, *saddr, *vdst),
+            Rdna2Detail::Unknown { .. } => false,
         };
 
         if handled {
@@ -17177,6 +17346,444 @@ impl IrEmitter {
         }
     }
 
+    // -- Ray tracing BVH & FLAT/GLOBAL address-arena lowering (S65 / #1674) --
+
+    fn vec2_u32_ty(&mut self) -> Handle<Type> {
+        insert_type(
+            &mut self.module,
+            None,
+            TypeInner::Vector {
+                size: VectorSize::Bi,
+                scalar: Scalar::U32,
+            },
+        )
+    }
+
+    fn vec4_u32_ty(&mut self) -> Handle<Type> {
+        insert_type(
+            &mut self.module,
+            None,
+            TypeInner::Vector {
+                size: VectorSize::Quad,
+                scalar: Scalar::U32,
+            },
+        )
+    }
+
+    fn ensure_pg6_load32_stub(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_pg6_load32 {
+            return h;
+        }
+        let vec2_u32_ty = self.vec2_u32_ty();
+        // Use a non-digit-ending name (`pg6_load32_stub`) so Naga's namer never appends a
+        // disambiguating `_` suffix; `strip_rt_prelude_stubs` removes the stub definition and
+        // rewrites calls to the runtime prelude's `pg6_load32(`.
+        let mut f = Function {
+            name: Some("pg6_load32_stub".to_string()),
+            arguments: vec![FunctionArgument {
+                name: Some("addr".to_string()),
+                ty: vec2_u32_ty,
+                binding: None,
+            }],
+            result: Some(FunctionResult {
+                ty: self.types.u32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let zero = f
+            .expressions
+            .append(Expression::Literal(Literal::U32(0)), Span::UNDEFINED);
+        f.body
+            .push(Statement::Return { value: Some(zero) }, Span::UNDEFINED);
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_pg6_load32 = Some(h);
+        h
+    }
+
+    fn call_pg6_load32(&mut self, addr: Handle<Expression>) -> Handle<Expression> {
+        let f = self.ensure_pg6_load32_stub();
+        self.call_helper_1(f, addr)
+    }
+
+    fn ensure_pg6_bvh_intersect_stub(&mut self) -> Handle<Function> {
+        if let Some(h) = self.helper_pg6_bvh_intersect {
+            return h;
+        }
+        let vec4_u32_ty = self.vec4_u32_ty();
+        let vec2_u32_ty = self.vec2_u32_ty();
+        let mut f = Function {
+            name: Some("pg6_bvh_intersect".to_string()),
+            arguments: vec![
+                FunctionArgument {
+                    name: Some("desc".to_string()),
+                    ty: vec4_u32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("node".to_string()),
+                    ty: vec2_u32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("extent".to_string()),
+                    ty: self.types.f32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("origin".to_string()),
+                    ty: self.types.vec3_f32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("dir".to_string()),
+                    ty: self.types.vec3_f32_ty,
+                    binding: None,
+                },
+                FunctionArgument {
+                    name: Some("inv_dir".to_string()),
+                    ty: self.types.vec3_f32_ty,
+                    binding: None,
+                },
+            ],
+            result: Some(FunctionResult {
+                ty: vec4_u32_ty,
+                binding: None,
+            }),
+            ..Function::default()
+        };
+        let zero = f
+            .expressions
+            .append(Expression::ZeroValue(vec4_u32_ty), Span::UNDEFINED);
+        f.body
+            .push(Statement::Return { value: Some(zero) }, Span::UNDEFINED);
+        let h = self.module.functions.append(f, Span::UNDEFINED);
+        self.helper_pg6_bvh_intersect = Some(h);
+        h
+    }
+
+    fn call_pg6_bvh_intersect(
+        &mut self,
+        desc: Handle<Expression>,
+        node: Handle<Expression>,
+        extent: Handle<Expression>,
+        origin: Handle<Expression>,
+        dir: Handle<Expression>,
+        inv_dir: Handle<Expression>,
+    ) -> Handle<Expression> {
+        let f = self.ensure_pg6_bvh_intersect_stub();
+        let res = self
+            .func
+            .expressions
+            .append(Expression::CallResult(f), Span::UNDEFINED);
+        self.func.body.push(
+            Statement::Call {
+                function: f,
+                arguments: vec![desc, node, extent, origin, dir, inv_dir],
+                result: Some(res),
+            },
+            Span::UNDEFINED,
+        );
+        res
+    }
+
+    fn emit_add_u64(
+        &mut self,
+        a_lo: Handle<Expression>,
+        a_hi: Handle<Expression>,
+        b_lo: Handle<Expression>,
+        b_hi: Handle<Expression>,
+    ) -> (Handle<Expression>, Handle<Expression>) {
+        let sum_lo = self.emit_bin(BinaryOperator::Add, a_lo, b_lo);
+        let overflow = self.emit_bin(BinaryOperator::Less, sum_lo, a_lo);
+        let one = self.lit_u32(1);
+        let zero = self.lit_u32(0);
+        let carry = self.emit_select(overflow, one, zero);
+        let sum_hi_0 = self.emit_bin(BinaryOperator::Add, a_hi, b_hi);
+        let sum_hi = self.emit_bin(BinaryOperator::Add, sum_hi_0, carry);
+        (sum_lo, sum_hi)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn translate_bvh_intersect(
+        &mut self,
+        op: u8,
+        a16: bool,
+        nsize: u8,
+        vaddr: u8,
+        nsa_vaddrs: &[u8; 12],
+        vdata: u8,
+        srsrc: u8,
+    ) -> bool {
+        if self.stage == ShaderStage::Vertex || self.mesh_output.is_some() {
+            return false;
+        }
+        let is_64 = match op {
+            0xE6 => false,
+            0xE7 => true,
+            _ => return false,
+        };
+
+        let load_addr_f32 = |this: &mut Self, idx: u8| -> Handle<Expression> {
+            match mimg_addr_vgpr(vaddr, nsize, nsa_vaddrs, idx) {
+                Some(reg) => this.load_vgpr_f32(reg),
+                None => this.lit_f32(0.0),
+            }
+        };
+        let load_addr_u32 = |this: &mut Self, idx: u8| -> Handle<Expression> {
+            match mimg_addr_vgpr(vaddr, nsize, nsa_vaddrs, idx) {
+                Some(reg) => {
+                    let vf = this.load_vgpr_f32(reg);
+                    this.bitcast_f32_to_u32(vf)
+                }
+                None => this.lit_u32(0),
+            }
+        };
+
+        let srsrc_base = srsrc.saturating_mul(4);
+        let d0 = match checked_sgpr_reg(srsrc_base, 0) {
+            Some(r) => self.load_sgpr_u32(r),
+            None => self.lit_u32(0),
+        };
+        let d1 = match checked_sgpr_reg(srsrc_base, 1) {
+            Some(r) => self.load_sgpr_u32(r),
+            None => self.lit_u32(0),
+        };
+        let d2 = match checked_sgpr_reg(srsrc_base, 2) {
+            Some(r) => self.load_sgpr_u32(r),
+            None => self.lit_u32(0),
+        };
+        let d3 = match checked_sgpr_reg(srsrc_base, 3) {
+            Some(r) => self.load_sgpr_u32(r),
+            None => self.lit_u32(0),
+        };
+        let vec4_u32_ty = self.vec4_u32_ty();
+        let desc = self.emit_expr(Expression::Compose {
+            ty: vec4_u32_ty,
+            components: vec![d0, d1, d2, d3],
+        });
+
+        let node_lo = load_addr_u32(self, 0);
+        let (node_hi, base_idx) = if is_64 {
+            (load_addr_u32(self, 1), 2u8)
+        } else {
+            (self.lit_u32(0), 1u8)
+        };
+        let vec2_u32_ty = self.vec2_u32_ty();
+        let node = self.emit_expr(Expression::Compose {
+            ty: vec2_u32_ty,
+            components: vec![node_lo, node_hi],
+        });
+
+        let extent = load_addr_f32(self, base_idx);
+        let ox = load_addr_f32(self, base_idx + 1);
+        let oy = load_addr_f32(self, base_idx + 2);
+        let oz = load_addr_f32(self, base_idx + 3);
+        let origin = self.emit_expr(Expression::Compose {
+            ty: self.types.vec3_f32_ty,
+            components: vec![ox, oy, oz],
+        });
+
+        let dir_base = base_idx + 4;
+        let (dir, inv_dir) = if !a16 {
+            let dx = load_addr_f32(self, dir_base);
+            let dy = load_addr_f32(self, dir_base + 1);
+            let dz = load_addr_f32(self, dir_base + 2);
+            let ix = load_addr_f32(self, dir_base + 3);
+            let iy = load_addr_f32(self, dir_base + 4);
+            let iz = load_addr_f32(self, dir_base + 5);
+            let dir = self.emit_expr(Expression::Compose {
+                ty: self.types.vec3_f32_ty,
+                components: vec![dx, dy, dz],
+            });
+            let inv_dir = self.emit_expr(Expression::Compose {
+                ty: self.types.vec3_f32_ty,
+                components: vec![ix, iy, iz],
+            });
+            (dir, inv_dir)
+        } else {
+            let u0 = load_addr_u32(self, dir_base);
+            let u1 = load_addr_u32(self, dir_base + 1);
+            let u2 = load_addr_u32(self, dir_base + 2);
+            let p0 = self.emit_expr(Expression::Math {
+                fun: MathFunction::Unpack2x16float,
+                arg: u0,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            });
+            let p1 = self.emit_expr(Expression::Math {
+                fun: MathFunction::Unpack2x16float,
+                arg: u1,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            });
+            let p2 = self.emit_expr(Expression::Math {
+                fun: MathFunction::Unpack2x16float,
+                arg: u2,
+                arg1: None,
+                arg2: None,
+                arg3: None,
+            });
+            let dx = self.emit_expr(Expression::AccessIndex { base: p0, index: 0 });
+            let dy = self.emit_expr(Expression::AccessIndex { base: p0, index: 1 });
+            let dz = self.emit_expr(Expression::AccessIndex { base: p1, index: 0 });
+            let ix = self.emit_expr(Expression::AccessIndex { base: p1, index: 1 });
+            let iy = self.emit_expr(Expression::AccessIndex { base: p2, index: 0 });
+            let iz = self.emit_expr(Expression::AccessIndex { base: p2, index: 1 });
+            let dir = self.emit_expr(Expression::Compose {
+                ty: self.types.vec3_f32_ty,
+                components: vec![dx, dy, dz],
+            });
+            let inv_dir = self.emit_expr(Expression::Compose {
+                ty: self.types.vec3_f32_ty,
+                components: vec![ix, iy, iz],
+            });
+            (dir, inv_dir)
+        };
+
+        let res = self.call_pg6_bvh_intersect(desc, node, extent, origin, dir, inv_dir);
+        for c in 0..4u8 {
+            let comp = self.emit_expr(Expression::AccessIndex {
+                base: res,
+                index: u32::from(c),
+            });
+            self.store_vgpr_offset_u32(vdata, c, comp);
+        }
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn translate_flat(
+        &mut self,
+        seg: u8,
+        op: u8,
+        offset: i16,
+        lds: bool,
+        addr: u8,
+        saddr: u8,
+        vdst: u8,
+    ) -> bool {
+        if self.stage == ShaderStage::Vertex
+            || self.mesh_output.is_some()
+            || lds
+            || !matches!(seg, 0 | 2)
+        {
+            return false;
+        }
+        if !matches!(op, 0x08..=0x0F) {
+            return false;
+        }
+
+        let (mut cur_lo, mut cur_hi) = if seg == 2 && saddr != 0x7F {
+            let base_lo = match checked_sgpr_reg(saddr, 0) {
+                Some(r) => self.load_sgpr_u32(r),
+                None => self.lit_u32(0),
+            };
+            let base_hi = match checked_sgpr_reg(saddr, 1) {
+                Some(r) => self.load_sgpr_u32(r),
+                None => self.lit_u32(0),
+            };
+            let v_off_f = self.load_vgpr_f32(addr);
+            let v_off_lo = self.bitcast_f32_to_u32(v_off_f);
+            let v_off_hi = self.lit_u32(0);
+            self.emit_add_u64(base_lo, base_hi, v_off_lo, v_off_hi)
+        } else {
+            let lo_f = self.load_vgpr_f32(addr);
+            let lo = self.bitcast_f32_to_u32(lo_f);
+            let hi = match checked_vgpr_reg(addr, 1) {
+                Some(r) => {
+                    let f = self.load_vgpr_f32(r);
+                    self.bitcast_f32_to_u32(f)
+                }
+                None => self.lit_u32(0),
+            };
+            (lo, hi)
+        };
+
+        if offset != 0 {
+            let off64 = i64::from(offset) as u64;
+            let off_lo = self.lit_u32(off64 as u32);
+            let off_hi = self.lit_u32((off64 >> 32) as u32);
+            (cur_lo, cur_hi) = self.emit_add_u64(cur_lo, cur_hi, off_lo, off_hi);
+        }
+
+        let vec2_u32_ty = self.vec2_u32_ty();
+        match op {
+            0x0C | 0x0D | 0x0E | 0x0F => {
+                let count: u8 = match op {
+                    0x0C => 1,
+                    0x0D => 2,
+                    0x0F => 3,
+                    0x0E => 4,
+                    _ => unreachable!(),
+                };
+                for k in 0..count {
+                    let (w_lo, w_hi) = if k == 0 {
+                        (cur_lo, cur_hi)
+                    } else {
+                        let delta_lo = self.lit_u32(u32::from(k) * 4);
+                        let delta_hi = self.lit_u32(0);
+                        self.emit_add_u64(cur_lo, cur_hi, delta_lo, delta_hi)
+                    };
+                    let addr_vec = self.emit_expr(Expression::Compose {
+                        ty: vec2_u32_ty,
+                        components: vec![w_lo, w_hi],
+                    });
+                    let loaded = self.call_pg6_load32(addr_vec);
+                    self.store_vgpr_offset_u32(vdst, k, loaded);
+                }
+                true
+            }
+            0x08..=0x0B => {
+                let align_mask = self.lit_u32(!3u32);
+                let aligned_lo = self.emit_bin(BinaryOperator::And, cur_lo, align_mask);
+                let addr_vec = self.emit_expr(Expression::Compose {
+                    ty: vec2_u32_ty,
+                    components: vec![aligned_lo, cur_hi],
+                });
+                let word = self.call_pg6_load32(addr_vec);
+                let three = self.lit_u32(3);
+                let byte_off = self.emit_bin(BinaryOperator::And, cur_lo, three);
+                let three_shift = self.lit_u32(3);
+                let bit_shift = self.emit_bin(BinaryOperator::ShiftLeft, byte_off, three_shift);
+                let shifted = self.emit_bin(BinaryOperator::ShiftRight, word, bit_shift);
+                match op {
+                    0x08 => {
+                        let mask = self.lit_u32(0xFF);
+                        let val = self.emit_bin(BinaryOperator::And, shifted, mask);
+                        self.store_vgpr_u32(vdst, val);
+                    }
+                    0x09 => {
+                        let shifted_i = self.bitcast_u32_to_i32(shifted);
+                        let s24_l = self.lit_u32(24);
+                        let s24_r = self.lit_u32(24);
+                        let hi = self.emit_bin(BinaryOperator::ShiftLeft, shifted_i, s24_l);
+                        let sext = self.emit_bin(BinaryOperator::ShiftRight, hi, s24_r);
+                        self.store_vgpr_i32(vdst, sext);
+                    }
+                    0x0A => {
+                        let mask = self.lit_u32(0xFFFF);
+                        let val = self.emit_bin(BinaryOperator::And, shifted, mask);
+                        self.store_vgpr_u32(vdst, val);
+                    }
+                    0x0B => {
+                        let shifted_i = self.bitcast_u32_to_i32(shifted);
+                        let s16_l = self.lit_u32(16);
+                        let s16_r = self.lit_u32(16);
+                        let hi = self.emit_bin(BinaryOperator::ShiftLeft, shifted_i, s16_l);
+                        let sext = self.emit_bin(BinaryOperator::ShiftRight, hi, s16_r);
+                        self.store_vgpr_i32(vdst, sext);
+                    }
+                    _ => unreachable!(),
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     // -- Exec mask (single-lane model) --
 
     /// `s_*_saveexec_b32/b64` and `s_andn{1,2}_wrexec_b32/b64` on the single-lane
@@ -17865,6 +18472,91 @@ fn validate_emitted_wgsl_structure(
 /// built-ins (no `enable f16;` extension required in WebGPU).
 const BASELINE_WEBGPU_CAPABILITIES: Capabilities = Capabilities::SHADER_FLOAT16_IN_FLOAT32;
 
+/// Strip temporary Naga-validation stub definitions for runtime-owned RT prelude helpers
+/// (`fn pg6_load32_stub(...) { ... }` and `fn pg6_bvh_intersect(...) { ... }`) from emitted WGSL
+/// and rewrite `pg6_load32_stub(` call sites to `pg6_load32(`.
+fn strip_rt_prelude_stubs(wgsl: &str) -> String {
+    const STUB_PREFIXES: &[&str] = &["fn pg6_load32_stub(", "fn pg6_bvh_intersect("];
+    let bytes = wgsl.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+    let mut brace_depth = 0usize;
+    let mut block_comment_depth = 0usize;
+
+    while i < len {
+        if block_comment_depth > 0 {
+            if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+                block_comment_depth += 1;
+                out.push_str("/*");
+                i += 2;
+            } else if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                out.push_str("*/");
+                i += 2;
+            } else {
+                let ch = wgsl[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let start = i;
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            out.push_str(&wgsl[start..i]);
+            continue;
+        }
+        if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            block_comment_depth = 1;
+            out.push_str("/*");
+            i += 2;
+            continue;
+        }
+
+        if brace_depth == 0
+            && (i == 0
+                || matches!(bytes[i - 1], b'\n' | b'\r' | b' ' | b'\t'))
+            && STUB_PREFIXES.iter().any(|p| wgsl[i..].starts_with(p))
+        {
+            let mut j = i;
+            while j < len && bytes[j] != b'{' {
+                j += 1;
+            }
+            if j < len && bytes[j] == b'{' {
+                let mut depth = 1usize;
+                j += 1;
+                while j < len && depth > 0 {
+                    if bytes[j] == b'{' {
+                        depth += 1;
+                    } else if bytes[j] == b'}' {
+                        depth -= 1;
+                    }
+                    j += 1;
+                }
+                while j < len && matches!(bytes[j], b'\r' | b'\n') {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+
+        if bytes[i] == b'{' {
+            brace_depth += 1;
+        } else if bytes[i] == b'}' {
+            brace_depth = brace_depth.saturating_sub(1);
+        }
+        let ch = wgsl[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.replace("pg6_load32_stub(", "pg6_load32(")
+}
+
 /// Translate a raw little-endian AMD RDNA2 (GFX10.3 / Scarlett) shader binary into
 /// a complete, Naga-validated WebGPU WGSL module.
 ///
@@ -17913,12 +18605,17 @@ pub fn translate_rdna2_to_wgsl(
         .validate(&module)
         .map_err(|err| Rdna2TranslateError::NagaValidation(err.emit_to_string("")))?;
 
-    let wgsl_body = naga::back::wgsl::write_string(
+    let raw_wgsl_body = naga::back::wgsl::write_string(
         &module,
         &module_info,
         naga::back::wgsl::WriterFlags::empty(),
     )
     .map_err(|err| Rdna2TranslateError::WgslEmit(err.to_string()))?;
+    let wgsl_body = if plan.rt_arena {
+        strip_rt_prelude_stubs(&raw_wgsl_body)
+    } else {
+        raw_wgsl_body
+    };
 
     // Prepend strictly sanitized WGSL header & graceful fallback opcode comments.
     let mut raw_wgsl = String::with_capacity(wgsl_body.len() + 256);
@@ -17946,15 +18643,222 @@ pub fn translate_rdna2_to_wgsl(
     validate_emitted_wgsl_structure(&wgsl, &entry_point)?;
 
     // When `naga/wgsl-in` is active (unit tests), additionally round-trip parse & validate the
-    // final WGSL text (including comments) via `naga::front::wgsl::parse_str`.
+    // final WGSL text (including comments) via `naga::front::wgsl::parse_str`. For `rt_arena`
+    // shaders, prepend the runtime-owned v1 RT prelude before parsing, matching runtime behavior.
     #[cfg(test)]
     {
-        let reparsed = naga::front::wgsl::parse_str(&wgsl)
-            .map_err(|err| Rdna2TranslateError::WgslParse(err.emit_to_string(&wgsl)))?;
+        const TEST_RT_PRELUDE_V1: &str = r#"// pg6 runtime prelude, version 1 (rt_bvh.h kPreludeVersion). Group 3, bindings 16-21: contract C3.
+@group(3) @binding(16) var<storage, read_write> pg6_arena0: array<u32>;
+@group(3) @binding(17) var<storage, read_write> pg6_arena1: array<u32>;
+@group(3) @binding(18) var<storage, read_write> pg6_arena2: array<u32>;
+@group(3) @binding(19) var<storage, read_write> pg6_arena3: array<u32>;
+@group(3) @binding(20) var<storage, read> pg6_arena_dir: array<u32>;
+@group(3) @binding(21) var<storage, read_write> pg6_rt_stats: array<atomic<u32>>;
+
+fn pg6_load32(addr: vec2<u32>) -> u32 {
+    let page = (addr.x >> 16u) | ((addr.y & 0xffu) << 16u);
+    let t = pg6_arena_dir[page >> 12u];
+    if (t == 0u) {
+        atomicAdd(&pg6_rt_stats[0], 1u);
+        return 0u;
+    }
+    let e = pg6_arena_dir[4096u + (t - 1u) * 4096u + (page & 0xfffu)];
+    if ((e & 0x80000000u) == 0u) {
+        atomicAdd(&pg6_rt_stats[0], 1u);
+        return 0u;
+    }
+    let w = (e & 0x1fffffffu) * 16384u + ((addr.x & 0xffffu) >> 2u);
+    switch ((e >> 29u) & 3u) {
+        case 0u: { return pg6_arena0[w]; }
+        case 1u: { return pg6_arena1[w]; }
+        case 2u: { return pg6_arena2[w]; }
+        default: { return pg6_arena3[w]; }
+    }
+}
+
+fn pg6_add40(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let lo = a.x + b.x;
+    var carry = 0u;
+    if (lo < a.x) { carry = 1u; }
+    return vec2<u32>(lo, (a.y + b.y + carry) & 0xffu);
+}
+
+fn pg6_addr_off(a: vec2<u32>, off: u32) -> vec2<u32> {
+    return pg6_add40(a, vec2<u32>(off, 0u));
+}
+
+fn pg6_f(a: vec2<u32>, off: u32) -> f32 {
+    return bitcast<f32>(pg6_load32(pg6_addr_off(a, off)));
+}
+
+fn pg6_slab(mn: vec3<f32>, mx: vec3<f32>, o: vec3<f32>, inv: vec3<f32>, extent: f32) -> vec2<f32> {
+    var lo = 0.0;
+    var hi = extent;
+    for (var a = 0u; a < 3u; a = a + 1u) {
+        if (mn[a] > mx[a]) {
+            return vec2<f32>(0.0, 0.0);
+        }
+        let t0 = (mn[a] - o[a]) * inv[a];
+        let t1 = (mx[a] - o[a]) * inv[a];
+        if (t0 != t0 || t1 != t1) {
+            continue;
+        }
+        var a0 = t1;
+        var a1 = t0;
+        if (t0 < t1) {
+            a0 = t0;
+            a1 = t1;
+        }
+        if (a0 > lo) { lo = a0; }
+        if (a1 < hi) { hi = a1; }
+    }
+    if (lo <= hi) {
+        return vec2<f32>(1.0, lo);
+    }
+    return vec2<f32>(0.0, 0.0);
+}
+
+fn pg6_tri_miss() -> vec4<u32> {
+    return vec4<u32>(0x7f800000u, 0x3f800000u, 0u, 0u);
+}
+
+fn pg6_vec_nan(v: vec3<f32>) -> bool {
+    return v.x != v.x || v.y != v.y || v.z != v.z;
+}
+
+fn pg6_triangle(addr: vec2<u32>, kind: u32, o: vec3<f32>, d: vec3<f32>) -> vec4<u32> {
+    var vi = vec3<u32>(0u, 1u, 2u);
+    if (kind == 1u) { vi = vec3<u32>(1u, 3u, 2u); }
+    if (kind == 2u) { vi = vec3<u32>(2u, 3u, 4u); }
+    if (kind == 3u) { vi = vec3<u32>(2u, 4u, 0u); }
+    var v: array<vec3<f32>, 3>;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        let b = vi[i] * 12u;
+        v[i] = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u)) - o;
+    }
+    var kz = 0u;
+    var az = abs(d.x);
+    if (abs(d.y) > az) { kz = 1u; az = abs(d.y); }
+    if (abs(d.z) > az) { kz = 2u; }
+    let dz = d[kz];
+    if (dz == 0.0) {
+        return pg6_tri_miss();
+    }
+    var kx = (kz + 1u) % 3u;
+    var ky = (kx + 1u) % 3u;
+    if (dz < 0.0) {
+        let t = kx;
+        kx = ky;
+        ky = t;
+    }
+    let sx = d[kx] / dz;
+    let sy = d[ky] / dz;
+    let sz = 1.0 / dz;
+    var px: array<f32, 3>;
+    var py: array<f32, 3>;
+    var pz: array<f32, 3>;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        px[i] = v[i][kx] - sx * v[i][kz];
+        py[i] = v[i][ky] - sy * v[i][kz];
+        pz[i] = sz * v[i][kz];
+    }
+    let u = px[2] * py[1] - py[2] * px[1];
+    let vv = px[0] * py[2] - py[0] * px[2];
+    let w = px[1] * py[0] - py[1] * px[0];
+    if ((u < 0.0 || vv < 0.0 || w < 0.0) && (u > 0.0 || vv > 0.0 || w > 0.0)) {
+        return pg6_tri_miss();
+    }
+    let det = u + vv + w;
+    let t_num = u * pz[0] + vv * pz[1] + w * pz[2];
+    if (det == 0.0 || det != det || t_num != t_num || u != u || vv != vv || w != w) {
+        return pg6_tri_miss();
+    }
+    let sel = (pg6_load32(pg6_addr_off(addr, 60u)) >> (8u * kind)) & 0xffu;
+    var wt = array<f32, 4>(u, vv, w, 0.0);
+    return vec4<u32>(bitcast<u32>(t_num), bitcast<u32>(det), bitcast<u32>(wt[sel & 3u]),
+                     bitcast<u32>(wt[(sel >> 2u) & 3u]));
+}
+
+fn pg6_bvh_intersect(desc: vec4<u32>, node: vec2<u32>, extent: f32, origin: vec3<f32>, dir: vec3<f32>,
+                     inv_dir: vec3<f32>) -> vec4<u32> {
+    let kind = node.x & 7u;
+    if (kind >= 6u) {
+        return pg6_tri_miss();
+    }
+    let nan_ray = extent != extent || pg6_vec_nan(origin) || pg6_vec_nan(dir) || pg6_vec_nan(inv_dir);
+    let base = vec2<u32>(desc.x << 8u, ((desc.y & 0xffu) << 8u) | (desc.x >> 24u));
+    let idx = vec2<u32>((node.x >> 3u) | (node.y << 29u), node.y >> 3u);
+    let off = vec2<u32>(idx.x << 6u, (idx.y << 6u) | (idx.x >> 26u));
+    let addr = pg6_add40(base, off);
+    if (kind < 4u) {
+        if (nan_ray) {
+            return pg6_tri_miss();
+        }
+        return pg6_triangle(addr, kind, origin, dir);
+    }
+    if (nan_ray) {
+        return vec4<u32>(0xffffffffu);
+    }
+    var ptr: array<u32, 4>;
+    var key: array<f32, 4>;
+    var hit: array<bool, 4>;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        ptr[i] = pg6_load32(pg6_addr_off(addr, 4u * i));
+        var mn: vec3<f32>;
+        var mx: vec3<f32>;
+        if (kind == 5u) {
+            let b = 16u + 24u * i;
+            mn = vec3<f32>(pg6_f(addr, b), pg6_f(addr, b + 4u), pg6_f(addr, b + 8u));
+            mx = vec3<f32>(pg6_f(addr, b + 12u), pg6_f(addr, b + 16u), pg6_f(addr, b + 20u));
+        } else {
+            let b = 16u + 12u * i;
+            let a = unpack2x16float(pg6_load32(pg6_addr_off(addr, b)));
+            let bb = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 4u)));
+            let c = unpack2x16float(pg6_load32(pg6_addr_off(addr, b + 8u)));
+            mn = vec3<f32>(a.x, a.y, bb.x);
+            mx = vec3<f32>(bb.y, c.x, c.y);
+        }
+        key[i] = 0.0;
+        hit[i] = false;
+        if (ptr[i] != 0xffffffffu) {
+            let s = pg6_slab(mn, mx, origin, inv_dir, extent);
+            hit[i] = s.x > 0.5;
+            key[i] = s.y;
+        }
+    }
+    var out = vec4<u32>(0xffffffffu);
+    let sort = (desc.y >> 31u) != 0u;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        if (!hit[i]) {
+            continue;
+        }
+        var rank = i;
+        if (sort) {
+            rank = 0u;
+            for (var j = 0u; j < 4u; j = j + 1u) {
+                if (hit[j] && (key[j] < key[i] || (key[j] == key[i] && j < i))) {
+                    rank = rank + 1u;
+                }
+            }
+        }
+        out[rank] = ptr[i];
+    }
+    return out;
+}
+"#;
+        let combined: String;
+        let parse_src = if plan.rt_arena {
+            combined = format!("{TEST_RT_PRELUDE_V1}\n{wgsl}");
+            &combined
+        } else {
+            &wgsl
+        };
+        let reparsed = naga::front::wgsl::parse_str(parse_src)
+            .map_err(|err| Rdna2TranslateError::WgslParse(err.emit_to_string(parse_src)))?;
         let mut revalidator = Validator::new(ValidationFlags::all(), BASELINE_WEBGPU_CAPABILITIES);
         revalidator
             .validate(&reparsed)
-            .map_err(|err| Rdna2TranslateError::NagaValidation(err.emit_to_string(&wgsl)))?;
+            .map_err(|err| Rdna2TranslateError::NagaValidation(err.emit_to_string(parse_src)))?;
     }
 
     let output_locations: Vec<u32> = match plan.stage {
@@ -18016,6 +18920,15 @@ pub fn translate_rdna2_to_wgsl(
         bindings,
         vertex_inputs,
         mesh_output: plan.mesh_output,
+        rt_arena: plan.rt_arena,
+        rt_prelude_version: if plan.rt_arena {
+            Some(RT_PRELUDE_VERSION)
+        } else {
+            None
+        },
+        bvh_ops: plan.bvh_ops,
+        raw_address: plan.raw_address,
+        atomic64: plan.atomic64,
         binding_summary,
     })
 }

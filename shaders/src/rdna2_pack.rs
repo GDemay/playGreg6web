@@ -231,6 +231,11 @@ pub struct Rdna2PackEntrySummary {
     pub bindings: Vec<WgslBindingInfo>,
     pub vertex_inputs: Vec<WgslVertexInputInfo>,
     pub mesh_output: Option<MeshOutputLayout>,
+    pub rt_arena: bool,
+    pub rt_prelude_version: Option<u32>,
+    pub bvh_ops: u32,
+    pub raw_address: bool,
+    pub atomic64: bool,
 }
 
 /// Strictly sanitized record of an individual shader that failed packing (zero host paths,
@@ -371,6 +376,21 @@ impl Rdna2PackSummary {
                 if let Some(mesh_output) = entry.mesh_output {
                     out.push_str(",\n      \"mesh_output\": ");
                     write_mesh_output_json(&mut out, mesh_output);
+                }
+                if entry.rt_arena {
+                    out.push_str(",\n      \"rt_arena\": true");
+                }
+                if let Some(ver) = entry.rt_prelude_version {
+                    let _ = write!(out, ",\n      \"rt_prelude_version\": {ver}");
+                }
+                if entry.bvh_ops > 0 {
+                    let _ = write!(out, ",\n      \"bvh_ops\": {}", entry.bvh_ops);
+                }
+                if entry.raw_address {
+                    out.push_str(",\n      \"raw_address\": true");
+                }
+                if entry.atomic64 {
+                    out.push_str(",\n      \"atomic64\": true");
                 }
                 out.push('\n');
                 if i + 1 < self.entries.len() {
@@ -1606,6 +1626,11 @@ struct TranslatedStageData {
     bindings: Vec<WgslBindingInfo>,
     vertex_inputs: Vec<WgslVertexInputInfo>,
     mesh_output: Option<MeshOutputLayout>,
+    rt_arena: bool,
+    rt_prelude_version: Option<u32>,
+    bvh_ops: u32,
+    raw_address: bool,
+    atomic64: bool,
 }
 
 impl TranslatedStageData {
@@ -1621,6 +1646,11 @@ impl TranslatedStageData {
             bindings: output.bindings,
             vertex_inputs: output.vertex_inputs,
             mesh_output: output.mesh_output,
+            rt_arena: output.rt_arena,
+            rt_prelude_version: output.rt_prelude_version,
+            bvh_ops: output.bvh_ops,
+            raw_address: output.raw_address,
+            atomic64: output.atomic64,
         }
     }
 
@@ -1643,6 +1673,11 @@ impl TranslatedStageData {
             bindings: self.bindings,
             vertex_inputs: self.vertex_inputs,
             mesh_output: self.mesh_output,
+            rt_arena: self.rt_arena,
+            rt_prelude_version: self.rt_prelude_version,
+            bvh_ops: self.bvh_ops,
+            raw_address: self.raw_address,
+            atomic64: self.atomic64,
         };
         (entry, summary)
     }
