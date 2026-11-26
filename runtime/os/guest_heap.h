@@ -115,6 +115,11 @@ struct GuestHeapStats {
     uint64_t large_live_blocks = 0;
     uint64_t committed_bytes = 0;   // arena bytes this heap currently commits (segments + large)
     GuestHeapFamilyStats family[kHeapFamilyCount];
+    // Lock contention (global heap mutex): every acquisition, those that found it held and the
+    // total time spent blocked on them.
+    uint64_t lock_acquisitions = 0;
+    uint64_t lock_contended = 0;
+    uint64_t lock_wait_ns = 0;
 };
 
 struct HeapBlockInfo {
@@ -213,6 +218,12 @@ private:
 
     VirtualMemoryArena& arena_;
     mutable std::mutex mutex_;
+    // Acquisition counters, written only while mutex_ is held except the contended-wait time
+    // which is measured before and folded in after the acquisition.
+    mutable uint64_t lock_acquisitions_ = 0;
+    mutable uint64_t lock_contended_ = 0;
+    mutable uint64_t lock_wait_ns_ = 0;
+    friend class HeapLock;
     bool abandoned_ = false;
     uint64_t soft_limit_ = 0;
     uint32_t invalid_logged_ = 0;

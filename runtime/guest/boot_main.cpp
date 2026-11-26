@@ -702,6 +702,17 @@ playgta6::os::audio_wav_dump::Writer g_audio_dump;
 
 void write_outputs(bool print_summary) {
     finish_profile();
+    {
+        const os::GuestHeapStats heap = os::default_guest_heap().stats();
+        std::fprintf(stderr,
+                     "[harness] guest heap lock: %llu acquisitions, %llu contended, %.3f ms blocked "
+                     "(%llu allocs, %llu frees)\n",
+                     static_cast<unsigned long long>(heap.lock_acquisitions),
+                     static_cast<unsigned long long>(heap.lock_contended),
+                     static_cast<double>(heap.lock_wait_ns) / 1e6,
+                     static_cast<unsigned long long>(heap.total_allocs),
+                     static_cast<unsigned long long>(heap.total_frees));
+    }
     if (!g_options.audio_dump.empty()) {
         playgta6::os::audio_downmix::set_stereo_sink(nullptr, nullptr);
         g_audio_dump.close();
@@ -1171,6 +1182,9 @@ int main(int argc, char** argv) {
                 {"heap_live_blocks", heap.live_blocks},
                 {"heap_live_bytes", heap.live_bytes},
                 {"heap_total_allocs", heap.total_allocs},
+                {"heap_lock_acquisitions", heap.lock_acquisitions},
+                {"heap_lock_contended", heap.lock_contended},
+                {"heap_lock_wait_us", heap.lock_wait_ns / 1000},
                 {"frame_waits", waits.waits},
                 {"frame_wait_us", waits.wait_us},
                 {"frame_polls", waits.polls},
