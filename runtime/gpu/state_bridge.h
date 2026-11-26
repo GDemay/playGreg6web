@@ -545,6 +545,25 @@ public:
     void note_resource_used(uint32_t resource_id);
     bool is_resource_used_in_frame(uint32_t resource_id) const;
     uint64_t resource_last_use_tick(uint32_t resource_id) const;
+    // Holds the retire lock once across a scan over many resources (an LRU eviction loop), instead
+    // of two lock round trips per candidate through is_resource_used_in_frame / resource_last_use_tick.
+    // Do not call other StateBridgeDevice methods that take the retire lock while one is alive.
+    class ResourceUseScan {
+    public:
+        explicit ResourceUseScan(const StateBridgeDevice& device)
+            : device_(device), lock_(device.retire_mutex_) {}
+        bool in_frame(uint32_t resource_id) const {
+            return resource_id != 0 && device_.frame_used_resources_.count(resource_id) != 0;
+        }
+        uint64_t last_use_tick(uint32_t resource_id) const {
+            if (resource_id == 0) return 0;
+            const auto it = device_.resource_last_use_.find(resource_id);
+            return it != device_.resource_last_use_.end() ? it->second : 0u;
+        }
+    private:
+        const StateBridgeDevice& device_;
+        std::lock_guard<std::mutex> lock_;
+    };
     // Emits DestroyResource(resource_id) into `encoder`, or defers it until after Present if
     // `resource_id` was referenced in the current frame. Returns true if deferred.
     bool destroy_or_defer_resource(uint32_t resource_id, CommandEncoder& encoder);
