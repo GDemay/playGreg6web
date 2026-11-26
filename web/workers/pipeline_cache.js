@@ -41,14 +41,79 @@
   const PIPELINE_PRIORITY_ALIASES = Object.freeze({
     critical: 'critical',
     urgent: 'critical',
+    demand: 'critical',
+    drawn: 'critical',
     high: 'high',
     normal: 'normal',
     default: 'normal',
     medium: 'normal',
     low: 'low',
     background: 'low',
+    prewarm: 'low',
+    warmup: 'low',
     idle: 'low',
   });
+
+  const PIPELINE_FAILURE_REASON = Object.freeze({
+    VALIDATION: 'validation',
+    WGSL_COMPILE: 'wgsl_compile',
+    LAYOUT_MISMATCH: 'layout_mismatch',
+    UNSUPPORTED_FEATURE: 'unsupported_feature',
+    DEVICE_LOST: 'device_lost',
+    NULL_PIPELINE: 'null_pipeline',
+    OTHER: 'other',
+  });
+
+  function createEmptyQuarantineReasonCounts() {
+    return {
+      validation: 0,
+      wgsl_compile: 0,
+      layout_mismatch: 0,
+      unsupported_feature: 0,
+      device_lost: 0,
+      null_pipeline: 0,
+      other: 0,
+    };
+  }
+
+  function classifyQuarantineReason(err) {
+    if (err && typeof err === 'object') {
+      if (err.reason === 'destroyed' || err.reason === 'unknown' || err.name === 'GPUDeviceLostError') {
+        return PIPELINE_FAILURE_REASON.DEVICE_LOST;
+      }
+      if (err.cause && err.cause !== err && classifyQuarantineReason(err.cause) === PIPELINE_FAILURE_REASON.DEVICE_LOST) {
+        return PIPELINE_FAILURE_REASON.DEVICE_LOST;
+      }
+    }
+    const msg = typeof err === 'string'
+      ? err
+      : (err && typeof err.message === 'string' ? err.message : '');
+    const name = err && typeof err === 'object' && typeof err.name === 'string' ? err.name : '';
+
+    if (/\b(?:gpu\s*)?device\s+(was\s+)?(lost|destroyed|unavailable)\b|\bgpu\s*device\s*lost\b|\bno\s+gpu\s+device\b/i.test(msg)) {
+      return PIPELINE_FAILURE_REASON.DEVICE_LOST;
+    }
+    if (/\b(?:returned|resolved)\s+(?:no|null|empty|undefined)\s+pipeline\b|\b(?:null|empty)\s+pipeline\b/i.test(msg)) {
+      return PIPELINE_FAILURE_REASON.NULL_PIPELINE;
+    }
+    if (/\blayout\b|\bbind\s*group\b|\bbinding\s+mismatch\b|\bpipeline\s*layout\b|\b@group\s*\(/i.test(msg)) {
+      return PIPELINE_FAILURE_REASON.LAYOUT_MISMATCH;
+    }
+    if (/\bunsupported\b|\bnot\s+supported\b|\bfeature\b|\blimit\b|\bexceeds\s+max\b|\bextension\b|\bstorage\s+texture\s+format\b/i.test(msg)) {
+      return PIPELINE_FAILURE_REASON.UNSUPPORTED_FEATURE;
+    }
+    if (/\bwgsl\b|\btint\b|\bshader\b|\bentry\s*point\b|\bsyntax\b|\bparse\b|\bspir-?v\b|\bnaga\b/i.test(msg)) {
+      return PIPELINE_FAILURE_REASON.WGSL_COMPILE;
+    }
+    if (
+      name === 'GPUValidationError' ||
+      (typeof GPUValidationError === 'function' && err instanceof GPUValidationError) ||
+      /\bvalidation\b|\binvalid\b|\bformat\s+mismatch\b|\btype\s+mismatch\b/i.test(msg)
+    ) {
+      return PIPELINE_FAILURE_REASON.VALIDATION;
+    }
+    return PIPELINE_FAILURE_REASON.OTHER;
+  }
 
   // WebGPU GPUShaderStage bitmask values with headless/Node fallbacks.
   const SHADER_STAGE_BITS = Object.freeze({
@@ -2689,58 +2754,82 @@
     throw new TypeError('Binding visibility must be a GPUShaderStage bitmask, stage string, or stage array');
   }
 
-  function normalizeReflectionBinding(raw, idx) {
+  function isRtArenaReflectionBinding(raw) {
+    if (!raw || typeof raw !== 'object') return false;
+    const src = raw.source;
+    return Boolean(src && typeof src === 'object' && (src.rt_arena === true || src.kind === 'rt_arena'));
+  }
+
+  function normalizeReflectionBinding(raw, idx, options = null) {
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
       throw new TypeError(`Reflection binding at index ${idx} must be an object`);
     }
-    if (!Number.isInteger(raw.binding) || raw.binding < 0) {
+    const sourceEntry =
+      raw.layoutEntry && typeof raw.layoutEntry === 'object' && !Array.isArray(raw.layoutEntry)
+        ? raw.layoutEntry
+        : raw;
+
+    const bindingIndex =
+      Number.isInteger(sourceEntry.binding) && sourceEntry.binding >= 0
+        ? sourceEntry.binding
+        : raw.binding;
+    if (!Number.isInteger(bindingIndex) || bindingIndex < 0) {
       throw new RangeError(`Reflection binding at index ${idx} must have a non-negative integer "binding"`);
     }
 
+    const rawVisibility =
+      sourceEntry.visibility !== undefined ? sourceEntry.visibility : raw.visibility;
     const entry = {
-      binding: raw.binding,
-      visibility: normalizeVisibility(raw.visibility),
+      binding: bindingIndex,
+      visibility: normalizeVisibility(rawVisibility),
     };
 
-    if (raw.buffer && typeof raw.buffer === 'object') {
+    if (sourceEntry.buffer && typeof sourceEntry.buffer === 'object') {
       const b = {};
-      if (raw.buffer.type !== undefined) b.type = raw.buffer.type;
+      if (sourceEntry.buffer.type !== undefined) b.type = sourceEntry.buffer.type;
       const hasDynamicOffset =
-        raw.buffer.hasDynamicOffset !== undefined
-          ? raw.buffer.hasDynamicOffset
-          : raw.buffer.has_dynamic_offset;
+        sourceEntry.buffer.hasDynamicOffset !== undefined
+          ? sourceEntry.buffer.hasDynamicOffset
+          : sourceEntry.buffer.has_dynamic_offset;
       if (hasDynamicOffset !== undefined) b.hasDynamicOffset = Boolean(hasDynamicOffset);
       const minBindingSize =
-        raw.buffer.minBindingSize !== undefined
-          ? raw.buffer.minBindingSize
-          : raw.buffer.min_binding_size;
+        sourceEntry.buffer.minBindingSize !== undefined
+          ? sourceEntry.buffer.minBindingSize
+          : sourceEntry.buffer.min_binding_size;
       if (minBindingSize !== undefined) b.minBindingSize = Number(minBindingSize);
       entry.buffer = b;
     }
 
-    if (raw.sampler && typeof raw.sampler === 'object') {
+    if (sourceEntry.sampler && typeof sourceEntry.sampler === 'object') {
       const s = {};
-      if (raw.sampler.type !== undefined) {
-        s.type = normalizeDefaultSamplerKind(raw.sampler.type);
+      if (sourceEntry.sampler.type !== undefined) {
+        s.type = normalizeDefaultSamplerKind(sourceEntry.sampler.type);
       }
       entry.sampler = s;
     }
 
-    if (raw.texture && typeof raw.texture === 'object') {
+    if (sourceEntry.texture && typeof sourceEntry.texture === 'object') {
       const tx = {};
       const sampleType =
-        raw.texture.sampleType !== undefined ? raw.texture.sampleType : raw.texture.sample_type;
+        sourceEntry.texture.sampleType !== undefined
+          ? sourceEntry.texture.sampleType
+          : sourceEntry.texture.sample_type;
       if (sampleType !== undefined) tx.sampleType = sampleType;
       const viewDimension =
-        raw.texture.viewDimension !== undefined
-          ? raw.texture.viewDimension
-          : raw.texture.view_dimension;
+        sourceEntry.texture.viewDimension !== undefined
+          ? sourceEntry.texture.viewDimension
+          : sourceEntry.texture.view_dimension;
       if (viewDimension !== undefined) tx.viewDimension = viewDimension;
-      if (raw.texture.multisampled !== undefined) tx.multisampled = Boolean(raw.texture.multisampled);
+      if (sourceEntry.texture.multisampled !== undefined) {
+        tx.multisampled = Boolean(sourceEntry.texture.multisampled);
+      }
       entry.texture = tx;
     }
 
-    const rawStorageTex = raw.storageTexture !== undefined ? raw.storageTexture : raw.storage_texture;
+    const rawStorageTex =
+      sourceEntry.storageTexture !== undefined
+        ? sourceEntry.storageTexture
+        : sourceEntry.storage_texture;
     if (rawStorageTex && typeof rawStorageTex === 'object') {
       const st = {};
       if (rawStorageTex.access !== undefined) st.access = rawStorageTex.access;
@@ -2753,9 +2842,31 @@
       entry.storageTexture = st;
     }
 
-    const rawExternalTex = raw.externalTexture !== undefined ? raw.externalTexture : raw.external_texture;
+    const rawExternalTex =
+      sourceEntry.externalTexture !== undefined
+        ? sourceEntry.externalTexture
+        : sourceEntry.external_texture;
     if (rawExternalTex && typeof rawExternalTex === 'object') {
       entry.externalTexture = {};
+    }
+
+    // W379: Support v3 lane-indexed heap binding arrays when explicitly opted in.
+    if (options && options.bindingArrays === true) {
+      const explicitArraySize =
+        sourceEntry.bindingArraySize !== undefined
+          ? sourceEntry.bindingArraySize
+          : sourceEntry.binding_array_size !== undefined
+            ? sourceEntry.binding_array_size
+            : raw.source &&
+                typeof raw.source === 'object' &&
+                (raw.source.kind === 'lane_indexed_resource_heap' ||
+                  raw.source.kind === 'lane_indexed_sampler_heap') &&
+                Number.isInteger(raw.source.maxCount)
+              ? raw.source.maxCount
+              : undefined;
+      if (Number.isInteger(explicitArraySize) && explicitArraySize >= 1 && explicitArraySize <= 256) {
+        entry.bindingArraySize = explicitArraySize;
+      }
     }
 
     return entry;
@@ -4091,6 +4202,12 @@
     if (options.priorityTier !== undefined && options.priorityTier !== null) {
       return normalizePipelinePriority(options.priorityTier);
     }
+    if (options.drawn === true || options.demand === true) {
+      return PIPELINE_PRIORITY_TIERS.CRITICAL;
+    }
+    if (options.warmup === true || options.prewarm === true) {
+      return PIPELINE_PRIORITY_TIERS.LOW;
+    }
     return null;
   }
 
@@ -4100,7 +4217,16 @@
     }
     for (const k in options) {
       if (!Object.prototype.hasOwnProperty.call(options, k)) continue;
-      if (k === 'priority' || k === 'priorityTier') continue;
+      if (
+        k === 'priority' ||
+        k === 'priorityTier' ||
+        k === 'drawn' ||
+        k === 'demand' ||
+        k === 'warmup' ||
+        k === 'prewarm'
+      ) {
+        continue;
+      }
       const v = options[k];
       if (v !== undefined && typeof v !== 'function') {
         return true;
@@ -4276,6 +4402,14 @@
       this._inFlightCompute = new Map();
       this._inFlightPriorities = new Map();
       this._quarantinedKeys = new Map();
+      this._quarantineHitsByReason = createEmptyQuarantineReasonCounts();
+      this._quarantineFailuresByReason = createEmptyQuarantineReasonCounts();
+      this._asyncPipelineCache =
+        options.asyncPipelineCache && typeof options.asyncPipelineCache === 'object'
+          ? options.asyncPipelineCache
+          : null;
+      this._activePrewarmQueues = new Set();
+      this._drawnFirstPromotions = 0;
       this._generation = 0;
       this._shaderPackGeneration = 0;
       this._accessSeq = 0;
@@ -4508,26 +4642,33 @@
 
       const synthesized = [];
       for (let i = 0; i < layoutEntries.length; i += 1) {
-        const entry = layoutEntries[i];
+        const rawEntry = layoutEntries[i];
+        if (!rawEntry || typeof rawEntry !== 'object' || isRtArenaReflectionBinding(rawEntry)) {
+          continue;
+        }
+        const entry =
+          rawEntry.layoutEntry && typeof rawEntry.layoutEntry === 'object'
+            ? rawEntry.layoutEntry
+            : rawEntry;
+        const bindingIndex =
+          Number.isInteger(entry.binding) && entry.binding >= 0 ? entry.binding : rawEntry.binding;
         if (
-          !entry ||
-          typeof entry !== 'object' ||
           !entry.sampler ||
           typeof entry.sampler !== 'object' ||
-          !Number.isInteger(entry.binding) ||
-          entry.binding < 0
+          !Number.isInteger(bindingIndex) ||
+          bindingIndex < 0
         ) {
           continue;
         }
-        if (boundSet.has(entry.binding)) {
+        if (boundSet.has(bindingIndex)) {
           continue;
         }
         const samplerKind = normalizeDefaultSamplerKind(entry.sampler.type);
         const sampler = this.getOrCreateDefaultSampler(samplerKind);
-        byBinding.set(entry.binding, { binding: entry.binding, resource: sampler });
-        boundSet.add(entry.binding);
+        byBinding.set(bindingIndex, { binding: bindingIndex, resource: sampler });
+        boundSet.add(bindingIndex);
         synthesized.push({
-          binding: entry.binding,
+          binding: bindingIndex,
           kind: samplerKind,
           resource: sampler,
         });
@@ -5259,7 +5400,10 @@
     }
 
     _quarantineKey(key, kind, err) {
-      if (!this._quarantineFailedKeys) {
+      const reasonBucket = classifyQuarantineReason(err);
+      this._quarantineFailuresByReason[reasonBucket] =
+        (this._quarantineFailuresByReason[reasonBucket] || 0) + 1;
+      if (!this._quarantineFailedKeys || reasonBucket === PIPELINE_FAILURE_REASON.DEVICE_LOST) {
         return;
       }
       const ts = this._now();
@@ -5270,6 +5414,7 @@
       if (existing !== undefined) {
         existing.kind = kind;
         existing.reason = sanitizedReason;
+        existing.reasonBucket = reasonBucket;
         existing.errorType = errorType;
         existing.failureCount += 1;
         existing.lastFailedAt = ts;
@@ -5283,6 +5428,7 @@
         key,
         kind,
         reason: sanitizedReason,
+        reasonBucket,
         errorType,
         failureCount: 1,
         hitCount: 0,
@@ -5329,7 +5475,160 @@
       this._quarantinedKeys.delete(key);
       this._quarantinedKeys.set(key, entry);
       this._stats.quarantineHits += 1;
+      const bucket = entry.reasonBucket || PIPELINE_FAILURE_REASON.OTHER;
+      this._quarantineHitsByReason[bucket] = (this._quarantineHitsByReason[bucket] || 0) + 1;
       return true;
+    }
+
+    _getQuarantinedByReason() {
+      const counts = createEmptyQuarantineReasonCounts();
+      for (const entry of this._quarantinedKeys.values()) {
+        const bucket = entry.reasonBucket || PIPELINE_FAILURE_REASON.OTHER;
+        counts[bucket] = (counts[bucket] || 0) + 1;
+      }
+      return counts;
+    }
+
+    /**
+     * W379: Attach (or detach with null) a companion `AsyncPipelineCache` so drawn-first priority
+     * promotions forward cleanly from `WebGpuPipelineCache` into the async compile queue.
+     *
+     * @param {object | null} asyncPipelineCache
+     */
+    attachAsyncPipelineCache(asyncPipelineCache) {
+      this._asyncPipelineCache =
+        asyncPipelineCache && typeof asyncPipelineCache === 'object' ? asyncPipelineCache : null;
+    }
+
+    _resolveOptionalKey(keyOrDescriptor, keyHint) {
+      if (keyHint !== undefined && keyHint !== null) {
+        try {
+          return this._resolveKey(keyOrDescriptor, keyHint);
+        } catch (_err) {
+          return null;
+        }
+      }
+      if (typeof keyOrDescriptor === 'string') {
+        return keyOrDescriptor.length > 0 ? keyOrDescriptor : null;
+      }
+      if (typeof keyOrDescriptor === 'bigint' || typeof keyOrDescriptor === 'number') {
+        try {
+          return this._resolveKey(null, keyOrDescriptor);
+        } catch (_err) {
+          return null;
+        }
+      }
+      if (keyOrDescriptor && typeof keyOrDescriptor === 'object' && !Array.isArray(keyOrDescriptor)) {
+        try {
+          return hashDescriptorKey(keyOrDescriptor);
+        } catch (_err) {
+          return null;
+        }
+      }
+      return null;
+    }
+
+    _promoteKeyOnDraw(key, kind = null, rawHint = undefined) {
+      let promoted = false;
+      if (key !== null && key !== undefined) {
+        if (kind === null || kind === 'render') {
+          if (this._renderPipelines.has(key)) {
+            this._getLru(this._renderPipelines, key, PIPELINE_PRIORITY_TIERS.CRITICAL);
+          }
+          if (this._inFlightRender.has(key)) {
+            this._recordInFlightPriority('render', key, PIPELINE_PRIORITY_TIERS.CRITICAL);
+          }
+        }
+        if (kind === null || kind === 'compute') {
+          if (this._computePipelines.has(key)) {
+            this._getLru(this._computePipelines, key, PIPELINE_PRIORITY_TIERS.CRITICAL);
+          }
+          if (this._inFlightCompute.has(key)) {
+            this._recordInFlightPriority('compute', key, PIPELINE_PRIORITY_TIERS.CRITICAL);
+          }
+        }
+        for (const q of this._activePrewarmQueues) {
+          if (kind !== null && q.kind !== kind) continue;
+          if (q.promoteKey(key)) {
+            promoted = true;
+          }
+        }
+      }
+
+      const asyncCache = this._asyncPipelineCache;
+      if (asyncCache) {
+        const candidates = [];
+        if (rawHint !== undefined && rawHint !== null) candidates.push(rawHint);
+        if (key !== null && key !== undefined && key !== rawHint) candidates.push(key);
+        for (let i = 0; i < candidates.length; i += 1) {
+          const target = candidates[i];
+          if (typeof asyncCache.promoteOnDraw === 'function') {
+            if (asyncCache.promoteOnDraw(target, kind)) promoted = true;
+          } else if (typeof asyncCache.promote === 'function') {
+            if (asyncCache.promote(target, 'critical', kind)) promoted = true;
+          }
+        }
+      }
+
+      if (promoted) {
+        this._drawnFirstPromotions += 1;
+      }
+      return promoted;
+    }
+
+    /**
+     * W379: Promote a pipeline needed by an active 3D draw ahead of queued background prewarm work,
+     * forwarding to any active prewarm pool and attached `AsyncPipelineCache`.
+     *
+     * @param {string | bigint | number | object} keyOrDescriptor
+     * @param {string | bigint | number | object} [keyHint]
+     * @param {'render' | 'compute' | null} [kind]
+     * @returns {boolean}
+     */
+    promoteOnDraw(keyOrDescriptor, keyHint, kind = null) {
+      let resolvedKind = kind;
+      let resolvedHint = keyHint;
+      if ((keyHint === 'render' || keyHint === 'compute') && kind === null) {
+        resolvedKind = keyHint;
+        resolvedHint = undefined;
+      }
+      const key = this._resolveOptionalKey(keyOrDescriptor, resolvedHint);
+      let promoted = this._promoteKeyOnDraw(key, resolvedKind, resolvedHint !== undefined ? resolvedHint : keyOrDescriptor);
+      if (!promoted && keyOrDescriptor && typeof keyOrDescriptor === 'object' && !Array.isArray(keyOrDescriptor)) {
+        try {
+          if (
+            (resolvedKind === null || resolvedKind === 'render') &&
+            (Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'vertex') ||
+              Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'fragment'))
+          ) {
+            const norm = this.normalizeRenderDescriptor(keyOrDescriptor);
+            const normKey = hashDescriptorKey(norm.descriptor);
+            if (normKey !== key && this._promoteKeyOnDraw(normKey, 'render', undefined)) {
+              promoted = true;
+            }
+          }
+          if (
+            (resolvedKind === null || resolvedKind === 'compute') &&
+            Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'compute')
+          ) {
+            const norm = normalizeComputePipelineDescriptor(keyOrDescriptor);
+            const normKey = hashDescriptorKey(norm.descriptor);
+            if (normKey !== key && this._promoteKeyOnDraw(normKey, 'compute', undefined)) {
+              promoted = true;
+            }
+          }
+        } catch (_err) {
+          // Ignore normalization failure during best-effort draw promotion.
+        }
+      }
+      return promoted;
+    }
+
+    /**
+     * W379: Alias for `promoteOnDraw` when notifying the cache of an actively drawn pipeline.
+     */
+    markDrawn(keyOrDescriptor, keyHint, kind = null) {
+      return this.promoteOnDraw(keyOrDescriptor, keyHint, kind);
     }
 
     /**
@@ -5411,6 +5710,7 @@
           key: sanitizePipelineErrorMessage(entry.key, MAX_PIPELINE_ERROR_KEY_LENGTH),
           kind: entry.kind,
           reason: entry.reason,
+          reasonBucket: entry.reasonBucket || PIPELINE_FAILURE_REASON.OTHER,
           errorType: entry.errorType,
           failureCount: entry.failureCount,
           hitCount: entry.hitCount,
@@ -5423,14 +5723,63 @@
     }
 
     /**
-     * Clear all quarantined failed pipeline keys so future lookups may retry compilation.
+     * W379: Return a sanitized summary of failed-pipeline quarantine counts grouped by fixed
+     * reason bucket (`validation`, `wgsl_compile`, `layout_mismatch`, `unsupported_feature`,
+     * `device_lost`, `null_pipeline`, `other`).
+     */
+    getQuarantineSummary() {
+      return {
+        enabled: this._quarantineFailedKeys,
+        maxQuarantined: this._maxQuarantinedKeys,
+        totalQuarantined: this._quarantinedKeys.size,
+        quarantineHits: this._stats.quarantineHits,
+        evictions: this._stats.negativeCacheEvictions,
+        byReason: this._getQuarantinedByReason(),
+        hitsByReason: { ...this._quarantineHitsByReason },
+        failuresByReason: { ...this._quarantineFailuresByReason },
+      };
+    }
+
+    /**
+     * Clear all quarantined failed pipeline keys (or a single specified key/descriptor)
+     * so future lookups may retry compilation.
      *
+     * @param {string | bigint | number | object} [keyOrDescriptor]
+     * @param {string | bigint | number | object} [keyHint]
      * @returns {number} Number of quarantined entries removed
      */
-    clearQuarantine() {
-      const removed = this._quarantinedKeys.size;
-      this._quarantinedKeys.clear();
-      return removed;
+    clearQuarantine(keyOrDescriptor, keyHint) {
+      if (keyOrDescriptor === undefined) {
+        const removed = this._quarantinedKeys.size;
+        this._quarantinedKeys.clear();
+        return removed;
+      }
+      const key = this._resolveOptionalKey(keyOrDescriptor, keyHint);
+      if (key !== null && this._quarantinedKeys.delete(key)) {
+        return 1;
+      }
+      if (keyOrDescriptor && typeof keyOrDescriptor === 'object' && !Array.isArray(keyOrDescriptor)) {
+        try {
+          if (
+            Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'vertex') ||
+            Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'fragment')
+          ) {
+            const norm = this.normalizeRenderDescriptor(keyOrDescriptor);
+            if (this._quarantinedKeys.delete(hashDescriptorKey(norm.descriptor))) {
+              return 1;
+            }
+          }
+          if (Object.prototype.hasOwnProperty.call(keyOrDescriptor, 'compute')) {
+            const norm = normalizeComputePipelineDescriptor(keyOrDescriptor);
+            if (this._quarantinedKeys.delete(hashDescriptorKey(norm.descriptor))) {
+              return 1;
+            }
+          }
+        } catch (_err) {
+          return 0;
+        }
+      }
+      return 0;
     }
 
     /**
@@ -5613,18 +5962,27 @@
       }
 
       const seenBindings = new Set();
-      const entries = new Array(rawEntries.length);
+      const entries = [];
       for (let i = 0; i < rawEntries.length; i += 1) {
         const rawEntry = rawEntries[i];
+        if (
+          rawEntry &&
+          typeof rawEntry === 'object' &&
+          (rawEntry.inLayout === false ||
+            rawEntry.in_layout === false ||
+            isRtArenaReflectionBinding(rawEntry))
+        ) {
+          continue;
+        }
         if (!hasInlineSampler && entryHasInlineSampler(rawEntry)) {
           hasInlineSampler = true;
         }
-        const normalized = normalizeReflectionBinding(rawEntry, i);
+        const normalized = normalizeReflectionBinding(rawEntry, i, options || null);
         if (seenBindings.has(normalized.binding)) {
           throw new Error(`Duplicate reflection binding index ${normalized.binding}`);
         }
         seenBindings.add(normalized.binding);
-        entries[i] = normalized;
+        entries.push(normalized);
       }
 
       // Sort by binding index so semantically identical reflection groups share one cache key.
@@ -6044,6 +6402,13 @@
         );
         this._stats.renderHits += 1;
         return Promise.resolve(cached);
+      }
+
+      const isDrawnPriority =
+        priority === PIPELINE_PRIORITY_TIERS.CRITICAL ||
+        Boolean(opts && (opts.drawn === true || opts.demand === true));
+      if (isDrawnPriority) {
+        this._promoteKeyOnDraw(key, 'render', keyHint);
       }
 
       const existing = this._inFlightRender.get(key);
@@ -6623,6 +6988,13 @@
         return Promise.resolve(cached);
       }
 
+      const isDrawnPriority =
+        priority === PIPELINE_PRIORITY_TIERS.CRITICAL ||
+        Boolean(options && (options.drawn === true || options.demand === true));
+      if (isDrawnPriority) {
+        this._promoteKeyOnDraw(key, 'compute', keyHint);
+      }
+
       const existing = this._inFlightCompute.get(key);
       if (existing !== undefined) {
         this._recordInFlightPriority('compute', key, priority);
@@ -6795,6 +7167,49 @@
       let cached = 0;
       let deduped = 0;
 
+      const itemKeys = new Array(list.length);
+      for (let i = 0; i < list.length; i += 1) {
+        const item = list[i];
+        const wrapped = isDescriptorWrapper(item);
+        const desc = wrapped ? item.descriptor : item;
+        const keyHint = wrapped ? item.keyHint : undefined;
+        try {
+          if (keyHint !== undefined && keyHint !== null) {
+            itemKeys[i] = this._resolveKey(null, keyHint);
+          } else {
+            const rawItemOpts = wrapped ? item.options : undefined;
+            const normPreview = isRender
+              ? this.normalizeRenderDescriptor(desc, rawItemOpts)
+              : normalizeComputePipelineDescriptor(desc);
+            itemKeys[i] = this._resolveKey(normPreview.descriptor, undefined);
+          }
+        } catch (_err) {
+          itemKeys[i] = null;
+        }
+      }
+
+      const activeQueueHandle = {
+        kind: isRender ? 'render' : 'compute',
+        promoteKey(targetKey) {
+          for (let pos = cursor; pos < workOrder.length; pos += 1) {
+            const origIdx = workOrder[pos];
+            if (itemKeys[origIdx] === targetKey) {
+              const prev = itemPriorities[origIdx];
+              const alreadyCritical = prev === PIPELINE_PRIORITY_TIERS.CRITICAL;
+              itemPriorities[origIdx] = PIPELINE_PRIORITY_TIERS.CRITICAL;
+              if (pos > cursor) {
+                workOrder.splice(pos, 1);
+                workOrder.splice(cursor, 0, origIdx);
+                return true;
+              }
+              return !alreadyCritical;
+            }
+          }
+          return false;
+        },
+      };
+      this._activePrewarmQueues.add(activeQueueHandle);
+
       const worker = async () => {
         while (cursor < workOrder.length) {
           const origIdx = workOrder[cursor++];
@@ -6846,7 +7261,11 @@
       for (let i = 0; i < workerCount; i += 1) {
         workers.push(worker());
       }
-      await Promise.all(workers);
+      try {
+        await Promise.all(workers);
+      } finally {
+        this._activePrewarmQueues.delete(activeQueueHandle);
+      }
 
       return {
         total: list.length,
@@ -7045,6 +7464,9 @@
       this._compileLatencyCount = 0;
       this._pipelineErrors.length = 0;
       this._pipelineErrorSeq = 0;
+      this._quarantineHitsByReason = createEmptyQuarantineReasonCounts();
+      this._quarantineFailuresByReason = createEmptyQuarantineReasonCounts();
+      this._drawnFirstPromotions = 0;
     }
 
     /**
@@ -7184,7 +7606,7 @@
           ? this._stats.reclaimedCount
           : 0;
 
-      return {
+      const stats = {
         hits: totalHits,
         misses: totalMisses,
         pipelineHits,
@@ -7265,6 +7687,26 @@
           },
         },
       };
+      // W379: Attach sanitized quarantine reason breakdown & draw promotion counters as
+      // non-enumerable properties so legacy deepEqual snapshots keep their exact own-enumerable shape.
+      Object.defineProperties(stats, {
+        quarantinedByReason: {
+          value: this._getQuarantinedByReason(),
+          enumerable: false,
+          configurable: true,
+        },
+        quarantineFailuresByReason: {
+          value: { ...this._quarantineFailuresByReason },
+          enumerable: false,
+          configurable: true,
+        },
+        drawnFirstPromotions: {
+          value: this._drawnFirstPromotions,
+          enumerable: false,
+          configurable: true,
+        },
+      });
+      return stats;
     }
   }
 
@@ -7278,6 +7720,7 @@
     DEFAULT_COMPILE_LATENCY_WINDOW_SIZE,
     PIPELINE_PRIORITY_TIERS,
     PIPELINE_PRIORITY_RANKS,
+    PIPELINE_FAILURE_REASON,
     DEFAULT_MAX_ERROR_HISTORY,
     DEFAULT_MAX_QUARANTINED_KEYS,
     DEFAULT_MAX_NEGATIVE_CACHE_ENTRIES,
@@ -7309,6 +7752,7 @@
     buildFallbackBindGroupLayoutDescriptor,
     normalizeRenderPipelineDescriptor,
     sanitizePipelineErrorMessage,
+    classifyQuarantineReason,
     WebGpuPipelineCache,
   };
 

@@ -9,9 +9,13 @@
   /** Supported S6 layout-manifest.json schema_version (shaders/src/reflect.rs). */
   const LAYOUT_MANIFEST_SCHEMA_VERSION = 1;
 
-  /** Supported stage-reflection sidecar (`*.reflect.json`) schema & version (runtime/gpu/stage_reflection.h). */
+  /** Supported stage-reflection sidecar (`*.reflect.json`) schema & versions (runtime/gpu/stage_reflection.h). */
   const STAGE_REFLECTION_SCHEMA = 'playgta6-stage-reflection';
   const STAGE_REFLECTION_VERSION = 1;
+  const STAGE_REFLECTION_MIN_VERSION = 1;
+  const STAGE_REFLECTION_VERSION_ROOT_TABLE_OFFSET = 2;
+  const STAGE_REFLECTION_VERSION_UNRESOLVED = 3;
+  const STAGE_REFLECTION_MAX_VERSION = 3;
 
   /** WebGPU baseline maxBindGroups (groups 0..3). */
   const MAX_WEBGPU_BIND_GROUPS = 4;
@@ -22,12 +26,27 @@
   /** Maximum valid bit-shift for S34 dynamic descriptor-heap index calculations (0..31). */
   const MAX_HEAP_INDEX_SHIFT = 31;
 
+  /** Largest lane-indexed heap window a sidecar may request (runtime/gpu/stage_reflection.h). */
+  const MAX_LANE_INDEXED_WINDOW = 256;
+
+  /** Mesh output layout bounds matching runtime/gpu/state_bridge.h (G66). */
+  const MAX_MESH_VERTICES = 256;
+  const MAX_MESH_PRIMITIVES = 256;
+  const MAX_MESH_ATTRIBUTES = 15;
+
+  /** Runtime-owned RT arena bind group & binding slots (group 3, bindings 16..21 -> mask 0x3f). */
+  const RT_ARENA_BIND_GROUP = 3;
+  const RT_ARENA_FIRST_BINDING = 16;
+  const RT_ARENA_LAST_BINDING = 21;
+  const RT_ARENA_FULL_MASK = 0x3f;
+
   /** Exact GFX10 S# dword count for #950 / S43 inline sampler sources. */
   const INLINE_SAMPLER_SDWORD_COUNT = 4;
 
   /** Console ABI user-data SGPR bases & descriptor-table slot size (runtime/gpu/stage_reflection.h). */
   const GRAPHICS_USER_DATA_BASE = 8;
   const COMPUTE_USER_DATA_BASE = 4;
+  const MESH_USER_DATA_BASE = 16;
   const TABLE_SLOT_BYTES = 32;
   const UNBOUNDED_DESCRIPTOR_COUNT = 0xffffffff;
   const DESCRIPTOR_RANGE_OFFSET_APPEND = 0xffffffff;
@@ -52,6 +71,9 @@
     MISSING_STORAGE_FORMAT: 'MISSING_STORAGE_FORMAT',
     MIN_BINDING_SIZE_MISALIGNED: 'MIN_BINDING_SIZE_MISALIGNED',
     MIN_BINDING_SIZE_UNEXPECTED: 'MIN_BINDING_SIZE_UNEXPECTED',
+    UNRESOLVED_WRITABLE_BINDING: 'UNRESOLVED_WRITABLE_BINDING',
+    BINDING_ARRAYS_UNSUPPORTED: 'BINDING_ARRAYS_UNSUPPORTED',
+    RT_ARENA_GROUP_CONFLICT: 'RT_ARENA_GROUP_CONFLICT',
   });
 
   /** WebGPU GPUShaderStage bitmask constants with headless/Node fallbacks. */
@@ -551,7 +573,10 @@
         key = `rc:${source.userSgpr}`;
         break;
       case 'root_descriptor':
-        key = `rd:${source.userSgpr}`;
+        key =
+          source.rootTableOffsetGiven === true
+            ? `rd:${source.userSgpr}:t:${source.tableByteOffset}`
+            : `rd:${source.userSgpr}`;
         break;
       case 'static_sampler':
         key = `ss:${source.index}`;
@@ -568,6 +593,33 @@
             ? `rhb:${source.userSgpr === undefined ? '' : source.userSgpr}`
             : `rh:${source.baseUserSgpr}:${source.stride}:${source.indexUserSgpr}:${source.indexShift}`;
         break;
+      case 'cbv_indexed_sampler_heap':
+      case 'cbv_indexed_resource_heap': {
+        const tag = source.kind === 'cbv_indexed_sampler_heap' ? 'csh' : 'crh';
+        const cbv = source.cbv;
+        const tOff = cbv.kind === 'table' ? cbv.tableByteOffset : '';
+        key = `${tag}:${cbv.kind}:${cbv.userSgpr}:${tOff}:${source.byteOffset}:${source.bitOffset}:${source.mask}:${source.shift}:${source.stride}`;
+        break;
+      }
+      case 'lane_indexed_sampler_heap':
+      case 'lane_indexed_resource_heap': {
+        const tag = source.kind === 'lane_indexed_sampler_heap' ? 'lsh' : 'lrh';
+        let wbKey = '0';
+        if (source.hasWindowBase && source.windowBase) {
+          const wb = source.windowBase;
+          const cbv = wb.cbv;
+          const tOff = cbv.kind === 'table' ? cbv.tableByteOffset : '';
+          wbKey = `1:${cbv.kind}:${cbv.userSgpr}:${tOff}:${wb.byteOffset}:${wb.bitOffset}:${wb.mask}`;
+        }
+        key = `${tag}:${source.maxCount}:${source.shift}:${source.stride}:${wbKey}`;
+        break;
+      }
+      case 'unresolved':
+        key = `u:${source.reason === null || source.reason === undefined ? '' : source.reason}`;
+        break;
+      case 'rt_arena':
+        key = 'rt:1';
+        break;
       default:
         return source;
     }
@@ -578,6 +630,19 @@
     }
     if (source.kind === 'inline_sampler' && Array.isArray(source.sdwords)) {
       Object.freeze(source.sdwords);
+    } else if (
+      (source.kind === 'cbv_indexed_sampler_heap' || source.kind === 'cbv_indexed_resource_heap') &&
+      source.cbv
+    ) {
+      Object.freeze(source.cbv);
+    } else if (
+      (source.kind === 'lane_indexed_sampler_heap' || source.kind === 'lane_indexed_resource_heap') &&
+      source.windowBase
+    ) {
+      if (source.windowBase.cbv) {
+        Object.freeze(source.windowBase.cbv);
+      }
+      Object.freeze(source.windowBase);
     }
     Object.freeze(source);
     pool.set(key, source);
@@ -1205,26 +1270,240 @@
     };
   }
 
+  function parseCbvDwordSpec(rawBody, path) {
+    if (!isPlainObject(rawBody)) {
+      throw new ManifestValidationError('CBV dword descriptor must be an object', path);
+    }
+    const rawCbv = rawBody.cbv;
+    if (!isPlainObject(rawCbv)) {
+      throw new ManifestValidationError('cbv must be an object', `${path}.cbv`);
+    }
+    if (!isNonNegativeInt(rawCbv.user_sgpr)) {
+      throw new ManifestValidationError(
+        `cbv.user_sgpr must be a non-negative uint32 safe integer, got ${JSON.stringify(rawCbv.user_sgpr)}`,
+        `${path}.cbv.user_sgpr`
+      );
+    }
+    if (hasOwn(rawCbv, 'root_descriptor') && typeof rawCbv.root_descriptor !== 'boolean') {
+      throw new ManifestValidationError('cbv.root_descriptor must be a boolean', `${path}.cbv.root_descriptor`);
+    }
+    if (hasOwn(rawCbv, 'root_constants') && typeof rawCbv.root_constants !== 'boolean') {
+      throw new ManifestValidationError('cbv.root_constants must be a boolean', `${path}.cbv.root_constants`);
+    }
+    const isRootDesc = rawCbv.root_descriptor === true;
+    const isRootConsts = rawCbv.root_constants === true;
+    const hasTableOff = hasOwn(rawCbv, 'table_byte_offset') && rawCbv.table_byte_offset !== undefined;
+    const modeCount = (isRootDesc ? 1 : 0) + (isRootConsts ? 1 : 0) + (hasTableOff ? 1 : 0);
+    if (modeCount !== 1) {
+      throw new ManifestValidationError(
+        'cbv must specify exactly one of root_descriptor: true, root_constants: true, or table_byte_offset',
+        `${path}.cbv`
+      );
+    }
+    let cbv;
+    if (isRootDesc) {
+      cbv = { kind: 'root_descriptor', userSgpr: rawCbv.user_sgpr };
+    } else if (isRootConsts) {
+      cbv = { kind: 'root_constants', userSgpr: rawCbv.user_sgpr };
+    } else {
+      if (!isNonNegativeInt(rawCbv.table_byte_offset)) {
+        throw new ManifestValidationError(
+          `cbv.table_byte_offset must be a non-negative uint32 safe integer, got ${JSON.stringify(rawCbv.table_byte_offset)}`,
+          `${path}.cbv.table_byte_offset`
+        );
+      }
+      cbv = {
+        kind: 'table',
+        userSgpr: rawCbv.user_sgpr,
+        tableByteOffset: rawCbv.table_byte_offset,
+      };
+    }
+
+    if (!isNonNegativeInt(rawBody.byte_offset) || rawBody.byte_offset % 4 !== 0) {
+      throw new ManifestValidationError(
+        `byte_offset must be a dword-aligned non-negative uint32 integer, got ${JSON.stringify(rawBody.byte_offset)}`,
+        `${path}.byte_offset`
+      );
+    }
+    let bitOffset = 0;
+    if (rawBody.bit_offset !== undefined && rawBody.bit_offset !== null) {
+      if (!isNonNegativeInt(rawBody.bit_offset) || rawBody.bit_offset > MAX_HEAP_INDEX_SHIFT) {
+        throw new ManifestValidationError(
+          `bit_offset must be an integer in 0..${MAX_HEAP_INDEX_SHIFT}, got ${JSON.stringify(rawBody.bit_offset)}`,
+          `${path}.bit_offset`
+        );
+      }
+      bitOffset = rawBody.bit_offset;
+    }
+    let mask = U32_MAX;
+    if (rawBody.mask !== undefined && rawBody.mask !== null) {
+      if (!isNonNegativeInt(rawBody.mask) || rawBody.mask === 0) {
+        throw new ManifestValidationError(
+          `mask must be a non-zero uint32 integer, got ${JSON.stringify(rawBody.mask)}`,
+          `${path}.mask`
+        );
+      }
+      mask = rawBody.mask;
+    }
+    return {
+      cbv,
+      byteOffset: rawBody.byte_offset,
+      bitOffset,
+      mask,
+    };
+  }
+
+  function parseCbvIndexedHeapBindingSource(kind, rawBody, path) {
+    if (!isPlainObject(rawBody)) {
+      throw new ManifestValidationError(`${kind} must be an object`, path);
+    }
+    const spec = parseCbvDwordSpec(rawBody, path);
+    if (!isNonNegativeInt(rawBody.shift) || rawBody.shift > MAX_HEAP_INDEX_SHIFT) {
+      throw new ManifestValidationError(
+        `${kind}.shift must be an integer in 0..${MAX_HEAP_INDEX_SHIFT}, got ${JSON.stringify(rawBody.shift)}`,
+        `${path}.shift`
+      );
+    }
+    let stride = 0;
+    if (rawBody.stride !== undefined && rawBody.stride !== null) {
+      if (!isNonNegativeInt(rawBody.stride)) {
+        throw new ManifestValidationError(
+          `${kind}.stride must be a non-negative uint32 integer, got ${JSON.stringify(rawBody.stride)}`,
+          `${path}.stride`
+        );
+      }
+      stride = rawBody.stride;
+    }
+    const out = {
+      kind,
+      cbv: spec.cbv,
+      userSgpr: spec.cbv.userSgpr,
+      byteOffset: spec.byteOffset,
+      bitOffset: spec.bitOffset,
+      mask: spec.mask,
+      shift: rawBody.shift,
+      stride,
+    };
+    if (spec.cbv.kind === 'table') {
+      out.tableByteOffset = spec.cbv.tableByteOffset;
+    }
+    return out;
+  }
+
+  function parseLaneIndexedHeapBindingSource(kind, rawBody, path) {
+    if (!isPlainObject(rawBody)) {
+      throw new ManifestValidationError(`${kind} must be an object`, path);
+    }
+    if (
+      !isNonNegativeInt(rawBody.max_count) ||
+      rawBody.max_count < 1 ||
+      rawBody.max_count > MAX_LANE_INDEXED_WINDOW
+    ) {
+      throw new ManifestValidationError(
+        `${kind}.max_count must be an integer in 1..${MAX_LANE_INDEXED_WINDOW}, got ${JSON.stringify(rawBody.max_count)}`,
+        `${path}.max_count`
+      );
+    }
+    if (!isNonNegativeInt(rawBody.shift) || rawBody.shift > MAX_HEAP_INDEX_SHIFT) {
+      throw new ManifestValidationError(
+        `${kind}.shift must be an integer in 0..${MAX_HEAP_INDEX_SHIFT}, got ${JSON.stringify(rawBody.shift)}`,
+        `${path}.shift`
+      );
+    }
+    let stride = 0;
+    if (rawBody.stride !== undefined && rawBody.stride !== null) {
+      if (!isNonNegativeInt(rawBody.stride)) {
+        throw new ManifestValidationError(
+          `${kind}.stride must be a non-negative uint32 integer, got ${JSON.stringify(rawBody.stride)}`,
+          `${path}.stride`
+        );
+      }
+      stride = rawBody.stride;
+    }
+    let windowBase = null;
+    if (rawBody.window_base !== undefined && rawBody.window_base !== null) {
+      windowBase = parseCbvDwordSpec(rawBody.window_base, `${path}.window_base`);
+    }
+    return {
+      kind,
+      maxCount: rawBody.max_count,
+      shift: rawBody.shift,
+      stride,
+      hasWindowBase: windowBase !== null,
+      windowBase,
+    };
+  }
+
+  function parseMeshOutputLayout(rawMesh, path) {
+    if (!isPlainObject(rawMesh)) {
+      throw new ManifestValidationError('mesh_output must be an object', path);
+    }
+    const maxVertices =
+      rawMesh.max_vertices !== undefined ? rawMesh.max_vertices : rawMesh.maxVertices;
+    const maxPrimitives =
+      rawMesh.max_primitives !== undefined ? rawMesh.max_primitives : rawMesh.maxPrimitives;
+    const vertexWords =
+      rawMesh.vertex_words !== undefined ? rawMesh.vertex_words : rawMesh.vertexWords;
+    const maxVertexWords = 4 + 4 * MAX_MESH_ATTRIBUTES;
+
+    if (!isNonNegativeInt(maxVertices) || maxVertices < 1 || maxVertices > MAX_MESH_VERTICES) {
+      throw new ManifestValidationError(
+        `mesh_output.max_vertices must be an integer in 1..${MAX_MESH_VERTICES}, got ${JSON.stringify(maxVertices)}`,
+        `${path}.max_vertices`
+      );
+    }
+    if (!isNonNegativeInt(maxPrimitives) || maxPrimitives < 1 || maxPrimitives > MAX_MESH_PRIMITIVES) {
+      throw new ManifestValidationError(
+        `mesh_output.max_primitives must be an integer in 1..${MAX_MESH_PRIMITIVES}, got ${JSON.stringify(maxPrimitives)}`,
+        `${path}.max_primitives`
+      );
+    }
+    if (
+      !isNonNegativeInt(vertexWords) ||
+      vertexWords < 4 ||
+      vertexWords % 4 !== 0 ||
+      vertexWords > maxVertexWords
+    ) {
+      throw new ManifestValidationError(
+        `mesh_output.vertex_words must be 4 + 4 * n (4..${maxVertexWords}), got ${JSON.stringify(vertexWords)}`,
+        `${path}.vertex_words`
+      );
+    }
+    return Object.freeze({
+      maxVertices,
+      maxPrimitives,
+      vertexWords,
+      max_vertices: maxVertices,
+      max_primitives: maxPrimitives,
+      vertex_words: vertexWords,
+    });
+  }
+
   /**
    * Parse and normalize a binding `source` entry matching `WgslBindingSource` in
-   * `shaders/src/rdna2_to_wgsl.rs`, `runtime/gpu/stage_reflection.cpp`, and
+   * `shaders/src/rdna2_to_wgsl.rs`, `runtime/gpu/stage_reflection.cpp` (v1/v2/v3), and
    * `tools/stage_reflection_sidecar.py`:
    * - `{"sampler_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
    * - `{"resource_heap": {"base_user_sgpr", "stride", "index": {"user_sgpr", "shift"}}}`
    * - `{"resource_heap": true}` (or `{"user_sgpr", "resource_heap": true}`)
+   * - `{"cbv_indexed_resource_heap" | "cbv_indexed_sampler_heap": {"cbv", "byte_offset", "shift", "bit_offset"?, "mask"?, "stride"?}}`
+   * - `{"lane_indexed_resource_heap" | "lane_indexed_sampler_heap": {"max_count", "shift", "stride"?, "window_base"?}}`
    * - `{"inline_sampler": {"sdwords": [d0, d1, d2, d3]}}`
+   * - `{"unresolved": true | "<reason>"}` (version >= 3; rejected for writable `storage` / `storage_texture`)
+   * - `{"rt_arena": true}` (group 3, bindings 16..21)
    * - `{"user_sgpr", "table_byte_offset"}`
    * - `{"user_sgpr", "root_constants": true}`
-   * - `{"user_sgpr", "root_descriptor": true}`
+   * - `{"user_sgpr", "root_descriptor": true, "table_byte_offset"? (v2+)}`
    * - `{"static_sampler": <u32>}`
    *
    * Returns `null` when `rawSource` is `undefined` or `null`.
    *
    * @param {unknown} rawSource
    * @param {string} [path]
+   * @param {{ version?: number, bindingKind?: string | null }} [options]
    * @returns {object | null}
    */
-  function parseBindingSource(rawSource, path = 'source') {
+  function parseBindingSource(rawSource, path = 'source', options = null) {
     if (rawSource === undefined || rawSource === null) {
       return null;
     }
@@ -1232,9 +1511,22 @@
       throw new ManifestValidationError('binding source must be an object or null', path);
     }
 
+    const version =
+      options && typeof options.version === 'number'
+        ? options.version
+        : STAGE_REFLECTION_MAX_VERSION;
+    const bindingKind =
+      options && typeof options.bindingKind === 'string' ? options.bindingKind : null;
+
     const hasSamplerHeap = hasOwn(rawSource, 'sampler_heap');
     const hasResourceHeap = hasOwn(rawSource, 'resource_heap');
+    const hasCbvSamplerHeap = hasOwn(rawSource, 'cbv_indexed_sampler_heap');
+    const hasCbvResourceHeap = hasOwn(rawSource, 'cbv_indexed_resource_heap');
+    const hasLaneSamplerHeap = hasOwn(rawSource, 'lane_indexed_sampler_heap');
+    const hasLaneResourceHeap = hasOwn(rawSource, 'lane_indexed_resource_heap');
     const hasInlineSampler = hasOwn(rawSource, 'inline_sampler');
+    const hasUnresolved = hasOwn(rawSource, 'unresolved');
+    const hasRtArena = hasOwn(rawSource, 'rt_arena');
     const hasStaticSampler = hasOwn(rawSource, 'static_sampler');
     const hasUserSgpr = hasOwn(rawSource, 'user_sgpr');
     const hasTableByteOffset = hasOwn(rawSource, 'table_byte_offset');
@@ -1248,8 +1540,17 @@
       );
     }
 
+    const hasV2V3Special =
+      hasCbvSamplerHeap ||
+      hasCbvResourceHeap ||
+      hasLaneSamplerHeap ||
+      hasLaneResourceHeap ||
+      hasUnresolved ||
+      hasRtArena;
+
     if (hasResourceHeap && rawSource.resource_heap === true) {
       if (
+        hasV2V3Special ||
         hasInlineSampler ||
         hasStaticSampler ||
         hasTableByteOffset ||
@@ -1283,6 +1584,7 @@
     if (hasSamplerHeap || hasResourceHeap) {
       const heapKey = hasSamplerHeap ? 'sampler_heap' : 'resource_heap';
       if (
+        hasV2V3Special ||
         hasInlineSampler ||
         hasStaticSampler ||
         hasUserSgpr ||
@@ -1298,8 +1600,64 @@
       return parseHeapBindingSource(heapKey, rawSource[heapKey], `${path}.${heapKey}`);
     }
 
+    if (hasCbvSamplerHeap || hasCbvResourceHeap) {
+      if (hasCbvSamplerHeap && hasCbvResourceHeap) {
+        throw new ManifestValidationError(
+          'binding source cannot define both cbv_indexed_sampler_heap and cbv_indexed_resource_heap',
+          path
+        );
+      }
+      const key = hasCbvSamplerHeap ? 'cbv_indexed_sampler_heap' : 'cbv_indexed_resource_heap';
+      if (
+        hasLaneSamplerHeap ||
+        hasLaneResourceHeap ||
+        hasInlineSampler ||
+        hasUnresolved ||
+        hasRtArena ||
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          `${key} source cannot be combined with other binding source fields`,
+          path
+        );
+      }
+      return parseCbvIndexedHeapBindingSource(key, rawSource[key], `${path}.${key}`);
+    }
+
+    if (hasLaneSamplerHeap || hasLaneResourceHeap) {
+      if (hasLaneSamplerHeap && hasLaneResourceHeap) {
+        throw new ManifestValidationError(
+          'binding source cannot define both lane_indexed_sampler_heap and lane_indexed_resource_heap',
+          path
+        );
+      }
+      const key = hasLaneSamplerHeap ? 'lane_indexed_sampler_heap' : 'lane_indexed_resource_heap';
+      if (
+        hasInlineSampler ||
+        hasUnresolved ||
+        hasRtArena ||
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          `${key} source cannot be combined with other binding source fields`,
+          path
+        );
+      }
+      return parseLaneIndexedHeapBindingSource(key, rawSource[key], `${path}.${key}`);
+    }
+
     if (hasInlineSampler) {
       if (
+        hasUnresolved ||
+        hasRtArena ||
         hasStaticSampler ||
         hasUserSgpr ||
         hasTableByteOffset ||
@@ -1312,6 +1670,64 @@
         );
       }
       return parseInlineSamplerBindingSource(rawSource.inline_sampler, `${path}.inline_sampler`);
+    }
+
+    if (hasRtArena) {
+      if (
+        hasUnresolved ||
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          'rt_arena source cannot be combined with other binding source fields',
+          path
+        );
+      }
+      if (rawSource.rt_arena !== true) {
+        throw new ManifestValidationError('rt_arena source must be true', `${path}.rt_arena`);
+      }
+      return {
+        kind: 'rt_arena',
+        rtArena: true,
+      };
+    }
+
+    if (hasUnresolved) {
+      if (
+        hasStaticSampler ||
+        hasUserSgpr ||
+        hasTableByteOffset ||
+        hasRootConstants ||
+        hasRootDescriptor
+      ) {
+        throw new ManifestValidationError(
+          'unresolved source cannot be combined with other binding source fields',
+          path
+        );
+      }
+      const rawUnresolved = rawSource.unresolved;
+      const marked =
+        rawUnresolved === true || (typeof rawUnresolved === 'string' && rawUnresolved.length > 0);
+      if (version < STAGE_REFLECTION_VERSION_UNRESOLVED || !marked) {
+        throw new ManifestValidationError(
+          'unresolved source needs "unresolved": true or a non-empty reason string, and version >= 3',
+          `${path}.unresolved`
+        );
+      }
+      if (bindingKind === 'storage' || bindingKind === 'storage_texture') {
+        throw new ManifestValidationError(
+          `a ${bindingKind} binding cannot have an unresolved source`,
+          `${path}.unresolved`
+        );
+      }
+      return {
+        kind: 'unresolved',
+        unresolved: true,
+        reason: typeof rawUnresolved === 'string' ? rawUnresolved : null,
+      };
     }
 
     if (hasStaticSampler) {
@@ -1356,25 +1772,44 @@
       const isRootConstants = rawSource.root_constants === true;
       const isRootDescriptor = rawSource.root_descriptor === true;
       const isTable = hasTableByteOffset && rawSource.table_byte_offset !== undefined;
-      const modeCount = (isRootConstants ? 1 : 0) + (isRootDescriptor ? 1 : 0) + (isTable ? 1 : 0);
 
-      if (modeCount !== 1) {
-        throw new ManifestValidationError(
-          'user_sgpr source must specify exactly one of table_byte_offset, root_constants: true, or root_descriptor: true',
-          path
-        );
-      }
       if (isRootConstants) {
+        if (isRootDescriptor || isTable) {
+          throw new ManifestValidationError(
+            'user_sgpr source must specify exactly one of table_byte_offset, root_constants: true, or root_descriptor: true',
+            path
+          );
+        }
         return {
           kind: 'root_constants',
           userSgpr: rawSource.user_sgpr,
         };
       }
       if (isRootDescriptor) {
+        if (isTable && version >= STAGE_REFLECTION_VERSION_ROOT_TABLE_OFFSET) {
+          if (!isNonNegativeInt(rawSource.table_byte_offset)) {
+            throw new ManifestValidationError(
+              `bad root_descriptor table_byte_offset ${JSON.stringify(rawSource.table_byte_offset)}`,
+              `${path}.table_byte_offset`
+            );
+          }
+          return {
+            kind: 'root_descriptor',
+            userSgpr: rawSource.user_sgpr,
+            tableByteOffset: rawSource.table_byte_offset,
+            rootTableOffsetGiven: true,
+          };
+        }
         return {
           kind: 'root_descriptor',
           userSgpr: rawSource.user_sgpr,
         };
+      }
+      if (!isTable) {
+        throw new ManifestValidationError(
+          'user_sgpr source must specify exactly one of table_byte_offset, root_constants: true, or root_descriptor: true',
+          path
+        );
       }
       if (!isNonNegativeInt(rawSource.table_byte_offset)) {
         throw new ManifestValidationError(
@@ -1397,7 +1832,7 @@
     }
 
     throw new ManifestValidationError(
-      'unrecognized binding source (expected sampler_heap, resource_heap, inline_sampler, static_sampler, or user_sgpr)',
+      'unrecognized binding source (expected sampler_heap, resource_heap, cbv_indexed_*_heap, lane_indexed_*_heap, inline_sampler, unresolved, rt_arena, static_sampler, or user_sgpr)',
       path
     );
   }
@@ -2465,6 +2900,7 @@
    * raw JSON payload or parse-time interning tables after `parseStageReflectionSidecar` returns.
    */
   function createParsedStageSidecar(
+    version,
     stages,
     stagesByHash,
     stagesByBareHex,
@@ -2479,6 +2915,11 @@
     const resourceHeapBindings = totals.resourceHeapBindings;
     const samplerHeapBindings = totals.samplerHeapBindings;
     const vertexIndexStages = totals.vertexIndexStages;
+    const unresolvedBindings = totals.unresolvedBindings || 0;
+    const cbvIndexedHeapBindings = totals.cbvIndexedHeapBindings || 0;
+    const laneIndexedHeapBindings = totals.laneIndexedHeapBindings || 0;
+    const meshOutputStages = totals.meshOutputStages || 0;
+    const rtArenaStages = totals.rtArenaStages || 0;
 
     const negativeHashCache = new Set();
     const negativeQueryCache = new Set();
@@ -2501,10 +2942,17 @@
       samplerHeapBindings,
       vertexIndexStages,
     };
+    Object.defineProperties(summary, {
+      unresolvedBindings: { value: unresolvedBindings, enumerable: false, configurable: true },
+      cbvIndexedHeapBindings: { value: cbvIndexedHeapBindings, enumerable: false, configurable: true },
+      laneIndexedHeapBindings: { value: laneIndexedHeapBindings, enumerable: false, configurable: true },
+      meshOutputStages: { value: meshOutputStages, enumerable: false, configurable: true },
+      rtArenaStages: { value: rtArenaStages, enumerable: false, configurable: true },
+    });
 
     return {
       schema: STAGE_REFLECTION_SCHEMA,
-      version: STAGE_REFLECTION_VERSION,
+      version,
       stages,
       stagesByHash,
       _byHashBigInt: stagesByHash,
@@ -2518,6 +2966,11 @@
       resourceHeapBindings,
       samplerHeapBindings,
       vertexIndexStages,
+      unresolvedBindings,
+      cbvIndexedHeapBindings,
+      laneIndexedHeapBindings,
+      meshOutputStages,
+      rtArenaStages,
       summary,
       getStageByHashFast(hashBigIntOrNum, stage) {
         return lookupFastHash(
@@ -2611,7 +3064,7 @@
           sanitizeNonNegativeInt(lookupStats.negativeLookupHits),
           lookupMisses
         );
-        return {
+        const stats = {
           stageCount,
           stagesIndexed: stageCount,
           inlineSamplerStages,
@@ -2627,23 +3080,29 @@
           fastHashHits,
           negativeLookupHits,
         };
+        Object.defineProperties(stats, {
+          unresolvedBindings: { value: unresolvedBindings, enumerable: false, configurable: true },
+          cbvIndexedHeapBindings: { value: cbvIndexedHeapBindings, enumerable: false, configurable: true },
+          laneIndexedHeapBindings: { value: laneIndexedHeapBindings, enumerable: false, configurable: true },
+          meshOutputStages: { value: meshOutputStages, enumerable: false, configurable: true },
+          rtArenaStages: { value: rtArenaStages, enumerable: false, configurable: true },
+        });
+        return stats;
       },
     };
   }
 
   /**
-   * Parse and validate a `playgta6-stage-reflection` v1 sidecar JSON document
+   * Parse and validate a `playgta6-stage-reflection` v1/v2/v3 sidecar JSON document
    * (e.g., `splash.wgsl.pack.reflect.json` emitted by `tools/stage_reflection_sidecar.py`
    * and consumed by `runtime/gpu/stage_reflection.cpp`).
    *
-   * Validates all binding sources including `#950` / `S43` `inline_sampler: { sdwords: [d0, d1, d2, d3] }`
-   * and `#482` `resource_heap` metadata (`{ base_user_sgpr, stride, index }` and `resource_heap: true`),
-   * compacts parsed stage entries with parse-local string/source/layout interning while discarding
-   * unused raw JSON wrappers after indexing, builds O(1) normalized-hash & zero-alloc `BigInt`/safe-int
-   * lookup indexes (`_byHashBigInt`, `getStageByHashFast`) with bounded negative-miss caching, and
-   * exposes sanitized telemetry (`stagesIndexed`, `inlineSamplerStages`, `resourceHeapStages`,
-   * `lookupHits`, `lookupMisses`, `lookupHitRate`, `fastHashLookups`, `fastHashHits`,
-   * `negativeLookupHits`) with `resetStats()`.
+   * Validates all v1/v2/v3 binding sources (`table`, `root_constants`, `root_descriptor` with
+   * optional v2+ `table_byte_offset`, `static_sampler`, `inline_sampler`, `sampler_heap`,
+   * `resource_heap`, `cbv_indexed_*_heap`, `lane_indexed_*_heap`, v3 `unresolved` for read-only
+   * kinds, and `rt_arena`), stage-level `mesh_output` and `rt_arena`, compacts parsed stage entries
+   * with parse-local string/source/layout interning while discarding raw JSON wrappers after
+   * indexing, and builds O(1) normalized-hash & zero-alloc `BigInt`/safe-int lookup indexes.
    *
    * @param {string | object} jsonOrObject
    * @param {{ maxNegativeLookupCacheSize?: number }} [options]
@@ -2684,12 +3143,17 @@
         'schema'
       );
     }
-    if (raw.version !== STAGE_REFLECTION_VERSION) {
+    if (
+      !Number.isInteger(raw.version) ||
+      raw.version < STAGE_REFLECTION_MIN_VERSION ||
+      raw.version > STAGE_REFLECTION_MAX_VERSION
+    ) {
       throw new ManifestValidationError(
-        `unsupported stage reflection version ${JSON.stringify(raw.version)} (expected ${STAGE_REFLECTION_VERSION})`,
+        `unsupported stage reflection version ${JSON.stringify(raw.version)} (expected ${STAGE_REFLECTION_MIN_VERSION}..${STAGE_REFLECTION_MAX_VERSION})`,
         'version'
       );
     }
+    const sidecarVersion = raw.version;
     if (!isPlainObject(raw.stages)) {
       throw new ManifestValidationError('stages must be an object', 'stages');
     }
@@ -2713,6 +3177,11 @@
     let totalInlineSamplerStages = 0;
     let totalInlineSamplerBindings = 0;
     let totalVertexIndexStages = 0;
+    let totalUnresolvedBindings = 0;
+    let totalCbvIndexedHeapBindings = 0;
+    let totalLaneIndexedHeapBindings = 0;
+    let totalMeshOutputStages = 0;
+    let totalRtArenaStages = 0;
 
     let rawStages = raw.stages;
     const seenSlots = new Set();
@@ -2740,6 +3209,23 @@
       }
       const visibility = STAGE_TO_VISIBILITY[stage];
 
+      const rawMeshOutput =
+        rawStage.mesh_output !== undefined ? rawStage.mesh_output : rawStage.meshOutput;
+      let meshOutput = null;
+      if (rawMeshOutput !== undefined && rawMeshOutput !== null) {
+        meshOutput = parseMeshOutputLayout(rawMeshOutput, `${stPath}.mesh_output`);
+      }
+
+      let rtArenaMask = 0;
+      if (rawStage.rt_arena !== undefined) {
+        if (typeof rawStage.rt_arena !== 'boolean') {
+          throw new ManifestValidationError('rt_arena must be a boolean', `${stPath}.rt_arena`);
+        }
+        if (rawStage.rt_arena === true) {
+          rtArenaMask = RT_ARENA_FULL_MASK;
+        }
+      }
+
       if (!Array.isArray(rawStage.bindings)) {
         throw new ManifestValidationError('bindings must be an array', `${stPath}.bindings`);
       }
@@ -2747,11 +3233,14 @@
       seenSlots.clear();
       groupEntriesMap.clear();
       const rawBindings = rawStage.bindings;
-      const bindings = rawBindings.length > 0 ? new Array(rawBindings.length) : EMPTY_ARRAY;
+      const bindings = [];
       let maxGroupSeen = -1;
       let stageSamplerHeapBindings = 0;
       let stageResourceHeapBindings = 0;
       let stageInlineSamplerBindings = 0;
+      let stageUnresolvedBindings = 0;
+      let stageCbvIndexedHeapBindings = 0;
+      let stageLaneIndexedHeapBindings = 0;
       let layoutComplete = true;
 
       for (let i = 0; i < rawBindings.length; i += 1) {
@@ -2766,6 +3255,24 @@
         if (!isNonNegativeInt(b.binding)) {
           throw new ManifestValidationError(`invalid binding ${JSON.stringify(b.binding)}`, `${bPath}.binding`);
         }
+
+        // Runtime-owned RT arena bindings (group 3, bindings 16..21): fold into rtArenaMask, not joined.
+        if (isPlainObject(b.source) && b.source.rt_arena === true) {
+          parseBindingSource(b.source, `${bPath}.source`, { version: sidecarVersion });
+          if (
+            b.group !== RT_ARENA_BIND_GROUP ||
+            b.binding < RT_ARENA_FIRST_BINDING ||
+            b.binding > RT_ARENA_LAST_BINDING
+          ) {
+            throw new ManifestValidationError(
+              `an rt_arena binding must be group ${RT_ARENA_BIND_GROUP}, binding ${RT_ARENA_FIRST_BINDING}..${RT_ARENA_LAST_BINDING}`,
+              bPath
+            );
+          }
+          rtArenaMask |= 1 << (b.binding - RT_ARENA_FIRST_BINDING);
+          continue;
+        }
+
         const slotKey =
           b.group < 65536 && b.binding < 65536
             ? b.group * 65536 + b.binding
@@ -2797,7 +3304,10 @@
           throw new ManifestValidationError('binding source is required in stage reflection sidecar', `${bPath}.source`);
         }
         const source = internNormalizedBindingSource(
-          parseBindingSource(b.source, `${bPath}.source`),
+          parseBindingSource(b.source, `${bPath}.source`, {
+            version: sidecarVersion,
+            bindingKind: kind,
+          }),
           sourcePool
         );
 
@@ -2859,9 +3369,26 @@
           stageResourceHeapBindings += 1;
         } else if (source.kind === 'inline_sampler') {
           stageInlineSamplerBindings += 1;
+        } else if (source.kind === 'unresolved') {
+          stageUnresolvedBindings += 1;
+        } else if (
+          source.kind === 'cbv_indexed_resource_heap' ||
+          source.kind === 'cbv_indexed_sampler_heap'
+        ) {
+          stageCbvIndexedHeapBindings += 1;
+        } else if (
+          source.kind === 'lane_indexed_resource_heap' ||
+          source.kind === 'lane_indexed_sampler_heap'
+        ) {
+          stageLaneIndexedHeapBindings += 1;
         }
 
         const isRootConsts = source.kind === 'root_constants';
+        const bindingArray =
+          source.kind === 'lane_indexed_resource_heap' ||
+          source.kind === 'lane_indexed_sampler_heap'
+            ? Object.freeze({ count: source.maxCount })
+            : null;
         const rec = {
           group: b.group,
           binding: b.binding,
@@ -2874,8 +3401,8 @@
           spirv: null,
           root_constants: isRootConsts,
           rootConstants: isRootConsts,
-          binding_array: null,
-          bindingArray: null,
+          binding_array: bindingArray,
+          bindingArray,
           source,
           view_dimension: viewDimension,
           viewDimension,
@@ -2905,8 +3432,10 @@
           layoutComplete = false;
         }
 
-        bindings[i] = rec;
+        bindings.push(rec);
       }
+
+      const finalBindings = bindings.length > 0 ? bindings : EMPTY_ARRAY;
 
       let resolvedGroupLayouts = EMPTY_ARRAY;
       let bindGroupLayoutIds = EMPTY_ARRAY;
@@ -2991,10 +3520,15 @@
       const isVertexIndexStage = stage === 'vertex' && vertexInputMode === 'vertex_index';
       const hasInlineSampler = stageInlineSamplerBindings > 0;
       const hasResourceHeap = stageResourceHeapBindings > 0;
+      const hasMeshOutput = meshOutput !== null;
+      const hasRtArena = rtArenaMask !== 0;
 
       totalSamplerHeapBindings += stageSamplerHeapBindings;
       totalResourceHeapBindings += stageResourceHeapBindings;
       totalInlineSamplerBindings += stageInlineSamplerBindings;
+      totalUnresolvedBindings += stageUnresolvedBindings;
+      totalCbvIndexedHeapBindings += stageCbvIndexedHeapBindings;
+      totalLaneIndexedHeapBindings += stageLaneIndexedHeapBindings;
       if (hasInlineSampler) {
         totalInlineSamplerStages += 1;
       }
@@ -3003,6 +3537,12 @@
       }
       if (isVertexIndexStage) {
         totalVertexIndexStages += 1;
+      }
+      if (hasMeshOutput) {
+        totalMeshOutputStages += 1;
+      }
+      if (hasRtArena) {
+        totalRtArenaStages += 1;
       }
 
       const entryPoint =
@@ -3039,7 +3579,7 @@
         layout_complete: layoutComplete,
         workgroupSize: null,
         workgroup_size: null,
-        bindings,
+        bindings: finalBindings,
         vertexInputs,
         vertex_inputs: vertexInputs,
         vertexInputMode,
@@ -3054,8 +3594,17 @@
         samplerHeapBindings: stageSamplerHeapBindings,
         resourceHeapBindings: stageResourceHeapBindings,
         inlineSamplerBindings: stageInlineSamplerBindings,
+        unresolvedBindings: stageUnresolvedBindings,
+        cbvIndexedHeapBindings: stageCbvIndexedHeapBindings,
+        laneIndexedHeapBindings: stageLaneIndexedHeapBindings,
         hasInlineSampler,
         hasResourceHeap,
+        hasMeshOutput,
+        meshOutput,
+        mesh_output: meshOutput,
+        hasRtArena,
+        rtArenaMask,
+        rt_arena_mask: rtArenaMask,
       };
 
       stages.set(hashHex, stageRecord);
@@ -3077,6 +3626,7 @@
     bglIdsPool.clear();
 
     return createParsedStageSidecar(
+      sidecarVersion,
       stages,
       stagesByHash,
       stagesByBareHex,
@@ -3088,6 +3638,11 @@
         resourceHeapBindings: totalResourceHeapBindings,
         samplerHeapBindings: totalSamplerHeapBindings,
         vertexIndexStages: totalVertexIndexStages,
+        unresolvedBindings: totalUnresolvedBindings,
+        cbvIndexedHeapBindings: totalCbvIndexedHeapBindings,
+        laneIndexedHeapBindings: totalLaneIndexedHeapBindings,
+        meshOutputStages: totalMeshOutputStages,
+        rtArenaStages: totalRtArenaStages,
       },
       maxNegativeCacheSize
     );
@@ -4016,6 +4571,25 @@
     return null;
   }
 
+  function isNormalizedCbvSpec(spec) {
+    if (!isPlainObject(spec) || !isPlainObject(spec.cbv)) return false;
+    const cbv = spec.cbv;
+    if (!isNonNegativeInt(cbv.userSgpr)) return false;
+    if (cbv.kind === 'table') {
+      if (!isNonNegativeInt(cbv.tableByteOffset)) return false;
+    } else if (cbv.kind !== 'root_descriptor' && cbv.kind !== 'root_constants') {
+      return false;
+    }
+    return (
+      isNonNegativeInt(spec.byteOffset) &&
+      spec.byteOffset % 4 === 0 &&
+      isNonNegativeInt(spec.bitOffset) &&
+      spec.bitOffset <= MAX_HEAP_INDEX_SHIFT &&
+      isNonNegativeInt(spec.mask) &&
+      spec.mask > 0
+    );
+  }
+
   function isNormalizedBindingSource(rawSource) {
     if (!isPlainObject(rawSource) || typeof rawSource.kind !== 'string') {
       return false;
@@ -4024,8 +4598,13 @@
       case 'table':
         return isNonNegativeInt(rawSource.userSgpr) && isNonNegativeInt(rawSource.tableByteOffset);
       case 'root_constants':
-      case 'root_descriptor':
         return isNonNegativeInt(rawSource.userSgpr);
+      case 'root_descriptor':
+        if (!isNonNegativeInt(rawSource.userSgpr)) return false;
+        if (rawSource.rootTableOffsetGiven === true) {
+          return isNonNegativeInt(rawSource.tableByteOffset);
+        }
+        return true;
       case 'static_sampler':
         return isNonNegativeInt(rawSource.index);
       case 'inline_sampler':
@@ -4055,6 +4634,29 @@
           isNonNegativeInt(rawSource.indexShift) &&
           rawSource.indexShift <= MAX_HEAP_INDEX_SHIFT
         );
+      case 'cbv_indexed_sampler_heap':
+      case 'cbv_indexed_resource_heap':
+        return (
+          isNormalizedCbvSpec(rawSource) &&
+          isNonNegativeInt(rawSource.shift) &&
+          rawSource.shift <= MAX_HEAP_INDEX_SHIFT &&
+          isNonNegativeInt(rawSource.stride)
+        );
+      case 'lane_indexed_sampler_heap':
+      case 'lane_indexed_resource_heap':
+        return (
+          isNonNegativeInt(rawSource.maxCount) &&
+          rawSource.maxCount >= 1 &&
+          rawSource.maxCount <= MAX_LANE_INDEXED_WINDOW &&
+          isNonNegativeInt(rawSource.shift) &&
+          rawSource.shift <= MAX_HEAP_INDEX_SHIFT &&
+          isNonNegativeInt(rawSource.stride) &&
+          (rawSource.hasWindowBase !== true || isNormalizedCbvSpec(rawSource.windowBase))
+        );
+      case 'unresolved':
+        return rawSource.unresolved === true;
+      case 'rt_arena':
+        return rawSource.rtArena === true;
       default:
         return false;
     }
@@ -4133,6 +4735,12 @@
     return { kind: null, rawKind: binding.resource !== undefined ? binding.resource : null };
   }
 
+  function formatCbvDesc(cbv) {
+    if (cbv.kind === 'root_descriptor') return `root CBV at s${cbv.userSgpr}`;
+    if (cbv.kind === 'root_constants') return `root constants at s${cbv.userSgpr}`;
+    return `table + ${cbv.tableByteOffset} at s${cbv.userSgpr}`;
+  }
+
   function formatBindingSourceKey(group, binding, source) {
     const base = `@group(${group}) @binding(${binding})`;
     if (!source) return base;
@@ -4142,7 +4750,9 @@
       case 'root_constants':
         return `${base} <- root constants at s${source.userSgpr}`;
       case 'root_descriptor':
-        return `${base} <- root descriptor at s${source.userSgpr}`;
+        return source.rootTableOffsetGiven === true
+          ? `${base} <- root descriptor at s${source.userSgpr} (table + ${source.tableByteOffset})`
+          : `${base} <- root descriptor at s${source.userSgpr}`;
       case 'static_sampler':
         return `${base} <- static sampler ${source.index}`;
       case 'inline_sampler': {
@@ -4160,6 +4770,28 @@
             : `${base} <- resource heap`;
         }
         return `${base} <- resource heap[s${source.indexUserSgpr} << ${source.indexShift}]`;
+      case 'cbv_indexed_sampler_heap':
+      case 'cbv_indexed_resource_heap': {
+        const heapName = source.kind === 'cbv_indexed_sampler_heap' ? 'sampler' : 'resource';
+        return `${base} <- ${heapName} heap[cb(${formatCbvDesc(source.cbv)})[${source.byteOffset}] << ${source.shift}]`;
+      }
+      case 'lane_indexed_sampler_heap':
+      case 'lane_indexed_resource_heap': {
+        const heapName = source.kind === 'lane_indexed_sampler_heap' ? 'sampler' : 'resource';
+        const baseStr =
+          source.hasWindowBase && source.windowBase
+            ? `cb(${formatCbvDesc(source.windowBase.cbv)})[${source.windowBase.byteOffset}]`
+            : '0';
+        const scaleStr =
+          source.stride !== 0 && source.stride !== 1 << source.shift
+            ? ` * ${source.stride}`
+            : ` << ${source.shift}`;
+        return `${base} <- ${heapName} heap[(${baseStr} + lane)${scaleStr}] x ${source.maxCount}`;
+      }
+      case 'unresolved':
+        return source.reason ? `${base} <- unresolved (${source.reason})` : `${base} <- unresolved`;
+      case 'rt_arena':
+        return `${base} <- rt_arena`;
       default:
         return base;
     }
@@ -4287,6 +4919,107 @@
    *   byStaticSamplerIndex: Map<number, object>
    * }}
    */
+  function resolveStageDefaultUserDataBase(stageReflection, compute) {
+    if (
+      stageReflection &&
+      (stageReflection.hasMeshOutput === true ||
+        isPlainObject(stageReflection.meshOutput) ||
+        isPlainObject(stageReflection.mesh_output))
+    ) {
+      return MESH_USER_DATA_BASE;
+    }
+    return compute ? COMPUTE_USER_DATA_BASE : GRAPHICS_USER_DATA_BASE;
+  }
+
+  function validateCbvDwordAgainstRootSignature(rs, cbvSpec, key, group, binding, kind, name, source, emit) {
+    const cbv = cbvSpec.cbv;
+    const param = findRootParameterStartingAt(rs.parameters, cbv.userSgpr);
+    if (!param) {
+      emit(
+        group,
+        binding,
+        kind,
+        DIAGNOSTIC_CODES.ROOT_PARAMETER_NOT_FOUND,
+        { userSgpr: cbv.userSgpr, parameterType: cbv.kind },
+        { userSgpr: cbv.userSgpr, userDataBase: rs.userDataBase },
+        `${key}: no root parameter starts at s${cbv.userSgpr}`,
+        name,
+        source
+      );
+      return null;
+    }
+    const pname = `root parameter ${param.index}`;
+    if (cbv.kind === 'root_descriptor') {
+      if (param.type !== 'cbv') {
+        emit(
+          group,
+          binding,
+          kind,
+          DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+          'cbv',
+          param.type,
+          `${key}: ${pname} is not a root CBV`,
+          name,
+          source
+        );
+        return null;
+      }
+      return { parameterIndex: param.index, cbvSource: 'root_descriptor', cbTableSlot: 0 };
+    }
+    if (cbv.kind === 'root_constants') {
+      if (param.type !== 'constants' || cbvSpec.byteOffset / 4 >= param.num32BitValues) {
+        emit(
+          group,
+          binding,
+          kind,
+          DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+          { type: 'constants', minDwords: cbvSpec.byteOffset / 4 + 1 },
+          { type: param.type, num32BitValues: param.num32BitValues },
+          `${key}: ${pname} is not root constants covering byte ${cbvSpec.byteOffset}`,
+          name,
+          source
+        );
+        return null;
+      }
+      return { parameterIndex: param.index, cbvSource: 'root_constants', cbTableSlot: 0 };
+    }
+    // table CBV
+    const isSamplerTable = param.ranges.some((r) => r.type === 'sampler');
+    if (param.type !== 'table' || isSamplerTable) {
+      emit(
+        group,
+        binding,
+        kind,
+        DIAGNOSTIC_CODES.ROOT_PARAMETER_TYPE_MISMATCH,
+        'resource_table',
+        isSamplerTable ? 'sampler_table' : param.type,
+        `${key}: ${pname} is not a CBV_SRV_UAV descriptor table`,
+        name,
+        source
+      );
+      return null;
+    }
+    if (cbv.tableByteOffset % rs.tableSlotBytes !== 0) {
+      emit(
+        group,
+        binding,
+        kind,
+        DIAGNOSTIC_CODES.TABLE_OFFSET_UNALIGNED,
+        { tableSlotBytes: rs.tableSlotBytes },
+        { tableByteOffset: cbv.tableByteOffset, remainder: cbv.tableByteOffset % rs.tableSlotBytes },
+        `${key}: ${pname}: byte offset ${cbv.tableByteOffset} is not a descriptor boundary`,
+        name,
+        source
+      );
+      return null;
+    }
+    return {
+      parameterIndex: param.index,
+      cbvSource: 'table',
+      cbTableSlot: cbv.tableByteOffset / rs.tableSlotBytes,
+    };
+  }
+
   function synthesizeMissingStaticSamplers(stageReflection, rootSignatureSpec = null, options = {}) {
     if (!isPlainObject(stageReflection)) {
       throw new TypeError('stageReflection must be an object');
@@ -4298,7 +5031,7 @@
     const stage = normalizeDiagnosticStage(stageReflection.stage) || 'fragment';
     const compute =
       typeof options.compute === 'boolean' ? options.compute : stage === 'compute';
-    const defaultBase = compute ? COMPUTE_USER_DATA_BASE : GRAPHICS_USER_DATA_BASE;
+    const defaultBase = resolveStageDefaultUserDataBase(stageReflection, compute);
     const normalizedRs =
       rootSignatureSpec !== null && rootSignatureSpec !== undefined
         ? normalizeRootSignatureSpec(rootSignatureSpec, defaultBase, options)
@@ -4448,8 +5181,17 @@
     const stage = normalizeDiagnosticStage(stageReflection.stage) || 'fragment';
     const compute =
       typeof options.compute === 'boolean' ? options.compute : stage === 'compute';
-    const defaultBase = compute ? COMPUTE_USER_DATA_BASE : GRAPHICS_USER_DATA_BASE;
+    const defaultBase = resolveStageDefaultUserDataBase(stageReflection, compute);
     const rs = normalizeRootSignatureSpec(rootSignatureSpec, defaultBase, options);
+    const bindingArraysEnabled = Boolean(options.bindingArrays);
+    const stageRtArenaMask =
+      typeof stageReflection.rtArenaMask === 'number'
+        ? stageReflection.rtArenaMask
+        : typeof stageReflection.rt_arena_mask === 'number'
+          ? stageReflection.rt_arena_mask
+          : stageReflection.rt_arena === true
+            ? RT_ARENA_FULL_MASK
+            : 0;
 
     const uniformAlign =
       options.uniformMinBindingSizeAlignment !== undefined
@@ -4496,6 +5238,10 @@
     };
 
     let checkedCount = 0;
+    let unresolvedCount = 0;
+    let laneIndexedBindingsCount = 0;
+    let laneIndexedArraysCount = 0;
+    let rootDescriptorTablesCount = 0;
 
     for (let i = 0; i < rawBindings.length; i += 1) {
       const raw = rawBindings[i];
@@ -4538,7 +5284,7 @@
           binding,
           kind || 'unknown',
           DIAGNOSTIC_CODES.MISSING_SOURCE,
-          'binding source (table, root_constants, root_descriptor, static_sampler, inline_sampler, sampler_heap, or resource_heap)',
+          'binding source (table, root_constants, root_descriptor, static_sampler, inline_sampler, sampler_heap, resource_heap, cbv_indexed_*_heap, lane_indexed_*_heap, or unresolved)',
           null,
           `@group(${group}) @binding(${binding}): missing binding source`,
           name,
@@ -4563,6 +5309,41 @@
             null
           );
         }
+      }
+
+      if (source && source.kind === 'rt_arena') {
+        if (
+          group !== RT_ARENA_BIND_GROUP ||
+          binding < RT_ARENA_FIRST_BINDING ||
+          binding > RT_ARENA_LAST_BINDING
+        ) {
+          emit(
+            group,
+            binding,
+            kind || 'unknown',
+            DIAGNOSTIC_CODES.RT_ARENA_GROUP_CONFLICT,
+            { group: RT_ARENA_BIND_GROUP, bindingRange: [RT_ARENA_FIRST_BINDING, RT_ARENA_LAST_BINDING] },
+            { group, binding },
+            `@group(${group}) @binding(${binding}): an rt_arena binding must be group ${RT_ARENA_BIND_GROUP}, binding ${RT_ARENA_FIRST_BINDING}..${RT_ARENA_LAST_BINDING}`,
+            name,
+            source
+          );
+        }
+        continue;
+      }
+
+      if (stageRtArenaMask !== 0 && group >= RT_ARENA_BIND_GROUP) {
+        emit(
+          group,
+          binding,
+          kind || 'unknown',
+          DIAGNOSTIC_CODES.RT_ARENA_GROUP_CONFLICT,
+          { maxGroup: RT_ARENA_BIND_GROUP - 1 },
+          { group, rtArenaMask: stageRtArenaMask },
+          `@group(${group}) @binding(${binding}): rt_arena stage cannot join bindings in group ${group} (runtime owns group ${RT_ARENA_BIND_GROUP})`,
+          name,
+          source
+        );
       }
 
       const key = formatBindingSourceKey(group, binding, source);
@@ -4689,6 +5470,8 @@
       let resolvedRootConstants = false;
       let resolvedHeap = null;
       let resolvedInlineSampler = false;
+      let resolvedUnresolved = false;
+      let resolvedBindingArraySize = 0;
       let synthesizedFallback = null;
       let joinFailed = false;
 
@@ -4771,6 +5554,157 @@
               shift: source.indexShift,
             };
           }
+        }
+      } else if (
+        source.kind === 'cbv_indexed_sampler_heap' ||
+        source.kind === 'cbv_indexed_resource_heap'
+      ) {
+        const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+        const isSamplerHeap = source.kind === 'cbv_indexed_sampler_heap';
+        if (isSamplerHeap !== samplerKind) {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.HEAP_KIND_MISMATCH,
+            samplerKind ? 'cbv_indexed_sampler_heap' : 'cbv_indexed_resource_heap',
+            source.kind,
+            `${key}: a ${kind} binding cannot come from the ${isSamplerHeap ? 'sampler' : 'resource'} heap`,
+            name,
+            source
+          );
+        } else {
+          const cbvJoin = validateCbvDwordAgainstRootSignature(
+            rs,
+            source,
+            key,
+            group,
+            binding,
+            kind,
+            name,
+            source,
+            emit
+          );
+          if (!cbvJoin) {
+            joinFailed = true;
+          } else {
+            resolvedParamIndex = cbvJoin.parameterIndex;
+            resolvedClass =
+              kind === 'uniform'
+                ? 'cbv'
+                : samplerKind
+                  ? 'sampler'
+                  : kind === 'storage' || kind === 'storage_texture'
+                    ? 'uav'
+                    : 'srv';
+            resolvedHeap = {
+              kind: source.kind,
+              parameterIndex: cbvJoin.parameterIndex,
+              cbvSource: cbvJoin.cbvSource,
+              cbTableSlot: cbvJoin.cbTableSlot,
+              byteOffset: source.byteOffset,
+              bitOffset: source.bitOffset,
+              mask: source.mask,
+              shift: source.shift,
+              stride: source.stride,
+            };
+          }
+        }
+      } else if (
+        source.kind === 'lane_indexed_sampler_heap' ||
+        source.kind === 'lane_indexed_resource_heap'
+      ) {
+        const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+        const isSamplerHeap = source.kind === 'lane_indexed_sampler_heap';
+        if (isSamplerHeap !== samplerKind) {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.HEAP_KIND_MISMATCH,
+            samplerKind ? 'lane_indexed_sampler_heap' : 'lane_indexed_resource_heap',
+            source.kind,
+            `${key}: a ${kind} binding cannot come from the ${isSamplerHeap ? 'sampler' : 'resource'} heap`,
+            name,
+            source
+          );
+        } else {
+          let wbJoin = null;
+          if (source.hasWindowBase && source.windowBase) {
+            wbJoin = validateCbvDwordAgainstRootSignature(
+              rs,
+              source.windowBase,
+              key,
+              group,
+              binding,
+              kind,
+              name,
+              source,
+              emit
+            );
+            if (!wbJoin) {
+              joinFailed = true;
+            }
+          }
+          if (!joinFailed && !bindingArraysEnabled) {
+            joinFailed = true;
+            laneIndexedBindingsCount += 1;
+            emit(
+              group,
+              binding,
+              kind,
+              DIAGNOSTIC_CODES.BINDING_ARRAYS_UNSUPPORTED,
+              { bindingArrays: true, maxCount: source.maxCount },
+              { bindingArrays: false },
+              `${key}: lane-indexed heap window of ${source.maxCount} descriptors needs a binding array; consumer does not bind binding arrays`,
+              name,
+              source
+            );
+          } else if (!joinFailed) {
+            laneIndexedArraysCount += 1;
+            resolvedBindingArraySize = source.maxCount;
+            resolvedParamIndex = wbJoin ? wbJoin.parameterIndex : null;
+            resolvedClass =
+              kind === 'uniform'
+                ? 'cbv'
+                : samplerKind
+                  ? 'sampler'
+                  : kind === 'storage' || kind === 'storage_texture'
+                    ? 'uav'
+                    : 'srv';
+            resolvedHeap = {
+              kind: source.kind,
+              maxCount: source.maxCount,
+              shift: source.shift,
+              stride: source.stride,
+              hasWindowBase: source.hasWindowBase,
+              parameterIndex: wbJoin ? wbJoin.parameterIndex : null,
+              cbvSource: wbJoin ? wbJoin.cbvSource : 'constant',
+              cbTableSlot: wbJoin ? wbJoin.cbTableSlot : 0,
+            };
+          }
+        }
+      } else if (source.kind === 'unresolved') {
+        if (kind === 'storage' || kind === 'storage_texture') {
+          joinFailed = true;
+          emit(
+            group,
+            binding,
+            kind,
+            DIAGNOSTIC_CODES.UNRESOLVED_WRITABLE_BINDING,
+            ['uniform', 'read_only_storage', 'texture', 'sampler', 'comparison_sampler'],
+            kind,
+            `${key}: a ${kind} binding cannot have an unresolved source`,
+            name,
+            source
+          );
+        } else {
+          const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
+          resolvedClass = kind === 'uniform' ? 'cbv' : samplerKind ? 'sampler' : 'srv';
+          resolvedUnresolved = true;
+          unresolvedCount += 1;
         }
       } else if (source.kind === 'inline_sampler') {
         const samplerKind = kind === 'sampler' || kind === 'comparison_sampler';
@@ -5014,7 +5948,48 @@
               resolvedRootConstants = true;
             }
           } else if (source.kind === 'root_descriptor') {
-            if (param.type !== 'cbv' && param.type !== 'srv' && param.type !== 'uav') {
+            if (param.type === 'table' && source.rootTableOffsetGiven === true) {
+              const effOffset = source.tableByteOffset;
+              if (effOffset % rs.tableSlotBytes !== 0) {
+                joinFailed = true;
+                emit(
+                  group,
+                  binding,
+                  kind,
+                  DIAGNOSTIC_CODES.TABLE_OFFSET_UNALIGNED,
+                  { tableSlotBytes: rs.tableSlotBytes },
+                  {
+                    tableByteOffset: effOffset,
+                    remainder: effOffset % rs.tableSlotBytes,
+                  },
+                  `${key}: ${pname} has no descriptor at byte offset ${effOffset} (not a multiple of ${rs.tableSlotBytes} bytes)`,
+                  name,
+                  source
+                );
+              } else {
+                const slot = effOffset / rs.tableSlotBytes;
+                const slotInfo = resolveTableSlot(param, slot);
+                if (!slotInfo) {
+                  joinFailed = true;
+                  emit(
+                    group,
+                    binding,
+                    kind,
+                    DIAGNOSTIC_CODES.TABLE_DESCRIPTOR_MISSING,
+                    { parameterIndex: param.index, tableByteOffset: effOffset, slot },
+                    { parameterIndex: param.index, rangeCount: param.ranges.length },
+                    `${key}: ${pname} has no descriptor at byte offset ${effOffset}`,
+                    name,
+                    source
+                  );
+                } else {
+                  resolvedClass = slotInfo.cls;
+                  resolvedRegister = slotInfo.shaderRegister;
+                  resolvedSpace = slotInfo.registerSpace;
+                  rootDescriptorTablesCount += 1;
+                }
+              }
+            } else if (param.type !== 'cbv' && param.type !== 'srv' && param.type !== 'uav') {
               joinFailed = true;
               emit(
                 group,
@@ -5069,6 +6044,8 @@
           heap: resolvedHeap,
           inlineSampler: resolvedInlineSampler,
           inlineSamplerSdwords: resolvedInlineSampler ? source.sdwords.slice() : null,
+          unresolved: resolvedUnresolved,
+          bindingArraySize: resolvedBindingArraySize,
           minBindingSizeBytes: minBindingSizeBytes !== null ? minBindingSizeBytes : 0,
           synthesizedStaticSampler: Boolean(synthesizedFallback),
           fallbackDescriptor: synthesizedFallback ? synthesizedFallback.fallbackDescriptor : null,
@@ -5082,6 +6059,7 @@
       compute,
       userDataBase: rs.userDataBase,
       tableSlotBytes: rs.tableSlotBytes,
+      rtArenaMask: stageRtArenaMask,
       bindingCount: checkedCount,
       resolvedBindings,
       diagnostics,
@@ -5091,6 +6069,10 @@
         resolvedCount: resolvedBindings.length,
         mismatchCount: diagnostics.length,
         synthesizedStaticSamplers: staticSamplerFallbacks.length,
+        unresolvedBindings: unresolvedCount,
+        laneIndexedBindings: laneIndexedBindingsCount,
+        laneIndexedArrays: laneIndexedArraysCount,
+        rootDescriptorTables: rootDescriptorTablesCount,
         codes: codeCounts,
       },
     };
@@ -5155,6 +6137,11 @@
       this._inlineSamplerStages = 0;
       this._inlineSamplerBindings = 0;
       this._vertexIndexStages = 0;
+      this._unresolvedBindings = 0;
+      this._cbvIndexedHeapBindings = 0;
+      this._laneIndexedHeapBindings = 0;
+      this._meshOutputStages = 0;
+      this._rtArenaStages = 0;
 
       this._stats = {
         manifestsLoaded: 0,
@@ -5177,6 +6164,9 @@
         this._samplerHeapBindings -= previous.samplerHeapBindings || 0;
         this._resourceHeapBindings -= previous.resourceHeapBindings || 0;
         this._inlineSamplerBindings -= previous.inlineSamplerBindings || 0;
+        this._unresolvedBindings -= previous.unresolvedBindings || 0;
+        this._cbvIndexedHeapBindings -= previous.cbvIndexedHeapBindings || 0;
+        this._laneIndexedHeapBindings -= previous.laneIndexedHeapBindings || 0;
         if (previous.hasInlineSampler) {
           this._inlineSamplerStages -= 1;
         }
@@ -5186,11 +6176,20 @@
         if (previous.isVertexIndexStage) {
           this._vertexIndexStages -= 1;
         }
+        if (previous.hasMeshOutput) {
+          this._meshOutputStages -= 1;
+        }
+        if (previous.hasRtArena || (previous.rtArenaMask || 0) !== 0) {
+          this._rtArenaStages -= 1;
+        }
       }
 
       this._samplerHeapBindings += shader.samplerHeapBindings || 0;
       this._resourceHeapBindings += shader.resourceHeapBindings || 0;
       this._inlineSamplerBindings += shader.inlineSamplerBindings || 0;
+      this._unresolvedBindings += shader.unresolvedBindings || 0;
+      this._cbvIndexedHeapBindings += shader.cbvIndexedHeapBindings || 0;
+      this._laneIndexedHeapBindings += shader.laneIndexedHeapBindings || 0;
       if (shader.hasInlineSampler) {
         this._inlineSamplerStages += 1;
       }
@@ -5199,6 +6198,12 @@
       }
       if (shader.isVertexIndexStage) {
         this._vertexIndexStages += 1;
+      }
+      if (shader.hasMeshOutput) {
+        this._meshOutputStages += 1;
+      }
+      if (shader.hasRtArena || (shader.rtArenaMask || 0) !== 0) {
+        this._rtArenaStages += 1;
       }
 
       const bareHex = shader.bareHashHex || shader.hashHex.slice(2);
@@ -5710,6 +6715,11 @@
       this._inlineSamplerStages = 0;
       this._inlineSamplerBindings = 0;
       this._vertexIndexStages = 0;
+      this._unresolvedBindings = 0;
+      this._cbvIndexedHeapBindings = 0;
+      this._laneIndexedHeapBindings = 0;
+      this._meshOutputStages = 0;
+      this._rtArenaStages = 0;
 
       if (options && options.resetStats) {
         this.resetStats();
@@ -5757,6 +6767,11 @@
         inlineSamplerStages: this._inlineSamplerStages,
         inlineSamplerBindings: this._inlineSamplerBindings,
         vertexIndexStages: this._vertexIndexStages,
+        unresolvedBindings: this._unresolvedBindings,
+        cbvIndexedHeapBindings: this._cbvIndexedHeapBindings,
+        laneIndexedHeapBindings: this._laneIndexedHeapBindings,
+        meshOutputStages: this._meshOutputStages,
+        rtArenaStages: this._rtArenaStages,
       };
     }
   }
@@ -5765,11 +6780,24 @@
     LAYOUT_MANIFEST_SCHEMA_VERSION,
     STAGE_REFLECTION_SCHEMA,
     STAGE_REFLECTION_VERSION,
+    STAGE_REFLECTION_MIN_VERSION,
+    STAGE_REFLECTION_VERSION_ROOT_TABLE_OFFSET,
+    STAGE_REFLECTION_VERSION_UNRESOLVED,
+    STAGE_REFLECTION_MAX_VERSION,
     MAX_WEBGPU_BIND_GROUPS,
     MAX_HEAP_INDEX_SHIFT,
+    MAX_LANE_INDEXED_WINDOW,
+    MAX_MESH_VERTICES,
+    MAX_MESH_PRIMITIVES,
+    MAX_MESH_ATTRIBUTES,
+    RT_ARENA_BIND_GROUP,
+    RT_ARENA_FIRST_BINDING,
+    RT_ARENA_LAST_BINDING,
+    RT_ARENA_FULL_MASK,
     INLINE_SAMPLER_SDWORD_COUNT,
     GRAPHICS_USER_DATA_BASE,
     COMPUTE_USER_DATA_BASE,
+    MESH_USER_DATA_BASE,
     TABLE_SLOT_BYTES,
     UNIFORM_MIN_BINDING_SIZE_ALIGNMENT,
     STORAGE_MIN_BINDING_SIZE_ALIGNMENT,
@@ -5788,6 +6816,7 @@
     computeBindGroupLayoutHash,
     computePipelineLayoutHash,
     parseBindingSource,
+    parseMeshOutputLayout,
     parseReflectionManifest,
     parseStageReflectionSidecar,
     buildBindGroupLayoutDescriptors,
