@@ -282,6 +282,22 @@ struct ApuBlock {
     Pg6ApuAddress apu_addr = 0;
 };
 
+struct ApuHostEntry {
+    uintptr_t host_start = 0;
+    uintptr_t host_end = 0;
+    uint64_t va = 0;
+    Pg6ApuAddress apu_addr = 0;
+    uint32_t size = 0;
+};
+
+struct ApuFreeRange {
+    uint64_t start = 0;
+    uint64_t size = 0;
+};
+
+constexpr Pg6ApuAddress kApuBaseAddr = 0x10000000u;
+constexpr uint64_t kApuLimitAddr = 0xFFFF0000ULL;
+
 struct ApuGlobals {
     std::mutex mutex;
     bool heap_created = false;
@@ -291,9 +307,46 @@ struct ApuGlobals {
     std::vector<uint64_t> shape_context_arrays;  // guest heap blocks handed out by AllocateShapeContexts
     uint64_t xma_contexts = 0;                   // the kind-4 (XMA) array of the live allocation
     uint32_t xma_context_count = 0;
-    Pg6ApuAddress next_apu_addr = 0x10000000u;
-    std::vector<ApuBlock> blocks;
+    Pg6ApuAddress next_apu_addr = kApuBaseAddr;
+    std::vector<ApuBlock> blocks_by_apu;       // sorted by apu_addr for O(log N) lookup
+    std::vector<ApuHostEntry> blocks_by_host;  // sorted by host_start for O(log N) lookup
+    std::vector<ApuFreeRange> free_ranges;     // sorted, coalesced freed APU intervals
 };
+
+void insert_free_range_locked(ApuGlobals& g, uint64_t start, uint64_t size) {
+    if (size == 0u) {
+        return;
+    }
+    auto it = std::lower_bound(g.free_ranges.begin(), g.free_ranges.end(), start,
+                               [](const ApuFreeRange& r, uint64_t s) { return r.start < s; });
+    it = g.free_ranges.insert(it, ApuFreeRange{start, size});
+    // Coalesce with predecessor.
+    if (it != g.free_ranges.begin()) {
+        auto prev = it - 1;
+        if (prev->start + prev->size == it->start) {
+            prev->size += it->size;
+            it = g.free_ranges.erase(it) - 1;
+        }
+    }
+    // Coalesce with successor.
+    if (it + 1 != g.free_ranges.end()) {
+        auto next = it + 1;
+        if (it->start + it->size == next->start) {
+            it->size += next->size;
+            g.free_ranges.erase(next);
+        }
+    }
+    // Reclaim tail free range directly back into the bump pointer when adjacent.
+    while (!g.free_ranges.empty()) {
+        const auto& tail = g.free_ranges.back();
+        if (tail.start + tail.size == uint64_t{g.next_apu_addr}) {
+            g.next_apu_addr = static_cast<Pg6ApuAddress>(tail.start);
+            g.free_ranges.pop_back();
+        } else {
+            break;
+        }
+    }
+}
 
 ApuGlobals& apu_globals() {
     static ApuGlobals g;
@@ -318,6 +371,8 @@ uint32_t normalize_alignment(uint32_t align) {
 // ---------------------------------------------------------------------------
 // 4. xapu.dll (stateful command/result session)
 // ---------------------------------------------------------------------------
+
+constexpr size_t kXApuMaxLoopbackResults = 4096u;
 
 struct XApuSessionState {
     std::deque<std::vector<uint8_t>> results;
@@ -1601,6 +1656,7 @@ static_assert(sizeof(ShapeContextRequest) == 0x48);
 constexpr uint32_t kShapeContextKindXma = 4;
 constexpr uint32_t kShapeContextBytes[6] = {0, 0, 0, 0, 64, 0};
 constexpr uint32_t kShapeContextAlignment = 256;
+constexpr uint64_t kMaxShapeContextBytes = 256ULL * 1024ULL * 1024ULL;
 }  // namespace
 
 Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
@@ -1618,10 +1674,17 @@ Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
                               " requested; the size of that kind is not established, returning E_NOTIMPL");
             return gdk::E_NOTIMPL_HR;
         }
+        if (request.counts[kind] != 0 &&
+            uint64_t{request.counts[kind]} > kMaxShapeContextBytes / kShapeContextBytes[kind]) {
+            std::memcpy(contexts, &request, sizeof(request));
+            return gdk::E_OUTOFMEMORY_HR;
+        }
     }
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
     playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    const uint64_t prev_xma_contexts = g.xma_contexts;
+    const uint32_t prev_xma_count = g.xma_context_count;
     for (uint32_t kind = 0; kind < 6; ++kind) {
         if (request.counts[kind] == 0) {
             continue;
@@ -1634,8 +1697,12 @@ Pg6HResult pg6_mw_acp_hal_allocate_shape_contexts(void* contexts) {
                 if (request.arrays[k] != 0) {
                     heap.free(request.arrays[k]);
                     g.shape_context_arrays.pop_back();
+                    request.arrays[k] = 0;
                 }
             }
+            g.xma_contexts = prev_xma_contexts;
+            g.xma_context_count = prev_xma_count;
+            std::memcpy(contexts, &request, sizeof(request));
             return gdk::E_OUTOFMEMORY_HR;
         }
         request.arrays[kind] = va;
@@ -1698,7 +1765,11 @@ Pg6XmaContextCensus pg6_mw_xma_context_census(void) {
         if ((d0 & (3u << 20)) != 0) {
             ++c.input_valid;
         }
-        if ((d0 >> 27) != (d9 & 0x1Fu)) {
+        const uint32_t raw_ring = (d0 >> 22) & 0x1Fu;
+        const uint32_t ring = raw_ring != 0u ? raw_ring : 32u;
+        const uint32_t write_block = (d0 >> 27) % ring;
+        const uint32_t read_block = (d9 & 0x1Fu) % ring;
+        if (write_block != read_block) {
             ++c.output_pending;
         }
     }
@@ -1729,35 +1800,101 @@ Pg6HResult pg6_mw_apu_alloc(void** virtual_address,
     }
 
     const uint32_t align = mw::normalize_alignment(alignment_in_bytes);
+    const uint64_t size64 = size_in_bytes;
+    if (size64 > mw::kApuLimitAddr - mw::kApuBaseAddr) {
+        return gdk::E_OUTOFMEMORY_HR;
+    }
 
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
 
-    const uint64_t next_aligned =
-        (static_cast<uint64_t>(g.next_apu_addr) + (static_cast<uint64_t>(align) - 1u)) &
-        ~(static_cast<uint64_t>(align) - 1u);
-    if (next_aligned + size_in_bytes > 0xFFFF0000ULL) {
-        return gdk::E_OUTOFMEMORY_HR;
+    // Prefer reusing a coalesced freed APU interval before advancing next_apu_addr.
+    size_t free_idx = g.free_ranges.size();
+    uint64_t chosen_apu = 0u;
+    const uint64_t align_mask = uint64_t{align} - 1u;
+    for (size_t i = 0; i < g.free_ranges.size(); ++i) {
+        const auto& r = g.free_ranges[i];
+        if (r.size < size64) {
+            continue;
+        }
+        const uint64_t r_end = r.start + r.size;
+        const uint64_t aligned = (r.start + align_mask) & ~align_mask;
+        if (aligned >= r.start && aligned <= r_end && (r_end - aligned) >= size64) {
+            free_idx = i;
+            chosen_apu = aligned;
+            break;
+        }
+    }
+
+    uint64_t bump_aligned = 0u;
+    if (free_idx == g.free_ranges.size()) {
+        const uint64_t cur = g.next_apu_addr;
+        bump_aligned = (cur + align_mask) & ~align_mask;
+        if (bump_aligned < cur || bump_aligned > mw::kApuLimitAddr ||
+            (mw::kApuLimitAddr - bump_aligned) < size64) {
+            return gdk::E_OUTOFMEMORY_HR;
+        }
+        chosen_apu = bump_aligned;
     }
 
     // Guest memory (the title reads and writes it), zero-filled like the console's APU heap.
     playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
-    const uint64_t va = heap.alloc(size_in_bytes, align, playgta6::os::HeapFamily::Other,
+    const uint64_t va = heap.alloc(size64, align, playgta6::os::HeapFamily::Other,
                                    playgta6::os::kHeapZeroMemory);
     if (va == 0) {
         return gdk::E_OUTOFMEMORY_HR;
     }
-    const Pg6ApuAddress apu_addr = static_cast<Pg6ApuAddress>(next_aligned);
-    g.next_apu_addr = static_cast<Pg6ApuAddress>(next_aligned + size_in_bytes);
+    uint8_t* host_ptr = heap.to_host(va);
+    const uintptr_t host_start = reinterpret_cast<uintptr_t>(host_ptr);
+    if (host_ptr == nullptr || host_start > (static_cast<uintptr_t>(~uintptr_t{0}) - size64)) {
+        heap.free(va);
+        return gdk::E_OUTOFMEMORY_HR;
+    }
+
+    // Commit APU address reservation only after guest allocation succeeded.
+    if (free_idx < g.free_ranges.size()) {
+        const mw::ApuFreeRange r = g.free_ranges[free_idx];
+        const uint64_t r_end = r.start + r.size;
+        const uint64_t alloc_end = chosen_apu + size64;
+        g.free_ranges.erase(g.free_ranges.begin() + static_cast<ptrdiff_t>(free_idx));
+        if (chosen_apu > r.start) {
+            mw::insert_free_range_locked(g, r.start, chosen_apu - r.start);
+        }
+        if (alloc_end < r_end) {
+            mw::insert_free_range_locked(g, alloc_end, r_end - alloc_end);
+        }
+    } else {
+        const uint64_t old_next = g.next_apu_addr;
+        g.next_apu_addr = static_cast<Pg6ApuAddress>(bump_aligned + size64);
+        if (bump_aligned > old_next) {
+            mw::insert_free_range_locked(g, old_next, bump_aligned - old_next);
+        }
+    }
+
+    const Pg6ApuAddress apu_addr = static_cast<Pg6ApuAddress>(chosen_apu);
 
     mw::ApuBlock block{};
     block.va = va;
-    block.aligned_ptr = heap.to_host(va);
+    block.aligned_ptr = host_ptr;
     block.size = size_in_bytes;
     block.alignment = align;
     block.flags = flags;
     block.apu_addr = apu_addr;
-    g.blocks.push_back(std::move(block));
+    auto apu_it = std::lower_bound(
+        g.blocks_by_apu.begin(), g.blocks_by_apu.end(), apu_addr,
+        [](const mw::ApuBlock& b, Pg6ApuAddress a) { return b.apu_addr < a; });
+    g.blocks_by_apu.insert(apu_it, std::move(block));
+
+    mw::ApuHostEntry host_entry{};
+    host_entry.host_start = host_start;
+    host_entry.host_end = host_start + static_cast<uintptr_t>(size64);
+    host_entry.va = va;
+    host_entry.apu_addr = apu_addr;
+    host_entry.size = size_in_bytes;
+    auto host_it = std::lower_bound(
+        g.blocks_by_host.begin(), g.blocks_by_host.end(), host_start,
+        [](const mw::ApuHostEntry& e, uintptr_t s) { return e.host_start < s; });
+    g.blocks_by_host.insert(host_it, host_entry);
 
     // Stored into guest memory: the guest address of the block.
     *virtual_address = reinterpret_cast<void*>(static_cast<uintptr_t>(va));
@@ -1771,16 +1908,30 @@ Pg6HResult pg6_mw_apu_free(void* virtual_address) {
     if (virtual_address == nullptr) {
         return gdk::S_OK_HR;
     }
+    const uintptr_t query = reinterpret_cast<uintptr_t>(virtual_address);
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
-    for (auto it = g.blocks.begin(); it != g.blocks.end(); ++it) {
-        if (it->aligned_ptr == virtual_address) {
-            playgta6::os::default_guest_heap().free(it->va);
-            g.blocks.erase(it);
-            return gdk::S_OK_HR;
-        }
+    auto host_it = std::lower_bound(
+        g.blocks_by_host.begin(), g.blocks_by_host.end(), query,
+        [](const mw::ApuHostEntry& e, uintptr_t s) { return e.host_start < s; });
+    if (host_it == g.blocks_by_host.end() || host_it->host_start != query) {
+        return gdk::E_INVALIDARG_HR;
     }
-    return gdk::E_INVALIDARG_HR;
+    const uint64_t va = host_it->va;
+    const Pg6ApuAddress apu_addr = host_it->apu_addr;
+    const uint32_t size = host_it->size;
+    g.blocks_by_host.erase(host_it);
+
+    auto apu_it = std::lower_bound(
+        g.blocks_by_apu.begin(), g.blocks_by_apu.end(), apu_addr,
+        [](const mw::ApuBlock& b, Pg6ApuAddress a) { return b.apu_addr < a; });
+    if (apu_it != g.blocks_by_apu.end() && apu_it->apu_addr == apu_addr) {
+        g.blocks_by_apu.erase(apu_it);
+    }
+
+    playgta6::os::default_guest_heap().free(va);
+    mw::insert_free_range_locked(g, apu_addr, size);
+    return gdk::S_OK_HR;
 }
 
 int32_t pg6_mw_apu_is_virtual_address_valid(const void* virtual_address,
@@ -1791,14 +1942,17 @@ int32_t pg6_mw_apu_is_virtual_address_valid(const void* virtual_address,
     const uintptr_t query = reinterpret_cast<uintptr_t>(virtual_address);
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
-    for (const auto& block : g.blocks) {
-        const uintptr_t start = reinterpret_cast<uintptr_t>(block.aligned_ptr);
-        const uintptr_t end = start + static_cast<uintptr_t>(block.size);
-        if (query >= start && query < end) {
-            const uintptr_t span = static_cast<uintptr_t>(physical_address_in_bytes);
-            if (span == 0u || (end - query) >= span) {
-                return 1;
-            }
+    auto it = std::upper_bound(
+        g.blocks_by_host.begin(), g.blocks_by_host.end(), query,
+        [](uintptr_t q, const mw::ApuHostEntry& e) { return q < e.host_start; });
+    if (it == g.blocks_by_host.begin()) {
+        return 0;
+    }
+    --it;
+    if (query >= it->host_start && query < it->host_end) {
+        const uintptr_t span = static_cast<uintptr_t>(physical_address_in_bytes);
+        if (span == 0u || (it->host_end - query) >= span) {
+            return 1;
         }
     }
     return 0;
@@ -1810,13 +1964,16 @@ void* pg6_mw_apu_map_apu_address(Pg6ApuAddress apu_address) {
     }
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
-    for (const auto& block : g.blocks) {
-        const uint64_t start = block.apu_addr;
-        const uint64_t end = start + block.size;
-        if (apu_address >= start && apu_address < end) {
-            const uint64_t offset = apu_address - start;
-            return block.aligned_ptr + offset;
-        }
+    auto it = std::upper_bound(
+        g.blocks_by_apu.begin(), g.blocks_by_apu.end(), apu_address,
+        [](Pg6ApuAddress q, const mw::ApuBlock& b) { return q < b.apu_addr; });
+    if (it == g.blocks_by_apu.begin()) {
+        return nullptr;
+    }
+    --it;
+    const uint64_t offset = uint64_t{apu_address} - uint64_t{it->apu_addr};
+    if (offset < uint64_t{it->size}) {
+        return it->aligned_ptr + offset;
     }
     return nullptr;
 }
@@ -1828,13 +1985,16 @@ Pg6ApuAddress pg6_mw_apu_map_virtual_address(const void* virtual_address) {
     const uintptr_t query = reinterpret_cast<uintptr_t>(virtual_address);
     auto& g = mw::apu_globals();
     std::lock_guard<std::mutex> lock(g.mutex);
-    for (const auto& block : g.blocks) {
-        const uintptr_t start = reinterpret_cast<uintptr_t>(block.aligned_ptr);
-        const uintptr_t end = start + static_cast<uintptr_t>(block.size);
-        if (query >= start && query < end) {
-            const uint32_t offset = static_cast<uint32_t>(query - start);
-            return block.apu_addr + offset;
-        }
+    auto it = std::upper_bound(
+        g.blocks_by_host.begin(), g.blocks_by_host.end(), query,
+        [](uintptr_t q, const mw::ApuHostEntry& e) { return q < e.host_start; });
+    if (it == g.blocks_by_host.begin()) {
+        return 0u;
+    }
+    --it;
+    if (query >= it->host_start && query < it->host_end) {
+        const uint32_t offset = static_cast<uint32_t>(query - it->host_start);
+        return it->apu_addr + offset;
     }
     return 0u;
 }
@@ -1885,6 +2045,9 @@ Pg6HResult pg6_mw_xapu_enqueue_command(Pg6XApuHandle handle,
         result.assign(bytes, bytes + command_size);
     }
     it->second->results.push_back(std::move(result));
+    while (it->second->results.size() > mw::kXApuMaxLoopbackResults) {
+        it->second->results.pop_front();
+    }
     return gdk::S_OK_HR;
 }
 

@@ -668,6 +668,199 @@ void test_ffx_bvh_mf() {
     CHECK(pg6_mw_mf_shutdown() == S_OK_HR);
 }
 
+// ---------------------------------------------------------------------------
+// 6. O50: APU heap reuse, O(log N) lookup stress, overflow & XMA census wrap
+// ---------------------------------------------------------------------------
+
+void test_apu_heap_reuse_and_lookup_stress() {
+    CHECK(pg6_mw_apu_create_heap(32u * 1024u * 1024u, 16u * 1024u * 1024u) == S_OK_HR);
+    playgta6::os::GuestHeap& guest_heap = playgta6::os::default_guest_heap();
+
+    // Overflow & invalid argument guards.
+    void* bad_va = nullptr;
+    Pg6ApuAddress bad_phys = 0u;
+    CHECK(pg6_mw_apu_alloc(nullptr, &bad_phys, 64u, 16u, 0u) == E_INVALIDARG_HR);
+    CHECK(pg6_mw_apu_alloc(&bad_va, &bad_phys, 0u, 16u, 0u) == E_INVALIDARG_HR);
+    CHECK(pg6_mw_apu_alloc(&bad_va, &bad_phys, 0xF5000000u, 16u, 0u) == gdk::E_OUTOFMEMORY_HR);
+    CHECK(bad_va == nullptr && bad_phys == 0u);
+
+    // Alignment edge cases: 0, 1, 7, 16, 17, 256, 4096, 65536, 131072 (capped at 64 KiB).
+    const uint32_t test_aligns[] = {0u, 1u, 7u, 16u, 17u, 256u, 4096u, 65536u, 131072u};
+    const uint32_t expected_aligns[] = {16u, 16u, 16u, 16u, 32u, 256u, 4096u, 65536u, 65536u};
+    for (size_t i = 0; i < sizeof(test_aligns) / sizeof(test_aligns[0]); ++i) {
+        void* va = nullptr;
+        Pg6ApuAddress phys = 0u;
+        CHECK(pg6_mw_apu_alloc(&va, &phys, 512u, test_aligns[i], 0u) == S_OK_HR);
+        CHECK(va != nullptr && phys != 0u);
+        CHECK((phys % expected_aligns[i]) == 0u);
+        void* host = guest_heap.to_host(reinterpret_cast<uintptr_t>(va));
+        CHECK(host != nullptr);
+        CHECK(pg6_mw_apu_is_virtual_address_valid(host, 512u) == 1);
+        // Huge span overflow guard: must not wrap around and report valid.
+        CHECK(pg6_mw_apu_is_virtual_address_valid(host, 0xFFFFFFFFu) == 0);
+        CHECK(pg6_mw_apu_free(host) == S_OK_HR);
+    }
+
+    // Sustained alloc/free churn: 400 rounds of 16 KiB allocations must reuse freed APU space
+    // rather than monotonically exhausting the 32-bit APU address space.
+    Pg6ApuAddress min_seen = 0xFFFFFFFFu;
+    Pg6ApuAddress max_seen = 0u;
+    for (uint32_t round = 0; round < 400u; ++round) {
+        void* va = nullptr;
+        Pg6ApuAddress phys = 0u;
+        CHECK(pg6_mw_apu_alloc(&va, &phys, 16384u, 4096u, 0u) == S_OK_HR);
+        min_seen = std::min(min_seen, phys);
+        max_seen = std::max(max_seen, phys);
+        void* host = guest_heap.to_host(reinterpret_cast<uintptr_t>(va));
+        CHECK(pg6_mw_apu_map_apu_address(phys) == host);
+        CHECK(pg6_mw_apu_map_virtual_address(host) == phys);
+        CHECK(pg6_mw_apu_free(host) == S_OK_HR);
+    }
+    // Without reuse, 400 * 16 KiB = 6.4 MiB span; with reuse it collapses to a single slot!
+    CHECK(max_seen - min_seen <= 65536u);
+
+    // Coalescing test: allocate 3 contiguous blocks A, B, C; free A and C, then free B; then
+    // allocate one combined block A+B+C and verify it reuses A's address!
+    struct Slot {
+        void* va = nullptr;
+        void* host = nullptr;
+        Pg6ApuAddress phys = 0u;
+        uint32_t size = 0u;
+    };
+    Slot s[3]{};
+    for (int i = 0; i < 3; ++i) {
+        s[i].size = 4096u;
+        CHECK(pg6_mw_apu_alloc(&s[i].va, &s[i].phys, s[i].size, 4096u, 0u) == S_OK_HR);
+        s[i].host = guest_heap.to_host(reinterpret_cast<uintptr_t>(s[i].va));
+    }
+    const Pg6ApuAddress base_a = s[0].phys;
+    // Keep a fourth sentinel block after C so tail retraction doesn't hide coalescing.
+    Slot sentinel{};
+    CHECK(pg6_mw_apu_alloc(&sentinel.va, &sentinel.phys, 4096u, 4096u, 0u) == S_OK_HR);
+    sentinel.host = guest_heap.to_host(reinterpret_cast<uintptr_t>(sentinel.va));
+
+    CHECK(pg6_mw_apu_free(s[0].host) == S_OK_HR);
+    CHECK(pg6_mw_apu_free(s[2].host) == S_OK_HR);
+    CHECK(pg6_mw_apu_free(s[1].host) == S_OK_HR);  // coalesces A + B + C into 12 KiB hole
+
+    Slot merged{};
+    CHECK(pg6_mw_apu_alloc(&merged.va, &merged.phys, 12288u, 4096u, 0u) == S_OK_HR);
+    merged.host = guest_heap.to_host(reinterpret_cast<uintptr_t>(merged.va));
+    CHECK(merged.phys == base_a);
+    CHECK(pg6_mw_apu_free(merged.host) == S_OK_HR);
+    CHECK(pg6_mw_apu_free(sentinel.host) == S_OK_HR);
+
+    // O(log N) interior pointer/APU mapping accuracy across 160 unsorted allocations.
+    std::vector<Slot> live;
+    uint32_t prng = 0x9E3779B9u;
+    auto next_rand = [&]() {
+        prng ^= prng << 13u;
+        prng ^= prng >> 17u;
+        prng ^= prng << 5u;
+        return prng;
+    };
+    for (uint32_t i = 0; i < 160u; ++i) {
+        const uint32_t sz = 256u + (next_rand() % 4096u);
+        const uint32_t al = 16u << (next_rand() % 6u);  // 16..512
+        Slot sl{};
+        sl.size = sz;
+        CHECK(pg6_mw_apu_alloc(&sl.va, &sl.phys, sz, al, 0u) == S_OK_HR);
+        sl.host = guest_heap.to_host(reinterpret_cast<uintptr_t>(sl.va));
+        CHECK((sl.phys % al) == 0u);
+        live.push_back(sl);
+    }
+    // Free every third block in scrambled order, then allocate replacements to mix address orders.
+    for (size_t i = 0; i < live.size(); i += 3u) {
+        CHECK(pg6_mw_apu_free(live[i].host) == S_OK_HR);
+        live[i].host = nullptr;
+    }
+    live.erase(std::remove_if(live.begin(), live.end(), [](const Slot& x) { return x.host == nullptr; }),
+               live.end());
+    for (uint32_t i = 0; i < 40u; ++i) {
+        Slot sl{};
+        sl.size = 512u + (next_rand() % 1024u);
+        CHECK(pg6_mw_apu_alloc(&sl.va, &sl.phys, sl.size, 64u, 0u) == S_OK_HR);
+        sl.host = guest_heap.to_host(reinterpret_cast<uintptr_t>(sl.va));
+        live.push_back(sl);
+    }
+    // Verify every live block's start, interior midpoint, and final byte map accurately.
+    for (const auto& sl : live) {
+        const uint32_t mid = sl.size / 2u;
+        const uint32_t last = sl.size - 1u;
+        auto* bytes = static_cast<uint8_t*>(sl.host);
+        CHECK(pg6_mw_apu_map_apu_address(sl.phys) == bytes);
+        CHECK(pg6_mw_apu_map_apu_address(sl.phys + mid) == bytes + mid);
+        CHECK(pg6_mw_apu_map_apu_address(sl.phys + last) == bytes + last);
+        CHECK(pg6_mw_apu_map_virtual_address(bytes) == sl.phys);
+        CHECK(pg6_mw_apu_map_virtual_address(bytes + mid) == sl.phys + mid);
+        CHECK(pg6_mw_apu_map_virtual_address(bytes + last) == sl.phys + last);
+        CHECK(pg6_mw_apu_is_virtual_address_valid(bytes, sl.size) == 1);
+        CHECK(pg6_mw_apu_is_virtual_address_valid(bytes + mid, sl.size - mid) == 1);
+        CHECK(pg6_mw_apu_is_virtual_address_valid(bytes + mid, sl.size - mid + 1u) == 0);
+    }
+    for (const auto& sl : live) {
+        CHECK(pg6_mw_apu_free(sl.host) == S_OK_HR);
+    }
+}
+
+void test_xma_census_wrap_and_xapu_loopback_cap() {
+    // Shape context count overflow guard.
+    struct ShapeContexts {
+        uint32_t counts[6];
+        uint64_t arrays[6];
+    };
+    ShapeContexts huge{};
+    huge.counts[4] = 0x10000000u;  // 0x10000000 * 64 = 16 GiB -> rejected cleanly
+    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(&huge) == gdk::E_OUTOFMEMORY_HR);
+    CHECK(huge.arrays[4] == 0u);
+
+    // XMA context census modulo ring_blocks check.
+    ShapeContexts shape{};
+    shape.counts[4] = 4u;
+    CHECK(pg6_mw_acp_hal_allocate_shape_contexts(&shape) == S_OK_HR);
+    auto* base = static_cast<uint8_t*>(playgta6::os::default_guest_heap().to_host(shape.arrays[4]));
+    CHECK(base != nullptr);
+    // Context 0: ring = 4, write = 6 (6 % 4 == 2), read = 2 (2 % 4 == 2) -> NOT pending.
+    {
+        const uint32_t d0 = (4u << 22) | (6u << 27);
+        const uint32_t d9 = 2u;
+        std::memcpy(base + 0 * 64, &d0, 4);
+        std::memcpy(base + 0 * 64 + 0x24, &d9, 4);
+    }
+    // Context 1: ring = 4, write = 5 (5 % 4 == 1), read = 0 (0 % 4 == 0) -> pending.
+    {
+        const uint32_t d0 = (4u << 22) | (5u << 27);
+        const uint32_t d9 = 0u;
+        std::memcpy(base + 1 * 64, &d0, 4);
+        std::memcpy(base + 1 * 64 + 0x24, &d9, 4);
+    }
+    // Context 2: ring = 0 (encodes 32), write = 31, read = 31 -> NOT pending.
+    {
+        const uint32_t d0 = (31u << 27);
+        const uint32_t d9 = 31u;
+        std::memcpy(base + 2 * 64, &d0, 4);
+        std::memcpy(base + 2 * 64 + 0x24, &d9, 4);
+    }
+    const Pg6XmaContextCensus census = pg6_mw_xma_context_census();
+    CHECK(census.contexts == 4u && census.touched == 3u && census.output_pending == 1u);
+    CHECK(pg6_mw_acp_hal_release_shape_contexts() == S_OK_HR);
+
+    // XApu loopback session bounded queue cap (4096 max, drops oldest).
+    Pg6XApuHandle xapu = nullptr;
+    CHECK(pg6_mw_xapu_connect(nullptr, &xapu) == S_OK_HR);
+    for (uint32_t i = 0; i < 4200u; ++i) {
+        CHECK(pg6_mw_xapu_enqueue_command(xapu, &i, sizeof(i)) == S_OK_HR);
+    }
+    uint32_t pending = 0u;
+    CHECK(pg6_mw_xapu_get_result_count(xapu, &pending) == S_OK_HR);
+    CHECK(pending == 4096u);
+    uint32_t first_val = 0u;
+    uint32_t written = 0u;
+    CHECK(pg6_mw_xapu_dequeue_result(xapu, &first_val, sizeof(first_val), &written) == S_OK_HR);
+    CHECK(written == sizeof(first_val) && first_val == (4200u - 4096u));
+    CHECK(pg6_mw_xapu_disconnect(xapu) == S_OK_HR);
+}
+
 }  // namespace
 
 int main() {
@@ -676,6 +869,8 @@ int main() {
     test_bink2();
     test_audio_apu_xapu_xdsp();
     test_ffx_bvh_mf();
+    test_apu_heap_reuse_and_lookup_stress();
+    test_xma_census_wrap_and_xapu_loopback_cap();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_xbox_middleware FAILED with %d failure(s).\n", g_failures);
