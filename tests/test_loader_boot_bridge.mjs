@@ -4365,3 +4365,172 @@ test('W360 loader.js SPSC gpu_ring boot attaches guest memory on runtime boot an
   assert.equal(lastTwo[0].buffer, grownBuf);
   assert.equal(lastTwo[1].type, 'drain-ring');
 });
+
+test('Orch-13 createWorkerBootInitPayloads forwards devicePixelRatio and swapchainOptions when provided and omits when absent', () => {
+  // Absent or invalid values are omitted from gpuInit and ioInit.
+  const omitted = createWorkerBootInitPayloads({
+    canvas: 'offscreen',
+    width: 1280,
+    height: 720,
+    dataBase: '/data/',
+  });
+  assert.equal('devicePixelRatio' in omitted.gpuInit, false);
+  assert.equal('swapchainOptions' in omitted.gpuInit, false);
+  assert.equal('devicePixelRatio' in omitted.ioInit, false);
+  assert.equal('swapchainOptions' in omitted.ioInit, false);
+
+  const invalid = createWorkerBootInitPayloads({
+    canvas: 'offscreen',
+    width: 1280,
+    height: 720,
+    dataBase: '/data/',
+    devicePixelRatio: 0,
+    swapchainOptions: ['not-an-object'],
+  });
+  assert.equal('devicePixelRatio' in invalid.gpuInit, false);
+  assert.equal('swapchainOptions' in invalid.gpuInit, false);
+
+  // Valid values are forwarded to gpuInit (with shallow-cloned swapchainOptions) and omitted from ioInit.
+  const swapOpts = { alphaMode: 'opaque', powerPreference: 'high-performance' };
+  const forwarded = createWorkerBootInitPayloads({
+    canvas: 'offscreen',
+    width: 2560,
+    height: 1440,
+    dataBase: '/data/',
+    devicePixelRatio: 1,
+    swapchainOptions: swapOpts,
+  });
+  assert.equal(forwarded.gpuInit.devicePixelRatio, 1);
+  assert.deepEqual(forwarded.gpuInit.swapchainOptions, {
+    alphaMode: 'opaque',
+    powerPreference: 'high-performance',
+  });
+  assert.notEqual(forwarded.gpuInit.swapchainOptions, swapOpts);
+  assert.equal('devicePixelRatio' in forwarded.ioInit, false);
+  assert.equal('swapchainOptions' in forwarded.ioInit, false);
+});
+
+test('Orch-13 loader.js gpu-validation-error emits gpuValidationForwarded: true on BroadcastChannel while forwarding structured message to main thread', () => {
+  const mainMessages = [];
+  const progressMessages = [];
+  const workersByScript = new Map();
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+    }
+    postMessage(msg) {
+      if (this.name === 'game-progress') {
+        progressMessages.push(msg);
+      }
+    }
+  }
+
+  class MockWorker {
+    constructor(script) {
+      this.script = script;
+      this.onmessage = null;
+      this.posted = [];
+      workersByScript.set(script, this);
+    }
+    postMessage(msg) {
+      this.posted.push(msg);
+    }
+  }
+
+  const workerSelf = {
+    onmessage: null,
+    postMessage(msg) {
+      mainMessages.push(msg);
+    },
+  };
+
+  const sandbox = {
+    self: workerSelf,
+    globalThis: null,
+    BroadcastChannel: MockBroadcastChannel,
+    Worker: MockWorker,
+    indexedDB: null,
+    Uint8Array,
+    Int32Array,
+    Uint32Array,
+    DataView,
+    ArrayBuffer,
+    SharedArrayBuffer,
+    Atomics,
+    BigInt,
+    TextEncoder,
+    TextDecoder,
+    Map,
+    Set,
+    Promise,
+    Error,
+    Number,
+    Math,
+    Date,
+    setTimeout,
+    clearTimeout,
+    fetch: async () => ({ ok: false, status: 404 }),
+    importScripts(scriptPath) {
+      const resolved = path.resolve(repoRoot, 'web', scriptPath);
+      vm.runInContext(fs.readFileSync(resolved, 'utf8'), context, { filename: resolved });
+    },
+  };
+  sandbox.globalThis = sandbox;
+  const context = vm.createContext(sandbox);
+
+  const loaderPath = path.join(repoRoot, 'web/loader.js');
+  vm.runInContext(fs.readFileSync(loaderPath, 'utf8'), context, { filename: loaderPath });
+
+  workerSelf.onmessage({
+    data: {
+      canvas: { id: 'c' },
+      width: 1280,
+      height: 720,
+      devicePixelRatio: 1,
+      swapchainOptions: { alphaMode: 'opaque' },
+      dataBase: '/data/',
+    },
+  });
+
+  const gpuWorker = workersByScript.get('./workers/wgpu_worker.js');
+  assert.ok(gpuWorker);
+  assert.equal(gpuWorker.posted[0].devicePixelRatio, 1);
+  assert.deepEqual({ ...gpuWorker.posted[0].swapchainOptions }, { alphaMode: 'opaque' });
+
+  // Resize forwards optional devicePixelRatio when valid and omits when absent.
+  workerSelf.onmessage({ data: { resize: true, width: 1920, height: 1080, devicePixelRatio: 1.5 } });
+  workerSelf.onmessage({ data: { resize: true, width: 1600, height: 900 } });
+  const resizePosts = gpuWorker.posted.filter((m) => m && m.resize === true);
+  assert.deepEqual(
+    resizePosts.map((m) => ({ ...m })),
+    [
+      { resize: true, width: 1920, height: 1080, devicePixelRatio: 1.5 },
+      { resize: true, width: 1600, height: 900 },
+    ]
+  );
+
+  // gpu-validation-error emits gpuValidationForwarded: true on BroadcastChannel AND forwards structured message to main.
+  gpuWorker.onmessage({
+    data: {
+      type: 'gpu-validation-error',
+      seq: 3,
+      timestampMs: 12345,
+      totalCount: 3,
+      error: {
+        type: 'validation',
+        message: 'Bind group entry mismatch',
+      },
+    },
+  });
+
+  const bcErr = progressMessages.find((m) => m && m.gpuValidationForwarded === true);
+  assert.ok(bcErr, 'expected BroadcastChannel message with gpuValidationForwarded: true');
+  assert.match(bcErr.error, /wgpu_worker:.*Bind group entry mismatch/);
+
+  const mainErr = mainMessages.find((m) => m && m.type === 'gpu-validation-error');
+  assert.ok(mainErr, 'expected structured gpu-validation-error forwarded to main thread');
+  assert.equal(mainErr.type, 'gpu-validation-error');
+  assert.equal(mainErr.error.type, 'validation');
+  assert.match(mainErr.error.message, /Bind group entry mismatch/);
+});

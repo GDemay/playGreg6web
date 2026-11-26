@@ -1483,6 +1483,25 @@ function createWorkerBootInitPayloads(msg = {}) {
     msg && typeof msg === 'object' && typeof msg.enableResourceReplay === 'boolean'
       ? msg.enableResourceReplay
       : false;
+  const gpuExtra = {};
+  if (
+    msg &&
+    typeof msg === 'object' &&
+    typeof msg.devicePixelRatio === 'number' &&
+    Number.isFinite(msg.devicePixelRatio) &&
+    msg.devicePixelRatio > 0
+  ) {
+    gpuExtra.devicePixelRatio = msg.devicePixelRatio;
+  }
+  if (
+    msg &&
+    typeof msg === 'object' &&
+    msg.swapchainOptions &&
+    typeof msg.swapchainOptions === 'object' &&
+    !Array.isArray(msg.swapchainOptions)
+  ) {
+    gpuExtra.swapchainOptions = Object.assign({}, msg.swapchainOptions);
+  }
   return {
     ioInit: Object.assign({ init: true, dataBase: msg.dataBase }, bootFields),
     gpuInit: Object.assign(
@@ -1493,6 +1512,7 @@ function createWorkerBootInitPayloads(msg = {}) {
         height: msg.height,
         enableResourceReplay,
       },
+      gpuExtra,
       bootFields,
     ),
   };
@@ -10119,7 +10139,15 @@ if (typeof self !== 'undefined') {
       return;
     }
     if (msg.resize && gpuWorker) {
-      gpuWorker.postMessage({ resize: true, width: msg.width, height: msg.height });
+      const resizePayload = { resize: true, width: msg.width, height: msg.height };
+      if (
+        typeof msg.devicePixelRatio === 'number' &&
+        Number.isFinite(msg.devicePixelRatio) &&
+        msg.devicePixelRatio > 0
+      ) {
+        resizePayload.devicePixelRatio = msg.devicePixelRatio;
+      }
+      gpuWorker.postMessage(resizePayload);
       return;
     }
     if (
@@ -10309,6 +10337,14 @@ if (typeof self !== 'undefined') {
       }
       if (data.type === 'first-visible-frame' || data.type === 'visible-frame') {
         attachActiveCoordinatorGuestMemory();
+        forwardGpuWorkerMessage(data, postToMain);
+        return;
+      }
+      if (data.type === 'gpu-validation-error') {
+        postProgress({
+          error: `wgpu_worker: ${formatGpuWorkerError(data.error)}`,
+          gpuValidationForwarded: true,
+        });
         forwardGpuWorkerMessage(data, postToMain);
         return;
       }

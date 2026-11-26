@@ -7,6 +7,35 @@
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2032%2032%27%3E%3Crect%20width=%2732%27%20height=%2732%27%20rx=%278%27%20fill=%27%23111112%27/%3E%3Cpath%20d=%27M8%209l5.5%2014L19%209%27%20fill=%27none%27%20stroke=%27%23dfe2e5%27%20stroke-width=%272.75%27%20stroke-linecap=%27round%27%20stroke-linejoin=%27round%27/%3E%3Cpolygon%20points=%2721.5,9.5%2026.5,16%2021.5,22.5%27%20fill=%27%236d9cfe%27/%3E%3C/svg%3E" />
   <link rel="stylesheet" href="./ui/overlay.css" />
   <style>
+    html,
+    body {
+      background: #000;
+    }
+    #viewport {
+      position: fixed;
+      inset: 0;
+      margin: auto;
+      width: min(100vw, calc(100vh * 16 / 9));
+      height: min(100vh, calc(100vw * 9 / 16));
+      max-width: 100vw;
+      max-height: 100vh;
+      aspect-ratio: 16 / 9;
+      object-fit: contain;
+      background: #000;
+      transition: opacity 220ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    #viewport[data-boot-state="loading"] {
+      opacity: 0;
+    }
+    #viewport[data-boot-state="presenting"],
+    #viewport[data-boot-state="visible"] {
+      opacity: 1;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #viewport {
+        transition: none;
+      }
+    }
     #hud[hidden],
     #scripted-input-badge[hidden] {
       display: none !important;
@@ -368,7 +397,8 @@
       'slabCacheMisses',
       'syncFastPathHits',
     ]);
-    let lastValidationEventKey = null;
+    const recentValidationEventKeys = new Set();
+    const MAX_VALIDATION_DEDUPE_KEYS = 64;
     const bootStartedAt = typeof performance !== 'undefined' && typeof performance.now === 'function'
       ? performance.now()
       : Date.now();
@@ -788,27 +818,60 @@
         payload && typeof payload === 'object'
           ? payload.record || payload.error || payload
           : payload;
-      const seq =
-        payload && typeof payload === 'object' && Number.isInteger(payload.seq) && payload.seq > 0
-          ? payload.seq
-          : record && typeof record === 'object' && Number.isInteger(record.seq) && record.seq > 0
-            ? record.seq
+      const workerSeq =
+        record && typeof record === 'object' && Number.isInteger(record.workerSeq) && record.workerSeq > 0
+          ? record.workerSeq
+          : payload && typeof payload === 'object' && Number.isInteger(payload.workerSeq) && payload.workerSeq > 0
+            ? payload.workerSeq
             : null;
+      const seq =
+        workerSeq !== null
+          ? workerSeq
+          : payload && typeof payload === 'object' && Number.isInteger(payload.seq) && payload.seq > 0
+            ? payload.seq
+            : record && typeof record === 'object' && Number.isInteger(record.seq) && record.seq > 0
+              ? record.seq
+              : null;
       const ts =
         payload && typeof payload === 'object' && Number.isFinite(payload.timestampMs)
           ? payload.timestampMs
           : record && typeof record === 'object' && Number.isFinite(record.timestampMs)
             ? record.timestampMs
             : null;
-      const dedupeKey = seq !== null ? `${seq}:${ts ?? ''}` : null;
-      if (dedupeKey !== null && dedupeKey === lastValidationEventKey) {
+      const rawMsg =
+        typeof record === 'string'
+          ? record
+          : record && typeof record === 'object' && typeof record.message === 'string'
+            ? record.message
+            : payload && typeof payload === 'object' && typeof payload.message === 'string'
+              ? payload.message
+              : '';
+      const rawType =
+        record && typeof record === 'object' && typeof (record.errorType ?? record.type) === 'string'
+          ? String(record.errorType ?? record.type).trim().toLowerCase()
+          : payload && typeof payload === 'object' && typeof payload.errorType === 'string'
+            ? payload.errorType.trim().toLowerCase()
+            : '';
+      const dedupeKey =
+        seq !== null
+          ? `s:${seq}:${ts ?? ''}:${rawType}:${rawMsg}`
+          : ts !== null && rawMsg.length > 0
+            ? `m:${ts}:${rawType}:${rawMsg}`
+            : null;
+      if (dedupeKey !== null && recentValidationEventKeys.has(dedupeKey)) {
         if (activeHudController) {
           syncValidationPillTooltip(activeHudController.getValidationSummary());
         }
         return;
       }
       if (dedupeKey !== null) {
-        lastValidationEventKey = dedupeKey;
+        recentValidationEventKeys.add(dedupeKey);
+        if (recentValidationEventKeys.size > MAX_VALIDATION_DEDUPE_KEYS) {
+          const oldest = recentValidationEventKeys.values().next().value;
+          if (oldest !== undefined) {
+            recentValidationEventKeys.delete(oldest);
+          }
+        }
       }
       if (activeHudController) {
         activeHudController.recordValidationError(record);
@@ -901,7 +964,15 @@
         if (bootProgressBarEl) {
           bootProgressBarEl.setAttribute('aria-valuenow', String(Math.round(pct)));
         }
-        if (pct >= 100 || stage === 'FIRST_PRESENT' || bootSummary.readyForSplash) {
+        const splashHolding = Boolean(
+          window.playgta6SplashOverlay &&
+          typeof window.playgta6SplashOverlay.getState === 'function' &&
+          window.playgta6SplashOverlay.getState()?.holdingForVisibleFrame
+        );
+        if (
+          !splashHolding &&
+          (pct >= 100 || stage === 'FIRST_VISIBLE_FRAME' || stage === 'FIRST_PRESENT' || bootSummary.readyForSplash)
+        ) {
           bootProgressFillEl.dataset.state = 'ok';
           bootCompleted = true;
         }

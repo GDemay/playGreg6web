@@ -3051,4 +3051,57 @@ test('W366 getPhaseTelemetry() and getFastStats() match getStats() accurately wi
   await controller.destroy();
 });
 
+test('Orch-13 recordGpuValidationError skips duplicate hud.appendLog when hud.recordValidationError exists and falls back to hud.appendLog otherwise', async () => {
+  // 1. HUD with dedicated recordValidationError hook must NOT receive a duplicate hud.appendLog line.
+  const hudWithHook = createExtendedMockHud();
+  const c1 = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud: hudWithHook,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  await c1.start();
+  const logsBefore = hudWithHook.logs.length;
+  const r1 = c1.recordGpuValidationError({
+    errorType: 'validation',
+    message: 'Invalid render pipeline bind group layout',
+  });
+  assert.equal(r1.handled, true);
+  assert.equal(hudWithHook.validationErrors.length, 1);
+  assert.equal(
+    hudWithHook.logs.slice(logsBefore).filter((l) => /WebGPU|Invalid render pipeline/i.test(l.message)).length,
+    0,
+    'must not duplicate hud.appendLog when hud.recordValidationError is defined'
+  );
+  await c1.destroy();
+
+  // 2. HUD without dedicated validation hook still logs via hud.appendLog with appropriate severity.
+  const hudLogOnly = createMockHud();
+  const c2 = new RuntimeSessionController({
+    fetchImpl: createMockFetch(readyStatus({ hasWasmBinary: true })),
+    hud: hudLogOnly,
+    capabilityProbe: () => fullCapabilities(),
+    startWasmRuntime: async () => ({ stop() {} }),
+  });
+
+  await c2.start();
+  const logsBefore2 = hudLogOnly.logs.length;
+  c2.recordGpuValidationError({
+    errorType: 'validation',
+    message: 'Fallback validation warning',
+  });
+  c2.recordGpuValidationError({
+    errorType: 'out-of-memory',
+    message: 'Fallback OOM error',
+  });
+
+  const addedLogs = hudLogOnly.logs.slice(logsBefore2);
+  assert.deepEqual(addedLogs, [
+    { message: '[WebGPU validation] Fallback validation warning', level: 'warn' },
+    { message: '[WebGPU out-of-memory] Fallback OOM error', level: 'error' },
+  ]);
+  await c2.destroy();
+});
+
 

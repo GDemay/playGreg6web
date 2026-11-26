@@ -5990,3 +5990,800 @@ test('shouldRelaunchGuest caps self-relaunches per session and resets after a pr
   assert.equal(shouldRelaunchGuest({}), true);
   assert.equal(shouldRelaunchGuest(null), true);
 });
+
+test('Orch-13 InputBridge visual boot sync (notifyFirstPresent & notifyFirstVisibleFrame) and canvas dataset.bootState lifecycle', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  function createFakeTimeouts() {
+    let nextId = 1;
+    const active = new Map();
+    return {
+      setTimeout(fn, ms) {
+        const id = nextId++;
+        active.set(id, { fn, ms });
+        return id;
+      },
+      clearTimeout(id) {
+        active.delete(id);
+      },
+      pendingCount() {
+        return active.size;
+      },
+    };
+  }
+
+  // Scenario A: Worker first-present / frame-presented / first-visible-frame messages sync
+  // InputBridge (even when BootOrchestrator handles notifyFirstPresent early), activate
+  // startOn: 'FIRST_VISIBLE_FRAME' scripts, enforce idempotency, and update canvas.dataset.bootState.
+  const clockA = createClock(1000);
+  const rafA = createFakeRaf(clockA);
+  const timersA = createFakeTimers();
+  const timeoutsA = createFakeTimeouts();
+  const webgpuA = createMockWebGpuEnv();
+  webgpuA.canvas.dataset = {};
+  const { windowObj: winA, documentObj: docA, navigatorObj: navA } = createMockBrowserHost({
+    clock: clockA,
+    raf: rafA,
+    timers: timersA,
+    gpu: webgpuA.gpu,
+  });
+  winA.location = { origin: 'http://127.0.0.1:8080', search: '' };
+  docA.head = makeMockNode('head');
+  docA.createElement = (tag) => makeMockNode(tag);
+  docA.querySelector = () => null;
+
+  const mockWorkerA = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const appA = bootstrapPlayGta6App({
+    windowObj: winA,
+    documentObj: docA,
+    navigatorObj: navA,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpuA.canvas,
+    hud: createMockHud(),
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    pgimPreloader: {
+      async preloadBootBundle() {
+        return { pgim: new Uint8Array(4), shaderPackBytes: null, reflectionManifest: null, bytesLoaded: 4 };
+      },
+    },
+    splashOverlayOptions: { fadeMs: 0, visibleFrameFadeMs: 0, nowFn: clockA.now },
+    defaultHoldUntilVisible: true,
+    now: clockA.now,
+    setInterval: timersA.setInterval,
+    clearInterval: timersA.clearInterval,
+    createWasmWorker: () => mockWorkerA,
+  });
+
+  let firstPresentCalls = 0;
+  let firstVisibleCalls = 0;
+  const origNotifyPresent = appA.inputBridge.notifyFirstPresent.bind(appA.inputBridge);
+  const origNotifyVisible = appA.inputBridge.notifyFirstVisibleFrame.bind(appA.inputBridge);
+  appA.inputBridge.notifyFirstPresent = (...args) => {
+    firstPresentCalls += 1;
+    return origNotifyPresent(...args);
+  };
+  appA.inputBridge.notifyFirstVisibleFrame = (...args) => {
+    firstVisibleCalls += 1;
+    return origNotifyVisible(...args);
+  };
+
+  try {
+    assert.equal(webgpuA.canvas.dataset.bootState, 'loading');
+    const started = await appA.start();
+    assert.equal(started.ok, true);
+    assert.ok(appA.bootOrchestrator, 'BootOrchestrator must be active');
+
+    // Arm a milestone-gated script waiting for FIRST_VISIBLE_FRAME.
+    appA.inputBridge.startScript('start-screen', {
+      startOn: 'FIRST_VISIBLE_FRAME',
+      visibleFrameFallbackMs: 60_000,
+      nowFn: clockA.now,
+      setTimeoutFn: timeoutsA.setTimeout,
+      clearTimeoutFn: timeoutsA.clearTimeout,
+      setIntervalFn: timersA.setInterval,
+      clearIntervalFn: timersA.clearInterval,
+    });
+    assert.equal(appA.inputBridge.getStats().scriptPending, true);
+    assert.equal(appA.inputBridge.getStats().scriptActive, false);
+
+    // Worker first-present -> BootOrchestrator handles early, InputBridge still notified once, canvas -> presenting.
+    mockWorkerA.dispatch('message', {
+      data: { type: 'first-present', presentCount: 1 },
+    });
+    assert.equal(firstPresentCalls, 1);
+    assert.equal(appA.inputBridge.getStats().firstPresentNotified, true);
+    assert.equal(webgpuA.canvas.dataset.bootState, 'presenting');
+
+    // Subsequent frame-presented and explicit app.notifyFirstPresent() are idempotent.
+    mockWorkerA.dispatch('message', {
+      data: { type: 'frame-presented', presentCount: 2 },
+    });
+    appA.notifyFirstPresent();
+    assert.equal(firstPresentCalls, 1);
+    assert.equal(webgpuA.canvas.dataset.bootState, 'presenting');
+
+    // Worker first-visible-frame -> InputBridge notified once, script activates, canvas -> visible.
+    mockWorkerA.dispatch('message', {
+      data: {
+        type: 'first-visible-frame',
+        firstVisibleFrame: true,
+        firstVisibleFrameMs: 1500,
+        presentCount: 3,
+        maxLuma: 220,
+      },
+    });
+    assert.equal(firstVisibleCalls, 1);
+    assert.equal(appA.inputBridge.getStats().firstVisibleFrameNotified, true);
+    assert.equal(appA.inputBridge.getStats().scriptPending, false);
+    assert.equal(appA.inputBridge.getStats().scriptActive, true);
+    assert.equal(appA.inputBridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+    assert.equal(webgpuA.canvas.dataset.bootState, 'visible');
+
+    // Explicit repeat app.notifyFirstVisibleFrame() is idempotent.
+    appA.notifyFirstVisibleFrame();
+    assert.equal(firstVisibleCalls, 1);
+
+    // stop() resets canvas.dataset.bootState back to 'loading'.
+    await appA.stop();
+    assert.equal(webgpuA.canvas.dataset.bootState, 'loading');
+  } finally {
+    await appA.destroy();
+  }
+
+  // Scenario B: Direct app.notifyFirstPresent() / app.notifyFirstVisibleFrame() re-anchors
+  // an already-running anchorable menu preset (chrome-menu-flow-4) and resets state on stop().
+  const clockB = createClock(2000);
+  const rafB = createFakeRaf(clockB);
+  const timersB = createFakeTimers();
+  const webgpuB = createMockWebGpuEnv();
+  webgpuB.canvas.dataset = {};
+  const { windowObj: winB, documentObj: docB, navigatorObj: navB } = createMockBrowserHost({
+    clock: clockB,
+    raf: rafB,
+    timers: timersB,
+    gpu: webgpuB.gpu,
+  });
+
+  const appB = bootstrapPlayGta6App({
+    windowObj: winB,
+    documentObj: docB,
+    navigatorObj: navB,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: webgpuB.canvas,
+    hud: createMockHud(),
+    now: clockB.now,
+    setInterval: timersB.setInterval,
+    clearInterval: timersB.clearInterval,
+    createWasmWorker: () => createFakeEventTarget({ postMessage() {}, terminate() {} }),
+  });
+
+  try {
+    assert.equal(webgpuB.canvas.dataset.bootState, 'loading');
+    await appB.start();
+    appB.inputBridge.startScript('chrome-menu-flow-4', {
+      nowFn: clockB.now,
+      setIntervalFn: timersB.setInterval,
+      clearIntervalFn: timersB.clearInterval,
+    });
+    assert.equal(appB.inputBridge.getStats().scriptStartedOn, 'immediate');
+    assert.equal(appB.inputBridge.getStats().scriptReanchoredCount, 0);
+
+    appB.notifyFirstPresent();
+    assert.equal(webgpuB.canvas.dataset.bootState, 'presenting');
+    assert.equal(appB.inputBridge.getStats().firstPresentNotified, true);
+
+    appB.notifyFirstVisibleFrame();
+    assert.equal(webgpuB.canvas.dataset.bootState, 'visible');
+    assert.equal(appB.inputBridge.getStats().scriptStartedOn, 'FIRST_VISIBLE_FRAME');
+    assert.equal(appB.inputBridge.getStats().scriptReanchoredCount, 1);
+
+    await appB.stop();
+    assert.equal(webgpuB.canvas.dataset.bootState, 'loading');
+  } finally {
+    await appB.destroy();
+  }
+});
+
+test('Orch-13 smooth splash defaults (fadeOutMs 220 + visibleFrameFadeMs 450), sidecar progress filtering, visiblePresentsTotal: 0 gate, and BootOrchestrator dismiss without hide', async () => {
+  const { createRequire } = await import('node:module');
+  const require = createRequire(import.meta.url);
+  const { SplashOverlayController, DISMISS_REASONS } = require('../web/ui/splash_overlay.js');
+  const { BootOrchestrator } = require('../web/runtime/boot_orchestrator.js');
+
+  function makeMockNode(tag = 'div') {
+    const attrs = new Map();
+    const styles = new Map();
+    const node = {
+      tagName: String(tag).toUpperCase(),
+      className: '',
+      hidden: false,
+      textContent: '',
+      innerHTML: '',
+      parentNode: null,
+      children: [],
+      style: {
+        setProperty(k, v) {
+          styles.set(k, String(v));
+        },
+        getPropertyValue(k) {
+          return styles.get(k) || '';
+        },
+      },
+      classList: {
+        add(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.add(c);
+          node.className = [...set].join(' ');
+        },
+        remove(c) {
+          const set = new Set(String(node.className || '').split(/\s+/).filter(Boolean));
+          set.delete(c);
+          node.className = [...set].join(' ');
+        },
+        contains(c) {
+          return String(node.className || '').split(/\s+/).includes(c);
+        },
+      },
+      setAttribute(k, v) {
+        attrs.set(k, String(v));
+      },
+      getAttribute(k) {
+        return attrs.has(k) ? attrs.get(k) : null;
+      },
+      removeAttribute(k) {
+        attrs.delete(k);
+      },
+      appendChild(child) {
+        child.parentNode = node;
+        node.children.push(child);
+        return child;
+      },
+      removeChild(child) {
+        const idx = node.children.indexOf(child);
+        if (idx >= 0) node.children.splice(idx, 1);
+        child.parentNode = null;
+        return child;
+      },
+      addEventListener() {},
+      removeEventListener() {},
+      querySelector() {
+        return null;
+      },
+    };
+    return node;
+  }
+
+  // Part 1: BootOrchestrator.notifyFirstPresent() calls dismiss() without snapping via hide() when dismiss exists.
+  {
+    const calls = [];
+    const orchestrator = new BootOrchestrator({
+      splashOverlay: {
+        dismiss(meta) {
+          calls.push({ fn: 'dismiss', meta });
+        },
+        hide(meta) {
+          calls.push({ fn: 'hide', meta });
+        },
+      },
+    });
+    const res = orchestrator.notifyFirstPresent({ source: 'unit-test' });
+    assert.equal(res.ok, true);
+    assert.deepEqual(
+      calls.map((c) => c.fn),
+      ['dismiss']
+    );
+
+    // Fallback: when overlay only implements hide(), hide() is still invoked.
+    const hideOnlyCalls = [];
+    const fallbackOrch = new BootOrchestrator({
+      splashOverlay: {
+        hide() {
+          hideOnlyCalls.push('hide');
+        },
+      },
+    });
+    fallbackOrch.notifyFirstPresent({ source: 'unit-test' });
+    assert.deepEqual(hideOnlyCalls, ['hide']);
+  }
+
+  // Part 2: Default SplashOverlayController keeps fadeOutMs: 220 and visibleFrameFadeMs: 450,
+  // sidecar progress (opfsWarmBoot, reflectionSidecar) is ignored for PGIM_LOAD phaseProgress,
+  // and visiblePresentsTotal: 0 latches the active pixel-probe gate until visiblePresentsTotal > 0.
+  const clock = createClock(5000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+  const broadcastInstances = [];
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.onmessage = null;
+      broadcastInstances.push(this);
+    }
+    close() {}
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.location = { origin: 'http://127.0.0.1:8080', search: '' };
+  windowObj.BroadcastChannel = MockBroadcastChannel;
+  documentObj.head = makeMockNode('head');
+  documentObj.createElement = (tag) => makeMockNode(tag);
+  documentObj.querySelector = () => null;
+
+  const mockWorker = createFakeEventTarget({
+    postMessage() {},
+    terminate() {},
+  });
+
+  const bootStateUpdates = [];
+  let releasePgimPreload = null;
+  let pgimOnProgress = null;
+  const splashTimeouts = [];
+  let nextSplashTimerId = 1;
+  const splashTimerMap = new Map();
+
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+      pgimUrl: '/boot/guest.pgim',
+      shaderPackUrl: '/shaders/splash.wgsl.pack',
+      splashImage: '/game/xbs_splash.png',
+    }),
+    canvas: webgpu.canvas,
+    hud: createMockHud(),
+    splashContainer: makeMockNode('div'),
+    SplashOverlayCtor: SplashOverlayController,
+    BootOrchestratorCtor: BootOrchestrator,
+    bootOrchestratorOptions: {
+      parallelPreload: true,
+      opfsProbe: async ({ onProgress }) => {
+        onProgress({ loadedBytes: 1024, totalBytes: 1024, pct: 100 });
+        return { warmed: true };
+      },
+      reflectionSidecarLoader: async (_url, { onProgress }) => {
+        onProgress({ loadedBytes: 2048, totalBytes: 2048, pct: 100 });
+        return { entries: 4 };
+      },
+    },
+    pgimPreloader: {
+      async preloadBootBundle({ onProgress }) {
+        pgimOnProgress = onProgress;
+        await new Promise((resolve) => {
+          releasePgimPreload = resolve;
+        });
+        return {
+          pgim: new Uint8Array(4),
+          shaderPackBytes: null,
+          reflectionManifest: null,
+          bytesLoaded: 4,
+        };
+      },
+    },
+    // Intentionally omit fadeMs / fadeOutMs / visibleFrameFadeMs to verify defaults!
+    splashOverlayOptions: {
+      nowFn: clock.now,
+      setTimeout: (fn, ms) => {
+        const id = nextSplashTimerId++;
+        const entry = { id, fn, ms };
+        splashTimeouts.push(entry);
+        splashTimerMap.set(id, entry);
+        return id;
+      },
+      clearTimeout: (id) => {
+        splashTimerMap.delete(id);
+      },
+    },
+    defaultHoldUntilVisible: true,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker: () => mockWorker,
+  });
+
+  try {
+    // Default fadeOutMs stays 220 while preserving smooth 450ms visible-frame cross-fade.
+    assert.equal(app.splashOverlay.getState().fadeOutMs, 220);
+    assert.equal(app.splashOverlay.getState().visibleFrameFadeMs, 450);
+
+    // Spy on splashOverlay.updateBootState to verify sidecar progress does not inject phaseProgress.
+    const origUpdateBootState = app.splashOverlay.updateBootState.bind(app.splashOverlay);
+    app.splashOverlay.updateBootState = (patch) => {
+      bootStateUpdates.push({ ...patch });
+      return origUpdateBootState(patch);
+    };
+
+    const startPromise = app.start();
+    // Wait a tick for parallel opfsWarmBoot + reflectionSidecar tasks to report 100% progress.
+    await new Promise((r) => setTimeout(r, 10));
+
+    const sidecarPatches = bootStateUpdates.filter(
+      (p) =>
+        p.streamingProgress &&
+        (p.streamingProgress.asset === 'opfsWarmBoot' ||
+          p.streamingProgress.asset === 'reflectionSidecar')
+    );
+    assert.ok(sidecarPatches.length >= 2, 'expected opfsWarmBoot and reflectionSidecar progress updates');
+    for (const patch of sidecarPatches) {
+      assert.equal(
+        patch.phaseProgress,
+        undefined,
+        `non-primary sidecar ${patch.streamingProgress.asset} must not set phaseProgress`
+      );
+    }
+    assert.ok(
+      app.splashOverlay.getState().progressPct < 20,
+      `tiny sidecar progress must not slam splash progressPct to 20% (got ${app.splashOverlay.getState().progressPct})`
+    );
+
+    // Primary pgim progress DOES set stage: 'PGIM_LOAD' and phaseProgress.
+    assert.equal(typeof pgimOnProgress, 'function');
+    pgimOnProgress({ asset: 'pgim', loadedBytes: 50, totalBytes: 100, pct: 50 });
+    const pgimPatch = bootStateUpdates.find(
+      (p) => p.streamingProgress && p.streamingProgress.asset === 'pgim' && p.phaseProgress === 0.5
+    );
+    assert.ok(pgimPatch, 'primary pgim preload progress must set phaseProgress: 0.5');
+
+    releasePgimPreload();
+    const started = await startPromise;
+    assert.equal(started.ok, true);
+
+    // FIRST_PRESENT enters splash hold.
+    clock.advance(200);
+    broadcastInstances[0].onmessage({ data: { label: 'WebGPU frame #1 presented' } });
+    assert.equal(app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(app.splashOverlay.getState().dismissed, false);
+
+    // Explicit visiblePresentsTotal: 0 latches the pixel-probe gate and holds splash despite realPackDrawCount > 0.
+    clock.advance(300);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        visiblePresentsTotal: 0,
+        frameStats: { framesPresented: 8, realPackDrawCount: 35 },
+      },
+    });
+    assert.equal(app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(app.splashOverlay.getState().dismissed, false);
+
+    // Subsequent partial telemetry omitting visiblePresentsTotal stays held while latched.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameStats: { framesPresented: 12, realPackDrawCount: 64 },
+      },
+    });
+    assert.equal(app.splashOverlay.getState().holdingForVisibleFrame, true);
+    assert.equal(app.splashOverlay.getState().dismissed, false);
+
+    // Explicit visiblePresentsTotal > 0 releases the gate and starts the 450ms visible-frame fade.
+    clock.advance(400);
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        visiblePresentsTotal: 1,
+        frameStats: { framesPresented: 13, realPackDrawCount: 68 },
+      },
+    });
+    assert.equal(app.splashOverlay.getState().dismissed, true);
+    assert.equal(app.splashOverlay.getState().fading, true);
+    const fadeTimer = [...splashTimerMap.values()].find((entry) => entry.ms === 450);
+    assert.ok(fadeTimer, 'expected smooth 450ms visible-frame fade timer');
+    fadeTimer.fn();
+    assert.equal(app.splashOverlay.getState().fadeOutCompleted, true);
+    assert.equal(app.splashOverlay.getState().dismissReason, DISMISS_REASONS.FIRST_VISIBLE_FRAME);
+  } finally {
+    await app.destroy();
+  }
+});
+
+test('Orch-13 viewport metrics (300x150 fallback + DPR clamp), initPayload devicePixelRatio/swapchainOptions, ResizeObserver, no-op resize dedupe, and restart canvas safety', async () => {
+  // Part 1: 300x150 default canvas fallback to innerWidth/innerHeight, DPR clamping to 2,
+  // initPayload devicePixelRatio: 1 + swapchainOptions, no-op resize dedupe, ResizeObserver,
+  // and parentNode.replaceChild(cloneNode(false)) on Wasm64 restart.
+  const clock = createClock(1000);
+  const raf = createFakeRaf(clock);
+  const timers = createFakeTimers();
+  const webgpu = createMockWebGpuEnv();
+
+  let canvasSeq = 0;
+  let replaceChildCalls = 0;
+  let cloneNodeCalls = 0;
+  const parentNode = {
+    child: null,
+    replaceChild(nextNode, oldNode) {
+      replaceChildCalls += 1;
+      assert.equal(oldNode, this.child);
+      this.child = nextNode;
+      nextNode.parentNode = this;
+      return oldNode;
+    },
+  };
+
+  function makeTransferableCanvas() {
+    const id = ++canvasSeq;
+    let transferred = false;
+    const offscreen = { kind: 'MockOffscreenCanvas', canvasId: id };
+    const c = createFakeEventTarget({
+      id: `canvas-${id}`,
+      width: 300,
+      height: 150,
+      clientWidth: 0,
+      clientHeight: 0,
+      dataset: {},
+      parentNode,
+      transferControlToOffscreen() {
+        if (transferred) {
+          throw new Error('InvalidStateError: Cannot transfer control from a canvas more than once');
+        }
+        transferred = true;
+        return offscreen;
+      },
+      cloneNode(deep) {
+        cloneNodeCalls += 1;
+        assert.equal(deep, false);
+        return makeTransferableCanvas();
+      },
+    });
+    c._offscreen = offscreen;
+    return c;
+  }
+
+  const initialCanvas = makeTransferableCanvas();
+  parentNode.child = initialCanvas;
+
+  const observerInstances = [];
+  class MockResizeObserver {
+    constructor(cb) {
+      this.cb = cb;
+      this.observed = [];
+      this.disconnected = 0;
+      observerInstances.push(this);
+    }
+    observe(target) {
+      this.observed.push(target);
+    }
+    disconnect() {
+      this.disconnected += 1;
+    }
+    trigger() {
+      this.cb([]);
+    }
+  }
+
+  const { windowObj, documentObj, navigatorObj } = createMockBrowserHost({
+    clock,
+    raf,
+    timers,
+    gpu: webgpu.gpu,
+  });
+  windowObj.innerWidth = 1440;
+  windowObj.innerHeight = 900;
+  windowObj.devicePixelRatio = 3; // Exceeds default maxDevicePixelRatio (2)
+  windowObj.ResizeObserver = MockResizeObserver;
+
+  const workers = [];
+  const createWasmWorker = () => {
+    const posted = [];
+    const worker = createFakeEventTarget({
+      posted,
+      postMessage(payload, transfer) {
+        posted.push({ payload, transfer });
+      },
+      terminate() {},
+    });
+    workers.push(worker);
+    return worker;
+  };
+
+  const swapchainOptions = { alphaMode: 'opaque', powerPreference: 'high-performance' };
+  const app = bootstrapPlayGta6App({
+    windowObj,
+    documentObj,
+    navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: initialCanvas,
+    hud: createMockHud(),
+    swapchainOptions,
+    now: clock.now,
+    setInterval: timers.setInterval,
+    clearInterval: timers.clearInterval,
+    createWasmWorker,
+  });
+
+  try {
+    // ResizeObserver observed the canvas on bootstrap.
+    assert.equal(observerInstances.length, 1);
+    assert.deepEqual(observerInstances[0].observed, [initialCanvas]);
+
+    // 1. Start Wasm64: prefers innerWidth/innerHeight (1440x900) over HTML default 300x150,
+    //    clamps implicit DPR 3 -> 2 (2880x1800), sends devicePixelRatio: 1, forwards swapchainOptions.
+    const r1 = await app.start();
+    assert.equal(r1.ok, true);
+    assert.equal(workers.length, 1);
+    const init1 = workers[0].posted[0];
+    assert.equal(init1.payload.canvas, initialCanvas._offscreen);
+    assert.equal(init1.payload.width, 2880);
+    assert.equal(init1.payload.height, 1800);
+    assert.equal(init1.payload.devicePixelRatio, 1);
+    assert.deepEqual(init1.payload.swapchainOptions, swapchainOptions);
+    assert.deepEqual(init1.transfer, [initialCanvas._offscreen]);
+
+    // 2. Duplicate no-op resize with identical pixel dimensions is skipped.
+    assert.equal(app.resize(1440, 900), false);
+    assert.equal(workers[0].posted.length, 1);
+
+    // Real resize posts new pixel dimensions (DPR 3 clamped to 2 -> 2560x1440), then skips repeat.
+    assert.equal(app.resize(1280, 720), true);
+    assert.equal(workers[0].posted.length, 2);
+    assert.deepEqual(workers[0].posted[1].payload, { resize: true, width: 2560, height: 1440 });
+    assert.equal(app.resize(1280, 720, 2), false);
+    assert.equal(workers[0].posted.length, 2);
+
+    // 3. ResizeObserver callback triggers resize with clamped DPR.
+    initialCanvas.clientWidth = 1000;
+    initialCanvas.clientHeight = 500;
+    observerInstances[0].trigger();
+    assert.equal(workers[0].posted.length, 3);
+    assert.deepEqual(workers[0].posted[2].payload, { resize: true, width: 2000, height: 1000 });
+
+    // 4. Restart Wasm64 after transferControlToOffscreen(): clones & replaces canvas in parentNode
+    //    instead of crashing with a second transfer on the same canvas.
+    await app.stop();
+    const r2 = await app.start();
+    assert.equal(r2.ok, true);
+    assert.equal(cloneNodeCalls, 1);
+    assert.equal(replaceChildCalls, 1);
+    assert.equal(workers.length, 2);
+    assert.notEqual(parentNode.child, initialCanvas);
+    assert.equal(workers[1].posted[0].payload.canvas, parentNode.child._offscreen);
+    assert.deepEqual(workers[1].posted[0].transfer, [parentNode.child._offscreen]);
+  } finally {
+    await app.destroy();
+  }
+
+  // ResizeObserver disconnects cleanly on destroy().
+  assert.equal(observerInstances[0].disconnected, 1);
+
+  // Part 2: Restart without parentNode / cloneNode reuses transferredOffscreenCanvas safely without re-transferring.
+  let detachedTransfers = 0;
+  const detachedOffscreen = { kind: 'DetachedOffscreen' };
+  const detachedCanvas = createFakeEventTarget({
+    width: 640,
+    height: 360,
+    clientWidth: 640,
+    clientHeight: 360,
+    transferControlToOffscreen() {
+      detachedTransfers += 1;
+      if (detachedTransfers > 1) {
+        throw new Error('InvalidStateError: second transfer');
+      }
+      return detachedOffscreen;
+    },
+  });
+  const detachedWorkers = [];
+  const detachedHost = createMockBrowserHost({
+    clock: createClock(3000),
+    raf: createFakeRaf(createClock(3000)),
+    timers: createFakeTimers(),
+    gpu: webgpu.gpu,
+  });
+  const detachedApp = bootstrapPlayGta6App({
+    windowObj: detachedHost.windowObj,
+    documentObj: detachedHost.documentObj,
+    navigatorObj: detachedHost.navigatorObj,
+    fetchImpl: createMockFetch({ ok: true, coopCoep: true, hasWasmBinary: true }),
+    canvas: detachedCanvas,
+    hud: createMockHud(),
+    createWasmWorker: () => {
+      const posted = [];
+      const w = createFakeEventTarget({
+        posted,
+        postMessage(payload, transfer) {
+          posted.push({ payload, transfer });
+        },
+        terminate() {},
+      });
+      detachedWorkers.push(w);
+      return w;
+    },
+  });
+  try {
+    assert.equal((await detachedApp.start()).ok, true);
+    await detachedApp.stop();
+    assert.equal((await detachedApp.start()).ok, true);
+    assert.equal(detachedTransfers, 1);
+    assert.equal(detachedWorkers.length, 2);
+    assert.equal(detachedWorkers[1].posted[0].payload.canvas, detachedOffscreen);
+    assert.equal(detachedWorkers[1].posted[0].transfer, undefined);
+  } finally {
+    await detachedApp.destroy();
+  }
+});
