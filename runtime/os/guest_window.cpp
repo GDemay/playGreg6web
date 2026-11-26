@@ -4,11 +4,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <iterator>
 #include <unordered_map>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -46,6 +48,19 @@ struct State {
     std::unordered_map<uint64_t, std::vector<uint64_t>> alias_groups;
     std::unordered_map<uint64_t, uint64_t> alias_of;
     std::atomic<size_t> alias_group_count{0};
+
+    // Active writable host pins (Buffers in-place views, DStorage / ReadFile destinations).
+    struct ActivePin {
+        uint64_t id = 0;
+        uint64_t first_slot = 0;
+        uint64_t last_slot = 0;
+        std::thread::id owner{};
+    };
+    std::mutex pin_mutex;
+    std::condition_variable pin_cv;
+    std::atomic<uint32_t> active_pins{0};
+    uint64_t next_pin_id = 1;
+    std::vector<ActivePin> pins;
 };
 
 State& state() {
@@ -361,7 +376,7 @@ size_t SlotIndex::size() const {
     return ranges_.size();
 }
 
-uint64_t map_runtime_range(void* host, uint64_t bytes) {
+uint64_t map_runtime_range(void* host, uint64_t bytes, bool map_slots_now) {
     const auto h = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host));
     if (!enabled() || host == nullptr || bytes == 0 || (h & (kSlotBytes - 1)) != 0 ||
         (bytes & (kSlotBytes - 1)) != 0) {
@@ -371,20 +386,22 @@ uint64_t map_runtime_range(void* host, uint64_t bytes) {
     uint64_t va = 0;
     {
         std::lock_guard<std::mutex> lock(s.mutex);
-        // First fit after the handed-out ranges; slots mapped by anyone else are skipped.
-        uint64_t at = kRuntimeRangeBase;
+        // First fit after the handed-out ranges, leaving 1 unmapped guard slot before the first
+        // runtime range (separating it from the 16 GiB CPU window) and between every pair of
+        // runtime ranges so distinct reservations never share adjacent mapped slots (split pairs).
+        uint64_t at = kRuntimeRangeBase + kSlotBytes;
         const uint64_t end = kWindowBase + kWindowMaxSize;
         while (at + bytes <= end && va == 0) {
             auto next = s.runtime_ranges.lower_bound(at);
             if (next != s.runtime_ranges.begin()) {
                 auto prev = std::prev(next);
-                if (prev->first + prev->second.bytes > at) {
-                    at = prev->first + prev->second.bytes;
+                if (prev->first + prev->second.bytes + kSlotBytes > at) {
+                    at = prev->first + prev->second.bytes + kSlotBytes;
                     continue;
                 }
             }
-            if (next != s.runtime_ranges.end() && next->first < at + bytes) {
-                at = next->first + next->second.bytes;
+            if (next != s.runtime_ranges.end() && next->first < at + bytes + kSlotBytes) {
+                at = next->first + next->second.bytes + kSlotBytes;
                 continue;
             }
             bool free = true;
@@ -403,9 +420,17 @@ uint64_t map_runtime_range(void* host, uint64_t bytes) {
             return 0;
         }
         s.runtime_ranges[va] = {bytes, static_cast<uint8_t*>(host)};
-    }
-    for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
-        map_slot(va + off, static_cast<uint8_t*>(host) + off);
+        if (map_slots_now) {
+            for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
+                const uint64_t slot = slot_of(va + off);
+                mark(slot).store(1, std::memory_order_release);
+                const uint64_t host_addr = h + off;
+                ++s.map_calls;
+                entry(slot).store(static_cast<int64_t>(host_addr - slot_va(slot)), std::memory_order_release);
+                s.reverse[host_addr] = slot;
+            }
+            s.reverse_entries.store(s.reverse.size(), std::memory_order_release);
+        }
     }
     return va;
 }
@@ -428,12 +453,115 @@ void* runtime_range_host(uint64_t va) {
 }
 
 void unmap_runtime_range(uint64_t va, uint64_t bytes) {
-    for (uint64_t off = 0; off < bytes; off += kSlotBytes) {
-        unmap_slot(va + off);
-    }
     State& s = state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    if (in_window(va)) {
+        const uint64_t limit = std::min<uint64_t>(bytes, (kWindowBase + kWindowMaxSize) - va);
+        for (uint64_t off = 0; off < limit; off += kSlotBytes) {
+            const uint64_t slot = slot_of(va + off);
+            const uint64_t prev = slot_host_locked(slot);
+            if (prev == 0) {
+                continue;
+            }
+            mark(slot).store(1, std::memory_order_release);
+            if (!s.alias_groups.empty()) {
+                leave_alias_group_locked(s, slot, prev);
+            }
+            forget_reverse_locked(s, slot);
+            ++s.unmap_calls;
+            entry(slot).store(static_cast<int64_t>(kTrapDelta), std::memory_order_release);
+        }
+    }
     s.runtime_ranges.erase(va);
+}
+
+WritePin::WritePin(uint64_t window_va, size_t bytes) {
+    if (!in_window(window_va) || bytes == 0 || !enabled()) {
+        return;
+    }
+    const uint64_t first = slot_of(window_va);
+    const uint64_t last_va = std::min<uint64_t>(window_va + (bytes - 1), kWindowBase + kWindowMaxSize - 1);
+    const uint64_t last = slot_of(last_va);
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.pin_mutex);
+    id_ = s.next_pin_id++;
+    s.pins.push_back(State::ActivePin{id_, first, last, std::this_thread::get_id()});
+    s.active_pins.store(static_cast<uint32_t>(s.pins.size()), std::memory_order_release);
+}
+
+WritePin::WritePin(WritePin&& other) noexcept : id_(other.id_) {
+    other.id_ = 0;
+}
+
+WritePin& WritePin::operator=(WritePin&& other) noexcept {
+    if (this != &other) {
+        release();
+        id_ = other.id_;
+        other.id_ = 0;
+    }
+    return *this;
+}
+
+WritePin::~WritePin() {
+    release();
+}
+
+void WritePin::release() {
+    if (id_ == 0) {
+        return;
+    }
+    const uint64_t id = id_;
+    id_ = 0;
+    State& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.pin_mutex);
+        for (size_t i = 0; i < s.pins.size(); ++i) {
+            if (s.pins[i].id == id) {
+                s.pins[i] = s.pins.back();
+                s.pins.pop_back();
+                break;
+            }
+        }
+        s.active_pins.store(static_cast<uint32_t>(s.pins.size()), std::memory_order_release);
+    }
+    s.pin_cv.notify_all();
+}
+
+namespace {
+
+bool overlaps_other_thread_pin_locked(const State& s, uint64_t first_slot, uint64_t last_slot, std::thread::id self) {
+    for (const auto& p : s.pins) {
+        if (p.owner != self && p.first_slot <= last_slot && p.last_slot >= first_slot) {
+            return true;
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool has_other_thread_write_pin(uint64_t first_va, uint64_t last_va_inclusive) {
+    State& s = state();
+    if (s.active_pins.load(std::memory_order_acquire) == 0 || !in_window(first_va) || !in_window(last_va_inclusive)) {
+        return false;
+    }
+    const uint64_t first_slot = slot_of(std::min(first_va, last_va_inclusive));
+    const uint64_t last_slot = slot_of(std::max(first_va, last_va_inclusive));
+    const std::thread::id self = std::this_thread::get_id();
+    std::lock_guard<std::mutex> lock(s.pin_mutex);
+    return overlaps_other_thread_pin_locked(s, first_slot, last_slot, self);
+}
+
+void wait_other_thread_write_pins(uint64_t first_va, uint64_t last_va_inclusive) {
+    State& s = state();
+    if (s.active_pins.load(std::memory_order_acquire) == 0 || !in_window(first_va) || !in_window(last_va_inclusive)) {
+        return;
+    }
+    const uint64_t first_slot = slot_of(std::min(first_va, last_va_inclusive));
+    const uint64_t last_slot = slot_of(std::max(first_va, last_va_inclusive));
+    const std::thread::id self = std::this_thread::get_id();
+    std::unique_lock<std::mutex> lock(s.pin_mutex);
+    s.pin_cv.wait(lock, [&] { return !overlaps_other_thread_pin_locked(s, first_slot, last_slot, self); });
 }
 
 void set_write_marks_verified(bool on) {
@@ -514,6 +642,52 @@ bool map_alias_slot(uint64_t window_va, void* host_page) {
     s.alias_of[slot] = host;
     s.alias_group_count.store(s.alias_groups.size(), std::memory_order_release);
     return true;
+}
+
+void map_slots_batch(const SlotMapping* mappings, size_t count) {
+    if (mappings == nullptr || count == 0) {
+        return;
+    }
+    State& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    std::atomic_thread_fence(std::memory_order_release);
+    for (size_t i = 0; i < count; ++i) {
+        const uint64_t window_va = mappings[i].window_va;
+        void* const host_page = mappings[i].host_page;
+        if (!in_window(window_va)) {
+            continue;
+        }
+        const uint64_t slot = slot_of(window_va);
+        mark(slot).store(1, std::memory_order_release);
+        if (const uint64_t prev = slot_host_locked(slot); prev != 0 && !s.alias_groups.empty()) {
+            leave_alias_group_locked(s, slot, prev);
+        }
+        forget_reverse_locked(s, slot);
+        if (host_page == nullptr) {
+            ++s.unmap_calls;
+            entry(slot).store(static_cast<int64_t>(kTrapDelta), std::memory_order_release);
+            continue;
+        }
+        ++s.map_calls;
+        const uint64_t host = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(host_page));
+        entry(slot).store(static_cast<int64_t>(host - slot_va(slot)), std::memory_order_release);
+        if (mappings[i].alias) {
+            auto& group = s.alias_groups[host];
+            if (group.empty()) {
+                if (const auto it = s.reverse.find(host); it != s.reverse.end() && it->second != slot) {
+                    group.push_back(it->second);
+                }
+            }
+            if (std::find(group.begin(), group.end(), slot) == group.end()) {
+                group.push_back(slot);
+            }
+            s.alias_of[slot] = host;
+            s.alias_group_count.store(s.alias_groups.size(), std::memory_order_release);
+        } else {
+            s.reverse[host] = slot;
+            s.reverse_entries.store(s.reverse.size(), std::memory_order_release);
+        }
+    }
 }
 
 size_t alias_slot_count() {
@@ -661,9 +835,17 @@ void* Buffers::range_window(uint64_t va, uint64_t bytes, bool writable) {
     }
     if (void* view = contiguous(va, static_cast<size_t>(bytes))) {
         if (writable) {
-            note_written(va, bytes);  // pinned: the host writes the guest's bytes in place
+            pins_.emplace_back(va, static_cast<size_t>(bytes));
+            // Re-check contiguity after installing the pin in case a relocation raced with us.
+            if (void* rechecked = contiguous(va, static_cast<size_t>(bytes))) {
+                view = rechecked;
+                note_written(va, bytes);  // pinned: the host writes the guest's bytes in place
+                return view;
+            }
+            pins_.pop_back();
+        } else {
+            return view;
         }
-        return view;
     }
     Bounce b;
     b.va = va;
@@ -758,6 +940,7 @@ void Buffers::finish() {
         mark_written(w.va, static_cast<size_t>(w.bytes));
     }
     written_.clear();
+    pins_.clear();
 }
 
 uint64_t Buffers::guest_address(const void* host) const {
@@ -833,6 +1016,11 @@ void reset_for_testing() {
     }
     g_verify.store(false, std::memory_order_relaxed);
     g_verify_misses.store(0, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> pin_lock(s.pin_mutex);
+        s.pins.clear();
+        s.active_pins.store(0, std::memory_order_release);
+    }
 }
 
 }  // namespace playgta6::os::guest_window

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -949,6 +950,334 @@ void test_xmem_concurrent_map_unmap_in_the_window() {
     gw::reset_for_testing();
 }
 
+// Rank #2 regression: mirrored reservations and alias slots in [kRuntimeRangeBase, kWindowBase +
+// kWindowMaxSize) must maintain contiguous runs (split_pairs == 0) under --contiguous-runs and
+// report impossible adjacent aliases instead of silently violating the lifter contract.
+void test_xmem_mirrored_alias_contiguity_zero_split_pairs() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);
+    void* committed = pg6_xbox_XMemVirtualAlloc(nullptr, 4 * k64K, 0x20003000u, 0x183u, kCpuProtect);
+    void* phys_heap = pg6_xbox_XMemVirtualAlloc(nullptr, 8 * k64K, kWindowType, 0x23u, kCpuProtect);
+    void* second = pg6_xbox_XMemVirtualAlloc(nullptr, GiB, kWindowType, 0x23u, kCpuProtect);
+    CHECK(cpu != nullptr && pool != nullptr && committed != nullptr && phys_heap != nullptr && second != nullptr);
+    const uint64_t H = va_of(phys_heap);
+    const uint64_t S = va_of(second);
+    CHECK(H >= gw::kRuntimeRangeBase && S >= gw::kRuntimeRangeBase);
+
+    constexpr size_t kPool = 48;
+    size_t count = kPool;
+    uint64_t pfn[kPool] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == kPool);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(pool, kPool, pfn) == pool);
+    auto* pool_bytes = static_cast<uint8_t*>(pool);
+    for (size_t p = 0; p < kPool; ++p) {
+        std::memset(pool_bytes + p * k64K, static_cast<int>(0x20 + p), k64K);
+    }
+
+    // Separate physical pages mapped into `phys_heap` (fresh homes, contiguous in arena).
+    size_t hcount = 2;
+    uint64_t hpfn[2] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &hcount, hpfn) == 1);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(phys_heap, 2, hpfn) == phys_heap);
+
+    // Map a live blocker right after pool page 5 in primary window W so mapping an adjacent alias
+    // in `second` forces `relocate_run_locked` on mirrored alias slots too.
+    const uint64_t block_va[] = {W + 100 * k64K};
+    const uint64_t block_pg[] = {pfn[6]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(block_va, 1, block_pg) == 1);
+
+    // Map out-of-order pool pages into adjacent slots of the mirrored second CPU window `S`:
+    // S + 10*64K <- pfn[5], S + 11*64K <- pfn[19], S + 12*64K <- pfn[2].
+    // Also map pfn[30] at an isolated slot in W and then into an adjacent run in S.
+    const uint64_t iso_va[] = {W + 200 * k64K};
+    const uint64_t iso_pg[] = {pfn[30]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(iso_va, 1, iso_pg) == 1);
+
+    const uint64_t s_vas[] = {S + 10 * k64K, S + 11 * k64K, S + 12 * k64K, S + 13 * k64K};
+    const uint64_t s_pgs[] = {pfn[5], pfn[19], pfn[2], pfn[30]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(s_vas, 4, s_pgs) == 1);
+
+    CHECK(g_violation == 0);
+    const XMemWindowContiguity c = xmem_window_contiguity();
+    const gw::Stats ws = gw::stats();
+    CHECK(c.run_breaks == 0);
+    CHECK(c.run_relocations >= 1);
+    CHECK(ws.split_pairs == 0);
+
+    // Contiguous direct host pointer spans all 4 alias slots with exact expected bytes.
+    const auto* run = static_cast<const uint8_t*>(gw::contiguous(S + 10 * k64K, 4 * k64K));
+    CHECK(run != nullptr);
+    if (run != nullptr) {
+        CHECK(run[0] == 0x25 && run[k64K - 1] == 0x25);
+        CHECK(run[k64K] == 0x20 + 19 && run[2 * k64K - 1] == 0x20 + 19);
+        CHECK(run[2 * k64K] == 0x22 && run[3 * k64K - 1] == 0x22);
+        CHECK(run[3 * k64K] == 0x20 + 30 && run[4 * k64K - 1] == 0x20 + 30);
+    }
+    // Isolated slot in W still points to pfn[30]'s bytes after relocation.
+    uint8_t b = 0;
+    CHECK(gw::copy_from_guest(&b, W + 200 * k64K + 123, 1) && b == 0x20 + 30);
+
+    // Impossible adjacent self-alias in S must report a contiguity violation instead of silently
+    // leaving a split pair.
+    const uint64_t bad_va[] = {S + 14 * k64K};
+    const uint64_t bad_pg[] = {pfn[30]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(bad_va, 1, bad_pg) == 1);
+    CHECK(g_violation == S + 14 * k64K);
+    CHECK(xmem_window_contiguity().run_breaks == 1);
+
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(second));
+    CHECK(xmem_virtual_free(phys_heap));
+    CHECK(xmem_virtual_free(committed));
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(kPool, pfn) == 1);
+    CHECK(pg6_xbox_XMemFreePhysicalPages(2, hpfn) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
+// Rank #1 regression (readers): relocating a live mapped run under --contiguous-runs must never
+// overwrite live mapped frames in place or expose torn/wrong-page bytes to concurrent readers
+// scanning across 64 KiB boundaries with cached window-table deltas.
+void test_xmem_concurrent_relocation_no_torn_reads() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);
+    CHECK(cpu != nullptr && pool != nullptr);
+
+    constexpr size_t kPool = 128;
+    size_t count = kPool;
+    uint64_t pfn[kPool] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == kPool);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(pool, kPool, pfn) == pool);
+
+    // Stamp each pool page with unique 64-bit words; page 0 starts with 'PSIN' like a PSO buffer.
+    auto* pool_bytes = static_cast<uint8_t*>(pool);
+    auto expected_word = [](size_t page_idx, size_t word_idx) -> uint64_t {
+        if (page_idx == 0 && word_idx == 0) {
+            return 0xA5A5A5A54E495350ull;  // "PSIN" + tag
+        }
+        return (static_cast<uint64_t>(page_idx + 1) << 32) | static_cast<uint64_t>(word_idx * 0x9E37u + 1u);
+    };
+    constexpr size_t kWordsPerPage = k64K / sizeof(uint64_t);
+    for (size_t p = 0; p < kPool; ++p) {
+        auto* words = reinterpret_cast<uint64_t*>(pool_bytes + p * k64K);
+        for (size_t w = 0; w < kWordsPerPage; ++w) {
+            words[w] = expected_word(p, w);
+        }
+    }
+
+    // Live 2-page run [W + 16*k64K, W + 18*k64K) holding pages 0 and 1.
+    const uint64_t run_va = W + 16 * k64K;
+    const uint64_t init_vas[] = {run_va, run_va + k64K};
+    const uint64_t init_pgs[] = {pfn[0], pfn[1]};
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(init_vas, 2, init_pgs) == 1);
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> readers_ready{0};
+    std::atomic<uint64_t> torn_reads{0};
+    std::atomic<uint64_t> total_scans{0};
+    constexpr int kReaders = 4;
+    std::vector<std::thread> readers;
+    for (int t = 0; t < kReaders; ++t) {
+        readers.emplace_back([&] {
+            const uint64_t slot0 = (run_va - W) >> gw::kSlotShift;
+            readers_ready.fetch_add(1, std::memory_order_release);
+            while (!stop.load(std::memory_order_relaxed)) {
+                // Simulate lifted --contiguous-runs code: load delta for slot0 once, then read
+                // straight across the 64 KiB boundary into slot1 without a straddle check.
+                const uint64_t delta = static_cast<uint64_t>(
+                    std::atomic_ref<int64_t>(__playgta6_window_table[slot0]).load(std::memory_order_acquire));
+                if (delta == gw::kTrapDelta) {
+                    torn_reads.fetch_add(1, std::memory_order_relaxed);
+                    break;
+                }
+                const auto* words = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(run_va + delta));
+                for (size_t i = 0; i < 2 * kWordsPerPage; i += 17) {
+                    const size_t p = i / kWordsPerPage;
+                    const size_t w = i % kWordsPerPage;
+                    if (words[i] != expected_word(p, w)) {
+                        torn_reads.fetch_add(1, std::memory_order_relaxed);
+                        return;
+                    }
+                }
+                // Also verify the exact 64 KiB straddle word.
+                uint64_t straddle = 0;
+                std::memcpy(&straddle,
+                            reinterpret_cast<const uint8_t*>(words) + k64K - 4,
+                            sizeof(straddle));
+                uint64_t expect_straddle = 0;
+                const uint64_t last_p0 = expected_word(0, kWordsPerPage - 1);
+                const uint64_t first_p1 = expected_word(1, 0);
+                std::memcpy(&expect_straddle, reinterpret_cast<const uint8_t*>(&last_p0) + 4, 4);
+                std::memcpy(reinterpret_cast<uint8_t*>(&expect_straddle) + 4, &first_p1, 4);
+                if (straddle != expect_straddle) {
+                    torn_reads.fetch_add(1, std::memory_order_relaxed);
+                    return;
+                }
+                total_scans.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    // Ensure all reader threads are actively scanning before starting the relocation storm.
+    while (readers_ready.load(std::memory_order_acquire) < kReaders ||
+           total_scans.load(std::memory_order_acquire) == 0) {
+        std::this_thread::yield();
+    }
+
+    // Repeatedly force relocate_run_locked on the live run [run_va, run_va + 2*k64K):
+    // pin the pool frame right after run_va + k64K by mapping whatever pool page lives there into
+    // a separate live window slot, then map a 3rd page at run_va + 2*k64K (forcing full run
+    // relocation), then unmap the 3rd page and the blocker.
+    const uint64_t blocker_slot = W + 64 * k64K;
+    const uint64_t third_slot = run_va + 2 * k64K;
+    const uint64_t unmap_zero[] = {0};
+    constexpr size_t kRelocationRounds = 32;
+    for (size_t r = 0; r < kRelocationRounds; ++r) {
+        // Find which pool page currently sits right after `run_va + k64K` and pin it in blocker_slot.
+        const auto* h1 = static_cast<const uint8_t*>(gw::slot_host(run_va + k64K));
+        CHECK(h1 != nullptr);
+        const size_t next_pool_idx = static_cast<size_t>((h1 - pool_bytes) / k64K) + 1;
+        if (next_pool_idx < kPool) {
+            // Map all non-member pages around next_pool_idx? No, mapping the single page owning
+            // next_pool_idx makes place_at_locked fail and forces relocate_run_locked.
+            // Determine which pfn owns pool + next_pool_idx * k64K from its stamped word!
+            uint64_t stamped = 0;
+            std::memcpy(&stamped, pool_bytes + next_pool_idx * k64K + 8, sizeof(stamped));
+            const size_t owner_idx = static_cast<size_t>((stamped >> 32) - 1);
+            if (owner_idx >= 2 && owner_idx < kPool) {
+                const uint64_t bpg = pfn[owner_idx];
+                CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&blocker_slot, 1, &bpg) == 1);
+            }
+        }
+        const uint64_t third_pg = pfn[2 + (r % 20)];
+        if (gw::slot_host(blocker_slot) != nullptr) {
+            uint64_t b_word = 0;
+            std::memcpy(&b_word, static_cast<const uint8_t*>(gw::slot_host(blocker_slot)) + 8, sizeof(b_word));
+            const size_t b_idx = static_cast<size_t>((b_word >> 32) - 1);
+            const uint64_t use_pg = (b_idx == 2 + (r % 20)) ? pfn[30 + (r % 20)] : third_pg;
+            CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&third_slot, 1, &use_pg) == 1);
+        } else {
+            CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&third_slot, 1, &third_pg) == 1);
+        }
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&third_slot, 1, unmap_zero) == 1);
+        CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&blocker_slot, 1, unmap_zero) == 1);
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& th : readers) {
+        th.join();
+    }
+
+    const XMemWindowContiguity c = xmem_window_contiguity();
+    const gw::Stats ws = gw::stats();
+    CHECK(torn_reads.load() == 0);
+    CHECK(total_scans.load() > 0);
+    CHECK(c.run_relocations >= 16);
+    CHECK(c.run_breaks == 0);
+    CHECK(g_violation == 0);
+    CHECK(ws.split_pairs == 0);
+
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(kPool, pfn) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
+// Rank #1 regression (concurrent host writers): relocating a live run while another thread holds a
+// writable Buffers in-place view must wait for the write to finish so zero bytes are lost into a
+// retired frame.
+void test_xmem_concurrent_write_pin_and_relocation() {
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+    gw::set_enabled(true);
+    xw::set_policy(xw::PlacementPolicy::PhantomGpuTranslatedCpu);
+    gw::set_contiguous_runs_required(true, &record_violation);
+    g_violation = 0;
+
+    void* cpu = pg6_xbox_XMemVirtualAlloc(nullptr, 16 * GiB, kWindowType, 0x21u, kCpuProtect);
+    void* pool = pg6_xbox_XMemVirtualAlloc(nullptr, 2 * GiB, kWindowType, 0x23u, kCpuProtect);
+    CHECK(cpu != nullptr && pool != nullptr);
+
+    constexpr size_t kPool = 32;
+    size_t count = kPool;
+    uint64_t pfn[kPool] = {};
+    CHECK(pg6_xbox_XMemAllocatePhysicalPages(0x380u, &count, pfn) == 1 && count == kPool);
+    CHECK(pg6_xbox_XMemMapPhysicalPages(pool, kPool, pfn) == pool);
+
+    const uint64_t run_va = W + 8 * k64K;
+    const uint64_t init_vas[] = {run_va, run_va + k64K, W + 40 * k64K};
+    const uint64_t init_pgs[] = {pfn[0], pfn[1], pfn[2]};  // pfn[2] blocks pool frame 2!
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(init_vas, 3, init_pgs) == 1);
+
+    std::atomic<bool> pinned{false};
+    std::atomic<bool> writer_done{false};
+    std::vector<uint8_t> payload(2 * k64K);
+    payload[0] = 'P';
+    payload[1] = 'S';
+    payload[2] = 'I';
+    payload[3] = 'N';
+    for (size_t i = 4; i < payload.size(); ++i) {
+        payload[i] = static_cast<uint8_t>((i * 29u + 13u) & 0xFFu);
+    }
+
+    std::thread writer([&] {
+        gw::Buffers bufs;
+        void* dst = bufs.range(run_va, payload.size(), true);
+        CHECK(dst != nullptr && bufs.bounce_count() == 0);
+        pinned.store(true, std::memory_order_release);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        if (dst != nullptr) {
+            std::memcpy(dst, payload.data(), payload.size());
+        }
+        bufs.finish();
+        writer_done.store(true, std::memory_order_release);
+    });
+
+    while (!pinned.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    // Map a 3rd page adjacent to `run_va + k64K`: must relocate [run_va, run_va + 3*k64K), and
+    // must wait for `writer`'s WritePin before copying & switching frames!
+    const uint64_t third_va = run_va + 2 * k64K;
+    const uint64_t third_pg = pfn[10];
+    CHECK(pg6_xbox_XMemMapPhysicalPagesScatter(&third_va, 1, &third_pg) == 1);
+    CHECK(writer_done.load(std::memory_order_acquire));
+    writer.join();
+
+    // Every byte written by `writer` must be intact in the relocated run!
+    std::vector<uint8_t> back(payload.size(), 0);
+    CHECK(gw::copy_from_guest(back.data(), run_va, back.size()));
+    CHECK(back == payload);
+    const XMemWindowContiguity c = xmem_window_contiguity();
+    CHECK(c.run_relocations >= 1 && c.run_breaks == 0 && g_violation == 0);
+    CHECK(gw::stats().split_pairs == 0);
+
+    gw::set_contiguous_runs_required(false);
+    CHECK(xmem_virtual_free(pool));
+    CHECK(xmem_virtual_free(cpu));
+    CHECK(pg6_xbox_XMemFreePhysicalPages(kPool, pfn) == 1);
+    xmem_reset_for_testing();
+    gw::reset_for_testing();
+}
+
 }  // namespace
 
 int main() {
@@ -964,6 +1293,9 @@ int main() {
     test_xmem_committed_regions_in_the_window();
     test_xmem_aliases_in_the_window();
     test_xmem_concurrent_map_unmap_in_the_window();
+    test_xmem_mirrored_alias_contiguity_zero_split_pairs();
+    test_xmem_concurrent_relocation_no_torn_reads();
+    test_xmem_concurrent_write_pin_and_relocation();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_guest_window: %d failure(s)\n", g_failures);
         return 1;
