@@ -909,7 +909,8 @@ bool submit_to_pool(std::function<void()> callback) {
     if (!pool.queue) {
         pool.queue = std::make_unique<XTaskQueue>(XTaskQueue::DispatchMode::ThreadPool,
                                                   XTaskQueue::DispatchMode::Manual,
-                                                  pool.max_threads);
+                                                  pool.max_threads,
+                                                  /*work_serialized=*/true);  // fixed, bounded pool
     }
     return pool.queue->submit_work(std::move(callback));
 }
