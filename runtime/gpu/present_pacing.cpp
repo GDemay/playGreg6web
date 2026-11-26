@@ -17,6 +17,7 @@ void PresentPacer::reset_for_testing() {
     sleep_until_ = [](Clock::time_point t) { os::host_sleep::sleep_until(t); };  // precise (R40)
     enabled_ = true;
     have_last_ = false;
+    title_driven_ = false;
     last_flip_ = 0;
     stats_ = Stats{};
 }
@@ -31,6 +32,16 @@ void PresentPacer::set_clock_for_testing(std::function<Clock::time_point()> now,
     have_last_ = false;
     last_flip_ = 0;
     stats_ = Stats{};
+}
+
+void PresentPacer::set_title_driven(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    title_driven_ = on;
+}
+
+bool PresentPacer::title_driven() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return title_driven_;
 }
 
 uint64_t PresentPacer::vblank_at(Clock::time_point t) const {
@@ -57,6 +68,10 @@ uint64_t PresentPacer::present(uint32_t interval) {
     }
     ++stats_.presents;
     stats_.last_interval = interval;
+    if (title_driven_) {
+        ++stats_.immediate;
+        return current;
+    }
     if (interval == 0) {
         ++stats_.immediate;
         last_flip_ = current;
