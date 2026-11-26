@@ -654,6 +654,29 @@ struct NativeExecutor::Impl {
         offscreen = device.CreateTexture(&td);
     }
 
+    // Fifo makes GetCurrentTexture block for the vertical blank (and far longer behind a busy compositor):
+    // the guest's frame pacing is its own, so prefer Mailbox (no tearing), then Immediate; Fifo is the
+    // always-supported fallback. Rendering is unchanged, only when a frame reaches the screen.
+    wgpu::PresentMode pick_present_mode() {
+        if (!present_mode_known) {
+            present_mode_known = true;
+            present_mode = wgpu::PresentMode::Fifo;
+            wgpu::SurfaceCapabilities caps{};
+            if (surface.GetCapabilities(adapter_handle, &caps) == wgpu::Status::Success) {
+                bool mailbox = false, immediate = false;
+                for (size_t i = 0; i < caps.presentModeCount; ++i) {
+                    mailbox |= caps.presentModes[i] == wgpu::PresentMode::Mailbox;
+                    immediate |= caps.presentModes[i] == wgpu::PresentMode::Immediate;
+                }
+                if (mailbox) present_mode = wgpu::PresentMode::Mailbox;
+                else if (immediate) present_mode = wgpu::PresentMode::Immediate;
+            }
+        }
+        return present_mode;
+    }
+    bool present_mode_known = false;
+    wgpu::PresentMode present_mode = wgpu::PresentMode::Fifo;
+
     void configure_surface(uint32_t w, uint32_t h) {
         wgpu::SurfaceConfiguration cfg{};
         cfg.device = device;
@@ -662,7 +685,7 @@ struct NativeExecutor::Impl {
         cfg.width = w;
         cfg.height = h;
         cfg.alphaMode = wgpu::CompositeAlphaMode::Opaque;  // the worker's DEFAULT_ALPHA_MODE
-        cfg.presentMode = wgpu::PresentMode::Fifo;
+        cfg.presentMode = pick_present_mode();
         surface.Configure(&cfg);
         swap_width = w;
         swap_height = h;
@@ -696,7 +719,19 @@ struct NativeExecutor::Impl {
         stats.last_packet_error = message;
     }
 
+    static uint64_t now_ns() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch()).count());
+    }
+
     bool dispatch(const Packet& p) {
+        const uint64_t t0 = now_ns();
+        const bool r = dispatch_op(p);
+        if (p.opcode < kOpcodeSlots) stats.opcode_ns[p.opcode] += now_ns() - t0;
+        return r;
+    }
+
+    bool dispatch_op(const Packet& p) {
         const uint16_t op = p.opcode;
         bool handled = true;
         const uint32_t n = p.payload_bytes;
@@ -2670,7 +2705,10 @@ struct NativeExecutor::Impl {
     }
 
     void present() {
-        if (lost || !acquire_target()) {
+        const uint64_t ta = now_ns();
+        const bool have_target = !lost && acquire_target();
+        stats.ns_present_acquire += now_ns() - ta;
+        if (!have_target) {
             ++stats.present_failures;
             fail_dropped_readbacks();
             reset_frame_state();
@@ -2678,6 +2716,7 @@ struct NativeExecutor::Impl {
             early_flushed = false;
             return;
         }
+        const uint64_t tp0 = now_ns();
         FrameTarget& target = *frame_target;
         Encoder e{*this, target, device.CreateCommandEncoder()};
         e.render_pass_opened = early_flushed;  // `ps.renderPassOpened = readbackOnly || earlyFlushedThisFrame`
@@ -2699,12 +2738,17 @@ struct NativeExecutor::Impl {
         }
         timer_resolve(e);
         wgpu::CommandBuffer cb = e.enc.Finish();
+        const uint64_t tp1 = now_ns();
+        stats.ns_present_encode += tp1 - tp0;
         queue.Submit(1, &cb);
         timer_collect(e);
         start_recorded_readbacks(true);
         ++frame_count;
         ++stats.frames_submitted;
+        const uint64_t tp2 = now_ns();
+        stats.ns_present_submit += tp2 - tp1;
         if (surface) surface.Present();
+        stats.ns_present_swap += now_ns() - tp2;
         frame_target.reset();
         early_flushed = false;
         reset_frame_state();
@@ -2790,19 +2834,28 @@ uint32_t NativeExecutor::execute(const uint8_t* data, size_t len) {
         return 0;
     }
     const uint64_t presents_before = s.stats.present_packets;
+    const uint64_t t0 = Impl::now_ns();
     const WalkResult r = walk_packets(data, len, [&](const Packet& p) { return s.dispatch(p); });
     s.stats.packets += r.packets;
     s.stats.bytes += r.bytes;
     if (r.truncated) ++s.stats.truncated_batches;
+    const uint64_t t1 = Impl::now_ns();
     if (s.readback_flush_wanted) s.flush_readbacks_now();  // at the end of every batch, like the worker
+    const uint64_t t2 = Impl::now_ns();
     s.instance.ProcessEvents();
+    const uint64_t t3 = Impl::now_ns();
+    s.stats.ns_execute += t1 - t0;
+    s.stats.ns_flush_readbacks += t2 - t1;
+    s.stats.ns_process_events += t3 - t2;
     return static_cast<uint32_t>(s.stats.present_packets - presents_before);
 }
 
 bool NativeExecutor::poll() {
+    const uint64_t t0 = Impl::now_ns();
     impl_->instance.ProcessEvents();
-    if (impl_->window) return impl_->window->pump();
-    return true;
+    const bool open = impl_->window ? impl_->window->pump() : true;
+    impl_->stats.ns_poll += Impl::now_ns() - t0;
+    return open;
 }
 
 bool NativeExecutor::window_focused() const { return impl_->window && impl_->window->focused(); }
@@ -2896,6 +2949,16 @@ std::string NativeExecutor::stats_json() const {
         }
         j += "}";
     };
+    num("ns_execute", st.ns_execute);
+    num("ns_process_events", st.ns_process_events);
+    num("ns_flush_readbacks", st.ns_flush_readbacks);
+    num("ns_poll", st.ns_poll);
+    num("ns_present_acquire", st.ns_present_acquire);
+    num("ns_present_encode", st.ns_present_encode);
+    num("ns_present_submit", st.ns_present_submit);
+    num("ns_present_swap", st.ns_present_swap);
+    table("opcode_ns", st.opcode_ns);
+    j += ", ";
     table("handled", st.handled);
     j += ", ";
     table("unhandled", st.unhandled);

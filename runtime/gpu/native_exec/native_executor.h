@@ -95,6 +95,10 @@ struct ExecutorStats {
     std::array<uint64_t, kOpcodeSlots> handled{};    // by opcode
     std::array<uint64_t, kOpcodeSlots> unhandled{};  // by opcode: not implemented yet, skipped
     uint64_t unknown_opcodes = 0;                    // opcode >= kOpcodeSlots
+    // Profile (ns, wall time on the executor thread): per opcode, and the phases of a batch / present.
+    std::array<uint64_t, kOpcodeSlots> opcode_ns{};
+    uint64_t ns_execute = 0, ns_process_events = 0, ns_flush_readbacks = 0, ns_poll = 0;
+    uint64_t ns_present_acquire = 0, ns_present_encode = 0, ns_present_submit = 0, ns_present_swap = 0;
     std::string last_device_error;
     std::vector<std::string> device_error_log;  // the first 20 uncaptured device errors
 };
