@@ -222,6 +222,75 @@ pub(super) fn in_lane(m: Mnemonic) -> bool {
     )
 }
 
+/// Whether [`FunctionLifter::lift_avx`] handles `ins` (mirroring its match arms).
+pub(super) fn is_avx_supported(ins: &Instruction) -> bool {
+    use Mnemonic as M;
+    let wide = is_256(ins);
+    match ins.mnemonic() {
+        M::Vbroadcastss
+        | M::Vbroadcastsd
+        | M::Vpbroadcastb
+        | M::Vpbroadcastw
+        | M::Vpbroadcastd
+        | M::Vpbroadcastq
+        | M::Vbroadcastf128
+        | M::Vbroadcasti128
+        | M::Vinsertf128
+        | M::Vinserti128
+        | M::Vextractf128
+        | M::Vextracti128
+        | M::Vperm2f128
+        | M::Vperm2i128
+        | M::Vpermq
+        | M::Vpermpd
+        | M::Vpermd
+        | M::Vpermps
+        | M::Ptest
+        | M::Vptest
+        | M::Vtestps
+        | M::Vtestpd
+        | M::Vmaskmovps
+        | M::Vpmaskmovd
+        | M::Vmaskmovpd
+        | M::Vpmaskmovq
+        | M::Pmovsxbw
+        | M::Vpmovsxbw
+        | M::Pmovsxbd
+        | M::Vpmovsxbd
+        | M::Pmovsxbq
+        | M::Vpmovsxbq
+        | M::Pmovsxwd
+        | M::Vpmovsxwd
+        | M::Pmovsxwq
+        | M::Vpmovsxwq
+        | M::Pmovsxdq
+        | M::Vpmovsxdq
+        | M::Pmovzxbw
+        | M::Vpmovzxbw
+        | M::Pmovzxbd
+        | M::Vpmovzxbd
+        | M::Pmovzxbq
+        | M::Vpmovzxbq
+        | M::Pmovzxwd
+        | M::Vpmovzxwd
+        | M::Pmovzxwq
+        | M::Vpmovzxwq
+        | M::Pmovzxdq
+        | M::Vpmovzxdq
+        | M::Vcvtph2ps
+        | M::Vcvtps2ph => true,
+        M::Vmovmskps
+        | M::Vmovmskpd
+        | M::Vpmovmskb
+        | M::Vcvtps2pd
+        | M::Vcvtdq2pd
+        | M::Vcvtpd2ps
+        | M::Vcvtpd2dq
+        | M::Vcvttpd2dq => wide,
+        _ => false,
+    }
+}
+
 /// F16C rounding control from `vcvtps2ph`'s immediate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Round {
