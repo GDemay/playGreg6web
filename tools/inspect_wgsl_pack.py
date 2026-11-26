@@ -55,7 +55,24 @@ PACK_HEADER_STRUCT = struct.Struct("<4sIII")
 PACK_HEADER_BYTES = PACK_HEADER_STRUCT.size  # 16 bytes
 
 PACK_ENTRY_STRUCT = struct.Struct("<QB3sII")
-PACK_ENTRY_BYTES = PACK_ENTRY_STRUCT.size  # 20 bytes
+PACK_ENTRY_BYTES = PACK_ENTRY_STRUCT.size  # 20 bytes (v1)
+# WGPK v2 (packs > 4 GiB): hash(8) stage(1) reserved(3) length(4) offset(8) = 24 bytes.
+PACK_VERSION_V2 = 2
+PACK_ENTRY_STRUCT_V2 = struct.Struct("<QB3sIQ")
+PACK_ENTRY_BYTES_V2 = PACK_ENTRY_STRUCT_V2.size  # 24 bytes
+SUPPORTED_PACK_VERSIONS = (PACK_VERSION, PACK_VERSION_V2)
+
+
+def _entry_bytes(version: int) -> int:
+    return PACK_ENTRY_BYTES_V2 if version == PACK_VERSION_V2 else PACK_ENTRY_BYTES
+
+
+def _unpack_entry(version: int, buf: Any, pos: int) -> tuple[int, int, bytes, int, int]:
+    """Unpack one TOC record as (hash, stage, reserved, offset, length) for either version."""
+    if version == PACK_VERSION_V2:
+        shader_hash, stage_raw, reserved, length, offset = PACK_ENTRY_STRUCT_V2.unpack_from(buf, pos)
+        return shader_hash, stage_raw, reserved, offset, length
+    return PACK_ENTRY_STRUCT.unpack_from(buf, pos)
 
 U32_MAX = 0xFFFFFFFF
 U64_MAX = 0xFFFFFFFFFFFFFFFF
@@ -286,7 +303,7 @@ class WgpkBundle:
 
     @property
     def data_start(self) -> int:
-        return PACK_HEADER_BYTES + len(self.entries) * PACK_ENTRY_BYTES
+        return PACK_HEADER_BYTES + len(self.entries) * _entry_bytes(self.version)
 
     @property
     def total_wgsl_bytes(self) -> int:
@@ -365,14 +382,15 @@ def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
             offset=0,
         )
 
-    if version != PACK_VERSION:
+    if version not in SUPPORTED_PACK_VERSIONS:
         raise WgpkParseError(
-            f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+            f"unsupported WGPK version {version} (expected 1 or 2)",
             code="unsupported_version",
             offset=4,
         )
 
-    table_bytes = entry_count * PACK_ENTRY_BYTES
+    entry_bytes = _entry_bytes(version)
+    table_bytes = entry_count * entry_bytes
     data_start = PACK_HEADER_BYTES + table_bytes
     if total_len < data_start:
         raise WgpkParseError(
@@ -385,8 +403,8 @@ def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
     non_empty_ranges: list[tuple[int, int, int]] = []
 
     for idx in range(entry_count):
-        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
-        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(mv, base)
+        base = PACK_HEADER_BYTES + idx * entry_bytes
+        shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, mv, base)
 
         try:
             stage = ShaderStage(stage_raw)
@@ -463,14 +481,15 @@ def parse_wgpk(data: bytes | bytearray | memoryview) -> WgpkBundle:
             offset=0,
         )
 
-    if version != PACK_VERSION:
+    if version not in SUPPORTED_PACK_VERSIONS:
         raise WgpkParseError(
-            f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+            f"unsupported WGPK version {version} (expected 1 or 2)",
             code="unsupported_version",
             offset=4,
         )
 
-    table_bytes = entry_count * PACK_ENTRY_BYTES
+    entry_bytes = _entry_bytes(version)
+    table_bytes = entry_count * entry_bytes
     data_start = PACK_HEADER_BYTES + table_bytes
     if total_len < data_start:
         raise WgpkParseError(
@@ -483,8 +502,8 @@ def parse_wgpk(data: bytes | bytearray | memoryview) -> WgpkBundle:
     non_empty_ranges: list[tuple[int, int, int]] = []
 
     for idx in range(entry_count):
-        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
-        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(raw, base)
+        base = PACK_HEADER_BYTES + idx * entry_bytes
+        shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, raw, base)
 
         try:
             stage = ShaderStage(stage_raw)
@@ -592,36 +611,45 @@ def build_wgpk(
     entries: Sequence[WgpkEntry | Mapping[str, Any] | tuple[int | str | None, int | str | ShaderStage, str | bytes]],
     *,
     flags: int = 0,
+    version: int | None = None,
 ) -> bytes:
-    """Serialize WGSL entries into a binary `WGPK` v1 bundle matching `shaders/src/pack.rs`."""
+    """Serialize WGSL entries into a binary `WGPK` v1 bundle matching `shaders/src/pack.rs`.
+
+    `version=None` picks v1 unless the pack would exceed u32 offsets, then v2 (64-bit offsets).
+    """
     if isinstance(flags, bool) or not isinstance(flags, int) or flags < 0 or flags > U32_MAX:
         raise ValueError(f"flags must be an unsigned 32-bit integer, got {flags!r}")
     if len(entries) > U32_MAX:
         raise ValueError("entry count exceeds u32::MAX")
 
     normalized = [_coerce_build_entry(item, idx) for idx, item in enumerate(entries)]
-    data_start = PACK_HEADER_BYTES + len(normalized) * PACK_ENTRY_BYTES
     total_payload = sum(len(payload) for _, _, payload in normalized)
+    if version is None:
+        v1_size = PACK_HEADER_BYTES + len(normalized) * PACK_ENTRY_BYTES + total_payload
+        version = PACK_VERSION if v1_size <= U32_MAX else PACK_VERSION_V2
+    if version not in SUPPORTED_PACK_VERSIONS:
+        raise ValueError(f"unsupported WGPK version {version}")
+    entry_bytes = _entry_bytes(version)
+    data_start = PACK_HEADER_BYTES + len(normalized) * entry_bytes
     total_size = data_start + total_payload
-    if total_size > U32_MAX:
+    if version == PACK_VERSION and total_size > U32_MAX:
         raise ValueError("total WGPK pack size exceeds u32::MAX byte offsets")
 
     out = bytearray(total_size)
-    PACK_HEADER_STRUCT.pack_into(out, 0, PACK_MAGIC, PACK_VERSION, len(normalized), flags)
+    PACK_HEADER_STRUCT.pack_into(out, 0, PACK_MAGIC, version, len(normalized), flags)
 
     cursor = data_start
     for idx, (shader_hash, stage, payload) in enumerate(normalized):
-        base = PACK_HEADER_BYTES + idx * PACK_ENTRY_BYTES
+        base = PACK_HEADER_BYTES + idx * entry_bytes
         length = len(payload)
-        PACK_ENTRY_STRUCT.pack_into(
-            out,
-            base,
-            shader_hash,
-            int(stage),
-            b"\x00\x00\x00",
-            cursor,
-            length,
-        )
+        if version == PACK_VERSION_V2:
+            PACK_ENTRY_STRUCT_V2.pack_into(
+                out, base, shader_hash, int(stage), b"\x00\x00\x00", length, cursor
+            )
+        else:
+            PACK_ENTRY_STRUCT.pack_into(
+                out, base, shader_hash, int(stage), b"\x00\x00\x00", cursor, length
+            )
         out[cursor : cursor + length] = payload
         cursor += length
 
@@ -2882,17 +2910,18 @@ def _verify_wgpk_stream(
         )
         return _finish()
 
-    if version != PACK_VERSION:
+    if version not in SUPPORTED_PACK_VERSIONS:
         violations.append(
             SyntaxViolation(
                 code="unsupported_version",
-                message=f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+                message=f"unsupported WGPK version {version} (expected 1 or 2)",
                 offset=4,
             )
         )
         return _finish(version=version, flags=flags, entry_count=entry_count)
 
-    table_bytes = entry_count * PACK_ENTRY_BYTES
+    entry_bytes = _entry_bytes(version)
+    table_bytes = entry_count * entry_bytes
     data_start = PACK_HEADER_BYTES + table_bytes
     if total_len < data_start:
         violations.append(
@@ -2927,11 +2956,9 @@ def _verify_wgpk_stream(
     valid_payload_entries: list[tuple[int, int, int, int, int]] = []
 
     for idx in range(entry_count):
-        rec_off = idx * PACK_ENTRY_BYTES
+        rec_off = idx * entry_bytes
         file_rec_off = PACK_HEADER_BYTES + rec_off
-        shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(
-            table_buf, rec_off
-        )
+        shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, table_buf, rec_off)
 
         if shader_hash in seen_hashes:
             duplicate_hash_count += 1
@@ -3137,13 +3164,14 @@ def load_wgpk_toc_streaming(
                     code="invalid_magic",
                     offset=0,
                 )
-            if version != PACK_VERSION:
+            if version not in SUPPORTED_PACK_VERSIONS:
                 raise WgpkParseError(
-                    f"unsupported WGPK version {version} (expected {PACK_VERSION})",
+                    f"unsupported WGPK version {version} (expected 1 or 2)",
                     code="unsupported_version",
                     offset=4,
                 )
-            table_bytes = entry_count * PACK_ENTRY_BYTES
+            entry_bytes = _entry_bytes(version)
+            table_bytes = entry_count * entry_bytes
             data_start = PACK_HEADER_BYTES + table_bytes
             if total_len < data_start:
                 raise WgpkParseError(
@@ -3163,10 +3191,8 @@ def load_wgpk_toc_streaming(
         entries: list[WgpkTocEntry] = []
         non_empty_ranges: list[tuple[int, int, int]] = []
         for idx in range(entry_count):
-            rec_off = idx * PACK_ENTRY_BYTES
-            shader_hash, stage_raw, _reserved, offset, length = PACK_ENTRY_STRUCT.unpack_from(
-                table_buf, rec_off
-            )
+            rec_off = idx * entry_bytes
+            shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, table_buf, rec_off)
             try:
                 stage = ShaderStage(stage_raw)
             except ValueError as exc:
