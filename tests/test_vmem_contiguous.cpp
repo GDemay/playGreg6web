@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -836,6 +837,35 @@ void test_lookup_cache_consistency() {
     CHECK(arena.query(ph + 3 * kG).state == MemState::Free);
 }
 
+// A pointer from host_ptr_const_held stays valid while held: a concurrent decommit of its pages (another
+// guest thread freeing memory the GPU flush is hashing in place) waits for the release instead of
+// pulling the pages out from under the reader. A plain host_ptr_const gives no such guarantee.
+void test_held_pointer_blocks_decommit() {
+    VirtualMemoryArena arena;
+    CHECK(arena.valid());
+    const uint64_t a = arena.reserve(0, 64 * 1024, PageProtect::ReadWrite);
+    CHECK(arena.commit(a, 4 * kPageSize, PageProtect::ReadWrite));
+    std::unique_lock<std::mutex> hold;
+    CHECK(arena.host_ptr_const_held(a, 4 * kPageSize, hold) == arena.translate(a));
+    CHECK(hold.owns_lock());
+    std::atomic<bool> decommitted{false};
+    std::thread freer([&] {
+        arena.decommit(a, 4 * kPageSize);
+        decommitted = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(!decommitted.load());
+    CHECK(arena.translate(a)[0] == 0);  // still readable while held
+    hold.unlock();
+    freer.join();
+    CHECK(decommitted.load());
+    // A range that is not committed fails and leaves nothing held.
+    std::unique_lock<std::mutex> hold2;
+    CHECK(arena.host_ptr_const_held(a, kPageSize, hold2) == nullptr);
+    CHECK(!hold2.owns_lock());
+    CHECK(!arena.host_ptr_const_held(0, 1, hold2));
+}
+
 int main() {
     std::printf("test_vmem_contiguous\n");
     test_translation_and_contiguity();
@@ -853,6 +883,7 @@ int main() {
     test_write_batch();
     test_mem_reset_and_reclaim_telemetry();
     test_lookup_cache_consistency();
+    test_held_pointer_blocks_decommit();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;
