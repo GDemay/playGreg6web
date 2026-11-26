@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -903,14 +904,15 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
 
-    // For a single 2D tightly-packed 256B-aligned linear surface taller than one band (e.g. 4K
-    // Bink2 Y plane), hash its 64-row bands once in place and derive the surface hash from them so
-    // the surface is never hashed twice or copied into an intermediate staging buffer.
-    const bool single_linear_256 = subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_a8 &&
-                                   (tight_row_bytes % 256u == 0u) && src_size == tight_mip0_bytes;
+    // G72 (#663): For a single tightly-packed linear surface (whether or not tight_row_bytes is
+    // 256B-aligned, e.g., 4K Bink2 Y/U/V planes), hash its 64-row bands once in place over tight
+    // rows and derive the surface hash from them so the surface is never hashed twice or eagerly
+    // copied/zero-filled into an intermediate staging buffer.
+    const bool single_linear_direct =
+        subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_a8 && src_size == tight_mip0_bytes;
     std::vector<uint64_t> direct_bands;
     uint64_t hash = 0;
-    if (single_linear_256 && d == 1u && blocks_y > kUploadBandRows) {
+    if (single_linear_direct && d == 1u && blocks_y > kUploadBandRows) {
         direct_bands.reserve((blocks_y + kUploadBandRows - 1u) / kUploadBandRows);
         for (uint32_t r = 0; r < blocks_y; r += kUploadBandRows) {
             const uint32_t n = std::min(kUploadBandRows, blocks_y - r);
@@ -940,6 +942,8 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         std::vector<uint8_t> bytes;       // owned staging bytes (empty when borrowing src_data)
         const uint8_t* borrowed = nullptr;  // non-null when referencing src_data directly
         size_t borrowed_size = 0;
+        uint32_t src_row_bytes = 0;         // tight row stride when needs_row_pad is true
+        bool needs_row_pad = false;         // true: borrowed has tight rows, pad to row_pitch on emit
         std::vector<uint64_t> bands;  // hash per band of kUploadBandRows rows (2D only; empty: none)
         std::vector<std::pair<uint32_t, uint32_t>> runs;  // block rows [first, first + count) to write
 
@@ -956,7 +960,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         const uint64_t row_bytes = uint64_t{bx} * l.block_bytes;
         const uint64_t row_pitch = align_up(row_bytes, 256u);
         Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {},
-                  nullptr, 0, {}, {}};
+                  nullptr, 0, 0, false, {}, {}};
         bool detiled = false;
         if (is_tiled && detile_fn) {
             st.bytes.assign(static_cast<size_t>(row_pitch * by * md), 0);
@@ -995,6 +999,12 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             } else if (row_pitch == row_bytes) {
                 st.borrowed = src_data + static_cast<size_t>(slice_off);
                 st.borrowed_size = static_cast<size_t>(row_pitch * by * md);
+            } else if (single_linear_direct) {
+                // Lazy row-pad: borrow tight src_data and repack only changed runs during emit.
+                st.borrowed = src_data;
+                st.borrowed_size = src_size;
+                st.src_row_bytes = static_cast<uint32_t>(row_bytes);
+                st.needs_row_pad = true;
             } else {
                 const uint32_t total_rows = by * md;
                 st.bytes.assign(static_cast<size_t>(row_pitch * total_rows), 0);
@@ -1037,10 +1047,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
         }
-        if (single_linear_256 && !direct_bands.empty()) {
+        if (single_linear_direct && !direct_bands.empty()) {
             st.bands = std::move(direct_bands);
             st.hash = hash;
-        } else if (single_linear_256 && !(st.copy_d == 1u && st.rows > kUploadBandRows)) {
+        } else if (single_linear_direct && !(st.copy_d == 1u && st.rows > kUploadBandRows)) {
             st.hash = hash;
         } else if (st.copy_d == 1u && st.rows > kUploadBandRows) {
             const uint8_t* ptr = st.data();
@@ -1056,8 +1066,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     uint32_t held_floor = 0;
-    const bool single_known_nonzero = !tt.ever_uploaded && subs.size() == 1u && !is_tiled && !convert_norm16 &&
-                                      !convert_a8 && src_size == tight_mip0_bytes;
+    const bool single_known_nonzero = !tt.ever_uploaded && single_linear_direct;
     {
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
         const auto it = tracked_textures_.find(resource_id);
@@ -1121,18 +1130,63 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // G66 partly-held mip chains: views of the texture start at its first held level.
     bridge_->set_resident_mip_floor(resource_id, held_floor);
 
+    struct PadScratch {
+        std::unique_ptr<uint8_t[]> data;
+        size_t capacity = 0;
+
+        uint8_t* ensure(size_t bytes) {
+            if (bytes > capacity) {
+                data.reset(new uint8_t[bytes]);
+                capacity = bytes;
+            }
+            return data.get();
+        }
+
+        void release() {
+            data.reset();
+            capacity = 0;
+        }
+    };
+    constexpr size_t kMaxRetainedPadScratch = 16u << 20;
+    thread_local PadScratch pad_scratch;
+    bool used_pad_scratch = false;
+
     for (const Staged& st : staged) {
         for (const auto& [first, count] : st.runs) {
             const uint32_t bh = st.copy_h / st.rows;  // block height (copy_h is whole blocks)
-            const uint8_t* data = st.data() + size_t{first} * st.row_pitch;
-            const uint32_t len = static_cast<uint32_t>(
-                count == st.rows ? st.size() : size_t{count} * st.row_pitch);
+            const uint8_t* data = nullptr;
+            uint32_t len = 0;
+            if (st.needs_row_pad) {
+                const size_t total_rows = size_t{count} * st.copy_d;
+                const size_t padded_bytes = total_rows * st.row_pitch;
+                const size_t src_row_bytes = st.src_row_bytes;
+                const size_t pad_tail = st.row_pitch - src_row_bytes;
+                uint8_t* scratch = pad_scratch.ensure(padded_bytes);
+                const uint8_t* src_base = st.borrowed + size_t{first} * src_row_bytes;
+                uint8_t* dst = scratch;
+                for (size_t r = 0; r < total_rows; ++r) {
+                    std::memcpy(dst, src_base, src_row_bytes);
+                    std::memset(dst + src_row_bytes, 0, pad_tail);
+                    src_base += src_row_bytes;
+                    dst += st.row_pitch;
+                }
+                data = scratch;
+                len = static_cast<uint32_t>(padded_bytes);
+                used_pad_scratch = true;
+            } else {
+                data = st.data() + size_t{first} * st.row_pitch;
+                len = static_cast<uint32_t>(
+                    count == st.rows ? st.size() : size_t{count} * st.row_pitch);
+            }
             encoder.write_texture(resource_id, st.sub.mip, 0u, first * bh, st.sub.slice, st.copy_w, count * bh,
                                   st.copy_d, st.row_pitch, count, data, len);
             count_work(Work::TextureUploads);
             note_upload(len);
             note_texture_upload();
         }
+    }
+    if (used_pad_scratch && pad_scratch.capacity > kMaxRetainedPadScratch) {
+        pad_scratch.release();
     }
     return !staged.empty();
 }
