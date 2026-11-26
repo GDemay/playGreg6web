@@ -18,6 +18,7 @@ namespace {
 std::mutex g_mutex;  // one operation at a time: updates are short and rare
 std::string g_save_dir = "pg6-saves";
 std::atomic<uint64_t> g_temp_counter{0};
+std::atomic<int> g_crash_point{0};
 
 constexpr size_t kMaxEncodedChars = 240;  // keeps "c-"/"b-" + name inside a path component
 
@@ -144,7 +145,40 @@ void remove_stale_temps(const fs::path& container) {
     }
 }
 
+// Finishes or rolls back a swap that a crash interrupted: ".old-<c-dir>-N" is the previous
+// container (restored when the container is missing), ".new-<c-dir>-N" an unfinished copy.
+void recover_swaps(const std::string& root) {
+    std::error_code ec;
+    std::vector<fs::path> olds;
+    std::vector<fs::path> news;
+    for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string file = it->path().filename().string();
+        if (file.compare(0, 5, ".old-") == 0) {
+            olds.push_back(it->path());
+        } else if (file.compare(0, 5, ".new-") == 0) {
+            news.push_back(it->path());
+        }
+    }
+    for (const fs::path& p : olds) {
+        std::string target = p.filename().string().substr(5);
+        target = target.substr(0, target.rfind('-'));
+        const fs::path dest = fs::path(root) / target;
+        if (fs::exists(dest, ec)) {
+            fs::remove_all(p, ec);
+        } else {
+            fs::rename(p, dest, ec);
+        }
+    }
+    for (const fs::path& p : news) {
+        fs::remove_all(p, ec);
+    }
+}
+
 }  // namespace
+
+void Store::set_test_crash_point(int point) {
+    g_crash_point.store(point);
+}
 
 bool valid_container_name(const std::string& name) {
     return valid_name(name, kMaxContainerNameChars);
@@ -167,6 +201,8 @@ std::string save_dir() {
 Store::Store(const std::string& root, uint64_t quota_bytes) : root_(root), quota_(quota_bytes) {
     std::error_code ec;
     fs::create_directories(root_, ec);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    recover_swaps(root_);
 }
 
 HResult Store::remaining_quota(int64_t* out) const {
@@ -292,9 +328,16 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
         return E_GS_INVALID_CONTAINER_NAME;
     }
     for (const BlobWrite& w : writes) {
-        if (!valid_name(w.name, kMaxBlobNameChars) || w.data.size() > kMaxBlobBytes) {
+        if (!valid_name(w.name, kMaxBlobNameChars)) {
             return E_INVALIDARG_HR;
         }
+    }
+    uint64_t update_bytes = 0;
+    for (const BlobWrite& w : writes) {
+        update_bytes += w.data.size();
+    }
+    if (update_bytes > kMaxUpdateBytes) {
+        return E_GS_UPDATE_TOO_BIG;
     }
     for (const std::string& d : deletes) {
         if (!valid_name(d, kMaxBlobNameChars)) {
@@ -328,39 +371,77 @@ HResult Store::submit_update(const std::string& container, const std::vector<Blo
     if (total > quota_) {
         return E_GS_QUOTA_EXCEEDED;
     }
-    // Stage every write; only when all are on disk do the renames start.
-    std::vector<std::pair<fs::path, fs::path>> staged;  // temp -> blob
-    auto abandon = [&]() {
-        for (const auto& entry : staged) {
-            fs::remove(entry.first, ec);
-        }
+    // Build the complete new container next to the old one: existing files are hard-linked (or
+    // copied), written blobs are fresh files, deleted blobs are left out.
+    const std::string base = container_path(root_, container).filename().string();
+    const std::string tag = "-" + std::to_string(g_temp_counter.fetch_add(1));
+    const fs::path fresh = fs::path(root_) / (".new-" + base + tag);
+    const fs::path aside = fs::path(root_) / (".old-" + base + tag);
+    auto fail = [&]() {
+        fs::remove_all(fresh, ec);
+        return E_FAIL_HR;
     };
-    for (const BlobWrite& w : writes) {
-        const fs::path temp = dir / (".tmp-" + std::to_string(g_temp_counter.fetch_add(1)));
-        staged.emplace_back(temp, blob_path(dir, w.name));
-        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
-        if (out) {
-            out.write(reinterpret_cast<const char*>(w.data.data()), static_cast<std::streamsize>(w.data.size()));
-            out.flush();
-        }
-        if (!out) {
-            out.close();
-            abandon();
-            return E_FAIL_HR;
-        }
+    fs::remove_all(fresh, ec);
+    if (!fs::create_directory(fresh, ec) || ec) {
+        return fail();
     }
-    for (size_t i = 0; i < staged.size(); ++i) {
-        fs::rename(staged[i].first, staged[i].second, ec);
-        if (ec) {
-            for (size_t j = i; j < staged.size(); ++j) {
-                fs::remove(staged[j].first, ec);
-            }
-            return E_FAIL_HR;
-        }
+    std::map<std::string, bool> replaced;  // file names of blobs written or deleted
+    for (const BlobWrite& w : writes) {
+        replaced[blob_path(dir, w.name).filename().string()] = true;
     }
     for (const std::string& d : deletes) {
-        fs::remove(blob_path(dir, d), ec);
+        replaced[blob_path(dir, d).filename().string()] = true;
     }
+    for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string file = it->path().filename().string();
+        if (file.compare(0, 5, ".tmp-") == 0 || replaced.count(file) != 0 || !it->is_regular_file(ec)) {
+            continue;
+        }
+        std::error_code link_ec;
+        fs::create_hard_link(it->path(), fresh / file, link_ec);
+        if (link_ec) {
+            fs::copy_file(it->path(), fresh / file, fs::copy_options::overwrite_existing, ec);
+            if (ec) {
+                return fail();
+            }
+        }
+    }
+    for (const BlobWrite& w : writes) {
+        bool ok = false;
+        {
+            std::ofstream out(blob_path(fresh, w.name), std::ios::binary | std::ios::trunc);
+            if (out) {
+                out.write(reinterpret_cast<const char*>(w.data.data()), static_cast<std::streamsize>(w.data.size()));
+                out.flush();
+                ok = static_cast<bool>(out);
+            }
+        }
+        if (!ok) {
+            return fail();
+        }
+    }
+    // Writes apply first, then deletes (a delete of a written name wins).
+    for (const std::string& d : deletes) {
+        fs::remove(blob_path(fresh, d), ec);
+    }
+    if (g_crash_point.load() == 1) {
+        return E_FAIL_HR;
+    }
+    // Commit: old aside, new in, old removed.
+    fs::rename(dir, aside, ec);
+    if (ec) {
+        return fail();
+    }
+    if (g_crash_point.load() == 2) {
+        return E_FAIL_HR;
+    }
+    fs::rename(fresh, dir, ec);
+    if (ec) {
+        std::error_code undo;
+        fs::rename(aside, dir, undo);
+        return fail();
+    }
+    fs::remove_all(aside, ec);
     return S_OK_HR;
 }
 
