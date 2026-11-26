@@ -1958,3 +1958,324 @@ test('W367: multi-lane out-of-order sequential slab reads deduplicate in-flight 
     await poolHost.stop();
   }
 });
+
+// ---------------------------------------------------------------------------
+// 11. W368: Per-lane atomic SAB claim (Claimed = 3), multi-worker contention,
+//     host Claimed waiting, shutdown wakeups, and ArrayBuffer responder fallback
+// ---------------------------------------------------------------------------
+
+test('W368: two worker_threads sharing the exact same SAB lane run concurrent open/read/close with zero corruption', async () => {
+  assert.equal(HttpfsStatus.Claimed, 3);
+  assert.equal(HttpfsStatus.CLAIMED, 3);
+
+  const fileSize = 24 * 1024 + 333; // 6+ x 4 KiB SAB chunks per read -> heavy multi-chunk contention
+  const fileA = makePatternBytes(fileSize, 41);
+  const fileB = makePatternBytes(fileSize, 97);
+
+  // Small async fetch delay guarantees both workers overlap on the same SAB lane.
+  const mock = createMockRangeFetch(
+    new Map([
+      ['/game/lane_share_a.rpf', fileA],
+      ['/game/lane_share_b.rpf', fileB],
+    ]),
+    { delayMs: 2 },
+  );
+
+  const sharedSab = createHttpfsMailboxBuffer(4096);
+  const barrierSab = new SharedArrayBuffer(4);
+  const barrierView = new Int32Array(barrierSab, 0, 1);
+
+  const host = new HttpfsMailboxHost(sharedSab, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 128 * 1024,
+    chunkSize: 8192,
+    readAheadChunks: 1,
+    probeOnOpen: true,
+  });
+  host.start();
+
+  const workerCode = `
+    const { workerData, parentPort } = require('node:worker_threads');
+    const { HttpfsMailboxClient } = require(workerData.mailboxPath);
+    const client = new HttpfsMailboxClient(workerData.sab, { timeoutMs: 10000 });
+    const barrier = new Int32Array(workerData.barrierSab, 0, 1);
+
+    // Synchronize both workers so they contend on the same SAB lane simultaneously.
+    const arrived = Atomics.add(barrier, 0, 1) + 1;
+    if (arrived >= 2) {
+      Atomics.notify(barrier, 0);
+    } else {
+      while (Atomics.load(barrier, 0) < 2) {
+        Atomics.wait(barrier, 0, 1, 5000);
+      }
+    }
+
+    const rounds = [];
+    for (let round = 0; round < 3; round += 1) {
+      const h = client.open(workerData.relPath);
+      if (h < 1) {
+        throw new Error('open failed for ' + workerData.relPath + ': ' + h);
+      }
+      const full = new Uint8Array(workerData.size);
+      const n1 = client.read(h, 0n, full, workerData.size);
+      const midOff = 4096 + round * 512;
+      const midLen = 6000;
+      const mid = new Uint8Array(midLen);
+      const n2 = client.read(h, BigInt(midOff), mid, midLen);
+      const eof = client.read(h, BigInt(workerData.size), new Uint8Array(32), 32);
+      const closed = client.close(h);
+      rounds.push({
+        h,
+        n1,
+        n2,
+        midOff,
+        eof,
+        closed,
+        full: Array.from(full),
+        mid: Array.from(mid),
+      });
+    }
+    parentPort.postMessage({ relPath: workerData.relPath, rounds });
+  `;
+
+  const spawnWorker = (relPath) =>
+    new Promise((resolve, reject) => {
+      const w = new NodeWorker(workerCode, {
+        eval: true,
+        workerData: {
+          sab: sharedSab,
+          barrierSab,
+          relPath,
+          size: fileSize,
+          mailboxPath: path.join(repoRoot, 'web', 'workers', 'httpfs_mailbox.js'),
+        },
+      });
+      w.once('message', resolve);
+      w.once('error', reject);
+      w.once('exit', (code) => {
+        if (code !== 0) reject(new Error(`Worker (${relPath}) exited with code ${code}`));
+      });
+    });
+
+  try {
+    const [resA, resB] = await Promise.all([
+      spawnWorker('game/lane_share_a.rpf'),
+      spawnWorker('game/lane_share_b.rpf'),
+    ]);
+
+    for (const [res, expectedBytes] of [
+      [resA, fileA],
+      [resB, fileB],
+    ]) {
+      assert.equal(res.rounds.length, 3);
+      for (const r of res.rounds) {
+        assert.ok(r.h >= 1);
+        assert.equal(r.n1, fileSize);
+        assert.equal(r.n2, 6000);
+        assert.equal(r.eof, 0);
+        assert.equal(r.closed, true);
+        assert.deepEqual(new Uint8Array(r.full), expectedBytes);
+        assert.deepEqual(
+          new Uint8Array(r.mid),
+          expectedBytes.subarray(r.midOff, r.midOff + 6000),
+        );
+      }
+    }
+
+    // Also verify two async clients sharing the same SAB lane serialize cleanly via _acquireLaneAsync().
+    const asyncClient1 = new HttpfsMailboxClient(sharedSab, { timeoutMs: 5000 });
+    const asyncClient2 = new HttpfsMailboxClient(sharedSab, { timeoutMs: 5000 });
+    const [hA, hB] = await Promise.all([
+      asyncClient1.openAsync('game/lane_share_a.rpf'),
+      asyncClient2.openAsync('game/lane_share_b.rpf'),
+    ]);
+    assert.ok(hA >= 1 && hB >= 1 && hA !== hB);
+    const outA = new Uint8Array(fileSize);
+    const outB = new Uint8Array(fileSize);
+    const [nA, nB] = await Promise.all([
+      asyncClient1.readAsync(hA, 0n, outA, fileSize),
+      asyncClient2.readAsync(hB, 0n, outB, fileSize),
+    ]);
+    assert.equal(nA, fileSize);
+    assert.equal(nB, fileSize);
+    assert.deepEqual(outA, fileA);
+    assert.deepEqual(outB, fileB);
+    const [cA, cB] = await Promise.all([
+      asyncClient1.closeAsync(hA),
+      asyncClient2.closeAsync(hB),
+    ]);
+    assert.equal(cA, true);
+    assert.equal(cB, true);
+
+    const statusView = new Int32Array(sharedSab, 0, 1);
+    assert.equal(Atomics.load(statusView, 0), HttpfsStatus.Idle);
+  } finally {
+    await host.stop();
+  }
+});
+
+test('W368: HttpfsMailboxHost waits cleanly on Claimed (3) until RequestReady (1) without corrupting state', async () => {
+  const payloadBytes = makePatternBytes(2048, 73);
+  const mock = createMockRangeFetch(new Map([['/game/claimed_wait.rpf', payloadBytes]]));
+
+  const sab = createHttpfsMailboxBuffer(4096);
+  const statusView = new Int32Array(sab, 0, 1);
+  const headerView = new DataView(sab, 0, HTTPFS_HEADER_BYTES);
+  const payloadView = new Uint8Array(sab, HTTPFS_HEADER_BYTES, 4096);
+
+  const host = new HttpfsMailboxHost(sab, {
+    fetchImpl: mock.fetchImpl,
+    cacheMaxBytes: 32 * 1024,
+    chunkSize: 4096,
+    readAheadChunks: 0,
+    probeOnOpen: false,
+  });
+
+  // Pre-claim the lane before any host poll/dispatch: processOnce() must treat Claimed as not ready.
+  Atomics.store(statusView, 0, HttpfsStatus.Claimed);
+  assert.equal(await host.processOnce(), false);
+  assert.equal(Atomics.load(statusView, 0), HttpfsStatus.Claimed);
+  assert.equal(host.getStats().requests, 0);
+
+  // Start the host loop while status is Claimed (3); it must wait cleanly without erroring.
+  host.start();
+  try {
+    await new Promise((r) => setTimeout(r, 25));
+    assert.equal(Atomics.load(statusView, 0), HttpfsStatus.Claimed);
+    assert.equal(host.getStats().requests, 0);
+
+    // Now finish populating the Open request and transition Claimed -> RequestReady + notify.
+    const encodedPath = new TextEncoder().encode('game/claimed_wait.rpf');
+    headerView.setUint32(HttpfsOffsets.OP, HttpfsOp.Open, true);
+    headerView.setInt32(HttpfsOffsets.HANDLE, -1, true);
+    headerView.setBigUint64(HttpfsOffsets.OFFSET, 0n, true);
+    headerView.setBigUint64(HttpfsOffsets.LENGTH, BigInt(encodedPath.byteLength), true);
+    headerView.setBigInt64(HttpfsOffsets.RESULT, -1n, true);
+    payloadView.set(encodedPath, 0);
+    Atomics.store(statusView, 0, HttpfsStatus.RequestReady);
+    Atomics.notify(statusView, 0);
+
+    await waitForCondition(
+      () => Atomics.load(statusView, 0) === HttpfsStatus.ResponseReady,
+      3000,
+      'host wakes from Claimed and completes Open',
+    );
+
+    const openedHandle = Number(headerView.getBigInt64(HttpfsOffsets.RESULT, true));
+    assert.ok(openedHandle >= 1);
+    assert.equal(host.getStats().requests, 1);
+
+    // Release back to Idle and verify normal client read + close succeeds cleanly.
+    Atomics.store(statusView, 0, HttpfsStatus.Idle);
+    Atomics.notify(statusView, 0);
+
+    const client = new HttpfsMailboxClient(sab, { timeoutMs: 3000 });
+    const out = new Uint8Array(2048);
+    assert.equal(await client.readAsync(openedHandle, 0n, out, 2048), 2048);
+    assert.deepEqual(out, payloadBytes);
+    assert.equal(await client.closeAsync(openedHandle), true);
+  } finally {
+    await host.stop();
+  }
+});
+
+test('W368: shutdown wakes sync and async clients waiting to acquire a Claimed lane, and plain ArrayBuffer responder hooks remain intact', async () => {
+  // Part A: Sync worker waiting in _acquireLaneSync() on a Claimed lane wakes immediately on Shutdown.
+  const sabSync = createHttpfsMailboxBuffer(4096);
+  const statusSync = new Int32Array(sabSync, 0, 1);
+  Atomics.store(statusSync, 0, HttpfsStatus.Claimed);
+
+  const workerCode = `
+    const { workerData, parentPort } = require('node:worker_threads');
+    const { HttpfsMailboxClient } = require(workerData.mailboxPath);
+    const client = new HttpfsMailboxClient(workerData.sab, { timeoutMs: 10000 });
+    const t0 = Date.now();
+    parentPort.postMessage({ started: true });
+    const h = client.open('game/blocked_on_claim.rpf');
+    const r = client.read(1, 0n, new Uint8Array(64), 64);
+    const c = client.close(1);
+    parentPort.postMessage({ done: true, h, r, c, elapsedMs: Date.now() - t0 });
+  `;
+
+  const workerResult = await new Promise((resolve, reject) => {
+    const w = new NodeWorker(workerCode, {
+      eval: true,
+      workerData: {
+        sab: sabSync,
+        mailboxPath: path.join(repoRoot, 'web', 'workers', 'httpfs_mailbox.js'),
+      },
+    });
+    w.on('message', (msg) => {
+      if (msg.started) {
+        setTimeout(() => {
+          HttpfsMailboxClient.shutdownWaiter(sabSync);
+        }, 25);
+      } else if (msg.done) {
+        resolve(msg);
+      }
+    });
+    w.once('error', reject);
+    w.once('exit', (code) => {
+      if (code !== 0) reject(new Error(`Shutdown worker exited with code ${code}`));
+    });
+  });
+
+  assert.equal(workerResult.h, -1);
+  assert.equal(workerResult.r, -1);
+  assert.equal(workerResult.c, false);
+  assert.ok(
+    workerResult.elapsedMs < 3000,
+    `Shutdown must wake client promptly (got ${workerResult.elapsedMs}ms)`,
+  );
+
+  // Part B: Async clients waiting in _acquireLaneAsync() on a Claimed lane wake immediately on Shutdown.
+  const sabAsync = createHttpfsMailboxBuffer(4096);
+  const statusAsync = new Int32Array(sabAsync, 0, 1);
+  Atomics.store(statusAsync, 0, HttpfsStatus.Claimed);
+  const asyncClient = new HttpfsMailboxClient(sabAsync, { timeoutMs: 10000 });
+  const t0Async = Date.now();
+  const pendingOpen = asyncClient.openAsync('game/blocked_async.rpf');
+  const pendingRead = asyncClient.readAsync(1, 0n, new Uint8Array(64), 64);
+  const pendingClose = asyncClient.closeAsync(1);
+  setTimeout(() => {
+    HttpfsMailboxClient.shutdownWaiter(sabAsync);
+  }, 20);
+  const [aOpen, aRead, aClose] = await Promise.all([pendingOpen, pendingRead, pendingClose]);
+  assert.equal(aOpen, -1);
+  assert.equal(aRead, -1);
+  assert.equal(aClose, false);
+  assert.ok(Date.now() - t0Async < 3000);
+
+  // Part C: Plain (non-Shared) ArrayBuffer with synchronous responder hook works identically.
+  const ab = new ArrayBuffer(HTTPFS_HEADER_BYTES + 256);
+  const abBytes = makePatternBytes(600, 19);
+  const abClient = new HttpfsMailboxClient(ab, (buf) => {
+    const status = new Int32Array(buf, 0, 1);
+    const header = new DataView(buf, 0, HTTPFS_HEADER_BYTES);
+    const payload = new Uint8Array(buf, HTTPFS_HEADER_BYTES, 256);
+    const op = header.getUint32(HttpfsOffsets.OP, true);
+    if (op === HttpfsOp.Open) {
+      header.setBigInt64(HttpfsOffsets.RESULT, 7n, true);
+      status[0] = HttpfsStatus.ResponseReady;
+    } else if (op === HttpfsOp.Read) {
+      const off = Number(header.getBigUint64(HttpfsOffsets.OFFSET, true));
+      const len = Number(header.getBigUint64(HttpfsOffsets.LENGTH, true));
+      const avail = Math.max(0, Math.min(len, abBytes.byteLength - off));
+      if (avail > 0) {
+        payload.set(abBytes.subarray(off, off + avail), 0);
+      }
+      header.setBigInt64(HttpfsOffsets.RESULT, BigInt(avail), true);
+      status[0] = HttpfsStatus.ResponseReady;
+    } else if (op === HttpfsOp.Close) {
+      header.setBigInt64(HttpfsOffsets.RESULT, 0n, true);
+      status[0] = HttpfsStatus.ResponseReady;
+    }
+  });
+
+  assert.equal(abClient.open('game/plain_ab.rpf'), 7);
+  const abOut = new Uint8Array(600);
+  assert.equal(abClient.read(7, 0n, abOut, 600), 600);
+  assert.deepEqual(abOut, abBytes);
+  assert.equal(abClient.close(7), true);
+  assert.equal(new Int32Array(ab, 0, 1)[0], HttpfsStatus.Idle);
+});
