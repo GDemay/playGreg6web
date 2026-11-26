@@ -15,9 +15,14 @@
 // User data -> root parameter (console ABI, established from the stage metadata of every pipeline
 // the title creates): root parameters occupy consecutive user-data SGPRs from s8 in graphics
 // stages and from s4 in compute stages; a descriptor table takes one SGPR (32-bit pointer), root
-// constants one per 32-bit value and a root descriptor two. CBV_SRV_UAV table descriptors are
-// 32-byte slots (`slot = table_byte_offset / 32`); sampler table descriptors are 16-byte slots
-// (`slot = table_byte_offset / 16`), matching `descriptor_handle_increment_size` and GFX10 S# size.
+// constants one per 32-bit value and a root descriptor two. When the root signature enables SM 6.6
+// directly-indexed descriptor heaps (`CbvSrvUavHeapDirectlyIndexed` = 0x400 and/or
+// `SamplerHeapDirectlyIndexed` = 0x800), the console appends implicit 1-SGPR heap base pointers
+// immediately after the explicit root parameters: `s_res = base + total_root_dwords` (when 0x400),
+// then `s_smp = base + total_root_dwords + (has_res ? 1 : 0)` (when 0x800). CBV_SRV_UAV table and
+// resource-heap descriptors are 32-byte slots (`slot = table_byte_offset / 32`); sampler table and
+// sampler-heap descriptors are 16-byte slots (`slot = table_byte_offset / 16`), matching
+// `descriptor_handle_increment_size` and GFX10 S# size.
 // Slots are numbered as D3D12 numbers them (ranges appended in order unless they give an explicit
 // offset).
 //
@@ -260,6 +265,9 @@ struct JoinStats {
     // Non-compute stages whose user-data SGPRs resolved via GFX10.3 shifted-base fallback (e.g.
     // s16 for NGG/merged VS or s12 for 4-SGPR-shifted VS) instead of the default s8 (on success).
     uint64_t shifted_user_data_base_stages = 0;
+    // Bindings resolved via SM 6.6 trailing implicit directly-indexed descriptor heap SGPRs
+    // (`s_res` for CbvSrvUavHeapDirectlyIndexed, `s_smp` for SamplerHeapDirectlyIndexed; on success).
+    uint64_t implicit_heap_bindings = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows

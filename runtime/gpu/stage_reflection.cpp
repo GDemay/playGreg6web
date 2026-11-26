@@ -858,11 +858,60 @@ int root_parameter_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute,
 
 namespace {
 
+static_assert(kTableSlotBytes == (1u << 5), "CBV/SRV/UAV descriptor slot stride must be 32 bytes (1 << 5)");
+static_assert(bridge::kSamplerSlotBytes == (1u << 4), "Sampler descriptor slot stride must be 16 bytes (1 << 4)");
+
+uint32_t effective_user_data_base(bool compute, uint32_t base) {
+    return base != 0 ? base : (compute ? kComputeUserDataBase : kGraphicsUserDataBase);
+}
+
+uint32_t total_root_dwords(const d3d::RootSignatureDesc& rs) {
+    uint32_t total = 0;
+    for (const d3d::RootParameterDesc& p : rs.parameters) {
+        total += parameter_dwords(p);
+    }
+    return total;
+}
+
+bool has_implicit_heap_sgprs(const d3d::RootSignatureDesc& rs) {
+    return (rs.flags & (d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed |
+                        d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed)) != 0;
+}
+
+enum class ImplicitHeapSgpr : uint8_t { None = 0, Resource = 1, Sampler = 2 };
+
+// SM 6.6 directly-indexed descriptor heaps: when CbvSrvUavHeapDirectlyIndexed (0x400) and/or
+// SamplerHeapDirectlyIndexed (0x800) are set, the console appends 1-SGPR heap base pointers
+// immediately after the explicit root parameters:
+//   s_res = base + total_root_dwords(rs)                 (when 0x400)
+//   s_smp = base + total_root_dwords(rs) + (has_res?1:0) (when 0x800)
+ImplicitHeapSgpr implicit_heap_for_user_sgpr(const d3d::RootSignatureDesc& rs, bool compute, uint32_t user_sgpr,
+                                             uint32_t base = 0) {
+    const bool has_res = (rs.flags & d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed) != 0;
+    const bool has_smp = (rs.flags & d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed) != 0;
+    if (!has_res && !has_smp) {
+        return ImplicitHeapSgpr::None;
+    }
+    uint32_t sgpr = effective_user_data_base(compute, base) + total_root_dwords(rs);
+    if (has_res) {
+        if (user_sgpr == sgpr) {
+            return ImplicitHeapSgpr::Resource;
+        }
+        ++sgpr;
+    }
+    if (has_smp && user_sgpr == sgpr) {
+        return ImplicitHeapSgpr::Sampler;
+    }
+    return ImplicitHeapSgpr::None;
+}
+
 // The constant buffer a CB-indexed index or a lane-indexed window base is read from (G62): the
-// root parameter at b.user_sgpr, checked against b.cbv. False with the reason when it does not fit.
+// root parameter at b.user_sgpr (or the SM 6.6 implicit ResourceDescriptorHeap SGPR when 0x400 is
+// set), checked against b.cbv. False with the reason when it does not fit.
 bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const ReflectedBinding& b, int* pi_out,
                    d3d::HeapIndexSource* from, uint32_t* cb_table_slot, uint32_t* cb_byte_offset_out,
-                   bool* is_root_table_out, uint64_t* root_table_coercions, std::string* why, uint32_t base) {
+                   bool* is_root_table_out, bool* is_implicit_heap_out, uint64_t* root_table_coercions,
+                   std::string* why, uint32_t base) {
     if (b.cb_byte_offset % 4 != 0) {
         *why = "byte offset " + std::to_string(b.cb_byte_offset) + " is not dword-aligned";
         return false;
@@ -876,6 +925,33 @@ bool join_cb_dword(const d3d::RootSignatureDesc& rs, bool compute, const Reflect
                        ? root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into, base)
                        : root_parameter_for_user_sgpr(rs, compute, b.user_sgpr, base);
     if (pi < 0) {
+        const ImplicitHeapSgpr implicit = implicit_heap_for_user_sgpr(rs, compute, b.user_sgpr, base);
+        if (implicit != ImplicitHeapSgpr::None) {
+            if (b.cbv == ReflectedCbv::RootConstants) {
+                *why = "s" + std::to_string(b.user_sgpr) + " is an implicit " +
+                       (implicit == ImplicitHeapSgpr::Sampler ? "sampler" : "resource") +
+                       " heap pointer, not root constants";
+                return false;
+            }
+            if (implicit == ImplicitHeapSgpr::Sampler) {
+                *why = "s" + std::to_string(b.user_sgpr) +
+                       " is the implicit sampler heap, not a CBV_SRV_UAV descriptor heap";
+                return false;
+            }
+            const uint32_t table_off =
+                (b.cbv == ReflectedCbv::RootDescriptor && !b.root_table_offset_given) ? 0u : b.table_byte_offset;
+            if (table_off % kTableSlotBytes != 0) {
+                *why = "implicit resource heap at s" + std::to_string(b.user_sgpr) + ": byte offset " +
+                       std::to_string(table_off) + " is not a descriptor boundary";
+                return false;
+            }
+            *pi_out = -1;
+            *from = d3d::HeapIndexSource::CbTable;
+            *cb_table_slot = table_off / kTableSlotBytes;
+            *cb_byte_offset_out = b.cb_byte_offset;
+            *is_implicit_heap_out = true;
+            return true;
+        }
         *why = b.cbv == ReflectedCbv::RootConstants
                    ? "no root parameter covers s" + std::to_string(b.user_sgpr)
                    : "no root parameter starts at s" + std::to_string(b.user_sgpr);
@@ -952,6 +1028,7 @@ struct StageJoinedBinding {
     bool lane_array = false;
     bool lane_scalar = false;
     bool root_table = false;
+    bool implicit_heap = false;
 };
 
 // Candidate GFX10.3 shifted user-data bases for a graphics stage whose user SGPRs fall past the
@@ -1015,6 +1092,21 @@ std::vector<uint32_t> collect_shifted_user_data_bases(const d3d::RootSignatureDe
             }
             param_off += dwords;
         }
+        auto note_implicit_off = [&](uint32_t off) {
+            if (min_sgpr >= off) {
+                const uint32_t cand = min_sgpr - off;
+                if (cand > kGraphicsUserDataBase && cand <= kMaxShiftedUserDataBase) {
+                    ((cand % 2u == 0) ? even_derived : odd_derived).push_back(cand);
+                }
+            }
+        };
+        if ((rs.flags & d3d::RootSignatureFlags::CbvSrvUavHeapDirectlyIndexed) != 0) {
+            note_implicit_off(param_off);
+            ++param_off;
+        }
+        if ((rs.flags & d3d::RootSignatureFlags::SamplerHeapDirectlyIndexed) != 0) {
+            note_implicit_off(param_off);
+        }
         for (uint32_t b : even_derived) {
             add_unique(b);
         }
@@ -1048,6 +1140,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
         bool is_lane_array = false;
         bool is_lane_scalar = false;
         bool is_root_table = false;
+        bool is_implicit_heap = false;
         // Where the descriptor comes from, as a root-signature register.
         d3d::DescriptorRangeType cls = d3d::DescriptorRangeType::Srv;
         uint32_t reg = 0, space = 0;
@@ -1072,6 +1165,18 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                 fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the " +
                             (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") + " heap");
                 continue;
+            }
+            const ImplicitHeapSgpr implicit_base =
+                implicit_heap_for_user_sgpr(rs, compute, b.heap_base_sgpr, stage_base);
+            if (implicit_base != ImplicitHeapSgpr::None) {
+                if ((implicit_base == ImplicitHeapSgpr::Sampler) != (b.source == ReflectedSource::SamplerHeap)) {
+                    fail(b, "s" + std::to_string(b.heap_base_sgpr) + " is the implicit " +
+                                (implicit_base == ImplicitHeapSgpr::Sampler ? "sampler" : "resource") +
+                                " heap, not the " +
+                                (b.source == ReflectedSource::SamplerHeap ? "sampler" : "resource") + " heap");
+                    continue;
+                }
+                is_implicit_heap = true;
             }
             cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
                   : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
@@ -1098,7 +1203,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
             uint32_t eff_cb_byte_offset = b.cb_byte_offset;
             std::string why;
             if (!join_cb_dword(rs, compute, b, &pi, &from, &lb.join.cb_table_slot, &eff_cb_byte_offset, &is_root_table,
-                               root_table_coercions, &why, stage_base)) {
+                               &is_implicit_heap, root_table_coercions, &why, stage_base)) {
                 if (root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, nullptr, stage_base) < 0) {
                     *had_uncovered_user_sgpr = true;
                 }
@@ -1118,7 +1223,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                       ? d3d::DescriptorRangeType::Uav
                       : d3d::DescriptorRangeType::Srv;
             lb.join.heap = sampler_kind ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
-            lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+            lb.join.heap_index_parameter = pi < 0 ? d3d::kNoIndex : static_cast<uint32_t>(pi);
             lb.join.heap_index_source = from;
             lb.join.heap_shift = b.heap_shift;
             if (b.heap_stride != 0 && b.heap_stride != (1u << b.heap_shift)) {
@@ -1154,7 +1259,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
             if (b.lane_has_window_base) {
                 std::string why;
                 if (!join_cb_dword(rs, compute, b, &pi, &from, &slot, &eff_cb_byte_offset, &is_root_table,
-                                   root_table_coercions, &why, stage_base)) {
+                                   &is_implicit_heap, root_table_coercions, &why, stage_base)) {
                     if (root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, nullptr, stage_base) < 0) {
                         *had_uncovered_user_sgpr = true;
                     }
@@ -1176,7 +1281,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                 lb.join.heap_stride = b.heap_stride;
             }
             if (b.lane_has_window_base) {
-                lb.join.heap_index_parameter = static_cast<uint32_t>(pi);
+                lb.join.heap_index_parameter = pi < 0 ? d3d::kNoIndex : static_cast<uint32_t>(pi);
                 lb.join.cb_table_slot = slot;
                 lb.join.cb_byte_offset = eff_cb_byte_offset;
                 lb.join.cb_bit_offset = b.cb_bit_offset;
@@ -1237,10 +1342,54 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
             uint32_t into = 0;
             const int pi = root_parameter_containing_user_sgpr(rs, compute, b.user_sgpr, &into, stage_base);
             if (pi < 0) {
-                *had_uncovered_user_sgpr = true;
-                fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
-                continue;
-            }
+                const ImplicitHeapSgpr implicit_heap =
+                    implicit_heap_for_user_sgpr(rs, compute, b.user_sgpr, stage_base);
+                if (implicit_heap == ImplicitHeapSgpr::None) {
+                    *had_uncovered_user_sgpr = true;
+                    fail(b, "no root parameter covers s" + std::to_string(b.user_sgpr));
+                    continue;
+                }
+                const bool is_sampler_heap = implicit_heap == ImplicitHeapSgpr::Sampler;
+                if (b.source == ReflectedSource::RootConstants) {
+                    *had_uncovered_user_sgpr = true;
+                    fail(b, "s" + std::to_string(b.user_sgpr) + " is an implicit " +
+                                (is_sampler_heap ? "sampler" : "resource") + " heap pointer, not root constants");
+                    continue;
+                }
+                const bool sampler_kind =
+                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+                if (sampler_kind != is_sampler_heap) {
+                    *had_uncovered_user_sgpr = true;
+                    fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot come from the implicit " +
+                                (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
+                                std::to_string(b.user_sgpr));
+                    continue;
+                }
+                const uint32_t table_byte_offset =
+                    (b.source == ReflectedSource::RootDescriptor && !b.root_table_offset_given) ? 0u
+                                                                                                : b.table_byte_offset;
+                const uint32_t slot_bytes = is_sampler_heap ? bridge::kSamplerSlotBytes : kTableSlotBytes;
+                if (table_byte_offset % slot_bytes != 0) {
+                    *had_uncovered_user_sgpr = true;
+                    fail(b, std::string("implicit ") + (is_sampler_heap ? "sampler" : "resource") + " heap at s" +
+                                std::to_string(b.user_sgpr) + ": byte offset " + std::to_string(table_byte_offset) +
+                                " is not a descriptor boundary");
+                    continue;
+                }
+                const uint32_t slot_index = table_byte_offset / slot_bytes;
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                      : (b.kind == ReflectedBindingKind::Storage || b.kind == ReflectedBindingKind::StorageTexture)
+                          ? d3d::DescriptorRangeType::Uav
+                          : d3d::DescriptorRangeType::Srv;
+                reg = space = 0;
+                lb.join.heap = is_sampler_heap ? d3d::HeapAccess::Sampler : d3d::HeapAccess::Resource;
+                lb.join.heap_index_source = d3d::HeapIndexSource::Constant;
+                lb.join.heap_index_parameter = d3d::kNoIndex;
+                lb.join.heap_index_dword = slot_index;
+                lb.join.heap_shift = is_sampler_heap ? 4u : 5u;
+                is_implicit_heap = true;
+            } else {
             if (into != 0 && (b.source == ReflectedSource::Table || b.source == ReflectedSource::RootDescriptor) &&
                 rs.parameters[static_cast<size_t>(pi)].parameter_type != d3d::RootParameterType::DescriptorTable) {
                 fail(b, "s" + std::to_string(b.user_sgpr) + " is dword " + std::to_string(into) + " of root parameter " +
@@ -1350,6 +1499,7 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                 case ReflectedSource::Unresolved:
                     break;
             }
+            }
         }
         if (!lb.join.root_constants && !kind_accepts(b.kind, cls)) {
             fail(b, std::string("a ") + kind_name(b.kind) + " binding cannot take a " +
@@ -1413,8 +1563,15 @@ bool resolve_stage_bindings(const d3d::RootSignatureDesc& rs, bool compute, cons
                 lb.entry.binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Comparison);
                 break;
         }
-        out_bindings->push_back(StageJoinedBinding{
-            {b.group, b.binding}, &b, lb, is_unresolved, is_outside_rs, is_lane_array, is_lane_scalar, is_root_table});
+        out_bindings->push_back(StageJoinedBinding{{b.group, b.binding},
+                                                   &b,
+                                                   lb,
+                                                   is_unresolved,
+                                                   is_outside_rs,
+                                                   is_lane_array,
+                                                   is_lane_scalar,
+                                                   is_root_table,
+                                                   is_implicit_heap});
     }
     return stage_ok;
 }
@@ -1431,6 +1588,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         bool lane_array = false;
         bool lane_scalar = false;
         bool root_table = false;
+        bool implicit_heap = false;
     };
     std::map<std::pair<uint32_t, uint32_t>, JoinedBinding> joined;
     uint64_t failed_lane_indexed = 0;
@@ -1475,9 +1633,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         const bool is_vertex_stage =
             is_non_compute_stage && (st.visibility & GpuShaderStageBits::Vertex) != 0 &&
             st.reflection->stage == ReflectedStage::Vertex;
+        const bool has_rs_sgprs = !rs.parameters.empty() || has_implicit_heap_sgprs(rs);
         bool allow_covered_shift = false;
-        if (!stage_ok && !had_uncovered_user_sgpr && explicit_base == 0 && is_vertex_stage &&
-            !rs.parameters.empty()) {
+        if (!stage_ok && !had_uncovered_user_sgpr && explicit_base == 0 && is_vertex_stage && has_rs_sgprs) {
             uint32_t min_sgpr = UINT32_MAX;
             std::vector<uint32_t> distinct_sgprs;
             auto note_sgpr = [&](uint32_t sgpr) {
@@ -1515,7 +1673,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 min_sgpr != UINT32_MAX && (min_sgpr >= kMeshUserDataBase || distinct_sgprs.size() >= 2u);
         }
         if (!stage_ok && (had_uncovered_user_sgpr || allow_covered_shift) && explicit_base == 0 &&
-            is_non_compute_stage && !rs.parameters.empty()) {
+            is_non_compute_stage && has_rs_sgprs) {
             bool found_exact = false;
             bool found_fallback = false;
             std::vector<StageJoinedBinding> best_bindings;
@@ -1560,7 +1718,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
             auto it = joined.find(sb.key);
             if (it == joined.end()) {
                 joined.emplace(sb.key, JoinedBinding{sb.lb, sb.unresolved, sb.outside_rs, sb.lane_array, sb.lane_scalar,
-                                                     sb.root_table});
+                                                     sb.root_table, sb.implicit_heap});
             } else if (same_binding(it->second.lb, sb.lb)) {
                 it->second.lb.entry.visibility |= sb.lb.entry.visibility;
                 it->second.lb.entry.min_binding_size =
@@ -1570,6 +1728,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 it->second.lane_array = it->second.lane_array || sb.lane_array;
                 it->second.lane_scalar = it->second.lane_scalar || sb.lane_scalar;
                 it->second.root_table = it->second.root_table || sb.root_table;
+                it->second.implicit_heap = it->second.implicit_heap || sb.implicit_heap;
             } else if ((it->second.unresolved || sb.unresolved) && same_entry(it->second.lb.entry, sb.lb.entry)) {
                 // One stage traced this binding's descriptor and another could not (version >= 3
                 // "unresolved"): when their WebGPU layout entries agree, keep the resolved source.
@@ -1585,6 +1744,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     it->second.lane_array = sb.lane_array;
                     it->second.lane_scalar = sb.lane_scalar;
                     it->second.root_table = sb.root_table;
+                    it->second.implicit_heap = sb.implicit_heap;
                 } else {
                     it->second.lb.entry.visibility |= sb.lb.entry.visibility;
                     it->second.lb.entry.min_binding_size =
@@ -1612,6 +1772,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     uint64_t lane_arrays = 0;
     uint64_t root_tables = 0;
     uint64_t unresolved = 0;
+    uint64_t implicit_heap = 0;
     for (const auto& [key, jb] : joined) {
         if (layout.groups.size() <= key.first) {
             layout.groups.resize(key.first + 1);
@@ -1628,6 +1789,9 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         }
         if (jb.unresolved) {
             ++unresolved;
+        }
+        if (jb.implicit_heap) {
+            ++implicit_heap;
         }
     }
     if (layout.groups.empty()) {
@@ -1649,6 +1813,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         stats->root_descriptor_tables += root_tables;
         stats->unresolved_bindings += unresolved;
         stats->shifted_user_data_base_stages += shifted_stages;
+        stats->implicit_heap_bindings += implicit_heap;
     }
     return true;
 }
