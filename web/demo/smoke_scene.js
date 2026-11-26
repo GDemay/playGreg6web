@@ -43,6 +43,8 @@ export const GPU_OPCODES = Object.freeze({
   DRAW_INDIRECT: 36,
   DRAW_INDEXED_INDIRECT: 37,
   DISPATCH_INDIRECT: 38,
+  READBACK_BUFFER: 39,
+  READBACK_TEXTURE: 40,
 });
 
 export const GPU_BUFFER_USAGE = Object.freeze({
