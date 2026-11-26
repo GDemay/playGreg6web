@@ -574,6 +574,165 @@ bool FramePacer::is_shut_down() const {
     return shutdown_;
 }
 
+void FramePacer::record_origin_token(uint64_t token) {
+    if (token == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    origin_tokens_[origin_token_cursor_ % kRecentOriginTokens] = token;
+    ++origin_token_cursor_;
+}
+
+bool FramePacer::is_recent_origin_token(uint64_t token) const {
+    if (token == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint64_t t : origin_tokens_) {
+        if (t == token) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void FramePacer::note_present_thread(std::thread::id id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    present_thread_ = id;
+    has_present_thread_ = true;
+}
+
+bool FramePacer::is_present_thread(std::thread::id id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return has_present_thread_ && present_thread_ == id;
+}
+
+uint32_t FramePacer::present_wait_cap_ms(uint32_t max_cap_ms) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (consecutive_unpresented_waits_ == 0) {
+        return max_cap_ms;
+    }
+    const uint32_t frame_ms = std::clamp<uint32_t>(interval_us_ / 1000u, 16u, 33u);
+    return std::min(max_cap_ms, frame_ms);
+}
+
+void FramePacer::note_present_wait_result(bool satisfied) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (satisfied) {
+        consecutive_unpresented_waits_ = 0;
+    } else if (consecutive_unpresented_waits_ < UINT32_MAX) {
+        ++consecutive_unpresented_waits_;
+    }
+}
+
+PresentPlaneColorPlan classify_present_plane_color(uint32_t dxgi_format, uint32_t raw_color_space, bool has_sub_rect,
+                                                   bool is_overlay_plane) {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+    using CS = PresentColorSpace;
+    using TM = PresentTransferMode;
+
+    PresentPlaneColorPlan plan{};
+    const auto d = static_cast<D>(dxgi_format);
+    bool is_float_hdr = false;
+    bool is_hdr10_capable = false;
+    bool is_srgb_resource = false;
+
+    switch (d) {
+    case D::R8G8B8A8_UNORM:
+    case D::R8G8B8A8_TYPELESS:
+        plan.canvas_format = static_cast<uint8_t>(F::Rgba8Unorm);
+        break;
+    case D::R8G8B8A8_UNORM_SRGB:
+        plan.canvas_format = static_cast<uint8_t>(F::Rgba8Unorm);
+        plan.sample_view_format = static_cast<uint8_t>(F::Rgba8Unorm);
+        is_srgb_resource = true;
+        break;
+    case D::B8G8R8A8_UNORM:
+    case D::B8G8R8A8_TYPELESS:
+        plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        break;
+    case D::B8G8R8A8_UNORM_SRGB:
+        plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        plan.sample_view_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        is_srgb_resource = true;
+        break;
+    case D::B8G8R8X8_UNORM:
+    case D::B8G8R8X8_TYPELESS:
+        plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        plan.opaque_alpha = true;
+        break;
+    case D::B8G8R8X8_UNORM_SRGB:
+        plan.canvas_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        plan.sample_view_format = static_cast<uint8_t>(F::Bgra8Unorm);
+        plan.opaque_alpha = true;
+        is_srgb_resource = true;
+        break;
+    case D::R10G10B10A2_UNORM:
+    case D::R10G10B10A2_TYPELESS:
+        plan.canvas_format = static_cast<uint8_t>(F::Rgba8Unorm);
+        is_hdr10_capable = true;
+        break;
+    case D::R16G16B16A16_FLOAT:
+    case D::R16G16B16A16_TYPELESS:
+    case D::R11G11B10_FLOAT:
+        plan.canvas_format = static_cast<uint8_t>(F::Rgba8Unorm);
+        is_float_hdr = true;
+        is_hdr10_capable = true;
+        break;
+    default:
+        return plan;
+    }
+
+    bool non_default_cs = false;
+    switch (static_cast<CS>(raw_color_space)) {
+    case CS::RgbFullG22NoneP709:
+        plan.transfer = is_float_hdr ? TM::LinearHdrToSrgb : TM::PassthroughSrgb;
+        break;
+    case CS::RgbFullG10NoneP709:
+        plan.transfer = is_float_hdr ? TM::LinearHdrToSrgb : TM::LinearSdrToSrgb;
+        non_default_cs = true;
+        break;
+    case CS::RgbStudioG22NoneP709:
+        plan.transfer = is_float_hdr ? TM::LinearHdrToSrgb : TM::StudioSdrToSrgb;
+        non_default_cs = true;
+        break;
+    case CS::RgbStudioG22NoneP2020:
+        plan.transfer = TM::Rec2020StudioG22ToSrgb;
+        non_default_cs = true;
+        break;
+    case CS::RgbFullG2084NoneP2020:
+        if (is_hdr10_capable) {
+            plan.transfer = TM::Hdr10PqToSrgb;
+            non_default_cs = true;
+        } else {
+            plan.transfer = TM::PassthroughSrgb;
+        }
+        break;
+    case CS::RgbStudioG2084NoneP2020:
+        if (is_hdr10_capable) {
+            plan.transfer = TM::Hdr10StudioPqToSrgb;
+            non_default_cs = true;
+        } else {
+            plan.transfer = TM::StudioSdrToSrgb;
+            non_default_cs = true;
+        }
+        break;
+    case CS::RgbFullG22NoneP2020:
+        plan.transfer = TM::Rec2020G22ToSrgb;
+        non_default_cs = true;
+        break;
+    default:
+        // Defensive fallback for unknown/unverified ColorSpace words: infer solely from format.
+        plan.transfer = is_float_hdr ? TM::LinearHdrToSrgb : TM::PassthroughSrgb;
+        break;
+    }
+
+    plan.needs_color_compositor =
+        is_srgb_resource || is_float_hdr || non_default_cs || has_sub_rect || (plan.opaque_alpha && is_overlay_plane);
+    return plan;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Xbox Scarlett 3D helpers (G84): fast clears, predication, async compute sync, VRS/depth bounds
 // ---------------------------------------------------------------------------------------------
@@ -1179,6 +1338,22 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
     uint64_t in = 0;
     token.read(in);
     count(xbox::Counter::FrameWaits);
+    auto mint_token = [&](uint64_t floor_frame) {
+        const uint64_t floor_tok = std::max<uint64_t>(floor_frame, 1);
+        uint64_t prev = last_frame_token_.load(std::memory_order_relaxed);
+        uint64_t out_tok = floor_tok;
+        for (;;) {
+            out_tok = std::max<uint64_t>(floor_tok, prev + 1);
+            if (last_frame_token_.compare_exchange_weak(prev, out_tok, std::memory_order_acq_rel,
+                                                        std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        if (type == 0) {
+            pacer_.record_origin_token(out_tok);
+        }
+        return out_tok;
+    };
     uint64_t frame = 0;
     if (timeout_ms == 0) {
         // Poll: never fails and never blocks (the executable traps if this fails).
@@ -1189,35 +1364,78 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         // the console, where the event means the frame's GPU work is done. Titles reuse that
         // frame's CPU-written memory (upload rings) on it, and our side reads that memory at
         // ExecuteCommandLists, before the frame's PresentX: completing earlier hands the title a
-        // region the frame's submissions have not read yet (G66, #691). A token nobody presents
-        // within kPresentWaitCapMs (a wait on the caller's own future present) falls back to the
-        // pacer tick below and is counted. Other waits (ORIGIN, ...) take at most one interval.
+        // region the frame's submissions have not read yet (G66, #691).
+        //
+        // Safeguards against 2.0 FPS (500 ms/frame) stalls:
+        // 1. Only tokens minted by ORIGIN waits (type 0) can ever be presented — waiting on a
+        //    reused type-2 output token or stale token would stall 500 ms and latch at 2.0 FPS.
+        // 2. Waiting on the thread that calls PresentX for an unpresented token can never be
+        //    satisfied while that thread is blocked, so bypass immediately to the pacer.
+        // 3. Repeated unpresented cross-thread waits back off to one frame interval instead of
+        //    repeatedly burning 500 ms, and avoid sleeping an extra pacer tick after a cap timeout.
         const auto started = std::chrono::steady_clock::now();
         uint64_t after = pacer_.current_frame();
+        bool waited_present_cap = false;
         if (type == 2 && in != 0 && g_present_token_waits.load(std::memory_order_relaxed)) {
             const uint64_t completed = last_present_token.load(std::memory_order_acquire);
             if (completed != 0 && in <= completed) {
                 after = 0;
+                pacer_.note_present_wait_result(true);
             } else if (in > last_frame_token_.load(std::memory_order_acquire)) {
                 // A token never handed out (ahead of every frame): nothing will present it.
                 after = std::min(in, pacer_.current_frame());
+            } else if (!pacer_.is_recent_origin_token(in)) {
+                // Not an ORIGIN-minted token (e.g. a reused WaitFrameEventX(PRESENT) output token
+                // or an evicted ancient token): PresentX will never receive it.
+                after = std::min(in, pacer_.current_frame());
+                count(xbox::Counter::PresentWaitsNonOriginToken);
+                count(xbox::Counter::PresentWaitsUnpresented);
+            } else if (pacer_.is_present_thread(std::this_thread::get_id())) {
+                // The PresentX thread itself cannot present `in` while blocked here.
+                after = std::min(in, pacer_.current_frame());
+                count(xbox::Counter::PresentWaitsSelfThread);
+                count(xbox::Counter::PresentWaitsUnpresented);
             } else {
-                const uint32_t bound = timeout_ms == kInfinite
-                                           ? kPresentWaitCapMs
-                                           : std::min<uint32_t>(timeout_ms, kPresentWaitCapMs);
+                const uint32_t cap = pacer_.present_wait_cap_ms(kPresentWaitCapMs);
+                const uint32_t bound =
+                    timeout_ms == kInfinite ? cap : std::min<uint32_t>(timeout_ms, cap);
                 if (wait_present_token(in, bound)) {
                     after = 0;
+                    pacer_.note_present_wait_result(true);
                     count(xbox::Counter::PresentWaitsSatisfied);
                 } else {
                     after = std::min(in, pacer_.current_frame());
+                    pacer_.note_present_wait_result(false);
                     count(xbox::Counter::PresentWaitsUnpresented);
+                    waited_present_cap = true;
                 }
             }
         }
-        // A satisfied PRESENT token (after == 0) ends at once; every other wait ends on a tick, once per
-        // tick per event kind (FramePacer::wait_event).
-        const auto r = after == 0 ? pacer_.wait_after(0, timeout_ms, &frame)
-                                  : pacer_.wait_event(type, timeout_ms, &frame);
+        // A satisfied PRESENT token (after == 0) ends at once; every other wait ends on a tick,
+        // once per tick per event kind (FramePacer::wait_event), without double-sleeping after a
+        // present-wait timeout.
+        xbox::FramePacer::WaitResult r = xbox::FramePacer::WaitResult::Ok;
+        if (after == 0) {
+            r = pacer_.wait_after(0, timeout_ms, &frame);
+        } else if (waited_present_cap) {
+            const uint64_t elapsed_us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+                    .count());
+            if (timeout_ms != kInfinite && elapsed_us >= uint64_t{timeout_ms} * 1000u) {
+                frame = std::max<uint64_t>(pacer_.current_frame(), 1);
+                r = xbox::FramePacer::WaitResult::Timeout;
+            } else if (elapsed_us >= pacer_.interval_us() || pacer_.is_shut_down()) {
+                r = pacer_.wait_after(0, 0, &frame);
+            } else {
+                const uint32_t remaining_ms =
+                    timeout_ms == kInfinite
+                        ? kInfinite
+                        : static_cast<uint32_t>(timeout_ms - elapsed_us / 1000u);
+                r = pacer_.wait_event(type, remaining_ms, &frame);
+            }
+        } else {
+            r = pacer_.wait_event(type, timeout_ms, &frame);
+        }
         g_frame_waits.fetch_add(1, std::memory_order_relaxed);
         g_frame_wait_us.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                                             std::chrono::steady_clock::now() - started)
@@ -1228,8 +1446,7 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
             count(xbox::Counter::FrameWaitTimeouts);
             // Only the origin wait with flag 2 gets a fresh token on a timeout; other waits leave it.
             if (type == 0 && (flags & 2) != 0) {
-                token.write(std::max<uint64_t>(std::max<uint64_t>(frame, 1),
-                                               last_frame_token_.load(std::memory_order_acquire)));
+                token.write(mint_token(frame));
             }
             // A timed-out wait is not a failure: S_FALSE, as a WaitForSingleObject-style timeout
             // (titles trap on a failed HRESULT from this call).
@@ -1237,21 +1454,14 @@ HResult Device::WaitFrameEventX(uint32_t type, uint32_t timeout_ms, uint64_t, ui
         }
     }
     // Always hand out a strictly monotonic, non-zero D3D12XBOX_FRAME_PIPELINE_TOKEN.
-    const uint64_t floor_tok = std::max<uint64_t>(frame, 1);
-    uint64_t prev = last_frame_token_.load(std::memory_order_relaxed);
-    uint64_t out_tok = floor_tok;
-    for (;;) {
-        out_tok = std::max<uint64_t>(floor_tok, prev + 1);
-        if (last_frame_token_.compare_exchange_weak(prev, out_tok, std::memory_order_acq_rel,
-                                                    std::memory_order_relaxed)) {
-            break;
-        }
-    }
-    token.write(out_tok);
+    token.write(mint_token(frame));
     return kSOk;
 }
 
 void Device::note_present_token(uint64_t token) {
+    if (token == 0 || token == UINT64_MAX) {
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
         uint64_t prev = last_present_token.load(std::memory_order_relaxed);
@@ -1265,7 +1475,8 @@ void Device::note_present_token(uint64_t token) {
 bool Device::wait_present_token(uint64_t token, uint32_t timeout_ms) {
     std::unique_lock<std::mutex> lock(present_mutex_);
     auto presented = [&] {
-        return present_shutdown_ || last_present_token.load(std::memory_order_acquire) >= token;
+        return present_shutdown_ || pacer_.is_shut_down() ||
+               last_present_token.load(std::memory_order_acquire) >= token;
     };
     if (timeout_ms == kInfiniteFrameWait) {
         present_cv_.wait(lock, presented);
@@ -1867,32 +2078,445 @@ HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext& ctx
     return kSOk;
 }
 
+namespace {
+
+constexpr std::string_view kColorPresentVs = R"(struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+  let x = f32((i << 1u) & 2u);
+  let y = f32(i & 2u);
+  var o: VsOut;
+  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+  o.uv = vec2<f32>(x, y);
+  return o;
+}
+)";
+
+constexpr std::string_view kColorPresentRectVs = R"(struct RectUniform {
+  uv_rect: vec4<f32>,
+};
+@group(0) @binding(2) var<uniform> u_rect: RectUniform;
+struct VsOut {
+  @builtin(position) pos: vec4<f32>,
+  @location(0) uv: vec2<f32>,
+};
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {
+  let x = f32((i << 1u) & 2u);
+  let y = f32(i & 2u);
+  var o: VsOut;
+  o.pos = vec4<f32>(x * 2.0 - 1.0, 1.0 - y * 2.0, 0.0, 1.0);
+  o.uv = u_rect.uv_rect.xy + vec2<f32>(x, y) * u_rect.uv_rect.zw;
+  return o;
+}
+)";
+
+std::string build_color_present_fs(xbox::PresentTransferMode mode, bool opaque_alpha) {
+    using TM = xbox::PresentTransferMode;
+    std::string wgsl =
+        "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+        "@group(0) @binding(1) var smp: sampler;\n";
+    if (mode == TM::PassthroughSrgb) {
+        if (opaque_alpha) {
+            wgsl +=
+                "@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n"
+                "  let c = textureSampleLevel(src, smp, uv, 0.0);\n"
+                "  return vec4<f32>(c.rgb, 1.0);\n"
+                "}\n";
+        } else {
+            wgsl +=
+                "@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n"
+                "  return textureSampleLevel(src, smp, uv, 0.0);\n"
+                "}\n";
+        }
+        return wgsl;
+    }
+
+    wgsl +=
+        "fn linear_to_srgb(lin: vec3<f32>) -> vec3<f32> {\n"
+        "  let c = clamp(lin, vec3<f32>(0.0), vec3<f32>(1.0));\n"
+        "  let lo = c * 12.92;\n"
+        "  let hi = 1.055 * pow(max(c, vec3<f32>(0.0031308)), vec3<f32>(1.0 / 2.4)) - vec3<f32>(0.055);\n"
+        "  return select(hi, lo, c <= vec3<f32>(0.0031308));\n"
+        "}\n";
+
+    if (mode == TM::Rec2020G22ToSrgb || mode == TM::Rec2020StudioG22ToSrgb) {
+        wgsl +=
+            "fn srgb_to_linear(s: vec3<f32>) -> vec3<f32> {\n"
+            "  let c = clamp(s, vec3<f32>(0.0), vec3<f32>(1.0));\n"
+            "  let lo = c / 12.92;\n"
+            "  let hi = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));\n"
+            "  return select(hi, lo, c <= vec3<f32>(0.04045));\n"
+            "}\n";
+    }
+    if (mode == TM::LinearHdrToSrgb || mode == TM::Hdr10PqToSrgb || mode == TM::Hdr10StudioPqToSrgb) {
+        wgsl +=
+            "fn tonemap_soft_knee(lin: vec3<f32>) -> vec3<f32> {\n"
+            "  let c = max(lin, vec3<f32>(0.0));\n"
+            "  let peak = max(c.r, max(c.g, c.b));\n"
+            "  if (peak <= 0.9) {\n"
+            "    return c;\n"
+            "  }\n"
+            "  let mapped = 0.9 + 0.1 * tanh((peak - 0.9) / 0.1);\n"
+            "  return c * (mapped / peak);\n"
+            "}\n";
+    }
+    if (mode == TM::Hdr10PqToSrgb || mode == TM::Hdr10StudioPqToSrgb) {
+        wgsl +=
+            "fn pq_to_linear_sdr(pq: vec3<f32>) -> vec3<f32> {\n"
+            "  let c = clamp(pq, vec3<f32>(0.0), vec3<f32>(1.0));\n"
+            "  let m1 = 0.1593017578125;\n"
+            "  let m2 = 78.84375;\n"
+            "  let c1 = 0.8359375;\n"
+            "  let c2 = 18.8515625;\n"
+            "  let c3 = 18.6875;\n"
+            "  let n = pow(max(c, vec3<f32>(1e-7)), vec3<f32>(1.0 / m2));\n"
+            "  let num = max(n - vec3<f32>(c1), vec3<f32>(0.0));\n"
+            "  let den = max(vec3<f32>(c2) - vec3<f32>(c3) * n, vec3<f32>(1e-6));\n"
+            "  return pow(num / den, vec3<f32>(1.0 / m1)) * (10000.0 / 203.0);\n"
+            "}\n";
+    }
+    if (mode == TM::Hdr10PqToSrgb || mode == TM::Hdr10StudioPqToSrgb || mode == TM::Rec2020G22ToSrgb ||
+        mode == TM::Rec2020StudioG22ToSrgb) {
+        wgsl +=
+            "fn rec2020_to_rec709(rgb: vec3<f32>) -> vec3<f32> {\n"
+            "  let r =  1.6604910 * rgb.r - 0.5876411 * rgb.g - 0.0728499 * rgb.b;\n"
+            "  let g = -0.1245505 * rgb.r + 1.1328999 * rgb.g - 0.0083494 * rgb.b;\n"
+            "  let b = -0.0181508 * rgb.r - 0.1005789 * rgb.g + 1.1187297 * rgb.b;\n"
+            "  return max(vec3<f32>(r, g, b), vec3<f32>(0.0));\n"
+            "}\n";
+    }
+
+    wgsl += "fn convert_rgb(rgb: vec3<f32>) -> vec3<f32> {\n";
+    switch (mode) {
+    case TM::LinearSdrToSrgb:
+        wgsl += "  return linear_to_srgb(rgb);\n";
+        break;
+    case TM::LinearHdrToSrgb:
+        wgsl += "  return linear_to_srgb(tonemap_soft_knee(rgb));\n";
+        break;
+    case TM::Hdr10PqToSrgb:
+        wgsl += "  return linear_to_srgb(tonemap_soft_knee(rec2020_to_rec709(pq_to_linear_sdr(rgb))));\n";
+        break;
+    case TM::Hdr10StudioPqToSrgb:
+        wgsl +=
+            "  let full = clamp((rgb - vec3<f32>(64.0 / 1023.0)) * (1023.0 / 876.0), vec3<f32>(0.0), vec3<f32>(1.0));\n"
+            "  return linear_to_srgb(tonemap_soft_knee(rec2020_to_rec709(pq_to_linear_sdr(full))));\n";
+        break;
+    case TM::StudioSdrToSrgb:
+        wgsl += "  return clamp((rgb - vec3<f32>(16.0 / 255.0)) * (255.0 / 219.0), vec3<f32>(0.0), vec3<f32>(1.0));\n";
+        break;
+    case TM::Rec2020G22ToSrgb:
+        wgsl += "  return linear_to_srgb(rec2020_to_rec709(srgb_to_linear(rgb)));\n";
+        break;
+    case TM::Rec2020StudioG22ToSrgb:
+        wgsl +=
+            "  let full = clamp((rgb - vec3<f32>(16.0 / 255.0)) * (255.0 / 219.0), vec3<f32>(0.0), vec3<f32>(1.0));\n"
+            "  return linear_to_srgb(rec2020_to_rec709(srgb_to_linear(full)));\n";
+        break;
+    default:
+        wgsl += "  return rgb;\n";
+        break;
+    }
+    wgsl += "}\n";
+
+    wgsl += "@fragment fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {\n";
+    wgsl += "  let c = textureSampleLevel(src, smp, uv, 0.0);\n";
+    if (opaque_alpha) {
+        wgsl += "  return vec4<f32>(convert_rgb(c.rgb), 1.0);\n";
+    } else {
+        wgsl +=
+            "  let a = clamp(c.a, 0.0, 1.0);\n"
+            "  if (a <= 1e-5) {\n"
+            "    return vec4<f32>(0.0, 0.0, 0.0, 0.0);\n"
+            "  }\n"
+            "  return vec4<f32>(convert_rgb(c.rgb / a) * a, a);\n";
+    }
+    wgsl += "}\n";
+    return wgsl;
+}
+
+struct PreparedPresentPlane {
+    uint32_t texture_id = 0;
+    uint32_t dxgi_format = 0;
+    uint32_t color_space = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool has_sub_rect = false;
+    float uv_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};  // u0, v0, du, dv
+    xbox::PresentPlaneColorPlan plan{};
+};
+
+uint32_t emit_color_managed_present_planes(Device* device, std::span<const PreparedPresentPlane> planes,
+                                           CommandEncoder& enc) {
+    // Draw bottom-up (last plane first, opaque; upper planes blended premultiplied alpha over).
+    std::vector<const PreparedPresentPlane*> order;
+    uint8_t canvas_format = 0;
+    for (size_t i = planes.size(); i-- > 0;) {
+        const PreparedPresentPlane& p = planes[i];
+        if (p.texture_id == 0 || p.plan.canvas_format == 0) {
+            continue;
+        }
+        if (order.empty()) {
+            canvas_format = p.plan.canvas_format;
+        }
+        order.push_back(&p);
+    }
+    if (order.empty()) {
+        return 0;
+    }
+
+    xbox::PresentColorBlitCache& c = device->frame_pacer().present_color_cache();
+    std::lock_guard<std::mutex> lock(c.mutex);
+
+    if (c.vs == 0) {
+        c.vs = device->allocate_id();
+        enc.create_shader_module(c.vs, GpuShaderStage::Vertex, kColorPresentVs);
+        GpuBindGroupLayoutEntry entries[2] = {};
+        entries[0].binding = 0;
+        entries[0].visibility = GpuShaderStageBits::Fragment;
+        entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entries[0].binding_type = static_cast<uint8_t>(GpuTextureSampleType::Float);
+        entries[0].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entries[1].binding = 1;
+        entries[1].visibility = GpuShaderStageBits::Fragment;
+        entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
+        entries[1].binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Filtering);
+        c.group_layout = device->allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.group_layout;
+        layout.entry_count = 2;
+        enc.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        c.pipeline_layout = device->allocate_id();
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = c.pipeline_layout;
+        pl.bind_group_layout_count = 1;
+        enc.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+        c.sampler = device->allocate_id();
+        GpuCreateSampler2Payload s{};
+        s.id = c.sampler;
+        s.mag_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+        s.min_filter = static_cast<uint8_t>(GpuFilterMode::Linear);
+        s.mipmap_filter = static_cast<uint8_t>(GpuFilterMode::Nearest);
+        s.max_anisotropy = 1;
+        s.lod_max_clamp = 32.0f;
+        enc.emit_packet(GpuOpcode::CreateSampler2, &s, sizeof(s));
+    }
+
+    auto ensure_rect_resources = [&] {
+        if (c.vs_rect != 0) {
+            return;
+        }
+        c.vs_rect = device->allocate_id();
+        enc.create_shader_module(c.vs_rect, GpuShaderStage::Vertex, kColorPresentRectVs);
+        GpuBindGroupLayoutEntry entries[3] = {};
+        entries[0].binding = 0;
+        entries[0].visibility = GpuShaderStageBits::Fragment;
+        entries[0].type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entries[0].binding_type = static_cast<uint8_t>(GpuTextureSampleType::Float);
+        entries[0].view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        entries[1].binding = 1;
+        entries[1].visibility = GpuShaderStageBits::Fragment;
+        entries[1].type = static_cast<uint8_t>(GpuBindingLayoutType::Sampler);
+        entries[1].binding_type = static_cast<uint8_t>(GpuSamplerBindingType::Filtering);
+        entries[2].binding = 2;
+        entries[2].visibility = GpuShaderStageBits::Vertex;
+        entries[2].type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+        entries[2].binding_type = static_cast<uint8_t>(GpuBufferBindingType::Uniform);
+        entries[2].min_binding_size = 16;
+        c.rect_group_layout = device->allocate_id();
+        GpuCreateBindGroupLayoutPayload layout{};
+        layout.id = c.rect_group_layout;
+        layout.entry_count = 3;
+        enc.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), entries, sizeof(entries));
+        c.rect_pipeline_layout = device->allocate_id();
+        GpuCreatePipelineLayoutPayload pl{};
+        pl.id = c.rect_pipeline_layout;
+        pl.bind_group_layout_count = 1;
+        enc.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.rect_group_layout, sizeof(uint32_t));
+        c.rect_uniform_buf = device->allocate_id();
+        enc.create_buffer(c.rect_uniform_buf, GpuBufferUsage::Uniform | GpuBufferUsage::CopyDst,
+                          uint64_t{kMaxPlanes} * 256u);
+    };
+
+    auto fs_for = [&](xbox::PresentTransferMode mode, bool opaque_alpha) {
+        const size_t idx = (static_cast<size_t>(mode) << 1) | (opaque_alpha ? 1u : 0u);
+        uint32_t& id = c.fs[idx];
+        if (id == 0) {
+            id = device->allocate_id();
+            enc.create_shader_module(id, GpuShaderStage::Fragment, build_color_present_fs(mode, opaque_alpha));
+        }
+        return id;
+    };
+
+    auto pipeline_for = [&](xbox::PresentTransferMode mode, bool opaque_alpha, bool blended, bool use_rect) {
+        const uint32_t key = (uint32_t{canvas_format} << 8) | (uint32_t{static_cast<uint8_t>(mode)} << 3) |
+                             (opaque_alpha ? 4u : 0u) | (blended ? 2u : 0u) | (use_rect ? 1u : 0u);
+        uint32_t& pipeline = c.pipelines[key];
+        if (pipeline == 0) {
+            pipeline = device->allocate_id();
+            GpuCreateRenderPipeline2Payload p{};
+            p.id = pipeline;
+            p.vs_module_id = use_rect ? c.vs_rect : c.vs;
+            p.fs_module_id = fs_for(mode, opaque_alpha);
+            p.pipeline_layout_id = use_rect ? c.rect_pipeline_layout : c.pipeline_layout;
+            p.key.color_target_count = 1;
+            GpuColorTargetKey& t = p.key.color_targets[0];
+            t.format = canvas_format;
+            t.write_mask = 0xF;
+            if (blended) {  // premultiplied alpha over the planes below
+                t.blend_enabled = 1;
+                t.color = {static_cast<uint8_t>(pso::WgpuBlendOperation::Add),
+                           static_cast<uint8_t>(pso::WgpuBlendFactor::One),
+                           static_cast<uint8_t>(pso::WgpuBlendFactor::OneMinusSrcAlpha), 0};
+                t.alpha = t.color;
+            }
+            p.key.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+            p.key.multisample.count = 1;
+            p.key.multisample.mask = 0xFFFFFFFFu;
+            enc.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+        }
+        return pipeline;
+    };
+
+    auto group_for = [&](const PreparedPresentPlane& plane, size_t slot_index) {
+        if (plane.has_sub_rect) {
+            ensure_rect_resources();
+            const uint32_t uniform_offset = static_cast<uint32_t>(slot_index) * 256u;
+            enc.write_buffer(c.rect_uniform_buf, uniform_offset, plane.uv_rect, sizeof(plane.uv_rect));
+            const uint64_t key = (uint64_t{plane.texture_id} << 16) | (uint64_t{plane.plan.sample_view_format} << 8) |
+                                 (uint64_t{0x80u} | static_cast<uint64_t>(slot_index & 0x7Fu));
+            auto& entry = c.groups[key];
+            if (entry.group_id == 0 || entry.width != plane.width || entry.height != plane.height ||
+                entry.dxgi_format != plane.dxgi_format) {
+                entry.group_id = device->allocate_id();
+                entry.width = plane.width;
+                entry.height = plane.height;
+                entry.dxgi_format = plane.dxgi_format;
+                GpuBindGroupEntry2 e[3] = {};
+                e[0].binding = 0;
+                e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+                e[0].resource_id = plane.texture_id;
+                e[0].view.format = plane.plan.sample_view_format;
+                e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+                e[0].view.mip_level_count = 1;
+                e[0].view.array_layer_count = 1;
+                e[1].binding = 1;
+                e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
+                e[1].resource_id = c.sampler;
+                e[2].binding = 2;
+                e[2].resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+                e[2].resource_id = c.rect_uniform_buf;
+                e[2].offset = uniform_offset;
+                e[2].size = sizeof(plane.uv_rect);
+                GpuCreateBindGroup2Payload g{};
+                g.id = entry.group_id;
+                g.layout_id = c.rect_group_layout;
+                g.entry_count = 3;
+                enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+            }
+            return entry.group_id;
+        }
+        const uint64_t key = (uint64_t{plane.texture_id} << 16) | (uint64_t{plane.plan.sample_view_format} << 8);
+        auto& entry = c.groups[key];
+        if (entry.group_id == 0 || entry.width != plane.width || entry.height != plane.height ||
+            entry.dxgi_format != plane.dxgi_format) {
+            entry.group_id = device->allocate_id();
+            entry.width = plane.width;
+            entry.height = plane.height;
+            entry.dxgi_format = plane.dxgi_format;
+            GpuBindGroupEntry2 e[2] = {};
+            e[0].binding = 0;
+            e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+            e[0].resource_id = plane.texture_id;
+            e[0].view.format = plane.plan.sample_view_format;
+            e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+            e[0].view.mip_level_count = 1;
+            e[0].view.array_layer_count = 1;
+            e[1].binding = 1;
+            e[1].resource_type = static_cast<uint32_t>(GpuBindResourceType::Sampler);
+            e[1].resource_id = c.sampler;
+            GpuCreateBindGroup2Payload g{};
+            g.id = entry.group_id;
+            g.layout_id = c.group_layout;
+            g.entry_count = 2;
+            enc.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        }
+        return entry.group_id;
+    };
+
+    std::vector<std::pair<uint32_t, uint32_t>> draws;
+    draws.reserve(order.size());
+    for (size_t k = 0; k < order.size(); ++k) {
+        const PreparedPresentPlane& plane = *order[k];
+        if (plane.has_sub_rect) {
+            ensure_rect_resources();
+        }
+        const uint32_t pipeline =
+            pipeline_for(plane.plan.transfer, plane.plan.opaque_alpha, /*blended=*/k > 0, plane.has_sub_rect);
+        draws.emplace_back(pipeline, group_for(plane, k));
+    }
+
+    GpuBeginRenderPassPayload pass{};
+    pass.color_count = 1;
+    pass.color[0].texture_id = kGpuSwapchainTextureId;
+    pass.color[0].load_op = static_cast<uint8_t>(GpuLoadOp::Clear);
+    pass.color[0].store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+    pass.color[0].view.format = canvas_format;
+    pass.color[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+    pass.color[0].view.mip_level_count = 1;
+    pass.color[0].view.array_layer_count = 1;
+    pass.color[0].clear_value[3] = 1.0f;
+    enc.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+    for (const auto& [pipeline, group] : draws) {
+        enc.set_pipeline(pipeline);
+        GpuSetBindGroup2Payload set{};
+        set.group_index = 0;
+        set.bind_group_id = group;
+        enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+        enc.draw(3);
+    }
+    enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+    return static_cast<uint32_t>(order.size());
+}
+
+}  // namespace
+
 HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t parameters) {
+    device_->frame_pacer().note_present_thread(std::this_thread::get_id());
     if (plane_count == 0) {
         device_->count(xbox::Counter::PresentsWithoutPlanes);
+        // A suspend/flush PresentX(0) still completes any in-flight executed frame token so
+        // cross-thread PRESENT waiters do not hang on a flushed frame.
+        const uint64_t exec_tok = device_->last_execute_token.load(std::memory_order_acquire);
+        if (exec_tok != 0 && exec_tok != UINT64_MAX) {
+            device_->note_present_token(exec_tok);
+        }
         return kSOk;
     }
-    xbox::GuestPresentPlaneX plane{};
-    if (plane_count > kMaxPlanes || planes == 0 || !com::read_guest(planes, plane)) {
+    std::array<xbox::GuestPresentPlaneX, kMaxPlanes> guest_planes{};
+    if (plane_count > kMaxPlanes || planes == 0 || !com::read_guest(planes, guest_planes[0])) {
         device_->note_bad_argument("PresentX: unreadable plane array (" + std::to_string(plane_count) + " planes)");
         return kEInvalidArg;
     }
-    // Every plane's texture is drawn into the canvas at the Present (Device::present), every
-    // frame: titles alternate back buffers whose render-target views predate the present, and
-    // compose the frame from several planes (e.g. a 4K scene plane under a 1080p overlay plane).
-    // Each plane contributes its first resource, full screen.
+    // Every plane's texture is drawn into the canvas at the Present, every frame: titles alternate
+    // back buffers whose render-target views predate the present, and compose the frame from
+    // several planes (e.g. a 4K scene plane under a 1080p overlay plane).
     std::array<uint32_t, kMaxPlanes> textures{};
-    uint64_t max_token = plane.Token;
+    std::array<PreparedPresentPlane, kMaxPlanes> prepared{};
+    uint64_t max_token = 0;
+    bool use_color_compositor = false;
     for (uint32_t i = 0; i < plane_count; ++i) {
-        xbox::GuestPresentPlaneX p{};
-        uint64_t resource = 0;
-        if (!com::read_guest(planes + uint64_t{i} * sizeof(p), p)) {
+        xbox::GuestPresentPlaneX& p = guest_planes[i];
+        if (i > 0 && !com::read_guest(planes + uint64_t{i} * sizeof(p), p)) {
             device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " descriptor is unreadable");
             continue;
         }
-        if (p.Token > max_token) {
+        if (p.Token != 0 && p.Token != UINT64_MAX && p.Token > max_token) {
             max_token = p.Token;
         }
+        uint64_t resource = 0;
         if (p.ResourceCount == 0 || p.ppResources == 0 ||
             !com::read_guest(p.ppResources, &resource, sizeof(resource)) || resource == 0) {
             device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " has no readable resource");
@@ -1911,14 +2535,98 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
             continue;
         }
         textures[i] = res->id();
+
+        bridge::TextureInfo info{};
+        if (!device_->state_bridge().texture_info(res->id(), &info) || info.swapchain ||
+            info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
+            continue;
+        }
+        bool has_sub_rect = false;
+        float uv_rect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        if (p.pSrcRects != 0 && info.width > 0 && info.height > 0) {
+            xbox::PresentRect rect{};
+            if (com::read_guest(p.pSrcRects, rect) && rect.left >= 0 && rect.top >= 0 && rect.right > rect.left &&
+                rect.bottom > rect.top && static_cast<uint32_t>(rect.right) <= info.width &&
+                static_cast<uint32_t>(rect.bottom) <= info.height &&
+                (rect.left > 0 || rect.top > 0 || static_cast<uint32_t>(rect.right) < info.width ||
+                 static_cast<uint32_t>(rect.bottom) < info.height)) {
+                has_sub_rect = true;
+                uv_rect[0] = static_cast<float>(rect.left) / static_cast<float>(info.width);
+                uv_rect[1] = static_cast<float>(rect.top) / static_cast<float>(info.height);
+                uv_rect[2] = static_cast<float>(rect.right - rect.left) / static_cast<float>(info.width);
+                uv_rect[3] = static_cast<float>(rect.bottom - rect.top) / static_cast<float>(info.height);
+            }
+        }
+        const bool is_overlay = (i + 1 < plane_count);
+        const xbox::PresentPlaneColorPlan plan =
+            xbox::classify_present_plane_color(res->desc().Format, p.ColorSpace, has_sub_rect, is_overlay);
+        if (plan.canvas_format != 0) {
+            PreparedPresentPlane& pp = prepared[i];
+            pp.texture_id = res->id();
+            pp.dxgi_format = res->desc().Format;
+            pp.color_space = p.ColorSpace;
+            pp.width = info.width;
+            pp.height = info.height;
+            pp.has_sub_rect = has_sub_rect;
+            std::memcpy(pp.uv_rect, uv_rect, sizeof(uv_rect));
+            pp.plan = plan;
+            if (plan.needs_color_compositor) {
+                use_color_compositor = true;
+            }
+        }
     }
     device_->count(xbox::Counter::PresentsWithPlanes);
     if (plane_count > 1) {
         device_->count(xbox::Counter::MultiPlanePresents);
     }
-    const uint32_t drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
+    uint32_t drawn = 0;
+    if (use_color_compositor) {
+        auto& cache = device_->frame_pacer().present_color_cache();
+        bool should_log = false;
+        {
+            std::lock_guard<std::mutex> lock(cache.mutex);
+            if (!cache.logged_color_profile) {
+                cache.logged_color_profile = true;
+                should_log = true;
+            }
+        }
+        if (should_log) {
+            std::string summary = "d3d12_xs: PresentX color-managed composition (" + std::to_string(plane_count) +
+                                  " plane(s)):";
+            for (uint32_t i = 0; i < plane_count; ++i) {
+                if (prepared[i].texture_id == 0) {
+                    continue;
+                }
+                summary += " [p" + std::to_string(i) + " dxgi=" + std::to_string(prepared[i].dxgi_format) +
+                           " cs=" + std::to_string(prepared[i].color_space) +
+                           " transfer=" + std::to_string(static_cast<uint32_t>(prepared[i].plan.transfer)) +
+                           " canvas=" + std::to_string(prepared[i].plan.canvas_format) +
+                           " view=" + std::to_string(prepared[i].plan.sample_view_format) +
+                           (prepared[i].has_sub_rect ? " subrect" : "") + "]";
+            }
+            os::log(summary);
+        }
+        CommandEncoder color_enc;
+        drawn = emit_color_managed_present_planes(
+            device_.get(), std::span<const PreparedPresentPlane>(prepared.data(), plane_count), color_enc);
+        if (!color_enc.empty()) {
+            device_->submit(color_enc);
+        }
+        (void)device_->present({});
+        device_->count(xbox::Counter::PresentColorManagedPresents);
+    } else {
+        drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
+    }
     // The frame is done on our side once its Present has been handed off (its submissions and their
     // CPU-visible buffer snapshots came before): PRESENT waits for this token may complete now.
+    // If all planes passed Token == 0 (D3D12XBOX_FRAME_PIPELINE_TOKEN_NULL), fall back to the
+    // latest ExecuteCommandListsX frame token so waiters are not stranded at 2.0 FPS.
+    if (max_token == 0) {
+        const uint64_t exec_tok = device_->last_execute_token.load(std::memory_order_acquire);
+        if (exec_tok != 0 && exec_tok != UINT64_MAX) {
+            max_token = exec_tok;
+        }
+    }
     if (max_token != 0) {
         device_->note_present_token(max_token);
     }
