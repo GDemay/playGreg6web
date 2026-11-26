@@ -636,6 +636,7 @@ void test_string_compare_and_locale() {
     CHECK(pg6_win32_compare_string_ordinal(nullptr, 0, u"a", 1, 0) == 0);
 
     char16_t buf[16];
+    CHECK(pg6_win32_set_host_locale("en-US"));  // pin: the host environment must not leak in
     CHECK(pg6_win32_get_user_default_locale_name(buf, 16) == 6 && std::u16string(buf) == u"en-US");
     CHECK(pg6_win32_get_user_default_locale_name(buf, 5) == 0);
     CHECK(GetLastError() == ERROR_INSUFFICIENT_BUFFER);
@@ -643,6 +644,14 @@ void test_string_compare_and_locale() {
     CHECK(pg6_win32_get_user_default_geo_name(buf, 16) == 3 && std::u16string(buf) == u"US");
     CHECK(pg6_win32_get_user_default_geo_name(nullptr, 0) == 3);
     CHECK(pg6_win32_get_user_default_geo_name(buf, 2) == 0);
+    // Host locale override: identity answers follow it, unknown names fall back to en-US.
+    CHECK(pg6_win32_set_host_locale("de_DE.UTF-8"));
+    CHECK(pg6_win32_get_user_default_locale_name(buf, 16) == 6 && std::u16string(buf) == u"de-DE");
+    CHECK(pg6_win32_get_user_default_geo_name(buf, 16) == 3 && std::u16string(buf) == u"DE");
+    CHECK(pg6_win32_locale_name_to_lcid(nullptr, 0) == 0x0407);
+    CHECK(!pg6_win32_set_host_locale("xx-ZZ"));
+    CHECK(pg6_win32_get_user_default_locale_name(buf, 16) == 6 && std::u16string(buf) == u"en-US");
+    CHECK(pg6_win32_locale_name_to_lcid(nullptr, 0) == 0x0409);
     CHECK(pg6_win32_locale_name_to_lcid(u"en-US", 0) == 0x0409);
     CHECK(pg6_win32_locale_name_to_lcid(u"EN-gb", 0) == 0x0809);
     CHECK(pg6_win32_locale_name_to_lcid(nullptr, 0) == 0x0409);
