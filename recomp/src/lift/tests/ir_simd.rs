@@ -267,6 +267,35 @@ fn random_sse_byte_sequences_never_panic() {
 }
 
 #[test]
+fn r61_supported_non_trapping_simd_never_traps_on_random_sse() {
+    use crate::lift::function::simd::is_supported_non_trapping_simd;
+    let functions = random_sse_program(800);
+    let mut checked = 0usize;
+    for func in functions.values() {
+        let lifted = lift_function(func).expect("lifts");
+        let trapped_addrs: std::collections::BTreeSet<u64> =
+            lifted.unsupported.iter().map(|u| u.address).collect();
+        for block in func.blocks.values() {
+            for ins in &block.instructions {
+                if is_supported_non_trapping_simd(ins) {
+                    checked += 1;
+                    assert!(
+                        !trapped_addrs.contains(&ins.ip()),
+                        "is_supported_non_trapping_simd accepted an instruction that trapped: {ins} ({:?}) at {:#x}",
+                        ins.code(),
+                        ins.ip()
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 100,
+        "expected >100 checked SIMD instructions, got {checked}"
+    );
+}
+
+#[test]
 fn r59_simd_vector_lowering_avoids_scalar_loops() {
     use crate::lift::target::LiftTarget;
 

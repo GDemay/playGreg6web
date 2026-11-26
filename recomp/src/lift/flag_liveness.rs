@@ -30,29 +30,33 @@
 //!
 //! # Registers a callee never touches
 //!
-//! The same summaries also record, per function, the guest state a call to it may touch: the
-//! general purpose registers read or written by any instruction it or a direct callee may execute,
-//! plus one bit ([`OTHER_STATE`]) for everything else (vector registers, and any way the state can
-//! be observed as a whole: an instruction the pass does not model, an indirect call or jump, a
-//! call outside the analysed set, a trap, invalid code, a non-returning call). The analysis is
-//! flow-insensitive (the union over every block of the function) and the least fixed point over
-//! the call graph. A register outside that set is neither read nor written by the callee, and
-//! nothing can look at `%state` while it runs, since every such place sets every bit: a caller
-//! keeps the register in SSA across a direct call instead of storing it before and reloading it
-//! after, and skips the vector registers when [`OTHER_STATE`] is clear. The stale copy in
-//! `%state` is refreshed by the caller's next full write-back (its return, tail jump, indirect
-//! call, helper or trap) or by the store before a call that may touch it. A host fault (wasm
-//! out-of-bounds access, native access violation) inside such a callee is fatal, not a guest
-//! exception, so no unwinder or handler ever reads the stale copy.
+//! The same summaries also record, per function, the guest state a call to it may touch:
+//! - bits `0..15`: general purpose registers `rax..r15`,
+//! - bits `16..31`: `xmm0..xmm15` (low 128 bits of `ymm0..15`),
+//! - bits `32..47`: `ymmh0..ymmh15` (upper 128 bits of `ymm0..15`, including VEX-128 zeroing),
+//! - bit `48` ([`OTHER_STATE`]): non-GPR/non-vector state (`mxcsr`, etc.) and any whole-state
+//!   observation (an instruction the pass does not model, an indirect call or jump, a call outside
+//!   the analysed set, a trap, invalid code, a non-returning call — which set [`ALL_STATE`]).
+//!
+//! The analysis is flow-insensitive (the union over every block of the function) and the least
+//! fixed point over the call graph. A register outside that set is neither read nor written by
+//! the callee, and nothing can look at `%state` while it runs, since every such place sets every
+//! bit: a caller keeps untouched GPRs, XMMs and YMM upper halves in its allocas across a direct
+//! call instead of storing them before and reloading them after. The stale copy in `%state` is
+//! refreshed by the caller's next full write-back (its return, tail jump, indirect call, helper
+//! or trap) or by the store before a call that may touch it. A host fault (wasm out-of-bounds
+//! access, native access violation) inside such a callee is fatal, not a guest exception, so no
+//! unwinder or handler ever reads the stale copy.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use iced_x86::{
-    Code, ConditionCode, Instruction, InstructionInfoFactory, Mnemonic, OpKind, Register,
+    Code, ConditionCode, EncodingKind, Instruction, InstructionInfoFactory, Mnemonic, OpKind,
+    Register,
 };
 
 use super::memory_access::WindowBurst;
-use super::{FLAGS, ends_in_transfer, is_immediate, mask};
+use super::{FLAGS, ends_in_transfer, is_immediate, mask, simd};
 use crate::cfg::{self, CallTarget, DiagnosticKind, Edge, Terminator};
 
 /// Bit `Flag as usize` per arithmetic flag.
@@ -61,14 +65,40 @@ pub(super) type FlagMask = u8;
 /// Every arithmetic flag.
 pub(super) const ALL_FLAGS: FlagMask = (1 << FLAGS.len()) - 1;
 
-/// Bit `n` per general purpose register `n` (`rax` = 0 ... `r15` = 15) plus [`OTHER_STATE`].
-pub(super) type StateMask = u32;
+/// Per-register guest-state touch mask:
+/// - bits `0..15`: GPRs `rax..r15`,
+/// - bits `16..31`: `xmm0..xmm15` ([`XMM_STATE_SHIFT`]),
+/// - bits `32..47`: `ymmh0..ymmh15` ([`YMMH_STATE_SHIFT`]),
+/// - bit `48`: [`OTHER_STATE`] (non-GPR/non-vector state such as `mxcsr`).
+pub(super) type StateMask = u64;
 
-/// Vector registers and any whole-state observation (see "Registers a callee never touches").
-pub(super) const OTHER_STATE: StateMask = 1 << 16;
+/// Bit shift of `xmm0..xmm15` within [`StateMask`].
+pub(super) const XMM_STATE_SHIFT: u32 = 16;
 
-/// Everything a call may touch.
+/// All 16 `xmm0..xmm15` bits (`16..31`).
+pub(super) const ALL_XMM_STATE: StateMask = 0xFFFF_u64 << XMM_STATE_SHIFT;
+
+/// Bit shift of `ymmh0..ymmh15` within [`StateMask`].
+pub(super) const YMMH_STATE_SHIFT: u32 = 32;
+
+/// All 16 `ymmh0..ymmh15` bits (`32..47`).
+pub(super) const ALL_YMMH_STATE: StateMask = 0xFFFF_u64 << YMMH_STATE_SHIFT;
+
+/// Non-GPR/non-XMM/non-YMMH state (`mxcsr`, x87, etc.) and whole-state observations.
+pub(super) const OTHER_STATE: StateMask = 1u64 << 48;
+
+/// Everything a call may touch (bits `0..=48`).
 pub(super) const ALL_STATE: StateMask = (OTHER_STATE << 1) - 1;
+
+/// Bit in [`StateMask`] for `xmm{idx}` (`idx < 16`).
+pub(super) const fn xmm_state_bit(idx: usize) -> StateMask {
+    1u64 << (XMM_STATE_SHIFT + idx as u32)
+}
+
+/// Bit in [`StateMask`] for `ymmh{idx}` (`idx < 16`).
+pub(super) const fn ymmh_state_bit(idx: usize) -> StateMask {
+    1u64 << (YMMH_STATE_SHIFT + idx as u32)
+}
 
 /// Per-function flags whose value at entry may be observed, and the guest state a call may touch
 /// (see the module docs).
@@ -122,9 +152,10 @@ impl FlagSummaries {
         self.live_in.get(&entry).copied()
     }
 
-    /// Guest state a call to the function at `entry` may read or write: register `n` as bit `n`,
-    /// everything else as bit 16. `None` for a function outside the set.
-    pub fn touched(&self, entry: u64) -> Option<u32> {
+    /// Guest state a call to the function at `entry` may read or write: GPR `n` as bit `n`,
+    /// `xmmN` as bit `16 + n`, `ymmhN` as bit `32 + n`, other state as bit `48`. `None` for a
+    /// function outside the set.
+    pub fn touched(&self, entry: u64) -> Option<u64> {
         self.touched.get(&entry).copied()
     }
 
@@ -629,10 +660,16 @@ fn instruction_step(block: &cfg::BasicBlock, ins: &Instruction) -> Step {
 /// `(read, written)` flags of the modelled instructions; `None` for everything else.
 fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     use Mnemonic as M;
+    if ins.code() == Code::INVALID || ins.has_lock_prefix() || ins.is_string_instruction() {
+        return None;
+    }
     if matches!(ins.mnemonic(), M::Nop | M::Endbr64) {
         return Some((0, 0));
     }
-    if ins.has_lock_prefix() || ins.is_string_instruction() || !plain_operands(ins) {
+    if let Some(effect) = simd_flag_effect(ins) {
+        return Some(effect);
+    }
+    if !plain_operands(ins) {
         return None;
     }
     // CF OF ZF SF PF: what a shift by a non-zero count writes (AF is left unchanged).
@@ -757,6 +794,29 @@ fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     }
 }
 
+/// `(read, written)` arithmetic flags for supported non-trapping SIMD/AVX instructions.
+fn simd_flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
+    if !simd::is_supported_non_trapping_simd(ins) {
+        return None;
+    }
+    use Mnemonic as M;
+    match ins.mnemonic() {
+        M::Comiss
+        | M::Vcomiss
+        | M::Ucomiss
+        | M::Vucomiss
+        | M::Comisd
+        | M::Vcomisd
+        | M::Ucomisd
+        | M::Vucomisd
+        | M::Ptest
+        | M::Vptest
+        | M::Vtestps
+        | M::Vtestpd => Some((0, ALL_FLAGS)),
+        _ => Some((0, 0)),
+    }
+}
+
 /// [`FlagSummaries::touched`] for every function: least fixed point of "own effects plus the
 /// effects of every direct callee and tail-jump target".
 fn touched_state(functions: &[&cfg::Function]) -> BTreeMap<u64, StateMask> {
@@ -822,7 +882,7 @@ fn own_effects(
                 }
                 Step::Effect { .. } if ins.mnemonic() == Mnemonic::Call => ALL_STATE,
                 Step::Effect { .. } if flag_effect(ins).is_none() => ALL_STATE,
-                Step::Effect { .. } => used_gprs(ins, factory),
+                Step::Effect { .. } => used_state(ins, factory),
             };
         }
         mask |= match (block.terminator, transfer) {
@@ -860,18 +920,50 @@ fn own_effects(
     (mask, callees)
 }
 
-/// General purpose registers a modelled instruction reads or writes (explicitly, implicitly or in
-/// an address, like the lifter's own register tracking); any other non-segment register sets
-/// [`OTHER_STATE`].
-fn used_gprs(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateMask {
-    let mut mask = 0;
+/// Guest registers (GPRs, `xmm0..15`, `ymmh0..15`) and other state a modelled non-trapping
+/// instruction reads or writes (explicitly, implicitly, in an address, or via VEX-128 upper-half
+/// zeroing). Any non-segment register outside GPR/XMM/YMM/ZMM0..15 sets [`OTHER_STATE`].
+fn used_state(ins: &Instruction, factory: &mut InstructionInfoFactory) -> StateMask {
+    match ins.mnemonic() {
+        Mnemonic::Vzeroall => return ALL_XMM_STATE | ALL_YMMH_STATE,
+        Mnemonic::Vzeroupper => return ALL_YMMH_STATE,
+        _ => {}
+    }
+    let mut mask: StateMask = 0;
     for used in factory.info(ins).used_registers() {
         let reg = used.register();
-        if reg.is_gpr() {
-            mask |= 1 << reg.full_register().number();
+        if reg.is_gpr() && reg.full_register().is_gpr64() {
+            mask |= 1u64 << reg.full_register().number();
+        } else if (reg.is_xmm() || reg.is_ymm() || reg.is_zmm()) && reg.number() < 16 {
+            let idx = reg.number();
+            mask |= xmm_state_bit(idx);
+            if !reg.is_xmm() {
+                mask |= ymmh_state_bit(idx);
+            }
         } else if !reg.is_segment_register() {
             mask |= OTHER_STATE;
         }
+    }
+    match ins.mnemonic() {
+        Mnemonic::Blendvps | Mnemonic::Blendvpd | Mnemonic::Pblendvb => {
+            // Legacy SSE4.1 variable blends implicitly read XMM0 as the mask.
+            mask |= xmm_state_bit(0);
+        }
+        Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => {
+            mask |= OTHER_STATE;
+        }
+        _ => {}
+    }
+    // VEX encodings with an XMM destination register zero bits 128..255 (`ymmhN`).
+    if ins.encoding() == EncodingKind::VEX
+        && ins.op_count() > 0
+        && ins.op_kind(0) == OpKind::Register
+        && ins.op_register(0).is_xmm()
+        && ins.op_register(0).number() < 16
+        && !simd::reads_only_first_operand(ins.mnemonic())
+    {
+        let idx = ins.op_register(0).number();
+        mask |= xmm_state_bit(idx) | ymmh_state_bit(idx);
     }
     mask
 }
