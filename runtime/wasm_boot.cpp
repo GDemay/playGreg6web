@@ -1061,6 +1061,11 @@ playgta6::InputState* input_state_ptr() noexcept {
 
 void attach_default_input_state() {
     os::scarlett::set_game_input_state(&g_wasm_input_state.state, os::SeqlockMode::MonotonicSeq);
+    // Browser InputBridge (web/input/input_bridge.js) already applies radial stick deadzone,
+    // response curve, and linear trigger deadzone normalization before writing into inputSab.
+    // Use passthrough [0, 1] bounds here so GameInputReader::poll() still enforces unit-disk /
+    // [0, 1] clamping and non-finite sanitization without double-deadzone distortion.
+    os::scarlett::set_game_input_deadzone(os::DeadzoneConfig{0.0f, 1.0f, 0.0f, 1.0f});
 #ifdef __EMSCRIPTEN__
     // O36: a key tap shorter than the title's frame must still reach it (press latch).
     os::scarlett::set_game_input_press_sampler(true);

@@ -1319,3 +1319,117 @@ test('W366 app_bootstrap uses session.getPhaseTelemetry() (zero session.getStats
     await app.destroy();
   }
 });
+
+test('Orch-13 gpu-validation-error anti-double-counting across session, HUD, crashReporter, BroadcastChannel, duplicates, and totalCount reconciliation', async () => {
+  const validationErrors = [];
+  const hudLogs = [];
+  const hudMetrics = [];
+  const sharedHud = {
+    validationErrors,
+    logs: hudLogs,
+    metrics: hudMetrics,
+    setStatus() {},
+    appendLog(message, level = 'info') {
+      hudLogs.push({ message, level });
+    },
+    updateMetrics(metrics) {
+      hudMetrics.push({ ...metrics });
+    },
+    recordValidationError(ev) {
+      validationErrors.push(ev);
+    },
+  };
+
+  const { app, mockWorker, broadcastInstances } = createTestHost(
+    {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+    },
+    { hud: sharedHud }
+  );
+
+  try {
+    const started = await app.start();
+    assert.equal(started.ok, true);
+    assert.equal(started.mode, SESSION_MODE.WASM);
+    assert.equal(broadcastInstances.length, 1);
+
+    // 1. Single gpu-validation-error delivered to app_bootstrap (with session sharing the same hud
+    //    and crashReporter) PLUS mirrored BroadcastChannel progress with gpuValidationForwarded: true.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-validation-error',
+        seq: 1,
+        timestampMs: 50_001,
+        errorType: 'validation',
+        message: 'Invalid bind group layout',
+        totalCount: 1,
+      },
+    });
+    broadcastInstances[0].onmessage({
+      data: {
+        error: 'wgpu_worker: [validation] Invalid bind group layout',
+        gpuValidationForwarded: true,
+      },
+    });
+
+    assert.equal(app.getBootTelemetry().validationErrorCount, 1);
+    assert.equal(app.session.getValidationErrorCount(), 1);
+    assert.equal(validationErrors.length, 1, 'hud.recordValidationError must be called once');
+    assert.equal(
+      app.crashReporter.getErrors().length,
+      1,
+      'crashReporter must record the validation error once without BroadcastChannel worker_error duplication'
+    );
+    assert.equal(
+      hudLogs.filter((entry) => /WebGPU validation|Invalid bind group layout/i.test(entry.message)).length,
+      0,
+      'session must not duplicate hud.appendLog when hud.recordValidationError is present'
+    );
+
+    // 2. Identical duplicate gpu-validation-error (same seq + timestampMs + message) is deduplicated.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-validation-error',
+        seq: 1,
+        timestampMs: 50_001,
+        errorType: 'validation',
+        message: 'Invalid bind group layout',
+        totalCount: 1,
+      },
+    });
+
+    assert.equal(app.getBootTelemetry().validationErrorCount, 1);
+    assert.equal(app.session.getValidationErrorCount(), 1);
+    assert.equal(validationErrors.length, 1);
+    assert.equal(app.crashReporter.getErrors().length, 1);
+
+    // 3. Periodic gpu-stats arriving ahead of an in-flight gpu-validation-error reconciles via
+    //    totalCount instead of overshooting validationErrorCount (2 -> 2, never 3).
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-stats',
+        validationErrorCount: 2,
+      },
+    });
+    assert.equal(app.getBootTelemetry().validationErrorCount, 2);
+
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-validation-error',
+        seq: 2,
+        timestampMs: 50_050,
+        errorType: 'validation',
+        message: 'Pipeline layout mismatch',
+        totalCount: 2,
+      },
+    });
+
+    assert.equal(app.getBootTelemetry().validationErrorCount, 2);
+    assert.equal(validationErrors.length, 2);
+    assert.equal(app.crashReporter.getErrors().length, 2);
+  } finally {
+    await app.destroy();
+  }
+});
