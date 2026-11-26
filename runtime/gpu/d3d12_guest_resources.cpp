@@ -2682,9 +2682,12 @@ bool Resource::initialize() {
         if (placement_.address != 0) {
             gpu_va_ = placement_.address;
             const uint64_t cpu = dev.cpu_address_for_gpu(placement_.address);
-            // Inside an alias window the CPU pages may be mapped later (streaming): keep the CPU
-            // address; flush_shadow reads whatever is mapped at each submission.
-            if (cpu != placement_.address || com::guest_to_host(cpu, static_cast<size_t>(size)) != nullptr) {
+            // Inside an alias window or mirrored MEM_PHYSICAL reservation the CPU pages may be
+            // mapped later (streaming): keep the CPU address; flush_shadow reads whatever is mapped
+            // at each submission.
+            if (cpu != placement_.address ||
+                os::guest_window::runtime_range_host(cpu) != nullptr ||
+                com::guest_to_host(cpu, static_cast<size_t>(size)) != nullptr) {
                 cpu_va_ = cpu;
             } else {
                 dev.note_bad_argument("resource at " + hex(placement_.address) +

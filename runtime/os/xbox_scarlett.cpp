@@ -505,6 +505,29 @@ void release_shared_locked(PhysicalPage& page) {
     }
 }
 
+// Maps every 64 KiB guest-window slot covered by a physical page of size `ps` (64 KiB or 2 MiB).
+void map_window_page(uint64_t slot_va, void* host_bytes, uint64_t ps, bool alias) {
+    auto* base = static_cast<uint8_t*>(host_bytes);
+    const uint64_t step = guest_window::kSlotBytes;
+    const uint64_t len = ps >= step ? ps : step;
+    for (uint64_t off = 0; off < len; off += step) {
+        if (alias) {
+            guest_window::map_alias_slot(slot_va + off, base + off);
+        } else {
+            guest_window::map_slot(slot_va + off, base + off);
+        }
+    }
+}
+
+// Unmaps every 64 KiB guest-window slot covered by a physical page of size `ps` (64 KiB or 2 MiB).
+void unmap_window_page(uint64_t slot_va, uint64_t ps) {
+    const uint64_t step = guest_window::kSlotBytes;
+    const uint64_t len = ps >= step ? ps : step;
+    for (uint64_t off = 0; off < len; off += step) {
+        guest_window::unmap_slot(slot_va + off);
+    }
+}
+
 // R19: points every translated-window slot of `page` at the page's current bytes (after its home
 // or store moved).
 void retarget_window_slots_locked(PhysicalPage& page) {
@@ -513,12 +536,7 @@ void retarget_window_slots_locked(PhysicalPage& page) {
     }
     uint8_t* bytes = page_bytes_locked(page);
     for (uint64_t slot : page.window_slots) {
-        if (slot >= guest_window::kRuntimeRangeBase) {
-            // O36: an alias slot of a mirrored reservation: it shows the page wherever it lives.
-            guest_window::map_alias_slot(slot, bytes);
-        } else {
-            guest_window::map_slot(slot, bytes);
-        }
+        map_window_page(slot, bytes, page.page_size, slot >= guest_window::kRuntimeRangeBase);
         // O29: the bytes moved (their home was unmapped or the page was mapped elsewhere): with
         // contiguous runs required, the slot's neighbours in the primary CPU window must still be
         // host-adjacent. Mirrored reservation alias slots (>= kRuntimeRangeBase) can legitimately
@@ -617,9 +635,9 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
                                 page.window_slots.end());
         VirtualRegion* mr = st.region_containing_locked(va, ps);
         if (mr != nullptr && mr->committed) {
-            guest_window::map_slot(w, host_of(va));
+            map_window_page(w, host_of(va), ps, false);
         } else {
-            guest_window::unmap_slot(w);
+            unmap_window_page(w, ps);
         }
         return;
     }
@@ -627,7 +645,7 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         // R19: an alias of the page's bytes; nothing moves.
         page.window_slots.erase(std::remove(page.window_slots.begin(), page.window_slots.end(), va),
                                 page.window_slots.end());
-        guest_window::unmap_slot(va);
+        unmap_window_page(va, ps);
         xmem_windows::note_cpu_window_mapping(-static_cast<int64_t>(ps));
         return;
     }
@@ -658,7 +676,7 @@ void unmap_slot_locked(XMemState& st, uint64_t va) {
         } else {
             // Unmap before decommit so concurrent guest code cannot access decommitted memory and
             // unmapped MEM_PHYSICAL slots do not form split pairs with adjacent alias runs.
-            guest_window::unmap_slot(w);
+            unmap_window_page(w, ps);
         }
     }
     if (region != nullptr && !region->phantom) {
@@ -1205,7 +1223,7 @@ MapResult map_slot_locked(XMemState& st,
         }
         if (keep != KeepResult::Relocated) {
             bytes = page_bytes_locked(page);
-            guest_window::map_slot(va, bytes);
+            map_window_page(va, bytes, ps, false);
         }
         xmem_windows::note_cpu_window_mapping(static_cast<int64_t>(ps));
         note_cpu_window_map_locked(st, va, page, *region);
@@ -1234,7 +1252,7 @@ MapResult map_slot_locked(XMemState& st,
             }
             if (keep != KeepResult::Relocated) {
                 bytes = page_bytes_locked(page);
-                guest_window::map_alias_slot(w, bytes);
+                map_window_page(w, bytes, ps, true);
             }
             ++st.alias_slots;
             return MapResult::Ok;
@@ -1293,7 +1311,7 @@ MapResult map_slot_locked(XMemState& st,
             page.pool_va = va;
         }
         if (const uint64_t w = mirror_window_va_locked(st, va)) {
-            guest_window::map_slot(w, dst);
+            map_window_page(w, dst, ps, false);
         }
         return MapResult::Ok;
     }
@@ -1314,8 +1332,8 @@ MapResult map_slot_locked(XMemState& st,
     }
     page.home_va = va;
     if (const uint64_t w = mirror_window_va_locked(st, va)) {
-        // Publish primary mirrored slot BEFORE retargeting alias slots so s.reverse[dst] is set.
-        guest_window::map_slot(w, dst);
+        // Publish primary mirrored slot(s) BEFORE retargeting alias slots so s.reverse[dst] is set.
+        map_window_page(w, dst, ps, false);
         if (guest_window::contiguous_runs_required() && !st.keeping_runs) {
             const bool left_ok = guest_window::slot_host(w - ps) == nullptr ||
                                  static_cast<uint8_t*>(guest_window::slot_host(w - ps)) + ps == dst;
@@ -1499,7 +1517,7 @@ FastResult map_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, uint
     } else {
         st.retired_frames.erase(va);
         if (const uint64_t w = mirror_window_va_locked(st, va)) {
-            guest_window::map_slot(w, host_of(va));
+            map_window_page(w, host_of(va), ps, false);
         }
     }
     if (cpu_window) {
@@ -1575,7 +1593,7 @@ FastResult unmap_slot_fast(XMemState& st, std::unique_lock<std::mutex>& lock, ui
             if (!region->committed) {
                 // Unmap before decommitting outside the lock so concurrent readers never touch
                 // decommitted memory and unmapped slots return to kTrapDelta.
-                guest_window::unmap_slot(w);
+                unmap_window_page(w, ps);
             } else {
                 mark_mirror_locked(st, va, ps);
             }
