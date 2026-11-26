@@ -102,7 +102,8 @@ static bool take_written_pages_impl(const void* host, uint64_t len, WriteCursor*
     }
     return views_only ? backing::take_written_view_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock, offsets)
                       : backing::take_written_pages(static_cast<const uint8_t*>(host), len, &cursor->view_clock,
-                                                    cursor->watch_epoch == ~uint64_t{0} ? nullptr : &cursor->watch_epoch, offsets);
+                                                    cursor->watch_epoch == ~uint64_t{0} ? nullptr : &cursor->watch_epoch,
+                                                    cursor->peek_watch, offsets);
 }
 
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {

@@ -896,6 +896,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 }
             }
             std::vector<uint64_t> pages;
+            cursor.peek_watch = true;  // uncollected OS write bits count as written; no reset per texture
             const bool tracked = os::take_written_pages(host, primary_size, &cursor, &pages);
             bool skip = false;
             {

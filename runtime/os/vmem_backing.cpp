@@ -57,10 +57,17 @@ void note_watched(const void* base, uint64_t size) {
     g_watched[reinterpret_cast<uintptr_t>(base)] = reinterpret_cast<uintptr_t>(base) + static_cast<uintptr_t>(size);
 }
 
-bool watched_covers(uintptr_t lo, uintptr_t hi) {
+bool watched_covers(uintptr_t lo, uintptr_t hi, uintptr_t* res_lo = nullptr, uintptr_t* res_hi = nullptr) {
     std::shared_lock<std::shared_mutex> lock(g_watched_mutex);
     auto it = g_watched.upper_bound(lo);
-    return it != g_watched.begin() && hi <= std::prev(it)->second;
+    if (it == g_watched.begin() || hi > std::prev(it)->second) {
+        return false;
+    }
+    if (res_lo != nullptr) {
+        *res_lo = std::prev(it)->first;
+        *res_hi = std::prev(it)->second;
+    }
+    return true;
 }
 
 DWORD win_protect(PageProtect protect) {
@@ -580,16 +587,100 @@ void drop_stamps(uintptr_t lo, uintptr_t hi) {
                          g_stamp_chunks.lower_bound(((hi - 1) >> kStampChunkShift) + 1));
 }
 
+bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, uint64_t* epoch, bool peek,
+                            std::vector<uint64_t>* offsets);
+
+// Peek mode: GetWriteWatch without RESET over the range (no page protection change, no TLB
+// flush) reports the bits nobody has collected yet; those count as written. When there are some and
+// the reservation was last collected more than kPeekCollectMs ago, the whole reservation is
+// collected (one reset for all readers' pages, stamped like any take) and the range peeked again.
+// Result: the pages stamped after *epoch plus the pages still uncollected; never fewer than written.
+// The reader's new epoch is the one read before it looked at anything: a collect running
+// meanwhile stamps later values, which the next call reports again (twice, never missed).
+constexpr int64_t kPeekCollectMs = 8;
+std::atomic<int64_t> g_last_collect_ms{0};
+
+int64_t now_ms() {
+    return static_cast<int64_t>(GetTickCount64());
+}
+
+bool written_pages_peek(uintptr_t start, uintptr_t end, uintptr_t origin, uintptr_t res_lo, uintptr_t res_hi,
+                        uint64_t* epoch, std::vector<uint64_t>* offsets) {
+    thread_local std::vector<PVOID> bits;
+    const uint64_t pages = (end - start + kWrittenPageSize - 1) / kWrittenPageSize;
+    const size_t cap = static_cast<size_t>(std::min<uint64_t>(pages, 4096));
+    if (bits.size() < cap) {
+        bits.resize(cap);
+    }
+    uint64_t e0 = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_stamp_mutex);
+        e0 = g_watch_epoch;
+    }
+    auto peek_bits = [&](size_t* n) {
+        ULONG_PTR count = cap;
+        DWORD granularity = 0;
+        if (GetWriteWatch(0, reinterpret_cast<PVOID>(start), static_cast<SIZE_T>(end - start), bits.data(), &count,
+                          &granularity) != 0 ||
+            granularity != kWrittenPageSize) {
+            return false;
+        }
+        *n = static_cast<size_t>(count);
+        return !(*n == cap && cap < pages);  // more bits than the buffer: unknown (caller: all written)
+    };
+    size_t n = 0;
+    if (!peek_bits(&n)) {
+        return false;
+    }
+    if (n > 0 && now_ms() - g_last_collect_ms.load(std::memory_order_relaxed) >= kPeekCollectMs) {
+        // Collect the whole reservation (stamps only; the pages it names are not wanted here).
+        std::vector<uint64_t> none;
+        if (written_pages_by_watch(res_lo, res_hi, res_lo, nullptr, false, &none)) {
+            g_last_collect_ms.store(now_ms(), std::memory_order_relaxed);
+            if (!peek_bits(&n)) {
+                return false;
+            }
+        }
+    }
+    const uint64_t seen = *epoch;
+    for (size_t i = 0; i < n; ++i) {
+        offsets->push_back(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(bits[i]) - origin));
+    }
+    std::lock_guard<std::mutex> lock(g_stamp_mutex);
+    for (auto it = g_stamp_chunks.lower_bound(start >> kStampChunkShift);
+         it != g_stamp_chunks.end() && (it->first << kStampChunkShift) < end; ++it) {
+        const StampChunk& chunk = *it->second;
+        if (chunk.newest <= seen) {
+            continue;
+        }
+        const uintptr_t chunk_base = it->first << kStampChunkShift;
+        const uintptr_t lo = std::max<uintptr_t>(chunk_base, start);
+        const uintptr_t hi = std::min<uintptr_t>(chunk_base + (uintptr_t{1} << kStampChunkShift), end);
+        for (uintptr_t a = lo; a < hi; a += kWrittenPageSize) {
+            if (chunk.stamp[(a >> 12) & (kStampChunkPages - 1)] > seen) {
+                offsets->push_back(static_cast<uint64_t>(a - origin));
+            }
+        }
+    }
+    *epoch = e0;
+    return true;
+}
+
 // MEM_WRITE_WATCH pages of [start, end) (one reservation), as offsets from `origin`.
 // O33: GetWriteWatch's output buffer is kept per thread (it was up to 512 KiB allocated and zeroed
 // on every take), and the pages it reports are appended in one go.
 // `epoch` null: the pages this call consumed. Otherwise: the pages stamped after *epoch, by this
 // call or by any other reader's, and *epoch moves to the newest stamp. False: not watched, or the
 // call failed (the caller then treats the range as written; stamps already made stay valid).
-bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, uint64_t* epoch,
+bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, uint64_t* epoch, bool peek,
                             std::vector<uint64_t>* offsets) {
-    if (!watched_covers(start, end)) {
+    uintptr_t res_lo = 0;
+    uintptr_t res_hi = 0;
+    if (!watched_covers(start, end, &res_lo, &res_hi)) {
         return false;
+    }
+    if (peek && epoch != nullptr) {
+        return written_pages_peek(start, end, origin, res_lo, res_hi, epoch, offsets);
     }
     thread_local std::vector<PVOID> written;
     const uint64_t pages = (end - start + kWrittenPageSize - 1) / kWrittenPageSize;
@@ -686,7 +777,7 @@ namespace {
 // views_only: report only through shared page views (never MEM_WRITE_WATCH, whose take is
 // destructive for other readers of the same pages); false when any part of the range is not
 // covered by tracked views. On false nothing is consumed (the caller's clock stays).
-bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint64_t* watch_epoch,
+bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint64_t* watch_epoch, bool peek,
                      std::vector<uint64_t>* offsets, bool views_only) {
     const uintptr_t start = reinterpret_cast<uintptr_t>(p) & ~(uintptr_t{kWrittenPageSize} - 1);
     const uintptr_t end = reinterpret_cast<uintptr_t>(p) + static_cast<uintptr_t>(len);
@@ -717,7 +808,7 @@ bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint6
                     if (views_only) {
                         return false;
                     }
-                    if (!written_pages_by_watch(at, lo, start, watch_epoch, offsets)) {
+                    if (!written_pages_by_watch(at, lo, start, watch_epoch, peek, offsets)) {
                         all_written(at, lo, start, offsets);
                     }
                 }
@@ -736,7 +827,7 @@ bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint6
                 if (views_only) {
                     return false;
                 }
-                if (!written_pages_by_watch(at, end, start, watch_epoch, offsets)) {
+                if (!written_pages_by_watch(at, end, start, watch_epoch, peek, offsets)) {
                     all_written(at, end, start, offsets);
                 }
             }
@@ -749,18 +840,18 @@ bool take_pages_impl(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint6
     if (views_only) {
         return false;
     }
-    return written_pages_by_watch(start, end, start, watch_epoch, offsets);
+    return written_pages_by_watch(start, end, start, watch_epoch, peek, offsets);
 }
 
 }  // namespace
 
-bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint64_t* watch_epoch,
+bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint64_t* watch_epoch, bool peek,
                         std::vector<uint64_t>* offsets) {
-    return take_pages_impl(p, len, view_clock, watch_epoch, offsets, false);
+    return take_pages_impl(p, len, view_clock, watch_epoch, peek, offsets, false);
 }
 
 bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets) {
-    return view_clock != nullptr && take_pages_impl(p, len, view_clock, nullptr, offsets, true);
+    return view_clock != nullptr && take_pages_impl(p, len, view_clock, nullptr, false, offsets, true);
 }
 
 #elif defined(__EMSCRIPTEN__)
@@ -902,7 +993,7 @@ bool enforces_protection() {
     return false;
 }
 
-bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, std::vector<uint64_t>*) {
+bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // no write tracking in linear memory
 }
 
@@ -995,7 +1086,7 @@ bool enforces_protection() {
     return true;
 }
 
-bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, std::vector<uint64_t>*) {
+bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // not tracked on POSIX hosts
 }
 

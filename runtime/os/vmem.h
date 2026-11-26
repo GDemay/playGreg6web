@@ -412,6 +412,10 @@ struct WriteCursor {
     // stamped; each cursor is told every page stamped after its epoch, so several readers of the
     // same arena memory (buffer flush, texture sync) each see every write.
     uint64_t watch_epoch = 0;
+    // Peek mode (O36): the take does not reset OS write bits itself, it counts a bit not yet collected as
+    // written and collects (the whole reservation, at most every few ms) only to learn it was
+    // written again. Cheap for readers that mostly find nothing (texture sync); never reports less.
+    bool peek_watch = false;
 };
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);

@@ -615,6 +615,35 @@ void test_written_pages_fanout() {
     pages.clear();
     CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
     CHECK(pages.size() == 8);
+    // Peek readers never reset the OS bits: an uncollected write is reported (every time until a
+    // collect stamps it), and a write is never missed next to buffer-flush style takes.
+    WriteCursor peeker;
+    peeker.peek_watch = true;
+    take_written_pages(p, 64 * 1024, &peeker, &pages);
+    pages.clear();
+    take_written_pages(p, 64 * 1024, &peeker, &pages);
+    take_written_pages(p, 64 * 1024, &peeker, &pages);
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &peeker, &pages));
+    CHECK(pages.empty());
+    p[4 * kWrittenPageSize] = 5;
+    CHECK(take_written_pages(p, 64 * 1024, &peeker, &pages));
+    CHECK(!pages.empty() && pages[0] == 4 * kWrittenPageSize);
+    pages.clear();
+    p[6 * kWrittenPageSize] = 5;
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));  // a non-peek reader consumes the bits
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &peeker, &pages));
+    bool saw4 = false;
+    bool saw6 = false;
+    for (uint64_t off : pages) {
+        saw4 |= off == 4 * kWrittenPageSize;
+        saw6 |= off == 6 * kWrittenPageSize;
+    }
+    CHECK(saw4 && saw6);  // stamped by x's take, still new for the peeker
+    pages.clear();
+    CHECK(take_written_pages(p, 64 * 1024, &peeker, &pages));
+    CHECK(pages.empty() || pages.size() <= 2);  // at most a repeat of the previous stamps
     CHECK(arena.release(a));
 }
 

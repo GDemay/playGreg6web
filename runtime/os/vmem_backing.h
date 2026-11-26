@@ -26,7 +26,7 @@ bool enforces_protection();
 // `watch_epoch`: the caller's position in the MEM_WRITE_WATCH fan-out (it is told every page
 // written since, whoever consumed the OS bits); null: only the pages this call consumed.
 bool take_written_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, uint64_t* watch_epoch,
-                        std::vector<uint64_t>* offsets);
+                        bool peek, std::vector<uint64_t>* offsets);
 // Like take_written_pages but only for ranges wholly covered by tracked shared page views: it never
 // reads MEM_WRITE_WATCH (a destructive take), and returns false (consuming nothing) otherwise.
 bool take_written_view_pages(const uint8_t* p, uint64_t len, uint64_t* view_clock, std::vector<uint64_t>* offsets);
