@@ -25,7 +25,7 @@ from collections import Counter
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 ABI_VERSION = 1
 
@@ -92,6 +92,19 @@ DEFAULT_PREVIEW_BYTES = 16
 DEFAULT_30FPS_BUDGET_MS = 33.333
 DEFAULT_TOP_N = 10
 SPIKE_ANALYSIS_SCHEMA_VERSION = 1
+SCENE_PASS_SUMMARY_SCHEMA = "playgta6-scene-pass-summary"
+SCENE_PASS_SUMMARY_VERSION = 1
+RT_ARENA_BIND_GROUP = 3
+RT_ARENA_BINDING_SLOTS: frozenset[int] = frozenset(range(16, 22))
+SCENE_SKIP_CAUSES: tuple[str, ...] = (
+    "no_pipeline_bound",
+    "zero_geometry",
+    "outside_render_pass",
+    "missing_bind_group",
+    "missing_index_buffer",
+    "missing_vertex_buffer",
+    "invalid_packet",
+)
 
 SPIKE_CAUSES: tuple[str, ...] = (
     "pso_compile",
@@ -542,11 +555,14 @@ class FrameSummary:
     complete: bool
     has_begin_frame: bool
     draw_indexed_calls: int = 0
+    draw_indirect_calls: int = 0
+    draw_indexed_indirect_calls: int = 0
+    dispatch_indirect_calls: int = 0
     compute_dispatches: int = 0
     compute_passes: int = 0
     textures_created: int = 0
     bind_groups_created: int = 0
-    # Packet ABI v2 summary metrics (opcodes 22..34).
+    # Packet ABI v2 summary metrics (opcodes 22..38).
     begin_render_passes: int = 0
     end_render_passes: int = 0
     color_load_ops: dict[str, int] | None = None
@@ -571,6 +587,9 @@ class FrameSummary:
             "packet_count": self.packet_count,
             "draw_calls": self.draw_calls,
             "draw_indexed_calls": self.draw_indexed_calls,
+            "draw_indirect_calls": self.draw_indirect_calls,
+            "draw_indexed_indirect_calls": self.draw_indexed_indirect_calls,
+            "dispatch_indirect_calls": self.dispatch_indirect_calls,
             "compute_dispatches": self.compute_dispatches,
             "compute_passes": self.compute_passes,
             "textures_created": self.textures_created,
@@ -624,7 +643,14 @@ class DecodedTrace:
         return sum(
             1
             for p in self.packets
-            if p.opcode in (GpuOpcode.Draw, GpuOpcode.DrawIndexed) and p.valid
+            if p.opcode
+            in (
+                GpuOpcode.Draw,
+                GpuOpcode.DrawIndexed,
+                GpuOpcode.DrawIndirect,
+                GpuOpcode.DrawIndexedIndirect,
+            )
+            and p.valid
         )
 
     @property
@@ -643,11 +669,31 @@ class DecodedTrace:
 
     @property
     def draw_indexed_calls(self) -> int:
-        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DrawIndexed and p.valid)
+        return sum(
+            1
+            for p in self.packets
+            if p.opcode in (GpuOpcode.DrawIndexed, GpuOpcode.DrawIndexedIndirect) and p.valid
+        )
+
+    @property
+    def draw_indirect_calls(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DrawIndirect and p.valid)
+
+    @property
+    def draw_indexed_indirect_calls(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DrawIndexedIndirect and p.valid)
+
+    @property
+    def dispatch_indirect_calls(self) -> int:
+        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DispatchIndirect and p.valid)
 
     @property
     def compute_dispatches(self) -> int:
-        return sum(1 for p in self.packets if p.opcode == GpuOpcode.DispatchCompute and p.valid)
+        return sum(
+            1
+            for p in self.packets
+            if p.opcode in (GpuOpcode.DispatchCompute, GpuOpcode.DispatchIndirect) and p.valid
+        )
 
     @property
     def compute_passes(self) -> int:
@@ -770,6 +816,7 @@ class DecodedTrace:
         binding_audit: bool = False,
         bink_video_audit: bool = False,
         start_screen_skips: bool = False,
+        scene_pass_summary: bool = False,
         analyze_30fps: bool = False,
         budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
         top_n: int = DEFAULT_TOP_N,
@@ -799,6 +846,9 @@ class DecodedTrace:
             "frame_count": self.frame_count,
             "draw_calls": self.draw_calls,
             "draw_indexed_calls": self.draw_indexed_calls,
+            "draw_indirect_calls": self.draw_indirect_calls,
+            "draw_indexed_indirect_calls": self.draw_indexed_indirect_calls,
+            "dispatch_indirect_calls": self.dispatch_indirect_calls,
             "compute_dispatches": self.compute_dispatches,
             "compute_passes": self.compute_passes,
             "textures_created": self.textures_created,
@@ -838,6 +888,8 @@ class DecodedTrace:
             result["bink_video_audit"] = audit_bink_video(self)
         if start_screen_skips:
             result["start_screen_skips"] = audit_start_screen_skips(self)
+        if scene_pass_summary:
+            result["scene_pass_summary"] = build_scene_pass_summary(self, top_n=top_n)
         if fps30_report is not None:
             result["fps30_analysis"] = fps30_report
         return result
@@ -854,7 +906,7 @@ _V2_TRUNCATION_DIAG_CODES = frozenset(
 
 
 def _is_v2_opcode(opcode: int) -> bool:
-    return GpuOpcode.CreateBindGroupLayout <= opcode <= GpuOpcode.CreateSampler2
+    return GpuOpcode.CreateBindGroupLayout <= opcode <= GpuOpcode.DispatchIndirect
 
 
 def _merge_op_histograms(histograms: Any) -> dict[str, int]:
@@ -869,7 +921,7 @@ def _diag_targets_v2(trace: DecodedTrace, diag: TraceDiagnostic) -> bool:
     if diag.packet_index is not None and 0 <= diag.packet_index < len(trace.packets):
         return _is_v2_opcode(trace.packets[diag.packet_index].opcode)
     # Stream-level truncations (no packet object emitted): match "(opcode N)" in the message.
-    for op in range(int(GpuOpcode.CreateBindGroupLayout), int(GpuOpcode.CreateSampler2) + 1):
+    for op in range(int(GpuOpcode.CreateBindGroupLayout), int(GpuOpcode.DispatchIndirect) + 1):
         if f"(opcode {op})" in diag.message:
             return True
     return False
@@ -1508,6 +1560,33 @@ def encode_create_texture2(
             0,
             padded_views,
         ),
+        flags,
+    )
+
+
+def encode_draw_indirect(buffer_id: int, offset: int = 0, flags: int = 0) -> bytes:
+    """Encode DrawIndirect (opcode 36, GpuIndirectPayload)."""
+    return encode_packet(
+        GpuOpcode.DrawIndirect,
+        INDIRECT_STRUCT.pack(buffer_id, 0, offset),
+        flags,
+    )
+
+
+def encode_draw_indexed_indirect(buffer_id: int, offset: int = 0, flags: int = 0) -> bytes:
+    """Encode DrawIndexedIndirect (opcode 37, GpuIndirectPayload)."""
+    return encode_packet(
+        GpuOpcode.DrawIndexedIndirect,
+        INDIRECT_STRUCT.pack(buffer_id, 0, offset),
+        flags,
+    )
+
+
+def encode_dispatch_indirect(buffer_id: int, offset: int = 0, flags: int = 0) -> bytes:
+    """Encode DispatchIndirect (opcode 38, GpuIndirectPayload)."""
+    return encode_packet(
+        GpuOpcode.DispatchIndirect,
+        INDIRECT_STRUCT.pack(buffer_id, 0, offset),
         flags,
     )
 
@@ -3073,11 +3152,14 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
         GpuOpcode.SetIndexBuffer,
         GpuOpcode.Draw,
         GpuOpcode.DrawIndexed,
+        GpuOpcode.DrawIndirect,
+        GpuOpcode.DrawIndexedIndirect,
         GpuOpcode.BeginRenderPass,
     }
     compute_pass_opcodes = {
         GpuOpcode.SetComputePipeline,
         GpuOpcode.DispatchCompute,
+        GpuOpcode.DispatchIndirect,
     }
 
     def _flush(*, complete: bool) -> None:
@@ -3086,6 +3168,9 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
         histogram: Counter[str] = Counter()
         draw_calls = 0
         draw_indexed_calls = 0
+        draw_indirect_calls = 0
+        draw_indexed_indirect_calls = 0
+        dispatch_indirect_calls = 0
         compute_dispatches = 0
         compute_passes = 0
         textures_created = 0
@@ -3119,8 +3204,18 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
             elif pkt.opcode == GpuOpcode.DrawIndexed:
                 draw_calls += 1
                 draw_indexed_calls += 1
+            elif pkt.opcode == GpuOpcode.DrawIndirect:
+                draw_calls += 1
+                draw_indirect_calls += 1
+            elif pkt.opcode == GpuOpcode.DrawIndexedIndirect:
+                draw_calls += 1
+                draw_indexed_calls += 1
+                draw_indexed_indirect_calls += 1
             elif pkt.opcode == GpuOpcode.DispatchCompute:
                 compute_dispatches += 1
+            elif pkt.opcode == GpuOpcode.DispatchIndirect:
+                compute_dispatches += 1
+                dispatch_indirect_calls += 1
             elif pkt.opcode == GpuOpcode.CreateTexture:
                 textures_created += 1
             elif pkt.opcode in (GpuOpcode.CreateBindGroup, GpuOpcode.CreateBindGroup2):
@@ -3175,6 +3270,9 @@ def split_frames(packets: Sequence[DecodedPacket]) -> list[FrameSummary]:
                 complete=complete,
                 has_begin_frame=(current[0].opcode == GpuOpcode.BeginFrame),
                 draw_indexed_calls=draw_indexed_calls,
+                draw_indirect_calls=draw_indirect_calls,
+                draw_indexed_indirect_calls=draw_indexed_indirect_calls,
+                dispatch_indirect_calls=dispatch_indirect_calls,
                 compute_dispatches=compute_dispatches,
                 compute_passes=compute_passes,
                 textures_created=textures_created,
@@ -3369,7 +3467,9 @@ _BARE64_HEX_RE = re.compile(r"^([0-9a-fA-F]{16})$")
 _DRAW_PACKET_NAMES = frozenset(
     {"Draw", "DrawIndexed", "DrawIndirect", "DrawIndexedIndirect"}
 )
-_DISPATCH_PACKET_NAMES = frozenset({"DispatchCompute", "DispatchComputeIndirect"})
+_DISPATCH_PACKET_NAMES = frozenset(
+    {"DispatchCompute", "DispatchIndirect", "DispatchComputeIndirect"}
+)
 
 _LAYOUT_TYPE_TO_EXPECTED_RESOURCE: dict[str, tuple[GpuBindResourceType, str]] = {
     "buffer": (GpuBindResourceType.Buffer, "Buffer"),
@@ -4240,6 +4340,1176 @@ def format_binding_audit_text(audit: dict[str, Any]) -> str:
                 f"    [{item['kind']}] draw=#{item['packet_index']:04d} "
                 f"pass=#{item['render_pass_packet_index']:04d} "
                 f"pipeline={item['pipeline_id']}{slot_str}: {item['message']}"
+            )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# 3D Scene Pass Summary & Binding/Reflection Audit (--scene-pass-summary)
+# ---------------------------------------------------------------------------
+
+
+def _is_rt_group3_layout_entry_valid(binding: int, entry: Mapping[str, Any]) -> bool:
+    """Validate one group-3 layout entry against Contract C3 (RT arena bindings 16..21)."""
+    if binding == 0:
+        return True
+    if binding not in RT_ARENA_BINDING_SLOTS:
+        return False
+    ltype = str(entry.get("type", ""))
+    btype = str(entry.get("binding_type", ""))
+    if ltype != "buffer":
+        return False
+    if binding == 21:
+        return btype == "storage"
+    return btype in ("storage", "read-only-storage")
+
+
+def build_scene_pass_summary(
+    trace: DecodedTrace,
+    *,
+    top_n: int = DEFAULT_TOP_N,
+) -> dict[str, Any]:
+    """Build a strictly sanitized 3D scene pass, skip-cause, and binding/reflection summary.
+
+    Reports render/compute/indirect/mesh/RT pass counts, skipped draws by cause, and
+    binding/reflection mismatches (including RT arena group-3 slot validation) with
+    bounded, strictly sanitized offender summaries (pipeline IDs, 64-bit hashes, counts only).
+    """
+    max_offenders = max(0, int(top_n))
+    hash_refs: dict[int, str] = dict(trace._shader_hash_refs)
+
+    # Pre-pass: correlate live CreateShaderModule packet indices with v2 pipeline key hashes.
+    active_mod_pkt: dict[int, int] = {}
+    mod_pkt_key_hash: dict[int, str] = {}
+    for pkt in trace.packets:
+        if not pkt.valid:
+            continue
+        op = pkt.opcode
+        f = pkt.fields
+        if op == GpuOpcode.CreateShaderModule:
+            active_mod_pkt[int(f["id"])] = pkt.index
+        elif op == GpuOpcode.DestroyResource:
+            active_mod_pkt.pop(int(f["id"]), None)
+        elif op == GpuOpcode.CreateRenderPipeline2:
+            key = f["key"]
+            vs_id = int(f["vs_module_id"])
+            fs_id = int(f["fs_module_id"])
+            vs_hash = str(key["vs_shader"])
+            ps_hash = str(key["ps_shader"])
+            if vs_id != 0 and vs_hash != _ZERO_HASH_HEX and vs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[vs_id], vs_hash)
+            if fs_id != 0 and ps_hash != _ZERO_HASH_HEX and fs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[fs_id], ps_hash)
+        elif op == GpuOpcode.CreateComputePipeline2:
+            cs_id = int(f["cs_module_id"])
+            cs_hash = str(f["cs_shader"])
+            if cs_id != 0 and cs_hash != _ZERO_HASH_HEX and cs_id in active_mod_pkt:
+                mod_pkt_key_hash.setdefault(active_mod_pkt[cs_id], cs_hash)
+
+    # Live resource & pipeline state.
+    active_module_hashes: dict[int, str | None] = {}
+    live_buffers: dict[int, dict[str, Any]] = {}
+    live_textures: set[int] = set()
+    live_samplers: set[int] = set()
+    destroyed_resources: set[int] = set()
+    layouts: dict[int, _BindGroupLayoutRecord] = {}
+    pipeline_layouts: dict[int, list[int]] = {}
+    bind_groups: dict[int, dict[str, Any]] = {}
+    render_pipelines: dict[int, dict[str, Any]] = {}
+    compute_pipelines: dict[int, dict[str, Any]] = {}
+
+    # Pass counters.
+    rp_begin = 0
+    rp_end = 0
+    rp_paired = 0
+    rp_unclosed = 0
+    rp_unmatched_end = 0
+    rp_color_only = 0
+    rp_depth_only = 0
+    rp_color_and_depth = 0
+    rp_empty = 0
+    rp_swapchain = 0
+    rp_mrt = 0
+    rp_max_colors = 0
+    rp_draws_inside = 0
+
+    compute_passes = 0
+    direct_compute_dispatches = 0
+    indirect_compute_dispatches = 0
+
+    draw_indirect_count = 0
+    draw_indexed_indirect_count = 0
+    dispatch_indirect_count = 0
+    indirect_passes = 0
+    indirect_buffer_ids: set[int] = set()
+
+    mesh_passes = 0
+    mesh_compute_to_indirect_draws = 0
+    mesh_compute_to_mesh_draws = 0
+    mesh_flagged_dispatches = 0
+    mesh_pipeline_ids: set[int] = set()
+
+    rt_passes = 0
+    rt_dispatches = 0
+    rt_layouts_seen: set[int] = set()
+    rt_bind_groups_seen: set[int] = set()
+    rt_set_bind_group_calls = 0
+    rt_arena_slots_seen: set[int] = set()
+    checked_rt_group3_layouts: set[int] = set()
+    flagged_rt_group3_layout_bindings: dict[int, set[int]] = {}
+    checked_rt_group3_bgs: set[int] = set()
+
+    # Skip causes & binding/reflection mismatch counters.
+    skipped_draws_by_cause: dict[str, int] = {cause: 0 for cause in SCENE_SKIP_CAUSES}
+    skipped_draw_calls = 0
+
+    unbound_required_groups = 0
+    resource_kind_mismatches = 0
+    missing_layout_bindings = 0
+    extra_bind_group_entries = 0
+    invalid_rt_group3_slots = 0
+    unresolved_or_placeholder_bindings = 0
+
+    # Per-pipeline offender tracking (strictly sanitized: IDs, hashes, counts).
+    offenders: dict[tuple[str, int | None], dict[str, Any]] = {}
+
+    def _resolve_shader_hash(module_id: int, key_hash: str | None) -> str | None:
+        if key_hash is not None and key_hash != _ZERO_HASH_HEX:
+            return key_hash
+        if module_id == 0:
+            return None
+        return active_module_hashes.get(module_id)
+
+    def _get_offender(
+        pipeline_id: int | None,
+        kind: str,
+        pipe_info: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        key = (kind, pipeline_id)
+        rec = offenders.get(key)
+        if rec is None:
+            rec = {
+                "pipeline_id": pipeline_id,
+                "kind": kind,
+                "vs_shader": pipe_info.get("vs_shader") if pipe_info is not None else None,
+                "ps_shader": pipe_info.get("ps_shader") if pipe_info is not None else None,
+                "cs_shader": pipe_info.get("cs_shader") if pipe_info is not None else None,
+                "skipped_draws": 0,
+                "binding_mismatches": 0,
+                "causes": Counter(),
+            }
+            offenders[key] = rec
+        elif pipe_info is not None:
+            for k in ("vs_shader", "ps_shader", "cs_shader"):
+                if rec[k] is None and pipe_info.get(k) is not None:
+                    rec[k] = pipe_info[k]
+        return rec
+
+    def _note_offender_skip(
+        pipeline_id: int | None,
+        kind: str,
+        pipe_info: dict[str, Any] | None,
+        causes: Sequence[str],
+    ) -> None:
+        rec = _get_offender(pipeline_id, kind, pipe_info)
+        rec["skipped_draws"] += 1
+        for c in causes:
+            rec["causes"][c] += 1
+
+    def _note_offender_mismatch(
+        pipeline_id: int | None,
+        kind: str,
+        pipe_info: dict[str, Any] | None,
+        category: str,
+        count: int = 1,
+    ) -> None:
+        if count <= 0:
+            return
+        rec = _get_offender(pipeline_id, kind, pipe_info)
+        rec["binding_mismatches"] += count
+        rec["causes"][category] += count
+
+    def _audit_rt_group3_layout(layout_id: int) -> bool:
+        """Inspect a BindGroupLayout bound at group 3; return True if it uses RT arena slots."""
+        nonlocal invalid_rt_group3_slots
+        layout = layouts.get(layout_id)
+        if layout is None or layout.manifest_reference:
+            return False
+        has_rt = any(b in RT_ARENA_BINDING_SLOTS for b in layout.entries)
+        if layout_id not in checked_rt_group3_layouts:
+            checked_rt_group3_layouts.add(layout_id)
+            bad_bindings: set[int] = set()
+            for binding, entry in sorted(layout.entries.items()):
+                if binding in RT_ARENA_BINDING_SLOTS:
+                    rt_arena_slots_seen.add(binding)
+                if not _is_rt_group3_layout_entry_valid(binding, entry):
+                    invalid_rt_group3_slots += 1
+                    bad_bindings.add(binding)
+            if bad_bindings:
+                flagged_rt_group3_layout_bindings[layout_id] = bad_bindings
+            if has_rt:
+                rt_layouts_seen.add(layout_id)
+        return has_rt
+
+    def _audit_rt_group3_bind_group(bg_id: int) -> tuple[bool, int]:
+        """Inspect a BindGroup bound at group 3; return (has_rt, newly_flagged_invalid_slots)."""
+        nonlocal invalid_rt_group3_slots
+        bg_info = bind_groups.get(bg_id)
+        if bg_info is None:
+            return False, 0
+        entries = bg_info["entries"]
+        has_rt = any(int(e["binding"]) in RT_ARENA_BINDING_SLOTS for e in entries)
+        layout_id = int(bg_info.get("layout_id", 0))
+        if layout_id != 0 and layout_id in layouts:
+            if _audit_rt_group3_layout(layout_id):
+                has_rt = True
+        newly_flagged = 0
+        if bg_id not in checked_rt_group3_bgs:
+            checked_rt_group3_bgs.add(bg_id)
+            already_flagged = flagged_rt_group3_layout_bindings.get(layout_id, set())
+            for entry in entries:
+                binding = int(entry["binding"])
+                rtype = int(entry["resource_type"])
+                if binding in RT_ARENA_BINDING_SLOTS:
+                    rt_arena_slots_seen.add(binding)
+                    if rtype != GpuBindResourceType.Buffer and binding not in already_flagged:
+                        invalid_rt_group3_slots += 1
+                        newly_flagged += 1
+                elif binding != 0 and binding not in already_flagged:
+                    invalid_rt_group3_slots += 1
+                    newly_flagged += 1
+            if has_rt:
+                rt_bind_groups_seen.add(bg_id)
+        return has_rt, newly_flagged
+
+    # Active execution state.
+    has_begin_frame_packets = any(
+        p.opcode == GpuOpcode.BeginFrame and p.valid for p in trace.packets
+    )
+    uses_explicit_render_passes = trace.begin_render_passes > 0
+    in_frame = not has_begin_frame_packets
+
+    active_render_pass: dict[str, Any] | None = None
+    active_pass_kind: str | None = None
+    lazy_render_pass_has_indirect = False
+    lazy_render_pass_has_rt = False
+    compute_pass_has_indirect = False
+    compute_pass_has_rt = False
+    compute_pass_has_mesh = False
+    compute_pass_id = 0
+
+    active_render_pipeline_id: int | None = None
+    active_compute_pipeline_id: int | None = None
+    active_bind_groups: dict[int, int] = {}
+    active_vertex_buffers: dict[int, int] = {}
+    active_index_buffer: int | None = None
+
+    # Per-frame compute-to-draw tracking for mesh-shader-to-compute passes.
+    # Maps buffer_id -> {"compute_pass_id": int, "pipeline_id": int | None}
+    compute_written_buffers: dict[int, dict[str, Any]] = {}
+    counted_mesh_compute_passes: set[int] = set()
+
+    def _close_compute_pass() -> None:
+        nonlocal active_pass_kind, compute_pass_has_indirect, compute_pass_has_rt, compute_pass_has_mesh
+        if active_pass_kind == "compute":
+            active_pass_kind = None
+            compute_pass_has_indirect = False
+            compute_pass_has_rt = False
+            compute_pass_has_mesh = False
+
+    def _close_render_pass(*, paired: bool) -> None:
+        nonlocal active_render_pass, active_pass_kind, rp_paired, rp_unclosed
+        nonlocal active_render_pipeline_id, active_index_buffer
+        if active_render_pass is not None:
+            if paired:
+                rp_paired += 1
+            else:
+                rp_unclosed += 1
+            active_render_pass = None
+        if active_pass_kind == "render":
+            active_pass_kind = None
+        active_render_pipeline_id = None
+        active_vertex_buffers.clear()
+        active_index_buffer = None
+
+    def _ensure_compute_pass() -> None:
+        nonlocal active_pass_kind, compute_passes, compute_pass_id
+        nonlocal compute_pass_has_indirect, compute_pass_has_rt, compute_pass_has_mesh
+        if active_render_pass is not None:
+            _close_render_pass(paired=False)
+        if active_pass_kind != "compute":
+            compute_passes += 1
+            compute_pass_id += 1
+            active_pass_kind = "compute"
+            compute_pass_has_indirect = False
+            compute_pass_has_rt = False
+            compute_pass_has_mesh = False
+            active_bind_groups.clear()
+
+    def _check_pipeline_bindings(
+        pipe_id: int,
+        kind: str,
+        pipe_info: dict[str, Any] | None,
+    ) -> tuple[bool, bool]:
+        """Validate bound groups against the active pipeline layout.
+
+        Returns `(missing_required_group, uses_rt_group3)`.
+        """
+        nonlocal unbound_required_groups, resource_kind_mismatches
+        nonlocal missing_layout_bindings, extra_bind_group_entries
+        nonlocal unresolved_or_placeholder_bindings
+
+        missing_required = False
+        uses_rt = bool(pipe_info.get("has_rt_layout")) if pipe_info is not None else False
+        expected_group_set: set[int] | None = None
+
+        if pipe_info is not None:
+            pll_id = int(pipe_info.get("pipeline_layout_id", 0))
+            if pll_id != 0 and pll_id in pipeline_layouts:
+                expected_groups = pipeline_layouts[pll_id]
+                expected_group_set = {
+                    idx for idx, bgl_id in enumerate(expected_groups) if bgl_id != 0
+                }
+                for group_idx, expected_bgl_id in enumerate(expected_groups):
+                    if expected_bgl_id == 0:
+                        continue
+                    expected_bgl = layouts.get(expected_bgl_id)
+                    requires_bg = (
+                        expected_bgl is None
+                        or expected_bgl.manifest_reference
+                        or len(expected_bgl.entries) > 0
+                    )
+                    bg_id = active_bind_groups.get(group_idx)
+                    if bg_id is None:
+                        if requires_bg:
+                            missing_required = True
+                            unbound_required_groups += 1
+                            _note_offender_mismatch(
+                                pipe_id, kind, pipe_info, "unbound_required_groups"
+                            )
+                        continue
+                    bg_info = bind_groups.get(bg_id)
+                    if bg_info is None:
+                        missing_required = True
+                        unbound_required_groups += 1
+                        _note_offender_mismatch(
+                            pipe_id, kind, pipe_info, "unbound_required_groups"
+                        )
+                        continue
+                    if bg_info["v2"]:
+                        actual_bgl_id = int(bg_info["layout_id"])
+                        if actual_bgl_id != expected_bgl_id:
+                            actual_bgl = layouts.get(actual_bgl_id)
+                            if not _layouts_equivalent(expected_bgl, actual_bgl):
+                                unresolved_or_placeholder_bindings += 1
+                                _note_offender_mismatch(
+                                    pipe_id,
+                                    kind,
+                                    pipe_info,
+                                    "unresolved_or_placeholder_bindings",
+                                )
+                    elif expected_bgl is not None and not expected_bgl.manifest_reference:
+                        # Cross-check v1 CreateBindGroup against v2 CreateBindGroupLayout.
+                        seen_b: set[int] = set()
+                        for entry in bg_info["entries"]:
+                            b = int(entry["binding"])
+                            rt = int(entry["resource_type"])
+                            if b in seen_b:
+                                extra_bind_group_entries += 1
+                                _note_offender_mismatch(
+                                    pipe_id, kind, pipe_info, "extra_bind_group_entries"
+                                )
+                                continue
+                            seen_b.add(b)
+                            le = expected_bgl.entries.get(b)
+                            if le is None:
+                                extra_bind_group_entries += 1
+                                _note_offender_mismatch(
+                                    pipe_id, kind, pipe_info, "extra_bind_group_entries"
+                                )
+                                continue
+                            exp_pair = _LAYOUT_TYPE_TO_EXPECTED_RESOURCE.get(str(le["type"]))
+                            if exp_pair is not None and rt != int(exp_pair[0]):
+                                resource_kind_mismatches += 1
+                                _note_offender_mismatch(
+                                    pipe_id, kind, pipe_info, "resource_kind_mismatches"
+                                )
+                        for b in sorted(expected_bgl.entries):
+                            if b not in seen_b:
+                                missing_layout_bindings += 1
+                                _note_offender_mismatch(
+                                    pipe_id, kind, pipe_info, "missing_layout_bindings"
+                                )
+
+        # Attribute creation-time bind-group anomalies of bound groups to the active pipeline
+        # and check for RT group-3 bindings.
+        for group_idx, bg_id in sorted(active_bind_groups.items()):
+            bg_info = bind_groups.get(bg_id)
+            if group_idx == RT_ARENA_BIND_GROUP and bg_info is not None:
+                has_rt_bg, new_bad = _audit_rt_group3_bind_group(bg_id)
+                if has_rt_bg:
+                    uses_rt = True
+                if new_bad:
+                    _note_offender_mismatch(
+                        pipe_id, kind, pipe_info, "invalid_rt_group3_slots", new_bad
+                    )
+            if expected_group_set is not None and group_idx not in expected_group_set:
+                continue
+            if bg_info is None:
+                continue
+            for category, count in bg_info["mismatch_counts"].items():
+                _note_offender_mismatch(pipe_id, kind, pipe_info, category, count)
+
+        return missing_required, uses_rt
+
+    def _collect_bound_buffer_ids(*, writable_only: bool = False) -> set[int]:
+        bufs: set[int] = set()
+        for bg_id in active_bind_groups.values():
+            bg_info = bind_groups.get(bg_id)
+            if bg_info is None:
+                continue
+            layout = layouts.get(int(bg_info["layout_id"])) if bg_info["v2"] else None
+            for entry in bg_info["entries"]:
+                if int(entry["resource_type"]) != GpuBindResourceType.Buffer:
+                    continue
+                rid = int(entry["resource_id"])
+                if rid == 0:
+                    continue
+                if writable_only and layout is not None and not layout.manifest_reference:
+                    le = layout.entries.get(int(entry["binding"]))
+                    if le is not None and str(le.get("binding_type")) != "storage":
+                        continue
+                bufs.add(rid)
+        return bufs
+
+    draw_or_dispatch_opcodes = {
+        GpuOpcode.Draw,
+        GpuOpcode.DrawIndexed,
+        GpuOpcode.DrawIndirect,
+        GpuOpcode.DrawIndexedIndirect,
+        GpuOpcode.DispatchCompute,
+        GpuOpcode.DispatchIndirect,
+    }
+
+    for pkt in trace.packets:
+        op = pkt.opcode
+        f = pkt.fields
+
+        if not pkt.valid:
+            if op in draw_or_dispatch_opcodes:
+                skipped_draws_by_cause["invalid_packet"] += 1
+                skipped_draw_calls += 1
+                if op in (GpuOpcode.DispatchCompute, GpuOpcode.DispatchIndirect):
+                    pid = active_compute_pipeline_id
+                    pinfo = compute_pipelines.get(pid) if pid is not None else None
+                    _note_offender_skip(pid, "compute", pinfo, ("invalid_packet",))
+                else:
+                    pid = active_render_pipeline_id
+                    pinfo = render_pipelines.get(pid) if pid is not None else None
+                    _note_offender_skip(pid, "render", pinfo, ("invalid_packet",))
+            continue
+
+        if op == GpuOpcode.CreateShaderModule:
+            mod_id = int(f["id"])
+            resolved_hash = mod_pkt_key_hash.get(pkt.index)
+            if resolved_hash is None:
+                resolved_hash = hash_refs.get(pkt.index)
+            if resolved_hash is None and int(f.get("code_len", 0)) > 0:
+                resolved_hash = str(f["wgsl_hash_fnv1a64"])
+            active_module_hashes[mod_id] = resolved_hash
+            destroyed_resources.discard(mod_id)
+
+        elif op == GpuOpcode.CreateBuffer:
+            bid = int(f["id"])
+            live_buffers[bid] = {
+                "usage_flags": int(f.get("usage_flags", 0)),
+                "byte_size": int(f.get("byte_size", 0)),
+            }
+            destroyed_resources.discard(bid)
+
+        elif op in (GpuOpcode.CreateTexture, GpuOpcode.CreateTexture2):
+            tid = int(f["id"])
+            live_textures.add(tid)
+            destroyed_resources.discard(tid)
+
+        elif op in (GpuOpcode.CreateSampler, GpuOpcode.CreateSampler2):
+            sid = int(f["id"])
+            live_samplers.add(sid)
+            destroyed_resources.discard(sid)
+
+        elif op == GpuOpcode.CreateBindGroupLayout:
+            layout_id = int(f["id"])
+            entries_map = {int(e["binding"]): e for e in f.get("entries", ())}
+            layouts[layout_id] = _BindGroupLayoutRecord(
+                layout_id=layout_id,
+                manifest_reference=bool(f["manifest_reference"]),
+                content_id=str(f["content_id"]),
+                entries=entries_map,
+            )
+            destroyed_resources.discard(layout_id)
+            checked_rt_group3_layouts.discard(layout_id)
+            flagged_rt_group3_layout_bindings.pop(layout_id, None)
+
+        elif op == GpuOpcode.CreatePipelineLayout:
+            pll_id = int(f["id"])
+            bgl_ids = [int(x) for x in f.get("bind_group_layout_ids", ())]
+            pipeline_layouts[pll_id] = bgl_ids
+            destroyed_resources.discard(pll_id)
+            for bgl_id in bgl_ids:
+                if bgl_id != 0 and bgl_id not in layouts:
+                    unresolved_or_placeholder_bindings += 1
+            if len(bgl_ids) > RT_ARENA_BIND_GROUP and bgl_ids[RT_ARENA_BIND_GROUP] != 0:
+                _audit_rt_group3_layout(bgl_ids[RT_ARENA_BIND_GROUP])
+
+        elif op == GpuOpcode.CreateBindGroup:
+            bg_id = int(f["id"])
+            bg_entries = list(f.get("entries", ()))
+            group_idx_hint = int(f.get("group_index", 0))
+            bg_mismatches: Counter[str] = Counter()
+            for entry in bg_entries:
+                rid = int(entry["resource_id"])
+                if rid == 0 or rid in destroyed_resources:
+                    unresolved_or_placeholder_bindings += 1
+                    bg_mismatches["unresolved_or_placeholder_bindings"] += 1
+            bind_groups[bg_id] = {
+                "v2": False,
+                "layout_id": 0,
+                "group_index": group_idx_hint,
+                "entries": bg_entries,
+                "mismatch_counts": bg_mismatches,
+            }
+            destroyed_resources.discard(bg_id)
+            checked_rt_group3_bgs.discard(bg_id)
+            if group_idx_hint == RT_ARENA_BIND_GROUP:
+                _audit_rt_group3_bind_group(bg_id)
+
+        elif op == GpuOpcode.CreateBindGroup2:
+            bg_id = int(f["id"])
+            layout_id = int(f["layout_id"])
+            bg_entries = list(f.get("entries", ()))
+            bg_mismatches = Counter()
+
+            for entry in bg_entries:
+                rid = int(entry["resource_id"])
+                if bool(entry.get("null_binding")) or rid == 0:
+                    unresolved_or_placeholder_bindings += 1
+                    bg_mismatches["unresolved_or_placeholder_bindings"] += 1
+                elif rid in destroyed_resources:
+                    unresolved_or_placeholder_bindings += 1
+                    bg_mismatches["unresolved_or_placeholder_bindings"] += 1
+
+            layout = layouts.get(layout_id)
+            if layout is None:
+                unresolved_or_placeholder_bindings += 1
+                bg_mismatches["unresolved_or_placeholder_bindings"] += 1
+            elif not layout.manifest_reference:
+                seen_bindings: set[int] = set()
+                for entry in bg_entries:
+                    binding = int(entry["binding"])
+                    rtype = int(entry["resource_type"])
+                    if binding in seen_bindings:
+                        extra_bind_group_entries += 1
+                        bg_mismatches["extra_bind_group_entries"] += 1
+                        continue
+                    seen_bindings.add(binding)
+                    layout_entry = layout.entries.get(binding)
+                    if layout_entry is None:
+                        extra_bind_group_entries += 1
+                        bg_mismatches["extra_bind_group_entries"] += 1
+                        continue
+                    expected_pair = _LAYOUT_TYPE_TO_EXPECTED_RESOURCE.get(str(layout_entry["type"]))
+                    if expected_pair is not None and rtype != int(expected_pair[0]):
+                        resource_kind_mismatches += 1
+                        bg_mismatches["resource_kind_mismatches"] += 1
+                for binding in sorted(layout.entries):
+                    if binding not in seen_bindings:
+                        missing_layout_bindings += 1
+                        bg_mismatches["missing_layout_bindings"] += 1
+
+            bind_groups[bg_id] = {
+                "v2": True,
+                "layout_id": layout_id,
+                "group_index": None,
+                "entries": bg_entries,
+                "mismatch_counts": bg_mismatches,
+            }
+            destroyed_resources.discard(bg_id)
+            checked_rt_group3_bgs.discard(bg_id)
+
+        elif op == GpuOpcode.CreateRenderPipeline:
+            pid = int(f["id"])
+            vs_id = int(f["vs_shader_id"])
+            fs_id = int(f["fs_shader_id"])
+            vstride = int(f.get("vertex_stride", 0))
+            render_pipelines[pid] = {
+                "id": pid,
+                "v2": False,
+                "vs_shader": _resolve_shader_hash(vs_id, None),
+                "ps_shader": _resolve_shader_hash(fs_id, None),
+                "pipeline_layout_id": 0,
+                "required_vertex_slots": {0} if vstride > 0 else set(),
+                "vertex_buffer_count": 1 if vstride > 0 else 0,
+                "has_rt_layout": False,
+            }
+            destroyed_resources.discard(pid)
+
+        elif op == GpuOpcode.CreateRenderPipeline2:
+            pid = int(f["id"])
+            vs_id = int(f["vs_module_id"])
+            fs_id = int(f["fs_module_id"])
+            pll_id = int(f["pipeline_layout_id"])
+            key = f["key"]
+            required_vb_slots: set[int] = set()
+            for slot_idx, vb in enumerate(key.get("vertex_buffers") or ()):
+                if vb is not None:
+                    required_vb_slots.add(slot_idx)
+                    for attr in vb.get("attributes") or ():
+                        required_vb_slots.add(int(attr["buffer_index"]))
+            has_rt_layout = False
+            if pll_id != 0 and pll_id in pipeline_layouts:
+                bgl_ids = pipeline_layouts[pll_id]
+                if len(bgl_ids) > RT_ARENA_BIND_GROUP and bgl_ids[RT_ARENA_BIND_GROUP] != 0:
+                    has_rt_layout = _audit_rt_group3_layout(bgl_ids[RT_ARENA_BIND_GROUP])
+            render_pipelines[pid] = {
+                "id": pid,
+                "v2": True,
+                "vs_shader": _resolve_shader_hash(vs_id, str(key["vs_shader"])),
+                "ps_shader": _resolve_shader_hash(fs_id, str(key["ps_shader"])),
+                "pipeline_layout_id": pll_id,
+                "required_vertex_slots": required_vb_slots,
+                "vertex_buffer_count": int(key.get("vertex_buffer_count", 0)),
+                "has_rt_layout": has_rt_layout,
+            }
+            destroyed_resources.discard(pid)
+
+        elif op == GpuOpcode.CreateComputePipeline:
+            pid = int(f["id"])
+            cs_id = int(f["cs_shader_id"])
+            pflags = int(f.get("flags", 0))
+            compute_pipelines[pid] = {
+                "id": pid,
+                "v2": False,
+                "cs_shader": _resolve_shader_hash(cs_id, None),
+                "pipeline_layout_id": 0,
+                "flags": pflags,
+                "is_flagged_mesh": bool(pflags & 0x1),
+                "has_rt_layout": False,
+            }
+            destroyed_resources.discard(pid)
+
+        elif op == GpuOpcode.CreateComputePipeline2:
+            pid = int(f["id"])
+            cs_id = int(f["cs_module_id"])
+            pll_id = int(f["pipeline_layout_id"])
+            cs_hash = str(f["cs_shader"])
+            has_rt_layout = False
+            if pll_id != 0 and pll_id in pipeline_layouts:
+                bgl_ids = pipeline_layouts[pll_id]
+                if len(bgl_ids) > RT_ARENA_BIND_GROUP and bgl_ids[RT_ARENA_BIND_GROUP] != 0:
+                    has_rt_layout = _audit_rt_group3_layout(bgl_ids[RT_ARENA_BIND_GROUP])
+            compute_pipelines[pid] = {
+                "id": pid,
+                "v2": True,
+                "cs_shader": _resolve_shader_hash(cs_id, cs_hash),
+                "pipeline_layout_id": pll_id,
+                "flags": 0,
+                "is_flagged_mesh": False,
+                "has_rt_layout": has_rt_layout,
+            }
+            destroyed_resources.discard(pid)
+
+        elif op == GpuOpcode.DestroyResource:
+            rid = int(f["id"])
+            destroyed_resources.add(rid)
+            active_module_hashes.pop(rid, None)
+            live_buffers.pop(rid, None)
+            live_textures.discard(rid)
+            live_samplers.discard(rid)
+            layouts.pop(rid, None)
+            pipeline_layouts.pop(rid, None)
+            bind_groups.pop(rid, None)
+            render_pipelines.pop(rid, None)
+            compute_pipelines.pop(rid, None)
+            if active_render_pipeline_id == rid:
+                active_render_pipeline_id = None
+            if active_compute_pipeline_id == rid:
+                active_compute_pipeline_id = None
+            for slot in [s for s, bid in active_vertex_buffers.items() if bid == rid]:
+                active_vertex_buffers.pop(slot, None)
+            if active_index_buffer == rid:
+                active_index_buffer = None
+            for g in [grp for grp, bg in active_bind_groups.items() if bg == rid]:
+                active_bind_groups.pop(g, None)
+
+        elif op == GpuOpcode.BeginFrame:
+            _close_render_pass(paired=False)
+            _close_compute_pass()
+            in_frame = True
+            active_bind_groups.clear()
+            active_compute_pipeline_id = None
+            lazy_render_pass_has_indirect = False
+            lazy_render_pass_has_rt = False
+            compute_written_buffers.clear()
+
+        elif op == GpuOpcode.Present:
+            _close_render_pass(paired=False)
+            _close_compute_pass()
+            in_frame = not has_begin_frame_packets
+            active_bind_groups.clear()
+            active_compute_pipeline_id = None
+            lazy_render_pass_has_indirect = False
+            lazy_render_pass_has_rt = False
+            compute_written_buffers.clear()
+
+        elif op == GpuOpcode.BeginRenderPass:
+            _close_compute_pass()
+            if active_render_pass is not None:
+                _close_render_pass(paired=False)
+            rp_begin += 1
+            active_pass_kind = "render"
+            active_bind_groups.clear()
+            active_render_pipeline_id = None
+            active_vertex_buffers.clear()
+            active_index_buffer = None
+
+            colors = [c for c in (f.get("color_attachments") or ()) if c is not None]
+            color_cnt = len(colors)
+            has_depth = f.get("depth_stencil") is not None
+            has_swapchain = any(bool(c.get("swapchain")) for c in colors)
+            is_mrt = color_cnt > 1
+            if color_cnt > rp_max_colors:
+                rp_max_colors = color_cnt
+            if color_cnt > 0 and has_depth:
+                rp_color_and_depth += 1
+            elif color_cnt > 0:
+                rp_color_only += 1
+            elif has_depth:
+                rp_depth_only += 1
+            else:
+                rp_empty += 1
+            if has_swapchain:
+                rp_swapchain += 1
+            if is_mrt:
+                rp_mrt += 1
+
+            active_render_pass = {
+                "has_indirect": False,
+                "has_rt": False,
+                "has_mesh": False,
+            }
+
+        elif op == GpuOpcode.EndRenderPass:
+            rp_end += 1
+            if active_render_pass is not None:
+                _close_render_pass(paired=True)
+                active_bind_groups.clear()
+            else:
+                rp_unmatched_end += 1
+
+        elif op == GpuOpcode.SetPipeline:
+            _close_compute_pass()
+            if active_pass_kind != "render":
+                active_pass_kind = "render"
+                lazy_render_pass_has_indirect = False
+                lazy_render_pass_has_rt = False
+            active_render_pipeline_id = int(f["pipeline_id"])
+
+        elif op == GpuOpcode.SetComputePipeline:
+            _ensure_compute_pass()
+            active_compute_pipeline_id = int(f["pipeline_id"])
+
+        elif op == GpuOpcode.SetVertexBuffer:
+            slot = int(f["slot"])
+            bid = int(f["buffer_id"])
+            if bid == 0 or bid in destroyed_resources:
+                active_vertex_buffers.pop(slot, None)
+            else:
+                active_vertex_buffers[slot] = bid
+
+        elif op == GpuOpcode.SetIndexBuffer:
+            bid = int(f["buffer_id"])
+            if bid == 0 or bid in destroyed_resources:
+                active_index_buffer = None
+            else:
+                active_index_buffer = bid
+
+        elif op in (GpuOpcode.SetBindGroup, GpuOpcode.SetBindGroup2):
+            group_idx = int(f["group_index"])
+            bg_id = int(f["bind_group_id"])
+            active_bind_groups[group_idx] = bg_id
+            if bg_id not in bind_groups:
+                unresolved_or_placeholder_bindings += 1
+            elif group_idx == RT_ARENA_BIND_GROUP:
+                has_rt_bg, _ = _audit_rt_group3_bind_group(bg_id)
+                if has_rt_bg:
+                    rt_set_bind_group_calls += 1
+
+        elif op in (
+            GpuOpcode.Draw,
+            GpuOpcode.DrawIndexed,
+            GpuOpcode.DrawIndirect,
+            GpuOpcode.DrawIndexedIndirect,
+        ):
+            _close_compute_pass()
+            if active_pass_kind != "render":
+                active_pass_kind = "render"
+                lazy_render_pass_has_indirect = False
+                lazy_render_pass_has_rt = False
+
+            is_indirect = op in (GpuOpcode.DrawIndirect, GpuOpcode.DrawIndexedIndirect)
+            is_indexed = op in (GpuOpcode.DrawIndexed, GpuOpcode.DrawIndexedIndirect)
+            if op == GpuOpcode.DrawIndirect:
+                draw_indirect_count += 1
+                indirect_buffer_ids.add(int(f["buffer_id"]))
+            elif op == GpuOpcode.DrawIndexedIndirect:
+                draw_indexed_indirect_count += 1
+                indirect_buffer_ids.add(int(f["buffer_id"]))
+
+            if active_render_pass is not None:
+                rp_draws_inside += 1
+                if is_indirect and not active_render_pass["has_indirect"]:
+                    active_render_pass["has_indirect"] = True
+                    indirect_passes += 1
+            elif is_indirect and not lazy_render_pass_has_indirect:
+                lazy_render_pass_has_indirect = True
+                indirect_passes += 1
+
+            causes: list[str] = []
+            pid = active_render_pipeline_id
+            pipe_info = render_pipelines.get(pid) if pid is not None else None
+            if pid is None or pipe_info is None:
+                causes.append("no_pipeline_bound")
+
+            if op == GpuOpcode.Draw:
+                if int(f["vertex_count"]) == 0 or int(f["instance_count"]) == 0:
+                    causes.append("zero_geometry")
+            elif op == GpuOpcode.DrawIndexed:
+                if int(f["index_count"]) == 0 or int(f["instance_count"]) == 0:
+                    causes.append("zero_geometry")
+
+            if active_render_pass is None:
+                if uses_explicit_render_passes or (pipe_info is not None and pipe_info["v2"]) or not in_frame:
+                    causes.append("outside_render_pass")
+
+            if is_indexed and active_index_buffer is None:
+                causes.append("missing_index_buffer")
+
+            if pipe_info is not None:
+                req_vb = pipe_info["required_vertex_slots"]
+                if req_vb and any(slot not in active_vertex_buffers for slot in req_vb):
+                    causes.append("missing_vertex_buffer")
+
+            uses_rt = False
+            if pid is not None and pipe_info is not None:
+                missing_bg, uses_rt = _check_pipeline_bindings(pid, "render", pipe_info)
+                if missing_bg:
+                    causes.append("missing_bind_group")
+
+            if uses_rt:
+                if active_render_pass is not None:
+                    if not active_render_pass["has_rt"]:
+                        active_render_pass["has_rt"] = True
+                        rt_passes += 1
+                elif not lazy_render_pass_has_rt:
+                    lazy_render_pass_has_rt = True
+                    rt_passes += 1
+
+            # Detect mesh-shader-to-compute -> draw pairs.
+            if is_indirect:
+                ind_buf = int(f["buffer_id"])
+                producer = compute_written_buffers.get(ind_buf)
+                if producer is not None:
+                    mesh_compute_to_indirect_draws += 1
+                    c_pass_id = int(producer["compute_pass_id"])
+                    if c_pass_id not in counted_mesh_compute_passes:
+                        counted_mesh_compute_passes.add(c_pass_id)
+                        mesh_passes += 1
+                    if producer["pipeline_id"] is not None:
+                        mesh_pipeline_ids.add(int(producer["pipeline_id"]))
+                    if pid is not None:
+                        mesh_pipeline_ids.add(pid)
+            elif pipe_info is not None and pipe_info["v2"] and pipe_info["vertex_buffer_count"] == 0:
+                bound_bufs = _collect_bound_buffer_ids(writable_only=False)
+                for b_id in sorted(bound_bufs):
+                    producer = compute_written_buffers.get(b_id)
+                    if producer is not None:
+                        mesh_compute_to_mesh_draws += 1
+                        c_pass_id = int(producer["compute_pass_id"])
+                        if c_pass_id not in counted_mesh_compute_passes:
+                            counted_mesh_compute_passes.add(c_pass_id)
+                            mesh_passes += 1
+                        if producer["pipeline_id"] is not None:
+                            mesh_pipeline_ids.add(int(producer["pipeline_id"]))
+                        if pid is not None:
+                            mesh_pipeline_ids.add(pid)
+                        break
+
+            if causes:
+                skipped_draw_calls += 1
+                for c in causes:
+                    skipped_draws_by_cause[c] += 1
+                _note_offender_skip(pid, "render", pipe_info, causes)
+
+        elif op in (GpuOpcode.DispatchCompute, GpuOpcode.DispatchIndirect):
+            _ensure_compute_pass()
+            is_indirect = op == GpuOpcode.DispatchIndirect
+            if is_indirect:
+                indirect_compute_dispatches += 1
+                dispatch_indirect_count += 1
+                indirect_buffer_ids.add(int(f["buffer_id"]))
+                if not compute_pass_has_indirect:
+                    compute_pass_has_indirect = True
+                    indirect_passes += 1
+            else:
+                direct_compute_dispatches += 1
+
+            causes = []
+            pid = active_compute_pipeline_id
+            pipe_info = compute_pipelines.get(pid) if pid is not None else None
+            if pid is None or pipe_info is None:
+                causes.append("no_pipeline_bound")
+
+            if op == GpuOpcode.DispatchCompute:
+                if (
+                    int(f["workgroup_x"]) == 0
+                    or int(f["workgroup_y"]) == 0
+                    or int(f["workgroup_z"]) == 0
+                ):
+                    causes.append("zero_geometry")
+
+            uses_rt = False
+            if pid is not None and pipe_info is not None:
+                missing_bg, uses_rt = _check_pipeline_bindings(pid, "compute", pipe_info)
+                if missing_bg:
+                    causes.append("missing_bind_group")
+
+            if uses_rt:
+                rt_dispatches += 1
+                if not compute_pass_has_rt:
+                    compute_pass_has_rt = True
+                    rt_passes += 1
+
+            if pipe_info is not None and pipe_info["is_flagged_mesh"]:
+                mesh_flagged_dispatches += 1
+                if compute_pass_id not in counted_mesh_compute_passes:
+                    counted_mesh_compute_passes.add(compute_pass_id)
+                    mesh_passes += 1
+                if pid is not None:
+                    mesh_pipeline_ids.add(pid)
+
+            # Record storage buffers written by this compute dispatch for mesh pass pairing.
+            for b_id in _collect_bound_buffer_ids(writable_only=True):
+                compute_written_buffers[b_id] = {
+                    "compute_pass_id": compute_pass_id,
+                    "pipeline_id": pid,
+                }
+
+            if causes:
+                skipped_draw_calls += 1
+                for c in causes:
+                    skipped_draws_by_cause[c] += 1
+                _note_offender_skip(pid, "compute", pipe_info, causes)
+
+    # Close any open pass at EOF.
+    _close_render_pass(paired=False)
+    _close_compute_pass()
+
+    total_compute_dispatches = direct_compute_dispatches + indirect_compute_dispatches
+    total_indirect_calls = (
+        draw_indirect_count + draw_indexed_indirect_count + dispatch_indirect_count
+    )
+    total_skipped_events = sum(skipped_draws_by_cause.values())
+    total_binding_mismatches = (
+        unbound_required_groups
+        + resource_kind_mismatches
+        + missing_layout_bindings
+        + extra_bind_group_entries
+        + invalid_rt_group3_slots
+        + unresolved_or_placeholder_bindings
+    )
+
+    ranked_offenders: list[dict[str, Any]] = []
+    for rec in offenders.values():
+        total_issues = int(rec["skipped_draws"]) + int(rec["binding_mismatches"])
+        if total_issues <= 0:
+            continue
+        ranked_offenders.append(
+            {
+                "pipeline_id": rec["pipeline_id"],
+                "kind": rec["kind"],
+                "vs_shader": rec["vs_shader"],
+                "ps_shader": rec["ps_shader"],
+                "cs_shader": rec["cs_shader"],
+                "total_issues": total_issues,
+                "skipped_draws": int(rec["skipped_draws"]),
+                "binding_mismatches": int(rec["binding_mismatches"]),
+                "causes": dict(sorted(rec["causes"].items())),
+            }
+        )
+    ranked_offenders.sort(
+        key=lambda item: (
+            -item["total_issues"],
+            -item["skipped_draws"],
+            -item["binding_mismatches"],
+            item["kind"],
+            item["pipeline_id"] if item["pipeline_id"] is not None else -1,
+            item["vs_shader"] or "",
+            item["ps_shader"] or "",
+            item["cs_shader"] or "",
+        )
+    )
+    bounded_offenders = ranked_offenders[:max_offenders]
+
+    ok = (
+        skipped_draw_calls == 0
+        and total_binding_mismatches == 0
+        and rp_unclosed == 0
+        and rp_unmatched_end == 0
+    )
+
+    return {
+        "schema": SCENE_PASS_SUMMARY_SCHEMA,
+        "version": SCENE_PASS_SUMMARY_VERSION,
+        "ok": ok,
+        "frame_count": trace.frame_count,
+        "present_count": trace.present_count,
+        "render_passes": {
+            "begin_count": rp_begin,
+            "end_count": rp_end,
+            "paired": rp_paired,
+            "unclosed": rp_unclosed,
+            "unmatched_end": rp_unmatched_end,
+            "color_only": rp_color_only,
+            "depth_only": rp_depth_only,
+            "color_and_depth": rp_color_and_depth,
+            "empty": rp_empty,
+            "swapchain": rp_swapchain,
+            "mrt": rp_mrt,
+            "max_color_attachments": rp_max_colors,
+            "draws_in_render_passes": rp_draws_inside,
+        },
+        "compute_passes": compute_passes,
+        "compute_dispatches": total_compute_dispatches,
+        "direct_compute_dispatches": direct_compute_dispatches,
+        "indirect_compute_dispatches": indirect_compute_dispatches,
+        "indirect_passes": indirect_passes,
+        "indirect_calls": {
+            "total": total_indirect_calls,
+            "draw_indirect": draw_indirect_count,
+            "draw_indexed_indirect": draw_indexed_indirect_count,
+            "dispatch_indirect": dispatch_indirect_count,
+            "unique_buffer_count": len(indirect_buffer_ids),
+        },
+        "mesh_passes": mesh_passes,
+        "mesh_pass_details": {
+            "compute_to_indirect_draws": mesh_compute_to_indirect_draws,
+            "compute_to_mesh_draws": mesh_compute_to_mesh_draws,
+            "flagged_mesh_dispatches": mesh_flagged_dispatches,
+            "pipeline_ids": sorted(mesh_pipeline_ids)[:max_offenders],
+        },
+        "rt_passes": rt_passes,
+        "rt_group3_bindings": {
+            "layouts_with_rt_slots": len(rt_layouts_seen),
+            "bind_groups_with_rt_slots": len(rt_bind_groups_seen),
+            "set_bind_group_calls": rt_set_bind_group_calls,
+            "arena_slots_seen": sorted(rt_arena_slots_seen),
+            "rt_dispatches": rt_dispatches,
+            "invalid_slot_count": invalid_rt_group3_slots,
+        },
+        "skipped_draw_calls": skipped_draw_calls,
+        "total_skipped_events": total_skipped_events,
+        "skipped_draws_by_cause": skipped_draws_by_cause,
+        "binding_reflection_mismatches": {
+            "total": total_binding_mismatches,
+            "unbound_required_groups": unbound_required_groups,
+            "resource_kind_mismatches": resource_kind_mismatches,
+            "missing_layout_bindings": missing_layout_bindings,
+            "extra_bind_group_entries": extra_bind_group_entries,
+            "invalid_rt_group3_slots": invalid_rt_group3_slots,
+            "unresolved_or_placeholder_bindings": unresolved_or_placeholder_bindings,
+            "top_offenders": bounded_offenders,
+            "total_offenders": len(ranked_offenders),
+        },
+    }
+
+
+def format_scene_pass_summary_text(summary: dict[str, Any]) -> str:
+    """Format a build_scene_pass_summary() dictionary as a strictly sanitized text report."""
+    rp = summary["render_passes"]
+    ind = summary["indirect_calls"]
+    mesh_d = summary["mesh_pass_details"]
+    rt = summary["rt_group3_bindings"]
+    skips = summary["skipped_draws_by_cause"]
+    mm = summary["binding_reflection_mismatches"]
+    status = "CLEAN" if summary["ok"] else "ISSUES FOUND"
+
+    lines: list[str] = [
+        f"3D Scene Pass Summary [{status}]:",
+        (
+            f"  Render Passes: begin={rp['begin_count']} end={rp['end_count']} "
+            f"(paired={rp['paired']}, unclosed={rp['unclosed']}, unmatched_end={rp['unmatched_end']}) | "
+            f"color_only={rp['color_only']} depth_only={rp['depth_only']} "
+            f"color+depth={rp['color_and_depth']} swapchain={rp['swapchain']} mrt={rp['mrt']}"
+        ),
+        (
+            f"  Compute: passes={summary['compute_passes']} dispatches={summary['compute_dispatches']} "
+            f"(direct={summary['direct_compute_dispatches']}, indirect={summary['indirect_compute_dispatches']})"
+        ),
+        (
+            f"  Indirect: passes={summary['indirect_passes']} calls={ind['total']} "
+            f"(draw_indirect={ind['draw_indirect']}, draw_indexed_indirect={ind['draw_indexed_indirect']}, "
+            f"dispatch_indirect={ind['dispatch_indirect']}, buffers={ind['unique_buffer_count']})"
+        ),
+        (
+            f"  Mesh Passes: {summary['mesh_passes']} "
+            f"(compute->indirect={mesh_d['compute_to_indirect_draws']}, "
+            f"compute->mesh_draw={mesh_d['compute_to_mesh_draws']}, "
+            f"flagged={mesh_d['flagged_mesh_dispatches']})"
+        ),
+        (
+            f"  RT Passes: {summary['rt_passes']} (rt_dispatches={rt['rt_dispatches']}) | "
+            f"Group3 RT: layouts={rt['layouts_with_rt_slots']} bgs={rt['bind_groups_with_rt_slots']} "
+            f"sets={rt['set_bind_group_calls']} slots={rt['arena_slots_seen']} "
+            f"invalid_slots={rt['invalid_slot_count']}"
+        ),
+        (
+            f"  Skipped Draws/Dispatches: calls={summary['skipped_draw_calls']} "
+            f"(events={summary['total_skipped_events']})"
+        ),
+    ]
+    nonzero_skips = [(k, v) for k, v in skips.items() if v > 0]
+    if nonzero_skips:
+        lines.append("    " + ", ".join(f"{k}={v}" for k, v in nonzero_skips))
+    else:
+        lines.append("    (none)")
+
+    lines.append(
+        f"  Binding/Reflection Mismatches: total={mm['total']} "
+        f"(unbound_groups={mm['unbound_required_groups']}, "
+        f"kind={mm['resource_kind_mismatches']}, "
+        f"missing_bindings={mm['missing_layout_bindings']}, "
+        f"extra_entries={mm['extra_bind_group_entries']}, "
+        f"invalid_rt_g3={mm['invalid_rt_group3_slots']}, "
+        f"unresolved_placeholder={mm['unresolved_or_placeholder_bindings']})"
+    )
+
+    offenders = mm.get("top_offenders") or []
+    if offenders:
+        lines.append(
+            f"  Top Offending Pipelines ({len(offenders)} of {mm['total_offenders']}):"
+        )
+        for item in offenders:
+            pid_str = f"#{item['pipeline_id']}" if item["pipeline_id"] is not None else "(none)"
+            if item["kind"] == "compute":
+                shader_str = f"cs={item['cs_shader'] or 'none'}"
+            else:
+                shader_str = f"vs={item['vs_shader'] or 'none'} ps={item['ps_shader'] or 'none'}"
+            causes_str = ", ".join(f"{k}={v}" for k, v in item["causes"].items())
+            lines.append(
+                f"    - {item['kind']} pipeline {pid_str} ({shader_str}): "
+                f"issues={item['total_issues']} (skips={item['skipped_draws']}, "
+                f"mismatches={item['binding_mismatches']}) [{causes_str}]"
             )
 
     return "\n".join(lines)
@@ -7729,6 +8999,8 @@ def _format_v2_fields(op: int, f: dict[str, Any]) -> str:
             f"filter=(mag={f['mag_filter']},min={f['min_filter']},mip={f['mipmap_filter']}) "
             f"aniso={f['max_anisotropy']} lod=[{f['lod_min_clamp']:g},{f['lod_max_clamp']:g}]{cmp}"
         )
+    if op in (GpuOpcode.DrawIndirect, GpuOpcode.DrawIndexedIndirect, GpuOpcode.DispatchIndirect):
+        return f"buffer=#{f['buffer_id']} offset={f['offset']}"
     return " ".join(f"{k}={v}" for k, v in f.items())
 
 
@@ -7746,6 +9018,7 @@ def format_trace_text(
     binding_audit: bool = False,
     bink_video_audit: bool = False,
     start_screen_skips: bool = False,
+    scene_pass_summary: bool = False,
     analyze_30fps: bool = False,
     budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
     top_n: int = DEFAULT_TOP_N,
@@ -7874,6 +9147,14 @@ def format_trace_text(
         lines.append("")
         lines.append(format_start_screen_skips_text(audit_start_screen_skips(trace)))
 
+    if scene_pass_summary:
+        lines.append("")
+        lines.append(
+            format_scene_pass_summary_text(
+                build_scene_pass_summary(trace, top_n=top_n)
+            )
+        )
+
     if analyze_30fps:
         lines.append("")
         lines.append(
@@ -7893,6 +9174,7 @@ def trace_to_json(
     binding_audit: bool = False,
     bink_video_audit: bool = False,
     start_screen_skips: bool = False,
+    scene_pass_summary: bool = False,
     analyze_30fps: bool = False,
     budget_ms: float = DEFAULT_30FPS_BUDGET_MS,
     top_n: int = DEFAULT_TOP_N,
@@ -7906,6 +9188,7 @@ def trace_to_json(
             binding_audit=binding_audit,
             bink_video_audit=bink_video_audit,
             start_screen_skips=start_screen_skips,
+            scene_pass_summary=scene_pass_summary,
             analyze_30fps=analyze_30fps,
             budget_ms=budget_ms,
             top_n=top_n,
@@ -7976,6 +9259,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Rank top pipelines/shader pairs associated with skipped/unemitted draws "
             "or missing-binding anomalies in sanitized text/JSON output."
+        ),
+    )
+    parser.add_argument(
+        "--scene-pass-summary",
+        action="store_true",
+        help=(
+            "Emit a strictly sanitized 3D scene pass summary (render/compute/indirect/mesh/RT "
+            "pass counts, skipped draws by cause, and binding/reflection mismatch breakdown)."
         ),
     )
     parser.add_argument(
@@ -8052,6 +9343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             or args.binding_audit
             or args.bink_video_audit
             or args.start_screen_skips
+            or args.scene_pass_summary
         )
         is_timing_log = _is_timing_log_input(raw_bytes, source_hint=source_hint)
         if is_timing_log or not has_binary_flags:
@@ -8086,6 +9378,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binding_audit=args.binding_audit,
                 bink_video_audit=args.bink_video_audit,
                 start_screen_skips=args.start_screen_skips,
+                scene_pass_summary=args.scene_pass_summary,
                 analyze_30fps=run_analyze_30fps,
                 budget_ms=budget_ms,
                 top_n=top_n,
@@ -8100,6 +9393,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 binding_audit=args.binding_audit,
                 bink_video_audit=args.bink_video_audit,
                 start_screen_skips=args.start_screen_skips,
+                scene_pass_summary=args.scene_pass_summary,
                 analyze_30fps=run_analyze_30fps,
                 budget_ms=budget_ms,
                 top_n=top_n,

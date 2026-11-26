@@ -1597,5 +1597,425 @@ class WgpkV2LargeOffsetTests(unittest.TestCase):
             wgpk.build_wgpk(self.ENTRIES, version=3)
 
 
+class _VirtualSparseWgpkStream:
+    """In-memory seekable stream simulating a >4 GiB WGPK v2 pack without allocating GiB of RAM.
+
+    Any attempt to read the entire stream at once (`size < 0` or `size > max_allowed_read`)
+    immediately fails the test so true streaming I/O is strictly proven.
+    """
+
+    def __init__(
+        self,
+        total_size: int,
+        segments: Sequence[tuple[int, bytes]],
+        *,
+        max_allowed_read: int = 1024 * 1024,
+    ) -> None:
+        self.total_size = total_size
+        self.segments = sorted(segments, key=lambda item: item[0])
+        self.max_allowed_read = max_allowed_read
+        self.pos = 0
+        self.max_single_read = 0
+        self.total_bytes_read = 0
+        self.read_ranges: list[tuple[int, int]] = []
+
+    def tell(self) -> int:
+        return self.pos
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 0:
+            new_pos = offset
+        elif whence == 1:
+            new_pos = self.pos + offset
+        elif whence == 2:
+            new_pos = self.total_size + offset
+        else:
+            raise ValueError(f"unsupported whence: {whence}")
+        if new_pos < 0:
+            raise ValueError(f"negative seek position: {new_pos}")
+        self.pos = new_pos
+        return self.pos
+
+    def read(self, size: int = -1) -> bytes:
+        if size < 0:
+            raise AssertionError("streaming reader must never call read(-1) on a >4 GiB pack")
+        if size > self.max_allowed_read:
+            raise AssertionError(
+                f"streaming read size {size} exceeds max_allowed_read {self.max_allowed_read}"
+            )
+        if size == 0 or self.pos >= self.total_size:
+            return b""
+        count = min(size, self.total_size - self.pos)
+        start = self.pos
+        end = start + count
+        buf = bytearray(count)
+        for seg_off, seg_bytes in self.segments:
+            seg_end = seg_off + len(seg_bytes)
+            ov_start = max(start, seg_off)
+            ov_end = min(end, seg_end)
+            if ov_start < ov_end:
+                buf[ov_start - start : ov_end - start] = seg_bytes[
+                    ov_start - seg_off : ov_end - seg_off
+                ]
+        self.pos = end
+        self.max_single_read = max(self.max_single_read, count)
+        self.total_bytes_read += count
+        self.read_ranges.append((start, end))
+        return bytes(buf)
+
+
+def _build_virtual_v2_stream(
+    entries: Sequence[tuple[int, str, str, int]],
+    *,
+    flags: int = 0,
+    extra_tail: int = 0,
+) -> _VirtualSparseWgpkStream:
+    """Build a virtual seekable WGPK v2 stream from `(hash, stage, wgsl, offset)` tuples."""
+    header = wgpk.PACK_HEADER_STRUCT.pack(
+        wgpk.PACK_MAGIC, wgpk.PACK_VERSION_V2, len(entries), flags
+    )
+    toc = bytearray()
+    segments: list[tuple[int, bytes]] = []
+    max_end = wgpk.PACK_HEADER_BYTES + len(entries) * wgpk.PACK_ENTRY_BYTES_V2
+    for shader_hash, stage_name, wgsl, offset in entries:
+        payload = wgsl.encode("utf-8")
+        stage = wgpk.ShaderStage.from_value(stage_name)
+        toc += wgpk.PACK_ENTRY_STRUCT_V2.pack(
+            shader_hash, int(stage), b"\x00\x00\x00", len(payload), offset
+        )
+        if payload:
+            segments.append((offset, payload))
+        max_end = max(max_end, offset + len(payload))
+    segments.insert(0, (0, header + bytes(toc)))
+    return _VirtualSparseWgpkStream(max_end + extra_tail, segments)
+
+
+class TestWgpkV2StreamingAndReflectVersions(unittest.TestCase):
+    """T104 tests: >4 GiB WGPK v2 streaming inspect/diff/toc, reflect v1/v2/v3, native vs DXIL-only."""
+
+    def test_gt4gib_v2_stream_toc_inspect_verify_and_diff_never_load_whole_pack(self) -> None:
+        base_gt4g = (1 << 32) + 4096  # > 4 GiB (0x1_0000_1000)
+        h_vs = 0xAA00000000000001
+        h_fs = 0xAA00000000000002
+        h_cs = 0xAA00000000000003
+        h_added = 0xAA00000000000004
+
+        stream_a = _build_virtual_v2_stream(
+            [
+                (h_vs, "vertex", MINIMAL_VERTEX_WGSL, base_gt4g),
+                (h_fs, "fragment", MINIMAL_FRAGMENT_WGSL, base_gt4g + 4096),
+                (h_cs, "compute", MINIMAL_COMPUTE_WGSL, base_gt4g + 8192),
+            ],
+            flags=0x00000005,
+        )
+
+        # 1. Streaming TOC reads ONLY header + TOC (zero payload bytes read!).
+        toc, label = wgpk.load_wgpk_toc_streaming(stream_a, source_label="huge_v2.wgsl.pack")
+        self.assertEqual(label, "huge_v2.wgsl.pack")
+        self.assertEqual(toc.version, 2)
+        self.assertEqual(toc.flags, 5)
+        self.assertGreater(toc.byte_length, wgpk.U32_MAX)
+        self.assertEqual(toc.entry_count, 3)
+        self.assertEqual(toc.entries[0].offset, base_gt4g)
+        self.assertEqual(toc.entries[2].offset, base_gt4g + 8192)
+        expected_toc_bytes = wgpk.PACK_HEADER_BYTES + 3 * wgpk.PACK_ENTRY_BYTES_V2
+        self.assertEqual(stream_a.total_bytes_read, expected_toc_bytes)
+
+        # 2. Streaming inspect_pack audits each >4 GiB shader one entry at a time.
+        report = wgpk.inspect_pack(stream_a, source_label="huge_v2.wgsl.pack")
+        self.assertEqual(report.version, 2)
+        self.assertEqual(report.flags, 5)
+        self.assertGreater(report.pack_bytes, wgpk.U32_MAX)
+        self.assertEqual(report.entry_count, 3)
+        self.assertEqual(report.stage_counts, {"vertex": 1, "fragment": 1, "compute": 1})
+        self.assertTrue(report.clean)
+        self.assertEqual([s.shader_hash for s in report.shaders], [h_vs, h_fs, h_cs])
+        self.assertLess(stream_a.max_single_read, 4096)
+
+        # 3. Streaming syntax pre-flight handles >4 GiB offsets cleanly too.
+        verify_rep = wgpk.verify_wgsl_pack_syntax(stream_a, source_label="huge_v2.wgsl.pack")
+        self.assertTrue(verify_rep.clean)
+        self.assertEqual(verify_rep.version, 2)
+        self.assertEqual(verify_rep.entries_checked, 3)
+
+        # 4. Streaming diff_packs between two >4 GiB WGPK v2 streams.
+        modified_fs = MINIMAL_FRAGMENT_WGSL + "\n// modified_v2_stream\n"
+        stream_b = _build_virtual_v2_stream(
+            [
+                (h_vs, "vertex", MINIMAL_VERTEX_WGSL, base_gt4g),
+                (h_fs, "fragment", modified_fs, base_gt4g + 8192),
+                (h_added, "compute", MINIMAL_COMPUTE_WGSL, base_gt4g + 16384),
+            ],
+            flags=0x00000005,
+        )
+        diff_rep = wgpk.diff_packs(
+            stream_a,
+            stream_b,
+            label_a="base_v2.wgsl.pack",
+            label_b="next_v2.wgsl.pack",
+        )
+        self.assertEqual(diff_rep.added_hashes, (h_added,))
+        self.assertEqual(diff_rep.removed_hashes, (h_cs,))
+        self.assertEqual(diff_rep.changed_hashes, (h_fs,))
+        self.assertEqual(diff_rep.unchanged_count, 1)
+        self.assertGreater(diff_rep.pack_bytes_a, wgpk.U32_MAX)
+        self.assertGreater(diff_rep.pack_bytes_b, wgpk.U32_MAX)
+        self.assertTrue(diff_rep.changed[0].source_changed)
+
+    def test_v1_u32_overflow_rejected_and_v2_u64_overflow_rejected(self) -> None:
+        # v1 entry whose offset + length overflows u32::MAX (even if stream total_size > 4 GiB)
+        v1_header = wgpk.PACK_HEADER_STRUCT.pack(wgpk.PACK_MAGIC, wgpk.PACK_VERSION, 1, 0)
+        v1_entry = wgpk.PACK_ENTRY_STRUCT.pack(
+            0x1234, int(wgpk.ShaderStage.VERTEX), b"\x00\x00\x00", 0xFFFFFFF0, 0x100
+        )
+        v1_stream = _VirtualSparseWgpkStream(
+            (1 << 32) + 4096,
+            [(0, v1_header + v1_entry)],
+        )
+        with self.assertRaises(wgpk.WgpkParseError) as ctx:
+            wgpk.load_wgpk_toc_streaming(v1_stream)
+        self.assertEqual(ctx.exception.code, "out_of_bounds")
+
+        # v2 entry whose offset + length overflows u64::MAX
+        v2_header = wgpk.PACK_HEADER_STRUCT.pack(wgpk.PACK_MAGIC, wgpk.PACK_VERSION_V2, 1, 0)
+        v2_entry = wgpk.PACK_ENTRY_STRUCT_V2.pack(
+            0x5678, int(wgpk.ShaderStage.COMPUTE), b"\x00\x00\x00", 64, wgpk.U64_MAX - 16
+        )
+        v2_stream = _VirtualSparseWgpkStream(
+            wgpk.U64_MAX,
+            [(0, v2_header + v2_entry)],
+        )
+        with self.assertRaises(wgpk.WgpkParseError) as ctx:
+            wgpk.load_wgpk_toc_streaming(v2_stream)
+        self.assertEqual(ctx.exception.code, "out_of_bounds")
+
+    def test_filesystem_inspect_diff_and_diff_dump_never_call_read_bytes(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pack_a = root / "a_v2.wgsl.pack"
+            pack_b = root / "b_v2.wgsl.pack"
+            dump_dir = root / "dump"
+            (dump_dir / "native").mkdir(parents=True)
+
+            h1 = 0x1010101010101001
+            h2 = 0x1010101010101002
+            pack_a.write_bytes(
+                wgpk.build_wgpk([(h1, "vertex", MINIMAL_VERTEX_WGSL)], version=2)
+            )
+            pack_b.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (h1, "vertex", MINIMAL_VERTEX_WGSL),
+                        (h2, "fragment", MINIMAL_FRAGMENT_WGSL),
+                    ],
+                    version=2,
+                )
+            )
+            (dump_dir / "native" / f"{wgpk.format_shader_hash(h1)}.bin").write_bytes(b"\x00" * 8)
+
+            def _forbid_read_bytes(self: Path) -> bytes:
+                raise AssertionError(f"Path.read_bytes() must not be called for {self.name}")
+
+            with mock.patch.object(Path, "read_bytes", _forbid_read_bytes):
+                insp = wgpk.inspect_pack(pack_a)
+                self.assertEqual(insp.version, 2)
+                self.assertEqual(insp.entry_count, 1)
+
+                diff_rep = wgpk.diff_packs(pack_a, pack_b)
+                self.assertEqual(diff_rep.added_hashes, (h2,))
+
+                dd_rep = wgpk.diff_pack_against_dump(pack_a, dump_dir)
+                self.assertEqual(dd_rep.pack_version, 2)
+                self.assertTrue(dd_rep.clean)
+
+                code, out, err = _run_cli(["inspect", str(pack_a), "--json"])
+                self.assertEqual(code, 0, msg=err)
+                self.assertEqual(json.loads(out)["version"], 2)
+
+                code, out, err = _run_cli(["diff", str(pack_a), str(pack_b), "--json"])
+                self.assertEqual(code, 0, msg=err)
+                self.assertEqual(json.loads(out)["addedHashes"], [wgpk.format_shader_hash(h2)])
+
+                code, out, err = _run_cli(
+                    ["inspect", str(pack_a), "--diff-dump", str(dump_dir), "--json"]
+                )
+                self.assertEqual(code, 0, msg=err)
+                self.assertEqual(json.loads(out)["pack_version"], 2)
+
+    def test_reflect_sidecar_versions_1_2_3_supported_and_invalid_versions_rejected(self) -> None:
+        h1 = 0x00000000CAFE0001
+        h2 = 0x00000000CAFE0002
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            for ver in (1, 2, 3):
+                reflect_path = root / f"reflect_v{ver}.json"
+                reflect_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": wgpk.REFLECT_SIDECAR_SCHEMA,
+                            "version": ver,
+                            "stages": {
+                                wgpk.format_shader_hash(h1): {
+                                    "stage": "vertex",
+                                    "bvh_ops": 0,
+                                    "raw_address": False,
+                                },
+                                wgpk.format_shader_hash(h2): {
+                                    "stage": "compute",
+                                    "bvh_ops": 2 if ver >= 3 else 0,
+                                    "raw_address": ver >= 3,
+                                },
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                summary = wgpk.load_reflect_sidecar(reflect_path)
+                self.assertEqual(summary.version, ver)
+                self.assertEqual(summary.stage_hashes, frozenset({h1, h2}))
+
+            for bad_ver in (0, 4, 99, True):
+                bad_path = root / f"reflect_bad_{bad_ver}.json"
+                bad_path.write_text(
+                    json.dumps(
+                        {
+                            "schema": wgpk.REFLECT_SIDECAR_SCHEMA,
+                            "version": bad_ver,
+                            "stages": {},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(wgpk.DumpDiffError) as ctx:
+                    wgpk.load_reflect_sidecar(bad_path)
+                self.assertEqual(ctx.exception.code, "invalid_reflect_sidecar")
+
+    def test_diff_dump_native_vs_dxil_only_breakdown_v2_pack_and_v3_reflect_sanitized(self) -> None:
+        sensitive = "secret_host_user_t104_dump"
+        secret_wgsl = "SECRET_WGSL_T104_DO_NOT_LEAK"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            nested = Path(tmpdir) / sensitive / "captures"
+            nested.mkdir(parents=True)
+
+            h_native_ok = 0x0000000000001001
+            h_native_and_dxil_missing = 0x0000000000001002  # present in both native & dxil -> native
+            h_native_only_missing = 0x0000000000001003
+            h_dxil_only_ok = 0x0000000000002001
+            h_dxil_only_miss_1 = 0x0000000000002002
+            h_dxil_only_miss_2 = 0x0000000000002003
+
+            pack_path = nested / "scene_3d.wgsl.pack"
+            pack_path.write_bytes(
+                wgpk.build_wgpk(
+                    [
+                        (h_native_ok, "vertex", f"// {secret_wgsl}\n" + MINIMAL_VERTEX_WGSL),
+                        (h_dxil_only_ok, "fragment", MINIMAL_FRAGMENT_WGSL),
+                    ],
+                    version=2,
+                )
+            )
+            reflect_path = Path(f"{pack_path}.reflect.json")
+            reflect_path.write_text(
+                json.dumps(
+                    {
+                        "schema": wgpk.REFLECT_SIDECAR_SCHEMA,
+                        "version": 3,
+                        "stages": {
+                            wgpk.format_shader_hash(h_native_ok): {"stage": "vertex"},
+                            wgpk.format_shader_hash(h_dxil_only_ok): {"stage": "fragment"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            dump_dir = nested / "pipeline_dump_3d"
+            dump_dir.mkdir()
+            (dump_dir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema": wgpk.PIPELINE_DUMP_SCHEMA,
+                        "schema_version": 1,
+                        "native_stages": [
+                            {"code_identity": wgpk.format_shader_hash(h_native_ok), "stage": "vertex"},
+                            {
+                                "code_identity": wgpk.format_shader_hash(h_native_and_dxil_missing),
+                                "stage": "pixel",
+                            },
+                            {
+                                "code_identity": wgpk.format_shader_hash(h_native_only_missing),
+                                "stage": "compute",
+                            },
+                        ],
+                        "dxil": [
+                            {
+                                "identity": wgpk.format_shader_hash(h_native_and_dxil_missing),
+                                "kind": 0,
+                            },
+                            {"identity": wgpk.format_shader_hash(h_dxil_only_ok), "kind": 0},
+                            {"identity": wgpk.format_shader_hash(h_dxil_only_miss_1), "kind": 1},
+                            {"identity": wgpk.format_shader_hash(h_dxil_only_miss_2), "kind": 5},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Test CLI JSON with max-samples=1 to verify per-origin capping & truncation flags.
+            code, out_json, err = _run_cli(
+                [
+                    "inspect",
+                    str(pack_path),
+                    "--diff-dump",
+                    str(dump_dir),
+                    "--max-samples",
+                    "1",
+                    "--json",
+                ]
+            )
+            self.assertEqual(code, 0, msg=err)
+            payload = json.loads(out_json)
+            self.assertEqual(payload["pack_version"], 2)
+            self.assertEqual(payload["reflect_version"], 3)
+            self.assertEqual(payload["dump_total_stages"], 6)
+            self.assertEqual(payload["in_pack"], 2)
+            self.assertEqual(payload["missing_from_pack"], 4)
+            self.assertEqual(payload["missing_native_from_pack"], 2)
+            self.assertEqual(payload["missing_dxil_from_pack"], 2)
+            self.assertEqual(payload["missing_dxil_only_from_pack"], 2)
+            self.assertEqual(payload["missing_native_from_reflect"], 2)
+            self.assertEqual(payload["missing_dxil_from_reflect"], 2)
+            self.assertEqual(payload["missing_dxil_only_from_reflect"], 2)
+            self.assertEqual(
+                payload["sample_missing_native_pack_hashes"],
+                [wgpk.format_shader_hash(h_native_and_dxil_missing)],
+            )
+            self.assertEqual(
+                payload["sample_missing_dxil_pack_hashes"],
+                [wgpk.format_shader_hash(h_dxil_only_miss_1)],
+            )
+            self.assertTrue(payload["missing_native_pack_hashes_truncated"])
+            self.assertTrue(payload["missing_dxil_pack_hashes_truncated"])
+            for forbidden in (sensitive, tmpdir, secret_wgsl):
+                self.assertNotIn(forbidden, out_json)
+
+            # Test CLI text output highlights WGPK v2 and native vs DXIL-only missing shaders.
+            code, text_out, err = _run_cli(
+                ["inspect", str(pack_path), "--diff-dump", str(dump_dir), "--max-samples", "5"]
+            )
+            self.assertEqual(code, 0, msg=err)
+            self.assertIn("Pack format:           WGPK v2", text_out)
+            self.assertIn("v3, 2 stages", text_out)
+            self.assertIn("Missing from pack:     4 (native=2, dxil_only=2)", text_out)
+            self.assertIn("Sample missing native (RDNA2) from pack (2 of 2):", text_out)
+            self.assertIn("Sample missing DXIL-only from pack (2 of 2):", text_out)
+            self.assertIn(wgpk.format_shader_hash(h_native_only_missing), text_out)
+            self.assertIn(wgpk.format_shader_hash(h_dxil_only_miss_2), text_out)
+            for forbidden in (sensitive, tmpdir, secret_wgsl):
+                self.assertNotIn(forbidden, text_out)
+
+
 if __name__ == "__main__":
     unittest.main()

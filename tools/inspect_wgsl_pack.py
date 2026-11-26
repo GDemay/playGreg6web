@@ -33,6 +33,7 @@ importable library and as a CLI:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -126,6 +127,7 @@ PIPELINE_DUMP_SCHEMA = "playgta6-pipeline-dump"
 PIPELINE_DUMP_SCHEMA_VERSION = 1
 REFLECT_SIDECAR_SCHEMA = "playgta6-stage-reflection"
 REFLECT_SIDECAR_VERSION = 1
+SUPPORTED_REFLECT_SIDECAR_VERSIONS: tuple[int, ...] = (1, 2, 3)
 DUMP_DIFF_REPORT_SCHEMA = "playgta6-wgpk-dump-diff"
 DUMP_DIFF_REPORT_VERSION = 1
 SYNTAX_VERIFY_REPORT_SCHEMA = "playgta6-wgpk-syntax-verify"
@@ -359,6 +361,21 @@ class WgpkToc:
         return frozenset(entry.hash for entry in self.entries)
 
 
+def _max_addressable_bytes(version: int) -> int:
+    """Return the maximum addressable byte offset/end for a WGPK version (v1: u32, v2: u64)."""
+    return U64_MAX if version == PACK_VERSION_V2 else U32_MAX
+
+
+def _is_binary_stream(obj: Any) -> bool:
+    """Return True if `obj` is a seekable binary stream (duck-typed read/seek/tell)."""
+    return (
+        not isinstance(obj, (str, Path, bytes, bytearray, memoryview, WgpkBundle, WgpkToc))
+        and callable(getattr(obj, "read", None))
+        and callable(getattr(obj, "seek", None))
+        and callable(getattr(obj, "tell", None))
+    )
+
+
 def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
     """Parse and validate a `.wgsl.pack` header and entry table without decoding WGSL payloads."""
     if not isinstance(data, (bytes, bytearray, memoryview)):
@@ -389,9 +406,16 @@ def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
             offset=4,
         )
 
+    max_addr = _max_addressable_bytes(version)
     entry_bytes = _entry_bytes(version)
     table_bytes = entry_count * entry_bytes
     data_start = PACK_HEADER_BYTES + table_bytes
+    if data_start > max_addr:
+        raise WgpkParseError(
+            f"WGPK v{version} entry table end {data_start} exceeds addressable limit {max_addr}",
+            code="out_of_bounds",
+            offset=PACK_HEADER_BYTES,
+        )
     if total_len < data_start:
         raise WgpkParseError(
             f"WGPK pack truncated: {total_len} bytes (header + {entry_count} entry records require {data_start} bytes)",
@@ -417,10 +441,10 @@ def parse_wgpk_toc(data: bytes | bytearray | memoryview) -> WgpkToc:
             ) from exc
 
         end = offset + length
-        if offset < data_start or end > total_len:
+        if offset < data_start or offset > max_addr or end > max_addr or end > total_len:
             raise WgpkParseError(
                 f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
-                f"(valid payload range: [{data_start}..{total_len}])",
+                f"(valid payload range: [{data_start}..{min(total_len, max_addr)}])",
                 code="out_of_bounds",
                 entry_index=idx,
                 offset=base + 12,
@@ -488,9 +512,16 @@ def parse_wgpk(data: bytes | bytearray | memoryview) -> WgpkBundle:
             offset=4,
         )
 
+    max_addr = _max_addressable_bytes(version)
     entry_bytes = _entry_bytes(version)
     table_bytes = entry_count * entry_bytes
     data_start = PACK_HEADER_BYTES + table_bytes
+    if data_start > max_addr:
+        raise WgpkParseError(
+            f"WGPK v{version} entry table end {data_start} exceeds addressable limit {max_addr}",
+            code="out_of_bounds",
+            offset=PACK_HEADER_BYTES,
+        )
     if total_len < data_start:
         raise WgpkParseError(
             f"WGPK pack truncated: {total_len} bytes (header + {entry_count} entry records require {data_start} bytes)",
@@ -516,10 +547,10 @@ def parse_wgpk(data: bytes | bytearray | memoryview) -> WgpkBundle:
             ) from exc
 
         end = offset + length
-        if offset < data_start or end > total_len:
+        if offset < data_start or offset > max_addr or end > max_addr or end > total_len:
             raise WgpkParseError(
                 f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
-                f"(valid payload range: [{data_start}..{total_len}])",
+                f"(valid payload range: [{data_start}..{min(total_len, max_addr)}])",
                 code="out_of_bounds",
                 entry_index=idx,
                 offset=base + 12,
@@ -1735,6 +1766,336 @@ class PackDiffReport:
         }
 
 
+def _parse_wgpk_toc_stream(stream: BinaryIO, total_len: int) -> WgpkToc:
+    """Read and validate only the WGPK v1/v2 header + TOC from a seekable binary stream."""
+    stream.seek(0)
+    if total_len < PACK_HEADER_BYTES:
+        raise WgpkParseError(
+            f"WGPK pack truncated: {total_len} bytes (minimum header size: {PACK_HEADER_BYTES})",
+            code="truncated_header",
+            offset=0,
+        )
+    header = _read_exact(stream, PACK_HEADER_BYTES)
+    if len(header) < PACK_HEADER_BYTES:
+        raise WgpkParseError(
+            f"WGPK header truncated: read {len(header)} of {PACK_HEADER_BYTES} bytes",
+            code="truncated_header",
+            offset=0,
+        )
+    magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(header, 0)
+    if magic != PACK_MAGIC:
+        raise WgpkParseError(
+            f"invalid WGPK magic {magic!r} (expected {PACK_MAGIC!r})",
+            code="invalid_magic",
+            offset=0,
+        )
+    if version not in SUPPORTED_PACK_VERSIONS:
+        raise WgpkParseError(
+            f"unsupported WGPK version {version} (expected 1 or 2)",
+            code="unsupported_version",
+            offset=4,
+        )
+
+    max_addr = _max_addressable_bytes(version)
+    entry_bytes = _entry_bytes(version)
+    table_bytes = entry_count * entry_bytes
+    data_start = PACK_HEADER_BYTES + table_bytes
+    if data_start > max_addr:
+        raise WgpkParseError(
+            f"WGPK v{version} entry table end {data_start} exceeds addressable limit {max_addr}",
+            code="out_of_bounds",
+            offset=PACK_HEADER_BYTES,
+        )
+    if total_len < data_start:
+        raise WgpkParseError(
+            f"WGPK pack truncated: {total_len} bytes "
+            f"(header + {entry_count} entry records require {data_start} bytes)",
+            code="truncated_table",
+            offset=PACK_HEADER_BYTES,
+        )
+
+    table_buf = _read_exact(stream, table_bytes)
+    if len(table_buf) < table_bytes:
+        raise WgpkParseError(
+            f"WGPK entry table truncated: read {len(table_buf)} of {table_bytes} bytes",
+            code="truncated_table",
+            offset=PACK_HEADER_BYTES,
+        )
+
+    entries: list[WgpkTocEntry] = []
+    non_empty_ranges: list[tuple[int, int, int]] = []
+    for idx in range(entry_count):
+        rec_off = idx * entry_bytes
+        shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, table_buf, rec_off)
+        try:
+            stage = ShaderStage(stage_raw)
+        except ValueError as exc:
+            raise WgpkParseError(
+                f"invalid shader stage value {stage_raw} at entry {idx}",
+                code="invalid_stage",
+                entry_index=idx,
+                offset=PACK_HEADER_BYTES + rec_off + 8,
+            ) from exc
+
+        end = offset + length
+        if offset < data_start or offset > max_addr or end > max_addr or end > total_len:
+            raise WgpkParseError(
+                f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
+                f"(valid payload range: [{data_start}..{min(total_len, max_addr)}])",
+                code="out_of_bounds",
+                entry_index=idx,
+                offset=PACK_HEADER_BYTES + rec_off + 12,
+            )
+        if length > 0:
+            non_empty_ranges.append((offset, end, idx))
+        entries.append(
+            WgpkTocEntry(hash=shader_hash, stage=stage, offset=offset, length=length)
+        )
+
+    if len(non_empty_ranges) > 1:
+        non_empty_ranges.sort(key=lambda item: (item[0], item[1]))
+        for prev, curr in zip(non_empty_ranges, non_empty_ranges[1:]):
+            if curr[0] < prev[1]:
+                raise WgpkParseError(
+                    f"overlapping payload ranges between entry {prev[2]} [{prev[0]}..{prev[1]}) "
+                    f"and entry {curr[2]} [{curr[0]}..{curr[1]})",
+                    code="overlapping_payloads",
+                    entry_index=curr[2],
+                    offset=curr[0],
+                )
+
+    return WgpkToc(
+        version=version,
+        flags=flags,
+        byte_length=total_len,
+        entries=tuple(entries),
+    )
+
+
+def _inspect_wgpk_stream(
+    stream: BinaryIO,
+    total_len: int,
+    *,
+    limits: WebGpuLimits,
+    source_label: str,
+    collect_digests: bool = False,
+) -> tuple[PackInspectReport, dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]] | None]:
+    """Stream-inspect a WGPK v1/v2 stream one shader payload at a time (constant WGSL RAM)."""
+    toc = _parse_wgpk_toc_stream(stream, total_len)
+
+    stage_counts = {stage: 0 for stage in STAGE_ORDER}
+    feature_counter: Counter[str] = Counter()
+    audits: list[ShaderAudit] = []
+    all_violations: list[BudgetViolation] = []
+    seen_hashes: set[int] = set()
+    total_wgsl_bytes = 0
+    diff_map: dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]] | None = (
+        {} if collect_digests else None
+    )
+
+    for idx, entry in enumerate(toc.entries):
+        if entry.length > 0:
+            stream.seek(entry.offset)
+            payload_bytes = _read_exact(stream, entry.length)
+            if len(payload_bytes) != entry.length:
+                raise WgpkParseError(
+                    f"entry {idx} payload short read: {len(payload_bytes)} bytes "
+                    f"(expected {entry.length})",
+                    code="out_of_bounds",
+                    entry_index=idx,
+                    offset=entry.offset,
+                )
+        else:
+            payload_bytes = b""
+
+        try:
+            wgsl = payload_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise WgpkParseError(
+                f"entry {idx} payload is not valid UTF-8: {exc.reason}",
+                code="invalid_utf8",
+                entry_index=idx,
+                offset=entry.offset + exc.start,
+            ) from exc
+
+        payload_digest = hashlib.sha256(payload_bytes).digest() if collect_digests else b""
+        # Drop raw bytes immediately after UTF-8 decoding + digesting.
+        del payload_bytes
+
+        stage_counts[entry.stage_name] += 1
+        total_wgsl_bytes += entry.length
+        audit = analyze_wgsl(
+            wgsl,
+            entry.hash,
+            limits=limits,
+            pack_stage=entry.stage_name,
+        )
+        # Drop WGSL text immediately after summarizing so peak RAM stays bounded.
+        del wgsl
+
+        audits.append(audit)
+        if diff_map is not None:
+            diff_map[entry.hash] = (entry, audit, payload_digest)
+
+        for feat in audit.enabled_features:
+            feature_counter[feat] += 1
+
+        if entry.hash in seen_hashes:
+            all_violations.append(
+                BudgetViolation(
+                    shader_hash=entry.hash,
+                    code="duplicate_shader_hash",
+                    message=f"duplicate shader hash {entry.hash_hex} in WGPK entry table",
+                )
+            )
+        else:
+            seen_hashes.add(entry.hash)
+
+        all_violations.extend(audit.violations)
+
+    feature_histogram = dict(sorted(feature_counter.items()))
+    report = PackInspectReport(
+        source=source_label,
+        version=toc.version,
+        flags=toc.flags,
+        pack_bytes=toc.byte_length,
+        entry_count=toc.entry_count,
+        total_wgsl_bytes=total_wgsl_bytes,
+        stage_counts=stage_counts,
+        feature_histogram=feature_histogram,
+        violations=tuple(all_violations),
+        shaders=tuple(audits),
+        limits=limits,
+    )
+    return report, diff_map
+
+
+def _inspect_bundle_for_diff(
+    bundle: WgpkBundle,
+    *,
+    limits: WebGpuLimits,
+    source_label: str,
+    collect_digests: bool = False,
+) -> tuple[PackInspectReport, dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]] | None]:
+    """Inspect an in-memory `WgpkBundle` without re-parsing binary bytes."""
+    stage_counts = {stage: 0 for stage in STAGE_ORDER}
+    feature_counter: Counter[str] = Counter()
+    audits: list[ShaderAudit] = []
+    all_violations: list[BudgetViolation] = []
+    seen_hashes: set[int] = set()
+    diff_map: dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]] | None = (
+        {} if collect_digests else None
+    )
+
+    for entry in bundle.entries:
+        stage_counts[entry.stage_name] += 1
+        audit = analyze_wgsl(
+            entry.wgsl,
+            entry.hash,
+            limits=limits,
+            pack_stage=entry.stage_name,
+        )
+        audits.append(audit)
+        if diff_map is not None:
+            toc_entry = WgpkTocEntry(
+                hash=entry.hash,
+                stage=entry.stage,
+                offset=entry.offset,
+                length=entry.length,
+            )
+            diff_map[entry.hash] = (
+                toc_entry,
+                audit,
+                hashlib.sha256(entry.wgsl.encode("utf-8")).digest(),
+            )
+        for feat in audit.enabled_features:
+            feature_counter[feat] += 1
+
+        if entry.hash in seen_hashes:
+            all_violations.append(
+                BudgetViolation(
+                    shader_hash=entry.hash,
+                    code="duplicate_shader_hash",
+                    message=f"duplicate shader hash {entry.hash_hex} in WGPK entry table",
+                )
+            )
+        else:
+            seen_hashes.add(entry.hash)
+
+        all_violations.extend(audit.violations)
+
+    feature_histogram = dict(sorted(feature_counter.items()))
+    report = PackInspectReport(
+        source=source_label,
+        version=bundle.version,
+        flags=bundle.flags,
+        pack_bytes=bundle.byte_length,
+        entry_count=bundle.entry_count,
+        total_wgsl_bytes=bundle.total_wgsl_bytes,
+        stage_counts=stage_counts,
+        feature_histogram=feature_histogram,
+        violations=tuple(all_violations),
+        shaders=tuple(audits),
+        limits=limits,
+    )
+    return report, diff_map
+
+
+def _inspect_source(
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | BinaryIO,
+    *,
+    limits: WebGpuLimits,
+    source_label: str | None = None,
+    collect_digests: bool = False,
+) -> tuple[PackInspectReport, dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]] | None]:
+    """Stream-inspect a filesystem path, seekable binary stream, bytes buffer, or `WgpkBundle`."""
+    if isinstance(path_or_bytes, WgpkBundle):
+        return _inspect_bundle_for_diff(
+            path_or_bytes,
+            limits=limits,
+            source_label=sanitize_source_label(source_label),
+            collect_digests=collect_digests,
+        )
+    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+        label = sanitize_source_label(source_label)
+        buf = io.BytesIO(path_or_bytes)
+        return _inspect_wgpk_stream(
+            buf,
+            len(path_or_bytes),
+            limits=limits,
+            source_label=label,
+            collect_digests=collect_digests,
+        )
+    if isinstance(path_or_bytes, (str, Path)):
+        path = Path(path_or_bytes)
+        label = sanitize_source_label(source_label if source_label is not None else path)
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            total_len = fh.tell()
+            return _inspect_wgpk_stream(
+                fh,
+                total_len,
+                limits=limits,
+                source_label=label,
+                collect_digests=collect_digests,
+            )
+    if _is_binary_stream(path_or_bytes):
+        label = sanitize_source_label(source_label)
+        path_or_bytes.seek(0, os.SEEK_END)
+        total_len = path_or_bytes.tell()
+        return _inspect_wgpk_stream(
+            path_or_bytes,
+            total_len,
+            limits=limits,
+            source_label=label,
+            collect_digests=collect_digests,
+        )
+    raise TypeError(
+        f"expected path, seekable binary stream, bytes-like buffer, or WgpkBundle, "
+        f"got {type(path_or_bytes).__name__}"
+    )
+
+
 def _load_bundle(
     path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle,
     *,
@@ -1756,88 +2117,34 @@ def _load_bundle(
 
 
 def inspect_pack(
-    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle,
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | BinaryIO,
     *,
     limits: WebGpuLimits | None = None,
     source_label: str | None = None,
 ) -> PackInspectReport:
-    """Parse and audit all shaders in a `.wgsl.pack` bundle against WebGPU limits."""
+    """Parse and audit all shaders in a `.wgsl.pack` bundle against WebGPU limits.
+
+    Filesystem paths and seekable binary streams are inspected using streaming I/O
+    (reading header + TOC, then seeking and auditing one shader payload at a time)
+    so multi-GiB WGPK v2 packs do not load all WGSL payloads into RAM.
+    """
     active_limits = limits if limits is not None else DEFAULT_WEBGPU_LIMITS
-    bundle, label = _load_bundle(path_or_bytes, source_label=source_label)
-
-    stage_counts = {stage: 0 for stage in STAGE_ORDER}
-    feature_counter: Counter[str] = Counter()
-    audits: list[ShaderAudit] = []
-    all_violations: list[BudgetViolation] = []
-    seen_hashes: set[int] = set()
-
-    for entry in bundle.entries:
-        stage_counts[entry.stage_name] += 1
-        audit = analyze_wgsl(
-            entry.wgsl,
-            entry.hash,
-            limits=active_limits,
-            pack_stage=entry.stage_name,
-        )
-        audits.append(audit)
-        for feat in audit.enabled_features:
-            feature_counter[feat] += 1
-
-        if entry.hash in seen_hashes:
-            all_violations.append(
-                BudgetViolation(
-                    shader_hash=entry.hash,
-                    code="duplicate_shader_hash",
-                    message=f"duplicate shader hash {entry.hash_hex} in WGPK entry table",
-                )
-            )
-        else:
-            seen_hashes.add(entry.hash)
-
-        all_violations.extend(audit.violations)
-
-    feature_histogram = dict(sorted(feature_counter.items()))
-
-    return PackInspectReport(
-        source=label,
-        version=bundle.version,
-        flags=bundle.flags,
-        pack_bytes=bundle.byte_length,
-        entry_count=bundle.entry_count,
-        total_wgsl_bytes=bundle.total_wgsl_bytes,
-        stage_counts=stage_counts,
-        feature_histogram=feature_histogram,
-        violations=tuple(all_violations),
-        shaders=tuple(audits),
+    report, _ = _inspect_source(
+        path_or_bytes,
         limits=active_limits,
+        source_label=source_label,
+        collect_digests=False,
     )
+    return report
 
 
-def diff_packs(
-    pack_a: str | Path | bytes | bytearray | memoryview | WgpkBundle,
-    pack_b: str | Path | bytes | bytearray | memoryview | WgpkBundle,
-    *,
-    limits: WebGpuLimits | None = None,
-    label_a: str | None = None,
-    label_b: str | None = None,
+def _diff_inspected_packs(
+    report_a: PackInspectReport,
+    map_a: dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]],
+    report_b: PackInspectReport,
+    map_b: dict[int, tuple[WgpkTocEntry, ShaderAudit, bytes]],
 ) -> PackDiffReport:
-    """Compare two `.wgsl.pack` bundles and compute added/removed/changed shaders and deltas."""
-    active_limits = limits if limits is not None else DEFAULT_WEBGPU_LIMITS
-    bundle_a, sanitized_a = _load_bundle(pack_a, source_label=label_a)
-    bundle_b, sanitized_b = _load_bundle(pack_b, source_label=label_b)
-
-    report_a = inspect_pack(bundle_a, limits=active_limits, source_label=sanitized_a)
-    report_b = inspect_pack(bundle_b, limits=active_limits, source_label=sanitized_b)
-
-    map_a: dict[int, tuple[WgpkEntry, ShaderAudit]] = {
-        entry.hash: (entry, audit)
-        for entry, audit in zip(bundle_a.entries, report_a.shaders)
-    }
-    map_b: dict[int, tuple[WgpkEntry, ShaderAudit]] = {
-        entry.hash: (entry, audit)
-        for entry, audit in zip(bundle_b.entries, report_b.shaders)
-    }
-
+    """Compute a `PackDiffReport` from two streamed inspection results + payload digests."""
     hashes_a = set(map_a.keys())
     hashes_b = set(map_b.keys())
 
@@ -1850,12 +2157,12 @@ def diff_packs(
     unchanged_count = 0
 
     for shader_hash in common_hashes:
-        entry_a, audit_a = map_a[shader_hash]
-        entry_b, audit_b = map_b[shader_hash]
+        entry_a, audit_a, digest_a = map_a[shader_hash]
+        entry_b, audit_b, digest_b = map_b[shader_hash]
 
         source_changed = (
             entry_a.length != entry_b.length
-            or entry_a.wgsl != entry_b.wgsl
+            or digest_a != digest_b
             or entry_a.stage != entry_b.stage
         )
         audit_changed = audit_a != audit_b
@@ -1889,8 +2196,8 @@ def diff_packs(
     }
 
     return PackDiffReport(
-        pack_a=sanitized_a,
-        pack_b=sanitized_b,
+        pack_a=report_a.source,
+        pack_b=report_b.source,
         entry_count_a=report_a.entry_count,
         entry_count_b=report_b.entry_count,
         total_wgsl_bytes_a=report_a.total_wgsl_bytes,
@@ -1908,6 +2215,31 @@ def diff_packs(
         violation_count_a=len(report_a.violations),
         violation_count_b=len(report_b.violations),
     )
+
+
+def diff_packs(
+    pack_a: str | Path | bytes | bytearray | memoryview | WgpkBundle | BinaryIO,
+    pack_b: str | Path | bytes | bytearray | memoryview | WgpkBundle | BinaryIO,
+    *,
+    limits: WebGpuLimits | None = None,
+    label_a: str | None = None,
+    label_b: str | None = None,
+) -> PackDiffReport:
+    """Compare two `.wgsl.pack` bundles and compute added/removed/changed shaders and deltas.
+
+    Streams filesystem paths and seekable binary streams one entry at a time using
+    per-entry SHA-256 payload digests and audits so multi-GiB WGPK v2 packs are
+    never loaded into RAM at once.
+    """
+    active_limits = limits if limits is not None else DEFAULT_WEBGPU_LIMITS
+    report_a, map_a = _inspect_source(
+        pack_a, limits=active_limits, source_label=label_a, collect_digests=True
+    )
+    report_b, map_b = _inspect_source(
+        pack_b, limits=active_limits, source_label=label_b, collect_digests=True
+    )
+    assert map_a is not None and map_b is not None
+    return _diff_inspected_packs(report_a, map_a, report_b, map_b)
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2322,18 @@ class DumpDiffReport:
     max_samples: int
     sample_missing_pack_hashes: tuple[str, ...]
     sample_missing_reflect_hashes: tuple[str, ...]
+    pack_version: int = PACK_VERSION
+    reflect_version: int | None = None
+    missing_native_from_pack: int = 0
+    missing_dxil_from_pack: int = 0
+    missing_dxil_only_from_pack: int = 0
+    missing_native_from_reflect: int = 0
+    missing_dxil_from_reflect: int = 0
+    missing_dxil_only_from_reflect: int = 0
+    sample_missing_native_pack_hashes: tuple[str, ...] = ()
+    sample_missing_dxil_pack_hashes: tuple[str, ...] = ()
+    sample_missing_native_reflect_hashes: tuple[str, ...] = ()
+    sample_missing_dxil_reflect_hashes: tuple[str, ...] = ()
 
     @property
     def pack_coverage_pct(self) -> float:
@@ -2016,17 +2360,25 @@ class DumpDiffReport:
             "schema": DUMP_DIFF_REPORT_SCHEMA,
             "version": DUMP_DIFF_REPORT_VERSION,
             "source": self.pack_source,
+            "pack_version": self.pack_version,
             "dump_source": self.dump_source,
             "reflect_source": self.reflect_source,
             "reflect_loaded": self.reflect_loaded,
+            "reflect_version": self.reflect_version,
             "manifest_loaded": self.manifest_loaded,
             "pack_entry_count": self.pack_entry_count,
             "reflect_stage_count": self.reflect_stage_count,
             "dump_total_stages": self.dump_total_stages,
             "in_pack": self.in_pack,
             "missing_from_pack": self.missing_from_pack,
+            "missing_native_from_pack": self.missing_native_from_pack,
+            "missing_dxil_from_pack": self.missing_dxil_from_pack,
+            "missing_dxil_only_from_pack": self.missing_dxil_only_from_pack,
             "in_reflect": self.in_reflect,
             "missing_from_reflect": self.missing_from_reflect,
+            "missing_native_from_reflect": self.missing_native_from_reflect,
+            "missing_dxil_from_reflect": self.missing_dxil_from_reflect,
+            "missing_dxil_only_from_reflect": self.missing_dxil_only_from_reflect,
             "in_pack_missing_from_reflect": self.in_pack_missing_from_reflect,
             "pack_coverage_pct": self.pack_coverage_pct,
             "reflect_coverage_pct": self.reflect_coverage_pct,
@@ -2043,9 +2395,19 @@ class DumpDiffReport:
             "max_samples": self.max_samples,
             "sample_missing_pack_hashes": list(self.sample_missing_pack_hashes),
             "sample_missing_reflect_hashes": list(self.sample_missing_reflect_hashes),
+            "sample_missing_native_pack_hashes": list(self.sample_missing_native_pack_hashes),
+            "sample_missing_dxil_pack_hashes": list(self.sample_missing_dxil_pack_hashes),
+            "sample_missing_native_reflect_hashes": list(self.sample_missing_native_reflect_hashes),
+            "sample_missing_dxil_reflect_hashes": list(self.sample_missing_dxil_reflect_hashes),
             "missing_pack_hashes_truncated": self.missing_from_pack > len(self.sample_missing_pack_hashes),
             "missing_reflect_hashes_truncated": (
                 self.missing_from_reflect > len(self.sample_missing_reflect_hashes)
+            ),
+            "missing_native_pack_hashes_truncated": (
+                self.missing_native_from_pack > len(self.sample_missing_native_pack_hashes)
+            ),
+            "missing_dxil_pack_hashes_truncated": (
+                self.missing_dxil_from_pack > len(self.sample_missing_dxil_pack_hashes)
             ),
             "clean": self.clean,
         }
@@ -2441,10 +2803,15 @@ def load_reflect_sidecar(
 
     version_val = doc.get("version")
     if version_val is not None:
-        if isinstance(version_val, bool) or not isinstance(version_val, int) or version_val != REFLECT_SIDECAR_VERSION:
+        if (
+            isinstance(version_val, bool)
+            or not isinstance(version_val, int)
+            or version_val not in SUPPORTED_REFLECT_SIDECAR_VERSIONS
+        ):
+            supported_str = ", ".join(str(v) for v in SUPPORTED_REFLECT_SIDECAR_VERSIONS)
             raise DumpDiffError(
                 f"unsupported reflection sidecar version in {label} "
-                f"(expected {REFLECT_SIDECAR_VERSION})",
+                f"(expected one of {supported_str})",
                 code="invalid_reflect_sidecar",
                 source=label,
             )
@@ -2485,43 +2852,20 @@ def load_reflect_sidecar(
 
 
 def _load_toc(
-    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc | BinaryIO,
     *,
     source_label: str | None = None,
 ) -> tuple[WgpkToc, str]:
-    """Load a `WgpkToc` from a path, raw bytes, `WgpkBundle`, or `WgpkToc`."""
-    if isinstance(path_or_bytes, WgpkToc):
-        return path_or_bytes, sanitize_source_label(source_label)
-    if isinstance(path_or_bytes, WgpkBundle):
-        toc = WgpkToc(
-            version=path_or_bytes.version,
-            flags=path_or_bytes.flags,
-            byte_length=path_or_bytes.byte_length,
-            entries=tuple(
-                WgpkTocEntry(
-                    hash=e.hash,
-                    stage=e.stage,
-                    offset=e.offset,
-                    length=e.length,
-                )
-                for e in path_or_bytes.entries
-            ),
-        )
-        return toc, sanitize_source_label(source_label)
-    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
-        return parse_wgpk_toc(path_or_bytes), sanitize_source_label(source_label)
-    if isinstance(path_or_bytes, (str, Path)):
-        path = Path(path_or_bytes)
-        label = sanitize_source_label(source_label if source_label is not None else path)
-        raw = path.read_bytes()
-        return parse_wgpk_toc(raw), label
-    raise TypeError(
-        f"expected path, bytes-like buffer, WgpkBundle, or WgpkToc, got {type(path_or_bytes).__name__}"
-    )
+    """Load a `WgpkToc` from a path, seekable stream, raw bytes, `WgpkBundle`, or `WgpkToc`.
+
+    Filesystem paths and seekable binary streams are always read via streaming TOC I/O
+    (`load_wgpk_toc_streaming`) so multi-GiB WGPK v2 packs never load payloads into RAM.
+    """
+    return load_wgpk_toc_streaming(path_or_bytes, source_label=source_label)
 
 
 def diff_pack_against_dump(
-    pack_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    pack_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc | BinaryIO,
     dump_dir: str | Path | PipelineDumpSummary,
     *,
     reflect_path: str | Path | ReflectSidecarSummary | None = None,
@@ -2573,6 +2917,10 @@ def diff_pack_against_dump(
     in_pack_missing_from_reflect = 0
     sample_missing_pack: list[str] = []
     sample_missing_reflect: list[str] = []
+    sample_missing_native_pack: list[str] = []
+    sample_missing_dxil_pack: list[str] = []
+    sample_missing_native_reflect: list[str] = []
+    sample_missing_dxil_reflect: list[str] = []
 
     for item in dump_summary.stages:
         has_pack = item.hash in pack_hashes
@@ -2596,6 +2944,12 @@ def diff_pack_against_dump(
             ob[2] += 1
             if len(sample_missing_pack) < max_samples:
                 sample_missing_pack.append(item.hash_hex)
+            if origin_key == "native":
+                if len(sample_missing_native_pack) < max_samples:
+                    sample_missing_native_pack.append(item.hash_hex)
+            else:
+                if len(sample_missing_dxil_pack) < max_samples:
+                    sample_missing_dxil_pack.append(item.hash_hex)
 
         if has_reflect:
             in_reflect += 1
@@ -2607,6 +2961,12 @@ def diff_pack_against_dump(
             ob[4] += 1
             if len(sample_missing_reflect) < max_samples:
                 sample_missing_reflect.append(item.hash_hex)
+            if origin_key == "native":
+                if len(sample_missing_native_reflect) < max_samples:
+                    sample_missing_native_reflect.append(item.hash_hex)
+            else:
+                if len(sample_missing_dxil_reflect) < max_samples:
+                    sample_missing_dxil_reflect.append(item.hash_hex)
             if has_pack:
                 in_pack_missing_from_reflect += 1
 
@@ -2616,6 +2976,8 @@ def diff_pack_against_dump(
     by_origin = {
         origin: StageCoverageCounts(*vals) for origin, vals in origin_buckets.items()
     }
+    native_counts = by_origin["native"]
+    dxil_counts = by_origin["dxil"]
 
     return DumpDiffReport(
         pack_source=sanitized_pack,
@@ -2636,6 +2998,18 @@ def diff_pack_against_dump(
         max_samples=max_samples,
         sample_missing_pack_hashes=tuple(sample_missing_pack),
         sample_missing_reflect_hashes=tuple(sample_missing_reflect),
+        pack_version=toc.version,
+        reflect_version=reflect_summary.version if reflect_summary is not None else None,
+        missing_native_from_pack=native_counts.missing_from_pack,
+        missing_dxil_from_pack=dxil_counts.missing_from_pack,
+        missing_dxil_only_from_pack=dxil_counts.missing_from_pack,
+        missing_native_from_reflect=native_counts.missing_from_reflect,
+        missing_dxil_from_reflect=dxil_counts.missing_from_reflect,
+        missing_dxil_only_from_reflect=dxil_counts.missing_from_reflect,
+        sample_missing_native_pack_hashes=tuple(sample_missing_native_pack),
+        sample_missing_dxil_pack_hashes=tuple(sample_missing_dxil_pack),
+        sample_missing_native_reflect_hashes=tuple(sample_missing_native_reflect),
+        sample_missing_dxil_reflect_hashes=tuple(sample_missing_dxil_reflect),
     )
 
 
@@ -2999,14 +3373,15 @@ def _verify_wgpk_stream(
                 )
             )
 
+        max_addr = _max_addressable_bytes(version)
         end = offset + length
-        if offset < data_start or end > total_len:
+        if offset < data_start or offset > max_addr or end > max_addr or end > total_len:
             violations.append(
                 SyntaxViolation(
                     code="out_of_bounds",
                     message=(
                         f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
-                        f"(valid payload range: [{data_start}..{total_len}])"
+                        f"(valid payload range: [{data_start}..{min(total_len, max_addr)}])"
                     ),
                     entry_index=idx,
                     shader_hash=shader_hash,
@@ -3109,11 +3484,11 @@ def _verify_wgpk_stream(
 
 
 def verify_wgsl_pack_syntax(
-    path_or_bytes: str | Path | bytes | bytearray | memoryview,
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | BinaryIO,
     *,
     source_label: str | None = None,
 ) -> SyntaxVerifyReport:
-    """Run fast streaming WGPK pre-flight validation on a file path or in-memory buffer.
+    """Run fast streaming WGPK pre-flight validation on a file path, stream, or in-memory buffer.
 
     Checks header magic/version/entry-count consistency, file-size bounds, non-overlapping
     non-empty payload ranges, duplicate shader hashes, UTF-8 validity, and invalid
@@ -3130,116 +3505,57 @@ def verify_wgsl_pack_syntax(
             fh.seek(0, os.SEEK_END)
             total_len = fh.tell()
             return _verify_wgpk_stream(fh, total_len, label)
+    if _is_binary_stream(path_or_bytes):
+        label = sanitize_source_label(source_label)
+        path_or_bytes.seek(0, os.SEEK_END)
+        total_len = path_or_bytes.tell()
+        return _verify_wgpk_stream(path_or_bytes, total_len, label)
     raise TypeError(
-        f"expected path or bytes-like buffer, got {type(path_or_bytes).__name__}"
+        f"expected path, seekable binary stream, or bytes-like buffer, got {type(path_or_bytes).__name__}"
     )
 
 
 def load_wgpk_toc_streaming(
-    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc,
+    path_or_bytes: str | Path | bytes | bytearray | memoryview | WgpkBundle | WgpkToc | BinaryIO,
     *,
     source_label: str | None = None,
 ) -> tuple[WgpkToc, str]:
     """Read and validate only the WGPK header + TOC without loading WGSL payload bytes."""
-    if isinstance(path_or_bytes, (WgpkToc, WgpkBundle, bytes, bytearray, memoryview)):
-        return _load_toc(path_or_bytes, source_label=source_label)
+    if isinstance(path_or_bytes, WgpkToc):
+        return path_or_bytes, sanitize_source_label(source_label)
+    if isinstance(path_or_bytes, WgpkBundle):
+        toc = WgpkToc(
+            version=path_or_bytes.version,
+            flags=path_or_bytes.flags,
+            byte_length=path_or_bytes.byte_length,
+            entries=tuple(
+                WgpkTocEntry(
+                    hash=e.hash,
+                    stage=e.stage,
+                    offset=e.offset,
+                    length=e.length,
+                )
+                for e in path_or_bytes.entries
+            ),
+        )
+        return toc, sanitize_source_label(source_label)
+    if isinstance(path_or_bytes, (bytes, bytearray, memoryview)):
+        return parse_wgpk_toc(path_or_bytes), sanitize_source_label(source_label)
     if isinstance(path_or_bytes, (str, Path)):
         path = Path(path_or_bytes)
         label = sanitize_source_label(source_label if source_label is not None else path)
         with path.open("rb") as fh:
             fh.seek(0, os.SEEK_END)
             total_len = fh.tell()
-            fh.seek(0)
-            if total_len < PACK_HEADER_BYTES:
-                raise WgpkParseError(
-                    f"WGPK pack truncated: {total_len} bytes (minimum header size: {PACK_HEADER_BYTES})",
-                    code="truncated_header",
-                    offset=0,
-                )
-            header = _read_exact(fh, PACK_HEADER_BYTES)
-            magic, version, entry_count, flags = PACK_HEADER_STRUCT.unpack_from(header, 0)
-            if magic != PACK_MAGIC:
-                raise WgpkParseError(
-                    f"invalid WGPK magic {magic!r} (expected {PACK_MAGIC!r})",
-                    code="invalid_magic",
-                    offset=0,
-                )
-            if version not in SUPPORTED_PACK_VERSIONS:
-                raise WgpkParseError(
-                    f"unsupported WGPK version {version} (expected 1 or 2)",
-                    code="unsupported_version",
-                    offset=4,
-                )
-            entry_bytes = _entry_bytes(version)
-            table_bytes = entry_count * entry_bytes
-            data_start = PACK_HEADER_BYTES + table_bytes
-            if total_len < data_start:
-                raise WgpkParseError(
-                    f"WGPK pack truncated: {total_len} bytes "
-                    f"(header + {entry_count} entry records require {data_start} bytes)",
-                    code="truncated_table",
-                    offset=PACK_HEADER_BYTES,
-                )
-            table_buf = _read_exact(fh, table_bytes)
-            if len(table_buf) < table_bytes:
-                raise WgpkParseError(
-                    f"WGPK entry table truncated: read {len(table_buf)} of {table_bytes} bytes",
-                    code="truncated_table",
-                    offset=PACK_HEADER_BYTES,
-                )
-
-        entries: list[WgpkTocEntry] = []
-        non_empty_ranges: list[tuple[int, int, int]] = []
-        for idx in range(entry_count):
-            rec_off = idx * entry_bytes
-            shader_hash, stage_raw, _reserved, offset, length = _unpack_entry(version, table_buf, rec_off)
-            try:
-                stage = ShaderStage(stage_raw)
-            except ValueError as exc:
-                raise WgpkParseError(
-                    f"invalid shader stage value {stage_raw} at entry {idx}",
-                    code="invalid_stage",
-                    entry_index=idx,
-                    offset=PACK_HEADER_BYTES + rec_off + 8,
-                ) from exc
-            end = offset + length
-            if offset < data_start or end > total_len:
-                raise WgpkParseError(
-                    f"entry {idx} payload [{offset}..+{length}] exceeds pack bounds "
-                    f"(valid payload range: [{data_start}..{total_len}])",
-                    code="out_of_bounds",
-                    entry_index=idx,
-                    offset=PACK_HEADER_BYTES + rec_off + 12,
-                )
-            if length > 0:
-                non_empty_ranges.append((offset, end, idx))
-            entries.append(
-                WgpkTocEntry(hash=shader_hash, stage=stage, offset=offset, length=length)
-            )
-
-        if len(non_empty_ranges) > 1:
-            non_empty_ranges.sort(key=lambda item: (item[0], item[1]))
-            for prev, curr in zip(non_empty_ranges, non_empty_ranges[1:]):
-                if curr[0] < prev[1]:
-                    raise WgpkParseError(
-                        f"overlapping payload ranges between entry {prev[2]} [{prev[0]}..{prev[1]}) "
-                        f"and entry {curr[2]} [{curr[0]}..{curr[1]})",
-                        code="overlapping_payloads",
-                        entry_index=curr[2],
-                        offset=curr[0],
-                    )
-
-        return (
-            WgpkToc(
-                version=version,
-                flags=flags,
-                byte_length=total_len,
-                entries=tuple(entries),
-            ),
-            label,
-        )
+            return _parse_wgpk_toc_stream(fh, total_len), label
+    if _is_binary_stream(path_or_bytes):
+        label = sanitize_source_label(source_label)
+        path_or_bytes.seek(0, os.SEEK_END)
+        total_len = path_or_bytes.tell()
+        return _parse_wgpk_toc_stream(path_or_bytes, total_len), label
     raise TypeError(
-        f"expected path, bytes-like buffer, WgpkBundle, or WgpkToc, got {type(path_or_bytes).__name__}"
+        f"expected path, seekable binary stream, bytes-like buffer, WgpkBundle, or WgpkToc, "
+        f"got {type(path_or_bytes).__name__}"
     )
 
 
@@ -3408,22 +3724,25 @@ def format_dump_diff_text(report: DumpDiffReport) -> str:
         if report.manifest_loaded
         else "absent (scanned blob filenames)"
     )
-    reflect_status = (
-        f"{report.reflect_source} ({report.reflect_stage_count} stages)"
-        if report.reflect_loaded and report.reflect_source is not None
-        else "(none)"
-    )
+    if report.reflect_loaded and report.reflect_source is not None:
+        ver_str = f"v{report.reflect_version}, " if report.reflect_version is not None else ""
+        reflect_status = f"{report.reflect_source} ({ver_str}{report.reflect_stage_count} stages)"
+    else:
+        reflect_status = "(none)"
     lines = [
         f"WGPK Pipeline Dump Coverage: {report.pack_source} vs {report.dump_source}",
+        f"  Pack format:           WGPK v{report.pack_version}",
         f"  Manifest:              {manifest_status}",
         f"  Reflect sidecar:       {reflect_status}",
         f"  Pack TOC entries:      {report.pack_entry_count}",
         f"  Dump total stages:     {report.dump_total_stages}",
         f"  In pack:               {report.in_pack} / {report.dump_total_stages} ({report.pack_coverage_pct:.2f}%)",
-        f"  Missing from pack:     {report.missing_from_pack}",
+        f"  Missing from pack:     {report.missing_from_pack} "
+        f"(native={report.missing_native_from_pack}, dxil_only={report.missing_dxil_only_from_pack})",
         f"  In reflect:            {report.in_reflect} / {report.dump_total_stages} ({report.reflect_coverage_pct:.2f}%)",
-        f"  Missing from reflect:  {report.missing_from_reflect}"
-        f" (in pack but missing reflect: {report.in_pack_missing_from_reflect})",
+        f"  Missing from reflect:  {report.missing_from_reflect} "
+        f"(native={report.missing_native_from_reflect}, dxil_only={report.missing_dxil_only_from_reflect}; "
+        f"in pack but missing reflect: {report.in_pack_missing_from_reflect})",
         "  By stage:",
     ]
     for stage in DUMP_STAGE_ORDER:
@@ -3437,10 +3756,39 @@ def format_dump_diff_text(report: DumpDiffReport) -> str:
     lines.append("  By origin:")
     for origin in DUMP_ORIGIN_ORDER:
         counts = report.by_origin[origin]
+        label = "native" if origin == "native" else "dxil_only"
         lines.append(
-            f"    {origin:<9} total={counts.dump_total}, in_pack={counts.in_pack}, "
+            f"    {label:<9} total={counts.dump_total}, in_pack={counts.in_pack}, "
             f"missing_pack={counts.missing_from_pack}, in_reflect={counts.in_reflect}, "
             f"missing_reflect={counts.missing_from_reflect}"
+        )
+
+    if report.sample_missing_native_pack_hashes:
+        shown = len(report.sample_missing_native_pack_hashes)
+        extra = report.missing_native_from_pack - shown
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(
+            f"  Sample missing native (RDNA2) from pack ({shown} of {report.missing_native_from_pack}){suffix}:"
+        )
+        lines.append("    " + ", ".join(report.sample_missing_native_pack_hashes))
+    elif report.missing_native_from_pack > 0:
+        lines.append(
+            f"  Sample missing native (RDNA2) from pack (0 of {report.missing_native_from_pack}, "
+            f"max_samples={report.max_samples})"
+        )
+
+    if report.sample_missing_dxil_pack_hashes:
+        shown = len(report.sample_missing_dxil_pack_hashes)
+        extra = report.missing_dxil_only_from_pack - shown
+        suffix = f" (+{extra} more)" if extra > 0 else ""
+        lines.append(
+            f"  Sample missing DXIL-only from pack ({shown} of {report.missing_dxil_only_from_pack}){suffix}:"
+        )
+        lines.append("    " + ", ".join(report.sample_missing_dxil_pack_hashes))
+    elif report.missing_dxil_only_from_pack > 0:
+        lines.append(
+            f"  Sample missing DXIL-only from pack (0 of {report.missing_dxil_only_from_pack}, "
+            f"max_samples={report.max_samples})"
         )
 
     if report.sample_missing_pack_hashes:
@@ -3963,7 +4311,12 @@ def _cmd_diff(args: argparse.Namespace) -> int:
     label_b = sanitize_source_label(args.pack_b)
 
     try:
-        raw_a = Path(args.pack_a).read_bytes()
+        report_a, map_a = _inspect_source(
+            Path(args.pack_a),
+            limits=DEFAULT_WEBGPU_LIMITS,
+            source_label=label_a,
+            collect_digests=True,
+        )
     except OSError as exc:
         return _emit_error(
             as_json=args.as_json,
@@ -3972,20 +4325,6 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             error_code="io_error",
             message=_sanitize_os_error(args.pack_a, exc),
         )
-
-    try:
-        raw_b = Path(args.pack_b).read_bytes()
-    except OSError as exc:
-        return _emit_error(
-            as_json=args.as_json,
-            command="diff",
-            source_label=label_b,
-            error_code="io_error",
-            message=_sanitize_os_error(args.pack_b, exc),
-        )
-
-    try:
-        bundle_a = parse_wgpk(raw_a)
     except WgpkParseError as exc:
         return _emit_error(
             as_json=args.as_json,
@@ -3996,7 +4335,20 @@ def _cmd_diff(args: argparse.Namespace) -> int:
         )
 
     try:
-        bundle_b = parse_wgpk(raw_b)
+        report_b, map_b = _inspect_source(
+            Path(args.pack_b),
+            limits=DEFAULT_WEBGPU_LIMITS,
+            source_label=label_b,
+            collect_digests=True,
+        )
+    except OSError as exc:
+        return _emit_error(
+            as_json=args.as_json,
+            command="diff",
+            source_label=label_b,
+            error_code="io_error",
+            message=_sanitize_os_error(args.pack_b, exc),
+        )
     except WgpkParseError as exc:
         return _emit_error(
             as_json=args.as_json,
@@ -4006,7 +4358,8 @@ def _cmd_diff(args: argparse.Namespace) -> int:
             message=f"{label_b}: {exc.message}",
         )
 
-    report = diff_packs(bundle_a, bundle_b, label_a=label_a, label_b=label_b)
+    assert map_a is not None and map_b is not None
+    report = _diff_inspected_packs(report_a, map_a, report_b, map_b)
     if args.as_json:
         payload = report.to_dict()
         payload["ok"] = True
