@@ -7,7 +7,9 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "os/win32_compat.h"
@@ -57,26 +59,137 @@ Query query_from_entry(const UserdataEntry& e) {
     return q;
 }
 
+// Thread-safe read-only HTTPFS stat cache keyed by normalized game-data path and tagged with
+// httpfs_client_generation(). Caches both positive existence (with optional size once queried) and
+// negative probes (e.g. ERROR_FILE_NOT_FOUND) to avoid redundant CreateFileA + CloseHandle HTTPFS
+// roundtrips on repeated attribute/find queries.
+struct GameFileStatEntry {
+    uint32_t err = ERROR_FILE_NOT_FOUND;
+    bool has_size = false;
+    uint64_t size = 0;
+};
+
+struct GameFileStatCache {
+    std::shared_mutex mutex;
+    uint64_t generation = 0;
+    std::unordered_map<std::string, GameFileStatEntry> entries;
+};
+
+GameFileStatCache& game_file_stat_cache() {
+    static GameFileStatCache cache;
+    return cache;
+}
+
 // Probes a read-only game-data file through the file backend (CreateFileA, plus GetFileSizeEx when
 // `size` is non-null), keeping the caller's last error intact. Returns ERROR_SUCCESS or the open
 // error. Callers that only need existence/attributes pass null: on HTTPFS the size probe is a
 // series of range reads, far more than the open.
 uint32_t probe_game_file(const std::string& key, uint64_t* size) {
-    const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
-    if (h == INVALID_HANDLE_VALUE) {
-        const uint32_t err = GetLastError();
-        return err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
-    }
-    if (size == nullptr) {
+    const uint64_t gen = httpfs_client_generation();
+    if (get_httpfs_client() == nullptr) {
+        auto& cache = game_file_stat_cache();
+        {
+            std::shared_lock<std::shared_mutex> rlock(cache.mutex);
+            if (cache.generation != gen && !cache.entries.empty()) {
+                rlock.unlock();
+                std::unique_lock<std::shared_mutex> wlock(cache.mutex);
+                if (cache.generation != gen) {
+                    cache.entries.clear();
+                    cache.generation = gen;
+                }
+            }
+        }
+        const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                     OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
+        if (h == INVALID_HANDLE_VALUE) {
+            const uint32_t err = GetLastError();
+            return err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
+        }
+        if (size == nullptr) {
+            CloseHandle(h);
+            return ERROR_SUCCESS;
+        }
+        int64_t file_size = 0;
+        const bool ok = GetFileSizeEx(h, &file_size);
         CloseHandle(h);
+        *size = ok && file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
         return ERROR_SUCCESS;
     }
-    int64_t file_size = 0;
-    const bool ok = GetFileSizeEx(h, &file_size);
-    CloseHandle(h);
-    *size = ok && file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
-    return ERROR_SUCCESS;
+
+    auto& cache = game_file_stat_cache();
+    bool need_clear = false;
+    {
+        std::shared_lock<std::shared_mutex> rlock(cache.mutex);
+        if (cache.generation != gen) {
+            need_clear = true;
+        } else {
+            const auto it = cache.entries.find(key);
+            if (it != cache.entries.end()) {
+                if (it->second.err != ERROR_SUCCESS) {
+                    return it->second.err;
+                }
+                if (size == nullptr) {
+                    return ERROR_SUCCESS;
+                }
+                if (it->second.has_size) {
+                    *size = it->second.size;
+                    return ERROR_SUCCESS;
+                }
+            }
+        }
+    }
+    if (need_clear) {
+        std::unique_lock<std::shared_mutex> wlock(cache.mutex);
+        if (cache.generation != gen) {
+            cache.entries.clear();
+            cache.generation = gen;
+        }
+    }
+
+    const Handle h = CreateFileA(key.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, kNullHandle);
+    GameFileStatEntry entry;
+    if (h == INVALID_HANDLE_VALUE) {
+        const uint32_t err = GetLastError();
+        entry.err = err == ERROR_SUCCESS ? ERROR_FILE_NOT_FOUND : err;
+    } else {
+        entry.err = ERROR_SUCCESS;
+        if (size != nullptr) {
+            int64_t file_size = 0;
+            const bool ok = GetFileSizeEx(h, &file_size);
+            CloseHandle(h);
+            if (ok) {
+                entry.has_size = true;
+                entry.size = file_size > 0 ? static_cast<uint64_t>(file_size) : 0;
+                *size = entry.size;
+            } else {
+                *size = 0;
+            }
+        } else {
+            CloseHandle(h);
+        }
+    }
+
+    if (httpfs_client_generation() == gen) {
+        std::unique_lock<std::shared_mutex> wlock(cache.mutex);
+        if (cache.generation != gen) {
+            cache.entries.clear();
+            cache.generation = gen;
+        }
+        auto it = cache.entries.find(key);
+        if (it == cache.entries.end()) {
+            cache.entries.emplace(key, entry);
+        } else if (entry.err != ERROR_SUCCESS) {
+            it->second = entry;
+        } else {
+            it->second.err = ERROR_SUCCESS;
+            if (entry.has_size) {
+                it->second.has_size = true;
+                it->second.size = entry.size;
+            }
+        }
+    }
+    return entry.err;
 }
 
 // `need_size` false leaves q->size 0 for game data (attribute/existence queries).
