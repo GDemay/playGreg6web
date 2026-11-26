@@ -1053,6 +1053,11 @@
         byReason: createEmptyReasonCounts(),
         byStage: createEmptyStageCounts(),
       };
+      // W363: Monotonic mutation version + bounded cache for getMissingShaderSummary().
+      this._summaryVersion = 0;
+      this._summaryCacheVersion = -1;
+      this._summaryCache = new Map();
+      this._summaryUniqueCountsCache = null;
 
       // W179: Real-shader override guard (protects real pack, menu, and Bink2 YUV shaders).
       this._realShaders = new Map();
@@ -1597,6 +1602,7 @@
 
     _recordBlockedOverride(hashHex, stageName, reason, nowMs) {
       this._blockedOverrideCount += 1;
+      this._summaryVersion += 1;
       const key = `${hashHex}|${stageName}`;
       const existing = this._blockedOverrides.get(key);
       if (existing) {
@@ -1699,6 +1705,7 @@
         registeredAtMs: this._now(),
       };
       this._realShaders.set(`${hashHex}|${stageKey}`, record);
+      this._summaryVersion += 1;
       this._clearResolveCache();
 
       return {
@@ -1729,6 +1736,7 @@
           }
         }
         if (removed) {
+          this._summaryVersion += 1;
           this._clearResolveCache();
         }
         return removed;
@@ -1736,6 +1744,7 @@
       const stageKey = stage === '*' ? '*' : normalizeStage(stage);
       const removed = this._realShaders.delete(`${hashHex}|${stageKey}`);
       if (removed) {
+        this._summaryVersion += 1;
         this._clearResolveCache();
       }
       return removed;
@@ -1747,6 +1756,7 @@
     clearRealShaders() {
       if (this._realShaders.size > 0) {
         this._realShaders.clear();
+        this._summaryVersion += 1;
         this._clearResolveCache();
       }
     }
@@ -2342,6 +2352,7 @@
         this._categorizedTotals.total += 1;
         this._categorizedTotals.byReason.not_in_pack += 1;
         this._categorizedTotals.byStage[cached.stageName] += 1;
+        this._summaryVersion += 1;
         const catRow = cached.categorizedRow;
         if (catRow !== null) {
           catRow.hitCount += 1;
@@ -2471,6 +2482,7 @@
       this._categorizedTotals.total += 1;
       this._categorizedTotals.byReason[reason] += 1;
       this._categorizedTotals.byStage[stageName] += 1;
+      this._summaryVersion += 1;
 
       const key = `${hashHex}|${stageName}`;
       const existing = this._categorizedMissing.get(key);
@@ -2624,30 +2636,130 @@
         throw new RangeError(`limit must be a non-negative integer, got ${limit}`);
       }
 
-      const uniqueCountsByReason = createEmptyReasonCounts();
-      const uniqueCountsByStage = createEmptyStageCounts();
-      const filteredRows = [];
+      if (this._summaryCacheVersion !== this._summaryVersion) {
+        this._summaryCache.clear();
+        this._summaryUniqueCountsCache = null;
+        this._summaryCacheVersion = this._summaryVersion;
+      }
 
-      for (const row of this._categorizedMissing.values()) {
-        uniqueCountsByStage[row.stage] += 1;
-        for (let i = 0; i < MISSING_SHADER_REASON_ORDER.length; i += 1) {
-          const r = MISSING_SHADER_REASON_ORDER[i];
-          if (row.reasons[r] > 0) {
-            uniqueCountsByReason[r] += 1;
+      const cacheKey = `${filterReason || '*'}|${filterStage || '*'}|${limit}`;
+      let cached = this._summaryCache.get(cacheKey);
+      if (cached === undefined) {
+        let uniqueCounts = this._summaryUniqueCountsCache;
+        let topMissing;
+        if (limit === 0 && uniqueCounts !== null) {
+          topMissing = [];
+        } else {
+          const computeUnique = uniqueCounts === null;
+          const uniqueCountsByReason = computeUnique
+            ? createEmptyReasonCounts()
+            : uniqueCounts.byReason;
+          const uniqueCountsByStage = computeUnique
+            ? createEmptyStageCounts()
+            : uniqueCounts.byStage;
+          const filteredRows = limit === 0 ? null : [];
+
+          for (const row of this._categorizedMissing.values()) {
+            if (computeUnique) {
+              uniqueCountsByStage[row.stage] += 1;
+              if (row.reasons.not_in_pack > 0) uniqueCountsByReason.not_in_pack += 1;
+              if (row.reasons.reflection_failed > 0) uniqueCountsByReason.reflection_failed += 1;
+              if (row.reasons.compile_failed > 0) uniqueCountsByReason.compile_failed += 1;
+              if (row.reasons.other > 0) uniqueCountsByReason.other += 1;
+            }
+
+            if (filteredRows === null) {
+              continue;
+            }
+            if (filterStage !== null && row.stage !== filterStage) {
+              continue;
+            }
+            if (filterReason !== null && !(row.reasons[filterReason] > 0)) {
+              continue;
+            }
+
+            filteredRows.push({
+              hashHex: row.hashHex,
+              stage: row.stage,
+              reason: filterReason !== null ? filterReason : getDominantMissingReason(row),
+              lastReason: row.lastReason,
+              hitCount: row.hitCount,
+              reasons: {
+                not_in_pack: row.reasons.not_in_pack,
+                reflection_failed: row.reasons.reflection_failed,
+                compile_failed: row.reasons.compile_failed,
+                other: row.reasons.other,
+              },
+              firstSeenMs: row.firstSeenMs,
+              lastSeenMs: row.lastSeenMs,
+            });
+          }
+
+          if (computeUnique) {
+            uniqueCounts = { byReason: uniqueCountsByReason, byStage: uniqueCountsByStage };
+            this._summaryUniqueCountsCache = uniqueCounts;
+          }
+
+          if (filteredRows === null || filteredRows.length === 0) {
+            topMissing = [];
+          } else {
+            filteredRows.sort((a, b) => {
+              if (filterReason !== null) {
+                const diffReason = b.reasons[filterReason] - a.reasons[filterReason];
+                if (diffReason !== 0) {
+                  return diffReason;
+                }
+              }
+              return (
+                b.hitCount - a.hitCount ||
+                compareLex(a.hashHex, b.hashHex) ||
+                compareLex(a.stage, b.stage)
+              );
+            });
+            topMissing = filteredRows.length > limit ? filteredRows.slice(0, limit) : filteredRows;
           }
         }
 
-        if (filterStage !== null && row.stage !== filterStage) {
-          continue;
+        cached = {
+          totalMissingEvents: this._categorizedTotals.total,
+          uniqueMissingHashes: this._categorizedMissing.size,
+          maxTrackedHashes: this._maxCategorizedMissing,
+          overflowCount: this._categorizedOverflowCount,
+          countsByReason: {
+            not_in_pack: this._categorizedTotals.byReason.not_in_pack,
+            reflection_failed: this._categorizedTotals.byReason.reflection_failed,
+            compile_failed: this._categorizedTotals.byReason.compile_failed,
+            other: this._categorizedTotals.byReason.other,
+          },
+          countsByStage: {
+            vertex: this._categorizedTotals.byStage.vertex,
+            fragment: this._categorizedTotals.byStage.fragment,
+            compute: this._categorizedTotals.byStage.compute,
+          },
+          uniqueCountsByReason: uniqueCounts.byReason,
+          uniqueCountsByStage: uniqueCounts.byStage,
+          realShaderGuard: {
+            registeredRealShaders: this._realShaders.size,
+            blockedOverrideCount: this._blockedOverrideCount,
+            overflowBlockedCount: this._blockedOverflowCount,
+          },
+          topMissing,
+        };
+        if (this._summaryCache.size >= 16) {
+          const oldestKey = this._summaryCache.keys().next().value;
+          this._summaryCache.delete(oldestKey);
         }
-        if (filterReason !== null && !(row.reasons[filterReason] > 0)) {
-          continue;
-        }
+        this._summaryCache.set(cacheKey, cached);
+      }
 
-        filteredRows.push({
+      const cachedTop = cached.topMissing;
+      const clonedTop = new Array(cachedTop.length);
+      for (let i = 0; i < cachedTop.length; i += 1) {
+        const row = cachedTop[i];
+        clonedTop[i] = {
           hashHex: row.hashHex,
           stage: row.stage,
-          reason: filterReason !== null ? filterReason : getDominantMissingReason(row),
+          reason: row.reason,
           lastReason: row.lastReason,
           hitCount: row.hitCount,
           reasons: {
@@ -2658,47 +2770,42 @@
           },
           firstSeenMs: row.firstSeenMs,
           lastSeenMs: row.lastSeenMs,
-        });
+        };
       }
 
-      filteredRows.sort((a, b) => {
-        if (filterReason !== null) {
-          const diffReason = b.reasons[filterReason] - a.reasons[filterReason];
-          if (diffReason !== 0) {
-            return diffReason;
-          }
-        }
-        return (
-          b.hitCount - a.hitCount ||
-          compareLex(a.hashHex, b.hashHex) ||
-          compareLex(a.stage, b.stage)
-        );
-      });
-
       return {
-        totalMissingEvents: this._categorizedTotals.total,
-        uniqueMissingHashes: this._categorizedMissing.size,
-        maxTrackedHashes: this._maxCategorizedMissing,
-        overflowCount: this._categorizedOverflowCount,
+        totalMissingEvents: cached.totalMissingEvents,
+        uniqueMissingHashes: cached.uniqueMissingHashes,
+        maxTrackedHashes: cached.maxTrackedHashes,
+        overflowCount: cached.overflowCount,
         countsByReason: {
-          not_in_pack: this._categorizedTotals.byReason.not_in_pack,
-          reflection_failed: this._categorizedTotals.byReason.reflection_failed,
-          compile_failed: this._categorizedTotals.byReason.compile_failed,
-          other: this._categorizedTotals.byReason.other,
+          not_in_pack: cached.countsByReason.not_in_pack,
+          reflection_failed: cached.countsByReason.reflection_failed,
+          compile_failed: cached.countsByReason.compile_failed,
+          other: cached.countsByReason.other,
         },
         countsByStage: {
-          vertex: this._categorizedTotals.byStage.vertex,
-          fragment: this._categorizedTotals.byStage.fragment,
-          compute: this._categorizedTotals.byStage.compute,
+          vertex: cached.countsByStage.vertex,
+          fragment: cached.countsByStage.fragment,
+          compute: cached.countsByStage.compute,
         },
-        uniqueCountsByReason,
-        uniqueCountsByStage,
+        uniqueCountsByReason: {
+          not_in_pack: cached.uniqueCountsByReason.not_in_pack,
+          reflection_failed: cached.uniqueCountsByReason.reflection_failed,
+          compile_failed: cached.uniqueCountsByReason.compile_failed,
+          other: cached.uniqueCountsByReason.other,
+        },
+        uniqueCountsByStage: {
+          vertex: cached.uniqueCountsByStage.vertex,
+          fragment: cached.uniqueCountsByStage.fragment,
+          compute: cached.uniqueCountsByStage.compute,
+        },
         realShaderGuard: {
-          registeredRealShaders: this._realShaders.size,
-          blockedOverrideCount: this._blockedOverrideCount,
-          overflowBlockedCount: this._blockedOverflowCount,
+          registeredRealShaders: cached.realShaderGuard.registeredRealShaders,
+          blockedOverrideCount: cached.realShaderGuard.blockedOverrideCount,
+          overflowBlockedCount: cached.realShaderGuard.overflowBlockedCount,
         },
-        topMissing: limit === 0 ? [] : filteredRows.slice(0, limit),
+        topMissing: clonedTop,
       };
     }
 
@@ -2937,6 +3044,7 @@
       this._categorizedTotals.total = 0;
       this._categorizedTotals.byReason = createEmptyReasonCounts();
       this._categorizedTotals.byStage = createEmptyStageCounts();
+      this._summaryVersion += 1;
     }
 
     /**
@@ -2958,6 +3066,7 @@
       this._blockedOverrides.clear();
       this._blockedOverrideCount = 0;
       this._blockedOverflowCount = 0;
+      this._summaryVersion += 1;
 
       if (this._compileFailures.size > 0) {
         this._compileFailures.clear();
