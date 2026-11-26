@@ -47,6 +47,18 @@ inline constexpr uint32_t kConsoleCbvWord3 = 0x0002403Cu;
 // The console's constant-buffer words for [address, address + size) (address 0: null CBV).
 void constant_buffer_words(uint64_t address, uint32_t size, uint32_t out[4]) noexcept;
 
+// Normalizes a D3D12 Shader4ComponentMapping: 0 (zero-initialized desc without bit 12) defaults to
+// D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (0x1688 = R,G,B,A).
+inline constexpr uint32_t normalize_component_mapping(uint32_t mapping) noexcept {
+    return mapping == 0u ? d3d12_state::kDefaultShader4ComponentMapping : mapping;
+}
+
+// Computes the GFX10 T#/V# word 3 DST_SEL_X/Y/Z/W swizzle for a D3D12 SRV with the given DXGI
+// format and Shader4ComponentMapping (applying 0 -> 0x1688 default normalization and composing
+// over the format's canonical hardware swizzle). Returns false if `dxgi_format` is unsupported.
+bool srv_component_swizzle(uint32_t dxgi_format, uint32_t shader_4_component_mapping,
+                           gfx10::Swizzle* out) noexcept;
+
 enum class WordsStatus : uint8_t {
     Ok,
     Null,               // null descriptor: zero words

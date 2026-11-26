@@ -280,6 +280,14 @@ else()
     target_link_libraries(test_gfx10_descriptors PRIVATE playgta6_core)
     add_test(NAME gfx10_descriptors_tests COMMAND test_gfx10_descriptors)
 
+    add_executable(test_descriptor_words ../tests/test_descriptor_words.cpp)
+    target_link_libraries(test_descriptor_words PRIVATE playgta6_core)
+    add_test(NAME descriptor_words_tests COMMAND test_descriptor_words)
+
+    add_executable(test_d3d12_guest_command_list_copy ../tests/test_d3d12_guest_command_list_copy.cpp)
+    target_link_libraries(test_d3d12_guest_command_list_copy PRIVATE playgta6_core)
+    add_test(NAME d3d12_guest_command_list_copy_tests COMMAND test_d3d12_guest_command_list_copy)
+
     add_executable(test_gfx10_detile ../tests/test_gfx10_detile.cpp)
     target_link_libraries(test_gfx10_detile PRIVATE playgta6_core)
     add_test(NAME test_gfx10_detile COMMAND test_gfx10_detile)
