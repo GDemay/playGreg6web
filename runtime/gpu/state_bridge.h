@@ -72,6 +72,66 @@ namespace d3d = playgta6::gpu::d3d12_state;
 
 // v1 GpuIndexFormat (SetIndexBuffer) <-> G7 / key index format code.
 pso::WgpuIndexFormat to_wgpu_index_format(GpuIndexFormat format) noexcept;
+// D3D_PRIMITIVE_TOPOLOGY -> GpuPrimitiveTopology (*exact is false for fan/adjacency/patch/invalid).
+GpuPrimitiveTopology to_gpu_primitive_topology(pso::D3DPrimitiveTopology topology, bool* exact = nullptr) noexcept;
+bool is_strip_topology(GpuPrimitiveTopology topology) noexcept;
+bool is_strip_topology(pso::WgpuPrimitiveTopology topology) noexcept;
+// Resolves WebGPU primitive.stripIndexFormat: Undefined for list topologies; for strip topologies,
+// prefers the bound index buffer format, else falls back to the PSO's IBStripCutValue.
+pso::WgpuIndexFormat resolve_strip_index_format(
+    pso::WgpuPrimitiveTopology topology,
+    pso::WgpuIndexFormat bound_index_format,
+    pso::D3D12IndexBufferStripCutValue strip_cut = pso::D3D12IndexBufferStripCutValue::Disabled) noexcept;
+// Sanitizes depth-bias float parameters (NaN, +/-Inf, -0.0f -> +0.0f).
+float sanitize_depth_bias_float(float value) noexcept;
+uint32_t sanitize_depth_bias_bits(float value) noexcept;
+// Sanitizes a GpuRenderPipelineKey against WebGPU validation rules (depth bias, 8-MRT blendable/
+// integer guards, stencil aspect/masks, stripIndexFormat) before packet emission. Returns true
+// when any field was adjusted.
+bool sanitize_render_pipeline_key(GpuRenderPipelineKey* key, uint32_t features) noexcept;
+
+// Compatible WebGPU viewFormats list for a texture format (sRGB <-> linear sibling pairs for
+// RGBA8, BGRA8, BC1, BC2, BC3, BC7; matches GpuCreateTexture2Payload::view_formats capacity).
+struct CompatibleViewFormats {
+    uint8_t count = 0;
+    std::array<pso::WgpuTextureFormat, 8> formats{};
+};
+CompatibleViewFormats compatible_view_formats(pso::WgpuTextureFormat format) noexcept;
+CompatibleViewFormats compatible_view_formats_for_dxgi(pso::DxgiFormat dxgi_format,
+                                                       pso::FormatUsage usage,
+                                                       uint32_t features) noexcept;
+// True when `view_format` is valid for a GPUTextureView of a texture created with `texture_format`:
+// Undefined (default), identical, or the sRGB <-> linear sibling pair.
+bool is_compatible_view_format(pso::WgpuTextureFormat texture_format,
+                               pso::WgpuTextureFormat view_format) noexcept;
+bool is_srgb_format(pso::WgpuTextureFormat format) noexcept;
+bool is_hdr_color_format(pso::DxgiFormat format) noexcept;
+bool is_depth_stencil_dxgi_format(pso::DxgiFormat format) noexcept;
+
+// Result of resolving a sampled (SRV) view format against its backing texture's DXGI format:
+// handles HDR formats, depth/typeless-depth SRV siblings (R32_FLOAT/R16_UNORM/R24_UNORM_X8/
+// X24_G8/R32_FLOAT_X8X24/X32_G8X24 -> depth format + DepthOnly/StencilOnly aspect), and sRGB <->
+// linear view aliasing validation.
+struct ResolvedViewFormat {
+    pso::WgpuTextureFormat format = pso::WgpuTextureFormat::Undefined;
+    pso::WgpuTextureAspect aspect = pso::WgpuTextureAspect::All;
+    bool srgb_aliased = false;
+    bool depth_sibling = false;
+    bool fallback_to_base = false;
+};
+ResolvedViewFormat resolve_sampled_view_format(pso::DxgiFormat texture_dxgi,
+                                               pso::DxgiFormat view_dxgi,
+                                               bool sampled_only,
+                                               uint32_t features,
+                                               bool is_depth_resource = false) noexcept;
+
+// Deterministic zero-alloc FNV-1a 64-bit / SplitMix64 hashing utilities for hot-path caches.
+uint64_t splitmix64(uint64_t x) noexcept;
+uint64_t fnv1a_hash64(const void* data, size_t size, uint64_t seed = 0xcbf29ce484222325ull) noexcept;
+uint64_t hash_combine64(uint64_t seed, uint64_t value) noexcept;
+uint64_t hash_sampler_payload(const GpuCreateSampler2Payload& payload) noexcept;
+uint64_t hash_render_pipeline_key(const GpuRenderPipelineKey& key) noexcept;
+
 // G6 DESCRIPTOR_RANGE_TYPE-style DXGI value (uint32) -> G7 DxgiFormat.
 inline constexpr pso::DxgiFormat to_dxgi(uint32_t dxgi_format) noexcept {
     return static_cast<pso::DxgiFormat>(dxgi_format);
@@ -249,6 +309,9 @@ struct BridgeOptions {
     // GpuBindGroupFlags::BindingArrays). Off by default: lane-indexed heap windows are then refused at
     // the reflection join (counted) and no layout with binding_array_size != 0 is emitted.
     bool binding_arrays = false;
+    // WebGPU device limit maxColorAttachmentBytesPerSample (G81: 128 supports full 8-MRT HDR
+    // G-buffers such as RGBA16F/RGBA32F; callers may lower to 32 for strict core WebGPU validation).
+    uint32_t max_color_attachment_bytes_per_sample = 128;
 };
 
 inline constexpr uint64_t kUniformOffsetAlignment = 256;
@@ -351,6 +414,7 @@ struct ViewRecord {
     d3d::SubresourceRange range{};
     d3d::ResourceUsage usage = d3d::ResourceUsage::RenderTarget;
 };
+uint64_t hash_view_record(const ViewRecord& record) noexcept;
 
 // Outcome of building one warm-list pipeline ahead of the title (StateBridgeDevice::prewarm_pipeline).
 enum class PrewarmPipelineResult : uint8_t {
@@ -498,9 +562,12 @@ private:
     friend class CommandListBridge;
     friend class GraphicsPipelineState;
     friend class ComputePipelineState;
+    friend uint64_t hash_sampler_payload(const GpuCreateSampler2Payload& payload) noexcept;
+    friend uint64_t hash_view_record(const ViewRecord& record) noexcept;
 
     struct GroupLayoutRecord {
         uint32_t id = 0;
+        uint64_t content_hash = 0;
         GpuCreateBindGroupLayoutPayload header{};
         // Per bind group entry: a binding array of N elements (binding_array_size N) is N copies of its
         // layout entry, joins[i].array_index 0..N-1 (one GpuBindGroupEntry2 each).
@@ -516,11 +583,134 @@ private:
     struct PipelineLayoutRecord {
         uint32_t id = 0;
         uint64_t content_id = 0;
+        uint64_t content_hash = 0;
         std::vector<GroupLayoutRecord*> groups;
         bool emitted = false;
         bool emitted_by_prewarm = false;
         bool rt_arena = false;  // group 3 is the runtime's arena group (rt_arena bindings 16-21)
     };
+
+    // Zero-alloc deterministic POD keys for hot-path hash maps (G81).
+    struct SplitMix32Hash {
+        size_t operator()(uint32_t v) const noexcept { return static_cast<size_t>(splitmix64(v)); }
+    };
+    struct SplitMix64Hash {
+        size_t operator()(uint64_t v) const noexcept { return static_cast<size_t>(splitmix64(v)); }
+    };
+    struct ShaderPairKey {
+        uint64_t first = 0;
+        uint64_t second = 0;
+        bool operator==(const ShaderPairKey& o) const noexcept { return first == o.first && second == o.second; }
+    };
+    struct ShaderPairKeyHash {
+        size_t operator()(const ShaderPairKey& k) const noexcept {
+            return static_cast<size_t>(hash_combine64(splitmix64(k.first), k.second));
+        }
+    };
+    struct SamplerKey {
+        uint8_t address_u = 0;
+        uint8_t address_v = 0;
+        uint8_t address_w = 0;
+        uint8_t mag_filter = 0;
+        uint8_t min_filter = 0;
+        uint8_t mipmap_filter = 0;
+        uint8_t compare = 0;
+        uint8_t reserved0 = 0;
+        uint16_t max_anisotropy = 0;
+        uint16_t reserved1 = 0;
+        uint32_t lod_min_clamp_bits = 0;
+        uint32_t lod_max_clamp_bits = 0;
+        bool operator==(const SamplerKey& o) const noexcept {
+            return address_u == o.address_u && address_v == o.address_v && address_w == o.address_w &&
+                   mag_filter == o.mag_filter && min_filter == o.min_filter && mipmap_filter == o.mipmap_filter &&
+                   compare == o.compare && max_anisotropy == o.max_anisotropy &&
+                   lod_min_clamp_bits == o.lod_min_clamp_bits && lod_max_clamp_bits == o.lod_max_clamp_bits;
+        }
+    };
+    struct SamplerKeyHash {
+        size_t operator()(const SamplerKey& k) const noexcept {
+            return static_cast<size_t>(splitmix64(fnv1a_hash64(&k, sizeof(k))));
+        }
+    };
+    struct ViewKey {
+        uint32_t texture_id = 0;
+        uint32_t resource_id = 0;
+        GpuTextureViewDesc view{};
+        d3d::SubresourceRange range{};
+        uint8_t usage = 0;
+        uint8_t reserved[3] = {};
+        bool operator==(const ViewKey& o) const noexcept {
+            return texture_id == o.texture_id && resource_id == o.resource_id &&
+                   view.format == o.view.format && view.dimension == o.view.dimension &&
+                   view.aspect == o.view.aspect && view.base_mip_level == o.view.base_mip_level &&
+                   view.mip_level_count == o.view.mip_level_count &&
+                   view.base_array_layer == o.view.base_array_layer &&
+                   view.array_layer_count == o.view.array_layer_count &&
+                   range.first_mip == o.range.first_mip && range.mip_count == o.range.mip_count &&
+                   range.first_slice == o.range.first_slice && range.slice_count == o.range.slice_count &&
+                   range.first_plane == o.range.first_plane && range.plane_count == o.range.plane_count &&
+                   usage == o.usage;
+        }
+    };
+    struct ViewKeyHash {
+        size_t operator()(const ViewKey& k) const noexcept {
+            return static_cast<size_t>(splitmix64(fnv1a_hash64(&k, sizeof(k))));
+        }
+    };
+    struct IntermediateKey {
+        uint32_t resource_id = 0;
+        uint8_t format = 0;
+        uint8_t reserved[3] = {};
+        bool operator==(const IntermediateKey& o) const noexcept {
+            return resource_id == o.resource_id && format == o.format;
+        }
+    };
+    struct IntermediateKeyHash {
+        size_t operator()(const IntermediateKey& k) const noexcept {
+            return static_cast<size_t>(splitmix64((uint64_t{k.resource_id} << 8) | k.format));
+        }
+    };
+    struct ConversionGroupKey {
+        uint32_t layout = 0;
+        uint32_t src = 0;
+        uint32_t dst = 0;
+        uint32_t mip = 0;
+        uint32_t base_layer = 0;
+        uint32_t layer_count = 0;
+        bool operator==(const ConversionGroupKey& o) const noexcept {
+            return layout == o.layout && src == o.src && dst == o.dst && mip == o.mip &&
+                   base_layer == o.base_layer && layer_count == o.layer_count;
+        }
+    };
+    struct ConversionGroupKeyHash {
+        size_t operator()(const ConversionGroupKey& k) const noexcept {
+            return static_cast<size_t>(splitmix64(fnv1a_hash64(&k, sizeof(k))));
+        }
+    };
+    struct ResourcePairKey {
+        uint32_t first = 0;
+        uint32_t second = 0;
+        bool operator==(const ResourcePairKey& o) const noexcept { return first == o.first && second == o.second; }
+    };
+    struct ResourcePairKeyHash {
+        size_t operator()(const ResourcePairKey& k) const noexcept {
+            return static_cast<size_t>(splitmix64((uint64_t{k.first} << 32) | k.second));
+        }
+    };
+    struct MeshLayoutKey {
+        PipelineLayoutRecord* base = nullptr;
+        uint32_t spec = 0;
+        bool operator==(const MeshLayoutKey& o) const noexcept { return base == o.base && spec == o.spec; }
+    };
+    struct MeshLayoutKeyHash {
+        size_t operator()(const MeshLayoutKey& k) const noexcept {
+            return static_cast<size_t>(hash_combine64(splitmix64(reinterpret_cast<uintptr_t>(k.base)), k.spec));
+        }
+    };
+
+    static ViewKey make_view_key(const ViewRecord& record) noexcept;
+    static SamplerKey make_sampler_key(const GpuCreateSampler2Payload& payload) noexcept;
+    bool is_depth_resource(uint32_t resource_id) const;
 
     uint32_t intern_view(const ViewRecord& record) const;
     std::vector<uint32_t> retire_views(uint32_t texture_id);
@@ -649,20 +839,23 @@ private:
 
     mutable std::mutex views_mutex_;
     mutable std::deque<ViewRecord> views_;  // index = view_id - 1 (stable addresses)
-    mutable std::unordered_map<std::string, uint32_t> view_ids_;
-    // O36: views die with their texture: the id is recycled (free list) and the interned key dropped.
-    mutable std::deque<std::string> view_keys_;                               // index = view_id - 1; empty = free
-    mutable std::unordered_map<uint32_t, std::vector<uint32_t>> views_by_texture_;
+    mutable std::unordered_map<ViewKey, uint32_t, ViewKeyHash> view_ids_;
+    // O36/G81: views die with their texture: the id is recycled (free list) and the interned key dropped.
+    mutable std::deque<uint8_t> view_live_;                                   // index = view_id - 1; 0 = free
+    mutable std::unordered_map<uint32_t, std::vector<uint32_t>, SplitMix32Hash> views_by_texture_;
+    mutable std::unordered_set<uint32_t, SplitMix32Hash> depth_textures_;     // typeless/depth resources used as DSV
     mutable std::vector<uint32_t> free_views_;
     mutable size_t views_tracked_ = 0;     // under views_mutex_: this device's share of the live-view gauge
     size_t samplers_tracked_ = 0;          // under objects_mutex_: its share of the sampler gauge
 
     std::mutex objects_mutex_;  // layouts, samplers, root constant ring
     std::vector<std::unique_ptr<GroupLayoutRecord>> group_layouts_;
+    std::unordered_map<uint64_t, std::vector<GroupLayoutRecord*>, SplitMix64Hash> group_layouts_by_hash_;
     std::vector<std::unique_ptr<PipelineLayoutRecord>> pipeline_layouts_;
-    std::map<std::pair<uint64_t, uint64_t>, PipelineLayoutRecord*> layouts_by_shaders_;
-    std::unordered_map<std::string, uint32_t> samplers_;
-    std::unordered_set<uint32_t> emitted_compute_;
+    std::unordered_map<uint64_t, std::vector<PipelineLayoutRecord*>, SplitMix64Hash> pipeline_layouts_by_hash_;
+    std::unordered_map<ShaderPairKey, PipelineLayoutRecord*, ShaderPairKeyHash> layouts_by_shaders_;
+    std::unordered_map<SamplerKey, uint32_t, SamplerKeyHash> samplers_;
+    std::unordered_set<uint32_t, SplitMix32Hash> emitted_compute_;
     // Pipeline prewarm hand-off. Lock order: prewarm_mutex_, then objects_mutex_.
     std::function<uint64_t(uint32_t)> module_pack_key_;
     std::atomic<bool> prewarm_sync_{false};
@@ -671,25 +864,25 @@ private:
     uint32_t ring_buffer_id_ = 0;
     uint32_t default_vertex_buffer_id_ = 0;
     uint32_t ring_cursor_ = 0;
-    std::map<std::pair<uint32_t, uint8_t>, uint32_t> intermediates_;     // (texture, format) -> texture
-    std::map<uint32_t, DepthTwinPipelines> depth_twin_pipelines_;  // depth format << 8 | twin format
-    std::map<uint32_t, StorageConversionPipeline> conversion_pipelines_;  // dst format << 8 | dimension
-    std::map<std::array<uint32_t, 6>, uint32_t> conversion_groups_;      // (layout, src, dst, mip, layers)
+    std::unordered_map<IntermediateKey, uint32_t, IntermediateKeyHash> intermediates_;  // (texture, format) -> texture
+    std::unordered_map<uint32_t, DepthTwinPipelines, SplitMix32Hash> depth_twin_pipelines_;  // depth format << 8 | twin format
+    std::unordered_map<uint32_t, StorageConversionPipeline, SplitMix32Hash> conversion_pipelines_;  // dst format << 8 | dimension
+    std::unordered_map<ConversionGroupKey, uint32_t, ConversionGroupKeyHash> conversion_groups_;  // (layout, src, dst, mip, layers)
     std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
     IndirectClamp indirect_clamp_{};
-    std::map<std::pair<uint32_t, uint32_t>, uint32_t> indirect_groups_;  // (args, count) -> bind group
+    std::unordered_map<ResourcePairKey, uint32_t, ResourcePairKeyHash> indirect_groups_;  // (args, count) -> bind group
     uint32_t indirect_cursor_ = 0;
-    std::map<std::pair<PipelineLayoutRecord*, uint32_t>, PipelineLayoutRecord*> mesh_layouts_;
+    std::unordered_map<MeshLayoutKey, PipelineLayoutRecord*, MeshLayoutKeyHash> mesh_layouts_;
     GroupLayoutRecord* empty_group_layout_ = nullptr;
     GroupLayoutRecord* rt_group_layout_ = nullptr;  // the runtime-owned RT arena group (bindings 16-21)
     uint32_t mesh_output_buffer_ = 0;
-    std::map<uint32_t, uint32_t> mesh_output_groups_;  // runtime group layout id -> bind group
+    std::unordered_map<uint32_t, uint32_t, SplitMix32Hash> mesh_output_groups_;  // runtime group layout id -> bind group
     // RT arena (created lazily by the first RT-class dispatch).
     std::unique_ptr<rt_arena::Arena> rt_arena_;
     uint32_t rt_buffers_[rt_arena::kArenaCount] = {};
     uint32_t rt_dir_buffer_ = 0;
     uint32_t rt_stats_buffer_ = 0;
-    std::map<uint32_t, uint32_t> rt_groups_;  // runtime group layout id -> bind group
+    std::unordered_map<uint32_t, uint32_t, SplitMix32Hash> rt_groups_;  // runtime group layout id -> bind group
 
     mutable std::mutex bridges_mutex_;
     std::vector<CommandListBridge*> bridges_;
@@ -1006,6 +1199,7 @@ private:
     // Relocations and interned views the last gpu_entries call made.
     std::vector<d3d::CachedBindGroup::Relocation> pending_relocations_;
     std::vector<uint32_t> pending_view_ids_;
+    std::vector<GpuBindGroupEntry2> scratch_gpu_entries_;
     void invalidate_resources_locked(std::span<const uint32_t> resource_ids,
                                      std::span<const uint32_t> view_ids,
                                      std::vector<uint32_t>* retired_bgs);
