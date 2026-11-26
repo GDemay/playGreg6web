@@ -52,6 +52,10 @@ constexpr Guid kIidIGameInputDevice = com::make_guid("31dd86fb-4c1b-408a-868f-43
 constexpr uint32_t kDeviceStatus = kGameInputDeviceConnected | kGameInputDeviceInputEnabled;
 constexpr size_t kHistory = 128;
 constexpr size_t kMaxSnapshotKeys = 16;
+constexpr uint32_t kGuestSabKeyboardMask =
+    os::input_button::kMoveForward | os::input_button::kMoveLeft | os::input_button::kMoveBackward |
+    os::input_button::kMoveRight | os::input_button::kJump | os::input_button::kSprint;
+static_assert(kGuestSabKeyboardMask == 0x3Fu);
 
 enum class DeviceKind : uint8_t { Gamepad = 0, Keyboard = 1, Mouse = 2 };
 constexpr size_t kDeviceKindCount = 3;
@@ -702,7 +706,7 @@ private:
             s.gamepad = pad;
         } else {
             os::KeyboardScanEntry decoded[kMaxSnapshotKeys]{};
-            const size_t n = os::decode_keyboard_scan_entries(raw, decoded, kMaxSnapshotKeys);
+            const size_t n = os::decode_keyboard_scan_entries(raw & kGuestSabKeyboardMask, decoded, kMaxSnapshotKeys);
             s.key_count = static_cast<uint32_t>(n);
             for (size_t i = 0; i < n; ++i) {
                 s.keys[i] = GameInputKeyState{
