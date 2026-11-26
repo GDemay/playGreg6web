@@ -57,9 +57,10 @@
 // source ((dword >> bit_offset) & mask), 0 without "window_base". The stage subtracts the same base
 // from its lane index and bounds-checks against max_count. Such a binding joins as a binding array
 // (GpuBindGroupLayoutEntry::binding_array_size = max_count; the bridge binds heap descriptors
-// window_base + 0 .. max_count - 1, see d3d::ShaderBinding::array_size) only when the consumer binds
+// window_base + 0 .. max_count - 1, see d3d::ShaderBinding::array_size) when the consumer binds
 // binding arrays (JoinOptions::binding_arrays, from bridge::BridgeOptions::binding_arrays; off by
-// default). Otherwise the join fails with a counted reason (JoinStats::lane_indexed_bindings).
+// default). Otherwise it degrades to a single scalar heap binding at window_base + 0 (or constant
+// slot 0 without window_base, binding_array_size = 0) and is counted in JoinStats::lane_indexed_bindings.
 // A CB-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[cb.index]): the index is the
 // 32-bit dword at "byte_offset" of a constant buffer: the root CBV, the CBV in a table slot or the
 // root constants of the root parameter whose user data starts at "cbv"."user_sgpr". The descriptor
@@ -232,16 +233,17 @@ int root_parameter_containing_user_sgpr(const d3d::RootSignatureDesc& rs, bool c
 struct ReflectedStageRef {
     uint32_t visibility = 0;  // GpuShaderStageBits
     const StageReflection* reflection = nullptr;
+    // Optional per-stage first root parameter's user SGPR (0: use JoinOptions::user_data_base / default).
+    uint32_t user_data_base = 0;
 };
 // Join statistics (added to on success only, except lane_indexed_bindings).
 struct JoinStats {
     // Table bindings joined by slot (ShaderBinding::table_parameter): the root signature does not
     // declare the slot, or declares it as another class.
     uint64_t table_slots_outside_rs = 0;
-    // Lane-indexed heap bindings (LaneIndexed*Heap) that are well formed but cannot be bound: the
-    // consumer does not bind binding arrays (JoinOptions::binding_arrays off). Counted whether or
-    // not the join succeeds (such a binding always fails it), so the caller can report these skips
-    // apart from other join failures.
+    // Lane-indexed heap bindings (LaneIndexed*Heap) degraded to a single scalar heap binding at the
+    // window base because the consumer does not bind binding arrays (JoinOptions::binding_arrays off).
+    // Counted for telemetry whether or not the join succeeds.
     uint64_t lane_indexed_bindings = 0;
     // Lane-indexed heap bindings joined as binding arrays (JoinOptions::binding_arrays; on success).
     uint64_t lane_indexed_arrays = 0;
@@ -253,6 +255,9 @@ struct JoinStats {
     uint64_t vertex_inputs_defaulted = 0;
     // Bindings with an unresolved source, bound as the worker's default (on success).
     uint64_t unresolved_bindings = 0;
+    // Non-compute stages whose user-data SGPRs resolved via GFX10.3 shifted-base fallback (e.g.
+    // s16 for NGG/merged VS or s12 for 4-SGPR-shifted VS) instead of the default s8 (on success).
+    uint64_t shifted_user_data_base_stages = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
