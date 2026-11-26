@@ -1350,9 +1350,45 @@
     );
   }
 
+  function isOpfsDisabledByQuery() {
+    try {
+      const search =
+        typeof globalThis !== 'undefined' &&
+        globalThis.location &&
+        typeof globalThis.location.search === 'string'
+          ? globalThis.location.search
+          : '';
+      if (!search) return false;
+      const query = search.startsWith('?') ? search.slice(1) : search;
+      const params = new URLSearchParams(query);
+      for (const [k, v] of params.entries()) {
+        if (k.toLowerCase() === 'opfsl2') {
+          const val = String(v).trim().toLowerCase();
+          if (val === '0' || val === 'false' || val === 'no' || val === 'off') {
+            return true;
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed location or URLSearchParams.
+    }
+    return false;
+  }
+
+  function hasNativeOpfsStorage(storageObj = undefined) {
+    const storage =
+      storageObj !== undefined
+        ? storageObj
+        : typeof navigator !== 'undefined' && navigator && navigator.storage
+          ? navigator.storage
+          : null;
+    return Boolean(storage && typeof storage.getDirectory === 'function');
+  }
+
   function createNativeOpfsStore({ dirHandle = null, dirName = DEFAULT_OPFS_CACHE_DIR, storageObj = undefined } = {}) {
+    let cachedDir = dirHandle || null;
     const resolveDir = async (create) => {
-      if (dirHandle) return dirHandle;
+      if (cachedDir) return cachedDir;
       const storage =
         storageObj !== undefined
           ? storageObj
@@ -1368,7 +1404,9 @@
       }
       if (!rootDir || typeof rootDir.getDirectoryHandle !== 'function') return null;
       try {
-        return await rootDir.getDirectoryHandle(dirName, { create });
+        const dir = await rootDir.getDirectoryHandle(dirName, { create });
+        if (dir) cachedDir = dir;
+        return dir;
       } catch (err) {
         if (!create && isNotFoundError(err)) return null;
         throw err;
@@ -1392,28 +1430,61 @@
         return new Uint8Array(await file.arrayBuffer());
       },
       async write(key, bytes) {
+        if (!bytes || (bytes.buffer && bytes.buffer.detached)) return false;
         const dir = await resolveDir(true);
         if (!dir) return false;
         const handle = await dir.getFileHandle(key, { create: true });
-        if (!handle || typeof handle.createWritable !== 'function') return false;
-        const writable = await handle.createWritable();
+        if (!handle) return false;
         let payload = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
-        try {
-          await writable.write(payload);
-          payload = null;
-          await writable.close();
-          return true;
-        } catch (err) {
-          payload = null;
-          if (typeof writable.abort === 'function') {
-            try {
-              await writable.abort();
-            } catch {
-              // Ignore abort cleanup error.
+        if (typeof handle.createWritable === 'function') {
+          const writable = await handle.createWritable();
+          try {
+            await writable.write(payload);
+            payload = null;
+            await writable.close();
+            return true;
+          } catch (err) {
+            payload = null;
+            if (typeof writable.abort === 'function') {
+              try {
+                await writable.abort();
+              } catch {
+                // Ignore abort cleanup error.
+              }
+            }
+            throw err;
+          }
+        }
+        if (typeof handle.createSyncAccessHandle === 'function') {
+          const syncHandle = await handle.createSyncAccessHandle();
+          try {
+            if (typeof syncHandle.truncate === 'function') {
+              syncHandle.truncate(0);
+            }
+            let pos = 0;
+            while (pos < payload.byteLength) {
+              const step = syncHandle.write(pos === 0 ? payload : payload.subarray(pos), { at: pos });
+              if (step === undefined) {
+                pos = payload.byteLength;
+                break;
+              }
+              if (typeof step !== 'number' || step <= 0) {
+                throw new Error(`Short OPFS sync write (${pos}/${payload.byteLength})`);
+              }
+              pos += step;
+            }
+            if (typeof syncHandle.flush === 'function') {
+              syncHandle.flush();
+            }
+            return true;
+          } finally {
+            payload = null;
+            if (typeof syncHandle.close === 'function') {
+              syncHandle.close();
             }
           }
-          throw err;
         }
+        return false;
       },
       async delete(key) {
         const dir = await resolveDir(false);
@@ -2217,7 +2288,7 @@
   constructor({
     fetchImpl,
     rangeCache = null,
-    opfsCache = null,
+    opfsCache = undefined,
     opfsCacheVersion = PGIM_OPFS_CACHE_VERSION,
     opfsCacheDirName = DEFAULT_OPFS_CACHE_DIR,
     opfsValidateWithHead = true,
@@ -2252,7 +2323,13 @@
       typeof opfsCacheDirName === 'string' && opfsCacheDirName.trim().length > 0
         ? opfsCacheDirName.trim()
         : DEFAULT_OPFS_CACHE_DIR;
-    const normalizedOpfsStore = normalizeOpfsCacheStore(opfsCache, {
+    const effectiveOpfsCache =
+      opfsCache !== undefined
+        ? opfsCache
+        : !isOpfsDisabledByQuery() && hasNativeOpfsStorage(opfsStorageObj)
+          ? true
+          : null;
+    const normalizedOpfsStore = normalizeOpfsCacheStore(effectiveOpfsCache, {
       dirName: normalizedOpfsDir,
       storageObj: opfsStorageObj,
     });
@@ -2303,7 +2380,7 @@
     }
     this.fetchImpl = impl;
     this.rangeCache = rangeCache;
-    this.opfsCache = opfsCache;
+    this.opfsCache = effectiveOpfsCache;
     this._opfsStore = normalizedOpfsStore;
     this.opfsCacheVersion = normalizedOpfsVersion;
     this.opfsCacheDirName = normalizedOpfsDir;
@@ -2839,7 +2916,7 @@
 
   _scheduleOpfsWrite(run, { url, etag, bytes, totalBytes }) {
     const store = this._opfsStore;
-    if (!store || !bytes || !(totalBytes > 0)) return;
+    if (!store || !bytes || !(totalBytes > 0) || (bytes.buffer && bytes.buffer.detached)) return;
     const fp = buildPgimOpfsFingerprint(url, etag, totalBytes, this.opfsCacheVersion);
     const metaPayload = new TextEncoder().encode(
       JSON.stringify({
@@ -2851,8 +2928,9 @@
         dataKey: fp.dataKey,
       })
     );
-    // Avoid SharedArrayBuffer views in FileSystemWritableFileStream.write().
-    let payloadToWrite = isSharedArrayBuffer(bytes.buffer) ? bytes.slice() : bytes;
+    // Snapshot an owned copy before returning so caller zero-copy postMessage transfer
+    // (detaching the ArrayBuffer) or SharedArrayBuffer views cannot corrupt/abort the async write.
+    let payloadToWrite = bytes.slice();
     const dataMeta = {
       kind: 'pgim',
       version: this.opfsCacheVersion,
@@ -4529,7 +4607,7 @@
       preloader = null,
       fetchImpl,
       rangeCache = null,
-      opfsCache = null,
+      opfsCache = undefined,
       opfsCacheVersion,
       opfsCacheDirName,
       opfsValidateWithHead,
@@ -4554,7 +4632,7 @@
         : new PgimPreloader({
             fetchImpl,
             rangeCache,
-            opfsCache,
+            ...(opfsCache !== undefined ? { opfsCache } : {}),
             ...(opfsCacheVersion !== undefined ? { opfsCacheVersion } : {}),
             ...(opfsCacheDirName !== undefined ? { opfsCacheDirName } : {}),
             ...(opfsValidateWithHead !== undefined ? { opfsValidateWithHead } : {}),

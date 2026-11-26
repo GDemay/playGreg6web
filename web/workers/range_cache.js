@@ -609,6 +609,9 @@ class RangeCache {
     this._opfsWriteQueue = new Map();
     this._activeOpfsWrites = new Set();
     this._opfsWriteWaiters = [];
+    this._opfsDirKnownFiles = null;
+    this._opfsDirIndexPromise = null;
+    this._opfsDirIndexedStore = null;
     this._quotaEvictChain = Promise.resolve();
     this._expectedChunkLengths = new Map();
     this._fileSizes = new Map();
@@ -711,12 +714,79 @@ class RangeCache {
     }
   }
 
+  _resetOpfsDirIndex() {
+    this._opfsDirKnownFiles = null;
+    this._opfsDirIndexPromise = null;
+    this._opfsDirIndexedStore = null;
+  }
+
+  _supportsOpfsDirIndex(dir) {
+    return Boolean(
+      dir &&
+        typeof dir.getFileHandle === 'function' &&
+        (typeof dir.keys === 'function' || typeof dir.entries === 'function'),
+    );
+  }
+
+  _ensureOpfsDirIndex(dir) {
+    if (!this._supportsOpfsDirIndex(dir)) {
+      return Promise.resolve(null);
+    }
+    if (this._opfsDirIndexedStore !== dir) {
+      this._opfsDirKnownFiles = null;
+      this._opfsDirIndexPromise = null;
+      this._opfsDirIndexedStore = dir;
+    }
+    if (this._opfsDirKnownFiles !== null) {
+      return Promise.resolve(this._opfsDirKnownFiles);
+    }
+    if (this._opfsDirIndexPromise !== null) {
+      return this._opfsDirIndexPromise;
+    }
+    const targetDir = dir;
+    const promise = (async () => {
+      const known = new Set();
+      try {
+        if (typeof targetDir.keys === 'function') {
+          for await (const name of targetDir.keys()) {
+            if (typeof name === 'string') {
+              known.add(name);
+            }
+          }
+        } else if (typeof targetDir.entries === 'function') {
+          for await (const pair of targetDir.entries()) {
+            if (Array.isArray(pair) && typeof pair[0] === 'string') {
+              known.add(pair[0]);
+            }
+          }
+        }
+      } catch {
+        if (this._opfsDirIndexPromise === promise) {
+          this._opfsDirIndexPromise = null;
+        }
+        return null;
+      }
+      if (this._opfsDirIndexedStore === targetDir && this._opfsDirIndexPromise === promise) {
+        for (const fileName of this._opfsEntries.keys()) {
+          known.add(fileName);
+        }
+        this._opfsDirKnownFiles = known;
+        this._opfsDirIndexPromise = null;
+        return known;
+      }
+      return this._opfsDirKnownFiles;
+    })();
+    this._opfsDirIndexPromise = promise;
+    return promise;
+  }
+
   setOpfsDir(opfsDir) {
     const nextDir = opfsDir || null;
     if (nextDir !== this.opfsDir) {
       this._opfsEntries.clear();
       this._keyToOpfsFile.clear();
       this._opfsWriteQueue.clear();
+      this._resetOpfsDirIndex();
     }
     this.opfsDir = nextDir;
   }
@@ -952,6 +1022,9 @@ class RangeCache {
 
   async _deleteOpfsFile(fileName) {
     if (!this.opfsDir || !fileName) return false;
+    if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === this.opfsDir) {
+      this._opfsDirKnownFiles.delete(fileName);
+    }
     try {
       if (typeof this.opfsDir.removeEntry === 'function') {
         await this.opfsDir.removeEntry(fileName);
@@ -1052,27 +1125,42 @@ class RangeCache {
       }
     }
 
-    const dirNames = await this._listOpfsEntryNames();
-    for (let i = 0; i < dirNames.length; i += 1) {
-      if (isStaleMatch(dirNames[i])) {
-        staleNames.add(dirNames[i]);
+    let usedIndex = false;
+    if (this._supportsOpfsDirIndex(this.opfsDir)) {
+      const knownFiles = await this._ensureOpfsDirIndex(this.opfsDir);
+      if (knownFiles !== null) {
+        usedIndex = true;
+        for (const fileName of knownFiles) {
+          if (isStaleMatch(fileName)) {
+            staleNames.add(fileName);
+          }
+        }
       }
     }
 
-    // Fallback for minimal KV stores lacking keys()/entries(): probe legacy un-fingerprinted key.
-    if (
-      staleNames.size === 0 &&
-      dirNames.length === 0 &&
-      legacyName !== activeFileName &&
-      typeof this.opfsDir.get === 'function'
-    ) {
-      try {
-        const legacyVal = await this.opfsDir.get(legacyName);
-        if (legacyVal !== undefined && legacyVal !== null) {
-          staleNames.add(legacyName);
+    if (!usedIndex) {
+      const dirNames = await this._listOpfsEntryNames();
+      for (let i = 0; i < dirNames.length; i += 1) {
+        if (isStaleMatch(dirNames[i])) {
+          staleNames.add(dirNames[i]);
         }
-      } catch {
-        // Ignore probe failures.
+      }
+
+      // Fallback for minimal KV stores lacking keys()/entries(): probe legacy un-fingerprinted key.
+      if (
+        staleNames.size === 0 &&
+        dirNames.length === 0 &&
+        legacyName !== activeFileName &&
+        typeof this.opfsDir.get === 'function'
+      ) {
+        try {
+          const legacyVal = await this.opfsDir.get(legacyName);
+          if (legacyVal !== undefined && legacyVal !== null) {
+            staleNames.add(legacyName);
+          }
+        } catch {
+          // Ignore probe failures.
+        }
       }
     }
 
@@ -1219,11 +1307,24 @@ class RangeCache {
 
     const fileName = opfsChunkFileName(relPath, chunkIndex, this.chunkSize, fp);
     if (typeof this.opfsDir.getFileHandle === 'function') {
+      const knownFiles = this._supportsOpfsDirIndex(this.opfsDir)
+        ? await this._ensureOpfsDirIndex(this.opfsDir)
+        : null;
+      if (knownFiles !== null && !knownFiles.has(fileName)) {
+        let staleInvalidated = false;
+        if (fp !== null) {
+          staleInvalidated = (await this._invalidateStaleOpfsChunkEntries(relPath, chunkIndex, fileName)) > 0;
+        }
+        return { bytes: null, corrupt: false, staleInvalidated, checkedOpfs: true, fileName };
+      }
       let handle;
       try {
         handle = await this.opfsDir.getFileHandle(fileName, { create: false });
       } catch (err) {
         if (isNotFoundError(err)) {
+          if (knownFiles !== null) {
+            knownFiles.delete(fileName);
+          }
           let staleInvalidated = false;
           if (fp !== null) {
             staleInvalidated = (await this._invalidateStaleOpfsChunkEntries(relPath, chunkIndex, fileName)) > 0;
@@ -1235,6 +1336,9 @@ class RangeCache {
       try {
         const file = await handle.getFile();
         const buf = await file.arrayBuffer();
+        if (knownFiles !== null) {
+          knownFiles.add(fileName);
+        }
         return { bytes: new Uint8Array(buf), corrupt: false, staleInvalidated: false, checkedOpfs: true, fileName };
       } catch {
         return { bytes: null, corrupt: true, staleInvalidated: false, checkedOpfs: true, fileName };
@@ -1279,6 +1383,43 @@ class RangeCache {
   async _writeOpfsOnce(fileName, bytes) {
     if (typeof this.opfsDir.getFileHandle === 'function') {
       const handle = await this.opfsDir.getFileHandle(fileName, { create: true });
+      if (typeof handle.createSyncAccessHandle === 'function') {
+        try {
+          const syncHandle = await handle.createSyncAccessHandle();
+          try {
+            if (typeof syncHandle.truncate === 'function') {
+              syncHandle.truncate(0);
+            }
+            const written = syncHandle.write(bytes, { at: 0 });
+            if (typeof written === 'number' && written < bytes.byteLength) {
+              let pos = written;
+              while (pos < bytes.byteLength) {
+                const step = syncHandle.write(bytes.subarray(pos), { at: pos });
+                if (typeof step !== 'number' || step <= 0) {
+                  throw new Error(`Short OPFS sync write (${pos}/${bytes.byteLength})`);
+                }
+                pos += step;
+              }
+            }
+            if (typeof syncHandle.flush === 'function') {
+              syncHandle.flush();
+            }
+          } finally {
+            if (typeof syncHandle.close === 'function') {
+              syncHandle.close();
+            }
+          }
+          if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === this.opfsDir) {
+            this._opfsDirKnownFiles.add(fileName);
+          }
+          return true;
+        } catch (err) {
+          if (isQuotaExceededError(err) || typeof handle.createWritable !== 'function') {
+            throw err;
+          }
+          // Fall back cleanly to async FileSystemWritableFileStream if SyncAccessHandle fails.
+        }
+      }
       if (typeof handle.createWritable === 'function') {
         const writable = await handle.createWritable();
         try {
@@ -1294,16 +1435,8 @@ class RangeCache {
           }
           throw err;
         }
-        return true;
-      }
-      if (typeof handle.createSyncAccessHandle === 'function') {
-        const syncHandle = await handle.createSyncAccessHandle();
-        try {
-          syncHandle.truncate(0);
-          syncHandle.write(bytes, { at: 0 });
-          syncHandle.flush();
-        } finally {
-          syncHandle.close();
+        if (this._opfsDirKnownFiles !== null && this._opfsDirIndexedStore === this.opfsDir) {
+          this._opfsDirKnownFiles.add(fileName);
         }
         return true;
       }
@@ -2933,6 +3066,7 @@ class RangeCache {
     this._seqTrackers.clear();
     this._prefetchedKeys.clear();
     this._readaheadKeys.clear();
+    this._resetOpfsDirIndex();
     this._bytesCached = 0;
     this._stats.adaptiveReadaheadWindowBytes = 0;
   }
