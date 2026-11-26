@@ -71,15 +71,20 @@ impl Pattern {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Group {
     pub sites: Vec<u64>,
     pub reachable: usize,
     /// Reachable sites by function entry.
     pub functions: BTreeMap<u64, usize>,
+    /// Shallowest boot call-graph depth among reachable sites in this group.
+    pub min_depth: Option<u32>,
+    /// Count of jump sites in this group whose sole-predecessor window terminated because a
+    /// block had `> 1` intra-function predecessors (a CFG merge point).
+    pub merge_predecessor_sites: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Location {
     pub function: u64,
     pub depth: u32,
@@ -88,7 +93,91 @@ pub struct Location {
     pub patterns: BTreeSet<usize>,
 }
 
-#[derive(Debug, Default)]
+/// Priority tier for unresolved indirect jump patterns, ordered highest-priority first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PriorityTier {
+    /// Boot-reachable switch with a guard, merge-predecessor window, or unknown/unbounded table.
+    CriticalBootSwitch,
+    /// Boot-reachable switch without the critical indicators above.
+    BootSwitch,
+    /// Boot-reachable non-switch (`tail_call` or `computed`).
+    BootOther,
+    /// Unreachable switch pattern.
+    UnreachableSwitch,
+    /// Unreachable non-switch pattern.
+    UnreachableOther,
+}
+
+impl PriorityTier {
+    /// Stable snake_case identifier for reports and JSON output.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CriticalBootSwitch => "critical_boot_switch",
+            Self::BootSwitch => "boot_switch",
+            Self::BootOther => "boot_other",
+            Self::UnreachableSwitch => "unreachable_switch",
+            Self::UnreachableOther => "unreachable_other",
+        }
+    }
+
+    /// Classifies a `(Pattern, Group)` pair into its priority tier.
+    pub fn classify(pattern: &Pattern, group: &Group) -> Self {
+        if pattern.role == "switch" && group.reachable > 0 {
+            if pattern.guard != "none"
+                || group.merge_predecessor_sites > 0
+                || pattern.reason == "table_base_unknown"
+                || pattern.reason == "table_unbounded"
+            {
+                Self::CriticalBootSwitch
+            } else {
+                Self::BootSwitch
+            }
+        } else if group.reachable > 0 {
+            Self::BootOther
+        } else if pattern.role == "switch" {
+            Self::UnreachableSwitch
+        } else {
+            Self::UnreachableOther
+        }
+    }
+}
+
+/// Deterministic numeric priority score (strictly monotonic across [`PriorityTier`] bands).
+pub fn priority_score(pattern: &Pattern, group: &Group) -> u64 {
+    let tier = PriorityTier::classify(pattern, group);
+    let tier_base: u64 = match tier {
+        PriorityTier::CriticalBootSwitch => 4_000_000_000,
+        PriorityTier::BootSwitch => 3_000_000_000,
+        PriorityTier::BootOther => 2_000_000_000,
+        PriorityTier::UnreachableSwitch => 1_000_000_000,
+        PriorityTier::UnreachableOther => 0,
+    };
+    let reachable_bonus = (group.reachable as u64).min(1_000_000) * 500;
+    let depth_bonus = group
+        .min_depth
+        .map_or(0, |d| 256u64.saturating_sub(u64::from(d).min(256)) * 1_000);
+    let merge_bonus = (group.merge_predecessor_sites as u64).min(100_000) * 100;
+    let guard_bonus = if pattern.role == "switch" && pattern.guard != "none" {
+        50_000
+    } else {
+        0
+    };
+    let total_bonus = (group.sites.len() as u64).min(100_000_000);
+    tier_base + reachable_bonus + depth_bonus + merge_bonus + guard_bonus + total_bonus
+}
+
+/// One pattern ranked by boot-first priority.
+#[derive(Debug, Clone)]
+pub struct PrioritizedPattern<'a> {
+    /// 1-based index into [`JumpSurvey::patterns`].
+    pub pattern_index: usize,
+    pub tier: PriorityTier,
+    pub score: u64,
+    pub pattern: &'a Pattern,
+    pub group: &'a Group,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct JumpSurvey {
     pub total_unresolved: usize,
     pub reachable_unresolved: usize,
@@ -97,9 +186,134 @@ pub struct JumpSurvey {
     /// Unresolved jumps whose pointer slot is statically initialised (target seeded as an entry).
     pub pointer_slot_jumps: usize,
     pub by_reason: BTreeMap<&'static str, usize>,
+    pub by_reason_reachable: BTreeMap<&'static str, usize>,
+    /// Role (`"switch"`, `"tail_call"`, `"computed"`) -> `(total, reachable)`.
+    pub by_role: BTreeMap<&'static str, (usize, usize)>,
     /// Ranked: reachable desc, total desc, label.
     pub patterns: Vec<(Pattern, Group)>,
     pub locations: Vec<Location>,
+}
+
+impl JumpSurvey {
+    /// Returns patterns ranked by boot-first priority:
+    /// `(tier asc, reachable desc, min_depth.unwrap_or(u32::MAX) asc, total desc, pattern asc)`.
+    pub fn prioritized_patterns(&self) -> Vec<PrioritizedPattern<'_>> {
+        let mut out: Vec<PrioritizedPattern<'_>> = self
+            .patterns
+            .iter()
+            .enumerate()
+            .map(|(i, (pattern, group))| PrioritizedPattern {
+                pattern_index: i + 1,
+                tier: PriorityTier::classify(pattern, group),
+                score: priority_score(pattern, group),
+                pattern,
+                group,
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.tier
+                .cmp(&b.tier)
+                .then_with(|| b.group.reachable.cmp(&a.group.reachable))
+                .then_with(|| {
+                    a.group
+                        .min_depth
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.group.min_depth.unwrap_or(u32::MAX))
+                })
+                .then_with(|| b.group.sites.len().cmp(&a.group.sites.len()))
+                .then_with(|| a.pattern.cmp(b.pattern))
+        });
+        out
+    }
+
+    /// Returns `(total_switches, reachable_switches, merge_predecessor_switches)`.
+    pub fn switch_counts(&self) -> (usize, usize, usize) {
+        let mut total = 0usize;
+        let mut reachable = 0usize;
+        let mut merge_preds = 0usize;
+        for (p, g) in &self.patterns {
+            if p.role == "switch" {
+                total += g.sites.len();
+                reachable += g.reachable;
+                merge_preds += g.merge_predecessor_sites;
+            }
+        }
+        (total, reachable, merge_preds)
+    }
+
+    /// Returns `(1-based pattern_index, pattern, group)` for every pattern matching `role`.
+    pub fn filtered_by_role(&self, role: &str) -> Vec<(usize, &Pattern, &Group)> {
+        self.patterns
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, _))| p.role == role)
+            .map(|(i, (p, g))| (i + 1, p, g))
+            .collect()
+    }
+
+    /// Returns a derived survey restricted strictly to patterns with `role == "switch"`.
+    pub fn switches_only(&self) -> Self {
+        let mut patterns: Vec<(Pattern, Group)> = Vec::new();
+        let mut by_reason: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut by_reason_reachable: BTreeMap<&'static str, usize> = BTreeMap::new();
+        let mut total_unresolved = 0usize;
+        let mut reachable_unresolved = 0usize;
+
+        for (p, g) in &self.patterns {
+            if p.role != "switch" {
+                continue;
+            }
+            total_unresolved += g.sites.len();
+            reachable_unresolved += g.reachable;
+            *by_reason.entry(p.reason).or_default() += g.sites.len();
+            if g.reachable > 0 {
+                *by_reason_reachable.entry(p.reason).or_default() += g.reachable;
+            }
+            patterns.push((p.clone(), g.clone()));
+        }
+
+        let mut by_role: BTreeMap<&'static str, (usize, usize)> = BTreeMap::new();
+        if total_unresolved > 0 {
+            by_role.insert("switch", (total_unresolved, reachable_unresolved));
+        }
+
+        let mut func_info: BTreeMap<u64, (usize, BTreeSet<usize>)> = BTreeMap::new();
+        for (pi, (_, g)) in patterns.iter().enumerate() {
+            for (&func, &count) in &g.functions {
+                let entry = func_info.entry(func).or_default();
+                entry.0 += count;
+                entry.1.insert(pi + 1);
+            }
+        }
+
+        let locations: Vec<Location> = self
+            .locations
+            .iter()
+            .filter_map(|loc| {
+                let (sites, pats) = func_info.get(&loc.function)?;
+                Some(Location {
+                    function: loc.function,
+                    depth: loc.depth,
+                    callers: loc.callers,
+                    sites: *sites,
+                    patterns: pats.clone(),
+                })
+            })
+            .collect();
+
+        Self {
+            total_unresolved,
+            reachable_unresolved,
+            functions_total: self.functions_total,
+            functions_reachable: self.functions_reachable,
+            pointer_slot_jumps: self.pointer_slot_jumps,
+            by_reason,
+            by_reason_reachable,
+            by_role,
+            patterns,
+            locations,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,13 +569,28 @@ pub(crate) fn window<'a>(
     preds: &BTreeMap<u64, Vec<u64>>,
     start: u64,
 ) -> Vec<&'a Instruction> {
+    window_with_merge(func, preds, start).0
+}
+
+/// Instruction window for the jump ending the block at `start`, also returning `true` if the
+/// sole-predecessor chain terminated because a block had `> 1` intra-function predecessors.
+fn window_with_merge<'a>(
+    func: &'a Function,
+    preds: &BTreeMap<u64, Vec<u64>>,
+    start: u64,
+) -> (Vec<&'a Instruction>, bool) {
     let mut chain = vec![start];
     let mut cur = start;
+    let mut hit_merge_predecessor = false;
     while chain.len() < MAX_WINDOW_BLOCKS {
         match preds.get(&cur).map(Vec::as_slice) {
             Some([p]) if !chain.contains(p) => {
                 chain.push(*p);
                 cur = *p;
+            }
+            Some(ps) if ps.len() > 1 => {
+                hit_merge_predecessor = true;
+                break;
             }
             _ => break,
         }
@@ -372,7 +601,7 @@ pub(crate) fn window<'a>(
             out.extend(block.instructions.iter());
         }
     }
-    out
+    (out, hit_merge_predecessor)
 }
 
 /// Builds the survey from a finished analysis. `roots` are the VAs the boot starts at;
@@ -445,15 +674,25 @@ pub fn survey_jumps(layout: &Layout, analysis: &Analysis, roots: &[u64], top: us
                 }
                 m
             });
-            let ins = window(f, preds, *start);
-            let g = groups.entry(classify(&ctx, reason, &ins)).or_default();
+            let (ins, hit_merge) = window_with_merge(f, preds, *start);
+            let pat = classify(&ctx, reason, &ins);
+            let role = pat.role;
+            let g = groups.entry(pat).or_default();
             g.sites.push(site);
+            if hit_merge {
+                g.merge_predecessor_sites += 1;
+            }
             survey.total_unresolved += 1;
             *survey.by_reason.entry(reason.name()).or_default() += 1;
-            if depth.contains_key(entry) {
+            let role_counts = survey.by_role.entry(role).or_default();
+            role_counts.0 += 1;
+            if let Some(&d) = depth.get(entry) {
                 g.reachable += 1;
                 survey.reachable_unresolved += 1;
+                *survey.by_reason_reachable.entry(reason.name()).or_default() += 1;
+                role_counts.1 += 1;
                 *g.functions.entry(*entry).or_default() += 1;
+                g.min_depth = Some(g.min_depth.map_or(d, |cur| cur.min(d)));
             }
         }
     }
@@ -486,6 +725,26 @@ pub fn survey_jumps(layout: &Layout, analysis: &Analysis, roots: &[u64], top: us
     survey
 }
 
+fn push_json_str(out: &mut String, input: &str) {
+    out.push('"');
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 /// Plain-text report (addresses, labels and counts only).
 pub fn render(s: &JumpSurvey, examples: usize) -> String {
     let mut o = String::new();
@@ -502,10 +761,33 @@ pub fn render(s: &JumpSurvey, examples: usize) -> String {
     );
     let _ = writeln!(o, "by lifter reason:");
     for (k, v) in &s.by_reason {
-        let _ = writeln!(o, "  {k}: {v}");
+        let reachable = s.by_reason_reachable.get(k).copied().unwrap_or(0);
+        let _ = writeln!(o, "  {k}: {v} (reachable={reachable})");
+    }
+    let (sw_total, sw_reach, sw_merge) = s.switch_counts();
+    let _ = writeln!(o, "by role:");
+    for (role, (total, reachable)) in &s.by_role {
+        if *role == "switch" {
+            let _ = writeln!(
+                o,
+                "  {role}: total={total} reachable={reachable} merge_preds={sw_merge}"
+            );
+        } else {
+            let _ = writeln!(o, "  {role}: total={total} reachable={reachable}");
+        }
+    }
+    if sw_total > 0 && !s.by_role.contains_key("switch") {
+        let _ = writeln!(
+            o,
+            "  switch: total={sw_total} reachable={sw_reach} merge_preds={sw_merge}"
+        );
     }
     let _ = writeln!(o, "patterns (ranked by reachable count):");
     for (i, (p, g)) in s.patterns.iter().enumerate() {
+        let tier = PriorityTier::classify(p, g);
+        let min_depth = g
+            .min_depth
+            .map_or_else(|| "none".to_string(), |d| d.to_string());
         let ex: Vec<String> = g
             .sites
             .iter()
@@ -514,10 +796,13 @@ pub fn render(s: &JumpSurvey, examples: usize) -> String {
             .collect();
         let _ = writeln!(
             o,
-            "  #{} total={} reachable={} :: {}\n      e.g. {}",
+            "  #{} total={} reachable={} tier={} min_depth={} merge_preds={} :: {}\n      e.g. {}",
             i + 1,
             g.sites.len(),
             g.reachable,
+            tier.as_str(),
+            min_depth,
+            g.merge_predecessor_sites,
             p.label(),
             ex.join(" ")
         );
@@ -541,6 +826,246 @@ pub fn render(s: &JumpSurvey, examples: usize) -> String {
     o
 }
 
+/// Deterministic, strict RFC 8259 JSON report (zero external crates, zero host paths).
+pub fn render_json(s: &JumpSurvey, examples: usize) -> String {
+    render_json_with_trace(s, examples, None)
+}
+
+fn render_json_with_trace(
+    s: &JumpSurvey,
+    examples: usize,
+    trace: Option<(
+        &str,
+        &crate::trace_seed::SeedDiagnostics,
+        &[crate::trace_seed::CorrelatedJumpHit],
+        usize,
+    )>,
+) -> String {
+    let (sw_total, sw_reach, sw_merge) = s.switch_counts();
+    let prioritized = s.prioritized_patterns();
+
+    let mut out = String::new();
+    out.push_str("{\n");
+    let _ = writeln!(out, "  \"total_unresolved\": {},", s.total_unresolved);
+    let _ = writeln!(
+        out,
+        "  \"reachable_unresolved\": {},",
+        s.reachable_unresolved
+    );
+    let _ = writeln!(out, "  \"functions_total\": {},", s.functions_total);
+    let _ = writeln!(
+        out,
+        "  \"functions_reachable\": {},",
+        s.functions_reachable
+    );
+    let _ = writeln!(out, "  \"pointer_slot_jumps\": {},", s.pointer_slot_jumps);
+
+    out.push_str("  \"by_reason\": {");
+    for (i, (k, v)) in s.by_reason.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        push_json_str(&mut out, k);
+        let _ = write!(out, ": {v}");
+    }
+    out.push_str("},\n");
+
+    out.push_str("  \"by_reason_reachable\": {");
+    for (i, (k, v)) in s.by_reason_reachable.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        push_json_str(&mut out, k);
+        let _ = write!(out, ": {v}");
+    }
+    out.push_str("},\n");
+
+    out.push_str("  \"by_role\": {");
+    for (i, (role, (total, reachable))) in s.by_role.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        push_json_str(&mut out, role);
+        let _ = write!(out, ": {{\"total\": {total}, \"reachable\": {reachable}}}");
+    }
+    out.push_str("},\n");
+
+    let _ = writeln!(
+        out,
+        "  \"switch_summary\": {{\"total\": {sw_total}, \"reachable\": {sw_reach}, \"merge_predecessor_sites\": {sw_merge}}},"
+    );
+
+    out.push_str("  \"patterns\": [");
+    for (idx, item) in prioritized.iter().enumerate() {
+        out.push_str(if idx == 0 { "\n" } else { ",\n" });
+        out.push_str("    {");
+        let _ = write!(
+            out,
+            "\"rank\": {}, \"pattern_index\": {}, \"tier\": ",
+            idx + 1,
+            item.pattern_index
+        );
+        push_json_str(&mut out, item.tier.as_str());
+        let _ = write!(
+            out,
+            ", \"priority_score\": {}, \"total\": {}, \"reachable\": {}, \"min_depth\": ",
+            item.score,
+            item.group.sites.len(),
+            item.group.reachable
+        );
+        match item.group.min_depth {
+            Some(d) => {
+                let _ = write!(out, "{d}");
+            }
+            None => out.push_str("null"),
+        }
+        let _ = write!(
+            out,
+            ", \"merge_predecessor_sites\": {}, \"reason\": ",
+            item.group.merge_predecessor_sites
+        );
+        push_json_str(&mut out, item.pattern.reason);
+        out.push_str(", \"role\": ");
+        push_json_str(&mut out, item.pattern.role);
+        out.push_str(", \"form\": ");
+        push_json_str(&mut out, &item.pattern.form);
+        out.push_str(", \"scale\": ");
+        push_json_str(&mut out, &item.pattern.scale);
+        out.push_str(", \"guard\": ");
+        push_json_str(&mut out, &item.pattern.guard);
+        out.push_str(", \"location\": ");
+        push_json_str(&mut out, &item.pattern.location);
+        out.push_str(", \"examples\": [");
+        for (ei, site) in item.group.sites.iter().take(examples).enumerate() {
+            if ei > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "\"0x{site:x}\"");
+        }
+        out.push_str("]}");
+    }
+    if prioritized.is_empty() {
+        out.push_str("],\n");
+    } else {
+        out.push_str("\n  ],\n");
+    }
+
+    out.push_str("  \"locations\": [");
+    for (i, loc) in s.locations.iter().enumerate() {
+        out.push_str(if i == 0 { "\n" } else { ",\n" });
+        out.push_str("    {");
+        let _ = write!(
+            out,
+            "\"function\": \"0x{:x}\", \"depth\": {}, \"callers\": {}, \"sites\": {}, \"patterns\": [",
+            loc.function, loc.depth, loc.callers, loc.sites
+        );
+        for (pi, pat) in loc.patterns.iter().enumerate() {
+            if pi > 0 {
+                out.push_str(", ");
+            }
+            let _ = write!(out, "{pat}");
+        }
+        out.push_str("]}");
+    }
+    if s.locations.is_empty() {
+        out.push(']');
+    } else {
+        out.push_str("\n  ]");
+    }
+
+    if let Some((module, diag, correlated, top)) = trace {
+        out.push_str(",\n  \"trace_seed\": {\n");
+        let diag_json = diag.render_json(module, top);
+        let indented = diag_json
+            .trim_end_matches('\n')
+            .replace('\n', "\n    ");
+        let _ = writeln!(out, "    \"diagnostics\": {indented},");
+        let _ = writeln!(out, "    \"correlated_hits_total\": {},", correlated.len());
+        out.push_str("    \"correlated_hits\": [");
+        let shown = correlated.len().min(top);
+        for (i, hit) in correlated.iter().take(shown).enumerate() {
+            out.push_str(if i == 0 { "\n" } else { ",\n" });
+            out.push_str("      {");
+            let _ = write!(
+                out,
+                "\"function\": \"0x{:x}\", \"jump_va\": \"0x{:x}\", \"reason\": ",
+                hit.function, hit.jump_va
+            );
+            push_json_str(&mut out, hit.reason.name());
+            let _ = write!(out, ", \"pattern_rank\": {}, \"pattern_label\": ", hit.pattern_rank);
+            push_json_str(&mut out, &hit.pattern_label);
+            out.push_str(", \"role\": ");
+            push_json_str(&mut out, hit.role);
+            out.push_str(", \"guard\": ");
+            push_json_str(&mut out, &hit.guard);
+            let _ = write!(
+                out,
+                ", \"boot_reachable\": {}, \"accepted_targets\": {}, \"hit_targets\": [",
+                hit.boot_reachable, hit.accepted_targets
+            );
+            for (ti, t) in hit.hit_targets.iter().enumerate() {
+                if ti > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "\"0x{t:x}\"");
+            }
+            out.push_str("], \"distinct_sites\": [");
+            for (si, site) in hit.distinct_sites.iter().enumerate() {
+                if si > 0 {
+                    out.push_str(", ");
+                }
+                let _ = write!(out, "\"0x{site:x}\"");
+            }
+            out.push_str("]}");
+        }
+        if shown == 0 {
+            out.push_str("]\n");
+        } else {
+            out.push_str("\n    ]\n");
+        }
+        out.push_str("  }\n");
+    } else {
+        out.push('\n');
+    }
+
+    out.push_str("}\n");
+    out
+}
+
+fn render_trace_correlation_text(
+    module: &str,
+    diag: &crate::trace_seed::SeedDiagnostics,
+    correlated: &[crate::trace_seed::CorrelatedJumpHit],
+    top: usize,
+) -> String {
+    let mut out = String::new();
+    out.push('\n');
+    out.push_str(&diag.render_text(module, top));
+    let _ = writeln!(
+        out,
+        "trace-seed survey correlation (top {} of {} matched unresolved jumps):",
+        top.min(correlated.len()),
+        correlated.len()
+    );
+    for hit in correlated.iter().take(top) {
+        let _ = writeln!(
+            out,
+            "  fn {:#x} jump {:#x} pattern=#{} role={} guard={} boot_reachable={} accepted={} hits={} sites={} :: {}",
+            hit.function,
+            hit.jump_va,
+            hit.pattern_rank,
+            hit.role,
+            hit.guard,
+            hit.boot_reachable,
+            hit.accepted_targets,
+            hit.hit_targets.len(),
+            hit.distinct_sites.len(),
+            hit.pattern_label
+        );
+    }
+    out
+}
+
 /// Boot roots: the PE entry point and TLS callbacks.
 pub fn boot_roots(pe: &Pe64) -> Vec<u64> {
     let mut v = vec![pe.optional.image_base + u64::from(pe.optional.entry_point_rva)];
@@ -550,9 +1075,8 @@ pub fn boot_roots(pe: &Pe64) -> Vec<u64> {
     v
 }
 
-/// `survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--out <file>]`.
-pub const USAGE: &str =
-    "survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--out <file>]";
+/// `survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--json] [--switches-only] [--seed-targets <file>] [--out <file>]`.
+pub const USAGE: &str = "survey-jumps <pe-path> [--top N] [--examples N] [--no-refine] [--json] [--switches-only] [--seed-targets <file>] [--out <file>]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Args {
@@ -560,6 +1084,9 @@ pub struct Args {
     pub top: usize,
     pub examples: usize,
     pub no_refine: bool,
+    pub json: bool,
+    pub switches_only: bool,
+    pub seed_targets: Option<std::path::PathBuf>,
     pub out: Option<std::path::PathBuf>,
 }
 
@@ -569,6 +1096,9 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         top: 40,
         examples: 4,
         no_refine: false,
+        json: false,
+        switches_only: false,
+        seed_targets: None,
         out: None,
     };
     let mut path = None;
@@ -583,8 +1113,18 @@ pub fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
         match args[i].as_str() {
             "-h" | "--help" => return Ok(None),
             "--no-refine" => out.no_refine = true,
+            "--json" => out.json = true,
+            "--switches-only" => out.switches_only = true,
             "--top" => out.top = num(&mut i, "--top")?,
             "--examples" => out.examples = num(&mut i, "--examples")?,
+            "--seed-targets" => {
+                i += 1;
+                out.seed_targets = Some(
+                    args.get(i)
+                        .ok_or_else(|| "--seed-targets requires a value".to_string())?
+                        .into(),
+                );
+            }
             "--out" => {
                 i += 1;
                 out.out = Some(
@@ -623,8 +1163,37 @@ pub fn run(args: &Args) -> Result<String, String> {
                 .map_err(|e| format!("failed to build the guest image: {e:?}"))?;
         crate::pipeline::refine::discover_refined(&mut seeded.image, &guest.image).0
     };
-    let s = survey_jumps(&Layout::from_pe(&pe), &analysis, &boot_roots(&pe), args.top);
-    let text = render(&s, args.examples);
+    let full_survey = survey_jumps(&Layout::from_pe(&pe), &analysis, &boot_roots(&pe), args.top);
+    let survey = if args.switches_only {
+        full_survey.switches_only()
+    } else {
+        full_survey
+    };
+
+    let module = crate::summary::sanitize_label(&args.pe_path.to_string_lossy());
+    let trace_data = if let Some(seed_path) = &args.seed_targets {
+        let seeds = crate::trace_seed::load(seed_path)?;
+        let outcome = crate::trace_seed::evaluate(&seeded.image, &analysis, &seeds);
+        let diag = outcome.diagnostics();
+        let correlated = crate::trace_seed::correlate_with_survey(&outcome, &survey);
+        Some((diag, correlated))
+    } else {
+        None
+    };
+
+    let text = if args.json {
+        let trace_ref = trace_data
+            .as_ref()
+            .map(|(diag, corr)| (module.as_str(), diag, corr.as_slice(), args.top));
+        render_json_with_trace(&survey, args.examples, trace_ref)
+    } else {
+        let mut s = render(&survey, args.examples);
+        if let Some((diag, corr)) = &trace_data {
+            s.push_str(&render_trace_correlation_text(&module, diag, corr, args.top));
+        }
+        s
+    };
+
     match &args.out {
         Some(f) => {
             std::fs::write(f, &text)
@@ -718,6 +1287,555 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(a.top, 3);
+        assert!(!a.json);
+        assert!(!a.switches_only);
+        assert!(a.seed_targets.is_none());
         assert!(parse_args(&["--bogus".into()]).is_err());
+    }
+
+    #[test]
+    fn parse_args_supports_json_switches_only_and_seed_targets() {
+        let a = parse_args(&[
+            "game.exe".into(),
+            "--json".into(),
+            "--switches-only".into(),
+            "--no-refine".into(),
+            "--top".into(),
+            "15".into(),
+            "--examples".into(),
+            "2".into(),
+            "--seed-targets".into(),
+            "seeds.txt".into(),
+            "--out".into(),
+            "report.json".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(a.pe_path, std::path::PathBuf::from("game.exe"));
+        assert!(a.json);
+        assert!(a.switches_only);
+        assert!(a.no_refine);
+        assert_eq!(a.top, 15);
+        assert_eq!(a.examples, 2);
+        assert_eq!(a.seed_targets, Some(std::path::PathBuf::from("seeds.txt")));
+        assert_eq!(a.out, Some(std::path::PathBuf::from("report.json")));
+
+        assert_eq!(parse_args(&["--help".into()]).unwrap(), None);
+        assert_eq!(parse_args(&["-h".into()]).unwrap(), None);
+        assert!(parse_args(&["game.exe".into(), "--seed-targets".into()]).is_err());
+        assert!(parse_args(&["game.exe".into(), "--out".into()]).is_err());
+        assert!(parse_args(&["game.exe".into(), "--top".into(), "abc".into()]).is_err());
+        assert!(parse_args(&["game.exe".into(), "--examples".into()]).is_err());
+        assert!(parse_args(&["a.exe".into(), "b.exe".into()]).is_err());
+        assert!(parse_args(&["--json".into()]).is_err());
+    }
+
+    /// Strict RFC 8259 JSON syntax validator (zero external dependencies).
+    struct JsonValidator<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+
+    impl<'a> JsonValidator<'a> {
+        fn validate(input: &'a str) -> Result<(), String> {
+            let mut v = Self {
+                bytes: input.as_bytes(),
+                pos: 0,
+            };
+            v.skip_ws();
+            v.parse_value()?;
+            v.skip_ws();
+            if v.pos != v.bytes.len() {
+                return Err(format!("trailing bytes at offset {}", v.pos));
+            }
+            Ok(())
+        }
+
+        fn peek(&self) -> Option<u8> {
+            self.bytes.get(self.pos).copied()
+        }
+
+        fn skip_ws(&mut self) {
+            while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+                self.pos += 1;
+            }
+        }
+
+        fn expect_byte(&mut self, expected: u8) -> Result<(), String> {
+            match self.peek() {
+                Some(b) if b == expected => {
+                    self.pos += 1;
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected '{}' at offset {}, got {:?}",
+                    expected as char, self.pos, other
+                )),
+            }
+        }
+
+        fn parse_value(&mut self) -> Result<(), String> {
+            self.skip_ws();
+            match self.peek() {
+                Some(b'{') => self.parse_object(),
+                Some(b'[') => self.parse_array(),
+                Some(b'"') => self.parse_string(),
+                Some(b't') => self.parse_literal(b"true"),
+                Some(b'f') => self.parse_literal(b"false"),
+                Some(b'n') => self.parse_literal(b"null"),
+                Some(b'-' | b'0'..=b'9') => self.parse_number(),
+                other => Err(format!("unexpected token {other:?} at offset {}", self.pos)),
+            }
+        }
+
+        fn parse_literal(&mut self, lit: &[u8]) -> Result<(), String> {
+            if self.bytes[self.pos..].starts_with(lit) {
+                self.pos += lit.len();
+                Ok(())
+            } else {
+                Err(format!("invalid literal at offset {}", self.pos))
+            }
+        }
+
+        fn parse_string(&mut self) -> Result<(), String> {
+            self.expect_byte(b'"')?;
+            while let Some(b) = self.peek() {
+                self.pos += 1;
+                match b {
+                    b'"' => return Ok(()),
+                    b'\\' => {
+                        let esc = self
+                            .peek()
+                            .ok_or_else(|| format!("unterminated escape at {}", self.pos))?;
+                        self.pos += 1;
+                        match esc {
+                            b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => {}
+                            b'u' => {
+                                for _ in 0..4 {
+                                    let h = self.peek().ok_or_else(|| {
+                                        format!("truncated unicode escape at {}", self.pos)
+                                    })?;
+                                    if !h.is_ascii_hexdigit() {
+                                        return Err(format!("invalid hex escape at {}", self.pos));
+                                    }
+                                    self.pos += 1;
+                                }
+                            }
+                            _ => return Err(format!("invalid escape '\\{}' at {}", esc as char, self.pos)),
+                        }
+                    }
+                    0x00..=0x1F => {
+                        return Err(format!("unescaped control byte 0x{b:02x} at {}", self.pos));
+                    }
+                    _ => {}
+                }
+            }
+            Err(format!("unterminated string at {}", self.pos))
+        }
+
+        fn parse_number(&mut self) -> Result<(), String> {
+            if self.peek() == Some(b'-') {
+                self.pos += 1;
+            }
+            match self.peek() {
+                Some(b'0') => self.pos += 1,
+                Some(b'1'..=b'9') => {
+                    while matches!(self.peek(), Some(b'0'..=b'9')) {
+                        self.pos += 1;
+                    }
+                }
+                _ => return Err(format!("invalid number at {}", self.pos)),
+            }
+            if self.peek() == Some(b'.') {
+                self.pos += 1;
+                if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(format!("expected fraction digit at {}", self.pos));
+                }
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            if matches!(self.peek(), Some(b'e' | b'E')) {
+                self.pos += 1;
+                if matches!(self.peek(), Some(b'+' | b'-')) {
+                    self.pos += 1;
+                }
+                if !matches!(self.peek(), Some(b'0'..=b'9')) {
+                    return Err(format!("expected exponent digit at {}", self.pos));
+                }
+                while matches!(self.peek(), Some(b'0'..=b'9')) {
+                    self.pos += 1;
+                }
+            }
+            Ok(())
+        }
+
+        fn parse_array(&mut self) -> Result<(), String> {
+            self.expect_byte(b'[')?;
+            self.skip_ws();
+            if self.peek() == Some(b']') {
+                self.pos += 1;
+                return Ok(());
+            }
+            loop {
+                self.parse_value()?;
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => self.pos += 1,
+                    Some(b']') => {
+                        self.pos += 1;
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected ',' or ']' in array at {}, got {other:?}",
+                            self.pos
+                        ));
+                    }
+                }
+            }
+        }
+
+        fn parse_object(&mut self) -> Result<(), String> {
+            self.expect_byte(b'{')?;
+            self.skip_ws();
+            if self.peek() == Some(b'}') {
+                self.pos += 1;
+                return Ok(());
+            }
+            loop {
+                self.skip_ws();
+                self.parse_string()?;
+                self.skip_ws();
+                self.expect_byte(b':')?;
+                self.parse_value()?;
+                self.skip_ws();
+                match self.peek() {
+                    Some(b',') => self.pos += 1,
+                    Some(b'}') => {
+                        self.pos += 1;
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(format!(
+                            "expected ',' or '}}' in object at {}, got {other:?}",
+                            self.pos
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    fn analyse_multi(entries: Vec<u64>, code: Vec<u8>) -> Analysis {
+        let text: &'static [u8] = Box::leak([code, vec![0xCC; 16]].concat().into_boxed_slice());
+        let rdata: &'static [u8] = Box::leak(vec![0u8; 0x100].into_boxed_slice());
+        let image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, text, true),
+                CodeSection::new(BASE + 0x2000, rdata, false),
+            ],
+            entries,
+        );
+        discover(&image)
+    }
+
+    #[test]
+    fn merge_predecessor_shift_guarded_switch_is_critical_boot_switch() {
+        let an = analyse(|a| {
+            let mut alt = a.create_label();
+            let mut merge = a.create_label();
+            a.test(ecx, ecx).unwrap();
+            a.jz(alt).unwrap();
+            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.jmp(merge).unwrap();
+            a.set_label(&mut alt).unwrap();
+            a.mov(rdx, qword_ptr(rcx + 0x10)).unwrap();
+            a.set_label(&mut merge).unwrap();
+            a.shr(rax, 2).unwrap();
+            a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
+        });
+        let s = survey_jumps(&layout(), &an, &[TEXT], 10);
+        assert_eq!(s.total_unresolved, 1);
+        assert_eq!(s.reachable_unresolved, 1);
+        assert_eq!(s.switch_counts(), (1, 1, 1));
+        assert_eq!(s.by_role.get("switch"), Some(&(1, 1)));
+        let (p, g) = &s.patterns[0];
+        assert_eq!(p.role, "switch");
+        assert_eq!(p.guard, "shift");
+        assert_eq!(p.scale, "8");
+        assert_eq!(g.merge_predecessor_sites, 1);
+        assert_eq!(g.min_depth, Some(0));
+        assert_eq!(PriorityTier::classify(p, g), PriorityTier::CriticalBootSwitch);
+
+        let prio = s.prioritized_patterns();
+        assert_eq!(prio.len(), 1);
+        assert_eq!(prio[0].tier, PriorityTier::CriticalBootSwitch);
+        assert_eq!(prio[0].pattern_index, 1);
+    }
+
+    #[test]
+    fn priority_ranking_puts_boot_switch_ahead_of_higher_count_tail_call() {
+        // Build 3 functions in one code buffer:
+        // fn0 (boot root, depth 0): calls fn1, fn2, fn3, fn4
+        // fn1, fn2, fn3 (depth 1): each does a vtable tail call `jmp [rax + 0x10]` (3 reachable tail_calls)
+        // fn4 (depth 1): boot-reachable switch (`mov rdx, [rcx+8]; mov rax, [rdx+rax*8]; jmp rax`)
+        // fn5 (unreachable): another switch
+        let mut buf = Vec::new();
+        let assemble_at = |va: u64, build: fn(&mut CodeAssembler)| -> Vec<u8> {
+            let mut a = CodeAssembler::new(64).unwrap();
+            build(&mut a);
+            a.assemble(va).unwrap()
+        };
+
+        let fn0 = TEXT;
+        let fn1 = TEXT + 0x40;
+        let fn2 = TEXT + 0x60;
+        let fn3 = TEXT + 0x80;
+        let fn4 = TEXT + 0xA0;
+        let fn5 = TEXT + 0xE0;
+
+        let mut a0 = CodeAssembler::new(64).unwrap();
+        a0.call(fn1).unwrap();
+        a0.call(fn2).unwrap();
+        a0.call(fn3).unwrap();
+        a0.call(fn4).unwrap();
+        a0.ret().unwrap();
+        let b0 = a0.assemble(fn0).unwrap();
+        buf.extend_from_slice(&b0);
+        buf.resize((fn1 - TEXT) as usize, 0xCC);
+
+        for target in [fn1, fn2, fn3] {
+            let b = assemble_at(target, |a| {
+                a.jmp(qword_ptr(rax + 0x10)).unwrap();
+            });
+            buf.extend_from_slice(&b);
+            buf.resize(((target - TEXT) + 0x20) as usize, 0xCC);
+        }
+
+        let b4 = assemble_at(fn4, |a| {
+            a.mov(rdx, qword_ptr(rcx + 0x8)).unwrap();
+            a.mov(rax, qword_ptr(rdx + rax * 8)).unwrap();
+            a.jmp(rax).unwrap();
+        });
+        buf.extend_from_slice(&b4);
+        buf.resize((fn5 - TEXT) as usize, 0xCC);
+
+        let b5 = assemble_at(fn5, |a| {
+            a.mov(rdx, qword_ptr(rcx + 0x10)).unwrap();
+            a.shr(rax, 1).unwrap();
+            a.jmp(qword_ptr(rdx + rax * 8)).unwrap();
+        });
+        buf.extend_from_slice(&b5);
+
+        let an = analyse_multi(vec![fn0, fn5], buf);
+        let s = survey_jumps(&layout(), &an, &[fn0], 10);
+
+        assert_eq!(s.total_unresolved, 5);
+        assert_eq!(s.reachable_unresolved, 4);
+        assert_eq!(s.by_role.get("tail_call"), Some(&(3, 3)));
+        assert_eq!(s.by_role.get("switch"), Some(&(2, 1)));
+        assert_eq!(s.switch_counts(), (2, 1, 0));
+        assert_eq!(s.by_reason_reachable.values().sum::<usize>(), 4);
+
+        // Raw patterns are sorted by reachable count desc -> tail_call (3) is first.
+        assert_eq!(s.patterns[0].0.role, "tail_call");
+        assert_eq!(s.patterns[0].1.reachable, 3);
+
+        // Prioritized patterns put the boot-reachable switch ahead of the higher-count tail_call!
+        let prio = s.prioritized_patterns();
+        assert_eq!(prio.len(), 3);
+        assert_eq!(prio[0].pattern.role, "switch");
+        assert!(matches!(
+            prio[0].tier,
+            PriorityTier::CriticalBootSwitch | PriorityTier::BootSwitch
+        ));
+        assert_eq!(prio[0].group.min_depth, Some(1));
+        assert_eq!(prio[1].pattern.role, "tail_call");
+        assert_eq!(prio[1].tier, PriorityTier::BootOther);
+        assert_eq!(prio[2].pattern.role, "switch");
+        assert_eq!(prio[2].tier, PriorityTier::UnreachableSwitch);
+        assert_eq!(prio[2].group.min_depth, None);
+        assert!(prio[0].score > prio[1].score);
+        assert!(prio[1].score > prio[2].score);
+
+        // Role filtering & switches_only()
+        assert_eq!(s.filtered_by_role("switch").len(), 2);
+        assert_eq!(s.filtered_by_role("tail_call").len(), 1);
+        let sw_only = s.switches_only();
+        assert_eq!(sw_only.total_unresolved, 2);
+        assert_eq!(sw_only.reachable_unresolved, 1);
+        assert_eq!(sw_only.patterns.len(), 2);
+        assert!(sw_only.patterns.iter().all(|(p, _)| p.role == "switch"));
+        assert_eq!(sw_only.locations.len(), 1);
+        assert_eq!(sw_only.locations[0].function, fn4);
+        assert_eq!(sw_only.by_role.len(), 1);
+        assert_eq!(sw_only.by_role.get("switch"), Some(&(2, 1)));
+
+        // Text rendering preserves headers and adds role/tier/depth/merge metadata.
+        let text = render(&s, 3);
+        assert!(text.contains("unresolved indirect jmp survey"));
+        assert!(text.contains("by lifter reason:"));
+        assert!(text.contains("by role:"));
+        assert!(text.contains("patterns (ranked by reachable count):"));
+        assert!(text.contains("locations (shallowest boot-reachable functions holding unresolved jumps):"));
+        assert!(text.contains("tier="));
+        assert!(text.contains("min_depth="));
+        assert!(text.contains("merge_preds="));
+        assert!(!crate::summary::contains_host_path(&text));
+
+        // JSON rendering is strict RFC 8259, deterministic, and host-path-free.
+        let json1 = render_json(&s, 3);
+        let json2 = render_json(&s, 3);
+        assert_eq!(json1, json2);
+        JsonValidator::validate(&json1).expect("render_json must emit valid RFC 8259 JSON");
+        assert!(!crate::summary::contains_host_path(&json1));
+        assert!(json1.contains("\"by_reason_reachable\""));
+        assert!(json1.contains("\"by_role\""));
+        assert!(json1.contains("\"switch_summary\""));
+        assert!(json1.contains("\"priority_score\""));
+        assert!(json1.contains("\"merge_predecessor_sites\""));
+
+        let sw_json = render_json(&sw_only, 3);
+        JsonValidator::validate(&sw_json).expect("switches_only JSON must be valid");
+        assert!(!sw_json.contains("\"tail_call\""));
+    }
+
+    #[test]
+    fn priority_tiers_and_min_depth_tiebreak_order_cleanly() {
+        let mk_pat = |role: &'static str, reason: &'static str, guard: &str, form: &str| Pattern {
+            reason,
+            role,
+            form: form.into(),
+            scale: if role == "switch" { "8".into() } else { "0".into() },
+            guard: guard.into(),
+            location: "loaded_pointer".into(),
+        };
+        let mk_grp = |sites: Vec<u64>, reachable: usize, min_depth: Option<u32>, merge: usize| Group {
+            sites,
+            reachable,
+            functions: BTreeMap::new(),
+            min_depth,
+            merge_predecessor_sites: merge,
+        };
+
+        let p_crit_d0 = mk_pat("switch", "table_base_unknown", "shift", "jmp [mem]");
+        let g_crit_d0 = mk_grp(vec![0x10], 1, Some(0), 1);
+
+        let p_crit_d2 = mk_pat("switch", "table_unbounded", "none", "jmp [mem]");
+        let g_crit_d2 = mk_grp(vec![0x20], 1, Some(2), 0);
+
+        let p_boot_sw = mk_pat("switch", "memory_operand", "none", "jmp [mem]");
+        let g_boot_sw = mk_grp(vec![0x30], 2, Some(1), 0);
+
+        let p_boot_other = mk_pat("tail_call", "memory_operand", "none", "jmp [mem]");
+        let g_boot_other = mk_grp(vec![0x40, 0x41, 0x42], 3, Some(0), 0);
+
+        let p_unreach_sw = mk_pat("switch", "table_base_unknown", "shift", "jmp [mem]");
+        let g_unreach_sw = mk_grp(vec![0x50], 0, None, 1);
+
+        let p_unreach_other = mk_pat("computed", "computed", "none", "jmp reg<-computed");
+        let g_unreach_other = mk_grp(vec![0x60], 0, None, 0);
+
+        let survey = JumpSurvey {
+            total_unresolved: 8,
+            reachable_unresolved: 7,
+            patterns: vec![
+                (p_unreach_other, g_unreach_other),
+                (p_boot_other, g_boot_other),
+                (p_unreach_sw, g_unreach_sw),
+                (p_crit_d2, g_crit_d2),
+                (p_boot_sw, g_boot_sw),
+                (p_crit_d0, g_crit_d0),
+            ],
+            ..Default::default()
+        };
+
+        let prio = survey.prioritized_patterns();
+        let tiers: Vec<PriorityTier> = prio.iter().map(|p| p.tier).collect();
+        assert_eq!(
+            tiers,
+            vec![
+                PriorityTier::CriticalBootSwitch,
+                PriorityTier::CriticalBootSwitch,
+                PriorityTier::BootSwitch,
+                PriorityTier::BootOther,
+                PriorityTier::UnreachableSwitch,
+                PriorityTier::UnreachableOther,
+            ]
+        );
+        // Same reachable count (1) in CriticalBootSwitch -> shallower min_depth (0 < 2) wins.
+        assert_eq!(prio[0].group.min_depth, Some(0));
+        assert_eq!(prio[1].group.min_depth, Some(2));
+        for w in prio.windows(2) {
+            assert!(w[0].score >= w[1].score);
+        }
+        assert_eq!(PriorityTier::CriticalBootSwitch.as_str(), "critical_boot_switch");
+        assert_eq!(PriorityTier::BootSwitch.as_str(), "boot_switch");
+        assert_eq!(PriorityTier::BootOther.as_str(), "boot_other");
+        assert_eq!(PriorityTier::UnreachableSwitch.as_str(), "unreachable_switch");
+        assert_eq!(PriorityTier::UnreachableOther.as_str(), "unreachable_other");
+    }
+
+    #[test]
+    fn render_json_with_trace_sanitizes_host_paths_and_escapes_strings() {
+        let s = JumpSurvey {
+            total_unresolved: 1,
+            reachable_unresolved: 1,
+            by_reason: BTreeMap::from([("table_base_unknown", 1)]),
+            by_reason_reachable: BTreeMap::from([("table_base_unknown", 1)]),
+            by_role: BTreeMap::from([("switch", (1, 1))]),
+            patterns: vec![(
+                Pattern {
+                    reason: "table_base_unknown",
+                    role: "switch",
+                    form: "jmp \"quoted\"\tform\x01".into(),
+                    scale: "8".into(),
+                    guard: "shift".into(),
+                    location: "anchor:.rdata(r)\n\\".into(),
+                },
+                Group {
+                    sites: vec![TEXT + 0x10],
+                    reachable: 1,
+                    functions: BTreeMap::from([(TEXT, 1)]),
+                    min_depth: Some(0),
+                    merge_predecessor_sites: 1,
+                },
+            )],
+            ..Default::default()
+        };
+        let outcome = crate::trace_seed::SeedOutcome {
+            pairs_in_range: 1,
+            rows: vec![crate::trace_seed::TargetRow {
+                target: TEXT + 0x20,
+                sites: vec![TEXT + 0x4],
+                verdict: crate::trace_seed::Verdict::Accepted,
+                container: Some(TEXT),
+                unresolved_jumps: vec![(TEXT + 0x10, UnresolvedJump::TableBaseUnknown)],
+            }],
+        };
+        let diag = outcome.diagnostics();
+        let correlated = crate::trace_seed::correlate_with_survey(&outcome, &s);
+        assert_eq!(correlated.len(), 1);
+
+        for host_path in [
+            r"C:\Users\dev\secret\game.exe",
+            r"\\fileserver\share\game.exe",
+            "/home/dev/builds/game.exe",
+            "file:///Users/dev/game.exe",
+        ] {
+            let json = render_json_with_trace(&s, 4, Some((host_path, &diag, &correlated, 10)));
+            JsonValidator::validate(&json).expect("embedded trace JSON must be valid RFC 8259");
+            assert!(
+                !crate::summary::contains_host_path(&json),
+                "host path leaked for {host_path}: {json}"
+            );
+            let txt = render_trace_correlation_text(host_path, &diag, &correlated, 10);
+            assert!(
+                !crate::summary::contains_host_path(&txt),
+                "host path leaked in text for {host_path}: {txt}"
+            );
+        }
     }
 }
