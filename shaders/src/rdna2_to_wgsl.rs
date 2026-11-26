@@ -8966,14 +8966,29 @@ fn align_up(value: u32, align: u32) -> u32 {
     value.saturating_add(align - 1) & !(align - 1)
 }
 
+/// Baseline WebGPU `maxBindGroups` limit (`@group(0)` through `@group(3)`).
+const MAX_WEBGPU_BIND_GROUPS: u32 = 4;
+
+/// Allocate a unique `@group(group) @binding(N)` slot starting from `preferred`, advancing
+/// deterministically (with safe wrap-around) if `preferred` is already claimed so duplicate
+/// bindings can never occur.
+fn alloc_group_binding(used: &mut BTreeSet<(u32, u32)>, group: u32, preferred: u32) -> u32 {
+    debug_assert!(
+        group < MAX_WEBGPU_BIND_GROUPS,
+        "WebGPU bind group index {group} exceeds baseline limit {MAX_WEBGPU_BIND_GROUPS}"
+    );
+    let clamped_group = group.min(MAX_WEBGPU_BIND_GROUPS - 1);
+    let mut candidate = preferred;
+    while !used.insert((clamped_group, candidate)) {
+        candidate = candidate.wrapping_add(1);
+    }
+    candidate
+}
+
 /// Allocate a unique `@group(0) @binding(N)` slot starting from `preferred`, advancing
 /// deterministically if `preferred` is already claimed so duplicate bindings cannot occur.
 fn alloc_group0_binding(used: &mut BTreeSet<(u32, u32)>, preferred: u32) -> u32 {
-    let mut candidate = preferred;
-    while !used.insert((0, candidate)) {
-        candidate = candidate.saturating_add(1);
-    }
-    candidate
+    alloc_group_binding(used, 0, preferred)
 }
 
 fn insert_type(module: &mut Module, name: Option<String>, inner: TypeInner) -> Handle<Type> {
@@ -9108,7 +9123,11 @@ impl IrEmitter {
         if !plan.cbv_slots.is_empty() {
             let mut cbv_struct_by_count: BTreeMap<u32, Handle<Type>> = BTreeMap::new();
             for (idx, slot) in plan.cbv_slots.iter().enumerate() {
-                let count = slot.vec4_count.max(1);
+                let count = slot.vec4_count.clamp(1, MAX_CBV_VEC4_COUNT);
+                let byte_size = count
+                    .checked_mul(16)
+                    .unwrap_or(MAX_CBV_VEC4_COUNT * 16);
+                let highest_vec4_offset = slot.highest_vec4_offset.min(count - 1);
                 let cbv_struct_ty = *cbv_struct_by_count.entry(count).or_insert_with(|| {
                     let arr_ty = insert_type(
                         &mut module,
@@ -9136,7 +9155,7 @@ impl IrEmitter {
                                 binding: None,
                                 offset: 0,
                             }],
-                            span: count.saturating_mul(16),
+                            span: byte_size,
                         },
                     )
                 });
@@ -9171,8 +9190,8 @@ impl IrEmitter {
                     name,
                     view_dimension: None,
                     storage_format: None,
-                    min_binding_size_bytes: Some(count.saturating_mul(16)),
-                    highest_vec4_offset: Some(slot.highest_vec4_offset),
+                    min_binding_size_bytes: Some(byte_size),
+                    highest_vec4_offset: Some(highest_vec4_offset),
                     source: plan.cbv_sources.get(&slot.key).copied(),
                 });
             }
@@ -9321,10 +9340,13 @@ impl IrEmitter {
             let mut srv_idx = 0u32;
             let mut uav_idx = 0u32;
             for slot in &plan.storage_buf_slots {
+                // WebGPU forbids writable storage buffers (`var<storage, read_write>`) in vertex
+                // shaders; clamp `writable` to `false` for `ShaderStage::Vertex`.
+                let writable = slot.writable && plan.stage != ShaderStage::Vertex;
                 let preferred_binding = binding_base.saturating_add(next_extra_binding);
                 next_extra_binding = next_extra_binding.saturating_add(1);
                 let binding_num = alloc_group0_binding(&mut used_group0_bindings, preferred_binding);
-                let (name, access, kind) = if slot.writable {
+                let (name, access, kind) = if writable {
                     let n = format!("uav_buf{uav_idx}");
                     uav_idx += 1;
                     (
@@ -9351,7 +9373,7 @@ impl IrEmitter {
                     },
                     Span::UNDEFINED,
                 );
-                storage_buf_globals.insert(slot.key, (g, slot.writable));
+                storage_buf_globals.insert(slot.key, (g, writable));
                 emitted_bindings.push(WgslBindingInfo {
                     group: 0,
                     binding: binding_num,
@@ -9366,7 +9388,8 @@ impl IrEmitter {
             }
         }
 
-        if !plan.storage_tex_slots.is_empty() {
+        // WebGPU forbids writable storage textures in vertex shaders.
+        if !plan.storage_tex_slots.is_empty() && plan.stage != ShaderStage::Vertex {
             let mut storage_tex_2d_ty: Option<Handle<Type>> = None;
             let mut storage_tex_2d_array_ty: Option<Handle<Type>> = None;
             let mut storage_tex_3d_ty: Option<Handle<Type>> = None;
@@ -9480,7 +9503,8 @@ impl IrEmitter {
         // `bridge::kMeshOutputGroup`). Intentionally NOT pushed into `emitted_bindings` because
         // `StateBridgeDevice::mesh_layout` appends group 3 itself and requires the stage's own
         // reflection bindings to occupy groups 0..2 only.
-        let mesh_out_global = if plan.mesh_output.is_some() {
+        let mesh_out_global = if plan.mesh_output.is_some() && plan.stage == ShaderStage::Compute {
+            let mesh_binding = alloc_group_binding(&mut used_group0_bindings, MESH_OUTPUT_GROUP, 0);
             let ms_arr_ty = insert_type(
                 &mut module,
                 None,
@@ -9498,7 +9522,7 @@ impl IrEmitter {
                     },
                     binding: Some(ResourceBinding {
                         group: MESH_OUTPUT_GROUP,
-                        binding: 0,
+                        binding: mesh_binding,
                     }),
                     ty: ms_arr_ty,
                     init: None,
@@ -9518,6 +9542,11 @@ impl IrEmitter {
                 b.name.as_str(),
             ))
         });
+        debug_assert!(
+            validate_emitted_bindings(&emitted_bindings, plan.stage).is_ok(),
+            "emitted bindings violated WebGPU invariants: {:?}",
+            validate_emitted_bindings(&emitted_bindings, plan.stage)
+        );
 
         let mut func = Function {
             name: Some(plan.entry_point.clone()),
@@ -9557,7 +9586,6 @@ impl IrEmitter {
                         let mut cur_offset = 4u32;
                         let mut max_align = 4u32;
                         let mut vec2_u32_ty: Option<Handle<Type>> = None;
-                        let mut vec3_i32_ty: Option<Handle<Type>> = None;
                         let mut vec4_i32_ty: Option<Handle<Type>> = None;
                         for (attr_idx, attr) in plan.vertex_attrs.iter().enumerate() {
                             let scalar_kind = match attr.component_type {
@@ -9585,20 +9613,7 @@ impl IrEmitter {
                                 (ScalarKind::Uint, _) => (vec4_u32_ty, 16u32, 16u32),
                                 (ScalarKind::Sint, 1) => (i32_ty, 4u32, 4u32),
                                 (ScalarKind::Sint, 2) => (vec2_i32_ty, 8u32, 8u32),
-                                (ScalarKind::Sint, 3) => (
-                                    *vec3_i32_ty.get_or_insert_with(|| {
-                                        insert_type(
-                                            &mut module,
-                                            None,
-                                            TypeInner::Vector {
-                                                size: VectorSize::Tri,
-                                                scalar: Scalar::I32,
-                                            },
-                                        )
-                                    }),
-                                    16u32,
-                                    12u32,
-                                ),
+                                (ScalarKind::Sint, 3) => (vec3_i32_ty, 16u32, 12u32),
                                 (ScalarKind::Sint, _) => (
                                     *vec4_i32_ty.get_or_insert_with(|| {
                                         insert_type(
@@ -9642,7 +9657,7 @@ impl IrEmitter {
                                 }),
                                 offset: cur_offset,
                             });
-                            cur_offset += size;
+                            cur_offset = cur_offset.saturating_add(size);
                         }
                         let span = align_up(cur_offset, max_align);
                         let vs_in_ty = insert_type(
@@ -15858,6 +15873,16 @@ impl IrEmitter {
             return true;
         }
         let inst_dim = TexDim::from_mimg_dim(dim);
+        let eff_mask = match dmask & 0xF {
+            0 => 0xF,
+            m => m,
+        };
+        let load_addr_f32 = |emitter: &mut Self, base_off: u8, delta: u8| -> Handle<Expression> {
+            match base_off.checked_add(delta) {
+                Some(off) => emitter.load_vgpr_offset_f32(vaddr, off),
+                None => emitter.lit_f32(0.0),
+            }
+        };
 
         if layout.is_store {
             if self.stage == ShaderStage::Vertex {
@@ -15876,14 +15901,14 @@ impl IrEmitter {
                 return false;
             };
             let image = self.raw_expr(Expression::GlobalVariable(uav_tex_global));
-            let ux = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
-            let uy = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
+            let ux = load_addr_f32(self, layout.uv_off, 0);
+            let uy = load_addr_f32(self, layout.uv_off, 1);
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let iz = if inst_dim == TexDim::D3 {
-                        let uz = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
+                        let uz = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(uz)
                     } else {
                         self.lit_i32(0)
@@ -15898,7 +15923,7 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
+                        let s = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(s)
                     } else {
                         self.lit_i32(0)
@@ -15920,27 +15945,38 @@ impl IrEmitter {
                 ),
             };
 
-            let eff_mask = if dmask == 0 { 0xF } else { dmask };
             let mut src_offset = 0u8;
             let mut comps = Vec::with_capacity(4);
+            let mut cached_d16_pair: Option<(u8, Handle<Expression>)> = None;
             for ch in 0..4u32 {
                 if (eff_mask & (1 << ch)) != 0 {
                     if d16 {
                         let reg_off = src_offset / 2;
                         let lane = u32::from(src_offset % 2);
-                        let raw_f = self.load_vgpr_offset_f32(vdata, reg_off);
-                        let raw_u = self.bitcast_f32_to_u32(raw_f);
-                        let pair = self.emit_expr(Expression::Math {
-                            fun: MathFunction::Unpack2x16float,
-                            arg: raw_u,
-                            arg1: None,
-                            arg2: None,
-                            arg3: None,
-                        });
-                        comps.push(self.emit_expr(Expression::AccessIndex {
-                            base: pair,
-                            index: lane,
-                        }));
+                        if checked_vgpr_reg(vdata, reg_off).is_some() {
+                            let pair = match cached_d16_pair {
+                                Some((cached_off, pair)) if cached_off == reg_off => pair,
+                                _ => {
+                                    let raw_f = self.load_vgpr_offset_f32(vdata, reg_off);
+                                    let raw_u = self.bitcast_f32_to_u32(raw_f);
+                                    let unpacked = self.emit_expr(Expression::Math {
+                                        fun: MathFunction::Unpack2x16float,
+                                        arg: raw_u,
+                                        arg1: None,
+                                        arg2: None,
+                                        arg3: None,
+                                    });
+                                    cached_d16_pair = Some((reg_off, unpacked));
+                                    unpacked
+                                }
+                            };
+                            comps.push(self.emit_expr(Expression::AccessIndex {
+                                base: pair,
+                                index: lane,
+                            }));
+                        } else {
+                            comps.push(self.lit_f32(0.0));
+                        }
                     } else {
                         comps.push(self.load_vgpr_offset_f32(vdata, src_offset));
                     }
@@ -15981,15 +16017,16 @@ impl IrEmitter {
         let lod_shift = inst_dim.extra_coord_vgprs();
 
         let sampled = if layout.is_load {
-            // image_load / image_load_mip
-            let ux = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
-            let uy = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
+            // image_load / image_load_mip: coordinate is always vec2<i32> (2D/2DArray) or
+            // vec3<i32> (3D), array_index is Some(i32) iff D2Array, and level is always Some(i32).
+            let ux = load_addr_f32(self, layout.uv_off, 0);
+            let uy = load_addr_f32(self, layout.uv_off, 1);
             let ix = self.bitcast_f32_to_i32(ux);
             let iy = self.bitcast_f32_to_i32(uy);
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let iz = if inst_dim == TexDim::D3 {
-                        let uz = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
+                        let uz = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(uz)
                     } else {
                         self.lit_i32(0)
@@ -16004,7 +16041,7 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
+                        let s = load_addr_f32(self, layout.uv_off, 2);
                         self.bitcast_f32_to_i32(s)
                     } else {
                         self.lit_i32(0)
@@ -16026,7 +16063,7 @@ impl IrEmitter {
                 ),
             };
             let level = if let Some(lod_off) = layout.lod_off {
-                let ml = self.load_vgpr_offset_f32(vaddr, lod_off.saturating_add(lod_shift));
+                let ml = load_addr_f32(self, lod_off, lod_shift);
                 Some(self.bitcast_f32_to_i32(ml))
             } else {
                 Some(self.lit_i32(0))
@@ -16053,12 +16090,28 @@ impl IrEmitter {
                 return false;
             };
             let sampler = self.raw_expr(Expression::GlobalVariable(samp_global));
-            let u = self.load_vgpr_offset_f32(vaddr, layout.uv_off);
-            let v = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(1));
+            // For 3D `image_sample_d`, GFX10.3 packs 6 gradient VGPRs (dudx,dvdx,dwdx,dudy,dvdy,dwdy)
+            // instead of 4 before (u,v,w), shifting `uv_off` by +2.
+            let uv_base = if layout.grad_off.is_some() && inst_dim == TexDim::D3 {
+                layout.uv_off.checked_add(2)
+            } else {
+                Some(layout.uv_off)
+            };
+            let u = match uv_base {
+                Some(base) => load_addr_f32(self, base, 0),
+                None => self.lit_f32(0.0),
+            };
+            let v = match uv_base {
+                Some(base) => load_addr_f32(self, base, 1),
+                None => self.lit_f32(0.0),
+            };
             let (coord, array_index) = match tex_dim {
                 TexDim::D3 => {
                     let w = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2))
+                        match uv_base {
+                            Some(base) => load_addr_f32(self, base, 2),
+                            None => self.lit_f32(0.0),
+                        }
                     } else {
                         self.lit_f32(0.0)
                     };
@@ -16072,7 +16125,10 @@ impl IrEmitter {
                 }
                 TexDim::D2Array => {
                     let arr = if inst_dim == TexDim::D2Array {
-                        let s = self.load_vgpr_offset_f32(vaddr, layout.uv_off.saturating_add(2));
+                        let s = match uv_base {
+                            Some(base) => load_addr_f32(self, base, 2),
+                            None => self.lit_f32(0.0),
+                        };
                         self.emit_expr(Expression::As {
                             expr: s,
                             kind: ScalarKind::Sint,
@@ -16099,28 +16155,28 @@ impl IrEmitter {
             };
 
             // WGSL only permits implicit-derivative `textureSample` / `textureSampleBias`
-            // in Fragment shaders; Vertex/Compute stages must use explicit `textureSampleLevel`
-            // or `textureSampleGrad`.
+            // in Fragment shaders within uniform control flow; Vertex, Compute, and non-uniform
+            // Fragment branches must use explicit `textureSampleLevel` or `textureSampleGrad`.
+            let allow_implicit_deriv = self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf();
             let level = if layout.is_zero_lod {
                 SampleLevel::Exact(self.lit_f32(0.0))
             } else if let Some(lod_off) = layout.lod_off {
-                let lod = self.load_vgpr_offset_f32(vaddr, lod_off.saturating_add(lod_shift));
+                let lod = load_addr_f32(self, lod_off, lod_shift);
                 SampleLevel::Exact(lod)
             } else if let Some(grad_off) = layout.grad_off {
+                let dy_base = if inst_dim == TexDim::D3 { 3u8 } else { 2u8 };
                 if tex_dim == TexDim::D3 {
-                    let dudx = self.load_vgpr_offset_f32(vaddr, grad_off);
-                    let dvdx = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(1));
+                    let dudx = load_addr_f32(self, grad_off, 0);
+                    let dvdx = load_addr_f32(self, grad_off, 1);
                     let dwdx = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(2))
+                        load_addr_f32(self, grad_off, 2)
                     } else {
                         self.lit_f32(0.0)
                     };
-                    let dy_base = if inst_dim == TexDim::D3 { 3 } else { 2 };
-                    let dy_off = grad_off.saturating_add(dy_base);
-                    let dudy = self.load_vgpr_offset_f32(vaddr, dy_off);
-                    let dvdy = self.load_vgpr_offset_f32(vaddr, dy_off.saturating_add(1));
+                    let dudy = load_addr_f32(self, grad_off, dy_base);
+                    let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
                     let dwdy = if inst_dim == TexDim::D3 {
-                        self.load_vgpr_offset_f32(vaddr, dy_off.saturating_add(2))
+                        load_addr_f32(self, grad_off, dy_base.saturating_add(2))
                     } else {
                         self.lit_f32(0.0)
                     };
@@ -16134,10 +16190,10 @@ impl IrEmitter {
                     });
                     SampleLevel::Gradient { x, y }
                 } else {
-                    let dudx = self.load_vgpr_offset_f32(vaddr, grad_off);
-                    let dvdx = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(1));
-                    let dudy = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(2));
-                    let dvdy = self.load_vgpr_offset_f32(vaddr, grad_off.saturating_add(3));
+                    let dudx = load_addr_f32(self, grad_off, 0);
+                    let dvdx = load_addr_f32(self, grad_off, 1);
+                    let dudy = load_addr_f32(self, grad_off, dy_base);
+                    let dvdy = load_addr_f32(self, grad_off, dy_base.saturating_add(1));
                     let x = self.emit_expr(Expression::Compose {
                         ty: self.types.vec2_f32_ty,
                         components: vec![dudx, dvdx],
@@ -16149,14 +16205,23 @@ impl IrEmitter {
                     SampleLevel::Gradient { x, y }
                 }
             } else if let Some(bias_off) = layout.bias_off {
-                // Implicit-derivative sampling requires uniform control flow in WGSL.
-                if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
-                    let bias = self.load_vgpr_offset_f32(vaddr, bias_off);
-                    SampleLevel::Bias(bias)
+                if allow_implicit_deriv {
+                    let raw_bias = load_addr_f32(self, bias_off, 0);
+                    // WGSL requires `textureSampleBias` bias within [-16.0, 15.99].
+                    let bias_lo = self.lit_f32(-16.0);
+                    let bias_hi = self.lit_f32(15.99);
+                    let clamped_bias = self.emit_expr(Expression::Math {
+                        fun: MathFunction::Clamp,
+                        arg: raw_bias,
+                        arg1: Some(bias_lo),
+                        arg2: Some(bias_hi),
+                        arg3: None,
+                    });
+                    SampleLevel::Bias(clamped_bias)
                 } else {
                     SampleLevel::Exact(self.lit_f32(0.0))
                 }
-            } else if self.stage == ShaderStage::Fragment && !self.in_nonuniform_cf() {
+            } else if allow_implicit_deriv {
                 SampleLevel::Auto
             } else {
                 SampleLevel::Exact(self.lit_f32(0.0))
@@ -16177,7 +16242,7 @@ impl IrEmitter {
             if let Some(cmp_off) = layout.compare_off {
                 // Depth/shadow comparison on baseline `texture_2d<f32>` + `sampler`:
                 // returns 1.0 when `z_ref <= tex.x`, else 0.0, replicated across channels.
-                let z_ref = self.load_vgpr_offset_f32(vaddr, cmp_off);
+                let z_ref = load_addr_f32(self, cmp_off, 0);
                 let depth_val = self.emit_expr(Expression::AccessIndex {
                     base: raw_sample,
                     index: 0,
@@ -16203,22 +16268,34 @@ impl IrEmitter {
             }
         };
 
-        let eff_mask = if dmask == 0 { 0xF } else { dmask };
         if d16 {
             // GFX10.3 packed 16-bit MIMG return: pack enabled dmask channels in LSB-to-MSB order
             // into consecutive 32-bit VGPRs (2 f16 channels per VGPR via WGSL `pack2x16float`).
-            let mut selected = Vec::with_capacity(4);
+            let mut selected_channels = [0u32; 4];
+            let mut selected_len = 0usize;
             for ch in 0..4u32 {
                 if (eff_mask & (1 << ch)) != 0 {
-                    selected.push(self.emit_expr(Expression::AccessIndex {
-                        base: sampled,
-                        index: ch,
-                    }));
+                    selected_channels[selected_len] = ch;
+                    selected_len += 1;
                 }
             }
-            for (pair_idx, chunk) in selected.chunks(2).enumerate() {
-                let lo = chunk[0];
-                let hi = chunk.get(1).copied().unwrap_or_else(|| self.lit_f32(0.0));
+            for (pair_idx, chunk) in selected_channels[..selected_len].chunks(2).enumerate() {
+                let dst_offset = pair_idx as u8;
+                if checked_vgpr_reg(vdata, dst_offset).is_none() {
+                    break;
+                }
+                let lo = self.emit_expr(Expression::AccessIndex {
+                    base: sampled,
+                    index: chunk[0],
+                });
+                let hi = if let Some(&hi_ch) = chunk.get(1) {
+                    self.emit_expr(Expression::AccessIndex {
+                        base: sampled,
+                        index: hi_ch,
+                    })
+                } else {
+                    self.lit_f32(0.0)
+                };
                 let pair = self.emit_expr(Expression::Compose {
                     ty: self.types.vec2_f32_ty,
                     components: vec![lo, hi],
@@ -16230,17 +16307,19 @@ impl IrEmitter {
                     arg2: None,
                     arg3: None,
                 });
-                self.store_vgpr_offset_u32(vdata, pair_idx as u8, packed);
+                self.store_vgpr_offset_u32(vdata, dst_offset, packed);
             }
         } else {
             let mut dst_offset = 0u8;
             for ch in 0..4u32 {
                 if (eff_mask & (1 << ch)) != 0 {
-                    let comp = self.emit_expr(Expression::AccessIndex {
-                        base: sampled,
-                        index: ch,
-                    });
-                    self.store_vgpr_offset_f32(vdata, dst_offset, comp);
+                    if checked_vgpr_reg(vdata, dst_offset).is_some() {
+                        let comp = self.emit_expr(Expression::AccessIndex {
+                            base: sampled,
+                            index: ch,
+                        });
+                        self.store_vgpr_offset_f32(vdata, dst_offset, comp);
+                    }
                     dst_offset = dst_offset.saturating_add(1);
                 }
             }
@@ -17644,10 +17723,209 @@ fn normalize_wgsl_newlines(raw: &str) -> String {
     out
 }
 
+/// Skip WGSL whitespace, `//` line comments, and nested `/* ... */` block comments starting at `*i`.
+fn skip_wgsl_ws_and_comments(bytes: &[u8], i: &mut usize) -> Result<(), Rdna2TranslateError> {
+    let len = bytes.len();
+    while *i < len {
+        let b = bytes[*i];
+        if b.is_ascii_whitespace() {
+            *i += 1;
+            continue;
+        }
+        if b == b'/' && *i + 1 < len && bytes[*i + 1] == b'/' {
+            *i += 2;
+            while *i < len && bytes[*i] != b'\n' {
+                *i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && *i + 1 < len && bytes[*i + 1] == b'*' {
+            let mut depth = 1usize;
+            *i += 2;
+            while *i < len && depth > 0 {
+                if bytes[*i] == b'/' && *i + 1 < len && bytes[*i + 1] == b'*' {
+                    depth += 1;
+                    *i += 2;
+                } else if bytes[*i] == b'*' && *i + 1 < len && bytes[*i + 1] == b'/' {
+                    depth -= 1;
+                    *i += 2;
+                } else {
+                    *i += 1;
+                }
+            }
+            if depth != 0 {
+                return Err(Rdna2TranslateError::WgslParse(
+                    "unterminated block comment in emitted WGSL".to_string(),
+                ));
+            }
+            continue;
+        }
+        break;
+    }
+    Ok(())
+}
+
+/// Parse an unsigned integer attribute argument inside `( ... )`, e.g. `(0)`, `(0u)`, `(0x10)`.
+fn parse_wgsl_attr_u32_arg(
+    wgsl: &str,
+    i: &mut usize,
+    attr_name: &str,
+) -> Result<u32, Rdna2TranslateError> {
+    let bytes = wgsl.as_bytes();
+    let len = bytes.len();
+    skip_wgsl_ws_and_comments(bytes, i)?;
+    if *i >= len || bytes[*i] != b'(' {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "malformed @{attr_name} attribute: expected '(' in emitted WGSL"
+        )));
+    }
+    *i += 1;
+    skip_wgsl_ws_and_comments(bytes, i)?;
+    let num_start = *i;
+    let value = if *i + 2 <= len && bytes[*i] == b'0' && matches!(bytes[*i + 1], b'x' | b'X') {
+        *i += 2;
+        let hex_start = *i;
+        while *i < len && bytes[*i].is_ascii_hexdigit() {
+            *i += 1;
+        }
+        if *i == hex_start {
+            return Err(Rdna2TranslateError::WgslParse(format!(
+                "malformed @{attr_name} hex literal in emitted WGSL"
+            )));
+        }
+        u32::from_str_radix(&wgsl[hex_start..*i], 16).map_err(|_| {
+            Rdna2TranslateError::WgslParse(format!(
+                "out-of-range @{attr_name} integer literal in emitted WGSL"
+            ))
+        })?
+    } else {
+        while *i < len && bytes[*i].is_ascii_digit() {
+            *i += 1;
+        }
+        if *i == num_start {
+            return Err(Rdna2TranslateError::WgslParse(format!(
+                "malformed @{attr_name} attribute: expected non-negative integer in emitted WGSL"
+            )));
+        }
+        wgsl[num_start..*i].parse::<u32>().map_err(|_| {
+            Rdna2TranslateError::WgslParse(format!(
+                "out-of-range @{attr_name} integer literal in emitted WGSL"
+            ))
+        })?
+    };
+    // Optional WGSL integer type suffix (`u` or `i`).
+    if *i < len && matches!(bytes[*i], b'u' | b'i') {
+        *i += 1;
+    }
+    skip_wgsl_ws_and_comments(bytes, i)?;
+    // Optional trailing comma allowed by WGSL attribute grammar.
+    if *i < len && bytes[*i] == b',' {
+        *i += 1;
+        skip_wgsl_ws_and_comments(bytes, i)?;
+    }
+    if *i >= len || bytes[*i] != b')' {
+        return Err(Rdna2TranslateError::WgslParse(format!(
+            "malformed @{attr_name} attribute: expected ')' in emitted WGSL"
+        )));
+    }
+    *i += 1;
+    Ok(value)
+}
+
+/// Commit a pending module-scope `@group(g) @binding(b)` pair into `seen_bindings`,
+/// rejecting incomplete pairs or duplicate `(group, binding)` declarations.
+fn commit_module_binding_pair(
+    pending_group: &mut Option<u32>,
+    pending_binding: &mut Option<u32>,
+    seen_bindings: &mut BTreeSet<(u32, u32)>,
+) -> Result<(), Rdna2TranslateError> {
+    match (pending_group.take(), pending_binding.take()) {
+        (Some(g), Some(b)) => {
+            if !seen_bindings.insert((g, b)) {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "duplicate @group({g}) @binding({b}) declaration in emitted WGSL"
+                )));
+            }
+            Ok(())
+        }
+        (Some(g), None) => Err(Rdna2TranslateError::WgslParse(format!(
+            "@group({g}) declaration missing @binding attribute in emitted WGSL"
+        ))),
+        (None, Some(b)) => Err(Rdna2TranslateError::WgslParse(format!(
+            "@binding({b}) declaration missing @group attribute in emitted WGSL"
+        ))),
+        (None, None) => Ok(()),
+    }
+}
+
+/// Verify reflection metadata in `emitted_bindings` satisfies WebGPU invariants:
+/// - Every `group < MAX_WEBGPU_BIND_GROUPS` (4)
+/// - Every `(group, binding)` pair is unique
+/// - Every `"uniform"` binding has a non-zero 16-byte-aligned `min_binding_size_bytes` and
+///   consistent `highest_vec4_offset < min_binding_size_bytes / 16`
+/// - Vertex shaders never declare writable `"storage"` or `"storage-texture"` bindings
+fn validate_emitted_bindings(
+    bindings: &[WgslBindingInfo],
+    stage: ShaderStage,
+) -> Result<(), Rdna2TranslateError> {
+    let mut seen: BTreeSet<(u32, u32)> = BTreeSet::new();
+    for b in bindings {
+        if b.group >= MAX_WEBGPU_BIND_GROUPS {
+            return Err(Rdna2TranslateError::WgslParse(format!(
+                "binding `{}` uses @group({}) >= WebGPU baseline maxBindGroups ({MAX_WEBGPU_BIND_GROUPS})",
+                b.name, b.group
+            )));
+        }
+        if !seen.insert((b.group, b.binding)) {
+            return Err(Rdna2TranslateError::WgslParse(format!(
+                "duplicate reflection binding @group({}) @binding({}) (`{}`)",
+                b.group, b.binding, b.name
+            )));
+        }
+        if b.kind == "uniform" {
+            let Some(min_bytes) = b.min_binding_size_bytes else {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "uniform binding `{}` missing min_binding_size_bytes",
+                    b.name
+                )));
+            };
+            if min_bytes == 0 || !min_bytes.is_multiple_of(16) {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "uniform binding `{}` has invalid non-16-byte-aligned size {min_bytes}",
+                    b.name
+                )));
+            }
+            let vec4_count = min_bytes / 16;
+            let Some(highest) = b.highest_vec4_offset else {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "uniform binding `{}` missing highest_vec4_offset",
+                    b.name
+                )));
+            };
+            if highest >= vec4_count {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "uniform binding `{}` highest_vec4_offset ({highest}) >= vec4_count ({vec4_count})",
+                    b.name
+                )));
+            }
+        }
+        if stage == ShaderStage::Vertex && matches!(b.kind, "storage" | "storage-texture") {
+            return Err(Rdna2TranslateError::WgslParse(format!(
+                "vertex stage illegally declares writable {} binding `{}`",
+                b.kind, b.name
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Post-emit WGSL structural checks executed unconditionally after Naga emission:
 /// - LF-only newlines (no `\r`)
 /// - Balanced `{`/`}`, `(`/`)`, `[`/`]` delimiters and closed nested `/* ... */` comments
 /// - No illegal module-scope `let` declarations
+/// - No duplicate `@group(g) @binding(b)` pairs and no `@group(>= 4)`
+/// - No disallowed module-scope `enable` directives (e.g. stray `enable f16;`)
+/// - No non-finite float tokens (`nan`/`inf`/`infinity`) outside comments
 /// - Present, non-empty entry point `fn <entry_point>(...) { ... }`
 fn validate_emitted_wgsl_structure(
     wgsl: &str,
@@ -17671,6 +17949,10 @@ fn validate_emitted_wgsl_structure(
     let mut paren_depth: usize = 0;
     let mut bracket_depth: usize = 0;
     let mut block_comment_depth: usize = 0;
+
+    let mut pending_group: Option<u32> = None;
+    let mut pending_binding: Option<u32> = None;
+    let mut seen_bindings: BTreeSet<(u32, u32)> = BTreeSet::new();
 
     // Entry-point state machine:
     //   0 = idle at module scope
@@ -17716,15 +17998,60 @@ fn validate_emitted_wgsl_structure(
             continue;
         }
 
+        let at_module_scope = brace_depth == 0 && paren_depth == 0 && bracket_depth == 0;
+
+        // Parse module-scope `@group(N)` and `@binding(M)` attributes to enforce uniqueness
+        // and WebGPU baseline `maxBindGroups = 4`.
+        if at_module_scope && b == b'@' {
+            i += 1;
+            skip_wgsl_ws_and_comments(bytes, &mut i)?;
+            if i < len && (bytes[i].is_ascii_alphabetic() || bytes[i] == b'_') {
+                let attr_start = i;
+                i += 1;
+                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                let attr_name = &wgsl[attr_start..i];
+                if attr_name == "group" {
+                    let group_val = parse_wgsl_attr_u32_arg(wgsl, &mut i, "group")?;
+                    if group_val >= MAX_WEBGPU_BIND_GROUPS {
+                        return Err(Rdna2TranslateError::WgslParse(format!(
+                            "@group({group_val}) exceeds WebGPU baseline maxBindGroups ({MAX_WEBGPU_BIND_GROUPS})"
+                        )));
+                    }
+                    if pending_group.is_some() {
+                        return Err(Rdna2TranslateError::WgslParse(
+                            "duplicate @group attribute on single declaration in emitted WGSL"
+                                .to_string(),
+                        ));
+                    }
+                    pending_group = Some(group_val);
+                } else if attr_name == "binding" {
+                    let binding_val = parse_wgsl_attr_u32_arg(wgsl, &mut i, "binding")?;
+                    if pending_binding.is_some() {
+                        return Err(Rdna2TranslateError::WgslParse(
+                            "duplicate @binding attribute on single declaration in emitted WGSL"
+                                .to_string(),
+                        ));
+                    }
+                    pending_binding = Some(binding_val);
+                }
+            }
+            continue;
+        }
+
         match b {
             b'{' => {
+                if at_module_scope {
+                    commit_module_binding_pair(
+                        &mut pending_group,
+                        &mut pending_binding,
+                        &mut seen_bindings,
+                    )?;
+                }
                 if ep_state == 3 {
                     ep_body_has_code = true;
-                } else if ep_state == 2
-                    && brace_depth == 0
-                    && paren_depth == 0
-                    && bracket_depth == 0
-                {
+                } else if ep_state == 2 && at_module_scope {
                     ep_state = 3;
                 }
                 brace_depth += 1;
@@ -17780,11 +18107,64 @@ fn validate_emitted_wgsl_structure(
                 i += 1;
                 continue;
             }
+            b';' if at_module_scope => {
+                commit_module_binding_pair(
+                    &mut pending_group,
+                    &mut pending_binding,
+                    &mut seen_bindings,
+                )?;
+                if ep_state == 1 || ep_state == 2 {
+                    ep_state = 0;
+                }
+                i += 1;
+                continue;
+            }
             _ => {}
         }
 
         if ep_state == 3 {
             ep_body_has_code = true;
+        }
+
+        // Consume WGSL numeric literals (decimal, hex, float exponent, optional u/i/f/h suffix)
+        // so numeric suffixes are never mis-tokenized as standalone identifiers.
+        if b.is_ascii_digit() {
+            if at_module_scope && ep_state == 1 {
+                ep_state = 0;
+            }
+            let is_hex = b == b'0' && i + 1 < len && matches!(bytes[i + 1], b'x' | b'X');
+            if is_hex {
+                i += 2;
+                while i < len && (bytes[i].is_ascii_hexdigit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                if i < len && matches!(bytes[i], b'p' | b'P') {
+                    i += 1;
+                    if i < len && matches!(bytes[i], b'+' | b'-') {
+                        i += 1;
+                    }
+                    while i < len && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            } else {
+                while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                    i += 1;
+                }
+                if i < len && matches!(bytes[i], b'e' | b'E') {
+                    i += 1;
+                    if i < len && matches!(bytes[i], b'+' | b'-') {
+                        i += 1;
+                    }
+                    while i < len && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                }
+            }
+            if i < len && matches!(bytes[i], b'u' | b'i' | b'f' | b'h') {
+                i += 1;
+            }
+            continue;
         }
 
         if b.is_ascii_alphabetic() || b == b'_' {
@@ -17793,11 +18173,25 @@ fn validate_emitted_wgsl_structure(
             while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                 i += 1;
             }
-            if brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 {
-                let ident = &wgsl[start..i];
+            let ident = &wgsl[start..i];
+            if ident.eq_ignore_ascii_case("nan")
+                || ident.eq_ignore_ascii_case("inf")
+                || ident.eq_ignore_ascii_case("infinity")
+            {
+                return Err(Rdna2TranslateError::WgslParse(format!(
+                    "non-finite float token `{ident}` outside comments in emitted WGSL"
+                )));
+            }
+            if at_module_scope {
                 if ident == "let" {
                     return Err(Rdna2TranslateError::WgslParse(
                         "illegal module-scope `let` declaration in emitted WGSL".to_string(),
+                    ));
+                }
+                if ident == "enable" {
+                    return Err(Rdna2TranslateError::WgslParse(
+                        "disallowed module-scope `enable` directive in baseline WebGPU WGSL"
+                            .to_string(),
                     ));
                 }
                 match ep_state {
@@ -17816,15 +18210,13 @@ fn validate_emitted_wgsl_structure(
             continue;
         }
 
-        if brace_depth == 0
-            && paren_depth == 0
-            && bracket_depth == 0
-            && (ep_state == 1 || (ep_state == 2 && b == b';'))
-        {
+        if at_module_scope && ep_state == 1 {
             ep_state = 0;
         }
         i += 1;
     }
+
+    commit_module_binding_pair(&mut pending_group, &mut pending_binding, &mut seen_bindings)?;
 
     if block_comment_depth != 0 {
         return Err(Rdna2TranslateError::WgslParse(
@@ -25608,5 +26000,178 @@ mod tests {
             "JSON:\n{json}"
         );
         assert_naga_wgsl_valid(&out.wgsl);
+    }
+
+    // -- S68 (#1209 / #482): Structural WGSL validator & binding hygiene unit tests --
+
+    #[test]
+    fn s68_validate_emitted_wgsl_structure_module_scope_let_and_hygiene() {
+        // Valid: identifiers starting with `let`, comments containing `let` / `nan` / `enable f16`,
+        // function-scope `let`, and distinct `@group`/`@binding` pairs across groups 0..3.
+        let valid = "\
+// let ignored = 1u; enable f16; nan inf
+/* nested /* let x = 0; */ comment */
+const letter: u32 = 1u;
+const let_x: u32 = 2u;
+@group(0) @binding(0) var<uniform> cb0: vec4<u32>;
+@binding(1) @group(0) var tex0: texture_2d<f32>;
+@group(3) @binding(0) var<storage, read_write> ms_out: array<u32>;
+@compute @workgroup_size(1, 1, 1)
+fn cs_main() {
+    let ok_local = letter + let_x;
+    var info: u32 = ok_local;
+    ms_out[0] = info;
+    return;
+}
+";
+        assert!(
+            validate_emitted_wgsl_structure(valid, "cs_main").is_ok(),
+            "valid WGSL must pass structural check"
+        );
+
+        // Module-scope `let` in various forms (plain, after comment, after attribute, after `;`).
+        for bad_let in [
+            "let x = 1u;\nfn cs_main() { return; }\n",
+            "/* comment */let x = 1u;\nfn cs_main() { return; }\n",
+            "// comment\nlet x = 1u;\nfn cs_main() { return; }\n",
+            "@diagnostic(off, derivative_uniformity) let x = 1u;\nfn cs_main() { return; }\n",
+            "const a = 1u; let b = 2u;\nfn cs_main() { return; }\n",
+        ] {
+            assert!(
+                validate_emitted_wgsl_structure(bad_let, "cs_main").is_err(),
+                "must reject module-scope `let`: {bad_let}"
+            );
+        }
+
+        // Duplicate `@group(g) @binding(b)` declarations (both same order and swapped order).
+        let dup_same = "\
+@group(0) @binding(2) var<uniform> a: vec4<u32>;
+@group(0) @binding(2) var<uniform> b: vec4<u32>;
+fn cs_main() { return; }
+";
+        assert!(validate_emitted_wgsl_structure(dup_same, "cs_main").is_err());
+
+        let dup_swapped = "\
+@group(1) @binding(0u) var<uniform> a: vec4<u32>;
+@binding(0x0) @group(1) var<uniform> b: vec4<u32>;
+fn cs_main() { return; }
+";
+        assert!(validate_emitted_wgsl_structure(dup_swapped, "cs_main").is_err());
+
+        // `@group(4)` exceeds WebGPU baseline maxBindGroups = 4.
+        let group_oob = "\
+@group(4) @binding(0) var<uniform> a: vec4<u32>;
+fn cs_main() { return; }
+";
+        assert!(validate_emitted_wgsl_structure(group_oob, "cs_main").is_err());
+
+        // Orphaned `@group` or `@binding`.
+        assert!(
+            validate_emitted_wgsl_structure(
+                "@group(0) var<uniform> a: vec4<u32>;\nfn cs_main() { return; }\n",
+                "cs_main"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_emitted_wgsl_structure(
+                "@binding(0) var<uniform> a: vec4<u32>;\nfn cs_main() { return; }\n",
+                "cs_main"
+            )
+            .is_err()
+        );
+
+        // Stray `enable f16;` at module scope.
+        assert!(
+            validate_emitted_wgsl_structure(
+                "enable f16;\nfn cs_main() { return; }\n",
+                "cs_main"
+            )
+            .is_err()
+        );
+
+        // Non-finite float tokens outside comments (`nan`, `inf`, `Infinity`).
+        for bad_float in [
+            "fn cs_main() { let x = nan; return; }\n",
+            "fn cs_main() { let x = -inf; return; }\n",
+            "fn cs_main() { let x = Infinity; return; }\n",
+        ] {
+            assert!(
+                validate_emitted_wgsl_structure(bad_float, "cs_main").is_err(),
+                "must reject non-finite token: {bad_float}"
+            );
+        }
+
+        // CR `\r`, empty body, missing entry point, unbalanced delimiters & block comments.
+        assert!(validate_emitted_wgsl_structure("", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() {\r\nreturn;\r\n}\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn vs_main() { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { return; \n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main( { return; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("fn cs_main() { var a = b[0; }\n", "cs_main").is_err());
+        assert!(validate_emitted_wgsl_structure("/* open fn cs_main() { return; }\n", "cs_main").is_err());
+    }
+
+    #[test]
+    fn s68_validate_emitted_bindings_and_alloc_group_binding_invariants() {
+        // Wrap-around safety when preferred == u32::MAX.
+        let mut used = BTreeSet::new();
+        assert_eq!(alloc_group0_binding(&mut used, u32::MAX), u32::MAX);
+        assert_eq!(alloc_group0_binding(&mut used, u32::MAX), 0);
+        assert_eq!(alloc_group0_binding(&mut used, 0), 1);
+
+        let good_cbv = WgslBindingInfo {
+            group: 0,
+            binding: 0,
+            kind: "uniform",
+            name: "cb0".to_string(),
+            view_dimension: None,
+            storage_format: None,
+            min_binding_size_bytes: Some(32),
+            highest_vec4_offset: Some(1),
+            source: None,
+        };
+        assert!(validate_emitted_bindings(std::slice::from_ref(&good_cbv), ShaderStage::Vertex).is_ok());
+
+        // Duplicate (group, binding) rejected.
+        assert!(
+            validate_emitted_bindings(&[good_cbv.clone(), good_cbv.clone()], ShaderStage::Fragment)
+                .is_err()
+        );
+
+        // Group >= 4 rejected.
+        let mut bad_group = good_cbv.clone();
+        bad_group.group = 4;
+        assert!(validate_emitted_bindings(&[bad_group], ShaderStage::Compute).is_err());
+
+        // Non-16-byte-aligned or zero uniform size rejected.
+        let mut bad_align = good_cbv.clone();
+        bad_align.min_binding_size_bytes = Some(12);
+        assert!(validate_emitted_bindings(&[bad_align], ShaderStage::Compute).is_err());
+
+        let mut bad_zero = good_cbv.clone();
+        bad_zero.min_binding_size_bytes = Some(0);
+        assert!(validate_emitted_bindings(&[bad_zero], ShaderStage::Compute).is_err());
+
+        // highest_vec4_offset >= vec4_count rejected.
+        let mut bad_offset = good_cbv;
+        bad_offset.highest_vec4_offset = Some(2); // vec4_count = 32 / 16 = 2
+        assert!(validate_emitted_bindings(&[bad_offset], ShaderStage::Compute).is_err());
+
+        // Vertex stage writable storage / storage-texture rejected.
+        let uav_buf = WgslBindingInfo {
+            group: 0,
+            binding: 3,
+            kind: "storage",
+            name: "uav_buf0".to_string(),
+            view_dimension: None,
+            storage_format: None,
+            min_binding_size_bytes: None,
+            highest_vec4_offset: None,
+            source: None,
+        };
+        assert!(validate_emitted_bindings(std::slice::from_ref(&uav_buf), ShaderStage::Compute).is_ok());
+        assert!(validate_emitted_bindings(&[uav_buf], ShaderStage::Vertex).is_err());
     }
 }
