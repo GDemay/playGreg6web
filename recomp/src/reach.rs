@@ -91,14 +91,19 @@ const GPR_COUNT: usize = 16;
 
 /// Register file state: one [`Known`] per 64-bit GPR (index = `Register::number()` of RAX..R15).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct State([Known; GPR_COUNT]);
+struct State([Known; GPR_COUNT], [u8; GPR_COUNT]);
+
+/// [`State`] alias slot: no register copy known.
+const NO_ALIAS: u8 = 0xff;
+/// [`State`] alias slot: no path seen yet (only during the analysis).
+const ALIAS_UNVISITED: u8 = 0xfe;
 
 impl State {
     fn unvisited() -> Self {
-        Self([Known::Unvisited; GPR_COUNT])
+        Self([Known::Unvisited; GPR_COUNT], [ALIAS_UNVISITED; GPR_COUNT])
     }
     fn unknown() -> Self {
-        Self([Known::Unknown; GPR_COUNT])
+        Self([Known::Unknown; GPR_COUNT], [NO_ALIAS; GPR_COUNT])
     }
     fn get(&self, reg: Register) -> Known {
         slot(reg).map_or(Known::Unknown, |i| self.0[i])
@@ -112,6 +117,13 @@ impl State {
         let mut out = *self;
         for (o, x) in out.0.iter_mut().zip(other.0.iter()) {
             *o = o.join(*x);
+        }
+        for (o, x) in out.1.iter_mut().zip(other.1.iter()) {
+            *o = match (*o, *x) {
+                (ALIAS_UNVISITED, y) | (y, ALIAS_UNVISITED) => y,
+                (a, b) if a == b => a,
+                _ => NO_ALIAS,
+            };
         }
         out
     }
@@ -244,6 +256,69 @@ fn reaching_values_bounded(
     max_depth: usize,
     max_worklist_steps: usize,
 ) -> Option<Vec<(Register, Known)>> {
+    let input = reaching_state_bounded(
+        blocks,
+        preds,
+        is_entry,
+        target,
+        max_blocks,
+        max_depth,
+        max_worklist_steps,
+    )?;
+    Some(
+        regs.iter()
+            .map(|&r| {
+                let k = input.get(r);
+                (
+                    r,
+                    if k == Known::Unvisited {
+                        Known::Unknown
+                    } else {
+                        k
+                    },
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Registers of `regs` that are a zero-extended 32-bit copy (`mov dst32, src32`) of another
+/// register on every path into `target`, as `(dst, src)` full registers.
+pub(crate) fn reaching_copies(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    regs: &[Register],
+) -> Option<Vec<(Register, Register)>> {
+    let input = reaching_state_bounded(
+        blocks,
+        preds,
+        is_entry,
+        target,
+        MAX_REACH_BLOCKS,
+        MAX_REACH_DEPTH,
+        MAX_WORKLIST_STEPS,
+    )?;
+    Some(
+        regs.iter()
+            .filter_map(|&r| {
+                let a = input.1[slot(r)?];
+                (a < GPR_COUNT as u8).then(|| (r.full_register(), Register::RAX + u32::from(a)))
+            })
+            .collect(),
+    )
+}
+
+fn reaching_state_bounded(
+    blocks: &BTreeMap<u64, BasicBlock>,
+    preds: &dyn Fn(u64) -> Vec<u64>,
+    is_entry: &dyn Fn(u64) -> bool,
+    target: u64,
+    max_blocks: usize,
+    max_depth: usize,
+    max_worklist_steps: usize,
+) -> Option<State> {
     let BackwardSubgraph { blocks: sub, roots } =
         collect_backward_subgraph_bounded(blocks, preds, is_entry, target, max_blocks, max_depth)?;
 
@@ -318,22 +393,7 @@ fn reaching_values_bounded(
         }
     }
 
-    let input = inputs.get(&target).copied().unwrap_or_else(State::unvisited);
-    Some(
-        regs.iter()
-            .map(|&r| {
-                let k = input.get(r);
-                (
-                    r,
-                    if k == Known::Unvisited {
-                        Known::Unknown
-                    } else {
-                        k
-                    },
-                )
-            })
-            .collect(),
-    )
+    Some(inputs.get(&target).copied().unwrap_or_else(State::unvisited))
 }
 
 fn writes(info: &mut InstructionInfoFactory, instr: &Instruction, reg: Register) -> bool {
@@ -361,6 +421,15 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
                 *known = Known::Unknown;
             }
         }
+        for i in 0..GPR_COUNT {
+            if is_win64_volatile(Register::RAX + i as u32) {
+                state.1[i] = NO_ALIAS;
+            }
+            let src = state.1[i];
+            if src != NO_ALIAS && is_win64_volatile(Register::RAX + u32::from(src)) {
+                state.1[i] = NO_ALIAS;
+            }
+        }
         return;
     }
     let written: Vec<Register> = {
@@ -385,6 +454,36 @@ fn transfer(info: &mut InstructionInfoFactory, instr: &Instruction, state: &mut 
     };
     if written.is_empty() {
         return;
+    }
+    // A `mov r32, r32` between distinct registers leaves the destination a zero-extended copy of
+    // the source; any other write ends the copy relations of the written register.
+    let copy = (instr.mnemonic() == Mnemonic::Mov
+        && instr.op_count() == 2
+        && instr.op0_kind() == OpKind::Register
+        && instr.op1_kind() == OpKind::Register
+        && instr.op0_register().is_gpr32()
+        && instr.op1_register().is_gpr32()
+        && instr.op0_register().full_register() != instr.op1_register().full_register())
+    .then(|| {
+        (
+            instr.op0_register().full_register(),
+            instr.op1_register().full_register(),
+        )
+    });
+    for reg in &written {
+        if let Some(i) = slot(*reg) {
+            state.1[i] = NO_ALIAS;
+            for other in state.1.iter_mut() {
+                if usize::from(*other) == i {
+                    *other = NO_ALIAS;
+                }
+            }
+        }
+    }
+    if let Some((dst, src)) = copy
+        && let (Some(d), Some(sr)) = (slot(dst), slot(src))
+    {
+        state.1[d] = sr as u8;
     }
     // The one register an exactly modelled instruction writes (operand 0).
     let modelled = model(instr, state);
@@ -769,6 +868,21 @@ pub(crate) fn synthesize(
         out.push((j, true));
     }
     out
+}
+
+/// Synthetic `mov dst32, src32` stating that `dst` is a zero-extended copy of `src`.
+pub(crate) fn synthesize_copy(dst: Register, src: Register) -> Option<(Instruction, bool)> {
+    let d = dst.full_register().number() as u8;
+    let s = src.full_register().number() as u8;
+    let rex = 0x40 | ((s >> 3) << 2) | (d >> 3);
+    let bytes = [rex, 0x89, 0xC0 | ((s & 7) << 3) | (d & 7)];
+    decode(&bytes, 0)
+        .filter(|i| {
+            i.op0_register().is_gpr32()
+                && i.op0_register().full_register() == dst.full_register()
+                && i.op1_register().full_register() == src.full_register()
+        })
+        .map(|i| (i, false))
 }
 
 fn decode(bytes: &[u8], ip: u64) -> Option<Instruction> {
