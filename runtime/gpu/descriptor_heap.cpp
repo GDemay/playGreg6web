@@ -42,6 +42,10 @@ bool valid_heap_type(DescriptorHeapType type) noexcept {
     return static_cast<uint32_t>(type) < kDescriptorHeapTypeCount;
 }
 
+uint32_t increment_shift(uint32_t inc) noexcept {
+    return inc == 16u ? 4u : 5u;
+}
+
 uint16_t clamp_u16(uint32_t v) noexcept {
     return static_cast<uint16_t>(std::min<uint32_t>(v, 0xffffu));
 }
@@ -288,29 +292,31 @@ Status DescriptorHeapRegistry::create_heap(const DescriptorHeapDesc& desc, Descr
         return Status::InvalidArgument;
     }
 
-    const uint64_t placed_bytes = static_cast<uint64_t>(desc.num_descriptors) * descriptor_handle_increment_size(desc.type);
+    const uint32_t inc = descriptor_handle_increment_size(desc.type);
+    const uint64_t placed_bytes = static_cast<uint64_t>(desc.num_descriptors) * inc;
     if (desc.cpu_address != 0) {
         // CPU handles are plain addresses: below the tag bits, aligned, not overlapping another
         // placed heap.
-        if ((desc.cpu_address >> 62) != 0 || ((desc.cpu_address + placed_bytes) >> 62) != 0 ||
-            desc.cpu_address > UINT64_MAX - placed_bytes || desc.cpu_address % 8 != 0) {
+        if ((desc.cpu_address >> 62) != 0 || desc.cpu_address > UINT64_MAX - placed_bytes ||
+            ((desc.cpu_address + placed_bytes) >> 62) != 0 || (desc.cpu_address & 7u) != 0) {
             return Status::InvalidArgument;
-        }
-        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
-        auto next = placed_.lower_bound(desc.cpu_address);
-        if (next != placed_.end() && next->first < desc.cpu_address + placed_bytes) {
-            return Status::InvalidArgument;
-        }
-        if (next != placed_.begin()) {
-            const DescriptorHeap* prev = std::prev(next)->second;
-            if (std::prev(next)->first + static_cast<uint64_t>(prev->capacity()) * prev->increment() >
-                desc.cpu_address) {
-                return Status::InvalidArgument;
-            }
         }
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
+    if (desc.cpu_address != 0) {
+        const uint64_t end = desc.cpu_address + placed_bytes;
+        std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
+        auto next = std::lower_bound(
+            placed_.begin(), placed_.end(), desc.cpu_address,
+            [](const PlacedHeapRange& r, uint64_t addr) { return r.start < addr; });
+        if (next != placed_.end() && next->start < end) {
+            return Status::InvalidArgument;
+        }
+        if (next != placed_.begin() && std::prev(next)->end > desc.cpu_address) {
+            return Status::InvalidArgument;
+        }
+    }
     uint32_t slot = 0;
     if (!free_slots_.empty()) {
         slot = free_slots_.back();
@@ -325,8 +331,13 @@ Status DescriptorHeapRegistry::create_heap(const DescriptorHeapDesc& desc, Descr
     owned_.emplace(heap, slot);
     slots_[slot].store(heap, std::memory_order_release);
     if (desc.cpu_address != 0) {
+        const uint64_t end = desc.cpu_address + placed_bytes;
+        const uint32_t shift = increment_shift(inc);
         std::unique_lock<std::shared_mutex> placed_lock(placed_mutex_);
-        placed_[desc.cpu_address] = heap;
+        auto pos = std::lower_bound(
+            placed_.begin(), placed_.end(), desc.cpu_address,
+            [](const PlacedHeapRange& r, uint64_t addr) { return r.start < addr; });
+        placed_.insert(pos, PlacedHeapRange{desc.cpu_address, end, heap, inc - 1u, shift});
     }
     live_heaps_.fetch_add(1, std::memory_order_relaxed);
     g_live_heaps.fetch_add(1, std::memory_order_relaxed);
@@ -347,8 +358,14 @@ void DescriptorHeapRegistry::destroy_heap(DescriptorHeap* heap) {
     const uint32_t slot = it->second;
     owned_.erase(it);
     if (heap->desc().cpu_address != 0) {
+        const uint64_t addr = heap->desc().cpu_address;
         std::unique_lock<std::shared_mutex> placed_lock(placed_mutex_);
-        placed_.erase(heap->desc().cpu_address);
+        auto pit = std::lower_bound(
+            placed_.begin(), placed_.end(), addr,
+            [](const PlacedHeapRange& r, uint64_t a) { return r.start < a; });
+        if (pit != placed_.end() && pit->start == addr) {
+            placed_.erase(pit);
+        }
     }
     slots_[slot].store(nullptr, std::memory_order_release);
     slot_generation_[slot] = static_cast<uint16_t>((slot_generation_[slot] + 1) & kSlotGenerationMask);
@@ -368,23 +385,39 @@ Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescr
     if (tag == kCpuTag && (hi & kTagMask) == 0 && ptr != 0) {
         // A CPU handle of a heap placed at an address.
         std::shared_lock<std::shared_mutex> placed_lock(placed_mutex_);
-        auto it = placed_.upper_bound(ptr);
-        if (it == placed_.begin()) {
+        const size_t n = placed_.size();
+        const PlacedHeapRange* found = nullptr;
+        if (n <= 8) {
+            for (size_t i = 0; i < n; ++i) {
+                if (ptr < placed_[i].start) {
+                    break;
+                }
+                if (ptr < placed_[i].end) {
+                    found = &placed_[i];
+                    break;
+                }
+            }
+        } else {
+            auto it = std::upper_bound(
+                placed_.begin(), placed_.end(), ptr,
+                [](uint64_t addr, const PlacedHeapRange& r) { return addr < r.start; });
+            if (it != placed_.begin()) {
+                const PlacedHeapRange& cand = *std::prev(it);
+                if (ptr < cand.end) {
+                    found = &cand;
+                }
+            }
+        }
+        if (found == nullptr) {
             return Status::InvalidHandle;
         }
-        --it;
-        const DescriptorHeap* heap = it->second;
-        const uint64_t offset = ptr - it->first;
-        const uint32_t inc = heap->increment();
-        if (offset % inc != 0) {
+        const uint64_t offset = ptr - found->start;
+        if ((offset & found->inc_mask) != 0) {
             return Status::MisalignedHandle;
         }
-        if (offset / inc >= heap->capacity()) {
-            return Status::InvalidHandle;
-        }
         if (out != nullptr) {
-            out->heap = const_cast<DescriptorHeap*>(heap);
-            out->index = static_cast<uint32_t>(offset / inc);
+            out->heap = found->heap;
+            out->index = static_cast<uint32_t>(offset >> found->inc_shift);
         }
         return Status::Ok;
     }
@@ -401,10 +434,10 @@ Status DescriptorHeapRegistry::resolve(uint64_t ptr, uint32_t tag, ResolvedDescr
     }
     const uint32_t offset = static_cast<uint32_t>(ptr);
     const uint32_t inc = heap->increment();
-    if (offset % inc != 0) {
+    if ((offset & (inc - 1u)) != 0) {
         return Status::MisalignedHandle;
     }
-    const uint32_t index = offset / inc;
+    const uint32_t index = offset >> increment_shift(inc);
     if (index >= heap->capacity()) {
         return Status::HandleOutOfRange;
     }
@@ -1585,10 +1618,10 @@ Status RootArgumentState::set_descriptor_table(
     }
     const uint32_t offset = static_cast<uint32_t>(base.ptr);
     const uint32_t inc = heap->increment();
-    if (offset % inc != 0) {
+    if ((offset & (inc - 1u)) != 0) {
         return Status::MisalignedHandle;
     }
-    const uint32_t index = offset / inc;
+    const uint32_t index = offset >> increment_shift(inc);
     if (index >= heap->capacity() || static_cast<uint64_t>(index) + info.table_extent > heap->capacity()) {
         return Status::HandleOutOfRange;
     }
@@ -1825,11 +1858,21 @@ void table_entry(const DescriptorSlotSource* source,
 }
 
 uint64_t hash_key(const std::vector<uint64_t>& key) noexcept {
-    Fnv64 h;
+    uint64_t h = 0x9e3779b97f4a7c15ull ^ (static_cast<uint64_t>(key.size()) * 0xbf58476d1ce4e5b9ull);
     for (uint64_t v : key) {
-        h.u64(v);
+        v += 0x9e3779b97f4a7c15ull;
+        v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9ull;
+        v = (v ^ (v >> 27)) * 0x94d049bb133111ebull;
+        v ^= v >> 31;
+        h ^= v;
+        h = std::rotl(h, 27) * 5u + 0x52dce729u;
     }
-    return h.h;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdull;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ull;
+    h ^= h >> 33;
+    return h;
 }
 
 }  // namespace
@@ -1883,6 +1926,7 @@ BindGroupPlan BindGroupPlan::build(
             if (index_ok && b.heap_shift < 32 &&
                 (b.heap == HeapAccess::Sampler) == (b.register_class == DescriptorRangeType::Sampler)) {
                 e.source = PlanSource::HeapIndexed;
+                plan.has_heap_indexed_ = true;
                 e.root_parameter_index = b.heap_index_source == HeapIndexSource::Constant ? kNoIndex
                                                                                            : b.heap_index_parameter;
                 e.heap_dword = b.heap_index_source == HeapIndexSource::RootConstantIndex ? b.heap_index_dword : 0;
@@ -2107,12 +2151,16 @@ bool heap_slot(const RootArgumentState& state, BindPoint bind_point, const PlanE
     if (!heap_byte_offset(state, bind_point, p, source, &byte_offset, cb_miss) || h == nullptr) {
         return false;
     }
-    const uint64_t increment = h->increment();
-    if (increment == 0 || byte_offset % increment != 0 || byte_offset / increment >= h->capacity()) {
+    const uint32_t inc = h->increment();
+    if (inc == 0 || (byte_offset & (inc - 1u)) != 0) {
+        return false;
+    }
+    const uint64_t idx = byte_offset >> increment_shift(inc);
+    if (idx >= h->capacity()) {
         return false;
     }
     *heap = const_cast<DescriptorHeap*>(h);
-    *index = static_cast<uint32_t>(byte_offset / increment);
+    *index = static_cast<uint32_t>(idx);
     return true;
 }
 
@@ -2212,6 +2260,77 @@ void BindGroupCache::build_entries(
     }
 }
 
+namespace {
+
+constexpr uint8_t kBindSlotEmpty = 0;
+constexpr uint8_t kBindSlotOccupied = 1;
+constexpr uint8_t kBindSlotTombstone = 2;
+constexpr size_t kBindGroupInitialCapacity = 32;
+
+}  // namespace
+
+BindGroupCache::Slot* BindGroupCache::find_slot(uint64_t hash) noexcept {
+    if (table_.empty()) {
+        return nullptr;
+    }
+    const size_t mask = table_.size() - 1;
+    size_t idx = static_cast<size_t>(hash) & mask;
+    for (;;) {
+        Slot& s = table_[idx];
+        if (s.state == kBindSlotEmpty) {
+            return nullptr;
+        }
+        if (s.state == kBindSlotOccupied && s.hash == hash) {
+            return &s;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void BindGroupCache::rehash(size_t new_cap) {
+    std::vector<Slot> next(new_cap);
+    const size_t mask = new_cap - 1;
+    for (Slot& s : table_) {
+        if (s.state != kBindSlotOccupied) {
+            continue;
+        }
+        size_t idx = static_cast<size_t>(s.hash) & mask;
+        while (next[idx].state == kBindSlotOccupied) {
+            idx = (idx + 1) & mask;
+        }
+        next[idx].hash = s.hash;
+        next[idx].entry = std::move(s.entry);
+        next[idx].state = kBindSlotOccupied;
+    }
+    table_ = std::move(next);
+    tombstones_ = 0;
+}
+
+void BindGroupCache::insert_entry(uint64_t hash, std::unique_ptr<CachedBindGroup> entry) {
+    if (table_.empty()) {
+        table_.resize(kBindGroupInitialCapacity);
+    } else if ((size_ + tombstones_ + 1) * 10 >= table_.size() * 7) {
+        const size_t new_cap = tombstones_ > size_ ? table_.size() : table_.size() * 2;
+        rehash(new_cap);
+    }
+    const size_t mask = table_.size() - 1;
+    size_t idx = static_cast<size_t>(hash) & mask;
+    for (;;) {
+        Slot& s = table_[idx];
+        if (s.state != kBindSlotOccupied) {
+            if (s.state == kBindSlotTombstone) {
+                --tombstones_;
+            }
+            s.hash = hash;
+            s.entry = std::move(entry);
+            s.state = kBindSlotOccupied;
+            ++size_;
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
 BindGroupLookup BindGroupCache::get_or_build(
     const RootArgumentState& state,
     BindPoint bind_point,
@@ -2232,13 +2351,16 @@ BindGroupLookup BindGroupCache::get_or_build(
     if (plan.entries().empty()) {
         return result;
     }
-    const uint64_t mask = plan.parameter_mask();
     scratch_key_.clear();
     scratch_key_.push_back(layout_key);
     scratch_key_.push_back(plan.hash());
-    for (uint32_t i = 0; i < signature->parameter_count(); ++i) {
-        if ((mask & (1ull << i)) == 0) {
-            continue;
+    uint64_t rem = plan.parameter_mask();
+    const uint32_t param_count = signature->parameter_count();
+    while (rem != 0) {
+        const uint32_t i = static_cast<uint32_t>(std::countr_zero(rem));
+        rem &= rem - 1;
+        if (i >= param_count) {
+            break;
         }
         const RootArgument& arg = state.argument(bind_point, i);
         if (!arg.is_set) {
@@ -2259,20 +2381,33 @@ BindGroupLookup BindGroupCache::get_or_build(
     }
     // Heap-indexed entries: the bound heap and the byte offset the root constant (or the constant-
     // buffer dword, read now: G62 CB-indexed heaps) selects.
-    for (const PlanEntry& p : plan.entries()) {
-        if (p.source != PlanSource::HeapIndexed) {
-            continue;
+    if (plan.has_heap_indexed()) {
+        for (const PlanEntry& p : plan.entries()) {
+            if (p.source != PlanSource::HeapIndexed) {
+                continue;
+            }
+            const DescriptorHeap* heap = state.bound_heap(
+                p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
+            uint64_t byte_offset = 0;
+            scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
+            scratch_key_.push_back(heap_byte_offset(state, bind_point, p, slot_source_, &byte_offset) ? byte_offset : ~0ull);
         }
-        const DescriptorHeap* heap = state.bound_heap(
-            p.register_class == DescriptorRangeType::Sampler ? DescriptorHeapType::Sampler : DescriptorHeapType::CbvSrvUav);
-        uint64_t byte_offset = 0;
-        scratch_key_.push_back(heap != nullptr ? heap->serial() : 0u);
-        scratch_key_.push_back(heap_byte_offset(state, bind_point, p, slot_source_, &byte_offset) ? byte_offset : ~0ull);
     }
     const uint64_t h = hash_key(scratch_key_);
-    auto it = entries_.find(h);
-    if (it != entries_.end() && it->second->key == scratch_key_) {
-        CachedBindGroup& cached = *it->second;
+    CachedBindGroup* hit_entry = nullptr;
+    Slot* existing_slot = nullptr;
+    if (last_entry_ != nullptr && last_hash_ == h && last_entry_->key == scratch_key_) {
+        hit_entry = last_entry_;
+    } else {
+        existing_slot = find_slot(h);
+        if (existing_slot != nullptr && existing_slot->entry->key == scratch_key_) {
+            hit_entry = existing_slot->entry.get();
+            last_hash_ = h;
+            last_entry_ = hit_entry;
+        }
+    }
+    if (hit_entry != nullptr) {
+        CachedBindGroup& cached = *hit_entry;
         cached.last_used_epoch = epoch_;
         bool changed = false;
         const std::vector<BindGroupPlan::TableWindow>& windows = plan.table_windows();
@@ -2309,25 +2444,46 @@ BindGroupLookup BindGroupCache::get_or_build(
         return result;
     }
     ++misses_;
-    if (it != entries_.end()) {
-        // Hash collision with a different key: replace.
-        result.retired_gpu_id = it->second->gpu_id;
-        entries_.erase(it);
-        track_size();
+    if (existing_slot != nullptr) {
+        // Hash collision with a different key: replace in-place.
+        result.retired_gpu_id = existing_slot->entry->gpu_id;
+        if (last_entry_ == existing_slot->entry.get()) {
+            last_entry_ = nullptr;
+            last_hash_ = 0;
+        }
+        auto entry = std::make_unique<CachedBindGroup>();
+        entry->layout_key = layout_key;
+        entry->key_hash = h;
+        entry->last_used_epoch = epoch_;
+        build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
+        CachedBindGroup* ptr = entry.get();
+        result.bind_group = ptr;
+        result.rebuilt = true;
+        const uint64_t budget = g_bind_group_slot_budget.load(std::memory_order_relaxed);
+        if (budget != 0 && (size_ - 1) >= budget) {
+            g_bind_group_budget_overflows.fetch_add(1, std::memory_order_relaxed);  // grows, never drops the draw
+        }
+        existing_slot->entry = std::move(entry);
+        last_hash_ = h;
+        last_entry_ = ptr;
+        return result;
     }
     auto entry = std::make_unique<CachedBindGroup>();
     entry->layout_key = layout_key;
     entry->key_hash = h;
     entry->last_used_epoch = epoch_;
     build_entries(state, bind_point, *signature, plan, resolver, resolver_user, entry.get());
-    result.bind_group = entry.get();
+    CachedBindGroup* ptr = entry.get();
+    result.bind_group = ptr;
     result.rebuilt = true;
     const uint64_t budget = g_bind_group_slot_budget.load(std::memory_order_relaxed);
-    if (budget != 0 && entries_.size() >= budget) {
+    if (budget != 0 && size_ >= budget) {
         g_bind_group_budget_overflows.fetch_add(1, std::memory_order_relaxed);  // grows, never drops the draw
     }
-    entries_.emplace(h, std::move(entry));
-    peak_epoch_entries_ = std::max(peak_epoch_entries_, entries_.size());
+    insert_entry(h, std::move(entry));
+    last_hash_ = h;
+    last_entry_ = ptr;
+    peak_epoch_entries_ = std::max(peak_epoch_entries_, size_);
     raise_peak(peak_epoch_entries_);
     track_size();
     return result;
@@ -2340,7 +2496,6 @@ bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind
         return false;
     }
     bool any = false;
-    std::vector<uint8_t> window;
     for (const BindGroupPlan::TableWindow& w : plan.table_windows()) {
         const RootArgument& arg = state.argument(bind_point, w.parameter_index);
         if (arg.heap == nullptr || !slot_source_->reads(*arg.heap)) {
@@ -2351,21 +2506,23 @@ bool BindGroupCache::memory_words(const RootArgumentState& state, BindPoint bind
             continue;
         }
         const uint32_t count = static_cast<uint32_t>(std::min<uint64_t>(w.count, arg.heap->capacity() - first));
-        slot_source_->snapshot(*arg.heap, static_cast<uint32_t>(first), count, &window);
-        out->insert(out->end(), window.begin(), window.end());
+        slot_source_->snapshot(*arg.heap, static_cast<uint32_t>(first), count, &scratch_window_);
+        out->insert(out->end(), scratch_window_.begin(), scratch_window_.end());
         any = true;
     }
     // Heap-indexed slots the title writes itself, after the windows.
-    for (const PlanEntry& p : plan.entries()) {
-        DescriptorHeap* heap = nullptr;
-        uint32_t index = 0;
-        if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, slot_source_, &heap, &index) ||
-            !slot_source_->reads(*heap)) {
-            continue;
+    if (plan.has_heap_indexed()) {
+        for (const PlanEntry& p : plan.entries()) {
+            DescriptorHeap* heap = nullptr;
+            uint32_t index = 0;
+            if (p.source != PlanSource::HeapIndexed || !heap_slot(state, bind_point, p, slot_source_, &heap, &index) ||
+                !slot_source_->reads(*heap)) {
+                continue;
+            }
+            slot_source_->snapshot(*heap, index, 1, &scratch_window_);
+            out->insert(out->end(), scratch_window_.begin(), scratch_window_.end());
+            any = true;
         }
-        slot_source_->snapshot(*heap, index, 1, &window);
-        out->insert(out->end(), window.begin(), window.end());
-        any = true;
     }
     return any;
 }
@@ -2449,24 +2606,34 @@ bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
 }
 
 void BindGroupCache::clear(std::vector<uint32_t>* retired) {
-    if (retired != nullptr) {
-        for (const auto& kv : entries_) {
-            if (kv.second->gpu_id != 0) {
-                retired->push_back(kv.second->gpu_id);
+    for (Slot& s : table_) {
+        if (s.state == kBindSlotOccupied) {
+            if (retired != nullptr && s.entry->gpu_id != 0) {
+                retired->push_back(s.entry->gpu_id);
             }
+            s.entry.reset();
         }
+        s.state = kBindSlotEmpty;
+        s.hash = 0;
     }
-    entries_.clear();
+    size_ = 0;
+    tombstones_ = 0;
+    last_hash_ = 0;
+    last_entry_ = nullptr;
     track_size();
 }
 
 BindGroupCache::~BindGroupCache() {
-    entries_.clear();
+    table_.clear();
+    size_ = 0;
+    tombstones_ = 0;
+    last_hash_ = 0;
+    last_entry_ = nullptr;
     track_size();
 }
 
 void BindGroupCache::track_size() noexcept {
-    const size_t now = entries_.size();
+    const size_t now = size_;
     if (now >= tracked_size_) {
         g_live_cached_bind_groups.fetch_add(now - tracked_size_, std::memory_order_relaxed);
     } else {
@@ -2476,13 +2643,22 @@ void BindGroupCache::track_size() noexcept {
 }
 
 uint32_t BindGroupCache::erase(const CachedBindGroup* group) {
-    for (auto it = entries_.begin(); it != entries_.end(); ++it) {
-        if (it->second.get() == group) {
-            const uint32_t id = it->second->gpu_id;
-            entries_.erase(it);
-            track_size();
-            return id;
+    if (group == nullptr || table_.empty()) {
+        return 0;
+    }
+    Slot* s = find_slot(group->key_hash);
+    if (s != nullptr && s->entry.get() == group) {
+        const uint32_t id = s->entry->gpu_id;
+        if (last_entry_ == group) {
+            last_entry_ = nullptr;
+            last_hash_ = 0;
         }
+        s->entry.reset();
+        s->state = kBindSlotTombstone;
+        --size_;
+        ++tombstones_;
+        track_size();
+        return id;
     }
     return 0;
 }
@@ -2498,7 +2674,7 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
                                                  std::span<const uint32_t> view_ids,
                                                  std::vector<uint32_t>* retired,
                                                  std::vector<uint64_t>* evicted_key_hashes) {
-    if (entries_.empty() || (resource_ids.empty() && view_ids.empty())) {
+    if (size_ == 0 || (resource_ids.empty() && view_ids.empty())) {
         return 0;
     }
     auto contains = [](std::span<const uint32_t> ids, uint32_t id) noexcept -> bool {
@@ -2537,19 +2713,33 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
         return false;
     };
     size_t dropped = 0;
-    for (auto it = entries_.begin(); it != entries_.end();) {
-        if (references_any(*it->second)) {
-            if (retired != nullptr && it->second->gpu_id != 0) {
-                retired->push_back(it->second->gpu_id);
+    for (Slot& s : table_) {
+        if (s.state == kBindSlotOccupied && references_any(*s.entry)) {
+            if (retired != nullptr && s.entry->gpu_id != 0) {
+                retired->push_back(s.entry->gpu_id);
             }
             if (evicted_key_hashes != nullptr) {
-                evicted_key_hashes->push_back(it->first);
+                evicted_key_hashes->push_back(s.hash);
             }
-            it = entries_.erase(it);
+            if (last_entry_ == s.entry.get()) {
+                last_entry_ = nullptr;
+                last_hash_ = 0;
+            }
+            s.entry.reset();
+            s.state = kBindSlotTombstone;
+            --size_;
+            ++tombstones_;
             ++dropped;
-        } else {
-            ++it;
         }
+    }
+    if (size_ == 0 && tombstones_ > 0) {
+        for (Slot& s : table_) {
+            s.state = kBindSlotEmpty;
+            s.hash = 0;
+        }
+        tombstones_ = 0;
+    } else if (tombstones_ > size_ && !table_.empty() && (size_ + tombstones_) * 10 >= table_.size() * 7) {
+        rehash(table_.size());
     }
     track_size();
     return dropped;
@@ -2557,25 +2747,38 @@ size_t BindGroupCache::evict_resources_and_views(std::span<const uint32_t> resou
 
 size_t BindGroupCache::end_epoch(size_t max_entries, std::vector<uint32_t>* retired) {
     size_t dropped = 0;
-    if (entries_.size() > max_entries) {
-        for (auto it = entries_.begin(); it != entries_.end();) {
-            if (it->second->last_used_epoch < epoch_) {
-                if (retired != nullptr && it->second->gpu_id != 0) {
-                    retired->push_back(it->second->gpu_id);
+    if (size_ > max_entries) {
+        for (Slot& s : table_) {
+            if (s.state == kBindSlotOccupied && s.entry->last_used_epoch < epoch_) {
+                if (retired != nullptr && s.entry->gpu_id != 0) {
+                    retired->push_back(s.entry->gpu_id);
                 }
-                it = entries_.erase(it);
+                if (last_entry_ == s.entry.get()) {
+                    last_entry_ = nullptr;
+                    last_hash_ = 0;
+                }
+                s.entry.reset();
+                s.state = kBindSlotTombstone;
+                --size_;
+                ++tombstones_;
                 ++dropped;
-            } else {
-                ++it;
             }
         }
-        if (entries_.size() > max_entries) {
-            dropped += entries_.size();
+        if (size_ > max_entries) {
+            dropped += size_;
             clear(retired);
+        } else if (size_ == 0 && tombstones_ > 0) {
+            for (Slot& s : table_) {
+                s.state = kBindSlotEmpty;
+                s.hash = 0;
+            }
+            tombstones_ = 0;
+        } else if (tombstones_ > size_ && !table_.empty()) {
+            rehash(table_.size());
         }
     }
     track_size();
-    peak_epoch_entries_ = entries_.size();  // the next epoch's peak starts from what survived
+    peak_epoch_entries_ = size_;  // the next epoch's peak starts from what survived
     ++epoch_;
     return dropped;
 }
@@ -2774,9 +2977,75 @@ void ResourceStateRegistry::execute(const CommandListStateTracker& list, std::ve
 
 // --- CommandListStateTracker -----------------------------------------------
 
+namespace {
+
+constexpr size_t kTrackerIndexInitialCapacity = 64;
+
+inline uint32_t hash_resource_id(uint32_t x) noexcept {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+}  // namespace
+
+uint32_t CommandListStateTracker::index_find(uint32_t key) const noexcept {
+    if (index_table_.empty()) {
+        return kNoIndex;
+    }
+    const size_t mask = index_table_.size() - 1;
+    size_t idx = hash_resource_id(key) & mask;
+    for (;;) {
+        const IndexSlot& s = index_table_[idx];
+        if (s.value == kNoIndex) {
+            return kNoIndex;
+        }
+        if (s.key == key) {
+            return s.value;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void CommandListStateTracker::index_insert(uint32_t key, uint32_t value) {
+    if (index_table_.empty()) {
+        index_table_.resize(kTrackerIndexInitialCapacity);
+    } else if ((index_size_ + 1) * 10 >= index_table_.size() * 7) {
+        const size_t new_cap = index_table_.size() * 2;
+        std::vector<IndexSlot> next(new_cap);
+        const size_t mask = new_cap - 1;
+        for (const IndexSlot& s : index_table_) {
+            if (s.value == kNoIndex) {
+                continue;
+            }
+            size_t idx = hash_resource_id(s.key) & mask;
+            while (next[idx].value != kNoIndex) {
+                idx = (idx + 1) & mask;
+            }
+            next[idx] = s;
+        }
+        index_table_ = std::move(next);
+    }
+    const size_t mask = index_table_.size() - 1;
+    size_t idx = hash_resource_id(key) & mask;
+    while (index_table_[idx].value != kNoIndex) {
+        idx = (idx + 1) & mask;
+    }
+    index_table_[idx] = IndexSlot{key, value};
+    ++index_size_;
+}
+
 void CommandListStateTracker::reset() {
     resources_.clear();
-    index_.clear();
+    if (index_size_ != 0) {
+        for (IndexSlot& s : index_table_) {
+            s.value = kNoIndex;
+        }
+        index_size_ = 0;
+    }
     diagnostics_.clear();
     dropped_diagnostics_ = 0;
     uav_barriers_ = 0;
@@ -2798,9 +3067,9 @@ void CommandListStateTracker::diag(
 }
 
 CommandListStateTracker::LocalResource* CommandListStateTracker::touch(uint32_t resource_id, uint32_t barrier_index) {
-    auto it = index_.find(resource_id);
-    if (it != index_.end()) {
-        return &resources_[it->second];
+    const uint32_t existing = index_find(resource_id);
+    if (existing != kNoIndex) {
+        return &resources_[existing];
     }
     uint32_t count = 0;
     bool promotion = false;
@@ -2812,14 +3081,14 @@ CommandListStateTracker::LocalResource* CommandListStateTracker::touch(uint32_t 
     r.id = resource_id;
     r.subresource_count = count;
     r.implicit_promotion = promotion;
-    index_.emplace(resource_id, static_cast<uint32_t>(resources_.size()));
+    index_insert(resource_id, static_cast<uint32_t>(resources_.size()));
     resources_.push_back(std::move(r));
     return &resources_.back();
 }
 
 const CommandListStateTracker::LocalResource* CommandListStateTracker::find(uint32_t resource_id) const {
-    auto it = index_.find(resource_id);
-    return it == index_.end() ? nullptr : &resources_[it->second];
+    const uint32_t existing = index_find(resource_id);
+    return existing == kNoIndex ? nullptr : &resources_[existing];
 }
 
 const CommandListStateTracker::SubState* CommandListStateTracker::sub_state(

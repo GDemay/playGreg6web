@@ -558,6 +558,14 @@ private:
     Status resolve_range(CpuDescriptorHandle start, uint32_t count, DescriptorHeapType type, ResolvedDescriptor* out) const noexcept;
     Status write_view_at(CpuDescriptorHandle dst, const ViewDescriptor& record) noexcept;
 
+    struct PlacedHeapRange {
+        uint64_t start = 0;
+        uint64_t end = 0;
+        DescriptorHeap* heap = nullptr;
+        uint32_t inc_mask = 0;
+        uint32_t inc_shift = 0;
+    };
+
     std::unique_ptr<std::atomic<DescriptorHeap*>[]> slots_;
     std::vector<uint16_t> slot_generation_;  // guarded by mutex_
     std::vector<uint32_t> free_slots_;       // guarded by mutex_
@@ -565,8 +573,8 @@ private:
     uint32_t next_unused_slot_ = 0;          // guarded by mutex_
     std::atomic<uint32_t> live_heaps_{0};
     mutable std::mutex mutex_;
-    // Heaps placed at a CPU address (DescriptorHeapDesc::cpu_address), by address.
-    std::map<uint64_t, DescriptorHeap*> placed_;  // guarded by placed_mutex_
+    // Heaps placed at a CPU address (DescriptorHeapDesc::cpu_address), sorted by start address.
+    std::vector<PlacedHeapRange> placed_;  // guarded by placed_mutex_
     mutable std::shared_mutex placed_mutex_;
     uint32_t cbv_alignment_ = 256;
 };
@@ -943,6 +951,7 @@ public:
     const std::vector<TableWindow>& table_windows() const noexcept { return windows_; }
     // Bit i = root parameter i feeds this bind group.
     uint64_t parameter_mask() const noexcept { return parameter_mask_; }
+    bool has_heap_indexed() const noexcept { return has_heap_indexed_; }
     uint32_t unresolved_count() const noexcept { return unresolved_; }
     uint64_t signature_hash() const noexcept { return signature_hash_; }
     // Content hash of the join (signature hash + entries).
@@ -955,6 +964,7 @@ private:
     uint32_t unresolved_ = 0;
     uint64_t signature_hash_ = 0;
     uint64_t hash_ = 0;
+    bool has_heap_indexed_ = false;
 };
 
 // The first three values match GpuBindResourceType (G5 CreateBindGroup entries).
@@ -1131,7 +1141,7 @@ public:
     // Tables in heaps the source reads come from descriptor memory (nullptr: registry only).
     void set_slot_source(const DescriptorSlotSource* source) noexcept { slot_source_ = source; }
     const DescriptorSlotSource* slot_source() const noexcept { return slot_source_; }
-    size_t size() const noexcept { return entries_.size(); }
+    size_t size() const noexcept { return size_; }
     uint64_t hits() const noexcept { return hits_; }
     uint64_t misses() const noexcept { return misses_; }
     // Heap-indexed bindings whose index fell outside the bound heap (or no heap was bound, or the
@@ -1142,7 +1152,17 @@ public:
     uint64_t cb_index_misses() const noexcept { return cb_index_misses_; }
 
 private:
-    // Keeps the process-wide live-entry gauge equal to entries_.size() after a mutation.
+    struct Slot {
+        uint64_t hash = 0;
+        std::unique_ptr<CachedBindGroup> entry;
+        uint8_t state = 0;  // 0 = Empty, 1 = Occupied, 2 = Tombstone
+    };
+
+    Slot* find_slot(uint64_t hash) noexcept;
+    void rehash(size_t new_cap);
+    void insert_entry(uint64_t hash, std::unique_ptr<CachedBindGroup> entry);
+
+    // Keeps the process-wide live-entry gauge equal to size_ after a mutation.
     void track_size() noexcept;
     size_t tracked_size_ = 0;
 
@@ -1159,12 +1179,17 @@ private:
     bool memory_words(const RootArgumentState& state, BindPoint bind_point, const BindGroupPlan& plan,
                       std::vector<uint8_t>* out) const;
 
-    std::unordered_map<uint64_t, std::unique_ptr<CachedBindGroup>> entries_;
+    std::vector<Slot> table_;
+    size_t size_ = 0;
+    size_t tombstones_ = 0;
+    uint64_t last_hash_ = 0;
+    CachedBindGroup* last_entry_ = nullptr;
     std::vector<uint64_t> scratch_key_;
     std::vector<uint8_t> scratch_words_;
+    mutable std::vector<uint8_t> scratch_window_;
     const DescriptorSlotSource* slot_source_ = nullptr;
     uint64_t epoch_ = 1;
-    size_t peak_epoch_entries_ = 0;  // largest entries_.size() in the open epoch
+    size_t peak_epoch_entries_ = 0;  // largest size_ in the open epoch
     uint64_t hits_ = 0;
     uint64_t misses_ = 0;
     uint64_t heap_index_misses_ = 0;
@@ -1345,9 +1370,18 @@ private:
     void maybe_collapse(LocalResource& r);
     void diag(StateDiagnosticCode code, uint32_t id, uint32_t sub, uint32_t expected, uint32_t actual, uint32_t index);
 
+    struct IndexSlot {
+        uint32_t key = 0;
+        uint32_t value = kNoIndex;
+    };
+
+    uint32_t index_find(uint32_t key) const noexcept;
+    void index_insert(uint32_t key, uint32_t value);
+
     const ResourceStateRegistry* registry_ = nullptr;
     std::vector<LocalResource> resources_;
-    std::unordered_map<uint32_t, uint32_t> index_;
+    std::vector<IndexSlot> index_table_;
+    size_t index_size_ = 0;
     std::vector<StateDiagnostic> diagnostics_;
     uint64_t dropped_diagnostics_ = 0;
     uint64_t uav_barriers_ = 0;

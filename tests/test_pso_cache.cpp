@@ -1924,6 +1924,231 @@ void test_tracker_pipeline_failures() {
     CHECK(t.events().back().pipeline_key->depth_stencil.format == TF::Undefined);
 }
 
+void test_g77_pso_hotpath_stress() {
+    // (a) Concurrent multi-threaded GraphicsPso::resolve across shared variants and new variant creation,
+    // verifying pointer stability of returned GraphicsPipelineKey* and exact single creation per variant.
+    {
+        PipelineCache cache;
+        D3D12GraphicsPsoDesc desc = basic_desc();
+        D3D12InputElementDesc elem{};
+        elem.SemanticName = "POSITION";
+        elem.Format = D::R32G32B32_FLOAT;
+        elem.InputSlot = 0;
+        elem.AlignedByteOffset = 0;
+        desc.pInputElementDescs = &elem;
+        desc.NumInputElements = 1;
+        GraphicsPso pso(desc);
+
+        constexpr int kThreads = 8;
+        constexpr int kVariantCount = 24;
+        std::vector<PipelineVariantState> variants(kVariantCount);
+        for (int i = 0; i < kVariantCount; ++i) {
+            PipelineVariantState v{};
+            v.flags = VariantFlags::BoundTargets;
+            v.num_render_targets = 1;
+            v.rtv_formats[0] = (i % 2 == 0) ? D::R8G8B8A8_UNORM : D::R16G16B16A16_FLOAT;
+            v.dsv_format = (i % 3 == 0) ? D::D32_FLOAT : D::D24_UNORM_S8_UINT;
+            v.sample_count = 1;
+            v.topology = (i % 4 == 0) ? D3DPrimitiveTopology::TriangleStrip : D3DPrimitiveTopology::TriangleList;
+            v.index_format = (v.topology == D3DPrimitiveTopology::TriangleStrip) ? WgpuIndexFormat::Uint16
+                                                                                 : WgpuIndexFormat::Undefined;
+            v.bound_vertex_slots = 1u;
+            v.vertex_strides[0] = 12u + static_cast<uint32_t>(i) * 4u;
+            variants[static_cast<size_t>(i)] = v;
+        }
+
+        std::array<std::array<uint32_t, kVariantCount>, kThreads> ids{};
+        std::array<std::array<const GraphicsPipelineKey*, kVariantCount>, kThreads> key_ptrs{};
+        std::atomic<int> created_count{0};
+        std::vector<std::thread> threads;
+        for (int t = 0; t < kThreads; ++t) {
+            threads.emplace_back([&, t] {
+                for (int round = 0; round < 60; ++round) {
+                    for (int step = 0; step < kVariantCount; ++step) {
+                        const int idx = (step + t * 5 + round) % kVariantCount;
+                        const PipelineResolution r = pso.resolve(cache, variants[static_cast<size_t>(idx)]);
+                        if (r.created) {
+                            created_count.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        if (ids[static_cast<size_t>(t)][static_cast<size_t>(idx)] == 0) {
+                            ids[static_cast<size_t>(t)][static_cast<size_t>(idx)] = r.pipeline_id;
+                            key_ptrs[static_cast<size_t>(t)][static_cast<size_t>(idx)] = r.key;
+                        } else {
+                            if (ids[static_cast<size_t>(t)][static_cast<size_t>(idx)] != r.pipeline_id) {
+                                ids[static_cast<size_t>(t)][static_cast<size_t>(idx)] = 0xFFFFFFFFu;
+                            }
+                            if (key_ptrs[static_cast<size_t>(t)][static_cast<size_t>(idx)] != r.key) {
+                                key_ptrs[static_cast<size_t>(t)][static_cast<size_t>(idx)] = nullptr;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& th : threads) {
+            th.join();
+        }
+        CHECK(pso.variant_count() == kVariantCount);
+        CHECK(created_count.load() == kVariantCount);
+        CHECK(cache.stats().misses == kVariantCount);
+        CHECK(cache.stats().variants == kVariantCount - 1);
+        for (int i = 0; i < kVariantCount; ++i) {
+            CHECK(ids[0][static_cast<size_t>(i)] != 0 && ids[0][static_cast<size_t>(i)] != 0xFFFFFFFFu);
+            CHECK(key_ptrs[0][static_cast<size_t>(i)] != nullptr);
+            CHECK(key_ptrs[0][static_cast<size_t>(i)]->vertex_buffers[0].array_stride ==
+                  12u + static_cast<uint32_t>(i) * 4u);
+            for (int t = 1; t < kThreads; ++t) {
+                CHECK(ids[static_cast<size_t>(t)][static_cast<size_t>(i)] == ids[0][static_cast<size_t>(i)]);
+                CHECK(key_ptrs[static_cast<size_t>(t)][static_cast<size_t>(i)] ==
+                      key_ptrs[0][static_cast<size_t>(i)]);
+            }
+        }
+    }
+
+    // (b) PipelineCache flat-table growth, tombstone rehash after many evictions, and forced
+    // hash collisions across tombstones.
+    {
+        PipelineCacheOptions opts{};
+        opts.eviction = EvictionPolicy::EvictUnreferenced;
+        PipelineCache cache(opts);
+
+        constexpr uint32_t kTotal = 600;
+        const auto keys = distinct_keys(kTotal);
+        std::vector<uint32_t> ids(kTotal, 0);
+        for (uint32_t i = 0; i < kTotal; ++i) {
+            const CacheLookup l = cache.acquire(keys[i]);
+            CHECK(l.created && l.pipeline_id != 0);
+            ids[i] = l.pipeline_id;
+        }
+        CHECK(cache.stats().live_graphics == kTotal);
+        for (uint32_t i = 0; i < kTotal; ++i) {
+            CHECK(cache.find(keys[i]) == ids[i]);
+        }
+
+        // Evict 80% of entries to create heavy tombstones, then re-insert new keys to trigger
+        // in-place tombstone compaction and growth.
+        for (uint32_t i = 0; i < kTotal; ++i) {
+            if (i % 5 != 0) {
+                const auto evicted = cache.release(keys[i]);
+                CHECK(evicted.has_value() && *evicted == ids[i]);
+            }
+        }
+        CHECK(cache.stats().live_graphics == kTotal / 5);
+        CHECK(cache.stats().evictions == kTotal - kTotal / 5);
+
+        // Surviving 20% must still be findable; evicted 80% must be absent.
+        for (uint32_t i = 0; i < kTotal; ++i) {
+            if (i % 5 == 0) {
+                CHECK(cache.find(keys[i]) == ids[i]);
+            } else {
+                CHECK(!cache.find(keys[i]).has_value());
+            }
+        }
+
+        // Repeated churn cycles (insert + evict) must preserve exact live counts and never lose survivors.
+        for (uint32_t cycle = 0; cycle < 3; ++cycle) {
+            for (uint32_t i = 0; i < kTotal; ++i) {
+                if (i % 5 != 0) {
+                    const CacheLookup l = cache.acquire(keys[i]);
+                    CHECK(l.created);
+                    ids[i] = l.pipeline_id;
+                }
+            }
+            CHECK(cache.stats().live_graphics == kTotal);
+            for (uint32_t i = 0; i < kTotal; ++i) {
+                CHECK(cache.find(keys[i]) == ids[i]);
+            }
+            for (uint32_t i = 0; i < kTotal; ++i) {
+                if (i % 5 != 0) {
+                    const auto evicted = cache.release(keys[i]);
+                    CHECK(evicted.has_value() && *evicted == ids[i]);
+                }
+            }
+            CHECK(cache.stats().live_graphics == kTotal / 5);
+        }
+
+        // Forced hash collisions with evictions (tombstone reuse must still detect collision with
+        // later occupied slots in the probe chain!).
+        PipelineCacheOptions col_opts{};
+        col_opts.eviction = EvictionPolicy::EvictUnreferenced;
+        col_opts.hash_override = &constant_hash;
+        PipelineCache col_cache(col_opts);
+        const auto col_keys = distinct_keys(30);
+        for (size_t i = 0; i < 20; ++i) {
+            CHECK(col_cache.acquire(col_keys[i]).created);
+        }
+        CHECK(col_cache.stats().hash_collisions == 19);
+        // Evict the first 10 keys, leaving tombstones ahead of keys[10..19].
+        for (size_t i = 0; i < 10; ++i) {
+            CHECK(col_cache.release(col_keys[i]).has_value());
+        }
+        // Remaining keys[10..19] must still be found past the tombstones.
+        for (size_t i = 10; i < 20; ++i) {
+            CHECK(col_cache.find(col_keys[i]).has_value());
+            CHECK(!col_cache.acquire(col_keys[i]).created);
+            CHECK(!col_cache.release(col_keys[i]).has_value());  // drop extra ref
+        }
+        // Inserting a brand-new key[20] reuses a tombstone slot yet MUST still count a collision
+        // because keys[10..19] share constant_hash later in the probe chain.
+        const uint64_t cols_before = col_cache.stats().hash_collisions;
+        CHECK(col_cache.acquire(col_keys[20]).created);
+        CHECK(col_cache.stats().hash_collisions == cols_before + 1);
+    }
+
+    // (c) CommandListStateTracker::reset() repeated frames: verifies complete state reset,
+    // option preservation, and zero stale state across frames.
+    {
+        PipelineCache cache;
+        GraphicsPso pso(basic_desc());
+        TrackerOptions opts{};
+        opts.mid_pass_clear = MidPassClearPolicy::DrawFallback;
+        CommandListStateTracker tracker(opts);
+        const RenderTargetViewInfo rt = rtv(1);
+        const RenderTargetViewInfo pending_rt = rtv(2);
+        const DepthStencilViewInfo ds = dsv(3, 1280, 720, D::D32_FLOAT);
+        const float clear_col[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+        const float blend_col[4] = {0.2f, 0.4f, 0.6f, 0.8f};
+
+        for (int frame = 0; frame < 5; ++frame) {
+            tracker.ClearRenderTargetView(rt, clear_col);
+            tracker.ClearRenderTargetView(pending_rt, clear_col);
+            tracker.set_render_targets(std::span<const RenderTargetViewInfo>(&rt, 1), &ds);
+            tracker.SetPipelineState(&pso);
+            set_full_viewport(tracker);
+            tracker.OMSetBlendFactor(blend_col);
+            tracker.OMSetStencilRef(static_cast<uint32_t>(frame + 1));
+            tracker.IASetPrimitiveTopology(D3DPrimitiveTopology::LineList);
+            const uint32_t stride = 16;
+            tracker.set_vertex_strides(0, 1, &stride);
+            CHECK(tracker.prepare_draw(&cache));
+            // Mid-pass clear uses DrawFallback (proves options_ was preserved by reset()).
+            tracker.ClearRenderTargetView(rt, clear_col);
+            CHECK(tracker.in_render_pass());
+            CHECK(tracker.clear_fallbacks().size() == 1);
+            CHECK(tracker.passes().size() == 1);
+            CHECK(tracker.stats().draws == 1);
+            CHECK(tracker.stats().clears_folded == 1);
+
+            tracker.reset();
+            CHECK(tracker.events().empty());
+            CHECK(tracker.passes().empty());
+            CHECK(tracker.clear_fallbacks().empty());
+            CHECK(!tracker.in_render_pass());
+            CHECK(tracker.diagnostics() == 0);
+            CHECK(tracker.pipeline_diagnostics() == 0);
+            CHECK(tracker.stats().draws == 0);
+            CHECK(tracker.stats().passes_begun == 0);
+            CHECK(tracker.stats().clear_fallbacks == 0);
+            CHECK(tracker.stats().clears_folded == 0);
+            CHECK(tracker.variant_state().topology == D3DPrimitiveTopology::Undefined);
+            CHECK(tracker.variant_state().bound_vertex_slots == 0);
+            // Calling close() right after reset() must emit nothing (pending_clears_ was cleared).
+            tracker.close();
+            CHECK(tracker.events().empty() && tracker.passes().empty());
+        }
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1948,6 +2173,7 @@ int main() {
     test_pending_clear_flush_and_merge();
     test_om_set_render_targets_descriptors();
     test_tracker_pipeline_failures();
+    test_g77_pso_hotpath_stress();
 
     if (g_failures != 0) {
         std::fprintf(stderr, "test_pso_cache failed with %d failure(s)\n", g_failures);
