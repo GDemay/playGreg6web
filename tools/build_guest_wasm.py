@@ -671,6 +671,7 @@ class BuildReport:
     toolchain: Toolchain | None = None
     jobs: int = 1
     opt: str = "O2"
+    opt_modules: dict[str, str] = field(default_factory=dict)
     compile_flags: tuple[str, ...] = ()
     link_flags: tuple[str, ...] = LINK_FLAGS
     sources: list[UnitBuildResult] = field(default_factory=list)
@@ -720,6 +721,7 @@ class BuildReport:
             "toolchain": self.toolchain.to_dict() if self.toolchain else None,
             "jobs": self.jobs,
             "opt": self.opt,
+            "opt_modules": dict(self.opt_modules),
             "no_link_opt": self.no_link_opt,
             "shrink_largest_shards": self.shrink_largest_shards,
             "wasm_exceptions": self.wasm_exceptions,
@@ -1057,6 +1059,92 @@ def parse_opt_level(raw: str) -> str:
     if text in {"0", "1", "2", "3", "s", "z"}:
         return f"O{text}"
     raise BuildGuestWasmError(f"invalid --opt {raw!r}; expected O0, O1, O2, O3, Os, or Oz")
+
+
+def parse_opt_modules(
+    raw: Sequence[str] | Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Parse repeatable `--opt-module MODULE=LEVEL` overrides into `{module: opt_level}`."""
+    if raw is None:
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(raw, Mapping):
+        for mod_raw, level_raw in raw.items():
+            if not isinstance(mod_raw, str) or not isinstance(level_raw, str):
+                raise BuildGuestWasmError(
+                    f"invalid --opt-module entry ({mod_raw!r}={level_raw!r}); expected MODULE=LEVEL"
+                )
+            mod = mod_raw.strip()
+            if not mod or any(ch.isspace() for ch in mod):
+                raise BuildGuestWasmError(
+                    f"invalid --opt-module {mod_raw!r}={level_raw!r}; module name must be non-empty"
+                )
+            try:
+                level = parse_opt_level(level_raw)
+            except BuildGuestWasmError as exc:
+                raise BuildGuestWasmError(
+                    f"invalid --opt-module {mod_raw}={level_raw!r}; "
+                    "expected level O0, O1, O2, O3, Os, or Oz"
+                ) from exc
+            out[mod] = level
+        return out
+    items: Sequence[str] = (raw,) if isinstance(raw, str) else raw
+    for entry in items:
+        if not isinstance(entry, str) or "=" not in entry:
+            raise BuildGuestWasmError(
+                f"invalid --opt-module {entry!r}; expected MODULE=LEVEL (e.g. bink2scarlett=O3)"
+            )
+        mod_raw, level_raw = entry.split("=", 1)
+        mod = mod_raw.strip()
+        if not mod or any(ch.isspace() for ch in mod):
+            raise BuildGuestWasmError(
+                f"invalid --opt-module {entry!r}; module name must be non-empty (expected MODULE=LEVEL)"
+            )
+        try:
+            level = parse_opt_level(level_raw)
+        except BuildGuestWasmError as exc:
+            raise BuildGuestWasmError(
+                f"invalid --opt-module {entry!r}; expected level O0, O1, O2, O3, Os, or Oz"
+            ) from exc
+        out[mod] = level
+    return out
+
+
+def _unit_module_name(unit: SourceUnit) -> str | None:
+    """Return the logical module name for `unit` (e.g. `bink2scarlett`, `main`)."""
+    if unit.module:
+        return unit.module
+    uid = unit.unit_id.replace("\\", "/")
+    if "/" in uid:
+        head = uid.split("/", 1)[0]
+        if head and head not in {"lift", "stubs", "exports"}:
+            return head
+    stem = Path(uid).stem
+    if "__" in stem:
+        prefix = stem.split("__", 1)[0]
+        if prefix:
+            return prefix
+    return None
+
+
+def opt_level_for_unit(
+    unit: SourceUnit,
+    *,
+    default_opt: str,
+    opt_modules: Mapping[str, str] | None = None,
+    shrink_ids: frozenset[str] = frozenset(),
+) -> str:
+    """Resolve the optimization level for a single `SourceUnit`.
+
+    Precedence: explicit `--opt-module` override > `--shrink-largest-shards` (`-Oz`) > `--opt`.
+    """
+    if opt_modules:
+        mod = _unit_module_name(unit)
+        if mod is not None and mod in opt_modules:
+            return opt_modules[mod]
+    if unit.unit_id in shrink_ids:
+        return "Oz"
+    return default_opt
 
 
 def parse_size_token(raw: str, *, flag_name: str) -> str:
@@ -3042,7 +3130,7 @@ def build_link_argv(
     else:
         argv.extend(str(path) for path in objects)
     for lib in runtime_libs:
-        if use_whole_archive and lib.suffix.lower() == ".a":
+        if use_whole_archive and lib.suffix.lower() == ".a" and not _is_companion_static_lib(lib):
             argv.extend(["-Wl,--whole-archive", str(lib), "-Wl,--no-whole-archive"])
         else:
             argv.append(str(lib))
@@ -4097,6 +4185,35 @@ def run_verify(
     }
 
 
+def _resolved_path_key(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path
+
+
+def _is_companion_static_lib(path: Path) -> bool:
+    """Return True for companion third-party static archives (e.g. `libopus.a`).
+
+    Companion archives do not bundle playgta6 boot objects (`wasm_boot.cpp.o`,
+    `main.cpp.o`), so split-module builds must preserve them directly without
+    `emar d` filtering or `--whole-archive` wrapping.
+    """
+    return path.name.lower() == "libopus.a"
+
+
+def _find_sibling_opus_lib(runtime_lib: Path) -> Path | None:
+    """Locate CMake FetchContent `libopus.a` beside a built `libplaygta6_core.a`."""
+    parent = runtime_lib.parent
+    for candidate in (
+        parent / "_deps" / "opus-build" / "libopus.a",
+        parent / "libopus.a",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def resolve_runtime_libs(
     *,
     repo_root: Path,
@@ -4104,17 +4221,35 @@ def resolve_runtime_libs(
     extra_objects: Sequence[Path],
 ) -> list[Path]:
     libs: list[Path] = []
+    seen: set[Path] = set()
+
+    def _append_unique(path: Path) -> None:
+        key = _resolved_path_key(path)
+        if key not in seen:
+            seen.add(key)
+            libs.append(path)
+
+    primary: Path | None = None
     if runtime_lib is not None:
-        libs.append(runtime_lib)
+        primary = runtime_lib
     else:
         default_lib = repo_root / DEFAULT_RUNTIME_LIB_REL
         if default_lib.is_file():
-            libs.append(default_lib)
+            primary = default_lib
         else:
             alt = repo_root / "runtime" / "libplaygta6_core.a"
             if alt.is_file():
-                libs.append(alt)
-    libs.extend(extra_objects)
+                primary = alt
+
+    if primary is not None:
+        _append_unique(primary)
+        if primary.is_file():
+            sibling_opus = _find_sibling_opus_lib(primary)
+            if sibling_opus is not None:
+                _append_unique(sibling_opus)
+
+    for extra in extra_objects:
+        _append_unique(extra)
     return libs
 
 
@@ -4163,6 +4298,7 @@ def run_build(
     out_dir: Path | None = None,
     jobs: int | None = None,
     opt: str = "O2",
+    opt_modules: Sequence[str] | Mapping[str, str] | None = None,
     runtime_lib: Path | None = None,
     extra_objects: Sequence[Path] = (),
     extra_link_flags: Sequence[str] = (),
@@ -4195,6 +4331,7 @@ def run_build(
 ) -> BuildReport:
     """Discover, compile (in parallel), and link guest shards into runtime.{js,wasm}."""
     opt_level = parse_opt_level(opt)
+    opt_modules_map = parse_opt_modules(opt_modules)
     worker_count = jobs if jobs is not None else (os.cpu_count() or 1)
     if worker_count < 1:
         raise BuildGuestWasmError("--jobs must be >= 1")
@@ -4270,6 +4407,7 @@ def run_build(
         toolchain=toolchain,
         jobs=worker_count,
         opt=opt_level,
+        opt_modules=dict(opt_modules_map),
         compile_flags=base_compile_flags,
         link_flags=effective_link_flags,
         linked_guest_boot=link_guest_boot,
@@ -4387,7 +4525,12 @@ def run_build(
             report.ok = False
             report.errors.append(f"no compiler for {unit.unit_id} ({unit.kind})")
             continue
-        unit_opt = "Oz" if unit.unit_id in shrink_ids else opt_level
+        unit_opt = opt_level_for_unit(
+            unit,
+            default_opt=opt_level,
+            opt_modules=opt_modules_map,
+            shrink_ids=shrink_ids,
+        )
         extra = boot_defines if link_guest_boot and unit.module == "boot" else ()
         flags = compile_flags_for(
             opt=unit_opt,
@@ -4590,7 +4733,7 @@ def run_build(
         split_runtime_libs: list[Path] = []
         archive_filter_plans: list[tuple[Path, Path]] = []
         for lib in runtime_libs:
-            if lib.suffix.lower() == ".a":
+            if lib.suffix.lower() == ".a" and not _is_companion_static_lib(lib):
                 filtered_lib = split_filtered_archive_path(cache_root, lib)
                 split_runtime_libs.append(filtered_lib)
                 archive_filter_plans.append((lib, filtered_lib))
@@ -4888,6 +5031,9 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         lines.append("  Linked guest boot: yes")
     if report.no_link_opt:
         lines.append("  No link opt: yes (skipping link-time -Os/-Oz wasm-opt)")
+    if report.opt_modules:
+        pairs = ", ".join(f"{mod}=-{lvl}" for mod, lvl in sorted(report.opt_modules.items()))
+        lines.append(f"  Module opt overrides: {pairs}")
     if report.shrink_largest_shards:
         lines.append(f"  Shrink largest shards: {report.shrink_largest_shards} (compiled at -Oz)")
     if report.wasm_exceptions:
@@ -5046,6 +5192,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--opt",
         default="O2",
         help="Optimization level: O0, O1, O2 (default), O3, Os, or Oz.",
+    )
+    parser.add_argument(
+        "--opt-module",
+        action="append",
+        default=[],
+        dest="opt_modules",
+        metavar="MODULE=LEVEL",
+        help=(
+            "Per-module optimization level override (repeatable; e.g. "
+            "--opt-module bink2scarlett=O3). Valid levels: O0, O1, O2, O3, Os, Oz."
+        ),
     )
     parser.add_argument(
         "--runtime-lib",
@@ -5346,6 +5503,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             out_dir=out_dir,
             jobs=args.jobs,
             opt=args.opt,
+            opt_modules=args.opt_modules,
             runtime_lib=runtime_lib,
             extra_objects=extra_objects,
             extra_link_flags=args.extra_link_flags,
