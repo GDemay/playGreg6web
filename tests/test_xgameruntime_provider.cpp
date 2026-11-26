@@ -507,9 +507,17 @@ void test_query_api() {
         CHECK(static_cast<uint32_t>(fx.vcall(hdr, 4, {0, 0})) == 2);
     }
     {
-        // XSpeechSynthesizer: silent synthesizer. Fixed handle, empty 16 kHz mono WAVE streams.
+        // XSpeechSynthesizer: silent synthesizer. Fixed handle, empty 16 kHz mono WAVE streams,
+        // and no installed voices (slot 8 returns S_OK without invoking the callback).
         const uint64_t speech = fx.query(com::make_guid("3e241977-6237-41e9-8559-102c2d9983f1"),
                                          com::make_guid("d722b373-8c4d-4692-9e51-d6ad9b37aa7d"));
+        g_record_calls = 0;
+        CHECK(hr32(fx.vcall(speech, 8, {0x1234, kRecord})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(g_record_calls == 0);
+        CHECK(hr32(fx.vcall(speech, 8, {0, kRecord})) == playgta6::os::gdk::S_OK_HR);
+        CHECK(g_record_calls == 0);
+        CHECK(hr32(fx.vcall(speech, 8, {0x1234, 0})) == com::E_INVALIDARG_HR);
+        CHECK(g_record_calls == 0);
         const uint64_t handle = fx.alloc(8);
         CHECK(com::write_guest(handle, uint64_t{0x1234}));
         CHECK(hr32(fx.vcall(speech, 9, {handle})) == playgta6::os::gdk::S_OK_HR);

@@ -94,8 +94,9 @@
 //     a directory of the /userdata overlay).
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
-//   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s9 XSpeechSynthesizerCreate(1) h (one
-//     pointer to a handle field; silent synthesizer: fixed handle, empty WAVE streams).
+//   {3e241977-...}/{d722b373-...} XSpeechSynthesizer: s8 XSpeechSynthesizerEnumerateInstalledVoices(2) h,
+//     s9 XSpeechSynthesizerCreate(1) h (one pointer to a handle field; silent synthesizer: fixed handle,
+//     empty WAVE streams, zero installed voices).
 //   {704c3f58-...}/{1bfff3af-...} XGameSave: s3 InitializeProvider(4) h, s4 InitializeProviderAsync(4) h,
 //     s5 InitializeProviderResult, s6 CloseProvider (O34: a local provider on the host directory
 //     --save-dir, never any cloud sync; s5/s6 by public header order), s13
@@ -1204,6 +1205,15 @@ public:
         put32(40, 0);
     }
 
+    // s8: XSpeechSynthesizerEnumerateInstalledVoices(void* context, callback*).
+    // No voices are installed, so the callback never runs.
+    int32_t EnumerateInstalledVoices(uint64_t /*context*/, uint64_t callback) {
+        if (callback == 0) {
+            return E_INVALIDARG_HR;
+        }
+        return S_OK_HR;
+    }
+
     // s9: XSpeechSynthesizerCreate(XSpeechSynthesizerHandle*).
     int32_t Create(GuestPtr<uint64_t> handle) {
         if (handle.is_null()) {
@@ -2261,6 +2271,7 @@ constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocal
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});
 using SP = M<SpeechApi>;
 constexpr auto kSpeechTable = slot_table<13>({
+    {8, SP::method<&SpeechApi::EnumerateInstalledVoices>("XSpeechSynthesizerEnumerateInstalledVoices")},
     {9, SP::method<&SpeechApi::Create>("XSpeechSynthesizerCreate")},
     {10, SP::method<&SpeechApi::Close>("XSpeechSynthesizerCloseInstance")},
     {11, SP::method<&SpeechApi::CreateStream>("XSpeechSynthesizerCreateStreamFromText")},
