@@ -149,6 +149,8 @@ class GpuOpcode(IntEnum):
     DrawIndirect = 36
     DrawIndexedIndirect = 37
     DispatchIndirect = 38
+    ReadbackBuffer = 39
+    ReadbackTexture = 40
 
 
 class GpuTextureFormat(IntEnum):

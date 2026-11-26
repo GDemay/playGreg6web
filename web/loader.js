@@ -6060,6 +6060,32 @@ function buildRuntimeModuleConfig(options = {}) {
     options.userdataStore !== undefined ? options.userdataStore : userdataStore;
   const activeGpuWorker = options.gpuWorker !== undefined ? options.gpuWorker : gpuWorker;
 
+  // G66 read-back: the GPU worker writes ReadbackBuffer / ReadbackTexture results straight into
+  // the runtime's shared memory, so it gets the current SharedArrayBuffer (again after a grow).
+  let attachedGuestMemory = null;
+  const attachGuestMemoryToGpuWorker = () => {
+    let buffer = null;
+    try {
+      buffer = resolveBuffer(
+        options.memory ||
+          (boundModule &&
+            (boundModule.wasmMemory || (boundModule.HEAPU8 && boundModule.HEAPU8.buffer))) ||
+          null
+      );
+    } catch {
+      buffer = null;
+    }
+    if (
+      !buffer ||
+      buffer === attachedGuestMemory ||
+      typeof SharedArrayBuffer === 'undefined' ||
+      !(buffer instanceof SharedArrayBuffer)
+    ) {
+      return;
+    }
+    attachedGuestMemory = buffer;
+    activeGpuWorker.postMessage({ type: 'attach-guest-memory', buffer });
+  };
   const wgpuSubmit =
     typeof options.wgpuSubmit === 'function'
       ? options.wgpuSubmit
@@ -6067,6 +6093,7 @@ function buildRuntimeModuleConfig(options = {}) {
           if (!activeGpuWorker) return;
           const cmdBuffer = toTransferableArrayBuffer(bytes);
           if (!cmdBuffer) return;
+          attachGuestMemoryToGpuWorker();
           activeGpuWorker.postMessage({ cmdBuffer }, [cmdBuffer]);
         };
 

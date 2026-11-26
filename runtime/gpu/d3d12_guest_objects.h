@@ -77,6 +77,7 @@
 
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_guest_structs.h"
+#include "gpu/d3d12_readback.h"
 #include "gpu/d3d12_xs_dump.h"
 #include "gpu/d3d12_xs_xbox.h"
 #include "gpu/descriptor_heap.h"
@@ -634,6 +635,16 @@ struct DeviceOptions {
     // never bound; creating them all at once costs the browser's GPU process gigabytes. Ids are
     // allocated at creation either way, so recorded packets stay valid. Off: created at once.
     bool defer_gpu_objects = true;
+    // GPU -> CPU read-back (G66, d3d12_readback.h): copies into CPU-visible memory become
+    // ReadbackBuffer / ReadbackTexture packets either way. With `gpu_readback_hold` a queue Signal
+    // issued after one is held until the consumer reports the bytes written (at most
+    // `gpu_readback_timeout_ms` per signal). Default: on where a consumer answers (the browser build).
+#ifdef __EMSCRIPTEN__
+    bool gpu_readback_hold = true;
+#else
+    bool gpu_readback_hold = false;
+#endif
+    uint32_t gpu_readback_timeout_ms = 250;
 };
 
 struct DeviceStats {
@@ -788,6 +799,8 @@ public:
     }
     uint32_t fence_publish_cap_ms() const { return options_.fence_publish_cap_ms; }
     uint64_t present_epoch() const { return present_epoch_.load(std::memory_order_acquire); }
+    // GPU -> CPU read-back ordering (d3d12_readback.h).
+    ReadbackGate& readbacks() { return *readback_gate_; }
     void register_lag_fence(Fence* fence);
     void unregister_lag_fence(Fence* fence);
     // Called at every PresentX (after the present): advances the epoch and publishes due values.
@@ -1033,6 +1046,7 @@ private:
 
     mutable std::mutex submit_mutex_;
     PacketSink sink_;
+    std::unique_ptr<ReadbackGate> readback_gate_;
     // With submit_mutex_ held: `bytes` (whole packets) to the sink, each held create packet written
     // before the first packet that references its id (emit_locked), or as they are (write_sink_locked).
     void emit_locked(const uint8_t* bytes, size_t n);
@@ -1530,6 +1544,14 @@ enum class Work : size_t {
     // table slot (stage_reflection.h, G62 #482), per pipeline state created.
     ReflectionRootDescriptorTables,
     ReflectionVertexInputsDefaulted,
+    // G66 GPU -> CPU read-back (d3d12_readback.h): ReadbackBuffer / ReadbackTexture packets issued
+    // and the bytes they write into guest memory, completions the consumer reported, queue signals
+    // held until their read-backs landed, and holds ended by the timeout instead.
+    ReadbacksIssued,
+    ReadbackBytes,
+    ReadbacksCompleted,
+    ReadbackSignalsHeld,
+    ReadbackTimeouts,
     Count
 };
 void count_work(Work w, uint64_t n = 1);
