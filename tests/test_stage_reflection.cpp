@@ -1167,6 +1167,445 @@ void test_rt_arena_bindings() {
         R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
             "bindings": [{"group": 2, "binding": 16, "kind": "storage", "source": {"rt_arena": true}}]}}})",
         &bad, &error));
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 3, "binding": 15, "kind": "storage", "source": {"rt_arena": true}}]}}})",
+        &bad, &error));
+}
+
+// G83 (#1748 / #651): comprehensive v3 unresolved read-only vs writable rejection, v1/v2 rejection,
+// and multi-stage sharing agreement (unresolved + unresolved, resolved + unresolved, mismatches).
+void test_g83_unresolved_and_multistage() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x0000000000000e10": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "min_binding_size_bytes": 64, "source": {"unresolved": true}},
+        {"group": 0, "binding": 1, "kind": "read_only_storage", "source": {"unresolved": "dynamic_cb_index"}},
+        {"group": 0, "binding": 2, "kind": "texture", "view_dimension": "cube", "source": {"unresolved": true}},
+        {"group": 0, "binding": 3, "kind": "sampler", "source": {"unresolved": "inline_dynamic"}},
+        {"group": 0, "binding": 4, "kind": "comparison_sampler", "source": {"unresolved": true}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &idx, &error));
+    CHECK(error.empty() && idx.size() == 1);
+    const StageReflection& ps = idx.at(0xe10);
+    CHECK(ps.bindings.size() == 5);
+
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(report.empty() && stats.unresolved_bindings == 5);
+    const bridge::LayoutBinding* u0 = find(layout, 0, 0);
+    const bridge::LayoutBinding* ro1 = find(layout, 0, 1);
+    const bridge::LayoutBinding* t2 = find(layout, 0, 2);
+    const bridge::LayoutBinding* s3 = find(layout, 0, 3);
+    const bridge::LayoutBinding* cs4 = find(layout, 0, 4);
+    CHECK(u0 != nullptr && u0->join.register_class == d3d::DescriptorRangeType::Cbv &&
+          u0->join.shader_register == d3d::kNoIndex && u0->entry.min_binding_size == 64);
+    CHECK(ro1 != nullptr && ro1->join.register_class == d3d::DescriptorRangeType::Srv &&
+          ro1->join.shader_register == d3d::kNoIndex);
+    CHECK(t2 != nullptr && t2->join.register_class == d3d::DescriptorRangeType::Srv &&
+          t2->entry.view_dimension == static_cast<uint8_t>(GpuTextureViewDimension::Cube));
+    CHECK(s3 != nullptr && s3->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          s3->entry.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Filtering));
+    CHECK(cs4 != nullptr && cs4->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          cs4->entry.binding_type == static_cast<uint8_t>(GpuSamplerBindingType::Comparison));
+
+    // Reject v1, v2, mixed-key unresolved source, and writable kinds in JSON.
+    const char* bad_json[] = {
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "uniform", "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 2, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": "reason"}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture",
+                          "source": {"unresolved": true, "user_sgpr": 8}}]}}})",
+    };
+    for (const char* bdoc : bad_json) {
+        StageReflectionIndex rejected;
+        error.clear();
+        CHECK(!parse_stage_reflection_json(bdoc, &rejected, &error));
+        CHECK(!error.empty());
+    }
+
+    // Programmatic writable unresolved bindings are rejected cleanly in join_pipeline_layout too.
+    for (const ReflectedBindingKind wk : {ReflectedBindingKind::Storage, ReflectedBindingKind::StorageTexture}) {
+        StageReflection st;
+        ReflectedBinding wb;
+        wb.group = 0;
+        wb.binding = 0;
+        wb.kind = wk;
+        wb.storage_format = 18;
+        wb.source = ReflectedSource::Unresolved;
+        st.bindings = {wb};
+        bridge::PipelineLayoutDesc untouched;
+        JoinStats wstats;
+        report.clear();
+        CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &st}}, &untouched, &report, &wstats));
+        CHECK(wstats.unresolved_bindings == 0);
+        CHECK(report.find("<- unresolved") != std::string::npos);
+        CHECK(report.find("cannot have an unresolved source") != std::string::npos);
+    }
+
+    // Multi-stage: two stages sharing the same unresolved binding merge visibility and count ONCE.
+    StageReflection vs_u, ps_u;
+    vs_u.stage = ReflectedStage::Vertex;
+    ps_u.stage = ReflectedStage::Fragment;
+    ReflectedBinding ub;
+    ub.group = 0;
+    ub.binding = 0;
+    ub.kind = ReflectedBindingKind::Uniform;
+    ub.min_binding_size = 64;
+    ub.source = ReflectedSource::Unresolved;
+    vs_u.bindings = {ub};
+    ub.min_binding_size = 128;
+    ps_u.bindings = {ub};
+    stats = JoinStats{};
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &vs_u}, {GpuShaderStageBits::Fragment, &ps_u}},
+                               &layout, &report, &stats));
+    CHECK(report.empty() && stats.unresolved_bindings == 1);
+    const bridge::LayoutBinding* shared_u = find(layout, 0, 0);
+    CHECK(shared_u != nullptr &&
+          shared_u->entry.visibility == (GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment) &&
+          shared_u->entry.min_binding_size == 128 && shared_u->join.shader_register == d3d::kNoIndex);
+
+    // Multi-stage: resolved + unresolved on the same read-only WebGPU entry adopts the resolved
+    // source symmetrically (both orders) and does not count as unresolved.
+    StageReflection vs_res;
+    vs_res.stage = ReflectedStage::Vertex;
+    ReflectedBinding rb;
+    rb.group = 0;
+    rb.binding = 0;
+    rb.kind = ReflectedBindingKind::Uniform;
+    rb.min_binding_size = 96;
+    rb.source = ReflectedSource::Table;
+    rb.user_sgpr = 8;
+    rb.table_byte_offset = 32;  // CBV b0 space 1
+    vs_res.bindings = {rb};
+    for (int order = 0; order < 2; ++order) {
+        std::vector<ReflectedStageRef> pair =
+            order == 0
+                ? std::vector<ReflectedStageRef>{{GpuShaderStageBits::Vertex, &vs_res},
+                                                 {GpuShaderStageBits::Fragment, &ps_u}}
+                : std::vector<ReflectedStageRef>{{GpuShaderStageBits::Fragment, &ps_u},
+                                                 {GpuShaderStageBits::Vertex, &vs_res}};
+        stats = JoinStats{};
+        report.clear();
+        CHECK(join_pipeline_layout(rs, false, pair, &layout, &report, &stats));
+        CHECK(report.empty() && stats.unresolved_bindings == 0);
+        const bridge::LayoutBinding* m = find(layout, 0, 0);
+        CHECK(m != nullptr && m->entry.visibility == (GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment) &&
+              m->entry.min_binding_size == 128 && m->join.register_class == d3d::DescriptorRangeType::Cbv &&
+              m->join.shader_register == 0 && m->join.register_space == 1);
+    }
+
+    // Multi-stage: resolved + unresolved with mismatched entry kind fails cleanly.
+    StageReflection ps_wrong_u;
+    ps_wrong_u.stage = ReflectedStage::Fragment;
+    ReflectedBinding wrong_u;
+    wrong_u.group = 0;
+    wrong_u.binding = 0;
+    wrong_u.kind = ReflectedBindingKind::Texture;
+    wrong_u.source = ReflectedSource::Unresolved;
+    ps_wrong_u.bindings = {wrong_u};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &vs_res}, {GpuShaderStageBits::Fragment, &ps_wrong_u}},
+                                &layout, &report));
+    CHECK(report.find("the stages disagree") != std::string::npos);
+
+    // Multi-stage: differing multisampled flag or storage format on the same (group, binding) fails.
+    StageReflection tex_a, tex_b;
+    ReflectedBinding ta;
+    ta.group = 0;
+    ta.binding = 0;
+    ta.kind = ReflectedBindingKind::Texture;
+    ta.source = ReflectedSource::Table;
+    ta.user_sgpr = 8;
+    ta.table_byte_offset = 0;
+    ta.multisampled = true;
+    tex_a.bindings = {ta};
+    ta.multisampled = false;
+    tex_b.bindings = {ta};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &tex_a}, {GpuShaderStageBits::Fragment, &tex_b}},
+                                &layout, &report));
+    CHECK(report.find("the stages disagree") != std::string::npos);
+
+    StageReflection st_a, st_b;
+    ReflectedBinding sfa;
+    sfa.group = 0;
+    sfa.binding = 0;
+    sfa.kind = ReflectedBindingKind::StorageTexture;
+    sfa.storage_format = 18;
+    sfa.source = ReflectedSource::Table;
+    sfa.user_sgpr = 8;
+    sfa.table_byte_offset = 0;
+    st_a.bindings = {sfa};
+    sfa.storage_format = 24;
+    st_b.bindings = {sfa};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Vertex, &st_a}, {GpuShaderStageBits::Fragment, &st_b}},
+                                &layout, &report));
+    CHECK(report.find("the stages disagree") != std::string::npos);
+}
+
+// G83 (#1748 / #651): cbv_indexed_*_heap + lane_indexed_*_heap stride propagation, multi-stage
+// sharing agreement, window_base variants, and validation boundaries.
+void test_g83_heap_strides_and_arrays() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x0000000000000e20": {
+      "stage": "vertex",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "texture",
+         "source": {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 11, "root_descriptor": true},
+                                                  "byte_offset": 12, "shift": 0, "stride": 24,
+                                                  "bit_offset": 4, "mask": 4095}}},
+        {"group": 0, "binding": 1, "kind": "sampler",
+         "source": {"cbv_indexed_sampler_heap": {"cbv": {"user_sgpr": 9, "root_constants": true},
+                                                 "byte_offset": 4, "shift": 0, "stride": 48}}},
+        {"group": 0, "binding": 2, "kind": "texture",
+         "source": {"lane_indexed_resource_heap": {"max_count": 256, "shift": 0, "stride": 24,
+                    "window_base": {"cbv": {"user_sgpr": 8, "table_byte_offset": 32},
+                                    "byte_offset": 8, "bit_offset": 8, "mask": 255}}}}
+      ]
+    },
+    "0x0000000000000e21": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 2, "kind": "texture",
+         "source": {"lane_indexed_resource_heap": {"max_count": 256, "shift": 0, "stride": 24,
+                    "window_base": {"cbv": {"user_sgpr": 8, "table_byte_offset": 32},
+                                    "byte_offset": 8, "bit_offset": 8, "mask": 255}}}},
+        {"group": 0, "binding": 3, "kind": "sampler",
+         "source": {"lane_indexed_sampler_heap": {"max_count": 1, "shift": 4, "stride": 16,
+                    "window_base": {"cbv": {"user_sgpr": 9, "root_constants": true}, "byte_offset": 0}}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &idx, &error));
+    CHECK(error.empty() && idx.size() == 2);
+
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &idx.at(0xe20)},
+                                {GpuShaderStageBits::Fragment, &idx.at(0xe21)}},
+                               &layout, &report, &stats, JoinOptions{true}));
+    CHECK(report.empty() && stats.lane_indexed_arrays == 2 && stats.lane_indexed_bindings == 0);
+
+    // Non-power-of-two stride propagates to ShaderBinding::heap_stride for cbv_indexed_*_heap too!
+    const bridge::LayoutBinding* cb_res = find(layout, 0, 0);
+    CHECK(cb_res != nullptr && cb_res->join.heap == d3d::HeapAccess::Resource &&
+          cb_res->join.heap_index_source == d3d::HeapIndexSource::CbRootDescriptor &&
+          cb_res->join.heap_shift == 0 && cb_res->join.heap_stride == 24 &&
+          cb_res->join.cb_byte_offset == 12 && cb_res->join.cb_bit_offset == 4 && cb_res->join.cb_mask == 4095);
+    const bridge::LayoutBinding* cb_smp = find(layout, 0, 1);
+    CHECK(cb_smp != nullptr && cb_smp->join.heap == d3d::HeapAccess::Sampler &&
+          cb_smp->join.heap_index_source == d3d::HeapIndexSource::CbRootConstants &&
+          cb_smp->join.heap_shift == 0 && cb_smp->join.heap_stride == 48 && cb_smp->join.cb_byte_offset == 4);
+    // Shared lane-indexed binding merges visibility and counts once in lane_indexed_arrays.
+    const bridge::LayoutBinding* lane_res = find(layout, 0, 2);
+    CHECK(lane_res != nullptr &&
+          lane_res->entry.visibility == (GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment) &&
+          lane_res->entry.binding_array_size == 256 && lane_res->join.array_size == 256 &&
+          lane_res->join.heap_stride == 24 && lane_res->join.heap_index_source == d3d::HeapIndexSource::CbTable &&
+          lane_res->join.cb_table_slot == 1 && lane_res->join.cb_byte_offset == 8 &&
+          lane_res->join.cb_bit_offset == 8 && lane_res->join.cb_mask == 255);
+    const bridge::LayoutBinding* lane_smp = find(layout, 0, 3);
+    CHECK(lane_smp != nullptr && lane_smp->entry.binding_array_size == 1 && lane_smp->join.array_size == 1 &&
+          lane_smp->join.heap_shift == 4 && lane_smp->join.heap_stride == 0 &&
+          lane_smp->join.heap_index_source == d3d::HeapIndexSource::CbRootConstants);
+
+    // BindGroupPlan preserves cbv_indexed and lane_indexed heap_stride cleanly.
+    d3d::RootSignature built;
+    CHECK(d3d::RootSignature::build(rs, &built).ok());
+    std::vector<d3d::ShaderBinding> sbs = {cb_res->join, cb_smp->join, lane_res->join, lane_smp->join};
+    for (uint32_t i = 0; i < sbs.size(); ++i) {
+        sbs[i].binding = i;
+    }
+    const d3d::BindGroupPlan plan =
+        d3d::BindGroupPlan::build(built, sbs, d3d::WebGpuStage::Vertex | d3d::WebGpuStage::Fragment);
+    CHECK(plan.unresolved_count() == 0 && plan.entries().size() == 4);
+    CHECK(plan.entries()[0].heap_stride == 24 && plan.entries()[1].heap_stride == 48 &&
+          plan.entries()[2].heap_stride == 24 && plan.entries()[3].heap_stride == 0);
+
+    // Multi-stage disagreement on stride fails cleanly.
+    StageReflection bad_ps = idx.at(0xe21);
+    bad_ps.bindings[0].heap_stride = 48;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false,
+                                {{GpuShaderStageBits::Vertex, &idx.at(0xe20)}, {GpuShaderStageBits::Fragment, &bad_ps}},
+                                &layout, &report, nullptr, JoinOptions{true}));
+    CHECK(report.find("the stages disagree") != std::string::npos);
+
+    // Ambiguous multi-key cbv and fractional integers are rejected at parse time.
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture",
+                          "source": {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 11, "root_descriptor": true,
+                                                                           "root_constants": true},
+                                                                   "byte_offset": 0, "shift": 5}}}]}}})",
+        &bad, &error));
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 2, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "uniform",
+                          "source": {"user_sgpr": 8, "root_descriptor": true, "table_byte_offset": 32.5}}]}}})",
+        &bad, &error));
+
+    // Programmatic validation of out-of-range shift / lane_max_count / cb_mask / alignment.
+    StageReflection prog;
+    ReflectedBinding pb;
+    pb.group = 0;
+    pb.binding = 0;
+    pb.kind = ReflectedBindingKind::Texture;
+    pb.source = ReflectedSource::LaneIndexedResourceHeap;
+    pb.lane_max_count = kMaxLaneIndexedWindow + 1;
+    prog.bindings = {pb};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &prog}}, &layout, &report, nullptr,
+                                JoinOptions{true}));
+    CHECK(report.find("max_count") != std::string::npos);
+
+    pb.source = ReflectedSource::CbvIndexedResourceHeap;
+    pb.user_sgpr = 11;
+    pb.cbv = ReflectedCbv::RootDescriptor;
+    pb.heap_shift = 32;
+    prog.bindings = {pb};
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &prog}}, &layout, &report));
+    CHECK(report.find("heap shift 32") != std::string::npos);
+}
+
+// G83 (#1748 / #651): mesh_output boundaries, kMeshUserDataBase (s16) full layout joins,
+// and RT group-3 conflict + multi-stage merging.
+void test_g83_mesh_and_rt_group3_joins() {
+    // mesh_output boundary acceptance and rejection.
+    StageReflectionIndex idx;
+    std::string error;
+    CHECK(parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {
+            "0x1": {"stage": "compute", "mesh_output": {"max_vertices": 1, "max_primitives": 1, "vertex_words": 4}},
+            "0x2": {"stage": "compute", "mesh_output": {"max_vertices": 256, "max_primitives": 256, "vertex_words": 64}}}})",
+        &idx, &error));
+    CHECK(idx.at(1).has_mesh_output && idx.at(2).has_mesh_output && idx.at(2).mesh_output.vertex_words == 64);
+    for (const char* bad_mesh : {
+             R"({"max_vertices": 0, "max_primitives": 1, "vertex_words": 4})",
+             R"({"max_vertices": 257, "max_primitives": 1, "vertex_words": 4})",
+             R"({"max_vertices": 1, "max_primitives": 0, "vertex_words": 4})",
+             R"({"max_vertices": 1, "max_primitives": 257, "vertex_words": 4})",
+             R"({"max_vertices": 1, "max_primitives": 1, "vertex_words": 0})",
+             R"({"max_vertices": 1, "max_primitives": 1, "vertex_words": 68})",
+         }) {
+        StageReflectionIndex bad;
+        CHECK(!parse_stage_reflection_json(
+            std::string(R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute", "mesh_output": )") +
+                bad_mesh + "}}}",
+            &bad, &error));
+    }
+
+    // Mesh stage lowered to compute with kMeshUserDataBase = s16:
+    // ui_root_signature parameters sit at s16 (table), s17..s18 (2 root constants), s19..s20 (root CBV).
+    const char* mesh_doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x4d53435300000010": {
+      "stage": "compute",
+      "mesh_output": {"max_vertices": 64, "max_primitives": 126, "vertex_words": 16},
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "read_only_storage", "source": {"user_sgpr": 16, "table_byte_offset": 0}},
+        {"group": 0, "binding": 1, "kind": "uniform", "source": {"user_sgpr": 17, "root_constants": true}},
+        {"group": 0, "binding": 2, "kind": "uniform",
+         "source": {"user_sgpr": 16, "root_descriptor": true, "table_byte_offset": 32}},
+        {"group": 0, "binding": 3, "kind": "texture",
+         "source": {"cbv_indexed_resource_heap": {"cbv": {"user_sgpr": 19, "root_descriptor": true},
+                                                  "byte_offset": 0, "shift": 5}}},
+        {"group": 0, "binding": 4, "kind": "texture",
+         "source": {"lane_indexed_resource_heap": {"max_count": 16, "shift": 5,
+                    "window_base": {"cbv": {"user_sgpr": 17, "root_constants": true}, "byte_offset": 4}}}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex mesh_idx;
+    CHECK(parse_stage_reflection_json(mesh_doc, &mesh_idx, &error));
+    const StageReflection& ms = mesh_idx.at(0x4d53435300000010ull);
+    const d3d::RootSignatureDesc rs = ui_root_signature();
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    JoinOptions mesh_opts;
+    mesh_opts.binding_arrays = true;
+    mesh_opts.user_data_base = kMeshUserDataBase;
+    CHECK(join_pipeline_layout(rs, false, {{GpuShaderStageBits::Compute, &ms}}, &layout, &report, &stats, mesh_opts));
+    CHECK(report.empty() && stats.root_descriptor_tables == 1 && stats.lane_indexed_arrays == 1);
+    CHECK(find(layout, 0, 0) != nullptr && find(layout, 0, 0)->join.shader_register == 2);
+    CHECK(find(layout, 0, 1) != nullptr && find(layout, 0, 1)->join.root_constants);
+    CHECK(find(layout, 0, 2) != nullptr && find(layout, 0, 2)->join.register_class == d3d::DescriptorRangeType::Cbv &&
+          find(layout, 0, 2)->join.shader_register == 0);
+    CHECK(find(layout, 0, 3) != nullptr && find(layout, 0, 3)->join.heap_index_parameter == 2);
+    CHECK(find(layout, 0, 4) != nullptr && find(layout, 0, 4)->join.heap_index_parameter == 1 &&
+          find(layout, 0, 4)->entry.binding_array_size == 16);
+
+    // Without kMeshUserDataBase, s16..s19 fail cleanly.
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Compute, &ms}}, &layout, &report, nullptr,
+                                JoinOptions{true, 0}));
+    CHECK(!report.empty());
+
+    // RT group-3: multi-stage merge succeeds when user bindings stay in groups 0..2,
+    // and fails when any stage joins a regular binding into group 3 or has invalid rt_arena_mask bits.
+    const char* rt_doc = R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {
+      "0x90": {"stage": "vertex", "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 9, "root_constants": true}},
+        {"group": 3, "binding": 16, "kind": "storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 17, "kind": "storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 18, "kind": "storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 19, "kind": "storage", "source": {"rt_arena": true}}]},
+      "0x91": {"stage": "fragment", "bindings": [
+        {"group": 2, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 11, "root_descriptor": true}},
+        {"group": 3, "binding": 20, "kind": "read_only_storage", "source": {"rt_arena": true}},
+        {"group": 3, "binding": 21, "kind": "storage", "source": {"rt_arena": true}}]},
+      "0x92": {"stage": "fragment", "rt_arena": true, "bindings": [
+        {"group": 3, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 11, "root_descriptor": true}}]}}})";
+    StageReflectionIndex rt_idx;
+    CHECK(parse_stage_reflection_json(rt_doc, &rt_idx, &error));
+    CHECK(rt_idx.at(0x90).rt_arena_mask == 0x0fu && rt_idx.at(0x91).rt_arena_mask == 0x30u);
+    report.clear();
+    CHECK(join_pipeline_layout(rs, false,
+                               {{GpuShaderStageBits::Vertex, &rt_idx.at(0x90)},
+                                {GpuShaderStageBits::Fragment, &rt_idx.at(0x91)}},
+                               &layout, &report));
+    CHECK(report.empty() && layout.rt_arena && layout.groups.size() == 3);
+
+    // Conflict: stage with rt_arena: true also has a non-RT binding in group 3.
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &rt_idx.at(0x92)}}, &layout, &report));
+    CHECK(report.find("the runtime owns group 3") != std::string::npos);
+
+    // Programmatic invalid rt_arena_mask bits outside 16..21.
+    StageReflection bad_rt;
+    bad_rt.rt_arena_mask = 0x40u;
+    report.clear();
+    CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad_rt}}, &layout, &report));
+    CHECK(report.find("rt_arena_mask") != std::string::npos);
 }
 
 int main() {
@@ -1187,6 +1626,9 @@ int main() {
     test_inline_sampler();
     test_root_descriptor_over_table();
     test_unresolved_source();
+    test_g83_unresolved_and_multistage();
+    test_g83_heap_strides_and_arrays();
+    test_g83_mesh_and_rt_group3_joins();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

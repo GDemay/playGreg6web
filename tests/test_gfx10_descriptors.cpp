@@ -12,8 +12,10 @@
 #include "gpu/cmd_encoder.h"
 #include "gpu/d3d12_guest_objects.h"
 #include "gpu/d3d12_guest_resources.h"
+#include "gpu/descriptor_words.h"
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/pso_cache.h"
+#include "gpu/state_bridge.h"
 #include "guest/com_bridge.h"
 #include "os/vmem.h"
 
@@ -654,6 +656,503 @@ void test_bgra8_uav_storage_usage() {
     com::set_guest_memory(nullptr);
 }
 
+// G83 (#1748 / #651): full 3D view dimension round-trips (1D, 1DArray, 2D, 2DArray, 2DMS,
+// 2DMSArray, 3D, Cube, CubeArray) through view_words / image_words_at_address / decode_view_words.
+void test_g83_3d_view_dimensions() {
+    namespace bridge = playgta6::gpu::bridge;
+    namespace pso = playgta6::gpu::pso;
+    using playgta6::GpuTextureDimension;
+
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps);
+
+    auto reg_tex = [&](uint32_t id, uint64_t va, GpuTextureDimension dim, uint32_t w, uint32_t h, uint32_t layers,
+                       uint32_t mips, uint32_t samples, pso::DxgiFormat fmt) {
+        bridge::TextureInfo ti;
+        ti.format = fmt;
+        ti.width = w;
+        ti.height = h;
+        ti.depth_or_array_size = layers;
+        ti.mip_levels = mips;
+        ti.sample_count = samples;
+        ti.dimension = dim;
+        ti.gpu_va = va;
+        device.register_texture(id, ti);
+    };
+
+    reg_tex(10, 0x0000'1000'0001'0000ull, GpuTextureDimension::Dim1D, 512, 1, 8, 5, 1, pso::DxgiFormat::R8G8B8A8_UNORM);
+    reg_tex(11, 0x0000'1000'0002'0000ull, GpuTextureDimension::Dim2D, 1024, 512, 12, 6, 1, pso::DxgiFormat::R16G16B16A16_FLOAT);
+    reg_tex(12, 0x0000'1000'0003'0000ull, GpuTextureDimension::Dim2D, 256, 256, 6, 1, 4, pso::DxgiFormat::R8G8B8A8_UNORM);
+    reg_tex(13, 0x0000'1000'0004'0000ull, GpuTextureDimension::Dim3D, 64, 32, 16, 4, 1, pso::DxgiFormat::R11G11B10_FLOAT);
+    reg_tex(14, 0x0000'1000'0005'0000ull, GpuTextureDimension::Dim2D, 128, 128, 18, 4, 1, pso::DxgiFormat::BC7_UNORM);
+    reg_tex(15, 0x0000'1000'0006'0000ull, GpuTextureDimension::Dim2D, 128, 128, 6, 4, 1, pso::DxgiFormat::R9G9B9E5_SHAREDEXP);
+
+    uint32_t words[8] = {};
+    d3d::ViewDescriptor back{};
+
+    // 1D & 1DArray
+    {
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.resource_id = 10;
+        v.dimension = d3d::ViewDimension::Texture1D;
+        v.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        v.first_mip = 1;
+        v.mip_levels = 3;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        CHECK(plausible_image(words) && decode_image(words).type == ImageType::Tex1D);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture1D && back.first_mip == 1 && back.mip_levels == 3 &&
+              back.first_array_slice == 0 && back.array_size == 1);
+
+        v.dimension = d3d::ViewDimension::Texture1DArray;
+        v.first_array_slice = 2;
+        v.array_size = 5;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        CHECK(decode_image(words).type == ImageType::Tex1DArray);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture1DArray && back.first_array_slice == 2 && back.array_size == 5);
+    }
+
+    // 2D, 2DArray, min_lod_clamp, and UAV single-mip round-trip
+    {
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.resource_id = 11;
+        v.dimension = d3d::ViewDimension::Texture2DArray;
+        v.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        v.first_mip = 2;
+        v.mip_levels = 4;
+        v.first_array_slice = 3;
+        v.array_size = 6;
+        v.min_lod_clamp = 1.5f;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        const ImageResource dec = decode_image(words);
+        CHECK(dec.type == ImageType::Tex2DArray && dec.base_level == 2 && dec.last_level == 5 && dec.max_mip == 5 &&
+              dec.base_array == 3 && dec.depth == 9 && dec.min_lod == lod_to_u4_8(1.5f));
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture2DArray && back.format == 10 && back.first_mip == 2 &&
+              back.mip_levels == 4 && back.first_array_slice == 3 && back.array_size == 6 && back.min_lod_clamp == 1.5f);
+
+        d3d::ViewDescriptor uav{};
+        uav.kind = d3d::DescriptorKind::Uav;
+        uav.resource_id = 11;
+        uav.dimension = d3d::ViewDimension::Texture2DArray;
+        uav.first_mip = 3;
+        uav.first_array_slice = 4;
+        uav.array_size = 2;
+        CHECK(bridge::view_words(device, uav, words) == bridge::WordsStatus::Ok);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Uav, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.kind == d3d::DescriptorKind::Uav && back.dimension == d3d::ViewDimension::Texture2DArray &&
+              back.first_mip == 3 && back.mip_levels == 1 && back.first_array_slice == 4 && back.array_size == 2);
+    }
+
+    // 2DMS & 2DMSArray (4x MSAA -> last_level = log2(4) = 2)
+    {
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.resource_id = 12;
+        v.dimension = d3d::ViewDimension::Texture2DMs;
+        v.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        const ImageResource ms = decode_image(words);
+        CHECK(ms.type == ImageType::Tex2DMsaa && ms.base_level == 0 && ms.last_level == 2 && ms.max_mip == 2);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture2DMs && back.first_mip == 0 && back.mip_levels == 1);
+
+        v.dimension = d3d::ViewDimension::Texture2DMsArray;
+        v.first_array_slice = 1;
+        v.array_size = 4;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        const ImageResource msa = decode_image(words);
+        CHECK(msa.type == ImageType::Tex2DMsaaArray && msa.base_array == 1 && msa.depth == 5 && msa.last_level == 2);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture2DMsArray && back.first_array_slice == 1 &&
+              back.array_size == 4 && back.first_mip == 0 && back.mip_levels == 1);
+    }
+
+    // 3D texture
+    {
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.resource_id = 13;
+        v.dimension = d3d::ViewDimension::Texture3D;
+        v.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        v.first_mip = 1;
+        v.mip_levels = 3;
+        CHECK(bridge::view_words(device, v, words) == bridge::WordsStatus::Ok);
+        const ImageResource d3 = decode_image(words);
+        CHECK(d3.type == ImageType::Tex3D && d3.width == 64 && d3.height == 32 && d3.depth == 16 &&
+              d3.base_level == 1 && d3.last_level == 3 && d3.format == 36);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::Texture3D && back.format == 26 && back.first_mip == 1 &&
+              back.mip_levels == 3 && back.array_size == 16);
+    }
+
+    // Cube (6 faces) and CubeArray (First2DArrayFace == 0 & > 0, NumCubes == 1, 2, unbounded)
+    {
+        d3d::ViewDescriptor cube{};
+        cube.kind = d3d::DescriptorKind::Srv;
+        cube.resource_id = 15;
+        cube.dimension = d3d::ViewDimension::TextureCube;
+        cube.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        cube.first_mip = 0;
+        cube.mip_levels = 4;
+        CHECK(bridge::view_words(device, cube, words) == bridge::WordsStatus::Ok);
+        const ImageResource ci = decode_image(words);
+        CHECK(ci.type == ImageType::Cube && ci.base_array == 0 && ci.depth == 6 && ci.format == 132);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::TextureCube && back.format == 67 && back.first_array_slice == 0 &&
+              back.array_size == 1 && back.mip_levels == 4);
+
+        // CubeArray with First2DArrayFace = 6, NumCubes = 1 (must stay TextureCubeArray, not collapse to TextureCube!)
+        d3d::ViewDescriptor ca{};
+        ca.kind = d3d::DescriptorKind::Srv;
+        ca.resource_id = 14;
+        ca.dimension = d3d::ViewDimension::TextureCubeArray;
+        ca.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        ca.first_mip = 1;
+        ca.mip_levels = 3;
+        ca.first_array_slice = 6;
+        ca.array_size = 1;
+        CHECK(bridge::view_words(device, ca, words) == bridge::WordsStatus::Ok);
+        const ImageResource ca1 = decode_image(words);
+        CHECK(ca1.type == ImageType::Cube && ca1.base_array == 6 && ca1.depth == 12);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::TextureCubeArray && back.format == 98 &&
+              back.first_array_slice == 6 && back.array_size == 1 && back.first_mip == 1 && back.mip_levels == 3);
+
+        // CubeArray with First2DArrayFace = 6, NumCubes = 2 (12 faces -> depth = 18)
+        ca.array_size = 2;
+        CHECK(bridge::view_words(device, ca, words) == bridge::WordsStatus::Ok);
+        CHECK(decode_image(words).base_array == 6 && decode_image(words).depth == 18);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::TextureCubeArray && back.first_array_slice == 6 && back.array_size == 2);
+
+        // CubeArray with First2DArrayFace = 0, NumCubes = 0xffffffff (all 3 cubes of the 18-layer texture)
+        ca.first_array_slice = 0;
+        ca.array_size = 0xffffffffu;
+        CHECK(bridge::view_words(device, ca, words) == bridge::WordsStatus::Ok);
+        CHECK(decode_image(words).base_array == 0 && decode_image(words).depth == 18);
+        CHECK(bridge::decode_view_words(device, words, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.dimension == d3d::ViewDimension::TextureCubeArray && back.first_array_slice == 0 && back.array_size == 3);
+    }
+
+    // image_words_at_address: 3D, CubeArray, error statuses
+    {
+        bridge::AddressTexture at;
+        at.dimension = 4;  // 3D
+        at.width = 32;
+        at.height = 32;
+        at.depth_or_array_size = 8;
+        at.mip_levels = 3;
+        at.format = 28;
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.dimension = d3d::ViewDimension::Texture3D;
+        v.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        v.mip_levels = 0xffffu;
+        CHECK(bridge::image_words_at_address(0x0000'2000'0000'0100ull, at, v, words) == bridge::WordsStatus::Ok);
+        const ImageResource dec = decode_image(words);
+        CHECK(dec.base == 0x0000'2000'0000'0100ull && dec.type == ImageType::Tex3D && dec.depth == 8 && dec.last_level == 2);
+        CHECK(bridge::image_words_at_address(0, at, v, words) == bridge::WordsStatus::NoAddress);
+        CHECK(bridge::image_words_at_address(0x10080ull, at, v, words) == bridge::WordsStatus::MisalignedAddress);
+        at.format = 100;  // unsupported video format
+        CHECK(bridge::image_words_at_address(0x10000ull, at, v, words) == bridge::WordsStatus::UnsupportedFormat);
+    }
+}
+
+// G83 (#1748 / #651): complete DXGI format encode/decode coverage across sRGB/typeless, UNORM/SNORM,
+// FLOAT/HDR, UINT/SINT, BC1-7, Depth/Stencil planes (including packed GFX10 IMG_FMT 142..146), and
+// custom SRV component mappings on BGRA / R8 / sRGB views.
+void test_g83_formats_depth_srgb_and_swizzles() {
+    namespace bridge = playgta6::gpu::bridge;
+    namespace pso = playgta6::gpu::pso;
+
+    // 1. Every concrete 3D shader format class round-trips through T# encode/decode.
+    const uint32_t kAllFormats[] = {
+        // FLOAT & HDR
+        2, 6, 10, 16, 26, 34, 41, 54, 67,
+        // UNORM / SNORM / sRGB / packed
+        11, 13, 24, 28, 29, 31, 35, 37, 49, 51, 56, 58, 61, 63, 65, 85, 86, 87, 88, 91, 93, 115,
+        // UINT / SINT (8/16/32-bit, 1/2/3/4-comp, R10G10B10A2_UINT)
+        3, 4, 7, 8, 12, 14, 17, 18, 25, 30, 32, 36, 38, 42, 43, 50, 52, 57, 59, 62, 64,
+        // BC1-BC7 (linear, sRGB, SNORM, HDR UF16/SF16)
+        71, 72, 74, 75, 77, 78, 80, 81, 83, 84, 95, 96, 98, 99,
+        // Depth / Stencil + Xbox D16S8
+        20, 21, 22, 40, 45, 46, 47, 55, 118, 119, 120,
+    };
+    for (const uint32_t dxgi : kAllFormats) {
+        HardwareFormat hf;
+        CHECK(hardware_format(dxgi, &hf));
+        ImageResource img;
+        img.base = 0x0000'0040'0001'0000ull;
+        img.format = hf.format;
+        img.dst_sel = hf.swizzle;
+        img.width = 16;
+        img.height = 16;
+        uint32_t w[8] = {};
+        encode(img, w);
+        CHECK(plausible_image(w) && classify_slot(w) == SlotContent::Image);
+        const ImageResource dec = decode_image(w);
+        bool exact = false;
+        const uint32_t back = dxgi_format(dec.format, dec.dst_sel, &exact);
+        CHECK(exact && back != 0);
+    }
+
+    // 2. Packed GFX10 depth/stencil IMG_FMTs 142..146 reverse-lookup cleanly.
+    bool exact = false;
+    CHECK(dxgi_format(142, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 47 && exact);
+    CHECK(dxgi_format(143, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 46 && exact);
+    CHECK(dxgi_format(144, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 47 && exact);
+    CHECK(dxgi_format(145, Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 22 && exact);
+    CHECK(dxgi_format(146, Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One}, &exact) == 21 && exact);
+
+    // 3. View-word decode over typeless sRGB textures and depth-stencil textures preserves exact view formats.
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps);
+    auto reg2d = [&](uint32_t id, uint64_t va, pso::DxgiFormat fmt) {
+        bridge::TextureInfo ti;
+        ti.format = fmt;
+        ti.width = 64;
+        ti.height = 64;
+        ti.mip_levels = 1;
+        ti.gpu_va = va;
+        device.register_texture(id, ti);
+    };
+    reg2d(20, 0x0000'3000'0001'0000ull, pso::DxgiFormat::R8G8B8A8_TYPELESS);
+    reg2d(21, 0x0000'3000'0002'0000ull, pso::DxgiFormat::B8G8R8A8_TYPELESS);
+    reg2d(22, 0x0000'3000'0003'0000ull, pso::DxgiFormat::BC7_TYPELESS);
+    reg2d(23, 0x0000'3000'0004'0000ull, pso::DxgiFormat::R24G8_TYPELESS);
+    reg2d(24, 0x0000'3000'0005'0000ull, pso::DxgiFormat::D32_FLOAT_S8X24_UINT);
+    reg2d(25, 0x0000'3000'0006'0000ull, pso::DxgiFormat::D16_UNORM_S8_UINT);
+    reg2d(26, 0x0000'3000'0007'0000ull, pso::DxgiFormat::B8G8R8A8_UNORM);
+    reg2d(27, 0x0000'3000'0008'0000ull, pso::DxgiFormat::R8_UNORM);
+
+    uint32_t w[8] = {};
+    d3d::ViewDescriptor back{};
+    auto check_view_fmt = [&](uint32_t id, uint32_t req_fmt, uint32_t expected_fmt,
+                              uint32_t mapping = d3d::kDefaultShader4ComponentMapping) {
+        d3d::ViewDescriptor v{};
+        v.kind = d3d::DescriptorKind::Srv;
+        v.resource_id = id;
+        v.dimension = d3d::ViewDimension::Texture2D;
+        v.format = req_fmt;
+        v.component_mapping = mapping;
+        CHECK(bridge::view_words(device, v, w) == bridge::WordsStatus::Ok);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.format == expected_fmt && back.component_mapping == mapping);
+    };
+    // Typeless sRGB & linear views
+    check_view_fmt(20, 29, 29);  // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM_SRGB
+    check_view_fmt(20, 28, 28);  // R8G8B8A8_TYPELESS -> R8G8B8A8_UNORM
+    check_view_fmt(21, 91, 91);  // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM_SRGB
+    check_view_fmt(21, 87, 87);  // B8G8R8A8_TYPELESS -> B8G8R8A8_UNORM
+    check_view_fmt(22, 99, 99);  // BC7_TYPELESS -> BC7_UNORM_SRGB
+    check_view_fmt(22, 98, 98);  // BC7_TYPELESS -> BC7_UNORM
+    // Depth & stencil plane views
+    check_view_fmt(23, 46, 46);   // R24G8_TYPELESS -> R24_UNORM_X8_TYPELESS (depth)
+    check_view_fmt(23, 47, 47);   // R24G8_TYPELESS -> X24_TYPELESS_G8_UINT (stencil)
+    check_view_fmt(24, 21, 21);   // D32_FLOAT_S8X24_UINT -> R32_FLOAT_X8X24_TYPELESS (depth)
+    check_view_fmt(24, 22, 22);   // D32_FLOAT_S8X24_UINT -> X32_TYPELESS_G8X24_UINT (stencil)
+    check_view_fmt(25, 119, 119); // D16_UNORM_S8_UINT -> R16_UNORM_X8_TYPELESS (depth)
+    check_view_fmt(25, 120, 120); // D16_UNORM_S8_UINT -> X16_TYPELESS_G8_UINT (stencil)
+
+    // Custom SRV swizzles that collide with another DXGI format entry still round-trip accurately!
+    const uint32_t kRgb1 = 0u | (1u << 3) | (2u << 6) | (5u << 9) | (1u << 12);  // (R, G, B, 1)
+    const uint32_t kBgra = 2u | (1u << 3) | (0u << 6) | (3u << 9) | (1u << 12);  // (B, G, R, A)
+    const uint32_t k000R = 4u | (4u << 3) | (4u << 6) | (0u << 9) | (1u << 12);  // (0, 0, 0, R)
+    check_view_fmt(26, 87, 87, kRgb1);  // B8G8R8A8_UNORM with (R, G, B, 1) (collides with BGRX8 swizzle)
+    check_view_fmt(26, 91, 91, kRgb1);  // B8G8R8A8_UNORM_SRGB with (R, G, B, 1)
+    check_view_fmt(26, 87, 87, kBgra);  // B8G8R8A8_UNORM with (B, G, R, A) (collides with RGBA8 swizzle)
+    check_view_fmt(27, 61, 61, k000R);  // R8_UNORM with (0, 0, 0, R) (collides with A8_UNORM swizzle)
+
+    // Raw packed IMG_FMT 142 (8_24_UINT stencil) & 146 (X24_8_32_FLOAT depth) decode cleanly via decode_view_words.
+    ImageResource packed_stencil;
+    packed_stencil.base = 0x0000'3000'0004'0000ull;  // texture 23 (R24G8_TYPELESS)
+    packed_stencil.format = 142;
+    packed_stencil.dst_sel = Swizzle{Sel::Y, Sel::Zero, Sel::Zero, Sel::One};
+    encode(packed_stencil, w);
+    CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+    CHECK(back.resource_id == 23 && back.format == 47 && back.component_mapping == d3d::kDefaultShader4ComponentMapping);
+
+    ImageResource packed_depth;
+    packed_depth.base = 0x0000'3000'0005'0000ull;  // texture 24 (D32_FLOAT_S8X24_UINT)
+    packed_depth.format = 146;
+    packed_depth.dst_sel = Swizzle{Sel::X, Sel::Zero, Sel::Zero, Sel::One};
+    encode(packed_depth, w);
+    CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+    CHECK(back.resource_id == 24 && back.format == 21 && back.component_mapping == d3d::kDefaultShader4ComponentMapping);
+}
+
+// G83 (#1748 / #651): complete V# (CBV, raw, structured, typed, 48-bit VAs, OOB modes) and
+// S# (plausible_sampler, comparison funcs, aniso point/linear mip, border colors, LODs) coverage.
+void test_g83_buffers_and_samplers() {
+    namespace bridge = playgta6::gpu::bridge;
+    d3d::DescriptorHeapRegistry heaps;
+    bridge::StateBridgeDevice device(heaps);
+
+    const uint64_t kHighVa = 0x0000'7abc'1234'0000ull;  // 48-bit GPU VA
+    device.register_buffer(100, kHighVa, 4096);
+
+    uint32_t w[8] = {};
+    d3d::ViewDescriptor back{};
+
+    // CBV with 48-bit VA
+    {
+        d3d::ViewDescriptor cbv{};
+        cbv.kind = d3d::DescriptorKind::Cbv;
+        cbv.first_element_or_address = kHighVa + 0x100;
+        cbv.num_elements_or_size = 240;  // 15 * 16
+        CHECK(bridge::view_words(device, cbv, w) == bridge::WordsStatus::Ok);
+        CHECK(plausible_buffer(w) && classify_slot(w) == SlotContent::Buffer);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Cbv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.first_element_or_address == kHighVa + 0x100 && back.num_elements_or_size == 240);
+    }
+
+    // Raw buffer SRV & UAV (Oob::Complete)
+    {
+        d3d::ViewDescriptor raw{};
+        raw.kind = d3d::DescriptorKind::Srv;
+        raw.resource_id = 100;
+        raw.dimension = d3d::ViewDimension::Buffer;
+        raw.flags = d3d::BufferViewFlags::Raw;
+        raw.first_element_or_address = 16;  // 64 bytes
+        raw.num_elements_or_size = 32;      // 128 bytes
+        CHECK(bridge::view_words(device, raw, w) == bridge::WordsStatus::Ok);
+        const BufferResource b = decode_buffer(w);
+        CHECK(b.base == kHighVa + 64 && b.stride == 0 && b.num_records == 128 && b.oob_select == Oob::Complete);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.resource_id == 100 && back.first_element_or_address == 64 && back.num_elements_or_size == 128);
+    }
+
+    // Structured buffer UAV (Oob::IndexAndOffset)
+    {
+        d3d::ViewDescriptor st{};
+        st.kind = d3d::DescriptorKind::Uav;
+        st.resource_id = 100;
+        st.dimension = d3d::ViewDimension::Buffer;
+        st.structure_byte_stride = 48;
+        st.first_element_or_address = 5;   // 240 bytes
+        st.num_elements_or_size = 10;      // 480 bytes
+        CHECK(bridge::view_words(device, st, w) == bridge::WordsStatus::Ok);
+        const BufferResource b = decode_buffer(w);
+        CHECK(b.base == kHighVa + 240 && b.stride == 48 && b.num_records == 10 && b.oob_select == Oob::IndexAndOffset);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Uav, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.kind == d3d::DescriptorKind::Uav && back.first_element_or_address == 240 &&
+              back.num_elements_or_size == 480);
+    }
+
+    // Typed buffer SRV (R16G16B16A16_FLOAT = 8 bytes/elem) + unsupported sRGB typed buffer rejection
+    {
+        d3d::ViewDescriptor tb{};
+        tb.kind = d3d::DescriptorKind::Srv;
+        tb.resource_id = 100;
+        tb.dimension = d3d::ViewDimension::Buffer;
+        tb.format = 10;  // R16G16B16A16_FLOAT
+        tb.component_mapping = d3d::kDefaultShader4ComponentMapping;
+        tb.first_element_or_address = 8;   // 64 bytes
+        tb.num_elements_or_size = 16;      // 128 bytes
+        CHECK(bridge::view_words(device, tb, w) == bridge::WordsStatus::Ok);
+        const BufferResource b = decode_buffer(w);
+        CHECK(b.base == kHighVa + 64 && b.stride == 8 && b.num_records == 16 && b.format == 71);
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        CHECK(back.first_element_or_address == 64 && back.num_elements_or_size == 128);
+
+        tb.format = 29;  // R8G8B8A8_UNORM_SRGB: image-only, not a typed buffer format
+        CHECK(bridge::buffer_words_at_address(kHighVa, tb, w) == bridge::WordsStatus::UnsupportedFormat);
+    }
+
+    // Oob::IndexOnly & Oob::NumRecords0 decode byte window as num_records * stride; Oob::Complete uses num_records bytes.
+    for (const uint32_t oob : {Oob::IndexAndOffset, Oob::IndexOnly, Oob::NumRecords0, Oob::Complete}) {
+        BufferResource b;
+        b.base = kHighVa + 128;
+        b.stride = 16;
+        b.num_records = 32;
+        b.format = Fmt::F32;
+        b.oob_select = oob;
+        std::memset(w, 0, sizeof(w));
+        encode(b, w);
+        CHECK(plausible_buffer(w));
+        CHECK(bridge::decode_view_words(device, w, d3d::DescriptorRangeType::Srv, &back) == bridge::DecodeStatus::Ok);
+        const uint32_t expected_bytes = oob == Oob::Complete ? 32u : 32u * 16u;
+        CHECK(back.first_element_or_address == 128 && back.num_elements_or_size == expected_bytes);
+    }
+
+    // Buffer plausibility rejection: reserved bits 19..20, 25..27, invalid sel 2.
+    {
+        BufferResource b;
+        b.format = Fmt::F32;
+        encode(b, w);
+        CHECK(plausible_buffer(w));
+        w[3] |= 1u << 19;
+        CHECK(!plausible_buffer(w));
+        encode(b, w);
+        w[3] |= 1u << 25;
+        CHECK(!plausible_buffer(w));
+        b.dst_sel[0] = 2;  // not in SQ_SEL_XYZW01
+        encode(b, w);
+        CHECK(!plausible_buffer(w));
+    }
+
+    // Sampler round-trips: comparison funcs 2..8, anisotropic point/linear mip, border colors, plausibility.
+    for (uint32_t cmp = 2; cmp <= 8; ++cmp) {
+        d3d::SamplerDesc sd;
+        sd.filter = 0x80u | 0x15u;
+        sd.comparison_func = cmp;
+        sd.address_u = 2;  // MIRROR
+        sd.address_v = 3;  // CLAMP
+        sd.address_w = 4;  // BORDER
+        sd.border_color[3] = 1.0f;  // opaque black
+        sd.min_lod = 1.25f;
+        sd.max_lod = 10.5f;
+        sd.mip_lod_bias = -2.25f;
+        uint32_t sw[4] = {};
+        bridge::sampler_words(sd, sw);
+        CHECK(plausible_sampler(sw));
+        d3d::SamplerDesc dec;
+        CHECK(bridge::decode_sampler_words(sw, &dec) == bridge::DecodeStatus::Ok);
+        CHECK(dec.filter == sd.filter && dec.comparison_func == cmp && dec.address_u == 2 && dec.address_v == 3 &&
+              dec.address_w == 4 && dec.border_color[3] == 1.0f && dec.min_lod == 1.25f && dec.max_lod == 10.5f &&
+              dec.mip_lod_bias == -2.25f);
+    }
+    // Anisotropic with linear mip (0x55), point mip (0x54), and comparison aniso (0xd5), max_anisotropy 1..16.
+    for (const uint32_t aniso_filter : {0x54u, 0x55u, 0xd5u, 0x155u, 0x1d5u}) {
+        for (const uint32_t max_a : {1u, 2u, 4u, 8u, 16u}) {
+            d3d::SamplerDesc sd;
+            sd.filter = aniso_filter;
+            sd.max_anisotropy = max_a;
+            sd.comparison_func = (aniso_filter & 0x180u) == 0x80u ? 2u : 0u;
+            uint32_t sw[4] = {};
+            bridge::sampler_words(sd, sw);
+            CHECK(plausible_sampler(sw));
+            d3d::SamplerDesc dec;
+            CHECK(bridge::decode_sampler_words(sw, &dec) == bridge::DecodeStatus::Ok);
+            CHECK(dec.filter == aniso_filter && dec.max_anisotropy == max_a);
+        }
+    }
+    // Sampler plausibility failures & Zero status.
+    {
+        uint32_t zero[4] = {};
+        d3d::SamplerDesc dec;
+        CHECK(bridge::decode_sampler_words(zero, &dec) == bridge::DecodeStatus::Zero);
+        uint32_t bad[4] = {0, 0, 0, 0x1000u};  // reserved bit 12 in dword 3
+        CHECK(!plausible_sampler(bad) && bridge::decode_sampler_words(bad, &dec) == bridge::DecodeStatus::NotDescriptor);
+        SamplerState s;
+        s.max_aniso_ratio = 5;  // out of range (> 4)
+        encode(s, bad);
+        CHECK(!plausible_sampler(bad) && bridge::decode_sampler_words(bad, &dec) == bridge::DecodeStatus::NotDescriptor);
+        s = SamplerState{};
+        s.filter_mode = 3;  // out of range (> 2)
+        encode(s, bad);
+        CHECK(!plausible_sampler(bad) && bridge::decode_sampler_words(bad, &dec) == bridge::DecodeStatus::NotDescriptor);
+        s = SamplerState{};
+        s.z_filter = 3;  // out of range (> 2)
+        encode(s, bad);
+        CHECK(!plausible_sampler(bad) && bridge::decode_sampler_words(bad, &dec) == bridge::DecodeStatus::NotDescriptor);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -666,6 +1165,9 @@ int main() {
     test_component_mapping();
     test_samplers();
     test_bgra8_uav_storage_usage();
+    test_g83_3d_view_dimensions();
+    test_g83_formats_depth_srgb_and_swizzles();
+    test_g83_buffers_and_samplers();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_gfx10_descriptors failed with %d failure(s)\n", g_failures);
         return 1;
