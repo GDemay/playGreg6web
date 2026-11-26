@@ -2153,3 +2153,479 @@ fn r70_3d_fp_fma_f16c_wasm64_codegen_and_execution() {
         }
     }
 }
+
+#[test]
+fn wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_exec() {
+    if !exec_or_skip("wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_exec") {
+        return;
+    }
+    use super::exec::{DATA_ADDR, R8, R9, R10};
+    use crate::lift::STATE_YMM_HI_OFFSET;
+    use crate::lift::target::LiftTarget;
+
+    const YMMH_STATE: u64 = STATE_ADDR + STATE_YMM_HI_OFFSET;
+
+    let f32s = |vals: [f32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let u32s = |vals: [u32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let i32s = |vals: [i32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f64s = |vals: [f64; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let u16s = |vals: [u16; 8]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let u64s = |vals: [u64; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let i64s = |vals: [i64; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    let f_bitmask = CODE_BASE;
+    let f_psadbw = CODE_BASE + 0x100;
+    let f_vtest = CODE_BASE + 0x200;
+    let f_vpmov = CODE_BASE + 0x300;
+    let f_dyn_shift = CODE_BASE + 0x400;
+    let f_idioms = CODE_BASE + 0x500;
+    let f_vmaskmov = CODE_BASE + 0x600;
+    let f_aes = CODE_BASE + 0x700;
+    let f_comis = CODE_BASE + 0x800;
+
+    let prog = Program::new()
+        .asm(f_bitmask, |a| {
+            a.movmskps(eax, xmm0)?;
+            a.vmovmskps(ecx, ymm0)?;
+            a.movmskpd(edx, xmm1)?;
+            a.vmovmskpd(r8, ymm1)?;
+            a.pmovmskb(r9d, xmm2)?;
+            a.vpmovmskb(r10, ymm2)?;
+            a.ret()
+        })
+        .asm(f_psadbw, |a| {
+            a.vpsadbw(ymm0, ymm1, ymm2)?;
+            a.psadbw(xmm3, xmm3)?;
+            a.ret()
+        })
+        .asm(f_vtest, |a| {
+            // Test ZF-only (`vtestps` + `sete`) and CF-only (`vtestpd` + `setb`) and both.
+            a.vtestps(ymm0, ymm1)?;
+            a.sete(al)?;
+            a.movzx(eax, al)?;
+            a.vtestpd(ymm2, ymm3)?;
+            a.setb(cl)?;
+            a.movzx(ecx, cl)?;
+            a.vtestps(xmm4, xmm5)?;
+            a.sete(dl)?;
+            a.setb(r8b)?;
+            a.movzx(edx, dl)?;
+            a.movzx(r8d, r8b)?;
+            a.ret()
+        })
+        .asm(f_vpmov, |a| {
+            a.vpmovsxbd(ymm0, qword_ptr(rcx))?;
+            a.vpmovzxbd(ymm1, xmm2)?;
+            a.vpmovsxbq(ymm3, dword_ptr(rdx))?;
+            a.vpmovzxbq(ymm4, xmm2)?;
+            a.vpmovsxwq(ymm5, qword_ptr(r8))?;
+            a.vpmovzxwq(ymm6, xmm7)?;
+            a.ret()
+        })
+        .asm(f_dyn_shift, |a| {
+            a.psllw(xmm0, xmm3)?;
+            a.psrld(xmm1, xmm4)?;
+            a.psrlq(xmm2, xmm5)?;
+            a.ret()
+        })
+        .asm(f_idioms, |a| {
+            a.pcmpeqd(xmm0, xmm0)?;
+            a.vpcmpeqb(xmm1, xmm1, xmm1)?; // VEX-128 must also zero ymmh1
+            a.pcmpgtw(xmm2, xmm2)?;
+            a.psubd(xmm3, xmm3)?;
+            a.psubsw(xmm4, xmm4)?;
+            a.pminsd(xmm5, xmm5)?;
+            a.pavgb(xmm6, xmm6)?;
+            a.vinsertps(xmm7, xmm8, xmm9, 0xCE)?; // lane 3 of xmm9 -> lane 0, zero lanes 1..3 + ymmh7
+            a.vinsertps(xmm10, xmm11, dword_ptr(rcx), 0x1D)?; // [rcx] -> lane 1, zero lanes 0,2,3 + ymmh10
+            a.ret()
+        })
+        .asm(f_vmaskmov, |a| {
+            // 1. Store selected lanes to [rdx]
+            a.vpmaskmovq(ymmword_ptr(rdx), ymm2, ymm3)?;
+            // 2. Load with aliasing dst == mask (ymm1) from [rcx]
+            a.vmaskmovps(ymm1, ymm1, ymmword_ptr(rcx))?;
+            // 3. All-zero mask at null address (0) must NOT fault!
+            a.vxorps(ymm4, ymm4, ymm4)?;
+            a.vmaskmovps(ymm5, ymm4, ymmword_ptr(r8))?;
+            a.ret()
+        })
+        .asm(f_aes, |a| {
+            a.aesenc(xmm0, xmm1)?;
+            a.aesdec(xmm2, xmm3)?;
+            a.aeskeygenassist(xmm4, xmm5, 0x01)?;
+            a.ret()
+        })
+        .asm(f_comis, |a| {
+            // Test fused `ja` terminator on `ucomisd xmm2, xmm3` -> rdx, and all 16 fused `setcc`
+            // predicates on `ucomiss xmm0, xmm1` -> [r9 + 0..16] (memory stores do not alter flags).
+            let mut gt_lbl = a.create_label();
+            let mut done_lbl = a.create_label();
+            a.ucomisd(xmm2, xmm3)?;
+            a.ja(gt_lbl)?;
+            a.mov(edx, 0)?;
+            a.jmp(done_lbl)?;
+            a.set_label(&mut gt_lbl)?;
+            a.mov(edx, 1)?;
+            a.set_label(&mut done_lbl)?;
+            a.ucomiss(xmm0, xmm1)?;
+            a.seto(byte_ptr(r9))?;
+            a.setno(byte_ptr(r9 + 1))?;
+            a.setb(byte_ptr(r9 + 2))?;
+            a.setae(byte_ptr(r9 + 3))?;
+            a.sete(byte_ptr(r9 + 4))?;
+            a.setne(byte_ptr(r9 + 5))?;
+            a.setbe(byte_ptr(r9 + 6))?;
+            a.seta(byte_ptr(r9 + 7))?;
+            a.sets(byte_ptr(r9 + 8))?;
+            a.setns(byte_ptr(r9 + 9))?;
+            a.setp(byte_ptr(r9 + 10))?;
+            a.setnp(byte_ptr(r9 + 11))?;
+            a.setl(byte_ptr(r9 + 12))?;
+            a.setge(byte_ptr(r9 + 13))?;
+            a.setle(byte_ptr(r9 + 14))?;
+            a.setg(byte_ptr(r9 + 15))?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    // Verify BOTH Wasm64 SIMD128 codegen (native bitmask / extadd_pairwise / load8x8) AND
+    // native x86-64-v3 retargeting compile cleanly with llc.
+    use crate::lift::compile::{LlvmTool, find_llvm_tool};
+    if let Some(LlvmTool::Llc { llc, opt }) = find_llvm_tool() {
+        let m = lift_module(functions.values()).expect("lift module");
+        let dir = std::env::temp_dir().join(format!("playgta6_simd_opt_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let wll = dir.join("simd_opt_wasm.ll");
+        let wbc = dir.join("simd_opt_wasm.bc");
+        let wasm_s = dir.join("simd_opt_wasm.s");
+        std::fs::write(&wll, &m.ir).expect("write wasm ll");
+        let w_input = if let Some(opt_bin) = &opt {
+            let st = std::process::Command::new(opt_bin)
+                .args(["-O2"])
+                .arg(&wll)
+                .arg("-o")
+                .arg(&wbc)
+                .status()
+                .expect("run opt");
+            assert!(st.success(), "opt -O2 failed on wasm IR");
+            &wbc
+        } else {
+            &wll
+        };
+        let st = std::process::Command::new(&llc)
+            .args(["-mtriple=wasm64-unknown-unknown", "-O2", "-filetype=asm"])
+            .arg(w_input)
+            .arg("-o")
+            .arg(&wasm_s)
+            .status()
+            .expect("run llc wasm64");
+        assert!(st.success(), "llc wasm64 failed");
+        let wasm_asm = std::fs::read_to_string(&wasm_s).expect("read wasm asm");
+        assert!(wasm_asm.contains("i32x4.bitmask"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i64x2.bitmask"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i8x16.bitmask"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i16x8.extadd_pairwise_i8x16_u"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i32x4.extadd_pairwise_i16x8_u"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i16x8.load8x8_s"), "{wasm_asm}");
+        assert!(wasm_asm.contains("i32x4.load16x4_s"), "{wasm_asm}");
+
+        let native_ir = LiftTarget::parse("native:x86_64-pc-windows-msvc", Some("x86-64-v3"))
+            .expect("native target")
+            .retarget(m.ir);
+        let nll = dir.join("simd_opt_x86.ll");
+        let nasm = dir.join("simd_opt_x86.s");
+        std::fs::write(&nll, &native_ir).expect("write native ll");
+        let st = std::process::Command::new(&llc)
+            .args([
+                "-mtriple=x86_64-pc-windows-msvc",
+                "-mcpu=x86-64-v3",
+                "-O2",
+                "-filetype=asm",
+            ])
+            .arg(&nll)
+            .arg("-o")
+            .arg(&nasm)
+            .status()
+            .expect("run llc native");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(st.success(), "llc native x86-64-v3 failed on retargeted IR");
+    }
+    let built = build("simd128_opt", functions.values());
+    let data = DATA_ADDR;
+
+    // Case 0: bitmask (128 & 256)
+    let mut c0 = Case::new(f_bitmask);
+    let mut s0 = vec![0u8; 3 * 16];
+    let mut h0 = vec![0u8; 3 * 16];
+    // ymm0 (f32): lo = [-0.0, +0.0, -NaN, +NaN] => mask 0b0101 = 5; hi = [+1, -1, -2, +3] => 0b0110 = 6 => 256-bit 0x65
+    s0[0..16].copy_from_slice(&u32s([0x8000_0000, 0x0000_0000, 0xFFC0_0001, 0x7FC0_0001]));
+    h0[0..16].copy_from_slice(&f32s([1.0, -1.0, -2.0, 3.0]));
+    // ymm1 (f64): lo = [-0.0, +1.0] => 0b01 = 1; hi = [+0.0, -Inf] => 0b10 = 2 => 256-bit 0b1001 = 9
+    s0[16..32].copy_from_slice(&f64s([-0.0, 1.0]));
+    h0[16..32].copy_from_slice(&f64s([0.0, f64::NEG_INFINITY]));
+    // ymm2 (i8): lo = alternating 0x80/0x7F => 0x5555; hi = all 0xFF except byte 15=0x00 => 0x7FFF => 256-bit 0x7FFF5555
+    let lo_b: [u8; 16] = std::array::from_fn(|i| if i % 2 == 0 { 0x80 } else { 0x7F });
+    let mut hi_b = [0xFFu8; 16];
+    hi_b[15] = 0x00;
+    s0[32..48].copy_from_slice(&lo_b);
+    h0[32..48].copy_from_slice(&hi_b);
+    c0.mem.push((XMM_STATE, s0));
+    c0.mem.push((YMMH_STATE, h0));
+
+    // Case 1: psadbw / vpsadbw
+    let mut c1 = Case::new(f_psadbw);
+    let mut s1 = vec![0u8; 4 * 16];
+    let mut h1 = vec![0u8; 4 * 16];
+    s1[16..32].copy_from_slice(&[0u8; 16]);
+    s1[32..48].copy_from_slice(&[255u8; 16]); // |0-255|*8 = 2040 per qword
+    h1[16..32].copy_from_slice(&[10, 20, 30, 40, 50, 60, 70, 80, 1, 2, 3, 4, 5, 6, 7, 8]);
+    h1[32..48].copy_from_slice(&[12, 15, 30, 45, 40, 70, 70, 79, 1, 2, 3, 4, 5, 6, 7, 10]);
+    // diffs hi lo-qword: 2+5+0+5+10+10+0+1 = 33; hi-qword: 0*7 + 2 = 2
+    s1[48..64].copy_from_slice(&[0xABu8; 16]); // xmm3 non-zero before `psadbw xmm3, xmm3`
+    c1.mem.push((XMM_STATE, s1));
+    c1.mem.push((YMMH_STATE, h1));
+    c1.read.push((XMM_STATE, 16));
+    c1.read.push((YMMH_STATE, 16));
+    c1.read.push((XMM_STATE + 48, 16));
+
+    // Case 2: vtestps / vtestpd
+    let mut c2 = Case::new(f_vtest);
+    let mut s2 = vec![0u8; 6 * 16];
+    let mut h2 = vec![0u8; 6 * 16];
+    // ymm0 & ymm1 sign bits disjoint (even though non-sign bits overlap) -> ZF = 1
+    s2[0..16].copy_from_slice(&u32s([0x8000_0001, 0x0000_0001, 0x7FFF_FFFF, 0x0000_0000]));
+    s2[16..32].copy_from_slice(&u32s([0x7FFF_FFFF, 0x8000_0001, 0x8000_0000, 0x8000_0000]));
+    // ymm2 & ymm3: upper half has !a & b sign bit set -> CF = 0
+    h2[32..48].copy_from_slice(&u64s([0, 0]));
+    h2[48..64].copy_from_slice(&u64s([0, 0x8000_0000_0000_0000]));
+    // xmm4 = all sign bits set, xmm5 = one sign bit set -> (a & b) != 0 (ZF=0), (!a & b) == 0 (CF=1)
+    s2[64..80].copy_from_slice(&u32s([0x8000_0000; 4]));
+    s2[80..96].copy_from_slice(&u32s([0, 0x8000_0000, 0, 0]));
+    c2.mem.push((XMM_STATE, s2));
+    c2.mem.push((YMMH_STATE, h2));
+
+    // Case 3: 256-bit vpmovsx*/vpmovzx*
+    let mut c3 = Case::new(f_vpmov);
+    c3 = c3.reg(RCX, data).reg(RDX, data + 16).reg(R8, data + 32);
+    c3.mem.push((data, vec![0x80, 0xFF, 0x00, 0x7F, 0x81, 0xFE, 0x01, 0x7E]));
+    c3.mem.push((data + 16, vec![0x80, 0xFF, 0x00, 0x7F]));
+    let w4: [i16; 4] = [i16::MIN, -1, 0, i16::MAX];
+    let mut w4_bytes = Vec::new();
+    for x in w4 {
+        w4_bytes.extend_from_slice(&x.to_le_bytes());
+    }
+    c3.mem.push((data + 32, w4_bytes));
+    let mut s3 = vec![0u8; 8 * 16];
+    s3[32..40].copy_from_slice(&[0x80, 0xFF, 0x00, 0x7F, 0x81, 0xFE, 0x01, 0x7E]); // xmm2
+    s3[112..120].copy_from_slice(&[0x00, 0x80, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0x7F]); // xmm7
+    c3.mem.push((XMM_STATE, s3));
+    for reg in [0usize, 1, 3, 4, 5, 6] {
+        c3.read.push((XMM_STATE + (reg * 16) as u64, 16));
+        c3.read.push((YMMH_STATE + (reg * 16) as u64, 16));
+    }
+
+    // Case 4 & 5: dynamic psllw/psrld/psrlq (in-range + overshift)
+    let make_shift = |cnt_w: u64, cnt_d: u64, cnt_q: u64| {
+        let mut c = Case::new(f_dyn_shift);
+        let mut s = vec![0u8; 6 * 16];
+        s[0..16].copy_from_slice(&u16s([1, 2, 0x8001, 0xFFFF, 0x1234, 0x5678, 0x9ABC, 0xDEF0]));
+        s[16..32].copy_from_slice(&u32s([0x8000_0001, 0xFFFF_FFFF, 0x1234_5678, 0]));
+        s[32..48].copy_from_slice(&u64s([0x8000_0000_0000_0001, 0xFEDC_BA98_7654_3210]));
+        s[48..64].copy_from_slice(&u64s([cnt_w, 0xDEAD_BEEF]));
+        s[64..80].copy_from_slice(&u64s([cnt_d, 0xCAFE_BABE]));
+        s[80..96].copy_from_slice(&u64s([cnt_q, 0x1234_5678]));
+        c.mem.push((XMM_STATE, s));
+        c.read.push((XMM_STATE, 48));
+        c
+    };
+    let c4 = make_shift(3, 4, 8);
+    let c5 = make_shift(16, 32, 64);
+
+    // Case 6: same-reg idioms + insertps + VEX upper-128-bit zeroing
+    let mut c6 = Case::new(f_idioms).reg(RCX, data + 64);
+    c6.mem.push((data + 64, 0x1122_3344u32.to_le_bytes().to_vec()));
+    let mut s6 = vec![0x55u8; 12 * 16];
+    let h6 = vec![0xEEu8; 12 * 16];
+    s6[5 * 16..6 * 16].copy_from_slice(&i32s([-10, 0, 42, i32::MAX]));
+    s6[6 * 16..7 * 16].copy_from_slice(&[0, 1, 127, 128, 254, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]);
+    s6[9 * 16..10 * 16].copy_from_slice(&u32s([0xAA, 0xBB, 0xCC, 0xDEAD_BEEF]));
+    c6.mem.push((XMM_STATE, s6));
+    c6.mem.push((YMMH_STATE, h6));
+    for reg in [0usize, 1, 2, 3, 4, 5, 6, 7, 10] {
+        c6.read.push((XMM_STATE + (reg * 16) as u64, 16));
+    }
+    c6.read.push((YMMH_STATE + 16, 16)); // ymmh1 zeroed by vpcmpeqb
+    c6.read.push((YMMH_STATE + 7 * 16, 16)); // ymmh7 zeroed by vinsertps
+    c6.read.push((YMMH_STATE + 10 * 16, 16)); // ymmh10 zeroed by vinsertps
+
+    // Case 7: vmaskmovps (dst==mask + null ptr with zero mask) & vpmaskmovq store
+    let mut c7 = Case::new(f_vmaskmov)
+        .reg(RCX, data + 0x100)
+        .reg(RDX, data + 0x140)
+        .reg(R8, 0x7FFF_0000_0000); // unmapped address for all-zero masked load (must not trap!)
+    c7.mem.push((data + 0x100, u32s([10, 20, 30, 40]).into_iter().chain(u32s([50, 60, 70, 80])).collect()));
+    c7.mem.push((data + 0x140, vec![0x77u8; 32]));
+    let mut s7 = vec![0u8; 6 * 16];
+    let mut h7 = vec![0u8; 6 * 16];
+    // ymm1 mask (and dst!): lo = [neg, pos, neg, pos], hi = [pos, neg, pos, neg]
+    s7[16..32].copy_from_slice(&u32s([0x8000_0000, 0x7FFF_FFFF, 0xFFFF_FFFF, 0]));
+    h7[16..32].copy_from_slice(&u32s([0, 0x8000_0000, 0x1234_5678, 0x8000_0001]));
+    // ymm2 mask for vpmaskmovq store: lo = [neg, pos], hi = [pos, neg]
+    s7[32..48].copy_from_slice(&u64s([0x8000_0000_0000_0000, 0]));
+    h7[32..48].copy_from_slice(&u64s([0x7FFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF]));
+    // ymm3 store data
+    s7[48..64].copy_from_slice(&u64s([0x1111_2222_3333_4444, 0x5555_6666_7777_8888]));
+    h7[48..64].copy_from_slice(&u64s([0x9999_AAAA_BBBB_CCCC, 0xDDDD_EEEE_FFFF_0000]));
+    c7.mem.push((XMM_STATE, s7));
+    c7.mem.push((YMMH_STATE, h7));
+    c7.read.push((XMM_STATE + 16, 16));
+    c7.read.push((YMMH_STATE + 16, 16));
+    c7.read.push((XMM_STATE + 5 * 16, 16));
+    c7.read.push((YMMH_STATE + 5 * 16, 16));
+    c7.read.push((data + 0x140, 32));
+
+    // Case 8: AES outlined sub_bytes (FIPS-197 zero state/key sanity)
+    let mut c8 = Case::new(f_aes);
+    let mut s8 = vec![0u8; 6 * 16];
+    s8[0..16].copy_from_slice(&[0u8; 16]);
+    s8[16..32].copy_from_slice(&[0u8; 16]);
+    s8[32..48].copy_from_slice(&[0x63u8; 16]); // InvSubBytes(0x63) = 0x00 -> InvMixColumns(0) = 0
+    s8[48..64].copy_from_slice(&[0u8; 16]);
+    s8[80..96].copy_from_slice(&[0u8; 16]); // SubBytes(0) = 0x63; rcon = 0x01 on dwords 1,3
+    c8.mem.push((XMM_STATE, s8));
+    c8.read.push((XMM_STATE, 16));
+    c8.read.push((XMM_STATE + 32, 16));
+    c8.read.push((XMM_STATE + 64, 16));
+
+    // Cases 9..13: `ucomiss`/`ucomisd` fused across all 16 CCs: `<`, `==`, `-0.0 == +0.0`, `>`, `NaN`
+    let make_comis = |a: f32, b: f32, da: f64, db: f64, out_addr: u64| {
+        let mut c = Case::new(f_comis).reg(R9, out_addr);
+        let mut s = vec![0u8; 4 * 16];
+        s[0..16].copy_from_slice(&f32s([a, 0.0, 0.0, 0.0]));
+        s[16..32].copy_from_slice(&f32s([b, 0.0, 0.0, 0.0]));
+        s[32..48].copy_from_slice(&f64s([da, 0.0]));
+        s[48..64].copy_from_slice(&f64s([db, 0.0]));
+        c.mem.push((XMM_STATE, s));
+        c.read.push((out_addr, 16));
+        c
+    };
+    let c9 = make_comis(1.0, 2.0, 1.0, 2.0, data + 0x200); // less
+    let c10 = make_comis(2.0, 2.0, 2.0, 2.0, data + 0x220); // equal
+    let c11 = make_comis(-0.0, 0.0, 3.0, 2.0, data + 0x240); // -0.0 == +0.0 (f32), greater (f64)
+    let c12 = make_comis(3.0, 2.0, f64::NAN, 1.0, data + 0x260); // greater (f32), NaN (f64)
+    let c13 = make_comis(f32::NAN, 1.0, 1.0, f64::NAN, data + 0x280); // NaN (f32 & f64)
+
+    let out = run(
+        &built,
+        &[c0, c1, c2, c3, c4, c5, c6, c7, c8, c9, c10, c11, c12, c13],
+    );
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+
+    // Verify Case 0: bitmask
+    assert_eq!(out[0].regs[RAX], 0x5, "movmskps 128");
+    assert_eq!(out[0].regs[RCX], 0x65, "vmovmskps 256");
+    assert_eq!(out[0].regs[RDX], 0x1, "movmskpd 128");
+    assert_eq!(out[0].regs[R8], 0x9, "vmovmskpd 256");
+    assert_eq!(out[0].regs[R9], 0x5555, "pmovmskb 128");
+    assert_eq!(out[0].regs[R10], 0x7FFF_5555, "vpmovmskb 256");
+
+    // Verify Case 1: psadbw
+    assert_eq!(out[1].mem[0], u64s([2040, 2040]), "vpsadbw lo");
+    assert_eq!(out[1].mem[1], u64s([33, 2]), "vpsadbw hi");
+    assert_eq!(out[1].mem[2], vec![0u8; 16], "psadbw same-reg");
+
+    // Verify Case 2: vtestps/vtestpd
+    assert_eq!(out[2].regs[RAX], 1, "vtestps disjoint signs -> ZF=1");
+    assert_eq!(out[2].regs[RCX], 0, "vtestpd hi !a&b sign bit -> CF=0");
+    assert_eq!(out[2].regs[RDX], 0, "vtestps 128 ZF=0");
+    assert_eq!(out[2].regs[R8], 1, "vtestps 128 CF=1");
+
+    // Verify Case 3: 256-bit vpmovsx*/vpmovzx*
+    assert_eq!(out[3].mem[0], i32s([-128, -1, 0, 127]), "vpmovsxbd lo");
+    assert_eq!(out[3].mem[1], i32s([-127, -2, 1, 126]), "vpmovsxbd hi");
+    assert_eq!(out[3].mem[2], u32s([0x80, 0xFF, 0x00, 0x7F]), "vpmovzxbd lo");
+    assert_eq!(out[3].mem[3], u32s([0x81, 0xFE, 0x01, 0x7E]), "vpmovzxbd hi");
+    assert_eq!(out[3].mem[4], i64s([-128, -1]), "vpmovsxbq lo");
+    assert_eq!(out[3].mem[5], i64s([0, 127]), "vpmovsxbq hi");
+    assert_eq!(out[3].mem[6], u64s([0x80, 0xFF]), "vpmovzxbq lo");
+    assert_eq!(out[3].mem[7], u64s([0x00, 0x7F]), "vpmovzxbq hi");
+    assert_eq!(out[3].mem[8], i64s([-32768, -1]), "vpmovsxwq lo");
+    assert_eq!(out[3].mem[9], i64s([0, 32767]), "vpmovsxwq hi");
+    assert_eq!(out[3].mem[10], u64s([0x8000, 0xFFFF]), "vpmovzxwq lo");
+    assert_eq!(out[3].mem[11], u64s([0x0000, 0x7FFF]), "vpmovzxwq hi");
+
+    // Verify Cases 4 & 5: dynamic shifts
+    assert_eq!(
+        &out[4].mem[0][0..16],
+        &u16s([8, 16, 8, 0xFFF8, 0x91A0, 0xB3C0, 0xD5E0, 0xF780]),
+        "psllw by 3"
+    );
+    assert_eq!(
+        &out[4].mem[0][16..32],
+        &u32s([0x0800_0000, 0x0FFF_FFFF, 0x0123_4567, 0]),
+        "psrld by 4"
+    );
+    assert_eq!(
+        &out[4].mem[0][32..48],
+        &u64s([0x0080_0000_0000_0000, 0x00FE_DCBA_9876_5432]),
+        "psrlq by 8"
+    );
+    assert_eq!(out[5].mem[0], vec![0u8; 48], "overshifted psllw/psrld/psrlq -> 0");
+
+    // Verify Case 6: same-reg idioms + insertps + VEX zeroing
+    assert_eq!(out[6].mem[0], vec![0xFFu8; 16], "pcmpeqd same-reg");
+    assert_eq!(out[6].mem[1], vec![0xFFu8; 16], "vpcmpeqb same-reg");
+    assert_eq!(out[6].mem[2], vec![0u8; 16], "pcmpgtw same-reg");
+    assert_eq!(out[6].mem[3], vec![0u8; 16], "psubd same-reg");
+    assert_eq!(out[6].mem[4], vec![0u8; 16], "psubsw same-reg");
+    assert_eq!(out[6].mem[5], i32s([-10, 0, 42, i32::MAX]), "pminsd same-reg");
+    assert_eq!(
+        out[6].mem[6],
+        vec![0, 1, 127, 128, 254, 255, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100],
+        "pavgb same-reg"
+    );
+    assert_eq!(out[6].mem[7], u32s([0xDEAD_BEEF, 0, 0, 0]), "vinsertps 0xCE");
+    assert_eq!(out[6].mem[8], u32s([0, 0x1122_3344, 0, 0]), "vinsertps mem 0x1D");
+    assert_eq!(out[6].mem[9], vec![0u8; 16], "vpcmpeqb zeroes ymmh1");
+    assert_eq!(out[6].mem[10], vec![0u8; 16], "vinsertps zeroes ymmh7");
+    assert_eq!(out[6].mem[11], vec![0u8; 16], "vinsertps mem zeroes ymmh10");
+
+    // Verify Case 7: vmaskmovps / vpmaskmovq
+    assert_eq!(out[7].mem[0], u32s([10, 0, 30, 0]), "vmaskmovps lo (dst==mask)");
+    assert_eq!(out[7].mem[1], u32s([0, 60, 0, 80]), "vmaskmovps hi (dst==mask)");
+    assert_eq!(out[7].mem[2], vec![0u8; 16], "vmaskmovps null zero-mask lo");
+    assert_eq!(out[7].mem[3], vec![0u8; 16], "vmaskmovps null zero-mask hi");
+    let mut expected_store = vec![0x77u8; 32];
+    expected_store[0..8].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+    expected_store[24..32].copy_from_slice(&0xDDDD_EEEE_FFFF_0000u64.to_le_bytes());
+    assert_eq!(out[7].mem[4], expected_store, "vpmaskmovq partial store");
+
+    // Verify Case 8: AES outlined sub_bytes
+    assert_eq!(out[8].mem[0], vec![0x63u8; 16], "aesenc(0, 0) = MixColumns(0x63..0x63) = 0x63..0x63");
+    assert_eq!(out[8].mem[1], vec![0x00u8; 16], "aesdec(0x63..0x63, 0) = 0");
+    assert_eq!(
+        out[8].mem[2],
+        u32s([0x6363_6363, 0x6363_6362, 0x6363_6363, 0x6363_6362]),
+        "aeskeygenassist(0, 1)"
+    );
+
+    // Verify Cases 9..13: fused ucomiss/ucomisd across all 16 x86 CCs!
+    // Order: [o, no, b, ae, e, ne, be, a, s, ns, p, np, l, ge, le, g]
+    let cc_less: [u8; 16] = [0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1];
+    let cc_eq: [u8; 16] = [0, 1, 0, 1, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0];
+    let cc_gt: [u8; 16] = [0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1];
+    let cc_nan: [u8; 16] = [0, 1, 1, 0, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0];
+    assert_eq!(out[9].mem[0], cc_less, "ucomiss <");
+    assert_eq!(out[9].regs[RDX], 0, "ucomisd 1.0 > 2.0 -> false");
+    assert_eq!(out[10].mem[0], cc_eq, "ucomiss ==");
+    assert_eq!(out[10].regs[RDX], 0, "ucomisd 2.0 > 2.0 -> false");
+    assert_eq!(out[11].mem[0], cc_eq, "ucomiss -0.0 == +0.0");
+    assert_eq!(out[11].regs[RDX], 1, "ucomisd 3.0 > 2.0 -> true");
+    assert_eq!(out[12].mem[0], cc_gt, "ucomiss >");
+    assert_eq!(out[12].regs[RDX], 0, "ucomisd NaN > 1.0 -> false");
+    assert_eq!(out[13].mem[0], cc_nan, "ucomiss NaN");
+    assert_eq!(out[13].regs[RDX], 0, "ucomisd 1.0 > NaN -> false");
+}

@@ -540,3 +540,74 @@ fn r71_bt_fusion_cmov_noop_and_direct_call_gpr_preservation() {
         "untouched rbp & constant rbx must survive direct leaf call without window checks:\n{ir}"
     );
 }
+
+#[test]
+fn flag_effect_no_poison_for_prefetch_leave_crc32_pdep_and_comis_fusion() {
+    // 1. `prefetcht0`, `pause`, `crc32`, `pdep`, `leave` must not poison flag liveness or
+    //    break `FlagSource` fusion, nor taint interprocedural register summaries.
+    const CALLER: u64 = 0x1_4000_7000;
+    const CALLEE: u64 = 0x1_4000_7100;
+    let prog = Program::new()
+        .asm(CALLER, |a| {
+            let mut gt = a.create_label();
+            a.mov(rbx, rdx)?;
+            a.call(CALLEE)?;
+            a.ucomiss(xmm0, xmm1)?;
+            a.prefetcht0(byte_ptr(rcx))?;
+            a.ja(gt)?;
+            a.mov(rax, rbx)?;
+            a.xor(ecx, ecx)?;
+            a.ret()?;
+            a.set_label(&mut gt)?;
+            a.add(rax, rbx)?;
+            a.ret()
+        })
+        .asm(CALLEE, |a| {
+            a.push(rbp)?;
+            a.mov(rbp, rsp)?;
+            a.prefetcht0(byte_ptr(rcx))?;
+            a.pause()?;
+            a.crc32(eax, dword_ptr(rcx))?;
+            a.pdep(eax, eax, ecx)?;
+            a.leave()?;
+            a.ret()
+        });
+    let funcs = prog.discover();
+    let module = lift_module(funcs.values()).expect("lifts");
+    let caller_ir = &module
+        .functions
+        .iter()
+        .find(|f| f.entry == CALLER)
+        .expect("caller")
+        .ir;
+    // `callee` never touches `rbx` — without flag_effect poisoning, caller must NOT spill/reload
+    // `rbx` around `call CALLEE`, and `ucomiss` + `prefetcht0` + `ja` must fuse to 1 `fcmp ogt`!
+    let after_call = {
+        let header = "after_call0:\n";
+        let start = caller_ir.find(header).expect("after_call0") + header.len();
+        let rest = &caller_ir[start..];
+        let end = rest
+            .find(":\n")
+            .map_or(rest.len(), |i| rest[..i].rfind('\n').unwrap_or(0));
+        &rest[..end]
+    };
+    assert!(
+        after_call.contains("fcmp ogt float"),
+        "ucomiss + prefetcht0 + ja must fuse to fcmp ogt float:\n{after_call}"
+    );
+    assert!(
+        !after_call.contains("fcmp ueq")
+            && !after_call.contains("fcmp uno")
+            && !after_call.contains("fcmp ult")
+            && !after_call.contains("ptr %cf")
+            && !after_call.contains("ptr %zf")
+            && !after_call.contains("ptr %pf"),
+        "fused ucomiss across prefetcht0 must not materialize or store cf/zf/pf:\n{after_call}"
+    );
+    // Check %rbx (%state.gpr3) syncs in caller: only 1 sync_out in ret_epilog (none around `call CALLEE`).
+    assert_eq!(
+        caller_ir.matches("ptr %state.gpr3").count(),
+        1,
+        "callee with prefetcht0/pause/crc32/pdep/leave must not poison rbx summary:\n{caller_ir}"
+    );
+}

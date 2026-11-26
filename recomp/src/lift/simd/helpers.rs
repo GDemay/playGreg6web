@@ -342,6 +342,31 @@ pub(super) fn aes_tables_ir() -> String {
     )
 }
 
+/// Outlined `<16 x i8> __playgta6_aes_{,inv_}sub_bytes(<16 x i8>)` helper (`noinline`), avoiding
+/// 80-instruction inline S-box expansion at every `aesenc`/`aesdec`/`aeskeygenassist` round.
+pub(super) fn aes_sub_bytes_ir(inverse: bool) -> String {
+    let (name, table) = if inverse {
+        ("@__playgta6_aes_inv_sub_bytes", "@__playgta6_aes_inv_sbox")
+    } else {
+        ("@__playgta6_aes_sub_bytes", "@__playgta6_aes_sbox")
+    };
+    let mut f = Ir::new(&format!(
+        "define internal <16 x i8> {name}(<16 x i8> %s) unnamed_addr noinline #0 {{\nentry:"
+    ));
+    let mut acc = "poison".to_string();
+    for l in 0..16 {
+        let b = f.v(&format!("extractelement <16 x i8> %s, i32 {l}"));
+        let idx = f.v(&format!("zext i8 {b} to i64"));
+        let ptr = f.v(&format!(
+            "getelementptr inbounds [256 x i8], ptr {table}, i64 0, i64 {idx}"
+        ));
+        let x = f.v(&format!("load i8, ptr {ptr}"));
+        acc = f.v(&format!("insertelement <16 x i8> {acc}, i8 {x}, i32 {l}"));
+    }
+    f.line(&format!("  ret <16 x i8> {acc}\n}}"));
+    f.out
+}
+
 /// `{ result, flags } __playgta6_pcmpstr(imm8, a, b, len_a, len_b, implicit)`: the SSE4.2 string
 /// compare core shared by `pcmp{i,e}str{i,m}` (Intel SDM "Packed Compare Implicit/Explicit Length
 /// Strings"). `a` is the first operand, `b` the second (the string). With `implicit` the lengths

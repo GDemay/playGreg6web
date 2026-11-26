@@ -351,6 +351,8 @@ enum ProducerKind {
     BitCount,
     /// `bt` / `bts` / `btr` / `btc`: `CF = tested bit`.
     CarryOnly,
+    /// `(v)(u)comis{s,d}`: all 16 x86 CCs fuse to a single `fcmp` or constant.
+    FloatCompare,
 }
 
 impl ProducerKind {
@@ -385,6 +387,7 @@ impl ProducerKind {
             Self::ZeroOnly => matches!(cc, C::e | C::ne),
             Self::BitCount => matches!(cc, C::e | C::ne | C::b | C::ae),
             Self::CarryOnly => matches!(cc, C::b | C::ae),
+            Self::FloatCompare => cc != C::None,
         }
     }
 }
@@ -512,6 +515,14 @@ fn producer_kind(ins: &Instruction) -> Option<ProducerKind> {
         M::Bsf | M::Bsr | M::Popcnt | M::Bextr => Some(ProducerKind::ZeroOnly),
         M::Tzcnt | M::Lzcnt => Some(ProducerKind::BitCount),
         M::Bt | M::Bts | M::Btr | M::Btc => Some(ProducerKind::CarryOnly),
+        M::Comiss
+        | M::Vcomiss
+        | M::Ucomiss
+        | M::Vucomiss
+        | M::Comisd
+        | M::Vcomisd
+        | M::Ucomisd
+        | M::Vucomisd => Some(ProducerKind::FloatCompare),
         _ => None,
     }
 }
@@ -700,7 +711,35 @@ pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
     if ins.code() == Code::INVALID || ins.has_lock_prefix() || ins.is_string_instruction() {
         return None;
     }
-    if matches!(ins.mnemonic(), M::Nop | M::Endbr64) {
+    if matches!(
+        ins.mnemonic(),
+        M::Nop
+            | M::Endbr64
+            | M::Prefetchnta
+            | M::Prefetcht0
+            | M::Prefetcht1
+            | M::Prefetcht2
+            | M::Prefetchw
+            | M::Prefetchwt1
+            | M::Prefetch
+            | M::Prefetchit0
+            | M::Prefetchit1
+            | M::Clflush
+            | M::Clflushopt
+            | M::Clwb
+            | M::Cldemote
+            | M::Reservednop
+            | M::Rdsspd
+            | M::Rdsspq
+            | M::Monitorx
+            | M::Mwaitx
+            | M::Mfence
+            | M::Lfence
+            | M::Sfence
+            | M::Pause
+            | M::Cld
+            | M::Std
+    ) {
         return Some((0, 0));
     }
     if let Some(effect) = simd_flag_effect(ins) {
@@ -740,11 +779,13 @@ pub(super) fn flag_effect(ins: &Instruction) -> Option<(FlagMask, FlagMask)> {
             Some((0, 0))
         }
         M::Movbe if operand_bits(ins).is_some_and(|b| b >= 16) => Some((0, 0)),
-        M::Shlx | M::Shrx | M::Sarx | M::Mulx
+        M::Shlx | M::Shrx | M::Sarx | M::Mulx | M::Pdep | M::Pext
             if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) =>
         {
             Some((0, 0))
         }
+        M::Crc32 if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64)) => Some((0, 0)),
+        M::Leave if ins.code() == Code::Leaveq => Some((0, 0)),
         M::Rorx
             if operand_bits(ins).is_some_and(|b| matches!(b, 32 | 64))
                 && is_immediate(ins.op_kind(2)) =>
@@ -1047,6 +1088,10 @@ fn used_and_written_state(ins: &Instruction, info: &InstructionInfo) -> (StateMa
         Mnemonic::Stmxcsr | Mnemonic::Vstmxcsr => {
             touched |= OTHER_STATE;
         }
+        Mnemonic::Cld | Mnemonic::Std => {
+            touched |= OTHER_STATE;
+            written |= OTHER_STATE;
+        }
         _ => {}
     }
     // VEX encodings with an XMM destination register zero bits 128..255 (`ymmhN`).
@@ -1272,7 +1317,7 @@ fn state_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (StateMask, Stat
 
         let mut ymmh_reads: u16 = 0;
         let mut ymmh_full_writes: u16 = 0;
-        if simd::is_zeroing_idiom(ins)
+        if simd::is_const_idiom(ins)
             && ins.op_count() > 0
             && ins.op_kind(0) == OpKind::Register
         {

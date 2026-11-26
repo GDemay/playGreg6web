@@ -455,20 +455,25 @@ fn r64a_elides_dead_entry_xmm_loads_soundly() {
         );
     }
 
-    // 3. FMA3, legacy blendvps (implicit xmm0), and pcmpeqd self-compare MUST preserve entry loads.
+    // 3. FMA3 and legacy blendvps (implicit xmm0) MUST preserve entry loads; `pcmpeqd xmm6, xmm6`
+    //    is a constant-materialization idiom (`-1`) and elides its dead entry load.
     let f_special = asm_function(0x3000, |a| {
         a.blendvps(xmm1, xmm2)?; // implicitly reads xmm0 + RMW xmm1
         a.vfmadd213ps(xmm3, xmm4, xmm5)?; // FMA reads op0 (xmm3)
-        a.pcmpeqd(xmm6, xmm6)?; // lifter loads operands for pcmpeqd -> must NOT elide!
+        a.pcmpeqd(xmm6, xmm6)?; // constant all-ones idiom -> elides dead entry load!
         a.ret()
     });
     let ir_s = lift_function(&f_special).expect("lifts").ir;
-    for idx in [0, 1, 2, 3, 4, 5, 6] {
+    for idx in [0, 1, 2, 3, 4, 5] {
         assert!(
             has_entry_load(&ir_s, idx),
             "xmm{idx} must preserve its entry load:\n{ir_s}"
         );
     }
+    assert!(
+        !has_entry_load(&ir_s, 6),
+        "pcmpeqd xmm6, xmm6 constant idiom should elide dead entry load:\n{ir_s}"
+    );
 
     // 4. Post-branch writes MUST preserve entry loads (only the entry block is scanned).
     let f_branch = asm_function(0x4000, |a| {
@@ -1367,6 +1372,261 @@ fn r70_3d_fp_fma_f16c_and_shuffle_lowering_ir() {
                 assert!(ir.contains("zext <4 x i16>"), "{ir}");
                 assert!(ir.contains("@llvm.ceil.v4f32("), "{ir}");
                 assert!(ir.contains("@llvm.fptosi.sat.v4i32.v4f32("), "{ir}");
+            }
+            _ => {}
+        }
+    }
+
+    let native_ir = LiftTarget::native_host().retarget(module.ir);
+    assert!(
+        !native_ir.contains("llvm.wasm."),
+        "wasm-only intrinsic leaked into native IR:\n{native_ir}"
+    );
+}
+
+#[test]
+fn wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_ir() {
+    use crate::lift::target::LiftTarget;
+
+    let cases: Vec<(&str, crate::cfg::Function)> = vec![
+        (
+            "bitmask_128_256",
+            asm_function(0x2000, |a| {
+                a.movmskps(eax, xmm0)?;
+                a.vmovmskps(ecx, ymm1)?;
+                a.movmskpd(edx, xmm2)?;
+                a.vmovmskpd(r8, ymm3)?;
+                a.pmovmskb(r9d, xmm4)?;
+                a.vpmovmskb(r10, ymm5)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vtest_bitmask_and_dead_cf",
+            asm_function(0x2100, |a| {
+                let mut zero = a.create_label();
+                a.vtestps(ymm0, ymm1)?;
+                a.je(zero)?;
+                a.vtestpd(xmm2, xmm3)?;
+                a.setb(al)?;
+                a.xor(ecx, ecx)?;
+                a.ret()?;
+                a.set_label(&mut zero)?;
+                a.xor(eax, eax)?;
+                a.ret()
+            }),
+        ),
+        (
+            "psadbw_extadd_and_same_reg",
+            asm_function(0x2200, |a| {
+                a.psadbw(xmm0, xmm1)?;
+                a.vpsadbw(ymm2, ymm3, ymm4)?;
+                a.psadbw(xmm5, xmm5)?;
+                a.ret()
+            }),
+        ),
+        (
+            "vpmov_256_staged",
+            asm_function(0x2300, |a| {
+                a.vpmovzxbd(ymm0, xmm1)?;
+                a.vpmovsxbd(ymm2, qword_ptr(rcx))?;
+                a.vpmovsxbq(ymm3, dword_ptr(rdx))?;
+                a.vpmovzxwq(ymm4, qword_ptr(r8))?;
+                a.vpmovsxbw(ymm5, xmm6)?;
+                a.ret()
+            }),
+        ),
+        (
+            "f16c_128_reg",
+            asm_function(0x2400, |a| {
+                a.vcvtps2ph(xmm0, xmm1, 0)?;
+                a.ret()
+            }),
+        ),
+        (
+            "dyn_shift_and_mask",
+            asm_function(0x2500, |a| {
+                a.psllw(xmm0, xmm1)?;
+                a.psrld(xmm2, xmm3)?;
+                a.psrlq(xmm4, xmm5)?;
+                a.ret()
+            }),
+        ),
+        (
+            "same_reg_idioms_and_insertps",
+            asm_function(0x2600, |a| {
+                a.pcmpeqd(xmm0, xmm0)?;
+                a.pcmpgtw(xmm1, xmm1)?;
+                a.psubd(xmm2, xmm2)?;
+                a.psubsw(xmm3, xmm3)?;
+                a.pminsd(xmm4, xmm4)?;
+                a.pavgb(xmm5, xmm5)?;
+                a.insertps(xmm6, xmm7, 0xCE)?; // extract lane 3 to lane 0, zero lanes 1..3
+                a.ret()
+            }),
+        ),
+        (
+            "vmaskmov_per_half",
+            asm_function(0x2700, |a| {
+                a.vmaskmovps(ymm0, ymm1, ymmword_ptr(rcx))?;
+                a.vpmaskmovq(ymmword_ptr(rdx), ymm2, ymm3)?;
+                a.ret()
+            }),
+        ),
+        (
+            "aes_outlined_sub_bytes",
+            asm_function(0x2800, |a| {
+                a.aesenc(xmm0, xmm1)?;
+                a.aesdec(xmm2, xmm3)?;
+                a.aeskeygenassist(xmm4, xmm5, 1)?;
+                a.ret()
+            }),
+        ),
+        (
+            "comis_fp_fusion",
+            asm_function(0x2900, |a| {
+                let mut gt = a.create_label();
+                a.ucomiss(xmm0, xmm1)?;
+                a.ja(gt)?;
+                a.comisd(xmm2, xmm3)?;
+                a.setbe(al)?;
+                a.setp(dl)?;
+                a.xor(ecx, ecx)?;
+                a.ret()?;
+                a.set_label(&mut gt)?;
+                a.xor(eax, eax)?;
+                a.ret()
+            }),
+        ),
+    ];
+
+    let module = lift_module(cases.iter().map(|(_, f)| f)).expect("lift module");
+    for ((name, _), f) in cases.iter().zip(&module.functions) {
+        assert!(f.unsupported.is_empty(), "{name}: {:?}", f.unsupported);
+        let ir = &f.ir;
+        match *name {
+            "bitmask_128_256" => {
+                assert!(ir.contains("@llvm.wasm.bitmask.v4i32("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitmask.v2i64("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitmask.v16i8("), "{ir}");
+                assert!(
+                    !ir.contains("icmp slt <"),
+                    "movmsk*/pmovmskb should emit direct llvm.wasm.bitmask, not icmp slt:\n{ir}"
+                );
+            }
+            "vtest_bitmask_and_dead_cf" => {
+                assert!(ir.contains("@llvm.wasm.bitmask.v4i32("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitmask.v2i64("), "{ir}");
+                // vtestps only feeds `je` (ZF): must not compute `xor -1` for dead CF;
+                // vtestpd only feeds `setb` (CF): must have only 1 `xor <2 x i64>` (for vtestpd).
+                assert_eq!(
+                    ir.matches("xor <2 x i64>").count(),
+                    1,
+                    "dead CF on vtestps should skip xor -1:\n{ir}"
+                );
+            }
+            "psadbw_extadd_and_same_reg" => {
+                assert!(
+                    ir.contains("@llvm.wasm.extadd.pairwise.unsigned.v8i16.v16i8("),
+                    "{ir}"
+                );
+                assert!(
+                    ir.contains("@llvm.wasm.extadd.pairwise.unsigned.v4i32.v8i16("),
+                    "{ir}"
+                );
+                // `psadbw xmm5, xmm5` must not read `%state.xmm5` in entry sync_in.
+                assert!(
+                    !ir.contains("load <2 x i64>, ptr %state.xmm5"),
+                    "same-reg psadbw should elide dead entry load of xmm5 (only sync_out writes it):\n{ir}"
+                );
+            }
+            "vpmov_256_staged" => {
+                assert!(
+                    !ir.contains("to <8 x i32>")
+                        && !ir.contains("to <4 x i64>")
+                        && !ir.contains("to <16 x i16>"),
+                    "256-bit vpmovsx*/vpmovzx* must stage in 128-bit vectors:\n{ir}"
+                );
+            }
+            "f16c_128_reg" => {
+                assert!(
+                    ir.contains("<i32 0, i32 2, i32 4, i32 6, i32 8, i32 8, i32 8, i32 8>"),
+                    "128-bit reg vcvtps2ph should pack & zero upper lanes in one shufflevector:\n{ir}"
+                );
+                assert!(
+                    !ir.contains("trunc <4 x i32>"),
+                    "128-bit reg vcvtps2ph should not emit trunc+zext_lanes:\n{ir}"
+                );
+            }
+            "dyn_shift_and_mask" => {
+                assert!(ir.contains("and i64 "), "{ir}");
+                assert!(
+                    !ir.contains(", i64 0, i64 "),
+                    "dynamic psll/psrl should mask count with `and` instead of clamping count with select:\n{ir}"
+                );
+            }
+            "same_reg_idioms_and_insertps" => {
+                assert!(!ir.contains("icmp eq <"), "{ir}");
+                assert!(!ir.contains("icmp sgt <"), "{ir}");
+                assert!(!ir.contains("sub <"), "{ir}");
+                assert!(!ir.contains("@llvm.ssub.sat"), "{ir}");
+                assert!(!ir.contains("@llvm.smin"), "{ir}");
+                assert!(!ir.contains("@llvm.wasm.avgr"), "{ir}");
+                // Constant idioms `pcmpeqd`/`pcmpgtw`/`psubd`/`psubsw` must elide entry loads!
+                for idx in [0, 1, 2, 3] {
+                    assert!(
+                        !ir.contains(&format!("load <2 x i64>, ptr %state.xmm{idx}")),
+                        "dead entry load expected to be elided for constant-idiom xmm{idx}:\n{ir}"
+                    );
+                }
+                // `insertps xmm6, xmm7, 0xCE` zeroes lanes 1..3 -> only 1 shufflevector, no load of xmm6 in body!
+                assert_eq!(
+                    ir.matches("shufflevector <4 x i32>").count(),
+                    1,
+                    "insertps zeroing all other lanes must emit 1 shufflevector:\n{ir}"
+                );
+                assert_eq!(
+                    ir.matches("load <2 x i64>, ptr %xmm6").count(),
+                    1,
+                    "insertps zeroing all other lanes must not load %xmm6 in body (only sync_out):\n{ir}"
+                );
+            }
+            "vmaskmov_per_half" => {
+                assert!(ir.contains("@llvm.wasm.bitmask.v4i32("), "{ir}");
+                assert!(ir.contains("@llvm.wasm.bitmask.v2i64("), "{ir}");
+                assert!(
+                    !ir.contains("mpre"),
+                    "vmaskmov should not emit empty mpre blocks:\n{ir}"
+                );
+                assert!(
+                    !ir.contains("<8 x i32>") && !ir.contains("<4 x i64>"),
+                    "256-bit vmaskmov should stay 128-bit per half:\n{ir}"
+                );
+            }
+            "aes_outlined_sub_bytes" => {
+                assert!(ir.contains("call <16 x i8> @__playgta6_aes_sub_bytes("), "{ir}");
+                assert!(ir.contains("call <16 x i8> @__playgta6_aes_inv_sub_bytes("), "{ir}");
+                assert!(
+                    !ir.contains("getelementptr inbounds [256 x i8]"),
+                    "AES SubBytes must be outlined, not expanded inline:\n{ir}"
+                );
+            }
+            "comis_fp_fusion" => {
+                assert!(ir.contains("fcmp ogt float"), "{ir}");
+                assert!(ir.contains("fcmp ule double"), "{ir}");
+                assert!(ir.contains("fcmp uno double"), "{ir}");
+                assert!(
+                    !ir.contains("fcmp ueq") && !ir.contains("fcmp ult"),
+                    "fused comis/ucomis must not materialize unused ueq/ult flags:\n{ir}"
+                );
+                // Only `ret_epilog` syncs flags back out; the body must never reload flag allocas!
+                let body = ir.split("ret_epilog:").next().unwrap_or(ir);
+                assert!(
+                    !body.contains("load i1, ptr %cf")
+                        && !body.contains("load i1, ptr %zf")
+                        && !body.contains("load i1, ptr %pf"),
+                    "fused comis/ucomis consumers must never reload flag allocas:\n{body}"
+                );
             }
             _ => {}
         }
