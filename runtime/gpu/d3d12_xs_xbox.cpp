@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -493,15 +494,33 @@ FramePacer::WaitResult FramePacer::wait_event(uint32_t kind, uint32_t timeout_ms
     if (!shutdown_ && last != 0 && current > last + 1) {
         // More than one tick behind: end at once on the overdue tick.
         last = last + 1;
-        *frame = last;
+        if (frame != nullptr) {
+            *frame = last;
+        }
         return WaitResult::Ok;
     }
     // Otherwise the next tick after both now and the kind's last tick.
-    const WaitResult r = wait_locked(lock, std::max(current, last), timeout_ms, frame);
+    uint64_t reached = 0;
+    const WaitResult r = wait_locked(lock, std::max(current, last), timeout_ms, &reached);
+    if (frame != nullptr) {
+        *frame = reached;
+    }
     if (r == WaitResult::Ok) {
-        last = std::max(last, *frame);
+        last = std::max(last, reached);
     }
     return r;
+}
+
+uint64_t FramePacer::last_event_tick(uint32_t kind) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_tick_[kind % kKinds];
+}
+
+void FramePacer::reset_event_ticks() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (uint64_t& tick : last_tick_) {
+        tick = 0;
+    }
 }
 
 FramePacer::WaitResult FramePacer::wait_locked(std::unique_lock<std::mutex>& lock, uint64_t after,
@@ -517,15 +536,21 @@ FramePacer::WaitResult FramePacer::wait_locked(std::unique_lock<std::mutex>& loc
         const auto now = Clock::now();
         const uint64_t current = frame_locked(now);
         if (shutdown_) {
-            *frame = std::max<uint64_t>(current, 1);
+            if (frame != nullptr) {
+                *frame = std::max<uint64_t>(current, 1);
+            }
             return WaitResult::Shutdown;
         }
         if (current > target_after) {
-            *frame = std::max<uint64_t>(current, 1);
+            if (frame != nullptr) {
+                *frame = std::max<uint64_t>(current, 1);
+            }
             return WaitResult::Ok;
         }
         if (bounded && now >= deadline) {
-            *frame = std::max<uint64_t>(current, 1);
+            if (frame != nullptr) {
+                *frame = std::max<uint64_t>(current, 1);
+            }
             return WaitResult::Timeout;
         }
         auto wake = start_of_locked(target_after + 1);
@@ -546,6 +571,496 @@ void FramePacer::shutdown() {
 bool FramePacer::is_shut_down() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return shutdown_;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Xbox Scarlett 3D helpers (G84): fast clears, predication, async compute sync, VRS/depth bounds
+// ---------------------------------------------------------------------------------------------
+
+void FastClearRegistry::register_surface_meta(uint64_t surface_key, CompressionMetaKind kind, uint64_t meta_va,
+                                              uint64_t meta_bytes) {
+    if (surface_key == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    SurfaceCompressionMeta& entry = surfaces_[surface_key];
+    entry.surface_key = surface_key;
+    entry.meta_kind = kind;
+    entry.meta_va = meta_va;
+    entry.meta_bytes = meta_bytes;
+}
+
+void FastClearRegistry::record_color_clear(uint64_t surface_key, uint32_t dxgi_format, const float rgba[4]) {
+    if (surface_key == 0 || rgba == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    SurfaceCompressionMeta& entry = surfaces_[surface_key];
+    entry.surface_key = surface_key;
+    entry.clear_value.kind = FastClearKind::Color;
+    entry.clear_value.dxgi_format = dxgi_format;
+    for (int i = 0; i < 4; ++i) {
+        entry.clear_value.rgba[i] = std::isfinite(rgba[i]) ? rgba[i] : 0.0f;
+    }
+    entry.clear_value.valid = true;
+    entry.fast_clear_active = true;
+    ++entry.clear_generation;
+    ++color_clears_;
+}
+
+void FastClearRegistry::record_depth_stencil_clear(uint64_t surface_key, uint32_t dxgi_format, uint32_t flags,
+                                                   float depth, uint8_t stencil) {
+    if (surface_key == 0 || (flags & 3u) == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    SurfaceCompressionMeta& entry = surfaces_[surface_key];
+    entry.surface_key = surface_key;
+    entry.clear_value.kind = FastClearKind::DepthStencil;
+    entry.clear_value.dxgi_format = dxgi_format;
+    entry.clear_value.clear_flags = flags & 3u;
+    if ((flags & 1u) != 0) {
+        entry.clear_value.depth = std::isfinite(depth) ? std::clamp(depth, 0.0f, 1.0f) : 1.0f;
+    }
+    if ((flags & 2u) != 0) {
+        entry.clear_value.stencil = stencil;
+    }
+    entry.clear_value.valid = true;
+    entry.fast_clear_active = true;
+    ++entry.clear_generation;
+    ++depth_stencil_clears_;
+}
+
+void FastClearRegistry::record_uav_clear_float(uint64_t surface_key, const float rgba[4]) {
+    if (surface_key == 0 || rgba == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    SurfaceCompressionMeta& entry = surfaces_[surface_key];
+    entry.surface_key = surface_key;
+    entry.clear_value.kind = FastClearKind::UnorderedAccessFloat;
+    for (int i = 0; i < 4; ++i) {
+        entry.clear_value.rgba[i] = rgba[i];
+    }
+    entry.clear_value.valid = true;
+    entry.fast_clear_active = true;
+    ++entry.clear_generation;
+    ++uav_clears_;
+}
+
+void FastClearRegistry::record_uav_clear_uint(uint64_t surface_key, const uint32_t rgba[4]) {
+    if (surface_key == 0 || rgba == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    SurfaceCompressionMeta& entry = surfaces_[surface_key];
+    entry.surface_key = surface_key;
+    entry.clear_value.kind = FastClearKind::UnorderedAccessUint;
+    for (int i = 0; i < 4; ++i) {
+        entry.clear_value.uint_rgba[i] = rgba[i];
+    }
+    entry.clear_value.valid = true;
+    entry.fast_clear_active = true;
+    ++entry.clear_generation;
+    ++uav_clears_;
+}
+
+bool FastClearRegistry::mark_decompressed(uint64_t surface_key) {
+    if (surface_key == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = surfaces_.find(surface_key);
+    if (it == surfaces_.end()) {
+        return false;
+    }
+    const bool was_active = it->second.fast_clear_active;
+    it->second.fast_clear_active = false;
+    ++it->second.decompress_count;
+    ++decompresses_;
+    return was_active;
+}
+
+bool FastClearRegistry::lookup(uint64_t surface_key, SurfaceCompressionMeta* out) const {
+    if (surface_key == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = surfaces_.find(surface_key);
+    if (it == surfaces_.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second;
+    }
+    return true;
+}
+
+bool FastClearRegistry::erase(uint64_t surface_key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return surfaces_.erase(surface_key) != 0;
+}
+
+void FastClearRegistry::clear() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    surfaces_.clear();
+    color_clears_ = 0;
+    depth_stencil_clears_ = 0;
+    uav_clears_ = 0;
+    decompresses_ = 0;
+}
+
+size_t FastClearRegistry::size() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return surfaces_.size();
+}
+
+FastClearRegistry::Stats FastClearRegistry::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    Stats s{};
+    s.color_clears = color_clears_;
+    s.depth_stencil_clears = depth_stencil_clears_;
+    s.uav_clears = uav_clears_;
+    s.decompresses = decompresses_;
+    for (const auto& [key, meta] : surfaces_) {
+        if (meta.fast_clear_active) {
+            ++s.active_fast_clears;
+        }
+        switch (meta.meta_kind) {
+        case CompressionMetaKind::Dcc: ++s.dcc_surfaces; break;
+        case CompressionMetaKind::Cmask: ++s.cmask_surfaces; break;
+        case CompressionMetaKind::Htile: ++s.htile_surfaces; break;
+        case CompressionMetaKind::None: break;
+        }
+    }
+    return s;
+}
+
+FastClearRegistry& fast_clear_registry() {
+    static FastClearRegistry reg;
+    return reg;
+}
+
+bool parse_guest_clear_color(uint64_t color_va, float out_rgba[4]) {
+    if (color_va == 0 || out_rgba == nullptr) {
+        return false;
+    }
+    float tmp[4] = {};
+    if (!com::read_guest(color_va, tmp, sizeof(tmp))) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        out_rgba[i] = tmp[i];
+    }
+    return true;
+}
+
+bool parse_guest_uav_clear_uint(uint64_t values_va, uint32_t out_rgba[4]) {
+    if (values_va == 0 || out_rgba == nullptr) {
+        return false;
+    }
+    uint32_t tmp[4] = {};
+    if (!com::read_guest(values_va, tmp, sizeof(tmp))) {
+        return false;
+    }
+    for (int i = 0; i < 4; ++i) {
+        out_rgba[i] = tmp[i];
+    }
+    return true;
+}
+
+bool PredicationTracker::set(uint64_t buffer_va, uint64_t aligned_offset, uint32_t raw_op, std::string* error) {
+    if (buffer_va == 0) {
+        state_ = PredicationState{};
+        ++stats_.clear_calls;
+        return true;
+    }
+    if ((aligned_offset & 7u) != 0) {
+        ++stats_.invalid_calls;
+        if (error != nullptr) {
+            *error = "SetPredication: offset must be 8-byte aligned";
+        }
+        return false;
+    }
+    if (raw_op > static_cast<uint32_t>(PredicationOp::NotEqualZero)) {
+        ++stats_.invalid_calls;
+        if (error != nullptr) {
+            *error = "SetPredication: invalid predication op " + std::to_string(raw_op);
+        }
+        return false;
+    }
+    state_.active = true;
+    state_.buffer_va = buffer_va;
+    state_.aligned_offset = aligned_offset;
+    state_.op = static_cast<PredicationOp>(raw_op);
+    state_.last_evaluated = false;
+    state_.last_skip_work = false;
+    state_.last_value = 0;
+    ++stats_.set_calls;
+    return true;
+}
+
+void PredicationTracker::reset() {
+    state_ = PredicationState{};
+    scopes_.clear();
+}
+
+bool PredicationTracker::push_scope() {
+    if (scopes_.size() >= kMaxScopeDepth) {
+        return false;
+    }
+    scopes_.push_back(state_);
+    return true;
+}
+
+bool PredicationTracker::pop_scope() {
+    if (scopes_.empty()) {
+        return false;
+    }
+    state_ = scopes_.back();
+    scopes_.pop_back();
+    return true;
+}
+
+bool PredicationTracker::should_skip_work(const std::function<bool(uint64_t va, uint64_t* value)>& reader) {
+    if (!state_.active) {
+        ++stats_.work_passed;
+        return false;
+    }
+    ++stats_.evaluations;
+    uint64_t val = 0;
+    const uint64_t addr = state_.buffer_va + state_.aligned_offset;
+    if (!reader || !reader(addr, &val)) {
+        // Fail safe: unreadable predicate memory must never silently drop rendering work.
+        ++stats_.unreadable_reads;
+        ++stats_.work_passed;
+        state_.last_evaluated = false;
+        state_.last_skip_work = false;
+        return false;
+    }
+    const bool skip = (state_.op == PredicationOp::EqualZero) ? (val == 0) : (val != 0);
+    state_.last_evaluated = true;
+    state_.last_value = val;
+    state_.last_skip_work = skip;
+    if (skip) {
+        ++stats_.work_skipped;
+    } else {
+        ++stats_.work_passed;
+    }
+    return skip;
+}
+
+bool PredicationTracker::should_skip_work_guest(const Device* device) {
+    return should_skip_work([device](uint64_t va, uint64_t* out_val) -> bool {
+        const uint64_t cpu_va = device != nullptr ? device->cpu_address_for_gpu(va) : va;
+        uint64_t v = 0;
+        if (!com::read_guest(cpu_va, v)) {
+            return false;
+        }
+        *out_val = v;
+        return true;
+    });
+}
+
+size_t AsyncComputeSync::record_signal(uint64_t queue_id, QueueKind kind, uint64_t fence_id, uint64_t value) {
+    size_t newly_satisfied = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        switch (kind) {
+        case QueueKind::Direct: ++stats_.signals_direct; break;
+        case QueueKind::Compute: ++stats_.signals_compute; break;
+        case QueueKind::Copy: ++stats_.signals_copy; break;
+        }
+        FenceState& f = fences_[fence_id];
+        if (!f.ever_signalled || value > f.value) {
+            f.value = value;
+        }
+        f.last_signaller_queue = queue_id;
+        f.last_signaller_kind = kind;
+        f.ever_signalled = true;
+        ++next_seq_;
+
+        auto it = pending_waits_.begin();
+        while (it != pending_waits_.end()) {
+            if (it->fence_id == fence_id && it->value <= f.value) {
+                ++newly_satisfied;
+                ++stats_.waits_satisfied;
+                if (it->queue_kind != kind) {
+                    ++stats_.cross_queue_syncs;
+                }
+                it = pending_waits_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    cv_.notify_all();
+    return newly_satisfied;
+}
+
+bool AsyncComputeSync::record_wait(uint64_t queue_id, QueueKind kind, uint64_t fence_id, uint64_t value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = fences_.find(fence_id);
+    if (it != fences_.end() && it->second.ever_signalled && it->second.value >= value) {
+        ++stats_.waits_immediate;
+        ++stats_.waits_satisfied;
+        if (it->second.last_signaller_kind != kind) {
+            ++stats_.cross_queue_syncs;
+        }
+        return true;
+    }
+    if (it != fences_.end() && it->second.ever_signalled && it->second.last_signaller_queue == queue_id &&
+        it->second.value < value) {
+        ++stats_.self_waits_detected;
+    }
+    ++stats_.waits_deferred;
+    pending_waits_.push_back(PendingWait{next_seq_++, queue_id, kind, fence_id, value});
+    return false;
+}
+
+bool AsyncComputeSync::wait_until_satisfied(uint64_t fence_id, uint64_t value, std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    auto reached = [&] {
+        if (shutdown_) {
+            return true;
+        }
+        const auto it = fences_.find(fence_id);
+        return it != fences_.end() && it->second.ever_signalled && it->second.value >= value;
+    };
+    const bool woke = cv_.wait_for(lock, timeout.count() < 0 ? std::chrono::milliseconds(0) : timeout, reached);
+    const auto it = fences_.find(fence_id);
+    const bool satisfied = it != fences_.end() && it->second.ever_signalled && it->second.value >= value;
+    if (!satisfied && !woke) {
+        ++stats_.wait_timeouts;
+    }
+    return satisfied;
+}
+
+bool AsyncComputeSync::is_potential_self_wait(uint64_t queue_id, uint64_t fence_id, uint64_t value) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = fences_.find(fence_id);
+    if (it == fences_.end() || !it->second.ever_signalled) {
+        return false;
+    }
+    return it->second.value < value && it->second.last_signaller_queue == queue_id;
+}
+
+uint64_t AsyncComputeSync::fence_value(uint64_t fence_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto it = fences_.find(fence_id);
+    return (it != fences_.end() && it->second.ever_signalled) ? it->second.value : 0u;
+}
+
+size_t AsyncComputeSync::pending_wait_count(uint64_t fence_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (fence_id == 0) {
+        return pending_waits_.size();
+    }
+    size_t n = 0;
+    for (const PendingWait& w : pending_waits_) {
+        if (w.fence_id == fence_id) {
+            ++n;
+        }
+    }
+    return n;
+}
+
+void AsyncComputeSync::shutdown() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown_ = true;
+    }
+    cv_.notify_all();
+}
+
+void AsyncComputeSync::reset() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        shutdown_ = false;
+        next_seq_ = 1;
+        fences_.clear();
+        pending_waits_.clear();
+        stats_ = Stats{};
+    }
+    cv_.notify_all();
+}
+
+AsyncComputeSync::Stats AsyncComputeSync::stats() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return stats_;
+}
+
+namespace {
+
+struct CommandListXboxStateTable {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, DepthBoundsState> depth_bounds;
+    std::unordered_map<uint64_t, ShadingRateState> shading_rate;
+};
+
+CommandListXboxStateTable& command_list_xbox_state() {
+    static CommandListXboxStateTable table;
+    return table;
+}
+
+}  // namespace
+
+bool is_valid_shading_rate(uint32_t rate) {
+    switch (rate) {
+    case 0x0:  // D3D12_SHADING_RATE_1X1
+    case 0x1:  // D3D12_SHADING_RATE_1X2
+    case 0x4:  // D3D12_SHADING_RATE_2X1
+    case 0x5:  // D3D12_SHADING_RATE_2X2
+    case 0x6:  // D3D12_SHADING_RATE_2X4
+    case 0x9:  // D3D12_SHADING_RATE_4X2
+    case 0xA:  // D3D12_SHADING_RATE_4X4
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_valid_shading_rate_combiner(uint32_t combiner) {
+    return combiner <= 4u;  // PASSTHROUGH(0)..SUM(4)
+}
+
+bool lookup_command_list_depth_bounds(uint64_t list_identity, DepthBoundsState* out) {
+    if (list_identity == 0) {
+        return false;
+    }
+    CommandListXboxStateTable& t = command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    const auto it = t.depth_bounds.find(list_identity);
+    if (it == t.depth_bounds.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second;
+    }
+    return true;
+}
+
+bool lookup_command_list_shading_rate(uint64_t list_identity, ShadingRateState* out) {
+    if (list_identity == 0) {
+        return false;
+    }
+    CommandListXboxStateTable& t = command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    const auto it = t.shading_rate.find(list_identity);
+    if (it == t.shading_rate.end()) {
+        return false;
+    }
+    if (out != nullptr) {
+        *out = it->second;
+    }
+    return true;
+}
+
+void clear_command_list_xbox_state() {
+    CommandListXboxStateTable& t = command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    t.depth_bounds.clear();
+    t.shading_rate.clear();
 }
 
 }  // namespace xbox
@@ -1365,10 +1880,18 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
     // compose the frame from several planes (e.g. a 4K scene plane under a 1080p overlay plane).
     // Each plane contributes its first resource, full screen.
     std::array<uint32_t, kMaxPlanes> textures{};
+    uint64_t max_token = plane.Token;
     for (uint32_t i = 0; i < plane_count; ++i) {
         xbox::GuestPresentPlaneX p{};
         uint64_t resource = 0;
-        if (!com::read_guest(planes + uint64_t{i} * sizeof(p), p) || p.ResourceCount == 0 || p.ppResources == 0 ||
+        if (!com::read_guest(planes + uint64_t{i} * sizeof(p), p)) {
+            device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " descriptor is unreadable");
+            continue;
+        }
+        if (p.Token > max_token) {
+            max_token = p.Token;
+        }
+        if (p.ResourceCount == 0 || p.ppResources == 0 ||
             !com::read_guest(p.ppResources, &resource, sizeof(resource)) || resource == 0) {
             device_->note_bad_argument("PresentX: plane " + std::to_string(i) + " has no readable resource");
             continue;
@@ -1388,11 +1911,14 @@ HResult CommandQueue::PresentX(uint32_t plane_count, uint64_t planes, uint64_t p
         textures[i] = res->id();
     }
     device_->count(xbox::Counter::PresentsWithPlanes);
+    if (plane_count > 1) {
+        device_->count(xbox::Counter::MultiPlanePresents);
+    }
     const uint32_t drawn = device_->present(std::span<const uint32_t>(textures.data(), plane_count));
     // The frame is done on our side once its Present has been handed off (its submissions and their
     // CPU-visible buffer snapshots came before): PRESENT waits for this token may complete now.
-    if (plane.Token != 0) {
-        device_->note_present_token(plane.Token);
+    if (max_token != 0) {
+        device_->note_present_token(max_token);
     }
     device_->on_frame_presented();  // fence publication epoch (DeviceOptions::fence_publish_lag)
     device_->count(xbox::Counter::PresentPlanesDrawn, drawn);
@@ -1497,18 +2023,29 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
     const bool graphics = e.kind != bridge::IndirectKind::Dispatch;
     PipelineState* pso = graphics ? graphics_pso_ : compute_pso_;
     // Only single-argument signatures (no root argument / view changes per command) are expressed.
-    if (signature->argument_count() != 1 || args == nullptr || !args->is_buffer() ||
-        (count_pointer != 0 && (count == nullptr || !count->is_buffer())) || (pso != nullptr && !pso->resolved()) ||
-        (graphics && rect_list_)) {
+    const uint32_t min_stride =
+        e.kind == bridge::IndirectKind::DrawIndexed
+            ? 20u
+            : (e.kind == bridge::IndirectKind::Draw ? 16u : 12u);
+    const uint64_t args_offset = ctx.int_arg(4);
+    const uint64_t count_offset = count != nullptr ? ctx.int_arg(6) : 0u;
+    if (signature->argument_count() != 1 || signature->byte_stride() < min_stride || args == nullptr ||
+        !args->is_buffer() || (args_offset & 3u) != 0 ||
+        (count_pointer != 0 && (count == nullptr || !count->is_buffer() || (count_offset & 3u) != 0)) ||
+        (pso != nullptr && !pso->resolved()) || (graphics && rect_list_)) {
         skip(xbox::Counter::IndirectSkipped);
         return;
     }
     e.max_count = static_cast<uint32_t>(ctx.int_arg(2));
+    if (e.max_count == 0) {
+        device_->count(xbox::Counter::IndirectZeroCount);
+        return;
+    }
     e.stride = signature->byte_stride();
     e.args_buffer = args->id();
-    e.args_offset = ctx.int_arg(4);
+    e.args_offset = args_offset;
     e.count_buffer = count != nullptr ? count->id() : 0u;
-    e.count_offset = count != nullptr ? ctx.int_arg(6) : 0u;
+    e.count_offset = count_offset;
     pinned_.push_back(com::Ref<com::ComObject>::share(args));
     if (count != nullptr) {
         pinned_.push_back(com::Ref<com::ComObject>::share(count));
@@ -1523,22 +2060,64 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
     count_work(Work::IndirectExecutionsEmitted);
 }
 
-void CommandList::OMSetDepthBounds(float, float) {
-    if (usable()) {
-        device_->count(xbox::Counter::DepthBoundsIgnored);  // no depth-bounds test in WebGPU
+void CommandList::OMSetDepthBounds(float min_depth, float max_depth) {
+    if (!usable()) {
+        return;
     }
+    device_->count(xbox::Counter::DepthBoundsIgnored);  // no depth-bounds test in WebGPU
+    if (!std::isfinite(min_depth) || !std::isfinite(max_depth) || min_depth > max_depth) {
+        note("OMSetDepthBounds: invalid depth range");
+        return;
+    }
+    xbox::CommandListXboxStateTable& t = xbox::command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    t.depth_bounds[identity()] = xbox::DepthBoundsState{min_depth, max_depth, true};
 }
 
-void CommandList::RSSetShadingRate(uint32_t, uint64_t) {
-    if (usable()) {
-        device_->count(xbox::Counter::ShadingRateIgnored);  // full-rate shading
+void CommandList::RSSetShadingRate(uint32_t rate, uint64_t combiners) {
+    if (!usable()) {
+        return;
     }
+    device_->count(xbox::Counter::ShadingRateIgnored);  // full-rate shading
+    if (!xbox::is_valid_shading_rate(rate)) {
+        note("RSSetShadingRate: invalid shading rate " + hex(rate));
+        return;
+    }
+    uint32_t comb[2] = {0, 0};
+    if (combiners != 0) {
+        if (!com::read_guest(combiners, comb, sizeof(comb))) {
+            note("RSSetShadingRate: unreadable combiner array at " + hex(combiners));
+            return;
+        }
+        if (!xbox::is_valid_shading_rate_combiner(comb[0]) || !xbox::is_valid_shading_rate_combiner(comb[1])) {
+            note("RSSetShadingRate: invalid combiner values (" + std::to_string(comb[0]) + ", " +
+                 std::to_string(comb[1]) + ")");
+            return;
+        }
+    }
+    xbox::CommandListXboxStateTable& t = xbox::command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    xbox::ShadingRateState& s = t.shading_rate[identity()];
+    s.base_rate = rate;
+    s.combiners[0] = comb[0];
+    s.combiners[1] = comb[1];
+    s.rate_set = true;
 }
 
-void CommandList::RSSetShadingRateImage(InterfaceArg<IResourceHost>) {
-    if (usable()) {
-        device_->count(xbox::Counter::ShadingRateIgnored);
+void CommandList::RSSetShadingRateImage(InterfaceArg<IResourceHost> image) {
+    if (!usable()) {
+        return;
     }
+    device_->count(xbox::Counter::ShadingRateIgnored);
+    if (image.va() != 0 && !image) {
+        note("RSSetShadingRateImage: invalid resource " + hex(image.va()));
+        return;
+    }
+    xbox::CommandListXboxStateTable& t = xbox::command_list_xbox_state();
+    std::lock_guard<std::mutex> lock(t.mutex);
+    xbox::ShadingRateState& s = t.shading_rate[identity()];
+    s.image_va = image.va();
+    s.image_set = true;
 }
 
 void CommandList::note_xbox_slot(uint32_t slot) {
