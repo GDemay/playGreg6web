@@ -269,8 +269,6 @@ pub const EXE_MODULE: &str = super::DEFAULT_MODULE;
 pub const HOST_MODULES: &[&str] = &[
     "acphal.dll",
     "amd_fidelityfx_loader_xbox.dll",
-    // Loaded at runtime by the --audio-out render thread (MMCSS "Pro Audio", os/audio_out_wasapi.cpp).
-    "avrt.dll",
     "bink2scarlett.dll",
     "chad.dll",
     "combase.dll",
@@ -286,6 +284,13 @@ pub const HOST_MODULES: &[&str] = &[
     "xcrdapi.dll",
     "xg_xs.dll",
     "xmem.dll",
+];
+
+/// DLLs the host runtime itself loads for its own use (not guest-visible): declared so the runtime
+/// scan test knows about them, but never treated as implemented for guest imports (see [`host_known`]).
+pub const HOST_ONLY_DEPENDENCIES: &[&str] = &[
+    // --audio-out render thread: MMCSS "Pro Audio" (os/audio_out_wasapi.cpp).
+    "avrt.dll",
 ];
 
 /// Whether the runtime implements `dll` (any spelling): a shim family of the import bridge, a
