@@ -1789,3 +1789,238 @@ test('W327 process() performs strictly zero allocations and zero Atomics.wait wi
   assert.ok(stats.peakFillRatio > 0 && stats.peakFillRatio <= 1.0);
   assert.ok(stats.fillRatio >= 0 && stats.fillRatio <= 1.0);
 });
+
+// ---------------------------------------------------------------------------
+// Jitter/Stutter Fix (#1028/#663): Hysteresis Prebuffer, Cross-Quantum 160f
+// Click-Free Micro-Ramps, High-Water Trim Safety, and Zero-Alloc Discipline
+// ---------------------------------------------------------------------------
+
+test('Jitter/stutter fix (#1028/#663): hysteresis prebuffer eliminates rapid stop-start oscillation and finishes cross-quantum 160-frame cosine ramps click-free', () => {
+  assert.equal(workletMod.DEFAULT_PREBUFFER_FRAMES, 0);
+  assert.equal(workletMod.DEFAULT_RECOVERY_PREBUFFER_FRAMES, 3840);
+  assert.equal(workletMod.DEFAULT_LIVE_DECLICK_FRAMES, 160);
+  assert.equal(workletMod.DEFAULT_LIVE_HIGH_WATERMARK_FRAMES, 10080);
+  assert.equal(workletMod.DEFAULT_LIVE_TARGET_WATERMARK_FRAMES, 4608);
+
+  const fadeFrames = 160; // ~3.33 ms @ 48 kHz (> 128-frame quantum -> spans 2 quanta)
+  const prebufferFrames = 3840; // 80 ms @ 48 kHz
+  const ampL = Math.fround(0.75);
+  const ampR = Math.fround(-0.55);
+  const maxStepL = (Math.PI / (2 * fadeFrames)) * Math.abs(ampL) + 1e-4;
+  const maxStepR = (Math.PI / (2 * fadeFrames)) * Math.abs(ampR) + 1e-4;
+
+  const ring = AudioRingBuffer.create(16384, 2);
+  const processor = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      declickFrames: fadeFrames,
+      fadeCurve: 'cosine',
+      prebufferFrames,
+      maxBufferedFrames: 10080,
+      targetWatermarkFrames: 4608,
+      trimCrossfadeFrames: 64,
+    },
+  });
+
+  // Control message protocol for prebufferFrames.
+  const replies = attachMessageRecorder(processor);
+  processor.port.onmessage({ data: { type: 'setPrebufferFrames', prebufferFrames: 3072, id: 'pb-1' } });
+  assert.deepEqual(replies[replies.length - 1], {
+    type: 'prebufferFrames',
+    prebufferFrames: 3072,
+    id: 'pb-1',
+  });
+  assert.equal(processor.prebufferFrames, 3072);
+  assert.equal(processor.setPrebufferFrames(prebufferFrames), prebufferFrames);
+
+  // 1. Steady-state playback followed by partial underrun (64 frames left):
+  //    starts 160-frame fade-out across quantum boundary (64 frames faded in Q1, 96 frames in Q2).
+  assert.equal(ring.pushSamples(makeConstantStereo(192, ampL, ampR)), 192);
+  const out = makePlanarOutput(2, 128);
+  assert.equal(processor.process([], out), true); // consumes 128 -> 64 left
+  assert.equal(out[0][0][127], ampL);
+
+  let prevL = out[0][0][127];
+  let prevR = out[0][1][127];
+  assert.equal(processor.process([], out), true); // 64 valid + 64 fade-out
+  for (let f = 0; f < 128; f++) {
+    assert.ok(Math.abs(out[0][0][f] - prevL) <= maxStepL, `Q1 fade-out L jump at f=${f}`);
+    assert.ok(Math.abs(out[0][1][f] - prevR) <= maxStepR, `Q1 fade-out R jump at f=${f}`);
+    prevL = out[0][0][f];
+    prevR = out[0][1][f];
+  }
+  assert.equal(processor.inUnderrun, true);
+  assert.equal(processor.fadeOutCount, 1);
+
+  // 2. Immediately trickle 256 frames (< 3840 prebuffer): processor MUST enter hysteresis hold
+  //    AND finish the remaining 96 frames of the 160-frame fade-out smoothly to exact 0.0!
+  assert.equal(ring.pushSamples(makeConstantStereo(256, ampL, ampR)), 256);
+  assert.equal(processor.process([], out), true);
+  assert.equal(processor.inRebuffer, true);
+  assert.equal(ring.availableFrames(), 256, 'trickle frames must remain buffered during hysteresis hold');
+  for (let f = 0; f < 128; f++) {
+    assert.ok(Math.abs(out[0][0][f] - prevL) <= maxStepL, `Q2 fade-out L jump at f=${f}`);
+    assert.ok(Math.abs(out[0][1][f] - prevR) <= maxStepR, `Q2 fade-out R jump at f=${f}`);
+    prevL = out[0][0][f];
+    prevR = out[0][1][f];
+  }
+  assert.equal(out[0][0][95], 0.0);
+  assert.equal(out[0][0][127], 0.0);
+  assert.equal(out[0][1][127], 0.0);
+
+  // 3. Push 12 more small 256-frame trickles (total = 13 * 256 = 3328 < 3840):
+  //    must hold exact silence with ZERO premature resume / stop-start oscillation!
+  for (let t = 0; t < 12; t++) {
+    assert.equal(ring.pushSamples(makeConstantStereo(256, ampL, ampR)), 256);
+    assert.equal(processor.process([], out), true);
+    assert.equal(processor.inRebuffer, true);
+    assert.ok(out[0][0].every((v) => v === 0.0));
+    assert.ok(out[0][1].every((v) => v === 0.0));
+  }
+  assert.equal(processor.fadeInCount, 0);
+  assert.equal(processor.fadeOutCount, 1);
+  assert.equal(ring.availableFrames(), 3328);
+
+  // 4. Push 512 more frames -> total 3840 (reaches 80ms hysteresis target!):
+  //    exits hold ONCE and applies click-free 160-frame half-cosine fade-in across 2 quanta!
+  assert.equal(ring.pushSamples(makeConstantStereo(512, ampL, ampR)), 512);
+  prevL = 0.0;
+  prevR = 0.0;
+  for (let q = 0; q < 2; q++) {
+    assert.equal(processor.process([], out), true);
+    for (let f = 0; f < 128; f++) {
+      assert.ok(Math.abs(out[0][0][f] - prevL) <= maxStepL, `Recovery fade-in L jump at q=${q} f=${f}`);
+      assert.ok(Math.abs(out[0][1][f] - prevR) <= maxStepR, `Recovery fade-in R jump at q=${q} f=${f}`);
+      prevL = out[0][0][f];
+      prevR = out[0][1][f];
+    }
+  }
+  assert.equal(processor.inRebuffer, false);
+  assert.equal(processor.inUnderrun, false);
+  assert.equal(processor.rebufferCount, 1);
+  assert.equal(processor.rebufferQuanta, 13);
+  assert.equal(processor.fadeInCount, 1);
+  assert.equal(out[0][0][127], ampL);
+  assert.equal(out[0][1][127], ampR);
+  // Remaining jitter cushion after 2 quanta = 3840 - 256 = 3584 frames (~74.7 ms)!
+  assert.equal(ring.availableFrames(), 3584);
+
+  // 5. High-water drift trim (> 10080 frames = 210ms) trims gently down to 4608 (96ms >= 80ms prebuffer)
+  //    with click-free crossfade and zero underruns!
+  assert.equal(ring.pushSamples(makeConstantStereo(8000, -ampL, -ampR)), 8000);
+  assert.equal(ring.availableFrames(), 11584); // > 10080 ceiling
+  assert.equal(processor.process([], out), true);
+  assert.equal(processor.overrunTrimCount, 1);
+  assert.equal(processor.overrunTrimmedFrames, 11584 - 4608);
+  assert.equal(ring.availableFrames(), 4608 - 128);
+  assert.equal(processor.inRebuffer, false);
+  assert.equal(processor.inUnderrun, false);
+
+  // 6. Misconfigured prebufferFrames > maxBufferedFrames clamps safely and NEVER deadlocks!
+  const smallRing = AudioRingBuffer.create(1024, 2);
+  const clampedProc = new PlayGta6AudioWorkletProcessor({
+    processorOptions: {
+      sab: smallRing.sab,
+      prebufferFrames: 9000,
+      prebufferOnStart: true,
+      maxBufferedFrames: 512,
+      targetWatermarkFrames: 384,
+      declickFrames: 32,
+    },
+  });
+  assert.equal(clampedProc.inRebuffer, true);
+  assert.equal(smallRing.pushSamples(makeConstantStereo(384, 0.5, -0.5)), 384);
+  assert.equal(clampedProc.process([], out), true);
+  assert.equal(clampedProc.inRebuffer, false, 'prebuffer must clamp to <= 75% of maxBufferedFrames (384)');
+  assert.equal(clampedProc.rebufferCount, 1);
+});
+
+test('Jitter/stutter fix (#1028/#663): process() stays strictly zero-alloc with hysteresis prebuffer, 160-frame cosine ramps, drift trim, and periodic stats active', () => {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '../web/workers/audio_worklet_processor.js'),
+    'utf8'
+  );
+
+  let allocationCount = 0;
+  let trackingAllocations = false;
+  function trackCtor(RealCtor) {
+    return new Proxy(RealCtor, {
+      construct(target, args, newTarget) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.construct(target, args, newTarget);
+      },
+      apply(target, thisArg, args) {
+        if (trackingAllocations) allocationCount++;
+        return Reflect.apply(target, thisArg, args);
+      },
+    });
+  }
+
+  let RegisteredProcessor = null;
+  class MockBase {
+    constructor() {
+      this.port = { onmessage: null, postMessage() {} };
+    }
+  }
+  const sandbox = {
+    AudioWorkletProcessor: MockBase,
+    registerProcessor(_name, ctor) {
+      RegisteredProcessor = ctor;
+    },
+    Array: trackCtor(Array),
+    Float32Array: trackCtor(Float32Array),
+    Int32Array: trackCtor(Int32Array),
+    Uint8Array: trackCtor(Uint8Array),
+    ArrayBuffer: trackCtor(ArrayBuffer),
+    SharedArrayBuffer: trackCtor(SharedArrayBuffer),
+    Object: trackCtor(Object),
+    Atomics: { load: Atomics.load, store: Atomics.store, add: Atomics.add },
+    Number,
+    Math,
+    Boolean,
+    String,
+    Error,
+    TypeError,
+    RangeError,
+  };
+  sandbox.globalThis = sandbox;
+  sandbox.self = sandbox;
+
+  vm.runInNewContext(src, sandbox, { filename: 'audio_worklet_processor.js' });
+
+  const ring = AudioRingBuffer.create(2048, 2);
+  const proc = new RegisteredProcessor({
+    processorOptions: {
+      sab: ring.sab,
+      declickFrames: 160,
+      fadeCurve: 'cosine',
+      prebufferFrames: 512,
+      prebufferOnStart: true,
+      maxBufferedFrames: 1280,
+      targetWatermarkFrames: 640,
+      trimCrossfadeFrames: 64,
+      statsIntervalQuanta: 4,
+    },
+  });
+
+  const out = makePlanarOutput(2, 128);
+  const trickle = makeConstantStereo(128, 0.4, -0.4);
+  const burst = makeConstantStereo(1536, -0.3, 0.3);
+
+  for (let q = 0; q < 48; q++) {
+    if (q < 6) {
+      pushRawSabFrames(ring.sab, trickle);
+    } else if (q === 20) {
+      pushRawSabFrames(ring.sab, burst);
+    } else if (q >= 32) {
+      pushRawSabFrames(ring.sab, trickle);
+    }
+    trackingAllocations = true;
+    assert.equal(proc.process([], out), true);
+    trackingAllocations = false;
+  }
+
+  assert.equal(allocationCount, 0, `Expected 0 allocations in process(), got ${allocationCount}`);
+  assert.ok(proc.rebufferCount >= 1);
+  assert.ok(proc.overrunTrimCount >= 1);
+});

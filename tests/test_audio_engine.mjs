@@ -1369,6 +1369,7 @@ test('W214: bounded PCM submitPcm/pullPcm tracks submittedFrames, droppedFrames,
     sampleRate: 48000,
     channels: 2,
     capacityFrames: 256,
+    declickFrames: 0,
     AudioContextCtor: MockAudioContext,
     AudioWorkletNodeCtor: MockAudioWorkletNode,
   });
@@ -2847,4 +2848,229 @@ test('O43: AudioEngine subscribes to BroadcastChannel("game-progress") audio-sta
 
   sender.close();
   assert.equal(openChannels, 0);
+});
+
+test('Jitter/stutter fix (#1028/#663): AudioEngine configures 341ms ring, click-free 160-frame ramps, 80ms hysteresis prebuffer, and 210ms drift trim', async () => {
+  // 1. Default 48 kHz live config.
+  {
+    const env = createMockWebAudioEnv({
+      initialState: 'running',
+      actualSampleRate: 48000,
+      attachRealProcessor: true,
+    });
+    const engine = new AudioEngine({
+      AudioContextCtor: env.MockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      listenTelemetryBroadcast: false,
+    });
+    const res = await engine.start();
+    assert.equal(res.ok, true);
+    assert.equal(engine.getStats().capacityFrames, 16384);
+
+    const opts = env.events.nodes[0].options.processorOptions;
+    assert.equal(opts.declickFrames, 160);
+    assert.equal(opts.fadeCurve, 'cosine');
+    assert.equal(opts.prebufferFrames, 3840);
+    assert.equal(opts.maxBufferedFrames, 10080);
+    assert.equal(opts.targetWatermarkFrames, 4608);
+    assert.equal(opts.trimCrossfadeFrames, 64);
+
+    // Re-attaching the same SAB is a no-op and does not reset worklet de-click state.
+    const postedBefore = env.events.nodes[0].postedMessages.length;
+    assert.equal(engine.attachSab(engine.sab), engine.sab);
+    assert.equal(env.events.nodes[0].postedMessages.length, postedBefore);
+
+    await engine.destroy();
+  }
+
+  // 2. Host sample-rate scaling (44.1 kHz and 96 kHz).
+  for (const hostRate of [44100, 96000]) {
+    const env = createMockWebAudioEnv({
+      initialState: 'running',
+      actualSampleRate: hostRate,
+      attachRealProcessor: true,
+    });
+    const engine = new AudioEngine({
+      AudioContextCtor: env.MockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      listenTelemetryBroadcast: false,
+    });
+    await engine.start();
+    const opts = env.events.nodes[0].options.processorOptions;
+    assert.ok(opts.declickFrames >= 128 && opts.declickFrames <= 384);
+    assert.ok(opts.prebufferFrames > 0 && opts.prebufferFrames <= 8192);
+    assert.ok(opts.maxBufferedFrames > opts.targetWatermarkFrames);
+    assert.ok(opts.targetWatermarkFrames >= opts.prebufferFrames);
+    await engine.destroy();
+  }
+
+  // 3. End-to-end bursty/jittery Bink2/Wasm simulation (60-75ms hitches + 180ms stall):
+  //    - 60-75ms hitches are absorbed cleanly with 0 underruns once prebuffered.
+  //    - Extreme 180ms stall fades out click-free, holds silence during hysteresis refill
+  //      (no stop-start oscillation), and fades back in click-free!
+  {
+    const { AudioMixerWorker } = require('../web/workers/audio_worker.js');
+    let fakeNow = 1000;
+    const timers = [];
+    const worker = new AudioMixerWorker(() => {}, {
+      now: () => fakeNow,
+      autoDrain: true,
+      declickFrames: 0,
+      setIntervalFn: (fn, ms) => {
+        const h = { fn, ms, cleared: false };
+        timers.push(h);
+        return h;
+      },
+      clearIntervalFn: (h) => {
+        if (h) h.cleared = true;
+      },
+    });
+
+    const env = createMockWebAudioEnv({
+      initialState: 'running',
+      actualSampleRate: 48000,
+      attachRealProcessor: true,
+    });
+    const engine = new AudioEngine({
+      audioWorker: worker,
+      AudioContextCtor: env.MockAudioContext,
+      AudioWorkletNodeCtor: env.MockAudioWorkletNode,
+      listenTelemetryBroadcast: false,
+    });
+    await engine.start();
+    const proc = env.events.nodes[0]._processor;
+
+    worker.handleMessage({
+      type: 'init',
+      sampleRate: 48000,
+      channels: 2,
+      ringSab: engine.sab,
+    });
+
+    // Build simulated Playgta6AudioRing (65536 stereo frames).
+    const capSamples = 131072;
+    const guestSab = new SharedArrayBuffer(64 + capSamples * 4);
+    const readCtrl = new Int32Array(guestSab, 0, 1);
+    const writeCtrl = new Int32Array(guestSab, 4, 1);
+    const guestData = new Float32Array(guestSab, 64, capSamples);
+    const mask = capSamples - 1;
+    let phaseFrame = 0;
+
+    function pushGuestFrames(frameCount) {
+      const write = Atomics.load(writeCtrl, 0) >>> 0;
+      for (let f = 0; f < frameCount; f++) {
+        const sample = 0.6;
+        guestData[(write + f * 2) & mask] = sample;
+        guestData[(write + f * 2 + 1) & mask] = -sample;
+        phaseFrame++;
+      }
+      Atomics.store(writeCtrl, 0, ((write + frameCount * 2) >>> 0) | 0);
+    }
+
+    worker.handleMessage({
+      type: 'attach-guest-pcm-ring',
+      sab: guestSab,
+      dataByteOffset: 64,
+      capacitySamples: capSamples,
+      channels: 2,
+      sampleRate: 48000,
+      readIndexByteOffset: 0,
+      writeIndexByteOffset: 4,
+      autoPump: true,
+    });
+    assert.equal(timers[timers.length - 1].ms, 8, 'active guest pump should run at 8ms cadence');
+
+    // Initial startup: Chrome runs 2 empty quanta before Wasm writes -> arms hysteresis prebuffer.
+    const out = makePlanarOutput(2, 128);
+    proc.process([], out);
+    proc.process([], out);
+    assert.equal(proc.inRebuffer, true);
+
+    // Wasm writes 90ms (4320 frames) -> single 8ms worker tick drains entire burst -> worklet exits prebuffer!
+    pushGuestFrames(4320);
+    fakeNow += 8;
+    timers[timers.length - 1].fn();
+    assert.equal(engine.availableFrames(), 4320);
+
+    // Drain 4 quanta to finish the 160-frame fade-in and reach steady-state 0.6/-0.6.
+    const underrunsBeforeHitches = proc.underruns;
+    for (let q = 0; q < 4; q++) {
+      proc.process([], out);
+    }
+    assert.equal(proc.inRebuffer, false);
+    assert.equal(out[0][0][127], Math.fround(0.6));
+
+    // Simulate 5 consecutive 64ms (3072-frame) Bink2/Wasm frame hitches followed by 64ms catch-up bursts!
+    for (let hitch = 0; hitch < 5; hitch++) {
+      // Worklet consumes 64ms = 24 quanta while Wasm is hitched (0 new frames produced).
+      for (let q = 0; q < 24; q++) {
+        proc.process([], out);
+        assert.equal(out[0][0][0], Math.fround(0.6), `hitch ${hitch} q=${q} should stay uninterrupted`);
+      }
+      // Wasm unfreezes and bursts 64ms (3072 frames); worker pumps full burst on next 8ms tick.
+      pushGuestFrames(3072);
+      fakeNow += 64;
+      timers[timers.length - 1].fn();
+    }
+    assert.equal(
+      proc.underruns,
+      underrunsBeforeHitches,
+      '64ms Bink2/Wasm hitches must be completely absorbed with 0 underruns'
+    );
+
+    // Now simulate an extreme 150ms stall that drains the entire cushion -> must fade out click-free
+    // and then hold silence cleanly during small trickles until 80ms (3840 frames) refills!
+    let prevL = out[0][0][127];
+    const maxAllowedStep = (Math.PI / (2 * 160)) * 0.6 + 1e-3;
+    for (let q = 0; q < 40; q++) {
+      proc.process([], out);
+      for (let f = 0; f < 128; f++) {
+        const curL = out[0][0][f];
+        assert.ok(
+          Math.abs(curL - prevL) <= maxAllowedStep,
+          `Click detected during stall fade-out at q=${q} f=${f}: ${prevL} -> ${curL}`
+        );
+        prevL = curL;
+      }
+    }
+    assert.equal(prevL, 0.0);
+    assert.equal(proc.inUnderrun, true);
+    assert.equal(proc.fadeOutCount, 1);
+
+    // Feed 5 small 512-frame trickles (2560 frames < 3840 prebuffer): worklet MUST stay silent
+    // (no stop-start oscillation!).
+    const fadeInsBeforeTrickles = proc.fadeInCount;
+    for (let t = 0; t < 5; t++) {
+      pushGuestFrames(512);
+      fakeNow += 8;
+      timers[timers.length - 1].fn();
+      proc.process([], out);
+      assert.ok(out[0][0].every((v) => v === 0.0), `Trickle ${t} must stay held in hysteresis silence`);
+      assert.equal(proc.inRebuffer, true);
+    }
+    assert.equal(proc.fadeInCount, fadeInsBeforeTrickles, 'Must not oscillate fade-in on tiny trickles');
+
+    // Feed remaining 1280 frames -> total 3840 (>= 80ms prebuffer) -> resumes ONCE with click-free fade-in!
+    pushGuestFrames(1280);
+    fakeNow += 8;
+    timers[timers.length - 1].fn();
+    prevL = 0.0;
+    for (let q = 0; q < 3; q++) {
+      proc.process([], out);
+      for (let f = 0; f < 128; f++) {
+        const curL = out[0][0][f];
+        assert.ok(
+          Math.abs(curL - prevL) <= maxAllowedStep,
+          `Click detected during recovery fade-in at q=${q} f=${f}: ${prevL} -> ${curL}`
+        );
+        prevL = curL;
+      }
+    }
+    assert.equal(proc.inRebuffer, false);
+    assert.equal(proc.fadeInCount, fadeInsBeforeTrickles + 1);
+    assert.equal(out[0][0][127], Math.fround(0.6));
+
+    worker.destroy();
+    await engine.destroy();
+  }
 });
