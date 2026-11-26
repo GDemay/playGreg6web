@@ -79,3 +79,26 @@ First frame about 30 s after load; the intro follows later. The first build take
 no window of its own, so the flag is opt-in and keys are read globally. It uses the table above plus I J K L (right
 stick), Shift / Ctrl (L3 / R3) and Z / C (LT / RT). Raw values pass through; the title's adapter applies the deadzones;
 the pad wins per axis when it is deflected more. `--input-script` takes precedence when both are given.
+
+## Native boot: fast, safe repeat builds
+
+`python tools/run_native_boot.py --build-only ...` runs only the (timed) build stages
+(`recomp`, `program`, `harness`) and exits before the run; each stage prints `done in N s`.
+Repeat builds avoid the three expensive stages by content-keyed caches that sit beside the
+object cache (`<object cache>-lift`, `<object cache>-recomp`):
+
+| Stage | Skipped when | Key |
+|---|---|---|
+| `recomp` (cargo release build, cold in a fresh worktree) | a binary for the same recompiler sources is cached; or the stamp `target/release/playgta6-recomp.key` matches | sha256 of every workspace crate's `src/`, manifests, `build.rs`, `Cargo.lock`, plus `rustc -vV` |
+| `program` (discovery + lift) | the lift cache has the entry, or `program/.lift-key` matches (#1475) | recompiler sources, exe, offered DLLs, shim headers, lift options |
+| `harness` (~389 shards) | the object cache has every shard object | per shard: IR hash, target triple, CPU, `-O` level, PIC mode, LLVM tool version, retarget code fingerprint |
+
+Overrides: `PLAYGTA6_RECOMP_CACHE=<dir>|off`, `PLAYGTA6_LIFT_CACHE=<dir>|off`, `--cache-dir`.
+Caches hold only hashes, binaries and generated IR, never game bytes in git.
+
+**Build-dir lock.** A run holds `<build-dir>/.build.lock` (heartbeat-kept, taken over after
+120 s without heartbeat when its process died) for the whole build and run. A second run on
+the same build dir fails immediately with `build directory ... is in use by another run` and
+exit code 2; give each parallel run its own `--build-dir` (the default `work/native-boot` is
+per checkout, so separate worktrees never collide). Never kill cargo/rustc/python to free a
+lock; wait or pick another build dir.
