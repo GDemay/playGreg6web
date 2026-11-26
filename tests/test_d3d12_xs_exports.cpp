@@ -975,7 +975,7 @@ constexpr uint32_t Map = 8, Unmap = 9, GetDesc = 10, GetGPUVirtualAddress = 11, 
 constexpr uint32_t ExecuteCommandLists = 35;
 // ID3D12GraphicsCommandList
 constexpr uint32_t Close = 9, Reset = 10, DrawInstanced = 12, DrawIndexedInstanced = 13, CopyBufferRegion = 15,
-                   CopyTextureRegion = 16, IASetPrimitiveTopology = 20, RSSetViewports = 21, RSSetScissorRects = 22,
+                   CopyTextureRegion = 16, CopyResource = 17, IASetPrimitiveTopology = 20, RSSetViewports = 21, RSSetScissorRects = 22,
                    SetPipelineState = 25, ResourceBarrier = 26, SetGraphicsRootSignature = 34, IASetIndexBuffer = 47,
                    IASetVertexBuffers = 48, OMSetRenderTargets = 50, ClearDepthStencilView = 51,
                    ClearRenderTargetView = 52;  // Xbox order (G27)
@@ -1906,6 +1906,153 @@ void test_copies_and_barriers() {
     // The barrier reached the device-level state registry at execute.
     CHECK(dev->resource_states().state(object_of<dg::Resource>(tex)->id(), 0) == 0x80);
     scene.release_all({list, upload, gpu_buf, tex});
+}
+
+// G66: GPU -> CPU read-back. A copy from GPU memory into a readback-heap buffer (buffer range or a
+// texture region into a placed footprint) becomes a ReadbackBuffer / ReadbackTexture packet that
+// names the source, the guest bytes' host address and the completion counter. A queue signal behind
+// it is held until the consumer has written the bytes and counted them, so the title never sees
+// the fence complete before its data; without an answer the hold ends at the timeout (counted).
+void test_gpu_readback() {
+    using W = dg::Work;
+    auto work = [](W w) { return dg::work_total(w); };
+    auto wait_for = [](auto pred) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (!pred() && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return pred();
+    };
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = false;  // the read-back hold alone decides
+        options.gpu_readback_hold = true;
+        options.gpu_readback_timeout_ms = 60000;
+        dx::set_device_options(options);
+        Scene scene(fx);
+        dg::Device* dev = host_device(scene.device);
+        const uint64_t list = scene.new_list();
+        const uint64_t gpu_buf = committed(fx, scene.device, 1, buffer_desc(256), 0x800);  // DEFAULT, COPY_SOURCE
+        const uint64_t readback = committed(fx, scene.device, 3, buffer_desc(4096), 0x400);  // READBACK
+        const uint64_t tex = committed(fx, scene.device, 1, texture_desc(16, 4, 28, 0), 0x800);  // RGBA8
+        const uint64_t rb_cpu = object_of<dg::Resource>(readback)->cpu_address();
+        CHECK(rb_cpu != 0 && object_of<dg::Resource>(gpu_buf)->cpu_address() == 0);
+        const uint64_t issued0 = work(W::ReadbacksIssued), bytes0 = work(W::ReadbackBytes);
+        const uint64_t held0 = work(W::ReadbackSignalsHeld), done0 = work(W::ReadbacksCompleted);
+
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::CopyBufferRegion, {I(readback), I(16), I(gpu_buf), I(8), I(32)});
+        dg::GuestTextureCopyLocation dst{};
+        dst.pResource = readback;
+        dst.Type = 1;
+        dst.PlacedFootprint = {1024, {28, 16, 4, 1, 256}};
+        dg::GuestTextureCopyLocation src{};
+        src.pResource = tex;
+        src.Type = 0;  // SubresourceIndex 0
+        fx.vcall(list, Slot2::CopyTextureRegion, {I(put(dst)), I(0), I(0), I(0), I(put(src)), I(0)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        CHECK(dev->stats().unsupported_copies == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        const Packet* rbb = find_op(ps, GpuOpcode::ReadbackBuffer);
+        const Packet* rbt = find_op(ps, GpuOpcode::ReadbackTexture);
+        CHECK(rbb != nullptr && rbt != nullptr);
+        if (rbb == nullptr || rbt == nullptr) {
+            return;
+        }
+        const auto b = payload_as<GpuReadbackBufferPayload>(*rbb);
+        CHECK(b.seq == 1 && b.buffer_id == object_of<dg::Resource>(gpu_buf)->id() && b.src_offset == 8 && b.size == 32);
+        CHECK(b.dst_addr == reinterpret_cast<uintptr_t>(com::guest_to_host(rb_cpu + 16, 32)));
+        CHECK(b.done_addr == dev->readbacks().done_address());
+        const auto t = payload_as<GpuReadbackTexturePayload>(*rbt);
+        CHECK(t.seq == 2 && t.texture_id == object_of<dg::Resource>(tex)->id() && t.mip_level == 0);
+        CHECK(t.width == 16 && t.height == 4 && t.depth_or_layers == 1 && t.bytes_per_row == 256 &&
+              t.rows_per_image == 4 && t.dst_size == 256 * 3 + 64);
+        CHECK(t.dst_addr == reinterpret_cast<uintptr_t>(com::guest_to_host(rb_cpu + 1024, t.dst_size)));
+        CHECK(work(W::ReadbacksIssued) == issued0 + 2 && work(W::ReadbackBytes) == bytes0 + 32 + 256 * 3 + 64);
+
+        // Signal after the read-backs: held (word and GetCompletedValue stay 0) until both landed.
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(work(W::ReadbackSignalsHeld) == held0 + 1);
+        CHECK(load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);
+        // A later signal queues behind it (in order).
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(2)})) == 0);
+        CHECK(dev->readbacks().stats().signals_pending == 2);
+
+        // The consumer: bytes first, then the counter (one per read-back).
+        auto* done = reinterpret_cast<std::atomic<uint32_t>*>(static_cast<uintptr_t>(b.done_addr));
+        std::vector<uint8_t> data(32);
+        for (size_t i = 0; i < data.size(); ++i) {
+            data[i] = static_cast<uint8_t>(0xA0 + i);
+        }
+        std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(b.dst_addr)), data.data(), data.size());
+        done->fetch_add(1);
+        dev->readbacks().poll();
+        CHECK(load64(word) == 0 && fx.vcall(fence, Slot::GetCompletedValue) == 0);  // texture still out
+        std::memset(reinterpret_cast<void*>(static_cast<uintptr_t>(t.dst_addr)), 0x5C, static_cast<size_t>(t.dst_size));
+        done->fetch_add(1);
+        CHECK(wait_for([&] { return load64(word) == 2; }));
+        CHECK(fx.vcall(fence, Slot::GetCompletedValue) == 2);
+        std::vector<uint8_t> got(32);
+        CHECK(com::read_guest(rb_cpu + 16, got.data(), got.size()) && got == data);
+        uint8_t texel = 0;
+        CHECK(com::read_guest(rb_cpu + 1024 + 256 * 3, &texel, 1) && texel == 0x5C);
+        CHECK(work(W::ReadbacksCompleted) == done0 + 2);
+
+        // Nothing outstanding: a signal completes at once.
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(3)})) == 0);
+        CHECK(load64(word) == 3 && dev->readbacks().stats().signals_pending == 0);
+
+        // Executing the list again issues (and numbers) its read-backs again.
+        const size_t mark2 = fx.captured.size();
+        scene.execute({list});
+        const auto ps2 = packets_since(fx, mark2);
+        const Packet* again = find_op(ps2, GpuOpcode::ReadbackBuffer);
+        CHECK(again != nullptr && payload_as<GpuReadbackBufferPayload>(*again).seq == 3);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(4)})) == 0);
+        CHECK(load64(word) == 3);
+        done->fetch_add(2);
+        CHECK(wait_for([&] { return load64(word) == 4; }));
+        scene.release_all({list, gpu_buf, readback, tex, fence});
+    }
+    // No consumer answers: the held signal is released at the timeout (counted), so the title
+    // cannot hang on it.
+    {
+        Fixture fx;
+        dg::DeviceOptions options;
+        options.sink = [&fx](const uint8_t* data, size_t size) { fx.captured.emplace_back(data, data + size); };
+        options.fence_publish_lag = false;
+        options.gpu_readback_hold = true;
+        options.gpu_readback_timeout_ms = 20;
+        dx::set_device_options(options);
+        Scene scene(fx);
+        const uint64_t list = scene.new_list();
+        const uint64_t gpu_buf = committed(fx, scene.device, 1, buffer_desc(256), 0x800);
+        const uint64_t readback = committed(fx, scene.device, 3, buffer_desc(256), 0x400);
+        CHECK(hr(fx.vcall(list, Slot2::Reset, {I(scene.allocator), I(0)})) == 0);
+        fx.vcall(list, Slot2::CopyResource, {I(readback), I(gpu_buf)});
+        CHECK(hr(fx.vcall(list, Slot2::Close)) == 0);
+        const size_t mark = fx.captured.size();
+        scene.execute({list});
+        const auto ps = packets_since(fx, mark);
+        const Packet* rbb = find_op(ps, GpuOpcode::ReadbackBuffer);
+        CHECK(rbb != nullptr && payload_as<GpuReadbackBufferPayload>(*rbb).size == 256);
+        const uint64_t timeouts0 = work(W::ReadbackTimeouts);
+        int32_t result = -1;
+        const uint64_t fence = fx.create(scene.device, Slot::CreateFence, {I(0), I(0)}, dg::IID_ID3D12Fence, &result);
+        const uint64_t word = fx.vcall(fence, 12);
+        CHECK(hr(fx.vcall(scene.queue, Slot::QueueSignal, {I(fence), I(1)})) == 0);
+        CHECK(load64(word) == 0);
+        CHECK(wait_for([&] { return load64(word) == 1; }));
+        CHECK(work(W::ReadbackTimeouts) == timeouts0 + 1);
+        scene.release_all({list, gpu_buf, readback, fence});
+    }
 }
 
 void test_concurrent_recording() {
@@ -6537,6 +6684,7 @@ int main() {
     test_frame_end_to_end();
     test_unresolved_shaders_and_indexed_draws();
     test_copies_and_barriers();
+    test_gpu_readback();
     test_a8_upload_widened();
     test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();

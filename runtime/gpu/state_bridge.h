@@ -645,6 +645,12 @@ public:
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
 
+    // G66 read-back: ends the open render pass (pending clears first, as for a copy) and emits a
+    // ReadbackBuffer / ReadbackTexture packet naming `resource_id`. Returns the encoder offset of
+    // the payload (the caller patches its sequence number at execution), or SIZE_MAX when the list
+    // is not writable.
+    size_t Readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id);
+
     // Emits a WriteTexture packet into this command list's encoder stream (G49b).
     void WriteTexture(uint32_t texture_id, uint32_t mip_level, uint32_t origin_x, uint32_t origin_y,
                       uint32_t origin_z, uint32_t width, uint32_t height, uint32_t depth_or_layers,

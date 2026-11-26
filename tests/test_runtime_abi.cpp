@@ -946,6 +946,8 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(static_cast<uint16_t>(GpuOpcode::SetBindGroup2) == 33);
     CHECK(static_cast<uint16_t>(GpuOpcode::CreateSampler2) == 34);
     CHECK(static_cast<uint16_t>(GpuOpcode::CreateTexture2) == 35);
+    CHECK(static_cast<uint16_t>(GpuOpcode::ReadbackBuffer) == 39);
+    CHECK(static_cast<uint16_t>(GpuOpcode::ReadbackTexture) == 40);
 
     CHECK(sizeof(GpuTextureViewDesc) == 16);
     CHECK(sizeof(GpuBindGroupLayoutEntry) == 24);
@@ -1009,6 +1011,15 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(offsetof(GpuCreateTexture2Payload, format) == 29);
     CHECK(offsetof(GpuCreateTexture2Payload, view_format_count) == 30);
     CHECK(offsetof(GpuCreateTexture2Payload, view_formats) == 32);
+    CHECK(sizeof(GpuReadbackBufferPayload) == 40);
+    CHECK(offsetof(GpuReadbackBufferPayload, src_offset) == 8);
+    CHECK(offsetof(GpuReadbackBufferPayload, dst_addr) == 24);
+    CHECK(offsetof(GpuReadbackBufferPayload, done_addr) == 32);
+    CHECK(sizeof(GpuReadbackTexturePayload) == 72);
+    CHECK(offsetof(GpuReadbackTexturePayload, bytes_per_row) == 36);
+    CHECK(offsetof(GpuReadbackTexturePayload, dst_addr) == 48);
+    CHECK(offsetof(GpuReadbackTexturePayload, done_addr) == 56);
+    CHECK(offsetof(GpuReadbackTexturePayload, dst_size) == 64);
     CHECK(kGpuMaxTextureViewFormats == 8);
 
     // GpuBindGroupEntry2 starts with the exact v1 entry.

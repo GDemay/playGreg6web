@@ -56,6 +56,11 @@ const char* work_name(Work w) {
     case Work::PipelinesCreated: return "pipelines_created";
     case Work::ReflectionRootDescriptorTables: return "reflection_root_descriptor_tables";
     case Work::ReflectionVertexInputsDefaulted: return "reflection_vertex_inputs_defaulted";
+    case Work::ReadbacksIssued: return "readbacks_issued";
+    case Work::ReadbackBytes: return "readback_bytes";
+    case Work::ReadbacksCompleted: return "readbacks_completed";
+    case Work::ReadbackSignalsHeld: return "readback_signals_held";
+    case Work::ReadbackTimeouts: return "readback_timeouts";
     case Work::Count: break;
     }
     return "?";
@@ -210,6 +215,9 @@ void CommandQueue::execute(const std::vector<uint64_t>& lists) {
     // One submission: changed CPU-visible buffers, then each list's CPU-sourced copies and packets.
     std::vector<CommandEncoder> parts(1 + resolved.size());
     device_->begin_submission();
+    for (CommandList* list : resolved) {
+        list->issue_readbacks();  // G66: numbered (and counted) before any signal can follow them
+    }
     device_->flush_cpu_buffers(parts[0]);
     std::vector<d3d::StateDiagnostic> state_diags;
     for (size_t i = 0; i < resolved.size(); ++i) {
@@ -275,6 +283,7 @@ void CommandList::reset(PipelineState* initial_state) {
     encoder_.clear();
     deferred_.clear();
     immediate_writes_.clear();
+    readbacks_.clear();
     graphics_root_args_ = {};
     graphics_root_signature_ = nullptr;
     vertex_buffers_ = {};
@@ -966,6 +975,19 @@ void CommandList::CopyBufferRegion(InterfaceArg<IResourceHost> dst_arg, uint64_t
         note("CopyBufferRegion: invalid resources or range");
         return;
     }
+    if (src->cpu_address() == 0 && dst->cpu_address() != 0) {
+        // G66: GPU memory into CPU-visible memory (a readback heap): read back.
+        pinned_.push_back(com::Ref<com::ComObject>::share(src));
+        pinned_.push_back(com::Ref<com::ComObject>::share(dst));
+        GpuReadbackBufferPayload p{};
+        p.buffer_id = src->id();
+        p.src_offset = src_offset;
+        p.size = bytes;
+        if (readback_target(dst->cpu_address() + dst_offset, bytes, &p.dst_addr, &p.done_addr)) {
+            record_readback(GpuOpcode::ReadbackBuffer, &p, sizeof(p), src->id(), dst->cpu_address() + dst_offset, bytes);
+        }
+        return;
+    }
     if (src->cpu_address() == 0) {
         device_->note_unsupported_copy("CopyBufferRegion: GPU-to-GPU buffer copy has no packet (skipped)");
         return;
@@ -1001,6 +1023,19 @@ void CommandList::CopyResource(InterfaceArg<IResourceHost> dst_arg, InterfaceArg
         deferred_.push_back(w);
         return;
     }
+    if (dst->is_buffer() && src->is_buffer() && src->cpu_address() == 0 && dst->cpu_address() != 0) {
+        // G66: a whole GPU buffer into CPU-visible memory: read back.
+        pinned_.push_back(com::Ref<com::ComObject>::share(src));
+        pinned_.push_back(com::Ref<com::ComObject>::share(dst));
+        const uint64_t bytes = std::min(dst->desc().Width, src->desc().Width);
+        GpuReadbackBufferPayload p{};
+        p.buffer_id = src->id();
+        p.size = bytes;
+        if (readback_target(dst->cpu_address(), bytes, &p.dst_addr, &p.done_addr)) {
+            record_readback(GpuOpcode::ReadbackBuffer, &p, sizeof(p), src->id(), dst->cpu_address(), bytes);
+        }
+        return;
+    }
     device_->note_unsupported_copy("CopyResource: only CPU-visible buffer sources are supported (skipped)");
 }
 
@@ -1018,6 +1053,11 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     Resource* buf = as_resource(src.pResource);
     va_watch_resource("copy source (CopyTextureRegion)", buf, "to resource id " + std::to_string(tex ? tex->id() : 0));
     va_watch_resource("copy destination (CopyTextureRegion)", tex, "from resource id " + std::to_string(buf ? buf->id() : 0));
+    if (dst.Type == 1 && src.Type == 0 && tex != nullptr && buf != nullptr && tex->is_buffer() && !buf->is_buffer()) {
+        // Here `tex` is the footprint buffer (destination) and `buf` the texture (source).
+        copy_texture_to_footprint(ctx, dst, src, tex, buf);
+        return;
+    }
     if (tex == nullptr || buf == nullptr || dst.Type != 0 || src.Type != 1 || tex->is_buffer() || !buf->is_buffer()) {
         device_->note_unsupported_copy("CopyTextureRegion: only buffer footprint -> texture subresource is supported");
         return;
@@ -1086,6 +1126,114 @@ void CommandList::CopyTextureRegion(com::CallContext& ctx) {
     wr.widen_a8 = tex->desc().Format == static_cast<uint32_t>(pso::DxgiFormat::A8_UNORM);
     deferred_.push_back(wr);
     device_->note_texture_copy_destination(tex->id());
+}
+
+// ---- GPU -> CPU read-back (G66) ----
+
+bool CommandList::readback_target(uint64_t va, uint64_t bytes, uint64_t* dst_addr, uint64_t* done_addr) {
+    void* host = bytes == 0 ? nullptr : com::guest_to_host(va, static_cast<size_t>(bytes));
+    if (host == nullptr) {
+        note("read-back: destination " + hex(va) + " (+" + std::to_string(bytes) + ") is not guest memory");
+        return false;
+    }
+    *dst_addr = reinterpret_cast<uintptr_t>(host);
+    *done_addr = device_->readbacks().done_address();
+    return true;
+}
+
+void CommandList::record_readback(GpuOpcode opcode, const void* payload, uint32_t payload_bytes, uint32_t resource_id,
+                                  uint64_t va, uint64_t bytes) {
+    const size_t at = bridge_.Readback(opcode, payload, payload_bytes, resource_id);
+    if (at == SIZE_MAX) {
+        return;
+    }
+    ReadbackRecord r;
+    r.seq_offset = at;  // seq is the payload's first field
+    r.guest_va = va;
+    r.bytes = bytes;
+    readbacks_.push_back(r);
+}
+
+void CommandList::issue_readbacks() {
+    for (const ReadbackRecord& r : readbacks_) {
+        const uint32_t seq = device_->readbacks().issue(r.guest_va, r.bytes);
+        encoder_.patch(r.seq_offset, &seq, sizeof(seq));
+    }
+}
+
+// CopyTextureRegion with a texture subresource source and a placed-footprint destination in
+// CPU-visible memory: the region is read back into the footprint's rows.
+void CommandList::copy_texture_to_footprint(com::CallContext& ctx, const GuestTextureCopyLocation& dst,
+                                            const GuestTextureCopyLocation& src, Resource* buf, Resource* tex) {
+    if (buf->cpu_address() == 0 || !tex->has_gpu_texture()) {
+        device_->note_unsupported_copy("CopyTextureRegion: texture -> footprint needs a CPU-visible buffer and a GPU texture");
+        return;
+    }
+    const uint32_t sub = static_cast<uint32_t>(src.PlacedFootprint.Offset);  // SubresourceIndex
+    if (sub >= tex->subresource_count()) {
+        note("CopyTextureRegion: source subresource " + std::to_string(sub) + " out of range");
+        return;
+    }
+    const GuestSubresourceFootprint& fp = dst.PlacedFootprint.Footprint;
+    const DxgiFormatLayout l = dxgi_format_layout(fp.Format);
+    if (!l.known || fp.RowPitch == 0) {
+        note("CopyTextureRegion: unknown footprint format " + std::to_string(fp.Format));
+        return;
+    }
+    if (device_->upload_needs_conversion(tex->desc().Format)) {
+        device_->note_unsupported_copy("CopyTextureRegion: DXGI format " + std::to_string(tex->desc().Format) +
+                                       " has a converted WebGPU format; read-back skipped");
+        return;
+    }
+    const uint32_t mip = sub % tex->mip_levels();
+    const uint32_t layer = (sub / tex->mip_levels()) % tex->array_layers();
+    const bool is3d = tex->desc().Dimension == ResourceDimension::Texture3D;
+    const uint64_t mip_w = std::max<uint64_t>(1, tex->desc().Width >> mip);
+    const uint32_t mip_h = std::max<uint32_t>(1, tex->desc().Height >> mip);
+    const uint32_t mip_d = is3d ? std::max<uint32_t>(1, tex->desc().DepthOrArraySize >> mip) : 1;
+    GuestBox box{0, 0, 0, static_cast<uint32_t>(mip_w), mip_h, mip_d};
+    if (ctx.int_arg(6) != 0 && !com::read_guest(ctx.int_arg(6), box)) {
+        note("CopyTextureRegion: unreadable source box");
+        return;
+    }
+    const uint32_t w = box.right > box.left ? box.right - box.left : 0;
+    const uint32_t h = box.bottom > box.top ? box.bottom - box.top : 0;
+    const uint32_t d = box.back > box.front ? box.back - box.front : 0;
+    if (w == 0 || h == 0 || d == 0) {
+        return;
+    }
+    const uint32_t dst_x = static_cast<uint32_t>(ctx.int_arg(2));
+    const uint32_t dst_y = static_cast<uint32_t>(ctx.int_arg(3));
+    const uint32_t dst_z = static_cast<uint32_t>(ctx.int_arg(4));
+    const uint32_t rows = (h + l.block_height - 1) / l.block_height;
+    const uint32_t rows_per_slice = (fp.Height + l.block_height - 1) / l.block_height;
+    const uint64_t row_bytes = uint64_t{(w + l.block_width - 1) / l.block_width} * l.block_bytes;
+    const uint64_t start = dst.PlacedFootprint.Offset + uint64_t{dst_z} * rows_per_slice * fp.RowPitch +
+                           uint64_t{dst_y / l.block_height} * fp.RowPitch +
+                           uint64_t{dst_x / l.block_width} * l.block_bytes;
+    const uint64_t len = uint64_t{d - 1} * rows_per_slice * fp.RowPitch + uint64_t{rows - 1} * fp.RowPitch + row_bytes;
+    if (row_bytes > fp.RowPitch || start + len > buf->desc().Width) {
+        note("CopyTextureRegion: read-back region exceeds the destination footprint");
+        return;
+    }
+    pinned_.push_back(com::Ref<com::ComObject>::share(buf));
+    pinned_.push_back(com::Ref<com::ComObject>::share(tex));
+    GpuReadbackTexturePayload p{};
+    p.texture_id = tex->id();
+    p.mip_level = mip;
+    p.origin_x = box.left;
+    p.origin_y = box.top;
+    p.origin_z = is3d ? box.front : layer;
+    p.width = w;
+    p.height = h;
+    p.depth_or_layers = d;
+    p.bytes_per_row = fp.RowPitch;
+    p.rows_per_image = rows_per_slice;
+    p.dst_size = len;
+    const uint64_t va = buf->cpu_address() + start;
+    if (readback_target(va, len, &p.dst_addr, &p.done_addr)) {
+        record_readback(GpuOpcode::ReadbackTexture, &p, sizeof(p), tex->id(), va, len);
+    }
 }
 
 // Xbox slot 85: (pDst, DstX, DstY, DstZ, pSrc, pSrcBox, flags) -> void. The title's texture upload
