@@ -231,12 +231,20 @@ def indirect_targets_path(cache_dir: Path | None, env: Mapping[str, str], exe: P
     return obj.with_name(obj.name + "-targets") / f"{exe.stem}-{file_digest(exe)[:12]}" / TARGETS_FILE
 
 
+def _set_marker(marker: Path, on: bool) -> None:
+    if on:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("native executor build")
+    elif marker.is_file():
+        marker.unlink()
+
+
 def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | None, jobs: int,
               force: bool, harness_override: Path | None,
               rebuild_program: bool = False, cache_dir: Path | None = None,
               lift_cache: Path | None = None, keep: int = LIFT_CACHE_KEEP,
               recomp_cache: Path | None = None, toolchain: str | None = None,
-              seed_targets: Path | None = None) -> tuple[Plan, Path, Path]:
+              seed_targets: Path | None = None, native_executor: bool = False) -> tuple[Plan, Path, Path]:
     """Returns the build plan, the program directory and the harness path. Objects go to
     `cache_dir`, else build_native_boot's machine-wide cache (shared by all checkouts). With
     `lift_cache`, a stale program is first looked up there by the hash of its inputs: a hit is
@@ -323,10 +331,17 @@ def make_plan(repo: Path, build_dir: Path, exe: Path | None, game_dir: Path | No
                                             ("the runtime sources or build_native_boot.py", runtime_newest)])
         if reason is None and plan.has("program"):
             reason = "the program is rebuilt"
+        marker = harness.parent / ".native-executor"
+        if reason is None and native_executor and not marker.is_file():
+            reason = "the harness was built without --native-executor"
+        if reason is None and not native_executor and marker.is_file():
+            reason = "the harness was built with --native-executor (rebuilding without)"
         if reason:
             cache = ["--cache-dir", str(cache_dir.resolve())] if cache_dir is not None else []
             plan.add("harness", reason, [sys.executable, str(repo / "tools" / "build_native_boot.py"), str(program),
-                                         *cache, "--jobs", str(jobs), "--keep-going", "--delete-ir", "--debug-info"])
+                                         *cache, "--jobs", str(jobs), "--keep-going", "--delete-ir", "--debug-info",
+                                         *(["--native-executor"] if native_executor else [])],
+                     after=lambda: _set_marker(marker, native_executor))
     return plan, program, harness
 
 
@@ -757,6 +772,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--ignore", action="append", default=[], metavar="PATTERN", help="compare_boot_reports --ignore")
     p.add_argument("--time-tolerance", type=float, metavar="REL")
     p.add_argument("--count-tolerance", type=float, metavar="REL")
+    p.add_argument("--native-executor", action="store_true",
+                   help="build the harness with --window support (Dawn executor; needs a Dawn checkout/cache)")
+    p.add_argument("--play", action="store_true",
+                   help="live native play: --native-executor build, then run with --window --audio-out --host-input")
     p.add_argument("extra", nargs=argparse.REMAINDER, help="after `--`: further playgta6_boot options")
     return p
 
@@ -863,7 +882,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
             raise RunnerError(f"--seed-targets: no recorded targets at {seed_file} (run the title once first)")
     plan, program, harness = make_plan(repo, build_dir, exe, game_dir, args.jobs, args.rebuild, args.harness,
                                       args.rebuild_program, args.cache_dir, lift_cache,
-                                      lift_cache_keep(env), recomp_cache, seed_targets=seed_file)
+                                      lift_cache_keep(env), recomp_cache, seed_targets=seed_file,
+                                      native_executor=args.native_executor or args.play)
     if args.trust_build:
         plan.steps = []
     max_ms = args.max_ms if args.max_ms is not None else preset["max_ms"]
@@ -899,6 +919,8 @@ def _run_locked(args, extra, runner, env, repo, exe, game_dir, build_dir, runs_d
         cmd += ["--dump-pipelines", args.dump_pipelines]
     if args.audio_dump:
         cmd += ["--audio-dump", args.audio_dump]
+    if args.play:
+        cmd += ["--window", "--audio-out", "--host-input"]
     cmd += extra
 
     for step in plan.steps:
