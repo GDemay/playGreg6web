@@ -147,9 +147,12 @@
 // CopyIntoSubresource writes that layout (gpu/gfx10_detile.h, the placement the runtime's detiler
 // reads); other descriptors get linear layouts (row pitch aligned to 256 bytes, mips one after
 // another). GetResourceTiling uses the D3D12 standard 64 KiB tile shapes (the same block grid as
-// GFX10 64KB modes; the packed-mip threshold is D3D12's). For the verified 64KB modes the tiles
-// are numbered in GFX10 memory order (mip tail first as one tile, then the larger mips
-// smallest-first), which the title assumes: it places the tail at tile 0 itself.
+// GFX10 64KB modes). For the verified 64KB modes the standard mips are those outside the GFX10
+// mip tail (not the D3D12 packed-mip threshold: a 2:1 mip below the tile shape can still have a
+// block of its own) and the tiles are numbered in GFX10 memory order (mip tail first as one tile,
+// then the larger mips smallest-first), which the title assumes: it places the tail at tile 0
+// itself and streams each standard mip and the tail as separate reads, which must match the
+// archive's compressed chunks (an assert in its DirectStorage request builder otherwise).
 
 namespace playgta6::os::scarlett::guest_api {
 

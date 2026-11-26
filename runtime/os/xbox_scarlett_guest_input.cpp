@@ -656,12 +656,26 @@ public:
         const XgTileShape t = tile_shape(desc_.dimension, e);
         const uint32_t mips = layout_.mip_levels;
         const uint32_t slices = desc_.dimension == 4 ? 1u : std::max<uint32_t>(layout_.array_size, 1);
+        namespace gfx10 = playgta6::gpu::gfx10;
+        const bool gfx10_64kb = tiled_ && tiled_block_bytes_ == 65536;
         uint32_t standard = 0;
         while (standard < mips) {
-            const Pg6XgMipLevelLayout& m = layout_.mips[standard];
-            if (m.width < t.width_in_texels || m.height < t.height_in_texels ||
-                (desc_.dimension == 4 && m.depth < t.depth_in_texels)) {
-                break;
+            if (gfx10_64kb) {
+                // GFX10 64KB modes: a mip is standard until it fits the mip tail (addrlib: both
+                // dimensions within the tail, which halves one block dimension), not when it gets
+                // smaller than a tile in one dimension (the D3D12 rule). For a 2:1 mip such as
+                // 64x32 BC7 blocks the two differ: GFX10 gives it a block of its own and the tail
+                // another one, and the title streams each standard mip and the tail as separate
+                // reads that must match the archive's per-block chunks.
+                if (gfx10::mip_placement(tiled_desc_, standard).in_tail) {
+                    break;
+                }
+            } else {
+                const Pg6XgMipLevelLayout& m = layout_.mips[standard];
+                if (m.width < t.width_in_texels || m.height < t.height_in_texels ||
+                    (desc_.dimension == 4 && m.depth < t.depth_in_texels)) {
+                    break;
+                }
             }
             ++standard;
         }
@@ -687,8 +701,7 @@ public:
         // numbered in memory order. addrlib puts the mip tail (one block) first and the larger
         // mips after it smallest-first, so mip 0 has the highest start tile; the title assumes
         // the tail at tile 0 and reads each mip at its start tile.
-        if (tiled_ && tiled_block_bytes_ == 65536) {
-            namespace gfx10 = playgta6::gpu::gfx10;
+        if (gfx10_64kb) {
             for (uint32_t m = 0; m < standard; ++m) {
                 per_mip[m].start_tile_index_in_overall_resource =
                     static_cast<uint32_t>(gfx10::mip_placement(tiled_desc_, m).macro_block_offset / 65536);
