@@ -663,7 +663,15 @@ test('bind groups: texture view descriptors, null bindings, manifest layouts and
     { binding: 4, visibility: 2, type: 2, subtype: 0, dimension: 2, flags: 0x2 }, // multisampled float
   ];
   const stream = concat(
-    new Stream().texture(50, 64, 64, 0).bytes(),
+    createTexture2Packet({
+      id: 50,
+      width: 64,
+      height: 64,
+      depthOrArrayLayers: 6,
+      mipLevelCount: 2,
+      format: 16, // r32float
+      usage: 0x04 | 0x08, // TEXTURE_BINDING | STORAGE_BINDING
+    }),
     bindGroupLayoutPacket(10, entries, { contentId: 0x1234n }),
     bindGroupLayoutPacket(11, [], { contentId: 0xabcn, flags: 1 }),
     pipelineLayoutPacket(12, [10, 0, 11]),
