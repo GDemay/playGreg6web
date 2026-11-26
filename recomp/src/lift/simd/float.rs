@@ -5,7 +5,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind};
 
 use super::super::{Flag, FunctionLifter, R, imm, unsupported};
-use super::{Elem, Form, Intr, Ty, fconst};
+use super::{Elem, Form, Intr, Ty, fconst, same_reg};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FOp {
@@ -348,13 +348,16 @@ impl FunctionLifter<'_> {
                 };
                 let t = Ty::v(e).ir();
                 let a = self.v128(ins, f.a, e)?;
-                let b = self.v128(ins, f.b, e)?;
-                let d = self.val(&format!("fsub {t} {a}, {b}"));
-                let s = self.val(&format!("fadd {t} {a}, {b}"));
-                let n = e.lanes();
-                // even lanes subtract, odd lanes add
-                let idx: Vec<u32> = (0..n).map(|l| if l % 2 == 1 { n + l } else { l }).collect();
-                let r = self.shuffle(&d, &s, e, &idx);
+                let b = if same_reg(ins, f.a, f.b) {
+                    a.clone()
+                } else {
+                    self.v128(ins, f.b, e)?
+                };
+                // Even lanes subtract, odd lanes add: in IEEE-754 round-to-nearest-even,
+                // `a - b` is bit-exact with `a + (-b)` (including signed zeros, inf, NaN),
+                // lowering to a single sign-bit `v128.xor` + `fadd` with zero shuffles.
+                let nb = self.neg_alt_lanes(&b, e, true);
+                let r = self.val(&format!("fadd {t} {a}, {nb}"));
                 self.xset(ins.op_register(f.dst), &r, e)?;
             }
             M::Roundps | M::Vroundps => self.round(ins, f, F32, false)?,
@@ -434,7 +437,7 @@ impl FunctionLifter<'_> {
                     "and {ti} {bits}, {}",
                     it.splat(&imm(0x8000_0000, 32))
                 ));
-                let mag = self.val(&format!("and {ti} {bits}, {}", it.splat("2147483647")));
+                let mag = self.val(&format!("xor {ti} {bits}, {sign}"));
                 // Denormal inputs count as zero: +-inf.
                 let den = self.val(&format!("icmp ult {ti} {mag}, {}", it.splat("8388608")));
                 let inf = self.val(&format!("or {ti} {sign}, {}", it.splat("2139095040")));
@@ -446,10 +449,10 @@ impl FunctionLifter<'_> {
                 if op == FOp::Rsqrt {
                     return r;
                 }
-                // rcp results that are not normal (|x| >= 2^126, finite) flush to +-0.
-                let big = self.val(&format!("icmp uge {ti} {mag}, {}", it.splat("2122317824")));
-                let finite = self.val(&format!("icmp ult {ti} {mag}, {}", it.splat("2139095040")));
-                let tiny = self.val(&format!("and {} {big}, {finite}", ty.bool_ir()));
+                // rcp results that are not normal (|x| >= 2^126, finite) flush to +-0:
+                // 0x7E80_0000 <= mag < 0x7F80_0000 <=> (mag - 0x7E80_0000) <_u 0x0100_0000.
+                let off = self.val(&format!("sub {ti} {mag}, {}", it.splat("2122317824")));
+                let tiny = self.val(&format!("icmp ult {ti} {off}, {}", it.splat("16777216")));
                 let zero = self.val(&format!("bitcast {ti} {sign} to {t}"));
                 self.val(&format!(
                     "select {} {tiny}, {t} {zero}, {t} {r}",
@@ -575,15 +578,43 @@ impl FunctionLifter<'_> {
         ))
     }
 
+    /// Flips the sign bit of even lanes (`neg_even == true`) or odd lanes (`neg_even == false`)
+    /// using a single bitwise `xor` on the integer view (1 `v128.xor` on Wasm SIMD128).
+    fn neg_alt_lanes(&mut self, v: &str, e: Elem, neg_even: bool) -> String {
+        let ty = Ty::v(e);
+        let ity = ty.int();
+        let mask = match (e, neg_even) {
+            (Elem::F32, true) => "<i32 -2147483648, i32 0, i32 -2147483648, i32 0>",
+            (Elem::F32, false) => "<i32 0, i32 -2147483648, i32 0, i32 -2147483648>",
+            (Elem::F64, true) => "<i64 -9223372036854775808, i64 0>",
+            (Elem::F64, false) => "<i64 0, i64 -9223372036854775808>",
+            _ => unreachable!(),
+        };
+        let iv = self.cast(v, ty, ity);
+        let flipped = self.val(&format!("xor {} {iv}, {mask}", ity.ir()));
+        self.cast(&flipped, ity, ty)
+    }
+
     /// `haddps/hsubps/haddpd/hsubpd`: pairwise op of adjacent lanes of a, then of b.
     fn horizontal(&mut self, ins: &Instruction, f: Form, e: Elem, op: &str) -> R<()> {
         let a = self.v128(ins, f.a, e)?;
-        let b = self.v128(ins, f.b, e)?;
         let n = e.lanes();
-        let even: Vec<u32> = (0..n).map(|l| 2 * l).collect();
-        let odd: Vec<u32> = (0..n).map(|l| 2 * l + 1).collect();
-        let lo = self.shuffle(&a, &b, e, &even);
-        let hi = self.shuffle(&a, &b, e, &odd);
+        let (lo, hi) = if same_reg(ins, f.a, f.b) {
+            let even: Vec<u32> = (0..n).map(|l| (2 * l) % n).collect();
+            let odd: Vec<u32> = (0..n).map(|l| (2 * l + 1) % n).collect();
+            (
+                self.shuffle(&a, "poison", e, &even),
+                self.shuffle(&a, "poison", e, &odd),
+            )
+        } else {
+            let b = self.v128(ins, f.b, e)?;
+            let even: Vec<u32> = (0..n).map(|l| 2 * l).collect();
+            let odd: Vec<u32> = (0..n).map(|l| 2 * l + 1).collect();
+            (
+                self.shuffle(&a, &b, e, &even),
+                self.shuffle(&a, &b, e, &odd),
+            )
+        };
         let r = self.val(&format!("{op} {} {lo}, {hi}", Ty::v(e).ir()));
         self.xset(ins.op_register(f.dst), &r, e)
     }
@@ -612,12 +643,16 @@ impl FunctionLifter<'_> {
 
     /// `dpps/dppd`: products of the lanes selected by imm8[7:4] (others +0.0), summed in the
     /// hardware's order, broadcast to the lanes selected by imm8[3:0] (others +0.0).
-    /// Uses vector `fmul` + mask shuffle against `zeroinitializer` (avoiding `0.0 * NaN` and
-    /// preserving exact `+0.0` sign) + pairwise vector `fadd` instead of scalar extract/insert.
+    /// Specialises 1-, 2-, and 3-lane masks for minimal Wasm SIMD128 shuffles while preserving
+    /// exact IEEE-754 `-0.0` sign rules and NaN isolation of masked-out lanes.
     fn dot(&mut self, ins: &Instruction, f: Form, e: Elem) -> R<()> {
         let i = Self::imm8(ins)?;
         let a = self.v128(ins, f.a, e)?;
-        let b = self.v128(ins, f.b, e)?;
+        let b = if same_reg(ins, f.a, f.b) {
+            a.clone()
+        } else {
+            self.v128(ins, f.b, e)?
+        };
         let n = e.lanes();
         let all = (1u32 << n) - 1;
         let in_mask = (i >> 4) & all;
@@ -627,30 +662,71 @@ impl FunctionLifter<'_> {
         }
         let vt = Ty::v(e).ir();
         let prod = self.val(&format!("fmul {vt} {a}, {b}"));
-        let masked = if in_mask == all {
-            prod
-        } else {
-            let idx: Vec<u32> = (0..n)
-                .map(|l| if (in_mask >> l) & 1 == 1 { l } else { n })
-                .collect();
-            self.shuffle(&prod, "zeroinitializer", e, &idx)
+        let emit_out = |l: &mut Self, vec: &str, lane: u32, broadcast: bool| -> String {
+            if out_mask == all {
+                if broadcast {
+                    vec.to_string()
+                } else {
+                    let idx: Vec<u32> = (0..n).map(|_| lane).collect();
+                    l.shuffle(vec, "poison", e, &idx)
+                }
+            } else {
+                let out_idx: Vec<u32> = (0..n)
+                    .map(|k| if (out_mask >> k) & 1 == 1 { lane } else { n })
+                    .collect();
+                l.shuffle(vec, "zeroinitializer", e, &out_idx)
+            }
         };
-        let sum_vec = if n == 4 {
-            let p1 = self.shuffle(&masked, "poison", e, &[1, 0, 3, 2]);
-            let s1 = self.val(&format!("fadd {vt} {masked}, {p1}"));
-            let p2 = self.shuffle(&s1, "poison", e, &[2, 3, 0, 1]);
-            self.val(&format!("fadd {vt} {s1}, {p2}"))
+        let active = in_mask.count_ones();
+        let r = if active == 1 {
+            // Single active lane: adding `+0.0` normalises `-0.0` to `+0.0` (matching the
+            // masked-out `+0.0` lanes in hardware) without any cross-lane shuffle.
+            let lane = in_mask.trailing_zeros();
+            let norm = self.val(&format!("fadd {vt} {prod}, zeroinitializer"));
+            emit_out(self, &norm, lane, false)
+        } else if n == 4 && active == 2 {
+            // Two active lanes `l0 < l1`: splat `l1`, add into `l0`, then add `+0.0` to match
+            // the hardware's masked-out `+0.0` lanes (5 ops vs 7).
+            let l0 = in_mask.trailing_zeros();
+            let l1 = (in_mask ^ (1 << l0)).trailing_zeros();
+            let p1 = self.shuffle(&prod, "poison", e, &[l1, l1, l1, l1]);
+            let s1 = self.val(&format!("fadd {vt} {prod}, {p1}"));
+            let s2 = self.val(&format!("fadd {vt} {s1}, zeroinitializer"));
+            emit_out(self, &s2, l0, false)
+        } else if n == 4 && active == 3 && out_mask != all {
+            // Three active lanes with partial output mask (e.g. `dpps 0x71`): combine the
+            // input masking with the first pairwise shuffle so lane `pair_dst` gets the pair
+            // sum and `lone` gets `prod[lone] + 0.0` in one step (saves 1 shuffle).
+            let (pair_dst, lone, p1_idx) = match in_mask {
+                0x7 => (0u32, 2u32, [1u32, 4, 4, 4]),
+                0xB => (0, 3, [1, 4, 4, 4]),
+                0xD => (2, 0, [4, 4, 3, 4]),
+                _ => (2, 1, [4, 4, 3, 4]), // 0xE
+            };
+            let p1 = self.shuffle(&prod, "zeroinitializer", e, &p1_idx);
+            let s1 = self.val(&format!("fadd {vt} {prod}, {p1}"));
+            let p2 = self.shuffle(&s1, "poison", e, &[lone, lone, lone, lone]);
+            let s2 = self.val(&format!("fadd {vt} {s1}, {p2}"));
+            emit_out(self, &s2, pair_dst, false)
         } else {
-            let p1 = self.shuffle(&masked, "poison", e, &[1, 0]);
-            self.val(&format!("fadd {vt} {masked}, {p1}"))
-        };
-        let r = if out_mask == all {
-            sum_vec
-        } else {
-            let out_idx: Vec<u32> = (0..n)
-                .map(|l| if (out_mask >> l) & 1 == 1 { 0 } else { n })
-                .collect();
-            self.shuffle(&sum_vec, "zeroinitializer", e, &out_idx)
+            let masked = if in_mask == all {
+                prod
+            } else {
+                let idx: Vec<u32> = (0..n)
+                    .map(|l| if (in_mask >> l) & 1 == 1 { l } else { n })
+                    .collect();
+                self.shuffle(&prod, "zeroinitializer", e, &idx)
+            };
+            let sum_vec = if n == 4 {
+                let p1 = self.shuffle(&masked, "poison", e, &[1, 0, 3, 2]);
+                let s1 = self.val(&format!("fadd {vt} {masked}, {p1}"));
+                let p2 = self.shuffle(&s1, "poison", e, &[2, 3, 0, 1]);
+                self.val(&format!("fadd {vt} {s1}, {p2}"))
+            } else {
+                let p1 = self.shuffle(&masked, "poison", e, &[1, 0]);
+                self.val(&format!("fadd {vt} {masked}, {p1}"))
+            };
+            emit_out(self, &sum_vec, 0, true)
         };
         self.xset(ins.op_register(f.dst), &r, e)
     }
@@ -662,13 +738,28 @@ impl FunctionLifter<'_> {
         let e = f.e;
         let n = if f.scalar { 1 } else { e.lanes() };
         let ty = if f.scalar { Ty::s(e) } else { Ty::v(e) };
-        let mut ops = Vec::new();
-        for i in 0..3 {
-            ops.push(if f.scalar {
+        let mut ops: Vec<String> = Vec::with_capacity(3);
+        let dst_vec = if f.scalar {
+            // Load op0's full 128-bit register once; extract lane 0 for the FMA and reuse the
+            // same vector to insert the scalar result back into lane 0.
+            let d = self.v128(ins, 0, e)?;
+            ops.push(self.extract(&d, e, 0));
+            Some(d)
+        } else {
+            ops.push(self.v128(ins, 0, e)?);
+            None
+        };
+        for i in 1..3 {
+            let v = if same_reg(ins, i, 0) {
+                ops[0].clone()
+            } else if i == 2 && same_reg(ins, 2, 1) {
+                ops[1].clone()
+            } else if f.scalar {
                 self.low(ins, i, e, 1)?
             } else {
                 self.v128(ins, i, e)?
-            });
+            };
+            ops.push(v);
         }
         let (x, y, z) = match f.order {
             FmaOrder::O132 => (&ops[0], &ops[2], &ops[1]),
@@ -684,21 +775,14 @@ impl FunctionLifter<'_> {
         let z = match f.neg_addend {
             [false, false] => z.clone(),
             [true, true] => self.val(&format!("fneg {t} {z}")),
-            [neg_even, _] => {
-                let nz = self.val(&format!("fneg {t} {z}"));
-                let idx: Vec<u32> = (0..n)
-                    .map(|l| if (l % 2 == 0) == neg_even { n + l } else { l })
-                    .collect();
-                self.shuffle(z, &nz, e, &idx)
-            }
+            [neg_even, _] => self.neg_alt_lanes(z, e, neg_even),
         };
         let r = if e == Elem::F32 {
             self.fma32(&x, y, &z, n)
         } else {
             self.fma64(&x, y, &z, n)
         };
-        if f.scalar {
-            let d = self.v128(ins, 0, e)?;
+        if let Some(d) = dst_vec {
             let v = self.insert(&d, e, &r, 0);
             self.xset(ins.op_register(0), &v, e)
         } else {
@@ -731,54 +815,89 @@ impl FunctionLifter<'_> {
     /// Correctly rounded binary32 `x * y + z` without a hardware FMA: the product is exact in
     /// binary64, the sum is rounded to odd in binary64 (TwoSum error term), and the final
     /// rounding to binary32 is then correct (53 >= 2 * 24 + 2).
+    ///
+    /// For `<4 x float>`, splits into two native 128-bit `<2 x double>` halves so LLVM emits
+    /// `f64x2.promote_low_f32x4` / `f32x4.demote_f64x2_zero` directly without 256-bit
+    /// legalization.
     fn fma32(&mut self, x: &str, y: &str, z: &str, n: u32) -> String {
+        if n == 4 {
+            let mut halves = Vec::with_capacity(2);
+            for half_mask in ["<2 x i32> <i32 0, i32 1>", "<2 x i32> <i32 2, i32 3>"] {
+                let xh = self.val(&format!(
+                    "shufflevector <4 x float> {x}, <4 x float> poison, {half_mask}"
+                ));
+                let yh = self.val(&format!(
+                    "shufflevector <4 x float> {y}, <4 x float> poison, {half_mask}"
+                ));
+                let zh = self.val(&format!(
+                    "shufflevector <4 x float> {z}, <4 x float> poison, {half_mask}"
+                ));
+                let h = self.fma32_core(&xh, &yh, &zh, 2);
+                // Zero-extend `<2 x float>` to `<4 x float>` and combine via swapped `or` on
+                // `<2 x i64>` so both zero upper halves stay demanded and LLVM emits native
+                // `f32x4.demote_f64x2_zero` instead of scalar `f64x2.extract_lane` + `f32.demote_f64`.
+                let z = self.zext_lanes(&h, Elem::F32, 2);
+                halves.push(self.cast(&z, Ty::v(Elem::F32), Ty::v(Elem::I64)));
+            }
+            let hi_swap = self.shuffle(&halves[1], "poison", Elem::I64, &[1, 0]);
+            let combined = self.val(&format!("or <2 x i64> {}, {hi_swap}", halves[0]));
+            return self.cast(&combined, Ty::v(Elem::I64), Ty::v(Elem::F32));
+        }
+        self.fma32_core(x, y, z, n)
+    }
+
+    /// Scalar (`n == 1`) or native 128-bit pair (`n == 2`) binary32 FMA via binary64 TwoSum
+    /// and branchless round-to-odd (zero `fcmp one`, zero double `select` chains, single `0.0`
+    /// constant).
+    fn fma32_core(&mut self, x: &str, y: &str, z: &str, n: u32) -> String {
         let (ft, dt, it, bt) = if n == 1 {
-            (
-                "float".to_string(),
-                "double".to_string(),
-                "i64".to_string(),
-                "i1".to_string(),
-            )
+            ("float", "double", "i64", "i1")
         } else {
-            (
-                format!("<{n} x float>"),
-                format!("<{n} x double>"),
-                format!("<{n} x i64>"),
-                format!("<{n} x i1>"),
-            )
+            ("<2 x float>", "<2 x double>", "<2 x i64>", "<2 x i1>")
         };
-        let dty = Ty::vn(Elem::F64, n);
-        let ity = Ty::vn(Elem::I64, n);
+        let zero_d = if n == 1 {
+            fconst(0.0)
+        } else {
+            "zeroinitializer".to_string()
+        };
+        let zero_i = if n == 1 { "0" } else { "zeroinitializer" };
+        let sh63 = if n == 1 { "63" } else { "<i64 63, i64 63>" };
+
         let a = self.val(&format!("fpext {ft} {x} to {dt}"));
         let b = self.val(&format!("fpext {ft} {y} to {dt}"));
         let c = self.val(&format!("fpext {ft} {z} to {dt}"));
         let p = self.val(&format!("fmul {dt} {a}, {b}"));
         let s = self.val(&format!("fadd {dt} {p}, {c}"));
-        // TwoSum: e = (p - (s - bb)) + (c - bb), bb = s - p.
+        // TwoSum: err = (p - (s - bb)) + (c - bb), bb = s - p.
         let bb = self.val(&format!("fsub {dt} {s}, {p}"));
         let t1 = self.val(&format!("fsub {dt} {s}, {bb}"));
         let e1 = self.val(&format!("fsub {dt} {p}, {t1}"));
         let e2 = self.val(&format!("fsub {dt} {c}, {bb}"));
         let err = self.val(&format!("fadd {dt} {e1}, {e2}"));
-        let zero = dty.splat(&fconst(0.0));
-        let inexact = self.val(&format!("fcmp one {dt} {err}, {zero}"));
+        // Sign of TwoSum error: d in {-1, 0, +1} (0 when err == 0 or NaN).
+        let gt = self.val(&format!("fcmp ogt {dt} {err}, {zero_d}"));
+        let lt = self.val(&format!("fcmp olt {dt} {err}, {zero_d}"));
+        let d = if n == 1 {
+            let gti = self.val(&format!("zext i1 {gt} to i64"));
+            let lti = self.val(&format!("zext i1 {lt} to i64"));
+            self.val(&format!("sub i64 {gti}, {lti}"))
+        } else {
+            // Vector comparisons produce all-ones (-1) for true, so `sext` is free on SIMD128.
+            let gti = self.val(&format!("sext {bt} {gt} to {it}"));
+            let lti = self.val(&format!("sext {bt} {lt} to {it}"));
+            self.val(&format!("sub {it} {lti}, {gti}"))
+        };
+        // Step to the odd neighbour on the side of the exact value:
+        // negate `d` when `s < 0`, and mask to 0 when `bits` is already odd.
         let bits = self.val(&format!("bitcast {dt} {s} to {it}"));
-        let lsb = self.val(&format!("and {it} {bits}, {}", ity.splat("1")));
-        let even = self.val(&format!("icmp eq {it} {lsb}, {}", ity.splat("0")));
-        let fix = self.val(&format!("and {bt} {inexact}, {even}"));
-        // Step to the odd neighbour on the side of the exact value.
-        let err_pos = self.val(&format!("fcmp ogt {dt} {err}, {zero}"));
-        let s_neg = self.val(&format!("icmp slt {it} {bits}, {}", ity.splat("0")));
-        let away = self.val(&format!("xor {bt} {err_pos}, {s_neg}"));
-        let step = self.val(&format!(
-            "select {bt} {away}, {it} {}, {it} {}",
-            ity.splat("1"),
-            ity.splat("-1")
-        ));
-        let step = self.val(&format!(
-            "select {bt} {fix}, {it} {step}, {it} {}",
-            ity.splat("0")
-        ));
+        let sneg_b = self.val(&format!("icmp slt {it} {bits}, {zero_i}"));
+        let sneg = self.val(&format!("sext {bt} {sneg_b} to {it}"));
+        let dx = self.val(&format!("xor {it} {d}, {sneg}"));
+        let ds = self.val(&format!("sub {it} {dx}, {sneg}"));
+        let lsb_top = self.val(&format!("shl {it} {bits}, {sh63}"));
+        let even_b = self.val(&format!("icmp eq {it} {lsb_top}, {zero_i}"));
+        let even = self.val(&format!("sext {bt} {even_b} to {it}"));
+        let step = self.val(&format!("and {it} {ds}, {even}"));
         let odd = self.val(&format!("add {it} {bits}, {step}"));
         let odd = self.val(&format!("bitcast {it} {odd} to {dt}"));
         self.val(&format!("fptrunc {dt} {odd} to {ft}"))

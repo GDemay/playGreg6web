@@ -5,7 +5,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use super::super::{FunctionLifter, R, unsupported};
-use super::{Elem, Form, Intr, Ty};
+use super::{Elem, Form, Intr, Ty, is_identity_mask, same_reg};
 
 /// Whether [`FunctionLifter::lift_moves`] handles `m` (mirroring its match arms).
 pub(super) fn is_move_supported(m: Mnemonic) -> bool {
@@ -133,14 +133,16 @@ impl FunctionLifter<'_> {
             M::Movlps | M::Vmovlps | M::Movlpd | M::Vmovlpd => self.move_half(ins, 0)?,
             M::Movhps | M::Vmovhps | M::Movhpd | M::Vmovhpd => self.move_half(ins, 1)?,
             M::Movlhps | M::Vmovlhps | M::Movhlps | M::Vmovhlps => {
+                let lh = matches!(ins.mnemonic(), M::Movlhps | M::Vmovlhps);
                 let a = self.xget(ins.op_register(f.a), I64)?;
-                let b = self.v128(ins, f.b, I64)?;
-                let idx = if matches!(ins.mnemonic(), M::Movlhps | M::Vmovlhps) {
-                    [0, 2]
+                let r = if same_reg(ins, f.a, f.b) {
+                    let idx = if lh { [0, 0] } else { [1, 1] };
+                    self.shuffle(&a, "poison", I64, &idx)
                 } else {
-                    [3, 1]
+                    let b = self.v128(ins, f.b, I64)?;
+                    let idx = if lh { [0, 2] } else { [3, 1] };
+                    self.shuffle(&a, &b, I64, &idx)
                 };
-                let r = self.shuffle(&a, &b, I64, &idx);
                 self.xset(ins.op_register(f.dst), &r, I64)?;
             }
             M::Movmskps | M::Vmovmskps => self.move_mask(ins, I32)?,
@@ -153,18 +155,19 @@ impl FunctionLifter<'_> {
                 } else {
                     [1, 1, 3, 3]
                 };
-                let r = self.shuffle(&v, &v, I32, &idx);
+                let r = self.shuffle(&v, "poison", I32, &idx);
                 self.xset(ins.op_register(0), &r, I32)?;
             }
             M::Movddup | M::Vmovddup => {
-                // xmm, xmm/m64 ; ymm, ymm/m256 (even quadword of each lane)
-                let v = if ins.op_kind(1) == OpKind::Memory && Self::mem_bytes(ins) == 8 {
+                // xmm, xmm/m64 ; ymm, ymm/m256 (even quadword of each lane).
+                // For m64, emit `splat_value` directly so LLVM lowers to `v128.load64_splat`.
+                let r = if ins.op_kind(1) == OpKind::Memory && Self::mem_bytes(ins) == 8 {
                     let s = self.low(ins, 1, I64, 1)?;
-                    self.zext_lanes(&s, I64, 1)
+                    self.splat_value(&s, I64)
                 } else {
-                    self.v128(ins, 1, I64)?
+                    let v = self.v128(ins, 1, I64)?;
+                    self.shuffle(&v, "poison", I64, &[0, 0])
                 };
-                let r = self.shuffle(&v, &v, I64, &[0, 0]);
                 self.xset(ins.op_register(0), &r, I64)?;
             }
             M::Vpermilps | M::Vpermilpd => {
@@ -182,7 +185,11 @@ impl FunctionLifter<'_> {
                         let i = self.lane_imm(i, 2);
                         (0..2).map(|l| (i >> l) & 1).collect()
                     };
-                    self.shuffle(&v, &v, e, &idx)
+                    if is_identity_mask(&idx) {
+                        v
+                    } else {
+                        self.shuffle(&v, "poison", e, &idx)
+                    }
                 } else {
                     // Variable control: bits 1:0 (ps) -> `i8x16.swizzle`; bit 1 (pd) -> vector
                     // select between splatted lanes (zero stack spills).
@@ -195,8 +202,8 @@ impl FunctionLifter<'_> {
                     } else {
                         let bit = self.val(&format!("and <2 x i64> {ctl}, <i64 2, i64 2>"));
                         let sel = self.val(&format!("icmp ne <2 x i64> {bit}, zeroinitializer"));
-                        let v0 = self.shuffle(&v, &v, I64, &[0, 0]);
-                        let v1 = self.shuffle(&v, &v, I64, &[1, 1]);
+                        let v0 = self.shuffle(&v, "poison", I64, &[0, 0]);
+                        let v1 = self.shuffle(&v, "poison", I64, &[1, 1]);
                         self.val(&format!("select <2 x i1> {sel}, <2 x i64> {v1}, <2 x i64> {v0}"))
                     }
                 };
@@ -222,18 +229,48 @@ impl FunctionLifter<'_> {
             M::Blendvpd | M::Vblendvpd => self.blend_var(ins, f, vex, I64)?,
             M::Insertps | M::Vinsertps => {
                 let i = Self::imm8(ins)?;
-                let a = self.xget(ins.op_register(f.a), I32)?;
-                let s = match ins.op_kind(f.b) {
-                    OpKind::Register => {
-                        let b = self.xget(ins.op_register(f.b), I32)?;
-                        self.extract(&b, I32, (i >> 6) & 3)
+                let zmask = i & 0xF;
+                if zmask == 0xF {
+                    if ins.op_kind(f.b) == OpKind::Memory {
+                        let _ = self.mem_load(ins, Ty::s(I32))?;
                     }
-                    _ => self.mem_load(ins, Ty::s(I32))?,
+                    self.xset(ins.op_register(f.dst), "zeroinitializer", I32)?;
+                    return Ok(true);
+                }
+                let src_lane = (i >> 6) & 3;
+                let dst_lane = (i >> 4) & 3;
+                let a = self.xget(ins.op_register(f.a), I32)?;
+                let mut r = match ins.op_kind(f.b) {
+                    OpKind::Register => {
+                        if (zmask >> dst_lane) & 1 == 1 {
+                            a
+                        } else if same_reg(ins, f.a, f.b) {
+                            let mut idx = [0, 1, 2, 3];
+                            idx[dst_lane as usize] = src_lane;
+                            if is_identity_mask(&idx) {
+                                a
+                            } else {
+                                self.shuffle(&a, "poison", I32, &idx)
+                            }
+                        } else {
+                            let b = self.xget(ins.op_register(f.b), I32)?;
+                            let mut idx = [0, 1, 2, 3];
+                            idx[dst_lane as usize] = 4 + src_lane;
+                            self.shuffle(&a, &b, I32, &idx)
+                        }
+                    }
+                    _ => {
+                        let s = self.mem_load(ins, Ty::s(I32))?;
+                        if (zmask >> dst_lane) & 1 == 1 {
+                            a
+                        } else {
+                            self.insert(&a, I32, &s, dst_lane)
+                        }
+                    }
                 };
-                let mut r = self.insert(&a, I32, &s, (i >> 4) & 3);
-                if i & 0xF != 0 {
+                if zmask != 0 {
                     let idx: Vec<u32> = (0..4)
-                        .map(|l| if i >> l & 1 == 1 { 4 } else { l })
+                        .map(|l| if (zmask >> l) & 1 == 1 { 4 } else { l })
                         .collect();
                     r = self.shuffle(&r, "zeroinitializer", I32, &idx);
                 }
@@ -251,10 +288,48 @@ impl FunctionLifter<'_> {
     }
 
     /// `dst = shufflevector(a, b, idx)` with the operand layout `f`.
+    /// Recognises identical register operands (`poison` unary shuffle), single-source masks
+    /// (such as trivial `blend` masks 0 / all-ones), and identity permutations (direct move).
     pub(super) fn shuffle_op(&mut self, ins: &Instruction, f: Form, e: Elem, idx: &[u32]) -> R<()> {
-        let a = self.v128(ins, f.a, e)?;
-        let b = self.v128(ins, f.b, e)?;
-        let r = self.shuffle(&a, &b, e, idx);
+        let n = e.lanes();
+        if same_reg(ins, f.a, f.b) {
+            let a = self.v128(ins, f.a, e)?;
+            let mapped: Vec<u32> = idx.iter().map(|&k| k % n).collect();
+            let r = if is_identity_mask(&mapped) {
+                a
+            } else {
+                self.shuffle(&a, "poison", e, &mapped)
+            };
+            return self.xset(ins.op_register(f.dst), &r, e);
+        }
+        let only_a = idx.iter().all(|&k| k < n);
+        let only_b = idx.iter().all(|&k| k >= n);
+        let r = if only_a {
+            let a = self.v128(ins, f.a, e)?;
+            if ins.op_kind(f.b) == OpKind::Memory {
+                let _ = self.v128(ins, f.b, e)?;
+            }
+            if is_identity_mask(idx) {
+                a
+            } else {
+                self.shuffle(&a, "poison", e, idx)
+            }
+        } else if only_b {
+            if ins.op_kind(f.a) == OpKind::Memory {
+                let _ = self.v128(ins, f.a, e)?;
+            }
+            let b = self.v128(ins, f.b, e)?;
+            let mapped: Vec<u32> = idx.iter().map(|&k| k - n).collect();
+            if is_identity_mask(&mapped) {
+                b
+            } else {
+                self.shuffle(&b, "poison", e, &mapped)
+            }
+        } else {
+            let a = self.v128(ins, f.a, e)?;
+            let b = self.v128(ins, f.b, e)?;
+            self.shuffle(&a, &b, e, idx)
+        };
         self.xset(ins.op_register(f.dst), &r, e)
     }
 
@@ -394,6 +469,10 @@ impl FunctionLifter<'_> {
     /// `blendvps/blendvpd/pblendvb`: lane from the second source when the mask lane's sign bit is
     /// set. The mask is the implicit `xmm0` (legacy) or the fourth operand (VEX).
     pub(super) fn blend_var(&mut self, ins: &Instruction, f: Form, vex: bool, e: Elem) -> R<()> {
+        if same_reg(ins, f.a, f.b) {
+            let a = self.v128(ins, f.a, e)?;
+            return self.xset(ins.op_register(f.dst), &a, e);
+        }
         let mask_reg = if vex {
             ins.op_register(3)
         } else {
