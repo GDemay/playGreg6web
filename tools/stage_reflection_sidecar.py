@@ -18,7 +18,7 @@ sidecar only when its reflection carries the join keys the runtime needs:
     window_base?: {cbv: <as above>, byte_offset, bit_offset?, mask?}}} (G62 / #482: per-lane
     (VGPR / waterfall) bindless, a window of max_count heap descriptors read as a binding_array;
     kept and counted, the runtime refuses the join with a counted reason until it binds arrays) |
-    {unresolved: true} (G62 / #482, sidecar version 3, only with --unresolved-sources: the translator
+    {unresolved: true | "<reason>"} (G62 / #482, sidecar version 3; added with --unresolved-sources: the translator
     reflected the binding but could not trace its descriptor, e.g. a bindless heap index read from a
     constant buffer at an offset computed from a root constant; the runtime binds the worker's
     default for it and joins the rest of the stage; writable kinds stay skipped));
@@ -227,7 +227,10 @@ def unresolved_source_ok(source: dict[str, Any], kind: Any) -> bool | None:
     """None: not an unresolved source; else whether it is exactly {unresolved: true} on a read-only kind."""
     if "unresolved" not in source:
         return None
-    return source == UNRESOLVED_SOURCE and KIND_MAP.get(str(kind)) in UNRESOLVABLE_KINDS
+    if len(source) != 1 or KIND_MAP.get(str(kind)) not in UNRESOLVABLE_KINDS:
+        return False
+    mark = source["unresolved"]
+    return mark is True or (isinstance(mark, str) and _SAFE_LABEL_RE.match(mark) is not None)
 
 
 def _stages_require_v3(stages: dict[str, Any]) -> bool:

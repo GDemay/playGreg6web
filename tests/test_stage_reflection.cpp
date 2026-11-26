@@ -990,7 +990,7 @@ void test_unresolved_source() {
       "bindings": [
         {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 8, "root_constants": true}},
         {"group": 0, "binding": 1, "kind": "texture", "view_dimension": "2d", "source": {"unresolved": true}},
-        {"group": 0, "binding": 2, "kind": "sampler", "source": {"unresolved": true}}
+        {"group": 0, "binding": 2, "kind": "sampler", "source": {"unresolved": "cb_dynamic_offset"}}
       ]
     }
   }
@@ -1040,6 +1040,8 @@ void test_unresolved_source() {
             "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": true}}]}}})",
         R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
             "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": false}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": ""}}]}}})",
         R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
             "bindings": [{"group": 0, "binding": 0, "kind": "storage", "source": {"unresolved": true}}]}}})",
         R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",

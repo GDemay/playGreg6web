@@ -1738,10 +1738,15 @@ class SidecarTests(unittest.TestCase):
     def test_unresolved_source_from_translator_is_validated(self):
         ok = self._sourceless_fragment("0x00000000000000f4", [])
         ok["bindings"].append({"group": 0, "binding": 1, "kind": "texture_2d", "source": {"unresolved": True}})
+        ok["bindings"].append({"group": 0, "binding": 2, "kind": "sampler",
+                               "source": {"unresolved": "cb_dynamic_offset"}})
         doc, skipped = sidecar.build([ok])
         self.assertEqual((doc["version"], skipped), (3, {}))
+        self.assertEqual(doc["stages"]["0x00000000000000f4"]["bindings"][2]["source"],
+                         {"unresolved": "cb_dynamic_offset"})
         for bad_source, kind in (({"unresolved": False}, "texture_2d"), ({"unresolved": True, "x": 1}, "texture_2d"),
-                                 ({"unresolved": True}, "storage")):
+                                 ({"unresolved": True}, "storage"), ({"unresolved": ""}, "texture_2d"),
+                                 ({"unresolved": "C:\\Users\\x"}, "texture_2d")):
             bad = self._sourceless_fragment("0x00000000000000f5", [])
             bad["bindings"].append({"group": 0, "binding": 1, "kind": kind, "source": bad_source})
             doc, skipped = sidecar.build([bad])

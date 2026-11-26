@@ -41,7 +41,7 @@
 //                               "max_count", "shift", "stride" (opt.),
 //                               "window_base" (opt.): {"cbv": <as above>, "byte_offset", "bit_offset" (0),
 //                                                      "mask" (0xffffffff)}}} |
-//                           {"unresolved": true} (version >= 3)}]}}}
+//                           {"unresolved": true | "<reason>"} (version >= 3)}]}}}
 // An unresolved source (G62, #482; version >= 3): the translator reflected the binding but could
 // not trace where the stage loads its descriptor from (mostly SM 6.6 bindless textures whose heap
 // index is a constant-buffer dword at an offset computed from a root constant, which the CB-indexed

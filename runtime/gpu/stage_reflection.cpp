@@ -462,9 +462,10 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
                     return false;
                 }
             } else if (const Json* unresolved = src->get("unresolved"); unresolved != nullptr) {
-                if (version < kStageReflectionVersionUnresolved || unresolved->type != Json::Type::Bool ||
-                    !unresolved->boolean) {
-                    *error = "unresolved source needs \"unresolved\": true and version >= 3";
+                const bool marked = (unresolved->type == Json::Type::Bool && unresolved->boolean) ||
+                                    (unresolved->type == Json::Type::String && !unresolved->string.empty());
+                if (version < kStageReflectionVersionUnresolved || !marked) {
+                    *error = "unresolved source needs \"unresolved\": true or a reason string, and version >= 3";
                     return false;
                 }
                 if (r.kind == ReflectedBindingKind::Storage || r.kind == ReflectedBindingKind::StorageTexture) {
