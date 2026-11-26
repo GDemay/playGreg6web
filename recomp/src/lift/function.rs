@@ -2304,6 +2304,16 @@ impl FunctionLifter<'_> {
         }
         match ins.mnemonic() {
             M::Nop | M::Endbr64 => {}
+            // x87 control/status plumbing that `setjmp`/`longjmp` and CRT startup use. No x87
+            // arithmetic is modelled, so the unit stays in its reset state: control word 0x027F
+            // (the Windows default, 53-bit precision), status word 0, nothing pending.
+            M::Fnstcw | M::Fstcw => self.write_op(ins, 0, "639", 16)?,
+            M::Fldcw => {
+                // Read for the access check; the value does not change anything modelled.
+                self.read_op(ins, 0, 16)?;
+            }
+            M::Fnstsw | M::Fstsw => self.write_op(ins, 0, "0", 16)?,
+            M::Fnclex | M::Fclex | M::Fninit | M::Finit | M::Wait | M::Fnop => {}
             M::Mov => {
                 let bits = self.op_bits(ins, 0)?;
                 let v = self.read_op(ins, 1, bits)?;
