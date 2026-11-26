@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -18,9 +19,10 @@ use playgta6_shaders::dxil_reflect::{
     sanitize_source_path,
 };
 use playgta6_shaders::pack::{
-    BlockerReportInput, FailedShaderRecord, PACK_ENTRY_BYTES, PACK_HEADER_BYTES, PackEntry,
-    SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, read_pack, render_blocker_report_md,
-    render_shader_index_json, write_pack_with_layout,
+    BlockerReportInput, FailedShaderRecord, PACK_HEADER_BYTES, PackEntry, PackVersion,
+    SHADER_INDEX_ABI_VERSION, ShaderIndexEntry, checked_table_data_start_for_version,
+    pack_entry_bytes, parse_pack_header, read_pack_toc, render_blocker_report_md,
+    render_shader_index_json, write_pack_with_layout_versioned,
 };
 use playgta6_shaders::rdna2::{
     analyze_instructions, decode_program, format_disasm_with_summary, to_json_with_disasm,
@@ -44,6 +46,7 @@ enum Command {
         spirv_dir: PathBuf,
         out_dir: PathBuf,
         pack_path: Option<PathBuf>,
+        pack_version: PackVersion,
         report_path: Option<PathBuf>,
         no_sanitize: bool,
         no_lower: bool,
@@ -88,6 +91,7 @@ enum Command {
         input_dir: Option<PathBuf>,
         manifest_path: Option<PathBuf>,
         out_path: PathBuf,
+        pack_version: PackVersion,
         best_effort: bool,
         max_wgsl_bytes: Option<usize>,
         max_pack_bytes: Option<u64>,
@@ -102,7 +106,7 @@ fn print_usage() {
     eprintln!("playgta6-shaders (ABI v{SHADER_INDEX_ABI_VERSION})");
     eprintln!("Usage:");
     eprintln!(
-        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--report <blockers.md>] [--no-sanitize] [--no-lower]"
+        "  playgta6-shaders convert --spirv <dir> --out <dir> [--pack <file.wgsl.pack>] [--pack-version auto|1|2] [--report <blockers.md>] [--no-sanitize] [--no-lower]"
     );
     eprintln!(
         "  playgta6-shaders audit --spirv <dir> [--report <audit.md>] [--no-sanitize]"
@@ -118,7 +122,7 @@ fn print_usage() {
         "  playgta6-shaders translate-rdna2 <file> [--out <file.wgsl>] [--stage auto|vertex|pixel|compute|mesh] [--json]"
     );
     eprintln!(
-        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
+        "  playgta6-shaders pack-rdna2 [<input-dir>] [--manifest <manifest.json>] --out <out.wgsl.pack> [--pack-version auto|1|2] [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
     );
     eprintln!();
     eprintln!(
@@ -136,6 +140,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut spirv_dir: Option<PathBuf> = None;
             let mut out_dir: Option<PathBuf> = None;
             let mut pack_path: Option<PathBuf> = None;
+            let mut pack_version = PackVersion::Auto;
             let mut report_path: Option<PathBuf> = None;
             let mut no_sanitize = false;
             let mut no_lower = false;
@@ -163,6 +168,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .get(i)
                             .ok_or_else(|| "missing value for --pack".to_string())?;
                         pack_path = Some(PathBuf::from(val));
+                    }
+                    "--pack-version" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --pack-version".to_string())?;
+                        pack_version = PackVersion::parse_str(val)?;
                     }
                     "--report" => {
                         i += 1;
@@ -193,6 +205,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 spirv_dir,
                 out_dir,
                 pack_path,
+                pack_version,
                 report_path,
                 no_sanitize,
                 no_lower,
@@ -458,6 +471,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             let mut input_dir: Option<PathBuf> = None;
             let mut manifest_path: Option<PathBuf> = None;
             let mut out_path: Option<PathBuf> = None;
+            let mut pack_version = PackVersion::Auto;
             let mut best_effort = false;
             let mut max_wgsl_bytes: Option<usize> = None;
             let mut max_pack_bytes: Option<u64> = None;
@@ -485,6 +499,13 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                             .get(i)
                             .ok_or_else(|| "missing value for --out".to_string())?;
                         out_path = Some(PathBuf::from(val));
+                    }
+                    "--pack-version" => {
+                        i += 1;
+                        let val = args
+                            .get(i)
+                            .ok_or_else(|| "missing value for --pack-version".to_string())?;
+                        pack_version = PackVersion::parse_str(val)?;
                     }
                     "--best-effort" => best_effort = true,
                     "--max-wgsl-bytes" => {
@@ -557,7 +578,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
 
             if input_dir.is_none() && manifest_path.is_none() {
                 return Err(
-                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
+                    "pack-rdna2 requires <input-dir> and/or --manifest <manifest.json> --out <out.wgsl.pack> [--pack-version auto|1|2] [--best-effort] [--max-wgsl-bytes <N>] [--max-pack-bytes <N>] [--budget-order hash-order|smallest-first|manifest-order] [--priority-hashes <file>] [--jobs <N>] [--json]"
                         .to_string(),
                 );
             }
@@ -569,6 +590,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
                 input_dir,
                 manifest_path,
                 out_path,
+                pack_version,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -625,6 +647,7 @@ fn run_convert(
     spirv_dir: &Path,
     out_dir: &Path,
     pack_path: Option<&Path>,
+    pack_version: PackVersion,
     report_path: Option<&Path>,
     options: ConvertOptions,
 ) -> Result<(), String> {
@@ -708,7 +731,7 @@ fn run_convert(
                 )
             })?;
         }
-        let written = write_pack_with_layout(&pack_entries, 0)
+        let written = write_pack_with_layout_versioned(&pack_entries, 0, pack_version)
             .map_err(|err| format!("failed to build shader pack: {err}"))?;
         fs::write(pack_dest, &written.bytes).map_err(|err| {
             format!(
@@ -853,17 +876,60 @@ fn run_audit(
 }
 
 fn run_inspect_pack(pack_path: &Path) -> Result<(), String> {
-    let bytes = fs::read(pack_path)
+    let mut file = File::open(pack_path)
         .map_err(|err| format!("failed to read shader pack {}: {err}", pack_path.display()))?;
-    let pack = read_pack(&bytes)
+    let total_file_size = file
+        .metadata()
+        .map_err(|err| format!("failed to stat shader pack {}: {err}", pack_path.display()))?
+        .len();
+
+    let mut header_buf = [0u8; PACK_HEADER_BYTES];
+    let header_read = file
+        .read(&mut header_buf)
+        .map_err(|err| format!("failed to read shader pack {}: {err}", pack_path.display()))?;
+    let (version, entry_count, _flags) = parse_pack_header(&header_buf[..header_read])
+        .map_err(|err| format!("invalid shader pack {}: {err}", pack_path.display()))?;
+    let data_start = checked_table_data_start_for_version(version, entry_count as usize)
+        .map_err(|err| format!("invalid shader pack {}: {err}", pack_path.display()))?;
+    let toc_len = usize::try_from(data_start.min(total_file_size))
+        .map_err(|_| format!("invalid shader pack {}: TOC exceeds platform usize", pack_path.display()))?;
+
+    file.seek(SeekFrom::Start(0))
+        .map_err(|err| format!("failed to seek shader pack {}: {err}", pack_path.display()))?;
+    let mut toc_buf = vec![0u8; toc_len];
+    file.read_exact(&mut toc_buf)
+        .map_err(|err| format!("failed to read shader pack TOC {}: {err}", pack_path.display()))?;
+
+    let toc = read_pack_toc(&toc_buf, total_file_size)
         .map_err(|err| format!("invalid shader pack {}: {err}", pack_path.display()))?;
 
-    let payload_bytes: usize = pack.entries.iter().map(|e| e.length as usize).sum();
-    let table_bytes = pack.entries.len() * PACK_ENTRY_BYTES;
+    // Validate UTF-8 payload bytes per entry without loading >4 GiB archives wholesale into RAM.
+    let mut scratch = Vec::new();
+    for (idx, entry) in toc.entries.iter().enumerate() {
+        let len = entry.length as usize;
+        if len == 0 {
+            continue;
+        }
+        scratch.resize(len, 0);
+        file.seek(SeekFrom::Start(entry.offset))
+            .map_err(|err| format!("failed to seek shader pack {}: {err}", pack_path.display()))?;
+        file.read_exact(&mut scratch)
+            .map_err(|err| format!("failed to read shader pack {}: {err}", pack_path.display()))?;
+        if let Err(err) = std::str::from_utf8(&scratch) {
+            return Err(format!(
+                "invalid shader pack {}: entry {idx} payload is not valid UTF-8: {err}",
+                pack_path.display()
+            ));
+        }
+    }
+
+    let entry_bytes = pack_entry_bytes(toc.version).expect("validated version");
+    let payload_bytes: u64 = toc.entries.iter().map(|e| u64::from(e.length)).sum();
+    let table_bytes = (toc.entries.len() as u64) * (entry_bytes as u64);
     let mut vertex = 0usize;
     let mut fragment = 0usize;
     let mut compute = 0usize;
-    for entry in &pack.entries {
+    for entry in &toc.entries {
         match entry.stage {
             ShaderStage::Vertex => vertex += 1,
             ShaderStage::Fragment => fragment += 1,
@@ -873,21 +939,20 @@ fn run_inspect_pack(pack_path: &Path) -> Result<(), String> {
 
     println!("Pack: {}", pack_path.display());
     println!("  Magic:   WGPK");
-    println!("  Version: {}", pack.version);
-    println!("  Flags:   0x{:08x}", pack.flags);
+    println!("  Version: {}", toc.version);
+    println!("  Flags:   0x{:08x}", toc.flags);
     println!(
         "  Entries: {} (vertex: {vertex}, fragment: {fragment}, compute: {compute})",
-        pack.entries.len()
+        toc.entries.len()
     );
     println!(
-        "  Layout:  header={PACK_HEADER_BYTES}B, table={table_bytes}B, payload={payload_bytes}B, total={}B",
-        bytes.len()
+        "  Layout:  header={PACK_HEADER_BYTES}B, table={table_bytes}B, payload={payload_bytes}B, total={total_file_size}B"
     );
 
-    if !pack.entries.is_empty() {
+    if !toc.entries.is_empty() {
         println!();
         println!("  {:<18}  {:<8}  {:>10}  {:>10}", "Hash", "Stage", "Offset", "Length");
-        for entry in &pack.entries {
+        for entry in &toc.entries {
             println!(
                 "  {:<18}  {:<8}  {:>10}  {:>10}",
                 format_shader_hash(entry.hash),
@@ -1283,6 +1348,7 @@ fn main() -> ExitCode {
             spirv_dir,
             out_dir,
             pack_path,
+            pack_version,
             report_path,
             no_sanitize,
             no_lower,
@@ -1299,6 +1365,7 @@ fn main() -> ExitCode {
                 &spirv_dir,
                 &out_dir,
                 pack_path.as_deref(),
+                pack_version,
                 report_path.as_deref(),
                 options,
             ) {
@@ -1411,6 +1478,7 @@ fn main() -> ExitCode {
             input_dir,
             manifest_path,
             out_path,
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -1427,6 +1495,7 @@ fn main() -> ExitCode {
                 }
             };
             let options = Rdna2PackOptions {
+                pack_version,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -1461,6 +1530,9 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use playgta6_shaders::pack::{
+        PACK_ENTRY_BYTES, PACK_ENTRY_BYTES_V2, PACK_VERSION_V1, PACK_VERSION_V2, read_pack,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
@@ -1543,10 +1615,48 @@ mod tests {
                 spirv_dir: PathBuf::from("in_spv"),
                 out_dir: PathBuf::from("out_wgsl"),
                 pack_path: Some(PathBuf::from("out_wgsl/all.wgsl.pack")),
+                pack_version: PackVersion::Auto,
                 report_path: Some(PathBuf::from("out_wgsl/blockers.md")),
                 no_sanitize: true,
                 no_lower: true,
             }
+        );
+
+        let cmd_v2 = parse_args(&[
+            "convert".to_string(),
+            "--spirv".to_string(),
+            "in_spv".to_string(),
+            "--out".to_string(),
+            "out_wgsl".to_string(),
+            "--pack".to_string(),
+            "out_wgsl/v2.wgsl.pack".to_string(),
+            "--pack-version".to_string(),
+            "2".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            cmd_v2,
+            Command::Convert {
+                spirv_dir: PathBuf::from("in_spv"),
+                out_dir: PathBuf::from("out_wgsl"),
+                pack_path: Some(PathBuf::from("out_wgsl/v2.wgsl.pack")),
+                pack_version: PackVersion::V2,
+                report_path: None,
+                no_sanitize: false,
+                no_lower: false,
+            }
+        );
+        assert!(
+            parse_args(&[
+                "convert".to_string(),
+                "--spirv".to_string(),
+                "in_spv".to_string(),
+                "--out".to_string(),
+                "out_wgsl".to_string(),
+                "--pack-version".to_string(),
+                "3".to_string(),
+            ])
+            .is_err()
         );
 
         let inspect_dxbc = parse_args(&[
@@ -1631,6 +1741,7 @@ mod tests {
             &spirv_dir,
             &out_dir,
             Some(&pack_file),
+            PackVersion::Auto,
             Some(&report_file),
             ConvertOptions::default(),
         )
@@ -1638,13 +1749,33 @@ mod tests {
 
         let pack_bytes = fs::read(&pack_file).unwrap();
         let decoded = read_pack(&pack_bytes).unwrap();
+        assert_eq!(decoded.version, PACK_VERSION_V1);
         assert_eq!(decoded.entries.len(), 1);
         assert_eq!(decoded.entries[0].stage, ShaderStage::Compute);
         assert!(decoded.entries[0].wgsl.contains("@compute"));
+        run_inspect_pack(&pack_file).expect("inspect-pack should accept v1 pack");
+
+        // 1b. Explicit --pack-version 2 emits WGPK v2 and passes inspect-pack.
+        let pack_file_v2 = out_dir.join("bundle_v2.wgsl.pack");
+        run_convert(
+            &spirv_dir,
+            &out_dir,
+            Some(&pack_file_v2),
+            PackVersion::V2,
+            None,
+            ConvertOptions::default(),
+        )
+        .expect("batch conversion with WGPK v2 should succeed");
+        let pack_bytes_v2 = fs::read(&pack_file_v2).unwrap();
+        let decoded_v2 = read_pack(&pack_bytes_v2).unwrap();
+        assert_eq!(decoded_v2.version, PACK_VERSION_V2);
+        assert_eq!(pack_bytes_v2.len() - pack_bytes.len(), 4);
+        assert_eq!(decoded_v2.entries[0].wgsl, decoded.entries[0].wgsl);
+        run_inspect_pack(&pack_file_v2).expect("inspect-pack should accept v2 pack");
 
         let index_text = fs::read_to_string(out_dir.join("shader-index.json")).unwrap();
         assert!(index_text.contains("\"abi_version\": 1"));
-        assert!(index_text.contains("\"pack\": \"bundle.wgsl.pack\""));
+        assert!(index_text.contains("\"pack\": \"bundle_v2.wgsl.pack\""));
 
         let report_text = fs::read_to_string(&report_file).unwrap();
         assert!(report_text.contains("InvalidSpirvHeader"));
@@ -1655,6 +1786,7 @@ mod tests {
             &spirv_dir,
             &out_no_san,
             None,
+            PackVersion::Auto,
             Some(&no_san_report),
             ConvertOptions::without_sanitization(),
         )
@@ -1797,7 +1929,14 @@ mod tests {
         fs::write(spirv_dir.join("broken.spv"), b"not-spirv").unwrap();
         fs::write(&pipelines, format!("# compute pipelines\n{storage_key}\n")).unwrap();
 
-        run_convert(&spirv_dir, &out_dir, None, None, ConvertOptions::default())
+        run_convert(
+            &spirv_dir,
+            &out_dir,
+            None,
+            PackVersion::Auto,
+            None,
+            ConvertOptions::default(),
+        )
             .expect("convert should succeed");
         let mut convention = RegisterConvention::default();
         convention.set_shift_arg("u=1").unwrap();
@@ -2146,6 +2285,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("rdna2_blobs")),
                 manifest_path: None,
                 out_path: PathBuf::from("out/splash.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2169,6 +2309,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("rdna2_blobs")),
                 manifest_path: None,
                 out_path: PathBuf::from("out/all.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2179,13 +2320,15 @@ mod tests {
             }
         );
 
-        // Standalone --manifest mode with size controls, --budget-order, --priority-hashes, and --jobs
+        // Standalone --manifest mode with size controls, --pack-version 2, --budget-order, --priority-hashes, and --jobs
         let cmd_manifest = parse_args(&[
             "pack-rdna2".to_string(),
             "--manifest".to_string(),
             "work/dump/manifest.json".to_string(),
             "--out".to_string(),
             "out/splash.wgsl.pack".to_string(),
+            "--pack-version".to_string(),
+            "2".to_string(),
             "--best-effort".to_string(),
             "--max-wgsl-bytes".to_string(),
             "262144".to_string(),
@@ -2206,6 +2349,7 @@ mod tests {
                 input_dir: None,
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/splash.wgsl.pack"),
+                pack_version: PackVersion::V2,
                 best_effort: true,
                 max_wgsl_bytes: Some(262_144),
                 max_pack_bytes: Some(536_870_912),
@@ -2233,6 +2377,7 @@ mod tests {
                 input_dir: None,
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/early.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2258,6 +2403,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("rdna2_blobs")),
                 manifest_path: None,
                 out_path: PathBuf::from("out/hash.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2284,6 +2430,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("rdna2_blobs")),
                 manifest_path: None,
                 out_path: PathBuf::from("out/single.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2309,6 +2456,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("rdna2_blobs")),
                 manifest_path: None,
                 out_path: PathBuf::from("out/short.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2335,6 +2483,7 @@ mod tests {
                 input_dir: Some(PathBuf::from("extra_blobs")),
                 manifest_path: Some(PathBuf::from("work/dump/manifest.json")),
                 out_path: PathBuf::from("out/combined.wgsl.pack"),
+                pack_version: PackVersion::Auto,
                 best_effort: false,
                 max_wgsl_bytes: None,
                 max_pack_bytes: None,
@@ -2915,6 +3064,7 @@ mod tests {
             input_dir,
             manifest_path: parsed_manifest,
             out_path,
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -2928,6 +3078,7 @@ mod tests {
         };
 
         let parsed_options = Rdna2PackOptions {
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3105,6 +3256,7 @@ mod tests {
             input_dir,
             manifest_path,
             out_path,
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3117,6 +3269,7 @@ mod tests {
             panic!("expected Command::PackRdna2");
         };
         let opts = Rdna2PackOptions {
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3220,6 +3373,7 @@ mod tests {
                 input_dir,
                 manifest_path,
                 out_path,
+                pack_version,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -3232,6 +3386,7 @@ mod tests {
                 panic!("expected Command::PackRdna2");
             };
             let opts = Rdna2PackOptions {
+                pack_version,
                 best_effort,
                 max_wgsl_bytes,
                 max_pack_bytes,
@@ -3316,6 +3471,7 @@ mod tests {
             input_dir,
             manifest_path,
             out_path,
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3330,6 +3486,7 @@ mod tests {
         assert_eq!(budget_order, BudgetOrder::SmallestFirst);
 
         let opts = Rdna2PackOptions {
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3439,6 +3596,7 @@ mod tests {
             input_dir,
             manifest_path,
             out_path,
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3459,6 +3617,7 @@ mod tests {
         );
 
         let opts = Rdna2PackOptions {
+            pack_version,
             best_effort,
             max_wgsl_bytes,
             max_pack_bytes,
@@ -3552,6 +3711,91 @@ mod tests {
             ),
             "JSON:\n{json_out}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn end_to_end_pack_rdna2_cli_pack_version_2_and_inspect_pack() {
+        let root = make_temp_dir("playgta6_cli_pack_v2");
+        let in_dir = root.join("blobs");
+        let out_v2 = root.join("out/shaders_v2.wgsl.pack");
+        fs::create_dir_all(&in_dir).unwrap();
+
+        let cs_bytes = words_to_bytes(&[
+            (0b011_1111_u32 << 25) | (1u32 << 17) | (0x01u32 << 9) | 242,
+            (0b1_0111_1111_u32 << 23) | (0x0Au32 << 16),
+            (0b1_0111_1111_u32 << 23) | (0x01u32 << 16),
+        ]);
+        fs::write(in_dir.join("cs_0000000000007001.rdna2"), &cs_bytes).unwrap();
+        fs::write(in_dir.join("cs_0000000000007002.rdna2"), &cs_bytes).unwrap();
+
+        let cmd = parse_args(&[
+            "pack-rdna2".to_string(),
+            in_dir.to_string_lossy().into_owned(),
+            "--out".to_string(),
+            out_v2.to_string_lossy().into_owned(),
+            "--pack-version".to_string(),
+            "2".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("pack-rdna2 --pack-version 2 should parse");
+        let Command::PackRdna2 {
+            input_dir,
+            manifest_path,
+            out_path,
+            pack_version,
+            best_effort,
+            max_wgsl_bytes,
+            max_pack_bytes,
+            budget_order,
+            priority_hashes_path: _,
+            jobs,
+            json,
+        } = cmd
+        else {
+            panic!("expected Command::PackRdna2");
+        };
+        assert_eq!(pack_version, PackVersion::V2);
+
+        let opts = Rdna2PackOptions {
+            pack_version,
+            best_effort,
+            max_wgsl_bytes,
+            max_pack_bytes,
+            budget_order,
+            jobs,
+            ..Rdna2PackOptions::default()
+        };
+        let (json_out, res) = format_and_write_pack_rdna2_sources(
+            input_dir.as_deref(),
+            manifest_path.as_deref(),
+            &out_path,
+            &opts,
+            json,
+        )
+        .expect("pack-rdna2 --pack-version 2 should succeed");
+
+        assert_eq!(res.summary.pack_version, PACK_VERSION_V2);
+        assert!(json_out.contains("\"format\": \"wgpk_v2\""), "JSON:\n{json_out}");
+
+        let disk_bytes = fs::read(&out_v2).unwrap();
+        let decoded = read_pack(&disk_bytes).expect("WGPK v2 on disk must decode");
+        assert_eq!(decoded.version, PACK_VERSION_V2);
+        assert_eq!(decoded.entries.len(), 2);
+        assert_eq!(
+            decoded.entries[0].offset,
+            (PACK_HEADER_BYTES + 2 * PACK_ENTRY_BYTES_V2) as u64
+        );
+        run_inspect_pack(&out_v2).expect("inspect-pack must succeed on WGPK v2");
+
+        // Corrupt UTF-8 payload byte in v2 file must be rejected by inspect-pack.
+        let mut corrupt = disk_bytes;
+        let payload_start = PACK_HEADER_BYTES + 2 * PACK_ENTRY_BYTES_V2;
+        corrupt[payload_start] = 0xff;
+        let corrupt_path = root.join("out/corrupt_v2.wgsl.pack");
+        fs::write(&corrupt_path, &corrupt).unwrap();
+        assert!(run_inspect_pack(&corrupt_path).is_err());
+
         let _ = fs::remove_dir_all(&root);
     }
 }
