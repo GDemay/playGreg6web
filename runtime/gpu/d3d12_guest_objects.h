@@ -1226,6 +1226,7 @@ private:
     uint64_t address_texture_tick_ = 0;  // under address_textures_mutex_
     mutable std::mutex detile_mutex_;
     DetileFn detile_texture_;
+    bool using_default_detile_ = false;
     std::atomic<uint64_t> upload_bytes_{0};
     std::atomic<uint64_t> shadow_bytes_{0};
     std::atomic<uint64_t> shadow_resident_bytes_{0};

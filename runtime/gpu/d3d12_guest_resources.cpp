@@ -636,6 +636,7 @@ bool Device::tracked_texture_info(uint32_t resource_id, TrackedTexture* out) con
 void Device::set_detile_fn(DetileFn fn) {
     std::lock_guard<std::mutex> lock(detile_mutex_);
     detile_texture_ = std::move(fn);
+    using_default_detile_ = false;
 }
 
 namespace {
@@ -766,9 +767,11 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     const bool is_tiled = tt.layout >= gfx10::kConsoleLinearLayout;
     const bool is_tiny = (w <= 2u && h <= 2u);
     DetileFn detile_fn;
+    bool using_default_detile = false;
     {
         std::lock_guard<std::mutex> lock(detile_mutex_);
         detile_fn = detile_texture_;
+        using_default_detile = using_default_detile_;
     }
     if (is_tiled && !detile_fn && !is_tiny) {
         return false;
@@ -908,8 +911,18 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // 256B-aligned, e.g., 4K Bink2 Y/U/V planes), hash its 64-row bands once in place over tight
     // rows and derive the surface hash from them so the surface is never hashed twice or eagerly
     // copied/zero-filled into an intermediate staging buffer.
+    // G73 (#663): For a single-subresource console-linear surface (layout == 0x100, mips=1,
+    // layers=1, d=1) using the built-in GFX10 detiler, addrlib ADDR_SW_LINEAR already places mip 0
+    // at offset 0 with 256B-aligned row pitch (`aligned_row_pitch * blocks_y` bytes). Borrow
+    // `src_data` directly with single-pass band hashing and skip detile + staging copy.
+    const uint64_t aligned_row_pitch = align_up(tight_row_bytes, 256u);
+    const uint64_t console_linear_bytes = aligned_row_pitch * blocks_y;
     const bool single_linear_direct =
         subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_a8 && src_size == tight_mip0_bytes;
+    const bool single_console_linear_direct =
+        using_default_detile && tt.layout == gfx10::kConsoleLinearLayout && whole_surface &&
+        subs.size() == 1u && mips == 1u && layers == 1u && d == 1u && !convert_norm16 && !convert_a8 &&
+        tiled_bytes == console_linear_bytes && src_size >= console_linear_bytes;
     std::vector<uint64_t> direct_bands;
     uint64_t hash = 0;
     if (single_linear_direct && d == 1u && blocks_y > kUploadBandRows) {
@@ -920,6 +933,16 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 content_hash(src_data + size_t{r} * tight_row_bytes, size_t{n} * tight_row_bytes));
         }
         hash = content_hash(direct_bands.data(), direct_bands.size() * sizeof(uint64_t));
+    } else if (single_console_linear_direct && blocks_y > kUploadBandRows) {
+        direct_bands.reserve((blocks_y + kUploadBandRows - 1u) / kUploadBandRows);
+        for (uint32_t r = 0; r < blocks_y; r += kUploadBandRows) {
+            const uint32_t n = std::min(kUploadBandRows, blocks_y - r);
+            direct_bands.push_back(
+                content_hash(src_data + size_t{r} * aligned_row_pitch, size_t{n} * aligned_row_pitch));
+        }
+        hash = content_hash(direct_bands.data(), direct_bands.size() * sizeof(uint64_t));
+    } else if (single_console_linear_direct) {
+        hash = content_hash(src_data, static_cast<size_t>(console_linear_bytes));
     } else {
         hash = content_hash(src_data, src_size);
     }
@@ -961,6 +984,15 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         const uint64_t row_pitch = align_up(row_bytes, 256u);
         Staged st{sub, bx * l.block_width, by * l.block_height, md, static_cast<uint32_t>(row_pitch), by, 0, {},
                   nullptr, 0, 0, false, {}, {}};
+        if (single_console_linear_direct) {
+            st.borrowed = src_data;
+            st.borrowed_size = static_cast<size_t>(console_linear_bytes);
+            st.row_pitch = static_cast<uint32_t>(aligned_row_pitch);
+            st.bands = std::move(direct_bands);
+            st.hash = hash;
+            staged.push_back(std::move(st));
+            continue;
+        }
         bool detiled = false;
         if (is_tiled && detile_fn) {
             st.bytes.assign(static_cast<size_t>(row_pitch * by * md), 0);
@@ -1066,7 +1098,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
 
     uint32_t held_floor = 0;
-    const bool single_known_nonzero = !tt.ever_uploaded && single_linear_direct;
+    const bool single_known_nonzero =
+        !tt.ever_uploaded &&
+        (single_linear_direct || (single_console_linear_direct && src_size == console_linear_bytes));
     {
         std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
         const auto it = tracked_textures_.find(resource_id);
