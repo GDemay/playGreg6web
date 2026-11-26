@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66, W119, T46)."""
+"""Unit and CLI tests for tools/stage_browser_boot.py (Track 5 / W51, W66, W119, T46, T70)."""
 
 from __future__ import annotations
 
@@ -2356,6 +2356,719 @@ class TestMergeReflectSidecarStaging(unittest.TestCase):
             # Zero host paths or usernames in both JSON and text output.
             for output in (buf_json.getvalue(), text_out):
                 self.assertNotIn("T46SecretHost_", output)
+                self.assertNotIn(str(base), output)
+                self.assertNotIn(str(base).replace("\\", "/"), output)
+                self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
+                self.assertNotIn("/Users/", output)
+                self.assertNotIn("/home/", output)
+                self.assertNotIn("/tmp/", output)
+                for username in sbb._current_usernames():
+                    self.assertNotRegex(
+                        output,
+                        re.compile(
+                            rf"(?<![A-Za-z0-9_]){re.escape(username)}(?![A-Za-z0-9_])",
+                            re.IGNORECASE,
+                        ),
+                    )
+
+
+def _build_wgpk_pack(
+    entries: list[tuple[int, int, bytes]],
+    *,
+    version: int = 1,
+    flags: int = 0,
+) -> bytes:
+    """Build a valid WGPK v1 (20-byte TOC) or v2 (24-byte TOC, u64 offset) shader pack."""
+    stride = 24 if version == 2 else 20
+    data_start = 16 + len(entries) * stride
+    header = struct.pack("<4sIII", b"WGPK", version, len(entries), flags)
+    toc = bytearray()
+    payloads = bytearray()
+    cursor = data_start
+    for shader_hash, stage_code, wgsl_bytes in entries:
+        if version == 2:
+            toc.extend(struct.pack("<QB3sIQ", shader_hash, stage_code, b"\x00\x00\x00", len(wgsl_bytes), cursor))
+        else:
+            toc.extend(struct.pack("<QB3sII", shader_hash, stage_code, b"\x00\x00\x00", cursor, len(wgsl_bytes)))
+        payloads.extend(wgsl_bytes)
+        cursor += len(wgsl_bytes)
+    return header + bytes(toc) + bytes(payloads)
+
+
+class TestWgpkV1AndV2AndSidecarVerification(unittest.TestCase):
+    def _sample_entries(self) -> list[tuple[int, int, bytes]]:
+        return [
+            (0x0000000000000101, 1, b"@vertex fn vs_main() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n"),
+            (0x0000000000000202, 2, b"@fragment fn fs_main() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }\n"),
+            (0x0000000000000303, 3, b"@compute @workgroup_size(1) fn cs_main() {}\n"),
+        ]
+
+    def _synced_sidecar_doc(self, entries: list[tuple[int, int, bytes]]) -> dict[str, object]:
+        stage_names = {1: "vertex", 2: "fragment", 3: "compute"}
+        return {
+            "schema": "playgta6-stage-reflection",
+            "version": 1,
+            "stages": {
+                f"0x{h:016x}": {
+                    "stage": stage_names[st],
+                    "bindings": [
+                        {
+                            "group": 0,
+                            "binding": 0,
+                            "kind": "uniform",
+                            "source": {"user_sgpr": 8, "table_byte_offset": 0},
+                        }
+                    ],
+                }
+                for h, st, _ in entries
+            },
+        }
+
+    def _synced_reflection_manifest(
+        self,
+        entries: list[tuple[int, int, bytes]],
+        *,
+        pack_name: str = "splash.wgsl.pack",
+    ) -> dict[str, object]:
+        stage_names = {1: "vertex", 2: "fragment", 3: "compute"}
+        return {
+            "schema_version": 1,
+            "pack": pack_name,
+            "entry_count": len(entries),
+            "shaders": {
+                f"0x{h:016x}": {
+                    "stage": stage_names[st],
+                    "entry_point": "main",
+                    "bindings": [],
+                }
+                for h, st, _ in entries
+            },
+        }
+
+    def test_valid_wgpk_v1_and_v2_with_synced_sidecar_and_reflection_manifest(self) -> None:
+        entries = self._sample_entries()
+        for version in (1, 2):
+            with self.subTest(wgpk_version=version), tempfile.TemporaryDirectory() as tmp:
+                repo = _make_repo_skeleton(Path(tmp))
+                src_dir = repo / "work" / f"shader_src_v{version}"
+                src_dir.mkdir(parents=True)
+                shaders_dir = repo / "local-data" / f"shaders_v{version}"
+
+                src_pack = src_dir / "splash.wgsl.pack"
+                src_pack.write_bytes(_build_wgpk_pack(entries, version=version, flags=0))
+                Path(str(src_pack) + ".reflect.json").write_text(
+                    json.dumps(self._synced_sidecar_doc(entries), indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                (src_dir / "reflection-manifest.json").write_text(
+                    json.dumps(self._synced_reflection_manifest(entries), indent=2) + "\n",
+                    encoding="utf-8",
+                )
+
+                report = sbb.stage_browser_boot(
+                    shader_pack=src_pack,
+                    shaders_dir=shaders_dir,
+                    require_sidecar_sync=True,
+                    verify_staged=True,
+                    repo_root=repo,
+                )
+                self.assertTrue(report["ok"], f"v{version} failed: {report['errors']}")
+                self.assertEqual(report["shaders"]["status"], "staged")
+                self.assertEqual(report["shaders"]["copied_count"], 3)
+                wgpk_val = report["shaders"]["wgpk_validation"]
+                self.assertTrue(wgpk_val["ok"])
+                self.assertEqual(wgpk_val["version"], version)
+                self.assertEqual(wgpk_val["entry_stride"], 24 if version == 2 else 20)
+                self.assertEqual(wgpk_val["entry_count"], 3)
+                self.assertTrue(wgpk_val["bounds_ok"])
+                self.assertEqual(
+                    wgpk_val["stage_counts"],
+                    {"vertex": 1, "fragment": 1, "compute": 1},
+                )
+                self.assertEqual(report["shaders"]["pack"]["wgpk_version"], version)
+                self.assertEqual(report["shaders"]["pack"]["entry_count"], 3)
+
+                sync = report["shaders"]["sidecar_sync"]
+                self.assertTrue(sync["synchronized"])
+                self.assertTrue(sync["ok"])
+                self.assertEqual(sync["matched_hash_count"], 3)
+                self.assertEqual(sync["missing_in_sidecar_count"], 0)
+                self.assertEqual(sync["stage_mismatch_count"], 0)
+
+                self.assertTrue(report["shaders"]["reflection_manifest_staged"])
+                rm = report["shaders"]["reflection_manifest"]
+                self.assertTrue(rm["ok"])
+                self.assertTrue(rm["pack_name_matches"])
+                self.assertTrue(rm["hash_parity_ok"])
+                self.assertEqual(rm["shader_count"], 3)
+
+                self.assertTrue(report["verification"]["checked"])
+                self.assertTrue(report["verification"]["ok"])
+                self.assertEqual(report["verification"]["shaders_dir"]["status"], "pass")
+                self.assertEqual(
+                    sorted(p.name for p in shaders_dir.iterdir()),
+                    [
+                        "reflection-manifest.json",
+                        "splash.wgsl.pack",
+                        "splash.wgsl.pack.reflect.json",
+                    ],
+                )
+
+    def test_wgpk_v2_validates_64bit_offset_above_4gib_streaming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            pack_path = Path(tmp) / "huge_v2.wgsl.pack"
+            five_gib = 5 * 1024 * 1024 * 1024
+            payload_len = 128
+            header = struct.pack("<4sIII", b"WGPK", 2, 1, 0)
+            entry_v2 = struct.pack(
+                "<QB3sIQ",
+                0xDEADBEEF00000001,
+                3,
+                b"\x00\x00\x00",
+                payload_len,
+                five_gib,
+            )
+            pack_path.write_bytes(header + entry_v2)
+
+            real_stat = Path.stat
+
+            class _FakeStat:
+                st_size = five_gib + payload_len
+
+            def fake_stat(self_path: Path, *args: object, **kwargs: object) -> object:
+                if self_path == pack_path:
+                    return _FakeStat()
+                return real_stat(self_path, *args, **kwargs)
+
+            with mock.patch.object(Path, "stat", fake_stat):
+                ok, summary, entry_stages, errors, _warnings = sbb.validate_wgpk_pack(pack_path)
+
+            self.assertTrue(ok, f"expected v2 >4GiB pack to pass, got errors={errors}")
+            self.assertEqual(summary["version"], 2)
+            self.assertEqual(summary["entry_stride"], 24)
+            self.assertEqual(summary["entry_count"], 1)
+            self.assertTrue(summary["bounds_ok"])
+            self.assertEqual(summary["max_payload_end"], five_gib + payload_len)
+            self.assertEqual(entry_stages, {"0xdeadbeef00000001": "compute"})
+
+    def test_corrupt_or_truncated_wgpk_pack_is_refused_without_clobbering(self) -> None:
+        # Build specific corrupt WGPK payloads.
+        bad_v1_oob = (
+            struct.pack("<4sIII", b"WGPK", 1, 1, 0)
+            + struct.pack("<QB3sII", 0x1, 1, b"\x00\x00\x00", 36, 9999)
+        )
+        bad_v1_overlap_hdr = (
+            struct.pack("<4sIII", b"WGPK", 1, 1, 0)
+            + struct.pack("<QB3sII", 0x1, 1, b"\x00\x00\x00", 8, 4)
+            + b"abcd"
+        )
+        bad_v1_stage = (
+            struct.pack("<4sIII", b"WGPK", 1, 1, 0)
+            + struct.pack("<QB3sII", 0x1, 9, b"\x00\x00\x00", 36, 4)
+            + b"wgsl"
+        )
+        bad_v1_overlap_payload = (
+            struct.pack("<4sIII", b"WGPK", 1, 2, 0)
+            + struct.pack("<QB3sII", 0x1, 1, b"\x00\x00\x00", 56, 8)
+            + struct.pack("<QB3sII", 0x2, 2, b"\x00\x00\x00", 60, 8)
+            + b"0123456789ab"
+        )
+        bad_v2_truncated_toc = struct.pack("<4sIII", b"WGPK", 2, 1, 0) + b"\x00" * 20  # needs 24
+        bad_cases = [
+            ("empty", b""),
+            ("truncated_header", b"WGPK\x01\x00"),
+            ("bad_magic", struct.pack("<4sIII", b"NOPE", 1, 0, 0)),
+            ("unsupported_v0", struct.pack("<4sIII", b"WGPK", 0, 0, 0)),
+            ("unsupported_v3", struct.pack("<4sIII", b"WGPK", 3, 0, 0)),
+            ("truncated_v1_table", struct.pack("<4sIII", b"WGPK", 1, 2, 0)),
+            ("truncated_v2_table", bad_v2_truncated_toc),
+            ("invalid_stage", bad_v1_stage),
+            ("payload_oob", bad_v1_oob),
+            ("payload_overlaps_header", bad_v1_overlap_hdr),
+            ("overlapping_payloads", bad_v1_overlap_payload),
+        ]
+
+        for label, bad_bytes in bad_cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as tmp:
+                repo = _make_repo_skeleton(Path(tmp))
+                shaders_dir = repo / "local-data" / "shaders"
+                shaders_dir.mkdir(parents=True)
+
+                existing_pack = _build_wgpk_pack(self._sample_entries(), version=1)
+                (shaders_dir / "splash.wgsl.pack").write_bytes(existing_pack)
+
+                src_pack = repo / "work" / f"{label}.wgsl.pack"
+                src_pack.write_bytes(bad_bytes)
+
+                report = sbb.stage_browser_boot(
+                    shader_pack=src_pack,
+                    shaders_dir=shaders_dir,
+                    repo_root=repo,
+                )
+                self.assertFalse(report["ok"], f"expected refusal for {label}")
+                self.assertEqual(report["shaders"]["status"], "refused")
+                self.assertFalse(report["shaders"]["wgpk_validation"]["ok"])
+                self.assertTrue(report["errors"])
+                # Existing staged pack MUST remain untouched.
+                self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), existing_pack)
+
+    def test_sidecar_sync_mismatch_and_malformed_reflection_manifest_rejected(self) -> None:
+        entries = self._sample_entries()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            shaders_dir = repo / "local-data" / "shaders"
+            shaders_dir.mkdir(parents=True)
+            existing_pack = _build_synthetic_wgpk(seed=42)
+            (shaders_dir / "splash.wgsl.pack").write_bytes(existing_pack)
+
+            # 1. Stage mismatch between WGPK TOC and sidecar is refused.
+            src_pack = repo / "work" / "mismatch.wgsl.pack"
+            src_pack.write_bytes(_build_wgpk_pack(entries, version=1))
+            mismatch_sidecar = self._synced_sidecar_doc(entries)
+            mismatch_sidecar["stages"]["0x0000000000000101"]["stage"] = "fragment"  # pack has vertex
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(mismatch_sidecar), encoding="utf-8"
+            )
+            res_mismatch = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+            )
+            self.assertFalse(res_mismatch["ok"])
+            self.assertEqual(res_mismatch["shaders"]["status"], "refused")
+            self.assertEqual(res_mismatch["shaders"]["sidecar_sync"]["stage_mismatch_count"], 1)
+            self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), existing_pack)
+
+            # 2. Empty sidecar for non-empty pack is refused.
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps({"schema": "playgta6-stage-reflection", "version": 1, "stages": {}}),
+                encoding="utf-8",
+            )
+            res_empty_sc = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                repo_root=repo,
+            )
+            self.assertFalse(res_empty_sc["ok"])
+            self.assertEqual(res_empty_sc["shaders"]["status"], "refused")
+
+            # 3. Partial sidecar warns by default, fails with require_sidecar_sync=True.
+            partial_sc = self._synced_sidecar_doc(entries[:1])
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(partial_sc), encoding="utf-8"
+            )
+            res_partial_strict = sbb.stage_browser_boot(
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                require_sidecar_sync=True,
+                repo_root=repo,
+            )
+            self.assertFalse(res_partial_strict["ok"])
+            self.assertFalse(res_partial_strict["shaders"]["sidecar_sync"]["synchronized"])
+            self.assertEqual(
+                res_partial_strict["shaders"]["sidecar_sync"]["missing_in_sidecar_count"], 2
+            )
+
+            # 4. Malformed or inconsistent reflection-manifest.json cases are refused.
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(self._synced_sidecar_doc(entries)), encoding="utf-8"
+            )
+            bad_manifests = [
+                ("empty", ""),
+                ("invalid_json", "{not-json"),
+                ("non_object", "[]"),
+                ("missing_shaders", json.dumps({"schema_version": 1})),
+                ("empty_shaders", json.dumps({"schema_version": 1, "shaders": {}})),
+                (
+                    "pack_name_mismatch",
+                    json.dumps(
+                        self._synced_reflection_manifest(entries, pack_name="wrong_other.wgsl.pack")
+                    ),
+                ),
+                (
+                    "missing_hash",
+                    json.dumps(self._synced_reflection_manifest(entries[:1])),
+                ),
+                (
+                    "entry_count_mismatch",
+                    json.dumps({**self._synced_reflection_manifest(entries), "entry_count": 99}),
+                ),
+            ]
+            for label, bad_text in bad_manifests:
+                with self.subTest(manifest_case=label):
+                    bad_rm = repo / "work" / f"bad_{label}_manifest.json"
+                    bad_rm.write_text(bad_text, encoding="utf-8")
+                    res_rm = sbb.stage_browser_boot(
+                        shader_pack=src_pack,
+                        shaders_dir=shaders_dir,
+                        reflection_manifest=bad_rm,
+                        repo_root=repo,
+                    )
+                    self.assertFalse(res_rm["ok"], f"expected refusal for manifest={label}")
+                    self.assertEqual(res_rm["shaders"]["status"], "refused")
+                    self.assertEqual((shaders_dir / "splash.wgsl.pack").read_bytes(), existing_pack)
+
+
+class TestFastBootExportAndStagedBundleVerification(unittest.TestCase):
+    def test_wasm_fast_boot_exports_detected_enforced_and_guest_manifest_staged(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            web_dist = repo / "web" / "dist"
+
+            # 1. Valid runtime.wasm WITH fast-boot exports + valid guest_manifest.json.
+            fast_wasm = wasm.build_valid_runtime_wasm(include_browser_boot_exports=True)
+            _write_wasm_pair(wasm_dir, fast_wasm)
+            gm_doc = {
+                "schema_version": 1,
+                "guest_dll_modules": ["game.exe", "Bink2Scarlett.dll"],
+            }
+            (wasm_dir / "guest_manifest.json").write_text(
+                json.dumps(gm_doc, indent=2) + "\n", encoding="utf-8"
+            )
+
+            ok_report = sbb.stage_browser_boot(
+                wasm_dir=wasm_dir,
+                web_dist=web_dist,
+                require_fast_boot_exports=True,
+                repo_root=repo,
+            )
+            self.assertTrue(ok_report["ok"], f"unexpected errors: {ok_report['errors']}")
+            val = ok_report["wasm"]["validation"]
+            self.assertTrue(val["fast_boot_exports_ok"])
+            self.assertTrue(val["all_browser_boot_exports_ok"])
+            self.assertTrue(val["has_audio_ring_export"])
+            self.assertEqual(val["audio_ring_export_name"], "_playgta6_audio_ring")
+            self.assertTrue(val["has_input_state_export"])
+            self.assertEqual(val["input_state_export_name"], "_playgta6_get_input_state_ptr")
+            self.assertEqual(val["missing_fast_boot_exports"], [])
+            self.assertTrue((web_dist / "guest_manifest.json").is_file())
+            self.assertEqual(ok_report["wasm"]["guest_manifest"]["guest_module_count"], 2)
+
+            # 2. Unprefixed export names also satisfy fast-boot export checks.
+            unprefixed_wasm = wasm.build_valid_runtime_wasm(
+                browser_boot_export_names=(
+                    "main",
+                    "playgta6_get_input_state_ptr",
+                    "playgta6_audio_ring",
+                )
+            )
+            _write_wasm_pair(wasm_dir, unprefixed_wasm)
+            unprefixed_report = sbb.stage_browser_boot(
+                wasm_dir=wasm_dir,
+                web_dist=web_dist,
+                require_fast_boot_exports=True,
+                repo_root=repo,
+            )
+            self.assertTrue(unprefixed_report["ok"])
+            self.assertEqual(
+                unprefixed_report["wasm"]["validation"]["audio_ring_export_name"],
+                "playgta6_audio_ring",
+            )
+            self.assertEqual(
+                unprefixed_report["wasm"]["validation"]["input_state_export_name"],
+                "playgta6_get_input_state_ptr",
+            )
+
+            # 3. Missing _playgta6_audio_ring or _playgta6_get_input_state_ptr refused when required.
+            for label, export_names in (
+                ("missing_audio_ring", ("_main", "_playgta6_get_input_state_ptr")),
+                ("missing_input_state", ("_main", "_playgta6_audio_ring")),
+                ("missing_both", ("_main",)),
+            ):
+                with self.subTest(case=label):
+                    _write_wasm_pair(
+                        wasm_dir,
+                        wasm.build_valid_runtime_wasm(browser_boot_export_names=export_names),
+                    )
+                    bad_report = sbb.stage_browser_boot(
+                        wasm_dir=wasm_dir,
+                        web_dist=web_dist,
+                        require_fast_boot_exports=True,
+                        repo_root=repo,
+                    )
+                    self.assertFalse(bad_report["ok"])
+                    self.assertEqual(bad_report["wasm"]["status"], "refused")
+                    self.assertFalse(bad_report["wasm"]["validation"]["fast_boot_exports_ok"])
+                    # Previously staged unprefixed_wasm MUST remain intact.
+                    self.assertEqual((web_dist / "runtime.wasm").read_bytes(), unprefixed_wasm)
+
+            # 4. Malformed guest_manifest.json is refused without clobbering web/dist.
+            _write_wasm_pair(wasm_dir, fast_wasm)
+            (wasm_dir / "guest_manifest.json").write_text("{broken-json", encoding="utf-8")
+            bad_gm = sbb.stage_browser_boot(
+                wasm_dir=wasm_dir,
+                web_dist=web_dist,
+                require_fast_boot_exports=True,
+                repo_root=repo,
+            )
+            self.assertFalse(bad_gm["ok"])
+            self.assertEqual(bad_gm["wasm"]["status"], "refused")
+            self.assertEqual((web_dist / "runtime.wasm").read_bytes(), unprefixed_wasm)
+
+    def test_verify_staged_bundle_end_to_end_and_failure_modes(self) -> None:
+        entries = [
+            (0x0000000000000A01, 1, b"@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n"),
+            (0x0000000000000A02, 2, b"@fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }\n"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _make_repo_skeleton(Path(tmp))
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            boot_dir = repo / "work" / "recomp_build"
+            web_dist = repo / "web" / "dist"
+            shaders_dir = repo / "local-data" / "shaders"
+            shader_src = repo / "work" / "shader_src"
+            shader_src.mkdir(parents=True)
+
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm(include_browser_boot_exports=True))
+            (wasm_dir / "guest_manifest.json").write_text(
+                json.dumps({"modules": ["main", "Bink2Scarlett.dll"]}), encoding="utf-8"
+            )
+            src_pack = shader_src / "splash.wgsl.pack"
+            src_pack.write_bytes(_build_wgpk_pack(entries, version=2))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 1,
+                        "stages": {
+                            "0x0000000000000a01": {"stage": "vertex", "bindings": []},
+                            "0x0000000000000a02": {"stage": "fragment", "bindings": []},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (shader_src / "reflection-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pack": "splash.wgsl.pack",
+                        "shaders": {
+                            "0x0000000000000a01": {"stage": "vertex"},
+                            "0x0000000000000a02": {"stage": "fragment"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            staged = sbb.stage_browser_boot(
+                program_dir=program_dir,
+                wasm_dir=wasm_dir,
+                boot_dir=boot_dir,
+                web_dist=web_dist,
+                shader_pack=src_pack,
+                shaders_dir=shaders_dir,
+                verify_window_marks=True,
+                require_fast_boot_exports=True,
+                require_sidecar_sync=True,
+                verify_staged=True,
+                repo_root=repo,
+            )
+            self.assertTrue(staged["ok"], f"staging failed: {staged['errors']}")
+            self.assertTrue(staged["verification"]["ok"])
+            self.assertEqual(staged["verification"]["web_dist"]["status"], "pass")
+            self.assertTrue(staged["verification"]["web_dist"]["guest_manifest"]["present"])
+            self.assertEqual(staged["verification"]["boot_dir"]["status"], "pass")
+            self.assertTrue(staged["verification"]["boot_dir"]["has_guest_pgim"])
+            self.assertTrue(staged["verification"]["boot_dir"]["boot_options"]["present"])
+            self.assertEqual(staged["verification"]["shaders_dir"]["status"], "pass")
+
+            # Direct verify_staged_bundle call passes cleanly.
+            direct = sbb.verify_staged_bundle(
+                web_dist=web_dist,
+                boot_dir=boot_dir,
+                shaders_dir=shaders_dir,
+                require_fast_boot_exports=True,
+                require_guest_manifest=True,
+                require_boot_options=True,
+                require_sidecar=True,
+                require_sidecar_sync=True,
+                require_reflection_manifest=True,
+                repo_root=repo,
+            )
+            self.assertTrue(direct["ok"], f"direct verify failed: {direct['errors']}")
+
+            # Verify corrupting staged artifacts causes clean, specific verification failures.
+            def _check_fails(mutate_fn, expected_substr: str) -> None:
+                snapshot: dict[Path, bytes] = {}
+                for root in (web_dist, boot_dir, shaders_dir):
+                    for p in root.rglob("*"):
+                        if p.is_file():
+                            snapshot[p] = p.read_bytes()
+                try:
+                    mutate_fn()
+                    res = sbb.verify_staged_bundle(
+                        web_dist=web_dist,
+                        boot_dir=boot_dir,
+                        shaders_dir=shaders_dir,
+                        require_fast_boot_exports=True,
+                        require_guest_manifest=True,
+                        require_boot_options=True,
+                        require_sidecar=True,
+                        require_sidecar_sync=True,
+                        require_reflection_manifest=True,
+                        repo_root=repo,
+                    )
+                    self.assertFalse(res["ok"])
+                    joined = " | ".join(res["errors"])
+                    self.assertIn(expected_substr, joined)
+                finally:
+                    for p, data in snapshot.items():
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_bytes(data)
+
+            _check_fails(lambda: (web_dist / "runtime.js").write_text("", encoding="utf-8"), "runtime.js is empty")
+            _check_fails(
+                lambda: (web_dist / "runtime.wasm").write_bytes(
+                    wasm.build_valid_runtime_wasm(browser_boot_export_names=("_main",))
+                ),
+                "playgta6_audio_ring",
+            )
+            _check_fails(
+                lambda: (web_dist / "guest_manifest.json").write_text("{bad", encoding="utf-8"),
+                "guest_manifest.json",
+            )
+            _check_fails(
+                lambda: (boot_dir / "main" / "image" / "guest.pgim").write_bytes(b"BAD!" + b"\x00" * 32),
+                "invalid magic",
+            )
+            _check_fails(
+                lambda: (boot_dir / "boot-options.json").write_text('{"unknown": 1}', encoding="utf-8"),
+                "unsupported key",
+            )
+            _check_fails(
+                lambda: (shaders_dir / "splash.wgsl.pack").write_bytes(b"NOPE" + b"\x00" * 16),
+                "invalid magic",
+            )
+            _check_fails(
+                lambda: (shaders_dir / "reflection-manifest.json").write_text(
+                    json.dumps({"schema_version": 1, "pack": "wrong.wgsl.pack", "shaders": {"0x1": {}}}),
+                    encoding="utf-8",
+                ),
+                "does not match staged shader pack",
+            )
+
+    def test_cli_verify_staged_and_json_output_strictly_sanitized(self) -> None:
+        entries = [
+            (0x0000000000000B01, 1, b"@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); }\n"),
+        ]
+        with tempfile.TemporaryDirectory(prefix="T70SecretHost_") as tmp:
+            base = Path(tmp)
+            repo = _make_repo_skeleton(base)
+            program_dir = repo / "work" / "recomp_program"
+            wasm_dir = repo / "work" / "wasm_guest_dist"
+            shader_src = base / "external_shaders"
+            shader_src.mkdir(parents=True)
+            ext_boot = base / "ext_boot_t70"
+            ext_dist = base / "ext_dist_t70"
+            ext_shaders = base / "ext_shaders_t70"
+
+            _populate_program_dir(program_dir)
+            _write_wasm_pair(wasm_dir, wasm.build_valid_runtime_wasm(include_browser_boot_exports=True))
+            (wasm_dir / "guest_manifest.json").write_text(
+                json.dumps({"guest_modules": ["main"]}), encoding="utf-8"
+            )
+            src_pack = shader_src / "splash.wgsl.pack"
+            src_pack.write_bytes(_build_wgpk_pack(entries, version=1))
+            Path(str(src_pack) + ".reflect.json").write_text(
+                json.dumps(
+                    {
+                        "schema": "playgta6-stage-reflection",
+                        "version": 1,
+                        "stages": {"0x0000000000000b01": {"stage": "vertex", "bindings": []}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (shader_src / "reflection-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "pack": "splash.wgsl.pack",
+                        "shaders": {"0x0000000000000b01": {"stage": "vertex"}},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # 1. Stage + verify via CLI with --json.
+            buf_json = io.StringIO()
+            with redirect_stdout(buf_json):
+                rc = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--program-dir",
+                        str(program_dir),
+                        "--wasm-dir",
+                        str(wasm_dir),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--web-dist",
+                        str(ext_dist),
+                        "--shader-pack",
+                        str(src_pack),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--verify-window-marks",
+                        "--require-fast-boot-exports",
+                        "--require-sidecar-sync",
+                        "--verify-staged",
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            payload = json.loads(buf_json.getvalue())
+            self.assertTrue(payload["ok"])
+            self.assertTrue(payload["verification"]["checked"])
+            self.assertTrue(payload["verification"]["ok"])
+
+            # 2. Standalone --verify-staged text mode (without re-staging program-dir).
+            buf_text = io.StringIO()
+            with redirect_stdout(buf_text):
+                rc_verify = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--boot-dir",
+                        str(ext_boot),
+                        "--web-dist",
+                        str(ext_dist),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--verify-staged",
+                    ]
+                )
+            self.assertEqual(rc_verify, 0)
+            text_out = buf_text.getvalue()
+            self.assertIn("Verification [PASS]", text_out)
+            self.assertIn("fast_boot_exports=OK", text_out)
+            self.assertIn("guest_pgim=YES", text_out)
+
+            # 3. Failure output on corrupt WGPK pack must ALSO contain zero host paths.
+            bad_pack = base / "corrupt_t70.wgsl.pack"
+            bad_pack.write_bytes(b"BAD!" + b"\x00" * 16)
+            buf_fail = io.StringIO()
+            with redirect_stdout(buf_fail):
+                rc_fail = sbb.main(
+                    [
+                        "--repo-root",
+                        str(repo),
+                        "--shader-pack",
+                        str(bad_pack),
+                        "--shaders-dir",
+                        str(ext_shaders),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(rc_fail, 1)
+
+            for output in (buf_json.getvalue(), text_out, buf_fail.getvalue()):
+                self.assertNotIn("T70SecretHost_", output)
                 self.assertNotIn(str(base), output)
                 self.assertNotIn(str(base).replace("\\", "/"), output)
                 self.assertNotRegex(output, r"[A-Za-z]:[\\/]")
