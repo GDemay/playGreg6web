@@ -8,6 +8,8 @@
 #include <condition_variable>
 #include <cstring>
 #include <functional>
+#include <iterator>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -15,6 +17,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -170,6 +173,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         counts_.clear();
     }
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return counts_.size();
+    }
 
 private:
     mutable std::mutex mutex_;
@@ -223,6 +230,79 @@ bool optional_queue_ok(uint64_t value) {
     return value == 0 || check_handle(queues(), value, "XTaskQueue handle");
 }
 
+// Bounded FIFO tracker for guest XAsyncBlock shadows started through this provider. Operations
+// without a Result getter (e.g. XAsyncRun, XUserGetTokenAndSignatureAsync, or abandoned calls)
+// otherwise keep their host shadow in guest_callbacks indefinitely; this reclaims finished
+// (!xasync_in_flight) shadows once more than kMaxTrackedShadows are tracked while never touching
+// in-flight operations or recent completed blocks.
+class GuestShadowTracker {
+public:
+    static constexpr size_t kMaxTrackedShadows = 64;
+
+    void track_and_reclaim(uint64_t guest_block) {
+        std::vector<uint64_t> to_end;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto existing = index_.find(guest_block);
+            if (existing != index_.end()) {
+                order_.erase(existing->second);
+                index_.erase(existing);
+            }
+            if (order_.size() >= kMaxTrackedShadows) {
+                for (auto it = order_.begin(); it != order_.end() && order_.size() >= kMaxTrackedShadows;) {
+                    const uint64_t candidate = *it;
+                    Pg6XAsyncBlock* shadow = cbk::async_shadow_find(candidate);
+                    if (shadow == nullptr) {
+                        index_.erase(candidate);
+                        it = order_.erase(it);
+                    } else if (!xasync_in_flight(shadow)) {
+                        to_end.push_back(candidate);
+                        index_.erase(candidate);
+                        it = order_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            order_.push_back(guest_block);
+            index_[guest_block] = std::prev(order_.end());
+        }
+        for (uint64_t va : to_end) {
+            cbk::async_shadow_end(va);
+        }
+    }
+
+    void untrack(uint64_t guest_block) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = index_.find(guest_block);
+        if (it != index_.end()) {
+            order_.erase(it->second);
+            index_.erase(it);
+        }
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return order_.size();
+    }
+
+    void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        order_.clear();
+        index_.clear();
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::list<uint64_t> order_;
+    std::unordered_map<uint64_t, std::list<uint64_t>::iterator> index_;
+};
+
+GuestShadowTracker& shadow_tracker() {
+    static GuestShadowTracker instance;
+    return instance;
+}
+
 // Begins a shadowed async call for a guest XAsyncBlock (validates its queue first).
 Pg6XAsyncBlock* begin_async(uint64_t guest_block) {
     cbk::GuestAsyncBlock guest{};
@@ -233,7 +313,18 @@ Pg6XAsyncBlock* begin_async(uint64_t guest_block) {
     if (!optional_queue_ok(guest.queue)) {
         return nullptr;
     }
-    return cbk::async_shadow_begin(guest_block);
+    Pg6XAsyncBlock* shadow = cbk::async_shadow_begin(guest_block);
+    if (shadow != nullptr) {
+        shadow_tracker().track_and_reclaim(guest_block);
+    }
+    return shadow;
+}
+
+void end_async(uint64_t guest_block) {
+    cbk::async_shadow_end(guest_block);
+    if (cbk::async_shadow_find(guest_block) == nullptr) {
+        shadow_tracker().untrack(guest_block);
+    }
 }
 
 Pg6XAsyncBlock* find_async(uint64_t guest_block) {
@@ -346,6 +437,13 @@ public:
         if (thread_.joinable()) {
             thread_.join();
         }
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto& [due, item] : items_) {
+            (void)due;
+            cbk::destroy_trampoline(item.callback.trampoline);
+            pg6_gdk_xtask_queue_close_handle(item.queue);
+        }
+        items_.clear();
     }
 
 private:
@@ -454,7 +552,7 @@ public:
 
     int32_t SubmitDelayedCallback(uint64_t queue, uint32_t port, uint32_t delay_ms, uint64_t context,
                                   uint64_t callback) {
-        if (callback == 0 || !check_handle(queues(), queue, "XTaskQueue handle")) {
+        if (callback == 0 || port > 1 || !check_handle(queues(), queue, "XTaskQueue handle")) {
             return E_INVALIDARG_HR;
         }
         cbk::HostCallback<Pg6XTaskQueueCallback> cb = cbk::adapt_task_queue_callback(callback, context);
@@ -517,10 +615,14 @@ public:
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        return XAsyncRunWith(shadow, [work, block](XAsyncBlock*) -> HResult {
+        const int32_t hr = XAsyncRunWith(shadow, [work, block](XAsyncBlock*) -> HResult {
             // DoWork of the queue: a top-level callback.
             return com::GuestFunction<int32_t(uint64_t)>(work).call_top_level(com::current_guest_state(), block);
         });
+        if (hr < 0) {
+            end_async(block);
+        }
+        return hr;
     }
 
     int32_t Begin(uint64_t block, uint64_t context, uint64_t identity, uint64_t identity_name, uint64_t provider) {
@@ -533,6 +635,7 @@ public:
         }
         auto adapter = std::make_unique<GuestProvider>(provider, block, context);
         if (!adapter->ok()) {
+            end_async(block);
             return E_OUTOFMEMORY_HR;
         }
         const std::string name = guest_string(identity_name, 128);
@@ -606,6 +709,17 @@ public:
 // Configured age group of the local user (set_user_age_group).
 std::atomic<uint32_t> g_user_age_group{static_cast<uint32_t>(UserAgeGroup::Unknown)};
 
+struct UserChangeTokens {
+    std::mutex mutex;
+    std::unordered_set<uint64_t> active;
+    uint64_t next = 1;
+};
+
+UserChangeTokens& user_change_tokens() {
+    static UserChangeTokens instance;
+    return instance;
+}
+
 class UserApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XUser";
@@ -622,7 +736,11 @@ public:
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        return pg6_gdk_xuser_add_async(options, shadow);
+        const int32_t hr = pg6_gdk_xuser_add_async(options, shadow);
+        if (hr < 0) {
+            end_async(block);
+        }
+        return hr;
     }
 
     int32_t AddResult(uint64_t block, OutPtr user) {
@@ -637,10 +755,15 @@ public:
         Pg6XUserHandle handle = nullptr;
         const int32_t hr = pg6_gdk_xuser_add_result(shadow, &handle);
         if (hr != E_PENDING_HR) {
-            cbk::async_shadow_end(block);
+            end_async(block);
         }
-        users().add(handle);
-        user.write(to_guest(handle));
+        if (handle != nullptr) {
+            if (!user.write(to_guest(handle))) {
+                pg6_gdk_xuser_close_handle(handle);
+                return E_INVALIDARG_HR;
+            }
+            users().add(handle);
+        }
         return hr;
     }
 
@@ -706,7 +829,7 @@ public:
 
     int32_t CheckPrivilege(uint64_t user, uint32_t options, uint32_t privilege, GuestPtr<uint8_t> has_privilege,
                            GuestPtr<uint32_t> deny_reasons) {
-        if (!check_handle(users(), user, "XUserHandle")) {
+        if (!check_handle(users(), user, "XUserHandle") || has_privilege.is_null()) {
             return E_INVALIDARG_HR;
         }
         bool has = false;
@@ -726,8 +849,12 @@ public:
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        return pg6_gdk_xuser_resolve_privilege_with_ui_async(from_guest<Pg6XUser>(user), options, privilege,
-                                                             shadow);
+        const int32_t hr = pg6_gdk_xuser_resolve_privilege_with_ui_async(from_guest<Pg6XUser>(user), options, privilege,
+                                                                         shadow);
+        if (hr < 0) {
+            end_async(block);
+        }
+        return hr;
     }
 
     int32_t ResolvePrivilegeWithUiResult(uint64_t block) {
@@ -737,7 +864,7 @@ public:
         }
         const int32_t hr = pg6_gdk_xuser_resolve_privilege_with_ui_result(shadow);
         if (hr != E_PENDING_HR) {
-            cbk::async_shadow_end(block);
+            end_async(block);
         }
         return hr;
     }
@@ -753,12 +880,20 @@ public:
             return E_INVALIDARG_HR;
         }
         // Offline: the shim completes with the offline result without reading the request.
-        return pg6_gdk_xuser_get_token_and_signature_async(from_guest<Pg6XUser>(user), options, method, url,
-                                                           static_cast<size_t>(header_count), headers,
-                                                           static_cast<size_t>(body_size), body, shadow);
+        const int32_t hr = pg6_gdk_xuser_get_token_and_signature_async(
+            from_guest<Pg6XUser>(user), options, method, url, static_cast<size_t>(header_count), headers,
+            static_cast<size_t>(body_size), body, shadow);
+        if (hr < 0) {
+            end_async(block);
+        }
+        return hr;
     }
 
     int32_t GetTokenAndSignatureResultSize(uint64_t block, GuestPtr<uint64_t> size) {
+        if (size.is_null()) {
+            return E_INVALIDARG_HR;
+        }
+        size.write(0);
         Pg6XAsyncBlock* shadow = find_async(block);
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
@@ -776,14 +911,22 @@ public:
         if (callback == 0 || token.is_null() || !optional_queue_ok(queue)) {
             return E_INVALIDARG_HR;
         }
-        token.write(next_token_++);
+        uint64_t id = 0;
+        {
+            auto& tokens = user_change_tokens();
+            std::lock_guard<std::mutex> lock(tokens.mutex);
+            id = tokens.next++;
+            tokens.active.insert(id);
+        }
+        token.write(id);
         return S_OK_HR;
     }
 
-    bool UnregisterForChangeEvent(uint64_t /*token*/, bool /*wait*/) { return true; }
-
-private:
-    std::atomic<uint64_t> next_token_{1};
+    bool UnregisterForChangeEvent(uint64_t token, bool /*wait*/) {
+        auto& tokens = user_change_tokens();
+        std::lock_guard<std::mutex> lock(tokens.mutex);
+        return tokens.active.erase(token) != 0;
+    }
 };
 
 // {01acd177-...}/{cef4fac0-7676-4a94-a119-4c43f9eb5b74}: XUser extension.
@@ -807,7 +950,9 @@ public:
         size_t host_used = 0;
         const int32_t hr = pg6_gdk_xuser_get_gamertag(from_guest<Pg6XUser>(user), component,
                                                       static_cast<size_t>(size), host_buffer, &host_used);
-        os::guest_window::mark_written(buffer, static_cast<size_t>(size));  // O37
+        if (hr >= 0 && buffer != 0 && host_used > 0) {
+            os::guest_window::mark_written(buffer, host_used);  // O37
+        }
         used.write(static_cast<uint64_t>(host_used));
         return hr;
     }
@@ -1039,13 +1184,23 @@ private:
     std::atomic<bool> result_logged_{false};
 };
 
-// The guest callback of one connectivity registration. The O8 shim calls it at most once (the
-// initial notification; the offline state never changes), so it frees itself when called. A
-// registration removed before its notification was dispatched leaks this 16-byte record.
+// The guest callback of one connectivity registration. Tracked so both initial delivery and
+// early unregistration reclaim the record cleanly with zero leaks and zero races.
 struct GuestConnectivityCallback {
     uint64_t function = 0;
     uint64_t context = 0;
+    uint64_t token = 0;
 };
+
+struct ConnectivityCallbackTable {
+    std::mutex mutex;
+    std::unordered_map<void*, std::unique_ptr<GuestConnectivityCallback>> live;
+};
+
+ConnectivityCallbackTable& connectivity_callbacks() {
+    static ConnectivityCallbackTable instance;
+    return instance;
+}
 
 // Guest-readable copy of the hint handed to guest callbacks (the offline hint is constant).
 uint64_t guest_connectivity_hint() {
@@ -1054,7 +1209,17 @@ uint64_t guest_connectivity_hint() {
 }
 
 void forward_connectivity_change(void* context, const Pg6XNetworkingConnectivityHint* hint) {
-    std::unique_ptr<GuestConnectivityCallback> cb(static_cast<GuestConnectivityCallback*>(context));
+    std::unique_ptr<GuestConnectivityCallback> cb;
+    {
+        auto& table = connectivity_callbacks();
+        std::lock_guard<std::mutex> lock(table.mutex);
+        auto it = table.live.find(context);
+        if (it == table.live.end()) {
+            return;  // already unregistered
+        }
+        cb = std::move(it->second);
+        table.live.erase(it);
+    }
     const uint64_t va = guest_connectivity_hint();
     if (va == 0 || hint == nullptr || !com::write_guest(va, *hint)) {
         com::detail::log_bad_pointer("XNetworkingConnectivityHint (guest copy)", va);
@@ -1086,12 +1251,27 @@ public:
         if (callback == 0 || token.is_null() || !optional_queue_ok(queue)) {
             return E_INVALIDARG_HR;
         }
-        auto cb = std::make_unique<GuestConnectivityCallback>(GuestConnectivityCallback{callback, context});
+        auto cb = std::make_unique<GuestConnectivityCallback>(GuestConnectivityCallback{callback, context, 0});
+        void* key = cb.get();
+        {
+            auto& table = connectivity_callbacks();
+            std::lock_guard<std::mutex> lock(table.mutex);
+            table.live.emplace(key, std::move(cb));
+        }
         Pg6XTaskQueueRegistrationToken host_token{};
         const int32_t hr = pg6_gdk_xnetworking_register_connectivity_hint_changed(
-            from_guest<Pg6XTaskQueue>(queue), cb.get(), &forward_connectivity_change, &host_token);
-        if (hr >= 0) {
-            cb.release();  // owned by the queued notification now
+            from_guest<Pg6XTaskQueue>(queue), key, &forward_connectivity_change, &host_token);
+        {
+            auto& table = connectivity_callbacks();
+            std::lock_guard<std::mutex> lock(table.mutex);
+            auto it = table.live.find(key);
+            if (it != table.live.end()) {
+                if (hr < 0) {
+                    table.live.erase(it);
+                } else {
+                    it->second->token = host_token.token;
+                }
+            }
         }
         token.write(host_token.token);
         return hr;
@@ -1100,7 +1280,18 @@ public:
     bool UnregisterConnectivityHintChanged(uint64_t token, bool wait) {
         Pg6XTaskQueueRegistrationToken host_token{};
         host_token.token = token;
-        return pg6_gdk_xnetworking_unregister_connectivity_hint_changed(host_token, wait ? 1 : 0) != 0;
+        const bool ok = pg6_gdk_xnetworking_unregister_connectivity_hint_changed(host_token, wait ? 1 : 0) != 0;
+        if (token != 0) {
+            auto& table = connectivity_callbacks();
+            std::lock_guard<std::mutex> lock(table.mutex);
+            for (auto it = table.live.begin(); it != table.live.end(); ++it) {
+                if (it->second->token == token) {
+                    table.live.erase(it);
+                    break;
+                }
+            }
+        }
+        return ok;
     }
 };
 
@@ -1141,25 +1332,38 @@ private:
     Write write_;
 };
 
-int32_t begin_ready_async(uint64_t async, const char* name, HResult hr, size_t result_size,
+const char kPkgInstallIdentity = 0;
+const char kPkgMountIdentity = 0;
+const char kPlsEnsureIdentity = 0;
+
+uint64_t async_identity_tag(const void* tag) {
+    return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tag));
+}
+
+int32_t begin_ready_async(uint64_t async, const void* identity, const char* name, HResult hr, size_t result_size,
                           PackageReadyOp::Write write) {
     Pg6XAsyncBlock* shadow = begin_async(async);
     if (shadow == nullptr) {
         return E_INVALIDARG_HR;
     }
-    return XAsyncBeginWith(shadow, std::make_unique<PackageReadyOp>(hr, result_size, std::move(write)), 0, name);
+    const int32_t begin_hr = XAsyncBeginWith(shadow, std::make_unique<PackageReadyOp>(hr, result_size, std::move(write)),
+                                             async_identity_tag(identity), name);
+    if (begin_hr < 0) {
+        end_async(async);
+    }
+    return begin_hr;
 }
 
 // Result half: copies the result to `buffer` and ends the shadow block once it is no longer pending.
-int32_t finish_ready_async(uint64_t async, uint64_t size, uint64_t buffer) {
+int32_t finish_ready_async(uint64_t async, const void* identity, uint64_t size, uint64_t buffer) {
     Pg6XAsyncBlock* shadow = find_async(async);
     if (shadow == nullptr) {
         return E_INVALIDARG_HR;
     }
     size_t used = 0;
-    const int32_t hr = XAsyncGetResultWith(shadow, 0, static_cast<size_t>(size), buffer, &used);
+    const int32_t hr = XAsyncGetResultWith(shadow, async_identity_tag(identity), static_cast<size_t>(size), buffer, &used);
     if (hr != E_PENDING_HR && hr != E_NOT_SUFFICIENT_BUFFER_HR) {
-        cbk::async_shadow_end(async);
+        end_async(async);
     }
     return hr;
 }
@@ -1294,11 +1498,16 @@ public:
         if (async == 0 || !selectors_ok(identifier, count, selectors)) {
             return E_INVALIDARG_HR;
         }
-        return begin_ready_async(async, "XPackageInstallChunksAsync", S_OK_HR, sizeof(uint64_t),
-                                 [](uint64_t buffer) {
+        return begin_ready_async(async, &kPkgInstallIdentity, "XPackageInstallChunksAsync", S_OK_HR, sizeof(uint64_t),
+                                 [](uint64_t buffer) -> HResult {
                                      auto* handle = new InstallationMonitor{};
                                      installation_monitors().add(handle);
-                                     return com::write_guest(buffer, to_guest(handle)) ? S_OK_HR : E_INVALIDARG_HR;
+                                     if (!com::write_guest(buffer, to_guest(handle))) {
+                                         installation_monitors().remove(handle);
+                                         delete handle;
+                                         return E_INVALIDARG_HR;
+                                     }
+                                     return S_OK_HR;
                                  });
     }
 
@@ -1308,7 +1517,7 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(monitor, uint64_t{0});
-        return finish_ready_async(async, sizeof(uint64_t), monitor);
+        return finish_ready_async(async, &kPkgInstallIdentity, sizeof(uint64_t), monitor);
     }
 
     // s18: XPackageEstimateDownloadSize(id, selectorCount, selectors, uint64_t* downloadSize,
@@ -1368,7 +1577,7 @@ public:
         if (!is_own_package(identifier)) {
             return kNotFound;
         }
-        return begin_ready_async(async, "XPackageMountWithUiAsync", S_OK_HR, sizeof(uint64_t),
+        return begin_ready_async(async, &kPkgMountIdentity, "XPackageMountWithUiAsync", S_OK_HR, sizeof(uint64_t),
                                  [](uint64_t buffer) -> HResult {
                                      auto* handle = new PackageMount{};
                                      package_mounts().add(handle);
@@ -1387,7 +1596,7 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(mount, uint64_t{0});
-        return finish_ready_async(async, sizeof(uint64_t), mount);
+        return finish_ready_async(async, &kPkgMountIdentity, sizeof(uint64_t), mount);
     }
 
     // s25: XPackageGetMountPath(mount, pathSize, path): the game-data root, NUL-terminated.
@@ -1510,11 +1719,11 @@ public:
             return E_INVALIDARG_HR;
         }
         const HResult hr = requested_bytes <= space_info().available_free_bytes ? S_OK_HR : E_ABORT_HR;
-        return begin_ready_async(async, "XPersistentLocalStorageEnsureSpaceAsync", hr, 0, nullptr);
+        return begin_ready_async(async, &kPlsEnsureIdentity, "XPersistentLocalStorageEnsureSpaceAsync", hr, 0, nullptr);
     }
 
     // s7: XPersistentLocalStorageEnsureSpaceResult(XAsyncBlock*).
-    int32_t EnsureSpaceResult(uint64_t async) { return finish_ready_async(async, 0, 0); }
+    int32_t EnsureSpaceResult(uint64_t async) { return finish_ready_async(async, &kPlsEnsureIdentity, 0, 0); }
 };
 
 // {03f0fe74-...}/{35f07670-...}: slot 4 is called through a two-argument wrapper (a preference
@@ -1684,6 +1893,10 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         objects_.clear();
     }
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return objects_.size();
+    }
 
 private:
     uint64_t first_;
@@ -1791,8 +2004,8 @@ bool write_blobs(uint64_t buffer, const ReadBlobs& read) {
     return true;
 }
 
-// Applies an update: the container is created by its first update; a failing update leaves no new
-// container behind.
+// Applies an update atomically: creates the container on first write and commits blobs + display
+// name in one directory swap; a failing update leaves no new container and bumps no dirty state.
 HResult submit_update(SaveUpdate& update) {
     std::vector<gamesave::BlobWrite> writes;
     std::vector<std::string> deletes;
@@ -1805,20 +2018,9 @@ HResult submit_update(SaveUpdate& update) {
         writes = std::move(update.writes);
         deletes = std::move(update.deletes);
     }
-    gamesave::Store& store = update.provider->store;
-    std::vector<gamesave::BlobInfo> existing;
-    const bool is_new = store.enumerate_blobs(update.container, &existing) == gamesave::E_GS_NO_SUCH_CONTAINER;
-    HResult hr = store.create_container(update.container);
-    if (hr >= 0) {
-        hr = store.submit_update(update.container, writes, deletes);
-    }
-    if (hr >= 0 && !update.display_name.empty()) {
-        hr = store.set_display_name(update.container, update.display_name);
-    }
-    if (hr < 0 && is_new) {
-        store.delete_container(update.container);
-    }
-    return hr;
+    const std::string* display_name = update.display_name.empty() ? nullptr : &update.display_name;
+    return update.provider->store.submit_update(update.container, writes, deletes, display_name,
+                                                /*create_if_missing=*/true);
 }
 
 // Guest blob-name array (const char* names[count]).
@@ -1837,10 +2039,19 @@ bool guest_names(uint64_t names, uint32_t count, std::vector<std::string>* out) 
     return true;
 }
 
+const char kSaveInitIdentity = 0;
+const char kSaveQuotaIdentity = 0;
+const char kSaveDeleteIdentity = 0;
+const char kSaveReadIdentity = 0;
+const char kSaveUpdateIdentity = 0;
+
 // XGameSaveInitializeProviderAsync: the provider is created in DoWork and handed over by Result.
+// If cancelled or abandoned before Result hands out the handle, Cleanup removes it from the table.
 class SaveInitOp final : public XAsyncProviderImpl {
 public:
     explicit SaveInitOp(std::string configuration_id) : configuration_id_(std::move(configuration_id)) {}
+    ~SaveInitOp() override { release_unclaimed(); }
+
     HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
         switch (op) {
         case XAsyncOp::Begin:
@@ -1850,24 +2061,43 @@ public:
             XAsyncComplete(block, S_OK_HR, sizeof(uint64_t));
             return E_PENDING_HR;
         case XAsyncOp::GetResult:
-            return com::write_guest(buffer, handle_) ? S_OK_HR : E_INVALIDARG_HR;
+            if (!com::write_guest(buffer, handle_)) {
+                return E_INVALIDARG_HR;
+            }
+            handle_ = 0;
+            return S_OK_HR;
+        case XAsyncOp::Cleanup:
+            release_unclaimed();
+            return S_OK_HR;
         default:
             return S_OK_HR;
         }
     }
 
 private:
+    void release_unclaimed() {
+        if (handle_ != 0) {
+            save_providers().remove(handle_);
+            handle_ = 0;
+        }
+    }
+
     std::string configuration_id_;
     uint64_t handle_ = 0;
 };
 
 // An XGameSave async operation whose work runs on the queue's work port: `work` returns the
-// HRESULT and the result size, `result` writes the result into the guest buffer.
+// HRESULT and the result size, `result` writes the result into the guest buffer, and `cleanup`
+// (optional) releases any side-table state on completion, cancellation, or abandonment.
 class SaveWorkOp final : public XAsyncProviderImpl {
 public:
     using Work = std::function<HResult(size_t* required)>;
     using Result = std::function<HResult(uint64_t buffer)>;
-    SaveWorkOp(Work work, Result result) : work_(std::move(work)), result_(std::move(result)) {}
+    using Cleanup = std::function<void()>;
+    SaveWorkOp(Work work, Result result, Cleanup cleanup = nullptr)
+        : work_(std::move(work)), result_(std::move(result)), cleanup_(std::move(cleanup)) {}
+    ~SaveWorkOp() override { run_cleanup(); }
+
     HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
         switch (op) {
         case XAsyncOp::Begin:
@@ -1880,14 +2110,26 @@ public:
         }
         case XAsyncOp::GetResult:
             return result_ ? result_(buffer) : S_OK_HR;
+        case XAsyncOp::Cleanup:
+            run_cleanup();
+            return S_OK_HR;
         default:
             return S_OK_HR;
         }
     }
 
 private:
+    void run_cleanup() {
+        if (cleanup_) {
+            auto fn = std::move(cleanup_);
+            cleanup_ = nullptr;
+            fn();
+        }
+    }
+
     Work work_;
     Result result_;
+    Cleanup cleanup_;
 };
 
 // ReadBlobDataAsync results by guest XAsyncBlock until ReadBlobDataResult hands them over (the
@@ -1898,6 +2140,14 @@ struct PendingRead {
 };
 std::mutex g_pending_reads_mutex;
 std::map<uint64_t, std::shared_ptr<PendingRead>> g_pending_reads;
+
+void erase_pending_read_if_match(uint64_t async, const std::shared_ptr<PendingRead>& expected) {
+    std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
+    auto it = g_pending_reads.find(async);
+    if (it != g_pending_reads.end() && it->second == expected) {
+        g_pending_reads.erase(it);
+    }
+}
 
 class GameSaveApi : public com::ComObject {
 public:
@@ -1914,7 +2164,11 @@ public:
             return E_INVALIDARG_HR;
         }
         log_once("XGameSaveInitializeProvider");
-        provider.write(add_save_provider(guest_string(configuration_id, 256)));
+        const uint64_t handle = add_save_provider(guest_string(configuration_id, 256));
+        if (!provider.write(handle)) {
+            save_providers().remove(handle);
+            return E_INVALIDARG_HR;
+        }
         return S_OK_HR;
     }
 
@@ -1929,8 +2183,12 @@ public:
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        return XAsyncBeginWith(shadow, std::make_unique<SaveInitOp>(guest_string(configuration_id, 256)), 0,
-                               "XGameSaveInitializeProviderAsync");
+        const int32_t hr = XAsyncBeginWith(shadow, std::make_unique<SaveInitOp>(guest_string(configuration_id, 256)),
+                                           async_identity_tag(&kSaveInitIdentity), "XGameSaveInitializeProviderAsync");
+        if (hr < 0) {
+            end_async(async);
+        }
+        return hr;
     }
 
     // s5: XGameSaveInitializeProviderResult(XAsyncBlock*, XGameSaveProviderHandle*).
@@ -1939,7 +2197,7 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(provider, uint64_t{0});
-        return finish_async(async, sizeof(uint64_t), provider);
+        return finish_async(async, &kSaveInitIdentity, sizeof(uint64_t), provider);
     }
 
     // s7: XGameSaveGetRemainingQuota(provider, int64_t* remainingQuota).
@@ -1950,7 +2208,9 @@ public:
         }
         int64_t value = 0;
         const int32_t hr = provider->store.remaining_quota(&value);
-        com::write_guest(remaining, hr < 0 ? int64_t{0} : value);
+        if (!com::write_guest(remaining, hr < 0 ? int64_t{0} : value)) {
+            return E_INVALIDARG_HR;
+        }
         return hr;
     }
 
@@ -1961,7 +2221,7 @@ public:
             return E_INVALIDARG_HR;
         }
         auto value = std::make_shared<int64_t>(0);
-        return begin_work(async, "XGameSaveGetRemainingQuotaAsync",
+        return begin_work(async, &kSaveQuotaIdentity, "XGameSaveGetRemainingQuotaAsync",
                           [provider, value](size_t* required) {
                               *required = sizeof(int64_t);
                               return provider->store.remaining_quota(value.get());
@@ -1977,7 +2237,7 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(remaining, int64_t{0});
-        return finish_async(async, sizeof(int64_t), remaining);
+        return finish_async(async, &kSaveQuotaIdentity, sizeof(int64_t), remaining);
     }
 
     // s10: XGameSaveDeleteContainer(provider, containerName).
@@ -1999,13 +2259,13 @@ public:
         if (!gamesave::valid_container_name(container)) {
             return gamesave::E_GS_INVALID_CONTAINER_NAME;
         }
-        return begin_work(async, "XGameSaveDeleteContainerAsync",
+        return begin_work(async, &kSaveDeleteIdentity, "XGameSaveDeleteContainerAsync",
                           [provider, container](size_t*) { return provider->store.delete_container(container); },
                           nullptr);
     }
 
     // s12: XGameSaveDeleteContainerResult(XAsyncBlock*).
-    int32_t DeleteContainerResult(uint64_t async) { return finish_async(async, 0, 0); }
+    int32_t DeleteContainerResult(uint64_t async) { return finish_async(async, &kSaveDeleteIdentity, 0, 0); }
 
     // XGameSaveContainerInfo as handed to the enumeration callback (x64; GDK field order: name,
     // displayName, blobCount, totalSize, lastModifiedTime, needsSync).
@@ -2034,7 +2294,9 @@ public:
         if (hr < 0) {
             return hr;
         }
+        constexpr uint64_t kEpochDiffSecs = 11644473600ull;
         const com::GuestFunction<uint64_t(uint64_t, uint64_t)> cb(callback);
+        playgta6::GuestState& guest_state = com::current_guest_state();
         for (const gamesave::ContainerInfo& info : containers) {
             const uint64_t size = sizeof(GuestContainerInfo) + info.name.size() + 1 + info.display_name.size() + 1;
             const uint64_t block = com::guest_alloc(size);
@@ -2046,13 +2308,14 @@ public:
             guest.display_name = guest.name + info.name.size() + 1;
             guest.total_size = info.total_size;
             guest.blob_count = info.blob_count;
-            guest.last_modified = info.last_modified / 10000000ull - 11644473600ull;
+            const uint64_t secs = info.last_modified / 10000000ull;
+            guest.last_modified = secs >= kEpochDiffSecs ? secs - kEpochDiffSecs : 0;
             com::write_guest(block, guest);
             com::write_guest(guest.name, info.name.c_str(), info.name.size() + 1);
             com::write_guest(guest.display_name, info.display_name.c_str(), info.display_name.size() + 1);
-            const bool keep_going = (cb.call(com::current_guest_state(), block, context) & 0xFF) != 0;
+            const bool keep_going = (cb.call(guest_state, block, context) & 0xFF) != 0;
             com::guest_free(block);
-            if (!keep_going) {
+            if (!keep_going || playgta6::guest::unwind_pending(guest_state)) {
                 break;
             }
         }
@@ -2060,9 +2323,10 @@ public:
     }
 
     // s13: XGameSaveEnumerateContainerInfoByName(provider, prefix, context, callback).
+    // Per GDK spec, a null prefix enumerates all containers.
     int32_t EnumerateContainerInfoByName(uint64_t provider, uint64_t prefix, uint64_t context, uint64_t callback) {
-        return prefix == 0 ? E_INVALIDARG_HR
-                           : EnumerateContainers(provider, guest_string(prefix, 256), context, callback);
+        return EnumerateContainers(provider, prefix == 0 ? std::string() : guest_string(prefix, 256), context,
+                                   callback);
     }
 
     // s14: XGameSaveEnumerateContainerInfo(provider, context, callback).
@@ -2094,13 +2358,16 @@ public:
         }
         const uint64_t handle =
             save_containers().add(std::make_shared<SaveContainer>(SaveContainer{provider, std::move(text)}));
-        com::write_guest(container, handle);
+        if (!com::write_guest(container, handle)) {
+            save_containers().remove(handle);
+            return E_INVALIDARG_HR;
+        }
         return S_OK_HR;
     }
 
     // s17: XGameSaveCloseContainer(XGameSaveContainerHandle).
     void CloseContainer(uint64_t container) {
-        if (!save_containers().remove(container)) {
+        if (container != 0 && !save_containers().remove(container)) {
             com::detail::log_bad_pointer("XGameSaveContainerHandle", container);
         }
     }
@@ -2118,6 +2385,7 @@ public:
             return hr;
         }
         const com::GuestFunction<uint64_t(uint64_t, uint64_t)> cb(callback);
+        playgta6::GuestState& guest_state = com::current_guest_state();
         for (const gamesave::BlobInfo& info : blobs) {
             if (info.name.compare(0, prefix.size(), prefix) != 0) {
                 continue;
@@ -2131,9 +2399,9 @@ public:
             guest.size = info.size;
             com::write_guest(block, guest);
             com::write_guest(guest.name, info.name.c_str(), info.name.size() + 1);
-            const bool keep_going = (cb.call(com::current_guest_state(), block, context) & 0xFF) != 0;
+            const bool keep_going = (cb.call(guest_state, block, context) & 0xFF) != 0;
             com::guest_free(block);
-            if (!keep_going) {
+            if (!keep_going || playgta6::guest::unwind_pending(guest_state)) {
                 break;
             }
         }
@@ -2147,8 +2415,9 @@ public:
 
     // s19: XGameSaveEnumerateBlobInfoByName(container, blobNamePrefix, context, callback). The title
     // looks up "Save Game Header" this way and sizes its read buffer from the reported size.
+    // Per GDK spec, a null prefix enumerates all blobs.
     int32_t EnumerateBlobInfoByName(uint64_t container, uint64_t prefix, uint64_t context, uint64_t callback) {
-        return prefix == 0 ? E_INVALIDARG_HR : EnumerateBlobs(container, guest_string(prefix, 256), context, callback);
+        return EnumerateBlobs(container, prefix == 0 ? std::string() : guest_string(prefix, 256), context, callback);
     }
 
     // s20: XGameSaveReadBlobData(container, const char** blobNames, uint32_t* countOfBlobs,
@@ -2194,7 +2463,7 @@ public:
             g_pending_reads[async] = pending;
         }
         const int32_t hr = begin_work(
-            async, "XGameSaveReadBlobDataAsync",
+            async, &kSaveReadIdentity, "XGameSaveReadBlobDataAsync",
             [container, wanted, pending](size_t* required) {
                 std::lock_guard<std::mutex> lock(pending->mutex);
                 const HResult r = read_blobs(*container, wanted, &pending->read);
@@ -2204,9 +2473,10 @@ public:
             [pending](uint64_t buffer) {
                 std::lock_guard<std::mutex> lock(pending->mutex);
                 return write_blobs(buffer, pending->read) ? S_OK_HR : E_INVALIDARG_HR;
-            });
+            },
+            [async, pending]() { erase_pending_read_if_match(async, pending); });
         if (hr < 0) {
-            take_pending_read(async);
+            erase_pending_read_if_match(async, pending);
         }
         return hr;
     }
@@ -2218,14 +2488,24 @@ public:
             return E_POINTER_HR;
         }
         com::write_guest(count_ptr, uint32_t{0});
-        int32_t hr = finish_async(async, size, buffer);
+        std::shared_ptr<PendingRead> pending;
+        {
+            std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
+            auto it = g_pending_reads.find(async);
+            if (it != g_pending_reads.end()) {
+                pending = it->second;
+            }
+        }
+        const int32_t hr = finish_async(async, &kSaveReadIdentity, size, buffer);
         if (hr == E_NOT_SUFFICIENT_BUFFER_HR) {
             return gamesave::E_GS_PROVIDED_BUFFER_TOO_SMALL;
         }
         if (hr == E_PENDING_HR) {
             return hr;
         }
-        auto pending = take_pending_read(async);
+        if (pending) {
+            erase_pending_read_if_match(async, pending);
+        }
         if (hr >= 0 && pending) {
             std::lock_guard<std::mutex> lock(pending->mutex);
             com::write_guest(count_ptr, static_cast<uint32_t>(pending->read.blobs.size()));
@@ -2247,13 +2527,17 @@ public:
         state->provider = container->provider;
         state->container = container->name;
         state->display_name = guest_string(display_name, gamesave::kMaxDisplayNameChars);
-        com::write_guest(update, save_updates().add(std::move(state)));
+        const uint64_t handle = save_updates().add(std::move(state));
+        if (!com::write_guest(update, handle)) {
+            save_updates().remove(handle);
+            return E_INVALIDARG_HR;
+        }
         return S_OK_HR;
     }
 
     // s24: XGameSaveCloseUpdate(XGameSaveUpdateHandle). An unsubmitted update is dropped.
     void CloseUpdate(uint64_t update) {
-        if (!save_updates().remove(update)) {
+        if (update != 0 && !save_updates().remove(update)) {
             com::detail::log_bad_pointer("XGameSaveUpdateHandle", update);
         }
     }
@@ -2318,53 +2602,50 @@ public:
         if (!update || async == 0) {
             return E_INVALIDARG_HR;
         }
-        return begin_work(async, "XGameSaveSubmitUpdateAsync",
+        return begin_work(async, &kSaveUpdateIdentity, "XGameSaveSubmitUpdateAsync",
                           [update](size_t*) { return submit_update(*update); }, nullptr);
     }
 
     // s29: XGameSaveSubmitUpdateResult(XAsyncBlock*).
-    int32_t SubmitUpdateResult(uint64_t async) { return finish_async(async, 0, 0); }
+    int32_t SubmitUpdateResult(uint64_t async) { return finish_async(async, &kSaveUpdateIdentity, 0, 0); }
 
     // s6: XGameSaveCloseProvider(XGameSaveProviderHandle).
     void CloseProvider(uint64_t provider) {
-        if (!save_providers().remove(provider)) {
+        if (provider != 0 && !save_providers().remove(provider)) {
             com::detail::log_bad_pointer("XGameSaveProviderHandle", provider);
         }
     }
 
 private:
-    int32_t begin_work(uint64_t async, const char* name, SaveWorkOp::Work work, SaveWorkOp::Result result) {
+    int32_t begin_work(uint64_t async, const void* identity, const char* name, SaveWorkOp::Work work,
+                       SaveWorkOp::Result result, SaveWorkOp::Cleanup cleanup = nullptr) {
         Pg6XAsyncBlock* shadow = begin_async(async);
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
-        return XAsyncBeginWith(shadow, std::make_unique<SaveWorkOp>(std::move(work), std::move(result)), 0, name);
+        const int32_t hr =
+            XAsyncBeginWith(shadow, std::make_unique<SaveWorkOp>(std::move(work), std::move(result), std::move(cleanup)),
+                            async_identity_tag(identity), name);
+        if (hr < 0) {
+            end_async(async);
+        }
+        return hr;
     }
 
     // Result half of an async call: copies the result (size bytes) to `buffer` and ends the
     // shadow block once the operation is no longer pending.
-    static int32_t finish_async(uint64_t async, uint64_t size, uint64_t buffer) {
+    static int32_t finish_async(uint64_t async, const void* identity, uint64_t size, uint64_t buffer) {
         Pg6XAsyncBlock* shadow = find_async(async);
         if (shadow == nullptr) {
             return E_INVALIDARG_HR;
         }
         size_t used = 0;
-        const int32_t hr = XAsyncGetResultWith(shadow, 0, static_cast<size_t>(size), buffer, &used);
+        const int32_t hr =
+            XAsyncGetResultWith(shadow, async_identity_tag(identity), static_cast<size_t>(size), buffer, &used);
         if (hr != E_PENDING_HR && hr != E_NOT_SUFFICIENT_BUFFER_HR) {  // a larger buffer may follow
-            cbk::async_shadow_end(async);
+            end_async(async);
         }
         return hr;
-    }
-
-    static std::shared_ptr<PendingRead> take_pending_read(uint64_t async) {
-        std::lock_guard<std::mutex> lock(g_pending_reads_mutex);
-        auto it = g_pending_reads.find(async);
-        if (it == g_pending_reads.end()) {
-            return nullptr;
-        }
-        auto pending = std::move(it->second);
-        g_pending_reads.erase(it);
-        return pending;
     }
 
     void log_once(const char* api) {
@@ -2997,6 +3278,22 @@ bool parse_user_age_group(const std::string& text, UserAgeGroup* group) {
     return false;
 }
 
+ProviderHandleCounts provider_handle_counts() {
+    ProviderHandleCounts counts{};
+    counts.task_queues = queues().size();
+    counts.users = users().size();
+    counts.stores = stores().size();
+    counts.save_providers = save_providers().size();
+    counts.save_containers = save_containers().size();
+    counts.save_updates = save_updates().size();
+    {
+        std::lock_guard<std::mutex> reads(g_pending_reads_mutex);
+        counts.pending_save_reads = g_pending_reads.size();
+    }
+    counts.tracked_async_shadows = shadow_tracker().size();
+    return counts;
+}
+
 void reset_xgameruntime_provider() {
     ProviderState& st = state();
     std::lock_guard<std::mutex> lock(st.mutex);
@@ -3009,12 +3306,26 @@ void reset_xgameruntime_provider() {
     users().clear();
     stores().clear();
     ports().clear();
+    installation_monitors().clear();
+    package_mounts().clear();
     save_providers().clear();
     save_containers().clear();
     save_updates().clear();
+    shadow_tracker().clear();
     {
         std::lock_guard<std::mutex> reads(g_pending_reads_mutex);
         g_pending_reads.clear();
+    }
+    {
+        auto& tokens = user_change_tokens();
+        std::lock_guard<std::mutex> tlock(tokens.mutex);
+        tokens.active.clear();
+        tokens.next = 1;
+    }
+    {
+        auto& table = connectivity_callbacks();
+        std::lock_guard<std::mutex> clock(table.mutex);
+        table.live.clear();
     }
     g_title_id.store(0, std::memory_order_relaxed);
     set_xbox_live_sandbox_id("");

@@ -13,6 +13,11 @@
 #include "os/threading.h"
 #include "os/xasync_provider.h"
 
+namespace {
+std::atomic<size_t> g_open_task_queues{0};
+std::atomic<size_t> g_open_users{0};
+}  // namespace
+
 struct Pg6XTaskQueuePort {
     Pg6XTaskQueue* owner = nullptr;
     uint32_t port = 0;  // XTaskQueuePort
@@ -26,6 +31,7 @@ struct Pg6XTaskQueue {
     std::atomic<bool> composite_terminated{false};
 
     Pg6XTaskQueue() {
+        g_open_task_queues.fetch_add(1, std::memory_order_relaxed);
         ports[0] = Pg6XTaskQueuePort{this, 0};
         ports[1] = Pg6XTaskQueuePort{this, 1};
     }
@@ -36,6 +42,9 @@ struct Pg6XUser {
     std::atomic<uint32_t> ref_count{1};
     uint64_t xuid = playgta6::os::gdk::kOfflineUserXuid;
     std::string gamertag = playgta6::os::gdk::kOfflineUserGamertag;
+
+    Pg6XUser() { g_open_users.fetch_add(1, std::memory_order_relaxed); }
+    ~Pg6XUser() { g_open_users.fetch_sub(1, std::memory_order_relaxed); }
 };
 
 namespace playgta6::os::gdk {
@@ -350,7 +359,7 @@ public:
             case XAsyncOp::DoWork:
                 user_ = new Pg6XUser();
                 XAsyncComplete(block, S_OK_HR, sizeof(XUserHandle));
-                return S_OK_HR;
+                return E_PENDING_HR;
             case XAsyncOp::GetResult:
                 if (buffer == 0 || buffer_size < sizeof(XUserHandle)) {
                     return E_INVALIDARG_HR;
@@ -393,6 +402,9 @@ HResult XUserAddResult(XAsyncBlock* async_block, XUserHandle* new_user) {
 }
 
 HResult XUserGetId(XUserHandle user, uint64_t* user_id) {
+    if (user_id != nullptr) {
+        *user_id = 0;
+    }
     if (user == nullptr || user_id == nullptr) {
         return E_INVALIDARG_HR;
     }
@@ -405,6 +417,9 @@ HResult XUserGetGamertag(XUserHandle user,
                          size_t gamertag_size,
                          char* gamertag,
                          size_t* gamertag_used) {
+    if (gamertag_used != nullptr) {
+        *gamertag_used = 0;
+    }
     if (user == nullptr) {
         return E_INVALIDARG_HR;
     }
@@ -444,6 +459,9 @@ void XUserCloseHandle(XUserHandle user) {
 }
 
 HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated) {
+    if (duplicated != nullptr) {
+        *duplicated = nullptr;
+    }
     if (user == nullptr || duplicated == nullptr) {
         return E_INVALIDARG_HR;
     }
@@ -452,6 +470,14 @@ HResult XUserDuplicateHandle(XUserHandle user, XUserHandle* duplicated) {
     copy->gamertag = user->gamertag;
     *duplicated = copy;
     return S_OK_HR;
+}
+
+size_t open_xtask_queue_count() {
+    return g_open_task_queues.load(std::memory_order_relaxed);
+}
+
+size_t open_xuser_count() {
+    return g_open_users.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +505,7 @@ Pg6XTaskQueue::~Pg6XTaskQueue() {
             playgta6::os::gdk::release_task_queue(port->owner);
         }
     }
+    g_open_task_queues.fetch_sub(1, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------

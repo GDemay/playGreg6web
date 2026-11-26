@@ -9,6 +9,7 @@
 
 #include "os/win32_kernel.h"
 #include "os/guest_window.h"
+#include "os/xasync_provider.h"
 #include "os/xbox_offline.h"
 #include "os/xgameruntime.h"
 
@@ -915,6 +916,65 @@ void test_winhttp_extras() {
     }
 }
 
+// O52: Multi-thousand-iteration offline Xbl handle + XAsync reclamation stress test (zero leaks).
+void test_o52_offline_xbl_stress(Pg6XUserHandle user) {
+    const size_t base_handles = open_dummy_handle_count();
+    const size_t base_tasks = gdk::xasync_task_count();
+
+    Pg6XTaskQueueHandle queue = nullptr;
+    CHECK(gdk::XTaskQueueCreate(gdk::XTaskQueueDispatchMode::Immediate,
+                                gdk::XTaskQueueDispatchMode::Immediate,
+                                &queue) == S_OK_HR);
+
+    constexpr int kIterations = 2500;
+    for (int i = 0; i < kIterations; ++i) {
+        Pg6XblContextHandle ctx = nullptr;
+        Pg6XblContextHandle dup = nullptr;
+        CHECK(pg6_gdk_xbl_context_create_handle(user, &ctx) == S_OK_HR && ctx != nullptr);
+        CHECK(pg6_gdk_xbl_context_duplicate_handle(ctx, &dup) == S_OK_HR && dup == ctx);
+
+        auto block = std::make_unique<Pg6XAsyncBlock>();
+        block->queue = queue;
+        switch (i % 4) {
+            case 0: {
+                CHECK(pg6_gdk_xbl_presence_set_presence_async(ctx, 1, nullptr, block.get()) == S_OK_HR);
+                CHECK(pg6_gdk_xasync_get_status(block.get(), 0) == kOfflineHResult);
+                break;
+            }
+            case 1: {
+                CHECK(pg6_gdk_xbl_profile_get_user_profile_async(ctx, gdk::kOfflineUserXuid, block.get()) == S_OK_HR);
+                unsigned char buf[16]{};
+                CHECK(pg6_gdk_xbl_profile_get_user_profile_result(block.get(), buf) == kOfflineHResult);
+                break;
+            }
+            case 2: {
+                CHECK(pg6_gdk_xbl_achievements_get_achievements_for_title_id_async(
+                          ctx, gdk::kOfflineUserXuid, 0x1234u, 0, 0, 0, 0, 10, block.get()) == S_OK_HR);
+                Pg6OfflineResultHandle res = garbage_ptr<Pg6OfflineResult>();
+                CHECK(pg6_gdk_xbl_achievements_get_achievements_for_title_id_result(block.get(), &res) ==
+                      kOfflineHResult);
+                CHECK(res == nullptr);
+                break;
+            }
+            default: {
+                CHECK(pg6_gdk_xbl_title_storage_get_quota_async(ctx, "scid", 0, block.get()) == S_OK_HR);
+                size_t used = 1, quota = 1;
+                CHECK(pg6_gdk_xbl_title_storage_get_quota_result(block.get(), &used, &quota) == kOfflineHResult);
+                CHECK(used == 0 && quota == 0);
+                break;
+            }
+        }
+
+        pg6_gdk_xbl_context_close_handle(dup);
+        pg6_gdk_xbl_context_close_handle(ctx);
+    }
+
+    CHECK(open_dummy_handle_count() == base_handles);
+    CHECK(gdk::xasync_task_count() == base_tasks);
+    CHECK(gdk::xasync_record_count() <= gdk::kXAsyncMaxObservedCompletedRecords + 16);
+    pg6_gdk_xtask_queue_close_handle(queue);
+}
+
 }  // namespace
 
 int main() {
@@ -931,6 +991,7 @@ int main() {
     test_telemetry();
     test_winhttp_extras();
     test_hit_counters();
+    test_o52_offline_xbl_stress(user);
 
     pg6_gdk_xuser_close_handle(user);
     gdk::XGameRuntimeUninitialize();
