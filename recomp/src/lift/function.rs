@@ -334,6 +334,7 @@ pub(super) fn lift(
         stack_values: BTreeMap::new(),
         window_load_cache: None,
         burst_override: None,
+        last_access: None,
         guest_base: None,
         cold_traps: Vec::new(),
         share_ret: return_blocks > 1,
@@ -419,6 +420,121 @@ fn drop_overwritten_slot_stores(ir: &str) -> String {
     out
 }
 
+/// Every `%name` token a line mentions (labels included; they never name a value definition).
+fn value_tokens(code: &str) -> impl Iterator<Item = &str> {
+    code.match_indices('%').map(move |(at, _)| {
+        let rest = &code[at + 1..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .unwrap_or(rest.len());
+        &rest[..end]
+    })
+}
+
+/// Whether the right-hand side of a value definition has no effect besides its result, so the
+/// definition can go once nothing uses it. Loads count only when they read guest state or a
+/// register/flag alloca, never guest memory (a guest load may fault) and never atomic or volatile
+/// ones (the memory-model barriers of #719/#722 order those); calls, divisions and every other
+/// instruction stay.
+fn is_pure_definition(rhs: &str) -> bool {
+    const PURE: [&str; 21] = [
+        "add ",
+        "sub ",
+        "mul ",
+        "and ",
+        "or ",
+        "xor ",
+        "shl ",
+        "lshr ",
+        "ashr ",
+        "icmp ",
+        "select ",
+        "trunc ",
+        "zext ",
+        "sext ",
+        "getelementptr ",
+        "inttoptr ",
+        "ptrtoint ",
+        "bitcast ",
+        "phi ",
+        "extractvalue ",
+        "extractelement ",
+    ];
+    if PURE.iter().any(|op| rhs.starts_with(op)) {
+        return true;
+    }
+    let Some(load) = rhs.strip_prefix("load ") else {
+        return false;
+    };
+    if load.starts_with("atomic ") || load.starts_with("volatile ") {
+        return false;
+    }
+    let Some((_, ptr)) = load.split_once(", ptr %") else {
+        return false;
+    };
+    let ptr = ptr.split([',', ' ']).next().unwrap_or_default();
+    ptr.starts_with("state.")
+        || GPR_NAMES.contains(&ptr)
+        || FLAGS.iter().any(|f| &f.slot()[1..] == ptr)
+}
+
+/// Removes pure value definitions ([`is_pure_definition`]) that nothing uses, transitively. The
+/// state syncs around calls reload every register and flag the callee may write, and the load
+/// forwarding plus [`drop_overwritten_slot_stores`] then leave the reloads of values the caller
+/// overwrites before reading (typically the flags after a call) without a single use.
+fn drop_unused_values(ir: &str) -> String {
+    let lines: Vec<&str> = ir.lines().collect();
+    let mut defs: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut uses: BTreeMap<&str, usize> = BTreeMap::new();
+    for (i, line) in lines.iter().enumerate() {
+        let code = line.trim();
+        let (def, rhs) = match code.split_once(" = ") {
+            Some((lhs, rhs)) if lhs.starts_with('%') && !lhs.contains(' ') => {
+                (Some(&lhs[1..]), rhs)
+            }
+            _ => (None, code),
+        };
+        if let Some(def) = def
+            && is_pure_definition(rhs)
+        {
+            defs.insert(def, i);
+        }
+        for token in value_tokens(rhs) {
+            *uses.entry(token).or_default() += 1;
+        }
+    }
+    let mut keep = vec![true; lines.len()];
+    let mut work: Vec<&str> = defs
+        .keys()
+        .copied()
+        .filter(|d| uses.get(d).copied().unwrap_or(0) == 0)
+        .collect();
+    while let Some(def) = work.pop() {
+        let Some(&i) = defs.get(def) else { continue };
+        if !keep[i] {
+            continue;
+        }
+        keep[i] = false;
+        let rhs = lines[i].trim().split_once(" = ").map_or("", |(_, r)| r);
+        for token in value_tokens(rhs) {
+            if let Some(n) = uses.get_mut(token) {
+                *n -= 1;
+                if *n == 0 && defs.contains_key(token) {
+                    work.push(token);
+                }
+            }
+        }
+    }
+    let mut out = String::with_capacity(ir.len());
+    for (line, keep) in lines.iter().zip(keep) {
+        if keep {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Terminators whose last instruction is the control transfer itself (lowered from the edges).
 fn ends_in_transfer(terminator: Terminator) -> bool {
     matches!(
@@ -475,6 +591,9 @@ struct FunctionLifter<'a> {
     window_load_cache: Option<memory_access::CachedWindowAddr>,
     /// R58: active fast-path translation override for a coalesced same-base window burst.
     burst_override: Option<memory_access::BurstOverride>,
+    /// The last plain guest load or store, for forwarding its value to a load of the same address
+    /// later in the same LLVM block (`memory_access::LastAccess`).
+    last_access: Option<memory_access::LastAccess>,
     /// SSA value holding `@__playgta6_guest_base`, loaded once in `entry:` when needed.
     pub(super) guest_base: Option<String>,
     /// Incoming edges `(kind, va, pred_block)` into this function's shared `cold_trap` sink.
@@ -799,6 +918,7 @@ impl FunctionLifter<'_> {
         ir.push_str(&body);
         ir.push_str("}\n");
         let ir = drop_overwritten_slot_stores(&ir);
+        let ir = drop_unused_values(&ir);
 
         let mut unsupported = std::mem::take(&mut self.unsupported);
         unsupported.sort_by_key(|u| u.address);
@@ -971,6 +1091,7 @@ impl FunctionLifter<'_> {
     fn start_block(&mut self, label: &str) {
         self.known = Known::default();
         self.window_load_cache = None;
+        self.last_access = None;
         self.current_block.clear();
         self.current_block.push_str(label);
         let _ = writeln!(self.body, "{label}:");
