@@ -306,6 +306,17 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
         *error = "unknown stage \"" + stage + "\"";
         return false;
     }
+    if (const Json* mesh = s.get("mesh_output"); mesh != nullptr) {
+        bridge::MeshOutputLayout& m = out->mesh_output;
+        if (mesh->type != Json::Type::Object || !get_u32(*mesh, "max_vertices", &m.max_vertices) ||
+            !get_u32(*mesh, "max_primitives", &m.max_primitives) || !get_u32(*mesh, "vertex_words", &m.vertex_words) ||
+            !bridge::valid_mesh_output_layout(m)) {
+            *error = "mesh_output needs max_vertices and max_primitives in 1..256 and vertex_words 4 + 4 * n (n <= " +
+                     std::to_string(bridge::kMaxMeshAttributes) + ")";
+            return false;
+        }
+        out->has_mesh_output = true;
+    }
     if (const Json* inputs = s.get("vertex_inputs"); inputs != nullptr && inputs->type == Json::Type::Array) {
         for (const Json& in : inputs->array) {
             ReflectedVertexInput v;

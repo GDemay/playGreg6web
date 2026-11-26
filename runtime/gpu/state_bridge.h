@@ -213,6 +213,10 @@ enum class IndirectKind : uint8_t {
     Draw = 0,         // 16-byte record: vertex count, instance count, first vertex, first instance
     DrawIndexed = 1,  // 20-byte record: index count, instance count, first index, base vertex, first instance
     Dispatch = 2,     // 12-byte record: thread group counts x, y, z
+    // G66 mesh pipelines: 12-byte DispatchMesh record (group counts x, y, z) for the bound mesh
+    // pipeline state. The clamp pass writes a 28-byte pair: a dispatch record (x, 1, 1) for the
+    // mesh stage run as compute, then a draw record (x * max_primitives * 3, 1, 0, 0).
+    DispatchMesh = 3,
 };
 struct IndirectExecution {
     IndirectKind kind = IndirectKind::Draw;
@@ -229,10 +233,49 @@ inline constexpr uint32_t kMaxIndirectCommands = 256;
 inline constexpr uint32_t kMaxIndirectWorkgroups = 65535;
 // The clamp pass's output ring (one window of kMaxIndirectCommands records per execution).
 inline constexpr uint32_t kIndirectRingBytes = 1u << 18;
-inline constexpr uint32_t kIndirectWindowBytes = kMaxIndirectCommands * 20u;
+inline constexpr uint32_t kIndirectWindowBytes = kMaxIndirectCommands * 28u;
+// Bytes the clamp pass writes per command of `kind` (the stride of the indirect packets' records).
+uint32_t indirect_output_bytes(IndirectKind kind) noexcept;
 // The clamp compute shader (entry point cs_main, workgroup size 64).
 const char* indirect_clamp_wgsl() noexcept;
 class CommandListBridge;
+
+// ---- G66: mesh pipelines (triangle output, x-dimension groups) emulated with compute + draw ----
+// A mesh pipeline state is two pipelines:
+//   * the mesh stage translated to a WGSL compute module (pack stage "compute", key
+//     mesh_compute_pack_key(mesh stage key), entry point cs_main, one workgroup per mesh group,
+//     workgroup_id.x = the group index). Its pipeline layout is the stage's own (groups 0..2, bound
+//     from the graphics root arguments) plus group kMeshOutputGroup, binding 0: the runtime's
+//     output buffer (storage, read_write), one record per group (mesh_group_record_words):
+//       word 0: vertex count, word 1: primitive count (SetMeshOutputCounts), words 2..3: 0,
+//       then max_vertices vertices of vertex_words words (SV_Position xyzw as f32 bits, then the
+//       attributes as vec4<f32> per location 0..), then max_primitives x 3 u32 local indices;
+//   * a draw with a runtime vertex shader (mesh_draw_vertex_wgsl) that pulls those triangles from
+//     the same buffer (group kMeshOutputGroup, read-only storage) and the title's pixel shader:
+//     groups * max_primitives * 3 vertices, unused primitives degenerate.
+struct MeshOutputLayout {
+    uint32_t max_vertices = 0;    // 1..256
+    uint32_t max_primitives = 0;  // 1..256
+    uint32_t vertex_words = 0;    // 4 (position) + 4 per attribute location (at most kMaxMeshAttributes)
+};
+inline constexpr uint32_t kMaxMeshAttributes = 15;
+inline constexpr uint32_t kMeshOutputGroup = 3;
+// The runtime's mesh output buffer: every mesh dispatch writes it from offset 0 (GPU-ordered).
+inline constexpr uint64_t kMeshOutputBytes = 32ull << 20;
+bool valid_mesh_output_layout(const MeshOutputLayout& layout) noexcept;
+uint32_t mesh_group_record_words(const MeshOutputLayout& layout) noexcept;
+// Groups one mesh dispatch runs at most: what fits in the output buffer, at most kMaxIndirectWorkgroups.
+uint32_t mesh_max_groups(const MeshOutputLayout& layout) noexcept;
+// The pack key of a mesh stage's compute translation.
+inline constexpr uint64_t kMeshComputeKeySalt = 0x4d53435300000000ull;  // "MSCS"
+constexpr uint64_t mesh_compute_pack_key(uint64_t mesh_stage_key) noexcept {
+    return mesh_stage_key ^ kMeshComputeKeySalt;
+}
+// The runtime vertex shader of a mesh draw (entry point vs_main) and the shader identity it is
+// registered under (one per output layout).
+std::string mesh_draw_vertex_wgsl(const MeshOutputLayout& layout);
+uint64_t mesh_draw_vertex_identity(const MeshOutputLayout& layout) noexcept;
+class MeshPipelineState;
 
 struct ViewRecord {
     uint32_t texture_id = 0;  // packet texture id (kGpuSwapchainTextureId for swapchain buffers)
@@ -273,9 +316,17 @@ public:
     std::unique_ptr<ComputePipelineState> create_compute_pipeline_state(
         const pso::D3D12ComputePsoDesc& desc,
         const d3d::RootSignature* root_signature);
+    // G66 mesh pipeline: `draw_desc` is the pipeline's graphics state with vs =
+    // mesh_draw_vertex_identity(output) (its module and its (vs, ps) layout registered), no input
+    // layout and triangle topology; `mesh_shader` is the identity the mesh stage's compute module
+    // and (mesh_shader, 0) layout are registered under. Diagnostics as for the other states.
+    std::unique_ptr<MeshPipelineState> create_mesh_pipeline_state(const pso::D3D12GraphicsPsoDesc& draw_desc,
+                                                                  uint64_t mesh_shader, const MeshOutputLayout& output,
+                                                                  const d3d::RootSignature* root_signature);
     // Final Release of a PSO: drops its pipeline-cache references and emits DestroyResource for the
     // pipelines the cache evicted (only with EvictUnreferenced caches).
     void release_pipeline_state(std::unique_ptr<GraphicsPipelineState> pso, CommandEncoder& encoder);
+    void release_mesh_pipeline_state(std::unique_ptr<MeshPipelineState> pso, CommandEncoder& encoder);
 
     // ---- pso::DescriptorViewResolver over the G6 heaps ----
     uint64_t rtv_descriptor_increment() const override;
@@ -349,6 +400,8 @@ private:
         // The emitted GpuBindGroupLayoutEntry list: one per binding (arrays not expanded).
         std::vector<GpuBindGroupLayoutEntry> layout_entries;
         bool emitted = false;
+        // G66 mesh pipelines: a group the caller binds itself (the mesh output buffer).
+        bool runtime_owned = false;
     };
     struct PipelineLayoutRecord {
         uint32_t id = 0;
@@ -397,6 +450,14 @@ private:
     uint32_t indirect_clamp_group(const IndirectClamp& clamp, uint32_t params_ring, uint32_t args, uint32_t count,
                                   CommandEncoder& encoder);
     uint32_t allocate_indirect_window();
+
+    // G66 mesh pipelines: `base` (at most kMeshOutputGroup groups) padded with empty groups and
+    // followed by the runtime-owned output group (binding 0, `visibility`, `binding_type`); null
+    // when `base` has more groups.
+    PipelineLayoutRecord* mesh_layout(PipelineLayoutRecord* base, uint32_t visibility, uint8_t binding_type);
+    // The output buffer's bind group for runtime group layout `group` (created through `encoder`
+    // on first use).
+    uint32_t mesh_output_group(const GroupLayoutRecord& group, CommandEncoder& encoder);
 
     // #482 storage-format fallback: the intermediate texture of `resource_id` in `format` (same size,
     // dimension and mips), created through `encoder` on first use.
@@ -457,6 +518,10 @@ private:
     IndirectClamp indirect_clamp_{};
     std::map<std::pair<uint32_t, uint32_t>, uint32_t> indirect_groups_;  // (args, count) -> bind group
     uint32_t indirect_cursor_ = 0;
+    std::map<std::pair<PipelineLayoutRecord*, uint32_t>, PipelineLayoutRecord*> mesh_layouts_;
+    GroupLayoutRecord* empty_group_layout_ = nullptr;
+    uint32_t mesh_output_buffer_ = 0;
+    std::map<uint32_t, uint32_t> mesh_output_groups_;  // runtime group layout id -> bind group
 
     mutable std::mutex bridges_mutex_;
     std::vector<CommandListBridge*> bridges_;
@@ -509,6 +574,23 @@ private:
     uint32_t cs_module_id_ = 0;
     StateBridgeDevice::PipelineLayoutRecord* layout_ = nullptr;
     std::vector<d3d::BindGroupPlan> plans_;
+    uint64_t diagnostics_ = 0;
+};
+
+// G66: a mesh pipeline state (see MeshOutputLayout).
+class MeshPipelineState {
+public:
+    GraphicsPipelineState* draw() const noexcept { return draw_.get(); }
+    ComputePipelineState* stage() const noexcept { return stage_.get(); }
+    const MeshOutputLayout& output() const noexcept { return output_; }
+    uint64_t diagnostics() const noexcept { return diagnostics_; }
+
+private:
+    friend class StateBridgeDevice;
+    friend class CommandListBridge;
+    std::unique_ptr<GraphicsPipelineState> draw_;
+    std::unique_ptr<ComputePipelineState> stage_;
+    MeshOutputLayout output_{};
     uint64_t diagnostics_ = 0;
 };
 
@@ -566,6 +648,10 @@ struct BridgeStats {
     uint64_t indirect_commands = 0;
     uint64_t indirect_skipped = 0;
     uint64_t indirect_truncated = 0;
+    // G66 mesh pipelines: mesh dispatches emitted (direct, and indirect commands), and mesh work
+    // skipped (no mesh pipeline state bound, invalid group counts, bindings that cannot be built).
+    uint64_t mesh_dispatches = 0;
+    uint64_t mesh_skipped = 0;
 };
 
 class CommandListBridge {
@@ -589,6 +675,8 @@ public:
     // Pipeline state.
     void SetPipelineState(GraphicsPipelineState* pso);
     void SetComputePipelineState(ComputePipelineState* pso);
+    // G66: binds a mesh pipeline state (graphics slot); SetPipelineState unbinds it.
+    void SetMeshPipelineState(MeshPipelineState* pso);
 
     // Output merger / clears.
     void OMSetRenderTargets(uint32_t num_render_target_descriptors,
@@ -641,6 +729,9 @@ public:
     void Dispatch(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
     // G66: ExecuteIndirect (see IndirectExecution). False when skipped (counted in stats().indirect_skipped).
     bool ExecuteIndirect(const IndirectExecution& execution);
+    // G66: DispatchMesh with the bound mesh pipeline state (x-dimension groups only: y and z must
+    // be 1). False when skipped (counted in stats().mesh_skipped).
+    bool DispatchMesh(uint32_t thread_group_count_x, uint32_t thread_group_count_y, uint32_t thread_group_count_z);
 
     // Barriers: flush pending clears and end the render pass (WebGPU usage scopes), then track states.
     void ResourceBarrier(uint32_t num_barriers, const d3d::ResourceBarrier* barriers);
@@ -721,6 +812,11 @@ private:
     bool prepare_render_draw();
     // Ends the render pass and binds the compute PSO and its bind groups (null: nothing to dispatch).
     ComputePipelineState* prepare_compute_dispatch();
+    ComputePipelineState* prepare_compute_dispatch(ComputePipelineState* state, d3d::BindPoint bind_point);
+    // G66 mesh pipelines: the mesh stage's compute pipeline and bindings (output group included),
+    // and the draw's render pass and bindings. False when they cannot be prepared.
+    bool prepare_mesh_stage();
+    bool prepare_mesh_draw();
     // G66: emits the clamp pass for `e` (count commands) and returns the ring offset of its output.
     bool emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring, uint32_t* out_offset);
     void apply_input_assembler(bool indexed);
@@ -765,6 +861,7 @@ private:
     bool open_ = false;
     GraphicsPipelineState* graphics_pso_ = nullptr;
     ComputePipelineState* compute_pso_ = nullptr;
+    MeshPipelineState* mesh_pso_ = nullptr;
     std::unordered_map<uint32_t, uint32_t> empty_bind_groups_;  // group layout id -> bind group id
     // Bind groups recorded over descriptor memory: where their entries sit in the encoder, what
     // they were built from.

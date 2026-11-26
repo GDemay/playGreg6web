@@ -381,6 +381,8 @@ struct StreamPipeline {
     StreamPipelineKind kind = StreamPipelineKind::Graphics;
     GuestGraphicsPipelineStateDesc graphics{};
     GuestComputePipelineStateDesc compute{};
+    GuestShaderBytecode mesh{};           // MS subobject (kind Mesh)
+    bool amplification = false;           // an AS subobject is present
     uint32_t subobjects = 0;
     uint32_t ignored_subobjects = 0;  // known types without an equivalent (view instancing, ...)
 };
@@ -466,7 +468,7 @@ enum class Counter : size_t {
     ExecutesWithToken,
     IndirectSkipped,             // ExecuteIndirect not emitted (invalid arguments, unsupported signature)
     IndirectExecuted,            // ... emitted (draw / indexed draw / dispatch through the clamp pass)
-    IndirectMeshSkipped,         // ... mesh dispatch signatures: no mesh pipelines yet, skipped
+    IndirectMeshSkipped,         // ... mesh dispatch signatures without an emulated mesh pipeline bound, skipped
     IndirectType105Skipped,      // ... Xbox type 105 signatures: skipped
     RectListPipelineStates,      // topology type kTopologyTypeRect accepted
     RectListDrawsSkipped,        // draws with topology kTopologyRectList that were not expanded
@@ -482,6 +484,7 @@ enum class Counter : size_t {
     DxilStagesJoined,            // DXIL stage joined to an indexed native stage
     DxilStagesNotJoined,
     PlaceholderPipelineStates,
+    MeshPipelineStates,          // G66: mesh pipelines emulated (mesh stage as compute + draw)
     UnknownOverrideKinds,
     ComputePipelineStatesX,      // slot 62 (DXIL)
     BlobPipelineStatesRefused,   // slot 67 (console-native compute)

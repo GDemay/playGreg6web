@@ -549,7 +549,7 @@ void StateBridgeDevice::register_pipeline_layout(uint64_t first_shader, uint64_t
 
         GroupLayoutRecord* found = nullptr;
         for (const auto& existing : group_layouts_) {
-            if (existing->header.content_id == record->header.content_id &&
+            if (!existing->runtime_owned && existing->header.content_id == record->header.content_id &&
                 existing->header.flags == record->header.flags &&
                 existing->entries.size() == record->entries.size() &&
                 existing->layout_entries.size() == record->layout_entries.size() &&
@@ -906,10 +906,16 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     var words = 4u;
+    var out_words = 4u;
     if (p.kind == 1u) {
         words = 5u;
+        out_words = 5u;
     } else if (p.kind == 2u) {
         words = 3u;
+        out_words = 3u;
+    } else if (p.kind == 3u) {
+        words = 3u;
+        out_words = 7u;
     }
     var n = p.count;
     if (p.has_count != 0u) {
@@ -920,10 +926,10 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let base = p.src_word + i * p.stride_words;
     let live = i < n && base < arrayLength(&src) && words <= arrayLength(&src) - base;
-    let out = i * words;
-    for (var k = 0u; k < words; k = k + 1u) {
+    let out = i * out_words;
+    for (var k = 0u; k < out_words; k = k + 1u) {
         var v = 0u;
-        if (live) {
+        if (live && k < words) {
             v = src[base + k];
         }
         dst[out + k] = v;
@@ -942,9 +948,236 @@ fn cs_main(@builtin(global_invocation_id) id: vec3<u32>) {
         dst[out] = min(dst[out], p.group_limit);
         dst[out + 1u] = min(dst[out + 1u], p.group_limit);
         dst[out + 2u] = min(dst[out + 2u], p.group_limit);
+    } else if (p.kind == 3u) {
+        // Mesh dispatch: x-dimension groups only (y = z = 1), at most group_limit; the draw that
+        // follows covers index_limit (max primitives * 3) vertices per group.
+        var groups = 0u;
+        if (dst[out + 1u] == 1u && dst[out + 2u] == 1u) {
+            groups = min(dst[out], p.group_limit);
+        }
+        dst[out] = groups;
+        dst[out + 1u] = 1u;
+        dst[out + 2u] = 1u;
+        dst[out + 3u] = groups * p.index_limit;
+        dst[out + 4u] = 1u;
     }
 }
 )";
+}
+
+uint32_t indirect_output_bytes(IndirectKind kind) noexcept {
+    switch (kind) {
+    case IndirectKind::Draw: return 16u;
+    case IndirectKind::DrawIndexed: return 20u;
+    case IndirectKind::Dispatch: return 12u;
+    case IndirectKind::DispatchMesh: return 28u;
+    }
+    return 16u;
+}
+
+// ---- G66: mesh pipelines ----
+
+bool valid_mesh_output_layout(const MeshOutputLayout& l) noexcept {
+    return l.max_vertices >= 1 && l.max_vertices <= 256 && l.max_primitives >= 1 && l.max_primitives <= 256 &&
+           l.vertex_words >= 4 && l.vertex_words % 4 == 0 && l.vertex_words <= 4 + 4 * kMaxMeshAttributes;
+}
+
+uint32_t mesh_group_record_words(const MeshOutputLayout& l) noexcept {
+    return 4u + l.max_vertices * l.vertex_words + l.max_primitives * 3u;
+}
+
+uint32_t mesh_max_groups(const MeshOutputLayout& l) noexcept {
+    if (!valid_mesh_output_layout(l)) {
+        return 0;
+    }
+    const uint64_t fit = kMeshOutputBytes / (uint64_t{mesh_group_record_words(l)} * 4u);
+    return static_cast<uint32_t>(std::min<uint64_t>(fit, kMaxIndirectWorkgroups));
+}
+
+std::string mesh_draw_vertex_wgsl(const MeshOutputLayout& l) {
+    const uint32_t attributes = l.vertex_words >= 4 ? (l.vertex_words - 4u) / 4u : 0u;
+    std::string w;
+    w += "struct VsOut {\n    @builtin(position) position: vec4<f32>,\n";
+    for (uint32_t a = 0; a < attributes; ++a) {
+        w += "    @location(" + std::to_string(a) + ") a" + std::to_string(a) + ": vec4<f32>,\n";
+    }
+    w += "}\n";
+    w += "@group(" + std::to_string(kMeshOutputGroup) + ") @binding(0) var<storage, read> ms_out: array<u32>;\n";
+    w += "const RECORD_WORDS: u32 = " + std::to_string(mesh_group_record_words(l)) + "u;\n";
+    w += "const MAX_VERTICES: u32 = " + std::to_string(l.max_vertices) + "u;\n";
+    w += "const MAX_PRIMITIVES: u32 = " + std::to_string(l.max_primitives) + "u;\n";
+    w += "const VERTEX_WORDS: u32 = " + std::to_string(l.vertex_words) + "u;\n";
+    w += "const INDEX_BASE: u32 = " + std::to_string(4u + l.max_vertices * l.vertex_words) + "u;\n";
+    w += R"(fn load4(w: u32) -> vec4<f32> {
+    return bitcast<vec4<f32>>(vec4<u32>(ms_out[w], ms_out[w + 1u], ms_out[w + 2u], ms_out[w + 3u]));
+}
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
+    var o: VsOut;
+    // Unused primitives: all three corners at one point outside the depth range (no fragments).
+    o.position = vec4<f32>(0.0, 0.0, 2.0, 1.0);
+    let per_group = MAX_PRIMITIVES * 3u;
+    let g = vertex_index / per_group;
+    let k = vertex_index % per_group;
+    let prim = k / 3u;
+    let rec = g * RECORD_WORDS;
+    if (rec + RECORD_WORDS > arrayLength(&ms_out)) {
+        return o;
+    }
+    let vertices = min(ms_out[rec], MAX_VERTICES);
+    let primitives = min(ms_out[rec + 1u], MAX_PRIMITIVES);
+    if (prim >= primitives) {
+        return o;
+    }
+    let tri = rec + INDEX_BASE + prim * 3u;
+    if (max(ms_out[tri], max(ms_out[tri + 1u], ms_out[tri + 2u])) >= vertices) {
+        return o;
+    }
+    let v = rec + 4u + ms_out[tri + k % 3u] * VERTEX_WORDS;
+    o.position = load4(v);
+)";
+    for (uint32_t a = 0; a < attributes; ++a) {
+        w += "    o.a" + std::to_string(a) + " = load4(v + " + std::to_string(4u + 4u * a) + "u);\n";
+    }
+    w += "    return o;\n}\n";
+    return w;
+}
+
+uint64_t mesh_draw_vertex_identity(const MeshOutputLayout& l) noexcept {
+    uint64_t h = 0xcbf29ce484222325ull;
+    const uint32_t words[4] = {0x4d534456u /* "MSDV" */, l.max_vertices, l.max_primitives, l.vertex_words};
+    for (uint32_t word : words) {
+        for (int b = 0; b < 4; ++b) {
+            h ^= (word >> (8 * b)) & 0xFFu;
+            h *= 0x100000001b3ull;
+        }
+    }
+    return h;
+}
+
+StateBridgeDevice::PipelineLayoutRecord* StateBridgeDevice::mesh_layout(PipelineLayoutRecord* base, uint32_t visibility,
+                                                                        uint8_t binding_type) {
+    std::lock_guard lock(objects_mutex_);
+    if (base == nullptr || base->groups.size() > kMeshOutputGroup) {
+        return nullptr;
+    }
+    PipelineLayoutRecord*& found = mesh_layouts_[{base, visibility << 8 | binding_type}];
+    if (found != nullptr) {
+        return found;
+    }
+    std::vector<GroupLayoutRecord*> groups = base->groups;
+    while (groups.size() < kMeshOutputGroup) {
+        if (empty_group_layout_ == nullptr) {
+            auto record = std::make_unique<GroupLayoutRecord>();
+            record->id = allocate_id();
+            record->header.id = record->id;
+            record->runtime_owned = false;
+            empty_group_layout_ = record.get();
+            group_layouts_.push_back(std::move(record));
+        }
+        groups.push_back(empty_group_layout_);
+    }
+    GpuBindGroupLayoutEntry entry{};
+    entry.binding = 0;
+    entry.visibility = visibility;
+    entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Buffer);
+    entry.binding_type = binding_type;
+    GroupLayoutRecord* output = nullptr;
+    for (const auto& existing : group_layouts_) {
+        if (existing->runtime_owned && existing->layout_entries.size() == 1 &&
+            std::memcmp(&existing->layout_entries[0], &entry, sizeof(entry)) == 0) {
+            output = existing.get();
+            break;
+        }
+    }
+    if (output == nullptr) {
+        auto record = std::make_unique<GroupLayoutRecord>();
+        record->id = allocate_id();
+        record->header.id = record->id;
+        record->header.entry_count = 1;
+        record->entries.push_back(entry);
+        record->layout_entries.push_back(entry);
+        record->joins.push_back(d3d::ShaderBinding{});
+        record->runtime_owned = true;
+        output = record.get();
+        group_layouts_.push_back(std::move(record));
+    }
+    groups.push_back(output);
+    auto layout = std::make_unique<PipelineLayoutRecord>();
+    layout->id = allocate_id();
+    layout->groups = std::move(groups);
+    found = layout.get();
+    pipeline_layouts_.push_back(std::move(layout));
+    return found;
+}
+
+uint32_t StateBridgeDevice::mesh_output_group(const GroupLayoutRecord& group, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    if (mesh_output_buffer_ == 0) {
+        mesh_output_buffer_ = allocate_id();
+        encoder.create_buffer(mesh_output_buffer_, GpuBufferUsage::Storage, kMeshOutputBytes);
+    }
+    uint32_t& id = mesh_output_groups_[group.id];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e{};
+        e.binding = 0;
+        e.resource_type = static_cast<uint32_t>(GpuBindResourceType::Buffer);
+        e.resource_id = mesh_output_buffer_;
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = group.id;
+        g.entry_count = 1;
+        encoder.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), &e, sizeof(e));
+    }
+    return id;
+}
+
+std::unique_ptr<MeshPipelineState> StateBridgeDevice::create_mesh_pipeline_state(
+    const pso::D3D12GraphicsPsoDesc& draw_desc, uint64_t mesh_shader, const MeshOutputLayout& output,
+    const d3d::RootSignature* root_signature) {
+    std::unique_ptr<MeshPipelineState> state(new MeshPipelineState());
+    state->output_ = output;
+    if (!valid_mesh_output_layout(output)) {
+        state->diagnostics_ |= BridgeDiag::MissingPipelineLayout;
+    }
+    pso::D3D12ComputePsoDesc stage_desc{};
+    stage_desc.cs = mesh_shader;
+    stage_desc.root_signature_id = draw_desc.root_signature_id;
+    state->stage_ = create_compute_pipeline_state(stage_desc, root_signature);
+    state->draw_ = create_graphics_pipeline_state(draw_desc, root_signature);
+    // Both pipelines get the runtime's output group after their own (bound from the graphics root
+    // arguments: the mesh stage is a graphics stage).
+    const auto extend = [&](PipelineLayoutRecord** layout, std::vector<d3d::BindGroupPlan>* plans, uint32_t visibility,
+                            GpuBufferBindingType type, uint64_t* diagnostics) {
+        if (*layout == nullptr) {
+            return;
+        }
+        PipelineLayoutRecord* extended = mesh_layout(*layout, visibility, static_cast<uint8_t>(type));
+        if (extended == nullptr) {
+            *diagnostics |= BridgeDiag::MissingPipelineLayout;
+            *layout = nullptr;
+            plans->clear();
+            return;
+        }
+        *layout = extended;
+        if (!plans->empty()) {
+            plans->resize(extended->groups.size());  // padding and output groups have no plan
+        }
+    };
+    extend(&state->stage_->layout_, &state->stage_->plans_, GpuShaderStageBits::Compute, GpuBufferBindingType::Storage,
+           &state->stage_->diagnostics_);
+    extend(&state->draw_->layout_, &state->draw_->plans_, GpuShaderStageBits::Vertex,
+           GpuBufferBindingType::ReadOnlyStorage, &state->draw_->diagnostics_);
+    state->diagnostics_ |= state->stage_->diagnostics_ | state->draw_->diagnostics_;
+    return state;
+}
+
+void StateBridgeDevice::release_mesh_pipeline_state(std::unique_ptr<MeshPipelineState> state, CommandEncoder& encoder) {
+    if (state != nullptr) {
+        release_pipeline_state(std::move(state->draw_), encoder);
+    }
 }
 
 StateBridgeDevice::IndirectClamp StateBridgeDevice::indirect_clamp(CommandEncoder& encoder) {
@@ -1642,7 +1875,17 @@ void CommandListBridge::SetPipelineState(GraphicsPipelineState* state) {
         return;
     }
     graphics_pso_ = state;
+    mesh_pso_ = nullptr;
     tracker_.SetPipelineState(state != nullptr ? &state->pso_ : nullptr);
+}
+
+void CommandListBridge::SetMeshPipelineState(MeshPipelineState* state) {
+    if (!writable()) {
+        return;
+    }
+    graphics_pso_ = state != nullptr ? state->draw_.get() : nullptr;
+    mesh_pso_ = state;
+    tracker_.SetPipelineState(graphics_pso_ != nullptr ? &graphics_pso_->pso_ : nullptr);
 }
 
 void CommandListBridge::SetComputePipelineState(ComputePipelineState* state) {
@@ -2589,6 +2832,9 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
     bound->resize(layout->groups.size());
     for (size_t g = 0; g < layout->groups.size(); ++g) {
         const StateBridgeDevice::GroupLayoutRecord& group = *layout->groups[g];
+        if (group.runtime_owned) {
+            continue;  // G66 mesh output group: bound by the caller
+        }
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> offsets;
         d3d::CachedBindGroup* cached = nullptr;
@@ -2841,11 +3087,15 @@ void CommandListBridge::DrawIndexedInstanced(uint32_t index_count_per_instance,
 }
 
 ComputePipelineState* CommandListBridge::prepare_compute_dispatch() {
+    return prepare_compute_dispatch(compute_pso_, d3d::BindPoint::Compute);
+}
+
+ComputePipelineState* CommandListBridge::prepare_compute_dispatch(ComputePipelineState* state,
+                                                                  d3d::BindPoint bind_point) {
     // G7: pending clears must land and the render pass must end before compute work.
     tracker_.flush_pending_clears();
     tracker_.end_render_pass();
     drain_events();
-    ComputePipelineState* state = compute_pso_;
     if (state == nullptr || state->pipeline_id_ == 0) {
         diagnostics_ |= BridgeDiag::NoComputePipeline;
         return nullptr;
@@ -2870,10 +3120,74 @@ ComputePipelineState* CommandListBridge::prepare_compute_dispatch() {
         compute_pipeline_bound_ = state->pipeline_id_;
     }
     if (state->layout_ != nullptr && state->plans_.size() == state->layout_->groups.size() &&
-        !apply_bind_groups(d3d::BindPoint::Compute, state->layout_, state->plans_, &compute_groups_, false)) {
+        !apply_bind_groups(bind_point, state->layout_, state->plans_, &compute_groups_, false)) {
         return nullptr;
     }
     return state;
+}
+
+bool CommandListBridge::prepare_mesh_stage() {
+    ComputePipelineState* stage = mesh_pso_->stage_.get();
+    if (stage->layout_ == nullptr || stage->plans_.size() != stage->layout_->groups.size() ||
+        prepare_compute_dispatch(stage, d3d::BindPoint::Graphics) == nullptr) {
+        return false;
+    }
+    const uint32_t group = device_.mesh_output_group(*stage->layout_->groups[kMeshOutputGroup], encoder_);
+    const GpuSetBindGroup2Payload set{kMeshOutputGroup, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    compute_groups_[kMeshOutputGroup].bind_group_id = group;
+    return true;
+}
+
+bool CommandListBridge::prepare_mesh_draw() {
+    GraphicsPipelineState* draw = mesh_pso_->draw_.get();
+    if (draw->layout_ == nullptr || draw->plans_.size() != draw->layout_->groups.size()) {
+        return false;
+    }
+    // The emulated mesh output is a triangle list whatever topology the list has set.
+    const pso::D3DPrimitiveTopology topology = tracker_.variant_state().topology;
+    tracker_.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const bool ok = prepare_render_draw();
+    tracker_.IASetPrimitiveTopology(topology);
+    if (!ok) {
+        return false;
+    }
+    const uint32_t group = device_.mesh_output_group(*draw->layout_->groups[kMeshOutputGroup], encoder_);
+    const GpuSetBindGroup2Payload set{kMeshOutputGroup, group, 0u, 0u};
+    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+    if (render_groups_.size() > kMeshOutputGroup) {
+        render_groups_[kMeshOutputGroup].bind_group_id = group;
+    }
+    return true;
+}
+
+bool CommandListBridge::DispatchMesh(uint32_t x, uint32_t y, uint32_t z) {
+    if (!writable()) {
+        return false;
+    }
+    if (mesh_pso_ == nullptr || y != 1 || z != 1 || x > mesh_max_groups(mesh_pso_->output_)) {
+        ++stats_.mesh_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    }
+    if (x == 0) {
+        return true;  // no groups
+    }
+    if (!prepare_mesh_stage()) {
+        ++stats_.mesh_skipped;
+        diagnostics_ |= BridgeDiag::DrawSkipped;
+        return false;
+    }
+    encoder_.dispatch_compute(x, 1, 1);
+    ++stats_.dispatches;
+    if (!prepare_mesh_draw()) {
+        ++stats_.mesh_skipped;
+        return false;
+    }
+    encoder_.draw(x * mesh_pso_->output_.max_primitives * 3u, 1, 0, 0);
+    ++stats_.draws;
+    ++stats_.mesh_dispatches;
+    return true;
 }
 
 void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
@@ -2929,8 +3243,12 @@ bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t
     const StateBridgeDevice::IndirectClamp clamp = device_.indirect_clamp(encoder_);
     const uint32_t params_ring = device_.ensure_root_constant_ring(encoder_);
     uint32_t index_limit = 0xFFFFFFFFu;
+    uint32_t group_limit = kMaxIndirectWorkgroups;
     if (e.kind == IndirectKind::DrawIndexed && index_buffer_.size_in_bytes != 0) {
         index_limit = index_buffer_.size_in_bytes / (index_buffer_.format == GpuIndexFormat::Uint32 ? 4u : 2u);
+    } else if (e.kind == IndirectKind::DispatchMesh && mesh_pso_ != nullptr) {
+        index_limit = mesh_pso_->output_.max_primitives * 3u;  // draw vertices per group
+        group_limit = mesh_max_groups(mesh_pso_->output_);
     }
     const uint32_t params[8] = {static_cast<uint32_t>(e.args_offset / 4u),
                                 e.stride / 4u,
@@ -2939,7 +3257,7 @@ bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t
                                 e.count_buffer != 0 ? 1u : 0u,
                                 static_cast<uint32_t>(e.kind),
                                 index_limit,
-                                kMaxIndirectWorkgroups};
+                                group_limit};
     bool wrapped = false;
     const uint32_t params_offset = device_.allocate_root_constants(sizeof(params), &wrapped);
     if (wrapped) {
@@ -2967,7 +3285,10 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
     if (!writable()) {
         return false;
     }
-    const uint32_t record = e.kind == IndirectKind::DrawIndexed ? 20u : e.kind == IndirectKind::Dispatch ? 12u : 16u;
+    const uint32_t record = e.kind == IndirectKind::DrawIndexed                                        ? 20u
+                            : e.kind == IndirectKind::Dispatch || e.kind == IndirectKind::DispatchMesh ? 12u
+                                                                                                       : 16u;
+    const uint32_t out_record = indirect_output_bytes(e.kind);
     const auto skip = [&] {
         ++stats_.indirect_skipped;
         diagnostics_ |= BridgeDiag::DrawSkipped;
@@ -2982,7 +3303,12 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         return true;  // no commands
     }
     const uint32_t count = std::min(e.max_count, kMaxIndirectCommands);
-    if (e.kind == IndirectKind::Dispatch) {
+    if (e.kind == IndirectKind::DispatchMesh) {
+        if (mesh_pso_ == nullptr || mesh_pso_->stage_->pipeline_id_ == 0 || mesh_max_groups(mesh_pso_->output_) == 0) {
+            ++stats_.mesh_skipped;
+            return skip();
+        }
+    } else if (e.kind == IndirectKind::Dispatch) {
         if (compute_pso_ == nullptr || compute_pso_->pipeline_id_ == 0) {
             diagnostics_ |= BridgeDiag::NoComputePipeline;
             return skip();
@@ -2998,6 +3324,26 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
     uint32_t ring = 0;
     uint32_t base = 0;
     emit_indirect_clamp(e, count, &ring, &base);
+    if (e.kind == IndirectKind::DispatchMesh) {
+        // Per command: the mesh stage as compute (dispatch record), then the draw over its output.
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint64_t at = uint64_t{base} + uint64_t{i} * out_record;
+            if (!prepare_mesh_stage()) {
+                ++stats_.mesh_skipped;
+                return skip();
+            }
+            encoder_.indirect(GpuOpcode::DispatchIndirect, ring, at);
+            if (!prepare_mesh_draw()) {
+                ++stats_.mesh_skipped;
+                return skip();
+            }
+            encoder_.indirect(GpuOpcode::DrawIndirect, ring, at + 12u);
+            ++stats_.mesh_dispatches;
+        }
+        stats_.indirect_commands += count;
+        ++stats_.indirect_executions;
+        return true;
+    }
     GpuOpcode opcode = GpuOpcode::DispatchIndirect;
     if (e.kind == IndirectKind::Dispatch) {
         if (prepare_compute_dispatch() == nullptr) {
@@ -3018,7 +3364,7 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         opcode = e.kind == IndirectKind::DrawIndexed ? GpuOpcode::DrawIndexedIndirect : GpuOpcode::DrawIndirect;
     }
     for (uint32_t i = 0; i < count; ++i) {
-        encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * record);
+        encoder_.indirect(opcode, ring, uint64_t{base} + uint64_t{i} * out_record);
     }
     stats_.indirect_commands += count;
     ++stats_.indirect_executions;

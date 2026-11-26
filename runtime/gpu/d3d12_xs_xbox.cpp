@@ -352,7 +352,14 @@ bool parse_pipeline_stream(const uint8_t* bytes, size_t size, StreamPipeline* ou
             std::memcpy(&p.compute.CS, d, 16);
             has_cs = true;
             break;
-        case 23: case 24: has_mesh = true; break;
+        case 23:
+            p.amplification = true;
+            has_mesh = true;
+            break;
+        case 24:
+            std::memcpy(&p.mesh, d, 16);
+            has_mesh = true;
+            break;
         case 7: std::memcpy(&g.StreamOutput, d, 32); break;
         case 8: std::memcpy(&g.BlendState, d, sizeof(GuestBlendDesc)); break;
         case 9: g.SampleMask = load<uint32_t>(d); break;
@@ -902,8 +909,7 @@ HResult Device::CreatePipelineStateFromStream(uint64_t stream_desc, const Guid& 
     case xbox::StreamPipelineKind::Compute:
         return create_compute_pso(p.compute, riid, out);
     case xbox::StreamPipelineKind::Mesh:
-        count(xbox::Counter::PlaceholderPipelineStates);
-        return create_placeholder_pso("mesh/amplification shaders", riid, out);
+        return create_mesh_pso(p.graphics, p.mesh, p.amplification, riid, out);
     case xbox::StreamPipelineKind::Graphics:
         break;
     }
@@ -1430,11 +1436,26 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
     case CommandSignature::kIndirectArgDrawIndexed: e.kind = bridge::IndirectKind::DrawIndexed; break;
     case CommandSignature::kIndirectArgDispatch: e.kind = bridge::IndirectKind::Dispatch; break;
     case CommandSignature::kIndirectArgDispatchMesh:
-        skip(xbox::Counter::IndirectMeshSkipped);  // no mesh pipelines yet
-        return;
+        // G66: the bound graphics pipeline must be an emulated mesh pipeline.
+        if (graphics_pso_ == nullptr || graphics_pso_->mesh() == nullptr || !graphics_pso_->resolved()) {
+            skip(xbox::Counter::IndirectMeshSkipped);
+            return;
+        }
+        e.kind = bridge::IndirectKind::DispatchMesh;
+        break;
     case CommandSignature::kIndirectArgXbox105:
-        skip(xbox::Counter::IndirectType105Skipped);
-        return;
+        // Xbox-only kind (meaning not established; read as a single-pass dispatch with a 12-byte
+        // group-count record): a mesh dispatch when an emulated mesh pipeline is bound, otherwise a
+        // compute dispatch.
+        if (graphics_pso_ != nullptr && graphics_pso_->mesh() != nullptr && graphics_pso_->resolved()) {
+            e.kind = bridge::IndirectKind::DispatchMesh;
+        } else if (compute_pso_ != nullptr) {
+            e.kind = bridge::IndirectKind::Dispatch;
+        } else {
+            skip(xbox::Counter::IndirectType105Skipped);
+            return;
+        }
+        break;
     default:
         skip(xbox::Counter::IndirectSkipped);
         return;
@@ -1462,7 +1483,9 @@ void CommandList::ExecuteIndirect(com::CallContext& ctx) {
         pinned_.push_back(com::Ref<com::ComObject>::share(count));
     }
     if (!bridge_.ExecuteIndirect(e)) {
-        skip(xbox::Counter::IndirectSkipped);
+        skip(e.kind == bridge::IndirectKind::DispatchMesh ? xbox::Counter::IndirectMeshSkipped
+             : signature->work_type() == CommandSignature::kIndirectArgXbox105 ? xbox::Counter::IndirectType105Skipped
+                                                                              : xbox::Counter::IndirectSkipped);
         return;
     }
     device_->count(xbox::Counter::IndirectExecuted);

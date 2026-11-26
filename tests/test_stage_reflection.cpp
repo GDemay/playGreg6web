@@ -960,7 +960,26 @@ void test_root_descriptor_over_table() {
     CHECK(report.find("is not a root descriptor") != std::string::npos);
 }
 
+// G66: a mesh stage's compute translation carries its output record layout.
+void test_mesh_output() {
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x4d535343000000d7": {"stage": "compute",
+            "mesh_output": {"max_vertices": 64, "max_primitives": 126, "vertex_words": 12}}}})",
+        &index, &error));
+    const auto it = index.find(0x4d535343000000d7ull);
+    CHECK(it != index.end() && it->second.has_mesh_output && it->second.mesh_output.max_vertices == 64 &&
+          it->second.mesh_output.max_primitives == 126 && it->second.mesh_output.vertex_words == 12);
+    StageReflectionIndex bad;
+    CHECK(!parse_stage_reflection_json(
+        R"({"schema": "playgta6-stage-reflection", "version": 1, "stages": {"0x1": {"stage": "compute",
+            "mesh_output": {"max_vertices": 64, "max_primitives": 126, "vertex_words": 10}}}})",
+        &bad, &error));
+}
+
 int main() {
+    test_mesh_output();
     test_parse();
     test_user_data_rule();
     test_contained_sgpr_and_bitcast_vertex();

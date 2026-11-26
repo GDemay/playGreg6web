@@ -807,6 +807,12 @@ public:
     // A pipeline state that binds as "unresolved" (draws skipped) for pipelines the layer cannot
     // build (mesh shaders, ...): handed out instead of a null pointer the caller would dereference.
     HResult create_placeholder_pso(const std::string& reason, const Guid& riid, OutPtr out);
+    // G66: a mesh pipeline (stream with an MS subobject) emulated as the mesh stage run as compute
+    // plus a draw over its output (bridge::MeshPipelineState) when the shader pack has the stage's
+    // compute translation (bridge::mesh_compute_pack_key) with its mesh_output reflection; a
+    // placeholder otherwise (and for amplification shaders).
+    HResult create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
+                            bool amplification, const Guid& riid, OutPtr out);
     // A console-native graphics pipeline (Xbox slot 57, d3d12_xs_xbox.h): unresolved, with one
     // identity per stage (native_stage_identity).
     HResult create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out);
