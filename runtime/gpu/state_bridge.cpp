@@ -1338,6 +1338,12 @@ uint32_t StateBridgeDevice::indirect_clamp_group(const IndirectClamp& clamp, uin
     return id;
 }
 
+bool StateBridgeDevice::indirect_clamp_group_known(uint32_t args, uint32_t count) {
+    std::lock_guard lock(objects_mutex_);
+    const auto it = indirect_groups_.find({args, count});
+    return it != indirect_groups_.end() && it->second != 0;
+}
+
 uint32_t StateBridgeDevice::allocate_indirect_window() {
     std::lock_guard lock(objects_mutex_);
     // GPU-ordered: the clamp pass that overwrites a reused window runs after the work that read it.
@@ -1893,6 +1899,7 @@ void CommandListBridge::note_bind_group_used_locked(const d3d::CachedBindGroup& 
 }
 
 void CommandListBridge::Reset(GraphicsPipelineState* initial_state) {
+    clamp_batch_.close();
     // O36: bound the per-list bind group cache. Its keys change per draw (ring-allocated root CBVs,
     // descriptor table bases), so it grew for the whole run, each entry a live WebGPU bind group,
     // until the browser renderer process ran out of memory (~215 s, #726). The previous recording
@@ -1954,6 +1961,7 @@ bool CommandListBridge::writable() noexcept {
 }
 
 void CommandListBridge::Close() {
+    clamp_batch_.close();
     if (!writable()) {
         return;
     }
@@ -3444,8 +3452,44 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
 }
 
+namespace {
+// One clamp pass: params upload, pipeline, bind group, dispatch. The encoded size does not depend
+// on the values, so a run's slots can be reserved ahead of time and patched.
+void encode_clamp_pass(CommandEncoder& enc, uint32_t pipeline, uint32_t params_ring, uint32_t params_offset,
+                       const uint32_t (&params)[8], uint32_t group, uint32_t window, uint32_t count) {
+    enc.write_buffer(params_ring, params_offset, params, sizeof(params));
+    enc.set_compute_pipeline(pipeline);
+    const GpuSetBindGroup2Payload set{0u, group, 2u, 0u};
+    const uint32_t offsets[2] = {params_offset, window};
+    enc.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set), offsets, sizeof(offsets));
+    enc.dispatch_compute((count + 63u) / 64u, 1, 1);
+}
+}  // namespace
+
 bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t count, uint32_t* ring,
                                             uint32_t* out_offset) {
+    // Backlog 41: clamps of plain draws are batched. The first of a run is recorded inline and
+    // reserves patchable slots behind it; later executions whose argument buffers were not written
+    // in between put their clamp into one of those slots, ahead of the draws between, instead of
+    // breaking the render pass for a one-group compute pass each.
+    const bool batchable = e.kind == IndirectKind::Draw || e.kind == IndirectKind::DrawIndexed;
+    if (batchable) {
+        clamp_batch_.scan(encoder_.data(), encoder_.size());
+    } else {
+        clamp_batch_.close();
+    }
+    const bool candidate =
+        batchable && clamp_batch_.open() && device_.indirect_clamp_group_known(e.args_buffer, e.count_buffer);
+    const auto end_pass = [&] {
+        // The clamp pass is compute work: the render pass ends first.
+        tracker_.flush_pending_clears();
+        tracker_.end_render_pass();
+        drain_events();
+    };
+    if (!candidate) {
+        end_pass();
+    }
+    const size_t size_before = encoder_.size();
     const StateBridgeDevice::IndirectClamp clamp = device_.indirect_clamp(encoder_);
     const uint32_t params_ring = device_.ensure_root_constant_ring(encoder_);
     uint32_t index_limit = 0xFFFFFFFFu;
@@ -3469,21 +3513,42 @@ bool CommandListBridge::emit_indirect_clamp(const IndirectExecution& e, uint32_t
     if (wrapped) {
         diagnostics_ |= BridgeDiag::RootConstantRingWrapped;
     }
-    encoder_.write_buffer(params_ring, params_offset, params, sizeof(params));
     const uint32_t group = device_.indirect_clamp_group(clamp, params_ring, e.args_buffer, e.count_buffer, encoder_);
     const uint32_t window = device_.allocate_indirect_window();
     note_recorded_resource(e.args_buffer);
     note_recorded_resource(e.count_buffer);
-    encoder_.set_compute_pipeline(clamp.pipeline);
-    const GpuSetBindGroup2Payload set{0u, group, 2u, 0u};
-    const uint32_t offsets[2] = {params_offset, window};
-    encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set), offsets, sizeof(offsets));
-    encoder_.dispatch_compute((count + 63u) / 64u, 1, 1);
+    *ring = clamp.ring;
+    *out_offset = window;
+
+    // A wrapped parameter slot may still be read by work recorded after the run's start, so a
+    // wrapped execution is never moved ahead.
+    if (candidate && !wrapped && encoder_.size() == size_before) {
+        const size_t slot = clamp_batch_.try_join(e.args_buffer, e.count_buffer, window);
+        if (slot != IndirectClampBatch::kNoSlot) {
+            CommandEncoder tmp;
+            encode_clamp_pass(tmp, clamp.pipeline, params_ring, params_offset, params, group, window, count);
+            if (tmp.size() == kIndirectClampSlotBytes && encoder_.patch(slot, tmp.data(), tmp.size())) {
+                ++stats_.indirect_clamps_batched;
+                return true;
+            }
+            // Unreachable while the slot size is fixed; keep the stream correct regardless.
+            clamp_batch_.close();
+        }
+    }
+    if (candidate) {
+        end_pass();
+    }
+    encode_clamp_pass(encoder_, clamp.pipeline, params_ring, params_offset, params, group, window, count);
     // The stage's pipeline and bind groups are set again by the next dispatch.
     compute_pipeline_bound_ = 0;
     compute_groups_.clear();
-    *ring = clamp.ring;
-    *out_offset = window;
+    if (batchable) {
+        const size_t reserve_at = encoder_.size();
+        for (uint32_t i = 1; i < kIndirectClampBatchSize; ++i) {
+            encoder_.nop_padded(kIndirectClampSlotBytes - static_cast<uint32_t>(sizeof(GpuPacketHeader)));
+        }
+        clamp_batch_.begin(reserve_at, kIndirectClampSlotBytes, encoder_.size(), window);
+    }
     return true;
 }
 
@@ -3523,10 +3588,6 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
         return skip();
     }
     stats_.indirect_truncated += e.max_count - count;
-    // The clamp pass is compute work: the render pass ends first.
-    tracker_.flush_pending_clears();
-    tracker_.end_render_pass();
-    drain_events();
     uint32_t ring = 0;
     uint32_t base = 0;
     emit_indirect_clamp(e, count, &ring, &base);
