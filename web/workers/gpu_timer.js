@@ -10,6 +10,39 @@
   const DEFAULT_30FPS_BUDGET_MS = DEFAULT_PASS_BUDGET_MS;
   const TIMESTAMP_BYTE_SIZE = 8;
   const NS_PER_MS = 1e6;
+  const PASS_KIND_UNKNOWN = 0;
+  const PASS_KIND_RENDER = 1;
+  const PASS_KIND_COMPUTE = 2;
+  const PASS_KINDS = Object.freeze(['unknown', 'render', 'compute']);
+
+  function normalizePassKindCode(kind) {
+    if (kind === 'render' || kind === PASS_KIND_RENDER) {
+      return PASS_KIND_RENDER;
+    }
+    if (kind === 'compute' || kind === PASS_KIND_COMPUTE) {
+      return PASS_KIND_COMPUTE;
+    }
+    if (typeof kind === 'string') {
+      const lower = kind.trim().toLowerCase();
+      if (lower === 'render') {
+        return PASS_KIND_RENDER;
+      }
+      if (lower === 'compute') {
+        return PASS_KIND_COMPUTE;
+      }
+    }
+    return PASS_KIND_UNKNOWN;
+  }
+
+  function passKindCodeToString(code) {
+    if (code === PASS_KIND_RENDER) {
+      return 'render';
+    }
+    if (code === PASS_KIND_COMPUTE) {
+      return 'compute';
+    }
+    return 'unknown';
+  }
 
   // WebGPU GPUBufferUsage & GPUMapMode constants with headless/Node fallbacks.
   const BUFFER_USAGE = Object.freeze({
@@ -286,17 +319,25 @@
       this._querySlotRecycles = 0;
       this._querySlotWraps = 0;
 
+      // Pre-allocated default pass names so unlabeled passes never allocate template strings.
+      this._defaultPassNames = new Array(this._maxPassesPerFrame);
+      for (let i = 0; i < this._maxPassesPerFrame; i += 1) {
+        this._defaultPassNames[i] = `pass_${i}`;
+      }
+
       // Pre-allocated per-frame pass recording storage (zero hot-path allocations).
       this._framePassNames = new Array(this._maxPassesPerFrame);
       this._framePassBeginIdx = new Uint32Array(this._maxPassesPerFrame);
       this._framePassEndIdx = new Uint32Array(this._maxPassesPerFrame);
+      this._framePassKinds = new Uint8Array(this._maxPassesPerFrame);
       this._framePassCount = 0;
       this._queryCursor = 0;
 
-      // Pre-allocated active pass stack for beginPass(label) / endPass().
+      // Pre-allocated active pass stack for beginPass(label, kind) / endPass().
       this._activePassLabels = new Array(this._maxPassesPerFrame);
       this._activePassStarts = new Float64Array(this._maxPassesPerFrame);
       this._activePassModes = new Uint8Array(this._maxPassesPerFrame); // 0 = GPU, 1 = CPU
+      this._activePassKinds = new Uint8Array(this._maxPassesPerFrame);
       this._activePassDepth = 0;
 
       // Pre-allocated rolling frame total ring for share-of-frame % calculations.
@@ -306,18 +347,42 @@
       this._frameTotalWindowCount = 0;
       this._frameSeq = 0;
 
+      // Pre-allocated per-category (render / compute / other) rolling frame totals.
+      this._renderFrameTotals = new Float64Array(this._historySize);
+      this._computeFrameTotals = new Float64Array(this._historySize);
+      this._otherFrameTotals = new Float64Array(this._historySize);
+      this._renderPassCount = 0;
+      this._computePassCount = 0;
+      this._otherPassCount = 0;
+      this._lastFrameRenderMs = 0;
+      this._lastFrameComputeMs = 0;
+      this._lastFrameOtherMs = 0;
+      this._lastFramePassCount = 0;
+
       // Pre-allocated rolling pass duration ring for global p50PassMs / p95PassMs / maxPassMs stats.
       this._passDurations = new Float64Array(this._historySize);
       this._passDurationWriteIdx = 0;
       this._passDurationWindowCount = 0;
 
-      // Reusable typed scratch buffer for zero-alloc percentile sorting over bounded rings.
+      // Reusable typed scratch buffer & stats record for zero-alloc percentile sorting.
       this._sortScratch = new Float64Array(this._historySize);
+      this._windowStatsScratch = {
+        count: 0,
+        avgMs: 0,
+        minMs: 0,
+        p50Ms: 0,
+        p95Ms: 0,
+        p99Ms: 0,
+        maxMs: 0,
+      };
 
       // Open CPU fallback frame accumulators (active only when !supported and beginPass/endPass are used).
       this._cpuFrameOpen = false;
       this._cpuFrameSeq = 0;
       this._cpuFrameTotalMs = 0;
+      this._cpuFrameRenderMs = 0;
+      this._cpuFrameComputeMs = 0;
+      this._cpuFrameOtherMs = 0;
       this._cpuFramePassCount = 0;
 
       this._resolvedFrames = 0;
@@ -375,6 +440,7 @@
             passNames: new Array(this._maxPassesPerFrame),
             passBeginIdx: new Uint32Array(this._maxPassesPerFrame),
             passEndIdx: new Uint32Array(this._maxPassesPerFrame),
+            passKinds: new Uint8Array(this._maxPassesPerFrame),
             passCount: 0,
             queryCount: 0,
             copyBytes: 0,
@@ -403,14 +469,31 @@
         this._supported = true;
 
         if (device && device.lost && typeof device.lost.then === 'function') {
-          device.lost.then(
-            () => {
-              this._deviceLost = true;
-            },
-            () => {
-              this._deviceLost = true;
+          const handleDeviceLost = () => {
+            this._deviceLost = true;
+            if (this._destroyed) {
+              return;
             }
-          );
+            // Release any queued (not yet mapping) pending readback slots cleanly so stale
+            // device buffers are never mapped after device loss and zero slots leak.
+            while (this._pendingCount > 0) {
+              const slot = this._pendingRing[this._pendingHead];
+              this._pendingRing[this._pendingHead] = null;
+              this._pendingHead = (this._pendingHead + 1) % this._readbackSlotCount;
+              this._pendingCount -= 1;
+              if (slot && slot.state === 'pending') {
+                slot.state = 'idle';
+                slot.passCount = 0;
+                slot.passNames.fill(undefined);
+                slot.passKinds.fill(PASS_KIND_UNKNOWN);
+                slot.queryCount = 0;
+                slot.copyBytes = 0;
+                slot.generation = this._resetGeneration;
+                this._droppedQueryFrames += 1;
+              }
+            }
+          };
+          device.lost.then(handleDeviceLost, handleDeviceLost);
         }
       } catch (_) {
         if (querySet && typeof querySet.destroy === 'function') {
@@ -480,17 +563,20 @@
       return this._destroyed;
     }
 
-    _computeWindowStats(ring, count) {
+    get isDeviceLost() {
+      return this._deviceLost;
+    }
+
+    _fillWindowStats(ring, count, target) {
       if (count <= 0) {
-        return {
-          count: 0,
-          avgMs: 0,
-          minMs: 0,
-          p50Ms: 0,
-          p95Ms: 0,
-          p99Ms: 0,
-          maxMs: 0,
-        };
+        target.count = 0;
+        target.avgMs = 0;
+        target.minMs = 0;
+        target.p50Ms = 0;
+        target.p95Ms = 0;
+        target.p99Ms = 0;
+        target.maxMs = 0;
+        return target;
       }
 
       const scratch = this._sortScratch;
@@ -506,23 +592,43 @@
         sum += view[i];
       }
 
-      return {
-        count,
-        avgMs: sum / count,
-        minMs: view[0],
-        p50Ms: percentileFromSorted(view, count, 0.5),
-        p95Ms: percentileFromSorted(view, count, 0.95),
-        p99Ms: percentileFromSorted(view, count, 0.99),
-        maxMs: view[count - 1],
-      };
+      target.count = count;
+      target.avgMs = sum / count;
+      target.minMs = view[0];
+      target.p50Ms = percentileFromSorted(view, count, 0.5);
+      target.p95Ms = percentileFromSorted(view, count, 0.95);
+      target.p99Ms = percentileFromSorted(view, count, 0.99);
+      target.maxMs = view[count - 1];
+      return target;
     }
 
-    _recordFrameTotal(totalMs, frameSeq) {
+    _computeWindowStats(ring, count) {
+      return this._fillWindowStats(ring, count, {
+        count: 0,
+        avgMs: 0,
+        minMs: 0,
+        p50Ms: 0,
+        p95Ms: 0,
+        p99Ms: 0,
+        maxMs: 0,
+      });
+    }
+
+    _recordFrameTotal(totalMs, frameSeq, renderMs = 0, computeMs = 0, otherMs = 0) {
       const safeTotalMs =
         typeof totalMs === 'number' && Number.isFinite(totalMs) && totalMs >= 0 ? totalMs : 0;
-      this._frameTotals[this._frameTotalWriteIdx] = safeTotalMs;
-      this._frameTotalSeqs[this._frameTotalWriteIdx] = frameSeq;
-      this._frameTotalWriteIdx = (this._frameTotalWriteIdx + 1) % this._historySize;
+      const idx = this._frameTotalWriteIdx;
+      this._frameTotals[idx] = safeTotalMs;
+      this._frameTotalSeqs[idx] = frameSeq;
+      this._renderFrameTotals[idx] =
+        typeof renderMs === 'number' && Number.isFinite(renderMs) && renderMs >= 0 ? renderMs : 0;
+      this._computeFrameTotals[idx] =
+        typeof computeMs === 'number' && Number.isFinite(computeMs) && computeMs >= 0
+          ? computeMs
+          : 0;
+      this._otherFrameTotals[idx] =
+        typeof otherMs === 'number' && Number.isFinite(otherMs) && otherMs >= 0 ? otherMs : 0;
+      this._frameTotalWriteIdx = (idx + 1) % this._historySize;
       if (this._frameTotalWindowCount < this._historySize) {
         this._frameTotalWindowCount += 1;
       }
@@ -533,18 +639,33 @@
         this._cpuFrameOpen = false;
         this._cpuFrameSeq = 0;
         this._cpuFrameTotalMs = 0;
+        this._cpuFrameRenderMs = 0;
+        this._cpuFrameComputeMs = 0;
+        this._cpuFrameOtherMs = 0;
         return false;
       }
       const frameSeq = this._cpuFrameSeq;
       const totalMs = this._cpuFrameTotalMs;
+      const renderMs = this._cpuFrameRenderMs;
+      const computeMs = this._cpuFrameComputeMs;
+      const otherMs = this._cpuFrameOtherMs;
+      const passCount = this._cpuFramePassCount;
+
       this._frameSeq = frameSeq;
-      this._recordFrameTotal(totalMs, frameSeq);
+      this._recordFrameTotal(totalMs, frameSeq, renderMs, computeMs, otherMs);
       this._resolvedFrames += 1;
       this._lastFrameGpuMs = totalMs;
+      this._lastFrameRenderMs = renderMs;
+      this._lastFrameComputeMs = computeMs;
+      this._lastFrameOtherMs = otherMs;
+      this._lastFramePassCount = passCount;
 
       this._cpuFrameOpen = false;
       this._cpuFrameSeq = 0;
       this._cpuFrameTotalMs = 0;
+      this._cpuFrameRenderMs = 0;
+      this._cpuFrameComputeMs = 0;
+      this._cpuFrameOtherMs = 0;
       this._cpuFramePassCount = 0;
       return true;
     }
@@ -570,6 +691,9 @@
       this._cpuFrameOpen = true;
       this._cpuFrameSeq = 0;
       this._cpuFrameTotalMs = 0;
+      this._cpuFrameRenderMs = 0;
+      this._cpuFrameComputeMs = 0;
+      this._cpuFrameOtherMs = 0;
       this._cpuFramePassCount = 0;
     }
 
@@ -599,44 +723,53 @@
      *   timestamp and returns `undefined`.
      *
      * @param {string} [label]
+     * @param {'render' | 'compute' | 'unknown'} [kind] Optional pass category/kind.
      * @returns {{ querySet: GPUQuerySet, beginningOfPassWriteIndex: number, endOfPassWriteIndex: number } | undefined}
      */
-    beginPass(label) {
+    beginPass(label, kind) {
       if (this._destroyed) {
         return undefined;
       }
 
+      const kindCode = normalizePassKindCode(kind);
+
       if (this._supported) {
-        const descriptor = this.getPassTimestampWrites(label);
+        const descriptor = this.getPassTimestampWrites(label, kindCode);
         if (descriptor !== undefined && this._activePassDepth < this._maxPassesPerFrame) {
           const depth = this._activePassDepth;
           this._activePassLabels[depth] = this._framePassNames[this._framePassCount - 1];
           this._activePassStarts[depth] = 0;
           this._activePassModes[depth] = 0;
+          this._activePassKinds[depth] = kindCode;
           this._activePassDepth = depth + 1;
         }
         return descriptor;
       }
 
-      if (this._activePassDepth >= this._maxPassesPerFrame) {
+      if (
+        this._activePassDepth >= this._maxPassesPerFrame ||
+        this._cpuFramePassCount + this._activePassDepth >= this._maxPassesPerFrame
+      ) {
         this._droppedPasses += 1;
         return undefined;
       }
 
       const depth = this._activePassDepth;
+      const passSlotIdx = this._cpuFramePassCount + depth;
       const name =
         typeof label === 'string' && label.length > 0
           ? label
-          : `pass_${this._cpuFramePassCount}`;
+          : this._defaultPassNames[passSlotIdx];
       this._activePassLabels[depth] = name;
       this._activePassStarts[depth] = this._now();
       this._activePassModes[depth] = 1;
+      this._activePassKinds[depth] = kindCode;
       this._activePassDepth = depth + 1;
       return undefined;
     }
 
     /**
-     * Ends the most recently started pass from `beginPass(label)`.
+     * Ends the most recently started pass from `beginPass(label, kind)`.
      *
      * - In CPU fallback mode: records the elapsed `performance.now()` duration into the
      *   pass's rolling history and returns the duration in milliseconds.
@@ -654,7 +787,9 @@
       this._activePassDepth = depth;
       const mode = this._activePassModes[depth];
       const label = this._activePassLabels[depth];
+      const kindCode = this._activePassKinds[depth];
       this._activePassLabels[depth] = undefined;
+      this._activePassKinds[depth] = PASS_KIND_UNKNOWN;
 
       if (mode === 0) {
         return null;
@@ -670,8 +805,15 @@
         this._cpuFrameOpen = true;
       }
       this._cpuFrameTotalMs += durationMs;
+      if (kindCode === PASS_KIND_RENDER) {
+        this._cpuFrameRenderMs += durationMs;
+      } else if (kindCode === PASS_KIND_COMPUTE) {
+        this._cpuFrameComputeMs += durationMs;
+      } else {
+        this._cpuFrameOtherMs += durationMs;
+      }
       this._cpuFramePassCount += 1;
-      this._recordPassSample(label, durationMs, this._cpuFrameSeq);
+      this._recordPassSample(label, durationMs, this._cpuFrameSeq, kindCode);
       return durationMs;
     }
 
@@ -683,9 +825,10 @@
      * or the per-frame query budget is exhausted.
      *
      * @param {string} [passName]
+     * @param {'render' | 'compute' | 'unknown' | number} [kind] Optional pass category/kind.
      * @returns {{ querySet: GPUQuerySet, beginningOfPassWriteIndex: number, endOfPassWriteIndex: number } | undefined}
      */
-    getPassTimestampWrites(passName) {
+    getPassTimestampWrites(passName, kind) {
       if (!this._supported || this._destroyed || !this._querySet) {
         return undefined;
       }
@@ -701,11 +844,14 @@
       this._framePassCount = passIdx + 1;
 
       const name =
-        typeof passName === 'string' && passName.length > 0 ? passName : `pass_${passIdx}`;
+        typeof passName === 'string' && passName.length > 0
+          ? passName
+          : this._defaultPassNames[passIdx];
 
       this._framePassNames[passIdx] = name;
       this._framePassBeginIdx[passIdx] = beginningOfPassWriteIndex;
       this._framePassEndIdx[passIdx] = endOfPassWriteIndex;
+      this._framePassKinds[passIdx] = normalizePassKindCode(kind);
 
       const descriptorIdx = this._activeQueryRingSlice * this._maxPassesPerFrame + passIdx;
       return this._timestampWriteDescriptors[descriptorIdx];
@@ -794,6 +940,7 @@
         freeSlot.passNames[i] = this._framePassNames[i];
         freeSlot.passBeginIdx[i] = this._framePassBeginIdx[i];
         freeSlot.passEndIdx[i] = this._framePassEndIdx[i];
+        freeSlot.passKinds[i] = this._framePassKinds[i];
       }
       freeSlot.passCount = passCount;
       freeSlot.queryCount = queryCount;
@@ -820,7 +967,7 @@
       return true;
     }
 
-    _recordPassSample(name, durationMs, frameSeq) {
+    _recordPassSample(name, durationMs, frameSeq, kindCode = PASS_KIND_UNKNOWN) {
       const safeDurationMs =
         typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0
           ? durationMs
@@ -832,6 +979,14 @@
         this._passDurationWindowCount += 1;
       }
 
+      if (kindCode === PASS_KIND_RENDER) {
+        this._renderPassCount += 1;
+      } else if (kindCode === PASS_KIND_COMPUTE) {
+        this._computePassCount += 1;
+      } else {
+        this._otherPassCount += 1;
+      }
+
       let entry = this._passHistories.get(name);
       if (!entry) {
         entry = {
@@ -840,6 +995,7 @@
           windowCount: 0,
           count: 0,
           lastMs: 0,
+          kind: kindCode,
           budgetExceedCount: 0,
           passesOverBudget: 0,
           frameSamples: new Float64Array(this._historySize),
@@ -850,6 +1006,8 @@
           lastFrameSlotIdx: -1,
         };
         this._passHistories.set(name, entry);
+      } else if (kindCode !== PASS_KIND_UNKNOWN) {
+        entry.kind = kindCode;
       }
 
       entry.samples[entry.writeIdx] = safeDurationMs;
@@ -951,16 +1109,27 @@
         const timestamps = readTimestampsView(range, queryCount);
 
         let totalGpuMs = 0;
+        let renderMs = 0;
+        let computeMs = 0;
+        let otherMs = 0;
         const passes = new Array(passCount);
 
         for (let i = 0; i < passCount; i += 1) {
           const passName = slot.passNames[i];
           const beginIdx = slot.passBeginIdx[i];
           const endIdx = slot.passEndIdx[i];
+          const kindCode = slot.passKinds[i];
           const startNs = beginIdx < timestamps.length ? timestamps[beginIdx] : 0n;
           const endNs = endIdx < timestamps.length ? timestamps[endIdx] : 0n;
           const durationMs = computeDurationMs(startNs, endNs);
           totalGpuMs += durationMs;
+          if (kindCode === PASS_KIND_RENDER) {
+            renderMs += durationMs;
+          } else if (kindCode === PASS_KIND_COMPUTE) {
+            computeMs += durationMs;
+          } else {
+            otherMs += durationMs;
+          }
           passes[i] = { name: passName, durationMs };
         }
 
@@ -976,12 +1145,16 @@
         this._frameSeq = frameSeq;
 
         for (let i = 0; i < passCount; i += 1) {
-          this._recordPassSample(passes[i].name, passes[i].durationMs, frameSeq);
+          this._recordPassSample(passes[i].name, passes[i].durationMs, frameSeq, slot.passKinds[i]);
         }
 
-        this._recordFrameTotal(totalGpuMs, frameSeq);
+        this._recordFrameTotal(totalGpuMs, frameSeq, renderMs, computeMs, otherMs);
         this._resolvedFrames += 1;
         this._lastFrameGpuMs = totalGpuMs;
+        this._lastFrameRenderMs = renderMs;
+        this._lastFrameComputeMs = computeMs;
+        this._lastFrameOtherMs = otherMs;
+        this._lastFramePassCount = passCount;
 
         return { totalGpuMs, passes };
       } catch (_) {
@@ -1007,6 +1180,7 @@
           slot.state = 'idle';
           slot.passCount = 0;
           slot.passNames.fill(undefined);
+          slot.passKinds.fill(PASS_KIND_UNKNOWN);
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
@@ -1253,6 +1427,13 @@
       this._mapErrors = 0;
       this._passesOverBudget = 0;
       this._lastFrameGpuMs = 0;
+      this._lastFrameRenderMs = 0;
+      this._lastFrameComputeMs = 0;
+      this._lastFrameOtherMs = 0;
+      this._lastFramePassCount = 0;
+      this._renderPassCount = 0;
+      this._computePassCount = 0;
+      this._otherPassCount = 0;
       this._passHistories.clear();
       this._passDurations.fill(0);
       this._passDurationWriteIdx = 0;
@@ -1264,17 +1445,25 @@
       this._querySlotWraps = 0;
       this._framePassCount = 0;
       this._framePassNames.fill(undefined);
+      this._framePassKinds.fill(PASS_KIND_UNKNOWN);
       this._queryCursor = 0;
       this._activePassDepth = 0;
       this._activePassLabels.fill(undefined);
+      this._activePassKinds.fill(PASS_KIND_UNKNOWN);
       this._frameTotals.fill(0);
       this._frameTotalSeqs.fill(0);
+      this._renderFrameTotals.fill(0);
+      this._computeFrameTotals.fill(0);
+      this._otherFrameTotals.fill(0);
       this._frameTotalWriteIdx = 0;
       this._frameTotalWindowCount = 0;
       this._frameSeq = 0;
       this._cpuFrameOpen = false;
       this._cpuFrameSeq = 0;
       this._cpuFrameTotalMs = 0;
+      this._cpuFrameRenderMs = 0;
+      this._cpuFrameComputeMs = 0;
+      this._cpuFrameOtherMs = 0;
       this._cpuFramePassCount = 0;
 
       for (let i = 0; i < this._pendingCount; i += 1) {
@@ -1285,6 +1474,7 @@
           slot.state = 'idle';
           slot.passCount = 0;
           slot.passNames.fill(undefined);
+          slot.passKinds.fill(PASS_KIND_UNKNOWN);
           slot.queryCount = 0;
           slot.copyBytes = 0;
           slot.generation = this._resetGeneration;
@@ -1372,8 +1562,112 @@
     }
 
     /**
-     * Returns a snapshot of overall profiler counters and per-pass rolling stats.
+     * Return the recorded pass category/kind (`'render'`, `'compute'`, or `'unknown'`) for a
+     * pass label, or `null` if no samples have been recorded for it.
      *
+     * @param {string} label
+     * @returns {'render' | 'compute' | 'unknown' | null}
+     */
+    getPassKind(label) {
+      if (typeof label !== 'string' || label.length === 0) {
+        return null;
+      }
+      const entry = this._passHistories.get(label);
+      if (!entry || entry.windowCount === 0) {
+        return null;
+      }
+      return passKindCodeToString(entry.kind);
+    }
+
+    /**
+     * Return per-category (`render`, `compute`, `other`) rolling frame timing summaries.
+     * Pass an optional reusable `out` object for zero-allocation reads.
+     *
+     * @param {object} [out]
+     */
+    getCategoryStats(out) {
+      const target = out && typeof out === 'object' ? out : {};
+      const renderTarget =
+        target.render && typeof target.render === 'object' ? target.render : (target.render = {});
+      const computeTarget =
+        target.compute && typeof target.compute === 'object'
+          ? target.compute
+          : (target.compute = {});
+      const otherTarget =
+        target.other && typeof target.other === 'object' ? target.other : (target.other = {});
+
+      const windowCount = this._frameTotalWindowCount;
+      const scratch = this._windowStatsScratch;
+
+      this._fillWindowStats(this._renderFrameTotals, windowCount, scratch);
+      renderTarget.count = this._renderPassCount;
+      renderTarget.lastFrameMs = this._lastFrameRenderMs;
+      renderTarget.avgFrameMs = scratch.avgMs;
+      renderTarget.p50FrameMs = scratch.p50Ms;
+      renderTarget.p95FrameMs = scratch.p95Ms;
+      renderTarget.maxFrameMs = scratch.maxMs;
+
+      this._fillWindowStats(this._computeFrameTotals, windowCount, scratch);
+      computeTarget.count = this._computePassCount;
+      computeTarget.lastFrameMs = this._lastFrameComputeMs;
+      computeTarget.avgFrameMs = scratch.avgMs;
+      computeTarget.p50FrameMs = scratch.p50Ms;
+      computeTarget.p95FrameMs = scratch.p95Ms;
+      computeTarget.maxFrameMs = scratch.maxMs;
+
+      this._fillWindowStats(this._otherFrameTotals, windowCount, scratch);
+      otherTarget.count = this._otherPassCount;
+      otherTarget.lastFrameMs = this._lastFrameOtherMs;
+      otherTarget.avgFrameMs = scratch.avgMs;
+      otherTarget.p50FrameMs = scratch.p50Ms;
+      otherTarget.p95FrameMs = scratch.p95Ms;
+      otherTarget.maxFrameMs = scratch.maxMs;
+
+      return target;
+    }
+
+    /**
+     * Return a compact zero-allocation frame timing summary including render/compute/other
+     * pass category breakdown, rolling pass percentiles, and readback health counters.
+     * Pass an optional reusable `out` object to populate it in-place with zero heap allocations.
+     *
+     * @param {object} [out]
+     */
+    getFrameSummary(out) {
+      const target = out && typeof out === 'object' ? out : {};
+      const rolling = this._fillWindowStats(
+        this._passDurations,
+        this._passDurationWindowCount,
+        this._windowStatsScratch
+      );
+
+      target.supported = this._supported;
+      target.mode = this._supported ? 'gpu' : 'cpu';
+      target.deviceLost = this._deviceLost;
+      target.resolvedFrames = this._resolvedFrames;
+      target.skippedFrames = this._skippedFrames;
+      target.droppedPasses = this._droppedPasses;
+      target.droppedQueryFrames = this._droppedQueryFrames;
+      target.mapErrors = this._mapErrors;
+      target.pendingReadbacks = this._pendingCount;
+      target.lastFrameGpuMs = this._lastFrameGpuMs;
+      target.lastFrameRenderMs = this._lastFrameRenderMs;
+      target.lastFrameComputeMs = this._lastFrameComputeMs;
+      target.lastFrameOtherMs = this._lastFrameOtherMs;
+      target.lastFramePassCount = this._lastFramePassCount;
+      target.p50PassMs = rolling.p50Ms;
+      target.p95PassMs = rolling.p95Ms;
+      target.maxPassMs = rolling.maxMs;
+      target.passBudgetMs = this._passBudgetMs;
+      target.passesOverBudget = this._passesOverBudget;
+      return target;
+    }
+
+    /**
+     * Returns a snapshot of overall profiler counters and per-pass rolling stats.
+     * Pass an optional reusable `out` object for zero-allocation steady-state reads.
+     *
+     * @param {object} [out]
      * @returns {{
      *   supported: boolean,
      *   resolvedFrames: number,
@@ -1400,30 +1694,65 @@
      *   }>
      * }}
      */
-    getStats() {
-      const passStats = this.getPassStats();
-      const rollingPassPercentiles = this._computeWindowStats(
-        this._passDurations,
-        this._passDurationWindowCount
-      );
+    getStats(out) {
+      const scratch = this._windowStatsScratch;
+      const target = out && typeof out === 'object' ? out : {};
+      let passStats;
 
-      return {
-        supported: this._supported,
-        resolvedFrames: this._resolvedFrames,
-        skippedFrames: this._skippedFrames,
-        droppedPasses: this._droppedPasses,
-        droppedQueryFrames: this._droppedQueryFrames,
-        mapErrors: this._mapErrors,
-        lastFrameGpuMs: this._lastFrameGpuMs,
-        p50PassMs: rollingPassPercentiles.p50Ms,
-        p95PassMs: rollingPassPercentiles.p95Ms,
-        maxPassMs: rollingPassPercentiles.maxMs,
-        passBudgetMs: this._passBudgetMs,
-        passesOverBudget: this._passesOverBudget,
-        querySlotRecycles: this._querySlotRecycles,
-        querySlotWraps: this._querySlotWraps,
-        passStats,
-      };
+      if (out && typeof out === 'object') {
+        passStats =
+          target.passStats && typeof target.passStats === 'object'
+            ? target.passStats
+            : (target.passStats = {});
+        // Remove stale keys if reset() cleared pass histories.
+        for (const existingKey in passStats) {
+          if (
+            Object.prototype.hasOwnProperty.call(passStats, existingKey) &&
+            !this._passHistories.has(existingKey)
+          ) {
+            delete passStats[existingKey];
+          }
+        }
+        for (const [name, entry] of this._passHistories.entries()) {
+          if (entry.windowCount === 0) {
+            continue;
+          }
+          this._fillWindowStats(entry.samples, entry.windowCount, scratch);
+          let slot = passStats[name];
+          if (!slot || typeof slot !== 'object') {
+            slot = {};
+            passStats[name] = slot;
+          }
+          slot.count = entry.count;
+          slot.lastMs = entry.lastMs;
+          slot.avgMs = scratch.avgMs;
+          slot.p50Ms = scratch.p50Ms;
+          slot.p95Ms = scratch.p95Ms;
+          slot.maxMs = scratch.maxMs;
+          slot.passesOverBudget = entry.passesOverBudget;
+        }
+      } else {
+        passStats = this.getPassStats();
+      }
+
+      this._fillWindowStats(this._passDurations, this._passDurationWindowCount, scratch);
+
+      target.supported = this._supported;
+      target.resolvedFrames = this._resolvedFrames;
+      target.skippedFrames = this._skippedFrames;
+      target.droppedPasses = this._droppedPasses;
+      target.droppedQueryFrames = this._droppedQueryFrames;
+      target.mapErrors = this._mapErrors;
+      target.lastFrameGpuMs = this._lastFrameGpuMs;
+      target.p50PassMs = scratch.p50Ms;
+      target.p95PassMs = scratch.p95Ms;
+      target.maxPassMs = scratch.maxMs;
+      target.passBudgetMs = this._passBudgetMs;
+      target.passesOverBudget = this._passesOverBudget;
+      target.querySlotRecycles = this._querySlotRecycles;
+      target.querySlotWraps = this._querySlotWraps;
+      target.passStats = passStats;
+      return target;
     }
 
     /**
@@ -1488,6 +1817,7 @@
     DEFAULT_PASS_BUDGET_MS,
     DEFAULT_30FPS_BUDGET_MS,
     TIMESTAMP_BYTE_SIZE,
+    PASS_KINDS,
     BUFFER_USAGE,
     MAP_MODE,
     computePercentiles,
