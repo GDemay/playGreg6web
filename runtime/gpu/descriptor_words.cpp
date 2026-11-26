@@ -114,14 +114,18 @@ WordsStatus image_words(uint64_t address, const TextureShape& t, const d3d::View
         break;
     case d3d::ViewDimension::TextureCube:
         img.type = hw::ImageType::Cube;
+        img.base_array = 0;
         img.depth = 6;
         break;
     case d3d::ViewDimension::TextureCubeArray: {
         img.type = hw::ImageType::Cube;
         // SRV cube arrays: First2DArrayFace / NumCubes in the array fields.
-        const uint32_t cubes = v.array_size == 0xffffffffu || v.array_size == 0 ? (layers - first_slice) / 6 : v.array_size;
+        const uint32_t max_cubes = layers > first_slice ? (layers - first_slice) / 6u : 0u;
+        const uint32_t cubes = v.array_size == 0xffffffffu || v.array_size == 0
+                                   ? max_cubes
+                                   : (max_cubes > 0 ? std::min(v.array_size, max_cubes) : v.array_size);
         img.base_array = first_slice;
-        img.depth = first_slice + 6 * std::max(1u, cubes);
+        img.depth = first_slice + 6u * std::max(1u, cubes);
         break;
     }
     default:
@@ -262,17 +266,81 @@ uint64_t buffer_bytes(const hw::BufferResource& b) noexcept {
     return b.num_records;
 }
 
-uint32_t srgb_sibling(uint32_t dxgi) noexcept {
-    static constexpr uint32_t kPairs[][2] = {{28, 29}, {87, 91}, {88, 93}, {71, 72}, {74, 75}, {77, 78}, {98, 99}};
-    for (const auto& p : kPairs) {
-        if (p[0] == dxgi) {
-            return p[1];
+// Resolves the concrete DXGI view format WebGPU may use when viewing a texture of format `own`
+// through a T# whose hardware format is `hw_fmt` (and default reverse lookup is `decoded_dxgi`).
+// Returns 0 when the view should inherit the texture's own format.
+uint32_t resolve_view_format(uint32_t own, uint32_t hw_fmt, uint32_t decoded_dxgi) noexcept {
+    if (own == 0) {
+        return 0;
+    }
+    // Depth-stencil textures: preserve the plane-specific view format so WebGPU selects the
+    // depth-only or stencil-only aspect (aspect "all" is invalid for sampling depth-stencil).
+    if (own == 44 || own == 45) {  // R24G8_TYPELESS / D24_UNORM_S8_UINT
+        if (hw_fmt == 141 || hw_fmt == 143) {
+            return 46;  // R24_UNORM_X8_TYPELESS (depth plane)
         }
-        if (p[1] == dxgi) {
-            return p[0];
+        if (hw_fmt == 5 || hw_fmt == 142 || hw_fmt == 144) {
+            return 47;  // X24_TYPELESS_G8_UINT (stencil plane)
+        }
+        return 0;
+    }
+    if (own == 19 || own == 20) {  // R32G8X24_TYPELESS / D32_FLOAT_S8X24_UINT
+        if (hw_fmt == 22 || hw_fmt == 146) {
+            return 21;  // R32_FLOAT_X8X24_TYPELESS (depth plane)
+        }
+        if (hw_fmt == 5 || hw_fmt == 145) {
+            return 22;  // X32_TYPELESS_G8X24_UINT (stencil plane)
+        }
+        return 0;
+    }
+    if (own == 118) {  // D16_UNORM_S8_UINT (Xbox)
+        if (hw_fmt == 7) {
+            return 119;  // R16_UNORM_X8_TYPELESS (depth plane)
+        }
+        if (hw_fmt == 5) {
+            return 120;  // X16_TYPELESS_G8_UINT (stencil plane)
+        }
+        return 0;
+    }
+    // sRGB-capable families (typeless, linear UNORM, sRGB): match by hardware format so typeless
+    // textures and custom-swizzled sRGB views keep their linear vs sRGB view format.
+    struct SrgbFamily {
+        uint32_t typeless;
+        uint32_t linear;
+        uint32_t srgb;
+        uint32_t linear_hw;
+        uint32_t srgb_hw;
+    };
+    static constexpr SrgbFamily kSrgbFamilies[] = {
+        {27, 28, 29, 56, 130},    // R8G8B8A8
+        {90, 87, 91, 56, 130},    // B8G8R8A8
+        {92, 88, 93, 56, 130},    // B8G8R8X8
+        {70, 71, 72, 169, 170},   // BC1
+        {73, 74, 75, 171, 172},   // BC2
+        {76, 77, 78, 173, 174},   // BC3
+        {97, 98, 99, 181, 182},   // BC7
+    };
+    for (const SrgbFamily& fam : kSrgbFamilies) {
+        if (own == fam.typeless || own == fam.linear || own == fam.srgb) {
+            if (hw_fmt == fam.srgb_hw) {
+                return fam.srgb;
+            }
+            if (hw_fmt == fam.linear_hw) {
+                return fam.linear;
+            }
+            return 0;
         }
     }
-    return 0;
+    if (decoded_dxgi == own) {
+        return decoded_dxgi;
+    }
+    // Same hardware format as the texture's own concrete format (e.g. R8_UNORM viewed with a custom
+    // swizzle that collides with A8_UNORM's canonical swizzle, or D32_FLOAT viewed as R32_FLOAT).
+    hw::HardwareFormat own_hw;
+    if (hw::hardware_format(own, &own_hw) && own_hw.format == hw_fmt) {
+        return own;
+    }
+    return 0u;
 }
 
 uint32_t view_dimension(const hw::ImageResource& img) noexcept {
@@ -285,7 +353,8 @@ uint32_t view_dimension(const hw::ImageResource& img) noexcept {
     case hw::ImageType::Tex2DMsaaArray: return d3d::ViewDimension::Texture2DMsArray;
     case hw::ImageType::Tex3D: return d3d::ViewDimension::Texture3D;
     case hw::ImageType::Cube:
-        return img.depth > img.base_array + 6 ? d3d::ViewDimension::TextureCubeArray : d3d::ViewDimension::TextureCube;
+        return (img.base_array != 0 || img.depth > img.base_array + 6) ? d3d::ViewDimension::TextureCubeArray
+                                                                       : d3d::ViewDimension::TextureCube;
     default: return d3d::ViewDimension::Unknown;
     }
 }
@@ -339,16 +408,19 @@ DecodeStatus decode_view_words(const StateBridgeDevice& device, const uint32_t w
         return DecodeStatus::UnsupportedFormat;
     }
     out->resource_id = id;
-    // The view format: the decoded one when it is the texture's own format or its sRGB sibling (what
-    // a WebGPU view of the texture may use), else the texture's format (0).
     TextureInfo tex;
     const uint32_t own = device.texture_info(id, &tex) ? static_cast<uint32_t>(tex.format) : 0u;
-    out->format = dxgi == own || srgb_sibling(dxgi) == own ? dxgi : 0u;
+    out->format = resolve_view_format(own, img.format, dxgi);
     out->dimension = static_cast<uint8_t>(view_dimension(img));
     if (out->kind == d3d::DescriptorKind::Srv) {
         hw::HardwareFormat f;
         uint32_t mapping = d3d::kDefaultShader4ComponentMapping;
-        if (!exact && hw::hardware_format(dxgi, &f)) {
+        const uint32_t effective_dxgi = out->format != 0 ? out->format : (own != 0 ? own : dxgi);
+        if (hw::hardware_format(effective_dxgi, &f) && f.format == img.format) {
+            if (f.swizzle != img.dst_sel) {
+                hw::component_mapping_from(f.swizzle, img.dst_sel, &mapping);
+            }
+        } else if (!exact && hw::hardware_format(dxgi, &f)) {
             hw::component_mapping_from(f.swizzle, img.dst_sel, &mapping);
         }
         out->component_mapping = mapping;
@@ -371,12 +443,10 @@ DecodeStatus decode_sampler_words(const uint32_t w[4], d3d::SamplerDesc* out) {
     if (w[0] == 0 && w[1] == 0 && w[2] == 0 && w[3] == 0) {
         return DecodeStatus::Zero;
     }
-    const hw::SamplerState s = hw::decode_sampler(w);
-    // Unused dword 3 bits 12..29 must be zero; enumerations in range.
-    if ((w[3] & 0x3ffff000u) != 0 || s.max_aniso_ratio > 4 || s.filter_mode > 2 || s.z_filter > 2) {
+    if (!hw::plausible_sampler(w)) {
         return DecodeStatus::NotDescriptor;
     }
-    *out = hw::d3d12_from_sampler(s);
+    *out = hw::d3d12_from_sampler(hw::decode_sampler(w));
     return DecodeStatus::Ok;
 }
 
