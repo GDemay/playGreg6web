@@ -337,7 +337,7 @@ struct Wasapi::Impl {
     // avrt.lib link dependency), falling back to a raised thread priority.
     void boost_render_thread() {
         typedef HANDLE(WINAPI * AvSetFn)(LPCWSTR, LPDWORD);
-        avrt_ = LoadLibraryW(L"avrt" L".dll")  // split: not a guest-visible host module registration;
+        avrt_ = LoadLibraryW(L"avrt" L".dll");  // split literal: not a host-module registration
         if (avrt_) {
             auto set = reinterpret_cast<AvSetFn>(GetProcAddress(avrt_, "AvSetMmThreadCharacteristicsW"));
             if (set) {
