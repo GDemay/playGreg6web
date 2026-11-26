@@ -5,6 +5,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -419,6 +420,16 @@ struct WriteCursor {
 };
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets);
 bool take_written_pages(const void* host, uint64_t len, uint64_t* commit_seq, std::vector<uint64_t>* offsets);
+// Batch of takes (a submission's buffer flush): collects the OS write bits of the (merged) host
+// ranges once, up front, so each take inside them skips its own OS call; a write after the collect
+// is reported by the next batch. Takes outside the ranges, and other threads, are unaffected.
+class WriteBatch {
+public:
+    explicit WriteBatch(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges);
+    ~WriteBatch();
+    WriteBatch(const WriteBatch&) = delete;
+    WriteBatch& operator=(const WriteBatch&) = delete;
+};
 // Like the cursor form, but non-destructive for other readers: only for a range wholly covered by
 // tracked shared page views (never reads MEM_WRITE_WATCH). False when the range is not (or the
 // commit log was overrun): the caller must then treat everything as written. The cursor's commit

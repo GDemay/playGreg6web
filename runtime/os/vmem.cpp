@@ -106,6 +106,14 @@ static bool take_written_pages_impl(const void* host, uint64_t len, WriteCursor*
                                                     cursor->peek_watch, offsets);
 }
 
+WriteBatch::WriteBatch(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
+    backing::precollect_begin(ranges);
+}
+
+WriteBatch::~WriteBatch() {
+    backing::precollect_end();
+}
+
 bool take_written_pages(const void* host, uint64_t len, WriteCursor* cursor, std::vector<uint64_t>* offsets) {
     return take_written_pages_impl(host, len, cursor, offsets, false);
 }

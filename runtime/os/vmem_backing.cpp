@@ -590,6 +590,19 @@ void drop_stamps(uintptr_t lo, uintptr_t hi) {
 bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, uint64_t* epoch, bool peek,
                             std::vector<uint64_t>* offsets);
 
+// Ranges this thread collected in one go (precollect_begin): a stamped take inside one needs no
+// GetWriteWatch call of its own (a write after the collect is reported by the next one).
+thread_local std::vector<std::pair<uintptr_t, uintptr_t>> t_precollected;
+
+bool precollected_covers(uintptr_t lo, uintptr_t hi) {
+    for (const auto& r : t_precollected) {
+        if (lo >= r.first && hi <= r.second) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Peek mode: GetWriteWatch without RESET over the range (no page protection change, no TLB
 // flush) reports the bits nobody has collected yet; those count as written. When there are some and
 // the window around the range was last collected more than kPeekCollectMs ago, the window is
@@ -712,7 +725,8 @@ bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, ui
     const uint32_t mine = static_cast<uint32_t>(g_watch_epoch + 1);
     bool consumed_any = false;
     bool ok = true;
-    for (;;) {
+    const bool collected_already = epoch != nullptr && precollected_covers(start, end);
+    for (; !collected_already;) {
         ULONG_PTR count = cap;
         DWORD granularity = 0;
         // Each call resets what it reports (WRITE_WATCH_FLAG_RESET, no separate ResetWriteWatch);
@@ -785,6 +799,39 @@ bool written_pages_by_watch(uintptr_t start, uintptr_t end, uintptr_t origin, ui
 }
 
 }  // namespace
+
+void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>* ranges) {
+    t_precollected.clear();
+    if (ranges == nullptr || ranges->empty()) {
+        return;
+    }
+    constexpr uintptr_t kMergeGap = uintptr_t{8} << 20;
+    std::sort(ranges->begin(), ranges->end());
+    std::vector<std::pair<uintptr_t, uintptr_t>> hulls;
+    for (const auto& r : *ranges) {
+        const uintptr_t lo = r.first & ~(uintptr_t{kWrittenPageSize} - 1);
+        const uintptr_t hi = (r.second + kWrittenPageSize - 1) & ~(uintptr_t{kWrittenPageSize} - 1);
+        if (!hulls.empty() && lo <= hulls.back().second + kMergeGap) {
+            hulls.back().second = std::max(hulls.back().second, hi);
+        } else {
+            hulls.emplace_back(lo, hi);
+        }
+    }
+    std::vector<uint64_t> none;
+    for (const auto& h : hulls) {
+        if (h.second <= h.first || !watched_covers(h.first, h.second)) {
+            continue;
+        }
+        none.clear();
+        if (written_pages_by_watch(h.first, h.second, h.first, nullptr, false, &none)) {
+            t_precollected.push_back(h);
+        }
+    }
+}
+
+void precollect_end() {
+    t_precollected.clear();
+}
 
 namespace {
 
@@ -1007,6 +1054,9 @@ bool enforces_protection() {
     return false;
 }
 
+void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
+void precollect_end() {}
+
 bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // no write tracking in linear memory
 }
@@ -1099,6 +1149,9 @@ bool protect(uint8_t* p, uint64_t len, PageProtect protect) {
 bool enforces_protection() {
     return true;
 }
+
+void precollect_begin(std::vector<std::pair<uintptr_t, uintptr_t>>*) {}
+void precollect_end() {}
 
 bool take_written_pages(const uint8_t*, uint64_t, uint64_t*, uint64_t*, bool, std::vector<uint64_t>*) {
     return false;  // not tracked on POSIX hosts
