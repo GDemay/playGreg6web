@@ -74,7 +74,7 @@ Xbox Live (XSAPI, `XblContextCreateHandle` etc.) answers with the offline HRESUL
 | XPackage 34 | XPackageUninstallPackage | Refused with `E_ACCESSDENIED` | R-xpackage |
 | XPackage mount slots (mount, mount with UI, path, close) | not served: slot numbers not confirmed, the mount-handle creator is unknown | Trapping stub | |
 | XPersistentLocalStorage 3/5/6/7 | GetPathSize, GetSpaceInfo (used from real contents of the storage dir, 2048 MB quota), EnsureSpace(+Result) (E_ABORT when it does not fit) | Implemented; a too-small path buffer is `E_FAIL` | R-xpackage |
-| XGameRuntimeIsFeatureAvailable | per-area census | true only for async 3, game 6, game save 8, networking 11, package 12, persistent storage 13, speech 14, task queue 18, user 19. **Always false (hard stop, owner decides):** store 15, system 16 (device-id attestation), thread 17, game streaming 21, game UI, invites, launcher, app capture, accessibility, any unknown id | R-xpackage |
+| XGameRuntimeIsFeatureAvailable | static survey: the title asks only ids 10 (XNetworking) and 20 (Events, telemetry) through one wrapper with two call sites; ids use the public zero-based enum | true only for 10 (GetConnectivityHint, offline). **Always false (hard stop, owner decides):** 20 Events, store 14, system 15, thread 17, user 18 (sign-in state), game streaming, game UI, invites, launcher, app capture, accessibility, any unknown id | R-xpackage |
 
 XGame 4 XLaunchNewGame is no longer listed: relaunching the running title is a process restart, not a store,
 licence or entitlement call. When the target is the title itself the guest stops with `kRelaunchSelfExitCode`
