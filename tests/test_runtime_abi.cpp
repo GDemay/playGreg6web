@@ -6,6 +6,7 @@
 #include <cstring>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "abi/playgta6_abi.h"
@@ -1085,6 +1086,410 @@ void test_v2_opcodes_and_payload_layouts() {
     CHECK(std::memcmp(reinterpret_cast<const uint8_t*>(&payload) + 16, &result.key, 376) == 0);
 }
 
+void test_g76_command_encoder_buffer_lifecycle() {
+    using namespace playgta6;
+    using namespace playgta6::gpu;
+
+    static_assert(CommandEncoder::kMinCapacity == 4096);
+    static_assert(std::is_nothrow_move_constructible_v<CommandEncoder>);
+    static_assert(std::is_nothrow_move_assignable_v<CommandEncoder>);
+
+    CommandEncoder enc;
+    CHECK(enc.empty());
+    CHECK(enc.size() == 0);
+    CHECK(enc.capacity() == 0);
+    CHECK(enc.data() == nullptr);
+
+    // reserve(0) on empty buffer does not allocate.
+    enc.reserve(0);
+    CHECK(enc.capacity() == 0);
+    CHECK(enc.data() == nullptr);
+
+    // First small reserve allocates at least kMinCapacity (4096).
+    enc.reserve(64);
+    CHECK(enc.empty());
+    CHECK(enc.size() == 0);
+    CHECK(enc.capacity() >= CommandEncoder::kMinCapacity);
+    const uint8_t* initial_ptr = enc.data();
+    CHECK(initial_ptr != nullptr);
+
+    // Writing within reserved capacity does not reallocate.
+    enc.begin_frame();
+    enc.set_pipeline(7u);
+    enc.present();
+    CHECK(!enc.empty());
+    CHECK(enc.size() == 28);
+    CHECK(enc.data() == initial_ptr);
+
+    // clear() resets size to 0 while retaining capacity and buffer pointer.
+    const size_t cap_before_clear = enc.capacity();
+    enc.clear();
+    CHECK(enc.empty());
+    CHECK(enc.size() == 0);
+    CHECK(enc.capacity() == cap_before_clear);
+    CHECK(enc.data() == initial_ptr);
+
+    // Grow past 4096 to verify geometric growth and reset_and_shrink(4096).
+    enc.reserve(32768);
+    CHECK(enc.capacity() >= 32768);
+    enc.begin_frame();
+    CHECK(!enc.empty());
+
+    enc.reset_and_shrink(4096);
+    CHECK(enc.empty());
+    CHECK(enc.size() == 0);
+    CHECK(enc.capacity() == 4096);
+    CHECK(enc.data() != nullptr);
+
+    // Calling reset_and_shrink(4096) again when already <= 4096 retains buffer in place.
+    const uint8_t* ptr_4k = enc.data();
+    enc.nop();
+    enc.reset_and_shrink(4096);
+    CHECK(enc.empty());
+    CHECK(enc.capacity() == 4096);
+    CHECK(enc.data() == ptr_4k);
+
+    // reset_and_shrink(0) frees all memory.
+    enc.nop();
+    enc.reset_and_shrink(0);
+    CHECK(enc.empty());
+    CHECK(enc.size() == 0);
+    CHECK(enc.capacity() == 0);
+    CHECK(enc.data() == nullptr);
+
+    // Subsequent write allocates fresh buffer >= kMinCapacity.
+    enc.begin_frame();
+    CHECK(enc.size() == sizeof(GpuPacketHeader));
+    CHECK(enc.capacity() >= CommandEncoder::kMinCapacity);
+    CHECK(enc.data() != nullptr);
+}
+
+void test_g76_nop_padded_and_patch() {
+    using namespace playgta6;
+    using namespace playgta6::gpu;
+
+    CommandEncoder enc;
+    enc.nop_padded(0);
+    const size_t off16 = enc.size();
+    enc.nop_padded(16);
+    const size_t off4096 = enc.size();
+    enc.nop_padded(4096);
+
+    const size_t expected_size =
+        (sizeof(GpuPacketHeader) + 0u) +
+        (sizeof(GpuPacketHeader) + 16u) +
+        (sizeof(GpuPacketHeader) + 4096u);
+    CHECK(enc.size() == expected_size);
+
+    const auto packets = decode_stream(enc.data(), enc.size());
+    CHECK(packets.size() == 3);
+
+    CHECK(packets[0].header.opcode == static_cast<uint16_t>(GpuOpcode::Nop));
+    CHECK(packets[0].header.flags == 0);
+    CHECK(packets[0].header.payload_bytes == 0);
+
+    CHECK(packets[1].header.opcode == static_cast<uint16_t>(GpuOpcode::Nop));
+    CHECK(packets[1].header.flags == 0);
+    CHECK(packets[1].header.payload_bytes == 16);
+    for (size_t i = 0; i < 16; ++i) {
+        CHECK(packets[1].payload[i] == 0);
+    }
+
+    CHECK(packets[2].header.opcode == static_cast<uint16_t>(GpuOpcode::Nop));
+    CHECK(packets[2].header.flags == 0);
+    CHECK(packets[2].header.payload_bytes == 4096);
+    for (size_t i = 0; i < 4096; ++i) {
+        CHECK(packets[2].payload[i] == 0);
+    }
+
+    // Patch a ClearColor packet (header 8 + payload 16 = 24 bytes) directly into the nop_padded(16) slot.
+    CommandEncoder replacement;
+    replacement.clear_color(0.25f, 0.5f, 0.75f, 1.0f);
+    CHECK(replacement.size() == sizeof(GpuPacketHeader) + 16u);
+    CHECK(enc.patch(off16, replacement.data(), replacement.size()));
+
+    // Out-of-range and null-source patch checks.
+    CHECK(!enc.patch(enc.size() + 1, replacement.data(), 1));
+    CHECK(!enc.patch(off4096, replacement.data(), enc.size()));
+    CHECK(!enc.patch(off16, nullptr, 4));
+    CHECK(enc.patch(off16, nullptr, 0));
+
+    const auto patched = decode_stream(enc.data(), enc.size());
+    CHECK(patched.size() == 3);
+    CHECK(patched[0].header.opcode == static_cast<uint16_t>(GpuOpcode::Nop));
+    CHECK(patched[1].header.opcode == static_cast<uint16_t>(GpuOpcode::ClearColor));
+    CHECK(patched[1].header.payload_bytes == sizeof(GpuClearColorPayload));
+    const auto cc = read_pod<GpuClearColorPayload>(patched[1].payload);
+    CHECK(cc.r == 0.25f && cc.g == 0.5f && cc.b == 0.75f && cc.a == 1.0f);
+    CHECK(patched[2].header.opcode == static_cast<uint16_t>(GpuOpcode::Nop));
+    CHECK(patched[2].header.payload_bytes == 4096);
+}
+
+void test_g76_append_raw_and_packet_safety() {
+    using namespace playgta6;
+    using namespace playgta6::gpu;
+
+    CommandEncoder part_a;
+    part_a.begin_frame();
+    part_a.set_pipeline(10u);
+
+    CommandEncoder part_b;
+    part_b.set_bind_group(0u, 20u);
+    part_b.set_vertex_buffer(0u, 30u, 64u);
+    part_b.set_index_buffer(31u, GpuIndexFormat::Uint32, 128u);
+
+    CommandEncoder part_c;
+    part_c.draw_indexed(36u, 2u, 0u, 0, 0u);
+    part_c.indirect(GpuOpcode::DrawIndirect, 32u, 256u);
+    part_c.present();
+
+    CommandEncoder combined;
+    combined.append_raw(nullptr, 100);
+    combined.append_raw(part_a.data(), 0);
+    CHECK(combined.empty());
+
+    combined.append_raw(part_a.data(), part_a.size());
+    combined.append_raw(part_b.data(), part_b.size());
+    combined.append_raw(part_c.data(), part_c.size());
+    CHECK(combined.size() == part_a.size() + part_b.size() + part_c.size());
+
+    const auto packets = decode_stream(combined.data(), combined.size());
+    CHECK(packets.size() == 8);
+    CHECK(packets[0].header.opcode == static_cast<uint16_t>(GpuOpcode::BeginFrame));
+    CHECK(packets[1].header.opcode == static_cast<uint16_t>(GpuOpcode::SetPipeline));
+    CHECK(read_pod<GpuSetPipelinePayload>(packets[1].payload).pipeline_id == 10u);
+    CHECK(packets[2].header.opcode == static_cast<uint16_t>(GpuOpcode::SetBindGroup));
+    CHECK(read_pod<GpuSetBindGroupPayload>(packets[2].payload).bind_group_id == 20u);
+    CHECK(packets[3].header.opcode == static_cast<uint16_t>(GpuOpcode::SetVertexBuffer));
+    CHECK(read_pod<GpuSetVertexBufferPayload>(packets[3].payload).offset == 64u);
+    CHECK(packets[4].header.opcode == static_cast<uint16_t>(GpuOpcode::SetIndexBuffer));
+    CHECK(read_pod<GpuSetIndexBufferPayload>(packets[4].payload).offset == 128u);
+    CHECK(packets[5].header.opcode == static_cast<uint16_t>(GpuOpcode::DrawIndexed));
+    CHECK(read_pod<GpuDrawIndexedPayload>(packets[5].payload).index_count == 36u);
+    CHECK(packets[6].header.opcode == static_cast<uint16_t>(GpuOpcode::DrawIndirect));
+    CHECK(read_pod<GpuIndirectPayload>(packets[6].payload).buffer_id == 32u);
+    CHECK(read_pod<GpuIndirectPayload>(packets[6].payload).offset == 256u);
+    CHECK(packets[7].header.opcode == static_cast<uint16_t>(GpuOpcode::Present));
+
+    // Self-aliasing append_raw across reallocation.
+    CommandEncoder self_dup;
+    self_dup.set_pipeline(99u);
+    for (int i = 0; i < 10; ++i) {
+        self_dup.append_raw(self_dup.data(), self_dup.size());
+    }
+    const auto dup_packets = decode_stream(self_dup.data(), self_dup.size());
+    CHECK(dup_packets.size() == 1024);
+    for (const auto& pkt : dup_packets) {
+        CHECK(pkt.header.opcode == static_cast<uint16_t>(GpuOpcode::SetPipeline));
+        CHECK(read_pod<GpuSetPipelinePayload>(pkt.payload).pipeline_id == 99u);
+    }
+
+    // write_packet_with_tail null-head, null-tail, and uint32_t overflow guards.
+    CommandEncoder safe_enc;
+    const uint32_t word = 0x12345678u;
+    safe_enc.emit_packet(GpuOpcode::Nop, nullptr, 16u, &word, sizeof(word));
+    safe_enc.emit_packet(GpuOpcode::Nop, &word, sizeof(word), nullptr, 16u);
+    const size_t size_before_overflow = safe_enc.size();
+    safe_enc.emit_packet(GpuOpcode::Nop, &word, 0xFFFFFFFFu, &word, 1u);
+    CHECK(safe_enc.size() == size_before_overflow);
+
+    const auto safe_pkts = decode_stream(safe_enc.data(), safe_enc.size());
+    CHECK(safe_pkts.size() == 2);
+    CHECK(safe_pkts[0].header.payload_bytes == sizeof(word));
+    CHECK(read_pod<uint32_t>(safe_pkts[0].payload) == word);
+    CHECK(safe_pkts[1].header.payload_bytes == sizeof(word));
+    CHECK(read_pod<uint32_t>(safe_pkts[1].payload) == word);
+}
+
+void test_g76_rule_of_five_and_vector_storage() {
+    using namespace playgta6;
+    using namespace playgta6::gpu;
+
+    CommandEncoder src;
+    src.begin_frame();
+    src.set_pipeline(42u);
+    src.draw(6u, 1u, 0u, 0u);
+    src.present();
+    const size_t expected_size = src.size();
+
+    // Copy construction (non-empty and empty).
+    CommandEncoder copy_ctor(src);
+    CHECK(copy_ctor.size() == expected_size);
+    CHECK(copy_ctor.data() != src.data());
+    CHECK(std::memcmp(copy_ctor.data(), src.data(), expected_size) == 0);
+
+    CommandEncoder empty_src;
+    CommandEncoder empty_copy(empty_src);
+    CHECK(empty_copy.empty());
+    CHECK(empty_copy.capacity() == 0);
+
+    // Copy assignment (into empty, into larger buffer, self-assignment, and from empty).
+    CommandEncoder copy_assign;
+    copy_assign = src;
+    CHECK(copy_assign.size() == expected_size);
+    CHECK(copy_assign.data() != src.data());
+    CHECK(std::memcmp(copy_assign.data(), src.data(), expected_size) == 0);
+
+    CommandEncoder& self_ref = copy_assign;
+    copy_assign = self_ref;
+    CHECK(copy_assign.size() == expected_size);
+    CHECK(std::memcmp(copy_assign.data(), src.data(), expected_size) == 0);
+
+    copy_assign.reserve(8192);
+    const uint8_t* large_ptr = copy_assign.data();
+    copy_assign = src;
+    CHECK(copy_assign.size() == expected_size);
+    CHECK(copy_assign.data() == large_ptr);  // reused larger capacity
+
+    copy_assign = empty_src;
+    CHECK(copy_assign.empty());
+    CHECK(copy_assign.data() == large_ptr);
+
+    // Move construction.
+    const uint8_t* moved_ptr = copy_ctor.data();
+    const size_t moved_cap = copy_ctor.capacity();
+    CommandEncoder move_ctor(std::move(copy_ctor));
+    CHECK(move_ctor.size() == expected_size);
+    CHECK(move_ctor.capacity() == moved_cap);
+    CHECK(move_ctor.data() == moved_ptr);
+    CHECK(copy_ctor.empty());
+    CHECK(copy_ctor.capacity() == 0);
+    CHECK(copy_ctor.data() == nullptr);
+
+    // Move assignment (including self-move).
+    CommandEncoder move_assign;
+    move_assign.nop();
+    move_assign = std::move(move_ctor);
+    CHECK(move_assign.size() == expected_size);
+    CHECK(move_assign.data() == moved_ptr);
+    CHECK(move_ctor.empty());
+    CHECK(move_ctor.data() == nullptr);
+
+    CommandEncoder& move_self_ref = move_assign;
+    move_assign = std::move(move_self_ref);
+    CHECK(move_assign.size() == expected_size);
+    CHECK(std::memcmp(move_assign.data(), src.data(), expected_size) == 0);
+
+    // Appending to a small copied encoder upgrades cleanly to >= kMinCapacity.
+    CommandEncoder small_copy(src);
+    small_copy.draw(3u, 1u, 0u, 0u);
+    CHECK(small_copy.capacity() >= CommandEncoder::kMinCapacity);
+    const auto appended_pkts = decode_stream(small_copy.data(), small_copy.size());
+    CHECK(appended_pkts.size() == 5);
+
+    // std::vector<CommandEncoder> growth & reallocation across many elements.
+    std::vector<CommandEncoder> batch;
+    constexpr uint32_t kBatchCount = 64;
+    for (uint32_t i = 0; i < kBatchCount; ++i) {
+        CommandEncoder item;
+        item.set_pipeline(100u + i);
+        item.draw_indexed(3u * (i + 1u), 1u, 0u, 0, i);
+        batch.push_back(std::move(item));
+    }
+    CHECK(batch.size() == kBatchCount);
+    for (uint32_t i = 0; i < kBatchCount; ++i) {
+        const auto pkts = decode_stream(batch[i].data(), batch[i].size());
+        CHECK(pkts.size() == 2);
+        CHECK(read_pod<GpuSetPipelinePayload>(pkts[0].payload).pipeline_id == 100u + i);
+        const auto di = read_pod<GpuDrawIndexedPayload>(pkts[1].payload);
+        CHECK(di.index_count == 3u * (i + 1u));
+        CHECK(di.first_instance == i);
+    }
+}
+
+void test_g76_high_draw_count_frame_stress() {
+    using namespace playgta6;
+    using namespace playgta6::gpu;
+
+    constexpr uint32_t kDrawCount = 2500;
+    constexpr uint32_t kFrameCount = 4;
+    const std::array<float, 16> push_constants = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.25f, -0.5f, 0.75f, 1.0f,
+    };
+
+    CommandEncoder enc;
+    std::vector<uint8_t> frame0_bytes;
+    const uint8_t* steady_ptr = nullptr;
+    size_t steady_cap = 0;
+
+    for (uint32_t frame = 0; frame < kFrameCount; ++frame) {
+        enc.clear();
+        CHECK(enc.empty());
+
+        enc.begin_frame();
+        enc.clear_color(0.02f, 0.04f, 0.08f, 1.0f);
+        for (uint32_t d = 0; d < kDrawCount; ++d) {
+            enc.write_buffer(
+                1000u,
+                (d & 0xFFu) * static_cast<uint32_t>(sizeof(push_constants)),
+                push_constants.data(),
+                static_cast<uint32_t>(sizeof(push_constants)));
+            enc.set_pipeline(10u + (d % 32u));
+            enc.set_bind_group(0u, 200u + (d % 64u));
+            enc.set_vertex_buffer(0u, 300u + (d % 16u), static_cast<uint64_t>(d) * 32u);
+            enc.set_index_buffer(400u + (d % 8u), GpuIndexFormat::Uint32, static_cast<uint64_t>(d) * 4u);
+            enc.draw_indexed(36u + (d % 120u), 1u, d * 3u, static_cast<int32_t>(d) - 1250, d & 3u);
+        }
+        enc.present();
+
+        // 1 BeginFrame + 1 ClearColor + 6 * kDrawCount + 1 Present.
+        const auto packets = decode_stream(enc.data(), enc.size());
+        CHECK(packets.size() == 3u + 6u * kDrawCount);
+        CHECK(packets.front().header.opcode == static_cast<uint16_t>(GpuOpcode::BeginFrame));
+        CHECK(packets[1].header.opcode == static_cast<uint16_t>(GpuOpcode::ClearColor));
+        CHECK(packets.back().header.opcode == static_cast<uint16_t>(GpuOpcode::Present));
+
+        // Verify first, middle, and last draw call payloads byte-for-byte.
+        for (uint32_t sample : {0u, kDrawCount / 2u, kDrawCount - 1u}) {
+            const size_t base = 2u + static_cast<size_t>(sample) * 6u;
+            CHECK(packets[base + 0].header.opcode == static_cast<uint16_t>(GpuOpcode::WriteBuffer));
+            const auto wb = read_pod<GpuWriteBufferPayload>(packets[base + 0].payload);
+            CHECK(wb.id == 1000u && wb.data_len == sizeof(push_constants));
+            CHECK(std::memcmp(
+                      packets[base + 0].payload + sizeof(GpuWriteBufferPayload),
+                      push_constants.data(),
+                      sizeof(push_constants)) == 0);
+
+            CHECK(packets[base + 1].header.opcode == static_cast<uint16_t>(GpuOpcode::SetPipeline));
+            CHECK(read_pod<GpuSetPipelinePayload>(packets[base + 1].payload).pipeline_id == 10u + (sample % 32u));
+
+            CHECK(packets[base + 2].header.opcode == static_cast<uint16_t>(GpuOpcode::SetBindGroup));
+            CHECK(read_pod<GpuSetBindGroupPayload>(packets[base + 2].payload).bind_group_id == 200u + (sample % 64u));
+
+            CHECK(packets[base + 3].header.opcode == static_cast<uint16_t>(GpuOpcode::SetVertexBuffer));
+            const auto vb = read_pod<GpuSetVertexBufferPayload>(packets[base + 3].payload);
+            CHECK(vb.buffer_id == 300u + (sample % 16u) && vb.offset == static_cast<uint64_t>(sample) * 32u);
+
+            CHECK(packets[base + 4].header.opcode == static_cast<uint16_t>(GpuOpcode::SetIndexBuffer));
+            const auto ib = read_pod<GpuSetIndexBufferPayload>(packets[base + 4].payload);
+            CHECK(ib.buffer_id == 400u + (sample % 8u) && ib.offset == static_cast<uint64_t>(sample) * 4u);
+
+            CHECK(packets[base + 5].header.opcode == static_cast<uint16_t>(GpuOpcode::DrawIndexed));
+            const auto di = read_pod<GpuDrawIndexedPayload>(packets[base + 5].payload);
+            CHECK(di.index_count == 36u + (sample % 120u));
+            CHECK(di.first_index == sample * 3u);
+            CHECK(di.base_vertex == static_cast<int32_t>(sample) - 1250);
+            CHECK(di.first_instance == (sample & 3u));
+        }
+
+        if (frame == 0) {
+            frame0_bytes.assign(enc.data(), enc.data() + enc.size());
+            steady_ptr = enc.data();
+            steady_cap = enc.capacity();
+            CHECK(steady_cap >= enc.size());
+        } else {
+            // Frame 2+ must perform zero reallocations and emit byte-identical streams.
+            CHECK(enc.data() == steady_ptr);
+            CHECK(enc.capacity() == steady_cap);
+            CHECK(enc.size() == frame0_bytes.size());
+            CHECK(std::memcmp(enc.data(), frame0_bytes.data(), frame0_bytes.size()) == 0);
+        }
+    }
+}
+
 }  // namespace
 
 void test_guest_state_layout() {
@@ -1158,5 +1563,10 @@ int main() {
     test_g5_abi_struct_sizes_and_encoder_roundtrip();
     test_d3d12_xs_compute_and_textured_indexed_draw();
     test_v2_opcodes_and_payload_layouts();
+    test_g76_command_encoder_buffer_lifecycle();
+    test_g76_nop_padded_and_patch();
+    test_g76_append_raw_and_packet_safety();
+    test_g76_rule_of_five_and_vector_storage();
+    test_g76_high_draw_count_frame_stress();
     return 0;
 }

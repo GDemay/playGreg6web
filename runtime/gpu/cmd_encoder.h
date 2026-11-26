@@ -2,8 +2,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <string_view>
-#include <vector>
+#include <type_traits>
 
 #include "abi/playgta6_abi.h"
 
@@ -11,7 +12,20 @@ namespace playgta6::gpu {
 
 class CommandEncoder {
 public:
-    void clear();
+    static constexpr size_t kMinCapacity = 4096;
+
+    CommandEncoder() noexcept = default;
+    ~CommandEncoder() noexcept;
+    CommandEncoder(const CommandEncoder& other);
+    CommandEncoder& operator=(const CommandEncoder& other);
+    CommandEncoder(CommandEncoder&& other) noexcept;
+    CommandEncoder& operator=(CommandEncoder&& other) noexcept;
+
+    void clear() noexcept;
+    void reserve(size_t byte_capacity);
+    void reset_and_shrink(size_t max_retain_bytes = 0);
+    void append_raw(const void* bytes, size_t byte_size);
+
     void nop();
     // A Nop packet carrying `payload_bytes` of zero padding (a patchable placeholder).
     void nop_padded(uint32_t payload_bytes);
@@ -97,20 +111,60 @@ public:
         const void* tail = nullptr,
         uint32_t tail_bytes = 0);
 
-    const uint8_t* data() const { return buf_.data(); }
+    const uint8_t* data() const noexcept { return data_; }
     // Overwrites `bytes` already-encoded bytes at `offset` (false when out of range).
     bool patch(size_t offset, const void* bytes, size_t size);
-    size_t size() const { return buf_.size(); }
+    size_t size() const noexcept { return size_; }
+    size_t capacity() const noexcept { return capacity_; }
+    bool empty() const noexcept { return size_ == 0; }
 
 private:
-    void write_packet(GpuOpcode opcode, const void* payload, uint32_t payload_bytes);
+    uint8_t* reserve_append(size_t extra_bytes) {
+        if (extra_bytes > capacity_ - size_) [[unlikely]] {
+            grow_append(extra_bytes);
+        }
+        uint8_t* dst = data_ + size_;
+        size_ += extra_bytes;
+        return dst;
+    }
+
+    void grow_append(size_t extra_bytes);
+    void grow_for(size_t required_capacity);
+
+    void write_empty_packet(GpuOpcode opcode) {
+        const GpuPacketHeader header{
+            static_cast<uint16_t>(opcode),
+            0,
+            0,
+        };
+        uint8_t* dst = reserve_append(sizeof(GpuPacketHeader));
+        std::memcpy(dst, &header, sizeof(GpuPacketHeader));
+    }
+
+    template <typename T>
+    void write_pod_packet(GpuOpcode opcode, const T& payload) {
+        static_assert(std::is_trivially_copyable_v<T>);
+        static_assert(sizeof(T) <= 0xFFFFFFFFu);
+        const GpuPacketHeader header{
+            static_cast<uint16_t>(opcode),
+            0,
+            static_cast<uint32_t>(sizeof(T)),
+        };
+        uint8_t* dst = reserve_append(sizeof(GpuPacketHeader) + sizeof(T));
+        std::memcpy(dst, &header, sizeof(GpuPacketHeader));
+        std::memcpy(dst + sizeof(GpuPacketHeader), &payload, sizeof(T));
+    }
+
     void write_packet_with_tail(
         GpuOpcode opcode,
         const void* head,
         uint32_t head_bytes,
         const void* tail,
         uint32_t tail_bytes);
-    std::vector<uint8_t> buf_;
+
+    uint8_t* data_ = nullptr;
+    size_t size_ = 0;
+    size_t capacity_ = 0;
 };
 
 }  // namespace playgta6::gpu
