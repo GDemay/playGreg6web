@@ -887,18 +887,28 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         return false;
     }
     bridge::TextureInfo created{};
-    const bool sampled_only = bridge_->texture_info(resource_id, &created) && created.sampled_only;
-    const pso::TextureFormatMapping mapping = pso::map_texture_format(
-        static_cast<pso::DxgiFormat>(tt.dxgi_format),
-        sampled_only ? pso::FormatUsage::SampledOnly : pso::FormatUsage::Sampled, bridge_->options().features);
+    const bool have_info = bridge_->texture_info(resource_id, &created);
+    const pso::FormatUsage map_usage =
+        have_info && created.depth_stencil  ? pso::FormatUsage::DepthStencil
+        : have_info && created.render_target ? pso::FormatUsage::RenderTarget
+        : have_info && created.sampled_only  ? pso::FormatUsage::SampledOnly
+                                             : pso::FormatUsage::Sampled;
+    const pso::TextureFormatMapping mapping =
+        pso::map_texture_format(static_cast<pso::DxgiFormat>(tt.dxgi_format), map_usage, bridge_->options().features);
     if (!mapping.supported() || pso::has_depth_aspect(mapping.format) || pso::has_stencil_aspect(mapping.format)) {
         return false;
     }
+    const bool format_mismatch =
+        have_info && created.created_format != pso::WgpuTextureFormat::Undefined &&
+        created.created_format != mapping.format;
+    const bool needs_conversion =
+        format_mismatch ||
+        (mapping.diagnostics & (pso::FormatDiag::NeedsCpuConversion | pso::FormatDiag::FeatureFallback)) != 0;
     // 16-bit normalized texels for a SampledOnly texture: converted to its float representation
     // (pso::convert_norm16_texels; exact as float32, reported once when it is float16).
     uint8_t probe_dst[4] = {};
     const uint8_t probe_src[2] = {};
-    const bool convert_norm16 = (mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+    const bool convert_norm16 = !format_mismatch && needs_conversion &&
                                 pso::convert_norm16_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format),
                                                            mapping.format, probe_src, 1, probe_dst);
     if (convert_norm16 && (mapping.diagnostics & pso::FormatDiag::LossyConversion) != 0) {
@@ -915,10 +925,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         }
     }
     // A8_UNORM held as rgba8unorm: each texel widened to (0, 0, 0, a).
-    const bool convert_a8 = (mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+    const bool convert_a8 = !format_mismatch && needs_conversion &&
                             pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
                                                  probe_src, 1, probe_dst);
-    if ((mapping.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 && !convert_norm16 && !convert_a8) {
+    if (needs_conversion && !convert_norm16 && !convert_a8) {
         // The GPU texture has a substitute format (e.g. rgba8unorm for BC without the feature):
         // the guest's texels do not fit it and are not converted. Skip, reported once per texture.
         bool first = false;
@@ -1930,6 +1940,7 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     info.layout = d3d12_layout;
     info.sampled_only = true;
     info.storage = (payload.usage_flags & GpuTextureUsage::StorageBinding) != 0;
+    info.created_format = mapping.format;
     bridge_->register_texture(id, info);
 
     if (gpu_va < kFakeGpuVaBase) {
@@ -2586,11 +2597,12 @@ void Device::note_unsupported_copy(const std::string& message) {
     note_bad_argument(message);
 }
 
-bool Device::upload_needs_conversion(uint32_t dxgi_format) const {
-    const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(dxgi_format),
-                                                                pso::FormatUsage::Sampled, bridge_->options().features);
+bool Device::upload_needs_conversion(uint32_t dxgi_format, pso::FormatUsage usage) const {
+    const pso::TextureFormatMapping m =
+        pso::map_texture_format(static_cast<pso::DxgiFormat>(dxgi_format), usage, bridge_->options().features);
     // A8_UNORM is converted on upload (widen_a8_rows).
-    return m.supported() && (m.diagnostics & pso::FormatDiag::NeedsCpuConversion) != 0 &&
+    return m.supported() && !pso::has_depth_aspect(m.format) && !pso::has_stencil_aspect(m.format) &&
+           (m.diagnostics & (pso::FormatDiag::NeedsCpuConversion | pso::FormatDiag::FeatureFallback)) != 0 &&
            static_cast<pso::DxgiFormat>(dxgi_format) != pso::DxgiFormat::A8_UNORM;
 }
 
@@ -2671,11 +2683,18 @@ Resource::~Resource() {
     if (id_ != 0) {
         device_->state_bridge().unregister_resource(id_);
         device_->resource_states().unregister_resource(id_);
-        // A GPU object whose create packet was never written (never used) needs no DestroyResource.
-        if ((is_buffer() || gpu_texture_) && !device_->release_deferred(id_)) {
+        if (is_buffer() || gpu_texture_) {
             CommandEncoder enc;
             device_->state_bridge().advance_present_frame(device_->stats().presents, enc);
-            device_->state_bridge().destroy_or_defer_resource(id_, enc);
+            // Keep a still-deferred create if any unexecuted command list or in-frame command
+            // already references this id: emit_locked writes the create before the first reference
+            // and drops DestroyResource if the list is reset without executing.
+            if (device_->state_bridge().is_resource_used_in_frame(id_) ||
+                device_->state_bridge().is_resource_recorded(id_)) {
+                device_->state_bridge().defer_destroy_resource(id_);
+            } else if (!device_->release_deferred(id_)) {
+                device_->state_bridge().destroy_or_defer_resource(id_, enc);
+            }
             if (enc.size() != 0) {
                 device_->submit(enc);
             }
@@ -2890,6 +2909,9 @@ bool Resource::initialize() {
             info.gpu_va = descriptor_va_;
             info.layout = desc_.Layout;
             info.storage = (p.usage_flags & GpuTextureUsage::StorageBinding) != 0;
+            info.render_target = rt;
+            info.depth_stencil = depth || bridge::is_depth_stencil_dxgi_format(info.format);
+            info.created_format = m.format;
             dev.state_bridge().register_texture(id_, info);
             va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
             if (const DxgiFormatLayout bl = dxgi_format_layout(desc_.Format); bl.known && bl.block_bytes != 0) {
@@ -3268,16 +3290,26 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
         device_->note_bad_argument("WriteToSubresource: unreadable box");
         return kEInvalidArg;
     }
-    if (device_->upload_needs_conversion(desc_.Format)) {
+    const bool depth = (desc_.Flags & ResourceFlags::AllowDepthStencil) != 0;
+    const bool rt = (desc_.Flags & ResourceFlags::AllowRenderTarget) != 0;
+    const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
+                                         : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
+    if (device_->upload_needs_conversion(desc_.Format, usage)) {
         device_->note_unsupported_copy("WriteToSubresource: DXGI format " + std::to_string(desc_.Format) +
                                        " needs CPU conversion for its WebGPU format (not implemented); skipped");
         return kSOk;
     }
     va_watch_resource("upload (WriteToSubresource)", this, "subresource " + std::to_string(sub));
     const DxgiFormatLayout l = dxgi_format_layout(desc_.Format);
-    const uint32_t bw = std::max<uint32_t>(1, box.right - box.left);
-    const uint32_t bh = std::max<uint32_t>(1, box.bottom - box.top);
+    const uint32_t raw_bw = std::max<uint32_t>(1, box.right - box.left);
+    const uint32_t raw_bh = std::max<uint32_t>(1, box.bottom - box.top);
     const uint32_t bd = std::max<uint32_t>(1, box.back - box.front);
+    // WebGPU requires block-compressed copySize and origin to be multiples of the block dimensions
+    // (small mips like 2x2 / 1x1 use their 4x4 physical block size).
+    const uint32_t bw = l.block_width > 1 ? static_cast<uint32_t>(align_up(raw_bw, l.block_width)) : raw_bw;
+    const uint32_t bh = l.block_height > 1 ? static_cast<uint32_t>(align_up(raw_bh, l.block_height)) : raw_bh;
+    const uint32_t origin_x = l.block_width > 1 ? (box.left / l.block_width) * l.block_width : box.left;
+    const uint32_t origin_y = l.block_height > 1 ? (box.top / l.block_height) * l.block_height : box.top;
     const uint32_t rows = (bh + l.block_height - 1) / l.block_height;
     const uint64_t len = uint64_t{depth_pitch} * (bd - 1) + uint64_t{row_pitch} * rows;
     std::vector<uint8_t> bytes(static_cast<size_t>(len));
@@ -3295,14 +3327,14 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
             device_->note_bad_argument("WriteToSubresource: A8 source smaller than its box");
             return kEInvalidArg;
         }
-        enc.write_texture(id_, host_mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, pitch, rows, wide.data(),
-                          static_cast<uint32_t>(wide.size()));
+        enc.write_texture(id_, host_mip, origin_x, origin_y, is3d ? box.front : layer, bw, bh, bd, pitch, rows,
+                          wide.data(), static_cast<uint32_t>(wide.size()));
         device_->submit(enc);
         device_->note_upload(wide.size());
         device_->note_texture_upload();
         return kSOk;
     }
-    enc.write_texture(id_, host_mip, box.left, box.top, is3d ? box.front : layer, bw, bh, bd, row_pitch,
+    enc.write_texture(id_, host_mip, origin_x, origin_y, is3d ? box.front : layer, bw, bh, bd, row_pitch,
                       row_pitch != 0 ? depth_pitch / row_pitch : rows, bytes.data(), static_cast<uint32_t>(len));
     device_->submit(enc);
     device_->note_upload(len);
@@ -3921,7 +3953,12 @@ bool read_shader(Device& dev, const GuestShaderBytecode& code, const char* stage
                    bytes.size());
     }
     if (embedded != nullptr) {
+        const uint8_t stage_key = static_cast<uint8_t>(want);
+        if (dev.pipeline_dump() == nullptr && dev.find_cached_embedded_native(*identity, stage_key, embedded)) {
+            return true;
+        }
         embedded_native_stage(dev, bytes, want, embedded);
+        dev.cache_embedded_native(*identity, stage_key, *embedded);
     }
     return true;
 }
@@ -4437,6 +4474,27 @@ HResult Device::create_graphics_pso_from(GraphicsPsoSource source, const Guid& r
     return hand_out(std::move(state), riid, out);
 }
 
+bool Device::mesh_pipelines_possible() const {
+    std::call_once(mesh_possible_once_, [this] {
+        const ShaderPackIndex* pack = options_.shader_pack.get();
+        const StageReflectionIndex* refl = options_.stage_reflection.get();
+        if (pack == nullptr || refl == nullptr) {
+            return;
+        }
+        for (const auto& [key, r] : *refl) {
+            if (!r.has_mesh_output) {
+                continue;
+            }
+            const auto it = pack->find(key);
+            if (it != pack->end() && it->second == PackStage::Compute) {
+                mesh_possible_ = true;
+                return;
+            }
+        }
+    });
+    return mesh_possible_;
+}
+
 HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const GuestShaderBytecode& ms,
                                 bool amplification, const Guid& riid, OutPtr out) {
     const auto placeholder = [&](const char* reason) {
@@ -4452,6 +4510,13 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
     if (pack == nullptr || refl == nullptr || !rs || g.NumRenderTargets > 8) {
         return placeholder("mesh shaders (no shader pack, reflection or root signature)");
     }
+    // Fast gate: when the shader pack + reflection sidecar contain zero mesh-compute stages,
+    // return a placeholder immediately before reading, hashing, or inflating MS/PS bytecodes
+    // (avoids multi-second CPU stalls on 512+ mesh PSO waves during boot).
+    if (dump_ == nullptr && ms.pShaderBytecode != 0 && ms.BytecodeLength != 0 &&
+        ms.BytecodeLength <= kMaxShaderBytes && !mesh_pipelines_possible()) {
+        return placeholder("mesh shaders (no mesh compute translation in the pack)");
+    }
     uint64_t ms_id = 0;
     uint64_t ps_id = 0;
     DxilDigest ms_digest{};
@@ -4460,8 +4525,7 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
     // other stage kinds; the mesh stage's is also written to the pipeline dump (stage "mesh").
     NativeStageRecord embedded_ms{};
     NativeStageRecord embedded_ps{};
-    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest, &embedded_ms, xbox::EmbeddedStage::Ms) ||
-        !read_shader(*this, g.PS, "PS", &ps_id, &ps_digest, &embedded_ps, xbox::EmbeddedStage::Ps) || ms_id == 0) {
+    if (!read_shader(*this, ms, "MS", &ms_id, &ms_digest, &embedded_ms, xbox::EmbeddedStage::Ms) || ms_id == 0) {
         return placeholder("mesh shaders (unreadable stage)");
     }
     // Pack keys, as for the other stages: the joined console-native stage's code identity first,
@@ -4483,9 +4547,18 @@ HResult Device::create_mesh_pso(const GuestGraphicsPipelineStateDesc& g, const G
         }
         return 0;
     };
+    // Resolve MS first so an MS pack/reflection miss skips reading/inflating the PS container.
     const uint64_t ms_key = find_key(ms_digest, ms_id, bridge::kMeshComputeKeySalt, PackStage::Compute, embedded_ms);
-    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment, embedded_ps) : 0;
     const auto ms_refl = ms_key != 0 ? refl->find(ms_key) : refl->end();
+    if (dump_ == nullptr && (ms_key == 0 || ms_refl == refl->end() || !ms_refl->second.has_mesh_output)) {
+        return placeholder(ms_key == 0                        ? "mesh shaders (no mesh compute translation in the pack)"
+                           : ms_refl == refl->end()           ? "mesh shaders (no reflection for the mesh compute stage)"
+                                                              : "mesh shaders (reflection without mesh_output)");
+    }
+    if (!read_shader(*this, g.PS, "PS", &ps_id, &ps_digest, &embedded_ps, xbox::EmbeddedStage::Ps)) {
+        return placeholder("mesh shaders (unreadable stage)");
+    }
+    const uint64_t ps_key = ps_id != 0 ? find_key(ps_digest, ps_id, 0, PackStage::Fragment, embedded_ps) : 0;
     if (ms_key == 0 || ms_refl == refl->end() || !ms_refl->second.has_mesh_output || (ps_id != 0 && ps_key == 0)) {
         // The reason names the missing piece (the text is the deduplication key of the notice).
         return placeholder(ms_key == 0                         ? "mesh shaders (no mesh compute translation in the pack)"
@@ -4637,6 +4710,29 @@ bool Device::find_native_stage(const DxilDigest& digest, NativeStageRecord* out)
 size_t Device::native_index_size() const {
     std::lock_guard<std::mutex> lock(shader_mutex_);
     return indexed_native_.size();
+}
+
+bool Device::find_cached_embedded_native(uint64_t identity, uint8_t want, NativeStageRecord* out) const {
+    if (identity == 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    const auto it = embedded_native_cache_.find(EmbeddedCacheKey{identity, want});
+    if (it == embedded_native_cache_.end()) {
+        return false;
+    }
+    *out = it->second;
+    return true;
+}
+
+void Device::cache_embedded_native(uint64_t identity, uint8_t want, const NativeStageRecord& record) {
+    if (identity == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(shader_mutex_);
+    if (embedded_native_cache_.size() < kMaxEmbeddedNativeCache) {
+        embedded_native_cache_.emplace(EmbeddedCacheKey{identity, want}, record);
+    }
 }
 
 HResult Device::create_native_pso(const xbox::NativePipeline& pipeline, const Guid& riid, OutPtr out) {

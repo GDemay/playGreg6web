@@ -264,6 +264,9 @@ Device::Device(DeviceOptions options) : options_(std::move(options)) {
     bo.sync_texture_memory = [this](uint32_t resource_id, CommandEncoder& encoder) {
         return sync_bound_texture_memory(resource_id, encoder);
     };
+    bo.defer_device_object = [this](uint32_t id, CommandEncoder& encoder) {
+        defer_device_object(id, encoder);
+    };
     detile_texture_ = options_.detile_texture;
     using_default_detile_ = !detile_texture_;
     if (!detile_texture_) {
@@ -544,6 +547,7 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
         break;
     case GpuOpcode::CreateBindGroup2:
         if (len >= sizeof(GpuCreateBindGroup2Payload)) {
+            fn(read_u32(p + offsetof(GpuCreateBindGroup2Payload, layout_id)));
             const uint32_t count = read_u32(p + offsetof(GpuCreateBindGroup2Payload, entry_count));
             for (uint32_t i = 0; i < count; ++i) {
                 const size_t at = sizeof(GpuCreateBindGroup2Payload) + size_t{i} * sizeof(GpuBindGroupEntry2);
@@ -551,6 +555,43 @@ void for_each_resource_ref(uint16_t opcode, const uint8_t* p, uint32_t len, Fn&&
                     break;
                 }
                 fn(read_u32(p + at + offsetof(GpuBindGroupEntry2, resource_id)));
+            }
+        }
+        break;
+    case GpuOpcode::SetBindGroup2:
+        if (len >= sizeof(GpuSetBindGroup2Payload)) {
+            fn(read_u32(p + offsetof(GpuSetBindGroup2Payload, bind_group_id)));
+        }
+        break;
+    case GpuOpcode::SetPipeline:
+        if (len >= sizeof(GpuSetPipelinePayload)) {
+            fn(read_u32(p + offsetof(GpuSetPipelinePayload, pipeline_id)));
+        }
+        break;
+    case GpuOpcode::SetComputePipeline:
+        if (len >= sizeof(GpuSetComputePipelinePayload)) {
+            fn(read_u32(p + offsetof(GpuSetComputePipelinePayload, pipeline_id)));
+        }
+        break;
+    case GpuOpcode::CreateRenderPipeline2:
+        if (len >= sizeof(GpuCreateRenderPipeline2Payload)) {
+            fn(read_u32(p + offsetof(GpuCreateRenderPipeline2Payload, pipeline_layout_id)));
+        }
+        break;
+    case GpuOpcode::CreateComputePipeline2:
+        if (len >= sizeof(GpuCreateComputePipeline2Payload)) {
+            fn(read_u32(p + offsetof(GpuCreateComputePipeline2Payload, pipeline_layout_id)));
+        }
+        break;
+    case GpuOpcode::CreatePipelineLayout:
+        if (len >= sizeof(GpuCreatePipelineLayoutPayload)) {
+            const uint32_t count = read_u32(p + offsetof(GpuCreatePipelineLayoutPayload, bind_group_layout_count));
+            for (uint32_t i = 0; i < count; ++i) {
+                const size_t at = sizeof(GpuCreatePipelineLayoutPayload) + size_t{i} * sizeof(uint32_t);
+                if (at + sizeof(uint32_t) > len) {
+                    break;
+                }
+                fn(read_u32(p + at));
             }
         }
         break;
@@ -577,11 +618,12 @@ void Device::emit_locked(const uint8_t* bytes, size_t n) {
     if (n == 0) {
         return;
     }
-    if (deferred_creates_.empty()) {
+    if (deferred_creates_.empty() && deferred_device_objects_.empty()) {
         write_sink_locked(bytes, n);
         return;
     }
-    // Walk the packets: a held create goes right before the first packet that references its id,
+    // Walk the packets: a held create (guest resource or device-global bridge object) goes right
+    // before the first packet that references its id (recursively resolving prerequisites first),
     // and a DestroyResource of a still-held id is dropped along with the create. The bytes are
     // copied only when that happens.
     std::vector<uint8_t> out;
@@ -595,8 +637,41 @@ void Device::emit_locked(const uint8_t* bytes, size_t n) {
         out.insert(out.end(), bytes + copied, bytes + end);
         copied = end;
     };
+    auto emit_deferred = [&](auto&& self, uint32_t id, size_t before_off) -> void {
+        if (id == 0) {
+            return;
+        }
+        if (const auto it = deferred_creates_.find(id); it != deferred_creates_.end()) {
+            std::vector<uint8_t> pkt = std::move(it->second);
+            deferred_creates_.erase(it);
+            ++gpu_objects_created_on_use_;
+            count_work(Work::GpuObjectsCreatedOnUse);
+            flush_to(before_off);
+            out.insert(out.end(), pkt.begin(), pkt.end());
+            return;
+        }
+        if (const auto it = deferred_device_objects_.find(id); it != deferred_device_objects_.end()) {
+            std::vector<uint8_t> pkt = std::move(it->second);
+            deferred_device_objects_.erase(it);
+            size_t poff = 0;
+            while (poff + sizeof(GpuPacketHeader) <= pkt.size()) {
+                GpuPacketHeader ph{};
+                std::memcpy(&ph, pkt.data() + poff, sizeof(ph));
+                const size_t pnext = poff + sizeof(GpuPacketHeader) + ph.payload_bytes;
+                if (pnext > pkt.size()) {
+                    break;
+                }
+                for_each_resource_ref(ph.opcode, pkt.data() + poff + sizeof(GpuPacketHeader), ph.payload_bytes,
+                                      [&](uint32_t dep) { self(self, dep, before_off); });
+                poff = pnext;
+            }
+            flush_to(before_off);
+            out.insert(out.end(), pkt.begin(), pkt.end());
+        }
+    };
     size_t off = 0;
-    while (off + sizeof(GpuPacketHeader) <= n && !deferred_creates_.empty()) {
+    while (off + sizeof(GpuPacketHeader) <= n &&
+           (!deferred_creates_.empty() || !deferred_device_objects_.empty())) {
         GpuPacketHeader h{};
         std::memcpy(&h, bytes + off, sizeof(h));
         const size_t next = off + sizeof(GpuPacketHeader) + h.payload_bytes;
@@ -605,26 +680,24 @@ void Device::emit_locked(const uint8_t* bytes, size_t n) {
         }
         const uint8_t* payload = bytes + off + sizeof(GpuPacketHeader);
         if (static_cast<GpuOpcode>(h.opcode) == GpuOpcode::DestroyResource) {
-            const auto it = h.payload_bytes >= 4 ? deferred_creates_.find(read_u32(payload)) : deferred_creates_.end();
-            if (it != deferred_creates_.end()) {
+            const uint32_t id = h.payload_bytes >= 4 ? read_u32(payload) : 0u;
+            if (const auto it = id != 0 ? deferred_creates_.find(id) : deferred_creates_.end();
+                it != deferred_creates_.end()) {
                 deferred_creates_.erase(it);
                 ++gpu_objects_never_created_;
                 count_work(Work::GpuObjectsNeverCreated);
                 flush_to(off);
                 copied = next;  // the packet is skipped
+            } else if (const auto dit =
+                           id != 0 ? deferred_device_objects_.find(id) : deferred_device_objects_.end();
+                       dit != deferred_device_objects_.end()) {
+                deferred_device_objects_.erase(dit);
+                flush_to(off);
+                copied = next;  // never created on the worker: skip DestroyResource too
             }
         } else {
-            for_each_resource_ref(h.opcode, payload, h.payload_bytes, [&](uint32_t id) {
-                const auto it = id == 0 ? deferred_creates_.end() : deferred_creates_.find(id);
-                if (it == deferred_creates_.end()) {
-                    return;
-                }
-                flush_to(off);
-                out.insert(out.end(), it->second.begin(), it->second.end());
-                deferred_creates_.erase(it);
-                ++gpu_objects_created_on_use_;
-                count_work(Work::GpuObjectsCreatedOnUse);
-            });
+            for_each_resource_ref(h.opcode, payload, h.payload_bytes,
+                                  [&](uint32_t id) { emit_deferred(emit_deferred, id, off); });
         }
         off = next;
     }
@@ -647,6 +720,14 @@ void Device::defer_create(uint32_t id, const CommandEncoder& create) {
     std::lock_guard<std::mutex> lock(submit_mutex_);
     deferred_creates_[id].assign(create.data(), create.data() + create.size());
     count_work(Work::GpuObjectsDeferred);
+}
+
+void Device::defer_device_object(uint32_t id, const CommandEncoder& create) {
+    if (id == 0 || create.size() == 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(submit_mutex_);
+    deferred_device_objects_[id].assign(create.data(), create.data() + create.size());
 }
 
 void Device::replace_host_texture(const GpuCreateTexture2Payload& p, CommandEncoder& encoder) {
@@ -727,7 +808,7 @@ uint8_t present_canvas_format(pso::WgpuTextureFormat f) {
 
 uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, CommandEncoder& enc) {
     // Drawable planes, bottom (last plane) first; the bottom one picks the canvas format.
-    std::vector<uint32_t> order;
+    std::vector<std::pair<uint32_t, pso::WgpuTextureFormat>> order;
     uint8_t canvas_format = 0;
     for (size_t i = plane_textures.size(); i-- > 0;) {
         const uint32_t id = plane_textures[i];
@@ -736,20 +817,24 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
             info.dimension != GpuTextureDimension::Dim2D || info.sample_count != 1) {
             continue;  // none, gone, already the canvas (set_back_buffer), or not a plain 2D texture
         }
-        const pso::TextureFormatMapping m =
-            pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features);
-        const uint8_t format = present_canvas_format(m.format);
+        const pso::WgpuTextureFormat plane_fmt =
+            info.created_format != pso::WgpuTextureFormat::Undefined
+                ? info.created_format
+                : pso::map_texture_format(info.format, pso::FormatUsage::RenderTarget, bridge_->options().features)
+                      .format;
+        const uint8_t format = present_canvas_format(plane_fmt);
         if (format == 0) {
             continue;
         }
         if (order.empty()) {
             canvas_format = format;
         }
-        order.push_back(id);
+        order.emplace_back(id, plane_fmt);
     }
     if (order.empty()) {
         return 0;
     }
+    const bool canvas_is_srgb = bridge::is_srgb_format(static_cast<pso::WgpuTextureFormat>(canvas_format));
     PresentBlit& b = present_blit_;
     if (b.vs == 0) {
         b.vs = allocate_id();
@@ -813,14 +898,23 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
         }
         return pipeline;
     };
-    auto group_for = [&](uint32_t texture_id) {
-        uint32_t& group = b.groups[texture_id];
+    auto group_for = [&](uint32_t texture_id, pso::WgpuTextureFormat plane_fmt) {
+        // Match each plane's sampled view sRGB-ness to the canvas format so mixing UNORM and sRGB
+        // planes never double-encodes (washed out) or decodes without re-encoding (darkened).
+        uint8_t view_format = 0;
+        if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(plane_fmt);
+            sibling != pso::WgpuTextureFormat::Undefined && bridge::is_srgb_format(plane_fmt) != canvas_is_srgb) {
+            view_format = static_cast<uint8_t>(sibling);
+        }
+        const uint64_t group_key = (uint64_t{texture_id} << 8) | view_format;
+        uint32_t& group = b.groups[group_key];
         if (group == 0) {
             group = allocate_id();
             GpuBindGroupEntry2 e[2] = {};
             e[0].binding = 0;
             e[0].resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
             e[0].resource_id = texture_id;
+            e[0].view.format = view_format;
             e[0].view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
             e[0].view.mip_level_count = 1;
             e[0].view.array_layer_count = 1;
@@ -838,7 +932,7 @@ uint32_t Device::emit_present_planes(std::span<const uint32_t> plane_textures, C
     std::vector<std::pair<uint32_t, uint32_t>> draws;  // (pipeline, bind group), bottom first
     for (size_t k = 0; k < order.size(); ++k) {
         const uint32_t pipeline = pipeline_for(k > 0);
-        draws.emplace_back(pipeline, group_for(order[k]));
+        draws.emplace_back(pipeline, group_for(order[k].first, order[k].second));
     }
     GpuBeginRenderPassPayload pass{};
     pass.color_count = 1;
@@ -1119,8 +1213,9 @@ bool Device::emit_msaa_resolve(uint32_t dst_texture_id, uint32_t dst_mip, uint32
     enc.draw(3, 1, 0, 0);
     enc.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
 
-    bridge_->note_resource_used(src_texture_id);
-    bridge_->note_resource_used(dst_texture_id);
+    bridge_->note_encoder_resource_used(enc, src_texture_id);
+    bridge_->note_encoder_resource_used(enc, dst_texture_id);
+    bridge_->note_encoder_resource_used(enc, group_id);
     bridge_->defer_destroy_resource(group_id);
     return true;
 }
