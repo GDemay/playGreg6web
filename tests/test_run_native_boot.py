@@ -479,7 +479,8 @@ class RunTests(unittest.TestCase):
         self.assertEqual(lines[i + 17:i + 19], ["end", "capture"])
         self.assertFalse(any("draws_per_frame!=37" in x for x in lines))
         terms = lines[i + 19:i + 34]
-        self.assertEqual(terms[0], "repeat every 16s until draws_per_frame!=33|50|51 for 3s timeout 200s")
+        # Gated on the loading screen after Confirm, not on leaving the terms screen's (jittery) draws/frame.
+        self.assertEqual(terms[0], "repeat every 16s until draws_per_frame<=4 for 3s timeout 200s")
         self.assertEqual([e.split()[1] for e in terms[1:14]],
                          ["DUp"] * 6 + ["RDown", "A", "DDown", "RDown", "A", "DDown", "A"])
         self.assertEqual(terms[14], "end")
