@@ -1558,6 +1558,9 @@ enum class Work : size_t {
     ReadbacksCompleted,
     ReadbackSignalsHeld,
     ReadbackTimeouts,
+    // G66 partly-held mip chains: sampled texture bindings emitted with their base mip level raised
+    // to the first level the title holds (streamed in / mapped) or to the view's min-LOD clamp.
+    MipClampedBinds,
     Count
 };
 void count_work(Work w, uint64_t n = 1);
