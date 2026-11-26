@@ -183,7 +183,7 @@ constexpr uint8_t kDistExtra[30] = {0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6,
                                     6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
 constexpr uint8_t kCodeLengthOrder[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
 
-constexpr int kFastBits = 9;
+constexpr int kFastBits = 10;
 
 struct Huffman {
     uint16_t count[16]{};
@@ -287,7 +287,18 @@ private:
             return true;
         }
         if constexpr (std::endian::native == std::endian::little) {
-            if (bitcnt_ <= 32 && pos_ + 4 <= len_) {
+            if (bitcnt_ < 56 && pos_ + 8 <= len_) {
+                uint64_t w = 0;
+                std::memcpy(&w, src_ + pos_, sizeof(w));
+                const int bytes = (63 - bitcnt_) >> 3;  // 1..7 bytes; keeps bits >= bitcnt_ zero
+                const uint64_t mask = (uint64_t{1} << (bytes * 8)) - 1u;
+                bitbuf_ |= (w & mask) << bitcnt_;
+                pos_ += static_cast<size_t>(bytes);
+                bitcnt_ += bytes * 8;
+                if (bitcnt_ >= n) {
+                    return true;
+                }
+            } else if (bitcnt_ <= 32 && pos_ + 4 <= len_) {
                 uint32_t w = 0;
                 std::memcpy(&w, src_ + pos_, sizeof(w));
                 bitbuf_ |= static_cast<uint64_t>(w) << bitcnt_;
@@ -324,7 +335,9 @@ private:
 
     // Symbol or -1 (truncated) / -2 (invalid code).
     int decode(const Huffman& h) {
-        need(kFastBits);  // may come up short at the end of the input
+        if (bitcnt_ < kFastBits) {
+            need(kFastBits);  // may come up short at the end of the input
+        }
         if (bitcnt_ >= kFastBits) {
             const uint16_t e = h.fast[bitbuf_ & ((1u << kFastBits) - 1)];
             if (e != 0) {
@@ -592,49 +605,26 @@ Pg6IDStorageFactory* acquire_host_factory() {
     return static_cast<Pg6IDStorageFactory*>(p);
 }
 
-// Synchronous reads through the O12 host objects: one host queue + status array per worker.
+// Synchronous reads directly through the O12 host file object, plus per-worker scratch buffers.
 class HostReader {
 public:
-    HostReader() {
-        factory_ = acquire_host_factory();
-        if (factory_ == nullptr) {
-            return;
-        }
-        Pg6DStorageQueueDesc desc{};
-        void* q = nullptr;
-        void* s = nullptr;
-        if (gdk::succeeded(factory_->CreateQueue(&desc, scarlett::kIidIDStorageQueue, &q))) {
-            queue_ = static_cast<Pg6IDStorageQueue*>(q);
-        }
-        if (gdk::succeeded(factory_->CreateStatusArray(1, "pg6 dstorage worker", scarlett::kIidIDStorageStatusArray, &s))) {
-            status_ = static_cast<Pg6IDStorageStatusArray*>(s);
-        }
-    }
-    ~HostReader() {
-        if (status_ != nullptr) status_->Release();
-        if (queue_ != nullptr) queue_->Release();
-        if (factory_ != nullptr) factory_->Release();
-    }
+    HostReader() = default;
+    ~HostReader() = default;
     HostReader(const HostReader&) = delete;
     HostReader& operator=(const HostReader&) = delete;
 
     HResult read(Pg6IDStorageFile* file, uint64_t offset, void* dst, uint32_t size) {
-        if (queue_ == nullptr || status_ == nullptr) {
-            return com::E_FAIL_HR;
-        }
         counters().file_reads.fetch_add(1, std::memory_order_relaxed);
-        queue_->EnqueueRead(file, offset, dst, size);
-        queue_->EnqueueStatus(status_, 0);
-        queue_->Submit();
-        return status_->GetHResult(0);
+        return scarlett::dstorage_file_read_at(file, offset, dst, size);
     }
 
-    // O48: per-worker reusable scratch buffers (trimmed if capacity ever exceeds 8 MiB).
+    // Per-worker reusable scratch buffers (trimmed if capacity ever exceeds 8 MiB).
     static constexpr size_t kMaxRetainedBufferBytes = 8u * 1024u * 1024u;
     std::vector<uint8_t> staging;
     std::vector<uint8_t> scratch;
     std::vector<uint8_t> intermediate;
     std::vector<size_t> file_reads;
+    std::vector<HResult> results;
 
     void trim_buffers() {
         auto trim_u8 = [](std::vector<uint8_t>& buf) {
@@ -650,12 +640,11 @@ public:
         if (file_reads.capacity() * sizeof(size_t) > kMaxRetainedBufferBytes) {
             std::vector<size_t>().swap(file_reads);
         }
+        results.clear();
+        if (results.capacity() * sizeof(HResult) > kMaxRetainedBufferBytes) {
+            std::vector<HResult>().swap(results);
+        }
     }
-
-private:
-    Pg6IDStorageFactory* factory_ = nullptr;
-    Pg6IDStorageQueue* queue_ = nullptr;
-    Pg6IDStorageStatusArray* status_ = nullptr;
 };
 
 
@@ -967,7 +956,7 @@ private:
     // before its own Submit, so running earlier writes into stale pages. The one exception is an
     // enqueue that finds the queue full, which must submit to make progress.
     void enqueue(Item&& item) {
-        item.enqueued_ms = trace_now_ms();
+        item.enqueued_ms = audio_trace_enabled() ? trace_now_ms() : 0;
         std::unique_lock<std::mutex> lock(mutex_);
         while (!closed_ && occupancy_locked() >= capacity_) {
             if (!pending_.empty()) {
@@ -1027,7 +1016,8 @@ private:
                     const uint8_t* data,
                     size_t len,
                     std::vector<uint8_t>& scratch,
-                    std::vector<uint8_t>& intermediate);
+                    std::vector<uint8_t>& intermediate,
+                    const bcpack::Tables* bcpack_tables);
     HResult write_destination(const DStorageRequest& r, const uint8_t* data, size_t len);
 
     DStorageQueueDesc desc_;
@@ -1120,7 +1110,9 @@ bool DStorageQueue::run_batch(HostReader& reader) {
         in_flight_ += batch.size();
     }
 
-    std::vector<HResult> results(batch.size(), kOk);
+    const size_t batch_count = batch.size();
+    std::vector<HResult>& results = reader.results;
+    results.assign(batch_count, kOk);
     execute(reader, batch, results);
     for (size_t i = 0; i < batch.size(); ++i) {
         Item& item = batch[i];
@@ -1149,9 +1141,10 @@ bool DStorageQueue::run_batch(HostReader& reader) {
         }
     }
     batch.clear();  // drop file / status references before reporting the room
+    reader.trim_buffers();
 
     std::lock_guard<std::mutex> lock(mutex_);
-    in_flight_ -= results.size();
+    in_flight_ -= batch_count;
     const bool more = !submitted_.empty();
     if (!more) {
         scheduled_ = false;
@@ -1181,7 +1174,8 @@ HResult DStorageQueue::deliver(const Item& item,
                                const uint8_t* data,
                                size_t len,
                                std::vector<uint8_t>& scratch,
-                               std::vector<uint8_t>& intermediate) {
+                               std::vector<uint8_t>& intermediate,
+                               const bcpack::Tables* bcpack_tables) {
     const DStorageRequest& r = item.req;
     const DStorageOptions opts = parse_dstorage_options(r.options);
     if (!opts.compressed()) {
@@ -1219,9 +1213,9 @@ HResult DStorageQueue::deliver(const Item& item,
         out = scratch.data();
     }
     if (unpack_bc) {
-        const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
-        const bcpack::DecodeStatus st = tables ? bcpack::decode(*tables, opts.bcpack_mode, data, len, out, expected)
-                                               : bcpack::DecodeStatus::Unsupported;
+        const bcpack::DecodeStatus st = bcpack_tables != nullptr
+                                            ? bcpack::decode(*bcpack_tables, opts.bcpack_mode, data, len, out, expected)
+                                            : bcpack::DecodeStatus::Unsupported;
         if (st != bcpack::DecodeStatus::Ok) {
             diag_once(once().bcpack_failed, "XCRDAPI: BCPack request (mode " + std::to_string(opts.bcpack_mode) +
                                                 ", " + std::to_string(len) + " -> " + std::to_string(expected) +
@@ -1259,6 +1253,17 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
     std::vector<uint8_t>& intermediate = reader.intermediate;
     file_reads.clear();
 
+    // Fetch active BCPack tables at most once per batch instead of twice per BCPack request.
+    std::shared_ptr<const bcpack::Tables> batch_bcpack_tables;
+    bool bcpack_tables_loaded = false;
+    auto get_bcpack_tables = [&]() -> const bcpack::Tables* {
+        if (!bcpack_tables_loaded) {
+            batch_bcpack_tables = bcpack::active_tables();
+            bcpack_tables_loaded = true;
+        }
+        return batch_bcpack_tables.get();
+    };
+
     for (size_t i = 0; i < items.size(); ++i) {
         Item& item = items[i];
         if (item.kind != Item::Request || item.cancelled) {
@@ -1278,17 +1283,17 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         }
         if (opts.bcpack_mode != 0) {
             const uint64_t n = counters().bcpack_requests.fetch_add(1, std::memory_order_relaxed) + 1;
-            const std::shared_ptr<const bcpack::Tables> tables = bcpack::active_tables();
-            if (!tables || !bcpack::supports(*tables, opts.bcpack_mode)) {
+            const bcpack::Tables* tables = get_bcpack_tables();
+            if (tables == nullptr || !bcpack::supports(*tables, opts.bcpack_mode)) {
                 if ((n & (n - 1)) == 0) {  // the 1st, 2nd, 4th, ... (they fail by the hundred: say which)
                     std::string name;
                     read_guest_string(r.name, 96, &name);
                     const std::string why =
-                        !tables ? "no BCPack tables are loaded: pass --bcpack-tables <file> or set "
-                                  "PLAYGTA6_BCPACK_TABLES (the repository does not ship them; docs/BCPACK.md)"
-                                : "the loaded BCPack tables cannot decode mode " + std::to_string(opts.bcpack_mode) +
-                                      " (they support: " + bcpack::supported_formats(*tables) +
-                                      "; BC2 has no BCPack decoder)";
+                        tables == nullptr ? "no BCPack tables are loaded: pass --bcpack-tables <file> or set "
+                                            "PLAYGTA6_BCPACK_TABLES (the repository does not ship them; docs/BCPACK.md)"
+                                          : "the loaded BCPack tables cannot decode mode " + std::to_string(opts.bcpack_mode) +
+                                                " (they support: " + bcpack::supported_formats(*tables) +
+                                                "; BC2 has no BCPack decoder)";
                     diag("XCRDAPI: request options " + hex64(r.options) + " ask for BCPack (mode " +
                          std::to_string(opts.bcpack_mode) + ", " + std::to_string(r.source_size) + " -> " +
                          std::to_string(r.destination_size) + " bytes, request '" + name + "'); " + why +
@@ -1321,7 +1326,8 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
                 results[i] = com::E_INVALIDARG_HR;
                 continue;
             }
-            results[i] = deliver(item, staging.data(), staging.size(), scratch, intermediate);
+            results[i] = deliver(item, staging.data(), staging.size(), scratch, intermediate,
+                                 batch_bcpack_tables.get());
             continue;
         }
         file_reads.push_back(i);
@@ -1356,7 +1362,9 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         }
         staging.resize(r.source_size);
         const HResult hr = reader.read(item.file->host(), r.source_offset, staging.data(), r.source_size);
-        return gdk::failed(hr) ? hr : deliver(item, staging.data(), r.source_size, scratch, intermediate);
+        return gdk::failed(hr) ? hr
+                               : deliver(item, staging.data(), r.source_size, scratch, intermediate,
+                                         batch_bcpack_tables.get());
     };
 
     size_t g = 0;
@@ -1394,7 +1402,8 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             for (size_t k = g; k < h; ++k) {
                 const Item& item = items[file_reads[k]];
                 results[file_reads[k]] = deliver(item, staging.data() + (item.req.source_offset - start),
-                                                 item.req.source_size, scratch, intermediate);
+                                                 item.req.source_size, scratch, intermediate,
+                                                 batch_bcpack_tables.get());
             }
         }
         g = h;
@@ -1407,7 +1416,6 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             trace_audio_request(items[i].file->path(), items[i].req, results[i], items[i].enqueued_ms);
         }
     }
-    reader.trim_buffers();
 }
 
 class DStorageFactory final : public com::ComObject {

@@ -1726,7 +1726,7 @@ void unmap_range_locked(XMemState& st, uint64_t base, uint64_t size) {
 // ===========================================================================
 
 struct DStorageGlobalState {
-    std::mutex mutex;
+    std::shared_mutex mutex;
     std::unordered_map<std::string, std::vector<uint8_t>> virtual_files;
     DStorageHostOpenCallback host_open_cb;
     DStorageHostReadCallback host_read_cb;
@@ -1750,11 +1750,15 @@ public:
     DStorageFileImpl(std::string normalized_path,
                      DStorageFileBackend backend,
                      uint64_t file_size,
-                     int32_t httpfs_handle = -1)
+                     int32_t httpfs_handle = -1,
+                     HttpfsMailboxClient* httpfs_client = nullptr,
+                     uint64_t httpfs_gen = 0)
         : path_(std::move(normalized_path)),
           backend_(backend),
           file_size_(file_size),
-          httpfs_handle_(httpfs_handle) {}
+          httpfs_handle_(httpfs_handle),
+          httpfs_client_(httpfs_client),
+          httpfs_gen_(httpfs_gen) {}
 
     ~DStorageFileImpl() override { Close(); }
 
@@ -1788,10 +1792,13 @@ public:
         }
         closed_ = true;
         if (backend_ == DStorageFileBackend::Httpfs && httpfs_handle_ >= 0) {
-            if (auto* client = win32::get_httpfs_client(); client != nullptr) {
-                client->close(httpfs_handle_);
+            if (httpfs_client_ != nullptr &&
+                win32::get_httpfs_client() == httpfs_client_ &&
+                win32::httpfs_client_generation() == httpfs_gen_) {
+                httpfs_client_->close(httpfs_handle_);
             }
             httpfs_handle_ = -1;
+            httpfs_client_ = nullptr;
         }
     }
 
@@ -1833,7 +1840,7 @@ public:
         switch (backend_) {
             case DStorageFileBackend::VirtualTable: {
                 auto& ds = dstorage_state();
-                std::lock_guard<std::mutex> glock(ds.mutex);
+                std::shared_lock<std::shared_mutex> glock(ds.mutex);
                 auto it = ds.virtual_files.find(path_);
                 if (it == ds.virtual_files.end()) {
                     return E_FILE_NOT_FOUND_HR;
@@ -1849,7 +1856,7 @@ public:
                 DStorageHostReadCallback read_cb;
                 {
                     auto& ds = dstorage_state();
-                    std::lock_guard<std::mutex> glock(ds.mutex);
+                    std::shared_lock<std::shared_mutex> glock(ds.mutex);
                     read_cb = ds.host_read_cb;
                 }
                 if (!read_cb) {
@@ -1865,11 +1872,12 @@ public:
                 return S_OK_HR;
             }
             case DStorageFileBackend::Httpfs: {
-                auto* client = win32::get_httpfs_client();
-                if (client == nullptr || httpfs_handle_ < 0) {
+                if (httpfs_client_ == nullptr || httpfs_handle_ < 0 ||
+                    win32::get_httpfs_client() != httpfs_client_ ||
+                    win32::httpfs_client_generation() != httpfs_gen_) {
                     return E_FAIL_HR;
                 }
-                const int64_t n = client->read(httpfs_handle_, offset, dst, size);
+                const int64_t n = httpfs_client_->read(httpfs_handle_, offset, dst, size);
                 if (n < 0) {
                     return E_FAIL_HR;
                 }
@@ -1900,6 +1908,8 @@ private:
     DStorageFileBackend backend_;
     uint64_t file_size_ = 0;
     int32_t httpfs_handle_ = -1;
+    HttpfsMailboxClient* httpfs_client_ = nullptr;
+    uint64_t httpfs_gen_ = 0;
     bool closed_ = false;
 };
 
@@ -2286,7 +2296,7 @@ public:
         // 1. In-memory virtual file table (highest priority).
         {
             auto& ds = dstorage_state();
-            std::lock_guard<std::mutex> lock(ds.mutex);
+            std::shared_lock<std::shared_mutex> lock(ds.mutex);
             auto it = ds.virtual_files.find(normalized);
             if (it != ds.virtual_files.end()) {
                 auto* file = new (std::nothrow) DStorageFileImpl(
@@ -2305,7 +2315,7 @@ public:
             DStorageHostReadCallback read_cb;
             {
                 auto& ds = dstorage_state();
-                std::lock_guard<std::mutex> lock(ds.mutex);
+                std::shared_lock<std::shared_mutex> lock(ds.mutex);
                 open_cb = ds.host_open_cb;
                 read_cb = ds.host_read_cb;
             }
@@ -2324,17 +2334,25 @@ public:
         }
 
         // 3. HTTPFS mailbox client.
-        if (auto* client = win32::get_httpfs_client(); client != nullptr) {
-            const int32_t handle = client->open(normalized);
-            if (handle >= 0) {
-                auto* file = new (std::nothrow)
-                    DStorageFileImpl(normalized, DStorageFileBackend::Httpfs, 0, handle);
-                if (file == nullptr) {
-                    client->close(handle);
-                    return E_OUTOFMEMORY_HR;
+        {
+            const uint64_t gen_before = win32::httpfs_client_generation();
+            auto* client = win32::get_httpfs_client();
+            const uint64_t gen_after = win32::httpfs_client_generation();
+            if (client != nullptr && (gen_before & 1u) == 0u && gen_before == gen_after) {
+                const int32_t handle = client->open(normalized);
+                if (handle >= 0) {
+                    if (win32::httpfs_client_generation() != gen_before) {
+                        return E_FILE_NOT_FOUND_HR;
+                    }
+                    auto* file = new (std::nothrow) DStorageFileImpl(
+                        normalized, DStorageFileBackend::Httpfs, 0, handle, client, gen_before);
+                    if (file == nullptr) {
+                        client->close(handle);
+                        return E_OUTOFMEMORY_HR;
+                    }
+                    *ppv = static_cast<Pg6IDStorageFile*>(file);
+                    return S_OK_HR;
                 }
-                *ppv = static_cast<Pg6IDStorageFile*>(file);
-                return S_OK_HR;
             }
         }
 
@@ -2383,14 +2401,14 @@ public:
             return E_INVALIDARG_HR;
         }
         auto& ds = dstorage_state();
-        std::lock_guard<std::mutex> lock(ds.mutex);
+        std::unique_lock<std::shared_mutex> lock(ds.mutex);
         ds.staging_buffer_size = size;
         return S_OK_HR;
     }
 
     uint32_t GetStagingBufferSize() const override {
         auto& ds = dstorage_state();
-        std::lock_guard<std::mutex> lock(ds.mutex);
+        std::shared_lock<std::shared_mutex> lock(ds.mutex);
         return ds.staging_buffer_size;
     }
 
@@ -3387,34 +3405,41 @@ void register_dstorage_virtual_file(std::string_view path, std::vector<uint8_t> 
         return;
     }
     auto& ds = dstorage_state();
-    std::lock_guard<std::mutex> lock(ds.mutex);
+    std::unique_lock<std::shared_mutex> lock(ds.mutex);
     ds.virtual_files[normalized] = std::move(data);
 }
 
 void unregister_dstorage_virtual_file(std::string_view path) {
     const std::string normalized = win32::normalize_path(path);
     auto& ds = dstorage_state();
-    std::lock_guard<std::mutex> lock(ds.mutex);
+    std::unique_lock<std::shared_mutex> lock(ds.mutex);
     ds.virtual_files.erase(normalized);
 }
 
 void clear_dstorage_virtual_files() {
     auto& ds = dstorage_state();
-    std::lock_guard<std::mutex> lock(ds.mutex);
+    std::unique_lock<std::shared_mutex> lock(ds.mutex);
     ds.virtual_files.clear();
 }
 
 void set_dstorage_host_callbacks(DStorageHostOpenCallback open_cb,
                                  DStorageHostReadCallback read_cb) {
     auto& ds = dstorage_state();
-    std::lock_guard<std::mutex> lock(ds.mutex);
+    std::unique_lock<std::shared_mutex> lock(ds.mutex);
     ds.host_open_cb = std::move(open_cb);
     ds.host_read_cb = std::move(read_cb);
 }
 
+Pg6HResult dstorage_file_read_at(Pg6IDStorageFile* file, uint64_t offset, void* dst, uint32_t size) {
+    if (file == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    return static_cast<DStorageFileImpl*>(file)->read_at(offset, dst, size);
+}
+
 void reset_dstorage_for_testing() {
     auto& ds = dstorage_state();
-    std::lock_guard<std::mutex> lock(ds.mutex);
+    std::unique_lock<std::shared_mutex> lock(ds.mutex);
     ds.virtual_files.clear();
     ds.host_open_cb = nullptr;
     ds.host_read_cb = nullptr;

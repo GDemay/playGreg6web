@@ -1599,6 +1599,42 @@ void test_o52_story_mode_saves_and_zero_leak() {
             cbk::async_shadow_end(init_blk);
             CHECK(prov::provider_handle_counts().save_providers == providers_before);
 
+            // Duplicate ReadBlobDataAsync on an already in-flight block must fail WITHOUT
+            // clobbering the live PendingRead entry!
+            const uint64_t live_names = fx.alloc(8);
+            CHECK(com::write_guest(live_names, blob_name));
+            const uint64_t live_blk = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 21, {c0, live_names, 1, live_blk})) == 0);
+            CHECK(hr32(fx.vcall(save, 21, {c0, names_arr, 1, live_blk})) == gdk::E_INVALIDARG_HR);
+            CHECK(dispatch(0) && dispatch(1));
+            const uint64_t live_buf = fx.alloc(256);
+            const uint64_t live_cnt = fx.alloc(4);
+            CHECK(hr32(fx.vcall(save, 22, {live_blk, 256, live_buf, live_cnt})) == 0);
+            uint32_t got_cnt = 0;
+            CHECK(com::read_guest(live_cnt, got_cnt) && got_cnt == 1);
+            CHECK(prov::provider_handle_counts().pending_save_reads == 0);
+
+            // XAsyncCancel on a Manual work-port XGameSave op completes immediately with E_ABORT
+            // without requiring the work port to be dispatched.
+            const uint64_t cancel_blk = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 21, {c0, live_names, 1, cancel_blk})) == 0);
+            fx.vcall(async_api, 5, {cancel_blk});  // XAsyncCancel (slot 5)
+            CHECK(hr32(fx.vcall(async_api, 3, {cancel_blk, 0})) == gdk::E_ABORT_HR);
+            CHECK(dispatch(1));  // completion port fires without dispatching work port
+            CHECK(prov::provider_handle_counts().pending_save_reads == 0);
+            CHECK(dispatch(0));  // draining stale work item is a clean no-op
+            cbk::async_shadow_end(cancel_blk);
+
+            const size_t providers_before_cancel = prov::provider_handle_counts().save_providers;
+            const uint64_t cancel_init = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(save, 4, {0x10, cfg, 0, cancel_init})) == 0);
+            fx.vcall(async_api, 5, {cancel_init});  // XAsyncCancel (slot 5)
+            CHECK(hr32(fx.vcall(async_api, 3, {cancel_init, 0})) == gdk::E_ABORT_HR);
+            CHECK(dispatch(1));
+            CHECK(dispatch(0));
+            cbk::async_shadow_end(cancel_init);
+            CHECK(prov::provider_handle_counts().save_providers == providers_before_cancel);
+
             fx.vcall(save, 17, {c0});
         }
 

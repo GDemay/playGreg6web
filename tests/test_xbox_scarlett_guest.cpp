@@ -3202,6 +3202,21 @@ void test_inflate_lz77_fast_paths() {
     CHECK(produced == b.expected.size());
     out.resize(produced);
     CHECK(out == b.expected);
+
+    // 5. Short streams with 1..15 byte payloads to exercise 56-bit refill, 32-bit fallback, and byte tail.
+    for (size_t n = 1; n <= 15; ++n) {
+        FixedDeflateBuilder sb;
+        for (size_t i = 0; i < n; ++i) {
+            sb.emit_lit(static_cast<uint8_t>(0x30u + i * 7u));
+        }
+        const std::vector<uint8_t> sz = sb.finish();
+        std::vector<uint8_t> sout(n + 8, 0xAA);
+        size_t sprod = 0;
+        CHECK(ga::inflate_stream(sz.data(), sz.size(), sout.data(), sout.size(), &sprod) == ga::InflateStatus::Ok);
+        CHECK(sprod == n);
+        sout.resize(sprod);
+        CHECK(sout == sb.expected);
+    }
 }
 
 // O48: multiple DirectStorage worker threads reading from the SAME IDStorageFile backed by a
