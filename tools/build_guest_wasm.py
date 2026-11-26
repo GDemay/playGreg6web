@@ -35,7 +35,7 @@ Pure Python 3.12 standard library only. Usable as a library and as a CLI:
         [--strip] [--no-link-opt] [--shrink-largest-shards N]
         [--wasm-exceptions] [--initial-memory SIZE] [--stack-size SIZE]
         [--assertions 0|1] [--browser-boot-exports] [--split-modules N]
-        [--split-strategy balanced|contiguous|asymmetric]
+        [--split-strategy balanced|contiguous|asymmetric|capped]
         [--max-side-module-mib MIB] [--proxy-to-pthread]
         [--max-concurrent-pthread-loads N] [--node-max-old-space-mb MB]
         [--pthread-pool-size N] [--extra-link-flag FLAG]
@@ -210,10 +210,12 @@ SIDE_MODULE_REQUIRED_EXPORT_NAMES: frozenset[str] = frozenset(
         "pg6_export_thunk_count",
     }
 )
-SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous", "asymmetric"})
+SPLIT_STRATEGIES: frozenset[str] = frozenset({"balanced", "contiguous", "asymmetric", "capped"})
 DEFAULT_SPLIT_STRATEGY = "balanced"
 # Proven Chrome two-part ceiling: pack part_0 up to ~994 MiB so part_1 lands near ~171 MiB.
 DEFAULT_MAX_SIDE_MODULE_MIB = 994
+# `capped` strategy: every part stays <= this (leaves ~124 MiB margin under the loader/V8 1024 MiB cap).
+DEFAULT_CAPPED_SIDE_MODULE_MIB = 900
 MAX_SIDE_MODULE_MIB_LIMIT = V8_MAX_WASM_MODULE_BYTES // (1024 * 1024)
 DEFAULT_SPLIT_NODE_MAX_OLD_SPACE_MB = 16384
 PROXY_TO_PTHREAD_FLAG = "-sPROXY_TO_PTHREAD=1"
@@ -1187,12 +1189,12 @@ def parse_split_modules(raw: int) -> int:
 def parse_split_strategy(raw: str) -> str:
     if not isinstance(raw, str):
         raise BuildGuestWasmError(
-            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', or 'asymmetric'"
+            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', 'asymmetric', or 'capped'"
         )
     token = raw.strip().lower()
     if token not in SPLIT_STRATEGIES:
         raise BuildGuestWasmError(
-            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', or 'asymmetric'"
+            f"invalid --split-strategy {raw!r}; expected 'balanced', 'contiguous', 'asymmetric', or 'capped'"
         )
     return token
 
@@ -1212,8 +1214,8 @@ def parse_max_side_module_mib(raw: int) -> int:
 
 
 def side_module_mode_for_strategy(strategy: str) -> int:
-    """Return 2 for asymmetric (pruned) side modules, else 1 (legacy default)."""
-    return 2 if parse_split_strategy(strategy) == "asymmetric" else 1
+    """Return 2 for asymmetric/capped (pruned) side modules, else 1 (legacy default)."""
+    return 2 if parse_split_strategy(strategy) in ("asymmetric", "capped") else 1
 
 
 def parse_node_max_old_space_mb(raw: int | None) -> int | None:
@@ -1956,6 +1958,57 @@ def partition_shards_asymmetric(
     return buckets
 
 
+def partition_shards_capped(
+    shard_items: Sequence[UnitBuildResult],
+    max_parts: int,
+    *,
+    max_bucket_bytes: int,
+) -> list[list[UnitBuildResult]]:
+    """Size-driven contiguous partition: the fewest parts whose every part is <= `max_bucket_bytes`.
+
+    N is auto-chosen (smallest k with exact minimax contiguous bound <= cap), then the shards are
+    split into k contiguous `unit_id`-ordered slices with minimum size variance
+    (`partition_shards_contiguous`), so parts are balanced rather than front-loaded. Fully
+    deterministic. Raises `BuildGuestWasmError` instead of ever returning an over-cap part.
+    """
+    limit = parse_split_modules(max_parts)
+    if isinstance(max_bucket_bytes, bool) or not isinstance(max_bucket_bytes, int) or max_bucket_bytes < 1:
+        raise BuildGuestWasmError(
+            f"invalid max_bucket_bytes {max_bucket_bytes!r}; expected a positive integer"
+        )
+    if not shard_items:
+        return []
+    ordered = sorted(shard_items, key=lambda item: item.unit.unit_id)
+    weights = [_partition_weight(item) for item in ordered]
+    mib = 1024 * 1024
+    biggest = max(range(len(weights)), key=lambda i: weights[i])
+    if weights[biggest] > max_bucket_bytes:
+        raise BuildGuestWasmError(
+            f"shard {ordered[biggest].unit.unit_id} alone is {weights[biggest] / mib:.1f} MiB, over the "
+            f"{max_bucket_bytes / mib:.1f} MiB per-part cap; shrink it (--shrink-largest-shards) or "
+            f"raise --max-side-module-mib (hard limit {MAX_SIDE_MODULE_MIB_LIMIT})"
+        )
+    total = sum(weights)
+    k = max(1, -(-total // max_bucket_bytes))
+    k = min(k, len(ordered))
+    while k < len(ordered) and _minimax_contiguous_bound(weights, k) > max_bucket_bytes:
+        k += 1
+    if k > limit:
+        raise BuildGuestWasmError(
+            f"guest code ({total / mib:.1f} MiB of objects) needs {k} parts of <= "
+            f"{max_bucket_bytes / mib:.1f} MiB but --split-modules allows only {limit}; "
+            f"raise --split-modules (parts are auto-sized, it is only an upper bound)"
+        )
+    buckets = partition_shards_contiguous(ordered, k)
+    worst = max(sum(_partition_weight(it) for it in b) for b in buckets)
+    if worst > max_bucket_bytes:
+        raise BuildGuestWasmError(
+            f"capped partition produced a {worst / mib:.1f} MiB part over the "
+            f"{max_bucket_bytes / mib:.1f} MiB cap"
+        )
+    return buckets
+
+
 def partition_shard_units(
     items: Sequence[UnitBuildResult],
     split_modules: int,
@@ -1987,6 +2040,16 @@ def partition_shard_units(
         return []
     if split_strat == "contiguous":
         return partition_shards_contiguous(shards, bucket_limit)
+    if split_strat == "capped":
+        return partition_shards_capped(
+            shards,
+            bucket_limit,
+            max_bucket_bytes=(
+                max_bucket_bytes
+                if max_bucket_bytes is not None
+                else DEFAULT_CAPPED_SIDE_MODULE_MIB * 1024 * 1024
+            ),
+        )
     if split_strat == "asymmetric":
         return partition_shards_asymmetric(
             shards,
@@ -4688,8 +4751,13 @@ def run_build(
     output_wasm = output_dir / RUNTIME_WASM
 
     if use_split:
+        capped_mib = (
+            DEFAULT_CAPPED_SIDE_MODULE_MIB
+            if split_strat == "capped" and max_side_mib == DEFAULT_MAX_SIDE_MODULE_MIB
+            else max_side_mib
+        )
         max_bucket_bytes = (
-            max_side_mib * 1024 * 1024 if split_strat == "asymmetric" else None
+            capped_mib * 1024 * 1024 if split_strat in ("asymmetric", "capped") else None
         )
         buckets = partition_shard_units(
             ordered,
@@ -4945,6 +5013,17 @@ def run_build(
                 module_name=side_result.name,
             )
             side_result.exceeds_v8_1gib_limit = side_exceeds
+            if (
+                split_strat == "capped"
+                and max_bucket_bytes is not None
+                and side_result.wasm_bytes > max_bucket_bytes
+            ):
+                report.ok = False
+                report.errors.append(
+                    f"{side_result.name} is {side_result.wasm_bytes / (1024 * 1024):.1f} MiB, over the "
+                    f"{max_bucket_bytes // (1024 * 1024)} MiB per-part cap (linked size exceeds the "
+                    f"object estimate); lower --max-side-module-mib to split into more parts"
+                )
             if side_warning is not None:
                 report.warnings.append(side_warning)
             any_exceeds = any_exceeds or side_exceeds
@@ -5100,7 +5179,7 @@ def format_report_text(report: BuildReport, *, sanitize: bool = False) -> str:
         )
         split_extra = (
             f", max_side={report.max_side_module_mib}MiB"
-            if report.split_strategy == "asymmetric"
+            if report.split_strategy in ("asymmetric", "capped")
             else ""
         )
         lines.append(
@@ -5343,13 +5422,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--split-strategy",
         default=DEFAULT_SPLIT_STRATEGY,
-        metavar="balanced|contiguous|asymmetric",
+        metavar="balanced|contiguous|asymmetric|capped",
         help=(
             "Shard bucketing strategy when --split-modules > 1: 'balanced' (default, greedy LPT "
             "size bin-packing), 'contiguous' (exact minimax contiguous partition in sorted "
             "unit_id / guest VA order), or 'asymmetric' (opt-in browser-proven contiguous pack "
             f"with part_0 capped at --max-side-module-mib / default {DEFAULT_MAX_SIDE_MODULE_MIB} "
-            f"MiB and {SIDE_MODULE_PRUNED_FLAG} export pruning)."
+            f"MiB and {SIDE_MODULE_PRUNED_FLAG} export pruning), or 'capped' (contiguous, parts "
+            f"auto-sized to <= {DEFAULT_CAPPED_SIDE_MODULE_MIB} MiB each and balanced; --split-modules "
+            "is only the upper bound; errors instead of emitting an over-cap part)."
         ),
     )
     parser.add_argument(
