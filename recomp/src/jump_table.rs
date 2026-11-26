@@ -40,12 +40,16 @@
 //! function as the jump (or, for code no `.pdata` range covers, by none). Anything else leaves the
 //! jump unresolved; nothing is guessed.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Instruction, InstructionInfoFactory, Mnemonic, OpAccess,
     OpKind, Register,
 };
 
-use crate::cfg::{JumpTable, JumpTableIndex, UnresolvedJump};
+use crate::cfg::{
+    BasicBlock, Edge, Function, JumpTable, JumpTableIndex, Terminator, UnresolvedJump,
+};
 use crate::code_image::CodeImage;
 
 /// Largest number of jump-table (or index-table) entries read for one dispatch.
@@ -178,6 +182,229 @@ struct Load {
     /// Bit width of `index` read at `index_at` (usually 64; 32 for 32-bit pre-scaling).
     index_width: u32,
 }
+
+/// Proven inclusive range of an index: either unsigned `[min, max]` or a bounded signed interval
+/// `[min, max]` (used to propagate negative-case switch ranges through `add`/`sub`/`inc`/`dec`/`lea`).
+#[derive(Debug, Clone, Copy)]
+enum RangeBound {
+    Unsigned(Bound),
+    Signed { min: i64, max: i64 },
+}
+
+/// Accumulated branch-guard facts on a single value.
+#[derive(Debug, Default, Clone)]
+struct GuardAccumulator {
+    unsigned_upper: Option<u64>,
+    unsigned_lower: u64,
+    signed_upper: Option<i64>,
+    signed_lower: Option<i64>,
+    excluded: Vec<u64>,
+}
+
+impl GuardAccumulator {
+    fn add(&mut self, fact: GuardFact, wmask: u64) {
+        match fact {
+            GuardFact::UnsignedUpper(u) => {
+                let u = u.min(wmask);
+                self.unsigned_upper = Some(self.unsigned_upper.map_or(u, |cur| cur.min(u)));
+            }
+            GuardFact::UnsignedLower(l) => {
+                self.unsigned_lower = self.unsigned_lower.max(l);
+            }
+            GuardFact::SignedUpper(su) => {
+                self.signed_upper = Some(self.signed_upper.map_or(su, |cur| cur.min(su)));
+            }
+            GuardFact::SignedLower(sl) => {
+                self.signed_lower = Some(self.signed_lower.map_or(sl, |cur| cur.max(sl)));
+            }
+            GuardFact::Equal(v) => {
+                let v = v.min(wmask);
+                self.unsigned_lower = self.unsigned_lower.max(v);
+                self.unsigned_upper = Some(self.unsigned_upper.map_or(v, |cur| cur.min(v)));
+            }
+            GuardFact::NotEqual(v) => {
+                if !self.excluded.contains(&v) && self.excluded.len() < MAX_EXCLUDED_VALUES {
+                    self.excluded.push(v);
+                }
+            }
+        }
+    }
+
+    fn resolve(mut self, def_b: Option<RangeBound>, width: u32) -> Option<RangeBound> {
+        if width == 0 || width > 64 {
+            return None;
+        }
+        let wmask = mask(width);
+        let smin = min_signed(width);
+        let smax = max_signed(width);
+
+        // When any signed bound is negative (or the defining range is signed), resolve via signed
+        // interval intersection so negative-case ranges like `[-4, 3]` survive into shifts.
+        let has_negative_signed = self.signed_lower.is_some_and(|sl| sl < 0)
+            || self.signed_upper.is_some_and(|su| su < 0)
+            || matches!(def_b, Some(RangeBound::Signed { .. }));
+
+        if !has_negative_signed {
+            let def_u = match def_b {
+                Some(RangeBound::Unsigned(b)) => Some(b),
+                _ => None,
+            };
+            let mut max_opt = self.unsigned_upper;
+            if let Some(su) = self.signed_upper {
+                let u = (su as u64).min(wmask);
+                max_opt = Some(max_opt.map_or(u, |cur| cur.min(u)));
+            }
+            let mut min = self.unsigned_lower;
+            if let Some(sl) = self.signed_lower
+                && sl > 0
+            {
+                min = min.max(sl as u64);
+            }
+
+            let (mut min, mut max, index) = match (def_u, max_opt) {
+                (Some(db), Some(gmax)) => (db.min.max(min), db.max.min(gmax), db.index),
+                (Some(db), None) => (db.min.max(min), db.max, db.index),
+                (None, Some(gmax)) => (min, gmax, None),
+                (None, None) => return None,
+            };
+
+            if min > max {
+                return None;
+            }
+            self.excluded.sort_unstable();
+            while self.excluded.binary_search(&max).is_ok() {
+                if max == min {
+                    return None;
+                }
+                max = max.checked_sub(1)?;
+            }
+            while self.excluded.binary_search(&min).is_ok() {
+                if min == max {
+                    return None;
+                }
+                min = min.checked_add(1)?;
+            }
+            if min > max {
+                return None;
+            }
+            return Some(RangeBound::Unsigned(Bound { min, max, index }));
+        }
+
+        // Signed interval resolution (handles negative lower/upper bounds and signed def ranges).
+        let mut lo_opt = self.signed_lower;
+        let mut hi_opt = self.signed_upper;
+        match def_b {
+            Some(RangeBound::Signed { min: d_lo, max: d_hi }) => {
+                lo_opt = Some(lo_opt.map_or(d_lo, |cur| cur.max(d_lo)));
+                hi_opt = Some(hi_opt.map_or(d_hi, |cur| cur.min(d_hi)));
+            }
+            Some(RangeBound::Unsigned(db)) => {
+                if db.index.is_some() {
+                    return None;
+                }
+                if db.max <= smax as u64 {
+                    let d_lo = db.min as i64;
+                    let d_hi = db.max as i64;
+                    lo_opt = Some(lo_opt.map_or(d_lo, |cur| cur.max(d_lo)));
+                    hi_opt = Some(hi_opt.map_or(d_hi, |cur| cur.min(d_hi)));
+                } else if db.min > smax as u64 && db.max <= wmask {
+                    let d_lo = sign_extend(db.min, width);
+                    let d_hi = sign_extend(db.max, width);
+                    lo_opt = Some(lo_opt.map_or(d_lo, |cur| cur.max(d_lo)));
+                    hi_opt = Some(hi_opt.map_or(d_hi, |cur| cur.min(d_hi)));
+                }
+            }
+            None => {}
+        }
+        if let Some(uu) = self.unsigned_upper
+            && uu <= smax as u64
+        {
+            lo_opt = Some(lo_opt.map_or(0, |cur| cur.max(0)));
+            hi_opt = Some(hi_opt.map_or(uu as i64, |cur| cur.min(uu as i64)));
+        }
+        if self.unsigned_lower > 0
+            && self.unsigned_lower <= smax as u64
+            && lo_opt.is_some_and(|l| l >= 0)
+        {
+            lo_opt = Some(lo_opt.unwrap_or(0).max(self.unsigned_lower as i64));
+        }
+
+        let (mut s_lo, mut s_hi) = (lo_opt?, hi_opt?);
+        if s_lo < smin || s_hi > smax || s_lo > s_hi {
+            return None;
+        }
+        let mut excl_s: Vec<i64> = self
+            .excluded
+            .iter()
+            .map(|&v| sign_extend(v, width))
+            .collect();
+        excl_s.sort_unstable();
+        while excl_s.binary_search(&s_hi).is_ok() {
+            if s_hi == s_lo {
+                return None;
+            }
+            s_hi = s_hi.checked_sub(1)?;
+        }
+        while excl_s.binary_search(&s_lo).is_ok() {
+            if s_lo == s_hi {
+                return None;
+            }
+            s_lo = s_lo.checked_add(1)?;
+        }
+        if s_lo > s_hi {
+            return None;
+        }
+        if s_lo >= 0 {
+            Some(RangeBound::Unsigned(Bound {
+                min: s_lo as u64,
+                max: s_hi as u64,
+                index: None,
+            }))
+        } else {
+            Some(RangeBound::Signed {
+                min: s_lo,
+                max: s_hi,
+            })
+        }
+    }
+}
+
+/// Key grouping guard facts that apply to the same offset-shifted ancestor SSA value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ShiftedGuardKey {
+    anc_reg: Register,
+    anc_def: Option<usize>,
+    anc_at: usize,
+    guard_delta: i128,
+    guard_bits: u32,
+    eff_bits: u32,
+    net_delta: i128,
+    sign_ext_32: bool,
+    zero_ext: bool,
+}
+
+enum AdaptedGuard {
+    Direct(GuardFact),
+    Shifted {
+        key: ShiftedGuardKey,
+        fact: GuardFact,
+    },
+}
+
+/// One node along a backward SSA copy/extension/offset chain from a register at a trace position.
+#[derive(Debug, Clone, Copy)]
+struct AliasNode {
+    reg: Register,
+    def: Option<usize>,
+    at: usize,
+    eff_bits: u32,
+    delta: i128,
+    sign_ext_32: bool,
+    zero_ext: bool,
+}
+
+/// Bound on distinct shifted-guard groups tracked during a single `range_bound` scan.
+const MAX_SHIFTED_GROUPS: usize = 8;
 
 /// Proven inclusive unsigned range `[min, max]` of an index.
 #[derive(Debug, Clone, Copy)]
@@ -315,6 +542,282 @@ pub(crate) fn resolve_in(
         inferred: false,
         alternates: Vec::new(),
     })
+}
+
+/// Maximum number of dominating blocks synthesized into a CFG-aware jump-table trace.
+#[cfg_attr(not(test), allow(dead_code))]
+const MAX_CFG_DOM_BLOCKS: usize = 64;
+
+/// Resolve the indirect jump at the end of `jmp_block` using CFG dominance and all-paths clobber
+/// verification, allowing multi-predecessor / diamond CFGs where the switch range check dominates
+/// `jmp_block` and holds along every path into it without any intervening arm clobbering the
+/// guarded index or table base.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resolve_in_cfg(
+    image: &CodeImage<'_>,
+    func: &Function,
+    jmp_block: u64,
+    leaf: Option<(u64, u64)>,
+) -> Option<JumpTable> {
+    let jmp_bb = func.blocks.get(&jmp_block)?;
+    if jmp_bb.terminator != Terminator::IndirectJump {
+        return None;
+    }
+    let last_jmp = jmp_bb.instructions.last()?;
+    if last_jmp.is_invalid() || last_jmp.flow_control() != FlowControl::IndirectBranch {
+        return None;
+    }
+
+    let dom_chain = func.dominator_chain(jmp_block);
+    if dom_chain.is_empty() {
+        return None;
+    }
+    let reachable: BTreeSet<u64> = func.reverse_postorder().into_iter().collect();
+    let preds = func.predecessors();
+
+    // Limit the dominating chain length and cut at any resume target (EH / longjmp can enter a
+    // resume target directly, bypassing dominating guards above it).
+    let mut start_idx = dom_chain.len().saturating_sub(MAX_CFG_DOM_BLOCKS);
+    let mut between_per_gap: Vec<BTreeSet<u64>> = Vec::with_capacity(dom_chain.len());
+    for i in 0..dom_chain.len().saturating_sub(1) {
+        let dom = dom_chain[i];
+        let next = dom_chain[i + 1];
+        let between = blocks_between(dom, next, &preds, &reachable);
+        if i >= start_idx
+            && (func.resume_targets.contains(&next)
+                || between.iter().any(|b| func.resume_targets.contains(b)))
+        {
+            start_idx = i + 1;
+        }
+        between_per_gap.push(between);
+    }
+
+    let mut info = InstructionInfoFactory::new();
+    let mut owned: Vec<(Instruction, Option<bool>)> = Vec::new();
+    for i in start_idx..dom_chain.len() {
+        let va = dom_chain[i];
+        let block = func.blocks.get(&va)?;
+        let is_last_dom = i + 1 == dom_chain.len();
+        let taken = if is_last_dom {
+            None
+        } else {
+            branch_direction(block, dom_chain[i + 1], &between_per_gap[i], func)
+        };
+        let last_instr = block.instructions.len().saturating_sub(1);
+        for (idx, &instr) in block.instructions.iter().enumerate() {
+            owned.push((instr, if idx == last_instr { taken } else { None }));
+        }
+        if !is_last_dom && !between_per_gap[i].is_empty() {
+            for barrier in collect_clobber_barriers(func, &between_per_gap[i], &mut info) {
+                owned.push((barrier, None));
+            }
+        }
+    }
+
+    let trace: Vec<Step<'_>> = owned
+        .iter()
+        .map(|(instr, taken)| Step {
+            instr,
+            taken: *taken,
+        })
+        .collect();
+    resolve_in(image, &trace, leaf)
+}
+
+/// All reachable blocks that can execute strictly between the last execution of `dom` and an
+/// execution of `target` (where `dom` dominates `target`). Includes `target` itself iff `target`
+/// can loop back to itself without passing through `dom`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn blocks_between(
+    dom: u64,
+    target: u64,
+    preds: &BTreeMap<u64, Vec<u64>>,
+    reachable: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut between = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    if let Some(target_preds) = preds.get(&target) {
+        for &p in target_preds {
+            if p != dom && reachable.contains(&p) && between.insert(p) {
+                queue.push_back(p);
+            }
+        }
+    }
+    while let Some(u) = queue.pop_front() {
+        if let Some(u_preds) = preds.get(&u) {
+            for &p in u_preds {
+                if p != dom && reachable.contains(&p) && between.insert(p) {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    between
+}
+
+/// Whether every intra-function path from `dom_block` to `target` takes the same direction out of
+/// `dom_block`'s conditional branch (`Some(true)` = taken, `Some(false)` = fallthrough, `None` =
+/// both directions can reach `target` or `dom_block` is not a conditional branch).
+#[cfg_attr(not(test), allow(dead_code))]
+fn branch_direction(
+    dom_block: &BasicBlock,
+    target: u64,
+    between: &BTreeSet<u64>,
+    func: &Function,
+) -> Option<bool> {
+    if dom_block.terminator != Terminator::Branch {
+        return None;
+    }
+    let mut taken_reaches = false;
+    let mut fall_reaches = false;
+    for &edge in &dom_block.successors {
+        match edge {
+            Edge::Taken(t) => {
+                if t == target || between.contains(&t) || !func.blocks.contains_key(&t) {
+                    taken_reaches = true;
+                }
+            }
+            Edge::Fallthrough(f) => {
+                if f == target || between.contains(&f) || !func.blocks.contains_key(&f) {
+                    fall_reaches = true;
+                }
+            }
+            Edge::TailCall(_) => {}
+            _ => return None,
+        }
+    }
+    match (taken_reaches, fall_reaches) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// All 16 64-bit general-purpose registers in deterministic order.
+#[cfg_attr(not(test), allow(dead_code))]
+const ALL_GPR64: [Register; 16] = [
+    Register::RAX,
+    Register::RCX,
+    Register::RDX,
+    Register::RBX,
+    Register::RSP,
+    Register::RBP,
+    Register::RSI,
+    Register::RDI,
+    Register::R8,
+    Register::R9,
+    Register::R10,
+    Register::R11,
+    Register::R12,
+    Register::R13,
+    Register::R14,
+    Register::R15,
+];
+
+/// Synthesize opaque clobber-barrier instructions for every GPR, memory write, and flag
+/// modification performed by any block in `between`, so the backward slicer rejects any value,
+/// table base, or guard that ANY intervening path could clobber.
+#[cfg_attr(not(test), allow(dead_code))]
+fn collect_clobber_barriers(
+    func: &Function,
+    between: &BTreeSet<u64>,
+    info: &mut InstructionInfoFactory,
+) -> Vec<Instruction> {
+    let mut clobbered_regs: BTreeSet<Register> = BTreeSet::new();
+    let mut clobbers_memory = false;
+    let mut clobbers_flags = false;
+
+    for &va in between {
+        let Some(block) = func.blocks.get(&va) else {
+            clobbered_regs.extend(ALL_GPR64);
+            clobbers_memory = true;
+            clobbers_flags = true;
+            break;
+        };
+        if block.terminator == Terminator::Invalid {
+            clobbered_regs.extend(ALL_GPR64);
+            clobbers_memory = true;
+            clobbers_flags = true;
+            break;
+        }
+        for instr in &block.instructions {
+            if matches!(
+                instr.flow_control(),
+                FlowControl::Call | FlowControl::IndirectCall
+            ) {
+                for reg in ALL_GPR64 {
+                    if !is_win64_nonvolatile(reg) {
+                        clobbered_regs.insert(reg);
+                    }
+                }
+                clobbers_memory = true;
+                clobbers_flags = true;
+                continue;
+            }
+            let ii = info.info(instr);
+            for used in ii.used_registers() {
+                if matches!(
+                    used.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                ) {
+                    let full = used.register().full_register();
+                    if full.is_gpr64() {
+                        clobbered_regs.insert(full);
+                    }
+                }
+            }
+            if ii.used_memory().iter().any(|m| {
+                matches!(
+                    m.access(),
+                    OpAccess::Write
+                        | OpAccess::CondWrite
+                        | OpAccess::ReadWrite
+                        | OpAccess::ReadCondWrite
+                )
+            }) {
+                clobbers_memory = true;
+            }
+            if instr.rflags_modified() != 0 {
+                clobbers_flags = true;
+            }
+        }
+    }
+
+    let mut barriers = Vec::with_capacity(
+        clobbered_regs.len() + usize::from(clobbers_memory) + usize::from(clobbers_flags),
+    );
+    for reg in clobbered_regs {
+        // `not r64`: writes only `reg` (`OpAccess::ReadWrite`), touches no memory or flags, and
+        // is opaque to every value/bound/alias rule in `Slicer`.
+        let num = reg.number() as u8;
+        let rex = 0x48 | ((num >> 3) & 1);
+        let modrm = 0xd0 | (num & 7);
+        let bytes = [rex, 0xf7, modrm];
+        let instr = Decoder::with_ip(64, &bytes, 0, DecoderOptions::NONE).decode();
+        if !instr.is_invalid() {
+            barriers.push(instr);
+        }
+    }
+    if clobbers_memory {
+        // `mov byte ptr [rsp], 0`: writes memory without modifying any GPR or rflags.
+        const MEM_BARRIER: [u8; 4] = [0xc6, 0x04, 0x24, 0x00];
+        let instr = Decoder::with_ip(64, &MEM_BARRIER, 0, DecoderOptions::NONE).decode();
+        if !instr.is_invalid() {
+            barriers.push(instr);
+        }
+    }
+    if clobbers_flags {
+        // `stc`: modifies rflags without modifying any GPR or memory.
+        const FLAGS_BARRIER: [u8; 1] = [0xf9];
+        let instr = Decoder::with_ip(64, &FLAGS_BARRIER, 0, DecoderOptions::NONE).decode();
+        if !instr.is_invalid() {
+            barriers.push(instr);
+        }
+    }
+    barriers
 }
 
 /// Why the indirect jump ending `trace` did not resolve (call only after [`resolve`] failed).
@@ -1057,6 +1560,10 @@ impl Slicer<'_, '_, '_, '_> {
         let reg = reg.full_register();
         let at = self.def(reg, before)?;
         let instr = self.trace[at].instr;
+        if instr.mnemonic() == Mnemonic::Cdqe {
+            let (orig, orig_at, orig_w, s) = self.scaled_index(Register::RAX, at, depth + 1)?;
+            return Some((orig, orig_at, orig_w.min(32), s));
+        }
         if instr.op_count() != 2 || instr.op0_kind() != OpKind::Register {
             return None;
         }
@@ -1071,10 +1578,33 @@ impl Slicer<'_, '_, '_, '_> {
             {
                 self.scaled_index(instr.op1_register(), at, depth + 1)
             }
+            (Mnemonic::Mov, OpKind::Register)
+                if dst.is_gpr32() && instr.op1_register().is_gpr32() =>
+            {
+                let (orig, orig_at, orig_w, s) =
+                    self.scaled_index(instr.op1_register(), at, depth + 1)?;
+                Some((orig, orig_at, orig_w.min(32), s))
+            }
+            (Mnemonic::Movsxd, OpKind::Register)
+                if dst.is_gpr64() && instr.op1_register().is_gpr32() =>
+            {
+                let (orig, orig_at, orig_w, s) =
+                    self.scaled_index(instr.op1_register(), at, depth + 1)?;
+                Some((orig, orig_at, orig_w.min(32), s))
+            }
             (Mnemonic::Shl, _) if instr.try_immediate(1).is_ok() => {
                 let shift = instr.try_immediate(1).ok()?;
                 if matches!(shift, 1..=3) {
-                    Some((dst.full_register(), at, width, 1u32 << shift))
+                    let factor = 1u32 << shift;
+                    if factor <= 4
+                        && let Some((orig, orig_at, orig_w, s)) =
+                            self.scaled_index(dst, at, depth + 1)
+                        && s.checked_mul(factor).is_some_and(|total| total <= 8)
+                    {
+                        Some((orig, orig_at, orig_w.min(width), s * factor))
+                    } else {
+                        Some((dst.full_register(), at, width, factor))
+                    }
                 } else {
                     None
                 }
@@ -1090,17 +1620,39 @@ impl Slicer<'_, '_, '_, '_> {
             }
             (Mnemonic::Lea, OpKind::Memory)
                 if !instr.is_ip_rel_memory_operand()
+                    && !matches!(instr.memory_segment(), Register::FS | Register::GS)
+                    && instr.memory_base().is_gpr64()
+                    && instr.memory_index() == instr.memory_base()
+                    && instr.memory_index_scale() == 1
+                    && instr.memory_displacement64() == 0 =>
+            {
+                let base = instr.memory_base();
+                if let Some((orig, orig_at, orig_w, s)) = self.scaled_index(base, at, depth + 1)
+                    && s <= 4
+                {
+                    Some((orig, orig_at, orig_w.min(width), s * 2))
+                } else {
+                    Some((base.full_register(), at, width, 2))
+                }
+            }
+            (Mnemonic::Lea, OpKind::Memory)
+                if !instr.is_ip_rel_memory_operand()
+                    && !matches!(instr.memory_segment(), Register::FS | Register::GS)
                     && instr.memory_base() == Register::None
                     && instr.memory_index().is_gpr64()
                     && instr.memory_displacement64() == 0
                     && matches!(instr.memory_index_scale(), 2 | 4 | 8) =>
             {
-                Some((
-                    instr.memory_index().full_register(),
-                    at,
-                    width,
-                    instr.memory_index_scale(),
-                ))
+                let idx = instr.memory_index();
+                let scale = instr.memory_index_scale();
+                if scale <= 4
+                    && let Some((orig, orig_at, orig_w, s)) = self.scaled_index(idx, at, depth + 1)
+                    && s.checked_mul(scale).is_some_and(|total| total <= 8)
+                {
+                    Some((orig, orig_at, orig_w.min(width), s * scale))
+                } else {
+                    Some((idx.full_register(), at, width, scale))
+                }
             }
             _ => None,
         }
@@ -1228,16 +1780,28 @@ impl Slicer<'_, '_, '_, '_> {
     /// Proven inclusive unsigned range `[min, max]` of the low `width` bits of the full register
     /// `reg` just before position `before` (`width == 64`: of the whole register).
     fn bound(&mut self, reg: Register, before: usize, width: u32, depth: u32) -> Option<Bound> {
+        match self.range_bound(reg, before, width, depth)? {
+            RangeBound::Unsigned(b) => Some(b),
+            RangeBound::Signed { .. } => None,
+        }
+    }
+
+    /// Proven inclusive unsigned or signed range of the low `width` bits of the full register
+    /// `reg` just before position `before`.
+    fn range_bound(
+        &mut self,
+        reg: Register,
+        before: usize,
+        width: u32,
+        depth: u32,
+    ) -> Option<RangeBound> {
         if depth > MAX_SLICE_DEPTH || width == 0 || width > 64 || !self.consume_step() {
             return None;
         }
         let reg = reg.full_register();
         let wmask = mask(width);
-        let mut unsigned_upper: Option<u64> = None;
-        let mut unsigned_lower: u64 = 0;
-        let mut signed_upper: Option<i64> = None;
-        let mut signed_lower: Option<i64> = None;
-        let mut excluded: Vec<u64> = Vec::new();
+        let mut acc = GuardAccumulator::default();
+        let mut shifted_groups: Vec<(ShiftedGuardKey, GuardAccumulator)> = Vec::new();
         let mut def_at: Option<usize> = None;
 
         for i in (0..before).rev() {
@@ -1248,123 +1812,237 @@ impl Slicer<'_, '_, '_, '_> {
             }
             if let Some(taken) = step.taken
                 && let Some(raw) = self.guard_at(i, taken)
-                && let Some(fact) = self.adapt_guard(reg, width, i, raw)
+                && let Some(adapted) = self.adapt_guard_ex(reg, width, i, raw)
             {
-                match fact {
-                    GuardFact::UnsignedUpper(u) => {
-                        let u = u.min(wmask);
-                        unsigned_upper = Some(unsigned_upper.map_or(u, |cur| cur.min(u)));
-                    }
-                    GuardFact::UnsignedLower(l) => {
-                        unsigned_lower = unsigned_lower.max(l);
-                    }
-                    GuardFact::SignedUpper(su) => {
-                        signed_upper = Some(signed_upper.map_or(su, |cur| cur.min(su)));
-                    }
-                    GuardFact::SignedLower(sl) => {
-                        signed_lower = Some(signed_lower.map_or(sl, |cur| cur.max(sl)));
-                    }
-                    GuardFact::Equal(v) => {
-                        let v = v.min(wmask);
-                        unsigned_lower = unsigned_lower.max(v);
-                        unsigned_upper = Some(unsigned_upper.map_or(v, |cur| cur.min(v)));
-                    }
-                    GuardFact::NotEqual(v) => {
-                        if !excluded.contains(&v) && excluded.len() < MAX_EXCLUDED_VALUES {
-                            excluded.push(v);
+                match adapted {
+                    AdaptedGuard::Direct(fact) => acc.add(fact, wmask),
+                    AdaptedGuard::Shifted { key, fact } => {
+                        let gmask = mask(key.guard_bits);
+                        if let Some((_, group)) =
+                            shifted_groups.iter_mut().find(|(k, _)| *k == key)
+                        {
+                            group.add(fact, gmask);
+                        } else if shifted_groups.len() < MAX_SHIFTED_GROUPS {
+                            let mut group = GuardAccumulator::default();
+                            group.add(fact, gmask);
+                            shifted_groups.push((key, group));
                         }
                     }
                 }
             }
         }
 
+        // Resolve any shifted guard groups (e.g. `lea eax, [rcx - 10]` guarded on `rcx`, or
+        // unshifted index guarded via `lea eax, [rcx - 10]; cmp eax, 5; ja default`) and fold
+        // them into the main accumulator.
+        for (key, group) in shifted_groups {
+            let pre = if key.guard_delta == 0 && key.anc_at < before {
+                self.range_bound(key.anc_reg, key.anc_at, key.guard_bits, depth + 1)
+            } else {
+                None
+            };
+            let Some(guard_range) = group.resolve(pre, key.guard_bits) else {
+                continue;
+            };
+            if key.guard_bits > key.eff_bits {
+                let fits = match guard_range {
+                    RangeBound::Unsigned(b) => b.max <= mask(key.eff_bits),
+                    RangeBound::Signed { min, max } => {
+                        min >= min_signed(key.eff_bits) && max <= max_signed(key.eff_bits)
+                    }
+                };
+                if !fits {
+                    continue;
+                }
+            }
+            let shift_out_width = if key.sign_ext_32 { 32 } else { width };
+            let Some(shifted) =
+                Self::shift_range(guard_range, key.net_delta, key.eff_bits, shift_out_width)
+            else {
+                continue;
+            };
+            let final_range = if key.sign_ext_32 {
+                let Some(ext) = Self::sign_extend_32_range(shifted, width) else {
+                    continue;
+                };
+                ext
+            } else if key.zero_ext && key.eff_bits < width {
+                let Some(ext) = Self::zero_extend_range(shifted, key.eff_bits, width) else {
+                    continue;
+                };
+                ext
+            } else {
+                shifted
+            };
+            match final_range {
+                RangeBound::Unsigned(b) => {
+                    acc.add(GuardFact::UnsignedLower(b.min), wmask);
+                    acc.add(GuardFact::UnsignedUpper(b.max), wmask);
+                }
+                RangeBound::Signed { min, max } => {
+                    acc.add(GuardFact::SignedLower(min), wmask);
+                    acc.add(GuardFact::SignedUpper(max), wmask);
+                }
+            }
+        }
+
         let def_b = def_at.and_then(|at| self.def_bound(at, width, depth));
-
-        let mut max_opt = unsigned_upper;
-        if let Some(su) = signed_upper {
-            if su < 0 {
-                return None;
-            }
-            if let Some(sl) = signed_lower
-                && sl < 0
-            {
-                return None;
-            }
-            let u = (su as u64).min(wmask);
-            max_opt = Some(max_opt.map_or(u, |cur| cur.min(u)));
-        }
-
-        let mut min = unsigned_lower;
-        if let Some(sl) = signed_lower
-            && sl > 0
-        {
-            min = min.max(sl as u64);
-        }
-
-        let (mut min, mut max, index) = match (def_b, max_opt) {
-            (Some(db), Some(gmax)) => (db.min.max(min), db.max.min(gmax), db.index),
-            (Some(db), None) => (db.min.max(min), db.max, db.index),
-            (None, Some(gmax)) => (min, gmax, None),
-            (None, None) => return None,
-        };
-
-        if min > max {
-            return None;
-        }
-        excluded.sort_unstable();
-        while excluded.binary_search(&max).is_ok() {
-            if max == min {
-                return None;
-            }
-            max = max.checked_sub(1)?;
-        }
-        while excluded.binary_search(&min).is_ok() {
-            if min == max {
-                return None;
-            }
-            min = min.checked_add(1)?;
-        }
-        if min > max {
-            return None;
-        }
-        Some(Bound { min, max, index })
+        acc.resolve(def_b, width)
     }
 
-    /// Shift a proven range `[min, max]` by signed `delta`, failing if it would wrap `eff_bits`
-    /// or `width`.
-    fn shift_bound(deeper: Bound, delta: i128, eff_bits: u32, width: u32) -> Option<Bound> {
-        if deeper.index.is_some() || eff_bits == 0 || width == 0 {
+    /// Propagate a 32-bit `RangeBound` through 32->64 sign extension (`movsxd`/`cdqe`).
+    fn sign_extend_32_range(deeper: RangeBound, width: u32) -> Option<RangeBound> {
+        match deeper {
+            RangeBound::Unsigned(b) => {
+                if width <= 32 || b.max < 0x8000_0000 {
+                    Some(RangeBound::Unsigned(b))
+                } else if b.index.is_none() && b.min >= 0x8000_0000 && b.max <= u64::from(u32::MAX)
+                {
+                    Some(RangeBound::Signed {
+                        min: i64::from(b.min as u32 as i32),
+                        max: i64::from(b.max as u32 as i32),
+                    })
+                } else {
+                    None
+                }
+            }
+            RangeBound::Signed { min, max } => {
+                if min < i64::from(i32::MIN) || max > i64::from(i32::MAX) || min > max {
+                    return None;
+                }
+                if min >= 0 {
+                    Some(RangeBound::Unsigned(Bound {
+                        min: min as u64,
+                        max: max as u64,
+                        index: None,
+                    }))
+                } else {
+                    Some(RangeBound::Signed { min, max })
+                }
+            }
+        }
+    }
+
+    /// Propagate an `eff_bits`-wide `RangeBound` through zero extension to `width` bits (e.g.
+    /// 32-bit GPR writes zeroing bits 32..63).
+    fn zero_extend_range(deeper: RangeBound, eff_bits: u32, width: u32) -> Option<RangeBound> {
+        if eff_bits == 0 || eff_bits > 64 || width == 0 || width > 64 {
             return None;
         }
-        let new_min = i128::from(deeper.min).checked_add(delta)?;
-        let new_max = i128::from(deeper.max).checked_add(delta)?;
-        let max_allowed = i128::from(mask(eff_bits.min(width)));
-        if new_min < 0 || new_min > new_max || new_max > max_allowed {
+        match deeper {
+            RangeBound::Unsigned(b) => Some(RangeBound::Unsigned(Bound {
+                min: b.min.min(mask(eff_bits)).min(mask(width)),
+                max: b.max.min(mask(eff_bits)).min(mask(width)),
+                index: b.index,
+            })),
+            RangeBound::Signed { min, max } => {
+                if width <= eff_bits {
+                    Some(RangeBound::Signed { min, max })
+                } else if min >= 0 {
+                    Some(RangeBound::Unsigned(Bound {
+                        min: min as u64,
+                        max: max as u64,
+                        index: None,
+                    }))
+                } else if max < 0 {
+                    // All values are negative in `eff_bits`; zero-extending maps them contiguously
+                    // to the top half of `[0, 2^eff_bits - 1]`.
+                    let m = mask(eff_bits);
+                    let lo = (min as u64) & m;
+                    let hi = (max as u64) & m;
+                    (lo <= hi && hi <= mask(width)).then_some(RangeBound::Unsigned(Bound {
+                        min: lo,
+                        max: hi,
+                        index: None,
+                    }))
+                } else {
+                    // Straddles zero: zero-extension splits the interval across `[0, max]` and
+                    // `[min + 2^eff_bits, 2^eff_bits - 1]`, no longer contiguous.
+                    None
+                }
+            }
+        }
+    }
+
+    /// Shift a proven range (unsigned or signed) by signed `delta` using wrap-free modular
+    /// arithmetic on `eff_bits`, returning either an unsigned range or (when `eff_bits >= width`)
+    /// a contiguous signed range.
+    fn shift_range(
+        deeper: RangeBound,
+        delta: i128,
+        eff_bits: u32,
+        width: u32,
+    ) -> Option<RangeBound> {
+        if eff_bits == 0 || eff_bits > 64 || width == 0 || width > 64 {
             return None;
         }
-        Some(Bound {
-            min: u64::try_from(new_min).ok()?,
-            max: u64::try_from(new_max).ok()?,
-            index: None,
-        })
+        let (lo, hi) = match deeper {
+            RangeBound::Unsigned(b) => {
+                if b.index.is_some() || b.min > b.max {
+                    return None;
+                }
+                (i128::from(b.min), i128::from(b.max))
+            }
+            RangeBound::Signed { min, max } => {
+                if min > max {
+                    return None;
+                }
+                (i128::from(min), i128::from(max))
+            }
+        };
+        let modulus = 1i128 << eff_bits;
+        let len = hi.checked_sub(lo)?;
+        if len < 0 || len >= modulus {
+            return None;
+        }
+        // 1) Wrap-free unsigned output on `eff_bits` (handles both `sub eax, min_case` on unsigned
+        //    `[min_case, max_case]` and `add eax, offset` / `sub eax, -offset` on signed ranges).
+        let y_lo = lo.checked_add(delta)?.rem_euclid(modulus);
+        let y_hi = y_lo.checked_add(len)?;
+        let max_out = i128::from(mask(eff_bits.min(width)));
+        if y_hi < modulus && y_hi <= max_out {
+            return Some(RangeBound::Unsigned(Bound {
+                min: u64::try_from(y_lo).ok()?,
+                max: u64::try_from(y_hi).ok()?,
+                index: None,
+            }));
+        }
+        // 2) Wrap-free signed output on `eff_bits` (only when not zero-extended to a wider query
+        //    width), allowing chained negative-offset shifts before reaching `[0, N]`.
+        if eff_bits >= width {
+            let half = 1i128 << (eff_bits - 1);
+            let s_lo = ((lo.checked_add(delta)?.checked_add(half)?).rem_euclid(modulus)) - half;
+            let s_hi = s_lo.checked_add(len)?;
+            if s_lo >= i128::from(min_signed(width)) && s_hi <= i128::from(max_signed(width)) {
+                if s_lo >= 0 {
+                    return Some(RangeBound::Unsigned(Bound {
+                        min: u64::try_from(s_lo).ok()?,
+                        max: u64::try_from(s_hi).ok()?,
+                        index: None,
+                    }));
+                }
+                return Some(RangeBound::Signed {
+                    min: i64::try_from(s_lo).ok()?,
+                    max: i64::try_from(s_hi).ok()?,
+                });
+            }
+        }
+        None
     }
 
     /// Bound of the register written by the instruction at `at`.
-    fn def_bound(&mut self, at: usize, width: u32, depth: u32) -> Option<Bound> {
+    fn def_bound(&mut self, at: usize, width: u32, depth: u32) -> Option<RangeBound> {
         let instr = self.trace.get(at)?.instr;
         let dst = instr.op0_register();
         let src = instr.op1_register();
         let src_is_reg = instr.op_count() == 2 && instr.op1_kind() == OpKind::Register;
-        let sign_extended = |bound: Bound| {
-            // Sign extension preserves an unsigned bound only below 2^31.
-            (width <= 32 || bound.max < 0x8000_0000).then_some(bound)
-        };
         match instr.mnemonic() {
             Mnemonic::Mov if src_is_reg && dst.is_gpr32() && src.is_gpr32() => {
-                self.bound(src, at, 32, depth + 1)
+                let deeper = self.range_bound(src, at, 32, depth + 1)?;
+                Self::zero_extend_range(deeper, 32, width)
             }
             Mnemonic::Mov if src_is_reg && dst.is_gpr64() && src.is_gpr64() => {
-                self.bound(src, at, width, depth + 1)
+                self.range_bound(src, at, width, depth + 1)
             }
             Mnemonic::Mov
                 if instr.op_count() == 2
@@ -1375,17 +2053,45 @@ impl Slicer<'_, '_, '_, '_> {
                     && !is_high_byte(dst) =>
             {
                 let load = self.table_load(at, 1, 1, depth)?;
-                self.index_table_from_load(load, 1, depth)
+                self.index_table_from_load(load, 1, false, width, depth)
+                    .map(RangeBound::Unsigned)
             }
-            // Index reloaded from a guarded memory slot (`mov eax, [rsp+0x30]`).
+            // 16-bit index table (`mov r16, word [base + idx*2 + disp]`).
             Mnemonic::Mov
                 if instr.op_count() == 2
                     && instr.op0_kind() == OpKind::Register
                     && instr.op1_kind() == OpKind::Memory
-                    && ((dst.is_gpr32() && instr.memory_size().size() == 4)
-                        || (dst.is_gpr64() && instr.memory_size().size() == 8)) =>
+                    && width <= 16
+                    && dst.is_gpr16() =>
             {
-                self.slot_bound(at, width)
+                let load = self.table_load(at, 1, 2, depth)?;
+                self.index_table_from_load(load, 2, false, width, depth)
+                    .map(RangeBound::Unsigned)
+            }
+            // 32-bit index table (`mov r32, dword [base + idx*4 + disp]`) or guarded memory slot.
+            Mnemonic::Mov
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && dst.is_gpr32()
+                    && instr.memory_size().size() == 4 =>
+            {
+                if let Some(load) = self.table_load(at, 1, 4, depth) {
+                    return self
+                        .index_table_from_load(load, 4, false, width, depth)
+                        .map(RangeBound::Unsigned);
+                }
+                self.slot_bound(at, width).map(RangeBound::Unsigned)
+            }
+            // 64-bit index reloaded from a guarded memory slot (`mov rax, [rsp+0x30]`).
+            Mnemonic::Mov
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && dst.is_gpr64()
+                    && instr.memory_size().size() == 8 =>
+            {
+                self.slot_bound(at, width).map(RangeBound::Unsigned)
             }
             Mnemonic::Mov
                 if instr.op_count() == 2
@@ -1398,11 +2104,11 @@ impl Slicer<'_, '_, '_, '_> {
             {
                 let dst_bits = dst.size() as u32 * 8;
                 let v = (instr.try_immediate(1).ok()? & mask(dst_bits)) & mask(width);
-                Some(Bound {
+                Some(RangeBound::Unsigned(Bound {
                     min: v,
                     max: v,
                     index: None,
-                })
+                }))
             }
             Mnemonic::Xor
                 if src_is_reg
@@ -1412,18 +2118,52 @@ impl Slicer<'_, '_, '_, '_> {
                         || dst.is_gpr64()
                         || (!is_high_byte(dst) && width <= dst.size() as u32 * 8)) =>
             {
-                Some(Bound {
+                Some(RangeBound::Unsigned(Bound {
                     min: 0,
                     max: 0,
                     index: None,
-                })
+                }))
             }
             Mnemonic::Movsxd if src_is_reg && dst.is_gpr64() && src.is_gpr32() => {
-                self.bound(src, at, 32, depth + 1).and_then(sign_extended)
+                let deeper = self.range_bound(src, at, 32, depth + 1)?;
+                Self::sign_extend_32_range(deeper, width)
             }
-            Mnemonic::Cdqe => self
-                .bound(Register::RAX, at, 32, depth + 1)
-                .and_then(sign_extended),
+            // 32-bit sign-extended index table (`movsxd r64, dword [base + idx*4 + disp]`) or
+            // guarded 32-bit stack slot.
+            Mnemonic::Movsxd
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && dst.is_gpr64()
+                    && instr.memory_size().size() == 4 =>
+            {
+                if let Some(load) = self.table_load(at, 1, 4, depth) {
+                    return self
+                        .index_table_from_load(load, 4, true, width, depth)
+                        .map(RangeBound::Unsigned);
+                }
+                let slot = self.slot_bound(at, 32)?;
+                Self::sign_extend_32_range(RangeBound::Unsigned(slot), width)
+            }
+            Mnemonic::Cdqe => {
+                let deeper = self.range_bound(Register::RAX, at, 32, depth + 1)?;
+                Self::sign_extend_32_range(deeper, width)
+            }
+            // 8-bit / 16-bit sign-extended index table (`movsx r32/r64, byte/word [base + idx*s + disp]`).
+            Mnemonic::Movsx
+                if instr.op_count() == 2
+                    && instr.op0_kind() == OpKind::Register
+                    && instr.op1_kind() == OpKind::Memory
+                    && matches!(instr.memory_size().size(), 1 | 2)
+                    && (dst.is_gpr32()
+                        || dst.is_gpr64()
+                        || (dst.is_gpr16() && instr.memory_size().size() == 1 && width <= 16)) =>
+            {
+                let elem = instr.memory_size().size() as u32;
+                let load = self.table_load(at, 1, elem, depth)?;
+                self.index_table_from_load(load, elem, true, width, depth)
+                    .map(RangeBound::Unsigned)
+            }
             Mnemonic::Movzx
                 if src_is_reg
                     && (src.is_gpr8() || src.is_gpr16())
@@ -1436,38 +2176,44 @@ impl Slicer<'_, '_, '_, '_> {
                     self.bound(src, at, bits, depth + 1)
                 };
                 match deeper {
-                    Some(b) => Some(Bound {
+                    Some(b) => Some(RangeBound::Unsigned(Bound {
                         min: b.min.min(mask(bits)),
                         max: b.max.min(mask(bits)),
                         index: b.index,
-                    }),
+                    })),
                     None => {
                         self.width_only = true;
-                        Some(Bound {
+                        Some(RangeBound::Unsigned(Bound {
                             min: 0,
                             max: mask(bits),
                             index: None,
-                        })
+                        }))
                     }
                 }
             }
             Mnemonic::Movzx
                 if instr.op1_kind() == OpKind::Memory
                     && matches!(instr.memory_size().size(), 1 | 2)
-                    && (dst.is_gpr32() || dst.is_gpr64()) =>
+                    && (dst.is_gpr32()
+                        || dst.is_gpr64()
+                        || (dst.is_gpr16() && instr.memory_size().size() == 1 && width <= 16)) =>
             {
                 let elem = instr.memory_size().size() as u32;
                 if let Some(load) = self.table_load(at, 1, elem, depth) {
-                    self.index_table_from_load(load, elem, depth)
-                } else if elem == 1 {
-                    self.width_only = true;
-                    Some(Bound {
-                        min: 0,
-                        max: 0xff,
-                        index: None,
-                    })
+                    self.index_table_from_load(load, elem, false, width, depth)
+                        .map(RangeBound::Unsigned)
                 } else {
-                    None
+                    let max = mask(elem * 8);
+                    if max <= mask(width) {
+                        self.width_only = true;
+                        Some(RangeBound::Unsigned(Bound {
+                            min: 0,
+                            max,
+                            index: None,
+                        }))
+                    } else {
+                        None
+                    }
                 }
             }
             // Power-of-2 or arbitrary bitmask bound (`and ecx, 7`, `and rcx, 0xf`, etc.).
@@ -1487,18 +2233,23 @@ impl Slicer<'_, '_, '_, '_> {
                 let max = deeper
                     .map_or(imm_mask, |b| b.max.min(imm_mask))
                     .min(mask(width));
-                Some(Bound {
+                Some(RangeBound::Unsigned(Bound {
                     min: 0,
                     max,
                     index: None,
-                })
+                }))
             }
             // Value-preserving `and r, r` / `or r, r` (often used to test sign/zero).
             Mnemonic::And | Mnemonic::Or
                 if src_is_reg && dst == src && (dst.is_gpr32() || dst.is_gpr64()) =>
             {
                 let eff_bits = if dst.is_gpr32() { 32 } else { width };
-                self.bound(dst, at, eff_bits, depth + 1)
+                let deeper = self.range_bound(dst, at, eff_bits, depth + 1)?;
+                if dst.is_gpr32() {
+                    Self::zero_extend_range(deeper, 32, width)
+                } else {
+                    Some(deeper)
+                }
             }
             // Logical right shift (`shr eax, 28` -> `0..=15`).
             Mnemonic::Shr
@@ -1533,11 +2284,11 @@ impl Slicer<'_, '_, '_, '_> {
                 if min == 0 && shift > 0 && max == mask(dst_bits) >> shift {
                     self.width_only = true;
                 }
-                Some(Bound {
+                Some(RangeBound::Unsigned(Bound {
                     min,
                     max,
                     index: None,
-                })
+                }))
             }
             // Case-offset shift: `sub r, imm` / `add r, imm` / `dec r` / `inc r`.
             Mnemonic::Sub | Mnemonic::Add
@@ -1548,13 +2299,14 @@ impl Slicer<'_, '_, '_, '_> {
             {
                 let eff_bits = if dst.is_gpr32() { 32 } else { width };
                 let imm = instr.try_immediate(1).ok()?;
+                let signed_imm = i128::from(sign_extend(imm, eff_bits));
                 let delta = if instr.mnemonic() == Mnemonic::Sub {
-                    -i128::from(imm & mask(eff_bits))
+                    -signed_imm
                 } else {
-                    i128::from(sign_extend(imm, eff_bits))
+                    signed_imm
                 };
-                let deeper = self.bound(dst, at, eff_bits, depth + 1)?;
-                Self::shift_bound(deeper, delta, eff_bits, width)
+                let deeper = self.range_bound(dst, at, eff_bits, depth + 1)?;
+                Self::shift_range(deeper, delta, eff_bits, width)
             }
             Mnemonic::Dec | Mnemonic::Inc
                 if instr.op_count() == 1
@@ -1567,8 +2319,8 @@ impl Slicer<'_, '_, '_, '_> {
                 } else {
                     1
                 };
-                let deeper = self.bound(dst, at, eff_bits, depth + 1)?;
-                Self::shift_bound(deeper, delta, eff_bits, width)
+                let deeper = self.range_bound(dst, at, eff_bits, depth + 1)?;
+                Self::shift_range(deeper, delta, eff_bits, width)
             }
             // `lea dst, [src + disp]` (copy or case-offset shift, e.g. `lea eax, [rcx - min_case]`).
             Mnemonic::Lea
@@ -1582,21 +2334,34 @@ impl Slicer<'_, '_, '_, '_> {
             {
                 let eff_bits = if dst.is_gpr32() { 32 } else { width };
                 let src_reg = instr.memory_base();
-                let disp = instr.memory_displacement64() as i64;
+                let disp = sign_extend(instr.memory_displacement64(), eff_bits);
+                let deeper = self.range_bound(src_reg, at, eff_bits, depth + 1)?;
                 if disp == 0 {
-                    self.bound(src_reg, at, eff_bits, depth + 1)
+                    if dst.is_gpr32() {
+                        Self::zero_extend_range(deeper, 32, width)
+                    } else {
+                        Some(deeper)
+                    }
                 } else {
-                    let deeper = self.bound(src_reg, at, eff_bits, depth + 1)?;
-                    Self::shift_bound(deeper, i128::from(disp), eff_bits, width)
+                    Self::shift_range(deeper, i128::from(disp), eff_bits, width)
                 }
             }
             _ => None,
         }
     }
 
-    /// Two-level dispatch: `movzx r, byte/word [base + index*element + index_rva]` from `load`.
-    fn index_table_from_load(&mut self, load: Load, element: u32, depth: u32) -> Option<Bound> {
-        if depth > MAX_SLICE_DEPTH || !self.consume_step() {
+    /// Two-level dispatch: 8-bit, 16-bit, or 32-bit unsigned (`mov`/`movzx`) or signed
+    /// (`movsx`/`movsxd`) index table read from `load`. Rejects signed tables immediately if ANY
+    /// entry in the bounded range is negative.
+    fn index_table_from_load(
+        &mut self,
+        load: Load,
+        element: u32,
+        signed: bool,
+        width: u32,
+        depth: u32,
+    ) -> Option<Bound> {
+        if depth > MAX_SLICE_DEPTH || width == 0 || width > 64 || !self.consume_step() {
             return None;
         }
         let load_site = self.trace.get(load.at)?.instr.ip();
@@ -1613,15 +2378,52 @@ impl Slicer<'_, '_, '_, '_> {
         let byte_len = count.checked_mul(elem)?;
         table_start.checked_add(byte_len)?;
         let bytes = read(self.image, table_start, byte_len)?;
-        let max = match element {
-            1 => u64::from(bytes.iter().copied().max()?),
-            2 => bytes
+        let max = match (element, signed) {
+            (1, false) => u64::from(bytes.iter().copied().max()?),
+            (1, true) => {
+                let mut m: u64 = 0;
+                for &b in bytes {
+                    let v = b as i8;
+                    if v < 0 {
+                        return None;
+                    }
+                    m = m.max(v as u64);
+                }
+                m
+            }
+            (2, false) => bytes
                 .chunks_exact(2)
                 .map(|c| u64::from(u16::from_le_bytes([c[0], c[1]])))
                 .max()?,
+            (2, true) => {
+                let mut m: u64 = 0;
+                for c in bytes.chunks_exact(2) {
+                    let v = i16::from_le_bytes([c[0], c[1]]);
+                    if v < 0 {
+                        return None;
+                    }
+                    m = m.max(v as u64);
+                }
+                m
+            }
+            (4, false) => bytes
+                .chunks_exact(4)
+                .map(|c| u64::from(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                .max()?,
+            (4, true) => {
+                let mut m: u64 = 0;
+                for c in bytes.chunks_exact(4) {
+                    let v = i32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                    if v < 0 {
+                        return None;
+                    }
+                    m = m.max(v as u64);
+                }
+                m
+            }
             _ => return None,
         };
-        if max >= MAX_JUMP_TABLE_ENTRIES {
+        if max >= MAX_JUMP_TABLE_ENTRIES || max > mask(width) {
             return None;
         }
         Some(Bound {
@@ -1877,72 +2679,44 @@ impl Slicer<'_, '_, '_, '_> {
         Some(fact)
     }
 
-    /// Adapt `raw` (proven at `branch_at`) to `(reg, width)`, following register copies and
-    /// extensions performed before `branch_at` when `reg` and `raw.reg` differ (e.g.
-    /// `movsxd rax, ecx; cmp ecx, N; ja default`).
-    fn adapt_guard(
+    /// Trace a register backwards from `start_pos` through copy, extension, and constant-offset
+    /// instructions (`mov`, `movsxd`, `cdqe`, `movzx`, `lea [src+disp]`, `add`/`sub`/`inc`/`dec`),
+    /// recording each ancestor's exact SSA identity `(full_reg, def_pos)` so live-span clobbers
+    /// are checked accurately per hop.
+    fn trace_alias_chain(
         &mut self,
-        reg: Register,
-        width: u32,
-        branch_at: usize,
-        raw: RawGuard,
-    ) -> Option<GuardFact> {
-        let mut cur_reg = reg.full_register();
-        let mut cur_width = width;
-        let mut cur_pos = branch_at;
+        start_reg: Register,
+        start_width: u32,
+        start_pos: usize,
+    ) -> Vec<AliasNode> {
+        let mut chain = Vec::with_capacity(MAX_ALIAS_DEPTH as usize + 1);
+        let mut cur_reg = start_reg.full_register();
+        let mut cur_width = start_width;
+        let mut cur_pos = start_pos;
+        let mut cur_delta: i128 = 0;
         let mut sign_ext_32 = false;
-        let target_full = raw.reg.full_register();
+        let mut zero_ext = false;
 
-        for _ in 0..=MAX_ALIAS_DEPTH {
+        let mut cur_def = self.def(cur_reg, cur_pos);
+        chain.push(AliasNode {
+            reg: cur_reg,
+            def: cur_def,
+            at: cur_pos,
+            eff_bits: cur_width,
+            delta: 0,
+            sign_ext_32: false,
+            zero_ext: false,
+        });
+
+        for _ in 0..MAX_ALIAS_DEPTH {
             if !self.consume_step() {
-                return None;
+                break;
             }
-            if cur_reg == target_full
-                && raw.bits < 32
-                && raw.bits < cur_width
-                && self.is_zero_above(cur_reg, cur_pos, raw.bits)
-            {
-                // `movzx eax, dl; cmp al, 0x28; ja default`: the bits above the compared byte are
-                // zero, so an unsigned fact about the byte holds for the whole register (a signed
-                // one does not: a "negative" byte is a large zero-extended value).
-                return match raw.fact {
-                    fact @ (GuardFact::UnsignedUpper(_)
-                    | GuardFact::UnsignedLower(_)
-                    | GuardFact::Equal(_)
-                    | GuardFact::NotEqual(_)) => Some(fact),
-                    _ => None,
-                };
-            }
-            if cur_reg == target_full {
-                let width_ok = raw.bits >= cur_width
-                    || (raw.bits == 32
-                        && cur_width == 64
-                        && self.is_zero_extended_32(cur_reg, cur_pos, 0));
-                if width_ok {
-                    if sign_ext_32 {
-                        return match raw.fact {
-                            GuardFact::UnsignedUpper(u) if u < 0x8000_0000 => {
-                                Some(GuardFact::UnsignedUpper(u))
-                            }
-                            GuardFact::UnsignedLower(l) if l < 0x8000_0000 => {
-                                Some(GuardFact::UnsignedLower(l))
-                            }
-                            GuardFact::Equal(v) if v < 0x8000_0000 => Some(GuardFact::Equal(v)),
-                            GuardFact::NotEqual(v) if v < 0x8000_0000 => {
-                                Some(GuardFact::NotEqual(v))
-                            }
-                            GuardFact::SignedUpper(su) => Some(GuardFact::SignedUpper(su)),
-                            GuardFact::SignedLower(sl) => Some(GuardFact::SignedLower(sl)),
-                            _ => None,
-                        };
-                    }
-                    return Some(raw.fact);
-                }
-            }
-
-            let def_at = self.def(cur_reg, cur_pos)?;
+            let Some(def_at) = cur_def else {
+                break;
+            };
             let instr = self.trace[def_at].instr;
-            let (next_reg, next_width, needs_sext) = match instr.mnemonic() {
+            let step = match instr.mnemonic() {
                 Mnemonic::Mov
                     if instr.op_count() == 2
                         && instr.op0_kind() == OpKind::Register
@@ -1950,11 +2724,15 @@ impl Slicer<'_, '_, '_, '_> {
                 {
                     let (dst, src) = (instr.op0_register(), instr.op1_register());
                     if dst.is_gpr64() && src.is_gpr64() {
-                        (src.full_register(), cur_width, false)
+                        Some((src.full_register(), cur_width, cur_delta, sign_ext_32, zero_ext))
                     } else if dst.is_gpr32() && src.is_gpr32() {
-                        (src.full_register(), cur_width.min(32), false)
+                        if cur_width > 32 {
+                            (cur_delta == 0).then(|| (src.full_register(), 32, 0, false, true))
+                        } else {
+                            Some((src.full_register(), cur_width, cur_delta, sign_ext_32, zero_ext))
+                        }
                     } else {
-                        return None;
+                        None
                     }
                 }
                 Mnemonic::Movsxd
@@ -1964,14 +2742,19 @@ impl Slicer<'_, '_, '_, '_> {
                         && instr.op0_register().is_gpr64()
                         && instr.op1_register().is_gpr32() =>
                 {
-                    (
-                        instr.op1_register().full_register(),
-                        cur_width.min(32),
-                        cur_width > 32,
-                    )
+                    let src = instr.op1_register().full_register();
+                    if cur_width > 32 {
+                        (cur_delta == 0).then_some((src, 32, 0, true, false))
+                    } else {
+                        Some((src, cur_width, cur_delta, sign_ext_32, zero_ext))
+                    }
                 }
                 Mnemonic::Cdqe if cur_reg == Register::RAX => {
-                    (Register::RAX, cur_width.min(32), cur_width > 32)
+                    if cur_width > 32 {
+                        (cur_delta == 0).then_some((Register::RAX, 32, 0, true, false))
+                    } else {
+                        Some((Register::RAX, cur_width, cur_delta, sign_ext_32, zero_ext))
+                    }
                 }
                 Mnemonic::Movzx
                     if instr.op_count() == 2
@@ -1981,11 +2764,14 @@ impl Slicer<'_, '_, '_, '_> {
                         && !is_high_byte(instr.op1_register()) =>
                 {
                     let src = instr.op1_register();
-                    (
-                        src.full_register(),
-                        cur_width.min(src.size() as u32 * 8),
-                        false,
-                    )
+                    let src_bits = src.size() as u32 * 8;
+                    if cur_delta == 0 && src_bits > 0 {
+                        let next_w = cur_width.min(src_bits);
+                        let zext = zero_ext || cur_width > src_bits;
+                        Some((src.full_register(), next_w, 0, false, zext))
+                    } else {
+                        None
+                    }
                 }
                 Mnemonic::Lea
                     if instr.op_count() == 2
@@ -1994,27 +2780,279 @@ impl Slicer<'_, '_, '_, '_> {
                         && !instr.is_ip_rel_memory_operand()
                         && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64())
                         && instr.memory_base().is_gpr64()
-                        && instr.memory_index() == Register::None
-                        && instr.memory_displacement64() == 0 =>
+                        && instr.memory_index() == Register::None =>
                 {
-                    let next_w = if instr.op0_register().is_gpr32() {
-                        cur_width.min(32)
+                    let dst = instr.op0_register();
+                    let base = instr.memory_base().full_register();
+                    let raw_disp = instr.memory_displacement64();
+                    if dst.is_gpr32() {
+                        if cur_width > 32 {
+                            if cur_delta == 0 {
+                                let d = i128::from(sign_extend(raw_disp, 32));
+                                Some((base, 32, d, false, true))
+                            } else {
+                                None
+                            }
+                        } else {
+                            let d = i128::from(sign_extend(raw_disp, cur_width));
+                            cur_delta
+                                .checked_add(d)
+                                .map(|nd| (base, cur_width, nd, sign_ext_32, zero_ext))
+                        }
                     } else {
-                        cur_width
-                    };
-                    (instr.memory_base().full_register(), next_w, false)
+                        let d = i128::from(sign_extend(raw_disp, cur_width));
+                        cur_delta
+                            .checked_add(d)
+                            .map(|nd| (base, cur_width, nd, sign_ext_32, zero_ext))
+                    }
                 }
-                _ => return None,
+                Mnemonic::Add | Mnemonic::Sub
+                    if instr.op_count() == 2
+                        && instr.op0_kind() == OpKind::Register
+                        && instr.try_immediate(1).is_ok()
+                        && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64()) =>
+                {
+                    let dst = instr.op0_register();
+                    let imm = instr.try_immediate(1).ok();
+                    imm.and_then(|imm| {
+                        let eff = if dst.is_gpr32() {
+                            cur_width.min(32)
+                        } else {
+                            cur_width
+                        };
+                        let signed_imm = i128::from(sign_extend(imm, eff));
+                        let step_d = if instr.mnemonic() == Mnemonic::Sub {
+                            -signed_imm
+                        } else {
+                            signed_imm
+                        };
+                        if dst.is_gpr32() && cur_width > 32 {
+                            (cur_delta == 0).then_some((dst.full_register(), 32, step_d, false, true))
+                        } else {
+                            cur_delta.checked_add(step_d).map(|nd| {
+                                (dst.full_register(), cur_width, nd, sign_ext_32, zero_ext)
+                            })
+                        }
+                    })
+                }
+                Mnemonic::Inc | Mnemonic::Dec
+                    if instr.op_count() == 1
+                        && instr.op0_kind() == OpKind::Register
+                        && (instr.op0_register().is_gpr32() || instr.op0_register().is_gpr64()) =>
+                {
+                    let dst = instr.op0_register();
+                    let step_d: i128 = if instr.mnemonic() == Mnemonic::Dec { -1 } else { 1 };
+                    if dst.is_gpr32() && cur_width > 32 {
+                        (cur_delta == 0).then_some((dst.full_register(), 32, step_d, false, true))
+                    } else {
+                        cur_delta.checked_add(step_d).map(|nd| {
+                            (dst.full_register(), cur_width, nd, sign_ext_32, zero_ext)
+                        })
+                    }
+                }
+                _ => None,
             };
-            if (def_at + 1..branch_at).any(|k| self.writes(self.trace[k].instr, next_reg)) {
-                return None;
-            }
+
+            let Some((next_reg, next_width, next_delta, next_sext, next_zext)) = step else {
+                break;
+            };
             cur_reg = next_reg;
             cur_width = next_width;
             cur_pos = def_at;
-            sign_ext_32 |= needs_sext;
+            cur_delta = next_delta;
+            sign_ext_32 = next_sext;
+            zero_ext = next_zext;
+            cur_def = self.def(cur_reg, cur_pos);
+            chain.push(AliasNode {
+                reg: cur_reg,
+                def: cur_def,
+                at: cur_pos,
+                eff_bits: cur_width,
+                delta: cur_delta,
+                sign_ext_32,
+                zero_ext,
+            });
         }
-        None
+        chain
+    }
+
+    /// Translate a guard fact on `V_guard = ext_g((V_anc + g.delta) mod 2^g.eff_bits)` back to
+    /// `(V_anc + g.delta) mod 2^g.eff_bits`.
+    fn unwrap_guard_ext(raw_fact: GuardFact, g: AliasNode) -> Option<GuardFact> {
+        if g.sign_ext_32 {
+            // `V_guard = sign_ext_32(x32)` (64-bit compare on a sign-extended 32-bit value).
+            return match raw_fact {
+                GuardFact::UnsignedUpper(u) if u < 0x8000_0000 => Some(GuardFact::UnsignedUpper(u)),
+                GuardFact::Equal(v) if v < 0x8000_0000 => Some(GuardFact::Equal(v)),
+                GuardFact::NotEqual(v) if v < 0x8000_0000 => Some(GuardFact::NotEqual(v)),
+                GuardFact::SignedUpper(su) => Some(GuardFact::SignedUpper(
+                    su.clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+                )),
+                GuardFact::SignedLower(sl) => Some(GuardFact::SignedLower(
+                    sl.clamp(i64::from(i32::MIN), i64::from(i32::MAX)),
+                )),
+                _ => None,
+            };
+        }
+        if g.zero_ext {
+            // `V_guard = zero_ext(x_narrow)` where `x_narrow` is `g.eff_bits` wide.
+            let m = mask(g.eff_bits);
+            return match raw_fact {
+                GuardFact::UnsignedUpper(u) => Some(GuardFact::UnsignedUpper(u.min(m))),
+                GuardFact::UnsignedLower(l) => (l <= m).then_some(GuardFact::UnsignedLower(l)),
+                GuardFact::Equal(v) => (v <= m).then_some(GuardFact::Equal(v)),
+                GuardFact::NotEqual(v) => (v <= m).then_some(GuardFact::NotEqual(v)),
+                GuardFact::SignedUpper(su) => {
+                    (su >= 0).then(|| GuardFact::UnsignedUpper((su as u64).min(m)))
+                }
+                GuardFact::SignedLower(sl) => {
+                    (sl > 0 && (sl as u64) <= m).then_some(GuardFact::UnsignedLower(sl as u64))
+                }
+            };
+        }
+        Some(raw_fact)
+    }
+
+    /// Translate a fact on `V_anc[0..q.eff_bits]` forward through `q`'s sign/zero extension to
+    /// the queried `(reg, width)`.
+    fn wrap_query_ext(fact: GuardFact, q: AliasNode, query_width: u32) -> Option<GuardFact> {
+        if q.sign_ext_32 {
+            return match fact {
+                GuardFact::UnsignedUpper(u) if u < 0x8000_0000 => Some(GuardFact::UnsignedUpper(u)),
+                GuardFact::UnsignedLower(l) if l < 0x8000_0000 => Some(GuardFact::UnsignedLower(l)),
+                GuardFact::Equal(v) if v < 0x8000_0000 => Some(GuardFact::Equal(v)),
+                GuardFact::NotEqual(v) if v < 0x8000_0000 => Some(GuardFact::NotEqual(v)),
+                GuardFact::SignedUpper(su) => Some(GuardFact::SignedUpper(su)),
+                GuardFact::SignedLower(sl) => Some(GuardFact::SignedLower(sl)),
+                _ => None,
+            };
+        }
+        if q.zero_ext && q.eff_bits < query_width {
+            // Zero extension of a byte/word (`q.eff_bits < 32`) turns negative signed values into
+            // large positive integers, so signed facts do not transfer.
+            if q.eff_bits < 32 {
+                return match fact {
+                    fact @ (GuardFact::UnsignedUpper(_)
+                    | GuardFact::UnsignedLower(_)
+                    | GuardFact::Equal(_)
+                    | GuardFact::NotEqual(_)) => Some(fact),
+                    _ => None,
+                };
+            }
+            // Zero extension of a 32-bit value to 64 bits preserves unsigned facts and non-negative
+            // signed facts, but negative 32-bit values become `0x8000_0000..=0xffff_ffff`.
+            return match fact {
+                GuardFact::SignedLower(sl) if sl < 0 => None,
+                GuardFact::SignedUpper(su) if su < 0 => None,
+                other => Some(other),
+            };
+        }
+        Some(fact)
+    }
+
+    /// Adapt `raw` (proven at `branch_at`) to `(reg, width)`, tracing BOTH the queried index
+    /// register and the guarded register backwards through SSA copy, extension, and constant-offset
+    /// chains with exact per-hop live-span clobber verification.
+    fn adapt_guard_ex(
+        &mut self,
+        reg: Register,
+        width: u32,
+        branch_at: usize,
+        raw: RawGuard,
+    ) -> Option<AdaptedGuard> {
+        let query_chain = self.trace_alias_chain(reg, width, branch_at);
+        let guard_chain = self.trace_alias_chain(raw.reg, raw.bits, branch_at);
+
+        let mut best_shifted: Option<(usize, AdaptedGuard)> = None;
+        let mut best_direct: Option<(usize, GuardFact)> = None;
+
+        for (qi, &q) in query_chain.iter().enumerate() {
+            for (gi, &g) in guard_chain.iter().enumerate() {
+                if q.reg != g.reg || q.def != g.def {
+                    continue;
+                }
+                let cost = qi + gi;
+                let Some(anc_fact) = Self::unwrap_guard_ext(raw.fact, g) else {
+                    continue;
+                };
+                let Some(net_delta) = q.delta.checked_sub(g.delta) else {
+                    continue;
+                };
+
+                if net_delta == 0 {
+                    // Direct alias match (same value modulo bit width / extension).
+                    let direct_fact = if g.eff_bits < 32
+                        && g.eff_bits < q.eff_bits
+                        && self.is_zero_above(q.reg, q.at, g.eff_bits)
+                    {
+                        match anc_fact {
+                            fact @ (GuardFact::UnsignedUpper(_)
+                            | GuardFact::UnsignedLower(_)
+                            | GuardFact::Equal(_)
+                            | GuardFact::NotEqual(_)) => Self::wrap_query_ext(fact, q, width),
+                            _ => None,
+                        }
+                    } else {
+                        let width_ok = g.eff_bits >= q.eff_bits
+                            || (g.eff_bits == 32
+                                && q.eff_bits == 64
+                                && self.is_zero_extended_32(q.reg, q.at, 0));
+                        if width_ok {
+                            Self::wrap_query_ext(anc_fact, q, width)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(fact) = direct_fact
+                        && best_direct.as_ref().is_none_or(|(c, _)| cost < *c)
+                    {
+                        best_direct = Some((cost, fact));
+                    }
+                } else {
+                    // Shifted match: `V_query[0..eff] = (V_guard[0..eff] + net_delta) mod 2^eff`.
+                    // Sound when `g.eff_bits == q.eff_bits`, or `g.eff_bits > q.eff_bits` with
+                    // `g.delta == 0` (the resolved guard interval is checked to fit `q.eff_bits`
+                    // without truncation before shifting), or `g.eff_bits == 32 && q.eff_bits == 64`
+                    // when `q.reg` is zero-extended 32-bit and `q.delta == 0`.
+                    let shift_width_ok = g.eff_bits == q.eff_bits
+                        || (g.eff_bits > q.eff_bits && g.delta == 0)
+                        || (g.eff_bits == 32
+                            && q.eff_bits == 64
+                            && q.delta == 0
+                            && self.is_zero_extended_32(q.reg, q.at, 0));
+                    if !shift_width_ok {
+                        continue;
+                    }
+                    let eff_bits = q.eff_bits.min(g.eff_bits);
+                    let key = ShiftedGuardKey {
+                        anc_reg: q.reg,
+                        anc_def: q.def,
+                        anc_at: q.at.min(g.at),
+                        guard_delta: g.delta,
+                        guard_bits: g.eff_bits,
+                        eff_bits,
+                        net_delta,
+                        sign_ext_32: q.sign_ext_32,
+                        zero_ext: q.zero_ext,
+                    };
+                    if best_shifted.as_ref().is_none_or(|(c, _)| cost < *c) {
+                        best_shifted = Some((
+                            cost,
+                            AdaptedGuard::Shifted {
+                                key,
+                                fact: anc_fact,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some((_, fact)) = best_direct {
+            Some(AdaptedGuard::Direct(fact))
+        } else {
+            best_shifted.map(|(_, adapted)| adapted)
+        }
     }
 }
 
@@ -4908,5 +5946,824 @@ mod tests {
         assert!(!analysis.jump_tables.contains_key(&jmp_va));
         let blocks = &analysis.functions[&TEXT].blocks;
         assert!(h.iter().all(|va| !blocks.contains_key(va)));
+    }
+
+    // ---- R72: diamond CFG guards, 8/16/32-bit index tables, negative offsets, scaled & sibling chains ----
+
+    /// Helper: build a synthetic `Function` with a diamond CFG
+    /// `B0 (cmp ecx, 3; ja default) -> B_split (test edx, edx; je B2) -> {B1, B2} -> B3 (jmp)`
+    /// by running `discover` on the assembled function, then calling `resolve_in_cfg` directly on
+    /// the merge block `B3`.
+    fn diamond_cfg_image_and_func<'a>(
+        code: &'a [u8],
+        data: &'a [u8],
+        ranges: &[(u32, u32, u32)],
+    ) -> (CodeImage<'a>, Function, u64) {
+        let mut image = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, code, true),
+                CodeSection::new(DATA, data, false),
+            ],
+            vec![TEXT],
+        );
+        image.function_table = FunctionTable::new(
+            ranges
+                .iter()
+                .map(|&(start, end, function)| FunctionRange {
+                    start: TEXT + u64::from(start),
+                    end: TEXT + u64::from(end),
+                    function: TEXT + u64::from(function),
+                })
+                .collect(),
+        );
+        let analysis = discover(&image);
+        let func = analysis.functions[&TEXT].clone();
+        let jmp_block = func
+            .blocks
+            .values()
+            .find(|b| b.terminator == Terminator::IndirectJump)
+            .expect("block ending in indirect jump")
+            .start;
+        (image, func, jmp_block)
+    }
+
+    #[test]
+    fn r72_resolve_in_cfg_handles_diamond_guards_and_rejects_clobbering_arms() {
+        use super::resolve_in_cfg;
+
+        // 1) Positive: diamond CFG where B0 guards `ecx <= 3` and loads table base `r12`,
+        //    B_split branches to {B1, B2} which only touch unrelated `r8`, merging into B3 (jmp).
+        let (code_ok, ips_ok) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            // B0: dominating guard + base setup
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            // B_split: diamond split
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            // B1: unrelated work
+            a.mov(r8d, 1)?;
+            a.jmp(b3)?;
+            // B2: unrelated work
+            a.set_label(&mut b2)?;
+            a.mov(r8d, 2)?;
+            // B3: multi-predecessor merge dispatch
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_ok = [ips_ok[0], ips_ok[1], ips_ok[2], ips_ok[3]];
+        let data_ok = rva_table(cases_ok.map(|va| (va - BASE) as u32));
+        let (img_ok, func_ok, jmp_blk_ok) =
+            diamond_cfg_image_and_func(&code_ok, &data_ok, &[(0, code_ok.len() as u32, 0)]);
+        assert_eq!(func_ok.predecessors_of(jmp_blk_ok).len(), 2);
+        let jt = resolve_in_cfg(&img_ok, &func_ok, jmp_blk_ok, None)
+            .expect("diamond CFG guard resolves via resolve_in_cfg");
+        assert!(!jt.inferred);
+        assert_eq!(jt.targets, cases_ok);
+
+        // 2) Negative: one arm (B1) clobbers the guarded index `ecx`.
+        let (code_clobber_idx, ips_ci) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            // B1 clobbers ecx!
+            a.mov(ecx, r9d)?;
+            a.jmp(b3)?;
+            a.set_label(&mut b2)?;
+            a.mov(r8d, 2)?;
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_ci = [ips_ci[0], ips_ci[1], ips_ci[2], ips_ci[3]];
+        let data_ci = rva_table(cases_ci.map(|va| (va - BASE) as u32));
+        // No .pdata so inference cannot mask a failed bound proof.
+        let (img_ci, func_ci, jmp_blk_ci) = diamond_cfg_image_and_func(&code_clobber_idx, &data_ci, &[]);
+        assert!(resolve_in_cfg(&img_ci, &func_ci, jmp_blk_ci, None).is_none());
+
+        // 3) Negative: one arm (B2) clobbers the table base `r12`.
+        let (code_clobber_base, ips_cb) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.mov(r8d, 1)?;
+            a.jmp(b3)?;
+            a.set_label(&mut b2)?;
+            // B2 clobbers table base r12!
+            a.mov(r12, r9)?;
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_cb = [ips_cb[0], ips_cb[1], ips_cb[2], ips_cb[3]];
+        let data_cb = rva_table(cases_cb.map(|va| (va - BASE) as u32));
+        let (img_cb, func_cb, jmp_blk_cb) =
+            diamond_cfg_image_and_func(&code_clobber_base, &data_cb, &[(0, code_clobber_base.len() as u32, 0)]);
+        assert!(resolve_in_cfg(&img_cb, &func_cb, jmp_blk_cb, None).is_none());
+
+        // 4) Negative: one arm calls a helper, clobbering volatile index `ecx`.
+        let (code_call_vol, ips_cv) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let mut helper = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.call(helper)?; // clobbers volatile ecx!
+            a.jmp(b3)?;
+            a.set_label(&mut b2)?;
+            a.nop()?;
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            a.set_label(&mut helper)?;
+            a.ret()?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_cv = [ips_cv[0], ips_cv[1], ips_cv[2], ips_cv[3]];
+        let data_cv = rva_table(cases_cv.map(|va| (va - BASE) as u32));
+        let (img_cv, func_cv, jmp_blk_cv) = diamond_cfg_image_and_func(&code_call_vol, &data_cv, &[]);
+        assert!(resolve_in_cfg(&img_cv, &func_cv, jmp_blk_cv, None).is_none());
+
+        // 5) Positive: one arm calls a helper, but both index (`ebx`) and base (`r12`) are Win64
+        //    non-volatile, so the guard and base survive across the call.
+        let (code_call_nv, ips_nv) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let mut helper = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ebx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.call(helper)?;
+            a.jmp(b3)?;
+            a.set_label(&mut b2)?;
+            a.nop()?;
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ebx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            a.set_label(&mut helper)?;
+            a.ret()?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases_nv = [ips_nv[0], ips_nv[1], ips_nv[2], ips_nv[3]];
+        let data_nv = rva_table(cases_nv.map(|va| (va - BASE) as u32));
+        let (img_nv, func_nv, jmp_blk_nv) = diamond_cfg_image_and_func(&code_call_nv, &data_nv, &[]);
+        let jt_nv = resolve_in_cfg(&img_nv, &func_nv, jmp_blk_nv, None)
+            .expect("non-volatile index and base survive diamond call");
+        assert!(!jt_nv.inferred);
+        assert_eq!(jt_nv.targets, cases_nv);
+
+        // 6) Negative: resume_target on the merge block invalidates dominating guards above it.
+        let mut func_resume = func_ok.clone();
+        func_resume.resume_targets.insert(jmp_blk_ok);
+        let img_no_pdata = CodeImage::new(
+            BASE,
+            vec![
+                CodeSection::new(TEXT, &code_ok, true),
+                CodeSection::new(DATA, &data_ok, false),
+            ],
+            vec![TEXT],
+        );
+        assert!(resolve_in_cfg(&img_no_pdata, &func_resume, jmp_blk_ok, None).is_none());
+    }
+
+    #[test]
+    fn r72_resolves_8_16_32_bit_unsigned_and_signed_index_tables_and_rejects_negatives() {
+        // 1) 16-bit `mov ax, word [base + idx*2 + disp]` + `movzx eax, ax` double-indirection.
+        let code_mov16 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 5)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ax, word_ptr(rdx + rax * 2 + (DATA_RVA + 0x20) as i32))?;
+            a.movzx(eax, ax)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_m16 = find_four_cases(&code_mov16);
+        let jmp_m16 = find_indirect_jmp(&code_mov16);
+        let mut data_m16 = rva_table(cases_m16[..3].iter().map(|va| (va - BASE) as u32));
+        data_m16.resize(0x20, 0xcc);
+        for idx in [0u16, 2, 1, 0, 2, 1] {
+            data_m16.extend_from_slice(&idx.to_le_bytes());
+        }
+        let an_m16 = analyze(&code_mov16, &data_m16, &[0], &[(0, code_mov16.len() as u32, 0)]);
+        let jt_m16 = an_m16.jump_tables.get(&jmp_m16).expect("mov r16 index table resolves");
+        assert!(!jt_m16.inferred);
+        assert_eq!(jt_m16.targets, cases_m16[..3]);
+        assert_eq!(jt_m16.index.expect("index metadata").len, 12);
+
+        // 2) 16-bit `movzx eax, word [rcx]` width-only fallback infers extent within `.pdata`.
+        let code_zx16_wo = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(eax, word_ptr(rcx))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_zx16 = find_four_cases(&code_zx16_wo);
+        let jmp_zx16 = find_indirect_jmp(&code_zx16_wo);
+        let mut data_zx16 = rva_table(cases_zx16.map(|va| (va - BASE) as u32));
+        data_zx16.extend_from_slice(&0u32.to_le_bytes()); // terminator outside function
+        let an_zx16 = analyze(
+            &code_zx16_wo,
+            &data_zx16,
+            &[0],
+            &[(0, code_zx16_wo.len() as u32, 0)],
+        );
+        let jt_zx16 = an_zx16
+            .jump_tables
+            .get(&jmp_zx16)
+            .expect("movzx word width-only infers extent inside .pdata");
+        assert!(jt_zx16.inferred);
+        assert_eq!(jt_zx16.targets, cases_zx16);
+
+        // 3) 32-bit `mov eax, dword [base + idx*4 + disp]` index table.
+        let code_mov32 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 4)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(eax, dword_ptr(rdx + rax * 4 + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_m32 = find_four_cases(&code_mov32);
+        let jmp_m32 = find_indirect_jmp(&code_mov32);
+        let mut data_m32 = rva_table(cases_m32[..3].iter().map(|va| (va - BASE) as u32));
+        data_m32.resize(0x20, 0xcc);
+        for idx in [0u32, 2, 1, 2, 0] {
+            data_m32.extend_from_slice(&idx.to_le_bytes());
+        }
+        let an_m32 = analyze(&code_mov32, &data_m32, &[0], &[(0, code_mov32.len() as u32, 0)]);
+        let jt_m32 = an_m32.jump_tables.get(&jmp_m32).expect("32-bit mov index table resolves");
+        assert!(!jt_m32.inferred);
+        assert_eq!(jt_m32.targets, cases_m32[..3]);
+        assert_eq!(jt_m32.index.expect("index metadata").len, 20);
+
+        // 4) 32-bit `movsxd rax, dword [base + idx*4 + disp]` (positive + negative rejection).
+        let code_sxd32 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsxd(rax, dword_ptr(rdx + rax * 4 + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_s32 = find_four_cases(&code_sxd32);
+        let jmp_s32 = find_indirect_jmp(&code_sxd32);
+        let mut data_s32_ok = rva_table(cases_s32[..3].iter().map(|va| (va - BASE) as u32));
+        data_s32_ok.resize(0x20, 0xcc);
+        for idx in [0i32, 1, 2, 0] {
+            data_s32_ok.extend_from_slice(&idx.to_le_bytes());
+        }
+        let an_s32_ok = analyze(&code_sxd32, &data_s32_ok, &[0], &[]);
+        let jt_s32 = an_s32_ok.jump_tables.get(&jmp_s32).expect("movsxd 32-bit index table resolves");
+        assert!(!jt_s32.inferred);
+        assert_eq!(jt_s32.targets, cases_s32[..3]);
+        assert_eq!(jt_s32.index.expect("index metadata").len, 16);
+
+        let mut data_s32_neg = rva_table(cases_s32[..3].iter().map(|va| (va - BASE) as u32));
+        data_s32_neg.resize(0x20, 0xcc);
+        for idx in [0i32, -1, 2, 0] {
+            data_s32_neg.extend_from_slice(&idx.to_le_bytes());
+        }
+        assert_unresolved(&analyze(&code_sxd32, &data_s32_neg, &[0], &[]), (jmp_s32 - TEXT) as u32);
+
+        // 5) 8-bit `movsx eax, byte [base + idx + disp]` and 16-bit `movsx rax, word [base + idx*2 + disp]`.
+        let code_sx8 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsx(eax, byte_ptr(rdx + rax + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sx8 = find_four_cases(&code_sx8);
+        let jmp_sx8 = find_indirect_jmp(&code_sx8);
+        let mut data_sx8_ok = rva_table(cases_sx8[..3].iter().map(|va| (va - BASE) as u32));
+        data_sx8_ok.resize(0x20, 0xcc);
+        data_sx8_ok.extend_from_slice(&[0u8, 2, 1, 0]);
+        let an_sx8 = analyze(&code_sx8, &data_sx8_ok, &[0], &[]);
+        assert_eq!(an_sx8.jump_tables[&jmp_sx8].targets, cases_sx8[..3]);
+        assert_eq!(an_sx8.jump_tables[&jmp_sx8].index.expect("idx").len, 4);
+
+        let mut data_sx8_neg = rva_table(cases_sx8[..3].iter().map(|va| (va - BASE) as u32));
+        data_sx8_neg.resize(0x20, 0xcc);
+        data_sx8_neg.extend_from_slice(&[0u8, 0xff, 1, 0]); // -1i8 must be rejected!
+        assert_unresolved(&analyze(&code_sx8, &data_sx8_neg, &[0], &[]), (jmp_sx8 - TEXT) as u32);
+
+        let code_sx16 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.movsx(rax, word_ptr(rdx + rax * 2 + (DATA_RVA + 0x20) as i32))?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sx16 = find_four_cases(&code_sx16);
+        let jmp_sx16 = find_indirect_jmp(&code_sx16);
+        let mut data_sx16_ok = rva_table(cases_sx16[..3].iter().map(|va| (va - BASE) as u32));
+        data_sx16_ok.resize(0x20, 0xcc);
+        for idx in [0i16, 1, 2, 1] {
+            data_sx16_ok.extend_from_slice(&idx.to_le_bytes());
+        }
+        let an_sx16 = analyze(&code_sx16, &data_sx16_ok, &[0], &[]);
+        assert_eq!(an_sx16.jump_tables[&jmp_sx16].targets, cases_sx16[..3]);
+        assert_eq!(an_sx16.jump_tables[&jmp_sx16].index.expect("idx").len, 8);
+
+        let mut data_sx16_neg = rva_table(cases_sx16[..3].iter().map(|va| (va - BASE) as u32));
+        data_sx16_neg.resize(0x20, 0xcc);
+        for idx in [0i16, -2, 2, 1] {
+            data_sx16_neg.extend_from_slice(&idx.to_le_bytes());
+        }
+        assert_unresolved(&analyze(&code_sx16, &data_sx16_neg, &[0], &[]), (jmp_sx16 - TEXT) as u32);
+    }
+
+    #[test]
+    fn r72_resolves_negative_case_offsets_lea_and_sub_negative_imm() {
+        // 1) Signed range `[-4, 3]` shifted by `add ecx, 4` -> `[0, 7]`.
+        let code_add = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, -4)?;
+            a.jl(def)?;
+            a.cmp(ecx, 3)?;
+            a.jg(def)?;
+            a.add(ecx, 4)?;
+            a.movsxd(rax, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_add = find_four_cases(&code_add);
+        let jmp_add = find_indirect_jmp(&code_add);
+        let eight_targets: Vec<u64> = (0..8).map(|i| cases_add[i % 4]).collect();
+        let data_add = rva_table(eight_targets.iter().map(|&va| (va - BASE) as u32));
+        let an_add = analyze(&code_add, &data_add, &[0], &[]);
+        let jt_add = an_add.jump_tables.get(&jmp_add).expect("negative range + add resolves");
+        assert!(!jt_add.inferred);
+        assert_eq!(jt_add.targets, eight_targets);
+
+        // 2) Signed range `[-4, 3]` shifted by `sub eax, -4` (sign-extended negative imm8 `83 e8 fc`).
+        let code_sub_neg = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(eax, -4)?;
+            a.jl(def)?;
+            a.cmp(eax, 3)?;
+            a.jg(def)?;
+            a.sub(eax, -4)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sn = find_four_cases(&code_sub_neg);
+        let jmp_sn = find_indirect_jmp(&code_sub_neg);
+        let targets_sn: Vec<u64> = (0..8).map(|i| cases_sn[i % 4]).collect();
+        let data_sn = rva_table(targets_sn.iter().map(|&va| (va - BASE) as u32));
+        let an_sn = analyze(&code_sub_neg, &data_sn, &[0], &[]);
+        let jt_sn = an_sn.jump_tables.get(&jmp_sn).expect("sub eax, -4 resolves");
+        assert!(!jt_sn.inferred);
+        assert_eq!(jt_sn.targets, targets_sn);
+
+        // 3) `lea eax, [rcx - 10]` scheduled BEFORE 64-bit `cmp rcx, 10; jb def; cmp rcx, 15; ja def`.
+        let code_lea_pre = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.lea(eax, ptr(rcx - 10))?;
+            a.cmp(rcx, 10)?;
+            a.jb(def)?;
+            a.cmp(rcx, 15)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_lp = find_four_cases(&code_lea_pre);
+        let jmp_lp = find_indirect_jmp(&code_lea_pre);
+        let targets_lp: Vec<u64> = (0..6).map(|i| cases_lp[i % 4]).collect();
+        let data_lp = rva_table(targets_lp.iter().map(|&va| (va - BASE) as u32));
+        let an_lp = analyze(&code_lea_pre, &data_lp, &[0], &[]);
+        let jt_lp = an_lp.jump_tables.get(&jmp_lp).expect("lea before cmp rcx range resolves");
+        assert!(!jt_lp.inferred);
+        assert_eq!(jt_lp.targets, targets_lp);
+
+        // 4) Negative: `lea eax, [rcx - 10]` with ONLY upper bound `cmp rcx, 15; ja def` (missing lower bound!).
+        let code_lea_unsafe = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.lea(eax, ptr(rcx - 10))?;
+            a.cmp(rcx, 15)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_lu = find_four_cases(&code_lea_unsafe);
+        let jmp_lu = (find_indirect_jmp(&code_lea_unsafe) - TEXT) as u32;
+        let data_lu = rva_table((0..6).map(|i| (cases_lu[i % 4] - BASE) as u32));
+        assert_unresolved(&analyze(&code_lea_unsafe, &data_lu, &[0], &[]), jmp_lu);
+
+        // 5) Guard on shifted register (`lea eax, [rcx - 10]; cmp eax, 3; ja def`), table indexed
+        //    via another shifted copy (`lea r8d, [rcx - 10]`) or `sub eax, 10; mov r8d, eax; cmp eax, 3; ja def`.
+        let code_sub_copy = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.sub(eax, 10)?;
+            a.mov(r8d, eax)?;
+            a.cmp(eax, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + r8 * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sc = find_four_cases(&code_sub_copy);
+        let jmp_sc = find_indirect_jmp(&code_sub_copy);
+        let data_sc = rva_table(cases_sc.map(|va| (va - BASE) as u32));
+        let an_sc = analyze(&code_sub_copy, &data_sc, &[0], &[]);
+        assert_eq!(an_sc.jump_tables[&jmp_sc].targets, cases_sc);
+    }
+
+    #[test]
+    fn r72_resolves_scaled_index_lea_doubling_and_32bit_copies() {
+        // 1) Chained `lea rax, [rcx + rcx]; lea rax, [rax + rax]` (x4) + `mov ecx, [rdx + rax + table]`.
+        let code_lea_x4 = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            a.movsxd(rcx, ecx)?;
+            a.lea(rax, ptr(rcx + rcx))?;
+            a.lea(rax, ptr(rax + rax))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_lx4 = find_four_cases(&code_lea_x4);
+        let jmp_lx4 = find_indirect_jmp(&code_lea_x4);
+        let data_lx4 = rva_table(cases_lx4.map(|va| (va - BASE) as u32));
+        let an_lx4 = analyze(&code_lea_x4, &data_lx4, &[0], &[]);
+        let jt_lx4 = an_lx4.jump_tables.get(&jmp_lx4).expect("lea [r+r] x4 resolves");
+        assert!(!jt_lx4.inferred);
+        assert_eq!(jt_lx4.targets, cases_lx4);
+
+        // 2) 32-bit `shl eax, 2; mov r8d, eax` and `shl eax, 2; movsxd r8, eax` in `scaled_index`.
+        for use_movsxd in [false, true] {
+            let code = assemble_at_text(|a| {
+                let (mut c0, mut c1, mut c2, mut def) = (
+                    a.create_label(),
+                    a.create_label(),
+                    a.create_label(),
+                    a.create_label(),
+                );
+                a.cmp(eax, 3)?;
+                a.ja(def)?;
+                a.shl(eax, 2)?;
+                if use_movsxd {
+                    a.movsxd(r8, eax)?;
+                } else {
+                    a.mov(r8d, eax)?;
+                }
+                lea_rip(a, Register::RDX, BASE)?;
+                a.mov(ecx, dword_ptr(rdx + r8 + DATA_RVA as i32))?;
+                a.add(rcx, rdx)?;
+                a.jmp(rcx)?;
+                emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+            });
+            let cases = find_four_cases(&code);
+            let jmp = find_indirect_jmp(&code);
+            let data = rva_table(cases.map(|va| (va - BASE) as u32));
+            let an = analyze(&code, &data, &[0], &[]);
+            let jt = an.jump_tables.get(&jmp).expect("32-bit scaled_index copy resolves");
+            assert!(!jt.inferred);
+            assert_eq!(jt.targets, cases);
+        }
+    }
+
+    #[test]
+    fn r72_sibling_copy_chains_and_live_span_clobber_soundness() {
+        // 1) Guard on a copy while the table uses the original (`mov eax, ecx; mov r8, [rsi]; cmp eax, 3; ja def; movsxd rdx, ecx`).
+        let code_guard_copy = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(eax, ecx)?;
+            a.mov(r8, qword_ptr(rsi))?;
+            a.cmp(eax, 3)?;
+            a.ja(def)?;
+            a.movsxd(r9, ecx)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + r9 * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_gc = find_four_cases(&code_guard_copy);
+        let jmp_gc = find_indirect_jmp(&code_guard_copy);
+        let data_gc = rva_table(cases_gc.map(|va| (va - BASE) as u32));
+        let an_gc = analyze(&code_guard_copy, &data_gc, &[0], &[]);
+        assert_eq!(an_gc.jump_tables[&jmp_gc].targets, cases_gc);
+
+        // 2) Sibling copy when the common source is LATER clobbered:
+        //    `mov eax, ecx; mov r9d, ecx; mov ecx, [rdi]; cmp r9d, 3; ja def; ... [rdx + rax*4]`.
+        let code_sibling_ok = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(eax, ecx)?;
+            a.mov(r9d, ecx)?;
+            a.mov(ecx, dword_ptr(rdi))?; // clobbers common source AFTER both copies
+            a.mov(r8, qword_ptr(rsi))?;
+            a.cmp(r9d, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sok = find_four_cases(&code_sibling_ok);
+        let jmp_sok = find_indirect_jmp(&code_sibling_ok);
+        let data_sok = rva_table(cases_sok.map(|va| (va - BASE) as u32));
+        let an_sok = analyze(&code_sibling_ok, &data_sok, &[0], &[]);
+        let jt_sok = an_sok.jump_tables.get(&jmp_sok).expect("sibling copy resolves");
+        assert!(!jt_sok.inferred);
+        assert_eq!(jt_sok.targets, cases_sok);
+
+        // 3) Negative: common source clobbered BETWEEN the two sibling copies -> MUST BE REJECTED!
+        let code_sibling_bad = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.mov(eax, ecx)?;
+            a.mov(ecx, dword_ptr(rdi))?; // clobbers ecx BEFORE second copy!
+            a.mov(r9d, ecx)?;
+            a.cmp(r9d, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_sbad = find_four_cases(&code_sibling_bad);
+        let jmp_sbad = (find_indirect_jmp(&code_sibling_bad) - TEXT) as u32;
+        let data_sbad = rva_table(cases_sbad.map(|va| (va - BASE) as u32));
+        assert_unresolved(&analyze(&code_sibling_bad, &data_sbad, &[0], &[]), jmp_sbad);
+    }
+
+    #[test]
+    fn r72_zero_false_positive_target_bleed_rejection() {
+        use super::resolve_in_cfg;
+
+        // Build a diamond switch and verify all four bleed classes are rejected:
+        // (a) target outside .pdata function bounds (inside another function),
+        // (b) target outside executable section (in .data),
+        // (c) target in unmapped address space,
+        // (d) inferred/width-only target landing mid-instruction (non-boundary).
+        let (code, ips) = assemble_labeled(|a, labels| {
+            let mut b2 = a.create_label();
+            let mut b3 = a.create_label();
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.cmp(ecx, 3)?;
+            a.ja(def)?;
+            lea_rip(a, Register::R12, BASE)?;
+            a.test(edx, edx)?;
+            a.je(b2)?;
+            a.nop()?;
+            a.jmp(b3)?;
+            a.set_label(&mut b2)?;
+            a.nop()?;
+            a.set_label(&mut b3)?;
+            a.movsxd(rax, ecx)?;
+            a.mov(ecx, dword_ptr(r12 + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, r12)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)?;
+            labels.extend([c0, c1, c2, def]);
+            Ok(())
+        });
+        let cases = [ips[0], ips[1], ips[2], ips[3]];
+
+        // (a) Target outside .pdata function bounds (c3 belongs to a separate .pdata range).
+        let c3_off = (cases[3] - TEXT) as u32;
+        let data_a = rva_table(cases.map(|va| (va - BASE) as u32));
+        let (img_a, func_a, blk_a) = diamond_cfg_image_and_func(
+            &code,
+            &data_a,
+            &[(0, c3_off, 0), (c3_off, code.len() as u32, c3_off)],
+        );
+        assert!(resolve_in_cfg(&img_a, &func_a, blk_a, None).is_none());
+
+        // (b) Target in non-executable .data section.
+        let mut data_b = rva_table(cases.map(|va| (va - BASE) as u32));
+        data_b[8..12].copy_from_slice(&DATA_RVA.to_le_bytes());
+        let (img_b, func_b, blk_b) = diamond_cfg_image_and_func(&code, &data_b, &[]);
+        assert!(resolve_in_cfg(&img_b, &func_b, blk_b, None).is_none());
+
+        // (c) Target in unmapped address space.
+        let mut data_c = rva_table(cases.map(|va| (va - BASE) as u32));
+        data_c[12..16].copy_from_slice(&0x00ff_0000u32.to_le_bytes());
+        let (img_c, func_c, blk_c) = diamond_cfg_image_and_func(&code, &data_c, &[]);
+        assert!(resolve_in_cfg(&img_c, &func_c, blk_c, None).is_none());
+
+        // (d) Width-only inferred table stops before a mid-instruction (non-boundary) entry.
+        let code_wo = assemble_at_text(|a| {
+            let (mut c0, mut c1, mut c2, mut def) = (
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+                a.create_label(),
+            );
+            a.movzx(eax, word_ptr(rcx))?;
+            lea_rip(a, Register::RDX, BASE)?;
+            a.mov(ecx, dword_ptr(rdx + rax * 4 + DATA_RVA as i32))?;
+            a.add(rcx, rdx)?;
+            a.jmp(rcx)?;
+            emit_four_cases(a, &mut c0, &mut c1, &mut c2, &mut def)
+        });
+        let cases_wo = find_four_cases(&code_wo);
+        let jmp_wo = find_indirect_jmp(&code_wo);
+        // Entry 2 lands 1 byte inside `mov eax, 2` (non-boundary): must stop at 2 entries!
+        let data_wo = rva_table([
+            (cases_wo[0] - BASE) as u32,
+            (cases_wo[1] - BASE) as u32,
+            (cases_wo[2] + 1 - BASE) as u32,
+            (cases_wo[3] - BASE) as u32,
+        ]);
+        let an_wo = analyze(&code_wo, &data_wo, &[0], &[(0, code_wo.len() as u32, 0)]);
+        let jt_wo = an_wo.jump_tables.get(&jmp_wo).expect("stops cleanly before non-boundary");
+        assert!(jt_wo.inferred);
+        assert_eq!(jt_wo.targets, cases_wo[..2]);
     }
 }
