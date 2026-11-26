@@ -1294,7 +1294,8 @@ void setup_bink_counters(BootState& b) {
 
 // A4: the title's audio stack as guest addresses (main executable, linked at 0x140000000). The
 // decoder factory is reached by vtable, so the dispatch observer sees it; a direct call between
-// two lifted functions would not show (the report says "indirect_calls_only").
+// two lifted functions would not show (`calls`, "indirect_calls_only"); a build with
+// `--probe-functions` also fills `entry_calls` from an entry counter, direct calls included.
 void setup_audio_probes(BootState& b) {
     b.audio_probes.clear();
     if (b.modules.empty() || !b.modules[0].loaded || b.modules[0].image.base == 0) {
@@ -4174,6 +4175,23 @@ BootResult run_boot(const BootConfig& config) {
 // ---------------------------------------------------------------------------
 // C ABI
 // ---------------------------------------------------------------------------
+
+// Entry counter of a function listed in a build's `--probe-functions` file: the lifter calls this
+// at the entry of each listed function, so direct calls count too. Not emitted without such a list.
+extern "C" void __playgta6_probe_hit(playgta6::GuestState* state, uint64_t va) {
+    using namespace playgta6::guest;
+    BootState& b = boot();
+    if (!b.audio_probes.active()) {
+        return;
+    }
+    const uint64_t args[AudioProbes::kArgs] = {state->gpr[GuestReg::Rcx], state->gpr[GuestReg::Rdx],
+                                               state->gpr[GuestReg::R8], state->gpr[GuestReg::R9]};
+    bool first = false;
+    const long idx = b.audio_probes.entry_hit(va, args, &first);
+    if (first && idx >= 0 && b.log_progress) {
+        os::log(("[audio-probe] first entry of " + b.audio_probes.name(static_cast<size_t>(idx))).c_str());
+    }
+}
 
 namespace guest = playgta6::guest;
 

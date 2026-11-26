@@ -288,6 +288,9 @@ pub struct PipelineOptions {
     pub trace_seeds: Option<crate::trace_seed::TraceSeeds>,
     /// Appended one JSON line per module with the seeding outcome (`--seed-report`).
     pub trace_seed_report: Option<PathBuf>,
+    /// Functions (entry VAs) that count their executions with an entry call to the runtime's
+    /// `__playgta6_probe_hit` (`--probe-functions`). Empty: code generation is unchanged.
+    pub probe_functions: BTreeSet<u64>,
     /// Compile every shard and the registration table to wasm64 objects.
     pub emit_obj: bool,
     /// Worker threads for lifting/compiling (does not affect any output).
@@ -307,6 +310,25 @@ pub struct PipelineOptions {
     pub indirect_dispatch: IndirectDispatch,
 }
 
+/// Parses a `--probe-functions` file: one hexadecimal VA per line (optional `0x`), anything after
+/// whitespace on the line is a free-form label, `#` starts a comment line. Kept outside the
+/// repository by the caller (the addresses are derived from the game).
+pub fn parse_probe_functions(text: &str) -> Result<BTreeSet<u64>, String> {
+    let mut out = BTreeSet::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let token = line.split_whitespace().next().unwrap_or("");
+        let digits = token.strip_prefix("0x").or_else(|| token.strip_prefix("0X")).unwrap_or(token);
+        let va = u64::from_str_radix(digits, 16)
+            .map_err(|_| format!("line {}: '{token}' is not a hexadecimal address", n + 1))?;
+        out.insert(va);
+    }
+    Ok(out)
+}
+
 impl PipelineOptions {
     /// Defaults: no shims, no extra entries, no objects, one job per available CPU,
     /// [`DEFAULT_SHARD_SIZE`], default image options.
@@ -320,6 +342,7 @@ impl PipelineOptions {
             extra_entries: Vec::new(),
             trace_seeds: None,
             trace_seed_report: None,
+            probe_functions: BTreeSet::new(),
             emit_obj: false,
             jobs: thread::available_parallelism().map_or(1, |n| n.get()),
             shard_size: DEFAULT_SHARD_SIZE,
@@ -741,6 +764,7 @@ pub fn lift_shards_for(
         memory,
         DEFAULT_MODULE,
         IndirectDispatch::Table,
+        &BTreeSet::new(),
         functions,
         shards,
         out_dir,
@@ -756,6 +780,7 @@ pub fn lift_shards_with_dispatch(
     memory: &MemoryModel,
     module: &str,
     indirect_dispatch: IndirectDispatch,
+    probes: &BTreeSet<u64>,
     functions: &[&Function],
     shards: &[Range<usize>],
     out_dir: &Path,
@@ -795,6 +820,7 @@ pub fn lift_shards_with_dispatch(
                         memory,
                         &flag_summaries,
                         dispatch,
+                        probes,
                         index,
                         &functions[range.clone()],
                         &lift_dir,
@@ -822,6 +848,7 @@ fn lift_shard(
     memory: &MemoryModel,
     flag_summaries: &lift::FlagSummaries,
     dispatch: Option<ShardDispatch<'_>>,
+    probes: &BTreeSet<u64>,
     index: usize,
     functions: &[&Function],
     lift_dir: &Path,
@@ -831,14 +858,16 @@ fn lift_shard(
     let mut instructions = 0;
     for function in functions {
         instructions += function.instruction_count();
-        lifted.push(
-            lift::lift_function_in(function, *memory, flag_summaries).map_err(|error| {
-                PipelineError::Lift {
-                    entry: function.entry,
-                    error,
-                }
-            })?,
-        );
+        let mut one = lift::lift_function_in(function, *memory, flag_summaries).map_err(
+            |error| PipelineError::Lift {
+                entry: function.entry,
+                error,
+            },
+        )?;
+        if probes.contains(&function.entry) {
+            one.insert_entry_probe();
+        }
+        lifted.push(one);
     }
     let mut unsupported = BTreeMap::new();
     for u in lifted.iter().flat_map(|f| f.unsupported.iter()) {
@@ -1557,6 +1586,7 @@ pub fn run_module(
         &options.memory,
         &options.module,
         options.indirect_dispatch,
+        &options.probe_functions,
         &functions,
         &shard_ranges,
         out,

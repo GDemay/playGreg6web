@@ -270,6 +270,9 @@ pub const HELPER_UNIMPLEMENTED: &str = "__playgta6_unimplemented";
 pub const HELPER_DIVIDE_ERROR: &str = "__playgta6_divide_error";
 /// Runtime trap for guest traps, invalid code and non-returning calls: `void (ptr state, i64 va)`.
 pub const HELPER_TRAP: &str = "__playgta6_trap";
+/// Entry counter of a function in a build's `--probe-functions` list (called with the state and the
+/// function's entry VA; the runtime tallies it). Emitted only for listed functions.
+pub const HELPER_PROBE_HIT: &str = "__playgta6_probe_hit";
 /// Runtime `cpuid`: `void (ptr state)` (see the module docs for the contract).
 pub const HELPER_CPUID: &str = "__playgta6_cpuid";
 /// Runtime `rdtsc`: `void (ptr state)` (see the module docs for the contract).
@@ -393,6 +396,19 @@ pub struct LiftedFunction {
 }
 
 impl LiftedFunction {
+    /// Calls [`HELPER_PROBE_HIT`] first thing in the function (before any guest state is read), so
+    /// every execution of it is counted whether it was called directly or through dispatch.
+    pub fn insert_entry_probe(&mut self) {
+        let call = format!(
+            "entry:\n  call void @{HELPER_PROBE_HIT}(ptr %state, i64 {})\n",
+            self.entry
+        );
+        if self.support.insert(Support::Probe) {
+            self.ir = self.ir.replacen("entry:\n", &call, 1);
+            self.tiny_leaf = false;
+        }
+    }
+
     /// Whether the function contains atomic instructions (its module needs a shared memory).
     pub fn uses_atomics(&self) -> bool {
         self.support.contains(&Support::Atomics)
@@ -426,6 +442,8 @@ enum Support {
     Helper(RuntimeHelper),
     /// The `@__playgta6_guest_base` declaration ([`GuestBase::Symbol`]).
     GuestBase,
+    /// The [`HELPER_PROBE_HIT`] declaration.
+    Probe,
     /// R19 memory models ([`memory`]): a delta table or a guest-memory runtime helper.
     Memory(memory::Decl),
 }
@@ -649,6 +667,12 @@ pub fn emit_module_with_dispatch(
             Support::Memset => out.push_str("declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)\n"),
             Support::Helper(helper) => {
                 let _ = writeln!(out, "declare void @{}(ptr noundef)", helper.symbol());
+            }
+            Support::Probe => {
+                let _ = writeln!(
+                    out,
+                    "declare void @{HELPER_PROBE_HIT}(ptr noundef, i64 noundef)"
+                );
             }
             Support::GuestBase => {
                 let _ = writeln!(out, "@{GUEST_BASE_SYMBOL} = external global i64, align 8");

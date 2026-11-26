@@ -32,6 +32,15 @@ public:
     // Counts a call to `target`; returns the probe index or -1. `first` is set on its first call.
     long hit(uint64_t target, const uint64_t args[kArgs], bool* first = nullptr) noexcept;
 
+    // Counts one execution of the function at `target` from the entry counter the lifter emits for
+    // `--probe-functions` addresses (direct calls included). Same arguments tally as `hit`, kept in
+    // separate counters so a call that arrives through dispatch is not counted twice.
+    long entry_hit(uint64_t target, const uint64_t args[kArgs], bool* first = nullptr) noexcept;
+    uint64_t entry_calls(size_t i) const { return entry_calls_[i].load(std::memory_order_relaxed); }
+    uint64_t entry_small_value(size_t i, size_t arg, size_t v) const {
+        return entry_small_[(i * kArgs + arg) * kSmall + v].load(std::memory_order_relaxed);
+    }
+
     size_t size() const { return count_; }
     const std::string& name(size_t i) const { return probes_[i].name; }
     uint64_t address(size_t i) const { return probes_[i].address; }
@@ -49,6 +58,8 @@ private:
     std::vector<AudioProbe> probes_;  // sorted by address
     std::unique_ptr<std::atomic<uint64_t>[]> calls_;
     std::unique_ptr<std::atomic<uint64_t>[]> small_;
+    std::unique_ptr<std::atomic<uint64_t>[]> entry_calls_;
+    std::unique_ptr<std::atomic<uint64_t>[]> entry_small_;
     size_t count_ = 0;
     uint64_t min_ = 0;
     uint64_t max_ = 0;

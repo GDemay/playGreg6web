@@ -47,6 +47,19 @@ void test_probes() {
     CHECK(j.find("\"rdx\": {\"5\": 1, \"11\": 2}") != std::string::npos);
     CHECK(j.find("\"indirect_calls_only\": true") != std::string::npos);
 
+    // Entry counters (lifter-emitted probes) are separate from the dispatch counts.
+    const uint64_t init_args[4] = {1, 0x7ff00000, 3, 0};
+    bool efirst = false;
+    const long e = p.entry_hit(0x2000, init_args, &efirst);
+    CHECK(e == p.find("init") && efirst);
+    CHECK(p.entry_hit(0x2000, init_args, &efirst) == e && !efirst);
+    CHECK(p.entry_hit(0x2001, init_args) == -1);
+    const size_t ei = static_cast<size_t>(e);
+    CHECK(p.entry_calls(ei) == 2 && p.calls(ei) == 0);
+    CHECK(p.entry_small_value(ei, 0, 1) == 2 && p.entry_small_value(ei, 2, 3) == 2);
+    CHECK(p.entry_calls(fi) == 0);
+    CHECK(p.to_json().find("\"entry_calls\": 2") != std::string::npos);
+
     std::vector<std::thread> ts;
     for (int t = 0; t < 4; ++t) {
         ts.emplace_back([&] {

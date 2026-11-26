@@ -450,6 +450,25 @@ class RunTests(unittest.TestCase):
             seeds.write_text("0x1 0x3\n")
             self.assertNotEqual(before, k())
 
+    def test_probe_functions_reach_the_lift_and_its_cache_key(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = Fixture(Path(d))
+            probes = Path(d) / "probes.txt"
+            probes.write_text("0x1000 a\n")
+            fx.manifest.unlink()
+            code, out, err, _ = fx.run("--name", "p1", "--probe-functions", str(probes), "--dry-run")
+            self.assertEqual(code, 0, err)
+            prog = [s for s in json.loads(out)["plan"] if s["stage"] == "program"][0]["cmd"]
+            self.assertEqual(prog[prog.index("--probe-functions") + 1], str(probes))
+            k = lambda: rnb.lift_inputs_key(fx.repo, fx.exe, fx.pkg,  # noqa: E731
+                                            ["--target", "native", "probe-functions", rnb.file_digest(probes)])
+            before = k()
+            probes.write_text("0x1000 a\n0x2000 b\n")
+            self.assertNotEqual(before, k())
+            code, out, _, _ = fx.run("--name", "p2", "--dry-run")
+            prog = [s for s in json.loads(out)["plan"] if s["stage"] == "program"][0]["cmd"]
+            self.assertNotIn("--probe-functions", prog)
+
     def test_shader_pack_hint(self):
         work = {"draws_issued": 100, "draws_emitted": 10, "draws_no_shader_module": 90}
         hint = rnb.shader_pack_hint({"gpu_work": work}, None)
