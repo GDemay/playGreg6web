@@ -649,6 +649,50 @@ void test_written_pages_fanout() {
 
 }  // namespace
 
+// A WriteBatch collects the OS write bits of its ranges once: takes inside it report the writes made
+// before the batch (to every cursor), and a write after the batch shows up in the next take once
+// the batch is gone.
+void test_write_batch() {
+    set_write_tracking(true);
+    VirtualMemoryArena arena;
+    set_write_tracking(false);
+    const uint64_t a = arena.reserve(0, 64 * 1024);
+    CHECK(a != 0);
+    CHECK(arena.commit(a, 64 * 1024, PageProtect::ReadWrite));
+    uint8_t* p = arena.host_ptr(a, 64 * 1024);
+    CHECK(p != nullptr);
+    if (p == nullptr) {
+        return;
+    }
+    WriteCursor x;
+    WriteCursor y;
+    std::vector<uint64_t> pages;
+    take_written_pages(p, 64 * 1024, &x, &pages);
+    take_written_pages(p, 64 * 1024, &y, &pages);
+    pages.clear();
+    if (!take_written_pages(p, 64 * 1024, &x, &pages)) {
+        return;  // not a write-watched host
+    }
+    take_written_pages(p, 64 * 1024, &y, &pages);
+    pages.clear();
+    p[2 * kWrittenPageSize] = 1;
+    {
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges{
+            {reinterpret_cast<uintptr_t>(p), reinterpret_cast<uintptr_t>(p) + 64 * 1024}};
+        const WriteBatch batch(&ranges);
+        CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+        CHECK(pages == (std::vector<uint64_t>{2 * kWrittenPageSize}));
+        pages.clear();
+        CHECK(take_written_pages(p, 64 * 1024, &y, &pages));
+        CHECK(pages == (std::vector<uint64_t>{2 * kWrittenPageSize}));
+        pages.clear();
+        p[5 * kWrittenPageSize] = 1;  // after the batch's collect: not reported inside it
+        CHECK(take_written_pages(p, 64 * 1024, &x, &pages) && pages.empty());
+    }
+    CHECK(take_written_pages(p, 64 * 1024, &x, &pages));
+    CHECK(pages == (std::vector<uint64_t>{5 * kWrittenPageSize}));
+}
+
 int main() {
     std::printf("test_vmem_contiguous\n");
     test_translation_and_contiguity();
@@ -663,6 +707,7 @@ int main() {
     test_process_arena();
     test_written_pages();
     test_written_pages_fanout();
+    test_write_batch();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_vmem_contiguous: %d failure(s)\n", g_failures);
         return 1;

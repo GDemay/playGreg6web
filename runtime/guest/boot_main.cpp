@@ -199,6 +199,7 @@ struct Options {
     bool eager_gpu_objects = false; // d3d12 DeviceOptions::defer_gpu_objects = false
     std::string profile;            // --profile: per-thread host PC samples (Windows)
     uint64_t profile_interval_us = 2000;  // --profile-interval-us
+    uint64_t profile_start_ms = 0;        // --profile-start-ms: sample only from this time on (a screen's window)
     std::string audio_dump;         // --audio-dump: WAV of the stereo mix
     std::string dump_pipelines;     // --dump-pipelines: d3d12 DeviceOptions::dump_dir (under a `work` dir)
     std::string pipeline_warm_list; // --pipeline-warm-list: warm list file ("off" disables; default per title under the cache dir)
@@ -323,7 +324,7 @@ bool parse(int argc, char** argv, Options& o) {
                    a == "--host-stack-mb" || a == "--survey-return" || a == "--import-trace-limit" ||
                    a == "--console-mode" || a == "--gpu-capture-frames" || a == "--gpu-capture-thin-uploads" || a == "--arena-log-limit" ||
                    a == "--gpu-capture-start-ms" ||
-                   a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--wgpu-features") {
+                   a == "--dstorage-workers" || a == "--profile-interval-us" || a == "--profile-start-ms" || a == "--wgpu-features") {
             if (!value(v)) {
                 return false;
             }
@@ -335,6 +336,7 @@ bool parse(int argc, char** argv, Options& o) {
                                : a == "--console-mode" ? o.console_mode
                                : a == "--dstorage-workers" ? o.dstorage_workers
                                : a == "--profile-interval-us" ? o.profile_interval_us
+                               : a == "--profile-start-ms" ? o.profile_start_ms
                                : a == "--wgpu-features" ? o.wgpu_features
                                : a == "--max-ms"      ? o.max_ms
                                : a == "--watchdog-ms" ? o.watchdog_ms
@@ -636,8 +638,13 @@ std::string profile_label(const CONTEXT& ctx, uint64_t top, uint32_t thread_id) 
     return where + " (last import " + (last.empty() ? "none" : last) + ")";
 }
 
-void profile_loop(uint64_t interval_us) {
+void profile_loop(uint64_t interval_us, uint64_t start_ms) {
+    const auto begin = std::chrono::steady_clock::now();
     while (!g_profile_stop.load(std::memory_order_relaxed)) {
+        if (std::chrono::steady_clock::now() - begin < std::chrono::milliseconds(start_ms)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
         std::vector<SampledThread> threads;
         {
             std::lock_guard<std::mutex> lock(g_profile_mutex);
@@ -665,7 +672,8 @@ void profile_loop(uint64_t interval_us) {
 
 void start_profile() {
     if (!g_options.profile.empty()) {
-        g_profile_thread = std::thread(profile_loop, std::max<uint64_t>(100, g_options.profile_interval_us));
+        g_profile_thread = std::thread(profile_loop, std::max<uint64_t>(100, g_options.profile_interval_us),
+                                    g_options.profile_start_ms);
     }
 }
 
