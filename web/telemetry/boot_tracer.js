@@ -47,6 +47,18 @@ export const ALL_BOOT_MILESTONES = Object.freeze([
   ...FAST_BOOT_MILESTONES,
 ]);
 
+/** Canonical M4 playability phases derived from reached boot milestones. */
+export const PLAYABILITY_STATE = Object.freeze({
+  BOOTING: 'BOOTING',
+  FIRST_PRESENT: 'FIRST_PRESENT',
+  START_SCREEN: 'START_SCREEN',
+  INTRO_VIDEO: 'INTRO_VIDEO',
+  MAIN_MENU: 'MAIN_MENU',
+  IN_GAME: 'IN_GAME',
+});
+
+const ALLOWED_AUDIO_OUTPUT_STATES = new Set(['active', 'suspended', 'headless-drain']);
+
 const POST_PRESENT_MILESTONES = Object.freeze([...OPTIONAL_BOOT_MILESTONES, ...FAST_BOOT_MILESTONES]);
 const ALL_MILESTONES = ALL_BOOT_MILESTONES;
 const OK_HUD_MILESTONES = new Set(['FIRST_PRESENT', ...POST_PRESENT_MILESTONES]);
@@ -72,7 +84,8 @@ const NON_FATAL_BY_DEFAULT = new Set([TRAP_KIND.UNRESOLVED_IMPORT]);
 const LOG_TAG_RE = /\[(wasm|boot|trap|unimpl|import)\]\s*(.*)$/i;
 const MILESTONE_TOKEN_RE = new RegExp(`\\b(${ALL_MILESTONES.join('|')})\\b`, 'gi');
 const TRAP_KIND_TOKEN_RE = new RegExp(`\\b(${TRAP_KIND_VALUES.join('|')})\\b`, 'i');
-const FAILURE_RE = /\b(?:fail(?:ed|s|ure)?|error|unresolved|missing|unimplemented|abort(?:ed)?)\b/i;
+const FAILURE_RE =
+  /\b(?:fail(?:ed|s|ure)?|error|unresolved|missing|unimplemented|abort(?:ed)?|timeout|timed[\s_-]*out|crash(?:ed)?|exception|not[\s_-]+reached|never[\s_-]+reached)\b/i;
 const HEX_RE = /\b0x([0-9a-f]{1,16})\b/gi;
 const LABELED_VA_RE = /\b(?:va|rip|pc|at|addr|address|target)\s*[=:]?\s*0x([0-9a-f]{1,16})\b/i;
 const NON_VA_PREFIX_RE = /\b(?:slot|rva|size|len|length|code|hr|hresult|status)\s*[=:]?\s*$/i;
@@ -108,10 +121,16 @@ const MILESTONE_HEURISTICS = Object.freeze([
   ['BINK_OPEN', /\bBinkOpen\w*\b|\bbink\s+(?:open(?:ed)?|stream\s+opened)\b/i],
   ['FIRST_PRESENT', /\bfirst[\s_-]*(?:swapchain[\s_-]*)?(?:present(?:ed)?|frame)\b/i],
   ['FIRST_VISIBLE_FRAME', /\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b/i],
-  ['START_SCREEN', /\bstart[\s_-]*screen\b|\bpress[\s_-]*(?:any[\s_-]*button|start)\b/i],
+  ['START_SCREEN', /\bstart[\s_-]*screen\b|\bpress[\s_-]*(?:any[\s_-]*button|start|a\s+to\s+start)\b/i],
   ['INTRO_VIDEO', /\bintro[\s_-]*(?:video|movie|cinematic|bink)\b|\bopening[\s_-]*(?:video|cinematic)\b/i],
-  ['MAIN_MENU', /\bmain[\s_-]*menu\b|\btitle[\s_-]*menu\b/i],
-  ['IN_GAME', /\bin[\s_-]*game\b|\bgameplay[\s_-]*(?:started|active|ready|entered)\b/i],
+  [
+    'MAIN_MENU',
+    /\bmain[\s_-]*menu(?:[\s_-]*(?:reached|interactive|ready|loaded|entered))?\b|\btitle[\s_-]*(?:menu|screen)\b|\bstory[\s_-]*mode(?:[\s_-]*(?:menu|selected|ready|screen|reached))?\b/i,
+  ],
+  [
+    'IN_GAME',
+    /\bin[\s_-]*game\b|\bgameplay[\s_-]*(?:started|active|ready|entered|loop)\b|\bworld[\s_-]*(?:loaded|ready|active|entered)\b|\bplayable[\s_-]*(?:state|world|gameplay)\b/i,
+  ],
 ]);
 
 function defaultNow() {
@@ -437,6 +456,259 @@ function clampNonNegativeFiniteMs(value) {
   return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : null;
 }
 
+function sanitizeOptionalNonNegativeInt(value) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean' || typeof value === 'object') {
+    return null;
+  }
+  if (typeof value === 'bigint') {
+    if (value < 0n) return null;
+    return value > BigInt(Number.MAX_SAFE_INTEGER) ? Number.MAX_SAFE_INTEGER : Number(value);
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.floor(n));
+}
+
+function sanitizeOptionalPositiveInt(value) {
+  const n = sanitizeOptionalNonNegativeInt(value);
+  return n !== null && n >= 1 ? n : null;
+}
+
+function sanitizeOptionalPercent(value, isUnitRatio = false) {
+  if (value === undefined || value === null || value === '' || typeof value === 'boolean' || typeof value === 'object') {
+    return null;
+  }
+  const n = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return null;
+  const scaled = isUnitRatio && n <= 1 ? n * 100 : n;
+  const clamped = Math.min(100, Math.max(0, scaled));
+  return Math.round(clamped * 10) / 10;
+}
+
+function sanitizeOptionalAudioState(value) {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toLowerCase().replace(/_/g, '-');
+  if (normalized === 'running' || normalized === 'playing') return 'active';
+  if (normalized === 'headless' || normalized === 'drain' || normalized === 'draining') return 'headless-drain';
+  if (normalized === 'paused' || normalized === 'closed' || normalized === 'idle' || normalized === 'muted') return 'suspended';
+  return ALLOWED_AUDIO_OUTPUT_STATES.has(normalized) ? normalized : null;
+}
+
+function pickFromObjects(objects, keys) {
+  for (let i = 0; i < objects.length; i += 1) {
+    const obj = objects[i];
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) continue;
+    for (let j = 0; j < keys.length; j += 1) {
+      let val;
+      try {
+        val = obj[keys[j]];
+      } catch {
+        val = undefined;
+      }
+      if (val !== undefined) return val;
+    }
+  }
+  return undefined;
+}
+
+function sanitizeLiveTelemetry(raw, prev = null) {
+  if (raw === null) {
+    return null;
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return prev;
+  }
+  const safeObj = (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : null);
+  const ioObj = safeObj(raw.io) || safeObj(raw.ioStats) || safeObj(raw.httpfs) || safeObj(raw.httpfsStats);
+  const audioObj = safeObj(raw.audio) || safeObj(raw.audioStats);
+  const opfsObj =
+    safeObj(raw.opfs) ||
+    safeObj(raw.opfsTelemetry) ||
+    safeObj(raw.opfsStats) ||
+    safeObj(raw.preloadTelemetry) ||
+    safeObj(raw.warmBoot);
+
+  const next = prev
+    ? {
+        httpfs: { ...prev.httpfs },
+        audio: { ...prev.audio },
+        opfs: { ...prev.opfs },
+      }
+    : {
+        httpfs: {
+          mailboxLanes: null,
+          activeMailboxLanes: null,
+          peakMailboxLanes: null,
+          rangeCacheHitRatePct: null,
+        },
+        audio: {
+          outputState: null,
+          guestRingAttached: false,
+          guestFramesDrained: 0,
+          framesDrained: 0,
+          underruns: 0,
+          guestUnderruns: 0,
+          overruns: 0,
+        },
+        opfs: {
+          opfsHits: 0,
+          opfsMisses: 0,
+          opfsWrites: 0,
+          opfsInvalidations: 0,
+          bytesFromOpfs: 0,
+          bytesFromNetwork: 0,
+          opfsHitRatePct: null,
+        },
+      };
+
+  let touched = false;
+
+  const lanes = pickFromObjects([ioObj, raw], ['mailboxLanes', 'mailbox_lanes', 'ioMailboxLanes', 'lanes']);
+  if (lanes !== undefined) {
+    next.httpfs.mailboxLanes = sanitizeOptionalPositiveInt(lanes);
+    touched = true;
+  }
+  const activeLanes = pickFromObjects([ioObj, raw], [
+    'activeMailboxLanes',
+    'active_mailbox_lanes',
+    'activeLanes',
+    'httpfsActiveConcurrency',
+  ]);
+  if (activeLanes !== undefined) {
+    next.httpfs.activeMailboxLanes = sanitizeOptionalNonNegativeInt(activeLanes);
+    touched = true;
+  }
+  const peakLanes = pickFromObjects([ioObj, raw], [
+    'peakMailboxLanes',
+    'peak_mailbox_lanes',
+    'peakLanes',
+    'httpfsPeakConcurrency',
+    'httpfs_peak_concurrency',
+  ]);
+  if (peakLanes !== undefined) {
+    next.httpfs.peakMailboxLanes = sanitizeOptionalNonNegativeInt(peakLanes);
+    touched = true;
+  } else if (next.httpfs.activeMailboxLanes !== null) {
+    next.httpfs.peakMailboxLanes = Math.max(
+      next.httpfs.peakMailboxLanes ?? 0,
+      next.httpfs.activeMailboxLanes
+    );
+  }
+  const rangePct = pickFromObjects([ioObj, raw], [
+    'rangeCacheHitRatePct',
+    'range_cache_hit_rate_pct',
+    'slabHitRatePct',
+    'slab_hit_rate_pct',
+  ]);
+  if (rangePct !== undefined) {
+    next.httpfs.rangeCacheHitRatePct = sanitizeOptionalPercent(rangePct, false);
+    touched = true;
+  } else {
+    const rangeRatio = pickFromObjects([ioObj, raw], ['rangeCacheHitRate', 'slabHitRate']);
+    if (rangeRatio !== undefined) {
+      next.httpfs.rangeCacheHitRatePct = sanitizeOptionalPercent(rangeRatio, true);
+      touched = true;
+    }
+  }
+
+  const outputState = pickFromObjects([audioObj, raw], ['outputState', 'output_state', 'audioOutputState']);
+  if (outputState !== undefined) {
+    next.audio.outputState = sanitizeOptionalAudioState(outputState);
+    touched = true;
+  }
+  const ringAttached = pickFromObjects([audioObj, raw], ['guestRingAttached', 'guest_ring_attached', 'ringAttached']);
+  if (ringAttached !== undefined) {
+    next.audio.guestRingAttached = ringAttached === true;
+    touched = true;
+  }
+  const guestDrained = pickFromObjects([audioObj, raw], ['guestFramesDrained', 'guest_frames_drained']);
+  if (guestDrained !== undefined) {
+    next.audio.guestFramesDrained = sanitizeOptionalNonNegativeInt(guestDrained) ?? 0;
+    touched = true;
+  }
+  const framesDrained = pickFromObjects([audioObj, raw], ['framesDrained', 'frames_drained', 'drainedFrames']);
+  if (framesDrained !== undefined) {
+    next.audio.framesDrained = sanitizeOptionalNonNegativeInt(framesDrained) ?? 0;
+    touched = true;
+  }
+  const underruns = pickFromObjects([audioObj, raw], ['underruns', 'underrunCount']);
+  if (underruns !== undefined) {
+    next.audio.underruns = sanitizeOptionalNonNegativeInt(underruns) ?? 0;
+    touched = true;
+  }
+  const guestUnderruns = pickFromObjects([audioObj, raw], ['guestUnderruns', 'guest_underruns']);
+  if (guestUnderruns !== undefined) {
+    next.audio.guestUnderruns = sanitizeOptionalNonNegativeInt(guestUnderruns) ?? 0;
+    touched = true;
+  }
+  const overruns = pickFromObjects([audioObj, raw], ['overruns', 'overrunCount', 'overflows']);
+  if (overruns !== undefined) {
+    next.audio.overruns = sanitizeOptionalNonNegativeInt(overruns) ?? 0;
+    touched = true;
+  }
+
+  let opfsCountsTouched = false;
+  const opfsHits = pickFromObjects([opfsObj, ioObj, raw], ['opfsHits', 'opfs_hits', 'opfsCacheHits']);
+  if (opfsHits !== undefined) {
+    next.opfs.opfsHits = sanitizeOptionalNonNegativeInt(opfsHits) ?? 0;
+    opfsCountsTouched = true;
+    touched = true;
+  }
+  const opfsMisses = pickFromObjects([opfsObj, ioObj, raw], ['opfsMisses', 'opfs_misses', 'opfsCacheMisses']);
+  if (opfsMisses !== undefined) {
+    next.opfs.opfsMisses = sanitizeOptionalNonNegativeInt(opfsMisses) ?? 0;
+    opfsCountsTouched = true;
+    touched = true;
+  }
+  const opfsWrites = pickFromObjects([opfsObj, ioObj, raw], ['opfsWrites', 'opfs_writes']);
+  if (opfsWrites !== undefined) {
+    next.opfs.opfsWrites = sanitizeOptionalNonNegativeInt(opfsWrites) ?? 0;
+    touched = true;
+  }
+  const opfsInvalidations = pickFromObjects([opfsObj, ioObj, raw], ['opfsInvalidations', 'opfs_invalidations']);
+  if (opfsInvalidations !== undefined) {
+    next.opfs.opfsInvalidations = sanitizeOptionalNonNegativeInt(opfsInvalidations) ?? 0;
+    touched = true;
+  }
+  const bytesFromOpfs = pickFromObjects([opfsObj, ioObj, raw], ['bytesFromOpfs', 'bytes_from_opfs']);
+  if (bytesFromOpfs !== undefined) {
+    next.opfs.bytesFromOpfs = sanitizeOptionalNonNegativeInt(bytesFromOpfs) ?? 0;
+    opfsCountsTouched = true;
+    touched = true;
+  }
+  const bytesFromNetwork = pickFromObjects([opfsObj, ioObj, raw], ['bytesFromNetwork', 'bytes_from_network']);
+  if (bytesFromNetwork !== undefined) {
+    next.opfs.bytesFromNetwork = sanitizeOptionalNonNegativeInt(bytesFromNetwork) ?? 0;
+    opfsCountsTouched = true;
+    touched = true;
+  }
+  const explicitOpfsPct = pickFromObjects([opfsObj, ioObj, raw], [
+    'opfsHitRatePct',
+    'opfs_hit_rate_pct',
+    'warmBootHitRatePct',
+  ]);
+  const explicitOpfsRatio = pickFromObjects([opfsObj, ioObj, raw], ['opfsHitRate', 'opfs_hit_rate']);
+  if (explicitOpfsPct !== undefined) {
+    next.opfs.opfsHitRatePct = sanitizeOptionalPercent(explicitOpfsPct, false);
+    touched = true;
+  } else if (explicitOpfsRatio !== undefined) {
+    next.opfs.opfsHitRatePct = sanitizeOptionalPercent(explicitOpfsRatio, true);
+    touched = true;
+  } else if (opfsCountsTouched) {
+    const lookups = next.opfs.opfsHits + next.opfs.opfsMisses;
+    const totalBytes = next.opfs.bytesFromOpfs + next.opfs.bytesFromNetwork;
+    if (lookups > 0) {
+      next.opfs.opfsHitRatePct = Math.round((next.opfs.opfsHits / lookups) * 1000) / 10;
+    } else if (totalBytes > 0) {
+      next.opfs.opfsHitRatePct = Math.round((next.opfs.bytesFromOpfs / totalBytes) * 1000) / 10;
+    } else {
+      next.opfs.opfsHitRatePct = null;
+    }
+  }
+
+  return touched ? next : prev;
+}
+
 /**
  * Tracks guest boot progress through `BOOT_MILESTONES` and collects guest traps
  * (unimplemented opcodes, unresolved imports, indirect-call misses, ...) into a
@@ -513,6 +785,7 @@ export class BootTracer {
     this._milestoneOrder = [];
     this._highestIdx = -1;
     this._gpuAdapter = null;
+    this._liveTelemetry = null;
     this._traps.clear();
     this._trapCount = 0;
     this._trapSeq = 0;
@@ -562,6 +835,37 @@ export class BootTracer {
 
   _bootToInGameMs() {
     return this._milestoneElapsedMs('IN_GAME');
+  }
+
+  _playabilityState() {
+    if (this._milestones.has('IN_GAME')) {
+      return PLAYABILITY_STATE.IN_GAME;
+    }
+    if (this._milestones.has('MAIN_MENU')) {
+      return PLAYABILITY_STATE.MAIN_MENU;
+    }
+    if (this._milestones.has('INTRO_VIDEO')) {
+      return PLAYABILITY_STATE.INTRO_VIDEO;
+    }
+    if (this._milestones.has('START_SCREEN')) {
+      return PLAYABILITY_STATE.START_SCREEN;
+    }
+    if (this._milestones.has('FIRST_VISIBLE_FRAME') || this._milestones.has('FIRST_PRESENT')) {
+      return PLAYABILITY_STATE.FIRST_PRESENT;
+    }
+    return PLAYABILITY_STATE.BOOTING;
+  }
+
+  _readyForSplash() {
+    if (this._milestones.has('FIRST_PRESENT')) {
+      return true;
+    }
+    for (const name of POST_PRESENT_MILESTONES) {
+      if (this._milestones.has(name)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   _blackLoadingMs() {
@@ -849,6 +1153,35 @@ export class BootTracer {
       this._forward('recordLog', 'info', 'boot_tracer', `gpu adapter: ${sanitized}`);
     }
     return this._gpuAdapter;
+  }
+
+  /**
+   * Attaches or updates sanitized live M4 telemetry (8-lane HTTPFS concurrency,
+   * live audio ring drained frames, and OPFS warm-boot hit rate). Passing `null`
+   * clears attached live telemetry.
+   *
+   * @param {object|null} telemetry
+   * @returns {object|null} Defensive clone of the stored sanitized live telemetry, or `null`.
+   */
+  recordLiveTelemetry(telemetry) {
+    this._liveTelemetry = sanitizeLiveTelemetry(telemetry, this._liveTelemetry);
+    return this.getLiveTelemetry();
+  }
+
+  /**
+   * Returns a defensive sanitized snapshot of attached live M4 telemetry, or `null`.
+   *
+   * @returns {object|null}
+   */
+  getLiveTelemetry() {
+    if (!this._liveTelemetry) {
+      return null;
+    }
+    return {
+      httpfs: { ...this._liveTelemetry.httpfs },
+      audio: { ...this._liveTelemetry.audio },
+      opfs: { ...this._liveTelemetry.opfs },
+    };
   }
 
   /**
@@ -1165,11 +1498,16 @@ export class BootTracer {
     const bootToMainMenuMs = this._bootToMainMenuMs();
     const bootToInGameMs = this._bootToInGameMs();
 
+    const playabilityState = this._playabilityState();
+    const liveTelemetry = this.getLiveTelemetry();
+
     const metadata = {
       source: 'playgta6web.boot_tracer',
       stage: this._stage(),
+      m4Phase: playabilityState,
+      playabilityState,
       progressPct: this._progressPct(),
-      readyForSplash: this._milestones.has('FIRST_PRESENT'),
+      readyForSplash: this._readyForSplash(),
       elapsedMs: this._elapsed(),
       firstPresentMs,
       firstVisibleFrameMs,
@@ -1179,6 +1517,7 @@ export class BootTracer {
       bootToMainMenuMs,
       bootToInGameMs,
       gpuAdapter: this._gpuAdapter,
+      liveTelemetry,
       milestonesReached: this._milestones.size,
       trapCount: this._trapCount,
     };
@@ -1255,10 +1594,15 @@ export class BootTracer {
     const bootToMainMenuMs = this._bootToMainMenuMs();
     const bootToInGameMs = this._bootToInGameMs();
 
+    const playabilityState = this._playabilityState();
+    const liveTelemetry = this.getLiveTelemetry();
+
     return sanitizeValue({
       stage: this._stage(),
+      m4Phase: playabilityState,
+      playabilityState,
       progressPct: this._progressPct(),
-      readyForSplash: this._milestones.has('FIRST_PRESENT'),
+      readyForSplash: this._readyForSplash(),
       elapsedMs: this._elapsed(),
       firstPresentMs,
       firstVisibleFrameMs,
@@ -1268,6 +1612,7 @@ export class BootTracer {
       bootToMainMenuMs,
       bootToInGameMs,
       gpuAdapter: this._gpuAdapter,
+      liveTelemetry,
       milestonesReached: this._milestones.size,
       milestones,
       slowThresholdMs: this._slowThresholdMs,
