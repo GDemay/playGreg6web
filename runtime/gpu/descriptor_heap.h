@@ -1008,6 +1008,10 @@ struct CachedBindGroup {
     uint64_t relocation_epoch = 0;
     // G66 (#691): the bridge's resource retire epoch when the entries were last checked live.
     uint64_t retire_epoch = 0;
+    // G70 (#691): bridge-interned view ids backing TextureView entries in this bind group, so
+    // retiring a texture's interned views immediately invalidates cached bind groups referencing them.
+    std::vector<uint32_t> view_ids;
+    uint64_t key_hash = 0;
 
     // Internal validity data.
     std::vector<uint64_t> key;
@@ -1028,14 +1032,16 @@ struct CachedBindGroup {
 };
 
 // Re-reads the memory-backed table entries of `group` (built for `plan`) through `source`: true
-// when the windows' words changed since the build, in which case the table entries and
-// built_words are rebuilt (other entries are kept). Heaps are looked up again by their handles.
+// when the windows' words changed since the build (or `force_rebuild` is true), in which case the
+// table entries and built_words are rebuilt (other entries are kept). Heaps are looked up again by
+// their handles.
 bool refresh_table_entries(const DescriptorHeapRegistry& heaps,
                            const DescriptorSlotSource& source,
                            const BindGroupPlan& plan,
                            GpuVaResolver resolver,
                            void* resolver_user,
-                           CachedBindGroup* group);
+                           CachedBindGroup* group,
+                           bool force_rebuild = false);
 
 struct BindGroupLookup {
     Status status = Status::Ok;
@@ -1065,6 +1071,16 @@ public:
     void clear(std::vector<uint32_t>* retired);
     // Drops one entry (a pointer a lookup returned); returns its gpu id (0 when none / not cached).
     uint32_t erase(const CachedBindGroup* group);
+    // G70 (#691): immediately evicts every cached entry referencing `resource_id` (directly in
+    // entries/views or in relocations) and appends their non-zero gpu ids to `retired`.
+    size_t evict_resource(uint32_t resource_id, std::vector<uint32_t>* retired = nullptr);
+    // G70 (#691): immediately evicts every cached entry referencing any id in `resource_ids`
+    // (entries/views/relocations) or any interned view id in `view_ids`, appending retired gpu ids
+    // and optionally the evicted entries' cache key hashes.
+    size_t evict_resources_and_views(std::span<const uint32_t> resource_ids,
+                                     std::span<const uint32_t> view_ids,
+                                     std::vector<uint32_t>* retired = nullptr,
+                                     std::vector<uint64_t>* evicted_key_hashes = nullptr);
     // Bounds the cache between recordings (O36). Keys carry root-view GPU addresses and table base
     // indices, which ring allocators change per draw, so without a bound the cache (and the WebGPU
     // bind groups behind it) grows for the whole run. When more than `max_entries` are cached, drops
