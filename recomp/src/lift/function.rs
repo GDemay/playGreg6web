@@ -1306,7 +1306,11 @@ impl FunctionLifter<'_> {
             )),
             RegRef::Low(idx, 64) => self.store_gpr(idx, value),
             RegRef::Low(idx, 32) => {
-                let wide = self.val(&format!("zext i32 {value} to i64"));
+                // A constant 32-bit result (e.g. `xor r9d, r9d`) zero-extends at lift time.
+                let wide = match value.parse::<i64>() {
+                    Ok(c) => (c as u32 as u64).to_string(),
+                    Err(_) => self.val(&format!("zext i32 {value} to i64")),
+                };
                 self.store_gpr(idx, &wide)
             }
             RegRef::Low(idx, bits) => self.merge_gpr(idx, value, bits, 0),
