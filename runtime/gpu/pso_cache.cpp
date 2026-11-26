@@ -22,8 +22,8 @@ constexpr uint32_t align_up(uint32_t value, uint32_t alignment) noexcept {
 }
 
 uint32_t canonical_float_bits(float value) noexcept {
-    if (std::isnan(value) || value == 0.0f) {
-        return 0u;  // NaN and -0.0 collapse onto +0.0
+    if (!std::isfinite(value) || value == 0.0f) {
+        return 0u;  // NaN, +/-Inf and -0.0 collapse onto +0.0
     }
     return std::bit_cast<uint32_t>(value);
 }
@@ -356,6 +356,11 @@ DxgiDescription describe_dxgi(DxgiFormat format) noexcept {
         case D::B4G4R4A4_UNORM:
             r.promoted = true;
             return color(F::Rgba8Unorm);
+        // Xbox-only 10-bit float HDR formats (116/117): promote to rgba16float (preserves HDR range and alpha).
+        case D::R10G10B10_7E3_A2_FLOAT:
+        case D::R10G10B10_6E4_A2_FLOAT:
+            r.promoted = true;
+            return color(F::Rgba16Float);
         case D::B8G8R8A8_UNORM: return color(F::Bgra8Unorm);
         case D::B8G8R8X8_UNORM:
             r.alpha_ignored = true;
@@ -755,6 +760,57 @@ VertexFormatMapping map_vertex_format(DxgiFormat format) noexcept {
     return VertexFormatMapping{v, vertex_format_byte_size(v)};
 }
 
+uint32_t dxgi_vertex_element_byte_size(DxgiFormat format) noexcept {
+    const VertexFormatMapping vf = map_vertex_format(format);
+    if (vf.supported()) {
+        return vf.byte_size;
+    }
+    using D = DxgiFormat;
+    switch (format) {
+        case D::R32G32B32A32_TYPELESS: return 16u;
+        case D::R32G32B32_TYPELESS: return 12u;
+        case D::R16G16B16A16_TYPELESS:
+        case D::R32G32_TYPELESS:
+        case D::R32G8X24_TYPELESS:
+        case D::D32_FLOAT_S8X24_UINT:
+        case D::R32_FLOAT_X8X24_TYPELESS:
+        case D::X32_TYPELESS_G8X24_UINT: return 8u;
+        case D::R10G10B10A2_TYPELESS:
+        case D::R10G10B10A2_UINT:
+        case D::R11G11B10_FLOAT:
+        case D::R8G8B8A8_TYPELESS:
+        case D::R8G8B8A8_UNORM_SRGB:
+        case D::R16G16_TYPELESS:
+        case D::R32_TYPELESS:
+        case D::D32_FLOAT:
+        case D::R24G8_TYPELESS:
+        case D::D24_UNORM_S8_UINT:
+        case D::R24_UNORM_X8_TYPELESS:
+        case D::X24_TYPELESS_G8_UINT:
+        case D::R9G9B9E5_SHAREDEXP:
+        case D::B8G8R8X8_UNORM:
+        case D::R10G10B10_XR_BIAS_A2_UNORM:
+        case D::B8G8R8A8_TYPELESS:
+        case D::B8G8R8A8_UNORM_SRGB:
+        case D::B8G8R8X8_TYPELESS:
+        case D::B8G8R8X8_UNORM_SRGB:
+        case D::R10G10B10_7E3_A2_FLOAT:
+        case D::R10G10B10_6E4_A2_FLOAT:
+        case D::D16_UNORM_S8_UINT:
+        case D::R16_UNORM_X8_TYPELESS:
+        case D::X16_TYPELESS_G8_UINT: return 4u;
+        case D::R8G8_TYPELESS:
+        case D::R16_TYPELESS:
+        case D::D16_UNORM:
+        case D::B5G6R5_UNORM:
+        case D::B5G5R5A1_UNORM:
+        case D::B4G4R4A4_UNORM: return 2u;
+        case D::R8_TYPELESS:
+        case D::A8_UNORM: return 1u;
+        default: return 0u;
+    }
+}
+
 std::optional<WgpuBlendFactor> map_blend_factor(D3D12Blend blend) noexcept {
     using B = D3D12Blend;
     using W = WgpuBlendFactor;
@@ -1094,6 +1150,7 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
     std::vector<Attr> attrs;
     uint32_t slot_end[kD3D12IaVertexInputSlotCount] = {};
     WgpuVertexStepMode slot_step[kMaxVertexBuffers] = {};
+    uint32_t declared_slots = 0;
     uint32_t location_mask = 0;
     std::vector<bool> signature_matched(desc.vs_input_signature != nullptr ? desc.vs_input_signature_count : 0u,
                                         false);
@@ -1102,31 +1159,40 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
     const uint32_t count = desc.pInputElementDescs != nullptr ? desc.NumInputElements : 0u;
     for (uint32_t i = 0; i < count; ++i) {
         const D3D12InputElementDesc& e = desc.pInputElementDescs[i];
-        const VertexFormatMapping vf = map_vertex_format(e.Format);
-        if (!vf.supported()) {
-            diag |= PipelineDiag::VertexFormatUnsupported;
-            continue;
-        }
         if (e.InputSlot >= kD3D12IaVertexInputSlotCount) {
             diag |= PipelineDiag::VertexSlotOutOfRange;
             continue;
         }
+        const VertexFormatMapping vf = map_vertex_format(e.Format);
+        const uint32_t raw_byte_size = vf.supported() ? vf.byte_size : dxgi_vertex_element_byte_size(e.Format);
         uint32_t offset = e.AlignedByteOffset;
-        if (offset == kD3D12AppendAlignedElement) {
-            offset = align_up(slot_end[e.InputSlot], std::min(4u, vf.byte_size));
+        if (raw_byte_size != 0) {
+            if (offset == kD3D12AppendAlignedElement) {
+                offset = align_up(slot_end[e.InputSlot], std::min(4u, raw_byte_size));
+            }
+            slot_end[e.InputSlot] = std::max(slot_end[e.InputSlot], offset + raw_byte_size);
         }
-        slot_end[e.InputSlot] = std::max(slot_end[e.InputSlot], offset + vf.byte_size);
+        if (!vf.supported()) {
+            diag |= PipelineDiag::VertexFormatUnsupported;
+            continue;
+        }
         if (e.InputSlot >= kMaxVertexBuffers) {
             diag |= PipelineDiag::VertexSlotOutOfRange;
             continue;
         }
+        declared_slots |= 1u << e.InputSlot;
         if (desc.vs_input_fetches != nullptr) {
             // Reflected stage: elements only give strides and the slot's classification.
-            const WgpuVertexStepMode step = e.InputSlotClass == D3D12InputClassification::PerInstanceData
-                                                ? WgpuVertexStepMode::Instance
-                                                : WgpuVertexStepMode::Vertex;
-            if (step == WgpuVertexStepMode::Instance && e.InstanceDataStepRate == 0) {
-                t.instance_stride_zero_slots |= 1u << e.InputSlot;
+            WgpuVertexStepMode step = WgpuVertexStepMode::Vertex;
+            if (e.InputSlotClass == D3D12InputClassification::PerInstanceData) {
+                step = WgpuVertexStepMode::Instance;
+                if (e.InstanceDataStepRate == 0) {
+                    t.instance_stride_zero_slots |= 1u << e.InputSlot;
+                } else if (e.InstanceDataStepRate > 1) {
+                    diag |= PipelineDiag::InstanceStepRateUnsupported;
+                }
+            } else if (e.InputSlotClass != D3D12InputClassification::PerVertexData) {
+                diag |= PipelineDiag::InvalidEnumValue;
             }
             if (slot_step[e.InputSlot] == WgpuVertexStepMode::Unused) {
                 slot_step[e.InputSlot] = step;
@@ -1182,9 +1248,11 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
         attrs.push_back(Attr{e.InputSlot, offset, location, vf.format});
     }
 
-    for (size_t s = 0; s < signature_matched.size(); ++s) {
-        if (!signature_matched[s]) {
-            diag |= PipelineDiag::MissingVertexInput;
+    if (desc.vs_input_fetches == nullptr) {
+        for (size_t s = 0; s < signature_matched.size(); ++s) {
+            if (!signature_matched[s]) {
+                diag |= PipelineDiag::MissingVertexInput;
+            }
         }
     }
 
@@ -1223,19 +1291,32 @@ void lower_input_layout(const D3D12GraphicsPsoDesc& desc, GraphicsPsoTranslation
             if (slot_step[f.slot] == WgpuVertexStepMode::Unused) {
                 slot_step[f.slot] = WgpuVertexStepMode::Vertex;
             }
+            const uint32_t fsize = vertex_format_byte_size(f.format);
+            if (fsize != 0) {
+                slot_end[f.slot] = std::max(slot_end[f.slot], f.offset + fsize);
+            }
             location_mask |= 1u << f.location;
             attrs.push_back(Attr{f.slot, f.offset, f.location, f.format});
         }
     }
 
     if (!defaults.empty()) {
-        uint32_t spare = 0;
         uint32_t taken = 0;
         for (const Attr& a : attrs) {
             taken |= 1u << a.slot;
         }
-        while (spare < kMaxVertexBuffers && (taken & (1u << spare)) != 0) {
+        // Prefer a slot neither fetched nor declared in pInputElementDescs so the default buffer
+        // does not collide with a vertex buffer slot the title still binds via IASetVertexBuffers.
+        uint32_t spare = 0;
+        const uint32_t avoid = taken | declared_slots;
+        while (spare < kMaxVertexBuffers && (avoid & (1u << spare)) != 0) {
             ++spare;
+        }
+        if (spare >= kMaxVertexBuffers) {
+            spare = 0;
+            while (spare < kMaxVertexBuffers && (taken & (1u << spare)) != 0) {
+                ++spare;
+            }
         }
         if (spare >= kMaxVertexBuffers) {
             diag |= PipelineDiag::VertexSlotOutOfRange;
@@ -1577,6 +1658,20 @@ uint64_t specialize_graphics_pipeline_key(const GraphicsPsoTranslation& t,
                 ds.stencil_read_mask = 0;
                 ds.stencil_write_mask = 0;
             }
+            if (bound && (v.dsv_flags & D3D12DsvFlags::ReadOnlyDepth) != 0) {
+                // WebGPU rejects depthWriteEnabled=true against a depthReadOnly render pass attachment.
+                ds.depth_write_enabled = 0;
+            }
+            if (bound && (v.dsv_flags & D3D12DsvFlags::ReadOnlyStencil) != 0) {
+                // WebGPU rejects writable stencil ops/mask against a stencilReadOnly render pass attachment.
+                ds.stencil_front.fail_op = WgpuStencilOperation::Keep;
+                ds.stencil_front.depth_fail_op = WgpuStencilOperation::Keep;
+                ds.stencil_front.pass_op = WgpuStencilOperation::Keep;
+                ds.stencil_back.fail_op = WgpuStencilOperation::Keep;
+                ds.stencil_back.depth_fail_op = WgpuStencilOperation::Keep;
+                ds.stencil_back.pass_op = WgpuStencilOperation::Keep;
+                ds.stencil_write_mask = 0;
+            }
         }
     }
     if (highest == 0 && ds.format == WgpuTextureFormat::Undefined) {
@@ -1629,11 +1724,20 @@ uint64_t specialize_graphics_pipeline_key(const GraphicsPsoTranslation& t,
 
     // --- Multisample.
     k.multisample.count = count;
-    k.multisample.mask = t.sample_mask & ((1u << count) - 1u);
+    const uint32_t full_mask = (1u << count) - 1u;
+    uint32_t sample_mask = t.sample_mask & full_mask;
+    if (samples > 1 && samples < count) {
+        const uint32_t src_full = (1u << samples) - 1u;
+        if ((t.sample_mask & src_full) == src_full) {
+            sample_mask = full_mask;  // e.g. 2x MSAA SampleMask=0x3 expanded to 4x MSAA 0xF
+        }
+    }
+    k.multisample.mask = sample_mask;
     if (k.multisample.alpha_to_coverage_enabled != 0) {
         const ColorTargetKey& rt0 = k.color_targets[0];
-        const bool ok = count > 1 && rt0.format != WgpuTextureFormat::Undefined &&
-                        is_blendable(rt0.format, features) && has_alpha_channel(rt0.format);
+        const bool ok = count > 1 && k.ps_shader != 0 && (t.ps_output_mask & 1u) != 0 &&
+                        rt0.format != WgpuTextureFormat::Undefined && is_blendable(rt0.format, features) &&
+                        has_alpha_channel(rt0.format);
         if (!ok) {
             diag |= PipelineDiag::AlphaToCoverageDropped;
             k.multisample.alpha_to_coverage_enabled = 0;
@@ -1661,8 +1765,8 @@ uint64_t specialize_graphics_pipeline_key(const GraphicsPsoTranslation& t,
         const VertexAttributeKey& a = k.vertex_attributes[i];
         const uint32_t size = vertex_format_byte_size(a.format);
         const uint32_t stride = k.vertex_buffers[a.buffer_index].array_stride;
-        const uint32_t limit = stride == 0 ? kMaxVertexBufferArrayStride : stride;
-        if (a.offset + size > limit || a.offset % std::min(4u, size) != 0) {
+        const uint64_t limit = stride == 0 ? kMaxVertexBufferArrayStride : stride;
+        if (uint64_t{a.offset} + size > limit || a.offset % std::min(4u, size) != 0) {
             diag |= PipelineDiag::VertexLayoutInvalid;
         }
     }
@@ -2003,6 +2107,7 @@ PipelineVariantState GraphicsPso::canonical_variant(const PipelineVariantState& 
         }
         c.dsv_format = v.dsv_format;
         c.sample_count = v.sample_count;
+        c.dsv_flags = static_cast<uint8_t>(v.dsv_flags & (D3D12DsvFlags::ReadOnlyDepth | D3D12DsvFlags::ReadOnlyStencil));
     }
     const WgpuPrimitiveTopology topo = v.topology == D3DPrimitiveTopology::Undefined
                                            ? translation_.base.primitive.topology
@@ -2223,6 +2328,10 @@ void CommandListStateTracker::update_variant_targets() {
         }
     }
     variant_.dsv_format = bound_.dsv.view_id != 0 ? bound_.dsv.format : DxgiFormat::UNKNOWN;
+    variant_.dsv_flags = bound_.dsv.view_id != 0
+                             ? static_cast<uint8_t>(bound_.dsv.flags &
+                                                    (D3D12DsvFlags::ReadOnlyDepth | D3D12DsvFlags::ReadOnlyStencil))
+                             : 0u;
     if (samples == 0 && bound_.dsv.view_id != 0) {
         samples = bound_.dsv.sample_count;
     }
@@ -2374,16 +2483,30 @@ void CommandListStateTracker::begin_pass(const Attachments& a) {
             ds.stencil_store_op = WgpuStoreOp::Store;
         }
         if (PendingClear* pc = find_pending(d.view_id); pc != nullptr && pc->depth_stencil) {
+            uint32_t consumed = 0;
             if ((pc->clear_flags & D3D12ClearFlags::Depth) != 0 && ds.depth_load_op != WgpuLoadOp::Undefined) {
                 ds.depth_load_op = WgpuLoadOp::Clear;
                 ds.depth_clear_value = pc->depth;
+                consumed |= D3D12ClearFlags::Depth;
             }
             if ((pc->clear_flags & D3D12ClearFlags::Stencil) != 0 && ds.stencil_load_op != WgpuLoadOp::Undefined) {
                 ds.stencil_load_op = WgpuLoadOp::Clear;
                 ds.stencil_clear_value = pc->stencil;
+                consumed |= D3D12ClearFlags::Stencil;
             }
-            ++stats_.clears_folded;
-            pending_clears_.erase(pending_clears_.begin() + (pc - pending_clears_.data()));
+            if (!depth_aspect) {
+                pc->clear_flags &= ~D3D12ClearFlags::Depth;
+            }
+            if (!stencil_aspect) {
+                pc->clear_flags &= ~D3D12ClearFlags::Stencil;
+            }
+            if (consumed != 0) {
+                ++stats_.clears_folded;
+                pc->clear_flags &= ~consumed;
+            }
+            if (pc->clear_flags == 0) {
+                pending_clears_.erase(pending_clears_.begin() + (pc - pending_clears_.data()));
+            }
         }
     }
 
