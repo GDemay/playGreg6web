@@ -1533,6 +1533,9 @@ enum class Work : size_t {
     IndirectExecutionsSkipped,
     IndirectExecutionsEmitted,  // G66: draws / indexed draws / dispatches through the clamp pass
     TextureUploads,
+    TextureSyncViewSkips,    // sync skipped: view-backed range, no page written since the last full check
+    TextureSyncViewTracked,  // sync of a wholly view-backed range (skipped or not)
+    TextureSyncUntracked,    // sync of a range with a host pointer but no view coverage
     BufferUploads,
     CopiesSkipped,
     ResourcesCreated,

@@ -911,7 +911,9 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 cur.view_size = primary_size;
                 cur.view_cursor = cursor;  // also after a refusal: its commit position is current, never stale
             }
+            count_work(tracked ? Work::TextureSyncViewTracked : Work::TextureSyncUntracked);
             if (skip) {
+                count_work(Work::TextureSyncViewSkips);
                 return false;
             }
             view_tracked = tracked;
