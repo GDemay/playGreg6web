@@ -63,6 +63,7 @@
   const DEFAULT_MAX_RETRY_DELAY_MS = 30000;
   const PGIM_OPFS_CACHE_VERSION = 1;
   const DEFAULT_OPFS_CACHE_DIR = 'playgta6-pgim-cache';
+  const DEFAULT_OPFS_CACHE_MODE = 'auto';
 
   function defaultSleep(ms, signal) {
     if (signal && signal.aborted) {
@@ -141,6 +142,15 @@
     return Number.isFinite(mbps) && mbps > 0 ? mbps : 0;
   }
 
+  function computeOpfsHitRatePct(hits, misses) {
+    const h = sanitizeNonNegativeInt(hits);
+    const m = sanitizeNonNegativeInt(misses);
+    const total = h + m;
+    if (total <= 0) return 0;
+    const pct = (h / total) * 100;
+    return Number.isFinite(pct) && pct > 0 ? Math.min(100, pct) : 0;
+  }
+
   function emptyTelemetrySnapshot() {
     return {
       state: 'idle',
@@ -156,12 +166,14 @@
       parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
+      opfsEnabled: false,
       opfsHits: 0,
       opfsMisses: 0,
       opfsWrites: 0,
       opfsInvalidations: 0,
       bytesFromOpfs: 0,
       bytesFromNetwork: 0,
+      opfsHitRatePct: 0,
       wireBytesReleased: 0,
       droppedWasmBuffers: 0,
     };
@@ -340,12 +352,14 @@
         parallelMode: Boolean(this.parallelMode),
         retryCount: sanitizeNonNegativeInt(this.retryCount),
         abortedCount: sanitizeNonNegativeInt(this.abortedCount),
+        opfsEnabled: false,
         opfsHits: sanitizeNonNegativeInt(this.opfsHits),
         opfsMisses: sanitizeNonNegativeInt(this.opfsMisses),
         opfsWrites: sanitizeNonNegativeInt(this.opfsWrites),
         opfsInvalidations: sanitizeNonNegativeInt(this.opfsInvalidations),
         bytesFromOpfs: sanitizeNonNegativeInt(this.bytesFromOpfs),
         bytesFromNetwork: sanitizeNonNegativeInt(this.bytesFromNetwork),
+        opfsHitRatePct: computeOpfsHitRatePct(this.opfsHits, this.opfsMisses),
         wireBytesReleased: sanitizeNonNegativeInt(this.wireBytesReleased),
         droppedWasmBuffers: sanitizeNonNegativeInt(this.droppedWasmBuffers),
       };
@@ -1227,6 +1241,12 @@
     return cleaned.length > 0 ? cleaned : null;
   }
 
+  function normalizeLastModified(rawLastModified) {
+    if (typeof rawLastModified !== 'string') return null;
+    const cleaned = rawLastModified.replace(/[\x00-\x1f\x7f]/g, '').trim();
+    return cleaned.length > 0 ? cleaned : null;
+  }
+
   function fnv1a64HexString(str) {
     const bytes = new TextEncoder().encode(String(str));
     return pgimFnv1a64(bytes).toString(16).padStart(16, '0');
@@ -1327,6 +1347,61 @@
     return buildPgimOpfsFingerprint(url, etag, byteLength, version).dataKey;
   }
 
+  /**
+   * Build a deterministic, OPFS-filename-safe versioned fingerprint and cache keys for JSON
+   * manifests (`program-manifest.json`, `boot-manifest.json`).
+   *
+   * @param {string} url
+   * @param {string | null} [etag=null]
+   * @param {number | null} [byteLength=null]
+   * @param {number | string} [version=PGIM_OPFS_CACHE_VERSION]
+   */
+  function buildManifestOpfsFingerprint(url, etag = null, byteLength = null, version = PGIM_OPFS_CACHE_VERSION) {
+    const ver = normalizeOpfsCacheVersion(version);
+    const urlPath = sanitizePgimCacheUrlPath(url);
+    const normEtag = normalizeEtag(etag);
+    const validSize = Number.isSafeInteger(byteLength) && byteLength >= 0 ? byteLength : null;
+    const pathHash = fnv1a64HexString(urlPath);
+    const etagHash = normEtag !== null ? fnv1a64HexString(normEtag) : 'noetag';
+    const sizeToken = validSize !== null ? String(validSize) : 'nosize';
+    const leafRaw = urlPath.includes('/') ? urlPath.slice(urlPath.lastIndexOf('/') + 1) : urlPath;
+    const stemRaw = leafRaw.replace(/\.json$/i, '');
+    const safeStem = (stemRaw.replace(/[^A-Za-z0-9_-]/g, '_').replace(/^_+|_+$/g, '') || 'manifest').slice(0, 28);
+    const versionTag = `v${ver}`;
+    const fingerprint = `manifest-${versionTag}:${pathHash}:${sizeToken}:${etagHash}`;
+    const dataKey = `manifest-${versionTag}-${pathHash}-${safeStem}-${sizeToken}-${etagHash}.json`;
+    const metaKey = `manifest-${versionTag}-${pathHash}-${safeStem}.meta.json`;
+    return {
+      version: ver,
+      urlPath,
+      etag: normEtag,
+      byteLength: validSize,
+      pathHash,
+      etagHash,
+      fingerprint,
+      dataKey,
+      metaKey,
+    };
+  }
+
+  function resolveNativeOpfsStorage(storageObj) {
+    if (storageObj !== undefined) {
+      return storageObj && typeof storageObj.getDirectory === 'function' ? storageObj : null;
+    }
+    try {
+      const nav =
+        typeof globalThis !== 'undefined' && globalThis && globalThis.navigator
+          ? globalThis.navigator
+          : typeof navigator !== 'undefined'
+            ? navigator
+            : null;
+      const storage = nav && nav.storage ? nav.storage : null;
+      return storage && typeof storage.getDirectory === 'function' ? storage : null;
+    } catch {
+      return null;
+    }
+  }
+
   function extractCachedBytes(raw) {
     if (raw === null || raw === undefined) return null;
     if (raw instanceof Uint8Array) return raw;
@@ -1376,26 +1451,15 @@
   }
 
   function hasNativeOpfsStorage(storageObj = undefined) {
-    const storage =
-      storageObj !== undefined
-        ? storageObj
-        : typeof navigator !== 'undefined' && navigator && navigator.storage
-          ? navigator.storage
-          : null;
-    return Boolean(storage && typeof storage.getDirectory === 'function');
+    return resolveNativeOpfsStorage(storageObj) !== null;
   }
 
   function createNativeOpfsStore({ dirHandle = null, dirName = DEFAULT_OPFS_CACHE_DIR, storageObj = undefined } = {}) {
     let cachedDir = dirHandle || null;
     const resolveDir = async (create) => {
       if (cachedDir) return cachedDir;
-      const storage =
-        storageObj !== undefined
-          ? storageObj
-          : typeof navigator !== 'undefined' && navigator && navigator.storage
-            ? navigator.storage
-            : null;
-      if (!storage || typeof storage.getDirectory !== 'function') return null;
+      const storage = resolveNativeOpfsStorage(storageObj);
+      if (!storage) return null;
       let rootDir;
       try {
         rootDir = await storage.getDirectory();
@@ -1501,14 +1565,25 @@
   }
 
   function normalizeOpfsCacheStore(opfsCache, { dirName = DEFAULT_OPFS_CACHE_DIR, storageObj = undefined } = {}) {
-    if (opfsCache === null || opfsCache === undefined || opfsCache === false) {
-      return null;
+    if (opfsCache === null || opfsCache === false) {
+      return { store: null, enabled: false };
+    }
+    if (opfsCache === undefined || opfsCache === DEFAULT_OPFS_CACHE_MODE) {
+      if (isOpfsDisabledByQuery()) {
+        return { store: null, enabled: false };
+      }
+      const nativeStorage = resolveNativeOpfsStorage(storageObj);
+      if (!nativeStorage) {
+        return { store: null, enabled: false };
+      }
+      return { store: createNativeOpfsStore({ dirName, storageObj: nativeStorage }), enabled: true };
     }
     if (opfsCache === true) {
-      return createNativeOpfsStore({ dirName, storageObj });
+      const nativeStorage = resolveNativeOpfsStorage(storageObj);
+      return { store: createNativeOpfsStore({ dirName, storageObj }), enabled: nativeStorage !== null };
     }
     if (isFileSystemDirectoryHandle(opfsCache)) {
-      return createNativeOpfsStore({ dirHandle: opfsCache, dirName });
+      return { store: createNativeOpfsStore({ dirHandle: opfsCache, dirName }), enabled: true };
     }
     if (typeof opfsCache === 'object') {
       const hasReadWrite = typeof opfsCache.read === 'function' && typeof opfsCache.write === 'function';
@@ -1521,18 +1596,21 @@
               ? (key) => opfsCache.remove(key)
               : null;
         return {
-          read: hasReadWrite
-            ? (key, meta) => opfsCache.read(key, meta)
-            : (key, meta) => opfsCache.get(key, meta),
-          write: hasReadWrite
-            ? (key, bytes, meta) => opfsCache.write(key, bytes, meta)
-            : (key, bytes, meta) => opfsCache.put(key, bytes, meta),
-          delete: deleteFn,
+          store: {
+            read: hasReadWrite
+              ? (key, meta) => opfsCache.read(key, meta)
+              : (key, meta) => opfsCache.get(key, meta),
+            write: hasReadWrite
+              ? (key, bytes, meta) => opfsCache.write(key, bytes, meta)
+              : (key, bytes, meta) => opfsCache.put(key, bytes, meta),
+            delete: deleteFn,
+          },
+          enabled: true,
         };
       }
     }
     throw new TypeError(
-      'opfsCache must be null, boolean, a FileSystemDirectoryHandle, or an object exposing { read, write, delete } (or { get, put, delete })'
+      "opfsCache must be 'auto', null, boolean, a FileSystemDirectoryHandle, or an object exposing { read, write, delete } (or { get, put, delete })"
     );
   }
 
@@ -2288,7 +2366,7 @@
   constructor({
     fetchImpl,
     rangeCache = null,
-    opfsCache = undefined,
+    opfsCache = DEFAULT_OPFS_CACHE_MODE,
     opfsCacheVersion = PGIM_OPFS_CACHE_VERSION,
     opfsCacheDirName = DEFAULT_OPFS_CACHE_DIR,
     opfsValidateWithHead = true,
@@ -2323,16 +2401,12 @@
       typeof opfsCacheDirName === 'string' && opfsCacheDirName.trim().length > 0
         ? opfsCacheDirName.trim()
         : DEFAULT_OPFS_CACHE_DIR;
-    const effectiveOpfsCache =
-      opfsCache !== undefined
-        ? opfsCache
-        : !isOpfsDisabledByQuery() && hasNativeOpfsStorage(opfsStorageObj)
-          ? true
-          : null;
-    const normalizedOpfsStore = normalizeOpfsCacheStore(effectiveOpfsCache, {
+    const normalizedOpfs = normalizeOpfsCacheStore(opfsCache, {
       dirName: normalizedOpfsDir,
       storageObj: opfsStorageObj,
     });
+    const normalizedOpfsStore = normalizedOpfs.store;
+    const opfsEnabled = normalizedOpfs.enabled;
     const effectiveChunkSize =
       chunkSize !== undefined
         ? chunkSize
@@ -2380,8 +2454,10 @@
     }
     this.fetchImpl = impl;
     this.rangeCache = rangeCache;
-    this.opfsCache = effectiveOpfsCache;
+    this.opfsCache = opfsCache;
     this._opfsStore = normalizedOpfsStore;
+    this._opfsEnabled = opfsEnabled;
+    this.opfsEnabled = opfsEnabled;
     this.opfsCacheVersion = normalizedOpfsVersion;
     this.opfsCacheDirName = normalizedOpfsDir;
     this.opfsValidateWithHead = Boolean(opfsValidateWithHead);
@@ -2440,6 +2516,8 @@
     const snap = this._telemetryRun ? this._telemetryRun.snapshot() : emptyTelemetrySnapshot();
     snap.wireBytesReleased = Math.max(snap.wireBytesReleased, sanitizeNonNegativeInt(this._wireBytesReleased));
     snap.droppedWasmBuffers = Math.max(snap.droppedWasmBuffers, sanitizeNonNegativeInt(this._droppedWasmBuffers));
+    snap.opfsEnabled = Boolean(this._opfsEnabled);
+    snap.opfsHitRatePct = computeOpfsHitRatePct(snap.opfsHits, snap.opfsMisses);
     return snap;
   }
 
@@ -2716,12 +2794,12 @@
     }
   }
 
-  async _readOpfsMeta(metaKey, signal) {
+  async _readOpfsMeta(metaKey, signal, kind = 'pgim-meta') {
     const store = this._opfsStore;
     if (!store) return null;
     let raw;
     try {
-      raw = await raceAbort(Promise.resolve().then(() => store.read(metaKey, { kind: 'pgim-meta' })), signal);
+      raw = await raceAbort(Promise.resolve().then(() => store.read(metaKey, { kind })), signal);
     } catch (err) {
       if ((signal && signal.aborted) || isAbortError(err)) throw err;
       return null;
@@ -2741,13 +2819,23 @@
   async _tryLoadFromOpfsCache(
     ctx,
     probe,
-    { verifyChecksums = false, expectedEtag = null, expectedBytes = null, countMiss = true } = {}
+    {
+      verifyChecksums = false,
+      expectedEtag = null,
+      expectedBytes = null,
+      expectedLastModified = null,
+      countMiss = true,
+    } = {}
   ) {
     const store = this._opfsStore;
     if (!store) return null;
     throwIfAborted(ctx.signal);
 
     const probeEtag = probe && probe.etag !== undefined ? normalizeEtag(probe.etag) : normalizeEtag(expectedEtag);
+    const probeLastModified =
+      probe && probe.lastModified !== undefined
+        ? normalizeLastModified(probe.lastModified)
+        : normalizeLastModified(expectedLastModified);
     const probeSize =
       probe && typeof probe.totalBytes === 'number' && Number.isSafeInteger(probe.totalBytes) && probe.totalBytes >= 0
         ? probe.totalBytes
@@ -2757,10 +2845,11 @@
     const headValidated = Boolean(probe && probe.headOk);
 
     const baseFp = buildPgimOpfsFingerprint(ctx.url, probeEtag, probeSize, this.opfsCacheVersion);
-    const meta = await this._readOpfsMeta(baseFp.metaKey, ctx.signal);
+    const meta = await this._readOpfsMeta(baseFp.metaKey, ctx.signal, 'pgim-meta');
 
     let candidateDataKey = null;
     let candidateEtag = probeEtag;
+    let candidateLastModified = probeLastModified;
     let candidateFingerprint = baseFp.fingerprint;
     let invalidated = false;
 
@@ -2778,6 +2867,7 @@
         invalidated = true;
       } else {
         const metaEtag = normalizeEtag(meta.etag);
+        const metaLastModified = normalizeLastModified(meta.lastModified);
         let mismatch = false;
         if (probeSize !== null && meta.byteLength !== probeSize) {
           mismatch = true;
@@ -2786,15 +2876,23 @@
           // Strict ETag equality when HEAD succeeded (detects ETag rotation, addition, or removal).
           if (metaEtag !== probeEtag) {
             mismatch = true;
+          } else if (probeEtag === null && metaLastModified !== probeLastModified) {
+            // Secondary validator when server omits ETag: Last-Modified change/addition/removal invalidates.
+            mismatch = true;
           }
-        } else if (probeEtag !== null && metaEtag !== probeEtag) {
-          mismatch = true;
+        } else {
+          if (probeEtag !== null && metaEtag !== probeEtag) {
+            mismatch = true;
+          } else if (probeEtag === null && probeLastModified !== null && metaLastModified !== probeLastModified) {
+            mismatch = true;
+          }
         }
         if (mismatch) {
           invalidated = true;
         } else {
           candidateDataKey = meta.dataKey;
           candidateEtag = metaEtag;
+          candidateLastModified = metaLastModified;
           candidateFingerprint =
             typeof meta.fingerprint === 'string' && meta.fingerprint.length > 0
               ? meta.fingerprint
@@ -2909,33 +3007,44 @@
       parallelMode: false,
       opfsCacheHit: true,
       etag: candidateEtag,
+      lastModified: candidateLastModified,
       cacheKey: candidateDataKey,
       cacheFingerprint: candidateFingerprint,
     };
   }
 
-  _scheduleOpfsWrite(run, { url, etag, bytes, totalBytes }) {
+  _scheduleOpfsWrite(run, { url, etag, lastModified = null, bytes, totalBytes }) {
     const store = this._opfsStore;
-    if (!store || !bytes || !(totalBytes > 0) || (bytes.buffer && bytes.buffer.detached)) return;
+    if (!store || !bytes || !(totalBytes > 0)) return;
+    if (bytes.byteLength !== totalBytes || (bytes.buffer && bytes.buffer.detached)) return;
     const fp = buildPgimOpfsFingerprint(url, etag, totalBytes, this.opfsCacheVersion);
-    const metaPayload = new TextEncoder().encode(
+    const normLastModified = normalizeLastModified(lastModified);
+    // Synchronously clone a detached-safe non-SAB copy so immediate Worker zero-copy transfer
+    // (`transferPreloadPayloadToWorker`) or `releaseBootBundleBytes()` cannot detach/corrupt the
+    // background OPFS write. Dropped immediately in `finally` to preserve W258 zero-retention.
+    let payloadToWrite;
+    try {
+      payloadToWrite = bytes.slice();
+    } catch {
+      return;
+    }
+    let metaPayload = new TextEncoder().encode(
       JSON.stringify({
         version: this.opfsCacheVersion,
         urlPath: fp.urlPath,
         etag: fp.etag,
+        lastModified: normLastModified,
         byteLength: totalBytes,
         fingerprint: fp.fingerprint,
         dataKey: fp.dataKey,
       })
     );
-    // Snapshot an owned copy before returning so caller zero-copy postMessage transfer
-    // (detaching the ArrayBuffer) or SharedArrayBuffer views cannot corrupt/abort the async write.
-    let payloadToWrite = bytes.slice();
     const dataMeta = {
       kind: 'pgim',
       version: this.opfsCacheVersion,
       urlPath: fp.urlPath,
       etag: fp.etag,
+      lastModified: normLastModified,
       byteLength: totalBytes,
       fingerprint: fp.fingerprint,
     };
@@ -2944,31 +3053,40 @@
       version: this.opfsCacheVersion,
       urlPath: fp.urlPath,
       etag: fp.etag,
+      lastModified: normLastModified,
       byteLength: totalBytes,
       fingerprint: fp.fingerprint,
     };
 
     const runWrite = async () => {
-      const dataToWrite = payloadToWrite;
+      let dataToWrite = payloadToWrite;
       payloadToWrite = null;
-      const writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
-      const stored =
-        writeRes !== false &&
-        !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
-      if (!stored) return;
+      let metaToWrite = metaPayload;
+      metaPayload = null;
       try {
-        await store.write(fp.metaKey, metaPayload, metaInfo);
-      } catch (metaErr) {
-        if (typeof store.delete === 'function') {
-          try {
-            await store.delete(fp.dataKey);
-          } catch {
-            // Ignore cleanup failure.
+        const writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
+        dataToWrite = null;
+        const stored =
+          writeRes !== false &&
+          !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
+        if (!stored) return;
+        try {
+          await store.write(fp.metaKey, metaToWrite, metaInfo);
+        } catch (metaErr) {
+          if (typeof store.delete === 'function') {
+            try {
+              await store.delete(fp.dataKey);
+            } catch {
+              // Ignore cleanup failure.
+            }
           }
+          throw metaErr;
         }
-        throw metaErr;
+        if (run) run.recordOpfsWrite();
+      } finally {
+        dataToWrite = null;
+        metaToWrite = null;
       }
-      if (run) run.recordOpfsWrite();
     };
 
     const task = runWrite()
@@ -2980,6 +3098,331 @@
         this._pendingOpfsWrites.delete(task);
       });
     this._pendingOpfsWrites.add(task);
+  }
+
+  _scheduleManifestOpfsWrite(run, { url, etag, lastModified = null, bytes }) {
+    const store = this._opfsStore;
+    if (!store || !bytes || !(bytes.byteLength > 0)) return;
+    if (bytes.buffer && bytes.buffer.detached) return;
+    const totalBytes = bytes.byteLength;
+    const fp = buildManifestOpfsFingerprint(url, etag, totalBytes, this.opfsCacheVersion);
+    const normLastModified = normalizeLastModified(lastModified);
+    let payloadToWrite;
+    try {
+      payloadToWrite = bytes.slice();
+    } catch {
+      return;
+    }
+    let metaPayload = new TextEncoder().encode(
+      JSON.stringify({
+        kind: 'manifest',
+        version: this.opfsCacheVersion,
+        urlPath: fp.urlPath,
+        etag: fp.etag,
+        lastModified: normLastModified,
+        byteLength: totalBytes,
+        fingerprint: fp.fingerprint,
+        dataKey: fp.dataKey,
+      })
+    );
+    const dataMeta = {
+      kind: 'manifest',
+      version: this.opfsCacheVersion,
+      urlPath: fp.urlPath,
+      etag: fp.etag,
+      lastModified: normLastModified,
+      byteLength: totalBytes,
+      fingerprint: fp.fingerprint,
+    };
+    const metaInfo = {
+      kind: 'manifest-meta',
+      version: this.opfsCacheVersion,
+      urlPath: fp.urlPath,
+      etag: fp.etag,
+      lastModified: normLastModified,
+      byteLength: totalBytes,
+      fingerprint: fp.fingerprint,
+    };
+
+    const runWrite = async () => {
+      let dataToWrite = payloadToWrite;
+      payloadToWrite = null;
+      let metaToWrite = metaPayload;
+      metaPayload = null;
+      try {
+        const writeRes = await store.write(fp.dataKey, dataToWrite, dataMeta);
+        dataToWrite = null;
+        const stored =
+          writeRes !== false &&
+          !(writeRes && typeof writeRes === 'object' && writeRes.stored === false);
+        if (!stored) return;
+        try {
+          await store.write(fp.metaKey, metaToWrite, metaInfo);
+        } catch (metaErr) {
+          if (typeof store.delete === 'function') {
+            try {
+              await store.delete(fp.dataKey);
+            } catch {
+              // Ignore cleanup failure.
+            }
+          }
+          throw metaErr;
+        }
+        if (run) run.recordOpfsWrite();
+      } finally {
+        dataToWrite = null;
+        metaToWrite = null;
+      }
+    };
+
+    const task = runWrite()
+      .catch((err) => {
+        void isQuotaExceededError(err);
+      })
+      .finally(() => {
+        this._pendingOpfsWrites.delete(task);
+      });
+    this._pendingOpfsWrites.add(task);
+  }
+
+  async _fetchManifestWithOpfs(url, label, parseFn, { telemetryRun = null, signal = null, opfsValidateWithHead = this.opfsValidateWithHead } = {}) {
+    throwIfAborted(signal);
+    const store = this._opfsStore;
+    if (!store) {
+      const ctx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
+      const response = await this._request(ctx, { method: 'GET' });
+      if (!response.ok) throw httpError(url, response.status, label);
+      const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+      throwIfAborted(signal);
+      if (telemetryRun && bytes.byteLength > 0) {
+        telemetryRun.recordNetworkBytes(bytes.byteLength);
+      }
+      const parsed = parseFn(bytes, { baseUrl: url, manifestUrl: url, url });
+      return {
+        parsed,
+        requests: ctx.requests,
+        opfsCacheHit: false,
+        etag: normalizeEtag(headerValue(response, 'etag')),
+        lastModified: normalizeLastModified(headerValue(response, 'last-modified')),
+      };
+    }
+
+    let requests = 0;
+    const baseFp = buildManifestOpfsFingerprint(url, null, null, this.opfsCacheVersion);
+    let meta = await this._readOpfsMeta(baseFp.metaKey, signal, 'manifest-meta');
+
+    if (meta !== null) {
+      const validMetaShape =
+        !meta._corrupt &&
+        meta.version === this.opfsCacheVersion &&
+        meta.urlPath === baseFp.urlPath &&
+        typeof meta.dataKey === 'string' &&
+        meta.dataKey.length > 0 &&
+        Number.isSafeInteger(meta.byteLength) &&
+        meta.byteLength > 0;
+      if (!validMetaShape) {
+        const keysToDelete = [baseFp.metaKey];
+        if (typeof meta.dataKey === 'string' && meta.dataKey.length > 0) {
+          keysToDelete.push(meta.dataKey);
+        }
+        await this._deleteOpfsKeys(keysToDelete);
+        if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+        meta = null;
+      }
+    }
+
+    const tryReadAndParseCached = async (cachedMeta, expectedSize = null) => {
+      let rawData;
+      try {
+        rawData = await raceAbort(
+          Promise.resolve().then(() =>
+            store.read(cachedMeta.dataKey, {
+              kind: 'manifest',
+              version: this.opfsCacheVersion,
+              urlPath: baseFp.urlPath,
+              etag: normalizeEtag(cachedMeta.etag),
+              byteLength: expectedSize ?? cachedMeta.byteLength,
+              fingerprint: cachedMeta.fingerprint || null,
+            })
+          ),
+          signal
+        );
+      } catch (err) {
+        if ((signal && signal.aborted) || isAbortError(err)) throw err;
+        return null;
+      }
+      throwIfAborted(signal);
+      const cachedBytes = extractCachedBytes(rawData);
+      if (!cachedBytes || cachedBytes.byteLength === 0) {
+        await this._deleteOpfsKeys([cachedMeta.dataKey, baseFp.metaKey]);
+        if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+        return null;
+      }
+      const checkSize = expectedSize !== null ? expectedSize : cachedMeta.byteLength;
+      if (checkSize !== null && cachedBytes.byteLength !== checkSize) {
+        await this._deleteOpfsKeys([cachedMeta.dataKey, baseFp.metaKey]);
+        if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+        return null;
+      }
+      let parsed;
+      try {
+        parsed = parseFn(cachedBytes, { baseUrl: url, manifestUrl: url, url });
+      } catch {
+        await this._deleteOpfsKeys([cachedMeta.dataKey, baseFp.metaKey]);
+        if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+        return null;
+      }
+      if (telemetryRun) {
+        telemetryRun.recordOpfsHit(cachedBytes.byteLength);
+      }
+      return {
+        parsed,
+        requests,
+        opfsCacheHit: true,
+        etag: normalizeEtag(cachedMeta.etag),
+        lastModified: normalizeLastModified(cachedMeta.lastModified),
+      };
+    };
+
+    if (meta !== null) {
+      if (!opfsValidateWithHead) {
+        const fastHit = await tryReadAndParseCached(meta, meta.byteLength);
+        if (fastHit !== null) return fastHit;
+        meta = null;
+      } else {
+        const metaEtag = normalizeEtag(meta.etag);
+        const metaLastModified = normalizeLastModified(meta.lastModified);
+        const headCtx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
+        let headResp = null;
+        try {
+          headResp = await this._request(headCtx, { method: 'HEAD' });
+          requests += headCtx.requests;
+        } catch (err) {
+          requests += headCtx.requests;
+          if ((signal && signal.aborted) || isAbortError(err)) throw err;
+          headResp = null;
+        }
+
+        let needsConditionalGet = false;
+        if (headResp && (headResp.status === 404 || headResp.status === 410)) {
+          await this._deleteOpfsKeys([meta.dataKey, baseFp.metaKey]);
+          if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+          throw httpError(url, headResp.status, label);
+        } else if (headResp && headResp.ok) {
+          const headEtag = normalizeEtag(headerValue(headResp, 'etag'));
+          const headSize = contentLength(headResp);
+          const headLastMod = normalizeLastModified(headerValue(headResp, 'last-modified'));
+          const hasHeadValidators = headEtag !== null || headSize !== null || headLastMod !== null;
+          let mismatch = false;
+          if (headSize !== null && meta.byteLength !== headSize) {
+            mismatch = true;
+          }
+          if (headEtag !== null && metaEtag !== headEtag) {
+            mismatch = true;
+          } else if (headEtag === null && metaEtag === null && metaLastModified !== headLastMod) {
+            mismatch = true;
+          }
+          if (mismatch) {
+            await this._deleteOpfsKeys([meta.dataKey, baseFp.metaKey]);
+            if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+            meta = null;
+          } else if (hasHeadValidators && !(headEtag === null && metaEtag !== null)) {
+            const headHit = await tryReadAndParseCached(meta, headSize !== null ? headSize : meta.byteLength);
+            if (headHit !== null) return headHit;
+            meta = null;
+          } else {
+            needsConditionalGet = true;
+          }
+        } else {
+          // HEAD unsupported (e.g. 405) or transient error: validate via conditional GET.
+          needsConditionalGet = true;
+        }
+
+        if (meta !== null && needsConditionalGet) {
+          const condHeaders = {};
+          if (metaEtag !== null) condHeaders['If-None-Match'] = metaEtag;
+          if (metaLastModified !== null) condHeaders['If-Modified-Since'] = metaLastModified;
+          const getCtx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
+          const init =
+            Object.keys(condHeaders).length > 0 ? { method: 'GET', headers: condHeaders } : { method: 'GET' };
+          const condResp = await this._request(getCtx, init);
+          requests += getCtx.requests;
+          if (condResp.status === 304) {
+            const condHit = await tryReadAndParseCached(meta, meta.byteLength);
+            if (condHit !== null) return condHit;
+            meta = null;
+          } else if (!condResp.ok) {
+            if (condResp.status === 404 || condResp.status === 410) {
+              await this._deleteOpfsKeys([meta.dataKey, baseFp.metaKey]);
+              if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+            }
+            throw httpError(url, condResp.status, label);
+          } else {
+            const bytes = new Uint8Array(await raceAbort(condResp.arrayBuffer(), signal));
+            throwIfAborted(signal);
+            const respEtag = normalizeEtag(headerValue(condResp, 'etag'));
+            const respLastMod = normalizeLastModified(headerValue(condResp, 'last-modified'));
+            const changed =
+              bytes.byteLength !== meta.byteLength ||
+              (respEtag !== null && respEtag !== metaEtag) ||
+              (respEtag === null && respLastMod !== null && respLastMod !== metaLastModified);
+            if (changed) {
+              await this._deleteOpfsKeys([meta.dataKey, baseFp.metaKey]);
+              if (telemetryRun) telemetryRun.recordOpfsInvalidation();
+            }
+            if (telemetryRun) {
+              telemetryRun.recordOpfsMiss();
+              telemetryRun.recordNetworkBytes(bytes.byteLength);
+            }
+            const parsed = parseFn(bytes, { baseUrl: url, manifestUrl: url, url });
+            if (!(signal && signal.aborted)) {
+              this._scheduleManifestOpfsWrite(telemetryRun, {
+                url,
+                etag: respEtag,
+                lastModified: respLastMod,
+                bytes,
+              });
+            }
+            return {
+              parsed,
+              requests,
+              opfsCacheHit: false,
+              etag: respEtag,
+              lastModified: respLastMod,
+            };
+          }
+        }
+      }
+    }
+
+    const getCtx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
+    const response = await this._request(getCtx, { method: 'GET' });
+    requests += getCtx.requests;
+    if (!response.ok) throw httpError(url, response.status, label);
+    const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
+    throwIfAborted(signal);
+    if (telemetryRun) {
+      telemetryRun.recordOpfsMiss();
+      telemetryRun.recordNetworkBytes(bytes.byteLength);
+    }
+    const parsed = parseFn(bytes, { baseUrl: url, manifestUrl: url, url });
+    const respEtag = normalizeEtag(headerValue(response, 'etag'));
+    const respLastMod = normalizeLastModified(headerValue(response, 'last-modified'));
+    if (!(signal && signal.aborted)) {
+      this._scheduleManifestOpfsWrite(telemetryRun, {
+        url,
+        etag: respEtag,
+        lastModified: respLastMod,
+        bytes,
+      });
+    }
+    return {
+      parsed,
+      requests,
+      opfsCacheHit: false,
+      etag: respEtag,
+      lastModified: respLastMod,
+    };
   }
 
   async _preloadGuestImageCore(
@@ -3065,12 +3508,19 @@
         : probe && probe.etag !== undefined
           ? probe.etag
           : null;
+    const effectiveLastModified =
+      loaded.lastModified !== undefined && loaded.lastModified !== null
+        ? loaded.lastModified
+        : probe && probe.lastModified !== undefined
+          ? probe.lastModified
+          : null;
     const opfsCacheHit = Boolean(loaded.opfsCacheHit);
 
     if (!opfsCacheHit && this._opfsStore && !(signal && signal.aborted)) {
       this._scheduleOpfsWrite(ctx.run, {
         url,
         etag: effectiveEtag,
+        lastModified: effectiveLastModified,
         bytes: loaded.bytes,
         totalBytes,
       });
@@ -3159,7 +3609,16 @@
       verifyChecksums = false,
       chunkSize = this.chunkSize,
       concurrency = this.concurrency,
+      opfsValidateWithHead,
+      validateWithHead,
     } = opts || {};
+
+    const effectiveValidateWithHead =
+      opfsValidateWithHead !== undefined
+        ? Boolean(opfsValidateWithHead)
+        : validateWithHead !== undefined
+          ? Boolean(validateWithHead)
+          : this.opfsValidateWithHead;
 
     validateManifestEndpointUrl(requestedUrl, 'program manifest URL');
     throwIfAborted(signal);
@@ -3183,28 +3642,26 @@
       moduleTotalBytes: null,
     });
 
-    const fetchManifestBytes = async (url, label) => {
-      const ctx = { url, signal, emit: () => {}, requests: 0, run: telemetryRun, ownsTotalBytes: false };
-      const response = await this._request(ctx, { method: 'GET' });
-      totalRequests += ctx.requests;
-      if (!response.ok) throw httpError(url, response.status, label);
-      const bytes = new Uint8Array(await raceAbort(response.arrayBuffer(), signal));
-      throwIfAborted(signal);
-      return bytes;
-    };
-
     let parsedManifest = null;
     let source = 'program-manifest';
     let resolvedManifestUrl = requestedUrl;
     let usedFallback = false;
+    let manifestOpfsCacheHit = false;
 
     try {
-      const manifestBytes = await fetchManifestBytes(requestedUrl, 'program manifest');
-      parsedManifest = parseProgramManifest(manifestBytes, {
-        baseUrl: requestedUrl,
-        manifestUrl: requestedUrl,
-        url: requestedUrl,
-      });
+      const fetched = await this._fetchManifestWithOpfs(
+        requestedUrl,
+        'program manifest',
+        parseProgramManifest,
+        {
+          telemetryRun,
+          signal,
+          opfsValidateWithHead: effectiveValidateWithHead,
+        }
+      );
+      totalRequests += fetched.requests;
+      parsedManifest = fetched.parsed;
+      manifestOpfsCacheHit = Boolean(fetched.opfsCacheHit);
     } catch (err) {
       if (!(err instanceof PgimPreloadError && err.code === 'NOT_FOUND')) {
         throw err;
@@ -3234,12 +3691,19 @@
           fallbackTo: resolvedBootUrl,
         });
         try {
-          const bootBytes = await fetchManifestBytes(resolvedBootUrl, 'boot manifest');
-          parsedManifest = parseBootManifest(bootBytes, {
-            baseUrl: resolvedBootUrl,
-            manifestUrl: resolvedBootUrl,
-            url: resolvedBootUrl,
-          });
+          const bootFetched = await this._fetchManifestWithOpfs(
+            resolvedBootUrl,
+            'boot manifest',
+            parseBootManifest,
+            {
+              telemetryRun,
+              signal,
+              opfsValidateWithHead: effectiveValidateWithHead,
+            }
+          );
+          totalRequests += bootFetched.requests;
+          parsedManifest = bootFetched.parsed;
+          manifestOpfsCacheHit = Boolean(bootFetched.opfsCacheHit);
           source = 'boot-manifest';
           resolvedManifestUrl = resolvedBootUrl;
           usedFallback = true;
@@ -3346,7 +3810,9 @@
     }
 
     // Pre-probe every module with HEAD (bounded by concurrency) to learn aggregate totalBytes upfront.
-    const probes = new Array(moduleCount);
+    // When OPFS no-HEAD fast path is enabled, read cached byteLength from OPFS metadata when available.
+    const probes = new Array(moduleCount).fill(null);
+    const cachedSizes = new Array(moduleCount).fill(null);
     const { controller: probeController, unlink: unlinkProbe } = linkSignal(signal);
     let nextProbe = 0;
     let probeFailure = null;
@@ -3354,6 +3820,22 @@
       while (probeFailure === null && nextProbe < moduleCount) {
         const idx = nextProbe;
         nextProbe += 1;
+        if (this._opfsStore && !effectiveValidateWithHead) {
+          const baseFp = buildPgimOpfsFingerprint(descriptors[idx].url, null, null, this.opfsCacheVersion);
+          const meta = await this._readOpfsMeta(baseFp.metaKey, probeController.signal, 'pgim-meta');
+          if (
+            meta &&
+            !meta._corrupt &&
+            meta.version === this.opfsCacheVersion &&
+            meta.urlPath === baseFp.urlPath &&
+            Number.isSafeInteger(meta.byteLength) &&
+            meta.byteLength >= PGIM_HEADER_BYTES
+          ) {
+            cachedSizes[idx] = meta.byteLength;
+            probes[idx] = null;
+            continue;
+          }
+        }
         const pCtx = {
           url: descriptors[idx].url,
           signal: probeController.signal,
@@ -3384,7 +3866,13 @@
     if (probeFailure !== null) throw probeFailure;
 
     const moduleLoaded = new Array(moduleCount).fill(0);
-    const moduleTotals = probes.map((p) => (p && typeof p.totalBytes === 'number' && p.totalBytes > 0 ? p.totalBytes : null));
+    const moduleTotals = probes.map((p, idx) =>
+      p && typeof p.totalBytes === 'number' && p.totalBytes > 0
+        ? p.totalBytes
+        : cachedSizes[idx] !== null
+          ? cachedSizes[idx]
+          : null
+    );
 
     const computeAggregate = () => {
       let loadedBytes = 0;
@@ -3452,6 +3940,7 @@
         emitComplete: false,
         telemetryRun,
         ownsTotalBytes: false,
+        opfsValidateWithHead: effectiveValidateWithHead,
         onProgress: (evt) => {
           if (typeof evt.loadedBytes === 'number' && evt.loadedBytes > moduleLoaded[i]) {
             moduleLoaded[i] = evt.loadedBytes;
@@ -3532,6 +4021,7 @@
       manifestUrl: resolvedManifestUrl,
       requestedManifestUrl: requestedUrl,
       usedFallback,
+      manifestOpfsCacheHit,
       manifest: parsedManifest.raw !== null ? parsedManifest : null,
       modules: loadedModules,
       modulesByName,
@@ -3695,6 +4185,8 @@
     chunkSize,
     chunkBytes,
     concurrency,
+    opfsValidateWithHead,
+    validateWithHead,
   } = {}) {
     const hasProgramManifest = typeof programManifestUrl === 'string' && programManifestUrl.length > 0;
     const hasPgimUrl = typeof pgimUrl === 'string' && pgimUrl.length > 0;
@@ -3702,6 +4194,12 @@
       throw new TypeError('pgimUrl or programManifestUrl must be a non-empty string');
     }
     const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
+    const effectiveValidateWithHead =
+      opfsValidateWithHead !== undefined
+        ? Boolean(opfsValidateWithHead)
+        : validateWithHead !== undefined
+          ? Boolean(validateWithHead)
+          : this.opfsValidateWithHead;
     const run = this._startTelemetryRun();
     try {
       throwIfAborted(signal);
@@ -3764,6 +4262,7 @@
                   verifyChecksums,
                   chunkSize: transfer.chunkSize,
                   concurrency: transfer.concurrency,
+                  opfsValidateWithHead: effectiveValidateWithHead,
                 },
                 run
               )
@@ -3778,6 +4277,7 @@
                 emitComplete: true,
                 telemetryRun: run,
                 ownsTotalBytes: false,
+                opfsValidateWithHead: effectiveValidateWithHead,
               })
         ),
         optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes, true),
@@ -3830,6 +4330,7 @@
           header: primary.header,
           shared: primary.shared,
           opfsCacheHit: allOpfsHits,
+          manifestOpfsCacheHit: Boolean(pgimResult.manifestOpfsCacheHit),
           program: pgimResult,
           modules: pgimResult.modules,
           modulesByName: pgimResult.modulesByName,
@@ -3950,10 +4451,10 @@
         response = await this._request(ctx, { method: 'HEAD' });
       } catch (err) {
         if (ctx.signal && ctx.signal.aborted) throw err;
-        return { totalBytes: null, acceptRanges: null, etag: null, headOk: false }; // HEAD unsupported: probe with a Range GET.
+        return { totalBytes: null, acceptRanges: null, etag: null, lastModified: null, headOk: false }; // HEAD unsupported: probe with a Range GET.
       }
       if (response.status === 404 || response.status === 410) throw httpError(ctx.url, response.status);
-      if (!response.ok) return { totalBytes: null, acceptRanges: null, etag: null, headOk: false };
+      if (!response.ok) return { totalBytes: null, acceptRanges: null, etag: null, lastModified: null, headOk: false };
       const totalBytes = contentLength(response);
       if (totalBytes !== null && totalBytes < PGIM_HEADER_BYTES) {
         throw new PgimPreloadError(
@@ -3969,7 +4470,8 @@
         else if (ranges.trim().toLowerCase() === 'none') acceptRanges = false;
       }
       const etag = normalizeEtag(headerValue(response, 'etag'));
-      return { totalBytes, acceptRanges, etag, headOk: true };
+      const lastModified = normalizeLastModified(headerValue(response, 'last-modified'));
+      return { totalBytes, acceptRanges, etag, lastModified, headOk: true };
     }
 
     async _probeAsset(ctx, what) {
@@ -4138,7 +4640,12 @@
 
           const bytes = new Uint8Array(await raceAbort(res.arrayBuffer(), signal));
           throwIfAborted(signal);
-          return { bytes, range: cr, etag: normalizeEtag(headerValue(res, 'etag')) };
+          return {
+            bytes,
+            range: cr,
+            etag: normalizeEtag(headerValue(res, 'etag')),
+            lastModified: normalizeLastModified(headerValue(res, 'last-modified')),
+          };
         } catch (err) {
           if (signal && signal.aborted) throw abortReason(signal);
           if (isAbortError(err)) throw err;
@@ -4175,7 +4682,7 @@
         // Server ignored the Range header: consume the full body as a single GET.
         return this._consumeFullBody(ctx, firstRes.fullResponse, probe.totalBytes);
       }
-      let { bytes: first, range, etag: chunkEtag } = firstRes;
+      let { bytes: first, range, etag: chunkEtag, lastModified: chunkLastModified } = firstRes;
       firstRes.bytes = null;
       if (range && (range.start !== 0 || range.end - range.start + 1 !== first.byteLength)) {
         throw new PgimPreloadError('RANGE_MISMATCH', `PGIM first chunk Content-Range does not match the ${first.byteLength} received bytes`);
@@ -4227,6 +4734,7 @@
         parallelMode,
         opfsCacheHit: false,
         etag: probe.etag ?? chunkEtag ?? null,
+        lastModified: probe.lastModified ?? chunkLastModified ?? null,
       };
     }
 
@@ -4337,6 +4845,7 @@
 
     async _consumeFullBody(ctx, response, knownTotal) {
       const responseEtag = normalizeEtag(headerValue(response, 'etag'));
+      const responseLastModified = normalizeLastModified(headerValue(response, 'last-modified'));
       const declared = contentLength(response);
       if (declared !== null && knownTotal !== null && declared !== knownTotal) {
         throw new PgimPreloadError('SIZE_MISMATCH', `PGIM size changed between HEAD (${knownTotal}) and GET (${declared})`);
@@ -4383,6 +4892,7 @@
           parallelMode: false,
           opfsCacheHit: false,
           etag: responseEtag,
+          lastModified: responseLastModified,
         };
       }
 
@@ -4463,6 +4973,7 @@
         parallelMode: false,
         opfsCacheHit: false,
         etag: responseEtag,
+        lastModified: responseLastModified,
       };
     }
 
@@ -4607,7 +5118,7 @@
       preloader = null,
       fetchImpl,
       rangeCache = null,
-      opfsCache = undefined,
+      opfsCache = DEFAULT_OPFS_CACHE_MODE,
       opfsCacheVersion,
       opfsCacheDirName,
       opfsValidateWithHead,
@@ -4667,6 +5178,7 @@
     DEFAULT_CONCURRENCY,
     PGIM_OPFS_CACHE_VERSION,
     DEFAULT_OPFS_CACHE_DIR,
+    DEFAULT_OPFS_CACHE_MODE,
     PROGRAM_MANIFEST_SCHEMA,
     PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,
@@ -4677,6 +5189,7 @@
     sanitizePgimCacheUrlPath,
     buildPgimOpfsFingerprint,
     buildPgimOpfsCacheKey,
+    buildManifestOpfsFingerprint,
     parseProgramManifest,
     parseBootManifest,
     preloadProgramModules,

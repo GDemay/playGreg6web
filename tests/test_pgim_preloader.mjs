@@ -1558,12 +1558,14 @@ test('W147 constructor validates retryDelayMs, maxRetryDelayMs, sleepFn, nowFn a
     parallelMode: false,
     retryCount: 0,
     abortedCount: 0,
+    opfsEnabled: false,
     opfsHits: 0,
     opfsMisses: 0,
     opfsWrites: 0,
     opfsInvalidations: 0,
     bytesFromOpfs: 0,
     bytesFromNetwork: 0,
+    opfsHitRatePct: 0,
     wireBytesReleased: 0,
     droppedWasmBuffers: 0,
   });
@@ -1926,12 +1928,14 @@ test('W147 honors AbortSignal immediately during retry backoff and tracks aborte
       parallelMode: false,
       retryCount: 0,
       abortedCount: 0,
+      opfsEnabled: false,
       opfsHits: 0,
       opfsMisses: 0,
       opfsWrites: 0,
       opfsInvalidations: 0,
       bytesFromOpfs: 0,
       bytesFromNetwork: 0,
+      opfsHitRatePct: 0,
       wireBytesReleased: 0,
       droppedWasmBuffers: 0,
     });
@@ -3149,12 +3153,29 @@ test('W310 multi-module preloadProgramModules mixes OPFS warm hits and cold miss
   assert.equal(server.getCount('GET', '/prog/dep/image/guest.pgim'), getsBefore);
 
   const stats = pre2.getStats();
-  assert.equal(stats.opfsHits, 1);
-  assert.equal(stats.opfsMisses, 1);
-  assert.equal(stats.opfsWrites, 1);
+  assert.equal(stats.opfsEnabled, true);
+  assert.equal(stats.opfsHits, 1); // dep PGIM hit
+  assert.equal(stats.opfsMisses, 2); // program-manifest.json + main PGIM cold miss
+  assert.equal(stats.opfsWrites, 2); // program-manifest.json + main PGIM persisted
   assert.equal(stats.opfsInvalidations, 0);
   assert.equal(stats.bytesFromOpfs, m1.byteLength);
-  assert.equal(stats.bytesFromNetwork, m2.byteLength);
+  assert.equal(stats.bytesFromNetwork, manifestBytes.byteLength + m2.byteLength);
+  assert.equal(res.manifestOpfsCacheHit, false);
+
+  // Repeat multi-module boot hits OPFS for program-manifest.json AND both modules (0 GETs!).
+  const getsBeforeWarm = server.getCount('GET');
+  const pre3 = new PgimPreloader({ fetchImpl: server.fetchImpl, opfsCache: store, chunkSize: 4096 });
+  const warmRes = await pre3.preloadProgramModules('/prog/program-manifest.json');
+  assert.equal(warmRes.manifestOpfsCacheHit, true);
+  assert.equal(warmRes.modulesByName.dep.opfsCacheHit, true);
+  assert.equal(warmRes.modulesByName.main.opfsCacheHit, true);
+  assert.equal(server.getCount('GET'), getsBeforeWarm);
+  const warmStats = pre3.getStats();
+  assert.equal(warmStats.opfsHits, 3);
+  assert.equal(warmStats.opfsMisses, 0);
+  assert.equal(warmStats.opfsHitRatePct, 100);
+  assert.equal(warmStats.bytesFromOpfs, manifestBytes.byteLength + m1.byteLength + m2.byteLength);
+  assert.equal(warmStats.bytesFromNetwork, 0);
 
   // Verify ratio on multi-module progress events is monotonic and reaches 1.
   const withRatio = events.filter((e) => typeof e.ratio === 'number');
