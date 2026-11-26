@@ -4,6 +4,7 @@
 #include "os/xmem_windows.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <chrono>
@@ -14,7 +15,12 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <shared_mutex>
 #include <unordered_map>
+
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <immintrin.h>
+#endif
 
 namespace playgta6::os::win32 {
 
@@ -58,6 +64,7 @@ int64_t guest_clock_ns() {
 std::atomic<VirtualMemoryArena*> g_vmem_arena{nullptr};
 std::atomic<TlsTable*> g_tls_table{nullptr};
 std::atomic<HttpfsMailboxClient*> g_httpfs_client{nullptr};
+std::atomic<uint64_t> g_httpfs_client_generation{1};
 
 // ---------------------------------------------------------------------------
 // In-memory /userdata overlay
@@ -140,32 +147,49 @@ struct FileObject final : KernelObject {
 };
 
 struct KernelHandleTable {
-    std::mutex mutex;
-    Handle next_handle = 1;
-    std::unordered_map<Handle, std::shared_ptr<KernelObject>> objects;
+    static constexpr size_t kNumShards = 64;
+
+    struct Shard {
+        std::shared_mutex mutex;
+        std::unordered_map<Handle, std::shared_ptr<KernelObject>> objects;
+    };
+
+    std::atomic<Handle> next_handle{1};
+    std::array<Shard, kNumShards> shards;
+
+    static size_t shard_index(Handle h) {
+        return static_cast<size_t>(h & (kNumShards - 1));
+    }
+
+    Handle allocate_candidate() {
+        for (;;) {
+            const Handle h = next_handle.fetch_add(1, std::memory_order_relaxed);
+            if (h != kNullHandle && h != INVALID_HANDLE_VALUE) {
+                return h;
+            }
+        }
+    }
 
     Handle insert(std::shared_ptr<KernelObject> obj) {
-        std::lock_guard<std::mutex> lock(mutex);
-        Handle h = next_handle++;
-        if (h == kNullHandle || h == INVALID_HANDLE_VALUE) {
-            h = 1;
-            next_handle = 2;
+        for (;;) {
+            const Handle h = allocate_candidate();
+            Shard& shard = shards[shard_index(h)];
+            std::unique_lock<std::shared_mutex> lock(shard.mutex);
+            if (shard.objects.find(h) == shard.objects.end()) {
+                shard.objects.emplace(h, std::move(obj));
+                return h;
+            }
         }
-        while (h == kNullHandle || h == INVALID_HANDLE_VALUE ||
-               objects.find(h) != objects.end()) {
-            h = next_handle++;
-        }
-        objects.emplace(h, std::move(obj));
-        return h;
     }
 
     std::shared_ptr<KernelObject> lookup(Handle h) {
         if (h == kNullHandle || h == INVALID_HANDLE_VALUE) {
             return nullptr;
         }
-        std::lock_guard<std::mutex> lock(mutex);
-        auto it = objects.find(h);
-        if (it == objects.end()) {
+        Shard& shard = shards[shard_index(h)];
+        std::shared_lock<std::shared_mutex> lock(shard.mutex);
+        auto it = shard.objects.find(h);
+        if (it == shard.objects.end()) {
             return nullptr;
         }
         return it->second;
@@ -175,13 +199,14 @@ struct KernelHandleTable {
         if (h == kNullHandle || h == INVALID_HANDLE_VALUE) {
             return nullptr;
         }
-        std::lock_guard<std::mutex> lock(mutex);
-        auto it = objects.find(h);
-        if (it == objects.end()) {
+        Shard& shard = shards[shard_index(h)];
+        std::unique_lock<std::shared_mutex> lock(shard.mutex);
+        auto it = shard.objects.find(h);
+        if (it == shard.objects.end()) {
             return nullptr;
         }
         auto obj = std::move(it->second);
-        objects.erase(it);
+        shard.objects.erase(it);
         return obj;
     }
 };
@@ -195,19 +220,21 @@ KernelHandleTable& handle_table() {
 
 KernelHandleCounts live_kernel_handles() {
     KernelHandleTable& t = handle_table();
-    std::lock_guard<std::mutex> lock(t.mutex);
     KernelHandleCounts c;
-    for (const auto& [handle, object] : t.objects) {
-        switch (object->kind) {
-            case KernelObjectKind::Dispatcher:
-                ++c.dispatcher;
-                break;
-            case KernelObjectKind::File:
-                ++c.file;
-                break;
-            default:
-                ++c.opaque;
-                break;
+    for (auto& shard : t.shards) {
+        std::shared_lock<std::shared_mutex> lock(shard.mutex);
+        for (const auto& [handle, object] : shard.objects) {
+            switch (object->kind) {
+                case KernelObjectKind::Dispatcher:
+                    ++c.dispatcher;
+                    break;
+                case KernelObjectKind::File:
+                    ++c.file;
+                    break;
+                default:
+                    ++c.opaque;
+                    break;
+            }
         }
     }
     return c;
@@ -583,10 +610,15 @@ void set_httpfs_client(HttpfsMailboxClient* client) {
     std::lock_guard<std::mutex> lock(cache.mutex);
     cache.sizes.clear();
     g_httpfs_client.store(client, std::memory_order_release);
+    g_httpfs_client_generation.fetch_add(1, std::memory_order_acq_rel);
 }
 
 HttpfsMailboxClient* get_httpfs_client() {
     return g_httpfs_client.load(std::memory_order_acquire);
+}
+
+uint64_t httpfs_client_generation() {
+    return g_httpfs_client_generation.load(std::memory_order_acquire);
 }
 
 Handle insert_dispatcher_object(std::shared_ptr<DispatcherObject> object) {
@@ -1162,7 +1194,8 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
     }
 
     // Parse into normalized path segments (collapsing duplicate slashes, '.', and '..').
-    std::vector<std::string> segments;
+    std::vector<std::string_view> segments;
+    segments.reserve(8);
     while (pos < s.size()) {
         while (pos < s.size() && s[pos] == '/') {
             ++pos;
@@ -1186,7 +1219,7 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
             }
             continue;
         }
-        segments.emplace_back(seg);
+        segments.push_back(seg);
     }
 
     if (segments.empty()) {
@@ -1200,7 +1233,13 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
         if (is_userdata != nullptr) {
             *is_userdata = true;
         }
-        std::string result = "/userdata";
+        size_t total_len = 9;  // "/userdata"
+        for (size_t i = 1; i < segments.size(); ++i) {
+            total_len += 1 + segments[i].size();
+        }
+        std::string result;
+        result.reserve(total_len);
+        result.append("/userdata");
         for (size_t i = 1; i < segments.size(); ++i) {
             result.push_back('/');
             result.append(segments[i]);
@@ -1208,7 +1247,12 @@ std::string normalize_path(std::string_view raw_path, bool* is_userdata) {
         return result;
     }
 
+    size_t total_len = segments.size() - 1;
+    for (const std::string_view seg : segments) {
+        total_len += seg.size();
+    }
     std::string result;
+    result.reserve(total_len);
     for (size_t i = 0; i < segments.size(); ++i) {
         if (i > 0) {
             result.push_back('/');
@@ -1580,6 +1624,20 @@ uint64_t current_thread_owner_id() {
     return id;
 }
 
+inline void cpu_pause_hint() {
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__) || defined(__arm__)
+    __asm__ __volatile__("yield");
+#elif defined(_MSC_VER) && defined(_M_ARM64)
+    __yield();
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 }  // namespace
 
 void InitializeCriticalSectionWithSpinCount(CriticalSection* critical_section, uint32_t spin_count) {
@@ -1618,7 +1676,22 @@ void EnterCriticalSection(CriticalSection* critical_section) {
         SetLastError(ERROR_INVALID_HANDLE);
         return;
     }
-    critical_section_lock(critical_section, true)->lock();
+    std::recursive_mutex* const lock = critical_section_lock(critical_section, true);
+    const uint32_t spin = static_cast<uint32_t>(critical_section->spin_count & 0xFFFFFFu);
+    bool acquired = false;
+    if (spin != 0) {
+        const uint32_t limit = std::min(spin, 256u);
+        for (uint32_t i = 0; i < limit; ++i) {
+            if (lock->try_lock()) {
+                acquired = true;
+                break;
+            }
+            cpu_pause_hint();
+        }
+    }
+    if (!acquired) {
+        lock->lock();
+    }
     ++critical_section->recursion_count;
     critical_section->owning_thread = current_thread_owner_id();
 }
@@ -1737,12 +1810,15 @@ void trace_audio_read(const std::string& path, uint64_t offset, uint32_t size, i
         const char* e = std::getenv("PG6_AUDIO_TRACE");
         return e != nullptr && e[0] == '1';
     }();
+    if (!on) {
+        return;
+    }
     static std::atomic<uint32_t> lines{0};
     std::string lower = path;
     for (char& c : lower) {
         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     }
-    if (!on || lower.find("audio") == std::string::npos || lines.fetch_add(1) >= 2000) {
+    if (lower.find("audio") == std::string::npos || lines.fetch_add(1) >= 2000) {
         return;
     }
     const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);

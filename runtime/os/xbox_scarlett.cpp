@@ -12,6 +12,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -283,6 +284,7 @@ struct XMemState {
     std::unordered_set<uint64_t> busy_slots;  // guest VAs
     std::unordered_set<uint64_t> busy_pages;  // page handles
     uint32_t idle_waiters = 0;
+    std::vector<uint8_t> swap_scratch;        // O48: reusable buffer for swap_frames_locked()
 
     void update_peak_locked() {
         const uint64_t current =
@@ -371,7 +373,41 @@ VirtualRegion* XMemState::region_containing_locked(uint64_t va, uint64_t len) {
 // XMem lock.
 uint64_t copy_to_store(const uint8_t* bytes, uint64_t n) {
     const size_t len = static_cast<size_t>(n);
-    if (std::none_of(bytes, bytes + len, [](uint8_t b) { return b != 0; })) {
+    size_t i = 0;
+    uint64_t acc = 0;
+    for (; i + 32 <= len; i += 32) {
+        uint64_t w0 = 0;
+        uint64_t w1 = 0;
+        uint64_t w2 = 0;
+        uint64_t w3 = 0;
+        std::memcpy(&w0, bytes + i, 8);
+        std::memcpy(&w1, bytes + i + 8, 8);
+        std::memcpy(&w2, bytes + i + 16, 8);
+        std::memcpy(&w3, bytes + i + 24, 8);
+        acc |= w0 | w1 | w2 | w3;
+        if (acc != 0) {
+            break;
+        }
+    }
+    if (acc == 0) {
+        for (; i + 8 <= len; i += 8) {
+            uint64_t w = 0;
+            std::memcpy(&w, bytes + i, 8);
+            if (w != 0) {
+                acc = w;
+                break;
+            }
+        }
+    }
+    if (acc == 0) {
+        for (; i < len; ++i) {
+            if (bytes[i] != 0) {
+                acc = bytes[i];
+                break;
+            }
+        }
+    }
+    if (acc == 0) {
         return 0;
     }
     GuestHeap& heap = default_guest_heap();
@@ -672,10 +708,13 @@ PhysicalPage* window_page_locked(XMemState& st, uint64_t va) {
 void swap_frames_locked(XMemState& st, PhysicalPage& page, PhysicalPage& other, uint64_t want) {
     const uint64_t ps = page.page_size;
     const uint64_t from = page_position(page);
-    std::vector<uint8_t> tmp(static_cast<size_t>(ps));
-    std::memcpy(tmp.data(), host_of(want), tmp.size());
-    std::memcpy(host_of(want), host_of(from), tmp.size());
-    std::memcpy(host_of(from), tmp.data(), tmp.size());
+    const size_t bytes = static_cast<size_t>(ps);
+    if (st.swap_scratch.size() < bytes) {
+        st.swap_scratch.resize(bytes);
+    }
+    std::memcpy(st.swap_scratch.data(), host_of(want), bytes);
+    std::memcpy(host_of(want), host_of(from), bytes);
+    std::memcpy(host_of(from), st.swap_scratch.data(), bytes);
     mark_mirror_locked(st, want, ps);
     mark_mirror_locked(st, from, ps);
     other.home_va = page.home_va;  // 0 when `page` lived in a store
@@ -1353,7 +1392,7 @@ public:
     }
 
     void Close() override {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::shared_mutex> lock(mutex_);
         if (closed_) {
             return;
         }
@@ -1370,7 +1409,7 @@ public:
         if (info == nullptr) {
             return E_POINTER_HR;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         if (closed_) {
             return gdk::E_HANDLE_HR;
         }
@@ -1385,7 +1424,7 @@ public:
         if (dst == nullptr) {
             return E_POINTER_HR;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::shared_lock<std::shared_mutex> lock(mutex_);
         if (closed_) {
             return gdk::E_HANDLE_HR;
         }
@@ -1457,7 +1496,7 @@ public:
 
 private:
     std::atomic<uint32_t> ref_count_{1};
-    std::mutex mutex_;
+    std::shared_mutex mutex_;
     std::string path_;
     DStorageFileBackend backend_;
     uint64_t file_size_ = 0;
@@ -1468,7 +1507,7 @@ private:
 class DStorageStatusArrayImpl final : public Pg6IDStorageStatusArray {
 public:
     explicit DStorageStatusArrayImpl(uint32_t capacity)
-        : complete_(capacity, 0u), results_(capacity, S_OK_HR) {}
+        : capacity_(capacity), slots_(std::make_unique<Slot[]>(capacity)) {}
 
     Pg6HResult QueryInterface(const Pg6Guid& riid, void** ppv_object) override {
         if (ppv_object == nullptr) {
@@ -1494,42 +1533,42 @@ public:
     }
 
     bool IsComplete(uint32_t index) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index >= complete_.size()) {
+        if (index >= capacity_) {
             return false;
         }
-        return complete_[index] != 0u;
+        return slots_[index].complete.load(std::memory_order_acquire) != 0u;
     }
 
     Pg6HResult GetHResult(uint32_t index) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index >= results_.size()) {
+        if (index >= capacity_) {
             return E_INVALIDARG_HR;
         }
-        return results_[index];
+        (void)slots_[index].complete.load(std::memory_order_acquire);
+        return slots_[index].hr.load(std::memory_order_acquire);
     }
 
     void mark_pending(uint32_t index) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < complete_.size()) {
-            complete_[index] = 0u;
-            results_[index] = gdk::E_PENDING_HR;
+        if (index < capacity_) {
+            slots_[index].complete.store(0u, std::memory_order_relaxed);
+            slots_[index].hr.store(gdk::E_PENDING_HR, std::memory_order_release);
         }
     }
 
     void mark_complete(uint32_t index, Pg6HResult hr) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (index < complete_.size()) {
-            results_[index] = hr;
-            complete_[index] = 1u;
+        if (index < capacity_) {
+            slots_[index].hr.store(hr, std::memory_order_relaxed);
+            slots_[index].complete.store(1u, std::memory_order_release);
         }
     }
 
 private:
+    struct Slot {
+        std::atomic<Pg6HResult> hr{S_OK_HR};
+        std::atomic<uint8_t> complete{0};
+    };
     std::atomic<uint32_t> ref_count_{1};
-    std::mutex mutex_;
-    std::vector<uint8_t> complete_;
-    std::vector<Pg6HResult> results_;
+    uint32_t capacity_ = 0;
+    std::unique_ptr<Slot[]> slots_;
 };
 
 class DStorageQueueImpl final : public Pg6IDStorageQueue {
@@ -2933,6 +2972,8 @@ void xmem_reset_for_testing() {
     st.virtual_reserved_bytes = 0;
     st.mapped_physical_bytes = 0;
     st.peak_working_set_bytes = 0;
+    st.swap_scratch.clear();
+    st.swap_scratch.shrink_to_fit();
 }
 
 void register_dstorage_virtual_file(std::string_view path, std::vector<uint8_t> data) {

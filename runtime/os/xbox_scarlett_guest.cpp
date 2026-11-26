@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cinttypes>
@@ -282,6 +283,21 @@ public:
 
 private:
     bool need(int n) {
+        if (bitcnt_ >= n) {
+            return true;
+        }
+        if constexpr (std::endian::native == std::endian::little) {
+            if (bitcnt_ <= 32 && pos_ + 4 <= len_) {
+                uint32_t w = 0;
+                std::memcpy(&w, src_ + pos_, sizeof(w));
+                bitbuf_ |= static_cast<uint64_t>(w) << bitcnt_;
+                bitcnt_ += 32;
+                pos_ += 4;
+                if (bitcnt_ >= n) {
+                    return true;
+                }
+            }
+        }
         while (bitcnt_ < n) {
             if (pos_ >= len_) {
                 return false;
@@ -408,8 +424,18 @@ private:
             }
             uint8_t* d = dst_ + out_;
             const uint8_t* s = d - distance;
-            for (size_t i = 0; i < length; ++i) {
-                d[i] = s[i];  // overlapping copies repeat the pattern, byte by byte
+            if (distance >= length) {
+                std::memcpy(d, s, length);
+            } else if (distance == 1) {
+                std::memset(d, s[0], length);
+            } else {
+                size_t copied = distance;
+                std::memcpy(d, s, copied);
+                while (copied < length) {
+                    const size_t chunk = std::min(copied, length - copied);
+                    std::memcpy(d + copied, d, chunk);
+                    copied += chunk;
+                }
             }
             out_ += length;
         }
@@ -521,15 +547,35 @@ uint32_t adler32(const uint8_t* data, size_t len) {
     uint32_t a = 1;
     uint32_t b = 0;
     while (len != 0) {
-        const size_t n = std::min<size_t>(len, 5552);
-        for (size_t i = 0; i < n; ++i) {
-            a += data[i];
+        size_t n = std::min<size_t>(len, 5552);
+        len -= n;
+        while (n >= 16) {
+            a += data[0];  b += a;
+            a += data[1];  b += a;
+            a += data[2];  b += a;
+            a += data[3];  b += a;
+            a += data[4];  b += a;
+            a += data[5];  b += a;
+            a += data[6];  b += a;
+            a += data[7];  b += a;
+            a += data[8];  b += a;
+            a += data[9];  b += a;
+            a += data[10]; b += a;
+            a += data[11]; b += a;
+            a += data[12]; b += a;
+            a += data[13]; b += a;
+            a += data[14]; b += a;
+            a += data[15]; b += a;
+            data += 16;
+            n -= 16;
+        }
+        while (n != 0) {
+            a += *data++;
             b += a;
+            --n;
         }
         a %= 65521u;
         b %= 65521u;
-        data += n;
-        len -= n;
     }
     return (b << 16) | a;
 }
@@ -581,6 +627,29 @@ public:
         queue_->EnqueueStatus(status_, 0);
         queue_->Submit();
         return status_->GetHResult(0);
+    }
+
+    // O48: per-worker reusable scratch buffers (trimmed if capacity ever exceeds 8 MiB).
+    static constexpr size_t kMaxRetainedBufferBytes = 8u * 1024u * 1024u;
+    std::vector<uint8_t> staging;
+    std::vector<uint8_t> scratch;
+    std::vector<uint8_t> intermediate;
+    std::vector<size_t> file_reads;
+
+    void trim_buffers() {
+        auto trim_u8 = [](std::vector<uint8_t>& buf) {
+            buf.clear();
+            if (buf.capacity() > kMaxRetainedBufferBytes) {
+                std::vector<uint8_t>().swap(buf);
+            }
+        };
+        trim_u8(staging);
+        trim_u8(scratch);
+        trim_u8(intermediate);
+        file_reads.clear();
+        if (file_reads.capacity() * sizeof(size_t) > kMaxRetainedBufferBytes) {
+            std::vector<size_t>().swap(file_reads);
+        }
     }
 
 private:
@@ -954,7 +1023,11 @@ private:
 
     // Executes the requests of one batch (worker thread); returns per-request results.
     void execute(HostReader& reader, std::vector<Item>& items, std::vector<HResult>& results);
-    HResult deliver(const Item& item, const uint8_t* data, size_t len, std::vector<uint8_t>& scratch);
+    HResult deliver(const Item& item,
+                    const uint8_t* data,
+                    size_t len,
+                    std::vector<uint8_t>& scratch,
+                    std::vector<uint8_t>& intermediate);
     HResult write_destination(const DStorageRequest& r, const uint8_t* data, size_t len);
 
     DStorageQueueDesc desc_;
@@ -1104,7 +1177,11 @@ HResult DStorageQueue::write_destination(const DStorageRequest& r, const uint8_t
     return kOk;
 }
 
-HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len, std::vector<uint8_t>& scratch) {
+HResult DStorageQueue::deliver(const Item& item,
+                               const uint8_t* data,
+                               size_t len,
+                               std::vector<uint8_t>& scratch,
+                               std::vector<uint8_t>& intermediate) {
     const DStorageRequest& r = item.req;
     const DStorageOptions opts = parse_dstorage_options(r.options);
     if (!opts.compressed()) {
@@ -1117,7 +1194,6 @@ HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len
     const bool unpack_bc = opts.bcpack_mode != 0;
     // zlib and BCPack together: the console inflates first (to uncompressed_size bytes, the
     // intermediate size), then unpacks the BC blocks into the destination.
-    std::vector<uint8_t> intermediate;
     if (unpack_bc && opts.zlib) {
         size_t produced = 0;
         intermediate.resize(r.uncompressed_size);
@@ -1137,7 +1213,8 @@ HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len
     const size_t expected =
         unpack_bc ? r.destination_size : (r.uncompressed_size != 0 ? r.uncompressed_size : r.destination_size);
     uint8_t* out = opts.physical_pages ? nullptr : static_cast<uint8_t*>(com::guest_to_host(r.destination, expected));
-    if (out == nullptr) {
+    const bool used_scratch = (out == nullptr);
+    if (used_scratch) {
         scratch.resize(expected);
         out = scratch.data();
     }
@@ -1162,7 +1239,7 @@ HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len
             return kHrInvalidData;
         }
     }
-    if (out == scratch.data()) {
+    if (used_scratch) {
         const HResult hr = write_destination(r, out, expected);
         if (gdk::failed(hr)) {
             return hr;
@@ -1176,9 +1253,11 @@ HResult DStorageQueue::deliver(const Item& item, const uint8_t* data, size_t len
 }
 
 void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::vector<HResult>& results) {
-    std::vector<size_t> file_reads;
-    std::vector<uint8_t> staging;
-    std::vector<uint8_t> scratch;
+    std::vector<size_t>& file_reads = reader.file_reads;
+    std::vector<uint8_t>& staging = reader.staging;
+    std::vector<uint8_t>& scratch = reader.scratch;
+    std::vector<uint8_t>& intermediate = reader.intermediate;
+    file_reads.clear();
 
     for (size_t i = 0; i < items.size(); ++i) {
         Item& item = items[i];
@@ -1242,7 +1321,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
                 results[i] = com::E_INVALIDARG_HR;
                 continue;
             }
-            results[i] = deliver(item, staging.data(), staging.size(), scratch);
+            results[i] = deliver(item, staging.data(), staging.size(), scratch, intermediate);
             continue;
         }
         file_reads.push_back(i);
@@ -1277,7 +1356,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
         }
         staging.resize(r.source_size);
         const HResult hr = reader.read(item.file->host(), r.source_offset, staging.data(), r.source_size);
-        return gdk::failed(hr) ? hr : deliver(item, staging.data(), r.source_size, scratch);
+        return gdk::failed(hr) ? hr : deliver(item, staging.data(), r.source_size, scratch, intermediate);
     };
 
     size_t g = 0;
@@ -1315,7 +1394,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             for (size_t k = g; k < h; ++k) {
                 const Item& item = items[file_reads[k]];
                 results[file_reads[k]] = deliver(item, staging.data() + (item.req.source_offset - start),
-                                                 item.req.source_size, scratch);
+                                                 item.req.source_size, scratch, intermediate);
             }
         }
         g = h;
@@ -1328,6 +1407,7 @@ void DStorageQueue::execute(HostReader& reader, std::vector<Item>& items, std::v
             trace_audio_request(items[i].file->path(), items[i].req, results[i], items[i].enqueued_ms);
         }
     }
+    reader.trim_buffers();
 }
 
 class DStorageFactory final : public com::ComObject {
