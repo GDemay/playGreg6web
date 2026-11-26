@@ -1277,3 +1277,175 @@ fn r64_triple_base_burst_and_entry_dead_xmm_elision_execute() {
         }
     }
 }
+
+#[test]
+fn r67_extended_64_insn_and_indexed_bursts_execute() {
+    if !exec_or_skip("r67_extended_64_insn_and_indexed_bursts_execute") {
+        return;
+    }
+    // Exercises R67 extended bursts (MAX_BURST_INSNS = 64) + indexed `[base + idx*scale + disp]`
+    // bursts end-to-end across every memory model:
+    //  1. 40-instruction (>32, <=64) single-base unrolled sum over 20 qwords `[rsi + 0..160)`.
+    //  2. Interleaved 3-base plain+indexed SIMD burst:
+    //       `[rcx + r8*4 + 0/16/32/48]` + `[rdx + 0/16/32/48]` -> `[rbx + r8*4 + 0/16/32/48]`
+    //     followed by `add r8, 16` (invalidating the indexed key!) and one more read/write at
+    //     the updated index `[rbx + r8*4]`.
+    //  3. Indexed `[rsp + r9*8 + 0/8]` burst verifying `rsp` with an index is NEVER mistakenly
+    //     treated as stack-flat (even under `window-runs` where `stack_flat = true`).
+    let f = asm_function(CODE_BASE, |a| {
+        a.xor(eax, eax)?;
+        for k in 0..20i32 {
+            a.mov(r10, qword_ptr(rsi + k * 8))?;
+            a.add(rax, r10)?;
+        }
+        for k in 0..4i32 {
+            let off = k * 16;
+            a.vmovdqu(xmm0, xmmword_ptr(rcx + r8 * 4 + off))?;
+            a.vmovdqu(xmm1, xmmword_ptr(rdx + off))?;
+            a.vpaddd(xmm2, xmm0, xmm1)?;
+            a.vmovdqu(xmmword_ptr(rbx + r8 * 4 + off), xmm2)?;
+        }
+        // Mutate index `r8` and write one more qword using the NEW index to verify no stale base.
+        a.add(r8, 16)?;
+        a.mov(qword_ptr(rbx + r8 * 4), rax)?;
+        // Indexed off `rsp`: read `[rsp + r9*8]`, add 1, store to `[rsp + r9*8 + 8]`.
+        a.mov(r11, qword_ptr(rsp + r9 * 8))?;
+        a.add(r11, 1)?;
+        a.mov(qword_ptr(rsp + r9 * 8 + 8), r11)?;
+        a.vzeroupper()?;
+        a.ret()
+    });
+
+    // 20 qwords: [1..=20] -> sum = 210.
+    let mut sum_in = Vec::with_capacity(160);
+    for i in 1u64..=20 {
+        sum_in.extend_from_slice(&i.to_le_bytes());
+    }
+    let want_sum = 210u64;
+
+    // 16 u32 lanes for src_a and src_b.
+    let mut src_a = Vec::with_capacity(64);
+    let mut src_b = Vec::with_capacity(64);
+    let mut want_dst = Vec::with_capacity(64);
+    for i in 0u32..16 {
+        let a_val = (i + 1) * 100;
+        let b_val = i + 5;
+        src_a.extend_from_slice(&a_val.to_le_bytes());
+        src_b.extend_from_slice(&b_val.to_le_bytes());
+        want_dst.extend_from_slice(&(a_val + b_val).to_le_bytes());
+    }
+    let rsp_in_val = 0x1122_3344_5566_7788u64;
+    let want_rsp_out = rsp_in_val + 1;
+
+    struct IdxScenario {
+        name: &'static str,
+        sum_base: u64,
+        idx_val: u64,
+        src_a_eff: u64,
+        src_b: u64,
+        dst_eff: u64,
+        rsp_target: u64,
+        want_slots: Vec<u64>,
+        outside_store: bool,
+    }
+    let scenarios = [
+        // 1. All flat (outside window): fast path, no dirty marks.
+        IdxScenario {
+            name: "all_flat",
+            sum_base: FLAT_ADDR,
+            idx_val: 8,
+            src_a_eff: FLAT_ADDR + 0x100,
+            src_b: FLAT_ADDR + 0x200,
+            dst_eff: FLAT_ADDR + 0x300,
+            rsp_target: FLAT_ADDR + 0x400,
+            want_slots: vec![],
+            outside_store: true,
+        },
+        // 2. All in-window single-slot (fast path!): dst in slot 4, rsp+r9*8 in slot 6.
+        IdxScenario {
+            name: "in_window_single_slot",
+            sum_base: boundary(1) + 0x100,
+            idx_val: 16,
+            src_a_eff: boundary(2) + 0x100,
+            src_b: boundary(3) + 0x100,
+            dst_eff: boundary(4) + 0x100,
+            rsp_target: boundary(6) + 0x100,
+            want_slots: vec![4, 6],
+            outside_store: false,
+        },
+        // 3. Indexed src_a straddles 64 KiB boundary (slots 1|2) AND 40-insn sum straddles (0|1? no, 7|8):
+        //    shared slow fallback! dst still writes slot 4 cleanly; rsp+r9*8 writes slot 9.
+        IdxScenario {
+            name: "indexed_src_and_long_sum_straddle",
+            sum_base: boundary(8) - 40,
+            idx_val: 12,
+            src_a_eff: boundary(2) - 24,
+            src_b: boundary(3) + 0x100,
+            dst_eff: boundary(4) + 0x100,
+            rsp_target: boundary(9) + 0x100,
+            want_slots: vec![4, 9],
+            outside_store: false,
+        },
+        // 4. Indexed dst straddles 64 KiB boundary (slots 5|6): forces shared slow fallback and
+        //    marks BOTH slots 5 and 6! (Tail store at dst_eff + 64 lands in slot 6.)
+        IdxScenario {
+            name: "indexed_dst_straddles_slot",
+            sum_base: FLAT_ADDR,
+            idx_val: 20,
+            src_a_eff: boundary(2) + 0x100,
+            src_b: boundary(3) + 0x100,
+            dst_eff: boundary(6) - 24,
+            rsp_target: boundary(10) - 8, // read in slot 9, store at +8 in slot 10!
+            want_slots: vec![5, 6, 10],
+            outside_store: false,
+        },
+    ];
+
+    for (name, memory) in mark_models() {
+        let built = build_with_memory(name, [&f], &[], &memory, GUEST_BASE);
+        for sc in &scenarios {
+            let sc_name = sc.name;
+            let rcx_base = sc.src_a_eff.wrapping_sub(sc.idx_val * 4);
+            let rbx_base = sc.dst_eff.wrapping_sub(sc.idx_val * 4);
+            let rsp_target = sc.rsp_target;
+            // Inside the function, `rsp` is `STACK_TOP - 8` (return address pushed by the harness).
+            let entry_rsp = STACK_TOP - 8;
+            let r9_val = (rsp_target.wrapping_sub(entry_rsp) as i64 / 8) as u64;
+            assert_eq!(entry_rsp.wrapping_add(r9_val.wrapping_mul(8)), rsp_target);
+
+            let case = Case::new(CODE_BASE)
+                .reg(super::exec::RSI, sc.sum_base)
+                .reg(RCX, rcx_base)
+                .reg(RDX, sc.src_b)
+                .reg(RBX, rbx_base)
+                .reg(super::exec::R8, sc.idx_val)
+                .reg(super::exec::R9, r9_val)
+                .mem(sc.sum_base, &sum_in)
+                .mem(sc.src_a_eff, &src_a)
+                .mem(sc.src_b, &src_b)
+                .mem(rsp_target, &rsp_in_val.to_le_bytes())
+                .read(sc.dst_eff, 64)
+                .read(sc.dst_eff + 64, 8)
+                .read(rsp_target + 8, 8);
+            let o = run(&built, &[case]);
+            ok(&o, &format!("{name}/{sc_name}"));
+            assert_eq!(o[0].regs[RAX], want_sum, "{name}/{sc_name}: sum");
+            assert_eq!(o[0].mem[0], want_dst, "{name}/{sc_name}: indexed dst");
+            assert_eq!(
+                le(&o[0].mem[1]),
+                want_sum,
+                "{name}/{sc_name}: post-mutation indexed tail store"
+            );
+            assert_eq!(
+                le(&o[0].mem[2]),
+                want_rsp_out,
+                "{name}/{sc_name}: indexed [rsp + r9*8 + 8]"
+            );
+            assert_eq!(
+                o[0].dirty,
+                expected_marks(name, &sc.want_slots, sc.outside_store),
+                "{name}/{sc_name}: dirty"
+            );
+        }
+    }
+}

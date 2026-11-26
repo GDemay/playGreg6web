@@ -232,10 +232,10 @@ fn calls_keep_untouched_registers_out_of_the_state() {
     let (before, after) = around_call(&ir, CALLER, LEAF);
     assert_eq!(gprs(&before), vec![RAX, RSP], "stores before the call");
     assert_eq!(gprs(&after), vec![RAX, RSP], "reloads after the call");
-    // MID also touches r8.
+    // MID reads r8 without writing it: r8 is stored before the call but NOT reloaded after.
     let (before, after) = around_call(&ir, MID_CALLER, MID);
     assert_eq!(gprs(&before), vec![RAX, RSP, R8]);
-    assert_eq!(gprs(&after), vec![RAX, RSP, R8]);
+    assert_eq!(gprs(&after), vec![RAX, RSP]);
     // TAIL also touches rdx; rsi stays.
     let (before, _) = around_call(&ir, TAIL_CALLER, TAIL);
     assert_eq!(gprs(&before), vec![RAX, RSP]);
@@ -542,14 +542,28 @@ fn r61_per_register_xmm_ymmh_summaries_and_spill_elision() {
         "pure GPR callee needs zero xmm reloads after call:\n{after_gpr}"
     );
 
-    // VEX-128 caller: spills/reloads ONLY xmm2 + ymmh2 around CALLEE_VXORPS2 (NOT ymm0 or ymm3).
+    // VEX-128 caller: CALLEE_VXORPS2 unconditionally overwrites xmm2 + ymmh2 without reading them,
+    // so R67 elides the pre-call spill and reloads ONLY xmm2 + ymmh2 after the call (NOT ymm0/ymm3).
     let (before_vx, after_vx) = around_vec_call(&ir, CALLER_VXORPS2, CALLEE_VXORPS2);
-    assert_eq!(state_xmms(&before_vx), vec![2], "before vxorps2:\n{before_vx}");
-    assert_eq!(state_ymmhs(&before_vx), vec![2], "before vxorps2:\n{before_vx}");
+    assert_eq!(
+        state_xmms(&before_vx),
+        Vec::<usize>::new(),
+        "write-first vxorps2 needs no pre-call xmm spill:\n{before_vx}"
+    );
+    assert_eq!(
+        state_ymmhs(&before_vx),
+        Vec::<usize>::new(),
+        "write-first vxorps2 needs no pre-call ymmh spill:\n{before_vx}"
+    );
     assert_eq!(state_xmms(&after_vx), vec![2], "after vxorps2:\n{after_vx}");
-    assert_eq!(state_ymmhs(&after_vx), vec![2], "after vxorps2:\n{after_vx}");
+    assert_eq!(
+        state_ymmhs(&after_vx),
+        vec![2],
+        "after vxorps2:\n{after_vx}"
+    );
 
-    // vzeroupper caller: spills/reloads ONLY ymmh0 (NOT xmm0 or xmm1)!
+    // vzeroupper caller: CALLEE_VZEROUPPER unconditionally zeroes ymmh0..15 without reading them,
+    // so R67 elides the pre-call spill and reloads ONLY ymmh0 after the call (NOT xmm0 or xmm1)!
     let vzu_ir = function_ir(&ir, CALLEE_VZEROUPPER);
     assert!(
         !vzu_ir.contains("%xmm"),
@@ -563,8 +577,8 @@ fn r61_per_register_xmm_ymmh_summaries_and_spill_elision() {
     );
     assert_eq!(
         state_ymmhs(&before_vzu),
-        vec![0],
-        "vzeroupper must spill tracked ymmh0:\n{before_vzu}"
+        Vec::<usize>::new(),
+        "write-first vzeroupper needs no pre-call ymmh spill:\n{before_vzu}"
     );
     assert_eq!(
         state_xmms(&after_vzu),
@@ -926,4 +940,291 @@ fn r62_unread_ymmh_direct_stores_and_vzeroupper_memset_wasm64() {
     // Verify Case 3
     assert_eq!(out[3].mem[0], vec![0u8; 256], "vzeroall cleared all 16 xmm");
     assert_eq!(out[3].mem[1], vec![0u8; 256], "vzeroall cleared all 16 ymmh");
+}
+
+#[test]
+fn r67_split_live_in_and_written_state_summaries_ir_and_wasm64() {
+    use super::exec::{R10, R11};
+    const XMM_STATE: u64 = STATE_ADDR + STATE_XMM_OFFSET;
+
+    // 1. Read-only args (rcx, rdx) + unconditionally-overwritten return/scratch (rax, r10, xmm0).
+    const CALLEE_READONLY_ARGS: u64 = CODE_BASE + 0x4000;
+    const CALLER_READONLY_ARGS: u64 = CODE_BASE + 0x4100;
+    // 2. Conditionally-written reg (rax written on one branch, untouched on the other).
+    const CALLEE_COND_WRITE: u64 = CODE_BASE + 0x4200;
+    const CALLER_COND_WRITE: u64 = CODE_BASE + 0x4300;
+    // 3. Partial 8/16-bit writes (`mov al`, `mov dx`), `cmove`, legacy partial `movss`, and
+    //    read-only `xmm3`.
+    const CALLEE_PARTIAL: u64 = CODE_BASE + 0x4400;
+    const CALLER_PARTIAL: u64 = CODE_BASE + 0x4500;
+    // 4. Transitive wrapper calling CALLEE_READONLY_ARGS.
+    const CALLEE_WRAPPER: u64 = CODE_BASE + 0x4600;
+
+    let prog = Program::new()
+        .asm(CALLEE_READONLY_ARGS, |a| {
+            a.mov(rax, rcx)?;
+            a.add(rax, rdx)?;
+            a.mov(r10d, 7)?;
+            a.add(rax, r10)?;
+            a.vxorps(xmm0, xmm0, xmm0)?;
+            a.ret()
+        })
+        .asm(CALLER_READONLY_ARGS, |a| {
+            a.mov(rax, 0xDEAD_BEEF_u64)?;
+            a.mov(r10, 0xCAFE_BABE_u64)?;
+            a.paddq(xmm0, xmm0)?;
+            a.call(CALLEE_READONLY_ARGS)?;
+            a.add(rax, rcx)?;
+            a.add(rax, rdx)?;
+            a.add(rax, r10)?;
+            a.paddq(xmm0, xmm0)?;
+            a.ret()
+        })
+        .asm(CALLEE_COND_WRITE, |a| {
+            let mut skip = a.create_label();
+            a.test(rcx, rcx)?;
+            a.jz(skip)?;
+            a.mov(eax, 99)?;
+            a.set_label(&mut skip)?;
+            a.ret()
+        })
+        .asm(CALLER_COND_WRITE, |a| {
+            a.add(rax, 1)?;
+            a.call(CALLEE_COND_WRITE)?;
+            a.add(rax, rcx)?;
+            a.ret()
+        })
+        .asm(CALLEE_PARTIAL, |a| {
+            a.mov(al, 0x5A)?;
+            a.mov(dx, 0x1234)?;
+            a.test(rcx, rcx)?;
+            a.cmove(r8, r11)?;
+            a.movss(xmm2, xmm3)?;
+            a.ret()
+        })
+        .asm(CALLER_PARTIAL, |a| {
+            a.add(rax, 1)?;
+            a.add(rdx, 1)?;
+            a.add(r8, 1)?;
+            a.paddq(xmm2, xmm2)?;
+            a.paddq(xmm3, xmm3)?;
+            a.call(CALLEE_PARTIAL)?;
+            a.add(rax, rdx)?;
+            a.add(rax, r8)?;
+            a.add(rax, rcx)?;
+            a.paddq(xmm2, xmm3)?;
+            a.ret()
+        })
+        .asm(CALLEE_WRAPPER, |a| {
+            a.call(CALLEE_READONLY_ARGS)?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let summaries = FlagSummaries::compute(functions.values());
+
+    // Verify exact `written` and `live_in_state` summaries.
+    let w_ro = summaries.written(CALLEE_READONLY_ARGS).expect("analysed");
+    let li_ro = summaries
+        .live_in_state(CALLEE_READONLY_ARGS)
+        .expect("analysed");
+    assert_eq!(
+        w_ro,
+        bit(RAX) | bit(R10) | bit(RSP) | xmm_bit(0) | ymmh_bit(0),
+        "read-only args rcx/rdx must NOT be in written"
+    );
+    assert_eq!(
+        li_ro & (bit(RAX) | bit(R10) | xmm_bit(0) | ymmh_bit(0)),
+        0,
+        "unconditionally full-written rax/r10/xmm0/ymmh0 must NOT be in live_in_state"
+    );
+    assert_ne!(li_ro & bit(RCX), 0, "rcx is read on entry");
+    assert_ne!(li_ro & bit(RDX), 0, "rdx is read on entry");
+
+    // Wrapper propagates both summaries cleanly across direct call.
+    assert_eq!(summaries.written(CALLEE_WRAPPER), Some(w_ro));
+    assert_eq!(
+        summaries.live_in_state(CALLEE_WRAPPER).unwrap()
+            & (bit(RAX) | bit(R10) | xmm_bit(0) | ymmh_bit(0)),
+        0,
+        "wrapper must propagate write-first kills through direct call"
+    );
+
+    // Conditional write: rax is in BOTH written AND live_in_state!
+    let w_cond = summaries.written(CALLEE_COND_WRITE).expect("analysed");
+    let li_cond = summaries.live_in_state(CALLEE_COND_WRITE).expect("analysed");
+    assert_eq!(w_cond, bit(RAX) | bit(RSP));
+    assert_ne!(
+        li_cond & bit(RAX),
+        0,
+        "conditionally written rax MUST remain live_in_state"
+    );
+
+    // Partial writes (`al`, `dx`, `cmove`, legacy `movss`) are NEVER full kills; `xmm3` is read-only.
+    let w_part = summaries.written(CALLEE_PARTIAL).expect("analysed");
+    let li_part = summaries.live_in_state(CALLEE_PARTIAL).expect("analysed");
+    assert_eq!(
+        w_part,
+        bit(RAX) | bit(RDX) | bit(R8) | bit(RSP) | xmm_bit(2),
+        "rcx, r11, xmm3 are read-only and must NOT be in written"
+    );
+    for (name, mask) in [
+        ("rax (8-bit al)", bit(RAX)),
+        ("rdx (16-bit dx)", bit(RDX)),
+        ("r8 (cmove)", bit(R8)),
+        ("xmm2 (legacy movss)", xmm_bit(2)),
+    ] {
+        assert_ne!(
+            li_part & mask,
+            0,
+            "{name} partial/conditional write must NOT kill live_in_state"
+        );
+    }
+
+    // Verify IR at call sites.
+    let ir = lift_module(functions.values()).expect("lifts").ir;
+
+    let (before_ro, after_ro) = around_call(&ir, CALLER_READONLY_ARGS, CALLEE_READONLY_ARGS);
+    assert_eq!(
+        gprs(&before_ro),
+        vec![RCX, RDX, RSP],
+        "write-first rax/r10 must NOT be stored before call:\n{before_ro}"
+    );
+    assert_eq!(
+        state_xmms(&before_ro),
+        Vec::<usize>::new(),
+        "write-first xmm0 must NOT be stored before call:\n{before_ro}"
+    );
+    assert_eq!(
+        gprs(&after_ro),
+        vec![RAX, RSP, R10],
+        "read-only rcx/rdx must NOT be reloaded after call:\n{after_ro}"
+    );
+    assert_eq!(
+        state_xmms(&after_ro),
+        vec![0],
+        "written xmm0 MUST be reloaded after call:\n{after_ro}"
+    );
+
+    let (before_cond, after_cond) = around_call(&ir, CALLER_COND_WRITE, CALLEE_COND_WRITE);
+    assert_eq!(
+        gprs(&before_cond),
+        vec![RAX, RCX, RSP],
+        "conditionally written rax MUST be stored before call:\n{before_cond}"
+    );
+    assert_eq!(
+        gprs(&after_cond),
+        vec![RAX, RSP],
+        "conditionally written rax MUST be reloaded after call (rcx skipped):\n{after_cond}"
+    );
+
+    let (before_part, after_part) = around_call(&ir, CALLER_PARTIAL, CALLEE_PARTIAL);
+    assert_eq!(
+        gprs(&before_part),
+        vec![RAX, RCX, RDX, RSP, R8],
+        "partial/conditional GPR writes MUST be stored before call:\n{before_part}"
+    );
+    assert_eq!(
+        gprs(&after_part),
+        vec![RAX, RDX, RSP, R8],
+        "written partial GPRs MUST be reloaded after call (read-only rcx skipped):\n{after_part}"
+    );
+    assert_eq!(
+        state_xmms(&before_part),
+        vec![2, 3],
+        "both partial-written xmm2 and read-only xmm3 must be stored before call:\n{before_part}"
+    );
+    assert_eq!(
+        state_xmms(&after_part),
+        vec![2],
+        "only written xmm2 is reloaded after call (read-only xmm3 skipped):\n{after_part}"
+    );
+
+    // Execute all cases in Node Wasm64 to verify exact register & vector values!
+    if !exec_or_skip("r67_split_live_in_and_written_state_summaries_ir_and_wasm64") {
+        return;
+    }
+    let built = build("r67_split_call_sync", functions.values());
+    let vec4 = |a: u32, b: u32, c: u32, d: u32| -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&a.to_le_bytes());
+        out[4..8].copy_from_slice(&b.to_le_bytes());
+        out[8..12].copy_from_slice(&c.to_le_bytes());
+        out[12..16].copy_from_slice(&d.to_le_bytes());
+        out
+    };
+
+    // Case 0: CALLER_READONLY_ARGS (rcx=10, rdx=20 -> callee rax=37, r10=7, xmm0=0 -> caller rax=37+10+20+7=74)
+    let mut c0 = Case::new(CALLER_READONLY_ARGS).reg(RCX, 10).reg(RDX, 20);
+    c0.mem.push((XMM_STATE, vec4(1, 2, 3, 4).to_vec()));
+    c0.read.push((XMM_STATE, 16));
+
+    // Case 1: CALLER_COND_WRITE with rcx=0 (branch skipped! caller's rax+1=42 must survive!)
+    let c1 = Case::new(CALLER_COND_WRITE).reg(RAX, 41).reg(RCX, 0);
+    // Case 2: CALLER_COND_WRITE with rcx=5 (branch taken! callee writes 99, caller adds 5 -> 104)
+    let c2 = Case::new(CALLER_COND_WRITE).reg(RAX, 41).reg(RCX, 5);
+
+    // Case 3: CALLER_PARTIAL with rcx=0 (cmove taken: r8 = r11d = 0x77)
+    let mut c3 = Case::new(CALLER_PARTIAL)
+        .reg(RAX, 0x1122_3344_5566_7700)
+        .reg(RDX, 0xAAAA_BBBB_CCCC_0000)
+        .reg(R8, 0x9999_8888_0000_0000)
+        .reg(RCX, 0)
+        .reg(R11, 0xFFFF_0000_0000_0077);
+    let mut xmm_in3 = vec![0u8; 64];
+    xmm_in3[32..48].copy_from_slice(&vec4(10, 20, 30, 40)); // xmm2 -> doubled to (20,40,60,80)
+    xmm_in3[48..64].copy_from_slice(&vec4(100, 200, 300, 400)); // xmm3 -> doubled to (200,400,600,800)
+    c3.mem.push((XMM_STATE, xmm_in3.clone()));
+    c3.read.push((XMM_STATE, 64));
+
+    // Case 4: CALLER_PARTIAL with rcx=1 (cmove NOT taken: r8 keeps caller's r8+1!)
+    let mut c4 = Case::new(CALLER_PARTIAL)
+        .reg(RAX, 0x1122_3344_5566_7700)
+        .reg(RDX, 0xAAAA_BBBB_CCCC_0000)
+        .reg(R8, 0x9999_8888_0000_0000)
+        .reg(RCX, 1)
+        .reg(R11, 0xFFFF_0000_0000_0077);
+    c4.mem.push((XMM_STATE, xmm_in3));
+    c4.read.push((XMM_STATE, 64));
+
+    let out = run(&built, &[c0, c1, c2, c3, c4]);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+
+    assert_eq!(out[0].regs[RAX], 74, "c0 rax");
+    assert_eq!(out[0].regs[RCX], 10, "c0 rcx preserved");
+    assert_eq!(out[0].regs[RDX], 20, "c0 rdx preserved");
+    assert_eq!(out[0].regs[R10], 7, "c0 r10");
+    assert_eq!(out[0].mem[0], vec![0u8; 16], "c0 xmm0 zeroed by callee");
+
+    assert_eq!(out[1].regs[RAX], 42, "c1 cond-write skipped preserves caller rax");
+    assert_eq!(out[2].regs[RAX], 104, "c2 cond-write taken returns 99 + 5");
+
+    let want_rax_base = 0x1122_3344_5566_775Au64;
+    let want_rdx = 0xAAAA_BBBB_CCCC_1234u64;
+    assert_eq!(
+        out[3].regs[RAX],
+        want_rax_base
+            .wrapping_add(want_rdx)
+            .wrapping_add(0xFFFF_0000_0000_0077),
+        "c3 partial + cmove taken"
+    );
+    assert_eq!(
+        out[4].regs[RAX],
+        want_rax_base
+            .wrapping_add(want_rdx)
+            .wrapping_add(0x9999_8888_0000_0001)
+            .wrapping_add(1),
+        "c4 partial + cmove not taken preserves caller r8+1"
+    );
+    // In c3/c4: before call xmm2=(20,40,60,80), xmm3=(200,400,600,800).
+    // movss xmm2, xmm3 replaces only lane 0 -> xmm2=(200,40,60,80).
+    // After call: paddq xmm2, xmm3 (64-bit lane adds: lo=(200+200, 40+400), hi=(60+600, 80+800) with no 32-bit carry).
+    let want_xmm2 = vec4(400, 440, 660, 880);
+    let want_xmm3 = vec4(200, 400, 600, 800);
+    assert_eq!(&out[3].mem[0][32..48], &want_xmm2, "c3 xmm2 preserved upper lanes");
+    assert_eq!(&out[3].mem[0][48..64], &want_xmm3, "c3 xmm3 preserved without reload");
+    assert_eq!(&out[4].mem[0][32..48], &want_xmm2, "c4 xmm2 preserved upper lanes");
+    assert_eq!(&out[4].mem[0][48..64], &want_xmm3, "c4 xmm3 preserved without reload");
 }

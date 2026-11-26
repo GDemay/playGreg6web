@@ -1375,6 +1375,8 @@ impl FunctionLifter<'_> {
                 let bit = self.val(&format!("trunc i8 {byte} to i1"));
                 self.emit(&format!("store i1 {bit}, ptr {}", flag.slot()));
                 self.known.flags[flag as usize] = Some(bit);
+            } else {
+                self.known.flags[flag as usize] = None;
             }
         }
         if state & (ALL_XMM_STATE | ALL_YMMH_STATE) != 0 {
@@ -1393,10 +1395,16 @@ impl FunctionLifter<'_> {
             .map_or(ALL_FLAGS, |summaries| summaries.needed_by(target))
     }
 
-    /// Guest state a direct call to `target` may touch (see `flag_liveness`).
-    fn state_touched_by(&self, target: u64) -> StateMask {
+    /// Guest state a direct call to `target` must store before calling (`touched & live_in_state`).
+    fn state_sync_out_by(&self, target: u64) -> StateMask {
         self.flag_summaries
-            .map_or(ALL_STATE, |summaries| summaries.touched_by(target))
+            .map_or(ALL_STATE, |summaries| summaries.sync_out_state_by(target))
+    }
+
+    /// Guest state a direct call to `target` must reload after returning (`written`).
+    fn state_written_by(&self, target: u64) -> StateMask {
+        self.flag_summaries
+            .map_or(ALL_STATE, |summaries| summaries.written_by(target))
     }
 
     /// [`Self::sync_out`] storing only the tracked GPRs, `xmm` and `ymmh` registers in `state`
@@ -1587,12 +1595,18 @@ impl FunctionLifter<'_> {
         }
         if !addr32
             && !has_fs_gs
-            && index == Register::None
             && base.is_gpr64()
+            && (index == Register::None || index.is_gpr64())
             && let Some(burst) = &mut self.burst_override
-            && let Some(slot) = burst.bases.iter_mut().find(|b| b.reg == base.number())
         {
-            slot.addrs.insert(addr.clone(), disp as i64);
+            let key = memory_access::BurstKey {
+                base: base.number(),
+                index: (index != Register::None)
+                    .then(|| (index.number(), ins.memory_index_scale())),
+            };
+            if let Some(slot) = burst.bases.iter_mut().find(|b| b.key == key) {
+                slot.addrs.insert(addr.clone(), disp as i64);
+            }
         }
         if with_segment {
             let field = match ins.memory_segment() {
@@ -1675,8 +1689,9 @@ impl FunctionLifter<'_> {
         self.store_gpr(RSP, &new_rsp)
     }
 
-    /// R58/R63/R64: scans a basic block body for non-overlapping bursts of consecutive plain memory
-    /// accesses sharing up to [`memory_access::MAX_BURST_BASES`] (3) 64-bit base GPRs under
+    /// R58/R63/R64/R67: scans a basic block body for non-overlapping bursts of consecutive plain
+    /// or indexed memory accesses sharing up to [`memory_access::MAX_BURST_BASES`] (3) 64-bit
+    /// addressing bases (`[base + disp]` or `[base + idx*scale + disp]`) under
     /// `WindowCheck::Branch` (`window`, `window-stack`, `window-runs`), so the entire burst pays
     /// one window range/page check per active base instead of one per access.
     fn find_window_bursts(&self, body: &[Instruction]) -> Vec<memory_access::WindowBurst> {
@@ -1687,7 +1702,7 @@ impl FunctionLifter<'_> {
         if w.check != WindowCheck::Branch || body.len() < 2 {
             return Vec::new();
         }
-        const MAX_BURST_INSNS: usize = 32;
+        const MAX_BURST_INSNS: usize = 64;
         #[derive(Clone, Copy)]
         struct Active {
             start: usize,
@@ -1717,32 +1732,33 @@ impl FunctionLifter<'_> {
         let mut barriers = vec![false; body.len()];
         let mut written = vec![0u16; body.len()];
         let mut accesses = vec![None; body.len()];
-        let mut active: [Option<Active>; 16] = [None; 16];
+        let mut active: BTreeMap<memory_access::BurstKey, Active> = BTreeMap::new();
         let mut candidates: Vec<SingleCandidate> = Vec::new();
         let mut factory = InstructionInfoFactory::new();
 
-        let close_reg = |slot: &mut Option<Active>, reg: usize, out: &mut Vec<SingleCandidate>| {
-            if let Some(a) = slot.take()
-                && a.end > a.start
-                && a.end - a.start < MAX_BURST_INSNS
-                && meets_threshold(a.count, a.has_write, a.has_simd_mem)
-                && span_ok(a.min_d, a.max_end)
-            {
-                out.push(SingleCandidate {
-                    start: a.start,
-                    end: a.end,
-                    base: memory_access::BurstBase {
-                        reg,
-                        min_d: a.min_d,
-                        max_end: a.max_end,
-                        has_write: a.has_write,
-                    },
-                });
-            }
-        };
-        let close_all = |active: &mut [Option<Active>; 16], out: &mut Vec<SingleCandidate>| {
-            for (r, slot) in active.iter_mut().enumerate() {
-                close_reg(slot, r, out);
+        let emit_candidate =
+            |key: memory_access::BurstKey, a: Active, out: &mut Vec<SingleCandidate>| {
+                if a.end > a.start
+                    && a.end - a.start < MAX_BURST_INSNS
+                    && meets_threshold(a.count, a.has_write, a.has_simd_mem)
+                    && span_ok(a.min_d, a.max_end)
+                {
+                    out.push(SingleCandidate {
+                        start: a.start,
+                        end: a.end,
+                        base: memory_access::BurstBase {
+                            key,
+                            min_d: a.min_d,
+                            max_end: a.max_end,
+                            has_write: a.has_write,
+                        },
+                    });
+                }
+            };
+        let close_all = |active: &mut BTreeMap<memory_access::BurstKey, Active>,
+                         out: &mut Vec<SingleCandidate>| {
+            for (key, a) in std::mem::take(active) {
+                emit_candidate(key, a, out);
             }
         };
 
@@ -1769,22 +1785,30 @@ impl FunctionLifter<'_> {
                 }
             }
             written[i] = written_gprs;
-            // Check if this instruction performs a plain `[base64 + disp]` memory access.
+            // Check if this instruction performs a plain `[base64 + disp]` or indexed
+            // `[base64 + idx64*scale + disp]` memory access.
             let mem_access = plain_burst_mem_access(ins, info, w.stack_flat);
             accesses[i] = mem_access;
-            let mem_base_reg = mem_access.map(|(r, _, _, _, _)| r);
+            let mem_key = mem_access.map(|(k, _, _, _, _)| k);
 
-            // Any register written WITHOUT first being used as this instruction's memory base
-            // closes BEFORE instruction `i`.
-            for (r, slot) in active.iter_mut().enumerate() {
-                if written_gprs & (1u16 << r) != 0 && mem_base_reg != Some(r) {
-                    close_reg(slot, r, &mut candidates);
+            // Any active key whose base or index GPR is written WITHOUT being this instruction's
+            // own addressing key closes BEFORE instruction `i`.
+            if written_gprs != 0 {
+                let to_close: Vec<memory_access::BurstKey> = active
+                    .keys()
+                    .copied()
+                    .filter(|&k| written_gprs & k.gpr_mask() != 0 && mem_key != Some(k))
+                    .collect();
+                for k in to_close {
+                    if let Some(a) = active.remove(&k) {
+                        emit_candidate(k, a, &mut candidates);
+                    }
                 }
             }
 
-            if let Some((reg, disp, size, is_write, is_simd_mem)) = mem_access {
+            if let Some((key, disp, size, is_write, is_simd_mem)) = mem_access {
                 let end_d = disp.saturating_add(size as i64);
-                let extend = match active[reg] {
+                let extend = match active.get(&key).copied() {
                     Some(a) if i - a.start < MAX_BURST_INSNS => {
                         let new_min = a.min_d.min(disp);
                         let new_max = a.max_end.max(end_d);
@@ -1805,33 +1829,40 @@ impl FunctionLifter<'_> {
                     _ => None,
                 };
                 if let Some(updated) = extend {
-                    active[reg] = Some(updated);
+                    active.insert(key, updated);
                 } else {
-                    close_reg(&mut active[reg], reg, &mut candidates);
-                    active[reg] = Some(Active {
-                        start: i,
-                        end: i,
-                        min_d: disp,
-                        max_end: end_d,
-                        count: 1,
-                        has_write: is_write,
-                        has_simd_mem: is_simd_mem,
-                    });
+                    if let Some(old) = active.remove(&key) {
+                        emit_candidate(key, old, &mut candidates);
+                    }
+                    active.insert(
+                        key,
+                        Active {
+                            start: i,
+                            end: i,
+                            min_d: disp,
+                            max_end: end_d,
+                            count: 1,
+                            has_write: is_write,
+                            has_simd_mem: is_simd_mem,
+                        },
+                    );
                 }
             }
 
-            // If this instruction also wrote its own memory base register (e.g. `mov rdx, [rdx+8]`),
-            // close its burst right AFTER `i` so `i` is the final instruction of the burst.
-            if let Some(r) = mem_base_reg
-                && written_gprs & (1u16 << r) != 0
+            // If this instruction also wrote its own memory base or index GPR (e.g.
+            // `mov rdx, [rdx+8]`), close its burst right AFTER `i` so `i` is the final
+            // instruction of the burst.
+            if let Some(k) = mem_key
+                && written_gprs & k.gpr_mask() != 0
+                && let Some(a) = active.remove(&k)
             {
-                close_reg(&mut active[r], r, &mut candidates);
+                emit_candidate(k, a, &mut candidates);
             }
         }
         close_all(&mut active, &mut candidates);
 
         // Pick non-overlapping bursts in program order (preferring earlier start, then larger span),
-        // iteratively merging up to `MAX_BURST_BASES` (3) overlapping unmodified base GPRs (R63b/R64b).
+        // iteratively merging up to `MAX_BURST_BASES` (3) overlapping unmodified keys (R63b/R64b/R67).
         candidates.sort_by_key(|b| (b.start, std::cmp::Reverse(b.end)));
         let mut chosen: Vec<memory_access::WindowBurst> = Vec::new();
         while !candidates.is_empty() {
@@ -1840,7 +1871,7 @@ impl FunctionLifter<'_> {
             let mut bases = [a.base; memory_access::MAX_BURST_BASES];
             let mut base_count = 1usize;
             let mut merged_end = a.end;
-            let mut chosen_mask = 1u16 << a.base.reg;
+            let mut chosen_mask = a.base.key.gpr_mask();
 
             #[derive(Clone, Copy)]
             struct Partner {
@@ -1865,40 +1896,16 @@ impl FunctionLifter<'_> {
                     }
                 }
 
-                let mut partners = [Partner {
-                    last_i: 0,
-                    min_d: 0,
-                    max_end: 0,
-                    count: 0,
-                    has_write: false,
-                    has_simd_mem: false,
-                    frozen: false,
-                    dead: false,
-                }; 16];
-                for (r, p) in partners.iter_mut().enumerate() {
-                    if chosen_mask & (1u16 << r) != 0 {
-                        p.dead = true;
-                    }
-                }
+                let mut partners: BTreeMap<memory_access::BurstKey, Partner> = BTreeMap::new();
+                let mut written_since_start: u16 = 0;
 
                 for k in a.start..=max_end_idx {
-                    if let Some((reg, disp, size, is_write, is_simd_mem)) = accesses[k] {
-                        let p = &mut partners[reg];
-                        if !p.dead && !p.frozen {
-                            let end_d = disp.saturating_add(size as i64);
-                            if p.count == 0 {
-                                if k > merged_end || !span_ok(disp, end_d) {
-                                    // Only merge a partner base that actually overlaps the burst.
-                                    p.dead = true;
-                                } else {
-                                    p.last_i = k;
-                                    p.min_d = disp;
-                                    p.max_end = end_d;
-                                    p.count = 1;
-                                    p.has_write = is_write;
-                                    p.has_simd_mem = is_simd_mem;
-                                }
-                            } else {
+                    if let Some((key, disp, size, is_write, is_simd_mem)) = accesses[k]
+                        && !bases[..base_count].iter().any(|b| b.key == key)
+                    {
+                        let end_d = disp.saturating_add(size as i64);
+                        if let Some(p) = partners.get_mut(&key) {
+                            if !p.dead && !p.frozen {
                                 let new_min = p.min_d.min(disp);
                                 let new_max = p.max_end.max(end_d);
                                 if span_ok(new_min, new_max) {
@@ -1912,12 +1919,32 @@ impl FunctionLifter<'_> {
                                     p.frozen = true;
                                 }
                             }
+                        } else if k <= merged_end
+                            && written_since_start & key.gpr_mask() == 0
+                            && span_ok(disp, end_d)
+                        {
+                            // Only merge a partner key that overlaps the burst and whose base/index
+                            // GPRs were unmodified since `a.start`.
+                            partners.insert(
+                                key,
+                                Partner {
+                                    last_i: k,
+                                    min_d: disp,
+                                    max_end: end_d,
+                                    count: 1,
+                                    has_write: is_write,
+                                    has_simd_mem: is_simd_mem,
+                                    frozen: false,
+                                    dead: false,
+                                },
+                            );
                         }
                     }
                     let w_mask = written[k];
+                    written_since_start |= w_mask;
                     if w_mask != 0 {
-                        for (r2, p) in partners.iter_mut().enumerate() {
-                            if w_mask & (1u16 << r2) != 0 && !p.dead {
+                        for (&key2, p) in &mut partners {
+                            if w_mask & key2.gpr_mask() != 0 && !p.dead {
                                 if k < merged_end {
                                     // Modified strictly inside `[a.start, merged_end)`: unsafe to hoist.
                                     p.dead = true;
@@ -1933,7 +1960,6 @@ impl FunctionLifter<'_> {
 
                 let best_partner = partners
                     .iter()
-                    .enumerate()
                     .filter(|(_, p)| {
                         !p.dead
                             && meets_threshold(p.count, p.has_write, p.has_simd_mem)
@@ -1942,19 +1968,19 @@ impl FunctionLifter<'_> {
                     .max_by_key(|(_, p)| {
                         (p.count, usize::from(p.has_write), usize::from(p.has_simd_mem))
                     })
-                    .map(|(r2, &p)| (r2, p));
+                    .map(|(&key2, &p)| (key2, p));
 
-                let Some((r2, p)) = best_partner else {
+                let Some((key2, p)) = best_partner else {
                     break;
                 };
                 bases[base_count] = memory_access::BurstBase {
-                    reg: r2,
+                    key: key2,
                     min_d: p.min_d,
                     max_end: p.max_end,
                     has_write: p.has_write,
                 };
                 base_count += 1;
-                chosen_mask |= 1u16 << r2;
+                chosen_mask |= key2.gpr_mask();
                 merged_end = merged_end.max(p.last_i);
             }
 
@@ -1975,8 +2001,8 @@ impl FunctionLifter<'_> {
                     let mut trimmed: Option<Active> = None;
                     for (k, acc) in accesses.iter().enumerate().take(c.end + 1).skip(merged_end + 1)
                     {
-                        if let Some((reg, disp, size, is_write, is_simd_mem)) = *acc
-                            && reg == c.base.reg
+                        if let Some((key, disp, size, is_write, is_simd_mem)) = *acc
+                            && key == c.base.key
                         {
                             let end_d = disp.saturating_add(size as i64);
                             trimmed = Some(match trimmed {
@@ -2011,7 +2037,7 @@ impl FunctionLifter<'_> {
                             start: t.start,
                             end: t.end,
                             base: memory_access::BurstBase {
-                                reg: c.base.reg,
+                                key: c.base.key,
                                 min_d: t.min_d,
                                 max_end: t.max_end,
                                 has_write: t.has_write,
@@ -3376,6 +3402,7 @@ impl FunctionLifter<'_> {
             return unsupported("far call");
         }
         let return_address = imm(ins.next_ip(), 64);
+        let live_flags_after = ALL_FLAGS & !self.dead_flags;
         if ins.op_kind(0) == OpKind::NearBranch64 {
             let target = ins.near_branch_target();
             self.push(&return_address, 64)?;
@@ -3388,14 +3415,15 @@ impl FunctionLifter<'_> {
                 return Ok(());
             }
             let flags = self.flags_needed_by(target);
-            let state = self.state_touched_by(target);
-            self.sync_out_parts(state, flags);
+            let out_state = self.state_sync_out_by(target);
+            let in_state = self.state_written_by(target);
+            self.sync_out_parts(out_state, flags);
             self.guest_call(&format!(
                 "call void @{}(ptr %state)",
                 function_symbol(target)
             ));
             self.callees.push(target);
-            self.sync_in_parts(state, ALL_FLAGS);
+            self.sync_in_parts(in_state, live_flags_after);
         } else {
             // The target is read before the return address is pushed (`call [rsp+8]`).
             let target = self.indirect_target(ins)?;
@@ -3404,7 +3432,7 @@ impl FunctionLifter<'_> {
             self.guest_call(&format!(
                 "call void @{HELPER_INDIRECT_CALL}(ptr %state, i64 {target})"
             ));
-            self.sync_in();
+            self.sync_in_parts(ALL_STATE, live_flags_after);
         }
         Ok(())
     }
@@ -3495,7 +3523,7 @@ impl FunctionLifter<'_> {
 /// - `full_writes`: subset of every GPR (excluding `rsp`) whose full 64-bit `%gpr` alloca lifting
 ///   `ins` unconditionally overwrites (64-bit writes and zero-extending 32-bit writes) without
 ///   loading `%gpr` first.
-fn gpr_rw_masks(ins: &Instruction, info: &iced_x86::InstructionInfo) -> (u16, u16) {
+pub(super) fn gpr_rw_masks(ins: &Instruction, info: &iced_x86::InstructionInfo) -> (u16, u16) {
     use Mnemonic as M;
     let rsp_bit = 1u16 << RSP;
     // Register zeroing idioms (`xor r32/r64, r32/r64` and `sub r32/r64, r32/r64`) write 0
@@ -3713,14 +3741,14 @@ fn is_burst_barrier(ins: &Instruction) -> bool {
     )
 }
 
-/// If `ins` performs a plain `[base64 + disp]` memory access (no index, no `fs:`/`gs:`, not
-/// `rsp` when `stack_flat` is enabled, fixed byte width 1..=32), returns
-/// `(base_gpr_idx, disp, bytes, is_write, is_simd_mem)`.
+/// If `ins` performs a plain `[base64 + disp]` or indexed `[base64 + idx64*scale + disp]` memory
+/// access (no `fs:`/`gs:`, not plain `rsp` when `stack_flat` is enabled, fixed byte width 1..=32),
+/// returns `(burst_key, disp, bytes, is_write, is_simd_mem)`.
 fn plain_burst_mem_access(
     ins: &Instruction,
     info: &iced_x86::InstructionInfo,
     stack_flat: bool,
-) -> Option<(usize, i64, usize, bool, bool)> {
+) -> Option<(memory_access::BurstKey, i64, usize, bool, bool)> {
     use Mnemonic as M;
     if matches!(
         ins.mnemonic(),
@@ -3749,14 +3777,27 @@ fn plain_burst_mem_access(
         return None;
     }
     let base = ins.memory_base();
-    if !base.is_gpr64() || ins.memory_index() != Register::None {
+    if !base.is_gpr64() {
         return None;
     }
+    let index_reg = ins.memory_index();
+    let index = if index_reg == Register::None {
+        None
+    } else if index_reg.is_gpr64() {
+        let scale = ins.memory_index_scale();
+        if !matches!(scale, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        Some((index_reg.number(), scale))
+    } else {
+        return None;
+    };
     if matches!(ins.memory_segment(), Register::FS | Register::GS) {
         return None;
     }
     let reg = base.number();
-    if stack_flat && reg == RSP {
+    // Only plain `[rsp + disp]` (no index) is guaranteed stack-flat.
+    if stack_flat && index.is_none() && reg == RSP {
         return None;
     }
     let bytes = ins.memory_size().size();
@@ -3770,7 +3811,14 @@ fn plain_burst_mem_access(
         )
     });
     let is_simd_mem = bytes >= 16 || simd::is_simd(ins);
-    Some((reg, ins.memory_displacement64() as i64, bytes, is_write, is_simd_mem))
+    let key = memory_access::BurstKey { base: reg, index };
+    Some((
+        key,
+        ins.memory_displacement64() as i64,
+        bytes,
+        is_write,
+        is_simd_mem,
+    ))
 }
 
 /// `{lo, hi} = a * b` (unsigned 64x64 -> 128) built from 32-bit halves, so no `i128` multiply
