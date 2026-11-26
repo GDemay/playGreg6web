@@ -843,10 +843,19 @@ impl<'i, 'a> Discovery<'i, 'a> {
             .filter(|(_, known)| matches!(known, reach::Known::Range { lo, hi } if lo == hi && contains(*lo)))
             .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains))
             .collect();
-        let all: Vec<(Instruction, bool)> = values
-            .iter()
-            .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains))
-            .collect();
+        // Register copies (`mov r9d, eax` before a loop or merge) go in front of the bounds, so a
+        // guard on the source reaches an index held in the copy.
+        let mut all: Vec<(Instruction, bool)> =
+            reach::reaching_copies(&self.blocks, &preds_of, &is_entry, first_block, &live)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|(dst, src)| reach::synthesize_copy(dst, src))
+                .collect();
+        all.extend(
+            values
+                .iter()
+                .flat_map(|&(reg, known)| reach::synthesize(reg, known, &contains)),
+        );
         Some((constants, all))
     }
 
