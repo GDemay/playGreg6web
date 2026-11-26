@@ -150,8 +150,14 @@ using AliasListener = std::function<void(const AliasPair&)>;
 uint64_t add_alias_listener(AliasListener listener);
 void remove_alias_listener(uint64_t id);
 
-// GPU page table (queue slot 31). `kind` 1 maps `count` pool pages starting at `pool_page` to
-// consecutive GPU pages, 2 unmaps `count` GPU pages; other kinds are counted and skipped.
+// GPU page table (queue slot 31). Each entry covers `count` consecutive GPU pages:
+//   kind 0: map consecutive pool pages starting at `pool_page`;
+//   kind 1: map the single pool page `pool_page` at every one of the `count` GPU pages;
+//   kind 2: unmap the GPU pages;
+//   kind 3: leave the GPU pages as they are (advances the destination only).
+// Same four range types as D3D12_TILE_RANGE_FLAGS (NONE / REUSE_SINGLE_TILE / NULL / SKIP).
+// Other kinds are counted and skipped without advancing the destination.
+enum PageMappingKind : uint32_t { kMapConsecutive = 0, kMapSinglePage = 1, kUnmap = 2, kKeep = 3 };
 struct PageMappingEntry {
     uint32_t kind = 0;
     uint32_t pool_page = 0;
@@ -166,6 +172,9 @@ struct PageMappingResult {
     uint64_t unmapped_pages = 0;
     uint64_t skipped_entries = 0;   // unknown kinds
     uint64_t outside_window = 0;    // pages not inside a GPU window
+    uint64_t kept_pages = 0;        // kind 3
+    uint64_t kind_entries[4] = {};  // entries per known kind
+    uint64_t repeated_single_runs = 0;  // kind-1 entries with count > 1
 };
 PageMappingResult apply_gpu_page_mappings(std::span<const PageMappingRange> ranges, uint64_t pool_va, uint64_t pool_pages);
 // Pool page mapped at the GPU page containing `gpu_va`, or -1.
@@ -181,6 +190,9 @@ struct Accounting {
     uint64_t cpu_window_mapped = 0;  // bytes of pool pages mapped into CPU windows
     uint64_t gpu_window_mapped = 0;  // bytes mapped into GPU windows (queue slot 31)
     uint64_t gpu_mapping_updates = 0;
+    uint64_t gpu_mapping_kind_entries[4] = {};  // cumulative entries per kind (queue slot 31)
+    uint64_t gpu_mapping_repeated_single_runs = 0;  // cumulative kind-1 entries with count > 1
+    uint64_t gpu_mapping_skipped_entries = 0;   // cumulative unknown kinds
 };
 Accounting accounting();
 std::string describe();  // one-line summary for diagnostics

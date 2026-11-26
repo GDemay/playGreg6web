@@ -1198,7 +1198,8 @@ HResult CommandQueue::ResumeX() {
 HResult CommandQueue::Slot31_UpdatePageMappings_unverified(com::CallContext& ctx) {
     // (range count, ranges, page-pool address, pool pages, 0); range = {u64 GPU-window address,
     // u32 entry count, u64 entries}, entry = {u32 kind, u32 pool page, u32 page count}
-    // (d3d12_xs_xbox.h). Applied to the XMem GPU page table (os/xmem_windows.h).
+    // (d3d12_xs_xbox.h). Kinds: 0 consecutive pool pages, 1 one pool page repeated, 2 unmap,
+    // 3 leave as is. Applied to the XMem GPU page table (os/xmem_windows.h).
     const uint64_t count = static_cast<uint32_t>(ctx.int_arg(1));
     const uint64_t ranges_va = ctx.int_arg(2);
     const uint64_t pool_va = ctx.int_arg(3);
