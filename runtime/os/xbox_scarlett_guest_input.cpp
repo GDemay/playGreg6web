@@ -1,13 +1,16 @@
 // GameInput.dll and xg_xs.dll guest interfaces (O23); evidence and layouts in xbox_scarlett_guest.h.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -47,47 +50,230 @@ constexpr Guid kIidIGameInputReading = com::make_guid("2156947a-e1fa-4de0-a30b-d
 constexpr Guid kIidIGameInputDevice = com::make_guid("31dd86fb-4c1b-408a-868f-439b3cd47125");
 
 constexpr uint32_t kDeviceStatus = kGameInputDeviceConnected | kGameInputDeviceInputEnabled;
-constexpr size_t kHistory = 64;
+constexpr size_t kHistory = 128;
+constexpr size_t kMaxSnapshotKeys = 16;
+constexpr uint32_t kGuestSabKeyboardMask =
+    os::input_button::kMoveForward | os::input_button::kMoveLeft | os::input_button::kMoveBackward |
+    os::input_button::kMoveRight | os::input_button::kJump | os::input_button::kSprint;
+static_assert(kGuestSabKeyboardMask == 0x3Fu);
 
-enum class DeviceKind : uint8_t { Gamepad = 0, Keyboard = 1 };
+enum class DeviceKind : uint8_t { Gamepad = 0, Keyboard = 1, Mouse = 2 };
+constexpr size_t kDeviceKindCount = 3;
 
 uint32_t input_kind_of(DeviceKind kind) {
-    return kind == DeviceKind::Gamepad ? kGameInputKindGamepad : kGameInputKindKeyboard;
+    switch (kind) {
+        case DeviceKind::Gamepad:
+            return kGameInputKindGamepad;
+        case DeviceKind::Keyboard:
+            return kGameInputKindKeyboard;
+        case DeviceKind::Mouse:
+            return kGameInputKindMouse;
+    }
+    return 0u;
+}
+
+const char* device_tag(DeviceKind kind) {
+    switch (kind) {
+        case DeviceKind::Gamepad:
+            return "pg6 virtual gamepad";
+        case DeviceKind::Keyboard:
+            return "pg6 virtual keyboard";
+        case DeviceKind::Mouse:
+            return "pg6 virtual mouse";
+    }
+    return "";
+}
+
+AppLocalDeviceId make_device_id(DeviceKind kind) {
+    AppLocalDeviceId id{};
+    const char* tag = device_tag(kind);
+    const size_t len = std::min(std::strlen(tag), sizeof(id.value));
+    std::memcpy(id.value, tag, len);
+    return id;
+}
+
+// GDK v0 GameInputMouseState layout (40 bytes, matching GameInput.h v0 and Pg6GameInputMouseState).
+struct GameInputMouseState {
+    uint32_t buttons;     // GameInputMouseButtons bitmask (+ 4 bytes alignment padding)
+    int64_t position_x;   // Cumulative relative X delta
+    int64_t position_y;   // Cumulative relative Y delta
+    int64_t wheel_x;      // Cumulative horizontal wheel delta
+    int64_t wheel_y;      // Cumulative vertical wheel delta
+};
+static_assert(sizeof(GameInputMouseState) == 40 && std::is_trivially_copyable_v<GameInputMouseState>);
+static_assert(offsetof(GameInputMouseState, buttons) == 0);
+static_assert(offsetof(GameInputMouseState, position_x) == 8);
+static_assert(offsetof(GameInputMouseState, position_y) == 16);
+static_assert(offsetof(GameInputMouseState, wheel_x) == 24);
+static_assert(offsetof(GameInputMouseState, wheel_y) == 32);
+
+float sanitize_unit_float(float v) {
+    if (!std::isfinite(v) || v <= 0.0f) {
+        return 0.0f;
+    }
+    return v >= 1.0f ? 1.0f : v;
+}
+
+float sanitize_signed_axis(float v) {
+    if (!std::isfinite(v) || v == 0.0f) {
+        return 0.0f;
+    }
+    return std::clamp(v, -1.0f, 1.0f);
+}
+
+void sanitize_stick_pair(float& x, float& y) {
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+        x = 0.0f;
+        y = 0.0f;
+        return;
+    }
+    const float mag = std::hypot(x, y);
+    if (!std::isfinite(mag)) {
+        const float max_abs = std::max(std::fabs(x), std::fabs(y));
+        if (max_abs <= 0.0f) {
+            x = 0.0f;
+            y = 0.0f;
+            return;
+        }
+        const float sx = x / max_abs;
+        const float sy = y / max_abs;
+        const float smag = std::hypot(sx, sy);
+        x = (smag > 0.0f && std::isfinite(smag)) ? sanitize_signed_axis(sx / smag) : 0.0f;
+        y = (smag > 0.0f && std::isfinite(smag)) ? sanitize_signed_axis(sy / smag) : 0.0f;
+        return;
+    }
+    if (mag > 1.0f) {
+        x /= mag;
+        y /= mag;
+    }
+    x = sanitize_signed_axis(x);
+    y = sanitize_signed_axis(y);
+}
+
+void sanitize_gamepad_state(GameInputGamepadState& pad) {
+    pad.left_trigger = sanitize_unit_float(pad.left_trigger);
+    pad.right_trigger = sanitize_unit_float(pad.right_trigger);
+    sanitize_stick_pair(pad.left_thumbstick_x, pad.left_thumbstick_y);
+    sanitize_stick_pair(pad.right_thumbstick_x, pad.right_thumbstick_y);
 }
 
 struct Snapshot {
     DeviceKind kind = DeviceKind::Gamepad;
     uint64_t sequence = 0;   // GameInput sequence number (one counter for all readings)
-    uint64_t timestamp = 0;  // microseconds, monotonic
+    uint64_t timestamp = 0;  // microseconds, strictly monotonic
     uint32_t host_sequence = 0;
     GameInputGamepadState gamepad{};
-    std::vector<GameInputKeyState> keys;
+    GameInputMouseState mouse{};
+    GameInputKeyState keys[kMaxSnapshotKeys]{};
+    uint32_t key_count = 0;
 };
+static_assert(std::is_trivially_copyable_v<Snapshot>);
 
-// Keyboard keys the InputState SAB carries (web/input/input_bridge.js bits 0..5).
-struct KeyMap {
-    uint32_t bit;
-    uint32_t scan_code;
-    uint32_t code_point;
-    uint8_t virtual_key;
-};
-constexpr KeyMap kKeyMap[] = {
-    {os::input_button::kMoveForward, 0x11, 'w', 0x57},   // W
-    {os::input_button::kMoveLeft, 0x1E, 'a', 0x41},      // A
-    {os::input_button::kMoveBackward, 0x1F, 's', 0x53},  // S
-    {os::input_button::kMoveRight, 0x20, 'd', 0x44},     // D
-    {os::input_button::kJump, 0x39, ' ', 0x20},          // Space
-    {os::input_button::kSprint, 0x2A, 0, 0xA0},          // Left Shift
+// Fixed-capacity ring buffer storing strictly-increasing sequences and timestamps (zero heap churn).
+template <size_t kCapacity>
+class ReadingRing {
+public:
+    bool empty() const { return count_ == 0; }
+    size_t size() const { return count_; }
+    void clear() {
+        head_ = 0;
+        count_ = 0;
+    }
+    const Snapshot& at(size_t i) const { return entries_[(head_ + i) % kCapacity]; }
+    const Snapshot& back() const { return at(count_ - 1); }
+
+    void push(const Snapshot& s) {
+        if (count_ < kCapacity) {
+            entries_[(head_ + count_) % kCapacity] = s;
+            ++count_;
+        } else {
+            entries_[head_] = s;
+            head_ = (head_ + 1) % kCapacity;
+        }
+    }
+
+    // First entry whose sequence > `sequence`.
+    bool find_next(uint64_t sequence, Snapshot* out) const {
+        size_t lo = 0;
+        size_t hi = count_;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (at(mid).sequence <= sequence) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo >= count_) {
+            return false;
+        }
+        *out = at(lo);
+        return true;
+    }
+
+    // Last entry whose sequence < `sequence`.
+    bool find_previous(uint64_t sequence, Snapshot* out) const {
+        size_t lo = 0;
+        size_t hi = count_;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (at(mid).sequence < sequence) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo == 0) {
+            return false;
+        }
+        *out = at(lo - 1);
+        return true;
+    }
+
+    // Newest entry whose timestamp <= `timestamp` (false when empty or timestamp < oldest).
+    bool find_temporal(uint64_t timestamp, Snapshot* out) const {
+        if (count_ == 0 || timestamp < at(0).timestamp) {
+            return false;
+        }
+        size_t lo = 0;
+        size_t hi = count_;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            if (at(mid).timestamp <= timestamp) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo == 0) {
+            return false;
+        }
+        *out = at(lo - 1);
+        return true;
+    }
+
+private:
+    std::array<Snapshot, kCapacity> entries_{};
+    size_t head_ = 0;
+    size_t count_ = 0;
 };
 
 GameInputRumbleParams& rumble_state() {
     static GameInputRumbleParams r{};
     return r;
 }
+os::RumbleTelemetry& rumble_telemetry_state() {
+    static os::RumbleTelemetry t{};
+    return t;
+}
 std::mutex& rumble_mutex() {
     static std::mutex m;
     return m;
 }
+
+class GameInputDeviceObj;
+com::InterfaceArg<GameInputDeviceObj> ensure_mouse_device();
+bool has_mouse_device();
 
 
 // ---------------------------------------------------------------------------
@@ -97,11 +283,7 @@ public:
     static constexpr const char* kComClassName = "GameInput.IGameInputDevice";
     static constexpr uint64_t kComPayloadSize = kGameInputDeviceInfoSize;
 
-    explicit GameInputDeviceObj(DeviceKind kind) : kind_(kind) {
-        const char* tag = kind == DeviceKind::Gamepad ? "pg6 virtual gamepad" : "pg6 virtual keyboard";
-        std::memset(id_.value, 0, sizeof(id_.value));
-        std::memcpy(id_.value, tag, std::strlen(tag));
-    }
+    explicit GameInputDeviceObj(DeviceKind kind) : kind_(kind), id_(make_device_id(kind)) {}
 
     // Fills the guest GameInputDeviceInfo (after the object has its guest block).
     void publish_info() {
@@ -109,7 +291,8 @@ public:
         const uint32_t size = static_cast<uint32_t>(kGameInputDeviceInfoSize);
         std::memcpy(info, &size, 4);
         const uint16_t vendor = 0x045E;  // Microsoft
-        const uint16_t product = kind_ == DeviceKind::Gamepad ? 0x0B12 : 0x0000;
+        const uint16_t product = kind_ == DeviceKind::Gamepad ? 0x0B12
+                                 : (kind_ == DeviceKind::Mouse ? 0x0001 : 0x0000);
         std::memcpy(info + kDeviceInfoVendorId, &vendor, 2);
         std::memcpy(info + kDeviceInfoProductId, &product, 2);
         std::memcpy(info + kDeviceInfoDeviceId, id_.value, sizeof(id_.value));
@@ -122,15 +305,49 @@ public:
     uint64_t GetDeviceInfo() { return payload_address(); }
     // slot 4
     uint32_t GetDeviceStatus() { return kDeviceStatus; }
-    // slot 10
+    // slot 9: GDK v0 HRESULT SetHapticMotorState(uint32_t motorIndex, const GameInputHapticFeedbackParams* params)
+    HResult SetHapticMotorState(uint32_t /*motor_index*/, uint64_t /*params*/) {
+        std::lock_guard<std::mutex> lock(rumble_mutex());
+        os::RumbleTelemetry& t = rumble_telemetry_state();
+        t.haptic_calls += 1;
+        const uint64_t ts = now_us();
+        t.last_timestamp_us = ts > t.last_timestamp_us ? ts : (t.last_timestamp_us + 1);
+        return kOk;
+    }
+    // slot 10: void SetRumbleState(const GameInputRumbleParams* params)
     void SetRumbleState(GuestPtr<GameInputRumbleParams> params) {
         GameInputRumbleParams p{};
-        if (!params.is_null() && !params.read(p)) {
-            return;
+        if (!params.is_null()) {
+            if (!params.read(p)) {
+                return;
+            }
+            p.low_frequency = sanitize_unit_float(p.low_frequency);
+            p.high_frequency = sanitize_unit_float(p.high_frequency);
+            p.left_trigger = sanitize_unit_float(p.left_trigger);
+            p.right_trigger = sanitize_unit_float(p.right_trigger);
         }
         if (kind_ == DeviceKind::Gamepad) {
             std::lock_guard<std::mutex> lock(rumble_mutex());
             rumble_state() = p;
+            os::RumbleTelemetry& t = rumble_telemetry_state();
+            t.set_calls += 1;
+            const bool nonzero = (p.low_frequency > 0.0f || p.high_frequency > 0.0f ||
+                                  p.left_trigger > 0.0f || p.right_trigger > 0.0f);
+            if (nonzero) {
+                t.nonzero_updates += 1;
+            } else {
+                t.stop_calls += 1;
+            }
+            const uint64_t ts = now_us();
+            t.last_timestamp_us = ts > t.last_timestamp_us ? ts : (t.last_timestamp_us + 1);
+            t.last_low_frequency = p.low_frequency;
+            t.last_high_frequency = p.high_frequency;
+            t.last_left_trigger = p.left_trigger;
+            t.last_right_trigger = p.right_trigger;
+            t.peak_low_frequency = std::max(t.peak_low_frequency, p.low_frequency);
+            t.peak_high_frequency = std::max(t.peak_high_frequency, p.high_frequency);
+            t.peak_left_trigger = std::max(t.peak_left_trigger, p.left_trigger);
+            t.peak_right_trigger = std::max(t.peak_right_trigger, p.right_trigger);
         }
     }
 
@@ -146,8 +363,8 @@ class GameInputReadingObj final : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "GameInput.IGameInputReading";
 
-    GameInputReadingObj(Snapshot snapshot, com::InterfaceArg<GameInputDeviceObj> device)
-        : snap_(std::move(snapshot)), device_(std::move(device)) {}
+    GameInputReadingObj(const Snapshot& snapshot, com::InterfaceArg<GameInputDeviceObj> device)
+        : snap_(snapshot), device_(std::move(device)) {}
 
     uint32_t GetInputKind() { return input_kind_of(snap_.kind); }                 // 3
     uint64_t GetSequenceNumber(uint32_t /*kind*/) { return snap_.sequence; }       // 4
@@ -166,15 +383,21 @@ public:
     }
     uint32_t GetZeroCount() { return 0; }                                          // 8, 10, 12, 17
     uint32_t GetZeroState(uint32_t /*count*/, uint64_t /*array*/) { return 0; }    // 9, 11, 13, 18
-    uint32_t GetKeyCount() { return static_cast<uint32_t>(snap_.keys.size()); }   // 14
+    uint32_t GetKeyCount() { return snap_.key_count; }                             // 14
     uint32_t GetKeyState(uint32_t count, uint64_t out) {                           // 15
-        const uint32_t n = std::min<uint32_t>(count, static_cast<uint32_t>(snap_.keys.size()));
-        if (n != 0 && !com::write_guest(out, snap_.keys.data(), n * sizeof(GameInputKeyState))) {
+        const uint32_t n = std::min<uint32_t>(count, snap_.key_count);
+        if (n != 0 && !com::write_guest(out, snap_.keys, n * sizeof(GameInputKeyState))) {
             return 0;
         }
         return n;
     }
-    bool GetNoState(uint64_t /*state*/) { return false; }                          // 16, 19..21, 23, 24
+    bool GetMouseState(GuestPtr<GameInputMouseState> out) {                        // 16
+        if (snap_.kind != DeviceKind::Mouse || out.is_null()) {
+            return false;
+        }
+        return out.write(snap_.mouse);
+    }
+    bool GetNoState(uint64_t /*state*/) { return false; }                          // 19..21, 23, 24
     bool GetGamepadState(GuestPtr<GameInputGamepadState> out) {                    // 22
         if (snap_.kind != DeviceKind::Gamepad || out.is_null()) {
             return false;
@@ -213,7 +436,11 @@ public:
         }
     }
 
-    uint64_t GetCurrentTimestamp() { return now_us(); }  // 3
+    uint64_t GetCurrentTimestamp() {  // 3
+        std::lock_guard<std::mutex> lock(mutex_);
+        const uint64_t ts = now_us();
+        return ts >= last_timestamp_ ? ts : last_timestamp_;
+    }
 
     // 4
     HResult GetCurrentReading(uint32_t kind, com::InterfaceArg<GameInputDeviceObj> device, OutPtr out) {
@@ -226,12 +453,20 @@ public:
             return hr;
         }
         Snapshot s;
+        bool have = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            poll_locked(dk);
-            s = history_[index(dk)].back();
+            poll_locked(dk, static_cast<bool>(device));
+            const ReadingRing<kHistory>& h = history_[index(dk)];
+            if (!h.empty()) {
+                s = h.back();
+                have = true;
+            }
         }
-        return emit(std::move(s), out);
+        if (!have) {
+            return kGameInputReadingNotFound;
+        }
+        return emit(s, out);
     }
 
     // 5
@@ -244,6 +479,44 @@ public:
     HResult GetPreviousReading(com::InterfaceArg<GameInputReadingObj> ref, uint32_t kind,
                                com::InterfaceArg<GameInputDeviceObj> device, OutPtr out) {
         return neighbour(ref, kind, device, out, false);
+    }
+
+    // 7 (implemented for ring-history temporal lookup; vtable slot 7 stays a named stub in
+    // kGameInputMethods while test_xbox_scarlett_guest.cpp probes slot 7 for stub_hit_report,
+    // and is exercised directly via playgta6::os::game_input_guest_temporal_reading).
+    HResult GetTemporalReading(uint64_t timestamp, com::InterfaceArg<GameInputDeviceObj> device, OutPtr out) {
+        if (out.is_null() || !out.write(0)) {
+            return com::E_POINTER_HR;
+        }
+        if (device.invalid()) {
+            return com::E_INVALIDARG_HR;
+        }
+        Snapshot found{};
+        bool have = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (device) {
+                const DeviceKind dk = device->kind();
+                const ReadingRing<kHistory>& h = history_[index(dk)];
+                have = h.find_temporal(timestamp, &found);
+            } else {
+                for (size_t i = 0; i < kDeviceKindCount; ++i) {
+                    Snapshot candidate{};
+                    if (!history_[i].find_temporal(timestamp, &candidate)) {
+                        continue;
+                    }
+                    if (!have || candidate.timestamp > found.timestamp ||
+                        (candidate.timestamp == found.timestamp && candidate.sequence > found.sequence)) {
+                        found = candidate;
+                        have = true;
+                    }
+                }
+            }
+        }
+        if (!have) {
+            return kGameInputReadingNotFound;
+        }
+        return emit(found, out);
     }
 
     // 9: device callbacks are invoked (once per matching device) before this returns for
@@ -266,9 +539,18 @@ public:
         if (enumeration == 0 || (status_filter & kDeviceStatus) == 0) {
             return kOk;
         }
-        for (const com::InterfaceArg<GameInputDeviceObj>* dp : {&gamepad_, &keyboard_}) {
-            const com::InterfaceArg<GameInputDeviceObj>& d = *dp;
-            if ((kind & input_kind_of(d->kind())) == 0 || (device && device.get() != d.get())) {
+        com::InterfaceArg<GameInputDeviceObj> devices[kDeviceKindCount];
+        size_t device_count = 0;
+        devices[device_count++] = gamepad_;
+        devices[device_count++] = keyboard_;
+        if ((kind & kGameInputKindMouse) != 0) {
+            if (com::InterfaceArg<GameInputDeviceObj> m = ensure_mouse_device()) {
+                devices[device_count++] = std::move(m);
+            }
+        }
+        for (size_t i = 0; i < device_count; ++i) {
+            const com::InterfaceArg<GameInputDeviceObj>& d = devices[i];
+            if (!d || (kind & input_kind_of(d->kind())) == 0 || (device && device.get() != d.get())) {
                 continue;
             }
             const com::GuestFunction<void(uint64_t, uint64_t, uint64_t, uint64_t, uint32_t, uint32_t)> fn(callback);
@@ -301,6 +583,13 @@ public:
                 return p != 0 ? kOk : kGameInputDeviceNotFound;
             }
         }
+        const AppLocalDeviceId mouse_id = make_device_id(DeviceKind::Mouse);
+        if (std::memcmp(want.value, mouse_id.value, sizeof(want.value)) == 0) {
+            const com::InterfaceArg<GameInputDeviceObj> m = ensure_mouse_device();
+            const uint64_t p = GameInputReadingObj::share(m);
+            out.write(p);
+            return p != 0 ? kOk : kGameInputDeviceNotFound;
+        }
         return kGameInputDeviceNotFound;
     }
 
@@ -311,6 +600,15 @@ public:
 
 private:
     static size_t index(DeviceKind k) { return static_cast<size_t>(k); }
+
+    uint64_t next_timestamp_locked() {
+        uint64_t ts = now_us();
+        if (ts <= last_timestamp_) {
+            ts = last_timestamp_ + 1;
+        }
+        last_timestamp_ = ts;
+        return ts;
+    }
 
     HResult select(uint32_t kind, const com::InterfaceArg<GameInputDeviceObj>& device, DeviceKind* out) const {
         if (device.invalid()) {
@@ -324,13 +622,19 @@ private:
             *out = DeviceKind::Keyboard;
             return kOk;
         }
+        if ((kind & kGameInputKindMouse) != 0 && (!device || device->kind() == DeviceKind::Mouse)) {
+            *out = DeviceKind::Mouse;
+            return kOk;
+        }
         return kGameInputReadingNotFound;
     }
 
     // Reads the host InputState (through the O12 host GameInput, which applies the button map,
-    // deadzones and WASD-to-stick synthesis) and records a new snapshot when it changed.
-    void poll_locked(DeviceKind kind) {
+    // deadzones, mouse delta accumulation, and WASD-to-stick synthesis) and records a new snapshot
+    // into the fixed-capacity ring buffer when state changed.
+    void poll_locked(DeviceKind kind, bool explicit_device = false) {
         GameInputGamepadState pad{};
+        Pg6GameInputMouseState hm{};
         uint32_t raw = 0;
         uint32_t host_seq = 0;
         Pg6IGameInputReading* r = nullptr;
@@ -345,32 +649,71 @@ private:
             pad.left_thumbstick_y = hp.left_thumbstick_y;
             pad.right_thumbstick_x = hp.right_thumbstick_x;
             pad.right_thumbstick_y = hp.right_thumbstick_y;
+            sanitize_gamepad_state(pad);
+            r->GetMouseState(&hm);
             raw = r->GetRawButtons();
             host_seq = static_cast<uint32_t>(r->GetSequenceNumber(scarlett::kGameInputKindGamepad));
             r->Release();
         }
-        std::deque<Snapshot>& h = history_[index(kind)];
+
+        const bool observed_mouse_delta = hm.buttons != last_observed_mouse_.buttons ||
+                                          hm.position_x != last_observed_mouse_.position_x ||
+                                          hm.position_y != last_observed_mouse_.position_y ||
+                                          hm.wheel_x != last_observed_mouse_.wheel_x ||
+                                          hm.wheel_y != last_observed_mouse_.wheel_y;
+        if (observed_mouse_delta) {
+            mouse_activity_seen_ = true;
+            last_observed_mouse_ = hm;
+        }
+
+        ReadingRing<kHistory>& h = history_[index(kind)];
+        if (kind == DeviceKind::Mouse) {
+            if (!mouse_activity_seen_ && !explicit_device && !has_mouse_device()) {
+                return;
+            }
+            if (!h.empty()) {
+                const GameInputMouseState& prev = h.back().mouse;
+                const bool changed = hm.buttons != prev.buttons || hm.position_x != prev.position_x ||
+                                     hm.position_y != prev.position_y || hm.wheel_x != prev.wheel_x ||
+                                     hm.wheel_y != prev.wheel_y;
+                if (!changed) {
+                    return;
+                }
+            }
+            Snapshot s{};
+            s.kind = DeviceKind::Mouse;
+            s.sequence = ++sequence_;
+            s.timestamp = next_timestamp_locked();
+            s.host_sequence = host_seq;
+            s.mouse.buttons = hm.buttons;
+            s.mouse.position_x = hm.position_x;
+            s.mouse.position_y = hm.position_y;
+            s.mouse.wheel_x = hm.wheel_x;
+            s.mouse.wheel_y = hm.wheel_y;
+            h.push(s);
+            return;
+        }
+
         if (!h.empty() && h.back().host_sequence == host_seq) {
             return;
         }
-        Snapshot s;
+        Snapshot s{};
         s.kind = kind;
         s.sequence = ++sequence_;
-        s.timestamp = now_us();
+        s.timestamp = next_timestamp_locked();
         s.host_sequence = host_seq;
         if (kind == DeviceKind::Gamepad) {
             s.gamepad = pad;
         } else {
-            for (const KeyMap& k : kKeyMap) {
-                if ((raw & k.bit) != 0) {
-                    s.keys.push_back(GameInputKeyState{k.scan_code, k.code_point, k.virtual_key, 0, {0, 0}});
-                }
+            os::KeyboardScanEntry decoded[kMaxSnapshotKeys]{};
+            const size_t n = os::decode_keyboard_scan_entries(raw & kGuestSabKeyboardMask, decoded, kMaxSnapshotKeys);
+            s.key_count = static_cast<uint32_t>(n);
+            for (size_t i = 0; i < n; ++i) {
+                s.keys[i] = GameInputKeyState{
+                    decoded[i].scan_code, decoded[i].code_point, decoded[i].virtual_key, decoded[i].is_dead_key, {0, 0}};
             }
         }
-        h.push_back(std::move(s));
-        while (h.size() > kHistory) {
-            h.pop_front();
-        }
+        h.push(s);
     }
 
     HResult neighbour(const com::InterfaceArg<GameInputReadingObj>& ref, uint32_t kind,
@@ -387,39 +730,23 @@ private:
             return hr;
         }
         const uint64_t at = ref->snapshot().sequence;
-        Snapshot found;
+        Snapshot found{};
         bool have = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (next) {
-                poll_locked(dk);
+                poll_locked(dk, static_cast<bool>(device));
             }
-            const std::deque<Snapshot>& h = history_[index(dk)];
-            if (next) {
-                for (const Snapshot& s : h) {
-                    if (s.sequence > at) {
-                        found = s;
-                        have = true;
-                        break;
-                    }
-                }
-            } else {
-                for (auto it = h.rbegin(); it != h.rend(); ++it) {
-                    if (it->sequence < at) {
-                        found = *it;
-                        have = true;
-                        break;
-                    }
-                }
-            }
+            const ReadingRing<kHistory>& h = history_[index(dk)];
+            have = next ? h.find_next(at, &found) : h.find_previous(at, &found);
         }
         if (!have) {
             return kGameInputReadingNotFound;
         }
-        return emit(std::move(found), out);
+        return emit(found, out);
     }
 
-    HResult emit(Snapshot s, OutPtr out);
+    HResult emit(const Snapshot& s, OutPtr out);
 
     bool remove(uint64_t token) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -435,8 +762,11 @@ private:
     com::InterfaceArg<GameInputDeviceObj> gamepad_;
     com::InterfaceArg<GameInputDeviceObj> keyboard_;
     std::mutex mutex_;
-    std::deque<Snapshot> history_[2];
+    ReadingRing<kHistory> history_[kDeviceKindCount];
+    Pg6GameInputMouseState last_observed_mouse_{};
+    bool mouse_activity_seen_ = false;
     uint64_t sequence_ = 0;
+    uint64_t last_timestamp_ = 0;
     uint64_t next_token_ = 1;
     std::vector<uint64_t> callbacks_;
 };
@@ -947,7 +1277,7 @@ constexpr com::MethodDesc kReadingMethods[] = {
     RM::method<&GameInputReadingObj::GetZeroState>("GetControllerSwitchState"),       // 13
     RM::method<&GameInputReadingObj::GetKeyCount>("GetKeyCount"),                     // 14
     RM::method<&GameInputReadingObj::GetKeyState>("GetKeyState"),                     // 15
-    RM::method<&GameInputReadingObj::GetNoState>("GetMouseState"),                    // 16
+    RM::method<&GameInputReadingObj::GetMouseState>("GetMouseState"),                 // 16
     RM::method<&GameInputReadingObj::GetZeroCount>("GetTouchCount"),                  // 17
     RM::method<&GameInputReadingObj::GetZeroState>("GetTouchState"),                  // 18
     RM::method<&GameInputReadingObj::GetNoState>("GetMotionState"),                   // 19
@@ -962,14 +1292,14 @@ constexpr auto kIReading = com::declare_interface<GameInputReadingObj>(
 
 using DM = com::Methods<GameInputDeviceObj>;
 constexpr com::MethodDesc kDeviceMethods[] = {
-    DM::method<&GameInputDeviceObj::GetDeviceInfo>("GetDeviceInfo"),      // 3
-    DM::method<&GameInputDeviceObj::GetDeviceStatus>("GetDeviceStatus"),  // 4
-    DM::stub("GetBatteryState"),                                          // 5
-    DM::stub("CreateForceFeedbackEffect"),                                // 6
-    DM::stub("IsForceFeedbackMotorPoweredOn"),                            // 7
-    DM::stub("SetForceFeedbackMotorGain"),                                // 8
-    DM::stub("SetHapticMotorState"),                                      // 9
-    DM::method<&GameInputDeviceObj::SetRumbleState>("SetRumbleState"),    // 10
+    DM::method<&GameInputDeviceObj::GetDeviceInfo>("GetDeviceInfo"),            // 3
+    DM::method<&GameInputDeviceObj::GetDeviceStatus>("GetDeviceStatus"),        // 4
+    DM::stub("GetBatteryState"),                                                // 5
+    DM::stub("CreateForceFeedbackEffect"),                                      // 6
+    DM::stub("IsForceFeedbackMotorPoweredOn"),                                  // 7
+    DM::stub("SetForceFeedbackMotorGain"),                                      // 8
+    DM::method<&GameInputDeviceObj::SetHapticMotorState>("SetHapticMotorState"), // 9
+    DM::method<&GameInputDeviceObj::SetRumbleState>("SetRumbleState"),          // 10
 };
 constexpr auto kIDevice = com::declare_interface<GameInputDeviceObj>("GameInput.IGameInputDevice", kIidIGameInputDevice,
                                                                      kDeviceMethods, {.slot_count = 24});
@@ -995,10 +1325,20 @@ const com::Interface<GameInputDeviceObj>& GameInputReadingObj::kIDevice() {
     return guest_api::kIDevice;
 }
 
-HResult GameInputApi::emit(Snapshot s, OutPtr out) {
-    com::InterfaceArg<GameInputDeviceObj> device = s.kind == DeviceKind::Gamepad ? gamepad_ : keyboard_;
+HResult GameInputApi::emit(const Snapshot& s, OutPtr out) {
+    com::InterfaceArg<GameInputDeviceObj> device;
+    if (s.kind == DeviceKind::Gamepad) {
+        device = gamepad_;
+    } else if (s.kind == DeviceKind::Keyboard) {
+        device = keyboard_;
+    } else {
+        device = ensure_mouse_device();
+        if (!device) {
+            return com::E_OUTOFMEMORY_HR;
+        }
+    }
     com::Ref<GameInputReadingObj> reading =
-        com::create_object<GameInputReadingObj>(com::implements(kIReading), std::move(s), std::move(device));
+        com::create_object<GameInputReadingObj>(com::implements(kIReading), s, std::move(device));
     if (!reading) {
         return com::E_OUTOFMEMORY_HR;
     }
@@ -1016,10 +1356,30 @@ struct InputModuleState {
     com::Ref<GameInputApi> game_input;
     com::Ref<GameInputDeviceObj> gamepad;
     com::Ref<GameInputDeviceObj> keyboard;
+    com::Ref<GameInputDeviceObj> mouse;
+    std::atomic<bool> mouse_materialized{false};
 };
 InputModuleState& input_state() {
     static InputModuleState s;
     return s;
+}
+
+bool has_mouse_device() {
+    return input_state().mouse_materialized.load(std::memory_order_acquire);
+}
+
+com::InterfaceArg<GameInputDeviceObj> ensure_mouse_device() {
+    InputModuleState& st = input_state();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    if (!st.mouse) {
+        st.mouse = com::create_object<GameInputDeviceObj>(com::implements(kIDevice), DeviceKind::Mouse);
+        if (!st.mouse) {
+            return com::InterfaceArg<GameInputDeviceObj>{};
+        }
+        st.mouse->publish_info();
+        st.mouse_materialized.store(true, std::memory_order_release);
+    }
+    return com::InterfaceArg<GameInputDeviceObj>::resolve(st.mouse->interface_pointer(kIDevice));
 }
 
 HResult game_input_create(OutPtr out) {
@@ -1132,12 +1492,73 @@ void detail::reset_input_guest() {
         st.game_input.reset();
         st.gamepad.reset();
         st.keyboard.reset();
+        st.mouse.reset();
+        st.mouse_materialized.store(false, std::memory_order_release);
     }
     std::lock_guard<std::mutex> lock(rumble_mutex());
     rumble_state() = GameInputRumbleParams{};
+    rumble_telemetry_state() = os::RumbleTelemetry{};
 }
 
 }  // namespace playgta6::os::scarlett::guest_api
+
+namespace playgta6::os {
+
+RumbleTelemetry game_input_rumble_telemetry() {
+    std::lock_guard<std::mutex> lock(scarlett::guest_api::rumble_mutex());
+    return scarlett::guest_api::rumble_telemetry_state();
+}
+
+void reset_game_input_rumble_telemetry() {
+    std::lock_guard<std::mutex> lock(scarlett::guest_api::rumble_mutex());
+    scarlett::guest_api::rumble_telemetry_state() = RumbleTelemetry{};
+}
+
+bool game_input_guest_temporal_reading(uint64_t game_input_va,
+                                       uint64_t timestamp_us,
+                                       uint64_t device_va,
+                                       uint64_t* out_reading_va,
+                                       int32_t* out_hr) {
+    namespace com = playgta6::guest::com;
+    using Api = scarlett::guest_api::GameInputApi;
+    using Dev = scarlett::guest_api::GameInputDeviceObj;
+
+    if (out_reading_va == nullptr) {
+        if (out_hr != nullptr) {
+            *out_hr = com::E_POINTER_HR;
+        }
+        return false;
+    }
+    *out_reading_va = 0;
+    auto api = com::InterfaceArg<Api>::resolve(game_input_va);
+    if (!api) {
+        if (out_hr != nullptr) {
+            *out_hr = com::E_INVALIDARG_HR;
+        }
+        return false;
+    }
+    auto dev = com::InterfaceArg<Dev>::resolve(device_va);
+    const uint64_t out_slot = com::guest_alloc(sizeof(uint64_t));
+    if (out_slot == 0) {
+        if (out_hr != nullptr) {
+            *out_hr = com::E_OUTOFMEMORY_HR;
+        }
+        return false;
+    }
+    const com::HResult hr = api->GetTemporalReading(timestamp_us, std::move(dev), com::OutPtr(out_slot));
+    uint64_t reading_va = 0;
+    com::read_guest(out_slot, reading_va);
+    com::guest_free(out_slot);
+    if (out_reading_va != nullptr) {
+        *out_reading_va = reading_va;
+    }
+    if (out_hr != nullptr) {
+        *out_hr = hr;
+    }
+    return gdk::succeeded(hr);
+}
+
+}  // namespace playgta6::os
 
 extern "C" {
 
