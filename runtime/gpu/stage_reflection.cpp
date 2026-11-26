@@ -461,6 +461,18 @@ bool parse_stage(const Json& s, uint32_t version, StageReflection* out, std::str
                     *error = "inline_sampler needs sdwords: four 32-bit unsigned integers";
                     return false;
                 }
+            } else if (const Json* unresolved = src->get("unresolved"); unresolved != nullptr) {
+                if (version < kStageReflectionVersionUnresolved || unresolved->type != Json::Type::Bool ||
+                    !unresolved->boolean) {
+                    *error = "unresolved source needs \"unresolved\": true and version >= 3";
+                    return false;
+                }
+                if (r.kind == ReflectedBindingKind::Storage || r.kind == ReflectedBindingKind::StorageTexture) {
+                    *error = std::string("a ") + (r.kind == ReflectedBindingKind::Storage ? "storage" : "storage_texture") +
+                             " binding cannot have an unresolved source";
+                    return false;
+                }
+                r.source = ReflectedSource::Unresolved;
             } else if (src->get("static_sampler") != nullptr) {
                 r.source = ReflectedSource::StaticSampler;
                 if (!get_u32(*src, "static_sampler", &r.static_sampler)) {
@@ -798,6 +810,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
     uint64_t lane_indexed = 0;
     uint64_t lane_arrays = 0;
     uint64_t root_tables = 0;
+    uint64_t unresolved = 0;
     bool ok = true;
     auto fail = [&](const ReflectedBinding& b, const std::string& why) {
         *report += binding_key(b) + ": " + why + "\n";
@@ -932,6 +945,16 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                 reg = space = d3d::kNoIndex;
                 lb.join.inline_sampler = true;
                 lb.join.sampler = desc;
+            } else if (b.source == ReflectedSource::Unresolved) {
+                // The translator could not trace the descriptor (#482): bind the worker's default
+                // for the kind (an unresolved register), so the rest of the stage still joins.
+                const bool sampler_kind =
+                    b.kind == ReflectedBindingKind::Sampler || b.kind == ReflectedBindingKind::ComparisonSampler;
+                cls = b.kind == ReflectedBindingKind::Uniform ? d3d::DescriptorRangeType::Cbv
+                      : sampler_kind                          ? d3d::DescriptorRangeType::Sampler
+                                                              : d3d::DescriptorRangeType::Srv;
+                reg = space = d3d::kNoIndex;
+                ++unresolved;
             } else if (b.source == ReflectedSource::StaticSampler) {
                 cls = d3d::DescriptorRangeType::Sampler;
                 if (b.static_sampler < rs.static_samplers.size()) {
@@ -1052,6 +1075,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
                     case ReflectedSource::CbvIndexedResourceHeap:
                     case ReflectedSource::LaneIndexedSamplerHeap:
                     case ReflectedSource::LaneIndexedResourceHeap:
+                    case ReflectedSource::Unresolved:
                         break;
                 }
             }
@@ -1151,6 +1175,7 @@ bool join_pipeline_layout(const d3d::RootSignatureDesc& rs, bool compute, const 
         stats->table_slots_outside_rs += outside_rs;
         stats->lane_indexed_arrays += lane_arrays;
         stats->root_descriptor_tables += root_tables;
+        stats->unresolved_bindings += unresolved;
     }
     return true;
 }

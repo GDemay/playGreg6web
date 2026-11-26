@@ -978,6 +978,81 @@ void test_mesh_output() {
         &bad, &error));
 }
 
+// G62 / #482 (sidecar version 3): a binding whose descriptor origin the translator could not trace
+// comes with an "unresolved" source. The stage still joins: the binding is bound as the worker's
+// default for its kind (no register), counted in JoinStats::unresolved_bindings.
+void test_unresolved_source() {
+    const char* doc = R"({
+  "schema": "playgta6-stage-reflection", "version": 3,
+  "stages": {
+    "0x00000000000000e1": {
+      "stage": "fragment",
+      "bindings": [
+        {"group": 0, "binding": 0, "kind": "uniform", "source": {"user_sgpr": 8, "root_constants": true}},
+        {"group": 0, "binding": 1, "kind": "texture", "view_dimension": "2d", "source": {"unresolved": true}},
+        {"group": 0, "binding": 2, "kind": "sampler", "source": {"unresolved": true}}
+      ]
+    }
+  }
+})";
+    StageReflectionIndex index;
+    std::string error;
+    CHECK(parse_stage_reflection_json(doc, &index, &error));
+    const StageReflection& ps = index.at(0xe1);
+    CHECK(ps.bindings.size() == 3 && ps.bindings[1].source == ReflectedSource::Unresolved &&
+          ps.bindings[2].source == ReflectedSource::Unresolved);
+
+    d3d::RootSignatureDesc desc;
+    d3d::RootParameterDesc constants;
+    constants.parameter_type = d3d::RootParameterType::Constants32Bit;
+    constants.num_32bit_values = 4;
+    desc.parameters = {constants};
+    bridge::PipelineLayoutDesc layout;
+    std::string report;
+    JoinStats stats;
+    CHECK(join_pipeline_layout(desc, false, {{GpuShaderStageBits::Fragment, &ps}}, &layout, &report, &stats));
+    CHECK(report.empty() && stats.unresolved_bindings == 2);
+    const bridge::LayoutBinding* tex = find(layout, 0, 1);
+    CHECK(tex != nullptr && tex->join.register_class == d3d::DescriptorRangeType::Srv &&
+          tex->join.shader_register == d3d::kNoIndex && tex->join.register_space == d3d::kNoIndex &&
+          tex->join.heap == d3d::HeapAccess::None && tex->join.table_parameter == d3d::kNoIndex &&
+          tex->entry.type == static_cast<uint8_t>(GpuBindingLayoutType::Texture));
+    const bridge::LayoutBinding* samp = find(layout, 0, 2);
+    CHECK(samp != nullptr && samp->join.register_class == d3d::DescriptorRangeType::Sampler &&
+          samp->join.shader_register == d3d::kNoIndex);
+    // The planner finds no slot for them (bound as the worker's default); the root constants resolve.
+    d3d::RootSignature rs;
+    CHECK(d3d::RootSignature::build(desc, &rs).ok());
+    std::vector<d3d::ShaderBinding> bindings;
+    for (const auto& g : layout.groups) {
+        for (const auto& lb : g.bindings) {
+            d3d::ShaderBinding sb = lb.join;
+            sb.binding = lb.entry.binding;
+            bindings.push_back(sb);
+        }
+    }
+    const d3d::BindGroupPlan plan = d3d::BindGroupPlan::build(rs, bindings, d3d::WebGpuStage::Fragment);
+    CHECK(plan.entries().size() == 3 && plan.unresolved_count() == 2);
+
+    // Before version 3, not literally true, or on a writable kind: malformed.
+    const char* bad_docs[] = {
+        R"({"schema": "playgta6-stage-reflection", "version": 2, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "fragment",
+            "bindings": [{"group": 0, "binding": 0, "kind": "texture", "source": {"unresolved": false}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 0, "binding": 0, "kind": "storage", "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 3, "stages": {"0x1": {"stage": "compute",
+            "bindings": [{"group": 0, "binding": 0, "kind": "storage_texture", "storage_format": 18,
+                          "source": {"unresolved": true}}]}}})",
+        R"({"schema": "playgta6-stage-reflection", "version": 4, "stages": {}})",
+    };
+    for (const char* bad_doc : bad_docs) {
+        StageReflectionIndex bad;
+        CHECK(!parse_stage_reflection_json(bad_doc, &bad, &error));
+    }
+}
+
 int main() {
     test_mesh_output();
     test_parse();
@@ -993,6 +1068,7 @@ int main() {
     test_lane_indexed_heap_sources();
     test_inline_sampler();
     test_root_descriptor_over_table();
+    test_unresolved_source();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_stage_reflection: %d failure(s)\n", g_failures);
         return 1;

@@ -56,6 +56,7 @@ const char* work_name(Work w) {
     case Work::PipelinesCreated: return "pipelines_created";
     case Work::ReflectionRootDescriptorTables: return "reflection_root_descriptor_tables";
     case Work::ReflectionVertexInputsDefaulted: return "reflection_vertex_inputs_defaulted";
+    case Work::ReflectionUnresolvedBindings: return "reflection_unresolved_bindings";
     case Work::ReadbacksIssued: return "readbacks_issued";
     case Work::ReadbackBytes: return "readback_bytes";
     case Work::ReadbacksCompleted: return "readbacks_completed";

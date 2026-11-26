@@ -1551,6 +1551,9 @@ enum class Work : size_t {
     // table slot (stage_reflection.h, G62 #482), per pipeline state created.
     ReflectionRootDescriptorTables,
     ReflectionVertexInputsDefaulted,
+    // Reflected bindings whose descriptor origin the translator could not trace ("unresolved"
+    // sources, sidecar version 3, G62 #482), bound as the worker's default, per pipeline state created.
+    ReflectionUnresolvedBindings,
     // G66 GPU -> CPU read-back (d3d12_readback.h): ReadbackBuffer / ReadbackTexture packets issued
     // and the bytes they write into guest memory, completions the consumer reported, queue signals
     // held until their read-backs landed, and holds ended by the timeout instead.

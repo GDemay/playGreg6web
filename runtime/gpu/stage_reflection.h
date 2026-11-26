@@ -40,7 +40,15 @@
 //                           {"lane_indexed_resource_heap" | "lane_indexed_sampler_heap": {
 //                               "max_count", "shift", "stride" (opt.),
 //                               "window_base" (opt.): {"cbv": <as above>, "byte_offset", "bit_offset" (0),
-//                                                      "mask" (0xffffffff)}}}}]}}}
+//                                                      "mask" (0xffffffff)}}} |
+//                           {"unresolved": true} (version >= 3)}]}}}
+// An unresolved source (G62, #482; version >= 3): the translator reflected the binding but could
+// not trace where the stage loads its descriptor from (mostly SM 6.6 bindless textures whose heap
+// index is a constant-buffer dword at an offset computed from a root constant, which the CB-indexed
+// source cannot express yet). The stage still joins: such a binding is bound as the worker's
+// default for its kind (an unresolved register, like a sampler without a static sampler), counted
+// in JoinStats::unresolved_bindings, instead of the whole stage falling back to conventions.
+// Writable kinds (storage, storage_texture) cannot be unresolved: their writes would be lost.
 // A lane-indexed heap source (G62, #482; SM 6.6 ResourceDescriptorHeap[NonUniformResourceIndex(i)]:
 // a VGPR index, v_readfirstlane_b32 waterfall loops): each lane picks its own descriptor, so the
 // stage reads a window of "max_count" consecutive heap descriptors as a WGSL
@@ -121,6 +129,7 @@ enum class ReflectedSource : uint8_t {
     CbvIndexedResourceHeap,
     LaneIndexedSamplerHeap,  // per-lane index into a window of the heap (lane_*), G62
     LaneIndexedResourceHeap,
+    Unresolved,  // origin not traced by the translator: bound as the default (version >= 3), G62
 };
 
 // Largest lane-indexed window a sidecar may ask for (WebGPU's per-stage sampled-texture limit we
@@ -186,10 +195,12 @@ struct StageReflection {
 using StageReflectionIndex = std::unordered_map<uint64_t, StageReflection>;
 
 // Sidecar versions this parser reads. Version 2 adds the optional "table_byte_offset" of a
-// "root_descriptor" source (ignored in version 1 documents).
+// "root_descriptor" source (ignored in version 1 documents); version 3 adds the "unresolved" source
+// (malformed in older documents).
 inline constexpr uint32_t kStageReflectionVersion = 1;
 inline constexpr uint32_t kStageReflectionVersionRootTableOffset = 2;
-inline constexpr uint32_t kStageReflectionMaxVersion = 2;
+inline constexpr uint32_t kStageReflectionVersionUnresolved = 3;
+inline constexpr uint32_t kStageReflectionMaxVersion = 3;
 
 // Parses a sidecar (see above). False + message when malformed; unknown members are ignored.
 bool parse_stage_reflection_json(std::string_view json, StageReflectionIndex* out, std::string* error);
@@ -229,6 +240,8 @@ struct JoinStats {
     // Vertex inputs no input-layout element covers, read as D3D12's (0, 0, 0, 1) defaults from a
     // shared constant buffer (join_vertex_inputs; on success).
     uint64_t vertex_inputs_defaulted = 0;
+    // Bindings with an unresolved source, bound as the worker's default (on success).
+    uint64_t unresolved_bindings = 0;
 };
 struct JoinOptions {
     // The consumer binds binding arrays (GpuLayoutFlags::BindingArrays): lane-indexed heap windows
