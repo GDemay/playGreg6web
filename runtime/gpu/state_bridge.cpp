@@ -2446,6 +2446,7 @@ bool CommandListBridge::emit_bind_group(d3d::BindPoint /*bind_point*/,
     cached->residency_epoch = device_.residency_epoch();
     cached->residency_key = residency_key(*cached);
     cached->view_ids = pending_view_ids_;
+    cached->null_write_entries = pending_null_writes_;
     GpuCreateBindGroup2Payload header{};
     header.id = device_.allocate_id();
     header.layout_id = group.id;
@@ -2588,6 +2589,7 @@ uint32_t CommandListBridge::refresh_memory_bind_groups(CommandEncoder& prelude) 
             std::vector<GpuBindGroupEntry2> entries;
             gpu_entries(*m.group, m.built, prelude, &entries);
             m.built.view_ids = pending_view_ids_;
+            m.built.null_write_entries = pending_null_writes_;
             // The conversions were recorded with the dispatches: a redirect the recording did not
             // make has none, so that binding is bound null as before (#482).
             const auto recorded = redirects_.find(m.built.gpu_id);
@@ -2642,6 +2644,20 @@ void CommandListBridge::sync_bound_textures(const StateBridgeDevice::GroupLayout
                 ++stats_.texture_memory_syncs;
             }
         }
+    }
+}
+
+// Depth and depth-stencil formats: WebGPU cannot bind them as storage textures.
+static bool is_depth_stencil_format(pso::DxgiFormat f) {
+    switch (f) {
+    case pso::DxgiFormat::D32_FLOAT_S8X24_UINT:
+    case pso::DxgiFormat::D32_FLOAT:
+    case pso::DxgiFormat::D24_UNORM_S8_UINT:
+    case pso::DxgiFormat::D16_UNORM:
+    case pso::DxgiFormat::D16_UNORM_S8_UINT:
+        return true;
+    default:
+        return false;
     }
 }
 
@@ -2854,6 +2870,9 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     layout.storage_format == 0 || own == layout.storage_format ||
                     own == static_cast<uint8_t>(
                                pso::srgb_sibling(static_cast<pso::WgpuTextureFormat>(layout.storage_format)));
+                if (e.resource_id != 0 && known && is_depth_stencil_format(info.format)) {
+                    ++stats_.storage_views_depth_untwinned;  // see the counter: no twin plane yet
+                }
                 if (e.resource_id != 0 && (!known || !info.storage)) {
                     out.resource_id = 0;
                     out.view = GpuTextureViewDesc{};
@@ -2936,6 +2955,21 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
             }
             diagnostics_ |= BridgeDiag::NullBinding;
             break;
+        }
+    }
+    // Writable storage bindings left null: the dispatch using this group is dropped (backlog 39).
+    pending_null_writes_ = 0;
+    for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
+        if (entries[i].resource_id != 0) {
+            continue;
+        }
+        const GpuBindGroupLayoutEntry& layout = group.entries[i];
+        const bool tex = layout.type == static_cast<uint8_t>(GpuBindingLayoutType::StorageTexture) &&
+                         layout.binding_type != static_cast<uint8_t>(GpuStorageTextureAccess::ReadOnly);
+        const bool buf = layout.type == static_cast<uint8_t>(GpuBindingLayoutType::Buffer) &&
+                         layout.binding_type == static_cast<uint8_t>(GpuBufferBindingType::Storage);
+        if (tex || buf) {
+            ++pending_null_writes_;
         }
     }
 }
@@ -3146,6 +3180,7 @@ bool CommandListBridge::apply_bind_groups(d3d::BindPoint bind_point,
             }
         }
         BoundGroup& b = (*bound)[g];
+        b.null_write_entries = cached != nullptr ? cached->null_write_entries : 0u;
         if (b.bind_group_id != bind_group_id || b.dynamic_offsets != offsets) {
             const GpuSetBindGroup2Payload header{static_cast<uint32_t>(g), bind_group_id,
                                                  static_cast<uint32_t>(offsets.size()), 0u};
@@ -3404,6 +3439,25 @@ bool CommandListBridge::DispatchMesh(uint32_t x, uint32_t y, uint32_t z) {
     return true;
 }
 
+bool CommandListBridge::drop_null_storage_dispatch(uint32_t pipeline_id) {
+    if (!device_.options().drop_null_storage_dispatch) {
+        return false;
+    }
+    bool null_write = false;
+    for (const BoundGroup& b : compute_groups_) {
+        null_write = null_write || b.null_write_entries != 0;
+    }
+    if (!null_write) {
+        return false;
+    }
+    ++stats_.dispatches_dropped_null_storage;
+    diagnostics_ |= BridgeDiag::NullStorageDispatchDropped;
+    if (null_storage_pipelines_.insert(pipeline_id).second) {
+        ++stats_.null_storage_dispatch_pipelines;
+    }
+    return true;
+}
+
 void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
                                  uint32_t thread_group_count_y,
                                  uint32_t thread_group_count_z) {
@@ -3412,6 +3466,9 @@ void CommandListBridge::Dispatch(uint32_t thread_group_count_x,
     }
     ComputePipelineState* state = prepare_compute_dispatch();
     if (state == nullptr) {
+        return;
+    }
+    if (drop_null_storage_dispatch(state->pipeline_id_)) {
         return;
     }
     // #482: storage bindings redirected to an intermediate texture. Dispatches in one compute pass
@@ -3613,7 +3670,11 @@ bool CommandListBridge::ExecuteIndirect(const IndirectExecution& e) {
     }
     GpuOpcode opcode = GpuOpcode::DispatchIndirect;
     if (e.kind == IndirectKind::Dispatch) {
-        if (prepare_compute_dispatch() == nullptr) {
+        ComputePipelineState* indirect_state = prepare_compute_dispatch();
+        if (indirect_state == nullptr) {
+            return skip();
+        }
+        if (drop_null_storage_dispatch(indirect_state->pipeline_id_)) {
             return skip();
         }
         // Storage bindings redirected to an intermediate texture (#482) need conversions around the

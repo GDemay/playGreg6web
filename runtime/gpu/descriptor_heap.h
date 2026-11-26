@@ -1019,6 +1019,9 @@ struct CachedBindGroup {
     std::vector<BindGroupEntry> entries;  // sorted by binding
     uint32_t gpu_id = 0;  // WebGPU bind group id, assigned by the caller after a rebuild
     uint32_t null_entries = 0;
+    // Writable storage bindings (storage texture write/read-write, read-write storage buffer) the
+    // bridge bound null: a dispatch through them is dropped (guard rail, backlog 39).
+    uint32_t null_write_entries = 0;
     uint64_t last_used_epoch = 0;  // BindGroupCache epoch of the last lookup that returned it
     // G66 (#691): entries the bridge bound as a relocated copy (relocate_uniform / relocate_storage)
     // and the home it got, with the relocation epoch at that time. A cache hit does not relocate

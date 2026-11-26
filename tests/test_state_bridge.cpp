@@ -3781,6 +3781,78 @@ void test_storage_texture_format_conversion() {
     }
 }
 
+// Backlog 39 / 35: a compute dispatch whose writable storage view is null is dropped and counted
+// (once per pipeline), not recorded; a depth-format texture given a storage view is null too (WebGPU
+// has no storage depth) and is counted in the census. variant 0: valid view (recorded), 1: empty
+// descriptor slot, 2: depth texture, 3: empty slot with the drop switched off.
+void test_null_storage_dispatch_dropped() {
+    for (int variant = 0; variant < 4; ++variant) {
+        d3d::DescriptorHeapRegistry heaps;
+        d3d::ResourceStateRegistry states;
+        bridge::BridgeOptions options = counting_options(7000);
+        options.drop_null_storage_dispatch = variant != 3;
+        bridge::StateBridgeDevice device(heaps, options, &states);
+        constexpr uint32_t kTex = 302;
+        constexpr uint64_t kCs = 0xE3;
+        const pso::DxgiFormat fmt = variant == 2 ? pso::DxgiFormat::D32_FLOAT : pso::DxgiFormat::R8G8B8A8_UNORM;
+        bridge::TextureInfo tex{fmt, 32, 16, 1, 1, 1, GpuTextureDimension::Dim2D, false};
+        tex.storage = variant == 0;
+        device.register_texture(kTex, tex);
+        device.register_shader_module(kCs, 3);
+        d3d::DescriptorHeap* view_heap = make_heap(heaps, d3d::DescriptorHeapType::CbvSrvUav, 4, true);
+        if (variant == 0 || variant == 2) {
+            d3d::ViewDesc vd;
+            vd.format = static_cast<uint32_t>(fmt);
+            vd.dimension = d3d::ViewDimension::Texture2D;
+            CHECK(heaps.create_unordered_access_view(kTex, 0, &vd, view_heap->cpu_handle(0)) == d3d::Status::Ok);
+        }
+        d3d::RootSignatureDesc rs;
+        d3d::RootParameterDesc table;
+        table.parameter_type = d3d::RootParameterType::DescriptorTable;
+        d3d::DescriptorRangeDesc range;
+        range.range_type = d3d::DescriptorRangeType::Uav;
+        range.num_descriptors = 1;
+        table.ranges.push_back(range);
+        rs.parameters.push_back(table);
+        d3d::RootSignature root;
+        CHECK(d3d::RootSignature::build(rs, &root).ok());
+        bridge::PipelineLayoutDesc layout;
+        bridge::GroupLayoutDesc group;
+        GpuBindGroupLayoutEntry entry =
+            layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
+                         static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),
+                         static_cast<uint8_t>(GpuTextureViewDimension::Dim2D));
+        entry.storage_format = static_cast<uint8_t>(pso::WgpuTextureFormat::Rgba8Unorm);
+        group.bindings.push_back({entry, join(0, d3d::DescriptorRangeType::Uav, 0)});
+        layout.groups.push_back(group);
+        device.register_pipeline_layout(kCs, 0, layout);
+        pso::D3D12ComputePsoDesc desc;
+        desc.cs = kCs;
+        auto cpso = device.create_compute_pipeline_state(desc, &root);
+        gpu::CommandEncoder enc;
+        bridge::CommandListBridge list(device, enc);
+        d3d::DescriptorHeap* visible[] = {view_heap};
+        CHECK(list.SetDescriptorHeaps(1, visible) == d3d::Status::Ok);
+        CHECK(list.SetComputeRootSignature(&root) == d3d::Status::Ok);
+        list.SetComputePipelineState(cpso.get());
+        CHECK(list.SetComputeRootDescriptorTable(0, view_heap->gpu_handle(0)) == d3d::Status::Ok);
+        list.Dispatch(2, 2, 2);
+        list.Dispatch(1, 1, 1);
+        list.Close();
+        uint32_t recorded = 0;
+        for (const Packet& pk : decode(enc)) {
+            recorded += pk.opcode == GpuOpcode::DispatchCompute ? 1u : 0u;
+        }
+        const bool dropped = variant == 1 || variant == 2;
+        CHECK(recorded == (dropped ? 0u : 2u));
+        CHECK(list.stats().dispatches == (dropped ? 0u : 2u));
+        CHECK(list.stats().dispatches_dropped_null_storage == (dropped ? 2u : 0u));
+        CHECK(list.stats().null_storage_dispatch_pipelines == (dropped ? 1u : 0u));
+        CHECK(((list.diagnostics() & bridge::BridgeDiag::NullStorageDispatchDropped) != 0) == dropped);
+        CHECK(list.stats().storage_views_depth_untwinned == (variant == 2 ? 1u : 0u));
+    }
+}
+
 // #482: a fragment-stage storage binding of a mismatched float format goes through an intermediate
 // too: copied in (read-write) before the draw in a pass of its own, converted out when the pass ends.
 void test_fragment_storage_texture_format_conversion() {
@@ -4529,6 +4601,7 @@ int main() {
     test_evicted_texture_destroy_deferred_until_after_present();
     test_content_hash_change_detection();
     test_storage_texture_format_conversion();
+    test_null_storage_dispatch_dropped();
     test_fragment_storage_texture_format_conversion();
     test_vertex_mixed_storage_and_attachment_alias();
     test_seam_conversions();
