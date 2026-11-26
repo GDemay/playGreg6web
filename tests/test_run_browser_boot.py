@@ -4175,6 +4175,8 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
             self.assertEqual(seen_calls[0]["duration_s"], 45.0)
             self.assertEqual(seen_calls[1]["duration_s"], 25.0)
             self.assertEqual(seen_calls[0]["user_data_dir"], seen_calls[1]["user_data_dir"])
+            self.assertGreater(seen_calls[0]["port"], 0)
+            self.assertEqual(seen_calls[0]["port"], seen_calls[1]["port"])
             self.assertEqual(seen_calls[1]["log_prefix"], "warm-")
             self.assertTrue(sentinel_present_on_warm["ok"])
             # Shared Chrome user-data-dir must be cleaned up after warm pass finishes
@@ -4244,6 +4246,73 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
             # compare_boot_reports compatibility preserved
             cmp_res = compare_boot_reports.compare(report, report, compare_boot_reports.Tolerances())
             self.assertEqual(cmp_res.failures(), [])
+
+    def test_warm_boot_check_shared_port_origin_resolution(self):
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+
+            # 1) warm_boot_check=True + --port 0 -> both passes get the exact same non-zero port
+            code_zero, _, err_zero, _, sessions_zero = fx.run_cli(
+                "--smoke",
+                "--name",
+                "warm-port-zero",
+                "--port",
+                "0",
+                "--warm-boot-check",
+            )
+            self.assertEqual(code_zero, 0, err_zero)
+            self.assertEqual(len(sessions_zero), 2)
+            cold_port = sessions_zero[0]["port"]
+            warm_port = sessions_zero[1]["port"]
+            self.assertIsInstance(cold_port, int)
+            self.assertGreater(cold_port, 0)
+            self.assertLessEqual(cold_port, 65535)
+            self.assertEqual(cold_port, warm_port)
+
+            # 2) warm_boot_check=True + explicit --port 8099 -> both passes receive 8099
+            code_explicit, _, err_explicit, _, sessions_explicit = fx.run_cli(
+                "--smoke",
+                "--name",
+                "warm-port-explicit",
+                "--port",
+                "8099",
+                "--warm-boot-check",
+            )
+            self.assertEqual(code_explicit, 0, err_explicit)
+            self.assertEqual(len(sessions_explicit), 2)
+            self.assertEqual(sessions_explicit[0]["port"], 8099)
+            self.assertEqual(sessions_explicit[1]["port"], 8099)
+
+            # 3) warm_boot_check=False + --port 0 -> unchanged (single session with port == 0)
+            code_cold, _, err_cold, _, sessions_cold = fx.run_cli(
+                "--smoke",
+                "--name",
+                "cold-port-zero",
+                "--port",
+                "0",
+            )
+            self.assertEqual(code_cold, 0, err_cold)
+            self.assertEqual(len(sessions_cold), 1)
+            self.assertEqual(sessions_cold[0]["port"], 0)
+
+    def test_wait_for_port_released_waits_for_listener_shutdown(self):
+        self.assertTrue(rbb.wait_for_port_released("127.0.0.1", 0))
+
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = int(srv.getsockname()[1])
+        try:
+            self.assertFalse(rbb.wait_for_port_released("127.0.0.1", port, timeout_s=0.1))
+
+            timer = threading.Timer(0.08, srv.close)
+            timer.start()
+            try:
+                self.assertTrue(rbb.wait_for_port_released("127.0.0.1", port, timeout_s=2.0))
+            finally:
+                timer.cancel()
+        finally:
+            srv.close()
 
     def test_run_browser_session_external_user_data_dir_reuse_and_log_prefix(self):
         with tempfile.TemporaryDirectory() as d:
