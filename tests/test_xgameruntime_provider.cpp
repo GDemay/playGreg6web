@@ -282,6 +282,12 @@ bool wait_for(Pred pred) {
     return pred();
 }
 
+// Cleanup ('C') can run on the DoWork/queue thread just after the test thread's last call returns
+// (maybe_cleanup is deferred while a provider call is still in flight), so wait for the sequence.
+bool provider_ops_settle(const char* expected) {
+    return wait_for([&] { return provider_ops() == expected; });
+}
+
 struct Fixture;
 uint64_t make_guest_block(Fixture& fx, uint64_t queue);
 
@@ -1257,7 +1263,7 @@ void test_async_provider_slots() {
     CHECK(hr32(fx.vcall(api, 11, {block, identity, 4, buffer, used})) == gdk::E_NOT_SUFFICIENT_BUFFER_HR);
     CHECK(hr32(fx.vcall(api, 11, {block, identity, 16, buffer, used})) == 0);  // XAsyncGetResult
     CHECK(load64(buffer) == kPayload && load64(used) == 8 && g_seen_buffer_size == 8);
-    CHECK(provider_ops() == "BWWRC");
+    CHECK(provider_ops_settle("BWWRC"));
     CHECK(hr32(fx.vcall(api, 11, {block, identity, 16, buffer, 0})) == gdk::E_ILLEGAL_METHOD_CALL_HR);
     CHECK(hr32(fx.vcall(api, 3, {block, 1})) == 0);
     pg6_gdk_xasync_complete(cbk::async_shadow_find(block), gdk::E_FAIL_HR, 0);  // ignored
@@ -1277,7 +1283,7 @@ void test_async_provider_slots() {
     g_done_block = 0;
     CHECK(dispatch(queue, 1));
     CHECK(g_done_block == block2);
-    CHECK(provider_ops() == "BXC");
+    CHECK(provider_ops_settle("BXC"));
 
     // XAsyncRun: the guest work function runs as DoWork; its result is the status.
     g_work_result = static_cast<int32_t>(0x80070005u);
@@ -1303,7 +1309,7 @@ void test_async_provider_slots() {
     CHECK(hr32(fx.vcall(api, 3, {block4, 1})) == 0);  // wait
     CHECK(g_done_block == block4);
     CHECK(hr32(fx.vcall(api, 11, {block4, identity, 8, buffer, used})) == 0);
-    CHECK(provider_ops() == "BWRC");
+    CHECK(provider_ops_settle("BWRC"));
 
     // XTaskQueueGetPort / XTaskQueueCreateComposite: work from `queue`, completions from `queue2`.
     CHECK(hr32(fx.vcall(api, 12, {0, 0, out})) == 0);
