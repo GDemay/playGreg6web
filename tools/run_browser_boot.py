@@ -10,7 +10,7 @@
         [--baseline NAME|DIR]
         [--input-script PRESET] [--stream-shaders] [--stream-threshold-mb MB]
         [--boot-options JSON|FILE] [--report-to-log] [--max-wall-ms MS] [--dump-pipelines]
-        [--quiet-server]
+        [--quiet-server] [--warm-boot-check] [--warm-duration-s N]
 
 What it does, in order:
 
@@ -137,6 +137,7 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
     "chrome-menu-flow-2": "chrome-menu-flow-2",
     "chrome-menu-flow-4": "chrome-menu-flow-4",
     "chrome-menu-flow-5": "chrome-menu-flow-5",
+    "chrome-menu-flow-6": "chrome-menu-flow-6",
     "chrome-to-ingame": "chrome-to-ingame",
     "intro-watch": "intro-watch",
     "legal-notices": "legal-notices",
@@ -146,6 +147,112 @@ ALLOWED_INPUT_SCRIPT_PRESETS: dict[str, str] = {
 }
 INPUT_SCRIPT_ALIASES: dict[str, str] = ALLOWED_INPUT_SCRIPT_PRESETS
 _SAFE_INPUT_SCRIPT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+PLAYABILITY_STATES: tuple[str, ...] = (
+    "BOOTING",
+    "FIRST_PRESENT",
+    "START_SCREEN",
+    "INTRO_VIDEO",
+    "MAIN_MENU",
+    "IN_GAME",
+)
+_PLAYABILITY_STATE_RANK: dict[str, int] = {name: idx for idx, name in enumerate(PLAYABILITY_STATES)}
+M4_MILESTONES: tuple[str, ...] = (
+    "FIRST_VISIBLE_FRAME",
+    "START_SCREEN",
+    "INTRO_VIDEO",
+    "MAIN_MENU",
+    "IN_GAME",
+)
+_M4_MILESTONE_FAILURE_RE = re.compile(
+    r"\b(?:fail(?:ed|s|ure)?|error|unresolved|missing|unimplemented|abort(?:ed)?|timeout|timed[\s_-]*out|crash(?:ed)?|exception|not[\s_-]+reached|never[\s_-]+reached)\b",
+    re.IGNORECASE,
+)
+_M4_MILESTONE_TOKEN_RE = re.compile(
+    r"\b(FIRST_VISIBLE_FRAME|START_SCREEN|INTRO_VIDEO|MAIN_MENU|IN_GAME)\b",
+    re.IGNORECASE,
+)
+_M4_MILESTONE_AT_RE = re.compile(
+    r"\b(FIRST_VISIBLE_FRAME|START_SCREEN|INTRO_VIDEO|MAIN_MENU|IN_GAME)\b[^\r\n]{0,64}?\bat\s+(\d+(?:\.\d+)?)\s*(ms|s)\b",
+    re.IGNORECASE,
+)
+_M4_MILESTONE_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("START_SCREEN", re.compile(r"\b(?:bootToStartScreenMs|boot_to_start_screen_ms)\s*[=:]\s*(\d+(?:\.\d+)?)\b")),
+    ("INTRO_VIDEO", re.compile(r"\b(?:bootToIntroVideoMs|boot_to_intro_video_ms)\s*[=:]\s*(\d+(?:\.\d+)?)\b")),
+    ("MAIN_MENU", re.compile(r"\b(?:bootToMainMenuMs|boot_to_main_menu_ms)\s*[=:]\s*(\d+(?:\.\d+)?)\b")),
+    ("IN_GAME", re.compile(r"\b(?:bootToInGameMs|boot_to_in_game_ms)\s*[=:]\s*(\d+(?:\.\d+)?)\b")),
+)
+_PLAYABILITY_STATE_KV_RE = re.compile(
+    r"\b(?:playabilityState|playability_state|m4Phase|m4_phase)\s*[=:]\s*([A-Za-z_]+)\b"
+)
+AUDIO_CONTEXT_STATES: frozenset[str] = frozenset(
+    {"running", "active", "suspended", "interrupted", "closed", "headless-drain"}
+)
+AUDIO_OUTPUT_STATES: frozenset[str] = frozenset({"active", "suspended", "headless-drain"})
+_AUDIO_CONTEXT_STATE_KV_RE = re.compile(
+    r"\b(?:audio_context_state|audioContextState|context_state|contextState)\s*[=:]\s*([A-Za-z_-]+)\b",
+    re.IGNORECASE,
+)
+_AUDIO_OUTPUT_STATE_KV_RE = re.compile(
+    r"\b(?:audio_output_state|audioOutputState|output_state|outputState)\s*[=:]\s*([A-Za-z_-]+)\b",
+    re.IGNORECASE,
+)
+_AUDIO_WORKLET_SAB_KV_RE = re.compile(
+    r"\b(?:audio_worklet_sab_attached|audioWorkletSabAttached|worklet_sab_attached|workletSabAttached|audio_ring_sab_attached|audioRingSabAttached|ring_sab_attached|ringSabAttached)\s*[=:]\s*(true|false|yes|no|1|0)\b",
+    re.IGNORECASE,
+)
+_AUDIO_EXPLICIT_SAMPLE_RATE_KV_RE = re.compile(
+    r"\b(?:audio_sample_rate|audioSampleRate)\s*[=:]\s*(\d+)\b",
+    re.IGNORECASE,
+)
+_AUDIO_GENERIC_SAMPLE_RATE_KV_RE = re.compile(
+    r"\b(?:sample_rate|sampleRate)\s*[=:]\s*(\d+)\b",
+    re.IGNORECASE,
+)
+_AUDIO_EXPLICIT_GUEST_FRAMES_DRAINED_KV_RE = re.compile(
+    r"\b(?:audio_guest_frames_drained|audioGuestFramesDrained|guest_frames_drained|guestFramesDrained|guest_drained_frames|guestDrainedFrames)\s*[=:]\s*(\d+)\b"
+)
+_AUDIO_LOG_CONTEXT_RE = re.compile(
+    r"\[audio\]|audio_worker|audio_engine|audio_ring|audioContext|guest[\s_-]*pcm[\s_-]*ring|guestRing|guestFramesDrained|playgta6_audio_ring",
+    re.IGNORECASE,
+)
+_OPFS_INT_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("opfsHits", re.compile(r"\b(?:opfsHits|opfs_hits|opfsCacheHits|opfs_cache_hits)\s*[=:]\s*(\d+)\b")),
+    ("opfsMisses", re.compile(r"\b(?:opfsMisses|opfs_misses|opfsCacheMisses|opfs_cache_misses)\s*[=:]\s*(\d+)\b")),
+    ("opfsWrites", re.compile(r"\b(?:opfsWrites|opfs_writes)\s*[=:]\s*(\d+)\b")),
+    ("bytesFromOpfs", re.compile(r"\b(?:bytesFromOpfs|bytes_from_opfs)\s*[=:]\s*(\d+)\b")),
+)
+_OPFS_HIT_RATE_PCT_KV_RE = re.compile(
+    r"\b(?:opfsHitRatePct|opfs_hit_rate_pct|warmBootHitRatePct|warm_boot_hit_rate_pct)\s*[=:]\s*(\d+(?:\.\d+)?)\b"
+)
+_GPU_MEMORY_KEYS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("liveBufferBytes", ("liveBufferBytes", "live_buffer_bytes")),
+    ("liveTextureBytes", ("liveTextureBytes", "live_texture_bytes")),
+    ("peakBufferBytes", ("peakBufferBytes", "peak_buffer_bytes")),
+    ("peakTextureBytes", ("peakTextureBytes", "peak_texture_bytes")),
+    ("stagingPoolBytes", ("stagingPoolBytes", "staging_pool_bytes")),
+    ("pendingDeferredDestroys", ("pendingDeferredDestroys", "pending_deferred_destroys")),
+    ("pendingDeferredDestroyBytes", ("pendingDeferredDestroyBytes", "pending_deferred_destroy_bytes")),
+    ("deferredHighWaterFlushes", ("deferredHighWaterFlushes", "deferred_high_water_flushes")),
+    ("vramBytes", ("vramBytes", "vram_bytes")),
+    ("totalLiveGpuBytes", ("totalLiveGpuBytes", "total_live_gpu_bytes")),
+)
+_GPU_MEMORY_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
+    (
+        canonical,
+        re.compile(r"\b(?:" + "|".join(re.escape(alias) for alias in aliases) + r")\s*[=:]\s*(\d+)\b"),
+    )
+    for canonical, aliases in _GPU_MEMORY_KEYS
+)
+_RENDERER_MEMORY_INT_KV_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "sharedModulesDeliveredToPthreads",
+        re.compile(r"\b(?:sharedModulesDeliveredToPthreads|shared_modules_delivered_to_pthreads)\s*[=:]\s*(\d+)\b"),
+    ),
+    (
+        "wasmLinearMemoryBytes",
+        re.compile(r"\b(?:wasmLinearMemoryBytes|wasm_linear_memory_bytes)\s*[=:]\s*(\d+)\b"),
+    ),
+)
 MAX_GPU_ADAPTER_LEN = 96
 _WGPU_ADAPTER_LOG_RE = re.compile(r"\[wgpu_worker\]\s+WebGPU adapter:\s*([^\r\n]+)", re.IGNORECASE)
 _LOG_ELAPSED_PREFIX_RE = re.compile(r"^\s*\[\s*(\d+(?:\.\d+)?)\s*s\s*\]")
@@ -979,6 +1086,18 @@ def validate_capture_interval_sec(raw: float | int) -> float:
     return value
 
 
+def validate_warm_duration_s(raw: float | int | None) -> float | None:
+    """Validate optional `--warm-duration-s` as a positive finite number."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise RunnerError("--warm-duration-s must be a positive finite number")
+    value = float(raw)
+    if not math.isfinite(value) or value <= 0.0:
+        raise RunnerError("--warm-duration-s must be a positive finite number")
+    return value
+
+
 def _validate_untracked_output_dir(target_dir: Path, repo_root: Path, artifact_name: str) -> None:
     """Refuse writing artifacts into tracked repository directories."""
     resolved_repo = repo_root.resolve()
@@ -1761,6 +1880,72 @@ TELEMETRY_PROBE_JS = r"""(() => {
       audioStats = JSON.parse(JSON.stringify(ae.getStats()));
     } else if (ae && typeof ae.getTelemetry === 'function') {
       audioStats = JSON.parse(JSON.stringify(ae.getTelemetry()));
+    } else if (ae && typeof ae.getAudioStats === 'function') {
+      audioStats = JSON.parse(JSON.stringify(ae.getAudioStats()));
+    }
+    if (ae && audioStats && typeof audioStats === 'object') {
+      if (audioStats.audioContextState === undefined) {
+        const ctxState = audioStats.contextState || (ae._context && ae._context.state) || ae.contextState;
+        if (typeof ctxState === 'string' && ctxState) {
+          audioStats.audioContextState = ctxState;
+        }
+      }
+      if (audioStats.sampleRate === undefined && typeof ae.sampleRate === 'number' && Number.isFinite(ae.sampleRate) && ae.sampleRate > 0) {
+        audioStats.sampleRate = ae.sampleRate;
+      }
+    }
+  } catch {}
+  let preloaderStats = null;
+  try {
+    const app = window.playgta6App;
+    if (app && app.pgimPreloader && typeof app.pgimPreloader.getStats === 'function') {
+      preloaderStats = JSON.parse(JSON.stringify(app.pgimPreloader.getStats()));
+    } else if (app && app.bootOrchestrator && typeof app.bootOrchestrator.getStats === 'function') {
+      preloaderStats = JSON.parse(JSON.stringify(app.bootOrchestrator.getStats()));
+    }
+  } catch {}
+  let gpuMemory = null;
+  try {
+    const app = window.playgta6App;
+    const rawGpuMem =
+      (bootState && bootState.gpu && bootState.gpu.gpuMemory) ||
+      (bootState && bootState.gpuMemory) ||
+      (diagnostics && diagnostics.gpuMemory) ||
+      (diagnostics && diagnostics.gpu && diagnostics.gpu.gpuMemory) ||
+      (app && app.perfMonitor && typeof app.perfMonitor.getGpuMemoryStats === 'function' ? app.perfMonitor.getGpuMemoryStats() : null) ||
+      (app && app.session && typeof app.session.getStats === 'function' ? (app.session.getStats() || {}).gpuMemory : null);
+    if (rawGpuMem && typeof rawGpuMem === 'object') {
+      gpuMemory = JSON.parse(JSON.stringify(rawGpuMem));
+    }
+  } catch {}
+  let rendererMemory = null;
+  try {
+    const app = window.playgta6App;
+    const sessStats = app && app.session && typeof app.session.getStats === 'function' ? app.session.getStats() : null;
+    const loaderStats = (bootState && bootState.loader) || (sessStats && sessStats.loader) || null;
+    const rm = {};
+    if (memory && typeof memory === 'object') {
+      if (memory.usedJSHeapSize !== null && memory.usedJSHeapSize !== undefined) rm.usedJSHeapSize = memory.usedJSHeapSize;
+      if (memory.totalJSHeapSize !== null && memory.totalJSHeapSize !== undefined) rm.totalJSHeapSize = memory.totalJSHeapSize;
+    }
+    const sharedPthreads =
+      (loaderStats && loaderStats.sharedModulesDeliveredToPthreads) ??
+      (bootState && bootState.sharedModulesDeliveredToPthreads) ??
+      (diagnostics && diagnostics.sharedModulesDeliveredToPthreads) ??
+      (sessStats && sessStats.sharedModulesDeliveredToPthreads);
+    if (typeof sharedPthreads === 'number' && Number.isFinite(sharedPthreads) && sharedPthreads >= 0) {
+      rm.sharedModulesDeliveredToPthreads = Math.floor(sharedPthreads);
+    }
+    const wasmBytes =
+      (loaderStats && loaderStats.wasmLinearMemoryBytes) ??
+      (bootState && bootState.wasmLinearMemoryBytes) ??
+      (diagnostics && diagnostics.wasmLinearMemoryBytes) ??
+      (sessStats && sessStats.wasmLinearMemoryBytes);
+    if (typeof wasmBytes === 'number' && Number.isFinite(wasmBytes) && wasmBytes >= 0) {
+      rm.wasmLinearMemoryBytes = Math.floor(wasmBytes);
+    }
+    if (Object.keys(rm).length > 0) {
+      rendererMemory = rm;
     }
   } catch {}
   const hudLog = [];
@@ -1787,6 +1972,9 @@ TELEMETRY_PROBE_JS = r"""(() => {
     inputScriptState,
     memory,
     audioStats,
+    preloaderStats,
+    gpuMemory,
+    rendererMemory,
     hud: {
       stage: safeText('hud-boot-stage'),
       status: safeText('hud-status'),
@@ -1861,6 +2049,16 @@ class BrowserSessionResult:
     js_heap_total_mb: float | None = None
     audio_ring_attached: bool | None = None
     audio_frames_drained: int | None = None
+    audio_guest_frames_drained: int | None = None
+    audio_context_state: str | None = None
+    audio_output_state: str | None = None
+    audio_worklet_sab_attached: bool | None = None
+    audio_sample_rate: int | None = None
+    playability_state: str | None = None
+    m4_milestones: dict[str, float] = field(default_factory=dict)
+    opfs_telemetry: dict[str, Any] | None = None
+    gpu_memory: dict[str, Any] | None = None
+    renderer_memory: dict[str, Any] | None = None
     present_fps_avg: float | None = None
     fps_steady_avg: float | None = None
     fps_p50_window: float | None = None
@@ -2378,13 +2576,16 @@ def extract_audio_ring_summary_from_console_lines(
         elif _AUDIO_RING_ATTACHED_EVENT_RE.search(raw_line) and not _AUDIO_RING_ATTACH_FAIL_RE.search(raw_line):
             attached = True
 
+        line_drained: list[int] = []
         kv_guest = _AUDIO_GUEST_FRAMES_DRAINED_KV_RE.search(raw_line)
         if kv_guest is not None:
-            frames_drained = int(kv_guest.group(1))
-        elif _AUDIO_RING_CONTEXT_RE.search(raw_line):
+            line_drained.append(int(kv_guest.group(1)))
+        if _AUDIO_RING_CONTEXT_RE.search(raw_line) or _AUDIO_LOG_CONTEXT_RE.search(raw_line):
             kv_gen = _AUDIO_GENERIC_FRAMES_DRAINED_KV_RE.search(raw_line)
             if kv_gen is not None:
-                frames_drained = int(kv_gen.group(1))
+                line_drained.append(int(kv_gen.group(1)))
+        if line_drained:
+            frames_drained = max(line_drained)
     return attached, frames_drained
 
 
@@ -2733,6 +2934,767 @@ def _extract_swapchain_probe_stats(probe: Mapping[str, Any] | None) -> dict[str,
     return out
 
 
+def sanitize_playability_state(raw: Any) -> str | None:
+    """Return a canonical W376 playability state (`BOOTING`..`IN_GAME`), or `None`."""
+    if not isinstance(raw, str):
+        return None
+    cleaned = raw.strip().upper().replace("-", "_").replace(" ", "_")
+    return cleaned if cleaned in _PLAYABILITY_STATE_RANK else None
+
+
+def extract_m4_milestones_from_console_lines(
+    lines: Sequence[str] | None,
+) -> tuple[dict[str, float], str | None]:
+    """Scan console/HUD log lines for W376 M4 milestones and playabilityState."""
+    milestones: dict[str, float] = {}
+    playability: str | None = None
+    if not lines:
+        return milestones, playability
+
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        m_state = _PLAYABILITY_STATE_KV_RE.search(raw_line)
+        if m_state is not None:
+            parsed_state = sanitize_playability_state(m_state.group(1))
+            if parsed_state is not None and (
+                playability is None or _PLAYABILITY_STATE_RANK[parsed_state] > _PLAYABILITY_STATE_RANK[playability]
+            ):
+                playability = parsed_state
+
+        if _M4_MILESTONE_FAILURE_RE.search(raw_line):
+            continue
+
+        for name, kv_re in _M4_MILESTONE_KV_PATTERNS:
+            if name in milestones:
+                continue
+            m_kv = kv_re.search(raw_line)
+            if m_kv is not None:
+                val = _sanitize_non_negative_float(float(m_kv.group(1)), digits=2)
+                if val is not None:
+                    milestones[name] = val
+
+        for m_at in _M4_MILESTONE_AT_RE.finditer(raw_line):
+            name = m_at.group(1).upper()
+            if name in milestones:
+                continue
+            raw_num = float(m_at.group(2))
+            unit = m_at.group(3).lower()
+            ms = raw_num if unit == "ms" else (raw_num * 1000.0)
+            val = _sanitize_non_negative_float(ms, digits=2)
+            if val is not None:
+                milestones[name] = val
+
+        m_prefix = _LOG_ELAPSED_PREFIX_RE.search(raw_line)
+        if m_prefix is not None:
+            prefix_ms = _sanitize_non_negative_float(float(m_prefix.group(1)) * 1000.0, digits=2)
+            if prefix_ms is not None:
+                for m_tok in _M4_MILESTONE_TOKEN_RE.finditer(raw_line):
+                    name = m_tok.group(1).upper()
+                    if name not in milestones:
+                        milestones[name] = prefix_ms
+
+    ordered = {name: milestones[name] for name in M4_MILESTONES if name in milestones}
+    return ordered, playability
+
+
+def _extract_m4_telemetry(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+    *,
+    reached_milestones: Sequence[Mapping[str, Any]] | None = None,
+    present_count: int = 0,
+) -> tuple[str, dict[str, float], bool]:
+    """Resolve canonical W376 `(playabilityState, m4_milestones, observed_m4_signal)` from session, probe, and logs."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    tracer = probe_map.get("tracerSummary") if isinstance(probe_map.get("tracerSummary"), Mapping) else {}
+    fast_boot_map = boot_state.get("fastBootMilestones") if isinstance(boot_state.get("fastBootMilestones"), Mapping) else {}
+
+    m4_ms: dict[str, float] = {}
+    has_first_present = session.first_present_ms is not None or present_count > 0
+
+    def record_m4(name: str, raw_ms: Any) -> None:
+        if name not in M4_MILESTONES or name in m4_ms:
+            return
+        val = _sanitize_non_negative_float(raw_ms, digits=2)
+        if val is not None:
+            m4_ms[name] = val
+
+    # 1. Explicit session overrides
+    if isinstance(session.m4_milestones, Mapping):
+        for name in M4_MILESTONES:
+            if name in session.m4_milestones:
+                record_m4(name, session.m4_milestones.get(name))
+
+    # 2. Already-collected report milestones (if supplied)
+    if reached_milestones:
+        for m in reached_milestones:
+            if not isinstance(m, Mapping):
+                continue
+            m_name = str(m.get("milestone") or "").upper()
+            if m_name == "FIRST_PRESENT":
+                has_first_present = True
+            elif m_name in M4_MILESTONES:
+                record_m4(m_name, m.get("elapsed_ms") if "elapsed_ms" in m else m.get("elapsedMs"))
+
+    # 3. Tracer milestones array
+    raw_milestones = tracer.get("milestones")
+    if isinstance(raw_milestones, list):
+        for m in raw_milestones:
+            if not isinstance(m, Mapping):
+                continue
+            if "reached" in m and m.get("reached") is not True:
+                continue
+            m_name = str(m.get("milestone") or "").upper()
+            if m_name == "FIRST_PRESENT":
+                has_first_present = True
+            elif m_name in M4_MILESTONES:
+                record_m4(m_name, m.get("elapsedMs") if "elapsedMs" in m else m.get("elapsed_ms"))
+
+    # 4. Direct fields on tracerSummary, bootState, fastBootMilestones, diagnostics
+    direct_m4_fields: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("FIRST_VISIBLE_FRAME", ("firstVisibleFrameMs", "first_visible_frame_ms")),
+        ("START_SCREEN", ("bootToStartScreenMs", "boot_to_start_screen_ms", "START_SCREEN")),
+        ("INTRO_VIDEO", ("bootToIntroVideoMs", "boot_to_intro_video_ms", "INTRO_VIDEO")),
+        ("MAIN_MENU", ("bootToMainMenuMs", "boot_to_main_menu_ms", "MAIN_MENU")),
+        ("IN_GAME", ("bootToInGameMs", "boot_to_in_game_ms", "IN_GAME")),
+    )
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    for src in (tracer, fast_boot_map, boot_state, gpu, diag, probe_map):
+        if not isinstance(src, Mapping):
+            continue
+        for m_name, keys in direct_m4_fields:
+            if m_name in m4_ms:
+                continue
+            for key in keys:
+                if key in src:
+                    record_m4(m_name, src.get(key))
+                    if m_name in m4_ms:
+                        break
+        if src.get("firstPresentMs") is not None or src.get("first_present_ms") is not None:
+            if _sanitize_non_negative_float(src.get("firstPresentMs") if "firstPresentMs" in src else src.get("first_present_ms")) is not None:
+                has_first_present = True
+
+    # 5. Console & HUD log fallback
+    log_m4, log_state = extract_m4_milestones_from_console_lines(session.console_lines)
+    for name, val in log_m4.items():
+        record_m4(name, val)
+
+    hud_state: str | None = None
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        hud_m4, hud_state = extract_m4_milestones_from_console_lines([str(x) for x in hud["logLines"]])
+        for name, val in hud_m4.items():
+            record_m4(name, val)
+
+    ordered_m4 = {name: m4_ms[name] for name in M4_MILESTONES if name in m4_ms}
+
+    # Derive playabilityState from reached milestones (mirrors BootTracer._playabilityState)
+    if "IN_GAME" in ordered_m4:
+        derived_state = "IN_GAME"
+    elif "MAIN_MENU" in ordered_m4:
+        derived_state = "MAIN_MENU"
+    elif "INTRO_VIDEO" in ordered_m4:
+        derived_state = "INTRO_VIDEO"
+    elif "START_SCREEN" in ordered_m4:
+        derived_state = "START_SCREEN"
+    elif "FIRST_VISIBLE_FRAME" in ordered_m4 or has_first_present:
+        derived_state = "FIRST_PRESENT"
+    else:
+        derived_state = "BOOTING"
+
+    best_state = derived_state
+    explicit_candidates: list[Any] = [
+        session.playability_state,
+        tracer.get("playabilityState"),
+        tracer.get("m4Phase"),
+        boot_state.get("playabilityState"),
+        boot_state.get("m4Phase"),
+        diag.get("playabilityState"),
+        diag.get("m4Phase"),
+        probe_map.get("playabilityState"),
+        probe_map.get("m4Phase"),
+        log_state,
+        hud_state,
+    ]
+    has_explicit_playability = False
+    for raw_state in explicit_candidates:
+        clean_state = sanitize_playability_state(raw_state)
+        if clean_state is not None:
+            has_explicit_playability = True
+            if _PLAYABILITY_STATE_RANK[clean_state] > _PLAYABILITY_STATE_RANK[best_state]:
+                best_state = clean_state
+
+    return best_state, ordered_m4, (has_explicit_playability or bool(ordered_m4))
+
+
+def _sanitize_optional_pct(value: Any, *, is_unit_ratio: bool = False) -> float | None:
+    """Sanitize a percentage into `[0.0, 100.0]` rounded to 1 decimal place."""
+    raw = _sanitize_non_negative_float(value)
+    if raw is None:
+        return None
+    scaled = raw * 100.0 if (is_unit_ratio and raw <= 1.0) else raw
+    clamped = min(100.0, max(0.0, scaled))
+    rounded = round(clamped, 1)
+    return 0.0 if rounded == 0.0 else rounded
+
+
+def extract_opfs_telemetry_from_console_lines(lines: Sequence[str] | None) -> dict[str, Any] | None:
+    """Scan console/HUD log lines for `#1015` OPFS cache counters and hit rate."""
+    if not lines:
+        return None
+    found_ints: dict[str, int] = {}
+    hit_rate_pct: float | None = None
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        for key, pattern in _OPFS_INT_KV_PATTERNS:
+            m = pattern.search(raw_line)
+            if m is not None:
+                val = int(m.group(1))
+                found_ints[key] = max(found_ints.get(key, 0), val)
+        m_pct = _OPFS_HIT_RATE_PCT_KV_RE.search(raw_line)
+        if m_pct is not None:
+            pct = _sanitize_optional_pct(float(m_pct.group(1)))
+            if pct is not None:
+                hit_rate_pct = pct
+    if not found_ints and hit_rate_pct is None:
+        return None
+    hits = found_ints.get("opfsHits", 0)
+    misses = found_ints.get("opfsMisses", 0)
+    writes = found_ints.get("opfsWrites", 0)
+    bytes_from_opfs = found_ints.get("bytesFromOpfs", 0)
+    if hit_rate_pct is None and (hits + misses) > 0:
+        hit_rate_pct = round((hits / float(hits + misses)) * 100.0, 1)
+    return {
+        "opfsHits": hits,
+        "opfsMisses": misses,
+        "opfsWrites": writes,
+        "opfsHitRatePct": hit_rate_pct,
+        "bytesFromOpfs": bytes_from_opfs,
+    }
+
+
+def _extract_opfs_telemetry(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve `#1015` OPFS telemetry (`opfsHits`, `opfsMisses`, `opfsWrites`, `opfsHitRatePct`, `bytesFromOpfs`)."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    tracer = probe_map.get("tracerSummary") if isinstance(probe_map.get("tracerSummary"), Mapping) else {}
+    live_tel = tracer.get("liveTelemetry") if isinstance(tracer.get("liveTelemetry"), Mapping) else {}
+
+    sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        session.opfs_telemetry,
+        live_tel.get("opfs"),
+        probe_map.get("preloaderStats"),
+        boot_state.get("preloadTelemetry"),
+        boot_state.get("opfs"),
+        diag.get("preloadTelemetry"),
+        diag.get("opfs"),
+        probe_map.get("opfs"),
+        probe_map.get("opfsTelemetry"),
+        probe_map.get("opfsStats"),
+    ):
+        if isinstance(candidate, Mapping):
+            sources.append(candidate)
+
+    int_aliases: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("opfsHits", ("opfsHits", "opfs_hits", "opfsCacheHits", "opfs_cache_hits")),
+        ("opfsMisses", ("opfsMisses", "opfs_misses", "opfsCacheMisses", "opfs_cache_misses")),
+        ("opfsWrites", ("opfsWrites", "opfs_writes")),
+        ("bytesFromOpfs", ("bytesFromOpfs", "bytes_from_opfs")),
+    )
+    collected: dict[str, list[int]] = {k: [] for k, _ in int_aliases}
+    explicit_pcts: list[float] = []
+
+    for src in sources:
+        for canonical, aliases in int_aliases:
+            for key in aliases:
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    collected[canonical].append(val)
+                    break
+        for pct_key in ("opfsHitRatePct", "opfs_hit_rate_pct", "warmBootHitRatePct", "warm_boot_hit_rate_pct"):
+            pct = _sanitize_optional_pct(src.get(pct_key), is_unit_ratio=False)
+            if pct is not None:
+                explicit_pcts.append(pct)
+                break
+        else:
+            for ratio_key in ("opfsHitRate", "opfs_hit_rate"):
+                pct = _sanitize_optional_pct(src.get(ratio_key), is_unit_ratio=True)
+                if pct is not None:
+                    explicit_pcts.append(pct)
+                    break
+
+    # Console and HUD fallback
+    log_sources: list[Sequence[str]] = [session.console_lines]
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        log_sources.append([str(x) for x in hud["logLines"]])
+    for lines in log_sources:
+        parsed = extract_opfs_telemetry_from_console_lines(lines)
+        if parsed is not None:
+            for key in ("opfsHits", "opfsMisses", "opfsWrites", "bytesFromOpfs"):
+                collected[key].append(int(parsed[key]))
+            if parsed.get("opfsHitRatePct") is not None:
+                explicit_pcts.append(float(parsed["opfsHitRatePct"]))
+
+    has_any = any(bool(vals) for vals in collected.values()) or bool(explicit_pcts)
+    if not has_any:
+        return None
+
+    hits = max(collected["opfsHits"]) if collected["opfsHits"] else 0
+    misses = max(collected["opfsMisses"]) if collected["opfsMisses"] else 0
+    writes = max(collected["opfsWrites"]) if collected["opfsWrites"] else 0
+    bytes_from_opfs = max(collected["bytesFromOpfs"]) if collected["bytesFromOpfs"] else 0
+
+    lookups = hits + misses
+    if lookups > 0:
+        hit_rate_pct: float | None = round((hits / float(lookups)) * 100.0, 1)
+    elif explicit_pcts:
+        hit_rate_pct = explicit_pcts[0]
+    else:
+        hit_rate_pct = None
+
+    return {
+        "opfsHits": hits,
+        "opfsMisses": misses,
+        "opfsWrites": writes,
+        "opfsHitRatePct": hit_rate_pct,
+        "bytesFromOpfs": bytes_from_opfs,
+    }
+
+
+def sanitize_audio_context_state(raw: Any) -> str | None:
+    """Sanitize a W377/W370 AudioContext state label."""
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().lower().replace("_", "-")
+    if normalized == "playing":
+        return "running"
+    if normalized in ("headless", "drain", "draining"):
+        return "headless-drain"
+    return normalized if normalized in AUDIO_CONTEXT_STATES else None
+
+
+def sanitize_audio_output_state(raw: Any) -> str | None:
+    """Sanitize a canonical audio output state (`active` | `suspended` | `headless-drain`)."""
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().lower().replace("_", "-")
+    if normalized in ("running", "playing"):
+        return "active"
+    if normalized in ("headless", "drain", "draining"):
+        return "headless-drain"
+    if normalized in ("paused", "closed", "idle", "muted", "interrupted"):
+        return "suspended"
+    return normalized if normalized in AUDIO_OUTPUT_STATES else None
+
+
+def _sanitize_audio_sample_rate(value: Any) -> int | None:
+    """Sanitize an audio sample rate in Hz (e.g. 48000)."""
+    rate = _sanitize_optional_non_negative_int(value)
+    if rate is None or rate < 8000 or rate > 384000:
+        return None
+    return rate
+
+
+def extract_audio_metrics_from_console_lines(lines: Sequence[str] | None) -> dict[str, Any]:
+    """Scan console/HUD log lines for W377/W370 audio context, output state, SAB attachment, and drained frames."""
+    out: dict[str, Any] = {
+        "audio_context_state": None,
+        "audio_output_state": None,
+        "audio_guest_frames_drained": None,
+        "audio_worklet_sab_attached": None,
+        "audio_sample_rate": None,
+    }
+    if not lines:
+        return out
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        m_ctx = _AUDIO_CONTEXT_STATE_KV_RE.search(raw_line)
+        if m_ctx is not None:
+            ctx = sanitize_audio_context_state(m_ctx.group(1))
+            if ctx is not None:
+                out["audio_context_state"] = ctx
+        m_out = _AUDIO_OUTPUT_STATE_KV_RE.search(raw_line)
+        if m_out is not None:
+            state = sanitize_audio_output_state(m_out.group(1))
+            if state is not None:
+                out["audio_output_state"] = state
+        m_sab = _AUDIO_WORKLET_SAB_KV_RE.search(raw_line)
+        if m_sab is not None:
+            out["audio_worklet_sab_attached"] = m_sab.group(1).lower() in ("true", "yes", "1")
+        m_sr = _AUDIO_EXPLICIT_SAMPLE_RATE_KV_RE.search(raw_line)
+        if m_sr is not None:
+            sr = _sanitize_audio_sample_rate(int(m_sr.group(1)))
+            if sr is not None:
+                out["audio_sample_rate"] = sr
+        elif _AUDIO_LOG_CONTEXT_RE.search(raw_line):
+            m_gsr = _AUDIO_GENERIC_SAMPLE_RATE_KV_RE.search(raw_line)
+            if m_gsr is not None:
+                sr = _sanitize_audio_sample_rate(int(m_gsr.group(1)))
+                if sr is not None:
+                    out["audio_sample_rate"] = sr
+        m_gd = _AUDIO_EXPLICIT_GUEST_FRAMES_DRAINED_KV_RE.search(raw_line)
+        if m_gd is not None:
+            out["audio_guest_frames_drained"] = max(
+                out["audio_guest_frames_drained"] or 0,
+                int(m_gd.group(1)),
+            )
+    return out
+
+
+def _extract_audio_metrics(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Resolve full W377/W370 `#1028` audio metrics while preserving `_extract_audio_ring_summary`."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    ring_attached, frames_drained = _extract_audio_ring_summary(session, probe_map)
+
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    tracer = probe_map.get("tracerSummary") if isinstance(probe_map.get("tracerSummary"), Mapping) else {}
+    live_tel = tracer.get("liveTelemetry") if isinstance(tracer.get("liveTelemetry"), Mapping) else {}
+
+    audio_sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        probe_map.get("audioStats"),
+        boot_state.get("audio"),
+        live_tel.get("audio"),
+        diag.get("audio"),
+        probe_map.get("audio"),
+        boot_state,
+        diag,
+    ):
+        if isinstance(candidate, Mapping):
+            audio_sources.append(candidate)
+
+    context_state = sanitize_audio_context_state(session.audio_context_state)
+    output_state = sanitize_audio_output_state(session.audio_output_state)
+    guest_frames_drained = _sanitize_optional_non_negative_int(session.audio_guest_frames_drained)
+    worklet_sab_attached = _sanitize_optional_bool(session.audio_worklet_sab_attached)
+    sample_rate = _sanitize_audio_sample_rate(session.audio_sample_rate)
+
+    if context_state is None:
+        for src in audio_sources:
+            for key in ("audioContextState", "audio_context_state", "contextState", "context_state"):
+                val = sanitize_audio_context_state(src.get(key))
+                if val is not None:
+                    context_state = val
+                    break
+            if context_state is not None:
+                break
+
+    if output_state is None:
+        for src in audio_sources:
+            for key in ("audioOutputState", "audio_output_state", "outputState", "output_state"):
+                val = sanitize_audio_output_state(src.get(key))
+                if val is not None:
+                    output_state = val
+                    break
+            if output_state is not None:
+                break
+
+    if guest_frames_drained is None:
+        guest_vals: list[int] = []
+        for src in audio_sources:
+            for key in (
+                "audio_guest_frames_drained",
+                "audioGuestFramesDrained",
+                "guestFramesDrained",
+                "guest_frames_drained",
+                "guestDrainedFrames",
+                "guest_drained_frames",
+            ):
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    guest_vals.append(val)
+                    break
+        if guest_vals:
+            guest_frames_drained = max(guest_vals)
+
+    if worklet_sab_attached is None:
+        sab_vals: list[bool] = []
+        for src in audio_sources:
+            for key in (
+                "audio_worklet_sab_attached",
+                "audioWorkletSabAttached",
+                "workletSabAttached",
+                "worklet_sab_attached",
+                "audioRingSabAttached",
+                "audio_ring_sab_attached",
+                "ringSabAttached",
+                "ring_sab_attached",
+            ):
+                val = _sanitize_optional_bool(src.get(key))
+                if val is not None:
+                    sab_vals.append(val)
+                    break
+        if sab_vals:
+            worklet_sab_attached = any(sab_vals)
+
+    if sample_rate is None:
+        for src in audio_sources:
+            for key in ("audioSampleRate", "audio_sample_rate", "sampleRate", "sample_rate"):
+                val = _sanitize_audio_sample_rate(src.get(key))
+                if val is not None:
+                    sample_rate = val
+                    break
+            if sample_rate is not None:
+                break
+
+    # Console and HUD log fallbacks for any missing extended audio field
+    log_sources: list[Sequence[str]] = [session.console_lines]
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        log_sources.append([str(x) for x in hud["logLines"]])
+    for lines in log_sources:
+        parsed = extract_audio_metrics_from_console_lines(lines)
+        if context_state is None and parsed["audio_context_state"] is not None:
+            context_state = parsed["audio_context_state"]
+        if output_state is None and parsed["audio_output_state"] is not None:
+            output_state = parsed["audio_output_state"]
+        if guest_frames_drained is None and parsed["audio_guest_frames_drained"] is not None:
+            guest_frames_drained = parsed["audio_guest_frames_drained"]
+        if worklet_sab_attached is None and parsed["audio_worklet_sab_attached"] is not None:
+            worklet_sab_attached = parsed["audio_worklet_sab_attached"]
+        if sample_rate is None and parsed["audio_sample_rate"] is not None:
+            sample_rate = parsed["audio_sample_rate"]
+
+    if output_state is None and context_state is not None:
+        output_state = sanitize_audio_output_state(context_state)
+
+    if guest_frames_drained is not None:
+        frames_drained = max(frames_drained, guest_frames_drained) if frames_drained is not None else guest_frames_drained
+
+    return {
+        "audio_ring_attached": ring_attached,
+        "audio_frames_drained": frames_drained,
+        "audio_guest_frames_drained": guest_frames_drained,
+        "audio_context_state": context_state,
+        "audio_output_state": output_state,
+        "audio_worklet_sab_attached": worklet_sab_attached,
+        "audio_sample_rate": sample_rate,
+    }
+
+
+def _build_audio_summary_object(audio_metrics: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Build a compact structured `audio` summary object with only observed non-None fields."""
+    mapping: tuple[tuple[str, str], ...] = (
+        ("ring_attached", "audio_ring_attached"),
+        ("frames_drained", "audio_frames_drained"),
+        ("guest_frames_drained", "audio_guest_frames_drained"),
+        ("context_state", "audio_context_state"),
+        ("output_state", "audio_output_state"),
+        ("worklet_sab_attached", "audio_worklet_sab_attached"),
+        ("sample_rate", "audio_sample_rate"),
+    )
+    obj = {dst: audio_metrics[src] for dst, src in mapping if audio_metrics.get(src) is not None}
+    return obj or None
+
+
+def extract_gpu_memory_from_console_lines(lines: Sequence[str] | None) -> dict[str, int]:
+    """Scan console/HUD log lines for W371 `#1077` GPU memory telemetry counters."""
+    found: dict[str, int] = {}
+    if not lines:
+        return found
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        for canonical, pattern in _GPU_MEMORY_KV_PATTERNS:
+            m = pattern.search(raw_line)
+            if m is not None:
+                found[canonical] = max(found.get(canonical, 0), int(m.group(1)))
+    return found
+
+
+def _extract_gpu_memory_stats(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Resolve W371 `#1077` GPU memory telemetry from session, probe objects, or logs."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    gpu = boot_state.get("gpu") if isinstance(boot_state.get("gpu"), Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+    diag_gpu = diag.get("gpu") if isinstance(diag.get("gpu"), Mapping) else {}
+
+    sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        session.gpu_memory,
+        gpu.get("gpuMemory"),
+        gpu,
+        boot_state.get("gpuMemory"),
+        probe_map.get("gpuMemory"),
+        diag.get("gpuMemory"),
+        diag_gpu.get("gpuMemory"),
+        diag_gpu,
+        diag,
+    ):
+        if isinstance(candidate, Mapping):
+            sources.append(candidate)
+
+    collected: dict[str, list[int]] = {canonical: [] for canonical, _ in _GPU_MEMORY_KEYS}
+    for src in sources:
+        for canonical, aliases in _GPU_MEMORY_KEYS:
+            for key in aliases:
+                val = _sanitize_optional_non_negative_int(src.get(key))
+                if val is not None:
+                    collected[canonical].append(val)
+                    break
+
+    log_sources: list[Sequence[str]] = [session.console_lines]
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        log_sources.append([str(x) for x in hud["logLines"]])
+    for lines in log_sources:
+        parsed = extract_gpu_memory_from_console_lines(lines)
+        for canonical, val in parsed.items():
+            collected[canonical].append(val)
+
+    out: dict[str, Any] = {}
+    for canonical, _ in _GPU_MEMORY_KEYS:
+        if collected[canonical]:
+            out[canonical] = max(collected[canonical])
+
+    if not out:
+        return None
+
+    if "totalLiveGpuBytes" not in out and any(
+        k in out for k in ("liveBufferBytes", "liveTextureBytes", "stagingPoolBytes")
+    ):
+        out["totalLiveGpuBytes"] = (
+            int(out.get("liveBufferBytes", 0))
+            + int(out.get("liveTextureBytes", 0))
+            + int(out.get("stagingPoolBytes", 0))
+        )
+
+    return out
+
+
+def extract_renderer_memory_from_console_lines(lines: Sequence[str] | None) -> dict[str, int]:
+    """Scan console/HUD log lines for W371 `#1077` renderer/Wasm memory counters."""
+    found: dict[str, int] = {}
+    if not lines:
+        return found
+    for raw_line in lines:
+        if not isinstance(raw_line, str):
+            continue
+        for canonical, pattern in _RENDERER_MEMORY_INT_KV_PATTERNS:
+            m = pattern.search(raw_line)
+            if m is not None:
+                found[canonical] = max(found.get(canonical, 0), int(m.group(1)))
+    return found
+
+
+def _extract_renderer_memory_stats(
+    session: BrowserSessionResult,
+    probe: Mapping[str, Any] | None = None,
+    *,
+    js_heap_used_mb: float | None = None,
+    js_heap_total_mb: float | None = None,
+) -> dict[str, Any] | None:
+    """Resolve W371 `#1077` renderer memory stats (`jsHeapUsedMb`, `jsHeapTotalMb`, pthreads shared modules, Wasm memory)."""
+    probe_map = probe if isinstance(probe, Mapping) else (
+        session.final_probe if isinstance(session.final_probe, Mapping) else {}
+    )
+    raw_boot = probe_map.get("bootState")
+    if not isinstance(raw_boot, Mapping):
+        raw_boot = probe_map.get("boot_state")
+    boot_state = raw_boot if isinstance(raw_boot, Mapping) else {}
+    loader = boot_state.get("loader") if isinstance(boot_state.get("loader"), Mapping) else {}
+    diag = probe_map.get("diagnostics") if isinstance(probe_map.get("diagnostics"), Mapping) else {}
+
+    sources: list[Mapping[str, Any]] = []
+    for candidate in (
+        session.renderer_memory,
+        probe_map.get("rendererMemory"),
+        boot_state.get("rendererMemory"),
+        diag.get("rendererMemory"),
+        loader,
+        boot_state,
+        diag,
+        probe_map.get("memory"),
+        probe_map,
+    ):
+        if isinstance(candidate, Mapping):
+            sources.append(candidate)
+
+    used_mb = _sanitize_non_negative_float(js_heap_used_mb, digits=1)
+    total_mb = _sanitize_non_negative_float(js_heap_total_mb, digits=1)
+    if used_mb is None or total_mb is None:
+        p_used, p_total = _extract_js_heap_mb(session, probe_map)
+        if used_mb is None:
+            used_mb = p_used
+        if total_mb is None:
+            total_mb = p_total
+
+    shared_vals: list[int] = []
+    wasm_mem_vals: list[int] = []
+    for src in sources:
+        for key in ("sharedModulesDeliveredToPthreads", "shared_modules_delivered_to_pthreads"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                shared_vals.append(val)
+                break
+        for key in ("wasmLinearMemoryBytes", "wasm_linear_memory_bytes"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                wasm_mem_vals.append(val)
+                break
+
+    log_sources: list[Sequence[str]] = [session.console_lines]
+    hud = probe_map.get("hud")
+    if isinstance(hud, Mapping) and isinstance(hud.get("logLines"), list):
+        log_sources.append([str(x) for x in hud["logLines"]])
+    for lines in log_sources:
+        parsed = extract_renderer_memory_from_console_lines(lines)
+        if "sharedModulesDeliveredToPthreads" in parsed:
+            shared_vals.append(parsed["sharedModulesDeliveredToPthreads"])
+        if "wasmLinearMemoryBytes" in parsed:
+            wasm_mem_vals.append(parsed["wasmLinearMemoryBytes"])
+
+    out: dict[str, Any] = {}
+    if used_mb is not None:
+        out["jsHeapUsedMb"] = used_mb
+    if total_mb is not None:
+        out["jsHeapTotalMb"] = total_mb
+    if shared_vals:
+        out["sharedModulesDeliveredToPthreads"] = max(shared_vals)
+    if wasm_mem_vals:
+        out["wasmLinearMemoryBytes"] = max(wasm_mem_vals)
+    return out or None
+
+
 def _sample_present_record(probe: Mapping[str, Any], index: int, wall_ms: float) -> dict[str, Any]:
     counts = _extract_gpu_counts(probe)
     present_count = _extract_present_count(probe)
@@ -3025,6 +3987,9 @@ def run_browser_session(
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
     quiet_server: bool = False,
+    user_data_dir: Path | None = None,
+    cleanup_user_data_dir: bool = True,
+    log_prefix: str = "",
     runner: CommandRunner = run_command,
     popen_fn: Callable[..., Any] = subprocess.Popen,
     cdp_factory: Callable[[str], CdpClient] = CdpClient,
@@ -3074,7 +4039,13 @@ def run_browser_session(
 
     want_frames = capture_enabled or encode_mp4
 
-    profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-profile-"))
+    if user_data_dir is not None:
+        profile_dir = Path(user_data_dir)
+        profile_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-profile-"))
+    server_log_path = run_dir / f"{log_prefix}server.log"
+    chrome_log_path = run_dir / f"{log_prefix}chrome.log"
     smoke_boot_dir: Path | None = None
     if smoke:
         smoke_boot_dir = Path(tempfile.mkdtemp(prefix="playgta6-smoke-boot-"))
@@ -3152,7 +4123,7 @@ def run_browser_session(
 
     start_mono = time.monotonic()
     try:
-        server_log_fh = (run_dir / "server.log").open("wb")
+        server_log_fh = server_log_path.open("wb")
         server_proc = popen_fn(
             server_cmd,
             cwd=repo,
@@ -3161,7 +4132,7 @@ def run_browser_session(
         )
         result.server_ready = wait_server_fn(host, server_port, timeout_s=SERVER_READY_TIMEOUT_S, proc=server_proc)
 
-        chrome_log_fh = (run_dir / "chrome.log").open("wb")
+        chrome_log_fh = chrome_log_path.open("wb")
         chrome_proc = popen_fn(
             chrome_cmd,
             cwd=repo,
@@ -3351,7 +4322,6 @@ def run_browser_session(
         if result.gpu_adapter is None and chrome_log_fh is not None:
             try:
                 chrome_log_fh.flush()
-                chrome_log_path = run_dir / "chrome.log"
                 if chrome_log_path.is_file():
                     chrome_log_lines = chrome_log_path.read_text(encoding="utf-8", errors="replace").splitlines()
                     result.gpu_adapter = extract_gpu_adapter_from_console_lines(chrome_log_lines)
@@ -3359,7 +4329,25 @@ def run_browser_session(
                 pass
         result.first_visible_frame_s, result.black_loading_s = _extract_visible_frame_timing(result)
         result.js_heap_used_mb, result.js_heap_total_mb = _extract_js_heap_mb(result)
-        result.audio_ring_attached, result.audio_frames_drained = _extract_audio_ring_summary(result)
+        audio_metrics = _extract_audio_metrics(result)
+        result.audio_ring_attached = audio_metrics["audio_ring_attached"]
+        result.audio_frames_drained = audio_metrics["audio_frames_drained"]
+        result.audio_guest_frames_drained = audio_metrics["audio_guest_frames_drained"]
+        result.audio_context_state = audio_metrics["audio_context_state"]
+        result.audio_output_state = audio_metrics["audio_output_state"]
+        result.audio_worklet_sab_attached = audio_metrics["audio_worklet_sab_attached"]
+        result.audio_sample_rate = audio_metrics["audio_sample_rate"]
+        result.playability_state, result.m4_milestones, _m4_observed = _extract_m4_telemetry(
+            result,
+            present_count=max(len(result.presents), _extract_present_count(result.final_probe)),
+        )
+        result.opfs_telemetry = _extract_opfs_telemetry(result)
+        result.gpu_memory = _extract_gpu_memory_stats(result)
+        result.renderer_memory = _extract_renderer_memory_stats(
+            result,
+            js_heap_used_mb=result.js_heap_used_mb,
+            js_heap_total_mb=result.js_heap_total_mb,
+        )
         result.present_fps_avg = _extract_present_fps_avg(result)
         rolling_fps = _extract_rolling_fps_stats(result)
         result.fps_steady_avg = rolling_fps["fps_steady_avg"]
@@ -3410,7 +4398,8 @@ def run_browser_session(
                     fh.close()
                 except OSError:
                     pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
+        if cleanup_user_data_dir:
+            shutil.rmtree(profile_dir, ignore_errors=True)
         if smoke_boot_dir is not None:
             shutil.rmtree(smoke_boot_dir, ignore_errors=True)
 
@@ -3418,6 +4407,107 @@ def run_browser_session(
 # ---------------------------------------------------------------------------
 # Report synthesis (playgta6-boot-report v2) & digest
 # ---------------------------------------------------------------------------
+
+
+def _extract_warm_boot_pass_metrics(report: Mapping[str, Any]) -> dict[str, Any]:
+    """Extract sanitized per-pass cold/warm metrics from a boot report."""
+    summary = report.get("summary") if isinstance(report.get("summary"), Mapping) else {}
+    opfs = report.get("opfs") if isinstance(report.get("opfs"), Mapping) else (
+        summary.get("opfs") if isinstance(summary.get("opfs"), Mapping) else {}
+    )
+    fvf_s = _sanitize_non_negative_float(report.get("first_visible_frame_s"), digits=3)
+    if fvf_s is None:
+        fvf_s = _sanitize_non_negative_float(summary.get("first_visible_frame_s"), digits=3)
+    fvf_ms = _sanitize_non_negative_float(summary.get("first_visible_frame_ms"), digits=2)
+    if fvf_ms is None and fvf_s is not None:
+        fvf_ms = round(fvf_s * 1000.0, 2)
+    if fvf_s is None and fvf_ms is not None:
+        fvf_s = round(fvf_ms / 1000.0, 3)
+
+    fp = report.get("first_present")
+    fp_ms = _sanitize_non_negative_float(fp.get("elapsed_ms"), digits=2) if isinstance(fp, Mapping) else None
+    if fp_ms is None:
+        for m in report.get("milestones") or []:
+            if isinstance(m, Mapping) and m.get("milestone") == "FIRST_PRESENT":
+                fp_ms = _sanitize_non_negative_float(m.get("elapsed_ms"), digits=2)
+                if fp_ms is not None:
+                    break
+
+    opfs_hits = _sanitize_optional_non_negative_int(opfs.get("opfsHits")) if isinstance(opfs, Mapping) else None
+    opfs_writes = _sanitize_optional_non_negative_int(opfs.get("opfsWrites")) if isinstance(opfs, Mapping) else None
+    opfs_hit_rate = _sanitize_optional_pct(opfs.get("opfsHitRatePct")) if isinstance(opfs, Mapping) else None
+    playability = sanitize_playability_state(report.get("playabilityState") or summary.get("playabilityState"))
+    status = sanitize_text(str(report.get("status"))) if report.get("status") is not None else None
+    return {
+        "first_visible_frame_s": fvf_s,
+        "first_visible_frame_ms": fvf_ms,
+        "first_present_ms": fp_ms,
+        "opfsHits": opfs_hits,
+        "opfsWrites": opfs_writes,
+        "opfsHitRatePct": opfs_hit_rate,
+        "playabilityState": playability,
+        "status": status,
+    }
+
+
+def build_warm_boot_summary(
+    cold_report: Mapping[str, Any],
+    warm_report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compute a sanitized cold-vs-warm `#1015` OPFS warm-boot comparison block."""
+    cold = _extract_warm_boot_pass_metrics(cold_report)
+    warm = _extract_warm_boot_pass_metrics(warm_report)
+
+    cold_s, warm_s = cold["first_visible_frame_s"], warm["first_visible_frame_s"]
+    cold_ms, warm_ms = cold["first_visible_frame_ms"], warm["first_visible_frame_ms"]
+    delta_s: float | None = round(warm_s - cold_s, 3) if (cold_s is not None and warm_s is not None) else None
+    delta_ms: float | None = round(warm_ms - cold_ms, 2) if (cold_ms is not None and warm_ms is not None) else None
+    if delta_s == 0.0:
+        delta_s = 0.0
+    if delta_ms == 0.0:
+        delta_ms = 0.0
+
+    speedup_pct: float | None = None
+    if cold_ms is not None and warm_ms is not None:
+        if cold_ms > 0.0:
+            speedup_pct = round(((cold_ms - warm_ms) / cold_ms) * 100.0, 2)
+            if speedup_pct == 0.0:
+                speedup_pct = 0.0
+        elif warm_ms == 0.0:
+            speedup_pct = 0.0
+
+    opfs_hits_delta: int | None = (
+        int(warm["opfsHits"]) - int(cold["opfsHits"])
+        if (cold["opfsHits"] is not None and warm["opfsHits"] is not None)
+        else None
+    )
+    opfs_writes_delta: int | None = (
+        int(warm["opfsWrites"]) - int(cold["opfsWrites"])
+        if (cold["opfsWrites"] is not None and warm["opfsWrites"] is not None)
+        else None
+    )
+    opfs_hit_rate_delta: float | None = (
+        round(float(warm["opfsHitRatePct"]) - float(cold["opfsHitRatePct"]), 1)
+        if (cold["opfsHitRatePct"] is not None and warm["opfsHitRatePct"] is not None)
+        else None
+    )
+    if opfs_hit_rate_delta == 0.0:
+        opfs_hit_rate_delta = 0.0
+
+    return sanitize_value(
+        {
+            "cold": cold,
+            "warm": warm,
+            "delta": {
+                "first_visible_frame_delta_s": delta_s,
+                "first_visible_frame_delta_ms": delta_ms,
+                "first_visible_frame_speedup_pct": speedup_pct,
+                "opfs_hits_delta": opfs_hits_delta,
+                "opfs_writes_delta": opfs_writes_delta,
+                "opfs_hit_rate_pct_delta": opfs_hit_rate_delta,
+            },
+        }
+    )
 
 
 def build_boot_report(
@@ -3429,6 +4519,7 @@ def build_boot_report(
     stream_shaders: bool = False,
     stream_threshold_mb: float | None = None,
     boot_options: Mapping[str, Any] | None = None,
+    warm_boot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a sanitized `playgta6-boot-report` v2 dict compatible with `compare_boot_reports.py`."""
     probe = session.final_probe if isinstance(session.final_probe, Mapping) else {}
@@ -3450,7 +4541,18 @@ def build_boot_report(
     effective_gpu_adapter = _extract_gpu_adapter(session, probe)
     effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
-    effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
+    effective_audio_metrics = _extract_audio_metrics(session, probe)
+    effective_audio_ring_attached = effective_audio_metrics["audio_ring_attached"]
+    effective_audio_frames_drained = effective_audio_metrics["audio_frames_drained"]
+    effective_audio_obj = _build_audio_summary_object(effective_audio_metrics)
+    effective_opfs = _extract_opfs_telemetry(session, probe)
+    effective_gpu_memory = _extract_gpu_memory_stats(session, probe)
+    effective_renderer_memory = _extract_renderer_memory_stats(
+        session,
+        probe,
+        js_heap_used_mb=effective_js_heap_used_mb,
+        js_heap_total_mb=effective_js_heap_total_mb,
+    )
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
     effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
@@ -3472,6 +4574,28 @@ def build_boot_report(
             )
     if session.first_present_ms is not None and not any(m["milestone"] == "FIRST_PRESENT" for m in milestones):
         milestones.append({"milestone": "FIRST_PRESENT", "elapsed_ms": round(session.first_present_ms, 2)})
+
+    present_count = max(len(session.presents), _extract_present_count(probe))
+    effective_playability_state, effective_m4_milestones, m4_signal_observed = _extract_m4_telemetry(
+        session,
+        probe,
+        reached_milestones=milestones,
+        present_count=present_count,
+    )
+    existing_milestone_names = {m["milestone"] for m in milestones}
+    added_m4 = False
+    for m_name in M4_MILESTONES:
+        if m_name in effective_m4_milestones and m_name not in existing_milestone_names:
+            milestones.append(
+                {
+                    "milestone": m_name,
+                    "elapsed_ms": round(float(effective_m4_milestones[m_name]), 2),
+                }
+            )
+            existing_milestone_names.add(m_name)
+            added_m4 = True
+    if added_m4:
+        milestones.sort(key=lambda m: float(m.get("elapsed_ms") or 0.0))
 
     last_trap = tracer.get("lastTrap") if isinstance(tracer.get("lastTrap"), Mapping) else None
     fault: dict[str, Any] | None = None
@@ -3499,7 +4623,6 @@ def build_boot_report(
     elif session.crashed:
         status = "error"
 
-    present_count = max(len(session.presents), _extract_present_count(probe))
     first_present: dict[str, Any] | None = None
     if session.first_present_ms is not None or present_count > 0:
         first_present = {
@@ -3515,6 +4638,10 @@ def build_boot_report(
         "validationErrorCount": gpu_counts["validationErrorCount"],
         "inputScript": effective_input_script,
     }
+    if m4_signal_observed:
+        summary["playabilityState"] = effective_playability_state
+    if effective_m4_milestones:
+        summary["m4_milestones"] = dict(effective_m4_milestones)
     if effective_stream_shaders:
         summary["streamShaders"] = True
     if effective_stream_threshold_mb is not None:
@@ -3538,6 +4665,23 @@ def build_boot_report(
         summary["audio_ring_attached"] = effective_audio_ring_attached
     if effective_audio_frames_drained is not None:
         summary["audio_frames_drained"] = effective_audio_frames_drained
+    for ext_audio_key in (
+        "audio_guest_frames_drained",
+        "audio_context_state",
+        "audio_output_state",
+        "audio_worklet_sab_attached",
+        "audio_sample_rate",
+    ):
+        if effective_audio_metrics[ext_audio_key] is not None:
+            summary[ext_audio_key] = effective_audio_metrics[ext_audio_key]
+    if effective_audio_obj is not None:
+        summary["audio"] = dict(effective_audio_obj)
+    if effective_opfs is not None:
+        summary["opfs"] = dict(effective_opfs)
+    if effective_gpu_memory is not None:
+        summary["gpu_memory"] = dict(effective_gpu_memory)
+    if effective_renderer_memory is not None:
+        summary["renderer_memory"] = dict(effective_renderer_memory)
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
     for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
@@ -3546,6 +4690,8 @@ def build_boot_report(
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             summary[probe_key] = effective_swapchain_probe[probe_key]
+    if warm_boot is not None:
+        summary["warm_boot"] = dict(warm_boot)
 
     report: dict[str, Any] = {
         "schema": REPORT_SCHEMA,
@@ -3555,6 +4701,8 @@ def build_boot_report(
         "mode": boot_mode,
         "smoke": bool(smoke),
         "inputScript": effective_input_script,
+        "playabilityState": effective_playability_state,
+        "m4_milestones": dict(effective_m4_milestones),
         "gpu_adapter": effective_gpu_adapter,
         "first_visible_frame_s": effective_first_visible_frame_s,
         "black_loading_s": effective_black_loading_s,
@@ -3598,6 +4746,25 @@ def build_boot_report(
         "presents": list(session.presents),
         "first_present": first_present,
     }
+    for ext_audio_key in (
+        "audio_guest_frames_drained",
+        "audio_context_state",
+        "audio_output_state",
+        "audio_worklet_sab_attached",
+        "audio_sample_rate",
+    ):
+        if effective_audio_metrics[ext_audio_key] is not None:
+            report[ext_audio_key] = effective_audio_metrics[ext_audio_key]
+    if effective_audio_obj is not None:
+        report["audio"] = dict(effective_audio_obj)
+    if effective_opfs is not None:
+        report["opfs"] = dict(effective_opfs)
+    if effective_gpu_memory is not None:
+        report["gpu_memory"] = dict(effective_gpu_memory)
+    if effective_renderer_memory is not None:
+        report["renderer_memory"] = dict(effective_renderer_memory)
+    if warm_boot is not None:
+        report["warm_boot"] = dict(warm_boot)
     if effective_boot_options is not None:
         report["boot_options"] = dict(effective_boot_options)
     return sanitize_value(report)
@@ -3617,6 +4784,7 @@ def build_telemetry_payload(
     hold_until_visible: str | None = None,
     mp4_fps: float | None = None,
     mp4_skip_black: bool = False,
+    warm_boot: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build sanitized `telemetry.json` artifact."""
     probe = session.final_probe if isinstance(session.final_probe, Mapping) else {}
@@ -3635,7 +4803,24 @@ def build_telemetry_payload(
     effective_gpu_adapter = _extract_gpu_adapter(session, probe)
     effective_first_visible_frame_s, effective_black_loading_s = _extract_visible_frame_timing(session, probe)
     effective_js_heap_used_mb, effective_js_heap_total_mb = _extract_js_heap_mb(session, probe)
-    effective_audio_ring_attached, effective_audio_frames_drained = _extract_audio_ring_summary(session, probe)
+    effective_audio_metrics = _extract_audio_metrics(session, probe)
+    effective_audio_ring_attached = effective_audio_metrics["audio_ring_attached"]
+    effective_audio_frames_drained = effective_audio_metrics["audio_frames_drained"]
+    effective_audio_obj = _build_audio_summary_object(effective_audio_metrics)
+    present_count = max(len(session.presents), _extract_present_count(probe))
+    effective_playability_state, effective_m4_milestones, m4_signal_observed = _extract_m4_telemetry(
+        session,
+        probe,
+        present_count=present_count,
+    )
+    effective_opfs = _extract_opfs_telemetry(session, probe)
+    effective_gpu_memory = _extract_gpu_memory_stats(session, probe)
+    effective_renderer_memory = _extract_renderer_memory_stats(
+        session,
+        probe,
+        js_heap_used_mb=effective_js_heap_used_mb,
+        js_heap_total_mb=effective_js_heap_total_mb,
+    )
     effective_present_fps_avg = _extract_present_fps_avg(session, probe)
     effective_rolling_fps = _extract_rolling_fps_stats(session, probe)
     effective_swapchain_probe = _extract_swapchain_probe_stats(probe)
@@ -3653,6 +4838,10 @@ def build_telemetry_payload(
         "validationErrorCount": gpu_counts["validationErrorCount"],
         "inputScript": effective_input_script,
     }
+    if m4_signal_observed:
+        summary["playabilityState"] = effective_playability_state
+    if effective_m4_milestones:
+        summary["m4_milestones"] = dict(effective_m4_milestones)
     if effective_stream_shaders:
         summary["streamShaders"] = True
     if effective_stream_threshold_mb is not None:
@@ -3676,6 +4865,23 @@ def build_telemetry_payload(
         summary["audio_ring_attached"] = effective_audio_ring_attached
     if effective_audio_frames_drained is not None:
         summary["audio_frames_drained"] = effective_audio_frames_drained
+    for ext_audio_key in (
+        "audio_guest_frames_drained",
+        "audio_context_state",
+        "audio_output_state",
+        "audio_worklet_sab_attached",
+        "audio_sample_rate",
+    ):
+        if effective_audio_metrics[ext_audio_key] is not None:
+            summary[ext_audio_key] = effective_audio_metrics[ext_audio_key]
+    if effective_audio_obj is not None:
+        summary["audio"] = dict(effective_audio_obj)
+    if effective_opfs is not None:
+        summary["opfs"] = dict(effective_opfs)
+    if effective_gpu_memory is not None:
+        summary["gpu_memory"] = dict(effective_gpu_memory)
+    if effective_renderer_memory is not None:
+        summary["renderer_memory"] = dict(effective_renderer_memory)
     if effective_present_fps_avg is not None:
         summary["present_fps_avg"] = effective_present_fps_avg
     for fps_key in ("fps_steady_avg", "fps_p50_window", "fps_max_window", "windows_ge_30fps_pct"):
@@ -3684,6 +4890,8 @@ def build_telemetry_payload(
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             summary[probe_key] = effective_swapchain_probe[probe_key]
+    if warm_boot is not None:
+        summary["warm_boot"] = dict(warm_boot)
     telemetry_payload: dict[str, Any] = {
         "schema": "playgta6-browser-telemetry",
         "schema_version": 1,
@@ -3693,6 +4901,8 @@ def build_telemetry_payload(
         "hide_hud": effective_hide_hud,
         "hold_until_visible": effective_hold_until_visible,
         "inputScript": effective_input_script,
+        "playabilityState": effective_playability_state,
+        "m4_milestones": dict(effective_m4_milestones),
         "gpu_adapter": effective_gpu_adapter,
         "first_visible_frame_s": effective_first_visible_frame_s,
         "black_loading_s": effective_black_loading_s,
@@ -3731,6 +4941,25 @@ def build_telemetry_payload(
         "page_error_count": len(session.page_errors),
         "warnings": list(session.warnings),
     }
+    for ext_audio_key in (
+        "audio_guest_frames_drained",
+        "audio_context_state",
+        "audio_output_state",
+        "audio_worklet_sab_attached",
+        "audio_sample_rate",
+    ):
+        if effective_audio_metrics[ext_audio_key] is not None:
+            telemetry_payload[ext_audio_key] = effective_audio_metrics[ext_audio_key]
+    if effective_audio_obj is not None:
+        telemetry_payload["audio"] = dict(effective_audio_obj)
+    if effective_opfs is not None:
+        telemetry_payload["opfs"] = dict(effective_opfs)
+    if effective_gpu_memory is not None:
+        telemetry_payload["gpu_memory"] = dict(effective_gpu_memory)
+    if effective_renderer_memory is not None:
+        telemetry_payload["renderer_memory"] = dict(effective_renderer_memory)
+    if warm_boot is not None:
+        telemetry_payload["warm_boot"] = dict(warm_boot)
     for probe_key in ("swapchainProbeCount", "lastSampledMaxLuma", "suppressedBlackFrames"):
         if effective_swapchain_probe[probe_key] is not None:
             telemetry_payload[probe_key] = effective_swapchain_probe[probe_key]
@@ -3893,13 +5122,151 @@ def digest(report: dict[str, Any], exit_code: int, max_counters: int = 12) -> st
     audio_frames_drained = _sanitize_optional_non_negative_int(report.get("audio_frames_drained"))
     if audio_frames_drained is None:
         audio_frames_drained = _sanitize_optional_non_negative_int(summary.get("audio_frames_drained"))
+    audio_obj = report.get("audio") if isinstance(report.get("audio"), Mapping) else (
+        summary.get("audio") if isinstance(summary.get("audio"), Mapping) else {}
+    )
+    audio_guest_frames_drained = _sanitize_optional_non_negative_int(
+        report.get("audio_guest_frames_drained")
+        if "audio_guest_frames_drained" in report
+        else (
+            summary.get("audio_guest_frames_drained")
+            if "audio_guest_frames_drained" in summary
+            else audio_obj.get("guest_frames_drained")
+        )
+    )
+    audio_context_state = sanitize_audio_context_state(
+        report.get("audio_context_state") or summary.get("audio_context_state") or audio_obj.get("context_state")
+    )
+    audio_output_state = sanitize_audio_output_state(
+        report.get("audio_output_state") or summary.get("audio_output_state") or audio_obj.get("output_state")
+    )
+    audio_worklet_sab_attached = _sanitize_optional_bool(
+        report.get("audio_worklet_sab_attached")
+        if "audio_worklet_sab_attached" in report
+        else (
+            summary.get("audio_worklet_sab_attached")
+            if "audio_worklet_sab_attached" in summary
+            else audio_obj.get("worklet_sab_attached")
+        )
+    )
+    audio_sample_rate = _sanitize_audio_sample_rate(
+        report.get("audio_sample_rate")
+        if "audio_sample_rate" in report
+        else (
+            summary.get("audio_sample_rate")
+            if "audio_sample_rate" in summary
+            else audio_obj.get("sample_rate")
+        )
+    )
     audio_parts: list[str] = []
     if audio_ring_attached is not None:
         audio_parts.append(f"attached={'true' if audio_ring_attached else 'false'}")
     if audio_frames_drained is not None:
         audio_parts.append(f"frames_drained={audio_frames_drained}")
+    if audio_guest_frames_drained is not None:
+        audio_parts.append(f"guest_frames_drained={audio_guest_frames_drained}")
+    if audio_context_state is not None:
+        audio_parts.append(f"context_state={audio_context_state}")
+    if audio_output_state is not None:
+        audio_parts.append(f"output_state={audio_output_state}")
+    if audio_worklet_sab_attached is not None:
+        audio_parts.append(f"worklet_sab_attached={'true' if audio_worklet_sab_attached else 'false'}")
+    if audio_sample_rate is not None:
+        audio_parts.append(f"sample_rate={audio_sample_rate}")
     if audio_parts:
         lines.append(f"audio_ring: {', '.join(audio_parts)}")
+
+    playability_state = sanitize_playability_state(report.get("playabilityState") or summary.get("playabilityState"))
+    if playability_state:
+        lines.append(f"playability_state: {playability_state}")
+    m4_milestones = report.get("m4_milestones") if isinstance(report.get("m4_milestones"), Mapping) else (
+        summary.get("m4_milestones") if isinstance(summary.get("m4_milestones"), Mapping) else {}
+    )
+    if m4_milestones:
+        m4_parts = [f"{k}={m4_milestones[k]}ms" for k in M4_MILESTONES if k in m4_milestones]
+        if m4_parts:
+            lines.append(f"m4_milestones: {', '.join(m4_parts)}")
+
+    opfs = report.get("opfs") if isinstance(report.get("opfs"), Mapping) else (
+        summary.get("opfs") if isinstance(summary.get("opfs"), Mapping) else None
+    )
+    if isinstance(opfs, Mapping) and opfs:
+        rate = opfs.get("opfsHitRatePct")
+        rate_str = f"{rate}%" if rate is not None else "n/a"
+        lines.append(
+            "opfs: "
+            f"hits={opfs.get('opfsHits', 0)}, "
+            f"misses={opfs.get('opfsMisses', 0)}, "
+            f"writes={opfs.get('opfsWrites', 0)}, "
+            f"hit_rate={rate_str}, "
+            f"bytes_from_opfs={opfs.get('bytesFromOpfs', 0)}"
+        )
+
+    gpu_memory = report.get("gpu_memory") if isinstance(report.get("gpu_memory"), Mapping) else (
+        summary.get("gpu_memory") if isinstance(summary.get("gpu_memory"), Mapping) else None
+    )
+    if isinstance(gpu_memory, Mapping) and gpu_memory:
+        gm_parts: list[str] = []
+        for label, key in (
+            ("total_live", "totalLiveGpuBytes"),
+            ("live_buf", "liveBufferBytes"),
+            ("live_tex", "liveTextureBytes"),
+            ("peak_buf", "peakBufferBytes"),
+            ("peak_tex", "peakTextureBytes"),
+            ("staging", "stagingPoolBytes"),
+            ("vram", "vramBytes"),
+        ):
+            raw_b = _sanitize_optional_non_negative_int(gpu_memory.get(key))
+            if raw_b is not None:
+                gm_parts.append(f"{label}={round(raw_b / (1024.0 * 1024.0), 1):.1f}MB")
+        for label, key in (
+            ("deferred_destroys", "pendingDeferredDestroys"),
+            ("deferred_destroy_bytes", "pendingDeferredDestroyBytes"),
+            ("high_water_flushes", "deferredHighWaterFlushes"),
+        ):
+            raw_c = _sanitize_optional_non_negative_int(gpu_memory.get(key))
+            if raw_c is not None:
+                gm_parts.append(f"{label}={raw_c}")
+        if gm_parts:
+            lines.append(f"gpu_memory: {', '.join(gm_parts)}")
+
+    renderer_memory = report.get("renderer_memory") if isinstance(report.get("renderer_memory"), Mapping) else (
+        summary.get("renderer_memory") if isinstance(summary.get("renderer_memory"), Mapping) else None
+    )
+    if isinstance(renderer_memory, Mapping) and renderer_memory:
+        rm_parts: list[str] = []
+        shared_pthreads = _sanitize_optional_non_negative_int(renderer_memory.get("sharedModulesDeliveredToPthreads"))
+        wasm_bytes = _sanitize_optional_non_negative_int(renderer_memory.get("wasmLinearMemoryBytes"))
+        if shared_pthreads is not None:
+            rm_parts.append(f"shared_modules_pthreads={shared_pthreads}")
+        if wasm_bytes is not None:
+            rm_parts.append(f"wasm_linear_mb={round(wasm_bytes / (1024.0 * 1024.0), 1):.1f}")
+        if rm_parts:
+            lines.append(f"renderer_memory: {', '.join(rm_parts)}")
+
+    warm_boot = report.get("warm_boot") if isinstance(report.get("warm_boot"), Mapping) else (
+        summary.get("warm_boot") if isinstance(summary.get("warm_boot"), Mapping) else None
+    )
+    if isinstance(warm_boot, Mapping) and warm_boot:
+        cold_wb = warm_boot.get("cold") if isinstance(warm_boot.get("cold"), Mapping) else {}
+        warm_wb = warm_boot.get("warm") if isinstance(warm_boot.get("warm"), Mapping) else {}
+        delta_wb = warm_boot.get("delta") if isinstance(warm_boot.get("delta"), Mapping) else {}
+        wb_parts: list[str] = []
+        if cold_wb.get("first_visible_frame_s") is not None or warm_wb.get("first_visible_frame_s") is not None:
+            sp = delta_wb.get("first_visible_frame_speedup_pct")
+            sp_str = f" ({sp:+.1f}% speedup)" if isinstance(sp, (int, float)) else ""
+            wb_parts.append(
+                f"fvf={cold_wb.get('first_visible_frame_s')}s->{warm_wb.get('first_visible_frame_s')}s{sp_str}"
+            )
+        if cold_wb.get("opfsHits") is not None or warm_wb.get("opfsHits") is not None:
+            wb_parts.append(f"opfsHits={cold_wb.get('opfsHits')}->{warm_wb.get('opfsHits')}")
+        if cold_wb.get("opfsWrites") is not None or warm_wb.get("opfsWrites") is not None:
+            wb_parts.append(f"opfsWrites={cold_wb.get('opfsWrites')}->{warm_wb.get('opfsWrites')}")
+        if cold_wb.get("opfsHitRatePct") is not None or warm_wb.get("opfsHitRatePct") is not None:
+            wb_parts.append(f"opfsHitRatePct={cold_wb.get('opfsHitRatePct')}%->{warm_wb.get('opfsHitRatePct')}%")
+        if wb_parts:
+            lines.append(f"warm_boot: {', '.join(wb_parts)}")
+
     input_script = report.get("inputScript") or summary.get("inputScript")
     if input_script:
         lines.append(f"input_script: {input_script}")
@@ -4091,6 +5458,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="pass --quiet to server/serve_local.py to suppress per-request access logs during long captures",
     )
+    p.add_argument(
+        "--warm-boot-check",
+        action="store_true",
+        help=(
+            "run a second warm-reload boot pass reusing the exact same temporary Chrome profile "
+            "(preserving OPFS cache) and report cold vs warm deltas"
+        ),
+    )
+    p.add_argument(
+        "--warm-duration-s",
+        type=float,
+        default=None,
+        metavar="N",
+        help="warm-reload pass duration in seconds when --warm-boot-check is set (default: same as --duration-s)",
+    )
     return p
 
 
@@ -4161,6 +5543,8 @@ def _run(
     hide_hud = bool(args.hide_hud)
     hold_until_visible = validate_hold_until_visible(args.hold_until_visible)
     quiet_server = bool(args.quiet_server)
+    warm_boot_check = bool(args.warm_boot_check)
+    warm_duration_override = validate_warm_duration_s(args.warm_duration_s)
     if args.jobs < 1:
         raise RunnerError("--jobs must be >= 1")
 
@@ -4183,6 +5567,7 @@ def _run(
         duration_s = SMOKE_MODE_DEFAULT_DURATION_S
     else:
         duration_s = float(preset_cfg["duration_s"])
+    warm_duration_s = warm_duration_override if warm_duration_override is not None else duration_s
     send_input = bool(preset_cfg["input"])
 
     build_dir = resolve_against_repo(args.build_dir or DEFAULT_BUILD_DIR_REL, repo)
@@ -4315,6 +5700,8 @@ def _run(
                 "mp4_fps": mp4_fps,
                 "mp4_skip_black": mp4_skip_black,
                 "quiet_server": quiet_server,
+                "warm_boot_check": warm_boot_check,
+                "warm_duration_s": warm_duration_s if warm_boot_check else warm_duration_override,
                 "trust_build": bool(args.trust_build),
                 "port": preview_port,
                 "chrome_found": chrome_path is not None,
@@ -4379,34 +5766,129 @@ def _run(
     clean_build_dirs.write_marker(build_dir, "run_browser_boot.py", repo)
     print(f"[run] {repo_relative_label(run_dir, repo)}", file=sys.stderr, flush=True)
 
-    session = session_runner(
-        repo=repo,
-        run_dir=run_dir,
-        chrome_path=chrome_path,
-        port=args.port,
-        boot_dir=None if args.smoke else boot_dir,
-        game_dir=game_dir,
-        shaders_dir=effective_shaders_dir,
-        duration_s=duration_s,
-        headless=args.headless,
-        smoke=args.smoke,
-        send_input=send_input,
-        capture_frames=capture_frames_enabled,
-        capture_frames_dir=capture_frames_dir,
-        capture_interval_sec=capture_interval_sec,
-        frame_interval_s=float(args.frame_interval_s),
-        encode_mp4=bool(args.mp4),
-        mp4_fps=mp4_fps,
-        mp4_skip_black=mp4_skip_black,
-        hide_hud=hide_hud,
-        hold_until_visible=hold_until_visible,
-        input_script=input_script,
-        stream_shaders=stream_shaders,
-        stream_threshold_mb=stream_threshold_mb,
-        boot_options=resolved_boot_options,
-        quiet_server=quiet_server,
-        runner=runner,
-    )
+    shared_profile_dir: Path | None = None
+    warm_session: BrowserSessionResult | None = None
+    warm_report: dict[str, Any] | None = None
+    warm_boot_summary: dict[str, Any] | None = None
+    if warm_boot_check:
+        shared_profile_dir = Path(tempfile.mkdtemp(prefix="playgta6-chrome-warm-profile-"))
+
+    try:
+        cold_kwargs: dict[str, Any] = {
+            "repo": repo,
+            "run_dir": run_dir,
+            "chrome_path": chrome_path,
+            "port": args.port,
+            "boot_dir": None if args.smoke else boot_dir,
+            "game_dir": game_dir,
+            "shaders_dir": effective_shaders_dir,
+            "duration_s": duration_s,
+            "headless": args.headless,
+            "smoke": args.smoke,
+            "send_input": send_input,
+            "capture_frames": capture_frames_enabled,
+            "capture_frames_dir": capture_frames_dir,
+            "capture_interval_sec": capture_interval_sec,
+            "frame_interval_s": float(args.frame_interval_s),
+            "encode_mp4": bool(args.mp4),
+            "mp4_fps": mp4_fps,
+            "mp4_skip_black": mp4_skip_black,
+            "hide_hud": hide_hud,
+            "hold_until_visible": hold_until_visible,
+            "input_script": input_script,
+            "stream_shaders": stream_shaders,
+            "stream_threshold_mb": stream_threshold_mb,
+            "boot_options": resolved_boot_options,
+            "quiet_server": quiet_server,
+            "runner": runner,
+        }
+        if shared_profile_dir is not None:
+            cold_kwargs["user_data_dir"] = shared_profile_dir
+            cold_kwargs["cleanup_user_data_dir"] = False
+
+        session = session_runner(**cold_kwargs)
+
+        cold_has_report = bool(
+            session.ok or session.final_probe or session.presents or session.status in ("ok", "fault")
+        )
+        cold_report: dict[str, Any] | None = None
+        if cold_has_report:
+            cold_report = build_boot_report(
+                session,
+                smoke=args.smoke,
+                preset=args.preset,
+                input_script=input_script,
+                stream_shaders=stream_shaders,
+                stream_threshold_mb=stream_threshold_mb,
+                boot_options=resolved_boot_options,
+            )
+
+        if warm_boot_check and cold_report is not None and shared_profile_dir is not None:
+            print(
+                f"[warm] running warm reload pass ({warm_duration_s:g}s) in shared Chrome profile",
+                file=sys.stderr,
+                flush=True,
+            )
+            warm_kwargs: dict[str, Any] = {
+                "repo": repo,
+                "run_dir": run_dir,
+                "chrome_path": chrome_path,
+                "port": args.port,
+                "boot_dir": None if args.smoke else boot_dir,
+                "game_dir": game_dir,
+                "shaders_dir": effective_shaders_dir,
+                "duration_s": warm_duration_s,
+                "headless": args.headless,
+                "smoke": args.smoke,
+                "send_input": send_input,
+                "capture_frames": False,
+                "capture_frames_dir": None,
+                "capture_interval_sec": capture_interval_sec,
+                "frame_interval_s": float(args.frame_interval_s),
+                "encode_mp4": False,
+                "mp4_fps": mp4_fps,
+                "mp4_skip_black": mp4_skip_black,
+                "hide_hud": hide_hud,
+                "hold_until_visible": hold_until_visible,
+                "input_script": input_script,
+                "stream_shaders": stream_shaders,
+                "stream_threshold_mb": stream_threshold_mb,
+                "boot_options": resolved_boot_options,
+                "quiet_server": quiet_server,
+                "user_data_dir": shared_profile_dir,
+                "cleanup_user_data_dir": False,
+                "log_prefix": "warm-",
+                "runner": runner,
+            }
+            warm_session = session_runner(**warm_kwargs)
+            warm_console_lines = list(warm_session.console_lines)
+            warm_hud_lines = ((warm_session.final_probe or {}).get("hud") or {}).get("logLines")
+            if isinstance(warm_hud_lines, list) and warm_hud_lines:
+                warm_console_lines.append("--- HUD LOG ---")
+                warm_console_lines.extend(sanitize_text(str(line)) for line in warm_hud_lines)
+            (run_dir / "warm-console.log").write_text(
+                ("\n".join(sanitize_text(line) for line in warm_console_lines) + "\n")
+                if warm_console_lines
+                else "",
+                encoding="utf-8",
+            )
+            warm_report = build_boot_report(
+                warm_session,
+                smoke=args.smoke,
+                preset=args.preset,
+                input_script=input_script,
+                stream_shaders=stream_shaders,
+                stream_threshold_mb=stream_threshold_mb,
+                boot_options=resolved_boot_options,
+            )
+            (run_dir / "warm-boot-report.json").write_text(
+                json.dumps(warm_report, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            warm_boot_summary = build_warm_boot_summary(cold_report, warm_report)
+    finally:
+        if shared_profile_dir is not None:
+            shutil.rmtree(shared_profile_dir, ignore_errors=True)
 
     # Always write console.log, telemetry.json, and command.json
     console_lines = list(session.console_lines)
@@ -4432,6 +5914,7 @@ def _run(
         hold_until_visible=hold_until_visible,
         mp4_fps=mp4_fps,
         mp4_skip_black=mp4_skip_black,
+        warm_boot=warm_boot_summary,
     )
     (run_dir / "telemetry.json").write_text(json.dumps(telemetry_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -4462,6 +5945,8 @@ def _run(
             "mp4_fps": mp4_fps,
             "mp4_skip_black": mp4_skip_black,
             "quiet_server": quiet_server,
+            "warm_boot_check": warm_boot_check,
+            "warm_duration_s": warm_duration_s if warm_boot_check else warm_duration_override,
             "trust_build": bool(args.trust_build),
             "chrome": basename_label(chrome_path),
             "plan": sanitized_plan,
@@ -4472,17 +5957,12 @@ def _run(
     (run_dir / "command.json").write_text(json.dumps(command_meta, indent=2) + "\n", encoding="utf-8")
 
     report_path = run_dir / "boot-report.json"
-    if session.ok or session.final_probe or session.presents or session.status in ("ok", "fault"):
-        report = build_boot_report(
-            session,
-            smoke=args.smoke,
-            preset=args.preset,
-            input_script=input_script,
-            stream_shaders=stream_shaders,
-            stream_threshold_mb=stream_threshold_mb,
-            boot_options=resolved_boot_options,
-        )
-        report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+    if cold_report is not None:
+        if warm_boot_summary is not None:
+            cold_report["warm_boot"] = sanitize_value(dict(warm_boot_summary))
+            if isinstance(cold_report.get("summary"), dict):
+                cold_report["summary"]["warm_boot"] = sanitize_value(dict(warm_boot_summary))
+        report_path.write_text(json.dumps(cold_report, indent=2) + "\n", encoding="utf-8")
 
     loaded_report = load_report(report_path)
     if loaded_report is None:
