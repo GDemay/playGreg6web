@@ -3936,6 +3936,15 @@ class T95ChromeMenuFlow4BootOptionsAndSwapchainProbeTests(unittest.TestCase):
 
     def test_chrome_to_ingame_preset_validation_url_help_and_cli(self):
         self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-to-ingame"), "chrome-to-ingame")
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-menu-flow-5"), "chrome-menu-flow-5")
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-menu-flow-5"), "chrome-menu-flow-5")
+        self.assertEqual(rbb.sanitize_input_script_preset("chrome-menu-flow-5"), "chrome-menu-flow-5")
+        self.assertEqual(rbb.sanitize_input_script_preset("  CHROME-MENU-FLOW-5  "), "chrome-menu-flow-5")
+        self.assertEqual(rbb.validate_input_script_preset("chrome-menu-flow-5"), "chrome-menu-flow-5")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="chrome-menu-flow-5"),
+            "http://127.0.0.1:8080/?inputScript=chrome-menu-flow-5",
+        )
         self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-to-ingame"), "chrome-to-ingame")
         self.assertEqual(
             list(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),

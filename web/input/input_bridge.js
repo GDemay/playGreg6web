@@ -194,6 +194,7 @@ function readGamepadTrigger(button) {
 
 export const MIN_SCRIPT_HOLD_MS = 180;
 export const CHROME_MENU_FLOW_4_HOLD_MS = 200;
+export const IDLE_GAMEPAD_POLL_INTERVAL_MS = 500;
 export const DEFAULT_VISIBLE_FRAME_FALLBACK_MS = 2000;
 export const FIRST_VISIBLE_FRAME_INITIAL_A_DELAY_MS = 500;
 export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
@@ -201,6 +202,7 @@ export const FIRST_VISIBLE_FRAME_INITIAL_A_HOLD_MS = 220;
 export const FIRST_VISIBLE_FRAME_ANCHOR_PRESETS = Object.freeze([
   'menu-to-ingame',
   'chrome-to-ingame',
+  'chrome-menu-flow-5',
   'chrome-menu-flow-4',
   'chrome-menu-flow-2',
   'chrome-menu-flow',
@@ -348,6 +350,26 @@ function buildChromeMenuFlow4Events() {
   events.push(
     Object.freeze({ atMs: 358000, holdMs: 220, button: INPUT_BUTTONS.A })
   );
+  return Object.freeze(events);
+}
+
+// W364 (Refs #663): Fast 4K Bink2 (~22-26 s after FIRST_VISIBLE_FRAME with G73+G75+R63)
+// setup flow matching #1581/#1592/#1614:
+// - Phase 1 (0s..10s): Start Screen A presses at 2s, 4s, 6s to start 4K Bink2 intro.
+// - Phase 2 (35s..80s): 3x 15 s-spaced _menu_cycle rounds (Up x6, Down, Down, A at 35s, 50s, 65s)
+//   to pass LEGAL NOTICES right after Bink2 settles and reach ROCKSTAR GAMES LEGAL TERMS & POLICIES.
+// - Phase 3 (85s+, looping every 16 s): CHROME_LEGAL_TERMS_ACCEPT_OFFSETS to check Privacy Policy
+//   + Terms of Service, click Confirm >, and enter Main Menu / Story (never presses B).
+function buildChromeMenuFlow5Events() {
+  const events = [];
+  for (const atMs of [2000, 4000, 6000]) {
+    events.push(
+      Object.freeze({ atMs, holdMs: CHROME_MENU_FLOW_4_HOLD_MS, button: INPUT_BUTTONS.A })
+    );
+  }
+  for (let round = 0; round < 3; round++) {
+    expandOffsetCycle(events, 35000 + round * 15000, CHROME_MENU_FLOW_4_CYCLE_OFFSETS);
+  }
   return Object.freeze(events);
 }
 
@@ -689,6 +711,18 @@ export const INPUT_SCRIPT_PRESETS = Object.freeze({
     // 358000 ms; never presses B).
     loop: Object.freeze({
       startMs: 368000,
+      periodMs: 16000,
+      events: CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
+    }),
+  }),
+  'chrome-menu-flow-5': Object.freeze({
+    name: 'chrome-menu-flow-5',
+    events: buildChromeMenuFlow5Events(),
+    // Phase 3 (W364): Looping 16 s CHROME_LEGAL_TERMS_ACCEPT_OFFSETS from 85000 ms
+    // (Up x6, right-stick scroll, A [Privacy Policy], Down, right-stick scroll,
+    // A [Terms of Service], Down, A [Confirm >], A; >= 200 ms holds, never presses B).
+    loop: Object.freeze({
+      startMs: 85000,
       periodMs: 16000,
       events: CHROME_LEGAL_TERMS_ACCEPT_OFFSETS,
     }),
@@ -1958,6 +1992,17 @@ export class InputBridge {
     this._gamepadConnects = 0;
     this._gamepadDisconnects = 0;
     this._activeGamepadIndex = null;
+    this._hasConnectedGamepad = false;
+    this._hasCustomNowFn = typeof opts.nowFn === 'function';
+    this._nowFn = this._hasCustomNowFn ? opts.nowFn : defaultNowMs;
+    this._idleGamepadPollIntervalMs =
+      typeof opts.idleGamepadPollIntervalMs === 'number' &&
+      Number.isFinite(opts.idleGamepadPollIntervalMs) &&
+      opts.idleGamepadPollIntervalMs >= 0
+        ? opts.idleGamepadPollIntervalMs
+        : IDLE_GAMEPAD_POLL_INTERVAL_MS;
+    this._lastIdleGamepadPollMs = null;
+    this._idleGamepadPollsSkipped = 0;
 
     // Input source state
     this._pressedKeys = new Set();
@@ -2048,9 +2093,26 @@ export class InputBridge {
     this.running = false;
     this.disposed = false;
 
-    this._boundTick = () => {
+    this._boundTick = (rafTimestampMs) => {
       if (!this.running || this.disposed) return;
-      this.pollGamepads();
+      const nowMs =
+        !this._hasCustomNowFn &&
+        typeof rafTimestampMs === 'number' &&
+        Number.isFinite(rafTimestampMs)
+          ? rafTimestampMs
+          : this._nowFn();
+      if (
+        this._hasConnectedGamepad ||
+        this._lastIdleGamepadPollMs === null ||
+        this._idleGamepadPollIntervalMs === 0 ||
+        nowMs - this._lastIdleGamepadPollMs >= this._idleGamepadPollIntervalMs ||
+        nowMs < this._lastIdleGamepadPollMs
+      ) {
+        this.pollGamepads();
+        this._lastIdleGamepadPollMs = this._hasConnectedGamepad ? null : nowMs;
+      } else {
+        this._idleGamepadPollsSkipped += 1;
+      }
       if (this.running && !this.disposed && this._window && typeof this._window.requestAnimationFrame === 'function') {
         this._rafId = this._window.requestAnimationFrame(this._boundTick);
       }
@@ -2283,6 +2345,8 @@ export class InputBridge {
     this._addListener(this._window, 'gamepadconnected', (e) => {
       if (this.disposed) return;
       this._gamepadConnects += 1;
+      this._hasConnectedGamepad = true;
+      this._lastIdleGamepadPollMs = null;
       const eventPad = e?.gamepad && e.gamepad.connected !== false ? e.gamepad : null;
       const eventPadIndex =
         eventPad && typeof eventPad.index === 'number' ? eventPad.index : null;
@@ -2300,6 +2364,10 @@ export class InputBridge {
         this._selectedGamepadScratch.pad = eventPad;
         this._selectedGamepadScratch.index = eventPadIndex ?? 0;
         selected = this._selectedGamepadScratch;
+      }
+      if (selected || eventPad !== null) {
+        this._hasConnectedGamepad = true;
+        this._lastIdleGamepadPollMs = null;
       }
       this._pollSelectedGamepadEntry(selected, false);
       this._selectedGamepadScratch.pad = null;
@@ -2323,9 +2391,13 @@ export class InputBridge {
 
       const remaining = this._selectGamepadEntry(disconnectedIndex);
       if (remaining) {
+        this._hasConnectedGamepad = true;
+        this._lastIdleGamepadPollMs = null;
         this._pollSelectedGamepadEntry(remaining, true);
         this._selectedGamepadScratch.pad = null;
       } else {
+        this._hasConnectedGamepad = false;
+        this._lastIdleGamepadPollMs = this._nowFn();
         this._activeGamepadIndex = null;
         this._commitMergedState(true);
         if (!this._manualStart) {
@@ -2403,34 +2475,56 @@ export class InputBridge {
     this._commitMergedState(true, true);
   }
 
+  get hasConnectedGamepad() {
+    return this._hasConnectedGamepad;
+  }
+
   _selectGamepadEntry(excludeIndex = null) {
     this._selectedGamepadScratch.pad = null;
     this._selectedGamepadScratch.index = -1;
 
     if (!this._navigator || typeof this._navigator.getGamepads !== 'function') {
+      this._hasConnectedGamepad = false;
       return null;
     }
     let pads;
     try {
       pads = this._navigator.getGamepads();
     } catch {
+      this._hasConnectedGamepad = false;
       return null;
     }
-    if (!pads) return null;
-
-    if (typeof this._gamepadIndex === 'number') {
-      if (excludeIndex !== null && this._gamepadIndex === excludeIndex) {
-        return null;
-      }
-      const target = pads[this._gamepadIndex];
-      if (!target || target.connected === false) return null;
-      const idx = typeof target.index === 'number' ? target.index : this._gamepadIndex;
-      if (excludeIndex !== null && idx === excludeIndex) return null;
-      this._selectedGamepadScratch.pad = target;
-      this._selectedGamepadScratch.index = idx;
-      return this._selectedGamepadScratch;
+    if (!pads) {
+      this._hasConnectedGamepad = false;
+      return null;
     }
 
+    if (typeof this._gamepadIndex === 'number') {
+      const target = pads[this._gamepadIndex];
+      const targetConnected = Boolean(target && target.connected !== false);
+      if (targetConnected) {
+        const idx = typeof target.index === 'number' ? target.index : this._gamepadIndex;
+        if (excludeIndex === null || (this._gamepadIndex !== excludeIndex && idx !== excludeIndex)) {
+          this._hasConnectedGamepad = true;
+          this._selectedGamepadScratch.pad = target;
+          this._selectedGamepadScratch.index = idx;
+          return this._selectedGamepadScratch;
+        }
+      }
+      let anyConnected = false;
+      for (let i = 0; i < pads.length; i++) {
+        const p = pads[i];
+        if (!p || p.connected === false) continue;
+        const idx = typeof p.index === 'number' ? p.index : i;
+        if (excludeIndex !== null && idx === excludeIndex) continue;
+        anyConnected = true;
+        break;
+      }
+      this._hasConnectedGamepad = anyConnected;
+      return null;
+    }
+
+    let anyConnected = false;
     let activePad = null;
     let activeIdx = -1;
     let firstStandardPad = null;
@@ -2443,6 +2537,7 @@ export class InputBridge {
       if (!pad || pad.connected === false) continue;
       const idx = typeof pad.index === 'number' ? pad.index : i;
       if (excludeIndex !== null && idx === excludeIndex) continue;
+      anyConnected = true;
 
       if (this._activeGamepadIndex !== null && idx === this._activeGamepadIndex) {
         activePad = pad;
@@ -2457,6 +2552,8 @@ export class InputBridge {
         fallbackIdx = idx;
       }
     }
+
+    this._hasConnectedGamepad = anyConnected;
 
     if (activePad !== null && (activePad.mapping === 'standard' || firstStandardPad === null)) {
       this._selectedGamepadScratch.pad = activePad;
@@ -2638,6 +2735,8 @@ export class InputBridge {
     if (this.running) return;
     if (!this._window || typeof this._window.requestAnimationFrame !== 'function') return;
 
+    // Always poll immediately on tick 1 after starting so pre-connected/mock gamepads are detected right away.
+    this._lastIdleGamepadPollMs = null;
     this.running = true;
     this._rafId = this._window.requestAnimationFrame(this._boundTick);
   }
@@ -3037,6 +3136,8 @@ export class InputBridge {
       gamepadConnects: this._gamepadConnects,
       gamepadDisconnects: this._gamepadDisconnects,
       activeGamepadIndex: this._activeGamepadIndex,
+      hasConnectedGamepad: this._hasConnectedGamepad,
+      idleGamepadPollsSkipped: this._idleGamepadPollsSkipped,
     };
   }
 
@@ -3117,6 +3218,8 @@ export class InputBridge {
 
     this._clearGamepadState();
     this._activeGamepadIndex = null;
+    this._hasConnectedGamepad = false;
+    this._lastIdleGamepadPollMs = null;
 
     this.buttons = 0;
     this._lastLx = 0;
