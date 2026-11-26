@@ -1026,3 +1026,120 @@ test('W350 preserves swapchain probe telemetry fields in app_bootstrap boot_stat
     await app.destroy();
   }
 });
+
+test('Zero swapchain probe GPU stalls (no copyTextureToBuffer, mapAsync, or ensureCopySrcUsage) once swapchain.hasVisibleContent is latched', async () => {
+  const { vsHash, fsHash, packBuffer } = createPackBuffer();
+  const env = createProbeEnv({ width: 1280, height: 720, format: 'bgra8unorm' });
+  let fakeNow = 500;
+  let ensureCopySrcCalls = 0;
+
+  const swapchain = new WgpuSwapchain({
+    canvas: env.canvas,
+    device: env.device,
+    context: env.ctx,
+    format: 'bgra8unorm',
+    enableDepth: false,
+    preserveCopySrcUntilVisible: true,
+    now: () => fakeNow,
+  });
+  swapchain.configure({ width: 1280, height: 720 });
+
+  const origEnsureCopySrc = swapchain.ensureCopySrcUsage.bind(swapchain);
+  swapchain.ensureCopySrcUsage = () => {
+    ensureCopySrcCalls += 1;
+    return origEnsureCopySrc();
+  };
+
+  // Pre-latch visible content on swapchain (e.g. from Bink2 intro frame or prior visible frame).
+  swapchain.confirmVisibleFrame({ timestampMs: 500, realPackDraws: 1 });
+  assert.equal(swapchain.hasVisibleContent, true);
+
+  const processor = new WgpuCommandProcessor(env.device, env.ctx, {
+    format: 'bgra8unorm',
+    width: 1280,
+    height: 720,
+    swapchain,
+    wgslPackBuffer: packBuffer,
+    now: () => fakeNow,
+    swapchainProbeIntervalMs: 250,
+    enableResourceReplay: false,
+    enableRtPool: false,
+  });
+
+  for (let i = 0; i < 6; i += 1) {
+    fakeNow += 300;
+    processor.execute(buildDrawStream(vsHash, fsHash, { includeSetup: i === 0 }));
+    await flushMicrotasks();
+  }
+
+  assert.equal(env.copyCalls.length, 0, 'must emit 0 copyTextureToBuffer calls when already visible');
+  assert.equal(env.probeBuffers.length, 0, 'must allocate 0 probe buffers when already visible');
+  assert.equal(ensureCopySrcCalls, 0, 'must not call ensureCopySrcUsage when already visible');
+  assert.equal(processor.swapchainProbeCount, 0);
+  assert.equal(processor._swapchainProbeBuffer, null);
+
+  processor.destroy();
+  swapchain.destroy();
+});
+
+test('defaultInitGpu keeps WgpuSwapchain preserveCopySrcUntilVisible droppable instead of locking COPY_SRC permanently', async () => {
+  const env = createProbeEnv({ width: 1280, height: 720, format: 'bgra8unorm' });
+  const posted = [];
+  const prevNavDesc = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const fakeGpu = {
+    getPreferredCanvasFormat: () => 'bgra8unorm',
+    async requestAdapter() {
+      return {
+        info: { vendor: 'amd', architecture: 'rdna2', device: 'test', description: 'test' },
+        features: new Set(),
+        limits: {},
+        async requestDevice() {
+          return env.device;
+        },
+      };
+    },
+  };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    writable: true,
+    value: { ...(globalThis.navigator || {}), gpu: fakeGpu },
+  });
+
+  let proc = null;
+  try {
+    const handler = createWgpuWorkerHandler({
+      postMessage: (msg) => posted.push(msg),
+      WgpuSwapchain,
+    });
+
+    await handler.handleMessage({
+      init: true,
+      canvas: env.canvas,
+      width: 1280,
+      height: 720,
+      enableResourceReplay: false,
+    });
+
+    proc = handler.processor;
+    assert.ok(proc && proc.swapchain);
+    assert.equal(proc.swapchain.hasCopySrcUsage, true, 'COPY_SRC active before first-visible-frame');
+
+    // Once first-visible-frame fires, swapchain is synced and subsequent resize drops COPY_SRC.
+    proc._notifyFirstVisibleFrame({ firstVisibleFrame: true, firstVisibleFrameMs: 1000 });
+    assert.equal(proc.swapchain.hasVisibleContent, true);
+    assert.equal(proc.swapchain.ensureCopySrcUsage(), false);
+    proc.swapchain.resize(1920, 1080);
+    assert.equal(
+      proc.swapchain.hasCopySrcUsage,
+      false,
+      'COPY_SRC must drop on resize after first-visible-frame for direct scanout'
+    );
+  } finally {
+    if (proc) proc.destroy();
+    if (prevNavDesc) {
+      Object.defineProperty(globalThis, 'navigator', prevNavDesc);
+    } else {
+      delete globalThis.navigator;
+    }
+  }
+});

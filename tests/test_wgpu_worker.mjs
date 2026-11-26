@@ -1729,11 +1729,14 @@ test('W99 _getWorkDoneFence tolerates synchronous OperationError from onSubmitte
     fenceCalls += 1;
     throw createInstanceLostError();
   };
-  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    resourceRegistry: { endFrame() {} },
+  });
 
   const rejections = await collectUnhandledRejections(async () => {
     assert.equal(processor._getWorkDoneFence(), null);
-    // _flushPresent submits and then requests the fence; neither may throw.
+    // _flushPresent submits and then requests the fence when a fence consumer is active; neither may throw.
     assert.doesNotThrow(() => processor._flushPresent());
     assert.doesNotThrow(() =>
       processor.execute(new BinaryCommandBuilder().beginFrame().present().finish())
@@ -1759,7 +1762,10 @@ test('W99 _getWorkDoneFence converts a rejected onSubmittedWorkDone promise into
     fenceCalls += 1;
     return Promise.reject(createInstanceLostError());
   };
-  const processor = new WgpuCommandProcessor(device, ctx, { format: 'bgra8unorm' });
+  const processor = new WgpuCommandProcessor(device, ctx, {
+    format: 'bgra8unorm',
+    resourceRegistry: { endFrame() {} },
+  });
 
   let fenceValue = 'unset';
   const rejections = await collectUnhandledRejections(async () => {
@@ -1839,10 +1845,17 @@ test('W99 _flushPresent records torn-down instance errors from finish/submit/enc
   assert.ok(presentErrors.length >= 1);
   assert.match(presentErrors[0].message, /OperationError: A valid external Instance reference/);
 
-  // Recovery: a healthy encoder presents normally again.
+  // Recovery: a healthy encoder presents normally again. With zero deferred destroys and no
+  // fence-consuming subsystem, steady-state _flushPresent skips onSubmittedWorkDone().
   device.createCommandEncoder = origCreateEncoder;
   assert.doesNotThrow(() => processor._flushPresent());
   assert.equal(processor.frameCount, 1);
+  assert.equal(fenceCalls, 0);
+
+  // When a deferred GPU destroy is queued, _flushPresent requests exactly one fence.
+  processor._deferredGpuDestroys.push({ destroy() {} });
+  assert.doesNotThrow(() => processor._flushPresent());
+  assert.equal(processor.frameCount, 2);
   assert.equal(fenceCalls, 1);
 });
 
@@ -1946,15 +1959,34 @@ test('W332 buildMergedBinkPresenterOptions defaults enableTripleBuffering: true 
   const { BinkVideoPresenter } = require('../web/workers/bink_presenter.js');
   assert.equal(typeof buildMergedBinkPresenterOptions, 'function');
 
-  // Default behavior: enableTripleBuffering defaults to true.
-  assert.deepEqual(buildMergedBinkPresenterOptions(null, null), { enableTripleBuffering: true });
-  assert.deepEqual(buildMergedBinkPresenterOptions({}, undefined), { enableTripleBuffering: true });
+  // Default behavior: enableTripleBuffering and allowUnalignedDirectUpload default to true.
+  assert.deepEqual(buildMergedBinkPresenterOptions(null, null), {
+    enableTripleBuffering: true,
+    allowUnalignedDirectUpload: true,
+  });
+  assert.deepEqual(buildMergedBinkPresenterOptions({}, undefined), {
+    enableTripleBuffering: true,
+    allowUnalignedDirectUpload: true,
+  });
   assert.deepEqual(buildMergedBinkPresenterOptions({ chromaOrder: 'YVU' }, null), {
     chromaOrder: 'yvu',
     enableTripleBuffering: true,
+    allowUnalignedDirectUpload: true,
   });
 
   // Explicit false in base or extra options is preserved.
+  assert.equal(
+    buildMergedBinkPresenterOptions({ allowUnalignedDirectUpload: false }, null)
+      .allowUnalignedDirectUpload,
+    false
+  );
+  assert.equal(
+    buildMergedBinkPresenterOptions(
+      { allowUnalignedDirectUpload: true },
+      { allowUnalignedDirectUpload: false }
+    ).allowUnalignedDirectUpload,
+    false
+  );
   assert.equal(
     buildMergedBinkPresenterOptions({ enableTripleBuffering: false }, null).enableTripleBuffering,
     false
