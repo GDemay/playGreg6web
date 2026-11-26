@@ -2762,3 +2762,89 @@ test('W293: saveAudioPreferences / loadAudioPreferences persist sanitized { mute
   await engine1.destroy();
   await engine2.destroy();
 });
+
+test('O43: AudioEngine subscribes to BroadcastChannel("game-progress") audio-stats telemetry and closes cleanly on destroy()', async () => {
+  const listeners = new Map();
+  let openChannels = 0;
+
+  class MockBroadcastChannel {
+    constructor(name) {
+      this.name = name;
+      this.closed = false;
+      this.onmessage = null;
+      openChannels += 1;
+      if (!listeners.has(name)) {
+        listeners.set(name, new Set());
+      }
+      listeners.get(name).add(this);
+    }
+    postMessage(msg) {
+      if (this.closed) return;
+      const peers = listeners.get(this.name);
+      if (!peers) return;
+      for (const peer of peers) {
+        if (peer !== this && !peer.closed && typeof peer.onmessage === 'function') {
+          peer.onmessage({ data: msg });
+        }
+      }
+    }
+    close() {
+      if (!this.closed) {
+        this.closed = true;
+        openChannels -= 1;
+        const peers = listeners.get(this.name);
+        if (peers) peers.delete(this);
+      }
+    }
+  }
+
+  const engine = new AudioEngine({
+    BroadcastChannelCtor: MockBroadcastChannel,
+    listenTelemetryBroadcast: true,
+  });
+  assert.equal(openChannels, 1);
+  assert.equal(engine.getStats().guestFramesDrained, 0);
+  assert.equal(engine.getStats().guestRingAttached, false);
+
+  // Broadcast live audio-stats from a simulated audio_worker on 'game-progress'.
+  const sender = new MockBroadcastChannel('game-progress');
+  sender.postMessage({ label: 'WebGPU frame #1 presented' }); // unrelated progress message ignored
+  assert.equal(engine.getStats().guestFramesDrained, 0);
+
+  sender.postMessage({
+    type: 'audio-stats',
+    timestamp: 12345,
+    stats: {
+      outputState: 'headless-drain',
+      framesDrained: 28800,
+      guestRingAttached: true,
+      guestFramesDrained: 28800,
+      guestUnderruns: 2,
+      guestOverruns: 0,
+      guestPeakLevel: 0.625,
+    },
+  });
+
+  const stats = engine.getStats();
+  assert.equal(stats.guestRingAttached, true);
+  assert.equal(stats.guestFramesDrained, 28800);
+  assert.equal(stats.guestUnderruns, 2);
+  assert.equal(stats.guestOverruns, 0);
+  assert.equal(stats.guestPeakLevel, 0.625);
+
+  const telem = engine.getTelemetry();
+  assert.equal(telem.guestRingAttached, true);
+  assert.equal(telem.guestFramesDrained, 28800);
+
+  // Destroy closes telemetry channel and ignores subsequent messages.
+  await engine.destroy();
+  assert.equal(openChannels, 1); // only sender remains open
+  sender.postMessage({
+    type: 'audio-stats',
+    stats: { guestFramesDrained: 99999 },
+  });
+  assert.equal(engine.getStats().guestFramesDrained, 28800);
+
+  sender.close();
+  assert.equal(openChannels, 0);
+});
