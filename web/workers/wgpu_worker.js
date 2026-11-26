@@ -4749,11 +4749,42 @@ class WgpuCommandProcessor {
       return;
     }
     this.readbackStats.requested += 1;
+    this._readbackFlushWanted = true;
     // Runs in stream order with the frame's passes: after the work recorded before it.
     this._passCommands.push({
       type: 'readback',
       run: (pc) => this._recordReadbackCopy(pc, req),
     });
+  }
+
+  /**
+   * G66: the title may block on a fence guarding a read-back, and in the browser a read-back only
+   * completes once its copy is submitted and mapped. Submit everything recorded up to the last
+   * read-back now (no present) so the maps start without waiting for a Present packet. The
+   * remaining commands stay queued for the frame.
+   * @returns {boolean} True when a flush ran.
+   */
+  _flushReadbacksNow() {
+    this._readbackFlushWanted = false;
+    if (this._destroyed || !this.device || !this.ctx || this._deviceRecovering) return false;
+    const cmds = this._passCommands;
+    let last = -1;
+    for (let i = cmds.length - 1; i >= 0; i -= 1) {
+      if (cmds[i].type === 'readback') {
+        last = i;
+        break;
+      }
+    }
+    if (last < 0) return false;
+    const tail = cmds.slice(last + 1);
+    this._passCommands = cmds.slice(0, last + 1);
+    try {
+      this._flushPresent({ readbackOnly: true });
+    } finally {
+      this._passCommands = tail;
+    }
+    this._earlyReadbackFlushes = (this._earlyReadbackFlushes || 0) + 1;
+    return true;
   }
 
   _recordReadbackCopy(pc, req) {
@@ -4839,6 +4870,7 @@ class WgpuCommandProcessor {
   }
 
   _resetFrameState() {
+    this._earlyFlushedThisFrame = false;
     this._clearColor = { ...DEFAULT_CLEAR_COLOR };
     this._passCommands = [];
     this._resetPerFrameDrawCounters();
@@ -9622,7 +9654,13 @@ class WgpuCommandProcessor {
     return reflected && reflected[groupIndex] ? reflected[groupIndex] : null;
   }
 
-  _flushPresent() {
+  /**
+   * @param {{ readbackOnly?: boolean }} [opts] G66: `readbackOnly` submits the recorded work up to
+   *   the last read-back without presenting (no frame accounting, no frame reset), so the staging
+   *   maps can start while the title waits on the fence that guards the read-back.
+   */
+  _flushPresent(opts) {
+    const readbackOnly = Boolean(opts && opts.readbackOnly === true);
     const pendingEncoder = this._pendingEncoder;
     this._pendingEncoder = null;
     this._hasPendingUploadCommands = false;
@@ -9664,6 +9702,10 @@ class WgpuCommandProcessor {
       }
     } catch (err) {
       this._notePresentSubmitFailure(err);
+      if (readbackOnly) {
+        this._startRecordedReadbacks(false);
+        return;
+      }
       this._drainDeferredGpuDestroys(null, { immediate: true });
       this._endSubsystemsForFrame(null);
       this._resetFrameState();
@@ -9671,7 +9713,8 @@ class WgpuCommandProcessor {
     }
     let activePass = null;
     let activePassKind = null;
-    let renderPassOpened = false;
+    // After an early read-back flush the canvas already holds this frame's work: keep it.
+    let renderPassOpened = readbackOnly || this._earlyFlushedThisFrame === true;
     let renderPassIdx = 0;
     let computePassIdx = 0;
 
@@ -10074,7 +10117,7 @@ class WgpuCommandProcessor {
     }
 
     endActivePass();
-    if (!renderPassOpened) {
+    if (!renderPassOpened && !readbackOnly) {
       try {
         ensureRenderPass();
       } catch (err) {
@@ -10087,6 +10130,7 @@ class WgpuCommandProcessor {
     // right before finishing and submitting when blit fallback is active (zero overhead
     // when usesBlitFallback === false).
     if (
+      !readbackOnly &&
       useSwapchainBlitFallback &&
       typeof activeSwapchain.blitToCanvasIfNeeded === 'function'
     ) {
@@ -10146,6 +10190,7 @@ class WgpuCommandProcessor {
     );
     let pendingSwapchainProbe = null;
     if (
+      !readbackOnly &&
       !this._firstVisibleFrameNotified &&
       this._requireNonBlackFrameExplicit !== false &&
       this._swapchainProbeSupported !== false &&
@@ -10196,7 +10241,7 @@ class WgpuCommandProcessor {
     }
 
     let timerResolved = false;
-    if (timerSupported && typeof this.passTimer.resolveFrame === 'function') {
+    if (!readbackOnly && timerSupported && typeof this.passTimer.resolveFrame === 'function') {
       timerResolved = Boolean(this.passTimer.resolveFrame(encoder));
     }
 
@@ -10236,6 +10281,10 @@ class WgpuCommandProcessor {
       }
     }
     this._startRecordedReadbacks(submitted);
+    if (readbackOnly) {
+      if (submitted) this._earlyFlushedThisFrame = true;
+      return;
+    }
 
     let presentSceneTransition = false;
     let presentResolutionChanged = false;
@@ -10658,6 +10707,9 @@ class WgpuCommandProcessor {
       this._pendingCommandStreamShaderProfiles = prevPendingHints;
       this._pendingCommandStreamView = prevPendingView;
       this._pendingCommandStreamScanned = prevPendingScanned;
+    }
+    if (this._readbackFlushWanted) {
+      this._flushReadbacksNow();
     }
 
     return { frameCount: this.frameCount, presents };

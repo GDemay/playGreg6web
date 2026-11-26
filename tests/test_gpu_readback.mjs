@@ -156,3 +156,28 @@ test('processor records the copy in stream order and delivers after the map', as
   assert.equal(Atomics.load(counter, 0), 3);
   assert.deepEqual(processor.readbackStats, { requested: 3, delivered: 2, failed: 1, bytes: 10 + 256 * 3 + 64 });
 });
+
+test('a title blocked on the guarded fence gets its read-back flushed without a Present', async () => {
+  const { device } = mockDevice();
+  const processor = new WgpuCommandProcessor(device, null, {});
+  processor.attachGuestMemory(new SharedArrayBuffer(8192));
+  const flushes = [];
+  processor.ctx = {};
+  processor._flushPresent = (opts) => {
+    flushes.push({ opts, cmds: processor._passCommands.map((c) => c.type) });
+  };
+  processor._handleReadback(OPCODES.READBACK_BUFFER,
+    bufferPayload({ seq: 1, bufferId: 5, srcOffset: 0, size: 4, dstAddr: 200, doneAddr: 64 }), 0, 40);
+  processor._passCommands.push({ type: 'draw' });
+  assert.equal(processor._readbackFlushWanted, true);
+  // The end of a command buffer (no Present packet) triggers the flush.
+  processor.executeCommandBuffer(new ArrayBuffer(0));
+  assert.equal(flushes.length, 1);
+  assert.deepEqual(flushes[0].opts, { readbackOnly: true });
+  assert.deepEqual(flushes[0].cmds, ['readback']);          // only the work up to the read-back
+  assert.deepEqual(processor._passCommands.map((c) => c.type), ['draw']);  // the rest waits for the frame
+  assert.equal(processor._readbackFlushWanted, false);
+  // Nothing recorded: no flush.
+  processor._passCommands = [];
+  assert.equal(processor._flushReadbacksNow(), false);
+});
