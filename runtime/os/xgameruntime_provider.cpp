@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -90,7 +91,7 @@
 //     s9 RegisterInstallationProgressChanged(4) h (the local package is complete: progress is
 //     always finished and launchable, and never changes), s39 EnumeratePackages(4) h (no local
 //     content packages; game-package enumeration returns E_NOTIMPL).
-//   {f4faf4d4-...}/{41a4e10c-...} XPersistentLocalStorage: s4 GetPath(3) h ("T:\userdata\pls\",
+//   {f4faf4d4-...}/{41a4e10c-...} XPersistentLocalStorage: s3 GetPathSize, s5 GetSpaceInfo, s6/s7 EnsureSpace; s4 GetPath(3) h ("T:\userdata\pls\",
 //     a directory of the /userdata overlay).
 //   {03f0fe74-...}/{35f07670-...}: s4 has the call shape of XDisplayTryEnableHdrMode(2) h
 //     (returns Disabled: the runtime presents SDR).
@@ -806,12 +807,49 @@ public:
     }
 };
 
-// {8836fe87-edb9-4fe3-8dad-05f0d2cd5b40}: XGameRuntimeIsFeatureAvailable. No optional runtime
-// feature is advertised.
+// {8836fe87-edb9-4fe3-8dad-05f0d2cd5b40}: XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature).
+// Answers true only for areas this runtime really serves (public feature numbering). Everything
+// store, licence, sign-in-UI, invite, streaming or thread related stays false, and so does any
+// id that is not listed. Every distinct id the title asks for is logged once (census).
+constexpr uint32_t kAvailableFeatures[] = {
+    3,   // XAsync
+    6,   // XGame (title id, relaunch of itself)
+    8,   // XGameSave (local provider)
+    11,  // XNetworking (connectivity hint)
+    12,  // XPackage (the local package is installed in full)
+    13,  // XPersistentLocalStorage
+    14,  // XSpeechSynthesizer (silent)
+    18,  // XTaskQueue
+    19,  // XUser (local offline user)
+};
+
+bool feature_is_served(uint32_t feature) {
+    for (const uint32_t served : kAvailableFeatures) {
+        if (served == feature) {
+            return true;
+        }
+    }
+    return false;
+}
+
 class FeatureApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XGameRuntimeFeature";
-    bool IsFeatureAvailable(uint32_t /*feature*/) { return false; }
+    bool IsFeatureAvailable(uint32_t feature) {
+        const bool available = feature_is_served(feature);
+        {
+            std::lock_guard<std::mutex> lock(seen_mutex_);
+            if (seen_.insert(feature).second) {
+                os::log("xgameruntime: XGameRuntimeIsFeatureAvailable(" + std::to_string(feature) + ") -> " +
+                        (available ? "true" : "false"));
+            }
+        }
+        return available;
+    }
+
+private:
+    std::mutex seen_mutex_;
+    std::set<uint32_t> seen_;
 };
 
 // {e349bd1a-...}/{1861cf2e-...}: XSystem.
@@ -1069,6 +1107,56 @@ struct GuestInstallationProgress {
 };
 static_assert(sizeof(GuestInstallationProgress) == 24, "XPackageInstallationProgress is 24 bytes on x64");
 
+// Async operation whose work is done at once on the queue: completes with `hr`; the result
+// half writes `result_size` bytes through `write`.
+class PackageReadyOp final : public XAsyncProviderImpl {
+public:
+    using Write = std::function<HResult(uint64_t buffer)>;
+    PackageReadyOp(HResult hr, size_t result_size, Write write)
+        : hr_(hr), result_size_(result_size), write_(std::move(write)) {}
+    HResult call(XAsyncOp op, XAsyncBlock* block, size_t /*buffer_size*/, uint64_t buffer) override {
+        switch (op) {
+        case XAsyncOp::Begin:
+            return XAsyncSchedule(block, 0);
+        case XAsyncOp::DoWork:
+            XAsyncComplete(block, hr_, hr_ < 0 ? 0 : result_size_);
+            return E_PENDING_HR;
+        case XAsyncOp::GetResult:
+            return write_ ? write_(buffer) : S_OK_HR;
+        default:
+            return S_OK_HR;
+        }
+    }
+
+private:
+    HResult hr_;
+    size_t result_size_;
+    Write write_;
+};
+
+int32_t begin_ready_async(uint64_t async, const char* name, HResult hr, size_t result_size,
+                          PackageReadyOp::Write write) {
+    Pg6XAsyncBlock* shadow = begin_async(async);
+    if (shadow == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    return XAsyncBeginWith(shadow, std::make_unique<PackageReadyOp>(hr, result_size, std::move(write)), 0, name);
+}
+
+// Result half: copies the result to `buffer` and ends the shadow block once it is no longer pending.
+int32_t finish_ready_async(uint64_t async, uint64_t size, uint64_t buffer) {
+    Pg6XAsyncBlock* shadow = find_async(async);
+    if (shadow == nullptr) {
+        return E_INVALIDARG_HR;
+    }
+    size_t used = 0;
+    const int32_t hr = XAsyncGetResultWith(shadow, 0, static_cast<size_t>(size), buffer, &used);
+    if (hr != E_PENDING_HR && hr != E_NOT_SUFFICIENT_BUFFER_HR) {
+        cbk::async_shadow_end(async);
+    }
+    return hr;
+}
+
 // {af406016-...}/{0b9d556e-...}: XPackage.
 class PackageApi : public com::ComObject {
     struct InstallationMonitor {
@@ -1152,6 +1240,99 @@ public:
         return S_OK_HR;
     }
 
+    // The chunk selectors (count and array pointer) must be consistent; their contents do not
+    // matter because the whole package, every chunk and every language, is installed.
+    static bool selectors_ok(uint64_t identifier, uint64_t count, uint64_t selectors) {
+        return identifier != 0 && !(static_cast<uint32_t>(count) != 0 && selectors == 0);
+    }
+
+    // s11: XPackageGetUserLocale(localeSize, locale): the package's user locale ("en-US", one of
+    // the manifest's languages).
+    int32_t GetUserLocale(uint64_t size, uint64_t locale) {
+        static constexpr char kLocale[] = "en-US";
+        if (locale == 0) {
+            return E_INVALIDARG_HR;
+        }
+        if (size < sizeof(kLocale)) {
+            return E_NOT_SUFFICIENT_BUFFER_HR;
+        }
+        return com::write_guest(locale, kLocale, sizeof(kLocale)) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // s12: XPackageFindChunkAvailability(id, selectorCount, selectors, XPackageChunkAvailability*):
+    // every chunk is installed, so Ready (0).
+    int32_t FindChunkAvailability(uint64_t identifier, uint64_t count, uint64_t selectors,
+                                  GuestPtr<uint32_t> availability) {
+        constexpr uint32_t kReady = 0;
+        if (availability.is_null()) {
+            return E_POINTER_HR;
+        }
+        if (!selectors_ok(identifier, count, selectors)) {
+            return E_INVALIDARG_HR;
+        }
+        availability.write(kReady);
+        return S_OK_HR;
+    }
+
+    // s14: XPackageChangeChunkInstallOrder(id, selectorCount, selectors): nothing is left to install.
+    int32_t ChangeChunkInstallOrder(uint64_t identifier, uint64_t count, uint64_t selectors) {
+        return selectors_ok(identifier, count, selectors) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // s16: XPackageInstallChunksAsync(id, selectorCount, selectors, minimumUpdateIntervalMs,
+    // suppressUserConfirmation, XAsyncBlock*). Completes at once; Result hands out a monitor that
+    // reports a finished installation.
+    int32_t InstallChunksAsync(uint64_t identifier, uint64_t count, uint64_t selectors, uint64_t /*interval_ms*/,
+                               uint64_t /*suppress_ui*/, uint64_t async) {
+        if (async == 0 || !selectors_ok(identifier, count, selectors)) {
+            return E_INVALIDARG_HR;
+        }
+        return begin_ready_async(async, "XPackageInstallChunksAsync", S_OK_HR, sizeof(uint64_t),
+                                 [](uint64_t buffer) {
+                                     auto* handle = new InstallationMonitor{};
+                                     installation_monitors().add(handle);
+                                     return com::write_guest(buffer, to_guest(handle)) ? S_OK_HR : E_INVALIDARG_HR;
+                                 });
+    }
+
+    // s17: XPackageInstallChunksResult(XAsyncBlock*, XPackageInstallationMonitorHandle*).
+    int32_t InstallChunksResult(uint64_t async, uint64_t monitor) {
+        if (monitor == 0) {
+            return E_POINTER_HR;
+        }
+        com::write_guest(monitor, uint64_t{0});
+        return finish_ready_async(async, sizeof(uint64_t), monitor);
+    }
+
+    // s18: XPackageEstimateDownloadSize(id, selectorCount, selectors, uint64_t* downloadSize,
+    // bool* shouldPresentUserConfirmation): nothing to download, nothing to confirm.
+    int32_t EstimateDownloadSize(uint64_t identifier, uint64_t count, uint64_t selectors, GuestPtr<uint64_t> size,
+                                 GuestPtr<uint8_t> present_confirmation) {
+        if (size.is_null()) {
+            return E_POINTER_HR;
+        }
+        if (!selectors_ok(identifier, count, selectors)) {
+            return E_INVALIDARG_HR;
+        }
+        size.write(0);
+        if (!present_confirmation.is_null()) {
+            present_confirmation.write(0);
+        }
+        return S_OK_HR;
+    }
+
+    // s19: XPackageUninstallChunks(id, selectorCount, selectors): accepted; the installed package
+    // is read-only game data here, so nothing is removed.
+    int32_t UninstallChunks(uint64_t identifier, uint64_t count, uint64_t selectors) {
+        return selectors_ok(identifier, count, selectors) ? S_OK_HR : E_INVALIDARG_HR;
+    }
+
+    // s34: XPackageUninstallPackage(id): refused, the title's own package cannot be removed.
+    int32_t UninstallPackage(uint64_t identifier) {
+        constexpr int32_t kAccessDenied = static_cast<int32_t>(0x80070005u);
+        return identifier == 0 ? E_INVALIDARG_HR : kAccessDenied;
+    }
+
     // XPackageGetInstallationProgress(monitor, progress*): complete and launchable.
     void GetInstallationProgress(uint64_t monitor, GuestPtr<GuestInstallationProgress> progress) {
         if (!check_handle(installation_monitors(), monitor, "XPackageInstallationMonitorHandle") ||
@@ -1173,8 +1354,47 @@ class PersistentLocalStorageApi : public com::ComObject {
 public:
     static constexpr const char* kComClassName = "xgameruntime XPersistentLocalStorage";
     static constexpr char kPath[] = "T:\\userdata\\pls\\";
+    // The manifest asks for 2048 MB of persistent local storage.
+    static constexpr uint64_t kQuotaBytes = 2048ull * 1024 * 1024;
 
-    // XPersistentLocalStorageGetPath(pathSize, path, pathUsed*): size in bytes with the terminator.
+    // XPersistentLocalStorageSpaceInfo: available free, total free, used and total bytes.
+    struct SpaceInfo {
+        uint64_t available_free_bytes;
+        uint64_t total_free_bytes;
+        uint64_t used_bytes;
+        uint64_t total_bytes;
+    };
+
+    // Bytes held by files below the storage directory (the quota is measured on real contents).
+    static uint64_t used_bytes(const std::string& key = "/userdata/pls", int depth = 0) {
+        std::vector<win32::UserdataEntry> entries;
+        if (depth > 16 || win32::userdata_list_directory(key, &entries) != 0) {
+            return 0;
+        }
+        uint64_t total = 0;
+        for (const auto& entry : entries) {
+            total += entry.is_directory ? used_bytes(key + "/" + entry.name, depth + 1) : entry.size;
+        }
+        return total;
+    }
+
+    static SpaceInfo space_info() {
+        const uint64_t used = used_bytes();
+        const uint64_t free_bytes = used >= kQuotaBytes ? 0 : kQuotaBytes - used;
+        return {free_bytes, free_bytes, used, kQuotaBytes};
+    }
+
+    // s3: XPersistentLocalStorageGetPathSize(size_t* pathSize): bytes with the terminator.
+    int32_t GetPathSize(GuestPtr<uint64_t> size) {
+        if (size.is_null()) {
+            return E_POINTER_HR;
+        }
+        size.write(sizeof(kPath));
+        return S_OK_HR;
+    }
+
+    // s4: XPersistentLocalStorageGetPath(pathSize, path, pathUsed*): size in bytes with the
+    // terminator. A buffer that is too small fails with E_FAIL (the console's result).
     int32_t GetPath(uint64_t size, uint64_t path, GuestPtr<uint64_t> used) {
         constexpr uint64_t kBytes = sizeof(kPath);
         if (!used.is_null()) {
@@ -1184,11 +1404,33 @@ public:
             return E_INVALIDARG_HR;
         }
         if (size < kBytes) {
-            return E_NOT_SUFFICIENT_BUFFER_HR;
+            return com::E_FAIL_HR;
         }
         win32::userdata_create_directory("/userdata/pls");
         return com::write_guest(path, kPath, kBytes) ? S_OK_HR : E_INVALIDARG_HR;
     }
+
+    // s5: XPersistentLocalStorageGetSpaceInfo(XPersistentLocalStorageSpaceInfo*).
+    int32_t GetSpaceInfo(GuestPtr<SpaceInfo> info) {
+        if (info.is_null()) {
+            return E_POINTER_HR;
+        }
+        info.write(space_info());
+        return S_OK_HR;
+    }
+
+    // s6: XPersistentLocalStorageEnsureSpaceAsync(requestedBytes, XAsyncBlock*): granted at once
+    // when the bytes fit in what is free, otherwise it completes with E_ABORT.
+    int32_t EnsureSpaceAsync(uint64_t requested_bytes, uint64_t async) {
+        if (async == 0) {
+            return E_INVALIDARG_HR;
+        }
+        const HResult hr = requested_bytes <= space_info().available_free_bytes ? S_OK_HR : E_ABORT_HR;
+        return begin_ready_async(async, "XPersistentLocalStorageEnsureSpaceAsync", hr, 0, nullptr);
+    }
+
+    // s7: XPersistentLocalStorageEnsureSpaceResult(XAsyncBlock*).
+    int32_t EnsureSpaceResult(uint64_t async) { return finish_ready_async(async, 0, 0); }
 };
 
 // {03f0fe74-...}/{35f07670-...}: slot 4 is called through a two-argument wrapper (a preference
@@ -2257,6 +2499,14 @@ constexpr auto kPackageTable = slot_table<37>({
     {7, PK::method<&PackageApi::GetInstallationProgress>("XPackageGetInstallationProgress")},
     {9, PK::method<&PackageApi::RegisterInstallationProgressChanged>(
             "XPackageRegisterInstallationProgressChanged")},
+    {11, PK::method<&PackageApi::GetUserLocale>("XPackageGetUserLocale")},
+    {12, PK::method<&PackageApi::FindChunkAvailability>("XPackageFindChunkAvailability")},
+    {14, PK::method<&PackageApi::ChangeChunkInstallOrder>("XPackageChangeChunkInstallOrder")},
+    {16, PK::method<&PackageApi::InstallChunksAsync>("XPackageInstallChunksAsync")},
+    {17, PK::method<&PackageApi::InstallChunksResult>("XPackageInstallChunksResult")},
+    {18, PK::method<&PackageApi::EstimateDownloadSize>("XPackageEstimateDownloadSize")},
+    {19, PK::method<&PackageApi::UninstallChunks>("XPackageUninstallChunks")},
+    {34, PK::method<&PackageApi::UninstallPackage>("XPackageUninstallPackage")},
     {39, PK::method<&PackageApi::EnumeratePackages>("XPackageEnumeratePackages")},
 });
 constexpr auto kIPackage = com::declare_interface<PackageApi>("xgameruntime.XPackage", kPackageIid,
@@ -2302,8 +2552,12 @@ constexpr auto kStoreExtTable = slot_table<70>({
 constexpr auto kIStoreExt = com::declare_interface<StoreExtApi>("xgameruntime.XStoreExt", kStoreExtIid,
                                                                 kStoreExtTable.slots, {.slot_count = 96});
 using PL = M<PersistentLocalStorageApi>;
-constexpr auto kPlsTable = slot_table<2>({
+constexpr auto kPlsTable = slot_table<5>({
+    {3, PL::method<&PersistentLocalStorageApi::GetPathSize>("XPersistentLocalStorageGetPathSize")},
     {4, PL::method<&PersistentLocalStorageApi::GetPath>("XPersistentLocalStorageGetPath")},
+    {5, PL::method<&PersistentLocalStorageApi::GetSpaceInfo>("XPersistentLocalStorageGetSpaceInfo")},
+    {6, PL::method<&PersistentLocalStorageApi::EnsureSpaceAsync>("XPersistentLocalStorageEnsureSpaceAsync")},
+    {7, PL::method<&PersistentLocalStorageApi::EnsureSpaceResult>("XPersistentLocalStorageEnsureSpaceResult")},
 });
 constexpr auto kIPersistentLocalStorage = com::declare_interface<PersistentLocalStorageApi>(
     "xgameruntime.XPersistentLocalStorage", kPlsIid, kPlsTable.slots, {.slot_count = 16});

@@ -452,7 +452,14 @@ void test_query_api() {
 
     // Simple mapped slots.
     const uint64_t feature = fx.query(kFeature, kFeature);
-    CHECK((fx.vcall(feature, 3, {1}) & 0xFF) == 0);
+    // Feature availability: only served areas answer true; store, licence, streaming, thread,
+    // invite, UI and unknown ids stay false.
+    for (uint32_t id : {3u, 6u, 8u, 11u, 12u, 13u, 14u, 18u, 19u}) {
+        CHECK((fx.vcall(feature, 3, {id}) & 0xFF) == 1);
+    }
+    for (uint32_t id : {0u, 1u, 2u, 4u, 5u, 7u, 9u, 10u, 15u, 16u, 17u, 20u, 21u, 22u, 23u, 1000u}) {
+        CHECK((fx.vcall(feature, 3, {id}) & 0xFF) == 0);
+    }
     const uint64_t package = fx.query(kPackageProvider, kPackageIid);
     CHECK((fx.vcall(package, 4) & 0xFF) == 1);
     {
@@ -495,6 +502,53 @@ void test_query_api() {
         CHECK(g_record_calls == 0);
         CHECK(hr32(fx.vcall(package, 39, {0, 0, 0xABC, kRecord})) == com::E_NOTIMPL_HR);
         CHECK(hr32(fx.vcall(package, 39, {1, 0, 0xABC, 0})) == com::E_INVALIDARG_HR);
+
+        // Chunk slots: a fully installed package.
+        const uint64_t sel = fx.alloc(16);
+        const uint64_t out = fx.alloc(16);
+        CHECK(hr32(fx.vcall(package, 11, {16, out})) == 0);
+        char loc[8] = {};
+        CHECK(com::read_guest(out, loc, sizeof(loc)) && std::strcmp(loc, "en-US") == 0);
+        CHECK(hr32(fx.vcall(package, 11, {2, out})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(package, 11, {16, 0})) == com::E_INVALIDARG_HR);
+        CHECK(com::write_guest(out, uint32_t{9}));
+        CHECK(hr32(fx.vcall(package, 12, {ident, 1, sel, out})) == 0);
+        uint32_t avail = 9;
+        CHECK(com::read_guest(out, avail) && avail == 0);  // Ready
+        CHECK(hr32(fx.vcall(package, 12, {ident, 1, 0, out})) == com::E_INVALIDARG_HR);
+        CHECK(hr32(fx.vcall(package, 12, {ident, 1, sel, 0})) == com::E_POINTER_HR);
+        CHECK(hr32(fx.vcall(package, 14, {ident, 1, sel})) == 0);
+        CHECK(hr32(fx.vcall(package, 14, {ident, 1, 0})) == com::E_INVALIDARG_HR);
+        CHECK(com::write_guest(out, uint64_t{77}) && com::write_guest(out + 8, uint8_t{1}));
+        CHECK(hr32(fx.vcall(package, 18, {ident, 1, sel, out, out + 8})) == 0);
+        CHECK(load64(out) == 0);
+        uint8_t confirm = 1;
+        CHECK(com::read_guest(out + 8, confirm) && confirm == 0);
+        CHECK(hr32(fx.vcall(package, 18, {ident, 1, sel, 0, 0})) == com::E_POINTER_HR);
+        CHECK(hr32(fx.vcall(package, 19, {ident, 1, sel})) == 0);
+        CHECK(hr32(fx.vcall(package, 34, {ident})) == static_cast<int32_t>(0x80070005u));
+        {
+            // s16 / s17 install chunks: completes, hands out a finished monitor.
+            const uint64_t queue_api = fx.query(kAsyncQueue, kAsyncQueue);
+            const uint64_t qout = fx.alloc(8);
+            CHECK(hr32(fx.vcall(queue_api, 12, {0, 0, qout})) == 0);
+            const uint64_t queue = load64(qout);
+            const uint64_t block = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(package, 16, {ident, 1, sel, 5000, 0, block})) == 0);
+            g_done_block = 0;
+            CHECK((fx.vcall(queue_api, 16, {queue, 0, 0}) & 0xFF) == 1);
+            CHECK((fx.vcall(queue_api, 16, {queue, 1, 0}) & 0xFF) == 1);
+            CHECK(g_done_block == block);
+            const uint64_t mon = fx.alloc(8);
+            CHECK(hr32(fx.vcall(package, 17, {block, mon})) == 0);
+            CHECK(load64(mon) != 0);
+            const uint64_t progress = fx.alloc(24);
+            fx.vcall(package, 7, {load64(mon), progress});
+            uint8_t flags[2] = {};
+            CHECK(com::read_guest(progress + 16, flags, sizeof(flags)) && flags[0] == 1 && flags[1] == 1);
+            fx.vcall(package, 6, {load64(mon)});
+            CHECK(hr32(fx.vcall(package, 16, {ident, 1, sel, 5000, 0, 0})) == com::E_INVALIDARG_HR);
+        }
     }
     {
         // XPersistentLocalStorageGetPath(size, path, used): a /userdata overlay directory.
@@ -507,8 +561,43 @@ void test_query_api() {
         CHECK(std::strcmp(text, "T:\\userdata\\pls\\") == 0);
         playgta6::os::win32::UserdataEntry entry;
         CHECK(playgta6::os::win32::userdata_stat("/userdata/pls", &entry) == 0 && entry.is_directory);
-        CHECK(hr32(fx.vcall(pls, 4, {4, path, used})) == playgta6::os::gdk::E_NOT_SUFFICIENT_BUFFER_HR);
+        CHECK(hr32(fx.vcall(pls, 4, {4, path, used})) == com::E_FAIL_HR);
         CHECK(load64(used) == std::strlen(text) + 1);
+        // s3 path size matches.
+        CHECK(hr32(fx.vcall(pls, 3, {used})) == 0 && load64(used) == std::strlen(text) + 1);
+        CHECK(hr32(fx.vcall(pls, 3, {0})) == com::E_POINTER_HR);
+
+        // s5 space info: used from the real contents, free = quota - used.
+        const uint64_t info = fx.alloc(32);
+        const uint64_t quota = 2048ull * 1024 * 1024;
+        playgta6::os::win32::clear_userdata_overlay();
+        CHECK(hr32(fx.vcall(pls, 5, {info})) == 0);
+        CHECK(load64(info) == quota && load64(info + 8) == quota && load64(info + 16) == 0 &&
+              load64(info + 24) == quota);
+        playgta6::os::win32::userdata_create_directory("/userdata/pls");
+        playgta6::os::win32::write_userdata_file("/userdata/pls/a.bin", std::vector<uint8_t>(1000, 7));
+        CHECK(hr32(fx.vcall(pls, 5, {info})) == 0);
+        CHECK(load64(info + 16) == 1000 && load64(info) == quota - 1000 && load64(info + 24) == quota);
+        CHECK(hr32(fx.vcall(pls, 5, {0})) == com::E_POINTER_HR);
+
+        // s6 / s7 make room: granted when the bytes fit, E_ABORT otherwise.
+        const uint64_t queue_api = fx.query(kAsyncQueue, kAsyncQueue);
+        const uint64_t qout = fx.alloc(8);
+        CHECK(hr32(fx.vcall(queue_api, 12, {0, 0, qout})) == 0);
+        const uint64_t queue = load64(qout);
+        auto run = [&](uint64_t bytes) {
+            const uint64_t block = make_guest_block(fx, queue);
+            CHECK(hr32(fx.vcall(pls, 6, {bytes, block})) == 0);
+            g_done_block = 0;
+            CHECK((fx.vcall(queue_api, 16, {queue, 0, 0}) & 0xFF) == 1);
+            CHECK((fx.vcall(queue_api, 16, {queue, 1, 0}) & 0xFF) == 1);
+            CHECK(g_done_block == block);
+            return hr32(fx.vcall(pls, 7, {block}));
+        };
+        CHECK(run(quota - 1000) == 0);
+        CHECK(run(quota - 999) == playgta6::os::gdk::E_ABORT_HR);
+        CHECK(hr32(fx.vcall(pls, 6, {1, 0})) == com::E_INVALIDARG_HR);
+        playgta6::os::win32::clear_userdata_overlay();
     }
     {
         // {03f0fe74} slot 4 (XDisplayTryEnableHdrMode shape): Disabled, zeroed info.
