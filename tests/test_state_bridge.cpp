@@ -3818,6 +3818,7 @@ void test_null_storage_dispatch_dropped() {
         CHECK(d3d::RootSignature::build(rs, &root).ok());
         bridge::PipelineLayoutDesc layout;
         bridge::GroupLayoutDesc group;
+        group.content_id = 0x5EED;  // a manifest layout: lists only the bindings the shader uses
         GpuBindGroupLayoutEntry entry =
             layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::StorageTexture,
                          static_cast<uint8_t>(GpuStorageTextureAccess::WriteOnly),

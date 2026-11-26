@@ -2958,8 +2958,10 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
         }
     }
     // Writable storage bindings left null: the dispatch using this group is dropped (backlog 39).
+    // Only for translator-manifest layouts (content_id != 0), which list the bindings the shader
+    // uses: a conventional root-signature layout declares every slot, so a null there says nothing.
     pending_null_writes_ = 0;
-    for (size_t i = 0; i < entries.size() && i < group.entries.size(); ++i) {
+    for (size_t i = 0; group.header.content_id != 0 && i < entries.size() && i < group.entries.size(); ++i) {
         if (entries[i].resource_id != 0) {
             continue;
         }
