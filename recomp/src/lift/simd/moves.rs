@@ -239,6 +239,25 @@ impl FunctionLifter<'_> {
                 }
                 let src_lane = (i >> 6) & 3;
                 let dst_lane = (i >> 4) & 3;
+                // When every lane other than `dst_lane` is zeroed (e.g. `0x0E`/`0x4E`/`0x8E`/`0xCE`
+                // extracting one lane to lane 0 and zeroing the rest), `a` is completely dead and
+                // one shuffle/insert with `zeroinitializer` suffices.
+                if (zmask | (1 << dst_lane)) == 0xF {
+                    let r = match ins.op_kind(f.b) {
+                        OpKind::Register => {
+                            let b = self.xget(ins.op_register(f.b), I32)?;
+                            let mut idx = [4u32; 4];
+                            idx[dst_lane as usize] = src_lane;
+                            self.shuffle(&b, "zeroinitializer", I32, &idx)
+                        }
+                        _ => {
+                            let s = self.mem_load(ins, Ty::s(I32))?;
+                            self.insert("zeroinitializer", I32, &s, dst_lane)
+                        }
+                    };
+                    self.xset(ins.op_register(f.dst), &r, I32)?;
+                    return Ok(true);
+                }
                 let a = self.xget(ins.op_register(f.a), I32)?;
                 let mut r = match ins.op_kind(f.b) {
                     OpKind::Register => {
@@ -442,14 +461,16 @@ impl FunctionLifter<'_> {
     }
 
     /// `movmskps/movmskpd/pmovmskb`: the sign bit of every lane, zero-extended into a GPR.
+    /// Emits native Wasm SIMD128 `i{8x16,32x4,64x2}.bitmask` (1 op, 2 bytes vs 22 bytes).
     fn move_mask(&mut self, ins: &Instruction, e: Elem) -> R<()> {
-        let n = e.lanes();
-        let t = Ty::v(e).ir();
         let v = self.xget(ins.op_register(1), e)?;
-        let neg = self.val(&format!("icmp slt {t} {v}, zeroinitializer"));
-        let bits = self.val(&format!("bitcast <{n} x i1> {neg} to i{n}"));
+        let bits = self.intr(Intr::Bitmask, Ty::v(e), &[&v]);
         let dst_bits = self.op_bits(ins, 0)?;
-        let r = self.val(&format!("zext i{n} {bits} to i{dst_bits}"));
+        let r = if dst_bits > 32 {
+            self.val(&format!("zext i32 {bits} to i{dst_bits}"))
+        } else {
+            bits
+        };
         self.write_op(ins, 0, &r, dst_bits)
     }
 

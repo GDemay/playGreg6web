@@ -306,12 +306,20 @@ pub(in crate::lift) enum Intr {
     WasmDot,
     /// `llvm.wasm.avgr.unsigned.<ty>` (`i8x16.avgr_u` / `i16x8.avgr_u`).
     AvgrUnsigned,
+    /// `llvm.wasm.bitmask.<ty>` (`i8x16`/`i32x4`/`i64x2.bitmask`): lane sign bits in low `i32`.
+    Bitmask,
+    /// `llvm.wasm.extadd.pairwise.unsigned.<dst>.<src>` (`i16x8`/`i32x4.extadd_pairwise_*_u`).
+    ExtAddPairwiseUnsigned,
     /// Internal helper `@__playgta6_fma_f64` (double-precision FMA).
     FmaF64,
     /// Internal helper `@__playgta6_clmul` (carry-less multiplication).
     Clmul,
     /// The AES S-box tables.
     AesTables,
+    /// Outlined `@__playgta6_aes_sub_bytes` helper (avoids 80-op inline expansion per AES round).
+    AesSubBytes,
+    /// Outlined `@__playgta6_aes_inv_sub_bytes` helper.
+    AesInvSubBytes,
     /// Internal helper `@__playgta6_pcmpstr` (SSE4.2 string compare core).
     PcmpStr,
 }
@@ -368,9 +376,22 @@ impl Decl {
             Intr::AvgrUnsigned => {
                 return format!("llvm.wasm.avgr.unsigned.{}", self.ty.suffix());
             }
+            Intr::Bitmask => {
+                return format!("llvm.wasm.bitmask.{}", self.ty.suffix());
+            }
+            Intr::ExtAddPairwiseUnsigned => {
+                let dst = Ty::v(Elem::of_bits(self.ty.e.bits() * 2));
+                return format!(
+                    "llvm.wasm.extadd.pairwise.unsigned.{}.{}",
+                    dst.suffix(),
+                    self.ty.suffix()
+                );
+            }
             Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
             Intr::Clmul => return "__playgta6_clmul".to_string(),
             Intr::AesTables => return "__playgta6_aes_sbox".to_string(),
+            Intr::AesSubBytes => return "__playgta6_aes_sub_bytes".to_string(),
+            Intr::AesInvSubBytes => return "__playgta6_aes_inv_sub_bytes".to_string(),
             Intr::PcmpStr => return "__playgta6_pcmpstr".to_string(),
         };
         format!("llvm.{base}.{}", self.ty.suffix())
@@ -383,6 +404,8 @@ impl Decl {
                 Ty::v(Elem::of_bits(self.ty.e.bits() / 2)).ir()
             }
             Intr::WasmDot => Ty::v(Elem::I32).ir(),
+            Intr::Bitmask => "i32".to_string(),
+            Intr::ExtAddPairwiseUnsigned => Ty::v(Elem::of_bits(self.ty.e.bits() * 2)).ir(),
             _ => self.ty.ir(),
         }
     }
@@ -390,9 +413,14 @@ impl Decl {
     fn params(self) -> String {
         let t = self.ty.ir();
         match self.intr {
-            Intr::Sqrt | Intr::Rint | Intr::Floor | Intr::Ceil | Intr::Trunc | Intr::FpToSiSat(_) => {
-                t
-            }
+            Intr::Sqrt
+            | Intr::Rint
+            | Intr::Floor
+            | Intr::Ceil
+            | Intr::Trunc
+            | Intr::FpToSiSat(_)
+            | Intr::Bitmask
+            | Intr::ExtAddPairwiseUnsigned => t,
             Intr::Abs => format!("{t}, i1"),
             _ => format!("{t}, {t}"),
         }
@@ -404,6 +432,8 @@ impl Decl {
             Intr::FmaF64 => return helpers::fma_f64_ir(),
             Intr::Clmul => return helpers::CLMUL_IR.to_string(),
             Intr::AesTables => return helpers::aes_tables_ir(),
+            Intr::AesSubBytes => return helpers::aes_sub_bytes_ir(false),
+            Intr::AesInvSubBytes => return helpers::aes_sub_bytes_ir(true),
             Intr::PcmpStr => return helpers::PCMPSTR_IR.to_string(),
             _ => {}
         }
@@ -604,11 +634,13 @@ pub(super) fn reads_only_first_operand(m: Mnemonic) -> bool {
     )
 }
 
-/// Whether `ins` is a vector zeroing idiom that [`FunctionLifter::logic`] lowers directly to
-/// `zeroinitializer` without reading any vector register alloca (`pxor`/`vpxor`/`xorps`/`vxorps`/
-/// `xorpd`/`vxorpd`/`pandn`/`vpandn`/`andnps`/`vandnps`/`andnpd`/`vandnpd` with identical
-/// register sources).
-pub(super) fn is_zeroing_idiom(ins: &Instruction) -> bool {
+/// Whether `ins` is a vector constant-materialization idiom that the lifter lowers directly to
+/// `zeroinitializer` or all-ones without reading any vector register alloca:
+/// - `pxor`/`vpxor`/`xorps`/`vxorps`/`xorpd`/`vxorpd`/`pandn`/`vpandn`/`andnps`/`vandnps`/
+///   `andnpd`/`vandnpd` with identical register sources -> `0`;
+/// - `pcmpeq*`/`vpcmpeq*` with identical register sources -> `-1` (all-ones);
+/// - `pcmpgt*`/`vpcmpgt*`/`psub*`/`vpsub*`/`psadbw`/`vpsadbw` with identical register sources -> `0`.
+pub(super) fn is_const_idiom(ins: &Instruction) -> bool {
     use Mnemonic as M;
     let vex = is_vex_encoded(ins);
     let f = Form::of(vex);
@@ -626,6 +658,40 @@ pub(super) fn is_zeroing_idiom(ins: &Instruction) -> bool {
             | M::Vandnps
             | M::Andnpd
             | M::Vandnpd
+            | M::Pcmpeqb
+            | M::Vpcmpeqb
+            | M::Pcmpeqw
+            | M::Vpcmpeqw
+            | M::Pcmpeqd
+            | M::Vpcmpeqd
+            | M::Pcmpeqq
+            | M::Vpcmpeqq
+            | M::Pcmpgtb
+            | M::Vpcmpgtb
+            | M::Pcmpgtw
+            | M::Vpcmpgtw
+            | M::Pcmpgtd
+            | M::Vpcmpgtd
+            | M::Pcmpgtq
+            | M::Vpcmpgtq
+            | M::Psubb
+            | M::Vpsubb
+            | M::Psubw
+            | M::Vpsubw
+            | M::Psubd
+            | M::Vpsubd
+            | M::Psubq
+            | M::Vpsubq
+            | M::Psubsb
+            | M::Vpsubsb
+            | M::Psubsw
+            | M::Vpsubsw
+            | M::Psubusb
+            | M::Vpsubusb
+            | M::Psubusw
+            | M::Vpsubusw
+            | M::Psadbw
+            | M::Vpsadbw
     ) && ins.op_count() > f.b
         && ins.op_kind(f.a) == OpKind::Register
         && ins.op_kind(f.b) == OpKind::Register
@@ -706,7 +772,7 @@ pub(super) fn xmm_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (u16, u
         M::Vzeroupper => return (0, 0),
         _ => {}
     }
-    if is_zeroing_idiom(ins)
+    if is_const_idiom(ins)
         && ins.op_count() > 0
         && ins.op_kind(0) == OpKind::Register
     {
@@ -726,8 +792,8 @@ pub(super) fn xmm_rw_masks(ins: &Instruction, info: &InstructionInfo) -> (u16, u
         }
     }
     // Conservatively mark every explicit source vector operand (1..op_count) as read, even for
-    // dependency-breaking idioms that `iced_x86` omits from `used_registers` (such as `pcmpeqd`
-    // or `psubd` with equal operands) unless `logic()` short-circuits them above.
+    // dependency-breaking idioms that `iced_x86` omits from `used_registers`, unless
+    // `is_const_idiom` short-circuits them above.
     for i in 1..ins.op_count() {
         if ins.op_kind(i) == OpKind::Register {
             let r = ins.op_register(i);
@@ -1294,6 +1360,12 @@ impl FunctionLifter<'_> {
             self.support.insert(Support::Umul128);
             self.support
                 .insert(Support::BitIntrinsic(super::super::BitIntrinsic::Ctlz, 64));
+        }
+        if matches!(intr, Intr::AesSubBytes | Intr::AesInvSubBytes) {
+            self.support.insert(Support::Simd(Decl {
+                intr: Intr::AesTables,
+                ty: Ty::s(Elem::I64),
+            }));
         }
     }
 

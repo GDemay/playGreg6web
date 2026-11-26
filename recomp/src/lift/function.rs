@@ -744,6 +744,13 @@ pub(super) enum FlagSource {
     },
     /// Lazy `CF = ((val >> bit) & 1) != 0` (`bt`/`bts`/`btr`/`btc` with known bit index `bit < bits`).
     BitTestBit { val: String, bit: u32, bits: u32 },
+    /// `(v)(u)comis{s,d}` (`ZF/PF/CF = 111` unordered, `000` >, `001` <, `100` ==; `OF=SF=AF=0`):
+    /// every x86 condition code lowers directly to a single `fcmp` or boolean constant.
+    FloatCompare {
+        a: String,
+        b: String,
+        scalar_ty: &'static str,
+    },
 }
 
 /// See [`FunctionLifter::known`].
@@ -2575,6 +2582,19 @@ impl FunctionLifter<'_> {
                     _ => None,
                 }
             }
+            FlagSource::FloatCompare { a, b, scalar_ty } => match cc {
+                C::o | C::s | C::l => Some("false".to_string()),
+                C::no | C::ns | C::ge => Some("true".to_string()),
+                C::b => Some(self.val(&format!("fcmp ult {scalar_ty} {a}, {b}"))),
+                C::ae => Some(self.val(&format!("fcmp oge {scalar_ty} {a}, {b}"))),
+                C::e | C::le => Some(self.val(&format!("fcmp ueq {scalar_ty} {a}, {b}"))),
+                C::ne | C::g => Some(self.val(&format!("fcmp one {scalar_ty} {a}, {b}"))),
+                C::be => Some(self.val(&format!("fcmp ule {scalar_ty} {a}, {b}"))),
+                C::a => Some(self.val(&format!("fcmp ogt {scalar_ty} {a}, {b}"))),
+                C::p => Some(self.val(&format!("fcmp uno {scalar_ty} {a}, {b}"))),
+                C::np => Some(self.val(&format!("fcmp ord {scalar_ty} {a}, {b}"))),
+                C::None => None,
+            },
         }
     }
 

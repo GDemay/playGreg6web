@@ -508,20 +508,32 @@ impl FunctionLifter<'_> {
     }
 
     /// `comiss/ucomiss/comisd/ucomisd`: ZF/PF/CF = 111 unordered, 000 greater, 001 less,
-    /// 100 equal; OF, SF and AF are cleared.
+    /// 100 equal; OF, SF and AF are cleared. Guards each `fcmp` with `flag_live` and installs
+    /// `FlagSource::FloatCompare` so same-block `jcc`/`setcc`/`cmovcc` fuse to a single `fcmp`.
     fn comis(&mut self, ins: &Instruction, e: Elem) -> R<()> {
         let t = e.scalar();
         let a = self.low(ins, 0, e, 1)?;
         let b = self.low(ins, 1, e, 1)?;
-        let zf = self.val(&format!("fcmp ueq {t} {a}, {b}"));
-        let pf = self.val(&format!("fcmp uno {t} {a}, {b}"));
-        let cf = self.val(&format!("fcmp ult {t} {a}, {b}"));
-        self.set_flag(Flag::Zf, &zf);
-        self.set_flag(Flag::Pf, &pf);
-        self.set_flag(Flag::Cf, &cf);
+        if self.flag_live(Flag::Zf) {
+            let zf = self.val(&format!("fcmp ueq {t} {a}, {b}"));
+            self.set_flag(Flag::Zf, &zf);
+        }
+        if self.flag_live(Flag::Pf) {
+            let pf = self.val(&format!("fcmp uno {t} {a}, {b}"));
+            self.set_flag(Flag::Pf, &pf);
+        }
+        if self.flag_live(Flag::Cf) {
+            let cf = self.val(&format!("fcmp ult {t} {a}, {b}"));
+            self.set_flag(Flag::Cf, &cf);
+        }
         self.set_flag(Flag::Of, "false");
         self.set_flag(Flag::Sf, "false");
         self.set_flag(Flag::Af, "false");
+        self.known.flag_source = Some(super::super::FlagSource::FloatCompare {
+            a,
+            b,
+            scalar_ty: t,
+        });
         Ok(())
     }
 

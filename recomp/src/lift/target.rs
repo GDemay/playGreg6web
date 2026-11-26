@@ -10,9 +10,10 @@
 //! | `attributes #0` | wasm `target-features` (`+simd128`, atomics, bulk memory) | `uwtable "target-cpu"="<cpu>"` |
 //!
 //! The only wasm-specific constructs in lifted IR besides those lines are the `llvm.wasm.*`
-//! SIMD128 intrinsics (`swizzle`, `narrow.*`, `dot`, `avgr.unsigned.*`); a native module defines
-//! internal `@__playgta6_*` helpers with identical semantics on top of SSE2/SSSE3/SSE4.1
-//! intrinsics (or portable IR) and calls those instead.
+//! SIMD128 intrinsics (`swizzle`, `narrow.*`, `dot`, `avgr.unsigned.*`, `bitmask.*`,
+//! `extadd.pairwise.unsigned.*`); a native module defines internal `@__playgta6_*` helpers with
+//! identical semantics on top of SSE2/SSSE3/SSE4.1 intrinsics (or portable IR) and calls those
+//! instead.
 //!
 //! The wasm feature strings mean nothing to the x86 backend, so a native module drops them and
 //! names a CPU instead ([`NATIVE_DEFAULT_CPU`], `x86-64-v3` = AVX2/FMA/BMI2, which the lifted
@@ -137,6 +138,67 @@ define internal <8 x i16> @__playgta6_avgr_u_i16x8(<8 x i16> %a, <8 x i16> %b) #
   %s3 = lshr <8 x i32> %s2, <i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1, i32 1>
   %r = trunc <8 x i32> %s3 to <8 x i16>
   ret <8 x i16> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitmask.v16i8(",
+        native_call: "@__playgta6_bitmask_v16i8(",
+        native_ir: "\
+define internal i32 @__playgta6_bitmask_v16i8(<16 x i8> %v) #0 {
+  %r = call i32 @llvm.x86.sse2.pmovmskb.128(<16 x i8> %v)
+  ret i32 %r
+}
+declare i32 @llvm.x86.sse2.pmovmskb.128(<16 x i8>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitmask.v4i32(",
+        native_call: "@__playgta6_bitmask_v4i32(",
+        native_ir: "\
+define internal i32 @__playgta6_bitmask_v4i32(<4 x i32> %v) #0 {
+  %f = bitcast <4 x i32> %v to <4 x float>
+  %r = call i32 @llvm.x86.sse.movmsk.ps(<4 x float> %f)
+  ret i32 %r
+}
+declare i32 @llvm.x86.sse.movmsk.ps(<4 x float>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitmask.v2i64(",
+        native_call: "@__playgta6_bitmask_v2i64(",
+        native_ir: "\
+define internal i32 @__playgta6_bitmask_v2i64(<2 x i64> %v) #0 {
+  %f = bitcast <2 x i64> %v to <2 x double>
+  %r = call i32 @llvm.x86.sse2.movmsk.pd(<2 x double> %f)
+  ret i32 %r
+}
+declare i32 @llvm.x86.sse2.movmsk.pd(<2 x double>)
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.extadd.pairwise.unsigned.v8i16.v16i8(",
+        native_call: "@__playgta6_extadd_pairwise_u_i16x8(",
+        native_ir: "\
+define internal <8 x i16> @__playgta6_extadd_pairwise_u_i16x8(<16 x i8> %v) #0 {
+  %v16 = bitcast <16 x i8> %v to <8 x i16>
+  %lo = and <8 x i16> %v16, <i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255, i16 255>
+  %hi = lshr <8 x i16> %v16, <i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8, i16 8>
+  %r = add nuw <8 x i16> %lo, %hi
+  ret <8 x i16> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.extadd.pairwise.unsigned.v4i32.v8i16(",
+        native_call: "@__playgta6_extadd_pairwise_u_i32x4(",
+        native_ir: "\
+define internal <4 x i32> @__playgta6_extadd_pairwise_u_i32x4(<8 x i16> %v) #0 {
+  %v32 = bitcast <8 x i16> %v to <4 x i32>
+  %lo = and <4 x i32> %v32, <i32 65535, i32 65535, i32 65535, i32 65535>
+  %hi = lshr <4 x i32> %v32, <i32 16, i32 16, i32 16, i32 16>
+  %r = add nuw <4 x i32> %lo, %hi
+  ret <4 x i32> %r
 }
 ",
     },

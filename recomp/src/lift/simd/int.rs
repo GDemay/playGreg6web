@@ -385,26 +385,20 @@ impl FunctionLifter<'_> {
                 self.xset(ins.op_register(f.dst), &r, I16)?;
             }
             M::Psadbw | M::Vpsadbw => {
-                // Pure SIMD128 sum of absolute differences without scalar lane extractions:
-                // |a - b| = umax(a, b) - umin(a, b) in `<16 x i8>`, then 3-stage little-endian
-                // pairwise reduction (2 -> 4 -> 8 bytes per qword, max sum 2040 fits easily).
+                if same_reg(ins, f.a, f.b) {
+                    self.xset(ins.op_register(f.dst), "zeroinitializer", I64)?;
+                    return Ok(true);
+                }
+                // Pure SIMD128 sum of absolute differences via native pairwise widening add:
+                // |a - b| = umax(a, b) - umin(a, b), then `extadd_pairwise` (16x8 -> 8x16 -> 4x32)
+                // and final 64-bit lane fold (drops 6 vector ops + 2 18-byte constants vs bitmask).
                 let a = self.v128(ins, f.a, I8)?;
                 let b = self.v128(ins, f.b, I8)?;
                 let hi = self.intr(Intr::UMax, Ty::v(I8), &[&a, &b]);
                 let lo = self.intr(Intr::UMin, Ty::v(I8), &[&a, &b]);
                 let d = self.val(&format!("sub <16 x i8> {hi}, {lo}"));
-                let d16 = self.cast(&d, Ty::v(I8), Ty::v(I16));
-                let d16_lo = self.val(&format!("and <8 x i16> {d16}, {}", Ty::v(I16).splat("255")));
-                let d16_hi = self.val(&format!("lshr <8 x i16> {d16}, {}", Ty::v(I16).splat("8")));
-                let s16 = self.val(&format!("add nuw <8 x i16> {d16_lo}, {d16_hi}"));
-                let s32_v = self.cast(&s16, Ty::v(I16), Ty::v(I32));
-                let s32_lo = self.val(&format!(
-                    "and <4 x i32> {s32_v}, {}",
-                    Ty::v(I32).splat("65535")
-                ));
-                let s32_hi =
-                    self.val(&format!("lshr <4 x i32> {s32_v}, {}", Ty::v(I32).splat("16")));
-                let s32 = self.val(&format!("add nuw <4 x i32> {s32_lo}, {s32_hi}"));
+                let s16 = self.intr(Intr::ExtAddPairwiseUnsigned, Ty::v(I8), &[&d]);
+                let s32 = self.intr(Intr::ExtAddPairwiseUnsigned, Ty::v(I16), &[&s16]);
                 let s64_v = self.cast(&s32, Ty::v(I32), Ty::v(I64));
                 let s64_lo = self.val(&format!(
                     "and <2 x i64> {s64_v}, {}",
@@ -473,10 +467,56 @@ impl FunctionLifter<'_> {
 
     fn int_binary(&mut self, ins: &Instruction, f: Form, op: IOp, e: Elem) -> R<()> {
         let ty = Ty::v(e);
+        if same_reg(ins, f.a, f.b) {
+            match op {
+                IOp::CmpEq => {
+                    return self.xset(ins.op_register(f.dst), &ty.splat("-1"), e);
+                }
+                IOp::CmpGt | IOp::Sub | IOp::SubSatS | IOp::SubSatU => {
+                    return self.xset(ins.op_register(f.dst), "zeroinitializer", e);
+                }
+                IOp::MinS | IOp::MinU | IOp::MaxS | IOp::MaxU | IOp::Avg => {
+                    let a = self.v128(ins, f.a, e)?;
+                    return self.xset(ins.op_register(f.dst), &a, e);
+                }
+                _ => {}
+            }
+        }
+        if matches!(op, IOp::MulEvenU | IOp::MulEvenS) {
+            // Load directly as `<4 x i32>` (avoiding `<2 x i64> -> <4 x i32>` bitcast) so LLVM
+            // emits native `i64x2.extmul_low_i32x4_{u,s}` on `<4 x i32>` chains and memory loads.
+            let a32 = self.v128(ins, f.a, Elem::I32)?;
+            let same = same_reg(ins, f.a, f.b);
+            let even = super::mask(&[0, 2]);
+            let ae = self.val(&format!(
+                "shufflevector <4 x i32> {a32}, <4 x i32> poison, {even}"
+            ));
+            let (ext, mflag) = if op == IOp::MulEvenU {
+                ("zext", "nuw")
+            } else {
+                ("sext", "nsw")
+            };
+            let wa = self.val(&format!("{ext} <2 x i32> {ae} to <2 x i64>"));
+            let wb = if same {
+                wa.clone()
+            } else {
+                let b32 = self.v128(ins, f.b, Elem::I32)?;
+                let be = self.val(&format!(
+                    "shufflevector <4 x i32> {b32}, <4 x i32> poison, {even}"
+                ));
+                self.val(&format!("{ext} <2 x i32> {be} to <2 x i64>"))
+            };
+            let r = self.val(&format!("mul {mflag} <2 x i64> {wa}, {wb}"));
+            return self.xset(ins.op_register(f.dst), &r, Elem::I64);
+        }
         let t = ty.ir();
         let bt = ty.bool_ir();
         let a = self.v128(ins, f.a, e)?;
-        let b = self.v128(ins, f.b, e)?;
+        let b = if same_reg(ins, f.a, f.b) {
+            a.clone()
+        } else {
+            self.v128(ins, f.b, e)?
+        };
         let r = match op {
             IOp::Add => self.val(&format!("add {t} {a}, {b}")),
             IOp::Sub => self.val(&format!("sub {t} {a}, {b}")),
@@ -524,27 +564,7 @@ impl FunctionLifter<'_> {
                 };
                 self.shuffle(&halves[0], &halves[1], Elem::I16, &pick)
             }
-            IOp::MulEvenU | IOp::MulEvenS => {
-                // Low 32 bits of each quadword (lanes 0, 2 of `<4 x i32>`), widened and multiplied
-                // so LLVM emits native `i64x2.extmul_low_i32x4_{u,s}` instead of `i64x2.mul`.
-                let a32 = self.cast(&a, Ty::v(Elem::I64), Ty::v(Elem::I32));
-                let b32 = self.cast(&b, Ty::v(Elem::I64), Ty::v(Elem::I32));
-                let even = super::mask(&[0, 2]);
-                let ae = self.val(&format!(
-                    "shufflevector <4 x i32> {a32}, <4 x i32> poison, {even}"
-                ));
-                let be = self.val(&format!(
-                    "shufflevector <4 x i32> {b32}, <4 x i32> poison, {even}"
-                ));
-                let (ext, mflag) = if op == IOp::MulEvenU {
-                    ("zext", "nuw")
-                } else {
-                    ("sext", "nsw")
-                };
-                let wa = self.val(&format!("{ext} <2 x i32> {ae} to <2 x i64>"));
-                let wb = self.val(&format!("{ext} <2 x i32> {be} to <2 x i64>"));
-                self.val(&format!("mul {mflag} <2 x i64> {wa}, {wb}"))
-            }
+            IOp::MulEvenU | IOp::MulEvenS => unreachable!(),
             IOp::CmpEq | IOp::CmpGt => {
                 let pred = if op == IOp::CmpEq { "eq" } else { "sgt" };
                 let c = self.val(&format!("icmp {pred} {t} {a}, {b}"));
@@ -617,7 +637,9 @@ impl FunctionLifter<'_> {
                 self.val(&format!("ashr {t} {v}, {s}"))
             }
             _ => {
-                let n = self.val(&format!("select i1 {big}, i64 0, i64 {count}"));
+                // Masking mod `width` keeps the shift poison-free and lets LLVM fold the mask away
+                // completely because Wasm SIMD128 shifts inherently mask counts mod `width`.
+                let n = self.val(&format!("and i64 {count}, {}", width - 1));
                 let n = self.narrow_count(&n, e);
                 let s = self.splat_value(&n, e);
                 let op = if kind == ShiftKind::Left {
