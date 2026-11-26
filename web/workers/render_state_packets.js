@@ -2948,10 +2948,28 @@ class RenderStatePackets {
     // 'c|r:<pipeId>:<bgId>' (+ '@<dynOffsets>' when root-constant dynamic offsets are non-zero)
     // -> GPUBindGroup | null. LRU-bounded by remappedBindGroupCacheLimit.
     this.remappedBindGroups = new Map();
+    // W363: O(affected) reverse indexes for bindGroupId / pipeline invalidation.
+    this._remappedBgByBindGroupId = new Map();
+    this._remappedBgByPipelineKey = new Map();
     this.remappedBindGroupCacheLimit =
       Number.isInteger(options.remappedBindGroupCacheLimit) && options.remappedBindGroupCacheLimit > 0
         ? options.remappedBindGroupCacheLimit
         : REMAPPED_BIND_GROUP_CACHE_LIMIT;
+    // W363: Per-frame pooled v2 pass command objects (released by WgpuCommandProcessor._clearPassCommands).
+    this._vpCmdPool = [];
+    this._vpCmdPoolUsed = 0;
+    this._scCmdPool = [];
+    this._scCmdPoolUsed = 0;
+    this._bcCmdPool = [];
+    this._bcCmdPoolUsed = 0;
+    this._srCmdPool = [];
+    this._srCmdPoolUsed = 0;
+    this._sbg2CmdPool = [];
+    this._sbg2CmdPoolUsed = 0;
+    this._remappedSbgCmdPool = [];
+    this._remappedSbgCmdPoolUsed = 0;
+    this._noopGroup0CmdPool = [];
+    this._noopGroup0CmdPoolUsed = 0;
     // W186: hot-path PresentX multi-plane cache keyed by (planeTextureId, viewFormat, sampler, pipeline/layout).
     this.presentxBindGroupCache = new Map();
     this.presentxBindGroupCacheLimit =
@@ -3348,7 +3366,7 @@ class RenderStatePackets {
         const vp = decodeViewportPacket(view, offset, this._scratch.viewport);
         if (!vp) return this._count(false);
         this.processor._passCommands.push(
-          new SetViewportCommand(this, vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth)
+          this._acquireSetViewportCommand(vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth)
         );
         return this._count(true);
       }
@@ -3357,7 +3375,7 @@ class RenderStatePackets {
         const sc = decodeScissorPacket(view, offset, this._scratch.scissor);
         if (!sc) return this._count(false);
         this.processor._passCommands.push(
-          new SetScissorRectCommand(this, sc.x, sc.y, sc.width, sc.height)
+          this._acquireSetScissorRectCommand(sc.x, sc.y, sc.width, sc.height)
         );
         return this._count(true);
       }
@@ -3365,14 +3383,16 @@ class RenderStatePackets {
         if (payloadBytes < BLEND_CONSTANTS_PACKET_BYTES) return this._count(false);
         const bc = decodeBlendConstantsPacket(view, offset, this._scratch.blendConstants);
         if (!bc) return this._count(false);
-        this.processor._passCommands.push(new SetBlendConstantCommand(this, bc.r, bc.g, bc.b, bc.a));
+        this.processor._passCommands.push(
+          this._acquireSetBlendConstantCommand(bc.r, bc.g, bc.b, bc.a)
+        );
         return this._count(true);
       }
       case V2_OPCODES.SET_STENCIL_REFERENCE: {
         if (payloadBytes < STENCIL_REF_PACKET_BYTES) return this._count(false);
         const sr = decodeStencilRefPacket(view, offset, this._scratch.stencilRef);
         if (!sr) return this._count(false);
-        this.processor._passCommands.push(new SetStencilReferenceCommand(this, sr.reference));
+        this.processor._passCommands.push(this._acquireSetStencilReferenceCommand(sr.reference));
         return this._count(true);
       }
       case V2_OPCODES.CREATE_BIND_GROUP2:
@@ -3403,37 +3423,247 @@ class RenderStatePackets {
     return true;
   }
 
+  _acquireSetViewportCommand(x, y, width, height, minDepth, maxDepth) {
+    const idx = this._vpCmdPoolUsed;
+    this._vpCmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._vpCmdPool.length) {
+      cmd = this._vpCmdPool[idx];
+      cmd.x = x;
+      cmd.y = y;
+      cmd.width = width;
+      cmd.height = height;
+      cmd.minDepth = minDepth;
+      cmd.maxDepth = maxDepth;
+    } else {
+      cmd = new SetViewportCommand(this, x, y, width, height, minDepth, maxDepth);
+      this._vpCmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireSetScissorRectCommand(x, y, width, height) {
+    const idx = this._scCmdPoolUsed;
+    this._scCmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._scCmdPool.length) {
+      cmd = this._scCmdPool[idx];
+      cmd.x = x;
+      cmd.y = y;
+      cmd.width = width;
+      cmd.height = height;
+    } else {
+      cmd = new SetScissorRectCommand(this, x, y, width, height);
+      this._scCmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireSetBlendConstantCommand(r, g, b, a) {
+    const idx = this._bcCmdPoolUsed;
+    this._bcCmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._bcCmdPool.length) {
+      cmd = this._bcCmdPool[idx];
+      cmd.r = r;
+      cmd.g = g;
+      cmd.b = b;
+      cmd.a = a;
+    } else {
+      cmd = new SetBlendConstantCommand(this, r, g, b, a);
+      this._bcCmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireSetStencilReferenceCommand(reference) {
+    const idx = this._srCmdPoolUsed;
+    this._srCmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._srCmdPool.length) {
+      cmd = this._srCmdPool[idx];
+      cmd.reference = reference;
+    } else {
+      cmd = new SetStencilReferenceCommand(this, reference);
+      this._srCmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireSetBindGroup2Command(groupIndex, bindGroupId, bindGroup, bindGroupDesc, offsets) {
+    const idx = this._sbg2CmdPoolUsed;
+    this._sbg2CmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._sbg2CmdPool.length) {
+      cmd = this._sbg2CmdPool[idx];
+      cmd.groupIndex = groupIndex;
+      cmd.bindGroupId = bindGroupId;
+      cmd.bindGroup = bindGroup;
+      cmd.bindGroupDesc = bindGroupDesc;
+      cmd.offsets = offsets;
+      cmd._wgpuMeta = cmd;
+    } else {
+      cmd = new SetBindGroup2Command(this, groupIndex, bindGroupId, bindGroup, bindGroupDesc, offsets);
+      this._sbg2CmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireRemappedSetBindGroupCommand(bindGroup, bindGroupId) {
+    const idx = this._remappedSbgCmdPoolUsed;
+    this._remappedSbgCmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._remappedSbgCmdPool.length) {
+      cmd = this._remappedSbgCmdPool[idx];
+      cmd.bindGroup = bindGroup;
+      cmd.bindGroupId = bindGroupId || 0;
+    } else {
+      cmd = new RemappedSetBindGroupCommand(this, bindGroup, bindGroupId);
+      this._remappedSbgCmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _acquireNoopRenderGroup0Command(bindGroupId) {
+    const idx = this._noopGroup0CmdPoolUsed;
+    this._noopGroup0CmdPoolUsed = idx + 1;
+    let cmd;
+    if (idx < this._noopGroup0CmdPool.length) {
+      cmd = this._noopGroup0CmdPool[idx];
+      cmd.bindGroupId = bindGroupId || 0;
+    } else {
+      cmd = new NoopRenderGroup0Command(bindGroupId);
+      this._noopGroup0CmdPool.push(cmd);
+    }
+    return cmd;
+  }
+
+  _releaseFramePools() {
+    for (let i = 0; i < this._sbg2CmdPoolUsed; i += 1) {
+      const cmd = this._sbg2CmdPool[i];
+      cmd.bindGroup = null;
+      cmd.bindGroupDesc = null;
+      cmd.offsets = EMPTY_DYNAMIC_OFFSETS;
+      cmd._wgpuMeta = cmd;
+    }
+    for (let i = 0; i < this._remappedSbgCmdPoolUsed; i += 1) {
+      this._remappedSbgCmdPool[i].bindGroup = null;
+    }
+    this._vpCmdPoolUsed = 0;
+    this._scCmdPoolUsed = 0;
+    this._bcCmdPoolUsed = 0;
+    this._srCmdPoolUsed = 0;
+    this._sbg2CmdPoolUsed = 0;
+    this._remappedSbgCmdPoolUsed = 0;
+    this._noopGroup0CmdPoolUsed = 0;
+    const MAX_POOL = 2048;
+    if (this._vpCmdPool.length > MAX_POOL) this._vpCmdPool.length = MAX_POOL;
+    if (this._scCmdPool.length > MAX_POOL) this._scCmdPool.length = MAX_POOL;
+    if (this._bcCmdPool.length > MAX_POOL) this._bcCmdPool.length = MAX_POOL;
+    if (this._srCmdPool.length > MAX_POOL) this._srCmdPool.length = MAX_POOL;
+    if (this._sbg2CmdPool.length > MAX_POOL) this._sbg2CmdPool.length = MAX_POOL;
+    if (this._remappedSbgCmdPool.length > MAX_POOL) this._remappedSbgCmdPool.length = MAX_POOL;
+    if (this._noopGroup0CmdPool.length > MAX_POOL) this._noopGroup0CmdPool.length = MAX_POOL;
+  }
+
+  _parseRemappedBgKeyPipeline(key) {
+    const firstColon = key.indexOf(':');
+    if (firstColon < 0) return '';
+    const secondColon = key.indexOf(':', firstColon + 1);
+    return secondColon > firstColon ? key.slice(0, secondColon) : '';
+  }
+
+  _parseRemappedBgKeyBindGroupId(key) {
+    const at = key.indexOf('@');
+    const baseEnd = at >= 0 ? at : key.length;
+    const lastColon = key.lastIndexOf(':', baseEnd - 1);
+    if (lastColon < 0) return 0;
+    const raw = key.slice(lastColon + 1, baseEnd);
+    const num = Number(raw);
+    return Number.isNaN(num) ? raw : num;
+  }
+
+  _addRemappedBgIndexes(cacheKey, pipelineKey, bindGroupId) {
+    const bgKey = bindGroupId !== undefined ? bindGroupId : this._parseRemappedBgKeyBindGroupId(cacheKey);
+    const pKey = pipelineKey !== undefined ? pipelineKey : this._parseRemappedBgKeyPipeline(cacheKey);
+    let bgSet = this._remappedBgByBindGroupId.get(bgKey);
+    if (!bgSet) {
+      bgSet = new Set();
+      this._remappedBgByBindGroupId.set(bgKey, bgSet);
+    }
+    bgSet.add(cacheKey);
+    if (pKey) {
+      let pipeSet = this._remappedBgByPipelineKey.get(pKey);
+      if (!pipeSet) {
+        pipeSet = new Set();
+        this._remappedBgByPipelineKey.set(pKey, pipeSet);
+      }
+      pipeSet.add(cacheKey);
+    }
+  }
+
+  _removeRemappedBgFromPipelineIndex(cacheKey) {
+    const pKey = this._parseRemappedBgKeyPipeline(cacheKey);
+    if (!pKey) return;
+    const pipeSet = this._remappedBgByPipelineKey.get(pKey);
+    if (pipeSet) {
+      pipeSet.delete(cacheKey);
+      if (pipeSet.size === 0) {
+        this._remappedBgByPipelineKey.delete(pKey);
+      }
+    }
+  }
+
+  _removeRemappedBgFromBindGroupIndex(cacheKey) {
+    const bgKey = this._parseRemappedBgKeyBindGroupId(cacheKey);
+    const bgSet = this._remappedBgByBindGroupId.get(bgKey);
+    if (bgSet) {
+      bgSet.delete(cacheKey);
+      if (bgSet.size === 0) {
+        this._remappedBgByBindGroupId.delete(bgKey);
+      }
+    }
+  }
+
   _invalidateRemappedBindGroupsForPipeline(pipelineId, isCompute) {
     if (this.remappedBindGroups.size === 0) return;
-    const prefix = `${isCompute ? 'c' : 'r'}:${pipelineId}:`;
-    for (const key of this.remappedBindGroups.keys()) {
-      if (key.startsWith(prefix)) {
-        this.remappedBindGroups.delete(key);
-      }
+    const pipelineKey = `${isCompute ? 'c' : 'r'}:${pipelineId}`;
+    const keys = this._remappedBgByPipelineKey.get(pipelineKey);
+    if (!keys) return;
+    this._remappedBgByPipelineKey.delete(pipelineKey);
+    for (const key of keys) {
+      this.remappedBindGroups.delete(key);
+      this._removeRemappedBgFromBindGroupIndex(key);
     }
   }
 
   _invalidateRemappedBindGroupsForBindGroup(bindGroupId) {
     if (this.remappedBindGroups.size === 0) return;
-    const target = String(bindGroupId);
-    for (const key of this.remappedBindGroups.keys()) {
-      // Key shape: '<c|r>:<pipeId>:<bgId>[@<dynOffsets>]'.
-      const at = key.indexOf('@');
-      const base = at >= 0 ? key.slice(0, at) : key;
-      if (base.slice(base.lastIndexOf(':') + 1) === target) {
-        this.remappedBindGroups.delete(key);
-      }
+    const keys = this._remappedBgByBindGroupId.get(bindGroupId);
+    if (!keys) return;
+    this._remappedBgByBindGroupId.delete(bindGroupId);
+    for (const key of keys) {
+      this.remappedBindGroups.delete(key);
+      this._removeRemappedBgFromPipelineIndex(key);
     }
   }
 
   // LRU insert: re-inserting moves the key to the most-recently-used end; the oldest entries are
   // evicted once the cache exceeds remappedBindGroupCacheLimit.
-  _cacheRemappedBindGroup(cacheKey, bindGroup) {
-    if (this.remappedBindGroups.has(cacheKey)) this.remappedBindGroups.delete(cacheKey);
+  _cacheRemappedBindGroup(cacheKey, bindGroup, pipelineKey, bindGroupId) {
+    const existed = this.remappedBindGroups.has(cacheKey);
+    if (existed) {
+      this.remappedBindGroups.delete(cacheKey);
+    }
     this.remappedBindGroups.set(cacheKey, bindGroup);
+    if (!existed) {
+      this._addRemappedBgIndexes(cacheKey, pipelineKey, bindGroupId);
+    }
     while (this.remappedBindGroups.size > this.remappedBindGroupCacheLimit) {
       const oldest = this.remappedBindGroups.keys().next().value;
       this.remappedBindGroups.delete(oldest);
+      this._removeRemappedBgFromBindGroupIndex(oldest);
+      this._removeRemappedBgFromPipelineIndex(oldest);
       this.telemetry.remappedBindGroupEvictions += 1;
     }
   }
@@ -3453,6 +3683,9 @@ class RenderStatePackets {
       this._textureViewOwners.clear();
       this.dummies.clear();
       this.remappedBindGroups.clear();
+      this._remappedBgByBindGroupId.clear();
+      this._remappedBgByPipelineKey.clear();
+      this._releaseFramePools();
       this.emptyLayout = null;
       this.emptyFragment = null;
       this._resetPassState(null);
@@ -3731,6 +3964,9 @@ class RenderStatePackets {
     this._pipelineBglCache = new WeakMap();
     this._textureViewOwners.clear();
     this.remappedBindGroups.clear();
+    this._remappedBgByBindGroupId.clear();
+    this._remappedBgByPipelineKey.clear();
+    this._releaseFramePools();
     this.dummies.clear();
     this.emptyLayout = null;
     this.emptyFragment = null;
@@ -4620,10 +4856,11 @@ class RenderStatePackets {
     const isLiveDesc =
       effectiveBgId === 0 ||
       (bindGroupDesc && this.bindGroupDescriptors.get(effectiveBgId) === bindGroupDesc);
-    const cacheKey = `${isCompute ? 'c' : 'r'}:${pipelineId}:${effectiveBgId}${dynKey ? `@${dynKey}` : ''}`;
+    const pipelineKey = `${isCompute ? 'c' : 'r'}:${pipelineId}`;
+    const cacheKey = `${pipelineKey}:${effectiveBgId}${dynKey ? `@${dynKey}` : ''}`;
     if (isLiveDesc && this.remappedBindGroups.has(cacheKey)) {
       const cached = this.remappedBindGroups.get(cacheKey);
-      this._cacheRemappedBindGroup(cacheKey, cached);
+      this._cacheRemappedBindGroup(cacheKey, cached, pipelineKey, effectiveBgId);
       return cached ? { status: 'ok', bindGroup: cached } : { status: 'empty', bindGroup: null };
     }
 
@@ -4631,11 +4868,11 @@ class RenderStatePackets {
     try {
       autoBgl = pipeline.getBindGroupLayout(0);
     } catch (_) {
-      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null);
+      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null, pipelineKey, effectiveBgId);
       return { status: 'empty', bindGroup: null };
     }
     if (!autoBgl) {
-      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null);
+      if (isLiveDesc) this._cacheRemappedBindGroup(cacheKey, null, pipelineKey, effectiveBgId);
       return { status: 'empty', bindGroup: null };
     }
 
@@ -4849,7 +5086,7 @@ class RenderStatePackets {
     }
 
     if (isLiveDesc) {
-      this._cacheRemappedBindGroup(cacheKey, remapped);
+      this._cacheRemappedBindGroup(cacheKey, remapped, pipelineKey, effectiveBgId);
     }
     return remapped ? { status: 'ok', bindGroup: remapped } : { status: 'empty', bindGroup: null };
   }
@@ -5035,7 +5272,7 @@ class RenderStatePackets {
               );
               group0BoundForCompute = true;
               if (res.status === 'ok') {
-                ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, bindGroupId));
+                ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId));
                 continue;
               }
               if (res.status === 'empty') {
@@ -5061,11 +5298,11 @@ class RenderStatePackets {
               );
               group0BoundForRender = true;
               if (res.status === 'ok') {
-                ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, bindGroupId));
+                ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, bindGroupId));
                 continue;
               }
               if (res.status === 'empty') {
-                ensureFiltered(i).push(new NoopRenderGroup0Command(bindGroupId));
+                ensureFiltered(i).push(this._acquireNoopRenderGroup0Command(bindGroupId));
                 continue;
               }
             }
@@ -5114,9 +5351,9 @@ class RenderStatePackets {
           );
           group0BoundForRender = true;
           if (res.status === 'ok') {
-            ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, srcBgId));
+            ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId));
           } else if (res.status === 'empty') {
-            ensureFiltered(i).push(new NoopRenderGroup0Command(srcBgId));
+            ensureFiltered(i).push(this._acquireNoopRenderGroup0Command(srcBgId));
           }
         }
         if (filtered !== null) filtered.push(cmd);
@@ -5177,7 +5414,7 @@ class RenderStatePackets {
           );
           group0BoundForCompute = true;
           if (res.status === 'ok') {
-            ensureFiltered(i).push(new RemappedSetBindGroupCommand(this, res.bindGroup, srcBgId));
+            ensureFiltered(i).push(this._acquireRemappedSetBindGroupCommand(res.bindGroup, srcBgId));
           }
         }
         this.telemetry.computeDispatchCount += 1;
@@ -6425,7 +6662,7 @@ class RenderStatePackets {
     }
     const bindGroupDesc = this.bindGroupDescriptors.get(bindGroupId) || null;
     this.processor._passCommands.push(
-      new SetBindGroup2Command(this, index, bindGroupId, bindGroup, bindGroupDesc, offsets)
+      this._acquireSetBindGroup2Command(index, bindGroupId, bindGroup, bindGroupDesc, offsets)
     );
     return true;
   }

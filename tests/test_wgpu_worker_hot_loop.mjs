@@ -19,6 +19,8 @@ const {
 } = require('../web/workers/wgpu_worker.js');
 const { GpuRingBuffer } = require('../web/workers/gpu_ring.js');
 const { installRenderStatePackets } = require('../web/workers/render_state_packets.js');
+const { ShaderFallbackRouter } = require('../web/workers/shader_fallback_router.js');
+import { WgslPackCache, buildWgslPackBuffer } from '../web/workers/wgsl_pack_loader.js';
 
 const enc = new TextEncoder();
 
@@ -76,6 +78,38 @@ class PacketBuilder {
     v.setUint32(24, usage, true);
     v.setUint32(28, TEXTURE_DIMENSION.DIM_2D, true);
     return this._push(OPCODES.CREATE_TEXTURE, buf);
+  }
+
+  writeTexture(
+    textureId,
+    mipLevel,
+    originX,
+    originY,
+    originZ,
+    width,
+    height,
+    depthOrArrayLayers,
+    bytesPerRow,
+    rowsPerImage,
+    data
+  ) {
+    const src = data instanceof Uint8Array ? data : new Uint8Array(data || 0);
+    const buf = new ArrayBuffer(48 + src.byteLength);
+    const v = new DataView(buf);
+    v.setUint32(0, textureId, true);
+    v.setUint32(4, mipLevel, true);
+    v.setUint32(8, originX, true);
+    v.setUint32(12, originY, true);
+    v.setUint32(16, originZ, true);
+    v.setUint32(20, width, true);
+    v.setUint32(24, height, true);
+    v.setUint32(28, depthOrArrayLayers, true);
+    v.setUint32(32, bytesPerRow, true);
+    v.setUint32(36, rowsPerImage, true);
+    v.setUint32(40, src.byteLength, true);
+    v.setUint32(44, 0, true);
+    if (src.byteLength > 0) new Uint8Array(buf, 48).set(src);
+    return this._push(OPCODES.WRITE_TEXTURE, buf);
   }
 
   createShaderModule(id, stage, wgsl) {
@@ -848,4 +882,316 @@ test('G75: wgpu_worker cmdBuffer sub-range byteLength and recycle-cmd-buffer rou
     0,
     'SharedArrayBuffer must never emit recycle-cmd-buffer'
   );
+});
+
+test('W363: _handleWriteTexture reuses scratch descriptors with exact WebGPU args and zero stale field bleed', () => {
+  const mock = createFastMockWebGpu();
+  const captured = [];
+  const rawRefs = [];
+  mock.device.queue.writeTexture = (dst, data, dataLayout, size) => {
+    rawRefs.push({ dst, origin: dst.origin, dataLayout, size });
+    captured.push({
+      texture: dst.texture,
+      mipLevel: dst.mipLevel,
+      origin: { ...dst.origin },
+      data: new Uint8Array(data),
+      dataLayout: { ...dataLayout },
+      layoutKeys: Object.keys(dataLayout).sort(),
+      size: { ...size },
+    });
+  };
+
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    width: 1280,
+    height: 720,
+    enableStagingPool: false,
+    enableResourceReplay: false,
+    requireNonBlackFrame: false,
+  });
+
+  const texelsA = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+  const texelsB = new Uint8Array([21, 22, 23, 24, 25, 26, 27, 28]);
+  const texelsC = new Uint8Array([31, 32, 33, 34]);
+  const texelsD = new Uint8Array([41, 42, 43, 44, 45, 46, 47, 48]);
+
+  // Exercise all 4 combinations of optional (bytesPerRow, rowsPerImage) in sequence so any
+  // stale field bleed between consecutive calls is immediately caught.
+  const stream = new PacketBuilder()
+    .createTexture(10, 64, 64)
+    .createTexture(11, 32, 32)
+    // 1. Both bytesPerRow > 0 and rowsPerImage > 0
+    .writeTexture(10, 2, 4, 8, 1, 2, 2, 3, 256, 4, texelsA)
+    // 2. bytesPerRow === 0 and rowsPerImage === 0 (neither optional key may bleed!)
+    .writeTexture(11, 0, 1, 2, 0, 2, 1, 1, 0, 0, texelsB)
+    // 3. bytesPerRow > 0 only (rowsPerImage must be absent!)
+    .writeTexture(10, 1, 0, 3, 2, 1, 1, 1, 64, 0, texelsC)
+    // 4. rowsPerImage > 0 only (bytesPerRow must be absent!)
+    .writeTexture(11, 3, 5, 6, 7, 2, 1, 2, 0, 2, texelsD)
+    // 5. Back to both > 0 with different values
+    .writeTexture(10, 0, 0, 0, 0, 4, 4, 1, 16, 4, texelsA)
+    .finish();
+
+  processor.executeCommandBuffer(stream);
+
+  const tex10 = processor.textures.get(10);
+  const tex11 = processor.textures.get(11);
+  assert.equal(captured.length, 5);
+
+  // Verify exact scratch object reuse across all 5 calls (zero per-packet dst/origin/size alloc).
+  for (let i = 0; i < rawRefs.length; i += 1) {
+    assert.equal(rawRefs[i].dst, processor._wtDstScratch);
+    assert.equal(rawRefs[i].origin, processor._wtOriginScratch);
+    assert.equal(rawRefs[i].size, processor._wtSizeScratch);
+  }
+  assert.equal(rawRefs[0].dataLayout, processor._wtLayoutFullScratch);
+  assert.equal(rawRefs[1].dataLayout, processor._wtLayoutOffsetOnlyScratch);
+  assert.equal(rawRefs[2].dataLayout, processor._wtLayoutBprScratch);
+  assert.equal(rawRefs[3].dataLayout, processor._wtLayoutRpiScratch);
+  assert.equal(rawRefs[4].dataLayout, processor._wtLayoutFullScratch);
+
+  // Verify dst.texture reference is cleared after _handleWriteTexture (never retained).
+  assert.equal(processor._wtDstScratch.texture, null);
+
+  // Verify exact values & own-property shapes for every single call.
+  assert.equal(captured[0].texture, tex10);
+  assert.equal(captured[0].mipLevel, 2);
+  assert.deepEqual(captured[0].origin, { x: 4, y: 8, z: 1 });
+  assert.deepEqual(captured[0].dataLayout, { offset: 0, bytesPerRow: 256, rowsPerImage: 4 });
+  assert.deepEqual(captured[0].layoutKeys, ['bytesPerRow', 'offset', 'rowsPerImage']);
+  assert.deepEqual(captured[0].size, { width: 2, height: 2, depthOrArrayLayers: 3 });
+  assert.deepEqual(Array.from(captured[0].data), Array.from(texelsA));
+
+  assert.equal(captured[1].texture, tex11);
+  assert.equal(captured[1].mipLevel, 0);
+  assert.deepEqual(captured[1].origin, { x: 1, y: 2, z: 0 });
+  assert.deepEqual(captured[1].dataLayout, { offset: 0 });
+  assert.deepEqual(captured[1].layoutKeys, ['offset']);
+  assert.deepEqual(captured[1].size, { width: 2, height: 1, depthOrArrayLayers: 1 });
+  assert.deepEqual(Array.from(captured[1].data), Array.from(texelsB));
+
+  assert.equal(captured[2].texture, tex10);
+  assert.equal(captured[2].mipLevel, 1);
+  assert.deepEqual(captured[2].origin, { x: 0, y: 3, z: 2 });
+  assert.deepEqual(captured[2].dataLayout, { offset: 0, bytesPerRow: 64 });
+  assert.deepEqual(captured[2].layoutKeys, ['bytesPerRow', 'offset']);
+  assert.deepEqual(captured[2].size, { width: 1, height: 1, depthOrArrayLayers: 1 });
+
+  assert.equal(captured[3].texture, tex11);
+  assert.equal(captured[3].mipLevel, 3);
+  assert.deepEqual(captured[3].origin, { x: 5, y: 6, z: 7 });
+  assert.deepEqual(captured[3].dataLayout, { offset: 0, rowsPerImage: 2 });
+  assert.deepEqual(captured[3].layoutKeys, ['offset', 'rowsPerImage']);
+  assert.deepEqual(captured[3].size, { width: 2, height: 1, depthOrArrayLayers: 2 });
+
+  assert.equal(captured[4].texture, tex10);
+  assert.equal(captured[4].mipLevel, 0);
+  assert.deepEqual(captured[4].origin, { x: 0, y: 0, z: 0 });
+  assert.deepEqual(captured[4].dataLayout, { offset: 0, bytesPerRow: 16, rowsPerImage: 4 });
+  assert.deepEqual(captured[4].size, { width: 4, height: 4, depthOrArrayLayers: 1 });
+
+  // Also verify hot cmdBuffer execution in worker handler runs synchronously and returns
+  // a shared resolved Promise reference (zero per-message Promise allocation).
+  const handler = createWgpuWorkerHandler({ processor, postMessage: () => {} });
+  const framePkt = new PacketBuilder().beginFrame().present().finish();
+  const ret1 = handler.handleMessage({
+    cmdBuffer: framePkt.buffer,
+    byteLength: framePkt.byteLength,
+  });
+  assert.equal(processor.frameCount, 1, 'cmdBuffer must execute synchronously before awaiting');
+  const ret2 = handler.handleMessage({
+    cmdBuffer: framePkt.buffer,
+    byteLength: framePkt.byteLength,
+  });
+  assert.equal(processor.frameCount, 2);
+  assert.equal(ret1, ret2, 'hot sync handleMessage paths must reuse shared resolved Promise');
+});
+
+test('W363: cached ShaderFallbackRouter.getMissingShaderSummary stays accurate across mutations and preserves mutation isolation', () => {
+  let tick = 1000;
+  const router = new ShaderFallbackRouter({ now: () => ++tick });
+
+  const s0 = router.getMissingShaderSummary();
+  assert.equal(s0.totalMissingEvents, 0);
+  assert.equal(s0.uniqueMissingHashes, 0);
+  assert.equal(s0.realShaderGuard.registeredRealShaders, 0);
+  assert.equal(router._summaryCacheVersion, router._summaryVersion);
+
+  // Record missing shaders -> bumps _summaryVersion and updates cached summary immediately.
+  const vBefore = router._summaryVersion;
+  router.recordMissingShader('0x1111', 'vertex', 'not_in_pack');
+  router.recordMissingShader('0x1111', 'vertex', 'not_in_pack');
+  router.recordMissingShader('0x2222', 'fragment', 'compile_failed');
+  assert.ok(router._summaryVersion > vBefore);
+
+  const s1 = router.getMissingShaderSummary({ limit: 8 });
+  assert.equal(s1.totalMissingEvents, 3);
+  assert.equal(s1.uniqueMissingHashes, 2);
+  assert.equal(s1.countsByReason.not_in_pack, 2);
+  assert.equal(s1.countsByReason.compile_failed, 1);
+  assert.equal(s1.topMissing.length, 2);
+  assert.equal(s1.topMissing[0].hitCount, 2);
+
+  // Repeated steady-state call hits cache (version unchanged) and stays mutation-isolated.
+  const versionSteady = router._summaryVersion;
+  s1.countsByReason.not_in_pack = 9999;
+  s1.topMissing[0].hitCount = 9999;
+  const s2 = router.getMissingShaderSummary({ limit: 8 });
+  assert.equal(router._summaryVersion, versionSteady);
+  assert.equal(s2.countsByReason.not_in_pack, 2);
+  assert.equal(s2.topMissing[0].hitCount, 2);
+
+  // Filtered and limit=0 queries stay accurate on the same version.
+  const fragOnly = router.getMissingShaderSummary({ stage: 'fragment', limit: 4 });
+  assert.equal(fragOnly.topMissing.length, 1);
+  assert.equal(fragOnly.topMissing[0].stage, 'fragment');
+  assert.deepEqual(router.getMissingShaderSummary({ limit: 0 }).topMissing, []);
+
+  // Real-shader guard mutations invalidate cache cleanly.
+  router.registerRealShader('0x3333', 'fragment', '@fragment fn fs_main() -> @location(0) vec4f { return vec4f(1.0); }');
+  assert.equal(router.getMissingShaderSummary().realShaderGuard.registeredRealShaders, 1);
+  router.unregisterRealShader('0x3333', 'fragment');
+  assert.equal(router.getMissingShaderSummary().realShaderGuard.registeredRealShaders, 0);
+
+  // resetMissingTelemetry() / reset() invalidate cache cleanly.
+  router.resetMissingTelemetry();
+  const afterReset = router.getMissingShaderSummary({ limit: 8 });
+  assert.equal(afterReset.totalMissingEvents, 0);
+  assert.equal(afterReset.uniqueMissingHashes, 0);
+  assert.deepEqual(afterReset.topMissing, []);
+});
+
+test('W363: cached WgslPackCache.getStats and WgslPack.stats stay accurate across all state mutations', () => {
+  const vsCode = '@vertex fn vs_main() -> @builtin(position) vec4f { return vec4f(0.0); }';
+  const fsCode = '@fragment fn fs_main() -> @location(0) vec4f { return vec4f(1.0); }';
+  const csCode = '@compute @workgroup_size(1) fn cs_main() {}';
+  const packBuf = buildWgslPackBuffer([
+    { hash: 0xaaa1n, stage: 'vertex', wgsl: vsCode },
+    { hash: 0xaaa2n, stage: 'fragment', wgsl: fsCode },
+  ]);
+
+  const cache = new WgslPackCache({ lazyDecode: true });
+  const initial = cache.getStats();
+  assert.equal(initial.packCount, 0);
+  assert.equal(initial.shaderCount, 0);
+
+  const v0 = cache._statsVersion;
+  const pack = cache.loadPackBuffer(packBuf, 'main');
+  assert.ok(cache._statsVersion > v0);
+
+  const st1 = cache.getStats();
+  assert.equal(st1.packCount, 1);
+  assert.equal(st1.shaderCount, 2);
+  assert.equal(st1.staticShaderCount, 2);
+  assert.deepEqual(st1.stageCounts, { vertex: 1, fragment: 1, compute: 0 });
+  assert.equal(st1.packs.main.decodedCount, 0);
+
+  // Mutation isolation on cached steady-state snapshot.
+  const cachedObj = cache._cachedStats;
+  st1.stageCounts.vertex = 999;
+  st1.packs.main.decodedCount = 999;
+  const st1Again = cache.getStats();
+  assert.equal(cache._cachedStats, cachedObj, 'steady-state getStats must hit cached snapshot');
+  assert.equal(st1Again.stageCounts.vertex, 1);
+  assert.equal(st1Again.packs.main.decodedCount, 0);
+
+  // Lazy decode of static entry inside pack must invalidate cached stats via decodedCount stamp.
+  assert.equal(pack.getSource(0xaaa1n), vsCode);
+  const stAfterDecode = cache.getStats();
+  assert.equal(stAfterDecode.packs.main.decodedCount, 1);
+
+  // Compiling & caching a shader module bumps _statsVersion without re-scanning static entries.
+  const entriesVerBeforeCompile = cache._entriesVersion;
+  const mockDevice = { createShaderModule: (d) => ({ label: d.label, code: d.code }) };
+  cache.getOrCreateShaderModule(mockDevice, 0xaaa1n);
+  cache.getOrCreateShaderModule(mockDevice, 0xaaa1n);
+  assert.equal(cache._entriesVersion, entriesVerBeforeCompile);
+  const stAfterCompile = cache.getStats();
+  assert.equal(stAfterCompile.compiles, 1);
+  assert.equal(stAfterCompile.misses, 1);
+  assert.equal(stAfterCompile.hits, 1);
+  assert.equal(stAfterCompile.cachedModules, 1);
+
+  // Dynamic shader registration, pinning, unpinning, eviction, and clear all stay 100% accurate.
+  cache.registerDynamicShader(0xaaa3n, 'compute', csCode);
+  let st = cache.getStats();
+  assert.equal(st.dynamicCount, 1);
+  assert.equal(st.shaderCount, 3);
+  assert.deepEqual(st.stageCounts, { vertex: 1, fragment: 1, compute: 1 });
+
+  cache.pinHashes([0xaaa1n]);
+  assert.equal(cache.getStats().pinnedCount, 1);
+  cache.unpinHashes([0xaaa1n]);
+  assert.equal(cache.getStats().pinnedCount, 0);
+
+  cache.unregisterDynamicShader(0xaaa3n);
+  st = cache.getStats();
+  assert.equal(st.dynamicCount, 0);
+  assert.equal(st.shaderCount, 2);
+
+  cache.evict(0xaaa1n);
+  st = cache.getStats();
+  assert.equal(st.cachedModules, 0);
+  assert.equal(st.evictions, 1);
+
+  cache.clear({ resetStats: true });
+  st = cache.getStats();
+  assert.equal(st.packCount, 0);
+  assert.equal(st.shaderCount, 0);
+  assert.equal(st.hits, 0);
+});
+
+test('W363: _invalidateRemappedBindGroupsForBindGroup uses O(affected) reverse index and handles LRU eviction cleanly', () => {
+  const mock = createFastMockWebGpu();
+  const processor = new WgpuCommandProcessor(mock.device, mock.ctx, {
+    width: 1280,
+    height: 720,
+    enableResourceReplay: false,
+    requireNonBlackFrame: false,
+  });
+  const handler = installRenderStatePackets(processor, { remappedBindGroupCacheLimit: 8 });
+
+  // Populate multiple remapped bind groups across render/compute pipelines and dynamic offsets.
+  handler._cacheRemappedBindGroup('r:100:400', { id: 'r100-400' }, 'r:100', 400);
+  handler._cacheRemappedBindGroup('r:100:400@0=256', { id: 'r100-400-256' }, 'r:100', 400);
+  handler._cacheRemappedBindGroup('c:200:400', { id: 'c200-400' }, 'c:200', 400);
+  handler._cacheRemappedBindGroup('r:100:401', { id: 'r100-401' }, 'r:100', 401);
+  handler._cacheRemappedBindGroup('c:200:402@0=512', { id: 'c200-402-512' }, 'c:200', 402);
+
+  assert.equal(handler.remappedBindGroups.size, 5);
+  assert.equal(handler._remappedBgByBindGroupId.get(400).size, 3);
+  assert.equal(handler._remappedBgByPipelineKey.get('r:100').size, 3);
+
+  // Invalidating an unrelated bindGroupId is O(1) no-op and touches nothing.
+  handler._invalidateRemappedBindGroupsForBindGroup(999);
+  assert.equal(handler.remappedBindGroups.size, 5);
+
+  // Invalidating bindGroupId 400 removes all 3 affected entries across render + compute + dynOffsets.
+  handler._invalidateRemappedBindGroupsForBindGroup(400);
+  assert.equal(handler.remappedBindGroups.size, 2);
+  assert.equal(handler.remappedBindGroups.has('r:100:400'), false);
+  assert.equal(handler.remappedBindGroups.has('r:100:400@0=256'), false);
+  assert.equal(handler.remappedBindGroups.has('c:200:400'), false);
+  assert.equal(handler.remappedBindGroups.has('r:100:401'), true);
+  assert.equal(handler.remappedBindGroups.has('c:200:402@0=512'), true);
+  assert.equal(handler._remappedBgByBindGroupId.has(400), false);
+  assert.equal(handler._remappedBgByPipelineKey.get('r:100').size, 1);
+  assert.equal(handler._remappedBgByPipelineKey.get('c:200').size, 1);
+
+  // Invalidating compute pipeline 200 removes only its entries and cleans up reverse index sets.
+  handler._invalidateRemappedBindGroupsForPipeline(200, true);
+  assert.equal(handler.remappedBindGroups.size, 1);
+  assert.equal(handler.remappedBindGroups.has('c:200:402@0=512'), false);
+  assert.equal(handler._remappedBgByBindGroupId.has(402), false);
+  assert.equal(handler._remappedBgByPipelineKey.has('c:200'), false);
+  assert.equal(handler.remappedBindGroups.has('r:100:401'), true);
+
+  // Verify LRU eviction keeps both reverse indexes completely in sync (zero leaked sets).
+  for (let i = 0; i < 10; i += 1) {
+    handler._cacheRemappedBindGroup(`r:300:${500 + i}`, { id: i });
+  }
+  assert.equal(handler.remappedBindGroups.size, 8);
+  assert.equal(handler.remappedBindGroups.has('r:100:401'), false);
+  assert.equal(handler._remappedBgByBindGroupId.has(401), false);
+  assert.equal(handler._remappedBgByPipelineKey.has('r:100'), false);
+  assert.equal(handler._remappedBgByPipelineKey.get('r:300').size, 8);
 });
