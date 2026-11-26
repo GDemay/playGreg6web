@@ -1,3 +1,5 @@
+<img width="6912" height="3456" alt="Greg Theft Auto (1) (1)" src="https://github.com/user-attachments/assets/6a2c668d-ed6e-47e6-9cc9-9c1ffe108161" />
+
 # PlayGreg6Web
 
 An experimental, self-hosted project to run **an Xbox Series title** directly inside the **user's browser** via **Wasm64 + WebGPU + HTTP Range streaming** — no server-side video streaming.
