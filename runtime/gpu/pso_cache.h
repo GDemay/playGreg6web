@@ -1146,13 +1146,19 @@ private:
         uint64_t diagnostics;
     };
 
+    struct VariantIndex {
+        uint64_t state_hash;
+        const Variant* ptr;
+    };
+
     PipelineVariantState canonical_variant(const PipelineVariantState& variant) const noexcept;
 
     GraphicsPsoTranslation translation_;
     PipelineKeyOptions options_;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::vector<std::unique_ptr<Variant>> variants_;
-    size_t last_hit_ = 0;
+    std::vector<VariantIndex> variant_index_;
+    std::atomic<size_t> last_hit_{0};
 };
 
 // =====================================================================================================
