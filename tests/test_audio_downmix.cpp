@@ -1,9 +1,13 @@
 // Stereo downmix matrix of the 7.1.4 static objects, the PCM ring (wraparound, full ring, SPSC
-// threads), the period mixer and the host accessor playgta6_audio_ring().
+// threads, cache-line separation, bounds guards, stereo-frame alignment), the period mixer (circular
+// staging overflow, NaN/Inf clamping, lock-free stats) and the host accessor playgta6_audio_ring().
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -42,16 +46,24 @@ void test_matrix() {
         CHECK(near(g.left, row.l));
         CHECK(near(g.right, row.r));
     }
-    // A unit impulse on each object lands at exactly its gains, interleaved L/R.
+    // A unit impulse on each object lands at exactly its gains, interleaved L/R, accumulating on
+    // non-zero output without disturbing untouched channels on single-sided paths.
     const float mono[4] = {1.0f, 0.5f, 0.0f, -1.0f};
     for (const Row& row : rows) {
-        float out[8] = {};
+        float out[8] = {0.25f, -0.25f, 0.25f, -0.25f, 0.25f, -0.25f, 0.25f, -0.25f};
         ad::mix_object_into_stereo(row.type, mono, 4, out);
         for (int i = 0; i < 4; ++i) {
-            CHECK(near(out[2 * i], mono[i] * row.l));
-            CHECK(near(out[2 * i + 1], mono[i] * row.r));
+            CHECK(near(out[2 * i], 0.25f + mono[i] * row.l));
+            CHECK(near(out[2 * i + 1], -0.25f + mono[i] * row.r));
         }
     }
+    // Null and zero-frame guards.
+    float untouched[2] = {0.5f, -0.5f};
+    ad::mix_object_into_stereo(ad::kFrontLeft, mono, 0, untouched);
+    ad::mix_object_into_stereo(ad::kFrontLeft, nullptr, 1, untouched);
+    ad::mix_object_into_stereo(ad::kFrontRight, mono, 1, nullptr);
+    CHECK(untouched[0] == 0.5f && untouched[1] == -0.5f);
+
     // All twelve objects at unit level: L and R are symmetric.
     float sum[2] = {};
     for (uint32_t bit = 1; bit < 13; ++bit) {
@@ -60,6 +72,32 @@ void test_matrix() {
     }
     CHECK(near(sum[0], sum[1]));
     CHECK(sum[0] > 4.0f);
+}
+
+void test_abi_and_cacheline_separation() {
+    static_assert(ad::kSampleRate == 48000);
+    static_assert(ad::kChannels == 2);
+    static_assert(ad::kRingSamples == (1u << 17));
+    static_assert(offsetof(Playgta6AudioRing, base) == 0);
+    static_assert(offsetof(Playgta6AudioRing, capacity) == sizeof(uintptr_t));
+    static_assert(offsetof(Playgta6AudioRing, channels) == sizeof(uintptr_t) + 4);
+    static_assert(offsetof(Playgta6AudioRing, sample_rate) == sizeof(uintptr_t) + 8);
+
+    const Playgta6AudioRing* view = playgta6_audio_ring();
+    CHECK(view != nullptr);
+    CHECK(view->base == reinterpret_cast<uintptr_t>(ad::runtime_ring().data));
+    CHECK(view->capacity == ad::kRingSamples);
+    CHECK(view->channels == ad::kChannels);
+    CHECK(view->sample_rate == ad::kSampleRate);
+    CHECK(view->write_index_ptr == reinterpret_cast<uintptr_t>(ad::runtime_ring().write_index));
+    CHECK(view->read_index_ptr == reinterpret_cast<uintptr_t>(ad::runtime_ring().read_index));
+
+    const std::ptrdiff_t idx_delta =
+        static_cast<std::ptrdiff_t>(view->write_index_ptr) - static_cast<std::ptrdiff_t>(view->read_index_ptr);
+    CHECK(std::abs(idx_delta) >= 64);
+    CHECK((view->write_index_ptr % 64) == 0);
+    CHECK((view->read_index_ptr % 64) == 0);
+    CHECK((view->base % 64) == 0);
 }
 
 void test_ring() {
@@ -107,6 +145,196 @@ void test_ring() {
     ad::reset();
 }
 
+void test_bounds_and_corrupted_index_guards() {
+    float buf[16] = {};
+    float io[32] = {};
+    uint32_t w = 0, r = 0;
+
+    // Null pointer and invalid capacity guards.
+    ad::PcmRing bad_data{nullptr, 16, &w, &r};
+    ad::PcmRing bad_cap0{buf, 0, &w, &r};
+    ad::PcmRing bad_cap_np2{buf, 12, &w, &r};
+    ad::PcmRing bad_w{buf, 16, nullptr, &r};
+    ad::PcmRing bad_r{buf, 16, &w, nullptr};
+    ad::PcmRing good{buf, 16, &w, &r};
+    for (ad::PcmRing* p : {&bad_data, &bad_cap0, &bad_cap_np2, &bad_w, &bad_r}) {
+        CHECK(ad::ring_readable(*p) == 0);
+        CHECK(ad::ring_push(*p, io, 4) == 0);
+        CHECK(ad::ring_push_frames(*p, io, 2) == 0);
+        CHECK(ad::ring_pop(*p, io, 4) == 0);
+    }
+    CHECK(ad::ring_push(good, nullptr, 4) == 0 && w == 0);
+    CHECK(ad::ring_push(good, io, 0) == 0 && w == 0);
+    CHECK(ad::ring_push_frames(good, nullptr, 2) == 0 && w == 0);
+    CHECK(ad::ring_push_frames(good, io, 0) == 0 && w == 0);
+    CHECK(ad::ring_pop(good, nullptr, 4) == 0 && r == 0);
+    CHECK(ad::ring_pop(good, io, 0) == 0 && r == 0);
+
+    // Corrupted / desynced index delta (w - r > capacity): no unsigned underflow or OOB read.
+    w = 100;
+    r = 0;
+    CHECK(ad::ring_push(good, io, 4) == 0 && w == 100);
+    CHECK(ad::ring_push_frames(good, io, 2) == 0 && w == 100);
+    CHECK(ad::ring_readable(good) == 16);
+    CHECK(ad::ring_pop(good, io, 32) == 16 && r == 16);
+
+    // Wrapped corrupted delta (w - r = 21 > 16).
+    w = 5;
+    r = 0xFFFFFFF0u;
+    CHECK(ad::ring_push(good, io, 4) == 0 && w == 5);
+    CHECK(ad::ring_push_frames(good, io, 2) == 0 && w == 5);
+    CHECK(ad::ring_readable(good) == 16);
+    CHECK(ad::ring_pop(good, io, 32) == 16 && r == 0u);
+
+    // NaN / +Inf / -Inf clamping and lock-free stats.
+    ad::reset();
+    const ad::AudioDownmixStats s0 = ad::stats();
+    CHECK(s0.periods_flushed == 0 && s0.frames_pushed == 0 && s0.frames_dropped == 0 &&
+          s0.staged_spatial_dropped == 0 && s0.staged_render_dropped == 0 && s0.non_finite_clamped == 0);
+
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    const float dirty[8] = {qnan, inf, -inf, 2.5f, -2.5f, 0.25f, -0.5f, qnan};
+    ad::push_render_stereo(dirty, 4);
+    CHECK(ad::flush_period(4) == 4);
+
+    float out[8] = {};
+    CHECK(ad::ring_pop(ad::runtime_ring(), out, 8) == 8);
+    CHECK(out[0] == 0.0f && out[1] == 0.0f && out[2] == 0.0f && out[3] == 1.0f);
+    CHECK(out[4] == -1.0f && near(out[5], 0.25f) && near(out[6], -0.5f) && out[7] == 0.0f);
+
+    const ad::AudioDownmixStats s1 = ad::stats();
+    CHECK(s1.periods_flushed == 1);
+    CHECK(s1.frames_pushed == 4);
+    CHECK(s1.frames_dropped == 0);
+    CHECK(s1.non_finite_clamped == 4);
+
+    ad::reset();
+    const ad::AudioDownmixStats s2 = ad::stats();
+    CHECK(s2.periods_flushed == 0 && s2.frames_pushed == 0 && s2.non_finite_clamped == 0);
+}
+
+void test_stereo_frame_aligned_overrun() {
+    ad::reset();
+    ad::PcmRing& ring = ad::runtime_ring();
+
+    // Fill the ring completely, then pop an ODD number of floats (5) so free_space == 5
+    // (2 whole stereo frames + 1 stray float), with write_index even and read_index odd.
+    std::vector<float> fill(ring.capacity, 0.0f);
+    CHECK(ad::ring_push(ring, fill.data(), fill.size()) == ring.capacity);
+    float discard[5] = {};
+    CHECK(ad::ring_pop(ring, discard, 5) == 5);
+    CHECK(ad::ring_readable(ring) == ring.capacity - 5);
+    const uint32_t w_before = *ring.write_index;
+    CHECK((w_before & 1u) == 0u);
+
+    // Flush 4 stereo frames into the ring with only 5 floats free: exactly 2 whole frames (4
+    // floats) must be pushed, leaving write_index even and recording 2 dropped frames.
+    const float frames4[8] = {0.1f, -0.1f, 0.2f, -0.2f, 0.3f, -0.3f, 0.4f, -0.4f};
+    ad::push_render_stereo(frames4, 4);
+    CHECK(ad::flush_period(4) == 4);
+    CHECK((*ring.write_index - w_before) == 4u);
+    CHECK((*ring.write_index & 1u) == 0u);
+
+    const ad::AudioDownmixStats st = ad::stats();
+    CHECK(st.periods_flushed == 1);
+    CHECK(st.frames_pushed == 2);
+    CHECK(st.frames_dropped == 2);
+
+    // Drain the pre-existing filler floats and verify the 2 pushed frames kept L/R alignment.
+    std::vector<float> drain(ring.capacity - 5);
+    CHECK(ad::ring_pop(ring, drain.data(), drain.size()) == drain.size());
+    float got4[4] = {};
+    CHECK(ad::ring_pop(ring, got4, 4) == 4);
+    CHECK(near(got4[0], 0.1f) && near(got4[1], -0.1f) && near(got4[2], 0.2f) && near(got4[3], -0.2f));
+
+    // A subsequent stereo frame still lands with L in slot 0 and R in slot 1 (no channel swap).
+    const float next1[2] = {0.9f, -0.9f};
+    ad::push_render_stereo(next1, 1);
+    CHECK(ad::flush_period(1) == 1);
+    float got1[2] = {};
+    CHECK(ad::ring_pop(ring, got1, 2) == 2);
+    CHECK(near(got1[0], 0.9f) && near(got1[1], -0.9f));
+
+    // Direct ring_push_frames check: free_space == 1 fits 0 frames; free_space == 3 fits 1 frame.
+    float small_buf[8] = {};
+    uint32_t w = 7, r = 0;
+    ad::PcmRing small_ring{small_buf, 8, &w, &r};
+    CHECK(ad::ring_push_frames(small_ring, next1, 1) == 0 && w == 7);
+    r = 2;  // free_space = 8 - 5 = 3 floats -> 1 whole frame
+    CHECK(ad::ring_push_frames(small_ring, frames4, 2) == 1 && w == 9);
+    ad::reset();
+}
+
+void test_circular_staging_overflow() {
+    ad::reset();
+
+    // 1. Render staging overflow past 48,000 frames: push 30,000 + 30,000 = 60,000 frames.
+    //    Oldest 12,000 frames must be dropped; newest 48,000 frames [12000..59999] survive.
+    std::vector<float> batch(30000 * 2);
+    for (uint32_t i = 0; i < 30000; ++i) {
+        batch[2 * i] = static_cast<float>(i) / 100000.0f;
+        batch[2 * i + 1] = -static_cast<float>(i) / 100000.0f;
+    }
+    ad::push_render_stereo(batch.data(), 30000);
+    for (uint32_t i = 0; i < 30000; ++i) {
+        const uint32_t idx = 30000 + i;
+        batch[2 * i] = static_cast<float>(idx) / 100000.0f;
+        batch[2 * i + 1] = -static_cast<float>(idx) / 100000.0f;
+    }
+    ad::push_render_stereo(batch.data(), 30000);
+    CHECK(ad::stats().staged_render_dropped == 12000);
+
+    bool render_ok = true;
+    uint32_t expected_idx = 12000;
+    std::vector<float> pop_buf(480 * 2);
+    for (int p = 0; p < 100; ++p) {
+        CHECK(ad::flush_period(480) == 480);
+        CHECK(ad::ring_pop(ad::runtime_ring(), pop_buf.data(), pop_buf.size()) == pop_buf.size());
+        for (uint32_t i = 0; i < 480; ++i) {
+            const float exp = static_cast<float>(expected_idx++) / 100000.0f;
+            if (!near(pop_buf[2 * i], exp) || !near(pop_buf[2 * i + 1], -exp)) {
+                render_ok = false;
+            }
+        }
+    }
+    CHECK(render_ok && expected_idx == 60000);
+    CHECK(ad::flush_period(480) == 0);
+
+    // 2. Spatial staging overflow (also exercises >2048-frame fallback scratch and >48000 single push).
+    ad::reset();
+    std::vector<float> fl(50000), fr(50000);
+    for (uint32_t i = 0; i < 50000; ++i) {
+        fl[i] = static_cast<float>(i) / 100000.0f;
+        fr[i] = -static_cast<float>(i) / 100000.0f;
+    }
+    const uint32_t types[] = {ad::kFrontLeft, ad::kFrontRight};
+    const float* bufs[] = {fl.data(), fr.data()};
+    // Push 500 frames first (will all be dropped by the subsequent 50,000-frame push).
+    ad::push_spatial_pass(types, bufs, 2, 500);
+    ad::push_spatial_pass(types, bufs, 2, 50000);
+    // Dropped: 500 previously staged + 2000 leading frames of the 50,000 push = 2500.
+    CHECK(ad::stats().staged_spatial_dropped == 2500);
+
+    bool spatial_ok = true;
+    expected_idx = 2000;
+    // Flush using a >2048-frame period as well to exercise flush_period's fallback path.
+    std::vector<float> big_pop(4000 * 2);
+    for (int p = 0; p < 12; ++p) {
+        CHECK(ad::flush_period(4000) == 4000);
+        CHECK(ad::ring_pop(ad::runtime_ring(), big_pop.data(), big_pop.size()) == big_pop.size());
+        for (uint32_t i = 0; i < 4000; ++i) {
+            const float exp = static_cast<float>(expected_idx++) / 100000.0f;
+            if (!near(big_pop[2 * i], exp) || !near(big_pop[2 * i + 1], -exp)) {
+                spatial_ok = false;
+            }
+        }
+    }
+    CHECK(spatial_ok && expected_idx == 50000);
+    CHECK(ad::flush_period(480) == 0);
+    ad::reset();
+}
+
 void test_spsc_threads() {
     ad::reset();
     ad::PcmRing& ring = ad::runtime_ring();
@@ -130,6 +358,64 @@ void test_spsc_threads() {
     }
     producer.join();
     CHECK(ordered);
+    ad::reset();
+}
+
+void test_spsc_multithread_variable_chunks_wrap32() {
+    ad::reset();
+    ad::PcmRing& ring = ad::runtime_ring();
+    // Start 65,536 floats below 2^32 so both indices cross 0xFFFFFFFF -> 0 during the stress run.
+    constexpr uint32_t kStartIdx = 0xFFFF0000u;
+    constexpr uint32_t kTotal = 1u << 20;  // 1,048,576 floats (~8 full ring laps)
+    *ring.write_index = kStartIdx;
+    *ring.read_index = kStartIdx;
+
+    std::thread producer([&] {
+        static constexpr size_t kPushChunks[] = {1, 2, 7, 13, 64, 255, 960, 1023, 4097};
+        std::vector<float> buf(4097);
+        uint32_t sent = 0;
+        size_t step = 0;
+        while (sent < kTotal) {
+            const size_t want = std::min<size_t>(kPushChunks[step++ % 9], kTotal - sent);
+            for (size_t i = 0; i < want; ++i) {
+                buf[i] = static_cast<float>((sent + static_cast<uint32_t>(i)) & 0xFFFFu);
+            }
+            size_t offset = 0;
+            while (offset < want) {
+                const size_t pushed = ad::ring_push(ring, buf.data() + offset, want - offset);
+                offset += pushed;
+                if (pushed == 0) {
+                    std::this_thread::yield();
+                }
+            }
+            sent += static_cast<uint32_t>(want);
+        }
+    });
+
+    static constexpr size_t kPopChunks[] = {3, 5, 16, 127, 480, 1000, 3001};
+    std::vector<float> out(3001);
+    uint32_t seen = 0;
+    size_t step = 0;
+    bool ordered = true;
+    while (seen < kTotal) {
+        const size_t want = std::min<size_t>(kPopChunks[step++ % 7], kTotal - seen);
+        const size_t got = ad::ring_pop(ring, out.data(), want);
+        if (got == 0) {
+            std::this_thread::yield();
+            continue;
+        }
+        for (size_t i = 0; i < got; ++i) {
+            if (out[i] != static_cast<float>((seen + static_cast<uint32_t>(i)) & 0xFFFFu)) {
+                ordered = false;
+            }
+        }
+        seen += static_cast<uint32_t>(got);
+    }
+    producer.join();
+    CHECK(ordered);
+    CHECK(ad::ring_readable(ring) == 0);
+    CHECK(*ring.write_index == static_cast<uint32_t>(kStartIdx + kTotal));
+    CHECK(*ring.read_index == static_cast<uint32_t>(kStartIdx + kTotal));
     ad::reset();
 }
 
@@ -191,8 +477,13 @@ void test_mixer_and_accessor() {
 
 int main() {
     test_matrix();
+    test_abi_and_cacheline_separation();
     test_ring();
+    test_bounds_and_corrupted_index_guards();
+    test_stereo_frame_aligned_overrun();
+    test_circular_staging_overflow();
     test_spsc_threads();
+    test_spsc_multithread_variable_chunks_wrap32();
     test_mixer_and_accessor();
     if (g_failures != 0) {
         std::fprintf(stderr, "test_audio_downmix failed with %d failure(s)\n", g_failures);

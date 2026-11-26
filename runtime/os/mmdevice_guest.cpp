@@ -34,6 +34,7 @@
 #include "os/audio_report.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -209,6 +210,7 @@ struct StreamClock {
 };
 
 struct Sink {
+    std::atomic<bool> has_sink{false};
     std::mutex mutex;
     AudioRenderSink fn = nullptr;
     void* user = nullptr;
@@ -220,6 +222,8 @@ Sink& sink() {
 
 class Engine {
 public:
+    Engine() { tick_live_.reserve(8); }
+
     void add(const std::shared_ptr<StreamClock>& clock) {
         std::lock_guard<std::mutex> lock(mutex_);
         clocks_.push_back(clock);
@@ -232,7 +236,8 @@ public:
 
     // One period for every started stream (the thread's step; tests call it directly).
     void tick() {
-        std::vector<std::shared_ptr<StreamClock>> live;
+        std::lock_guard<std::mutex> tick_lock(tick_mutex_);
+        tick_live_.clear();
         {
             std::lock_guard<std::mutex> lock(mutex_);
             clocks_.erase(std::remove_if(clocks_.begin(), clocks_.end(),
@@ -240,12 +245,12 @@ public:
                           clocks_.end());
             for (const auto& w : clocks_) {
                 if (auto c = w.lock()) {
-                    live.push_back(std::move(c));
+                    tick_live_.push_back(std::move(c));
                 }
             }
         }
         audio_downmix::flush_period(kPeriodFrames);
-        for (const auto& c : live) {
+        for (const auto& c : tick_live_) {
             if (!c->started.load()) {
                 continue;
             }
@@ -255,6 +260,7 @@ public:
                 win32::SetEvent(static_cast<win32::Handle>(ev));
             }
         }
+        tick_live_.clear();
     }
 
     void set_manual(bool manual) {
@@ -301,8 +307,10 @@ private:
     }
 
     std::mutex mutex_;
+    std::mutex tick_mutex_;
     std::condition_variable cv_;
     std::vector<std::weak_ptr<StreamClock>> clocks_;
+    std::vector<std::shared_ptr<StreamClock>> tick_live_;
     std::thread thread_;
     bool stop_ = false;
     bool manual_ = false;
@@ -323,26 +331,33 @@ std::atomic<uint64_t> g_render_nonzero_frames{0};
 std::atomic<uint64_t> g_render_silent_releases{0};   // ReleaseBuffer with AUDCLNT_BUFFERFLAGS_SILENT
 
 bool any_nonzero(const float* p, size_t n, float* peak) {
+    if (peak == nullptr) {
+        for (size_t i = 0; i < n; ++i) {
+            const float v = p[i];
+            if (v > 0.0f || v < 0.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
     bool nz = false;
+    float max_peak = *peak;
     for (size_t i = 0; i < n; ++i) {
-        const float a = p[i] < 0 ? -p[i] : p[i];
+        const float a = p[i] < 0.0f ? -p[i] : p[i];
         if (a > 0.0f) {
             nz = true;
-            if (peak != nullptr && a > *peak) {
-                *peak = a;
+            if (a > max_peak) {
+                max_peak = a;
             }
         }
     }
+    *peak = max_peak;
     return nz;
 }
 
 // PG6_AUDIO_TRACE=1: one diagnostic line per 500 spatial passes (5 s) with what the title wrote.
 void trace_window(uint32_t objects_this_pass, float pass_peak) {
-    static const bool on = [] {
-        const char* e = std::getenv("PG6_AUDIO_TRACE");
-        return e != nullptr && e[0] == '1';
-    }();
-    if (!on) {
+    if (!audio_trace_enabled()) {
         return;
     }
     static std::mutex m;
@@ -383,17 +398,29 @@ void trace_window(uint32_t objects_this_pass, float pass_peak) {
 }
 
 void forward_samples(uint32_t object_type, const float* pcm, uint32_t frames, uint32_t channels) {
+    if (frames == 0 || pcm == nullptr) {
+        return;
+    }
     Sink& s = sink();
+    if (!s.has_sink.load(std::memory_order_acquire)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (s.fn != nullptr && frames != 0) {
+    if (s.fn != nullptr) {
         s.fn(s.user, object_type, pcm, frames, channels, kSampleRate);
     }
 }
 
-void forward_pcm(uint32_t object_type, uint64_t buffer, uint32_t frames, uint32_t channels) {
+[[maybe_unused]] void forward_pcm(uint32_t object_type, uint64_t buffer, uint32_t frames, uint32_t channels) {
+    if (buffer == 0 || frames == 0) {
+        return;
+    }
     Sink& s = sink();
+    if (!s.has_sink.load(std::memory_order_acquire)) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(s.mutex);
-    if (s.fn == nullptr || buffer == 0 || frames == 0) {
+    if (s.fn == nullptr) {
         return;
     }
     std::vector<float> pcm(static_cast<size_t>(frames) * channels);
@@ -652,16 +679,26 @@ public:
             g_render_silent_releases.fetch_add(1);
         }
         g_render_frames.fetch_add(frames);
-        forward_pcm(0, buffer, frames, 2);
         if (buffer != 0 && frames != 0) {
-            std::vector<float> stereo(static_cast<size_t>(frames) * 2);
-            if (com::read_guest(buffer, stereo.data(), stereo.size() * sizeof(float))) {
-                const bool nonzero = any_nonzero(stereo.data(), stereo.size(), nullptr);
+            const size_t samples = static_cast<size_t>(frames) * 2;
+            float stack_stereo[kRenderBufferFrames * 2];
+            float* stereo = stack_stereo;
+            std::unique_lock<std::mutex> scratch_lock;
+            if (frames > kRenderBufferFrames) {
+                scratch_lock = std::unique_lock<std::mutex>(scratch_mutex_);
+                if (stereo_scratch_.size() < samples) {
+                    stereo_scratch_.resize(samples);
+                }
+                stereo = stereo_scratch_.data();
+            }
+            if (com::read_guest(buffer, stereo, samples * sizeof(float))) {
+                forward_samples(0, stereo, frames, 2);
+                const bool nonzero = any_nonzero(stereo, samples, nullptr);
                 if (nonzero) {
                     g_render_nonzero_frames.fetch_add(frames);
                 }
                 audio_report::windows().record(frames, nonzero);
-                audio_downmix::push_render_stereo(stereo.data(), frames);
+                audio_downmix::push_render_stereo(stereo, frames);
             }
         }
         return kOk;
@@ -681,6 +718,8 @@ private:
     }
 
     std::mutex mutex_;
+    std::mutex scratch_mutex_;
+    std::vector<float> stereo_scratch_;
     std::shared_ptr<StreamClock> clock_;
     bool initialized_ = false;
     bool event_driven_ = false;
@@ -822,7 +861,10 @@ public:
             uint64_t buffer;
             float volume;
         };
-        std::vector<Written> written;
+        constexpr size_t kMaxInlineObjects = 20;  // kAnyStaticObject has 17 static bits
+        std::array<Written, kMaxInlineObjects> written_inline{};
+        std::vector<Written> written_overflow;
+        size_t written_count = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!updating_) {
@@ -831,47 +873,79 @@ public:
             updating_ = false;
             for (auto& o : objects_) {
                 if (o.handed_out && o.object->active()) {
-                    written.push_back({o.object->type(), o.buffer, o.object->volume()});
+                    const Written entry{o.object->type(), o.buffer, o.object->volume()};
+                    if (written_count < kMaxInlineObjects) {
+                        written_inline[written_count] = entry;
+                    } else {
+                        if (written_overflow.empty()) {
+                            written_overflow.assign(written_inline.begin(), written_inline.end());
+                        }
+                        written_overflow.push_back(entry);
+                    }
+                    ++written_count;
                 }
                 o.handed_out = false;
             }
         }
+        const Written* written_data = written_overflow.empty() ? written_inline.data() : written_overflow.data();
         g_spatial_passes.fetch_add(1);
-        std::vector<uint32_t> types;
-        std::vector<std::vector<float>> pcm;
+
+        std::array<uint32_t, kMaxInlineObjects> types_inline{};
+        std::array<const float*, kMaxInlineObjects> ptrs_inline{};
+        std::vector<uint32_t> types_overflow;
+        std::vector<const float*> ptrs_overflow;
+        uint32_t* types_data = types_inline.data();
+        const float** ptrs_data = ptrs_inline.data();
+        if (written_count > kMaxInlineObjects) {
+            types_overflow.resize(written_count);
+            ptrs_overflow.resize(written_count);
+            types_data = types_overflow.data();
+            ptrs_data = ptrs_overflow.data();
+        }
+
+        const bool trace_on = audio_trace_enabled();
         float pass_peak = 0.0f;
         bool pass_nonzero = false;
-        for (const auto& [type, buffer, volume] : written) {
-            std::vector<float> mono(kPeriodFrames);
-            if (buffer != 0 && com::read_guest(buffer, mono.data(), mono.size() * sizeof(float))) {
-                if (volume != 1.0f) {
-                    for (float& v : mono) {
-                        v *= volume;
+        uint32_t valid_count = 0;
+        {
+            std::lock_guard<std::mutex> scratch_lock(scratch_mutex_);
+            const size_t needed_samples = written_count * kPeriodFrames;
+            if (mono_scratch_.size() < needed_samples) {
+                mono_scratch_.resize(needed_samples);
+            }
+            for (size_t i = 0; i < written_count; ++i) {
+                const auto& [type, buffer, volume] = written_data[i];
+                float* mono = mono_scratch_.data() + static_cast<size_t>(valid_count) * kPeriodFrames;
+                if (buffer != 0 && com::read_guest(buffer, mono, kPeriodFrames * sizeof(float))) {
+                    if (volume != 1.0f) {
+                        for (uint32_t j = 0; j < kPeriodFrames; ++j) {
+                            mono[j] *= volume;
+                        }
                     }
+                    forward_samples(type, mono, kPeriodFrames, 1);
+                    g_spatial_object_buffers.fetch_add(1);
+                    if (any_nonzero(mono, kPeriodFrames, trace_on ? &pass_peak : nullptr)) {
+                        g_spatial_nonzero_buffers.fetch_add(1);
+                        pass_nonzero = true;
+                    }
+                    types_data[valid_count] = type;
+                    ptrs_data[valid_count] = mono;
+                    ++valid_count;
                 }
-                forward_samples(type, mono.data(), kPeriodFrames, 1);
-                g_spatial_object_buffers.fetch_add(1);
-                if (any_nonzero(mono.data(), mono.size(), &pass_peak)) {
-                    g_spatial_nonzero_buffers.fetch_add(1);
-                    pass_nonzero = true;
-                }
-                types.push_back(type);
-                pcm.push_back(std::move(mono));
+            }
+            // The report's non-silent fraction and windows count spatial passes like render frames:
+            // a title that only renders through static objects otherwise reports 0 frames.
+            if (pass_nonzero) {
+                g_spatial_nonzero_passes.fetch_add(1);
+            }
+            audio_report::windows().record(kPeriodFrames, pass_nonzero);
+            if (valid_count != 0) {
+                audio_downmix::push_spatial_pass(types_data, ptrs_data, valid_count, kPeriodFrames);
             }
         }
-        // The report's non-silent fraction and windows count spatial passes like render frames:
-        // a title that only renders through static objects otherwise reports 0 frames.
-        if (pass_nonzero) {
-            g_spatial_nonzero_passes.fetch_add(1);
+        if (trace_on) {
+            trace_window(valid_count, pass_peak);
         }
-        audio_report::windows().record(kPeriodFrames, pass_nonzero);
-        std::vector<const float*> ptrs;
-        for (const auto& v : pcm) {
-            ptrs.push_back(v.data());
-        }
-        audio_downmix::push_spatial_pass(types.data(), ptrs.data(), static_cast<uint32_t>(types.size()),
-                                         kPeriodFrames);
-        trace_window(static_cast<uint32_t>(types.size()), pass_peak);
         return kOk;
     }
     HResult ActivateSpatialAudioObject(uint32_t type, OutPtr out);  // 10
@@ -913,6 +987,8 @@ private:
         bool handed_out = false;
     };
     std::mutex mutex_;
+    std::mutex scratch_mutex_;
+    std::vector<float> mono_scratch_;
     std::shared_ptr<StreamClock> clock_;
     uint32_t mask_;
     bool updating_ = false;
@@ -1390,6 +1466,7 @@ void set_audio_render_sink(AudioRenderSink sink_fn, void* user) {
     std::lock_guard<std::mutex> lock(s.mutex);
     s.fn = sink_fn;
     s.user = user;
+    s.has_sink.store(sink_fn != nullptr, std::memory_order_release);
 }
 
 void set_audio_stereo_sink(AudioStereoSink sink_fn, void* user) { audio_downmix::set_stereo_sink(sink_fn, user); }
