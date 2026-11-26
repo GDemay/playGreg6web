@@ -103,6 +103,12 @@ struct FaultRecord {
     bool has_host_frames = false;
     std::vector<HostFrame> host_frames;
     std::vector<DispatchRecord> recent_dispatches;  // faulting thread, oldest first
+    // Fault record (BootConfig::fault_record): context captured with the fault.
+    uint32_t thread_id = 0;
+    uint64_t elapsed_ms = 0;
+    bool has_present = false;
+    uint64_t presents = 0;
+    uint64_t draws_per_frame = 0;
 };
 
 struct ExecRange {
@@ -245,6 +251,7 @@ struct BootState {
     uint64_t max_wall_ms = 0;
     size_t recent_capacity = 32;
     size_t max_frames = 32;
+    bool fault_record = true;  // BootConfig::fault_record
     CaptureHostStackFn capture_host_stack = nullptr;
     HostFunctionStartFn host_function_start = nullptr;
     OffThreadFaultFn off_thread_fault = nullptr;
@@ -360,7 +367,7 @@ thread_local bool t_running_boot = false;
 thread_local long t_last_import = -1;
 thread_local uint64_t t_last_import_seq = 0;
 // Ring of the last dispatched calls on this thread (fault reports).
-constexpr size_t kDispatchRing = 32;
+constexpr size_t kDispatchRing = 64;
 thread_local DispatchRecord t_dispatch_ring[kDispatchRing];
 thread_local uint64_t t_dispatch_count = 0;
 
@@ -777,7 +784,17 @@ void capture_fault(const char* kind, GuestState* state, uint64_t va, uint64_t de
         }
     }
     capture_host_frames(r);
-    const uint64_t count = std::min<uint64_t>(t_dispatch_count, kDispatchRing);
+    r.thread_id = t_active != nullptr ? t_active->thread_id : 0;
+    r.elapsed_ms = elapsed_ms();
+    if (b.fault_record) {
+        std::unique_lock<std::mutex> lock(b.mutex, std::try_to_lock);
+        if (lock.owns_lock() && b.present_samples.total() != 0) {
+            r.has_present = true;
+            r.presents = b.present_samples.total();
+            r.draws_per_frame = b.present_samples.last().draws;
+        }
+    }
+    const uint64_t count = b.fault_record ? std::min<uint64_t>(t_dispatch_count, kDispatchRing) : 0;
     for (uint64_t k = t_dispatch_count - count; k < t_dispatch_count; ++k) {
         r.recent_dispatches.push_back(t_dispatch_ring[k % kDispatchRing]);
     }
@@ -985,7 +1002,13 @@ void boot_dispatch_observer(GuestState* state, uint64_t target) {
     }
     const uint64_t n = b.dispatches.fetch_add(1, std::memory_order_relaxed) + 1;
     {
-        DispatchRecord& d = t_dispatch_ring[t_dispatch_count++ % kDispatchRing];
+        // With the fault record off only the latest slot is kept (event-trace caller / import
+        // return address), so the write cost stays one slot.
+        if (!b.fault_record) {
+            t_dispatch_count = 1;
+        }
+        DispatchRecord& d = b.fault_record ? t_dispatch_ring[t_dispatch_count++ % kDispatchRing]
+                                           : t_dispatch_ring[0];
         d.target = target;
         d.rcx = state->gpr[GuestReg::Rcx];
         d.rdx = state->gpr[GuestReg::Rdx];
@@ -1698,6 +1721,160 @@ std::string tls_json(const ModuleState& m) {
     return o + "}";
 }
 
+// Nearest named export of a loaded module at or below `va` (fault record only; reads the mapped
+// export directory). Returns false when no module covers `va` or none of its exports precedes it.
+struct ExportHit {
+    std::string module;
+    std::string name;
+    uint64_t address = 0;
+};
+
+bool nearest_export(uint64_t va, ExportHit& out) {
+    BootState& b = boot();
+    if (b.arena == nullptr) {
+        return false;
+    }
+    VirtualMemoryArena& arena = *b.arena;
+    for (const ModuleState& m : b.modules) {
+        const uint64_t base = m.image.base;
+        if (!m.loaded || base == 0 || va < base || va - base >= m.image.size_of_image) {
+            continue;
+        }
+        uint32_t lfanew = 0;
+        uint8_t nt[0x90];
+        if (!arena.read(base + 0x3C, &lfanew, sizeof(lfanew)) || lfanew > 0x1000 ||
+            !arena.read(base + lfanew, nt, sizeof(nt))) {
+            return false;
+        }
+        uint32_t sig = 0;
+        std::memcpy(&sig, nt, 4);
+        uint16_t magic = 0;
+        std::memcpy(&magic, nt + 0x18, 2);
+        if (sig != 0x4550 || magic != 0x20B) {
+            return false;
+        }
+        uint32_t dir_rva = 0;
+        uint32_t dir_size = 0;
+        std::memcpy(&dir_rva, nt + 0x18 + 0x70, 4);
+        std::memcpy(&dir_size, nt + 0x18 + 0x74, 4);
+        uint32_t ed[10];
+        if (dir_rva == 0 || dir_size == 0 || !arena.read(base + dir_rva, ed, sizeof(ed))) {
+            return false;
+        }
+        const uint32_t n_funcs = ed[5];
+        const uint32_t n_names = ed[6];
+        const uint32_t funcs = ed[7];
+        const uint32_t names = ed[8];
+        const uint32_t ords = ed[9];
+        if (n_names > 200000 || n_funcs > 200000) {
+            return false;
+        }
+        const uint64_t rva = va - base;
+        uint64_t best_rva = 0;
+        std::string best_name;
+        for (uint32_t i = 0; i < n_names; ++i) {
+            uint32_t name_rva = 0;
+            uint16_t ord = 0;
+            uint32_t func_rva = 0;
+            if (!arena.read(base + names + 4ULL * i, &name_rva, 4) ||
+                !arena.read(base + ords + 2ULL * i, &ord, 2) || ord >= n_funcs ||
+                !arena.read(base + funcs + 4ULL * ord, &func_rva, 4)) {
+                continue;
+            }
+            if (func_rva > rva || func_rva < best_rva || (func_rva >= dir_rva && func_rva < dir_rva + dir_size)) {
+                continue;  // above va, worse than the best, or a forwarder string
+            }
+            char name[128] = {};
+            if (!arena.read(base + name_rva, name, sizeof(name) - 1)) {
+                continue;
+            }
+            best_rva = func_rva;
+            best_name = name;
+        }
+        if (best_name.empty()) {
+            return false;
+        }
+        out.module = m.name;
+        out.name = best_name;
+        out.address = base + best_rva;
+        return true;
+    }
+    return false;
+}
+
+// {"address", "entry", "offset", "symbol": {module, name, offset} | null} for a code address
+// (null when no lifted function precedes it and no export either).
+std::string code_location_json(uint64_t va) {
+    const uint64_t entry = nearest_entry(va);
+    ExportHit sym;
+    const bool has_sym = nearest_export(va, sym);
+    if (entry == 0 && !has_sym) {
+        return "null";
+    }
+    std::string o = "{\"address\": " + hex(va) + ", \"entry\": " + (entry != 0 ? hex(entry) : std::string("null")) +
+                    ", \"offset\": " + (entry != 0 ? hex(va - entry) : std::string("null")) + ", \"symbol\": ";
+    if (has_sym) {
+        o += "{\"module\": " + json_string(sym.module) + ", \"name\": " + json_string(sym.name) +
+             ", \"offset\": " + hex(va - sym.address) + "}";
+    } else {
+        o += "null";
+    }
+    return o + "}";
+}
+
+// The compact fault record (BootConfig::fault_record): everything needed to triage a recompiler
+// gap from the report alone. Consumed by tools/fault_report.py.
+std::string fault_record_json(const FaultRecord& f) {
+    const GuestState* regs = f.has_registers ? &f.registers : nullptr;
+    const bool code_miss = f.kind == "unknown_target" || f.kind == "unknown_resume_target" || f.kind == "trap";
+    std::string o = "{\"kind\": " + json_string(f.kind) + ", \"code_miss\": " + (code_miss ? "true" : "false") +
+                    ", \"thread\": " + std::to_string(f.thread_id) +
+                    ", \"elapsed_ms\": " + std::to_string(f.elapsed_ms) +
+                    ", \"rip\": " + (regs != nullptr ? hex(regs->rip) : std::string("null")) +
+                    ", \"target\": " + hex(f.va) + ", \"detail\": " + hex(f.detail) + ", \"present\": " +
+                    (f.has_present ? "{\"presents\": " + std::to_string(f.presents) +
+                                         ", \"draws_per_frame\": " + std::to_string(f.draws_per_frame) + "}"
+                                   : std::string("null")) +
+                    ", \"function\": " + code_location_json(f.va);
+    // Source of an indirect miss: the call site's return address of the faulting dispatch.
+    std::string source = "null";
+    if (f.kind == "unknown_target") {
+        for (size_t i = f.recent_dispatches.size(); i-- > 0;) {
+            if (f.recent_dispatches[i].target == f.va) {
+                source = "{\"return_address\": " + hex(f.recent_dispatches[i].return_address) +
+                         ", \"location\": " + code_location_json(f.recent_dispatches[i].return_address) + "}";
+                break;
+            }
+        }
+    } else if (f.kind == "unknown_resume_target" && regs != nullptr) {
+        source = "{\"resume_rip\": " + hex(regs->resume_rip) +
+                 ", \"location\": " + code_location_json(regs->resume_rip) + "}";
+    }
+    o += ", \"source\": " + source;
+    o += ", \"registers\": ";
+    if (regs != nullptr) {
+        o += "{";
+        for (unsigned i = 0; i < 16; ++i) {
+            o += (i == 0 ? "" : ", ") + json_string(kGprNames[i]) + ": " + hex(regs->gpr[i]);
+        }
+        o += "}";
+    } else {
+        o += "null";
+    }
+    o += ", \"call_stack\": {\"method\": " + json_string(f.backtrace_method) + ", \"frames\": [";
+    for (size_t i = 0; i < f.frames.size(); ++i) {
+        o += (i == 0 ? "" : ", ") + code_location_json(f.frames[i].return_address);
+    }
+    o += "]}, \"recent_entries\": [";
+    for (size_t i = 0; i < f.recent_dispatches.size(); ++i) {
+        const DispatchRecord& d = f.recent_dispatches[i];
+        const std::string label = dispatch_label(d.target);
+        o += (i == 0 ? "" : ", ") + std::string("{\"target\": ") + hex(d.target) + ", \"name\": " +
+             (label.empty() ? std::string("null") : json_string(label)) + ", \"from\": " + hex(d.return_address) + "}";
+    }
+    return o + "]}";
+}
+
 std::string build_report() {
     BootState& b = boot();
     const ModuleState* exe = b.modules.empty() ? nullptr : &b.modules.front();
@@ -1739,6 +1916,9 @@ std::string build_report() {
         o += ", \"guest_address\": " + (f.has_host ? hex_or_null(host_to_guest(f.host_address)) : std::string("null"));
         o += ", \"host_pc\": " + (f.has_host ? hex(f.host_pc) : std::string("null"));
         o += "},\n";
+        if (b.fault_record) {
+            o += "  \"fault_record\": " + fault_record_json(f) + ",\n";
+        }
     } else {
         o += "  \"fault\": null,\n";
     }
@@ -2349,6 +2529,25 @@ void log_trap() {
     }
     text += " (" + f.kind + ", " + function_text(f.va) + ")";
     logf("%s", text.c_str());
+    if (b.fault_record) {
+        // One compact line next to the trap line; tools/fault_report.py prints the full record.
+        ExportHit sym;
+        const bool has_sym = nearest_export(f.va, sym);
+        char line[512];
+        std::snprintf(line, sizeof(line),
+                      "[fault] %s rip=0x%" PRIx64 " target=0x%" PRIx64 " fn=%s%s%s thread=%u t=%" PRIu64 "ms",
+                      f.kind.c_str(), f.has_registers ? f.registers.rip : uint64_t{0}, f.va,
+                      function_text(f.va).c_str(), has_sym ? " sym=" : "", has_sym ? sym.name.c_str() : "",
+                      f.thread_id, f.elapsed_ms);
+        std::string out = line;
+        if (f.has_present) {
+            out += " presents=" + std::to_string(f.presents) + " draws/frame=" + std::to_string(f.draws_per_frame);
+        }
+        if (!f.frames.empty()) {
+            out += " caller=" + function_text(f.frames.front().return_address);
+        }
+        logf("%s", out.c_str());
+    }
 }
 
 void finish_report() {
@@ -3033,6 +3232,7 @@ BootResult run_boot(const BootConfig& config) {
     b.max_wall_ms = config.max_wall_ms;
     b.recent_capacity = config.recent_import_count;
     b.max_frames = config.max_backtrace_frames;
+    b.fault_record = config.fault_record;
     b.capture_host_stack = config.capture_host_stack;
     b.trace_limit = config.import_trace_limit;
     b.previous_arena_observer = os::set_arena_observer(&boot_arena_observer);

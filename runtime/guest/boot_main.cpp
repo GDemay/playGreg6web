@@ -211,6 +211,7 @@ struct Options {
     bool tls_callbacks = true;
     bool entry = true;
     bool quiet = false;
+    bool fault_record = true;    // --no-fault-record: no fault_record / entry ring (benchmarks)
     bool present_pacing = true;  // O36: --no-present-pacing turns it off (benchmarks)
 };
 
@@ -224,7 +225,7 @@ void usage() {
                  "                     [--cmdline <text>] [--survey] [--max-calls N] [--max-ms N]\n"
                  "                     [--watchdog-ms N] [--stack BYTES] [--host-stack-mb N]\n"
                  "                     [--report <file>] [--summary <file>] [--no-tls-callbacks]\n"
-                 "                     [--no-entry] [--quiet] [--no-present-pacing] [--no-xmem-shared-pages]\n"
+                 "                     [--no-entry] [--quiet] [--no-fault-record] [--no-present-pacing] [--no-xmem-shared-pages]\n"
                  "                     [--gpu-capture <file> [--gpu-capture-frames N] [--gpu-capture-payloads]\n"
                  "                      [--gpu-capture-start-ms N | --gpu-capture-start-at-script]]\n"
                  "                     [--native-pipelines] [--fence-lag] [--eager-gpu-objects]\n"
@@ -262,6 +263,8 @@ bool parse(int argc, char** argv, Options& o) {
             o.entry = false;
         } else if (a == "--quiet") {
             o.quiet = true;
+        } else if (a == "--no-fault-record") {
+            o.fault_record = false;
         } else if (a == "--no-present-pacing") {
             o.present_pacing = false;
         } else if (a == "--no-xmem-shared-pages") {
@@ -948,6 +951,7 @@ void run_boot_thread() {
     cfg.run_tls_callbacks = g_options.tls_callbacks;
     cfg.call_entry = g_options.entry;
     cfg.log_progress = !g_options.quiet;
+    cfg.fault_record = g_options.fault_record;
     cfg.capture_host_stack = &capture_host_stack;
     cfg.import_trace_limit = g_options.import_trace.empty() ? 0 : g_options.import_trace_limit;
     cfg.arena_log_limit = static_cast<size_t>(g_options.arena_log_limit);

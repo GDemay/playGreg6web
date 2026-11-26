@@ -984,6 +984,32 @@ void test_fault_reports() {
         CHECK(misses["unknown_resume_target"]["count"].number == 0);
         CHECK(misses["trap"]["targets"].items.empty());
     }
+    {
+        // Fault record: rip/target, containing function, indirect source, entry ring, register snapshot.
+        const Json& fr = run.report["fault_record"];
+        CHECK(fr["kind"].text == "unknown_target");
+        CHECK(fr["code_miss"].boolean);
+        CHECK(fr["target"].hex() == kUnknownInsideEntry);
+        CHECK(fr["rip"].hex() == kUnknownInsideEntry);
+        CHECK(fr["function"]["entry"].hex() == kEntry);
+        CHECK(fr["function"]["offset"].hex() == kUnknownInsideEntry - kEntry);
+        CHECK(fr["source"]["return_address"].hex() == kEntryCallsIat);
+        CHECK(fr["source"]["location"]["entry"].hex() == kEntry);
+        CHECK(!fr["registers"]["rsp"].text.empty());
+        CHECK(fr["elapsed_ms"].type == Json::Number);
+        CHECK(!fr["recent_entries"].items.empty());
+        const Json& last = fr["recent_entries"][fr["recent_entries"].items.size() - 1];
+        CHECK(last["target"].hex() == kUnknownInsideEntry);
+        CHECK(last["from"].hex() == kEntryCallsIat);
+        CHECK(!fr["call_stack"]["frames"].items.empty());
+    }
+    // Toggled off: no record and no entry ring in the report.
+    {
+        const Run off = boot_scenario(Scenario::UnknownTarget, [](BootConfig& c) { c.fault_record = false; });
+        CHECK(off.report["fault_record"].type == Json::Null);
+        CHECK(off.report["recent_dispatches"].items.empty());
+        CHECK(off.report["code_misses"]["unknown_target"]["count"].number == 1);
+    }
     // (the synthetic unwind info describes the Trap scenario's frames; only the caller is exact here)
     CHECK(!run.report["backtrace"]["frames"].items.empty());
     CHECK(run.report["backtrace"]["frames"][0]["return_address"].hex() == kEntryCallsIat);
