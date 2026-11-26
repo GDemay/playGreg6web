@@ -108,6 +108,7 @@ impl FunctionLifter<'_> {
         let step = self.val(&format!("select i1 {df}, i64 {}, i64 {k}", -i64::from(k)));
 
         if repeat == Repeat::Once {
+            self.clear_window_cache();
             return self.string_step(op, bits, &step, segment);
         }
 

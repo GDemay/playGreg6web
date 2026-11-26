@@ -418,6 +418,15 @@ pub(super) struct Regs {
     half: u32,
     /// Whether the current instruction is a 256-bit one lifted per 128-bit lane.
     wide: bool,
+    /// R58: cached `(lo, hi)` `<2 x i64>` halves of a single 32-byte AVX memory load for the
+    /// instruction currently being lifted, avoiding two separate 16-byte window-checked loads.
+    mem32: Option<(String, String)>,
+}
+
+impl Regs {
+    pub(super) fn clear_mem32(&mut self) {
+        self.mem32 = None;
+    }
 }
 
 /// Records the vector registers an instruction uses (`reg` from its used-register info).
@@ -590,11 +599,29 @@ impl FunctionLifter<'_> {
 
     /// Guest address of the memory operand plus `offset` bytes.
     fn mem_ea_at(&mut self, ins: &Instruction, offset: u64) -> R<String> {
-        let mut ea = self.mem_ea(ins)?;
-        if offset != 0 {
-            ea = self.val(&format!("add i64 {ea}, {offset}"));
-        }
-        Ok(ea)
+        let ea = self.mem_ea(ins)?;
+        Ok(self.offset_addr(&ea, offset))
+    }
+
+    /// R58: loads a 32-byte AVX memory operand once as `<4 x i64>`, caches both `<2 x i64>`
+    /// halves for the current instruction, and returns lane `half` cast to `ty`.
+    fn load_mem32_half(&mut self, ins: &Instruction, half: u32, ty: Ty) -> R<String> {
+        let (lo, hi) = if let Some(pair) = &self.simd.mem32 {
+            pair.clone()
+        } else {
+            let ea = self.mem_ea(ins)?;
+            let full = self.guest_load(&ea, "<4 x i64>", 32);
+            let lo = self.val(&format!(
+                "shufflevector <4 x i64> {full}, <4 x i64> poison, <2 x i32> <i32 0, i32 1>"
+            ));
+            let hi = self.val(&format!(
+                "shufflevector <4 x i64> {full}, <4 x i64> poison, <2 x i32> <i32 2, i32 3>"
+            ));
+            self.simd.mem32 = Some((lo.clone(), hi.clone()));
+            (lo, hi)
+        };
+        let raw = if half == 0 { lo } else { hi };
+        Ok(self.cast(&raw, Ty::v(Elem::I64), ty))
     }
 
     /// Byte offset of the current lane's part of the memory operand, checking its size: `bytes`
@@ -620,9 +647,13 @@ impl FunctionLifter<'_> {
 
     /// Loads a value of type `ty` from the memory operand (the current lane's part of it).
     fn mem_load(&mut self, ins: &Instruction, ty: Ty) -> R<String> {
-        let offset = self.mem_part(ins, Self::ty_bytes(ty))?;
+        let bytes = Self::ty_bytes(ty);
+        let offset = self.mem_part(ins, bytes)?;
+        if self.simd.wide && bytes == 16 && Self::mem_bytes(ins) == 32 {
+            return self.load_mem32_half(ins, self.simd.half, ty);
+        }
         let ea = self.mem_ea_at(ins, offset)?;
-        Ok(self.guest_load(&ea, &ty.ir(), Self::ty_bytes(ty) as u64))
+        Ok(self.guest_load(&ea, &ty.ir(), bytes as u64))
     }
 
     /// Stores a value of type `ty` to the memory operand (the current lane's part of it).
@@ -641,8 +672,12 @@ impl FunctionLifter<'_> {
                 Self::mem_bytes(ins)
             ));
         }
+        let bytes = Self::ty_bytes(ty);
+        if total == 32 && bytes == 16 && (offset == 0 || offset == 16) {
+            return self.load_mem32_half(ins, (offset / 16) as u32, ty);
+        }
         let ea = self.mem_ea_at(ins, offset)?;
-        Ok(self.guest_load(&ea, &ty.ir(), Self::ty_bytes(ty) as u64))
+        Ok(self.guest_load(&ea, &ty.ir(), bytes as u64))
     }
 
     /// Stores `ty` at `offset` into a memory operand of exactly `total` bytes.
@@ -849,6 +884,7 @@ impl FunctionLifter<'_> {
             _ => {}
         }
         let vex = self.check_encoding(ins)?;
+        self.simd.mem32 = None;
         let result = if is_256(ins) {
             self.lift_256(ins)
         } else {
@@ -860,6 +896,7 @@ impl FunctionLifter<'_> {
         };
         self.simd.half = 0;
         self.simd.wide = false;
+        self.simd.mem32 = None;
         result?;
         // VEX encodings zero bits 128..255 of an XMM destination register.
         if vex
@@ -892,6 +929,32 @@ impl FunctionLifter<'_> {
     /// independent 128-bit halves.
     fn lift_256(&mut self, ins: &Instruction) -> R<()> {
         if self.lift_avx(ins)? {
+            return Ok(());
+        }
+        // R58: 256-bit vector stores emit a single 32-byte guest store (1 window check, 1 dirty
+        // mark) instead of two 16-byte halves.
+        if ins.op_kind(0) == OpKind::Memory
+            && Self::mem_bytes(ins) == 32
+            && matches!(
+                ins.mnemonic(),
+                Mnemonic::Vmovaps
+                    | Mnemonic::Vmovups
+                    | Mnemonic::Vmovapd
+                    | Mnemonic::Vmovupd
+                    | Mnemonic::Vmovdqa
+                    | Mnemonic::Vmovdqu
+                    | Mnemonic::Vmovntps
+                    | Mnemonic::Vmovntpd
+                    | Mnemonic::Vmovntdq
+            )
+        {
+            let lo = self.xget_half(ins.op_register(1), 0, Elem::I64)?;
+            let hi = self.xget_half(ins.op_register(1), 1, Elem::I64)?;
+            let val = self.val(&format!(
+                "shufflevector <2 x i64> {lo}, <2 x i64> {hi}, <4 x i32> <i32 0, i32 1, i32 2, i32 3>"
+            ));
+            let ea = self.mem_ea(ins)?;
+            self.guest_store(&ea, "<4 x i64>", &val, 32);
             return Ok(());
         }
         if !avx::in_lane(ins.mnemonic()) {
