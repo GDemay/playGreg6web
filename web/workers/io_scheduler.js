@@ -77,6 +77,8 @@
   const SPECULATIVE_PREFETCH_RE = /(?:^|\/)(?:prefetch|speculative)(?:\/|$)|\.prefetch$/i;
   const UI_FONT_PATH_RE =
     /(?:^|[/._-])(?:ui|hud|fonts?|scaleform|frontend|menu|splash)(?:[/._-]|$)/i;
+  const WORLD_STRUCTURE_EXT_RE = /\.(?:ymap|ytyp|ybn)$/i;
+  const WORLD_STREAMING_EXT_RE = /\.(?:ydr|ytd|ydd|yft|ymap|ytyp|ybn|awc)$/i;
   const BOOT_CRITICAL_RPF_NAMES = new Set([
     'movies.rpf',
     'shaders.rpf',
@@ -189,6 +191,22 @@
     );
   }
 
+  function isWorldStructureAssetPath(pathOrRelPath) {
+    const norm = normalizePathForClassification(pathOrRelPath);
+    if (!norm) {
+      return false;
+    }
+    return WORLD_STRUCTURE_EXT_RE.test(norm);
+  }
+
+  function isWorldStreamingAssetPath(pathOrRelPath) {
+    const norm = normalizePathForClassification(pathOrRelPath);
+    if (!norm) {
+      return false;
+    }
+    return WORLD_STREAMING_EXT_RE.test(norm);
+  }
+
   function classifyIoPriority(pathOrRelPath, explicitPriority) {
     if (isValidPriority(explicitPriority)) {
       return explicitPriority;
@@ -220,7 +238,8 @@
       norm.endsWith('.bik') ||
       isBootCriticalRpfPath(norm) ||
       isUiFontRpfPath(norm) ||
-      isDirectFontOrUiAssetPath(norm)
+      isDirectFontOrUiAssetPath(norm) ||
+      WORLD_STRUCTURE_EXT_RE.test(norm)
     ) {
       return IO_PRIORITY.HIGH;
     }
@@ -380,6 +399,43 @@
         Number.isInteger(options.maxConcurrency) && options.maxConcurrency > 0
           ? options.maxConcurrency
           : DEFAULT_MAX_CONCURRENCY;
+      const rawPrefetchCap =
+        options.maxPrefetchConcurrency !== undefined
+          ? options.maxPrefetchConcurrency
+          : options.prefetchConcurrencyCap;
+      const defaultReservedForeground =
+        this.maxConcurrency >= 4 ? 2 : this.maxConcurrency >= 2 ? 1 : 0;
+
+      if (
+        Number.isInteger(options.reservedForegroundSlots) &&
+        options.reservedForegroundSlots >= 0
+      ) {
+        this.reservedForegroundSlots = Math.min(
+          options.reservedForegroundSlots,
+          Math.max(0, this.maxConcurrency - 1)
+        );
+      } else if (rawPrefetchCap === Infinity) {
+        this.reservedForegroundSlots = 0;
+      } else if (Number.isInteger(rawPrefetchCap) && rawPrefetchCap >= 0) {
+        this.reservedForegroundSlots = Math.max(
+          0,
+          Math.min(defaultReservedForeground, this.maxConcurrency - rawPrefetchCap)
+        );
+      } else {
+        this.reservedForegroundSlots = defaultReservedForeground;
+      }
+
+      if (rawPrefetchCap === Infinity) {
+        this.maxPrefetchConcurrency = Infinity;
+      } else if (Number.isInteger(rawPrefetchCap) && rawPrefetchCap >= 0) {
+        this.maxPrefetchConcurrency = rawPrefetchCap;
+      } else {
+        this.maxPrefetchConcurrency =
+          this.maxConcurrency === 1
+            ? 1
+            : Math.max(1, this.maxConcurrency - this.reservedForegroundSlots);
+      }
+
       this.maxRetries =
         Number.isInteger(options.maxRetries) && options.maxRetries >= 0
           ? options.maxRetries
@@ -442,9 +498,12 @@
         peakQueueDepth: 0,
         highPriorityCount: 0,
         preemptedCount: 0,
+        foregroundPreemptions: 0,
+        prefetchDeferredByCap: 0,
         binkVideoReads: 0,
         shaderPackReads: 0,
         uiFontReads: 0,
+        worldAssetReads: 0,
       };
 
       this._byPriority = PRIORITY_LEVELS.map(() => ({
@@ -503,6 +562,9 @@
         this._stats.shaderPackReads += 1;
       } else if (isUiFontRpfPath(path)) {
         this._stats.uiFontReads += 1;
+      }
+      if (isWorldStreamingAssetPath(path)) {
+        this._stats.worldAssetReads += 1;
       }
 
       const key = makeReadKey(path, offset, length);
@@ -692,6 +754,7 @@
     getStats() {
       const byPriority = {};
       const avgQueueWaitMsByPriority = {};
+      const tierWaitMs = {};
       const priorityCounts = {};
       const activeByPriority = {};
       let queued = 0;
@@ -705,6 +768,11 @@
           counters.dispatched > 0 ? counters.totalQueueWaitMs / counters.dispatched : 0;
         queued += levelQueued;
         avgQueueWaitMsByPriority[name] = avgQueueWaitMs;
+        tierWaitMs[name] = {
+          avg: avgQueueWaitMs,
+          max: counters.maxQueueWaitMs,
+          total: counters.totalQueueWaitMs,
+        };
         priorityCounts[name] = counters.scheduled;
         activeByPriority[name] = counters.inFlight;
         byPriority[name] = {
@@ -724,6 +792,7 @@
           agedPromotions: counters.agedPromotions,
           promotions: counters.agedPromotions,
           promotedByAgingCount: counters.agedPromotions,
+          starvationPromotions: counters.agedPromotions,
         };
       }
 
@@ -743,6 +812,7 @@
         agedPromotions: this._stats.agedPromotions,
         promotions: this._stats.agedPromotions,
         promotedByAgingCount: this._stats.agedPromotions,
+        starvationPromotions: this._stats.agedPromotions,
         avgQueueWaitMs,
         maxQueueWaitMs: this._stats.maxQueueWaitMs,
         peakQueueDepth: this._stats.peakQueueDepth,
@@ -750,12 +820,18 @@
         maxWaitMs: this._stats.maxQueueWaitMs,
         highPriorityCount: this._stats.highPriorityCount,
         preemptedCount: this._stats.preemptedCount,
+        foregroundPreemptions: this._stats.foregroundPreemptions,
+        prefetchDeferredByCap: this._stats.prefetchDeferredByCap,
+        reservedForegroundSlots: this.reservedForegroundSlots,
+        maxPrefetchConcurrency: this.maxPrefetchConcurrency,
         binkVideoReads: this._stats.binkVideoReads,
         shaderPackReads: this._stats.shaderPackReads,
         uiFontReads: this._stats.uiFontReads,
+        worldAssetReads: this._stats.worldAssetReads,
         activeByPriority,
         priorityCounts,
         avgQueueWaitMsByPriority,
+        tierWaitMs,
         byPriority,
       };
     }
@@ -811,9 +887,12 @@
       this._stats.peakQueueDepth = 0;
       this._stats.highPriorityCount = 0;
       this._stats.preemptedCount = 0;
+      this._stats.foregroundPreemptions = 0;
+      this._stats.prefetchDeferredByCap = 0;
       this._stats.binkVideoReads = 0;
       this._stats.shaderPackReads = 0;
       this._stats.uiFontReads = 0;
+      this._stats.worldAssetReads = 0;
 
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
         const counters = this._byPriority[PRIORITY_LEVELS[i]];
@@ -1005,16 +1084,51 @@
       return count;
     }
 
+    _canDispatchPrefetch(isPromoted) {
+      if (isPromoted) {
+        return true;
+      }
+      const activePrefetch = this._byPriority[IO_PRIORITY.PREFETCH].inFlight;
+      if (activePrefetch >= this.maxPrefetchConcurrency) {
+        return false;
+      }
+      if (this.reservedForegroundSlots > 0) {
+        const foregroundInFlight =
+          this._byPriority[IO_PRIORITY.CRITICAL].inFlight +
+          this._byPriority[IO_PRIORITY.HIGH].inFlight;
+        const remainingReserved = Math.max(0, this.reservedForegroundSlots - foregroundInFlight);
+        const freeSlotsAfter = this.maxConcurrency - (this._inFlight + 1);
+        if (freeSlotsAfter < remainingReserved) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    _recordPrefetchCapDeferral() {
+      const prefQueue = this._queues[IO_PRIORITY.PREFETCH];
+      if (prefQueue.length > 0 && !prefQueue[0]._countedCapDeferral) {
+        prefQueue[0]._countedCapDeferral = true;
+        this._stats.prefetchDeferredByCap += 1;
+      }
+    }
+
     _dequeueNext(nowMs) {
-      let strictLevel = -1;
+      const prefetchAllowed = this._canDispatchPrefetch(false);
+      let rawStrictLevel = -1;
+      let eligibleStrictLevel = -1;
       for (let i = 0; i < PRIORITY_LEVELS.length; i += 1) {
         const level = PRIORITY_LEVELS[i];
         if (this._queues[level].length > 0) {
-          strictLevel = level;
-          break;
+          if (rawStrictLevel === -1) {
+            rawStrictLevel = level;
+          }
+          if (eligibleStrictLevel === -1 && (level !== IO_PRIORITY.PREFETCH || prefetchAllowed)) {
+            eligibleStrictLevel = level;
+          }
         }
       }
-      if (strictLevel === -1) {
+      if (rawStrictLevel === -1) {
         return null;
       }
 
@@ -1049,7 +1163,7 @@
         if (bestStarvedLevel !== -1) {
           return {
             task: this._queues[bestStarvedLevel].shift(),
-            promoted: bestStarvedLevel > strictLevel,
+            promoted: bestStarvedLevel > rawStrictLevel,
           };
         }
       }
@@ -1071,6 +1185,10 @@
           const steps = Math.floor(waitMs / this.agingIntervalMs);
           const effectivePriority = Math.max(IO_PRIORITY.CRITICAL, level - steps);
 
+          if (level === IO_PRIORITY.PREFETCH && !prefetchAllowed && effectivePriority >= IO_PRIORITY.PREFETCH) {
+            continue;
+          }
+
           if (
             bestLevel === -1 ||
             effectivePriority < bestEffectivePriority ||
@@ -1089,14 +1207,18 @@
         if (bestLevel !== -1) {
           return {
             task: this._queues[bestLevel].shift(),
-            promoted: bestLevel > strictLevel,
+            promoted: bestLevel > rawStrictLevel,
           };
+        }
+        if (!prefetchAllowed && this._queues[IO_PRIORITY.PREFETCH].length > 0) {
+          this._recordPrefetchCapDeferral();
+          return null;
         }
       }
 
       if (this.agingWindowMs > 0) {
         // CRITICAL stays strictly highest so boot-critical shaders/metadata are never delayed.
-        if (strictLevel === IO_PRIORITY.CRITICAL) {
+        if (rawStrictLevel === IO_PRIORITY.CRITICAL) {
           return {
             task: this._queues[IO_PRIORITY.CRITICAL].shift(),
             promoted: false,
@@ -1123,6 +1245,10 @@
           // Promote one priority tier per aging window, capped at HIGH (below CRITICAL).
           const effectivePriority = Math.max(IO_PRIORITY.HIGH, level - steps);
 
+          if (level === IO_PRIORITY.PREFETCH && !prefetchAllowed && effectivePriority >= IO_PRIORITY.PREFETCH) {
+            continue;
+          }
+
           if (
             bestLevel === -1 ||
             effectivePriority < bestEffectivePriority ||
@@ -1141,13 +1267,24 @@
         if (bestLevel !== -1) {
           return {
             task: this._queues[bestLevel].shift(),
-            promoted: bestLevel > strictLevel,
+            promoted: bestLevel > rawStrictLevel,
           };
+        }
+        if (!prefetchAllowed && this._queues[IO_PRIORITY.PREFETCH].length > 0) {
+          this._recordPrefetchCapDeferral();
+          return null;
         }
       }
 
+      if (eligibleStrictLevel === -1) {
+        if (!prefetchAllowed && this._queues[IO_PRIORITY.PREFETCH].length > 0) {
+          this._recordPrefetchCapDeferral();
+        }
+        return null;
+      }
+
       return {
-        task: this._queues[strictLevel].shift(),
+        task: this._queues[eligibleStrictLevel].shift(),
         promoted: false,
       };
     }
@@ -1203,6 +1340,9 @@
           prioStats.agedPromotions += 1;
         } else if (this._hasEarlierLowerPriorityQueued(task)) {
           this._stats.preemptedCount += 1;
+          if (task.priority <= IO_PRIORITY.HIGH) {
+            this._stats.foregroundPreemptions += 1;
+          }
         }
 
         this._inFlight += 1;
@@ -1388,6 +1528,8 @@
     isBinkVideoPath,
     isShaderPackPath,
     isUiFontRpfPath,
+    isWorldStructureAssetPath,
+    isWorldStreamingAssetPath,
     isRetryableError,
     isAbortError,
     createAbortError,
