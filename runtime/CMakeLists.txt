@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(playgta6_core STATIC
     os/os_shim.cpp
     os/vmem.cpp
+    os/process_memory.cpp
     os/vmem_backing.cpp
     os/threading.cpp
     os/game_input.cpp
