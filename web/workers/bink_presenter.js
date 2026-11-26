@@ -538,6 +538,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
   }
 
+  function isSharedArrayBufferView(bytes) {
+    return Boolean(
+      typeof SharedArrayBuffer !== 'undefined' &&
+        bytes &&
+        bytes.buffer &&
+        (bytes.buffer instanceof SharedArrayBuffer ||
+          Object.prototype.toString.call(bytes.buffer) === '[object SharedArrayBuffer]')
+    );
+  }
+
   /**
    * Prepare a plane's pixel rows with 256-byte `bytesPerRow` alignment, optionally reusing a
    * caller-supplied scratch `Uint8Array` to avoid per-frame allocations.
@@ -706,6 +716,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         targetFps = DEFAULT_TARGET_FPS,
         doubleBuffer = true,
         enableTripleBuffering = false,
+        allowUnalignedDirectUpload = false,
         planeRingDepth,
         slotCount,
         bindGroupCacheCapacity = DEFAULT_BIND_GROUP_CACHE_CAPACITY,
@@ -766,6 +777,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       this._device = device;
       this._presentationFormat = presentationFormat;
       this._stagingPool = stagingPool || null;
+      this._allowUnalignedDirectUpload = Boolean(allowUnalignedDirectUpload);
       this._colorSpace = colorSpace;
       this._colorRange = colorRange;
       this._chromaOrder = chromaOrder;
@@ -1146,6 +1158,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return sanitizeNonNegativeNumber(this._peakPresentIntervalMs);
     }
 
+    get allowUnalignedDirectUpload() {
+      return this._allowUnalignedDirectUpload;
+    }
+
     _recordUploadDuration(startMs, endMs) {
       const raw = endMs - startMs;
       const durationMs = Number.isFinite(raw) && raw > 0 ? raw : 0;
@@ -1350,14 +1366,71 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
       return slot;
     }
 
+    _ensureUploadScratch(totalBytes) {
+      if (!this._uploadScratch || this._uploadScratch.byteLength < totalBytes) {
+        this._uploadScratch = new Uint8Array(totalBytes);
+        this._scratchAllocations += 1;
+      }
+      return this._uploadScratch.byteLength === totalBytes
+        ? this._uploadScratch
+        : this._uploadScratch.subarray(0, totalBytes);
+    }
+
     _preparePlaneForUpload(src, tightRowBytes, height, srcStride, label) {
       validatePlaneBuffer(src, tightRowBytes, height, srcStride, label);
+
+      const isSharedSrc = isSharedArrayBufferView(src);
+
+      // WebGPU `GPUQueue.writeTexture` does NOT require 256-byte `bytesPerRow` alignment —
+      // only `copyBufferToTexture` (stagingPool) does. When `allowUnalignedDirectUpload` is
+      // enabled and we are uploading via `queue.writeTexture`, skip the per-row CPU repack
+      // completely (zero-copy for plain ArrayBuffers, single bulk `TypedArray.set()` into the
+      // persistent scratch buffer for SharedArrayBuffers).
+      if (!this._stagingPool && this._allowUnalignedDirectUpload) {
+        const minRequiredBytes =
+          height > 1 ? srcStride * (height - 1) + tightRowBytes : tightRowBytes;
+        const fullStrideBytes = srcStride * height;
+        const directTotalBytes =
+          src.byteLength >= fullStrideBytes ? fullStrideBytes : minRequiredBytes;
+        const srcSlice =
+          src.byteLength === directTotalBytes ? src : src.subarray(0, directTotalBytes);
+        const out = this._preparedPlaneScratch;
+        if (isSharedSrc) {
+          const dst = this._ensureUploadScratch(directTotalBytes);
+          dst.set(srcSlice, 0);
+          out.data = dst;
+          out.bytesPerRow = srcStride;
+          out.totalBytes = directTotalBytes;
+          out.padded = false;
+          out.usesScratch = true;
+          return out;
+        }
+        out.data = srcSlice;
+        out.bytesPerRow = srcStride;
+        out.totalBytes = directTotalBytes;
+        out.padded = false;
+        out.usesScratch = false;
+        return out;
+      }
 
       const isSrcStrideAligned =
         srcStride % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0 && srcStride >= tightRowBytes;
       const directTotalBytes = srcStride * height;
 
       if (isSrcStrideAligned && src.byteLength >= directTotalBytes) {
+        if (!this._stagingPool && isSharedSrc) {
+          const srcSlice =
+            src.byteLength === directTotalBytes ? src : src.subarray(0, directTotalBytes);
+          const dst = this._ensureUploadScratch(directTotalBytes);
+          dst.set(srcSlice, 0);
+          const out = this._preparedPlaneScratch;
+          out.data = dst;
+          out.bytesPerRow = srcStride;
+          out.totalBytes = directTotalBytes;
+          out.padded = false;
+          out.usesScratch = true;
+          return out;
+        }
         return prepareAlignedPlaneData(
           src,
           tightRowBytes,
@@ -1371,11 +1444,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
       const alignedBytesPerRow = alignUp(tightRowBytes, WEBGPU_BYTES_PER_ROW_ALIGNMENT);
       const totalBytes = alignedBytesPerRow * height;
-
-      if (!this._uploadScratch || this._uploadScratch.byteLength < totalBytes) {
-        this._uploadScratch = new Uint8Array(totalBytes);
-        this._scratchAllocations += 1;
-      }
+      this._ensureUploadScratch(totalBytes);
 
       return prepareAlignedPlaneData(
         src,
@@ -2877,6 +2946,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         skipped: this._skipped,
         pipelineReady: this._pipeline !== null,
         usesStagingPool: this._stagingPool !== null,
+        allowUnalignedDirectUpload: this._allowUnalignedDirectUpload,
         pendingUploads: this._pendingUploads.length,
         destroyed: this._destroyed,
       };

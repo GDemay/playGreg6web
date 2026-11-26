@@ -1892,6 +1892,12 @@ fn fs_main(in: BlitVsOut) -> @location(0) vec4<f32> {
       ) {
         return false;
       }
+      if (
+        this._preserveCopySrcUntilVisible &&
+        (this._firstVisibleFired || this._hasVisibleContent)
+      ) {
+        return false;
+      }
       if ((this._usage & TEXTURE_USAGE_COPY_SRC) !== 0) {
         this._copySrcSupported = true;
         return true;
