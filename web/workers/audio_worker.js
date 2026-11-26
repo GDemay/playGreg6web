@@ -6,11 +6,13 @@
   const MAX_SAMPLE_RATE = 384000;
   const DEFAULT_CHANNELS = 2;
   const MAX_CHANNELS = 8;
-  const DEFAULT_CAPACITY_FRAMES = 4096;
+  const DEFAULT_CAPACITY_FRAMES = 16384; // ~341 ms @ 48 kHz for jitter/hitch absorption
   const MAX_CAPACITY_FRAMES = 1048576;
 
-  // Bounded headless/suspended drain defaults (48 kHz real-time paced).
+  // Bounded headless/suspended drain defaults (48 kHz real-time paced)
+  // and active-mode guest PCM pump cadence (well above Chrome's 4 ms timer clamp).
   const DEFAULT_DRAIN_INTERVAL_MS = 20;
+  const DEFAULT_ACTIVE_PUMP_INTERVAL_MS = 8;
   const MIN_DRAIN_INTERVAL_MS = 4;
   const MAX_DRAIN_INTERVAL_MS = 250;
   const MAX_DRAIN_ELAPSED_MS = 100;
@@ -62,6 +64,7 @@
   const GUEST_PCM_RING_MIN_CAPACITY_SAMPLES = 2;
   const GUEST_PCM_RING_MAX_CAPACITY_SAMPLES = 1 << 24;
   const GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES = 480; // 10 ms @ 48 kHz
+  const GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES = 4096; // ~85 ms zero-alloc burst chunk
   const GUEST_PCM_RING_MAX_QUANTUM_FRAMES = 65536;
 
   // O43 (#1028/#663): Live audio-stats BroadcastChannel telemetry defaults matching
@@ -3489,6 +3492,8 @@
         MIN_DRAIN_INTERVAL_MS,
         MAX_DRAIN_INTERVAL_MS
       );
+      this._explicitDrainInterval = opts.drainIntervalMs !== undefined;
+      this._activeTimerIntervalMs = null;
       this._explicitMaxDrainFramesPerTick =
         typeof opts.maxDrainFramesPerTick === 'number' &&
         Number.isFinite(opts.maxDrainFramesPerTick) &&
@@ -3893,6 +3898,20 @@
       return this._publishAudioStatsInternal(false, false, nowMs);
     }
 
+    _effectiveTimerIntervalMs() {
+      if (this._explicitDrainInterval || this._targetLatencyConfigured) {
+        return this._drainIntervalMs;
+      }
+      if (
+        this.outputState === OUTPUT_STATES.ACTIVE &&
+        this._guestRing !== null &&
+        this._guestRingAutoPump
+      ) {
+        return DEFAULT_ACTIVE_PUMP_INTERVAL_MS;
+      }
+      return this._drainIntervalMs;
+    }
+
     _startDrainTimer() {
       this._stopDrainTimer();
       if (!this.initialized || !this.ring || !this._autoDrain || !this._shouldRunTimer()) {
@@ -3901,12 +3920,14 @@
       if (!this._setInterval) {
         return;
       }
+      const intervalMs = this._effectiveTimerIntervalMs();
       this._lastDrainMs = this._now();
-      const handle = this._setInterval(this._onDrainTimerTick, this._drainIntervalMs);
+      const handle = this._setInterval(this._onDrainTimerTick, intervalMs);
       if (handle && typeof handle.unref === 'function') {
         handle.unref();
       }
       this._drainTimer = handle;
+      this._activeTimerIntervalMs = intervalMs;
     }
 
     _stopDrainTimer() {
@@ -3918,6 +3939,7 @@
         }
       }
       this._drainTimer = null;
+      this._activeTimerIntervalMs = null;
     }
 
     setSampleRate(sampleRate) {
@@ -4005,7 +4027,10 @@
       }
 
       if (this._shouldRunTimer()) {
-        this._startDrainTimer();
+        const desiredInterval = this._effectiveTimerIntervalMs();
+        if (this._drainTimer === null || this._activeTimerIntervalMs !== desiredInterval) {
+          this._startDrainTimer();
+        }
       } else {
         this._stopDrainTimer();
       }
@@ -4027,11 +4052,17 @@
       if (options && typeof options === 'object' && options.sampleRate !== undefined) {
         this.setSampleRate(options.sampleRate);
       }
+      const prevState = this.outputState;
       this.outputState = normalizeOutputState(state, OUTPUT_STATES.HEADLESS_DRAIN);
-      this._stalledFullTicks = 0;
-      this._lastObservedReadCursor = null;
+      if (this.outputState !== prevState) {
+        this._stalledFullTicks = 0;
+        this._lastObservedReadCursor = null;
+      }
       if (this._shouldRunTimer()) {
-        this._startDrainTimer();
+        const desiredInterval = this._effectiveTimerIntervalMs();
+        if (this._drainTimer === null || this._activeTimerIntervalMs !== desiredInterval) {
+          this._startDrainTimer();
+        }
       } else {
         this._stopDrainTimer();
       }
@@ -4119,9 +4150,10 @@
     }
 
     /**
-     * Time-paced active-mode guest PCM ring pump: transfers stereo frames from
-     * `playgta6_audio_ring` into `this.ring` up to available free space without
-     * discarding unread samples so AudioWorkletProcessor plays them seamlessly.
+     * Active-mode guest PCM ring pump: drains available stereo frames (including
+     * post-hitch bursts) from `playgta6_audio_ring` into `this.ring` up to free
+     * space without discarding unread samples or throttling to 1x elapsed wall-clock
+     * time, so AudioWorkletProcessor maintains a healthy jitter cushion.
      *
      * Handles sample-rate conversion budgeting cleanly (e.g. 48 kHz guest -> 44.1/96 kHz
      * host AudioContext) and prevents GuestPcmRingReader deadlocks if the AudioWorklet
@@ -4137,33 +4169,48 @@
       }
       const now =
         typeof nowMs === 'number' && Number.isFinite(nowMs) ? nowMs : this._now();
+      const timerIntervalMs = this._effectiveTimerIntervalMs();
       let elapsedMs;
       if (this._lastDrainMs === null) {
-        elapsedMs = this._drainIntervalMs;
+        elapsedMs = timerIntervalMs;
       } else {
         elapsedMs = now - this._lastDrainMs;
         if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
-          elapsedMs = this._drainIntervalMs;
+          elapsedMs = timerIntervalMs;
         } else if (elapsedMs > MAX_DRAIN_ELAPSED_MS) {
           elapsedMs = MAX_DRAIN_ELAPSED_MS;
         }
       }
       this._lastDrainMs = now;
 
-      const guestRate = this._guestRing.sampleRate;
-      const targetRate = this.sampleRate;
-      const needsResample = guestRate !== targetRate;
-      let guestTimeBudget = Math.floor((guestRate * elapsedMs) / 1000);
-      if (elapsedMs > 0 && guestTimeBudget <= 0) {
-        guestTimeBudget = 1;
-      }
-      const tickCap = this._effectiveMaxDrainFramesPerTick();
-      guestTimeBudget = Math.min(guestTimeBudget, tickCap);
-      if (guestTimeBudget <= 0) {
+      const availGuestFrames = this._guestRing.availableFrames();
+      if (availGuestFrames <= 0) {
         return 0;
       }
 
-      let free = this.ring.freeFrames();
+      const guestRate = this._guestRing.sampleRate;
+      const targetRate = this.sampleRate;
+      const needsResample = guestRate !== targetRate;
+      const tickCap = this._effectiveMaxDrainFramesPerTick();
+      const maxScratchFrames = Math.max(
+        1,
+        Math.floor(this._scratchPool._maxSamples / GUEST_PCM_RING_CHANNELS)
+      );
+      const burstCap =
+        this._explicitMaxDrainFramesPerTick !== null
+          ? tickCap
+          : Math.min(
+              Math.max(tickCap, this.ring.capacityFrames),
+              GUEST_PCM_RING_MAX_QUANTUM_FRAMES,
+              maxScratchFrames
+            );
+
+      const maxFillFrames = this._effectiveMaxFillFrames();
+      const currentUsed = this.ring.availableFrames();
+      let free =
+        maxFillFrames !== undefined
+          ? Math.max(0, maxFillFrames - currentUsed)
+          : this.ring.freeFrames();
       const curRead = Atomics.load(this.ring._ctrl, HDR_READ_CURSOR);
       if (free <= 0) {
         let shouldEvictOldest = false;
@@ -4183,13 +4230,9 @@
         if (!shouldEvictOldest) {
           return 0;
         }
-        const availGuestFrames = this._guestRing.availableFrames();
-        if (availGuestFrames <= 0) {
-          return 0;
-        }
         const outputStep = Math.min(
           this.ring.capacityFrames,
-          Math.max(1, Math.floor((targetRate * elapsedMs) / 1000)),
+          Math.max(1, Math.floor((targetRate * Math.max(elapsedMs, 1)) / 1000)),
           tickCap
         );
         const evicted = this.ring.discardFrames(outputStep);
@@ -4197,7 +4240,11 @@
           this.framesDrained += evicted;
           this._lastObservedReadCursor = Atomics.load(this.ring._ctrl, HDR_READ_CURSOR);
         }
-        free = this.ring.freeFrames();
+        const nextUsed = this.ring.availableFrames();
+        free =
+          maxFillFrames !== undefined
+            ? Math.max(0, maxFillFrames - nextUsed)
+            : this.ring.freeFrames();
         if (free <= 0) {
           return 0;
         }
@@ -4207,22 +4254,43 @@
       }
 
       const maxGuestForFree = needsResample
-        ? Math.max(1, Math.floor((free > 1 ? free - 1 : free) * (guestRate / targetRate)))
+        ? free > 2
+          ? Math.floor((free - 2) * (guestRate / targetRate))
+          : 0
         : free;
-      const maxFrames = Math.min(maxGuestForFree, guestTimeBudget, tickCap);
-      if (maxFrames <= 0) {
+      if (maxGuestForFree <= 0) {
         return 0;
       }
+      const totalTarget = Math.min(availGuestFrames, maxGuestForFree, burstCap);
+      if (totalTarget <= 0) {
+        return 0;
+      }
+
+      const chunkCap = Math.min(
+        Math.max(this._guestRingQuantumFrames, GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES),
+        GUEST_PCM_RING_MAX_QUANTUM_FRAMES,
+        maxScratchFrames
+      );
       const prevInDrainTick = this._inDrainTick;
       this._inDrainTick = true;
       let pumped = 0;
+      let remaining = totalTarget;
       try {
-        const pumpRes = this._drainGuestPcmRingInto(maxFrames, null, this._drainGuestOutResult);
-        pumped = pumpRes.framesDrained;
+        while (remaining > 0) {
+          const step = remaining <= chunkCap ? remaining : chunkCap;
+          const pumpRes = this._drainGuestPcmRingInto(step, null, this._drainGuestOutResult);
+          pumped += pumpRes.framesDrained;
+          remaining -= step;
+          if (pumpRes.framesDrained < step || pumpRes.droppedFrames > 0) {
+            break;
+          }
+        }
       } finally {
         this._inDrainTick = prevInDrainTick;
       }
-      this._maybeBroadcastAudioStats(now);
+      if (pumped > 0) {
+        this._maybeBroadcastAudioStats(now);
+      }
       return pumped;
     }
 
@@ -4556,23 +4624,24 @@
         this._guestRecoveryFadeCount = 0;
       }
 
-      // Pre-warm the guest drain stereo scratch buffer once on attach for zero-alloc quanta.
+      // Pre-warm the guest drain stereo scratch buffer once on attach for zero-alloc quanta & bursts.
+      const basePrewarmFrames = Math.min(
+        Math.max(quantumFrames, GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES),
+        quantumCap
+      );
       const prewarmFrames = this._targetLatencyConfigured
-        ? Math.min(Math.max(quantumFrames, this.drainWatermarkFrames), quantumCap)
-        : quantumFrames;
+        ? Math.min(Math.max(basePrewarmFrames, this.drainWatermarkFrames), quantumCap)
+        : basePrewarmFrames;
       this._scratchPool.acquireFloat32Backing(
         'guestDrain',
         prewarmFrames * GUEST_PCM_RING_CHANNELS
       );
 
-      if (
-        this.initialized &&
-        this.ring &&
-        this._autoDrain &&
-        this._drainTimer === null &&
-        this._shouldRunTimer()
-      ) {
-        this._startDrainTimer();
+      if (this.initialized && this.ring && this._autoDrain && this._shouldRunTimer()) {
+        const desiredInterval = this._effectiveTimerIntervalMs();
+        if (this._drainTimer === null || this._activeTimerIntervalMs !== desiredInterval) {
+          this._startDrainTimer();
+        }
       }
 
       this._publishAudioStatsInternal(true, false, this._now());
@@ -5337,6 +5406,7 @@
               MIN_DRAIN_INTERVAL_MS,
               MAX_DRAIN_INTERVAL_MS
             );
+            this._explicitDrainInterval = true;
           }
           if (
             typeof msg.maxDrainFramesPerTick === 'number' &&
@@ -6185,6 +6255,7 @@
     MAX_CAPACITY_FRAMES,
     MAX_CHANNELS,
     DEFAULT_DRAIN_INTERVAL_MS,
+    DEFAULT_ACTIVE_PUMP_INTERVAL_MS,
     DEFAULT_TARGET_LATENCY_MS,
     MIN_TARGET_LATENCY_MS,
     MAX_TARGET_LATENCY_MS,
@@ -6200,6 +6271,7 @@
     GUEST_PCM_RING_CHANNELS,
     GUEST_PCM_RING_DEFAULT_CAPACITY_SAMPLES,
     GUEST_PCM_RING_DEFAULT_QUANTUM_FRAMES,
+    GUEST_PCM_RING_ACTIVE_BURST_CHUNK_FRAMES,
     PROGRESS_CHANNEL_NAME,
     DEFAULT_TELEMETRY_BROADCAST_INTERVAL_MS,
     ITU_BS775_CENTER_GAIN,
