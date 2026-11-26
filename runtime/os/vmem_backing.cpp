@@ -368,6 +368,10 @@ void pin_views(uintptr_t lo, uintptr_t hi, bool pin) {
     }
 }
 
+namespace {
+void drop_stamps(uintptr_t lo, uintptr_t hi);  // O36 (below)
+}  // namespace
+
 void release(uint8_t* base, uint64_t /*size*/) {
     {
         uintptr_t watched_end = 0;
