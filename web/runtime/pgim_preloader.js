@@ -64,6 +64,38 @@
   const PGIM_OPFS_CACHE_VERSION = 1;
   const DEFAULT_OPFS_CACHE_DIR = 'playgta6-pgim-cache';
   const DEFAULT_OPFS_CACHE_MODE = 'auto';
+  /** Explicit `?streamShaders=1` default threshold (matches web/workers/wgpu_worker.js). */
+  const DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES = 64 * 1024 * 1024;
+  /** Default auto-stream threshold for plain URLs without `?streamShaders` (matches web/workers/wgpu_worker.js). */
+  const DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES = 128 * 1024 * 1024;
+
+  function resolveShaderPackPreloadPolicy({ streamShaders, streamThresholdBytes } = {}) {
+    const validThreshold =
+      typeof streamThresholdBytes === 'number' &&
+      Number.isSafeInteger(streamThresholdBytes) &&
+      streamThresholdBytes >= 0
+        ? streamThresholdBytes
+        : undefined;
+    if (streamShaders === true) {
+      return {
+        skipFullPreload: true,
+        maxPreloadBytes:
+          validThreshold !== undefined && validThreshold > 0
+            ? validThreshold
+            : DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+      };
+    }
+    if (streamShaders === false) {
+      return { skipFullPreload: false, maxPreloadBytes: 0 };
+    }
+    if (validThreshold !== undefined) {
+      return { skipFullPreload: false, maxPreloadBytes: validThreshold };
+    }
+    return {
+      skipFullPreload: false,
+      maxPreloadBytes: DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
+    };
+  }
 
   function defaultSleep(ms, signal) {
     if (signal && signal.aborted) {
@@ -2383,6 +2415,8 @@
     nowFn = now,
     useSharedArrayBuffer = false,
     targetBuffer = null,
+    streamShaders = undefined,
+    streamThresholdBytes = undefined,
   } = {}) {
     const impl =
       fetchImpl !== undefined && fetchImpl !== null
@@ -2474,6 +2508,13 @@
     this.nowFn = nowFn;
     this.useSharedArrayBuffer = Boolean(useSharedArrayBuffer);
     this.targetBuffer = targetBuffer;
+    this.streamShaders = typeof streamShaders === 'boolean' ? streamShaders : undefined;
+    this.streamThresholdBytes =
+      typeof streamThresholdBytes === 'number' &&
+      Number.isSafeInteger(streamThresholdBytes) &&
+      streamThresholdBytes >= 0
+        ? streamThresholdBytes
+        : undefined;
     this._telemetryRun = null;
     this._wireBytesReleased = 0;
     this._droppedWasmBuffers = 0;
@@ -4077,19 +4118,92 @@
    * @param {{ onProgress?: Function, signal?: AbortSignal,
    *           chunkSize?: number, chunkBytes?: number, concurrency?: number }} [options]
    */
-  async preloadShaderPack(url, { onProgress, signal, chunkSize, chunkBytes, concurrency } = {}) {
+  async preloadShaderPack(
+    url,
+    { onProgress, signal, chunkSize, chunkBytes, concurrency, streamShaders, streamThresholdBytes } = {}
+  ) {
     if (typeof url !== 'string' || url.length === 0) throw new TypeError('shader pack url must be a non-empty string');
     const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
+    const policy = resolveShaderPackPreloadPolicy({
+      streamShaders: streamShaders !== undefined ? streamShaders : this.streamShaders,
+      streamThresholdBytes:
+        streamThresholdBytes !== undefined ? streamThresholdBytes : this.streamThresholdBytes,
+    });
     const run = this._startTelemetryRun();
     try {
       throwIfAborted(signal);
       const started = this._now();
+      if (policy.skipFullPreload) {
+        if (typeof onProgress === 'function') {
+          onProgress({
+            phase: 'skipped',
+            reason: 'stream-shaders',
+            loadedBytes: 0,
+            totalBytes: 0,
+            pct: 100,
+          });
+        }
+        run.complete(0);
+        const stats = run.snapshot();
+        return {
+          buffer: null,
+          bytes: null,
+          bytesLoaded: 0,
+          totalBytes: 0,
+          skipped: true,
+          skipReason: 'stream-shaders',
+          transport: 'stream-deferred',
+          chunksFetched: 0,
+          durationMs: this._elapsedSince(started),
+          elapsedMs: stats.elapsedMs,
+          bytesPerSec: stats.bytesPerSec,
+          peakBytesPerSec: stats.peakBytesPerSec,
+          throughputMBps: stats.throughputMBps,
+          parallelMode: false,
+          retryCount: stats.retryCount,
+          abortedCount: stats.abortedCount,
+        };
+      }
       const emit = makeEmitter(onProgress);
       const fetched = await this._fetchAsset(url, 'WGPK shader pack', signal, emit, run, true, {
         allowParallelRange: true,
         chunkSize: transfer.chunkSize,
         concurrency: transfer.concurrency,
+        maxPreloadBytes: policy.maxPreloadBytes,
       });
+      if (fetched.skipped) {
+        const skipReason = fetched.skipReason || 'exceeds-preload-threshold';
+        const knownTotal = fetched.totalBytes || 0;
+        if (typeof onProgress === 'function') {
+          onProgress({
+            phase: 'skipped',
+            reason: skipReason,
+            loadedBytes: 0,
+            totalBytes: knownTotal,
+            pct: 100,
+          });
+        }
+        run.complete(0);
+        const stats = run.snapshot();
+        return {
+          buffer: null,
+          bytes: null,
+          bytesLoaded: 0,
+          totalBytes: knownTotal,
+          skipped: true,
+          skipReason,
+          transport: 'stream-deferred',
+          chunksFetched: 0,
+          durationMs: this._elapsedSince(started),
+          elapsedMs: stats.elapsedMs,
+          bytesPerSec: stats.bytesPerSec,
+          peakBytesPerSec: stats.peakBytesPerSec,
+          throughputMBps: stats.throughputMBps,
+          parallelMode: false,
+          retryCount: stats.retryCount,
+          abortedCount: stats.abortedCount,
+        };
+      }
       const validated = validateWgslPackBytes(fetched.bytes, url);
       const isExactBuffer =
         validated.byteOffset === 0 && validated.byteLength === validated.buffer.byteLength;
@@ -4187,6 +4301,8 @@
     concurrency,
     opfsValidateWithHead,
     validateWithHead,
+    streamShaders,
+    streamThresholdBytes,
   } = {}) {
     const hasProgramManifest = typeof programManifestUrl === 'string' && programManifestUrl.length > 0;
     const hasPgimUrl = typeof pgimUrl === 'string' && pgimUrl.length > 0;
@@ -4194,6 +4310,11 @@
       throw new TypeError('pgimUrl or programManifestUrl must be a non-empty string');
     }
     const transfer = this._resolveTransferConfig({ chunkSize, chunkBytes, concurrency });
+    const shaderPolicy = resolveShaderPackPreloadPolicy({
+      streamShaders: streamShaders !== undefined ? streamShaders : this.streamShaders,
+      streamThresholdBytes:
+        streamThresholdBytes !== undefined ? streamThresholdBytes : this.streamThresholdBytes,
+    });
     const effectiveValidateWithHead =
       opfsValidateWithHead !== undefined
         ? Boolean(opfsValidateWithHead)
@@ -4205,6 +4326,7 @@
       throwIfAborted(signal);
       const started = this._now();
       const timingMs = { pgim: null, shaderPack: null, reflection: null, total: 0 };
+      let shaderPackSkipInfo = null;
       const { controller, unlink } = linkSignal(signal);
       const inner = controller.signal;
       const timed = async (key, fn) => {
@@ -4218,7 +4340,7 @@
       const forward = (asset) =>
         typeof onProgress === 'function' ? (event) => onProgress({ ...event, asset }) : undefined;
 
-      const optionalAsset = async (key, url, label, validate, allowParallelRange) => {
+      const optionalAsset = async (key, url, label, validate, allowParallelRange, maxPreloadBytes = 0) => {
         if (!url) return null;
         try {
           return await timed(key, async () => {
@@ -4233,8 +4355,27 @@
                 allowParallelRange,
                 chunkSize: transfer.chunkSize,
                 concurrency: transfer.concurrency,
+                maxPreloadBytes,
               }
             );
+            if (fetched.skipped) {
+              const reason = fetched.skipReason || 'exceeds-preload-threshold';
+              const totalBytes = fetched.totalBytes ?? null;
+              if (key === 'shaderPack') {
+                shaderPackSkipInfo = { reason, totalBytes };
+              }
+              if (typeof onProgress === 'function') {
+                onProgress({
+                  phase: 'skipped',
+                  asset: key,
+                  reason,
+                  loadedBytes: 0,
+                  totalBytes: totalBytes || 0,
+                  pct: 100,
+                });
+              }
+              return null;
+            }
             return validate(fetched.bytes, url);
           });
         } catch (err) {
@@ -4248,6 +4389,33 @@
           throw err;
         }
       };
+
+      const shaderPackTask = !shaderPackUrl
+        ? Promise.resolve(null)
+        : shaderPolicy.skipFullPreload
+          ? Promise.resolve().then(() => {
+              timingMs.shaderPack = 0;
+              shaderPackSkipInfo = { reason: 'stream-shaders', totalBytes: null };
+              if (typeof onProgress === 'function') {
+                onProgress({
+                  phase: 'skipped',
+                  asset: 'shaderPack',
+                  reason: 'stream-shaders',
+                  loadedBytes: 0,
+                  totalBytes: 0,
+                  pct: 100,
+                });
+              }
+              return null;
+            })
+          : optionalAsset(
+              'shaderPack',
+              shaderPackUrl,
+              'WGPK shader pack',
+              validateWgslPackBytes,
+              true,
+              shaderPolicy.maxPreloadBytes
+            );
 
       const tasks = [
         timed('pgim', () =>
@@ -4280,7 +4448,7 @@
                 opfsValidateWithHead: effectiveValidateWithHead,
               })
         ),
-        optionalAsset('shaderPack', shaderPackUrl, 'WGPK shader pack', validateWgslPackBytes, true),
+        shaderPackTask,
         optionalAsset('reflection', reflectionUrl, 'reflection manifest', parseReflectionManifestJson, false),
       ];
 
@@ -4336,6 +4504,13 @@
           modulesByName: pgimResult.modulesByName,
           moduleCount: pgimResult.moduleCount,
           shaderPackBytes,
+          ...(shaderPackSkipInfo
+            ? {
+                shaderPackSkipped: true,
+                shaderPackSkipReason: shaderPackSkipInfo.reason,
+                shaderPackStreamedBytes: shaderPackSkipInfo.totalBytes,
+              }
+            : {}),
           reflectionManifest,
           timingMs,
           durationMs: timingMs.total,
@@ -4377,6 +4552,13 @@
         opfsCacheHit: Boolean(image.opfsCacheHit),
         etag: image.etag ?? null,
         shaderPackBytes,
+        ...(shaderPackSkipInfo
+          ? {
+              shaderPackSkipped: true,
+              shaderPackSkipReason: shaderPackSkipInfo.reason,
+              shaderPackStreamedBytes: shaderPackSkipInfo.totalBytes,
+            }
+          : {}),
         reflectionManifest,
         timingMs,
         durationMs: timingMs.total,
@@ -4492,6 +4674,35 @@
         else if (ranges.trim().toLowerCase() === 'none') acceptRanges = false;
       }
       return { totalBytes, acceptRanges };
+    }
+
+    /**
+     * Lightweight HEAD probe returning the shader pack byte length (or null if unavailable).
+     * Never throws on 404/405/network errors; propagates AbortSignal cancellation.
+     */
+    async probeShaderPackSize(url, { signal } = {}) {
+      if (typeof url !== 'string' || url.length === 0) return null;
+      throwIfAborted(signal);
+      const ctx = {
+        url,
+        signal: signal || null,
+        emit: () => {},
+        requests: 0,
+        run: null,
+        ownsTotalBytes: false,
+        chunkSize: this.chunkSize,
+        concurrency: this.concurrency,
+        what: 'WGPK shader pack',
+      };
+      try {
+        const probe = await this._probeAsset(ctx, 'WGPK shader pack');
+        return probe && typeof probe.totalBytes === 'number' && Number.isSafeInteger(probe.totalBytes)
+          ? probe.totalBytes
+          : null;
+      } catch (err) {
+        if ((signal && signal.aborted) || isAbortError(err)) throw err;
+        return null;
+      }
     }
 
   _allocate(totalBytes) {
@@ -4984,7 +5195,7 @@
       emit,
       telemetryRun = null,
       ownsTotalBytes = false,
-      { allowParallelRange = false, chunkSize = this.chunkSize, concurrency = this.concurrency } = {}
+      { allowParallelRange = false, chunkSize = this.chunkSize, concurrency = this.concurrency, maxPreloadBytes = 0 } = {}
     ) {
       const ctx = {
         url,
@@ -4997,9 +5208,28 @@
         concurrency,
         what,
       };
-      if (allowParallelRange && concurrency > 1) {
+      const hasMaxPreloadBytes = Number.isSafeInteger(maxPreloadBytes) && maxPreloadBytes > 0;
+      const shouldProbe = (allowParallelRange && concurrency > 1) || hasMaxPreloadBytes;
+      if (shouldProbe) {
         const probe = await this._probeAsset(ctx, what);
-        if (probe.acceptRanges === true && probe.totalBytes !== null && probe.totalBytes > chunkSize) {
+        if (hasMaxPreloadBytes && probe.totalBytes !== null && probe.totalBytes >= maxPreloadBytes) {
+          return {
+            bytes: null,
+            skipped: true,
+            skipReason: 'exceeds-preload-threshold',
+            totalBytes: probe.totalBytes,
+            transport: 'stream-deferred',
+            chunksFetched: 0,
+            parallelMode: false,
+          };
+        }
+        if (
+          allowParallelRange &&
+          concurrency > 1 &&
+          probe.acceptRanges === true &&
+          probe.totalBytes !== null &&
+          probe.totalBytes > chunkSize
+        ) {
           const total = probe.totalBytes;
           const dest = new Uint8Array(total);
           if (telemetryRun && ownsTotalBytes) telemetryRun.setTotalBytes(total);
@@ -5027,6 +5257,20 @@
       const response = await this._request(ctx, { method: 'GET' });
       if (!response.ok) throw httpError(url, response.status, what);
       const declared = contentLength(response);
+      if (hasMaxPreloadBytes && declared !== null && declared >= maxPreloadBytes) {
+        if (response.body && typeof response.body.cancel === 'function') {
+          response.body.cancel().catch(() => {});
+        }
+        return {
+          bytes: null,
+          skipped: true,
+          skipReason: 'exceeds-preload-threshold',
+          totalBytes: declared,
+          transport: 'stream-deferred',
+          chunksFetched: 0,
+          parallelMode: false,
+        };
+      }
       emit('download', 0, declared);
       let bytes;
       const body = response.body;
@@ -5043,6 +5287,20 @@
             const { done, value } = await raceAbort(reader.read(), signal);
             if (done) break;
             const part = toBytes(value, what);
+            if (hasMaxPreloadBytes && loaded + part.byteLength >= maxPreloadBytes) {
+              reader.cancel().catch(() => {});
+              prealloc = null;
+              parts = null;
+              return {
+                bytes: null,
+                skipped: true,
+                skipReason: 'exceeds-preload-threshold',
+                totalBytes: declared,
+                transport: 'stream-deferred',
+                chunksFetched: 0,
+                parallelMode: false,
+              };
+            }
             if (prealloc !== null) {
               if (loaded + part.byteLength <= prealloc.byteLength) {
                 prealloc.set(part, loaded);
@@ -5179,6 +5437,8 @@
     PGIM_OPFS_CACHE_VERSION,
     DEFAULT_OPFS_CACHE_DIR,
     DEFAULT_OPFS_CACHE_MODE,
+    DEFAULT_STREAM_SHADERS_THRESHOLD_BYTES,
+    DEFAULT_AUTO_STREAM_SHADER_THRESHOLD_BYTES,
     PROGRAM_MANIFEST_SCHEMA,
     PROGRAM_MANIFEST_SCHEMA_VERSION,
     PgimPreloadError,

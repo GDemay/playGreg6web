@@ -11,7 +11,11 @@ import {
   SESSION_STATE,
 } from './runtime/session_controller.js';
 import { SmokeDemoRunner } from './demo/run_smoke_demo.js';
-import { INPUT_SCRIPT_PRESETS, InputBridge } from './input/input_bridge.js';
+import {
+  FIRST_VISIBLE_FRAME_ANCHOR_PRESETS,
+  INPUT_SCRIPT_PRESETS,
+  InputBridge,
+} from './input/input_bridge.js';
 import { InputProfileManager } from './input/input_profiles.js';
 import { AudioEngine } from './audio/audio_engine.js';
 import { BrowserStorageManager } from './storage/storage_manager.js';
@@ -113,6 +117,41 @@ const ALLOWED_INPUT_SCRIPT_PRESETS = (() => {
   }
   return map;
 })();
+
+const FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET = new Set(
+  Array.isArray(FIRST_VISIBLE_FRAME_ANCHOR_PRESETS) ? FIRST_VISIBLE_FRAME_ANCHOR_PRESETS : []
+);
+
+function resolveInputScriptStartOptions(preset, callerOptions) {
+  const hasCallerOptions = Boolean(callerOptions && typeof callerOptions === 'object');
+  if (!FIRST_VISIBLE_FRAME_ANCHOR_PRESET_SET.has(preset)) {
+    return hasCallerOptions ? callerOptions : null;
+  }
+  if (
+    hasCallerOptions &&
+    (callerOptions.startOn !== undefined || callerOptions.waitForFirstVisibleFrame !== undefined)
+  ) {
+    return callerOptions;
+  }
+  return hasCallerOptions
+    ? { ...callerOptions, startOn: 'FIRST_VISIBLE_FRAME' }
+    : { startOn: 'FIRST_VISIBLE_FRAME' };
+}
+
+function buildPreloaderStreamOptions(streamConfig, explicitDisabled) {
+  if (streamConfig && streamConfig.streamShaders === true) {
+    return {
+      streamShaders: true,
+      ...(isPositiveFinite(streamConfig.streamThresholdBytes)
+        ? { streamThresholdBytes: streamConfig.streamThresholdBytes }
+        : {}),
+    };
+  }
+  if (explicitDisabled === true) {
+    return { streamShaders: false };
+  }
+  return {};
+}
 
 const MAX_VALIDATION_ERROR_MESSAGE_LENGTH = 512;
 const MAX_VALIDATION_ERROR_CODE_LENGTH = 64;
@@ -1942,6 +1981,8 @@ export function bootstrapPlayGta6App(options = {}) {
     holdUntilVisible: resolvedHoldUntilVisible,
   });
   let activeStreamConfig = baseStreamConfig;
+  const baseStreamExplicitDisabled = options.streamShaders === false;
+  let activeStreamExplicitDisabled = baseStreamExplicitDisabled;
   let activeDumpConfig = baseDumpConfig;
   let configuredInputScript = baseInputScript;
   let activeInputScript = null;
@@ -5626,6 +5667,7 @@ export function bootstrapPlayGta6App(options = {}) {
       ? options.pgimPreloader
       : typeof PgimPreloaderCtor === 'function'
         ? new PgimPreloaderCtor({
+            ...buildPreloaderStreamOptions(baseStreamConfig, baseStreamExplicitDisabled),
             ...pgimPreloaderOptions,
             ...(resolvedPgimOpfsCache !== undefined ? { opfsCache: resolvedPgimOpfsCache } : {}),
             ...(resolvedPgimOpfsCacheVersion !== undefined
@@ -7543,6 +7585,12 @@ export function bootstrapPlayGta6App(options = {}) {
       preloader: pgimPreloader,
       bootTracer,
       nowFn: bootOrchestratorOptions.nowFn || now,
+      ...(bootOrchestratorOptions.getStreamConfig === undefined
+        ? {
+            getStreamConfig: () =>
+              buildPreloaderStreamOptions(activeStreamConfig, activeStreamExplicitDisabled),
+          }
+        : {}),
       onLaunchRuntime: async (bootPayload) => {
         recordDiscoveredBootAssets(bootPayload);
         lastBootSessionResult = await session.start(pendingStartOpts);
@@ -9209,8 +9257,10 @@ export function bootstrapPlayGta6App(options = {}) {
     const hasRunningScript =
       activeInputScript !== null ||
       (inputBridge &&
-        typeof inputBridge.getScriptState === 'function' &&
-        Boolean(inputBridge.getScriptState()?.active));
+        ((typeof inputBridge.getScriptState === 'function' &&
+          Boolean(inputBridge.getScriptState()?.active)) ||
+          (typeof inputBridge.getStats === 'function' &&
+            Boolean(inputBridge.getStats()?.scriptPending))));
     activeInputScript = null;
     if (!hasRunningScript || !inputBridge || typeof inputBridge.stopScript !== 'function') {
       return;
@@ -9233,8 +9283,9 @@ export function bootstrapPlayGta6App(options = {}) {
       return false;
     }
     try {
-      if (options.inputScriptOptions && typeof options.inputScriptOptions === 'object') {
-        inputBridge.startScript(preset, options.inputScriptOptions);
+      const scriptOptions = resolveInputScriptStartOptions(preset, options.inputScriptOptions);
+      if (scriptOptions) {
+        inputBridge.startScript(preset, scriptOptions);
       } else {
         inputBridge.startScript(preset);
       }
@@ -9355,6 +9406,13 @@ export function bootstrapPlayGta6App(options = {}) {
     }
     stopActiveInputScript();
     activeStreamConfig = resolveStreamConfigOverride(startOpts, baseStreamConfig);
+    activeStreamExplicitDisabled =
+      startOpts &&
+      typeof startOpts === 'object' &&
+      Object.prototype.hasOwnProperty.call(startOpts, 'streamShaders') &&
+      startOpts.streamShaders !== undefined
+        ? startOpts.streamShaders === false
+        : baseStreamExplicitDisabled;
     activeDumpConfig = resolveDumpConfigOverride(startOpts, baseDumpConfig);
     const desiredInputScript = resolveInputScriptOverride(startOpts, baseInputScript);
     configuredInputScript = desiredInputScript;
