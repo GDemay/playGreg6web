@@ -19,6 +19,7 @@ const {
   BOOT_PHASE_RANGES,
   DISMISS_REASONS,
   computeBootProgress,
+  formatElapsedClock,
   resolveBootPhase,
   clampMonotonicPhaseProgress,
   sanitizeScriptedInputPreset,
@@ -32,6 +33,7 @@ const {
   DEFAULT_FADE_OUT_MS,
   DEFAULT_VISIBLE_FRAME_FADE_MS,
   DEFAULT_HOLD_FALLBACK_TIMEOUT_MS,
+  DEFAULT_ELAPSED_INTERVAL_MS,
   DEFAULT_LOADING_ASSETS_MESSAGE,
   DEFAULT_GREG_IMAGE_URL,
   DEFAULT_GREG_CLICK_THRESHOLD,
@@ -462,11 +464,13 @@ test('updateBootState integrates BootTracer-style snapshots', () => {
 
   const root = state.root;
   assert.equal(root.querySelector('.pg6-splash__stage').textContent, 'Creating D3D12 device');
-  assert.equal(root.querySelector('.pg6-splash__pct').textContent, '78%');
-  assert.equal(root.querySelector('.pg6-splash__bar-fill').style.width, '78%');
+  assert.equal(root.querySelector('.pg6-splash__bar'), null);
+  assert.equal(root.querySelector('.pg6-splash__bar-fill'), null);
+  assert.equal(root.querySelector('.pg6-splash__pct'), null);
+  assert.equal(root.querySelector('.pg6-splash__elapsed-label').textContent, 'Elapsed');
+  assert.equal(root.querySelector('.pg6-splash__elapsed').textContent, '00:01');
   assert.equal(root.querySelector('.pg6-splash__stream').hidden, false);
   assert.equal(root.querySelector('.pg6-splash__stream-fill').style.width, '50%');
-  assert.equal(root.querySelector('.pg6-splash__bar').getAttribute('aria-valuenow'), '78');
   controller.destroy();
 });
 
@@ -1454,7 +1458,7 @@ test('W228: exports isGregQuery, Spinning Greg constants, and web/assets/greg.pn
   assert.equal(isGregQuery('http://localhost:8000/?greg=0#?greg=1'), false);
 });
 
-test('W228: default Spinning Greg spinner renders cleanly with gregMode true, hides on dismiss, and respects reduced motion', () => {
+test('W228: default Greg Theft Auto hero renders cleanly with non-spinning banner, monochrome ring spinner, hides on dismiss, and respects reduced motion', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const state = controller.getState();
@@ -1462,41 +1466,46 @@ test('W228: default Spinning Greg spinner renders cleanly with gregMode true, hi
 
   assert.equal(state.gregMode, true);
   assert.equal(stats.gregMode, true);
+  assert.equal(state.gregBackdropActive, true);
 
   const panel = state.root.querySelector('.pg6-splash__panel');
   assert.ok(panel);
+  const heroImg = state.root.querySelector('.pg6-splash__img');
   const spinner = panel.querySelector('.pg6-splash__spinner');
   const ring = panel.querySelector('.pg6-splash__spinner-ring');
   const greg = panel.querySelector('.pg6-splash__greg');
   const stage = panel.querySelector('.pg6-splash__stage');
 
+  assert.ok(heroImg, 'hero splash img element must render');
   assert.ok(spinner, 'spinner element must render inside panel');
-  assert.ok(ring, 'fallback CSS ring spinner must render inside spinner');
-  assert.ok(greg, 'greg img element must render inside spinner');
+  assert.ok(ring, 'monochrome CSS ring spinner must render inside spinner');
+  assert.ok(greg, 'legacy greg img element remains hidden and non-spinning');
   assert.ok(stage, 'stage label must remain intact inside panel');
+  assert.equal(heroImg.hidden, false);
+  assert.equal(heroImg.getAttribute('src'), './assets/greg.png');
+  assert.equal(heroImg.getAttribute('alt'), 'Greg Theft Auto');
+  assert.equal(heroImg.classList.contains('pg6-splash__img--greg'), true);
   assert.equal(spinner.hidden, false);
   assert.equal(spinner.style.display, '');
   assert.equal(spinner.getAttribute('aria-hidden'), 'true');
   assert.equal(spinner.getAttribute('data-greg-mode'), 'true');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
-  assert.equal(ring.hidden, true);
-  assert.equal(ring.style.display, 'none');
-  assert.equal(greg.hidden, false);
-  assert.equal(greg.style.display, '');
-  assert.equal(greg.getAttribute('src'), './assets/greg.png');
-  assert.equal(greg.getAttribute('alt'), 'Greg');
-  assert.equal(greg.getAttribute('aria-hidden'), 'true');
-  assert.equal(greg.getAttribute('draggable'), 'false');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(ring.hidden, false);
+  assert.equal(ring.style.display, '');
+  assert.equal(greg.hidden, true);
+  assert.equal(greg.style.display, 'none');
+  assert.equal(greg.style.animation, 'none');
 
-  // Shared stylesheet includes spin keyframes and reduced-motion animation suppression.
+  // Shared stylesheet includes spin keyframes for ring, subtle pulse for hero banner, and reduced-motion suppression.
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
   assert.ok(styleEl);
   assert.match(styleEl.textContent, /@keyframes pg6-spin/);
+  assert.match(styleEl.textContent, /@keyframes pg6-greg-pulse/);
   assert.match(styleEl.textContent, /\.pg6-splash__spinner/);
-  assert.match(styleEl.textContent, /\.pg6-splash__greg/);
+  assert.match(styleEl.textContent, /\.pg6-splash__greg\{[^}]*animation:none;/);
   assert.match(
     styleEl.textContent,
-    /@media \(prefers-reduced-motion: reduce\)\{[\s\S]*\.pg6-splash__spinner-ring,\.pg6-splash__greg\{animation:none!important;\}\}/
+    /@media \(prefers-reduced-motion: reduce\)\{[\s\S]*\.pg6-splash__spinner-ring,\.pg6-splash__greg,\.pg6-splash__img--greg\{animation:none!important;transform:none!important;\}\}/
   );
 
   // Dismissing hides the spinner cleanly; show() restores it.
@@ -1509,9 +1518,10 @@ test('W228: default Spinning Greg spinner renders cleanly with gregMode true, hi
   assert.equal(spinner.style.display, '');
   controller.destroy();
 
-  // Reduced motion disables spin animation without breaking Greg visibility.
+  // Reduced motion disables ring spin & hero pulse animations while keeping Greg Theft Auto visible cleanly.
   const reduced = createController({ reducedMotion: true, gregMode: true });
   const rRoot = reduced.controller.getState().root;
+  const rHero = rRoot.querySelector('.pg6-splash__img');
   const rSpinner = rRoot.querySelector('.pg6-splash__spinner');
   const rRing = rRoot.querySelector('.pg6-splash__spinner-ring');
   const rGreg = rRoot.querySelector('.pg6-splash__greg');
@@ -1520,13 +1530,15 @@ test('W228: default Spinning Greg spinner renders cleanly with gregMode true, hi
   assert.equal(rSpinner.hidden, false);
   assert.equal(rSpinner.getAttribute('data-reduced-motion'), 'true');
   assert.equal(rRing.style.animation, 'none');
-  assert.equal(rGreg.hidden, false);
-  assert.equal(rGreg.style.display, '');
+  assert.equal(rHero.hidden, false);
+  assert.equal(rHero.style.animation, 'none');
+  assert.equal(rGreg.hidden, true);
+  assert.equal(rGreg.style.display, 'none');
   assert.equal(rGreg.style.animation, 'none');
   reduced.controller.destroy();
 });
 
-test('W228: ?greg=1 / ?greg=0 query and constructor options control Spinning Greg and preserve ?hud=0', () => {
+test('W228: ?greg=1 / ?greg=0 query and constructor options control Greg Theft Auto mode and preserve ?hud=0', () => {
   // Option validation.
   assert.throws(
     () => new SplashOverlayController({ documentObj: new MockDocument(), gregMode: 'yes' }),
@@ -1545,29 +1557,30 @@ test('W228: ?greg=1 / ?greg=0 query and constructor options control Spinning Gre
     TypeError
   );
 
-  // ?greg=1 via locationSearch keeps Spinning Greg active.
+  // ?greg=1 via locationSearch keeps Greg Theft Auto hero active with clean ring spinner.
   const viaQuery1 = createController({ locationSearch: '?greg=1' });
   assert.equal(viaQuery1.controller.getState().gregMode, true);
   assert.equal(viaQuery1.controller.getStats().gregMode, true);
   const root1 = viaQuery1.controller.getState().root;
-  assert.equal(root1.querySelector('.pg6-splash__spinner').classList.contains('pg6-splash__spinner--greg'), true);
-  assert.equal(root1.querySelector('.pg6-splash__spinner-ring').hidden, true);
-  assert.equal(root1.querySelector('.pg6-splash__greg').hidden, false);
-  assert.equal(root1.querySelector('.pg6-splash__greg').getAttribute('src'), './assets/greg.png');
-  assert.equal(root1.querySelector('.pg6-splash__greg').getAttribute('alt'), 'Greg');
+  assert.equal(root1.querySelector('.pg6-splash__img').getAttribute('src'), './assets/greg.png');
+  assert.equal(root1.querySelector('.pg6-splash__img').getAttribute('alt'), 'Greg Theft Auto');
+  assert.equal(root1.querySelector('.pg6-splash__spinner').getAttribute('data-greg-mode'), 'true');
+  assert.equal(root1.querySelector('.pg6-splash__spinner-ring').hidden, false);
+  assert.equal(root1.querySelector('.pg6-splash__greg').hidden, true);
   viaQuery1.controller.destroy();
 
-  // ?greg=0 via locationSearch opts out back to the ring spinner.
+  // ?greg=0 via locationSearch opts out of Greg Theft Auto hero.
   const viaQuery0 = createController({ locationSearch: '?greg=0' });
   assert.equal(viaQuery0.controller.getState().gregMode, false);
   assert.equal(viaQuery0.controller.getStats().gregMode, false);
   const root0 = viaQuery0.controller.getState().root;
-  assert.equal(root0.querySelector('.pg6-splash__spinner').classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(root0.querySelector('.pg6-splash__spinner').getAttribute('data-greg-mode'), 'false');
   assert.equal(root0.querySelector('.pg6-splash__spinner-ring').hidden, false);
   assert.equal(root0.querySelector('.pg6-splash__greg').hidden, true);
+  assert.equal(root0.querySelector('.pg6-splash__img').hidden, true);
   viaQuery0.controller.destroy();
 
-  // ?greg=true via windowObj.location.search enables Spinning Greg automatically.
+  // ?greg=true via windowObj.location.search enables Greg Theft Auto automatically.
   const viaWindow = createController({ windowObj: { location: { search: '?foo=bar&greg=true' } } });
   assert.equal(viaWindow.controller.getState().gregMode, true);
   assert.equal(viaWindow.controller.getStats().gregMode, true);
@@ -1601,25 +1614,28 @@ test('W228: ?greg=1 / ?greg=0 query and constructor options control Spinning Gre
   hudHiddenWithGreg.controller.destroy();
 });
 
-test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects gregClickThreshold', () => {
+test('W228: 3x spinner click trigger toggles Greg Theft Auto hero cleanly and respects gregClickThreshold', () => {
   const { controller } = createController();
   const root = controller.getState().root;
+  const heroImg = root.querySelector('.pg6-splash__img');
   const spinner = root.querySelector('.pg6-splash__spinner');
   const ring = root.querySelector('.pg6-splash__spinner-ring');
   const greg = root.querySelector('.pg6-splash__greg');
 
-  // Spinning Greg is enabled by default.
+  // Greg Theft Auto hero is enabled by default; monochrome ring spinner stays active and non-spinning banner never spins.
   assert.equal(controller.getState().gregMode, true);
   spinner.dispatch('click');
   spinner.dispatch('click');
   assert.equal(controller.getState().gregMode, true);
-  assert.equal(ring.hidden, true);
-  assert.equal(greg.hidden, false);
+  assert.equal(heroImg.hidden, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
 
-  // 3rd click toggles Spinning Greg OFF (fallback ring spinner).
+  // 3rd click toggles Greg Theft Auto hero OFF.
   spinner.dispatch('click');
   assert.equal(controller.getState().gregMode, false);
   assert.equal(controller.getStats().gregMode, false);
+  assert.equal(heroImg.hidden, true);
   assert.equal(ring.hidden, false);
   assert.equal(greg.hidden, true);
 
@@ -1637,8 +1653,9 @@ test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects 
   assert.equal(controller.getState().gregMode, false);
   spinner.dispatch('click');
   assert.equal(controller.getState().gregMode, true);
-  assert.equal(ring.hidden, true);
-  assert.equal(greg.hidden, false);
+  assert.equal(heroImg.hidden, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
 
   // Listener is cleaned up on destroy.
   assert.equal(spinner.listenerCount('click'), 1);
@@ -1655,7 +1672,7 @@ test('W228: 3x spinner click trigger toggles Spinning Greg cleanly and respects 
   customThreshold.controller.destroy();
 });
 
-test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modifiers, and cleans up on destroy', () => {
+test('W228: typing g-r-e-g toggles Greg Theft Auto hero, ignores editable inputs & modifiers, and cleans up on destroy', () => {
   const { controller, documentObj } = createController();
   assert.equal(documentObj.listenerCount('keydown'), 1);
   assert.equal(controller.getStats().gregMode, true);
@@ -1684,11 +1701,12 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
   });
   assert.equal(controller.getStats().gregMode, true);
 
-  // Typing g-r-e-g (even after unrelated keys) toggles Spinning Greg OFF.
+  // Typing g-r-e-g (even after unrelated keys) toggles Greg Theft Auto hero OFF.
   typeWord(documentObj, 'abgreg');
   assert.equal(controller.getState().gregMode, false);
   assert.equal(controller.getStats().gregMode, false);
-  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, true);
+  assert.equal(controller.getState().gregBackdropActive, false);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__img').hidden, true);
 
   // Ignored while splash overlay is hidden or dismissed.
   controller.hide();
@@ -1696,10 +1714,11 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
   assert.equal(controller.getStats().gregMode, false);
   controller.show();
 
-  // Case-insensitive typing toggles Spinning Greg ON again.
+  // Case-insensitive typing toggles Greg Theft Auto hero ON again.
   typeWord(documentObj, 'GREG');
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(controller.getState().root.querySelector('.pg6-splash__greg').hidden, false);
+  assert.equal(controller.getState().gregBackdropActive, true);
+  assert.equal(controller.getState().root.querySelector('.pg6-splash__img').hidden, false);
 
   // destroy() removes keydown listener so no listeners leak.
   controller.destroy();
@@ -1733,6 +1752,7 @@ test('W228: typing g-r-e-g toggles Spinning Greg, ignores editable inputs & modi
 test('W228: setGregMode and toggleGregMode update DOM & telemetry cleanly and are safe no-ops after destroy', () => {
   const { controller } = createController();
   const root = controller.getState().root;
+  const heroImg = root.querySelector('.pg6-splash__img');
   const spinner = root.querySelector('.pg6-splash__spinner');
   const ring = root.querySelector('.pg6-splash__spinner-ring');
   const greg = root.querySelector('.pg6-splash__greg');
@@ -1742,9 +1762,9 @@ test('W228: setGregMode and toggleGregMode update DOM & telemetry cleanly and ar
   assert.equal(controller.getStats().gregMode, true);
   assert.equal(root.getAttribute('data-greg-mode'), 'true');
   assert.equal(spinner.getAttribute('data-greg-mode'), 'true');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
-  assert.equal(ring.hidden, true);
-  assert.equal(greg.hidden, false);
+  assert.equal(heroImg.hidden, false);
+  assert.equal(ring.hidden, false);
+  assert.equal(greg.hidden, true);
   assert.doesNotThrow(() => JSON.stringify(controller.getStats()));
 
   const s2 = controller.toggleGregMode();
@@ -1752,7 +1772,7 @@ test('W228: setGregMode and toggleGregMode update DOM & telemetry cleanly and ar
   assert.equal(controller.getStats().gregMode, false);
   assert.equal(root.getAttribute('data-greg-mode'), 'false');
   assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
+  assert.equal(heroImg.hidden, true);
   assert.equal(ring.hidden, false);
   assert.equal(greg.hidden, true);
 
@@ -1964,19 +1984,24 @@ test('W230: holdUntilVisible holds past FIRST_PRESENT, updates loading progress,
   assert.ok(controller.getState().progressPct <= 99);
   assert.equal(controller.getState().dismissed, false);
 
-  // W228 Spinning Greg triggers still work while held (default ON -> 3x click OFF -> typing greg ON)!
+  // W228 Greg Theft Auto hero triggers still work while held (default ON -> 3x click OFF -> typing greg ON)!
+  const heroImg = root.querySelector('.pg6-splash__img');
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(gregImg.hidden, false);
+  assert.equal(controller.getStats().gregBackdropActive, true);
+  assert.equal(heroImg.hidden, false);
+  assert.equal(gregImg.hidden, true);
   spinner.dispatch('click');
   spinner.dispatch('click');
   spinner.dispatch('click');
   assert.equal(controller.getStats().gregMode, false);
-  assert.equal(gregImg.hidden, true);
+  assert.equal(controller.getStats().gregBackdropActive, false);
+  assert.equal(heroImg.hidden, true);
   for (const ch of 'greg') {
     documentObj.dispatch('keydown', { key: ch });
   }
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(gregImg.hidden, false);
+  assert.equal(controller.getStats().gregBackdropActive, true);
+  assert.equal(heroImg.hidden, false);
 
   // notifyFirstVisibleFrame() cancels fallback timer and fades out smoothly (450 ms default).
   now = 195000;
@@ -2157,7 +2182,7 @@ test('W230: holdFallbackTimeoutMs safety cap prevents infinite splash hang, 0 di
   manual.controller.destroy();
 });
 
-test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested inner pill box, and updates bar completion state', () => {
+test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested inner pill box, and replaces visible progress bar with live elapsed readout', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const root = controller.getState().root;
@@ -2165,15 +2190,22 @@ test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested 
   const panel = root.querySelector('.pg6-splash__panel');
   const statusRow = root.querySelector('.pg6-splash__status-row');
   const stageRow = root.querySelector('.pg6-splash__stage-row');
-  const barFill = root.querySelector('.pg6-splash__bar-fill');
+  const elapsedLabel = root.querySelector('.pg6-splash__elapsed-label');
+  const elapsed = root.querySelector('.pg6-splash__elapsed');
   assert.ok(panel, '.pg6-splash__panel must exist');
   assert.ok(statusRow, '.pg6-splash__status-row must exist');
   assert.equal(statusRow, stageRow, '.pg6-splash__status-row and .pg6-splash__stage-row alias the same row');
   assert.ok(statusRow.querySelector('.pg6-splash__spinner'), 'spinner must be inside status row');
   assert.ok(statusRow.querySelector('.pg6-splash__spinner-ring'), 'spinner ring must be inside status row');
-  assert.ok(statusRow.querySelector('.pg6-splash__greg'), 'Spinning Greg img must be inside status row');
   assert.ok(statusRow.querySelector('.pg6-splash__stage'), 'stage text must be inside status row');
-  assert.ok(barFill, '.pg6-splash__bar-fill must exist');
+  assert.equal(root.querySelector('.pg6-splash__bar'), null, 'visible progress bar must be removed');
+  assert.equal(root.querySelector('.pg6-splash__bar-fill'), null, 'visible progress bar fill must be removed');
+  assert.equal(root.querySelector('.pg6-splash__pct'), null, 'visible percentage readout must be removed');
+  assert.ok(elapsedLabel, '.pg6-splash__elapsed-label must exist');
+  assert.equal(elapsedLabel.textContent, 'Elapsed');
+  assert.ok(elapsed, '.pg6-splash__elapsed must exist');
+  assert.equal(elapsed.getAttribute('role'), 'timer');
+  assert.equal(elapsed.textContent, '00:00');
 
   // Verify shared stylesheet matches #hud Astryx tokens with zero nested inner pill box and zero neon blue.
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
@@ -2202,34 +2234,28 @@ test('W252: Astryx-matched compact splash card uses #hud tokens, removes nested 
   assert.match(rowCss, /box-shadow:\s*none/);
   assert.match(rowCss, /backdrop-filter:\s*none/);
 
-  // Monochrome Astryx spinner (14px) & Spinning Greg (22px).
+  // Monochrome Astryx spinner (14px) and non-spinning hero styling.
   assert.match(css, /\.pg6-splash__spinner-ring\{[^}]*width:14px;height:14px[^}]*border:2px solid var\(--color-track[^}]*border-top-color:var\(--color-accent/);
-  assert.match(css, /\.pg6-splash__spinner--greg\{width:22px;height:22px;\}/);
-  assert.match(css, /\.pg6-splash__greg\{width:22px;height:22px;/);
-
-  // Astryx 4px progress bar using --color-track / --color-accent / --color-success with zero neon blue.
-  assert.match(css, /\.pg6-splash__bar,\.pg6-splash__stream\{[^}]*height:4px;border:none;border-radius:var\(--radius-full[^}]*background:var\(--color-track/);
-  assert.match(css, /\.pg6-splash__bar-fill,\.pg6-splash__stream-fill\{[^}]*background:var\(--color-accent/);
-  assert.match(css, /\.pg6-splash__bar-fill\[data-state="ok"\]\{background:var\(--color-success/);
+  assert.match(css, /\.pg6-splash__greg\{[^}]*animation:none;/);
+  assert.match(css, /\.pg6-splash__elapsed-label\{/);
+  assert.match(css, /\.pg6-splash__elapsed\{[^}]*font-variant-numeric:tabular-nums;/);
   assert.doesNotMatch(css, /#6db3ff/i, 'SHARED_CSS must not use legacy neon blue #6db3ff');
 
-  // Progress fill transitions from active (--color-accent) to ok (--color-success) when complete/ready.
-  assert.equal(barFill.getAttribute('data-state'), 'active');
+  // Telemetry progressPct still tracks boot stages cleanly even without a visible progress bar.
   controller.updateBootState({ stage: 'D3D12_CREATE_DEVICE', progressPct: 78 });
-  assert.equal(barFill.getAttribute('data-state'), 'active');
+  assert.equal(controller.getStats().progressPct, 78);
   controller.updateBootState({ stage: 'FIRST_PRESENT', progressPct: 100, readyForSplash: true });
-  assert.equal(barFill.getAttribute('data-state'), 'ok');
+  assert.equal(controller.getStats().progressPct, 100);
   controller.show({ reset: true });
-  assert.equal(barFill.getAttribute('data-state'), 'active');
+  assert.equal(controller.getStats().progressPct, 0);
   controller.destroy();
 
-  // While holding for visible frame (W230), bar stays active until notifyFirstVisibleFrame().
+  // While holding for visible frame (W230), progressPct stays capped at 99 until notifyFirstVisibleFrame().
   const held = createController({ holdUntilVisible: true });
-  const heldBarFill = held.controller.getState().root.querySelector('.pg6-splash__bar-fill');
   held.controller.onFirstPresent();
-  assert.equal(heldBarFill.getAttribute('data-state'), 'active');
+  assert.equal(held.controller.getStats().progressPct, 90);
   held.controller.notifyFirstVisibleFrame({ fadeDurationMs: 0 });
-  assert.equal(heldBarFill.getAttribute('data-state'), 'ok');
+  assert.equal(held.controller.getStats().progressPct, 100);
   held.controller.destroy();
 });
 
@@ -2293,7 +2319,8 @@ test('W311: exports monotonic phase constants, DEFAULT_FADE_OUT_MS (220), and ph
 test('W311: monotonic phase-aware progress clamping prevents backwards jumps during parallel preloads and reaches 100% right before dismiss', () => {
   const { controller } = createController({ holdUntilVisible: true, fadeOutMs: 220 });
   const root = controller.getState().root;
-  const barFill = root.querySelector('.pg6-splash__bar-fill');
+  assert.equal(root.querySelector('.pg6-splash__bar'), null);
+  assert.equal(root.querySelector('.pg6-splash__bar-fill'), null);
 
   // 1. PGIM_LOAD clamps upper bound to 20% even if a sub-loader reports 100%.
   let state = controller.updateBootState({ stage: 'PGIM_LOAD', progressPct: 12, elapsedMs: 100 });
@@ -2331,7 +2358,6 @@ test('W311: monotonic phase-aware progress clamping prevents backwards jumps dur
   state = controller.onFirstPresent();
   assert.equal(state.phase, 'ASSET_STREAMING');
   assert.equal(state.progressPct, 90);
-  assert.equal(barFill.getAttribute('data-state'), 'active');
 
   state = controller.setLoadingAssetsProgress({ presents: 50, realPackDraws: 20, progressPct: 95 });
   assert.equal(state.progressPct, 95);
@@ -2346,14 +2372,11 @@ test('W311: monotonic phase-aware progress clamping prevents backwards jumps dur
   // Overshooting 100% during ASSET_STREAMING stays capped at 99% until first visible frame.
   state = controller.setLoadingAssetsProgress({ presents: 100, realPackDraws: 50, progressPct: 100 });
   assert.equal(state.progressPct, 99);
-  assert.equal(barFill.getAttribute('data-state'), 'active');
 
   // 5. First non-black frame smoothly reaches 100% right before fade-out dismiss.
   state = controller.notifyFirstVisibleFrame();
   assert.equal(state.phase, 'FIRST_VISIBLE_FRAME');
   assert.equal(state.progressPct, 100);
-  assert.equal(barFill.style.width, '100%');
-  assert.equal(barFill.getAttribute('data-state'), 'ok');
   assert.equal(state.fading, true);
   assert.equal(state.fadeOutCompleted, false);
 
@@ -2548,22 +2571,24 @@ test('W311: surfaces sanitized phase timing telemetry (stageDurationsMs, totalSp
   now = 2000; // WASM_INIT = 550 ms
   controller.updateBootState({ stage: 'D3D12_INIT', progressPct: 75 });
 
-  // Verify Spinning Greg is active by default mid-boot and toggles cleanly while preserving W252 Astryx DOM.
+  // Verify Greg Theft Auto hero is active by default mid-boot and toggles cleanly while preserving W252 Astryx DOM.
   const root = controller.getState().root;
+  const heroImg = root.querySelector('.pg6-splash__img');
   const spinner = root.querySelector('.pg6-splash__spinner');
   const gregImg = root.querySelector('.pg6-splash__greg');
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(gregImg.hidden, false);
-  spinner.dispatch('click');
-  spinner.dispatch('click');
-  spinner.dispatch('click');
-  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(heroImg.hidden, false);
   assert.equal(gregImg.hidden, true);
   spinner.dispatch('click');
   spinner.dispatch('click');
   spinner.dispatch('click');
+  assert.equal(controller.getStats().gregMode, false);
+  assert.equal(heroImg.hidden, true);
+  spinner.dispatch('click');
+  spinner.dispatch('click');
+  spinner.dispatch('click');
   assert.equal(controller.getStats().gregMode, true);
-  assert.equal(gregImg.hidden, false);
+  assert.equal(heroImg.hidden, false);
 
   now = 2300; // D3D12_INIT = 300 ms
   controller.onFirstPresent();
@@ -2645,79 +2670,84 @@ test('W311: surfaces sanitized phase timing telemetry (stageDurationsMs, totalSp
   faulty.controller.destroy();
 });
 
-test('spinning Greg splash spinner renders assets/greg.png by default, degrades gracefully on load error or minimal mocks, and honors reduced motion', () => {
+test('Greg Theft Auto hero banner renders assets/greg.png without spinning, keeps ring spinner, degrades gracefully on load error or minimal mocks, and honors reduced motion', () => {
   const doc = new MockDocument();
   const { controller } = createController({ documentObj: doc });
   const root = controller.getState().root;
+  const heroImg = root.querySelector('.pg6-splash__img');
   const spinner = root.querySelector('.pg6-splash__spinner');
   const ring = root.querySelector('.pg6-splash__spinner-ring');
   const greg = root.querySelector('.pg6-splash__greg');
 
-  // 1) Default spinner displays Spinning Greg (./assets/greg.png) with aria-hidden & non-draggable img.
+  // 1) Default hero displays Greg Theft Auto (./assets/greg.png) framed cleanly; bottom spinner shows monochrome ring and NEVER spins the banner.
+  assert.ok(heroImg);
   assert.ok(spinner);
   assert.ok(ring);
   assert.ok(greg);
+  assert.equal(heroImg.tagName, 'IMG');
+  assert.equal(heroImg.getAttribute('src'), './assets/greg.png');
+  assert.equal(heroImg.getAttribute('alt'), 'Greg Theft Auto');
+  assert.equal(heroImg.getAttribute('draggable'), 'false');
+  assert.equal(heroImg.hidden, false);
+  assert.equal(heroImg.classList.contains('pg6-splash__img--greg'), true);
   assert.equal(spinner.getAttribute('aria-hidden'), 'true');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
-  assert.equal(greg.tagName, 'IMG');
-  assert.equal(greg.getAttribute('src'), './assets/greg.png');
-  assert.equal(greg.getAttribute('aria-hidden'), 'true');
-  assert.equal(greg.getAttribute('draggable'), 'false');
-  assert.equal(greg.hidden, false);
-  assert.equal(greg.style.display, '');
-  assert.equal(greg.style.animation, '');
-  assert.equal(ring.hidden, true);
-  assert.equal(ring.style.display, 'none');
-
-  // Verify shared stylesheet & web/ui/overlay.css define 360-degree spin animation + object-fit: contain + reduced-motion override.
-  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
-  assert.ok(styleEl);
-  assert.match(styleEl.textContent, /\.pg6-splash__greg\{[^}]*object-fit:contain[^}]*animation:pg6-spin 1200ms linear infinite/);
-  assert.match(styleEl.textContent, /@keyframes pg6-spin\{from\{transform:rotate\(0deg\);\}to\{transform:rotate\(360deg\);\}\}/);
-  assert.match(styleEl.textContent, /\.pg6-splash\[data-reduced-motion="true"\] \.pg6-splash__greg\{animation:none!important;\}/);
-
-  const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
-  assert.match(overlayCss, /@keyframes\s+pg6-spin\s*\{[\s\S]*rotate\(0deg\)[\s\S]*rotate\(360deg\)/);
-  assert.match(
-    overlayCss,
-    /#splash-overlay-root\s+\.pg6-splash__greg\s*\{[\s\S]*object-fit:\s*contain;[\s\S]*animation:\s*pg6-spin\s+1200ms\s+linear\s+infinite;/
-  );
-  assert.match(
-    overlayCss,
-    /\.pg6-splash\[data-reduced-motion="true"\]\s+\.pg6-splash__greg[\s\S]*animation:\s*none\s*!important;/
-  );
-  assert.match(
-    overlayCss,
-    /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)[\s\S]*\.pg6-splash__greg[\s\S]*animation:\s*none\s*!important;/
-  );
-
-  // 2) If assets/greg.png fails to load, gracefully degrades to .pg6-splash__spinner-ring without throwing.
-  assert.equal(greg.listenerCount('error'), 1);
-  assert.doesNotThrow(() => greg.dispatch('error'));
-  assert.equal(greg.hidden, true);
-  assert.equal(greg.style.display, 'none');
+  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
   assert.equal(ring.hidden, false);
   assert.equal(ring.style.display, '');
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), false);
-  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
+  assert.equal(ring.style.animation, '');
+  assert.equal(greg.hidden, true);
+  assert.equal(greg.style.display, 'none');
+  assert.equal(greg.style.animation, 'none');
 
-  // Error listener is cleaned up on destroy.
+  // Verify shared stylesheet & web/ui/overlay.css use subtle pulse (not 360-deg spin) on the hero banner and disable spin on .pg6-splash__greg.
+  const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
+  assert.ok(styleEl);
+  assert.match(styleEl.textContent, /\.pg6-splash__img\.pg6-splash__img--greg\{[^}]*aspect-ratio:2\/1[^}]*animation:pg6-greg-pulse 4800ms ease-in-out infinite;/);
+  assert.match(styleEl.textContent, /@keyframes pg6-greg-pulse\{/);
+  assert.match(styleEl.textContent, /\.pg6-splash__greg\{[^}]*animation:none;/);
+  assert.match(styleEl.textContent, /\.pg6-splash\[data-reduced-motion="true"\] \.pg6-splash__img--greg\{animation:none!important;transform:none!important;\}/);
+
+  const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
+  assert.match(overlayCss, /@keyframes\s+pg6-greg-pulse\s*\{[\s\S]*scale\(1\.012\)/);
+  assert.match(
+    overlayCss,
+    /#splash-overlay-root\s+\.pg6-splash__greg\s*\{[\s\S]*display:\s*none;[\s\S]*animation:\s*none;/
+  );
+  assert.match(
+    overlayCss,
+    /\.pg6-splash\[data-reduced-motion="true"\]\s+\.pg6-splash__img--greg[\s\S]*animation:\s*none\s*!important;/
+  );
+  assert.match(
+    overlayCss,
+    /@media\s*\(\s*prefers-reduced-motion\s*:\s*reduce\s*\)[\s\S]*\.pg6-splash__img--greg[\s\S]*animation:\s*none\s*!important;/
+  );
+
+  // 2) If assets/greg.png fails to load on the hero img, degrades gracefully to fallback without throwing.
+  assert.equal(heroImg.listenerCount('error'), 1);
+  assert.doesNotThrow(() => heroImg.dispatch('error'));
+  assert.equal(heroImg.hidden, true);
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'false');
+  assert.equal(ring.hidden, false);
+
+  // Error listeners are cleaned up on destroy.
   controller.destroy();
+  assert.equal(heroImg.listenerCount('error'), 0);
   assert.equal(greg.listenerCount('error'), 0);
 
-  // 3) Reduced motion stops Greg spinning while keeping Greg visible cleanly.
+  // 3) Reduced motion stops pulse & ring spin while keeping Greg Theft Auto visible cleanly.
   const reduced = createController({
     matchMedia: (q) => ({ matches: q === REDUCED_MOTION_QUERY }),
   });
   const rRoot = reduced.controller.getState().root;
+  const rHero = rRoot.querySelector('.pg6-splash__img');
   const rSpinner = rRoot.querySelector('.pg6-splash__spinner');
-  const rGreg = rRoot.querySelector('.pg6-splash__greg');
+  const rRing = rRoot.querySelector('.pg6-splash__spinner-ring');
   assert.equal(rRoot.getAttribute('data-reduced-motion'), 'true');
   assert.equal(rSpinner.getAttribute('data-reduced-motion'), 'true');
   assert.equal(rSpinner.getAttribute('aria-hidden'), 'true');
-  assert.equal(rGreg.hidden, false);
-  assert.equal(rGreg.style.display, '');
-  assert.equal(rGreg.style.animation, 'none');
+  assert.equal(rHero.hidden, false);
+  assert.equal(rHero.style.animation, 'none');
+  assert.equal(rRing.style.animation, 'none');
   reduced.controller.destroy();
 
   // 4) Minimal DOM test mocks (omitting style/classList/addEventListener) degrade gracefully without throwing.
@@ -2747,7 +2777,7 @@ test('spinning Greg splash spinner renders assets/greg.png by default, degrades 
   });
 });
 
-test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping Spinning Greg and centered dark styling', () => {
+test('default Greg Theft Auto hero backdrop replaces /game/xbs_splash.png with wide rounded hero framing on dark Astryx canvas', () => {
   assert.equal(typeof resolveDefaultGregMode, 'function');
   assert.equal(resolveDefaultGregMode(''), true);
   assert.equal(resolveDefaultGregMode(null), true);
@@ -2768,9 +2798,10 @@ test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping S
   const img = root.querySelector('.pg6-splash__img');
   const fallback = root.querySelector('.pg6-splash__fallback');
   const spinner = root.querySelector('.pg6-splash__spinner');
+  const ring = root.querySelector('.pg6-splash__spinner-ring');
   const gregSpinner = root.querySelector('.pg6-splash__greg');
 
-  // 1) Initial mount uses Greg backdrop and keeps Spinning Greg in the bottom Astryx card.
+  // 1) Initial mount uses Greg Theft Auto hero backdrop and monochrome ring spinner in the bottom Astryx card.
   const initial = controller.getState();
   assert.equal(initial.gregMode, true);
   assert.equal(initial.gregBackdropActive, true);
@@ -2782,17 +2813,17 @@ test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping S
   assert.equal(media.classList.contains('pg6-splash__media--greg'), true);
   assert.equal(media.getAttribute('data-greg-backdrop'), 'true');
   assert.equal(img.getAttribute('src'), './assets/greg.png');
-  assert.equal(img.getAttribute('alt'), 'Greg');
+  assert.equal(img.getAttribute('alt'), 'Greg Theft Auto');
   assert.equal(img.getAttribute('data-greg-backdrop'), 'true');
   assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
   assert.equal(img.style.objectFit, 'contain');
   assert.equal(img.hidden, false);
   assert.equal(fallback.hidden, true);
-  assert.equal(spinner.classList.contains('pg6-splash__spinner--greg'), true);
-  assert.equal(gregSpinner.hidden, false);
-  assert.equal(gregSpinner.getAttribute('src'), './assets/greg.png');
+  assert.equal(spinner.getAttribute('data-greg-mode'), 'true');
+  assert.equal(ring.hidden, false);
+  assert.equal(gregSpinner.hidden, true);
 
-  // 2) Calling setSplashImageUrl() / setSplashImage() later stores original URL but keeps Greg backdrop active.
+  // 2) Calling setSplashImageUrl() / setSplashImage() later stores original URL but keeps Greg Theft Auto hero active.
   const afterSet = controller.setSplashImageUrl('/game/Assets/xbs_splash.png');
   assert.equal(afterSet.splashImageUrl, '/game/Assets/xbs_splash.png');
   assert.equal(afterSet.activeSplashImageUrl, './assets/greg.png');
@@ -2801,14 +2832,14 @@ test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping S
   assert.equal(img.style.objectFit, 'contain');
   assert.equal(img.classList.contains('pg6-splash__img--greg'), true);
 
-  // 3) Verify SHARED_CSS and web/ui/overlay.css style the centered Greg backdrop on a dark #0b0c10 vignette.
+  // 3) Verify SHARED_CSS and web/ui/overlay.css style the wide rounded Greg Theft Auto hero frame on a dark #0b0c10 vignette.
   const styleEl = doc.head.children.find((el) => el.getAttribute('data-pg6-splash-style') === '1');
   assert.ok(styleEl);
   assert.match(styleEl.textContent, /\.pg6-splash\[data-greg-backdrop="true"\]\{background:#0b0c10;\}/);
   assert.match(styleEl.textContent, /\.pg6-splash__media--greg\{[^}]*radial-gradient\([^}]*#0b0c10/);
   assert.match(
     styleEl.textContent,
-    /\.pg6-splash__img\.pg6-splash__img--greg\{[^}]*width:min\(340px,46vmin\)[^}]*max-width:70vw;max-height:55vh;object-fit:contain;/
+    /\.pg6-splash__img\.pg6-splash__img--greg\{[^}]*width:min\(1040px,92vw\)[^}]*aspect-ratio:2\/1;object-fit:contain;[^}]*border-radius:var\(--radius-container,16px\);/
   );
 
   const overlayCss = fs.readFileSync(path.join(REPO_ROOT, 'web', 'ui', 'overlay.css'), 'utf8');
@@ -2816,7 +2847,7 @@ test('default Greg splash backdrop replaces /game/xbs_splash.png while keeping S
   assert.match(overlayCss, /#splash-overlay-root\s+\.pg6-splash__media--greg[\s\S]*radial-gradient/);
   assert.match(
     overlayCss,
-    /#splash-overlay-root\s+\.pg6-splash__img\.pg6-splash__img--greg[\s\S]*width:\s*min\(340px,\s*46vmin\)[\s\S]*max-width:\s*70vw;[\s\S]*max-height:\s*55vh;[\s\S]*object-fit:\s*contain;/
+    /#splash-overlay-root\s+\.pg6-splash__img\.pg6-splash__img--greg[\s\S]*width:\s*min\(1040px,\s*92vw\)[\s\S]*aspect-ratio:\s*2\s*\/\s*1;[\s\S]*object-fit:\s*contain;[\s\S]*border-radius:\s*var\(--radius-container\);/
   );
 
   controller.destroy();
@@ -2980,4 +3011,155 @@ test('Greg backdrop degrades gracefully when ./assets/greg.png fails to load', (
   assert.equal(nImg.hidden, true);
   assert.equal(nFallback.hidden, false);
   withoutOriginal.controller.destroy();
+});
+
+test('Greg Theft Auto asset dimensions and live elapsed-time clock replace 99%-stuck progress bar with zero leaked timers', () => {
+  // 1) Verify web/assets/greg.png is a valid 2:1 widescreen PNG (1280x640) and compact (< 512 KiB).
+  const gregPath = path.join(REPO_ROOT, 'web', 'assets', 'greg.png');
+  const pngBytes = fs.readFileSync(gregPath);
+  assert.ok(pngBytes.length > 0 && pngBytes.length < 512 * 1024);
+  const width = pngBytes.readUInt32BE(16);
+  const height = pngBytes.readUInt32BE(20);
+  assert.equal(width, 1280);
+  assert.equal(height, 640);
+
+  // 2) formatElapsedClock and DEFAULT_ELAPSED_INTERVAL_MS exports.
+  assert.equal(typeof formatElapsedClock, 'function');
+  assert.equal(DEFAULT_ELAPSED_INTERVAL_MS, 250);
+  assert.equal(globalThis.PlayGta6SplashOverlay.formatElapsedClock, formatElapsedClock);
+  assert.equal(
+    globalThis.PlayGta6SplashOverlay.DEFAULT_ELAPSED_INTERVAL_MS,
+    DEFAULT_ELAPSED_INTERVAL_MS
+  );
+  assert.equal(formatElapsedClock(0), '00:00');
+  assert.equal(formatElapsedClock(999), '00:00');
+  assert.equal(formatElapsedClock(1000), '00:01');
+  assert.equal(formatElapsedClock(42500), '00:42');
+  assert.equal(formatElapsedClock(65000), '01:05');
+  assert.equal(formatElapsedClock(3661000), '1:01:01');
+  assert.equal(formatElapsedClock(-500), '00:00');
+  assert.equal(formatElapsedClock(Number.NaN), '00:00');
+  assert.equal(formatElapsedClock(Number.POSITIVE_INFINITY), '00:00');
+
+  // 3) Validate setInterval, clearInterval, and elapsedIntervalMs options.
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), setInterval: 123 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), clearInterval: 123 }),
+    TypeError
+  );
+  assert.throws(
+    () => new SplashOverlayController({ documentObj: new MockDocument(), elapsedIntervalMs: -10 }),
+    TypeError
+  );
+
+  // 4) Live elapsed timer ticks smoothly while visible (even with no boot-stage updates) and stops immediately on dismiss/hide/destroy.
+  let nextIntervalId = 1;
+  const activeIntervals = new Map();
+  const fakeIntervals = {
+    setInterval(fn, ms) {
+      const id = nextIntervalId++;
+      activeIntervals.set(id, { fn, ms });
+      return id;
+    },
+    clearInterval(id) {
+      activeIntervals.delete(id);
+    },
+    tick() {
+      for (const entry of Array.from(activeIntervals.values())) {
+        entry.fn();
+      }
+    },
+  };
+
+  let now = 10000;
+  const { controller, timer } = createController({
+    holdUntilVisible: true,
+    fadeOutMs: 220,
+    nowFn: () => now,
+    setInterval: fakeIntervals.setInterval,
+    clearInterval: fakeIntervals.clearInterval,
+    elapsedIntervalMs: 250,
+  });
+
+  const root = controller.getState().root;
+  const elapsedEl = root.querySelector('.pg6-splash__elapsed');
+  assert.equal(root.querySelector('.pg6-splash__bar'), null);
+  assert.equal(root.querySelector('.pg6-splash__pct'), null);
+  assert.equal(activeIntervals.size, 1);
+  assert.equal(elapsedEl.textContent, '00:00');
+  assert.equal(controller.getStats().elapsedText, '00:00');
+
+  // Simulate long 99%-held boot with zero progress updates: wall clock still ticks cleanly!
+  controller.setStage('ASSET_STREAMING', 'Loading game assets...');
+  controller.updateProgress(99);
+  assert.equal(controller.getStats().progressPct, 99);
+  assert.equal(root.querySelector('.pg6-splash__stage').textContent, 'Loading game assets...');
+
+  now = 52400; // +42.4s
+  fakeIntervals.tick();
+  assert.equal(elapsedEl.textContent, '00:42');
+  assert.equal(elapsedEl.getAttribute('aria-label'), 'Elapsed: 00:42');
+  assert.equal(controller.getStats().liveElapsedMs, 42400);
+  assert.equal(controller.getStats().elapsedText, '00:42');
+
+  now = 75000; // +65s
+  fakeIntervals.tick();
+  assert.equal(elapsedEl.textContent, '01:05');
+
+  // hide() stops the interval immediately; show() resumes it cleanly.
+  controller.hide();
+  assert.equal(activeIntervals.size, 0);
+  controller.show();
+  assert.equal(activeIntervals.size, 1);
+
+  // dismiss() stops the interval immediately (before fade completes) and freezes final elapsed time.
+  now = 80000; // +70s
+  controller.dismiss({ fadeOutMs: 220 });
+  assert.equal(activeIntervals.size, 0);
+  assert.equal(elapsedEl.textContent, '01:10');
+  now = 80220;
+  timer.flush();
+  assert.equal(activeIntervals.size, 0);
+  assert.equal(controller.getStats().totalSplashMs, 70220);
+
+  // show({ reset: true }) resets elapsed time to 00:00 and restarts interval.
+  now = 90000;
+  controller.show({ reset: true });
+  assert.equal(activeIntervals.size, 1);
+  assert.equal(elapsedEl.textContent, '00:00');
+  now = 93000;
+  fakeIntervals.tick();
+  assert.equal(elapsedEl.textContent, '00:03');
+
+  // destroy() clears active interval cleanly with zero leaks.
+  controller.destroy();
+  assert.equal(activeIntervals.size, 0);
+
+  // 5) ?hud=0 and visible: false do not start background intervals.
+  const hud0 = createController({
+    locationSearch: '?hud=0',
+    setInterval: fakeIntervals.setInterval,
+    clearInterval: fakeIntervals.clearInterval,
+  });
+  assert.equal(activeIntervals.size, 0);
+  hud0.controller.destroy();
+
+  const hiddenInit = createController({
+    visible: false,
+    setInterval: fakeIntervals.setInterval,
+    clearInterval: fakeIntervals.clearInterval,
+  });
+  assert.equal(activeIntervals.size, 0);
+  hiddenInit.controller.destroy();
+
+  const disabledInterval = createController({
+    elapsedIntervalMs: 0,
+    setInterval: fakeIntervals.setInterval,
+    clearInterval: fakeIntervals.clearInterval,
+  });
+  assert.equal(activeIntervals.size, 0);
+  disabledInterval.controller.destroy();
 });
