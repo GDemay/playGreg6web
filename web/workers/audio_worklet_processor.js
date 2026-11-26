@@ -875,17 +875,22 @@
       this._samples = new Float32Array(sab, RING_HEADER_BYTES, capacityFrames * channels);
     }
 
-    _updateTargetGain(immediate = false) {
+    _updateTargetGain(immediate = false, rampFramesOverride = undefined) {
       const nextTarget = this._muted ? 0.0 : this._gain;
       this._targetGain = nextTarget;
 
-      if (immediate || this._smoothingFrames <= 0 || this._currentGain === nextTarget) {
+      const rampFrames =
+        rampFramesOverride !== undefined && rampFramesOverride !== null
+          ? sanitizeSmoothingFrames(rampFramesOverride)
+          : this._smoothingFrames;
+
+      if (immediate || rampFrames <= 0 || this._currentGain === nextTarget) {
         this._currentGain = nextTarget;
         this._rampStep = 0.0;
         this._rampRemaining = 0;
       } else {
-        this._rampRemaining = this._smoothingFrames;
-        this._rampStep = (nextTarget - this._currentGain) / this._smoothingFrames;
+        this._rampRemaining = rampFrames;
+        this._rampStep = (nextTarget - this._currentGain) / rampFrames;
       }
     }
 
@@ -1037,13 +1042,13 @@
 
         case 'setGain': {
           this._gain = clampGain(msg.gain);
-          this._updateTargetGain(Boolean(msg.immediate));
+          this._updateTargetGain(Boolean(msg.immediate), msg.rampFrames);
           break;
         }
 
         case 'setMuted': {
           this._muted = Boolean(msg.muted);
-          this._updateTargetGain(Boolean(msg.immediate));
+          this._updateTargetGain(Boolean(msg.immediate), msg.rampFrames);
           break;
         }
 

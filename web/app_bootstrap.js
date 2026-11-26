@@ -2604,18 +2604,38 @@ export function bootstrapPlayGta6App(options = {}) {
     typeof effectiveAudioContextCtor === 'function' &&
     typeof effectiveAudioWorkletNodeCtor === 'function';
 
+  const userAudioOnStateChange =
+    typeof audioOptions.onStateChange === 'function' ? audioOptions.onStateChange : null;
+  let notifyRuntimeAudioContextState = () => {};
+
   const hasExplicitAudioEngine =
     options.audioEngine !== undefined && options.audioEngine !== null;
   const audioEngine = hasExplicitAudioEngine
     ? options.audioEngine
     : new AudioEngine({
         ...audioOptions,
+        ...(audioOptions.audioWorker === undefined &&
+        audioOptions.worker === undefined &&
+        audioOptions.bridge === undefined &&
+        options.audioWorker
+          ? { audioWorker: options.audioWorker }
+          : {}),
         ...(resolvedAudioContextCtor !== undefined
           ? { AudioContextCtor: resolvedAudioContextCtor }
           : {}),
         ...(resolvedAudioWorkletNodeCtor !== undefined
           ? { AudioWorkletNodeCtor: resolvedAudioWorkletNodeCtor }
           : {}),
+        onStateChange: (nextState) => {
+          if (nextState === 'running') {
+            notifyRuntimeAudioContextState('active');
+          } else if (nextState === 'suspended' || nextState === 'interrupted') {
+            notifyRuntimeAudioContextState('suspended');
+          }
+          if (userAudioOnStateChange) {
+            userAudioOnStateChange(nextState);
+          }
+        },
         onError: (err) => {
           crashReporter.recordError('runtime', err, { source: 'audioEngine' });
           if (userAudioOnError) {
@@ -7359,7 +7379,41 @@ export function bootstrapPlayGta6App(options = {}) {
     resizeListenerAttached = true;
   }
 
-  // 8b. First-user-gesture Web Audio unlock (W261 / #1028 live stereo audio).
+  // 8b. First-user-gesture Web Audio unlock (W261 / W370 / #1028 live stereo audio).
+  notifyRuntimeAudioContextState = (outputState) => {
+    if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+      return;
+    }
+    const loaderWorker =
+      activeWasmHandle && activeWasmHandle.worker && typeof activeWasmHandle.worker.postMessage === 'function'
+        ? activeWasmHandle.worker
+        : null;
+    if (!loaderWorker) {
+      return;
+    }
+    try {
+      const payload = {
+        type: 'audio-context-state',
+        setOutputState: true,
+        outputState,
+        unlockedOnGesture: Boolean(audioEngine.unlockedOnGesture),
+      };
+      if (
+        typeof audioEngine.sampleRate === 'number' &&
+        Number.isFinite(audioEngine.sampleRate) &&
+        audioEngine.sampleRate > 0
+      ) {
+        payload.sampleRate = audioEngine.sampleRate;
+      }
+      if (audioEngine.sab) {
+        payload.ringSab = audioEngine.sab;
+      }
+      loaderWorker.postMessage(payload);
+    } catch {
+      // Non-fatal audio-context-state forwarding error.
+    }
+  };
+
   const audioGestureTarget =
     options.audioGestureTarget !== undefined
       ? options.audioGestureTarget
@@ -7369,7 +7423,10 @@ export function bootstrapPlayGta6App(options = {}) {
           ? documentObj
           : null;
   let audioGestureUnlockAttempted = false;
+  let audioGestureUnlockInFlight = false;
+  let audioGestureRetriesRemaining = 5;
   let audioGestureCleanup = null;
+  const audioGestureEvents = ['pointerdown', 'keydown', 'click', 'touchstart'];
 
   function detachAudioGestureUnlock() {
     if (!audioGestureCleanup) {
@@ -7384,66 +7441,14 @@ export function bootstrapPlayGta6App(options = {}) {
     }
   }
 
-  function invokeAudioGestureUnlock() {
-    if (destroyed || audioGestureUnlockAttempted || !audioEngine || typeof audioEngine !== 'object') {
+  function armAudioGestureUnlock() {
+    if (destroyed || audioGestureUnlockAttempted || !isEventTargetLike(audioGestureTarget) || !audioEngine) {
       return;
     }
-    audioGestureUnlockAttempted = true;
     detachAudioGestureUnlock();
-
-    const triggerUnlock = () => {
-      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
-        return;
-      }
-      try {
-        let result;
-        if (typeof audioEngine.unlockOnUserGesture === 'function') {
-          result = audioEngine.unlockOnUserGesture();
-        } else if (typeof audioEngine.unlockOnGesture === 'function') {
-          result = audioEngine.unlockOnGesture();
-        } else if (typeof audioEngine.resume === 'function') {
-          result = audioEngine.resume();
-        }
-        if (result && typeof result.catch === 'function') {
-          result.catch(() => {
-            // Audio unlock rejections must never surface as unhandled rejections.
-          });
-        }
-      } catch {
-        // Audio unlock errors must never interrupt input or rendering.
-      }
-    };
-
-    const needsLazyStart =
-      !hasExplicitAudioEngine &&
-      hasWebAudioSupport &&
-      !audioEngine.context &&
-      audioEngine.state === 'idle' &&
-      typeof audioEngine.start === 'function';
-
-    if (needsLazyStart) {
-      try {
-        Promise.resolve(audioEngine.start())
-          .then(() => {
-            triggerUnlock();
-          })
-          .catch(() => {
-            // Ignore lazy WebAudio startup failures during gesture unlock.
-          });
-      } catch {
-        // Ignore synchronous startup errors.
-      }
-      return;
-    }
-
-    triggerUnlock();
-  }
-
-  if (isEventTargetLike(audioGestureTarget) && audioEngine) {
-    const gestureEvents = ['pointerdown', 'keydown'];
     const registeredEvents = [];
-    for (let i = 0; i < gestureEvents.length; i += 1) {
-      const evt = gestureEvents[i];
+    for (let i = 0; i < audioGestureEvents.length; i += 1) {
+      const evt = audioGestureEvents[i];
       try {
         audioGestureTarget.addEventListener(evt, invokeAudioGestureUnlock, {
           passive: true,
@@ -7466,6 +7471,113 @@ export function bootstrapPlayGta6App(options = {}) {
       };
     }
   }
+
+  function invokeAudioGestureUnlock() {
+    if (
+      destroyed ||
+      audioGestureUnlockAttempted ||
+      audioGestureUnlockInFlight ||
+      !audioEngine ||
+      typeof audioEngine !== 'object'
+    ) {
+      return;
+    }
+    audioGestureUnlockInFlight = true;
+    detachAudioGestureUnlock();
+
+    const finishAttempt = (failedExplicitly) => {
+      audioGestureUnlockInFlight = false;
+      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+        audioGestureUnlockAttempted = true;
+        return;
+      }
+      const stillSuspended = Boolean(
+        audioEngine.context &&
+          (audioEngine.state === 'suspended' || audioEngine.state === 'interrupted')
+      );
+      if ((failedExplicitly || stillSuspended) && audioGestureRetriesRemaining > 0) {
+        audioGestureRetriesRemaining -= 1;
+        armAudioGestureUnlock();
+        return;
+      }
+      audioGestureUnlockAttempted = true;
+      if (audioEngine.state === 'running') {
+        notifyRuntimeAudioContextState('active');
+      }
+    };
+
+    const triggerUnlock = () => {
+      if (destroyed || !audioEngine || typeof audioEngine !== 'object') {
+        finishAttempt(false);
+        return;
+      }
+      try {
+        let result;
+        if (typeof audioEngine.unlockOnUserGesture === 'function') {
+          result = audioEngine.unlockOnUserGesture();
+        } else if (typeof audioEngine.unlockOnGesture === 'function') {
+          result = audioEngine.unlockOnGesture();
+        } else if (typeof audioEngine.resume === 'function') {
+          result = audioEngine.resume();
+        }
+        if (result && typeof result.then === 'function') {
+          result.then(
+            (val) => {
+              const failed =
+                val === false ||
+                (val && typeof val === 'object' && (val.ok === false || val.unlocked === false));
+              finishAttempt(Boolean(failed));
+            },
+            () => {
+              finishAttempt(true);
+            }
+          );
+        } else {
+          const failed =
+            result === false ||
+            (result &&
+              typeof result === 'object' &&
+              (result.ok === false || result.unlocked === false));
+          finishAttempt(Boolean(failed));
+        }
+      } catch {
+        // Audio unlock errors must never interrupt input or rendering.
+        finishAttempt(true);
+      }
+    };
+
+    const needsLazyStart =
+      !hasExplicitAudioEngine &&
+      hasWebAudioSupport &&
+      !audioEngine.context &&
+      audioEngine.state === 'idle' &&
+      typeof audioEngine.start === 'function';
+
+    if (needsLazyStart) {
+      try {
+        Promise.resolve(audioEngine.start())
+          .then((startRes) => {
+            if (startRes && typeof startRes === 'object' && startRes.ok === false) {
+              finishAttempt(true);
+              return;
+            }
+            triggerUnlock();
+          })
+          .catch(() => {
+            // Ignore lazy WebAudio startup failures during gesture unlock.
+            finishAttempt(true);
+          });
+      } catch {
+        // Ignore synchronous startup errors.
+        finishAttempt(true);
+      }
+      return;
+    }
+
+    triggerUnlock();
+  }
+
+  armAudioGestureUnlock();
 
   function resolveCurrentBootMode() {
     if (session && typeof session.getBootMode === 'function') {
