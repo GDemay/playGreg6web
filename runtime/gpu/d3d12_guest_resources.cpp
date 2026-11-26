@@ -1176,21 +1176,34 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
         it->second.last_use = ++address_texture_tick_;
         return it->second.id;
     }
-    // O36: bounded: the least recently used texture is dropped (and its GPU texture freed) before
-    // a new one is made, so a long session's streaming does not grow the table without limit.
+    // O36 / G70 (#691): bounded LRU. Prefer evicting textures not used in the current frame, and
+    // incorporate StateBridgeDevice::resource_last_use_tick so textures kept hot by BindGroupCache
+    // hits are not starved. Any victim referenced in the current frame has its DestroyResource
+    // deferred until after Present so queue.submit() never sees a destroyed texture.
+    CommandEncoder drop;
+    bridge_->advance_present_frame(stats().presents, drop);
     while (address_textures_.size() >= kMaxAddressTextures) {
-        auto oldest = address_textures_.begin();
+        auto oldest = address_textures_.end();
+        bool oldest_in_frame = true;
+        uint64_t oldest_use = UINT64_MAX;
         for (auto i = address_textures_.begin(); i != address_textures_.end(); ++i) {
-            if (i->second.last_use < oldest->second.last_use) {
+            const bool in_frame = bridge_->is_resource_used_in_frame(i->second.id);
+            const uint64_t use = std::max(i->second.last_use, bridge_->resource_last_use_tick(i->second.id));
+            if (oldest == address_textures_.end() ||
+                (oldest_in_frame && !in_frame) ||
+                (in_frame == oldest_in_frame && use < oldest_use)) {
                 oldest = i;
+                oldest_in_frame = in_frame;
+                oldest_use = use;
             }
         }
         const uint32_t victim = oldest->second.id;
         address_textures_.erase(oldest);
         untrack_guest_texture(victim);
         bridge_->unregister_resource(victim);
-        CommandEncoder drop;
-        drop.destroy_resource(victim);
+        bridge_->destroy_or_defer_resource(victim, drop);
+    }
+    if (drop.size() != 0) {
         submit(drop);
     }
 
@@ -1270,6 +1283,9 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 
 void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     std::lock_guard<std::mutex> flush_lock(flush_mutex_);
+    // G70 (#691): emit deferred DestroyResource packets from the previous frame once Present has
+    // advanced (strictly after that frame's Present and before any draw in the new frame).
+    bridge_->advance_present_frame(stats().presents, encoder);
     // O36: one pass over the translated window's write marks for the buffers and the relocated
     // ranges below. A relocated range in the window whose slots are unmarked has not been written
     // since its bytes were last read (the same protocol as the buffers: marks taken before the
@@ -1583,7 +1599,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             if (lru_it->second.dedicated) {
                 const uint32_t old_id = lru_it->second.buffer_id;
                 bridge_->unregister_resource(old_id);
-                enc.destroy_resource(old_id);
+                bridge_->advance_present_frame(stats().presents, enc);
+                bridge_->destroy_or_defer_resource(old_id, enc);
                 storage_relocation_buffers_.erase(
                     std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), old_id),
                     storage_relocation_buffers_.end());
@@ -1689,17 +1706,28 @@ bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id,
     const uint64_t buffer_bytes = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(buffer_bytes), 0);
 
-    // Bounded like the storage relocations: the least recently bound mirror is destroyed.
+    // Bounded like the storage relocations: the least recently bound mirror is destroyed
+    // (preferring entries not used in the current frame, and deferring DestroyResource past Present
+    // if a current-frame buffer had to be evicted).
     CommandEncoder enc;
+    bridge_->advance_present_frame(stats().presents, enc);
     while (!ia_relocations_.empty() &&
            (ia_relocations_.size() >= kMaxEntries || ia_relocation_bytes_ + buffer_bytes > kMaxTotalBytes)) {
-        auto lru = ia_relocations_.begin();
+        auto lru = ia_relocations_.end();
+        bool lru_in_frame = true;
+        uint64_t lru_use = UINT64_MAX;
         for (auto it = ia_relocations_.begin(); it != ia_relocations_.end(); ++it) {
-            if (it->second.last_used_seq < lru->second.last_used_seq) {
+            const bool in_frame = bridge_->is_resource_used_in_frame(it->second.buffer_id);
+            const uint64_t use = std::max(it->second.last_used_seq, bridge_->resource_last_use_tick(it->second.buffer_id));
+            if (lru == ia_relocations_.end() ||
+                (lru_in_frame && !in_frame) ||
+                (in_frame == lru_in_frame && use < lru_use)) {
                 lru = it;
+                lru_in_frame = in_frame;
+                lru_use = use;
             }
         }
-        enc.destroy_resource(lru->second.buffer_id);
+        bridge_->destroy_or_defer_resource(lru->second.buffer_id, enc);
         ia_relocation_bytes_ -= lru->second.buffer_bytes;
         ia_relocations_.erase(lru);
     }
@@ -1832,8 +1860,11 @@ Resource::~Resource() {
         // A GPU object whose create packet was never written (never used) needs no DestroyResource.
         if ((is_buffer() || gpu_texture_) && !device_->release_deferred(id_)) {
             CommandEncoder enc;
-            enc.destroy_resource(id_);
-            device_->submit(enc);
+            device_->state_bridge().advance_present_frame(device_->stats().presents, enc);
+            device_->state_bridge().destroy_or_defer_resource(id_, enc);
+            if (enc.size() != 0) {
+                device_->submit(enc);
+            }
         }
     }
     if (owned_guest_memory_ != 0) {
