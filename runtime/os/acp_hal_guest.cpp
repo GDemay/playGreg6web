@@ -560,12 +560,21 @@ HResult xdsp_submit_command(uint64_t handle, uint64_t command) {
 // (0x144E64480), accepts payloads of at most 0x280 bytes (0x144E64710) and copies a record minus
 // its length prefix into the input slot; 960 float32 frames per channel per packet is Opus's
 // 20 ms frame at 48 kHz. The channel count is capacity / 0xF00.
-// Model: no processing hardware, but every command of types 1, 2 and 5 is acknowledged with a
-// result {type, voice index} (the rest zero) in submission order, so voices move through their
-// states and are freed. Command 3 is decoded synchronously (os/xapu_opus.h; per-voice decoder
-// state, reset by commands 1 and 2), the float32 PCM written to the output address, and a result
-// {3, voice index, zeros, +0x34 bytes written} queued (0 bytes when the packet does not decode).
-// Other command types are accepted without a result (counted, the first logged).
+// Model: no processing hardware, but every command is acknowledged with a result {type, voice
+// index} (the rest zero) in submission order, so voices move through their states and are freed.
+// Command 3 is decoded synchronously (os/xapu_opus.h; per-voice decoder state, reset by commands 1
+// and 2), the float32 PCM written to the output address, and a result {3, voice index, zeros, +0x34
+// bytes written} queued (0 bytes when the packet does not decode).
+// Evidence (R40 verification, static survey of the executable's five XApu import thunks and all
+// their callers; no runtime trace): the title only ever sends types 1, 2, 3 and 5 (one sender
+// each, 0x1400483d0 type 5, 0x144ee9930 type 1, 0x144f20900 type 2, 0x144f20ad0 type 3), and its
+// result drain (0x144eaa840: GetResultCount(handle, 0), then that many DequeueResult calls into a
+// zeroed 0x58-byte struct; result type at +0, voice at +4) acts only on result types 1, 2, 3 and
+// 5 and ignores any other type, and skips a failing dequeue. So acknowledging types the title never
+// sends (the "every type gets a result" rule) is harmless but unobservable. No caller checks the
+// HRESULT of XApuEnqueueCommand (each discards it and advances its voice state), so the
+// queue-full HRESULT below is a modelling choice, not something the title reacts to; a dropped
+// command would strand that voice in its pending state.
 //
 // Codec census (R40, menu-flow run of 420 s): the executable sends XApu only types 1, 2 and 3
 // (5 is wired but was not seen); every decode command carries one Opus packet (287 decoded, 0
@@ -645,6 +654,8 @@ uint64_t alloc_zeroed(uint64_t bytes) {
 }
 
 // Connect parameters: see os/xapu_connect.h (six u32 words, layout verified against the title's call).
+// 0x8007006C (Win32 code 108) is a guess: no caller in the executable inspects the
+// enqueue result, so any failing value behaves the same for the title.
 constexpr HResult kXApuQueueFull = static_cast<HResult>(0x8007006Cu);
 
 xapu_connect::Params parse_connect_params(uint64_t params) {
@@ -865,7 +876,8 @@ HResult xapu_enqueue_command(uint64_t handle, uint64_t command, uint32_t /*flags
     if (const size_t limit = xapu().limits[handle]; limit != 0 && it->second.size() >= limit) {
         return kXApuQueueFull;
     }
-    // Every command type is acknowledged with a result, in command order.
+    // Every command type is acknowledged with a result, in command order. The title sends only types
+    // 1, 2, 3 and 5 and its drain loop ignores other result types (see the model notes above).
     const bool acknowledged = true;
     if (++xapu().commands[type] == 1) {
         diag("XApu: first command of type " + std::to_string(type) +
