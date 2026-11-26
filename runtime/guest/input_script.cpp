@@ -1,4 +1,5 @@
 #include "guest/input_script.h"
+#include "os/thread_name.h"
 
 #include <algorithm>
 #include <chrono>
@@ -402,6 +403,7 @@ void InputScriptPlayer::write(const InputScriptEvent* held) {
 }
 
 void InputScriptPlayer::run() {
+    playgta6::os::name_this_thread(L"pg6-input-script");
     using clock = std::chrono::steady_clock;
     const clock::time_point t0 = clock::now();
     auto ms_since_start = [&] {

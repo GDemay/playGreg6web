@@ -1,4 +1,5 @@
 #include "gpu/d3d12_readback.h"
+#include "os/thread_name.h"
 
 #include <limits>
 #include <string>
@@ -298,6 +299,7 @@ void ReadbackGate::start_poller_locked() {
     // Use adaptive backoff so active completions wake quickly (~250 us) while idle or stalled
     // readbacks never busy-spin or waste CPU.
     poller_ = std::thread([this] {
+        playgta6::os::name_this_thread(L"pg6-readback-poller");
         constexpr int64_t kMinPollUs = 250;
         constexpr int64_t kMaxPollUs = 8000;
         int64_t poll_us = kMinPollUs;

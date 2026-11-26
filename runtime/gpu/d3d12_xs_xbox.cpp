@@ -3,6 +3,7 @@
 // Evidence, contracts and confidence: d3d12_xs_xbox.h.
 
 #include "gpu/d3d12_xs_xbox.h"
+#include "os/thread_name.h"
 
 #include <algorithm>
 #include <array>
@@ -1128,6 +1129,7 @@ HResult Device::ScheduleFrameEventX(uint32_t type, uint32_t offset_us, uint64_t 
 }
 
 void Device::run_frame_events() {
+    playgta6::os::name_this_thread(L"pg6-frame-events");
     for (;;) {
         uint64_t frame = 0;
         if (pacer_.wait_after(pacer_.current_frame(), kInfinite, &frame) == xbox::FramePacer::WaitResult::Shutdown) {
