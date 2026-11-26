@@ -640,6 +640,7 @@ void test_partly_held_mip_chain_clamps_views() {
     CHECK(bridge::held_mip_floor(all_held, 3, 1) == 0);
     const uint64_t top_only[] = {1, 0, 0};  // smaller levels filled on the GPU: not clamped
     CHECK(bridge::held_mip_floor(top_only, 3, 1) == 0);
+    CHECK(bridge::held_mip_floor(small_held, 6, 1, /*streamable=*/false) == 0);  // black mips of a plain texture
     const uint64_t two_slices[] = {0, 0, 1, 0, 1, 0};  // slice 0 holds level 2, slice 1 level 1
     CHECK(bridge::held_mip_floor(two_slices, 3, 2) == 1);
 

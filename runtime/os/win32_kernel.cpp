@@ -1779,8 +1779,11 @@ bool read_file_at(Handle file_handle,
     }
 
     const auto read_start = std::chrono::steady_clock::now();
-    const int64_t got =
-        file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+    int64_t got = 0;
+    {
+        HostStallScope stall;  // a package read can block on the network/disk for seconds
+        got = file->httpfs_client->read(file->httpfs_handle, file->cursor, buffer, bytes_to_read);
+    }
     trace_audio_read(file->httpfs_key, file->cursor, bytes_to_read, got, read_start);
     if (got < 0) {
         SetLastError(ERROR_READ_FAULT);
