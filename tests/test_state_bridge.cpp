@@ -1945,6 +1945,96 @@ void test_unaligned_storage_relocation() {
     }
 }
 
+// G66: the title's UI vertex stage (root signature: one root SRV) reads that root SRV as a uniform
+// header (binding 0) and as read-only storage for vertex pulling (binding 3): the same GPU VA. At
+// an unaligned VA both bindings are relocated copies of that memory; the storage one (no view size:
+// a root view) copies up to the end of the buffer. It was bound null, which emptied the LEGAL
+// NOTICES alpha mask.
+void test_root_srv_read_as_uniform_and_storage() {
+    d3d::DescriptorHeapRegistry heaps;
+    d3d::ResourceStateRegistry states;
+    std::vector<std::pair<uint64_t, uint64_t>> uniform_calls, storage_calls;
+    bridge::BridgeOptions options = counting_options(5000);
+    options.relocate_uniform = [&uniform_calls](uint64_t va, uint64_t size, uint64_t, uint32_t* id, uint64_t* offset) {
+        uniform_calls.emplace_back(va, size);
+        *id = 777;
+        *offset = 512;
+        return true;
+    };
+    options.relocate_storage = [&storage_calls](uint64_t va, uint64_t size, uint32_t* id, uint64_t* offset) {
+        storage_calls.emplace_back(va, size);
+        *id = 888;
+        *offset = 1024;
+        return true;
+    };
+    bridge::StateBridgeDevice device(heaps, options, &states);
+    constexpr uint32_t kTarget = 100, kBuf = 301, kVsModule = 1, kFsModule = 2;
+    constexpr uint64_t kVs = 0xC1, kPs = 0xC2, kBufVa = 0x20000, kViewOffset = 0x40;
+    device.register_texture(kTarget, {pso::DxgiFormat::B8G8R8A8_UNORM, 64, 64, 1, 1, 1,
+                                      GpuTextureDimension::Dim2D, false});
+    device.register_buffer(kBuf, kBufVa, 4096);
+    device.register_shader_module(kVs, kVsModule);
+    device.register_shader_module(kPs, kFsModule);
+    d3d::DescriptorHeap* rtv_heap = make_heap(heaps, d3d::DescriptorHeapType::Rtv, 1, false);
+    CHECK(heaps.create_render_target_view(kTarget, nullptr, rtv_heap->cpu_handle(0)) == d3d::Status::Ok);
+
+    d3d::RootSignatureDesc rs;
+    d3d::RootParameterDesc srv;
+    srv.parameter_type = d3d::RootParameterType::Srv;
+    srv.shader_register = 0;
+    rs.parameters.push_back(srv);
+    d3d::RootSignature root;
+    CHECK(d3d::RootSignature::build(rs, &root).ok());
+    bridge::PipelineLayoutDesc layout;
+    bridge::GroupLayoutDesc group;
+    auto uniform = layout_entry(0, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                static_cast<uint8_t>(GpuBufferBindingType::Uniform));
+    uniform.min_binding_size = 16;
+    group.bindings.push_back({uniform, join(0, d3d::DescriptorRangeType::Srv, 0)});
+    group.bindings.push_back({layout_entry(3, GpuShaderStageBits::Vertex, GpuBindingLayoutType::Buffer,
+                                           static_cast<uint8_t>(GpuBufferBindingType::ReadOnlyStorage)),
+                              join(3, d3d::DescriptorRangeType::Srv, 0)});
+    layout.groups.push_back(group);
+    device.register_pipeline_layout(kVs, kPs, layout);
+    pso::D3D12GraphicsPsoDesc d = Scene::pso_desc();
+    d.vs = kVs;
+    d.ps = kPs;
+    d.DSVFormat = pso::DxgiFormat::UNKNOWN;
+    auto state = device.create_graphics_pipeline_state(d, &root);
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(device, enc);
+    CHECK(list.SetGraphicsRootSignature(&root) == d3d::Status::Ok);
+    list.SetPipelineState(state.get());
+    CHECK(list.SetGraphicsRootShaderResourceView(0, kBufVa + kViewOffset) == d3d::Status::Ok);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::TriangleList);
+    const d3d::CpuDescriptorHandle rtv0 = rtv_heap->cpu_handle(0);
+    list.OMSetRenderTargets(1, &rtv0, false, nullptr);
+    list.DrawInstanced(3, 1, 0, 0);
+    list.Close();
+
+    const Packet* bind_group = nullptr;
+    const auto packets = decode(enc);
+    for (const Packet& packet : packets) {
+        if (packet.opcode == GpuOpcode::CreateBindGroup2 &&
+            packet.payload.size() >= sizeof(GpuCreateBindGroup2Payload) + 2 * sizeof(GpuBindGroupEntry2)) {
+            bind_group = &packet;
+        }
+    }
+    CHECK(bind_group != nullptr);
+    if (bind_group != nullptr) {
+        const auto e0 = pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload));
+        const auto e3 =
+            pod<GpuBindGroupEntry2>(*bind_group, sizeof(GpuCreateBindGroup2Payload) + sizeof(GpuBindGroupEntry2));
+        CHECK(e0.binding == 0 && e0.resource_id == 777 && e0.offset == 512);
+        CHECK(e3.binding == 3 && e3.resource_id == 888 && e3.offset == 1024 && e3.size == 4096 - kViewOffset);
+        CHECK(uniform_calls.size() == 1 && uniform_calls[0].first == kBufVa + kViewOffset);
+        CHECK(storage_calls.size() == 1 && storage_calls[0].first == kBufVa + kViewOffset &&
+              storage_calls[0].second == 4096 - kViewOffset);
+        CHECK((list.diagnostics() & (bridge::BridgeDiag::UnalignedStorage | bridge::BridgeDiag::NullBinding)) == 0);
+    }
+}
+
 // G66 (#691): a cached bind group over a relocated storage copy must follow the copy when the
 // device hands its home to another range (LRU eviction, relocation_epoch bumped). Before, the cache
 // hit kept binding the old home, so the LEGAL NOTICES draws read another draw's vertex data (grey).
@@ -4275,6 +4365,7 @@ int main() {
     test_representative_command_list();
     test_unaligned_uniform_relocation();
     test_unaligned_storage_relocation();
+    test_root_srv_read_as_uniform_and_storage();
     test_cached_bind_group_follows_moved_relocation();
     test_storage_texture_needs_storage_usage();
     test_reflected_uniform_min_size();
