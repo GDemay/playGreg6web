@@ -293,6 +293,8 @@ public:
     bool resolved() const { return resolved_; }
     bridge::GraphicsPipelineState* graphics() const { return graphics_.get(); }
     bridge::ComputePipelineState* compute() const { return compute_.get(); }
+    // G66: emulated mesh pipeline (null for every other pipeline state).
+    bridge::MeshPipelineState* mesh() const { return mesh_.get(); }
     const std::vector<uint64_t>& shader_identities() const { return identities_; }
     // Graphics description (null for compute and placeholder pipeline states).
     const GraphicsPsoSource* graphics_source() const { return source_.get(); }
@@ -318,6 +320,7 @@ private:
     com::Ref<RootSignature> root_signature_;
     std::unique_ptr<bridge::GraphicsPipelineState> graphics_;
     std::unique_ptr<bridge::ComputePipelineState> compute_;
+    std::unique_ptr<bridge::MeshPipelineState> mesh_;
     std::unique_ptr<GraphicsPsoSource> source_;
     std::unique_ptr<Native> native_;
     uint32_t dump_index_ = kNoDumpIndex;

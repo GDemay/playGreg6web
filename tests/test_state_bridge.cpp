@@ -1058,6 +1058,192 @@ void test_execute_indirect_packets() {
     CHECK(scene.device.deferred_destroy_count() >= 1);
 }
 
+// G66 mesh pipelines: the mesh stage runs as compute (groups 0..2 from the graphics root arguments,
+// group 3 the runtime's output buffer), then a draw with the runtime vertex shader pulls the
+// triangles. DispatchMesh directly and through ExecuteIndirect (clamp kind 3: dispatch + draw pair).
+void test_mesh_pipeline_packets() {
+    Scene scene(11000);
+    constexpr uint32_t kArgs = 500;
+    scene.device.register_buffer(kArgs, 0x400000, 4096);
+
+    bridge::MeshOutputLayout out{64, 32, 12};
+    CHECK(bridge::valid_mesh_output_layout(out));
+    CHECK(!bridge::valid_mesh_output_layout({0, 32, 12}) && !bridge::valid_mesh_output_layout({64, 300, 12}) &&
+          !bridge::valid_mesh_output_layout({64, 32, 10}) && !bridge::valid_mesh_output_layout({64, 32, 68}));
+    const uint32_t record = 4 + 64 * 12 + 32 * 3;
+    CHECK(bridge::mesh_group_record_words(out) == record);
+    CHECK(bridge::mesh_max_groups(out) == std::min<uint64_t>(bridge::kMeshOutputBytes / (record * 4u), 65535u));
+    CHECK(bridge::mesh_max_groups({256, 256, 64}) == bridge::kMeshOutputBytes / ((4u + 256u * 64u + 768u) * 4u));
+    CHECK(bridge::indirect_output_bytes(bridge::IndirectKind::DispatchMesh) == 28);
+    CHECK(bridge::mesh_compute_pack_key(bridge::mesh_compute_pack_key(0x1234)) == 0x1234);
+    CHECK(bridge::mesh_draw_vertex_identity(out) != bridge::mesh_draw_vertex_identity({64, 32, 8}));
+    const std::string vs = bridge::mesh_draw_vertex_wgsl(out);
+    CHECK(vs.find("fn vs_main(@builtin(vertex_index)") != std::string::npos);
+    CHECK(vs.find("@group(3) @binding(0) var<storage, read> ms_out: array<u32>;") != std::string::npos);
+    CHECK(vs.find("@location(1) a1: vec4<f32>") != std::string::npos && vs.find("@location(2)") == std::string::npos);
+    CHECK(vs.find("const RECORD_WORDS: u32 = " + std::to_string(record) + "u;") != std::string::npos);
+    CHECK(vs.find("const INDEX_BASE: u32 = 772u;") != std::string::npos);
+    const std::string clamp = bridge::indirect_clamp_wgsl();
+    CHECK(clamp.find("p.kind == 3u") != std::string::npos && clamp.find("groups * p.index_limit") != std::string::npos);
+
+    // The mesh stage: module 6, one group with the root constants (compute visibility).
+    constexpr uint64_t kMs = 0xD7;
+    const uint64_t stage_identity = bridge::mesh_compute_pack_key(kMs);
+    scene.device.register_shader_module(stage_identity, 6);
+    bridge::PipelineLayoutDesc stage_layout;
+    bridge::GroupLayoutDesc stage_group;
+    stage_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Compute, GpuBindingLayoutType::Buffer,
+                                                 static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                                    join(0, d3d::DescriptorRangeType::Cbv, 0, true)});
+    stage_layout.groups.push_back(stage_group);
+    scene.device.register_pipeline_layout(stage_identity, 0, stage_layout);
+    // The draw: the runtime vertex shader (module 7) and the scene's pixel shader and layout.
+    const uint64_t draw_vs = bridge::mesh_draw_vertex_identity(out);
+    scene.device.register_shader_module(draw_vs, 7);
+    bridge::PipelineLayoutDesc draw_layout;
+    bridge::GroupLayoutDesc draw_group;
+    draw_group.bindings.push_back({layout_entry(0, GpuShaderStageBits::Vertex | GpuShaderStageBits::Fragment,
+                                                GpuBindingLayoutType::Buffer,
+                                                static_cast<uint8_t>(GpuBufferBindingType::Uniform)),
+                                   join(0, d3d::DescriptorRangeType::Cbv, 0, true)});
+    draw_layout.groups.push_back(draw_group);
+    scene.device.register_pipeline_layout(draw_vs, Scene::kPs, draw_layout);
+    pso::D3D12GraphicsPsoDesc desc = Scene::pso_desc();
+    desc.vs = draw_vs;
+    desc.pInputElementDescs = nullptr;
+    desc.NumInputElements = 0;
+    auto mesh = scene.device.create_mesh_pipeline_state(desc, stage_identity, out, &scene.root_signature);
+    CHECK(mesh != nullptr && mesh->diagnostics() == 0);
+    if (mesh == nullptr || mesh->diagnostics() != 0) {
+        return;
+    }
+
+    gpu::CommandEncoder enc;
+    bridge::CommandListBridge list(scene.device, enc);
+    scene.bind_root(list);
+    const d3d::CpuDescriptorHandle rtv1 = scene.rtv(1);
+    list.OMSetRenderTargets(1, &rtv1, false, nullptr);
+    list.IASetPrimitiveTopology(pso::D3DPrimitiveTopology::LineList);  // mesh draws are triangles regardless
+    list.SetMeshPipelineState(mesh.get());
+    const size_t mark = enc.size();
+    CHECK(list.DispatchMesh(5, 1, 1));
+    uint32_t output_buffer = 0;
+    {
+        using O = GpuOpcode;
+        const std::vector<Packet> p = decode(enc, mark);
+        const size_t create = find_op(p, O::CreateComputePipeline2);
+        const size_t dispatch = find_op(p, O::DispatchCompute);
+        const size_t begin = find_op(p, O::BeginRenderPass, dispatch);
+        const size_t render = find_op(p, O::CreateRenderPipeline2, dispatch);
+        const size_t draw = find_op(p, O::Draw, dispatch);
+        CHECK(create < dispatch && dispatch < begin && begin < draw && render < draw && draw < p.size());
+        if (draw >= p.size() || render >= p.size()) {
+            return;
+        }
+        const auto cp = pod<GpuCreateComputePipeline2Payload>(p[create]);
+        const auto rp = pod<GpuCreateRenderPipeline2Payload>(p[render]);
+        CHECK(cp.cs_module_id == 6 && rp.vs_module_id == 7 && rp.fs_module_id == Scene::kFsModule);
+        CHECK(pod<GpuCreateRenderPipeline2Payload>(p[render]).key.primitive.topology ==
+              static_cast<uint8_t>(pso::WgpuPrimitiveTopology::TriangleList));
+        // Both pipeline layouts: own group, two empty groups, the output group.
+        size_t layouts = 0;
+        for (const Packet& k : p) {
+            if (k.opcode == O::CreatePipelineLayout) {
+                const auto pl = pod<GpuCreatePipelineLayoutPayload>(k);
+                if (pl.id == cp.pipeline_layout_id || pl.id == rp.pipeline_layout_id) {
+                    CHECK(pl.bind_group_layout_count == 4);
+                    ++layouts;
+                }
+            }
+        }
+        CHECK(layouts == 2);
+        for (size_t i = 0; i < dispatch; ++i) {
+            if (p[i].opcode == O::CreateBuffer && pod<GpuCreateBufferPayload>(p[i]).byte_size == bridge::kMeshOutputBytes) {
+                CHECK(pod<GpuCreateBufferPayload>(p[i]).usage_flags == GpuBufferUsage::Storage);
+                output_buffer = pod<GpuCreateBufferPayload>(p[i]).id;
+            }
+        }
+        CHECK(output_buffer != 0);
+        // Group 3 is set right before the dispatch and before the draw.
+        const auto stage_set = pod<GpuSetBindGroup2Payload>(p[dispatch - 1]);
+        CHECK(p[dispatch - 1].opcode == O::SetBindGroup2 && stage_set.group_index == bridge::kMeshOutputGroup);
+        const auto draw_set = pod<GpuSetBindGroup2Payload>(p[draw - 1]);
+        CHECK(p[draw - 1].opcode == O::SetBindGroup2 && draw_set.group_index == bridge::kMeshOutputGroup &&
+              draw_set.bind_group_id != stage_set.bind_group_id);
+        size_t output_groups = 0;
+        for (const Packet& k : p) {
+            if (k.opcode == O::CreateBindGroup2 && pod<GpuCreateBindGroup2Payload>(k).entry_count == 1) {
+                output_groups += pod<GpuBindGroupEntry2>(k, sizeof(GpuCreateBindGroup2Payload)).resource_id ==
+                                 output_buffer;
+            }
+        }
+        CHECK(output_groups == 2);
+        const auto d = pod<GpuDispatchComputePayload>(p[dispatch]);
+        CHECK(d.workgroup_x == 5 && d.workgroup_y == 1 && d.workgroup_z == 1);
+        const auto dr = pod<GpuDrawPayload>(p[draw]);
+        CHECK(dr.vertex_count == 5 * 32 * 3 && dr.instance_count == 1);
+    }
+    CHECK(list.stats().mesh_dispatches == 1);
+
+    // y/z groups and over-budget x are skipped without packets.
+    const size_t mark2 = enc.size();
+    CHECK(!list.DispatchMesh(5, 2, 1));
+    CHECK(!list.DispatchMesh(bridge::mesh_max_groups(out) + 1, 1, 1));
+    CHECK(enc.size() == mark2 && list.stats().mesh_skipped == 2);
+
+    // Indirect: per command a dispatch record, then the draw record 12 bytes on (28-byte pairs).
+    bridge::IndirectExecution e;
+    e.kind = bridge::IndirectKind::DispatchMesh;
+    e.max_count = 2;
+    e.stride = 16;
+    e.args_buffer = kArgs;
+    e.args_offset = 32;
+    CHECK(list.ExecuteIndirect(e));
+    {
+        using O = GpuOpcode;
+        const std::vector<Packet> p = decode(enc, mark2);
+        const size_t clamp_dispatch = find_op(p, O::DispatchCompute);
+        const std::array<uint32_t, 8> params = indirect_params(p, clamp_dispatch);
+        CHECK((params == std::array<uint32_t, 8>{8, 4, 2, 0, 0, 3, 32 * 3, bridge::mesh_max_groups(out)}));
+        std::vector<GpuIndirectPayload> work;
+        std::vector<O> ops;
+        for (size_t i = clamp_dispatch; i < p.size(); ++i) {
+            if (p[i].opcode == O::DispatchIndirect || p[i].opcode == O::DrawIndirect) {
+                work.push_back(pod<GpuIndirectPayload>(p[i]));
+                ops.push_back(p[i].opcode);
+                const auto set = pod<GpuSetBindGroup2Payload>(p[i - 1]);
+                CHECK(p[i - 1].opcode == O::SetBindGroup2 && set.group_index == bridge::kMeshOutputGroup);
+            }
+        }
+        CHECK((ops == std::vector<O>{O::DispatchIndirect, O::DrawIndirect, O::DispatchIndirect, O::DrawIndirect}));
+        if (work.size() == 4) {
+            CHECK(work[1].offset == work[0].offset + 12 && work[2].offset == work[0].offset + 28 &&
+                  work[3].offset == work[0].offset + 40);
+            CHECK(work[0].buffer_id == work[3].buffer_id);
+        }
+    }
+    CHECK(list.stats().mesh_dispatches == 3 && list.stats().indirect_commands == 2);
+
+    // A regular pipeline state unbinds the mesh one: mesh work is skipped.
+    list.SetPipelineState(scene.pso.get());
+    const size_t mark3 = enc.size();
+    CHECK(!list.ExecuteIndirect(e));
+    CHECK(!list.DispatchMesh(1, 1, 1));
+    CHECK(enc.size() == mark3 && list.stats().mesh_skipped == 4);
+    list.Close();
+
+    // A stage layout with more than three groups cannot take the output group.
+    constexpr uint64_t kWide = 0xE8;
+    bridge::PipelineLayoutDesc wide;
+    for (int i = 0; i < 4; ++i) {
+        wide.groups.push_back(bridge::GroupLayoutDesc{});
+    }
+    scene.device.register_shader_module(kWide, 8);
+    scene.device.register_pipeline_layout(kWide, 0, wide);
+    auto bad = scene.device.create_mesh_pipeline_state(desc, kWide, out, &scene.root_signature);
+    CHECK((bad->diagnostics() & bridge::BridgeDiag::MissingPipelineLayout) != 0);
+}
+
 // Binding arrays (G62, lane-indexed heap windows): with the device capability on, the layout entry
 // carries binding_array_size and the bind group a run of elements; off (default), such a layout is
 // refused and nothing array-shaped reaches the stream.
@@ -3971,6 +4157,7 @@ int main() {
     test_partial_clear_is_reported();
     test_compute_dispatch_packets();
     test_execute_indirect_packets();
+    test_mesh_pipeline_packets();
     test_binding_array_layouts();
     test_diagnostics_and_closed_list();
     test_indexed_draw_and_layout_dedup();
