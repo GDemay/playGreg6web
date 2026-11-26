@@ -462,6 +462,13 @@ impl FunctionLifter<'_> {
 
     /// Bitwise logic on 128 bits (`andn` complements the first source).
     pub(super) fn logic(&mut self, ins: &Instruction, f: Form, op: &str, not_a: bool) -> R<()> {
+        if ((op == "xor" && !not_a) || (op == "and" && not_a))
+            && ins.op_kind(f.a) == OpKind::Register
+            && ins.op_kind(f.b) == OpKind::Register
+            && ins.op_register(f.a) == ins.op_register(f.b)
+        {
+            return self.xset(ins.op_register(f.dst), "zeroinitializer", Elem::I64);
+        }
         let t = Ty::v(Elem::I64).ir();
         let mut a = self.v128(ins, f.a, Elem::I64)?;
         let b = self.v128(ins, f.b, Elem::I64)?;
