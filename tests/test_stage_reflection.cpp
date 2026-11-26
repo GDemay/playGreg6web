@@ -948,8 +948,8 @@ void test_root_descriptor_over_table() {
     report.clear();
     CHECK(!join_pipeline_layout(rs, false, {{GpuShaderStageBits::Fragment, &bad}}, &layout, &report));
     CHECK(report.find("not a descriptor boundary") != std::string::npos);
-    StageReflectionIndex v3;
-    CHECK(!parse_stage_reflection_json(root_table_sidecar(3), &v3, &error));
+    StageReflectionIndex v4;
+    CHECK(!parse_stage_reflection_json(root_table_sidecar(4), &v4, &error));
     CHECK(error.find("version") != std::string::npos);
     // Root constants are still not a root descriptor.
     StageReflection consts = ps1;
