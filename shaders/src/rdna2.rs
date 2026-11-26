@@ -1549,6 +1549,53 @@ pub fn decode_instruction(bytes: &[u8], offset: usize) -> Option<Rdna2Instructio
     }
 }
 
+/// GFX10.3 `s_sendmsg` message IDs (`simm16[3:0]`).
+pub const SENDMSG_ID_INTERRUPT: u8 = 1;
+pub const SENDMSG_ID_GS: u8 = 2;
+pub const SENDMSG_ID_GS_DONE: u8 = 3;
+pub const SENDMSG_ID_GS_ALLOC_REQ: u8 = 9;
+pub const SENDMSG_ID_GET_DOORBELL: u8 = 10;
+pub const SENDMSG_ID_SYSMSG: u8 = 15;
+
+/// Extract the 4-bit message ID (`simm16[3:0]`) from an `s_sendmsg` / `s_sendmsghalt` immediate.
+#[inline]
+pub const fn sendmsg_id(simm16: u16) -> u8 {
+    (simm16 & 0x000F) as u8
+}
+
+/// Format an `s_sendmsg` / `s_sendmsghalt` `simm16` operand into sanitized GFX10.3 assembly text.
+pub fn format_sendmsg(simm16: u16) -> String {
+    let msg_id = sendmsg_id(simm16);
+    let op = ((simm16 >> 4) & 0x7) as u8;
+    let stream = ((simm16 >> 8) & 0x3) as u8;
+    match msg_id {
+        SENDMSG_ID_INTERRUPT => "sendmsg(MSG_INTERRUPT)".to_string(),
+        SENDMSG_ID_GS | SENDMSG_ID_GS_DONE => {
+            let msg_name = if msg_id == SENDMSG_ID_GS {
+                "MSG_GS"
+            } else {
+                "MSG_GS_DONE"
+            };
+            let op_name = match op {
+                0 => "GS_OP_NOP",
+                1 => "GS_OP_CUT",
+                2 => "GS_OP_EMIT",
+                3 => "GS_OP_EMIT_CUT",
+                _ => return format!("0x{simm16:04x}"),
+            };
+            if stream == 0 {
+                format!("sendmsg({msg_name}, {op_name})")
+            } else {
+                format!("sendmsg({msg_name}, {op_name}, {stream})")
+            }
+        }
+        SENDMSG_ID_GS_ALLOC_REQ => "sendmsg(MSG_GS_ALLOC_REQ)".to_string(),
+        SENDMSG_ID_GET_DOORBELL => "sendmsg(MSG_GET_DOORBELL)".to_string(),
+        SENDMSG_ID_SYSMSG => format!("sendmsg(MSG_SYSMSG, {op})"),
+        _ => format!("0x{simm16:04x}"),
+    }
+}
+
 fn decode_sopp(offset: usize, w0: u32) -> Rdna2Instruction {
     let op = ((w0 >> 16) & 0x7F) as u8;
     let simm16 = (w0 & 0xFFFF) as u16;
@@ -1568,6 +1615,8 @@ fn decode_sopp(offset: usize, w0: u32) -> Rdna2Instruction {
         }
     } else if op == 0x0C {
         format_waitcnt(simm16)
+    } else if matches!(op, 0x10 | 0x11) {
+        format_sendmsg(simm16)
     } else if matches!(op, 0x01 | 0x03 | 0x0A | 0x13 | 0x1B | 0x1C | 0x1E | 0x1F | 0x22) {
         String::new()
     } else {
@@ -5484,5 +5533,50 @@ mod tests {
         let reversed_summary = analyze_instructions(&bytes, &reversed_insts);
         assert_eq!(reversed_summary, baseline_summary);
         assert_eq!(reversed_summary.to_json(), baseline_summary.to_json());
+    }
+
+    #[test]
+    fn decodes_mesh_exp_prim_and_s_sendmsg_gs_alloc_req_and_done() {
+        let mut words = Vec::new();
+        words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_ALLOC_REQ))); // s_sendmsg MSG_GS_ALLOC_REQ
+        words.extend_from_slice(&enc_exp(12, 0xF, false, false, false, [0, 1, 2, 3])); // exp pos0
+        words.extend_from_slice(&enc_exp(32, 0xF, false, false, false, [4, 5, 6, 7])); // exp param0
+        words.extend_from_slice(&enc_exp(20, 0x1, false, true, false, [8, 0, 0, 0])); // exp prim done
+        words.push(enc_sopp(0x10, u16::from(SENDMSG_ID_GS_DONE))); // s_sendmsg MSG_GS_DONE
+        words.push(enc_sopp(0x01, 0)); // s_endpgm
+
+        let bytes = words_to_bytes(&words);
+        let insts = decode_program(&bytes);
+        let summary = analyze_instructions(&bytes, &insts);
+
+        assert_eq!(insts.len(), 6);
+        assert_eq!(insts[0].mnemonic, "s_sendmsg");
+        assert_eq!(insts[0].format_text(), "s_sendmsg sendmsg(MSG_GS_ALLOC_REQ)");
+        assert_eq!(sendmsg_id(u16::from(SENDMSG_ID_GS_ALLOC_REQ)), 9);
+
+        assert_eq!(insts[3].mnemonic, "exp");
+        assert_eq!(insts[3].format_text(), "exp prim v8, off, off, off done");
+        assert!(matches!(
+            insts[3].detail,
+            Rdna2Detail::Exp {
+                target: Rdna2ExportTarget::Prim,
+                en: 0x1,
+                done: true,
+                vsrc: [8, 0, 0, 0],
+                ..
+            }
+        ));
+
+        assert_eq!(insts[4].mnemonic, "s_sendmsg");
+        assert_eq!(
+            insts[4].format_text(),
+            "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)"
+        );
+        assert_eq!(sendmsg_id(u16::from(SENDMSG_ID_GS_DONE)), 3);
+
+        assert_eq!(summary.exports.len(), 3);
+        assert_eq!(summary.exports[0].target, Rdna2ExportTarget::Pos(0));
+        assert_eq!(summary.exports[1].target, Rdna2ExportTarget::Param(0));
+        assert_eq!(summary.exports[2].target, Rdna2ExportTarget::Prim);
     }
 }

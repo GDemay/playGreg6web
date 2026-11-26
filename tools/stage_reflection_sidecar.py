@@ -99,6 +99,28 @@ def _u32(value: Any) -> bool:
 
 
 MAX_LANE_INDEXED_WINDOW = 256
+MAX_MESH_VERTICES = 256
+MAX_MESH_PRIMITIVES = 256
+MAX_MESH_ATTRIBUTES = 15
+MAX_MESH_VERTEX_WORDS = 4 + 4 * MAX_MESH_ATTRIBUTES
+
+
+def mesh_output_ok(mesh_output: Any) -> bool:
+    """Whether `mesh_output` follows the G66 / S62 contract (#482, #1537):
+    max_vertices and max_primitives in 1..256, vertex_words = 4 + 4 * n (0 <= n <= 15)."""
+    if not isinstance(mesh_output, dict):
+        return False
+    mv = mesh_output.get("max_vertices")
+    mp = mesh_output.get("max_primitives")
+    vw = mesh_output.get("vertex_words")
+    if not (_u32(mv) and _u32(mp) and _u32(vw)):
+        return False
+    return (
+        1 <= mv <= MAX_MESH_VERTICES
+        and 1 <= mp <= MAX_MESH_PRIMITIVES
+        and 4 <= vw <= MAX_MESH_VERTEX_WORDS
+        and vw % 4 == 0
+    )
 
 
 def _cb_dword_ok(heap: dict[str, Any]) -> bool:
@@ -231,6 +253,15 @@ def convert(entry: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None, s
         if not isinstance(inputs, list):
             return key, None, "vertex stage without vertex_inputs"
         out["vertex_inputs"] = inputs
+    if "mesh_output" in entry and entry["mesh_output"] is not None:
+        mesh_output = entry["mesh_output"]
+        if stage != "compute" or not mesh_output_ok(mesh_output):
+            return key, None, "malformed mesh_output"
+        out["mesh_output"] = {
+            "max_vertices": mesh_output["max_vertices"],
+            "max_primitives": mesh_output["max_primitives"],
+            "vertex_words": mesh_output["vertex_words"],
+        }
     return key, out, ""
 
 
@@ -531,6 +562,9 @@ def _load_sidecar(path: Path, *, label: str, allow_missing: bool) -> dict[str, A
                         raise ValueError(
                             f"{label} stage {safe_k!r} has malformed v2 root_descriptor source"
                         )
+        if "mesh_output" in v:
+            if v.get("stage") != "compute" or not mesh_output_ok(v["mesh_output"]):
+                raise ValueError(f"{label} stage {safe_k!r} has malformed mesh_output")
         validated[k] = v
     return validated
 
@@ -568,6 +602,7 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
     lane_indexed_heap_stages = 0
     lane_indexed_heap_bindings = 0
     vertex_index_stages = 0
+    mesh_output_stages = 0
 
     for stage_obj in stages.values():
         if not isinstance(stage_obj, dict):
@@ -611,6 +646,8 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
             lane_indexed_heap_stages += 1
         if _is_vertex_index_stage(stage_obj):
             vertex_index_stages += 1
+        if stage == "compute" and isinstance(stage_obj.get("mesh_output"), dict):
+            mesh_output_stages += 1
 
     return {
         "by_stage": by_stage,
@@ -623,6 +660,7 @@ def summarize_stages(stages: dict[str, Any]) -> dict[str, Any]:
         "lane_indexed_heap_stages": lane_indexed_heap_stages,
         "lane_indexed_heap_bindings": lane_indexed_heap_bindings,
         "vertex_index_stages": vertex_index_stages,
+        "mesh_output_stages": mesh_output_stages,
     }
 
 
