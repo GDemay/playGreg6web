@@ -3770,5 +3770,170 @@ class CdpTimeoutHoldUntilVisibleAndRollingFpsTests(unittest.TestCase):
             self.assertEqual(cmp_res.failures(), [])
 
 
+class T95ChromeMenuFlow4BootOptionsAndSwapchainProbeTests(unittest.TestCase):
+    def test_chrome_menu_flow_4_preset_validation_url_help_and_cli(self):
+        self.assertEqual(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.get("chrome-menu-flow-4"), "chrome-menu-flow-4")
+        self.assertEqual(rbb.INPUT_SCRIPT_ALIASES.get("chrome-menu-flow-4"), "chrome-menu-flow-4")
+        self.assertEqual(
+            list(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+            sorted(rbb.ALLOWED_INPUT_SCRIPT_PRESETS.keys()),
+        )
+        self.assertEqual(rbb.sanitize_input_script_preset("chrome-menu-flow-4"), "chrome-menu-flow-4")
+        self.assertEqual(rbb.sanitize_input_script_preset("  CHROME-MENU-FLOW-4  "), "chrome-menu-flow-4")
+        self.assertEqual(rbb.validate_input_script_preset("chrome-menu-flow-4"), "chrome-menu-flow-4")
+        self.assertEqual(
+            rbb.build_target_url("127.0.0.1", 8080, input_script="chrome-menu-flow-4"),
+            "http://127.0.0.1:8080/?inputScript=chrome-menu-flow-4",
+        )
+
+        help_text = rbb.build_arg_parser().format_help()
+        self.assertIn("chrome-menu-flow-4", help_text)
+
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-chrome-menu-flow-4",
+                "--input-script",
+                "chrome-menu-flow-4",
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["input_script"], "chrome-menu-flow-4")
+            self.assertEqual(payload["inputScript"], "chrome-menu-flow-4")
+            self.assertEqual(
+                payload["url"],
+                "http://127.0.0.1:<ephemeral>/?smoke=1&inputScript=chrome-menu-flow-4",
+            )
+
+            code_cli, _, err_cli, _, sessions = fx.run_cli(
+                "--smoke",
+                "--name",
+                "run-chrome-menu-flow-4",
+                "--input-script",
+                "chrome-menu-flow-4",
+            )
+            self.assertEqual(code_cli, 0, err_cli)
+            self.assertEqual(sessions[0]["input_script"], "chrome-menu-flow-4")
+            cmd_meta = json.loads(
+                (fx.build / "runs" / "run-chrome-menu-flow-4" / "command.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(cmd_meta["input_script"], "chrome-menu-flow-4")
+
+    def test_boot_options_accepts_fence_publish_and_present_max_interval(self):
+        new_opts = {
+            "fence_publish_lag_frames": 1,
+            "fence_publish_cap_ms": 33,
+            "present_max_interval": 1,
+        }
+        parsed = rbb.parse_and_validate_boot_options(boot_options=dict(new_opts))
+        self.assertEqual(parsed, new_opts)
+
+        # Zero is valid for uint keys (e.g. fence_publish_lag_frames=0 publishes at issue)
+        zero_opts = {
+            "fence_publish_lag_frames": 0,
+            "fence_publish_cap_ms": 0,
+            "present_max_interval": 0,
+        }
+        self.assertEqual(rbb.parse_and_validate_boot_options(boot_options=dict(zero_opts)), zero_opts)
+
+        # Invalid types / negative values must be rejected for all three keys
+        for key in ("fence_publish_lag_frames", "fence_publish_cap_ms", "present_max_interval"):
+            for bad_val in (-1, True, False, "1", 1.5, None):
+                with self.assertRaises(rbb.RunnerError, msg=f"{key}={bad_val!r}"):
+                    rbb.parse_and_validate_boot_options(boot_options={key: bad_val})
+
+        # End-to-end dry-run CLI validation with inline JSON
+        with tempfile.TemporaryDirectory() as d:
+            fx = RepoFixture(Path(d))
+            code, out, err, _, _ = fx.run_cli(
+                "--smoke",
+                "--dry-run",
+                "--name",
+                "dry-t95-boot-opts",
+                "--boot-options",
+                json.dumps(new_opts),
+            )
+            self.assertEqual(code, 0, err)
+            payload = json.loads(out)
+            self.assertEqual(payload["boot_options"], new_opts)
+
+    def test_extract_swapchain_probe_stats_multi_source_and_stale_zero_override(self):
+        # Stale 0 in bootState.gpu must not shadow a non-zero count in diagnostics or bootState
+        probe_diag_override = make_sample_probe()
+        probe_diag_override["bootState"]["gpu"]["swapchainProbeCount"] = 0
+        probe_diag_override["bootState"]["gpu"]["lastSampledMaxLuma"] = 0
+        probe_diag_override["bootState"]["gpu"]["suppressedBlackFrames"] = 0
+        probe_diag_override["diagnostics"]["swapchainProbeCount"] = 27
+        probe_diag_override["diagnostics"]["lastSampledMaxLuma"] = 44
+        probe_diag_override["diagnostics"]["suppressedBlackFrames"] = 251
+        self.assertEqual(
+            rbb._extract_swapchain_probe_stats(probe_diag_override),
+            {
+                "swapchainProbeCount": 27,
+                "lastSampledMaxLuma": 44,
+                "suppressedBlackFrames": 251,
+            },
+        )
+
+        # Snake-case boot_state & diagnostics fields (and maxLuma fallback) are extracted cleanly
+        probe_snake = {
+            "boot_state": {
+                "swapchain_probe_count": 12,
+                "gpu": {
+                    "swapchain_probe_count": 0,
+                    "max_luma": 128,
+                    "suppressed_black_frames": 3,
+                },
+            },
+            "diagnostics": {
+                "suppressed_black_frames": 9,
+            },
+        }
+        self.assertEqual(
+            rbb._extract_swapchain_probe_stats(probe_snake),
+            {
+                "swapchainProbeCount": 12,
+                "lastSampledMaxLuma": 128,
+                "suppressedBlackFrames": 9,
+            },
+        )
+
+        # Nested diagnostics.gpu and top-level probe fields are also supported
+        probe_nested = {
+            "swapchain_probe_count": 5,
+            "diagnostics": {
+                "gpu": {
+                    "swapchainProbeCount": 19,
+                    "maxLuma": 64,
+                    "suppressedBlackFrames": 42,
+                }
+            },
+        }
+        self.assertEqual(
+            rbb._extract_swapchain_probe_stats(probe_nested),
+            {
+                "swapchainProbeCount": 19,
+                "lastSampledMaxLuma": 64,
+                "suppressedBlackFrames": 42,
+            },
+        )
+
+        # End-to-end report, telemetry, and digest surface the recovered non-zero count
+        sess = make_fake_session_result(probe=probe_diag_override)
+        rep = rbb.build_boot_report(sess, smoke=False, preset="long")
+        tel = rbb.build_telemetry_payload(sess, smoke=False, preset="long", headless=True)
+        dig = rbb.digest(rep, 0)
+        self.assertEqual(rep["summary"]["swapchainProbeCount"], 27)
+        self.assertEqual(tel["swapchainProbeCount"], 27)
+        self.assertEqual(tel["summary"]["swapchainProbeCount"], 27)
+        self.assertIn(
+            "swapchain_probe: swapchainProbeCount=27, lastSampledMaxLuma=44, suppressedBlackFrames=251",
+            dig,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
