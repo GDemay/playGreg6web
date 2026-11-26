@@ -210,6 +210,7 @@ const CANONICAL_SESSION_PHASES = Object.freeze([
   'main_menu',
   'in_game',
 ]);
+const CANONICAL_SESSION_PHASE_SET = new Set(CANONICAL_SESSION_PHASES);
 
 const PERF_TELEMETRY_MESSAGE_TYPES = new Set([
   'perf-stats',
@@ -520,6 +521,8 @@ const FRAME_PRESENTED_LOG_MILESTONES = Object.freeze(new Set([1, 10, 60]));
 const FRAME_PRESENTED_LOG_INTERVAL_FRAMES = 300;
 const FRAME_PRESENTED_LOG_INTERVAL_MS = 10000;
 const FRAME_PRESENTED_HUD_THROTTLE_MS = 100;
+const HIDDEN_HUD_FRAME_METRICS_THROTTLE_MS = 500;
+const JS_HEAP_SAMPLE_THROTTLE_MS = 1000;
 const MAX_SYNTHETIC_FRAME_DELTA_STEPS = 2048;
 const FIRST_VISIBLE_FRAME_LOG_RE =
   /\bFIRST_VISIBLE_FRAME\b|\bfirst[\s_-]*(?:visible|non[\s_-]*black)[\s_-]*frame\b/i;
@@ -1948,7 +1951,44 @@ export function bootstrapPlayGta6App(options = {}) {
 
   let latestFastBootPlan = null;
   let latestQuotaEviction = null;
+  let lastJsHeapSampleAtMs = -Infinity;
+  let jsHeapNotifiedToHud = false;
+  let lastFramePresentedForwardAtMs = -Infinity;
+  let lastFramePresentedForwardedDraws = -1;
+  let lastFramePresentedForwardedErrors = -1;
+  let lastFramePresentedForwardedVisible = false;
   const bootStartedAtMs = now();
+
+  function isHudHidden() {
+    const ctrl =
+      options.hudController ||
+      (windowObj && typeof windowObj === 'object' ? windowObj.playgta6HudController : null);
+    if (ctrl && typeof ctrl === 'object') {
+      if (typeof ctrl.isVisible === 'function') {
+        try {
+          return ctrl.isVisible() === false;
+        } catch {
+          // Ignore optional visibility checks.
+        }
+      }
+      if (typeof ctrl.visible === 'boolean') {
+        return ctrl.visible === false;
+      }
+    }
+    if (hud && typeof hud === 'object') {
+      if (typeof hud.isVisible === 'function') {
+        try {
+          return hud.isVisible() === false;
+        } catch {
+          // Ignore optional visibility checks.
+        }
+      }
+      if (typeof hud.visible === 'boolean') {
+        return hud.visible === false;
+      }
+    }
+    return false;
+  }
 
   function readRawPerformanceMemory() {
     const perfCandidates = [
@@ -4131,19 +4171,38 @@ export function bootstrapPlayGta6App(options = {}) {
     }
 
     if (!sawExplicitMemory) {
-      const sampledMem = sampleJsHeapMemory();
-      if (sampledMem) {
-        if (sampledMem.jsHeapUsedMb !== null) {
-          perfTelemetry.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
-          panelPatch.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
-          memoryUpdated = true;
-          panelFieldUpdated = true;
-          updated = true;
-        }
-        if (sampledMem.jsHeapTotalMb !== null) {
-          perfTelemetry.jsHeapTotalMb = sampledMem.jsHeapTotalMb;
-          memoryUpdated = true;
-          updated = true;
+      const sampleNowMs = now();
+      const needsFirstHudNotify = notifyHud && !jsHeapNotifiedToHud;
+      const shouldSampleHeap =
+        perfTelemetry.jsHeapUsedMb === null ||
+        needsFirstHudNotify ||
+        sampleNowMs - lastJsHeapSampleAtMs >= JS_HEAP_SAMPLE_THROTTLE_MS ||
+        sampleNowMs < lastJsHeapSampleAtMs;
+      if (shouldSampleHeap) {
+        lastJsHeapSampleAtMs = sampleNowMs;
+        const sampledMem = sampleJsHeapMemory();
+        if (sampledMem) {
+          if (
+            sampledMem.jsHeapUsedMb !== null &&
+            (sampledMem.jsHeapUsedMb !== perfTelemetry.jsHeapUsedMb || needsFirstHudNotify)
+          ) {
+            perfTelemetry.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
+            panelPatch.jsHeapUsedMb = sampledMem.jsHeapUsedMb;
+            memoryUpdated = true;
+            panelFieldUpdated = true;
+            updated = true;
+          }
+          if (
+            sampledMem.jsHeapTotalMb !== null &&
+            (sampledMem.jsHeapTotalMb !== perfTelemetry.jsHeapTotalMb || needsFirstHudNotify)
+          ) {
+            perfTelemetry.jsHeapTotalMb = sampledMem.jsHeapTotalMb;
+            memoryUpdated = true;
+            updated = true;
+          }
+          if (notifyHud && memoryUpdated) {
+            jsHeapNotifiedToHud = true;
+          }
         }
       }
     }
@@ -5065,7 +5124,23 @@ export function bootstrapPlayGta6App(options = {}) {
         );
       }
       syncVisibleFrameFromTelemetry(data, { source: 'frame-presented', deferObserverForward: true });
-      forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+      const frameFwdNowMs = now();
+      const currentVisible = Boolean(gpuTelemetry.hasVisibleContent);
+      const shouldForwardFrameObservers =
+        wgpuFramesPresented <= 1 ||
+        !isHudHidden() ||
+        gpuTelemetry.realPackDrawCount !== lastFramePresentedForwardedDraws ||
+        validationErrorCount !== lastFramePresentedForwardedErrors ||
+        currentVisible !== lastFramePresentedForwardedVisible ||
+        frameFwdNowMs - lastFramePresentedForwardAtMs >= HIDDEN_HUD_FRAME_METRICS_THROTTLE_MS ||
+        frameFwdNowMs < lastFramePresentedForwardAtMs;
+      if (shouldForwardFrameObservers) {
+        lastFramePresentedForwardAtMs = frameFwdNowMs;
+        lastFramePresentedForwardedDraws = gpuTelemetry.realPackDrawCount;
+        lastFramePresentedForwardedErrors = validationErrorCount;
+        lastFramePresentedForwardedVisible = currentVisible;
+        forwardGpuStatsToObservers(buildGpuStatsPayload(), { allowHudMetricsFallback: false });
+      }
       if (gpuBootPanel && perfRes.panelFieldUpdated) {
         safeUpdateGpuBootPanel(perfRes.panelPatch);
       }
@@ -6542,16 +6617,55 @@ export function bootstrapPlayGta6App(options = {}) {
         progressChannel.onmessage = (ev) => {
           const data = ev && ev.data && typeof ev.data === 'object' ? ev.data : null;
           if (!data) return;
-          if (handleWorkerMessage(data)) {
-            return;
+
+          // W366 fast-path: pure per-frame progress labels (`WebGPU frame #N presented`)
+          // arrive at 30-60 Hz; bypass 32-source loader/perf scanning and performance.memory
+          // sampling when no extra telemetry keys are attached.
+          let fastPresentedFrameNum = null;
+          if (
+            data.type === undefined &&
+            data.error === undefined &&
+            data.metrics === undefined &&
+            typeof data.label === 'string'
+          ) {
+            const parsedNum = parseWebGpuFramePresentedLabel(data.label);
+            if (parsedNum !== null) {
+              let hasExtraKeys = false;
+              for (const key in data) {
+                if (
+                  key !== 'label' &&
+                  key !== 'framesPresented' &&
+                  key !== 'presentCount' &&
+                  key !== 'frame' &&
+                  key !== 'frameCount' &&
+                  key !== 'timestampMs' &&
+                  key !== 'drawCalls' &&
+                  key !== 'packetsProcessed' &&
+                  key !== 'packetCount' &&
+                  key !== 'computeDispatches'
+                ) {
+                  hasExtraKeys = true;
+                  break;
+                }
+              }
+              if (!hasExtraKeys) {
+                fastPresentedFrameNum = parsedNum;
+              }
+            }
           }
-          ingestGpuAdapterFromPayload(data);
-          ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
-          if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
-            try {
-              hud.updateMetrics(data.metrics);
-            } catch {
-              // Ignore HUD errors.
+
+          if (fastPresentedFrameNum === null) {
+            if (handleWorkerMessage(data)) {
+              return;
+            }
+            ingestGpuAdapterFromPayload(data);
+            ingestLoaderTelemetry(data, { notify: true, parseLabel: true });
+            if (data.metrics && hud && typeof hud.updateMetrics === 'function') {
+              try {
+                hud.updateMetrics(data.metrics);
+              } catch {
+                // Ignore HUD errors.
+              }
             }
           }
           if (data.error) {
@@ -6568,7 +6682,10 @@ export function bootstrapPlayGta6App(options = {}) {
             }
           } else if (data.label) {
             const labelStr = String(data.label);
-            const presentedFrameNum = parseWebGpuFramePresentedLabel(labelStr);
+            const presentedFrameNum =
+              fastPresentedFrameNum !== null
+                ? fastPresentedFrameNum
+                : parseWebGpuFramePresentedLabel(labelStr);
             if (presentedFrameNum !== null) {
               const frameNowMs = now();
               wgpuFramesPresented = Math.max(wgpuFramesPresented, presentedFrameNum);
@@ -6584,11 +6701,14 @@ export function bootstrapPlayGta6App(options = {}) {
               if (isSplashOverlayHolding()) {
                 updateSplashLoadingAssetsProgress();
               }
+              const hudFrameThrottleMs = isHudHidden()
+                ? HIDDEN_HUD_FRAME_METRICS_THROTTLE_MS
+                : FRAME_PRESENTED_HUD_THROTTLE_MS;
               if (
                 hud &&
                 typeof hud.updateMetrics === 'function' &&
                 (presentedFrameNum === 1 ||
-                  frameNowMs - lastHudFrameMetricsAtMs >= FRAME_PRESENTED_HUD_THROTTLE_MS)
+                  frameNowMs - lastHudFrameMetricsAtMs >= hudFrameThrottleMs)
               ) {
                 lastHudFrameMetricsAtMs = frameNowMs;
                 try {
@@ -7412,7 +7532,16 @@ export function bootstrapPlayGta6App(options = {}) {
     if (activeSmokeRunner && Number.isFinite(activeSmokeRunner.frameIndex)) {
       frames = Math.max(frames, Math.max(0, Math.floor(activeSmokeRunner.frameIndex)));
     }
-    if (perfMonitor && typeof perfMonitor.getSnapshot === 'function') {
+    if (perfMonitor && typeof perfMonitor.getTotalFrames === 'function') {
+      try {
+        const total = perfMonitor.getTotalFrames();
+        if (typeof total === 'number' && Number.isFinite(total) && total > 0) {
+          frames = Math.max(frames, Math.floor(total));
+        }
+      } catch {
+        // Ignore PerfMonitor errors.
+      }
+    } else if (perfMonitor && typeof perfMonitor.getSnapshot === 'function') {
       try {
         const snap = perfMonitor.getSnapshot();
         const total = snap && snap.frames && snap.frames.totalFrames;
@@ -7661,8 +7790,15 @@ export function bootstrapPlayGta6App(options = {}) {
             }
           })()
         : null);
-    if (typeof rawCurrentPhase === 'string' && rawCurrentPhase.trim().length > 0) {
-      currentPhase = sanitizeDiagnosticText(rawCurrentPhase.trim(), 64) || null;
+    if (typeof rawCurrentPhase === 'string' && rawCurrentPhase.length > 0) {
+      if (CANONICAL_SESSION_PHASE_SET.has(rawCurrentPhase)) {
+        currentPhase = rawCurrentPhase;
+      } else {
+        const trimmed = rawCurrentPhase.trim();
+        if (trimmed.length > 0) {
+          currentPhase = sanitizeDiagnosticText(trimmed, 64) || null;
+        }
+      }
     }
 
     const phaseTransitionCount = toSafeNonNegativeInt(
