@@ -2883,7 +2883,23 @@ fn decode_vopc(bytes: &[u8], offset: usize, w0: u32) -> Rdna2Instruction {
     };
 
     let mnemonic = vopc_mnemonic(op);
-    let dst = if (op & 0x10) != 0 { "exec" } else { "vcc" };
+    let dst_str;
+    let dst: &str = if (op & 0x10) != 0 {
+        "exec"
+    } else if src0 == 0xF9
+        && let Some(w1) = literal
+        && ((w1 >> 15) & 1) != 0
+    {
+        let sdst = ((w1 >> 8) & 0x7F) as u8;
+        if sdst == 106 {
+            "vcc"
+        } else {
+            dst_str = format!("s{sdst}");
+            &dst_str
+        }
+    } else {
+        "vcc"
+    };
     let operands = format!("{dst}, {}, v{vsrc1}", format_src_operand(src0, literal));
 
     Rdna2Instruction {
