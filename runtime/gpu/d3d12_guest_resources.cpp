@@ -75,6 +75,89 @@ constexpr uint64_t align_up(uint64_t v, uint64_t a) {
     return (v + a - 1) / a * a;
 }
 
+// Block geometry of a WebGPU host texture format (used when zero-filling reused pooled host
+// textures whose DXGI format was promoted to a wider WebGPU format, e.g. A8_UNORM -> rgba8unorm
+// or R16_UNORM -> r32float, so WriteTexture bytes_per_row matches the host format).
+DxgiFormatLayout wgpu_format_block_layout(pso::WgpuTextureFormat format) noexcept {
+    using F = pso::WgpuTextureFormat;
+    auto uncomp = [](uint32_t bpp) noexcept { return DxgiFormatLayout{bpp, 1u, 1u, 1u, true}; };
+    auto bc = [](uint32_t bpb) noexcept { return DxgiFormatLayout{bpb, 4u, 4u, 1u, true}; };
+    switch (format) {
+        case F::R8Unorm:
+        case F::R8Snorm:
+        case F::R8Uint:
+        case F::R8Sint:
+        case F::Stencil8:
+            return uncomp(1u);
+        case F::R16Unorm:
+        case F::R16Snorm:
+        case F::R16Uint:
+        case F::R16Sint:
+        case F::R16Float:
+        case F::Rg8Unorm:
+        case F::Rg8Snorm:
+        case F::Rg8Uint:
+        case F::Rg8Sint:
+        case F::Depth16Unorm:
+            return uncomp(2u);
+        case F::R32Uint:
+        case F::R32Sint:
+        case F::R32Float:
+        case F::Rg16Unorm:
+        case F::Rg16Snorm:
+        case F::Rg16Uint:
+        case F::Rg16Sint:
+        case F::Rg16Float:
+        case F::Rgba8Unorm:
+        case F::Rgba8UnormSrgb:
+        case F::Rgba8Snorm:
+        case F::Rgba8Uint:
+        case F::Rgba8Sint:
+        case F::Bgra8Unorm:
+        case F::Bgra8UnormSrgb:
+        case F::Rgb9e5Ufloat:
+        case F::Rgb10a2Uint:
+        case F::Rgb10a2Unorm:
+        case F::Rg11b10Ufloat:
+        case F::Depth24Plus:
+        case F::Depth24PlusStencil8:
+        case F::Depth32Float:
+            return uncomp(4u);
+        case F::Rg32Uint:
+        case F::Rg32Sint:
+        case F::Rg32Float:
+        case F::Rgba16Unorm:
+        case F::Rgba16Snorm:
+        case F::Rgba16Uint:
+        case F::Rgba16Sint:
+        case F::Rgba16Float:
+        case F::Depth32FloatStencil8:
+            return uncomp(8u);
+        case F::Rgba32Uint:
+        case F::Rgba32Sint:
+        case F::Rgba32Float:
+            return uncomp(16u);
+        case F::Bc1RgbaUnorm:
+        case F::Bc1RgbaUnormSrgb:
+        case F::Bc4RUnorm:
+        case F::Bc4RSnorm:
+            return bc(8u);
+        case F::Bc2RgbaUnorm:
+        case F::Bc2RgbaUnormSrgb:
+        case F::Bc3RgbaUnorm:
+        case F::Bc3RgbaUnormSrgb:
+        case F::Bc5RgUnorm:
+        case F::Bc5RgSnorm:
+        case F::Bc6hRgbUfloat:
+        case F::Bc6hRgbFloat:
+        case F::Bc7RgbaUnorm:
+        case F::Bc7RgbaUnormSrgb:
+            return bc(16u);
+        default:
+            return DxgiFormatLayout{};
+    }
+}
+
 bool heap_cpu_visible(const GuestHeapProperties& p) {
     if (p.Type == HeapType::Upload || p.Type == HeapType::Readback) {
         return true;
@@ -1676,12 +1759,15 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     key.dim = static_cast<uint8_t>(dim);
 
     const DxgiFormatLayout shape_layout = dxgi_format_layout(dxgi_format);
+    const DxgiFormatLayout host_layout = wgpu_format_block_layout(mapping.format);
+    const DxgiFormatLayout& effective_layout =
+        (host_layout.known && host_layout.block_bytes != 0) ? host_layout : shape_layout;
     const bool is3d_tex = dim == GpuTextureDimension::Dim3D;
     const uint64_t chain_bytes =
-        shape_layout.known && shape_layout.block_bytes != 0
-            ? texture_chain_bytes(width, safe_height, is3d_tex ? safe_depth : 1u, safe_mips, shape_layout.block_width,
-                                  shape_layout.block_height, shape_layout.block_bytes, 0u,
-                                  is3d_tex ? 1u : safe_depth)
+        effective_layout.known && effective_layout.block_bytes != 0
+            ? texture_chain_bytes(width, safe_height, is3d_tex ? safe_depth : 1u, safe_mips,
+                                  effective_layout.block_width, effective_layout.block_height,
+                                  effective_layout.block_bytes, 0u, is3d_tex ? 1u : safe_depth)
             : 0u;
     const uint64_t cur_frame = present_epoch();
 
@@ -1808,8 +1894,8 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     CommandEncoder enc;
     if (reused_id != 0) {
         const std::vector<ZeroWrite> zeros =
-            zero_fill_writes(width, safe_height, safe_depth, safe_mips, is3d_tex, shape_layout.block_width,
-                             shape_layout.block_height, shape_layout.block_bytes);
+            zero_fill_writes(width, safe_height, safe_depth, safe_mips, is3d_tex, effective_layout.block_width,
+                             effective_layout.block_height, effective_layout.block_bytes);
         std::vector<uint8_t> zero_bytes;
         for (const ZeroWrite& z : zeros) {
             zero_bytes.assign(static_cast<size_t>(z.bytes), 0u);

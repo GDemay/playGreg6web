@@ -30,6 +30,7 @@
 #include "gpu/gfx10_descriptors.h"
 #include "gpu/gfx10_detile.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/small_texture_pool.h"
 #include "gpu/stage_reflection.h"
 #include "gpu/texture_budget.h"
 #include "gpu/gpu_va_watch.h"
@@ -1847,6 +1848,79 @@ void test_a8_upload_widened() {
         CHECK(d[256 + 3] == src[256]);
     }
     scene.release_all({list, upload, tex});
+}
+
+// Reusing a parked small A8_UNORM texture (promoted to rgba8unorm on WebGPU) must zero-fill every
+// mip with the host WebGPU format's row pitch (4 bytes/pixel -> 256, 128, 64, 32, 16, 8 for a
+// 64x64 6-mip chain), never the DXGI A8_UNORM 1-byte/pixel pitch (64, 32, 16, 8, 4, 2).
+void test_pooled_a8_zero_fill_uses_host_format() {
+    Fixture fx;
+    Scene scene(fx);
+    dg::Device* dev = host_device(scene.device);
+    CHECK(dev != nullptr);
+    if (dev == nullptr) {
+        return;
+    }
+
+    const uint64_t va1 = com::guest_alloc(65536);
+    const uint64_t va2 = com::guest_alloc(65536);
+    CHECK(va1 != 0 && va2 != 0);
+
+    // 64x64 6-mip A8_UNORM: DXGI size is 5,460 B, promoted rgba8unorm host size is 21,840 B (<= 64 KiB pool cap).
+    const uint32_t first_id = dev->ensure_address_texture(
+        va1, 65u /*A8_UNORM*/, 64u, 64u, 1u, 6u, 0u, GpuTextureDimension::Dim2D, false);
+    CHECK(first_id != 0);
+
+    playgta6::gpu::SmallTextureShape shape{};
+    shape.owner = reinterpret_cast<uintptr_t>(dev);
+    shape.dxgi_format = 65u;
+    shape.width = 64u;
+    shape.height = 64u;
+    shape.depth = 1u;
+    shape.mip_levels = 6u;
+    shape.dim = static_cast<uint8_t>(GpuTextureDimension::Dim2D);
+    shape.storage = false;
+    const uint64_t host_chain_bytes =
+        playgta6::gpu::texture_chain_bytes(64u, 64u, 1u, 6u, 1u, 1u, 4u, 0u, 1u);
+    CHECK(playgta6::gpu::small_texture_pool().release(shape, first_id, host_chain_bytes, nullptr, nullptr));
+
+    const size_t mark = fx.captured.size();
+    const uint32_t reused_id = dev->ensure_address_texture(
+        va2, 65u /*A8_UNORM*/, 64u, 64u, 1u, 6u, 0u, GpuTextureDimension::Dim2D, false);
+    CHECK(reused_id == first_id);
+
+    const auto ps = packets_since(fx, mark);
+    std::vector<GpuWriteTexturePayload> writes;
+    for (const Packet& p : ps) {
+        if (p.opcode == GpuOpcode::WriteTexture) {
+            writes.push_back(payload_as<GpuWriteTexturePayload>(p));
+        }
+    }
+    CHECK(writes.size() == 6u);
+    for (uint32_t m = 0; m < writes.size(); ++m) {
+        const uint32_t dim = 64u >> m;
+        const uint32_t expected_bpr = dim * 4u;  // rgba8unorm host format, NOT 1 B/px A8_UNORM
+        CHECK(writes[m].texture_id == reused_id);
+        CHECK(writes[m].mip_level == m);
+        CHECK(writes[m].width == dim && writes[m].height == dim);
+        CHECK(writes[m].bytes_per_row == expected_bpr);
+        CHECK(writes[m].rows_per_image == dim);
+        CHECK(writes[m].data_len == expected_bpr * dim);
+    }
+
+    // 128x128 6-mip A8_UNORM promotes to rgba8unorm (87,360 B > 64 KiB pool cap), so the pool
+    // must count host bytes and decline parking it rather than under-counting it at 21,840 B.
+    const uint64_t big_host_bytes =
+        playgta6::gpu::texture_chain_bytes(128u, 128u, 1u, 6u, 1u, 1u, 4u, 0u, 1u);
+    CHECK(big_host_bytes > playgta6::gpu::kSmallTextureMaxBytes);
+    shape.width = 128u;
+    shape.height = 128u;
+    CHECK(!playgta6::gpu::small_texture_pool().release(shape, 99999u, big_host_bytes, nullptr, nullptr));
+
+    std::vector<uint32_t> drained_ids;
+    std::vector<uint64_t> drained_bytes;
+    playgta6::gpu::small_texture_pool().drain(reinterpret_cast<uintptr_t>(dev), &drained_ids, &drained_bytes);
+    scene.release_all();
 }
 
 void test_copies_and_barriers() {
@@ -8716,6 +8790,7 @@ int main() {
     test_copies_and_barriers();
     test_gpu_readback();
     test_a8_upload_widened();
+    test_pooled_a8_zero_fill_uses_host_format();
     test_gpu_va_watch_hooks();
     test_srgb_sibling_view_formats();
     test_bc_upload_needs_feature();

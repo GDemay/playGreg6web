@@ -6384,3 +6384,56 @@ test('W373: BeginRenderPassCommand and SetBindGroup2 dynamic-offsets frame pools
   assert.deepEqual(f2SetBgs[0].args[2], [1024, 1280]);
   assert.deepEqual(f2SetBgs[1].args[2], [1536, 0]);
 });
+
+test('depth-only and stencil-only views on combined depth-stencil textures coerce format to aspect format', () => {
+  const gpu = createMockWebGpu();
+  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx);
+  const handler = installRenderStatePackets(processor);
+
+  const ds32Tex = gpu.device.createTexture({
+    size: { width: 32, height: 32, depthOrArrayLayers: 1 },
+    format: 'depth32float-stencil8',
+    usage: 0x10 | 0x04,
+  });
+  const ds24Tex = gpu.device.createTexture({
+    size: { width: 32, height: 32, depthOrArrayLayers: 1 },
+    format: 'depth24plus-stencil8',
+    usage: 0x10 | 0x04,
+  });
+  processor.textures.set(501, ds32Tex);
+  processor.textures.set(502, ds24Tex);
+
+  const depthOnly32 = handler.getOrCreateTextureView(
+    ds32Tex,
+    { format: 'depth32float-stencil8', aspect: 'depth-only', dimension: '2d' },
+    null,
+    501
+  );
+  const stencilOnly32 = handler.getOrCreateTextureView(
+    ds32Tex,
+    { format: 'depth32float-stencil8', aspect: 'stencil-only', dimension: '2d' },
+    null,
+    501
+  );
+  const depthOnly24 = handler.getOrCreateTextureView(
+    ds24Tex,
+    { format: 'depth24plus-stencil8', aspect: 'depth-only', dimension: '2d' },
+    null,
+    502
+  );
+  const stencilOnly24 = handler.getOrCreateTextureView(
+    ds24Tex,
+    { format: 'depth24plus-stencil8', aspect: 'stencil-only', dimension: '2d' },
+    null,
+    502
+  );
+
+  assert.ok(depthOnly32 && stencilOnly32 && depthOnly24 && stencilOnly24);
+  const views = gpu.results('texture.createView').map((v) => v.desc);
+  assert.deepEqual(views, [
+    { format: 'depth32float', aspect: 'depth-only', dimension: '2d' },
+    { format: 'stencil8', aspect: 'stencil-only', dimension: '2d' },
+    { format: 'depth24plus', aspect: 'depth-only', dimension: '2d' },
+    { format: 'stencil8', aspect: 'stencil-only', dimension: '2d' },
+  ]);
+});
