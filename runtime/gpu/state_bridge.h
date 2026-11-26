@@ -168,6 +168,7 @@ inline constexpr uint64_t CommandListClosed = 1ull << 13;       // call on a clo
 inline constexpr uint64_t ComponentMappingIgnored = 1ull << 14; // non-identity SRV swizzle
 inline constexpr uint64_t UnalignedUniform = 1ull << 15;        // uniform binding offset % 256, not relocated
 inline constexpr uint64_t UnalignedStorage = 1ull << 16;        // storage binding offset % 256, not relocated
+inline constexpr uint64_t NullStorageDispatchDropped = 1ull << 18;  // a dispatch with a null writable storage binding was dropped
 inline constexpr uint64_t StorageViewNoUsage = 1ull << 17;      // storage view of a texture without storage usage
                                                                 // or of another format than the stage's: null
 }  // namespace BridgeDiag
@@ -179,6 +180,8 @@ inline constexpr uint64_t StorageViewNoUsage = 1ull << 17;      // storage view 
 struct BridgeOptions {
     // Shared resource id allocator (must be thread-safe, never return 0). Default: counter from 1.
     std::function<uint32_t()> id_allocator;
+    // Drop dispatches that have a null writable storage binding (counted, never faked as done).
+    bool drop_null_storage_dispatch = true;
     uint32_t features = 0;  // pso::WgpuFeature bits enabled on the WebGPU device
     pso::MidPassClearPolicy mid_pass_clear = pso::MidPassClearPolicy::SplitPass;
     uint32_t max_texture_dimension_2d = 8192;
@@ -681,6 +684,16 @@ struct BridgeStats {
     uint64_t storage_views_converted = 0;
     // Conversion dispatches emitted for them (intermediate <-> real texture).
     uint64_t storage_conversions = 0;
+    // Storage-texture bindings of a depth/stencil-format texture, bound null because WebGPU has no
+    // storage access on depth formats (backlog 35). The colour-format "twin" with a copy into the
+    // real depth plane is NOT implemented: these writes are lost, counted here, never faked.
+    uint64_t storage_views_depth_untwinned = 0;
+    // Dispatches (direct and indirect) dropped because a writable storage binding is null: reads
+    // would give zero and atomics no progress, so work-queue / spin-wait loops can hang the device
+    // (backlog 39). Their other writes are lost. Counted per dispatch; the distinct pipelines hit
+    // are in null_storage_dispatch_pipelines (each logged once through diagnostics).
+    uint64_t dispatches_dropped_null_storage = 0;
+    uint64_t null_storage_dispatch_pipelines = 0;
     // Heap-indexed bindings (SM 6.6 directly indexed heaps) whose root-constant index fell outside
     // the bound heap: bound as null.
     uint64_t heap_index_misses = 0;
@@ -818,6 +831,7 @@ private:
     struct BoundGroup {
         uint32_t bind_group_id = 0;
         std::vector<uint32_t> dynamic_offsets;
+        uint32_t null_write_entries = 0;  // writable storage bindings of the group bound null
     };
     struct VertexBinding {
         uint32_t buffer_id = 0;
@@ -947,6 +961,10 @@ private:
     uint64_t seen_invalidation_epoch_ = 0;
     // Storage redirects the last gpu_entries call made, and those of each bind group (by gpu id).
     std::vector<StorageRedirect> pending_redirects_;
+    uint32_t pending_null_writes_ = 0;  // null writable storage bindings of the last gpu_entries call
+    std::unordered_set<uint32_t> null_storage_pipelines_;  // compute pipelines already counted
+    // True (and counted) when a bound group has a null writable storage binding: the dispatch is dropped.
+    bool drop_null_storage_dispatch(uint32_t pipeline_id);
     std::array<uint32_t, pso::kMaxColorTargets + 1> om_attachments_{};  // texture ids of the bound RTVs + DSV
     std::unordered_map<uint32_t, std::vector<StorageRedirect>> redirects_;
     static constexpr size_t kNoPacket = ~size_t{0};  // created by an earlier recording
