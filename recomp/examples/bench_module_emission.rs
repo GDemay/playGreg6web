@@ -2,10 +2,11 @@
 use playgta6_recomp::{
     code_image::{CodeImage, CodeSection},
     discover::discover,
-    lift::{emit_module, lift_function},
+    lift::{ShardDispatch, emit_module, emit_module_with_dispatch, lift_function},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    collections::HashSet,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::Instant,
 };
@@ -62,17 +63,29 @@ fn main() {
     let function = discover(&image).functions.remove(&0x1000).unwrap();
     let mut lifted = lift_function(&function).unwrap();
     let newline = if kind == "crlf" { "\r\n" } else { "\n" };
-    let attrs = if kind == "raw" { "" } else { " #0" };
+    let attrs = if kind.starts_with("raw") { "" } else { " #0" };
     let function_count = if kind.ends_with("many") {
         1536
-    } else if kind == "skew" {
+    } else if kind.contains("skew") {
         32
     } else {
         1
     };
     let mut ir = format!("define void @synthetic(ptr %state){attrs} {{{newline}");
+    if kind.contains("dispatch") {
+        ir.push_str(&format!(
+            "  %v = load i64, ptr %state, !tbaa !9002{newline}"
+        ));
+    }
     let line = format!("  ; deterministic synthetic lifted body 0123456789abcdef{newline}");
-    while ir.len() < mib * 1024 * 1024 / if kind == "skew" { 1 } else { function_count } {
+    while ir.len()
+        < mib * 1024 * 1024
+            / if kind.contains("skew") {
+                1
+            } else {
+                function_count
+            }
+    {
         ir.push_str(&line);
     }
     ir.push_str(&format!("  ret void{newline}}}{newline}"));
@@ -81,19 +94,46 @@ fn main() {
         .map(|i| {
             let mut f = lifted.clone();
             f.entry += i as u64 * 16;
-            f.ir = if kind == "skew" && i > 0 {
+            f.symbol = format!(
+                "synthetic{i}{}",
+                if kind.contains("long") {
+                    "x".repeat(512)
+                } else {
+                    String::new()
+                }
+            );
+            f.ir = if kind.contains("skew") && i > 0 {
                 format!("define void @synthetic{i}(ptr %state) #0 {{\n  ret void\n}}\n")
             } else {
-                ir.replacen("@synthetic(", &format!("@synthetic{i}("), 1)
+                ir.replacen("@synthetic(", &format!("@{}(", f.symbol), 1)
             };
             f
         })
         .collect();
+    let external_entries: HashSet<_> = fixtures
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 == 0)
+        .map(|(_, f)| f.entry)
+        .collect();
+    let dispatcher_symbol = if kind.contains("long") {
+        "dispatch_".repeat(1024)
+    } else {
+        "dispatch".to_owned()
+    };
+    let dispatch = kind.contains("dispatch").then_some(ShardDispatch {
+        dispatcher_symbol: &dispatcher_symbol,
+        external_entries: &external_entries,
+    });
     LIVE.store(0, Ordering::Relaxed);
     PEAK.store(0, Ordering::Relaxed);
     ACTIVE.store(true, Ordering::Relaxed);
     let start = Instant::now();
-    let output = emit_module(&fixtures).unwrap();
+    let output = match dispatch {
+        Some(d) => emit_module_with_dispatch(&fixtures, Some(d)),
+        None => emit_module(&fixtures),
+    }
+    .unwrap();
     let wall_ms = start.elapsed().as_secs_f64() * 1000.;
     ACTIVE.store(false, Ordering::Relaxed);
     let peak = PEAK.load(Ordering::Relaxed);

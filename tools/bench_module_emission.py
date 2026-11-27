@@ -22,7 +22,7 @@ if a.samples < 3:
     p.error('at least 3 samples required')
 binaries = {'before': a.before, 'after': a.after}
 cases = []
-for kind, mib in [('helper-many', 40), ('control-many', 40), ('skew', 40), ('helper', 40), ('raw', 40), ('crlf', 40), ('control', 0)]:
+for kind, mib in [('dispatch-many', 0), ('dispatch-many', 40), ('helper-dispatch-many', 40), ('dispatch-long-many', 40), ('dispatch-skew', 40), ('raw-dispatch', 40), ('dispatch-control', 0), ('helper-many', 40), ('control-many', 40), ('skew', 40), ('helper', 40), ('raw', 40), ('crlf', 40), ('control', 0)]:
     samples = {'before': [], 'after': []}
     with tempfile.TemporaryDirectory() as tmp:
         outputs = []
