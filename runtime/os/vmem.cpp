@@ -215,6 +215,13 @@ uint64_t shared_view_write_faults() {
     return backing::tracked_view_faults();
 }
 
+bool materialize_host_range(const void* p, uint64_t len) {
+    if (p == nullptr || len == 0) {
+        return true;
+    }
+    return backing::materialize_for_write(static_cast<uint8_t*>(const_cast<void*>(p)), static_cast<size_t>(len));
+}
+
 HostWriteScope::HostWriteScope(const void* p, uint64_t len) {
     if (p != nullptr && len != 0) {
         lo_ = reinterpret_cast<uintptr_t>(p);

@@ -367,6 +367,10 @@ else()
     target_link_libraries(test_xbox_middleware PRIVATE playgta6_core)
     add_test(NAME test_xbox_middleware COMMAND test_xbox_middleware)
 
+    add_executable(test_lazy_host_access ../tests/test_lazy_host_access.cpp)
+    target_link_libraries(test_lazy_host_access PRIVATE playgta6_core)
+    add_test(NAME playgta6_lazy_host_access_tests COMMAND test_lazy_host_access)
+
     add_executable(test_ucrt_bridge ../tests/test_ucrt_bridge.cpp)
     target_link_libraries(test_ucrt_bridge PRIVATE playgta6_core)
     add_test(NAME playgta6_ucrt_bridge_tests COMMAND test_ucrt_bridge)
