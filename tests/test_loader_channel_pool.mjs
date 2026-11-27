@@ -862,8 +862,10 @@ test('W345 pthread wgpuSubmit and coordinator handlePthreadWgpuSubmit forward st
   });
   const gpuWorker = coordWorkers.get('./workers/wgpu_worker.js');
   assert.ok(gpuWorker);
-  // W345: live Wasm64 boot disables per-batch resource replay shadow-copying in wgpu_worker init.
-  assert.equal(gpuWorker.received[0].msg.enableResourceReplay, false);
+  // W345/Wave-5: live Wasm64 boot enables lightweight resource creation-packet replay while
+  // keeping per-batch WriteBuffer shadow-copying disabled in wgpu_worker init.
+  assert.equal(gpuWorker.received[0].msg.enableResourceReplay, true);
+  assert.equal(gpuWorker.received[0].msg.enableShadowBufferReplay, false);
 
   // Spawn one pthread so coordinator creates a tracked MessageChannel pair.
   const pthreadWorker = new coordSelf.Worker('./dist/runtime.js', { name: 'em-pthread-1' });

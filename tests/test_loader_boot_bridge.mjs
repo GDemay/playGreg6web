@@ -294,9 +294,11 @@ test('collectBootBridgeInitFields and worker payloads omit optional URLs when ab
     canvas: 'offscreen',
     width: 1280,
     height: 720,
-    enableResourceReplay: false,
+    enableResourceReplay: true,
+    enableShadowBufferReplay: false,
   });
   assert.equal('enableResourceReplay' in payloads.ioInit, false);
+  assert.equal('enableShadowBufferReplay' in payloads.ioInit, false);
   assert.equal('shaderPackUrl' in payloads.ioInit, false);
   assert.equal('bootBase' in payloads.gpuInit, false);
   assert.equal('gameBase' in payloads.ioInit, false);
@@ -3486,15 +3488,17 @@ test('W180/#918 buildRuntimeModuleConfig hooks preRun timer + onExit final flush
   assert.equal(syncer2.getStats().pendingCount, 0);
 });
 
-test('W345 createWorkerBootInitPayloads disables enableResourceReplay by default and honors explicit overrides', () => {
+test('W345/Wave-5 createWorkerBootInitPayloads enables lightweight creation replay while disabling WriteBuffer shadow replay by default and honors explicit overrides', () => {
   const defaultPayloads = createWorkerBootInitPayloads({
     canvas: 'c',
     width: 1920,
     height: 1080,
     dataBase: '/data/',
   });
-  assert.equal(defaultPayloads.gpuInit.enableResourceReplay, false);
+  assert.equal(defaultPayloads.gpuInit.enableResourceReplay, true);
+  assert.equal(defaultPayloads.gpuInit.enableShadowBufferReplay, false);
   assert.equal('enableResourceReplay' in defaultPayloads.ioInit, false);
+  assert.equal('enableShadowBufferReplay' in defaultPayloads.ioInit, false);
 
   const optedIn = createWorkerBootInitPayloads({
     canvas: 'c',
@@ -3502,9 +3506,12 @@ test('W345 createWorkerBootInitPayloads disables enableResourceReplay by default
     height: 1080,
     dataBase: '/data/',
     enableResourceReplay: true,
+    enableShadowBufferReplay: true,
   });
   assert.equal(optedIn.gpuInit.enableResourceReplay, true);
+  assert.equal(optedIn.gpuInit.enableShadowBufferReplay, true);
   assert.equal('enableResourceReplay' in optedIn.ioInit, false);
+  assert.equal('enableShadowBufferReplay' in optedIn.ioInit, false);
 
   const optedOut = createWorkerBootInitPayloads({
     canvas: 'c',
@@ -3512,18 +3519,22 @@ test('W345 createWorkerBootInitPayloads disables enableResourceReplay by default
     height: 1080,
     dataBase: '/data/',
     enableResourceReplay: false,
+    enableShadowBufferReplay: false,
   });
   assert.equal(optedOut.gpuInit.enableResourceReplay, false);
+  assert.equal(optedOut.gpuInit.enableShadowBufferReplay, false);
 
-  // Non-boolean values fall back safely to false.
+  // Non-boolean values fall back safely to their respective defaults.
   const nonBoolean = createWorkerBootInitPayloads({
     canvas: 'c',
     width: 1920,
     height: 1080,
     dataBase: '/data/',
     enableResourceReplay: 'yes',
+    enableShadowBufferReplay: 'yes',
   });
-  assert.equal(nonBoolean.gpuInit.enableResourceReplay, false);
+  assert.equal(nonBoolean.gpuInit.enableResourceReplay, true);
+  assert.equal(nonBoolean.gpuInit.enableShadowBufferReplay, false);
 });
 
 test('W345 toTransferableArrayBuffer avoids copying standalone non-shared buffers and safely copies subviews/SABs', () => {
