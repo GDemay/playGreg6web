@@ -4141,17 +4141,22 @@ def _extract_renderer_memory_stats(
 
     used_mb = _sanitize_non_negative_float(js_heap_used_mb, digits=1)
     total_mb = _sanitize_non_negative_float(js_heap_total_mb, digits=1)
-    if used_mb is None or total_mb is None:
-        p_used, p_total = _extract_js_heap_mb(session, probe_map)
-        if used_mb is None:
-            used_mb = p_used
-        if total_mb is None:
-            total_mb = p_total
+    probe_main_used_mb, probe_main_total_mb = extract_js_heap_mb_from_probe(probe_map)
+    if used_mb is None:
+        used_mb = probe_main_used_mb
+    if total_mb is None:
+        total_mb = probe_main_total_mb
 
     shared_vals: list[int] = []
     wasm_mem_vals: list[int] = []
     heap_used_bytes_vals: list[int] = []
     heap_total_bytes_vals: list[int] = []
+    cdp_used_bytes_vals: list[int] = []
+    cdp_total_bytes_vals: list[int] = []
+    cdp_used_mb_vals: list[float] = []
+    cdp_total_mb_vals: list[float] = []
+    main_used_mb_vals: list[float] = []
+    main_total_mb_vals: list[float] = []
     for src in sources:
         for key in ("sharedModulesDeliveredToPthreads", "shared_modules_delivered_to_pthreads"):
             val = _sanitize_optional_non_negative_int(src.get(key))
@@ -4173,6 +4178,36 @@ def _extract_renderer_memory_stats(
             if val is not None:
                 heap_total_bytes_vals.append(val)
                 break
+        for key in ("cdpTotalJsHeapUsedBytes", "cdp_total_js_heap_used_bytes"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                cdp_used_bytes_vals.append(val)
+                break
+        for key in ("cdpTotalJsHeapTotalBytes", "cdp_total_js_heap_total_bytes"):
+            val = _sanitize_optional_non_negative_int(src.get(key))
+            if val is not None:
+                cdp_total_bytes_vals.append(val)
+                break
+        for key in ("cdpTotalJsHeapUsedMb", "cdp_total_js_heap_used_mb"):
+            val = _sanitize_non_negative_float(src.get(key), digits=1)
+            if val is not None:
+                cdp_used_mb_vals.append(val)
+                break
+        for key in ("cdpTotalJsHeapTotalMb", "cdp_total_js_heap_total_mb"):
+            val = _sanitize_non_negative_float(src.get(key), digits=1)
+            if val is not None:
+                cdp_total_mb_vals.append(val)
+                break
+        for key in ("mainThreadJsHeapUsedMb", "main_thread_js_heap_used_mb"):
+            val = _sanitize_non_negative_float(src.get(key), digits=1)
+            if val is not None:
+                main_used_mb_vals.append(val)
+                break
+        for key in ("mainThreadJsHeapTotalMb", "main_thread_js_heap_total_mb"):
+            val = _sanitize_non_negative_float(src.get(key), digits=1)
+            if val is not None:
+                main_total_mb_vals.append(val)
+                break
 
     log_sources: list[Sequence[str]] = [session.console_lines]
     hud = probe_map.get("hud")
@@ -4190,9 +4225,25 @@ def _extract_renderer_memory_stats(
             heap_total_bytes_vals.append(parsed["jsHeapTotalBytes"])
 
     out: dict[str, Any] = {}
-    if used_mb is not None:
+    main_used_mb = (
+        probe_main_used_mb
+        if probe_main_used_mb is not None
+        else (main_used_mb_vals[0] if main_used_mb_vals else None)
+    )
+    main_total_mb = (
+        probe_main_total_mb
+        if probe_main_total_mb is not None
+        else (main_total_mb_vals[0] if main_total_mb_vals else None)
+    )
+    if main_used_mb is not None:
+        out["jsHeapUsedMb"] = main_used_mb
+        out["mainThreadJsHeapUsedMb"] = main_used_mb
+    elif used_mb is not None:
         out["jsHeapUsedMb"] = used_mb
-    if total_mb is not None:
+    if main_total_mb is not None:
+        out["jsHeapTotalMb"] = main_total_mb
+        out["mainThreadJsHeapTotalMb"] = main_total_mb
+    elif total_mb is not None:
         out["jsHeapTotalMb"] = total_mb
     if heap_used_bytes_vals:
         out["jsHeapUsedBytes"] = max(heap_used_bytes_vals)
@@ -4200,12 +4251,45 @@ def _extract_renderer_memory_stats(
             derived_mb = sanitize_js_heap_mb_from_bytes(out["jsHeapUsedBytes"])
             if derived_mb is not None:
                 out["jsHeapUsedMb"] = derived_mb
+                if not cdp_used_bytes_vals:
+                    out["mainThreadJsHeapUsedMb"] = derived_mb
     if heap_total_bytes_vals:
         out["jsHeapTotalBytes"] = max(heap_total_bytes_vals)
         if "jsHeapTotalMb" not in out:
             derived_mb = sanitize_js_heap_mb_from_bytes(out["jsHeapTotalBytes"])
             if derived_mb is not None:
                 out["jsHeapTotalMb"] = derived_mb
+                if not cdp_total_bytes_vals:
+                    out["mainThreadJsHeapTotalMb"] = derived_mb
+    if cdp_used_bytes_vals:
+        cdp_used_bytes = max(cdp_used_bytes_vals)
+        out["cdpTotalJsHeapUsedBytes"] = cdp_used_bytes
+        cdp_derived_mb = sanitize_js_heap_mb_from_bytes(cdp_used_bytes)
+        if cdp_derived_mb is not None:
+            out["cdpTotalJsHeapUsedMb"] = cdp_derived_mb
+        # Backward-compat fallback only when main-thread performance.memory is unavailable.
+        if "jsHeapUsedBytes" not in out and "jsHeapUsedMb" not in out:
+            out["jsHeapUsedBytes"] = cdp_used_bytes
+            if cdp_derived_mb is not None:
+                out["jsHeapUsedMb"] = cdp_derived_mb
+    elif cdp_used_mb_vals:
+        out["cdpTotalJsHeapUsedMb"] = max(cdp_used_mb_vals)
+        if "jsHeapUsedMb" not in out:
+            out["jsHeapUsedMb"] = out["cdpTotalJsHeapUsedMb"]
+    if cdp_total_bytes_vals:
+        cdp_total_bytes = max(cdp_total_bytes_vals)
+        out["cdpTotalJsHeapTotalBytes"] = cdp_total_bytes
+        cdp_total_derived_mb = sanitize_js_heap_mb_from_bytes(cdp_total_bytes)
+        if cdp_total_derived_mb is not None:
+            out["cdpTotalJsHeapTotalMb"] = cdp_total_derived_mb
+        if "jsHeapTotalBytes" not in out and "jsHeapTotalMb" not in out:
+            out["jsHeapTotalBytes"] = cdp_total_bytes
+            if cdp_total_derived_mb is not None:
+                out["jsHeapTotalMb"] = cdp_total_derived_mb
+    elif cdp_total_mb_vals:
+        out["cdpTotalJsHeapTotalMb"] = max(cdp_total_mb_vals)
+        if "jsHeapTotalMb" not in out:
+            out["jsHeapTotalMb"] = out["cdpTotalJsHeapTotalMb"]
     if shared_vals:
         out["sharedModulesDeliveredToPthreads"] = max(shared_vals)
     if wasm_mem_vals:
@@ -4233,8 +4317,23 @@ def _build_memory_stats_summary(
             if val is not None:
                 out[key] = val
     if isinstance(renderer_memory, Mapping):
-        for key in ("wasmLinearMemoryBytes", "jsHeapUsedBytes", "jsHeapTotalBytes"):
+        for key in (
+            "wasmLinearMemoryBytes",
+            "jsHeapUsedBytes",
+            "jsHeapTotalBytes",
+            "cdpTotalJsHeapUsedBytes",
+            "cdpTotalJsHeapTotalBytes",
+        ):
             val = _sanitize_optional_non_negative_int(renderer_memory.get(key))
+            if val is not None:
+                out[key] = val
+        for key in (
+            "mainThreadJsHeapUsedMb",
+            "mainThreadJsHeapTotalMb",
+            "cdpTotalJsHeapUsedMb",
+            "cdpTotalJsHeapTotalMb",
+        ):
+            val = _sanitize_non_negative_float(renderer_memory.get(key), digits=1)
             if val is not None:
                 out[key] = val
     return out or None
@@ -4289,11 +4388,25 @@ def _merge_renderer_memory_snapshots(
     if not isinstance(sample, Mapping) or not sample:
         return acc
     merged: dict[str, Any] = dict(acc) if acc else {}
-    for key in ("jsHeapUsedMb", "jsHeapTotalMb"):
+    for key in (
+        "jsHeapUsedMb",
+        "jsHeapTotalMb",
+        "mainThreadJsHeapUsedMb",
+        "mainThreadJsHeapTotalMb",
+        "cdpTotalJsHeapUsedMb",
+        "cdpTotalJsHeapTotalMb",
+    ):
         val = _sanitize_non_negative_float(sample.get(key), digits=1)
         if val is not None:
             merged[key] = val
-    for key in ("jsHeapUsedBytes", "jsHeapTotalBytes", "sharedModulesDeliveredToPthreads", "wasmLinearMemoryBytes"):
+    for key in (
+        "jsHeapUsedBytes",
+        "jsHeapTotalBytes",
+        "cdpTotalJsHeapUsedBytes",
+        "cdpTotalJsHeapTotalBytes",
+        "sharedModulesDeliveredToPthreads",
+        "wasmLinearMemoryBytes",
+    ):
         val = _sanitize_optional_non_negative_int(sample.get(key))
         if val is not None:
             prev = _sanitize_optional_non_negative_int(merged.get(key))
@@ -4992,8 +5105,8 @@ def run_browser_session(
                     if result.first_present_ms is None:
                         result.first_present_ms = round(wall_ms, 2)
                     result.presents.append(_sample_present_record(final_probe, len(result.presents), wall_ms))
-            # CDP Performance.getMetrics fallback for JSHeapUsedSize / JSHeapTotalSize when
-            # performance.memory is unavailable.
+            # CDP Performance.getMetrics captures multi-isolate JSHeapUsedSize / JSHeapTotalSize;
+            # keep these under cdpTotalJsHeap* so they never clobber main-thread performance.memory.
             try:
                 perf_resp = cdp.send("Performance.getMetrics", timeout=3.0)
                 metrics_list = perf_resp.get("metrics") if isinstance(perf_resp, Mapping) else None
@@ -5006,11 +5119,15 @@ def run_browser_session(
                     cdp_used = _sanitize_optional_non_negative_int(perf_map.get("JSHeapUsedSize"))
                     cdp_total = _sanitize_optional_non_negative_int(perf_map.get("JSHeapTotalSize"))
                     if cdp_used is not None or cdp_total is not None:
+                        cdp_used_mb = sanitize_js_heap_mb_from_bytes(cdp_used) if cdp_used is not None else None
+                        cdp_total_mb = sanitize_js_heap_mb_from_bytes(cdp_total) if cdp_total is not None else None
                         observed_renderer_memory = _merge_renderer_memory_snapshots(
                             observed_renderer_memory,
                             {
-                                **({"jsHeapUsedBytes": cdp_used} if cdp_used is not None else {}),
-                                **({"jsHeapTotalBytes": cdp_total} if cdp_total is not None else {}),
+                                **({"cdpTotalJsHeapUsedBytes": cdp_used} if cdp_used is not None else {}),
+                                **({"cdpTotalJsHeapUsedMb": cdp_used_mb} if cdp_used_mb is not None else {}),
+                                **({"cdpTotalJsHeapTotalBytes": cdp_total} if cdp_total is not None else {}),
+                                **({"cdpTotalJsHeapTotalMb": cdp_total_mb} if cdp_total_mb is not None else {}),
                             },
                         )
             except (CdpError, TimeoutError, OSError):

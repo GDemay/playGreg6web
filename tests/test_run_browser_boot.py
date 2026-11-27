@@ -4638,7 +4638,9 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
         }
         expected_renderer_mem = {
             "jsHeapUsedMb": 210.5,
+            "mainThreadJsHeapUsedMb": 210.5,
             "jsHeapTotalMb": 320.0,
+            "mainThreadJsHeapTotalMb": 320.0,
             "jsHeapUsedBytes": int(210.5 * 1024 * 1024),
             "jsHeapTotalBytes": int(320.0 * 1024 * 1024),
             "sharedModulesDeliveredToPthreads": 24,
@@ -4655,6 +4657,8 @@ class T105ChromeM4WarmBootAndTelemetryTests(unittest.TestCase):
             "wasmLinearMemoryBytes": 512 * 1024 * 1024,
             "jsHeapUsedBytes": int(210.5 * 1024 * 1024),
             "jsHeapTotalBytes": int(320.0 * 1024 * 1024),
+            "mainThreadJsHeapUsedMb": 210.5,
+            "mainThreadJsHeapTotalMb": 320.0,
         }
         for container in (rep, rep["summary"], tel, tel["summary"]):
             self.assertEqual(container["gpu_memory"], expected_gpu_mem)
@@ -5181,7 +5185,46 @@ class Orch14DumpPipelinesStagingAndTelemetryTests(unittest.TestCase):
             self.assertEqual(mem["peakTextureBytes"], 250 * 1024 * 1024)
             self.assertEqual(mem["wasmLinearMemoryBytes"], 1024 * 1024 * 1024)
             self.assertEqual(mem["jsHeapUsedBytes"], 94371840)
+            self.assertEqual(mem["cdpTotalJsHeapUsedBytes"], 94371840)
+            self.assertEqual(mem["cdpTotalJsHeapUsedMb"], 90.0)
             self.assertEqual(rep["js_heap_used_mb"], 90.0)
+            self.assertNotIn("mainThreadJsHeapUsedMb", rep["renderer_memory"])
+
+    def test_orch32_p2_separates_main_thread_js_heap_from_cdp_multi_isolate_metrics(self):
+        # When BOTH main-thread performance.memory (64 MiB) and CDP multi-isolate
+        # Performance.getMetrics JSHeapUsedSize (384 MiB) exist, they stay cleanly separate.
+        main_used_bytes = 64 * 1024 * 1024
+        main_total_bytes = 96 * 1024 * 1024
+        cdp_used_bytes = 384 * 1024 * 1024
+        cdp_total_bytes = 512 * 1024 * 1024
+        probe = make_sample_probe(boot_mode="real-wasm64", session_state="running_wasm")
+        probe["memory"] = {
+            "usedJSHeapSize": main_used_bytes,
+            "totalJSHeapSize": main_total_bytes,
+        }
+        sess = make_fake_session_result(probe=probe)
+        sess.renderer_memory = {
+            "jsHeapUsedBytes": main_used_bytes,
+            "jsHeapTotalBytes": main_total_bytes,
+            "cdpTotalJsHeapUsedBytes": cdp_used_bytes,
+            "cdpTotalJsHeapUsedMb": 384.0,
+            "cdpTotalJsHeapTotalBytes": cdp_total_bytes,
+            "cdpTotalJsHeapTotalMb": 512.0,
+        }
+        rep = rbb.build_boot_report(sess, smoke=False, preset="long")
+        rm = rep["renderer_memory"]
+        mem = rep["memory_stats"]
+
+        self.assertEqual(rep["js_heap_used_mb"], 64.0)
+        self.assertEqual(rm["mainThreadJsHeapUsedMb"], 64.0)
+        self.assertEqual(rm["jsHeapUsedMb"], 64.0)
+        self.assertEqual(rm["jsHeapUsedBytes"], main_used_bytes)
+        self.assertEqual(rm["cdpTotalJsHeapUsedBytes"], cdp_used_bytes)
+        self.assertEqual(rm["cdpTotalJsHeapUsedMb"], 384.0)
+        self.assertEqual(mem["mainThreadJsHeapUsedMb"], 64.0)
+        self.assertEqual(mem["jsHeapUsedBytes"], main_used_bytes)
+        self.assertEqual(mem["cdpTotalJsHeapUsedBytes"], cdp_used_bytes)
+        self.assertEqual(mem["cdpTotalJsHeapUsedMb"], 384.0)
 
 
 if __name__ == "__main__":

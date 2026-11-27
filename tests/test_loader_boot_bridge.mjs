@@ -50,6 +50,7 @@ const {
   collectBootBridgeInitFields,
   createWorkerBootInitPayloads,
   forwardGpuWorkerMessage,
+  sanitizeFrameStats,
   sanitizeRenderStateStats,
   getLoaderStatus,
   createHostImports,
@@ -4926,4 +4927,66 @@ test('Orch-39 loader.js coordinator VM handles flush-pipeline-dumps message, glo
   assert.ok(statusReply);
   assert.equal(statusReply.lastFaultRecord.kind, 'trap');
   assert.equal(statusReply.pipelineDumpStats.filesUploaded, 3);
+});
+
+test('Orch-32 P2 #5 + P1 #4a: sanitizeFrameStats preserves gpuMemory and createWorkerBootInitPayloads forwards requireNonBlackFrame', () => {
+  const forwarded = [];
+  const payload = forwardGpuWorkerMessage(
+    {
+      type: 'gpu-telemetry',
+      frameStats: {
+        framesPresented: 12,
+        droppedFrames: 1,
+        gpuMemory: {
+          liveBufferBytes: 16 * 1024 * 1024,
+          liveTextureBytes: 32 * 1024 * 1024,
+          peakBufferBytes: 24 * 1024 * 1024,
+          peakTextureBytes: 48 * 1024 * 1024,
+          stagingPoolBytes: 4 * 1024 * 1024,
+          totalLiveGpuBytes: 52 * 1024 * 1024,
+          customPoolBytes: 1024,
+          negativeBad: -5,
+          hostPathBad: 'C:\\secret\\path',
+          boolBad: true,
+        },
+      },
+    },
+    (msg) => forwarded.push(msg),
+  );
+
+  assert.ok(payload);
+  assert.equal(forwarded.length, 1);
+  assert.deepEqual(payload.frameStats.gpuMemory, {
+    liveBufferBytes: 16 * 1024 * 1024,
+    liveTextureBytes: 32 * 1024 * 1024,
+    peakBufferBytes: 24 * 1024 * 1024,
+    peakTextureBytes: 48 * 1024 * 1024,
+    stagingPoolBytes: 4 * 1024 * 1024,
+    totalLiveGpuBytes: 52 * 1024 * 1024,
+    customPoolBytes: 1024,
+  });
+  assert.deepEqual(payload.gpuMemory, payload.frameStats.gpuMemory);
+  assert.equal(payload.frameStats.vramBytes, 52 * 1024 * 1024);
+
+  // Also verify direct sanitizeFrameStats computes totalLiveGpuBytes if omitted.
+  const direct = sanitizeFrameStats({
+    type: 'gpu-stats',
+    gpuMemory: {
+      liveBufferBytes: 1000,
+      liveTextureBytes: 2000,
+      stagingPoolBytes: 500,
+    },
+  });
+  assert.equal(direct.gpuMemory.totalLiveGpuBytes, 3500);
+
+  // P1 #4a: requireNonBlackFrame: false forwards into gpuInit only (not ioInit).
+  const initPayloads = createWorkerBootInitPayloads({
+    canvas: { id: 'c' },
+    width: 1280,
+    height: 720,
+    dataBase: '/data/',
+    requireNonBlackFrame: false,
+  });
+  assert.equal(initPayloads.gpuInit.requireNonBlackFrame, false);
+  assert.equal(initPayloads.ioInit.requireNonBlackFrame, undefined);
 });

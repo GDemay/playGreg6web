@@ -1433,3 +1433,93 @@ test('Orch-13 gpu-validation-error anti-double-counting across session, HUD, cra
     await app.destroy();
   }
 });
+
+test('Orch-32 P1 #4a + P1 #4b + P2 #5: holdUntilVisible query + requireNonBlackFrame + gpuMemory + swapchainProbeSupported sync', async () => {
+  const { parseSplashHoldQuery } = await import('../web/app_bootstrap.js');
+
+  // 1. parseSplashHoldQuery accepts both ?holdUntilVisible= and ?splashHold= (last wins).
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=0'), false);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=false'), false);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=off'), false);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=no'), false);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=1'), true);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=true'), true);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=on'), true);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=yes'), true);
+  assert.equal(parseSplashHoldQuery('?splashHold=1&holdUntilVisible=0'), false);
+  assert.equal(parseSplashHoldQuery('?holdUntilVisible=0&splashHold=1'), true);
+
+  // 2. ?holdUntilVisible=0 resolves holdUntilVisible=false and forwards requireNonBlackFrame: false to worker init.
+  const { app, mockWorker } = createTestHost(
+    {
+      ok: true,
+      coopCoep: true,
+      hasWasmBinary: true,
+    },
+    {
+      urlSearch: '?holdUntilVisible=0',
+      defaultHoldUntilVisible: true,
+      attachGlobalHook: false,
+    }
+  );
+
+  const postedInits = [];
+  mockWorker.postMessage = (msg) => {
+    postedInits.push(msg);
+  };
+
+  try {
+    await app.start();
+    assert.equal(app.getBootTelemetry().holdUntilVisible, false);
+    assert.equal(app.getDiagnosticsSnapshot().holdUntilVisible, false);
+    assert.ok(postedInits.length >= 1);
+    assert.equal(postedInits[0].requireNonBlackFrame, false);
+
+    // 3. gpu-telemetry carries gpuMemory (with monotonic peaks) + syncs swapchainProbeSupported to inputBridge.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        swapchainProbeSupported: true,
+        frameStats: {
+          framesPresented: 3,
+          droppedFrames: 0,
+          gpuMemory: {
+            liveBufferBytes: 1000,
+            liveTextureBytes: 2000,
+            peakBufferBytes: 1500,
+            peakTextureBytes: 2500,
+            stagingPoolBytes: 500,
+            totalLiveGpuBytes: 3500,
+          },
+        },
+      },
+    });
+    assert.equal(app.inputBridge.getStats().swapchainProbeSupported, true);
+    assert.equal(app.getBootTelemetry().gpu.gpuMemory.liveBufferBytes, 1000);
+    assert.equal(app.getBootTelemetry().gpu.gpuMemory.totalLiveGpuBytes, 3500);
+    assert.equal(app.getDiagnosticsSnapshot().gpuMemory.peakTextureBytes, 2500);
+
+    // Lower live counts on later sample preserve monotonic peak counters.
+    mockWorker.dispatch('message', {
+      data: {
+        type: 'gpu-telemetry',
+        frameStats: {
+          framesPresented: 4,
+          droppedFrames: 0,
+          gpuMemory: {
+            liveBufferBytes: 800,
+            liveTextureBytes: 1200,
+            stagingPoolBytes: 400,
+            totalLiveGpuBytes: 2400,
+          },
+        },
+      },
+    });
+    assert.equal(app.getBootTelemetry().gpu.gpuMemory.liveBufferBytes, 800);
+    assert.equal(app.getBootTelemetry().gpu.gpuMemory.peakBufferBytes, 1500);
+    assert.equal(app.getBootTelemetry().gpu.gpuMemory.peakTextureBytes, 2500);
+    assert.equal(app.getDiagnosticsSnapshot().gpuMemory.totalLiveGpuBytes, 2400);
+  } finally {
+    await app.destroy();
+  }
+});
