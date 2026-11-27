@@ -60,6 +60,7 @@ add_library(playgta6_core STATIC
     gpu/stage_reflection.cpp
     gpu/gpu_va_watch.cpp
     gpu/drop_table.cpp
+    gpu/binding_fallbacks.cpp
     gpu/rt_arena.cpp
     gpu/rt_bvh.cpp
     gpu/rt_residency.cpp
@@ -308,6 +309,9 @@ else()
     add_executable(test_drop_table ../tests/test_drop_table.cpp)
     target_link_libraries(test_drop_table PRIVATE playgta6_core)
     add_test(NAME test_drop_table COMMAND test_drop_table)
+    add_executable(test_binding_fallbacks ../tests/test_binding_fallbacks.cpp)
+    target_link_libraries(test_binding_fallbacks PRIVATE playgta6_core)
+    add_test(NAME test_binding_fallbacks COMMAND test_binding_fallbacks)
     add_executable(test_rt_arena ../tests/test_rt_arena.cpp)
     target_link_libraries(test_rt_arena PRIVATE playgta6_core)
     add_test(NAME test_rt_arena COMMAND test_rt_arena)
