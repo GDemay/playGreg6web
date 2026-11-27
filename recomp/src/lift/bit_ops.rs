@@ -754,7 +754,7 @@ impl FunctionLifter<'_> {
     }
 
     /// The masked shift/rotate count of operand `i` (imm8 or CL) in `dst_bits` (`i32` or `i64`),
-    /// along with the constant value when immediate.
+    /// along with the constant value when immediate or known constant in `rcx`.
     fn masked_count(
         &mut self,
         ins: &Instruction,
@@ -765,9 +765,20 @@ impl FunctionLifter<'_> {
         let count_mask: u64 = if bits == 64 { 63 } else { 31 };
         match ins.op_kind(i) {
             OpKind::Register if ins.op_register(i) == Register::CL => {
-                let (cl, _) = self.read_reg(Register::CL)?;
-                let masked = self.val(&format!("and i8 {cl}, {count_mask}"));
-                Ok((self.val(&format!("zext i8 {masked} to i{dst_bits}")), None))
+                let rcx = self.load_gpr(super::integer::RCX)?;
+                if let Some(v) = super::memory_access::const_addr(&rcx) {
+                    let c = v & count_mask;
+                    return Ok((c.to_string(), Some(c)));
+                }
+                let raw = if dst_bits == 64 {
+                    rcx
+                } else {
+                    self.val(&format!("trunc i64 {rcx} to i{dst_bits}"))
+                };
+                Ok((
+                    self.val(&format!("and i{dst_bits} {raw}, {count_mask}")),
+                    None,
+                ))
             }
             kind if is_immediate(kind) => match ins.try_immediate(i) {
                 Ok(v) => {

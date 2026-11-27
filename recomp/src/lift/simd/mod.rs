@@ -310,6 +310,10 @@ pub(in crate::lift) enum Intr {
     Bitmask,
     /// `llvm.wasm.extadd.pairwise.unsigned.<dst>.<src>` (`i16x8`/`i32x4.extadd_pairwise_*_u`).
     ExtAddPairwiseUnsigned,
+    /// `llvm.wasm.bitselect.<ty>` (`v128.bitselect`): `(a & c) | (b & ~c)` without 16B zero consts.
+    Bitselect,
+    /// `llvm.wasm.q15mulr.sat.signed` (`i16x8.q15mulr_sat_s`): saturating Q15 rounding multiply.
+    Q15MulrSatSigned,
     /// Internal helper `@__playgta6_fma_f64` (double-precision FMA).
     FmaF64,
     /// Internal helper `@__playgta6_clmul` (carry-less multiplication).
@@ -387,6 +391,10 @@ impl Decl {
                     self.ty.suffix()
                 );
             }
+            Intr::Bitselect => {
+                return format!("llvm.wasm.bitselect.{}", self.ty.suffix());
+            }
+            Intr::Q15MulrSatSigned => return "llvm.wasm.q15mulr.sat.signed".to_string(),
             Intr::FmaF64 => return "__playgta6_fma_f64".to_string(),
             Intr::Clmul => return "__playgta6_clmul".to_string(),
             Intr::AesTables => return "__playgta6_aes_sbox".to_string(),
@@ -422,6 +430,7 @@ impl Decl {
             | Intr::Bitmask
             | Intr::ExtAddPairwiseUnsigned => t,
             Intr::Abs => format!("{t}, i1"),
+            Intr::Bitselect => format!("{t}, {t}, {t}"),
             _ => format!("{t}, {t}"),
         }
     }
@@ -1289,18 +1298,16 @@ impl FunctionLifter<'_> {
 
     /// Expands four 32-bit lane indices (`<4 x i32>`, masked by `index_mask` such as `3` or `7`)
     /// into a `<16 x i8>` byte-index vector `[4*k, 4*k+1, 4*k+2, 4*k+3]` for `llvm.wasm.swizzle`.
+    /// Multiplying `k <= 7` by `0x04040404` (`67372036`) computes `4*k` in all 4 bytes of each
+    /// dword simultaneously with zero cross-byte carry (saves `shl 2` + `i8x16.shuffle`).
     fn dword_swizzle_indices(&mut self, idx: &str, index_mask: u32) -> String {
         let i32v = Ty::v(Elem::I32);
         let k = self.val(&format!(
             "and <4 x i32> {idx}, {}",
             i32v.splat(&index_mask.to_string())
         ));
-        let k4 = self.val(&format!("shl <4 x i32> {k}, {}", i32v.splat("2")));
-        let kb = self.cast(&k4, i32v, Ty::v(Elem::I8));
-        let rep = self.val(&format!(
-            "shufflevector <16 x i8> {kb}, <16 x i8> poison, {}",
-            mask(&[0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12])
-        ));
+        let rep32 = self.val(&format!("mul <4 x i32> {k}, {}", i32v.splat("67372036")));
+        let rep = self.cast(&rep32, i32v, Ty::v(Elem::I8));
         self.val(&format!(
             "or <16 x i8> {rep}, <i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3, i8 0, i8 1, i8 2, i8 3>"
         ))

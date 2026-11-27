@@ -135,7 +135,7 @@ impl Ir {
 /// `@llvm.ctlz.i64` and `@__playgta6_umul128`.
 pub(super) fn fma_f64_ir() -> String {
     let mut f = Ir::new(
-        "define internal double @__playgta6_fma_f64(double %a, double %b, double %c) unnamed_addr #0 {\nentry:",
+        "define internal double @__playgta6_fma_f64(double %a, double %b, double %c) unnamed_addr noinline #0 {\nentry:",
     );
     let mut parts = Vec::new();
     for x in ["%a", "%b", "%c"] {
@@ -261,7 +261,7 @@ pub(super) fn fma_f64_ir() -> String {
 
 /// `{lo, hi} = __playgta6_clmul(a, b)`: carry-less 64 x 64 -> 128-bit product.
 pub(super) const CLMUL_IR: &str = "\
-define internal { i64, i64 } @__playgta6_clmul(i64 %a, i64 %b) unnamed_addr #0 {
+define internal { i64, i64 } @__playgta6_clmul(i64 %a, i64 %b) unnamed_addr noinline #0 {
 entry:
   br label %loop
 loop:
@@ -375,7 +375,7 @@ pub(super) fn aes_sub_bytes_ir(inverse: bool) -> String {
 /// `result` is IntRes2 (one bit per element), `flags` holds CF (bit 0), ZF (1), SF (2), OF (3).
 /// Needs `@llvm.cttz.i32`.
 pub(super) const PCMPSTR_IR: &str = "\
-define internal { i32, i32 } @__playgta6_pcmpstr(i32 %imm, <2 x i64> %a, <2 x i64> %b, i64 %la0, i64 %lb0, i1 %implicit) unnamed_addr #0 {
+define internal { i32, i32 } @__playgta6_pcmpstr(i32 %imm, <2 x i64> %a, <2 x i64> %b, i64 %la0, i64 %lb0, i1 %implicit) unnamed_addr noinline #0 {
 entry:
   %A = alloca [16 x i32], align 4
   %B = alloca [16 x i32], align 4

@@ -7,7 +7,7 @@
 use iced_x86::{Instruction, Mnemonic, OpKind, Register};
 
 use super::super::{Flag, FunctionLifter, R, imm, unsupported};
-use super::{Elem, Intr, Ty, fconst, is_256, is_identity_mask, mask};
+use super::{Elem, Intr, Ty, fconst, is_256, is_identity_mask, mask, same_reg};
 
 /// 256-bit forms that operate on each 128-bit lane independently (with the same per-lane
 /// semantics as the 128-bit form; per-lane immediate bits are handled by the lane lifters).
@@ -512,9 +512,9 @@ impl FunctionLifter<'_> {
                 self.xset_half(ins.op_register(0), 0, &r, I64)?;
             }
             M::Vcvtpd2dq | M::Vcvttpd2dq if wide => {
-                // Lower each `<2 x double>` half identically to 128-bit `cvt(t)pd2dq` so both
-                // halves keep their zero upper lanes through `select` and LLVM emits two native
-                // `i32x4.trunc_sat_f64x2_s_zero` instructions with zero scalarization.
+                // Lower each `<2 x double>` half identically to 128-bit `cvt(t)pd2dq` using
+                // `@llvm.wasm.bitselect.v4i32` so both halves emit native
+                // `i32x4.trunc_sat_f64x2_s_zero` with zero scalarization or mask legalization.
                 let truncate = m == M::Vcvttpd2dq;
                 let limit = Ty::v(F64).splat(&fconst(2f64.powi(31)));
                 let mut halves = Vec::with_capacity(2);
@@ -528,12 +528,18 @@ impl FunctionLifter<'_> {
                     let sat2 = self.intr(Intr::FpToSiSat(I32), Ty::v(F64), &[&x]);
                     let sat4 = self.zext_lanes(&sat2, I32, 2);
                     let ok2 = self.val(&format!("fcmp olt <2 x double> {x}, {limit}"));
-                    let ok4 = self.val(&format!(
-                        "shufflevector <2 x i1> {ok2}, <2 x i1> poison, <4 x i32> <i32 0, i32 1, i32 0, i32 1>"
-                    ));
-                    let r4 = self.val(&format!(
-                        "select <4 x i1> {ok4}, <4 x i32> {sat4}, <4 x i32> <i32 -2147483648, i32 -2147483648, i32 0, i32 0>"
-                    ));
+                    let ok64 = self.val(&format!("sext <2 x i1> {ok2} to <2 x i64>"));
+                    let ok32 = self.cast(&ok64, Ty::v(I64), Ty::v(I32));
+                    let mask = self.shuffle(&ok32, "poison", I32, &[0, 2, 0, 2]);
+                    let r4 = self.intr(
+                        Intr::Bitselect,
+                        Ty::v(I32),
+                        &[
+                            &sat4,
+                            "<i32 -2147483648, i32 -2147483648, i32 0, i32 0>",
+                            &mask,
+                        ],
+                    );
                     halves.push(self.cast(&r4, Ty::v(I32), Ty::v(I64)));
                 }
                 let hi_swap = self.shuffle(&halves[1], "poison", I64, &[1, 0]);
@@ -645,14 +651,25 @@ impl FunctionLifter<'_> {
     fn test(&mut self, ins: &Instruction, sign: Option<Elem>) -> R<()> {
         let wide = is_256(ins);
         let t = Ty::v(Elem::I64).ir();
+        let same = same_reg(ins, 0, 1);
         let want_zf = self.flag_live(Flag::Zf);
         let want_cf = self.flag_live(Flag::Cf);
         let mut acc_and = String::new();
         let mut acc_andn = String::new();
         let halves = if wide { 2 } else { 1 };
-        if want_zf || want_cf {
+        if want_zf || (want_cf && !same) {
             for half in 0..halves {
                 let a = self.v_half(ins, 0, half, Elem::I64)?;
+                if same {
+                    if want_zf {
+                        acc_and = if half == 0 {
+                            a
+                        } else {
+                            self.val(&format!("or {t} {acc_and}, {a}"))
+                        };
+                    }
+                    continue;
+                }
                 let b = self.v_half(ins, 1, half, Elem::I64)?;
                 if want_zf {
                     let v_and = self.val(&format!("and {t} {a}, {b}"));
@@ -692,7 +709,11 @@ impl FunctionLifter<'_> {
             self.set_flag(Flag::Zf, &zf);
         }
         if want_cf {
-            let cf = is_all_zero(self, acc_andn);
+            let cf = if same {
+                "true".to_string()
+            } else {
+                is_all_zero(self, acc_andn)
+            };
             self.set_flag(Flag::Cf, &cf);
         }
         for flag in [Flag::Af, Flag::Of, Flag::Pf, Flag::Sf] {

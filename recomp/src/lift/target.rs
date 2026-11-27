@@ -11,9 +11,9 @@
 //!
 //! The only wasm-specific constructs in lifted IR besides those lines are the `llvm.wasm.*`
 //! SIMD128 intrinsics (`swizzle`, `narrow.*`, `dot`, `avgr.unsigned.*`, `bitmask.*`,
-//! `extadd.pairwise.unsigned.*`); a native module defines internal `@__playgta6_*` helpers with
-//! identical semantics on top of SSE2/SSSE3/SSE4.1 intrinsics (or portable IR) and calls those
-//! instead.
+//! `extadd.pairwise.unsigned.*`, `bitselect.*`, `q15mulr.sat.signed`); a native module defines
+//! internal `@__playgta6_*` helpers with identical semantics on top of SSE2/SSSE3/SSE4.1
+//! intrinsics (or portable IR) and calls those instead.
 //!
 //! The wasm feature strings mean nothing to the x86 backend, so a native module drops them and
 //! names a CPU instead ([`NATIVE_DEFAULT_CPU`], `x86-64-v3` = AVX2/FMA/BMI2, which the lifted
@@ -202,6 +202,62 @@ define internal <4 x i32> @__playgta6_extadd_pairwise_u_i32x4(<8 x i16> %v) #0 {
 }
 ",
     },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitselect.v16i8(",
+        native_call: "@__playgta6_bitselect_v16i8(",
+        native_ir: "\
+define internal <16 x i8> @__playgta6_bitselect_v16i8(<16 x i8> %a, <16 x i8> %b, <16 x i8> %c) #0 {
+  %nc = xor <16 x i8> %c, <i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1, i8 -1>
+  %t = and <16 x i8> %a, %c
+  %f = and <16 x i8> %b, %nc
+  %r = or <16 x i8> %t, %f
+  ret <16 x i8> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitselect.v4i32(",
+        native_call: "@__playgta6_bitselect_v4i32(",
+        native_ir: "\
+define internal <4 x i32> @__playgta6_bitselect_v4i32(<4 x i32> %a, <4 x i32> %b, <4 x i32> %c) #0 {
+  %nc = xor <4 x i32> %c, <i32 -1, i32 -1, i32 -1, i32 -1>
+  %t = and <4 x i32> %a, %c
+  %f = and <4 x i32> %b, %nc
+  %r = or <4 x i32> %t, %f
+  ret <4 x i32> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.bitselect.v2i64(",
+        native_call: "@__playgta6_bitselect_v2i64(",
+        native_ir: "\
+define internal <2 x i64> @__playgta6_bitselect_v2i64(<2 x i64> %a, <2 x i64> %b, <2 x i64> %c) #0 {
+  %nc = xor <2 x i64> %c, <i64 -1, i64 -1>
+  %t = and <2 x i64> %a, %c
+  %f = and <2 x i64> %b, %nc
+  %r = or <2 x i64> %t, %f
+  ret <2 x i64> %r
+}
+",
+    },
+    WasmIntrinsicRewrite {
+        wasm_call: "@llvm.wasm.q15mulr.sat.signed(",
+        native_call: "@__playgta6_q15mulr_sat_s(",
+        // wasm `i16x8.q15mulr_sat_s(-32768, -32768)` saturates to +32767, whereas x86 `pmulhrsw`
+        // wraps to -32768; match wasm's exact semantics here so callers are target-independent.
+        native_ir: "\
+define internal <8 x i16> @__playgta6_q15mulr_sat_s(<8 x i16> %a, <8 x i16> %b) #0 {
+  %q = call <8 x i16> @llvm.x86.ssse3.pmul.hr.sw.128(<8 x i16> %a, <8 x i16> %b)
+  %ea = icmp eq <8 x i16> %a, <i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768>
+  %eb = icmp eq <8 x i16> %b, <i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768, i16 -32768>
+  %both = and <8 x i1> %ea, %eb
+  %r = select <8 x i1> %both, <8 x i16> <i16 32767, i16 32767, i16 32767, i16 32767, i16 32767, i16 32767, i16 32767, i16 32767>, <8 x i16> %q
+  ret <8 x i16> %r
+}
+declare <8 x i16> @llvm.x86.ssse3.pmul.hr.sw.128(<8 x i16>, <8 x i16>)
+",
+    },
 ];
 
 /// Where a lifted module will be compiled for.
@@ -295,18 +351,18 @@ impl LiftTarget {
             if body.starts_with("target datalayout = ") {
                 continue;
             }
-            if has_wasm_intr && body.contains("@llvm.wasm.") {
-                if let Some(rew) = WASM_INTRINSICS
+            if has_wasm_intr
+                && body.contains("@llvm.wasm.")
+                && let Some(rew) = WASM_INTRINSICS
                     .iter()
                     .find(|rew| body.contains(rew.wasm_call))
-                {
-                    if body.starts_with("declare ") {
-                        out.push_str(rew.native_ir);
-                    } else {
-                        out.push_str(&line.replace(rew.wasm_call, rew.native_call));
-                    }
-                    continue;
+            {
+                if body.starts_with("declare ") {
+                    out.push_str(rew.native_ir);
+                } else {
+                    out.push_str(&line.replace(rew.wasm_call, rew.native_call));
                 }
+                continue;
             }
             if let Some(with_comdat) = linkonce_global_with_comdat(body) {
                 out.push_str(&with_comdat);
@@ -418,6 +474,15 @@ declare <8 x i16> @llvm.wasm.narrow.unsigned.v8i16.v4i32(<4 x i32>, <4 x i32>)
 declare <4 x i32> @llvm.wasm.dot(<8 x i16>, <8 x i16>)
 declare <16 x i8> @llvm.wasm.avgr.unsigned.v16i8(<16 x i8>, <16 x i8>)
 declare <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16>, <8 x i16>)
+declare i32 @llvm.wasm.bitmask.v16i8(<16 x i8>)
+declare i32 @llvm.wasm.bitmask.v4i32(<4 x i32>)
+declare i32 @llvm.wasm.bitmask.v2i64(<2 x i64>)
+declare <8 x i16> @llvm.wasm.extadd.pairwise.unsigned.v8i16.v16i8(<16 x i8>)
+declare <4 x i32> @llvm.wasm.extadd.pairwise.unsigned.v4i32.v8i16(<8 x i16>)
+declare <16 x i8> @llvm.wasm.bitselect.v16i8(<16 x i8>, <16 x i8>, <16 x i8>)
+declare <4 x i32> @llvm.wasm.bitselect.v4i32(<4 x i32>, <4 x i32>, <4 x i32>)
+declare <2 x i64> @llvm.wasm.bitselect.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)
+declare <8 x i16> @llvm.wasm.q15mulr.sat.signed(<8 x i16>, <8 x i16>)
   %r0 = call <16 x i8> @llvm.wasm.swizzle(<16 x i8> %a0, <16 x i8> %b0)
   %r1 = call <16 x i8> @llvm.wasm.narrow.signed.v16i8.v8i16(<8 x i16> %a1, <8 x i16> %b1)
   %r2 = call <16 x i8> @llvm.wasm.narrow.unsigned.v16i8.v8i16(<8 x i16> %a2, <8 x i16> %b2)
@@ -426,6 +491,15 @@ declare <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16>, <8 x i16>)
   %r5 = call <4 x i32> @llvm.wasm.dot(<8 x i16> %a5, <8 x i16> %b5)
   %r6 = call <16 x i8> @llvm.wasm.avgr.unsigned.v16i8(<16 x i8> %a6, <16 x i8> %b6)
   %r7 = call <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16> %a7, <8 x i16> %b7)
+  %r8 = call i32 @llvm.wasm.bitmask.v16i8(<16 x i8> %a8)
+  %r9 = call i32 @llvm.wasm.bitmask.v4i32(<4 x i32> %a9)
+  %r10 = call i32 @llvm.wasm.bitmask.v2i64(<2 x i64> %a10)
+  %r11 = call <8 x i16> @llvm.wasm.extadd.pairwise.unsigned.v8i16.v16i8(<16 x i8> %a11)
+  %r12 = call <4 x i32> @llvm.wasm.extadd.pairwise.unsigned.v4i32.v8i16(<8 x i16> %a12)
+  %r13 = call <16 x i8> @llvm.wasm.bitselect.v16i8(<16 x i8> %a13, <16 x i8> %b13, <16 x i8> %c13)
+  %r14 = call <4 x i32> @llvm.wasm.bitselect.v4i32(<4 x i32> %a14, <4 x i32> %b14, <4 x i32> %c14)
+  %r15 = call <2 x i64> @llvm.wasm.bitselect.v2i64(<2 x i64> %a15, <2 x i64> %b15, <2 x i64> %c15)
+  %r16 = call <8 x i16> @llvm.wasm.q15mulr.sat.signed(<8 x i16> %a16, <8 x i16> %b16)
 "
         );
         assert_eq!(LiftTarget::Wasm64.retarget(ir.clone()), ir);
@@ -463,6 +537,42 @@ declare <8 x i16> @llvm.wasm.avgr.unsigned.v8i16(<8 x i16>, <8 x i16>)
             (
                 "define internal <8 x i16> @__playgta6_avgr_u_i16x8(",
                 "call <8 x i16> @__playgta6_avgr_u_i16x8(<8 x i16> %a7, <8 x i16> %b7)",
+            ),
+            (
+                "define internal i32 @__playgta6_bitmask_v16i8(",
+                "call i32 @__playgta6_bitmask_v16i8(<16 x i8> %a8)",
+            ),
+            (
+                "define internal i32 @__playgta6_bitmask_v4i32(",
+                "call i32 @__playgta6_bitmask_v4i32(<4 x i32> %a9)",
+            ),
+            (
+                "define internal i32 @__playgta6_bitmask_v2i64(",
+                "call i32 @__playgta6_bitmask_v2i64(<2 x i64> %a10)",
+            ),
+            (
+                "define internal <8 x i16> @__playgta6_extadd_pairwise_u_i16x8(",
+                "call <8 x i16> @__playgta6_extadd_pairwise_u_i16x8(<16 x i8> %a11)",
+            ),
+            (
+                "define internal <4 x i32> @__playgta6_extadd_pairwise_u_i32x4(",
+                "call <4 x i32> @__playgta6_extadd_pairwise_u_i32x4(<8 x i16> %a12)",
+            ),
+            (
+                "define internal <16 x i8> @__playgta6_bitselect_v16i8(",
+                "call <16 x i8> @__playgta6_bitselect_v16i8(<16 x i8> %a13, <16 x i8> %b13, <16 x i8> %c13)",
+            ),
+            (
+                "define internal <4 x i32> @__playgta6_bitselect_v4i32(",
+                "call <4 x i32> @__playgta6_bitselect_v4i32(<4 x i32> %a14, <4 x i32> %b14, <4 x i32> %c14)",
+            ),
+            (
+                "define internal <2 x i64> @__playgta6_bitselect_v2i64(",
+                "call <2 x i64> @__playgta6_bitselect_v2i64(<2 x i64> %a15, <2 x i64> %b15, <2 x i64> %c15)",
+            ),
+            (
+                "define internal <8 x i16> @__playgta6_q15mulr_sat_s(",
+                "call <8 x i16> @__playgta6_q15mulr_sat_s(<8 x i16> %a16, <8 x i16> %b16)",
             ),
         ] {
             assert!(out.contains(def_name), "missing {def_name}:\n{out}");

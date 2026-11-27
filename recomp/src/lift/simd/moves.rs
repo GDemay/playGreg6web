@@ -489,6 +489,8 @@ impl FunctionLifter<'_> {
 
     /// `blendvps/blendvpd/pblendvb`: lane from the second source when the mask lane's sign bit is
     /// set. The mask is the implicit `xmm0` (legacy) or the fourth operand (VEX).
+    /// Lowers via `ashr` sign-bit splat + `@llvm.wasm.bitselect.*` (6B vs 22B with `v128.const 0`
+    /// + `icmp slt`, while still folding `ashr` away after `cmpps`/`pcmpeq*`/`pcmpgt*`).
     pub(super) fn blend_var(&mut self, ins: &Instruction, f: Form, vex: bool, e: Elem) -> R<()> {
         if same_reg(ins, f.a, f.b) {
             let a = self.v128(ins, f.a, e)?;
@@ -499,15 +501,14 @@ impl FunctionLifter<'_> {
         } else {
             Register::XMM0
         };
-        let t = Ty::v(e).ir();
+        let ty = Ty::v(e);
+        let t = ty.ir();
         let a = self.v128(ins, f.a, e)?;
         let b = self.v128(ins, f.b, e)?;
         let m = self.xget(mask_reg, e)?;
-        let c = self.val(&format!("icmp slt {t} {m}, zeroinitializer"));
-        let r = self.val(&format!(
-            "select {} {c}, {t} {b}, {t} {a}",
-            Ty::v(e).bool_ir()
-        ));
+        let shift = ty.splat(&(e.bits() - 1).to_string());
+        let mask = self.val(&format!("ashr {t} {m}, {shift}"));
+        let r = self.intr(Intr::Bitselect, ty, &[&b, &a, &mask]);
         self.xset(ins.op_register(f.dst), &r, e)
     }
 }

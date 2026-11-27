@@ -1799,3 +1799,257 @@ fn r71_bit_ops_bt_fusion_cmov_and_adcx_adox_execute() {
     assert_eq!(o[10].regs[R8], hi32, "mulx32 equal dst high half");
     assert_eq!(o[10].regs[R9], hi64, "mulx64 equal dst high half");
 }
+
+#[test]
+fn wasm64_batch2_scalar_hotloop_exec_bit_exact() {
+    let test = "wasm64_batch2_scalar_hotloop_exec_bit_exact";
+    if !exec_or_skip(test) {
+        return;
+    }
+
+    const F_CARRY_FUSION: u64 = CODE_BASE;
+    const F_SBB_FLAGS: u64 = CODE_BASE + 0x100;
+    const F_DIV_FAST: u64 = CODE_BASE + 0x200;
+    const F_IDIV64_FAST: u64 = CODE_BASE + 0x280;
+    const F_IDIV_FALLBACK: u64 = CODE_BASE + 0x300;
+    const F_MUL_CRC: u64 = CODE_BASE + 0x380;
+    const F_SHIFT_CL_LIVE: u64 = CODE_BASE + 0x400;
+    const F_CALL_CLEAN_LEAF: u64 = CODE_BASE + 0x480;
+    const F_CLEAN_LEAF: u64 = CODE_BASE + 0x500;
+
+    let prog = Program::new()
+        .asm(F_CARRY_FUSION, |a| {
+            // 1) cmp rcx, rdx; sbb eax, eax -> 0xFFFF_FFFF if rcx < rdx else 0
+            a.cmp(rcx, rdx)?;
+            a.sbb(eax, eax)?;
+            // 2) neg r8; sbb r8, r8 -> -1 if r8 != 0 else 0
+            a.neg(r8)?;
+            a.sbb(r8, r8)?;
+            // 3) add r9, r10; adc r11, 0 -> r11 += carry(r9 + r10)
+            a.add(r9, r10)?;
+            a.adc(r11, 0)?;
+            // 4) bt rcx, 3; sbb ebx, ebx -> 0xFFFF_FFFF if bit 3 set else 0
+            a.bt(rcx, 3)?;
+            a.sbb(ebx, ebx)?;
+            // 5) cmp rcx, rdx; cmc; adc rsi, 0 -> rsi += (rcx >= rdx)
+            a.cmp(rcx, rdx)?;
+            a.cmc()?;
+            a.adc(rsi, 0)?;
+            // 6) xor edi, edi; cmp rcx, rdx; sete dil -> 1 if rcx == rdx else 0
+            a.xor(edi, edi)?;
+            a.cmp(rcx, rdx)?;
+            a.sete(dil)?;
+            a.ret()
+        })
+        .asm(F_SBB_FLAGS, |a| {
+            // Observe all 6 flags of `sbb eax, eax` after `cmp rcx, rdx`.
+            a.cmp(rcx, rdx)?;
+            a.sbb(eax, eax)?;
+            a.ret()
+        })
+        .asm(F_DIV_FAST, |a| {
+            // 32-bit unsigned fast path (`xor edx, edx; div ecx`) -> r8=q, r9=r
+            a.xor(edx, edx)?;
+            a.div(ecx)?;
+            a.mov(r8d, eax)?;
+            a.mov(r9d, edx)?;
+            // 32-bit signed fast path (`cdq; idiv r10d`) -> rax=q, rdx=r
+            a.mov(eax, r11d)?;
+            a.cdq()?;
+            a.idiv(r10d)?;
+            a.ret()
+        })
+        .asm(F_IDIV64_FAST, |a| {
+            a.cqo()?;
+            a.idiv(rcx)?;
+            a.ret()
+        })
+        .asm(F_IDIV_FALLBACK, |a| {
+            // `cdq` followed by overwriting `edx` MUST fall back to 64-bit `idiv`, not fast path!
+            a.cdq()?;
+            a.mov(edx, r8d)?;
+            a.idiv(ecx)?;
+            a.ret()
+        })
+        .asm(F_MUL_CRC, |a| {
+            // MSVC magic divide by 3: `mov rax, 0xAAAA_AAAA_AAAA_AAAB; mul rcx; shr rdx, 1`
+            a.mov(rax, 0xAAAA_AAAA_AAAA_AAABu64)?;
+            a.mul(rcx)?;
+            a.shr(rdx, 1)?;
+            a.mov(r8, rdx)?;
+            // Zero-fold `xor eax, eax; mul rcx` -> rax=0, rdx=0
+            a.xor(eax, eax)?;
+            a.mul(rcx)?;
+            // Table-driven `crc32` across 8/16/32/64-bit operands
+            a.mov(r9d, 0x1234_5678u32)?;
+            a.crc32(r9d, r10b)?;
+            a.crc32(r9d, r10w)?;
+            a.crc32(r9d, r10d)?;
+            a.crc32(r9, r10)?;
+            a.ret()
+        })
+        .asm(F_SHIFT_CL_LIVE, |a| {
+            // Incoming flags from `cmp` MUST survive when `cl == 0` and update when `cl != 0`.
+            a.cmp(r8, r9)?;
+            a.shl(rax, cl)?;
+            a.ret()
+        })
+        .asm(F_CALL_CLEAN_LEAF, |a| {
+            // Flags from `cmp rcx, rdx` must stay exact across call to flag-clean leaf!
+            a.cmp(rcx, rdx)?;
+            a.call(F_CLEAN_LEAF)?;
+            a.ret()
+        })
+        .asm(F_CLEAN_LEAF, |a| {
+            a.lea(rax, ptr(rcx + rdx * 2 + 5))?;
+            a.ret()
+        });
+
+    let functions = prog.discover();
+    let built = build("batch2_scalar_exec", functions.values());
+
+    let ref_crc32c = |mut crc: u32, bytes: &[u8]| -> u32 {
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ if crc & 1 != 0 { 0x82F6_3B78 } else { 0 };
+            }
+        }
+        crc
+    };
+
+    let cases = vec![
+        // 0: carry fusion (rcx < rdx, r8 != 0, r9+r10 wraps, bit3 set)
+        Case::new(F_CARRY_FUSION)
+            .reg(RCX, 0x18)
+            .reg(RDX, 0x20)
+            .reg(R8, 42)
+            .reg(R9, u64::MAX)
+            .reg(R10, 5)
+            .reg(R11, 10)
+            .reg(RSI, 100),
+        // 1: carry fusion (rcx == rdx, r8 == 0, no carry, bit3 clear)
+        Case::new(F_CARRY_FUSION)
+            .reg(RCX, 0x10)
+            .reg(RDX, 0x10)
+            .reg(R8, 0)
+            .reg(R9, 5)
+            .reg(R10, 7)
+            .reg(R11, 10)
+            .reg(RSI, 100),
+        // 2 & 3: sbb eax, eax exact 6 flags (CF=1 and CF=0)
+        Case::new(F_SBB_FLAGS).reg(RCX, 3).reg(RDX, 9),
+        Case::new(F_SBB_FLAGS).reg(RCX, 9).reg(RDX, 3),
+        // 4: 32-bit div/idiv fast path
+        Case::new(F_DIV_FAST)
+            .reg(RAX, 1_000_000)
+            .reg(RCX, 7)
+            .reg(R11, (-12345i32) as u32 as u64)
+            .reg(R10, 17),
+        // 5: 64-bit idiv fast path normal
+        Case::new(F_IDIV64_FAST)
+            .reg(RAX, (-1_000_000_000_000i64) as u64)
+            .reg(RCX, 97),
+        // 6: 64-bit idiv fast path #DE (INT64_MIN / -1)
+        Case::new(F_IDIV64_FAST)
+            .reg(RAX, i64::MIN as u64)
+            .reg(RCX, u64::MAX),
+        // 7: 32-bit idiv fallback when edx overwritten after cdq: (1:0) / 2 = 0x80000000 -> #DE? Use (-1:0) / 2?
+        // (0:0x8000_0000) / 4 = 0x2000_0000 rem 0 (positive dividend even though eax has sign bit!)
+        Case::new(F_IDIV_FALLBACK)
+            .reg(RAX, 0x8000_0000)
+            .reg(R8, 0)
+            .reg(RCX, 4),
+        // 8: mul128 magic constant + zero-fold + table-driven crc32
+        Case::new(F_MUL_CRC)
+            .reg(RCX, 3_000_000_009)
+            .reg(R10, 0x0123_4567_89AB_CDEF),
+        // 9 & 10: shl rax, cl with cl == 0 (preserves cmp flags) vs cl == 3 (updates flags)
+        Case::new(F_SHIFT_CL_LIVE)
+            .reg(RAX, 5)
+            .reg(RCX, 0)
+            .reg(R8, 10)
+            .reg(R9, 20),
+        Case::new(F_SHIFT_CL_LIVE)
+            .reg(RAX, 5)
+            .reg(RCX, 3)
+            .reg(R8, 10)
+            .reg(R9, 20),
+        // 11: flag-clean leaf preserves caller's cmp flags without state round-trip
+        Case::new(F_CALL_CLEAN_LEAF).reg(RCX, 7).reg(RDX, 12),
+    ];
+
+    let out = run(&built, &cases);
+    for (i, o) in out.iter().enumerate() {
+        if i == 6 {
+            assert!(o.error.contains("divide error"), "case 6 expected #DE: {o:?}");
+        } else {
+            assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+        }
+    }
+
+    // Verify Cases 0 & 1: carry fusion
+    assert_eq!(out[0].regs[RAX], 0xFFFF_FFFF, "cmp lt -> sbb eax,eax = 0xFFFFFFFF");
+    assert_eq!(out[0].regs[R8], u64::MAX, "neg 42 -> sbb r8,r8 = -1");
+    assert_eq!(out[0].regs[R11], 11, "add wrap -> adc r11, 0 increments");
+    assert_eq!(out[0].regs[RBX], 0xFFFF_FFFF, "bt bit3=1 -> sbb ebx,ebx");
+    assert_eq!(out[0].regs[RSI], 100, "cmp lt -> cmc CF=0 -> adc rsi,0 unchanged");
+    assert_eq!(out[0].regs[RDI], 0, "xor edi,edi; sete dil (ne)");
+
+    assert_eq!(out[1].regs[RAX], 0, "cmp eq -> sbb eax,eax = 0");
+    assert_eq!(out[1].regs[R8], 0, "neg 0 -> sbb r8,r8 = 0");
+    assert_eq!(out[1].regs[R11], 10, "add no wrap -> adc r11, 0 unchanged");
+    assert_eq!(out[1].regs[RBX], 0, "bt bit3=0 -> sbb ebx,ebx = 0");
+    assert_eq!(out[1].regs[RSI], 101, "cmp eq -> cmc CF=1 -> adc rsi,0 increments");
+    assert_eq!(out[1].regs[RDI], 1, "xor edi,edi; sete dil (eq)");
+
+    // Verify Cases 2 & 3: sbb eax, eax exact 6 flags [CF, PF, AF, ZF, SF, OF]
+    assert_eq!(out[2].regs[RAX], 0xFFFF_FFFF);
+    assert_eq!(out[2].flags, [true, true, true, false, true, false], "sbb CF=1 flags");
+    assert_eq!(out[3].regs[RAX], 0);
+    assert_eq!(out[3].flags, [false, true, false, true, false, false], "sbb CF=0 flags");
+
+    // Verify Case 4: 32-bit fast div/idiv
+    assert_eq!((out[4].regs[R8], out[4].regs[R9]), (1_000_000 / 7, 1_000_000 % 7));
+    assert_eq!(
+        (out[4].regs[RAX], out[4].regs[RDX]),
+        ((-12345i32 / 17) as u32 as u64, (-12345i32 % 17) as u32 as u64)
+    );
+
+    // Verify Case 5: 64-bit fast idiv
+    assert_eq!(
+        (out[5].regs[RAX], out[5].regs[RDX]),
+        (
+            (-1_000_000_000_000i64 / 97) as u64,
+            (-1_000_000_000_000i64 % 97) as u64
+        )
+    );
+
+    // Verify Case 7: fallback when edx overwritten after cdq
+    assert_eq!((out[7].regs[RAX], out[7].regs[RDX]), (0x2000_0000, 0));
+
+    // Verify Case 8: mul128 magic divide + zero-fold + table-driven crc32
+    assert_eq!(out[8].regs[R8], 3_000_000_009 / 3, "magic mul128 div by 3");
+    assert_eq!((out[8].regs[RAX], out[8].regs[RDX]), (0, 0), "zero-fold mul");
+    let v = 0x0123_4567_89AB_CDEFu64;
+    let mut want_crc = 0x1234_5678u32;
+    want_crc = ref_crc32c(want_crc, &(v as u8).to_le_bytes());
+    want_crc = ref_crc32c(want_crc, &(v as u16).to_le_bytes());
+    want_crc = ref_crc32c(want_crc, &(v as u32).to_le_bytes());
+    want_crc = ref_crc32c(want_crc, &v.to_le_bytes());
+    assert_eq!(out[8].regs[R9], u64::from(want_crc), "table-driven crc32c");
+
+    // Verify Cases 9 & 10: shl rax, cl flags
+    assert_eq!(out[9].regs[RAX], 5);
+    assert!(out[9].flags[0], "cl==0 preserves cmp(10, 20) CF=1");
+    assert!(out[9].flags[4], "cl==0 preserves cmp(10, 20) SF=1");
+    assert_eq!(out[10].regs[RAX], 40);
+    assert!(!out[10].flags[0], "cl==3 updates CF=0");
+    assert!(!out[10].flags[4], "cl==3 updates SF=0");
+
+    // Verify Case 11: flag-clean leaf preserves cmp(7, 12) flags
+    assert_eq!(out[11].regs[RAX], 7 + 12 * 2 + 5);
+    assert!(out[11].flags[0], "CF=1 preserved across clean leaf");
+    assert!(!out[11].flags[3], "ZF=0 preserved across clean leaf");
+    assert!(out[11].flags[4], "SF=1 preserved across clean leaf");
+}

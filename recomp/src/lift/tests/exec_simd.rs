@@ -5,13 +5,14 @@
 use iced_x86::code_asm::*;
 
 use super::exec::{
-    CODE_BASE, Case, RAX, RCX, RDX, RSP, STACK_TOP, STATE_ADDR, build, exec_or_skip, run,
+    CODE_BASE, Case, R8, RAX, RCX, RDX, RSP, STACK_TOP, STATE_ADDR, build, exec_or_skip, run,
 };
 use super::ir_simd::random_sse_program;
 use super::{Program, asm_function};
-use crate::lift::{STATE_XMM_OFFSET, lift_module};
+use crate::lift::{STATE_XMM_OFFSET, STATE_YMM_HI_OFFSET, lift_module};
 
 const XMM_STATE: u64 = STATE_ADDR + STATE_XMM_OFFSET;
+const YMMH_STATE: u64 = STATE_ADDR + STATE_YMM_HI_OFFSET;
 /// Host function in `runner.js`: `xmm0 = xmm0 * xmm1 + r8` (doubles), then `ret`.
 const HOST_FMA_IMPORT: u64 = 0x7FFE_0010;
 
@@ -2628,4 +2629,464 @@ fn wasm64_simd128_bitmask_extadd_fp_fusion_and_idioms_exec() {
     assert_eq!(out[12].regs[RDX], 0, "ucomisd NaN > 1.0 -> false");
     assert_eq!(out[13].mem[0], cc_nan, "ucomiss NaN");
     assert_eq!(out[13].regs[RDX], 0, "ucomisd 1.0 > NaN -> false");
+}
+
+#[test]
+fn wasm64_batch2_simd128_codegen_and_exec_bit_exact() {
+    use crate::lift::target::LiftTarget;
+
+    if !exec_or_skip("wasm64_batch2_simd128_codegen_and_exec_bit_exact") {
+        return;
+    }
+
+    // 1) Verify LLVM Wasm64 + Native x86-64-v3 codegen for Batch 2 SIMD128 intrinsics & lowering.
+    if let Some(tool) = crate::lift::compile::find_llvm_tool() {
+        struct CodegenProbe {
+            name: &'static str,
+            func: crate::cfg::Function,
+            want_wasm: &'static str,
+            forbid_wasm: Option<&'static str>,
+            want_x86: Option<&'static str>,
+        }
+        let probes = [
+            CodegenProbe {
+                name: "blendvps_bs",
+                func: asm_function(0x1000, |a| {
+                    a.vblendvps(ymm0, ymm1, ymm2, ymm3)?;
+                    a.ret()
+                }),
+                want_wasm: "v128.bitselect",
+                forbid_wasm: Some("v128.const"),
+                want_x86: Some("vblendvps"),
+            },
+            CodegenProbe {
+                name: "pmulhrsw_q15",
+                func: asm_function(0x1100, |a| {
+                    a.pmulhrsw(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                want_wasm: "i16x8.q15mulr_sat_s",
+                forbid_wasm: None,
+                want_x86: Some("pmulhrsw"),
+            },
+            CodegenProbe {
+                name: "cvtpd2dq_bs",
+                func: asm_function(0x1200, |a| {
+                    a.cvttpd2dq(xmm0, xmm1)?;
+                    a.ret()
+                }),
+                want_wasm: "i32x4.trunc_sat_f64x2_s_zero",
+                forbid_wasm: Some("i32x4.shl"),
+                want_x86: None,
+            },
+            CodegenProbe {
+                name: "fma32_bs",
+                func: asm_function(0x1300, |a| {
+                    a.vfmadd213ps(xmm0, xmm1, xmm2)?;
+                    a.ret()
+                }),
+                want_wasm: "v128.bitselect",
+                forbid_wasm: None,
+                want_x86: None,
+            },
+            CodegenProbe {
+                name: "pcmpistrm_vec",
+                func: asm_function(0x1400, |a| {
+                    a.pcmpistrm(xmm0, xmm1, 0x40)?;
+                    a.ret()
+                }),
+                want_wasm: "i8x16.ne",
+                forbid_wasm: Some("i8x16.replace_lane"),
+                want_x86: None,
+            },
+            CodegenProbe {
+                name: "vpermd_mul",
+                func: asm_function(0x1500, |a| {
+                    a.vpermd(ymm0, ymm1, ymm2)?;
+                    a.ret()
+                }),
+                want_wasm: "i32x4.mul",
+                forbid_wasm: None,
+                want_x86: None,
+            },
+        ];
+
+        let compile_to_asm = |ll: &std::path::Path,
+                              bc: &std::path::Path,
+                              out_asm: &std::path::Path,
+                              triple: &str,
+                              cpu: Option<&str>| {
+            match &tool {
+                crate::lift::compile::LlvmTool::Llc { llc, opt } => {
+                    let input = if let Some(opt_bin) = opt {
+                        let st = std::process::Command::new(opt_bin)
+                            .args(["-O2"])
+                            .arg(ll)
+                            .arg("-o")
+                            .arg(bc)
+                            .status()
+                            .expect("run opt");
+                        assert!(st.success(), "opt failed on {}", ll.display());
+                        bc
+                    } else {
+                        ll
+                    };
+                    let mut cmd = std::process::Command::new(llc);
+                    cmd.arg(format!("-mtriple={triple}"))
+                        .args(["-O2", "-filetype=asm"]);
+                    if let Some(c) = cpu {
+                        cmd.arg(format!("-mcpu={c}"));
+                    }
+                    let st = cmd
+                        .arg(input)
+                        .arg("-o")
+                        .arg(out_asm)
+                        .status()
+                        .expect("run llc");
+                    assert!(st.success(), "llc failed on {}", ll.display());
+                }
+                crate::lift::compile::LlvmTool::Clang(clang) => {
+                    let mut cmd = std::process::Command::new(clang);
+                    cmd.args(["-S", "-O2", "-Wno-override-module"])
+                        .arg(format!("--target={triple}"));
+                    if let Some(c) = cpu {
+                        cmd.arg(format!("-march={c}"));
+                    }
+                    let st = cmd
+                        .arg(ll)
+                        .arg("-o")
+                        .arg(out_asm)
+                        .status()
+                        .expect("run clang");
+                    assert!(st.success(), "clang failed on {}", ll.display());
+                }
+            }
+            std::fs::read_to_string(out_asm).expect("read asm")
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "playgta6_batch2_simd_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let native_target = LiftTarget::parse("native:x86_64-pc-windows-msvc", Some("x86-64-v3"))
+            .expect("native target");
+        for CodegenProbe {
+            name,
+            func,
+            want_wasm,
+            forbid_wasm,
+            want_x86,
+        } in &probes
+        {
+            let m = lift_module([func]).expect("lift");
+            let ll = dir.join(format!("{name}.ll"));
+            let bc = dir.join(format!("{name}.bc"));
+            let asm_path = dir.join(format!("{name}.s"));
+            std::fs::write(&ll, &m.ir).expect("write ll");
+            let asm = compile_to_asm(&ll, &bc, &asm_path, "wasm64-unknown-unknown", None);
+            assert!(
+                asm.contains(want_wasm),
+                "{name} expected `{want_wasm}` in wasm64 asm:\n{asm}"
+            );
+            if let Some(forbid) = forbid_wasm {
+                assert!(
+                    !asm.contains(forbid),
+                    "{name} must NOT emit `{forbid}` in wasm64 asm:\n{asm}"
+                );
+            }
+            if let Some(x86_mnem) = want_x86 {
+                let native_ir = native_target.retarget(m.ir);
+                assert!(!native_ir.contains("llvm.wasm."), "leaked wasm intrinsic");
+                let nll = dir.join(format!("{name}_x86.ll"));
+                let nbc = dir.join(format!("{name}_x86.bc"));
+                let nasm = dir.join(format!("{name}_x86.s"));
+                std::fs::write(&nll, &native_ir).expect("write native ll");
+                let x86_asm = compile_to_asm(
+                    &nll,
+                    &nbc,
+                    &nasm,
+                    "x86_64-pc-windows-msvc",
+                    Some("x86-64-v3"),
+                );
+                assert!(
+                    x86_asm.contains(x86_mnem),
+                    "{name} expected `{x86_mnem}` in x86-64 asm:\n{x86_asm}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 2) Bit-exact Wasm64 Node/V8 execution across all Batch 2 SIMD128 edge cases!
+    let f_blendv = CODE_BASE;
+    let f_pmulhrsw = CODE_BASE + 0x100;
+    let f_cvtpd2dq = CODE_BASE + 0x200;
+    let f_fma32 = CODE_BASE + 0x300;
+    let f_pcmpstrm = CODE_BASE + 0x400;
+    let f_vpermd_ptest = CODE_BASE + 0x500;
+
+    let program = Program::new()
+        .asm(f_blendv, |a| {
+            // Legacy blendvps (mask=xmm0), blendvpd (mask=xmm0), pblendvb (mask=xmm0), 256-bit vblendvps
+            a.blendvps(xmm1, xmm2)?;
+            a.blendvpd(xmm3, xmm4)?;
+            a.pblendvb(xmm5, xmm6)?;
+            a.vblendvps(ymm7, ymm8, ymm9, ymm10)?;
+            // VEX-128 vblendvps must zero upper 128 bits of ymm11.
+            a.vblendvps(xmm11, xmm8, xmm9, xmm10)?;
+            a.ret()
+        })
+        .asm(f_pmulhrsw, |a| {
+            // Distinct-reg (including (-32768, -32768) wrap!), same-reg (-32768, -32768), and 256-bit
+            a.pmulhrsw(xmm0, xmm1)?;
+            a.pmulhrsw(xmm2, xmm2)?;
+            a.vpmulhrsw(ymm3, ymm4, ymm5)?;
+            a.ret()
+        })
+        .asm(f_cvtpd2dq, |a| {
+            a.cvtpd2dq(xmm0, xmm1)?;
+            a.cvttpd2dq(xmm2, xmm3)?;
+            a.vcvtpd2dq(xmm4, ymm5)?;
+            a.vcvttpd2dq(xmm6, ymm7)?;
+            a.ret()
+        })
+        .asm(f_fma32, |a| {
+            // Single-rounding FMA32 edge cases (exact cancellation & halfway-to-even).
+            a.vfmadd213ps(xmm0, xmm1, xmm2)?;
+            a.ret()
+        })
+        .asm(f_pcmpstrm, |a| {
+            // Equal-each (imm = 0x48 = 0x40 unit-mask | 0x08 equal-each | 0x00 u8)
+            a.pcmpistrm(xmm1, xmm2, 0x48)?;
+            a.movdqa(xmm4, xmm0)?;
+            // 16-bit equal-each (imm = 0x49 = 0x40 unit-mask | 0x08 equal-each | 0x01 u16) with VEX
+            a.vpcmpistrm(xmm3, xmm5, 0x49)?;
+            a.ret()
+        })
+        .asm(f_vpermd_ptest, |a| {
+            a.vpermd(ymm0, ymm1, ymm2)?;
+            // Same-reg ptest on zero -> ZF=1, CF=1
+            a.ptest(xmm3, xmm3)?;
+            a.sete(al)?;
+            a.setb(cl)?;
+            // Same-reg ptest on non-zero -> ZF=0, CF=1
+            a.ptest(xmm4, xmm4)?;
+            a.sete(dl)?;
+            a.setb(r8b)?;
+            a.ret()
+        });
+
+    let functions = program.discover();
+    let built = build("batch2_simd_exec", functions.values());
+
+    let i16s = |vals: [i16; 8]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let i32s = |vals: [i32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let u32s = |vals: [u32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f32s = |vals: [f32; 4]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+    let f64s = |vals: [f64; 2]| -> Vec<u8> { vals.iter().flat_map(|v| v.to_le_bytes()).collect() };
+
+    // Case 0: blendv* (including -0.0 sign bit = 1 selecting b, +0.0 sign bit = 0 selecting a, NaN)
+    let mut c0 = Case::new(f_blendv);
+    let mut xmm0_in = vec![0u8; 12 * 16];
+    let mut ymmh0_in = vec![0xAAu8; 12 * 16];
+    // xmm0 mask: lane0=-0.0 (bit31=1), lane1=+0.0 (bit31=0), lane2=0x80000000, lane3=0x7FFFFFFF
+    xmm0_in[0..16].copy_from_slice(&u32s([0x8000_0000, 0x0000_0000, 0x8000_0001, 0x7FFF_FFFF]));
+    xmm0_in[16..32].copy_from_slice(&u32s([10, 20, 30, 40])); // xmm1 (a)
+    xmm0_in[32..48].copy_from_slice(&u32s([100, 200, 300, 400])); // xmm2 (b)
+    xmm0_in[48..64].copy_from_slice(&xmm_bytes(0x1111, 0x2222)); // xmm3 (a f64)
+    xmm0_in[64..80].copy_from_slice(&xmm_bytes(0xAAAA, 0xBBBB)); // xmm4 (b f64)
+    xmm0_in[80..96].copy_from_slice(&[1u8; 16]); // xmm5 (a bytes)
+    xmm0_in[96..112].copy_from_slice(&[9u8; 16]); // xmm6 (b bytes)
+    xmm0_in[128..144].copy_from_slice(&u32s([1, 2, 3, 4])); // xmm8 lo
+    ymmh0_in[128..144].copy_from_slice(&u32s([5, 6, 7, 8])); // ymmh8 hi
+    xmm0_in[144..160].copy_from_slice(&u32s([11, 22, 33, 44])); // xmm9 lo
+    ymmh0_in[144..160].copy_from_slice(&u32s([55, 66, 77, 88])); // ymmh9 hi
+    xmm0_in[160..176].copy_from_slice(&u32s([0x8000_0000, 0, 0, 0xFFFF_FFFF])); // xmm10 mask lo
+    ymmh0_in[160..176].copy_from_slice(&u32s([0, 0x8000_0000, 0xFFFF_FFFF, 0])); // ymmh10 mask hi
+    c0.mem.push((XMM_STATE, xmm0_in));
+    c0.mem.push((YMMH_STATE, ymmh0_in));
+    c0.read.push((XMM_STATE + 16, 16)); // xmm1
+    c0.read.push((XMM_STATE + 48, 16)); // xmm3
+    c0.read.push((XMM_STATE + 80, 16)); // xmm5
+    c0.read.push((XMM_STATE + 7 * 16, 16)); // xmm7 lo
+    c0.read.push((YMMH_STATE + 7 * 16, 16)); // ymmh7 hi
+    c0.read.push((XMM_STATE + 11 * 16, 16)); // xmm11 lo
+    c0.read.push((YMMH_STATE + 11 * 16, 16)); // ymmh11 hi (must be zeroed!)
+
+    // Case 1: pmulhrsw / vpmulhrsw (including (-32768, -32768) wrap in distinct & same-reg!)
+    let mut c1 = Case::new(f_pmulhrsw);
+    let mut xmm1_in = vec![0u8; 6 * 16];
+    let mut ymmh1_in = vec![0u8; 6 * 16];
+    let a16 = [-32768i16, -32768, 32767, 16384, -16384, 1, 0, -1];
+    let b16 = [-32768i16, 32767, 32767, 16384, 16384, 16384, -32768, 16384];
+    xmm1_in[0..16].copy_from_slice(&i16s(a16));
+    xmm1_in[16..32].copy_from_slice(&i16s(b16));
+    xmm1_in[32..48].copy_from_slice(&i16s([-32768, 32767, 0, -1, 16384, -16384, 1000, -1000]));
+    xmm1_in[64..80].copy_from_slice(&i16s(a16));
+    xmm1_in[80..96].copy_from_slice(&i16s(b16));
+    ymmh1_in[64..80].copy_from_slice(&i16s([-32768; 8]));
+    ymmh1_in[80..96].copy_from_slice(&i16s([-32768; 8]));
+    c1.mem.push((XMM_STATE, xmm1_in));
+    c1.mem.push((YMMH_STATE, ymmh1_in));
+    c1.read.push((XMM_STATE, 16)); // xmm0
+    c1.read.push((XMM_STATE + 32, 16)); // xmm2 (same-reg)
+    c1.read.push((XMM_STATE + 48, 16)); // ymm3 lo
+    c1.read.push((YMMH_STATE + 48, 16)); // ymm3 hi
+
+    // Case 2: cvtpd2dq / cvttpd2dq / 256-bit vcvt(t)pd2dq edge cases (NaN, +-Inf, 2^31, -2^31, ties)
+    let mut c2 = Case::new(f_cvtpd2dq);
+    let mut xmm2_in = vec![0u8; 8 * 16];
+    let mut ymmh2_in = vec![0xFFu8; 8 * 16];
+    xmm2_in[16..32].copy_from_slice(&f64s([2.5, f64::NAN])); // xmm1 -> [2, INT_MIN, 0, 0]
+    xmm2_in[48..64].copy_from_slice(&f64s([2147483648.0, -2147483648.0])); // xmm3 -> [INT_MIN, INT_MIN, 0, 0]
+    xmm2_in[80..96].copy_from_slice(&f64s([3.5, -3.5])); // ymm5 lo -> [4, -4]
+    ymmh2_in[80..96].copy_from_slice(&f64s([f64::INFINITY, -f64::INFINITY])); // ymm5 hi -> [INT_MIN, INT_MIN]
+    xmm2_in[112..128].copy_from_slice(&f64s([2147483647.9, -2147483648.9])); // ymm7 lo -> [2147483647, INT_MIN]
+    ymmh2_in[112..128].copy_from_slice(&f64s([f64::NAN, -0.0])); // ymm7 hi -> [INT_MIN, 0]
+    c2.mem.push((XMM_STATE, xmm2_in));
+    c2.mem.push((YMMH_STATE, ymmh2_in));
+    c2.read.push((XMM_STATE, 16)); // xmm0
+    c2.read.push((XMM_STATE + 32, 16)); // xmm2
+    c2.read.push((XMM_STATE + 64, 16)); // xmm4
+    c2.read.push((XMM_STATE + 96, 16)); // xmm6
+
+    // Case 3: vfmadd213ps single-rounding exactness
+    let mut c3 = Case::new(f_fma32);
+    let a_f32 = [
+        f32::from_bits(0x3F80_0001), // (1 + 2^-23)
+        f32::from_bits(0x3F80_0001),
+        f32::from_bits(0x4B80_0001), // large exact
+        f32::NAN,
+    ];
+    let b_f32 = [
+        f32::from_bits(0x3F80_0001), // (1 + 2^-23)^2 = 1 + 2^-22 + 2^-46
+        f32::from_bits(0x3F80_0001),
+        2.0f32,
+        1.0f32,
+    ];
+    let c_f32 = [
+        -f32::from_bits(0x3F80_0002), // cancels 1 + 2^-22, leaving exact 2^-46!
+        f32::from_bits(0x2880_0000),  // 2^-46 -> tests round-to-odd tie-breaking
+        -1.0f32,
+        2.0f32,
+    ];
+    c3.mem
+        .push((XMM_STATE, [f32s(a_f32), f32s(b_f32), f32s(c_f32)].concat()));
+    c3.read.push((XMM_STATE, 16));
+
+    // Case 4: pcmpistrm (n==16) & vpcmpistrm (n==8) unit-mask expansion
+    let mut c4 = Case::new(f_pcmpstrm);
+    let mut xmm4_in = vec![0u8; 6 * 16];
+    let ymmh4_in = vec![0xBBu8; 16];
+    // xmm1 vs xmm2 (bytes): match at indices 0, 2, 7, 8, 15
+    let s1 = *b"AbCdEfGhIjKlMnOp";
+    let s2 = *b"AxCyEzGhIxKxMxXp";
+    xmm4_in[16..32].copy_from_slice(&s1);
+    xmm4_in[32..48].copy_from_slice(&s2);
+    // xmm3 vs xmm5 (u16 words): match at indices 0, 3, 7
+    xmm4_in[48..64].copy_from_slice(&i16s([1, 2, 3, 4, 5, 6, 7, 8]));
+    xmm4_in[80..96].copy_from_slice(&i16s([1, 9, 9, 4, 9, 9, 9, 8]));
+    c4.mem.push((XMM_STATE, xmm4_in));
+    c4.mem.push((YMMH_STATE, ymmh4_in));
+    c4.read.push((XMM_STATE + 64, 16)); // xmm4 (8-bit unit mask)
+    c4.read.push((XMM_STATE, 16)); // xmm0 (16-bit unit mask)
+    c4.read.push((YMMH_STATE, 16)); // ymmh0 (zeroed by vpcmpistrm)
+
+    // Case 5: vpermd (dword_swizzle_indices) + same-reg ptest
+    let mut c5 = Case::new(f_vpermd_ptest);
+    let mut xmm5_in = vec![0u8; 5 * 16];
+    let mut ymmh5_in = vec![0u8; 5 * 16];
+    xmm5_in[16..32].copy_from_slice(&u32s([7, 0, 5, 2])); // idx lo
+    ymmh5_in[16..32].copy_from_slice(&u32s([3, 6, 1, 4])); // idx hi
+    xmm5_in[32..48].copy_from_slice(&u32s([10, 20, 30, 40])); // src lo
+    ymmh5_in[32..48].copy_from_slice(&u32s([50, 60, 70, 80])); // src hi
+    xmm5_in[48..64].copy_from_slice(&u32s([0, 0, 0, 0])); // xmm3 == 0
+    xmm5_in[64..80].copy_from_slice(&u32s([0, 1, 0, 0])); // xmm4 != 0
+    c5.mem.push((XMM_STATE, xmm5_in));
+    c5.mem.push((YMMH_STATE, ymmh5_in));
+    c5.read.push((XMM_STATE, 16));
+    c5.read.push((YMMH_STATE, 16));
+
+    let out = run(&built, &[c0, c1, c2, c3, c4, c5]);
+    for (i, o) in out.iter().enumerate() {
+        assert!(o.error.is_empty(), "case {i} trapped: {}", o.error);
+    }
+
+    // Verify Case 0: blendv*
+    assert_eq!(out[0].mem[0], u32s([100, 20, 300, 40]), "blendvps");
+    // xmm0 as <2 x u64>: lane0=0x0000_0000_8000_0000 (bit63=0 -> a), lane1=0x7FFF_FFFF_8000_0001 (bit63=0 -> a)
+    assert_eq!(out[0].mem[1], xmm_bytes(0x1111, 0x2222), "blendvpd");
+    // xmm0 bytes (LE): byte3=0x80, byte11=0x80, bytes 12..=14=0xFF (from 0x7FFF_FFFF) have bit7=1 (sel b);
+    // all other bytes (including byte15=0x7F) have bit7=0 (sel a).
+    let mut want_pb = [1u8; 16];
+    for i in [3, 11, 12, 13, 14] {
+        want_pb[i] = 9;
+    }
+    assert_eq!(out[0].mem[2], want_pb, "pblendvb");
+    assert_eq!(out[0].mem[3], u32s([11, 2, 3, 44]), "vblendvps ymm lo");
+    assert_eq!(out[0].mem[4], u32s([5, 66, 77, 8]), "vblendvps ymm hi");
+    assert_eq!(out[0].mem[5], u32s([11, 2, 3, 44]), "vblendvps xmm lo");
+    assert_eq!(out[0].mem[6], vec![0u8; 16], "vblendvps xmm zeroes ymmh11");
+
+    // Verify Case 1: pmulhrsw exact ref
+    let ref_hrsw = |x: i16, y: i16| -> i16 {
+        ((((i32::from(x) * i32::from(y)) >> 14) + 1) >> 1) as i16
+    };
+    let want_hrsw: [i16; 8] = std::array::from_fn(|i| ref_hrsw(a16[i], b16[i]));
+    assert_eq!(want_hrsw[0], -32768, "sanity: (-32768,-32768) wraps to -32768");
+    assert_eq!(out[1].mem[0], i16s(want_hrsw), "pmulhrsw distinct");
+    let same_in = [-32768i16, 32767, 0, -1, 16384, -16384, 1000, -1000];
+    let want_same: [i16; 8] = std::array::from_fn(|i| ref_hrsw(same_in[i], same_in[i]));
+    assert_eq!(out[1].mem[1], i16s(want_same), "pmulhrsw same-reg");
+    assert_eq!(out[1].mem[2], i16s(want_hrsw), "vpmulhrsw lo");
+    assert_eq!(out[1].mem[3], i16s([-32768; 8]), "vpmulhrsw hi all (-32768,-32768)");
+
+    // Verify Case 2: cvt(t)pd2dq
+    assert_eq!(out[2].mem[0], i32s([2, i32::MIN, 0, 0]), "cvtpd2dq");
+    assert_eq!(out[2].mem[1], i32s([i32::MIN, i32::MIN, 0, 0]), "cvttpd2dq");
+    assert_eq!(out[2].mem[2], i32s([4, -4, i32::MIN, i32::MIN]), "vcvtpd2dq 256");
+    assert_eq!(out[2].mem[3], i32s([i32::MAX, i32::MIN, i32::MIN, 0]), "vcvttpd2dq 256");
+
+    // Verify Case 3: vfmadd213ps single-rounding exactness
+    let got_fma: Vec<u32> = out[3].mem[0]
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        got_fma[0],
+        (2.0f32.powi(-46)).to_bits(),
+        "fma32 exact cancellation 2^-46"
+    );
+    assert_eq!(
+        got_fma[1],
+        a_f32[1].mul_add(b_f32[1], c_f32[1]).to_bits(),
+        "fma32 round-to-odd tie-breaking"
+    );
+    assert_eq!(
+        got_fma[2],
+        a_f32[2].mul_add(b_f32[2], c_f32[2]).to_bits(),
+        "fma32 large exact"
+    );
+    assert!(f32::from_bits(got_fma[3]).is_nan(), "fma32 NaN");
+
+    // Verify Case 4: pcmpistrm / vpcmpistrm unit masks
+    let want_m8: Vec<u8> = (0..16)
+        .map(|i| if s1[i] == s2[i] { 0xFF } else { 0x00 })
+        .collect();
+    assert_eq!(out[4].mem[0], want_m8, "pcmpistrm 8-bit unit mask");
+    assert_eq!(
+        out[4].mem[1],
+        i16s([-1, 0, 0, -1, 0, 0, 0, -1]),
+        "vpcmpistrm 16-bit unit mask"
+    );
+    assert_eq!(out[4].mem[2], vec![0u8; 16], "vpcmpistrm zeroes ymmh0");
+
+    // Verify Case 5: vpermd + same-reg ptest
+    assert_eq!(out[5].mem[0], u32s([80, 10, 60, 30]), "vpermd lo");
+    assert_eq!(out[5].mem[1], u32s([40, 70, 20, 50]), "vpermd hi");
+    assert_eq!(out[5].regs[RAX] & 0xFF, 1, "ptest(0,0) ZF=1");
+    assert_eq!(out[5].regs[RCX] & 0xFF, 1, "ptest(0,0) CF=1");
+    assert_eq!(out[5].regs[RDX] & 0xFF, 0, "ptest(nz,nz) ZF=0");
+    assert_eq!(out[5].regs[R8] & 0xFF, 1, "ptest(nz,nz) CF=1");
 }
