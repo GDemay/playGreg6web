@@ -672,7 +672,9 @@ pub struct RelocationMap {
 impl RelocationMap {
     /// Build a map from arbitrary relocations (sorts and deduplicates).
     pub fn from_entries(mut entries: Vec<Relocation>) -> Self {
-        entries.sort_unstable();
+        // Stable: discovery hands over long presorted runs, which a merge sort only checks
+        // (equal relocations are identical, so the result is the same as an unstable sort).
+        entries.sort();
         entries.dedup();
         Self { entries }
     }
