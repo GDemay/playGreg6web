@@ -285,6 +285,7 @@ and `mmcss_registered` (false when `off` or when avrt.dll refused), so compare f
 ### A/B the guest Sleep timer: `--timer-resolution`
 
 The harness raises the Windows timer resolution to 1 ms by default. `--timer-resolution default` keeps the OS tick as an A/B baseline (`1ms` is the default). The `guest_sleep` block of `boot-report.json` records requested vs actual wall time of every guest `Sleep(ms)` (count, mean/max, overshoot histogram), so compare it per mode.
+The `guest_timed_wait` block does the same for guest waits with a finite timeout (`WaitForSingleObject` and friends): `timed_out` carries the overshoot histogram, `signalled` only the count and mean/max wait; `tools/boot_summary.py` shows the overshoot p50/p99 and `--compare` marks a higher overshoot as a regression.
 
 ### Debugging a black or garbled screen: `--show-target`
 

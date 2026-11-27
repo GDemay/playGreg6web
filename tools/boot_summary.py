@@ -417,6 +417,62 @@ def _browser_gpu_validation_errors(report: dict[str, Any]) -> int | None:
     return int(v) if v is not None else None
 
 
+_BUCKET_UPPER_MS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0)
+_BUCKET_KEYS = ("lt0.5", "lt1", "lt2", "lt4", "lt8", "lt16", "lt32", "ge32")
+
+
+def overshoot_quantile(block: dict[str, Any], q: float) -> float | None:
+    """Upper bound (ms) of the overshoot histogram bucket holding quantile q, capped by max_overshoot_ms;
+    None when the block has no histogram samples."""
+    bk = _d(block.get("overshoot_ms_buckets"))
+    counts = [_n(bk.get(k)) for k in _BUCKET_KEYS]
+    total = sum(counts)
+    if total <= 0:
+        return None
+    need, acc = q * total, 0.0
+    mx = _n(block.get("max_overshoot_ms"))
+    for i, c in enumerate(counts):
+        acc += c
+        if acc >= need:
+            return min(_BUCKET_UPPER_MS[i], mx) if i < len(_BUCKET_UPPER_MS) and mx > 0 else (
+                _BUCKET_UPPER_MS[i] if i < len(_BUCKET_UPPER_MS) else mx)
+    return mx
+
+
+def timing_blocks(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """The overshoot-bearing blocks: guest_sleep and guest_timed_wait.timed_out (the signalled waits have none)."""
+    out = {}
+    if _d(report.get("guest_sleep")):
+        out["guest_sleep"] = _d(report.get("guest_sleep"))
+    tw = _d(_d(report.get("guest_timed_wait")).get("timed_out"))
+    if tw:
+        out["guest_timed_wait"] = tw
+    return out
+
+
+def flush_ms_per_frame(report: dict[str, Any]) -> dict[str, float]:
+    """gpu_work.flush_buffer_ns / flush_uniform_ns as ms per present (empty when absent or no presents)."""
+    gw = _d(report.get("gpu_work"))
+    frames = _total_presents(report)
+    if frames <= 0:
+        return {}
+    return {k: _n(gw.get(f"{k}_ns")) / 1e6 / frames for k in ("flush_buffer", "flush_uniform")
+            if isinstance(gw.get(f"{k}_ns"), (int, float))}
+
+
+def timing_lines(report: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for name, blk in timing_blocks(report).items():
+        p50, p99 = overshoot_quantile(blk, 0.5), overshoot_quantile(blk, 0.99)
+        out.append(f"{name}: {_i(blk.get('count'))} calls, overshoot p50 "
+                   f"{'<=%.1f' % p50 if p50 is not None else '-'} ms, p99 "
+                   f"{'<=%.1f' % p99 if p99 is not None else '-'} ms, max {_n(blk.get('max_overshoot_ms')):.1f} ms")
+    fl = flush_ms_per_frame(report)
+    if fl:
+        out.append("gpu flush: " + ", ".join(f"{k} {v:.3f} ms/frame" for k, v in fl.items()))
+    return out
+
+
 def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_stops: str | None = None) -> str:
     L: list[str] = []
     L += _identity(report)
@@ -513,9 +569,14 @@ def summarize(report: dict[str, Any], syms: "gs.PeSymbols | None" = None, hard_s
         L.append(f"bink: {b.get('binding')}, {_i(b.get('total_calls'))} calls"
                  + (" (" + ", ".join(f"{e.get('name')}={_i(e.get('calls'))}" for e in callers[:3]) + ")"
                     if callers else ""))
+    if b.get("lookup_null") is not None:
+        names = [str(x) for x in (b.get("lookup_null_names") or [])][:3]
+        L.append(f"bink lookups: {_i(b.get('lookup_null'))} null" + (f" ({', '.join(names)})" if names else "")
+                 + f", {len(b.get('open_log') or [])} opens logged")
+    L += timing_lines(report)
     mb = _d(report.get("memory_budget"))
     if mb:
-        ga = _d(mb.get("guest_arena"))
+        ga =_d(mb.get("guest_arena"))
         L.append(f"memory: arena peak {_bytes(ga.get('arena_peak_committed'))}, host private "
                  f"{_bytes(mb.get('host_private_bytes'))}, gpu visible {_bytes(mb.get('gpu_visible_bytes'))}")
     gm = _gpu_memory_dict(report)
@@ -631,6 +692,18 @@ def numeric_facts(report: dict[str, Any]) -> dict[str, float]:
     peak = _d(_d(report.get("memory_budget")).get("guest_arena")).get("arena_peak_committed")
     if _is_num(peak):
         facts["memory.arena_peak_committed"] = float(peak)
+    lookup_null = _d(report.get("bink")).get("lookup_null")
+    if isinstance(lookup_null, (int, float)) and not isinstance(lookup_null, bool):
+        facts["bink.lookup_null"] = float(lookup_null)
+    for name, blk in timing_blocks(report).items():
+        for tag, q in (("p50", 0.5), ("p99", 0.99)):
+            v = overshoot_quantile(blk, q)
+            if v is not None:
+                facts[f"{name}.overshoot_{tag}_ms"] = v
+        if "max_overshoot_ms" in blk:
+            facts[f"{name}.overshoot_max_ms"] = _n(blk.get("max_overshoot_ms"))
+    for k, v in flush_ms_per_frame(report).items():
+        facts[f"gpu_work.{k}_ms_per_frame"] = v
     drops = _d(_d(report.get("gpu_work")).get("drops_by_program"))
     facts["drops_total"] = float(sum(int(_n(v)) for v in drops.values()))
     return facts
@@ -646,7 +719,8 @@ HIGHER_BETTER = ("fps_", "presents", "frames_played", "shader_pack_hits", "xapu_
                  "audio_open_ok", "frames_submitted", "non_silent_fraction", "low1_fps", "low01_fps", "prewarmed")
 LOWER_BETTER = ("errors", "failures", "misses", "underruns", "hitches", "drops", "failed", "wasted", "elapsed_ms",
                 "late_pct", "missed_vblanks", "binding_fallbacks", "draws_skipped", "no_shader_module", "peak",
-                "draws_dropped_by_bridge", "black_loading", "first_visible_frame")
+                "draws_dropped_by_bridge", "black_loading", "first_visible_frame", "overshoot", "lookup_null",
+                "_ms_per_frame")
 
 
 def _direction(key: str) -> int:
