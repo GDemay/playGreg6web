@@ -905,6 +905,13 @@ private:
     uint32_t storage_conversion_group(const StorageConversionPipeline& pipeline, uint8_t dimension, uint32_t src,
                                       uint8_t src_format, uint32_t dst, uint8_t dst_format, uint32_t mip,
                                       uint32_t base_layer, uint32_t layer_count, CommandEncoder& encoder);
+    // Fullscreen render-pass copy-out for renderable non-storage textures redirected through a
+    // float/HDR intermediate (e.g. Rg11b10Ufloat/Rgb10a2Unorm/R16Float/Rg16Float/Bgra8Unorm when
+    // texture-formats-tier1 / bgra8unorm-storage is unavailable).
+    StorageConversionPipeline storage_render_out_pipeline(uint8_t target_format, CommandEncoder& encoder);
+    uint32_t storage_render_out_group(uint32_t layout, uint32_t intermediate, uint8_t intermediate_format,
+                                      uint32_t target_texture, uint32_t mip, uint32_t layer,
+                                      CommandEncoder& encoder);
     // Drops the intermediates and conversion bind groups of `resource_id` (queued for frame-safe destroy)
     // and returns the retired intermediate texture ids so cached bind groups can be invalidated too.
     std::vector<uint32_t> retire_intermediates(uint32_t resource_id);
@@ -996,6 +1003,7 @@ private:
     std::unordered_map<uint32_t, StencilTwinPipelines, SplitMix32Hash> stencil_twin_pipelines_;  // depth format << 8 | twin format
     std::unordered_map<uint32_t, DepthTwinPipelines, SplitMix32Hash> depth_twin_pipelines_;  // depth format << 8 | twin format
     std::unordered_map<uint32_t, StorageConversionPipeline, SplitMix32Hash> conversion_pipelines_;  // dst format << 8 | dimension
+    std::unordered_map<uint32_t, StorageConversionPipeline, SplitMix32Hash> render_out_pipelines_;  // target format -> render copy-out
     std::unordered_map<ConversionGroupKey, uint32_t, ConversionGroupKeyHash> conversion_groups_;  // (layout, src, dst, mip, layers)
     std::vector<uint32_t> retired_ids_;                                   // DestroyResource at next safe point
     IndirectClamp indirect_clamp_{};
@@ -1419,20 +1427,24 @@ private:
         uint32_t layer_count = 1;
         uint32_t extent[3] = {1, 1, 1};  // texels of the view (z: depth or layers)
         bool depth_twin = false;     // backlog 35: `intermediate` is the colour twin of a depth plane
+        bool render_copy_out = false;  // target lacks STORAGE_BINDING: copy back via fullscreen render pass
         uint8_t depth_format = 0;    // depth_twin: the depth texture's WebGPU format
         bool stencil_twin = false;   // backlog 35: with depth_twin, `intermediate` twins the stencil plane
         bool same_target(const StorageRedirect& o) const noexcept {
             return entry == o.entry && texture == o.texture && intermediate == o.intermediate &&
                    format == o.format && storage_format == o.storage_format && dimension == o.dimension &&
                    mip == o.mip && base_layer == o.base_layer && layer_count == o.layer_count &&
-                   stencil_twin == o.stencil_twin;
+                   stencil_twin == o.stencil_twin && render_copy_out == o.render_copy_out;
         }
     };
     bool storage_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id, const TextureInfo& info,
                           uint8_t own_format, const GpuTextureViewDesc& view, CommandEncoder& side,
-                          StorageRedirect* out);
+                          bool allow_render_copy_out, StorageRedirect* out);
     // Emits one conversion dispatch: real -> intermediate (`into_intermediate`) or back.
     void emit_storage_conversion(const StorageRedirect& r, bool into_intermediate);
+    // Copies `r.intermediate` back into `r.texture` via a fullscreen render pass (for renderable
+    // textures without STORAGE_BINDING).
+    void emit_storage_render_out(const StorageRedirect& r);
     // Backlog 35: a compute storage binding of a depth texture bound to a colour twin. True (and
     // `out` filled) when the binding can be twinned.
     bool depth_twin_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id, const TextureInfo& info,

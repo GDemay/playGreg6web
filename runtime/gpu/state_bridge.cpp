@@ -389,6 +389,8 @@ bool is_hdr_color_format(pso::DxgiFormat format) noexcept {
     case D::R16G16_FLOAT:
     case D::R16_FLOAT:
     case D::R9G9B9E5_SHAREDEXP:
+    case D::R10G10B10_7E3_A2_FLOAT:
+    case D::R10G10B10_6E4_A2_FLOAT:
     case D::BC6H_UF16:
     case D::BC6H_SF16:
     case D::BC6H_TYPELESS:
@@ -1786,9 +1788,9 @@ PrewarmPipelineResult StateBridgeDevice::prewarm_pipeline(const PrewarmPipelineD
 
 namespace {
 
-// Float formats WGSL can declare as a write-only storage texture without optional features: the
-// conversion pass loads one as unfilterable-float and stores the other.
-bool convertible_storage_format(uint8_t code) noexcept {
+// Float/normalized formats WGSL can declare as a write-only storage texture under the enabled
+// WebGPU device features: the conversion pass loads one as unfilterable-float and stores the other.
+bool convertible_storage_format(uint8_t code, uint32_t features) noexcept {
     using F = pso::WgpuTextureFormat;
     switch (static_cast<F>(code)) {
     case F::Rgba8Unorm:
@@ -1798,9 +1800,95 @@ bool convertible_storage_format(uint8_t code) noexcept {
     case F::Rg32Float:
     case F::Rgba32Float:
         return true;
+    case F::Bgra8Unorm:
+        return (features & pso::WgpuFeature::Bgra8UnormStorage) != 0;
+    case F::R8Unorm:
+    case F::R8Snorm:
+    case F::Rg8Unorm:
+    case F::Rg8Snorm:
+    case F::R16Unorm:
+    case F::R16Snorm:
+    case F::R16Float:
+    case F::Rg16Unorm:
+    case F::Rg16Snorm:
+    case F::Rg16Float:
+    case F::Rgba16Unorm:
+    case F::Rgba16Snorm:
+    case F::Rgb10a2Unorm:
+    case F::Rg11b10Ufloat:
+        return (features & pso::WgpuFeature::TextureFormatsTier1) != 0;
     default:
         return false;
     }
+}
+
+// Renderable float/color formats that can receive UAV copy-out via a fullscreen render pass when
+// the host WebGPU device lacks STORAGE_BINDING for the format (e.g. without texture-formats-tier1
+// or bgra8unorm-storage).
+bool renderable_color_storage_fallback(uint8_t code, uint32_t features) noexcept {
+    using F = pso::WgpuTextureFormat;
+    switch (static_cast<F>(code)) {
+    case F::Rgba8Unorm:
+    case F::Rgba8UnormSrgb:
+    case F::Bgra8Unorm:
+    case F::Bgra8UnormSrgb:
+    case F::R8Unorm:
+    case F::Rg8Unorm:
+    case F::R16Float:
+    case F::Rg16Float:
+    case F::Rgba16Float:
+    case F::R32Float:
+    case F::Rg32Float:
+    case F::Rgba32Float:
+    case F::Rgb10a2Unorm:
+        return true;
+    case F::Rg11b10Ufloat:
+        return (features & pso::WgpuFeature::Rg11b10UfloatRenderable) != 0;
+    default:
+        return false;
+    }
+}
+
+// Non-quantizing core WebGPU storage format chosen for a redirected intermediate when the layout
+// does not pin a specific storage format (preserves HDR/float range instead of clamping to 8-bit).
+uint8_t preferred_storage_intermediate_format(uint8_t own_format) noexcept {
+    using F = pso::WgpuTextureFormat;
+    switch (static_cast<F>(own_format)) {
+    case F::R32Float:
+    case F::Rg32Float:
+    case F::Rgba32Float:
+        return static_cast<uint8_t>(F::Rgba32Float);
+    case F::Rgba16Float:
+    case F::R16Float:
+    case F::Rg16Float:
+    case F::Rg11b10Ufloat:
+    case F::Rgb10a2Unorm:
+    case F::R16Unorm:
+    case F::R16Snorm:
+    case F::Rg16Unorm:
+    case F::Rg16Snorm:
+    case F::Rgba16Unorm:
+    case F::Rgba16Snorm:
+        return static_cast<uint8_t>(F::Rgba16Float);
+    case F::Rgba8Snorm:
+    case F::R8Snorm:
+    case F::Rg8Snorm:
+        return static_cast<uint8_t>(F::Rgba8Snorm);
+    default:
+        return static_cast<uint8_t>(F::Rgba8Unorm);
+    }
+}
+
+std::string storage_render_out_wgsl() {
+    return "@group(0) @binding(0) var src: texture_2d<f32>;\n"
+           "struct VsOut { @builtin(position) pos: vec4<f32> };\n"
+           "@vertex fn vs_main(@builtin(vertex_index) i: u32) -> VsOut {\n"
+           "  let p = vec2<f32>(f32((i << 1u) & 2u), f32(i & 2u));\n"
+           "  return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0));\n"
+           "}\n"
+           "@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {\n"
+           "  return textureLoad(src, vec2<i32>(in.pos.xy), 0);\n"
+           "}\n";
 }
 
 std::string storage_conversion_wgsl(uint8_t dst_format, uint8_t dimension) {
@@ -1978,6 +2066,83 @@ uint32_t StateBridgeDevice::storage_conversion_group(const StorageConversionPipe
         g.entry_count = 2;
         emit_device_object(id, encoder, [&](CommandEncoder& out) {
             out.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), e, sizeof(e));
+        });
+    }
+    return id;
+}
+
+StateBridgeDevice::StorageConversionPipeline StateBridgeDevice::storage_render_out_pipeline(
+    uint8_t target_format, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    StorageConversionPipeline& c = render_out_pipelines_[target_format];
+    if (c.pipeline == 0) {
+        GpuBindGroupLayoutEntry entry{};
+        entry.binding = 0;
+        entry.visibility = GpuShaderStageBits::Fragment;
+        entry.type = static_cast<uint8_t>(GpuBindingLayoutType::Texture);
+        entry.binding_type = static_cast<uint8_t>(GpuTextureSampleType::UnfilterableFloat);
+        entry.view_dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        c.group_layout = allocate_id();
+        emit_device_object(c.group_layout, encoder, [&](CommandEncoder& dst) {
+            GpuCreateBindGroupLayoutPayload layout{};
+            layout.id = c.group_layout;
+            layout.entry_count = 1;
+            dst.emit_packet(GpuOpcode::CreateBindGroupLayout, &layout, sizeof(layout), &entry, sizeof(entry));
+        });
+        c.pipeline = allocate_id();
+        emit_device_object(c.pipeline, encoder, [&](CommandEncoder& dst) {
+            const std::string wgsl = storage_render_out_wgsl();
+            const uint32_t vs = allocate_id();
+            const uint32_t fs = allocate_id();
+            dst.create_shader_module(vs, GpuShaderStage::Vertex, wgsl);
+            dst.create_shader_module(fs, GpuShaderStage::Fragment, wgsl);
+            GpuCreatePipelineLayoutPayload pl{};
+            pl.id = allocate_id();
+            pl.bind_group_layout_count = 1;
+            dst.emit_packet(GpuOpcode::CreatePipelineLayout, &pl, sizeof(pl), &c.group_layout, sizeof(uint32_t));
+            GpuCreateRenderPipeline2Payload p{};
+            p.id = c.pipeline;
+            p.vs_module_id = vs;
+            p.fs_module_id = fs;
+            p.pipeline_layout_id = pl.id;
+            GpuRenderPipelineKey& k = p.key;
+            k.ps_shader = 1;
+            k.color_target_count = 1;
+            k.color_targets[0].format = target_format;
+            k.color_targets[0].write_mask = 0xFu;
+            k.primitive.topology = static_cast<uint8_t>(GpuPrimitiveTopology::TriangleList);
+            k.multisample.count = 1;
+            k.multisample.mask = 0xFFFFFFFFu;
+            sanitize_render_pipeline_key(&k, options_.features);
+            dst.emit_packet(GpuOpcode::CreateRenderPipeline2, &p, sizeof(p));
+        });
+    }
+    return c;
+}
+
+uint32_t StateBridgeDevice::storage_render_out_group(uint32_t layout, uint32_t intermediate,
+                                                     uint8_t intermediate_format, uint32_t target_texture,
+                                                     uint32_t mip, uint32_t layer, CommandEncoder& encoder) {
+    std::lock_guard lock(objects_mutex_);
+    uint32_t& id = conversion_groups_[ConversionGroupKey{layout, intermediate, target_texture, mip, layer, 1u}];
+    if (id == 0) {
+        id = allocate_id();
+        GpuBindGroupEntry2 e{};
+        e.binding = 0;
+        e.resource_type = static_cast<uint32_t>(GpuBindResourceType::TextureView);
+        e.resource_id = intermediate;
+        e.view.format = intermediate_format;
+        e.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        e.view.base_mip_level = static_cast<uint16_t>(mip);
+        e.view.mip_level_count = 1;
+        e.view.base_array_layer = layer;
+        e.view.array_layer_count = 1;
+        GpuCreateBindGroup2Payload g{};
+        g.id = id;
+        g.layout_id = layout;
+        g.entry_count = 1;
+        emit_device_object(id, encoder, [&](CommandEncoder& dst) {
+            dst.emit_packet(GpuOpcode::CreateBindGroup2, &g, sizeof(g), &e, sizeof(e));
         });
     }
     return id;
@@ -3962,10 +4127,22 @@ GpuTextureViewDesc CommandListBridge::texture_view_desc(const d3d::ViewDescripto
             tex.format, to_dxgi(v.format), tex.sampled_only, features, device_.is_depth_resource(v.resource_id));
         pso::WgpuTextureFormat fmt = resolved.format;
         // Reconcile against the host texture's actual created format (e.g. R11G11B10_FLOAT or
-        // RGBA8_SNORM render targets promoted to rgba16float cannot take a rg11b10ufloat view).
-        if (!resolved.depth_sibling && fmt != pso::WgpuTextureFormat::Undefined) {
+        // RGBA8_SNORM render targets promoted to rgba16float cannot take a rg11b10ufloat view;
+        // sRGB textures lowered to their linear sibling for STORAGE_BINDING must emit an
+        // explicit *-srgb view format when the guest SRV leaves format as UNKNOWN).
+        if (!resolved.depth_sibling) {
             const pso::WgpuTextureFormat host_fmt = host_texture_format(tex, features);
-            if (host_fmt != pso::WgpuTextureFormat::Undefined && !is_compatible_view_format(host_fmt, fmt)) {
+            if (fmt == pso::WgpuTextureFormat::Undefined) {
+                const pso::WgpuTextureFormat guest_fmt =
+                    pso::map_texture_format(tex.format, usage, features).format;
+                if (host_fmt != pso::WgpuTextureFormat::Undefined &&
+                    guest_fmt != pso::WgpuTextureFormat::Undefined &&
+                    guest_fmt != host_fmt &&
+                    is_compatible_view_format(host_fmt, guest_fmt)) {
+                    fmt = guest_fmt;
+                }
+            } else if (host_fmt != pso::WgpuTextureFormat::Undefined &&
+                       !is_compatible_view_format(host_fmt, fmt)) {
                 fmt = host_fmt;
             }
         }
@@ -4551,16 +4728,30 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
                     out.view = GpuTextureViewDesc{};
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
                     ++stats_.storage_views_without_usage;
+                } else if (StorageRedirect r;
+                           e.resource_id != 0 && known && !info.storage && info.render_target &&
+                           storage_redirect(layout, e.resource_id, info, own, out.view, side, true, &r)) {
+                    // Renderable color/HDR texture whose host format lacks STORAGE_BINDING (e.g.
+                    // Rg11b10Ufloat/Rgb10a2Unorm/R16Float/Rg16Float/Bgra8Unorm without tier1 or
+                    // bgra8unorm-storage): write into a float/HDR storage intermediate and copy
+                    // back via a fullscreen render pass instead of dropping the compute dispatch.
+                    r.entry = i;
+                    out.resource_id = r.intermediate;
+                    note_recorded_resource(r.intermediate);
+                    out.view.format = r.storage_format;
+                    pending_redirects_.push_back(r);
                 } else if (e.resource_id != 0 && (!known || !info.storage)) {
                     out.resource_id = 0;
                     out.view = GpuTextureViewDesc{};
                     diagnostics_ |= BridgeDiag::StorageViewNoUsage;
                     ++stats_.storage_views_without_usage;
-                } else if (StorageRedirect r; e.resource_id != 0 && !format_ok &&
-                                              storage_redirect(layout, e.resource_id, info, own, out.view, side, &r)) {
-                    // #482: the translator declares every storage texture rgba8unorm. A compute
-                    // binding of another storage-capable float format is bound to an intermediate
-                    // texture in the declared format, converted into the real one after the dispatch.
+                } else if (StorageRedirect r;
+                           e.resource_id != 0 && !format_ok &&
+                           storage_redirect(layout, e.resource_id, info, own, out.view, side, false, &r)) {
+                    // #482: a storage binding whose format differs from the stage's declared
+                    // storage format is bound to an intermediate texture in the declared format,
+                    // converted into the real texture after the dispatch (and from it before, for
+                    // read/read-write access).
                     r.entry = i;
                     out.resource_id = r.intermediate;
                     note_recorded_resource(r.intermediate);
@@ -4660,28 +4851,58 @@ void CommandListBridge::gpu_entries(const StateBridgeDevice::GroupLayoutRecord& 
 
 bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, uint32_t resource_id,
                                          const TextureInfo& info, uint8_t own_format, const GpuTextureViewDesc& view,
-                                         CommandEncoder& side, StorageRedirect* out) {
+                                         CommandEncoder& side, bool allow_render_copy_out, StorageRedirect* out) {
     using D = GpuTextureViewDimension;
+    const uint32_t features = device_.options().features;
     // Compute or fragment only: the conversions run as dispatches next to the stage's own (compute),
     // or around the render pass (fragment).
     // Vertex and mixed vertex/fragment bindings are converted the same way as fragment ones.
     const bool compute_only = (layout.visibility & ~GpuShaderStageBits::Compute) == 0;
     const bool render_only = (layout.visibility & GpuShaderStageBits::Compute) == 0;
-    if (layout.visibility == 0 || (!compute_only && !render_only) || info.sample_count > 1 ||
-        !convertible_storage_format(own_format) || !convertible_storage_format(layout.storage_format)) {
+    if (layout.visibility == 0 || (!compute_only && !render_only) || info.sample_count > 1) {
         return false;
     }
     const D dim = layout.view_dimension == static_cast<uint8_t>(D::Undefined) ? D::Dim2D
                                                                              : static_cast<D>(layout.view_dimension);
     const bool volume = info.dimension == GpuTextureDimension::Dim3D;
+    uint8_t target_format = own_format;
+    uint8_t inter_format = layout.storage_format;
+    if (allow_render_copy_out) {
+        if (!compute_only || volume || info.dimension != GpuTextureDimension::Dim2D ||
+            (dim != D::Dim2D && dim != D::Dim2DArray)) {
+            return false;
+        }
+        // D3D12 UAV writes raw linear bits even on *_SRGB resources: render back through the
+        // linear sibling view format when available so gamma encoding is not applied twice.
+        if (is_srgb_format(static_cast<pso::WgpuTextureFormat>(target_format))) {
+            const pso::WgpuTextureFormat lin = pso::srgb_sibling(static_cast<pso::WgpuTextureFormat>(target_format));
+            if (lin != pso::WgpuTextureFormat::Undefined) {
+                target_format = static_cast<uint8_t>(lin);
+            }
+        }
+        if (!renderable_color_storage_fallback(target_format, features)) {
+            return false;
+        }
+        if (inter_format == 0) {
+            inter_format = preferred_storage_intermediate_format(target_format);
+        }
+        if (!convertible_storage_format(inter_format, features)) {
+            return false;
+        }
+    } else {
+        if (!convertible_storage_format(own_format, features) ||
+            !convertible_storage_format(layout.storage_format, features)) {
+            return false;
+        }
+    }
     if ((dim == D::Dim3D) != volume || (dim != D::Dim3D && dim != D::Dim2D && dim != D::Dim2DArray) ||
         view.base_mip_level >= std::max(info.mip_levels, 1u)) {
         return false;
     }
     StorageRedirect r;
     r.texture = resource_id;
-    r.format = own_format;
-    r.storage_format = layout.storage_format;
+    r.format = target_format;
+    r.storage_format = inter_format;
     r.dimension = static_cast<uint8_t>(dim);
     r.access = layout.binding_type;
     r.mip = view.base_mip_level;
@@ -4696,7 +4917,8 @@ bool CommandListBridge::storage_redirect(const GpuBindGroupLayoutEntry& layout, 
     r.extent[0] = mip_extent(info.width, r.mip);
     r.extent[1] = mip_extent(info.height, r.mip);
     r.extent[2] = volume ? mip_extent(info.depth_or_array_size, r.mip) : r.layer_count;
-    r.intermediate = device_.intermediate_storage_texture(resource_id, info, layout.storage_format, side);
+    r.render_copy_out = allow_render_copy_out;
+    r.intermediate = device_.intermediate_storage_texture(resource_id, info, inter_format, side);
     *out = r;
     return true;
 }
@@ -4923,6 +5145,10 @@ void CommandListBridge::flush_depth_twin(uint32_t texture) {
 }
 
 void CommandListBridge::emit_storage_conversion(const StorageRedirect& r, bool into_intermediate) {
+    if (!into_intermediate && r.render_copy_out) {
+        emit_storage_render_out(r);
+        return;
+    }
     const uint8_t dst_format = into_intermediate ? r.storage_format : r.format;
     const StateBridgeDevice::StorageConversionPipeline pipeline =
         device_.storage_conversion_pipeline(dst_format, r.dimension, encoder_);
@@ -4944,6 +5170,43 @@ void CommandListBridge::emit_storage_conversion(const StorageRedirect& r, bool i
     encoder_.dispatch_compute((r.extent[0] + xy - 1) / xy, (r.extent[1] + xy - 1) / xy,
                               volume ? (r.extent[2] + 3u) / 4u : r.extent[2]);
     ++stats_.storage_conversions;
+}
+
+void CommandListBridge::emit_storage_render_out(const StorageRedirect& r) {
+    const StateBridgeDevice::StorageConversionPipeline p =
+        device_.storage_render_out_pipeline(r.format, encoder_);
+    for (uint32_t layer = r.base_layer; layer < r.base_layer + r.layer_count; ++layer) {
+        const uint32_t group = device_.storage_render_out_group(p.group_layout, r.intermediate, r.storage_format,
+                                                                r.texture, r.mip, layer, encoder_);
+        GpuBeginRenderPassPayload pass{};
+        pass.color_count = 1;
+        GpuRenderPassColorAttachment& a = pass.color[0];
+        a.texture_id = r.texture;
+        a.load_op = static_cast<uint8_t>(GpuLoadOp::Load);
+        a.store_op = static_cast<uint8_t>(GpuStoreOp::Store);
+        a.view.format = r.format;
+        a.view.dimension = static_cast<uint8_t>(GpuTextureViewDimension::Dim2D);
+        a.view.aspect = static_cast<uint8_t>(GpuTextureAspect::All);
+        a.view.base_mip_level = static_cast<uint16_t>(r.mip);
+        a.view.mip_level_count = 1;
+        a.view.base_array_layer = layer;
+        a.view.array_layer_count = 1;
+        encoder_.emit_packet(GpuOpcode::BeginRenderPass, &pass, sizeof(pass));
+        ++stats_.render_passes;
+        encoder_.set_pipeline(p.pipeline);
+        const GpuSetBindGroup2Payload set{0u, group, 0u, 0u};
+        encoder_.emit_packet(GpuOpcode::SetBindGroup2, &set, sizeof(set));
+        note_recorded_resource(r.texture);
+        note_recorded_resource(r.intermediate);
+        note_recorded_resource(group);
+        encoder_.draw(3, 1, 0, 0);
+        encoder_.emit_packet(GpuOpcode::EndRenderPass, nullptr, 0);
+        ++stats_.storage_conversions;
+        invalidate_pass_bindings();
+        compute_pass_valid_ = false;
+        compute_pipeline_bound_ = 0;
+        compute_groups_.clear();
+    }
 }
 
 void CommandListBridge::add_usage(const d3d::BindGroupEntry& entry, const d3d::ShaderBinding& join) {

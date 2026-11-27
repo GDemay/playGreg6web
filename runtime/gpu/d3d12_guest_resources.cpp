@@ -214,6 +214,226 @@ bool storage_capable(pso::WgpuTextureFormat f, uint32_t features) {
     }
 }
 
+// WebGPU forbids STORAGE_BINDING on *-srgb base textures. When a single-sample sRGB texture
+// requests ALLOW_UNORDERED_ACCESS and its linear sibling supports STORAGE_BINDING under `features`,
+// lower the host texture's base format to the linear sibling (listing the *-srgb sibling in
+// view_formats so RTV/SRV/Present paths view it as sRGB while UAVs bind the linear base natively).
+pso::WgpuTextureFormat storage_base_format(pso::WgpuTextureFormat mapped, bool allow_uav, uint32_t sample_count,
+                                           uint32_t features) {
+    if (!allow_uav || sample_count > 1 || storage_capable(mapped, features) || !bridge::is_srgb_format(mapped)) {
+        return mapped;
+    }
+    const pso::WgpuTextureFormat linear = pso::srgb_sibling(mapped);
+    if (linear != pso::WgpuTextureFormat::Undefined && storage_capable(linear, features)) {
+        return linear;
+    }
+    return mapped;
+}
+
+// Renderable float/color formats that lack STORAGE_BINDING when optional WebGPU features
+// (texture-formats-tier1 / bgra8unorm-storage) are absent: giving a 2D UAV texture RenderAttachment
+// usage lets state_bridge copy UAV results back via a non-quantizing fullscreen render pass instead
+// of dropping compute dispatches.
+bool renderable_uav_fallback(pso::WgpuTextureFormat f, uint32_t features) {
+    using F = pso::WgpuTextureFormat;
+    switch (f) {
+        case F::Bgra8Unorm:
+        case F::Bgra8UnormSrgb:
+        case F::R8Unorm:
+        case F::Rg8Unorm:
+        case F::R16Float:
+        case F::Rg16Float:
+        case F::Rgb10a2Unorm:
+            return true;
+        case F::Rg11b10Ufloat:
+            return (features & pso::WgpuFeature::Rg11b10UfloatRenderable) != 0;
+        default:
+            return false;
+    }
+}
+
+// CPU upload wideners for DXGI formats promoted to wider WebGPU formats:
+//   A8_UNORM (1B)                    -> Rgba8Unorm (4B)
+//   B5G6R5_UNORM (2B)                -> Rgba8Unorm (4B)
+//   B5G5R5A1_UNORM (2B)              -> Rgba8Unorm (4B)
+//   B4G4R4A4_UNORM (2B)              -> Rgba8Unorm (4B)
+//   R10G10B10_7E3_A2_FLOAT (116, 4B) -> Rgba16Float (8B)
+//   R10G10B10_6E4_A2_FLOAT (117, 4B) -> Rgba16Float (8B)
+struct CpuWidenSpec {
+    uint32_t src_bpp = 0;
+    uint32_t dst_bpp = 0;
+};
+
+CpuWidenSpec cpu_widen_spec(pso::DxgiFormat from, pso::WgpuTextureFormat to) noexcept {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+    if (to == F::Rgba8Unorm) {
+        switch (from) {
+            case D::A8_UNORM:
+                return {1u, 4u};
+            case D::B5G6R5_UNORM:
+            case D::B5G5R5A1_UNORM:
+            case D::B4G4R4A4_UNORM:
+                return {2u, 4u};
+            default:
+                return {};
+        }
+    }
+    if (to == F::Rgba16Float) {
+        switch (from) {
+            case D::R10G10B10_7E3_A2_FLOAT:
+            case D::R10G10B10_6E4_A2_FLOAT:
+                return {4u, 8u};
+            default:
+                return {};
+        }
+    }
+    return {};
+}
+
+// Lossless 10-bit Xbox unsigned float 7e3 (bias 3, 7-bit mantissa, 3-bit exponent, finite [0, 31.875])
+// -> IEEE 754 binary16. Every non-zero 7e3 value is an exact normal binary16 (min 2^-9 > 2^-14).
+uint16_t decode_7e3_to_f16(uint32_t v) noexcept {
+    const uint32_t e = (v >> 7) & 0x7u;
+    const uint32_t m = v & 0x7Fu;
+    if (e > 0u) {
+        return static_cast<uint16_t>(((e + 12u) << 10) | (m << 3));
+    }
+    if (m == 0u) {
+        return 0x0000u;
+    }
+    uint32_t msb = 0u;
+    while ((m >> (msb + 1u)) != 0u) {
+        ++msb;
+    }
+    const uint32_t exp = msb + 6u;  // (msb - 9) + 15
+    const uint32_t mant = (m & ((1u << msb) - 1u)) << (10u - msb);
+    return static_cast<uint16_t>((exp << 10) | mant);
+}
+
+// Lossless 10-bit Xbox unsigned float 6e4 (bias 7, 6-bit mantissa, 4-bit exponent, finite [0, 508.0])
+// -> IEEE 754 binary16. Every non-zero 6e4 value is an exact normal binary16 (min 2^-12 > 2^-14).
+uint16_t decode_6e4_to_f16(uint32_t v) noexcept {
+    const uint32_t e = (v >> 6) & 0xFu;
+    const uint32_t m = v & 0x3Fu;
+    if (e > 0u) {
+        return static_cast<uint16_t>(((e + 8u) << 10) | (m << 4));
+    }
+    if (m == 0u) {
+        return 0x0000u;
+    }
+    uint32_t msb = 0u;
+    while ((m >> (msb + 1u)) != 0u) {
+        ++msb;
+    }
+    const uint32_t exp = msb + 3u;  // (msb - 12) + 15
+    const uint32_t mant = (m & ((1u << msb) - 1u)) << (10u - msb);
+    return static_cast<uint16_t>((exp << 10) | mant);
+}
+
+bool widen_cpu_texels(pso::DxgiFormat from, pso::WgpuTextureFormat to, const uint8_t* src, size_t count,
+                      uint8_t* dst) noexcept {
+    using D = pso::DxgiFormat;
+    using F = pso::WgpuTextureFormat;
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+    if (from == D::A8_UNORM && to == F::Rgba8Unorm) {
+        return pso::widen_a8_texels(from, to, src, count, dst);
+    }
+    if (to == F::Rgba8Unorm && from == D::B5G6R5_UNORM) {
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t px = 0;
+            std::memcpy(&px, src + i * 2, 2);
+            const uint8_t b5 = static_cast<uint8_t>(px & 0x1Fu);
+            const uint8_t g6 = static_cast<uint8_t>((px >> 5) & 0x3Fu);
+            const uint8_t r5 = static_cast<uint8_t>((px >> 11) & 0x1Fu);
+            dst[i * 4 + 0] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+            dst[i * 4 + 1] = static_cast<uint8_t>((g6 << 2) | (g6 >> 4));
+            dst[i * 4 + 2] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+            dst[i * 4 + 3] = 0xFFu;
+        }
+        return true;
+    }
+    if (to == F::Rgba8Unorm && from == D::B5G5R5A1_UNORM) {
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t px = 0;
+            std::memcpy(&px, src + i * 2, 2);
+            const uint8_t b5 = static_cast<uint8_t>(px & 0x1Fu);
+            const uint8_t g5 = static_cast<uint8_t>((px >> 5) & 0x1Fu);
+            const uint8_t r5 = static_cast<uint8_t>((px >> 10) & 0x1Fu);
+            const uint8_t a1 = static_cast<uint8_t>((px >> 15) & 0x1u);
+            dst[i * 4 + 0] = static_cast<uint8_t>((r5 << 3) | (r5 >> 2));
+            dst[i * 4 + 1] = static_cast<uint8_t>((g5 << 3) | (g5 >> 2));
+            dst[i * 4 + 2] = static_cast<uint8_t>((b5 << 3) | (b5 >> 2));
+            dst[i * 4 + 3] = a1 != 0 ? 0xFFu : 0x00u;
+        }
+        return true;
+    }
+    if (to == F::Rgba8Unorm && from == D::B4G4R4A4_UNORM) {
+        for (size_t i = 0; i < count; ++i) {
+            uint16_t px = 0;
+            std::memcpy(&px, src + i * 2, 2);
+            const uint8_t b4 = static_cast<uint8_t>(px & 0xFu);
+            const uint8_t g4 = static_cast<uint8_t>((px >> 4) & 0xFu);
+            const uint8_t r4 = static_cast<uint8_t>((px >> 8) & 0xFu);
+            const uint8_t a4 = static_cast<uint8_t>((px >> 12) & 0xFu);
+            dst[i * 4 + 0] = static_cast<uint8_t>((r4 << 4) | r4);
+            dst[i * 4 + 1] = static_cast<uint8_t>((g4 << 4) | g4);
+            dst[i * 4 + 2] = static_cast<uint8_t>((b4 << 4) | b4);
+            dst[i * 4 + 3] = static_cast<uint8_t>((a4 << 4) | a4);
+        }
+        return true;
+    }
+    if (to == F::Rgba16Float && (from == D::R10G10B10_7E3_A2_FLOAT || from == D::R10G10B10_6E4_A2_FLOAT)) {
+        // Exact nearest-even binary16 values for 2-bit UNORM alpha {0, 1/3, 2/3, 1}.
+        static constexpr uint16_t kA2ToHalf[4] = {0x0000u, 0x3555u, 0x3955u, 0x3C00u};
+        const bool is_7e3 = from == D::R10G10B10_7E3_A2_FLOAT;
+        for (size_t i = 0; i < count; ++i) {
+            uint32_t px = 0;
+            std::memcpy(&px, src + i * 4, 4);
+            const uint32_t r10 = px & 0x3FFu;
+            const uint32_t g10 = (px >> 10) & 0x3FFu;
+            const uint32_t b10 = (px >> 20) & 0x3FFu;
+            const uint32_t a2 = (px >> 30) & 0x3u;
+            const uint16_t out[4] = {
+                is_7e3 ? decode_7e3_to_f16(r10) : decode_6e4_to_f16(r10),
+                is_7e3 ? decode_7e3_to_f16(g10) : decode_6e4_to_f16(g10),
+                is_7e3 ? decode_7e3_to_f16(b10) : decode_6e4_to_f16(b10),
+                kA2ToHalf[a2],
+            };
+            std::memcpy(dst + i * 8, out, 8);
+        }
+        return true;
+    }
+    return false;
+}
+
+bool widen_promoted_rows(pso::DxgiFormat from, pso::WgpuTextureFormat to, const uint8_t* src, size_t src_size,
+                         uint32_t width, uint32_t rows, uint32_t slices, uint32_t src_pitch, uint64_t slice_pitch,
+                         std::vector<uint8_t>* out, uint32_t* out_pitch) {
+    const CpuWidenSpec spec = cpu_widen_spec(from, to);
+    if (spec.src_bpp == 0 || rows == 0 || slices == 0) {
+        return false;
+    }
+    const uint64_t src_row_bytes = uint64_t{width} * spec.src_bpp;
+    const uint64_t pitch = align_up(uint64_t{width} * spec.dst_bpp, 256u);
+    if (uint64_t{slices - 1} * slice_pitch + uint64_t{rows - 1} * src_pitch + src_row_bytes > src_size) {
+        return false;
+    }
+    out->assign(static_cast<size_t>(pitch * rows * slices), 0);
+    for (uint32_t z = 0; z < slices; ++z) {
+        for (uint32_t r = 0; r < rows; ++r) {
+            if (!widen_cpu_texels(from, to, src + z * slice_pitch + uint64_t{r} * src_pitch, width,
+                                  out->data() + (uint64_t{z} * rows + r) * pitch)) {
+                return false;
+            }
+        }
+    }
+    *out_pitch = static_cast<uint32_t>(pitch);
+    return true;
+}
+
 uint32_t mips_or_all(uint32_t v) {
     return v == 0xFFFFFFFFu ? 0xffffu : v;
 }
@@ -956,7 +1176,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     }
     const bool format_mismatch =
         have_info && created.created_format != pso::WgpuTextureFormat::Undefined &&
-        created.created_format != mapping.format;
+        !bridge::is_compatible_view_format(created.created_format, mapping.format);
     const bool needs_conversion =
         format_mismatch ||
         (mapping.diagnostics & (pso::FormatDiag::NeedsCpuConversion | pso::FormatDiag::FeatureFallback)) != 0;
@@ -980,11 +1200,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                     "enabled): uploads round each value to float16 (11-bit mantissa)");
         }
     }
-    // A8_UNORM held as rgba8unorm: each texel widened to (0, 0, 0, a).
-    const bool convert_a8 = !format_mismatch && needs_conversion &&
-                            pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
-                                                 probe_src, 1, probe_dst);
-    if (needs_conversion && !convert_norm16 && !convert_a8) {
+    // Promoted CPU-upload formats (A8_UNORM, B5G5R5A1_UNORM, B4G4R4A4_UNORM -> rgba8unorm;
+    // Xbox HDR R10G10B10_7E3_A2_FLOAT / R10G10B10_6E4_A2_FLOAT -> rgba16float).
+    const CpuWidenSpec widen_spec =
+        (!format_mismatch && needs_conversion)
+            ? cpu_widen_spec(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format)
+            : CpuWidenSpec{};
+    const bool convert_widen = widen_spec.src_bpp != 0;
+    if (needs_conversion && !convert_norm16 && !convert_widen) {
         // The GPU texture has a substitute format (e.g. rgba8unorm for BC without the feature):
         // the guest's texels do not fit it and are not converted. Skip, reported once per texture.
         bool first = false;
@@ -1248,10 +1471,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     const uint64_t aligned_row_pitch = align_up(tight_row_bytes, 256u);
     const uint64_t console_linear_bytes = aligned_row_pitch * blocks_y;
     const bool single_linear_direct =
-        subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_a8 && src_size == tight_mip0_bytes;
+        subs.size() == 1u && !is_tiled && !convert_norm16 && !convert_widen && src_size == tight_mip0_bytes;
     const bool single_console_linear_direct =
         using_default_detile && tt.layout == gfx10::kConsoleLinearLayout && whole_surface &&
-        subs.size() == 1u && mips == 1u && layers == 1u && d == 1u && !convert_norm16 && !convert_a8 &&
+        subs.size() == 1u && mips == 1u && layers == 1u && d == 1u && !convert_norm16 && !convert_widen &&
         tiled_bytes == console_linear_bytes && src_size >= console_linear_bytes;
     // G75 (#663): Streaming full-frame textures (e.g. 4K Bink2 Y/U/V planes) modify >= 75% of
     // bands every dirty frame. After 3 consecutive full-surface dirty updates in a write-marked
@@ -1436,7 +1659,7 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
         uint64_t linear_src_pitch = row_pitch;
         if (!detiled) {
             const uint64_t slice_off = uint64_t{sub.slice} * tight_mip0_bytes;
-            if (convert_norm16 || convert_a8) {
+            if (convert_norm16 || convert_widen) {
                 linear_src = src_data + static_cast<size_t>(slice_off);
                 linear_src_pitch = row_bytes;
             } else if (row_pitch == row_bytes) {
@@ -1479,13 +1702,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
         }
-        if (convert_a8) {
-            const uint64_t out_pitch = align_up(row_bytes * 4u, 256u);
+        if (convert_widen) {
+            const size_t texels_per_row = static_cast<size_t>(row_bytes / widen_spec.src_bpp);
+            const uint64_t out_pitch = align_up(uint64_t{texels_per_row} * widen_spec.dst_bpp, 256u);
             std::vector<uint8_t> converted(static_cast<size_t>(out_pitch * by * md), 0);
             for (uint32_t r = 0; r < by * md; ++r) {
-                pso::widen_a8_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
-                                     linear_src + static_cast<size_t>(r) * linear_src_pitch, static_cast<size_t>(row_bytes),
-                                     converted.data() + static_cast<size_t>(r) * out_pitch);
+                widen_cpu_texels(static_cast<pso::DxgiFormat>(tt.dxgi_format), mapping.format,
+                                 linear_src + static_cast<size_t>(r) * linear_src_pitch, texels_per_row,
+                                 converted.data() + static_cast<size_t>(r) * out_pitch);
             }
             st.bytes = std::move(converted);
             st.row_pitch = static_cast<uint32_t>(out_pitch);
@@ -1930,6 +2154,11 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
 
     // Backlog 38: the host texture of a released small texture of the same shape is reused; every
     // texel of every mip is zeroed below, so nothing of its previous content stays visible.
+    const uint32_t features = bridge_->options().features;
+    const pso::WgpuTextureFormat create_format = storage_base_format(mapping.format, uav, 1u, features);
+    const bool can_store = uav && storage_capable(create_format, features);
+    const bool can_render_uav =
+        uav && !can_store && dim == GpuTextureDimension::Dim2D && renderable_uav_fallback(create_format, features);
     SmallTextureShape shape{};
     shape.owner = reinterpret_cast<uintptr_t>(this);
     shape.dxgi_format = dxgi_format;
@@ -1938,8 +2167,8 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     shape.depth = safe_depth;
     shape.mip_levels = safe_mips;
     shape.dim = static_cast<uint8_t>(dim);
-    shape.storage = uav && storage_capable(mapping.format, bridge_->options().features);
-    const uint32_t reused_id = small_texture_pool().acquire(shape, chain_bytes);
+    shape.storage = can_store;
+    const uint32_t reused_id = can_render_uav ? 0u : small_texture_pool().acquire(shape, chain_bytes);
     const uint32_t id = reused_id != 0 ? reused_id : allocate_id();
     GpuCreateTexture2Payload payload{};
     payload.id = id;
@@ -1950,11 +2179,13 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     payload.sample_count = 1;
     payload.dimension = static_cast<uint8_t>(dim);
     payload.usage_flags = GpuTextureUsage::TextureBinding | GpuTextureUsage::CopyDst;
-    if (uav && storage_capable(mapping.format, bridge_->options().features)) {
+    if (can_store) {
         payload.usage_flags |= GpuTextureUsage::StorageBinding;
+    } else if (can_render_uav) {
+        payload.usage_flags |= GpuTextureUsage::RenderAttachment;
     }
-    payload.format = static_cast<uint8_t>(mapping.format);
-    if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(mapping.format);
+    payload.format = static_cast<uint8_t>(create_format);
+    if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(create_format);
         sibling != pso::WgpuTextureFormat::Undefined) {
         payload.view_format_count = 1;  // other descriptors may view it sRGB / linear
         payload.view_formats[0] = static_cast<uint8_t>(sibling);
@@ -1996,7 +2227,8 @@ uint32_t Device::ensure_address_texture(uint64_t gpu_va, uint32_t dxgi_format, u
     info.layout = d3d12_layout;
     info.sampled_only = true;
     info.storage = (payload.usage_flags & GpuTextureUsage::StorageBinding) != 0;
-    info.created_format = mapping.format;
+    info.render_target = can_render_uav;
+    info.created_format = create_format;
     bridge_->register_texture(id, info);
 
     if (gpu_va < kFakeGpuVaBase) {
@@ -3126,10 +3358,12 @@ bool Resource::initialize() {
             p.textures.push_back(this);
             probe_registered_ = true;
         }
+        const uint32_t features = dev.state_bridge().options().features;
+        const bool allow_uav = (desc_.Flags & ResourceFlags::AllowUnorderedAccess) != 0;
         const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
                                              : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
-        const pso::TextureFormatMapping m = pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage,
-                                                                    dev.state_bridge().options().features);
+        const pso::TextureFormatMapping m =
+            pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage, features);
         if (!m.supported()) {
             dev.note_bad_argument("texture format " + std::to_string(desc_.Format) +
                                   " has no WebGPU equivalent: resource created without a GPU texture");
@@ -3146,27 +3380,34 @@ bool Resource::initialize() {
                                                    : (desc_.Dimension == ResourceDimension::Texture3D
                                                           ? GpuTextureDimension::Dim3D
                                                           : GpuTextureDimension::Dim2D));
+            const pso::WgpuTextureFormat create_format =
+                storage_base_format(m.format, allow_uav, p.sample_count, features);
+            const bool can_store = allow_uav && p.sample_count == 1 && storage_capable(create_format, features);
+            const bool can_render_uav = allow_uav && !can_store && p.sample_count == 1 &&
+                                        p.dimension == static_cast<uint8_t>(GpuTextureDimension::Dim2D) &&
+                                        renderable_uav_fallback(create_format, features);
             p.usage_flags = GpuTextureUsage::CopySrc | GpuTextureUsage::CopyDst;
             if ((desc_.Flags & ResourceFlags::DenyShaderResource) == 0) {
                 p.usage_flags |= GpuTextureUsage::TextureBinding;
             }
-            if ((rt || depth) && p.dimension != static_cast<uint8_t>(GpuTextureDimension::Dim1D)) {
+            if ((rt || depth || can_render_uav) && p.dimension != static_cast<uint8_t>(GpuTextureDimension::Dim1D)) {
                 p.usage_flags |= GpuTextureUsage::RenderAttachment;
             }
-            if ((desc_.Flags & ResourceFlags::AllowUnorderedAccess) != 0) {
-                if (p.sample_count == 1 && storage_capable(m.format, dev.state_bridge().options().features)) {
+            if (allow_uav) {
+                if (can_store) {
                     p.usage_flags |= GpuTextureUsage::StorageBinding;
                 } else {
                     // WebGPU rejects the whole texture when STORAGE_BINDING is not allowed for its
-                    // format; such a texture keeps its other usages (its UAV bindings cannot work).
-                    dev.note_bad_argument(std::string("UAV texture format ") + pso::texture_format_name(m.format) +
+                    // format; such a texture keeps its other usages (renderable 2D formats still
+                    // fall back through a render-pass copy-out in state_bridge).
+                    dev.note_bad_argument(std::string("UAV texture format ") + pso::texture_format_name(create_format) +
                                           " has no WebGPU storage binding: created without storage usage");
                 }
             }
-            p.format = static_cast<uint8_t>(m.format);
+            p.format = static_cast<uint8_t>(create_format);
             // Views of a D3D12 resource may switch between the sRGB and the linear format (an
             // _SRGB texture rendered through a UNORM RTV, and the reverse): list the sibling.
-            if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(m.format);
+            if (const pso::WgpuTextureFormat sibling = pso::srgb_sibling(create_format);
                 sibling != pso::WgpuTextureFormat::Undefined) {
                 p.view_format_count = 1;
                 p.view_formats[0] = static_cast<uint8_t>(sibling);
@@ -3190,9 +3431,9 @@ bool Resource::initialize() {
             info.gpu_va = descriptor_va_;
             info.layout = desc_.Layout;
             info.storage = (p.usage_flags & GpuTextureUsage::StorageBinding) != 0;
-            info.render_target = rt;
+            info.render_target = rt || can_render_uav;
             info.depth_stencil = depth || bridge::is_depth_stencil_dxgi_format(info.format);
-            info.created_format = m.format;
+            info.created_format = create_format;
             dev.state_bridge().register_texture(id_, info);
             va_watch::note_texture(descriptor_va_, committed_memory_size(desc_), p.width, p.height, desc_.Format, id_);
             if (const DxgiFormatLayout bl = dxgi_format_layout(desc_.Format); bl.known && bl.block_bytes != 0) {
@@ -3581,7 +3822,11 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     const bool rt = (desc_.Flags & ResourceFlags::AllowRenderTarget) != 0;
     const pso::FormatUsage usage = depth ? pso::FormatUsage::DepthStencil
                                          : (rt ? pso::FormatUsage::RenderTarget : pso::FormatUsage::Sampled);
-    if (device_->upload_needs_conversion(desc_.Format, usage)) {
+    const pso::TextureFormatMapping mapped =
+        pso::map_texture_format(static_cast<pso::DxgiFormat>(desc_.Format), usage, device_->state_bridge().options().features);
+    const CpuWidenSpec widen_spec =
+        mapped.supported() ? cpu_widen_spec(static_cast<pso::DxgiFormat>(desc_.Format), mapped.format) : CpuWidenSpec{};
+    if (widen_spec.src_bpp == 0 && device_->upload_needs_conversion(desc_.Format, usage)) {
         device_->note_unsupported_copy("WriteToSubresource: DXGI format " + std::to_string(desc_.Format) +
                                        " needs CPU conversion for its WebGPU format (not implemented); skipped");
         return kSOk;
@@ -3607,11 +3852,12 @@ HResult Resource::WriteToSubresource(com::CallContext& ctx) {
     CommandEncoder enc;
     const bool is3d = desc_.Dimension == ResourceDimension::Texture3D;
     count_work(Work::TextureUploads);
-    if (desc_.Format == static_cast<uint32_t>(pso::DxgiFormat::A8_UNORM)) {
+    if (widen_spec.src_bpp != 0) {
         std::vector<uint8_t> wide;
         uint32_t pitch = 0;
-        if (!widen_a8_rows(bytes.data(), bytes.size(), bw, rows, bd, row_pitch, depth_pitch, &wide, &pitch)) {
-            device_->note_bad_argument("WriteToSubresource: A8 source smaller than its box");
+        if (!widen_promoted_rows(static_cast<pso::DxgiFormat>(desc_.Format), mapped.format, bytes.data(), bytes.size(),
+                                 bw, rows, bd, row_pitch, depth_pitch, &wide, &pitch)) {
+            device_->note_bad_argument("WriteToSubresource: widened source smaller than its box");
             return kEInvalidArg;
         }
         enc.write_texture(id_, host_mip, origin_x, origin_y, is3d ? box.front : layer, bw, bh, bd, pitch, rows,
