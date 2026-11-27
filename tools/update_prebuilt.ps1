@@ -73,7 +73,7 @@ if ($Web) {
         Write-Host "[dry-run] web prebuilt: $target (build in $tmp, swap on success; no headless smoke boot for the browser build)"
         return
     }
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction Stop }
     $seed = @()
     if (Test-Path -LiteralPath $target) { $seed = @("--seed-from", $target) }
     & python (Join-Path $PSScriptRoot "prebuilt_web.py") prepare --repo $repo --dest $tmp @seed
@@ -101,10 +101,14 @@ if ($DryRun) {
     Write-Host "[dry-run] smoke gate: $(if ($SkipSmoke) { 'skipped (-SkipSmoke)' } else { "python tools/run_native_boot.py --preset menu-flow --name prebuilt-smoke-<yyyyMMdd-HHmmss>-<commit> --live-executor --trust-build --build-dir $tmp --runs-dir $tmp-smoke-runs$(if ($StdPack) { " --shader-pack $StdPack" }) --max-ms 75000; then python tools/prebuilt_smoke.py <run dir> --expect-name <that name> (only that runs report is read); keeps the last 3 smoke runs" })"
     exit 0
 }
-if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
-if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old }
+# Same as the -Web branch: Windows PowerShell 5.1 turns any native stderr line into a terminating error under "Stop" when the output is
+# redirected (*>, 2>&1) or the script runs as a background job. Every native call below is checked via $LASTEXITCODE; cmdlets that must
+# fail loudly carry -ErrorAction Stop.
+$ErrorActionPreference = "Continue"
+if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction Stop }
+if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old -ErrorAction Stop }
 $parent = Split-Path -Parent $Dir
-if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null }
 $commit = (& git -C $repo rev-parse HEAD).Trim()
 $dirty = [bool](& git -C $repo status --porcelain --untracked-files=no)
 Push-Location $repo
@@ -113,11 +117,11 @@ try {
         --exe $Exe --game-dir $GameDir --build-dir $tmp
     if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE); the existing prebuilt copy is untouched." }
 } catch {
-    if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp }
+    if (Test-Path -LiteralPath $tmp) { Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction Continue }
     throw
 } finally { Pop-Location }
 @{ commit = $commit; dirty = $dirty; built_utc = (Get-Date).ToUniversalTime().ToString("o") } |
-    ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json")
+    ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $tmp "prebuilt.json") -ErrorAction Stop
 if (-not $SkipSmoke) {
     $smokeName = "prebuilt-smoke-$((Get-Date).ToString('yyyyMMdd-HHmmss'))-$($commit.Substring(0, 9))"  # unique per gate run: never reuse (or read) an older run's dir
     $smokeRuns = "$tmp-smoke-runs"  # outside the prebuilt (it is read-only for the runners)
@@ -139,14 +143,14 @@ if (-not $SkipSmoke) {
     }
 }
 # drop what is not needed to run (per-run outputs and object/IR intermediates)
-foreach ($n in @("runs", "program\native\harness-build", "program\native\bin\playgta6_boot.pdb")) { $p = Join-Path $tmp $n; if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p } }
+foreach ($n in @("runs", "program\native\harness-build", "program\native\bin\playgta6_boot.pdb")) { $p = Join-Path $tmp $n; if (Test-Path -LiteralPath $p) { Remove-Item -Recurse -Force -LiteralPath $p -ErrorAction Stop } }
 $busy = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path -like "$Dir\*" })
 if ($busy) {
     Write-Host "[prebuilt] $Dir is in use (pid $($busy.Id -join ',')); new build kept at $tmp. Close the game, then: Rename-Item '$Dir' '$(Split-Path -Leaf $old)'; Rename-Item '$tmp' '$(Split-Path -Leaf $Dir)'; Remove-Item -Recurse -Force '$old'"
     exit 2
 }
-if (Test-Path -LiteralPath $Dir) { Rename-Item -LiteralPath $Dir -NewName (Split-Path -Leaf $old) }
-try { Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Dir) }
-catch { if (Test-Path -LiteralPath $old) { Rename-Item -LiteralPath $old -NewName (Split-Path -Leaf $Dir) }; throw }
-if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old }
+if (Test-Path -LiteralPath $Dir) { Rename-Item -LiteralPath $Dir -NewName (Split-Path -Leaf $old) -ErrorAction Stop }
+try { Rename-Item -LiteralPath $tmp -NewName (Split-Path -Leaf $Dir) -ErrorAction Stop }
+catch { if (Test-Path -LiteralPath $old) { Rename-Item -LiteralPath $old -NewName (Split-Path -Leaf $Dir) -ErrorAction Stop }; throw }
+if (Test-Path -LiteralPath $old) { Remove-Item -Recurse -Force -LiteralPath $old -ErrorAction Stop }
 Write-Host "[prebuilt] updated $Dir from $commit. Play: `$env:PLAYGTA6_PREBUILT_DIR='$Dir'; .\tools\play_native.ps1 -Prebuilt"
