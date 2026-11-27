@@ -32,6 +32,51 @@ constexpr double kBucketMs[kBuckets - 1] = {0.5, 1, 2, 4, 8, 16, 32};
 std::atomic<uint64_t> g_count{0}, g_req_us{0}, g_act_us{0}, g_max_act_us{0}, g_max_over_us{0};
 std::atomic<uint64_t> g_hist[kBuckets];
 
+struct TimedWaitAgg {
+    std::atomic<uint64_t> count{0}, req_us{0}, act_us{0}, max_act_us{0}, max_over_us{0};
+    std::atomic<uint64_t> hist[kBuckets];
+    void reset() {
+        count = 0;
+        req_us = 0;
+        act_us = 0;
+        max_act_us = 0;
+        max_over_us = 0;
+        for (auto& h : hist) h = 0;
+    }
+};
+TimedWaitAgg g_tw_timed_out, g_tw_signalled;
+
+void atomic_max(std::atomic<uint64_t>& m, uint64_t v) {
+    uint64_t cur = m.load(std::memory_order_relaxed);
+    while (v > cur && !m.compare_exchange_weak(cur, v, std::memory_order_relaxed)) {
+    }
+}
+
+std::string agg_json(const TimedWaitAgg& a, bool with_hist) {
+    const uint64_t n = a.count.load();
+    char buf[512];
+    const int len = std::snprintf(buf, sizeof(buf),
+                                  "{\"count\": %llu, \"mean_requested_ms\": %.3f, \"mean_actual_ms\": %.3f, "
+                                  "\"max_actual_ms\": %.3f",
+                                  static_cast<unsigned long long>(n),
+                                  n ? a.req_us.load() / 1000.0 / static_cast<double>(n) : 0.0,
+                                  n ? a.act_us.load() / 1000.0 / static_cast<double>(n) : 0.0,
+                                  a.max_act_us.load() / 1000.0);
+    std::string o(buf, static_cast<size_t>(len));
+    if (with_hist) {
+        std::snprintf(buf, sizeof(buf),
+                      ", \"max_overshoot_ms\": %.3f, \"overshoot_ms_buckets\": {\"lt0.5\": %llu, \"lt1\": %llu, "
+                      "\"lt2\": %llu, \"lt4\": %llu, \"lt8\": %llu, \"lt16\": %llu, \"lt32\": %llu, \"ge32\": %llu}",
+                      a.max_over_us.load() / 1000.0, static_cast<unsigned long long>(a.hist[0].load()),
+                      static_cast<unsigned long long>(a.hist[1].load()), static_cast<unsigned long long>(a.hist[2].load()),
+                      static_cast<unsigned long long>(a.hist[3].load()), static_cast<unsigned long long>(a.hist[4].load()),
+                      static_cast<unsigned long long>(a.hist[5].load()), static_cast<unsigned long long>(a.hist[6].load()),
+                      static_cast<unsigned long long>(a.hist[7].load()));
+        o += buf;
+    }
+    return o + "}";
+}
+
 #ifdef _WIN32
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -105,6 +150,31 @@ std::string guest_sleep_stats_json() {
                   static_cast<unsigned long long>(g_hist[5].load()), static_cast<unsigned long long>(g_hist[6].load()),
                   static_cast<unsigned long long>(g_hist[7].load()));
     return buf;
+}
+
+void record_guest_timed_wait(uint32_t requested_ms, std::chrono::steady_clock::duration actual, bool timed_out) {
+    const int64_t req = static_cast<int64_t>(requested_ms) * 1000;
+    int64_t act = std::chrono::duration_cast<std::chrono::microseconds>(actual).count();
+    if (act < 0) act = 0;
+    const int64_t over = act > req ? act - req : 0;
+    TimedWaitAgg& a = timed_out ? g_tw_timed_out : g_tw_signalled;
+    int b = 0;
+    while (b < kBuckets - 1 && over >= static_cast<int64_t>(kBucketMs[b] * 1000.0)) ++b;
+    if (timed_out) a.hist[b].fetch_add(1, std::memory_order_relaxed);
+    a.count.fetch_add(1, std::memory_order_relaxed);
+    a.req_us.fetch_add(static_cast<uint64_t>(req), std::memory_order_relaxed);
+    a.act_us.fetch_add(static_cast<uint64_t>(act), std::memory_order_relaxed);
+    atomic_max(a.max_act_us, static_cast<uint64_t>(act));
+    atomic_max(a.max_over_us, static_cast<uint64_t>(over));
+}
+
+void reset_guest_timed_wait_stats() {
+    g_tw_timed_out.reset();
+    g_tw_signalled.reset();
+}
+
+std::string guest_timed_wait_stats_json() {
+    return "{\"timed_out\": " + agg_json(g_tw_timed_out, true) + ", \"signalled\": " + agg_json(g_tw_signalled, false) + "}";
 }
 
 void raise_timer_resolution() {
