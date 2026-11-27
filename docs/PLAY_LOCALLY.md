@@ -1,4 +1,4 @@
-# Play locally
+﻿# Play locally
 
 ## Quick start: play natively (Windows)
 
@@ -281,6 +281,10 @@ or more missed vblanks than without audio, A/B the scheduling class:
 pro-audio|audio|off` on `playgta6_boot` / `run_native_boot.py --play`, or env `PLAYGTA6_AUDIO_MMCSS` (the flag wins).
 `off` leaves the thread at normal priority (no MMCSS, no priority boost). The `audio_out` block of `boot-report.json` records `mmcss_mode`
 and `mmcss_registered` (false when `off` or when avrt.dll refused), so compare fps p5 / missed vblanks per mode.
+
+### A/B the guest Sleep timer: `--timer-resolution`
+
+The harness raises the Windows timer resolution to 1 ms by default. `--timer-resolution default` keeps the OS tick as an A/B baseline (`1ms` is the default). The `guest_sleep` block of `boot-report.json` records requested vs actual wall time of every guest `Sleep(ms)` (count, mean/max, overshoot histogram), so compare it per mode.
 
 ### Debugging a black or garbled screen: `--show-target`
 
