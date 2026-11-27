@@ -742,7 +742,7 @@ void test_contiguous_run_edges() {
     // computes each source element separately, rather than sharing the tile/detile walker.
     uint32_t seed = 18000;
     for (uint32_t format : {61u, 56u, 28u, 10u, 2u, 71u, 98u}) {
-        for (uint32_t mode : {1u, 2u, 5u, 6u, 9u, 10u, 25u, 26u}) {
+        for (uint32_t mode : {1u, 2u, 3u, 5u, 6u, 7u, 9u, 10u, 11u, 25u, 26u, 27u}) {
             TextureLayoutDesc desc{format, 67u, 35u, 1u, 7u, 0x100u | mode, 0u};
             desc.pipe_bank_xor = 0xA5;
             verify_element_offsets(desc, 2u, seed++);
