@@ -81,17 +81,38 @@ void test_rows_are_well_formed() {
             CHECK(row.note != nullptr && row.note[0] != '\0');  // deny/pending say why
         }
     }
-    // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 52, middleware 98,
+    // Every shim of the four audited families has a row (ucrt 186 + ucrt_ext 59, middleware 98,
     // xbox 17, winsock 25 registered + WSASetLastError, declared but not registered); stubs.rs
     // checks the same against the export tables.
-    CHECK(seen.size() == 186u + 52u + 98u + 17u + 26u);
+    CHECK(seen.size() == 186u + 59u + 98u + 17u + 26u);
     CHECK(ok > 0);
+    // P4 and P8 sandboxed UCRT stdio/fs shims must all be audited ok.
+    const char* expected_ok[] = {
+        "pg6_crt_fopen",   "pg6_crt_wfopen", "pg6_crt_remove",  "pg6_crt_wstat64",
+        "pg6_crt_fsopen",  "pg6_crt_wfsopen", "pg6_crt_wrename", "pg6_crt_wchdir",
+        "pg6_crt_wrmdir",  "pg6_crt_wremove", "pg6_crt_wgetcwd",
+    };
+    for (const char* sym : expected_ok) {
+        bool found_ok = false;
+        for (const AuditRow& row : kRows) {
+            if (std::strcmp(row.symbol, sym) == 0 && std::strcmp(row.verdict, "ok") == 0) {
+                found_ok = true;
+                break;
+            }
+        }
+        CHECK(found_ok);
+    }
     for (const GapRow& gap : kGaps) {
         if (gap.dll == nullptr) {
             break;  // sentinel
         }
         CHECK(gap.name != nullptr && gap.reason != nullptr);
         CHECK(gap.reason[0] != '\0');
+        // None of the resolved P8 imports should remain recorded as gaps.
+        CHECK(std::strcmp(gap.name, "_fsopen") != 0 && std::strcmp(gap.name, "_wfsopen") != 0 &&
+              std::strcmp(gap.name, "_wchdir") != 0 && std::strcmp(gap.name, "_wremove") != 0 &&
+              std::strcmp(gap.name, "_wrename") != 0 && std::strcmp(gap.name, "_wrmdir") != 0 &&
+              std::strcmp(gap.name, "_wgetcwd") != 0);
     }
 }
 
@@ -313,6 +334,32 @@ void test_ucrt_ext() {
         CHECK(name[0] == 'g' && table[1] == 0);
     }
     CHECK(pg6_crt_configure_wide_argv(1) == 0);
+
+    // P8 sandboxed stdio/fs/cwd shims in ucrt_ext.
+    pg6_crt_reset_runtime_state();
+    uint16_t* cwd_alloc = pg6_crt_wgetcwd(nullptr, 0);
+    CHECK(cwd_alloc != nullptr && gheap.owns(gheap.to_guest(cwd_alloc)));
+    CHECK(cwd_alloc != nullptr && cwd_alloc[0] == 'G' && cwd_alloc[1] == ':' &&
+          cwd_alloc[2] == '\\' && cwd_alloc[3] == 0);
+    pg6_crt_free(cwd_alloc);
+    const uint16_t w_ud[] = {'/', 'u', 's', 'e', 'r', 'd', 'a', 't', 'a', 0};
+    const uint16_t w_root[] = {'G', ':', '\\', 0};
+    const uint16_t w_f1[] = {'a', 'u', 'd', 'i', 't', '1', '.', 't', 'x', 't', 0};
+    const uint16_t w_f2[] = {'a', 'u', 'd', 'i', 't', '2', '.', 't', 'x', 't', 0};
+    const uint16_t w_wb[] = {'w', 'b', 0};
+    CHECK(pg6_crt_wchdir(w_ud) == 0);
+    FILE* ef = pg6_crt_wfsopen(w_f1, w_wb, 0x40);
+    CHECK(ef != nullptr);
+    if (ef != nullptr) {
+        CHECK(pg6_crt_fputs("ok", ef) == 0);
+        CHECK(pg6_crt_fclose(ef) == 0);
+    }
+    CHECK(pg6_crt_wrename(w_f1, w_f2) == 0);
+    CHECK(pg6_crt_wremove(w_f2) == 0);
+    CHECK(pg6_crt_wchdir(w_root) == 0);
+    CHECK(pg6_crt_fsopen("C:\\forbidden.txt", "wb", 0x40) == nullptr);
+    CHECK(*pg6_crt_errno() == PG6_CRT_EACCES);
+    pg6_crt_reset_runtime_state();
 }
 
 }  // namespace

@@ -195,7 +195,6 @@ void pg6_export_ws2_closesocket(void* state) {
 }
 
 const Pg6ExportThunk kExportThunks[] = {
-    {"api-ms-win-crt-filesystem-l1-1-0.dll", "remove", 0u, 0u, nullptr, nullptr, "denied: pg6_crt_remove: denied by the shim audit: deletes host files by a raw guest path, bypassing the win32 file shims' path mapping"},
     {"api-ms-win-crt-math-l1-1-0.dll", "pow", 0u, kPg6ExportGenerated, "pg6_crt_pow", &pg6_export_crt_pow, nullptr},
     {"api-ms-win-crt-math-l1-1-0.dll", "sinf", 0u, kPg6ExportGenerated, "pg6_crt_sinf", &pg6_export_crt_sinf, nullptr},
     {"api-ms-win-crt-string-l1-1-0.dll", "strlen", 0u, kPg6ExportGenerated, "pg6_crt_strlen", &pg6_export_crt_strlen, nullptr},
@@ -209,6 +208,7 @@ const Pg6ExportThunk kExportThunks[] = {
     {"KERNEL32.dll", "SetLastError", 0u, kPg6ExportGenerated, "pg6_win32_set_last_error", &pg6_export_win32_set_last_error, nullptr},
     {"KERNEL32.dll", "SleepConditionVariableCS", 0u, kPg6ExportGenerated, "pg6_win32_sleep_condition_variable_cs", &pg6_export_win32_sleep_condition_variable_cs, nullptr},
     {"KERNEL32.dll", "WakeAllConditionVariable", 0u, kPg6ExportGenerated, "pg6_win32_wake_all_condition_variable", &pg6_export_win32_wake_all_condition_variable, nullptr},
+    {"VCRUNTIME140.dll", "_purecall", 0u, 0u, nullptr, nullptr, "denied: pg6_crt_purecall: denied by the shim audit: returns 0 to the pure-virtual call site instead of terminating"},
     {"WS2_32.dll", "closesocket", 3u, kPg6ExportGenerated, "pg6_ws2_closesocket", &pg6_export_ws2_closesocket, nullptr},
 };
 

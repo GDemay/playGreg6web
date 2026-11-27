@@ -115,6 +115,8 @@ int32_t clamp_long(long long value) {
 // ---------------------------------------------------------------------------
 
 #define PG6_UCRT_EXT_MOD_CONVERT "api-ms-win-crt-convert-l1-1-0.dll"
+#define PG6_UCRT_EXT_MOD_ENV "api-ms-win-crt-environment-l1-1-0.dll"
+#define PG6_UCRT_EXT_MOD_FS "api-ms-win-crt-filesystem-l1-1-0.dll"
 #define PG6_UCRT_EXT_MOD_HEAP "api-ms-win-crt-heap-l1-1-0.dll"
 #define PG6_UCRT_EXT_MOD_LOCALE "api-ms-win-crt-locale-l1-1-0.dll"
 #define PG6_UCRT_EXT_MOD_MATH "api-ms-win-crt-math-l1-1-0.dll"
@@ -154,6 +156,13 @@ int32_t clamp_long(long long value) {
     E(STDIO, "fputwc", pg6_crt_fputwc) \
     E(STDIO, "fgetwc", pg6_crt_fgetwc) \
     E(STDIO, "ungetwc", pg6_crt_ungetwc) \
+    E(STDIO, "_fsopen", pg6_crt_fsopen) \
+    E(STDIO, "_wfsopen", pg6_crt_wfsopen) \
+    E(FS, "_wrename", pg6_crt_wrename) \
+    E(FS, "_wchdir", pg6_crt_wchdir) \
+    E(FS, "_wrmdir", pg6_crt_wrmdir) \
+    E(FS, "_wremove", pg6_crt_wremove) \
+    E(ENV, "_wgetcwd", pg6_crt_wgetcwd) \
     E(TIME, "_Getdays", pg6_crt_getdays) \
     E(TIME, "_Getmonths", pg6_crt_getmonths) \
     E(TIME, "_Gettnames", pg6_crt_gettnames) \
@@ -368,14 +377,18 @@ int32_t pg6_crt_seh_filter_dll(uint32_t exception_num, void* exception_ptrs) {
     return pg6_crt_seh_filter_exe(exception_num, exception_ptrs);
 }
 
-// --- stdio -----------------------------------------------------------------
+// --- stdio / sandboxed filesystem / environment ----------------------------
 
 int32_t pg6_crt_fputs(const char* str, FILE* stream) {
     if (str == nullptr || stream == nullptr) {
         *pg6_crt_errno() = PG6_CRT_EINVAL;
         return EOF;
     }
-    return std::fputs(str, stream) < 0 ? EOF : 0;
+    const size_t len = std::strlen(str);
+    if (len == 0) {
+        return 0;
+    }
+    return pg6_crt_fwrite(str, 1, len, stream) == len ? 0 : EOF;
 }
 
 uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream) {
@@ -388,7 +401,7 @@ uint16_t pg6_crt_fputwc(uint16_t ch, FILE* stream) {
         *pg6_crt_errno() = PG6_CRT_EILSEQ;
         return PG6_CRT_WEOF;
     }
-    return std::fputc(ch, stream) == EOF ? PG6_CRT_WEOF : ch;
+    return pg6_crt_fputc(ch, stream) == EOF ? PG6_CRT_WEOF : ch;
 }
 
 uint16_t pg6_crt_fgetwc(FILE* stream) {
@@ -396,7 +409,7 @@ uint16_t pg6_crt_fgetwc(FILE* stream) {
         *pg6_crt_errno() = PG6_CRT_EINVAL;
         return PG6_CRT_WEOF;
     }
-    const int c = std::fgetc(stream);
+    const int32_t c = pg6_crt_fgetc(stream);
     return c == EOF ? PG6_CRT_WEOF : static_cast<uint16_t>(c);
 }
 
@@ -404,7 +417,102 @@ uint16_t pg6_crt_ungetwc(uint16_t ch, FILE* stream) {
     if (stream == nullptr || ch == PG6_CRT_WEOF || ch > 0xFF) {
         return PG6_CRT_WEOF;
     }
-    return std::ungetc(ch, stream) == EOF ? PG6_CRT_WEOF : ch;
+    return pg6_crt_ungetc(ch, stream) == EOF ? PG6_CRT_WEOF : ch;
+}
+
+FILE* pg6_crt_fsopen(const char* filename, const char* mode, int32_t shflag) {
+    // Sharing mode is accepted for MSVC/msvcp140 compatibility; sandboxed virtual streams live
+    // inside the process's /userdata overlay and read-only HTTPFS game root.
+    (void)shflag;
+    return playgta6::os::ucrt_detail::sandbox_fopen(filename, mode);
+}
+
+FILE* pg6_crt_wfsopen(const uint16_t* filename, const uint16_t* mode, int32_t shflag) {
+    (void)shflag;
+    if (filename == nullptr || mode == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return nullptr;
+    }
+    const std::string fname_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(filename);
+    const std::string mode_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(mode);
+    return playgta6::os::ucrt_detail::sandbox_fopen(fname_utf8.c_str(), mode_utf8.c_str());
+}
+
+int32_t pg6_crt_wrename(const uint16_t* oldname, const uint16_t* newname) {
+    if (oldname == nullptr || newname == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return -1;
+    }
+    const std::string old_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(oldname);
+    const std::string new_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(newname);
+    return playgta6::os::ucrt_detail::sandbox_rename(old_utf8, new_utf8);
+}
+
+int32_t pg6_crt_wchdir(const uint16_t* dirname) {
+    if (dirname == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return -1;
+    }
+    const std::string dir_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(dirname);
+    return playgta6::os::ucrt_detail::sandbox_chdir(dir_utf8);
+}
+
+int32_t pg6_crt_wrmdir(const uint16_t* dirname) {
+    if (dirname == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return -1;
+    }
+    const std::string dir_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(dirname);
+    return playgta6::os::ucrt_detail::sandbox_rmdir(dir_utf8);
+}
+
+int32_t pg6_crt_wremove(const uint16_t* path) {
+    if (path == nullptr) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return -1;
+    }
+    const std::string path_utf8 = playgta6::os::ucrt_detail::utf16_to_utf8(path);
+    return playgta6::os::ucrt_detail::sandbox_remove(path_utf8);
+}
+
+uint16_t* pg6_crt_wgetcwd(uint16_t* buffer, int32_t maxlen) {
+    const std::vector<uint16_t> cwd = playgta6::os::ucrt_detail::sandbox_getcwd_utf16();
+    const size_t needed = cwd.size() + 1;  // including NUL terminator
+    if (buffer == nullptr) {
+        if (maxlen < 0) {
+            *pg6_crt_errno() = PG6_CRT_EINVAL;
+            return nullptr;
+        }
+        const size_t alloc_units =
+            (maxlen > 0 && static_cast<size_t>(maxlen) > needed)
+                ? static_cast<size_t>(maxlen)
+                : needed;
+        auto* out = static_cast<uint16_t*>(pg6_crt_with_host_errno([&](int32_t* e) {
+            return playgta6::os::guest_crt::malloc(alloc_units * sizeof(uint16_t), e);
+        }));
+        if (out == nullptr) {
+            *pg6_crt_errno() = PG6_CRT_ENOMEM;
+            return nullptr;
+        }
+        if (!cwd.empty()) {
+            std::memcpy(out, cwd.data(), cwd.size() * sizeof(uint16_t));
+        }
+        out[cwd.size()] = 0;
+        return out;
+    }
+    if (maxlen <= 0) {
+        *pg6_crt_errno() = PG6_CRT_EINVAL;
+        return nullptr;
+    }
+    if (needed > static_cast<size_t>(maxlen)) {
+        *pg6_crt_errno() = PG6_CRT_ERANGE;
+        return nullptr;
+    }
+    if (!cwd.empty()) {
+        std::memcpy(buffer, cwd.data(), cwd.size() * sizeof(uint16_t));
+    }
+    buffer[cwd.size()] = 0;
+    return buffer;
 }
 
 // --- time ------------------------------------------------------------------

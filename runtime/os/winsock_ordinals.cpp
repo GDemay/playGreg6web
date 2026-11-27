@@ -4,6 +4,7 @@
 #include <cstring>
 #include <mutex>
 
+#include "os/guest_heap.h"
 #include "os/win32_loader.h"
 
 namespace ws = playgta6::os::winsock;
@@ -178,9 +179,23 @@ uint32_t pg6_ws2_inet_addr(const char* cp) {
 }
 
 char* pg6_ws2_inet_ntoa(Pg6InAddr in) {
-    thread_local char buffer[16];
-    format_ipv4(in.s_addr, buffer, sizeof(buffer));
-    return buffer;
+    // Format into a per-thread 16-byte buffer in guest-accessible heap memory (re-allocating
+    // transparently if the guest arena/heap resets) so callers never observe a raw host TLS
+    // pointer outside guest memory. Guest imports bind pg6_gthunk_inet_ntoa (os/host_marshallers.h)
+    // for the Win64 by-value struct in_addr ABI.
+    thread_local playgta6::os::GuestHeap* t_heap = nullptr;
+    thread_local uint64_t t_guest_va = 0;
+    thread_local char t_fallback[16];
+
+    playgta6::os::GuestHeap& heap = playgta6::os::default_guest_heap();
+    if (t_heap != &heap || t_guest_va == 0 || !heap.owns(t_guest_va)) {
+        t_heap = &heap;
+        t_guest_va = heap.alloc(16, 16, playgta6::os::HeapFamily::Crt,
+                                playgta6::os::kHeapZeroMemory);
+    }
+    char* out = (t_guest_va != 0) ? reinterpret_cast<char*>(heap.to_host(t_guest_va)) : t_fallback;
+    format_ipv4(in.s_addr, out, 16);
+    return out;
 }
 
 int32_t pg6_ws2_listen(Pg6Socket, int32_t) {
