@@ -101,6 +101,9 @@ const KEY_OFFSET = 16; // CreateRenderPipeline2: header, then the 376-byte key
 const KEY_SIZE = 376;
 const CREATE_TEXTURE2_BYTES = 40;
 const MAX_TEXTURE_VIEW_FORMATS = 8;
+const MAX_TEXTURE_GENERATIONS = 16384;
+const MAX_SEEN_WARNING_KEYS = 4096;
+const MAX_LAYOUTS_BY_CONTENT = 4096;
 const GPU_BUFFER_USAGE_INDEX = 0x0010;
 const GPU_BUFFER_USAGE_UNIFORM = 0x0040;
 const GPU_BUFFER_USAGE_STORAGE = 0x0080;
@@ -3879,7 +3882,8 @@ class RenderStatePackets {
       Number.isInteger(options.presentxBindGroupCacheLimit) && options.presentxBindGroupCacheLimit > 0
         ? options.presentxBindGroupCacheLimit
         : PRESENTX_BIND_GROUP_CACHE_LIMIT;
-    this._textureGenerations = new Map(); // textureId -> monotonic generation
+    this._textureGenerations = new Map(); // textureId -> monotonic generation (LRU-bounded)
+    this._nextTextureGeneration = 0;
     this._textureViewOwners = new Map(); // textureId -> GPUTexture handle for silent-replacement detection
     this._destroyed = false;
     this._lastBuiltRenderPipelineAutoLayout = null;
@@ -4273,6 +4277,12 @@ class RenderStatePackets {
   _recordTelemetryWarningOnce(key, message) {
     if (typeof key === 'string' && key.length > 0) {
       if (this._seenWarningKeys.has(key)) return;
+      if (this._seenWarningKeys.size >= MAX_SEEN_WARNING_KEYS) {
+        const oldestKey = this._seenWarningKeys.values().next().value;
+        if (oldestKey !== undefined) {
+          this._seenWarningKeys.delete(oldestKey);
+        }
+      }
       this._seenWarningKeys.add(key);
     }
     this._recordTelemetryWarning(message);
@@ -4683,7 +4693,16 @@ class RenderStatePackets {
   }
 
   _bumpTextureGeneration(textureId) {
-    const next = (this._textureGenerations.get(textureId) || 0) + 1;
+    this._nextTextureGeneration += 1;
+    const next = this._nextTextureGeneration;
+    if (this._textureGenerations.has(textureId)) {
+      this._textureGenerations.delete(textureId);
+    } else if (this._textureGenerations.size >= MAX_TEXTURE_GENERATIONS) {
+      const oldestTextureId = this._textureGenerations.keys().next().value;
+      if (oldestTextureId !== undefined) {
+        this._textureGenerations.delete(oldestTextureId);
+      }
+    }
     this._textureGenerations.set(textureId, next);
     return next;
   }
@@ -4994,8 +5013,16 @@ class RenderStatePackets {
     this._invalidateRemappedBindGroupsForPipeline(id, true);
     this._invalidateRemappedBindGroupsForPipeline(id, false);
     this._invalidateRemappedBindGroupsForBindGroup(id);
+    const wasTrackedTexture =
+      this.textureMeta.has(id) ||
+      this.textureViews.has(id) ||
+      this._textureViewOwners.has(id) ||
+      this._textureGenerations.has(id) ||
+      Boolean(this.processor && this.processor.textures && this.processor.textures.has(id));
     this._invalidatePresentXCacheForResource(id);
-    this._bumpTextureGeneration(id);
+    if (wasTrackedTexture) {
+      this._bumpTextureGeneration(id);
+    }
     const prevOwner = this._textureViewOwners.get(id);
     if (prevOwner) {
       this._textureViewWeakCache.delete(prevOwner);
@@ -5138,7 +5165,17 @@ class RenderStatePackets {
         this._packetError = `bind group layout ${id}: ${String(err && err.message ? err.message : err)}`;
         return false;
       }
-      if (contentKey) this.layoutsByContent.set(contentKey, layout);
+      if (contentKey) {
+        if (this.layoutsByContent.has(contentKey)) {
+          this.layoutsByContent.delete(contentKey);
+        } else if (this.layoutsByContent.size >= MAX_LAYOUTS_BY_CONTENT) {
+          const oldestContentKey = this.layoutsByContent.keys().next().value;
+          if (oldestContentKey !== undefined) {
+            this.layoutsByContent.delete(oldestContentKey);
+          }
+        }
+        this.layoutsByContent.set(contentKey, layout);
+      }
     }
     this.bindGroupLayouts.set(id, {
       layout,

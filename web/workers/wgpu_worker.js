@@ -18009,6 +18009,26 @@ function createWgpuWorkerHandler(options = {}) {
       initInFlight = false;
       if (processor && pendingCommandBatches.length > 0) {
         flushPendingCommandBatches();
+      } else if (!processor && pendingCommandBatches.length > 0) {
+        const abandoned = pendingCommandBatches.splice(0, pendingCommandBatches.length);
+        for (let i = 0; i < abandoned.length; i += 1) {
+          const p = abandoned[i];
+          const rawBuf = extractRawBatchBuffer(p);
+          if (
+            p &&
+            p.recycleBuffer === true &&
+            p.cmdBuffer === rawBuf &&
+            isPlainArrayBuffer(rawBuf) &&
+            rawBuf.byteLength >= RECYCLE_CMD_BUFFER_MIN_BYTES &&
+            rawBuf.byteLength <= RECYCLE_CMD_BUFFER_MAX_BYTES
+          ) {
+            try {
+              postMessage({ type: 'recycle-cmd-buffer', cmdBuffer: rawBuf }, [rawBuf]);
+            } catch (_) {
+              // Ignore transfer errors if the buffer was detached or the channel closed.
+            }
+          }
+        }
       }
     }
   }
@@ -18554,6 +18574,21 @@ function createWgpuWorkerHandler(options = {}) {
         extractRawBatchBuffer(payload) !== null
       ) {
         pendingCommandBatches.push(payload);
+      } else if (
+        !processor &&
+        !initInFlight &&
+        payload.recycleBuffer === true &&
+        isPlainArrayBuffer(payload.cmdBuffer) &&
+        payload.cmdBuffer.byteLength >= RECYCLE_CMD_BUFFER_MIN_BYTES &&
+        payload.cmdBuffer.byteLength <= RECYCLE_CMD_BUFFER_MAX_BYTES
+      ) {
+        try {
+          postMessage({ type: 'recycle-cmd-buffer', cmdBuffer: payload.cmdBuffer }, [
+            payload.cmdBuffer,
+          ]);
+        } catch (_) {
+          // Ignore transfer errors if the buffer was detached or the channel closed.
+        }
       } else if (
         processor &&
         (payload.cmdBuffer ||
