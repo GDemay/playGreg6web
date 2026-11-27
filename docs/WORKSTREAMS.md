@@ -340,6 +340,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Single-command `python tools/preflight.py [--json]` verifying toolchains, `.env` / `GTA6_GAME_DIR`, COOP/COEP server sanity, `web/dist/runtime.wasm`, `data-manifest.json`, `bootset.json`, and `.wgsl.pack` readiness.
 - [x] **W14 — OPFS Cache Quota Inspector & Browser Storage Manager** — `DONE` (PR #70, closes #63) *(no game files required — disjoint files `web/storage/storage_manager.js`, `tests/test_storage_manager.mjs`)*
   - Query `navigator.storage.estimate()`, request persistent storage, inspect/clear OPFS range cache and IndexedDB `/userdata` slots cleanly from the browser HUD.
+- [x] **Performance #2048 — FNV64 streaming verification arithmetic** — `DONE` (#2048, @GDemay) *(synthetic validation; no game files required)*
+
 - [x] **W15 — Frame Telemetry Ring & Performance Profiler (`web/telemetry/perf_monitor.js`)** — `DONE` (PR #71, closes #64) *(no game files required — disjoint files `web/telemetry/perf_monitor.js`, `tests/test_perf_monitor.mjs`)*
   - Lock-free rolling frame-time, p95/p99 latency, HTTP Range throughput, GPU packet rate, and audio underrun aggregator feeding `window.playgta6Hud.updateMetrics()`.
 - [x] **W16 — Browser WebGPU Smoke Demo & Built-in Intro Splash Test Scene (`web/demo/smoke_scene.js`)** — `DONE` (PR #79, closes #68) *(no game files required — disjoint files `web/demo/smoke_scene.js`, `tests/test_smoke_scene.mjs`)*
@@ -438,5 +440,3 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
   - Handles Emscripten 7.0.1 `em-pthread` worker bootstrap and forwards `env.host_*` host-import bindings across worker threads inside `web/loader.js`.
 - [x] **W63 — Fix Inline `detectWasm64` (`address: 'i64'` + `index: 'i64'`) in `web/index.html`** — `DONE` (PR #385, closes #384) *(no game files required — disjoint files `web/index.html`, `tests/test_index_html_wiring.mjs`)*
   - Updates the inline HUD `detectWasm64` probe in `web/index.html` to check `address: 'i64'` with `index: 'i64'` fallback consistently across all browser entrypoints.
-
-- [ ] **Performance #2048 — FNV64 streaming verification arithmetic** — `IN PROGRESS` (#2048, @GDemay) *(synthetic validation; no game files required)*
