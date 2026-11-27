@@ -1,0 +1,83 @@
+name: Isolated candidate full Linux validation
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_ref:
+        description: Immutable candidate commit in GDemay/playGreg6web
+        required: true
+permissions:
+  contents: read
+jobs:
+  rust:
+    name: Full Rust workspace
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.candidate_ref }}
+      - name: Verify immutable checkout
+        shell: bash
+        run: |
+          [[ '${{ inputs.candidate_ref }}' =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = '${{ inputs.candidate_ref }}'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: false
+      - name: Report LLVM tools
+        run: |
+          which -a llc opt clang || true
+          clang --version || true
+      - run: cargo test --workspace
+  runtime:
+    name: Default Opus CMake and all CTest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.candidate_ref }}
+      - uses: hendrikmuhs/ccache-action@v1.2
+        with:
+          key: runtime-cpp
+          save: false
+      - name: Default-feature Release build and every CTest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake -S runtime -B runtime/build-host -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          cmake --build runtime/build-host --parallel 4
+          ctest --test-dir runtime/build-host --output-on-failure --parallel 4
+  python-web:
+    name: Python 3.12 and Node 22 complete checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: GDemay/playGreg6web
+          ref: ${{ inputs.candidate_ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: No game files guard
+        shell: bash
+        run: |
+          BAD=$(git ls-files | grep -iE '(^|/)\.env$|\.(rpf|xvd|xvc|ttpf|awc|dxbc|spv|wgsl\.pack|pgim|exe|dll)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "$BAD"
+            exit 1
+          fi
+      - run: python -m unittest discover -s tests -v
+      - name: Every web JavaScript syntax check and Node test
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' f; do node --check "$f"; done < <(find web -name '*.js' -print0)
+          node --test tests/*.mjs
