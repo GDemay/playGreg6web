@@ -847,11 +847,15 @@ function createWarmCmdBufferPool(options = {}) {
       const upperBound = Math.max(byteLength * 2, byteLength + maxSlackBytes);
       let bestIndex = -1;
       let bestSize = Infinity;
-      for (let i = 0; i < buffers.length; i += 1) {
+      for (let i = buffers.length - 1; i >= 0; i -= 1) {
         const buf = buffers[i];
-        if (!isTransferableArrayBuffer(buf)) {
+        if (!isTransferableArrayBuffer(buf) || buf.byteLength === 0) {
+          buffers.splice(i, 1);
           continue;
         }
+      }
+      for (let i = 0; i < buffers.length; i += 1) {
+        const buf = buffers[i];
         const len = buf.byteLength;
         if (len >= byteLength && len <= upperBound && len < bestSize) {
           bestIndex = i;
@@ -2923,6 +2927,564 @@ function patchPthreadWasmImports(wasmModuleOrBytes, rawImports, wasmNs, hostImpo
   return patchedImports;
 }
 
+const SHARED_WASM_STUB_CUSTOM_SECTION_NAME = 'pg6.shared.ref';
+const SHARED_WASM_STUB_MAX_BYTES = 16384;
+
+function encodeWasmUleb128(value) {
+  let n = value >>> 0;
+  const out = [];
+  do {
+    let byte = n & 0x7f;
+    n >>>= 7;
+    if (n !== 0) {
+      byte |= 0x80;
+    }
+    out.push(byte);
+  } while (n !== 0);
+  return out;
+}
+
+function encodeWasmCustomSection(name, payloadBytes) {
+  const nameBytes = utf8Encoder.encode(name);
+  const nameLenLeb = encodeWasmUleb128(nameBytes.byteLength);
+  const payload =
+    payloadBytes instanceof Uint8Array
+      ? payloadBytes
+      : payloadBytes instanceof ArrayBuffer
+        ? new Uint8Array(payloadBytes)
+        : new Uint8Array(0);
+  const bodyLen = nameLenLeb.length + nameBytes.byteLength + payload.byteLength;
+  const bodyLenLeb = encodeWasmUleb128(bodyLen);
+  const section = new Uint8Array(1 + bodyLenLeb.length + bodyLen);
+  let offset = 0;
+  section[offset] = 0x00;
+  offset += 1;
+  section.set(bodyLenLeb, offset);
+  offset += bodyLenLeb.length;
+  section.set(nameLenLeb, offset);
+  offset += nameLenLeb.length;
+  section.set(nameBytes, offset);
+  offset += nameBytes.byteLength;
+  if (payload.byteLength > 0) {
+    section.set(payload, offset);
+  }
+  return section;
+}
+
+/**
+ * Build a minimal (~100-byte) valid WebAssembly binary carrying the compiled module's exact
+ * `dylink.0` / `dylink` custom section(s) plus a tiny `pg6.shared.ref` marker.
+ *
+ * Emscripten's `loadDynamicLibrary` fetches side modules via `fetch(url).then(r => r.arrayBuffer())`,
+ * parses `dylink.0`, and then calls `WebAssembly.compile` / `new WebAssembly.Module` /
+ * `WebAssembly.instantiate`. Returning this ~100-byte stub instead of re-fetching a ~908 MB
+ * `guest_part_0.wasm` prevents `RangeError: Array buffer allocation failed` when pthreads spawn
+ * late in a long session (#663, #1077).
+ */
+function buildSharedWasmModuleDylinkStub(wasmModule, moduleKey, wasmNs) {
+  const sections = [];
+  const ModuleCtor =
+    (wasmNs && typeof wasmNs.Module === 'function' ? wasmNs.Module : null) ||
+    (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Module === 'function'
+      ? WebAssembly.Module
+      : null);
+  if (ModuleCtor && typeof ModuleCtor.customSections === 'function' && wasmModule) {
+    const dylinkNames = ['dylink.0', 'dylink'];
+    for (let i = 0; i < dylinkNames.length; i += 1) {
+      const secName = dylinkNames[i];
+      try {
+        const found = ModuleCtor.customSections(wasmModule, secName);
+        if (Array.isArray(found)) {
+          for (let j = 0; j < found.length; j += 1) {
+            if (found[j] && typeof found[j].byteLength === 'number') {
+              sections.push(encodeWasmCustomSection(secName, new Uint8Array(found[j])));
+            }
+          }
+        }
+      } catch {
+        // Mock WebAssembly.Module instances may not support customSections(); continue with stub.
+      }
+    }
+  }
+  const cleanKey = typeof moduleKey === 'string' ? moduleKey.trim().toLowerCase() : '';
+  if (cleanKey) {
+    sections.push(
+      encodeWasmCustomSection(SHARED_WASM_STUB_CUSTOM_SECTION_NAME, utf8Encoder.encode(cleanKey)),
+    );
+  }
+  let totalBytes = 8;
+  for (let i = 0; i < sections.length; i += 1) {
+    totalBytes += sections[i].byteLength;
+  }
+  const stub = new Uint8Array(totalBytes);
+  // WebAssembly magic (`\0asm`) + version 1
+  stub[0] = 0x00;
+  stub[1] = 0x61;
+  stub[2] = 0x73;
+  stub[3] = 0x6d;
+  stub[4] = 0x01;
+  stub[5] = 0x00;
+  stub[6] = 0x00;
+  stub[7] = 0x00;
+  let cursor = 8;
+  for (let i = 0; i < sections.length; i += 1) {
+    stub.set(sections[i], cursor);
+    cursor += sections[i].byteLength;
+  }
+  return stub;
+}
+
+function extractSharedWasmStubKey(bytesOrBuf) {
+  let view = null;
+  if (bytesOrBuf instanceof Uint8Array) {
+    view = bytesOrBuf;
+  } else if (isTransferableArrayBuffer(bytesOrBuf) || isSharedArrayBuffer(bytesOrBuf)) {
+    view = new Uint8Array(bytesOrBuf);
+  } else if (ArrayBuffer.isView(bytesOrBuf)) {
+    view = new Uint8Array(bytesOrBuf.buffer, bytesOrBuf.byteOffset, bytesOrBuf.byteLength);
+  }
+  if (!view || view.byteLength < 10 || view.byteLength > SHARED_WASM_STUB_MAX_BYTES) {
+    return null;
+  }
+  if (
+    view[0] !== 0x00 ||
+    view[1] !== 0x61 ||
+    view[2] !== 0x73 ||
+    view[3] !== 0x6d ||
+    view[4] !== 0x01 ||
+    view[5] !== 0x00 ||
+    view[6] !== 0x00 ||
+    view[7] !== 0x00
+  ) {
+    return null;
+  }
+  const len = view.byteLength;
+  let offset = 8;
+  const readUleb128 = () => {
+    let result = 0;
+    let shift = 0;
+    while (offset < len && shift <= 28) {
+      const b = view[offset];
+      offset += 1;
+      result |= (b & 0x7f) << shift;
+      if ((b & 0x80) === 0) {
+        return result >>> 0;
+      }
+      shift += 7;
+    }
+    return -1;
+  };
+  while (offset < len) {
+    const secId = view[offset];
+    offset += 1;
+    const secSize = readUleb128();
+    if (secSize < 0 || offset + secSize > len) {
+      return null;
+    }
+    const secEnd = offset + secSize;
+    if (secId === 0x00) {
+      const nameLen = readUleb128();
+      if (nameLen >= 0 && offset + nameLen <= secEnd) {
+        const name = utf8Decoder.decode(view.subarray(offset, offset + nameLen));
+        offset += nameLen;
+        if (name === SHARED_WASM_STUB_CUSTOM_SECTION_NAME) {
+          return utf8Decoder.decode(view.subarray(offset, secEnd)) || null;
+        }
+      }
+    }
+    offset = secEnd;
+  }
+  return null;
+}
+
+function extractFetchRequestUrl(input) {
+  if (typeof input === 'string') {
+    return input;
+  }
+  if (input && typeof input === 'object') {
+    if (typeof input.url === 'string') {
+      return input.url;
+    }
+    if (typeof input.href === 'string') {
+      return input.href;
+    }
+  }
+  return '';
+}
+
+function extractFetchRequestMethod(input, init) {
+  if (init && typeof init === 'object' && typeof init.method === 'string') {
+    return init.method.trim().toUpperCase();
+  }
+  if (input && typeof input === 'object' && typeof input.method === 'string') {
+    return input.method.trim().toUpperCase();
+  }
+  return 'GET';
+}
+
+function createSharedWasmStubResponse(url, stubBytes, cachedMod, stubBufferToModule, ResponseCtor) {
+  const makeTaggedCopy = () => {
+    const copy = stubBytes.slice();
+    stubBufferToModule.set(copy.buffer, cachedMod);
+    return copy;
+  };
+  const contentLength = String(stubBytes.byteLength);
+  if (typeof ResponseCtor === 'function') {
+    try {
+      const resp = new ResponseCtor(stubBytes, {
+        status: 200,
+        headers: {
+          'content-type': 'application/wasm',
+          'content-length': contentLength,
+        },
+      });
+      try {
+        Object.defineProperty(resp, 'url', { value: url, configurable: true });
+      } catch {
+        // Ignore if Response.url is non-configurable in a custom harness.
+      }
+      resp.arrayBuffer = () => Promise.resolve(makeTaggedCopy().buffer);
+      resp.bytes = () => Promise.resolve(makeTaggedCopy());
+      return resp;
+    } catch {
+      // Fall back to lightweight Response-like stub below.
+    }
+  }
+  const headerMap = new Map([
+    ['content-type', 'application/wasm'],
+    ['content-length', contentLength],
+  ]);
+  return {
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    url,
+    bodyUsed: false,
+    headers: {
+      get(name) {
+        return headerMap.get(String(name || '').toLowerCase()) || null;
+      },
+      has(name) {
+        return headerMap.has(String(name || '').toLowerCase());
+      },
+    },
+    arrayBuffer() {
+      this.bodyUsed = true;
+      return Promise.resolve(makeTaggedCopy().buffer);
+    },
+    bytes() {
+      this.bodyUsed = true;
+      return Promise.resolve(makeTaggedCopy());
+    },
+    body: {
+      cancel() {
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+/**
+ * Install a lightweight `fetch` + `WebAssembly.{compile,Module,instantiate,compileStreaming,
+ * instantiateStreaming}` shim on `globalScope` so precompiled side modules (`guest_part_*.wasm`)
+ * never re-fetch or allocate 908 MB `ArrayBuffer`s in the coordinator or dynamically spawned
+ * Emscripten pthread workers (#663, #1077).
+ */
+function installSharedWasmModuleShim(globalScope, options = {}) {
+  const safeOpts = options && typeof options === 'object' ? options : {};
+  const resolveSharedModule =
+    typeof safeOpts.resolveSharedModule === 'function' ? safeOpts.resolveSharedModule : null;
+  const onModuleCompiled =
+    typeof safeOpts.onModuleCompiled === 'function' ? safeOpts.onModuleCompiled : null;
+  if (!globalScope || (!resolveSharedModule && !onModuleCompiled)) {
+    return function noopRestore() {};
+  }
+
+  const fetchScope = safeOpts.fetchScope || globalScope;
+  const wasmNs =
+    safeOpts.wasmNs ||
+    (globalScope.WebAssembly && typeof globalScope.WebAssembly === 'object'
+      ? globalScope.WebAssembly
+      : null);
+  const ResponseCtor =
+    (fetchScope && typeof fetchScope.Response === 'function' ? fetchScope.Response : null) ||
+    (typeof Response === 'function' ? Response : null);
+  const OriginalFetch =
+    fetchScope && typeof fetchScope.fetch === 'function' ? fetchScope.fetch : null;
+  const OriginalModule =
+    wasmNs && typeof wasmNs.Module === 'function' ? wasmNs.Module : null;
+  const OriginalCompile =
+    wasmNs && typeof wasmNs.compile === 'function' ? wasmNs.compile : null;
+  const OriginalInstantiate =
+    wasmNs && typeof wasmNs.instantiate === 'function' ? wasmNs.instantiate : null;
+  const OriginalCompileStreaming =
+    wasmNs && typeof wasmNs.compileStreaming === 'function' ? wasmNs.compileStreaming : null;
+  const OriginalInstantiateStreaming =
+    wasmNs && typeof wasmNs.instantiateStreaming === 'function'
+      ? wasmNs.instantiateStreaming
+      : null;
+  const OriginalInstance =
+    wasmNs && typeof wasmNs.Instance === 'function' ? wasmNs.Instance : null;
+
+  const stubBufferToModule = new WeakMap();
+  const stubBytesByModule = new WeakMap();
+
+  const cancelResponseBodyQuietly = (resp) => {
+    try {
+      if (resp && resp.body && typeof resp.body.cancel === 'function' && !resp.bodyUsed) {
+        const p = resp.body.cancel();
+        if (p && typeof p.catch === 'function') {
+          p.catch(() => {});
+        }
+      }
+    } catch {
+      // Ignore body cancel errors on mock or already-consumed Response objects.
+    }
+  };
+
+  const getOrBuildStubBytes = (cachedMod, rawUrl) => {
+    let stub = stubBytesByModule.get(cachedMod);
+    if (!stub) {
+      const key = extractWasmBasename(rawUrl) || rawUrl;
+      stub = buildSharedWasmModuleDylinkStub(cachedMod, key, { Module: OriginalModule });
+      stubBytesByModule.set(cachedMod, stub);
+    }
+    return stub;
+  };
+
+  const resolveCachedModuleFromBytes = (source) => {
+    if (!source || typeof source !== 'object') {
+      return null;
+    }
+    if (isCompiledWasmModule(source, { Module: OriginalModule })) {
+      return null;
+    }
+    const backing = ArrayBuffer.isView(source) ? source.buffer : source;
+    if (backing && typeof backing === 'object') {
+      const direct = stubBufferToModule.get(backing);
+      if (direct && isCompiledWasmModule(direct, { Module: OriginalModule })) {
+        return direct;
+      }
+    }
+    if (resolveSharedModule) {
+      const stubKey = extractSharedWasmStubKey(source);
+      if (stubKey) {
+        const matched = resolveSharedModule(stubKey);
+        if (isCompiledWasmModule(matched, { Module: OriginalModule })) {
+          return matched;
+        }
+      }
+    }
+    return null;
+  };
+
+  let WrappedFetch = null;
+  if (OriginalFetch && resolveSharedModule) {
+    WrappedFetch = function wrappedSharedWasmFetch(input, init) {
+      const method = extractFetchRequestMethod(input, init);
+      if (method === 'GET') {
+        const rawUrl = extractFetchRequestUrl(input);
+        if (rawUrl) {
+          const cachedMod = resolveSharedModule(rawUrl);
+          if (isCompiledWasmModule(cachedMod, { Module: OriginalModule })) {
+            const stubBytes = getOrBuildStubBytes(cachedMod, rawUrl);
+            return Promise.resolve(
+              createSharedWasmStubResponse(
+                rawUrl,
+                stubBytes,
+                cachedMod,
+                stubBufferToModule,
+                ResponseCtor,
+              ),
+            );
+          }
+        }
+      }
+      return OriginalFetch.apply(this || fetchScope, arguments);
+    };
+    try {
+      fetchScope.fetch = WrappedFetch;
+    } catch {
+      WrappedFetch = null;
+    }
+  }
+
+  let WrappedModule = null;
+  if (OriginalModule && resolveSharedModule) {
+    WrappedModule = new Proxy(OriginalModule, {
+      construct(target, args, newTarget) {
+        if (args.length >= 1) {
+          const cachedMod = resolveCachedModuleFromBytes(args[0]);
+          if (cachedMod) {
+            return cachedMod;
+          }
+        }
+        const targetNew = newTarget === WrappedModule ? target : newTarget;
+        return Reflect.construct(target, args, targetNew);
+      },
+    });
+    try {
+      wasmNs.Module = WrappedModule;
+    } catch {
+      WrappedModule = null;
+    }
+  }
+
+  let WrappedCompile = null;
+  if (OriginalCompile && resolveSharedModule) {
+    WrappedCompile = function wrappedSharedWasmCompile(bytes) {
+      const cachedMod = resolveCachedModuleFromBytes(bytes);
+      if (cachedMod) {
+        return Promise.resolve(cachedMod);
+      }
+      return OriginalCompile.apply(wasmNs, arguments);
+    };
+    try {
+      wasmNs.compile = WrappedCompile;
+    } catch {
+      WrappedCompile = null;
+    }
+  }
+
+  let WrappedInstantiate = null;
+  if (OriginalInstantiate && resolveSharedModule && safeOpts.wrapInstantiate !== false) {
+    WrappedInstantiate = function wrappedSharedWasmInstantiate(moduleOrBytes, imports) {
+      const cachedMod = resolveCachedModuleFromBytes(moduleOrBytes);
+      if (cachedMod) {
+        const instPromise =
+          arguments.length >= 2
+            ? OriginalInstantiate.call(wasmNs, cachedMod, imports)
+            : OriginalInstantiate.call(wasmNs, cachedMod);
+        return Promise.resolve(instPromise).then((instance) => ({ instance, module: cachedMod }));
+      }
+      return OriginalInstantiate.apply(wasmNs, arguments);
+    };
+    try {
+      wasmNs.instantiate = WrappedInstantiate;
+    } catch {
+      WrappedInstantiate = null;
+    }
+  }
+
+  let WrappedCompileStreaming = null;
+  if (OriginalCompileStreaming && (resolveSharedModule || onModuleCompiled)) {
+    WrappedCompileStreaming = function wrappedSharedWasmCompileStreaming(source) {
+      return Promise.resolve(source).then((resp) => {
+        const respUrl = resp && typeof resp.url === 'string' ? resp.url : '';
+        if (respUrl && resolveSharedModule) {
+          const cachedMod = resolveSharedModule(respUrl);
+          if (isCompiledWasmModule(cachedMod, { Module: OriginalModule })) {
+            cancelResponseBodyQuietly(resp);
+            return cachedMod;
+          }
+        }
+        return OriginalCompileStreaming.call(wasmNs, Promise.resolve(resp)).then((compiledMod) => {
+          if (respUrl && onModuleCompiled && isCompiledWasmModule(compiledMod, { Module: OriginalModule })) {
+            try {
+              onModuleCompiled(respUrl, compiledMod);
+            } catch {
+              // Capture hook failures must never break compilation.
+            }
+          }
+          return compiledMod;
+        });
+      });
+    };
+    try {
+      wasmNs.compileStreaming = WrappedCompileStreaming;
+    } catch {
+      WrappedCompileStreaming = null;
+    }
+  }
+
+  let WrappedInstantiateStreaming = null;
+  if (
+    OriginalInstantiateStreaming &&
+    (resolveSharedModule || onModuleCompiled) &&
+    safeOpts.wrapInstantiateStreaming !== false
+  ) {
+    WrappedInstantiateStreaming = function wrappedSharedWasmInstantiateStreaming(source, imports) {
+      return Promise.resolve(source).then((resp) => {
+        const respUrl = resp && typeof resp.url === 'string' ? resp.url : '';
+        if (respUrl && resolveSharedModule) {
+          const cachedMod = resolveSharedModule(respUrl);
+          if (isCompiledWasmModule(cachedMod, { Module: OriginalModule })) {
+            cancelResponseBodyQuietly(resp);
+            if (OriginalInstantiate) {
+              return OriginalInstantiate.call(wasmNs, cachedMod, imports).then((instance) => ({
+                instance,
+                module: cachedMod,
+              }));
+            }
+            if (OriginalInstance) {
+              return { instance: new OriginalInstance(cachedMod, imports), module: cachedMod };
+            }
+          }
+        }
+        return OriginalInstantiateStreaming.call(wasmNs, Promise.resolve(resp), imports).then(
+          (instantiated) => {
+            const compiledMod = instantiated && instantiated.module ? instantiated.module : null;
+            if (
+              respUrl &&
+              onModuleCompiled &&
+              isCompiledWasmModule(compiledMod, { Module: OriginalModule })
+            ) {
+              try {
+                onModuleCompiled(respUrl, compiledMod);
+              } catch {
+                // Capture hook failures must never break instantiation.
+              }
+            }
+            return instantiated;
+          },
+        );
+      });
+    };
+    try {
+      wasmNs.instantiateStreaming = WrappedInstantiateStreaming;
+    } catch {
+      WrappedInstantiateStreaming = null;
+    }
+  }
+
+  let restored = false;
+  const restore = function restoreSharedWasmModuleShim() {
+    if (restored) {
+      return;
+    }
+    restored = true;
+    if (WrappedFetch && fetchScope && fetchScope.fetch === WrappedFetch) {
+      try {
+        fetchScope.fetch = OriginalFetch;
+      } catch {
+        // Ignore restore failures on frozen scopes.
+      }
+    }
+    if (wasmNs) {
+      if (WrappedModule && wasmNs.Module === WrappedModule) {
+        wasmNs.Module = OriginalModule;
+      }
+      if (WrappedCompile && wasmNs.compile === WrappedCompile) {
+        wasmNs.compile = OriginalCompile;
+      }
+      if (WrappedInstantiate && wasmNs.instantiate === WrappedInstantiate) {
+        wasmNs.instantiate = OriginalInstantiate;
+      }
+      if (WrappedCompileStreaming && wasmNs.compileStreaming === WrappedCompileStreaming) {
+        wasmNs.compileStreaming = OriginalCompileStreaming;
+      }
+      if (
+        WrappedInstantiateStreaming &&
+        wasmNs.instantiateStreaming === WrappedInstantiateStreaming
+      ) {
+        wasmNs.instantiateStreaming = OriginalInstantiateStreaming;
+      }
+    }
+  };
+  restore.resolveCachedModuleFromBytes = resolveCachedModuleFromBytes;
+  return restore;
+}
+
 /**
  * Wrap `globalScope.WebAssembly.Instance` (and `WebAssembly.instantiate` when present) so that
  * inside an Emscripten `em-pthread` worker, both the main module and `SIDE_MODULE=1` side modules
@@ -2931,6 +3493,9 @@ function patchPthreadWasmImports(wasmModuleOrBytes, rawImports, wasmNs, hostImpo
  * preserving `GOT.mem`, `GOT.func`, `env.__memory_base`, `env.__table_base`,
  * `env.__indirect_function_table`, dynamic-linking Proxies, non-stub functions, and
  * `WebAssembly.Instance.prototype` / `instanceof`.
+ * Also intercepts `fetch`, `WebAssembly.compile`, `WebAssembly.Module`, `WebAssembly.instantiate`,
+ * `WebAssembly.compileStreaming`, and `WebAssembly.instantiateStreaming` for precompiled shared
+ * side modules so dynamically spawned pthreads never re-fetch or allocate 908 MB `ArrayBuffer`s.
  * Returns an idempotent restore function.
  */
 function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}) {
@@ -2946,20 +3511,35 @@ function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}
   const OriginalInstance = wasmNs.Instance;
   const OriginalInstantiate =
     typeof wasmNs.instantiate === 'function' ? wasmNs.instantiate : null;
-  const OriginalCompileStreaming =
-    typeof wasmNs.compileStreaming === 'function' ? wasmNs.compileStreaming : null;
   const OriginalInstantiateStreaming =
     typeof wasmNs.instantiateStreaming === 'function' ? wasmNs.instantiateStreaming : null;
   const resolveSharedModule =
     shimOptions && typeof shimOptions.resolveSharedModule === 'function'
       ? shimOptions.resolveSharedModule
       : null;
+  const fetchScope =
+    shimOptions && shimOptions.fetchScope ? shimOptions.fetchScope : globalScope;
   const hostEnv =
     hostImports && typeof hostImports === 'object'
       ? hostImports.env && typeof hostImports.env === 'object'
         ? hostImports.env
         : hostImports
       : null;
+
+  // Install shared side-module fetch + compile + Module + compileStreaming interceptor first.
+  const restoreSharedShim = resolveSharedModule
+    ? installSharedWasmModuleShim(globalScope, {
+        fetchScope,
+        wasmNs,
+        resolveSharedModule,
+        wrapInstantiate: false,
+        wrapInstantiateStreaming: false,
+      })
+    : null;
+  const resolveCachedModuleFromBytes =
+    restoreSharedShim && typeof restoreSharedShim.resolveCachedModuleFromBytes === 'function'
+      ? restoreSharedShim.resolveCachedModuleFromBytes
+      : () => null;
 
   const cancelResponseBodyQuietly = (resp) => {
     try {
@@ -3014,6 +3594,21 @@ function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}
   let WrappedInstantiate = null;
   if (OriginalInstantiate) {
     WrappedInstantiate = function wrappedWasmInstantiate(moduleOrBytes, imports) {
+      const cachedMod = resolveCachedModuleFromBytes(moduleOrBytes);
+      if (cachedMod) {
+        const patchedImports =
+          imports && typeof imports === 'object'
+            ? patchPthreadWasmImports(cachedMod, imports, wasmNs, hostImports, hostEnv)
+            : imports;
+        const res =
+          arguments.length >= 2
+            ? OriginalInstantiate.call(wasmNs, cachedMod, patchedImports)
+            : OriginalInstantiate.call(wasmNs, cachedMod);
+        return Promise.resolve(res).then((instance) => {
+          bindExportedMemoryIfNeeded(imports, instance);
+          return { instance, module: cachedMod };
+        });
+      }
       const patchedImports =
         imports && typeof imports === 'object'
           ? patchPthreadWasmImports(moduleOrBytes, imports, wasmNs, hostImports, hostEnv)
@@ -3033,24 +3628,6 @@ function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}
       return res;
     };
     wasmNs.instantiate = WrappedInstantiate;
-  }
-
-  let WrappedCompileStreaming = null;
-  if (OriginalCompileStreaming && resolveSharedModule) {
-    WrappedCompileStreaming = function wrappedWasmCompileStreaming(source) {
-      return Promise.resolve(source).then((resp) => {
-        const respUrl = resp && typeof resp.url === 'string' ? resp.url : '';
-        if (respUrl) {
-          const cachedMod = resolveSharedModule(respUrl);
-          if (isCompiledWasmModule(cachedMod, wasmNs)) {
-            cancelResponseBodyQuietly(resp);
-            return cachedMod;
-          }
-        }
-        return OriginalCompileStreaming.call(wasmNs, Promise.resolve(resp));
-      });
-    };
-    wasmNs.compileStreaming = WrappedCompileStreaming;
   }
 
   let WrappedInstantiateStreaming = null;
@@ -3106,11 +3683,11 @@ function installPthreadHostImportShim(globalScope, hostImports, shimOptions = {}
     if (OriginalInstantiate && wasmNs.instantiate === WrappedInstantiate) {
       wasmNs.instantiate = OriginalInstantiate;
     }
-    if (OriginalCompileStreaming && wasmNs.compileStreaming === WrappedCompileStreaming) {
-      wasmNs.compileStreaming = OriginalCompileStreaming;
-    }
     if (OriginalInstantiateStreaming && wasmNs.instantiateStreaming === WrappedInstantiateStreaming) {
       wasmNs.instantiateStreaming = OriginalInstantiateStreaming;
+    }
+    if (restoreSharedShim) {
+      restoreSharedShim();
     }
   };
 }
@@ -3607,6 +4184,7 @@ function bootstrapEmscriptenPthreadWorker(options = {}) {
     return hit;
   };
   const restoreWasmInstance = installPthreadHostImportShim(wasmTargetScope, hostImports, {
+    fetchScope: scope,
     resolveSharedModule: resolvePthreadSharedModule,
   });
 
@@ -10645,6 +11223,19 @@ let activeSideModuleProgressGetter = null;
 let pendingPreloadedWasmBinary = null;
 let pendingPreloadedGuestBuffers = null;
 const coordinatorSharedWasmModules = createSharedWasmModuleCache({ trackGlobalCount: true });
+let activeCoordinatorSharedModuleShimRestore = null;
+
+function restoreCoordinatorSharedModuleShim() {
+  const restore = activeCoordinatorSharedModuleShimRestore;
+  activeCoordinatorSharedModuleShimRestore = null;
+  if (typeof restore === 'function') {
+    try {
+      restore();
+    } catch {
+      // Ignore shim teardown errors.
+    }
+  }
+}
 
 function attachActiveCoordinatorGuestMemory(modOverride) {
   if (
@@ -10760,6 +11351,7 @@ function resetGpuPresentBackpressure(options = {}) {
   const safeOpts = options && typeof options === 'object' ? options : {};
   _inFlightGpuPresents = 0;
   _lastGpuPresentProgressAtMs = 0;
+  pendingRecycleTxPorts.length = 0;
   if (_pendingCoalescedPresent) {
     recycleAbandonedCmdBufferToPort(_pendingCoalescedPresent);
     _pendingCoalescedPresent = null;
@@ -10810,7 +11402,15 @@ function flushPendingCoalescedPresent() {
     _lastGpuPresentProgressAtMs = Date.now();
   }
   _inFlightGpuPresents += 1;
-  gpuWorker.postMessage(gpuMsg, [entry.transferBuf]);
+  try {
+    gpuWorker.postMessage(gpuMsg, [entry.transferBuf]);
+  } catch (err) {
+    _inFlightGpuPresents = Math.max(0, _inFlightGpuPresents - 1);
+    if (entry.wantRecycle && pendingRecycleTxPorts.length > 0) {
+      pendingRecycleTxPorts.pop();
+    }
+    throw err;
+  }
   return true;
 }
 
@@ -10957,7 +11557,17 @@ function handlePthreadWgpuSubmit(data, options = {}) {
       }
       _inFlightGpuPresents += 1;
     }
-    gpuWorker.postMessage(gpuMsg, [transferBuf]);
+    try {
+      gpuWorker.postMessage(gpuMsg, [transferBuf]);
+    } catch (err) {
+      if (batchInfo.hasPresent) {
+        _inFlightGpuPresents = Math.max(0, _inFlightGpuPresents - 1);
+      }
+      if (wantRecycle && pendingRecycleTxPorts.length > 0) {
+        pendingRecycleTxPorts.pop();
+      }
+      throw err;
+    }
     return true;
   }
   return false;
@@ -11236,6 +11846,75 @@ async function tryBootWasmRuntime() {
         }
       }
 
+      // Precompile split-module side modules (`guest_part_*.wasm`) ONCE via WebAssembly.compileStreaming
+      // so neither the coordinator nor any dynamically spawned pthread worker ever allocates a
+      // ~908 MB `ArrayBuffer` during `loadDynamicLibrary` (#663, #1077).
+      const candidateSideModules = [];
+      const seenSideKeys = new Set();
+      const collectSideModule = (rawEntry) => {
+        const entryUrl = extractSideModuleEntryUrl(rawEntry);
+        if (!entryUrl) {
+          return;
+        }
+        const key = (extractWasmBasename(entryUrl) || entryUrl).toLowerCase();
+        if (!key || seenSideKeys.has(key) || coordinatorSharedWasmModules.hasModule(key)) {
+          return;
+        }
+        seenSideKeys.add(key);
+        candidateSideModules.push(entryUrl);
+      };
+      if (Array.isArray(configuredDynamicLibraries)) {
+        for (let i = 0; i < configuredDynamicLibraries.length; i += 1) {
+          collectSideModule(configuredDynamicLibraries[i]);
+        }
+      }
+      if (Array.isArray(configuredSideModuleUrls)) {
+        for (let i = 0; i < configuredSideModuleUrls.length; i += 1) {
+          collectSideModule(configuredSideModuleUrls[i]);
+        }
+      }
+      if (manifestSummary && Array.isArray(manifestSummary.sideModules)) {
+        for (let i = 0; i < manifestSummary.sideModules.length; i += 1) {
+          collectSideModule(manifestSummary.sideModules[i]);
+        }
+      }
+
+      const resolvedRuntimeUrlForSide = resolveRuntimeScriptUrl(
+        manifestSummary && manifestSummary.runtimeScriptUrl
+          ? resolveSideModuleUrl(manifestSummary.runtimeScriptUrl, DEFAULT_RUNTIME_SCRIPT_RELATIVE)
+          : undefined,
+        self.location && typeof self.location.href === 'string' ? self.location.href : '',
+      );
+      if (
+        candidateSideModules.length > 0 &&
+        typeof fetch === 'function' &&
+        typeof WebAssembly !== 'undefined' &&
+        typeof WebAssembly.compile === 'function'
+      ) {
+        try {
+          await coordinatorSharedWasmModules.precompileSideModules(candidateSideModules, {
+            fetchFn: fetch,
+            reportFn: report,
+            resolveUrl: (u) => resolveSideModuleUrl(u, resolvedRuntimeUrlForSide),
+          });
+        } catch (precompileErr) {
+          report(
+            `side-module streaming precompile skipped (falling back to Emscripten loader): ${precompileErr}`,
+          );
+        }
+      }
+
+      restoreCoordinatorSharedModuleShim();
+      activeCoordinatorSharedModuleShimRestore = installSharedWasmModuleShim(self, {
+        resolveSharedModule: (urlOrName) => coordinatorSharedWasmModules.getModule(urlOrName),
+        onModuleCompiled: (urlOrName, compiledMod) => {
+          const base = extractWasmBasename(urlOrName);
+          if (base && GUEST_SIDE_MODULE_BASENAME_RE.test(base)) {
+            coordinatorSharedWasmModules.setModule(base, compiledMod);
+          }
+        },
+      });
+
       const runtimeOptions = {
         onFirstPresent: () => {
           coordinatorFirstPresentEmitted = true;
@@ -11245,6 +11924,7 @@ async function tryBootWasmRuntime() {
           if (relaunch) {
             postProgress(relaunch);
           }
+          restoreCoordinatorSharedModuleShim();
           coordinatorPthreadPool.closeTxPorts();
           coordinatorSharedWasmModules.clear();
           coordinatorAudioBridge.clearPending();
@@ -11270,6 +11950,7 @@ async function tryBootWasmRuntime() {
               // Ignore dump flush errors during abort teardown.
             }
           }
+          restoreCoordinatorSharedModuleShim();
           coordinatorPthreadPool.closeTxPorts();
           coordinatorSharedWasmModules.clear();
           coordinatorAudioBridge.clearPending();
@@ -11377,6 +12058,7 @@ async function tryBootWasmRuntime() {
       }
     }
   } catch (err) {
+    restoreCoordinatorSharedModuleShim();
     // W371 (#1077): Release any unconsumed preloaded wire bytes on boot failure so nothing leaks.
     if (pendingPreloadedWasmBinary) {
       const binInfo = getBinaryWireInfo(pendingPreloadedWasmBinary);
@@ -11619,6 +12301,7 @@ if (typeof self !== 'undefined') {
         return;
       }
       if (msg.type === 'teardown' || msg.type === 'destroy') {
+        restoreCoordinatorSharedModuleShim();
         resetGpuPresentBackpressure({ resetCounters: true });
         if (activeCoordinatorPipelineDumpSyncer) {
           try {
@@ -11669,6 +12352,7 @@ if (typeof self !== 'undefined') {
       return;
     }
     resetLastFaultRecord();
+    restoreCoordinatorSharedModuleShim();
     resetGpuPresentBackpressure({
       resetCounters: true,
       maxInFlightPresents:
@@ -11984,6 +12668,9 @@ const exportedApi = {
   normalizeHttpfsMailboxLanes,
   allocateHttpfsMailboxPool,
   createPatchedPthreadEnv,
+  buildSharedWasmModuleDylinkStub,
+  extractSharedWasmStubKey,
+  installSharedWasmModuleShim,
   installPthreadHostImportShim,
   bootstrapEmscriptenPthreadWorker,
   createPthreadPoolCoordinator,
