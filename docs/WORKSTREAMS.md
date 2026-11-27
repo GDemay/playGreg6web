@@ -314,6 +314,8 @@ Work is split into **5 independent tracks** so many contributors (and AI agents)
 
 ---
 
+- [ ] **Web performance #2069 — Direct unaligned video-plane uploads** — `IN PROGRESS` (#2069, @GDemay) *(4K Y/Cr/Cb production packets; no game files)*
+
 ## Track 5: Browser Shell, Streaming I/O & Audio (`web/`, `server/`, `tools/`, JS + Python + Rust)
 **Goal:** Fast, resilient browser loading, streaming, caching, and audio playback.
 

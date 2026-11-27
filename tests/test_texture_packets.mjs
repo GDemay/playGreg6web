@@ -1253,227 +1253,36 @@ test('W108 (#734): destroying or recreating a fallback texture ID clears fallbac
   assert.equal(handler.stats.bc3dFallbackUploadsSkipped, 0);
 });
 
-test('W164 (#871): 4K Bink2 3840x2160 r8unorm Y plane takes zero-copy direct queue.writeTexture path even with stagingPool', () => {
+test('4K Bink2 chroma keeps 1920-byte pitches and bypasses padding/staging', () => {
   const gpu = createMockWebGpu({ strictWebGpu: true });
   const stagingPool = new GpuStagingPool({ device: gpu.device, chunkSize: 4 * 1024 * 1024 });
   const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
   const handler = tp.installTexturePackets(processor);
-
-  const W = 3840;
-  const H = 2160;
-  assert.equal(W % 256, 0);
-
-  // Create 4K r8unorm (format code 1) Y plane texture.
-  processor.executeCommandBuffer(
-    createTexture2Packet({ id: 300, width: W, height: H, usage: 0x06, format: 1 })
+  for (const id of [310, 311]) processor.executeCommandBuffer(
+    createTexture2Packet({ id, width: 1920, height: 1080, usage: 0x06, format: 1 })
   );
-  assert.equal(processor.textures.get(300).desc.format, 'r8unorm');
-  assert.equal(processor.textures.get(300).desc.viewFormats, undefined);
-
-  const yBytes = new Uint8Array(W * H);
-  yBytes[0] = 0x11;
-  yBytes[W - 1] = 0x22;
-  yBytes[(H - 1) * W] = 0x33;
-  yBytes[W * H - 1] = 0x44;
-
-  const pkt = writeTexturePacket({
-    textureId: 300,
-    width: W,
-    height: H,
-    bytesPerRow: W,
-    rowsPerImage: H,
-    data: yBytes,
-    useSab: false,
-  });
-
-  processor.executeCommandBuffer(pkt);
-
-  // Must go directly to queue.writeTexture with the exact command packet ArrayBuffer (zero-copy).
-  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
-  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
-  assert.equal(wtCalls.length, 1);
-  assert.equal(c2tCalls.length, 0);
-  assert.equal(wtCalls[0].bufferRef, pkt.buffer, '3840x2160 aligned r8unorm upload must be zero-copy');
-  assert.equal(wtCalls[0].byteOffset, 8 + 48);
-  assert.equal(wtCalls[0].byteLength, W * H);
-  assert.equal(wtCalls[0].dataLayout.bytesPerRow, W);
-  assert.equal(wtCalls[0].dataLayout.rowsPerImage, H);
-  assert.equal(wtCalls[0].bytes[0], 0x11);
-  assert.equal(wtCalls[0].bytes[W - 1], 0x22);
-  assert.equal(wtCalls[0].bytes[(H - 1) * W], 0x33);
-  assert.equal(wtCalls[0].bytes[W * H - 1], 0x44);
-
-  // No staging buffer chunks allocated and no scratch buffer touched.
-  assert.equal(stagingPool.getStats().totalChunksAllocated, 0);
-  assert.deepEqual(handler.getStats(), {
-    created: 1,
-    errors: 0,
-    createTexture2Count: 1,
-    rowPitchRepackCount: 0,
-    sabCopyCount: 0,
-    bc3dFallbacks: 0,
-    bc3dFallbackUploadsSkipped: 0,
-    uploadCount: 1,
-    uploadsCount: 1,
-    uploadBytes: W * H,
-    uploadBytesTotal: W * H,
-    reusedDescriptorCount: 1,
-    clampedSubRegionCount: 0,
-    zeroCopyUploads: 1,
-    scratchRepackUploads: 0,
-    directZeroCopyUploads: 1,
-    repackedUploads: 0,
-    scratchBufferReuses: 0,
-    scratchBufferAllocations: 0,
-    scratchBufferBytes: 0,
-    r8unormUploads: 1,
-    bytesUploaded: W * H,
-    srgbSiblingViewFormatsAdded: 0,
-    promoted1DTo2DCount: 0,
-    chunkedWrites: 0,
-    trimmedStagingBytes: 0,
-    destroyedTextures: 0,
-  });
-});
-
-test('W164 (#871): 4K Bink2 1920x1080 r8unorm Cr/Cb planes reuse persistent scratch Uint8Array across frames and zero padding tails', () => {
-  const gpu = createMockWebGpu({ strictWebGpu: true });
-  const stagingPool = new GpuStagingPool({
-    device: gpu.device,
-    chunkSize: 4 * 1024 * 1024,
-    maxPoolBytes: 64 * 1024 * 1024,
-  });
-  const processor = new WgpuCommandProcessor(gpu.device, gpu.ctx, { stagingPool });
-  const handler = tp.installTexturePackets(processor);
-
-  const YW = 3840;
-  const YH = 2160;
-  const CW = 1920;
-  const CH = 1080;
-  const ALIGNED_CW = 2048;
-  assert.equal(tp.alignBytesPerRow256(CW), ALIGNED_CW);
-
-  // Create Y, Cr, Cb r8unorm planes.
-  processor.executeCommandBuffer(
-    createTexture2Packet({ id: 310, width: YW, height: YH, usage: 0x06, format: 1 })
-  );
-  processor.executeCommandBuffer(
-    createTexture2Packet({ id: 311, width: CW, height: CH, usage: 0x06, format: 1 })
-  );
-  processor.executeCommandBuffer(
-    createTexture2Packet({ id: 312, width: CW, height: CH, usage: 0x06, format: 1 })
-  );
-
-  const yData = new Uint8Array(YW * YH);
-  const crData = new Uint8Array(CW * CH);
-  const cbData = new Uint8Array(CW * CH);
-
-  // Simulate 3 frames at 30 FPS cadence: 3x Y (zero-copy) + 3x Cr + 3x Cb (scratch-reused repack).
-  const FRAMES = 3;
-  let firstScratchRef = null;
-  for (let frame = 0; frame < FRAMES; frame += 1) {
-    stagingPool.beginFrame(frame);
-    yData[0] = 0x10 + frame;
-    crData.fill(0xa0 + frame);
-    cbData.fill(0x50 + frame);
-    // Mark first and last active bytes of row 0 and last row.
-    crData[0] = 0xc0 + frame;
-    crData[CW - 1] = 0xd0 + frame;
-    cbData[0] = 0x60 + frame;
-    cbData[CW - 1] = 0x70 + frame;
-    cbData[(CH - 1) * CW + (CW - 1)] = 0x80 + frame;
-
-    processor.executeCommandBuffer(
-      writeTexturePacket({
-        textureId: 310,
-        width: YW,
-        height: YH,
-        bytesPerRow: YW,
-        rowsPerImage: YH,
-        data: yData,
-      })
-    );
-    processor.executeCommandBuffer(
-      writeTexturePacket({
-        textureId: 311,
-        width: CW,
-        height: CH,
-        bytesPerRow: CW,
-        rowsPerImage: CH,
-        data: crData,
-      })
-    );
-    if (frame === 0) {
-      firstScratchRef = handler._scratchBuffer;
-      assert.ok(firstScratchRef instanceof Uint8Array);
-      assert.equal(firstScratchRef.byteLength, ALIGNED_CW * CH);
-      // Poison padding tail in scratch buffer to verify next upload strictly zeroes it.
-      firstScratchRef.fill(0xff, CW, ALIGNED_CW);
+  for (let frame = 0; frame < 3; frame++) {
+    for (const id of [310, 311]) {
+      const data = new Uint8Array(1920 * 1080).fill(frame + id - 300);
+      data[data.length - 1] = 0xff - frame;
+      processor.executeCommandBuffer(writeTexturePacket({
+        textureId: id, width: 1920, height: 1080, bytesPerRow: 1920,
+        rowsPerImage: 1080, data,
+      }));
     }
-    processor.executeCommandBuffer(
-      writeTexturePacket({
-        textureId: 312,
-        width: CW,
-        height: CH,
-        bytesPerRow: CW,
-        rowsPerImage: CH,
-        data: cbData,
-      })
-    );
-    assert.equal(
-      handler._scratchBuffer,
-      firstScratchRef,
-      `Frame ${frame}: scratch Uint8Array must be reused without reallocating`
-    );
-    stagingPool.endFrame();
   }
-
-  const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
-  const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
-  assert.equal(wtCalls.length, FRAMES, 'Y plane uses direct zero-copy writeTexture each frame');
-  assert.equal(c2tCalls.length, FRAMES * 2, 'Cr + Cb planes stage repacked 2048B rows');
-
-  // Verify Cb frame 0 repacked rows have exact active pixels and strictly zeroed padding [1920..2048).
-  const cbFrame0 = c2tCalls[1];
-  assert.equal(cbFrame0.source.bytesPerRow, ALIGNED_CW);
-  assert.equal(cbFrame0.source.rowsPerImage, CH);
-  assert.equal(cbFrame0.bytes[0], 0x60);
-  assert.equal(cbFrame0.bytes[CW - 1], 0x70);
-  for (let p = CW; p < ALIGNED_CW; p += 1) {
-    assert.equal(cbFrame0.bytes[p], 0, `padding byte at offset ${p} must be zeroed`);
+  const writes = gpu.calls.filter((c) => c.op === 'writeTexture');
+  assert.equal(writes.length, 6);
+  for (let i = 0; i < writes.length; i++) {
+    assert.equal(writes[i].dataLayout.bytesPerRow, 1920);
+    assert.equal(writes[i].bytes.length, 1920 * 1080);
+    assert.equal(writes[i].bytes[0], Math.floor(i / 2) + 10 + i % 2);
+    assert.equal(writes[i].bytes.at(-1), 0xff - Math.floor(i / 2));
   }
-  assert.equal(cbFrame0.bytes[(CH - 1) * ALIGNED_CW + (CW - 1)], 0x80);
-
-  const expectedBytes = FRAMES * (YW * YH) + FRAMES * 2 * (ALIGNED_CW * CH);
-  assert.deepEqual(handler.getStats(), {
-    created: 3,
-    errors: 0,
-    createTexture2Count: 3,
-    rowPitchRepackCount: FRAMES * 2,
-    sabCopyCount: 0,
-    bc3dFallbacks: 0,
-    bc3dFallbackUploadsSkipped: 0,
-    uploadCount: FRAMES * 3,
-    uploadsCount: FRAMES * 3,
-    uploadBytes: expectedBytes,
-    uploadBytesTotal: expectedBytes,
-    reusedDescriptorCount: FRAMES * 3,
-    clampedSubRegionCount: 0,
-    zeroCopyUploads: FRAMES,
-    scratchRepackUploads: FRAMES * 2,
-    directZeroCopyUploads: FRAMES,
-    repackedUploads: FRAMES * 2,
-    scratchBufferReuses: FRAMES * 2 - 1,
-    scratchBufferAllocations: 1,
-    scratchBufferBytes: ALIGNED_CW * CH,
-    r8unormUploads: FRAMES * 3,
-    bytesUploaded: expectedBytes,
-    srgbSiblingViewFormatsAdded: 0,
-    promoted1DTo2DCount: 0,
-    chunkedWrites: 0,
-    trimmedStagingBytes: 0,
-    destroyedTextures: 0,
-  });
+  assert.equal(gpu.calls.filter((c) => c.op === 'copyBufferToTexture').length, 0);
+  assert.equal(handler.getStats().rowPitchRepackCount, 0);
+  assert.equal(handler.getStats().scratchBufferAllocations, 0);
+  assert.equal(handler.getStats().directZeroCopyUploads, 6);
 });
 
 test('W164 (#871): scratch buffer grows on demand, respects maxScratchBytes cap, and handles SAB-backed aligned uploads', () => {
@@ -1496,6 +1305,9 @@ test('W164 (#871): scratch buffer grows on demand, respects maxScratchBytes cap,
     createTexture2Packet({ id: 323, width: 256, height: 8, usage: 0x06, format: 1 }) // aligned 256x8 = 2048B SAB
   );
 
+  // Exercise the existing staging fallback on consumers without queue.writeTexture.
+  const directWrite = gpu.device.queue.writeTexture;
+  gpu.device.queue.writeTexture = undefined;
   // 1) Initial 16x4 -> repacked 256*4 = 1024 bytes (alloc #1).
   processor.executeCommandBuffer(
     writeTexturePacket({ textureId: 320, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
@@ -1524,6 +1336,8 @@ test('W164 (#871): scratch buffer grows on demand, respects maxScratchBytes cap,
   );
   assert.equal(handler.getStats().scratchBufferAllocations, 2);
   assert.equal(handler.getStats().scratchBufferBytes, 2048);
+
+  gpu.device.queue.writeTexture = directWrite;
 
   // 5) SAB-backed aligned 256x8 (2048B) -> copies out of SAB using existing 2048B scratch (reuse #2), direct writeTexture!
   const sabData = new Uint8Array(256 * 8);
@@ -1678,12 +1492,17 @@ test('W164 (#871): telemetry resets cleanly on reset(), destroy(), and processor
   processor.executeCommandBuffer(
     writeTexturePacket({ textureId: 500, width: 256, height: 4, bytesPerRow: 256, rowsPerImage: 4, data: new Uint8Array(1024) })
   );
+  // Exercise the existing staging fallback on consumers without queue.writeTexture.
+  const directWrite = gpu.device.queue.writeTexture;
+  gpu.device.queue.writeTexture = undefined;
   processor.executeCommandBuffer(
     writeTexturePacket({ textureId: 501, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
   );
   processor.executeCommandBuffer(
     writeTexturePacket({ textureId: 501, width: 16, height: 4, bytesPerRow: 16, rowsPerImage: 4, data: new Uint8Array(64) })
   );
+
+  gpu.device.queue.writeTexture = directWrite;
 
   const beforeReset = handler.getStats();
   assert.equal(beforeReset.created, 3);
@@ -1939,6 +1758,9 @@ test('W191: upload telemetry distinguishes zero-copy, scratch-repack, oversized 
   });
   processor.executeCommandBuffer(alignedPkt);
 
+  // Exercise the existing staging fallback on consumers without queue.writeTexture.
+  const directWrite = gpu.device.queue.writeTexture;
+  gpu.device.queue.writeTexture = undefined;
   // 2) Three repeated padded uploads (20x4 -> 256x4 = 1024B <= 4096B) -> 1 alloc + 2 reuses.
   let scratchRef = null;
   for (let i = 0; i < 3; i += 1) {
@@ -1975,6 +1797,8 @@ test('W191: upload telemetry distinguishes zero-copy, scratch-repack, oversized 
     })
   );
   assert.equal(handler._scratchBuffer, scratchRef, 'Oversized upload must not replace persistent scratch');
+
+  gpu.device.queue.writeTexture = directWrite;
 
   // 4) Aligned SAB upload (256x4 = 1024B) -> copies out of SAB using existing scratch (reuse #3), NOT zeroCopy.
   processor.executeCommandBuffer(
@@ -3599,8 +3423,6 @@ test('W344: 4K Bink2 SAB Y+Cr+Cb multi-frame uploads reuse a single persistent s
       stableScratchRef = handler._scratchBuffer;
       assert.ok(stableScratchRef instanceof Uint8Array);
       assert.equal(stableScratchRef.byteLength, YW * YH);
-      // Poison chroma padding zone inside the shared scratch buffer to prove strict zero-padding on reuse.
-      stableScratchRef.fill(0xee, CW, ALIGNED_CW);
     }
     processor.executeCommandBuffer(
       writeTexturePacket({
@@ -3634,18 +3456,17 @@ test('W344: 4K Bink2 SAB Y+Cr+Cb multi-frame uploads reuse a single persistent s
 
   const wtCalls = gpu.calls.filter((c) => c.op === 'writeTexture');
   const c2tCalls = gpu.calls.filter((c) => c.op === 'copyBufferToTexture');
-  assert.equal(wtCalls.length, FRAMES);
-  assert.equal(c2tCalls.length, FRAMES * 2);
+  assert.equal(wtCalls.length, FRAMES * 3);
+  assert.equal(c2tCalls.length, 0);
   assert.ok(wtCalls.every((c) => c.isSab === false), 'no SAB views may reach queue.writeTexture');
 
-  // Verify frame 0 Y plane bytes and Cr plane zero-padded tail [1920..2048).
+  // Verify tight pitches and exact active pixels for all frame-0 planes.
   assert.equal(wtCalls[0].bytes[0], 0x10);
   assert.equal(wtCalls[0].bytes[YW * YH - 1], 0x20);
-  assert.equal(c2tCalls[0].bytes[0], 0x30);
-  assert.equal(c2tCalls[0].bytes[CW - 1], 0x40);
-  for (let p = CW; p < ALIGNED_CW; p += 1) {
-    assert.equal(c2tCalls[0].bytes[p], 0, `Cr padding byte ${p} must be zeroed on reused scratch`);
-  }
+  assert.equal(wtCalls[1].dataLayout.bytesPerRow, CW);
+  assert.equal(wtCalls[1].bytes[0], 0x30);
+  assert.equal(wtCalls[1].bytes[CW - 1], 0x40);
+  assert.equal(wtCalls[2].bytes.at(-1), 0x60);
 
   const stats = handler.getStats();
   assert.equal(stats.scratchBufferAllocations, 1, 'only 1 scratch allocation across 12 SAB plane uploads');

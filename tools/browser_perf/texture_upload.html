@@ -1,0 +1,10 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Synthetic production texture upload benchmark</title>
+<p>Serve the repository with COOP/COEP headers on localhost. Run <code>await runTextureUploadBenchmark()</code> in DevTools. All pixels are synthetic.</p>
+<canvas id="canvas" width="64" height="64"></canvas>
+<pre id="result"></pre>
+<script src="../../web/workers/staging_pool.js"></script>
+<script src="../../web/workers/wgpu_worker.js"></script>
+<script src="../../web/workers/texture_packets.js"></script>
+<script src="texture_upload.js"></script>

@@ -4,11 +4,11 @@
 //   automatically attaching compatible sRGB/linear sibling `viewFormats` (`rgba8unorm`,
 //   `bgra8unorm`, `bc1..bc7`) and promoting `1d` LUT textures to WebGPU `2d` (`width x 1 x 1`)
 //   when `promote1DTo2D` is enabled (default `true`, W341 / #1460) for `texture_2d` compatibility.
-// - Zero-copy direct `queue.writeTexture` fast path when source row pitch is already 256-byte
-//   aligned (e.g., 4K Bink2 `3840x2160` `r8unorm` Y plane).
+// - Direct `queue.writeTexture` for aligned row pitches and all r8unorm video planes,
+//   including 1920-byte 4K chroma rows (which do not need 256-byte alignment).
 // - WebGPU 256-byte bytesPerRow alignment & row-pitch repacking helpers (`alignBytesPerRow256`,
 //   `repackRowsTo256`) backed by a bounded persistent per-handler scratch `Uint8Array` (e.g.,
-//   reused across 4K Bink2 `1920x1080` `r8unorm` Cr/Cb planes where `1920 -> 2048`).
+//   reused when a buffer-to-texture copy needs padded rows).
 // - Zero-alloc WebGPU upload descriptor reuse: pre-allocated `GPUTexelCopyTextureInfo`,
 //   `GPUTexelCopyBufferLayout` / `GPUTexelCopyBufferInfo`, `GPUExtent3DDict`, and staging layout
 //   structs are reused across hot `writeTexture` / `copyBufferToTexture` / `handleWriteTexture`
@@ -4174,18 +4174,17 @@
         return;
       }
 
-      const isRowAligned256 =
-        effectiveBytesPerRow > 0 &&
-        effectiveBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0;
       const hasDirectQueueWrite = Boolean(
         p.device.queue && typeof p.device.queue.writeTexture === 'function'
       );
 
-      // Fast path: when source row pitch is already 256-byte aligned (e.g., 4K Bink2
-      // 3840x2160 r8unorm Y plane where 3840 % 256 === 0, or 64x64 BC7 / 128x128 BC1),
-      // upload directly via queue.writeTexture without staging pool churn, double
-      // sub-region clamping, or scratch repacking.
-      if (isRowAligned256 && hasDirectQueueWrite && copyWidth > 0 && copyHeight > 0 && dataLen > 0) {
+      // queue.writeTexture accepts unaligned row pitches (WebGPU §19.2):
+      // https://www.w3.org/TR/webgpu/#dom-gpuqueue-writetexture
+      // Only copyBufferToTexture requires 256-byte rows. This keeps the 1920-byte
+      // chroma rows of 4K video out of CPU padding and staging-buffer copies.
+      const directRowPitch = effectiveBytesPerRow > 0 &&
+        (effectiveBytesPerRow % WEBGPU_BYTES_PER_ROW_ALIGNMENT === 0 || textureFormat === 'r8unorm');
+      if (directRowPitch && hasDirectQueueWrite && copyWidth > 0 && copyHeight > 0 && dataLen > 0) {
         const directRpi =
           rowsPerImage > 0 || totalRows > 1 ? effectiveRowsPerImage : undefined;
         this._writeTextureDirectPreclamped(
