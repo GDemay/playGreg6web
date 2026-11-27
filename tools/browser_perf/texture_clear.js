@@ -4,7 +4,7 @@
 // After: both use the existing ClearTexture consumer packet. Does not time C++ packet generation.
 window.runTextureClearBenchmark = async function ({ mode = 'baseline', samples = 9, warmups = 3, operationsPerSample = 4 } = {}) {
   const check = (ok,message) => { if(!ok) throw new Error(message); };
-  check(mode==='baseline'||mode==='gpu-clear','mode must be baseline or gpu-clear');
+  check(mode==='baseline'||mode==='gpu-clear'||mode==='consume-only','mode must be baseline, gpu-clear or consume-only');
   check(crossOriginIsolated && typeof SharedArrayBuffer==='function','COOP/COEP required for Wasm-like SAB packets');
   const adapter = await navigator.gpu.requestAdapter(); check(adapter,'WebGPU unavailable');
   const requiredFeatures = adapter.features.has('texture-compression-bc') ? ['texture-compression-bc'] : [];
@@ -80,7 +80,8 @@ window.runTextureClearBenchmark = async function ({ mode = 'baseline', samples =
     async function sample(){
       reset();const t=performance.now();
       for(let i=0;i<operationsPerSample;i++){
-        if(mode==='gpu-clear')clear(textureId);
+        if(mode==='consume-only') { /* unchanged texture, identical GPU sink consumption */ }
+        else if(mode==='gpu-clear')clear(textureId);
         else if(size===128)processor.executeCommandBuffer(zeros);
         else{processor.textures.get(textureId).destroy();create(textureId,size,size);}
         const consumer=real.createCommandEncoder();
